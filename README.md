@@ -134,7 +134,7 @@ First-class multi-node support:
 
 ## Project Status
 
-See [ROADMAP.md](ROADMAP.md) for the full development plan and current phase.
+See [docs/development/roadmap.md](docs/development/roadmap.md) for the full development plan and current phase.
 
 ## License
 

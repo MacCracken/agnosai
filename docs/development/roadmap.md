@@ -11,43 +11,49 @@ AgnosAI distills production-proven patterns from three systems:
 
 ---
 
-## Current Phase: 1 — Core Foundation
+## Current Phase: 2 — LLM & Tools
 
-### Phase 1: Core Crate (Foundation)
+### Phase 1: Core Crate (Foundation) — Complete
 
 Build `agnosai-core` and `agnosai-orchestrator` with essential primitives.
 
 | Item | Source | Status |
 |------|--------|--------|
-| Core types (Agent, Task, Crew, Message, Resource) | Agnosticos `agnos-common` | Scaffolded |
-| Error types (`AgnosaiError` via thiserror) | New | Scaffolded |
-| Orchestrator with `Arc<RwLock<State>>` | Agnosticos `daimon/orchestrator` | Scaffolded |
-| Priority task scheduler with DAG resolution | Agnosticos `scheduling.rs` + new DAG | Pending |
-| Agent scoring (CPU, GPU, capability, affinity) | Agnosticos `scoring.rs` | Pending |
-| IPC (Unix sockets, length-prefixed framing) | Agnosticos `ipc.rs` | Pending |
-| Topic pub/sub with wildcards | Agnosticos `pubsub.rs` | Pending |
-| Agent definitions (JSON/YAML loading) | Agnostic v1 format | Pending |
-| Crew runner (assemble → execute → aggregate) | New, replaces CrewAI Crew | Pending |
+| Core types (Agent, Task, Crew, Message, Resource) | Agnosticos `agnos-common` | Done |
+| Error types (`AgnosaiError` via thiserror) | New | Done |
+| Orchestrator with `Arc<RwLock<State>>` | Agnosticos `daimon/orchestrator` | Done |
+| Priority task scheduler with DAG resolution | Agnosticos `scheduling.rs` + new DAG | Done (9 tests) |
+| Agent scoring (tools, complexity, GPU, domain) | Agnosticos `scoring.rs` | Done (11 tests) |
+| Topic pub/sub with wildcards | Agnosticos `pubsub.rs` | Done (21 tests) |
+| Agent definitions (JSON/YAML loading) | Agnostic v1 format | Done (11 tests) |
+| Crew runner (assemble → execute → aggregate) | New, replaces CrewAI Crew | Done (11 tests) |
 
-**Exit criteria**: Define agents in JSON, assemble a crew, execute a task DAG in a single process with native Rust tools.
+**Exit criteria**: Define agents in JSON, assemble a crew, execute a task DAG in a single process with native Rust tools. **Met — 63 tests passing.**
 
 ---
 
 ### Phase 2: LLM & Tools
 
-| Item | Source |
-|------|--------|
-| `LlmProvider` trait + OpenAI provider | Agnosticos hoosh + SY model router |
-| Anthropic, Ollama, Gemini providers | SY provider implementations |
-| Remaining providers (DeepSeek, Mistral, Groq, LM Studio, hoosh) | SY + Agnosticos |
-| Model router (task-complexity scoring) | SY `model-router.ts` |
-| Provider health ring buffer + failover | SY health scoring |
-| Response cache (LRU + TTL) | SY + Agnosticos |
-| Token budget accounting | Agnosticos hoosh |
-| Rate limiter (semaphore-based) | Agnosticos `rate_limiter.rs` |
-| Native Rust tool trait + registry | Agnostic `tool_registry.py` |
-| WASM tool sandbox (wasmtime) | Agnosticos `sandbox_mod/` |
-| Python tool bridge (sandboxed subprocess) | New |
+| Item | Source | Status |
+|------|--------|--------|
+| `LlmProvider` trait + OpenAI provider | Agnosticos hoosh + SY model router | Done |
+| Anthropic provider | SY provider implementations | Done |
+| Ollama provider | SY provider implementations | Done |
+| Remaining providers (Gemini, DeepSeek, Mistral, Groq, LM Studio, hoosh) | SY + Agnosticos | Pending |
+| Model router (task-complexity scoring) | SY `model-router.ts` | Done (10 tests) |
+| Provider health ring buffer + failover | SY health scoring | Done (8 tests) |
+| Response cache (LRU + TTL) | SY + Agnosticos | Pending |
+| Token budget accounting | Agnosticos hoosh | Pending |
+| Rate limiter (semaphore-based) | Agnosticos `rate_limiter.rs` | Done (4 tests) |
+| Native Rust tool trait + registry | Agnostic `tool_registry.py` | Done (10 tests) |
+| Built-in tools: Synapse (3), Mneme (3), Delta (3) | AGNOS ecosystem integration | Done |
+| WASM tool sandbox (wasmtime) | Agnosticos `sandbox_mod/` | Pending |
+| Python tool bridge (sandboxed subprocess) | New | Pending |
+
+**AGNOS ecosystem tools** (optional, not hard dependencies):
+- **Synapse** — LLM inference (`synapse_infer`, `synapse_list_models`, `synapse_status`)
+- **Mneme** — Knowledge base (`mneme_search`, `mneme_get_note`, `mneme_create_note`)
+- **Delta** — Code platform (`delta_list_repos`, `delta_trigger_pipeline`, `delta_get_pipeline`)
 
 **Exit criteria**: Run a crew that calls LLMs and executes tools (native, WASM, or sandboxed Python).
 
@@ -57,6 +63,7 @@ Build `agnosai-core` and `agnosai-orchestrator` with essential primitives.
 
 | Item | Source |
 |------|--------|
+| IPC (Unix sockets, length-prefixed framing) | Agnosticos `ipc.rs` |
 | Node registry + heartbeat | Agnostic v1 fleet → Rust |
 | Placement engine (5 scheduling policies) | Agnostic v1 fleet → Rust |
 | Inter-node relay (Redis pub/sub) | Agnostic v1 fleet → Rust |
@@ -120,6 +127,8 @@ Build `agnosai-core` and `agnosai-orchestrator` with essential primitives.
 ---
 
 ## Design Principles
+
+See [docs/architecture/overview.md](../architecture/overview.md) for the full integration map and system context.
 
 1. **Concurrency over parallelism hacks** — tokio async, not thread pools with GIL workarounds
 2. **Compile-time safety** — Rust type system catches what Python tests miss
