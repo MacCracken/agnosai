@@ -12,8 +12,8 @@ use agnosai_core::error::AgnosaiError;
 use tracing::{debug, info, warn};
 use wasmtime::*;
 use wasmtime_wasi::WasiCtxBuilder;
-use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
-use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+use wasmtime_wasi::p1::{self, WasiP1Ctx};
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 
 /// Default memory limit: 64 MiB.
 const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -154,7 +154,7 @@ impl WasmSandbox {
 
         // -- Link WASI and instantiate. --
         let mut linker: Linker<SandboxState> = Linker::new(&self.engine);
-        preview1::add_to_linker_sync(&mut linker, |state: &mut SandboxState| &mut state.wasi_ctx)
+        p1::add_to_linker_sync(&mut linker, |state: &mut SandboxState| &mut state.wasi_ctx)
             .map_err(map_wasm_err)?;
 
         let instance = linker
