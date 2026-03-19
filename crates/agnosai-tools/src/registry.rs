@@ -104,4 +104,97 @@ mod tests {
         let reg = ToolRegistry::new();
         assert!(reg.get("nonexistent").is_none());
     }
+
+    #[test]
+    fn register_multiple_tools_verify_count() {
+        let reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(JsonTransformTool));
+        assert_eq!(reg.count(), 2);
+        assert!(reg.has("echo"));
+        assert!(reg.has("json_transform"));
+    }
+
+    #[test]
+    fn register_same_name_overwrites() {
+        let reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        assert_eq!(reg.count(), 1);
+        let schema_before = reg.get("echo").unwrap().schema();
+        assert_eq!(schema_before.parameters.len(), 1);
+
+        // Register another EchoTool under the same name — count stays 1.
+        reg.register(Arc::new(EchoTool));
+        assert_eq!(reg.count(), 1);
+        assert!(reg.has("echo"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_access() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut handles = Vec::new();
+
+        // Spawn 20 tasks that register tools concurrently.
+        for i in 0..20 {
+            let reg_clone = reg.clone();
+            handles.push(tokio::spawn(async move {
+                // Alternate between registering echo and json_transform to
+                // exercise concurrent insert + read paths.
+                if i % 2 == 0 {
+                    reg_clone.register(Arc::new(EchoTool));
+                } else {
+                    reg_clone.register(Arc::new(JsonTransformTool));
+                }
+                // Concurrent reads while writes are happening.
+                let _ = reg_clone.list();
+                let _ = reg_clone.get("echo");
+                let _ = reg_clone.has("json_transform");
+                reg_clone.count()
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // After all tasks complete, both tools should be registered.
+        assert!(reg.has("echo"));
+        assert!(reg.has("json_transform"));
+        assert_eq!(reg.count(), 2);
+    }
+
+    #[test]
+    fn list_returns_schemas_for_all_registered() {
+        let reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(JsonTransformTool));
+
+        let schemas = reg.list();
+        assert_eq!(schemas.len(), 2);
+
+        for schema in &schemas {
+            assert!(!schema.name.is_empty());
+            assert!(!schema.description.is_empty());
+        }
+
+        let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"echo"));
+        assert!(names.contains(&"json_transform"));
+
+        // Verify parameter details are present.
+        let echo_schema = schemas.iter().find(|s| s.name == "echo").unwrap();
+        assert_eq!(echo_schema.parameters.len(), 1);
+        assert_eq!(echo_schema.parameters[0].name, "message");
+
+        let jt_schema = schemas.iter().find(|s| s.name == "json_transform").unwrap();
+        assert_eq!(jt_schema.parameters.len(), 2);
+    }
+
+    #[test]
+    fn remove_nonexistent_returns_false() {
+        let reg = ToolRegistry::new();
+        assert!(!reg.remove("does_not_exist"));
+        assert!(!reg.remove(""));
+        assert!(!reg.remove("some_random_tool"));
+    }
 }

@@ -1,6 +1,8 @@
 //! Groq provider — thin wrapper over the OpenAI-compatible API.
 
-use crate::provider::{InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result};
+use crate::provider::{
+    InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result,
+};
 use crate::providers::openai::OpenAiProvider;
 
 /// Groq LLM provider (OpenAI-compatible).
@@ -38,5 +40,17 @@ mod tests {
     fn provider_type() {
         let p = GroqProvider::new("sk-test".into());
         assert_eq!(p.provider_type(), ProviderType::Groq);
+    }
+
+    #[test]
+    fn base_url_is_groq() {
+        let p = GroqProvider::new("sk-test".into());
+        assert_eq!(p.0.base_url(), "https://api.groq.com/openai");
+    }
+
+    #[test]
+    fn default_model_is_llama() {
+        let p = GroqProvider::new("sk-test".into());
+        assert_eq!(p.0.default_model(), "llama-3.3-70b-versatile");
     }
 }

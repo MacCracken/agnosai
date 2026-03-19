@@ -41,12 +41,7 @@ impl ProviderHealth {
     /// A provider is healthy if it does NOT have 3+ consecutive failures
     /// at the tail of the buffer.
     pub fn is_healthy(&self) -> bool {
-        let consecutive_failures = self
-            .buffer
-            .iter()
-            .rev()
-            .take_while(|&&ok| !ok)
-            .count();
+        let consecutive_failures = self.buffer.iter().rev().take_while(|&&ok| !ok).count();
         consecutive_failures < 3
     }
 

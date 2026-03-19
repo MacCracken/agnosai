@@ -246,3 +246,151 @@ impl NativeTool for MnemeCreateNote {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── MnemeSearch ─────────────────────────────────────────────────────
+
+    #[test]
+    fn mneme_search_name() {
+        assert_eq!(MnemeSearch::new().name(), "mneme_search");
+    }
+
+    #[test]
+    fn mneme_search_description_non_empty() {
+        assert!(!MnemeSearch::new().description().is_empty());
+    }
+
+    #[test]
+    fn mneme_search_schema_parameters() {
+        let schema = MnemeSearch::new().schema();
+        assert_eq!(schema.name, "mneme_search");
+        assert_eq!(schema.parameters.len(), 2);
+
+        let query = schema.parameters.iter().find(|p| p.name == "query").unwrap();
+        assert_eq!(query.param_type, "string");
+        assert!(query.required);
+
+        let limit = schema.parameters.iter().find(|p| p.name == "limit").unwrap();
+        assert_eq!(limit.param_type, "number");
+        assert!(!limit.required);
+    }
+
+    #[tokio::test]
+    async fn mneme_search_missing_query() {
+        let tool = MnemeSearch::new();
+        let output = tool
+            .execute(ToolInput {
+                parameters: HashMap::new(),
+            })
+            .await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("query"));
+    }
+
+    // ── MnemeGetNote ────────────────────────────────────────────────────
+
+    #[test]
+    fn mneme_get_note_name() {
+        assert_eq!(MnemeGetNote::new().name(), "mneme_get_note");
+    }
+
+    #[test]
+    fn mneme_get_note_description_non_empty() {
+        assert!(!MnemeGetNote::new().description().is_empty());
+    }
+
+    #[test]
+    fn mneme_get_note_schema_parameters() {
+        let schema = MnemeGetNote::new().schema();
+        assert_eq!(schema.name, "mneme_get_note");
+        assert_eq!(schema.parameters.len(), 1);
+
+        let note_id = &schema.parameters[0];
+        assert_eq!(note_id.name, "note_id");
+        assert_eq!(note_id.param_type, "string");
+        assert!(note_id.required);
+    }
+
+    #[tokio::test]
+    async fn mneme_get_note_missing_note_id() {
+        let tool = MnemeGetNote::new();
+        let output = tool
+            .execute(ToolInput {
+                parameters: HashMap::new(),
+            })
+            .await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("note_id"));
+    }
+
+    // ── MnemeCreateNote ─────────────────────────────────────────────────
+
+    #[test]
+    fn mneme_create_note_name() {
+        assert_eq!(MnemeCreateNote::new().name(), "mneme_create_note");
+    }
+
+    #[test]
+    fn mneme_create_note_description_non_empty() {
+        assert!(!MnemeCreateNote::new().description().is_empty());
+    }
+
+    #[test]
+    fn mneme_create_note_schema_parameters() {
+        let schema = MnemeCreateNote::new().schema();
+        assert_eq!(schema.name, "mneme_create_note");
+        assert_eq!(schema.parameters.len(), 3);
+
+        let title = schema.parameters.iter().find(|p| p.name == "title").unwrap();
+        assert_eq!(title.param_type, "string");
+        assert!(title.required);
+
+        let content = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "content")
+            .unwrap();
+        assert_eq!(content.param_type, "string");
+        assert!(content.required);
+
+        let tags = schema.parameters.iter().find(|p| p.name == "tags").unwrap();
+        assert_eq!(tags.param_type, "array");
+        assert!(!tags.required);
+    }
+
+    #[tokio::test]
+    async fn mneme_create_note_missing_title() {
+        let tool = MnemeCreateNote::new();
+        let mut params = HashMap::new();
+        params.insert("content".to_owned(), json!("body text"));
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("title"));
+    }
+
+    #[tokio::test]
+    async fn mneme_create_note_missing_content() {
+        let tool = MnemeCreateNote::new();
+        let mut params = HashMap::new();
+        params.insert("title".to_owned(), json!("My Note"));
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("content"));
+    }
+
+    #[tokio::test]
+    async fn mneme_create_note_missing_all_required() {
+        let tool = MnemeCreateNote::new();
+        let output = tool
+            .execute(ToolInput {
+                parameters: HashMap::new(),
+            })
+            .await;
+        assert!(!output.success);
+        assert!(output.error.is_some());
+    }
+}

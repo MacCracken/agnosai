@@ -74,11 +74,7 @@ impl TokenBudget {
     }
 
     /// Record token usage for an agent. Returns `Err` if the agent or global limit would be exceeded.
-    pub fn record_usage(
-        &mut self,
-        agent_key: &str,
-        tokens: u64,
-    ) -> Result<(), BudgetExceeded> {
+    pub fn record_usage(&mut self, agent_key: &str, tokens: u64) -> Result<(), BudgetExceeded> {
         // Check global limit first.
         if let Some(global_limit) = self.global_limit {
             if self.global_used + tokens > global_limit {

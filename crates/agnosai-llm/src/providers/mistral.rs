@@ -1,6 +1,8 @@
 //! Mistral provider — thin wrapper over the OpenAI-compatible API.
 
-use crate::provider::{InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result};
+use crate::provider::{
+    InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result,
+};
 use crate::providers::openai::OpenAiProvider;
 
 /// Mistral LLM provider (OpenAI-compatible).
@@ -38,5 +40,17 @@ mod tests {
     fn provider_type() {
         let p = MistralProvider::new("sk-test".into());
         assert_eq!(p.provider_type(), ProviderType::Mistral);
+    }
+
+    #[test]
+    fn base_url_is_mistral() {
+        let p = MistralProvider::new("sk-test".into());
+        assert_eq!(p.0.base_url(), "https://api.mistral.ai");
+    }
+
+    #[test]
+    fn default_model_is_mistral_large() {
+        let p = MistralProvider::new("sk-test".into());
+        assert_eq!(p.0.default_model(), "mistral-large-latest");
     }
 }

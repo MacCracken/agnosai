@@ -243,3 +243,175 @@ impl NativeTool for DeltaGetPipeline {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── DeltaListRepos ──────────────────────────────────────────────────
+
+    #[test]
+    fn delta_list_repos_name() {
+        assert_eq!(DeltaListRepos::new().name(), "delta_list_repos");
+    }
+
+    #[test]
+    fn delta_list_repos_description_non_empty() {
+        assert!(!DeltaListRepos::new().description().is_empty());
+    }
+
+    #[test]
+    fn delta_list_repos_schema_no_params() {
+        let schema = DeltaListRepos::new().schema();
+        assert_eq!(schema.name, "delta_list_repos");
+        assert!(schema.parameters.is_empty());
+    }
+
+    // ── DeltaTriggerPipeline ────────────────────────────────────────────
+
+    #[test]
+    fn delta_trigger_pipeline_name() {
+        assert_eq!(DeltaTriggerPipeline::new().name(), "delta_trigger_pipeline");
+    }
+
+    #[test]
+    fn delta_trigger_pipeline_description_non_empty() {
+        assert!(!DeltaTriggerPipeline::new().description().is_empty());
+    }
+
+    #[test]
+    fn delta_trigger_pipeline_schema_parameters() {
+        let schema = DeltaTriggerPipeline::new().schema();
+        assert_eq!(schema.name, "delta_trigger_pipeline");
+        assert_eq!(schema.parameters.len(), 3);
+
+        let owner = schema.parameters.iter().find(|p| p.name == "owner").unwrap();
+        assert_eq!(owner.param_type, "string");
+        assert!(owner.required);
+
+        let repo = schema.parameters.iter().find(|p| p.name == "repo").unwrap();
+        assert_eq!(repo.param_type, "string");
+        assert!(repo.required);
+
+        let branch = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "branch")
+            .unwrap();
+        assert_eq!(branch.param_type, "string");
+        assert!(!branch.required);
+    }
+
+    #[tokio::test]
+    async fn delta_trigger_pipeline_missing_owner() {
+        let tool = DeltaTriggerPipeline::new();
+        let mut params = HashMap::new();
+        params.insert("repo".to_owned(), json!("my-repo"));
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("owner"));
+    }
+
+    #[tokio::test]
+    async fn delta_trigger_pipeline_missing_repo() {
+        let tool = DeltaTriggerPipeline::new();
+        let mut params = HashMap::new();
+        params.insert("owner".to_owned(), json!("my-org"));
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("repo"));
+    }
+
+    #[tokio::test]
+    async fn delta_trigger_pipeline_missing_all_required() {
+        let tool = DeltaTriggerPipeline::new();
+        let output = tool
+            .execute(ToolInput {
+                parameters: HashMap::new(),
+            })
+            .await;
+        assert!(!output.success);
+        assert!(output.error.is_some());
+    }
+
+    // ── DeltaGetPipeline ────────────────────────────────────────────────
+
+    #[test]
+    fn delta_get_pipeline_name() {
+        assert_eq!(DeltaGetPipeline::new().name(), "delta_get_pipeline");
+    }
+
+    #[test]
+    fn delta_get_pipeline_description_non_empty() {
+        assert!(!DeltaGetPipeline::new().description().is_empty());
+    }
+
+    #[test]
+    fn delta_get_pipeline_schema_parameters() {
+        let schema = DeltaGetPipeline::new().schema();
+        assert_eq!(schema.name, "delta_get_pipeline");
+        assert_eq!(schema.parameters.len(), 3);
+
+        let owner = schema.parameters.iter().find(|p| p.name == "owner").unwrap();
+        assert_eq!(owner.param_type, "string");
+        assert!(owner.required);
+
+        let repo = schema.parameters.iter().find(|p| p.name == "repo").unwrap();
+        assert_eq!(repo.param_type, "string");
+        assert!(repo.required);
+
+        let pipeline_id = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "pipeline_id")
+            .unwrap();
+        assert_eq!(pipeline_id.param_type, "string");
+        assert!(pipeline_id.required);
+    }
+
+    #[tokio::test]
+    async fn delta_get_pipeline_missing_owner() {
+        let tool = DeltaGetPipeline::new();
+        let mut params = HashMap::new();
+        params.insert("repo".to_owned(), json!("my-repo"));
+        params.insert("pipeline_id".to_owned(), json!("123"));
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("owner"));
+    }
+
+    #[tokio::test]
+    async fn delta_get_pipeline_missing_repo() {
+        let tool = DeltaGetPipeline::new();
+        let mut params = HashMap::new();
+        params.insert("owner".to_owned(), json!("my-org"));
+        params.insert("pipeline_id".to_owned(), json!("123"));
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("repo"));
+    }
+
+    #[tokio::test]
+    async fn delta_get_pipeline_missing_pipeline_id() {
+        let tool = DeltaGetPipeline::new();
+        let mut params = HashMap::new();
+        params.insert("owner".to_owned(), json!("my-org"));
+        params.insert("repo".to_owned(), json!("my-repo"));
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("pipeline_id"));
+    }
+
+    #[tokio::test]
+    async fn delta_get_pipeline_missing_all_required() {
+        let tool = DeltaGetPipeline::new();
+        let output = tool
+            .execute(ToolInput {
+                parameters: HashMap::new(),
+            })
+            .await;
+        assert!(!output.success);
+        assert!(output.error.is_some());
+    }
+}

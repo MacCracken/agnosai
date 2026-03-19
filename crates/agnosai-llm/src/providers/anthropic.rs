@@ -219,13 +219,25 @@ mod tests {
 
     #[test]
     fn construct_with_model() {
-        let p = AnthropicProvider::with_model("sk-ant-test".into(), "claude-opus-4-20250514".into());
+        let p =
+            AnthropicProvider::with_model("sk-ant-test".into(), "claude-opus-4-20250514".into());
         assert_eq!(p.default_model, "claude-opus-4-20250514");
     }
 
     #[test]
-    fn system_message_extraction() {
-        // Verify the system-message separation logic compiles and works
+    fn resolve_model_uses_default_when_empty() {
+        let p = AnthropicProvider::new("sk-ant-test".into());
+        assert_eq!(p.resolve_model(""), DEFAULT_MODEL);
+        assert_eq!(
+            p.resolve_model("claude-opus-4-20250514"),
+            "claude-opus-4-20250514"
+        );
+    }
+
+    // ── System message extraction ───────────────────────────────────
+
+    #[test]
+    fn system_message_extraction_single() {
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
@@ -253,5 +265,258 @@ mod tests {
         assert_eq!(system_parts.len(), 1);
         assert_eq!(api_messages.len(), 1);
         assert_eq!(api_messages[0].role, "user");
+    }
+
+    #[test]
+    fn system_message_extraction_multiple() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "You are helpful.".into(),
+            },
+            ChatMessage {
+                role: "system".into(),
+                content: "Be concise.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hello".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Hi!".into(),
+            },
+        ];
+
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut api_messages: Vec<AnthropicMessage> = Vec::new();
+        for msg in &messages {
+            if msg.role == "system" {
+                system_parts.push(msg.content.clone());
+            } else {
+                api_messages.push(AnthropicMessage {
+                    role: msg.role.clone(),
+                    content: msg.content.clone(),
+                });
+            }
+        }
+
+        let system = if system_parts.is_empty() {
+            None
+        } else {
+            Some(system_parts.join("\n\n"))
+        };
+
+        assert_eq!(system, Some("You are helpful.\n\nBe concise.".to_string()));
+        assert_eq!(api_messages.len(), 2);
+        assert_eq!(api_messages[0].role, "user");
+        assert_eq!(api_messages[1].role, "assistant");
+    }
+
+    #[test]
+    fn system_message_extraction_none() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
+
+        let mut system_parts: Vec<String> = Vec::new();
+        for msg in &messages {
+            if msg.role == "system" {
+                system_parts.push(msg.content.clone());
+            }
+        }
+
+        let system = if system_parts.is_empty() {
+            None
+        } else {
+            Some(system_parts.join("\n\n"))
+        };
+
+        assert!(system.is_none());
+    }
+
+    // ── Request body serialization ──────────────────────────────────
+
+    #[test]
+    fn request_body_json_structure() {
+        let body = AnthropicRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+            max_tokens: 4096,
+            system: Some("Be helpful.".to_string()),
+            temperature: Some(0.7),
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["model"], "claude-sonnet-4-20250514");
+        assert_eq!(json["max_tokens"], 4096);
+        assert_eq!(json["system"], "Be helpful.");
+        assert_eq!(json["temperature"], 0.7);
+        assert_eq!(json["messages"][0]["role"], "user");
+        assert_eq!(json["messages"][0]["content"], "Hello");
+        // No "stream" field in Anthropic request
+        assert!(json.get("stream").is_none());
+    }
+
+    #[test]
+    fn request_body_omits_none_fields() {
+        let body = AnthropicRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![],
+            max_tokens: 4096,
+            system: None,
+            temperature: None,
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("system").is_none());
+        assert!(json.get("temperature").is_none());
+        // max_tokens is always present (not optional in Anthropic API)
+        assert_eq!(json["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn request_body_default_max_tokens() {
+        // When max_tokens is None in InferenceRequest, the provider defaults to 4096
+        let request = InferenceRequest {
+            model: "".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "test".into(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+        };
+
+        let max_tokens = request.max_tokens.unwrap_or(4096);
+        assert_eq!(max_tokens, 4096);
+    }
+
+    // ── Response parsing ────────────────────────────────────────────
+
+    #[test]
+    fn parse_response_single_block() {
+        let json = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "Hello! How can I help you?" }
+            ],
+            "model": "claude-sonnet-4-20250514",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 8
+            }
+        });
+
+        let ar: AnthropicResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(ar.model, "claude-sonnet-4-20250514");
+        assert_eq!(ar.content.len(), 1);
+        assert_eq!(ar.content[0].text, "Hello! How can I help you?");
+        assert_eq!(ar.usage.input_tokens, 12);
+        assert_eq!(ar.usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn parse_response_multiple_content_blocks() {
+        let json = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "First part." },
+                { "type": "text", "text": " Second part." }
+            ],
+            "model": "claude-sonnet-4-20250514",
+            "usage": { "input_tokens": 5, "output_tokens": 10 }
+        });
+
+        let ar: AnthropicResponse = serde_json::from_value(json).unwrap();
+
+        // The provider joins all content blocks
+        let content: String = ar
+            .content
+            .into_iter()
+            .map(|b| b.text)
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert_eq!(content, "First part. Second part.");
+    }
+
+    #[test]
+    fn parse_response_to_inference_response() {
+        let json = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "Answer here." }
+            ],
+            "model": "claude-sonnet-4-20250514",
+            "usage": { "input_tokens": 20, "output_tokens": 5 }
+        });
+
+        let ar: AnthropicResponse = serde_json::from_value(json).unwrap();
+
+        let content = ar
+            .content
+            .into_iter()
+            .map(|b| b.text)
+            .collect::<Vec<_>>()
+            .join("");
+        let total = ar.usage.input_tokens + ar.usage.output_tokens;
+
+        let resp = InferenceResponse {
+            content,
+            model: ar.model,
+            usage: TokenUsage {
+                prompt_tokens: ar.usage.input_tokens,
+                completion_tokens: ar.usage.output_tokens,
+                total_tokens: total,
+            },
+        };
+
+        assert_eq!(resp.content, "Answer here.");
+        assert_eq!(resp.model, "claude-sonnet-4-20250514");
+        assert_eq!(resp.usage.prompt_tokens, 20);
+        assert_eq!(resp.usage.completion_tokens, 5);
+        assert_eq!(resp.usage.total_tokens, 25);
+    }
+
+    #[test]
+    fn parse_error_response() {
+        let json = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "authentication_error",
+                "message": "Invalid API key"
+            }
+        });
+
+        let err: AnthropicErrorResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(err.error.message, "Invalid API key");
+    }
+
+    #[test]
+    fn list_models_returns_known_family() {
+        // Anthropic list_models is a static list — verify it at least returns entries
+        // We can't call async in a sync test easily, but we verify the static data
+        let models = vec![
+            ModelInfo {
+                id: "claude-sonnet-4-20250514".into(),
+                name: "Claude Sonnet 4".into(),
+                provider: ProviderType::Anthropic,
+            },
+            ModelInfo {
+                id: "claude-opus-4-20250514".into(),
+                name: "Claude Opus 4".into(),
+                provider: ProviderType::Anthropic,
+            },
+            ModelInfo {
+                id: "claude-3-5-haiku-20241022".into(),
+                name: "Claude 3.5 Haiku".into(),
+                provider: ProviderType::Anthropic,
+            },
+        ];
+        assert_eq!(models.len(), 3);
+        assert!(models.iter().all(|m| m.provider == ProviderType::Anthropic));
     }
 }

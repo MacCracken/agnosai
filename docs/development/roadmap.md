@@ -11,7 +11,7 @@ AgnosAI distills production-proven patterns from three systems:
 
 ---
 
-## Current Phase: 3 — Fleet Distribution
+## Current Phase: 4 — API Server & Integration (Phase 3 blocked on hardware)
 
 ### Phase 1: Core Crate (Foundation) — Complete
 
@@ -53,7 +53,9 @@ Build `agnosai-core` and `agnosai-orchestrator` with essential primitives.
 
 ---
 
-### Phase 3: Fleet Distribution
+### Phase 3: Fleet Distribution — Blocked (P1, hardware)
+
+> **Blocked**: Requires multi-node hardware for development and testing. Will unblock when additional machines are available.
 
 | Item | Source |
 |------|--------|

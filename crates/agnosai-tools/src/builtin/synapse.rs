@@ -232,3 +232,122 @@ impl NativeTool for SynapseStatus {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── SynapseInfer ────────────────────────────────────────────────────
+
+    #[test]
+    fn synapse_infer_name() {
+        assert_eq!(SynapseInfer::new().name(), "synapse_infer");
+    }
+
+    #[test]
+    fn synapse_infer_description_non_empty() {
+        assert!(!SynapseInfer::new().description().is_empty());
+    }
+
+    #[test]
+    fn synapse_infer_schema_parameters() {
+        let schema = SynapseInfer::new().schema();
+        assert_eq!(schema.name, "synapse_infer");
+        assert_eq!(schema.parameters.len(), 4);
+
+        let model = schema.parameters.iter().find(|p| p.name == "model").unwrap();
+        assert_eq!(model.param_type, "string");
+        assert!(model.required);
+
+        let prompt = schema.parameters.iter().find(|p| p.name == "prompt").unwrap();
+        assert_eq!(prompt.param_type, "string");
+        assert!(prompt.required);
+
+        let max_tokens = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "max_tokens")
+            .unwrap();
+        assert_eq!(max_tokens.param_type, "number");
+        assert!(!max_tokens.required);
+
+        let temperature = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "temperature")
+            .unwrap();
+        assert_eq!(temperature.param_type, "number");
+        assert!(!temperature.required);
+    }
+
+    #[tokio::test]
+    async fn synapse_infer_missing_model() {
+        let tool = SynapseInfer::new();
+        let mut params = HashMap::new();
+        params.insert("prompt".to_owned(), json!("hello"));
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("model"));
+    }
+
+    #[tokio::test]
+    async fn synapse_infer_missing_prompt() {
+        let tool = SynapseInfer::new();
+        let mut params = HashMap::new();
+        params.insert("model".to_owned(), json!("gpt-4"));
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("prompt"));
+    }
+
+    #[tokio::test]
+    async fn synapse_infer_missing_all_required() {
+        let tool = SynapseInfer::new();
+        let output = tool
+            .execute(ToolInput {
+                parameters: HashMap::new(),
+            })
+            .await;
+        assert!(!output.success);
+        assert!(output.error.is_some());
+    }
+
+    // ── SynapseListModels ───────────────────────────────────────────────
+
+    #[test]
+    fn synapse_list_models_name() {
+        assert_eq!(SynapseListModels::new().name(), "synapse_list_models");
+    }
+
+    #[test]
+    fn synapse_list_models_description_non_empty() {
+        assert!(!SynapseListModels::new().description().is_empty());
+    }
+
+    #[test]
+    fn synapse_list_models_schema_no_params() {
+        let schema = SynapseListModels::new().schema();
+        assert_eq!(schema.name, "synapse_list_models");
+        assert!(schema.parameters.is_empty());
+    }
+
+    // ── SynapseStatus ───────────────────────────────────────────────────
+
+    #[test]
+    fn synapse_status_name() {
+        assert_eq!(SynapseStatus::new().name(), "synapse_status");
+    }
+
+    #[test]
+    fn synapse_status_description_non_empty() {
+        assert!(!SynapseStatus::new().description().is_empty());
+    }
+
+    #[test]
+    fn synapse_status_schema_no_params() {
+        let schema = SynapseStatus::new().schema();
+        assert_eq!(schema.name, "synapse_status");
+        assert!(schema.parameters.is_empty());
+    }
+}

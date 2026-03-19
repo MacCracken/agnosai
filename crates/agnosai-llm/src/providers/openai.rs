@@ -66,6 +66,18 @@ impl OpenAiProvider {
             model.to_string()
         }
     }
+
+    /// Base URL (for testing wrapper providers).
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Default model (for testing wrapper providers).
+    #[cfg(test)]
+    pub(crate) fn default_model(&self) -> &str {
+        &self.default_model
+    }
 }
 
 // ── OpenAI API types ────────────────────────────────────────────────
@@ -239,6 +251,7 @@ impl LlmProvider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ChatMessage;
 
     #[test]
     fn construct_default() {
@@ -265,5 +278,269 @@ mod tests {
         let p = OpenAiProvider::new("sk-test".into());
         assert_eq!(p.resolve_model(""), "gpt-4o");
         assert_eq!(p.resolve_model("gpt-3.5-turbo"), "gpt-3.5-turbo");
+    }
+
+    // ── Request body serialization tests ────────────────────────────
+
+    #[test]
+    fn request_body_json_structure() {
+        let body = OaiChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                OaiMessage {
+                    role: "system".to_string(),
+                    content: "You are helpful.".to_string(),
+                },
+                OaiMessage {
+                    role: "user".to_string(),
+                    content: "Hello".to_string(),
+                },
+            ],
+            temperature: Some(0.7),
+            max_tokens: Some(1024),
+            stream: false,
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["model"], "gpt-4o");
+        assert_eq!(json["stream"], false);
+        assert_eq!(json["temperature"], 0.7);
+        assert_eq!(json["max_tokens"], 1024);
+
+        let msgs = json["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "You are helpful.");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "Hello");
+    }
+
+    #[test]
+    fn request_body_omits_none_fields() {
+        let body = OaiChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("temperature").is_none());
+        assert!(json.get("max_tokens").is_none());
+        // stream and model are always present
+        assert_eq!(json["stream"], false);
+        assert_eq!(json["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn request_body_maps_from_inference_request() {
+        let request = InferenceRequest {
+            model: "".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            }],
+            temperature: Some(0.5),
+            max_tokens: Some(256),
+            stream: false,
+        };
+
+        let p = OpenAiProvider::new("sk-test".into());
+        let model = p.resolve_model(&request.model);
+
+        let body = OaiChatRequest {
+            model: model.clone(),
+            messages: request
+                .messages
+                .iter()
+                .map(|m| OaiMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect(),
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+            stream: false,
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+        // Empty model should resolve to default
+        assert_eq!(json["model"], "gpt-4o");
+        assert_eq!(json["messages"][0]["content"], "Hi");
+        assert_eq!(json["temperature"], 0.5);
+        assert_eq!(json["max_tokens"], 256);
+    }
+
+    // ── Response parsing tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_chat_response() {
+        let json = serde_json::json!({
+            "id": "chatcmpl-abc123",
+            "object": "chat.completion",
+            "model": "gpt-4o-2025-01-01",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello! How can I help you?"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 8,
+                "total_tokens": 18
+            }
+        });
+
+        let oai: OaiChatResponse = serde_json::from_value(json).unwrap();
+
+        assert_eq!(oai.model, "gpt-4o-2025-01-01");
+        assert_eq!(oai.choices.len(), 1);
+        assert_eq!(oai.choices[0].message.content, "Hello! How can I help you?");
+        assert_eq!(oai.choices[0].message.role, "assistant");
+
+        let usage = oai.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 8);
+        assert_eq!(usage.total_tokens, 18);
+    }
+
+    #[test]
+    fn parse_chat_response_no_usage() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Hi"
+                }
+            }]
+        });
+
+        let oai: OaiChatResponse = serde_json::from_value(json).unwrap();
+        assert!(oai.usage.is_none());
+        assert_eq!(oai.choices[0].message.content, "Hi");
+    }
+
+    #[test]
+    fn parse_chat_response_empty_choices() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": []
+        });
+
+        let oai: OaiChatResponse = serde_json::from_value(json).unwrap();
+        // The provider code uses .first().unwrap_or_default() — empty choices yields ""
+        let content = oai
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default();
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn parse_chat_response_to_inference_response() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{
+                "message": { "role": "assistant", "content": "Answer" }
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3,
+                "total_tokens": 8
+            }
+        });
+
+        let oai: OaiChatResponse = serde_json::from_value(json).unwrap();
+
+        let content = oai
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default();
+
+        let usage = oai.usage.map_or_else(TokenUsage::default, |u| TokenUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+        });
+
+        let resp = InferenceResponse {
+            content,
+            model: oai.model,
+            usage,
+        };
+
+        assert_eq!(resp.content, "Answer");
+        assert_eq!(resp.model, "gpt-4o");
+        assert_eq!(resp.usage.prompt_tokens, 5);
+        assert_eq!(resp.usage.completion_tokens, 3);
+        assert_eq!(resp.usage.total_tokens, 8);
+    }
+
+    #[test]
+    fn parse_error_response() {
+        let json = serde_json::json!({
+            "error": {
+                "message": "Invalid API key provided",
+                "type": "invalid_request_error",
+                "code": "invalid_api_key"
+            }
+        });
+
+        let err: OaiErrorResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(err.error.message, "Invalid API key provided");
+    }
+
+    #[test]
+    fn parse_error_response_fallback_to_raw_text() {
+        // When the body is not valid JSON for OaiErrorResponse, code falls back to raw text
+        let raw = "Service Unavailable";
+        let result = serde_json::from_str::<OaiErrorResponse>(raw);
+        assert!(result.is_err());
+        // The provider code uses .unwrap_or(text) — so raw text is the detail
+    }
+
+    #[test]
+    fn parse_models_response() {
+        let json = serde_json::json!({
+            "data": [
+                { "id": "gpt-4o" },
+                { "id": "gpt-4o-mini" },
+                { "id": "gpt-3.5-turbo" }
+            ]
+        });
+
+        let models: OaiModelsResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(models.data.len(), 3);
+        assert_eq!(models.data[0].id, "gpt-4o");
+        assert_eq!(models.data[1].id, "gpt-4o-mini");
+        assert_eq!(models.data[2].id, "gpt-3.5-turbo");
+
+        // Convert to ModelInfo the same way the provider does
+        let infos: Vec<ModelInfo> = models
+            .data
+            .into_iter()
+            .map(|m| ModelInfo {
+                id: m.id.clone(),
+                name: m.id,
+                provider: ProviderType::OpenAi,
+            })
+            .collect();
+        assert_eq!(infos.len(), 3);
+        assert_eq!(infos[0].name, "gpt-4o");
+        assert_eq!(infos[0].provider, ProviderType::OpenAi);
+    }
+
+    #[test]
+    fn parse_models_response_empty() {
+        let json = serde_json::json!({ "data": [] });
+        let models: OaiModelsResponse = serde_json::from_value(json).unwrap();
+        assert!(models.data.is_empty());
     }
 }

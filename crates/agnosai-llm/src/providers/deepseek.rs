@@ -1,6 +1,8 @@
 //! DeepSeek provider — thin wrapper over the OpenAI-compatible API.
 
-use crate::provider::{InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result};
+use crate::provider::{
+    InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result,
+};
 use crate::providers::openai::OpenAiProvider;
 
 /// DeepSeek LLM provider (OpenAI-compatible).
@@ -38,5 +40,17 @@ mod tests {
     fn provider_type() {
         let p = DeepSeekProvider::new("sk-test".into());
         assert_eq!(p.provider_type(), ProviderType::DeepSeek);
+    }
+
+    #[test]
+    fn base_url_is_deepseek() {
+        let p = DeepSeekProvider::new("sk-test".into());
+        assert_eq!(p.0.base_url(), "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn default_model_is_deepseek_chat() {
+        let p = DeepSeekProvider::new("sk-test".into());
+        assert_eq!(p.0.default_model(), "deepseek-chat");
     }
 }

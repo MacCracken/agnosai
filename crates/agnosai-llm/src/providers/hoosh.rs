@@ -1,6 +1,8 @@
 //! Hoosh gateway provider — thin wrapper over the OpenAI-compatible API.
 
-use crate::provider::{InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result};
+use crate::provider::{
+    InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result,
+};
 use crate::providers::openai::OpenAiProvider;
 
 /// Hoosh LLM gateway provider (OpenAI-compatible).
@@ -58,5 +60,31 @@ mod tests {
     fn provider_type_custom_url() {
         let p = HooshProvider::with_base_url("http://remote:9090".into());
         assert_eq!(p.provider_type(), ProviderType::Hoosh);
+    }
+
+    #[test]
+    fn base_url_default() {
+        let p = HooshProvider::new();
+        assert_eq!(p.0.base_url(), "http://localhost:8088");
+    }
+
+    #[test]
+    fn base_url_custom() {
+        let p = HooshProvider::with_base_url("http://gateway:8088".into());
+        assert_eq!(p.0.base_url(), "http://gateway:8088");
+    }
+
+    #[test]
+    fn default_model_is_default() {
+        let p = HooshProvider::new();
+        assert_eq!(p.0.default_model(), "default");
+    }
+
+    #[test]
+    fn default_trait_matches_new() {
+        let p1 = HooshProvider::new();
+        let p2 = HooshProvider::default();
+        assert_eq!(p1.0.base_url(), p2.0.base_url());
+        assert_eq!(p1.0.default_model(), p2.0.default_model());
     }
 }

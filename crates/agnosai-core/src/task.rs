@@ -103,3 +103,165 @@ impl Default for ProcessMode {
         Self::Sequential
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn task_new_generates_unique_ids() {
+        let t1 = Task::new("task one");
+        let t2 = Task::new("task two");
+        assert_ne!(t1.id, t2.id);
+    }
+
+    #[test]
+    fn task_new_sets_correct_defaults() {
+        let t = Task::new("do something");
+        assert_eq!(t.description, "do something");
+        assert!(t.expected_output.is_none());
+        assert!(t.assigned_agent.is_none());
+        assert_eq!(t.priority, TaskPriority::Normal);
+        assert_eq!(t.status, TaskStatus::Pending);
+        assert!(t.dependencies.is_empty());
+        assert!(t.context.is_empty());
+    }
+
+    #[test]
+    fn task_priority_ordering() {
+        assert!(TaskPriority::Critical > TaskPriority::High);
+        assert!(TaskPriority::High > TaskPriority::Normal);
+        assert!(TaskPriority::Normal > TaskPriority::Low);
+        assert!(TaskPriority::Low > TaskPriority::Background);
+    }
+
+    #[test]
+    fn task_priority_default_is_normal() {
+        assert_eq!(TaskPriority::default(), TaskPriority::Normal);
+    }
+
+    #[test]
+    fn task_status_default_is_pending() {
+        assert_eq!(TaskStatus::default(), TaskStatus::Pending);
+    }
+
+    #[test]
+    fn task_status_serde_round_trip_all_variants() {
+        let variants = [
+            TaskStatus::Pending,
+            TaskStatus::Queued,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let restored: TaskStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, restored);
+        }
+    }
+
+    #[test]
+    fn process_mode_serde_sequential() {
+        let mode = ProcessMode::Sequential;
+        let json = serde_json::to_string(&mode).unwrap();
+        let restored: ProcessMode = serde_json::from_str(&json).unwrap();
+        assert!(matches!(restored, ProcessMode::Sequential));
+    }
+
+    #[test]
+    fn process_mode_serde_hierarchical() {
+        let manager_id = Uuid::new_v4();
+        let mode = ProcessMode::Hierarchical { manager: manager_id };
+        let json = serde_json::to_string(&mode).unwrap();
+        let restored: ProcessMode = serde_json::from_str(&json).unwrap();
+        match restored {
+            ProcessMode::Hierarchical { manager } => assert_eq!(manager, manager_id),
+            _ => panic!("expected Hierarchical"),
+        }
+    }
+
+    #[test]
+    fn process_mode_serde_dag() {
+        let mode = ProcessMode::Dag;
+        let json = serde_json::to_string(&mode).unwrap();
+        let restored: ProcessMode = serde_json::from_str(&json).unwrap();
+        assert!(matches!(restored, ProcessMode::Dag));
+    }
+
+    #[test]
+    fn process_mode_serde_parallel() {
+        let mode = ProcessMode::Parallel {
+            max_concurrency: 8,
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let restored: ProcessMode = serde_json::from_str(&json).unwrap();
+        match restored {
+            ProcessMode::Parallel { max_concurrency } => assert_eq!(max_concurrency, 8),
+            _ => panic!("expected Parallel"),
+        }
+    }
+
+    #[test]
+    fn process_mode_default_is_sequential() {
+        assert!(matches!(ProcessMode::default(), ProcessMode::Sequential));
+    }
+
+    #[test]
+    fn task_dag_serde_round_trip() {
+        let t = Task::new("subtask");
+        let tid = "t1".to_string();
+        let mut tasks = HashMap::new();
+        tasks.insert(tid.clone(), t);
+        let dag = TaskDAG {
+            tasks,
+            edges: vec![("t1".into(), "t2".into())],
+            process: ProcessMode::Dag,
+        };
+        let json = serde_json::to_string(&dag).unwrap();
+        let restored: TaskDAG = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tasks.len(), 1);
+        assert!(restored.tasks.contains_key("t1"));
+        assert_eq!(restored.edges.len(), 1);
+        assert_eq!(restored.edges[0], ("t1".into(), "t2".into()));
+        assert!(matches!(restored.process, ProcessMode::Dag));
+    }
+
+    #[test]
+    fn task_result_serde_round_trip() {
+        let task_id = Uuid::new_v4();
+        let mut meta = HashMap::new();
+        meta.insert(
+            "key".to_string(),
+            serde_json::Value::String("value".into()),
+        );
+        let result = TaskResult {
+            task_id,
+            output: "all good".into(),
+            status: TaskStatus::Completed,
+            metadata: meta,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: TaskResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.task_id, task_id);
+        assert_eq!(restored.output, "all good");
+        assert_eq!(restored.status, TaskStatus::Completed);
+        assert_eq!(
+            restored.metadata.get("key").unwrap(),
+            &serde_json::Value::String("value".into())
+        );
+    }
+
+    #[test]
+    fn task_serde_round_trip() {
+        let t = Task::new("round trip test");
+        let json = serde_json::to_string(&t).unwrap();
+        let restored: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.id, t.id);
+        assert_eq!(restored.description, "round trip test");
+        assert_eq!(restored.priority, TaskPriority::Normal);
+        assert_eq!(restored.status, TaskStatus::Pending);
+    }
+}

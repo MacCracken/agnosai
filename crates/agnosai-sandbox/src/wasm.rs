@@ -313,4 +313,88 @@ mod tests {
         let result = sandbox.load_module_from_file(Path::new("/nonexistent/module.wasm"));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn execute_wasi_module_captures_stdout() {
+        // Minimal WASI module that writes "hello" to stdout via fd_write.
+        let wat = r#"(module
+            (import "wasi_snapshot_preview1" "fd_write"
+                (func $fd_write (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "hello")
+            (data (i32.const 8) "\00\00\00\00")
+            (data (i32.const 12) "\05\00\00\00")
+            (func (export "_start")
+                (drop (call $fd_write
+                    (i32.const 1)
+                    (i32.const 8)
+                    (i32.const 1)
+                    (i32.const 20)
+                ))
+            )
+        )"#;
+
+        let wasm_bytes = wat::parse_str(wat).expect("WAT should parse");
+        let sandbox = WasmSandbox::new().expect("should create sandbox");
+        let module = sandbox
+            .load_module(&wasm_bytes)
+            .expect("should load module");
+        let result = sandbox
+            .execute(&module, "")
+            .expect("should execute module");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello");
+    }
+
+    #[test]
+    fn execute_wasi_module_with_stdin_input() {
+        // Module that reads from stdin and writes what it read to stdout.
+        // We keep it simple: read a fixed number of bytes and echo them.
+        let wat = r#"(module
+            (import "wasi_snapshot_preview1" "fd_read"
+                (func $fd_read (param i32 i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_write"
+                (func $fd_write (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "_start")
+                ;; Set up iov for reading: buffer at offset 100, length 5
+                (i32.store (i32.const 0) (i32.const 100))  ;; iov_base
+                (i32.store (i32.const 4) (i32.const 5))    ;; iov_len
+
+                ;; fd_read(stdin=0, iovs=0, iovs_count=1, nread_ptr=200)
+                (drop (call $fd_read
+                    (i32.const 0)
+                    (i32.const 0)
+                    (i32.const 1)
+                    (i32.const 200)
+                ))
+
+                ;; Now write what we read: set up write iov at offset 0
+                ;; pointing to the buffer at 100, with length from nread at 200
+                (i32.store (i32.const 0) (i32.const 100))         ;; iov_base
+                (i32.store (i32.const 4) (i32.load (i32.const 200))) ;; iov_len = nread
+
+                ;; fd_write(stdout=1, iovs=0, iovs_count=1, nwritten_ptr=204)
+                (drop (call $fd_write
+                    (i32.const 1)
+                    (i32.const 0)
+                    (i32.const 1)
+                    (i32.const 204)
+                ))
+            )
+        )"#;
+
+        let wasm_bytes = wat::parse_str(wat).expect("WAT should parse");
+        let sandbox = WasmSandbox::new().expect("should create sandbox");
+        let module = sandbox
+            .load_module(&wasm_bytes)
+            .expect("should load module");
+        let result = sandbox
+            .execute(&module, "world")
+            .expect("should execute module");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "world");
+    }
 }

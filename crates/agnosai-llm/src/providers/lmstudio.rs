@@ -1,6 +1,8 @@
 //! LM Studio provider — thin wrapper over the OpenAI-compatible API.
 
-use crate::provider::{InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result};
+use crate::provider::{
+    InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType, Result,
+};
 use crate::providers::openai::OpenAiProvider;
 
 /// LM Studio LLM provider (local, OpenAI-compatible).
@@ -44,5 +46,25 @@ mod tests {
     fn provider_type() {
         let p = LmStudioProvider::new();
         assert_eq!(p.provider_type(), ProviderType::LmStudio);
+    }
+
+    #[test]
+    fn base_url_is_localhost() {
+        let p = LmStudioProvider::new();
+        assert_eq!(p.0.base_url(), "http://localhost:1234");
+    }
+
+    #[test]
+    fn default_model_is_default() {
+        let p = LmStudioProvider::new();
+        assert_eq!(p.0.default_model(), "default");
+    }
+
+    #[test]
+    fn default_trait_matches_new() {
+        let p1 = LmStudioProvider::new();
+        let p2 = LmStudioProvider::default();
+        assert_eq!(p1.0.base_url(), p2.0.base_url());
+        assert_eq!(p1.0.default_model(), p2.0.default_model());
     }
 }
