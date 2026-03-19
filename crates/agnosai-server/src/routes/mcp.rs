@@ -1,9 +1,9 @@
 //! MCP (Model Context Protocol) server — JSON-RPC 2.0 over HTTP POST.
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use agnosai_tools::ToolInput;
 
@@ -167,9 +167,7 @@ async fn handle_tools_call(id: Value, params: &Value, state: &SharedState) -> Js
             }),
         )
     } else {
-        let text = output
-            .error
-            .unwrap_or_else(|| "Unknown error".to_string());
+        let text = output.error.unwrap_or_else(|| "Unknown error".to_string());
         JsonRpcResponse::success(
             id,
             json!({
@@ -185,10 +183,10 @@ mod tests {
     use super::*;
     use crate::state::{AppState, SharedState};
     use agnosai_orchestrator::Orchestrator;
-    use agnosai_tools::builtin::echo::EchoTool;
     use agnosai_tools::ToolRegistry;
-    use axum::http::{Request, StatusCode};
+    use agnosai_tools::builtin::echo::EchoTool;
     use axum::Router;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -260,7 +258,7 @@ mod tests {
         let tools = json["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "echo");
-        assert!(tools[0]["description"].as_str().unwrap().len() > 0);
+        assert!(!tools[0]["description"].as_str().unwrap().is_empty());
         // Verify inputSchema structure
         let schema = &tools[0]["inputSchema"];
         assert_eq!(schema["type"], "object");
@@ -308,10 +306,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["result"]["isError"], true);
         let content = json["result"]["content"].as_array().unwrap();
-        assert!(content[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("not found"));
+        assert!(content[0]["text"].as_str().unwrap().contains("not found"));
     }
 
     #[tokio::test]

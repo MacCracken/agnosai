@@ -162,9 +162,7 @@ impl CrewStateManager {
         }
 
         let run_barriers = self.barriers.entry(run_id).or_default();
-        let arrived = run_barriers
-            .entry(barrier_name.to_string())
-            .or_default();
+        let arrived = run_barriers.entry(barrier_name.to_string()).or_default();
         arrived.insert(node_id);
 
         let total = state.participating_nodes.len();
@@ -420,10 +418,7 @@ mod tests {
         let mut mgr = CrewStateManager::new();
         let run = mgr.create_run(nodes(&["a"]), 5);
         assert!(mgr.fail(run, "oom".into()));
-        assert_eq!(
-            mgr.get(run).unwrap().phase,
-            CrewPhase::Failed("oom".into())
-        );
+        assert_eq!(mgr.get(run).unwrap().phase, CrewPhase::Failed("oom".into()));
     }
 
     #[test]

@@ -9,19 +9,10 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 /// JWT/auth configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
     pub enabled: bool,
     pub secret: String,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            secret: String::new(),
-        }
-    }
 }
 
 /// Middleware that checks for a valid Bearer token.
@@ -61,11 +52,11 @@ pub async fn auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::body::Body;
     use axum::http::Request;
     use axum::middleware;
     use axum::routing::get;
-    use axum::Router;
     use tower::ServiceExt;
 
     async fn handler() -> &'static str {
@@ -73,12 +64,14 @@ mod tests {
     }
 
     fn test_router(config: AuthConfig) -> Router {
-        Router::new().route("/test", get(handler)).layer(
-            middleware::from_fn(move |req: Request<Body>, next: Next| {
-                let cfg = config.clone();
-                async move { auth_middleware(cfg, req, next).await }
-            }),
-        )
+        Router::new()
+            .route("/test", get(handler))
+            .layer(middleware::from_fn(
+                move |req: Request<Body>, next: Next| {
+                    let cfg = config.clone();
+                    async move { auth_middleware(cfg, req, next).await }
+                },
+            ))
     }
 
     #[tokio::test]

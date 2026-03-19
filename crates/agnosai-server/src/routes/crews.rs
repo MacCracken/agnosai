@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -54,9 +54,7 @@ pub async fn create_crew(
             }
         }
         Some("dag") => ProcessMode::Dag,
-        Some("parallel") => ProcessMode::Parallel {
-            max_concurrency: 4,
-        },
+        Some("parallel") => ProcessMode::Parallel { max_concurrency: 4 },
         _ => ProcessMode::Sequential,
     };
 
@@ -96,14 +94,14 @@ pub async fn create_crew(
                 .map(|r| TaskResultResponse {
                     task_id: r.task_id,
                     output: r.output.clone(),
-                    status: serde_json::to_value(&r.status)
+                    status: serde_json::to_value(r.status)
                         .ok()
                         .and_then(|v| v.as_str().map(String::from))
                         .unwrap_or_else(|| "unknown".to_string()),
                 })
                 .collect();
 
-            let status = serde_json::to_value(&crew_state.status)
+            let status = serde_json::to_value(crew_state.status)
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_else(|| "unknown".to_string());
@@ -136,8 +134,8 @@ mod tests {
     use crate::state::{AppState, SharedState};
     use agnosai_orchestrator::Orchestrator;
     use agnosai_tools::ToolRegistry;
-    use axum::http::{Request, StatusCode};
     use axum::Router;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -177,7 +175,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["crew_id"].is_string());
         assert!(json["status"].is_string());
@@ -201,7 +201,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["status"], "completed");
         assert_eq!(json["results"].as_array().unwrap().len(), 0);

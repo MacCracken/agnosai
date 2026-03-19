@@ -5,7 +5,7 @@
 
 use crate::native::{NativeTool, ParameterSchema, ToolInput, ToolOutput, ToolSchema};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -19,6 +19,12 @@ const DEFAULT_BASE_URL: &str = "http://localhost:8420";
 pub struct SynapseInfer {
     client: Client,
     base_url: String,
+}
+
+impl Default for SynapseInfer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SynapseInfer {
@@ -129,6 +135,12 @@ pub struct SynapseListModels {
     base_url: String,
 }
 
+impl Default for SynapseListModels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SynapseListModels {
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
@@ -159,10 +171,7 @@ impl NativeTool for SynapseListModels {
         }
     }
 
-    fn execute(
-        &self,
-        _input: ToolInput,
-    ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+    fn execute(&self, _input: ToolInput) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
         Box::pin(async move {
             let url = format!("{}/v1/models", self.base_url);
             match self.client.get(&url).send().await {
@@ -184,6 +193,12 @@ impl NativeTool for SynapseListModels {
 pub struct SynapseStatus {
     client: Client,
     base_url: String,
+}
+
+impl Default for SynapseStatus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SynapseStatus {
@@ -216,10 +231,7 @@ impl NativeTool for SynapseStatus {
         }
     }
 
-    fn execute(
-        &self,
-        _input: ToolInput,
-    ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+    fn execute(&self, _input: ToolInput) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
         Box::pin(async move {
             let url = format!("{}/system/status", self.base_url);
             match self.client.get(&url).send().await {
@@ -256,11 +268,19 @@ mod tests {
         assert_eq!(schema.name, "synapse_infer");
         assert_eq!(schema.parameters.len(), 4);
 
-        let model = schema.parameters.iter().find(|p| p.name == "model").unwrap();
+        let model = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "model")
+            .unwrap();
         assert_eq!(model.param_type, "string");
         assert!(model.required);
 
-        let prompt = schema.parameters.iter().find(|p| p.name == "prompt").unwrap();
+        let prompt = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "prompt")
+            .unwrap();
         assert_eq!(prompt.param_type, "string");
         assert!(prompt.required);
 

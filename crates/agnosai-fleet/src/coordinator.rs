@@ -241,10 +241,7 @@ mod tests {
         coord.fan_out(tasks.clone(), assignments);
 
         assert!(coord.task_completed(tasks[0].0));
-        assert_eq!(
-            coord.tasks[&tasks[0].0].status,
-            FleetTaskStatus::Completed
-        );
+        assert_eq!(coord.tasks[&tasks[0].0].status, FleetTaskStatus::Completed);
     }
 
     #[test]
@@ -260,10 +257,7 @@ mod tests {
         coord.fan_out(tasks.clone(), vec![(tasks[0].0, "n".into())]);
 
         assert_eq!(coord.task_failed(tasks[0].0), FailoverAction::Retry);
-        assert_eq!(
-            coord.tasks[&tasks[0].0].status,
-            FleetTaskStatus::Reassigned
-        );
+        assert_eq!(coord.tasks[&tasks[0].0].status, FleetTaskStatus::Reassigned);
     }
 
     #[test]
@@ -280,7 +274,10 @@ mod tests {
     #[test]
     fn task_failed_unknown() {
         let mut coord = FleetCoordinator::new();
-        assert_eq!(coord.task_failed(Uuid::new_v4()), FailoverAction::UnknownTask);
+        assert_eq!(
+            coord.task_failed(Uuid::new_v4()),
+            FailoverAction::UnknownTask
+        );
     }
 
     #[test]

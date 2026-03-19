@@ -179,7 +179,7 @@ impl CrewRunner {
                 remaining.into_iter().partition(|id| {
                     dep_sets
                         .get(id)
-                        .map_or(true, |deps| deps.is_subset(&completed))
+                        .is_none_or(|deps| deps.is_subset(&completed))
                 });
 
             if ready.is_empty() {

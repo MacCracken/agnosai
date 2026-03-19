@@ -63,10 +63,10 @@ fn match_score(member: &TeamMember, agent: &AgentDefinition) -> f64 {
     }
 
     // Complexity matching.
-    if let Some(ref requested) = member.complexity {
-        if agent.complexity.to_lowercase() == requested.to_lowercase() {
-            score += 2.0;
-        }
+    if let Some(ref requested) = member.complexity
+        && agent.complexity.to_lowercase() == requested.to_lowercase()
+    {
+        score += 2.0;
     }
 
     score

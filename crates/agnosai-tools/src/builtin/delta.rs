@@ -5,7 +5,7 @@
 
 use crate::native::{NativeTool, ParameterSchema, ToolInput, ToolOutput, ToolSchema};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -19,6 +19,12 @@ const DEFAULT_BASE_URL: &str = "http://localhost:8070";
 pub struct DeltaListRepos {
     client: Client,
     base_url: String,
+}
+
+impl Default for DeltaListRepos {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DeltaListRepos {
@@ -51,10 +57,7 @@ impl NativeTool for DeltaListRepos {
         }
     }
 
-    fn execute(
-        &self,
-        _input: ToolInput,
-    ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+    fn execute(&self, _input: ToolInput) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
         Box::pin(async move {
             let url = format!("{}/api/v1/repos", self.base_url);
             match self.client.get(&url).send().await {
@@ -76,6 +79,12 @@ impl NativeTool for DeltaListRepos {
 pub struct DeltaTriggerPipeline {
     client: Client,
     base_url: String,
+}
+
+impl Default for DeltaTriggerPipeline {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DeltaTriggerPipeline {
@@ -163,6 +172,12 @@ impl NativeTool for DeltaTriggerPipeline {
 pub struct DeltaGetPipeline {
     client: Client,
     base_url: String,
+}
+
+impl Default for DeltaGetPipeline {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DeltaGetPipeline {
@@ -286,7 +301,11 @@ mod tests {
         assert_eq!(schema.name, "delta_trigger_pipeline");
         assert_eq!(schema.parameters.len(), 3);
 
-        let owner = schema.parameters.iter().find(|p| p.name == "owner").unwrap();
+        let owner = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "owner")
+            .unwrap();
         assert_eq!(owner.param_type, "string");
         assert!(owner.required);
 
@@ -353,7 +372,11 @@ mod tests {
         assert_eq!(schema.name, "delta_get_pipeline");
         assert_eq!(schema.parameters.len(), 3);
 
-        let owner = schema.parameters.iter().find(|p| p.name == "owner").unwrap();
+        let owner = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "owner")
+            .unwrap();
         assert_eq!(owner.param_type, "string");
         assert!(owner.required);
 

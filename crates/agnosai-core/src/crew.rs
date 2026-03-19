@@ -38,20 +38,15 @@ pub struct CrewState {
     pub results: Vec<TaskResult>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CrewStatus {
+    #[default]
     Pending,
     Running,
     Completed,
     Failed,
     Cancelled,
-}
-
-impl Default for CrewStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 #[cfg(test)]

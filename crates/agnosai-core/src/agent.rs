@@ -37,21 +37,16 @@ impl AgentDefinition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
+    #[default]
     Idle,
     Assigned,
     Working,
     Blocked,
     Completed,
     Failed,
-}
-
-impl Default for AgentState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 #[cfg(test)]
@@ -180,7 +175,10 @@ mod tests {
 
     #[test]
     fn agent_state_serde_snake_case() {
-        assert_eq!(serde_json::to_string(&AgentState::Idle).unwrap(), "\"idle\"");
+        assert_eq!(
+            serde_json::to_string(&AgentState::Idle).unwrap(),
+            "\"idle\""
+        );
         assert_eq!(
             serde_json::to_string(&AgentState::Assigned).unwrap(),
             "\"assigned\""

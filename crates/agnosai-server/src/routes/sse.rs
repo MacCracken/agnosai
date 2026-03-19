@@ -39,8 +39,8 @@ mod tests {
     use crate::state::{AppState, SharedState};
     use agnosai_orchestrator::Orchestrator;
     use agnosai_tools::ToolRegistry;
-    use axum::http::{Request, StatusCode};
     use axum::Router;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -60,7 +60,7 @@ mod tests {
         let crew_id = uuid::Uuid::new_v4();
         let response = app
             .oneshot(
-                Request::get(&format!("/api/v1/crews/{crew_id}/stream"))
+                Request::get(format!("/api/v1/crews/{crew_id}/stream"))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )

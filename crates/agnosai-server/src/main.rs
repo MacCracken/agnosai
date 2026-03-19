@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use agnosai_orchestrator::Orchestrator;
+use agnosai_tools::ToolRegistry;
 use agnosai_tools::builtin::echo::EchoTool;
 use agnosai_tools::builtin::json_transform::JsonTransformTool;
-use agnosai_tools::ToolRegistry;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
-use agnosai_server::{router, AppState, SharedState};
+use agnosai_server::{AppState, SharedState, router};
 
 #[tokio::main]
 async fn main() -> Result<()> {

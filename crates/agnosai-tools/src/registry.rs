@@ -35,7 +35,10 @@ impl ToolRegistry {
 
     /// Return the schemas of all registered tools (unordered).
     pub fn list(&self) -> Vec<ToolSchema> {
-        self.tools.iter().map(|entry| entry.value().schema()).collect()
+        self.tools
+            .iter()
+            .map(|entry| entry.value().schema())
+            .collect()
     }
 
     /// Check whether a tool with the given name is registered.

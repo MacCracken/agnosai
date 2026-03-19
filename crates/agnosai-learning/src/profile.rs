@@ -55,11 +55,7 @@ impl PerformanceProfile {
     }
 
     /// Success rate for a specific action type.
-    pub fn success_rate_for_action(
-        &self,
-        agent_key: &str,
-        action_type: &str,
-    ) -> Option<f64> {
+    pub fn success_rate_for_action(&self, agent_key: &str, action_type: &str) -> Option<f64> {
         let records = self.records.get(agent_key)?;
         let filtered: Vec<_> = records
             .iter()
@@ -83,11 +79,7 @@ impl PerformanceProfile {
     }
 
     /// Average duration for a specific action type.
-    pub fn avg_duration_for_action(
-        &self,
-        agent_key: &str,
-        action_type: &str,
-    ) -> Option<Duration> {
+    pub fn avg_duration_for_action(&self, agent_key: &str, action_type: &str) -> Option<Duration> {
         let records = self.records.get(agent_key)?;
         let filtered: Vec<_> = records
             .iter()
@@ -137,14 +129,7 @@ mod tests {
         profile.record("agent-a", "build", Duration::from_millis(150), false);
 
         assert!((profile.success_rate_for_action("agent-a", "build").unwrap() - 0.5).abs() < 1e-9);
-        assert!(
-            (profile
-                .success_rate_for_action("agent-a", "test")
-                .unwrap()
-                - 0.0)
-                .abs()
-                < 1e-9
-        );
+        assert!((profile.success_rate_for_action("agent-a", "test").unwrap() - 0.0).abs() < 1e-9);
     }
 
     #[test]
@@ -164,9 +149,7 @@ mod tests {
         profile.record("agent-a", "test", Duration::from_millis(300), true);
         profile.record("agent-a", "build", Duration::from_millis(200), true);
 
-        let avg = profile
-            .avg_duration_for_action("agent-a", "build")
-            .unwrap();
+        let avg = profile.avg_duration_for_action("agent-a", "build").unwrap();
         assert_eq!(avg, Duration::from_millis(150));
     }
 
@@ -184,13 +167,17 @@ mod tests {
     fn empty_agent_returns_none() {
         let profile = PerformanceProfile::new();
         assert!(profile.success_rate("nonexistent").is_none());
-        assert!(profile
-            .success_rate_for_action("nonexistent", "build")
-            .is_none());
+        assert!(
+            profile
+                .success_rate_for_action("nonexistent", "build")
+                .is_none()
+        );
         assert!(profile.avg_duration("nonexistent").is_none());
-        assert!(profile
-            .avg_duration_for_action("nonexistent", "build")
-            .is_none());
+        assert!(
+            profile
+                .avg_duration_for_action("nonexistent", "build")
+                .is_none()
+        );
     }
 
     #[test]
@@ -198,11 +185,15 @@ mod tests {
         let mut profile = PerformanceProfile::new();
         profile.record("agent-a", "build", Duration::from_millis(100), true);
 
-        assert!(profile
-            .success_rate_for_action("agent-a", "deploy")
-            .is_none());
-        assert!(profile
-            .avg_duration_for_action("agent-a", "deploy")
-            .is_none());
+        assert!(
+            profile
+                .success_rate_for_action("agent-a", "deploy")
+                .is_none()
+        );
+        assert!(
+            profile
+                .avg_duration_for_action("agent-a", "deploy")
+                .is_none()
+        );
     }
 }

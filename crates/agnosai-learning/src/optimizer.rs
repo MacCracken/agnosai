@@ -84,8 +84,7 @@ mod tests {
     fn update_with_existing_next_state() {
         let mut q = QLearner::new(0.5, 0.9);
         // Set up Q(s2, a1) = 2.0
-        q.q_table
-            .insert(("s2".to_string(), "a1".to_string()), 2.0);
+        q.q_table.insert(("s2".to_string(), "a1".to_string()), 2.0);
 
         q.update("s1", "a1", 1.0, "s2", &["a1", "a2"]);
         // Q(s1,a1) = 0 + 0.5 * (1.0 + 0.9*2.0 - 0) = 0.5 * 2.8 = 1.4
@@ -96,12 +95,9 @@ mod tests {
     #[test]
     fn best_action_selects_highest_q() {
         let mut q = QLearner::new(0.1, 0.9);
-        q.q_table
-            .insert(("s1".to_string(), "a1".to_string()), 0.3);
-        q.q_table
-            .insert(("s1".to_string(), "a2".to_string()), 0.9);
-        q.q_table
-            .insert(("s1".to_string(), "a3".to_string()), 0.5);
+        q.q_table.insert(("s1".to_string(), "a1".to_string()), 0.3);
+        q.q_table.insert(("s1".to_string(), "a2".to_string()), 0.9);
+        q.q_table.insert(("s1".to_string(), "a3".to_string()), 0.5);
 
         let best = q.best_action("s1", &["a1", "a2", "a3"]).unwrap();
         assert_eq!(best, "a2");

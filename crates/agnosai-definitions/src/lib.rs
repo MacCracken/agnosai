@@ -10,5 +10,5 @@ pub mod packaging;
 pub mod versioning;
 
 // Re-exports for convenience.
-pub use loader::{builtin_presets, PresetSpec};
+pub use loader::{PresetSpec, builtin_presets};
 pub use packaging::AgnosPackage;

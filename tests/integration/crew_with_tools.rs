@@ -133,20 +133,30 @@ async fn crew_with_tools_dag_pipeline() {
     );
 
     // Verify task outputs contain their descriptions (placeholder execution).
-    let gather_result = state.results.iter().find(|r| r.task_id == gather_id).unwrap();
-    assert!(gather_result
-        .output
-        .contains("Gather and document project requirements"));
+    let gather_result = state
+        .results
+        .iter()
+        .find(|r| r.task_id == gather_id)
+        .unwrap();
+    assert!(
+        gather_result
+            .output
+            .contains("Gather and document project requirements")
+    );
 
-    let design_result = state.results.iter().find(|r| r.task_id == design_id).unwrap();
-    assert!(design_result
-        .output
-        .contains("Design system architecture"));
+    let design_result = state
+        .results
+        .iter()
+        .find(|r| r.task_id == design_id)
+        .unwrap();
+    assert!(design_result.output.contains("Design system architecture"));
 
-    let review_result = state.results.iter().find(|r| r.task_id == review_id).unwrap();
-    assert!(review_result
-        .output
-        .contains("Review all deliverables"));
+    let review_result = state
+        .results
+        .iter()
+        .find(|r| r.task_id == review_id)
+        .unwrap();
+    assert!(review_result.output.contains("Review all deliverables"));
 }
 
 #[tokio::test]

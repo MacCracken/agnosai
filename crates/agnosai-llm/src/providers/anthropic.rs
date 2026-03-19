@@ -499,7 +499,7 @@ mod tests {
     fn list_models_returns_known_family() {
         // Anthropic list_models is a static list — verify it at least returns entries
         // We can't call async in a sync test easily, but we verify the static data
-        let models = vec![
+        let models = [
             ModelInfo {
                 id: "claude-sonnet-4-20250514".into(),
                 name: "Claude Sonnet 4".into(),

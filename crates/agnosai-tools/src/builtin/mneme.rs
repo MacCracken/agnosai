@@ -5,7 +5,7 @@
 
 use crate::native::{NativeTool, ParameterSchema, ToolInput, ToolOutput, ToolSchema};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -19,6 +19,12 @@ const DEFAULT_BASE_URL: &str = "http://localhost:8400";
 pub struct MnemeSearch {
     client: Client,
     base_url: String,
+}
+
+impl Default for MnemeSearch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MnemeSearch {
@@ -100,6 +106,12 @@ pub struct MnemeGetNote {
     base_url: String,
 }
 
+impl Default for MnemeGetNote {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MnemeGetNote {
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
@@ -162,6 +174,12 @@ impl NativeTool for MnemeGetNote {
 pub struct MnemeCreateNote {
     client: Client,
     base_url: String,
+}
+
+impl Default for MnemeCreateNote {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MnemeCreateNote {
@@ -270,11 +288,19 @@ mod tests {
         assert_eq!(schema.name, "mneme_search");
         assert_eq!(schema.parameters.len(), 2);
 
-        let query = schema.parameters.iter().find(|p| p.name == "query").unwrap();
+        let query = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "query")
+            .unwrap();
         assert_eq!(query.param_type, "string");
         assert!(query.required);
 
-        let limit = schema.parameters.iter().find(|p| p.name == "limit").unwrap();
+        let limit = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "limit")
+            .unwrap();
         assert_eq!(limit.param_type, "number");
         assert!(!limit.required);
     }
@@ -345,7 +371,11 @@ mod tests {
         assert_eq!(schema.name, "mneme_create_note");
         assert_eq!(schema.parameters.len(), 3);
 
-        let title = schema.parameters.iter().find(|p| p.name == "title").unwrap();
+        let title = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "title")
+            .unwrap();
         assert_eq!(title.param_type, "string");
         assert!(title.required);
 

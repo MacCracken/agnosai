@@ -1,5 +1,5 @@
 use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
@@ -15,8 +15,8 @@ mod tests {
     use crate::state::{AppState, SharedState};
     use agnosai_orchestrator::Orchestrator;
     use agnosai_tools::ToolRegistry;
-    use axum::http::{Request, StatusCode};
     use axum::Router;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -34,11 +34,17 @@ mod tests {
     async fn get_health_returns_200() {
         let app = test_app().await;
         let response = app
-            .oneshot(Request::get("/health").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
     }
@@ -47,11 +53,17 @@ mod tests {
     async fn get_ready_returns_200_with_version() {
         let app = test_app().await;
         let response = app
-            .oneshot(Request::get("/ready").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ready");
         assert_eq!(json["version"], "0.1.0");

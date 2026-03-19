@@ -1,6 +1,6 @@
-use axum::extract::State;
-use axum::Json;
 use agnosai_tools::ToolSchema;
+use axum::Json;
+use axum::extract::State;
 
 use crate::state::SharedState;
 
@@ -12,11 +12,11 @@ pub async fn list_tools(State(state): State<SharedState>) -> Json<Vec<ToolSchema
 mod tests {
     use crate::state::{AppState, SharedState};
     use agnosai_orchestrator::Orchestrator;
+    use agnosai_tools::ToolRegistry;
     use agnosai_tools::builtin::echo::EchoTool;
     use agnosai_tools::builtin::json_transform::JsonTransformTool;
-    use agnosai_tools::ToolRegistry;
-    use axum::http::{Request, StatusCode};
     use axum::Router;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -44,7 +44,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 2);

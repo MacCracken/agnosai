@@ -100,10 +100,9 @@ impl GpuScheduler {
     /// Returns `true` if the allocation existed and was released.
     pub fn release(&mut self, task_id: Uuid) -> bool {
         if let Some(alloc) = self.allocations.remove(&task_id) {
-            self.devices[alloc.device_index].vram_used_mb =
-                self.devices[alloc.device_index]
-                    .vram_used_mb
-                    .saturating_sub(alloc.vram_mb);
+            self.devices[alloc.device_index].vram_used_mb = self.devices[alloc.device_index]
+                .vram_used_mb
+                .saturating_sub(alloc.vram_mb);
             true
         } else {
             false

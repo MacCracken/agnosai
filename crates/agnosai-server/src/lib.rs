@@ -11,8 +11,8 @@ pub mod state;
 pub use auth::AuthConfig;
 pub use state::{AppState, SharedState};
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 
 /// Build the complete application router with all routes.
 pub fn router(state: SharedState) -> Router {

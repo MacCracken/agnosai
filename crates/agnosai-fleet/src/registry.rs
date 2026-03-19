@@ -193,8 +193,7 @@ impl NodeRegistry {
         self.nodes
             .values()
             .filter(|n| {
-                n.status == NodeStatus::Online
-                    && n.capabilities.iter().any(|c| c == capability)
+                n.status == NodeStatus::Online && n.capabilities.iter().any(|c| c == capability)
             })
             .collect()
     }
@@ -250,8 +249,7 @@ mod tests {
 
     #[test]
     fn status_transitions() {
-        let mut reg =
-            NodeRegistry::with_ttl(Duration::from_millis(20), Duration::from_millis(60));
+        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(20), Duration::from_millis(60));
         let id = reg.register("n".into(), "a".into(), 0, 0, vec![]);
 
         assert_eq!(reg.get(&id).unwrap().status, NodeStatus::Online);
@@ -269,8 +267,7 @@ mod tests {
 
     #[test]
     fn heartbeat_resets_to_online() {
-        let mut reg =
-            NodeRegistry::with_ttl(Duration::from_millis(10), Duration::from_millis(50));
+        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(10), Duration::from_millis(50));
         let id = reg.register("n".into(), "a".into(), 0, 0, vec![]);
 
         std::thread::sleep(Duration::from_millis(15));
@@ -292,8 +289,7 @@ mod tests {
 
     #[test]
     fn list_online_filters_correctly() {
-        let mut reg =
-            NodeRegistry::with_ttl(Duration::from_millis(10), Duration::from_millis(50));
+        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(10), Duration::from_millis(50));
         let id1 = reg.register("a".into(), "a".into(), 0, 0, vec![]);
         let _id2 = reg.register("b".into(), "b".into(), 0, 0, vec![]);
 
@@ -332,8 +328,7 @@ mod tests {
 
     #[test]
     fn count_and_count_online() {
-        let mut reg =
-            NodeRegistry::with_ttl(Duration::from_millis(10), Duration::from_millis(50));
+        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(10), Duration::from_millis(50));
         assert_eq!(reg.count(), 0);
         assert_eq!(reg.count_online(), 0);
 

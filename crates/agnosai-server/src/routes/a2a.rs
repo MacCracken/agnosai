@@ -1,8 +1,8 @@
 //! A2A (Agent-to-Agent) protocol endpoints for cross-system task delegation.
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use agnosai_core::{CrewSpec, Task};
@@ -110,8 +110,8 @@ mod tests {
     use crate::state::{AppState, SharedState};
     use agnosai_orchestrator::Orchestrator;
     use agnosai_tools::ToolRegistry;
-    use axum::http::{Request, StatusCode};
     use axum::Router;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
 

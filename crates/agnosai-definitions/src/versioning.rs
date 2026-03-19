@@ -61,11 +61,7 @@ impl VersionStore {
 
     /// Rollback to a previous version by copying it as a new latest version.
     /// Returns the cloned definition if the target version exists.
-    pub fn rollback(
-        &mut self,
-        agent_key: &str,
-        version: u32,
-    ) -> Option<AgentDefinition> {
+    pub fn rollback(&mut self, agent_key: &str, version: u32) -> Option<AgentDefinition> {
         let old_def = self
             .versions
             .get(agent_key)?

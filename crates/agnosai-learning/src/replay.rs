@@ -194,7 +194,10 @@ mod tests {
             }
         }
         // Should appear in the vast majority of samples.
-        assert!(high_count > 30, "high-priority item appeared {high_count}/50 times");
+        assert!(
+            high_count > 30,
+            "high-priority item appeared {high_count}/50 times"
+        );
     }
 
     #[test]

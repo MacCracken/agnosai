@@ -339,9 +339,7 @@ mod tests {
         let module = sandbox
             .load_module(&wasm_bytes)
             .expect("should load module");
-        let result = sandbox
-            .execute(&module, "")
-            .expect("should execute module");
+        let result = sandbox.execute(&module, "").expect("should execute module");
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "hello");

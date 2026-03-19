@@ -39,37 +39,27 @@ impl Task {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPriority {
     Background = 0,
     Low = 1,
+    #[default]
     Normal = 2,
     High = 3,
     Critical = 4,
 }
 
-impl Default for TaskPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    #[default]
     Pending,
     Queued,
     Running,
     Completed,
     Failed,
     Cancelled,
-}
-
-impl Default for TaskStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,19 +79,18 @@ pub struct TaskDAG {
     pub process: ProcessMode,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessMode {
+    #[default]
     Sequential,
-    Hierarchical { manager: AgentId },
+    Hierarchical {
+        manager: AgentId,
+    },
     Dag,
-    Parallel { max_concurrency: usize },
-}
-
-impl Default for ProcessMode {
-    fn default() -> Self {
-        Self::Sequential
-    }
+    Parallel {
+        max_concurrency: usize,
+    },
 }
 
 #[cfg(test)]
@@ -174,7 +163,9 @@ mod tests {
     #[test]
     fn process_mode_serde_hierarchical() {
         let manager_id = Uuid::new_v4();
-        let mode = ProcessMode::Hierarchical { manager: manager_id };
+        let mode = ProcessMode::Hierarchical {
+            manager: manager_id,
+        };
         let json = serde_json::to_string(&mode).unwrap();
         let restored: ProcessMode = serde_json::from_str(&json).unwrap();
         match restored {
@@ -193,9 +184,7 @@ mod tests {
 
     #[test]
     fn process_mode_serde_parallel() {
-        let mode = ProcessMode::Parallel {
-            max_concurrency: 8,
-        };
+        let mode = ProcessMode::Parallel { max_concurrency: 8 };
         let json = serde_json::to_string(&mode).unwrap();
         let restored: ProcessMode = serde_json::from_str(&json).unwrap();
         match restored {
@@ -233,10 +222,7 @@ mod tests {
     fn task_result_serde_round_trip() {
         let task_id = Uuid::new_v4();
         let mut meta = HashMap::new();
-        meta.insert(
-            "key".to_string(),
-            serde_json::Value::String("value".into()),
-        );
+        meta.insert("key".to_string(), serde_json::Value::String("value".into()));
         let result = TaskResult {
             task_id,
             output: "all good".into(),

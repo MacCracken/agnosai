@@ -95,14 +95,14 @@ impl CapabilityScorer {
 
     /// Get confidence for a capability. Returns 0.5 for unknown capabilities.
     pub fn confidence(&self, capability: &str) -> f64 {
-        self.scores
-            .get(capability)
-            .map_or(0.5, |s| s.confidence)
+        self.scores.get(capability).map_or(0.5, |s| s.confidence)
     }
 
     /// Get the trend for a capability. Returns Stable for unknown capabilities.
     pub fn trend(&self, capability: &str) -> Trend {
-        self.scores.get(capability).map_or(Trend::Stable, |s| s.trend)
+        self.scores
+            .get(capability)
+            .map_or(Trend::Stable, |s| s.trend)
     }
 
     /// Return all capability names and their scores.

@@ -246,10 +246,7 @@ mod tests {
         let pkg = AgnosPackage::new("empty".into(), "0.1.0".into());
         assert!(pkg.definitions.is_empty());
         assert!(pkg.metadata.is_object());
-        assert_eq!(
-            pkg.metadata.as_object().unwrap().len(),
-            0
-        );
+        assert_eq!(pkg.metadata.as_object().unwrap().len(), 0);
     }
 
     #[test]

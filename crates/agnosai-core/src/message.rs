@@ -52,16 +52,8 @@ mod tests {
     #[test]
     fn message_new_generates_unique_id() {
         let from = Uuid::new_v4();
-        let m1 = Message::new(
-            from,
-            MessageTarget::Broadcast,
-            serde_json::Value::Null,
-        );
-        let m2 = Message::new(
-            from,
-            MessageTarget::Broadcast,
-            serde_json::Value::Null,
-        );
+        let m1 = Message::new(from, MessageTarget::Broadcast, serde_json::Value::Null);
+        let m2 = Message::new(from, MessageTarget::Broadcast, serde_json::Value::Null);
         assert_ne!(m1.id, m2.id);
     }
 

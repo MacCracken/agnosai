@@ -37,17 +37,18 @@ impl IpcServer {
                 agnosai_core::AgnosaiError::Ipc(format!("failed to remove stale socket: {e}"))
             })?;
         }
-        let listener = UnixListener::bind(path).map_err(|e| {
-            agnosai_core::AgnosaiError::Ipc(format!("failed to bind socket: {e}"))
-        })?;
+        let listener = UnixListener::bind(path)
+            .map_err(|e| agnosai_core::AgnosaiError::Ipc(format!("failed to bind socket: {e}")))?;
         Ok(Self { listener })
     }
 
     /// Accept the next incoming connection.
     pub async fn accept(&self) -> agnosai_core::Result<IpcConnection> {
-        let (stream, _addr) = self.listener.accept().await.map_err(|e| {
-            agnosai_core::AgnosaiError::Ipc(format!("accept failed: {e}"))
-        })?;
+        let (stream, _addr) = self
+            .listener
+            .accept()
+            .await
+            .map_err(|e| agnosai_core::AgnosaiError::Ipc(format!("accept failed: {e}")))?;
         Ok(IpcConnection { stream })
     }
 }
@@ -70,9 +71,9 @@ impl IpcConnection {
 impl IpcClient {
     /// Connect to an IPC server at the given Unix socket path.
     pub async fn connect(path: &std::path::Path) -> agnosai_core::Result<Self> {
-        let stream = UnixStream::connect(path).await.map_err(|e| {
-            agnosai_core::AgnosaiError::Ipc(format!("connect failed: {e}"))
-        })?;
+        let stream = UnixStream::connect(path)
+            .await
+            .map_err(|e| agnosai_core::AgnosaiError::Ipc(format!("connect failed: {e}")))?;
         Ok(Self { stream })
     }
 
@@ -100,24 +101,28 @@ async fn write_frame(stream: &mut UnixStream, data: &[u8]) -> agnosai_core::Resu
             "frame size {len} exceeds maximum {MAX_FRAME_SIZE}"
         )));
     }
-    stream.write_all(&len.to_be_bytes()).await.map_err(|e| {
-        agnosai_core::AgnosaiError::Ipc(format!("write length failed: {e}"))
-    })?;
-    stream.write_all(data).await.map_err(|e| {
-        agnosai_core::AgnosaiError::Ipc(format!("write payload failed: {e}"))
-    })?;
-    stream.flush().await.map_err(|e| {
-        agnosai_core::AgnosaiError::Ipc(format!("flush failed: {e}"))
-    })?;
+    stream
+        .write_all(&len.to_be_bytes())
+        .await
+        .map_err(|e| agnosai_core::AgnosaiError::Ipc(format!("write length failed: {e}")))?;
+    stream
+        .write_all(data)
+        .await
+        .map_err(|e| agnosai_core::AgnosaiError::Ipc(format!("write payload failed: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| agnosai_core::AgnosaiError::Ipc(format!("flush failed: {e}")))?;
     Ok(())
 }
 
 /// Read a length-prefixed frame: 4-byte big-endian u32 length, then payload.
 async fn read_frame(stream: &mut UnixStream) -> agnosai_core::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await.map_err(|e| {
-        agnosai_core::AgnosaiError::Ipc(format!("read length failed: {e}"))
-    })?;
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| agnosai_core::AgnosaiError::Ipc(format!("read length failed: {e}")))?;
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_FRAME_SIZE {
         return Err(agnosai_core::AgnosaiError::Ipc(format!(
@@ -125,9 +130,10 @@ async fn read_frame(stream: &mut UnixStream) -> agnosai_core::Result<Vec<u8>> {
         )));
     }
     let mut buf = vec![0u8; len as usize];
-    stream.read_exact(&mut buf).await.map_err(|e| {
-        agnosai_core::AgnosaiError::Ipc(format!("read payload failed: {e}"))
-    })?;
+    stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(|e| agnosai_core::AgnosaiError::Ipc(format!("read payload failed: {e}")))?;
     Ok(buf)
 }
 
