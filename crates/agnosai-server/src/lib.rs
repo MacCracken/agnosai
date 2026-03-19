@@ -1,3 +1,8 @@
+//! HTTP API server for AgnosAI — REST endpoints for crew execution and management.
+//!
+//! Built on axum. Provides health probes, crew execution, tool listing,
+//! and agent definition management.
+
 pub mod routes;
 pub mod sse;
 pub mod state;

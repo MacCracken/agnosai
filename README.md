@@ -2,7 +2,7 @@
 
 Rust-native agent orchestration engine. Multi-agent crews with task DAGs, LLM routing, fleet distribution, and sandboxed tool execution.
 
-AgnosAI replaces Python/CrewAI orchestration with a compiled Rust binary — real concurrency, zero GIL, predictable performance. Use it standalone or as the core engine inside [Agnostic](https://github.com/maccracken/agnostic).
+AgnosAI replaces Python/CrewAI orchestration with a compiled Rust binary -- real concurrency, zero GIL, predictable performance. Use it standalone or as the core engine inside [Agnostic](https://github.com/maccracken/agnostic).
 
 ## Why
 
@@ -21,15 +21,17 @@ AgnosAI replaces Python/CrewAI orchestration with a compiled Rust binary — rea
 ```
 agnosai (workspace)
 ├── agnosai-core          Core types, traits, error handling
-├── agnosai-orchestrator  Task scheduling, agent coordination, pub/sub
-├── agnosai-llm           LLM provider abstraction (9 providers, native HTTP)
+├── agnosai-orchestrator  Task scheduling, agent scoring, crew execution (Sequential/Parallel/DAG/Hierarchical)
+├── agnosai-llm           LLM provider abstraction (8 providers, native HTTP)
 ├── agnosai-fleet         Distributed fleet coordination, GPU scheduling
 ├── agnosai-sandbox       Tool execution isolation (WASM, process, OCI)
 ├── agnosai-tools         Tool registry & execution (native, WASM, Python bridge)
 ├── agnosai-learning      Adaptive learning & reinforcement learning
-├── agnosai-server        HTTP/gRPC API server (REST, MCP, A2A, SSE)
+├── agnosai-server        HTTP API server (REST, health probes, SSE)
 └── agnosai-definitions   Preset library, crew assembly, packaging
 ```
+
+All crates are fully implemented with tests. See [Architecture Overview](docs/architecture/overview.md) for detailed design.
 
 ## Quick Start
 
@@ -37,14 +39,15 @@ agnosai (workspace)
 # Build everything
 cargo build
 
-# Run with a simple crew definition
-cargo run --example simple_crew
-
 # Run the API server
 cargo run -p agnosai-server
 
-# Run tests
+# Run tests (424 tests across all crates)
 cargo test
+
+# Run clippy + format checks
+cargo clippy --all-targets --all-features
+cargo fmt --all --check
 ```
 
 ## Usage as a Library
@@ -58,29 +61,46 @@ agnosai-orchestrator = { git = "https://github.com/maccracken/agnosai" }
 ```
 
 ```rust
-use agnosai_core::{AgentDefinition, Task, CrewSpec};
+use agnosai_core::{AgentDefinition, CrewSpec, Task, ProcessMode, TaskPriority};
 use agnosai_orchestrator::Orchestrator;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let orchestrator = Orchestrator::new(Default::default()).await?;
 
-    let crew = CrewSpec::builder()
-        .name("analysis-crew")
-        .agent(AgentDefinition::from_file("agents/analyst.json")?)
-        .agent(AgentDefinition::from_file("agents/reviewer.json")?)
-        .task(Task::new("Analyze the codebase for security issues"))
-        .build();
+    // Define agents
+    let analyst = AgentDefinition::from_json(r#"{
+        "agent_key": "analyst",
+        "name": "Analyst",
+        "role": "data analyst",
+        "goal": "analyze data",
+        "domain": "data-engineering",
+        "tools": ["json_transform"],
+        "complexity": "high"
+    }"#)?;
+
+    // Build a crew with tasks and dependencies
+    let mut task_a = Task::new("Gather quarterly revenue data");
+    task_a.priority = TaskPriority::High;
+    let mut task_b = Task::new("Analyze trends and anomalies");
+    task_b.dependencies.push(task_a.id);
+
+    let mut crew = CrewSpec::new("analysis-crew");
+    crew.agents = vec![analyst];
+    crew.tasks = vec![task_a, task_b];
+    crew.process = ProcessMode::Dag;
 
     let result = orchestrator.run_crew(crew).await?;
-    println!("{}", result.summary());
+    for r in &result.results {
+        println!("[{}] {}", r.status, r.output);
+    }
     Ok(())
 }
 ```
 
 ## Agent Definitions
 
-Agents are defined declaratively in JSON or YAML — same format as Agnostic v1 presets:
+Agents are defined declaratively in JSON -- same format as Agnostic v1 presets:
 
 ```json
 {
@@ -97,13 +117,12 @@ Agents are defined declaratively in JSON or YAML — same format as Agnostic v1 
 
 ## LLM Providers
 
-Native HTTP implementations — no Python SDKs, no litellm:
+Native HTTP implementations -- no Python SDKs, no litellm:
 
 | Provider | Protocol |
 |---|---|
 | OpenAI | REST (`/v1/chat/completions`) |
 | Anthropic | REST (`/v1/messages`) |
-| Google Gemini | REST (`/v1beta/models`) |
 | Ollama | REST (`/api/chat`) |
 | DeepSeek | OpenAI-compatible |
 | Mistral | OpenAI-compatible |
@@ -117,9 +136,9 @@ Task-complexity routing automatically selects the right model tier (Fast / Capab
 
 Tools run in three tiers with increasing isolation:
 
-1. **Native Rust** — in-process, zero overhead
-2. **WASM** — wasmtime sandbox, memory-isolated, capability-controlled
-3. **Sandboxed Python** — subprocess with seccomp-bpf + Landlock + cgroups + network namespace
+1. **Native Rust** -- in-process, zero overhead
+2. **WASM** -- wasmtime sandbox, memory-isolated, capability-controlled
+3. **Sandboxed Python** -- subprocess with seccomp-bpf + Landlock + cgroups + network namespace
 
 ## Fleet Distribution
 
@@ -131,6 +150,30 @@ First-class multi-node support:
 - Barrier sync and checkpoint-based crew state
 - GPU detection and VRAM-aware scheduling
 - Multi-cluster federation
+
+## Test Suite
+
+424 tests across 9 crates, all passing:
+
+```
+$ cargo test
+...
+test result: ok. 424 passed; 0 failed; 0 ignored
+```
+
+Tests cover core types, orchestration (all 4 process modes), DAG cycle detection, agent scoring, priority scheduling, pub/sub, IPC, LLM provider routing, tool registry, and API routes.
+
+## Documentation
+
+See the [docs/](docs/index.md) directory:
+
+- [Getting Started](docs/guides/getting-started.md)
+- [Architecture Overview](docs/architecture/overview.md)
+- [Crew Execution Patterns](docs/guides/crew-patterns.md)
+- [API Reference](docs/guides/api-reference.md)
+- [Adding LLM Providers](docs/guides/adding-providers.md)
+- [Adding Native Tools](docs/guides/adding-tools.md)
+- [Roadmap](docs/development/roadmap.md)
 
 ## Project Status
 

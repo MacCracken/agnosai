@@ -1,3 +1,13 @@
+//! Adaptive learning and reinforcement learning for agent optimization.
+//!
+//! Pure Rust implementations of RL primitives — no Python ML libraries:
+//!
+//! - [`PerformanceProfile`] — success rate and duration tracking per agent
+//! - [`Ucb1`] — multi-armed bandit for strategy selection
+//! - [`ReplayBuffer`] — prioritized experience replay
+//! - [`CapabilityScorer`] — dynamic confidence scoring with trend detection
+//! - [`QLearner`] — tabular Q-learning
+
 pub mod capability;
 pub mod optimizer;
 pub mod profile;

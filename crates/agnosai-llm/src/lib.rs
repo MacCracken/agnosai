@@ -1,3 +1,18 @@
+//! LLM provider abstraction with native HTTP implementations.
+//!
+//! Every provider is a direct HTTP client via `reqwest` — no Python SDKs,
+//! no litellm dependency. Includes model routing, health tracking, response
+//! caching, token budgeting, and rate limiting.
+//!
+//! # Providers
+//!
+//! | Provider | Type |
+//! |----------|------|
+//! | OpenAI | Direct REST |
+//! | Anthropic | Direct REST |
+//! | Ollama | Direct REST |
+//! | DeepSeek, Mistral, Groq, LM Studio, hoosh | OpenAI-compatible wrappers |
+
 pub mod budget;
 pub mod cache;
 pub mod health;
