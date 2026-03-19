@@ -11,7 +11,7 @@ AgnosAI distills production-proven patterns from three systems:
 
 ---
 
-## Current Phase: 4 — API Server & Integration (Phase 3 blocked on hardware)
+## Current Phase: 4 — API Server & Integration
 
 ### Phase 1: Core Crate (Foundation) — Complete
 
@@ -53,38 +53,36 @@ Build `agnosai-core` and `agnosai-orchestrator` with essential primitives.
 
 ---
 
-### Phase 3: Fleet Distribution — Blocked (P1, hardware)
+### Phase 3: Fleet Distribution — Partial (blocked items deferred)
 
-> **Blocked**: Requires multi-node hardware for development and testing. Will unblock when additional machines are available.
+| Item | Source | Status |
+|------|--------|--------|
+| IPC (Unix sockets, length-prefixed framing) | Agnosticos `ipc.rs` | Done (4 tests) |
+| Node registry + heartbeat | Agnostic v1 fleet → Rust | Done (9 tests) |
+| Placement engine (5 scheduling policies) | Agnostic v1 fleet → Rust | Done (9 tests) |
+| GPU detection + scheduler | Agnostic v1 gpu → Rust | Done (8 tests) |
+| Crew state manager (barrier sync, checkpoints) | Agnostic v1 fleet → Rust | Done (14 tests) |
+| Fleet coordinator (fan-out, aggregation, failover) | Agnostic v1 fleet → Rust | Done (13 tests) |
+| Inter-node relay (Redis pub/sub) | Agnostic v1 fleet → Rust | Deferred (needs Redis) |
+| Federation (multi-cluster) | Agnosticos federation | Deferred (needs hardware) |
 
-| Item | Source |
-|------|--------|
-| IPC (Unix sockets, length-prefixed framing) | Agnosticos `ipc.rs` |
-| Node registry + heartbeat | Agnostic v1 fleet → Rust |
-| Placement engine (5 scheduling policies) | Agnostic v1 fleet → Rust |
-| Inter-node relay (Redis pub/sub) | Agnostic v1 fleet → Rust |
-| Fleet coordinator (fan-out, aggregation, failover) | Agnostic v1 fleet → Rust |
-| Crew state manager (barrier sync, checkpoints) | Agnostic v1 fleet → Rust |
-| GPU detection + scheduler | Agnostic v1 gpu → Rust |
-| Federation (multi-cluster) | Agnosticos federation |
-
-**Exit criteria**: Distribute a crew across multiple nodes with lockstep execution, failover, and GPU-aware placement.
+**Exit criteria**: Distribute a crew across multiple nodes with lockstep execution, failover, and GPU-aware placement. **Partial — 57 tests passing. Relay + federation deferred.**
 
 ---
 
 ### Phase 4: API Server & Integration
 
-| Item | Source |
-|------|--------|
-| axum HTTP server with REST API | Mirrors Agnostic v1 FastAPI |
-| MCP server (tool advertisement) | Agnostic v1 MCP routes |
-| A2A protocol (webhooks) | Agnostic v1 A2A |
-| SSE streaming for crew execution | New |
-| JWT auth + token delegation | Agnostic v1 auth |
-| Preset library (18 presets) | Agnostic v1 presets |
-| Crew assembler (team spec → agents) | Agnostic v1 crew assembler |
-| Learning & RL module | Agnosticos learning + RL optimizer |
-| Definition versioning & .agpkg packaging | Agnostic v1 versioning + packaging |
+| Item | Source | Status |
+|------|--------|--------|
+| axum HTTP server with REST API | Mirrors Agnostic v1 FastAPI | Done (5 tests) |
+| MCP server (tool advertisement) | Agnostic v1 MCP routes | Deferred |
+| A2A protocol (webhooks) | Agnostic v1 A2A | Deferred |
+| SSE streaming for crew execution | New | Deferred |
+| JWT auth + token delegation | Agnostic v1 auth | Deferred |
+| Preset library (18 presets) | Agnostic v1 presets | Placeholder |
+| Crew assembler (team spec → agents) | Agnostic v1 crew assembler | Done (6 tests) |
+| Learning & RL module | Agnosticos learning + RL optimizer | Done (35 tests) |
+| Definition versioning & .agpkg packaging | Agnostic v1 versioning + packaging | Done (versioning: 5 tests) |
 
 **Exit criteria**: Full API compatibility with Agnostic v1. Drop-in backend replacement.
 

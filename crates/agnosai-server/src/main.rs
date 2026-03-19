@@ -1,5 +1,13 @@
+use std::sync::Arc;
+
+use agnosai_orchestrator::Orchestrator;
+use agnosai_tools::builtin::echo::EchoTool;
+use agnosai_tools::builtin::json_transform::JsonTransformTool;
+use agnosai_tools::ToolRegistry;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
+
+use agnosai_server::{router, AppState, SharedState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,9 +18,18 @@ async fn main() -> Result<()> {
 
     tracing::info!("AgnosAI server starting");
 
-    let app = axum::Router::new()
-        .route("/health", axum::routing::get(health))
-        .route("/ready", axum::routing::get(ready));
+    // Initialise shared state.
+    let orchestrator = Orchestrator::new(Default::default()).await?;
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(Arc::new(EchoTool));
+    tools.register(Arc::new(JsonTransformTool));
+
+    let state: SharedState = Arc::new(AppState {
+        orchestrator,
+        tools,
+    });
+
+    let app = router(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
     tracing::info!("listening on {addr}");
@@ -21,13 +38,4 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-async fn health() -> &'static str {
-    "ok"
-}
-
-async fn ready() -> &'static str {
-    // TODO: Check orchestrator + provider health
-    "ok"
 }
