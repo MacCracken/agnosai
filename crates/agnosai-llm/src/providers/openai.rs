@@ -49,6 +49,16 @@ impl OpenAiProvider {
         }
     }
 
+    /// Create a provider with custom base URL and default model.
+    pub fn with_base_url_and_model(api_key: String, base_url: String, model: String) -> Self {
+        Self {
+            client: Client::new(),
+            base_url,
+            api_key,
+            default_model: model,
+        }
+    }
+
     fn resolve_model(&self, model: &str) -> String {
         if model.is_empty() {
             self.default_model.clone()

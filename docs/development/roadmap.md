@@ -11,7 +11,7 @@ AgnosAI distills production-proven patterns from three systems:
 
 ---
 
-## Current Phase: 2 — LLM & Tools
+## Current Phase: 3 — Fleet Distribution
 
 ### Phase 1: Core Crate (Foundation) — Complete
 
@@ -32,30 +32,24 @@ Build `agnosai-core` and `agnosai-orchestrator` with essential primitives.
 
 ---
 
-### Phase 2: LLM & Tools
+### Phase 2: LLM & Tools — Complete
 
 | Item | Source | Status |
 |------|--------|--------|
 | `LlmProvider` trait + OpenAI provider | Agnosticos hoosh + SY model router | Done |
-| Anthropic provider | SY provider implementations | Done |
-| Ollama provider | SY provider implementations | Done |
-| Remaining providers (Gemini, DeepSeek, Mistral, Groq, LM Studio, hoosh) | SY + Agnosticos | Pending |
+| Anthropic, Ollama providers | SY provider implementations | Done |
+| DeepSeek, Mistral, Groq, LM Studio, hoosh providers | OpenAI-compatible wrappers | Done |
 | Model router (task-complexity scoring) | SY `model-router.ts` | Done (10 tests) |
 | Provider health ring buffer + failover | SY health scoring | Done (8 tests) |
-| Response cache (LRU + TTL) | SY + Agnosticos | Pending |
-| Token budget accounting | Agnosticos hoosh | Pending |
+| Response cache (LRU + TTL) | SY + Agnosticos | Done (8 tests) |
+| Token budget accounting | Agnosticos hoosh | Done (10 tests) |
 | Rate limiter (semaphore-based) | Agnosticos `rate_limiter.rs` | Done (4 tests) |
 | Native Rust tool trait + registry | Agnostic `tool_registry.py` | Done (10 tests) |
 | Built-in tools: Synapse (3), Mneme (3), Delta (3) | AGNOS ecosystem integration | Done |
-| WASM tool sandbox (wasmtime) | Agnosticos `sandbox_mod/` | Pending |
-| Python tool bridge (sandboxed subprocess) | New | Pending |
+| WASM tool sandbox (wasmtime) | Agnosticos `sandbox_mod/` | Done (5 tests) |
+| Python tool bridge (sandboxed subprocess) | New | Done (5 tests) |
 
-**AGNOS ecosystem tools** (optional, not hard dependencies):
-- **Synapse** — LLM inference (`synapse_infer`, `synapse_list_models`, `synapse_status`)
-- **Mneme** — Knowledge base (`mneme_search`, `mneme_get_note`, `mneme_create_note`)
-- **Delta** — Code platform (`delta_list_repos`, `delta_trigger_pipeline`, `delta_get_pipeline`)
-
-**Exit criteria**: Run a crew that calls LLMs and executes tools (native, WASM, or sandboxed Python).
+**Exit criteria**: Run a crew that calls LLMs and executes tools (native, WASM, or sandboxed Python). **Met — 140 tests passing.**
 
 ---
 

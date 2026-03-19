@@ -18,5 +18,14 @@ pub use router::{Complexity, ModelTier, TaskProfile, TaskType};
 
 // Re-export provider implementations.
 pub use providers::anthropic::AnthropicProvider;
+pub use providers::deepseek::DeepSeekProvider;
+pub use providers::groq::GroqProvider;
+pub use providers::hoosh::HooshProvider;
+pub use providers::lmstudio::LmStudioProvider;
+pub use providers::mistral::MistralProvider;
 pub use providers::ollama::OllamaProvider;
 pub use providers::openai::OpenAiProvider;
+
+// Re-export cache and budget types.
+pub use budget::{BudgetExceeded, BudgetSummary, TokenBudget};
+pub use cache::{cache_key, ResponseCache};
