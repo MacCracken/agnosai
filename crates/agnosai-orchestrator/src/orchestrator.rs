@@ -3,6 +3,7 @@ use tokio::sync::RwLock;
 
 use agnosai_core::{CrewSpec, CrewState, CrewStatus, ResourceBudget, Result};
 
+use crate::crew_runner::CrewRunner;
 use crate::scheduler::Scheduler;
 
 pub struct OrchestratorState {
@@ -29,33 +30,36 @@ impl Orchestrator {
     }
 
     pub async fn run_crew(&self, spec: CrewSpec) -> Result<CrewState> {
-        let crew_state = CrewState {
-            crew_id: spec.id,
-            status: CrewStatus::Pending,
-            results: Vec::new(),
-        };
+        let crew_id = spec.id;
 
+        // Register as pending.
         {
             let mut state = self.state.write().await;
-            state.active_crews.push(crew_state.clone());
+            state.active_crews.push(CrewState {
+                crew_id,
+                status: CrewStatus::Pending,
+                results: Vec::new(),
+            });
         }
 
-        // TODO: Phase 1 — implement crew lifecycle:
-        // 1. Resolve task DAG (topological sort)
-        // 2. Score and assign agents
-        // 3. Execute tasks respecting dependencies
-        // 4. Aggregate results
+        // Delegate to CrewRunner for the actual lifecycle.
+        let mut runner = CrewRunner::new(spec);
+        let crew_state = runner.run().await?;
+
+        // Update stored state.
+        {
+            let mut state = self.state.write().await;
+            if let Some(entry) = state.active_crews.iter_mut().find(|c| c.crew_id == crew_id) {
+                *entry = crew_state.clone();
+            }
+        }
 
         Ok(crew_state)
     }
 
     pub async fn cancel_crew(&self, crew_id: agnosai_core::crew::CrewId) -> Result<()> {
         let mut state = self.state.write().await;
-        if let Some(crew) = state
-            .active_crews
-            .iter_mut()
-            .find(|c| c.crew_id == crew_id)
-        {
+        if let Some(crew) = state.active_crews.iter_mut().find(|c| c.crew_id == crew_id) {
             crew.status = CrewStatus::Cancelled;
             Ok(())
         } else {
