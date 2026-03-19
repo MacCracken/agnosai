@@ -159,6 +159,7 @@ mod tests {
             gpu_required: false,
             gpu_preferred: false,
             gpu_memory_min_mb: None,
+            hardware: None,
         }
     }
 

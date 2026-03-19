@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use agnosai_core::resource::{HardwareInventory, HardwareRequirement};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -31,6 +32,9 @@ pub struct NodeInfo {
     pub gpu_count: u32,
     pub gpu_vram_mb: u64,
     pub capabilities: Vec<String>,
+    /// Hardware inventory for this node.
+    #[serde(default)]
+    pub hardware: HardwareInventory,
     pub last_heartbeat: DateTime<Utc>,
     /// Monotonic instant of registration (not serialized).
     #[serde(skip, default = "Instant::now")]
@@ -52,10 +56,22 @@ impl NodeInfo {
             gpu_count,
             gpu_vram_mb,
             capabilities: Vec::new(),
+            hardware: HardwareInventory::default(),
             last_heartbeat: Utc::now(),
             registered_at: Instant::now(),
             last_heartbeat_instant: Instant::now(),
         }
+    }
+
+    /// Builder-style method to set hardware inventory.
+    pub fn with_hardware(mut self, hardware: HardwareInventory) -> Self {
+        self.hardware = hardware;
+        self
+    }
+
+    /// Check if this node's hardware satisfies a requirement.
+    pub fn satisfies_hardware(&self, req: &HardwareRequirement) -> bool {
+        self.hardware.satisfies(req)
     }
 
     /// Builder-style method to set capabilities.
@@ -119,6 +135,7 @@ impl NodeRegistry {
             gpu_count: gpu_count as u32,
             gpu_vram_mb,
             capabilities,
+            hardware: HardwareInventory::default(),
             last_heartbeat: Utc::now(),
             registered_at: now,
             last_heartbeat_instant: now,
@@ -355,5 +372,64 @@ mod tests {
         assert_eq!(node.capabilities, vec!["python"]);
         assert_eq!(node.status, NodeStatus::Draining);
         assert!(node.has_gpu());
+    }
+
+    #[test]
+    fn satisfies_hardware_with_inventory() {
+        use agnosai_core::resource::{
+            AcceleratorType, ComputeDevice, HardwareInventory, HardwareRequirement,
+        };
+
+        let inventory = HardwareInventory {
+            cpu_cores: 16,
+            memory_total_mb: 65536,
+            devices: vec![
+                ComputeDevice {
+                    index: 0,
+                    name: "NVIDIA A100".into(),
+                    accelerator: AcceleratorType::Cuda,
+                    memory_total_mb: 81920,
+                    memory_available_mb: 81920,
+                },
+                ComputeDevice {
+                    index: 1,
+                    name: "NVIDIA A100".into(),
+                    accelerator: AcceleratorType::Cuda,
+                    memory_total_mb: 81920,
+                    memory_available_mb: 81920,
+                },
+            ],
+        };
+
+        let node = NodeInfo::new("hw-node", 2, 81920).with_hardware(inventory);
+
+        // Should satisfy CUDA requirement.
+        let cuda_req = HardwareRequirement {
+            accelerators: vec![AcceleratorType::Cuda],
+            min_memory_mb: 40960,
+            min_device_count: 2,
+            min_cpu_cores: 8,
+        };
+        assert!(node.satisfies_hardware(&cuda_req));
+
+        // Should NOT satisfy TPU requirement.
+        let tpu_req = HardwareRequirement {
+            accelerators: vec![AcceleratorType::Tpu],
+            min_memory_mb: 0,
+            min_device_count: 1,
+            min_cpu_cores: 0,
+        };
+        assert!(!node.satisfies_hardware(&tpu_req));
+
+        // Empty requirement should always pass.
+        let empty_req = HardwareRequirement::default();
+        assert!(node.satisfies_hardware(&empty_req));
+    }
+
+    #[test]
+    fn node_info_default_hardware_is_empty() {
+        let node = NodeInfo::new("plain", 0, 0);
+        assert!(node.hardware.devices.is_empty());
+        assert_eq!(node.hardware.cpu_cores, 0);
     }
 }

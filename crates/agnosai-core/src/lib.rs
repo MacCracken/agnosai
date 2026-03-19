@@ -31,5 +31,7 @@ pub use agent::{AgentDefinition, AgentId, AgentState};
 pub use crew::{CrewSpec, CrewState, CrewStatus};
 pub use error::{AgnosaiError, Result};
 pub use message::Message;
-pub use resource::ResourceBudget;
+pub use resource::{
+    AcceleratorType, ComputeDevice, HardwareInventory, HardwareRequirement, ResourceBudget,
+};
 pub use task::{ProcessMode, Task, TaskDAG, TaskPriority, TaskResult, TaskStatus};

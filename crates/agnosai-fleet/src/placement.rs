@@ -25,6 +25,8 @@ pub struct PlacementRequest {
     pub required_capabilities: Vec<String>,
     /// For Manual policy: the specific node to target.
     pub preferred_node: Option<NodeId>,
+    /// Hardware requirements (new — takes precedence over legacy GPU fields).
+    pub hardware: Option<agnosai_core::resource::HardwareRequirement>,
 }
 
 /// Result of a placement decision.
@@ -47,14 +49,22 @@ fn score_node(request: &PlacementRequest, node: &NodeInfo, index: usize, count: 
         return 0.0;
     }
 
-    // Hard requirement: GPU.
-    if request.required_gpu && !node.has_gpu() {
-        return 0.0;
-    }
+    // Hardware requirement check (takes precedence over legacy GPU fields).
+    if let Some(hw_req) = &request.hardware {
+        if !node.satisfies_hardware(hw_req) {
+            return 0.0;
+        }
+    } else {
+        // Legacy GPU checks as fallback when hardware is None.
+        // Hard requirement: GPU.
+        if request.required_gpu && !node.has_gpu() {
+            return 0.0;
+        }
 
-    // Hard requirement: minimum VRAM.
-    if request.min_gpu_vram_mb > 0 && node.gpu_vram_mb < request.min_gpu_vram_mb {
-        return 0.0;
+        // Hard requirement: minimum VRAM.
+        if request.min_gpu_vram_mb > 0 && node.gpu_vram_mb < request.min_gpu_vram_mb {
+            return 0.0;
+        }
     }
 
     match request.policy {
@@ -137,6 +147,7 @@ mod tests {
             min_gpu_vram_mb: 0,
             required_capabilities: Vec::new(),
             preferred_node: None,
+            hardware: None,
         }
     }
 
@@ -172,6 +183,7 @@ mod tests {
             min_gpu_vram_mb: 0,
             required_capabilities: Vec::new(),
             preferred_node: None,
+            hardware: None,
         };
         let result = place(&req, &nodes).unwrap();
         assert_eq!(result.node_id, "gpu-box");
@@ -210,6 +222,7 @@ mod tests {
             min_gpu_vram_mb: 0,
             required_capabilities: vec!["python".into(), "docker".into()],
             preferred_node: None,
+            hardware: None,
         };
         let result = place(&req, &nodes).unwrap();
         assert_eq!(result.node_id, "a");
@@ -240,6 +253,7 @@ mod tests {
             min_gpu_vram_mb: 0,
             required_capabilities: Vec::new(),
             preferred_node: Some("target".into()),
+            hardware: None,
         };
         let result = place(&req, &nodes).unwrap();
         assert_eq!(result.node_id, "target");
@@ -256,6 +270,7 @@ mod tests {
             min_gpu_vram_mb: 0,
             required_capabilities: Vec::new(),
             preferred_node: Some("target".into()),
+            hardware: None,
         };
         assert!(place(&req, &nodes).is_none());
     }
@@ -288,5 +303,90 @@ mod tests {
         for w in ranked.windows(2) {
             assert!(w[0].score >= w[1].score);
         }
+    }
+
+    #[test]
+    fn hardware_cuda_requirement_filters_nodes() {
+        use agnosai_core::resource::{
+            AcceleratorType, ComputeDevice, HardwareInventory, HardwareRequirement,
+        };
+
+        let cuda_inventory = HardwareInventory {
+            cpu_cores: 16,
+            memory_total_mb: 65536,
+            devices: vec![ComputeDevice {
+                index: 0,
+                name: "A100".into(),
+                accelerator: AcceleratorType::Cuda,
+                memory_total_mb: 81920,
+                memory_available_mb: 81920,
+            }],
+        };
+        let n1 = cpu_node("cpu-only");
+        let n2 = gpu_node("cuda-box", 81920).with_hardware(cuda_inventory);
+        let nodes: Vec<&NodeInfo> = vec![&n1, &n2];
+
+        let req = PlacementRequest {
+            policy: PlacementPolicy::Balanced,
+            required_gpu: false,
+            min_gpu_vram_mb: 0,
+            required_capabilities: Vec::new(),
+            preferred_node: None,
+            hardware: Some(HardwareRequirement {
+                accelerators: vec![AcceleratorType::Cuda],
+                min_memory_mb: 40960,
+                min_device_count: 1,
+                min_cpu_cores: 0,
+            }),
+        };
+        let result = place(&req, &nodes).unwrap();
+        assert_eq!(result.node_id, "cuda-box");
+
+        // CPU-only node should be filtered out.
+        let ranked = rank_nodes(&req, &nodes);
+        assert_eq!(ranked.len(), 1);
+    }
+
+    #[test]
+    fn hardware_tpu_requirement_returns_none_when_no_tpu() {
+        use agnosai_core::resource::{AcceleratorType, HardwareRequirement};
+
+        let n1 = gpu_node("gpu-1", 24000);
+        let n2 = cpu_node("cpu-1");
+        let nodes: Vec<&NodeInfo> = vec![&n1, &n2];
+
+        let req = PlacementRequest {
+            policy: PlacementPolicy::Balanced,
+            required_gpu: false,
+            min_gpu_vram_mb: 0,
+            required_capabilities: Vec::new(),
+            preferred_node: None,
+            hardware: Some(HardwareRequirement {
+                accelerators: vec![AcceleratorType::Tpu],
+                min_memory_mb: 0,
+                min_device_count: 1,
+                min_cpu_cores: 0,
+            }),
+        };
+        assert!(place(&req, &nodes).is_none());
+    }
+
+    #[test]
+    fn no_hardware_requirement_backward_compat() {
+        // When hardware is None, legacy GPU fields still work.
+        let n1 = gpu_node("gpu-box", 16000);
+        let n2 = cpu_node("cpu-only");
+        let nodes: Vec<&NodeInfo> = vec![&n1, &n2];
+
+        let req = PlacementRequest {
+            policy: PlacementPolicy::GpuAffinity,
+            required_gpu: true,
+            min_gpu_vram_mb: 8000,
+            required_capabilities: Vec::new(),
+            preferred_node: None,
+            hardware: None,
+        };
+        let result = place(&req, &nodes).unwrap();
+        assert_eq!(result.node_id, "gpu-box");
     }
 }

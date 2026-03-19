@@ -30,6 +30,7 @@ fn make_agent(key: &str, role: &str, goal: &str, tools: Vec<&str>) -> AgentDefin
         gpu_required: false,
         gpu_preferred: false,
         gpu_memory_min_mb: None,
+        hardware: None,
     }
 }
 

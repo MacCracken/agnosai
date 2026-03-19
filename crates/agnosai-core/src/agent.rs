@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::resource::{AcceleratorType, HardwareRequirement};
+
 pub type AgentId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +27,10 @@ pub struct AgentDefinition {
     pub gpu_preferred: bool,
     #[serde(default)]
     pub gpu_memory_min_mb: Option<u64>,
+    /// Hardware requirements for this agent's workloads.
+    /// If None, falls back to legacy gpu_required/gpu_preferred/gpu_memory_min_mb fields.
+    #[serde(default)]
+    pub hardware: Option<HardwareRequirement>,
 }
 
 fn default_complexity() -> String {
@@ -34,6 +40,23 @@ fn default_complexity() -> String {
 impl AgentDefinition {
     pub fn from_json(json: &str) -> crate::Result<Self> {
         serde_json::from_str(json).map_err(crate::AgnosaiError::Serialization)
+    }
+
+    /// Get hardware requirements, preferring the explicit `hardware` field
+    /// but falling back to legacy GPU fields for backward compatibility.
+    pub fn hardware_requirement(&self) -> HardwareRequirement {
+        if let Some(ref hw) = self.hardware {
+            return hw.clone();
+        }
+        // Legacy fallback
+        let mut req = HardwareRequirement::default();
+        if self.gpu_required {
+            req.accelerators = vec![AcceleratorType::Cuda, AcceleratorType::Rocm];
+            if let Some(min_mb) = self.gpu_memory_min_mb {
+                req.min_memory_mb = min_mb;
+            }
+        }
+        req
     }
 }
 
@@ -68,6 +91,7 @@ mod tests {
             gpu_required: true,
             gpu_preferred: false,
             gpu_memory_min_mb: Some(4096),
+            hardware: None,
         };
         let json = serde_json::to_string(&agent).unwrap();
         let restored: AgentDefinition = serde_json::from_str(&json).unwrap();
@@ -171,6 +195,137 @@ mod tests {
             let restored: AgentState = serde_json::from_str(&json).unwrap();
             assert_eq!(*variant, restored);
         }
+    }
+
+    #[test]
+    fn hardware_requirement_with_explicit_hardware_field() {
+        let agent = AgentDefinition {
+            agent_key: "hw-agent".into(),
+            name: "HW Agent".into(),
+            role: "worker".into(),
+            goal: "do work".into(),
+            backstory: None,
+            domain: None,
+            tools: vec![],
+            complexity: "medium".into(),
+            llm_model: None,
+            gpu_required: true, // should be ignored when hardware is set
+            gpu_preferred: false,
+            gpu_memory_min_mb: Some(4096), // should be ignored
+            hardware: Some(HardwareRequirement {
+                accelerators: vec![AcceleratorType::Tpu],
+                min_memory_mb: 32768,
+                min_device_count: 2,
+                min_cpu_cores: 0,
+            }),
+        };
+        let req = agent.hardware_requirement();
+        assert_eq!(req.accelerators, vec![AcceleratorType::Tpu]);
+        assert_eq!(req.min_memory_mb, 32768);
+        assert_eq!(req.min_device_count, 2);
+    }
+
+    #[test]
+    fn hardware_requirement_falls_back_to_legacy_gpu_fields() {
+        let agent = AgentDefinition {
+            agent_key: "legacy-gpu".into(),
+            name: "Legacy GPU".into(),
+            role: "worker".into(),
+            goal: "do work".into(),
+            backstory: None,
+            domain: None,
+            tools: vec![],
+            complexity: "medium".into(),
+            llm_model: None,
+            gpu_required: true,
+            gpu_preferred: true,
+            gpu_memory_min_mb: Some(8192),
+            hardware: None,
+        };
+        let req = agent.hardware_requirement();
+        assert_eq!(
+            req.accelerators,
+            vec![AcceleratorType::Cuda, AcceleratorType::Rocm]
+        );
+        assert_eq!(req.min_memory_mb, 8192);
+    }
+
+    #[test]
+    fn hardware_requirement_no_gpu_returns_empty() {
+        let agent = AgentDefinition {
+            agent_key: "cpu-only".into(),
+            name: "CPU Only".into(),
+            role: "worker".into(),
+            goal: "do work".into(),
+            backstory: None,
+            domain: None,
+            tools: vec![],
+            complexity: "medium".into(),
+            llm_model: None,
+            gpu_required: false,
+            gpu_preferred: false,
+            gpu_memory_min_mb: None,
+            hardware: None,
+        };
+        let req = agent.hardware_requirement();
+        assert!(req.accelerators.is_empty());
+        assert_eq!(req.min_memory_mb, 0);
+        assert_eq!(req.min_device_count, 0);
+        assert_eq!(req.min_cpu_cores, 0);
+    }
+
+    #[test]
+    fn serde_agent_with_hardware_field_round_trips() {
+        let agent = AgentDefinition {
+            agent_key: "hw-rt".into(),
+            name: "HW RT".into(),
+            role: "worker".into(),
+            goal: "do work".into(),
+            backstory: None,
+            domain: None,
+            tools: vec![],
+            complexity: "medium".into(),
+            llm_model: None,
+            gpu_required: false,
+            gpu_preferred: false,
+            gpu_memory_min_mb: None,
+            hardware: Some(HardwareRequirement {
+                accelerators: vec![AcceleratorType::Cuda, AcceleratorType::Tpu],
+                min_memory_mb: 16384,
+                min_device_count: 1,
+                min_cpu_cores: 4,
+            }),
+        };
+        let json = serde_json::to_string(&agent).unwrap();
+        let restored: AgentDefinition = serde_json::from_str(&json).unwrap();
+        let hw = restored.hardware.unwrap();
+        assert_eq!(hw.accelerators.len(), 2);
+        assert_eq!(hw.min_memory_mb, 16384);
+        assert_eq!(hw.min_device_count, 1);
+        assert_eq!(hw.min_cpu_cores, 4);
+    }
+
+    #[test]
+    fn serde_agent_without_hardware_field_backward_compat() {
+        let json = r#"{
+            "agent_key": "old-style",
+            "name": "Old Style",
+            "role": "worker",
+            "goal": "do work",
+            "gpu_required": true,
+            "gpu_memory_min_mb": 4096
+        }"#;
+        let agent = AgentDefinition::from_json(json).unwrap();
+        assert!(agent.hardware.is_none());
+        assert!(agent.gpu_required);
+        assert_eq!(agent.gpu_memory_min_mb, Some(4096));
+        // Legacy fallback should still work
+        let req = agent.hardware_requirement();
+        assert_eq!(
+            req.accelerators,
+            vec![AcceleratorType::Cuda, AcceleratorType::Rocm]
+        );
+        assert_eq!(req.min_memory_mb, 4096);
     }
 
     #[test]
