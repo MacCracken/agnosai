@@ -1,3 +1,3 @@
-/// JSON/YAML agent definition loading.
+//! JSON/YAML agent definition loading.
 
 // TODO: Implement definition loader

@@ -1,3 +1,3 @@
-/// Prioritized experience replay buffer.
+//! Prioritized experience replay buffer.
 
 // TODO: Port from Agnosticos

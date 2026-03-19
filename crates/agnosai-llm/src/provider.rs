@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 /// No Python SDKs, no litellm dependency.
 #[allow(async_fn_in_trait)]
 pub trait LlmProvider: Send + Sync {
-    async fn infer(&self, request: InferenceRequest) -> crate::Result<InferenceResponse>;
-    async fn list_models(&self) -> crate::Result<Vec<ModelInfo>>;
+    async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse>;
+    async fn list_models(&self) -> Result<Vec<ModelInfo>>;
     fn provider_type(&self) -> ProviderType;
 }
 
-pub type Result<T> = std::result::Result<T, agnosai_core::AgnosaiError>;
+pub type Result<T> = core::result::Result<T, agnosai_core::AgnosaiError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {

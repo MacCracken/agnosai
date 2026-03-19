@@ -1,3 +1,3 @@
-/// Sandbox profiles with strength scoring.
+//! Sandbox profiles with strength scoring.
 
 // TODO: Implement sandbox policies

@@ -1,3 +1,3 @@
-/// Dynamic capability confidence scoring with trend detection.
+//! Dynamic capability confidence scoring with trend detection.
 
 // TODO: Port from Agnosticos

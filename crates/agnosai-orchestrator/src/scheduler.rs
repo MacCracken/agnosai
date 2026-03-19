@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use agnosai_core::task::{Task, TaskPriority};
+use agnosai_core::task::Task;
 
 /// Priority-based task scheduler with per-level queues.
 ///
