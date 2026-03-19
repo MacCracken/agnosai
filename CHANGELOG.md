@@ -87,4 +87,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rust-toolchain.toml` (stable channel)
 - Release profile: `lto = "fat"`, `strip = true`, `panic = "abort"`, `codegen-units = 1`
 - Apache-2.0 license
-- 424 tests passing
+- 451 tests passing
+
+#### Server — MCP, A2A, SSE, Auth
+- MCP server (JSON-RPC 2.0 over HTTP POST): `initialize`, `tools/list`, `tools/call` with ToolRegistry integration
+- A2A protocol: `POST /api/v1/a2a/receive` — webhook-based crew delegation with optional callback URL
+- SSE streaming: `GET /api/v1/crews/:id/stream` — event stream endpoint with `CrewEvent` types
+- Auth middleware: shared-secret Bearer token validation, configurable enable/disable
+
+#### Definitions — Presets & Packaging
+- 6 built-in presets embedded at compile time via `include_str!`: quality (lean/standard), software-engineering (lean/standard), devops-lean, data-engineering-lean
+- `PresetSpec` type with `builtin_presets()`, `load_preset_from_json()`, `load_preset_from_file()`, `load_all_presets()`
+- `.agpkg` ZIP packaging: `AgnosPackage` with `export()`/`import()` for in-memory and file-based round-trips

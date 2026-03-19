@@ -8,3 +8,7 @@ pub mod assembler;
 pub mod loader;
 pub mod packaging;
 pub mod versioning;
+
+// Re-exports for convenience.
+pub use loader::{builtin_presets, PresetSpec};
+pub use packaging::AgnosPackage;

@@ -9,16 +9,13 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 
 ## Remaining Work
 
-### API & Protocol Integration
+### Remaining API & Protocol Work
 
-| Item | Source | Priority |
-|------|--------|----------|
-| MCP server (tool advertisement) | Agnostic v1 MCP routes | High |
-| A2A protocol (webhooks) | Agnostic v1 A2A | High |
-| SSE streaming for crew execution | New | Medium |
-| JWT auth + token delegation | Agnostic v1 auth | Medium |
-| Preset library (18 built-in presets) | Agnostic v1 presets | Medium |
-| .agpkg bundle export/import | Agnostic v1 packaging | Low |
+| Item | Notes | Priority |
+|------|-------|----------|
+| Full JWT validation (RS256, claims, expiry) | Currently shared-secret only | Medium |
+| SSE integration with CrewRunner events | SSE endpoint exists, needs event wiring | Medium |
+| Remaining 12 presets | 6 of 18 built-in, need design/data-eng/devops standard+large | Low |
 
 ### Fleet (blocked)
 

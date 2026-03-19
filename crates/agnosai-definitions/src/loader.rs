@@ -1,9 +1,14 @@
-//! JSON/YAML agent definition loading.
+//! JSON/YAML agent definition and preset loading.
 
 use std::path::Path;
 
 use agnosai_core::agent::AgentDefinition;
 use agnosai_core::{AgnosaiError, Result};
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Agent definition loading
+// ---------------------------------------------------------------------------
 
 /// Load an agent definition from a JSON string.
 pub fn load_from_json(json: &str) -> Result<AgentDefinition> {
@@ -62,10 +67,80 @@ pub fn load_all_from_dir(dir: &Path) -> Result<Vec<AgentDefinition>> {
     Ok(definitions)
 }
 
+// ---------------------------------------------------------------------------
+// Preset loading
+// ---------------------------------------------------------------------------
+
+/// A preset crew specification containing a named team of agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresetSpec {
+    pub name: String,
+    pub description: String,
+    pub domain: String,
+    pub size: String,
+    pub version: String,
+    pub agents: Vec<AgentDefinition>,
+}
+
+/// Load a preset from a JSON string.
+pub fn load_preset_from_json(json: &str) -> Result<PresetSpec> {
+    serde_json::from_str(json).map_err(AgnosaiError::Serialization)
+}
+
+/// Load a preset from a file.
+pub fn load_preset_from_file(path: &Path) -> Result<PresetSpec> {
+    let content = std::fs::read_to_string(path)?;
+    load_preset_from_json(&content)
+}
+
+/// Load all presets from a directory (`.json` files only).
+pub fn load_all_presets(dir: &Path) -> Result<Vec<PresetSpec>> {
+    let mut presets = Vec::new();
+
+    let entries = std::fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if ext == "json" {
+            presets.push(load_preset_from_file(&path)?);
+        }
+    }
+
+    Ok(presets)
+}
+
+/// Get the built-in presets (embedded at compile time).
+pub fn builtin_presets() -> Vec<PresetSpec> {
+    let jsons = [
+        include_str!("../presets/quality-lean.json"),
+        include_str!("../presets/quality-standard.json"),
+        include_str!("../presets/software-engineering-lean.json"),
+        include_str!("../presets/software-engineering-standard.json"),
+        include_str!("../presets/devops-lean.json"),
+        include_str!("../presets/data-engineering-lean.json"),
+    ];
+    jsons
+        .iter()
+        .filter_map(|j| load_preset_from_json(j).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    // -----------------------------------------------------------------------
+    // Agent definition tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_load_from_json() {
@@ -212,5 +287,110 @@ goal: g
         let dir = tempfile::tempdir().unwrap();
         let defs = load_all_from_dir(dir.path()).unwrap();
         assert!(defs.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Preset tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_builtin_presets_non_empty() {
+        let presets = builtin_presets();
+        assert!(!presets.is_empty());
+        assert_eq!(presets.len(), 6);
+    }
+
+    #[test]
+    fn test_builtin_presets_have_valid_agents() {
+        let presets = builtin_presets();
+        for preset in &presets {
+            assert!(!preset.name.is_empty());
+            assert!(!preset.domain.is_empty());
+            assert!(!preset.size.is_empty());
+            assert!(!preset.agents.is_empty());
+            for agent in &preset.agents {
+                assert!(!agent.agent_key.is_empty());
+                assert!(!agent.name.is_empty());
+                assert!(!agent.role.is_empty());
+                assert!(!agent.goal.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_load_preset_from_json_round_trip() {
+        let json = r#"{
+            "name": "test-preset",
+            "description": "A test preset",
+            "domain": "quality",
+            "size": "lean",
+            "version": "1.0.0",
+            "agents": [
+                {
+                    "agent_key": "agent-a",
+                    "name": "Agent A",
+                    "role": "tester",
+                    "goal": "test things"
+                }
+            ]
+        }"#;
+        let preset = load_preset_from_json(json).unwrap();
+        assert_eq!(preset.name, "test-preset");
+        assert_eq!(preset.domain, "quality");
+        assert_eq!(preset.size, "lean");
+        assert_eq!(preset.agents.len(), 1);
+        assert_eq!(preset.agents[0].agent_key, "agent-a");
+
+        // Round-trip back to JSON and parse again.
+        let serialized = serde_json::to_string(&preset).unwrap();
+        let restored = load_preset_from_json(&serialized).unwrap();
+        assert_eq!(restored.name, preset.name);
+        assert_eq!(restored.agents.len(), 1);
+    }
+
+    #[test]
+    fn test_load_preset_from_json_invalid() {
+        let result = load_preset_from_json("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_all_presets_from_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let preset_json = r#"{
+            "name": "p1",
+            "description": "desc",
+            "domain": "quality",
+            "size": "lean",
+            "version": "1.0.0",
+            "agents": [{"agent_key":"a","name":"A","role":"r","goal":"g"}]
+        }"#;
+        fs::write(dir.path().join("p1.json"), preset_json).unwrap();
+        // Non-JSON files should be skipped.
+        fs::write(dir.path().join("readme.txt"), "ignored").unwrap();
+
+        let presets = load_all_presets(dir.path()).unwrap();
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].name, "p1");
+    }
+
+    #[test]
+    fn test_load_preset_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let preset_json = r#"{
+            "name": "file-preset",
+            "description": "from file",
+            "domain": "devops",
+            "size": "lean",
+            "version": "2.0.0",
+            "agents": [{"agent_key":"b","name":"B","role":"r","goal":"g"}]
+        }"#;
+        let path = dir.path().join("preset.json");
+        fs::write(&path, preset_json).unwrap();
+
+        let preset = load_preset_from_file(&path).unwrap();
+        assert_eq!(preset.name, "file-preset");
+        assert_eq!(preset.domain, "devops");
+        assert_eq!(preset.version, "2.0.0");
     }
 }
