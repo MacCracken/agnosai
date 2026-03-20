@@ -22,6 +22,7 @@
 - [ADR-002: Ecosystem Tools](adr/002-ecosystem-tools.md)
 - [ADR-003: Native HTTP for LLM](adr/003-llm-native-http.md)
 - [ADR-004: Concurrency Model](adr/004-concurrency-model.md)
+- [ADR-005: ai-hwaccel Integration](adr/005-ai-hwaccel-integration.md)
 
 ## Development
 

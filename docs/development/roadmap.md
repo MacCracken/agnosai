@@ -22,6 +22,20 @@ Multiple rounds of review covering all aspects before any further feature work:
 - [ ] Performance — unnecessary allocations, hot path efficiency, memory layout
 - [ ] Code quality — dead code, naming consistency, module organization
 
+### ai-hwaccel Integration
+
+| Item | Notes | Priority |
+|------|-------|----------|
+| Optional feature-gated dependency | `[features] hwaccel = ["dep:ai-hwaccel"]` | High |
+| `HardwareInventory::detect()` via ai-hwaccel | Auto-detect GPU/TPU/NPU at node startup | High |
+| Map ai-hwaccel types → agnosai types | Compatibility shim for 13→6 accelerator variants | High |
+| Replace `AcceleratorType` with ai-hwaccel's | 13 variants, `#[non_exhaustive]`, richer model | Future |
+| `suggest_quantization()` in LLM model router | Automatic precision selection per hardware | Future |
+| `plan_sharding()` in fleet coordinator | Model distribution across devices | Future |
+| Training memory estimation in resource budget | Validate agents have enough VRAM for workload | Future |
+
+See [ADR-005](../adr/005-ai-hwaccel-integration.md) for full design.
+
 ### Remaining API & Protocol Work
 
 | Item | Notes | Priority |
