@@ -145,7 +145,10 @@ impl Relay {
         }
 
         // Dedup by sequence number.
-        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = self.seen.lock().unwrap_or_else(|e| {
+            warn!("relay seen-map mutex was poisoned, recovering");
+            e.into_inner()
+        });
         let last_seen = seen.entry(msg.from.clone()).or_insert(0);
         if msg.seq <= *last_seen {
             debug!(
@@ -194,7 +197,10 @@ impl Relay {
     pub fn stats(&self) -> RelayStats {
         self.stats
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| {
+                warn!("relay stats mutex was poisoned, recovering");
+                e.into_inner()
+            })
             .clone()
     }
 }

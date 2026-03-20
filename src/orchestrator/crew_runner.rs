@@ -119,7 +119,17 @@ impl CrewRunner {
         for (task, agent) in task_snapshots {
             let permit = semaphore.clone();
             join_set.spawn(async move {
-                let _permit = permit.acquire().await.expect("semaphore closed");
+                let _permit = match permit.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return TaskResult {
+                            task_id: task.id,
+                            status: TaskStatus::Failed,
+                            output: "internal error: concurrency semaphore closed".into(),
+                            metadata: Default::default(),
+                        };
+                    }
+                };
                 execute_task(&task, agent.as_ref()).await
             });
         }

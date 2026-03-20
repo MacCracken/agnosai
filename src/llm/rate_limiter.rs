@@ -26,12 +26,10 @@ impl RateLimiter {
     /// Acquire a permit, waiting if the concurrency cap is reached.
     ///
     /// The permit is held until dropped, at which point the slot is released.
-    pub async fn acquire(&self) -> OwnedSemaphorePermit {
-        self.semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore should never be closed")
+    /// Returns `None` if the semaphore has been closed (should not happen in
+    /// normal operation).
+    pub async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.semaphore.clone().acquire_owned().await.ok()
     }
 
     /// Number of currently available permits.
@@ -54,10 +52,10 @@ mod tests {
         let limiter = RateLimiter::new(2);
         assert_eq!(limiter.available(), 2);
 
-        let p1 = limiter.acquire().await;
+        let p1 = limiter.acquire().await.unwrap();
         assert_eq!(limiter.available(), 1);
 
-        let p2 = limiter.acquire().await;
+        let p2 = limiter.acquire().await.unwrap();
         assert_eq!(limiter.available(), 0);
 
         drop(p1);
@@ -72,7 +70,7 @@ mod tests {
         let limiter = RateLimiter::new(3);
         let limiter2 = limiter.clone();
 
-        let _p = limiter.acquire().await;
+        let _p = limiter.acquire().await.unwrap();
         assert_eq!(limiter2.available(), 2);
     }
 
@@ -85,12 +83,12 @@ mod tests {
     #[tokio::test]
     async fn waits_when_full() {
         let limiter = RateLimiter::new(1);
-        let p1 = limiter.acquire().await;
+        let p1 = limiter.acquire().await.unwrap();
 
         // Spawn a task that will wait for the permit
         let limiter2 = limiter.clone();
         let handle = tokio::spawn(async move {
-            let _p = limiter2.acquire().await;
+            let _p = limiter2.acquire().await.unwrap();
             42
         });
 
@@ -121,7 +119,7 @@ mod tests {
             let cc = concurrent_count.clone();
             let mo = max_observed.clone();
             handles.push(tokio::spawn(async move {
-                let _permit = lim.acquire().await;
+                let _permit = lim.acquire().await.unwrap();
                 let current = cc.fetch_add(1, Ordering::SeqCst) + 1;
                 // Update max observed concurrency
                 mo.fetch_max(current, Ordering::SeqCst);
@@ -151,13 +149,13 @@ mod tests {
     #[tokio::test]
     async fn release_allows_next_waiter() {
         let limiter = RateLimiter::new(1);
-        let p1 = limiter.acquire().await;
+        let p1 = limiter.acquire().await.unwrap();
         assert_eq!(limiter.available(), 0);
 
         let limiter2 = limiter.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            let _p = limiter2.acquire().await;
+            let _p = limiter2.acquire().await.unwrap();
             tx.send(()).unwrap();
             // hold briefly
             tokio::task::yield_now().await;
@@ -183,7 +181,7 @@ mod tests {
         let limiter = RateLimiter::new(5);
 
         for _ in 0..1000 {
-            let permit = limiter.acquire().await;
+            let permit = limiter.acquire().await.unwrap();
             drop(permit);
         }
 
@@ -202,7 +200,7 @@ mod tests {
         for i in 0..50 {
             let lim = limiter.clone();
             handles.push(tokio::spawn(async move {
-                let _permit = lim.acquire().await;
+                let _permit = lim.acquire().await.unwrap();
                 // Vary work slightly
                 if i % 3 == 0 {
                     tokio::task::yield_now().await;
