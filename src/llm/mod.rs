@@ -1,46 +1,21 @@
-//! LLM provider abstraction with native HTTP implementations.
+//! LLM inference via [hoosh](https://github.com/MacCracken/hoosh).
 //!
-//! Every provider is a direct HTTP client via `reqwest` — no Python SDKs,
-//! no litellm dependency. Includes model routing, health tracking, response
-//! caching, token budgeting, and rate limiting.
-//!
-//! # Providers
-//!
-//! | Provider | Type |
-//! |----------|------|
-//! | OpenAI | Direct REST |
-//! | Anthropic | Direct REST |
-//! | Ollama | Direct REST |
-//! | DeepSeek, Mistral, Groq, LM Studio, hoosh | OpenAI-compatible wrappers |
+//! All provider implementations, token budgeting, response caching, and
+//! streaming are provided by the `hoosh` crate. This module re-exports the
+//! key types and adds AgnosAI-specific task-complexity routing.
 
-pub mod budget;
-pub mod cache;
-pub mod health;
-pub mod provider;
-pub mod rate_limiter;
 pub mod router;
 
-pub mod providers;
-
-// Re-export key types for ergonomic use.
-pub use health::ProviderHealth;
-pub use provider::{
-    ChatMessage, InferenceRequest, InferenceResponse, LlmProvider, ModelInfo, ProviderType,
-    TokenUsage,
+// Re-export hoosh's core types so the rest of agnosai doesn't need to
+// depend on hoosh directly.
+pub use hoosh::budget::{TokenBudget, TokenPool};
+pub use hoosh::cache::ResponseCache;
+pub use hoosh::client::HooshClient;
+pub use hoosh::error::HooshError;
+pub use hoosh::inference::{
+    InferenceRequest, InferenceResponse, Message, ModelInfo, Role, TokenUsage,
 };
-pub use rate_limiter::RateLimiter;
+pub use hoosh::provider::{LlmProvider, ProviderType};
+
+// AgnosAI-specific task-complexity routing.
 pub use router::{Complexity, ModelTier, TaskProfile, TaskType};
-
-// Re-export provider implementations.
-pub use providers::anthropic::AnthropicProvider;
-pub use providers::deepseek::DeepSeekProvider;
-pub use providers::groq::GroqProvider;
-pub use providers::hoosh::HooshProvider;
-pub use providers::lmstudio::LmStudioProvider;
-pub use providers::mistral::MistralProvider;
-pub use providers::ollama::OllamaProvider;
-pub use providers::openai::OpenAiProvider;
-
-// Re-export cache and budget types.
-pub use budget::{BudgetExceeded, BudgetSummary, TokenBudget};
-pub use cache::{ResponseCache, cache_key};
