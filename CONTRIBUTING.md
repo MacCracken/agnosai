@@ -11,29 +11,29 @@ cargo build
 # Run tests
 cargo test
 
-# Run clippy
-cargo clippy --all-targets --all-features
-
-# Format
-cargo fmt --all
+# Run all CI checks locally
+make check
 ```
 
 ## Project Structure
 
-AgnosAI is a Cargo workspace with 9 crates. See [README.md](README.md) for the architecture overview.
-
-### Crate Dependency Order
+AgnosAI is a single Rust crate with feature-gated modules:
 
 ```
-agnosai-core          (no internal deps)
-  ├── agnosai-orchestrator
-  ├── agnosai-llm
-  ├── agnosai-fleet
-  ├── agnosai-sandbox
-  │     └── agnosai-tools
-  ├── agnosai-learning
-  ├── agnosai-definitions
-  └── agnosai-server  (depends on most crates)
+agnosai
+├── src/
+│   ├── core/             Core types, traits, error handling
+│   ├── orchestrator/     Task scheduling, agent scoring, crew execution
+│   ├── llm/              LLM provider abstraction (8 providers)
+│   ├── fleet/            Distributed fleet coordination [feature: fleet]
+│   ├── sandbox/          Tool execution isolation (WASM) [feature: sandbox]
+│   ├── tools/            Tool registry & execution
+│   ├── learning/         Adaptive learning & reinforcement learning
+│   ├── server/           HTTP API server
+│   └── definitions/      Preset library, crew assembly [feature: definitions]
+├── benches/              Criterion benchmarks
+├── tests/                Integration tests
+└── examples/             Usage examples
 ```
 
 ## Development Guidelines
@@ -41,16 +41,16 @@ agnosai-core          (no internal deps)
 ### Code Style
 
 - `cargo fmt` before committing
-- `cargo clippy` must pass with no warnings
+- `cargo clippy` must pass with zero warnings (`-D warnings`)
 - Use `thiserror` for library error types, `anyhow` only in binaries and tests
 - Prefer `Arc<RwLock<T>>` over `Mutex` when readers dominate
 - Use `DashMap` for concurrent registries with high read:write ratio
+- Every public item should have a doc comment
 
 ### Testing
 
 - Unit tests live next to the code (`#[cfg(test)] mod tests`)
-- Integration tests in `tests/integration/`
-- E2E tests in `tests/e2e/`
+- Integration tests in `tests/`
 - All async tests use `#[tokio::test]`
 
 ### Commit Messages
@@ -72,3 +72,8 @@ Open an issue with:
 - What happened
 - Minimal reproduction steps
 - Rust version (`rustc --version`)
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for vulnerability reporting. Do not open public
+issues for security vulnerabilities.

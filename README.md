@@ -19,35 +19,39 @@ AgnosAI replaces Python/CrewAI orchestration with a compiled Rust binary -- real
 ## Architecture
 
 ```
-agnosai (workspace)
-├── agnosai-core          Core types, traits, error handling
-├── agnosai-orchestrator  Task scheduling, agent scoring, crew execution (Sequential/Parallel/DAG/Hierarchical)
-├── agnosai-llm           LLM provider abstraction (8 providers, native HTTP)
-├── agnosai-fleet         Distributed fleet coordination, GPU scheduling
-├── agnosai-sandbox       Tool execution isolation (WASM, process, OCI)
-├── agnosai-tools         Tool registry & execution (native, WASM, Python bridge)
-├── agnosai-learning      Adaptive learning & reinforcement learning
-├── agnosai-server        HTTP API server (REST, health probes, SSE)
-└── agnosai-definitions   Preset library, crew assembly, packaging
+agnosai
+├── src/
+│   ├── core/             Core types, traits, error handling
+│   ├── orchestrator/     Task scheduling, agent scoring, crew execution
+│   ├── llm/              LLM provider abstraction (8 providers, native HTTP)
+│   ├── fleet/            Distributed fleet coordination, GPU scheduling [feature: fleet]
+│   ├── sandbox/          Tool execution isolation (WASM, process, OCI) [feature: sandbox]
+│   ├── tools/            Tool registry & execution (native, WASM, Python bridge)
+│   ├── learning/         Adaptive learning & reinforcement learning
+│   ├── server/           HTTP API server (REST, health probes, SSE)
+│   └── definitions/      Preset library, crew assembly, packaging [feature: definitions]
+├── benches/              Criterion benchmarks
+├── tests/                Integration tests
+├── examples/             Usage examples
+└── docs/                 Guides, ADRs, architecture docs
 ```
 
-All crates are fully implemented with tests. See [Architecture Overview](docs/architecture/overview.md) for detailed design.
+See [Architecture Overview](docs/architecture/overview.md) for detailed design.
 
 ## Quick Start
 
 ```bash
-# Build everything
+# Build
 cargo build
 
 # Run the API server
-cargo run -p agnosai-server
+cargo run --bin agnosai-server
 
-# Run tests (424 tests across all crates)
+# Run tests
 cargo test
 
-# Run clippy + format checks
-cargo clippy --all-targets --all-features
-cargo fmt --all --check
+# Run all CI checks locally
+make check
 ```
 
 ## Usage as a Library
@@ -56,13 +60,12 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agnosai-core = { git = "https://github.com/maccracken/agnosai" }
-agnosai-orchestrator = { git = "https://github.com/maccracken/agnosai" }
+agnosai = { git = "https://github.com/maccracken/agnosai" }
 ```
 
 ```rust
-use agnosai_core::{AgentDefinition, CrewSpec, Task, ProcessMode, TaskPriority};
-use agnosai_orchestrator::Orchestrator;
+use agnosai::core::{AgentDefinition, CrewSpec, Task, ProcessMode, TaskPriority};
+use agnosai::orchestrator::Orchestrator;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -153,8 +156,6 @@ First-class multi-node support:
 
 ## Test Suite
 
-424 tests across 9 crates, all passing:
-
 ```
 $ cargo test
 ...
@@ -181,4 +182,4 @@ See [docs/development/roadmap.md](docs/development/roadmap.md) for the full deve
 
 ## License
 
-Apache-2.0
+AGPL-3.0-only — see [LICENSE](LICENSE) for details.

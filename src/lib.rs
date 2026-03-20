@@ -3,6 +3,8 @@
 //! This crate unifies core types, LLM providers, task orchestration, tool
 //! execution, adaptive learning, and an HTTP API server into a single library.
 
+#![warn(missing_docs)]
+
 pub mod core;
 pub mod learning;
 pub mod llm;
