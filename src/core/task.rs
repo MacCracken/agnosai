@@ -7,6 +7,7 @@ use crate::core::AgentId;
 pub type TaskId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Task {
     pub id: TaskId,
     pub description: String,
@@ -41,6 +42,7 @@ impl Task {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TaskPriority {
     Background = 0,
     Low = 1,
@@ -52,6 +54,7 @@ pub enum TaskPriority {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TaskStatus {
     #[default]
     Pending,
@@ -63,6 +66,7 @@ pub enum TaskStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TaskResult {
     pub task_id: TaskId,
     pub output: String,
@@ -81,6 +85,7 @@ pub struct TaskDAG {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ProcessMode {
     #[default]
     Sequential,

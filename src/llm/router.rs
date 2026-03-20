@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Model tier — maps to concrete models per provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ModelTier {
     /// Cheapest / fastest models (e.g. gpt-4o-mini, haiku, gemma).
     Fast,
@@ -22,6 +23,7 @@ pub enum ModelTier {
 /// What kind of task is being performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TaskType {
     Summarize,
     Classify,
@@ -35,6 +37,7 @@ pub enum TaskType {
 /// How complex the task is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Complexity {
     Simple,
     Medium,
@@ -102,10 +105,7 @@ pub fn suggest_quantization(
 ///
 /// Returns the estimated memory in bytes.
 #[cfg(feature = "hwaccel")]
-pub fn estimate_model_memory(
-    model_params: u64,
-    quant: &ai_hwaccel::QuantizationLevel,
-) -> u64 {
+pub fn estimate_model_memory(model_params: u64, quant: &ai_hwaccel::QuantizationLevel) -> u64 {
     ai_hwaccel::AcceleratorRegistry::estimate_memory(model_params, quant)
 }
 

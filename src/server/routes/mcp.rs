@@ -10,6 +10,7 @@ use crate::tools::ToolInput;
 use crate::server::state::SharedState;
 
 #[derive(Deserialize)]
+#[non_exhaustive]
 pub struct JsonRpcRequest {
     #[allow(dead_code)]
     pub jsonrpc: String,
@@ -20,6 +21,7 @@ pub struct JsonRpcRequest {
 }
 
 #[derive(Serialize)]
+#[non_exhaustive]
 pub struct JsonRpcResponse {
     pub jsonrpc: String,
     pub id: Value,
@@ -181,8 +183,8 @@ async fn handle_tools_call(id: Value, params: &Value, state: &SharedState) -> Js
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::state::{AppState, SharedState};
     use crate::orchestrator::Orchestrator;
+    use crate::server::state::{AppState, SharedState};
     use crate::tools::ToolRegistry;
     use crate::tools::builtin::echo::EchoTool;
     use axum::Router;

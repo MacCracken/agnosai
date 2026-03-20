@@ -12,6 +12,7 @@ pub type CrewRunId = Uuid;
 
 /// Phase of a distributed crew run.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CrewPhase {
     Initializing,
     Running,
@@ -54,6 +55,7 @@ pub struct Checkpoint {
 
 /// Result of a barrier synchronisation attempt.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BarrierResult {
     /// Still waiting; value is the number of nodes that have not yet reached the barrier.
     Waiting(usize),

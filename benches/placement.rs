@@ -32,8 +32,7 @@ fn gpu_node_with_hw(id: &str, num_gpus: usize, vram_per_gpu: u64) -> NodeInfo {
         memory_total_mb: 524288,
         devices,
     };
-    NodeInfo::new(id, num_gpus as u32, vram_per_gpu)
-        .with_hardware(inv)
+    NodeInfo::new(id, num_gpus as u32, vram_per_gpu).with_hardware(inv)
 }
 
 fn make_fleet(n: usize) -> Vec<NodeInfo> {

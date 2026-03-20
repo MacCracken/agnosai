@@ -10,8 +10,8 @@ pub async fn list_tools(State(state): State<SharedState>) -> Json<Vec<ToolSchema
 
 #[cfg(test)]
 mod tests {
-    use crate::server::state::{AppState, SharedState};
     use crate::orchestrator::Orchestrator;
+    use crate::server::state::{AppState, SharedState};
     use crate::tools::ToolRegistry;
     use crate::tools::builtin::echo::EchoTool;
     use crate::tools::builtin::json_transform::JsonTransformTool;

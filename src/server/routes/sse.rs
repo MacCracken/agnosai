@@ -40,8 +40,8 @@ pub async fn crew_stream(
 
 #[cfg(test)]
 mod tests {
-    use crate::server::state::{AppState, SharedState};
     use crate::orchestrator::Orchestrator;
+    use crate::server::state::{AppState, SharedState};
     use crate::tools::ToolRegistry;
     use axum::Router;
     use axum::http::{Request, StatusCode};

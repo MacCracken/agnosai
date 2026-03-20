@@ -14,24 +14,11 @@ use agnosai::core::task::{ProcessMode, Task, TaskStatus};
 use agnosai::orchestrator::crew_runner::CrewRunner;
 use agnosai::tools::builtin::echo::EchoTool;
 use agnosai::tools::registry::ToolRegistry;
-use uuid::Uuid;
 
 fn make_agent(key: &str, role: &str, goal: &str, tools: Vec<&str>) -> AgentDefinition {
-    AgentDefinition {
-        agent_key: key.into(),
-        name: key.into(),
-        role: role.into(),
-        goal: goal.into(),
-        backstory: None,
-        domain: Some("quality".into()),
-        tools: tools.into_iter().map(String::from).collect(),
-        complexity: "medium".into(),
-        llm_model: None,
-        gpu_required: false,
-        gpu_preferred: false,
-        gpu_memory_min_mb: None,
-        hardware: None,
-    }
+    AgentDefinition::new(key, role, goal)
+        .with_tools(tools.into_iter().map(String::from).collect())
+        .with_domain("quality")
 }
 
 #[tokio::test]
@@ -67,14 +54,6 @@ async fn crew_with_tools_dag_pipeline() {
     assert_eq!(tool.name(), "echo");
 
     // ── 3. Build CrewSpec with DAG tasks ─────────────────────────────
-    //
-    // DAG shape:
-    //   gather_reqs
-    //       |
-    //   design_system
-    //       |
-    //   review_output
-    //
     let gather_reqs = Task::new("Gather and document project requirements");
     let mut design_system = Task::new("Design system architecture based on requirements");
     design_system.dependencies.push(gather_reqs.id);
@@ -86,14 +65,10 @@ async fn crew_with_tools_dag_pipeline() {
     let design_id = design_system.id;
     let review_id = review_output.id;
 
-    let spec = CrewSpec {
-        id: Uuid::new_v4(),
-        name: "integration-test-crew".into(),
-        agents: vec![analyst, designer, reviewer],
-        tasks: vec![gather_reqs, design_system, review_output],
-        process: ProcessMode::Dag,
-        metadata: Default::default(),
-    };
+    let spec = CrewSpec::new("integration-test-crew")
+        .with_agents(vec![analyst, designer, reviewer])
+        .with_tasks(vec![gather_reqs, design_system, review_output])
+        .with_process(ProcessMode::Dag);
 
     // ── 4. Run through CrewRunner ───────────────────────────────────
     let mut runner = CrewRunner::new(spec);
@@ -107,12 +82,10 @@ async fn crew_with_tools_dag_pipeline() {
     );
     assert_eq!(state.results.len(), 3, "should have 3 task results");
 
-    // All tasks completed.
     for result in &state.results {
         assert_eq!(result.status, TaskStatus::Completed);
     }
 
-    // Results must arrive in dependency order: gather < design < review.
     let pos_of = |id: uuid::Uuid| {
         state
             .results
@@ -124,16 +97,9 @@ async fn crew_with_tools_dag_pipeline() {
     let design_pos = pos_of(design_id);
     let review_pos = pos_of(review_id);
 
-    assert!(
-        gather_pos < design_pos,
-        "gather_reqs must complete before design_system"
-    );
-    assert!(
-        design_pos < review_pos,
-        "design_system must complete before review_output"
-    );
+    assert!(gather_pos < design_pos);
+    assert!(design_pos < review_pos);
 
-    // Verify task outputs contain their descriptions (placeholder execution).
     let gather_result = state
         .results
         .iter()
@@ -162,7 +128,6 @@ async fn crew_with_tools_dag_pipeline() {
 
 #[tokio::test]
 async fn crew_with_tools_parallel_pipeline() {
-    // Verify the pipeline also works with parallel process mode.
     let agents = vec![
         make_agent("agent-a", "worker", "do work", vec!["echo"]),
         make_agent("agent-b", "worker", "do work", vec!["echo"]),
@@ -177,14 +142,10 @@ async fn crew_with_tools_parallel_pipeline() {
         Task::new("parallel task 3"),
     ];
 
-    let spec = CrewSpec {
-        id: Uuid::new_v4(),
-        name: "parallel-integration-crew".into(),
-        agents,
-        tasks,
-        process: ProcessMode::Parallel { max_concurrency: 2 },
-        metadata: Default::default(),
-    };
+    let spec = CrewSpec::new("parallel-integration-crew")
+        .with_agents(agents)
+        .with_tasks(tasks)
+        .with_process(ProcessMode::Parallel { max_concurrency: 2 });
 
     let mut runner = CrewRunner::new(spec);
     let state = runner.run().await.expect("crew run should succeed");

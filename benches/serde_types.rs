@@ -2,9 +2,9 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
+use agnosai::core::agent::AgentDefinition;
 use agnosai::core::resource::*;
 use agnosai::core::task::*;
-use agnosai::core::agent::AgentDefinition;
 
 fn bench_hardware_inventory_json(c: &mut Criterion) {
     let mut devices = Vec::new();

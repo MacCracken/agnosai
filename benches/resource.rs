@@ -57,7 +57,7 @@ fn bench_satisfies(c: &mut Criterion) {
         min_memory_mb: 40960,
         min_device_count: 4,
         min_cpu_cores: 64,
-            required_family: None,
+        required_family: None,
     };
     c.bench_function("satisfies (10 devices, CUDA req)", |b| {
         b.iter(|| inv.satisfies(&req));
@@ -112,7 +112,7 @@ fn bench_satisfies_small(c: &mut Criterion) {
         min_memory_mb: 40000,
         min_device_count: 1,
         min_cpu_cores: 4,
-            required_family: None,
+        required_family: None,
     };
     c.bench_function("satisfies (1 device, CUDA req)", |b| {
         b.iter(|| inv.satisfies(&req));

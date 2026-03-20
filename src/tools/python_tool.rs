@@ -69,7 +69,10 @@ mod inner {
             }
         }
 
-        fn execute(&self, input: ToolInput) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+        fn execute(
+            &self,
+            input: ToolInput,
+        ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
             Box::pin(async move {
                 let params = serde_json::Value::Object(
                     input
@@ -102,9 +105,7 @@ mod inner {
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(true);
                                 if success {
-                                    ToolOutput::ok(
-                                        value.get("result").cloned().unwrap_or(value),
-                                    )
+                                    ToolOutput::ok(value.get("result").cloned().unwrap_or(value))
                                 } else {
                                     let err = value
                                         .get("error")
@@ -113,9 +114,9 @@ mod inner {
                                     ToolOutput::err(err)
                                 }
                             }
-                            Err(_) => {
-                                ToolOutput::ok(serde_json::Value::String(result.stdout.trim().to_string()))
-                            }
+                            Err(_) => ToolOutput::ok(serde_json::Value::String(
+                                result.stdout.trim().to_string(),
+                            )),
                         }
                     }
                     Err(e) => ToolOutput::err(format!("python sandbox error: {e}")),

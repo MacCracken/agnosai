@@ -7,21 +7,14 @@ use agnosai::core::task::Task;
 use agnosai::orchestrator::scoring::{rank_agents, score_agent};
 
 fn make_agent(tools: Vec<&str>, complexity: &str, domain: Option<&str>) -> AgentDefinition {
-    AgentDefinition {
-        agent_key: "bench-agent".into(),
-        name: "Bench Agent".into(),
-        role: "bench".into(),
-        goal: "benchmark".into(),
-        backstory: None,
-        domain: domain.map(|s| s.to_string()),
-        tools: tools.into_iter().map(|s| s.to_string()).collect(),
-        complexity: complexity.to_string(),
-        llm_model: None,
-        gpu_required: false,
-        gpu_preferred: false,
-        gpu_memory_min_mb: None,
-        hardware: None,
+    let mut agent = AgentDefinition::new("bench-agent", "bench", "benchmark")
+        .with_name("Bench Agent")
+        .with_tools(tools.into_iter().map(|s| s.to_string()).collect());
+    agent.complexity = complexity.to_string();
+    if let Some(d) = domain {
+        agent = agent.with_domain(d);
     }
+    agent
 }
 
 fn make_rich_task() -> Task {
@@ -74,11 +67,7 @@ fn bench_rank_agents_10(c: &mut Criterion) {
                     1 => "medium",
                     _ => "high",
                 },
-                if i % 2 == 0 {
-                    Some("finance")
-                } else {
-                    None
-                },
+                if i % 2 == 0 { Some("finance") } else { None },
             )
         })
         .collect();

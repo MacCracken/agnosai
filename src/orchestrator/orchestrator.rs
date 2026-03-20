@@ -63,9 +63,7 @@ impl Orchestrator {
             crew.status = CrewStatus::Cancelled;
             Ok(())
         } else {
-            Err(crate::core::AgnosaiError::CrewNotFound(
-                crew_id.to_string(),
-            ))
+            Err(crate::core::AgnosaiError::CrewNotFound(crew_id.to_string()))
         }
     }
 

@@ -118,14 +118,14 @@ impl ProcessSandbox {
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            AgnosaiError::Sandbox(format!("failed to spawn {}: {e}", argv[0]))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| AgnosaiError::Sandbox(format!("failed to spawn {}: {e}", argv[0])))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(input.as_bytes()).await {
-                warn!("failed to write to process stdin: {e}");
-            }
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(e) = stdin.write_all(input.as_bytes()).await
+        {
+            warn!("failed to write to process stdin: {e}");
         }
 
         match tokio::time::timeout(self.config.timeout, child.wait_with_output()).await {
@@ -141,7 +141,10 @@ impl ProcessSandbox {
             }
             Ok(Err(e)) => Err(AgnosaiError::Sandbox(format!("process I/O error: {e}"))),
             Err(_) => {
-                warn!(timeout_secs = self.config.timeout.as_secs(), "sandboxed process (argv) timed out");
+                warn!(
+                    timeout_secs = self.config.timeout.as_secs(),
+                    "sandboxed process (argv) timed out"
+                );
                 Ok(ProcessResult {
                     stdout: String::new(),
                     stderr: String::new(),
@@ -159,11 +162,7 @@ impl ProcessSandbox {
     ///
     /// **Security warning**: When using a shell sandbox, the command string
     /// is interpreted by the shell. Use `execute_argv()` for untrusted input.
-    pub async fn execute(
-        &self,
-        command: &str,
-        input: &str,
-    ) -> crate::core::Result<ProcessResult> {
+    pub async fn execute(&self, command: &str, input: &str) -> crate::core::Result<ProcessResult> {
         use std::process::Stdio;
 
         debug!(
@@ -202,12 +201,11 @@ impl ProcessSandbox {
             ))
         })?;
 
-        // Write input to stdin.
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(input.as_bytes()).await {
-                warn!("failed to write to process stdin: {e}");
-            }
-            // Drop closes the pipe.
+        // Write input to stdin, then drop to close the pipe.
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(e) = stdin.write_all(input.as_bytes()).await
+        {
+            warn!("failed to write to process stdin: {e}");
         }
 
         match tokio::time::timeout(self.config.timeout, child.wait_with_output()).await {

@@ -4,11 +4,11 @@
 //! execution, adaptive learning, and an HTTP API server into a single library.
 
 pub mod core;
+pub mod learning;
 pub mod llm;
 pub mod orchestrator;
-pub mod tools;
-pub mod learning;
 pub mod server;
+pub mod tools;
 
 #[cfg(feature = "sandbox")]
 pub mod sandbox;

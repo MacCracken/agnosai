@@ -3,6 +3,7 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, AgnosaiError>;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AgnosaiError {
     #[error("agent not found: {0}")]
     AgentNotFound(String),

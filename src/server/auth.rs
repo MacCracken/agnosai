@@ -10,6 +10,7 @@ use axum::response::Response;
 
 /// JWT/auth configuration.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct AuthConfig {
     pub enabled: bool,
     pub secret: String,

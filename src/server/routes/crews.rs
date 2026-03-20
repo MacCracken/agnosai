@@ -9,6 +9,7 @@ use crate::core::{AgentDefinition, CrewSpec, ProcessMode, Task, TaskPriority};
 use crate::server::state::SharedState;
 
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct TaskRequest {
     pub description: String,
     #[serde(default)]
@@ -20,6 +21,7 @@ pub struct TaskRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct CrewRunRequest {
     pub name: String,
     pub agents: Vec<AgentDefinition>,
@@ -29,6 +31,7 @@ pub struct CrewRunRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[non_exhaustive]
 pub struct CrewRunResponse {
     pub crew_id: Uuid,
     pub status: String,
@@ -36,6 +39,7 @@ pub struct CrewRunResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[non_exhaustive]
 pub struct TaskResultResponse {
     pub task_id: Uuid,
     pub output: String,
@@ -178,8 +182,8 @@ pub async fn get_crew(
 
 #[cfg(test)]
 mod tests {
-    use crate::server::state::{AppState, SharedState};
     use crate::orchestrator::Orchestrator;
+    use crate::server::state::{AppState, SharedState};
     use crate::tools::ToolRegistry;
     use axum::Router;
     use axum::http::{Request, StatusCode};

@@ -117,11 +117,7 @@ impl Relay {
     }
 
     /// Broadcast a message to all nodes.
-    pub fn broadcast(
-        &self,
-        topic: impl Into<String>,
-        payload: serde_json::Value,
-    ) -> u64 {
+    pub fn broadcast(&self, topic: impl Into<String>, payload: serde_json::Value) -> u64 {
         self.send("", topic, payload)
     }
 

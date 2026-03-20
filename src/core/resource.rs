@@ -5,12 +5,9 @@ use serde::{Deserialize, Serialize};
 // sharding plans, and training methods without depending on ai-hwaccel directly.
 #[cfg(feature = "hwaccel")]
 pub use ai_hwaccel::{
-    AcceleratorFamily as HwAccelFamily,
-    AcceleratorRequirement as HwAccelRequirement,
-    AcceleratorType as HwAccelType,
-    QuantizationLevel,
-    ShardingPlan, ShardingStrategy, ModelShard,
-    TrainingMethod, TrainingTarget, MemoryEstimate,
+    AcceleratorFamily as HwAccelFamily, AcceleratorRequirement as HwAccelRequirement,
+    AcceleratorType as HwAccelType, MemoryEstimate, ModelShard, QuantizationLevel, ShardingPlan,
+    ShardingStrategy, TrainingMethod, TrainingTarget,
 };
 
 /// Broad accelerator family for requirement matching.
@@ -20,6 +17,7 @@ pub use ai_hwaccel::{
 /// specific vendor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AcceleratorFamily {
     Cpu,
     Gpu,
@@ -36,6 +34,7 @@ pub enum AcceleratorFamily {
 /// when you need the full vendor-specific detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AcceleratorType {
     Cpu,
     Cuda,
@@ -156,10 +155,8 @@ impl HardwareInventory {
         for (i, profile) in registry.all_profiles().iter().enumerate() {
             let accel = AcceleratorType::from_hwaccel(&profile.accelerator);
             let mem_mb = profile.memory_bytes / (1024 * 1024);
-            let avail_mb = profile
-                .memory_free_bytes
-                .unwrap_or(profile.memory_bytes)
-                / (1024 * 1024);
+            let avail_mb =
+                profile.memory_free_bytes.unwrap_or(profile.memory_bytes) / (1024 * 1024);
 
             if matches!(profile.accelerator, ai_hwaccel::AcceleratorType::Cpu) {
                 // Use CPU memory as system memory total; estimate cores from
@@ -732,7 +729,10 @@ mod tests {
     fn hwaccel_accelerator_type_mapping() {
         use ai_hwaccel::AcceleratorType as HW;
 
-        assert_eq!(AcceleratorType::from_hwaccel(&HW::Cpu), AcceleratorType::Cpu);
+        assert_eq!(
+            AcceleratorType::from_hwaccel(&HW::Cpu),
+            AcceleratorType::Cpu
+        );
         assert_eq!(
             AcceleratorType::from_hwaccel(&HW::CudaGpu { device_id: 0 }),
             AcceleratorType::Cuda
@@ -831,9 +831,9 @@ mod tests {
     fn hwaccel_empty_registry_gives_cpu_only() {
         use ai_hwaccel::{AcceleratorProfile, AcceleratorRegistry};
 
-        let registry = AcceleratorRegistry::from_profiles(vec![
-            AcceleratorProfile::cpu(16 * 1024 * 1024 * 1024),
-        ]);
+        let registry = AcceleratorRegistry::from_profiles(vec![AcceleratorProfile::cpu(
+            16 * 1024 * 1024 * 1024,
+        )]);
         let inv = HardwareInventory::from_hwaccel(&registry);
 
         assert!(inv.devices.is_empty());
@@ -870,7 +870,10 @@ mod tests {
             // Full fine-tune of 7B needs model + optimizer + activations.
             assert!(est.total_gb > 0.0, "total should be positive");
             assert!(est.model_gb > 0.0, "model memory should be positive");
-            assert!(est.optimizer_gb > 0.0, "optimizer memory should be positive");
+            assert!(
+                est.optimizer_gb > 0.0,
+                "optimizer memory should be positive"
+            );
             assert!(
                 est.total_gb >= est.model_gb,
                 "total should be >= model alone"

@@ -12,8 +12,8 @@ pub async fn ready() -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::state::{AppState, SharedState};
     use crate::orchestrator::Orchestrator;
+    use crate::server::state::{AppState, SharedState};
     use crate::tools::ToolRegistry;
     use axum::Router;
     use axum::http::{Request, StatusCode};

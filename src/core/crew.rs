@@ -7,6 +7,7 @@ use crate::core::task::{ProcessMode, Task, TaskResult};
 pub type CrewId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CrewSpec {
     pub id: CrewId,
     pub name: String,
@@ -29,6 +30,21 @@ impl CrewSpec {
             metadata: std::collections::HashMap::new(),
         }
     }
+
+    pub fn with_agents(mut self, agents: Vec<AgentDefinition>) -> Self {
+        self.agents = agents;
+        self
+    }
+
+    pub fn with_tasks(mut self, tasks: Vec<Task>) -> Self {
+        self.tasks = tasks;
+        self
+    }
+
+    pub fn with_process(mut self, process: ProcessMode) -> Self {
+        self.process = process;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +56,7 @@ pub struct CrewState {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CrewStatus {
     #[default]
     Pending,

@@ -13,6 +13,7 @@ pub type NodeId = String;
 
 /// Status of a fleet node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum NodeStatus {
     Online,
     /// Missed heartbeat but within grace period.

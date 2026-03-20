@@ -4,6 +4,7 @@ use uuid::Uuid;
 use crate::core::AgentId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Message {
     pub id: Uuid,
     pub from: AgentId,
@@ -14,6 +15,7 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageTarget {
     Agent(AgentId),
     Topic(String),

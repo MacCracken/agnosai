@@ -8,6 +8,7 @@ use std::pin::Pin;
 
 /// Description of a single tool parameter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ParameterSchema {
     pub name: String,
     pub description: String,
@@ -18,6 +19,7 @@ pub struct ParameterSchema {
 
 /// Schema describing a tool's name, purpose, and accepted parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolSchema {
     pub name: String,
     pub description: String,
@@ -26,6 +28,7 @@ pub struct ToolSchema {
 
 /// Input passed to a tool's `execute` method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolInput {
     /// Parameter values keyed by name.
     pub parameters: HashMap<String, Value>,
@@ -50,6 +53,7 @@ impl ToolInput {
 
 /// Output returned from a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolOutput {
     pub success: bool,
     pub result: Value,

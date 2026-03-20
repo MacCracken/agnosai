@@ -11,3 +11,10 @@ pub mod placement;
 pub mod registry;
 pub mod relay;
 pub mod state;
+
+pub use coordinator::FleetCoordinator;
+pub use federation::FederationManager;
+pub use placement::{PlacementPolicy, PlacementRequest, PlacementResult, place, rank_nodes};
+pub use registry::{NodeId, NodeInfo, NodeRegistry, NodeStatus};
+pub use relay::Relay;
+pub use state::CrewRunId;

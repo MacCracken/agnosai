@@ -84,7 +84,10 @@ mod inner {
             }
         }
 
-        fn execute(&self, input: ToolInput) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+        fn execute(
+            &self,
+            input: ToolInput,
+        ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
             Box::pin(async move {
                 let input_json = match serde_json::to_string(&serde_json::json!({
                     "parameters": input.parameters,
@@ -108,9 +111,7 @@ mod inner {
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(true);
                                 if success {
-                                    ToolOutput::ok(
-                                        value.get("result").cloned().unwrap_or(value),
-                                    )
+                                    ToolOutput::ok(value.get("result").cloned().unwrap_or(value))
                                 } else {
                                     let err = value
                                         .get("error")

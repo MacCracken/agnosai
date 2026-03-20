@@ -10,9 +10,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// The numeric strength value is used by the sandbox manager to select the
 /// cheapest backend that meets a tool's minimum requirement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[non_exhaustive]
 pub enum IsolationLevel {
     /// In-process execution (native Rust tools). No sandbox overhead.
+    #[default]
     None = 0,
     /// WASM sandbox — memory-isolated, no filesystem/network.
     Wasm = 1,
@@ -29,14 +33,9 @@ impl IsolationLevel {
     }
 }
 
-impl Default for IsolationLevel {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 /// Policy governing how a tool should be sandboxed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SandboxPolicy {
     /// Minimum isolation level required.
     pub min_isolation: IsolationLevel,

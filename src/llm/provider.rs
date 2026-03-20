@@ -14,6 +14,7 @@ pub trait LlmProvider: Send + Sync {
 pub type Result<T> = core::result::Result<T, crate::core::AgnosaiError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InferenceRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -26,12 +27,14 @@ pub struct InferenceRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InferenceResponse {
     pub content: String,
     pub model: String,
@@ -39,6 +42,7 @@ pub struct InferenceResponse {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -46,6 +50,7 @@ pub struct TokenUsage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
@@ -54,6 +59,7 @@ pub struct ModelInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ProviderType {
     OpenAi,
     Anthropic,

@@ -13,6 +13,7 @@
 
 pub mod crew_runner;
 pub mod ipc;
+#[allow(clippy::module_inception)]
 pub mod orchestrator;
 pub mod pubsub;
 pub mod scheduler;

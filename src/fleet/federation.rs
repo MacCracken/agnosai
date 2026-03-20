@@ -19,6 +19,7 @@ pub type ClusterId = String;
 
 /// Role of a cluster in the federation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum FederationRole {
     /// This cluster is the coordinator (leader).
     Coordinator,
@@ -30,6 +31,7 @@ pub enum FederationRole {
 
 /// Status of a federated cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ClusterStatus {
     Online,
     Suspect,
@@ -122,21 +124,18 @@ impl FederationManager {
     /// Register or update a peer cluster from a heartbeat.
     pub fn heartbeat(&mut self, cluster_id: ClusterId, endpoint: String, node_count: usize) {
         let now = Instant::now();
-        let entry = self
-            .clusters
-            .entry(cluster_id.clone())
-            .or_insert_with(|| {
-                info!(cluster = %cluster_id, "new cluster joined federation");
-                ClusterInfo {
-                    id: cluster_id.clone(),
-                    endpoint: endpoint.clone(),
-                    status: ClusterStatus::Online,
-                    role: FederationRole::Follower,
-                    node_count: 0,
-                    last_heartbeat: Utc::now(),
-                    last_heartbeat_instant: now,
-                }
-            });
+        let entry = self.clusters.entry(cluster_id.clone()).or_insert_with(|| {
+            info!(cluster = %cluster_id, "new cluster joined federation");
+            ClusterInfo {
+                id: cluster_id.clone(),
+                endpoint: endpoint.clone(),
+                status: ClusterStatus::Online,
+                role: FederationRole::Follower,
+                node_count: 0,
+                last_heartbeat: Utc::now(),
+                last_heartbeat_instant: now,
+            }
+        });
 
         entry.endpoint = endpoint;
         entry.node_count = node_count;
@@ -152,16 +151,14 @@ impl FederationManager {
         let now = Instant::now();
         for cluster in self.clusters.values_mut() {
             let elapsed = now.duration_since(cluster.last_heartbeat_instant);
-            if elapsed > self.config.offline_timeout {
-                if cluster.status != ClusterStatus::Offline {
-                    warn!(cluster = %cluster.id, "cluster marked offline");
-                    cluster.status = ClusterStatus::Offline;
-                }
-            } else if elapsed > self.config.suspect_timeout {
-                if cluster.status == ClusterStatus::Online {
-                    warn!(cluster = %cluster.id, "cluster marked suspect");
-                    cluster.status = ClusterStatus::Suspect;
-                }
+            if elapsed > self.config.offline_timeout && cluster.status != ClusterStatus::Offline {
+                warn!(cluster = %cluster.id, "cluster marked offline");
+                cluster.status = ClusterStatus::Offline;
+            } else if elapsed > self.config.suspect_timeout
+                && cluster.status == ClusterStatus::Online
+            {
+                warn!(cluster = %cluster.id, "cluster marked suspect");
+                cluster.status = ClusterStatus::Suspect;
             }
         }
     }
@@ -339,7 +336,10 @@ mod tests {
         fm.heartbeat("cluster-b".into(), "http://b:8080".into(), 10);
 
         assert_eq!(fm.cluster_count(), 1);
-        let b = fm.clusters.get("cluster-b").expect("cluster-b should exist");
+        let b = fm
+            .clusters
+            .get("cluster-b")
+            .expect("cluster-b should exist");
         assert_eq!(b.node_count, 10);
     }
 

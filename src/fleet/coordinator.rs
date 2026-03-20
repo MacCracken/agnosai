@@ -18,6 +18,7 @@ pub struct FleetTask {
 
 /// Status of a fleet task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FleetTaskStatus {
     Pending,
     Assigned,
@@ -30,6 +31,7 @@ pub enum FleetTaskStatus {
 
 /// Action to take after a task failure.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FailoverAction {
     /// Task can be retried on another node.
     Retry,
@@ -434,8 +436,11 @@ mod tests {
                 AcceleratorProfile::cpu(64 * 1024 * 1024 * 1024),
                 AcceleratorProfile::cuda(0, 80 * 1024 * 1024 * 1024),
             ]);
-            let plan =
-                FleetCoordinator::plan_sharding(7_000_000_000, &QuantizationLevel::Float16, &registry);
+            let plan = FleetCoordinator::plan_sharding(
+                7_000_000_000,
+                &QuantizationLevel::Float16,
+                &registry,
+            );
             assert!(
                 plan.shards.len() <= 1,
                 "7B FP16 on 80GB should not need sharding, got {} shards",

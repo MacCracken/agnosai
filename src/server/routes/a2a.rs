@@ -38,7 +38,8 @@ fn is_safe_callback_url(url: &str) -> bool {
                 if v4.is_private()
                     || v4.is_loopback()
                     || v4.is_link_local()
-                    || v4.octets()[0] == 169 && v4.octets()[1] == 254 // metadata service
+                    || v4.octets()[0] == 169 && v4.octets()[1] == 254
+                // metadata service
                 {
                     return false;
                 }
@@ -56,6 +57,7 @@ fn is_safe_callback_url(url: &str) -> bool {
 
 /// A2A task delegation request — matches Agnostic v1 format.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct A2ARequest {
     pub task_id: String,
     pub description: String,
@@ -72,6 +74,7 @@ pub struct A2ARequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct A2AResponse {
     pub task_id: String,
     pub status: String, // "accepted", "completed", "failed"
@@ -156,8 +159,8 @@ pub async fn status() -> Json<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
-    use crate::server::state::{AppState, SharedState};
     use crate::orchestrator::Orchestrator;
+    use crate::server::state::{AppState, SharedState};
     use crate::tools::ToolRegistry;
     use axum::Router;
     use axum::http::{Request, StatusCode};

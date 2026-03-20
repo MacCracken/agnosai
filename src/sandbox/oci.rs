@@ -152,10 +152,10 @@ impl OciSandbox {
             ))
         })?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(input.as_bytes()).await {
-                warn!("failed to write to container stdin: {e}");
-            }
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(e) = stdin.write_all(input.as_bytes()).await
+        {
+            warn!("failed to write to container stdin: {e}");
         }
 
         match tokio::time::timeout(self.config.timeout, child.wait_with_output()).await {
@@ -169,9 +169,7 @@ impl OciSandbox {
                     timed_out: false,
                 })
             }
-            Ok(Err(e)) => Err(AgnosaiError::Sandbox(format!(
-                "container I/O error: {e}"
-            ))),
+            Ok(Err(e)) => Err(AgnosaiError::Sandbox(format!("container I/O error: {e}"))),
             Err(_) => {
                 warn!(
                     timeout_secs = self.config.timeout.as_secs(),

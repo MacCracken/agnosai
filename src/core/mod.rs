@@ -37,8 +37,7 @@ pub use resource::{
 };
 #[cfg(feature = "hwaccel")]
 pub use resource::{
-    HwAccelFamily, HwAccelRequirement, HwAccelType, MemoryEstimate, ModelShard,
-    QuantizationLevel, ShardingPlan, ShardingStrategy, TrainingMemoryEstimate, TrainingMethod,
-    TrainingTarget,
+    HwAccelFamily, HwAccelRequirement, HwAccelType, MemoryEstimate, ModelShard, QuantizationLevel,
+    ShardingPlan, ShardingStrategy, TrainingMemoryEstimate, TrainingMethod, TrainingTarget,
 };
 pub use task::{ProcessMode, Task, TaskDAG, TaskPriority, TaskResult, TaskStatus};

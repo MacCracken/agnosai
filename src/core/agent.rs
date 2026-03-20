@@ -6,6 +6,7 @@ use crate::core::resource::{AcceleratorType, HardwareRequirement};
 pub type AgentId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AgentDefinition {
     pub agent_key: String,
     pub name: String,
@@ -38,6 +39,54 @@ fn default_complexity() -> String {
 }
 
 impl AgentDefinition {
+    /// Create a minimal agent definition with the required fields.
+    pub fn new(
+        agent_key: impl Into<String>,
+        role: impl Into<String>,
+        goal: impl Into<String>,
+    ) -> Self {
+        let key = agent_key.into();
+        Self {
+            name: key.clone(),
+            agent_key: key,
+            role: role.into(),
+            goal: goal.into(),
+            backstory: None,
+            domain: None,
+            tools: Vec::new(),
+            complexity: default_complexity(),
+            llm_model: None,
+            gpu_required: false,
+            gpu_preferred: false,
+            gpu_memory_min_mb: None,
+            hardware: None,
+        }
+    }
+
+    /// Set the agent's tool list.
+    pub fn with_tools(mut self, tools: Vec<String>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Set the agent's domain.
+    pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    /// Set the agent's name (defaults to agent_key).
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Set hardware requirements.
+    pub fn with_hardware(mut self, hw: HardwareRequirement) -> Self {
+        self.hardware = Some(hw);
+        self
+    }
+
     pub fn from_json(json: &str) -> crate::core::Result<Self> {
         serde_json::from_str(json).map_err(crate::core::AgnosaiError::Serialization)
     }
@@ -62,6 +111,7 @@ impl AgentDefinition {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AgentState {
     #[default]
     Idle,
@@ -217,7 +267,7 @@ mod tests {
                 min_memory_mb: 32768,
                 min_device_count: 2,
                 min_cpu_cores: 0,
-            required_family: None,
+                required_family: None,
             }),
         };
         let req = agent.hardware_requirement();
@@ -295,7 +345,7 @@ mod tests {
                 min_memory_mb: 16384,
                 min_device_count: 1,
                 min_cpu_cores: 4,
-            required_family: None,
+                required_family: None,
             }),
         };
         let json = serde_json::to_string(&agent).unwrap();
