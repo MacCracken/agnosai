@@ -42,10 +42,57 @@ pub struct TaskResultResponse {
     pub status: String,
 }
 
+/// Maximum number of agents per crew.
+const MAX_AGENTS: usize = 100;
+/// Maximum number of tasks per crew.
+const MAX_TASKS: usize = 1000;
+/// Maximum string field length.
+const MAX_STRING_LEN: usize = 10_000;
+
+fn validate_crew_request(req: &CrewRunRequest) -> Result<(), String> {
+    if req.name.is_empty() || req.name.len() > MAX_STRING_LEN {
+        return Err(format!("name must be 1-{MAX_STRING_LEN} characters"));
+    }
+    if req.agents.is_empty() {
+        return Err("at least one agent is required".into());
+    }
+    if req.agents.len() > MAX_AGENTS {
+        return Err(format!("at most {MAX_AGENTS} agents allowed"));
+    }
+    if req.tasks.is_empty() {
+        return Err("at least one task is required".into());
+    }
+    if req.tasks.len() > MAX_TASKS {
+        return Err(format!("at most {MAX_TASKS} tasks allowed"));
+    }
+    for (i, agent) in req.agents.iter().enumerate() {
+        if agent.agent_key.len() > MAX_STRING_LEN || agent.role.len() > MAX_STRING_LEN {
+            return Err(format!("agent {i}: field exceeds max length"));
+        }
+    }
+    for (i, task) in req.tasks.iter().enumerate() {
+        if task.description.len() > MAX_STRING_LEN {
+            return Err(format!("task {i}: description exceeds max length"));
+        }
+        for &dep in &task.dependencies {
+            if dep >= req.tasks.len() {
+                return Err(format!("task {i}: dependency index {dep} out of range"));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn create_crew(
     State(state): State<SharedState>,
     Json(req): Json<CrewRunRequest>,
 ) -> Result<Json<CrewRunResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if let Err(msg) = validate_crew_request(&req) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        ));
+    }
     let process = match req.process.as_deref() {
         Some("hierarchical") => {
             // Use first agent as manager placeholder
@@ -184,7 +231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_crews_with_empty_tasks_returns_completed() {
+    async fn post_crews_with_empty_agents_returns_bad_request() {
         let app = test_app().await;
         let body = serde_json::json!({
             "name": "empty-crew",
@@ -200,12 +247,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["status"], "completed");
-        assert_eq!(json["results"].as_array().unwrap().len(), 0);
+        assert!(json["error"].as_str().unwrap().contains("agent"));
     }
 }

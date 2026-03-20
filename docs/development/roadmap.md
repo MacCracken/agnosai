@@ -13,9 +13,9 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 
 Multiple rounds of review covering all aspects before any further feature work:
 
-- [ ] Security audit — input validation, sandbox escape paths, auth bypass, injection vectors
+- [x] Security audit — input validation, sandbox escape paths, auth bypass, injection vectors
 - [x] Error handling — panic paths, unwrap usage, error propagation completeness
-- [ ] Concurrency — lock ordering, deadlock potential, race conditions, Send/Sync correctness
+- [x] Concurrency — lock ordering, deadlock potential, race conditions, Send/Sync correctness
 - [ ] API surface — public API consistency, breaking change risk, documentation accuracy
 - [ ] Test coverage — gap analysis, edge cases, failure path testing
 - [ ] Dependency audit — supply chain, minimal surface, version currency, advisory compliance

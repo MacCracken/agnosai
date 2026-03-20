@@ -131,33 +131,34 @@ impl PythonSandbox {
         tool_name: &str,
         parameters: &serde_json::Value,
     ) -> crate::core::Result<PythonResult> {
-        let wrapper_script = format!(
-            r#"
+        // The tool source is passed via stdin alongside the parameters, not
+        // interpolated into the script string. This eliminates any possibility
+        // of string-escape breakout via triple-quotes or other Python syntax.
+        let wrapper_script = r#"
 import sys, json, traceback
 
 input_data = json.loads(sys.stdin.read())
+tool_source = input_data["__tool_source__"]
 
 try:
-    # Execute the tool source to define create_tool()
-    exec("""{tool_source}""")
+    exec(tool_source)
 
     tool = create_tool()
     result = tool.execute(input_data["parameters"])
-    print(json.dumps({{"result": result, "success": True, "error": None}}))
+    print(json.dumps({"result": result, "success": True, "error": None}))
 except Exception as e:
-    print(json.dumps({{"result": None, "success": False, "error": str(e)}}))
+    print(json.dumps({"result": None, "success": False, "error": str(e)}))
     sys.exit(1)
-"#,
-            tool_source = tool_source.replace('\\', "\\\\").replace('"', r#"\""#),
-        );
+"#;
 
         let input = serde_json::json!({
+            "__tool_source__": tool_source,
             "tool_name": tool_name,
             "parameters": parameters,
         });
         let input_str = serde_json::to_string(&input)?;
 
-        self.execute_script(&wrapper_script, &input_str).await
+        self.execute_script(wrapper_script, &input_str).await
     }
 }
 

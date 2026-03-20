@@ -12,7 +12,11 @@ pub use auth::AuthConfig;
 pub use state::{AppState, SharedState};
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+
+/// Maximum request body size: 10 MiB.
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Build the complete application router with all routes.
 pub fn router(state: SharedState) -> Router {
@@ -35,5 +39,6 @@ pub fn router(state: SharedState) -> Router {
         .route("/ready", get(routes::health::ready))
         .route("/mcp", post(routes::mcp::mcp_handler))
         .nest("/api/v1", api_v1)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }

@@ -31,7 +31,11 @@ pub async fn crew_stream(
         // For now the stream ends after the connected event.
     };
 
-    Sse::new(stream)
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    )
 }
 
 #[cfg(test)]

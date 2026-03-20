@@ -9,6 +9,51 @@ use crate::core::{CrewSpec, Task};
 
 use crate::server::state::SharedState;
 
+/// Validate that a callback URL is safe to POST to.
+///
+/// Rejects URLs targeting private/internal networks to prevent SSRF.
+fn is_safe_callback_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+
+    // Only allow HTTP(S).
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return false;
+    }
+
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+
+    // Block localhost.
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+        return false;
+    }
+
+    // Block private/link-local IP ranges.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_private()
+                    || v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.octets()[0] == 169 && v4.octets()[1] == 254 // metadata service
+                {
+                    return false;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback() {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
 /// A2A task delegation request — matches Agnostic v1 format.
 #[derive(Debug, Deserialize)]
 pub struct A2ARequest {
@@ -75,15 +120,19 @@ pub async fn receive(
                 error: None,
             };
 
-            // Fire-and-forget callback if URL is provided.
+            // Fire-and-forget callback if URL is provided and passes SSRF validation.
             if let Some(url) = req.callback_url {
-                let resp_clone = response.clone();
-                tokio::spawn(async move {
-                    let client = reqwest::Client::new();
-                    if let Err(e) = client.post(&url).json(&resp_clone).send().await {
-                        tracing::warn!(task_id = %task_id, url = %url, "A2A callback failed: {e}");
-                    }
-                });
+                if is_safe_callback_url(&url) {
+                    let resp_clone = response.clone();
+                    tokio::spawn(async move {
+                        let client = reqwest::Client::new();
+                        if let Err(e) = client.post(&url).json(&resp_clone).send().await {
+                            tracing::warn!(task_id = %task_id, url = %url, "A2A callback failed: {e}");
+                        }
+                    });
+                } else {
+                    tracing::warn!(task_id = %task_id, url = %url, "A2A callback URL rejected (SSRF protection)");
+                }
             }
 
             (StatusCode::OK, Json(response))
