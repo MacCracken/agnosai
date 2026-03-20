@@ -14,3 +14,88 @@ pub async fn create_definition(Json(def): Json<AgentDefinition>) -> (StatusCode,
     let value = serde_json::to_value(&def).unwrap_or(Value::Null);
     (StatusCode::CREATED, Json(value))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::orchestrator::Orchestrator;
+    use crate::server::sse::EventBus;
+    use crate::server::state::{AppState, SharedState};
+    use crate::tools::ToolRegistry;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn test_app() -> Router {
+        let orchestrator = Orchestrator::new(Default::default()).await.unwrap();
+        let tools = Arc::new(ToolRegistry::new());
+        let state: SharedState = Arc::new(AppState {
+            orchestrator,
+            tools,
+            auth: Default::default(),
+            events: EventBus::new(),
+        });
+        crate::server::router(state)
+    }
+
+    #[tokio::test]
+    async fn list_definitions_returns_empty_array() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/agents/definitions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn create_definition_returns_201() {
+        let app = test_app().await;
+        let body = serde_json::json!({
+            "agent_key": "test-agent",
+            "name": "Test Agent",
+            "role": "tester",
+            "goal": "test things"
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/agents/definitions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["agent_key"], "test-agent");
+    }
+
+    #[tokio::test]
+    async fn create_definition_rejects_invalid_body() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/agents/definitions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"not":"valid"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}

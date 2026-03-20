@@ -69,3 +69,94 @@ pub fn event_stream(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_bus_new_is_empty() {
+        let bus = EventBus::new();
+        let id = Uuid::new_v4();
+        // Subscribe creates the channel lazily.
+        let _rx = bus.subscribe(id);
+    }
+
+    #[test]
+    fn event_bus_sender_creates_channel() {
+        let bus = EventBus::new();
+        let id = Uuid::new_v4();
+        let tx = bus.sender(id);
+        // Should be able to send without panic.
+        let _ = tx.send(CrewEvent {
+            crew_id: id.to_string(),
+            event_type: "test".into(),
+            data: serde_json::json!({}),
+        });
+    }
+
+    #[test]
+    fn event_bus_subscribe_receives_events() {
+        let bus = EventBus::new();
+        let id = Uuid::new_v4();
+        let mut rx = bus.subscribe(id);
+        let tx = bus.sender(id);
+
+        tx.send(CrewEvent {
+            crew_id: id.to_string(),
+            event_type: "task_started".into(),
+            data: serde_json::json!({"task": "a"}),
+        })
+        .unwrap();
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.event_type, "task_started");
+        assert_eq!(event.crew_id, id.to_string());
+    }
+
+    #[test]
+    fn event_bus_remove_cleans_channel() {
+        let bus = EventBus::new();
+        let id = Uuid::new_v4();
+        let _tx = bus.sender(id);
+        bus.remove(id);
+
+        // After remove, a new subscribe gets a fresh channel.
+        let mut rx = bus.subscribe(id);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_bus_independent_crews() {
+        let bus = EventBus::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        let mut rx1 = bus.subscribe(id1);
+        let mut rx2 = bus.subscribe(id2);
+
+        bus.sender(id1)
+            .send(CrewEvent {
+                crew_id: id1.to_string(),
+                event_type: "e1".into(),
+                data: serde_json::json!(null),
+            })
+            .unwrap();
+
+        // rx1 should receive, rx2 should not.
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[test]
+    fn crew_event_serializes() {
+        let event = CrewEvent {
+            crew_id: "abc".into(),
+            event_type: "task_completed".into(),
+            data: serde_json::json!({"status": "ok"}),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("task_completed"));
+        assert!(json.contains("abc"));
+    }
+}

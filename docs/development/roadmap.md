@@ -11,7 +11,7 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 
 ### Code Audit & Review (P0)
 
-- [ ] Test coverage — gap analysis, edge cases, failure path testing
+- [x] Test coverage — gap analysis, edge cases, failure path testing
 - [ ] Code quality — dead code, naming consistency, module organization
 
 ### Agnostic Migration (Phase 5)
@@ -24,7 +24,7 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 | Migrate presets domain-by-domain | Medium | Done (18 presets) |
 | Port high-value Python tools to native Rust | Medium | Done (load_testing, security_audit) |
 | Fleet shim (Python fleet → AgnosAI fleet via HTTP) | Medium | Done |
-| Community tool SDK (WASM) | Low | |
+| Community tool SDK (WASM) | Low | Done |
 | Remove CrewAI dependency | Final | |
 
 **Exit criteria**: Agnostic runs entirely on AgnosAI. Zero Python in the hot path. CrewAI removed.

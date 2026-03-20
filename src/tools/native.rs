@@ -101,3 +101,107 @@ pub trait NativeTool: Send + Sync {
     /// Execute the tool with the given input.
     fn execute(&self, input: ToolInput) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_output_ok_has_correct_fields() {
+        let output = ToolOutput::ok(serde_json::json!(42));
+        assert!(output.success);
+        assert_eq!(output.result, serde_json::json!(42));
+        assert!(output.error.is_none());
+    }
+
+    #[test]
+    fn tool_output_err_has_correct_fields() {
+        let output = ToolOutput::err("something broke");
+        assert!(!output.success);
+        assert_eq!(output.result, serde_json::Value::Null);
+        assert_eq!(output.error.as_deref(), Some("something broke"));
+    }
+
+    #[test]
+    fn tool_input_get_str_returns_none_for_missing() {
+        let input = ToolInput {
+            parameters: HashMap::new(),
+        };
+        assert!(input.get_str("missing").is_none());
+    }
+
+    #[test]
+    fn tool_input_get_str_returns_none_for_wrong_type() {
+        let input = ToolInput {
+            parameters: HashMap::from([("count".into(), serde_json::json!(42))]),
+        };
+        assert!(input.get_str("count").is_none());
+    }
+
+    #[test]
+    fn tool_input_get_str_returns_value() {
+        let input = ToolInput {
+            parameters: HashMap::from([("name".into(), serde_json::json!("alice"))]),
+        };
+        assert_eq!(input.get_str("name"), Some("alice"));
+    }
+
+    #[test]
+    fn tool_input_get_f64_returns_value() {
+        let input = ToolInput {
+            parameters: HashMap::from([("ratio".into(), serde_json::json!(3.14))]),
+        };
+        assert_eq!(input.get_f64("ratio"), Some(3.14));
+    }
+
+    #[test]
+    fn tool_input_get_u64_returns_value() {
+        let input = ToolInput {
+            parameters: HashMap::from([("count".into(), serde_json::json!(42))]),
+        };
+        assert_eq!(input.get_u64("count"), Some(42));
+    }
+
+    #[test]
+    fn tool_input_get_u64_returns_none_for_negative() {
+        let input = ToolInput {
+            parameters: HashMap::from([("count".into(), serde_json::json!(-1))]),
+        };
+        assert!(input.get_u64("count").is_none());
+    }
+
+    #[test]
+    fn tool_output_ok_serde_round_trip() {
+        let output = ToolOutput::ok(serde_json::json!({"key": "value"}));
+        let json = serde_json::to_string(&output).unwrap();
+        let restored: ToolOutput = serde_json::from_str(&json).unwrap();
+        assert!(restored.success);
+        assert_eq!(restored.result["key"], "value");
+    }
+
+    #[test]
+    fn tool_output_err_skips_none_error_in_ok() {
+        let output = ToolOutput::ok(serde_json::json!(1));
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn tool_schema_serde_round_trip() {
+        let schema = ToolSchema {
+            name: "test".into(),
+            description: "desc".into(),
+            parameters: vec![ParameterSchema {
+                name: "p1".into(),
+                description: "param 1".into(),
+                param_type: "string".into(),
+                required: true,
+            }],
+        };
+        let json = serde_json::to_string(&schema).unwrap();
+        let restored: ToolSchema = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.name, "test");
+        assert_eq!(restored.parameters.len(), 1);
+        assert!(restored.parameters[0].required);
+    }
+}

@@ -5,7 +5,6 @@
 //! disclosure indicators.
 
 use crate::tools::native::{NativeTool, ParameterSchema, ToolInput, ToolOutput, ToolSchema};
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -298,6 +297,7 @@ async fn analyze_cors(client: &reqwest::Client, target_url: &str) -> CorsAnalysi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn security_audit_name() {
