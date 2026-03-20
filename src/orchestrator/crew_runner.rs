@@ -39,11 +39,9 @@ impl CrewRunner {
     pub async fn run(&mut self) -> crate::core::Result<CrewState> {
         info!(crew_id = %self.spec.id, name = %self.spec.name, "starting crew run");
 
-        let results = match &self.spec.process.clone() {
+        let results = match self.spec.process {
             ProcessMode::Sequential => self.run_sequential().await?,
-            ProcessMode::Parallel { max_concurrency } => {
-                self.run_parallel(*max_concurrency).await?
-            }
+            ProcessMode::Parallel { max_concurrency } => self.run_parallel(max_concurrency).await?,
             ProcessMode::Dag => self.run_dag().await?,
             ProcessMode::Hierarchical { .. } => {
                 // Phase 2: manager delegation. For now, fall back to sequential.

@@ -101,8 +101,9 @@ impl LlmProvider for AnthropicProvider {
         let url = format!("{API_BASE}/v1/messages");
 
         // Separate system messages from user/assistant messages.
-        let mut system_parts: Vec<String> = Vec::new();
-        let mut messages: Vec<AnthropicMessage> = Vec::new();
+        let msg_count = request.messages.len();
+        let mut system_parts: Vec<String> = Vec::with_capacity(2);
+        let mut messages: Vec<AnthropicMessage> = Vec::with_capacity(msg_count);
 
         for msg in &request.messages {
             if msg.role == "system" {

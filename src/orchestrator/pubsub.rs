@@ -105,9 +105,27 @@ impl Default for PubSub {
 ///
 /// Both pattern and topic are split on `'.'`.
 pub fn matches_pattern(pattern: &str, topic: &str) -> bool {
-    let pat_segments: Vec<&str> = pattern.split('.').collect();
-    let topic_segments: Vec<&str> = topic.split('.').collect();
-    matches_recursive(&pat_segments, &topic_segments)
+    // Use stack-allocated arrays for small segment counts (typical: 2-5 segments).
+    // Only heap-allocate for unusually deep topic hierarchies.
+    let mut pat_buf: [&str; 16] = [""; 16];
+    let mut topic_buf: [&str; 16] = [""; 16];
+
+    let pat_count = pattern.split('.').count();
+    let topic_count = topic.split('.').count();
+
+    if pat_count <= 16 && topic_count <= 16 {
+        for (i, seg) in pattern.split('.').enumerate() {
+            pat_buf[i] = seg;
+        }
+        for (i, seg) in topic.split('.').enumerate() {
+            topic_buf[i] = seg;
+        }
+        matches_recursive(&pat_buf[..pat_count], &topic_buf[..topic_count])
+    } else {
+        let pat_segments: Vec<&str> = pattern.split('.').collect();
+        let topic_segments: Vec<&str> = topic.split('.').collect();
+        matches_recursive(&pat_segments, &topic_segments)
+    }
 }
 
 fn matches_recursive(pattern: &[&str], topic: &[&str]) -> bool {

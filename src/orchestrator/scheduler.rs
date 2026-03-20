@@ -74,8 +74,9 @@ impl Scheduler {
     /// Replaces any previously loaded DAG state.
     pub fn load_dag(&mut self, dag: &TaskDAG) -> Result<()> {
         // Build adjacency from edges.
-        let mut dependents: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
+        let cap = dag.tasks.len();
+        let mut dependents: HashMap<String, HashSet<String>> = HashMap::with_capacity(cap);
+        let mut dependencies: HashMap<String, HashSet<String>> = HashMap::with_capacity(cap);
 
         // Initialise every task key so nodes with no edges still appear.
         for key in dag.tasks.keys() {
@@ -149,8 +150,9 @@ impl Scheduler {
     ///
     /// Returns `Err(AgnosaiError::CyclicDAG)` if the graph contains a cycle.
     pub fn topological_sort(dag: &TaskDAG) -> Result<Vec<String>> {
-        let mut dependents: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
+        let cap = dag.tasks.len();
+        let mut dependents: HashMap<String, HashSet<String>> = HashMap::with_capacity(cap);
+        let mut dependencies: HashMap<String, HashSet<String>> = HashMap::with_capacity(cap);
 
         for key in dag.tasks.keys() {
             dependents.entry(key.clone()).or_default();

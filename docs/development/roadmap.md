@@ -18,8 +18,8 @@ Multiple rounds of review covering all aspects before any further feature work:
 - [x] Concurrency — lock ordering, deadlock potential, race conditions, Send/Sync correctness
 - [x] API surface — public API consistency, breaking change risk, documentation accuracy
 - [ ] Test coverage — gap analysis, edge cases, failure path testing
-- [ ] Dependency audit — supply chain, minimal surface, version currency, advisory compliance
-- [ ] Performance — unnecessary allocations, hot path efficiency, memory layout
+- [x] Dependency audit — supply chain, minimal surface, version currency, advisory compliance
+- [x] Performance — unnecessary allocations, hot path efficiency, memory layout
 - [ ] Code quality — dead code, naming consistency, module organization
 
 ### ai-hwaccel Integration

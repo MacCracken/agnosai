@@ -4,13 +4,12 @@ use agnosai::orchestrator::Orchestrator;
 use agnosai::tools::ToolRegistry;
 use agnosai::tools::builtin::echo::EchoTool;
 use agnosai::tools::builtin::json_transform::JsonTransformTool;
-use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 use agnosai::server::{AppState, SharedState, router};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("agnosai=info".parse()?))
         .json()
