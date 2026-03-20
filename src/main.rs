@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use agnosai::orchestrator::Orchestrator;
+use agnosai::server::sse::EventBus;
 use agnosai::tools::ToolRegistry;
 use agnosai::tools::builtin::echo::EchoTool;
 use agnosai::tools::builtin::json_transform::JsonTransformTool;
@@ -18,7 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("AgnosAI server starting");
 
     // Initialise shared state.
-    let orchestrator = Orchestrator::new(Default::default()).await?;
+    let events = EventBus::new();
+    let orchestrator = Orchestrator::new(Default::default())
+        .await?
+        .with_events(events.clone());
     let tools = Arc::new(ToolRegistry::new());
     tools.register(Arc::new(EchoTool));
     tools.register(Arc::new(JsonTransformTool));
@@ -27,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         orchestrator,
         tools,
         auth: Default::default(),
+        events,
     });
 
     let app = router(state);

@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use crate::core::agent::AgentDefinition;
 use crate::core::crew::{CrewSpec, CrewState, CrewStatus};
 use crate::core::task::{ProcessMode, Task, TaskId, TaskResult, TaskStatus};
+use crate::server::sse::CrewEvent;
+use tokio::sync::broadcast;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
@@ -23,11 +25,32 @@ use crate::orchestrator::scoring;
 /// Orchestrates the full crew lifecycle.
 pub struct CrewRunner {
     spec: CrewSpec,
+    event_tx: Option<broadcast::Sender<CrewEvent>>,
 }
 
 impl CrewRunner {
     pub fn new(spec: CrewSpec) -> Self {
-        Self { spec }
+        Self {
+            spec,
+            event_tx: None,
+        }
+    }
+
+    /// Attach an event sender for SSE streaming.
+    pub fn with_events(mut self, tx: broadcast::Sender<CrewEvent>) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Emit a crew event if an event sender is configured.
+    fn emit(&self, event_type: &str, data: serde_json::Value) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(CrewEvent {
+                crew_id: self.spec.id.to_string(),
+                event_type: event_type.to_string(),
+                data,
+            });
+        }
     }
 
     /// Execute the crew according to its `ProcessMode`.
@@ -38,6 +61,14 @@ impl CrewRunner {
     /// status tracking, and result aggregation.
     pub async fn run(&mut self) -> crate::core::Result<CrewState> {
         info!(crew_id = %self.spec.id, name = %self.spec.name, "starting crew run");
+
+        self.emit(
+            "crew_started",
+            serde_json::json!({
+                "name": self.spec.name,
+                "task_count": self.spec.tasks.len(),
+            }),
+        );
 
         let results = match self.spec.process {
             ProcessMode::Sequential => self.run_sequential().await?,
@@ -59,6 +90,14 @@ impl CrewRunner {
 
         info!(crew_id = %self.spec.id, ?status, "crew run finished");
 
+        self.emit(
+            "crew_completed",
+            serde_json::json!({
+                "status": format!("{status:?}"),
+                "task_count": results.len(),
+            }),
+        );
+
         Ok(CrewState {
             crew_id: self.spec.id,
             status,
@@ -75,13 +114,33 @@ impl CrewRunner {
             let agent = pick_best_agent(&self.spec.agents, &self.spec.tasks[i]);
             self.spec.tasks[i].status = TaskStatus::Queued;
 
-            if let Some(a) = &agent {
+            let agent_key = agent.as_ref().map(|a| a.agent_key.clone());
+
+            if let Some(ref a) = agent {
                 debug!(task_id = %self.spec.tasks[i].id, agent = %a.agent_key, "assigned");
             }
+
+            self.emit(
+                "task_started",
+                serde_json::json!({
+                    "task_id": self.spec.tasks[i].id.to_string(),
+                    "description": self.spec.tasks[i].description,
+                    "agent": agent_key,
+                }),
+            );
 
             self.spec.tasks[i].status = TaskStatus::Running;
             let result = execute_task(&self.spec.tasks[i], agent.as_ref()).await;
             self.spec.tasks[i].status = result.status;
+
+            self.emit(
+                "task_completed",
+                serde_json::json!({
+                    "task_id": result.task_id.to_string(),
+                    "status": format!("{:?}", result.status),
+                }),
+            );
+
             results.push(result);
         }
 
@@ -112,6 +171,18 @@ impl CrewRunner {
             })
             .collect();
 
+        // Emit task_started for all tasks.
+        for (task, agent) in &task_snapshots {
+            self.emit(
+                "task_started",
+                serde_json::json!({
+                    "task_id": task.id.to_string(),
+                    "description": task.description,
+                    "agent": agent.as_ref().map(|a| &a.agent_key),
+                }),
+            );
+        }
+
         let mut join_set = tokio::task::JoinSet::new();
 
         for (task, agent) in task_snapshots {
@@ -135,7 +206,16 @@ impl CrewRunner {
         let mut results = Vec::with_capacity(self.spec.tasks.len());
         while let Some(res) = join_set.join_next().await {
             match res {
-                Ok(task_result) => results.push(task_result),
+                Ok(task_result) => {
+                    self.emit(
+                        "task_completed",
+                        serde_json::json!({
+                            "task_id": task_result.task_id.to_string(),
+                            "status": format!("{:?}", task_result.status),
+                        }),
+                    );
+                    results.push(task_result);
+                }
                 Err(e) => {
                     warn!("task join error: {e}");
                 }
@@ -204,6 +284,16 @@ impl CrewRunner {
                 let idx = task_map[id];
                 self.spec.tasks[idx].status = TaskStatus::Queued;
                 let agent = pick_best_agent(&self.spec.agents, &self.spec.tasks[idx]);
+
+                self.emit(
+                    "task_started",
+                    serde_json::json!({
+                        "task_id": self.spec.tasks[idx].id.to_string(),
+                        "description": self.spec.tasks[idx].description,
+                        "agent": agent.as_ref().map(|a| &a.agent_key),
+                    }),
+                );
+
                 let task_snap = self.spec.tasks[idx].clone();
 
                 join_set.spawn(async move { execute_task(&task_snap, agent.as_ref()).await });
@@ -215,6 +305,13 @@ impl CrewRunner {
                         if let Some(&idx) = task_map.get(&tr.task_id) {
                             self.spec.tasks[idx].status = tr.status;
                         }
+                        self.emit(
+                            "task_completed",
+                            serde_json::json!({
+                                "task_id": tr.task_id.to_string(),
+                                "status": format!("{:?}", tr.status),
+                            }),
+                        );
                         completed.insert(tr.task_id);
                         results.push(tr);
                     }
@@ -548,5 +645,31 @@ mod tests {
         // Sequential order preserved in fallback.
         assert_eq!(state.results[0].output, "h1");
         assert_eq!(state.results[1].output, "h2");
+    }
+
+    // ── SSE event emission ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_events_emitted_during_sequential_run() {
+        let tasks = vec![test_task("step one"), test_task("step two")];
+        let spec = test_spec(tasks, ProcessMode::Sequential);
+        let (tx, mut rx) = broadcast::channel::<CrewEvent>(64);
+        let mut runner = CrewRunner::new(spec).with_events(tx);
+
+        let state = runner.run().await.unwrap();
+        assert_eq!(state.status, CrewStatus::Completed);
+
+        // Collect all events.
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Should have: crew_started, task_started x2, task_completed x2, crew_completed
+        let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(types.contains(&"crew_started"));
+        assert!(types.contains(&"crew_completed"));
+        assert_eq!(types.iter().filter(|&&t| t == "task_started").count(), 2);
+        assert_eq!(types.iter().filter(|&&t| t == "task_completed").count(), 2);
     }
 }

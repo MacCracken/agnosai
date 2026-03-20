@@ -1,21 +1,26 @@
 //! SSE streaming endpoint for crew execution events.
 
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::response::sse::{Event, Sse};
 use futures::stream::Stream;
 use std::convert::Infallible;
 use uuid::Uuid;
 
 use crate::server::sse::CrewEvent;
+use crate::server::state::SharedState;
 
 /// GET /api/v1/crews/:id/stream — SSE stream for crew events.
 ///
-/// For now, returns a simple stream that sends a "connected" event then closes.
-/// Full integration with `CrewRunner` events is future work.
+/// Subscribes to the event bus for the given crew ID and streams events
+/// as they are emitted by the crew runner.
 pub async fn crew_stream(
+    State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let crew_id = id.to_string();
+
+    // Subscribe to the crew's event channel.
+    let rx = state.events.subscribe(id);
 
     let stream = async_stream::stream! {
         // Send initial connected event.
@@ -27,8 +32,12 @@ pub async fn crew_stream(
         let data = serde_json::to_string(&connected).unwrap_or_default();
         yield Ok(Event::default().event("connected").data(data));
 
-        // Future: subscribe to broadcast channel for real crew events.
-        // For now the stream ends after the connected event.
+        // Forward real crew events from the broadcast channel.
+        let mut event_rx = rx;
+        while let Ok(event) = event_rx.recv().await {
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            yield Ok(Event::default().event(event.event_type.clone()).data(data));
+        }
     };
 
     Sse::new(stream).keep_alive(
@@ -41,6 +50,7 @@ pub async fn crew_stream(
 #[cfg(test)]
 mod tests {
     use crate::orchestrator::Orchestrator;
+    use crate::server::sse::EventBus;
     use crate::server::state::{AppState, SharedState};
     use crate::tools::ToolRegistry;
     use axum::Router;
@@ -55,6 +65,7 @@ mod tests {
             orchestrator,
             tools,
             auth: Default::default(),
+            events: EventBus::new(),
         });
         crate::server::router(state)
     }

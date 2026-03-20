@@ -120,12 +120,30 @@ pub fn load_all_presets(dir: &Path) -> Result<Vec<PresetSpec>> {
 /// Get the built-in presets (embedded at compile time).
 pub fn builtin_presets() -> Vec<PresetSpec> {
     let jsons = [
+        // Quality
         include_str!("../presets/quality-lean.json"),
         include_str!("../presets/quality-standard.json"),
+        include_str!("../presets/quality-large.json"),
+        // Software Engineering
         include_str!("../presets/software-engineering-lean.json"),
         include_str!("../presets/software-engineering-standard.json"),
+        include_str!("../presets/software-engineering-large.json"),
+        // DevOps
         include_str!("../presets/devops-lean.json"),
+        include_str!("../presets/devops-standard.json"),
+        include_str!("../presets/devops-large.json"),
+        // Data Engineering
         include_str!("../presets/data-engineering-lean.json"),
+        include_str!("../presets/data-engineering-standard.json"),
+        include_str!("../presets/data-engineering-large.json"),
+        // Design
+        include_str!("../presets/design-lean.json"),
+        include_str!("../presets/design-standard.json"),
+        include_str!("../presets/design-large.json"),
+        // Security
+        include_str!("../presets/security-lean.json"),
+        include_str!("../presets/security-standard.json"),
+        include_str!("../presets/security-large.json"),
     ];
     jsons
         .iter()
@@ -297,7 +315,7 @@ goal: g
     fn test_builtin_presets_non_empty() {
         let presets = builtin_presets();
         assert!(!presets.is_empty());
-        assert_eq!(presets.len(), 6);
+        assert_eq!(presets.len(), 18);
     }
 
     #[test]

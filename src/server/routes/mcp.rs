@@ -200,6 +200,7 @@ mod tests {
             orchestrator,
             tools,
             auth: Default::default(),
+            events: crate::server::sse::EventBus::new(),
         });
         crate::server::router(state)
     }

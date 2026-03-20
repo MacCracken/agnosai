@@ -30,9 +30,11 @@ All ai-hwaccel integration items are complete. See [ADR-005](../adr/005-ai-hwacc
 
 | Item | Notes | Priority |
 |------|-------|----------|
-| Full JWT validation (RS256, claims, expiry) | Currently shared-secret only | Medium |
-| SSE integration with CrewRunner events | SSE endpoint exists, needs event wiring | Medium |
-| Remaining 12 presets | 6 of 18 built-in, need design/data-eng/devops standard+large | Low |
+| ~~Full JWT validation (RS256, claims, expiry)~~ | ~~Currently shared-secret only~~ | ~~Medium~~ |
+| ~~SSE integration with CrewRunner events~~ | ~~SSE endpoint exists, needs event wiring~~ | ~~Medium~~ |
+| ~~Remaining 12 presets~~ | ~~6 of 18 built-in, need design/data-eng/devops standard+large~~ | ~~Low~~ |
+
+All API & Protocol work items are complete.
 
 ### Agnostic Migration (Phase 5)
 

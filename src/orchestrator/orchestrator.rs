@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::core::{CrewSpec, CrewState, CrewStatus, ResourceBudget, Result};
+use crate::server::sse::EventBus;
 
 use crate::orchestrator::crew_runner::CrewRunner;
 use crate::orchestrator::scheduler::Scheduler;
@@ -14,6 +15,7 @@ pub struct OrchestratorState {
 pub struct Orchestrator {
     state: Arc<RwLock<OrchestratorState>>,
     budget: ResourceBudget,
+    events: Option<EventBus>,
 }
 
 impl Orchestrator {
@@ -26,7 +28,14 @@ impl Orchestrator {
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
             budget,
+            events: None,
         })
+    }
+
+    /// Attach an event bus for SSE streaming.
+    pub fn with_events(mut self, events: EventBus) -> Self {
+        self.events = Some(events);
+        self
     }
 
     pub async fn run_crew(&self, spec: CrewSpec) -> Result<CrewState> {
@@ -44,6 +53,9 @@ impl Orchestrator {
 
         // Delegate to CrewRunner for the actual lifecycle.
         let mut runner = CrewRunner::new(spec);
+        if let Some(ref events) = self.events {
+            runner = runner.with_events(events.sender(crew_id));
+        }
         let crew_state = runner.run().await?;
 
         // Update stored state.
@@ -52,6 +64,11 @@ impl Orchestrator {
             if let Some(entry) = state.active_crews.iter_mut().find(|c| c.crew_id == crew_id) {
                 *entry = crew_state.clone();
             }
+        }
+
+        // Clean up the event channel now that the crew is done.
+        if let Some(ref events) = self.events {
+            events.remove(crew_id);
         }
 
         Ok(crew_state)
