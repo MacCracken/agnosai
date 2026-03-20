@@ -122,6 +122,7 @@ fn bench_place_with_hardware_req(c: &mut Criterion) {
             min_memory_mb: 40000,
             min_device_count: 2,
             min_cpu_cores: 32,
+            required_family: None,
         }),
     };
 

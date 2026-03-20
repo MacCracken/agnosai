@@ -32,6 +32,13 @@ pub use crew::{CrewSpec, CrewState, CrewStatus};
 pub use error::{AgnosaiError, Result};
 pub use message::Message;
 pub use resource::{
-    AcceleratorType, ComputeDevice, HardwareInventory, HardwareRequirement, ResourceBudget,
+    AcceleratorFamily, AcceleratorType, ComputeDevice, HardwareInventory, HardwareRequirement,
+    ResourceBudget,
+};
+#[cfg(feature = "hwaccel")]
+pub use resource::{
+    HwAccelFamily, HwAccelRequirement, HwAccelType, MemoryEstimate, ModelShard,
+    QuantizationLevel, ShardingPlan, ShardingStrategy, TrainingMemoryEstimate, TrainingMethod,
+    TrainingTarget,
 };
 pub use task::{ProcessMode, Task, TaskDAG, TaskPriority, TaskResult, TaskStatus};

@@ -409,6 +409,7 @@ mod tests {
             min_memory_mb: 40960,
             min_device_count: 2,
             min_cpu_cores: 8,
+            required_family: None,
         };
         assert!(node.satisfies_hardware(&cuda_req));
 
@@ -418,6 +419,7 @@ mod tests {
             min_memory_mb: 0,
             min_device_count: 1,
             min_cpu_cores: 0,
+            required_family: None,
         };
         assert!(!node.satisfies_hardware(&tpu_req));
 

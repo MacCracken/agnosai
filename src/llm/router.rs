@@ -80,6 +80,35 @@ pub fn route(profile: &TaskProfile) -> ModelTier {
     }
 }
 
+/// Quantization recommendation for a model based on available hardware.
+///
+/// Uses `ai-hwaccel`'s `suggest_quantization()` to pick the best precision
+/// level (FP32 / FP16 / BF16 / INT8 / INT4) that fits in available VRAM.
+///
+/// # Arguments
+/// * `model_params` — approximate parameter count (e.g. 7_000_000_000 for a 7B model)
+/// * `registry` — detected hardware from `ai_hwaccel::AcceleratorRegistry::detect()`
+///
+/// Returns a quantization level suitable for inference on the best available device.
+#[cfg(feature = "hwaccel")]
+pub fn suggest_quantization(
+    model_params: u64,
+    registry: &ai_hwaccel::AcceleratorRegistry,
+) -> ai_hwaccel::QuantizationLevel {
+    registry.suggest_quantization(model_params)
+}
+
+/// Estimate the memory required to load a model at a given quantization level.
+///
+/// Returns the estimated memory in bytes.
+#[cfg(feature = "hwaccel")]
+pub fn estimate_model_memory(
+    model_params: u64,
+    quant: &ai_hwaccel::QuantizationLevel,
+) -> u64 {
+    ai_hwaccel::AcceleratorRegistry::estimate_memory(model_params, quant)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +201,53 @@ mod tests {
             complexity: Complexity::Complex,
         };
         assert_eq!(route(&p), ModelTier::Premium);
+    }
+
+    #[cfg(feature = "hwaccel")]
+    mod hwaccel_tests {
+        use super::super::*;
+        use ai_hwaccel::{AcceleratorProfile, AcceleratorRegistry, QuantizationLevel};
+
+        #[test]
+        fn suggest_quantization_small_model_high_vram() {
+            // 7B model with 80GB GPU — should suggest FP16 or better.
+            let registry = AcceleratorRegistry::from_profiles(vec![
+                AcceleratorProfile::cpu(64 * 1024 * 1024 * 1024),
+                AcceleratorProfile::cuda(0, 80 * 1024 * 1024 * 1024),
+            ]);
+            let quant = suggest_quantization(7_000_000_000, &registry);
+            // With 80GB VRAM, a 7B model easily fits at FP16 or FP32.
+            assert!(
+                quant.bits_per_param() >= 16,
+                "7B model with 80GB should get at least FP16, got {:?}",
+                quant
+            );
+        }
+
+        #[test]
+        fn suggest_quantization_large_model_small_vram() {
+            // 70B model with 24GB GPU — must quantize aggressively.
+            let registry = AcceleratorRegistry::from_profiles(vec![
+                AcceleratorProfile::cpu(32 * 1024 * 1024 * 1024),
+                AcceleratorProfile::cuda(0, 24 * 1024 * 1024 * 1024),
+            ]);
+            let quant = suggest_quantization(70_000_000_000, &registry);
+            // 70B at FP16 = ~140GB, way over 24GB. Must quantize.
+            assert!(
+                quant.bits_per_param() < 16,
+                "70B model with 24GB should be quantized below FP16, got {:?}",
+                quant
+            );
+        }
+
+        #[test]
+        fn estimate_model_memory_scales_with_quantization() {
+            let fp32 = estimate_model_memory(7_000_000_000, &QuantizationLevel::None);
+            let fp16 = estimate_model_memory(7_000_000_000, &QuantizationLevel::Float16);
+            let int4 = estimate_model_memory(7_000_000_000, &QuantizationLevel::Int4);
+
+            assert!(fp32 > fp16, "FP32 should use more memory than FP16");
+            assert!(fp16 > int4, "FP16 should use more memory than INT4");
+        }
     }
 }

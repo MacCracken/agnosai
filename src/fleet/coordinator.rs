@@ -195,6 +195,27 @@ impl FleetCoordinator {
     pub fn state_manager(&self) -> &CrewStateManager {
         &self.state_manager
     }
+
+    /// Plan how to distribute a model across available devices.
+    ///
+    /// Uses `ai-hwaccel`'s sharding planner to determine the optimal strategy
+    /// (pipeline parallel, tensor parallel, or no sharding) based on model size,
+    /// quantization level, and available hardware.
+    ///
+    /// # Arguments
+    /// * `model_params` — approximate parameter count (e.g. 70_000_000_000 for 70B)
+    /// * `quant` — quantization level to use
+    /// * `registry` — detected hardware
+    ///
+    /// Returns a `ShardingPlan` describing how to split the model.
+    #[cfg(feature = "hwaccel")]
+    pub fn plan_sharding(
+        model_params: u64,
+        quant: &ai_hwaccel::QuantizationLevel,
+        registry: &ai_hwaccel::AcceleratorRegistry,
+    ) -> ai_hwaccel::ShardingPlan {
+        registry.plan_sharding(model_params, quant)
+    }
 }
 
 impl Default for FleetCoordinator {
@@ -399,5 +420,71 @@ mod tests {
         let coord = FleetCoordinator::new();
         // Just verify we can access it without panic.
         let _sm = coord.state_manager();
+    }
+
+    #[cfg(feature = "hwaccel")]
+    mod hwaccel_tests {
+        use super::super::*;
+        use ai_hwaccel::{AcceleratorProfile, AcceleratorRegistry, QuantizationLevel};
+
+        #[test]
+        fn plan_sharding_single_gpu_no_shard() {
+            // 7B model at FP16 (~14GB) on a single 80GB GPU — should not shard.
+            let registry = AcceleratorRegistry::from_profiles(vec![
+                AcceleratorProfile::cpu(64 * 1024 * 1024 * 1024),
+                AcceleratorProfile::cuda(0, 80 * 1024 * 1024 * 1024),
+            ]);
+            let plan =
+                FleetCoordinator::plan_sharding(7_000_000_000, &QuantizationLevel::Float16, &registry);
+            assert!(
+                plan.shards.len() <= 1,
+                "7B FP16 on 80GB should not need sharding, got {} shards",
+                plan.shards.len()
+            );
+        }
+
+        #[test]
+        fn plan_sharding_multi_gpu_large_model() {
+            // 70B model at FP16 (~140GB) on 2x 80GB GPUs — should shard.
+            let registry = AcceleratorRegistry::from_profiles(vec![
+                AcceleratorProfile::cpu(128 * 1024 * 1024 * 1024),
+                AcceleratorProfile::cuda(0, 80 * 1024 * 1024 * 1024),
+                AcceleratorProfile::cuda(1, 80 * 1024 * 1024 * 1024),
+            ]);
+            let plan = FleetCoordinator::plan_sharding(
+                70_000_000_000,
+                &QuantizationLevel::Float16,
+                &registry,
+            );
+            assert!(
+                plan.shards.len() >= 2,
+                "70B FP16 on 2x80GB should shard across devices, got {} shards",
+                plan.shards.len()
+            );
+            assert!(
+                plan.total_memory_bytes > 0,
+                "plan should report memory usage"
+            );
+        }
+
+        #[test]
+        fn plan_sharding_quantized_fits_single() {
+            // 70B model at INT4 (~35GB) on single 80GB GPU — may fit without sharding.
+            let registry = AcceleratorRegistry::from_profiles(vec![
+                AcceleratorProfile::cpu(64 * 1024 * 1024 * 1024),
+                AcceleratorProfile::cuda(0, 80 * 1024 * 1024 * 1024),
+            ]);
+            let plan = FleetCoordinator::plan_sharding(
+                70_000_000_000,
+                &QuantizationLevel::Int4,
+                &registry,
+            );
+            // INT4 70B ≈ 35GB, fits in 80GB.
+            assert!(
+                plan.shards.len() <= 1,
+                "70B INT4 on 80GB should fit without sharding, got {} shards",
+                plan.shards.len()
+            );
+        }
     }
 }

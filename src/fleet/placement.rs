@@ -337,6 +337,7 @@ mod tests {
                 min_memory_mb: 40960,
                 min_device_count: 1,
                 min_cpu_cores: 0,
+            required_family: None,
             }),
         };
         let result = place(&req, &nodes).unwrap();
@@ -366,6 +367,7 @@ mod tests {
                 min_memory_mb: 0,
                 min_device_count: 1,
                 min_cpu_cores: 0,
+            required_family: None,
             }),
         };
         assert!(place(&req, &nodes).is_none());

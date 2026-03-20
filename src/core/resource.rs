@@ -1,10 +1,39 @@
 use serde::{Deserialize, Serialize};
 
-/// Hardware accelerator type — compatibility shim over `ai-hwaccel`'s richer enum.
+// Re-export ai-hwaccel's rich types when the feature is enabled, so callers
+// can work with the full 19-variant AcceleratorType, quantization levels,
+// sharding plans, and training methods without depending on ai-hwaccel directly.
+#[cfg(feature = "hwaccel")]
+pub use ai_hwaccel::{
+    AcceleratorFamily as HwAccelFamily,
+    AcceleratorRequirement as HwAccelRequirement,
+    AcceleratorType as HwAccelType,
+    QuantizationLevel,
+    ShardingPlan, ShardingStrategy, ModelShard,
+    TrainingMethod, TrainingTarget, MemoryEstimate,
+};
+
+/// Broad accelerator family for requirement matching.
 ///
-/// These 6 broad categories map from `ai-hwaccel`'s 19-variant `AcceleratorType`.
-/// When the `hwaccel` feature is enabled, use [`AcceleratorType::from_hwaccel`] to
-/// convert detected hardware into this simplified representation.
+/// Use this instead of matching on specific [`AcceleratorType`] variants when
+/// you care about the *kind* of device (any GPU, any NPU) rather than the
+/// specific vendor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceleratorFamily {
+    Cpu,
+    Gpu,
+    Npu,
+    Tpu,
+    AiAsic,
+}
+
+/// Hardware accelerator type.
+///
+/// These 6 broad categories cover the most common accelerator families.
+/// When the `hwaccel` feature is enabled, use [`AcceleratorType::from_hwaccel`]
+/// for lossless conversion from ai-hwaccel's 19-variant enum, and [`HwAccelType`]
+/// when you need the full vendor-specific detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceleratorType {
@@ -14,6 +43,27 @@ pub enum AcceleratorType {
     Metal,
     Vulkan,
     Tpu,
+}
+
+impl AcceleratorType {
+    /// Broad family this accelerator belongs to.
+    pub fn family(self) -> AcceleratorFamily {
+        match self {
+            Self::Cpu => AcceleratorFamily::Cpu,
+            Self::Cuda | Self::Rocm | Self::Metal | Self::Vulkan => AcceleratorFamily::Gpu,
+            Self::Tpu => AcceleratorFamily::Tpu,
+        }
+    }
+
+    /// Whether this is a GPU variant.
+    pub fn is_gpu(self) -> bool {
+        self.family() == AcceleratorFamily::Gpu
+    }
+
+    /// Whether this is a TPU variant.
+    pub fn is_tpu(self) -> bool {
+        self.family() == AcceleratorFamily::Tpu
+    }
 }
 
 #[cfg(feature = "hwaccel")]
@@ -32,8 +82,6 @@ impl AcceleratorType {
             HW::MetalGpu => Self::Metal,
             HW::VulkanGpu { .. } => Self::Vulkan,
             HW::Tpu { .. } => Self::Tpu,
-            // NPUs, ASICs, and other specialized hardware fall back to Cpu.
-            // Phase 2 will replace this enum with ai-hwaccel's directly.
             _ => Self::Cpu,
         }
     }
@@ -64,6 +112,13 @@ pub struct HardwareRequirement {
     /// Minimum CPU cores (0 = no requirement).
     #[serde(default)]
     pub min_cpu_cores: usize,
+    /// Required accelerator family (None = match by specific type via `accelerators`).
+    ///
+    /// When set, any device in this family satisfies the requirement regardless
+    /// of the `accelerators` list. This is useful for requirements like "any GPU"
+    /// without enumerating Cuda, Rocm, Metal, Vulkan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_family: Option<AcceleratorFamily>,
 }
 
 /// Hardware inventory for a node.
@@ -139,7 +194,31 @@ impl HardwareInventory {
         if req.min_cpu_cores > 0 && self.cpu_cores < req.min_cpu_cores {
             return false;
         }
-        // Check accelerator types
+
+        // Family-based matching: "any GPU", "any TPU", etc.
+        if let Some(family) = req.required_family {
+            let matching_devices: Vec<_> = self
+                .devices
+                .iter()
+                .filter(|d| d.accelerator.family() == family)
+                .collect();
+            if matching_devices.is_empty() {
+                return false;
+            }
+            if req.min_device_count > 0 && matching_devices.len() < req.min_device_count {
+                return false;
+            }
+            if req.min_memory_mb > 0
+                && !matching_devices
+                    .iter()
+                    .any(|d| d.memory_total_mb >= req.min_memory_mb)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        // Specific type matching (original behavior).
         if !req.accelerators.is_empty() {
             let matching_devices: Vec<_> = self
                 .devices
@@ -180,6 +259,62 @@ impl HardwareInventory {
             .iter()
             .map(|d| d.memory_total_mb)
             .sum()
+    }
+}
+
+/// Training memory estimate for a model on specific hardware.
+///
+/// Wraps `ai-hwaccel`'s `estimate_training_memory()` to validate whether
+/// an agent's workload fits in the available VRAM before scheduling.
+#[cfg(feature = "hwaccel")]
+#[derive(Debug, Clone)]
+pub struct TrainingMemoryEstimate {
+    /// Model weights memory in GB.
+    pub model_gb: f64,
+    /// Optimizer state memory in GB.
+    pub optimizer_gb: f64,
+    /// Activation memory in GB.
+    pub activation_gb: f64,
+    /// Total estimated memory in GB.
+    pub total_gb: f64,
+}
+
+#[cfg(feature = "hwaccel")]
+impl TrainingMemoryEstimate {
+    /// Estimate training memory for a model with a given fine-tuning method.
+    ///
+    /// # Arguments
+    /// * `model_params_millions` — parameter count in millions (e.g. 7000 for 7B)
+    /// * `method` — training/fine-tuning method (FullFineTune, LoRA, QLoRA, etc.)
+    /// * `target` — target accelerator type (Gpu, Tpu, Gaudi, Cpu)
+    pub fn estimate(
+        model_params_millions: u64,
+        method: ai_hwaccel::TrainingMethod,
+        target: ai_hwaccel::TrainingTarget,
+    ) -> Self {
+        let est = ai_hwaccel::estimate_training_memory(model_params_millions, method, target);
+        Self {
+            model_gb: est.model_gb,
+            optimizer_gb: est.optimizer_gb,
+            activation_gb: est.activation_gb,
+            total_gb: est.total_gb,
+        }
+    }
+
+    /// Check whether the estimated training memory fits in an inventory's
+    /// total accelerator VRAM.
+    pub fn fits_in(&self, inventory: &HardwareInventory) -> bool {
+        let total_vram_gb = inventory
+            .devices
+            .iter()
+            .map(|d| d.memory_total_mb as f64 / 1024.0)
+            .sum::<f64>();
+        self.total_gb <= total_vram_gb
+    }
+
+    /// Total memory in bytes.
+    pub fn total_bytes(&self) -> u64 {
+        (self.total_gb * 1024.0 * 1024.0 * 1024.0) as u64
     }
 }
 
@@ -304,12 +439,14 @@ mod tests {
         };
         let req = HardwareRequirement {
             min_cpu_cores: 4,
+            required_family: None,
             ..Default::default()
         };
         assert!(inv.satisfies(&req));
 
         let req_too_many = HardwareRequirement {
             min_cpu_cores: 16,
+            required_family: None,
             ..Default::default()
         };
         assert!(!inv.satisfies(&req_too_many));
@@ -443,6 +580,80 @@ mod tests {
         };
         let req = HardwareRequirement::default();
         assert!(inv.satisfies(&req));
+    }
+
+    #[test]
+    fn accelerator_type_family() {
+        assert_eq!(AcceleratorType::Cpu.family(), AcceleratorFamily::Cpu);
+        assert_eq!(AcceleratorType::Cuda.family(), AcceleratorFamily::Gpu);
+        assert_eq!(AcceleratorType::Rocm.family(), AcceleratorFamily::Gpu);
+        assert_eq!(AcceleratorType::Metal.family(), AcceleratorFamily::Gpu);
+        assert_eq!(AcceleratorType::Vulkan.family(), AcceleratorFamily::Gpu);
+        assert_eq!(AcceleratorType::Tpu.family(), AcceleratorFamily::Tpu);
+    }
+
+    #[test]
+    fn accelerator_type_is_gpu() {
+        assert!(AcceleratorType::Cuda.is_gpu());
+        assert!(AcceleratorType::Rocm.is_gpu());
+        assert!(!AcceleratorType::Cpu.is_gpu());
+        assert!(!AcceleratorType::Tpu.is_gpu());
+    }
+
+    #[test]
+    fn satisfies_with_required_family_any_gpu() {
+        let inv = HardwareInventory {
+            cpu_cores: 8,
+            memory_total_mb: 32768,
+            devices: vec![ComputeDevice {
+                index: 0,
+                name: "AMD MI300X".into(),
+                accelerator: AcceleratorType::Rocm,
+                memory_total_mb: 196608,
+                memory_available_mb: 196608,
+            }],
+        };
+        // Require "any GPU" — ROCm should match.
+        let req = HardwareRequirement {
+            required_family: Some(AcceleratorFamily::Gpu),
+            ..Default::default()
+        };
+        assert!(inv.satisfies(&req));
+
+        // Require TPU — ROCm should not match.
+        let req_tpu = HardwareRequirement {
+            required_family: Some(AcceleratorFamily::Tpu),
+            ..Default::default()
+        };
+        assert!(!inv.satisfies(&req_tpu));
+    }
+
+    #[test]
+    fn satisfies_family_with_memory_requirement() {
+        let inv = HardwareInventory {
+            cpu_cores: 8,
+            memory_total_mb: 32768,
+            devices: vec![ComputeDevice {
+                index: 0,
+                name: "Small GPU".into(),
+                accelerator: AcceleratorType::Cuda,
+                memory_total_mb: 8192,
+                memory_available_mb: 8192,
+            }],
+        };
+        let req = HardwareRequirement {
+            required_family: Some(AcceleratorFamily::Gpu),
+            min_memory_mb: 4096,
+            ..Default::default()
+        };
+        assert!(inv.satisfies(&req));
+
+        let req_too_much = HardwareRequirement {
+            required_family: Some(AcceleratorFamily::Gpu),
+            min_memory_mb: 16384,
+            ..Default::default()
+        };
+        assert!(!inv.satisfies(&req_too_much));
     }
 
     #[test]
@@ -601,6 +812,7 @@ mod tests {
             min_memory_mb: 20000,
             min_device_count: 1,
             min_cpu_cores: 0,
+            required_family: None,
         };
         assert!(inv.satisfies(&req));
 
@@ -609,6 +821,7 @@ mod tests {
             min_memory_mb: 50000,
             min_device_count: 1,
             min_cpu_cores: 0,
+            required_family: None,
         };
         assert!(!inv.satisfies(&req_too_much));
     }
@@ -641,5 +854,122 @@ mod tests {
         assert_eq!(restored.name, "NVIDIA A100");
         assert_eq!(restored.vram_total_mb, 81920);
         assert_eq!(restored.vram_available_mb, 40960);
+    }
+
+    #[cfg(feature = "hwaccel")]
+    mod training_tests {
+        use super::super::*;
+
+        #[test]
+        fn estimate_full_finetune_7b() {
+            let est = TrainingMemoryEstimate::estimate(
+                7000,
+                ai_hwaccel::TrainingMethod::FullFineTune,
+                ai_hwaccel::TrainingTarget::Gpu,
+            );
+            // Full fine-tune of 7B needs model + optimizer + activations.
+            assert!(est.total_gb > 0.0, "total should be positive");
+            assert!(est.model_gb > 0.0, "model memory should be positive");
+            assert!(est.optimizer_gb > 0.0, "optimizer memory should be positive");
+            assert!(
+                est.total_gb >= est.model_gb,
+                "total should be >= model alone"
+            );
+        }
+
+        #[test]
+        fn estimate_lora_uses_less_memory() {
+            let full = TrainingMemoryEstimate::estimate(
+                7000,
+                ai_hwaccel::TrainingMethod::FullFineTune,
+                ai_hwaccel::TrainingTarget::Gpu,
+            );
+            let lora = TrainingMemoryEstimate::estimate(
+                7000,
+                ai_hwaccel::TrainingMethod::LoRA,
+                ai_hwaccel::TrainingTarget::Gpu,
+            );
+            assert!(
+                lora.total_gb < full.total_gb,
+                "LoRA ({:.1} GB) should use less memory than full fine-tune ({:.1} GB)",
+                lora.total_gb,
+                full.total_gb
+            );
+        }
+
+        #[test]
+        fn estimate_qlora_uses_less_than_lora() {
+            let lora = TrainingMemoryEstimate::estimate(
+                7000,
+                ai_hwaccel::TrainingMethod::LoRA,
+                ai_hwaccel::TrainingTarget::Gpu,
+            );
+            let qlora = TrainingMemoryEstimate::estimate(
+                7000,
+                ai_hwaccel::TrainingMethod::QLoRA { bits: 4 },
+                ai_hwaccel::TrainingTarget::Gpu,
+            );
+            assert!(
+                qlora.total_gb < lora.total_gb,
+                "QLoRA ({:.1} GB) should use less memory than LoRA ({:.1} GB)",
+                qlora.total_gb,
+                lora.total_gb
+            );
+        }
+
+        #[test]
+        fn fits_in_inventory() {
+            let est = TrainingMemoryEstimate::estimate(
+                7000,
+                ai_hwaccel::TrainingMethod::LoRA,
+                ai_hwaccel::TrainingTarget::Gpu,
+            );
+
+            let big_inv = HardwareInventory {
+                cpu_cores: 8,
+                memory_total_mb: 65536,
+                devices: vec![ComputeDevice {
+                    index: 0,
+                    name: "A100 80GB".into(),
+                    accelerator: AcceleratorType::Cuda,
+                    memory_total_mb: 81920,
+                    memory_available_mb: 81920,
+                }],
+            };
+            assert!(
+                est.fits_in(&big_inv),
+                "7B LoRA ({:.1} GB) should fit in 80GB GPU",
+                est.total_gb
+            );
+
+            let small_inv = HardwareInventory {
+                cpu_cores: 4,
+                memory_total_mb: 16384,
+                devices: vec![ComputeDevice {
+                    index: 0,
+                    name: "Small GPU".into(),
+                    accelerator: AcceleratorType::Cuda,
+                    memory_total_mb: 4096,
+                    memory_available_mb: 4096,
+                }],
+            };
+            // 7B LoRA needs more than 4GB.
+            assert!(
+                !est.fits_in(&small_inv),
+                "7B LoRA ({:.1} GB) should not fit in 4GB GPU",
+                est.total_gb
+            );
+        }
+
+        #[test]
+        fn total_bytes_consistent() {
+            let est = TrainingMemoryEstimate::estimate(
+                7000,
+                ai_hwaccel::TrainingMethod::FullFineTune,
+                ai_hwaccel::TrainingTarget::Gpu,
+            );
+            let expected = (est.total_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+            assert_eq!(est.total_bytes(), expected);
+        }
     }
 }

@@ -217,6 +217,7 @@ mod tests {
                 min_memory_mb: 32768,
                 min_device_count: 2,
                 min_cpu_cores: 0,
+            required_family: None,
             }),
         };
         let req = agent.hardware_requirement();
@@ -294,6 +295,7 @@ mod tests {
                 min_memory_mb: 16384,
                 min_device_count: 1,
                 min_cpu_cores: 4,
+            required_family: None,
             }),
         };
         let json = serde_json::to_string(&agent).unwrap();
