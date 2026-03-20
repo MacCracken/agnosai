@@ -1,26 +1,25 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/agnosai-core",
-    "crates/agnosai-orchestrator",
-    "crates/agnosai-llm",
-    "crates/agnosai-fleet",
-    "crates/agnosai-sandbox",
-    "crates/agnosai-tools",
-    "crates/agnosai-learning",
-    "crates/agnosai-server",
-    "crates/agnosai-definitions",
-    "tests/integration",
-]
-
-[workspace.package]
+[package]
+name = "agnosai"
+description = "Provider-agnostic AI orchestration framework"
 version = "2026.3.19"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/maccracken/agnosai"
 rust-version = "1.89"
 
-[workspace.dependencies]
+[[bin]]
+name = "agnosai-server"
+path = "src/main.rs"
+
+[features]
+default = []
+full = ["sandbox", "fleet", "definitions", "hwaccel"]
+sandbox = ["dep:wasmtime", "dep:wasmtime-wasi"]
+fleet = ["dep:redis", "dep:tonic", "dep:prost"]
+definitions = ["dep:serde_yaml", "dep:zip"]
+hwaccel = ["dep:ai-hwaccel"]
+
+[dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -31,7 +30,7 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], defau
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_yaml = { version = "0.9", optional = true }
 
 # Concurrency
 dashmap = "6"
@@ -48,40 +47,70 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# gRPC
-tonic = "0.13"
-prost = "0.13"
+# gRPC (fleet)
+tonic = { version = "0.13", optional = true }
+prost = { version = "0.13", optional = true }
 
 # TLS
 rustls = "0.23"
 
-# Redis
-redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
+# Redis (fleet)
+redis = { version = "0.28", features = ["tokio-comp", "connection-manager"], optional = true }
 
 # WASM sandbox
-wasmtime = "42"
-wasmtime-wasi = "42"
+wasmtime = { version = "42", optional = true }
+wasmtime-wasi = { version = "42", optional = true }
 
 # RNG
 rand = "0.8"
 
-# Archive
-zip = "2"
+# Archive (definitions)
+zip = { version = "2", optional = true }
 
-# Testing
+# Streaming
+async-stream = "0.3"
+futures = "0.3"
+
+# Hardware detection
+ai-hwaccel = { path = "../ai-hwaccel", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tokio-test = "0.4"
 tempfile = "3"
+tower = "0.5"
+wat = "1"
+ai-hwaccel = { path = "../ai-hwaccel" }
 
-# Internal crates
-agnosai-core = { path = "crates/agnosai-core" }
-agnosai-orchestrator = { path = "crates/agnosai-orchestrator" }
-agnosai-llm = { path = "crates/agnosai-llm" }
-agnosai-fleet = { path = "crates/agnosai-fleet" }
-agnosai-sandbox = { path = "crates/agnosai-sandbox" }
-agnosai-tools = { path = "crates/agnosai-tools" }
-agnosai-learning = { path = "crates/agnosai-learning" }
-agnosai-server = { path = "crates/agnosai-server" }
-agnosai-definitions = { path = "crates/agnosai-definitions" }
+[[bench]]
+name = "resource"
+harness = false
+required-features = ["hwaccel"]
+
+[[bench]]
+name = "serde_types"
+harness = false
+
+[[bench]]
+name = "scheduler"
+harness = false
+
+[[bench]]
+name = "scoring"
+harness = false
+
+[[bench]]
+name = "placement"
+harness = false
+required-features = ["fleet"]
+
+[[test]]
+name = "crew_with_tools"
+path = "tests/crew_with_tools.rs"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
 
 [profile.release]
 opt-level = 2

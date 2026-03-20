@@ -1,5 +1,5 @@
-use agnosai_core::{CrewSpec, Task};
-use agnosai_orchestrator::Orchestrator;
+use agnosai::core::{CrewSpec, Task};
+use agnosai::orchestrator::Orchestrator;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
