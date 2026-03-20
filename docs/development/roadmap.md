@@ -11,43 +11,21 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 
 ### Code Audit & Review (P0)
 
-Multiple rounds of review covering all aspects before any further feature work:
-
-- [x] Security audit — input validation, sandbox escape paths, auth bypass, injection vectors
-- [x] Error handling — panic paths, unwrap usage, error propagation completeness
-- [x] Concurrency — lock ordering, deadlock potential, race conditions, Send/Sync correctness
-- [x] API surface — public API consistency, breaking change risk, documentation accuracy
 - [ ] Test coverage — gap analysis, edge cases, failure path testing
-- [x] Dependency audit — supply chain, minimal surface, version currency, advisory compliance
-- [x] Performance — unnecessary allocations, hot path efficiency, memory layout
 - [ ] Code quality — dead code, naming consistency, module organization
-
-### ai-hwaccel Integration
-
-All ai-hwaccel integration items are complete. See [ADR-005](../adr/005-ai-hwaccel-integration.md) for full design.
-
-### Remaining API & Protocol Work
-
-| Item | Notes | Priority |
-|------|-------|----------|
-| ~~Full JWT validation (RS256, claims, expiry)~~ | ~~Currently shared-secret only~~ | ~~Medium~~ |
-| ~~SSE integration with CrewRunner events~~ | ~~SSE endpoint exists, needs event wiring~~ | ~~Medium~~ |
-| ~~Remaining 12 presets~~ | ~~6 of 18 built-in, need design/data-eng/devops standard+large~~ | ~~Low~~ |
-
-All API & Protocol work items are complete.
 
 ### Agnostic Migration (Phase 5)
 
-| Item | Priority |
-|------|----------|
-| Feature flag: `AGNOSTIC_BACKEND=agnosai\|crewai` | High |
-| Port unit tests to run against both backends | High |
-| Port E2E tests (Docker compose with AgnosAI binary) | Medium |
-| Migrate presets domain-by-domain | Medium |
-| Port high-value Python tools to native Rust | Medium |
-| Community tool SDK (WASM) | Low |
-| Remove CrewAI dependency | Final |
-| Remove Python fleet code | Final |
+| Item | Priority | Status |
+|------|----------|--------|
+| Feature flag: `AGNOSTIC_BACKEND=agnosai\|crewai` | High | Done |
+| Port unit tests to run against both backends | High | Done |
+| Port E2E tests (Docker compose with AgnosAI binary) | Medium | Done |
+| Migrate presets domain-by-domain | Medium | Done (18 presets) |
+| Port high-value Python tools to native Rust | Medium | Done (load_testing, security_audit) |
+| Fleet shim (Python fleet → AgnosAI fleet via HTTP) | Medium | Done |
+| Community tool SDK (WASM) | Low | |
+| Remove CrewAI dependency | Final | |
 
 **Exit criteria**: Agnostic runs entirely on AgnosAI. Zero Python in the hot path. CrewAI removed.
 

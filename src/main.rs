@@ -5,6 +5,8 @@ use agnosai::server::sse::EventBus;
 use agnosai::tools::ToolRegistry;
 use agnosai::tools::builtin::echo::EchoTool;
 use agnosai::tools::builtin::json_transform::JsonTransformTool;
+use agnosai::tools::builtin::load_testing::LoadTestingTool;
+use agnosai::tools::builtin::security_audit::SecurityAuditTool;
 use tracing_subscriber::EnvFilter;
 
 use agnosai::server::{AppState, SharedState, router};
@@ -26,6 +28,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tools = Arc::new(ToolRegistry::new());
     tools.register(Arc::new(EchoTool));
     tools.register(Arc::new(JsonTransformTool));
+    tools.register(Arc::new(LoadTestingTool));
+    tools.register(Arc::new(SecurityAuditTool));
 
     let state: SharedState = Arc::new(AppState {
         orchestrator,
