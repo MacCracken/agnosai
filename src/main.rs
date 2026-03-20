@@ -27,6 +27,7 @@ async fn main() -> Result<()> {
     let state: SharedState = Arc::new(AppState {
         orchestrator,
         tools,
+        auth: Default::default(),
     });
 
     let app = router(state);

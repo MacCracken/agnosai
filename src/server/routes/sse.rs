@@ -54,6 +54,7 @@ mod tests {
         let state: SharedState = Arc::new(AppState {
             orchestrator,
             tools,
+            auth: Default::default(),
         });
         crate::server::router(state)
     }

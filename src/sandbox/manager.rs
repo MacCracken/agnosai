@@ -124,7 +124,7 @@ impl SandboxManager {
                     env: Vec::new(),
                     volumes: Vec::new(),
                 };
-                let sandbox = OciSandbox::new(oci_config);
+                let sandbox = OciSandbox::new(oci_config)?;
                 let result = sandbox.execute(&["sh", "-c", command], input).await?;
                 Ok(SandboxResult {
                     stdout: result.stdout,

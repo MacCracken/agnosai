@@ -60,14 +60,40 @@ impl OciSandboxConfig {
     }
 }
 
+/// Validate an OCI image reference.
+///
+/// Rejects images containing shell metacharacters, flags (`--`), or other
+/// characters that could inject arguments into the container runtime.
+/// Accepts standard Docker image references: `[registry/]name[:tag][@digest]`.
+fn validate_image_ref(image: &str) -> Result<(), String> {
+    if image.is_empty() {
+        return Err("image name is empty".into());
+    }
+    if image.starts_with('-') {
+        return Err("image name must not start with '-' (flag injection)".into());
+    }
+    // Allow alphanumeric, /, -, _, ., :, @ (standard Docker image ref characters).
+    let invalid = image
+        .chars()
+        .find(|c| !c.is_alphanumeric() && !"-_./:#@".contains(*c));
+    if let Some(ch) = invalid {
+        return Err(format!("image name contains invalid character: '{ch}'"));
+    }
+    Ok(())
+}
+
 /// OCI container sandbox.
 pub struct OciSandbox {
     config: OciSandboxConfig,
 }
 
 impl OciSandbox {
-    pub fn new(config: OciSandboxConfig) -> Self {
-        Self { config }
+    /// Create a new OCI sandbox, validating the image reference.
+    pub fn new(config: OciSandboxConfig) -> crate::core::Result<Self> {
+        validate_image_ref(&config.image).map_err(|e| {
+            crate::core::error::AgnosaiError::Sandbox(format!("invalid OCI image: {e}"))
+        })?;
+        Ok(Self { config })
     }
 
     /// Execute a command inside an ephemeral container.
@@ -193,8 +219,44 @@ mod tests {
     async fn missing_runtime_returns_error() {
         let mut cfg = OciSandboxConfig::new("alpine:latest");
         cfg.runtime = "/nonexistent/runtime".into();
-        let sandbox = OciSandbox::new(cfg);
+        let sandbox = OciSandbox::new(cfg).unwrap();
         let result = sandbox.execute(&["echo", "hi"], "").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_image_with_flag_injection() {
+        let mut cfg = OciSandboxConfig::new("alpine");
+        cfg.image = "--privileged".into();
+        assert!(OciSandbox::new(cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_image_with_shell_metacharacters() {
+        let mut cfg = OciSandboxConfig::new("alpine");
+        cfg.image = "alpine; rm -rf /".into();
+        assert!(OciSandbox::new(cfg).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_image_refs() {
+        for image in &[
+            "alpine",
+            "alpine:latest",
+            "ubuntu:22.04",
+            "registry.example.com/myapp:v1.2.3",
+            "ghcr.io/org/repo:sha-abc123",
+            "myimage@sha256:abcdef1234567890",
+        ] {
+            let cfg = OciSandboxConfig::new(*image);
+            assert!(OciSandbox::new(cfg).is_ok(), "should accept: {image}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_image() {
+        let mut cfg = OciSandboxConfig::new("alpine");
+        cfg.image = String::new();
+        assert!(OciSandbox::new(cfg).is_err());
     }
 }

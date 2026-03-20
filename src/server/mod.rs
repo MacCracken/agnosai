@@ -13,13 +13,21 @@ pub use state::{AppState, SharedState};
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::middleware;
 use axum::routing::{get, post};
+
+use auth::auth_middleware;
 
 /// Maximum request body size: 10 MiB.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Build the complete application router with all routes.
+///
+/// Auth middleware is applied to `/api/v1/*` and `/mcp`. Health and readiness
+/// probes (`/health`, `/ready`) are always public.
 pub fn router(state: SharedState) -> Router {
+    let auth_config = state.auth.clone();
+
     let api_v1 = Router::new()
         .route("/crews", post(routes::crews::create_crew))
         .route("/crews/{id}", get(routes::crews::get_crew))
@@ -34,11 +42,21 @@ pub fn router(state: SharedState) -> Router {
         .route("/presets", get(routes::definitions::list_presets))
         .with_state(state.clone());
 
+    // Protected routes: /api/v1/* and /mcp require auth (when enabled).
+    let protected = Router::new()
+        .route("/mcp", post(routes::mcp::mcp_handler))
+        .nest("/api/v1", api_v1)
+        .layer(middleware::from_fn(move |req, next| {
+            let cfg = auth_config.clone();
+            async move { auth_middleware(cfg, req, next).await }
+        }))
+        .with_state(state.clone());
+
+    // Public routes: health probes are always accessible.
     Router::new()
         .route("/health", get(routes::health::health))
         .route("/ready", get(routes::health::ready))
-        .route("/mcp", post(routes::mcp::mcp_handler))
-        .nest("/api/v1", api_v1)
+        .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
