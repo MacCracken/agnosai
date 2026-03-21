@@ -18,4 +18,4 @@ pub use hoosh::inference::{
 pub use hoosh::provider::{LlmProvider, ProviderType};
 
 // AgnosAI-specific task-complexity routing.
-pub use router::{Complexity, ModelTier, TaskProfile, TaskType};
+pub use router::{Complexity, ModelTier, TaskProfile, TaskType, default_model, parse_complexity};

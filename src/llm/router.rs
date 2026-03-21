@@ -95,6 +95,27 @@ pub fn route(profile: &TaskProfile) -> ModelTier {
     }
 }
 
+/// Map a model tier to a default model identifier.
+///
+/// These are the defaults when no explicit `llm_model` is set on the agent.
+/// The hoosh server resolves these to whichever provider is configured.
+pub fn default_model(tier: ModelTier) -> &'static str {
+    match tier {
+        ModelTier::Fast => "llama3",
+        ModelTier::Capable => "llama3:70b",
+        ModelTier::Premium => "llama3:405b",
+    }
+}
+
+/// Map an agent's complexity string to a [`Complexity`] enum value.
+pub fn parse_complexity(s: &str) -> Complexity {
+    match s.to_lowercase().as_str() {
+        "low" | "simple" => Complexity::Simple,
+        "high" | "complex" => Complexity::Complex,
+        _ => Complexity::Medium,
+    }
+}
+
 /// Quantization recommendation for a model based on available hardware.
 ///
 /// Uses `ai-hwaccel`'s `suggest_quantization()` to pick the best precision
@@ -213,6 +234,36 @@ mod tests {
             complexity: Complexity::Complex,
         };
         assert_eq!(route(&p), ModelTier::Premium);
+    }
+
+    // ── default_model ─────────────────────────────────────────────────
+
+    #[test]
+    fn default_model_fast() {
+        assert_eq!(default_model(ModelTier::Fast), "llama3");
+    }
+
+    #[test]
+    fn default_model_capable() {
+        assert_eq!(default_model(ModelTier::Capable), "llama3:70b");
+    }
+
+    #[test]
+    fn default_model_premium() {
+        assert_eq!(default_model(ModelTier::Premium), "llama3:405b");
+    }
+
+    // ── parse_complexity ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_complexity_variants() {
+        assert_eq!(parse_complexity("low"), Complexity::Simple);
+        assert_eq!(parse_complexity("simple"), Complexity::Simple);
+        assert_eq!(parse_complexity("medium"), Complexity::Medium);
+        assert_eq!(parse_complexity("high"), Complexity::Complex);
+        assert_eq!(parse_complexity("complex"), Complexity::Complex);
+        assert_eq!(parse_complexity("HIGH"), Complexity::Complex);
+        assert_eq!(parse_complexity("unknown"), Complexity::Medium);
     }
 
     #[cfg(feature = "hwaccel")]

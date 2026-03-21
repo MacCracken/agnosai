@@ -3,6 +3,7 @@ use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::core::{CrewSpec, CrewState, CrewStatus, ResourceBudget, Result};
+use crate::llm::HooshClient;
 use crate::server::sse::EventBus;
 
 use crate::orchestrator::crew_runner::CrewRunner;
@@ -24,6 +25,8 @@ pub struct Orchestrator {
     state: Arc<RwLock<OrchestratorState>>,
     budget: ResourceBudget,
     events: Option<EventBus>,
+    /// LLM client for inference. When `None`, tasks use placeholder execution.
+    llm: Option<Arc<HooshClient>>,
     /// Semaphore limiting concurrent crew executions.
     crew_semaphore: Arc<Semaphore>,
 }
@@ -41,6 +44,7 @@ impl Orchestrator {
             state: Arc::new(RwLock::new(state)),
             budget,
             events: None,
+            llm: None,
             crew_semaphore: Arc::new(Semaphore::new(max_concurrent)),
         })
     }
@@ -48,6 +52,12 @@ impl Orchestrator {
     /// Attach an event bus for SSE streaming.
     pub fn with_events(mut self, events: EventBus) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Attach an LLM client for real inference.
+    pub fn with_llm(mut self, client: Arc<HooshClient>) -> Self {
+        self.llm = Some(client);
         self
     }
 
@@ -90,6 +100,9 @@ impl Orchestrator {
 
         // Delegate to CrewRunner for the actual lifecycle.
         let mut runner = CrewRunner::new(spec);
+        if let Some(ref llm) = self.llm {
+            runner = runner.with_llm(Arc::clone(llm));
+        }
         if let Some(ref events) = self.events {
             runner = runner.with_events(events.sender(crew_id));
         }

@@ -11,10 +11,12 @@
 //! 6. Aggregate results into CrewState
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::core::agent::AgentDefinition;
 use crate::core::crew::{CrewSpec, CrewState, CrewStatus};
 use crate::core::task::{ProcessMode, Task, TaskId, TaskResult, TaskStatus};
+use crate::llm::{HooshClient, InferenceRequest, Message, Role};
 use crate::server::sse::CrewEvent;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
@@ -26,6 +28,8 @@ use crate::orchestrator::scoring;
 pub struct CrewRunner {
     spec: CrewSpec,
     event_tx: Option<broadcast::Sender<CrewEvent>>,
+    /// LLM client for real inference. When `None`, falls back to placeholder.
+    llm: Option<Arc<HooshClient>>,
 }
 
 impl CrewRunner {
@@ -34,7 +38,14 @@ impl CrewRunner {
         Self {
             spec,
             event_tx: None,
+            llm: None,
         }
+    }
+
+    /// Attach an LLM client for real inference.
+    pub fn with_llm(mut self, client: Arc<HooshClient>) -> Self {
+        self.llm = Some(client);
+        self
     }
 
     /// Attach an event sender for SSE streaming.
@@ -131,7 +142,7 @@ impl CrewRunner {
             );
 
             self.spec.tasks[i].status = TaskStatus::Running;
-            let result = execute_task(&self.spec.tasks[i], agent.as_ref()).await;
+            let result = execute_task(&self.spec.tasks[i], agent.as_ref(), self.llm.as_ref()).await;
             self.spec.tasks[i].status = result.status;
 
             self.emit(
@@ -188,6 +199,7 @@ impl CrewRunner {
 
         for (task, agent) in task_snapshots {
             let permit = semaphore.clone();
+            let llm = self.llm.clone();
             join_set.spawn(async move {
                 let _permit = match permit.acquire().await {
                     Ok(p) => p,
@@ -200,7 +212,7 @@ impl CrewRunner {
                         };
                     }
                 };
-                execute_task(&task, agent.as_ref()).await
+                execute_task(&task, agent.as_ref(), llm.as_ref()).await
             });
         }
 
@@ -296,8 +308,11 @@ impl CrewRunner {
                 );
 
                 let task_snap = self.spec.tasks[idx].clone();
+                let llm = self.llm.clone();
 
-                join_set.spawn(async move { execute_task(&task_snap, agent.as_ref()).await });
+                join_set.spawn(async move {
+                    execute_task(&task_snap, agent.as_ref(), llm.as_ref()).await
+                });
             }
 
             while let Some(res) = join_set.join_next().await {
@@ -345,27 +360,169 @@ fn pick_best_agent(agents: &[AgentDefinition], task: &Task) -> Option<AgentDefin
     ranked.first().map(|(a, _)| (*a).clone())
 }
 
-/// Placeholder task execution — returns the description as output.
-///
-/// Phase 2 will replace this with an actual LLM call via the agent's model.
-async fn execute_task(task: &Task, agent: Option<&AgentDefinition>) -> TaskResult {
+/// Execute a task via LLM inference, or fall back to placeholder if no client.
+async fn execute_task(
+    task: &Task,
+    agent: Option<&AgentDefinition>,
+    llm: Option<&Arc<HooshClient>>,
+) -> TaskResult {
     let agent_label = agent.map(|a| a.agent_key.as_str()).unwrap_or("unassigned");
 
-    debug!(
-        task_id = %task.id,
-        agent = agent_label,
-        "executing task (placeholder)"
+    // If no LLM client, fall back to placeholder (useful for tests).
+    let Some(client) = llm else {
+        debug!(task_id = %task.id, agent = agent_label, "executing task (placeholder — no LLM client)");
+        tokio::task::yield_now().await;
+        return TaskResult {
+            task_id: task.id,
+            output: task.description.clone(),
+            status: TaskStatus::Completed,
+            metadata: HashMap::new(),
+        };
+    };
+
+    debug!(task_id = %task.id, agent = agent_label, "executing task via LLM");
+
+    // Build system prompt from agent definition.
+    let system_prompt = build_system_prompt(agent);
+
+    // Choose model: agent override → router-based tier selection.
+    let model = select_model(agent);
+
+    // Build messages: include any context as a preamble.
+    let mut messages = Vec::new();
+    if !task.context.is_empty() {
+        let ctx_json = serde_json::to_string_pretty(&task.context).unwrap_or_default();
+        messages.push(Message {
+            role: Role::User,
+            content: format!("Context:\n```json\n{ctx_json}\n```"),
+        });
+        messages.push(Message {
+            role: Role::Assistant,
+            content: "Understood, I have the context.".into(),
+        });
+    }
+
+    // The task description is the main user message.
+    let mut user_msg = task.description.clone();
+    if let Some(ref expected) = task.expected_output {
+        user_msg.push_str(&format!("\n\nExpected output format: {expected}"));
+    }
+
+    let request = InferenceRequest {
+        model: model.to_string(),
+        prompt: user_msg,
+        system: Some(system_prompt),
+        messages,
+        max_tokens: Some(4096),
+        temperature: Some(0.7),
+        ..Default::default()
+    };
+
+    match client.infer(&request).await {
+        Ok(response) => {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "model".into(),
+                serde_json::Value::String(response.model.clone()),
+            );
+            metadata.insert(
+                "provider".into(),
+                serde_json::Value::String(response.provider.clone()),
+            );
+            metadata.insert("latency_ms".into(), serde_json::json!(response.latency_ms));
+            metadata.insert(
+                "tokens".into(),
+                serde_json::json!({
+                    "prompt": response.usage.prompt_tokens,
+                    "completion": response.usage.completion_tokens,
+                    "total": response.usage.total_tokens,
+                }),
+            );
+
+            info!(
+                task_id = %task.id,
+                agent = agent_label,
+                model = %response.model,
+                latency_ms = response.latency_ms,
+                tokens = response.usage.total_tokens,
+                "task completed via LLM"
+            );
+
+            TaskResult {
+                task_id: task.id,
+                output: response.text,
+                status: TaskStatus::Completed,
+                metadata,
+            }
+        }
+        Err(e) => {
+            warn!(
+                task_id = %task.id,
+                agent = agent_label,
+                error = %e,
+                "LLM inference failed"
+            );
+            let mut metadata = HashMap::new();
+            metadata.insert("error".into(), serde_json::Value::String(e.to_string()));
+
+            TaskResult {
+                task_id: task.id,
+                output: format!("LLM error: {e}"),
+                status: TaskStatus::Failed,
+                metadata,
+            }
+        }
+    }
+}
+
+/// Build a system prompt from an agent's definition.
+fn build_system_prompt(agent: Option<&AgentDefinition>) -> String {
+    let Some(agent) = agent else {
+        return "You are a helpful AI assistant executing tasks within a crew.".into();
+    };
+
+    let mut prompt = format!(
+        "You are {name}, a {role}.\n\nGoal: {goal}",
+        name = agent.name,
+        role = agent.role,
+        goal = agent.goal,
     );
 
-    // Simulate a tiny bit of async work so tokio can schedule other tasks.
-    tokio::task::yield_now().await;
-
-    TaskResult {
-        task_id: task.id,
-        output: task.description.clone(),
-        status: TaskStatus::Completed,
-        metadata: HashMap::new(),
+    if let Some(ref backstory) = agent.backstory {
+        prompt.push_str(&format!("\n\nBackstory: {backstory}"));
     }
+
+    if let Some(ref domain) = agent.domain {
+        prompt.push_str(&format!("\n\nDomain expertise: {domain}"));
+    }
+
+    if !agent.tools.is_empty() {
+        prompt.push_str(&format!("\n\nAvailable tools: {}", agent.tools.join(", ")));
+    }
+
+    prompt
+}
+
+/// Select a model for a task: agent override, or route by complexity tier.
+fn select_model(agent: Option<&AgentDefinition>) -> &str {
+    if let Some(agent) = agent {
+        // Agent-specific model override takes priority.
+        if let Some(ref model) = agent.llm_model {
+            return model.as_str();
+        }
+
+        // Route by agent complexity.
+        let complexity = crate::llm::parse_complexity(&agent.complexity);
+        let profile = crate::llm::TaskProfile {
+            task_type: crate::llm::TaskType::Reason,
+            complexity,
+        };
+        let tier = crate::llm::router::route(&profile);
+        return crate::llm::default_model(tier);
+    }
+
+    // No agent — use capable tier default.
+    crate::llm::default_model(crate::llm::ModelTier::Capable)
 }
 
 /// Kahn's algorithm for topological sort. Returns an error on cycles.
@@ -646,6 +803,85 @@ mod tests {
         // Sequential order preserved in fallback.
         assert_eq!(state.results[0].output, "h1");
         assert_eq!(state.results[1].output, "h2");
+    }
+
+    // ── System prompt building ──────────────────────────────────────────
+
+    #[test]
+    fn test_build_system_prompt_no_agent() {
+        let prompt = build_system_prompt(None);
+        assert!(prompt.contains("helpful AI assistant"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_full_agent() {
+        let mut agent = test_agent("qa");
+        agent.name = "QA Lead".into();
+        agent.role = "quality assurance".into();
+        agent.goal = "ensure zero defects".into();
+        agent.backstory = Some("10 years in QA".into());
+        agent.domain = Some("testing".into());
+        agent.tools = vec!["selenium".into(), "pytest".into()];
+
+        let prompt = build_system_prompt(Some(&agent));
+        assert!(prompt.contains("QA Lead"));
+        assert!(prompt.contains("quality assurance"));
+        assert!(prompt.contains("ensure zero defects"));
+        assert!(prompt.contains("10 years in QA"));
+        assert!(prompt.contains("testing"));
+        assert!(prompt.contains("selenium, pytest"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_minimal_agent() {
+        let agent = test_agent("min");
+        let prompt = build_system_prompt(Some(&agent));
+        assert!(prompt.contains("min")); // name
+        assert!(prompt.contains("tester")); // role
+        assert!(prompt.contains("test things")); // goal
+        assert!(!prompt.contains("Backstory"));
+        assert!(!prompt.contains("Domain"));
+        assert!(!prompt.contains("Available tools"));
+    }
+
+    // ── Model selection ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_select_model_no_agent() {
+        let model = select_model(None);
+        // Should use capable tier default.
+        assert_eq!(model, "llama3:70b");
+    }
+
+    #[test]
+    fn test_select_model_agent_override() {
+        let mut agent = test_agent("a");
+        agent.llm_model = Some("gpt-4o".into());
+        assert_eq!(select_model(Some(&agent)), "gpt-4o");
+    }
+
+    #[test]
+    fn test_select_model_routes_by_complexity() {
+        let mut low = test_agent("low");
+        low.complexity = "low".into();
+        // Low complexity + Reason → Capable → llama3:70b
+        assert_eq!(select_model(Some(&low)), "llama3:70b");
+
+        let mut high = test_agent("high");
+        high.complexity = "high".into();
+        // High complexity + Reason → Premium → llama3:405b
+        assert_eq!(select_model(Some(&high)), "llama3:405b");
+    }
+
+    // ── Placeholder fallback (no LLM client) ────────────────────────────
+
+    #[tokio::test]
+    async fn test_execute_task_placeholder_when_no_llm() {
+        let task = test_task("do something");
+        let agent = test_agent("a");
+        let result = execute_task(&task, Some(&agent), None).await;
+        assert_eq!(result.status, TaskStatus::Completed);
+        assert_eq!(result.output, "do something");
     }
 
     // ── SSE event emission ──────────────────────────────────────────────
