@@ -128,7 +128,17 @@ pub fn matches_pattern(pattern: &str, topic: &str) -> bool {
     }
 }
 
+/// Maximum recursion depth to prevent stack overflow on adversarial patterns.
+const MAX_MATCH_DEPTH: usize = 32;
+
 fn matches_recursive(pattern: &[&str], topic: &[&str]) -> bool {
+    matches_recursive_inner(pattern, topic, 0)
+}
+
+fn matches_recursive_inner(pattern: &[&str], topic: &[&str], depth: usize) -> bool {
+    if depth > MAX_MATCH_DEPTH {
+        return false;
+    }
     match (pattern.first(), topic.first()) {
         // Both exhausted — match.
         (None, None) => true,
@@ -145,7 +155,7 @@ fn matches_recursive(pattern: &[&str], topic: &[&str]) -> bool {
             }
             // Try consuming 0, 1, 2, ... topic segments.
             for i in 0..=topic.len() {
-                if matches_recursive(rest_pat, &topic[i..]) {
+                if matches_recursive_inner(rest_pat, &topic[i..], depth + 1) {
                     return true;
                 }
             }
@@ -157,12 +167,12 @@ fn matches_recursive(pattern: &[&str], topic: &[&str]) -> bool {
         (Some(_), None) => pattern.iter().all(|&s| s == "#"),
 
         // `*` matches exactly one segment.
-        (Some(&"*"), Some(_)) => matches_recursive(&pattern[1..], &topic[1..]),
+        (Some(&"*"), Some(_)) => matches_recursive_inner(&pattern[1..], &topic[1..], depth + 1),
 
         // Literal match.
         (Some(p), Some(t)) => {
             if *p == *t {
-                matches_recursive(&pattern[1..], &topic[1..])
+                matches_recursive_inner(&pattern[1..], &topic[1..], depth + 1)
             } else {
                 false
             }

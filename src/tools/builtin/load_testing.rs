@@ -166,9 +166,10 @@ async fn run_load_test(
     let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
 
     let avg_latency = all_latencies.iter().map(|d| to_ms(*d)).sum::<f64>() / all_latencies.len() as f64;
-    let p50 = to_ms(all_latencies[all_latencies.len() * 50 / 100]);
-    let p95 = to_ms(all_latencies[all_latencies.len() * 95 / 100]);
-    let p99 = to_ms(all_latencies[(all_latencies.len() * 99 / 100).min(all_latencies.len() - 1)]);
+    let last = all_latencies.len() - 1;
+    let p50 = to_ms(all_latencies[(all_latencies.len() * 50 / 100).min(last)]);
+    let p95 = to_ms(all_latencies[(all_latencies.len() * 95 / 100).min(last)]);
+    let p99 = to_ms(all_latencies[(all_latencies.len() * 99 / 100).min(last)]);
     let min_latency = to_ms(all_latencies[0]);
     let max_latency = to_ms(*all_latencies.last().unwrap());
 

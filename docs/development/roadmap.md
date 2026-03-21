@@ -107,6 +107,10 @@ Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/re
 | Silent serialization errors in SSE | Medium | Log errors instead of `unwrap_or_default()` |
 | `#[must_use]` on Result-returning functions | Medium | Prevent accidental error swallowing |
 | Clippy `unwrap_used` restriction lint | Medium | Forbid `.unwrap()` in non-test code via CI |
+| IPC distinguish EOF from truncated frames | Medium | Log `UnexpectedEof` separately from other I/O errors |
+| SSE validate crew existence before subscribing | Medium | Return 404 for unknown crew_id, prevent EventBus leak |
+| Fleet checkpoint phase isolation | Medium | Separate checkpointing flag from phase enum to prevent interleaving |
+| Fleet barrier timeout mechanism | Medium | Caller-side timeout to detect dead nodes and call `force_barrier()` |
 | Add re-exports to `tools::builtin` module | Low | Convenience `pub use echo::EchoTool` etc. |
 | Public API re-exports in `lib.rs` | Low | Common types at crate root for ergonomics |
 | Resolve `orchestrator/orchestrator.rs` module inception | Low | Rename inner file to avoid `#[allow(clippy::module_inception)]` |

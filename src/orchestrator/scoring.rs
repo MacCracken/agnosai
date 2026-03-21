@@ -21,7 +21,10 @@ fn tool_coverage_score(agent: &AgentDefinition, task: &Task) -> f64 {
     let required = match task.context.get("required_tools") {
         Some(val) => match serde_json::from_value::<Vec<String>>(val.clone()) {
             Ok(tools) => tools,
-            Err(_) => return 1.0, // malformed → no penalty
+            Err(_) => {
+                tracing::warn!("task has malformed required_tools context, penalizing score");
+                return 0.5; // malformed → partial penalty (was 1.0)
+            }
         },
         None => return 1.0, // no requirement → full score
     };

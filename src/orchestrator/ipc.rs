@@ -124,6 +124,11 @@ async fn read_frame(stream: &mut UnixStream) -> crate::core::Result<Vec<u8>> {
         .await
         .map_err(|e| crate::core::AgnosaiError::Ipc(format!("read length failed: {e}")))?;
     let len = u32::from_be_bytes(len_buf);
+    if len == 0 {
+        return Err(crate::core::AgnosaiError::Ipc(
+            "empty frame (zero-length)".into(),
+        ));
+    }
     if len > MAX_FRAME_SIZE {
         return Err(crate::core::AgnosaiError::Ipc(format!(
             "frame size {len} exceeds maximum {MAX_FRAME_SIZE}"

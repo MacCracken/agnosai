@@ -182,6 +182,34 @@ impl CrewStateManager {
         }
     }
 
+    /// Force a barrier to complete, even if not all nodes have arrived.
+    ///
+    /// Use when a node has been detected as dead and the barrier would otherwise
+    /// deadlock. The caller should remove the dead node from `participating_nodes`
+    /// first or accept that the barrier completes with fewer nodes.
+    pub fn force_barrier(&mut self, run_id: CrewRunId, barrier_name: &str) -> bool {
+        let Some(state) = self.states.get_mut(&run_id) else {
+            return false;
+        };
+        // Clean up barrier tracking.
+        if let Some(run_barriers) = self.barriers.get_mut(&run_id) {
+            run_barriers.remove(barrier_name);
+        }
+        state.phase = CrewPhase::Running;
+        state.updated_at = Utc::now();
+        true
+    }
+
+    /// Remove a node from a run's participating set (e.g. after detecting it as dead).
+    pub fn remove_node(&mut self, run_id: CrewRunId, node_id: &NodeId) -> bool {
+        let Some(state) = self.states.get_mut(&run_id) else {
+            return false;
+        };
+        state.participating_nodes.retain(|n| n != node_id);
+        state.updated_at = Utc::now();
+        true
+    }
+
     /// Create a checkpoint of the current state.
     pub fn checkpoint(
         &mut self,
