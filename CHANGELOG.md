@@ -101,7 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rust-toolchain.toml` (stable channel)
 - Release profile: `lto = "fat"`, `strip = true`, `panic = "abort"`, `codegen-units = 1`
 - AGPL-3.0-only license
-- 309 tests passing
+- 323 tests passing
 
 #### Server — MCP, A2A, SSE, Auth
 - MCP server (JSON-RPC 2.0 over HTTP POST): `initialize`, `tools/list`, `tools/call` with ToolRegistry integration

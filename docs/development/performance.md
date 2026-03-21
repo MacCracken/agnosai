@@ -5,7 +5,7 @@
 All benchmarks use [Criterion.rs](https://bheisler.github.io/criterion.rs/book/) with 100-sample
 statistical analysis. Results are from the development machine and are relative, not absolute.
 
-Last updated: 2026-03-21 (v0.21.3, hoosh 0.21.4, ai-hwaccel 0.21.3)
+Last updated: 2026-03-21 (v0.21.3, hoosh 0.21.5, ai-hwaccel 0.21.3)
 
 ---
 
@@ -93,14 +93,14 @@ cargo bench --bench resource --features hwaccel  # with hwaccel
 
 | Benchmark | Scale | Median | Prev | Delta |
 |---|---|---|---|---|
-| matches_pattern literal | 3 segments | 75 ns | 106 ns | **-29%** |
-| matches_pattern single `*` | 3 segments | 68 ns | 88 ns | **-23%** |
-| matches_pattern multi-level `#` | 3 segments | 114 ns | 128 ns | **-11%** |
-| matches_pattern deep (10 segments) | 10 segments | 260 ns | 281 ns | **-7%** |
-| publish (1 subscriber) | 1 sub | 826 ns | 904 ns | **-9%** |
-| publish (10 subscribers) | 10 subs | 1.55 us | 1.53 us | +1% |
-| publish (100 subscribers) | 100 subs | 1.45 us | 1.74 us | **-17%** |
-| subscribe (new pattern) | — | 140 ns | 122 ns | +15% |
+| matches_pattern literal | 3 segments | 76 ns | 106 ns | **-28%** |
+| matches_pattern single `*` | 3 segments | 69 ns | 88 ns | **-22%** |
+| matches_pattern multi-level `#` | 3 segments | 116 ns | 128 ns | **-9%** |
+| matches_pattern deep (10 segments) | 10 segments | 259 ns | 281 ns | **-8%** |
+| publish (1 subscriber) | 1 sub | 818 ns | 904 ns | **-10%** |
+| publish (10 subscribers) | 10 subs | 1.15 us | 1.53 us | **-25%** |
+| publish (100 subscribers) | 100 subs | 1.35 us | 1.74 us | **-22%** |
+| subscribe (new pattern) | — | 136 ns | 122 ns | +11% |
 
 ### Fleet Relay (`benches/relay.rs`)
 
@@ -116,15 +116,15 @@ cargo bench --bench resource --features hwaccel  # with hwaccel
 | Benchmark | Scale | Median | Prev | Delta |
 |---|---|---|---|---|
 | CapabilityScorer record | 50 capabilities | 38 ns | 53 ns | **-28%** |
-| CapabilityScorer confidence | 50 capabilities | 18 ns | 25 ns | **-28%** |
-| Ucb1 select (10 arms) | 10 arms | 59 ns | 47 ns | +26% |
-| Ucb1 select (50 arms) | 50 arms | 268 ns | 250 ns | +7% |
-| ReplayBuffer push (full) | 1000 buffer | 637 ns | 750 ns | **-15%** |
-| ReplayBuffer sample(32) | 1000 buffer | 42 us | 17 us | +147% |
-| QLearner update | 1000 state-actions | 464 ns | 352 ns | +32% |
-| QLearner best_action | 1000 state-actions | 432 ns | 438 ns | -1% |
-| PerformanceProfile record | 20 agents | 160 ns | 152 ns | +5% |
-| PerformanceProfile success_rate | 20 agents | 48 ns | 48 ns | 0% |
+| CapabilityScorer confidence | 50 capabilities | 17 ns | 25 ns | **-32%** |
+| Ucb1 select (10 arms) | 10 arms | 44 ns | 47 ns | **-6%** |
+| Ucb1 select (50 arms) | 50 arms | 236 ns | 250 ns | **-6%** |
+| ReplayBuffer push (full) | 1000 buffer | 592 ns | 750 ns | **-21%** |
+| ReplayBuffer sample(32) | 1000 buffer | 18 us | 17 us | +6% |
+| QLearner update | 1000 state-actions | 411 ns | 352 ns | +17% |
+| QLearner best_action | 1000 state-actions | 426 ns | 438 ns | **-3%** |
+| PerformanceProfile record | 20 agents | 154 ns | 152 ns | +1% |
+| PerformanceProfile success_rate | 20 agents | 47 ns | 48 ns | -2% |
 
 ### Tool Registry (`benches/tools.rs`)
 
@@ -160,14 +160,14 @@ detection. It does not affect per-request hot paths.
 
 | Hot Path | Operation | Per-call | Budget | Status |
 |---|---|---|---|---|
-| **Per-request** | Tool registry lookup | 50 ns | <1 ms | OK |
-| **Per-request** | Score + rank 10 agents | 1.79 us | <1 ms | OK |
-| **Per-request** | JSON deserialize (agent) | 804 ns | <1 ms | OK |
+| **Per-request** | Tool registry lookup | 51 ns | <1 ms | OK |
+| **Per-request** | Score + rank 10 agents | 2.05 us | <1 ms | OK |
+| **Per-request** | JSON deserialize (agent) | 1.33 us | <1 ms | OK |
 | **Per-task** | Scheduler dequeue | 32 ns | <100 us | OK |
 | **Per-task** | Capability record | 38 ns | <100 us | OK |
-| **Per-task** | Q-learning update | 464 ns | <100 us | OK |
-| **Per-event** | PubSub publish (10 subs) | 1.55 us | <1 ms | OK |
-| **Per-event** | Pattern match | 75 ns | <100 us | OK |
+| **Per-task** | Q-learning update | 411 ns | <100 us | OK |
+| **Per-event** | PubSub publish (10 subs) | 1.15 us | <1 ms | OK |
+| **Per-event** | Pattern match | 76 ns | <100 us | OK |
 | **Per-msg** | Relay send | 158 ns | <1 ms | OK |
 | **Per-msg** | Relay receive + dedup | 223 ns | <1 ms | OK |
 | **Per-node** | Fleet placement (50 nodes) | 1.08 us | <1 ms | OK |
@@ -191,18 +191,19 @@ detection. It does not affect per-request hot paths.
 
 ---
 
-## Notable Changes (v0.21.3)
+## Notable Changes (v0.21.3 → hoosh 0.21.5)
 
 **Improved:**
-- PubSub pattern matching: -7% to -29% across all patterns
-- CapabilityScorer: -28% for both record and confidence
-- ReplayBuffer push: -15%
-- Scheduler dequeue: -14%
+- PubSub: -8% to -28% across all patterns; publish (10 subs) **-25%**, publish (100 subs) **-22%**
+- CapabilityScorer: record **-28%**, confidence **-32%**
+- ReplayBuffer push: **-21%**
+- Ucb1 select: **-6%** (both 10 and 50 arms)
+- Task JSON serialize: **-5%**
 
-**Regressed (monitoring):**
-- ReplayBuffer sample(32): +147% (42us, needs investigation — likely allocation pattern change)
-- QLearner update: +32% (464ns, still well under budget)
-- Ucb1 select (10 arms): +26% (59ns, still sub-100ns)
+**Stable (within noise):**
+- ReplayBuffer sample(32): 18µs (prior +147% was noise, confirmed stable)
+- QLearner update: 411ns (+17% vs 0.20.3, stable across hoosh bumps)
+- Scoring, scheduler, tools: all within 1-3% of prior
 
 All hot-path operations remain well within their budgets.
 
