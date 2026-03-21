@@ -503,12 +503,32 @@ fn build_system_prompt(agent: Option<&AgentDefinition>) -> String {
     prompt
 }
 
+/// Strip provider prefixes (e.g. `ollama/`, `openai/`) from a model string.
+///
+/// LiteLLM-style identifiers use `provider/model` notation but most inference
+/// endpoints (including Ollama's OpenAI-compatible API) expect just the model
+/// name.  This helper normalises both forms.
+fn strip_provider_prefix(model: &str) -> &str {
+    // Common litellm prefixes: ollama/, openai/, anthropic/, etc.
+    if let Some(idx) = model.find('/') {
+        let prefix = &model[..idx];
+        // Only strip known provider prefixes, not arbitrary path components.
+        match prefix {
+            "ollama" | "openai" | "anthropic" | "groq" | "deepseek" | "mistral" | "together"
+            | "fireworks" | "anyscale" | "perplexity" | "bedrock" | "azure" => &model[idx + 1..],
+            _ => model,
+        }
+    } else {
+        model
+    }
+}
+
 /// Select a model for a task: agent override, or route by complexity tier.
 fn select_model(agent: Option<&AgentDefinition>) -> &str {
     if let Some(agent) = agent {
         // Agent-specific model override takes priority.
         if let Some(ref model) = agent.llm_model {
-            return model.as_str();
+            return strip_provider_prefix(model.as_str());
         }
 
         // Route by agent complexity.
@@ -858,6 +878,26 @@ mod tests {
         let mut agent = test_agent("a");
         agent.llm_model = Some("gpt-4o".into());
         assert_eq!(select_model(Some(&agent)), "gpt-4o");
+    }
+
+    #[test]
+    fn test_select_model_strips_provider_prefix() {
+        let mut agent = test_agent("a");
+        agent.llm_model = Some("ollama/llama3.2:1b".into());
+        assert_eq!(select_model(Some(&agent)), "llama3.2:1b");
+
+        agent.llm_model = Some("openai/gpt-4o".into());
+        assert_eq!(select_model(Some(&agent)), "gpt-4o");
+
+        agent.llm_model = Some("anthropic/claude-sonnet-4-20250514".into());
+        assert_eq!(select_model(Some(&agent)), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn test_strip_provider_prefix_preserves_unknown() {
+        // Unknown prefix should be kept as-is.
+        assert_eq!(strip_provider_prefix("custom/model"), "custom/model");
+        assert_eq!(strip_provider_prefix("llama3:70b"), "llama3:70b");
     }
 
     #[test]
