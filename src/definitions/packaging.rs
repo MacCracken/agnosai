@@ -79,17 +79,38 @@ impl AgnosPackage {
         Ok(cursor.into_inner())
     }
 
+    /// Maximum decompressed size for a single file in a package (1 MiB).
+    const MAX_FILE_SIZE: u64 = 1024 * 1024;
+
+    /// Maximum number of entries in a package.
+    const MAX_ENTRIES: usize = 100;
+
     /// Import from ZIP bytes.
     pub fn import(data: &[u8]) -> Result<Self> {
         let cursor = Cursor::new(data);
         let mut archive = zip::ZipArchive::new(cursor)
             .map_err(|e| AgnosaiError::InvalidDefinition(format!("invalid zip: {e}")))?;
 
+        // Guard against zip bombs: limit entry count.
+        if archive.len() > Self::MAX_ENTRIES {
+            return Err(AgnosaiError::InvalidDefinition(format!(
+                "package has {} entries, max is {}",
+                archive.len(),
+                Self::MAX_ENTRIES,
+            )));
+        }
+
         // Read manifest.
         let manifest: PackageManifest = {
             let mut file = archive.by_name("manifest.json").map_err(|e| {
                 AgnosaiError::InvalidDefinition(format!("missing manifest.json: {e}"))
             })?;
+            // Guard against zip bomb on manifest.
+            if file.size() > Self::MAX_FILE_SIZE {
+                return Err(AgnosaiError::InvalidDefinition(
+                    "manifest.json exceeds 1 MiB size limit".into(),
+                ));
+            }
             let mut content = String::new();
             file.read_to_string(&mut content)?;
             serde_json::from_str(&content)?
@@ -101,6 +122,10 @@ impl AgnosPackage {
             .filter_map(|i| {
                 let file = archive.by_index(i).ok()?;
                 let name = file.name().to_string();
+                // Reject path traversal: no ".." components allowed.
+                if name.contains("..") {
+                    return None;
+                }
                 if name.starts_with("definitions/") && name.ends_with(".json") {
                     Some(name)
                 } else {
@@ -113,6 +138,12 @@ impl AgnosPackage {
             let mut file = archive
                 .by_name(&name)
                 .map_err(|e| AgnosaiError::Other(format!("zip read error: {e}")))?;
+            // Guard against zip bomb per file.
+            if file.size() > Self::MAX_FILE_SIZE {
+                return Err(AgnosaiError::InvalidDefinition(format!(
+                    "{name} exceeds 1 MiB size limit"
+                )));
+            }
             let mut content = String::new();
             file.read_to_string(&mut content)?;
             let def: AgentDefinition = serde_json::from_str(&content)?;

@@ -55,8 +55,14 @@ fn is_safe_callback_url(url: &str) -> bool {
     true
 }
 
+/// Maximum string field length for A2A requests.
+const A2A_MAX_STRING_LEN: usize = 10_000;
+/// Maximum metadata JSON size in bytes.
+const A2A_MAX_METADATA_BYTES: usize = 64 * 1024; // 64 KiB
+
 /// A2A task delegation request — matches Agnostic v1 format.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct A2ARequest {
     pub task_id: String,
@@ -91,6 +97,32 @@ pub async fn receive(
     State(state): State<SharedState>,
     Json(req): Json<A2ARequest>,
 ) -> (StatusCode, Json<A2AResponse>) {
+    // Validate field lengths.
+    if req.task_id.len() > A2A_MAX_STRING_LEN || req.description.len() > A2A_MAX_STRING_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(A2AResponse {
+                task_id: req.task_id,
+                status: "failed".to_string(),
+                result: None,
+                error: Some("field exceeds max length".to_string()),
+            }),
+        );
+    }
+    if let Ok(meta_bytes) = serde_json::to_vec(&req.metadata) {
+        if meta_bytes.len() > A2A_MAX_METADATA_BYTES {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(A2AResponse {
+                    task_id: req.task_id,
+                    status: "failed".to_string(),
+                    result: None,
+                    error: Some("metadata exceeds 64 KiB limit".to_string()),
+                }),
+            );
+        }
+    }
+
     let task_id = req.task_id.clone();
 
     // Build a simple crew with one task and default (empty) agent list.

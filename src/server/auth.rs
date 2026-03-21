@@ -12,14 +12,19 @@ use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation};
 use serde::{Deserialize, Serialize};
 
 /// Constant-time byte comparison to prevent timing attacks on secret comparison.
+///
+/// Both length and content are compared in constant time — no early return
+/// on length mismatch that would leak secret length.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    // XOR the lengths to avoid timing leak on length mismatch.
+    let mut result = (a.len() ^ b.len()) as u8;
+    // Compare up to the shorter length, then pad comparison for the remainder.
+    for i in 0..a.len().max(b.len()) {
+        let x = if i < a.len() { a[i] } else { 0 };
+        let y = if i < b.len() { b[i] } else { 0 };
+        result |= x ^ y;
     }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    result == 0
 }
 
 /// JWT/auth configuration.
@@ -135,7 +140,15 @@ fn validate_jwt(token: &str, config: &JwtConfig) -> Result<TokenData<Claims>, St
         validation.validate_aud = false;
     }
 
-    jsonwebtoken::decode::<Claims>(token, &key, &validation).map_err(|_| StatusCode::UNAUTHORIZED)
+    let token_data =
+        jsonwebtoken::decode::<Claims>(token, &key, &validation).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // Defense-in-depth: reject tokens without an explicit expiration claim.
+    if token_data.claims.exp.is_none() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(token_data)
 }
 
 /// Middleware that checks for a valid Bearer token.

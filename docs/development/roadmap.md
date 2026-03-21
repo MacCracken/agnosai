@@ -102,7 +102,11 @@ Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/re
 | DNS rebinding protection for A2A callbacks | Medium | Resolve-once + validate before connect |
 | Request rate limiting per client IP | Medium | Middleware layer, token bucket or sliding window |
 | Crew execution timeout | Medium | Configurable max wall-clock per crew |
-| Shared `reqwest::Client` for A2A callbacks | Medium | Pass via AppState instead of creating per-callback |
+| Shared `reqwest::Client` in AppState | Medium | Reuse across A2A callbacks and provider calls |
+| Fleet relay poisoned mutex recovery | Medium | Reset seen-map on recovery instead of blind `into_inner()` |
+| Silent serialization errors in SSE | Medium | Log errors instead of `unwrap_or_default()` |
+| `#[must_use]` on Result-returning functions | Medium | Prevent accidental error swallowing |
+| Clippy `unwrap_used` restriction lint | Medium | Forbid `.unwrap()` in non-test code via CI |
 | Add re-exports to `tools::builtin` module | Low | Convenience `pub use echo::EchoTool` etc. |
 | Public API re-exports in `lib.rs` | Low | Common types at crate root for ergonomics |
 | Resolve `orchestrator/orchestrator.rs` module inception | Low | Rename inner file to avoid `#[allow(clippy::module_inception)]` |

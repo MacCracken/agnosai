@@ -34,7 +34,11 @@ impl ReplayBuffer {
                 .experiences
                 .iter()
                 .enumerate()
-                .min_by(|a, b| a.1.priority.partial_cmp(&b.1.priority).unwrap())
+                .min_by(|a, b| {
+                    a.1.priority
+                        .partial_cmp(&b.1.priority)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
             {
                 // Only evict if the new experience has higher priority.
                 if exp.priority > min_exp.priority {

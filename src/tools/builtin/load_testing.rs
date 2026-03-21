@@ -61,7 +61,7 @@ impl NativeTool for LoadTestingTool {
 
             // Cap to reasonable limits.
             let concurrent_users = concurrent_users.min(500);
-            let duration = Duration::from_secs(duration_secs.min(300));
+            let duration = Duration::from_secs(duration_secs.clamp(1, 300));
 
             match run_load_test(&target_url, concurrent_users, duration).await {
                 Ok(result) => ToolOutput::ok(serde_json::to_value(result).unwrap_or_default()),

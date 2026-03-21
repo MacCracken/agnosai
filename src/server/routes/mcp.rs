@@ -10,6 +10,7 @@ use crate::tools::ToolInput;
 use crate::server::state::SharedState;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct JsonRpcRequest {
     #[allow(dead_code)]
