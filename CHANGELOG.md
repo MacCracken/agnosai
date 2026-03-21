@@ -5,7 +5,21 @@ All notable changes to AgnosAI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.21.3] — 2026-03-21
+
+### Added
+- Lazy LLM provider initialisation — `HooshClient` created on first inference via `OnceLock`, not at server startup
+- Crew execution profiling — `CrewProfile` on every `CrewState` with wall time and per-task `task_duration_ms` metadata
+- Inference response caching — hoosh `ResponseCache` (TTL + LRU eviction) wired into `execute_task`, shared across crews
+- Dockerfile (multi-stage build, `rust:1.89-bookworm` builder, `debian:bookworm-slim` runtime)
+- `strip_provider_prefix()` — normalises LiteLLM-style `provider/model` identifiers for inference
+
+### Changed
+- hoosh dependency updated from 0.20 to 0.21.3
+- `Orchestrator::with_llm_url()` replaces eager `with_llm(Arc<HooshClient>)` as primary init path
+- Server startup no longer creates LLM client — deferred to first crew execution
+
+## [0.20.3] — 2026-03-18
 
 ### Added
 
@@ -83,11 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Contributing guide with commit conventions
 
 #### Project
-- 9-crate Cargo workspace (edition 2024, MSRV 1.89)
+- Single-crate layout (edition 2024, MSRV 1.89)
 - `rust-toolchain.toml` (stable channel)
 - Release profile: `lto = "fat"`, `strip = true`, `panic = "abort"`, `codegen-units = 1`
-- Apache-2.0 license
-- 451 tests passing
+- AGPL-3.0-only license
+- 309 tests passing
 
 #### Server — MCP, A2A, SSE, Auth
 - MCP server (JSON-RPC 2.0 over HTTP POST): `initialize`, `tools/list`, `tools/call` with ToolRegistry integration

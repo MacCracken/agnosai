@@ -62,16 +62,16 @@ Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/re
 
 ### Scale Readiness (v0.21 — aligned with ai-hwaccel v0.21.3)
 
-| Item | Priority | Notes |
-|------|----------|-------|
-| Lazy agent/provider initialization | High | Only load LLM providers when first used |
-| Parallel crew execution profiling (`--profile`) | High | Identify bottlenecks in orchestration |
-| Connection pooling for LLM providers | High | Share HTTP clients across crews |
-| Caching infrastructure (detection, model routing) | Medium | TTL-based cache for repeated crew configs |
-| Topology-aware fleet scheduling | Medium | Leverage ai-hwaccel NVLink/XGMI data for GPU-affinity placement |
-| Cost-aware crew planning | Medium | Cloud GPU pricing lookup for budget-constrained crews |
-| Container/VM environment detection | Medium | Auto-detect resource limits in containers |
-| Real LLM execution (Phase 2) | High | Replace placeholder execute_task with actual provider calls |
+| Item | Priority | Status |
+|------|----------|--------|
+| Lazy agent/provider initialization | High | Done — `OnceLock`-based lazy init, client created on first inference |
+| Crew execution profiling | High | Done — `CrewProfile` with wall time + per-task `task_duration_ms` |
+| Connection pooling for LLM providers | High | Done — shared `Arc<HooshClient>`, reqwest pool (10 idle/host) |
+| Caching infrastructure | Medium | Done — `ResponseCache` (TTL, LRU eviction) wired into `execute_task` |
+| Real LLM execution (Phase 2) | High | Done — `execute_task` calls hoosh with system prompt, model routing |
+| Topology-aware fleet scheduling | Medium | Deferred to v0.22 |
+| Cost-aware crew planning | Medium | Deferred to v0.22 |
+| Container/VM environment detection | Medium | Deferred to v0.22 |
 
 ### Ecosystem (v0.22 — aligned with ai-hwaccel v0.22.3)
 

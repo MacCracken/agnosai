@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::core::{CrewSpec, CrewState, CrewStatus, ResourceBudget, Result};
-use crate::llm::HooshClient;
+use crate::llm::{HooshClient, ResponseCache};
 use crate::server::sse::EventBus;
 
 use crate::orchestrator::crew_runner::CrewRunner;
@@ -25,8 +25,14 @@ pub struct Orchestrator {
     state: Arc<RwLock<OrchestratorState>>,
     budget: ResourceBudget,
     events: Option<EventBus>,
-    /// LLM client for inference. When `None`, tasks use placeholder execution.
-    llm: Option<Arc<HooshClient>>,
+    /// Lazily-initialised LLM client. Created on first crew execution that
+    /// needs inference, so startup stays fast when no LLM work is pending.
+    llm: OnceLock<Arc<HooshClient>>,
+    /// Base URL for the hoosh inference gateway (e.g. `http://localhost:8088`).
+    /// When `None`, tasks fall back to placeholder execution.
+    llm_url: Option<String>,
+    /// Shared inference response cache across all crew executions.
+    cache: Arc<ResponseCache>,
     /// Semaphore limiting concurrent crew executions.
     crew_semaphore: Arc<Semaphore>,
 }
@@ -44,7 +50,9 @@ impl Orchestrator {
             state: Arc::new(RwLock::new(state)),
             budget,
             events: None,
-            llm: None,
+            llm: OnceLock::new(),
+            llm_url: None,
+            cache: Arc::new(ResponseCache::new(Default::default())),
             crew_semaphore: Arc::new(Semaphore::new(max_concurrent)),
         })
     }
@@ -55,10 +63,32 @@ impl Orchestrator {
         self
     }
 
-    /// Attach an LLM client for real inference.
-    pub fn with_llm(mut self, client: Arc<HooshClient>) -> Self {
-        self.llm = Some(client);
+    /// Set the hoosh URL for lazy LLM client initialisation.
+    ///
+    /// The actual [`HooshClient`] is created on the first crew execution that
+    /// requires inference, keeping server startup fast.
+    pub fn with_llm_url(mut self, url: impl Into<String>) -> Self {
+        self.llm_url = Some(url.into());
         self
+    }
+
+    /// Attach a pre-built LLM client (skips lazy init).
+    pub fn with_llm(self, client: Arc<HooshClient>) -> Self {
+        let _ = self.llm.set(client);
+        self
+    }
+
+    /// Get or lazily create the LLM client. Returns `None` when no URL was
+    /// configured (placeholder mode).
+    fn llm_client(&self) -> Option<&Arc<HooshClient>> {
+        if let Some(client) = self.llm.get() {
+            return Some(client);
+        }
+        let url = self.llm_url.as_deref()?;
+        Some(self.llm.get_or_init(|| {
+            info!(hoosh_url = %url, "LLM client initialised (lazy)");
+            Arc::new(HooshClient::new(url))
+        }))
     }
 
     /// Submit and execute a crew, returning the final state.
@@ -95,12 +125,13 @@ impl Orchestrator {
                 crew_id,
                 status: CrewStatus::Pending,
                 results: Vec::new(),
+                profile: None,
             });
         }
 
         // Delegate to CrewRunner for the actual lifecycle.
-        let mut runner = CrewRunner::new(spec);
-        if let Some(ref llm) = self.llm {
+        let mut runner = CrewRunner::new(spec).with_cache(Arc::clone(&self.cache));
+        if let Some(llm) = self.llm_client() {
             runner = runner.with_llm(Arc::clone(llm));
         }
         if let Some(ref events) = self.events {
@@ -122,6 +153,7 @@ impl Orchestrator {
                     crew_id,
                     status: CrewStatus::Failed,
                     results: Vec::new(),
+                    profile: None,
                 }
             }
         };

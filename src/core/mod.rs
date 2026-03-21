@@ -34,7 +34,7 @@ pub mod resource;
 pub mod task;
 
 pub use agent::{AgentDefinition, AgentId, AgentState};
-pub use crew::{CrewSpec, CrewState, CrewStatus};
+pub use crew::{CrewProfile, CrewSpec, CrewState, CrewStatus};
 pub use error::{AgnosaiError, Result};
 pub use message::Message;
 pub use resource::{

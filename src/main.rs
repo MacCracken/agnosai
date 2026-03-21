@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use agnosai::llm::HooshClient;
 use agnosai::orchestrator::Orchestrator;
 use agnosai::server::auth::{AuthConfig, JwtConfig};
 use agnosai::server::sse::EventBus;
@@ -66,12 +65,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialise shared state.
     let events = EventBus::new();
     let hoosh_url = std::env::var("HOOSH_URL").unwrap_or_else(|_| "http://localhost:8088".into());
-    let llm_client = Arc::new(HooshClient::new(&hoosh_url));
-    tracing::info!(hoosh_url = %hoosh_url, "LLM client configured");
+    tracing::info!(hoosh_url = %hoosh_url, "LLM client configured (lazy — init on first use)");
 
     let orchestrator = Orchestrator::new(Default::default())
         .await?
-        .with_llm(Arc::clone(&llm_client))
+        .with_llm_url(&hoosh_url)
         .with_events(events.clone());
     let tools = Arc::new(ToolRegistry::new());
     tools.register(Arc::new(EchoTool));

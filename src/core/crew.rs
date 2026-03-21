@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::core::agent::AgentDefinition;
-use crate::core::task::{ProcessMode, Task, TaskResult};
+use crate::core::task::{ProcessMode, Task, TaskId, TaskResult};
 
 /// Unique identifier for a crew.
 pub type CrewId = Uuid;
@@ -68,6 +70,20 @@ pub struct CrewState {
     pub status: CrewStatus,
     /// Task results collected so far.
     pub results: Vec<TaskResult>,
+    /// Execution profile (always collected, lightweight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<CrewProfile>,
+}
+
+/// Lightweight execution profile for a crew run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrewProfile {
+    /// Total wall-clock time in milliseconds.
+    pub wall_ms: u64,
+    /// Per-task durations in milliseconds, keyed by task ID.
+    pub task_ms: HashMap<TaskId, u64>,
+    /// Number of tasks that ran.
+    pub task_count: usize,
 }
 
 /// Lifecycle status of a crew execution.
@@ -180,6 +196,7 @@ mod tests {
             crew_id: Uuid::new_v4(),
             status: CrewStatus::Running,
             results: vec![],
+            profile: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: CrewState = serde_json::from_str(&json).unwrap();

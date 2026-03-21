@@ -9,7 +9,7 @@ pub mod router;
 // Re-export hoosh's core types so the rest of agnosai doesn't need to
 // depend on hoosh directly.
 pub use hoosh::budget::{TokenBudget, TokenPool};
-pub use hoosh::cache::ResponseCache;
+pub use hoosh::cache::{CacheConfig, ResponseCache, cache_key};
 pub use hoosh::client::HooshClient;
 pub use hoosh::error::HooshError;
 pub use hoosh::inference::{

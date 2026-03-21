@@ -12,11 +12,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::core::agent::AgentDefinition;
-use crate::core::crew::{CrewSpec, CrewState, CrewStatus};
+use crate::core::crew::{CrewProfile, CrewSpec, CrewState, CrewStatus};
 use crate::core::task::{ProcessMode, Task, TaskId, TaskResult, TaskStatus};
-use crate::llm::{HooshClient, InferenceRequest, Message, Role};
+use crate::llm::{HooshClient, InferenceRequest, Message, ResponseCache, Role, cache_key};
 use crate::server::sse::CrewEvent;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
@@ -30,6 +31,8 @@ pub struct CrewRunner {
     event_tx: Option<broadcast::Sender<CrewEvent>>,
     /// LLM client for real inference. When `None`, falls back to placeholder.
     llm: Option<Arc<HooshClient>>,
+    /// Shared response cache for inference results.
+    cache: Arc<ResponseCache>,
 }
 
 impl CrewRunner {
@@ -39,7 +42,14 @@ impl CrewRunner {
             spec,
             event_tx: None,
             llm: None,
+            cache: Arc::new(ResponseCache::new(Default::default())),
         }
+    }
+
+    /// Attach a shared response cache.
+    pub fn with_cache(mut self, cache: Arc<ResponseCache>) -> Self {
+        self.cache = cache;
+        self
     }
 
     /// Attach an LLM client for real inference.
@@ -67,11 +77,12 @@ impl CrewRunner {
 
     /// Execute the crew according to its `ProcessMode`.
     ///
-    /// Each task "execution" currently produces a placeholder result (the task
-    /// description echoed back). Actual LLM calls come in Phase 2. The value
-    /// here is the orchestration logic: dependency resolution, agent assignment,
-    /// status tracking, and result aggregation.
+    /// Tasks are executed via LLM inference when a client is configured, or
+    /// fall back to placeholder output (useful for tests). Orchestration
+    /// handles dependency resolution, agent assignment, status tracking,
+    /// result aggregation, and profiling.
     pub async fn run(&mut self) -> crate::core::Result<CrewState> {
+        let crew_start = Instant::now();
         info!(crew_id = %self.spec.id, name = %self.spec.name, "starting crew run");
 
         self.emit(
@@ -93,6 +104,7 @@ impl CrewRunner {
             }
         };
 
+        let wall_ms = crew_start.elapsed().as_millis() as u64;
         let all_ok = results.iter().all(|r| r.status == TaskStatus::Completed);
         let status = if all_ok {
             CrewStatus::Completed
@@ -100,13 +112,35 @@ impl CrewRunner {
             CrewStatus::Failed
         };
 
-        info!(crew_id = %self.spec.id, ?status, "crew run finished");
+        // Build profile from per-task latency metadata.
+        let task_ms: HashMap<TaskId, u64> = results
+            .iter()
+            .filter_map(|r| {
+                r.metadata
+                    .get("task_duration_ms")
+                    .and_then(|v| v.as_u64())
+                    .map(|ms| (r.task_id, ms))
+            })
+            .collect();
+        let profile = CrewProfile {
+            wall_ms,
+            task_count: results.len(),
+            task_ms,
+        };
+
+        info!(
+            crew_id = %self.spec.id,
+            ?status,
+            wall_ms,
+            "crew run finished"
+        );
 
         self.emit(
             "crew_completed",
             serde_json::json!({
                 "status": format!("{status:?}"),
                 "task_count": results.len(),
+                "wall_ms": wall_ms,
             }),
         );
 
@@ -114,6 +148,7 @@ impl CrewRunner {
             crew_id: self.spec.id,
             status,
             results,
+            profile: Some(profile),
         })
     }
 
@@ -142,7 +177,7 @@ impl CrewRunner {
             );
 
             self.spec.tasks[i].status = TaskStatus::Running;
-            let result = execute_task(&self.spec.tasks[i], agent.as_ref(), self.llm.as_ref()).await;
+            let result = execute_task(&self.spec.tasks[i], agent.as_ref(), self.llm.as_ref(), &self.cache).await;
             self.spec.tasks[i].status = result.status;
 
             self.emit(
@@ -200,6 +235,7 @@ impl CrewRunner {
         for (task, agent) in task_snapshots {
             let permit = semaphore.clone();
             let llm = self.llm.clone();
+            let cache = Arc::clone(&self.cache);
             join_set.spawn(async move {
                 let _permit = match permit.acquire().await {
                     Ok(p) => p,
@@ -212,7 +248,7 @@ impl CrewRunner {
                         };
                     }
                 };
-                execute_task(&task, agent.as_ref(), llm.as_ref()).await
+                execute_task(&task, agent.as_ref(), llm.as_ref(), &cache).await
             });
         }
 
@@ -309,9 +345,10 @@ impl CrewRunner {
 
                 let task_snap = self.spec.tasks[idx].clone();
                 let llm = self.llm.clone();
+                let cache = Arc::clone(&self.cache);
 
                 join_set.spawn(async move {
-                    execute_task(&task_snap, agent.as_ref(), llm.as_ref()).await
+                    execute_task(&task_snap, agent.as_ref(), llm.as_ref(), &cache).await
                 });
             }
 
@@ -365,18 +402,25 @@ async fn execute_task(
     task: &Task,
     agent: Option<&AgentDefinition>,
     llm: Option<&Arc<HooshClient>>,
+    cache: &Arc<ResponseCache>,
 ) -> TaskResult {
+    let task_start = Instant::now();
     let agent_label = agent.map(|a| a.agent_key.as_str()).unwrap_or("unassigned");
 
     // If no LLM client, fall back to placeholder (useful for tests).
     let Some(client) = llm else {
         debug!(task_id = %task.id, agent = agent_label, "executing task (placeholder — no LLM client)");
         tokio::task::yield_now().await;
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "task_duration_ms".into(),
+            serde_json::json!(task_start.elapsed().as_millis() as u64),
+        );
         return TaskResult {
             task_id: task.id,
             output: task.description.clone(),
             status: TaskStatus::Completed,
-            metadata: HashMap::new(),
+            metadata,
         };
     };
 
@@ -418,8 +462,35 @@ async fn execute_task(
         ..Default::default()
     };
 
+    // Check cache before calling the LLM.
+    let ck = cache_key(&request.model, &request.messages);
+    if let Some(cached) = cache.get(&ck) {
+        let task_duration_ms = task_start.elapsed().as_millis() as u64;
+        let mut metadata = HashMap::new();
+        metadata.insert("model".into(), serde_json::Value::String(request.model.clone()));
+        metadata.insert("cached".into(), serde_json::json!(true));
+        metadata.insert("task_duration_ms".into(), serde_json::json!(task_duration_ms));
+
+        debug!(
+            task_id = %task.id,
+            agent = agent_label,
+            model = %request.model,
+            "task completed from cache"
+        );
+
+        return TaskResult {
+            task_id: task.id,
+            output: (*cached).clone(),
+            status: TaskStatus::Completed,
+            metadata,
+        };
+    }
+
     match client.infer(&request).await {
         Ok(response) => {
+            // Cache the successful response.
+            cache.insert(ck, response.text.clone());
+
             let mut metadata = HashMap::new();
             metadata.insert(
                 "model".into(),
@@ -438,12 +509,15 @@ async fn execute_task(
                     "total": response.usage.total_tokens,
                 }),
             );
+            let task_duration_ms = task_start.elapsed().as_millis() as u64;
+            metadata.insert("task_duration_ms".into(), serde_json::json!(task_duration_ms));
 
             info!(
                 task_id = %task.id,
                 agent = agent_label,
                 model = %response.model,
                 latency_ms = response.latency_ms,
+                task_duration_ms,
                 tokens = response.usage.total_tokens,
                 "task completed via LLM"
             );
@@ -456,14 +530,17 @@ async fn execute_task(
             }
         }
         Err(e) => {
+            let task_duration_ms = task_start.elapsed().as_millis() as u64;
             warn!(
                 task_id = %task.id,
                 agent = agent_label,
+                task_duration_ms,
                 error = %e,
                 "LLM inference failed"
             );
             let mut metadata = HashMap::new();
             metadata.insert("error".into(), serde_json::Value::String(e.to_string()));
+            metadata.insert("task_duration_ms".into(), serde_json::json!(task_duration_ms));
 
             TaskResult {
                 task_id: task.id,
@@ -919,7 +996,8 @@ mod tests {
     async fn test_execute_task_placeholder_when_no_llm() {
         let task = test_task("do something");
         let agent = test_agent("a");
-        let result = execute_task(&task, Some(&agent), None).await;
+        let cache = Arc::new(ResponseCache::new(Default::default()));
+        let result = execute_task(&task, Some(&agent), None, &cache).await;
         assert_eq!(result.status, TaskStatus::Completed);
         assert_eq!(result.output, "do something");
     }
