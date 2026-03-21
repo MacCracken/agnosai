@@ -52,7 +52,11 @@ pub struct ComputeScheduler {
 /// Backward compatibility type alias.
 pub type GpuScheduler = ComputeScheduler;
 
-/// Legacy GPU device view (read-only, for backward compat).
+/// Legacy GPU device view (read-only).
+///
+/// Prefer [`crate::core::resource::GpuDevice`] for serializable GPU state.
+/// This type exists for backward compatibility with fleet scheduling internals.
+#[deprecated(note = "Use crate::core::resource::GpuDevice instead")]
 #[derive(Debug, Clone)]
 pub struct GpuDevice {
     pub index: GpuId,

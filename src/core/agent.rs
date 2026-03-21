@@ -22,14 +22,19 @@ pub struct AgentDefinition {
     pub complexity: String,
     #[serde(default)]
     pub llm_model: Option<String>,
+    /// Legacy: prefer [`hardware`](Self::hardware) field instead.
     #[serde(default)]
     pub gpu_required: bool,
+    /// Legacy: prefer [`hardware`](Self::hardware) field instead.
     #[serde(default)]
     pub gpu_preferred: bool,
+    /// Legacy: prefer [`hardware`](Self::hardware) field instead.
     #[serde(default)]
     pub gpu_memory_min_mb: Option<u64>,
     /// Hardware requirements for this agent's workloads.
-    /// If None, falls back to legacy gpu_required/gpu_preferred/gpu_memory_min_mb fields.
+    ///
+    /// When set, takes precedence over the legacy `gpu_required` / `gpu_preferred` /
+    /// `gpu_memory_min_mb` fields. See [`hardware_requirement()`](Self::hardware_requirement).
     #[serde(default)]
     pub hardware: Option<HardwareRequirement>,
 }

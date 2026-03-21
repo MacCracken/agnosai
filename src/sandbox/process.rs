@@ -108,6 +108,11 @@ impl ProcessSandbox {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        // Sanitize environment: strip variables that could inject libraries.
+        for var in crate::sandbox::SANITIZED_ENV_VARS {
+            cmd.env_remove(var);
+        }
+
         if let Some(ref dir) = self.config.work_dir {
             cmd.current_dir(dir);
         }

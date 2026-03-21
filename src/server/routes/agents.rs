@@ -9,10 +9,16 @@ pub async fn list_definitions() -> Json<Vec<Value>> {
     Json(vec![])
 }
 
-pub async fn create_definition(Json(def): Json<AgentDefinition>) -> (StatusCode, Json<Value>) {
-    // Placeholder — accept and echo back.
-    let value = serde_json::to_value(&def).unwrap_or(Value::Null);
-    (StatusCode::CREATED, Json(value))
+pub async fn create_definition(
+    Json(def): Json<AgentDefinition>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let value = serde_json::to_value(&def).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("serialization failed: {e}")})),
+        )
+    })?;
+    Ok((StatusCode::CREATED, Json(value)))
 }
 
 #[cfg(test)]

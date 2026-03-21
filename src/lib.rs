@@ -2,6 +2,16 @@
 //!
 //! This crate unifies core types, LLM providers, task orchestration, tool
 //! execution, adaptive learning, and an HTTP API server into a single library.
+//!
+//! # Feature flags
+//!
+//! All features are opt-in (no defaults):
+//!
+//! - **`sandbox`** — WASM (wasmtime) and Python subprocess tool sandboxing.
+//! - **`fleet`** — Distributed multi-node crew execution and GPU scheduling.
+//! - **`definitions`** — YAML/JSON agent preset loading and `.agpkg` packaging.
+//! - **`hwaccel`** — Hardware accelerator detection via [`ai-hwaccel`](https://github.com/maccracken/ai-hwaccel).
+//! - **`full`** — Enables all of the above.
 
 #![warn(missing_docs)]
 

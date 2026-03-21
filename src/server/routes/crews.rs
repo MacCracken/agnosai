@@ -9,6 +9,7 @@ use crate::core::{AgentDefinition, CrewSpec, ProcessMode, Task, TaskPriority};
 use crate::server::state::SharedState;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct TaskRequest {
     pub description: String,
@@ -21,6 +22,7 @@ pub struct TaskRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct CrewRunRequest {
     pub name: String,
