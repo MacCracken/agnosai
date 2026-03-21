@@ -1248,7 +1248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dag_tasks_have_duration_metadata() {
-        let mut t1 = test_task("dag root");
+        let t1 = test_task("dag root");
         let mut t2 = test_task("dag child");
         t2.dependencies.push(t1.id);
         let tasks = vec![t1, t2];
