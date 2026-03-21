@@ -25,7 +25,7 @@ deny:
 
 # Dependency audit chain
 vet:
-	cargo vet --locked
+	cargo vet
 
 # Run benchmarks
 bench:
