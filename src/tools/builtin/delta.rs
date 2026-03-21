@@ -28,10 +28,12 @@ impl Default for DeltaListRepos {
 }
 
 impl DeltaListRepos {
+    /// Create a new instance with the default base URL.
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
     }
 
+    /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::new(),
@@ -88,10 +90,12 @@ impl Default for DeltaTriggerPipeline {
 }
 
 impl DeltaTriggerPipeline {
+    /// Create a new instance with the default base URL.
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
     }
 
+    /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::new(),
@@ -181,10 +185,12 @@ impl Default for DeltaGetPipeline {
 }
 
 impl DeltaGetPipeline {
+    /// Create a new instance with the default base URL.
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
     }
 
+    /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::new(),

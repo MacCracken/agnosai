@@ -1,10 +1,12 @@
 use axum::Json;
 use serde_json::{Value, json};
 
+/// GET /health — Liveness probe.
 pub async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
+/// GET /ready — Readiness probe.
 pub async fn ready() -> Json<Value> {
     Json(json!({"status": "ready", "version": "0.1.0"}))
 }

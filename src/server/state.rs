@@ -19,4 +19,5 @@ pub struct AppState {
     pub http_client: reqwest::Client,
 }
 
+/// Thread-safe shared reference to application state.
 pub type SharedState = Arc<AppState>;

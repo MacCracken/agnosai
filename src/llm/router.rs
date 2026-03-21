@@ -25,12 +25,19 @@ pub enum ModelTier {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TaskType {
+    /// Summarize text or data.
     Summarize,
+    /// Classify or categorize input.
     Classify,
+    /// Generate or modify code.
     Code,
+    /// Create a plan or strategy.
     Plan,
+    /// Perform logical reasoning.
     Reason,
+    /// Conduct research across sources.
     Research,
+    /// Execute a multi-step workflow.
     MultiStep,
 }
 
@@ -39,15 +46,20 @@ pub enum TaskType {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Complexity {
+    /// Low effort, quick turnaround.
     Simple,
+    /// Moderate effort, standard workload.
     Medium,
+    /// High effort, demanding reasoning.
     Complex,
 }
 
 /// A description of a task for routing purposes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskProfile {
+    /// The kind of task being performed.
     pub task_type: TaskType,
+    /// How complex the task is.
     pub complexity: Complexity,
 }
 

@@ -4,6 +4,7 @@ use axum::extract::State;
 
 use crate::server::state::SharedState;
 
+/// GET /api/v1/tools — List all registered tools.
 pub async fn list_tools(State(state): State<SharedState>) -> Json<Vec<ToolSchema>> {
     Json(state.tools.list())
 }

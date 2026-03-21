@@ -29,6 +29,7 @@ pub struct CrewRunner {
 }
 
 impl CrewRunner {
+    /// Create a new crew runner for the given specification.
     pub fn new(spec: CrewSpec) -> Self {
         Self {
             spec,

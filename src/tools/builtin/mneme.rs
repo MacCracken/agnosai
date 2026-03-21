@@ -28,10 +28,12 @@ impl Default for MnemeSearch {
 }
 
 impl MnemeSearch {
+    /// Create a new instance with the default base URL.
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
     }
 
+    /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::new(),
@@ -113,10 +115,12 @@ impl Default for MnemeGetNote {
 }
 
 impl MnemeGetNote {
+    /// Create a new instance with the default base URL.
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
     }
 
+    /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::new(),
@@ -183,10 +187,12 @@ impl Default for MnemeCreateNote {
 }
 
 impl MnemeCreateNote {
+    /// Create a new instance with the default base URL.
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
     }
 
+    /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::new(),

@@ -7,21 +7,30 @@ use crate::core::AgentId;
 /// Unique identifier for a task.
 pub type TaskId = Uuid;
 
+/// A unit of work to be executed by an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Task {
+    /// Unique task identifier.
     pub id: TaskId,
+    /// Human-readable description of the task.
     pub description: String,
+    /// Optional description of the expected output format.
     #[serde(default)]
     pub expected_output: Option<String>,
+    /// Agent assigned to execute this task, if any.
     #[serde(default)]
     pub assigned_agent: Option<AgentId>,
+    /// Execution priority tier.
     #[serde(default)]
     pub priority: TaskPriority,
+    /// Current execution status.
     #[serde(default)]
     pub status: TaskStatus,
+    /// IDs of tasks that must complete before this one.
     #[serde(default)]
     pub dependencies: Vec<TaskId>,
+    /// Arbitrary key-value context passed to the executing agent.
     #[serde(default)]
     pub context: HashMap<String, serde_json::Value>,
 }
@@ -66,60 +75,89 @@ impl Task {
     }
 }
 
+/// Priority tier for task scheduling (higher = more urgent).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TaskPriority {
+    /// Lowest priority; executed when no other work is pending.
     Background = 0,
+    /// Below-normal priority.
     Low = 1,
+    /// Default priority tier.
     #[default]
     Normal = 2,
+    /// Elevated priority.
     High = 3,
+    /// Highest priority; pre-empts all other tiers.
     Critical = 4,
 }
 
+/// Lifecycle status of a task.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TaskStatus {
+    /// Task has been created but not yet scheduled.
     #[default]
     Pending,
+    /// Task is waiting in a priority queue.
     Queued,
+    /// Task is currently being executed.
     Running,
+    /// Task finished successfully.
     Completed,
+    /// Task execution failed.
     Failed,
+    /// Task was cancelled before completion.
     Cancelled,
 }
 
+/// Result produced by executing a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct TaskResult {
+    /// ID of the task that produced this result.
     pub task_id: TaskId,
+    /// Output text or data from execution.
     pub output: String,
+    /// Final status of the task.
     pub status: TaskStatus,
+    /// Optional metadata attached to the result.
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+/// Directed acyclic graph of interdependent tasks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDAG {
+    /// Tasks keyed by a string identifier.
     pub tasks: HashMap<String, Task>,
+    /// Directed edges `(from, to)` defining execution order.
     pub edges: Vec<(String, String)>,
+    /// Execution mode for the DAG.
     #[serde(default)]
     pub process: ProcessMode,
 }
 
+/// How tasks within a crew should be executed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ProcessMode {
+    /// Execute tasks one after another in order.
     #[default]
     Sequential,
+    /// A manager agent delegates and coordinates sub-tasks.
     Hierarchical {
+        /// Agent ID of the manager responsible for delegation.
         manager: AgentId,
     },
+    /// Execute respecting a directed acyclic graph of dependencies.
     Dag,
+    /// Execute tasks concurrently up to a concurrency limit.
     Parallel {
+        /// Maximum number of tasks running at the same time.
         max_concurrency: usize,
     },
 }

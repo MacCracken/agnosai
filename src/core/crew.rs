@@ -7,20 +7,28 @@ use crate::core::task::{ProcessMode, Task, TaskResult};
 /// Unique identifier for a crew.
 pub type CrewId = Uuid;
 
+/// Specification defining a crew of agents and the tasks they execute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CrewSpec {
+    /// Unique crew identifier.
     pub id: CrewId,
+    /// Human-readable crew name.
     pub name: String,
+    /// Agent definitions participating in this crew.
     pub agents: Vec<AgentDefinition>,
+    /// Tasks to be executed by the crew.
     pub tasks: Vec<Task>,
+    /// Execution mode (sequential, parallel, DAG, hierarchical).
     #[serde(default)]
     pub process: ProcessMode,
+    /// Arbitrary metadata attached to the crew.
     #[serde(default)]
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl CrewSpec {
+    /// Create a new crew spec with the given name and default settings.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -32,38 +40,51 @@ impl CrewSpec {
         }
     }
 
+    /// Set the crew's agent roster.
     pub fn with_agents(mut self, agents: Vec<AgentDefinition>) -> Self {
         self.agents = agents;
         self
     }
 
+    /// Set the crew's task list.
     pub fn with_tasks(mut self, tasks: Vec<Task>) -> Self {
         self.tasks = tasks;
         self
     }
 
+    /// Set the crew's execution mode.
     pub fn with_process(mut self, process: ProcessMode) -> Self {
         self.process = process;
         self
     }
 }
 
+/// Runtime state of a crew execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrewState {
+    /// ID of the crew this state belongs to.
     pub crew_id: CrewId,
+    /// Current overall status of the crew run.
     pub status: CrewStatus,
+    /// Task results collected so far.
     pub results: Vec<TaskResult>,
 }
 
+/// Lifecycle status of a crew execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CrewStatus {
+    /// Crew has been created but execution has not started.
     #[default]
     Pending,
+    /// Crew is actively executing tasks.
     Running,
+    /// All tasks completed successfully.
     Completed,
+    /// One or more tasks failed.
     Failed,
+    /// Crew execution was cancelled.
     Cancelled,
 }
 

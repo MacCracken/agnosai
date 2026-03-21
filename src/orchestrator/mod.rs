@@ -11,12 +11,18 @@
 //! - [`Scheduler`](scheduler::Scheduler) — priority queue + DAG topological sort
 //! - [`PubSub`](pubsub::PubSub) — topic-based pub/sub with wildcard matching
 
+/// Crew lifecycle runner (assemble, execute, aggregate).
 pub mod crew_runner;
+/// Inter-process communication utilities.
 pub mod ipc;
 #[allow(clippy::module_inception)]
+/// Top-level orchestrator struct and crew execution.
 pub mod orchestrator;
+/// Topic-based publish/subscribe with wildcard matching.
 pub mod pubsub;
+/// Priority queue and DAG topological sort.
 pub mod scheduler;
+/// Agent-task scoring and ranking.
 pub mod scoring;
 
 pub use orchestrator::Orchestrator;

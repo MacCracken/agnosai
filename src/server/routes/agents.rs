@@ -4,11 +4,13 @@ use serde_json::Value;
 
 use crate::core::AgentDefinition;
 
+/// GET /api/v1/agents/definitions — List all agent definitions.
 pub async fn list_definitions() -> Json<Vec<Value>> {
     // Placeholder — return empty array.
     Json(vec![])
 }
 
+/// POST /api/v1/agents/definitions — Create a new agent definition.
 pub async fn create_definition(
     Json(def): Json<AgentDefinition>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {

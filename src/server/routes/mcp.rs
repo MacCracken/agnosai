@@ -9,32 +9,44 @@ use crate::tools::ToolInput;
 
 use crate::server::state::SharedState;
 
+/// Inbound JSON-RPC 2.0 request for the MCP endpoint.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct JsonRpcRequest {
     /// JSON-RPC version (must be "2.0").
     pub jsonrpc: String,
+    /// Request identifier for correlating responses.
     pub id: Value,
+    /// Method name to invoke.
     pub method: String,
+    /// Optional parameters for the method.
     #[serde(default)]
     pub params: Value,
 }
 
+/// Outbound JSON-RPC 2.0 response.
 #[derive(Serialize)]
 #[non_exhaustive]
 pub struct JsonRpcResponse {
+    /// JSON-RPC version (always "2.0").
     pub jsonrpc: String,
+    /// Request identifier echoed back.
     pub id: Value,
+    /// Result payload on success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// Error payload on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
 }
 
+/// JSON-RPC error object.
 #[derive(Serialize)]
 pub struct JsonRpcError {
+    /// Numeric error code.
     pub code: i32,
+    /// Human-readable error message.
     pub message: String,
 }
 
@@ -61,6 +73,7 @@ impl JsonRpcResponse {
     }
 }
 
+/// POST /mcp — Handle an MCP JSON-RPC 2.0 request.
 pub async fn mcp_handler(
     State(state): State<SharedState>,
     Json(req): Json<JsonRpcRequest>,

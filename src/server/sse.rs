@@ -14,8 +14,11 @@ const CHANNEL_CAPACITY: usize = 256;
 /// A crew execution event sent over SSE.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CrewEvent {
+    /// ID of the crew that emitted the event.
     pub crew_id: String,
+    /// Event type name (e.g. `"task_started"`, `"crew_completed"`).
     pub event_type: String,
+    /// Arbitrary JSON payload for the event.
     pub data: serde_json::Value,
 }
 

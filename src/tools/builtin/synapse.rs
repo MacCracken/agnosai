@@ -28,10 +28,12 @@ impl Default for SynapseInfer {
 }
 
 impl SynapseInfer {
+    /// Create a new instance with the default base URL.
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
     }
 
+    /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::new(),
@@ -142,10 +144,12 @@ impl Default for SynapseListModels {
 }
 
 impl SynapseListModels {
+    /// Create a new instance with the default base URL.
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
     }
 
+    /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::new(),
@@ -202,10 +206,12 @@ impl Default for SynapseStatus {
 }
 
 impl SynapseStatus {
+    /// Create a new instance with the default base URL.
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL.to_string())
     }
 
+    /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::new(),

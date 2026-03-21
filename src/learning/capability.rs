@@ -6,16 +6,23 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Trend {
+    /// Confidence is increasing over recent observations.
     Improving,
+    /// Confidence is roughly constant.
     Stable,
+    /// Confidence is decreasing over recent observations.
     Declining,
 }
 
 /// Score data for a single capability.
 pub struct CapabilityScore {
+    /// Current confidence level (0.0 to 1.0).
     pub confidence: f64,
+    /// Total number of successful outcomes.
     pub successes: u32,
+    /// Total number of failed outcomes.
     pub failures: u32,
+    /// Direction the confidence is trending.
     pub trend: Trend,
     /// Recent results (true = success), used for trend detection.
     recent: Vec<bool>,
@@ -66,12 +73,14 @@ pub struct CapabilityScorer {
 }
 
 impl CapabilityScorer {
+    /// Create a new scorer with no recorded capabilities.
     pub fn new() -> Self {
         Self {
             scores: HashMap::new(),
         }
     }
 
+    /// Record a successful outcome for the given capability.
     pub fn record_success(&mut self, capability: &str) {
         let score = self
             .scores
@@ -83,6 +92,7 @@ impl CapabilityScorer {
         score.update_trend();
     }
 
+    /// Record a failed outcome for the given capability.
     pub fn record_failure(&mut self, capability: &str) {
         let score = self
             .scores

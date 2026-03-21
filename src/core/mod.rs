@@ -20,11 +20,17 @@
 //! let crew = CrewSpec::new("analysis-crew");
 //! ```
 
+/// Agent definitions and state.
 pub mod agent;
+/// Crew specifications and lifecycle state.
 pub mod crew;
+/// Error types and result alias.
 pub mod error;
+/// Inter-agent messaging.
 pub mod message;
+/// Hardware resources, accelerators, and budgets.
 pub mod resource;
+/// Tasks, priorities, and execution modes.
 pub mod task;
 
 pub use agent::{AgentDefinition, AgentId, AgentState};

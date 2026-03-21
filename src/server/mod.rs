@@ -3,9 +3,13 @@
 //! Built on axum. Provides health probes, crew execution, tool listing,
 //! agent definition management, A2A delegation, and SSE streaming.
 
+/// Authentication and authorization middleware.
 pub mod auth;
+/// HTTP route handlers.
 pub mod routes;
+/// Server-sent event streaming.
 pub mod sse;
+/// Shared application state.
 pub mod state;
 
 pub use auth::AuthConfig;
@@ -20,6 +24,9 @@ use auth::auth_middleware;
 
 /// Maximum request body size: 10 MiB.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum concurrent requests per route (simple rate limiter).
+const MAX_CONCURRENT_REQUESTS: usize = 100;
 
 /// Build the complete application router with all routes.
 ///
@@ -58,5 +65,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/ready", get(routes::health::ready))
         .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            MAX_CONCURRENT_REQUESTS,
+        ))
         .with_state(state)
 }

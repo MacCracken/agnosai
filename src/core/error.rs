@@ -1,53 +1,70 @@
 use thiserror::Error;
 
+/// Alias for `Result<T, AgnosaiError>`.
 #[must_use]
 pub type Result<T> = std::result::Result<T, AgnosaiError>;
 
+/// Top-level error type for the AgnosAI framework.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AgnosaiError {
+    /// The requested agent was not found.
     #[error("agent not found: {0}")]
     AgentNotFound(String),
 
+    /// The requested task was not found.
     #[error("task not found: {0}")]
     TaskNotFound(String),
 
+    /// The requested crew was not found.
     #[error("crew not found: {0}")]
     CrewNotFound(String),
 
+    /// An agent or crew definition failed validation.
     #[error("invalid definition: {0}")]
     InvalidDefinition(String),
 
+    /// The task dependency graph contains a cycle.
     #[error("task DAG contains a cycle")]
     CyclicDAG,
 
+    /// An error occurred during task scheduling.
     #[error("scheduling error: {0}")]
     Scheduling(String),
 
+    /// An LLM provider returned an error.
     #[error("LLM provider error: {0}")]
     LlmProvider(String),
 
+    /// A tool failed during execution.
     #[error("tool execution error: {0}")]
     ToolExecution(String),
 
+    /// A sandbox operation failed.
     #[error("sandbox error: {0}")]
     Sandbox(String),
 
+    /// A fleet/cluster operation failed.
     #[error("fleet error: {0}")]
     Fleet(String),
 
+    /// An inter-process communication error.
     #[error("IPC error: {0}")]
     Ipc(String),
 
+    /// JSON serialization or deserialization failed.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    /// An I/O operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// An operation exceeded its time limit.
     #[error("timeout after {0:?}")]
     Timeout(std::time::Duration),
 
+    /// Catch-all for errors that don't fit other variants.
     #[error("{0}")]
     Other(String),
 }

@@ -28,6 +28,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Create a new empty scheduler.
     pub fn new() -> Self {
         Self {
             queues: Default::default(),

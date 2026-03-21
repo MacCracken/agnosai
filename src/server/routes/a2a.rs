@@ -76,26 +76,38 @@ const A2A_MAX_METADATA_BYTES: usize = 64 * 1024; // 64 KiB
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct A2ARequest {
+    /// External task identifier from the calling system.
     pub task_id: String,
+    /// Description of the task to perform.
     pub description: String,
+    /// Domain hint for agent selection (e.g. `"quality"`, `"security"`).
     #[serde(default)]
     pub domain: Option<String>,
+    /// Crew size hint: `"lean"`, `"standard"`, or `"large"`.
     #[serde(default)]
-    pub size: Option<String>, // "lean", "standard", "large"
+    pub size: Option<String>,
+    /// Named preset configuration to use.
     #[serde(default)]
     pub preset: Option<String>,
+    /// Optional webhook URL to POST results back to.
     #[serde(default)]
-    pub callback_url: Option<String>, // webhook to POST results back
+    pub callback_url: Option<String>,
+    /// Arbitrary metadata passed through to the crew.
     #[serde(default)]
     pub metadata: serde_json::Value,
 }
 
+/// Response returned from an A2A task delegation.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct A2AResponse {
+    /// Task identifier echoed from the request.
     pub task_id: String,
-    pub status: String, // "accepted", "completed", "failed"
+    /// Execution status: `"accepted"`, `"completed"`, or `"failed"`.
+    pub status: String,
+    /// Result payload on success.
     pub result: Option<serde_json::Value>,
+    /// Error message on failure.
     pub error: Option<String>,
 }
 

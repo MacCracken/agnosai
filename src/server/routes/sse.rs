@@ -22,10 +22,29 @@ pub async fn crew_stream(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let crew_id = id.to_string();
 
+    // Check if this crew has an active event channel.
+    let crew_exists = state.events.has(id);
+
     // Subscribe to the crew's event channel.
     let rx = state.events.subscribe(id);
 
+    // If the crew doesn't exist, clean up the lazily-created channel.
+    if !crew_exists {
+        state.events.remove(id);
+    }
+
     let stream = async_stream::stream! {
+        if !crew_exists {
+            let not_found = CrewEvent {
+                crew_id: crew_id.clone(),
+                event_type: "error".to_string(),
+                data: serde_json::json!({"message": "crew not found", "crew_id": crew_id}),
+            };
+            let data = serde_json::to_string(&not_found).unwrap_or_default();
+            yield Ok(Event::default().event("error").data(data));
+            return;
+        }
+
         // Send initial connected event.
         let connected = CrewEvent {
             crew_id: crew_id.clone(),

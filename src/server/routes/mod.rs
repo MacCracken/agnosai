@@ -9,11 +9,19 @@
 //! - [`mcp`] — Model Context Protocol JSON-RPC (`/mcp`)
 //! - [`health`] — health and readiness probes (`/health`, `/ready`)
 
+/// Agent-to-Agent task delegation.
 pub mod a2a;
+/// Agent definition management.
 pub mod agents;
+/// Crew creation and execution.
 pub mod crews;
+/// Preset listing.
 pub mod definitions;
+/// Health and readiness probes.
 pub mod health;
+/// Model Context Protocol (JSON-RPC).
 pub mod mcp;
+/// Server-sent events for crew streaming.
 pub mod sse;
+/// Tool listing.
 pub mod tools;

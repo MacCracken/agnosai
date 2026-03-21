@@ -10,10 +10,13 @@ use std::pin::Pin;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ParameterSchema {
+    /// Parameter name.
     pub name: String,
+    /// Human-readable description of the parameter.
     pub description: String,
     /// JSON-schema type string (e.g. `"string"`, `"number"`, `"array"`).
     pub param_type: String,
+    /// Whether this parameter must be provided.
     pub required: bool,
 }
 
@@ -21,8 +24,11 @@ pub struct ParameterSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ToolSchema {
+    /// Unique tool name.
     pub name: String,
+    /// Human-readable tool description.
     pub description: String,
+    /// Parameter definitions accepted by this tool.
     pub parameters: Vec<ParameterSchema>,
 }
 
@@ -55,8 +61,11 @@ impl ToolInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ToolOutput {
+    /// Whether execution succeeded.
     pub success: bool,
+    /// Result value (meaningful when `success` is true).
     pub result: Value,
+    /// Error message (present when `success` is false).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

@@ -11,11 +11,15 @@ use crate::orchestrator::scheduler::Scheduler;
 /// Maximum number of completed crews retained in memory.
 const MAX_RETAINED_CREWS: usize = 1000;
 
+/// Internal mutable state of the orchestrator.
 pub struct OrchestratorState {
+    /// Task scheduler instance.
     pub scheduler: Scheduler,
+    /// Crews currently tracked (active and recently completed).
     pub active_crews: Vec<CrewState>,
 }
 
+/// Top-level orchestrator managing crew lifecycles and scheduling.
 pub struct Orchestrator {
     state: Arc<RwLock<OrchestratorState>>,
     budget: ResourceBudget,
@@ -25,6 +29,7 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
+    /// Create a new orchestrator with the given resource budget.
     pub async fn new(budget: ResourceBudget) -> Result<Self> {
         let max_concurrent = budget.max_concurrent_tasks.unwrap_or(10);
         let state = OrchestratorState {
@@ -46,6 +51,7 @@ impl Orchestrator {
         self
     }
 
+    /// Submit and execute a crew, returning the final state.
     pub async fn run_crew(&self, spec: CrewSpec) -> Result<CrewState> {
         // Enforce concurrent crew limit.
         let _permit = self
@@ -128,6 +134,7 @@ impl Orchestrator {
         Ok(crew_state)
     }
 
+    /// Cancel a running crew by ID.
     pub async fn cancel_crew(&self, crew_id: crate::core::crew::CrewId) -> Result<()> {
         let mut state = self.state.write().await;
         if let Some(crew) = state.active_crews.iter_mut().find(|c| c.crew_id == crew_id) {
@@ -140,6 +147,7 @@ impl Orchestrator {
         }
     }
 
+    /// Get a reference to the resource budget.
     pub fn budget(&self) -> &ResourceBudget {
         &self.budget
     }

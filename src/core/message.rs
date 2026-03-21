@@ -3,26 +3,37 @@ use uuid::Uuid;
 
 use crate::core::AgentId;
 
+/// An inter-agent message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Message {
+    /// Unique message identifier.
     pub id: Uuid,
+    /// Sender agent ID.
     pub from: AgentId,
+    /// Destination target.
     pub to: MessageTarget,
+    /// Arbitrary JSON payload.
     pub payload: serde_json::Value,
+    /// When the message was created.
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// Where a message should be delivered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MessageTarget {
+    /// Send to a specific agent by ID.
     Agent(AgentId),
+    /// Publish to a named topic.
     Topic(String),
+    /// Send to all agents.
     Broadcast,
 }
 
 impl Message {
+    /// Create a new message with an auto-generated ID and current timestamp.
     pub fn new(from: AgentId, to: MessageTarget, payload: serde_json::Value) -> Self {
         Self {
             id: Uuid::new_v4(),

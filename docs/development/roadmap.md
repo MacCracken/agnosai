@@ -95,12 +95,7 @@ Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/re
 
 ### Engineering Backlog
 
-| Item | Severity | Notes |
-|------|----------|-------|
-| Request rate limiting per client IP | Medium | Tower middleware, token bucket or sliding window |
-| SSE return 404 for unknown crew_id | Medium | Query orchestrator before EventBus subscribe |
-| Remaining doc comments (~30 items) | Low | Struct fields and enum variants still missing `///` |
-| QLearner string interning | Low | Numeric IDs for large state spaces |
+All items cleared. No outstanding backlog.
 
 ### Final Migration
 

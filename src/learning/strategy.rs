@@ -2,8 +2,11 @@
 
 /// Statistics tracked per arm.
 pub struct ArmStats {
+    /// Human-readable arm name.
     pub name: String,
+    /// Cumulative reward received from this arm.
     pub total_reward: f64,
+    /// Number of times this arm has been pulled.
     pub count: u32,
 }
 
@@ -22,6 +25,7 @@ pub struct Ucb1 {
 }
 
 impl Ucb1 {
+    /// Create a new UCB1 bandit with the given arm names.
     pub fn new(arm_names: Vec<String>) -> Self {
         Self {
             arms: arm_names

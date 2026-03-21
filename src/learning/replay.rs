@@ -5,10 +5,15 @@ use rand::Rng;
 /// A single experience tuple stored in the replay buffer.
 #[derive(Debug, Clone)]
 pub struct Experience {
+    /// State before the action was taken.
     pub state: String,
+    /// Action that was taken.
     pub action: String,
+    /// Reward received after the action.
     pub reward: f64,
+    /// State after the action was taken.
     pub next_state: String,
+    /// Sampling priority (higher = more likely to be replayed).
     pub priority: f64,
 }
 
@@ -19,6 +24,7 @@ pub struct ReplayBuffer {
 }
 
 impl ReplayBuffer {
+    /// Create a new replay buffer with the given maximum capacity.
     pub fn new(max_size: usize) -> Self {
         Self {
             experiences: Vec::with_capacity(max_size),
@@ -105,10 +111,12 @@ impl ReplayBuffer {
         result
     }
 
+    /// Number of experiences currently in the buffer.
     pub fn len(&self) -> usize {
         self.experiences.len()
     }
 
+    /// Whether the buffer contains no experiences.
     pub fn is_empty(&self) -> bool {
         self.experiences.is_empty()
     }

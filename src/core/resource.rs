@@ -19,10 +19,15 @@ pub use ai_hwaccel::{
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AcceleratorFamily {
+    /// General-purpose CPU.
     Cpu,
+    /// Graphics processing unit (NVIDIA, AMD, etc.).
     Gpu,
+    /// Neural processing unit.
     Npu,
+    /// Tensor processing unit (Google).
     Tpu,
+    /// Custom AI ASIC (Groq, Cerebras, etc.).
     AiAsic,
 }
 
@@ -36,11 +41,17 @@ pub enum AcceleratorFamily {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AcceleratorType {
+    /// General-purpose CPU.
     Cpu,
+    /// NVIDIA CUDA GPU.
     Cuda,
+    /// AMD ROCm GPU.
     Rocm,
+    /// Apple Metal GPU.
     Metal,
+    /// Vulkan-capable GPU.
     Vulkan,
+    /// Google TPU.
     Tpu,
 }
 
@@ -89,10 +100,15 @@ impl AcceleratorType {
 /// A compute device with type, memory, and identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeDevice {
+    /// Zero-based device index.
     pub index: usize,
+    /// Human-readable device name.
     pub name: String,
+    /// Accelerator type of this device.
     pub accelerator: AcceleratorType,
+    /// Total device memory in megabytes.
     pub memory_total_mb: u64,
+    /// Available (free) device memory in megabytes.
     pub memory_available_mb: u64,
 }
 
@@ -123,8 +139,11 @@ pub struct HardwareRequirement {
 /// Hardware inventory for a node.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HardwareInventory {
+    /// Number of CPU cores available.
     pub cpu_cores: usize,
+    /// Total system memory in megabytes.
     pub memory_total_mb: u64,
+    /// Accelerator devices present on this node.
     pub devices: Vec<ComputeDevice>,
 }
 

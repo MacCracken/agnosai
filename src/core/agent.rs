@@ -6,21 +6,31 @@ use crate::core::resource::{AcceleratorType, HardwareRequirement};
 /// Unique identifier for an agent instance.
 pub type AgentId = Uuid;
 
+/// Definition of an agent's identity, capabilities, and configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AgentDefinition {
+    /// Unique key identifying this agent type.
     pub agent_key: String,
+    /// Display name of the agent.
     pub name: String,
+    /// Role the agent fulfils within a crew.
     pub role: String,
+    /// High-level objective for the agent.
     pub goal: String,
+    /// Optional narrative backstory for prompt context.
     #[serde(default)]
     pub backstory: Option<String>,
+    /// Domain of expertise (e.g. `"quality"`, `"security"`).
     #[serde(default)]
     pub domain: Option<String>,
+    /// Tool names this agent is allowed to use.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Complexity tier (`"low"`, `"medium"`, `"high"`).
     #[serde(default = "default_complexity")]
     pub complexity: String,
+    /// Override LLM model identifier, if any.
     #[serde(default)]
     pub llm_model: Option<String>,
     /// Legacy: prefer [`hardware`](Self::hardware) field instead.
@@ -93,6 +103,7 @@ impl AgentDefinition {
         self
     }
 
+    /// Deserialize an agent definition from a JSON string.
     pub fn from_json(json: &str) -> crate::core::Result<Self> {
         serde_json::from_str(json).map_err(crate::core::AgnosaiError::Serialization)
     }
@@ -115,16 +126,23 @@ impl AgentDefinition {
     }
 }
 
+/// Runtime state of an agent instance.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AgentState {
+    /// Agent is idle and available for assignment.
     #[default]
     Idle,
+    /// Agent has been assigned a task but has not started.
     Assigned,
+    /// Agent is actively working on a task.
     Working,
+    /// Agent is blocked waiting on a dependency.
     Blocked,
+    /// Agent finished its task successfully.
     Completed,
+    /// Agent's task execution failed.
     Failed,
 }
 

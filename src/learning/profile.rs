@@ -7,9 +7,13 @@ use chrono::{DateTime, Utc};
 
 /// A single recorded action for an agent.
 pub struct ActionRecord {
+    /// Type of action performed (e.g. `"inference"`, `"tool_call"`).
     pub action_type: String,
+    /// Wall-clock duration of the action.
     pub duration: Duration,
+    /// Whether the action succeeded.
     pub success: bool,
+    /// When the action occurred.
     pub timestamp: DateTime<Utc>,
 }
 
@@ -19,6 +23,7 @@ pub struct PerformanceProfile {
 }
 
 impl PerformanceProfile {
+    /// Create an empty performance profile.
     pub fn new() -> Self {
         Self {
             records: HashMap::new(),

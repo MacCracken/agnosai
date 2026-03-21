@@ -8,43 +8,61 @@ use crate::core::{AgentDefinition, CrewSpec, ProcessMode, Task, TaskPriority};
 
 use crate::server::state::SharedState;
 
+/// Inbound task definition within a crew creation request.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct TaskRequest {
+    /// Description of the task to perform.
     pub description: String,
+    /// Optional expected output description.
     #[serde(default)]
     pub expected_output: Option<String>,
+    /// Optional priority override.
     #[serde(default)]
     pub priority: Option<TaskPriority>,
+    /// Index-based dependency list referencing other tasks in the request.
     #[serde(default)]
     pub dependencies: Vec<usize>,
 }
 
+/// Request body for creating and running a new crew.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct CrewRunRequest {
+    /// Name for the crew.
     pub name: String,
+    /// Agent definitions to include in the crew.
     pub agents: Vec<AgentDefinition>,
+    /// Tasks for the crew to execute.
     pub tasks: Vec<TaskRequest>,
+    /// Optional process mode string (`"sequential"`, `"parallel"`, `"dag"`, `"hierarchical"`).
     #[serde(default)]
     pub process: Option<String>,
 }
 
+/// Response body returned after a crew run completes.
 #[derive(Debug, Serialize)]
 #[non_exhaustive]
 pub struct CrewRunResponse {
+    /// Unique identifier of the crew that was executed.
     pub crew_id: Uuid,
+    /// Overall crew status (e.g. `"completed"`, `"failed"`).
     pub status: String,
+    /// Per-task results.
     pub results: Vec<TaskResultResponse>,
 }
 
+/// Single task result within a crew run response.
 #[derive(Debug, Serialize)]
 #[non_exhaustive]
 pub struct TaskResultResponse {
+    /// ID of the completed task.
     pub task_id: Uuid,
+    /// Task output text.
     pub output: String,
+    /// Task status string.
     pub status: String,
 }
 
@@ -121,6 +139,7 @@ fn has_dependency_cycle(n: usize, tasks: &[TaskRequest]) -> bool {
     (0..n).any(|i| visit(i, tasks, &mut state))
 }
 
+/// POST /api/v1/crews — Create and run a new crew.
 pub async fn create_crew(
     State(state): State<SharedState>,
     Json(req): Json<CrewRunRequest>,
@@ -209,6 +228,7 @@ pub async fn create_crew(
     }
 }
 
+/// GET /api/v1/crews/:id — Retrieve crew state (placeholder).
 pub async fn get_crew(
     axum::extract::Path(_id): axum::extract::Path<Uuid>,
 ) -> (StatusCode, Json<serde_json::Value>) {
