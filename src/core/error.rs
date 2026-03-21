@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+#[must_use]
 pub type Result<T> = std::result::Result<T, AgnosaiError>;
 
 #[derive(Debug, Error)]

@@ -28,6 +28,9 @@ pub enum CrewPhase {
 pub struct DistributedCrewState {
     pub run_id: CrewRunId,
     pub phase: CrewPhase,
+    /// True while a checkpoint operation is in progress.
+    /// Barrier operations should be queued until this is false.
+    pub is_checkpointing: bool,
     pub participating_nodes: HashSet<NodeId>,
     pub node_progress: HashMap<NodeId, NodeProgress>,
     pub checkpoints: Vec<Checkpoint>,
@@ -106,6 +109,7 @@ impl CrewStateManager {
         let state = DistributedCrewState {
             run_id,
             phase: CrewPhase::Initializing,
+            is_checkpointing: false,
             participating_nodes: nodes,
             node_progress,
             checkpoints: Vec::new(),
@@ -221,8 +225,8 @@ impl CrewStateManager {
             return false;
         };
 
-        let prev_phase = state.phase.clone();
-        state.phase = CrewPhase::Checkpointing;
+        // Use flag instead of swapping phase to avoid interleaving with barrier ops.
+        state.is_checkpointing = true;
 
         state.checkpoints.push(Checkpoint {
             name: name.to_string(),
@@ -230,11 +234,13 @@ impl CrewStateManager {
             node_states,
         });
 
-        // Restore previous phase (unless it was Initializing, in which case go to Running).
-        state.phase = match prev_phase {
-            CrewPhase::Initializing => CrewPhase::Running,
-            other => other,
-        };
+        state.is_checkpointing = false;
+
+        // Move from Initializing to Running after first checkpoint.
+        if state.phase == CrewPhase::Initializing {
+            state.phase = CrewPhase::Running;
+        }
+        // (Other phases are preserved as-is.)
         state.updated_at = Utc::now();
         true
     }

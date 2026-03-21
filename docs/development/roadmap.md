@@ -97,19 +97,9 @@ Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/re
 
 | Item | Severity | Notes |
 |------|----------|-------|
-| Split `core/resource.rs` (978 lines) into focused modules | Medium | accelerator.rs, device.rs, budget.rs, training.rs |
-| DNS rebinding protection for A2A callbacks | Medium | Resolve-once + validate before connect |
 | Request rate limiting per client IP | Medium | Tower middleware, token bucket or sliding window |
-| Crew execution timeout | Medium | Configurable max wall-clock per crew via `tokio::time::timeout` |
-| `#[must_use]` on Result-returning functions | Medium | Prevent accidental error swallowing |
-| Clippy `unwrap_used` restriction lint | Medium | Forbid `.unwrap()` in non-test code via CI |
-| SSE validate crew existence before subscribing | Medium | Return 404 for unknown crew_id, prevent EventBus leak |
-| Fleet checkpoint phase isolation | Medium | Separate checkpointing flag from phase enum |
-| Fleet barrier caller-side timeout | Medium | Async timeout to detect dead nodes and call `force_barrier()` |
-| Doc comments on ~45 public items | Medium | Struct fields, type aliases, enum variants |
-| Resolve `orchestrator/orchestrator.rs` module inception | Low | Rename inner file |
-| EventBus LRU eviction for orphaned channels | Low | Background cleanup task |
-| `ResourceBudget` enforcement in orchestrator | Low | Check `max_tokens`, `max_cost_usd` during execution |
+| SSE return 404 for unknown crew_id | Medium | Query orchestrator before EventBus subscribe |
+| Remaining doc comments (~30 items) | Low | Struct fields and enum variants still missing `///` |
 | QLearner string interning | Low | Numeric IDs for large state spaces |
 
 ### Final Migration

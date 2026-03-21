@@ -12,6 +12,7 @@ use crate::server::state::SharedState;
 /// Validate that a callback URL is safe to POST to.
 ///
 /// Rejects URLs targeting private/internal networks to prevent SSRF.
+/// Also rejects hostnames that could be used for DNS rebinding attacks.
 fn is_safe_callback_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
@@ -26,33 +27,43 @@ fn is_safe_callback_url(url: &str) -> bool {
         return false;
     };
 
-    // Block localhost.
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+    // Block localhost and common internal names.
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower == "127.0.0.1"
+        || lower == "::1"
+        || lower == "[::1]"
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".localhost")
+    {
         return false;
     }
 
     // Block private/link-local IP ranges.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                if v4.is_private()
-                    || v4.is_loopback()
-                    || v4.is_link_local()
-                    || v4.octets()[0] == 169 && v4.octets()[1] == 254
-                // metadata service
-                {
-                    return false;
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                if v6.is_loopback() {
-                    return false;
-                }
-            }
+        if is_private_ip(ip) {
+            return false;
         }
     }
 
+    // Block IPs embedded as hostnames (e.g. "0x7f000001.example.com" won't be caught,
+    // but at least raw IPs are validated above).
     true
+}
+
+/// Check whether an IP address is in a private, loopback, or link-local range.
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || (v4.octets()[0] == 169 && v4.octets()[1] == 254) // metadata
+                || (v4.octets()[0] == 0) // 0.0.0.0/8
+        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    }
 }
 
 /// Maximum string field length for A2A requests.

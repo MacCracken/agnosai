@@ -85,7 +85,25 @@ impl Orchestrator {
         if let Some(ref events) = self.events {
             runner = runner.with_events(events.sender(crew_id));
         }
-        let crew_state = runner.run().await?;
+
+        // Enforce execution timeout from budget.
+        let timeout_dur = self
+            .budget
+            .max_duration_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(std::time::Duration::from_secs(3600)); // 1 hour default
+
+        let crew_state = match tokio::time::timeout(timeout_dur, runner.run()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!(crew_id = %crew_id, timeout_secs = timeout_dur.as_secs(), "crew execution timed out");
+                CrewState {
+                    crew_id,
+                    status: CrewStatus::Failed,
+                    results: Vec::new(),
+                }
+            }
+        };
 
         info!(
             crew_id = %crew_id,

@@ -315,11 +315,16 @@ impl TrainingMemoryEstimate {
     }
 }
 
+/// Budget limits for crew execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceBudget {
+    /// Maximum total LLM tokens across all tasks.
     pub max_tokens: Option<u64>,
+    /// Maximum total cost in USD.
     pub max_cost_usd: Option<f64>,
+    /// Maximum wall-clock seconds for the entire crew run.
     pub max_duration_secs: Option<u64>,
+    /// Maximum number of concurrent crew executions.
     pub max_concurrent_tasks: Option<usize>,
 }
 
@@ -334,11 +339,16 @@ impl Default for ResourceBudget {
     }
 }
 
+/// A GPU device with VRAM capacity information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuDevice {
+    /// Zero-based device index.
     pub index: usize,
+    /// Device name (e.g. "NVIDIA A100").
     pub name: String,
+    /// Total VRAM in megabytes.
     pub vram_total_mb: u64,
+    /// Available (free) VRAM in megabytes.
     pub vram_available_mb: u64,
 }
 

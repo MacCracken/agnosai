@@ -52,6 +52,22 @@ impl EventBus {
     pub fn remove(&self, crew_id: Uuid) {
         self.channels.remove(&crew_id);
     }
+
+    /// Check whether a channel exists for the given crew.
+    pub fn has(&self, crew_id: Uuid) -> bool {
+        self.channels.contains_key(&crew_id)
+    }
+
+    /// Number of active channels.
+    pub fn len(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// Remove channels with no active receivers (orphan cleanup).
+    pub fn cleanup_orphans(&self) {
+        self.channels
+            .retain(|_id, sender| sender.receiver_count() > 0);
+    }
 }
 
 /// Create an SSE stream from a broadcast receiver.

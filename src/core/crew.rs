@@ -4,6 +4,7 @@ use uuid::Uuid;
 use crate::core::agent::AgentDefinition;
 use crate::core::task::{ProcessMode, Task, TaskResult};
 
+/// Unique identifier for a crew.
 pub type CrewId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

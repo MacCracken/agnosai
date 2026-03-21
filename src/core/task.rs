@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::core::AgentId;
 
+/// Unique identifier for a task.
 pub type TaskId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

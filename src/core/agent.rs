@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::core::resource::{AcceleratorType, HardwareRequirement};
 
+/// Unique identifier for an agent instance.
 pub type AgentId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
