@@ -568,22 +568,22 @@ async fn execute_task(
 
             // If streaming was requested, replay via infer_stream for SSE token
             // events. This is best-effort — the full response is already captured.
-            if let Some(tx) = event_tx {
-                if let Ok(mut rx) = client.infer_stream(&request).await {
-                    while let Some(chunk) = rx.recv().await {
-                        match chunk {
-                            Ok(token) => {
-                                let _ = tx.send(CrewEvent {
-                                    crew_id: task.id.to_string(),
-                                    event_type: "token".into(),
-                                    data: serde_json::json!({
-                                        "task_id": task.id.to_string(),
-                                        "token": token,
-                                    }),
-                                });
-                            }
-                            Err(_) => break,
+            if let Some(tx) = event_tx
+                && let Ok(mut rx) = client.infer_stream(&request).await
+            {
+                while let Some(chunk) = rx.recv().await {
+                    match chunk {
+                        Ok(token) => {
+                            let _ = tx.send(CrewEvent {
+                                crew_id: task.id.to_string(),
+                                event_type: "token".into(),
+                                data: serde_json::json!({
+                                    "task_id": task.id.to_string(),
+                                    "token": token,
+                                }),
+                            });
                         }
+                        Err(_) => break,
                     }
                 }
             }
