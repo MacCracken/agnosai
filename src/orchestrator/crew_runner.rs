@@ -177,7 +177,13 @@ impl CrewRunner {
             );
 
             self.spec.tasks[i].status = TaskStatus::Running;
-            let result = execute_task(&self.spec.tasks[i], agent.as_ref(), self.llm.as_ref(), &self.cache).await;
+            let result = execute_task(
+                &self.spec.tasks[i],
+                agent.as_ref(),
+                self.llm.as_ref(),
+                &self.cache,
+            )
+            .await;
             self.spec.tasks[i].status = result.status;
 
             self.emit(
@@ -467,9 +473,15 @@ async fn execute_task(
     if let Some(cached) = cache.get(&ck) {
         let task_duration_ms = task_start.elapsed().as_millis() as u64;
         let mut metadata = HashMap::new();
-        metadata.insert("model".into(), serde_json::Value::String(request.model.clone()));
+        metadata.insert(
+            "model".into(),
+            serde_json::Value::String(request.model.clone()),
+        );
         metadata.insert("cached".into(), serde_json::json!(true));
-        metadata.insert("task_duration_ms".into(), serde_json::json!(task_duration_ms));
+        metadata.insert(
+            "task_duration_ms".into(),
+            serde_json::json!(task_duration_ms),
+        );
 
         debug!(
             task_id = %task.id,
@@ -510,7 +522,10 @@ async fn execute_task(
                 }),
             );
             let task_duration_ms = task_start.elapsed().as_millis() as u64;
-            metadata.insert("task_duration_ms".into(), serde_json::json!(task_duration_ms));
+            metadata.insert(
+                "task_duration_ms".into(),
+                serde_json::json!(task_duration_ms),
+            );
 
             info!(
                 task_id = %task.id,
@@ -540,7 +555,10 @@ async fn execute_task(
             );
             let mut metadata = HashMap::new();
             metadata.insert("error".into(), serde_json::Value::String(e.to_string()));
-            metadata.insert("task_duration_ms".into(), serde_json::json!(task_duration_ms));
+            metadata.insert(
+                "task_duration_ms".into(),
+                serde_json::json!(task_duration_ms),
+            );
 
             TaskResult {
                 task_id: task.id,

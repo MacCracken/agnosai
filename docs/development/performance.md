@@ -5,7 +5,7 @@
 All benchmarks use [Criterion.rs](https://bheisler.github.io/criterion.rs/book/) with 100-sample
 statistical analysis. Results are from the development machine and are relative, not absolute.
 
-Last updated: 2026-03-20
+Last updated: 2026-03-21 (v0.21.3, hoosh 0.21.4, ai-hwaccel 0.21.3)
 
 ---
 
@@ -48,35 +48,35 @@ cargo bench --bench resource --features hwaccel  # with hwaccel
 
 ### Serde Round-Trips (`benches/serde_types.rs`)
 
-| Benchmark | Payload | Median |
-|---|---|---|
-| HardwareInventory serialize (8 devices) | ~2 KB JSON | 888 ns |
-| HardwareInventory deserialize (8 devices) | ~2 KB JSON | 1.17 us |
-| Task serialize | ~500 B JSON | 351 ns |
-| Task deserialize | ~500 B JSON | 577 ns |
-| AgentDefinition from_json | ~400 B JSON | 730 ns |
-| ResourceBudget serialize | ~100 B JSON | 89 ns |
-| ResourceBudget deserialize | ~100 B JSON | 99 ns |
+| Benchmark | Payload | Median | Prev | Delta |
+|---|---|---|---|---|
+| HardwareInventory serialize (8 devices) | ~2 KB JSON | 912 ns | 888 ns | +3% |
+| HardwareInventory deserialize (8 devices) | ~2 KB JSON | 1.20 us | 1.17 us | +3% |
+| Task serialize | ~500 B JSON | 342 ns | 351 ns | **-3%** |
+| Task deserialize | ~500 B JSON | 600 ns | 577 ns | +4% |
+| AgentDefinition from_json | ~400 B JSON | 804 ns | 730 ns | +10% |
+| ResourceBudget serialize | ~100 B JSON | 91 ns | 89 ns | +2% |
+| ResourceBudget deserialize | ~100 B JSON | 101 ns | 99 ns | +2% |
 
 ### Scheduler (`benches/scheduler.rs`)
 
-| Benchmark | Scale | Median |
-|---|---|---|
-| enqueue 100 tasks | 100 tasks, 5 priorities | 10.4 us |
-| dequeue 100 tasks (priority order) | 100 tasks | 3.7 us |
-| load_dag linear (50 tasks) | 50 nodes, 49 edges | 33 us |
-| load_dag linear (500 tasks) | 500 nodes, 499 edges | 338 us |
-| load_dag wide (100 workers) | 102 nodes, 200 edges | 94 us |
-| ready_tasks (wide DAG, 100 workers) | 100 workers | 1.9 us |
+| Benchmark | Scale | Median | Prev | Delta |
+|---|---|---|---|---|
+| enqueue 100 tasks | 100 tasks, 5 priorities | 10.5 us | 10.4 us | +1% |
+| dequeue 100 tasks (priority order) | 100 tasks | 3.2 us | 3.7 us | **-14%** |
+| load_dag linear (50 tasks) | 50 nodes, 49 edges | 33 us | 33 us | 0% |
+| load_dag linear (500 tasks) | 500 nodes, 499 edges | 337 us | 338 us | 0% |
+| load_dag wide (100 workers) | 102 nodes, 200 edges | 95 us | 94 us | +1% |
+| ready_tasks (wide DAG, 100 workers) | 100 workers | 1.95 us | 1.9 us | +3% |
 
 ### Agent Scoring (`benches/scoring.rs`)
 
-| Benchmark | Scale | Median |
-|---|---|---|
-| score_agent (rich context) | 1 agent, 4 tools | 165 ns |
-| score_agent (no context) | 1 agent, 0 tools | 25 ns |
-| rank_agents (10 agents) | 10 agents | 1.68 us |
-| rank_agents (100 agents) | 100 agents | 17.7 us |
+| Benchmark | Scale | Median | Prev | Delta |
+|---|---|---|---|---|
+| score_agent (rich context) | 1 agent, 4 tools | 176 ns | 165 ns | +7% |
+| score_agent (no context) | 1 agent, 0 tools | 26 ns | 25 ns | +4% |
+| rank_agents (10 agents) | 10 agents | 1.79 us | 1.68 us | +6% |
+| rank_agents (100 agents) | 100 agents | 18.3 us | 17.7 us | +3% |
 
 ### Fleet Placement (`benches/placement.rs`)
 
@@ -91,16 +91,16 @@ cargo bench --bench resource --features hwaccel  # with hwaccel
 
 ### PubSub Pattern Matching (`benches/pubsub.rs`)
 
-| Benchmark | Scale | Median |
-|---|---|---|
-| matches_pattern literal | 3 segments | 106 ns |
-| matches_pattern single `*` | 3 segments | 88 ns |
-| matches_pattern multi-level `#` | 3 segments | 128 ns |
-| matches_pattern deep (10 segments) | 10 segments | 281 ns |
-| publish (1 subscriber) | 1 sub | 904 ns |
-| publish (10 subscribers) | 10 subs | 1.53 us |
-| publish (100 subscribers) | 100 subs | 1.74 us |
-| subscribe (new pattern) | — | 122 ns |
+| Benchmark | Scale | Median | Prev | Delta |
+|---|---|---|---|---|
+| matches_pattern literal | 3 segments | 75 ns | 106 ns | **-29%** |
+| matches_pattern single `*` | 3 segments | 68 ns | 88 ns | **-23%** |
+| matches_pattern multi-level `#` | 3 segments | 114 ns | 128 ns | **-11%** |
+| matches_pattern deep (10 segments) | 10 segments | 260 ns | 281 ns | **-7%** |
+| publish (1 subscriber) | 1 sub | 826 ns | 904 ns | **-9%** |
+| publish (10 subscribers) | 10 subs | 1.55 us | 1.53 us | +1% |
+| publish (100 subscribers) | 100 subs | 1.45 us | 1.74 us | **-17%** |
+| subscribe (new pattern) | — | 140 ns | 122 ns | +15% |
 
 ### Fleet Relay (`benches/relay.rs`)
 
@@ -113,27 +113,27 @@ cargo bench --bench resource --features hwaccel  # with hwaccel
 
 ### Learning Module (`benches/learning.rs`)
 
-| Benchmark | Scale | Median |
-|---|---|---|
-| CapabilityScorer record | 50 capabilities | 53 ns |
-| CapabilityScorer confidence | 50 capabilities | 25 ns |
-| Ucb1 select (10 arms) | 10 arms | 47 ns |
-| Ucb1 select (50 arms) | 50 arms | 250 ns |
-| ReplayBuffer push (full) | 1000 buffer | 750 ns |
-| ReplayBuffer sample(32) | 1000 buffer | 17 us |
-| QLearner update | 1000 state-actions | 352 ns |
-| QLearner best_action | 1000 state-actions | 438 ns |
-| PerformanceProfile record | 20 agents | 152 ns |
-| PerformanceProfile success_rate | 20 agents | 48 ns |
+| Benchmark | Scale | Median | Prev | Delta |
+|---|---|---|---|---|
+| CapabilityScorer record | 50 capabilities | 38 ns | 53 ns | **-28%** |
+| CapabilityScorer confidence | 50 capabilities | 18 ns | 25 ns | **-28%** |
+| Ucb1 select (10 arms) | 10 arms | 59 ns | 47 ns | +26% |
+| Ucb1 select (50 arms) | 50 arms | 268 ns | 250 ns | +7% |
+| ReplayBuffer push (full) | 1000 buffer | 637 ns | 750 ns | **-15%** |
+| ReplayBuffer sample(32) | 1000 buffer | 42 us | 17 us | +147% |
+| QLearner update | 1000 state-actions | 464 ns | 352 ns | +32% |
+| QLearner best_action | 1000 state-actions | 432 ns | 438 ns | -1% |
+| PerformanceProfile record | 20 agents | 160 ns | 152 ns | +5% |
+| PerformanceProfile success_rate | 20 agents | 48 ns | 48 ns | 0% |
 
 ### Tool Registry (`benches/tools.rs`)
 
-| Benchmark | Scale | Median |
-|---|---|---|
-| get (5 tools) | 5 tools | 49 ns |
-| get (50 tools) | 50 tools | 53 ns |
-| list (50 tools) | 50 tools | 8.5 us |
-| register | — | 948 ns |
+| Benchmark | Scale | Median | Prev | Delta |
+|---|---|---|---|---|
+| get (5 tools) | 5 tools | 50 ns | 49 ns | +2% |
+| get (50 tools) | 50 tools | 55 ns | 53 ns | +4% |
+| list (50 tools) | 50 tools | 8.3 us | 8.5 us | **-2%** |
+| register | — | 931 ns | 948 ns | -2% |
 
 ---
 
@@ -160,19 +160,19 @@ detection. It does not affect per-request hot paths.
 
 | Hot Path | Operation | Per-call | Budget | Status |
 |---|---|---|---|---|
-| **Per-request** | Tool registry lookup | 49 ns | <1 ms | OK |
-| **Per-request** | Score + rank 10 agents | 1.68 us | <1 ms | OK |
-| **Per-request** | JSON deserialize (agent) | 730 ns | <1 ms | OK |
-| **Per-task** | Scheduler dequeue | 37 ns | <100 us | OK |
-| **Per-task** | Capability record | 53 ns | <100 us | OK |
-| **Per-task** | Q-learning update | 352 ns | <100 us | OK |
-| **Per-event** | PubSub publish (10 subs) | 1.53 us | <1 ms | OK |
-| **Per-event** | Pattern match | 106 ns | <100 us | OK |
+| **Per-request** | Tool registry lookup | 50 ns | <1 ms | OK |
+| **Per-request** | Score + rank 10 agents | 1.79 us | <1 ms | OK |
+| **Per-request** | JSON deserialize (agent) | 804 ns | <1 ms | OK |
+| **Per-task** | Scheduler dequeue | 32 ns | <100 us | OK |
+| **Per-task** | Capability record | 38 ns | <100 us | OK |
+| **Per-task** | Q-learning update | 464 ns | <100 us | OK |
+| **Per-event** | PubSub publish (10 subs) | 1.55 us | <1 ms | OK |
+| **Per-event** | Pattern match | 75 ns | <100 us | OK |
 | **Per-msg** | Relay send | 158 ns | <1 ms | OK |
 | **Per-msg** | Relay receive + dedup | 223 ns | <1 ms | OK |
 | **Per-node** | Fleet placement (50 nodes) | 1.08 us | <1 ms | OK |
 | **Startup** | from_hwaccel detection | 39.7 us | <100 ms | OK |
-| **Startup** | Load DAG (500 tasks) | 338 us | <100 ms | OK |
+| **Startup** | Load DAG (500 tasks) | 337 us | <100 ms | OK |
 
 ---
 
@@ -188,6 +188,23 @@ detection. It does not affect per-request hot paths.
 | Fleet msg overhead | ~50 ms | <1 ms | 0.22 us |
 | Dependencies | 200+ | ~30 | 22 |
 | Python in hot path | 100% | 0% | 0% |
+
+---
+
+## Notable Changes (v0.21.3)
+
+**Improved:**
+- PubSub pattern matching: -7% to -29% across all patterns
+- CapabilityScorer: -28% for both record and confidence
+- ReplayBuffer push: -15%
+- Scheduler dequeue: -14%
+
+**Regressed (monitoring):**
+- ReplayBuffer sample(32): +147% (42us, needs investigation — likely allocation pattern change)
+- QLearner update: +32% (464ns, still well under budget)
+- Ucb1 select (10 arms): +26% (59ns, still sub-100ns)
+
+All hot-path operations remain well within their budgets.
 
 ---
 
