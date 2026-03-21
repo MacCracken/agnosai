@@ -16,7 +16,7 @@ pub trait NativeTool: Send + Sync {
 ## Example: HTTP Health Check Tool
 
 ```rust
-use agnosai_tools::{NativeTool, ToolSchema, ParameterSchema, ToolInput, ToolOutput};
+use agnosai::tools::{NativeTool, ToolSchema, ParameterSchema, ToolInput, ToolOutput};
 use std::pin::Pin;
 use std::future::Future;
 
@@ -74,7 +74,7 @@ impl NativeTool for HealthCheckTool {
 ## Registering the Tool
 
 ```rust
-use agnosai_tools::ToolRegistry;
+use agnosai::tools::ToolRegistry;
 use std::sync::Arc;
 
 let registry = ToolRegistry::new();
@@ -92,9 +92,9 @@ let output = tool.execute(input).await;
 
 To include your tool in the default set:
 
-1. Create `crates/agnosai-tools/src/builtin/your_tool.rs`
-2. Export it in `crates/agnosai-tools/src/builtin/mod.rs`
-3. Follow the pattern of existing built-ins (echo, json_transform)
+1. Create `src/tools/builtin/your_tool.rs`
+2. Export it in `src/tools/builtin/mod.rs`
+3. Register it in `src/main.rs` (follow the pattern of EchoTool, JsonTransformTool)
 
 ## AGNOS Service Tools Pattern
 

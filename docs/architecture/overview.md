@@ -25,22 +25,25 @@
                     (optional throughput tools)
 ```
 
-- **Agnostic** depends on `agnosai-core` + `agnosai-orchestrator` (replaces CrewAI)
+- **Agnostic** depends on `agnosai` (replaces CrewAI)
 - **SecureYeoman** talks to Agnostic via A2A/MCP — same wire protocol, faster backend
 - **Synapse/Mneme/Delta** are optional HTTP tool backends for agents
 
-## Crate Dependency Graph
+## Module Structure
+
+AgnosAI is a single crate with feature-gated modules:
 
 ```
-agnosai-core              (no internal deps — foundation types)
-  ├── agnosai-orchestrator    (scheduling, scoring, pub/sub, crew runner)
-  ├── agnosai-llm             (provider trait, HTTP clients, routing, health)
-  ├── agnosai-fleet           (distribution, placement, relay, GPU)
-  ├── agnosai-sandbox         (WASM, process, OCI isolation)
-  │     └── agnosai-tools     (tool trait, registry, builtins)
-  ├── agnosai-learning        (RL, profiling, capability scoring)
-  ├── agnosai-definitions     (loader, assembler, versioning, packaging)
-  └── agnosai-server          (axum HTTP/gRPC, depends on most crates)
+agnosai
+  ├── core           (foundation types — agents, tasks, crews, errors)
+  ├── orchestrator   (scheduling, scoring, pub/sub, crew runner)
+  ├── llm            (hoosh re-exports, task-complexity routing)
+  ├── fleet          (distribution, placement, relay, GPU) [feature: fleet]
+  ├── sandbox        (WASM, process isolation) [feature: sandbox]
+  ├── tools          (tool trait, registry, builtins)
+  ├── learning       (RL, profiling, capability scoring)
+  ├── definitions    (loader, assembler, versioning, packaging) [feature: definitions]
+  └── server         (axum HTTP, MCP, A2A, SSE)
 ```
 
 ## Key Data Flow
@@ -56,15 +59,15 @@ CrewRunner::new(spec)
     ├── ProcessMode::Sequential → run tasks in order
     ├── ProcessMode::Parallel   → JoinSet + Semaphore(max_concurrency)
     ├── ProcessMode::DAG        → topological sort → wave execution
-    └── ProcessMode::Hierarchical → manager delegation (Phase 2)
+    └── ProcessMode::Hierarchical → manager delegation (falls back to sequential)
     │
     ├── For each task:
     │   ├── score_agent() → rank agents by suitability (4-factor weighted)
     │   ├── pick_best_agent() → assign highest-scoring agent
-    │   └── execute_task() → LLM call + tool execution (Phase 2)
+    │   └── execute_task() → LLM inference via hoosh + response caching
     │
     ▼
-CrewState { crew_id, status, results: Vec<TaskResult> }
+CrewState { crew_id, status, results, profile }
 ```
 
 ### Agent Scoring

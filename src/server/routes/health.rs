@@ -8,7 +8,7 @@ pub async fn health() -> Json<Value> {
 
 /// GET /ready — Readiness probe.
 pub async fn ready() -> Json<Value> {
-    Json(json!({"status": "ready", "version": "0.1.0"}))
+    Json(json!({"status": "ready", "version": env!("CARGO_PKG_VERSION")}))
 }
 
 #[cfg(test)]
@@ -71,6 +71,6 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ready");
-        assert_eq!(json["version"], "0.1.0");
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
     }
 }

@@ -5,7 +5,7 @@ AgnosAI supports four execution patterns via the `ProcessMode` enum in `agnosai-
 ## Process Modes
 
 ```rust
-// From agnosai_core::task
+// From agnosai::core::task
 pub enum ProcessMode {
     Sequential,
     Parallel { max_concurrency: usize },
@@ -23,8 +23,8 @@ The default is `Sequential`.
 Tasks run one at a time, in the order they appear in the crew spec. Simple and predictable -- use this when each task depends on the previous one's output.
 
 ```rust
-use agnosai_core::{CrewSpec, Task, ProcessMode};
-use agnosai_orchestrator::Orchestrator;
+use agnosai::core::{CrewSpec, Task, ProcessMode};
+use agnosai::orchestrator::Orchestrator;
 
 let orchestrator = Orchestrator::new(Default::default()).await?;
 
@@ -49,7 +49,7 @@ let result = orchestrator.run_crew(crew).await?;
 All tasks run concurrently, bounded by a semaphore. Tasks are independent -- no dependency ordering is enforced.
 
 ```rust
-use agnosai_core::{CrewSpec, Task, ProcessMode};
+use agnosai::core::{CrewSpec, Task, ProcessMode};
 
 let mut crew = CrewSpec::new("batch-analysis");
 crew.tasks = vec![
@@ -76,7 +76,7 @@ The `max_concurrency` field controls how many tasks can execute at once. Interna
 Tasks form a directed acyclic graph via their `dependencies` field. The orchestrator resolves the graph using Kahn's algorithm (topological sort), detects cycles, and executes tasks in waves -- each wave contains all tasks whose dependencies are satisfied.
 
 ```rust
-use agnosai_core::{CrewSpec, Task, ProcessMode, TaskPriority};
+use agnosai::core::{CrewSpec, Task, ProcessMode, TaskPriority};
 
 let mut gather = Task::new("Gather data from API");
 gather.priority = TaskPriority::High;
@@ -110,10 +110,10 @@ Cyclic dependencies produce an `AgnosaiError::CyclicDAG` error at scheduling tim
 
 ## Hierarchical Execution
 
-A designated manager agent delegates tasks to worker agents. Currently falls back to sequential execution while full manager delegation is under development.
+A designated manager agent delegates tasks to worker agents. Currently falls back to sequential execution while full manager delegation is being implemented.
 
 ```rust
-use agnosai_core::{CrewSpec, Task, ProcessMode};
+use agnosai::core::{CrewSpec, Task, ProcessMode};
 use uuid::Uuid;
 
 let manager_id = Uuid::new_v4();
@@ -127,10 +127,10 @@ crew.tasks = vec![
 crew.process = ProcessMode::Hierarchical { manager: manager_id };
 
 let result = orchestrator.run_crew(crew).await?;
-// Currently executes sequentially; manager delegation coming in Phase 2.
+// Currently executes sequentially; manager delegation is on the roadmap.
 ```
 
-**When to use:** Scenarios where a lead agent should decompose and assign work. Currently equivalent to sequential; full delegation is on the roadmap.
+**When to use:** Scenarios where a lead agent should decompose and assign work. Currently equivalent to sequential; full manager delegation is on the roadmap.
 
 ---
 
@@ -160,7 +160,7 @@ task.context.insert("gpu_required".into(), serde_json::json!(false));
 You can also rank agents explicitly:
 
 ```rust
-use agnosai_orchestrator::scoring::rank_agents;
+use agnosai::orchestrator::scoring::rank_agents;
 
 let ranked = rank_agents(&crew.agents, &task);
 // Returns Vec<(agent_index, score)> sorted by score descending

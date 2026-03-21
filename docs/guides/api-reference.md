@@ -1,6 +1,6 @@
 # API Reference
 
-AgnosAI exposes a REST API via the `agnosai-server` crate, built on [axum](https://github.com/tokio-rs/axum).
+AgnosAI exposes a REST API via the `agnosai-server` binary, built on [axum](https://github.com/tokio-rs/axum).
 
 ## Endpoints
 
@@ -40,7 +40,7 @@ Readiness check. Returns 200 when the server is fully initialized and ready to a
 ```json
 {
   "status": "ready",
-  "version": "0.1.0"
+  "version": "0.21.3"
 }
 ```
 
@@ -271,10 +271,10 @@ Currently returns an empty array. The preset library endpoint is on the roadmap.
 ## Running the Server
 
 ```bash
-cargo run -p agnosai-server
+cargo run --bin agnosai-server
 ```
 
-The server binds to `0.0.0.0:3000` by default. Use `AGNOSAI_PORT` to change the port.
+The server binds to `0.0.0.0:8080` by default. Use `PORT` or `AGNOSAI_PORT` to change the port.
 
 ## Content Type
 

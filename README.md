@@ -159,7 +159,7 @@ First-class multi-node support:
 ```
 $ cargo test
 ...
-test result: ok. 424 passed; 0 failed; 0 ignored
+test result: ok. 309 passed; 0 failed; 0 ignored
 ```
 
 Tests cover core types, orchestration (all 4 process modes), DAG cycle detection, agent scoring, priority scheduling, pub/sub, IPC, LLM provider routing, tool registry, and API routes.

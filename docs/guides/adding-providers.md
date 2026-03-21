@@ -16,7 +16,7 @@ pub trait LlmProvider: Send + Sync {
 
 ### 1. Add the Provider Type
 
-In `crates/agnosai-llm/src/provider.rs`, add your provider to the `ProviderType` enum:
+In `src/llm/mod.rs` (re-exported from hoosh), add your provider to the `ProviderType` enum:
 
 ```rust
 pub enum ProviderType {
@@ -29,7 +29,7 @@ pub enum ProviderType {
 
 ### 2. Create the Implementation
 
-Create `crates/agnosai-llm/src/providers/your_provider.rs`:
+Create `src/llm/your_provider.rs`:
 
 ```rust
 use reqwest::Client;
@@ -109,16 +109,11 @@ impl LlmProvider for YourProvider {
 
 ### 3. Register in the Module
 
-In `crates/agnosai-llm/src/providers/mod.rs`:
+In `src/llm/mod.rs`, add the module and re-export:
 
 ```rust
 pub mod your_provider;
-```
-
-In `crates/agnosai-llm/src/lib.rs`:
-
-```rust
-pub use providers::your_provider::YourProvider;
+pub use your_provider::YourProvider;
 ```
 
 ### 4. OpenAI-Compatible Shortcut

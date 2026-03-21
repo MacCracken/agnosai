@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.85+ (`rustup update`)
+- Rust 1.89+ (`rustup update`)
 - For AGNOS tools: running instances of Synapse, Mneme, or Delta (optional)
 
 ## Build
@@ -28,7 +28,7 @@ Crew completed with status: Completed
 ## Run the API Server
 
 ```bash
-cargo run -p agnosai-server
+cargo run --bin agnosai-server
 ```
 
 The server starts on `http://localhost:8080` with:
@@ -47,15 +47,14 @@ Add to your project's `Cargo.toml`:
 
 ```toml
 [dependencies]
-agnosai-core = { git = "https://github.com/maccracken/agnosai" }
-agnosai-orchestrator = { git = "https://github.com/maccracken/agnosai" }
+agnosai = { git = "https://github.com/maccracken/agnosai" }
 ```
 
 ### Minimal Crew
 
 ```rust
-use agnosai_core::{CrewSpec, Task};
-use agnosai_orchestrator::Orchestrator;
+use agnosai::core::{CrewSpec, Task};
+use agnosai::orchestrator::Orchestrator;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -73,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
 ### With Agent Definitions
 
 ```rust
-use agnosai_definitions::loader;
+use agnosai::definitions::loader;
 
 // Load from JSON file
 let agent = loader::load_from_file(Path::new("agents/analyst.json"))?;
@@ -90,7 +89,7 @@ crew.tasks.push(Task::new("Find security vulnerabilities"));
 ### DAG Execution
 
 ```rust
-use agnosai_core::task::ProcessMode;
+use agnosai::core::task::ProcessMode;
 
 let mut task_a = Task::new("Gather requirements");
 let mut task_b = Task::new("Write code");
@@ -108,8 +107,8 @@ crew.tasks = vec![task_a, task_b, task_c];
 ### Using Tools
 
 ```rust
-use agnosai_tools::{ToolRegistry, NativeTool};
-use agnosai_tools::builtin::echo::EchoTool;
+use agnosai::tools::{ToolRegistry, NativeTool};
+use agnosai::tools::builtin::echo::EchoTool;
 use std::sync::Arc;
 
 let registry = ToolRegistry::new();
@@ -124,9 +123,9 @@ for schema in registry.list() {
 ### AGNOS Ecosystem Tools
 
 ```rust
-use agnosai_tools::builtin::synapse::SynapseInfer;
-use agnosai_tools::builtin::mneme::MnemeSearch;
-use agnosai_tools::builtin::delta::DeltaListRepos;
+use agnosai::tools::builtin::synapse::SynapseInfer;
+use agnosai::tools::builtin::mneme::MnemeSearch;
+use agnosai::tools::builtin::delta::DeltaListRepos;
 
 // Default URLs (localhost)
 let synapse = Arc::new(SynapseInfer::new());

@@ -7,46 +7,6 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 
 ---
 
-## Completed
-
-### Code Audit & Review (P0)
-
-- [x] Security audit — input validation, sandbox escape paths, auth bypass, injection vectors
-- [x] Error handling — panic paths, unwrap usage, error propagation completeness
-- [x] Concurrency — lock ordering, deadlock potential, race conditions, Send/Sync correctness
-- [x] API surface — public API consistency, breaking change risk, documentation accuracy
-- [x] Test coverage — gap analysis, edge cases, failure path testing
-- [x] Dependency audit — supply chain, minimal surface, version currency, advisory compliance
-- [x] Performance — unnecessary allocations, hot path efficiency, memory layout
-- [x] Code quality — dead code, naming consistency, module organization
-
-### API & Protocol Work
-
-- [x] Full JWT validation (RS256, claims, expiry)
-- [x] SSE integration with CrewRunner events
-- [x] All 18 presets (6 domains x 3 sizes)
-
-### Agnostic Migration (Phase 5)
-
-- [x] Feature flag: `AGNOSTIC_BACKEND=agnosai|crewai`
-- [x] Port unit tests to run against both backends
-- [x] Port E2E tests (Docker compose with AgnosAI binary)
-- [x] Migrate presets domain-by-domain (18 presets)
-- [x] Port high-value Python tools to native Rust (load_testing, security_audit)
-- [x] Fleet shim (Python fleet → AgnosAI fleet via HTTP)
-- [x] Community tool SDK (WASM)
-
-### Hardening (ai-hwaccel parity)
-
-- [x] Fuzz testing (4 targets: agent definitions, crew requests, presets, tool input)
-- [x] cargo-vet supply chain auditing
-- [x] `#[serde(deny_unknown_fields)]` on API input types
-- [x] Threat model document
-- [x] Benchmark CI job
-- [x] Environment sanitization (LD_PRELOAD/DYLD stripping in all sandboxes)
-
----
-
 ## Remaining Work
 
 ### Test Coverage (ongoing)
@@ -60,23 +20,13 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/registry
 (feature-gated), A2A route handlers, SSE streaming paths.
 
-### Scale Readiness (v0.21 — aligned with ai-hwaccel v0.21.3)
-
-| Item | Priority | Status |
-|------|----------|--------|
-| Lazy agent/provider initialization | High | Done — `OnceLock`-based lazy init, client created on first inference |
-| Crew execution profiling | High | Done — `CrewProfile` with wall time + per-task `task_duration_ms` |
-| Connection pooling for LLM providers | High | Done — shared `Arc<HooshClient>`, reqwest pool (10 idle/host) |
-| Caching infrastructure | Medium | Done — `ResponseCache` (TTL, LRU eviction) wired into `execute_task` |
-| Real LLM execution (Phase 2) | High | Done — `execute_task` calls hoosh with system prompt, model routing |
-| Topology-aware fleet scheduling | Medium | Deferred to v0.22 |
-| Cost-aware crew planning | Medium | Deferred to v0.22 |
-| Container/VM environment detection | Medium | Deferred to v0.22 |
-
-### Ecosystem (v0.22 — aligned with ai-hwaccel v0.22.3)
+### Ecosystem & Scale (v0.22 — aligned with ai-hwaccel v0.22.3)
 
 | Item | Priority | Notes |
 |------|----------|-------|
+| Topology-aware fleet scheduling | Medium | Leverage ai-hwaccel NVLink/XGMI data for GPU-affinity placement |
+| Cost-aware crew planning | Medium | Cloud GPU pricing lookup for budget-constrained crews |
+| Container/VM environment detection | Medium | Auto-detect resource limits in containers |
 | Python bindings (PyO3) | Medium | Let Python callers use AgnosAI as a library |
 | Multi-node fleet discovery (mDNS, Consul, K8s) | Medium | Auto-discover fleet nodes |
 | Kubernetes operator | Low | CRDs for crew/agent definitions |
@@ -92,10 +42,6 @@ Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/re
 | Health monitoring & alerting | Medium | Agent health, provider latency, fleet node status |
 | Multi-tenancy (crew isolation, resource quotas) | Medium | Per-tenant budget enforcement |
 | Dashboard API (crew history, agent performance) | Low | REST endpoints for operational dashboards |
-
-### Engineering Backlog
-
-All items cleared. No outstanding backlog.
 
 ### Final Migration
 
