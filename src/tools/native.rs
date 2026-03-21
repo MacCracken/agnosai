@@ -158,9 +158,9 @@ mod tests {
     #[test]
     fn tool_input_get_f64_returns_value() {
         let input = ToolInput {
-            parameters: HashMap::from([("ratio".into(), serde_json::json!(3.14))]),
+            parameters: HashMap::from([("ratio".into(), serde_json::json!(1.5))]),
         };
-        assert_eq!(input.get_f64("ratio"), Some(3.14));
+        assert_eq!(input.get_f64("ratio"), Some(1.5));
     }
 
     #[test]

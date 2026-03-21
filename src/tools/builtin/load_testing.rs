@@ -65,7 +65,7 @@ impl NativeTool for LoadTestingTool {
 
             match run_load_test(&target_url, concurrent_users, duration).await {
                 Ok(result) => ToolOutput::ok(serde_json::to_value(result).unwrap_or_default()),
-                Err(e) => ToolOutput::err(&format!("load test failed: {e}")),
+                Err(e) => ToolOutput::err(format!("load test failed: {e}")),
             }
         })
     }
@@ -165,7 +165,8 @@ async fn run_load_test(
 
     let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
 
-    let avg_latency = all_latencies.iter().map(|d| to_ms(*d)).sum::<f64>() / all_latencies.len() as f64;
+    let avg_latency =
+        all_latencies.iter().map(|d| to_ms(*d)).sum::<f64>() / all_latencies.len() as f64;
     let last = all_latencies.len() - 1;
     let p50 = to_ms(all_latencies[(all_latencies.len() * 50 / 100).min(last)]);
     let p95 = to_ms(all_latencies[(all_latencies.len() * 95 / 100).min(last)]);
@@ -212,7 +213,12 @@ mod tests {
     #[test]
     fn load_testing_schema_has_target_url() {
         let schema = LoadTestingTool.schema();
-        assert!(schema.parameters.iter().any(|p| p.name == "target_url" && p.required));
+        assert!(
+            schema
+                .parameters
+                .iter()
+                .any(|p| p.name == "target_url" && p.required)
+        );
     }
 
     #[tokio::test]

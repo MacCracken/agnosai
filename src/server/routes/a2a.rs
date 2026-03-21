@@ -41,10 +41,10 @@ fn is_safe_callback_url(url: &str) -> bool {
     }
 
     // Block private/link-local IP ranges.
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_private_ip(ip) {
-            return false;
-        }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && is_private_ip(ip)
+    {
+        return false;
     }
 
     // Block IPs embedded as hostnames (e.g. "0x7f000001.example.com" won't be caught,
@@ -136,23 +136,23 @@ pub async fn receive(
             }),
         );
     }
-    if let Ok(meta_bytes) = serde_json::to_vec(&req.metadata) {
-        if meta_bytes.len() > A2A_MAX_METADATA_BYTES {
-            tracing::warn!(
-                task_id = %req.task_id,
-                metadata_bytes = meta_bytes.len(),
-                "A2A rejected: metadata exceeds limit"
-            );
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(A2AResponse {
-                    task_id: req.task_id,
-                    status: "failed".to_string(),
-                    result: None,
-                    error: Some("metadata exceeds 64 KiB limit".to_string()),
-                }),
-            );
-        }
+    if let Ok(meta_bytes) = serde_json::to_vec(&req.metadata)
+        && meta_bytes.len() > A2A_MAX_METADATA_BYTES
+    {
+        tracing::warn!(
+            task_id = %req.task_id,
+            metadata_bytes = meta_bytes.len(),
+            "A2A rejected: metadata exceeds limit"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(A2AResponse {
+                task_id: req.task_id,
+                status: "failed".to_string(),
+                result: None,
+                error: Some("metadata exceeds 64 KiB limit".to_string()),
+            }),
+        );
     }
 
     let task_id = req.task_id.clone();

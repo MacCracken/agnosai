@@ -66,14 +66,12 @@ fn bench_publish_10_subscribers(c: &mut Criterion) {
 fn bench_publish_100_subscribers(c: &mut Criterion) {
     let ps = PubSub::new();
     let _rxs: Vec<_> = (0..100)
-        .map(|i| {
-            match i % 5 {
-                0 => ps.subscribe("task.completed"),
-                1 => ps.subscribe("task.*"),
-                2 => ps.subscribe("task.#"),
-                3 => ps.subscribe("agent.*"),
-                _ => ps.subscribe("#"),
-            }
+        .map(|i| match i % 5 {
+            0 => ps.subscribe("task.completed"),
+            1 => ps.subscribe("task.*"),
+            2 => ps.subscribe("task.#"),
+            3 => ps.subscribe("agent.*"),
+            _ => ps.subscribe("#"),
         })
         .collect();
 

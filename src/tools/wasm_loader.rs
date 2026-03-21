@@ -64,10 +64,7 @@ mod inner {
 
         let wasm_path = dir.join(format!("{}.wasm", pkg.name));
         let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
-            AgnosaiError::InvalidDefinition(format!(
-                "failed to read {}: {e}",
-                wasm_path.display()
-            ))
+            AgnosaiError::InvalidDefinition(format!("failed to read {}: {e}", wasm_path.display()))
         })?;
 
         let manifest = WasmToolManifest {

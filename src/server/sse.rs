@@ -66,6 +66,11 @@ impl EventBus {
         self.channels.len()
     }
 
+    /// Whether the event bus has no channels.
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+
     /// Remove channels with no active receivers (orphan cleanup).
     pub fn cleanup_orphans(&self) {
         self.channels

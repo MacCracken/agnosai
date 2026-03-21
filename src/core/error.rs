@@ -1,7 +1,6 @@
 use thiserror::Error;
 
 /// Alias for `Result<T, AgnosaiError>`.
-#[must_use]
 pub type Result<T> = std::result::Result<T, AgnosaiError>;
 
 /// Top-level error type for the AgnosAI framework.

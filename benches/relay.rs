@@ -14,7 +14,11 @@ fn bench_send(c: &mut Criterion) {
 
     c.bench_function("Relay::send throughput", |b| {
         b.iter(|| {
-            relay.send("node-b", "task.assigned", json!({"agent": "worker-1", "payload_kb": 4}));
+            relay.send(
+                "node-b",
+                "task.assigned",
+                json!({"agent": "worker-1", "payload_kb": 4}),
+            );
         });
     });
 }

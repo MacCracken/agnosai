@@ -16,8 +16,8 @@ use crate::core::agent::AgentDefinition;
 use crate::core::crew::{CrewSpec, CrewState, CrewStatus};
 use crate::core::task::{ProcessMode, Task, TaskId, TaskResult, TaskStatus};
 use crate::server::sse::CrewEvent;
-use tokio::sync::broadcast;
 use tokio::sync::Semaphore;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::orchestrator::scoring;

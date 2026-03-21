@@ -119,16 +119,13 @@ async fn write_frame(stream: &mut UnixStream, data: &[u8]) -> crate::core::Resul
 /// Read a length-prefixed frame: 4-byte big-endian u32 length, then payload.
 async fn read_frame(stream: &mut UnixStream) -> crate::core::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                crate::core::AgnosaiError::Ipc("peer disconnected (EOF on length read)".into())
-            } else {
-                crate::core::AgnosaiError::Ipc(format!("read length failed: {e}"))
-            }
-        })?;
+    stream.read_exact(&mut len_buf).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            crate::core::AgnosaiError::Ipc("peer disconnected (EOF on length read)".into())
+        } else {
+            crate::core::AgnosaiError::Ipc(format!("read length failed: {e}"))
+        }
+    })?;
     let len = u32::from_be_bytes(len_buf);
     if len == 0 {
         return Err(crate::core::AgnosaiError::Ipc(
@@ -141,18 +138,15 @@ async fn read_frame(stream: &mut UnixStream) -> crate::core::Result<Vec<u8>> {
         )));
     }
     let mut buf = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                crate::core::AgnosaiError::Ipc(format!(
-                    "peer disconnected mid-frame (expected {len} bytes)"
-                ))
-            } else {
-                crate::core::AgnosaiError::Ipc(format!("read payload failed: {e}"))
-            }
-        })?;
+    stream.read_exact(&mut buf).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            crate::core::AgnosaiError::Ipc(format!(
+                "peer disconnected mid-frame (expected {len} bytes)"
+            ))
+        } else {
+            crate::core::AgnosaiError::Ipc(format!("read payload failed: {e}"))
+        }
+    })?;
     Ok(buf)
 }
 

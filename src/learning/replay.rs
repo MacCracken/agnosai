@@ -36,16 +36,11 @@ impl ReplayBuffer {
     pub fn push(&mut self, exp: Experience) {
         if self.experiences.len() >= self.max_size {
             // Find the index of the lowest-priority experience.
-            if let Some((min_idx, min_exp)) = self
-                .experiences
-                .iter()
-                .enumerate()
-                .min_by(|a, b| {
-                    a.1.priority
-                        .partial_cmp(&b.1.priority)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
+            if let Some((min_idx, min_exp)) = self.experiences.iter().enumerate().min_by(|a, b| {
+                a.1.priority
+                    .partial_cmp(&b.1.priority)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
                 // Only evict if the new experience has higher priority.
                 if exp.priority > min_exp.priority {
                     self.experiences.swap_remove(min_idx);

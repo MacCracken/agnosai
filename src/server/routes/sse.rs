@@ -1,9 +1,7 @@
 //! SSE streaming endpoint for crew execution events.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
-use axum::response::IntoResponse;
 use futures::stream::Stream;
 use std::convert::Infallible;
 use uuid::Uuid;

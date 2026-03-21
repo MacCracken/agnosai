@@ -28,7 +28,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// JWT/auth configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct AuthConfig {
     /// Whether auth is enabled at all.
@@ -37,16 +37,6 @@ pub struct AuthConfig {
     pub secret: String,
     /// JWT configuration. When set, tokens are validated as RS256 JWTs.
     pub jwt: Option<JwtConfig>,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            secret: String::new(),
-            jwt: None,
-        }
-    }
 }
 
 impl AuthConfig {

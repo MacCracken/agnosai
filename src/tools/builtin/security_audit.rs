@@ -33,7 +33,8 @@ impl NativeTool for SecurityAuditTool {
                 },
                 ParameterSchema {
                     name: "scan_profile".to_owned(),
-                    description: "Scan depth: quick, standard, or deep (default: standard)".to_owned(),
+                    description: "Scan depth: quick, standard, or deep (default: standard)"
+                        .to_owned(),
                     param_type: "string".to_owned(),
                     required: false,
                 },
@@ -52,7 +53,7 @@ impl NativeTool for SecurityAuditTool {
 
             match run_security_audit(&target_url).await {
                 Ok(result) => ToolOutput::ok(serde_json::to_value(result).unwrap_or_default()),
-                Err(e) => ToolOutput::err(&format!("security audit failed: {e}")),
+                Err(e) => ToolOutput::err(format!("security audit failed: {e}")),
             }
         })
     }
@@ -156,10 +157,10 @@ async fn run_security_audit(target_url: &str) -> Result<AuditResult, String> {
     // Check information disclosure.
     let mut disclosure = Vec::new();
     for &h in DISCLOSURE_HEADERS {
-        if let Some(val) = headers.get(h) {
-            if let Ok(v) = val.to_str() {
-                disclosure.push(format!("{h}: {v}"));
-            }
+        if let Some(val) = headers.get(h)
+            && let Ok(v) = val.to_str()
+        {
+            disclosure.push(format!("{h}: {v}"));
         }
     }
 
@@ -186,7 +187,8 @@ async fn run_security_audit(target_url: &str) -> Result<AuditResult, String> {
             r#type: "cors_misconfiguration".to_string(),
             severity: "critical".to_string(),
             description: "CORS allows all origins with credentials".to_string(),
-            remediation: "Restrict Access-Control-Allow-Origin to specific trusted domains".to_string(),
+            remediation: "Restrict Access-Control-Allow-Origin to specific trusted domains"
+                .to_string(),
         });
     }
 
@@ -307,7 +309,12 @@ mod tests {
     #[test]
     fn security_audit_schema_has_target_url() {
         let schema = SecurityAuditTool.schema();
-        assert!(schema.parameters.iter().any(|p| p.name == "target_url" && p.required));
+        assert!(
+            schema
+                .parameters
+                .iter()
+                .any(|p| p.name == "target_url" && p.required)
+        );
     }
 
     #[tokio::test]

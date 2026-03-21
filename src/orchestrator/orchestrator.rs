@@ -54,11 +54,10 @@ impl Orchestrator {
     /// Submit and execute a crew, returning the final state.
     pub async fn run_crew(&self, spec: CrewSpec) -> Result<CrewState> {
         // Enforce concurrent crew limit.
-        let _permit = self
-            .crew_semaphore
-            .acquire()
-            .await
-            .map_err(|_| crate::core::AgnosaiError::Scheduling("crew semaphore closed".into()))?;
+        let _permit =
+            self.crew_semaphore.acquire().await.map_err(|_| {
+                crate::core::AgnosaiError::Scheduling("crew semaphore closed".into())
+            })?;
 
         let crew_id = spec.id;
         let crew_name = spec.name.clone();
@@ -77,7 +76,10 @@ impl Orchestrator {
                         CrewStatus::Completed | CrewStatus::Failed | CrewStatus::Cancelled
                     )
                 });
-                debug!(evicted = before - state.active_crews.len(), "evicted completed crews");
+                debug!(
+                    evicted = before - state.active_crews.len(),
+                    "evicted completed crews"
+                );
             }
             state.active_crews.push(CrewState {
                 crew_id,

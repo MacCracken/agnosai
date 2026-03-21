@@ -34,7 +34,9 @@ fn load_auth_config() -> AuthConfig {
         });
 
     if enabled && secret.is_empty() && jwt.is_none() {
-        tracing::warn!("Auth enabled but no secret or JWT key configured — all requests will be rejected");
+        tracing::warn!(
+            "Auth enabled but no secret or JWT key configured — all requests will be rejected"
+        );
     }
 
     if let Some(ref jwt_cfg) = jwt {

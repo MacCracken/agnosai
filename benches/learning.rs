@@ -65,6 +65,7 @@ fn make_explored_bandit(n: usize) -> (Ucb1, u32) {
     let rounds = (n * 10) as u32;
     for round in 0..rounds {
         let arm = round as usize % n;
+        #[allow(clippy::manual_is_multiple_of)]
         let reward = if arm % 3 == 0 { 0.8 } else { 0.3 };
         bandit.update(arm, reward);
     }
@@ -199,6 +200,7 @@ fn bench_profile_record(c: &mut Criterion) {
         b.iter(|| {
             let agent = format!("agent-{}", i % 20);
             let duration = Duration::from_millis(100 + i % 150);
+            #[allow(clippy::manual_is_multiple_of)]
             profile.record(&agent, "build", duration, i % 2 == 0);
             i += 1;
         });
