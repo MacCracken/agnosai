@@ -56,7 +56,6 @@ pub type GpuScheduler = ComputeScheduler;
 ///
 /// Prefer [`crate::core::resource::GpuDevice`] for serializable GPU state.
 /// This type exists for backward compatibility with fleet scheduling internals.
-#[deprecated(note = "Use crate::core::resource::GpuDevice instead")]
 #[derive(Debug, Clone)]
 pub struct GpuDevice {
     pub index: GpuId,

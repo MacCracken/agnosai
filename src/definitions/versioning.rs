@@ -7,9 +7,13 @@ use chrono::{DateTime, Utc};
 
 /// A single versioned snapshot of an agent definition.
 pub struct DefinitionVersion {
+    /// Auto-incrementing version number.
     pub version: u32,
+    /// The agent definition at this version.
     pub definition: AgentDefinition,
+    /// When this version was created.
     pub created_at: DateTime<Utc>,
+    /// Optional human-readable commit message.
     pub message: Option<String>,
 }
 
@@ -19,6 +23,7 @@ pub struct VersionStore {
 }
 
 impl VersionStore {
+    /// Create an empty version store.
     pub fn new() -> Self {
         Self {
             versions: HashMap::new(),

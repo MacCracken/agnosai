@@ -8,10 +8,6 @@ use agnosai::core::resource::{
 use agnosai::fleet::placement::{PlacementPolicy, PlacementRequest, place, rank_nodes};
 use agnosai::fleet::registry::NodeInfo;
 
-fn gpu_node(id: &str, vram: u64) -> NodeInfo {
-    NodeInfo::new(id, 1, vram)
-}
-
 fn cpu_node(id: &str) -> NodeInfo {
     NodeInfo::new(id, 0, 0)
 }

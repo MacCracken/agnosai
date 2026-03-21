@@ -13,8 +13,6 @@
 //! - **`hwaccel`** — Hardware accelerator detection via [`ai-hwaccel`](https://github.com/maccracken/ai-hwaccel).
 //! - **`full`** — Enables all of the above.
 
-#![warn(missing_docs)]
-
 pub mod core;
 pub mod learning;
 pub mod llm;
