@@ -84,6 +84,13 @@ pub struct CrewProfile {
     pub task_ms: HashMap<TaskId, u64>,
     /// Number of tasks that ran.
     pub task_count: usize,
+    /// Total estimated inference cost in USD.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cost_usd: f64,
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0 || !v.is_finite()
 }
 
 /// Lifecycle status of a crew execution.
@@ -203,5 +210,50 @@ mod tests {
         assert_eq!(restored.crew_id, state.crew_id);
         assert_eq!(restored.status, CrewStatus::Running);
         assert!(restored.results.is_empty());
+    }
+
+    #[test]
+    fn crew_profile_serde_with_cost() {
+        let profile = CrewProfile {
+            wall_ms: 1500,
+            task_ms: HashMap::new(),
+            task_count: 3,
+            cost_usd: 0.0025,
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(json.contains("cost_usd"));
+        let restored: CrewProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.wall_ms, 1500);
+        assert_eq!(restored.task_count, 3);
+        assert!((restored.cost_usd - 0.0025).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn crew_profile_skips_zero_cost() {
+        let profile = CrewProfile {
+            wall_ms: 100,
+            task_ms: HashMap::new(),
+            task_count: 1,
+            cost_usd: 0.0,
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(!json.contains("cost_usd"), "zero cost should be omitted");
+    }
+
+    #[test]
+    fn crew_profile_deserializes_missing_cost_as_zero() {
+        let json = r#"{"wall_ms":100,"task_ms":{},"task_count":1}"#;
+        let profile: CrewProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(profile.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn is_zero_handles_special_values() {
+        assert!(is_zero(&0.0));
+        assert!(is_zero(&f64::NAN));
+        assert!(is_zero(&f64::INFINITY));
+        assert!(is_zero(&f64::NEG_INFINITY));
+        assert!(!is_zero(&0.001));
+        assert!(!is_zero(&-0.001));
     }
 }

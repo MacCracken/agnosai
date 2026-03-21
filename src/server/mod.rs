@@ -59,10 +59,11 @@ pub fn router(state: SharedState) -> Router {
         }))
         .with_state(state.clone());
 
-    // Public routes: health probes are always accessible.
+    // Public routes: health probes and metrics are always accessible.
     Router::new()
         .route("/health", get(routes::health::health))
         .route("/ready", get(routes::health::ready))
+        .route("/metrics", get(routes::health::metrics))
         .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(tower::limit::ConcurrencyLimitLayer::new(

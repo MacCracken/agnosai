@@ -37,11 +37,22 @@ Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/re
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| Prometheus metrics export | High | Crew duration, throughput, error rate, GPU utilization |
-| OpenTelemetry tracing spans | High | Distributed tracing across crew execution |
-| Health monitoring & alerting | Medium | Agent health, provider latency, fleet node status |
+| Prometheus metrics export | High | Done — `/metrics` endpoint, hoosh metrics re-exported |
+| OpenTelemetry tracing spans | High | hoosh 0.21.5 has `otel` feature — wire into AgnosAI |
+| Health monitoring & alerting | Medium | Done — hoosh 0.21.5 has 3-strike health checker + majra heartbeat |
 | Multi-tenancy (crew isolation, resource quotas) | Medium | Per-tenant budget enforcement |
 | Dashboard API (crew history, agent performance) | Low | REST endpoints for operational dashboards |
+
+### Engineering Backlog (from hoosh 0.21.5)
+
+| Item | Priority | Notes |
+|------|----------|-------|
+| Cryptographic audit chain | Medium | HMAC-SHA256 tamper-proof inference event log via `hoosh::audit` |
+| Per-endpoint rate limiting | Low | Sliding-window RPM via `hoosh::middleware::rate_limit` |
+| Priority inference queue | Low | Batch/background inference via `hoosh::queue` + majra |
+| OpenTelemetry integration | Medium | OTLP trace export via hoosh's `otel` feature gate |
+| AgnosAI-specific Prometheus metrics | Medium | Crew execution counts, task durations, agent scoring histograms |
+| Hot-reload configuration | Low | `arc-swap` pattern for config changes without restart |
 
 ### Final Migration
 

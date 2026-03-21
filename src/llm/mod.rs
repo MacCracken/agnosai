@@ -1,8 +1,8 @@
 //! LLM inference via [hoosh](https://github.com/MacCracken/hoosh).
 //!
-//! All provider implementations, token budgeting, response caching, and
-//! streaming are provided by the `hoosh` crate. This module re-exports the
-//! key types and adds AgnosAI-specific task-complexity routing.
+//! All provider implementations, token budgeting, response caching, streaming,
+//! cost tracking, and metrics are provided by the `hoosh` crate. This module
+//! re-exports the key types and adds AgnosAI-specific task-complexity routing.
 
 pub mod router;
 
@@ -11,10 +11,12 @@ pub mod router;
 pub use hoosh::budget::{TokenBudget, TokenPool};
 pub use hoosh::cache::{CacheConfig, ResponseCache, cache_key};
 pub use hoosh::client::HooshClient;
+pub use hoosh::cost::{CostTracker, ModelPricing, ProviderCostRecord};
 pub use hoosh::error::HooshError;
 pub use hoosh::inference::{
     InferenceRequest, InferenceResponse, Message, ModelInfo, Role, TokenUsage,
 };
+pub use hoosh::metrics as llm_metrics;
 pub use hoosh::provider::{LlmProvider, ProviderType};
 
 // AgnosAI-specific task-complexity routing.

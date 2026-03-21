@@ -3,7 +3,7 @@ use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::core::{CrewSpec, CrewState, CrewStatus, ResourceBudget, Result};
-use crate::llm::{HooshClient, ResponseCache};
+use crate::llm::{CostTracker, HooshClient, ResponseCache};
 use crate::server::sse::EventBus;
 
 use crate::orchestrator::crew_runner::CrewRunner;
@@ -33,6 +33,8 @@ pub struct Orchestrator {
     llm_url: Option<String>,
     /// Shared inference response cache across all crew executions.
     cache: Arc<ResponseCache>,
+    /// Shared cost tracker for inference cost accounting.
+    cost_tracker: Arc<CostTracker>,
     /// Semaphore limiting concurrent crew executions.
     crew_semaphore: Arc<Semaphore>,
 }
@@ -53,6 +55,7 @@ impl Orchestrator {
             llm: OnceLock::new(),
             llm_url: None,
             cache: Arc::new(ResponseCache::new(Default::default())),
+            cost_tracker: Arc::new(CostTracker::new()),
             crew_semaphore: Arc::new(Semaphore::new(max_concurrent)),
         })
     }
@@ -130,7 +133,9 @@ impl Orchestrator {
         }
 
         // Delegate to CrewRunner for the actual lifecycle.
-        let mut runner = CrewRunner::new(spec).with_cache(Arc::clone(&self.cache));
+        let mut runner = CrewRunner::new(spec)
+            .with_cache(Arc::clone(&self.cache))
+            .with_cost_tracker(Arc::clone(&self.cost_tracker));
         if let Some(llm) = self.llm_client() {
             runner = runner.with_llm(Arc::clone(llm));
         }

@@ -11,6 +11,11 @@ pub async fn ready() -> Json<Value> {
     Json(json!({"status": "ready", "version": env!("CARGO_PKG_VERSION")}))
 }
 
+/// GET /metrics — Prometheus metrics endpoint.
+pub async fn metrics() -> String {
+    crate::llm::llm_metrics::gather()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +77,30 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ready");
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn get_metrics_returns_200_with_prometheus_format() {
+        let app = test_app().await;
+        let response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // Prometheus text format: lines are comments (# ...) or metric lines.
+        for line in text.lines() {
+            assert!(
+                line.starts_with('#') || line.contains(' ') || line.is_empty(),
+                "unexpected metrics format: {line}"
+            );
+        }
     }
 }

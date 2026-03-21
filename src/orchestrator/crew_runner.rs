@@ -17,7 +17,10 @@ use std::time::Instant;
 use crate::core::agent::AgentDefinition;
 use crate::core::crew::{CrewProfile, CrewSpec, CrewState, CrewStatus};
 use crate::core::task::{ProcessMode, Task, TaskId, TaskResult, TaskStatus};
-use crate::llm::{HooshClient, InferenceRequest, Message, ResponseCache, Role, cache_key};
+use crate::llm::{
+    CostTracker, HooshClient, InferenceRequest, Message, ProviderType, ResponseCache, Role,
+    cache_key,
+};
 use crate::server::sse::CrewEvent;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
@@ -33,6 +36,8 @@ pub struct CrewRunner {
     llm: Option<Arc<HooshClient>>,
     /// Shared response cache for inference results.
     cache: Arc<ResponseCache>,
+    /// Cost tracker for inference cost accounting.
+    cost_tracker: Arc<CostTracker>,
 }
 
 impl CrewRunner {
@@ -43,12 +48,19 @@ impl CrewRunner {
             event_tx: None,
             llm: None,
             cache: Arc::new(ResponseCache::new(Default::default())),
+            cost_tracker: Arc::new(CostTracker::new()),
         }
     }
 
     /// Attach a shared response cache.
     pub fn with_cache(mut self, cache: Arc<ResponseCache>) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// Attach a shared cost tracker.
+    pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
+        self.cost_tracker = tracker;
         self
     }
 
@@ -112,7 +124,7 @@ impl CrewRunner {
             CrewStatus::Failed
         };
 
-        // Build profile from per-task latency metadata.
+        // Build profile from per-task latency and cost metadata.
         let task_ms: HashMap<TaskId, u64> = results
             .iter()
             .filter_map(|r| {
@@ -122,10 +134,15 @@ impl CrewRunner {
                     .map(|ms| (r.task_id, ms))
             })
             .collect();
+        let cost_usd: f64 = results
+            .iter()
+            .filter_map(|r| r.metadata.get("cost_usd").and_then(|v| v.as_f64()))
+            .sum();
         let profile = CrewProfile {
             wall_ms,
             task_count: results.len(),
             task_ms,
+            cost_usd,
         };
 
         info!(
@@ -182,6 +199,8 @@ impl CrewRunner {
                 agent.as_ref(),
                 self.llm.as_ref(),
                 &self.cache,
+                &self.cost_tracker,
+                self.event_tx.as_ref(),
             )
             .await;
             self.spec.tasks[i].status = result.status;
@@ -242,6 +261,7 @@ impl CrewRunner {
             let permit = semaphore.clone();
             let llm = self.llm.clone();
             let cache = Arc::clone(&self.cache);
+            let cost_tracker = Arc::clone(&self.cost_tracker);
             join_set.spawn(async move {
                 let _permit = match permit.acquire().await {
                     Ok(p) => p,
@@ -254,7 +274,15 @@ impl CrewRunner {
                         };
                     }
                 };
-                execute_task(&task, agent.as_ref(), llm.as_ref(), &cache).await
+                execute_task(
+                    &task,
+                    agent.as_ref(),
+                    llm.as_ref(),
+                    &cache,
+                    &cost_tracker,
+                    None,
+                )
+                .await
             });
         }
 
@@ -352,9 +380,18 @@ impl CrewRunner {
                 let task_snap = self.spec.tasks[idx].clone();
                 let llm = self.llm.clone();
                 let cache = Arc::clone(&self.cache);
+                let cost_tracker = Arc::clone(&self.cost_tracker);
 
                 join_set.spawn(async move {
-                    execute_task(&task_snap, agent.as_ref(), llm.as_ref(), &cache).await
+                    execute_task(
+                        &task_snap,
+                        agent.as_ref(),
+                        llm.as_ref(),
+                        &cache,
+                        &cost_tracker,
+                        None,
+                    )
+                    .await
                 });
             }
 
@@ -403,12 +440,35 @@ fn pick_best_agent(agents: &[AgentDefinition], task: &Task) -> Option<AgentDefin
     ranked.first().map(|(a, _)| (*a).clone())
 }
 
+/// Infer the provider type from a model name for cost tracking.
+fn infer_provider(model: &str) -> ProviderType {
+    let m = model.to_lowercase();
+    if m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") {
+        ProviderType::OpenAi
+    } else if m.starts_with("claude") {
+        ProviderType::Anthropic
+    } else if m.starts_with("deepseek") {
+        ProviderType::DeepSeek
+    } else if m.starts_with("gemini") {
+        ProviderType::Google
+    } else if m.starts_with("grok") {
+        ProviderType::Grok
+    } else if m.starts_with("mistral") || m.starts_with("mixtral") {
+        ProviderType::Mistral
+    } else {
+        // Local models (llama, etc.) — free via Ollama.
+        ProviderType::Ollama
+    }
+}
+
 /// Execute a task via LLM inference, or fall back to placeholder if no client.
 async fn execute_task(
     task: &Task,
     agent: Option<&AgentDefinition>,
     llm: Option<&Arc<HooshClient>>,
     cache: &Arc<ResponseCache>,
+    cost_tracker: &Arc<CostTracker>,
+    event_tx: Option<&broadcast::Sender<CrewEvent>>,
 ) -> TaskResult {
     let task_start = Instant::now();
     let agent_label = agent.map(|a| a.agent_key.as_str()).unwrap_or("unassigned");
@@ -498,10 +558,51 @@ async fn execute_task(
         };
     }
 
+    // Primary path: non-streaming inference (gives full metadata).
+    // When an event sender is present, also attempt streaming for token-by-token
+    // SSE delivery, then fall back to the non-streaming response for metadata.
     match client.infer(&request).await {
         Ok(response) => {
             // Cache the successful response.
             cache.insert(ck, response.text.clone());
+
+            // If streaming was requested, replay via infer_stream for SSE token
+            // events. This is best-effort — the full response is already captured.
+            if let Some(tx) = event_tx {
+                if let Ok(mut rx) = client.infer_stream(&request).await {
+                    while let Some(chunk) = rx.recv().await {
+                        match chunk {
+                            Ok(token) => {
+                                let _ = tx.send(CrewEvent {
+                                    crew_id: task.id.to_string(),
+                                    event_type: "token".into(),
+                                    data: serde_json::json!({
+                                        "task_id": task.id.to_string(),
+                                        "token": token,
+                                    }),
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+
+            let task_duration_ms = task_start.elapsed().as_millis() as u64;
+            let provider = infer_provider(&response.model);
+
+            // Record cost using actual token counts from the response.
+            let cost_usd = cost_tracker.record(provider, "hoosh", &response.model, &response.usage);
+
+            // Record Prometheus metrics.
+            crate::llm::llm_metrics::record_request(
+                &provider.to_string(),
+                &response.model,
+                "success",
+                task_duration_ms as f64 / 1000.0,
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+            );
 
             let mut metadata = HashMap::new();
             metadata.insert(
@@ -521,7 +622,7 @@ async fn execute_task(
                     "total": response.usage.total_tokens,
                 }),
             );
-            let task_duration_ms = task_start.elapsed().as_millis() as u64;
+            metadata.insert("cost_usd".into(), serde_json::json!(cost_usd));
             metadata.insert(
                 "task_duration_ms".into(),
                 serde_json::json!(task_duration_ms),
@@ -534,6 +635,7 @@ async fn execute_task(
                 latency_ms = response.latency_ms,
                 task_duration_ms,
                 tokens = response.usage.total_tokens,
+                cost_usd,
                 "task completed via LLM"
             );
 
@@ -546,6 +648,16 @@ async fn execute_task(
         }
         Err(e) => {
             let task_duration_ms = task_start.elapsed().as_millis() as u64;
+
+            crate::llm::llm_metrics::record_request(
+                "hoosh",
+                &request.model,
+                "error",
+                task_duration_ms as f64 / 1000.0,
+                0,
+                0,
+            );
+
             warn!(
                 task_id = %task.id,
                 agent = agent_label,
@@ -1015,7 +1127,8 @@ mod tests {
         let task = test_task("do something");
         let agent = test_agent("a");
         let cache = Arc::new(ResponseCache::new(Default::default()));
-        let result = execute_task(&task, Some(&agent), None, &cache).await;
+        let cost_tracker = Arc::new(CostTracker::new());
+        let result = execute_task(&task, Some(&agent), None, &cache, &cost_tracker, None).await;
         assert_eq!(result.status, TaskStatus::Completed);
         assert_eq!(result.output, "do something");
     }
@@ -1044,5 +1157,107 @@ mod tests {
         assert!(types.contains(&"crew_completed"));
         assert_eq!(types.iter().filter(|&&t| t == "task_started").count(), 2);
         assert_eq!(types.iter().filter(|&&t| t == "task_completed").count(), 2);
+    }
+
+    // ── Provider inference ──────────────────────────────────────────────
+
+    #[test]
+    fn test_infer_provider_openai() {
+        assert_eq!(infer_provider("gpt-4o"), ProviderType::OpenAi);
+        assert_eq!(infer_provider("gpt-4o-mini"), ProviderType::OpenAi);
+        assert_eq!(infer_provider("o1"), ProviderType::OpenAi);
+        assert_eq!(infer_provider("o3-mini"), ProviderType::OpenAi);
+    }
+
+    #[test]
+    fn test_infer_provider_anthropic() {
+        assert_eq!(infer_provider("claude-sonnet-4"), ProviderType::Anthropic);
+        assert_eq!(
+            infer_provider("claude-sonnet-4-20250514"),
+            ProviderType::Anthropic
+        );
+        assert_eq!(infer_provider("claude-opus-4"), ProviderType::Anthropic);
+    }
+
+    #[test]
+    fn test_infer_provider_deepseek() {
+        assert_eq!(infer_provider("deepseek-chat"), ProviderType::DeepSeek);
+        assert_eq!(infer_provider("deepseek-coder"), ProviderType::DeepSeek);
+    }
+
+    #[test]
+    fn test_infer_provider_local_models() {
+        assert_eq!(infer_provider("llama3"), ProviderType::Ollama);
+        assert_eq!(infer_provider("llama3:70b"), ProviderType::Ollama);
+        assert_eq!(infer_provider("phi3"), ProviderType::Ollama);
+        assert_eq!(infer_provider("unknown-model"), ProviderType::Ollama);
+    }
+
+    #[test]
+    fn test_infer_provider_case_insensitive() {
+        assert_eq!(infer_provider("GPT-4o"), ProviderType::OpenAi);
+        assert_eq!(infer_provider("Claude-Opus-4"), ProviderType::Anthropic);
+        assert_eq!(infer_provider("DEEPSEEK-CHAT"), ProviderType::DeepSeek);
+    }
+
+    // ── Cost tracking in placeholder mode ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_execute_task_placeholder_has_duration() {
+        let task = test_task("check duration");
+        let agent = test_agent("a");
+        let cache = Arc::new(ResponseCache::new(Default::default()));
+        let cost_tracker = Arc::new(CostTracker::new());
+        let result = execute_task(&task, Some(&agent), None, &cache, &cost_tracker, None).await;
+        assert!(result.metadata.contains_key("task_duration_ms"));
+        // Placeholder mode should not record any cost.
+        assert!(cost_tracker.total_cost() == 0.0);
+    }
+
+    // ── CrewProfile cost aggregation ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_crew_profile_includes_cost() {
+        let tasks = vec![test_task("task a")];
+        let spec = test_spec(tasks, ProcessMode::Sequential);
+        let mut runner = CrewRunner::new(spec);
+        let state = runner.run().await.unwrap();
+        // Placeholder mode: cost should be 0.
+        let profile = state.profile.unwrap();
+        assert_eq!(profile.cost_usd, 0.0);
+        assert_eq!(profile.task_count, 1);
+        assert!(profile.wall_ms < 1000); // should be sub-millisecond
+    }
+
+    // ── Parallel execution tracks per-task durations ────────────────────
+
+    #[tokio::test]
+    async fn test_parallel_tasks_have_duration_metadata() {
+        let tasks = vec![test_task("par a"), test_task("par b"), test_task("par c")];
+        let spec = test_spec(tasks, ProcessMode::Parallel { max_concurrency: 3 });
+        let mut runner = CrewRunner::new(spec);
+        let state = runner.run().await.unwrap();
+        assert_eq!(state.status, CrewStatus::Completed);
+        let profile = state.profile.unwrap();
+        assert_eq!(profile.task_count, 3);
+        // All tasks should have duration metadata.
+        assert_eq!(profile.task_ms.len(), 3);
+    }
+
+    // ── DAG execution tracks per-task durations ─────────────────────────
+
+    #[tokio::test]
+    async fn test_dag_tasks_have_duration_metadata() {
+        let mut t1 = test_task("dag root");
+        let mut t2 = test_task("dag child");
+        t2.dependencies.push(t1.id);
+        let tasks = vec![t1, t2];
+        let spec = test_spec(tasks, ProcessMode::Dag);
+        let mut runner = CrewRunner::new(spec);
+        let state = runner.run().await.unwrap();
+        assert_eq!(state.status, CrewStatus::Completed);
+        let profile = state.profile.unwrap();
+        assert_eq!(profile.task_count, 2);
+        assert_eq!(profile.task_ms.len(), 2);
     }
 }
