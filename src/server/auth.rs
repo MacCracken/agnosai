@@ -124,8 +124,10 @@ pub struct Claims {
 
 /// Validate a JWT string against the given config. Returns parsed claims on success.
 fn validate_jwt(token: &str, config: &JwtConfig) -> Result<TokenData<Claims>, StatusCode> {
-    let key = DecodingKey::from_rsa_pem(config.public_key_pem.as_bytes())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let key = DecodingKey::from_rsa_pem(config.public_key_pem.as_bytes()).map_err(|e| {
+        tracing::error!(error = %e, "JWT public key PEM is invalid — check AGNOSAI_JWT_PUBLIC_KEY");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let mut validation = Validation::new(Algorithm::RS256);
     validation.validate_exp = true;
@@ -140,8 +142,10 @@ fn validate_jwt(token: &str, config: &JwtConfig) -> Result<TokenData<Claims>, St
         validation.validate_aud = false;
     }
 
-    let token_data =
-        jsonwebtoken::decode::<Claims>(token, &key, &validation).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let token_data = jsonwebtoken::decode::<Claims>(token, &key, &validation).map_err(|e| {
+        tracing::warn!(error = %e, "JWT validation failed");
+        StatusCode::UNAUTHORIZED
+    })?;
 
     // Defense-in-depth: reject tokens without an explicit expiration claim.
     if token_data.claims.exp.is_none() {
@@ -174,11 +178,15 @@ pub async fn auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let t = &header["Bearer ".len()..];
             if t.is_empty() {
+                tracing::warn!("auth rejected: empty bearer token");
                 return Err(StatusCode::UNAUTHORIZED);
             }
             t
         }
-        _ => return Err(StatusCode::UNAUTHORIZED),
+        _ => {
+            tracing::warn!("auth rejected: missing or malformed authorization header");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
     };
 
     if let Some(ref jwt_config) = config.jwt {
@@ -187,6 +195,7 @@ pub async fn auth_middleware(
     } else {
         // Shared-secret fallback with constant-time comparison.
         if !constant_time_eq(token.as_bytes(), config.secret.as_bytes()) {
+            tracing::warn!("auth rejected: invalid shared secret");
             return Err(StatusCode::UNAUTHORIZED);
         }
     }

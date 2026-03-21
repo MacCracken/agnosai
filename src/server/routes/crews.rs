@@ -84,9 +84,41 @@ fn validate_crew_request(req: &CrewRunRequest) -> Result<(), String> {
             if dep >= req.tasks.len() {
                 return Err(format!("task {i}: dependency index {dep} out of range"));
             }
+            if dep == i {
+                return Err(format!("task {i}: self-dependency"));
+            }
         }
     }
+    // Simple cycle detection via DFS on index-based graph.
+    if has_dependency_cycle(req.tasks.len(), &req.tasks) {
+        return Err("task dependencies contain a cycle".into());
+    }
     Ok(())
+}
+
+/// DFS-based cycle detection on index-based task dependencies.
+fn has_dependency_cycle(n: usize, tasks: &[TaskRequest]) -> bool {
+    // 0 = unvisited, 1 = in-progress, 2 = done
+    let mut state = vec![0u8; n];
+
+    fn visit(node: usize, tasks: &[TaskRequest], state: &mut [u8]) -> bool {
+        if state[node] == 1 {
+            return true; // cycle
+        }
+        if state[node] == 2 {
+            return false;
+        }
+        state[node] = 1;
+        for &dep in &tasks[node].dependencies {
+            if dep < tasks.len() && visit(dep, tasks, state) {
+                return true;
+            }
+        }
+        state[node] = 2;
+        false
+    }
+
+    (0..n).any(|i| visit(i, tasks, &mut state))
 }
 
 pub async fn create_crew(
@@ -94,6 +126,7 @@ pub async fn create_crew(
     Json(req): Json<CrewRunRequest>,
 ) -> Result<Json<CrewRunResponse>, (StatusCode, Json<serde_json::Value>)> {
     if let Err(msg) = validate_crew_request(&req) {
+        tracing::warn!(crew = %req.name, error = %msg, "crew request validation failed");
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": msg})),
@@ -111,6 +144,7 @@ pub async fn create_crew(
         _ => ProcessMode::Sequential,
     };
 
+    let crew_name = req.name.clone();
     let mut spec = CrewSpec::new(req.name);
     spec.agents = req.agents;
     spec.process = process;
@@ -165,10 +199,13 @@ pub async fn create_crew(
                 results,
             }))
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )),
+        Err(e) => {
+            tracing::error!(error = %e, crew = %crew_name, "crew execution failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "crew execution failed"})),
+            ))
+        }
     }
 }
 
@@ -200,6 +237,7 @@ mod tests {
             tools,
             auth: Default::default(),
             events: crate::server::sse::EventBus::new(),
+            http_client: reqwest::Client::new(),
         });
         crate::server::router(state)
     }

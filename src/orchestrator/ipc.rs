@@ -122,7 +122,13 @@ async fn read_frame(stream: &mut UnixStream) -> crate::core::Result<Vec<u8>> {
     stream
         .read_exact(&mut len_buf)
         .await
-        .map_err(|e| crate::core::AgnosaiError::Ipc(format!("read length failed: {e}")))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                crate::core::AgnosaiError::Ipc("peer disconnected (EOF on length read)".into())
+            } else {
+                crate::core::AgnosaiError::Ipc(format!("read length failed: {e}"))
+            }
+        })?;
     let len = u32::from_be_bytes(len_buf);
     if len == 0 {
         return Err(crate::core::AgnosaiError::Ipc(
@@ -138,7 +144,15 @@ async fn read_frame(stream: &mut UnixStream) -> crate::core::Result<Vec<u8>> {
     stream
         .read_exact(&mut buf)
         .await
-        .map_err(|e| crate::core::AgnosaiError::Ipc(format!("read payload failed: {e}")))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                crate::core::AgnosaiError::Ipc(format!(
+                    "peer disconnected mid-frame (expected {len} bytes)"
+                ))
+            } else {
+                crate::core::AgnosaiError::Ipc(format!("read payload failed: {e}"))
+            }
+        })?;
     Ok(buf)
 }
 

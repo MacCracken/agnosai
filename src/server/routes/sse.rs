@@ -1,7 +1,9 @@
 //! SSE streaming endpoint for crew execution events.
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
 use futures::stream::Stream;
 use std::convert::Infallible;
 use uuid::Uuid;
@@ -12,7 +14,8 @@ use crate::server::state::SharedState;
 /// GET /api/v1/crews/:id/stream — SSE stream for crew events.
 ///
 /// Subscribes to the event bus for the given crew ID and streams events
-/// as they are emitted by the crew runner.
+/// as they are emitted by the crew runner. Handles lagged receivers by
+/// notifying the client and closing the stream.
 pub async fn crew_stream(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -29,14 +32,38 @@ pub async fn crew_stream(
             event_type: "connected".to_string(),
             data: serde_json::json!({"message": "SSE stream connected"}),
         };
-        let data = serde_json::to_string(&connected).unwrap_or_default();
+        let data = serde_json::to_string(&connected).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "SSE: failed to serialize connected event");
+            r#"{"event_type":"connected"}"#.to_string()
+        });
         yield Ok(Event::default().event("connected").data(data));
 
         // Forward real crew events from the broadcast channel.
         let mut event_rx = rx;
-        while let Ok(event) = event_rx.recv().await {
-            let data = serde_json::to_string(&event).unwrap_or_default();
-            yield Ok(Event::default().event(event.event_type.clone()).data(data));
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    let data = serde_json::to_string(&event).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            event_type = %event.event_type,
+                            "SSE: failed to serialize event"
+                        );
+                        format!(r#"{{"event_type":"{}","error":"serialization failed"}}"#, event.event_type)
+                    });
+                    yield Ok(Event::default().event(event.event_type.clone()).data(data));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(crew_id = %crew_id, dropped = n, "SSE: client lagged, closing stream");
+                    let err_data = serde_json::json!({
+                        "event_type": "error",
+                        "message": format!("stream lagged, {n} events dropped"),
+                    });
+                    yield Ok(Event::default().event("error").data(err_data.to_string()));
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     };
 
@@ -66,6 +93,7 @@ mod tests {
             tools,
             auth: Default::default(),
             events: EventBus::new(),
+            http_client: reqwest::Client::new(),
         });
         crate::server::router(state)
     }

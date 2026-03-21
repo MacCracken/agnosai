@@ -13,7 +13,7 @@ use crate::server::state::SharedState;
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct JsonRpcRequest {
-    #[allow(dead_code)]
+    /// JSON-RPC version (must be "2.0").
     pub jsonrpc: String,
     pub id: Value,
     pub method: String,
@@ -65,11 +65,15 @@ pub async fn mcp_handler(
     State(state): State<SharedState>,
     Json(req): Json<JsonRpcRequest>,
 ) -> Json<JsonRpcResponse> {
+    tracing::debug!(method = %req.method, "MCP request");
     Json(match req.method.as_str() {
         "initialize" => handle_initialize(req.id),
         "tools/list" => handle_tools_list(req.id, &state),
         "tools/call" => handle_tools_call(req.id, &req.params, &state).await,
-        _ => JsonRpcResponse::error(req.id, -32601, "Method not found"),
+        _ => {
+            tracing::warn!(method = %req.method, "MCP unknown method");
+            JsonRpcResponse::error(req.id, -32601, "Method not found")
+        }
     })
 }
 
@@ -155,7 +159,16 @@ async fn handle_tools_call(id: Value, params: &Value, state: &SharedState) -> Js
     };
 
     let input = ToolInput { parameters };
+    let start = std::time::Instant::now();
     let output = tool.execute(input).await;
+    let elapsed = start.elapsed();
+
+    tracing::info!(
+        tool = name,
+        success = output.success,
+        duration_ms = elapsed.as_millis() as u64,
+        "MCP tool call"
+    );
 
     if output.success {
         let text = match output.result {
@@ -202,6 +215,7 @@ mod tests {
             tools,
             auth: Default::default(),
             events: crate::server::sse::EventBus::new(),
+            http_client: reqwest::Client::new(),
         });
         crate::server::router(state)
     }

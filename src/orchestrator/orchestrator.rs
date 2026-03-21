@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
+use tracing::{debug, info, warn};
 
 use crate::core::{CrewSpec, CrewState, CrewStatus, ResourceBudget, Result};
 use crate::server::sse::EventBus;
@@ -54,17 +55,23 @@ impl Orchestrator {
             .map_err(|_| crate::core::AgnosaiError::Scheduling("crew semaphore closed".into()))?;
 
         let crew_id = spec.id;
+        let crew_name = spec.name.clone();
+        let task_count = spec.tasks.len();
+
+        info!(crew_id = %crew_id, name = %crew_name, tasks = task_count, "crew accepted");
 
         // Register as pending, evicting oldest completed crews if at capacity.
         {
             let mut state = self.state.write().await;
             if state.active_crews.len() >= MAX_RETAINED_CREWS {
+                let before = state.active_crews.len();
                 state.active_crews.retain(|c| {
                     !matches!(
                         c.status,
                         CrewStatus::Completed | CrewStatus::Failed | CrewStatus::Cancelled
                     )
                 });
+                debug!(evicted = before - state.active_crews.len(), "evicted completed crews");
             }
             state.active_crews.push(CrewState {
                 crew_id,
@@ -79,6 +86,13 @@ impl Orchestrator {
             runner = runner.with_events(events.sender(crew_id));
         }
         let crew_state = runner.run().await?;
+
+        info!(
+            crew_id = %crew_id,
+            status = ?crew_state.status,
+            results = crew_state.results.len(),
+            "crew finished"
+        );
 
         // Update stored state.
         {
@@ -100,8 +114,10 @@ impl Orchestrator {
         let mut state = self.state.write().await;
         if let Some(crew) = state.active_crews.iter_mut().find(|c| c.crew_id == crew_id) {
             crew.status = CrewStatus::Cancelled;
+            info!(crew_id = %crew_id, "crew cancelled");
             Ok(())
         } else {
+            warn!(crew_id = %crew_id, "cancel failed: crew not found");
             Err(crate::core::AgnosaiError::CrewNotFound(crew_id.to_string()))
         }
     }

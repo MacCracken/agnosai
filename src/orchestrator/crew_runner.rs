@@ -76,7 +76,7 @@ impl CrewRunner {
             ProcessMode::Dag => self.run_dag().await?,
             ProcessMode::Hierarchical { .. } => {
                 // Phase 2: manager delegation. For now, fall back to sequential.
-                debug!("hierarchical mode not yet implemented, falling back to sequential");
+                warn!("hierarchical mode not yet implemented, falling back to sequential");
                 self.run_sequential().await?
             }
         };
@@ -217,7 +217,7 @@ impl CrewRunner {
                     results.push(task_result);
                 }
                 Err(e) => {
-                    warn!("task join error: {e}");
+                    warn!(error = %e, "task join error");
                 }
             }
         }
@@ -316,7 +316,7 @@ impl CrewRunner {
                         results.push(tr);
                     }
                     Err(e) => {
-                        warn!("DAG task join error: {e}");
+                        warn!(error = %e, "DAG task join error");
                     }
                 }
             }

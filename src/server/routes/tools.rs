@@ -30,6 +30,7 @@ mod tests {
             tools,
             auth: Default::default(),
             events: crate::server::sse::EventBus::new(),
+            http_client: reqwest::Client::new(),
         });
         crate::server::router(state)
     }

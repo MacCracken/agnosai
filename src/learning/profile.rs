@@ -75,7 +75,8 @@ impl PerformanceProfile {
             return None;
         }
         let total: Duration = records.iter().map(|r| r.duration).sum();
-        Some(total / records.len() as u32)
+        let count = u32::try_from(records.len()).unwrap_or(u32::MAX);
+        Some(total / count)
     }
 
     /// Average duration for a specific action type.
@@ -89,7 +90,8 @@ impl PerformanceProfile {
             return None;
         }
         let total: Duration = filtered.iter().map(|r| r.duration).sum();
-        Some(total / filtered.len() as u32)
+        let count = u32::try_from(filtered.len()).unwrap_or(u32::MAX);
+        Some(total / count)
     }
 
     /// Total number of recorded actions for the agent.

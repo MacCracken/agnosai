@@ -12,3 +12,9 @@ pub mod load_testing;
 pub mod mneme;
 pub mod security_audit;
 pub mod synapse;
+
+// Convenience re-exports.
+pub use echo::EchoTool;
+pub use json_transform::JsonTransformTool;
+pub use load_testing::LoadTestingTool;
+pub use security_audit::SecurityAuditTool;

@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.register(Arc::new(JsonTransformTool));
     tools.register(Arc::new(LoadTestingTool));
     tools.register(Arc::new(SecurityAuditTool));
+    tracing::info!(tools = tools.count(), "tools registered");
 
     let auth = load_auth_config();
     if auth.enabled {
@@ -78,11 +79,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("authentication disabled — set AGNOSAI_AUTH_ENABLED=true for production");
     }
 
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .build()
+        .expect("failed to build HTTP client");
+
     let state: SharedState = Arc::new(AppState {
         orchestrator,
         tools,
         auth,
         events,
+        http_client,
     });
 
     let app = router(state);

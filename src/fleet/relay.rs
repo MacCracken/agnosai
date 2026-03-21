@@ -142,8 +142,10 @@ impl Relay {
 
         // Dedup by sequence number.
         let mut seen = self.seen.lock().unwrap_or_else(|e| {
-            warn!("relay seen-map mutex was poisoned, recovering");
-            e.into_inner()
+            warn!("relay seen-map mutex was poisoned, resetting");
+            let mut inner = e.into_inner();
+            inner.clear(); // Reset to safe empty state rather than using corrupted data.
+            inner
         });
         let last_seen = seen.entry(msg.from.clone()).or_insert(0);
         if msg.seq <= *last_seen {

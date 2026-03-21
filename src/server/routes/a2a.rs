@@ -99,6 +99,10 @@ pub async fn receive(
 ) -> (StatusCode, Json<A2AResponse>) {
     // Validate field lengths.
     if req.task_id.len() > A2A_MAX_STRING_LEN || req.description.len() > A2A_MAX_STRING_LEN {
+        tracing::warn!(
+            task_id = %req.task_id.chars().take(100).collect::<String>(),
+            "A2A rejected: field exceeds max length"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(A2AResponse {
@@ -111,6 +115,11 @@ pub async fn receive(
     }
     if let Ok(meta_bytes) = serde_json::to_vec(&req.metadata) {
         if meta_bytes.len() > A2A_MAX_METADATA_BYTES {
+            tracing::warn!(
+                task_id = %req.task_id,
+                metadata_bytes = meta_bytes.len(),
+                "A2A rejected: metadata exceeds limit"
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(A2AResponse {
@@ -159,13 +168,10 @@ pub async fn receive(
             if let Some(url) = req.callback_url {
                 if is_safe_callback_url(&url) {
                     let resp_clone = response.clone();
+                    let client = state.http_client.clone();
                     tokio::spawn(async move {
-                        let client = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(30))
-                            .build()
-                            .unwrap_or_default();
                         if let Err(e) = client.post(&url).json(&resp_clone).send().await {
-                            tracing::warn!(task_id = %task_id, url = %url, "A2A callback failed: {e}");
+                            tracing::warn!(task_id = %task_id, url = %url, error = %e, "A2A callback failed");
                         }
                     });
                 } else {
@@ -210,6 +216,7 @@ mod tests {
             tools,
             auth: Default::default(),
             events: crate::server::sse::EventBus::new(),
+            http_client: reqwest::Client::new(),
         });
         crate::server::router(state)
     }

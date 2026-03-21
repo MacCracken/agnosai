@@ -26,6 +26,7 @@ pub struct Task {
 }
 
 impl Task {
+    /// Create a new task with a description.
     pub fn new(description: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -37,6 +38,30 @@ impl Task {
             dependencies: Vec::new(),
             context: HashMap::new(),
         }
+    }
+
+    /// Set the expected output.
+    pub fn with_expected_output(mut self, output: impl Into<String>) -> Self {
+        self.expected_output = Some(output.into());
+        self
+    }
+
+    /// Set the task priority.
+    pub fn with_priority(mut self, priority: TaskPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Add a dependency on another task.
+    pub fn with_dependency(mut self, dep: TaskId) -> Self {
+        self.dependencies.push(dep);
+        self
+    }
+
+    /// Add a context key-value pair.
+    pub fn with_context(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.context.insert(key.into(), value);
+        self
     }
 }
 
@@ -175,7 +200,7 @@ mod tests {
         let restored: ProcessMode = serde_json::from_str(&json).unwrap();
         match restored {
             ProcessMode::Hierarchical { manager } => assert_eq!(manager, manager_id),
-            _ => panic!("expected Hierarchical"),
+            other => panic!("expected Hierarchical, got {other:?}"),
         }
     }
 
