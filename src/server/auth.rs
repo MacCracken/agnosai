@@ -11,6 +11,17 @@ use axum::response::Response;
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation};
 use serde::{Deserialize, Serialize};
 
+/// Constant-time byte comparison to prevent timing attacks on secret comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 /// JWT/auth configuration.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -33,6 +44,26 @@ impl Default for AuthConfig {
     }
 }
 
+impl AuthConfig {
+    /// Create an auth config with a shared secret.
+    pub fn with_secret(secret: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            secret: secret.into(),
+            jwt: None,
+        }
+    }
+
+    /// Create an auth config with JWT validation.
+    pub fn with_jwt(jwt: JwtConfig) -> Self {
+        Self {
+            enabled: true,
+            secret: String::new(),
+            jwt: Some(jwt),
+        }
+    }
+}
+
 /// RS256 JWT validation configuration.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -43,6 +74,29 @@ pub struct JwtConfig {
     pub issuer: Option<String>,
     /// Expected `aud` claim. If set, tokens without a matching audience are rejected.
     pub audience: Option<String>,
+}
+
+impl JwtConfig {
+    /// Create a JWT config with just the public key.
+    pub fn new(public_key_pem: impl Into<String>) -> Self {
+        Self {
+            public_key_pem: public_key_pem.into(),
+            issuer: None,
+            audience: None,
+        }
+    }
+
+    /// Set the expected issuer.
+    pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.issuer = Some(issuer.into());
+        self
+    }
+
+    /// Set the expected audience.
+    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = Some(audience.into());
+        self
+    }
 }
 
 /// Standard JWT claims we validate.
@@ -118,8 +172,8 @@ pub async fn auth_middleware(
         // RS256 JWT validation path.
         validate_jwt(token, jwt_config)?;
     } else {
-        // Shared-secret fallback.
-        if token != config.secret {
+        // Shared-secret fallback with constant-time comparison.
+        if !constant_time_eq(token.as_bytes(), config.secret.as_bytes()) {
             return Err(StatusCode::UNAUTHORIZED);
         }
     }

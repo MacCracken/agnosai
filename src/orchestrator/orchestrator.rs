@@ -1,11 +1,14 @@
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::core::{CrewSpec, CrewState, CrewStatus, ResourceBudget, Result};
 use crate::server::sse::EventBus;
 
 use crate::orchestrator::crew_runner::CrewRunner;
 use crate::orchestrator::scheduler::Scheduler;
+
+/// Maximum number of completed crews retained in memory.
+const MAX_RETAINED_CREWS: usize = 1000;
 
 pub struct OrchestratorState {
     pub scheduler: Scheduler,
@@ -16,10 +19,13 @@ pub struct Orchestrator {
     state: Arc<RwLock<OrchestratorState>>,
     budget: ResourceBudget,
     events: Option<EventBus>,
+    /// Semaphore limiting concurrent crew executions.
+    crew_semaphore: Arc<Semaphore>,
 }
 
 impl Orchestrator {
     pub async fn new(budget: ResourceBudget) -> Result<Self> {
+        let max_concurrent = budget.max_concurrent_tasks.unwrap_or(10);
         let state = OrchestratorState {
             scheduler: Scheduler::new(),
             active_crews: Vec::new(),
@@ -29,6 +35,7 @@ impl Orchestrator {
             state: Arc::new(RwLock::new(state)),
             budget,
             events: None,
+            crew_semaphore: Arc::new(Semaphore::new(max_concurrent)),
         })
     }
 
@@ -39,11 +46,26 @@ impl Orchestrator {
     }
 
     pub async fn run_crew(&self, spec: CrewSpec) -> Result<CrewState> {
+        // Enforce concurrent crew limit.
+        let _permit = self
+            .crew_semaphore
+            .acquire()
+            .await
+            .map_err(|_| crate::core::AgnosaiError::Scheduling("crew semaphore closed".into()))?;
+
         let crew_id = spec.id;
 
-        // Register as pending.
+        // Register as pending, evicting oldest completed crews if at capacity.
         {
             let mut state = self.state.write().await;
+            if state.active_crews.len() >= MAX_RETAINED_CREWS {
+                state.active_crews.retain(|c| {
+                    !matches!(
+                        c.status,
+                        CrewStatus::Completed | CrewStatus::Failed | CrewStatus::Cancelled
+                    )
+                });
+            }
             state.active_crews.push(CrewState {
                 crew_id,
                 status: CrewStatus::Pending,

@@ -128,7 +128,10 @@ pub async fn receive(
                 if is_safe_callback_url(&url) {
                     let resp_clone = response.clone();
                     tokio::spawn(async move {
-                        let client = reqwest::Client::new();
+                        let client = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(30))
+                            .build()
+                            .unwrap_or_default();
                         if let Err(e) = client.post(&url).json(&resp_clone).send().await {
                             tracing::warn!(task_id = %task_id, url = %url, "A2A callback failed: {e}");
                         }

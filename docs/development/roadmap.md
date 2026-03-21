@@ -93,6 +93,23 @@ Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/re
 | Multi-tenancy (crew isolation, resource quotas) | Medium | Per-tenant budget enforcement |
 | Dashboard API (crew history, agent performance) | Low | REST endpoints for operational dashboards |
 
+### Engineering Backlog
+
+| Item | Severity | Notes |
+|------|----------|-------|
+| Split `core/resource.rs` (978 lines) into focused modules | Medium | accelerator.rs, device.rs, budget.rs, training.rs |
+| Handle broadcast lagging in SSE stream | Medium | Log + notify client on `RecvError::Lagged` |
+| DNS rebinding protection for A2A callbacks | Medium | Resolve-once + validate before connect |
+| Request rate limiting per client IP | Medium | Middleware layer, token bucket or sliding window |
+| Crew execution timeout | Medium | Configurable max wall-clock per crew |
+| Shared `reqwest::Client` for A2A callbacks | Medium | Pass via AppState instead of creating per-callback |
+| Add re-exports to `tools::builtin` module | Low | Convenience `pub use echo::EchoTool` etc. |
+| Public API re-exports in `lib.rs` | Low | Common types at crate root for ergonomics |
+| Resolve `orchestrator/orchestrator.rs` module inception | Low | Rename inner file to avoid `#[allow(clippy::module_inception)]` |
+| Per-IP rate limiter for crew creation | Low | Tower middleware |
+| EventBus LRU eviction for orphaned channels | Low | Prevent leak on orchestrator panic/crash |
+| `ResourceBudget` enforcement in orchestrator | Low | Check `max_tokens`, `max_cost_usd` during execution |
+
 ### Final Migration
 
 | Item | Priority |
