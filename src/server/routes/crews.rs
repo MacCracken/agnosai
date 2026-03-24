@@ -40,6 +40,9 @@ pub struct CrewRunRequest {
     /// Optional process mode string (`"sequential"`, `"parallel"`, `"dag"`, `"hierarchical"`).
     #[serde(default)]
     pub process: Option<String>,
+    /// Maximum concurrency for parallel mode (default: 4, max: 64).
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
 }
 
 /// Response body returned after a crew run completes.
@@ -160,7 +163,9 @@ pub async fn create_crew(
             }
         }
         Some("dag") => ProcessMode::Dag,
-        Some("parallel") => ProcessMode::Parallel { max_concurrency: 4 },
+        Some("parallel") => ProcessMode::Parallel {
+            max_concurrency: req.max_concurrency.unwrap_or(4).clamp(1, 64),
+        },
         _ => ProcessMode::Sequential,
     };
 
@@ -361,6 +366,7 @@ mod tests {
             agents: vec![make_agent()],
             tasks: vec![make_task("do stuff")],
             process: None,
+            max_concurrency: None,
         };
         let err = super::validate_crew_request(&req).unwrap_err();
         assert!(err.contains("name"));
@@ -373,6 +379,7 @@ mod tests {
             agents: vec![make_agent()],
             tasks: vec![],
             process: None,
+            max_concurrency: None,
         };
         let err = super::validate_crew_request(&req).unwrap_err();
         assert!(err.contains("task"));
@@ -385,6 +392,7 @@ mod tests {
             agents: vec![make_agent()],
             tasks: vec![make_task_with_deps("task0", vec![0])],
             process: None,
+            max_concurrency: None,
         };
         let err = super::validate_crew_request(&req).unwrap_err();
         assert!(err.contains("self-dependency"));
@@ -397,6 +405,7 @@ mod tests {
             agents: vec![make_agent()],
             tasks: vec![make_task("task0"), make_task_with_deps("task1", vec![99])],
             process: None,
+            max_concurrency: None,
         };
         let err = super::validate_crew_request(&req).unwrap_err();
         assert!(err.contains("out of range"));
@@ -412,6 +421,7 @@ mod tests {
                 make_task_with_deps("task1", vec![0]),
             ],
             process: None,
+            max_concurrency: None,
         };
         let err = super::validate_crew_request(&req).unwrap_err();
         assert!(err.contains("cycle"));
@@ -428,6 +438,7 @@ mod tests {
                 make_task_with_deps("task2", vec![0, 1]),
             ],
             process: None,
+            max_concurrency: None,
         };
         assert!(super::validate_crew_request(&req).is_ok());
     }

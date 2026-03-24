@@ -65,16 +65,14 @@ impl SandboxManager {
         Self { config }
     }
 
-    /// Execute a command in the sandbox backend determined by `policy`.
+    /// Execute a program with explicit arguments in the sandbox backend.
     ///
-    /// - `IsolationLevel::None` — returns the input as output (passthrough).
-    /// - `IsolationLevel::Wasm` — caller should use `WasmSandbox` directly.
-    /// - `IsolationLevel::Process` — runs via subprocess sandbox.
-    /// - `IsolationLevel::Oci` — runs via OCI container sandbox.
-    pub async fn execute(
+    /// This is the safe API — no shell interpretation of the arguments.
+    /// For `IsolationLevel::Wasm`, use `WasmSandbox` directly.
+    pub async fn execute_argv(
         &self,
         policy: &SandboxPolicy,
-        command: &str,
+        argv: &[&str],
         input: &str,
     ) -> crate::core::Result<SandboxResult> {
         let level = policy.effective_isolation();
@@ -84,31 +82,23 @@ impl SandboxManager {
             self.config.default_timeout
         };
 
-        debug!(?level, command, "sandbox manager dispatching");
+        debug!(?level, ?argv, "sandbox manager dispatching (argv)");
 
         match level {
-            IsolationLevel::None => {
-                // Native tools don't need sandboxing. Return a passthrough result.
-                Ok(SandboxResult {
-                    stdout: input.to_owned(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                    timed_out: false,
-                    backend: IsolationLevel::None,
-                })
-            }
-            IsolationLevel::Wasm => {
-                // WASM execution requires a compiled module, not a shell command.
-                // The caller should use WasmSandbox directly for WASM tools.
-                Err(AgnosaiError::Sandbox(
-                    "WASM tools must be executed via WasmSandbox directly with a compiled module"
-                        .into(),
-                ))
-            }
+            IsolationLevel::None => Ok(SandboxResult {
+                stdout: input.to_owned(),
+                stderr: String::new(),
+                exit_code: 0,
+                timed_out: false,
+                backend: IsolationLevel::None,
+            }),
+            IsolationLevel::Wasm => Err(AgnosaiError::Sandbox(
+                "WASM tools must be executed via WasmSandbox directly with a compiled module"
+                    .into(),
+            )),
             IsolationLevel::Process => {
                 let sandbox = ProcessSandbox::shell(timeout);
-                // Use execute_argv to avoid shell injection from untrusted commands.
-                let result = sandbox.execute_argv(&["sh", "-c", command], input).await?;
+                let result = sandbox.execute_argv(argv, input).await?;
                 Ok(SandboxResult {
                     stdout: result.stdout,
                     stderr: result.stderr,
@@ -128,7 +118,7 @@ impl SandboxManager {
                     volumes: Vec::new(),
                 };
                 let sandbox = OciSandbox::new(oci_config)?;
-                let result = sandbox.execute(&["sh", "-c", command], input).await?;
+                let result = sandbox.execute(argv, input).await?;
                 Ok(SandboxResult {
                     stdout: result.stdout,
                     stderr: result.stderr,
@@ -189,7 +179,7 @@ mod tests {
         let mgr = SandboxManager::default();
         let policy = SandboxPolicy::native();
         let result = mgr
-            .execute(&policy, "", "test input")
+            .execute_argv(&policy, &["true"], "test input")
             .await
             .expect("native should succeed");
         assert_eq!(result.backend, IsolationLevel::None);
@@ -201,7 +191,7 @@ mod tests {
     async fn execute_wasm_returns_error() {
         let mgr = SandboxManager::default();
         let policy = SandboxPolicy::wasm();
-        let result = mgr.execute(&policy, "noop", "").await;
+        let result = mgr.execute_argv(&policy, &["noop"], "").await;
         assert!(result.is_err());
     }
 
@@ -210,7 +200,7 @@ mod tests {
         let mgr = SandboxManager::default();
         let policy = SandboxPolicy::process();
         let result = mgr
-            .execute(&policy, "echo hello", "")
+            .execute_argv(&policy, &["echo", "hello"], "")
             .await
             .expect("process should succeed");
         assert_eq!(result.backend, IsolationLevel::Process);

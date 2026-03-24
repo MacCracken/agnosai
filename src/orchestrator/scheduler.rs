@@ -227,6 +227,60 @@ impl Scheduler {
     }
 }
 
+/// Topological sort for a slice of [`Task`]s using their `id` and `dependencies` fields.
+///
+/// Returns task IDs in dependency order, respecting priority (highest first
+/// among tasks at the same dependency depth). Returns `CyclicDAG` on cycles.
+pub fn topological_sort_tasks(tasks: &[Task]) -> Result<Vec<TaskId>> {
+    let ids: HashSet<TaskId> = tasks.iter().map(|t| t.id).collect();
+    let mut in_degree: HashMap<TaskId, usize> = tasks.iter().map(|t| (t.id, 0)).collect();
+    let mut dependents: HashMap<TaskId, Vec<TaskId>> = HashMap::new();
+
+    for task in tasks {
+        for dep in &task.dependencies {
+            if ids.contains(dep) {
+                *in_degree.entry(task.id).or_default() += 1;
+                dependents.entry(*dep).or_default().push(task.id);
+            }
+        }
+    }
+
+    // Pre-build priority lookup.
+    let priority_map: HashMap<TaskId, crate::core::task::TaskPriority> =
+        tasks.iter().map(|t| (t.id, t.priority)).collect();
+
+    // Seed with zero in-degree nodes. Sort ascending so pop() takes highest priority.
+    let mut queue: Vec<TaskId> = in_degree
+        .iter()
+        .filter(|&(_, &deg)| deg == 0)
+        .map(|(&id, _)| id)
+        .collect();
+    queue.sort_by(|a, b| priority_map.get(a).cmp(&priority_map.get(b)));
+
+    let mut order = Vec::with_capacity(tasks.len());
+
+    while let Some(id) = queue.pop() {
+        order.push(id);
+        if let Some(children) = dependents.get(&id) {
+            for child in children {
+                if let Some(deg) = in_degree.get_mut(child) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push(*child);
+                        queue.sort_by(|a, b| priority_map.get(a).cmp(&priority_map.get(b)));
+                    }
+                }
+            }
+        }
+    }
+
+    if order.len() != tasks.len() {
+        return Err(AgnosaiError::CyclicDAG);
+    }
+
+    Ok(order)
+}
+
 impl Default for Scheduler {
     fn default() -> Self {
         Self::new()

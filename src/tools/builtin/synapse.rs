@@ -8,8 +8,15 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:8420";
+
+/// Shared HTTP client for all synapse tools (avoids per-tool connection pools).
+fn shared_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(Client::new)
+}
 
 // ---------------------------------------------------------------------------
 // synapse_infer
@@ -36,7 +43,7 @@ impl SynapseInfer {
     /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client: shared_client().clone(),
             base_url,
         }
     }
@@ -152,7 +159,7 @@ impl SynapseListModels {
     /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client: shared_client().clone(),
             base_url,
         }
     }
@@ -214,7 +221,7 @@ impl SynapseStatus {
     /// Create a new instance targeting the given base URL.
     pub fn with_base_url(base_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client: shared_client().clone(),
             base_url,
         }
     }

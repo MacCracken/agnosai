@@ -911,65 +911,10 @@ fn mood_adjusted_temperature(profile: &bhava::traits::PersonalityProfile, base: 
     (base + delta).clamp(0.1, 1.5)
 }
 
-/// Kahn's algorithm for topological sort. Returns an error on cycles.
+/// Kahn's algorithm for topological sort. Delegates to the shared implementation
+/// in [`crate::orchestrator::scheduler::topological_sort_tasks`].
 fn topological_sort(tasks: &[Task]) -> crate::core::Result<Vec<TaskId>> {
-    let ids: HashSet<TaskId> = tasks.iter().map(|t| t.id).collect();
-    let mut in_degree: HashMap<TaskId, usize> = tasks.iter().map(|t| (t.id, 0)).collect();
-    let mut dependents: HashMap<TaskId, Vec<TaskId>> = HashMap::new();
-
-    for task in tasks {
-        for dep in &task.dependencies {
-            if ids.contains(dep) {
-                *in_degree.entry(task.id).or_default() += 1;
-                dependents.entry(*dep).or_default().push(task.id);
-            }
-        }
-    }
-
-    // Pre-build priority lookup to avoid quadratic scan in sort.
-    let priority_map: HashMap<TaskId, crate::core::task::TaskPriority> =
-        tasks.iter().map(|t| (t.id, t.priority)).collect();
-
-    // Seed with zero in-degree nodes, ordered by priority (highest first).
-    let mut queue: Vec<TaskId> = in_degree
-        .iter()
-        .filter(|&(_, &deg)| deg == 0)
-        .map(|(&id, _)| id)
-        .collect();
-    // Sort ascending so highest priority is at the end (where pop() takes from).
-    queue.sort_by(|a, b| {
-        let pa = priority_map.get(a);
-        let pb = priority_map.get(b);
-        pa.cmp(&pb) // ascending: highest priority at back for pop()
-    });
-
-    let mut order = Vec::with_capacity(tasks.len());
-
-    while let Some(id) = queue.pop() {
-        order.push(id);
-        if let Some(children) = dependents.get(&id) {
-            for child in children {
-                if let Some(deg) = in_degree.get_mut(child) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push(*child);
-                        // Re-sort to maintain priority ordering.
-                        queue.sort_by(|a, b| {
-                            let pa = priority_map.get(a);
-                            let pb = priority_map.get(b);
-                            pa.cmp(&pb)
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    if order.len() != tasks.len() {
-        return Err(crate::core::AgnosaiError::CyclicDAG);
-    }
-
-    Ok(order)
+    crate::orchestrator::scheduler::topological_sort_tasks(tasks)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
