@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `success_rate_for_action` / `avg_duration_for_action` eliminated intermediate `Vec` allocation
 
 ### Added
+- **Crew cancellation**: `cancel_crew()` now actually stops running crews via `AtomicBool` cancellation token shared between `Orchestrator` and `CrewRunner`; sequential mode breaks between tasks, parallel mode aborts pending tasks before semaphore acquisition, DAG mode halts between waves
+- `CrewRunner::with_cancel_token()` builder method
+- `CrewRunner::is_cancelled()` inline check
+- `Orchestrator.cancel_tokens` per-crew `DashMap<CrewId, Arc<AtomicBool>>` with automatic cleanup on completion
 - `#[must_use]` on pure functions: `score_agent`, `rank_agents`, `matches_pattern`, `pattern_count`, `EventBus::has/len/is_empty`, `Ucb1::select/best_arm/arm_count`, `ReplayBuffer::sample/len/is_empty`, `QLearner::get_value/best_action`, `CapabilityScorer::confidence/trend/all_scores`, `PerformanceProfile::success_rate*/avg_duration*/total_actions`
 - `#[inline]` on `is_private_ipv4` helper
 - `is_private_ipv4` helper for cleaner IPv4 range checks

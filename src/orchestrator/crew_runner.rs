@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::core::agent::AgentDefinition;
@@ -38,6 +39,8 @@ pub struct CrewRunner {
     cache: Arc<ResponseCache>,
     /// Cost tracker for inference cost accounting.
     cost_tracker: Arc<CostTracker>,
+    /// Cancellation flag — when `true`, the runner stops scheduling new tasks.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl CrewRunner {
@@ -49,6 +52,7 @@ impl CrewRunner {
             llm: None,
             cache: Arc::new(ResponseCache::new(Default::default())),
             cost_tracker: Arc::new(CostTracker::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -70,10 +74,22 @@ impl CrewRunner {
         self
     }
 
+    /// Attach a cancellation token shared with the orchestrator.
+    pub fn with_cancel_token(mut self, token: Arc<AtomicBool>) -> Self {
+        self.cancelled = token;
+        self
+    }
+
     /// Attach an event sender for SSE streaming.
     pub fn with_events(mut self, tx: broadcast::Sender<CrewEvent>) -> Self {
         self.event_tx = Some(tx);
         self
+    }
+
+    /// Check whether cancellation has been requested.
+    #[inline]
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 
     /// Emit a crew event if an event sender is configured.
@@ -117,8 +133,9 @@ impl CrewRunner {
         };
 
         let wall_ms = crew_start.elapsed().as_millis() as u64;
-        let all_ok = results.iter().all(|r| r.status == TaskStatus::Completed);
-        let status = if all_ok {
+        let status = if self.is_cancelled() {
+            CrewStatus::Cancelled
+        } else if results.iter().all(|r| r.status == TaskStatus::Completed) {
             CrewStatus::Completed
         } else {
             CrewStatus::Failed
@@ -175,6 +192,10 @@ impl CrewRunner {
         let mut results = Vec::with_capacity(self.spec.tasks.len());
 
         for i in 0..self.spec.tasks.len() {
+            if self.is_cancelled() {
+                info!(crew_id = %self.spec.id, "crew cancelled — stopping sequential execution");
+                break;
+            }
             let agent = pick_best_agent(&self.spec.agents, &self.spec.tasks[i]);
             self.spec.tasks[i].status = TaskStatus::Queued;
 
@@ -262,7 +283,17 @@ impl CrewRunner {
             let llm = self.llm.clone();
             let cache = Arc::clone(&self.cache);
             let cost_tracker = Arc::clone(&self.cost_tracker);
+            let cancel = Arc::clone(&self.cancelled);
             join_set.spawn(async move {
+                // Check cancellation before acquiring permit (avoids blocking for nothing).
+                if cancel.load(Ordering::Acquire) {
+                    return TaskResult {
+                        task_id: task.id,
+                        status: TaskStatus::Failed,
+                        output: "crew cancelled".into(),
+                        metadata: Default::default(),
+                    };
+                }
                 let _permit = match permit.acquire().await {
                     Ok(p) => p,
                     Err(_) => {
@@ -274,6 +305,15 @@ impl CrewRunner {
                         };
                     }
                 };
+                // Check again after acquiring permit.
+                if cancel.load(Ordering::Acquire) {
+                    return TaskResult {
+                        task_id: task.id,
+                        status: TaskStatus::Failed,
+                        output: "crew cancelled".into(),
+                        metadata: Default::default(),
+                    };
+                }
                 execute_task(
                     &task,
                     agent.as_ref(),
@@ -345,6 +385,10 @@ impl CrewRunner {
         let mut remaining: Vec<TaskId> = order;
 
         while !remaining.is_empty() {
+            if self.is_cancelled() {
+                info!(crew_id = %self.spec.id, "crew cancelled — stopping DAG execution");
+                break;
+            }
             // Collect the ready front.
             let (ready, not_ready): (Vec<TaskId>, Vec<TaskId>) =
                 remaining.into_iter().partition(|id| {

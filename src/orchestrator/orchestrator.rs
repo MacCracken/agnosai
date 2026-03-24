@@ -1,10 +1,13 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
+use crate::core::crew::CrewId;
 use crate::core::{CrewSpec, CrewState, CrewStatus, ResourceBudget, Result};
 use crate::llm::{CostTracker, HooshClient, ResponseCache};
 use crate::server::sse::EventBus;
+use dashmap::DashMap;
 
 use crate::orchestrator::crew_runner::CrewRunner;
 use crate::orchestrator::scheduler::Scheduler;
@@ -37,6 +40,9 @@ pub struct Orchestrator {
     cost_tracker: Arc<CostTracker>,
     /// Semaphore limiting concurrent crew executions.
     crew_semaphore: Arc<Semaphore>,
+    /// Per-crew cancellation tokens. When set to `true`, the crew runner
+    /// will stop scheduling new tasks and return early.
+    cancel_tokens: Arc<DashMap<CrewId, Arc<AtomicBool>>>,
 }
 
 impl Orchestrator {
@@ -57,6 +63,7 @@ impl Orchestrator {
             cache: Arc::new(ResponseCache::new(Default::default())),
             cost_tracker: Arc::new(CostTracker::new()),
             crew_semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            cancel_tokens: Arc::new(DashMap::new()),
         })
     }
 
@@ -132,10 +139,16 @@ impl Orchestrator {
             });
         }
 
+        // Create cancellation token for this crew.
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        self.cancel_tokens
+            .insert(crew_id, Arc::clone(&cancel_token));
+
         // Delegate to CrewRunner for the actual lifecycle.
         let mut runner = CrewRunner::new(spec)
             .with_cache(Arc::clone(&self.cache))
-            .with_cost_tracker(Arc::clone(&self.cost_tracker));
+            .with_cost_tracker(Arc::clone(&self.cost_tracker))
+            .with_cancel_token(cancel_token);
         if let Some(llm) = self.llm_client() {
             runner = runner.with_llm(Arc::clone(llm));
         }
@@ -178,7 +191,8 @@ impl Orchestrator {
             }
         }
 
-        // Clean up the event channel now that the crew is done.
+        // Clean up cancellation token and event channel.
+        self.cancel_tokens.remove(&crew_id);
         if let Some(ref events) = self.events {
             events.remove(crew_id);
         }
@@ -187,7 +201,16 @@ impl Orchestrator {
     }
 
     /// Cancel a running crew by ID.
-    pub async fn cancel_crew(&self, crew_id: crate::core::crew::CrewId) -> Result<()> {
+    ///
+    /// Sets the cancellation token so the crew runner stops scheduling new
+    /// tasks and returns early. Tasks already in flight will complete but no
+    /// new tasks will be started.
+    pub async fn cancel_crew(&self, crew_id: CrewId) -> Result<()> {
+        // Signal the cancellation token (if the crew is still running).
+        if let Some(token) = self.cancel_tokens.get(&crew_id) {
+            token.store(true, Ordering::Release);
+        }
+
         let mut state = self.state.write().await;
         if let Some(crew) = state.active_crews.iter_mut().find(|c| c.crew_id == crew_id) {
             crew.status = CrewStatus::Cancelled;
@@ -326,5 +349,32 @@ mod tests {
         let b = orch.budget();
         // Budget is accessible and non-empty.
         assert!(b.max_concurrent_tasks.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_token_signals_crew_runner() {
+        let orch = Orchestrator::new(Default::default()).await.unwrap();
+
+        // Create a spec with multiple sequential tasks.
+        let agent = AgentDefinition::new("agent-a", "tester", "test things");
+        let tasks: Vec<Task> = (0..5).map(|i| Task::new(format!("task {i}"))).collect();
+        let spec = CrewSpec::new("cancel-test")
+            .with_agents(vec![agent])
+            .with_tasks(tasks)
+            .with_process(ProcessMode::Sequential);
+        let crew_id = spec.id;
+
+        // Pre-cancel before running — runner should stop early.
+        orch.cancel_tokens
+            .insert(crew_id, Arc::new(AtomicBool::new(true)));
+
+        // Manually create a runner with the cancel token to test the mechanism.
+        let token = orch.cancel_tokens.get(&crew_id).unwrap().clone();
+        let mut runner = CrewRunner::new(spec).with_cancel_token(token);
+        let state = runner.run().await.unwrap();
+
+        // Crew should be marked cancelled with fewer results than total tasks.
+        assert_eq!(state.status, CrewStatus::Cancelled);
+        assert_eq!(state.results.len(), 0, "no tasks should have run");
     }
 }
