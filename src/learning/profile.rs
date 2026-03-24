@@ -6,6 +6,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 /// A single recorded action for an agent.
+#[non_exhaustive]
 pub struct ActionRecord {
     /// Type of action performed (e.g. `"inference"`, `"tool_call"`).
     pub action_type: String,
@@ -21,6 +22,7 @@ pub struct ActionRecord {
 const MAX_RECORDS_PER_AGENT: usize = 10_000;
 
 /// Tracks performance records per agent, enabling success-rate and duration queries.
+#[non_exhaustive]
 pub struct PerformanceProfile {
     records: HashMap<String, Vec<ActionRecord>>,
 }

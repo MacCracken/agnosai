@@ -46,6 +46,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `#[must_use]` on pure functions: `score_agent`, `rank_agents`, `matches_pattern`, `pattern_count`, `EventBus::has/len/is_empty`, `Ucb1::select/best_arm/arm_count`, `ReplayBuffer::sample/len/is_empty`, `QLearner::get_value/best_action`, `CapabilityScorer::confidence/trend/all_scores`, `PerformanceProfile::success_rate*/avg_duration*/total_actions`
 - `#[inline]` on `is_private_ipv4` helper
 - `is_private_ipv4` helper for cleaner IPv4 range checks
+- **Cryptographic audit chain**: HMAC-SHA256 tamper-proof event logging via `hoosh::audit::AuditChain`
+  - `Orchestrator.audit` — shared `Arc<AuditChain>` with random 256-bit signing key
+  - Records `crew_accepted`, `crew_finished`, `crew_cancelled`, and `task_completed` events
+  - Per-task audit entries with crew ID, task ID, status, agent assignment
+  - Crew-level entries with wall time, cost, task count, status
+  - Chain integrity verifiable via `audit.verify()`
+  - `Orchestrator::with_audit()` builder for custom audit chain, `audit()` accessor
+  - `CrewRunner::with_audit()` builder + `audit_record()` helper
+  - `AppState.audit` field for route-level access
+  - Re-exported `AuditChain` and `AuditEntry` from `agnosai::llm`
+- **SSRF validation tests**: 10 new tests covering IPv4/IPv6 private ranges, mapped addresses, localhost variants, non-HTTP schemes, metadata IPs, overlong fields, oversized metadata
+- **Crew validation tests**: 8 new tests covering empty name, missing tasks, self-dependencies, out-of-range deps, dependency cycles, valid DAG, GET crew 404, DAG mode execution
+- **URL IPv6 parsing fix**: `is_safe_callback_url` now uses `url::Host` enum for correct bracketed IPv6 handling
 
 ## [0.22.3] — 2026-03-23
 

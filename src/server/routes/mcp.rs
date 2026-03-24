@@ -43,6 +43,7 @@ pub struct JsonRpcResponse {
 
 /// JSON-RPC error object.
 #[derive(Serialize)]
+#[non_exhaustive]
 pub struct JsonRpcError {
     /// Numeric error code.
     pub code: i32,
@@ -229,6 +230,7 @@ mod tests {
             auth: Default::default(),
             events: crate::server::sse::EventBus::new(),
             http_client: reqwest::Client::new(),
+            audit: std::sync::Arc::new(crate::llm::AuditChain::new(b"test-key", 100)),
         });
         crate::server::router(state)
     }

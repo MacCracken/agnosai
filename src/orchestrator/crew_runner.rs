@@ -11,6 +11,7 @@
 //! 6. Aggregate results into CrewState
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -19,8 +20,8 @@ use crate::core::agent::AgentDefinition;
 use crate::core::crew::{CrewProfile, CrewSpec, CrewState, CrewStatus};
 use crate::core::task::{ProcessMode, Task, TaskId, TaskResult, TaskStatus};
 use crate::llm::{
-    CostTracker, HooshClient, InferenceRequest, Message, ProviderType, ResponseCache, Role,
-    cache_key,
+    AuditChain, CostTracker, HooshClient, InferenceRequest, Message, ProviderType, ResponseCache,
+    Role, cache_key,
 };
 use crate::server::sse::CrewEvent;
 use tokio::sync::Semaphore;
@@ -41,6 +42,8 @@ pub struct CrewRunner {
     cost_tracker: Arc<CostTracker>,
     /// Cancellation flag — when `true`, the runner stops scheduling new tasks.
     cancelled: Arc<AtomicBool>,
+    /// Optional audit chain for tamper-proof event logging.
+    audit: Option<Arc<AuditChain>>,
 }
 
 impl CrewRunner {
@@ -53,6 +56,7 @@ impl CrewRunner {
             cache: Arc::new(ResponseCache::new(Default::default())),
             cost_tracker: Arc::new(CostTracker::new()),
             cancelled: Arc::new(AtomicBool::new(false)),
+            audit: None,
         }
     }
 
@@ -80,6 +84,12 @@ impl CrewRunner {
         self
     }
 
+    /// Attach an audit chain for crew/task event logging.
+    pub fn with_audit(mut self, audit: Arc<AuditChain>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
     /// Attach an event sender for SSE streaming.
     pub fn with_events(mut self, tx: broadcast::Sender<CrewEvent>) -> Self {
         self.event_tx = Some(tx);
@@ -90,6 +100,13 @@ impl CrewRunner {
     #[inline]
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Record an audit event if an audit chain is attached.
+    fn audit_record(&self, event: &str, level: &str, message: &str, metadata: serde_json::Value) {
+        if let Some(ref audit) = self.audit {
+            audit.record(event, level, message, None, None, Some(metadata));
+        }
     }
 
     /// Emit a crew event if an event sender is configured.
@@ -234,6 +251,23 @@ impl CrewRunner {
                 }),
             );
 
+            let task_level = if result.status == TaskStatus::Completed {
+                "info"
+            } else {
+                "error"
+            };
+            self.audit_record(
+                "task_completed",
+                task_level,
+                &self.spec.tasks[i].description,
+                serde_json::json!({
+                    "crew_id": self.spec.id.to_string(),
+                    "task_id": result.task_id.to_string(),
+                    "status": format!("{:?}", result.status),
+                    "agent": agent_key,
+                }),
+            );
+
             results.push(result);
         }
 
@@ -340,7 +374,14 @@ impl CrewRunner {
                     results.push(task_result);
                 }
                 Err(e) => {
-                    warn!(error = %e, "task join error");
+                    warn!(error = %e, "task join error (task panicked)");
+                    // Synthesize a Failed result so the crew status correctly reflects the failure.
+                    results.push(TaskResult {
+                        task_id: uuid::Uuid::nil(),
+                        output: format!("task panicked: {e}"),
+                        status: TaskStatus::Failed,
+                        metadata: Default::default(),
+                    });
                 }
             }
         }
@@ -582,7 +623,6 @@ async fn execute_task(
     // The task description is the main user message.
     let mut user_msg = task.description.clone();
     if let Some(ref expected) = task.expected_output {
-        use std::fmt::Write;
         let _ = write!(user_msg, "\n\nExpected output format: {expected}");
     }
 
@@ -644,26 +684,24 @@ async fn execute_task(
             // Cache the successful response.
             cache.insert(ck, response.text.clone());
 
-            // If streaming was requested, replay via infer_stream for SSE token
-            // events. This is best-effort — the full response is already captured.
-            if let Some(tx) = event_tx
-                && let Ok(mut rx) = client.infer_stream(&request).await
-            {
-                while let Some(chunk) = rx.recv().await {
-                    match chunk {
-                        Ok(token) => {
-                            let _ = tx.send(CrewEvent {
-                                crew_id: task.id.to_string(),
-                                event_type: "token".into(),
-                                data: serde_json::json!({
-                                    "task_id": task.id.to_string(),
-                                    "token": token,
-                                }),
-                            });
-                        }
-                        Err(_) => break,
-                    }
-                }
+            // If streaming was requested, emit the completed response as a
+            // single token event. This avoids a redundant second inference call
+            // that would double latency and cost.
+            if let Some(tx) = event_tx {
+                let _ = tx.send(CrewEvent {
+                    crew_id: task
+                        .context
+                        .get("crew_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    event_type: "token".into(),
+                    data: serde_json::json!({
+                        "task_id": task.id.to_string(),
+                        "token": response.text,
+                        "complete": true,
+                    }),
+                });
             }
 
             let task_duration_ms = task_start.elapsed().as_millis() as u64;
@@ -751,7 +789,6 @@ async fn execute_task(
             );
 
             let mut output = String::from("LLM error: ");
-            use std::fmt::Write;
             let _ = write!(output, "{e}");
             TaskResult {
                 task_id: task.id,
@@ -777,17 +814,14 @@ fn build_system_prompt(agent: Option<&AgentDefinition>) -> String {
     );
 
     if let Some(ref backstory) = agent.backstory {
-        use std::fmt::Write;
         let _ = write!(prompt, "\n\nBackstory: {backstory}");
     }
 
     if let Some(ref domain) = agent.domain {
-        use std::fmt::Write;
         let _ = write!(prompt, "\n\nDomain expertise: {domain}");
     }
 
     if !agent.tools.is_empty() {
-        use std::fmt::Write;
         let _ = write!(prompt, "\n\nAvailable tools: {}", agent.tools.join(", "));
     }
 
@@ -886,16 +920,21 @@ fn topological_sort(tasks: &[Task]) -> crate::core::Result<Vec<TaskId>> {
         }
     }
 
+    // Pre-build priority lookup to avoid quadratic scan in sort.
+    let priority_map: HashMap<TaskId, crate::core::task::TaskPriority> =
+        tasks.iter().map(|t| (t.id, t.priority)).collect();
+
     // Seed with zero in-degree nodes, ordered by priority (highest first).
     let mut queue: Vec<TaskId> = in_degree
         .iter()
         .filter(|&(_, &deg)| deg == 0)
         .map(|(&id, _)| id)
         .collect();
+    // Sort ascending so highest priority is at the end (where pop() takes from).
     queue.sort_by(|a, b| {
-        let pa = tasks.iter().find(|t| t.id == *a).map(|t| t.priority);
-        let pb = tasks.iter().find(|t| t.id == *b).map(|t| t.priority);
-        pb.cmp(&pa) // higher priority first
+        let pa = priority_map.get(a);
+        let pb = priority_map.get(b);
+        pa.cmp(&pb) // ascending: highest priority at back for pop()
     });
 
     let mut order = Vec::with_capacity(tasks.len());
@@ -908,6 +947,12 @@ fn topological_sort(tasks: &[Task]) -> crate::core::Result<Vec<TaskId>> {
                     *deg -= 1;
                     if *deg == 0 {
                         queue.push(*child);
+                        // Re-sort to maintain priority ordering.
+                        queue.sort_by(|a, b| {
+                            let pa = priority_map.get(a);
+                            let pb = priority_map.get(b);
+                            pa.cmp(&pb)
+                        });
                     }
                 }
             }

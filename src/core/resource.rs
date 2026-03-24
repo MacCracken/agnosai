@@ -99,6 +99,7 @@ impl AcceleratorType {
 
 /// A compute device with type, memory, and identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ComputeDevice {
     /// Zero-based device index.
     pub index: usize,
@@ -110,6 +111,32 @@ pub struct ComputeDevice {
     pub memory_total_mb: u64,
     /// Available (free) device memory in megabytes.
     pub memory_available_mb: u64,
+}
+
+impl ComputeDevice {
+    /// Create a new compute device.
+    #[must_use]
+    pub fn new(
+        index: usize,
+        name: impl Into<String>,
+        accelerator: AcceleratorType,
+        memory_total_mb: u64,
+    ) -> Self {
+        Self {
+            index,
+            name: name.into(),
+            accelerator,
+            memory_total_mb,
+            memory_available_mb: memory_total_mb,
+        }
+    }
+
+    /// Create a device with specific available memory.
+    #[must_use]
+    pub fn with_available(mut self, memory_available_mb: u64) -> Self {
+        self.memory_available_mb = memory_available_mb;
+        self
+    }
 }
 
 /// Hardware requirements for a task or agent workload.
@@ -136,8 +163,41 @@ pub struct HardwareRequirement {
     pub required_family: Option<AcceleratorFamily>,
 }
 
+impl HardwareRequirement {
+    /// Create a requirement for specific accelerator types.
+    #[must_use]
+    pub fn for_accelerators(accelerators: Vec<AcceleratorType>) -> Self {
+        Self {
+            accelerators,
+            ..Default::default()
+        }
+    }
+
+    /// Set minimum device memory.
+    #[must_use]
+    pub fn with_min_memory(mut self, mb: u64) -> Self {
+        self.min_memory_mb = mb;
+        self
+    }
+
+    /// Set minimum device count.
+    #[must_use]
+    pub fn with_min_devices(mut self, count: usize) -> Self {
+        self.min_device_count = count;
+        self
+    }
+
+    /// Set minimum CPU cores.
+    #[must_use]
+    pub fn with_min_cpu_cores(mut self, cores: usize) -> Self {
+        self.min_cpu_cores = cores;
+        self
+    }
+}
+
 /// Hardware inventory for a node.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct HardwareInventory {
     /// Number of CPU cores available.
     pub cpu_cores: usize,
@@ -148,6 +208,16 @@ pub struct HardwareInventory {
 }
 
 impl HardwareInventory {
+    /// Create a new hardware inventory.
+    #[must_use]
+    pub fn new(cpu_cores: usize, memory_total_mb: u64, devices: Vec<ComputeDevice>) -> Self {
+        Self {
+            cpu_cores,
+            memory_total_mb,
+            devices,
+        }
+    }
+
     /// Auto-detect hardware and populate inventory from system probes.
     ///
     /// Uses `ai-hwaccel`'s `AcceleratorRegistry::detect()` to probe for GPUs,
@@ -336,6 +406,7 @@ impl TrainingMemoryEstimate {
 
 /// Budget limits for crew execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ResourceBudget {
     /// Maximum total LLM tokens across all tasks.
     pub max_tokens: Option<u64>,
@@ -345,6 +416,24 @@ pub struct ResourceBudget {
     pub max_duration_secs: Option<u64>,
     /// Maximum number of concurrent crew executions.
     pub max_concurrent_tasks: Option<usize>,
+}
+
+impl ResourceBudget {
+    /// Create a new resource budget with all limits set.
+    #[must_use]
+    pub fn new(
+        max_tokens: Option<u64>,
+        max_cost_usd: Option<f64>,
+        max_duration_secs: Option<u64>,
+        max_concurrent_tasks: Option<usize>,
+    ) -> Self {
+        Self {
+            max_tokens,
+            max_cost_usd,
+            max_duration_secs,
+            max_concurrent_tasks,
+        }
+    }
 }
 
 impl Default for ResourceBudget {
@@ -360,6 +449,7 @@ impl Default for ResourceBudget {
 
 /// A GPU device with VRAM capacity information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GpuDevice {
     /// Zero-based device index.
     pub index: usize,

@@ -93,13 +93,13 @@ fn bench_ucb1_select_50(c: &mut Criterion) {
 fn make_full_buffer(size: usize) -> ReplayBuffer {
     let mut buf = ReplayBuffer::new(size);
     for i in 0..size {
-        buf.push(Experience {
-            state: format!("state_{}", i % 100),
-            action: format!("action_{}", i % 10),
-            reward: (i as f64 * 0.01).sin(),
-            next_state: format!("state_{}", (i + 1) % 100),
-            priority: (i as f64 * 0.1).cos().abs() + 0.01,
-        });
+        buf.push(Experience::new(
+            format!("state_{}", i % 100),
+            format!("action_{}", i % 10),
+            (i as f64 * 0.01).sin(),
+            format!("state_{}", (i + 1) % 100),
+            (i as f64 * 0.1).cos().abs() + 0.01,
+        ));
     }
     buf
 }
@@ -110,13 +110,13 @@ fn bench_replay_push(c: &mut Criterion) {
 
     c.bench_function("ReplayBuffer::push (1000 cap, full)", |b| {
         b.iter(|| {
-            buf.push(Experience {
-                state: format!("s_{i}"),
-                action: "act".into(),
-                reward: 1.0,
-                next_state: "s_next".into(),
-                priority: (i as f64 * 0.07).cos().abs() + 0.5,
-            });
+            buf.push(Experience::new(
+                format!("s_{i}"),
+                "act",
+                1.0,
+                "s_next",
+                (i as f64 * 0.07).cos().abs() + 0.5,
+            ));
             i += 1;
         });
     });

@@ -12,6 +12,7 @@ use tokio::process::Command;
 
 /// Result of executing a Python script in the sandbox.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct PythonResult {
     pub stdout: String,
     pub stderr: String,

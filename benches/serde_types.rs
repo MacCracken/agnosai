@@ -9,19 +9,14 @@ use agnosai::core::task::*;
 fn bench_hardware_inventory_json(c: &mut Criterion) {
     let mut devices = Vec::new();
     for i in 0..8 {
-        devices.push(ComputeDevice {
-            index: i,
-            name: format!("GPU #{i}"),
-            accelerator: AcceleratorType::Cuda,
-            memory_total_mb: 81920,
-            memory_available_mb: 81920,
-        });
+        devices.push(ComputeDevice::new(
+            i,
+            format!("GPU #{i}"),
+            AcceleratorType::Cuda,
+            81920,
+        ));
     }
-    let inv = HardwareInventory {
-        cpu_cores: 128,
-        memory_total_mb: 1048576,
-        devices,
-    };
+    let inv = HardwareInventory::new(128, 1048576, devices);
     let json = serde_json::to_string(&inv).unwrap();
 
     let mut group = c.benchmark_group("hardware_inventory_json");
@@ -82,12 +77,7 @@ fn bench_agent_from_json(c: &mut Criterion) {
 }
 
 fn bench_resource_budget_json(c: &mut Criterion) {
-    let budget = ResourceBudget {
-        max_tokens: Some(100000),
-        max_cost_usd: Some(5.0),
-        max_duration_secs: Some(600),
-        max_concurrent_tasks: Some(8),
-    };
+    let budget = ResourceBudget::new(Some(100000), Some(5.0), Some(600), Some(8));
     let json = serde_json::to_string(&budget).unwrap();
 
     let mut group = c.benchmark_group("resource_budget_json");

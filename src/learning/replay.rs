@@ -4,6 +4,7 @@ use rand::Rng;
 
 /// A single experience tuple stored in the replay buffer.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Experience {
     /// State before the action was taken.
     pub state: String,
@@ -17,7 +18,27 @@ pub struct Experience {
     pub priority: f64,
 }
 
+impl Experience {
+    /// Create a new experience tuple.
+    pub fn new(
+        state: impl Into<String>,
+        action: impl Into<String>,
+        reward: f64,
+        next_state: impl Into<String>,
+        priority: f64,
+    ) -> Self {
+        Self {
+            state: state.into(),
+            action: action.into(),
+            reward,
+            next_state: next_state.into(),
+            priority,
+        }
+    }
+}
+
 /// Fixed-capacity replay buffer that evicts lowest-priority experiences when full.
+#[non_exhaustive]
 pub struct ReplayBuffer {
     experiences: Vec<Experience>,
     max_size: usize,

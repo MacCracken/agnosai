@@ -73,6 +73,7 @@ pub fn load_all_from_dir(dir: &Path) -> Result<Vec<AgentDefinition>> {
 
 /// A preset crew specification containing a named team of agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PresetSpec {
     pub name: String,
     pub description: String,

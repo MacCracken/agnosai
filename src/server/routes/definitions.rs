@@ -17,3 +17,25 @@ pub async fn list_presets() -> Json<Vec<Value>> {
         Json(vec![])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_presets_returns_array() {
+        let Json(presets) = list_presets().await;
+        // With "definitions" feature enabled, we expect built-in presets.
+        // Without it, we get an empty vec. Either way it must be a Vec.
+        #[cfg(feature = "definitions")]
+        assert!(
+            !presets.is_empty(),
+            "expected non-empty presets with definitions feature"
+        );
+        #[cfg(not(feature = "definitions"))]
+        assert!(
+            presets.is_empty(),
+            "expected empty presets without definitions feature"
+        );
+    }
+}

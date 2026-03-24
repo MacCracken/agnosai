@@ -1,6 +1,7 @@
 //! UCB1 multi-armed bandit for strategy selection.
 
 /// Statistics tracked per arm.
+#[non_exhaustive]
 pub struct ArmStats {
     /// Human-readable arm name.
     pub name: String,
@@ -20,6 +21,7 @@ impl ArmStats {
 }
 
 /// UCB1 multi-armed bandit implementation.
+#[non_exhaustive]
 pub struct Ucb1 {
     arms: Vec<ArmStats>,
 }

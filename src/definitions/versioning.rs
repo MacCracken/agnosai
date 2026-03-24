@@ -6,6 +6,7 @@ use crate::core::agent::AgentDefinition;
 use chrono::{DateTime, Utc};
 
 /// A single versioned snapshot of an agent definition.
+#[non_exhaustive]
 pub struct DefinitionVersion {
     /// Auto-incrementing version number.
     pub version: u32,
@@ -18,6 +19,7 @@ pub struct DefinitionVersion {
 }
 
 /// In-memory version store for agent definitions, keyed by agent_key.
+#[non_exhaustive]
 pub struct VersionStore {
     versions: HashMap<String, Vec<DefinitionVersion>>,
 }

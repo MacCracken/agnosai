@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::llm::AuditChain;
 use crate::orchestrator::Orchestrator;
 use crate::server::auth::AuthConfig;
 use crate::server::sse::EventBus;
@@ -17,6 +18,8 @@ pub struct AppState {
     pub events: EventBus,
     /// Shared HTTP client for outbound requests (A2A callbacks, etc.).
     pub http_client: reqwest::Client,
+    /// Cryptographic audit chain for tamper-proof event logging.
+    pub audit: Arc<AuditChain>,
 }
 
 /// Thread-safe shared reference to application state.

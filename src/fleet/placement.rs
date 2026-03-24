@@ -19,6 +19,7 @@ pub enum PlacementPolicy {
 }
 
 /// A request for node placement.
+#[non_exhaustive]
 pub struct PlacementRequest {
     pub policy: PlacementPolicy,
     pub required_gpu: bool,
@@ -30,8 +31,53 @@ pub struct PlacementRequest {
     pub hardware: Option<crate::core::resource::HardwareRequirement>,
 }
 
+impl PlacementRequest {
+    /// Create a new placement request.
+    pub fn new(policy: PlacementPolicy) -> Self {
+        Self {
+            policy,
+            required_gpu: false,
+            min_gpu_vram_mb: 0,
+            required_capabilities: Vec::new(),
+            preferred_node: None,
+            hardware: None,
+        }
+    }
+
+    /// Set whether a GPU is required.
+    pub fn with_required_gpu(mut self, required: bool) -> Self {
+        self.required_gpu = required;
+        self
+    }
+
+    /// Set minimum GPU VRAM requirement.
+    pub fn with_min_gpu_vram_mb(mut self, mb: u64) -> Self {
+        self.min_gpu_vram_mb = mb;
+        self
+    }
+
+    /// Set required capabilities.
+    pub fn with_capabilities(mut self, caps: Vec<String>) -> Self {
+        self.required_capabilities = caps;
+        self
+    }
+
+    /// Set preferred node.
+    pub fn with_preferred_node(mut self, node: NodeId) -> Self {
+        self.preferred_node = Some(node);
+        self
+    }
+
+    /// Set hardware requirements.
+    pub fn with_hardware(mut self, hw: crate::core::resource::HardwareRequirement) -> Self {
+        self.hardware = Some(hw);
+        self
+    }
+}
+
 /// Result of a placement decision.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PlacementResult {
     pub node_id: NodeId,
     pub score: f64,

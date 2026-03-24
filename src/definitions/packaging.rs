@@ -17,6 +17,7 @@ struct PackageManifest {
 
 /// An `.agpkg` package containing agent definitions and metadata.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct AgnosPackage {
     pub name: String,
     pub version: String,

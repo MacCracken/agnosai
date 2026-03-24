@@ -63,11 +63,7 @@ fn build_linear_dag(n: usize) -> TaskDAG {
             edges.push((format!("t{}", i - 1), key));
         }
     }
-    TaskDAG {
-        tasks,
-        edges,
-        process: ProcessMode::Dag,
-    }
+    TaskDAG::new(tasks, edges, ProcessMode::Dag)
 }
 
 fn build_wide_dag(n: usize) -> TaskDAG {
@@ -81,11 +77,7 @@ fn build_wide_dag(n: usize) -> TaskDAG {
         edges.push(("root".into(), key.clone()));
         edges.push((key, "sink".into()));
     }
-    TaskDAG {
-        tasks,
-        edges,
-        process: ProcessMode::Dag,
-    }
+    TaskDAG::new(tasks, edges, ProcessMode::Dag)
 }
 
 fn bench_load_dag(c: &mut Criterion) {

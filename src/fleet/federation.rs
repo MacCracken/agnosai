@@ -40,6 +40,7 @@ pub enum ClusterStatus {
 
 /// Information about a federated cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClusterInfo {
     pub id: ClusterId,
     /// gRPC/HTTP endpoint for the cluster's control plane.
@@ -55,6 +56,7 @@ pub struct ClusterInfo {
 
 /// Election state for coordinator selection.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ElectionState {
     /// Current election term.
     pub term: u64,
@@ -66,6 +68,7 @@ pub struct ElectionState {
 
 /// Configuration for the federation manager.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FederationConfig {
     /// This cluster's ID.
     pub cluster_id: ClusterId,
@@ -209,7 +212,10 @@ impl FederationManager {
             self.role = FederationRole::Follower;
         }
 
-        // Update the role in the cluster info if we track this cluster.
+        // Reset all clusters to Follower, then set the new coordinator.
+        for cluster in self.clusters.values_mut() {
+            cluster.role = FederationRole::Follower;
+        }
         if let Some(cluster) = self.clusters.get_mut(&coordinator_id) {
             cluster.role = FederationRole::Coordinator;
         }

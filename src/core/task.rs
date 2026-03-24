@@ -130,6 +130,7 @@ pub struct TaskResult {
 
 /// Directed acyclic graph of interdependent tasks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TaskDAG {
     /// Tasks keyed by a string identifier.
     pub tasks: HashMap<String, Task>,
@@ -138,6 +139,21 @@ pub struct TaskDAG {
     /// Execution mode for the DAG.
     #[serde(default)]
     pub process: ProcessMode,
+}
+
+impl TaskDAG {
+    /// Create a new DAG with the given tasks, edges, and process mode.
+    pub fn new(
+        tasks: HashMap<String, Task>,
+        edges: Vec<(String, String)>,
+        process: ProcessMode,
+    ) -> Self {
+        Self {
+            tasks,
+            edges,
+            process,
+        }
+    }
 }
 
 /// How tasks within a crew should be executed.

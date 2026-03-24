@@ -13,7 +13,7 @@ use crate::server::state::SharedState;
 ///
 /// Rejects URLs targeting private/internal networks to prevent SSRF.
 /// Also rejects hostnames that could be used for DNS rebinding attacks.
-fn is_safe_callback_url(url: &str) -> bool {
+pub(crate) fn is_safe_callback_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
@@ -40,15 +40,22 @@ fn is_safe_callback_url(url: &str) -> bool {
         return false;
     }
 
-    // Block private/link-local IP ranges.
-    if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        && is_private_ip(ip)
-    {
-        return false;
+    // Block private/link-local IP ranges. Use parsed.host() to correctly
+    // handle both IPv4 and bracketed IPv6 addresses.
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if is_private_ipv4(v4) {
+                return false;
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if is_private_ip(std::net::IpAddr::V6(v6)) {
+                return false;
+            }
+        }
+        _ => {}
     }
 
-    // Block IPs embedded as hostnames (e.g. "0x7f000001.example.com" won't be caught,
-    // but at least raw IPs are validated above).
     true
 }
 
@@ -56,7 +63,7 @@ fn is_safe_callback_url(url: &str) -> bool {
 ///
 /// Covers IPv4 private ranges, IPv6 private/link-local ranges, and
 /// IPv6-mapped IPv4 addresses (e.g. `::ffff:10.0.0.1`).
-fn is_private_ip(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_private_ipv4(v4),
         std::net::IpAddr::V6(v6) => {
@@ -260,6 +267,7 @@ pub async fn status() -> Json<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    use crate::llm::AuditChain;
     use crate::orchestrator::Orchestrator;
     use crate::server::state::{AppState, SharedState};
     use crate::tools::ToolRegistry;
@@ -277,6 +285,7 @@ mod tests {
             auth: Default::default(),
             events: crate::server::sse::EventBus::new(),
             http_client: reqwest::Client::new(),
+            audit: Arc::new(AuditChain::new(b"test-key", 1_000)),
         });
         crate::server::router(state)
     }
@@ -333,5 +342,129 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["task_id"], "min-1");
         assert_eq!(json["status"], "completed");
+    }
+
+    #[test]
+    fn safe_callback_rejects_private_ipv4() {
+        use super::is_safe_callback_url;
+        assert!(!is_safe_callback_url("http://10.0.0.1/callback"));
+        assert!(!is_safe_callback_url("http://192.168.1.1/callback"));
+        assert!(!is_safe_callback_url("http://172.16.0.1/callback"));
+    }
+
+    #[test]
+    fn safe_callback_rejects_loopback() {
+        use super::is_safe_callback_url;
+        assert!(!is_safe_callback_url("http://127.0.0.1/callback"));
+        assert!(!is_safe_callback_url("http://[::1]/callback"));
+    }
+
+    #[test]
+    fn safe_callback_rejects_ipv6_mapped_ipv4() {
+        use super::{is_private_ip, is_safe_callback_url};
+        // Verify is_private_ip catches IPv6-mapped IPv4.
+        let mapped_10: std::net::IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(is_private_ip(mapped_10));
+        let mapped_lo: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_private_ip(mapped_lo));
+        // Verify the URL-level function also rejects these.
+        assert!(!is_safe_callback_url("http://[::ffff:10.0.0.1]/path"));
+        assert!(!is_safe_callback_url("http://[::ffff:127.0.0.1]/path"));
+    }
+
+    #[test]
+    fn safe_callback_rejects_ipv6_private() {
+        use super::{is_private_ip, is_safe_callback_url};
+        // Verify is_private_ip catches unique-local and link-local IPv6.
+        let ula: std::net::IpAddr = "fc00::1".parse().unwrap();
+        assert!(is_private_ip(ula));
+        let link_local: std::net::IpAddr = "fe80::1".parse().unwrap();
+        assert!(is_private_ip(link_local));
+        // Verify the URL-level function also rejects these.
+        assert!(!is_safe_callback_url("http://[fc00::1]/path"));
+        assert!(!is_safe_callback_url("http://[fe80::1]/path"));
+    }
+
+    #[test]
+    fn safe_callback_rejects_localhost_variants() {
+        use super::is_safe_callback_url;
+        assert!(!is_safe_callback_url("http://localhost/callback"));
+        assert!(!is_safe_callback_url("http://foo.local/callback"));
+        assert!(!is_safe_callback_url("http://bar.internal/callback"));
+        assert!(!is_safe_callback_url("http://baz.localhost/callback"));
+    }
+
+    #[test]
+    fn safe_callback_rejects_non_http() {
+        use super::is_safe_callback_url;
+        assert!(!is_safe_callback_url("ftp://example.com/file"));
+        assert!(!is_safe_callback_url("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn safe_callback_accepts_public_urls() {
+        use super::is_safe_callback_url;
+        assert!(is_safe_callback_url("https://example.com/callback"));
+        assert!(is_safe_callback_url("http://api.example.org/hook"));
+    }
+
+    #[test]
+    fn safe_callback_rejects_metadata_ip() {
+        use super::is_safe_callback_url;
+        assert!(!is_safe_callback_url("http://169.254.169.254/latest"));
+    }
+
+    #[tokio::test]
+    async fn a2a_receive_rejects_overlong_field() {
+        let app = test_app().await;
+        let long_id = "x".repeat(10_001);
+        let body = serde_json::json!({
+            "task_id": long_id,
+            "description": "short"
+        });
+        let response = app
+            .oneshot(
+                Request::post("/api/v1/a2a/receive")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "failed");
+        assert!(json["error"].as_str().unwrap().contains("max length"));
+    }
+
+    #[tokio::test]
+    async fn a2a_receive_rejects_oversized_metadata() {
+        let app = test_app().await;
+        // Build metadata larger than 64 KiB.
+        let big_value = "A".repeat(65 * 1024);
+        let body = serde_json::json!({
+            "task_id": "meta-big",
+            "description": "test",
+            "metadata": {"blob": big_value}
+        });
+        let response = app
+            .oneshot(
+                Request::post("/api/v1/a2a/receive")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "failed");
+        assert!(json["error"].as_str().unwrap().contains("metadata"));
     }
 }

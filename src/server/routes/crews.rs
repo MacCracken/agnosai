@@ -73,7 +73,7 @@ const MAX_TASKS: usize = 1000;
 /// Maximum string field length.
 const MAX_STRING_LEN: usize = 10_000;
 
-fn validate_crew_request(req: &CrewRunRequest) -> Result<(), String> {
+pub(crate) fn validate_crew_request(req: &CrewRunRequest) -> Result<(), String> {
     if req.name.is_empty() || req.name.len() > MAX_STRING_LEN {
         return Err(format!("name must be 1-{MAX_STRING_LEN} characters"));
     }
@@ -115,7 +115,7 @@ fn validate_crew_request(req: &CrewRunRequest) -> Result<(), String> {
 }
 
 /// DFS-based cycle detection on index-based task dependencies.
-fn has_dependency_cycle(n: usize, tasks: &[TaskRequest]) -> bool {
+pub(crate) fn has_dependency_cycle(n: usize, tasks: &[TaskRequest]) -> bool {
     // 0 = unvisited, 1 = in-progress, 2 = done
     let mut state = vec![0u8; n];
 
@@ -241,6 +241,7 @@ pub async fn get_crew(
 
 #[cfg(test)]
 mod tests {
+    use crate::llm::AuditChain;
     use crate::orchestrator::Orchestrator;
     use crate::server::state::{AppState, SharedState};
     use crate::tools::ToolRegistry;
@@ -258,6 +259,7 @@ mod tests {
             auth: Default::default(),
             events: crate::server::sse::EventBus::new(),
             http_client: reqwest::Client::new(),
+            audit: Arc::new(AuditChain::new(b"test-key", 1_000)),
         });
         crate::server::router(state)
     }
@@ -319,5 +321,167 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["error"].as_str().unwrap().contains("agent"));
+    }
+
+    // --- Validation unit tests ---
+
+    fn make_agent() -> crate::core::AgentDefinition {
+        serde_json::from_value(serde_json::json!({
+            "agent_key": "a",
+            "name": "Agent",
+            "role": "role",
+            "goal": "goal"
+        }))
+        .unwrap()
+    }
+
+    fn make_task(desc: &str) -> super::TaskRequest {
+        super::TaskRequest {
+            description: desc.into(),
+            expected_output: None,
+            priority: None,
+            dependencies: vec![],
+        }
+    }
+
+    fn make_task_with_deps(desc: &str, deps: Vec<usize>) -> super::TaskRequest {
+        super::TaskRequest {
+            description: desc.into(),
+            expected_output: None,
+            priority: None,
+            dependencies: deps,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_name() {
+        let req = super::CrewRunRequest {
+            name: String::new(),
+            agents: vec![make_agent()],
+            tasks: vec![make_task("do stuff")],
+            process: None,
+        };
+        let err = super::validate_crew_request(&req).unwrap_err();
+        assert!(err.contains("name"));
+    }
+
+    #[test]
+    fn validate_rejects_missing_tasks() {
+        let req = super::CrewRunRequest {
+            name: "crew".into(),
+            agents: vec![make_agent()],
+            tasks: vec![],
+            process: None,
+        };
+        let err = super::validate_crew_request(&req).unwrap_err();
+        assert!(err.contains("task"));
+    }
+
+    #[test]
+    fn validate_rejects_self_dependency() {
+        let req = super::CrewRunRequest {
+            name: "crew".into(),
+            agents: vec![make_agent()],
+            tasks: vec![make_task_with_deps("task0", vec![0])],
+            process: None,
+        };
+        let err = super::validate_crew_request(&req).unwrap_err();
+        assert!(err.contains("self-dependency"));
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_dependency() {
+        let req = super::CrewRunRequest {
+            name: "crew".into(),
+            agents: vec![make_agent()],
+            tasks: vec![make_task("task0"), make_task_with_deps("task1", vec![99])],
+            process: None,
+        };
+        let err = super::validate_crew_request(&req).unwrap_err();
+        assert!(err.contains("out of range"));
+    }
+
+    #[test]
+    fn validate_rejects_dependency_cycle() {
+        let req = super::CrewRunRequest {
+            name: "crew".into(),
+            agents: vec![make_agent()],
+            tasks: vec![
+                make_task_with_deps("task0", vec![1]),
+                make_task_with_deps("task1", vec![0]),
+            ],
+            process: None,
+        };
+        let err = super::validate_crew_request(&req).unwrap_err();
+        assert!(err.contains("cycle"));
+    }
+
+    #[test]
+    fn validate_accepts_valid_dag() {
+        let req = super::CrewRunRequest {
+            name: "crew".into(),
+            agents: vec![make_agent()],
+            tasks: vec![
+                make_task("task0"),
+                make_task_with_deps("task1", vec![0]),
+                make_task_with_deps("task2", vec![0, 1]),
+            ],
+            process: None,
+        };
+        assert!(super::validate_crew_request(&req).is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_crew_returns_not_found() {
+        let app = test_app().await;
+        let id = uuid::Uuid::new_v4();
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/v1/crews/{id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn post_crews_dag_mode() {
+        let app = test_app().await;
+        let body = serde_json::json!({
+            "name": "dag-crew",
+            "agents": [{
+                "agent_key": "worker",
+                "name": "Worker",
+                "role": "worker",
+                "goal": "do work"
+            }],
+            "tasks": [
+                {"description": "first task"},
+                {"description": "second task", "dependencies": [0]}
+            ],
+            "process": "dag"
+        });
+        let response = app
+            .oneshot(
+                Request::post("/api/v1/crews")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["crew_id"].is_string());
     }
 }

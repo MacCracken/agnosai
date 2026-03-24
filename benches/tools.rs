@@ -62,7 +62,7 @@ fn bench_get_5(c: &mut Criterion) {
         let mut i = 0usize;
         b.iter(|| {
             let name = format!("tool_{}", i % 5);
-            reg.get(&name);
+            let _ = reg.get(&name);
             i += 1;
         });
     });
@@ -75,7 +75,7 @@ fn bench_get_50(c: &mut Criterion) {
         let mut i = 0usize;
         b.iter(|| {
             let name = format!("tool_{}", i % 50);
-            reg.get(&name);
+            let _ = reg.get(&name);
             i += 1;
         });
     });

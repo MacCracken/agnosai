@@ -36,6 +36,7 @@ mod tests {
             auth: Default::default(),
             events: crate::server::sse::EventBus::new(),
             http_client: reqwest::Client::new(),
+            audit: std::sync::Arc::new(crate::llm::AuditChain::new(b"test-key", 100)),
         });
         crate::server::router(state)
     }

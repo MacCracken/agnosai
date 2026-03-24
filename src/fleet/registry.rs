@@ -24,6 +24,7 @@ pub enum NodeStatus {
 
 /// Information about a single fleet node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct NodeInfo {
     pub id: NodeId,
     pub hostname: String,

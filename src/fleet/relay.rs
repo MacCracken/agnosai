@@ -16,6 +16,7 @@ use super::registry::NodeId;
 
 /// A message sent between fleet nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RelayMessage {
     /// Monotonic sequence number from the sender.
     pub seq: u64,
@@ -31,8 +32,29 @@ pub struct RelayMessage {
     pub timestamp: DateTime<Utc>,
 }
 
+impl RelayMessage {
+    /// Create a new relay message.
+    pub fn new(
+        seq: u64,
+        from: impl Into<NodeId>,
+        to: impl Into<String>,
+        topic: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            seq,
+            from: from.into(),
+            to: to.into(),
+            topic: topic.into(),
+            payload,
+            timestamp: Utc::now(),
+        }
+    }
+}
+
 /// Incoming message after dedup.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IncomingMessage {
     pub message: RelayMessage,
     /// Whether this was a broadcast (to == "").
@@ -41,6 +63,7 @@ pub struct IncomingMessage {
 
 /// Stats about relay activity.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RelayStats {
     pub messages_sent: u64,
     pub messages_received: u64,

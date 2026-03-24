@@ -56,6 +56,7 @@ pub enum Complexity {
 
 /// A description of a task for routing purposes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TaskProfile {
     /// The kind of task being performed.
     pub task_type: TaskType,
@@ -76,6 +77,7 @@ pub struct TaskProfile {
 /// | Reason      | Capable | Capable | Premium |
 /// | Research    | Capable | Premium | Premium |
 /// | MultiStep   | Capable | Premium | Premium |
+#[must_use]
 pub fn route(profile: &TaskProfile) -> ModelTier {
     use Complexity::*;
     use TaskType::*;
@@ -99,6 +101,7 @@ pub fn route(profile: &TaskProfile) -> ModelTier {
 ///
 /// These are the defaults when no explicit `llm_model` is set on the agent.
 /// The hoosh server resolves these to whichever provider is configured.
+#[must_use]
 pub fn default_model(tier: ModelTier) -> &'static str {
     match tier {
         ModelTier::Fast => "llama3",
@@ -108,11 +111,14 @@ pub fn default_model(tier: ModelTier) -> &'static str {
 }
 
 /// Map an agent's complexity string to a [`Complexity`] enum value.
+#[must_use]
 pub fn parse_complexity(s: &str) -> Complexity {
-    match s.to_lowercase().as_str() {
-        "low" | "simple" => Complexity::Simple,
-        "high" | "complex" => Complexity::Complex,
-        _ => Complexity::Medium,
+    if s.eq_ignore_ascii_case("low") || s.eq_ignore_ascii_case("simple") {
+        Complexity::Simple
+    } else if s.eq_ignore_ascii_case("high") || s.eq_ignore_ascii_case("complex") {
+        Complexity::Complex
+    } else {
+        Complexity::Medium
     }
 }
 

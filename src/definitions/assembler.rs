@@ -6,6 +6,7 @@ use crate::core::task::Task;
 
 /// A requested team member specification.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TeamMember {
     pub role: String,
     pub tools: Vec<String>,

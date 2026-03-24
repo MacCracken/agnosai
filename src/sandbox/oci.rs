@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 
 /// Result of an OCI container execution.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OciResult {
     pub stdout: String,
     pub stderr: String,
@@ -29,6 +30,7 @@ pub struct OciResult {
 
 /// Configuration for the OCI sandbox.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OciSandboxConfig {
     /// Runtime binary (e.g. "docker", "podman").
     pub runtime: String,

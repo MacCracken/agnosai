@@ -25,11 +25,12 @@ const WEIGHT_PERSONALITY: f64 = 0.15;
 /// Map a complexity string to a numeric level.
 #[inline]
 fn complexity_level(s: &str) -> u8 {
-    match s.to_lowercase().as_str() {
-        "low" => 1,
-        "medium" => 2,
-        "high" => 3,
-        _ => 2, // default to medium
+    if s.eq_ignore_ascii_case("low") {
+        1
+    } else if s.eq_ignore_ascii_case("high") {
+        3
+    } else {
+        2 // "medium" or unrecognized → default
     }
 }
 

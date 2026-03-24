@@ -47,7 +47,7 @@ Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/re
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| Cryptographic audit chain | Medium | HMAC-SHA256 tamper-proof inference event log via `hoosh::audit` |
+| Cryptographic audit chain | Medium | Done — crew/task lifecycle events logged via `hoosh::audit::AuditChain` |
 | Per-endpoint rate limiting | Low | Sliding-window RPM via `hoosh::middleware::rate_limit` |
 | Priority inference queue | Low | Batch/background inference via `hoosh::queue` + majra |
 | OpenTelemetry integration | Medium | OTLP trace export via hoosh's `otel` feature gate |

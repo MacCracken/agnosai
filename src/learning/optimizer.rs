@@ -37,6 +37,7 @@ impl StringInterner {
 ///
 /// Uses numeric indices internally for efficient lookups while
 /// accepting `&str` keys at the API boundary.
+#[non_exhaustive]
 pub struct QLearner {
     q_table: HashMap<(u32, u32), f64>,
     interner: StringInterner,

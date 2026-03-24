@@ -29,11 +29,14 @@ impl ToolRegistry {
     }
 
     /// Look up a tool by name.
+    #[inline]
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<dyn NativeTool>> {
         self.tools.get(name).map(|entry| Arc::clone(entry.value()))
     }
 
     /// Return the schemas of all registered tools (unordered).
+    #[must_use]
     pub fn list(&self) -> Vec<ToolSchema> {
         self.tools
             .iter()
@@ -42,6 +45,8 @@ impl ToolRegistry {
     }
 
     /// Check whether a tool with the given name is registered.
+    #[inline]
+    #[must_use]
     pub fn has(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
@@ -52,6 +57,7 @@ impl ToolRegistry {
     }
 
     /// Number of currently registered tools.
+    #[must_use]
     pub fn count(&self) -> usize {
         self.tools.len()
     }

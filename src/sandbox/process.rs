@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 
 /// Result of a sandboxed process execution.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProcessResult {
     pub stdout: String,
     pub stderr: String,
@@ -25,6 +26,7 @@ pub struct ProcessResult {
 
 /// Configuration for the process sandbox.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProcessSandboxConfig {
     /// Path to the executable.
     pub executable: PathBuf,

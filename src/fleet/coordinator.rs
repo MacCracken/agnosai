@@ -9,6 +9,7 @@ use super::state::{CrewRunId, CrewStateManager};
 
 /// A task managed by the fleet coordinator.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FleetTask {
     pub task_id: Uuid,
     pub description: String,

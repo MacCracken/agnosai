@@ -63,6 +63,7 @@ impl CrewSpec {
 
 /// Runtime state of a crew execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CrewState {
     /// ID of the crew this state belongs to.
     pub crew_id: CrewId,
@@ -77,6 +78,7 @@ pub struct CrewState {
 
 /// Lightweight execution profile for a crew run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CrewProfile {
     /// Total wall-clock time in milliseconds.
     pub wall_ms: u64,
@@ -90,7 +92,8 @@ pub struct CrewProfile {
 }
 
 fn is_zero(v: &f64) -> bool {
-    *v == 0.0 || !v.is_finite()
+    // Treat NaN and infinities as "zero" so they are skipped during serialization.
+    !v.is_finite() || *v == 0.0
 }
 
 /// Lifecycle status of a crew execution.

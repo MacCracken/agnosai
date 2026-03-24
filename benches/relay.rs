@@ -4,7 +4,6 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use serde_json::json;
 
 use agnosai::fleet::relay::{Relay, RelayMessage};
-use chrono::Utc;
 
 // ── Relay::send ─────────────────────────────────────────────────────────
 
@@ -31,14 +30,13 @@ fn bench_receive_no_dupes(c: &mut Criterion) {
 
     c.bench_function("Relay::receive (no dupes)", |b| {
         b.iter(|| {
-            let msg = RelayMessage {
+            let msg = RelayMessage::new(
                 seq,
-                from: "node-a".into(),
-                to: "node-b".into(),
-                topic: "task.result".into(),
-                payload: json!({"status": "ok"}),
-                timestamp: Utc::now(),
-            };
+                "node-a",
+                "node-b",
+                "task.result",
+                json!({"status": "ok"}),
+            );
             relay.receive(msg);
             seq += 1;
         });
@@ -50,14 +48,7 @@ fn bench_receive_50pct_dupes(c: &mut Criterion) {
 
     // Pre-seed: receive messages with seq 1..500 so they are "seen".
     for s in 1..=500u64 {
-        let msg = RelayMessage {
-            seq: s,
-            from: "node-a".into(),
-            to: "node-b".into(),
-            topic: "warmup".into(),
-            payload: json!(null),
-            timestamp: Utc::now(),
-        };
+        let msg = RelayMessage::new(s, "node-a", "node-b", "warmup", json!(null));
         let _ = relay.receive(msg);
     }
 
@@ -76,14 +67,8 @@ fn bench_receive_50pct_dupes(c: &mut Criterion) {
             };
             toggle = !toggle;
 
-            let msg = RelayMessage {
-                seq,
-                from: "node-a".into(),
-                to: "node-b".into(),
-                topic: "task.result".into(),
-                payload: json!({"data": 123}),
-                timestamp: Utc::now(),
-            };
+            let msg =
+                RelayMessage::new(seq, "node-a", "node-b", "task.result", json!({"data": 123}));
             relay.receive(msg);
         });
     });

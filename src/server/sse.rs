@@ -16,6 +16,7 @@ const MAX_EVENT_CHANNELS: usize = 10_000;
 
 /// A crew execution event sent over SSE.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct CrewEvent {
     /// ID of the crew that emitted the event.
     pub crew_id: String,

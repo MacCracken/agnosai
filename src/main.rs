@@ -91,12 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("failed to build HTTP client");
 
+    let audit = orchestrator.audit().clone();
     let state: SharedState = Arc::new(AppState {
         orchestrator,
         tools,
         auth,
         events,
         http_client,
+        audit,
     });
 
     let app = router(state);

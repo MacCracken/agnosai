@@ -13,6 +13,7 @@ pub type GpuAllocation = ComputeAllocation;
 
 /// A compute memory allocation tied to a task.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ComputeAllocation {
     pub task_id: Uuid,
     pub device_index: usize,
@@ -57,6 +58,7 @@ pub type GpuScheduler = ComputeScheduler;
 /// Prefer [`crate::core::resource::GpuDevice`] for serializable GPU state.
 /// This type exists for backward compatibility with fleet scheduling internals.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GpuDevice {
     pub index: GpuId,
     pub name: String,
@@ -174,6 +176,9 @@ impl ComputeScheduler {
             .map(|(i, _)| i)?;
 
         self.devices[best_idx].memory_used_mb += memory_mb;
+        // Keep ComputeDevice.memory_available_mb in sync for external consumers.
+        self.devices[best_idx].device.memory_available_mb =
+            self.devices[best_idx].memory_available_mb();
 
         let alloc = ComputeAllocation {
             task_id,
@@ -191,6 +196,9 @@ impl ComputeScheduler {
             self.devices[alloc.device_index].memory_used_mb = self.devices[alloc.device_index]
                 .memory_used_mb
                 .saturating_sub(alloc.memory_mb);
+            // Keep ComputeDevice.memory_available_mb in sync.
+            self.devices[alloc.device_index].device.memory_available_mb =
+                self.devices[alloc.device_index].memory_available_mb();
             true
         } else {
             false

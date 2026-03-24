@@ -17,6 +17,7 @@ use super::process::ProcessSandbox;
 
 /// Unified result from any sandbox backend.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SandboxResult {
     pub stdout: String,
     pub stderr: String,
@@ -27,6 +28,7 @@ pub struct SandboxResult {
 
 /// Configuration for available backends.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SandboxManagerConfig {
     /// Default timeout for process/OCI backends.
     pub default_timeout: Duration,

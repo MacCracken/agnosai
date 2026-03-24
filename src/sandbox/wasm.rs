@@ -48,6 +48,7 @@ pub struct WasmModule {
 
 /// Result of executing a WASM module.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WasmResult {
     /// Captured stdout from the module.
     pub stdout: String,

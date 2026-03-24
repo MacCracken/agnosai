@@ -15,6 +15,7 @@ pub enum Trend {
 }
 
 /// Score data for a single capability.
+#[non_exhaustive]
 pub struct CapabilityScore {
     /// Current confidence level (0.0 to 1.0).
     pub confidence: f64,
@@ -77,6 +78,7 @@ impl CapabilityScore {
 }
 
 /// Tracks capability confidence scores across multiple capabilities.
+#[non_exhaustive]
 pub struct CapabilityScorer {
     scores: HashMap<String, CapabilityScore>,
 }

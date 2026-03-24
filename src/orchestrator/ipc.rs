@@ -31,11 +31,15 @@ pub struct IpcClient {
 impl IpcServer {
     /// Bind to a Unix socket path. Removes any existing socket file first.
     pub async fn bind(path: &std::path::Path) -> crate::core::Result<Self> {
-        // Remove stale socket if present.
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|e| {
-                crate::core::AgnosaiError::Ipc(format!("failed to remove stale socket: {e}"))
-            })?;
+        // Remove stale socket unconditionally (avoids TOCTOU race).
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(crate::core::AgnosaiError::Ipc(format!(
+                    "failed to remove stale socket: {e}"
+                )));
+            }
         }
         let listener = UnixListener::bind(path)
             .map_err(|e| crate::core::AgnosaiError::Ipc(format!("failed to bind socket: {e}")))?;

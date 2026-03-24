@@ -42,16 +42,22 @@ pub struct ToolInput {
 
 impl ToolInput {
     /// Get a required string parameter.
+    #[inline]
+    #[must_use]
     pub fn get_str(&self, key: &str) -> Option<&str> {
         self.parameters.get(key).and_then(|v| v.as_str())
     }
 
     /// Get an optional number parameter.
+    #[inline]
+    #[must_use]
     pub fn get_f64(&self, key: &str) -> Option<f64> {
         self.parameters.get(key).and_then(|v| v.as_f64())
     }
 
     /// Get an optional u64 parameter.
+    #[inline]
+    #[must_use]
     pub fn get_u64(&self, key: &str) -> Option<u64> {
         self.parameters.get(key).and_then(|v| v.as_u64())
     }
@@ -72,6 +78,8 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     /// Create a successful output.
+    #[inline]
+    #[must_use]
     pub fn ok(result: Value) -> Self {
         Self {
             success: true,
@@ -81,6 +89,8 @@ impl ToolOutput {
     }
 
     /// Create a failed output.
+    #[inline]
+    #[must_use]
     pub fn err(msg: impl Into<String>) -> Self {
         Self {
             success: false,

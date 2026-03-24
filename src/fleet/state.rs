@@ -25,6 +25,7 @@ pub enum CrewPhase {
 
 /// Full state of a distributed crew run.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DistributedCrewState {
     pub run_id: CrewRunId,
     pub phase: CrewPhase,
@@ -40,6 +41,7 @@ pub struct DistributedCrewState {
 
 /// Progress report from a single node.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NodeProgress {
     pub node_id: NodeId,
     pub tasks_completed: usize,
@@ -50,6 +52,7 @@ pub struct NodeProgress {
 
 /// A snapshot of node states at a point in time.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Checkpoint {
     pub name: String,
     pub created_at: DateTime<Utc>,
@@ -205,12 +208,34 @@ impl CrewStateManager {
     }
 
     /// Remove a node from a run's participating set (e.g. after detecting it as dead).
+    ///
+    /// After removal, checks whether any pending barriers are now satisfied
+    /// (all remaining participants have arrived) and auto-completes them.
     pub fn remove_node(&mut self, run_id: CrewRunId, node_id: &NodeId) -> bool {
         let Some(state) = self.states.get_mut(&run_id) else {
             return false;
         };
         state.participating_nodes.retain(|n| n != node_id);
+        state.node_progress.remove(node_id);
         state.updated_at = Utc::now();
+
+        // Recheck pending barriers — removing a node may satisfy one.
+        if let Some(run_barriers) = self.barriers.get(&run_id) {
+            let satisfied: Vec<String> = run_barriers
+                .iter()
+                .filter(|(_, arrived)| state.participating_nodes.is_subset(arrived))
+                .map(|(name, _)| name.clone())
+                .collect();
+            for barrier_name in &satisfied {
+                if let Some(rb) = self.barriers.get_mut(&run_id) {
+                    rb.remove(barrier_name);
+                }
+                if matches!(state.phase, CrewPhase::WaitingBarrier(ref b) if b == barrier_name) {
+                    state.phase = CrewPhase::Running;
+                }
+            }
+        }
+
         true
     }
 
