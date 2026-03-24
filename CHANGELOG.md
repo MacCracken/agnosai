@@ -5,6 +5,23 @@ All notable changes to AgnosAI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.3] — 2026-03-23
+
+### Added
+- `personality` feature flag — optional bhava integration for agent personality modeling
+- `AgentDefinition.personality` field — attach a `PersonalityProfile` to any agent (feature-gated)
+- `with_personality()` builder method on `AgentDefinition`
+- `build_system_prompt()` injects personality behavioral disposition into system prompts when personality is set
+- Mood-driven temperature adjustment — `mood_adjusted_temperature()` maps creativity/curiosity/precision/risk traits to inference temperature (0.1–1.5)
+- Personality-aware agent scoring — `personality_score()` factors trait groups and specific trait levels into task-agent assignment (15% weight)
+- Task context fields: `personality_group` and `personality_trait` for personality-based agent selection
+- bhava 0.22.3 as optional dependency (15-trait personality system, mood vectors, sentiment analysis)
+
+### Changed
+- hoosh dependency updated to 0.22.3 (with sentiment analysis support)
+- Scoring weights redistributed when `personality` feature enabled (tool: 0.35, complexity: 0.25, GPU: 0.10, domain: 0.15, personality: 0.15)
+- `full` feature now includes `personality`
+
 ## [0.21.3] — 2026-03-21
 
 ### Added

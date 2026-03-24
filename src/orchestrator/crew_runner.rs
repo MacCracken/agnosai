@@ -518,13 +518,23 @@ async fn execute_task(
         user_msg.push_str(&format!("\n\nExpected output format: {expected}"));
     }
 
+    // Base temperature — may be adjusted by personality mood.
+    let mut temperature = 0.7;
+
+    #[cfg(feature = "personality")]
+    if let Some(agent) = agent {
+        if let Some(ref profile) = agent.personality {
+            temperature = mood_adjusted_temperature(profile, temperature);
+        }
+    }
+
     let request = InferenceRequest {
         model: model.to_string(),
         prompt: user_msg,
         system: Some(system_prompt),
         messages,
         max_tokens: Some(4096),
-        temperature: Some(0.7),
+        temperature: Some(temperature),
         ..Default::default()
     };
 
@@ -707,6 +717,15 @@ fn build_system_prompt(agent: Option<&AgentDefinition>) -> String {
         prompt.push_str(&format!("\n\nAvailable tools: {}", agent.tools.join(", ")));
     }
 
+    #[cfg(feature = "personality")]
+    if let Some(ref profile) = agent.personality {
+        let disposition = profile.compose_prompt();
+        if !disposition.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&disposition);
+        }
+    }
+
     prompt
 }
 
@@ -750,6 +769,32 @@ fn select_model(agent: Option<&AgentDefinition>) -> &str {
 
     // No agent — use capable tier default.
     crate::llm::default_model(crate::llm::ModelTier::Capable)
+}
+
+/// Adjust inference temperature based on personality traits.
+///
+/// Maps personality dimensions to temperature modifiers:
+/// - High creativity / curiosity → higher temperature (more diverse output)
+/// - High precision / low risk tolerance → lower temperature (more focused output)
+/// - High confidence → slightly lower (more deterministic)
+///
+/// Returns a temperature clamped to 0.1–1.5.
+#[cfg(feature = "personality")]
+fn mood_adjusted_temperature(profile: &bhava::traits::PersonalityProfile, base: f64) -> f64 {
+    use bhava::traits::TraitKind;
+
+    let creativity = profile.get_trait(TraitKind::Creativity).normalized() as f64;
+    let curiosity = profile.get_trait(TraitKind::Curiosity).normalized() as f64;
+    let precision = profile.get_trait(TraitKind::Precision).normalized() as f64;
+    let risk = profile.get_trait(TraitKind::RiskTolerance).normalized() as f64;
+    let confidence = profile.get_trait(TraitKind::Confidence).normalized() as f64;
+
+    // Creativity and curiosity push temperature up; precision and confidence pull down
+    let delta = (creativity * 0.15) + (curiosity * 0.1) + (risk * 0.1)
+        - (precision * 0.15)
+        - (confidence * 0.05);
+
+    (base + delta).clamp(0.1, 1.5)
 }
 
 /// Kahn's algorithm for topological sort. Returns an error on cycles.

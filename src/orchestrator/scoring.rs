@@ -1,10 +1,26 @@
 use crate::core::agent::AgentDefinition;
 use crate::core::task::Task;
 
+#[cfg(not(feature = "personality"))]
 const WEIGHT_TOOL_COVERAGE: f64 = 0.40;
+#[cfg(not(feature = "personality"))]
 const WEIGHT_COMPLEXITY: f64 = 0.30;
+#[cfg(not(feature = "personality"))]
 const WEIGHT_GPU: f64 = 0.15;
+#[cfg(not(feature = "personality"))]
 const WEIGHT_DOMAIN: f64 = 0.15;
+
+// With personality enabled, redistribute weights to include personality factor.
+#[cfg(feature = "personality")]
+const WEIGHT_TOOL_COVERAGE: f64 = 0.35;
+#[cfg(feature = "personality")]
+const WEIGHT_COMPLEXITY: f64 = 0.25;
+#[cfg(feature = "personality")]
+const WEIGHT_GPU: f64 = 0.10;
+#[cfg(feature = "personality")]
+const WEIGHT_DOMAIN: f64 = 0.15;
+#[cfg(feature = "personality")]
+const WEIGHT_PERSONALITY: f64 = 0.15;
 
 /// Map a complexity string to a numeric level.
 fn complexity_level(s: &str) -> u8 {
@@ -90,12 +106,85 @@ pub fn score_agent(agent: &AgentDefinition, task: &Task) -> f64 {
     let gpu = gpu_score(agent, task);
     let domain = domain_score(agent, task);
 
-    let score = WEIGHT_TOOL_COVERAGE * tool
+    let mut score = WEIGHT_TOOL_COVERAGE * tool
         + WEIGHT_COMPLEXITY * complexity
         + WEIGHT_GPU * gpu
         + WEIGHT_DOMAIN * domain;
 
+    #[cfg(feature = "personality")]
+    {
+        let personality = personality_score(agent, task);
+        score += WEIGHT_PERSONALITY * personality;
+    }
+
     score.clamp(0.0, 1.0)
+}
+
+/// Score personality fit for a task.
+///
+/// Uses task context fields:
+/// - `personality_group`: preferred trait group ("social", "cognitive", "behavioral", "professional")
+/// - `personality_trait`: specific required trait (e.g., "precision", "creativity")
+///
+/// When the `personality` feature is disabled, this function is not compiled.
+#[cfg(feature = "personality")]
+fn personality_score(agent: &AgentDefinition, task: &Task) -> f64 {
+    let Some(ref profile) = agent.personality else {
+        return 0.5; // no personality → neutral score
+    };
+
+    let mut score = 0.5; // base: neutral
+
+    // Check if task wants a specific trait group average
+    if let Some(group_name) = task
+        .context
+        .get("personality_group")
+        .and_then(|v| v.as_str())
+    {
+        let group = match group_name.to_lowercase().as_str() {
+            "social" => Some(bhava::traits::TraitGroup::Social),
+            "cognitive" => Some(bhava::traits::TraitGroup::Cognitive),
+            "behavioral" => Some(bhava::traits::TraitGroup::Behavioral),
+            "professional" => Some(bhava::traits::TraitGroup::Professional),
+            _ => None,
+        };
+        if let Some(g) = group {
+            // Higher group average → better fit (map -1..1 to 0..1)
+            score = ((profile.group_average(g) + 1.0) / 2.0) as f64;
+        }
+    }
+
+    // Check if task wants a specific trait level
+    if let Some(trait_name) = task
+        .context
+        .get("personality_trait")
+        .and_then(|v| v.as_str())
+    {
+        let kind = match trait_name.to_lowercase().as_str() {
+            "warmth" => Some(bhava::traits::TraitKind::Warmth),
+            "empathy" => Some(bhava::traits::TraitKind::Empathy),
+            "humor" => Some(bhava::traits::TraitKind::Humor),
+            "patience" => Some(bhava::traits::TraitKind::Patience),
+            "confidence" => Some(bhava::traits::TraitKind::Confidence),
+            "creativity" => Some(bhava::traits::TraitKind::Creativity),
+            "curiosity" => Some(bhava::traits::TraitKind::Curiosity),
+            "skepticism" => Some(bhava::traits::TraitKind::Skepticism),
+            "directness" => Some(bhava::traits::TraitKind::Directness),
+            "precision" => Some(bhava::traits::TraitKind::Precision),
+            "autonomy" => Some(bhava::traits::TraitKind::Autonomy),
+            "pedagogy" => Some(bhava::traits::TraitKind::Pedagogy),
+            "formality" => Some(bhava::traits::TraitKind::Formality),
+            "verbosity" => Some(bhava::traits::TraitKind::Verbosity),
+            "risk_tolerance" => Some(bhava::traits::TraitKind::RiskTolerance),
+            _ => None,
+        };
+        if let Some(k) = kind {
+            // Map -1..1 normalized to 0..1
+            score = ((profile.get_trait(k).normalized() + 1.0) / 2.0) as f64;
+        }
+    }
+
+    score
 }
 
 /// Rank agents by suitability for a task, returning (index, score) pairs sorted descending.
@@ -129,6 +218,8 @@ mod tests {
             gpu_preferred: false,
             gpu_memory_min_mb: None,
             hardware: None,
+            #[cfg(feature = "personality")]
+            personality: None,
         }
     }
 

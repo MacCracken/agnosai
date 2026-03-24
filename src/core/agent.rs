@@ -48,6 +48,14 @@ pub struct AgentDefinition {
     /// `gpu_memory_min_mb` fields. See [`hardware_requirement()`](Self::hardware_requirement).
     #[serde(default)]
     pub hardware: Option<HardwareRequirement>,
+
+    /// Personality profile from bhava (optional, requires `personality` feature).
+    ///
+    /// When set, the agent's system prompt includes behavioral disposition
+    /// derived from the personality traits.
+    #[cfg(feature = "personality")]
+    #[serde(default)]
+    pub personality: Option<bhava::traits::PersonalityProfile>,
 }
 
 fn default_complexity() -> String {
@@ -76,6 +84,8 @@ impl AgentDefinition {
             gpu_preferred: false,
             gpu_memory_min_mb: None,
             hardware: None,
+            #[cfg(feature = "personality")]
+            personality: None,
         }
     }
 
@@ -100,6 +110,13 @@ impl AgentDefinition {
     /// Set hardware requirements.
     pub fn with_hardware(mut self, hw: HardwareRequirement) -> Self {
         self.hardware = Some(hw);
+        self
+    }
+
+    /// Set a bhava personality profile for this agent.
+    #[cfg(feature = "personality")]
+    pub fn with_personality(mut self, profile: bhava::traits::PersonalityProfile) -> Self {
+        self.personality = Some(profile);
         self
     }
 
