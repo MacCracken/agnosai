@@ -105,7 +105,8 @@ impl SandboxManager {
             }
             IsolationLevel::Process => {
                 let sandbox = ProcessSandbox::shell(timeout);
-                let result = sandbox.execute(command, input).await?;
+                // Use execute_argv to avoid shell injection from untrusted commands.
+                let result = sandbox.execute_argv(&["sh", "-c", command], input).await?;
                 Ok(SandboxResult {
                     stdout: result.stdout,
                     stderr: result.stderr,

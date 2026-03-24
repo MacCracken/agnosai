@@ -11,6 +11,9 @@ use uuid::Uuid;
 /// Default broadcast channel capacity per crew.
 const CHANNEL_CAPACITY: usize = 256;
 
+/// Maximum number of concurrent crew event channels.
+const MAX_EVENT_CHANNELS: usize = 10_000;
+
 /// A crew execution event sent over SSE.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CrewEvent {
@@ -39,7 +42,25 @@ impl EventBus {
     }
 
     /// Get or create a broadcast sender for a crew.
+    ///
+    /// If the channel limit has been reached and this is a new crew ID,
+    /// orphan channels are cleaned up first. If still at capacity, the
+    /// channel is created anyway (the orchestrator needs it), but a warning
+    /// is logged.
     pub fn sender(&self, crew_id: Uuid) -> broadcast::Sender<CrewEvent> {
+        if let Some(entry) = self.channels.get(&crew_id) {
+            return entry.clone();
+        }
+        if self.channels.len() >= MAX_EVENT_CHANNELS {
+            self.cleanup_orphans();
+            if self.channels.len() >= MAX_EVENT_CHANNELS {
+                tracing::warn!(
+                    channels = self.channels.len(),
+                    limit = MAX_EVENT_CHANNELS,
+                    "event bus at capacity after orphan cleanup"
+                );
+            }
+        }
         self.channels
             .entry(crew_id)
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
@@ -57,16 +78,19 @@ impl EventBus {
     }
 
     /// Check whether a channel exists for the given crew.
+    #[must_use]
     pub fn has(&self, crew_id: Uuid) -> bool {
         self.channels.contains_key(&crew_id)
     }
 
     /// Number of active channels.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.channels.len()
     }
 
     /// Whether the event bus has no channels.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.channels.is_empty()
     }

@@ -23,6 +23,7 @@ const WEIGHT_DOMAIN: f64 = 0.15;
 const WEIGHT_PERSONALITY: f64 = 0.15;
 
 /// Map a complexity string to a numeric level.
+#[inline]
 fn complexity_level(s: &str) -> u8 {
     match s.to_lowercase().as_str() {
         "low" => 1,
@@ -33,6 +34,7 @@ fn complexity_level(s: &str) -> u8 {
 }
 
 /// Score the fraction of required tools the agent provides.
+#[inline]
 fn tool_coverage_score(agent: &AgentDefinition, task: &Task) -> f64 {
     let required = match task.context.get("required_tools") {
         Some(val) => match serde_json::from_value::<Vec<String>>(val.clone()) {
@@ -52,6 +54,7 @@ fn tool_coverage_score(agent: &AgentDefinition, task: &Task) -> f64 {
 }
 
 /// Score how well the agent's complexity matches the task's.
+#[inline]
 fn complexity_score(agent: &AgentDefinition, task: &Task) -> f64 {
     let task_complexity = task
         .context
@@ -64,6 +67,7 @@ fn complexity_score(agent: &AgentDefinition, task: &Task) -> f64 {
 }
 
 /// Score GPU compatibility.
+#[inline]
 fn gpu_score(agent: &AgentDefinition, task: &Task) -> f64 {
     let gpu_required = task
         .context
@@ -81,6 +85,7 @@ fn gpu_score(agent: &AgentDefinition, task: &Task) -> f64 {
 }
 
 /// Score domain match.
+#[inline]
 fn domain_score(agent: &AgentDefinition, task: &Task) -> f64 {
     let task_domain = match task.context.get("domain").and_then(|v| v.as_str()) {
         Some(d) => d,
@@ -100,6 +105,7 @@ fn domain_score(agent: &AgentDefinition, task: &Task) -> f64 {
 /// - Complexity alignment (0.30): how well complexity levels match
 /// - GPU match (0.15): GPU capability when the task requires it
 /// - Domain match (0.15): domain compatibility
+#[must_use]
 pub fn score_agent(agent: &AgentDefinition, task: &Task) -> f64 {
     let tool = tool_coverage_score(agent, task);
     let complexity = complexity_score(agent, task);
@@ -188,6 +194,7 @@ fn personality_score(agent: &AgentDefinition, task: &Task) -> f64 {
 }
 
 /// Rank agents by suitability for a task, returning (index, score) pairs sorted descending.
+#[must_use]
 pub fn rank_agents(agents: &[AgentDefinition], task: &Task) -> Vec<(usize, f64)> {
     let mut scored: Vec<(usize, f64)> = agents
         .iter()
@@ -233,6 +240,20 @@ mod tests {
         task
     }
 
+    /// Helper: compute expected score using the active weight constants.
+    fn expected_score(tool: f64, complexity: f64, gpu: f64, domain: f64) -> f64 {
+        let mut s = WEIGHT_TOOL_COVERAGE * tool
+            + WEIGHT_COMPLEXITY * complexity
+            + WEIGHT_GPU * gpu
+            + WEIGHT_DOMAIN * domain;
+        // When personality feature is on but agent has no personality, personality_score returns 0.5.
+        #[cfg(feature = "personality")]
+        {
+            s += WEIGHT_PERSONALITY * 0.5;
+        }
+        s
+    }
+
     #[test]
     fn test_perfect_score() {
         let agent = make_agent(vec!["lint", "test"], "medium", Some("quality"));
@@ -242,9 +263,10 @@ mod tests {
             "domain": "quality"
         }));
         let score = score_agent(&agent, &task);
+        let expected = expected_score(1.0, 1.0, 1.0, 1.0);
         assert!(
-            (score - 1.0).abs() < f64::EPSILON,
-            "expected 1.0, got {score}"
+            (score - expected).abs() < 1e-9,
+            "expected {expected}, got {score}"
         );
     }
 
@@ -255,8 +277,7 @@ mod tests {
             "required_tools": ["lint", "test", "scan"]
         }));
         let score = score_agent(&agent, &task);
-        // tool coverage = 0.0, complexity = 1.0, gpu = 1.0, domain = 1.0
-        let expected = 0.0 * 0.4 + 1.0 * 0.3 + 1.0 * 0.15 + 1.0 * 0.15;
+        let expected = expected_score(0.0, 1.0, 1.0, 1.0);
         assert!(
             (score - expected).abs() < 1e-9,
             "expected {expected}, got {score}"
@@ -269,9 +290,8 @@ mod tests {
         let task = make_task_with_context(json!({
             "required_tools": ["lint", "test", "scan", "deploy"]
         }));
-        let tool = 2.0 / 4.0; // 0.5
-        let expected = tool * 0.4 + 1.0 * 0.3 + 1.0 * 0.15 + 1.0 * 0.15;
         let score = score_agent(&agent, &task);
+        let expected = expected_score(0.5, 1.0, 1.0, 1.0);
         assert!(
             (score - expected).abs() < 1e-9,
             "expected {expected}, got {score}"
@@ -282,9 +302,8 @@ mod tests {
     fn test_complexity_mismatch() {
         let agent = make_agent(vec![], "low", None);
         let task = make_task_with_context(json!({ "complexity": "high" }));
-        // tool = 1.0, complexity = 1 - 2/3 = 1/3, gpu = 1.0, domain = 1.0
-        let expected = 1.0 * 0.4 + (1.0 / 3.0) * 0.3 + 1.0 * 0.15 + 1.0 * 0.15;
         let score = score_agent(&agent, &task);
+        let expected = expected_score(1.0, 1.0 / 3.0, 1.0, 1.0);
         assert!(
             (score - expected).abs() < 1e-9,
             "expected {expected}, got {score}"
@@ -297,7 +316,11 @@ mod tests {
         agent.gpu_required = true;
         let task = make_task_with_context(json!({ "gpu_required": true }));
         let score = score_agent(&agent, &task);
-        assert!((score - 1.0).abs() < f64::EPSILON);
+        let expected = expected_score(1.0, 1.0, 1.0, 1.0);
+        assert!(
+            (score - expected).abs() < 1e-9,
+            "expected {expected}, got {score}"
+        );
     }
 
     #[test]
@@ -306,16 +329,19 @@ mod tests {
         agent.gpu_preferred = true;
         let task = make_task_with_context(json!({ "gpu_required": true }));
         let score = score_agent(&agent, &task);
-        assert!((score - 1.0).abs() < f64::EPSILON);
+        let expected = expected_score(1.0, 1.0, 1.0, 1.0);
+        assert!(
+            (score - expected).abs() < 1e-9,
+            "expected {expected}, got {score}"
+        );
     }
 
     #[test]
     fn test_gpu_required_agent_lacks_it() {
         let agent = make_agent(vec![], "medium", None);
         let task = make_task_with_context(json!({ "gpu_required": true }));
-        // gpu = 0.0
-        let expected = 1.0 * 0.4 + 1.0 * 0.3 + 0.0 * 0.15 + 1.0 * 0.15;
         let score = score_agent(&agent, &task);
+        let expected = expected_score(1.0, 1.0, 0.0, 1.0);
         assert!(
             (score - expected).abs() < 1e-9,
             "expected {expected}, got {score}"
@@ -326,8 +352,8 @@ mod tests {
     fn test_domain_mismatch() {
         let agent = make_agent(vec![], "medium", Some("devops"));
         let task = make_task_with_context(json!({ "domain": "quality" }));
-        let expected = 1.0 * 0.4 + 1.0 * 0.3 + 1.0 * 0.15 + 0.0 * 0.15;
         let score = score_agent(&agent, &task);
+        let expected = expected_score(1.0, 1.0, 1.0, 0.0);
         assert!(
             (score - expected).abs() < 1e-9,
             "expected {expected}, got {score}"
@@ -339,9 +365,10 @@ mod tests {
         let agent = make_agent(vec![], "medium", None);
         let task = Task::new("simple task");
         let score = score_agent(&agent, &task);
+        let expected = expected_score(1.0, 1.0, 1.0, 1.0);
         assert!(
-            (score - 1.0).abs() < f64::EPSILON,
-            "expected 1.0, got {score}"
+            (score - expected).abs() < 1e-9,
+            "expected {expected}, got {score}"
         );
     }
 

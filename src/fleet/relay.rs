@@ -89,7 +89,7 @@ impl Relay {
         topic: impl Into<String>,
         payload: serde_json::Value,
     ) -> u64 {
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
         let msg = RelayMessage {
             seq,
             from: self.node_id.clone(),

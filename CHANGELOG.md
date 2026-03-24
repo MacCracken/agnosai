@@ -5,6 +5,44 @@ All notable changes to AgnosAI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.4] — 2026-03-24
+
+### Changed
+- hoosh dependency updated from 0.22.3 to 0.23.4 (tool use/function calling, model registry)
+- bhava dependency updated from 0.23.3 to 0.24.3 (14 new modules, 785 tests)
+- ai-hwaccel dependency updated from 0.21.3 to 0.23.3
+- `hoosh::inference::Message` construction uses `Message::new()` constructor (new `tool_call_id`/`tool_calls` fields)
+- Scoring tests use weight constants instead of hardcoded values (works with/without personality feature)
+- `PubSub::subscribe()` now returns `Option` (returns `None` when at 10,000 pattern limit)
+- `Ucb1::select()` and `best_arm()` now return `Option<usize>` (returns `None` for empty bandits)
+- MCP server reports `CARGO_PKG_VERSION` instead of hardcoded `"0.1.0"`
+- Relay sequence numbers use `Ordering::AcqRel` instead of `Relaxed`
+- GPL-3.0 / GPL-3.0-only added to `deny.toml` license allowlist (bhava compatibility)
+
+### Security
+- **Constant-time comparison**: length XOR no longer truncates to `u8` — lengths differing by 256 no longer collide
+- **SSRF hardening**: `is_private_ip` now covers IPv6 private ranges (fc00::/7, fe80::/10) and IPv6-mapped IPv4 addresses (::ffff:x.x.x.x)
+- **A2A callback timeout**: 30s timeout on fire-and-forget callback requests (prevents slow-server DoS)
+- **Process sandbox env sanitization**: `execute()` now strips `LD_PRELOAD`/`LD_LIBRARY_PATH`/`DYLD_*` (was only done in `execute_argv()`)
+- **SandboxManager**: process backend uses `execute_argv` path for env sanitization
+- **DAG failure propagation**: failed tasks are no longer treated as completed dependencies — downstream tasks are skipped
+- **PubSub DoS protection**: subscription patterns capped at 10,000
+- **EventBus DoS protection**: channel count monitored with orphan cleanup at capacity
+- **Replay buffer sampling**: fixed biased weighted sampling (remaining priority recomputed per draw)
+- **StringInterner overflow**: `checked_add` on u32 ID allocation (panic on overflow instead of silent wrap)
+
+### Performance
+- `#[inline]` on scoring hot-path functions: `tool_coverage_score`, `complexity_score`, `gpu_score`, `domain_score`, `complexity_level`
+- `format!` → `write!` on system prompt construction, error messages, expected output formatting
+- `CapabilityScore::recent` bounded to 64 entries (was unbounded)
+- `PerformanceProfile` records bounded to 10,000 per agent (was unbounded)
+- `success_rate_for_action` / `avg_duration_for_action` eliminated intermediate `Vec` allocation
+
+### Added
+- `#[must_use]` on pure functions: `score_agent`, `rank_agents`, `matches_pattern`, `pattern_count`, `EventBus::has/len/is_empty`, `Ucb1::select/best_arm/arm_count`, `ReplayBuffer::sample/len/is_empty`, `QLearner::get_value/best_action`, `CapabilityScorer::confidence/trend/all_scores`, `PerformanceProfile::success_rate*/avg_duration*/total_actions`
+- `#[inline]` on `is_private_ipv4` helper
+- `is_private_ipv4` helper for cleaner IPv4 range checks
+
 ## [0.22.3] — 2026-03-23
 
 ### Added

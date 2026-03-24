@@ -395,6 +395,7 @@ impl CrewRunner {
                 });
             }
 
+            let mut wave_failed = false;
             while let Some(res) = join_set.join_next().await {
                 match res {
                     Ok(tr) => {
@@ -408,16 +409,38 @@ impl CrewRunner {
                                 "status": format!("{:?}", tr.status),
                             }),
                         );
-                        completed.insert(tr.task_id);
+                        if tr.status == TaskStatus::Failed {
+                            wave_failed = true;
+                            warn!(task_id = %tr.task_id, "DAG task failed — downstream tasks will be skipped");
+                        } else {
+                            // Only mark successful tasks as completed for dependency resolution.
+                            completed.insert(tr.task_id);
+                        }
                         results.push(tr);
                     }
                     Err(e) => {
                         warn!(error = %e, "DAG task join error");
+                        wave_failed = true;
                     }
                 }
             }
 
             remaining = not_ready;
+
+            // If any task in this wave failed and there are remaining tasks
+            // that depend on the failed one, stop early to prevent cascading.
+            if wave_failed && !remaining.is_empty() {
+                // Check if any remaining task can still run (all deps in completed set).
+                let any_runnable = remaining.iter().any(|id| {
+                    dep_sets
+                        .get(id)
+                        .is_none_or(|deps| deps.is_subset(&completed))
+                });
+                if !any_runnable {
+                    warn!("DAG execution halted: no runnable tasks after failure");
+                    break;
+                }
+            }
         }
 
         Ok(results)
@@ -502,30 +525,31 @@ async fn execute_task(
     let mut messages = Vec::new();
     if !task.context.is_empty() {
         let ctx_json = serde_json::to_string_pretty(&task.context).unwrap_or_default();
-        messages.push(Message {
-            role: Role::User,
-            content: format!("Context:\n```json\n{ctx_json}\n```"),
-        });
-        messages.push(Message {
-            role: Role::Assistant,
-            content: "Understood, I have the context.".into(),
-        });
+        messages.push(Message::new(
+            Role::User,
+            format!("Context:\n```json\n{ctx_json}\n```"),
+        ));
+        messages.push(Message::new(
+            Role::Assistant,
+            "Understood, I have the context.",
+        ));
     }
 
     // The task description is the main user message.
     let mut user_msg = task.description.clone();
     if let Some(ref expected) = task.expected_output {
-        user_msg.push_str(&format!("\n\nExpected output format: {expected}"));
+        use std::fmt::Write;
+        let _ = write!(user_msg, "\n\nExpected output format: {expected}");
     }
 
     // Base temperature — may be adjusted by personality mood.
     let mut temperature = 0.7;
 
     #[cfg(feature = "personality")]
-    if let Some(agent) = agent {
-        if let Some(ref profile) = agent.personality {
-            temperature = mood_adjusted_temperature(profile, temperature);
-        }
+    if let Some(agent) = agent
+        && let Some(ref profile) = agent.personality
+    {
+        temperature = mood_adjusted_temperature(profile, temperature);
     }
 
     let request = InferenceRequest {
@@ -682,9 +706,12 @@ async fn execute_task(
                 serde_json::json!(task_duration_ms),
             );
 
+            let mut output = String::from("LLM error: ");
+            use std::fmt::Write;
+            let _ = write!(output, "{e}");
             TaskResult {
                 task_id: task.id,
-                output: format!("LLM error: {e}"),
+                output,
                 status: TaskStatus::Failed,
                 metadata,
             }
@@ -706,15 +733,18 @@ fn build_system_prompt(agent: Option<&AgentDefinition>) -> String {
     );
 
     if let Some(ref backstory) = agent.backstory {
-        prompt.push_str(&format!("\n\nBackstory: {backstory}"));
+        use std::fmt::Write;
+        let _ = write!(prompt, "\n\nBackstory: {backstory}");
     }
 
     if let Some(ref domain) = agent.domain {
-        prompt.push_str(&format!("\n\nDomain expertise: {domain}"));
+        use std::fmt::Write;
+        let _ = write!(prompt, "\n\nDomain expertise: {domain}");
     }
 
     if !agent.tools.is_empty() {
-        prompt.push_str(&format!("\n\nAvailable tools: {}", agent.tools.join(", ")));
+        use std::fmt::Write;
+        let _ = write!(prompt, "\n\nAvailable tools: {}", agent.tools.join(", "));
     }
 
     #[cfg(feature = "personality")]
@@ -872,6 +902,8 @@ mod tests {
             gpu_preferred: false,
             gpu_memory_min_mb: None,
             hardware: None,
+            #[cfg(feature = "personality")]
+            personality: None,
         }
     }
 

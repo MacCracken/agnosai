@@ -41,16 +41,23 @@ impl Ucb1 {
 
     /// Select the next arm using UCB1: mean + sqrt(2 * ln(N) / n).
     /// Arms that have never been pulled are selected first (lowest index).
-    pub fn select(&self, total_rounds: u32) -> usize {
+    ///
+    /// Returns `None` if there are no arms.
+    #[must_use]
+    pub fn select(&self, total_rounds: u32) -> Option<usize> {
+        if self.arms.is_empty() {
+            return None;
+        }
+
         // Select any unexplored arm first.
         for (i, arm) in self.arms.iter().enumerate() {
             if arm.count == 0 {
-                return i;
+                return Some(i);
             }
         }
 
         if total_rounds == 0 {
-            return 0;
+            return Some(0);
         }
 
         let ln_n = (total_rounds as f64).ln();
@@ -63,7 +70,6 @@ impl Ucb1 {
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
-            .unwrap_or(0)
     }
 
     /// Record a reward for the given arm index.
@@ -75,7 +81,9 @@ impl Ucb1 {
     }
 
     /// Return the arm index with the highest mean reward.
-    pub fn best_arm(&self) -> usize {
+    /// Returns `None` if there are no arms.
+    #[must_use]
+    pub fn best_arm(&self) -> Option<usize> {
         self.arms
             .iter()
             .enumerate()
@@ -85,10 +93,10 @@ impl Ucb1 {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(i, _)| i)
-            .unwrap_or(0)
     }
 
     /// Number of arms.
+    #[must_use]
     pub fn arm_count(&self) -> usize {
         self.arms.len()
     }
@@ -102,7 +110,7 @@ mod tests {
     fn select_unexplored_first() {
         let bandit = Ucb1::new(vec!["a".into(), "b".into(), "c".into()]);
         // With no rounds played, should select first unexplored arm (index 0).
-        assert_eq!(bandit.select(0), 0);
+        assert_eq!(bandit.select(0), Some(0));
     }
 
     #[test]
@@ -111,10 +119,10 @@ mod tests {
         // Pull arm 0.
         bandit.update(0, 1.0);
         // Next select should pick arm 1 (first unexplored).
-        assert_eq!(bandit.select(1), 1);
+        assert_eq!(bandit.select(1), Some(1));
         bandit.update(1, 0.5);
         // Now arm 2 is unexplored.
-        assert_eq!(bandit.select(2), 2);
+        assert_eq!(bandit.select(2), Some(2));
     }
 
     #[test]
@@ -134,7 +142,7 @@ mod tests {
             bandit.update(0, 0.1);
         }
         // With enough exploitation data, best_arm should be 1.
-        assert_eq!(bandit.best_arm(), 1);
+        assert_eq!(bandit.best_arm(), Some(1));
     }
 
     #[test]
@@ -143,7 +151,7 @@ mod tests {
         bandit.update(0, 0.3);
         bandit.update(1, 0.9);
         bandit.update(2, 0.5);
-        assert_eq!(bandit.best_arm(), 1);
+        assert_eq!(bandit.best_arm(), Some(1));
     }
 
     #[test]
@@ -156,7 +164,7 @@ mod tests {
     fn empty_bandit() {
         let bandit = Ucb1::new(vec![]);
         assert_eq!(bandit.arm_count(), 0);
-        assert_eq!(bandit.select(0), 0);
-        assert_eq!(bandit.best_arm(), 0);
+        assert_eq!(bandit.select(0), None);
+        assert_eq!(bandit.best_arm(), None);
     }
 }

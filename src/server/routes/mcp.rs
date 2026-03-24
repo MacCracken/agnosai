@@ -97,7 +97,7 @@ fn handle_initialize(id: Value) -> JsonRpcResponse {
             "protocolVersion": "2024-11-05",
             "serverInfo": {
                 "name": "agnosai",
-                "version": "0.1.0"
+                "version": env!("CARGO_PKG_VERSION")
             },
             "capabilities": {
                 "tools": {}
@@ -273,7 +273,10 @@ mod tests {
         assert_eq!(json["id"], 1);
         assert_eq!(json["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(json["result"]["serverInfo"]["name"], "agnosai");
-        assert_eq!(json["result"]["serverInfo"]["version"], "0.1.0");
+        assert_eq!(
+            json["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
         assert!(json["result"]["capabilities"]["tools"].is_object());
     }
 

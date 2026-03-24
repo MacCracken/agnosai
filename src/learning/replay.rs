@@ -54,25 +54,42 @@ impl ReplayBuffer {
 
     /// Sample a batch of experiences, weighted by priority.
     /// Returns up to `batch_size` references (may return fewer if buffer is smaller).
+    #[must_use]
     pub fn sample(&self, batch_size: usize) -> Vec<&Experience> {
         if self.experiences.is_empty() {
             return Vec::new();
         }
 
         let n = batch_size.min(self.experiences.len());
-        let total_priority: f64 = self.experiences.iter().map(|e| e.priority.abs()).sum();
-
-        if total_priority == 0.0 {
-            // All zero priority — return first n.
-            return self.experiences.iter().take(n).collect();
-        }
-
         let mut rng = rand::thread_rng();
         let mut result = Vec::with_capacity(n);
         let mut selected = vec![false; self.experiences.len()];
 
         for _ in 0..n {
-            let mut r = rng.r#gen::<f64>() * total_priority;
+            // Recompute remaining priority each round to avoid bias.
+            let remaining_priority: f64 = self
+                .experiences
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !selected[*i])
+                .map(|(_, e)| e.priority.abs())
+                .sum();
+
+            if remaining_priority <= 0.0 || remaining_priority.is_nan() {
+                // Fall back: fill from unselected in order.
+                for (i, exp) in self.experiences.iter().enumerate() {
+                    if result.len() >= n {
+                        break;
+                    }
+                    if !selected[i] {
+                        selected[i] = true;
+                        result.push(exp);
+                    }
+                }
+                break;
+            }
+
+            let mut r = rng.r#gen::<f64>() * remaining_priority;
             let mut chosen = 0;
             for (i, exp) in self.experiences.iter().enumerate() {
                 if selected[i] {
@@ -85,33 +102,21 @@ impl ReplayBuffer {
                 }
                 chosen = i;
             }
-            if !selected[chosen] {
-                selected[chosen] = true;
-                result.push(&self.experiences[chosen]);
-            }
-        }
-
-        // If we didn't get enough due to collisions, fill from unselected.
-        if result.len() < n {
-            for (i, exp) in self.experiences.iter().enumerate() {
-                if result.len() >= n {
-                    break;
-                }
-                if !selected[i] {
-                    result.push(exp);
-                }
-            }
+            selected[chosen] = true;
+            result.push(&self.experiences[chosen]);
         }
 
         result
     }
 
     /// Number of experiences currently in the buffer.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.experiences.len()
     }
 
     /// Whether the buffer contains no experiences.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.experiences.is_empty()
     }

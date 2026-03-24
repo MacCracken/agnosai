@@ -183,6 +183,8 @@ mod tests {
             gpu_preferred: false,
             gpu_memory_min_mb: Some(4096),
             hardware: None,
+            #[cfg(feature = "personality")]
+            personality: None,
         };
         let json = serde_json::to_string(&agent).unwrap();
         let restored: AgentDefinition = serde_json::from_str(&json).unwrap();
@@ -310,6 +312,8 @@ mod tests {
                 min_cpu_cores: 0,
                 required_family: None,
             }),
+            #[cfg(feature = "personality")]
+            personality: None,
         };
         let req = agent.hardware_requirement();
         assert_eq!(req.accelerators, vec![AcceleratorType::Tpu]);
@@ -333,6 +337,8 @@ mod tests {
             gpu_preferred: true,
             gpu_memory_min_mb: Some(8192),
             hardware: None,
+            #[cfg(feature = "personality")]
+            personality: None,
         };
         let req = agent.hardware_requirement();
         assert_eq!(
@@ -358,6 +364,8 @@ mod tests {
             gpu_preferred: false,
             gpu_memory_min_mb: None,
             hardware: None,
+            #[cfg(feature = "personality")]
+            personality: None,
         };
         let req = agent.hardware_requirement();
         assert!(req.accelerators.is_empty());
@@ -388,6 +396,8 @@ mod tests {
                 min_cpu_cores: 4,
                 required_family: None,
             }),
+            #[cfg(feature = "personality")]
+            personality: None,
         };
         let json = serde_json::to_string(&agent).unwrap();
         let restored: AgentDefinition = serde_json::from_str(&json).unwrap();

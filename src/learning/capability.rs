@@ -46,7 +46,16 @@ impl CapabilityScore {
         }
     }
 
+    /// Maximum number of recent observations kept for trend detection.
+    const MAX_RECENT: usize = 64;
+
     fn update_trend(&mut self) {
+        // Trim to bounded window to prevent unbounded growth.
+        if self.recent.len() > Self::MAX_RECENT {
+            let drain_count = self.recent.len() - Self::MAX_RECENT;
+            self.recent.drain(..drain_count);
+        }
+
         let window = 5;
         if self.recent.len() < window {
             self.trend = Trend::Stable;
@@ -105,11 +114,13 @@ impl CapabilityScorer {
     }
 
     /// Get confidence for a capability. Returns 0.5 for unknown capabilities.
+    #[must_use]
     pub fn confidence(&self, capability: &str) -> f64 {
         self.scores.get(capability).map_or(0.5, |s| s.confidence)
     }
 
     /// Get the trend for a capability. Returns Stable for unknown capabilities.
+    #[must_use]
     pub fn trend(&self, capability: &str) -> Trend {
         self.scores
             .get(capability)
@@ -117,6 +128,7 @@ impl CapabilityScorer {
     }
 
     /// Return all capability names and their scores.
+    #[must_use]
     pub fn all_scores(&self) -> Vec<(&str, &CapabilityScore)> {
         self.scores.iter().map(|(k, v)| (k.as_str(), v)).collect()
     }

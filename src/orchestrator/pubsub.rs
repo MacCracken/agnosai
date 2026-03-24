@@ -15,6 +15,9 @@ use tokio::sync::broadcast;
 /// Default broadcast channel capacity per subscription pattern.
 const CHANNEL_CAPACITY: usize = 256;
 
+/// Maximum number of subscription patterns to prevent unbounded memory growth.
+const MAX_SUBSCRIPTION_PATTERNS: usize = 10_000;
+
 /// A message delivered to subscribers.
 #[derive(Debug, Clone)]
 pub struct TopicMessage {
@@ -49,11 +52,29 @@ impl PubSub {
     /// If the same pattern is subscribed to more than once, each call returns
     /// an independent receiver attached to the *same* underlying broadcast
     /// channel, so every receiver sees every matching message.
-    pub fn subscribe(&self, pattern: &str) -> broadcast::Receiver<TopicMessage> {
-        self.subscriptions
-            .entry(pattern.to_owned())
-            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
-            .subscribe()
+    ///
+    /// Returns `None` if the maximum number of subscription patterns has been
+    /// reached and the pattern is new.
+    pub fn subscribe(&self, pattern: &str) -> Option<broadcast::Receiver<TopicMessage>> {
+        // Check if pattern already exists (no capacity issue).
+        if let Some(entry) = self.subscriptions.get(pattern) {
+            return Some(entry.subscribe());
+        }
+        // Enforce max patterns for new subscriptions.
+        if self.subscriptions.len() >= MAX_SUBSCRIPTION_PATTERNS {
+            tracing::warn!(
+                pattern,
+                limit = MAX_SUBSCRIPTION_PATTERNS,
+                "pubsub subscription rejected: pattern limit reached"
+            );
+            return None;
+        }
+        Some(
+            self.subscriptions
+                .entry(pattern.to_owned())
+                .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
+                .subscribe(),
+        )
     }
 
     /// Publish a message to a concrete topic.
@@ -85,6 +106,7 @@ impl PubSub {
     }
 
     /// Return the number of active subscription patterns.
+    #[must_use]
     pub fn pattern_count(&self) -> usize {
         self.subscriptions.len()
     }
@@ -104,6 +126,7 @@ impl Default for PubSub {
 /// - All other segments must match literally.
 ///
 /// Both pattern and topic are split on `'.'`.
+#[must_use]
 pub fn matches_pattern(pattern: &str, topic: &str) -> bool {
     // Use stack-allocated arrays for small segment counts (typical: 2-5 segments).
     // Only heap-allocate for unusually deep topic hierarchies.
@@ -273,7 +296,7 @@ mod tests {
     #[tokio::test]
     async fn publish_reaches_exact_subscriber() {
         let ps = PubSub::new();
-        let mut rx = ps.subscribe("task.completed");
+        let mut rx = ps.subscribe("task.completed").unwrap();
 
         ps.publish("task.completed", json!({"id": 1}));
 
@@ -285,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn publish_reaches_wildcard_subscriber() {
         let ps = PubSub::new();
-        let mut rx = ps.subscribe("task.*");
+        let mut rx = ps.subscribe("task.*").unwrap();
 
         ps.publish("task.completed", json!({"id": 2}));
         ps.publish("task.failed", json!({"id": 3}));
@@ -300,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn publish_reaches_hash_subscriber() {
         let ps = PubSub::new();
-        let mut rx = ps.subscribe("agent.#");
+        let mut rx = ps.subscribe("agent.#").unwrap();
 
         ps.publish("agent.status.changed", json!({"status": "idle"}));
 
@@ -311,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn non_matching_subscriber_gets_nothing() {
         let ps = PubSub::new();
-        let mut rx = ps.subscribe("task.*");
+        let mut rx = ps.subscribe("task.*").unwrap();
 
         ps.publish("agent.started", json!({}));
 
@@ -322,8 +345,8 @@ mod tests {
     #[tokio::test]
     async fn multiple_subscribers_same_pattern() {
         let ps = PubSub::new();
-        let mut rx1 = ps.subscribe("task.*");
-        let mut rx2 = ps.subscribe("task.*");
+        let mut rx1 = ps.subscribe("task.*").unwrap();
+        let mut rx2 = ps.subscribe("task.*").unwrap();
 
         ps.publish("task.done", json!({"ok": true}));
 
@@ -336,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn unsubscribe_all_closes_receivers() {
         let ps = PubSub::new();
-        let mut rx = ps.subscribe("task.*");
+        let mut rx = ps.subscribe("task.*").unwrap();
 
         ps.unsubscribe_all("task.*");
 
@@ -347,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn message_has_timestamp() {
         let ps = PubSub::new();
-        let mut rx = ps.subscribe("t");
+        let mut rx = ps.subscribe("t").unwrap();
         let before = Utc::now();
 
         ps.publish("t", json!(null));

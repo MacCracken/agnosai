@@ -53,17 +53,43 @@ fn is_safe_callback_url(url: &str) -> bool {
 }
 
 /// Check whether an IP address is in a private, loopback, or link-local range.
+///
+/// Covers IPv4 private ranges, IPv6 private/link-local ranges, and
+/// IPv6-mapped IPv4 addresses (e.g. `::ffff:10.0.0.1`).
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || (v4.octets()[0] == 169 && v4.octets()[1] == 254) // metadata
-                || (v4.octets()[0] == 0) // 0.0.0.0/8
+        std::net::IpAddr::V4(v4) => is_private_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return true;
+            }
+            // IPv6-mapped IPv4: ::ffff:x.x.x.x — check the embedded IPv4.
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_private_ipv4(mapped);
+            }
+            let segments = v6.segments();
+            // fc00::/7 — unique local addresses
+            if segments[0] & 0xfe00 == 0xfc00 {
+                return true;
+            }
+            // fe80::/10 — link-local
+            if segments[0] & 0xffc0 == 0xfe80 {
+                return true;
+            }
+            false
         }
-        std::net::IpAddr::V6(v6) => v6.is_loopback(),
     }
+}
+
+/// Check whether an IPv4 address is private, loopback, link-local, or metadata.
+#[inline]
+fn is_private_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || (v4.octets()[0] == 169 && v4.octets()[1] == 254) // metadata
+        || v4.is_unspecified()                                // 0.0.0.0
+        || (v4.octets()[0] == 0) // 0.0.0.0/8
 }
 
 /// Maximum string field length for A2A requests.
@@ -193,8 +219,19 @@ pub async fn receive(
                     let resp_clone = response.clone();
                     let client = state.http_client.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = client.post(&url).json(&resp_clone).send().await {
-                            tracing::warn!(task_id = %task_id, url = %url, error = %e, "A2A callback failed");
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            client.post(&url).json(&resp_clone).send(),
+                        )
+                        .await;
+                        match result {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(task_id = %task_id, url = %url, error = %e, "A2A callback failed");
+                            }
+                            Err(_) => {
+                                tracing::warn!(task_id = %task_id, url = %url, "A2A callback timed out");
+                            }
                         }
                     });
                 } else {

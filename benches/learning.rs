@@ -51,7 +51,7 @@ fn bench_capability_confidence(c: &mut Criterion) {
     c.bench_function("CapabilityScorer::confidence (50 caps)", |b| {
         let mut idx = 0usize;
         b.iter(|| {
-            scorer.confidence(&caps[idx % 50]);
+            let _ = scorer.confidence(&caps[idx % 50]);
             idx += 1;
         });
     });
@@ -169,7 +169,7 @@ fn bench_qlearner_best_action(c: &mut Criterion) {
     c.bench_function("QLearner::best_action (1000 state-actions)", |b| {
         b.iter(|| {
             let state = format!("s_{}", i % 50);
-            q.best_action(&state, &actions);
+            let _ = q.best_action(&state, &actions);
             i += 1;
         });
     });
@@ -214,7 +214,7 @@ fn bench_profile_success_rate(c: &mut Criterion) {
     c.bench_function("PerformanceProfile::success_rate (20 agents)", |b| {
         let mut idx = 0usize;
         b.iter(|| {
-            profile.success_rate(&agents[idx % 20]);
+            let _ = profile.success_rate(&agents[idx % 20]);
             idx += 1;
         });
     });

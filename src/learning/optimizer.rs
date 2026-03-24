@@ -24,7 +24,10 @@ impl StringInterner {
             return id;
         }
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("StringInterner: exhausted u32 ID space (>4 billion unique strings)");
         self.map.insert(s.to_string(), id);
         id
     }
@@ -55,6 +58,7 @@ impl QLearner {
     }
 
     /// Get the Q-value for a (state, action) pair. Defaults to 0.0 if unseen.
+    #[must_use]
     pub fn get_value(&self, state: &str, action: &str) -> f64 {
         let s = self.interner.map.get(state);
         let a = self.interner.map.get(action);
@@ -88,6 +92,7 @@ impl QLearner {
 
     /// Return the action with the highest Q-value in the given state.
     /// Returns `None` if `actions` is empty.
+    #[must_use]
     pub fn best_action(&self, state: &str, actions: &[&str]) -> Option<String> {
         actions
             .iter()

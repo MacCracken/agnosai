@@ -16,15 +16,18 @@ use serde::{Deserialize, Serialize};
 /// Both length and content are compared in constant time — no early return
 /// on length mismatch that would leak secret length.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // XOR the lengths to avoid timing leak on length mismatch.
-    let mut result = (a.len() ^ b.len()) as u8;
-    // Compare up to the shorter length, then pad comparison for the remainder.
+    // Track length mismatch as a full usize to avoid truncation bugs
+    // (e.g. lengths differing by a multiple of 256 colliding when cast to u8).
+    let len_diff = a.len() ^ b.len();
+    // Compare up to the longer length, then pad comparison for the remainder.
+    let mut result: u8 = 0;
     for i in 0..a.len().max(b.len()) {
         let x = if i < a.len() { a[i] } else { 0 };
         let y = if i < b.len() { b[i] } else { 0 };
         result |= x ^ y;
     }
-    result == 0
+    // Both content and length must match.
+    result == 0 && len_diff == 0
 }
 
 /// JWT/auth configuration.

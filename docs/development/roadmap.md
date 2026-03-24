@@ -20,7 +20,7 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/registry
 (feature-gated), A2A route handlers, SSE streaming paths.
 
-### Ecosystem & Scale (v0.22 — aligned with ai-hwaccel v0.22.3)
+### Ecosystem & Scale (v0.23 — aligned with ai-hwaccel v0.23.3)
 
 | Item | Priority | Notes |
 |------|----------|-------|

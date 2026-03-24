@@ -17,6 +17,9 @@ pub struct ActionRecord {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Maximum number of action records retained per agent.
+const MAX_RECORDS_PER_AGENT: usize = 10_000;
+
 /// Tracks performance records per agent, enabling success-rate and duration queries.
 pub struct PerformanceProfile {
     records: HashMap<String, Vec<ActionRecord>>,
@@ -38,18 +41,22 @@ impl PerformanceProfile {
         duration: Duration,
         success: bool,
     ) {
-        self.records
-            .entry(agent_key.to_string())
-            .or_default()
-            .push(ActionRecord {
-                action_type: action_type.to_string(),
-                duration,
-                success,
-                timestamp: Utc::now(),
-            });
+        let records = self.records.entry(agent_key.to_string()).or_default();
+        // Evict oldest records when at capacity.
+        if records.len() >= MAX_RECORDS_PER_AGENT {
+            let drain_count = records.len() - MAX_RECORDS_PER_AGENT + 1;
+            records.drain(..drain_count);
+        }
+        records.push(ActionRecord {
+            action_type: action_type.to_string(),
+            duration,
+            success,
+            timestamp: Utc::now(),
+        });
     }
 
     /// Overall success rate for the agent across all action types.
+    #[must_use]
     pub fn success_rate(&self, agent_key: &str) -> Option<f64> {
         let records = self.records.get(agent_key)?;
         if records.is_empty() {
@@ -60,20 +67,25 @@ impl PerformanceProfile {
     }
 
     /// Success rate for a specific action type.
+    #[must_use]
     pub fn success_rate_for_action(&self, agent_key: &str, action_type: &str) -> Option<f64> {
         let records = self.records.get(agent_key)?;
-        let filtered: Vec<_> = records
+        let total = records
             .iter()
             .filter(|r| r.action_type == action_type)
-            .collect();
-        if filtered.is_empty() {
+            .count();
+        if total == 0 {
             return None;
         }
-        let successes = filtered.iter().filter(|r| r.success).count();
-        Some(successes as f64 / filtered.len() as f64)
+        let successes = records
+            .iter()
+            .filter(|r| r.action_type == action_type && r.success)
+            .count();
+        Some(successes as f64 / total as f64)
     }
 
     /// Average duration across all actions for the agent.
+    #[must_use]
     pub fn avg_duration(&self, agent_key: &str) -> Option<Duration> {
         let records = self.records.get(agent_key)?;
         if records.is_empty() {
@@ -85,21 +97,23 @@ impl PerformanceProfile {
     }
 
     /// Average duration for a specific action type.
+    #[must_use]
     pub fn avg_duration_for_action(&self, agent_key: &str, action_type: &str) -> Option<Duration> {
         let records = self.records.get(agent_key)?;
-        let filtered: Vec<_> = records
-            .iter()
-            .filter(|r| r.action_type == action_type)
-            .collect();
-        if filtered.is_empty() {
+        let mut total = Duration::ZERO;
+        let mut count = 0u32;
+        for r in records.iter().filter(|r| r.action_type == action_type) {
+            total += r.duration;
+            count += 1;
+        }
+        if count == 0 {
             return None;
         }
-        let total: Duration = filtered.iter().map(|r| r.duration).sum();
-        let count = u32::try_from(filtered.len()).unwrap_or(u32::MAX);
         Some(total / count)
     }
 
     /// Total number of recorded actions for the agent.
+    #[must_use]
     pub fn total_actions(&self, agent_key: &str) -> usize {
         self.records
             .get(agent_key)
