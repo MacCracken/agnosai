@@ -13,90 +13,15 @@ use crate::server::state::SharedState;
 ///
 /// Rejects URLs targeting private/internal networks to prevent SSRF.
 /// Also rejects hostnames that could be used for DNS rebinding attacks.
+/// Validate that a callback URL is safe to POST to (delegates to shared SSRF module).
 pub(crate) fn is_safe_callback_url(url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-
-    // Only allow HTTP(S).
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return false;
-    }
-
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-
-    // Block localhost and common internal names.
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost"
-        || lower == "127.0.0.1"
-        || lower == "::1"
-        || lower == "[::1]"
-        || lower.ends_with(".local")
-        || lower.ends_with(".internal")
-        || lower.ends_with(".localhost")
-    {
-        return false;
-    }
-
-    // Block private/link-local IP ranges. Use parsed.host() to correctly
-    // handle both IPv4 and bracketed IPv6 addresses.
-    match parsed.host() {
-        Some(url::Host::Ipv4(v4)) => {
-            if is_private_ipv4(v4) {
-                return false;
-            }
-        }
-        Some(url::Host::Ipv6(v6)) => {
-            if is_private_ip(std::net::IpAddr::V6(v6)) {
-                return false;
-            }
-        }
-        _ => {}
-    }
-
-    true
+    crate::server::ssrf::is_safe_url(url)
 }
 
-/// Check whether an IP address is in a private, loopback, or link-local range.
-///
-/// Covers IPv4 private ranges, IPv6 private/link-local ranges, and
-/// IPv6-mapped IPv4 addresses (e.g. `::ffff:10.0.0.1`).
+/// Re-export for test compatibility.
+#[cfg(test)]
 pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => is_private_ipv4(v4),
-        std::net::IpAddr::V6(v6) => {
-            if v6.is_loopback() {
-                return true;
-            }
-            // IPv6-mapped IPv4: ::ffff:x.x.x.x — check the embedded IPv4.
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_private_ipv4(mapped);
-            }
-            let segments = v6.segments();
-            // fc00::/7 — unique local addresses
-            if segments[0] & 0xfe00 == 0xfc00 {
-                return true;
-            }
-            // fe80::/10 — link-local
-            if segments[0] & 0xffc0 == 0xfe80 {
-                return true;
-            }
-            false
-        }
-    }
-}
-
-/// Check whether an IPv4 address is private, loopback, link-local, or metadata.
-#[inline]
-fn is_private_ipv4(v4: std::net::Ipv4Addr) -> bool {
-    v4.is_private()
-        || v4.is_loopback()
-        || v4.is_link_local()
-        || (v4.octets()[0] == 169 && v4.octets()[1] == 254) // metadata
-        || v4.is_unspecified()                                // 0.0.0.0
-        || (v4.octets()[0] == 0) // 0.0.0.0/8
+    crate::server::ssrf::is_private_ip(ip)
 }
 
 /// Maximum string field length for A2A requests.
@@ -149,6 +74,7 @@ pub struct A2AResponse {
 /// Builds a single-task crew from the request, runs it through the orchestrator,
 /// and returns the result. If `callback_url` is set, spawns a background task
 /// to POST results back (fire-and-forget).
+#[tracing::instrument(skip(state, req), fields(task_id = %req.task_id, domain = req.domain.as_deref().unwrap_or("general")))]
 pub async fn receive(
     State(state): State<SharedState>,
     Json(req): Json<A2ARequest>,

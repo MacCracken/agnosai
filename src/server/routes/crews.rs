@@ -140,6 +140,7 @@ pub(crate) fn has_dependency_cycle(n: usize, tasks: &[TaskRequest]) -> bool {
 }
 
 /// POST /api/v1/crews — Create and run a new crew.
+#[tracing::instrument(skip(state, req), fields(crew_name = %req.name, agents = req.agents.len(), tasks = req.tasks.len()))]
 pub async fn create_crew(
     State(state): State<SharedState>,
     Json(req): Json<CrewRunRequest>,

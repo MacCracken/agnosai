@@ -11,6 +11,7 @@
 //! - **`fleet`** — Distributed multi-node crew execution and GPU scheduling.
 //! - **`definitions`** — YAML/JSON agent preset loading and `.agpkg` packaging.
 //! - **`hwaccel`** — Hardware accelerator detection via [`ai-hwaccel`](https://github.com/maccracken/ai-hwaccel).
+//! - **`otel`** — OpenTelemetry OTLP trace export via [`hoosh::telemetry`].
 //! - **`full`** — Enables all of the above.
 
 pub mod core;
@@ -19,6 +20,9 @@ pub mod llm;
 pub mod orchestrator;
 pub mod server;
 pub mod tools;
+
+#[cfg(feature = "otel")]
+pub mod telemetry;
 
 #[cfg(feature = "sandbox")]
 pub mod sandbox;

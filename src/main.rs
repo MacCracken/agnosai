@@ -8,6 +8,7 @@ use agnosai::tools::builtin::echo::EchoTool;
 use agnosai::tools::builtin::json_transform::JsonTransformTool;
 use agnosai::tools::builtin::load_testing::LoadTestingTool;
 use agnosai::tools::builtin::security_audit::SecurityAuditTool;
+#[cfg(not(feature = "otel"))]
 use tracing_subscriber::EnvFilter;
 
 use agnosai::server::{AppState, SharedState, router};
@@ -55,10 +56,21 @@ fn load_auth_config() -> AuthConfig {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("agnosai=info".parse()?))
-        .json()
-        .init();
+    // Initialise tracing. When the `otel` feature is enabled and
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set, spans are exported via OTLP.
+    #[cfg(feature = "otel")]
+    let _tracing_guard = {
+        let endpoint = agnosai::telemetry::otlp_endpoint_from_env();
+        agnosai::telemetry::init_tracing(endpoint.as_deref())?
+    };
+
+    #[cfg(not(feature = "otel"))]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive("agnosai=info".parse()?))
+            .json()
+            .init();
+    }
 
     tracing::info!("AgnosAI server starting");
 

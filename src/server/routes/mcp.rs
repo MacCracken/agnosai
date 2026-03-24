@@ -75,6 +75,7 @@ impl JsonRpcResponse {
 }
 
 /// POST /mcp — Handle an MCP JSON-RPC 2.0 request.
+#[tracing::instrument(skip(state, req), fields(method = %req.method))]
 pub async fn mcp_handler(
     State(state): State<SharedState>,
     Json(req): Json<JsonRpcRequest>,

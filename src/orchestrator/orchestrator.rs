@@ -121,6 +121,7 @@ impl Orchestrator {
     }
 
     /// Submit and execute a crew, returning the final state.
+    #[tracing::instrument(skip(self, spec), fields(crew_id = %spec.id, crew_name = %spec.name, task_count = spec.tasks.len()))]
     pub async fn run_crew(&self, spec: CrewSpec) -> Result<CrewState> {
         // Enforce concurrent crew limit.
         let _permit =
@@ -265,6 +266,7 @@ impl Orchestrator {
     /// Sets the cancellation token so the crew runner stops scheduling new
     /// tasks and returns early. Tasks already in flight will complete but no
     /// new tasks will be started.
+    #[tracing::instrument(skip(self), fields(%crew_id))]
     pub async fn cancel_crew(&self, crew_id: CrewId) -> Result<()> {
         // Signal the cancellation token (if the crew is still running).
         if let Some(token) = self.cancel_tokens.get(&crew_id) {

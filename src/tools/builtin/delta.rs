@@ -151,6 +151,13 @@ impl NativeTool for DeltaTriggerPipeline {
                 None => return ToolOutput::err("missing required parameter: repo"),
             };
 
+            // Reject path traversal in user-supplied path segments.
+            for (name, val) in [("owner", &owner), ("repo", &repo)] {
+                if val.contains('/') || val.contains("..") {
+                    return ToolOutput::err(format!("{name} contains invalid characters"));
+                }
+            }
+
             let mut body = json!({});
             if let Some(branch) = input.get_str("branch") {
                 body["branch"] = json!(branch);
@@ -249,6 +256,17 @@ impl NativeTool for DeltaGetPipeline {
                 Some(p) => p.to_string(),
                 None => return ToolOutput::err("missing required parameter: pipeline_id"),
             };
+
+            // Reject path traversal in user-supplied path segments.
+            for (name, val) in [
+                ("owner", &owner),
+                ("repo", &repo),
+                ("pipeline_id", &pipeline_id),
+            ] {
+                if val.contains('/') || val.contains("..") {
+                    return ToolOutput::err(format!("{name} contains invalid characters"));
+                }
+            }
 
             let url = format!(
                 "{}/api/v1/{}/{}/pipelines/{}",

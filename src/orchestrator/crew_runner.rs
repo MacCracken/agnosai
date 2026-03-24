@@ -126,6 +126,7 @@ impl CrewRunner {
     /// fall back to placeholder output (useful for tests). Orchestration
     /// handles dependency resolution, agent assignment, status tracking,
     /// result aggregation, and profiling.
+    #[tracing::instrument(skip(self), fields(crew_id = %self.spec.id, process = ?self.spec.process))]
     pub async fn run(&mut self) -> crate::core::Result<CrewState> {
         let crew_start = Instant::now();
         info!(crew_id = %self.spec.id, name = %self.spec.name, "starting crew run");
@@ -205,6 +206,7 @@ impl CrewRunner {
 
     // ── Sequential ──────────────────────────────────────────────────────
 
+    #[tracing::instrument(skip(self), fields(crew_id = %self.spec.id, task_count = self.spec.tasks.len()))]
     async fn run_sequential(&mut self) -> crate::core::Result<Vec<TaskResult>> {
         let mut results = Vec::with_capacity(self.spec.tasks.len());
 
@@ -276,6 +278,7 @@ impl CrewRunner {
 
     // ── Parallel ────────────────────────────────────────────────────────
 
+    #[tracing::instrument(skip(self), fields(crew_id = %self.spec.id, max_concurrency))]
     async fn run_parallel(
         &mut self,
         max_concurrency: usize,
@@ -400,6 +403,7 @@ impl CrewRunner {
 
     // ── DAG ─────────────────────────────────────────────────────────────
 
+    #[tracing::instrument(skip(self), fields(crew_id = %self.spec.id, task_count = self.spec.tasks.len()))]
     async fn run_dag(&mut self) -> crate::core::Result<Vec<TaskResult>> {
         let order = topological_sort(&self.spec.tasks)?;
 
@@ -570,6 +574,7 @@ fn infer_provider(model: &str) -> ProviderType {
 }
 
 /// Execute a task via LLM inference, or fall back to placeholder if no client.
+#[tracing::instrument(skip(task, agent, llm, cache, cost_tracker, event_tx), fields(task_id = %task.id, agent = agent.map(|a| a.agent_key.as_str()).unwrap_or("none")))]
 async fn execute_task(
     task: &Task,
     agent: Option<&AgentDefinition>,
@@ -627,6 +632,7 @@ async fn execute_task(
     }
 
     // Base temperature — may be adjusted by personality mood.
+    #[allow(unused_mut)] // mut needed when personality feature is enabled
     let mut temperature = 0.7;
 
     #[cfg(feature = "personality")]

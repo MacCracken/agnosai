@@ -158,6 +158,9 @@ impl NativeTool for MnemeGetNote {
                 None => return ToolOutput::err("missing required parameter: note_id"),
             };
 
+            if note_id.contains('/') || note_id.contains("..") {
+                return ToolOutput::err("note_id contains invalid characters");
+            }
             let url = format!("{}/api/notes/{}", self.base_url, note_id);
             match self.client.get(&url).send().await {
                 Ok(resp) => match resp.json::<Value>().await {

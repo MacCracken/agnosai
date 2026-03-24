@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `success_rate_for_action` / `avg_duration_for_action` eliminated intermediate `Vec` allocation
 
 ### Added
+- **OpenTelemetry tracing spans** (`otel` feature flag):
+  - `src/telemetry.rs` — `init_tracing()` with optional OTLP export, `otlp_endpoint_from_env()`, `TracingGuard`
+  - OTLP gRPC export via `hoosh::telemetry` (batch exporter, configurable service name)
+  - `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME` environment variables
+  - `#[tracing::instrument]` on `Orchestrator::run_crew`, `cancel_crew`, `CrewRunner::run/run_sequential/run_parallel/run_dag`, `execute_task`, `score_agent`, `create_crew`, `a2a::receive`, `mcp_handler`
+  - Span fields: crew_id, crew_name, task_count, process mode, task_id, agent, max_concurrency, method, domain
+  - `full` feature now includes `otel`
+  - `main.rs` auto-detects OTLP endpoint and configures dual export (stderr + OTLP) or stderr-only
 - **Crew cancellation**: `cancel_crew()` now actually stops running crews via `AtomicBool` cancellation token shared between `Orchestrator` and `CrewRunner`; sequential mode breaks between tasks, parallel mode aborts pending tasks before semaphore acquisition, DAG mode halts between waves
 - `CrewRunner::with_cancel_token()` builder method
 - `CrewRunner::is_cancelled()` inline check

@@ -9,6 +9,8 @@ pub mod auth;
 pub mod routes;
 /// Server-sent event streaming.
 pub mod sse;
+/// SSRF protection utilities.
+pub mod ssrf;
 /// Shared application state.
 pub mod state;
 

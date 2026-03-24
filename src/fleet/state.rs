@@ -80,6 +80,9 @@ pub struct CrewStateManager {
     barriers: HashMap<CrewRunId, HashMap<String, HashSet<NodeId>>>,
 }
 
+/// Maximum number of completed/failed/cancelled runs retained in memory.
+const MAX_RETAINED_RUNS: usize = 1000;
+
 impl CrewStateManager {
     pub fn new() -> Self {
         Self {
@@ -88,8 +91,30 @@ impl CrewStateManager {
         }
     }
 
+    /// Evict completed/failed/cancelled runs when at capacity.
+    fn evict_if_needed(&mut self) {
+        if self.states.len() >= MAX_RETAINED_RUNS {
+            let to_remove: Vec<CrewRunId> = self
+                .states
+                .iter()
+                .filter(|(_, s)| {
+                    matches!(
+                        s.phase,
+                        CrewPhase::Completed | CrewPhase::Failed(_) | CrewPhase::Cancelled
+                    )
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            for id in to_remove {
+                self.states.remove(&id);
+                self.barriers.remove(&id);
+            }
+        }
+    }
+
     /// Create a new distributed crew run. Each node starts with `tasks_per_node` tasks.
     pub fn create_run(&mut self, nodes: HashSet<NodeId>, tasks_per_node: usize) -> CrewRunId {
+        self.evict_if_needed();
         let run_id = Uuid::new_v4();
         let now = Utc::now();
 

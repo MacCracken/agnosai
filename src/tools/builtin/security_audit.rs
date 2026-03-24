@@ -49,6 +49,13 @@ impl NativeTool for SecurityAuditTool {
                 None => return ToolOutput::err("missing required parameter: target_url"),
             };
 
+            // SSRF protection: reject requests to private/internal networks.
+            if !crate::server::ssrf::is_safe_url(&target_url) {
+                return ToolOutput::err(
+                    "target_url rejected: cannot target private/internal networks",
+                );
+            }
+
             let _profile = input.get_str("scan_profile").unwrap_or("standard");
 
             match run_security_audit(&target_url).await {

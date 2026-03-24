@@ -111,7 +111,13 @@ pub fn event_stream(
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         while let Ok(event) = rx.recv().await {
-            let data = serde_json::to_string(&event).unwrap_or_default();
+            let data = match serde_json::to_string(&event) {
+                Ok(json) => json,
+                Err(e) => {
+                    tracing::warn!(error = %e, "SSE event serialization failed");
+                    "{\"error\":\"serialization failed\"}".to_string()
+                }
+            };
             yield Ok(Event::default()
                 .event(event.event_type.clone())
                 .data(data));

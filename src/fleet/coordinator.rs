@@ -42,6 +42,9 @@ pub enum FailoverAction {
     UnknownTask,
 }
 
+/// Maximum number of completed tasks retained in the coordinator.
+const MAX_RETAINED_TASKS: usize = 10_000;
+
 /// Coordinates fan-out, tracking, and failover for fleet tasks.
 pub struct FleetCoordinator {
     state_manager: CrewStateManager,
@@ -73,11 +76,37 @@ impl FleetCoordinator {
     ///
     /// Creates a crew run in the state manager and registers all tasks with their
     /// assigned nodes. Returns the run ID.
+    /// Evict completed/failed tasks when at capacity.
+    fn evict_completed_tasks(&mut self) {
+        if self.tasks.len() >= MAX_RETAINED_TASKS {
+            let to_remove: Vec<Uuid> = self
+                .tasks
+                .iter()
+                .filter(|(_, t)| {
+                    matches!(
+                        t.status,
+                        FleetTaskStatus::Completed | FleetTaskStatus::Failed
+                    )
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            for id in to_remove {
+                self.tasks.remove(&id);
+                self.retry_counts.remove(&id);
+            }
+        }
+    }
+
+    /// Fan out tasks to nodes based on pre-computed placement assignments.
+    ///
+    /// Creates a crew run in the state manager and registers all tasks with their
+    /// assigned nodes. Returns the run ID.
     pub fn fan_out(
         &mut self,
         tasks: Vec<(Uuid, String)>,
         assignments: Vec<(Uuid, NodeId)>,
     ) -> CrewRunId {
+        self.evict_completed_tasks();
         // Build lookup from task_id -> node_id.
         let assignment_map: HashMap<Uuid, NodeId> = assignments.into_iter().collect();
 

@@ -56,6 +56,13 @@ impl NativeTool for LoadTestingTool {
                 None => return ToolOutput::err("missing required parameter: target_url"),
             };
 
+            // SSRF protection: reject requests to private/internal networks.
+            if !crate::server::ssrf::is_safe_url(&target_url) {
+                return ToolOutput::err(
+                    "target_url rejected: cannot target private/internal networks",
+                );
+            }
+
             let concurrent_users = input.get_u64("concurrent_users").unwrap_or(10) as usize;
             let duration_secs = input.get_u64("duration_seconds").unwrap_or(10);
 

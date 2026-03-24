@@ -93,7 +93,7 @@ fn domain_score(agent: &AgentDefinition, task: &Task) -> f64 {
         None => return 1.0,
     };
     match &agent.domain {
-        Some(agent_domain) if agent_domain == task_domain => 1.0,
+        Some(agent_domain) if agent_domain.eq_ignore_ascii_case(task_domain) => 1.0,
         Some(_) => 0.0,
         None => 1.0, // agent has no domain constraint → compatible
     }
@@ -107,12 +107,14 @@ fn domain_score(agent: &AgentDefinition, task: &Task) -> f64 {
 /// - GPU match (0.15): GPU capability when the task requires it
 /// - Domain match (0.15): domain compatibility
 #[must_use]
+#[tracing::instrument(skip(agent, task), fields(agent_key = %agent.agent_key, task_id = %task.id))]
 pub fn score_agent(agent: &AgentDefinition, task: &Task) -> f64 {
     let tool = tool_coverage_score(agent, task);
     let complexity = complexity_score(agent, task);
     let gpu = gpu_score(agent, task);
     let domain = domain_score(agent, task);
 
+    #[allow(unused_mut)] // mut needed when personality feature is enabled
     let mut score = WEIGHT_TOOL_COVERAGE * tool
         + WEIGHT_COMPLEXITY * complexity
         + WEIGHT_GPU * gpu

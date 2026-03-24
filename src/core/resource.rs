@@ -141,6 +141,7 @@ impl ComputeDevice {
 
 /// Hardware requirements for a task or agent workload.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct HardwareRequirement {
     /// Acceptable accelerator types (empty = any, including CPU-only).
     #[serde(default)]
