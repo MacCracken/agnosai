@@ -13,29 +13,35 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   build:
-    name: Build (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
     needs: [ci]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            arch: amd64
+            os: ubuntu-latest
+            name: linux-amd64
           - target: aarch64-unknown-linux-gnu
-            arch: arm64
+            os: ubuntu-latest
+            name: linux-arm64
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: macos-arm64
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.89"
           targets: ${{ matrix.target }}
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross-compilation deps (arm64)
-        if: matrix.arch == 'arm64'
+      - name: Cross deps (arm64 Linux)
+        if: matrix.cross
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -49,14 +55,14 @@ jobs:
       - name: Package
         run: |
           VERSION=$(cat VERSION | tr -d '[:space:]')
-          ARCHIVE="agnosai-server-${VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          ARCHIVE="agnosai-server-${VERSION}-${{ matrix.name }}.tar.gz"
           tar czf "${ARCHIVE}" -C target/${{ matrix.target }}/release agnosai-server
-          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256" || shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: agnosai-${{ matrix.arch }}
+          name: agnosai-${{ matrix.name }}
           path: |
             agnosai-server-*.tar.gz
             agnosai-server-*.sha256
@@ -88,17 +94,15 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   release:
-    name: Create Release
+    name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [ci, build, publish]
     steps:
       - uses: actions/checkout@v4
-
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
