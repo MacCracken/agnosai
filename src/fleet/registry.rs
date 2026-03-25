@@ -268,28 +268,32 @@ mod tests {
 
     #[test]
     fn status_transitions() {
-        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(20), Duration::from_millis(60));
+        // Use wide TTL gaps so CI scheduling jitter doesn't skip Suspect.
+        let mut reg =
+            NodeRegistry::with_ttl(Duration::from_millis(50), Duration::from_millis(500));
         let id = reg.register("n".into(), "a".into(), 0, 0, vec![]);
 
         assert_eq!(reg.get(&id).unwrap().status, NodeStatus::Online);
 
-        // Wait past heartbeat TTL but before offline TTL.
-        std::thread::sleep(Duration::from_millis(30));
+        // Wait past heartbeat TTL but well before offline TTL.
+        std::thread::sleep(Duration::from_millis(80));
         reg.update_statuses();
         assert_eq!(reg.get(&id).unwrap().status, NodeStatus::Suspect);
 
         // Wait past offline TTL.
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(500));
         reg.update_statuses();
         assert_eq!(reg.get(&id).unwrap().status, NodeStatus::Offline);
     }
 
     #[test]
     fn heartbeat_resets_to_online() {
-        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(10), Duration::from_millis(50));
+        let mut reg =
+            NodeRegistry::with_ttl(Duration::from_millis(50), Duration::from_millis(500));
         let id = reg.register("n".into(), "a".into(), 0, 0, vec![]);
 
-        std::thread::sleep(Duration::from_millis(15));
+        // Wait past heartbeat TTL but well before offline TTL.
+        std::thread::sleep(Duration::from_millis(80));
         reg.update_statuses();
         assert_eq!(reg.get(&id).unwrap().status, NodeStatus::Suspect);
 
