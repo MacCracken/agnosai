@@ -59,7 +59,7 @@ impl Orchestrator {
 
         // Generate a cryptographically random signing key for the audit chain.
         let mut audit_key = [0u8; 32];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut audit_key);
+        rand::Rng::fill(&mut rand::rng(), &mut audit_key);
 
         Ok(Self {
             state: Arc::new(RwLock::new(state)),

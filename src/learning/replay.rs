@@ -82,7 +82,7 @@ impl ReplayBuffer {
         }
 
         let n = batch_size.min(self.experiences.len());
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut result = Vec::with_capacity(n);
         let mut selected = vec![false; self.experiences.len()];
 
@@ -110,7 +110,7 @@ impl ReplayBuffer {
                 break;
             }
 
-            let mut r = rng.r#gen::<f64>() * remaining_priority;
+            let mut r = rng.random::<f64>() * remaining_priority;
             let mut chosen = 0;
             for (i, exp) in self.experiences.iter().enumerate() {
                 if selected[i] {
