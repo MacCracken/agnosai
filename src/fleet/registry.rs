@@ -269,8 +269,7 @@ mod tests {
     #[test]
     fn status_transitions() {
         // Use wide TTL gaps so CI scheduling jitter doesn't skip Suspect.
-        let mut reg =
-            NodeRegistry::with_ttl(Duration::from_millis(50), Duration::from_millis(500));
+        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(50), Duration::from_millis(500));
         let id = reg.register("n".into(), "a".into(), 0, 0, vec![]);
 
         assert_eq!(reg.get(&id).unwrap().status, NodeStatus::Online);
@@ -288,8 +287,7 @@ mod tests {
 
     #[test]
     fn heartbeat_resets_to_online() {
-        let mut reg =
-            NodeRegistry::with_ttl(Duration::from_millis(50), Duration::from_millis(500));
+        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(50), Duration::from_millis(500));
         let id = reg.register("n".into(), "a".into(), 0, 0, vec![]);
 
         // Wait past heartbeat TTL but well before offline TTL.
