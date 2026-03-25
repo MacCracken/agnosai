@@ -13,45 +13,41 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 
 | Milestone | Target | Current |
 |-----------|--------|---------|
-| CI gate (blocking) | ≥55% | 69% |
+| CI gate (blocking) | ≥55% | ~70% |
 | Near-term | ≥75% | — |
 | Target | ≥85% | — |
 
-Key gaps: HTTP tool execute paths (load_testing, security_audit), fleet relay/registry
-(feature-gated), A2A route handlers, SSE streaming paths.
+620 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
+paths (load_testing, security_audit need mock servers), SSE streaming edge cases,
+telemetry OTLP init paths.
 
-### Ecosystem & Scale (v0.23 — aligned with ai-hwaccel v0.23.3)
+### Ecosystem & Scale (v0.23+)
 
 | Item | Priority | Notes |
 |------|----------|-------|
 | Topology-aware fleet scheduling | Medium | Leverage ai-hwaccel NVLink/XGMI data for GPU-affinity placement |
 | Cost-aware crew planning | Medium | Cloud GPU pricing lookup for budget-constrained crews |
-| Container/VM environment detection | Medium | Auto-detect resource limits in containers |
+| Container/VM environment detection | Medium | Auto-detect cgroup/namespace resource limits via ai-hwaccel `RuntimeEnvironment` |
 | Python bindings (PyO3) | Medium | Let Python callers use AgnosAI as a library |
 | Multi-node fleet discovery (mDNS, Consul, K8s) | Medium | Auto-discover fleet nodes |
 | Kubernetes operator | Low | CRDs for crew/agent definitions |
 | WASM tool registry (remote fetch) | Low | Download community tools from a registry |
 | Hot-reload tool registration | Low | Register/unregister tools without restart |
 
-### Observability & Operations (v0.23 — aligned with ai-hwaccel v0.23.3)
+### Observability & Operations
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| Prometheus metrics export | High | Done — `/metrics` endpoint, hoosh metrics re-exported |
-| OpenTelemetry tracing spans | High | Done — `otel` feature flag, `#[instrument]` on crew/task/scoring/routes |
-| Health monitoring & alerting | Medium | Done — hoosh 0.21.5 has 3-strike health checker + majra heartbeat |
+| AgnosAI-specific Prometheus metrics | Medium | Crew execution counts, task durations, agent scoring histograms |
 | Multi-tenancy (crew isolation, resource quotas) | Medium | Per-tenant budget enforcement |
 | Dashboard API (crew history, agent performance) | Low | REST endpoints for operational dashboards |
 
-### Engineering Backlog (from hoosh 0.21.5)
+### Engineering Backlog
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| Cryptographic audit chain | Medium | Done — crew/task lifecycle events logged via `hoosh::audit::AuditChain` |
 | Per-endpoint rate limiting | Low | Sliding-window RPM via `hoosh::middleware::rate_limit` |
 | Priority inference queue | Low | Batch/background inference via `hoosh::queue` + majra |
-| OpenTelemetry integration | Medium | Done — OTLP gRPC export via `agnosai::telemetry::init_tracing()` |
-| AgnosAI-specific Prometheus metrics | Medium | Crew execution counts, task durations, agent scoring histograms |
 | Hot-reload configuration | Low | `arc-swap` pattern for config changes without restart |
 
 ### Final Migration

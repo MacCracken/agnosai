@@ -446,4 +446,142 @@ mod tests {
         assert!(evicted.is_empty());
         assert_eq!(fm.cluster_count(), 1);
     }
+
+    #[test]
+    fn coordinator_returns_none_initially() {
+        let fm = FederationManager::new(test_config("a"));
+        assert!(fm.coordinator().is_none());
+        assert!(!fm.is_coordinator());
+    }
+
+    #[test]
+    fn initial_role_is_follower() {
+        let fm = FederationManager::new(test_config("a"));
+        assert_eq!(fm.role(), FederationRole::Follower);
+    }
+
+    #[test]
+    fn is_coordinator_reflects_election() {
+        let mut fm = FederationManager::new(test_config("a"));
+        assert!(!fm.is_coordinator());
+
+        fm.start_election();
+        fm.declare_coordinator(1, "a".into());
+        assert!(fm.is_coordinator());
+
+        // Declare a different coordinator — we become follower.
+        fm.start_election();
+        fm.declare_coordinator(2, "b".into());
+        assert!(!fm.is_coordinator());
+        assert_eq!(fm.role(), FederationRole::Follower);
+    }
+
+    #[test]
+    fn role_changes_with_declare_coordinator() {
+        let mut fm = FederationManager::new(test_config("x"));
+        assert_eq!(fm.role(), FederationRole::Follower);
+
+        fm.start_election();
+        assert_eq!(fm.role(), FederationRole::Candidate);
+
+        fm.declare_coordinator(1, "x".into());
+        assert_eq!(fm.role(), FederationRole::Coordinator);
+
+        fm.start_election();
+        fm.declare_coordinator(2, "y".into());
+        assert_eq!(fm.role(), FederationRole::Follower);
+    }
+
+    #[test]
+    fn term_increments_with_elections() {
+        let mut fm = FederationManager::new(test_config("a"));
+        assert_eq!(fm.term(), 0);
+
+        fm.start_election();
+        assert_eq!(fm.term(), 1);
+        fm.start_election();
+        assert_eq!(fm.term(), 2);
+        fm.start_election();
+        assert_eq!(fm.term(), 3);
+    }
+
+    #[test]
+    fn clusters_and_online_clusters_filtering() {
+        let mut fm = FederationManager::new(test_config("a"));
+        fm.heartbeat("b".into(), "http://b:8080".into(), 1);
+        fm.heartbeat("c".into(), "http://c:8080".into(), 2);
+
+        assert_eq!(fm.clusters().len(), 2);
+        assert_eq!(fm.online_clusters().len(), 2);
+
+        // Mark one offline.
+        if let Some(c) = fm.clusters.get_mut("b") {
+            c.status = ClusterStatus::Offline;
+        }
+
+        assert_eq!(fm.clusters().len(), 2, "clusters() returns all");
+        assert_eq!(fm.online_clusters().len(), 1, "online_clusters() filters");
+        assert_eq!(fm.online_clusters()[0].id, "c");
+    }
+
+    #[test]
+    fn cluster_count_accuracy() {
+        let mut fm = FederationManager::new(test_config("a"));
+        assert_eq!(fm.cluster_count(), 0);
+
+        fm.heartbeat("b".into(), "http://b:8080".into(), 1);
+        assert_eq!(fm.cluster_count(), 1);
+
+        fm.heartbeat("c".into(), "http://c:8080".into(), 2);
+        assert_eq!(fm.cluster_count(), 2);
+
+        // Heartbeat same cluster again — count stays the same.
+        fm.heartbeat("b".into(), "http://b:8080".into(), 5);
+        assert_eq!(fm.cluster_count(), 2);
+    }
+
+    #[test]
+    fn evict_offline_removes_old_clusters() {
+        let mut fm = FederationManager::new(test_config("a"));
+        fm.heartbeat("b".into(), "http://b:8080".into(), 1);
+        fm.heartbeat("c".into(), "http://c:8080".into(), 1);
+
+        // Only mark "b" as old+offline.
+        if let Some(c) = fm.clusters.get_mut("b") {
+            c.status = ClusterStatus::Offline;
+            c.last_heartbeat_instant = Instant::now() - Duration::from_secs(120);
+        }
+
+        let evicted = fm.evict_offline(Duration::from_secs(60));
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0], "b");
+        assert_eq!(fm.cluster_count(), 1);
+        // "c" should still be there.
+        assert!(fm.clusters.contains_key("c"));
+    }
+
+    #[test]
+    fn new_coordinator_resets_old_coordinator_role() {
+        let mut fm = FederationManager::new(test_config("a"));
+        fm.heartbeat("b".into(), "http://b:8080".into(), 1);
+        fm.heartbeat("c".into(), "http://c:8080".into(), 1);
+
+        // Elect "b" as coordinator.
+        fm.start_election();
+        fm.declare_coordinator(1, "b".into());
+        assert_eq!(
+            fm.clusters.get("b").unwrap().role,
+            FederationRole::Coordinator
+        );
+        assert_eq!(fm.clusters.get("c").unwrap().role, FederationRole::Follower);
+
+        // Now elect "c" — "b" should be reset to Follower.
+        fm.start_election();
+        fm.declare_coordinator(2, "c".into());
+        assert_eq!(fm.clusters.get("b").unwrap().role, FederationRole::Follower);
+        assert_eq!(
+            fm.clusters.get("c").unwrap().role,
+            FederationRole::Coordinator
+        );
+    }
 }

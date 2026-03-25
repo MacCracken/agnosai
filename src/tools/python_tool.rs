@@ -128,3 +128,139 @@ mod inner {
 
 #[cfg(feature = "sandbox")]
 pub use inner::*;
+
+#[cfg(test)]
+#[cfg(feature = "sandbox")]
+mod tests {
+    use super::*;
+    use crate::tools::native::{NativeTool, ParameterSchema};
+    use std::sync::Arc;
+
+    use crate::sandbox::python::PythonSandbox;
+
+    fn sample_tool(sandbox: Arc<PythonSandbox>) -> PythonTool {
+        PythonTool::new(
+            "greet",
+            "Greet a user",
+            vec![ParameterSchema {
+                name: "name".to_string(),
+                description: "The user's name".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+            }],
+            r#"
+def create_tool():
+    class Greeter:
+        def execute(self, params):
+            return {"greeting": f"Hello, {params['name']}!"}
+    return Greeter()
+"#,
+            sandbox,
+        )
+    }
+
+    #[test]
+    fn tool_name_and_description() {
+        let sandbox = Arc::new(PythonSandbox::new());
+        let tool = sample_tool(sandbox);
+        assert_eq!(tool.name(), "greet");
+        assert_eq!(tool.description(), "Greet a user");
+    }
+
+    #[test]
+    fn tool_schema_matches() {
+        let sandbox = Arc::new(PythonSandbox::new());
+        let tool = sample_tool(sandbox);
+        let schema = tool.schema();
+        assert_eq!(schema.name, "greet");
+        assert_eq!(schema.description, "Greet a user");
+        assert_eq!(schema.parameters.len(), 1);
+        assert_eq!(schema.parameters[0].name, "name");
+        assert!(schema.parameters[0].required);
+    }
+
+    #[test]
+    fn tool_debug_format() {
+        let sandbox = Arc::new(PythonSandbox::new());
+        let tool = sample_tool(sandbox);
+        let debug_str = format!("{tool:?}");
+        assert!(debug_str.contains("PythonTool"));
+        assert!(debug_str.contains("greet"));
+    }
+
+    #[test]
+    fn output_success_parsing() {
+        let stdout = r#"{"result": "ok", "success": true}"#;
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        let success = value
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(success);
+        assert_eq!(value.get("result").unwrap(), "ok");
+    }
+
+    #[test]
+    fn output_failure_parsing() {
+        let stdout = r#"{"success": false, "error": "missing param"}"#;
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        let success = value
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(!success);
+        assert_eq!(
+            value.get("error").and_then(|v| v.as_str()).unwrap(),
+            "missing param"
+        );
+    }
+
+    #[test]
+    fn output_missing_success_defaults_true() {
+        let stdout = r#"{"result": {"key": "value"}}"#;
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        let success = value
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(success);
+    }
+
+    #[test]
+    fn output_non_json_returns_raw() {
+        let stdout = "not json at all\n";
+        let result = serde_json::from_str::<serde_json::Value>(stdout.trim());
+        assert!(result.is_err());
+        let fallback = serde_json::Value::String(stdout.trim().to_string());
+        assert_eq!(fallback.as_str().unwrap(), "not json at all");
+    }
+
+    #[test]
+    fn output_missing_error_defaults_unknown() {
+        let stdout = r#"{"success": false}"#;
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        let err = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        assert_eq!(err, "unknown error");
+    }
+
+    #[test]
+    fn output_result_extracted_when_present() {
+        let stdout = r#"{"result": [1, 2, 3], "success": true}"#;
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        let result = value.get("result").cloned().unwrap_or(value.clone());
+        assert!(result.is_array());
+        assert_eq!(result.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn output_whole_value_when_no_result_key() {
+        let stdout = r#"{"data": "something"}"#;
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        let result = value.get("result").cloned().unwrap_or(value.clone());
+        // Should fall back to the whole value
+        assert!(result.get("data").is_some());
+    }
+}

@@ -1,25 +1,10 @@
 use crate::core::agent::AgentDefinition;
 use crate::core::task::Task;
 
-#[cfg(not(feature = "personality"))]
-const WEIGHT_TOOL_COVERAGE: f64 = 0.40;
-#[cfg(not(feature = "personality"))]
-const WEIGHT_COMPLEXITY: f64 = 0.30;
-#[cfg(not(feature = "personality"))]
-const WEIGHT_GPU: f64 = 0.15;
-#[cfg(not(feature = "personality"))]
-const WEIGHT_DOMAIN: f64 = 0.15;
-
-// With personality enabled, redistribute weights to include personality factor.
-#[cfg(feature = "personality")]
 const WEIGHT_TOOL_COVERAGE: f64 = 0.35;
-#[cfg(feature = "personality")]
 const WEIGHT_COMPLEXITY: f64 = 0.25;
-#[cfg(feature = "personality")]
 const WEIGHT_GPU: f64 = 0.10;
-#[cfg(feature = "personality")]
 const WEIGHT_DOMAIN: f64 = 0.15;
-#[cfg(feature = "personality")]
 const WEIGHT_PERSONALITY: f64 = 0.15;
 
 /// Map a complexity string to a numeric level.
@@ -114,17 +99,13 @@ pub fn score_agent(agent: &AgentDefinition, task: &Task) -> f64 {
     let gpu = gpu_score(agent, task);
     let domain = domain_score(agent, task);
 
-    #[allow(unused_mut)] // mut needed when personality feature is enabled
     let mut score = WEIGHT_TOOL_COVERAGE * tool
         + WEIGHT_COMPLEXITY * complexity
         + WEIGHT_GPU * gpu
         + WEIGHT_DOMAIN * domain;
 
-    #[cfg(feature = "personality")]
-    {
-        let personality = personality_score(agent, task);
-        score += WEIGHT_PERSONALITY * personality;
-    }
+    let personality = personality_score(agent, task);
+    score += WEIGHT_PERSONALITY * personality;
 
     score.clamp(0.0, 1.0)
 }
@@ -135,8 +116,6 @@ pub fn score_agent(agent: &AgentDefinition, task: &Task) -> f64 {
 /// - `personality_group`: preferred trait group ("social", "cognitive", "behavioral", "professional")
 /// - `personality_trait`: specific required trait (e.g., "precision", "creativity")
 ///
-/// When the `personality` feature is disabled, this function is not compiled.
-#[cfg(feature = "personality")]
 fn personality_score(agent: &AgentDefinition, task: &Task) -> f64 {
     let Some(ref profile) = agent.personality else {
         return 0.5; // no personality → neutral score
@@ -228,7 +207,6 @@ mod tests {
             gpu_preferred: false,
             gpu_memory_min_mb: None,
             hardware: None,
-            #[cfg(feature = "personality")]
             personality: None,
         }
     }
@@ -245,16 +223,12 @@ mod tests {
 
     /// Helper: compute expected score using the active weight constants.
     fn expected_score(tool: f64, complexity: f64, gpu: f64, domain: f64) -> f64 {
-        let mut s = WEIGHT_TOOL_COVERAGE * tool
+        // no personality → neutral score (0.5)
+        WEIGHT_TOOL_COVERAGE * tool
             + WEIGHT_COMPLEXITY * complexity
             + WEIGHT_GPU * gpu
-            + WEIGHT_DOMAIN * domain;
-        // When personality feature is on but agent has no personality, personality_score returns 0.5.
-        #[cfg(feature = "personality")]
-        {
-            s += WEIGHT_PERSONALITY * 0.5;
-        }
-        s
+            + WEIGHT_DOMAIN * domain
+            + WEIGHT_PERSONALITY * 0.5
     }
 
     #[test]

@@ -108,4 +108,73 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
+
+    #[tokio::test]
+    async fn create_definition_with_malformed_json_returns_error() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/agents/definitions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("this is not json at all"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
+            "expected 400 or 422 for malformed JSON, got {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_definition_missing_required_fields_returns_422() {
+        let app = test_app().await;
+        // Provide valid JSON but missing required fields (e.g. no "role" or "goal").
+        let body = serde_json::json!({
+            "agent_key": "incomplete-agent",
+            "name": "Incomplete"
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/agents/definitions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn list_definitions_returns_empty_array_with_correct_content_type() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/agents/definitions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("application/json"),
+            "expected application/json, got {content_type}"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = json.as_array().expect("should be an array");
+        assert!(arr.is_empty());
+    }
 }

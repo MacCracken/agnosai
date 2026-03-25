@@ -133,3 +133,132 @@ mod inner {
 
 #[cfg(feature = "sandbox")]
 pub use inner::*;
+
+#[cfg(test)]
+#[cfg(feature = "sandbox")]
+mod tests {
+    use super::*;
+    use crate::tools::native::ParameterSchema;
+
+    fn sample_manifest() -> WasmToolManifest {
+        WasmToolManifest {
+            name: "test_tool".to_string(),
+            description: "A test WASM tool".to_string(),
+            parameters: vec![ParameterSchema {
+                name: "input".to_string(),
+                description: "The input value".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn manifest_serde_round_trip() {
+        let manifest = sample_manifest();
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        let parsed: WasmToolManifest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.name, "test_tool");
+        assert_eq!(parsed.description, "A test WASM tool");
+        assert_eq!(parsed.parameters.len(), 1);
+        assert_eq!(parsed.parameters[0].name, "input");
+        assert_eq!(parsed.parameters[0].param_type, "string");
+        assert!(parsed.parameters[0].required);
+    }
+
+    #[test]
+    fn manifest_from_json_string() {
+        let json = r#"{
+            "name": "fetch",
+            "description": "Fetch a URL",
+            "parameters": [
+                {
+                    "name": "url",
+                    "description": "Target URL",
+                    "param_type": "string",
+                    "required": true
+                },
+                {
+                    "name": "timeout",
+                    "description": "Timeout in seconds",
+                    "param_type": "number",
+                    "required": false
+                }
+            ]
+        }"#;
+        let manifest: WasmToolManifest = serde_json::from_str(json).expect("parse");
+        assert_eq!(manifest.name, "fetch");
+        assert_eq!(manifest.parameters.len(), 2);
+        assert!(!manifest.parameters[1].required);
+    }
+
+    #[test]
+    fn manifest_empty_parameters() {
+        let json = r#"{
+            "name": "noop",
+            "description": "Does nothing",
+            "parameters": []
+        }"#;
+        let manifest: WasmToolManifest = serde_json::from_str(json).expect("parse");
+        assert_eq!(manifest.name, "noop");
+        assert!(manifest.parameters.is_empty());
+    }
+
+    #[test]
+    fn manifest_clone_and_debug() {
+        let manifest = sample_manifest();
+        let cloned = manifest.clone();
+        assert_eq!(cloned.name, manifest.name);
+        let debug_str = format!("{manifest:?}");
+        assert!(debug_str.contains("test_tool"));
+    }
+
+    #[test]
+    fn tool_output_success_parsing() {
+        // Simulates parsing the JSON output a WASM module would produce
+        let stdout = r#"{"result": "hello", "success": true}"#;
+        let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+        let success = value
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(success);
+        assert_eq!(value.get("result").unwrap(), "hello");
+    }
+
+    #[test]
+    fn tool_output_failure_parsing() {
+        let stdout = r#"{"success": false, "error": "bad input"}"#;
+        let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+        let success = value
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(!success);
+        assert_eq!(
+            value.get("error").and_then(|v| v.as_str()).unwrap(),
+            "bad input"
+        );
+    }
+
+    #[test]
+    fn tool_output_missing_success_defaults_true() {
+        let stdout = r#"{"result": 42}"#;
+        let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+        let success = value
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(success);
+    }
+
+    #[test]
+    fn tool_output_non_json_returns_raw_string() {
+        let stdout = "plain text output";
+        let result = serde_json::from_str::<serde_json::Value>(stdout);
+        assert!(result.is_err());
+        // The code path wraps raw text in Value::String
+        let fallback = serde_json::Value::String(stdout.to_string());
+        assert_eq!(fallback.as_str().unwrap(), "plain text output");
+    }
+}

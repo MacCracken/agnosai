@@ -87,11 +87,45 @@ fn bench_broadcast(c: &mut Criterion) {
     });
 }
 
+// ── Relay::send large payload ───────────────────────────────────────────
+
+fn bench_send_large_payload(c: &mut Criterion) {
+    let relay = Relay::new("node-a", 4096);
+    let _rx = relay.subscribe();
+    // 64 KiB JSON payload.
+    let big_data: String = "x".repeat(64 * 1024);
+    let payload = json!({"data": big_data});
+
+    c.bench_function("Relay::send (64 KiB payload)", |b| {
+        b.iter(|| {
+            relay.send("node-b", "large", payload.clone());
+        });
+    });
+}
+
+// ── Relay::stats ───────────────────────────────────────────────────────
+
+fn bench_stats(c: &mut Criterion) {
+    let relay = Relay::new("node-a", 4096);
+    // Send some messages to populate stats.
+    for _ in 0..100 {
+        relay.send("node-b", "t", json!(null));
+    }
+
+    c.bench_function("Relay::stats (after 100 sends)", |b| {
+        b.iter(|| {
+            let _ = relay.stats();
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_send,
+    bench_send_large_payload,
     bench_receive_no_dupes,
     bench_receive_50pct_dupes,
     bench_broadcast,
+    bench_stats,
 );
 criterion_main!(benches);

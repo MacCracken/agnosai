@@ -59,4 +59,77 @@ mod tests {
         assert!(names.contains(&"echo"));
         assert!(names.contains(&"json_transform"));
     }
+
+    #[tokio::test]
+    async fn get_tools_returns_correct_schema_fields() {
+        let app = test_app().await;
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/tools")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = json.as_array().unwrap();
+
+        for tool in arr {
+            assert!(
+                tool.get("name").is_some(),
+                "each tool should have a 'name' field"
+            );
+            assert!(
+                tool.get("description").is_some(),
+                "each tool should have a 'description' field"
+            );
+            assert!(
+                tool.get("parameters").is_some(),
+                "each tool should have a 'parameters' field"
+            );
+            assert!(
+                tool["name"].as_str().is_some_and(|s| !s.is_empty()),
+                "tool name should be non-empty"
+            );
+            assert!(
+                tool["description"].as_str().is_some_and(|s| !s.is_empty()),
+                "tool description should be non-empty"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_tools_with_no_tools_returns_empty_array() {
+        let orchestrator = Orchestrator::new(Default::default()).await.unwrap();
+        let tools = Arc::new(ToolRegistry::new()); // no tools registered
+        let state: SharedState = Arc::new(AppState {
+            orchestrator,
+            tools,
+            auth: Default::default(),
+            events: crate::server::sse::EventBus::new(),
+            http_client: reqwest::Client::new(),
+            audit: std::sync::Arc::new(crate::llm::AuditChain::new(b"test-key", 100)),
+        });
+        let app = crate::server::router(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/tools")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = json.as_array().expect("response should be a JSON array");
+        assert!(arr.is_empty(), "expected empty array, got {arr:?}");
+    }
 }

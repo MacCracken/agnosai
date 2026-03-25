@@ -509,4 +509,88 @@ mod tests {
         assert_eq!(ready[0].description, "high");
         assert_eq!(ready[1].description, "low");
     }
+
+    // ── topological_sort_tasks tests ──────────────────────────────────
+
+    fn make_tasks_with_deps(count: usize, deps: &[(usize, usize)]) -> Vec<Task> {
+        let mut tasks: Vec<Task> = (0..count)
+            .map(|i| {
+                let mut t = make_task(&format!("task-{i}"), TaskPriority::Normal);
+                // Use deterministic UUIDs based on index for stable testing.
+                t.id = uuid::Uuid::from_u128(i as u128);
+                t
+            })
+            .collect();
+        for &(from, to) in deps {
+            let dep_id = tasks[from].id;
+            tasks[to].dependencies.push(dep_id);
+        }
+        tasks
+    }
+
+    #[test]
+    fn topo_sort_tasks_linear_chain() {
+        // 0 → 1 → 2
+        let tasks = make_tasks_with_deps(3, &[(0, 1), (1, 2)]);
+        let order = topological_sort_tasks(&tasks).unwrap();
+        assert_eq!(order[0], tasks[0].id);
+        assert_eq!(order[1], tasks[1].id);
+        assert_eq!(order[2], tasks[2].id);
+    }
+
+    #[test]
+    fn topo_sort_tasks_diamond() {
+        // 0 → {1, 2} → 3
+        let tasks = make_tasks_with_deps(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]);
+        let order = topological_sort_tasks(&tasks).unwrap();
+        assert_eq!(order[0], tasks[0].id);
+        assert_eq!(order[3], tasks[3].id);
+        // 1 and 2 are in the middle (order depends on priority, both Normal).
+        assert!(order[1..3].contains(&tasks[1].id));
+        assert!(order[1..3].contains(&tasks[2].id));
+    }
+
+    #[test]
+    fn topo_sort_tasks_cycle_detected() {
+        // 0 → 1 → 2 → 0
+        let tasks = make_tasks_with_deps(3, &[(0, 1), (1, 2), (2, 0)]);
+        let err = topological_sort_tasks(&tasks).unwrap_err();
+        assert!(matches!(err, AgnosaiError::CyclicDAG));
+    }
+
+    #[test]
+    fn topo_sort_tasks_independent() {
+        // Three independent tasks — all should appear in order.
+        let tasks = make_tasks_with_deps(3, &[]);
+        let order = topological_sort_tasks(&tasks).unwrap();
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn topo_sort_tasks_respects_priority() {
+        let mut tasks = make_tasks_with_deps(3, &[]);
+        tasks[0].priority = TaskPriority::Background;
+        tasks[1].priority = TaskPriority::Critical;
+        tasks[2].priority = TaskPriority::Normal;
+
+        let order = topological_sort_tasks(&tasks).unwrap();
+        // Critical first, Normal second, Background last.
+        assert_eq!(order[0], tasks[1].id);
+        assert_eq!(order[1], tasks[2].id);
+        assert_eq!(order[2], tasks[0].id);
+    }
+
+    #[test]
+    fn topo_sort_tasks_single() {
+        let tasks = make_tasks_with_deps(1, &[]);
+        let order = topological_sort_tasks(&tasks).unwrap();
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0], tasks[0].id);
+    }
+
+    #[test]
+    fn topo_sort_tasks_empty() {
+        let order = topological_sort_tasks(&[]).unwrap();
+        assert!(order.is_empty());
+    }
 }

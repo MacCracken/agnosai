@@ -49,11 +49,10 @@ pub struct AgentDefinition {
     #[serde(default)]
     pub hardware: Option<HardwareRequirement>,
 
-    /// Personality profile from bhava (optional, requires `personality` feature).
+    /// Personality profile from bhava.
     ///
     /// When set, the agent's system prompt includes behavioral disposition
     /// derived from the personality traits.
-    #[cfg(feature = "personality")]
     #[serde(default)]
     pub personality: Option<bhava::traits::PersonalityProfile>,
 }
@@ -84,7 +83,6 @@ impl AgentDefinition {
             gpu_preferred: false,
             gpu_memory_min_mb: None,
             hardware: None,
-            #[cfg(feature = "personality")]
             personality: None,
         }
     }
@@ -114,7 +112,6 @@ impl AgentDefinition {
     }
 
     /// Set a bhava personality profile for this agent.
-    #[cfg(feature = "personality")]
     pub fn with_personality(mut self, profile: bhava::traits::PersonalityProfile) -> Self {
         self.personality = Some(profile);
         self
@@ -183,7 +180,6 @@ mod tests {
             gpu_preferred: false,
             gpu_memory_min_mb: Some(4096),
             hardware: None,
-            #[cfg(feature = "personality")]
             personality: None,
         };
         let json = serde_json::to_string(&agent).unwrap();
@@ -312,7 +308,6 @@ mod tests {
                 min_cpu_cores: 0,
                 required_family: None,
             }),
-            #[cfg(feature = "personality")]
             personality: None,
         };
         let req = agent.hardware_requirement();
@@ -337,7 +332,6 @@ mod tests {
             gpu_preferred: true,
             gpu_memory_min_mb: Some(8192),
             hardware: None,
-            #[cfg(feature = "personality")]
             personality: None,
         };
         let req = agent.hardware_requirement();
@@ -364,7 +358,6 @@ mod tests {
             gpu_preferred: false,
             gpu_memory_min_mb: None,
             hardware: None,
-            #[cfg(feature = "personality")]
             personality: None,
         };
         let req = agent.hardware_requirement();
@@ -396,7 +389,6 @@ mod tests {
                 min_cpu_cores: 4,
                 required_family: None,
             }),
-            #[cfg(feature = "personality")]
             personality: None,
         };
         let json = serde_json::to_string(&agent).unwrap();

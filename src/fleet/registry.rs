@@ -436,4 +436,130 @@ mod tests {
         assert!(node.hardware.devices.is_empty());
         assert_eq!(node.hardware.cpu_cores, 0);
     }
+
+    #[test]
+    fn unregister_decrements_count() {
+        let mut reg = NodeRegistry::new();
+        let id1 = reg.register("a".into(), "a".into(), 0, 0, vec![]);
+        let id2 = reg.register("b".into(), "b".into(), 0, 0, vec![]);
+        assert_eq!(reg.count(), 2);
+
+        assert!(reg.unregister(id1));
+        assert_eq!(reg.count(), 1);
+        assert!(reg.get(&id2).is_some());
+    }
+
+    #[test]
+    fn unregister_nonexistent_returns_false() {
+        let mut reg = NodeRegistry::new();
+        assert!(!reg.unregister("ghost".into()));
+        assert_eq!(reg.count(), 0);
+    }
+
+    #[test]
+    fn heartbeat_updates_last_seen_chrono() {
+        let mut reg = NodeRegistry::new();
+        let id = reg.register("n".into(), "addr".into(), 0, 0, vec![]);
+
+        let before = reg.get(&id).unwrap().last_heartbeat;
+        std::thread::sleep(Duration::from_millis(10));
+        reg.heartbeat(id.clone());
+        let after = reg.get(&id).unwrap().last_heartbeat;
+        assert!(after >= before, "chrono last_heartbeat should advance");
+    }
+
+    #[test]
+    fn find_by_capability_excludes_offline_nodes() {
+        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(10), Duration::from_millis(50));
+        let _id = reg.register("a".into(), "a".into(), 0, 0, vec!["inference".into()]);
+
+        // Initially findable.
+        assert_eq!(reg.find_by_capability("inference").len(), 1);
+
+        // After becoming suspect, not findable (find_by_capability checks Online).
+        std::thread::sleep(Duration::from_millis(15));
+        reg.update_statuses();
+        assert!(reg.find_by_capability("inference").is_empty());
+    }
+
+    #[test]
+    fn list_vs_list_online_after_transitions() {
+        let mut reg = NodeRegistry::with_ttl(Duration::from_millis(10), Duration::from_millis(50));
+        let id1 = reg.register("a".into(), "a".into(), 0, 0, vec![]);
+        let _id2 = reg.register("b".into(), "b".into(), 0, 0, vec![]);
+
+        assert_eq!(reg.list().len(), 2);
+        assert_eq!(reg.list_online().len(), 2);
+
+        // Expire both, then heartbeat only one.
+        std::thread::sleep(Duration::from_millis(15));
+        reg.update_statuses();
+        reg.heartbeat(id1.clone());
+
+        assert_eq!(
+            reg.list().len(),
+            2,
+            "list() returns all regardless of status"
+        );
+        assert_eq!(
+            reg.list_online().len(),
+            1,
+            "only heartbeated node is online"
+        );
+        assert_eq!(reg.list_online()[0].id, id1);
+    }
+
+    #[test]
+    fn count_online_accuracy_with_mixed_statuses() {
+        let mut reg = NodeRegistry::new();
+        let id1 = reg.register("a".into(), "a".into(), 0, 0, vec![]);
+        reg.register("b".into(), "b".into(), 0, 0, vec![]);
+        reg.register("c".into(), "c".into(), 0, 0, vec![]);
+
+        assert_eq!(reg.count_online(), 3);
+
+        // Manually set one to Draining via get_mut workaround — use unregister instead.
+        reg.unregister(id1);
+        assert_eq!(reg.count(), 2);
+        assert_eq!(reg.count_online(), 2);
+    }
+
+    #[test]
+    fn register_duplicate_hostname_creates_separate_entries() {
+        let mut reg = NodeRegistry::new();
+        let id1 = reg.register(
+            "same-host".into(),
+            "a:80".into(),
+            1,
+            1024,
+            vec!["gpu".into()],
+        );
+        let id2 = reg.register(
+            "same-host".into(),
+            "b:80".into(),
+            2,
+            2048,
+            vec!["cpu".into()],
+        );
+
+        // UUIDs differ, so two entries exist.
+        assert_ne!(id1, id2);
+        assert_eq!(reg.count(), 2);
+
+        let n1 = reg.get(&id1).unwrap();
+        let n2 = reg.get(&id2).unwrap();
+        assert_eq!(n1.hostname, "same-host");
+        assert_eq!(n2.hostname, "same-host");
+        assert_eq!(n1.gpu_count, 1);
+        assert_eq!(n2.gpu_count, 2);
+    }
+
+    #[test]
+    fn default_registry_has_zero_nodes() {
+        let reg = NodeRegistry::default();
+        assert_eq!(reg.count(), 0);
+        assert_eq!(reg.count_online(), 0);
+        assert!(reg.list().is_empty());
+        assert!(reg.list_online().is_empty());
+    }
 }

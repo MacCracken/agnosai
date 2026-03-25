@@ -41,6 +41,12 @@ pub struct ToolInput {
 }
 
 impl ToolInput {
+    /// Create a new tool input from a parameter map.
+    #[must_use]
+    pub fn new(parameters: HashMap<String, Value>) -> Self {
+        Self { parameters }
+    }
+
     /// Get a required string parameter.
     #[inline]
     #[must_use]

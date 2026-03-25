@@ -7,66 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.23.4] — 2026-03-24
 
+### Added
+
+#### Features
+- **OpenTelemetry tracing spans** (`otel` feature flag): `src/telemetry.rs` with `init_tracing()`, OTLP gRPC export, `TracingGuard`, env var auto-detection (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`)
+- **`#[tracing::instrument]`** on `Orchestrator::run_crew`, `cancel_crew`, `CrewRunner::run/run_sequential/run_parallel/run_dag`, `execute_task`, `score_agent`, `create_crew`, `a2a::receive`, `mcp_handler`
+- **Crew cancellation**: `cancel_crew()` stops running crews via `AtomicBool` token — sequential breaks between tasks, parallel aborts pre-semaphore, DAG halts between waves
+- **Cryptographic audit chain**: HMAC-SHA256 tamper-proof event logging via `hoosh::audit::AuditChain` — records `crew_accepted`, `crew_finished`, `crew_cancelled`, `task_completed` with metadata
+- **SSRF protection module**: `server::ssrf` shared utilities — `is_safe_url()`, `is_private_ip()`, `is_private_ipv4()` — used by A2A callbacks, `LoadTestingTool`, and `SecurityAuditTool`
+- **Configurable parallel concurrency**: `CrewRunRequest.max_concurrency` field (default 4, clamped 1–64)
+- Constructors/builders for `ComputeDevice`, `HardwareInventory`, `HardwareRequirement`, `TaskDAG`, `ResourceBudget`, `Experience`, `RelayMessage`, `PlacementRequest`, `TaskProfile`, `TeamMember`, `ToolInput`
+- `#[non_exhaustive]` on 48+ public structs across core, server, sandbox, fleet, learning, definitions
+- `#[must_use]` on 30+ pure functions across scoring, learning, SSE, pubsub, tools, router
+- `#[inline]` on 20+ hot-path accessors
+
+#### Tests (620 total, up from 323)
+- SSRF validation: 27 tests (IPv4/IPv6/mapped/localhost/schemes/metadata)
+- Crew validation: 8 tests (cycle detection, self-deps, DAG mode)
+- Fleet federation: 8 tests (election, roles, eviction)
+- Fleet registry: 7 tests (heartbeat, capability search, online filtering)
+- Scheduler `topological_sort_tasks`: 7 tests (chain, diamond, cycle, priority)
+- Route handlers: SSE (3), tools (3), agents (3), definitions (1)
+- WASM tool: 8 tests (manifest serde, output parsing)
+- Python tool: 10 tests (JSON protocol, error handling)
+- Audit chain: 3 tests (lifecycle, per-task events, cancel event)
+- Telemetry: 2 tests
+
+#### Benchmarks (106 across 17 files, up from 85 across 9)
+- New: `orchestrator` (5), `llm_router` (10), `definitions` (3), `audit` (7), `server` (6), `sandbox` (4), `ipc` (3), `fleet` (7)
+- Extended: `scoring` (+3), `relay` (+2), `tools` (+5)
+
 ### Changed
-- hoosh dependency updated from 0.22.3 to 0.23.4 (tool use/function calling, model registry)
-- bhava dependency updated from 0.23.3 to 0.24.3 (14 new modules, 785 tests)
-- ai-hwaccel dependency updated from 0.21.3 to 0.23.3
-- `hoosh::inference::Message` construction uses `Message::new()` constructor (new `tool_call_id`/`tool_calls` fields)
-- Scoring tests use weight constants instead of hardcoded values (works with/without personality feature)
-- `PubSub::subscribe()` now returns `Option` (returns `None` when at 10,000 pattern limit)
-- `Ucb1::select()` and `best_arm()` now return `Option<usize>` (returns `None` for empty bandits)
-- MCP server reports `CARGO_PKG_VERSION` instead of hardcoded `"0.1.0"`
-- Relay sequence numbers use `Ordering::AcqRel` instead of `Relaxed`
-- GPL-3.0 / GPL-3.0-only added to `deny.toml` license allowlist (bhava compatibility)
+
+#### Dependencies
+- hoosh: 0.22.3 → 0.23.4, now from crates.io (was local path)
+- bhava: 0.23.3 → 1.0.0, now from crates.io, **always-on** (no longer optional)
+- ai-hwaccel: 0.21.3 → 0.23.3
+- wasmtime/wasmtime-wasi: 42 → 43
+- `personality` feature flag **removed** — bhava is a required dependency
+- Scoring weights permanently personality-aware (tool: 0.35, complexity: 0.25, GPU: 0.10, domain: 0.15, personality: 0.15)
+- GPL-3.0 / GPL-3.0-only added to `deny.toml` license allowlist
+
+#### API
+- `PubSub::subscribe()` → returns `Option` (capped at 10,000 patterns)
+- `Ucb1::select()` / `best_arm()` → return `Option<usize>`
+- `SandboxManager::execute()` replaced by `execute_argv()` (no shell interpretation)
+- `OrchestratorState` → `pub(crate)` (internal state no longer leaked)
+- `AgentDefinition.personality` always compiled (was `#[cfg(feature = "personality")]`)
+- MCP server reports `CARGO_PKG_VERSION`
+- Domain scoring uses case-insensitive comparison
+- Duplicate `topological_sort` in crew_runner eliminated — delegates to `scheduler::topological_sort_tasks()`
+- Shared `reqwest::Client` via `OnceLock` in synapse/mneme/delta tools (was per-instance)
 
 ### Security
-- **Constant-time comparison**: length XOR no longer truncates to `u8` — lengths differing by 256 no longer collide
-- **SSRF hardening**: `is_private_ip` now covers IPv6 private ranges (fc00::/7, fe80::/10) and IPv6-mapped IPv4 addresses (::ffff:x.x.x.x)
-- **A2A callback timeout**: 30s timeout on fire-and-forget callback requests (prevents slow-server DoS)
-- **Process sandbox env sanitization**: `execute()` now strips `LD_PRELOAD`/`LD_LIBRARY_PATH`/`DYLD_*` (was only done in `execute_argv()`)
-- **SandboxManager**: process backend uses `execute_argv` path for env sanitization
-- **DAG failure propagation**: failed tasks are no longer treated as completed dependencies — downstream tasks are skipped
-- **PubSub DoS protection**: subscription patterns capped at 10,000
-- **EventBus DoS protection**: channel count monitored with orphan cleanup at capacity
-- **Replay buffer sampling**: fixed biased weighted sampling (remaining priority recomputed per draw)
-- **StringInterner overflow**: `checked_add` on u32 ID allocation (panic on overflow instead of silent wrap)
+- **Constant-time comparison**: length comparison uses full `usize` (was truncated to `u8`)
+- **SSRF hardening**: IPv6 private ranges (fc00::/7, fe80::/10), IPv6-mapped IPv4 (::ffff:x.x.x.x), bracketed IPv6 URL parsing via `url::Host`
+- **SSRF on tools**: `LoadTestingTool` and `SecurityAuditTool` reject private/internal target URLs
+- **URL path traversal**: mneme `note_id`, delta `owner`/`repo`/`pipeline_id` reject `/` and `..`
+- **A2A callback timeout**: 30s limit on fire-and-forget callbacks
+- **Process sandbox env sanitization**: `execute()` strips `LD_PRELOAD`/`LD_LIBRARY_PATH`/`DYLD_*`
+- **PubSub DoS**: subscription patterns capped at 10,000
+- **EventBus DoS**: channel count monitored with orphan cleanup
+- **Fleet unbounded growth**: `CrewStateManager` evicts at 1,000 completed runs, `FleetCoordinator` evicts at 10,000 completed tasks
+- **Replay buffer**: fixed biased weighted sampling
+- **StringInterner**: `checked_add` on u32 ID allocation
+
+### Fixed
+- **DAG priority ordering**: sort ascending for `pop()` (was inverted — highest priority processed last)
+- **Double inference call**: streaming now emits captured response instead of re-invoking LLM
+- **Wrong crew_id in streaming events**: was using task_id
+- **JoinError in parallel/DAG**: synthesizes Failed `TaskResult` (was silently dropped)
+- **`is_zero` NaN masking**: corrupt cost data now serialized (was silently dropped)
+- **`ComputeDevice.memory_available_mb`**: kept in sync on allocate/release (was stale after first alloc)
+- **`remove_node` barrier deadlock**: removing a node auto-satisfies pending barriers
+- **`declare_coordinator` stale role**: resets all clusters to Follower before setting new coordinator
+- **IPC TOCTOU race**: socket removal uses unconditional `remove_file` + ignore NotFound
+- **SSE serialization failure**: emits error JSON instead of empty string
+- **DAG failure propagation**: failed tasks no longer treated as completed dependencies
 
 ### Performance
-- `#[inline]` on scoring hot-path functions: `tool_coverage_score`, `complexity_score`, `gpu_score`, `domain_score`, `complexity_level`
-- `format!` → `write!` on system prompt construction, error messages, expected output formatting
-- `CapabilityScore::recent` bounded to 64 entries (was unbounded)
-- `PerformanceProfile` records bounded to 10,000 per agent (was unbounded)
-- `success_rate_for_action` / `avg_duration_for_action` eliminated intermediate `Vec` allocation
-
-### Added
-- **OpenTelemetry tracing spans** (`otel` feature flag):
-  - `src/telemetry.rs` — `init_tracing()` with optional OTLP export, `otlp_endpoint_from_env()`, `TracingGuard`
-  - OTLP gRPC export via `hoosh::telemetry` (batch exporter, configurable service name)
-  - `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME` environment variables
-  - `#[tracing::instrument]` on `Orchestrator::run_crew`, `cancel_crew`, `CrewRunner::run/run_sequential/run_parallel/run_dag`, `execute_task`, `score_agent`, `create_crew`, `a2a::receive`, `mcp_handler`
-  - Span fields: crew_id, crew_name, task_count, process mode, task_id, agent, max_concurrency, method, domain
-  - `full` feature now includes `otel`
-  - `main.rs` auto-detects OTLP endpoint and configures dual export (stderr + OTLP) or stderr-only
-- **Crew cancellation**: `cancel_crew()` now actually stops running crews via `AtomicBool` cancellation token shared between `Orchestrator` and `CrewRunner`; sequential mode breaks between tasks, parallel mode aborts pending tasks before semaphore acquisition, DAG mode halts between waves
-- `CrewRunner::with_cancel_token()` builder method
-- `CrewRunner::is_cancelled()` inline check
-- `Orchestrator.cancel_tokens` per-crew `DashMap<CrewId, Arc<AtomicBool>>` with automatic cleanup on completion
-- `#[must_use]` on pure functions: `score_agent`, `rank_agents`, `matches_pattern`, `pattern_count`, `EventBus::has/len/is_empty`, `Ucb1::select/best_arm/arm_count`, `ReplayBuffer::sample/len/is_empty`, `QLearner::get_value/best_action`, `CapabilityScorer::confidence/trend/all_scores`, `PerformanceProfile::success_rate*/avg_duration*/total_actions`
-- `#[inline]` on `is_private_ipv4` helper
-- `is_private_ipv4` helper for cleaner IPv4 range checks
-- **Cryptographic audit chain**: HMAC-SHA256 tamper-proof event logging via `hoosh::audit::AuditChain`
-  - `Orchestrator.audit` — shared `Arc<AuditChain>` with random 256-bit signing key
-  - Records `crew_accepted`, `crew_finished`, `crew_cancelled`, and `task_completed` events
-  - Per-task audit entries with crew ID, task ID, status, agent assignment
-  - Crew-level entries with wall time, cost, task count, status
-  - Chain integrity verifiable via `audit.verify()`
-  - `Orchestrator::with_audit()` builder for custom audit chain, `audit()` accessor
-  - `CrewRunner::with_audit()` builder + `audit_record()` helper
-  - `AppState.audit` field for route-level access
-  - Re-exported `AuditChain` and `AuditEntry` from `agnosai::llm`
-- **SSRF validation tests**: 10 new tests covering IPv4/IPv6 private ranges, mapped addresses, localhost variants, non-HTTP schemes, metadata IPs, overlong fields, oversized metadata
-- **Crew validation tests**: 8 new tests covering empty name, missing tasks, self-dependencies, out-of-range deps, dependency cycles, valid DAG, GET crew 404, DAG mode execution
-- **URL IPv6 parsing fix**: `is_safe_callback_url` now uses `url::Host` enum for correct bracketed IPv6 handling
+- `complexity_level` / `parse_complexity` / `domain_score`: zero-alloc via `eq_ignore_ascii_case`
+- `format!` → `write!` on system prompt construction, error messages, expected output
+- `#[inline]` on scoring hot paths, tool accessors, fleet GPU methods
+- `CapabilityScore::recent` bounded to 64 entries
+- `PerformanceProfile` records bounded to 10,000 per agent
+- DAG priority lookup: O(1) HashMap (was quadratic scan)
+- Consolidated `use std::fmt::Write` import in crew_runner
 
 ## [0.22.3] — 2026-03-23
 

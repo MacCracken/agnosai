@@ -106,11 +106,80 @@ fn bench_register(c: &mut Criterion) {
     });
 }
 
+// ── ToolRegistry::has ──────────────────────────────────────────────────
+
+fn bench_has_50(c: &mut Criterion) {
+    let reg = make_registry(50);
+
+    c.bench_function("ToolRegistry::has (50 tools, hit)", |b| {
+        b.iter(|| {
+            let _ = reg.has("tool_25");
+        });
+    });
+}
+
+fn bench_has_miss(c: &mut Criterion) {
+    let reg = make_registry(50);
+
+    c.bench_function("ToolRegistry::has (50 tools, miss)", |b| {
+        b.iter(|| {
+            let _ = reg.has("nonexistent");
+        });
+    });
+}
+
+// ── Tool execute ──────────────────────────────────────────────────────
+
+fn bench_echo_execute(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let tool = EchoTool;
+    let input = ToolInput::new(
+        [("message".to_string(), serde_json::json!("hello benchmark"))]
+            .into_iter()
+            .collect(),
+    );
+
+    c.bench_function("EchoTool::execute", |b| {
+        b.to_async(&rt).iter(|| {
+            let input = input.clone();
+            async { tool.execute(input).await }
+        });
+    });
+}
+
+// ── Large registry ────────────────────────────────────────────────────
+
+fn bench_get_500(c: &mut Criterion) {
+    let reg = make_registry(500);
+
+    c.bench_function("ToolRegistry::get (500 tools)", |b| {
+        let mut i = 0usize;
+        b.iter(|| {
+            let name = format!("tool_{}", i % 500);
+            let _ = reg.get(&name);
+            i += 1;
+        });
+    });
+}
+
+fn bench_list_500(c: &mut Criterion) {
+    let reg = make_registry(500);
+
+    c.bench_function("ToolRegistry::list (500 tools)", |b| {
+        b.iter(|| reg.list());
+    });
+}
+
 criterion_group!(
     benches,
     bench_get_5,
     bench_get_50,
+    bench_get_500,
+    bench_has_50,
+    bench_has_miss,
     bench_list_50,
+    bench_list_500,
     bench_register,
+    bench_echo_execute,
 );
 criterion_main!(benches);

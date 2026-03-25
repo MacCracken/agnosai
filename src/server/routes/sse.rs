@@ -140,4 +140,74 @@ mod tests {
             "expected text/event-stream, got {content_type}"
         );
     }
+
+    #[tokio::test]
+    async fn sse_endpoint_sends_error_event_for_unknown_crew() {
+        let app = test_app().await;
+        let crew_id = uuid::Uuid::new_v4();
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/v1/crews/{crew_id}/stream"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Read the SSE body and verify an error event is emitted.
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 64)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("event: error"),
+            "expected an error event for unknown crew, got: {body}"
+        );
+        assert!(
+            body.contains("crew not found"),
+            "expected 'crew not found' in error event data, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_for_active_crew_sends_connected_event() {
+        let crew_id = uuid::Uuid::new_v4();
+        let orchestrator = Orchestrator::new(Default::default()).await.unwrap();
+        let tools = Arc::new(ToolRegistry::new());
+        let state: SharedState = Arc::new(AppState {
+            orchestrator,
+            tools,
+            auth: Default::default(),
+            events: EventBus::new(),
+            http_client: reqwest::Client::new(),
+            audit: std::sync::Arc::new(crate::llm::AuditChain::new(b"test-key", 100)),
+        });
+
+        // Pre-create the event channel so the crew is "known".
+        let _rx = state.events.subscribe(crew_id);
+        let router = crate::server::router(state);
+
+        let response = router
+            .oneshot(
+                Request::get(format!("/api/v1/crews/{crew_id}/stream"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("text/event-stream"),
+            "expected text/event-stream, got {content_type}"
+        );
+    }
 }

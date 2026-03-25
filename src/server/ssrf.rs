@@ -98,3 +98,200 @@ pub fn is_private_ipv4(v4: std::net::Ipv4Addr) -> bool {
         || v4.is_unspecified()                                // 0.0.0.0
         || (v4.octets()[0] == 0) // 0.0.0.0/8
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // ── is_safe_url ──────────────────────────────────────────────
+
+    #[test]
+    fn safe_url_accepts_public_https() {
+        assert!(is_safe_url("https://example.com"));
+        assert!(is_safe_url("https://example.com/path?q=1"));
+    }
+
+    #[test]
+    fn safe_url_accepts_public_http() {
+        assert!(is_safe_url("http://example.com"));
+    }
+
+    #[test]
+    fn safe_url_rejects_non_http_schemes() {
+        assert!(!is_safe_url("ftp://example.com"));
+        assert!(!is_safe_url("file:///etc/passwd"));
+        assert!(!is_safe_url("gopher://example.com"));
+        assert!(!is_safe_url("ssh://example.com"));
+    }
+
+    #[test]
+    fn safe_url_rejects_invalid_url() {
+        assert!(!is_safe_url("not a url"));
+        assert!(!is_safe_url(""));
+    }
+
+    #[test]
+    fn safe_url_rejects_localhost() {
+        assert!(!is_safe_url("http://localhost"));
+        assert!(!is_safe_url("http://localhost:8080"));
+        assert!(!is_safe_url("http://127.0.0.1"));
+        assert!(!is_safe_url("http://127.0.0.1:3000"));
+    }
+
+    #[test]
+    fn safe_url_rejects_ipv6_loopback() {
+        assert!(!is_safe_url("http://[::1]"));
+        assert!(!is_safe_url("http://[::1]:8080"));
+    }
+
+    #[test]
+    fn safe_url_rejects_internal_hostnames() {
+        assert!(!is_safe_url("http://myservice.local"));
+        assert!(!is_safe_url("http://db.internal"));
+        assert!(!is_safe_url("http://app.localhost"));
+    }
+
+    #[test]
+    fn safe_url_rejects_private_ipv4_10() {
+        assert!(!is_safe_url("http://10.0.0.1"));
+        assert!(!is_safe_url("http://10.255.255.255"));
+    }
+
+    #[test]
+    fn safe_url_rejects_private_ipv4_172() {
+        assert!(!is_safe_url("http://172.16.0.1"));
+        assert!(!is_safe_url("http://172.31.255.255"));
+    }
+
+    #[test]
+    fn safe_url_rejects_private_ipv4_192() {
+        assert!(!is_safe_url("http://192.168.0.1"));
+        assert!(!is_safe_url("http://192.168.255.255"));
+    }
+
+    #[test]
+    fn safe_url_rejects_metadata_ip() {
+        assert!(!is_safe_url("http://169.254.169.254"));
+        assert!(!is_safe_url("http://169.254.169.254/latest/meta-data"));
+    }
+
+    #[test]
+    fn safe_url_rejects_zero_network() {
+        assert!(!is_safe_url("http://0.0.0.0"));
+        assert!(!is_safe_url("http://0.1.2.3"));
+    }
+
+    #[test]
+    fn safe_url_rejects_private_ipv6() {
+        // unique local fc00::/7
+        assert!(!is_safe_url("http://[fc00::1]"));
+        assert!(!is_safe_url("http://[fd12::1]"));
+        // link-local fe80::/10
+        assert!(!is_safe_url("http://[fe80::1]"));
+    }
+
+    // ── is_private_ip ────────────────────────────────────────────
+
+    #[test]
+    fn private_ip_ipv4_ranges() {
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+    }
+
+    #[test]
+    fn private_ip_ipv6_loopback() {
+        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn private_ip_ipv6_mapped_ipv4() {
+        // ::ffff:10.0.0.1
+        let mapped: Ipv6Addr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(is_private_ip(IpAddr::V6(mapped)));
+        // ::ffff:192.168.1.1
+        let mapped2: Ipv6Addr = "::ffff:192.168.1.1".parse().unwrap();
+        assert!(is_private_ip(IpAddr::V6(mapped2)));
+    }
+
+    #[test]
+    fn private_ip_ipv6_unique_local() {
+        let addr: Ipv6Addr = "fc00::1".parse().unwrap();
+        assert!(is_private_ip(IpAddr::V6(addr)));
+        let addr2: Ipv6Addr = "fd12:3456::1".parse().unwrap();
+        assert!(is_private_ip(IpAddr::V6(addr2)));
+    }
+
+    #[test]
+    fn private_ip_ipv6_link_local() {
+        let addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        assert!(is_private_ip(IpAddr::V6(addr)));
+    }
+
+    #[test]
+    fn private_ip_public_returns_false() {
+        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
+        let public_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(!is_private_ip(IpAddr::V6(public_v6)));
+    }
+
+    #[test]
+    fn private_ip_mapped_public_returns_false() {
+        let mapped: Ipv6Addr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(!is_private_ip(IpAddr::V6(mapped)));
+    }
+
+    // ── is_private_ipv4 ─────────────────────────────────────────
+
+    #[test]
+    fn private_ipv4_10_range() {
+        assert!(is_private_ipv4(Ipv4Addr::new(10, 0, 0, 0)));
+        assert!(is_private_ipv4(Ipv4Addr::new(10, 255, 255, 255)));
+    }
+
+    #[test]
+    fn private_ipv4_172_range() {
+        assert!(is_private_ipv4(Ipv4Addr::new(172, 16, 0, 0)));
+        assert!(is_private_ipv4(Ipv4Addr::new(172, 31, 255, 255)));
+        // 172.15 is not private
+        assert!(!is_private_ipv4(Ipv4Addr::new(172, 15, 0, 1)));
+        // 172.32 is not private
+        assert!(!is_private_ipv4(Ipv4Addr::new(172, 32, 0, 1)));
+    }
+
+    #[test]
+    fn private_ipv4_192_range() {
+        assert!(is_private_ipv4(Ipv4Addr::new(192, 168, 0, 0)));
+        assert!(is_private_ipv4(Ipv4Addr::new(192, 168, 255, 255)));
+    }
+
+    #[test]
+    fn private_ipv4_loopback() {
+        assert!(is_private_ipv4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(is_private_ipv4(Ipv4Addr::new(127, 255, 255, 255)));
+    }
+
+    #[test]
+    fn private_ipv4_link_local() {
+        assert!(is_private_ipv4(Ipv4Addr::new(169, 254, 0, 1)));
+        assert!(is_private_ipv4(Ipv4Addr::new(169, 254, 169, 254)));
+    }
+
+    #[test]
+    fn private_ipv4_zero_network() {
+        assert!(is_private_ipv4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(is_private_ipv4(Ipv4Addr::new(0, 1, 2, 3)));
+    }
+
+    #[test]
+    fn private_ipv4_public_returns_false() {
+        assert!(!is_private_ipv4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_private_ipv4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!is_private_ipv4(Ipv4Addr::new(93, 184, 216, 34)));
+    }
+}

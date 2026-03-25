@@ -632,10 +632,8 @@ async fn execute_task(
     }
 
     // Base temperature — may be adjusted by personality mood.
-    #[allow(unused_mut)] // mut needed when personality feature is enabled
     let mut temperature = 0.7;
 
-    #[cfg(feature = "personality")]
     if let Some(agent) = agent
         && let Some(ref profile) = agent.personality
     {
@@ -831,7 +829,6 @@ fn build_system_prompt(agent: Option<&AgentDefinition>) -> String {
         let _ = write!(prompt, "\n\nAvailable tools: {}", agent.tools.join(", "));
     }
 
-    #[cfg(feature = "personality")]
     if let Some(ref profile) = agent.personality {
         let disposition = profile.compose_prompt();
         if !disposition.is_empty() {
@@ -893,7 +890,6 @@ fn select_model(agent: Option<&AgentDefinition>) -> &str {
 /// - High confidence → slightly lower (more deterministic)
 ///
 /// Returns a temperature clamped to 0.1–1.5.
-#[cfg(feature = "personality")]
 fn mood_adjusted_temperature(profile: &bhava::traits::PersonalityProfile, base: f64) -> f64 {
     use bhava::traits::TraitKind;
 
@@ -942,7 +938,6 @@ mod tests {
             gpu_preferred: false,
             gpu_memory_min_mb: None,
             hardware: None,
-            #[cfg(feature = "personality")]
             personality: None,
         }
     }

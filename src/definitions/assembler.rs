@@ -13,6 +13,18 @@ pub struct TeamMember {
     pub complexity: Option<String>,
 }
 
+impl TeamMember {
+    /// Create a new team member specification.
+    #[must_use]
+    pub fn new(role: impl Into<String>, tools: Vec<String>, complexity: Option<String>) -> Self {
+        Self {
+            role: role.into(),
+            tools,
+            complexity,
+        }
+    }
+}
+
 /// Assemble a crew from a list of role descriptions, matching against available agent definitions.
 /// For each member, selects the best-matching agent definition from `available`.
 pub fn assemble_team(
@@ -106,7 +118,6 @@ mod tests {
             gpu_preferred: false,
             gpu_memory_min_mb: None,
             hardware: None,
-            #[cfg(feature = "personality")]
             personality: None,
         }
     }

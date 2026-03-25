@@ -64,6 +64,18 @@ pub struct TaskProfile {
     pub complexity: Complexity,
 }
 
+impl TaskProfile {
+    /// Create a new task profile.
+    #[must_use]
+    #[inline]
+    pub fn new(task_type: TaskType, complexity: Complexity) -> Self {
+        Self {
+            task_type,
+            complexity,
+        }
+    }
+}
+
 /// Select the appropriate model tier for a given task profile.
 ///
 /// The routing matrix:
