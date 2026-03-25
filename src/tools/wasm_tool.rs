@@ -1,8 +1,8 @@
 //! WASM tool loading and execution via the sandbox.
 //!
-//! Bridges [`WasmSandbox`](crate::sandbox::wasm::WasmSandbox) to the
-//! [`NativeTool`] trait so WASM modules can be registered in the
-//! [`ToolRegistry`](crate::tools::registry::ToolRegistry) alongside native tools.
+//! Bridges `WasmSandbox` to the
+//! `NativeTool` trait so WASM modules can be registered in the
+//! `ToolRegistry` alongside native tools.
 
 #[cfg(feature = "sandbox")]
 mod inner {

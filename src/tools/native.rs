@@ -109,7 +109,7 @@ impl ToolOutput {
 /// Core trait for all native Rust tools.
 ///
 /// Implementations must be `Send + Sync` so they can live inside the
-/// thread-safe [`crate::registry::ToolRegistry`].
+/// thread-safe [`crate::tools::registry::ToolRegistry`].
 ///
 /// The `execute` method returns a pinned, boxed future so the trait is
 /// object-safe and can be used as `dyn NativeTool`.

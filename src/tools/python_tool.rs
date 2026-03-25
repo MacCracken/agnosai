@@ -1,8 +1,8 @@
 //! Legacy Python tool bridge — runs tools in sandboxed subprocess.
 //!
-//! Bridges [`PythonSandbox`](crate::sandbox::python::PythonSandbox) to the
-//! [`NativeTool`] trait so Python-based tools can be registered in the
-//! [`ToolRegistry`](crate::tools::registry::ToolRegistry).
+//! Bridges `PythonSandbox` to the
+//! `NativeTool` trait so Python-based tools can be registered in the
+//! `ToolRegistry`.
 
 #[cfg(feature = "sandbox")]
 mod inner {
