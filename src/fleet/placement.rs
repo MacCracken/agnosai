@@ -84,6 +84,7 @@ pub struct PlacementResult {
 }
 
 /// Select the best node for a placement request from available nodes.
+#[must_use]
 pub fn place(request: &PlacementRequest, nodes: &[&NodeInfo]) -> Option<PlacementResult> {
     rank_nodes(request, nodes).into_iter().next()
 }
@@ -161,6 +162,7 @@ fn score_node(request: &PlacementRequest, node: &NodeInfo, index: usize, count: 
 }
 
 /// Rank all online nodes, return sorted (best first).
+#[must_use]
 pub fn rank_nodes(request: &PlacementRequest, nodes: &[&NodeInfo]) -> Vec<PlacementResult> {
     let count = nodes.len();
     let mut results: Vec<PlacementResult> = nodes

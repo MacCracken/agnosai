@@ -17,6 +17,7 @@ mod inner {
 
     /// Metadata about a WASM tool, loaded from the module or provided at registration.
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WasmToolManifest {
         pub name: String,
         pub description: String,

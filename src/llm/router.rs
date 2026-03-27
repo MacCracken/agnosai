@@ -94,7 +94,7 @@ pub fn route(profile: &TaskProfile) -> ModelTier {
     use Complexity::*;
     use TaskType::*;
 
-    match (&profile.task_type, &profile.complexity) {
+    let tier = match (&profile.task_type, &profile.complexity) {
         // Light tasks stay on fast tier unless complex.
         (Summarize | Classify, Simple | Medium) => ModelTier::Fast,
         (Summarize | Classify, Complex) => ModelTier::Capable,
@@ -106,7 +106,16 @@ pub fn route(profile: &TaskProfile) -> ModelTier {
         // Research / MultiStep escalate earlier.
         (Research | MultiStep, Simple) => ModelTier::Capable,
         (Research | MultiStep, Medium | Complex) => ModelTier::Premium,
-    }
+    };
+
+    tracing::debug!(
+        task_type = ?profile.task_type,
+        complexity = ?profile.complexity,
+        tier = ?tier,
+        "model tier selected"
+    );
+
+    tier
 }
 
 /// Map a model tier to a default model identifier.

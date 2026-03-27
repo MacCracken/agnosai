@@ -164,16 +164,19 @@ impl NodeRegistry {
     }
 
     /// Look up a node by ID.
+    #[must_use]
     pub fn get(&self, node_id: &str) -> Option<&NodeInfo> {
         self.nodes.get(node_id)
     }
 
     /// List all registered nodes.
+    #[must_use]
     pub fn list(&self) -> Vec<&NodeInfo> {
         self.nodes.values().collect()
     }
 
     /// List only nodes with `Online` status.
+    #[must_use]
     pub fn list_online(&self) -> Vec<&NodeInfo> {
         self.nodes
             .values()
@@ -195,11 +198,13 @@ impl NodeRegistry {
     }
 
     /// Total number of registered nodes (any status).
+    #[must_use]
     pub fn count(&self) -> usize {
         self.nodes.len()
     }
 
     /// Number of nodes currently `Online`.
+    #[must_use]
     pub fn count_online(&self) -> usize {
         self.nodes
             .values()
@@ -208,6 +213,7 @@ impl NodeRegistry {
     }
 
     /// Find online nodes that advertise a given capability.
+    #[must_use]
     pub fn find_by_capability(&self, capability: &str) -> Vec<&NodeInfo> {
         self.nodes
             .values()

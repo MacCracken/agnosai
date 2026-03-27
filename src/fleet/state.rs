@@ -150,6 +150,7 @@ impl CrewStateManager {
     }
 
     /// Get the state of a run.
+    #[must_use]
     pub fn get(&self, run_id: CrewRunId) -> Option<&DistributedCrewState> {
         self.states.get(&run_id)
     }
@@ -326,6 +327,7 @@ impl CrewStateManager {
     }
 
     /// List all runs that are not in a terminal state.
+    #[must_use]
     pub fn active_runs(&self) -> Vec<CrewRunId> {
         self.states
             .values()
@@ -340,6 +342,7 @@ impl CrewStateManager {
     }
 
     /// Overall progress as a fraction (0.0–1.0). Returns `None` for unknown runs.
+    #[must_use]
     pub fn overall_progress(&self, run_id: CrewRunId) -> Option<f64> {
         let state = self.states.get(&run_id)?;
         let mut completed: usize = 0;

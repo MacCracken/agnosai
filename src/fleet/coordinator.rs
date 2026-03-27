@@ -171,6 +171,7 @@ impl FleetCoordinator {
     }
 
     /// Get all tasks assigned to a specific node.
+    #[must_use]
     pub fn tasks_for_node(&self, node_id: NodeId) -> Vec<&FleetTask> {
         self.tasks
             .values()
@@ -179,6 +180,7 @@ impl FleetCoordinator {
     }
 
     /// Returns `true` when every task is either `Completed` or terminally `Failed`.
+    #[must_use]
     pub fn is_complete(&self) -> bool {
         if self.tasks.is_empty() {
             return true;
@@ -192,6 +194,7 @@ impl FleetCoordinator {
     }
 
     /// Fraction of tasks that are completed (0.0–1.0).
+    #[must_use]
     pub fn completion_pct(&self) -> f64 {
         if self.tasks.is_empty() {
             return 1.0;
@@ -205,6 +208,7 @@ impl FleetCoordinator {
     }
 
     /// List tasks that have been marked `Reassigned` (failed but retriable).
+    #[must_use]
     pub fn pending_reassignment(&self) -> Vec<&FleetTask> {
         self.tasks
             .values()
@@ -224,6 +228,7 @@ impl FleetCoordinator {
     }
 
     /// Read-only access to the underlying state manager.
+    #[must_use]
     pub fn state_manager(&self) -> &CrewStateManager {
         &self.state_manager
     }

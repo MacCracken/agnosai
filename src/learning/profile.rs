@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use tracing::debug;
 
 /// A single recorded action for an agent.
 #[non_exhaustive]
@@ -49,6 +50,13 @@ impl PerformanceProfile {
             let drain_count = records.len() - MAX_RECORDS_PER_AGENT + 1;
             records.drain(..drain_count);
         }
+        debug!(
+            agent_key,
+            action_type,
+            success,
+            duration_ms = duration.as_millis() as u64,
+            "action recorded"
+        );
         records.push(ActionRecord {
             action_type: action_type.to_string(),
             duration,

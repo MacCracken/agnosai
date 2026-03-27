@@ -68,6 +68,7 @@ pub struct GpuDevice {
 
 impl GpuDevice {
     /// Available VRAM in megabytes.
+    #[must_use]
     pub fn vram_available_mb(&self) -> u64 {
         self.vram_total_mb.saturating_sub(self.vram_used_mb)
     }
@@ -103,11 +104,13 @@ impl ComputeScheduler {
     }
 
     /// Get all registered devices as `ComputeDevice` references.
+    #[must_use]
     pub fn compute_devices(&self) -> Vec<&ComputeDevice> {
         self.devices.iter().map(|ds| &ds.device).collect()
     }
 
     /// Get all registered devices as legacy `GpuDevice` views.
+    #[must_use]
     pub fn devices(&self) -> Vec<GpuDevice> {
         self.devices
             .iter()
@@ -121,6 +124,7 @@ impl ComputeScheduler {
     }
 
     /// Get devices of a specific accelerator type.
+    #[must_use]
     pub fn devices_of_type(&self, accel: AcceleratorType) -> Vec<&ComputeDevice> {
         self.devices
             .iter()
@@ -130,6 +134,7 @@ impl ComputeScheduler {
     }
 
     /// Total memory across all devices, optionally filtered by accelerator type.
+    #[must_use]
     pub fn total_memory_mb(&self, accel: Option<AcceleratorType>) -> u64 {
         self.devices
             .iter()
@@ -139,6 +144,7 @@ impl ComputeScheduler {
     }
 
     /// Available (unused) memory across all devices, optionally filtered by accelerator type.
+    #[must_use]
     pub fn available_memory_mb(&self, accel: Option<AcceleratorType>) -> u64 {
         self.devices
             .iter()
@@ -148,11 +154,13 @@ impl ComputeScheduler {
     }
 
     /// Backward compat: total VRAM across all devices.
+    #[must_use]
     pub fn total_vram_mb(&self) -> u64 {
         self.total_memory_mb(None)
     }
 
     /// Backward compat: available VRAM across all devices.
+    #[must_use]
     pub fn available_vram_mb(&self) -> u64 {
         self.available_memory_mb(None)
     }
@@ -206,6 +214,7 @@ impl ComputeScheduler {
     }
 
     /// Find the device with the most available memory.
+    #[must_use]
     pub fn best_device(&self) -> Option<GpuDevice> {
         self.devices
             .iter()
@@ -219,6 +228,7 @@ impl ComputeScheduler {
     }
 
     /// List all active allocations.
+    #[must_use]
     pub fn allocations(&self) -> Vec<&ComputeAllocation> {
         self.allocations.values().collect()
     }

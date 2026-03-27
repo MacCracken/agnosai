@@ -1,6 +1,7 @@
 //! Dynamic capability confidence scoring with trend detection.
 
 use std::collections::HashMap;
+use tracing::debug;
 
 /// Direction the capability confidence is moving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +102,7 @@ impl CapabilityScorer {
         score.recent.push(true);
         score.update_confidence();
         score.update_trend();
+        debug!(capability, confidence = score.confidence, trend = ?score.trend, "capability success");
     }
 
     /// Record a failed outcome for the given capability.
@@ -113,6 +115,7 @@ impl CapabilityScorer {
         score.recent.push(false);
         score.update_confidence();
         score.update_trend();
+        debug!(capability, confidence = score.confidence, trend = ?score.trend, "capability failure");
     }
 
     /// Get confidence for a capability. Returns 0.5 for unknown capabilities.

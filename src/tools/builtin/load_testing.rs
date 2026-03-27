@@ -10,6 +10,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+/// Maximum total requests across all concurrent users to prevent unbounded memory growth.
+const MAX_TOTAL_REQUESTS: usize = 100_000;
+
 /// Native Rust load testing tool.
 pub struct LoadTestingTool;
 
@@ -70,8 +73,23 @@ impl NativeTool for LoadTestingTool {
             let concurrent_users = concurrent_users.min(500);
             let duration = Duration::from_secs(duration_secs.clamp(1, 300));
 
+            tracing::info!(
+                target_url = %target_url,
+                concurrent_users,
+                duration_secs = duration.as_secs(),
+                "load test starting"
+            );
+
             match run_load_test(&target_url, concurrent_users, duration).await {
-                Ok(result) => ToolOutput::ok(serde_json::to_value(result).unwrap_or_default()),
+                Ok(result) => {
+                    tracing::info!(
+                        total_requests = result.total_requests,
+                        throughput_rps = result.throughput_rps,
+                        p99_latency_ms = result.p99_latency_ms,
+                        "load test completed"
+                    );
+                    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
+                }
                 Err(e) => ToolOutput::err(format!("load test failed: {e}")),
             }
         })
@@ -114,6 +132,8 @@ async fn run_load_test(
     // Each "user" is a spawned task that loops until the deadline.
     let mut handles = Vec::with_capacity(concurrent_users);
 
+    let max_requests_per_user = MAX_TOTAL_REQUESTS / concurrent_users.max(1);
+
     for _ in 0..concurrent_users {
         let client = client.clone();
         let url = url.clone();
@@ -123,7 +143,9 @@ async fn run_load_test(
             let mut status_counts: HashMap<u16, u64> = HashMap::new();
             let mut errors: u64 = 0;
 
-            while Instant::now() < deadline {
+            while Instant::now() < deadline
+                && latencies.len() + (errors as usize) < max_requests_per_user
+            {
                 let start = Instant::now();
                 match client.get(&url).send().await {
                     Ok(resp) => {

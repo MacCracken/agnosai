@@ -18,6 +18,9 @@ pub struct DefinitionVersion {
     pub message: Option<String>,
 }
 
+/// Maximum number of versions retained per agent.
+const MAX_VERSIONS_PER_AGENT: usize = 500;
+
 /// In-memory version store for agent definitions, keyed by agent_key.
 #[non_exhaustive]
 pub struct VersionStore {
@@ -33,9 +36,16 @@ impl VersionStore {
     }
 
     /// Save a new version of the definition. Returns the assigned version number.
+    ///
+    /// Evicts the oldest versions when the per-agent cap is reached.
     pub fn save(&mut self, definition: AgentDefinition, message: Option<String>) -> u32 {
         let key = definition.agent_key.clone();
         let history = self.versions.entry(key).or_default();
+        // Evict oldest versions when at capacity.
+        if history.len() >= MAX_VERSIONS_PER_AGENT {
+            let drain_count = history.len() - MAX_VERSIONS_PER_AGENT + 1;
+            history.drain(..drain_count);
+        }
         let version = history.last().map_or(1, |v| v.version + 1);
         history.push(DefinitionVersion {
             version,
@@ -47,6 +57,7 @@ impl VersionStore {
     }
 
     /// Get a specific version of an agent definition.
+    #[must_use]
     pub fn get(&self, agent_key: &str, version: u32) -> Option<&DefinitionVersion> {
         self.versions
             .get(agent_key)?
@@ -55,11 +66,13 @@ impl VersionStore {
     }
 
     /// Get the latest version of an agent definition.
+    #[must_use]
     pub fn latest(&self, agent_key: &str) -> Option<&DefinitionVersion> {
         self.versions.get(agent_key)?.last()
     }
 
     /// List all versions of an agent definition.
+    #[must_use]
     pub fn list_versions(&self, agent_key: &str) -> Vec<&DefinitionVersion> {
         self.versions
             .get(agent_key)
@@ -205,6 +218,24 @@ mod tests {
     fn rollback_nonexistent_agent_returns_none() {
         let mut store = VersionStore::new();
         assert!(store.rollback("nonexistent", 1).is_none());
+    }
+
+    #[test]
+    fn version_store_evicts_oldest_when_at_capacity() {
+        let mut store = VersionStore::new();
+        // Fill to capacity + 1.
+        for i in 0..=super::MAX_VERSIONS_PER_AGENT {
+            store.save(
+                make_def("agent-a", &format!("role-{i}")),
+                Some(format!("v{i}")),
+            );
+        }
+        // Should have at most MAX_VERSIONS_PER_AGENT entries.
+        let versions = store.list_versions("agent-a");
+        assert!(versions.len() <= super::MAX_VERSIONS_PER_AGENT);
+        // The latest version number should be MAX + 1 (monotonic, not reset).
+        let latest = store.latest("agent-a").unwrap();
+        assert_eq!(latest.version as usize, super::MAX_VERSIONS_PER_AGENT + 1);
     }
 
     #[test]

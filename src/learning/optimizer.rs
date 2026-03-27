@@ -1,6 +1,7 @@
 //! Q-learning and policy gradient optimization.
 
 use std::collections::HashMap;
+use tracing::debug;
 
 /// String-interning table for efficient Q-table lookups.
 ///
@@ -85,6 +86,8 @@ impl QLearner {
             .fold(0.0_f64, f64::max);
         let td_target = reward + self.discount_factor * max_next_q;
         let new_q = current_q + self.learning_rate * (td_target - current_q);
+
+        debug!(state, action, reward, new_q, "q-value updated");
 
         let s_id = self.interner.intern(state);
         let a_id = self.interner.intern(action);
