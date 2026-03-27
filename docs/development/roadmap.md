@@ -34,6 +34,15 @@ telemetry OTLP init paths.
 | WASM tool registry (remote fetch) | Low | Download community tools from a registry |
 | Hot-reload tool registration | Low | Register/unregister tools without restart |
 
+### Kavach Integration (Sandboxed Execution)
+
+| Item | Priority | Notes |
+|------|----------|-------|
+| Sandboxed crew execution via kavach | High | Execute untrusted agent tools in kavach Process/WASM sandboxes |
+| Externalization gate on tool outputs | High | Apply kavach's 17 secret patterns to tool results before returning to agents |
+| Sandbox strength in crew metadata | Medium | Carry kavach strength scores (0–100) in crew execution results |
+| Per-crew isolation policy | Medium | Map crew trust level to kavach policy preset (minimal/basic/strict) |
+
 ### Observability & Operations
 
 | Item | Priority | Notes |
