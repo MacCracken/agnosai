@@ -27,6 +27,16 @@ pub struct CrewSpec {
     /// Arbitrary metadata attached to the crew.
     #[serde(default)]
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    /// Trust level for sandbox isolation policy ("minimal", "basic", "strict").
+    ///
+    /// When the `kavach` feature is enabled, this controls the externalization
+    /// gate thresholds applied to tool outputs.  Defaults to `"basic"`.
+    #[serde(default = "default_trust_level")]
+    pub trust_level: String,
+}
+
+fn default_trust_level() -> String {
+    "basic".into()
 }
 
 impl CrewSpec {
@@ -39,6 +49,7 @@ impl CrewSpec {
             tasks: Vec::new(),
             process: ProcessMode::default(),
             metadata: std::collections::HashMap::new(),
+            trust_level: default_trust_level(),
         }
     }
 
@@ -57,6 +68,12 @@ impl CrewSpec {
     /// Set the crew's execution mode.
     pub fn with_process(mut self, process: ProcessMode) -> Self {
         self.process = process;
+        self
+    }
+
+    /// Set the crew's trust level for sandbox isolation ("minimal", "basic", "strict").
+    pub fn with_trust_level(mut self, level: impl Into<String>) -> Self {
+        self.trust_level = level.into();
         self
     }
 }
@@ -89,6 +106,10 @@ pub struct CrewProfile {
     /// Total estimated inference cost in USD.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cost_usd: f64,
+    /// Kavach sandbox strength score (0–100) for the isolation level used.
+    /// Only present when the `kavach` feature is enabled and a sandbox policy is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_strength: Option<u8>,
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -222,6 +243,7 @@ mod tests {
             task_ms: HashMap::new(),
             task_count: 3,
             cost_usd: 0.0025,
+            sandbox_strength: None,
         };
         let json = serde_json::to_string(&profile).unwrap();
         assert!(json.contains("cost_usd"));
@@ -238,6 +260,7 @@ mod tests {
             task_ms: HashMap::new(),
             task_count: 1,
             cost_usd: 0.0,
+            sandbox_strength: None,
         };
         let json = serde_json::to_string(&profile).unwrap();
         assert!(!json.contains("cost_usd"), "zero cost should be omitted");
@@ -248,6 +271,54 @@ mod tests {
         let json = r#"{"wall_ms":100,"task_ms":{},"task_count":1}"#;
         let profile: CrewProfile = serde_json::from_str(json).unwrap();
         assert_eq!(profile.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn crew_spec_default_trust_level() {
+        let c = CrewSpec::new("trust-test");
+        assert_eq!(c.trust_level, "basic");
+    }
+
+    #[test]
+    fn crew_spec_with_trust_level() {
+        let c = CrewSpec::new("strict-crew").with_trust_level("strict");
+        assert_eq!(c.trust_level, "strict");
+    }
+
+    #[test]
+    fn crew_profile_sandbox_strength_serialized_when_present() {
+        let profile = CrewProfile {
+            wall_ms: 100,
+            task_ms: HashMap::new(),
+            task_count: 1,
+            cost_usd: 0.0,
+            sandbox_strength: Some(60),
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(json.contains("sandbox_strength"));
+        let restored: CrewProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.sandbox_strength, Some(60));
+    }
+
+    #[test]
+    fn crew_profile_sandbox_strength_omitted_when_none() {
+        let profile = CrewProfile {
+            wall_ms: 100,
+            task_ms: HashMap::new(),
+            task_count: 1,
+            cost_usd: 0.0,
+            sandbox_strength: None,
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(!json.contains("sandbox_strength"));
+    }
+
+    #[test]
+    fn crew_spec_trust_level_serde() {
+        let c = CrewSpec::new("serde-trust").with_trust_level("minimal");
+        let json = serde_json::to_string(&c).unwrap();
+        let restored: CrewSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.trust_level, "minimal");
     }
 
     #[test]

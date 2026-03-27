@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `policy_for_trust()` — maps crew trust levels ("minimal"/"strict"/"basic") to kavach `ExternalizationPolicy` presets
 - `KavachToolResult` — result struct carrying output, exit code, strength score, and scan verdict
 - kavach 1.0.1 as optional dependency with `process` feature (seccomp, Landlock, credential scanning)
+- **Sandbox strength in crew metadata**: `CrewProfile.sandbox_strength` — kavach strength score (0–100) carried in crew execution results
+- **Per-crew isolation policy**: `CrewSpec.trust_level` ("minimal"/"basic"/"strict") — controls externalization gate thresholds via `policy_for_trust()`
 
 #### Infrastructure
 - **Graceful shutdown** in `main.rs` — handles SIGTERM and SIGINT via `tokio::signal`, logs shutdown reason
@@ -86,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`scan_input` prompt guard**: zero-alloc — replaced `to_ascii_lowercase()` with `eq_ignore_ascii_case` byte-window search
 - **`rank_agents` scoring loop**: single `extract_required_tools()` call shared across all agents (was N calls)
 
-#### Tests (675 total, up from 620)
+#### Tests (680 total, up from 620)
 - Prompt guard: 12 tests (injection patterns, sanitization, boundary wrapping)
 - Output validation: 11 tests (JSON parsing, type checks, required fields, fence extraction, retry prompts)
 - Approval gate: 7 tests (approve/reject flow, timeout, capacity, cancel, listing)

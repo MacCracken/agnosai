@@ -173,11 +173,21 @@ impl CrewRunner {
             .iter()
             .filter_map(|r| r.metadata.get("cost_usd").and_then(|v| v.as_f64()))
             .sum();
+        // Compute kavach sandbox strength score for the crew's isolation level.
+        #[cfg(feature = "kavach")]
+        let sandbox_strength = {
+            let sandbox_policy = crate::sandbox::policy::SandboxPolicy::process();
+            Some(crate::sandbox::kavach_bridge::strength_for_policy(&sandbox_policy).value())
+        };
+        #[cfg(not(feature = "kavach"))]
+        let sandbox_strength: Option<u8> = None;
+
         let profile = CrewProfile {
             wall_ms,
             task_count: results.len(),
             task_ms,
             cost_usd,
+            sandbox_strength,
         };
 
         info!(
@@ -993,6 +1003,7 @@ mod tests {
             tasks,
             process,
             metadata: Default::default(),
+            trust_level: "basic".into(),
         }
     }
 
