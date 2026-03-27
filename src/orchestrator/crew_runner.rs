@@ -687,6 +687,7 @@ async fn execute_task(
     // If the task has an output_schema, validate the response and retry with
     // error feedback on failure (up to MAX_VALIDATION_RETRIES attempts).
     let mut current_request = request;
+    let original_prompt = current_request.prompt.clone();
     let mut final_response = client.infer(&current_request).await;
 
     if let Some(ref schema) = task.output_schema {
@@ -702,11 +703,15 @@ async fn execute_task(
                         attempt,
                         &err,
                     );
-                    // Build retry prompt with error feedback and lower temperature.
+                    // Build retry prompt from the ORIGINAL prompt (not accumulated)
+                    // to prevent exponential growth. Sanitize the failed output to
+                    // prevent prompt injection via error feedback.
+                    let sanitized_output =
+                        crate::server::prompt_guard::sanitize(&extracted, "failed_output");
                     current_request.prompt =
                         crate::orchestrator::output_validation::build_retry_prompt(
-                            &current_request.prompt,
-                            &extracted,
+                            &original_prompt,
+                            &sanitized_output,
                             &err,
                             schema,
                         );

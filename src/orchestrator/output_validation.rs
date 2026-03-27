@@ -134,17 +134,22 @@ pub fn extract_and_validate(output: &str, schema: &Value) -> (String, Validation
 }
 
 /// Extract the first ```json ... ``` or ``` ... ``` block from text.
+///
+/// Uses `\n```" as the closing delimiter (newline before backticks) to avoid
+/// false matches on literal triple backticks inside JSON string values.
 fn extract_json_block(text: &str) -> Option<&str> {
-    // Look for ```json\n...\n```
     let start_markers = ["```json\n", "```json\r\n", "```\n", "```\r\n"];
     for marker in start_markers {
         if let Some(start) = text.find(marker) {
             let content_start = start + marker.len();
-            if let Some(end) = text[content_start..].find("```") {
-                let block = text[content_start..content_start + end].trim();
-                if !block.is_empty() {
-                    return Some(block);
-                }
+            let remainder = &text[content_start..];
+            // Look for closing fence on its own line.
+            let end = remainder
+                .find("\n```")
+                .or_else(|| remainder.find("\r\n```"))?;
+            let block = remainder[..end].trim();
+            if !block.is_empty() {
+                return Some(block);
             }
         }
     }
@@ -279,6 +284,16 @@ mod tests {
         assert!(prompt.contains("not valid JSON"));
         assert!(prompt.contains("not json"));
         assert!(prompt.contains("schema"));
+    }
+
+    #[test]
+    fn fence_with_backticks_in_json_value() {
+        // Triple backticks inside a JSON string should not break extraction.
+        let text = "Result:\n```json\n{\"code\": \"use ```markdown``` here\"}\n```\nDone.";
+        let schema = json!({"type": "object", "required": ["code"]});
+        let (extracted, result) = extract_and_validate(text, &schema);
+        assert_eq!(result, ValidationResult::Valid);
+        assert!(extracted.contains("markdown"));
     }
 
     #[test]

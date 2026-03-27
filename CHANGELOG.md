@@ -67,6 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Load testing tool request cap**: total requests capped at 100K across all concurrent users
 
 ### Fixed
+- **Output validation retry prompt injection**: failed LLM outputs are now sanitized via `prompt_guard::sanitize()` before inclusion in retry prompts
+- **Output validation retry prompt growth**: retry prompts now use the original prompt as base, preventing exponential accumulation
+- **JSON fence extraction**: closing delimiter now requires newline prefix (`\n`````), preventing false termination on literal triple backticks inside JSON string values
 - `#[non_exhaustive]` added to `WasmToolManifest`
 
 #### Observability
@@ -83,7 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`scan_input` prompt guard**: zero-alloc — replaced `to_ascii_lowercase()` with `eq_ignore_ascii_case` byte-window search
 - **`rank_agents` scoring loop**: single `extract_required_tools()` call shared across all agents (was N calls)
 
-#### Tests (674 total, up from 620)
+#### Tests (675 total, up from 620)
 - Prompt guard: 12 tests (injection patterns, sanitization, boundary wrapping)
 - Output validation: 11 tests (JSON parsing, type checks, required fields, fence extraction, retry prompts)
 - Approval gate: 7 tests (approve/reject flow, timeout, capacity, cancel, listing)
