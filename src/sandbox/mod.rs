@@ -18,6 +18,8 @@ pub const SANITIZED_ENV_VARS: &[&str] = &[
     "DYLD_LIBRARY_PATH",
 ];
 
+#[cfg(feature = "kavach")]
+pub mod kavach_bridge;
 pub mod manager;
 pub mod oci;
 pub mod policy;

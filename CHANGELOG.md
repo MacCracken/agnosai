@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ApprovalDecision` enum (Approved/Rejected) with serde support
 - `AppState.approval_gate` — shared approval gate accessible from all route handlers
 
+#### Kavach Integration (`kavach` feature flag)
+- **`sandbox::kavach_bridge`** — bridge module mapping AgnosAI sandbox policies to kavach sandboxes
+- `map_backend()` — maps `IsolationLevel` (None/Wasm/Process/Oci) to kavach `Backend`
+- `build_config()` — converts `SandboxPolicy` to kavach `SandboxConfig` with externalization gate, seccomp, and agent ID
+- `strength_for_policy()` — computes kavach `StrengthScore` (0–100) for any sandbox policy
+- `execute()` — full lifecycle: create → start → exec → stop → destroy, with tracing and security metadata
+- `scan_output()` — standalone externalization gate for scanning native tool outputs (secrets, code violations, PII)
+- `policy_for_trust()` — maps crew trust levels ("minimal"/"strict"/"basic") to kavach `ExternalizationPolicy` presets
+- `KavachToolResult` — result struct carrying output, exit code, strength score, and scan verdict
+- kavach 1.0.1 as optional dependency with `process` feature (seccomp, Landlock, credential scanning)
+
 #### Infrastructure
 - **Graceful shutdown** in `main.rs` — handles SIGTERM and SIGINT via `tokio::signal`, logs shutdown reason
 - **`scripts/bench-history.sh`** — runs all benchmarks and appends median times to `bench-history.csv`
@@ -72,11 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`scan_input` prompt guard**: zero-alloc — replaced `to_ascii_lowercase()` with `eq_ignore_ascii_case` byte-window search
 - **`rank_agents` scoring loop**: single `extract_required_tools()` call shared across all agents (was N calls)
 
-#### Tests (658 total, up from 620)
+#### Tests (674 total, up from 620)
 - Prompt guard: 12 tests (injection patterns, sanitization, boundary wrapping)
 - Output validation: 11 tests (JSON parsing, type checks, required fields, fence extraction, retry prompts)
 - Approval gate: 7 tests (approve/reject flow, timeout, capacity, cancel, listing)
 - Tool allow-list: 5 tests (empty list, allow/block, missing tool)
+- Kavach bridge: 16 tests (backend mapping, strength scoring, config building, externalization gate, trust policies)
 - VersionStore eviction: 1 test
 
 ## [0.24.3] — 2026-03-24
