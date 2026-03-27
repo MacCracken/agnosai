@@ -5,6 +5,80 @@ All notable changes to AgnosAI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### Security — Prompt Injection & Tool Allow-Lists
+- **Prompt injection detection** (`server::prompt_guard`): heuristic scanner for 30+ injection patterns (instruction override, role hijack, prompt leak, delimiter injection) with case-insensitive matching
+- **Input sanitization**: `sanitize()` truncates inputs to 50K chars, wraps in `<user_input>` boundary markers, logs warnings on suspicious content
+- **System prompt hardening**: `wrap_system_prompt()` adds `<system_instructions>` delimiters and anti-injection directive to all LLM system prompts
+- **Per-agent tool allow-list enforcement**: `ToolRegistry::get_allowed()` validates tool calls against agent's `tools` field before execution; empty list means "all tools"
+- `ToolRegistry::is_tool_allowed()` static helper for allow-list checks
+
+#### Structured Output Validation
+- **Output validation module** (`orchestrator::output_validation`): validates LLM responses against JSON Schema (`type` and `required` field checks)
+- **Retry-on-parse-failure**: when `Task.output_schema` is set, failed validation triggers up to 2 retries with error feedback injected into the prompt and temperature forced to 0.1
+- **Markdown fence extraction**: `extract_and_validate()` automatically extracts JSON from ````json` code blocks in LLM responses
+- `Task.output_schema` field — optional JSON Schema for output validation with retry
+
+#### Human-in-the-Loop Approval Gates
+- **Approval gate module** (`orchestrator::approval`): suspends crew runner via oneshot channels, resumes on HTTP callback
+- `ApprovalGate` with configurable timeout (default 5 min), max 1,000 pending approvals, capacity enforcement
+- `TaskRisk` enum (Low/Medium/High) on `Task` — determines whether human approval is required
+- `ApprovalGate::requires_approval()` — configurable per-risk-level gating
+- **REST endpoints**: `POST /api/v1/approvals` (submit decision), `GET /api/v1/approvals` (list pending)
+- `ApprovalDecision` enum (Approved/Rejected) with serde support
+- `AppState.approval_gate` — shared approval gate accessible from all route handlers
+
+#### Infrastructure
+- **Graceful shutdown** in `main.rs` — handles SIGTERM and SIGINT via `tokio::signal`, logs shutdown reason
+- **`scripts/bench-history.sh`** — runs all benchmarks and appends median times to `bench-history.csv`
+
+### Changed
+- `main.rs`: HTTP client build uses `?` instead of `.expect()` (no longer panics on TLS init failure)
+- Crew runner: system prompts wrapped with anti-injection boundaries via `prompt_guard::wrap_system_prompt()`
+- Crew runner: task descriptions and context values sanitized via `prompt_guard::sanitize()` before LLM submission
+- Crew runner: output validation retry loop when `Task.output_schema` is set
+
+#### `#[must_use]` additions (26 methods)
+- `fleet::registry`: `get`, `list`, `list_online`, `count`, `count_online`, `find_by_capability`
+- `fleet::placement`: `place`, `rank_nodes`
+- `fleet::gpu`: `compute_devices`, `devices`, `devices_of_type`, `total_memory_mb`, `available_memory_mb`, `total_vram_mb`, `available_vram_mb`, `best_device`, `allocations`, `vram_available_mb`
+- `fleet::state`: `get`, `active_runs`, `overall_progress`
+- `fleet::coordinator`: `tasks_for_node`, `is_complete`, `completion_pct`, `pending_reassignment`, `state_manager`
+- `definitions::versioning`: `get`, `latest`, `list_versions`
+
+### Security
+- **Prompt injection defence-in-depth**: boundary markers, anti-injection directives, heuristic scanning
+- **Tool call allow-list**: prevents LLM from invoking tools outside agent's declared tool set
+- **VersionStore bounded growth**: capped at 500 versions per agent with oldest-first eviction
+- **Load testing tool request cap**: total requests capped at 100K across all concurrent users
+
+### Fixed
+- `#[non_exhaustive]` added to `WasmToolManifest`
+
+#### Observability
+- `llm::router::route()` — `tracing::debug` on model tier routing decisions
+- `tools::builtin::load_testing` — `tracing::info` on test start/completion with metrics
+- `learning::profile` — `tracing::debug` on action recording
+- `learning::optimizer` — `tracing::debug` on Q-value updates
+- `learning::capability` — `tracing::debug` on capability success/failure with confidence and trend
+
+### Performance
+- **`rank_agents` (10 agents)**: 2.95 µs → 889 ns (−70%) — pre-extract `required_tools` once per task instead of re-deserializing per agent
+- **Crew cancel/update**: O(n) → O(1) — `active_crews` changed from `Vec<CrewState>` to `HashMap<CrewId, CrewState>`
+- **DAG topological sort**: O(n² log n) → O(n log n) — replaced Vec + sort() with BinaryHeap for priority ordering
+- **`scan_input` prompt guard**: zero-alloc — replaced `to_ascii_lowercase()` with `eq_ignore_ascii_case` byte-window search
+- **`rank_agents` scoring loop**: single `extract_required_tools()` call shared across all agents (was N calls)
+
+#### Tests (658 total, up from 620)
+- Prompt guard: 12 tests (injection patterns, sanitization, boundary wrapping)
+- Output validation: 11 tests (JSON parsing, type checks, required fields, fence extraction, retry prompts)
+- Approval gate: 7 tests (approve/reject flow, timeout, capacity, cancel, listing)
+- Tool allow-list: 5 tests (empty list, allow/block, missing tool)
+- VersionStore eviction: 1 test
+
 ## [0.24.3] — 2026-03-24
 
 ### Added

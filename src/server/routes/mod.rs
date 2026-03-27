@@ -13,6 +13,8 @@
 pub mod a2a;
 /// Agent definition management.
 pub mod agents;
+/// Human-in-the-loop approval endpoints.
+pub mod approval;
 /// Crew creation and execution.
 pub mod crews;
 /// Preset listing.

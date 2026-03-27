@@ -266,6 +266,7 @@ mod tests {
             events: crate::server::sse::EventBus::new(),
             http_client: reqwest::Client::new(),
             audit: Arc::new(AuditChain::new(b"test-key", 1_000)),
+            approval_gate: Default::default(),
         });
         crate::server::router(state)
     }

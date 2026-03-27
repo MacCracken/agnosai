@@ -34,6 +34,7 @@ async fn test_app() -> Router {
         events: agnosai::server::sse::EventBus::new(),
         http_client: reqwest::Client::new(),
         audit: Arc::new(AuditChain::new(b"bench-key", 1_000)),
+        approval_gate: Default::default(),
     });
     server::router(state)
 }

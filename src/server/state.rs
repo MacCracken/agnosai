@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::llm::AuditChain;
 use crate::orchestrator::Orchestrator;
+use crate::orchestrator::approval::ApprovalGate;
 use crate::server::auth::AuthConfig;
 use crate::server::sse::EventBus;
 use crate::tools::ToolRegistry;
@@ -20,6 +21,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Cryptographic audit chain for tamper-proof event logging.
     pub audit: Arc<AuditChain>,
+    /// Human-in-the-loop approval gate for task results.
+    pub approval_gate: ApprovalGate,
 }
 
 /// Thread-safe shared reference to application state.

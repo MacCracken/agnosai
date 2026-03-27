@@ -19,22 +19,31 @@ fn complexity_level(s: &str) -> u8 {
     }
 }
 
-/// Score the fraction of required tools the agent provides.
-#[inline]
-fn tool_coverage_score(agent: &AgentDefinition, task: &Task) -> f64 {
-    let required = match task.context.get("required_tools") {
-        Some(val) => match serde_json::from_value::<Vec<String>>(val.clone()) {
-            Ok(tools) => tools,
-            Err(_) => {
-                tracing::warn!("task has malformed required_tools context, penalizing score");
-                return 0.5; // malformed → partial penalty (was 1.0)
-            }
-        },
-        None => return 1.0, // no requirement → full score
-    };
-    if required.is_empty() {
-        return 1.0;
+/// Extract required tools from a task's context once, avoiding repeated
+/// JSON deserialization on every agent-task scoring call.
+#[must_use]
+pub fn extract_required_tools(task: &Task) -> Option<Vec<String>> {
+    let val = task.context.get("required_tools")?;
+    match serde_json::from_value::<Vec<String>>(val.clone()) {
+        Ok(tools) => Some(tools),
+        Err(_) => {
+            tracing::warn!("task has malformed required_tools context");
+            None
+        }
     }
+}
+
+/// Score the fraction of required tools the agent provides.
+///
+/// Pass `pre_extracted` from [`extract_required_tools`] to avoid repeated
+/// JSON deserialization when scoring multiple agents against the same task.
+#[inline]
+fn tool_coverage_score(agent: &AgentDefinition, pre_extracted: Option<&[String]>) -> f64 {
+    let required = match pre_extracted {
+        Some(tools) if !tools.is_empty() => tools,
+        Some(_) => return 1.0, // empty list → full score
+        None => return 1.0,    // no requirement → full score
+    };
     let matched = required.iter().filter(|t| agent.tools.contains(t)).count();
     matched as f64 / required.len() as f64
 }
@@ -94,7 +103,17 @@ fn domain_score(agent: &AgentDefinition, task: &Task) -> f64 {
 #[must_use]
 #[tracing::instrument(skip(agent, task), fields(agent_key = %agent.agent_key, task_id = %task.id))]
 pub fn score_agent(agent: &AgentDefinition, task: &Task) -> f64 {
-    let tool = tool_coverage_score(agent, task);
+    let required_tools = extract_required_tools(task);
+    score_agent_with_tools(agent, task, required_tools.as_deref())
+}
+
+/// Score an agent with pre-extracted required tools (avoids repeated deserialization).
+fn score_agent_with_tools(
+    agent: &AgentDefinition,
+    task: &Task,
+    required_tools: Option<&[String]>,
+) -> f64 {
+    let tool = tool_coverage_score(agent, required_tools);
     let complexity = complexity_score(agent, task);
     let gpu = gpu_score(agent, task);
     let domain = domain_score(agent, task);
@@ -178,10 +197,17 @@ fn personality_score(agent: &AgentDefinition, task: &Task) -> f64 {
 /// Rank agents by suitability for a task, returning (index, score) pairs sorted descending.
 #[must_use]
 pub fn rank_agents(agents: &[AgentDefinition], task: &Task) -> Vec<(usize, f64)> {
+    // Pre-extract required tools once to avoid N deserializations.
+    let required_tools = extract_required_tools(task);
     let mut scored: Vec<(usize, f64)> = agents
         .iter()
         .enumerate()
-        .map(|(i, agent)| (i, score_agent(agent, task)))
+        .map(|(i, agent)| {
+            (
+                i,
+                score_agent_with_tools(agent, task, required_tools.as_deref()),
+            )
+        })
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored

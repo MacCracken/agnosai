@@ -61,6 +61,28 @@ impl ToolRegistry {
     pub fn count(&self) -> usize {
         self.tools.len()
     }
+
+    /// Check whether a tool name is permitted by an agent's allow-list.
+    ///
+    /// If `allowed_tools` is empty the check passes (no restriction).
+    /// Otherwise the tool name must appear in the list.
+    #[must_use]
+    pub fn is_tool_allowed(tool_name: &str, allowed_tools: &[String]) -> bool {
+        allowed_tools.is_empty() || allowed_tools.iter().any(|t| t == tool_name)
+    }
+
+    /// Look up a tool by name, enforcing an agent's allow-list.
+    ///
+    /// Returns `None` if the tool is not registered **or** not in
+    /// `allowed_tools` (unless the list is empty, which means "all tools").
+    #[must_use]
+    pub fn get_allowed(&self, name: &str, allowed_tools: &[String]) -> Option<Arc<dyn NativeTool>> {
+        if !Self::is_tool_allowed(name, allowed_tools) {
+            tracing::warn!(tool = name, "tool call blocked: not in agent allow-list");
+            return None;
+        }
+        self.get(name)
+    }
 }
 
 impl Default for ToolRegistry {
@@ -197,6 +219,43 @@ mod tests {
 
         let jt_schema = schemas.iter().find(|s| s.name == "json_transform").unwrap();
         assert_eq!(jt_schema.parameters.len(), 2);
+    }
+
+    #[test]
+    fn is_tool_allowed_empty_list_permits_all() {
+        assert!(ToolRegistry::is_tool_allowed("anything", &[]));
+    }
+
+    #[test]
+    fn is_tool_allowed_checks_list() {
+        let allowed = vec!["echo".into(), "json_transform".into()];
+        assert!(ToolRegistry::is_tool_allowed("echo", &allowed));
+        assert!(ToolRegistry::is_tool_allowed("json_transform", &allowed));
+        assert!(!ToolRegistry::is_tool_allowed("load_testing", &allowed));
+    }
+
+    #[test]
+    fn get_allowed_blocks_unlisted_tool() {
+        let reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(JsonTransformTool));
+
+        let allowed = vec!["echo".into()];
+        assert!(reg.get_allowed("echo", &allowed).is_some());
+        assert!(reg.get_allowed("json_transform", &allowed).is_none());
+    }
+
+    #[test]
+    fn get_allowed_empty_list_allows_all() {
+        let reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        assert!(reg.get_allowed("echo", &[]).is_some());
+    }
+
+    #[test]
+    fn get_allowed_missing_tool_returns_none() {
+        let reg = ToolRegistry::new();
+        assert!(reg.get_allowed("nonexistent", &[]).is_none());
     }
 
     #[test]

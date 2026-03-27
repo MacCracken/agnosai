@@ -605,30 +605,30 @@ async fn execute_task(
 
     debug!(task_id = %task.id, agent = agent_label, "executing task via LLM");
 
-    // Build system prompt from agent definition.
-    let system_prompt = build_system_prompt(agent);
+    // Build system prompt from agent definition, wrapped with anti-injection boundary.
+    let raw_system = build_system_prompt(agent);
+    let system_prompt = crate::server::prompt_guard::wrap_system_prompt(&raw_system);
 
     // Choose model: agent override → router-based tier selection.
     let model = select_model(agent);
 
-    // Build messages: include any context as a preamble.
+    // Build messages: include any context as a preamble (sanitized).
     let mut messages = Vec::new();
     if !task.context.is_empty() {
         let ctx_json = serde_json::to_string_pretty(&task.context).unwrap_or_default();
-        messages.push(Message::new(
-            Role::User,
-            format!("Context:\n```json\n{ctx_json}\n```"),
-        ));
+        let sanitized_ctx = crate::server::prompt_guard::sanitize(&ctx_json, "context");
+        messages.push(Message::new(Role::User, sanitized_ctx));
         messages.push(Message::new(
             Role::Assistant,
             "Understood, I have the context.",
         ));
     }
 
-    // The task description is the main user message.
-    let mut user_msg = task.description.clone();
+    // The task description is the main user message (sanitized).
+    let mut user_msg = crate::server::prompt_guard::sanitize(&task.description, "task_description");
     if let Some(ref expected) = task.expected_output {
-        let _ = write!(user_msg, "\n\nExpected output format: {expected}");
+        let sanitized_expected = crate::server::prompt_guard::sanitize(expected, "expected_output");
+        let _ = write!(user_msg, "\n\n{sanitized_expected}");
     }
 
     // Base temperature — may be adjusted by personality mood.
@@ -683,7 +683,41 @@ async fn execute_task(
     // Primary path: non-streaming inference (gives full metadata).
     // When an event sender is present, also attempt streaming for token-by-token
     // SSE delivery, then fall back to the non-streaming response for metadata.
-    match client.infer(&request).await {
+    //
+    // If the task has an output_schema, validate the response and retry with
+    // error feedback on failure (up to MAX_VALIDATION_RETRIES attempts).
+    let mut current_request = request;
+    let mut final_response = client.infer(&current_request).await;
+
+    if let Some(ref schema) = task.output_schema {
+        for attempt in 1..=crate::orchestrator::output_validation::MAX_VALIDATION_RETRIES {
+            let Ok(ref resp) = final_response else { break };
+            let (extracted, result) =
+                crate::orchestrator::output_validation::extract_and_validate(&resp.text, schema);
+            match result {
+                crate::orchestrator::output_validation::ValidationResult::Valid => break,
+                crate::orchestrator::output_validation::ValidationResult::Invalid(err) => {
+                    crate::orchestrator::output_validation::log_retry(
+                        &task.id.to_string(),
+                        attempt,
+                        &err,
+                    );
+                    // Build retry prompt with error feedback and lower temperature.
+                    current_request.prompt =
+                        crate::orchestrator::output_validation::build_retry_prompt(
+                            &current_request.prompt,
+                            &extracted,
+                            &err,
+                            schema,
+                        );
+                    current_request.temperature = Some(0.1);
+                    final_response = client.infer(&current_request).await;
+                }
+            }
+        }
+    }
+
+    match final_response {
         Ok(response) => {
             // Cache the successful response.
             cache.insert(ck, response.text.clone());
@@ -771,7 +805,7 @@ async fn execute_task(
 
             crate::llm::llm_metrics::record_request(
                 "hoosh",
-                &request.model,
+                &current_request.model,
                 "error",
                 task_duration_ms as f64 / 1000.0,
                 0,

@@ -11,6 +11,8 @@
 //! - [`Scheduler`](scheduler::Scheduler) — priority queue + DAG topological sort
 //! - [`PubSub`](pubsub::PubSub) — topic-based pub/sub with wildcard matching
 
+/// Human-in-the-loop approval gates for task results.
+pub mod approval;
 /// Crew lifecycle runner (assemble, execute, aggregate).
 pub mod crew_runner;
 /// Inter-process communication utilities.
@@ -18,6 +20,8 @@ pub mod ipc;
 #[allow(clippy::module_inception)]
 /// Top-level orchestrator struct and crew execution.
 pub mod orchestrator;
+/// Structured output validation and retry logic.
+pub mod output_validation;
 /// Topic-based publish/subscribe with wildcard matching.
 pub mod pubsub;
 /// Priority queue and DAG topological sort.

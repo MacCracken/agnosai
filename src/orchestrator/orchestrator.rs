@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{RwLock, Semaphore};
@@ -21,7 +22,7 @@ pub(crate) struct OrchestratorState {
     #[allow(dead_code)]
     pub(crate) scheduler: Scheduler,
     /// Crews currently tracked (active and recently completed).
-    pub(crate) active_crews: Vec<CrewState>,
+    pub(crate) active_crews: HashMap<CrewId, CrewState>,
 }
 
 /// Top-level orchestrator managing crew lifecycles and scheduling.
@@ -54,7 +55,7 @@ impl Orchestrator {
         let max_concurrent = budget.max_concurrent_tasks.unwrap_or(10);
         let state = OrchestratorState {
             scheduler: Scheduler::new(),
-            active_crews: Vec::new(),
+            active_crews: HashMap::new(),
         };
 
         // Generate a cryptographically random signing key for the audit chain.
@@ -153,7 +154,7 @@ impl Orchestrator {
             let mut state = self.state.write().await;
             if state.active_crews.len() >= MAX_RETAINED_CREWS {
                 let before = state.active_crews.len();
-                state.active_crews.retain(|c| {
+                state.active_crews.retain(|_, c| {
                     !matches!(
                         c.status,
                         CrewStatus::Completed | CrewStatus::Failed | CrewStatus::Cancelled
@@ -164,12 +165,15 @@ impl Orchestrator {
                     "evicted completed crews"
                 );
             }
-            state.active_crews.push(CrewState {
+            state.active_crews.insert(
                 crew_id,
-                status: CrewStatus::Pending,
-                results: Vec::new(),
-                profile: None,
-            });
+                CrewState {
+                    crew_id,
+                    status: CrewStatus::Pending,
+                    results: Vec::new(),
+                    profile: None,
+                },
+            );
         }
 
         // Create cancellation token for this crew.
@@ -247,9 +251,7 @@ impl Orchestrator {
         // Update stored state.
         {
             let mut state = self.state.write().await;
-            if let Some(entry) = state.active_crews.iter_mut().find(|c| c.crew_id == crew_id) {
-                *entry = crew_state.clone();
-            }
+            state.active_crews.insert(crew_id, crew_state.clone());
         }
 
         // Clean up cancellation token and event channel.
@@ -274,7 +276,7 @@ impl Orchestrator {
         }
 
         let mut state = self.state.write().await;
-        if let Some(crew) = state.active_crews.iter_mut().find(|c| c.crew_id == crew_id) {
+        if let Some(crew) = state.active_crews.get_mut(&crew_id) {
             crew.status = CrewStatus::Cancelled;
             info!(crew_id = %crew_id, "crew cancelled");
             self.audit.record(

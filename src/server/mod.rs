@@ -5,6 +5,8 @@
 
 /// Authentication and authorization middleware.
 pub mod auth;
+/// Prompt injection detection and input sanitization.
+pub mod prompt_guard;
 /// HTTP route handlers.
 pub mod routes;
 /// Server-sent event streaming.
@@ -48,6 +50,10 @@ pub fn router(state: SharedState) -> Router {
             get(routes::agents::list_definitions).post(routes::agents::create_definition),
         )
         .route("/tools", get(routes::tools::list_tools))
+        .route(
+            "/approvals",
+            get(routes::approval::list_pending).post(routes::approval::submit_approval),
+        )
         .route("/presets", get(routes::definitions::list_presets))
         .with_state(state.clone());
 

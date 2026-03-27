@@ -33,6 +33,16 @@ pub struct Task {
     /// Arbitrary key-value context passed to the executing agent.
     #[serde(default)]
     pub context: HashMap<String, serde_json::Value>,
+    /// Risk level for human-in-the-loop approval gating.
+    #[serde(default)]
+    pub risk: TaskRisk,
+    /// Optional JSON Schema that the task output must conform to.
+    ///
+    /// When set, the crew runner validates the LLM response against this
+    /// schema.  On validation failure the runner retries inference with the
+    /// error message injected as feedback (up to a configurable limit).
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 impl Task {
@@ -47,12 +57,26 @@ impl Task {
             status: TaskStatus::default(),
             dependencies: Vec::new(),
             context: HashMap::new(),
+            risk: TaskRisk::default(),
+            output_schema: None,
         }
     }
 
     /// Set the expected output.
     pub fn with_expected_output(mut self, output: impl Into<String>) -> Self {
         self.expected_output = Some(output.into());
+        self
+    }
+
+    /// Set the risk level for human-in-the-loop gating.
+    pub fn with_risk(mut self, risk: TaskRisk) -> Self {
+        self.risk = risk;
+        self
+    }
+
+    /// Set a JSON Schema for output validation with retry.
+    pub fn with_output_schema(mut self, schema: serde_json::Value) -> Self {
+        self.output_schema = Some(schema);
         self
     }
 
@@ -73,6 +97,24 @@ impl Task {
         self.context.insert(key.into(), value);
         self
     }
+}
+
+/// Risk level for human-in-the-loop approval gating.
+///
+/// Tasks with `High` risk require explicit human approval before the LLM
+/// response is returned.  `Medium` risk can be configured to require approval.
+/// `Low` risk tasks proceed automatically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TaskRisk {
+    /// Proceeds automatically without approval.
+    #[default]
+    Low,
+    /// May require approval depending on crew configuration.
+    Medium,
+    /// Always requires human approval before the result is used.
+    High,
 }
 
 /// Priority tier for task scheduling (higher = more urgent).

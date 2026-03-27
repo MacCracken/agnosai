@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::core::error::{AgnosaiError, Result};
 use crate::core::task::{Task, TaskDAG, TaskId};
@@ -249,25 +249,24 @@ pub fn topological_sort_tasks(tasks: &[Task]) -> Result<Vec<TaskId>> {
     let priority_map: HashMap<TaskId, crate::core::task::TaskPriority> =
         tasks.iter().map(|t| (t.id, t.priority)).collect();
 
-    // Seed with zero in-degree nodes. Sort ascending so pop() takes highest priority.
-    let mut queue: Vec<TaskId> = in_degree
+    // Seed with zero in-degree nodes in a priority heap.
+    // BinaryHeap is a max-heap, so higher TaskPriority values pop first.
+    let mut queue: BinaryHeap<(crate::core::task::TaskPriority, TaskId)> = in_degree
         .iter()
         .filter(|&(_, &deg)| deg == 0)
-        .map(|(&id, _)| id)
+        .map(|(&id, _)| (priority_map.get(&id).copied().unwrap_or_default(), id))
         .collect();
-    queue.sort_by(|a, b| priority_map.get(a).cmp(&priority_map.get(b)));
 
     let mut order = Vec::with_capacity(tasks.len());
 
-    while let Some(id) = queue.pop() {
+    while let Some((_, id)) = queue.pop() {
         order.push(id);
         if let Some(children) = dependents.get(&id) {
             for child in children {
                 if let Some(deg) = in_degree.get_mut(child) {
                     *deg -= 1;
                     if *deg == 0 {
-                        queue.push(*child);
-                        queue.sort_by(|a, b| priority_map.get(a).cmp(&priority_map.get(b)));
+                        queue.push((priority_map.get(child).copied().unwrap_or_default(), *child));
                     }
                 }
             }
@@ -305,6 +304,8 @@ mod tests {
             status: TaskStatus::Pending,
             dependencies: Vec::new(),
             context: HashMap::new(),
+            risk: crate::core::task::TaskRisk::default(),
+            output_schema: None,
         }
     }
 
@@ -480,6 +481,8 @@ mod tests {
             status: TaskStatus::Pending,
             dependencies: Vec::new(),
             context: HashMap::new(),
+            risk: crate::core::task::TaskRisk::default(),
+            output_schema: None,
         };
         let t_lo = Task {
             id: uuid::Uuid::new_v4(),
@@ -490,6 +493,8 @@ mod tests {
             status: TaskStatus::Pending,
             dependencies: Vec::new(),
             context: HashMap::new(),
+            risk: crate::core::task::TaskRisk::default(),
+            output_schema: None,
         };
         tasks.insert("hi".to_string(), t_hi);
         tasks.insert("lo".to_string(), t_lo);

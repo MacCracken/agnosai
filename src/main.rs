@@ -103,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let audit = orchestrator.audit().clone();
+    let approval_gate = agnosai::orchestrator::approval::ApprovalGate::new();
     let state: SharedState = Arc::new(AppState {
         orchestrator,
         tools,
@@ -110,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         events,
         http_client,
         audit,
+        approval_gate,
     });
 
     let app = router(state);
