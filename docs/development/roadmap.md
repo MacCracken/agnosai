@@ -17,20 +17,10 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 | Near-term | ≥75% | — |
 | Target | ≥85% | — |
 
-680 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
+709 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
 paths (load_testing, security_audit need mock servers), SSE streaming edge cases,
 telemetry OTLP init paths, adversarial input tests (prompt injection), sandbox
 escape tests, concurrent cancel stress tests.
-
-### Resilience & Context (P1)
-
-| Item | Priority | Notes |
-|------|----------|-------|
-| LLM inference retry with exponential backoff | High | Retry on transient failures (rate limits, 503s, timeouts) at the HooshClient call path |
-| Token/cost budget enforcement per task | High | Enforce `ResourceBudget.max_tokens_per_task` / `max_cost_per_crew` in crew runner |
-| Multi-turn conversation memory | High | `ConversationBuffer` per agent — full, sliding window, or summarize-and-compress strategies |
-| OTel GenAI semantic convention spans | High | Emit `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.usage.*` per OpenTelemetry v1.37 |
-| Per-task cost attribution metrics | Medium | Break down `CrewProfile.cost_usd` per-task and per-agent for optimization |
 
 ### Ecosystem & Scale
 

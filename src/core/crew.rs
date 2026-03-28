@@ -106,6 +106,12 @@ pub struct CrewProfile {
     /// Total estimated inference cost in USD.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cost_usd: f64,
+    /// Per-agent cost breakdown in USD, keyed by agent_key.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub agent_cost_usd: HashMap<String, f64>,
+    /// Per-task cost breakdown in USD, keyed by task ID.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub task_cost_usd: HashMap<TaskId, f64>,
     /// Kavach sandbox strength score (0–100) for the isolation level used.
     /// Only present when the `kavach` feature is enabled and a sandbox policy is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,6 +249,8 @@ mod tests {
             task_ms: HashMap::new(),
             task_count: 3,
             cost_usd: 0.0025,
+            agent_cost_usd: HashMap::new(),
+            task_cost_usd: HashMap::new(),
             sandbox_strength: None,
         };
         let json = serde_json::to_string(&profile).unwrap();
@@ -260,6 +268,8 @@ mod tests {
             task_ms: HashMap::new(),
             task_count: 1,
             cost_usd: 0.0,
+            agent_cost_usd: HashMap::new(),
+            task_cost_usd: HashMap::new(),
             sandbox_strength: None,
         };
         let json = serde_json::to_string(&profile).unwrap();
@@ -292,6 +302,8 @@ mod tests {
             task_ms: HashMap::new(),
             task_count: 1,
             cost_usd: 0.0,
+            agent_cost_usd: HashMap::new(),
+            task_cost_usd: HashMap::new(),
             sandbox_strength: Some(60),
         };
         let json = serde_json::to_string(&profile).unwrap();
@@ -307,6 +319,8 @@ mod tests {
             task_ms: HashMap::new(),
             task_count: 1,
             cost_usd: 0.0,
+            agent_cost_usd: HashMap::new(),
+            task_cost_usd: HashMap::new(),
             sandbox_strength: None,
         };
         let json = serde_json::to_string(&profile).unwrap();

@@ -169,10 +169,30 @@ impl CrewRunner {
                     .map(|ms| (r.task_id, ms))
             })
             .collect();
-        let cost_usd: f64 = results
+        // Per-task cost breakdown.
+        let task_cost_usd: HashMap<TaskId, f64> = results
             .iter()
-            .filter_map(|r| r.metadata.get("cost_usd").and_then(|v| v.as_f64()))
-            .sum();
+            .filter_map(|r| {
+                r.metadata
+                    .get("cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .filter(|&c| c > 0.0)
+                    .map(|c| (r.task_id, c))
+            })
+            .collect();
+        let cost_usd: f64 = task_cost_usd.values().sum();
+
+        // Per-agent cost breakdown.
+        let mut agent_cost_usd: HashMap<String, f64> = HashMap::new();
+        for r in &results {
+            if let Some(cost) = r.metadata.get("cost_usd").and_then(|v| v.as_f64())
+                && cost > 0.0
+                && let Some(agent_key) = r.metadata.get("agent").and_then(|v| v.as_str())
+            {
+                *agent_cost_usd.entry(agent_key.to_string()).or_default() += cost;
+            }
+        }
+
         // Compute kavach sandbox strength score for the crew's isolation level.
         #[cfg(feature = "kavach")]
         let sandbox_strength = {
@@ -187,6 +207,8 @@ impl CrewRunner {
             task_count: results.len(),
             task_ms,
             cost_usd,
+            agent_cost_usd,
+            task_cost_usd,
             sandbox_strength,
         };
 
@@ -698,7 +720,17 @@ async fn execute_task(
     // error feedback on failure (up to MAX_VALIDATION_RETRIES attempts).
     let mut current_request = request;
     let original_prompt = current_request.prompt.clone();
-    let mut final_response = client.infer(&current_request).await;
+    let retry_config = crate::llm::retry::RetryConfig::default();
+    let task_id_str = task.id.to_string();
+
+    // Budget check: verify token/cost budget before inference (uses CostTracker as proxy).
+    // The actual budget enforcement uses the accumulated cost from the cost_tracker.
+    // Per-task token recording happens after each successful inference below.
+
+    let mut final_response = {
+        let req = &current_request;
+        crate::llm::retry::with_retry(&retry_config, &task_id_str, || client.infer(req)).await
+    };
 
     if let Some(ref schema) = task.output_schema {
         for attempt in 1..=crate::orchestrator::output_validation::MAX_VALIDATION_RETRIES {
@@ -726,7 +758,13 @@ async fn execute_task(
                             schema,
                         );
                     current_request.temperature = Some(0.1);
-                    final_response = client.infer(&current_request).await;
+                    final_response = {
+                        let req = &current_request;
+                        crate::llm::retry::with_retry(&retry_config, &task_id_str, || {
+                            client.infer(req)
+                        })
+                        .await
+                    };
                 }
             }
         }

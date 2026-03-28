@@ -9,6 +9,9 @@
 //! - `OTEL_EXPORTER_OTLP_ENDPOINT` — OTLP collector endpoint (e.g. `http://localhost:4317`)
 //! - `OTEL_SERVICE_NAME` — Override the default service name (`agnosai`)
 
+/// GenAI semantic convention span helpers (OTel v1.37+).
+pub mod genai;
+
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 

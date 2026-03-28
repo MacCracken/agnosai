@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sandbox strength in crew metadata**: `CrewProfile.sandbox_strength` — kavach strength score (0–100) carried in crew execution results
 - **Per-crew isolation policy**: `CrewSpec.trust_level` ("minimal"/"basic"/"strict") — controls externalization gate thresholds via `policy_for_trust()`
 
+#### Resilience & Context (P1)
+- **LLM inference retry with exponential backoff** (`llm::retry`): configurable `RetryConfig` (max retries, base delay, max delay, jitter), `with_retry()` async wrapper, `is_retryable()` heuristic for transient errors (rate limits, 503s, timeouts, connection resets), wired into crew runner inference path
+- **Token/cost budget enforcement** (`orchestrator::budget`): `BudgetTracker` with atomic counters, `check()` validates before inference, `record_tokens()`/`record_cost()` after, `BudgetExceeded` error enum (Tokens/Cost variants)
+- **Multi-turn conversation memory** (`orchestrator::memory`): `ConversationBuffer` with three strategies — `Full` (unlimited), `SlidingWindow` (evict oldest), `HeadTail` (keep first + last N), per-agent context accumulation
+- **OTel GenAI semantic convention spans** (`telemetry::genai`): `inference_span()`, `tool_span()`, `crew_span()` helpers emitting standardized attributes per OTel v1.37 (`gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.usage.input_tokens`, `gen_ai.response.model`, etc.)
+- **Per-task cost attribution**: `CrewProfile.task_cost_usd` (per-task) and `CrewProfile.agent_cost_usd` (per-agent) cost breakdowns populated from TaskResult metadata
+
 #### Infrastructure
 - **Graceful shutdown** in `main.rs` — handles SIGTERM and SIGINT via `tokio::signal`, logs shutdown reason
 - **`scripts/bench-history.sh`** — runs all benchmarks and appends median times to `bench-history.csv`
@@ -89,13 +96,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `learning::optimizer` — `tracing::debug` on Q-value updates
 - `learning::capability` — `tracing::debug` on capability success/failure with confidence and trend
 
-### Tests (680 total, up from 620)
+### Tests (709 total, up from 620)
 - Prompt guard: 12 tests (injection patterns, sanitization, boundary wrapping)
 - Output validation: 12 tests (JSON parsing, type checks, required fields, fence extraction, retry prompts, backtick edge case)
 - Approval gate: 7 tests (approve/reject flow, timeout, capacity, cancel, listing)
 - Tool allow-list: 5 tests (empty list, allow/block, missing tool)
 - Kavach bridge: 16 tests (backend mapping, strength scoring, config building, externalization gate, trust policies)
 - Crew trust/strength: 5 tests (default trust, custom trust, strength serialization, serde roundtrip)
+- LLM retry: 11 tests (exponential backoff, retryable detection, transient recovery, exhaustion, non-retryable skip)
+- Budget tracker: 6 tests (token/cost enforcement, accumulation, display)
+- Conversation memory: 8 tests (full/sliding/head-tail strategies, clear, serde)
+- GenAI spans: 4 tests (attribute naming, span creation)
 - VersionStore eviction: 1 test
 
 ## [0.24.3] — 2026-03-24

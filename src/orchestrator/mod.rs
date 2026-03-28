@@ -13,10 +13,14 @@
 
 /// Human-in-the-loop approval gates for task results.
 pub mod approval;
+/// Token and cost budget enforcement.
+pub mod budget;
 /// Crew lifecycle runner (assemble, execute, aggregate).
 pub mod crew_runner;
 /// Inter-process communication utilities.
 pub mod ipc;
+/// Multi-turn conversation memory for agents.
+pub mod memory;
 #[allow(clippy::module_inception)]
 /// Top-level orchestrator struct and crew execution.
 pub mod orchestrator;
