@@ -17,7 +17,7 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 | Near-term | ≥75% | — |
 | Target | ≥85% | — |
 
-709 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
+721 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
 paths (load_testing, security_audit need mock servers), SSE streaming edge cases,
 telemetry OTLP init paths, adversarial input tests (prompt injection), sandbox
 escape tests, concurrent cancel stress tests.
@@ -56,8 +56,6 @@ escape tests, concurrent cancel stress tests.
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| Per-endpoint rate limiting | Low | Sliding-window RPM via `hoosh::middleware::rate_limit` |
-| Priority inference queue | Low | Batch/background inference via `hoosh::queue` + majra |
 | Hot-reload configuration | Low | `arc-swap` pattern for config changes without restart |
 
 ### Final Migration

@@ -7,6 +7,9 @@
 pub mod auth;
 /// Prompt injection detection and input sanitization.
 pub mod prompt_guard;
+/// Per-endpoint rate limiting backed by majra.
+#[cfg(feature = "majra")]
+pub mod rate_limit;
 /// HTTP route handlers.
 pub mod routes;
 /// Server-sent event streaming.

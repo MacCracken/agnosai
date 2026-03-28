@@ -4,6 +4,8 @@
 //! cost tracking, and metrics are provided by the `hoosh` crate. This module
 //! re-exports the key types and adds AgnosAI-specific task-complexity routing.
 
+#[cfg(feature = "majra")]
+pub mod inference_queue;
 pub mod retry;
 pub mod router;
 

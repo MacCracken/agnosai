@@ -51,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OTel GenAI semantic convention spans** (`telemetry::genai`): `inference_span()`, `tool_span()`, `crew_span()` helpers emitting standardized attributes per OTel v1.37 (`gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.usage.input_tokens`, `gen_ai.response.model`, etc.)
 - **Per-task cost attribution**: `CrewProfile.task_cost_usd` (per-task) and `CrewProfile.agent_cost_usd` (per-agent) cost breakdowns populated from TaskResult metadata
 
+#### Majra Integration (`majra` feature flag)
+- **Priority inference queue** (`llm::inference_queue`): `InferenceQueue` backed by majra's `ConcurrentPriorityQueue` — enqueue inference requests at 5 priority tiers (Critical→Background), async worker loop dispatches in priority order, oneshot reply channels
+- `map_priority()` — maps AgnosAI `TaskPriority` to majra `Priority`
+- `InferenceQueue::spawn_worker()` — background task that pops and executes queued inference requests
+- **Per-endpoint rate limiting** (`server::rate_limit`): `RateLimitState` backed by majra's token bucket `RateLimiter` — per-IP rate limiting with X-Forwarded-For/X-Real-IP extraction, stale key eviction, HTTP 429 middleware
+- majra 1.0.1 as optional dependency with `queue`, `ratelimit`, `pubsub` features
+
 #### Infrastructure
 - **Graceful shutdown** in `main.rs` — handles SIGTERM and SIGINT via `tokio::signal`, logs shutdown reason
 - **`scripts/bench-history.sh`** — runs all benchmarks and appends median times to `bench-history.csv`
@@ -96,7 +103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `learning::optimizer` — `tracing::debug` on Q-value updates
 - `learning::capability` — `tracing::debug` on capability success/failure with confidence and trend
 
-### Tests (709 total, up from 620)
+### Tests (721 total, up from 620)
 - Prompt guard: 12 tests (injection patterns, sanitization, boundary wrapping)
 - Output validation: 12 tests (JSON parsing, type checks, required fields, fence extraction, retry prompts, backtick edge case)
 - Approval gate: 7 tests (approve/reject flow, timeout, capacity, cancel, listing)
@@ -107,6 +114,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Budget tracker: 6 tests (token/cost enforcement, accumulation, display)
 - Conversation memory: 8 tests (full/sliding/head-tail strategies, clear, serde)
 - GenAI spans: 4 tests (attribute naming, span creation)
+- Inference queue: 4 tests (creation, priority mapping, enqueue, background)
+- Rate limiter: 7 tests (burst, separate keys, stats, eviction, header extraction)
 - VersionStore eviction: 1 test
 
 ## [0.24.3] — 2026-03-24
