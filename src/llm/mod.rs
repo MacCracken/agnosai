@@ -15,13 +15,18 @@ pub use hoosh::audit::{AuditChain, AuditEntry};
 pub use hoosh::budget::{TokenBudget, TokenPool};
 pub use hoosh::cache::{CacheConfig, ResponseCache, cache_key};
 pub use hoosh::client::HooshClient;
+pub use hoosh::context::compactor::{CompactionResult, ContextCompactor};
+pub use hoosh::context::tokens::TokenCounter;
 pub use hoosh::cost::{CostTracker, ModelPricing, ProviderCostRecord};
+pub use hoosh::dlp::{ClassificationLevel, DlpConfig, DlpScanner};
 pub use hoosh::error::HooshError;
 pub use hoosh::inference::{
     InferenceRequest, InferenceResponse, Message, ModelInfo, Role, TokenUsage,
 };
 pub use hoosh::metrics as llm_metrics;
+pub use hoosh::middleware::rate_limit::RateLimitRegistry;
 pub use hoosh::provider::{LlmProvider, ProviderType};
+pub use hoosh::tools::{ToolCall, ToolChoice, ToolDefinition, ToolResult};
 
 // AgnosAI-specific task-complexity routing.
 pub use router::{Complexity, ModelTier, TaskProfile, TaskType, default_model, parse_complexity};

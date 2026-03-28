@@ -866,10 +866,7 @@ mod tests {
             AcceleratorType::Metal
         );
         assert_eq!(
-            AcceleratorType::from_hwaccel(&HW::VulkanGpu {
-                device_id: 0,
-                device_name: "test".into(),
-            }),
+            AcceleratorType::from_hwaccel(&HW::VulkanGpu { device_id: 0 }),
             AcceleratorType::Vulkan
         );
         assert_eq!(

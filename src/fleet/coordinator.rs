@@ -477,9 +477,9 @@ mod tests {
                 &registry,
             );
             assert!(
-                plan.shards.len() <= 1,
+                plan.shards().len() <= 1,
                 "7B FP16 on 80GB should not need sharding, got {} shards",
-                plan.shards.len()
+                plan.shards().len()
             );
         }
 
@@ -497,9 +497,9 @@ mod tests {
                 &registry,
             );
             assert!(
-                plan.shards.len() >= 2,
+                plan.shards().len() >= 2,
                 "70B FP16 on 2x80GB should shard across devices, got {} shards",
-                plan.shards.len()
+                plan.shards().len()
             );
             assert!(
                 plan.total_memory_bytes > 0,
@@ -521,9 +521,9 @@ mod tests {
             );
             // INT4 70B ≈ 35GB, fits in 80GB.
             assert!(
-                plan.shards.len() <= 1,
+                plan.shards().len() <= 1,
                 "70B INT4 on 80GB should fit without sharding, got {} shards",
-                plan.shards.len()
+                plan.shards().len()
             );
         }
     }
