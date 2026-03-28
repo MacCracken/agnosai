@@ -1,19 +1,31 @@
-.PHONY: check fmt clippy test audit deny vet bench fuzz coverage build release doc clean
+.PHONY: check fmt clippy test test-all bench bench-history audit deny vet fuzz coverage doc build release clean
 
 # Run all CI checks locally
-check: fmt clippy test audit deny vet
+check: fmt clippy test-all audit deny doc
 
 # Format check
 fmt:
 	cargo fmt --all -- --check
 
-# Lint (zero warnings, allow missing-docs for now)
+# Lint (zero warnings)
 clippy:
-	cargo clippy --workspace --all-targets -- -D warnings -A missing-docs
+	cargo clippy --all-features --all-targets -- -D warnings
 
-# Run test suite
+# Run core tests
 test:
-	cargo test --workspace
+	cargo test
+
+# Run tests with all features
+test-all:
+	cargo test --all-features
+
+# Run benchmarks (all benchmark files)
+bench:
+	cargo bench --all-features
+
+# Run benchmarks and append to bench-history.csv
+bench-history:
+	./scripts/bench-history.sh
 
 # Security audit
 audit:
@@ -27,10 +39,6 @@ deny:
 vet:
 	cargo vet
 
-# Run benchmarks
-bench:
-	cargo bench --bench serde_types --bench scheduler --bench scoring -- --noplot
-
 # Fuzz all targets (30s each)
 fuzz:
 	@cd fuzz && for target in $$(cargo +nightly fuzz list 2>/dev/null); do \
@@ -38,25 +46,25 @@ fuzz:
 		cargo +nightly fuzz run "$$target" -- -max_total_time=30 -max_len=4096 || exit 1; \
 	done
 
-# Coverage (fails if below 55%)
+# Code coverage
 coverage:
-	cargo tarpaulin --workspace --skip-clean --fail-under 55
+	cargo tarpaulin --all-features --skip-clean --fail-under 55
+
+# Generate documentation (warnings as errors)
+doc:
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 # Build release binary
 build:
-	cargo build --release
+	cargo build --release --all-features
 
 # Build and package release artifact
 release:
 	@VERSION=$$(cat VERSION | tr -d '[:space:]'); \
-	cargo build --release; \
+	cargo build --release --all-features; \
 	tar czf "agnosai-server-$${VERSION}-linux-amd64.tar.gz" -C target/release agnosai-server; \
 	sha256sum "agnosai-server-$${VERSION}-linux-amd64.tar.gz" > "agnosai-server-$${VERSION}-linux-amd64.tar.gz.sha256"; \
 	echo "Packaged agnosai-server-$${VERSION}-linux-amd64.tar.gz"
-
-# Generate documentation
-doc:
-	cargo doc --no-deps --workspace
 
 # Clean build artifacts
 clean:
