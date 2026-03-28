@@ -1,6 +1,6 @@
 //! Prioritized experience replay buffer.
 
-use rand::Rng;
+use rand::RngExt;
 
 /// A single experience tuple stored in the replay buffer.
 #[derive(Debug, Clone)]
@@ -110,7 +110,7 @@ impl ReplayBuffer {
                 break;
             }
 
-            let mut r = rng.random::<f64>() * remaining_priority;
+            let mut r = rng.random_range(0.0..1.0_f64) * remaining_priority;
             let mut chosen = 0;
             for (i, exp) in self.experiences.iter().enumerate() {
                 if selected[i] {
