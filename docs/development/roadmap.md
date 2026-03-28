@@ -17,54 +17,30 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 | Near-term | ≥75% | — |
 | Target | ≥85% | — |
 
-721 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
+823 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
 paths (load_testing, security_audit need mock servers), SSE streaming edge cases,
 telemetry OTLP init paths, adversarial input tests (prompt injection), sandbox
 escape tests, concurrent cancel stress tests.
 
-### Ecosystem & Scale
+### Future Features (demand-gated)
 
-| Item | Priority | Notes |
-|------|----------|-------|
-| Topology-aware fleet scheduling | Medium | Leverage ai-hwaccel NVLink/XGMI data for GPU-affinity placement |
-| Cost-aware crew planning | Medium | Cloud GPU pricing lookup for budget-constrained crews |
-| Container/VM environment detection | Medium | Auto-detect cgroup/namespace resource limits via ai-hwaccel `RuntimeEnvironment` |
-| Python bindings (PyO3) | Medium | Let Python callers use AgnosAI as a library |
-| Multi-node fleet discovery (mDNS, Consul, K8s) | Medium | Auto-discover fleet nodes |
-| Kubernetes operator | Low | CRDs for crew/agent definitions |
-| WASM tool registry (remote fetch) | Low | Download community tools from a registry |
-| Hot-reload tool registration | Low | Register/unregister tools without restart |
+| Item | Notes |
+|------|-------|
+| Python bindings (PyO3) | Needs separate crate with `cdylib` target + maturin build |
 
-### Observability & Operations
+### v1.0.0 Release
 
-| Item | Priority | Notes |
-|------|----------|-------|
-| AgnosAI-specific Prometheus metrics | Medium | Crew execution counts, task durations, agent scoring histograms |
-| Multi-tenancy (crew isolation, resource quotas) | Medium | Per-tenant budget enforcement |
-| Dashboard API (crew history, agent performance) | Low | REST endpoints for operational dashboards |
+| Item | Notes |
+|------|-------|
+| Crate conformance audit | Align with AGNOS public crate standards (see hisab 1.3, abaco 1.1, kavach 1.0, majra 1.0) — bench-history.csv, bench-latest.md, Makefile, codecov.yml, scripts/ |
+| Version bump 0.25 → 1.0.0 | Via `scripts/version-bump.sh` — VERSION, Cargo.toml, recipe sync |
+| Release checklist | `cargo publish` dry-run, crates.io metadata, docs.rs build, README examples verified |
 
-### Durability & Advanced Modes (P2)
+### Post-v1.0.0
 
-| Item | Priority | Notes |
-|------|----------|-------|
-| Durable crew state / resume-from-checkpoint | Medium | Serialize crew state to disk/database with resume capability after crash |
-| Hierarchical process mode | Medium | Manager agent dynamically delegates sub-tasks to sub-agents (currently falls back to sequential) |
-| Sensitive information output filter | Medium | Post-inference filter scanning for system prompt leaks, API keys, PII patterns |
-| Plan caching for repeated similar crews | Low | Semantic similarity cache for agent assignment decisions and task decomposition plans |
-
-### Engineering Backlog
-
-| Item | Priority | Notes |
-|------|----------|-------|
-| Hot-reload configuration | Low | `arc-swap` pattern for config changes without restart |
-
-### Final Migration
-
-| Item | Priority |
-|------|----------|
-| Remove CrewAI dependency from Agnostic | Final |
-
-**Exit criteria**: Agnostic runs entirely on AgnosAI. Zero Python in the hot path. CrewAI removed.
+| Item | Notes |
+|------|-------|
+| Final migration: remove CrewAI from Agnostic | Exit criteria: Agnostic runs entirely on AgnosAI. Zero Python in the hot path |
 
 ---
 

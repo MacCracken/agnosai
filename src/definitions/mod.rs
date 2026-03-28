@@ -5,6 +5,8 @@
 //! versions with rollback support.
 
 pub mod assembler;
+/// Kubernetes CRD type definitions for crew/agent resources.
+pub mod k8s_crd;
 pub mod loader;
 pub mod packaging;
 pub mod versioning;

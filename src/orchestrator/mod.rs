@@ -17,15 +17,23 @@ pub mod approval;
 pub mod budget;
 /// Crew lifecycle runner (assemble, execute, aggregate).
 pub mod crew_runner;
+/// Durable crew state persistence and recovery.
+pub mod durable_state;
+/// Hierarchical process mode — manager-driven task delegation.
+pub mod hierarchical;
 /// Inter-process communication utilities.
 pub mod ipc;
 /// Multi-turn conversation memory for agents.
 pub mod memory;
+/// Multi-tenancy with per-tenant budget enforcement.
+pub mod multi_tenant;
 #[allow(clippy::module_inception)]
 /// Top-level orchestrator struct and crew execution.
 pub mod orchestrator;
 /// Structured output validation and retry logic.
 pub mod output_validation;
+/// Plan caching for repeated crew executions.
+pub mod plan_cache;
 /// Topic-based publish/subscribe with wildcard matching.
 pub mod pubsub;
 /// Priority queue and DAG topological sort.

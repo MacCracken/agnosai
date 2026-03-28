@@ -20,6 +20,7 @@ pub mod builtin;
 pub mod native;
 pub mod python_tool;
 pub mod registry;
+pub mod remote_registry;
 pub mod wasm_loader;
 pub mod wasm_tool;
 

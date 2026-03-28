@@ -17,6 +17,8 @@ pub mod agents;
 pub mod approval;
 /// Crew creation and execution.
 pub mod crews;
+/// Dashboard API — crew history and agent performance.
+pub mod dashboard;
 /// Preset listing.
 pub mod definitions;
 /// Health and readiness probes.

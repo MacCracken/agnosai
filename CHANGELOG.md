@@ -58,6 +58,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Per-endpoint rate limiting** (`server::rate_limit`): `RateLimitState` backed by majra's token bucket `RateLimiter` — per-IP rate limiting with X-Forwarded-For/X-Real-IP extraction, stale key eviction, HTTP 429 middleware
 - majra 1.0.1 as optional dependency with `queue`, `ratelimit`, `pubsub` features
 
+#### Medium-Priority Batch — Ecosystem, Observability, Durability
+- **Topology-aware fleet scheduling** (`fleet::topology`): `NodeTopology`, `DeviceLink`, `InterconnectType` (PCIe/NVLink/XGMI/CXL), `topology_score()` for multi-GPU placement, `supports_tensor_parallel()` check
+- **Cost-aware crew planning** (`fleet::cost_planning`): `GpuPricing` with per-hour rates for 5 GPU types, `estimate_crew_cost()`, `select_cheapest_model()` budget-constrained selection
+- **Container/VM environment detection** (`fleet::environment`): `RuntimeEnvironment` enum (Bare/Container/Vm/Kubernetes/Unknown), `detect()` via cgroup/hypervisor/env inspection, `resource_limits()` from cgroup v1/v2
+- **Multi-node fleet discovery** (`fleet::discovery`): `DiscoveryBackend` trait, `StaticDiscovery` impl, `DnsDiscovery` stub for DNS SRV
+- **Prometheus metrics** (`server::prometheus`): `AgnosMetrics` with atomic counters (crews, tasks, tokens, cost), `gather()` in Prometheus exposition format
+- **Multi-tenancy** (`orchestrator::multi_tenant`): `TenantRegistry` with DashMap, `TenantBudget`, per-tenant budget checking
+- **Durable crew state** (`orchestrator::durable_state`): `StateStore` trait, `FileStateStore` impl (JSON to disk), `serialize_crew_state()` / `deserialize_crew_state()`
+- **Hierarchical process mode** (`orchestrator::hierarchical`): `delegate_tasks()` using scoring module to assign tasks to best-fit agents, replaces sequential fallback
+- **Sensitive information output filter** (`server::output_filter`): `OutputFilter` scanning for system prompt leakage, API keys (AWS/GitHub/Bearer), PII (email/phone/SSN), `scan()` + `redact()`
+
+#### Low-Priority Batch
+- **Hot-reload tool registration**: `DELETE /api/v1/tools/{name}` for runtime tool unregistration
+- **Dashboard API**: `GET /api/v1/dashboard/crews` (crew history summaries), `GET /api/v1/dashboard/agents` (agent performance from recent runs)
+- **Remote WASM tool registry** (`tools::remote_registry`): `fetch_package()` downloads tool packages from URL with SSRF protection and 10 MB size limit
+- **Hot-reload configuration** (`server::hot_config`): `ConfigHolder<T>` backed by `tokio::sync::watch` — zero-contention reads, instant propagation, `RuntimeConfig` struct with reloadable settings
+- **Plan caching** (`orchestrator::plan_cache`): `PlanCache` with LRU eviction (256 max), TTL expiry, order-independent crew spec hashing via `PlanKey`
+- **Kubernetes CRD types** (`definitions::k8s_crd`): `CrewCrd`, `AgentCrdSpec`, `TaskCrdSpec` with `agnosai.io/v1` API group — serde-compatible, no k8s client dependency
+
 #### Infrastructure
 - **Graceful shutdown** in `main.rs` — handles SIGTERM and SIGINT via `tokio::signal`, logs shutdown reason
 - **`scripts/bench-history.sh`** — runs all benchmarks and appends median times to `bench-history.csv`
@@ -103,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `learning::optimizer` — `tracing::debug` on Q-value updates
 - `learning::capability` — `tracing::debug` on capability success/failure with confidence and trend
 
-### Tests (721 total, up from 620)
+### Tests (823 total, up from 620)
 - Prompt guard: 12 tests (injection patterns, sanitization, boundary wrapping)
 - Output validation: 12 tests (JSON parsing, type checks, required fields, fence extraction, retry prompts, backtick edge case)
 - Approval gate: 7 tests (approve/reject flow, timeout, capacity, cancel, listing)
@@ -116,6 +135,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GenAI spans: 4 tests (attribute naming, span creation)
 - Inference queue: 4 tests (creation, priority mapping, enqueue, background)
 - Rate limiter: 7 tests (burst, separate keys, stats, eviction, header extraction)
+- Topology scheduling: 7 tests (single GPU, no links, full NVLink, partial, tensor parallel)
+- Cost planning: 8 tests (estimation, model selection, budget constraints)
+- Environment detection: 7 tests (enum variants, resource limits, detection)
+- Fleet discovery: 7 tests (static backend, discovered node, trait impl)
+- Prometheus metrics: 7 tests (counters, gauges, gather format)
+- Multi-tenancy: 11 tests (registration, budget check, concurrent access)
+- Durable state: 7 tests (serialize/deserialize, file store, tempdir)
+- Hierarchical mode: 6 tests (task delegation, scoring-based assignment)
+- Output filter: 16 tests (API keys, PII, system prompt leak, redaction)
+- Plan cache: 7 tests (insert/get, order-independent hashing, TTL expiry, LRU eviction)
+- K8s CRD types: 4 tests (serde roundtrip, YAML compat, defaults, API constants)
+- Hot config: 5 tests (initial value, update, receiver, runtime config defaults, serde)
+- Remote registry: 3 tests (SSRF rejection, localhost rejection, size constant)
 - VersionStore eviction: 1 test
 
 ## [0.24.3] — 2026-03-24

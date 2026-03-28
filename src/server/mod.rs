@@ -5,6 +5,12 @@
 
 /// Authentication and authorization middleware.
 pub mod auth;
+/// Hot-reload configuration via watch channel.
+pub mod hot_config;
+/// Sensitive information output filter for LLM responses.
+pub mod output_filter;
+/// Prometheus-compatible metrics collection.
+pub mod prometheus;
 /// Prompt injection detection and input sanitization.
 pub mod prompt_guard;
 /// Per-endpoint rate limiting backed by majra.
@@ -54,10 +60,19 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/tools", get(routes::tools::list_tools))
         .route(
+            "/tools/{name}",
+            axum::routing::delete(routes::tools::remove_tool),
+        )
+        .route(
             "/approvals",
             get(routes::approval::list_pending).post(routes::approval::submit_approval),
         )
         .route("/presets", get(routes::definitions::list_presets))
+        .route("/dashboard/crews", get(routes::dashboard::crew_history))
+        .route(
+            "/dashboard/agents",
+            get(routes::dashboard::agent_performance),
+        )
         .with_state(state.clone());
 
     // Protected routes: /api/v1/* and /mcp require auth (when enabled).

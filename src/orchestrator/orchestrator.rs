@@ -298,6 +298,11 @@ impl Orchestrator {
     pub fn budget(&self) -> &ResourceBudget {
         &self.budget
     }
+
+    /// Read-only access to the internal state (for dashboard/monitoring).
+    pub(crate) fn state(&self) -> &Arc<RwLock<OrchestratorState>> {
+        &self.state
+    }
 }
 
 #[cfg(test)]

@@ -1,12 +1,27 @@
-use crate::tools::ToolSchema;
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 
 use crate::server::state::SharedState;
+use crate::tools::ToolSchema;
 
 /// GET /api/v1/tools — List all registered tools.
 pub async fn list_tools(State(state): State<SharedState>) -> Json<Vec<ToolSchema>> {
     Json(state.tools.list())
+}
+
+/// DELETE /api/v1/tools/{name} — Unregister a tool at runtime.
+pub async fn remove_tool(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if state.tools.remove(&name) {
+        tracing::info!(tool = %name, "tool unregistered");
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 #[cfg(test)]
