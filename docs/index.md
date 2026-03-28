@@ -27,4 +27,7 @@
 ## Development
 
 - [Roadmap](development/roadmap.md)
+- [Performance & Benchmarks](development/performance.md)
+- [AgnosAI vs CrewAI Comparison](development/comparison-crewai.md)
+- [Threat Model](development/threat-model.md)
 - [Changelog](../CHANGELOG.md)
