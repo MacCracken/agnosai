@@ -74,26 +74,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **JSON fence extraction**: closing delimiter now requires newline prefix (`\n`````), preventing false termination on literal triple backticks inside JSON string values
 - `#[non_exhaustive]` added to `WasmToolManifest`
 
-#### Observability
+### Performance
+- **`rank_agents` (10 agents)**: 2.95 µs → 870 ns (−71%) — pre-extract `required_tools` once per task instead of re-deserializing per agent
+- **Crew cancel/update**: O(n) → O(1) — `active_crews` changed from `Vec<CrewState>` to `HashMap<CrewId, CrewState>`
+- **DAG topological sort**: O(n² log n) → O(n log n) — replaced Vec + sort() with BinaryHeap for priority ordering
+- **`scan_input` prompt guard**: zero-alloc — replaced `to_ascii_lowercase()` with `eq_ignore_ascii_case` byte-window search
+- **`rank_agents` scoring loop**: single `extract_required_tools()` call shared across all agents (was N calls)
+- **Server endpoints**: GET /health −43%, POST /mcp −40%, EchoTool −37%
+
+### Observability
 - `llm::router::route()` — `tracing::debug` on model tier routing decisions
 - `tools::builtin::load_testing` — `tracing::info` on test start/completion with metrics
 - `learning::profile` — `tracing::debug` on action recording
 - `learning::optimizer` — `tracing::debug` on Q-value updates
 - `learning::capability` — `tracing::debug` on capability success/failure with confidence and trend
 
-### Performance
-- **`rank_agents` (10 agents)**: 2.95 µs → 889 ns (−70%) — pre-extract `required_tools` once per task instead of re-deserializing per agent
-- **Crew cancel/update**: O(n) → O(1) — `active_crews` changed from `Vec<CrewState>` to `HashMap<CrewId, CrewState>`
-- **DAG topological sort**: O(n² log n) → O(n log n) — replaced Vec + sort() with BinaryHeap for priority ordering
-- **`scan_input` prompt guard**: zero-alloc — replaced `to_ascii_lowercase()` with `eq_ignore_ascii_case` byte-window search
-- **`rank_agents` scoring loop**: single `extract_required_tools()` call shared across all agents (was N calls)
-
-#### Tests (680 total, up from 620)
+### Tests (680 total, up from 620)
 - Prompt guard: 12 tests (injection patterns, sanitization, boundary wrapping)
-- Output validation: 11 tests (JSON parsing, type checks, required fields, fence extraction, retry prompts)
+- Output validation: 12 tests (JSON parsing, type checks, required fields, fence extraction, retry prompts, backtick edge case)
 - Approval gate: 7 tests (approve/reject flow, timeout, capacity, cancel, listing)
 - Tool allow-list: 5 tests (empty list, allow/block, missing tool)
 - Kavach bridge: 16 tests (backend mapping, strength scoring, config building, externalization gate, trust policies)
+- Crew trust/strength: 5 tests (default trust, custom trust, strength serialization, serde roundtrip)
 - VersionStore eviction: 1 test
 
 ## [0.24.3] — 2026-03-24

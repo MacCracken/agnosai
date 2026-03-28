@@ -17,12 +17,22 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 | Near-term | ≥75% | — |
 | Target | ≥85% | — |
 
-658 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
+680 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
 paths (load_testing, security_audit need mock servers), SSE streaming edge cases,
 telemetry OTLP init paths, adversarial input tests (prompt injection), sandbox
 escape tests, concurrent cancel stress tests.
 
-### Ecosystem & Scale (v0.23+)
+### Resilience & Context (P1)
+
+| Item | Priority | Notes |
+|------|----------|-------|
+| LLM inference retry with exponential backoff | High | Retry on transient failures (rate limits, 503s, timeouts) at the HooshClient call path |
+| Token/cost budget enforcement per task | High | Enforce `ResourceBudget.max_tokens_per_task` / `max_cost_per_crew` in crew runner |
+| Multi-turn conversation memory | High | `ConversationBuffer` per agent — full, sliding window, or summarize-and-compress strategies |
+| OTel GenAI semantic convention spans | High | Emit `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.usage.*` per OpenTelemetry v1.37 |
+| Per-task cost attribution metrics | Medium | Break down `CrewProfile.cost_usd` per-task and per-agent for optimization |
+
+### Ecosystem & Scale
 
 | Item | Priority | Notes |
 |------|----------|-------|
@@ -35,14 +45,6 @@ escape tests, concurrent cancel stress tests.
 | WASM tool registry (remote fetch) | Low | Download community tools from a registry |
 | Hot-reload tool registration | Low | Register/unregister tools without restart |
 
-### ~~Kavach Integration (Sandboxed Execution)~~ ✓ Complete
-
-All four items shipped in the `kavach` feature flag:
-- ✓ Sandboxed crew execution via kavach (`kavach_bridge::execute()`)
-- ✓ Externalization gate on tool outputs (`kavach_bridge::scan_output()`)
-- ✓ Sandbox strength in crew metadata (`CrewProfile.sandbox_strength`)
-- ✓ Per-crew isolation policy (`CrewSpec.trust_level` → `policy_for_trust()`)
-
 ### Observability & Operations
 
 | Item | Priority | Notes |
@@ -51,23 +53,12 @@ All four items shipped in the `kavach` feature flag:
 | Multi-tenancy (crew isolation, resource quotas) | Medium | Per-tenant budget enforcement |
 | Dashboard API (crew history, agent performance) | Low | REST endpoints for operational dashboards |
 
-### Resilience & Context (P1)
-
-| Item | Priority | Notes |
-|------|----------|-------|
-| LLM inference retry with exponential backoff | High | Retry on transient failures (rate limits, 503s, timeouts) at the HooshClient call path |
-| Token/cost budget enforcement per task | High | Enforce `ResourceBudget.max_tokens_per_task` / `max_cost_per_crew` in crew runner |
-| Multi-turn conversation memory | High | `ConversationBuffer` per agent — full, sliding window, or summarize-and-compress strategies |
-| OTel GenAI semantic convention spans | High | Emit `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.usage.*` per OpenTelemetry v1.37 |
-| Per-task cost attribution metrics | Medium | Break down `CrewProfile.cost_usd` per-task and per-agent for optimization |
-
 ### Durability & Advanced Modes (P2)
 
 | Item | Priority | Notes |
 |------|----------|-------|
 | Durable crew state / resume-from-checkpoint | Medium | Serialize crew state to disk/database with resume capability after crash |
 | Hierarchical process mode | Medium | Manager agent dynamically delegates sub-tasks to sub-agents (currently falls back to sequential) |
-| Crew state HashMap instead of Vec linear scan | Medium | `OrchestratorState.active_crews` → `HashMap<CrewId, CrewState>` for O(1) lookup |
 | Sensitive information output filter | Medium | Post-inference filter scanning for system prompt leaks, API keys, PII patterns |
 | Plan caching for repeated similar crews | Low | Semantic similarity cache for agent assignment decisions and task decomposition plans |
 
