@@ -67,7 +67,7 @@ pub fn compute_delay(config: &RetryConfig, attempt: u32) -> Duration {
     let capped = exp_delay.min(config.max_delay);
 
     if config.jitter {
-        let jitter_range = capped.as_millis() as u64 / 4; // ±25% jitter
+        let jitter_range = capped.as_millis() as u64 / 4; // +0–25% jitter
         if jitter_range > 0 {
             let jitter = rand::rng().random_range(0..=jitter_range);
             capped + Duration::from_millis(jitter)

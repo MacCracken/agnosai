@@ -133,17 +133,23 @@ impl ConversationBuffer {
                 self.messages.drain(..excess);
             }
             MemoryStrategy::HeadTail => {
-                // Keep first message + last (max_messages - 1) messages.
-                if self.messages.len() > self.max_messages && self.max_messages >= 2 {
+                if self.max_messages == 1 {
+                    // Special case: keep only the last message.
+                    let last = self.messages.len() - 1;
+                    self.messages.drain(..last);
+                } else {
+                    // Keep first message + last (max_messages - 1) messages.
                     let keep_tail = self.max_messages - 1;
                     let remove_start = 1;
                     let remove_end = self.messages.len() - keep_tail;
-                    debug!(
-                        agent_id = %self.agent_id,
-                        evicted = remove_end - remove_start,
-                        "head-tail: evicting middle messages"
-                    );
-                    self.messages.drain(remove_start..remove_end);
+                    if remove_end > remove_start {
+                        debug!(
+                            agent_id = %self.agent_id,
+                            evicted = remove_end - remove_start,
+                            "head-tail: evicting middle messages"
+                        );
+                        self.messages.drain(remove_start..remove_end);
+                    }
                 }
             }
         }
@@ -192,6 +198,16 @@ mod tests {
         assert_eq!(buf.messages()[1].content, "msg-7");
         assert_eq!(buf.messages()[2].content, "msg-8");
         assert_eq!(buf.messages()[3].content, "msg-9");
+    }
+
+    #[test]
+    fn head_tail_max_one_keeps_last() {
+        let mut buf = ConversationBuffer::with_head_tail("agent-1", 1);
+        buf.add_user("first");
+        buf.add_user("second");
+        buf.add_user("third");
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.messages()[0].content, "third");
     }
 
     #[test]

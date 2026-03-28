@@ -28,6 +28,8 @@ pub mod attrs {
     pub const AGENT_NAME: &str = "gen_ai.agent.name";
     /// Agent identifier.
     pub const AGENT_ID: &str = "gen_ai.agent.id";
+    /// Tool name (AgnosAI-specific — not in OTel GenAI spec).
+    pub const TOOL_NAME: &str = "agnosai.tool.name";
     /// Crew identifier.
     pub const CREW_ID: &str = "agnosai.crew.id";
     /// Crew name.
@@ -79,7 +81,7 @@ pub fn tool_span(tool_name: &str, agent_name: &str, task_id: &str) -> tracing::S
     tracing::info_span!(
         "gen_ai.execute_tool",
         { attrs::OPERATION_NAME } = "execute_tool",
-        "gen_ai.tool.name" = tool_name,
+        { attrs::TOOL_NAME } = tool_name,
         { attrs::AGENT_NAME } = agent_name,
         { attrs::TASK_ID } = task_id,
     )

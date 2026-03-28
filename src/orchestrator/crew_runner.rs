@@ -723,10 +723,6 @@ async fn execute_task(
     let retry_config = crate::llm::retry::RetryConfig::default();
     let task_id_str = task.id.to_string();
 
-    // Budget check: verify token/cost budget before inference (uses CostTracker as proxy).
-    // The actual budget enforcement uses the accumulated cost from the cost_tracker.
-    // Per-task token recording happens after each successful inference below.
-
     let mut final_response = {
         let req = &current_request;
         crate::llm::retry::with_retry(&retry_config, &task_id_str, || client.infer(req)).await

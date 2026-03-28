@@ -17,7 +17,7 @@ pub enum BudgetExceeded {
     /// Total token usage exceeded the budget.
     Tokens { used: u64, limit: u64 },
     /// Total cost exceeded the budget.
-    Cost { used_cents: u64, limit_cents: u64 },
+    Cost { used_units: u64, limit_units: u64 },
 }
 
 impl std::fmt::Display for BudgetExceeded {
@@ -27,14 +27,14 @@ impl std::fmt::Display for BudgetExceeded {
                 write!(f, "token budget exceeded: {used} used, {limit} limit")
             }
             Self::Cost {
-                used_cents,
-                limit_cents,
+                used_units,
+                limit_units,
             } => {
                 write!(
                     f,
                     "cost budget exceeded: ${:.4} used, ${:.4} limit",
-                    *used_cents as f64 / 10_000.0,
-                    *limit_cents as f64 / 10_000.0
+                    *used_units as f64 / 10_000.0,
+                    *limit_units as f64 / 10_000.0
                 )
             }
         }
@@ -47,10 +47,10 @@ impl std::fmt::Display for BudgetExceeded {
 pub struct BudgetTracker {
     tokens_used: AtomicU64,
     /// Cost in 1/10000 USD (to avoid floating-point atomics).
-    cost_cents: AtomicU64,
+    cost_units: AtomicU64,
     max_tokens: Option<u64>,
     /// Stored as 1/10000 USD.
-    max_cost_cents: Option<u64>,
+    max_cost_units: Option<u64>,
 }
 
 impl BudgetTracker {
@@ -59,9 +59,9 @@ impl BudgetTracker {
     pub fn new(budget: &ResourceBudget) -> Self {
         Self {
             tokens_used: AtomicU64::new(0),
-            cost_cents: AtomicU64::new(0),
+            cost_units: AtomicU64::new(0),
             max_tokens: budget.max_tokens,
-            max_cost_cents: budget.max_cost_usd.map(|c| (c * 10_000.0) as u64),
+            max_cost_units: budget.max_cost_usd.map(|c| (c * 10_000.0) as u64),
         }
     }
 
@@ -77,17 +77,17 @@ impl BudgetTracker {
                 return Err(BudgetExceeded::Tokens { used, limit });
             }
         }
-        if let Some(limit_cents) = self.max_cost_cents {
-            let used_cents = self.cost_cents.load(Ordering::Relaxed);
-            if used_cents >= limit_cents {
+        if let Some(limit_units) = self.max_cost_units {
+            let used_units = self.cost_units.load(Ordering::Relaxed);
+            if used_units >= limit_units {
                 warn!(
-                    used_usd = used_cents as f64 / 10_000.0,
-                    limit_usd = limit_cents as f64 / 10_000.0,
+                    used_usd = used_units as f64 / 10_000.0,
+                    limit_usd = limit_units as f64 / 10_000.0,
                     "cost budget exceeded"
                 );
                 return Err(BudgetExceeded::Cost {
-                    used_cents,
-                    limit_cents,
+                    used_units,
+                    limit_units,
                 });
             }
         }
@@ -101,8 +101,8 @@ impl BudgetTracker {
 
     /// Record cost from a completed inference call (in USD).
     pub fn record_cost(&self, cost_usd: f64) {
-        let cents = (cost_usd * 10_000.0) as u64;
-        self.cost_cents.fetch_add(cents, Ordering::Relaxed);
+        let units = (cost_usd * 10_000.0) as u64;
+        self.cost_units.fetch_add(units, Ordering::Relaxed);
     }
 
     /// Current total tokens used.
@@ -114,13 +114,13 @@ impl BudgetTracker {
     /// Current total cost in USD.
     #[must_use]
     pub fn cost_usd(&self) -> f64 {
-        self.cost_cents.load(Ordering::Relaxed) as f64 / 10_000.0
+        self.cost_units.load(Ordering::Relaxed) as f64 / 10_000.0
     }
 
     /// Whether any budget limit is configured.
     #[must_use]
     pub fn has_limits(&self) -> bool {
-        self.max_tokens.is_some() || self.max_cost_cents.is_some()
+        self.max_tokens.is_some() || self.max_cost_units.is_some()
     }
 }
 
