@@ -16,7 +16,7 @@ Last updated: 2026-03-28
 | **Version** | 1.0.0 | 1.12.2 |
 | **GitHub Stars** | — | 47.4k |
 | **Tests** | 823 | — |
-| **Benchmarks** | 106 (Criterion.rs) | None published |
+| **Benchmarks** | 90 (Criterion.rs, 19 suites) | None published |
 | **Dependencies** | ~30 crates | 200+ packages (1.5-2.5 GB installed) |
 | **Binary Size** | <50 MB target | ~1.5 GB container |
 | **Cold Start** | <2 s target | 3-6 s measured |
@@ -92,8 +92,9 @@ Weighted scoring per agent-task pair:
 | GPU match | 15% | Hardware capability when task requires it |
 | Domain match | 15% | Domain compatibility |
 
-- rank_agents (10 agents): 870 ns (post-optimization, was 2.95 us)
-- rank_agents (100 agents): 9.1 us
+- rank_agents (10 agents): 823 ns (v1.0.0, was 2.95 us pre-optimization)
+- rank_agents (100 agents): 7.74 us
+- rank_agents (1000 agents): 76.2 us
 
 ### CrewAI — No Agent Scoring
 
@@ -165,10 +166,10 @@ Security is not comparable. AgnosAI has defense-in-depth across every layer. Cre
 ### AgnosAI Benchmarks
 
 - UCB1 select (10 arms): 47 ns
-- UCB1 select (50 arms): 253 ns
-- QLearner update (1K state-actions): 450 ns
-- CapabilityScorer record (50 caps): 50 ns
-- ReplayBuffer push (full, 1K): 630 ns
+- UCB1 select (50 arms): 252 ns
+- QLearner update (1K state-actions): 456 ns
+- CapabilityScorer record (50 caps): 54 ns
+- ReplayBuffer push (full, 1K): 609 ns
 
 ### Verdict
 
@@ -191,9 +192,9 @@ AgnosAI has a complete reinforcement learning stack for continuous improvement. 
 
 ### AgnosAI Benchmarks
 
-- Fleet relay send: 166 ns
-- Fleet relay receive: 230 ns
-- Fleet placement (50 nodes): 1.1 us
+- Fleet relay send: 161 ns
+- Fleet relay receive: 233 ns
+- Fleet placement (50 nodes): 1.17 us
 
 ### Verdict
 
@@ -235,7 +236,7 @@ CrewAI's memory is more feature-rich (long-term + entity memory with vector stor
 | Metric | AgnosAI | CrewAI | Advantage |
 |--------|---------|--------|-----------|
 | Cold start | <1 s | 3-6 s | ~5x |
-| Idle memory | ~11 MB RSS | 200-500 MB | ~30x |
+| Idle memory | ~11 MB RSS | 200-500 MB | ~25x |
 | Per-agent overhead | negligible | ~180 MB | — |
 | Crew creation | <1 ms | ~500 ms | ~500x |
 
@@ -243,16 +244,20 @@ CrewAI's memory is more feature-rich (long-term + entity memory with vector stor
 
 | Operation | Scale | AgnosAI Median | Notes |
 |-----------|-------|----------------|-------|
-| Tool registry lookup | 50 tools | 55 ns | DashMap, lock-free |
-| Score + rank agents | 10 agents | 870 ns | 4-factor weighted, pre-extracted tools |
-| Scheduler dequeue | priority | 32 ns | VecDeque per tier |
-| PubSub publish | 10 subs | 1.15 us | Wildcard matching |
-| Fleet relay send | — | 166 ns | With dedup |
-| DAG load (500 tasks) | startup | 337 us | BinaryHeap topological sort |
-| Orchestrator::new | — | 715 ns | HashMap crew state |
-| GET /health | — | 1.3 us | axum handler |
-| POST /mcp (init) | — | 4.4 us | JSON-RPC 2.0 |
-| EchoTool::execute | — | 94 ns | Native tool |
+| Tool registry lookup | 50 tools | 59 ns | DashMap, lock-free |
+| Score + rank agents | 10 agents | 823 ns | 4-factor weighted, pre-extracted tools |
+| Scheduler ready_tasks | 100 workers | 2.04 us | Wide DAG wave detection |
+| PubSub publish | 10 subs | 1.29 us | Wildcard matching |
+| Fleet relay send | — | 161 ns | With dedup |
+| Fleet placement | 50 nodes | 1.17 us | GPU affinity |
+| Orchestrator::new | — | 682 ns | HashMap crew state |
+| GET /health | — | 1.03 us | axum handler |
+| POST /mcp (init) | — | 3.49 us | JSON-RPC 2.0 |
+| EchoTool::execute | — | 84 ns | Native tool |
+| run_crew (1 task) | — | 19 us | Sequential, placeholder LLM |
+| run_crew (10 parallel) | — | 79 us | max_concurrency=4 |
+| Audit chain verify | 1K entries | 1.06 ms | HMAC-SHA256 linked chain |
+| WASM sandbox execute | hello world | 50.3 ms | wasmtime cold start |
 
 ### Concurrency
 
@@ -261,7 +266,7 @@ CrewAI's memory is more feature-rich (long-term + entity memory with vector stor
 | Concurrent crews | Unlimited (async) | ~5-10 (GIL) |
 | Python in hot path | 0% | 100% |
 | True parallelism | Yes (tokio multi-thread) | No (GIL) |
-| Fleet msg overhead | 0.22 us | N/A (single process) |
+| Fleet msg overhead | 0.23 us | N/A (single process) |
 
 ---
 
