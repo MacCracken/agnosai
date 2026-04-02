@@ -9,18 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+#### License
+- AGPL-3.0-only → GPL-3.0-only
+
 #### Dependencies
 - bhava: 1.8.0 → 2.0.0
+- bote: local path dep → 0.91.0 from crates.io
 - serde_yaml 0.9 (deprecated) → serde_yaml_ng 0.10 (maintained fork)
-- bote: local path dep → 0.90.0 from crates.io
+
+#### Infrastructure
+- **scripts/version-bump.sh**: now updates all crate Cargo.tomls (root, SDK, examples) from VERSION
+- **supply-chain/config.toml**: added publisher trust for 12 maintainers/orgs, pruned stale exemptions
+- Version parity enforced: agnosai, agnosai-tool-sdk, and hello-tool all track VERSION
 
 ### Fixed
 - **fleet/registry**: `usize → u32` GPU count cast now uses `try_from` with saturation instead of silent truncation
 - **orchestrator/budget**: cost rounding uses `ceil()` to prevent budget underflow from floating-point truncation
 - **llm/retry**: removed dead `last_err` variable and replaced `.expect("unreachable")` with `unreachable!()` for clarity
+- **sandbox/wasm**: `extract_exit_code` now uses debug formatting to match fuel/epoch keywords in wasmtime error chain
 - **orchestrator/ipc**: corrected misleading TOCTOU comment on socket bind
 - **benches/server**: added missing `definitions` field to `AppState` construction
 - **scripts/bench-history.sh**: fixed median extraction parsing — was capturing unit suffix instead of value, causing all CSV entries to be 0
+- **docs**: updated stale version refs, test counts, benchmark dates, scoring weights, and serde_yaml→serde_yaml_ng across 8 doc files
 
 ### Observability
 - **orchestrator/output_validation**: `warn!()` on all validation failure paths (invalid JSON, type mismatch, missing fields)
