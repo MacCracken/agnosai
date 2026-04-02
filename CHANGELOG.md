@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 #### Dependencies
+- bhava: 1.8.0 → 2.0.0
 - serde_yaml 0.9 (deprecated) → serde_yaml_ng 0.10 (maintained fork)
 - bote: local path dep → 0.90.0 from crates.io
 
