@@ -17,7 +17,7 @@ pub fn load_from_json(json: &str) -> Result<AgentDefinition> {
 
 /// Load an agent definition from a YAML string.
 pub fn load_from_yaml(yaml: &str) -> Result<AgentDefinition> {
-    serde_yaml::from_str(yaml).map_err(|e| AgnosaiError::InvalidDefinition(e.to_string()))
+    serde_yaml_ng::from_str(yaml).map_err(|e| AgnosaiError::InvalidDefinition(e.to_string()))
 }
 
 /// Load an agent definition from a file, auto-detecting format by extension.

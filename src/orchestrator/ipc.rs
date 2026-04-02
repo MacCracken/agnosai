@@ -31,7 +31,8 @@ pub struct IpcClient {
 impl IpcServer {
     /// Bind to a Unix socket path. Removes any existing socket file first.
     pub async fn bind(path: &std::path::Path) -> crate::core::Result<Self> {
-        // Remove stale socket unconditionally (avoids TOCTOU race).
+        // Remove stale socket unconditionally (narrow TOCTOU window remains
+        // between remove and bind, but this is the standard Unix socket pattern).
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

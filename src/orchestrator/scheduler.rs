@@ -58,11 +58,13 @@ impl Scheduler {
     }
 
     /// Total number of tasks across all priority queues (excludes DAG tasks).
+    #[inline]
     pub fn len(&self) -> usize {
         self.queues.iter().map(|q| q.len()).sum()
     }
 
     /// Whether all priority queues are empty (excludes DAG tasks).
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.queues.iter().all(|q| q.is_empty())
     }

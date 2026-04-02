@@ -69,6 +69,7 @@ impl SandboxManager {
     ///
     /// This is the safe API — no shell interpretation of the arguments.
     /// For `IsolationLevel::Wasm`, use `WasmSandbox` directly.
+    #[tracing::instrument(skip_all, fields(isolation = ?policy.effective_isolation()))]
     pub async fn execute_argv(
         &self,
         policy: &SandboxPolicy,

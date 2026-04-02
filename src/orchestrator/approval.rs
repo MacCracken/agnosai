@@ -144,6 +144,7 @@ impl ApprovalGate {
     }
 
     /// Number of currently pending approvals.
+    #[inline]
     #[must_use]
     pub fn pending_count(&self) -> usize {
         self.pending.len()

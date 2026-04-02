@@ -134,7 +134,7 @@ impl NodeRegistry {
             hostname,
             address,
             status: NodeStatus::Online,
-            gpu_count: gpu_count as u32,
+            gpu_count: u32::try_from(gpu_count).unwrap_or(u32::MAX),
             gpu_vram_mb,
             capabilities,
             hardware: HardwareInventory::default(),

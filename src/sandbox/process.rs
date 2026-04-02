@@ -83,6 +83,7 @@ impl ProcessSandbox {
     ///
     /// This is the safe alternative to `execute()` for untrusted input —
     /// no shell metacharacter interpretation is possible.
+    #[tracing::instrument(skip_all)]
     pub async fn execute_argv(
         &self,
         argv: &[&str],

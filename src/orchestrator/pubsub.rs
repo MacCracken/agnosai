@@ -106,6 +106,7 @@ impl PubSub {
     }
 
     /// Return the number of active subscription patterns.
+    #[inline]
     #[must_use]
     pub fn pattern_count(&self) -> usize {
         self.subscriptions.len()

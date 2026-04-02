@@ -581,6 +581,14 @@ fn pick_best_agent(agents: &[AgentDefinition], task: &Task) -> Option<AgentDefin
         .map(|a| (a, scoring::score_agent(a, task)))
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some((agent, score)) = ranked.first() {
+        debug!(
+            agent_key = %agent.agent_key,
+            score,
+            task_id = %task.id,
+            "picked best agent for task"
+        );
+    }
     ranked.first().map(|(a, _)| (*a).clone())
 }
 

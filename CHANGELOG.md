@@ -5,6 +5,30 @@ All notable changes to AgnosAI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+#### Dependencies
+- serde_yaml 0.9 (deprecated) → serde_yaml_ng 0.10 (maintained fork)
+- bote: local path dep → 0.90.0 from crates.io
+
+### Fixed
+- **fleet/registry**: `usize → u32` GPU count cast now uses `try_from` with saturation instead of silent truncation
+- **orchestrator/budget**: cost rounding uses `ceil()` to prevent budget underflow from floating-point truncation
+- **llm/retry**: removed dead `last_err` variable and replaced `.expect("unreachable")` with `unreachable!()` for clarity
+- **orchestrator/ipc**: corrected misleading TOCTOU comment on socket bind
+- **benches/server**: added missing `definitions` field to `AppState` construction
+- **scripts/bench-history.sh**: fixed median extraction parsing — was capturing unit suffix instead of value, causing all CSV entries to be 0
+
+### Observability
+- **orchestrator/output_validation**: `warn!()` on all validation failure paths (invalid JSON, type mismatch, missing fields)
+- **orchestrator/crew_runner**: `debug!()` logging in `pick_best_agent()` with agent key, score, and task ID
+- **sandbox**: `#[tracing::instrument]` on `manager::execute_argv`, `process::execute_argv`, `python::execute_script`, `oci::execute`
+
+### Performance
+- `#[inline]` on 8 hot-path accessors: `BudgetTracker::{tokens_used, cost_usd, has_limits}`, `ApprovalGate::pending_count`, `Scheduler::{len, is_empty}`, `PubSub::pattern_count`
+
 ## [1.0.2] — 2026-03-29
 
 ### Changed

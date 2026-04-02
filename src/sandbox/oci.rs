@@ -102,6 +102,7 @@ impl OciSandbox {
     ///
     /// The `input` string is piped to the container's stdin. stdout and stderr
     /// are captured. The container is destroyed after execution.
+    #[tracing::instrument(skip_all)]
     pub async fn execute(
         &self,
         entrypoint_args: &[&str],

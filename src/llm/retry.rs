@@ -113,8 +113,6 @@ where
     Fut: std::future::Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
-    let mut last_err = None;
-
     for attempt in 0..=config.max_retries {
         match call().await {
             Ok(result) => {
@@ -152,13 +150,14 @@ where
                     error = %e,
                     "inference failed, retrying"
                 );
-                last_err = Some(e);
                 tokio::time::sleep(delay).await;
             }
         }
     }
 
-    Err(last_err.expect("unreachable: loop must have run at least once"))
+    // The loop runs at least once (0..=max_retries) and every iteration
+    // either returns Ok/Err directly, so this is unreachable.
+    unreachable!("retry loop must return from within")
 }
 
 #[cfg(test)]

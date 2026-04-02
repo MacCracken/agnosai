@@ -59,6 +59,7 @@ impl PythonSandbox {
     ///
     /// Spawns `python3 -c <script>`, writes `input` to stdin, then waits
     /// for the process to finish (or kills it on timeout).
+    #[tracing::instrument(skip_all)]
     pub async fn execute_script(
         &self,
         script: &str,

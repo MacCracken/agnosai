@@ -61,7 +61,7 @@ impl BudgetTracker {
             tokens_used: AtomicU64::new(0),
             cost_units: AtomicU64::new(0),
             max_tokens: budget.max_tokens,
-            max_cost_units: budget.max_cost_usd.map(|c| (c * 10_000.0) as u64),
+            max_cost_units: budget.max_cost_usd.map(|c| (c * 10_000.0).ceil() as u64),
         }
     }
 
@@ -101,23 +101,26 @@ impl BudgetTracker {
 
     /// Record cost from a completed inference call (in USD).
     pub fn record_cost(&self, cost_usd: f64) {
-        let units = (cost_usd * 10_000.0) as u64;
+        let units = (cost_usd * 10_000.0).ceil() as u64;
         self.cost_units.fetch_add(units, Ordering::Relaxed);
     }
 
     /// Current total tokens used.
+    #[inline]
     #[must_use]
     pub fn tokens_used(&self) -> u64 {
         self.tokens_used.load(Ordering::Relaxed)
     }
 
     /// Current total cost in USD.
+    #[inline]
     #[must_use]
     pub fn cost_usd(&self) -> f64 {
         self.cost_units.load(Ordering::Relaxed) as f64 / 10_000.0
     }
 
     /// Whether any budget limit is configured.
+    #[inline]
     #[must_use]
     pub fn has_limits(&self) -> bool {
         self.max_tokens.is_some() || self.max_cost_units.is_some()

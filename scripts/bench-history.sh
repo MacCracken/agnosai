@@ -27,7 +27,7 @@ while IFS= read -r line; do
     # Lines with "time:" contain the measurements.
     if echo "$line" | grep -q 'time:'; then
         # Extract median: second value inside brackets [low median high]
-        median=$(echo "$line" | sed 's/.*\[//;s/\].*//' | awk '{print $2}')
+        median=$(echo "$line" | sed 's/.*\[//;s/\].*//' | awk '{print $3 $4}')
         if [ -z "$median" ]; then
             continue
         fi

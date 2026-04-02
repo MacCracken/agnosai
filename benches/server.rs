@@ -35,6 +35,7 @@ async fn test_app() -> Router {
         http_client: reqwest::Client::new(),
         audit: Arc::new(AuditChain::new(b"bench-key", 1_000)),
         approval_gate: Default::default(),
+        definitions: Default::default(),
     });
     server::router(state)
 }

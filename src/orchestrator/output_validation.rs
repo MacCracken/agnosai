@@ -43,6 +43,7 @@ pub fn validate_output(output: &str, schema: &Value) -> ValidationResult {
     let parsed: Value = match serde_json::from_str(output) {
         Ok(v) => v,
         Err(e) => {
+            warn!("output validation: response is not valid JSON: {e}");
             return ValidationResult::Invalid(format!("Response is not valid JSON: {e}"));
         }
     };
@@ -51,6 +52,10 @@ pub fn validate_output(output: &str, schema: &Value) -> ValidationResult {
     if let Some(expected_type) = schema.get("type").and_then(|v| v.as_str()) {
         let actual_type = json_type_name(&parsed);
         if actual_type != expected_type {
+            warn!(
+                expected_type,
+                actual_type, "output validation: type mismatch"
+            );
             return ValidationResult::Invalid(format!(
                 "Expected top-level type \"{expected_type}\", got \"{actual_type}\""
             ));
@@ -66,6 +71,7 @@ pub fn validate_output(output: &str, schema: &Value) -> ValidationResult {
                 .filter(|key| !obj.contains_key(*key))
                 .collect();
             if !missing.is_empty() {
+                warn!(fields = %missing.join(", "), "output validation: missing required fields");
                 return ValidationResult::Invalid(format!(
                     "Missing required fields: {}",
                     missing.join(", ")

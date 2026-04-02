@@ -4,8 +4,8 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::core::{AgentDefinition, CrewSpec, ProcessMode, Task, TaskPriority};
 use crate::core::crew::CrewProfile;
+use crate::core::{AgentDefinition, CrewSpec, ProcessMode, Task, TaskPriority};
 
 use crate::server::state::SharedState;
 
@@ -262,7 +262,9 @@ pub async fn cancel_crew(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     match state.orchestrator.cancel_crew(id).await {
-        Ok(()) => Ok(Json(serde_json::json!({"status": "cancelled", "crew_id": id.to_string()}))),
+        Ok(()) => Ok(Json(
+            serde_json::json!({"status": "cancelled", "crew_id": id.to_string()}),
+        )),
         Err(_) => Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "crew not found"})),
