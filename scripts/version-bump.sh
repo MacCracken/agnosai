@@ -17,9 +17,15 @@ echo "Bumping AgnosAI to version ${NEW_VERSION}..."
 echo "$NEW_VERSION" > "$REPO_ROOT/VERSION"
 echo "  Updated VERSION"
 
-# Update workspace Cargo.toml
-sed -i "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" "$REPO_ROOT/Cargo.toml"
-echo "  Updated Cargo.toml"
+# Update all Cargo.toml files
+for toml in "$REPO_ROOT/Cargo.toml" \
+            "$REPO_ROOT/sdk/agnosai-tool-sdk/Cargo.toml" \
+            "$REPO_ROOT/examples/wasm-tools/hello-tool/Cargo.toml"; do
+    if [ -f "$toml" ]; then
+        sed -i "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" "$toml"
+        echo "  Updated $(realpath --relative-to="$REPO_ROOT" "$toml")"
+    fi
+done
 
 # Regenerate Cargo.lock
 cd "$REPO_ROOT"

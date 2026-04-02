@@ -182,4 +182,4 @@ See [docs/development/roadmap.md](docs/development/roadmap.md) for the full deve
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE) for details.
+GPL-3.0-only — see [LICENSE](LICENSE) for details.

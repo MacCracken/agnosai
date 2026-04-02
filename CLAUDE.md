@@ -5,7 +5,7 @@
 **AgnosAI** (AGNOS + AI) — Provider-agnostic AI orchestration — crews, tasks, tools, agent delegation
 
 - **Type**: Flat crate with binary
-- **License**: AGPL-3.0-only
+- **License**: GPL-3.0-only
 - **MSRV**: 1.89
 - **Version**: SemVer 0.D.M pre-1.0
 

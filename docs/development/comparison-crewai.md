@@ -12,7 +12,7 @@ Last updated: 2026-04-02
 | Dimension | AgnosAI | CrewAI |
 |-----------|---------|--------|
 | **Language** | Rust (edition 2024) | Python (>=3.10) |
-| **License** | AGPL-3.0-only | MIT |
+| **License** | GPL-3.0-only | MIT |
 | **Version** | 1.1.0 | 1.12.2 |
 | **GitHub Stars** | — | 47.4k |
 | **Tests** | 863 | — |
