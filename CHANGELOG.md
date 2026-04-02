@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 - `#[inline]` on 8 hot-path accessors: `BudgetTracker::{tokens_used, cost_usd, has_limits}`, `ApprovalGate::pending_count`, `Scheduler::{len, is_empty}`, `PubSub::pattern_count`
 
+### Tests (863 total, up from 824)
+- **LoadTestingTool**: +5 tests (mock server execution, error status codes, connection refused, SSRF gate, trait-level SSRF)
+- **SecurityAuditTool**: +7 tests (missing headers, good headers, CORS wildcard+credentials, information disclosure, HTTPS recommendation, trait-level SSRF)
+- **SSE EventBus**: +7 tests (orphan cleanup, capacity boundary, broadcast overflow/lagged, concurrent subscribers, crew isolation, sender idempotency, has/remove)
+- **Prompt injection adversarial**: +10 tests (mixed case, buried injection, multiple patterns, empty input, unicode padding, newline splitting, all 30 patterns, boundary markers, anti-injection directive, exact max length)
+- **WASM sandbox escape**: +4 tests (fuel exhaustion, epoch timeout, valid module execution, zero-length input)
+- **Telemetry**: +6 tests (record_usage, all attr constants, OTel prefix, agnosai prefix, guard lifecycle, env filter)
+
 ## [1.0.2] — 2026-03-29
 
 ### Changed

@@ -334,4 +334,186 @@ mod tests {
         assert!(!output.success);
         assert!(output.error.unwrap().contains("target_url"));
     }
+
+    #[tokio::test]
+    async fn security_audit_ssrf_rejects_private_ip() {
+        let tool = SecurityAuditTool;
+        let mut params = HashMap::new();
+        params.insert(
+            "target_url".to_owned(),
+            serde_json::Value::String("http://192.168.1.1/admin".to_owned()),
+        );
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("private"));
+    }
+
+    /// Mock server with configurable security headers and CORS.
+    async fn mock_audit_server(
+        security_headers: bool,
+        cors_wildcard: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::http::{HeaderValue, header};
+        use axum::response::IntoResponse;
+        use axum::{Router, routing::any};
+
+        let app = Router::new().route(
+            "/",
+            any(move |req: axum::extract::Request| async move {
+                let mut resp = "OK".into_response();
+                let h = resp.headers_mut();
+
+                if security_headers {
+                    h.insert(
+                        header::CONTENT_SECURITY_POLICY,
+                        HeaderValue::from_static("default-src 'self'"),
+                    );
+                    h.insert(
+                        header::STRICT_TRANSPORT_SECURITY,
+                        HeaderValue::from_static("max-age=63072000"),
+                    );
+                    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+                    h.insert(
+                        header::X_CONTENT_TYPE_OPTIONS,
+                        HeaderValue::from_static("nosniff"),
+                    );
+                    h.insert(
+                        header::REFERRER_POLICY,
+                        HeaderValue::from_static("no-referrer"),
+                    );
+                }
+
+                if cors_wildcard {
+                    h.insert(
+                        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                        HeaderValue::from_static("*"),
+                    );
+                    h.insert(
+                        "access-control-allow-credentials"
+                            .parse::<axum::http::HeaderName>()
+                            .unwrap(),
+                        HeaderValue::from_static("true"),
+                    );
+                }
+
+                // Deliberate info disclosure for testing.
+                h.insert(header::SERVER, HeaderValue::from_static("Apache/2.4.99"));
+
+                let _ = req;
+                resp
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn audit_detects_missing_security_headers() {
+        let (base_url, handle) = mock_audit_server(false, false).await;
+
+        let result = run_security_audit(&base_url)
+            .await
+            .expect("audit should succeed");
+
+        // No security headers → low score.
+        assert!(result.security_score < 50.0);
+        assert!(!result.header_analysis.missing.is_empty());
+        assert!(
+            result
+                .header_analysis
+                .missing
+                .iter()
+                .any(|m| m.header == "content-security-policy")
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn audit_scores_well_with_security_headers() {
+        let (base_url, handle) = mock_audit_server(true, false).await;
+
+        let result = run_security_audit(&base_url)
+            .await
+            .expect("audit should succeed");
+
+        // Most security headers present → reasonable score.
+        assert!(result.header_analysis.score >= 50.0);
+        assert!(!result.header_analysis.present.is_empty());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn audit_detects_cors_wildcard_with_credentials() {
+        let (base_url, handle) = mock_audit_server(false, true).await;
+
+        let result = run_security_audit(&base_url)
+            .await
+            .expect("audit should succeed");
+
+        assert!(result.cors_analysis.allows_all_origins);
+        assert!(result.cors_analysis.allows_credentials);
+        assert!(result.cors_analysis.misconfigured);
+        assert!(
+            result
+                .vulnerabilities
+                .iter()
+                .any(|v| v.r#type == "cors_misconfiguration")
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn audit_detects_information_disclosure() {
+        let (base_url, handle) = mock_audit_server(true, false).await;
+
+        let result = run_security_audit(&base_url)
+            .await
+            .expect("audit should succeed");
+
+        assert!(!result.information_disclosure.is_empty());
+        assert!(
+            result
+                .information_disclosure
+                .iter()
+                .any(|d| d.contains("Apache"))
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn audit_recommends_https_for_http_target() {
+        let (base_url, handle) = mock_audit_server(true, false).await;
+
+        let result = run_security_audit(&base_url)
+            .await
+            .expect("audit should succeed");
+
+        assert!(result.recommendations.iter().any(|r| r.contains("HTTPS")));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn audit_execute_trait_ssrf_blocks_localhost() {
+        // The NativeTool::execute path applies SSRF checks, so 127.0.0.1
+        // is correctly blocked even if a real server is listening there.
+        let (base_url, handle) = mock_audit_server(true, false).await;
+        let tool = SecurityAuditTool;
+        let mut params = HashMap::new();
+        params.insert("target_url".to_owned(), serde_json::Value::String(base_url));
+
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("private"));
+
+        handle.abort();
+    }
 }

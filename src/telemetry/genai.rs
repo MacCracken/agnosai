@@ -129,4 +129,78 @@ mod tests {
         let span = crew_span("crew-123", "test-crew", 5);
         let _ = span;
     }
+
+    #[test]
+    fn record_usage_does_not_panic() {
+        let span = inference_span("gpt-4", "openai", "agent-1", "task-1");
+        record_usage(&span, 100, 50, "gpt-4-0613");
+    }
+
+    #[test]
+    fn all_attr_constants_are_non_empty() {
+        let all = [
+            attrs::OPERATION_NAME,
+            attrs::SYSTEM,
+            attrs::REQUEST_MODEL,
+            attrs::RESPONSE_MODEL,
+            attrs::USAGE_INPUT_TOKENS,
+            attrs::USAGE_OUTPUT_TOKENS,
+            attrs::RESPONSE_FINISH_REASON,
+            attrs::AGENT_NAME,
+            attrs::AGENT_ID,
+            attrs::TOOL_NAME,
+            attrs::CREW_ID,
+            attrs::CREW_NAME,
+            attrs::TASK_ID,
+            attrs::REQUEST_TEMPERATURE,
+            attrs::REQUEST_MAX_TOKENS,
+        ];
+        for attr in all {
+            assert!(!attr.is_empty(), "attribute constant should not be empty");
+            assert!(
+                attr.contains('.'),
+                "attribute '{attr}' should follow dotted naming convention"
+            );
+        }
+    }
+
+    #[test]
+    fn otel_standard_attrs_use_gen_ai_prefix() {
+        // OTel GenAI spec requires gen_ai.* prefix for standard attributes.
+        let otel_attrs = [
+            attrs::OPERATION_NAME,
+            attrs::SYSTEM,
+            attrs::REQUEST_MODEL,
+            attrs::RESPONSE_MODEL,
+            attrs::USAGE_INPUT_TOKENS,
+            attrs::USAGE_OUTPUT_TOKENS,
+            attrs::RESPONSE_FINISH_REASON,
+            attrs::AGENT_NAME,
+            attrs::AGENT_ID,
+            attrs::REQUEST_TEMPERATURE,
+            attrs::REQUEST_MAX_TOKENS,
+        ];
+        for attr in otel_attrs {
+            assert!(
+                attr.starts_with("gen_ai."),
+                "OTel attribute '{attr}' must start with gen_ai."
+            );
+        }
+    }
+
+    #[test]
+    fn agnosai_attrs_use_agnosai_prefix() {
+        let custom_attrs = [
+            attrs::TOOL_NAME,
+            attrs::CREW_ID,
+            attrs::CREW_NAME,
+            attrs::TASK_ID,
+        ];
+        for attr in custom_attrs {
+            assert!(
+                attr.starts_with("agnosai."),
+                "custom attribute '{attr}' must start with agnosai."
+            );
+        }
+    }
 }

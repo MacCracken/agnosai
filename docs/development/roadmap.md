@@ -17,10 +17,12 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 | Near-term | ≥75% | — |
 | Target | ≥85% | — |
 
-823 tests, 106 benchmarks across 17 files. Key remaining gaps: HTTP tool execute
-paths (load_testing, security_audit need mock servers), SSE streaming edge cases,
-telemetry OTLP init paths, adversarial input tests (prompt injection), sandbox
-escape tests, concurrent cancel stress tests.
+863 tests, 112 benchmarks across 19 files. Addressed gaps: HTTP tool execution
+(mock servers), SSE streaming edge cases (overflow, orphans, isolation), prompt
+injection adversarial inputs, WASM sandbox escape (fuel/epoch), telemetry span
+attributes. Remaining gaps: process sandbox (env sanitization, timeout, kill-on-drop),
+python sandbox (subprocess, timeout), concurrent cancel stress tests (mid-execution
+interruption), init_tracing() OTLP error paths.
 
 ### Future Features (demand-gated)
 

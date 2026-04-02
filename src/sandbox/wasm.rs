@@ -209,13 +209,17 @@ fn extract_exit_code(err: &Error) -> i32 {
     if let Some(exit) = err.downcast_ref::<wasmtime_wasi::I32Exit>() {
         return exit.0;
     }
+    // Stringify the full error chain (includes Caused-by sections).
+    let full = format!("{err:?}");
     // Epoch interruption means we hit the timeout.
-    if err.to_string().contains("epoch") {
+    // wasmtime surfaces this as "wasm trap: interrupt" in the error chain.
+    if full.contains("epoch") || full.contains("interrupt") {
         warn!("WASM execution interrupted by epoch deadline (timeout)");
         return -1;
     }
     // Fuel exhaustion.
-    if err.to_string().contains("fuel") {
+    // wasmtime surfaces this as "all fuel consumed" in the error chain.
+    if full.contains("fuel") {
         warn!("WASM execution ran out of fuel (CPU limit)");
         return -2;
     }
@@ -395,5 +399,123 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "world");
+    }
+
+    #[test]
+    fn fuel_exhaustion_returns_error() {
+        // Infinite loop — will exhaust fuel quickly.
+        let wat = r#"(module
+            (func (export "_start")
+                (loop br 0)
+            )
+            (memory (export "memory") 1)
+        )"#;
+
+        let wasm_bytes = wat::parse_str(wat).expect("WAT should parse");
+        let mut sandbox =
+            WasmSandbox::with_limits(DEFAULT_MAX_MEMORY_BYTES, Duration::from_secs(30))
+                .expect("should create sandbox");
+        // Set fuel very low so the infinite loop exhausts it before the timeout.
+        sandbox.fuel = 1_000;
+
+        let module = sandbox
+            .load_module(&wasm_bytes)
+            .expect("should load module");
+        let result = sandbox
+            .execute(&module, "")
+            .expect("should return result, not panic");
+
+        assert_eq!(
+            result.exit_code, -2,
+            "fuel exhaustion should produce exit_code -2, got {}",
+            result.exit_code
+        );
+    }
+
+    #[test]
+    fn epoch_timeout_returns_error() {
+        // Infinite loop — will be interrupted by epoch timeout.
+        let wat = r#"(module
+            (func (export "_start")
+                (loop br 0)
+            )
+            (memory (export "memory") 1)
+        )"#;
+
+        let wasm_bytes = wat::parse_str(wat).expect("WAT should parse");
+        let mut sandbox =
+            WasmSandbox::with_limits(DEFAULT_MAX_MEMORY_BYTES, Duration::from_millis(100))
+                .expect("should create sandbox");
+        // Give plenty of fuel so it doesn't run out before the epoch fires.
+        sandbox.fuel = u64::MAX / 2;
+
+        let module = sandbox
+            .load_module(&wasm_bytes)
+            .expect("should load module");
+        let result = sandbox
+            .execute(&module, "")
+            .expect("should return result, not panic");
+
+        assert_eq!(
+            result.exit_code, -1,
+            "epoch timeout should produce exit_code -1, got {}",
+            result.exit_code
+        );
+    }
+
+    #[test]
+    fn execute_valid_wasi_module_exits_cleanly() {
+        // Minimal module that simply returns (exits with code 0).
+        let wat = r#"(module
+            (memory (export "memory") 1)
+            (func (export "_start"))
+        )"#;
+
+        let wasm_bytes = wat::parse_str(wat).expect("WAT should parse");
+        let sandbox = WasmSandbox::new().expect("should create sandbox");
+        let module = sandbox
+            .load_module(&wasm_bytes)
+            .expect("should load module");
+        let result = sandbox.execute(&module, "").expect("should execute module");
+
+        assert_eq!(result.exit_code, 0, "clean exit should produce exit_code 0");
+        assert!(
+            result.stdout.is_empty(),
+            "no-op module should produce empty stdout"
+        );
+    }
+
+    #[test]
+    fn zero_length_input_succeeds() {
+        // Module that reads stdin — with empty input, fd_read returns 0 bytes.
+        let wat = r#"(module
+            (import "wasi_snapshot_preview1" "fd_read"
+                (func $fd_read (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "_start")
+                ;; Set up iov: buffer at 100, length 16
+                (i32.store (i32.const 0) (i32.const 100))
+                (i32.store (i32.const 4) (i32.const 16))
+
+                ;; fd_read(stdin=0, iovs=0, iovs_count=1, nread_ptr=200)
+                (drop (call $fd_read
+                    (i32.const 0)
+                    (i32.const 0)
+                    (i32.const 1)
+                    (i32.const 200)
+                ))
+            )
+        )"#;
+
+        let wasm_bytes = wat::parse_str(wat).expect("WAT should parse");
+        let sandbox = WasmSandbox::new().expect("should create sandbox");
+        let module = sandbox
+            .load_module(&wasm_bytes)
+            .expect("should load module");
+        let result = sandbox
+            .execute(&module, "")
+            .expect("should execute with empty input");
+
+        assert_eq!(result.exit_code, 0, "empty input should not cause an error");
     }
 }

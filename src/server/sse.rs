@@ -214,4 +214,149 @@ mod tests {
         assert!(json.contains("task_completed"));
         assert!(json.contains("abc"));
     }
+
+    #[test]
+    fn cleanup_orphans_removes_channels_with_no_receivers() {
+        let bus = EventBus::new();
+        let id = Uuid::new_v4();
+
+        // Create a channel by calling sender, then subscribe so the channel exists.
+        let tx = bus.sender(id);
+        let rx = tx.subscribe();
+
+        // Drop the only receiver — channel is now orphaned.
+        drop(rx);
+        assert!(bus.has(id));
+
+        bus.cleanup_orphans();
+        assert!(
+            !bus.has(id),
+            "orphan channel should be removed after cleanup"
+        );
+    }
+
+    #[test]
+    fn channel_capacity_boundary() {
+        let bus = EventBus::new();
+        let ids: Vec<Uuid> = (0..100).map(|_| Uuid::new_v4()).collect();
+
+        for &id in &ids {
+            let _tx = bus.sender(id);
+            // Subscribe so the channel stays alive during cleanup.
+            let _rx = bus.subscribe(id);
+        }
+        assert_eq!(bus.len(), 100);
+
+        for &id in &ids {
+            bus.remove(id);
+        }
+        assert!(
+            bus.is_empty(),
+            "bus should be empty after removing all channels"
+        );
+    }
+
+    #[test]
+    fn broadcast_channel_overflow_causes_lagged_error() {
+        let bus = EventBus::new();
+        let id = Uuid::new_v4();
+        let mut rx = bus.subscribe(id);
+        let tx = bus.sender(id);
+
+        // Send CHANNEL_CAPACITY + 1 events without receiving.
+        for i in 0..=CHANNEL_CAPACITY {
+            let _ = tx.send(CrewEvent {
+                crew_id: id.to_string(),
+                event_type: format!("evt_{i}"),
+                data: serde_json::json!(null),
+            });
+        }
+
+        // The first recv should report Lagged because the oldest messages were overwritten.
+        match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {} // expected
+            other => panic!("expected Lagged error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_subscribers_same_crew() {
+        let bus = EventBus::new();
+        let id = Uuid::new_v4();
+
+        let mut rx1 = bus.subscribe(id);
+        let mut rx2 = bus.subscribe(id);
+        let mut rx3 = bus.subscribe(id);
+
+        bus.sender(id)
+            .send(CrewEvent {
+                crew_id: id.to_string(),
+                event_type: "shared".into(),
+                data: serde_json::json!({"v": 1}),
+            })
+            .unwrap();
+
+        assert_eq!(rx1.try_recv().unwrap().event_type, "shared");
+        assert_eq!(rx2.try_recv().unwrap().event_type, "shared");
+        assert_eq!(rx3.try_recv().unwrap().event_type, "shared");
+    }
+
+    #[test]
+    fn event_isolation_between_crews() {
+        let bus = EventBus::new();
+        let crew_a = Uuid::new_v4();
+        let crew_b = Uuid::new_v4();
+
+        // Subscribe to both crews so that sends succeed.
+        let _rx_a = bus.subscribe(crew_a);
+        let mut rx_b = bus.subscribe(crew_b);
+
+        bus.sender(crew_a)
+            .send(CrewEvent {
+                crew_id: crew_a.to_string(),
+                event_type: "only_a".into(),
+                data: serde_json::json!(null),
+            })
+            .unwrap();
+
+        assert!(
+            rx_b.try_recv().is_err(),
+            "crew B subscriber must not receive crew A events"
+        );
+    }
+
+    #[test]
+    fn sender_idempotent_for_same_crew() {
+        let bus = EventBus::new();
+        let id = Uuid::new_v4();
+
+        let tx1 = bus.sender(id);
+        let tx2 = bus.sender(id);
+
+        // Both senders should point to the same underlying channel.
+        // Sending on tx1 should be observable by a subscriber created via tx2.
+        let mut rx = tx2.subscribe();
+        tx1.send(CrewEvent {
+            crew_id: id.to_string(),
+            event_type: "dup".into(),
+            data: serde_json::json!(null),
+        })
+        .unwrap();
+
+        assert_eq!(rx.try_recv().unwrap().event_type, "dup");
+        // Only one channel should exist, not two.
+        assert_eq!(bus.len(), 1);
+    }
+
+    #[test]
+    fn has_returns_false_after_remove() {
+        let bus = EventBus::new();
+        let id = Uuid::new_v4();
+
+        let _tx = bus.sender(id);
+        assert!(bus.has(id), "channel should exist after sender()");
+
+        bus.remove(id);
+        assert!(!bus.has(id), "channel should not exist after remove()");
+    }
 }

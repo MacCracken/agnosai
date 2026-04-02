@@ -99,4 +99,18 @@ mod tests {
         let result = otlp_endpoint_from_env();
         let _ = result;
     }
+
+    #[test]
+    fn tracing_guard_can_be_created_without_otel() {
+        // Guard without OTLP should have None otel field.
+        let guard = TracingGuard { _otel: None };
+        drop(guard); // Should not panic.
+    }
+
+    #[test]
+    fn default_env_filter_parses() {
+        // Verify the fallback env filter is valid.
+        let filter = tracing_subscriber::EnvFilter::new("agnosai=info");
+        let _ = filter;
+    }
 }

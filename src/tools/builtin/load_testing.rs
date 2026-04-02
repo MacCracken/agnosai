@@ -260,4 +260,105 @@ mod tests {
         assert!(!output.success);
         assert!(output.error.unwrap().contains("target_url"));
     }
+
+    /// Spin up a mock HTTP server on an OS-assigned port and return its URL.
+    async fn mock_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, routing::get};
+        let app = Router::new().route("/ok", get(|| async { "OK" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn load_test_ssrf_rejects_private_ip() {
+        let tool = LoadTestingTool;
+        let mut params = HashMap::new();
+        params.insert(
+            "target_url".to_owned(),
+            serde_json::Value::String("http://10.0.0.1/secret".to_owned()),
+        );
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("private"));
+    }
+
+    #[tokio::test]
+    async fn run_load_test_against_mock_server() {
+        let (base_url, handle) = mock_server().await;
+        let url = format!("{base_url}/ok");
+
+        let result = run_load_test(&url, 2, Duration::from_secs(1))
+            .await
+            .expect("load test should succeed");
+
+        assert!(result.total_requests > 0);
+        assert!(result.successful_requests > 0);
+        assert_eq!(result.failed_requests, 0);
+        assert!(result.avg_latency_ms > 0.0);
+        assert!(result.p50_latency_ms > 0.0);
+        assert!(result.throughput_rps > 0.0);
+        assert!(result.error_rate < f64::EPSILON);
+        assert_eq!(
+            *result.status_codes.get(&200).unwrap_or(&0),
+            result.total_requests
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_load_test_records_error_status_codes() {
+        use axum::{Router, http::StatusCode, routing::get};
+        let app = Router::new().route("/bad", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let url = format!("http://{addr}/bad");
+
+        let result = run_load_test(&url, 1, Duration::from_secs(1))
+            .await
+            .expect("load test should complete");
+
+        assert!(result.total_requests > 0);
+        assert!(result.status_codes.contains_key(&500));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_load_test_connection_refused() {
+        // Connect to a port that definitely isn't listening.
+        let result = run_load_test("http://127.0.0.1:1/nope", 1, Duration::from_secs(1)).await;
+        // Either errors or records failures — both are acceptable.
+        if let Ok(r) = result {
+            // If the test managed to connect, it should have recorded failures.
+            assert!(r.failed_requests > 0 || r.error_rate > 0.0);
+        }
+        // Err("no requests completed") is also acceptable.
+    }
+
+    #[tokio::test]
+    async fn load_test_execute_trait_ssrf_blocks_localhost() {
+        // The NativeTool::execute path applies SSRF checks, so 127.0.0.1
+        // is correctly blocked even if a real server is listening there.
+        let (base_url, handle) = mock_server().await;
+        let tool = LoadTestingTool;
+        let mut params = HashMap::new();
+        params.insert(
+            "target_url".to_owned(),
+            serde_json::json!(format!("{base_url}/ok")),
+        );
+
+        let output = tool.execute(ToolInput { parameters: params }).await;
+        assert!(!output.success);
+        assert!(output.error.unwrap().contains("private"));
+
+        handle.abort();
+    }
 }
