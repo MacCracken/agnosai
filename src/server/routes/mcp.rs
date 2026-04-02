@@ -1,93 +1,65 @@
 //! MCP (Model Context Protocol) server — JSON-RPC 2.0 over HTTP POST.
+//!
+//! Uses bote's protocol types for JSON-RPC compliance. Tool dispatch remains
+//! async via the NativeTool trait — bote's sync Dispatcher is not used here
+//! because agnosai tools require async execution.
 
 use axum::Json;
 use axum::extract::State;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+
+use bote::protocol::{JsonRpcRequest, JsonRpcResponse};
+use bote::registry::{ToolDef, ToolSchema};
 
 use crate::tools::ToolInput;
 
 use crate::server::state::SharedState;
 
-/// Inbound JSON-RPC 2.0 request for the MCP endpoint.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[non_exhaustive]
-pub struct JsonRpcRequest {
-    /// JSON-RPC version (must be "2.0").
-    pub jsonrpc: String,
-    /// Request identifier for correlating responses.
-    pub id: Value,
-    /// Method name to invoke.
-    pub method: String,
-    /// Optional parameters for the method.
-    #[serde(default)]
-    pub params: Value,
-}
+/// Convert agnosai's ToolSchema into bote's ToolDef for MCP discovery.
+fn to_bote_tool_def(schema: &crate::tools::native::ToolSchema) -> ToolDef {
+    let mut properties = HashMap::new();
+    let mut required = Vec::new();
 
-/// Outbound JSON-RPC 2.0 response.
-#[derive(Serialize)]
-#[non_exhaustive]
-pub struct JsonRpcResponse {
-    /// JSON-RPC version (always "2.0").
-    pub jsonrpc: String,
-    /// Request identifier echoed back.
-    pub id: Value,
-    /// Result payload on success.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    /// Error payload on failure.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
-}
-
-/// JSON-RPC error object.
-#[derive(Serialize)]
-#[non_exhaustive]
-pub struct JsonRpcError {
-    /// Numeric error code.
-    pub code: i32,
-    /// Human-readable error message.
-    pub message: String,
-}
-
-impl JsonRpcResponse {
-    fn success(id: Value, result: Value) -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id,
-            result: Some(result),
-            error: None,
-        }
-    }
-
-    fn error(id: Value, code: i32, message: impl Into<String>) -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id,
-            result: None,
-            error: Some(JsonRpcError {
-                code,
-                message: message.into(),
+    for param in &schema.parameters {
+        properties.insert(
+            param.name.clone(),
+            json!({
+                "type": param.param_type,
+                "description": param.description,
             }),
+        );
+        if param.required {
+            required.push(param.name.clone());
         }
     }
+
+    ToolDef::new(
+        &schema.name,
+        &schema.description,
+        ToolSchema::new("object", properties, required),
+    )
 }
 
 /// POST /mcp — Handle an MCP JSON-RPC 2.0 request.
+///
+/// Uses bote's `JsonRpcRequest` / `JsonRpcResponse` for protocol compliance.
+/// Tool dispatch is async via agnosai's NativeTool trait (not bote's sync Dispatcher).
 #[tracing::instrument(skip(state, req), fields(method = %req.method))]
 pub async fn mcp_handler(
     State(state): State<SharedState>,
     Json(req): Json<JsonRpcRequest>,
 ) -> Json<JsonRpcResponse> {
     tracing::debug!(method = %req.method, "MCP request");
+    let id = req.id.clone().unwrap_or(Value::Null);
+
     Json(match req.method.as_str() {
-        "initialize" => handle_initialize(req.id),
-        "tools/list" => handle_tools_list(req.id, &state),
-        "tools/call" => handle_tools_call(req.id, &req.params, &state).await,
+        "initialize" => handle_initialize(id),
+        "tools/list" => handle_tools_list(id, &state),
+        "tools/call" => handle_tools_call(id, &req.params, &state).await,
         _ => {
             tracing::warn!(method = %req.method, "MCP unknown method");
-            JsonRpcResponse::error(req.id, -32601, "Method not found")
+            JsonRpcResponse::error(id, -32601, "Method not found")
         }
     })
 }
@@ -96,7 +68,7 @@ fn handle_initialize(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(
         id,
         json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-03-26",
             "serverInfo": {
                 "name": "agnosai",
                 "version": env!("CARGO_PKG_VERSION")
@@ -113,30 +85,11 @@ fn handle_tools_list(id: Value, state: &SharedState) -> JsonRpcResponse {
     let tools: Vec<Value> = schemas
         .into_iter()
         .map(|schema| {
-            let mut properties = serde_json::Map::new();
-            let mut required = Vec::new();
-
-            for param in &schema.parameters {
-                properties.insert(
-                    param.name.clone(),
-                    json!({
-                        "type": param.param_type,
-                        "description": param.description,
-                    }),
-                );
-                if param.required {
-                    required.push(Value::String(param.name.clone()));
-                }
-            }
-
+            let def = to_bote_tool_def(&schema);
             json!({
-                "name": schema.name,
-                "description": schema.description,
-                "inputSchema": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                }
+                "name": def.name,
+                "description": def.description,
+                "inputSchema": def.input_schema,
             })
         })
         .collect();
@@ -233,6 +186,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             audit: std::sync::Arc::new(crate::llm::AuditChain::new(b"test-key", 100)),
             approval_gate: Default::default(),
+            definitions: dashmap::DashMap::new(),
         });
         crate::server::router(state)
     }
@@ -275,7 +229,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["jsonrpc"], "2.0");
         assert_eq!(json["id"], 1);
-        assert_eq!(json["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(json["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(json["result"]["serverInfo"]["name"], "agnosai");
         assert_eq!(
             json["result"]["serverInfo"]["version"],

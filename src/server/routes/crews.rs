@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::core::{AgentDefinition, CrewSpec, ProcessMode, Task, TaskPriority};
+use crate::core::crew::CrewProfile;
 
 use crate::server::state::SharedState;
 
@@ -55,6 +56,9 @@ pub struct CrewRunResponse {
     pub status: String,
     /// Per-task results.
     pub results: Vec<TaskResultResponse>,
+    /// Execution profile (timing, cost).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<CrewProfile>,
 }
 
 /// Single task result within a crew run response.
@@ -222,6 +226,7 @@ pub async fn create_crew(
                 crew_id: crew_state.crew_id,
                 status,
                 results,
+                profile: crew_state.profile,
             }))
         }
         Err(e) => {
@@ -234,15 +239,35 @@ pub async fn create_crew(
     }
 }
 
-/// GET /api/v1/crews/:id — Retrieve crew state (placeholder).
+/// GET /api/v1/crews/:id — Retrieve crew state.
 pub async fn get_crew(
-    axum::extract::Path(_id): axum::extract::Path<Uuid>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    // Placeholder — full state tracking is future work.
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": "crew not found"})),
-    )
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let inner = state.orchestrator.state().read().await;
+    if let Some(crew) = inner.active_crews.get(&id) {
+        Ok(Json(serde_json::to_value(crew).unwrap_or_default()))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "crew not found"})),
+        ))
+    }
+}
+
+/// POST /api/v1/crews/:id/cancel — Cancel a running crew.
+#[tracing::instrument(skip(state), fields(%id))]
+pub async fn cancel_crew(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match state.orchestrator.cancel_crew(id).await {
+        Ok(()) => Ok(Json(serde_json::json!({"status": "cancelled", "crew_id": id.to_string()}))),
+        Err(_) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "crew not found"})),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +292,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             audit: Arc::new(AuditChain::new(b"test-key", 1_000)),
             approval_gate: Default::default(),
+            definitions: dashmap::DashMap::new(),
         });
         crate::server::router(state)
     }

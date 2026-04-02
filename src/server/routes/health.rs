@@ -38,6 +38,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             audit: std::sync::Arc::new(crate::llm::AuditChain::new(b"test-key", 100)),
             approval_gate: Default::default(),
+            definitions: dashmap::DashMap::new(),
         });
         crate::server::router(state)
     }

@@ -112,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client,
         audit,
         approval_gate,
+        definitions: dashmap::DashMap::new(),
     });
 
     let app = router(state);

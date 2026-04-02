@@ -1,17 +1,24 @@
 use axum::Json;
+use axum::extract::State;
 use axum::http::StatusCode;
 use serde_json::Value;
 
 use crate::core::AgentDefinition;
+use crate::server::state::SharedState;
 
 /// GET /api/v1/agents/definitions — List all agent definitions.
-pub async fn list_definitions() -> Json<Vec<Value>> {
-    // Placeholder — return empty array.
-    Json(vec![])
+pub async fn list_definitions(State(state): State<SharedState>) -> Json<Vec<Value>> {
+    let defs: Vec<Value> = state
+        .definitions
+        .iter()
+        .filter_map(|entry| serde_json::to_value(entry.value()).ok())
+        .collect();
+    Json(defs)
 }
 
 /// POST /api/v1/agents/definitions — Create a new agent definition.
 pub async fn create_definition(
+    State(state): State<SharedState>,
     Json(def): Json<AgentDefinition>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let value = serde_json::to_value(&def).map_err(|e| {
@@ -20,6 +27,7 @@ pub async fn create_definition(
             Json(serde_json::json!({"error": format!("serialization failed: {e}")})),
         )
     })?;
+    state.definitions.insert(def.agent_key.clone(), def);
     Ok((StatusCode::CREATED, Json(value)))
 }
 
@@ -46,6 +54,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             audit: std::sync::Arc::new(crate::llm::AuditChain::new(b"test-key", 100)),
             approval_gate: Default::default(),
+            definitions: dashmap::DashMap::new(),
         });
         crate::server::router(state)
     }

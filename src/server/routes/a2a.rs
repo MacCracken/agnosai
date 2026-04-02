@@ -213,6 +213,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             audit: Arc::new(AuditChain::new(b"test-key", 1_000)),
             approval_gate: Default::default(),
+            definitions: dashmap::DashMap::new(),
         });
         crate::server::router(state)
     }

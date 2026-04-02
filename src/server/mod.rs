@@ -51,6 +51,7 @@ pub fn router(state: SharedState) -> Router {
     let api_v1 = Router::new()
         .route("/crews", post(routes::crews::create_crew))
         .route("/crews/{id}", get(routes::crews::get_crew))
+        .route("/crews/{id}/cancel", post(routes::crews::cancel_crew))
         .route("/crews/{id}/stream", get(routes::sse::crew_stream))
         .route("/a2a/receive", post(routes::a2a::receive))
         .route("/a2a/status", post(routes::a2a::status))

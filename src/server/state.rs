@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
+use crate::core::AgentDefinition;
 use crate::llm::AuditChain;
 use crate::orchestrator::Orchestrator;
 use crate::orchestrator::approval::ApprovalGate;
@@ -23,6 +26,8 @@ pub struct AppState {
     pub audit: Arc<AuditChain>,
     /// Human-in-the-loop approval gate for task results.
     pub approval_gate: ApprovalGate,
+    /// Agent definitions created via the API.
+    pub definitions: DashMap<String, AgentDefinition>,
 }
 
 /// Thread-safe shared reference to application state.
