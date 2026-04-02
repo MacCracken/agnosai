@@ -1,9 +1,9 @@
 # AgnosAI vs CrewAI — Technical Comparison
 
 > Detailed comparison of AgnosAI (Rust) and CrewAI (Python) orchestration frameworks.
-> Benchmarks run 2026-03-28, confirmed via documented method.
+> Benchmarks run 2026-04-02, confirmed via documented method.
 
-Last updated: 2026-03-28
+Last updated: 2026-04-02
 
 ---
 
@@ -13,10 +13,10 @@ Last updated: 2026-03-28
 |-----------|---------|--------|
 | **Language** | Rust (edition 2024) | Python (>=3.10) |
 | **License** | AGPL-3.0-only | MIT |
-| **Version** | 1.0.0 | 1.12.2 |
+| **Version** | 1.1.0 | 1.12.2 |
 | **GitHub Stars** | — | 47.4k |
-| **Tests** | 823 | — |
-| **Benchmarks** | 90 (Criterion.rs, 19 suites) | None published |
+| **Tests** | 863 | — |
+| **Benchmarks** | 112 (Criterion.rs, 19 suites) | None published |
 | **Dependencies** | ~30 crates | 200+ packages (1.5-2.5 GB installed) |
 | **Binary Size** | <50 MB target | ~1.5 GB container |
 | **Cold Start** | <2 s target | 3-6 s measured |

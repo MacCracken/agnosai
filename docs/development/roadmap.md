@@ -9,26 +9,26 @@ For architecture and integration context, see [docs/architecture/overview.md](..
 
 ## Remaining Work
 
-### Test Coverage (ongoing)
+### Test Coverage
 
-| Milestone | Target | Current |
-|-----------|--------|---------|
-| CI gate (blocking) | ≥55% | ~70% |
-| Near-term | ≥75% | — |
-| Target | ≥85% | — |
+863 tests, 112 benchmarks across 19 files. CI gate ≥55% exceeded (~70%).
 
-863 tests, 112 benchmarks across 19 files. Addressed gaps: HTTP tool execution
-(mock servers), SSE streaming edge cases (overflow, orphans, isolation), prompt
-injection adversarial inputs, WASM sandbox escape (fuel/epoch), telemetry span
-attributes. Remaining gaps: process sandbox (env sanitization, timeout, kill-on-drop),
-python sandbox (subprocess, timeout), concurrent cancel stress tests (mid-execution
-interruption), init_tracing() OTLP error paths.
+**Remaining gaps:**
+
+| Area | What's missing |
+|------|---------------|
+| Process sandbox | env sanitization, timeout enforcement, kill-on-drop |
+| Python sandbox | subprocess execution, timeout, env sanitization |
+| Concurrent cancel | mid-execution interruption, parallel/DAG cancel stress |
+| Telemetry init | OTLP error paths, env var override, guard lifecycle |
+
+**Target:** ≥85% line coverage.
 
 ### Future Features (demand-gated)
 
 | Item | Notes |
 |------|-------|
-| Python bindings (PyO3) | Needs separate crate with `cdylib` target + maturin build |
+| Python bindings (PyO3) | Separate crate, `cdylib` target, maturin build |
 
 ---
 
@@ -37,12 +37,12 @@ interruption), init_tracing() OTLP error paths.
 | Metric | Target | Measured |
 |--------|--------|---------|
 | Container image | <50 MB | — |
-| Boot to ready | <2s | <1s |
-| Memory (idle) | <100 MB | ~11 MB RSS |
-| Crew creation | <10ms | <1ms |
-| Concurrent crews | 100+ | Unlimited (async) |
-| Fleet msg overhead | <1ms | 166 ns |
-| Dependencies | ~30 | ~30 crates |
+| Boot to ready | <2s | ✅ <1s |
+| Memory (idle) | <100 MB | ✅ ~11 MB RSS |
+| Crew creation | <10ms | ✅ <1ms |
+| Concurrent crews | 100+ | ✅ Unlimited (async) |
+| Fleet msg overhead | <1ms | ✅ 166 ns |
+| Dependencies | ~30 | ✅ ~30 crates |
 
 ---
 

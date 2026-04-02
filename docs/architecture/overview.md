@@ -72,14 +72,15 @@ CrewState { crew_id, status, results, profile }
 
 ### Agent Scoring
 
-Four weighted factors (0.0–1.0 each):
+Five weighted factors (0.0–1.0 each):
 
 | Factor | Weight | Source |
 |--------|--------|--------|
-| Tool coverage | 0.40 | Fraction of required tools the agent provides |
-| Complexity alignment | 0.30 | How well agent/task complexity levels match |
-| GPU match | 0.15 | GPU capability when task requires it |
+| Tool coverage | 0.35 | Fraction of required tools the agent provides |
+| Complexity alignment | 0.25 | How well agent/task complexity levels match |
 | Domain match | 0.15 | Domain compatibility |
+| Personality fit | 0.15 | Personality trait alignment via bhava |
+| GPU match | 0.10 | GPU capability when task requires it |
 
 ### Task DAG Resolution
 

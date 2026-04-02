@@ -63,7 +63,7 @@ Agent definitions, crew specs, and presets are loaded from JSON/YAML.
 | Unknown fields in JSON | `#[serde(deny_unknown_fields)]` on API input types |
 | Type confusion | Strong Rust typing; `#[non_exhaustive]` on all public enums |
 | Oversized payloads | Request body limits; validation bounds on string lengths and collection sizes |
-| Malicious YAML | YAML parsing only in `definitions` feature; `serde_yaml` with default limits |
+| Malicious YAML | YAML parsing only in `definitions` feature; `serde_yaml_ng` with default limits |
 
 ### 6. Supply Chain
 

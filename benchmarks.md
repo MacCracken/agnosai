@@ -1,6 +1,6 @@
 # Benchmarks
 
-Latest: **2026-03-28** — v1.0.0
+Latest: **2026-04-02** — v1.1.0
 
 Full history in [`bench-history.csv`](bench-history.csv). Run with `make bench` or `./scripts/bench-history.sh`.
 

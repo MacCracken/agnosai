@@ -5,7 +5,7 @@
 All benchmarks use [Criterion.rs](https://bheisler.github.io/criterion.rs/book/) with 100-sample
 statistical analysis. Results are from the development machine and are relative, not absolute.
 
-Last updated: 2026-03-28 (v1.0.0, hoosh 1.0.0, ai-hwaccel 1.0.0)
+Last updated: 2026-04-02 (v1.1.0, hoosh 1.1.0, ai-hwaccel 1.0.0)
 
 ---
 

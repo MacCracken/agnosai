@@ -40,7 +40,7 @@ Readiness check. Returns 200 when the server is fully initialized and ready to a
 ```json
 {
   "status": "ready",
-  "version": "0.21.3"
+  "version": "1.1.0"
 }
 ```
 
