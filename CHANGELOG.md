@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **id** — `agnosai_uuid_*`: UUID v4 and v5 (RFC 4122) over the stdlib's kernel-entropy
+  `random_bytes` plus `sha1`. This closes a Phase 0 scaffold gate. It exists rather than being a
+  dependency because **mneme is unusable** — no lib block, no `dist/` bundle, and AGPL-3.0 against
+  agnosai's GPL-3.0-only. No mneme text was copied. Verified against the published
+  v5(DNS, "www.example.com") vector.
+- **core** (M2, Phase 1, in progress) — `src/core.cyr` hub plus the first two submodules:
+  - **core_error** — `agnosai_error_*`: all 15 `AgnosaiError` variants with byte-exact `Display`
+    parity, including a reimplementation of Rust's `Duration` `Debug` rendering for `Timeout`
+    (`30s`, `1.5s`, `100ms`, `1.5µs`, `100ns`).
+  - **core_message** — `agnosai_message_*`: `Message` and `MessageTarget` over bayan's JSON value
+    tree, with serde's externally-tagged snake_case wire forms and declaration-order fields.
+    Timestamps reproduce chrono's serde output exactly (RFC3339, `SecondsFormat::AutoSi` — 0, 3, 6
+    or 9 fractional digits), which `lib/chrono.cyr`'s second-precision `iso8601` cannot do alone;
+    without it a `Utc::now()` timestamp would not survive a round trip.
+- **scripts/bench-history.sh** — rewritten to drive `cyrius bench` and append to a fresh root
+  `bench-history.csv`. `cyrius bench` already handles discovery, timing and unit formatting, so
+  only the unit normalisation and date/version stamping remain — the criterion name/timing
+  pairing logic is gone. The Rust-era harness is preserved verbatim at
+  `rust-old/scripts/bench-history.sh`.
 - **learning** — the first real Cyrius code of the port (M2 beachhead, Phase 1). All five
   submodules of `rust-old/src/learning/` ported, with `src/learning.cyr` as the hub mirroring
   `mod.rs`:

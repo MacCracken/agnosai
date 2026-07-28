@@ -1,0 +1,308 @@
+# =========================================================================
+# core_message — inter-agent messaging.
+#
+# Parity oracle: rust-old/src/core/message.rs
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * `serde_json::Value` becomes a bayan JSON value tree (`bayan_json_v_*`) —
+#     the same shape, built and serialized through bayan rather than serde.
+#   * `Uuid` becomes a 16-byte buffer from src/id.cyr (`AgentId` is a Uuid in
+#     the oracle, so `from` is one too).
+#   * `chrono::DateTime<Utc>` becomes an i64 **nanosecond** epoch count. The
+#     wire form is held to chrono's serde output exactly — RFC3339 with
+#     `SecondsFormat::AutoSi`, which emits 0, 3, 6 or 9 fractional digits
+#     depending on what is non-zero. `lib/chrono.cyr`'s `iso8601` is
+#     second-precision only, so the fraction is spliced in here; without it a
+#     `Utc::now()` timestamp would not survive a round trip.
+#
+# The JSON field order matches serde's, which emits struct fields in
+# declaration order — bayan's object preserves insertion order, so the emitted
+# bytes line up with the oracle's.
+# =========================================================================
+
+# Where a message should be delivered. Values are the oracle's declaration
+# order; the wire names are its `rename_all = "snake_case"` spellings.
+enum AgnosaiMessageTargetKind {
+    AGNOSAI_TARGET_AGENT = 0;
+    AGNOSAI_TARGET_TOPIC = 1;
+    AGNOSAI_TARGET_BROADCAST = 2;
+}
+
+# MessageTarget heap layout — 24 bytes.
+enum AgnosaiMessageTargetOff {
+    AGN_TGT_KIND = 0;
+    AGN_TGT_AGENT = 8;
+    AGN_TGT_TOPIC = 16;
+    AGN_TGT_SIZE = 24;
+}
+
+# Message heap layout — 40 bytes.
+enum AgnosaiMessageOff {
+    AGN_MSG_ID = 0;
+    AGN_MSG_FROM = 8;
+    AGN_MSG_TO = 16;
+    AGN_MSG_PAYLOAD = 24;
+    AGN_MSG_TIMESTAMP_NS = 32;
+    AGN_MSG_SIZE = 40;
+}
+
+# Send to a specific agent by ID.
+fn agnosai_message_target_agent(agent_id): i64 {
+    var t = alloc(AGN_TGT_SIZE);
+    store64(t + AGN_TGT_KIND, AGNOSAI_TARGET_AGENT);
+    store64(t + AGN_TGT_AGENT, agent_id);
+    store64(t + AGN_TGT_TOPIC, 0);
+    return t;
+}
+
+# Publish to a named topic.
+fn agnosai_message_target_topic(topic: Str): i64 {
+    var t = alloc(AGN_TGT_SIZE);
+    store64(t + AGN_TGT_KIND, AGNOSAI_TARGET_TOPIC);
+    store64(t + AGN_TGT_AGENT, 0);
+    store64(t + AGN_TGT_TOPIC, topic);
+    return t;
+}
+
+# Send to all agents.
+fn agnosai_message_target_broadcast(): i64 {
+    var t = alloc(AGN_TGT_SIZE);
+    store64(t + AGN_TGT_KIND, AGNOSAI_TARGET_BROADCAST);
+    store64(t + AGN_TGT_AGENT, 0);
+    store64(t + AGN_TGT_TOPIC, 0);
+    return t;
+}
+
+# Which variant a target is.
+fn agnosai_message_target_kind(t): i64 {
+    return load64(t + AGN_TGT_KIND);
+}
+
+# The destination agent id, or 0 unless this is an Agent target.
+fn agnosai_message_target_agent_id(t): i64 {
+    return load64(t + AGN_TGT_AGENT);
+}
+
+# The destination topic, or 0 unless this is a Topic target.
+fn agnosai_message_target_topic_name(t): i64 {
+    return load64(t + AGN_TGT_TOPIC);
+}
+
+# A target as a bayan JSON value, in serde's externally-tagged form:
+# `{"agent":"<uuid>"}`, `{"topic":"<name>"}`, or the bare string `"broadcast"`.
+fn agnosai_message_target_to_value(t): i64 {
+    var kind = load64(t + AGN_TGT_KIND);
+    if (kind == AGNOSAI_TARGET_BROADCAST) {
+        return bayan_json_v_str_new(str_from("broadcast"));
+    }
+    var obj = bayan_json_v_obj_new();
+    if (kind == AGNOSAI_TARGET_AGENT) {
+        var id_str = agnosai_uuid_to_str(load64(t + AGN_TGT_AGENT));
+        bayan_json_v_obj_set(obj, str_from("agent"), bayan_json_v_str_new(id_str));
+        return obj;
+    }
+    bayan_json_v_obj_set(obj, str_from("topic"), bayan_json_v_str_new(load64(t + AGN_TGT_TOPIC)));
+    return obj;
+}
+
+# Rebuild a target from its JSON value. Returns 0 when the value is not one of
+# the three known shapes.
+fn agnosai_message_target_from_value(v): i64 {
+    if (bayan_json_v_is_str(v) == 1) {
+        if (str_eq(bayan_json_v_str(v), str_from("broadcast")) == 1) {
+            return agnosai_message_target_broadcast();
+        }
+        return 0;
+    }
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+
+    var agent = bayan_json_v_obj_get(v, "agent");
+    if (agent != 0 && bayan_json_v_is_str(agent) == 1) {
+        var id = agnosai_uuid_parse(bayan_json_v_str(agent));
+        if (id == 0) { return 0; }
+        return agnosai_message_target_agent(id);
+    }
+
+    var topic = bayan_json_v_obj_get(v, "topic");
+    if (topic != 0 && bayan_json_v_is_str(topic) == 1) {
+        return agnosai_message_target_topic(bayan_json_v_str(topic));
+    }
+    return 0;
+}
+
+# Append `fract` nanoseconds as chrono's `SecondsFormat::AutoSi` fraction: an
+# empty string when zero, otherwise the fewest of 3, 6 or 9 digits that keeps
+# every non-zero digit.
+fn _agnosai_msg_append_subsec(sb, fract): i64 {
+    if (fract == 0) { return 0; }
+
+    var digits = 9;
+    var value = fract;
+    if (fract % 1000000 == 0) {
+        digits = 3;
+        value = fract / 1000000;
+    } elif (fract % 1000 == 0) {
+        digits = 6;
+        value = fract / 1000;
+    }
+
+    str_builder_putc(sb, 46);
+    var scale = 1;
+    for (var i = 1; i < digits; i = i + 1) { scale = scale * 10; }
+    while (scale > 0) {
+        str_builder_putc(sb, 48 + ((value / scale) % 10));
+        scale = scale / 10;
+    }
+    return 0;
+}
+
+# Render epoch nanoseconds the way chrono's serde does: RFC3339, UTC, with an
+# AutoSi sub-second fraction. 0 nanos -> "2026-07-28T22:00:00Z".
+fn _agnosai_msg_fmt_rfc3339(ns): i64 {
+    var secs = ns / AGNOSAI_NS_PER_SEC;
+    var fract = ns % AGNOSAI_NS_PER_SEC;
+    var base = iso8601(secs);
+
+    var sb = str_builder_new();
+    # iso8601 is "....SSZ"; take everything up to the seconds, splice the
+    # fraction in, then re-attach the zone.
+    str_builder_add(sb, str_new(base, 19));
+    _agnosai_msg_append_subsec(sb, fract);
+    str_builder_add_cstr(sb, "Z");
+    return str_builder_build(sb);
+}
+
+# Parse an RFC3339 UTC timestamp back to epoch nanoseconds, accepting any
+# number of fractional digits. Returns -1 when the seconds part is malformed.
+fn _agnosai_msg_parse_rfc3339(s: Str): i64 {
+    var cstr = str_cstr(s);
+    var secs = iso8601_parse(cstr);
+    if (secs < 0) { return 0 - 1; }
+
+    var ns = secs * AGNOSAI_NS_PER_SEC;
+    var len = str_len(s);
+    if (len <= 19) { return ns; }
+    if (load8(cstr + 19) != 46) { return ns; }
+
+    var fract = 0;
+    var scale = AGNOSAI_NS_PER_SEC / 10;
+    for (var i = 20; i < len; i = i + 1) {
+        var c = load8(cstr + i);
+        if (c < 48 || c > 57) { break; }
+        if (scale > 0) {
+            fract = fract + (c - 48) * scale;
+            scale = scale / 10;
+        }
+    }
+    return ns + fract;
+}
+
+# Create a new message with an auto-generated v4 id and the current timestamp.
+fn agnosai_message_new(from, to, payload): i64 {
+    var m = alloc(AGN_MSG_SIZE);
+    store64(m + AGN_MSG_ID, agnosai_uuid_v4());
+    store64(m + AGN_MSG_FROM, from);
+    store64(m + AGN_MSG_TO, to);
+    store64(m + AGN_MSG_PAYLOAD, payload);
+    store64(m + AGN_MSG_TIMESTAMP_NS, clock_epoch_ns());
+    return m;
+}
+
+# Unique message identifier.
+fn agnosai_message_id(m): i64 {
+    return load64(m + AGN_MSG_ID);
+}
+
+# Sender agent ID.
+fn agnosai_message_from(m): i64 {
+    return load64(m + AGN_MSG_FROM);
+}
+
+# Destination target.
+fn agnosai_message_to(m): i64 {
+    return load64(m + AGN_MSG_TO);
+}
+
+# Arbitrary JSON payload, as a bayan value.
+fn agnosai_message_payload(m): i64 {
+    return load64(m + AGN_MSG_PAYLOAD);
+}
+
+# When the message was created, as nanoseconds since the Unix epoch.
+fn agnosai_message_timestamp_ns(m): i64 {
+    return load64(m + AGN_MSG_TIMESTAMP_NS);
+}
+
+# The message as a bayan JSON value. Field order matches serde's, which emits
+# struct fields in declaration order.
+fn agnosai_message_to_value(m): i64 {
+    var obj = bayan_json_v_obj_new();
+    var id_str = agnosai_uuid_to_str(load64(m + AGN_MSG_ID));
+    var from_str = agnosai_uuid_to_str(load64(m + AGN_MSG_FROM));
+    bayan_json_v_obj_set(obj, str_from("id"), bayan_json_v_str_new(id_str));
+    bayan_json_v_obj_set(obj, str_from("from"), bayan_json_v_str_new(from_str));
+    bayan_json_v_obj_set(obj, str_from("to"), agnosai_message_target_to_value(load64(m + AGN_MSG_TO)));
+    bayan_json_v_obj_set(obj, str_from("payload"), load64(m + AGN_MSG_PAYLOAD));
+    var ts = _agnosai_msg_fmt_rfc3339(load64(m + AGN_MSG_TIMESTAMP_NS));
+    bayan_json_v_obj_set(obj, str_from("timestamp"), bayan_json_v_str_new(ts));
+    return obj;
+}
+
+# The message serialized to JSON text.
+fn agnosai_message_to_json(m): i64 {
+    return bayan_json_v_build(agnosai_message_to_value(m));
+}
+
+# Rebuild a message from a bayan JSON value. Returns 0 when a required field is
+# missing or malformed.
+fn agnosai_message_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+
+    var id_v = bayan_json_v_obj_get(v, "id");
+    var from_v = bayan_json_v_obj_get(v, "from");
+    var to_v = bayan_json_v_obj_get(v, "to");
+    var ts_v = bayan_json_v_obj_get(v, "timestamp");
+    if (id_v == 0 || from_v == 0 || to_v == 0 || ts_v == 0) { return 0; }
+    if (bayan_json_v_is_str(id_v) == 0 || bayan_json_v_is_str(from_v) == 0) { return 0; }
+    if (bayan_json_v_is_str(ts_v) == 0) { return 0; }
+
+    var id = agnosai_uuid_parse(bayan_json_v_str(id_v));
+    var from = agnosai_uuid_parse(bayan_json_v_str(from_v));
+    var to = agnosai_message_target_from_value(to_v);
+    var ts = _agnosai_msg_parse_rfc3339(bayan_json_v_str(ts_v));
+    if (id == 0 || from == 0 || to == 0 || ts < 0) { return 0; }
+
+    var payload = bayan_json_v_obj_get(v, "payload");
+    if (payload == 0) { payload = bayan_json_v_null(); }
+
+    var m = alloc(AGN_MSG_SIZE);
+    store64(m + AGN_MSG_ID, id);
+    store64(m + AGN_MSG_FROM, from);
+    store64(m + AGN_MSG_TO, to);
+    store64(m + AGN_MSG_PAYLOAD, payload);
+    store64(m + AGN_MSG_TIMESTAMP_NS, ts);
+    return m;
+}
+
+# Parse a message from JSON text. Returns 0 on a parse error or a malformed
+# message.
+#
+# Two bayan API hazards are load-bearing here, both verified by probe against
+# cyrius 6.4.86:
+#
+#   1. The key types are asymmetric. `bayan_json_v_obj_get` (used above) takes
+#      a **C string**; `bayan_json_v_obj_set` and `bayan_json_v_parse` take a
+#      **Str**. Passing the wrong one reads a Str header as text, or text as a
+#      pointer — a segfault, not a clean error.
+#   2. **`bayan_json_v_parse` itself is unusable.** A call to it misresolves to
+#      its `bayan_json_v_parse_str` sibling (the compiler warns "expects 2
+#      arguments, got 1") and returns 0 for every input, including valid JSON.
+#      The `json_v_parse` back-compat alias has the identical fault. The
+#      explicit-length entry points are unaffected, so we call
+#      `bayan_json_v_parse_str` directly. Filed for upstream — do NOT "simplify"
+#      this back to the bare call.
+fn agnosai_message_from_json(src: Str): i64 {
+    var v = bayan_json_v_parse_str(str_data(src), str_len(src));
+    if (v == 0) { return 0; }
+    return agnosai_message_from_value(v);
+}

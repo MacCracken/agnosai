@@ -33,15 +33,16 @@ Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **`learning` 
 | `cyrius port` run | ✅ 2026-07-28 |
 | `cyrius lib sync` + `cyrius deps` | ✅ 43/43 stdlib modules, 9 deps resolved, 0 errors, 79 locked |
 | Hello-world builds and runs | ✅ `cyrius build src/main.cyr build/agnosai` → OK |
-| `src/id.cyr` (uuid v4/v5) | ⬜ not started |
+| `src/id.cyr` (uuid v4/v5) | ✅ v4 + v5, verified against the published RFC 4122 vector |
 | `src/order.cyr` (`ai_sort` / `ai_select_nth`) | ⬜ not started |
 | Tool-sandbox approach decided | ✅ cx + kavach — [ADR-006](../adr/006-cx-tool-sandbox.md) |
 | `learning` ported (M2, Phase 1) | ✅ 5 modules + hub, 112 assertions, 100% reference coverage |
-| `core` ported (M2, Phase 1) | ⬜ not started |
+| `core` ported (M2, Phase 1) | 🟡 2 of 6 — error + message done; task/agent/crew/resource pending |
+| Money representation decided | ✅ integer micro-USD (2026-07-28) — gates core BITE 8 |
 
 ## Tests
 
-**112 assertions across 5 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**205 assertions across 8 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -50,12 +51,15 @@ Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **`learning` 
 | `learning_strategy.tcyr` | 19 | 6 |
 | `learning_replay.tcyr` | 29 | 7 |
 | `learning_optimizer.tcyr` | 21 | 7 |
+| `core_error.tcyr` | 30 | 16 |
+| `core_message.tcyr` | 39 | 6 |
+| `id.tcyr` | 26 | — (reimplementation; the `uuid` crate is the reference) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
 the Q-table's packed-key distinctness — none of which the Rust tests reach.
 
-`cyrius coverage --min 80` → **100% (56/56 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (100/100 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -131,12 +135,22 @@ on the **money representation** open question (integer micro-USD is the
 recommendation) — see the open questions in
 [`cyrius-port-plan.md`](cyrius-port-plan.md).
 
-Two items surfaced by the `learning` bite, neither blocking:
+Open items, none blocking:
 
-1. **`scripts/bench-history.sh` still drives `cargo bench`.** It parses criterion
-   output into `bench-history.csv`, so it cannot record Cyrius numbers — the
-   root `bench-history.csv` does not exist yet. Driving `cyrius bench` instead
-   is a rewrite of the parser half.
+1. **`bayan_json_v_parse` is unusable and needs an upstream filing.** A call to
+   it misresolves to its `bayan_json_v_parse_str` sibling — the compiler warns
+   `'bayan_json_v_parse_str' expects 2 arguments, got 1` — and it returns 0 for
+   every input, including valid JSON. The `json_v_parse` back-compat alias has
+   the identical fault. The explicit-length entry points
+   (`bayan_json_v_parse_str`, `bayan_json_v_parse_ctx`) are unaffected and are
+   what `core_message` calls. Minimal reproducer: `bayan_json_v_parse(str_from("{}"))`
+   in a stock project returns 0. Synthetic prefix-shadowing cases do **not**
+   reproduce it, so the trigger is narrower than "the name is a prefix of a
+   sibling" — upstream will need to isolate it.
 2. **`lib/sakshi.cyr` is vendored at 2.4.3 while the 6.4.86 toolchain bundles
    2.4.6**, which every build reports as a shadow warning. `cyrius lib sync
    --full` re-syncs.
+
+Also worth knowing when writing core: **bayan's JSON key types are asymmetric.**
+`bayan_json_v_obj_set` takes a `Str`, `bayan_json_v_obj_get` takes a C string.
+Getting it backwards is a segfault, not a clean error.

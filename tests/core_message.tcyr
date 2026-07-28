@@ -1,0 +1,137 @@
+# =========================================================================
+# core_message.tcyr — parity tests for src/core_message.cyr
+#
+# Oracle: the 6 #[cfg(test)] tests in rust-old/src/core/message.rs, plus the
+# RFC3339 AutoSi renderings the oracle never pins directly but whose exactness
+# its `restored.timestamp == msg.timestamp` assertion depends on.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/core_error.cyr"
+include "src/id.cyr"
+include "src/core_message.cyr"
+include "tests/test_helpers.cyr"
+
+# Assert a nanosecond epoch renders to exactly `expected`.
+fn _t_assert_ts(ns, expected, name): i64 {
+    return assert(str_eq(_agnosai_msg_fmt_rfc3339(ns), str_from(expected)) == 1, name);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("core_message");
+
+    # --- message_new_sets_timestamp ---
+    var before = clock_epoch_ns();
+    var payload = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(payload, str_from("hello"), bayan_json_v_str_new(str_from("world")));
+    var msg = agnosai_message_new(agnosai_uuid_v4(), agnosai_message_target_broadcast(), payload);
+    var after = clock_epoch_ns();
+    assert(agnosai_message_timestamp_ns(msg) >= before, "timestamp is not before creation");
+    assert(agnosai_message_timestamp_ns(msg) <= after, "timestamp is not after creation");
+
+    # --- message_new_generates_unique_id ---
+    var from = agnosai_uuid_v4();
+    var m1 = agnosai_message_new(from, agnosai_message_target_broadcast(), bayan_json_v_null());
+    var m2 = agnosai_message_new(from, agnosai_message_target_broadcast(), bayan_json_v_null());
+    assert_eq(agnosai_uuid_eq(agnosai_message_id(m1), agnosai_message_id(m2)), 0,
+    "each message gets a distinct id");
+    assert_eq(agnosai_uuid_eq(agnosai_message_from(m1), from), 1, "sender round-trips");
+
+    # --- message_target_serde_agent ---
+    var agent_id = agnosai_uuid_v4();
+    var t_agent = agnosai_message_target_agent(agent_id);
+    var restored_agent = agnosai_message_target_from_value(agnosai_message_target_to_value(t_agent));
+    assert(restored_agent != 0, "agent target round-trips");
+    assert_eq(agnosai_message_target_kind(restored_agent), AGNOSAI_TARGET_AGENT, "agent variant");
+    assert_eq(agnosai_uuid_eq(agnosai_message_target_agent_id(restored_agent), agent_id), 1,
+    "agent target keeps its id");
+
+    # --- message_target_serde_topic ---
+    var t_topic = agnosai_message_target_topic(str_from("my-topic"));
+    var restored_topic = agnosai_message_target_from_value(agnosai_message_target_to_value(t_topic));
+    assert(restored_topic != 0, "topic target round-trips");
+    assert_eq(agnosai_message_target_kind(restored_topic), AGNOSAI_TARGET_TOPIC, "topic variant");
+    assert(str_eq(agnosai_message_target_topic_name(restored_topic), str_from("my-topic")) == 1,
+    "topic target keeps its name");
+
+    # --- message_target_serde_broadcast ---
+    var t_bcast = agnosai_message_target_broadcast();
+    var restored_bcast = agnosai_message_target_from_value(agnosai_message_target_to_value(t_bcast));
+    assert(restored_bcast != 0, "broadcast target round-trips");
+    assert_eq(agnosai_message_target_kind(restored_bcast), AGNOSAI_TARGET_BROADCAST,
+    "broadcast variant");
+
+    # --- the target wire forms are serde's externally-tagged snake_case ---
+    assert(str_eq(bayan_json_v_build(agnosai_message_target_to_value(t_bcast)),
+    str_from("\"broadcast\"")) == 1, "broadcast is a bare string");
+    assert(str_eq(bayan_json_v_build(agnosai_message_target_to_value(t_topic)),
+    str_from("{\"topic\":\"my-topic\"}")) == 1, "topic is externally tagged");
+
+    # --- message_serde_round_trip ---
+    var events = agnosai_message_target_topic(str_from("events"));
+    var p2 = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(p2, str_from("type"), bayan_json_v_str_new(str_from("test")));
+    var orig = agnosai_message_new(agnosai_uuid_v4(), events, p2);
+    var json = agnosai_message_to_json(orig);
+    var back = agnosai_message_from_json(json);
+    assert(back != 0, "message parses back from its own JSON");
+    assert_eq(agnosai_uuid_eq(agnosai_message_id(back), agnosai_message_id(orig)), 1, "id survives");
+    assert_eq(agnosai_uuid_eq(agnosai_message_from(back), agnosai_message_from(orig)), 1,
+    "from survives");
+    assert_eq(agnosai_message_timestamp_ns(back), agnosai_message_timestamp_ns(orig),
+    "timestamp survives to the nanosecond");
+    assert_eq(agnosai_message_target_kind(agnosai_message_to(back)), AGNOSAI_TARGET_TOPIC,
+    "target survives");
+    assert(str_eq(bayan_json_v_build(agnosai_message_payload(back)),
+    bayan_json_v_build(agnosai_message_payload(orig))) == 1, "payload survives");
+
+    # --- the value-level round trip, skipping the text form entirely ---
+    var via_value = agnosai_message_from_value(agnosai_message_to_value(orig));
+    assert(via_value != 0, "message round-trips through the value tree");
+    assert_eq(agnosai_message_timestamp_ns(via_value), agnosai_message_timestamp_ns(orig),
+    "value round trip keeps the timestamp");
+    assert_eq(agnosai_message_from_value(bayan_json_v_str_new(str_from("x"))), 0,
+    "a non-object value is not a message");
+
+    # --- field order matches serde's declaration order ---
+    var v = agnosai_message_to_value(orig);
+    assert(str_eq(bayan_json_v_obj_key(v, 0), str_from("id")) == 1, "field 0 is id");
+    assert(str_eq(bayan_json_v_obj_key(v, 1), str_from("from")) == 1, "field 1 is from");
+    assert(str_eq(bayan_json_v_obj_key(v, 2), str_from("to")) == 1, "field 2 is to");
+    assert(str_eq(bayan_json_v_obj_key(v, 3), str_from("payload")) == 1, "field 3 is payload");
+    assert(str_eq(bayan_json_v_obj_key(v, 4), str_from("timestamp")) == 1, "field 4 is timestamp");
+
+    # --- RFC3339 AutoSi: 0, 3, 6 or 9 fractional digits, never anything else ---
+    _t_assert_ts(1785283200 * AGNOSAI_NS_PER_SEC, "2026-07-29T00:00:00Z", "whole seconds omit the fraction");
+    _t_assert_ts(1785283200 * AGNOSAI_NS_PER_SEC + 500000000, "2026-07-29T00:00:00.500Z",
+    "half a second renders as 3 digits");
+    _t_assert_ts(1785283200 * AGNOSAI_NS_PER_SEC + 123456000, "2026-07-29T00:00:00.123456Z",
+    "microsecond precision renders as 6 digits");
+    _t_assert_ts(1785283200 * AGNOSAI_NS_PER_SEC + 123456789, "2026-07-29T00:00:00.123456789Z",
+    "nanosecond precision renders as 9 digits");
+    _t_assert_ts(1785283200 * AGNOSAI_NS_PER_SEC + 1, "2026-07-29T00:00:00.000000001Z",
+    "a single nanosecond keeps its leading zeros");
+
+    # --- and the fractional forms all parse back exactly ---
+    var ns9 = 1785283200 * AGNOSAI_NS_PER_SEC + 123456789;
+    assert_eq(_agnosai_msg_parse_rfc3339(_agnosai_msg_fmt_rfc3339(ns9)), ns9, "9-digit round trip");
+    var ns3 = 1785283200 * AGNOSAI_NS_PER_SEC + 500000000;
+    assert_eq(_agnosai_msg_parse_rfc3339(_agnosai_msg_fmt_rfc3339(ns3)), ns3, "3-digit round trip");
+    var ns0 = 1785283200 * AGNOSAI_NS_PER_SEC;
+    assert_eq(_agnosai_msg_parse_rfc3339(_agnosai_msg_fmt_rfc3339(ns0)), ns0, "no-fraction round trip");
+
+    # --- malformed input is rejected ---
+    assert_eq(agnosai_message_from_json(str_from("not json")), 0, "garbage JSON rejected");
+    assert_eq(agnosai_message_from_json(str_from("{\"id\":\"x\"}")), 0, "missing fields rejected");
+    assert_eq(agnosai_message_target_from_value(bayan_json_v_str_new(str_from("nope"))), 0,
+    "unknown target string rejected");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

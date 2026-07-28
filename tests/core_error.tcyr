@@ -1,0 +1,94 @@
+# =========================================================================
+# core_error.tcyr — parity tests for src/core_error.cyr
+#
+# Oracle: the 16 #[cfg(test)] tests in rust-old/src/core/error.rs. Every
+# expected string is the oracle's `#[error("...")]` text verbatim — these are
+# log- and wire-visible, so they are the parity surface.
+#
+# Also covers the Duration Debug renderings the oracle only spot-checks at 30s.
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/core_error.cyr"
+include "tests/test_helpers.cyr"
+
+# Assert an error renders to exactly `expected`.
+fn _t_assert_msg(e, expected, name): i64 {
+    return assert(str_eq(agnosai_error_message(e), str_from(expected)) == 1, name);
+}
+
+# Assert a nanosecond count renders the way Rust's Duration Debug would.
+fn _t_assert_duration(ns, expected, name): i64 {
+    var sb = str_builder_new();
+    _agnosai_fmt_duration_debug(sb, ns);
+    return assert(str_eq(str_builder_build(sb), str_from(expected)) == 1, name);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("core_error");
+
+    # --- one test per variant's Display, mirroring the oracle ---
+    var e_agent = agnosai_error_agent_not_found(str_from("agent-42"));
+    _t_assert_msg(e_agent, "agent not found: agent-42", "agent_not_found_display");
+    assert_eq(agnosai_error_kind(e_agent), AGNOSAI_ERR_AGENT_NOT_FOUND, "agent kind");
+
+    _t_assert_msg(agnosai_error_task_not_found(str_from("task-99")),
+    "task not found: task-99", "task_not_found_display");
+    _t_assert_msg(agnosai_error_crew_not_found(str_from("crew-x")),
+    "crew not found: crew-x", "crew_not_found_display");
+    _t_assert_msg(agnosai_error_invalid_definition(str_from("missing role")),
+    "invalid definition: missing role", "invalid_definition_display");
+    _t_assert_msg(agnosai_error_cyclic_dag(), "task DAG contains a cycle", "cyclic_dag_display");
+    _t_assert_msg(agnosai_error_scheduling(str_from("no slots")),
+    "scheduling error: no slots", "scheduling_display");
+    _t_assert_msg(agnosai_error_llm_provider(str_from("rate limited")),
+    "LLM provider error: rate limited", "llm_provider_display");
+    _t_assert_msg(agnosai_error_tool_execution(str_from("crash")),
+    "tool execution error: crash", "tool_execution_display");
+    _t_assert_msg(agnosai_error_sandbox(str_from("oom")), "sandbox error: oom", "sandbox_display");
+    _t_assert_msg(agnosai_error_fleet(str_from("unreachable")),
+    "fleet error: unreachable", "fleet_display");
+    _t_assert_msg(agnosai_error_ipc(str_from("broken pipe")),
+    "IPC error: broken pipe", "ipc_display");
+    _t_assert_msg(agnosai_error_other(str_from("something else")),
+    "something else", "other_display");
+
+    # --- timeout_display: the oracle's Duration::from_secs(30) ---
+    var e_timeout = agnosai_error_timeout(30 * AGNOSAI_NS_PER_SEC);
+    _t_assert_msg(e_timeout, "timeout after 30s", "timeout_display");
+    assert_eq(agnosai_error_timeout_ns(e_timeout), 30 * AGNOSAI_NS_PER_SEC, "timeout ns kept");
+
+    # --- from_serde_json_error / from_io_error: the #[from] replacements ---
+    var e_ser = agnosai_error_serialization(str_from("expected value at line 1 column 1"));
+    assert_eq(agnosai_error_kind(e_ser), AGNOSAI_ERR_SERIALIZATION, "serialization kind");
+    assert(str_starts_with(agnosai_error_message(e_ser), str_from("serialization error:")) == 1,
+    "serialization message prefix");
+
+    var e_io = agnosai_error_io(str_from("file missing"));
+    assert_eq(agnosai_error_kind(e_io), AGNOSAI_ERR_IO, "io kind");
+    assert(str_starts_with(agnosai_error_message(e_io), str_from("I/O error:")) == 1,
+    "io message prefix");
+
+    # --- detail round-trips, and the payload-free variants carry none ---
+    assert(str_eq(agnosai_error_detail(e_agent), str_from("agent-42")) == 1, "detail round-trips");
+    assert_eq(agnosai_error_detail(agnosai_error_cyclic_dag()), 0, "cyclic dag has no detail");
+    assert_eq(agnosai_error_timeout_ns(e_agent), 0, "non-timeout has no duration");
+
+    # --- Duration Debug parity beyond the oracle's single 30s case ---
+    _t_assert_duration(30 * AGNOSAI_NS_PER_SEC, "30s", "whole seconds drop the fraction");
+    _t_assert_duration(1500 * AGNOSAI_NS_PER_MS, "1.5s", "fractional seconds trim to one digit");
+    _t_assert_duration(100 * AGNOSAI_NS_PER_MS, "100ms", "sub-second renders as ms");
+    _t_assert_duration(AGNOSAI_NS_PER_MS, "1ms", "exactly one millisecond");
+    _t_assert_duration(1500, "1.5\u{b5}s", "sub-millisecond renders as microseconds");
+    _t_assert_duration(100, "100ns", "sub-microsecond renders as nanoseconds");
+    _t_assert_duration(0, "0ns", "zero renders as nanoseconds");
+    _t_assert_duration(1002000000, "1.002s", "leading fraction zeros are kept");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -225,6 +225,6 @@ included later (last-definition-wins, silently). Real modules **are** includable
 
 ## Open questions (need a decision before the bites they gate)
 
-1. **Money representation** — recommend integer micro-USD (per hoosh pricing.cyr:6-9). Round-trip wire-compatible but textually `0.002500` vs serde's `0.0025`. Gates core BITE 8 and every downstream cost path.
+1. ~~**Money representation**~~ — ✅ **DECIDED 2026-07-28: integer micro-USD** (user, following hoosh pricing.cyr:6-9). Exact, wire round-trip compatible, no f64 accumulation drift across a crew's cost path. The known cost: serialization is textually `0.002500` where serde emitted `0.0025` — numerically equal, so any JSON-number consumer is unaffected; only a byte-exact string diff would notice. Applies to core BITE 8 and every downstream cost path.
 2. **`"personality": null`** — bhava is a *hard* dep today, so the default Rust build emits an explicit null. Emit the literal to keep byte-exact default-build wire parity? This is the line between "bhava deferred" and "the wire changed."
 3. **Drop the ~20 zero-consumer hoosh re-exports** (src/llm/mod.rs) as a v2.0.0 Breaking change — and with them `inference_queue.rs`, `genai.rs`, and router's `suggest_quantization`/`estimate_model_memory` (all zero-consumer)?

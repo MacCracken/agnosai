@@ -1,0 +1,92 @@
+# =========================================================================
+# id.tcyr — tests for src/id.cyr (UUID v4/v5).
+#
+# Oracle: the `uuid` crate's RFC 4122 behaviour, as agnosai consumes it. There
+# is no #[cfg(test)] block to mirror — mneme is unusable (AGPL, no dist bundle)
+# so this is a reimplementation, and these tests are what stand in for the
+# crate's own guarantees.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/id.cyr"
+include "tests/test_helpers.cyr"
+
+fn main() {
+    alloc_init();
+
+    test_group("id");
+
+    # --- v4: shape, version and variant bits ---
+    var a = agnosai_uuid_v4();
+    assert_eq(agnosai_uuid_version(a), 4, "v4 stamps version 4");
+    assert_eq((load8(a + 8) >> 6) & 0x03, 2, "v4 stamps the RFC 4122 variant");
+
+    var s = agnosai_uuid_to_str(a);
+    assert_eq(str_len(s), AGNOSAI_UUID_STR_LEN, "rendered UUID is 36 chars");
+    assert_eq(load8(str_data(s) + 8), 45, "hyphen at index 8");
+    assert_eq(load8(str_data(s) + 13), 45, "hyphen at index 13");
+    assert_eq(load8(str_data(s) + 18), 45, "hyphen at index 18");
+    assert_eq(load8(str_data(s) + 23), 45, "hyphen at index 23");
+    assert_eq(load8(str_data(s) + 14), 52, "version digit '4' at index 14");
+
+    # --- v4 ids are distinct (the oracle's message_new_generates_unique_id) ---
+    var distinct = 1;
+    for (var i = 0; i < 64; i = i + 1) {
+        if (agnosai_uuid_eq(agnosai_uuid_v4(), agnosai_uuid_v4()) == 1) { distinct = 0; }
+    }
+    assert(distinct, "64 v4 pairs are all distinct");
+
+    # --- round-trip through the canonical string form ---
+    var parsed = agnosai_uuid_parse(s);
+    assert(parsed != 0, "canonical form parses");
+    assert_eq(agnosai_uuid_eq(parsed, a), 1, "parse(to_str(u)) == u");
+    assert(str_eq(agnosai_uuid_to_str(parsed), s) == 1, "to_str round-trips");
+
+    # --- uppercase hex parses too, and renders back lowercase ---
+    var upper = agnosai_uuid_parse(str_from("6BA7B810-9DAD-11D1-80B4-00C04FD430C8"));
+    assert(upper != 0, "uppercase form parses");
+    assert(str_eq(agnosai_uuid_to_str(upper), str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8")) == 1,
+    "rendering is always lowercase");
+
+    # --- malformed input is rejected, not silently accepted ---
+    assert_eq(agnosai_uuid_parse(str_from("too-short")), 0, "short input rejected");
+    assert_eq(agnosai_uuid_parse(str_from("6ba7b8109dad11d180b400c04fd430c8xxxx")), 0,
+    "missing hyphens rejected");
+    assert_eq(agnosai_uuid_parse(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430cZ")), 0,
+    "non-hex digit rejected");
+
+    # --- v5 is deterministic, and namespace-sensitive ---
+    var ns_dns = agnosai_uuid_parse(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8"));
+    var v5a = agnosai_uuid_v5(ns_dns, str_from("example.com"));
+    var v5b = agnosai_uuid_v5(ns_dns, str_from("example.com"));
+    assert_eq(agnosai_uuid_version(v5a), 5, "v5 stamps version 5");
+    assert_eq((load8(v5a + 8) >> 6) & 0x03, 2, "v5 stamps the RFC 4122 variant");
+    assert_eq(agnosai_uuid_eq(v5a, v5b), 1, "v5 is deterministic for the same name");
+
+    var v5c = agnosai_uuid_v5(ns_dns, str_from("other.com"));
+    assert_eq(agnosai_uuid_eq(v5a, v5c), 0, "v5 differs for a different name");
+
+    var ns_url = agnosai_uuid_parse(str_from("6ba7b811-9dad-11d1-80b4-00c04fd430c8"));
+    var v5d = agnosai_uuid_v5(ns_url, str_from("example.com"));
+    assert_eq(agnosai_uuid_eq(v5a, v5d), 0, "v5 differs for a different namespace");
+
+    # --- RFC 4122 §A.1 known-answer: v5(DNS, "www.example.com") ---
+    # The uuid crate produces 2ed6657d-e927-568b-95e1-2665a8aea6a2 for this.
+    var kat = agnosai_uuid_v5(ns_dns, str_from("www.example.com"));
+    assert(str_eq(agnosai_uuid_to_str(kat), str_from("2ed6657d-e927-568b-95e1-2665a8aea6a2")) == 1,
+    "v5(DNS, www.example.com) matches the published vector");
+
+    # --- nil ---
+    var nil = agnosai_uuid_nil();
+    assert_eq(agnosai_uuid_version(nil), 0, "nil UUID has version 0");
+    assert(str_eq(agnosai_uuid_to_str(nil), str_from("00000000-0000-0000-0000-000000000000")) == 1,
+    "nil UUID renders as all zeros");
+    assert_eq(agnosai_uuid_eq(nil, agnosai_uuid_nil()), 1, "nil equals nil");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -1,63 +1,62 @@
 #!/usr/bin/env bash
-# bench-history.sh — run all benchmarks and append summary to bench-history.csv
+# bench-history.sh — run every Cyrius benchmark and append the results to
+# bench-history.csv.
+#
+# `cyrius bench` already does most of what the Rust-era script had to do by
+# hand: it discovers the harnesses, runs them, times them, and prints one
+# self-describing line per benchmark. So this script only has to normalise the
+# unit and stamp each row with the date and version.
+#
+# The Rust-era harness is frozen at rust-old/scripts/bench-history.sh. It drove
+# `cargo bench` and reconstructed names from criterion's two output layouts —
+# none of which applies here. Do NOT compare rows across the two files: the
+# allocator, harness and statistics are all different, and the Cyrius line
+# starts its own baseline. See CLAUDE.md.
+#
+# Output line shape this parses (lib/bench.cyr `bench_report`):
+#   "  ucb1_select_50arms: 1.154us avg (min=1.154us max=1.154us) [20000 iters]"
 set -euo pipefail
 
 CSV="bench-history.csv"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 VERSION="$(cat VERSION 2>/dev/null || echo unknown)"
 
-# Create CSV header if missing.
+# Create CSV header if missing. Column names match the Rust-era file so the two
+# can be read by the same tooling, even though the rows are not comparable.
 if [ ! -f "$CSV" ]; then
     echo "date,version,benchmark,time_ns" > "$CSV"
 fi
 
-echo "Running benchmarks..."
 TMPFILE=$(mktemp)
-cargo bench --all-features 2>&1 | tee "$TMPFILE"
+trap 'rm -f "$TMPFILE"' EXIT
 
-# Criterion outputs benchmark name on one line, timing on the next.
-# Pattern: "benchmark_name\n                        time:   [low median high]"
-# We pair them by tracking the last non-indented line as the benchmark name.
-LAST_NAME=""
-while IFS= read -r line; do
-    # Lines starting with non-space are benchmark names.
-    #
-    # Criterion uses TWO layouts: a long name gets its own line with the
-    # timing on the next, but a short name is padded and printed on the SAME
-    # line as its timing ("EchoTool::execute    time: [81.078 ns ...]").
-    # Capturing the whole line put "  time: [...]" inside the name field for
-    # every short-named benchmark — 24 of 237 rows in the committed history.
-    # Strip from `time:` so both layouts yield just the name.
-    if echo "$line" | grep -qE '^[A-Za-z]' && ! echo "$line" | grep -q 'Benchmarking\|Compiling\|Finished\|Running\|warning\|Found\|Gnuplot'; then
-        LAST_NAME=$(echo "$line" | sed 's/[[:space:]]*time:.*$//; s/[[:space:]]*$//')
-    fi
-    # Lines with "time:" contain the measurements.
-    if echo "$line" | grep -q 'time:'; then
-        # Extract median: second value inside brackets [low median high]
-        median=$(echo "$line" | sed 's/.*\[//;s/\].*//' | awk '{print $3 $4}')
-        if [ -z "$median" ]; then
-            continue
-        fi
-        # Normalise to nanoseconds.
-        if echo "$median" | grep -q 'µs'; then
-            ns=$(echo "$median" | sed 's/µs//' | awk '{printf "%.0f", $1 * 1000}')
-        elif echo "$median" | grep -q 'ms'; then
-            ns=$(echo "$median" | sed 's/ms//' | awk '{printf "%.0f", $1 * 1000000}')
-        elif echo "$median" | grep -q 'ns'; then
-            ns=$(echo "$median" | sed 's/ns//' | awk '{printf "%.0f", $1}')
-        elif echo "$median" | grep -q 'ps'; then
-            ns=$(echo "$median" | sed 's/ps//' | awk '{printf "%.0f", $1 / 1000}')
-        elif echo "$median" | grep -q 's$'; then
-            ns=$(echo "$median" | sed 's/s$//' | awk '{printf "%.0f", $1 * 1000000000}')
-        else
-            ns="$median"
-        fi
-        if [ -n "$LAST_NAME" ] && [ "$ns" != "0" ]; then
-            echo "${DATE},${VERSION},${LAST_NAME},${ns}" >> "$CSV"
-        fi
-    fi
-done < "$TMPFILE"
+echo "Running benchmarks..."
+cyrius bench 2>&1 | tee "$TMPFILE"
 
-ENTRIES=$(grep -c "$DATE" "$CSV" 2>/dev/null || echo 0)
-rm -f "$TMPFILE"
+# One row per reported benchmark. The pattern is anchored on the "<value><unit>
+# avg" shape so build notes, shadow-lib warnings and duplicate-fn warnings on
+# the same stream cannot be mistaken for results.
+grep -E '^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*: [0-9.]+(ns|us|ms|s) avg' "$TMPFILE" \
+    | while IFS= read -r line; do
+        name=$(echo "$line" | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*):.*/\1/')
+        value=$(echo "$line" | sed -E 's/^[^:]*:[[:space:]]*([0-9.]+)(ns|us|ms|s) avg.*/\1/')
+        unit=$(echo "$line" | sed -E 's/^[^:]*:[[:space:]]*([0-9.]+)(ns|us|ms|s) avg.*/\2/')
+
+        # Normalise to nanoseconds. ERE alternation is leftmost-longest, so
+        # "ns"/"us"/"ms" always win over the bare "s" branch.
+        case "$unit" in
+            ns) scale=1 ;;
+            us) scale=1000 ;;
+            ms) scale=1000000 ;;
+            s)  scale=1000000000 ;;
+            *)  continue ;;
+        esac
+        ns=$(awk -v v="$value" -v s="$scale" 'BEGIN { printf "%.0f", v * s }')
+
+        if [ -n "$name" ] && [ "$ns" != "0" ]; then
+            echo "${DATE},${VERSION},${name},${ns}" >> "$CSV"
+        fi
+    done
+
+ENTRIES=$(grep -c "^${DATE}," "$CSV" || echo 0)
 echo "Appended $ENTRIES benchmark entries to $CSV"
