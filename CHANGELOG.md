@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency because **mneme is unusable** — no lib block, no `dist/` bundle, and AGPL-3.0 against
   agnosai's GPL-3.0-only. No mneme text was copied. Verified against the published
   v5(DNS, "www.example.com") vector.
-- **core** (M2, Phase 1, in progress) — `src/core.cyr` hub plus the first two submodules:
+- **core** (M2, Phase 1) — **complete**. `src/core.cyr` hub plus all six oracle submodules:
   - **core_error** — `agnosai_error_*`: all 15 `AgnosaiError` variants with byte-exact `Display`
     parity, including a reimplementation of Rust's `Duration` `Debug` rendering for `Timeout`
     (`30s`, `1.5s`, `100ms`, `1.5µs`, `100ns`).
@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Timestamps reproduce chrono's serde output exactly (RFC3339, `SecondsFormat::AutoSi` — 0, 3, 6
     or 9 fractional digits), which `lib/chrono.cyr`'s second-precision `iso8601` cannot do alone;
     without it a `Utc::now()` timestamp would not survive a round trip.
+  - **core_task** — `agnosai_task_*`: `Task`, `TaskResult`, `TaskDAG`, `ProcessMode` and the three
+    enums. `TaskPriority` keeps the oracle's explicit discriminants because it derives `Ord`, so
+    the tier ordering is observable behaviour rather than an implementation detail.
+  - **core_resource** — `agnosai_hw_*` / `agnosai_resource_budget_*` / `agnosai_accelerator_*`:
+    devices, requirements, inventories, placement matching and budgets.
+  - **core_agent** — `agnosai_agent_*`: `AgentDefinition` and `AgentState`, including the
+    `hardware_requirement()` precedence rule (explicit `hardware` field over the legacy GPU
+    fields, with `gpu_memory_min_mb` only applying when `gpu_required` is set).
+  - **core_crew** — `agnosai_crew_*`: `CrewSpec`, `CrewState`, `CrewProfile`, `CrewStatus`.
+  - **core_json** — shared JSON field helpers. No oracle module; extracted once task, resource and
+    agent all needed the same `Option`/map/bool plumbing that serde's derives had provided.
+- **id** — `agnosai_uuid_*` (listed above) also unblocked `core_message`, `core_task` and
+  `core_crew`, all of which key on `Uuid`.
 - **scripts/bench-history.sh** — rewritten to drive `cyrius bench` and append to a fresh root
   `bench-history.csv`. `cyrius bench` already handles discovery, timing and unit formatting, so
   only the unit normalisation and date/version stamping remain — the criterion name/timing
@@ -48,6 +61,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Cyrius baseline. Not comparable to the frozen Rust CSV.
 
 ### Changed
+- **Money is integer micro-USD** across the cost path (`ResourceBudget::max_cost_usd`,
+  `CrewProfile::cost_usd` and both per-key cost breakdowns), per the 2026-07-28 decision.
+  Amounts accumulate exactly with no float drift. Serialization still routes through an f64
+  under the original `*_usd` wire names, so bayan's Grisu2 emits the shortest round-tripping
+  form — `0.0025`, `5.0`, `0.000001` — byte-identical to serde. **This corrects the port plan's
+  prediction** that micro-USD would cost a `0.002500` vs `0.0025` textual divergence: converting
+  only at the wire boundary avoids it entirely.
+- **core** — divergences from the Rust API, each documented at the top of its module:
+  `Option<T>` numeric fields use a `-1` sentinel (`AGNOSAI_NO_LIMIT`); `Option<String>` fields use
+  `0`; `from_json` returns `0` in place of `Result::Err`; `HashMap<Uuid, _>` keys become the
+  canonical UUID string, which is what serde emitted. Every `skip_serializing_if` in the oracle is
+  honoured exactly, since those omissions are wire-visible.
+- **core_agent** — `personality` is not ported (bhava is post-v2), but the field still serializes
+  as `"personality": null`, which is what the default Rust build emitted. Incoming values are
+  accepted and ignored. This resolves port plan open question 2 the conservative way, preserving
+  byte-exact default-build wire parity; say so if you want the field dropped from the wire instead.
+- **core_resource** — the `#[cfg(feature = "hwaccel")]` half is not ported (ai-hwaccel re-exports,
+  `TrainingMemoryEstimate`, the `detect`/`from_hwaccel` probes). `hwaccel` is not in the default
+  build, so it sits outside the v2.0.0 parity bar alongside bhava. 19 of the oracle's 28
+  resource tests port; the 9 hwaccel-gated ones defer with the feature.
 - **learning** — three deliberate shape divergences from the Rust API, each documented at the top
   of its module. `Option<T>` returns become presence-return plus an out-param, keeping the query
   paths allocation-free where a tagged `Option` would heap-allocate. `Duration` becomes an i64

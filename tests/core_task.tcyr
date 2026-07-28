@@ -1,0 +1,201 @@
+# =========================================================================
+# core_task.tcyr — parity tests for src/core_task.cyr
+#
+# Oracle: the 13 #[cfg(test)] tests in rust-old/src/core/task.rs, plus the
+# snake_case wire spellings, which the oracle only checks by round-tripping
+# (so a matching pair of wrong spellings would pass there but not here).
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/id.cyr"
+include "src/core_message.cyr"
+include "src/core_task.cyr"
+include "tests/test_helpers.cyr"
+
+# Assert a value serializes to exactly `expected` JSON text.
+fn _t_assert_json(v, expected, name): i64 {
+    return assert(str_eq(bayan_json_v_build(v), str_from(expected)) == 1, name);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("core_task");
+
+    # --- task_new_generates_unique_ids ---
+    var t1 = agnosai_task_new(str_from("task one"));
+    var t2 = agnosai_task_new(str_from("task two"));
+    assert_eq(agnosai_uuid_eq(agnosai_task_id(t1), agnosai_task_id(t2)), 0, "task ids are unique");
+
+    # --- task_new_sets_correct_defaults ---
+    var t = agnosai_task_new(str_from("do something"));
+    assert(str_eq(agnosai_task_description(t), str_from("do something")) == 1, "description set");
+    assert_eq(agnosai_task_expected_output(t), 0, "expected_output defaults to none");
+    assert_eq(agnosai_task_assigned_agent(t), 0, "assigned_agent defaults to none");
+    assert_eq(agnosai_task_priority(t), AGNOSAI_PRIORITY_NORMAL, "priority defaults to normal");
+    assert_eq(agnosai_task_status(t), AGNOSAI_STATUS_PENDING, "status defaults to pending");
+    assert_eq(vec_len(agnosai_task_dependencies(t)), 0, "dependencies default to empty");
+    assert_eq(map_size(agnosai_task_context(t)), 0, "context defaults to empty");
+    assert_eq(agnosai_task_risk(t), AGNOSAI_RISK_LOW, "risk defaults to low");
+    assert_eq(agnosai_task_output_schema(t), 0, "output_schema defaults to none");
+
+    # --- task_priority_ordering (the oracle derives Ord; integers give it) ---
+    assert(AGNOSAI_PRIORITY_CRITICAL > AGNOSAI_PRIORITY_HIGH, "critical > high");
+    assert(AGNOSAI_PRIORITY_HIGH > AGNOSAI_PRIORITY_NORMAL, "high > normal");
+    assert(AGNOSAI_PRIORITY_NORMAL > AGNOSAI_PRIORITY_LOW, "normal > low");
+    assert(AGNOSAI_PRIORITY_LOW > AGNOSAI_PRIORITY_BACKGROUND, "low > background");
+
+    # --- the builders chain and set what they say ---
+    var b = agnosai_task_new(str_from("built"));
+    agnosai_task_with_expected_output(b, str_from("json"));
+    agnosai_task_with_risk(b, AGNOSAI_RISK_HIGH);
+    agnosai_task_with_priority(b, AGNOSAI_PRIORITY_CRITICAL);
+    agnosai_task_with_status(b, AGNOSAI_STATUS_RUNNING);
+    var dep = agnosai_uuid_v4();
+    agnosai_task_with_dependency(b, dep);
+    agnosai_task_with_context(b, str_from("k"), bayan_json_v_int_new(9));
+    agnosai_task_with_agent(b, agnosai_uuid_v4());
+    agnosai_task_with_output_schema(b, bayan_json_v_obj_new());
+    assert(str_eq(agnosai_task_expected_output(b), str_from("json")) == 1, "with_expected_output");
+    assert_eq(agnosai_task_risk(b), AGNOSAI_RISK_HIGH, "with_risk");
+    assert_eq(agnosai_task_priority(b), AGNOSAI_PRIORITY_CRITICAL, "with_priority");
+    assert_eq(agnosai_task_status(b), AGNOSAI_STATUS_RUNNING, "with_status");
+    assert_eq(vec_len(agnosai_task_dependencies(b)), 1, "with_dependency");
+    assert_eq(map_size(agnosai_task_context(b)), 1, "with_context");
+    assert(agnosai_task_assigned_agent(b) != 0, "with_agent");
+    assert(agnosai_task_output_schema(b) != 0, "with_output_schema");
+
+    # --- the exact snake_case wire spellings ---
+    assert(str_eq(agnosai_task_status_to_wire(AGNOSAI_STATUS_PENDING), str_from("pending")) == 1, "wire pending");
+    assert(str_eq(agnosai_task_status_to_wire(AGNOSAI_STATUS_QUEUED), str_from("queued")) == 1, "wire queued");
+    assert(str_eq(agnosai_task_status_to_wire(AGNOSAI_STATUS_RUNNING), str_from("running")) == 1, "wire running");
+    assert(str_eq(agnosai_task_status_to_wire(AGNOSAI_STATUS_COMPLETED), str_from("completed")) == 1, "wire completed");
+    assert(str_eq(agnosai_task_status_to_wire(AGNOSAI_STATUS_FAILED), str_from("failed")) == 1, "wire failed");
+    assert(str_eq(agnosai_task_status_to_wire(AGNOSAI_STATUS_CANCELLED), str_from("cancelled")) == 1, "wire cancelled");
+    assert(str_eq(agnosai_task_priority_to_wire(AGNOSAI_PRIORITY_BACKGROUND), str_from("background")) == 1,
+    "wire background");
+    assert(str_eq(agnosai_task_priority_to_wire(AGNOSAI_PRIORITY_NORMAL), str_from("normal")) == 1, "wire normal");
+    assert(str_eq(agnosai_task_risk_to_wire(AGNOSAI_RISK_MEDIUM), str_from("medium")) == 1, "wire medium");
+
+    # --- task_status_serde_round_trip_all_variants ---
+    var all_ok = 1;
+    for (var s = AGNOSAI_STATUS_PENDING; s <= AGNOSAI_STATUS_CANCELLED; s = s + 1) {
+        if (agnosai_task_status_from_wire(agnosai_task_status_to_wire(s)) != s) { all_ok = 0; }
+    }
+    assert(all_ok, "every status round-trips through its wire spelling");
+
+    var all_pr = 1;
+    for (var p = AGNOSAI_PRIORITY_BACKGROUND; p <= AGNOSAI_PRIORITY_CRITICAL; p = p + 1) {
+        if (agnosai_task_priority_from_wire(agnosai_task_priority_to_wire(p)) != p) { all_pr = 0; }
+    }
+    assert(all_pr, "every priority round-trips through its wire spelling");
+
+    # unknown spellings fall back to the oracle's defaults
+    assert_eq(agnosai_task_status_from_wire(str_from("bogus")), AGNOSAI_STATUS_PENDING, "unknown status -> pending");
+    assert_eq(agnosai_task_priority_from_wire(str_from("bogus")), AGNOSAI_PRIORITY_NORMAL,
+    "unknown priority -> normal");
+    assert(agnosai_task_from_value(agnosai_task_to_value(t)) != 0,
+    "agnosai_task_from_value accepts a task value tree");
+    assert_eq(agnosai_task_risk_from_wire(str_from("bogus")), AGNOSAI_RISK_LOW, "unknown risk -> low");
+
+    # --- process_mode_serde_* : the four variants and their wire forms ---
+    _t_assert_json(agnosai_process_to_value(agnosai_process_sequential()), "\"sequential\"",
+    "sequential is a bare string");
+    _t_assert_json(agnosai_process_to_value(agnosai_process_dag()), "\"dag\"", "dag is a bare string");
+    _t_assert_json(agnosai_process_to_value(agnosai_process_parallel(8)),
+    "{\"parallel\":{\"max_concurrency\":8}}", "parallel is externally tagged");
+
+    var mgr = agnosai_uuid_v4();
+    var hier = agnosai_process_hierarchical(mgr);
+    var hier_back = agnosai_process_from_value(agnosai_process_to_value(hier));
+    assert_eq(agnosai_process_kind(hier_back), AGNOSAI_PROCESS_HIERARCHICAL, "hierarchical round-trips");
+    assert_eq(agnosai_uuid_eq(agnosai_process_manager(hier_back), mgr), 1, "hierarchical keeps its manager");
+
+    var par_back = agnosai_process_from_value(agnosai_process_to_value(agnosai_process_parallel(8)));
+    assert_eq(agnosai_process_kind(par_back), AGNOSAI_PROCESS_PARALLEL, "parallel round-trips");
+    assert_eq(agnosai_process_max_concurrency(par_back), 8, "parallel keeps max_concurrency 8");
+
+    var seq_back = agnosai_process_from_value(agnosai_process_to_value(agnosai_process_sequential()));
+    assert_eq(agnosai_process_kind(seq_back), AGNOSAI_PROCESS_SEQUENTIAL, "sequential round-trips");
+    var proc_dag_back = agnosai_process_from_value(agnosai_process_to_value(agnosai_process_dag()));
+    assert_eq(agnosai_process_kind(proc_dag_back), AGNOSAI_PROCESS_DAG, "dag round-trips");
+
+    # --- task_serde_round_trip ---
+    var rt = agnosai_task_new(str_from("round trip test"));
+    var rt_back = agnosai_task_from_json(agnosai_task_to_json(rt));
+    assert(rt_back != 0, "task parses back from its own JSON");
+    assert_eq(agnosai_uuid_eq(agnosai_task_id(rt_back), agnosai_task_id(rt)), 1, "task id survives");
+    assert(str_eq(agnosai_task_description(rt_back), str_from("round trip test")) == 1, "description survives");
+    assert_eq(agnosai_task_priority(rt_back), AGNOSAI_PRIORITY_NORMAL, "priority survives");
+    assert_eq(agnosai_task_status(rt_back), AGNOSAI_STATUS_PENDING, "status survives");
+
+    # a fully-populated task survives too
+    var full_back = agnosai_task_from_json(agnosai_task_to_json(b));
+    assert(full_back != 0, "populated task parses back");
+    assert_eq(agnosai_task_risk(full_back), AGNOSAI_RISK_HIGH, "risk survives");
+    assert_eq(agnosai_task_priority(full_back), AGNOSAI_PRIORITY_CRITICAL, "critical priority survives");
+    assert_eq(vec_len(agnosai_task_dependencies(full_back)), 1, "dependencies survive");
+    assert_eq(agnosai_uuid_eq(vec_get(agnosai_task_dependencies(full_back), 0), dep), 1, "dependency id survives");
+    assert_eq(map_size(agnosai_task_context(full_back)), 1, "context survives");
+    assert(agnosai_task_assigned_agent(full_back) != 0, "assigned agent survives");
+
+    # --- field order matches serde's declaration order ---
+    var tv = agnosai_task_to_value(rt);
+    assert(str_eq(bayan_json_v_obj_key(tv, 0), str_from("id")) == 1, "field 0 is id");
+    assert(str_eq(bayan_json_v_obj_key(tv, 2), str_from("expected_output")) == 1, "field 2 is expected_output");
+    assert(str_eq(bayan_json_v_obj_key(tv, 9), str_from("output_schema")) == 1, "field 9 is output_schema");
+    assert_eq(bayan_json_v_is_null(bayan_json_v_obj_val(tv, 2)), 1, "unset Option emits null");
+
+    # --- serde(default): missing optional fields take defaults, not failure ---
+    var minimal = str_cat(str_cat(str_from("{\"id\":\""),
+    agnosai_uuid_to_str(agnosai_uuid_v4())), str_from("\",\"description\":\"m\"}"));
+    var min_back = agnosai_task_from_json(minimal);
+    assert(min_back != 0, "a minimal task object parses");
+    assert_eq(agnosai_task_priority(min_back), AGNOSAI_PRIORITY_NORMAL, "missing priority -> normal");
+    assert_eq(agnosai_task_status(min_back), AGNOSAI_STATUS_PENDING, "missing status -> pending");
+    assert_eq(agnosai_task_risk(min_back), AGNOSAI_RISK_LOW, "missing risk -> low");
+    assert_eq(vec_len(agnosai_task_dependencies(min_back)), 0, "missing dependencies -> empty");
+    assert_eq(agnosai_task_from_json(str_from("{\"description\":\"no id\"}")), 0, "missing id is rejected");
+
+    # --- task_result_serde_round_trip ---
+    var task_id = agnosai_uuid_v4();
+    var res = agnosai_task_result_new(task_id, str_from("all good"), AGNOSAI_STATUS_COMPLETED);
+    agnosai_task_result_with_metadata(res, str_from("key"), bayan_json_v_str_new(str_from("value")));
+    var res_back = agnosai_task_result_from_value(agnosai_task_result_to_value(res));
+    assert(res_back != 0, "result round-trips");
+    assert_eq(agnosai_uuid_eq(agnosai_task_result_task_id(res_back), task_id), 1, "result task_id survives");
+    assert(str_eq(agnosai_task_result_output(res_back), str_from("all good")) == 1, "result output survives");
+    assert_eq(agnosai_task_result_status(res_back), AGNOSAI_STATUS_COMPLETED, "result status survives");
+    assert_eq(map_size(agnosai_task_result_metadata(res_back)), 1, "result metadata survives");
+    var mval = map_get(agnosai_task_result_metadata(res_back), str_from("key"));
+    assert(str_eq(bayan_json_v_str(mval), str_from("value")) == 1, "metadata value survives");
+
+    # --- task_dag_serde_round_trip ---
+    var dag_tasks = map_new_str();
+    map_set(dag_tasks, str_from("t1"), agnosai_task_new(str_from("subtask")));
+    var dag_edges = vec_new();
+    vec_push(dag_edges, agnosai_edge_new(str_from("t1"), str_from("t2")));
+    var dag = agnosai_task_dag_new(dag_tasks, dag_edges, agnosai_process_dag());
+    var dag_back = agnosai_task_dag_from_value(agnosai_task_dag_to_value(dag));
+    assert(dag_back != 0, "dag round-trips");
+    assert_eq(map_size(agnosai_task_dag_tasks(dag_back)), 1, "dag has 1 task");
+    assert(map_get(agnosai_task_dag_tasks(dag_back), str_from("t1")) != 0, "dag contains key t1");
+    assert_eq(vec_len(agnosai_task_dag_edges(dag_back)), 1, "dag has 1 edge");
+    var e0 = vec_get(agnosai_task_dag_edges(dag_back), 0);
+    assert(str_eq(agnosai_edge_from(e0), str_from("t1")) == 1, "edge from is t1");
+    assert(str_eq(agnosai_edge_to(e0), str_from("t2")) == 1, "edge to is t2");
+    assert_eq(agnosai_process_kind(agnosai_task_dag_process(dag_back)), AGNOSAI_PROCESS_DAG, "dag process survives");
+
+    # edges emit as two-element arrays, matching serde's tuple rendering
+    var edges_v = bayan_json_v_obj_get(agnosai_task_dag_to_value(dag), "edges");
+    _t_assert_json(edges_v, "[[\"t1\",\"t2\"]]", "edges render as nested arrays");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

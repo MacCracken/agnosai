@@ -1,0 +1,176 @@
+# =========================================================================
+# core_crew.tcyr — parity tests for src/core_crew.cyr
+#
+# Oracle: the #[cfg(test)] tests in rust-old/src/core/crew.rs, plus explicit
+# coverage of the `skip_serializing_if` omissions, which are wire-visible and
+# which a round-trip test alone would not catch.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/id.cyr"
+include "src/core_message.cyr"
+include "src/core_resource.cyr"
+include "src/core_task.cyr"
+include "src/core_agent.cyr"
+include "src/core_crew.cyr"
+include "tests/test_helpers.cyr"
+
+fn main() {
+    alloc_init();
+
+    test_group("core_crew");
+
+    # --- crew_spec_new_generates_unique_id ---
+    var c1 = agnosai_crew_new(str_from("crew-a"));
+    var c2 = agnosai_crew_new(str_from("crew-b"));
+    assert_eq(agnosai_uuid_eq(agnosai_crew_id(c1), agnosai_crew_id(c2)), 0, "crew ids are unique");
+
+    # --- crew_spec_new_defaults ---
+    var c = agnosai_crew_new(str_from("my crew"));
+    assert(str_eq(agnosai_crew_name(c), str_from("my crew")) == 1, "name set");
+    assert_eq(vec_len(agnosai_crew_agents(c)), 0, "agents default to empty");
+    assert_eq(vec_len(agnosai_crew_tasks(c)), 0, "tasks default to empty");
+    assert_eq(agnosai_process_kind(agnosai_crew_process(c)), AGNOSAI_PROCESS_SEQUENTIAL,
+    "process defaults to sequential");
+    assert_eq(map_size(agnosai_crew_metadata(c)), 0, "metadata defaults to empty");
+    assert(str_eq(agnosai_crew_trust_level(c), str_from("basic")) == 1, "trust_level defaults to basic");
+    assert(str_eq(agnosai_default_trust_level(), str_from("basic")) == 1, "default trust level is basic");
+
+    # --- crew_status_default_is_pending + snake_case round trip ---
+    assert_eq(AGNOSAI_CREW_PENDING, 0, "pending is the default status");
+    var st_ok = 1;
+    for (var s = AGNOSAI_CREW_PENDING; s <= AGNOSAI_CREW_CANCELLED; s = s + 1) {
+        if (agnosai_crew_status_from_wire(agnosai_crew_status_to_wire(s)) != s) { st_ok = 0; }
+    }
+    assert(st_ok, "every crew status round-trips through its wire spelling");
+    assert(str_eq(agnosai_crew_status_to_wire(AGNOSAI_CREW_PENDING), str_from("pending")) == 1, "wire pending");
+    assert(str_eq(agnosai_crew_status_to_wire(AGNOSAI_CREW_RUNNING), str_from("running")) == 1, "wire running");
+    assert(str_eq(agnosai_crew_status_to_wire(AGNOSAI_CREW_CANCELLED), str_from("cancelled")) == 1, "wire cancelled");
+    assert_eq(agnosai_crew_status_from_wire(str_from("bogus")), AGNOSAI_CREW_PENDING, "unknown status -> pending");
+
+    # --- builders ---
+    var agents = vec_new();
+    vec_push(agents, agnosai_agent_new(str_from("a1"), str_from("worker"), str_from("work")));
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("t1")));
+    agnosai_crew_with_agents(c, agents);
+    agnosai_crew_with_tasks(c, tasks);
+    agnosai_crew_with_process(c, agnosai_process_parallel(4));
+    agnosai_crew_with_trust_level(c, str_from("strict"));
+    agnosai_crew_with_metadata(c, str_from("owner"), bayan_json_v_str_new(str_from("ops")));
+    assert_eq(vec_len(agnosai_crew_agents(c)), 1, "with_agents");
+    assert_eq(vec_len(agnosai_crew_tasks(c)), 1, "with_tasks");
+    assert_eq(agnosai_process_kind(agnosai_crew_process(c)), AGNOSAI_PROCESS_PARALLEL, "with_process");
+    assert(str_eq(agnosai_crew_trust_level(c), str_from("strict")) == 1, "with_trust_level");
+    assert_eq(map_size(agnosai_crew_metadata(c)), 1, "with_metadata");
+
+    # --- crew spec round trip, nested agents and tasks included ---
+    var c_back = agnosai_crew_from_json(agnosai_crew_to_json(c));
+    assert(c_back != 0, "crew round-trips through JSON");
+    assert_eq(agnosai_uuid_eq(agnosai_crew_id(c_back), agnosai_crew_id(c)), 1, "crew id survives");
+    assert(str_eq(agnosai_crew_name(c_back), str_from("my crew")) == 1, "crew name survives");
+    assert_eq(vec_len(agnosai_crew_agents(c_back)), 1, "nested agent survives");
+    assert(str_eq(agnosai_agent_key(vec_get(agnosai_crew_agents(c_back), 0)), str_from("a1")) == 1,
+    "nested agent_key survives");
+    assert_eq(vec_len(agnosai_crew_tasks(c_back)), 1, "nested task survives");
+    assert(str_eq(agnosai_task_description(vec_get(agnosai_crew_tasks(c_back), 0)), str_from("t1")) == 1,
+    "nested task description survives");
+    assert_eq(agnosai_process_kind(agnosai_crew_process(c_back)), AGNOSAI_PROCESS_PARALLEL,
+    "crew process survives");
+    assert_eq(agnosai_process_max_concurrency(agnosai_crew_process(c_back)), 4, "crew concurrency survives");
+    assert(str_eq(agnosai_crew_trust_level(c_back), str_from("strict")) == 1, "trust_level survives");
+    assert_eq(map_size(agnosai_crew_metadata(c_back)), 1, "metadata survives");
+    assert_eq(agnosai_crew_from_json(str_from("{\"name\":\"no id\"}")), 0, "crew without an id is rejected");
+    assert(agnosai_crew_from_value(agnosai_crew_to_value(c)) != 0,
+    "agnosai_crew_from_value accepts a crew value tree");
+
+    # --- field order matches serde's declaration order ---
+    var cv = agnosai_crew_to_value(c);
+    assert(str_eq(bayan_json_v_obj_key(cv, 0), str_from("id")) == 1, "crew field 0 is id");
+    assert(str_eq(bayan_json_v_obj_key(cv, 6), str_from("trust_level")) == 1, "crew field 6 is trust_level");
+
+    # --- CrewProfile: skip_serializing_if omissions are wire-visible ---
+    var empty_prof = agnosai_crew_profile_new();
+    var ev = agnosai_crew_profile_to_value(empty_prof);
+    assert_eq(bayan_json_v_obj_get(ev, "cost_usd"), 0, "zero cost_usd is omitted");
+    assert_eq(bayan_json_v_obj_get(ev, "agent_cost_usd"), 0, "empty agent_cost_usd is omitted");
+    assert_eq(bayan_json_v_obj_get(ev, "task_cost_usd"), 0, "empty task_cost_usd is omitted");
+    assert_eq(bayan_json_v_obj_get(ev, "sandbox_strength"), 0, "unset sandbox_strength is omitted");
+    assert(bayan_json_v_obj_get(ev, "wall_ms") != 0, "wall_ms is always present");
+    assert(bayan_json_v_obj_get(ev, "task_count") != 0, "task_count is always present");
+
+    # --- CrewProfile: populated, with micro-USD costs ---
+    var task_id = agnosai_uuid_v4();
+    var prof = agnosai_crew_profile_new();
+    agnosai_crew_profile_with_wall_ms(prof, 1500);
+    agnosai_crew_profile_with_task_count(prof, 3);
+    agnosai_crew_profile_record_task_ms(prof, task_id, 420);
+    agnosai_crew_profile_with_cost(prof, 2500);
+    agnosai_crew_profile_record_agent_cost(prof, str_from("a1"), 1500);
+    agnosai_crew_profile_record_task_cost(prof, task_id, 1000);
+    agnosai_crew_profile_with_sandbox_strength(prof, 85);
+
+    var pv = agnosai_crew_profile_to_value(prof);
+    assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(pv, "cost_usd")), str_from("0.0025")) == 1,
+    "2500 micro-USD renders as 0.0025");
+    assert(bayan_json_v_obj_get(pv, "agent_cost_usd") != 0, "populated agent_cost_usd is emitted");
+    assert(bayan_json_v_obj_get(pv, "task_cost_usd") != 0, "populated task_cost_usd is emitted");
+    assert(bayan_json_v_obj_get(pv, "sandbox_strength") != 0, "set sandbox_strength is emitted");
+
+    var prof_back = agnosai_crew_profile_from_value(pv);
+    assert_eq(agnosai_crew_profile_wall_ms(prof_back), 1500, "wall_ms survives");
+    assert_eq(agnosai_crew_profile_task_count(prof_back), 3, "task_count survives");
+    assert_eq(agnosai_crew_profile_cost_micro_usd(prof_back), 2500, "micro-USD cost survives exactly");
+    assert_eq(map_size(agnosai_crew_profile_task_ms(prof_back)), 1, "task_ms survives");
+    assert_eq(map_get(agnosai_crew_profile_task_ms(prof_back), agnosai_uuid_to_str(task_id)), 420,
+    "per-task duration survives keyed by uuid string");
+    assert_eq(map_get(agnosai_crew_profile_agent_cost(prof_back), str_from("a1")), 1500,
+    "per-agent micro-USD cost survives exactly");
+    assert_eq(map_get(agnosai_crew_profile_task_cost(prof_back), agnosai_uuid_to_str(task_id)), 1000,
+    "per-task micro-USD cost survives exactly");
+    assert_eq(agnosai_crew_profile_sandbox_strength(prof_back), 85, "sandbox_strength survives");
+
+    # a cost that is not exactly representable in binary still round-trips
+    # through the micro-USD boundary
+    var odd = agnosai_crew_profile_with_cost(agnosai_crew_profile_new(), 123457);
+    assert_eq(agnosai_crew_profile_cost_micro_usd(
+    agnosai_crew_profile_from_value(agnosai_crew_profile_to_value(odd))), 123457,
+    "0.123457 USD survives the f64 wire boundary exactly");
+
+    # --- CrewState ---
+    var state = agnosai_crew_state_new(agnosai_crew_id(c), AGNOSAI_CREW_RUNNING);
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_RUNNING, "state status set");
+    assert_eq(vec_len(agnosai_crew_state_results(state)), 0, "state results start empty");
+    assert_eq(agnosai_crew_state_profile(state), 0, "state profile starts unset");
+
+    var sv_empty = agnosai_crew_state_to_value(state);
+    assert_eq(bayan_json_v_obj_get(sv_empty, "profile"), 0, "unset profile is omitted from the wire");
+
+    agnosai_crew_state_with_result(state,
+    agnosai_task_result_new(task_id, str_from("done"), AGNOSAI_STATUS_COMPLETED));
+    agnosai_crew_state_with_profile(state, prof);
+    var sv = agnosai_crew_state_to_value(state);
+    assert(bayan_json_v_obj_get(sv, "profile") != 0, "set profile is emitted");
+
+    var state_back = agnosai_crew_state_from_value(sv);
+    assert(state_back != 0, "crew state round-trips");
+    assert_eq(agnosai_uuid_eq(agnosai_crew_state_crew_id(state_back), agnosai_crew_id(c)), 1,
+    "state crew_id survives");
+    assert_eq(agnosai_crew_state_status(state_back), AGNOSAI_CREW_RUNNING, "state status survives");
+    assert_eq(vec_len(agnosai_crew_state_results(state_back)), 1, "state results survive");
+    assert_eq(agnosai_task_result_status(vec_get(agnosai_crew_state_results(state_back), 0)),
+    AGNOSAI_STATUS_COMPLETED, "nested result status survives");
+    assert(agnosai_crew_state_profile(state_back) != 0, "state profile survives");
+    assert_eq(agnosai_crew_profile_cost_micro_usd(agnosai_crew_state_profile(state_back)), 2500,
+    "nested profile cost survives");
+    assert_eq(agnosai_crew_state_from_value(bayan_json_v_obj_new()), 0, "state without a crew_id is rejected");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

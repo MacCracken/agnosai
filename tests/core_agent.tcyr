@@ -1,0 +1,220 @@
+# =========================================================================
+# core_agent.tcyr — parity tests for src/core_agent.cyr
+#
+# Oracle: the 12 #[cfg(test)] tests in rust-old/src/core/agent.rs.
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/id.cyr"
+include "src/core_message.cyr"
+include "src/core_resource.cyr"
+include "src/core_agent.cyr"
+include "tests/test_helpers.cyr"
+
+# A vec of two tool-name strings.
+fn _t_tools2(a, b): i64 {
+    var v = vec_new();
+    vec_push(v, a);
+    vec_push(v, b);
+    return v;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("core_agent");
+
+    # --- default_complexity_is_medium ---
+    assert(str_eq(agnosai_default_complexity(), str_from("medium")) == 1, "default complexity is medium");
+
+    # --- new() defaults, incl. name mirroring agent_key ---
+    var a0 = agnosai_agent_new(str_from("min"), str_from("worker"), str_from("do work"));
+    assert(str_eq(agnosai_agent_key(a0), str_from("min")) == 1, "agent_key set");
+    assert(str_eq(agnosai_agent_name(a0), str_from("min")) == 1, "name defaults to agent_key");
+    assert(str_eq(agnosai_agent_complexity(a0), str_from("medium")) == 1, "complexity defaults to medium");
+    assert_eq(agnosai_agent_backstory(a0), 0, "backstory defaults to none");
+    assert_eq(agnosai_agent_domain(a0), 0, "domain defaults to none");
+    assert_eq(vec_len(agnosai_agent_tools(a0)), 0, "tools default to empty");
+    assert_eq(agnosai_agent_llm_model(a0), 0, "llm_model defaults to none");
+    assert_eq(agnosai_agent_gpu_required(a0), 0, "gpu_required defaults to false");
+    assert_eq(agnosai_agent_gpu_preferred(a0), 0, "gpu_preferred defaults to false");
+    assert_eq(agnosai_agent_gpu_memory_min_mb(a0), AGNOSAI_NO_LIMIT, "gpu_memory_min_mb defaults to none");
+    assert_eq(agnosai_agent_hardware(a0), 0, "hardware defaults to none");
+
+    # --- builders ---
+    agnosai_agent_with_name(a0, str_from("Minimal"));
+    agnosai_agent_with_domain(a0, str_from("quality"));
+    agnosai_agent_with_tools(a0, _t_tools2(str_from("tool_a"), str_from("tool_b")));
+    assert(str_eq(agnosai_agent_name(a0), str_from("Minimal")) == 1, "with_name overrides");
+    assert(str_eq(agnosai_agent_domain(a0), str_from("quality")) == 1, "with_domain");
+    assert_eq(vec_len(agnosai_agent_tools(a0)), 2, "with_tools");
+
+    # --- agent_state_default_is_idle + snake_case spellings ---
+    assert_eq(AGNOSAI_AGENT_IDLE, 0, "idle is the default state");
+    assert(str_eq(agnosai_agent_state_to_wire(AGNOSAI_AGENT_IDLE), str_from("idle")) == 1, "wire idle");
+    assert(str_eq(agnosai_agent_state_to_wire(AGNOSAI_AGENT_ASSIGNED), str_from("assigned")) == 1, "wire assigned");
+    assert(str_eq(agnosai_agent_state_to_wire(AGNOSAI_AGENT_WORKING), str_from("working")) == 1, "wire working");
+    assert(str_eq(agnosai_agent_state_to_wire(AGNOSAI_AGENT_BLOCKED), str_from("blocked")) == 1, "wire blocked");
+    assert(str_eq(agnosai_agent_state_to_wire(AGNOSAI_AGENT_COMPLETED), str_from("completed")) == 1, "wire completed");
+    assert(str_eq(agnosai_agent_state_to_wire(AGNOSAI_AGENT_FAILED), str_from("failed")) == 1, "wire failed");
+
+    var st_ok = 1;
+    for (var s = AGNOSAI_AGENT_IDLE; s <= AGNOSAI_AGENT_FAILED; s = s + 1) {
+        if (agnosai_agent_state_from_wire(agnosai_agent_state_to_wire(s)) != s) { st_ok = 0; }
+    }
+    assert(st_ok, "every agent state round-trips through its wire spelling");
+    assert_eq(agnosai_agent_state_from_wire(str_from("bogus")), AGNOSAI_AGENT_IDLE, "unknown state -> idle");
+
+    # --- serde_round_trip ---
+    var full = agnosai_agent_new(str_from("test-agent"), str_from("tester"), str_from("test things"));
+    agnosai_agent_with_name(full, str_from("Test Agent"));
+    agnosai_agent_with_backstory(full, str_from("a backstory"));
+    agnosai_agent_with_domain(full, str_from("quality"));
+    agnosai_agent_with_tools(full, _t_tools2(str_from("tool_a"), str_from("tool_b")));
+    agnosai_agent_with_complexity(full, str_from("high"));
+    agnosai_agent_with_llm_model(full, str_from("gpt-4"));
+    agnosai_agent_with_gpu(full, 1, 0, 4096);
+
+    var back = agnosai_agent_from_json(agnosai_agent_to_json(full));
+    assert(back != 0, "agent round-trips through JSON");
+    assert(str_eq(agnosai_agent_key(back), str_from("test-agent")) == 1, "agent_key survives");
+    assert(str_eq(agnosai_agent_name(back), str_from("Test Agent")) == 1, "name survives");
+    assert(str_eq(agnosai_agent_role(back), str_from("tester")) == 1, "role survives");
+    assert(str_eq(agnosai_agent_goal(back), str_from("test things")) == 1, "goal survives");
+    assert(str_eq(agnosai_agent_backstory(back), str_from("a backstory")) == 1, "backstory survives");
+    assert(str_eq(agnosai_agent_domain(back), str_from("quality")) == 1, "domain survives");
+    assert_eq(vec_len(agnosai_agent_tools(back)), 2, "tools survive");
+    assert(str_eq(vec_get(agnosai_agent_tools(back), 0), str_from("tool_a")) == 1, "tool 0 survives");
+    assert(str_eq(agnosai_agent_complexity(back), str_from("high")) == 1, "complexity survives");
+    assert(str_eq(agnosai_agent_llm_model(back), str_from("gpt-4")) == 1, "llm_model survives");
+    assert_eq(agnosai_agent_gpu_required(back), 1, "gpu_required survives");
+    assert_eq(agnosai_agent_gpu_preferred(back), 0, "gpu_preferred survives");
+    assert_eq(agnosai_agent_gpu_memory_min_mb(back), 4096, "gpu_memory_min_mb survives");
+
+    # --- from_json_valid_full ---
+    var js_head = str_cat(
+    str_from("{\"agent_key\":\"qa-lead\",\"name\":\"QA Lead\",\"role\":\"lead tester\","),
+    str_from("\"goal\":\"ensure quality\",\"backstory\":\"experienced tester\",\"domain\":\"quality\","));
+    var js_tail = str_cat(
+    str_from("\"tools\":[\"selenium\"],\"complexity\":\"high\",\"llm_model\":\"claude-3\","),
+    str_from("\"gpu_required\":false,\"gpu_preferred\":true,\"gpu_memory_min_mb\":2048}"));
+    var js = str_cat(js_head, js_tail);
+    var qa = agnosai_agent_from_json(js);
+    assert(qa != 0, "full JSON parses");
+    assert(str_eq(agnosai_agent_key(qa), str_from("qa-lead")) == 1, "parsed agent_key");
+    assert(str_eq(agnosai_agent_name(qa), str_from("QA Lead")) == 1, "parsed name");
+    assert(str_eq(agnosai_agent_backstory(qa), str_from("experienced tester")) == 1, "parsed backstory");
+    assert_eq(vec_len(agnosai_agent_tools(qa)), 1, "parsed tools");
+    assert(str_eq(agnosai_agent_complexity(qa), str_from("high")) == 1, "parsed complexity");
+    assert(str_eq(agnosai_agent_llm_model(qa), str_from("claude-3")) == 1, "parsed llm_model");
+    assert_eq(agnosai_agent_gpu_required(qa), 0, "parsed gpu_required false");
+    assert_eq(agnosai_agent_gpu_preferred(qa), 1, "parsed gpu_preferred true");
+    assert_eq(agnosai_agent_gpu_memory_min_mb(qa), 2048, "parsed gpu_memory_min_mb");
+
+    # --- from_json_minimal_uses_defaults ---
+    var minimal = agnosai_agent_from_json(
+    str_from("{\"agent_key\":\"min\",\"name\":\"Minimal\",\"role\":\"worker\",\"goal\":\"do work\"}"));
+    assert(minimal != 0, "minimal JSON parses");
+    assert(str_eq(agnosai_agent_complexity(minimal), str_from("medium")) == 1, "missing complexity -> medium");
+    assert_eq(agnosai_agent_backstory(minimal), 0, "missing backstory -> none");
+    assert_eq(vec_len(agnosai_agent_tools(minimal)), 0, "missing tools -> empty");
+    assert_eq(agnosai_agent_gpu_required(minimal), 0, "missing gpu_required -> false");
+    assert_eq(agnosai_agent_gpu_memory_min_mb(minimal), AGNOSAI_NO_LIMIT, "missing gpu memory -> none");
+
+    # --- from_json_invalid_returns_error / missing required field ---
+    assert_eq(agnosai_agent_from_json(str_from("not json")), 0, "invalid JSON is rejected");
+    assert_eq(agnosai_agent_from_json(str_from("{\"agent_key\":\"k\",\"name\":\"N\"}")), 0,
+    "missing role and goal is rejected");
+
+    # --- hardware_requirement_with_explicit_hardware_field ---
+    var hw_accels = vec_new();
+    vec_push(hw_accels, AGNOSAI_ACCEL_TPU);
+    var explicit = agnosai_hw_requirement_with_min_cpu_cores(agnosai_hw_requirement_with_min_devices(
+    agnosai_hw_requirement_with_min_memory(agnosai_hw_requirement_for_accelerators(hw_accels), 32768), 2), 0);
+    var hw_agent = agnosai_agent_new(str_from("hw-agent"), str_from("worker"), str_from("do work"));
+    agnosai_agent_with_gpu(hw_agent, 1, 0, 4096);
+    agnosai_agent_with_hardware(hw_agent, explicit);
+    var req = agnosai_agent_hardware_requirement(hw_agent);
+    assert_eq(vec_len(agnosai_hw_requirement_accelerators(req)), 1, "explicit hardware wins: 1 accelerator");
+    assert_eq(vec_get(agnosai_hw_requirement_accelerators(req), 0), AGNOSAI_ACCEL_TPU, "explicit accelerator is tpu");
+    assert_eq(agnosai_hw_requirement_min_memory_mb(req), 32768, "explicit min memory wins over legacy 4096");
+    assert_eq(agnosai_hw_requirement_min_device_count(req), 2, "explicit min device count");
+
+    # --- hardware_requirement_falls_back_to_legacy_gpu_fields ---
+    var legacy = agnosai_agent_new(str_from("legacy-gpu"), str_from("worker"), str_from("do work"));
+    agnosai_agent_with_gpu(legacy, 1, 1, 8192);
+    var lreq = agnosai_agent_hardware_requirement(legacy);
+    assert_eq(vec_len(agnosai_hw_requirement_accelerators(lreq)), 2, "legacy fallback asks for 2 accelerators");
+    var laccels = agnosai_hw_requirement_accelerators(lreq);
+    assert_eq(vec_get(laccels, 0), AGNOSAI_ACCEL_CUDA, "legacy accelerator 0 is cuda");
+    assert_eq(vec_get(laccels, 1), AGNOSAI_ACCEL_ROCM, "legacy accelerator 1 is rocm");
+    assert_eq(agnosai_hw_requirement_min_memory_mb(lreq), 8192, "legacy min memory applied");
+
+    # --- hardware_requirement_no_gpu_returns_empty ---
+    var cpu_only = agnosai_agent_new(str_from("cpu-only"), str_from("worker"), str_from("do work"));
+    var creq = agnosai_agent_hardware_requirement(cpu_only);
+    assert_eq(vec_len(agnosai_hw_requirement_accelerators(creq)), 0, "cpu-only asks for no accelerators");
+    assert_eq(agnosai_hw_requirement_min_memory_mb(creq), 0, "cpu-only min memory 0");
+    assert_eq(agnosai_hw_requirement_min_device_count(creq), 0, "cpu-only min devices 0");
+    assert_eq(agnosai_hw_requirement_min_cpu_cores(creq), 0, "cpu-only min cores 0");
+
+    # a min-memory hint without gpu_required is ignored, matching the oracle's
+    # branch placement
+    var hint_only = agnosai_agent_new(str_from("hint"), str_from("worker"), str_from("do work"));
+    agnosai_agent_with_gpu(hint_only, 0, 0, 8192);
+    assert_eq(agnosai_hw_requirement_min_memory_mb(agnosai_agent_hardware_requirement(hint_only)), 0,
+    "gpu_memory_min_mb is ignored when gpu_required is false");
+
+    # --- serde_agent_with_hardware_field_round_trips ---
+    var rt_accels = vec_new();
+    vec_push(rt_accels, AGNOSAI_ACCEL_CUDA);
+    vec_push(rt_accels, AGNOSAI_ACCEL_TPU);
+    var rt_hw = agnosai_hw_requirement_with_min_cpu_cores(agnosai_hw_requirement_with_min_devices(
+    agnosai_hw_requirement_with_min_memory(agnosai_hw_requirement_for_accelerators(rt_accels), 16384), 1), 4);
+    var rt_agent = agnosai_agent_new(str_from("hw-rt"), str_from("worker"), str_from("do work"));
+    agnosai_agent_with_hardware(rt_agent, rt_hw);
+    var rt_back = agnosai_agent_from_json(agnosai_agent_to_json(rt_agent));
+    assert(rt_back != 0, "agent with hardware round-trips");
+    var rt_hw_back = agnosai_agent_hardware(rt_back);
+    assert(rt_hw_back != 0, "hardware field survives");
+    assert_eq(vec_len(agnosai_hw_requirement_accelerators(rt_hw_back)), 2, "hardware accelerators survive");
+    assert_eq(agnosai_hw_requirement_min_memory_mb(rt_hw_back), 16384, "hardware min memory survives");
+    assert_eq(agnosai_hw_requirement_min_device_count(rt_hw_back), 1, "hardware min devices survives");
+    assert_eq(agnosai_hw_requirement_min_cpu_cores(rt_hw_back), 4, "hardware min cores survives");
+
+    # --- serde_agent_without_hardware_field_backward_compat ---
+    var old_js = str_cat(str_from("{\"agent_key\":\"old-style\",\"name\":\"Old Style\",\"role\":\"worker\","),
+    str_from("\"goal\":\"do work\",\"gpu_required\":true,\"gpu_memory_min_mb\":4096}"));
+    var old = agnosai_agent_from_json(old_js);
+    assert(old != 0, "old-style JSON parses");
+    assert_eq(agnosai_agent_hardware(old), 0, "old-style has no hardware field");
+    assert_eq(agnosai_agent_gpu_required(old), 1, "old-style gpu_required");
+    assert_eq(agnosai_agent_gpu_memory_min_mb(old), 4096, "old-style gpu memory");
+    var oreq = agnosai_agent_hardware_requirement(old);
+    assert_eq(vec_len(agnosai_hw_requirement_accelerators(oreq)), 2, "old-style legacy fallback still works");
+    assert_eq(agnosai_hw_requirement_min_memory_mb(oreq), 4096, "old-style legacy memory");
+
+    # --- personality stays on the wire as null (bhava is post-v2) ---
+    var pv = agnosai_agent_to_value(a0);
+    assert(bayan_json_v_obj_get(pv, "personality") != 0, "personality is present on the wire");
+    assert_eq(bayan_json_v_is_null(bayan_json_v_obj_get(pv, "personality")), 1, "personality is null");
+    var pers_js = str_cat(str_from("{\"agent_key\":\"p\",\"name\":\"P\",\"role\":\"r\",\"goal\":\"g\","),
+    str_from("\"personality\":{\"openness\":0.8}}"));
+    var with_pers = agnosai_agent_from_json(pers_js);
+    assert(agnosai_agent_from_value(bayan_json_v_parse_str(str_data(pers_js), str_len(pers_js))) != 0,
+    "agnosai_agent_from_value accepts the same object");
+    assert(with_pers != 0, "an incoming personality is accepted and ignored");
+
+    # --- field order matches serde's declaration order ---
+    assert(str_eq(bayan_json_v_obj_key(pv, 0), str_from("agent_key")) == 1, "field 0 is agent_key");
+    assert(str_eq(bayan_json_v_obj_key(pv, 3), str_from("goal")) == 1, "field 3 is goal");
+    assert(str_eq(bayan_json_v_obj_key(pv, 13), str_from("personality")) == 1, "field 13 is personality");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

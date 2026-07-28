@@ -1,0 +1,249 @@
+# =========================================================================
+# core_resource.tcyr — parity tests for src/core_resource.cyr
+#
+# Oracle: the 19 non-hwaccel #[cfg(test)] tests in
+# rust-old/src/core/resource.rs. The 9 `#[cfg(feature = "hwaccel")]` tests
+# defer with that feature — it is not in the default build.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/id.cyr"
+include "src/core_message.cyr"
+include "src/core_resource.cyr"
+include "tests/test_helpers.cyr"
+
+# A vec holding one accelerator type.
+fn _t_accels1(a): i64 {
+    var v = vec_new();
+    vec_push(v, a);
+    return v;
+}
+
+# A vec holding two accelerator types.
+fn _t_accels2(a, b): i64 {
+    var v = vec_new();
+    vec_push(v, a);
+    vec_push(v, b);
+    return v;
+}
+
+# A vec holding one device.
+fn _t_devices1(d): i64 {
+    var v = vec_new();
+    vec_push(v, d);
+    return v;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("core_resource");
+
+    # --- resource_budget_default_values ---
+    var bd = agnosai_resource_budget_default();
+    assert_eq(agnosai_resource_budget_max_tokens(bd), AGNOSAI_NO_LIMIT, "default max_tokens is none");
+    assert_eq(agnosai_resource_budget_max_cost_micro_usd(bd), AGNOSAI_NO_LIMIT, "default max_cost is none");
+    assert_eq(agnosai_resource_budget_max_duration_secs(bd), AGNOSAI_NO_LIMIT, "default duration is none");
+    assert_eq(agnosai_resource_budget_max_concurrent_tasks(bd), 10, "default concurrency is 10");
+
+    # --- money is integer micro-USD, and the wire form matches serde's f64 ---
+    var b2 = agnosai_resource_budget_new(1000, 2500, 60, 4);
+    assert_eq(agnosai_resource_budget_max_cost_micro_usd(b2), 2500, "cost stored as micro-USD");
+    var cost_v = bayan_json_v_obj_get(agnosai_resource_budget_to_value(b2), "max_cost_usd");
+    assert(str_eq(bayan_json_v_build(cost_v), str_from("0.0025")) == 1,
+    "2500 micro-USD renders as 0.0025, byte-identical to serde");
+
+    var whole = agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, 5000000, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT);
+    var whole_v = bayan_json_v_obj_get(agnosai_resource_budget_to_value(whole), "max_cost_usd");
+    assert(str_eq(bayan_json_v_build(whole_v), str_from("5.0")) == 1,
+    "5000000 micro-USD renders as 5.0, matching serde");
+    _t_assert_f64(agnosai_micro_usd_to_f64(2500), f64_div(f64_from(25), f64_from(10000)),
+    "agnosai_micro_usd_to_f64 converts to dollars");
+    assert_eq(agnosai_f64_to_micro_usd(f64_div(f64_from(25), f64_from(10000))), 2500,
+    "agnosai_f64_to_micro_usd rounds back to the exact micro amount");
+
+    # micro-USD arithmetic is exact where repeated f64 addition would drift
+    var acc = 0;
+    for (var i = 0; i < 10; i = i + 1) { acc = acc + 100000; }
+    assert_eq(acc, 1000000, "ten 0.1 USD charges sum to exactly 1.000000 USD");
+
+    # --- resource_budget_serde_round_trip ---
+    var b2_back = agnosai_resource_budget_from_value(agnosai_resource_budget_to_value(b2));
+    assert_eq(agnosai_resource_budget_max_tokens(b2_back), 1000, "max_tokens survives");
+    assert_eq(agnosai_resource_budget_max_cost_micro_usd(b2_back), 2500, "micro-USD cost survives exactly");
+    assert_eq(agnosai_resource_budget_max_duration_secs(b2_back), 60, "duration survives");
+    assert_eq(agnosai_resource_budget_max_concurrent_tasks(b2_back), 4, "concurrency survives");
+
+    # --- resource_budget_serde_with_none_fields ---
+    var bnone = agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT,
+    AGNOSAI_NO_LIMIT);
+    var bnone_v = agnosai_resource_budget_to_value(bnone);
+    assert_eq(bayan_json_v_is_null(bayan_json_v_obj_get(bnone_v, "max_tokens")), 1, "unset max_tokens is null");
+    assert_eq(bayan_json_v_is_null(bayan_json_v_obj_get(bnone_v, "max_cost_usd")), 1, "unset cost is null");
+    var bnone_back = agnosai_resource_budget_from_value(bnone_v);
+    assert_eq(agnosai_resource_budget_max_tokens(bnone_back), AGNOSAI_NO_LIMIT, "null max_tokens round-trips");
+    assert_eq(agnosai_resource_budget_max_cost_micro_usd(bnone_back), AGNOSAI_NO_LIMIT, "null cost round-trips");
+
+    # --- accelerator_type_serde_round_trip_all_variants ---
+    var all_ok = 1;
+    for (var a = AGNOSAI_ACCEL_CPU; a <= AGNOSAI_ACCEL_TPU; a = a + 1) {
+        if (agnosai_accelerator_type_from_wire(agnosai_accelerator_type_to_wire(a)) != a) { all_ok = 0; }
+    }
+    assert(all_ok, "every accelerator type round-trips through its wire spelling");
+    assert(str_eq(agnosai_accelerator_type_to_wire(AGNOSAI_ACCEL_CUDA), str_from("cuda")) == 1, "wire cuda");
+    assert(str_eq(agnosai_accelerator_type_to_wire(AGNOSAI_ACCEL_ROCM), str_from("rocm")) == 1, "wire rocm");
+    assert(str_eq(agnosai_accelerator_family_to_wire(AGNOSAI_FAMILY_AI_ASIC), str_from("ai_asic")) == 1,
+    "AiAsic renders snake_case as ai_asic");
+
+    var fam_ok = 1;
+    for (var g = AGNOSAI_FAMILY_CPU; g <= AGNOSAI_FAMILY_AI_ASIC; g = g + 1) {
+        if (agnosai_accelerator_family_from_wire(agnosai_accelerator_family_to_wire(g)) != g) { fam_ok = 0; }
+    }
+    assert(fam_ok, "every accelerator family round-trips");
+
+    # --- accelerator_type_family / is_gpu ---
+    assert_eq(agnosai_accelerator_family_of(AGNOSAI_ACCEL_CPU), AGNOSAI_FAMILY_CPU, "cpu family");
+    assert_eq(agnosai_accelerator_family_of(AGNOSAI_ACCEL_CUDA), AGNOSAI_FAMILY_GPU, "cuda is gpu family");
+    assert_eq(agnosai_accelerator_family_of(AGNOSAI_ACCEL_ROCM), AGNOSAI_FAMILY_GPU, "rocm is gpu family");
+    assert_eq(agnosai_accelerator_family_of(AGNOSAI_ACCEL_METAL), AGNOSAI_FAMILY_GPU, "metal is gpu family");
+    assert_eq(agnosai_accelerator_family_of(AGNOSAI_ACCEL_VULKAN), AGNOSAI_FAMILY_GPU, "vulkan is gpu family");
+    assert_eq(agnosai_accelerator_family_of(AGNOSAI_ACCEL_TPU), AGNOSAI_FAMILY_TPU, "tpu family");
+    assert_eq(agnosai_accelerator_is_gpu(AGNOSAI_ACCEL_CUDA), 1, "cuda is_gpu");
+    assert_eq(agnosai_accelerator_is_gpu(AGNOSAI_ACCEL_CPU), 0, "cpu is not gpu");
+    assert_eq(agnosai_accelerator_is_gpu(AGNOSAI_ACCEL_TPU), 0, "tpu is not gpu");
+    assert_eq(agnosai_accelerator_is_tpu(AGNOSAI_ACCEL_TPU), 1, "tpu is_tpu");
+
+    # --- compute_device_serde_round_trip ---
+    var dev = agnosai_compute_device_new(0, str_from("NVIDIA A100"), AGNOSAI_ACCEL_CUDA, 40960);
+    assert_eq(agnosai_compute_device_memory_available_mb(dev), 40960, "available defaults to total");
+    agnosai_compute_device_with_available(dev, 20480);
+    assert_eq(agnosai_compute_device_memory_available_mb(dev), 20480, "with_available overrides");
+    var dev_back = agnosai_compute_device_from_value(agnosai_compute_device_to_value(dev));
+    assert(dev_back != 0, "device round-trips");
+    assert_eq(agnosai_compute_device_index(dev_back), 0, "device index survives");
+    assert(str_eq(agnosai_compute_device_name(dev_back), str_from("NVIDIA A100")) == 1, "device name survives");
+    assert_eq(agnosai_compute_device_accelerator(dev_back), AGNOSAI_ACCEL_CUDA, "device accelerator survives");
+    assert_eq(agnosai_compute_device_memory_total_mb(dev_back), 40960, "device total memory survives");
+    assert_eq(agnosai_compute_device_memory_available_mb(dev_back), 20480, "device available memory survives");
+
+    # --- hardware_requirement_default_is_empty ---
+    var req0 = agnosai_hw_requirement_new();
+    assert_eq(vec_len(agnosai_hw_requirement_accelerators(req0)), 0, "default accelerators empty");
+    assert_eq(agnosai_hw_requirement_min_memory_mb(req0), 0, "default min memory 0");
+    assert_eq(agnosai_hw_requirement_min_device_count(req0), 0, "default min devices 0");
+    assert_eq(agnosai_hw_requirement_min_cpu_cores(req0), 0, "default min cores 0");
+    assert_eq(agnosai_hw_requirement_required_family(req0), AGNOSAI_NO_LIMIT, "default family unset");
+
+    # required_family is skip_serializing_if none — omitted, not null
+    var req0_v = agnosai_hw_requirement_to_value(req0);
+    assert_eq(bayan_json_v_obj_get(req0_v, "required_family"), 0, "unset required_family is omitted entirely");
+    var reqf = agnosai_hw_requirement_with_family(agnosai_hw_requirement_new(), AGNOSAI_FAMILY_GPU);
+    assert(bayan_json_v_obj_get(agnosai_hw_requirement_to_value(reqf), "required_family") != 0,
+    "set required_family is emitted");
+
+    # --- hardware_inventory_satisfies_cpu_only_requirement ---
+    var cpu_inv = agnosai_hw_inventory_new(8, 16384, vec_new());
+    assert_eq(agnosai_hw_inventory_satisfies(cpu_inv, agnosai_hw_requirement_new()), 1,
+    "empty requirement is satisfied by a CPU-only node");
+    var need4 = agnosai_hw_requirement_with_min_cpu_cores(agnosai_hw_requirement_new(), 4);
+    assert_eq(agnosai_hw_inventory_satisfies(cpu_inv, need4), 1, "8 cores satisfies min 4");
+    var need16 = agnosai_hw_requirement_with_min_cpu_cores(agnosai_hw_requirement_new(), 16);
+    assert_eq(agnosai_hw_inventory_satisfies(cpu_inv, need16), 0, "8 cores fails min 16");
+
+    # --- hardware_inventory_satisfies_cuda_gpu_requirement ---
+    var cuda_dev = agnosai_compute_device_new(0, str_from("A100"), AGNOSAI_ACCEL_CUDA, 40960);
+    var gpu_inv = agnosai_hw_inventory_new(16, 65536, _t_devices1(cuda_dev));
+    var need_cuda = agnosai_hw_requirement_for_accelerators(_t_accels1(AGNOSAI_ACCEL_CUDA));
+    assert_eq(agnosai_hw_inventory_satisfies(gpu_inv, need_cuda), 1, "cuda node satisfies a cuda requirement");
+    var need_tpu = agnosai_hw_requirement_for_accelerators(_t_accels1(AGNOSAI_ACCEL_TPU));
+    assert_eq(agnosai_hw_inventory_satisfies(gpu_inv, need_tpu), 0, "cuda node fails a tpu requirement");
+    assert_eq(agnosai_hw_inventory_satisfies(cpu_inv, need_cuda), 0, "cpu-only node fails a cuda requirement");
+
+    # --- min_memory_mb / min_device_count checks ---
+    var big = agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_for_accelerators(_t_accels1(AGNOSAI_ACCEL_CUDA)), 80000);
+    assert_eq(agnosai_hw_inventory_satisfies(gpu_inv, big), 0, "40GB device fails an 80GB requirement");
+    var fits = agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_for_accelerators(_t_accels1(AGNOSAI_ACCEL_CUDA)), 32768);
+    assert_eq(agnosai_hw_inventory_satisfies(gpu_inv, fits), 1, "40GB device satisfies a 32GB requirement");
+    var two = agnosai_hw_requirement_with_min_devices(
+    agnosai_hw_requirement_for_accelerators(_t_accels1(AGNOSAI_ACCEL_CUDA)), 2);
+    assert_eq(agnosai_hw_inventory_satisfies(gpu_inv, two), 0, "one device fails a min-2 requirement");
+
+    # --- satisfies_with_required_family_any_gpu ---
+    var rocm_dev = agnosai_compute_device_new(1, str_from("MI300"), AGNOSAI_ACCEL_ROCM, 65536);
+    var mixed = vec_new();
+    vec_push(mixed, cuda_dev);
+    vec_push(mixed, rocm_dev);
+    var mixed_inv = agnosai_hw_inventory_new(32, 131072, mixed);
+    var any_gpu = agnosai_hw_requirement_with_family(agnosai_hw_requirement_new(), AGNOSAI_FAMILY_GPU);
+    assert_eq(agnosai_hw_inventory_satisfies(mixed_inv, any_gpu), 1, "any-GPU matches without enumerating types");
+    assert_eq(agnosai_hw_inventory_satisfies(cpu_inv, any_gpu), 0, "any-GPU fails on a CPU-only node");
+    var any_tpu = agnosai_hw_requirement_with_family(agnosai_hw_requirement_new(), AGNOSAI_FAMILY_TPU);
+    assert_eq(agnosai_hw_inventory_satisfies(mixed_inv, any_tpu), 0, "any-TPU fails with only GPUs present");
+
+    # family matching ignores the accelerators list entirely (the oracle returns
+    # from the family branch before reaching type matching)
+    var fam_over_type = agnosai_hw_requirement_with_family(
+    agnosai_hw_requirement_for_accelerators(_t_accels1(AGNOSAI_ACCEL_TPU)), AGNOSAI_FAMILY_GPU);
+    assert_eq(agnosai_hw_inventory_satisfies(mixed_inv, fam_over_type), 1,
+    "required_family short-circuits the accelerators list");
+
+    # --- satisfies_family_with_memory_requirement ---
+    var fam_mem = agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_with_family(agnosai_hw_requirement_new(), AGNOSAI_FAMILY_GPU), 65536);
+    assert_eq(agnosai_hw_inventory_satisfies(mixed_inv, fam_mem), 1,
+    "the 64GB ROCm device meets the family memory bar");
+    var fam_mem_big = agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_with_family(agnosai_hw_requirement_new(), AGNOSAI_FAMILY_GPU), 131072);
+    assert_eq(agnosai_hw_inventory_satisfies(mixed_inv, fam_mem_big), 0, "no single GPU meets a 128GB bar");
+    var fam_count = agnosai_hw_requirement_with_min_devices(
+    agnosai_hw_requirement_with_family(agnosai_hw_requirement_new(), AGNOSAI_FAMILY_GPU), 3);
+    assert_eq(agnosai_hw_inventory_satisfies(mixed_inv, fam_count), 0, "two GPUs fail a min-3 family requirement");
+
+    # --- hardware_inventory_satisfies_empty_accelerators_any_ok ---
+    var empty_req = agnosai_hw_requirement_for_accelerators(vec_new());
+    assert_eq(agnosai_hw_inventory_satisfies(mixed_inv, empty_req), 1, "an empty accelerator list matches anything");
+
+    # --- devices_of_type / total_memory_mb ---
+    assert_eq(vec_len(agnosai_hw_inventory_devices_of_type(mixed_inv, AGNOSAI_ACCEL_CUDA)), 1,
+    "one cuda device found");
+    assert_eq(vec_len(agnosai_hw_inventory_devices_of_type(mixed_inv, AGNOSAI_ACCEL_TPU)), 0, "no tpu devices");
+    assert_eq(agnosai_hw_inventory_total_memory_mb(mixed_inv, AGNOSAI_ACCEL_CUDA), 40960, "cuda memory total");
+    assert_eq(agnosai_hw_inventory_total_memory_mb(mixed_inv, AGNOSAI_ACCEL_ROCM), 65536, "rocm memory total");
+    assert_eq(agnosai_hw_inventory_total_memory_mb(mixed_inv, AGNOSAI_ACCEL_TPU), 0, "absent type totals 0");
+
+    # --- hardware requirement + inventory round-trips ---
+    var rreq = agnosai_hw_requirement_with_min_cpu_cores(agnosai_hw_requirement_with_min_devices(
+    agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_for_accelerators(_t_accels2(AGNOSAI_ACCEL_CUDA, AGNOSAI_ACCEL_TPU)), 16384), 1), 4);
+    var rreq_back = agnosai_hw_requirement_from_value(agnosai_hw_requirement_to_value(rreq));
+    assert_eq(vec_len(agnosai_hw_requirement_accelerators(rreq_back)), 2, "2 accelerators survive");
+    assert_eq(agnosai_hw_requirement_min_memory_mb(rreq_back), 16384, "min memory survives");
+    assert_eq(agnosai_hw_requirement_min_device_count(rreq_back), 1, "min device count survives");
+    assert_eq(agnosai_hw_requirement_min_cpu_cores(rreq_back), 4, "min cpu cores survives");
+    assert_eq(agnosai_hw_requirement_required_family(rreq_back), AGNOSAI_NO_LIMIT, "omitted family stays unset");
+
+    var inv_back = agnosai_hw_inventory_from_value(agnosai_hw_inventory_to_value(mixed_inv));
+    assert_eq(agnosai_hw_inventory_cpu_cores(inv_back), 32, "inventory cpu cores survive");
+    assert_eq(agnosai_hw_inventory_memory_total_mb(inv_back), 131072, "inventory memory survives");
+    assert_eq(vec_len(agnosai_hw_inventory_devices(inv_back)), 2, "inventory devices survive");
+
+    # --- gpu_device_serde_round_trip ---
+    var gpu = agnosai_gpu_device_new(0, str_from("NVIDIA A100"), 40960, 20480);
+    var gpu_back = agnosai_gpu_device_from_value(agnosai_gpu_device_to_value(gpu));
+    assert(gpu_back != 0, "gpu device round-trips");
+    assert_eq(agnosai_gpu_device_index(gpu_back), 0, "gpu index survives");
+    assert(str_eq(agnosai_gpu_device_name(gpu_back), str_from("NVIDIA A100")) == 1, "gpu name survives");
+    assert_eq(agnosai_gpu_device_vram_total_mb(gpu_back), 40960, "gpu vram total survives");
+    assert_eq(agnosai_gpu_device_vram_available_mb(gpu_back), 20480, "gpu vram available survives");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

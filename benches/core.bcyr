@@ -1,0 +1,206 @@
+# =========================================================================
+# core.bcyr — benchmarks for the core group.
+#
+# No oracle bench file: rust-old/benches/ has no core.rs. These measure the
+# paths core actually gets hammered on — UUID minting and rendering, and the
+# JSON serialize/parse round trips every request boundary crosses.
+#
+# These numbers start the CYRIUS baseline. They are NOT comparable to
+# rust-old/bench-history.csv. See CLAUDE.md.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/id.cyr"
+include "src/core.cyr"
+
+# A representative populated task: an assigned agent, a dependency, and one
+# context entry.
+fn _b_sample_task(): i64 {
+    var t = agnosai_task_new(str_from("analyze quarterly revenue trends"));
+    agnosai_task_with_expected_output(t, str_from("a markdown table"));
+    agnosai_task_with_priority(t, AGNOSAI_PRIORITY_HIGH);
+    agnosai_task_with_agent(t, agnosai_uuid_v4());
+    agnosai_task_with_dependency(t, agnosai_uuid_v4());
+    agnosai_task_with_context(t, str_from("quarter"), bayan_json_v_str_new(str_from("Q4")));
+    return t;
+}
+
+# A representative agent definition with tools and hardware requirements.
+fn _b_sample_agent(): i64 {
+    var a = agnosai_agent_new(str_from("analyst"), str_from("data analyst"), str_from("analyze data"));
+    agnosai_agent_with_name(a, str_from("Analyst"));
+    agnosai_agent_with_backstory(a, str_from("ten years in financial reporting"));
+    agnosai_agent_with_domain(a, str_from("quality"));
+    var tools = vec_new();
+    vec_push(tools, str_from("sql"));
+    vec_push(tools, str_from("plot"));
+    agnosai_agent_with_tools(a, tools);
+    var accels = vec_new();
+    vec_push(accels, AGNOSAI_ACCEL_CUDA);
+    agnosai_agent_with_hardware(a, agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_for_accelerators(accels), 16384));
+    return a;
+}
+
+# A crew of `n` agents and `n` tasks — the shape a crew-spec POST carries.
+fn _b_sample_crew(n): i64 {
+    var c = agnosai_crew_new(str_from("analysis-crew"));
+    var agents = vec_new();
+    var tasks = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(agents, _b_sample_agent());
+        vec_push(tasks, _b_sample_task());
+    }
+    agnosai_crew_with_agents(c, agents);
+    agnosai_crew_with_tasks(c, tasks);
+    return c;
+}
+
+# UUID v4 minting — every task, message and crew pays this once.
+fn _b_uuid_v4(): i64 {
+    var n = 200000;
+    var b = bench_new("uuid_v4_generate");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_uuid_v4(); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# UUID rendering — on every serialize of every id-bearing struct.
+fn _b_uuid_to_str(): i64 {
+    var u = agnosai_uuid_v4();
+    var n = 500000;
+    var b = bench_new("uuid_to_str");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_uuid_to_str(u); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# UUID parsing — on every deserialize.
+fn _b_uuid_parse(): i64 {
+    var s = agnosai_uuid_to_str(agnosai_uuid_v4());
+    var n = 500000;
+    var b = bench_new("uuid_parse");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_uuid_parse(s); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Task serialization to JSON text.
+fn _b_task_to_json(): i64 {
+    var t = _b_sample_task();
+    var n = 50000;
+    var b = bench_new("task_to_json");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_task_to_json(t); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Task parsing from JSON text.
+fn _b_task_from_json(): i64 {
+    var js = agnosai_task_to_json(_b_sample_task());
+    var n = 50000;
+    var b = bench_new("task_from_json");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_task_from_json(js); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Agent definition parsing — the config-load path.
+fn _b_agent_from_json(): i64 {
+    var js = agnosai_agent_to_json(_b_sample_agent());
+    var n = 50000;
+    var b = bench_new("agent_from_json");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_agent_from_json(js); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A 10-agent, 10-task crew spec serialized — the largest routine payload.
+fn _b_crew_to_json(): i64 {
+    var c = _b_sample_crew(10);
+    var n = 5000;
+    var b = bench_new("crew_to_json_10x10");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_crew_to_json(c); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The same crew spec parsed back.
+fn _b_crew_from_json(): i64 {
+    var js = agnosai_crew_to_json(_b_sample_crew(10));
+    var n = 5000;
+    var b = bench_new("crew_from_json_10x10");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_crew_from_json(js); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Message round trip — the inter-agent bus payload.
+fn _b_message_round_trip(): i64 {
+    var payload = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(payload, str_from("type"), bayan_json_v_str_new(str_from("task_done")));
+    var m = agnosai_message_new(agnosai_uuid_v4(), agnosai_message_target_topic(str_from("events")), payload);
+    var n = 50000;
+    var b = bench_new("message_to_json");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_message_to_json(m); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Placement matching — run per (task, node) pair by the scheduler.
+fn _b_inventory_satisfies(): i64 {
+    var devices = vec_new();
+    vec_push(devices, agnosai_compute_device_new(0, str_from("A100"), AGNOSAI_ACCEL_CUDA, 40960));
+    vec_push(devices, agnosai_compute_device_new(1, str_from("MI300"), AGNOSAI_ACCEL_ROCM, 65536));
+    var inv = agnosai_hw_inventory_new(32, 131072, devices);
+    var accels = vec_new();
+    vec_push(accels, AGNOSAI_ACCEL_CUDA);
+    var req = agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_for_accelerators(accels), 16384);
+    var n = 500000;
+    var b = bench_new("hw_inventory_satisfies");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_hw_inventory_satisfies(inv, req); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    _b_uuid_v4();
+    _b_uuid_to_str();
+    _b_uuid_parse();
+    _b_task_to_json();
+    _b_task_from_json();
+    _b_agent_from_json();
+    _b_crew_to_json();
+    _b_crew_from_json();
+    _b_message_round_trip();
+    _b_inventory_satisfies();
+
+    return 0;
+}
+
+var r = main();
+syscall(60, r);

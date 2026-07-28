@@ -65,8 +65,17 @@ serde, zero traits, zero I/O — it exercises tyche, f64-as-bit-patterns, and th
   needed), `cyrius tests` walks `tests/` recursively, `cyrius coverage --min`
   measures project `src/` and gates properly, and the `agnosai_*` prefix rule
   keeps our symbols clear of the fold (zero duplicate-fn warnings from our code).
-- ⬜ **`core` next.** Its BITE 8 is gated on the money-representation open
-  question — integer micro-USD is the standing recommendation.
+- ✅ **`core` done** — all six oracle submodules plus a shared `core_json`
+  helper module: 388 assertions green, plus 26 for the `src/id.cyr` UUID
+  prerequisite that `message`, `task` and `crew` all key on. 100% reference
+  coverage across the project. The money-representation question is settled (integer micro-USD),
+  and converting to f64 only at the wire boundary means the wire stays
+  byte-identical to serde. Two documented exclusions, both outside the v2.0.0
+  parity bar: `AgentDefinition::personality` (bhava, post-v2 — still emits
+  `null` for wire parity) and the `#[cfg(feature = "hwaccel")]` half of
+  `resource.rs`.
+
+**M2 exit met:** learning + core tests green against `rust-old/` as oracle.
 
 ### M3 — `llm`, the hoosh seam (Phase 2)
 

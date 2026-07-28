@@ -18,12 +18,13 @@ lands, not before, so the number always names something that actually shipped.
 ## Source
 
 - **Rust reference**: 27,683 lines at `rust-old/` — frozen, do not edit. It is the parity oracle.
-- **Cyrius port**: `learning` landed (5 modules + hub, ~1,000 lines). `src/main.cyr` is still the
-  stub entry point — no CLI surface yet.
+- **Cyrius port**: `learning` (5 modules + hub) and `core` (6 modules + hub + shared helpers),
+  plus `src/id.cyr`. `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
 ## Where the port is
 
-Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **`learning` done, `core` next**.
+Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **complete**: `learning` and
+`core` both ported and green against the oracle.
 
 | Gate | Status |
 |---|---|
@@ -37,12 +38,12 @@ Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **`learning` 
 | `src/order.cyr` (`ai_sort` / `ai_select_nth`) | ⬜ not started |
 | Tool-sandbox approach decided | ✅ cx + kavach — [ADR-006](../adr/006-cx-tool-sandbox.md) |
 | `learning` ported (M2, Phase 1) | ✅ 5 modules + hub, 112 assertions, 100% reference coverage |
-| `core` ported (M2, Phase 1) | 🟡 2 of 6 — error + message done; task/agent/crew/resource pending |
+| `core` ported (M2, Phase 1) | ✅ 6 of 6 + shared `core_json` helpers |
 | Money representation decided | ✅ integer micro-USD (2026-07-28) — gates core BITE 8 |
 
 ## Tests
 
-**205 assertions across 8 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**526 assertions across 12 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -54,12 +55,16 @@ Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **`learning` 
 | `core_error.tcyr` | 30 | 16 |
 | `core_message.tcyr` | 39 | 6 |
 | `id.tcyr` | 26 | — (reimplementation; the `uuid` crate is the reference) |
+| `core_task.tcyr` | 82 | 13 |
+| `core_resource.tcyr` | 83 | 19 of 28 (9 are hwaccel-gated and defer) |
+| `core_agent.tcyr` | 88 | 12 |
+| `core_crew.tcyr` | 66 | 8 |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
 the Q-table's packed-key distinctness — none of which the Rust tests reach.
 
-`cyrius coverage --min 80` → **100% (100/100 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (286/286 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -91,8 +96,30 @@ an O(n) lowest-priority scan on every insert once full, and `sample` recomputes 
 priority sum each round — which `replay.rs:90` does deliberately, "to avoid bias". Changing
 either would diverge from parity and needs an ADR first.
 
+`benches/core.bcyr` — no oracle bench file exists for core, so these measure the paths core
+actually gets hammered on: id minting/rendering and the JSON round trips at every request
+boundary.
+
+| Benchmark | Time |
+|---|---|
+| `hw_inventory_satisfies` | 165 ns |
+| `uuid_to_str` | 217 ns |
+| `uuid_parse` | 252 ns |
+| `uuid_v4_generate` | 526 ns |
+| `message_to_json` | 8.67 µs |
+| `task_from_json` | 10.1 µs |
+| `agent_from_json` | 10.2 µs |
+| `task_to_json` | 14.7 µs |
+| `crew_to_json_10x10` | 305 µs |
+| `crew_from_json_10x10` | 710 µs |
+
+`uuid_v4_generate` is dominated by the `random_bytes` getrandom syscall, which is the right
+trade: v4 ids must come from kernel entropy, never tyche. If id minting ever shows up hot, the
+fix is batching entropy, not changing the source.
+
 **Not comparable to `rust-old/bench-history.csv`** — different allocator, different harness, no
-criterion statistics. The Cyrius line starts its own baseline.
+criterion statistics. The Cyrius line starts its own baseline, captured by
+`scripts/bench-history.sh` into the root `bench-history.csv`.
 
 ## Dependencies
 
@@ -129,11 +156,11 @@ kiran (game AI) — none consuming the Cyrius line yet.
 
 ## Next
 
-`core` — the second half of M2 in [`roadmap.md`](roadmap.md). The root of the
-graph: pure data, the vocabulary every other group speaks. Its BITE 8 is gated
-on the **money representation** open question (integer micro-USD is the
-recommendation) — see the open questions in
-[`cyrius-port-plan.md`](cyrius-port-plan.md).
+**M3 — `llm`, the hoosh seam** ([`roadmap.md`](roadmap.md), Phase 2). The
+cheapest group in the port: the reference implementation already exists at
+`thoth/src/hoosh.cyr` (1,197 lines), and `llm` defines the types orchestrator
+consumes, so it lands early. Exit: a live chat-completion round-trip against
+`hoosh serve 8088`.
 
 Open items, none blocking:
 
@@ -145,10 +172,11 @@ Open items, none blocking:
    `bayan_json_v_parse(someStr)` was rewritten into a 1-arg call to a 2-arg fn
    and returned 0 for valid JSON — silently, across ~26 files ecosystem-wide.
    bayan 1.3.0 renames those forms `_str` → `_buf`.
-   **Action here when the fold lands:** `core_message.cyr`'s
-   `agnosai_message_from_json` currently calls `bayan_json_v_parse_str`, which
-   will no longer exist — switch it to the bare `bayan_json_v_parse(src)`. It
-   is a compile error, not a silent break, so it cannot be missed.
+   **Action here when the fold lands:** four `*_from_json` entries currently
+   call `bayan_json_v_parse_str` — in `core_message.cyr`, `core_task.cyr`,
+   `core_agent.cyr` and `core_crew.cyr`. That name will no longer exist; switch
+   each to the bare `bayan_json_v_parse(src)`. It is a compile error, not a
+   silent break, so none can be missed.
 2. **`lib/sakshi.cyr` is vendored at 2.4.3 while the 6.4.86 toolchain bundles
    2.4.6**, which every build reports as a shadow warning. `cyrius lib sync
    --full` re-syncs.

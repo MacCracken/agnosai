@@ -1,0 +1,332 @@
+# =========================================================================
+# core_agent — agent definitions and runtime state.
+#
+# Parity oracle: rust-old/src/core/agent.rs
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * **`personality` is not ported.** bhava is post-v2 by user decree, so
+#     there is no field and no `with_personality`. The wire form still emits
+#     `"personality": null`, which is exactly what the default Rust build
+#     emitted (bhava is a hard dep there, so the `Option` was always present
+#     and always `None` unless explicitly set). Incoming `personality` is
+#     accepted and ignored. This keeps default-build wire parity byte-exact
+#     rather than changing the shape — port plan open question 2, resolved the
+#     conservative way; say so if you want the field dropped from the wire.
+#   * `Option<String>` fields are 0 when absent; `gpu_memory_min_mb` uses
+#     AGNOSAI_NO_LIMIT, matching core_resource's convention.
+#   * `from_json` returns 0 rather than a `Result`. The four required fields
+#     (`agent_key`, `name`, `role`, `goal`) are genuinely required — the oracle
+#     has no `#[serde(default)]` on them, so a missing one is a parse failure.
+# =========================================================================
+
+# Runtime state of an agent instance.
+enum AgnosaiAgentState {
+    AGNOSAI_AGENT_IDLE = 0;
+    AGNOSAI_AGENT_ASSIGNED = 1;
+    AGNOSAI_AGENT_WORKING = 2;
+    AGNOSAI_AGENT_BLOCKED = 3;
+    AGNOSAI_AGENT_COMPLETED = 4;
+    AGNOSAI_AGENT_FAILED = 5;
+}
+
+# AgentDefinition heap layout — 104 bytes.
+enum AgnosaiAgentDefOff {
+    AGN_AGENT_KEY = 0;
+    AGN_AGENT_NAME = 8;
+    AGN_AGENT_ROLE = 16;
+    AGN_AGENT_GOAL = 24;
+    AGN_AGENT_BACKSTORY = 32;
+    AGN_AGENT_DOMAIN = 40;
+    AGN_AGENT_TOOLS = 48;
+    AGN_AGENT_COMPLEXITY = 56;
+    AGN_AGENT_LLM_MODEL = 64;
+    AGN_AGENT_GPU_REQUIRED = 72;
+    AGN_AGENT_GPU_PREFERRED = 80;
+    AGN_AGENT_GPU_MEMORY_MIN_MB = 88;
+    AGN_AGENT_HARDWARE = 96;
+    AGN_AGENT_SIZE = 104;
+}
+
+# The oracle's `default_complexity()`.
+fn agnosai_default_complexity(): i64 {
+    return str_from("medium");
+}
+
+# The snake_case wire spelling of an agent state.
+fn agnosai_agent_state_to_wire(state): i64 {
+    if (state == AGNOSAI_AGENT_ASSIGNED) { return str_from("assigned"); }
+    if (state == AGNOSAI_AGENT_WORKING) { return str_from("working"); }
+    if (state == AGNOSAI_AGENT_BLOCKED) { return str_from("blocked"); }
+    if (state == AGNOSAI_AGENT_COMPLETED) { return str_from("completed"); }
+    if (state == AGNOSAI_AGENT_FAILED) { return str_from("failed"); }
+    return str_from("idle");
+}
+
+# An agent state from its wire spelling. Unknown spellings fall back to the
+# oracle's default, Idle.
+fn agnosai_agent_state_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("assigned")) == 1) { return AGNOSAI_AGENT_ASSIGNED; }
+    if (str_eq(s, str_from("working")) == 1) { return AGNOSAI_AGENT_WORKING; }
+    if (str_eq(s, str_from("blocked")) == 1) { return AGNOSAI_AGENT_BLOCKED; }
+    if (str_eq(s, str_from("completed")) == 1) { return AGNOSAI_AGENT_COMPLETED; }
+    if (str_eq(s, str_from("failed")) == 1) { return AGNOSAI_AGENT_FAILED; }
+    return AGNOSAI_AGENT_IDLE;
+}
+
+# Create a minimal agent definition. `name` defaults to `agent_key`, matching
+# the oracle's `Self { name: key.clone(), agent_key: key, .. }`.
+fn agnosai_agent_new(agent_key: Str, role: Str, goal: Str): i64 {
+    var a = alloc(AGN_AGENT_SIZE);
+    store64(a + AGN_AGENT_KEY, agent_key);
+    store64(a + AGN_AGENT_NAME, agent_key);
+    store64(a + AGN_AGENT_ROLE, role);
+    store64(a + AGN_AGENT_GOAL, goal);
+    store64(a + AGN_AGENT_BACKSTORY, 0);
+    store64(a + AGN_AGENT_DOMAIN, 0);
+    store64(a + AGN_AGENT_TOOLS, vec_new());
+    store64(a + AGN_AGENT_COMPLEXITY, agnosai_default_complexity());
+    store64(a + AGN_AGENT_LLM_MODEL, 0);
+    store64(a + AGN_AGENT_GPU_REQUIRED, 0);
+    store64(a + AGN_AGENT_GPU_PREFERRED, 0);
+    store64(a + AGN_AGENT_GPU_MEMORY_MIN_MB, AGNOSAI_NO_LIMIT);
+    store64(a + AGN_AGENT_HARDWARE, 0);
+    return a;
+}
+
+# Set the agent's tool list (a vec of Str). Returns the agent.
+fn agnosai_agent_with_tools(a, tools): i64 {
+    store64(a + AGN_AGENT_TOOLS, tools);
+    return a;
+}
+
+# Set the agent's domain. Returns the agent.
+fn agnosai_agent_with_domain(a, domain: Str): i64 {
+    store64(a + AGN_AGENT_DOMAIN, domain);
+    return a;
+}
+
+# Set the agent's display name (defaults to agent_key). Returns the agent.
+fn agnosai_agent_with_name(a, name: Str): i64 {
+    store64(a + AGN_AGENT_NAME, name);
+    return a;
+}
+
+# Set hardware requirements. Returns the agent.
+fn agnosai_agent_with_hardware(a, hw): i64 {
+    store64(a + AGN_AGENT_HARDWARE, hw);
+    return a;
+}
+
+# Set the narrative backstory used for prompt context. Returns the agent.
+fn agnosai_agent_with_backstory(a, backstory: Str): i64 {
+    store64(a + AGN_AGENT_BACKSTORY, backstory);
+    return a;
+}
+
+# Set the complexity tier ("low" / "medium" / "high"). Returns the agent.
+fn agnosai_agent_with_complexity(a, complexity: Str): i64 {
+    store64(a + AGN_AGENT_COMPLEXITY, complexity);
+    return a;
+}
+
+# Set an override LLM model identifier. Returns the agent.
+fn agnosai_agent_with_llm_model(a, model: Str): i64 {
+    store64(a + AGN_AGENT_LLM_MODEL, model);
+    return a;
+}
+
+# Set the legacy GPU hints. Prefer agnosai_agent_with_hardware.
+fn agnosai_agent_with_gpu(a, required, preferred, memory_min_mb): i64 {
+    store64(a + AGN_AGENT_GPU_REQUIRED, required);
+    store64(a + AGN_AGENT_GPU_PREFERRED, preferred);
+    store64(a + AGN_AGENT_GPU_MEMORY_MIN_MB, memory_min_mb);
+    return a;
+}
+
+# Unique key identifying this agent type.
+fn agnosai_agent_key(a): i64 {
+    return load64(a + AGN_AGENT_KEY);
+}
+
+# Display name of the agent.
+fn agnosai_agent_name(a): i64 {
+    return load64(a + AGN_AGENT_NAME);
+}
+
+# Role the agent fulfils within a crew.
+fn agnosai_agent_role(a): i64 {
+    return load64(a + AGN_AGENT_ROLE);
+}
+
+# High-level objective for the agent.
+fn agnosai_agent_goal(a): i64 {
+    return load64(a + AGN_AGENT_GOAL);
+}
+
+# Narrative backstory for prompt context, or 0 when unset.
+fn agnosai_agent_backstory(a): i64 {
+    return load64(a + AGN_AGENT_BACKSTORY);
+}
+
+# Domain of expertise, or 0 when unset.
+fn agnosai_agent_domain(a): i64 {
+    return load64(a + AGN_AGENT_DOMAIN);
+}
+
+# Vec of tool names this agent is allowed to use.
+fn agnosai_agent_tools(a): i64 {
+    return load64(a + AGN_AGENT_TOOLS);
+}
+
+# Complexity tier ("low", "medium", "high").
+fn agnosai_agent_complexity(a): i64 {
+    return load64(a + AGN_AGENT_COMPLEXITY);
+}
+
+# Override LLM model identifier, or 0 when unset.
+fn agnosai_agent_llm_model(a): i64 {
+    return load64(a + AGN_AGENT_LLM_MODEL);
+}
+
+# Legacy GPU-required flag. Prefer the hardware field.
+fn agnosai_agent_gpu_required(a): i64 {
+    return load64(a + AGN_AGENT_GPU_REQUIRED);
+}
+
+# Legacy GPU-preferred flag. Prefer the hardware field.
+fn agnosai_agent_gpu_preferred(a): i64 {
+    return load64(a + AGN_AGENT_GPU_PREFERRED);
+}
+
+# Legacy minimum GPU memory in MB, or AGNOSAI_NO_LIMIT when unset.
+fn agnosai_agent_gpu_memory_min_mb(a): i64 {
+    return load64(a + AGN_AGENT_GPU_MEMORY_MIN_MB);
+}
+
+# Explicit hardware requirement, or 0 when unset.
+fn agnosai_agent_hardware(a): i64 {
+    return load64(a + AGN_AGENT_HARDWARE);
+}
+
+# The agent's hardware requirement.
+#
+# Prefers the explicit `hardware` field; otherwise falls back to the legacy GPU
+# fields. The fallback is the oracle's exactly: a `gpu_required` agent asks for
+# Cuda **or** Rocm, and `gpu_memory_min_mb` only applies inside that branch —
+# a min-memory hint on an agent that does not require a GPU is ignored.
+fn agnosai_agent_hardware_requirement(a): i64 {
+    var hw = load64(a + AGN_AGENT_HARDWARE);
+    if (hw != 0) { return hw; }
+
+    var req = agnosai_hw_requirement_new();
+    if (load64(a + AGN_AGENT_GPU_REQUIRED) == 1) {
+        var accels = load64(req + AGN_REQ_ACCELERATORS);
+        vec_push(accels, AGNOSAI_ACCEL_CUDA);
+        vec_push(accels, AGNOSAI_ACCEL_ROCM);
+        var min_mb = load64(a + AGN_AGENT_GPU_MEMORY_MIN_MB);
+        if (min_mb != AGNOSAI_NO_LIMIT) { store64(req + AGN_REQ_MIN_MEMORY_MB, min_mb); }
+    }
+    return req;
+}
+
+# The agent definition as a bayan JSON value, fields in declaration order.
+# `personality` is emitted as null — see the module note.
+fn agnosai_agent_to_value(a): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("agent_key"), bayan_json_v_str_new(load64(a + AGN_AGENT_KEY)));
+    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(a + AGN_AGENT_NAME)));
+    bayan_json_v_obj_set(obj, str_from("role"), bayan_json_v_str_new(load64(a + AGN_AGENT_ROLE)));
+    bayan_json_v_obj_set(obj, str_from("goal"), bayan_json_v_str_new(load64(a + AGN_AGENT_GOAL)));
+    bayan_json_v_obj_set(obj, str_from("backstory"),
+    _agnosai_opt_str_to_value(load64(a + AGN_AGENT_BACKSTORY)));
+    bayan_json_v_obj_set(obj, str_from("domain"), _agnosai_opt_str_to_value(load64(a + AGN_AGENT_DOMAIN)));
+
+    var tools = load64(a + AGN_AGENT_TOOLS);
+    var tools_v = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(tools); i = i + 1) {
+        bayan_json_v_arr_push(tools_v, bayan_json_v_str_new(vec_get(tools, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("tools"), tools_v);
+
+    bayan_json_v_obj_set(obj, str_from("complexity"),
+    bayan_json_v_str_new(load64(a + AGN_AGENT_COMPLEXITY)));
+    bayan_json_v_obj_set(obj, str_from("llm_model"),
+    _agnosai_opt_str_to_value(load64(a + AGN_AGENT_LLM_MODEL)));
+    bayan_json_v_obj_set(obj, str_from("gpu_required"),
+    _agnosai_bool_to_value(load64(a + AGN_AGENT_GPU_REQUIRED)));
+    bayan_json_v_obj_set(obj, str_from("gpu_preferred"),
+    _agnosai_bool_to_value(load64(a + AGN_AGENT_GPU_PREFERRED)));
+    bayan_json_v_obj_set(obj, str_from("gpu_memory_min_mb"),
+    _agnosai_opt_int_to_value(load64(a + AGN_AGENT_GPU_MEMORY_MIN_MB)));
+
+    var hw = load64(a + AGN_AGENT_HARDWARE);
+    var hw_v = bayan_json_v_null();
+    if (hw != 0) { hw_v = agnosai_hw_requirement_to_value(hw); }
+    bayan_json_v_obj_set(obj, str_from("hardware"), hw_v);
+
+    bayan_json_v_obj_set(obj, str_from("personality"), bayan_json_v_null());
+    return obj;
+}
+
+# Rebuild an agent definition from a bayan JSON value. Returns 0 when the value
+# is not an object or any of the four required fields is missing.
+fn agnosai_agent_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+
+    var key_v = bayan_json_v_obj_get(v, "agent_key");
+    var name_v = bayan_json_v_obj_get(v, "name");
+    var role_v = bayan_json_v_obj_get(v, "role");
+    var goal_v = bayan_json_v_obj_get(v, "goal");
+    if (key_v == 0 || name_v == 0 || role_v == 0 || goal_v == 0) { return 0; }
+    if (bayan_json_v_is_str(key_v) == 0 || bayan_json_v_is_str(name_v) == 0) { return 0; }
+    if (bayan_json_v_is_str(role_v) == 0 || bayan_json_v_is_str(goal_v) == 0) { return 0; }
+
+    var a = agnosai_agent_new(bayan_json_v_str(key_v), bayan_json_v_str(role_v),
+    bayan_json_v_str(goal_v));
+    store64(a + AGN_AGENT_NAME, bayan_json_v_str(name_v));
+
+    var bs = bayan_json_v_obj_get(v, "backstory");
+    if (bs != 0 && bayan_json_v_is_str(bs) == 1) { store64(a + AGN_AGENT_BACKSTORY, bayan_json_v_str(bs)); }
+
+    var dm = bayan_json_v_obj_get(v, "domain");
+    if (dm != 0 && bayan_json_v_is_str(dm) == 1) { store64(a + AGN_AGENT_DOMAIN, bayan_json_v_str(dm)); }
+
+    var tv = bayan_json_v_obj_get(v, "tools");
+    if (tv != 0 && bayan_json_v_is_arr(tv) == 1) {
+        var tools = load64(a + AGN_AGENT_TOOLS);
+        for (var i = 0; i < bayan_json_v_arr_len(tv); i = i + 1) {
+            var e = bayan_json_v_arr_get(tv, i);
+            if (bayan_json_v_is_str(e) == 1) { vec_push(tools, bayan_json_v_str(e)); }
+        }
+    }
+
+    var cx = bayan_json_v_obj_get(v, "complexity");
+    if (cx != 0 && bayan_json_v_is_str(cx) == 1) { store64(a + AGN_AGENT_COMPLEXITY, bayan_json_v_str(cx)); }
+
+    var lm = bayan_json_v_obj_get(v, "llm_model");
+    if (lm != 0 && bayan_json_v_is_str(lm) == 1) { store64(a + AGN_AGENT_LLM_MODEL, bayan_json_v_str(lm)); }
+
+    store64(a + AGN_AGENT_GPU_REQUIRED, _agnosai_bool_field(v, "gpu_required"));
+    store64(a + AGN_AGENT_GPU_PREFERRED, _agnosai_bool_field(v, "gpu_preferred"));
+    store64(a + AGN_AGENT_GPU_MEMORY_MIN_MB, _agnosai_opt_int_field(v, "gpu_memory_min_mb"));
+
+    var hv = bayan_json_v_obj_get(v, "hardware");
+    if (hv != 0 && bayan_json_v_is_obj(hv) == 1) {
+        store64(a + AGN_AGENT_HARDWARE, agnosai_hw_requirement_from_value(hv));
+    }
+    return a;
+}
+
+# The agent definition serialized to JSON text.
+fn agnosai_agent_to_json(a): i64 {
+    return bayan_json_v_build(agnosai_agent_to_value(a));
+}
+
+# Deserialize an agent definition from JSON text. Returns 0 on a parse error or
+# a missing required field — the oracle's `Result` `Err` arm.
+# See core_message.cyr for why this calls `bayan_json_v_parse_str`.
+fn agnosai_agent_from_json(src: Str): i64 {
+    var v = bayan_json_v_parse_str(str_data(src), str_len(src));
+    if (v == 0) { return 0; }
+    return agnosai_agent_from_value(v);
+}
