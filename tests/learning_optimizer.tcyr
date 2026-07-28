@@ -1,0 +1,130 @@
+# =========================================================================
+# learning_optimizer.tcyr — parity tests for src/learning_optimizer.cyr
+#
+# Oracle: the 7 #[cfg(test)] tests in rust-old/src/learning/optimizer.rs, plus
+# explicit coverage of the "get_value never interns" invariant that two of
+# those tests depend on without stating.
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/learning_optimizer.cyr"
+include "tests/test_helpers.cyr"
+
+# A vec holding the given Str values — the `&["a1", "a2"]` slices the oracle
+# passes for next_actions / actions.
+fn _t_actions2(a, b): i64 {
+    var v = vec_new();
+    vec_push(v, a);
+    vec_push(v, b);
+    return v;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("learning_optimizer");
+
+    var s1 = str_from("s1");
+    var s2 = str_from("s2");
+    var a1 = str_from("a1");
+    var a2 = str_from("a2");
+    var a3 = str_from("a3");
+    var term = str_from("term");
+    var empty = vec_new();
+
+    # --- initial_values_are_zero ---
+    var q1 = agnosai_qlearner_new(_t_f64_ratio(1, 10), _t_f64_ratio(9, 10));
+    _t_assert_f64(agnosai_qlearner_get_value(q1, s1, a1), f64_from(0), "unseen Q is 0.0");
+    _t_assert_f64(agnosai_qlearner_get_value(q1, str_from("any"), str_from("thing")),
+    f64_from(0), "unseen pair Q is 0.0");
+    _t_assert_f64(agnosai_qlearner_learning_rate(q1), _t_f64_ratio(1, 10), "learning rate kept");
+    _t_assert_f64(agnosai_qlearner_discount_factor(q1), _t_f64_ratio(9, 10), "discount kept");
+
+    # --- get_value never interns (the invariant tests 3 and 7 depend on) ---
+    assert_eq(agnosai_qlearner_interned_count(q1), 0, "lookups did not intern anything");
+    assert_eq(agnosai_qlearner_table_size(q1), 0, "lookups did not populate the table");
+
+    # --- update_changes_value ---
+    # Q(s1,a1) = 0 + 0.5 * (1.0 + 0.9*0 - 0) = 0.5
+    var q2 = agnosai_qlearner_new(F64_HALF, _t_f64_ratio(9, 10));
+    agnosai_qlearner_update(q2, s1, a1, F64_ONE, s2, _t_actions2(a1, a2));
+    _t_assert_f64(agnosai_qlearner_get_value(q2, s1, a1), F64_HALF, "one update -> Q 0.5");
+
+    # --- update_with_existing_next_state ---
+    # Q(s2,a1) = 0 + 0.5*(2.0 + 0.9*0 - 0) = 1.0, then
+    # Q(s1,a1) = 0 + 0.5 * (1.0 + 0.9*1.0 - 0) = 0.95
+    var q3 = agnosai_qlearner_new(F64_HALF, _t_f64_ratio(9, 10));
+    agnosai_qlearner_update(q3, s2, a1, F64_TWO, str_from("terminal"), empty);
+    _t_assert_f64(agnosai_qlearner_get_value(q3, s2, a1), F64_ONE, "seed Q(s2,a1) is 1.0");
+    agnosai_qlearner_update(q3, s1, a1, F64_ONE, s2, _t_actions2(a1, a2));
+    _t_assert_f64(agnosai_qlearner_get_value(q3, s1, a1), _t_f64_ratio(95, 100),
+    "bootstrapped update -> Q 0.95");
+
+    # --- best_action_selects_highest_q ---
+    # With an empty next_actions and lr 0.1: Q = 0.1 * reward.
+    var q4 = agnosai_qlearner_new(_t_f64_ratio(1, 10), _t_f64_ratio(9, 10));
+    agnosai_qlearner_update(q4, s1, a1, f64_from(3), term, empty);
+    agnosai_qlearner_update(q4, s1, a2, f64_from(9), term, empty);
+    agnosai_qlearner_update(q4, s1, a3, f64_from(5), term, empty);
+    var actions3 = vec_new();
+    vec_push(actions3, a1);
+    vec_push(actions3, a2);
+    vec_push(actions3, a3);
+    assert(str_eq(agnosai_qlearner_best_action(q4, s1, actions3), a2) == 1,
+    "best_action picks the highest Q");
+    _t_assert_f64(agnosai_qlearner_get_value(q4, s1, a2), _t_f64_ratio(9, 10), "Q(s1,a2) is 0.9");
+    assert_eq(agnosai_qlearner_table_size(q4), 3, "three cells populated");
+
+    # --- best_action_empty_returns_none ---
+    var q5 = agnosai_qlearner_new(_t_f64_ratio(1, 10), _t_f64_ratio(9, 10));
+    assert_eq(agnosai_qlearner_best_action(q5, s1, vec_new()), AGNOSAI_Q_NO_ACTION,
+    "no actions -> None");
+
+    # --- best_action_with_unseen_state ---
+    # Every action reads 0.0, so the max_by tie rule decides: the LAST wins.
+    var q6 = agnosai_qlearner_new(_t_f64_ratio(1, 10), _t_f64_ratio(9, 10));
+    var best_unseen = agnosai_qlearner_best_action(q6, str_from("unknown"), _t_actions2(a1, a2));
+    assert(best_unseen != AGNOSAI_Q_NO_ACTION, "unseen state still yields an action");
+    assert(str_eq(best_unseen, a2) == 1, "tied Q values resolve to the last action");
+
+    # --- repeated_updates_converge ---
+    # next_state "s2" is never interned (only update's own state/action are), so
+    # max_next_q stays 0.0 and Q converges on the reward, 1.0.
+    var q7 = agnosai_qlearner_new(_t_f64_ratio(1, 10), _t_f64_ratio(9, 10));
+    var next1 = vec_new();
+    vec_push(next1, a1);
+    for (var i = 0; i < 100; i = i + 1) {
+        agnosai_qlearner_update(q7, s1, a1, F64_ONE, s2, next1);
+    }
+    var converged = agnosai_qlearner_get_value(q7, s1, a1);
+    assert(f64_lt(f64_abs(f64_sub(converged, F64_ONE)), _t_f64_ratio(1, 100)) == 1,
+    "100 updates converge Q to ~1.0");
+
+    # --- interning_reuses_ids ---
+    # Two updates over the same (state, action) intern exactly 2 strings; the
+    # next_state and next_actions are looked up, never interned.
+    var q8 = agnosai_qlearner_new(_t_f64_ratio(1, 10), _t_f64_ratio(9, 10));
+    var state = str_from("state");
+    var action = str_from("action");
+    var next_actions = vec_new();
+    vec_push(next_actions, str_from("a"));
+    agnosai_qlearner_update(q8, state, action, F64_ONE, str_from("next"), next_actions);
+    agnosai_qlearner_update(q8, state, action, F64_TWO, str_from("next"), next_actions);
+    assert_eq(agnosai_qlearner_interned_count(q8), 2, "only state and action are interned");
+    assert_eq(agnosai_qlearner_table_size(q8), 1, "repeated pair reuses one cell");
+
+    # --- packed key keeps state and action distinct ---
+    # (s,a) and (a,s) must not collide once both halves are interned.
+    var q9 = agnosai_qlearner_new(F64_HALF, f64_from(0));
+    agnosai_qlearner_update(q9, s1, a1, F64_TWO, term, empty);
+    agnosai_qlearner_update(q9, a1, s1, f64_from(4), term, empty);
+    _t_assert_f64(agnosai_qlearner_get_value(q9, s1, a1), F64_ONE, "Q(s1,a1) unaffected");
+    _t_assert_f64(agnosai_qlearner_get_value(q9, a1, s1), F64_TWO, "Q(a1,s1) is its own cell");
+    assert_eq(agnosai_qlearner_table_size(q9), 2, "swapped pair is a distinct key");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -1,0 +1,99 @@
+# =========================================================================
+# learning_capability.tcyr — parity tests for src/learning_capability.cyr
+#
+# Oracle: the 8 #[cfg(test)] tests in rust-old/src/learning/capability.rs.
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/learning_capability.cyr"
+include "tests/test_helpers.cyr"
+
+fn main() {
+    alloc_init();
+
+    test_group("learning_capability");
+
+    # --- initial_confidence_is_default ---
+    var sc0 = agnosai_capability_scorer_new();
+    _t_assert_f64(agnosai_capability_scorer_confidence(sc0, str_from("unknown")),
+    F64_HALF, "unknown capability confidence is 0.5");
+
+    # --- confidence_improves_after_success ---
+    var sc1 = agnosai_capability_scorer_new();
+    var build = str_from("build");
+    agnosai_capability_scorer_record_success(sc1, build);
+    _t_assert_f64(agnosai_capability_scorer_confidence(sc1, build),
+    F64_ONE, "1 success -> confidence 1.0");
+
+    agnosai_capability_scorer_record_failure(sc1, build);
+    _t_assert_f64(agnosai_capability_scorer_confidence(sc1, build),
+    F64_HALF, "1 success 1 failure -> confidence 0.5");
+
+    agnosai_capability_scorer_record_success(sc1, build);
+    _t_assert_f64(agnosai_capability_scorer_confidence(sc1, build),
+    _t_f64_ratio(2, 3), "2 successes 1 failure -> confidence 2/3");
+
+    var s_build = agnosai_capability_scorer_score(sc1, build);
+    assert_eq(agnosai_capability_score_successes(s_build), 2, "successes counted");
+    assert_eq(agnosai_capability_score_failures(s_build), 1, "failures counted");
+    _t_assert_f64(agnosai_capability_score_confidence(s_build), _t_f64_ratio(2, 3), "score confidence");
+    assert_eq(agnosai_capability_score_trend(s_build), AGNOSAI_TREND_STABLE, "3 records -> stable");
+
+    # --- confidence_declines_after_failure ---
+    var sc2 = agnosai_capability_scorer_new();
+    agnosai_capability_scorer_record_failure(sc2, str_from("deploy"));
+    _t_assert_f64(agnosai_capability_scorer_confidence(sc2, str_from("deploy")),
+    f64_from(0), "1 failure -> confidence 0.0");
+
+    # --- trend_improving ---
+    # A poor overall record, then recent successes: 5/15 = 0.333 overall
+    # against a trailing 5/5 = 1.0 -> Improving.
+    var sc3 = agnosai_capability_scorer_new();
+    var t3 = str_from("test");
+    for (var i = 0; i < 10; i = i + 1) { agnosai_capability_scorer_record_failure(sc3, t3); }
+    for (var j = 0; j < 5; j = j + 1) { agnosai_capability_scorer_record_success(sc3, t3); }
+    assert_eq(agnosai_capability_scorer_trend(sc3, t3), AGNOSAI_TREND_IMPROVING, "trend improving");
+
+    # --- trend_declining ---
+    # 10/15 = 0.667 overall against a trailing 0/5 = 0.0 -> Declining.
+    var sc4 = agnosai_capability_scorer_new();
+    var t4 = str_from("test");
+    for (var k = 0; k < 10; k = k + 1) { agnosai_capability_scorer_record_success(sc4, t4); }
+    for (var m = 0; m < 5; m = m + 1) { agnosai_capability_scorer_record_failure(sc4, t4); }
+    assert_eq(agnosai_capability_scorer_trend(sc4, t4), AGNOSAI_TREND_DECLINING, "trend declining");
+
+    # --- trend_stable_with_few_records ---
+    var sc5 = agnosai_capability_scorer_new();
+    var t5 = str_from("test");
+    agnosai_capability_scorer_record_success(sc5, t5);
+    agnosai_capability_scorer_record_failure(sc5, t5);
+    assert_eq(agnosai_capability_scorer_trend(sc5, t5), AGNOSAI_TREND_STABLE,
+    "fewer than 5 recent records -> stable");
+
+    # --- unknown_capability_trend_is_stable ---
+    var sc6 = agnosai_capability_scorer_new();
+    assert_eq(agnosai_capability_scorer_trend(sc6, str_from("nonexistent")), AGNOSAI_TREND_STABLE,
+    "unknown capability trend is stable");
+
+    # --- all_scores_returns_all (keys + score, per the port note) ---
+    var sc7 = agnosai_capability_scorer_new();
+    agnosai_capability_scorer_record_success(sc7, str_from("a"));
+    agnosai_capability_scorer_record_failure(sc7, str_from("b"));
+    assert_eq(agnosai_capability_scorer_count(sc7), 2, "two capabilities recorded");
+    assert_eq(vec_len(agnosai_capability_scorer_keys(sc7)), 2, "two keys returned");
+    assert(agnosai_capability_scorer_score(sc7, str_from("a")) != 0, "score 'a' resolves");
+    assert(agnosai_capability_scorer_score(sc7, str_from("zz")) == 0, "unrecorded score is 0");
+
+    # --- recent window stays bounded at MAX_RECENT (Rust's drain guard) ---
+    var sc8 = agnosai_capability_scorer_new();
+    var t8 = str_from("bounded");
+    for (var n = 0; n < 200; n = n + 1) { agnosai_capability_scorer_record_success(sc8, t8); }
+    assert_eq(agnosai_capability_score_recent_len(agnosai_capability_scorer_score(sc8, t8)),
+    AGNOSAI_CAP_MAX_RECENT, "recent window trimmed to 64");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

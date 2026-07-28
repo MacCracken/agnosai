@@ -1,0 +1,159 @@
+# =========================================================================
+# learning_replay.tcyr — parity tests for src/learning_replay.cyr
+#
+# Oracle: the 7 #[cfg(test)] tests in rust-old/src/learning/replay.rs, plus the
+# zero-priority and NaN fallback branches, which the oracle's own tests never
+# reach.
+#
+# Sampling is seeded (rng_seed) so every run of this suite is reproducible.
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/learning_replay.cyr"
+include "tests/test_helpers.cyr"
+
+# rust-old's `make_exp(state, priority)`: action "act", reward 1.0, next "next".
+fn _t_exp(state_cstr, priority): i64 {
+    return agnosai_experience_new(str_from(state_cstr), str_from("act"), F64_ONE,
+    str_from("next"), priority);
+}
+
+# Whether a sample batch contains an experience whose state is `state_cstr`.
+fn _t_batch_has_state(batch, state_cstr): i64 {
+    var want = str_from(state_cstr);
+    for (var i = 0; i < vec_len(batch); i = i + 1) {
+        if (str_eq(agnosai_experience_state(vec_get(batch, i)), want) == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    rng_seed(42);
+
+    test_group("learning_replay");
+
+    # --- push_and_sample ---
+    var b1 = agnosai_replay_buffer_new(10);
+    agnosai_replay_buffer_push(b1, _t_exp("s1", F64_ONE));
+    agnosai_replay_buffer_push(b1, _t_exp("s2", F64_TWO));
+    agnosai_replay_buffer_push(b1, _t_exp("s3", f64_from(3)));
+    assert_eq(agnosai_replay_buffer_len(b1), 3, "3 experiences pushed");
+    assert_eq(agnosai_replay_buffer_is_empty(b1), 0, "buffer is not empty");
+    assert_eq(vec_len(agnosai_replay_buffer_sample(b1, 2)), 2, "sample(2) returns 2");
+
+    # --- Experience field accessors round-trip ---
+    var e0 = agnosai_replay_buffer_get(b1, 0);
+    assert(str_eq(agnosai_experience_state(e0), str_from("s1")) == 1, "experience state");
+    assert(str_eq(agnosai_experience_action(e0), str_from("act")) == 1, "experience action");
+    assert(str_eq(agnosai_experience_next_state(e0), str_from("next")) == 1, "experience next_state");
+    _t_assert_f64(agnosai_experience_reward(e0), F64_ONE, "experience reward 1.0");
+    _t_assert_f64(agnosai_experience_priority(e0), F64_ONE, "experience priority 1.0");
+
+    # --- max_size_eviction ---
+    # At capacity, a higher-priority push evicts the lowest (s1 at 1.0).
+    var b2 = agnosai_replay_buffer_new(3);
+    agnosai_replay_buffer_push(b2, _t_exp("s1", F64_ONE));
+    agnosai_replay_buffer_push(b2, _t_exp("s2", F64_TWO));
+    agnosai_replay_buffer_push(b2, _t_exp("s3", f64_from(3)));
+    assert_eq(agnosai_replay_buffer_len(b2), 3, "buffer at capacity");
+    agnosai_replay_buffer_push(b2, _t_exp("s4", f64_from(5)));
+    assert_eq(agnosai_replay_buffer_len(b2), 3, "capacity held after eviction");
+    var all_high = 1;
+    for (var i = 0; i < agnosai_replay_buffer_len(b2); i = i + 1) {
+        if (f64_lt(agnosai_experience_priority(agnosai_replay_buffer_get(b2, i)), F64_TWO) == 1) {
+            all_high = 0;
+        }
+    }
+    assert(all_high, "every surviving priority is >= 2.0");
+
+    # swap_remove semantics are observable: s3 (the old tail) took s1's slot.
+    assert(str_eq(agnosai_experience_state(agnosai_replay_buffer_get(b2, 0)), str_from("s3")) == 1,
+    "swap_remove moved the tail into the evicted slot");
+    assert(str_eq(agnosai_experience_state(agnosai_replay_buffer_get(b2, 2)), str_from("s4")) == 1,
+    "the new experience landed at the tail");
+
+    # --- eviction_skips_lower_priority ---
+    var b3 = agnosai_replay_buffer_new(2);
+    agnosai_replay_buffer_push(b3, _t_exp("s1", f64_from(5)));
+    agnosai_replay_buffer_push(b3, _t_exp("s2", f64_from(3)));
+    agnosai_replay_buffer_push(b3, _t_exp("s3", F64_ONE));
+    assert_eq(agnosai_replay_buffer_len(b3), 2, "low-priority push did not grow the buffer");
+    var saw_s3 = 0;
+    for (var j = 0; j < agnosai_replay_buffer_len(b3); j = j + 1) {
+        if (str_eq(agnosai_experience_state(agnosai_replay_buffer_get(b3, j)), str_from("s3")) == 1) {
+            saw_s3 = 1;
+        }
+    }
+    assert_eq(saw_s3, 0, "the rejected experience is absent");
+
+    # --- priority_ordering_in_sample ---
+    # One dominant experience against 20 near-zero ones. All 20 share the "low"
+    # state literal: the oracle numbers them, but only "high" is asserted on.
+    var b4 = agnosai_replay_buffer_new(100);
+    agnosai_replay_buffer_push(b4, _t_exp("high", f64_from(100)));
+    for (var k = 0; k < 20; k = k + 1) {
+        agnosai_replay_buffer_push(b4, _t_exp("low", _t_f64_ratio(1, 100)));
+    }
+    var high_count = 0;
+    for (var m = 0; m < 50; m = m + 1) {
+        if (_t_batch_has_state(agnosai_replay_buffer_sample(b4, 5), "high") == 1) {
+            high_count = high_count + 1;
+        }
+    }
+    assert(high_count > 30, "high-priority experience dominates sampling");
+
+    # --- update_priority ---
+    var b5 = agnosai_replay_buffer_new(10);
+    agnosai_replay_buffer_push(b5, _t_exp("s1", F64_ONE));
+    agnosai_replay_buffer_update_priority(b5, 0, f64_from(99));
+    _t_assert_f64(agnosai_experience_priority(agnosai_replay_buffer_get(b5, 0)),
+    f64_from(99), "priority updated to 99.0");
+    agnosai_replay_buffer_update_priority(b5, 7, f64_from(1));
+    _t_assert_f64(agnosai_experience_priority(agnosai_replay_buffer_get(b5, 0)),
+    f64_from(99), "out-of-range update is ignored");
+
+    # --- empty_buffer ---
+    var b6 = agnosai_replay_buffer_new(10);
+    assert_eq(agnosai_replay_buffer_is_empty(b6), 1, "new buffer is empty");
+    assert_eq(agnosai_replay_buffer_len(b6), 0, "new buffer has length 0");
+    assert_eq(vec_len(agnosai_replay_buffer_sample(b6, 5)), 0, "sampling an empty buffer is empty");
+    assert_eq(agnosai_replay_buffer_get(b6, 0), 0, "get on an empty buffer is 0");
+
+    # --- sample_more_than_buffer ---
+    var b7 = agnosai_replay_buffer_new(10);
+    agnosai_replay_buffer_push(b7, _t_exp("s1", F64_ONE));
+    agnosai_replay_buffer_push(b7, _t_exp("s2", F64_TWO));
+    assert_eq(vec_len(agnosai_replay_buffer_sample(b7, 10)), 2, "sample is capped at buffer length");
+
+    # --- zero-priority fallback: remaining priority is 0, so sample() fills
+    # from unselected in index order rather than sampling.
+    var b8 = agnosai_replay_buffer_new(10);
+    agnosai_replay_buffer_push(b8, _t_exp("z0", f64_from(0)));
+    agnosai_replay_buffer_push(b8, _t_exp("z1", f64_from(0)));
+    agnosai_replay_buffer_push(b8, _t_exp("z2", f64_from(0)));
+    var zbatch = agnosai_replay_buffer_sample(b8, 2);
+    assert_eq(vec_len(zbatch), 2, "zero-priority fallback still returns a full batch");
+    assert(str_eq(agnosai_experience_state(vec_get(zbatch, 0)), str_from("z0")) == 1,
+    "zero-priority fallback fills in index order");
+    assert(str_eq(agnosai_experience_state(vec_get(zbatch, 1)), str_from("z1")) == 1,
+    "zero-priority fallback fills the second slot in order");
+
+    # --- NaN fallback: a NaN priority poisons the sum, which must take the same
+    # in-order fill path rather than looping or selecting nothing.
+    var b9 = agnosai_replay_buffer_new(10);
+    var nan = f64_div(f64_from(0), f64_from(0));
+    assert_eq(_agnosai_f64_is_nan(nan), 1, "0.0/0.0 is NaN");
+    agnosai_replay_buffer_push(b9, _t_exp("n0", nan));
+    agnosai_replay_buffer_push(b9, _t_exp("n1", F64_ONE));
+    var nbatch = agnosai_replay_buffer_sample(b9, 2);
+    assert_eq(vec_len(nbatch), 2, "NaN fallback still returns a full batch");
+    assert(str_eq(agnosai_experience_state(vec_get(nbatch, 0)), str_from("n0")) == 1,
+    "NaN fallback fills in index order");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

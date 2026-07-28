@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **learning** — the first real Cyrius code of the port (M2 beachhead, Phase 1). All five
+  submodules of `rust-old/src/learning/` ported, with `src/learning.cyr` as the hub mirroring
+  `mod.rs`:
+  - **learning_capability** — `agnosai_capability_scorer_*`: confidence scoring over a Str-keyed
+    map, with the bounded 64-observation recent window and the 5-observation trend verdict.
+  - **learning_profile** — `agnosai_profile_*`: per-agent success rates and durations, with the
+    10,000-record-per-agent eviction cap.
+  - **learning_strategy** — `agnosai_ucb1_*`: UCB1 bandit, `mean + sqrt(2 * ln(N) / n)` over the
+    `f64_sqrt` / `f64_ln` builtins.
+  - **learning_replay** — `agnosai_replay_buffer_*`: prioritized experience replay sampling over
+    tyche's `rng_uniform`, with lowest-priority eviction and the zero/NaN fallback path.
+  - **learning_optimizer** — `agnosai_qlearner_*`: tabular Q-learning over a u64-keyed table with
+    an interned-string front end.
+- **tests** — 112 assertions across five `.tcyr` suites, covering all 35 `#[cfg(test)]` tests of
+  the oracle plus branches the oracle never reaches: the UCB1 formula itself, the `max_by`
+  tie rule, replay's zero-priority and NaN fallbacks, and the Q-table's packed-key distinctness.
+  `cyrius coverage` reports 100% reference coverage (56/56 fns), against the 80% gate.
+- **benches/learning.bcyr** — the 10 benchmark shapes of `rust-old/benches/learning.rs`, starting
+  the Cyrius baseline. Not comparable to the frozen Rust CSV.
+
+### Changed
+- **learning** — three deliberate shape divergences from the Rust API, each documented at the top
+  of its module. `Option<T>` returns become presence-return plus an out-param, keeping the query
+  paths allocation-free where a tagged `Option` would heap-allocate. `Duration` becomes an i64
+  nanosecond count and `DateTime<Utc>` becomes epoch nanoseconds. `CapabilityScorer::all_scores`
+  splits into `agnosai_capability_scorer_keys` + `_score`, which together cover the same surface
+  without minting a pair per entry. Wire behaviour is unchanged; `learning` has no consumers
+  outside itself (verified by the port plan's grep), so no downstream code is affected.
+- **tests/agnosai.tcyr**: replaced the stock `proj-tcyr` epilogue with the clamp-safe form. The
+  stock epilogue passes the raw failure count to `exit`, which the kernel masks `& 0xFF` — so
+  exactly 256, 512 or 768 failures would have scored as PASS.
+
 ### Fixed
 - **orchestrator/crew_runner**: `cargo check --no-default-features --features kavach` failed to
   compile. The `sandbox_strength` block was gated on `kavach` alone but reaches into

@@ -16,7 +16,7 @@ plus fleet, plus 77% of sandbox, plus JSON-only definitions, plus OTLP telemetry
 | Excluded | Why |
 |---|---|
 | bhava / `personality` | user decree, post-v2 |
-| WASM — `wasm.rs`, `wasm_tool.rs`, `wasm_loader.rs`, the tool SDK, `examples/wasm-tools/` (955 lines) | **no WASM runtime exists in the ecosystem** (port-plan blocker #6, re-confirmed 2026-07-28) |
+| WASM **as a format** — the tool SDK and `examples/wasm-tools/` | Explicit cyrius non-goal. The *capability* ships instead: the tool sandbox rides **cx** + kavach ([ADR-006](../adr/006-cx-tool-sandbox.md)). Existing `.wasm` tools must be **rewritten in Cyrius** — not a drop-in. Linux-x86 only until cx arc C |
 | definitions ZIP + YAML | both behind the non-default `definitions` feature; both are upstream filings |
 | `genai.rs`, `inference_queue.rs` | zero consumers; pending sign-off |
 
@@ -39,16 +39,16 @@ independently compilable + testable). ~122 bites across 10 groups.
 - Rust baseline greened: blocker #7 fixed, fmt + clippy clean, all 9 feature combos compile, 863 + 2 + 1 tests pass
 - Terminal Rust benchmark row set captured (112 rows at v1.1.0), CSV frozen into `rust-old/`
 - Blockers re-verified against cyrius 6.4.83 with adversarial refutation of every "resolved" verdict
-- Upstream: **sandhi 1.9.4** shipped (blocker #1 + two adjacent silent-truncation paths found while fixing it); `chan_try_send` filed against cyrius (blocker #4)
+- Upstream: **sandhi 1.9.4** shipped (blocker #1 + two adjacent silent-truncation paths found while fixing it); `chan_try_send` filed against cyrius and shipped in 6.4.84 (blocker #4)
 - `cyrius port` run; Rust preserved at `rust-old/`
 
 ### M1 — Dependency scaffold (Phase 0)
 
-Ordered stdlib array + declare-ahead `[deps.*]` (daimon/stiva pattern, **not**
-vendoring). **Gates:** sigil pinned via `[deps.sigil]` and removed from the
-stdlib array (two packagings = daimon's 227 duplicate-fn warnings); UUID
-reimplemented in `src/id.cyr` (no `[deps.mneme]` — no `[lib]` block, and AGPL
-against our GPL); `ai_sort`/`ai_select_nth` vendored (blocker #8).
+Ordered stdlib array + declare-ahead git deps (daimon/stiva pattern, **not**
+vendoring). **Gates:** sigil pinned as a git dep and removed from the stdlib
+array (two packagings = daimon's 227 duplicate-fn warnings); UUID reimplemented
+in `src/id.cyr` (mneme is unusable — no lib block, and AGPL against our GPL);
+`ai_sort`/`ai_select_nth` vendored (blocker #8).
 **Exit:** hello-world builds; `cyrius deps` resolves clean.
 
 ### M2 — Beachhead: `learning` + `core` (Phase 1)
@@ -57,6 +57,16 @@ Both blocked by nothing. `learning` first — zero coupling, zero async, zero
 serde, zero traits, zero I/O — it exercises tyche, f64-as-bit-patterns, and the
 `.tcyr` harness with no downstream risk. Then `core`, the root of the graph.
 **Exit:** learning + core tests green against `rust-old/` as oracle.
+
+- ✅ **`learning` done** — 5 modules + hub, 112 assertions green against the
+  oracle's 35 tests, 100% reference coverage, 10 benchmarks seeding the Cyrius
+  baseline. It confirmed the harness assumptions the rest of the port rests on:
+  a `.tcyr` can include real `src/` modules (no hoosh-style mirror-defining
+  needed), `cyrius tests` walks `tests/` recursively, `cyrius coverage --min`
+  measures project `src/` and gates properly, and the `agnosai_*` prefix rule
+  keeps our symbols clear of the fold (zero duplicate-fn warnings from our code).
+- ⬜ **`core` next.** Its BITE 8 is gated on the money-representation open
+  question — integer micro-USD is the standing recommendation.
 
 ### M3 — `llm`, the hoosh seam (Phase 2)
 
@@ -93,7 +103,13 @@ routes/*, router, main. **Gates:** per-worker arena + `_a` variants throughout
 ### M7 — `sandbox`, 77% (Phase 6)
 
 policy (rename to `AgnSandboxPolicy` first), kavach_bridge, exec, process, python,
-oci, manager. **Defers `wasm.rs`.** agnosai consumes only kavach's scoring + gate,
+oci, manager. **`wasm.rs`'s successor rides cx** per
+[ADR-006](../adr/006-cx-tool-sandbox.md): `cycc_cx` → `.cyx` → `cxvm`, spawned
+**inside** a kavach sandbox. `cxvm` does no syscall filtering of its own, so
+kavach's seccomp + landlock *are* the security boundary — an unwrapped `cxvm`
+spawn is a full escape, and the milestone needs a test asserting a `.cyx` that
+attempts `open("/etc/passwd")` is refused. Tool code is **integer-only** until cx
+arc B (float literals miscompile) and **Linux-x86 only** until arc C. agnosai consumes only kavach's scoring + gate,
 which port 1:1; uses `persistent_spawn/send/read/terminate` for the stdin-JSON
 tool protocol.
 

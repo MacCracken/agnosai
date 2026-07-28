@@ -1,0 +1,113 @@
+# =========================================================================
+# learning_profile.tcyr — parity tests for src/learning_profile.cyr
+#
+# Oracle: the 7 #[cfg(test)] tests in rust-old/src/learning/profile.rs.
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/learning_profile.cyr"
+include "tests/test_helpers.cyr"
+
+# Milliseconds as the nanosecond count the profile API takes — the readable
+# spelling of the oracle's `Duration::from_millis(n)`.
+fn _t_ms(n): i64 {
+    return n * AGNOSAI_NANOS_PER_MILLI;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("learning_profile");
+
+    var out: i64[1];
+    var agent = str_from("agent-a");
+    var build = str_from("build");
+    var test_action = str_from("test");
+    var deploy = str_from("deploy");
+    var missing = str_from("nonexistent");
+
+    # --- record_and_success_rate ---
+    var p1 = agnosai_profile_new();
+    agnosai_profile_record(p1, agent, build, _t_ms(100), 1);
+    agnosai_profile_record(p1, agent, build, _t_ms(200), 0);
+    agnosai_profile_record(p1, agent, build, _t_ms(150), 1);
+    assert_eq(agnosai_profile_success_rate(p1, agent, &out), 1, "success_rate is Some");
+    _t_assert_f64(load64(&out), _t_f64_ratio(2, 3), "3 records 2 ok -> rate 2/3");
+
+    # --- success_rate_for_action ---
+    var p2 = agnosai_profile_new();
+    agnosai_profile_record(p2, agent, build, _t_ms(100), 1);
+    agnosai_profile_record(p2, agent, test_action, _t_ms(200), 0);
+    agnosai_profile_record(p2, agent, build, _t_ms(150), 0);
+    assert_eq(agnosai_profile_success_rate_for_action(p2, agent, build, &out), 1,
+    "build rate is Some");
+    _t_assert_f64(load64(&out), F64_HALF, "build rate 0.5");
+    assert_eq(agnosai_profile_success_rate_for_action(p2, agent, test_action, &out), 1,
+    "test rate is Some");
+    _t_assert_f64(load64(&out), f64_from(0), "test rate 0.0");
+
+    # --- avg_duration ---
+    var p3 = agnosai_profile_new();
+    agnosai_profile_record(p3, agent, build, _t_ms(100), 1);
+    agnosai_profile_record(p3, agent, build, _t_ms(200), 1);
+    assert_eq(agnosai_profile_avg_duration(p3, agent, &out), 1, "avg_duration is Some");
+    assert_eq(load64(&out), _t_ms(150), "avg of 100ms and 200ms is 150ms");
+
+    # --- avg_duration_for_action ---
+    var p4 = agnosai_profile_new();
+    agnosai_profile_record(p4, agent, build, _t_ms(100), 1);
+    agnosai_profile_record(p4, agent, test_action, _t_ms(300), 1);
+    agnosai_profile_record(p4, agent, build, _t_ms(200), 1);
+    assert_eq(agnosai_profile_avg_duration_for_action(p4, agent, build, &out), 1,
+    "avg build duration is Some");
+    assert_eq(load64(&out), _t_ms(150), "avg build duration is 150ms");
+
+    # --- total_actions ---
+    var p5 = agnosai_profile_new();
+    assert_eq(agnosai_profile_total_actions(p5, agent), 0, "unknown agent has 0 actions");
+    agnosai_profile_record(p5, agent, build, _t_ms(100), 1);
+    agnosai_profile_record(p5, agent, test_action, _t_ms(200), 0);
+    assert_eq(agnosai_profile_total_actions(p5, agent), 2, "2 actions recorded");
+
+    # --- empty_agent_returns_none ---
+    var p6 = agnosai_profile_new();
+    assert_eq(agnosai_profile_success_rate(p6, missing, &out), 0, "success_rate None");
+    assert_eq(agnosai_profile_success_rate_for_action(p6, missing, build, &out), 0,
+    "success_rate_for_action None");
+    assert_eq(agnosai_profile_avg_duration(p6, missing, &out), 0, "avg_duration None");
+    assert_eq(agnosai_profile_avg_duration_for_action(p6, missing, build, &out), 0,
+    "avg_duration_for_action None");
+
+    # --- no_actions_of_type_returns_none ---
+    var p7 = agnosai_profile_new();
+    agnosai_profile_record(p7, agent, build, _t_ms(100), 1);
+    assert_eq(agnosai_profile_success_rate_for_action(p7, agent, deploy, &out), 0,
+    "no records of type -> success rate None");
+    assert_eq(agnosai_profile_avg_duration_for_action(p7, agent, deploy, &out), 0,
+    "no records of type -> avg duration None");
+
+    # --- ActionRecord field accessors round-trip ---
+    var p8 = agnosai_profile_new();
+    agnosai_profile_record(p8, agent, build, _t_ms(42), 1);
+    var rec = vec_get(map_get(load64(p8), agent), 0);
+    assert(str_eq(agnosai_action_record_action_type(rec), build) == 1, "record action_type");
+    assert_eq(agnosai_action_record_duration_ns(rec), _t_ms(42), "record duration_ns");
+    assert_eq(agnosai_action_record_success(rec), 1, "record success");
+    assert(agnosai_action_record_timestamp_ns(rec) > 0, "record timestamp stamped");
+
+    # --- record cap holds at MAX_RECORDS_PER_AGENT (Rust's eviction guard) ---
+    var p9 = agnosai_profile_new();
+    var churn = str_from("churn");
+    var over = AGNOSAI_MAX_RECORDS_PER_AGENT + 50;
+    for (var i = 0; i < over; i = i + 1) {
+        agnosai_profile_record(p9, churn, build, _t_ms(1), 1);
+    }
+    assert_eq(agnosai_profile_total_actions(p9, churn), AGNOSAI_MAX_RECORDS_PER_AGENT,
+    "records capped at 10000");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -1,0 +1,192 @@
+# =========================================================================
+# learning_optimizer — tabular Q-learning with interned state/action keys.
+#
+# Parity oracle: rust-old/src/learning/optimizer.rs
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * `HashMap<(u32, u32), f64>` becomes a u64-keyed map over the packed key
+#     `(state_id << 32) | action_id`. Both halves are u32 by construction (the
+#     interner refuses to hand out an id past U32_MAX), so the packing is
+#     lossless and the map needs no tuple support.
+#   * `best_action` returns the caller's own Str rather than an owned copy
+#     (Rust's `a.to_string()`), and 0 in place of `None`.
+#   * `f64::max` becomes `f64_max`. Both return the non-NaN operand's ordering
+#     verdict via a single `>` test, so the fold behaves identically here.
+#
+# The load-bearing invariant, and the reason two of the oracle's tests pass:
+# **`get_value` never interns.** An unseen state or action reads as 0.0 and
+# leaves the interner untouched; only `update` mints ids, and only for its own
+# `state` and `action` — never for `next_state` or `next_actions`.
+# =========================================================================
+
+# StringInterner heap layout — 16 bytes.
+enum AgnosaiInternerOff {
+    AGN_INTERN_MAP = 0;
+    AGN_INTERN_NEXT_ID = 8;
+    AGN_INTERN_SIZE = 16;
+}
+
+# QLearner heap layout — 32 bytes.
+enum AgnosaiQLearnerOff {
+    AGN_Q_TABLE = 0;
+    AGN_Q_INTERNER = 8;
+    AGN_Q_LEARNING_RATE = 16;
+    AGN_Q_DISCOUNT_FACTOR = 24;
+    AGN_Q_SIZE = 32;
+}
+
+# One past the largest id the interner will mint — the u32 ID space Rust's
+# `checked_add` guards.
+var AGNOSAI_INTERN_ID_LIMIT = 0x100000000;
+
+# Returned by best_action in place of Rust's `None`.
+var AGNOSAI_Q_NO_ACTION = 0;
+
+# Create an empty string-interning table.
+fn _agnosai_interner_new(): i64 {
+    var it = alloc(AGN_INTERN_SIZE);
+    store64(it + AGN_INTERN_MAP, map_new_str());
+    store64(it + AGN_INTERN_NEXT_ID, 0);
+    return it;
+}
+
+# The id already assigned to `s`, or -1 when it has never been interned.
+# Ids start at 0, so -1 is unambiguous — and this is the read-only half that
+# `get_value` needs in order not to mint ids as a side effect of a lookup.
+fn _agnosai_interner_lookup(it, s: Str): i64 {
+    var m = load64(it + AGN_INTERN_MAP);
+    if (map_has(m, s) == 0) { return 0 - 1; }
+    return map_get(m, s);
+}
+
+# The id for `s`, minting and recording a fresh one when absent.
+# The key is cloned on insert, matching the Rust `s.to_string()`.
+fn _agnosai_interner_intern(it, s: Str): i64 {
+    var existing = _agnosai_interner_lookup(it, s);
+    if (existing >= 0) { return existing; }
+
+    var id = load64(it + AGN_INTERN_NEXT_ID);
+    if (id >= AGNOSAI_INTERN_ID_LIMIT) {
+        panic("agnosai interner: exhausted u32 ID space (>4 billion unique strings)");
+    }
+    store64(it + AGN_INTERN_NEXT_ID, id + 1);
+    map_set(load64(it + AGN_INTERN_MAP), str_clone(s), id);
+    return id;
+}
+
+# Number of distinct strings interned so far.
+fn _agnosai_interner_count(it): i64 {
+    return map_size(load64(it + AGN_INTERN_MAP));
+}
+
+# Pack a (state id, action id) pair into the single u64 the Q-table is keyed on.
+fn _agnosai_q_key(state_id, action_id): i64 {
+    return (state_id << 32) | action_id;
+}
+
+# Create a new Q-learner. `learning_rate` (alpha) and `discount_factor` (gamma)
+# are f64 bit patterns.
+fn agnosai_qlearner_new(learning_rate, discount_factor): i64 {
+    var q = alloc(AGN_Q_SIZE);
+    store64(q + AGN_Q_TABLE, map_u64_new());
+    store64(q + AGN_Q_INTERNER, _agnosai_interner_new());
+    store64(q + AGN_Q_LEARNING_RATE, learning_rate);
+    store64(q + AGN_Q_DISCOUNT_FACTOR, discount_factor);
+    return q;
+}
+
+# Learning rate (alpha), as an f64 bit pattern.
+fn agnosai_qlearner_learning_rate(q): i64 {
+    return load64(q + AGN_Q_LEARNING_RATE);
+}
+
+# Discount factor (gamma), as an f64 bit pattern.
+fn agnosai_qlearner_discount_factor(q): i64 {
+    return load64(q + AGN_Q_DISCOUNT_FACTOR);
+}
+
+# Number of distinct strings the learner has interned. Only `update` interns,
+# and only its own state and action.
+fn agnosai_qlearner_interned_count(q): i64 {
+    return _agnosai_interner_count(load64(q + AGN_Q_INTERNER));
+}
+
+# Number of populated (state, action) cells in the Q-table.
+fn agnosai_qlearner_table_size(q): i64 {
+    return map_u64_size(load64(q + AGN_Q_TABLE));
+}
+
+# The Q-value for a (state, action) pair, as an f64 bit pattern.
+# Unseen pairs read as 0.0. This is a pure read: it never interns.
+fn agnosai_qlearner_get_value(q, state: Str, action: Str): i64 {
+    var it = load64(q + AGN_Q_INTERNER);
+    var s_id = _agnosai_interner_lookup(it, state);
+    if (s_id < 0) { return f64_from(0); }
+    var a_id = _agnosai_interner_lookup(it, action);
+    if (a_id < 0) { return f64_from(0); }
+    return map_u64_get_or(load64(q + AGN_Q_TABLE), _agnosai_q_key(s_id, a_id), f64_from(0));
+}
+
+# Q-learning update:
+#   Q(s,a) = Q(s,a) + lr * (reward + gamma * max_Q(s',a') - Q(s,a))
+# `reward` is an f64 bit pattern; `next_actions` is a vec of Str (possibly
+# empty). max_Q folds from 0.0, so it is never negative — matching the oracle's
+# `fold(0.0_f64, f64::max)`.
+fn agnosai_qlearner_update(q, state: Str, action: Str, reward, next_state: Str, next_actions): i64 {
+    var current_q = agnosai_qlearner_get_value(q, state, action);
+
+    var max_next_q = f64_from(0);
+    var n = vec_len(next_actions);
+    for (var i = 0; i < n; i = i + 1) {
+        var next_q = agnosai_qlearner_get_value(q, next_state, vec_get(next_actions, i));
+        max_next_q = f64_max(max_next_q, next_q);
+    }
+
+    var td_target = f64_add(reward, f64_mul(load64(q + AGN_Q_DISCOUNT_FACTOR), max_next_q));
+    var td_error = f64_sub(td_target, current_q);
+    var new_q = f64_add(current_q, f64_mul(load64(q + AGN_Q_LEARNING_RATE), td_error));
+
+    _agnosai_qlearner_log(state, action, new_q);
+
+    var it = load64(q + AGN_Q_INTERNER);
+    var s_id = _agnosai_interner_intern(it, state);
+    var a_id = _agnosai_interner_intern(it, action);
+    map_u64_set(load64(q + AGN_Q_TABLE), _agnosai_q_key(s_id, a_id), new_q);
+    return 0;
+}
+
+# The action with the highest Q-value in `state`, from the vec of Str
+# `actions`. Returns AGNOSAI_Q_NO_ACTION when `actions` is empty. Ties resolve
+# to the LAST such action, matching Rust's `max_by`.
+fn agnosai_qlearner_best_action(q, state: Str, actions): i64 {
+    var n = vec_len(actions);
+    if (n == 0) { return AGNOSAI_Q_NO_ACTION; }
+
+    var best = vec_get(actions, 0);
+    var best_v = agnosai_qlearner_get_value(q, state, best);
+    for (var i = 1; i < n; i = i + 1) {
+        var cand = vec_get(actions, i);
+        var v = agnosai_qlearner_get_value(q, state, cand);
+        if (f64_gt(best_v, v) == 0) {
+            best = cand;
+            best_v = v;
+        }
+    }
+    return best;
+}
+
+# Emit the debug trace Rust's `debug!(state, action, reward, new_q)` carries.
+# Guarded on the live level so the formatting cost is only paid when the
+# message would be emitted.
+fn _agnosai_qlearner_log(state: Str, action: Str, new_q): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, state);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add(sb, action);
+    str_builder_add_cstr(sb, " new_q_milli=");
+    str_builder_add_int(sb, f64_to(f64_mul(new_q, f64_from(1000))));
+    var line = str_builder_build(sb);
+    sakshi_log_kv(SK_DEBUG, "q-value updated", 15, "pair", 4, str_data(line), str_len(line));
+    return 0;
+}

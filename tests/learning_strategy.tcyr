@@ -1,0 +1,110 @@
+# =========================================================================
+# learning_strategy.tcyr — parity tests for src/learning_strategy.cyr
+#
+# Oracle: the 6 #[cfg(test)] tests in rust-old/src/learning/strategy.rs, plus
+# coverage of the UCB formula and the max_by tie rule, which the oracle's own
+# tests never reach (they only exercise unexplored-first and best_arm).
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/learning_strategy.cyr"
+include "tests/test_helpers.cyr"
+
+# A vec of `n` single-letter arm names: "a", "b", "c", ...
+# str_clone is load-bearing: str_from BORROWS the cstr rather than copying it,
+# so without the clone every name would alias this one reused stack buffer.
+fn _t_arm_names(n): i64 {
+    var v = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        var name[2];
+        store8(&name, 97 + i);
+        store8(&name + 1, 0);
+        vec_push(v, str_clone(str_from(&name)));
+    }
+    return v;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("learning_strategy");
+
+    # --- select_unexplored_first ---
+    var b1 = agnosai_ucb1_new(_t_arm_names(3));
+    assert_eq(agnosai_ucb1_select(b1, 0), 0, "no rounds played -> first unexplored arm");
+
+    # --- select_cycles_through_unexplored ---
+    var b2 = agnosai_ucb1_new(_t_arm_names(3));
+    agnosai_ucb1_update(b2, 0, F64_ONE);
+    assert_eq(agnosai_ucb1_select(b2, 1), 1, "arm 0 played -> select arm 1");
+    agnosai_ucb1_update(b2, 1, F64_HALF);
+    assert_eq(agnosai_ucb1_select(b2, 2), 2, "arms 0,1 played -> select arm 2");
+
+    # --- update_affects_selection ---
+    var b3 = agnosai_ucb1_new(_t_arm_names(2));
+    agnosai_ucb1_update(b3, 0, _t_f64_ratio(1, 10));
+    agnosai_ucb1_update(b3, 1, _t_f64_ratio(9, 10));
+    for (var i = 0; i < 20; i = i + 1) { agnosai_ucb1_update(b3, 1, _t_f64_ratio(9, 10)); }
+    for (var j = 0; j < 20; j = j + 1) { agnosai_ucb1_update(b3, 0, _t_f64_ratio(1, 10)); }
+    assert_eq(agnosai_ucb1_best_arm(b3), 1, "higher mean arm wins best_arm");
+    _t_assert_f64(agnosai_arm_stats_mean_reward(agnosai_ucb1_arm(b3, 1)),
+    _t_f64_ratio(9, 10), "arm 1 mean reward is 0.9");
+    assert_eq(agnosai_arm_stats_count(agnosai_ucb1_arm(b3, 1)), 21, "arm 1 pulled 21 times");
+
+    # --- best_arm_returns_highest_mean ---
+    var b4 = agnosai_ucb1_new(_t_arm_names(3));
+    agnosai_ucb1_update(b4, 0, _t_f64_ratio(3, 10));
+    agnosai_ucb1_update(b4, 1, _t_f64_ratio(9, 10));
+    agnosai_ucb1_update(b4, 2, _t_f64_ratio(5, 10));
+    assert_eq(agnosai_ucb1_best_arm(b4), 1, "best_arm is the highest mean");
+    _t_assert_f64(agnosai_arm_stats_total_reward(agnosai_ucb1_arm(b4, 0)), _t_f64_ratio(3, 10),
+    "arm 0 cumulative reward is 0.3");
+
+    # --- arm_count ---
+    var b5 = agnosai_ucb1_new(_t_arm_names(2));
+    assert_eq(agnosai_ucb1_arm_count(b5), 2, "arm_count is 2");
+    assert(str_eq(agnosai_arm_stats_name(agnosai_ucb1_arm(b5, 0)), str_from("a")) == 1,
+    "arm 0 keeps its name");
+
+    # --- empty_bandit ---
+    var b6 = agnosai_ucb1_new(vec_new());
+    assert_eq(agnosai_ucb1_arm_count(b6), 0, "empty bandit has no arms");
+    assert_eq(agnosai_ucb1_select(b6, 0), AGNOSAI_UCB1_NO_ARM, "empty bandit select is None");
+    assert_eq(agnosai_ucb1_best_arm(b6), AGNOSAI_UCB1_NO_ARM, "empty bandit best_arm is None");
+
+    # --- the UCB formula itself: both arms explored, equal exploration bonus,
+    # so the higher mean must win.
+    var b7 = agnosai_ucb1_new(_t_arm_names(2));
+    agnosai_ucb1_update(b7, 0, f64_from(0));
+    agnosai_ucb1_update(b7, 1, F64_ONE);
+    assert_eq(agnosai_ucb1_select(b7, 2), 1, "explored arms -> higher UCB score wins");
+
+    # --- an under-explored arm outranks a better-performing but saturated one:
+    # arm 0 mean 1.0 over 50 pulls, arm 1 mean 0.0 over 1 pull. At 51 rounds the
+    # sqrt(2*ln(51)/1) bonus on arm 1 exceeds arm 0's one-point lead.
+    var b8 = agnosai_ucb1_new(_t_arm_names(2));
+    for (var k = 0; k < 50; k = k + 1) { agnosai_ucb1_update(b8, 0, F64_ONE); }
+    agnosai_ucb1_update(b8, 1, f64_from(0));
+    assert_eq(agnosai_ucb1_select(b8, 51), 1, "exploration bonus lifts the starved arm");
+
+    # --- max_by tie rule: identical arms tie, and the LAST index wins.
+    var b9 = agnosai_ucb1_new(_t_arm_names(3));
+    agnosai_ucb1_update(b9, 0, F64_HALF);
+    agnosai_ucb1_update(b9, 1, F64_HALF);
+    agnosai_ucb1_update(b9, 2, F64_HALF);
+    assert_eq(agnosai_ucb1_select(b9, 3), 2, "tied UCB scores resolve to the last arm");
+    assert_eq(agnosai_ucb1_best_arm(b9), 2, "tied means resolve to the last arm");
+
+    # --- out-of-range update is ignored, not a crash ---
+    var b10 = agnosai_ucb1_new(_t_arm_names(2));
+    agnosai_ucb1_update(b10, 7, F64_ONE);
+    agnosai_ucb1_update(b10, 0 - 1, F64_ONE);
+    assert_eq(agnosai_arm_stats_count(agnosai_ucb1_arm(b10, 0)), 0, "bad index left arm 0 alone");
+    assert_eq(agnosai_ucb1_arm(b10, 7), 0, "out-of-range arm resolves to 0");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

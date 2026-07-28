@@ -1,7 +1,7 @@
 # AgnosAI — Rust → Cyrius Port Plan (v2.0.0)
 
 > Status: **Phase 0 in progress** (2026-07-28). Baseline greened, blockers
-> re-verified against cyrius 6.4.83, two upstream items shipped/filed.
+> re-verified against cyrius 6.4.83 (now pinned 6.4.85), two upstream fixes shipped.
 > Baseline: Rust v1.1.0, GREEN — `cargo fmt --check` clean,
 > `cargo clippy --all-features --all-targets -D warnings` clean, all 9 feature
 > combinations compile, **863 + 2 + 1 tests pass**. That green tree is the
@@ -14,10 +14,10 @@
 >
 > **Done so far:** blocker #7 fixed (the Rust tree is now a valid oracle);
 > blocker #1 fixed upstream in **sandhi 1.9.4** (three silent-truncation paths,
-> not one); blocker #4 filed as a cyrius issue; blocker #5 downgraded to
-> hygiene; blocker #8 (sort) discovered and quantified. Blockers #3 and #6
-> remain genuinely blocking — #3 with a known agnosai-side mitigation, #6 with
-> none (WASM does not ship in v2.0.0).
+> not one); blocker #4 shipped in cyrius 6.4.84; blocker #5 downgraded to
+> hygiene; blocker #8 (sort) discovered and quantified; blocker #6 **resolved by decision** — the tool sandbox rides **cx** +
+> kavach, recorded in ADR-006. Blocker #3 remains genuinely blocking, with a
+> known agnosai-side mitigation.
 
 ## Verdict
 
@@ -65,9 +65,9 @@ Keep `lib/async.cyr` in scope for **client-side fan-out only**.
 | 1 | **sandhi 64 KiB body cap, silent truncation** | ✅ **FIXED upstream in sandhi 1.9.4** | `HSV_REQ_BUF_SIZE = 65536`; `recv_request` fell out at max and `return have` — no 413. The constant `HTTP_PAYLOAD_TOO_LARGE = 413` was *declared* with **zero references**; nothing ever sent it. Reading the fn turned up **two more** silent paths: a peer that hangs up mid-request returned the partial bytes as if whole, and `Transfer-Encoding: chunked` with no Content-Length slipped past both smuggling guards, collapsing `need_body` to the header terminator so the handler ran with an **empty body** while the chunked bytes sat unread. 1.9.4 gives each a distinct sentinel (`ERR_TOO_LARGE` / `ERR_INCOMPLETE`) answered **413** / **400** / **501**, adds `sandhi_server_options_max_request` so the cap is policy (default unchanged at 64 KiB), and drains briefly before closing a refusal so the status is not destroyed by an RST. **Correction to the original entry:** the 1.28 GiB figure was attributed to the wrong function — `run_pooled` has no arena, each worker holds one reusable buffer, so cost is `cap × workers` and workers is already tunable. `run_async` is the one that eagerly allocates `max_conns`-sized. 10 MiB bodies cost ~80 MiB at 8 workers. |
 | 2 | **bayan JSON has no recursion-depth cap** | ✅ **resolved (bayan 1.1.1, folded)** | Confirmed present in the **folded** `~/.cyrius/lib/bayan.cyr`, not just upstream: `_JP_MAX_DEPTH = 128` (:3304), depth counter at `ps+40`, guards in **both** recursive descents — the tree parser `_jp_parse_value` (:3539) and the streaming parser `_js_parse_value` (:4059). Failure is a retrievable per-call error, not a crash. **Residual:** the *serializer* `_jb_walk` (:3761-3826) recurses on `JTAG_ARR`/`JTAG_OBJ` with **no cap** — uncapped upstream too, so it is not a fold lag. Only reachable from a tree agnosai itself built, so it is not an untrusted-input path; do not build unbounded-depth values from user data. |
 | 3 | **`sandhi_router_dispatch` allocates per request, never frees** | ❌ **STILL BLOCKING** — and broader than filed | Confirmed. But bypassing the router alone buys ~32 B/req out of a **~700–4096 B/req** leak: the whole bare `sandhi_server_*` accessor + `_send_*` family allocates on the global bump. Mitigation is agnosai-side and needs no upstream change: write our own handler on the raw `fn(ctx, cfd, buf, blen)` signature, take a per-worker arena, and use the `_a` variants **everywhere**, with one `reset_via` exit path. Invariant: nothing outliving the request (registry, router table, config) may come from the arena. **Residual we cannot close from a handler:** `_sandhi_server_pool_worker` itself calls bare `sandhi_server_send_status` on the smuggling rejects (~176 B/req before our handler runs) — a malformed-request flood at 10k req/s leaks ~1.76 MB/s. If internet-facing, replace `run_pooled` with a ~40-line accept loop (every primitive is in the fold); if behind a reverse proxy, accept it. Regression test: assert `alloc_used()` delta ≈ 0 over N thousand requests. |
-| 4 | **`chan_try_send` does not exist** | ⚠️ **filed upstream; NOT a port blocker** | Confirmed absent on **all three** backends (`thread.cyr`, `thread_win.cyr:87`, `thread_agnos.cyr:95`); each ships `chan_try_recv` and a blocking-only `chan_send`. Filed as `cyrius/docs/development/issues/2026-07-28-agnosai-chan-try-send.md`. **Important correction to the mapping:** every `let _ = tx.send(..)` in agnosai is a tokio **broadcast** send, which never blocks and never fails — a lagging subscriber gets the ring's *oldest* overwritten and reads `Lagged(n)` (sse.rs:266-279). So the Cyrius equivalent is **not** "drop the newest when full", it is "**evict the oldest**". A naive `tx.send` → `chan_send` port converts never-block-lossy into block-forever, the worst possible regression for SSE fan-out. Port as a private `agnosai_chan_push_lossy` that, under one mutex acquisition, advances `head` when full and then enqueues, keeping a lag counter. The real blocker is downstream: **do not route agnosai's fan-out through majra `pubsub_publish` as it stands** (2.5.1 holds the hub mutex across blocking sends, :138-184). |
+| 4 | **`chan_try_send` does not exist** | ✅ **SHIPPED in cyrius 6.4.84** | Was absent on all three backends. Filed 2026-07-28, shipped the same day: `chan_try_send(ch, val)` on `thread.cyr:409` / `thread_win.cyr:112` / `thread_agnos.cyr:116`, uniform contract **0** enqueued / **−1** closed / **−2** full, gated by a 20-assertion `vr01_` test on real hardware. The fix also uncovered that `chan_try_recv` and `chan_close` had been raising SIGSYS on macOS since forever — the channel fns called `SYS_FUTEX` directly, bypassing the macOS mutex backend; all three now route through `_chan_wake`. agnosai is pinned to 6.4.85. **Important correction to the mapping:** every `let _ = tx.send(..)` in agnosai is a tokio **broadcast** send, which never blocks and never fails — a lagging subscriber gets the ring's *oldest* overwritten and reads `Lagged(n)` (sse.rs:266-279). So the Cyrius equivalent is **not** "drop the newest when full", it is "**evict the oldest**". A naive `tx.send` → `chan_send` port converts never-block-lossy into block-forever, the worst possible regression for SSE fan-out. Port as a private `agnosai_chan_push_lossy` built **on top of** `chan_try_send` — the primitive gives "drop the newest when full", agnosai needs "evict the oldest", so on `-2` advance `head` and retry, keeping a lag counter. **Our filing was wrong on one point:** it proposed aliasing `chan_try_send` to `chan_send` on agnos/Windows since those never block. They return `-1` on FULL and never inspect `closed`, so that alias would have made closed and full indistinguishable on exactly those backends. Upstream wrote all three out properly instead. **Downstream status:** the majra half is **fixed in majra 2.5.3** (2026-07-28) — publish now snapshots each subscriber list under one short lock and walks it unlocked, so a lagging subscriber no longer freezes unrelated topics. 2.5.3 also closed two silent data-loss races in `pubsub_subscribe` and `mq_enqueue` (unlocked `fl_alloc` handing two subscribers the same block). agnosai is pinned to 2.5.3. |
 | 5 | **`SandboxPolicy` name collision** | 🟢 **downgraded to hygiene** | Not reachable as filed. The two structs' **field names are disjoint**, so no accessor symbol actually collides — and 6.4.83 *warns* on duplicate definitions rather than silently taking the last. Also, agnosai's strength lives on `IsolationLevel` (policy.rs:30-33), which has no kavach counterpart at all. Still do the `AgnSandboxPolicy` rename: one-line edit, cheap insurance, and the safety margin here should not depend on two type definitions staying disjoint by accident. |
-| 6 | **No WASM runtime anywhere** | ❌ **STILL BLOCKING — confirmed** | agnosai v2.0.0 **cannot** ship WASM. No embeddable engine exists in the ecosystem, and kavach 3.9.3's `Backend.WASM` shell-out has no binary to shell out to. Defers 955 lines: `sandbox/wasm.rs` (521), `tools/wasm_tool.rs` (265), `tools/wasm_loader.rs` (169), plus the `WasmModule`/`WasmResult`/`WasmSandbox` re-exports. |
+| 6 | ~~No WASM runtime anywhere~~ → **tool sandbox rides `cx`** | ✅ **DECIDED — see [ADR-006](../adr/006-cx-tool-sandbox.md)** | The earlier verdict conflated the *format* with the *capability*. WASM is an explicit cyrius non-goal, but what those 955 lines buy is **sandboxed portable execution of untrusted tool code**, and the **cx** arc — opened because a consumer "hit the wasm-shaped wall" — ships that today. Verified: `cycc_cx` compiles `.cyr` → `.cyx`, `cxvm` runs it from stdin, exit code passes through (6×7 probe → 42). Both installed. **The critical finding: `cxvm` is NOT a sandbox** — opcode `0x70` dispatches guest syscalls straight to the host kernel (`programs/cxvm.cyr:309-311`), with no allowlist, no filtering, no capability model. Every isolation guarantee therefore comes from **kavach** (seccomp `strict`/`basic` + landlock, both real). Filesystem/network confinement gets *stronger* (kernel-enforced); CPU metering gets *weaker* (wall-clock timeout, no fuel equivalent). **Hard requirement: no path may exec a `.cyx` outside a kavach sandbox** — an unwrapped `cxvm` spawn is a full escape. Arc-A limits, all verified: x86-Linux only, 64 KB caps, **float literals silently miscompile**, bare of stdlib. |
 | 7 | **Live Rust bug, fix first** | ✅ **FIXED 2026-07-28** | `cargo check --no-default-features --features kavach` failed: crew_runner.rs:199 gated on `kavach` but reached into `crate::sandbox::`, which lib.rs:27 gates on `sandbox`; only `full` hid it. Now `all(feature = "kavach", feature = "sandbox")`. All 9 feature combos compile; fmt + clippy clean; **863 + 2 + 1 tests pass**. The baseline is now a valid oracle. |
 | 8 | **No O(n log n) sort** *(promoted from "Corrections")* | ❌ **STILL BLOCKING — vendor ~55 lines** | Measured on this box at 6.4.83: an itihas-style insertion sort over agnosai's 100k-entry percentile vector (load_testing.rs) costs **52.6 seconds**; heapsort costs 87 ms (605×); three quickselects cost ~21 ms. Vendor both `ai_sort` (iterative in-place heapsort — O(n log n) *worst* case, O(1) extra memory, no recursion depth; not stable, and no site needs stability) and `ai_select_nth` (Hoare quickselect, median-of-3) — percentiles never needed a full sort. **Naming is load-bearing:** prefix `ai_*`; never define a bare `vec_sort`, which itihas exports unprefixed into the flat namespace. Second-order: scheduler.rs:257's `BinaryHeap` has no stdlib equivalent either — build it on the same sift primitive, or just sort the (small) ready-set each round. |
 
@@ -84,26 +84,26 @@ must precede callers).
 
 **Revised 2026-07-28 — use the daimon/stiva declare-ahead pattern, NOT
 vendoring.** The agnosys collision that justified hoosh's `src/vendor/` is gone,
-and agnosai wants majra as a first-class dep anyway. So `[deps.bote]` (core
-profile), `[deps.majra]`, `[deps.kavach]`, `[deps.sigil]`, `[deps.ai-hwaccel]`,
-`[deps.tyche]` — each declared explicitly *even where only transitively needed*,
+and agnosai wants majra as a first-class dep anyway. So `bote` (core
+profile), `majra`, `kavach`, `sigil`, `ai-hwaccel`,
+`tyche` — each declared explicitly *even where only transitively needed*,
 so `cyrius deps`' recursion resolves to **our** pins. Vendoring stays the
 fallback if `cyrius deps` misbehaves (then `src/vendor/`, never a top-level
 `vendor/` — cyaudit reads that as untrusted).
 
 Three hard constraints the scaffold must honor:
-- **sigil goes in `[deps.sigil]` and comes OUT of the stdlib array.** kavach,
+- **sigil goes in `sigil` and comes OUT of the stdlib array.** kavach,
   libro and majra all pin sigil themselves, so `cyrius deps` vendors a
   `dist/sigil.cyr` regardless; leaving `"sigil"` in the stdlib array too gives
   two packagings of one version — that is daimon's 227 "duplicate fn (last
   definition wins)" warnings. But `ct`/`keccak`/`random`/`thread_local` **stay**
   in the array: they are not in sigil's bundle, and omitting one links clean
   then SIGILLs (exit 132) at first crypto use.
-- **`[deps.mneme]` cannot exist** — mneme has no `[lib]` block, ships no `dist/`
+- **`mneme` cannot exist** — mneme has no lib block, ships no `dist/`
   bundle, and is AGPL-3.0 against our GPL-3.0-only. Reimplement UUID v4/v5 in
   `src/id.cyr` over stdlib `random_bytes` + `sha1` (~15 lines; add `"sha1"` to
   the array). Do not copy mneme's text.
-- **`sakshi` and `patra` are folded stdlib at 6.4.83** — no `[deps.*]` needed
+- **`sakshi` and `patra` are folded stdlib at 6.4.83** — no git pin needed
   unless a shadow warning appears.
 
 **Exit:** hello-world builds; `cyrius deps` resolves clean.
@@ -172,7 +172,7 @@ JSON-only definitions, plus OTLP telemetry.
 
 **Excluded, with reason:**
 - **bhava / `personality`** — not ported (user decree, post-v2).
-- **WASM**: wasm.rs, wasm_tool.rs, wasm_loader.rs, the tool SDK, examples/wasm-tools/ — no runtime exists.
+- **WASM as a FORMAT** — not ported (explicit cyrius non-goal). The *capability* ships: the tool sandbox rides **cx** + kavach per ADR-006. Existing `.wasm` tools, the tool SDK and `examples/wasm-tools/` do **not** port — they must be rewritten in Cyrius.
 - **definitions ZIP + YAML** — both behind the non-default `definitions` feature; both are upstream filings.
 - **genai.rs, inference_queue.rs** — zero consumers; pending sign-off.
 
@@ -206,7 +206,7 @@ included later (last-definition-wins, silently). Real modules **are** includable
 | kavach | WASM availability one-liner; stderr capture; **exec timeout — an undocumented regression** (Rust 2.0.0 shipped it, the Cyrius port dropped it, ADR-004 omits it) |
 | sigil | `pem_decode_pubkey` — a ~20-line clone of `pem_decode_privkey`. **Nice-to-have, not a blocker** (see below) |
 | bote | `jwt_verify_rs256` — **its stated premise is stale**: jwt.cyr:9-11 says "RS256 needs an asymmetric primitive sigil doesn't yet expose", but sigil has `rsa_pkcs1v15_verify_sha256` and `rsa_pubkey_from_der` already accepts SPKI. **Do not wait on this** — verified 2026-07-28 by *compiling and running* a scratch RS256 verify against the real toolchain. Implement the JWT half locally in agnosai over `bayan_base64url_decode` + `clock_epoch_secs` + sigil's existing RSA/SHA-256 primitives |
-| majra | pubsub holds the hub mutex across blocking sends; relay's file-scope globals make `relay_receive` non-reentrant (its own comment says they're vestigial) |
+| majra | ✅ **hub-mutex-across-blocking-sends fixed in 2.5.3**. Still open: relay's file-scope globals make `relay_receive` non-reentrant (its own comment says they're vestigial) |
 | sandhi | ✅ **body cap/413 shipped in 1.9.4** (blocker #1) — plus the two adjacent silent paths found while fixing it (peer-hangup, TE-chunked-only) and a configurable `max_request`. **Still open:** per-request allocation (blocker #3) — ask for `sandhi_router_dispatch_a(a, ...)` / `_c_a` plus an optional per-request arena hook on `run_pooled` (the TLS pool already proves the pattern), and `_a` variants for the two bare `send_status` calls inside `_sandhi_server_pool_worker`; `backlog` silently ignored by run_opts/run_async; chunked start hardcodes " OK"; **inbound** chunked decoding (1.9.4 answers 501, which is honest but not the same as support) |
 
 ## Corrections to earlier claims (recorded so they are not re-derived)
