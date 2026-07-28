@@ -194,12 +194,13 @@ impl CrewRunner {
         }
 
         // Compute kavach sandbox strength score for the crew's isolation level.
-        #[cfg(feature = "kavach")]
+        // `kavach_bridge` lives under `sandbox`, so both features must be on.
+        #[cfg(all(feature = "kavach", feature = "sandbox"))]
         let sandbox_strength = {
             let sandbox_policy = crate::sandbox::policy::SandboxPolicy::process();
             Some(crate::sandbox::kavach_bridge::strength_for_policy(&sandbox_policy).value())
         };
-        #[cfg(not(feature = "kavach"))]
+        #[cfg(not(all(feature = "kavach", feature = "sandbox")))]
         let sandbox_strength: Option<u8> = None;
 
         let profile = CrewProfile {

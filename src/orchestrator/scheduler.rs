@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::core::error::{AgnosaiError, Result};
@@ -145,7 +146,7 @@ impl Scheduler {
             .collect();
 
         // Highest priority first.
-        ready.sort_by(|a, b| b.priority.cmp(&a.priority));
+        ready.sort_by_key(|t| Reverse(t.priority));
         ready
     }
 

@@ -45,7 +45,7 @@ Keep `lib/async.cyr` in scope for **client-side fan-out only**.
 | # | Blocker | Detail |
 |---|---|---|
 | 1 | **sandhi 64 KiB body cap, silent truncation** | `HSV_REQ_BUF_SIZE = 65536` (sandhi.cyr:12724); `recv_request` falls out at max and `return have` — no 413, the string "413" does not appear in sandhi.cyr. Handler gets a truncated body + a Content-Length claiming more. agnosai's `MAX_BODY_BYTES = 10 MiB` (server/mod.rs:39) is **160x**. Cannot just raise it: it sizes the per-conn arena (128 × 10 MiB = 1.28 GiB). |
-| 2 | **bayan JSON has no recursion-depth cap** | `_JP_STATE_SIZE = 40` = 5 slots, no depth counter; `_jp_parse_value` recurses freely. serde_json defaults to 128. A nested body on POST /crews, /a2a/receive, /mcp stack-overflows the worker. This is a **parity regression**, not a gap. |
+| 2 | **bayan JSON has no recursion-depth cap** — ✅ **resolved in bayan 1.1.1** | ~~`_JP_STATE_SIZE = 40` = 5 slots, no depth counter; `_jp_parse_value` recurses freely.~~ bayan 1.1.1 caps both descents at 128 (`_JP_MAX_DEPTH`, serde_json wire-parity); past the cap the parse fails `"nesting too deep"` through the per-call error path. Picked up by re-pinning bayan ≥ 1.1.1 (or the next cyrius `lib/bayan.cyr` refold). serde_json defaults to 128. A nested body on POST /crews, /a2a/receive, /mcp stack-overflowed the worker — a **parity regression**, now closed. |
 | 3 | **`sandhi_router_dispatch` allocates per request, never frees** | Uses non-arena accessors on the global bump allocator; sandhi's own comment (:13359-13365) defers this. Unbounded RSS growth per request on a long-running server. |
 | 4 | **`chan_try_send` does not exist** | `chan_try_recv` exists (thread.cyr:409); `chan_send` blocks (:331/:352). Breaks non-blocking `let _ = tx.send(..)` (crew_runner.rs:115,786) and majra pubsub fan-out (one wedged SSE subscriber stalls every topic). |
 | 5 | **`SandboxPolicy` name collision** | agnosai `policy.rs:39` vs kavach `policy.cyr:7`. One flat namespace, both `#derive(accessors)` → both emit `SandboxPolicy_set_*` → last-definition-wins → **silently corrupted strength scores**. Rename agnosai's to `AgnSandboxPolicy`. |
@@ -157,7 +157,7 @@ included later (last-definition-wins, silently). Real modules **are** includable
 
 | Repo | Ask |
 |---|---|
-| bayan | YAML parse → the existing tagged value tree (draft written); **+ JSON recursion-depth cap** (blocker #2) |
+| bayan | ✅ **both filed 2026-07-16** — YAML parse → the existing tagged value tree: `bayan/docs/development/issues/2026-07-16-agnosai-yaml-parse-into-tagged-value-tree.md` (also accepted onto bayan's roadmap as `bayan_yaml_*`; the "draft written" here never materialized as a file — the filing supersedes it); JSON recursion-depth cap (blocker #2): `bayan/docs/development/issues/2026-07-16-agnosai-json-no-recursion-depth-cap.md` — ✅ **resolved in bayan 1.1.1** (cap 128, serde_json parity; 101/101 asserts green) |
 | sankoch | ZIP archive container (deflate + crc32 already there; ~250 lines) |
 | cyrius | `chan_try_send` (blocker #4); O(n log n) sort (every ecosystem sort is O(n²) — agora/board.cyr:805-808 explicitly invites the bite "if a consumer reports a perf concern"; load_testing.rs p50/p95/p99 over 100k entries is that consumer) |
 | kavach | WASM availability one-liner; stderr capture; **exec timeout — an undocumented regression** (Rust 2.0.0 shipped it, the Cyrius port dropped it, ADR-004 omits it) |

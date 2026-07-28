@@ -41,18 +41,13 @@ pub fn is_safe_url(url: &str) -> bool {
 
     // Block private/link-local IP ranges. Use parsed.host() to correctly
     // handle both IPv4 and bracketed IPv6 addresses.
-    match parsed.host() {
-        Some(url::Host::Ipv4(v4)) => {
-            if is_private_ipv4(v4) {
-                return false;
-            }
-        }
-        Some(url::Host::Ipv6(v6)) => {
-            if is_private_ip(std::net::IpAddr::V6(v6)) {
-                return false;
-            }
-        }
-        _ => {}
+    let private = match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => is_private_ipv4(v4),
+        Some(url::Host::Ipv6(v6)) => is_private_ip(std::net::IpAddr::V6(v6)),
+        _ => false,
+    };
+    if private {
+        return false;
     }
 
     true
