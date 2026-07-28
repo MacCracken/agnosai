@@ -1,0 +1,175 @@
+# =========================================================================
+# llm_retry.tcyr — parity tests for src/llm_retry.cyr
+#
+# Oracle: the 7 sync + 4 #[tokio::test] tests in rust-old/src/llm/retry.rs.
+# The four async ones port here as ordinary tests: the Cyrius driver takes a
+# function pointer rather than a future, so there is nothing to await.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/core_error.cyr"
+include "src/learning_profile.cyr"
+include "src/llm_retry.cyr"
+include "tests/test_helpers.cyr"
+
+# Call counter shared by the callback fixtures below. Each fixture resets it.
+var _t_calls = 0;
+
+# Always succeeds, writing 42.
+fn _t_cb_ok(ctx, out_value): i64 {
+    _t_calls = _t_calls + 1;
+    store64(out_value, 42);
+    return 0;
+}
+
+# Fails with a retryable error for the first two calls, then succeeds.
+fn _t_cb_transient(ctx, out_value): i64 {
+    var n = _t_calls;
+    _t_calls = _t_calls + 1;
+    if (n < 2) { return str_from("503 Service Unavailable"); }
+    store64(out_value, 7);
+    return 0;
+}
+
+# Always fails with a retryable error.
+fn _t_cb_always_retryable(ctx, out_value): i64 {
+    _t_calls = _t_calls + 1;
+    return str_from("rate limit exceeded");
+}
+
+# Always fails with a non-retryable error.
+fn _t_cb_non_retryable(ctx, out_value): i64 {
+    _t_calls = _t_calls + 1;
+    return str_from("invalid API key");
+}
+
+# Milliseconds as the nanosecond count the retry API takes.
+fn _t_ms_ns(n): i64 {
+    return n * AGNOSAI_NS_PER_MS;
+}
+
+fn main() {
+    alloc_init();
+    rng_seed(42);
+
+    # The retry paths under test warn on every failed attempt. The oracle's
+    # tests install no tracing subscriber, so they emit nothing; raising the
+    # sakshi floor to ERROR reproduces that and keeps a real failure visible in
+    # the suite output instead of buried in expected warnings.
+    sakshi_set_level(SK_ERROR);
+
+    test_group("llm_retry");
+
+    var out: i64[1];
+
+    # --- default_config ---
+    var d = agnosai_retry_config_default();
+    assert_eq(agnosai_retry_config_max_retries(d), 3, "default max_retries is 3");
+    assert_eq(agnosai_retry_config_base_delay_ns(d), _t_ms_ns(500), "default base delay is 500ms");
+    assert_eq(agnosai_retry_config_max_delay_ns(d), 30 * AGNOSAI_NS_PER_SEC, "default max delay is 30s");
+    assert_eq(agnosai_retry_config_jitter(d), 1, "default jitter is on");
+
+    # --- none_config_no_retries (other fields keep their defaults) ---
+    var none = agnosai_retry_config_none();
+    assert_eq(agnosai_retry_config_max_retries(none), 0, "none config has 0 retries");
+    assert_eq(agnosai_retry_config_base_delay_ns(none), _t_ms_ns(500), "none config keeps the default base delay");
+
+    var agg = agnosai_retry_config_aggressive();
+    assert_eq(agnosai_retry_config_max_retries(agg), 5, "aggressive config has 5 retries");
+    assert_eq(agnosai_retry_config_base_delay_ns(agg), _t_ms_ns(250), "aggressive base delay is 250ms");
+    assert_eq(agnosai_retry_config_max_delay_ns(agg), 60 * AGNOSAI_NS_PER_SEC, "aggressive max delay is 60s");
+
+    # --- compute_delay_exponential ---
+    var exp = agnosai_retry_config_new(3, _t_ms_ns(100), 10 * AGNOSAI_NS_PER_SEC, 0);
+    assert_eq(agnosai_compute_delay(exp, 0), _t_ms_ns(100), "attempt 0 -> 100ms");
+    assert_eq(agnosai_compute_delay(exp, 1), _t_ms_ns(200), "attempt 1 -> 200ms");
+    assert_eq(agnosai_compute_delay(exp, 2), _t_ms_ns(400), "attempt 2 -> 400ms");
+    assert_eq(agnosai_compute_delay(exp, 3), _t_ms_ns(800), "attempt 3 -> 800ms");
+
+    # --- compute_delay_capped ---
+    var capped = agnosai_retry_config_new(3, AGNOSAI_NS_PER_SEC, 5 * AGNOSAI_NS_PER_SEC, 0);
+    assert_eq(agnosai_compute_delay(capped, 10), 5 * AGNOSAI_NS_PER_SEC, "attempt 10 caps at max_delay");
+    # a very large attempt must still cap rather than overflow
+    assert_eq(agnosai_compute_delay(capped, 4000), 5 * AGNOSAI_NS_PER_SEC, "a huge attempt still caps, no overflow");
+
+    # --- compute_delay_with_jitter: within [capped, capped + 25%] ---
+    var jit = agnosai_retry_config_new(3, _t_ms_ns(100), 10 * AGNOSAI_NS_PER_SEC, 1);
+    var in_range = 1;
+    var saw_jitter = 0;
+    for (var i = 0; i < 200; i = i + 1) {
+        var dly = agnosai_compute_delay(jit, 0);
+        if (dly < _t_ms_ns(100)) { in_range = 0; }
+        if (dly > _t_ms_ns(125)) { in_range = 0; }
+        if (dly > _t_ms_ns(100)) { saw_jitter = 1; }
+    }
+    assert(in_range, "jittered delay stays within [100ms, 125ms]");
+    assert(saw_jitter, "jitter actually varies the delay");
+
+    # a capped delay under 4ms yields no jitter at all, matching the oracle's
+    # integer-millisecond jitter_range
+    var tiny = agnosai_retry_config_new(3, _t_ms_ns(2), _t_ms_ns(2), 1);
+    assert_eq(agnosai_compute_delay(tiny, 0), _t_ms_ns(2), "a sub-4ms delay gets no jitter");
+
+    # --- is_retryable_rate_limit ---
+    assert_eq(agnosai_is_retryable(str_from("rate limit exceeded")), 1, "rate limit is retryable");
+    assert_eq(agnosai_is_retryable(str_from("HTTP 429 Too Many Requests")), 1, "429 is retryable");
+    assert_eq(agnosai_is_retryable(str_from("503 Service Unavailable")), 1, "503 is retryable");
+    assert_eq(agnosai_is_retryable(str_from("connection timed out")), 1, "timed out is retryable");
+    assert_eq(agnosai_is_retryable(str_from("server overloaded")), 1, "overloaded is retryable");
+
+    # --- is_retryable_non_retryable ---
+    assert_eq(agnosai_is_retryable(str_from("invalid API key")), 0, "invalid API key is not retryable");
+    assert_eq(agnosai_is_retryable(str_from("model not found")), 0, "model not found is not retryable");
+    assert_eq(agnosai_is_retryable(str_from("invalid request")), 0, "invalid request is not retryable");
+
+    # matching is case-insensitive, as to_ascii_lowercase makes it
+    assert_eq(agnosai_is_retryable(str_from("RATE LIMIT EXCEEDED")), 1, "uppercase rate limit is retryable");
+    assert_eq(agnosai_is_retryable(str_from("Connection Reset By Peer")), 1, "mixed-case connection reset");
+    assert_eq(agnosai_is_retryable(str_from("")), 0, "an empty message is not retryable");
+
+    # --- with_retry_succeeds_first_try ---
+    _t_calls = 0;
+    store64(&out, 0);
+    assert_eq(agnosai_with_retry(none, str_from("t1"), &_t_cb_ok, 0, &out), 0, "with_retry returns success");
+    assert_eq(load64(&out), 42, "with_retry wrote the callback's value");
+    assert_eq(_t_calls, 1, "callback ran once");
+
+    # --- with_retry_succeeds_after_transient_failure ---
+    var fast = agnosai_retry_config_new(3, _t_ms_ns(1), _t_ms_ns(10), 0);
+    _t_calls = 0;
+    store64(&out, 0);
+    assert_eq(agnosai_with_retry(fast, str_from("t2"), &_t_cb_transient, 0, &out), 0,
+    "with_retry recovers from transient failures");
+    assert_eq(load64(&out), 7, "recovered value written");
+    assert_eq(_t_calls, 3, "2 failures + 1 success");
+
+    # --- with_retry_exhausts_retries ---
+    var two = agnosai_retry_config_new(2, _t_ms_ns(1), _t_ms_ns(10), 0);
+    _t_calls = 0;
+    var err = agnosai_with_retry(two, str_from("t3"), &_t_cb_always_retryable, 0, &out);
+    assert(err != 0, "with_retry returns the last error when retries are exhausted");
+    assert(str_eq(err, str_from("rate limit exceeded")) == 1, "the returned error is the callback's");
+    assert_eq(_t_calls, 3, "max_retries 2 means 3 total attempts");
+
+    # --- with_retry_skips_non_retryable ---
+    _t_calls = 0;
+    var nerr = agnosai_with_retry(agnosai_retry_config_default(), str_from("t4"),
+    &_t_cb_non_retryable, 0, &out);
+    assert(nerr != 0, "a non-retryable error is returned");
+    assert(str_eq(nerr, str_from("invalid API key")) == 1, "the non-retryable error is passed through");
+    assert_eq(_t_calls, 1, "a non-retryable error short-circuits without consuming retries");
+
+    # --- a zero-retry config attempts exactly once even on a retryable error ---
+    _t_calls = 0;
+    assert(agnosai_with_retry(agnosai_retry_config_none(), str_from("t5"),
+    &_t_cb_always_retryable, 0, &out) != 0, "none config still surfaces the error");
+    assert_eq(_t_calls, 1, "none config attempts exactly once");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

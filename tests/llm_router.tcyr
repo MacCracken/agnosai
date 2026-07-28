@@ -1,0 +1,142 @@
+# =========================================================================
+# llm_router.tcyr — parity tests for src/llm_router.cyr
+#
+# Oracle: the 14 non-hwaccel #[cfg(test)] tests in rust-old/src/llm/router.rs.
+# The 3 `#[cfg(feature = "hwaccel")]` tests defer with that feature.
+#
+# The oracle spot-checks 10 of the 21 routing-matrix cells; this walks all 21,
+# since the matrix is the whole point of the module.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/llm_router.cyr"
+include "tests/test_helpers.cyr"
+
+# Assert routing a (task_type, complexity) pair yields `expected`.
+fn _t_assert_route(task_type, complexity, expected, name): i64 {
+    return assert_eq(agnosai_route(agnosai_task_profile_new(task_type, complexity)), expected, name);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("llm_router");
+
+    # --- the oracle's named cases ---
+    _t_assert_route(AGNOSAI_TASKTYPE_SUMMARIZE, AGNOSAI_COMPLEXITY_SIMPLE, AGNOSAI_TIER_FAST,
+    "summarize_simple_is_fast");
+    _t_assert_route(AGNOSAI_TASKTYPE_CLASSIFY, AGNOSAI_COMPLEXITY_MEDIUM, AGNOSAI_TIER_FAST,
+    "classify_medium_is_fast");
+    _t_assert_route(AGNOSAI_TASKTYPE_SUMMARIZE, AGNOSAI_COMPLEXITY_COMPLEX, AGNOSAI_TIER_CAPABLE,
+    "summarize_complex_is_capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_CODE, AGNOSAI_COMPLEXITY_SIMPLE, AGNOSAI_TIER_CAPABLE,
+    "code_simple_is_capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_CODE, AGNOSAI_COMPLEXITY_COMPLEX, AGNOSAI_TIER_PREMIUM,
+    "code_complex_is_premium");
+    _t_assert_route(AGNOSAI_TASKTYPE_REASON, AGNOSAI_COMPLEXITY_MEDIUM, AGNOSAI_TIER_CAPABLE,
+    "reason_medium_is_capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_RESEARCH, AGNOSAI_COMPLEXITY_SIMPLE, AGNOSAI_TIER_CAPABLE,
+    "research_simple_is_capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_RESEARCH, AGNOSAI_COMPLEXITY_MEDIUM, AGNOSAI_TIER_PREMIUM,
+    "research_medium_is_premium");
+    _t_assert_route(AGNOSAI_TASKTYPE_MULTI_STEP, AGNOSAI_COMPLEXITY_COMPLEX, AGNOSAI_TIER_PREMIUM,
+    "multistep_complex_is_premium");
+    _t_assert_route(AGNOSAI_TASKTYPE_PLAN, AGNOSAI_COMPLEXITY_COMPLEX, AGNOSAI_TIER_PREMIUM,
+    "plan_complex_is_premium");
+
+    # --- the 11 matrix cells the oracle never names ---
+    _t_assert_route(AGNOSAI_TASKTYPE_SUMMARIZE, AGNOSAI_COMPLEXITY_MEDIUM, AGNOSAI_TIER_FAST,
+    "summarize/medium -> fast");
+    _t_assert_route(AGNOSAI_TASKTYPE_CLASSIFY, AGNOSAI_COMPLEXITY_SIMPLE, AGNOSAI_TIER_FAST,
+    "classify/simple -> fast");
+    _t_assert_route(AGNOSAI_TASKTYPE_CLASSIFY, AGNOSAI_COMPLEXITY_COMPLEX, AGNOSAI_TIER_CAPABLE,
+    "classify/complex -> capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_CODE, AGNOSAI_COMPLEXITY_MEDIUM, AGNOSAI_TIER_CAPABLE,
+    "code/medium -> capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_PLAN, AGNOSAI_COMPLEXITY_SIMPLE, AGNOSAI_TIER_CAPABLE,
+    "plan/simple -> capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_PLAN, AGNOSAI_COMPLEXITY_MEDIUM, AGNOSAI_TIER_CAPABLE,
+    "plan/medium -> capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_REASON, AGNOSAI_COMPLEXITY_SIMPLE, AGNOSAI_TIER_CAPABLE,
+    "reason/simple -> capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_REASON, AGNOSAI_COMPLEXITY_COMPLEX, AGNOSAI_TIER_PREMIUM,
+    "reason/complex -> premium");
+    _t_assert_route(AGNOSAI_TASKTYPE_RESEARCH, AGNOSAI_COMPLEXITY_COMPLEX, AGNOSAI_TIER_PREMIUM,
+    "research/complex -> premium");
+    _t_assert_route(AGNOSAI_TASKTYPE_MULTI_STEP, AGNOSAI_COMPLEXITY_SIMPLE, AGNOSAI_TIER_CAPABLE,
+    "multi_step/simple -> capable");
+    _t_assert_route(AGNOSAI_TASKTYPE_MULTI_STEP, AGNOSAI_COMPLEXITY_MEDIUM, AGNOSAI_TIER_PREMIUM,
+    "multi_step/medium -> premium");
+
+    # every cell resolves to one of the three tiers, never to a stray value
+    var all_valid = 1;
+    for (var tt = AGNOSAI_TASKTYPE_SUMMARIZE; tt <= AGNOSAI_TASKTYPE_MULTI_STEP; tt = tt + 1) {
+        for (var cx = AGNOSAI_COMPLEXITY_SIMPLE; cx <= AGNOSAI_COMPLEXITY_COMPLEX; cx = cx + 1) {
+            var t = agnosai_route(agnosai_task_profile_new(tt, cx));
+            if (t < AGNOSAI_TIER_FAST || t > AGNOSAI_TIER_PREMIUM) { all_valid = 0; }
+        }
+    }
+    assert(all_valid, "all 21 matrix cells resolve to a valid tier");
+
+    # --- default_model ---
+    assert(str_eq(agnosai_default_model(AGNOSAI_TIER_FAST), str_from("llama3")) == 1, "default_model_fast");
+    assert(str_eq(agnosai_default_model(AGNOSAI_TIER_CAPABLE), str_from("llama3:70b")) == 1,
+    "default_model_capable");
+    assert(str_eq(agnosai_default_model(AGNOSAI_TIER_PREMIUM), str_from("llama3:405b")) == 1,
+    "default_model_premium");
+
+    # --- parse_complexity_variants ---
+    assert_eq(agnosai_parse_complexity(str_from("low")), AGNOSAI_COMPLEXITY_SIMPLE, "low -> simple");
+    assert_eq(agnosai_parse_complexity(str_from("simple")), AGNOSAI_COMPLEXITY_SIMPLE, "simple -> simple");
+    assert_eq(agnosai_parse_complexity(str_from("medium")), AGNOSAI_COMPLEXITY_MEDIUM, "medium -> medium");
+    assert_eq(agnosai_parse_complexity(str_from("high")), AGNOSAI_COMPLEXITY_COMPLEX, "high -> complex");
+    assert_eq(agnosai_parse_complexity(str_from("complex")), AGNOSAI_COMPLEXITY_COMPLEX, "complex -> complex");
+    assert_eq(agnosai_parse_complexity(str_from("HIGH")), AGNOSAI_COMPLEXITY_COMPLEX, "HIGH -> complex");
+    assert_eq(agnosai_parse_complexity(str_from("unknown")), AGNOSAI_COMPLEXITY_MEDIUM, "unknown -> medium");
+
+    # case-insensitivity beyond the oracle's single HIGH case
+    assert_eq(agnosai_parse_complexity(str_from("LoW")), AGNOSAI_COMPLEXITY_SIMPLE, "LoW -> simple");
+    assert_eq(agnosai_parse_complexity(str_from("CoMpLeX")), AGNOSAI_COMPLEXITY_COMPLEX, "CoMpLeX -> complex");
+    assert_eq(agnosai_parse_complexity(str_from("")), AGNOSAI_COMPLEXITY_MEDIUM, "empty -> medium");
+    assert_eq(agnosai_parse_complexity(str_from("lowe")), AGNOSAI_COMPLEXITY_MEDIUM,
+    "a longer string that merely starts with 'low' is not Simple");
+
+    # --- wire spellings ---
+    assert(str_eq(agnosai_model_tier_to_wire(AGNOSAI_TIER_FAST), str_from("fast")) == 1, "wire fast");
+    assert(str_eq(agnosai_model_tier_to_wire(AGNOSAI_TIER_CAPABLE), str_from("capable")) == 1, "wire capable");
+    assert(str_eq(agnosai_model_tier_to_wire(AGNOSAI_TIER_PREMIUM), str_from("premium")) == 1, "wire premium");
+    assert(str_eq(agnosai_task_type_to_wire(AGNOSAI_TASKTYPE_MULTI_STEP), str_from("multi_step")) == 1,
+    "MultiStep renders snake_case as multi_step, not multistep");
+    assert(str_eq(agnosai_complexity_to_wire(AGNOSAI_COMPLEXITY_SIMPLE), str_from("simple")) == 1, "wire simple");
+
+    var tier_ok = 1;
+    for (var ti = AGNOSAI_TIER_FAST; ti <= AGNOSAI_TIER_PREMIUM; ti = ti + 1) {
+        if (agnosai_model_tier_from_wire(agnosai_model_tier_to_wire(ti)) != ti) { tier_ok = 0; }
+    }
+    assert(tier_ok, "every model tier round-trips through its wire spelling");
+
+    var tt_ok = 1;
+    for (var tj = AGNOSAI_TASKTYPE_SUMMARIZE; tj <= AGNOSAI_TASKTYPE_MULTI_STEP; tj = tj + 1) {
+        if (agnosai_task_type_from_wire(agnosai_task_type_to_wire(tj)) != tj) { tt_ok = 0; }
+    }
+    assert(tt_ok, "every task type round-trips through its wire spelling");
+
+    assert_eq(agnosai_model_tier_from_wire(str_from("bogus")), AGNOSAI_TIER_FAST, "unknown tier -> fast");
+    assert_eq(agnosai_task_type_from_wire(str_from("bogus")), AGNOSAI_TASKTYPE_SUMMARIZE,
+    "unknown task type -> summarize");
+
+    # --- TaskProfile accessors + JSON ---
+    var p = agnosai_task_profile_new(AGNOSAI_TASKTYPE_CODE, AGNOSAI_COMPLEXITY_COMPLEX);
+    assert_eq(agnosai_task_profile_task_type(p), AGNOSAI_TASKTYPE_CODE, "profile task_type");
+    assert_eq(agnosai_task_profile_complexity(p), AGNOSAI_COMPLEXITY_COMPLEX, "profile complexity");
+    assert(str_eq(bayan_json_v_build(agnosai_task_profile_to_value(p)),
+    str_from("{\"task_type\":\"code\",\"complexity\":\"complex\"}")) == 1,
+    "task profile serializes in declaration order");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

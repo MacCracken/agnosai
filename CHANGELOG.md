@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **llm** (M3, Phase 2, in progress) — `src/llm.cyr` hub plus two of three submodules:
+  - **llm_router** — `agnosai_route` / `agnosai_default_model` / `agnosai_parse_complexity`:
+    task-complexity model routing over ModelTier, TaskType, Complexity and TaskProfile.
+  - **llm_retry** — `agnosai_with_retry` / `agnosai_compute_delay` / `agnosai_is_retryable`:
+    exponential backoff with jitter, and the retryable-error classifier.
+- **units** — the shared `AGNOSAI_NS_PER_SEC` / `_MS` / `_US` time constants. No oracle module;
+  extracted once `learning_profile` and `core_error` had each grown their own — under two
+  different names for the same value — and `llm_retry` would have been the third consumer.
 - **id** — `agnosai_uuid_*`: UUID v4 and v5 (RFC 4122) over the stdlib's kernel-entropy
   `random_bytes` plus `sha1`. This closes a Phase 0 scaffold gate. It exists rather than being a
   dependency because **mneme is unusable** — no lib block, no `dist/` bundle, and AGPL-3.0 against
