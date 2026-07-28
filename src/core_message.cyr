@@ -294,13 +294,16 @@ fn agnosai_message_from_value(v): i64 {
 #      a **C string**; `bayan_json_v_obj_set` and `bayan_json_v_parse` take a
 #      **Str**. Passing the wrong one reads a Str header as text, or text as a
 #      pointer — a segfault, not a clean error.
-#   2. **`bayan_json_v_parse` itself is unusable.** A call to it misresolves to
-#      its `bayan_json_v_parse_str` sibling (the compiler warns "expects 2
-#      arguments, got 1") and returns 0 for every input, including valid JSON.
-#      The `json_v_parse` back-compat alias has the identical fault. The
-#      explicit-length entry points are unaffected, so we call
-#      `bayan_json_v_parse_str` directly. Filed for upstream — do NOT "simplify"
-#      this back to the bare call.
+#   2. **`bayan_json_v_parse` is unusable in the vendored bayan.** Cyrius routes
+#      a call `X(a, …)` to `X_str` when `a` is Str-typed and `X_str` exists (the
+#      same overload dispatch that routes `&IDENT` to `_ptr`). Because the
+#      cstr+len form was named `bayan_json_v_parse_str`, the bare call was
+#      rewritten into a 1-arg call to a 2-arg fn and returned 0 for valid JSON.
+#      **Fixed upstream in bayan 1.3.0** (cstr+len forms renamed `_str` →
+#      `_buf`), but the fold into cyrius has not landed yet, so we still call
+#      `bayan_json_v_parse_str` here. **At the next bayan fold-in, switch this
+#      to the bare `bayan_json_v_parse(src)`** — and note `_str` will no longer
+#      exist, so this line is a compile error until it is updated.
 fn agnosai_message_from_json(src: Str): i64 {
     var v = bayan_json_v_parse_str(str_data(src), str_len(src));
     if (v == 0) { return 0; }

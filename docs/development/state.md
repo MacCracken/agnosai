@@ -137,20 +137,27 @@ recommendation) — see the open questions in
 
 Open items, none blocking:
 
-1. **`bayan_json_v_parse` is unusable and needs an upstream filing.** A call to
-   it misresolves to its `bayan_json_v_parse_str` sibling — the compiler warns
-   `'bayan_json_v_parse_str' expects 2 arguments, got 1` — and it returns 0 for
-   every input, including valid JSON. The `json_v_parse` back-compat alias has
-   the identical fault. The explicit-length entry points
-   (`bayan_json_v_parse_str`, `bayan_json_v_parse_ctx`) are unaffected and are
-   what `core_message` calls. Minimal reproducer: `bayan_json_v_parse(str_from("{}"))`
-   in a stock project returns 0. Synthetic prefix-shadowing cases do **not**
-   reproduce it, so the trigger is narrower than "the name is a prefix of a
-   sibling" — upstream will need to isolate it.
+1. **Awaiting the bayan 1.3.0 fold-in.** Root-caused and fixed upstream
+   2026-07-28: Cyrius routes a call `X(a, …)` to `X_str` whenever `a` is
+   Str-typed at the call site and `X_str` exists (the same overload dispatch
+   that routes `&IDENT` to `_ptr`). Because bayan's cstr+len forms were named
+   `bayan_json_v_parse_str` / `bayan_yaml_parse_str`, every bare
+   `bayan_json_v_parse(someStr)` was rewritten into a 1-arg call to a 2-arg fn
+   and returned 0 for valid JSON — silently, across ~26 files ecosystem-wide.
+   bayan 1.3.0 renames those forms `_str` → `_buf`.
+   **Action here when the fold lands:** `core_message.cyr`'s
+   `agnosai_message_from_json` currently calls `bayan_json_v_parse_str`, which
+   will no longer exist — switch it to the bare `bayan_json_v_parse(src)`. It
+   is a compile error, not a silent break, so it cannot be missed.
 2. **`lib/sakshi.cyr` is vendored at 2.4.3 while the 6.4.86 toolchain bundles
    2.4.6**, which every build reports as a shadow warning. `cyrius lib sync
    --full` re-syncs.
 
-Also worth knowing when writing core: **bayan's JSON key types are asymmetric.**
-`bayan_json_v_obj_set` takes a `Str`, `bayan_json_v_obj_get` takes a C string.
-Getting it backwards is a segfault, not a clean error.
+Two API hazards worth knowing when writing the rest of core:
+
+- **`X_str` is a reserved overload slot.** Never name a fn `X_str` unless it
+  genuinely takes a `Str` first — dispatch will hijack every `X(<Str>)` call.
+  `_ptr` / `_buf` / `_ctx` siblings are unaffected.
+- **bayan's JSON key types are asymmetric.** `bayan_json_v_obj_set` takes a
+  `Str`, `bayan_json_v_obj_get` takes a C string. Getting it backwards is a
+  segfault, not a clean error.
