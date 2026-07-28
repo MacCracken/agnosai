@@ -1,0 +1,185 @@
+[package]
+name = "agnosai"
+version = "${file:VERSION}"
+description = "AgnosAI — provider-agnostic AI orchestration: crews, tasks, tools, agent delegation"
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/agnosai"
+language = "cyrius"
+cyrius = "6.4.83"
+
+# AgnosAI is a Cyrius port of a 27,683-line Rust tree, preserved at `rust-old/`
+# as the parity oracle. Plan of record: docs/development/cyrius-port-plan.md.
+
+[build]
+entry = "src/main.cyr"
+output = "build/agnosai"
+
+# ─────────────────────────────────────────────────────────────────────
+# deps.stdlib — ORDER IS THE AUTO-INCLUDE ORDER
+# ─────────────────────────────────────────────────────────────────────
+# cyrius prepends this array, in array order, ahead of every compilation
+# unit's own includes, and resolution is SINGLE-PASS: a callee must
+# precede its caller. Each grouping below has a scar behind it.
+#
+#   - syscalls FIRST: tls_native_conn takes &sys_getrandom since 6.2.28.
+#   - bayan (json/toml/cyml/base64/bigint/u128/csv) BEFORE anything that
+#     wants u256 or base64 — i.e. before crypto and before the transport.
+#   - atomic / sync / thread / thread_local / ct / keccak / random ALL
+#     before any crypto: sigil's crypto_scratch self-installs a per-thread
+#     TLS bank, and a missing module LINKS CLEAN then SIGILLs (exit 132)
+#     at first crypto use. That is why they stay here even though sigil
+#     itself does not.
+#   - mmap BEFORE dynlib (dynlib uses mmap's PROT_NONE without including
+#     it); dynlib BEFORE fdlopen (fdlopen calls dynlib_auxv_get); all
+#     three, plus net/http/async, BEFORE tls and sandhi.
+#   - sandhi LAST — it composes everything above it.
+#
+# sigil is DELIBERATELY ABSENT from this array. kavach, libro and majra
+# each pin sigil themselves, so `cyrius deps` vendors a dist/sigil.cyr
+# into lib/ regardless; leaving "sigil" here too yields two packagings of
+# one version, which is exactly daimon's 227 "duplicate fn (last
+# definition wins)" warnings. It is pinned at deps.sigil instead.
+[deps]
+stdlib = [
+    # base substrate
+    "syscalls", "alloc", "result", "tagged", "fmt", "io", "fs", "str", "string",
+    "vec", "slice", "args", "process", "assert", "bench",
+    # general utilities
+    "fnptr", "freelist", "hashmap", "hashmap_fast", "callback", "chrono", "math", "regex",
+    # data formats — before crypto, before transport
+    "bayan",
+    # durable state — patra is folded stdlib at 6.4.83, so no git pin is needed
+    "patra",
+    # concurrency + crypto floor. sha1 backs the uuid_v5 in src/id.cyr
+    "atomic", "sync", "thread", "thread_local", "ct", "keccak", "random", "sha1",
+    # dynamic-link floor
+    "mmap", "dynlib", "fdlopen",
+    # async — sandhi's epoll server path
+    "async",
+    # transport + tracing, sandhi last
+    "net", "http", "tls", "ws", "sakshi", "sandhi",
+]
+
+# ws_server is intentionally NOT in the array above — auto-injecting it burns
+# compile-source budget in every test file (bote's precedent). Add it only if an
+# MCP-over-WebSocket transport lands, and then only to the ws-specific
+# entry/test files.
+#
+# CAUTION when editing the array: cyrius 6.4.83's cyml reader does NOT strip
+# comments before scanning. A bracketed token inside a comment between array
+# entries is read as a section header and SILENTLY TRUNCATES the array — every
+# later entry is dropped, with no error, and `cyrius deps` then reports the
+# dropped modules as "not in the cyrius stdlib". A double-quoted token inside a
+# comment is likewise harvested as an entry. So: no brackets and no double
+# quotes in comments inside the array. Filed upstream 2026-07-28.
+
+# ─────────────────────────────────────────────────────────────────────
+# git deps — DECLARATION ORDER IS THE AUTO-INCLUDE ORDER; callees first
+# ─────────────────────────────────────────────────────────────────────
+# Every block is declared explicitly even where the need is only
+# TRANSITIVE, so `cyrius deps`' recursion into bote/kavach resolves to OUR
+# pins rather than whatever those manifests happen to name. That is the
+# daimon 1.4.2 / stiva lesson.
+#
+# This is the DECLARE-AHEAD pattern (daimon/stiva), chosen over vendoring
+# into src/vendor/ (hoosh's approach) because the agnosys collision that
+# justified vendoring is gone and agnosai wants majra as a first-class dep
+# anyway. If `cyrius deps` ever misbehaves, vendoring is the fallback —
+# then use src/vendor/, never a top-level vendor/, which cyaudit reads as
+# untrusted.
+
+# sigil — crypto floor for bote (JWT/PKCE), kavach (HMAC audit chain), majra.
+# Pinned to the self-contained UMBRELLA bundle so exactly one sigil packaging
+# is vendored; the .deps sidecars of libro/majra/kavach would otherwise pull
+# the MODULAR component files and collide with the monolith.
+[deps.sigil]
+git = "https://github.com/MacCracken/sigil.git"
+path = "../sigil"
+tag = "3.12.1"
+modules = ["dist/sigil.cyr"]
+
+# bote — MCP JSON-RPC 2.0 registry/dispatcher. CORE profile only (transport-free):
+# agnosai supplies its own sandhi transport, exactly as hoosh does.
+# Constructor is `tool_registry_new` (renamed at 2.7.6), NOT `registry_new`,
+# which ai-hwaccel also defines.
+#
+# NOTE: bote's own manifest declares a libro dep, and cyrius deps recurses into
+# it regardless of which bote PROFILE we take, so dist/libro.cyr lands in lib/
+# even though the core profile excludes the two modules (audit_libro,
+# libro_tools) that libro actually backs. That transitive arrival is what forces
+# the majra ordering below.
+[deps.bote]
+git = "https://github.com/MacCracken/bote.git"
+path = "../bote"
+tag = "3.1.4"
+modules = ["dist/bote-core.cyr"]
+
+# majra — pub/sub event bus for crew/task events.
+#
+# !! KNOWN BROKEN COMBINATION — majra's SUBSCRIBE PATH IS UNUSABLE IN THIS BUILD.
+# libro (pulled in transitively by bote, above) and majra BOTH define `_sub_new`,
+# with different arity AND different semantics: majra's is
+# _sub_new(chan, filter_fn), 16 bytes from the freelist; libro's is
+# _sub_new(pattern), 24 bytes from the bump. Cyrius has one flat namespace and
+# last-definition-wins, so whichever lands later binds for BOTH. libro lands
+# later and wins — verified — while majra calls _sub_new(ch, 0) and
+# _sub_new(ch, filter_fn) at majra.cyr:1687/:1704/:1721. Every majra subscribe
+# is therefore calling a one-arg function with two arguments.
+#
+# Reordering these declarations does NOT fix it: cyrius deps derives include
+# order from its own dependency graph, not from declaration order (tested).
+# Until this is resolved upstream, do NOT call majra's pubsub subscribe path.
+# Blocker #4 in the port plan already recommends against majra pubsub for a
+# separate reason (the hub mutex is held across blocking sends), so the
+# practical answer for M5 is agnosai's own channel-backed event bus.
+#
+# WARNING: majra also defines ratelimit_new / ratelimit_check / uuid_generate.
+# If agnosai defines any of those, agnosai's own modules must be included AFTER
+# majra so last-definition-wins lands on ours. hoosh hit exactly this.
+#
+# See port-plan blocker #4 before routing SSE fan-out through pubsub_publish:
+# majra 2.5.1 holds the hub mutex across blocking sends.
+[deps.majra]
+git = "https://github.com/MacCracken/majra.git"
+path = "../majra"
+tag = "2.5.1"
+modules = ["dist/majra.cyr"]
+
+# kavach — sandbox execution for tool calls. agnosai consumes kavach's SCORING
+# and GATE only; both port 1:1. kavach 3.9.3 makes its own samay + ai-hwaccel
+# deps optional behind a default-on `scheduler` feature, and transitive
+# features tables are not parsed downstream, so neither arrives uninvited —
+# we name ai-hwaccel ourselves, below, on our own terms.
+[deps.kavach]
+git = "https://github.com/MacCracken/kavach.git"
+path = "../kavach"
+tag = "3.9.3"
+modules = ["dist/kavach.cyr"]
+
+# ai-hwaccel — accelerator detection for local-inference placement.
+[deps.ai-hwaccel]
+git = "https://github.com/MacCracken/ai-hwaccel.git"
+path = "../ai-hwaccel"
+tag = "2.3.15"
+modules = ["dist/ai-hwaccel.cyr"]
+
+# tyche — deterministic statistical PRNG (seeded sampling, temperature jitter).
+# NOT a CSPRNG: the audit key stays on stdlib `random_bytes`. Exports the BARE
+# names rng_seed / rng_u64 / rng_uniform / rng_normal — do not shadow them.
+[deps.tyche]
+git = "https://github.com/MacCracken/tyche.git"
+path = "../tyche"
+tag = "1.0.0"
+modules = ["dist/tyche.cyr"]
+
+# NO deps.mneme — mneme has no lib block, ships no dist/ bundle, and is
+# AGPL-3.0 against our GPL-3.0-only. UUID v4/v5 are REIMPLEMENTED in src/id.cyr
+# over stdlib random_bytes + sha1 (~15 lines). Do not copy mneme's text.
+#
+# NO deps.sakshi / deps.patra — both are folded stdlib at 6.4.83. If a build
+# ever warns "./lib/ shadows version-pinned sakshi X (pinned: Y)", add an
+# explicit pin and drop the name from the stdlib array.
+
+[release]
+bins = ["agnosai"]
+cross_bins = ["agnosai-aarch64"]

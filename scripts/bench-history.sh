@@ -21,8 +21,15 @@ cargo bench --all-features 2>&1 | tee "$TMPFILE"
 LAST_NAME=""
 while IFS= read -r line; do
     # Lines starting with non-space are benchmark names.
+    #
+    # Criterion uses TWO layouts: a long name gets its own line with the
+    # timing on the next, but a short name is padded and printed on the SAME
+    # line as its timing ("EchoTool::execute    time: [81.078 ns ...]").
+    # Capturing the whole line put "  time: [...]" inside the name field for
+    # every short-named benchmark — 24 of 237 rows in the committed history.
+    # Strip from `time:` so both layouts yield just the name.
     if echo "$line" | grep -qE '^[A-Za-z]' && ! echo "$line" | grep -q 'Benchmarking\|Compiling\|Finished\|Running\|warning\|Found\|Gnuplot'; then
-        LAST_NAME=$(echo "$line" | sed 's/\s*$//')
+        LAST_NAME=$(echo "$line" | sed 's/[[:space:]]*time:.*$//; s/[[:space:]]*$//')
     fi
     # Lines with "time:" contain the measurements.
     if echo "$line" | grep -q 'time:'; then

@@ -1,10 +1,23 @@
 # AgnosAI — Rust → Cyrius Port Plan (v2.0.0)
 
-> Status: **proposed** — not started. No code written, no tree changes.
-> Baseline: Rust v1.1.0, 30,692 LOC, GREEN (`cargo fmt --check` clean,
-> `cargo check --all-targets` passes). That green tree is the parity oracle.
+> Status: **Phase 0 in progress** (2026-07-28). Baseline greened, blockers
+> re-verified against cyrius 6.4.83, two upstream items shipped/filed.
+> Baseline: Rust v1.1.0, GREEN — `cargo fmt --check` clean,
+> `cargo clippy --all-features --all-targets -D warnings` clean, all 9 feature
+> combinations compile, **863 + 2 + 1 tests pass**. That green tree is the
+> parity oracle.
 > Method note: every capability claim below was verified by **reading the
-> module**, not by grepping Rust crate names. See "Corrections" at the end.
+> module**, not by grepping Rust crate names — and on the 2026-07-28 pass every
+> "resolved" verdict was independently refuted before being accepted, with the
+> JWT and sort findings confirmed by *compiling and running* code against the
+> real toolchain. See "Corrections" at the end.
+>
+> **Done so far:** blocker #7 fixed (the Rust tree is now a valid oracle);
+> blocker #1 fixed upstream in **sandhi 1.9.4** (three silent-truncation paths,
+> not one); blocker #4 filed as a cyrius issue; blocker #5 downgraded to
+> hygiene; blocker #8 (sort) discovered and quantified. Blockers #3 and #6
+> remain genuinely blocking — #3 with a known agnosai-side mitigation, #6 with
+> none (WASM does not ship in v2.0.0).
 
 ## Verdict
 
@@ -42,15 +55,21 @@ Keep `lib/async.cyr` in scope for **client-side fan-out only**.
 
 ## Blockers (must be resolved or consciously accepted)
 
-| # | Blocker | Detail |
-|---|---|---|
-| 1 | **sandhi 64 KiB body cap, silent truncation** | `HSV_REQ_BUF_SIZE = 65536` (sandhi.cyr:12724); `recv_request` falls out at max and `return have` — no 413, the string "413" does not appear in sandhi.cyr. Handler gets a truncated body + a Content-Length claiming more. agnosai's `MAX_BODY_BYTES = 10 MiB` (server/mod.rs:39) is **160x**. Cannot just raise it: it sizes the per-conn arena (128 × 10 MiB = 1.28 GiB). |
-| 2 | **bayan JSON has no recursion-depth cap** — ✅ **resolved in bayan 1.1.1** | ~~`_JP_STATE_SIZE = 40` = 5 slots, no depth counter; `_jp_parse_value` recurses freely.~~ bayan 1.1.1 caps both descents at 128 (`_JP_MAX_DEPTH`, serde_json wire-parity); past the cap the parse fails `"nesting too deep"` through the per-call error path. Picked up by re-pinning bayan ≥ 1.1.1 (or the next cyrius `lib/bayan.cyr` refold). serde_json defaults to 128. A nested body on POST /crews, /a2a/receive, /mcp stack-overflowed the worker — a **parity regression**, now closed. |
-| 3 | **`sandhi_router_dispatch` allocates per request, never frees** | Uses non-arena accessors on the global bump allocator; sandhi's own comment (:13359-13365) defers this. Unbounded RSS growth per request on a long-running server. |
-| 4 | **`chan_try_send` does not exist** | `chan_try_recv` exists (thread.cyr:409); `chan_send` blocks (:331/:352). Breaks non-blocking `let _ = tx.send(..)` (crew_runner.rs:115,786) and majra pubsub fan-out (one wedged SSE subscriber stalls every topic). |
-| 5 | **`SandboxPolicy` name collision** | agnosai `policy.rs:39` vs kavach `policy.cyr:7`. One flat namespace, both `#derive(accessors)` → both emit `SandboxPolicy_set_*` → last-definition-wins → **silently corrupted strength scores**. Rename agnosai's to `AgnSandboxPolicy`. |
-| 6 | **No WASM runtime anywhere** | Verified 3 ways across 138 repos. kavach shells out to the `wasmtime` CLI (not installed on this box); `backend_is_available(WASM)` hardcodes `return 0` (a one-line bug — every sibling probes via `which_exists`). Defers wasm.rs + wasm_tool.rs + wasm_loader.rs. |
-| 7 | **Live Rust bug, fix first** | `cargo check --no-default-features --features kavach` **FAILS today**: crew_runner.rs:199 gates on `kavach` but reaches into `crate::sandbox::`, which lib.rs:27 gates on `sandbox`. Only `full` hides it. The baseline must be green before it becomes the oracle. |
+> **Re-verified 2026-07-28 against cyrius 6.4.83** by reading each module (not by
+> grepping crate names), with every "resolved" verdict independently refuted
+> before it was accepted. Status column is current; the Detail column keeps the
+> original finding so the reasoning is not re-derived.
+
+| # | Blocker | Status | Detail |
+|---|---|---|---|
+| 1 | **sandhi 64 KiB body cap, silent truncation** | ✅ **FIXED upstream in sandhi 1.9.4** | `HSV_REQ_BUF_SIZE = 65536`; `recv_request` fell out at max and `return have` — no 413. The constant `HTTP_PAYLOAD_TOO_LARGE = 413` was *declared* with **zero references**; nothing ever sent it. Reading the fn turned up **two more** silent paths: a peer that hangs up mid-request returned the partial bytes as if whole, and `Transfer-Encoding: chunked` with no Content-Length slipped past both smuggling guards, collapsing `need_body` to the header terminator so the handler ran with an **empty body** while the chunked bytes sat unread. 1.9.4 gives each a distinct sentinel (`ERR_TOO_LARGE` / `ERR_INCOMPLETE`) answered **413** / **400** / **501**, adds `sandhi_server_options_max_request` so the cap is policy (default unchanged at 64 KiB), and drains briefly before closing a refusal so the status is not destroyed by an RST. **Correction to the original entry:** the 1.28 GiB figure was attributed to the wrong function — `run_pooled` has no arena, each worker holds one reusable buffer, so cost is `cap × workers` and workers is already tunable. `run_async` is the one that eagerly allocates `max_conns`-sized. 10 MiB bodies cost ~80 MiB at 8 workers. |
+| 2 | **bayan JSON has no recursion-depth cap** | ✅ **resolved (bayan 1.1.1, folded)** | Confirmed present in the **folded** `~/.cyrius/lib/bayan.cyr`, not just upstream: `_JP_MAX_DEPTH = 128` (:3304), depth counter at `ps+40`, guards in **both** recursive descents — the tree parser `_jp_parse_value` (:3539) and the streaming parser `_js_parse_value` (:4059). Failure is a retrievable per-call error, not a crash. **Residual:** the *serializer* `_jb_walk` (:3761-3826) recurses on `JTAG_ARR`/`JTAG_OBJ` with **no cap** — uncapped upstream too, so it is not a fold lag. Only reachable from a tree agnosai itself built, so it is not an untrusted-input path; do not build unbounded-depth values from user data. |
+| 3 | **`sandhi_router_dispatch` allocates per request, never frees** | ❌ **STILL BLOCKING** — and broader than filed | Confirmed. But bypassing the router alone buys ~32 B/req out of a **~700–4096 B/req** leak: the whole bare `sandhi_server_*` accessor + `_send_*` family allocates on the global bump. Mitigation is agnosai-side and needs no upstream change: write our own handler on the raw `fn(ctx, cfd, buf, blen)` signature, take a per-worker arena, and use the `_a` variants **everywhere**, with one `reset_via` exit path. Invariant: nothing outliving the request (registry, router table, config) may come from the arena. **Residual we cannot close from a handler:** `_sandhi_server_pool_worker` itself calls bare `sandhi_server_send_status` on the smuggling rejects (~176 B/req before our handler runs) — a malformed-request flood at 10k req/s leaks ~1.76 MB/s. If internet-facing, replace `run_pooled` with a ~40-line accept loop (every primitive is in the fold); if behind a reverse proxy, accept it. Regression test: assert `alloc_used()` delta ≈ 0 over N thousand requests. |
+| 4 | **`chan_try_send` does not exist** | ⚠️ **filed upstream; NOT a port blocker** | Confirmed absent on **all three** backends (`thread.cyr`, `thread_win.cyr:87`, `thread_agnos.cyr:95`); each ships `chan_try_recv` and a blocking-only `chan_send`. Filed as `cyrius/docs/development/issues/2026-07-28-agnosai-chan-try-send.md`. **Important correction to the mapping:** every `let _ = tx.send(..)` in agnosai is a tokio **broadcast** send, which never blocks and never fails — a lagging subscriber gets the ring's *oldest* overwritten and reads `Lagged(n)` (sse.rs:266-279). So the Cyrius equivalent is **not** "drop the newest when full", it is "**evict the oldest**". A naive `tx.send` → `chan_send` port converts never-block-lossy into block-forever, the worst possible regression for SSE fan-out. Port as a private `agnosai_chan_push_lossy` that, under one mutex acquisition, advances `head` when full and then enqueues, keeping a lag counter. The real blocker is downstream: **do not route agnosai's fan-out through majra `pubsub_publish` as it stands** (2.5.1 holds the hub mutex across blocking sends, :138-184). |
+| 5 | **`SandboxPolicy` name collision** | 🟢 **downgraded to hygiene** | Not reachable as filed. The two structs' **field names are disjoint**, so no accessor symbol actually collides — and 6.4.83 *warns* on duplicate definitions rather than silently taking the last. Also, agnosai's strength lives on `IsolationLevel` (policy.rs:30-33), which has no kavach counterpart at all. Still do the `AgnSandboxPolicy` rename: one-line edit, cheap insurance, and the safety margin here should not depend on two type definitions staying disjoint by accident. |
+| 6 | **No WASM runtime anywhere** | ❌ **STILL BLOCKING — confirmed** | agnosai v2.0.0 **cannot** ship WASM. No embeddable engine exists in the ecosystem, and kavach 3.9.3's `Backend.WASM` shell-out has no binary to shell out to. Defers 955 lines: `sandbox/wasm.rs` (521), `tools/wasm_tool.rs` (265), `tools/wasm_loader.rs` (169), plus the `WasmModule`/`WasmResult`/`WasmSandbox` re-exports. |
+| 7 | **Live Rust bug, fix first** | ✅ **FIXED 2026-07-28** | `cargo check --no-default-features --features kavach` failed: crew_runner.rs:199 gated on `kavach` but reached into `crate::sandbox::`, which lib.rs:27 gates on `sandbox`; only `full` hid it. Now `all(feature = "kavach", feature = "sandbox")`. All 9 feature combos compile; fmt + clippy clean; **863 + 2 + 1 tests pass**. The baseline is now a valid oracle. |
+| 8 | **No O(n log n) sort** *(promoted from "Corrections")* | ❌ **STILL BLOCKING — vendor ~55 lines** | Measured on this box at 6.4.83: an itihas-style insertion sort over agnosai's 100k-entry percentile vector (load_testing.rs) costs **52.6 seconds**; heapsort costs 87 ms (605×); three quickselects cost ~21 ms. Vendor both `ai_sort` (iterative in-place heapsort — O(n log n) *worst* case, O(1) extra memory, no recursion depth; not stable, and no site needs stability) and `ai_select_nth` (Hoare quickselect, median-of-3) — percentiles never needed a full sort. **Naming is load-bearing:** prefix `ai_*`; never define a bare `vec_sort`, which itihas exports unprefixed into the flat namespace. Second-order: scheduler.rs:257's `BinaryHeap` has no stdlib equivalent either — build it on the same sift primitive, or just sort the (small) ready-set each round. |
 
 ## Phases
 
@@ -59,13 +78,36 @@ independently compilable + testable).
 
 ### Phase 0 — Scaffold
 `cyrius port` (Rust → `rust-old/`, scaffolds src/main.cyr + cyrius.cyml).
-Ordered stdlib array (order matters — the resolver falls back to array order:
-bayan before sigil; mmap before dynlib; dynlib/fdlopen/mmap before tls+sandhi —
-see thoth/cyrius.cyml). Vendor `dist/bote-core.cyr` + `dist/majra.cyr` under
-`src/vendor/` (NOT `[deps.bote]` — it recurses into libro+majra and collides).
-`[deps.ai-hwaccel]`, `[deps.mneme]` (uuid), `[deps.tyche]` (RNG).
+Ordered stdlib array (order matters — it is the auto-include order, prepended
+ahead of every unit's own includes, and resolution is single-pass, so callees
+must precede callers).
+
+**Revised 2026-07-28 — use the daimon/stiva declare-ahead pattern, NOT
+vendoring.** The agnosys collision that justified hoosh's `src/vendor/` is gone,
+and agnosai wants majra as a first-class dep anyway. So `[deps.bote]` (core
+profile), `[deps.majra]`, `[deps.kavach]`, `[deps.sigil]`, `[deps.ai-hwaccel]`,
+`[deps.tyche]` — each declared explicitly *even where only transitively needed*,
+so `cyrius deps`' recursion resolves to **our** pins. Vendoring stays the
+fallback if `cyrius deps` misbehaves (then `src/vendor/`, never a top-level
+`vendor/` — cyaudit reads that as untrusted).
+
+Three hard constraints the scaffold must honor:
+- **sigil goes in `[deps.sigil]` and comes OUT of the stdlib array.** kavach,
+  libro and majra all pin sigil themselves, so `cyrius deps` vendors a
+  `dist/sigil.cyr` regardless; leaving `"sigil"` in the stdlib array too gives
+  two packagings of one version — that is daimon's 227 "duplicate fn (last
+  definition wins)" warnings. But `ct`/`keccak`/`random`/`thread_local` **stay**
+  in the array: they are not in sigil's bundle, and omitting one links clean
+  then SIGILLs (exit 132) at first crypto use.
+- **`[deps.mneme]` cannot exist** — mneme has no `[lib]` block, ships no `dist/`
+  bundle, and is AGPL-3.0 against our GPL-3.0-only. Reimplement UUID v4/v5 in
+  `src/id.cyr` over stdlib `random_bytes` + `sha1` (~15 lines; add `"sha1"` to
+  the array). Do not copy mneme's text.
+- **`sakshi` and `patra` are folded stdlib at 6.4.83** — no `[deps.*]` needed
+  unless a shadow warning appears.
+
 **Exit:** hello-world builds; `cyrius deps` resolves clean.
-**First, though:** fix the `--features kavach` Rust bug so the baseline is green.
+**First, though:** ~~fix the `--features kavach` Rust bug~~ — ✅ done 2026-07-28.
 
 ### Phase 1 — Beachhead: `learning` + `core`
 Both are blocked by nothing. `learning` is the ideal first real code: **zero
@@ -144,14 +186,15 @@ mirrors reuse production symbol names, so the real modules can **never** be
 included later (last-definition-wins, silently). Real modules **are** includable
 — proved by probe.
 
-- **Per-module `.tcyr`** (`cyrius tests` walks recursively; 464 tests compile+run in 2.46s).
+- **Per-module `.tcyr`** (`cyrius tests` walks recursively — verified to depth 3 — aggregates pass/fail, and exits 1 on any failure; safe as the single test entrypoint).
 - **Ban mirror-defining**: any `fn` in a .tcyr duplicating a src/ symbol is a defect. Enforce by CI grep.
 - Inline `#[cfg(test)]` mods testing private fns are a **non-problem** — Cyrius has no module privacy.
-- `.bcyr` goes in `benches/` (the only layout `cyrius bench` no-arg discovers).
-- **Build our own coverage.** `cyrius coverage` is hardcoded to lib/ + tests/tcyr → measures the vendored **stdlib**, never src/ (7/1097 in hoosh). CLAUDE.md's 80% gate cannot be discharged by it.
-- **Exit-code clamp hazard**: `sys_exit(assert_summary())` & 0xFF → exactly 256/512/768 failures scores **PASS**. agnosai has 865 tests. Clamp to 1.
+- **`cyrius bench` no-arg is NON-recursive** — it lists `benches/`, `tests/bcyr/` and `tests/` one level each. Verified: `benches/nested/deep.bcyr` was silently skipped while `benches/top.bcyr` ran. Keep every `.bcyr` **flat**.
+- ~~**Build our own coverage.**~~ **CORRECTED 2026-07-28 — this claim is stale.** `cyrius coverage --min 80` walks project **`src/`** recursively and reads `tests/**/*.tcyr` as the corpus; `--min` genuinely gates (non-zero exit). CLAUDE.md's 80% gate **is** dischargeable today. (cyrius archived its own issue `2026-07-23-hoosh-coverage-reports-stdlib-not-local-repo.md` — the hoosh 7/1097 number was the bug, and it is fixed.) Two conditions: matching is **substring-based**, so keep the `agnosai_*` prefix on every public fn (a bare `add` or `run` gets falsely credited) and `_`-prefix genuine internals so they leave the denominator; and `cyrius audit` does **not** run coverage, so CI needs it as its own step.
+- **Hard constraint — the 1 MiB corpus cliff.** Total `.tcyr` bytes under `tests/` must stay under **1,048,575** or coverage silently under-reports and `--min` becomes unsatisfiable for reasons unrelated to test quality. agnosai has ~412 KB of `#[cfg(test)]` Rust today; the `.tcyr` translation (explicit includes, no macros, no `?`) plausibly lands at 0.7–1.2 MB — **right at the cliff**. Budget test text aggressively, share helpers through one included file, and if it still overflows, run the bulk suite from a sibling dir via `cyrius tests <dir>` while keeping `tests/` compact. File upstream if hit.
+- **Exit-code clamp hazard**: `sys_exit(assert_summary())` & 0xFF → exactly 256/512/768 failures scores **PASS**. agnosai has 865 tests. Still live in 6.4.83 — do **not** use the stock `proj-tcyr` epilogue. Every `.tcyr` ends `var f = main(); if (f > 0) { f = 1; } syscall(60, f);`, and CI greps for the raw pattern.
 - 155 of 865 tests are `#[tokio::test]` and Cyrius has **no async test harness**.
-- **Freeze** the 124-row Rust bench-history.csv; start a fresh Cyrius baseline. tokio numbers are not comparable — do not claim wins/regressions across the port.
+- **Freeze** the 124-row Rust bench-history.csv; start a fresh Cyrius baseline. tokio numbers are not comparable — do not claim wins/regressions across the port. *(A terminal v1.1.0 row set was captured 2026-07-28 before the freeze, closing the gap since the last rows at v1.0.2/2026-04-02. `scripts/bench-history.sh` also had a name-capture bug — criterion prints short names on the same line as their timing, so `time: [...]` landed inside the name field for 24 of 237 rows; fixed before the final capture.)*
 
 ## Upstream filings (user files; never `gh` — curl to the GitHub API)
 
@@ -159,12 +202,12 @@ included later (last-definition-wins, silently). Real modules **are** includable
 |---|---|
 | bayan | ✅ **both filed 2026-07-16** — YAML parse → the existing tagged value tree: `bayan/docs/development/issues/2026-07-16-agnosai-yaml-parse-into-tagged-value-tree.md` (also accepted onto bayan's roadmap as `bayan_yaml_*`; the "draft written" here never materialized as a file — the filing supersedes it); JSON recursion-depth cap (blocker #2): `bayan/docs/development/issues/2026-07-16-agnosai-json-no-recursion-depth-cap.md` — ✅ **resolved in bayan 1.1.1** (cap 128, serde_json parity; 101/101 asserts green) |
 | sankoch | ZIP archive container (deflate + crc32 already there; ~250 lines) |
-| cyrius | `chan_try_send` (blocker #4); O(n log n) sort (every ecosystem sort is O(n²) — agora/board.cyr:805-808 explicitly invites the bite "if a consumer reports a perf concern"; load_testing.rs p50/p95/p99 over 100k entries is that consumer) |
+| cyrius | ✅ **`chan_try_send` filed 2026-07-28** — `docs/development/issues/2026-07-28-agnosai-chan-try-send.md` (blocker #4; the load-bearing evidence is majra's hub-mutex-across-blocking-send, not agnosai's own call sites). **Still to file:** `vec_sort_by` / `vec_select_nth` in `lib/vec.cyr` — 18+ consumers (itihas, sankhya, goonj, naad, agora, mela, mneme, samay, stiva, takumi, sit, shakti, varna, chakshu, darshini, hisab, nous, dhvani) have each independently reimplemented an O(n²) insertion sort, which is the strongest possible argument that this is a stdlib gap rather than an app concern |
 | kavach | WASM availability one-liner; stderr capture; **exec timeout — an undocumented regression** (Rust 2.0.0 shipped it, the Cyrius port dropped it, ADR-004 omits it) |
-| sigil | `pem_decode_pubkey` — a ~20-line clone of `pem_decode_privkey` |
-| bote | `jwt_verify_rs256` — **its stated premise is stale**: jwt.cyr:9-11 says "RS256 needs an asymmetric primitive sigil doesn't yet expose", but sigil.cyr:17642 has `rsa_pkcs1v15_verify_sha256` and :17704 already accepts SPKI |
+| sigil | `pem_decode_pubkey` — a ~20-line clone of `pem_decode_privkey`. **Nice-to-have, not a blocker** (see below) |
+| bote | `jwt_verify_rs256` — **its stated premise is stale**: jwt.cyr:9-11 says "RS256 needs an asymmetric primitive sigil doesn't yet expose", but sigil has `rsa_pkcs1v15_verify_sha256` and `rsa_pubkey_from_der` already accepts SPKI. **Do not wait on this** — verified 2026-07-28 by *compiling and running* a scratch RS256 verify against the real toolchain. Implement the JWT half locally in agnosai over `bayan_base64url_decode` + `clock_epoch_secs` + sigil's existing RSA/SHA-256 primitives |
 | majra | pubsub holds the hub mutex across blocking sends; relay's file-scope globals make `relay_receive` non-reentrant (its own comment says they're vestigial) |
-| sandhi | body cap/413 (blocker #1); per-request allocation (blocker #3); `backlog` silently ignored by run_opts/run_async; chunked start hardcodes " OK" |
+| sandhi | ✅ **body cap/413 shipped in 1.9.4** (blocker #1) — plus the two adjacent silent paths found while fixing it (peer-hangup, TE-chunked-only) and a configurable `max_request`. **Still open:** per-request allocation (blocker #3) — ask for `sandhi_router_dispatch_a(a, ...)` / `_c_a` plus an optional per-request arena hook on `run_pooled` (the TLS pool already proves the pattern), and `_a` variants for the two bare `send_status` calls inside `_sandhi_server_pool_worker`; `backlog` silently ignored by run_opts/run_async; chunked start hardcodes " OK"; **inbound** chunked decoding (1.9.4 answers 501, which is honest but not the same as support) |
 
 ## Corrections to earlier claims (recorded so they are not re-derived)
 
@@ -174,9 +217,11 @@ included later (last-definition-wins, silently). Real modules **are** includable
 - **"No broadcast/fan-out"** — FALSE. majra pubsub fans out to per-subscriber channels; `fleet/relay.rs` maps onto majra `relay_*` near-1:1 (identical fields, API, and doc language).
 - **"sigil has no SPKI decoder"** — FALSE. `rsa_pubkey_from_der` (sigil.cyr:17696-17703) explicitly accepts both PKCS#1 and X.509 SubjectPublicKeyInfo. Only the `-----BEGIN PUBLIC KEY-----` PEM label pair is missing.
 - **"No ranged RNG"** — FALSE. tyche (`rng_uniform`/`rng_normal`/`rng_seed`). But **never for the audit key** (orchestrator.rs:63) — tyche is not a CSPRNG; that stays `random_bytes()`.
-- **"No sort"** — half-false. `itihas/src/util.cyr:57 vec_sort(v, cmp)` exists but is O(n²), and is **unprefixed** → collides under the fold. Copy the 17 lines locally.
+- **"No sort"** — half-false, and **promoted to blocker #8** with measurements. `itihas/src/util.cyr:57 vec_sort(v, cmp)` exists but is O(n²) and **unprefixed** → collides under the fold. "Copy the 17 lines locally" was the wrong remedy: at agnosai's 100k percentile workload that shape costs **52.6 s**. Vendor `ai_sort` (heapsort, 87 ms) + `ai_select_nth` (quickselect, ~21 ms for all three percentiles) instead.
 - **"Arc is a real gap"** — dissolves. 52 `Arc<` in src/, of which 49 are process-lifetime shared-immutable state = a raw pointer in an arena. Only 3 are `Arc<RwLock|Mutex>` → futex mutex + `async_rwlock_new`.
-- **`cyrius coverage` / `cyrius bench`** — structurally unusable as-is (see Test strategy).
+- ~~**`cyrius coverage` / `cyrius bench`** — structurally unusable as-is.~~ **RETRACTED 2026-07-28.** `cyrius coverage --min 80` measures project `src/` and gates properly; cyrius fixed and archived its own issue for this. `cyrius bench` is usable too — the real constraint is just that no-arg discovery is **non-recursive**, so keep `.bcyr` flat. See the rewritten Test strategy.
+- **"`cyrius fmt --check` is a no-op that always exits 0"** — FALSE (a claim that surfaced during this re-verification and was checked). It is silent by design and returns **exit 1 on drift** — confirmed live against sandhi, where it caught real drift in `tests/sandhi.tcyr`. CI should read the exit code, **not** diff `cyrius fmt`'s stdout. Related trap: `cyrius fmt FILE` (no `--check`) prints the formatted file to **stdout** and does not write in place; redirect through a temp file to apply.
+- **"agnosai's `tx.send` needs a non-blocking send"** — half-true, and the half that matters is different. They are tokio **broadcast** sends: never block, never fail, and **evict the oldest** on lag. See blocker #4 — the port needs overwrite-oldest semantics, not drop-newest.
 
 ## Open questions (need a decision before the bites they gate)
 

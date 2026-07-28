@@ -1,17 +1,38 @@
 # AgnosAI — Claude Code Instructions
 
+> **Core rule**: this file is **preferences, process, and procedures** — durable
+> rules that change rarely. Volatile state (current version, port progress, test
+> counts, module line counts) lives in
+> [`docs/development/state.md`](docs/development/state.md). Do not inline state here.
+
 ## Project Identity
 
 **AgnosAI** (AGNOS + AI) — Provider-agnostic AI orchestration — crews, tasks, tools, agent delegation
 
-- **Type**: Flat crate with binary
+- **Type**: Port (Rust → Cyrius). Flat module tree with binary
 - **License**: GPL-3.0-only
-- **MSRV**: 1.89
-- **Version**: SemVer 0.D.M pre-1.0
+- **Language**: Cyrius (toolchain pinned in `cyrius.cyml [package].cyrius`)
+- **Version**: `VERSION` at the project root is the source of truth — do not inline the number here
+- **Rust reference**: 27,683 lines preserved at `rust-old/` (v1.1.0, green) — the **parity oracle**
 
 ## Consumers
 
 Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran (game AI)
+
+## The port
+
+Scaffolded with `cyrius port` on 2026-07-28. `rust-old/` is the reference oracle.
+The plan of record is
+[`docs/development/cyrius-port-plan.md`](docs/development/cyrius-port-plan.md) —
+read it before starting any bite; it carries the verified blocker status and the
+corrections that must not be re-derived.
+
+```sh
+cyrius deps                                 # resolve dependencies into lib/
+cyrius build src/main.cyr build/agnosai     # compile
+cyrius tests tests                          # run every .tcyr (recursive)
+cyrius coverage --min 80                    # the 80% gate — its own CI step
+```
 
 ## Development Process
 
@@ -19,7 +40,7 @@ Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran
 
 0. Read roadmap, CHANGELOG, and open issues — know what was intended before auditing what was built
 1. Test + benchmark sweep of existing code
-2. Cleanliness check: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
+2. Cleanliness check: `cyrius fmt <file> --check`, `cyrius lint`, `cyrius vet src/main.cyr`, `cyrius deny src/main.cyr`, `cyrius doc --check`
 3. Get baseline benchmarks (`./scripts/bench-history.sh`)
 4. Internal deep review — gaps, optimizations, security, logging/errors, docs
 5. External research — domain completeness, missing capabilities, best practices, world-class accuracy
@@ -31,7 +52,7 @@ Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran
 ### Work Loop / Working Loop (continuous)
 
 1. Work phase — new features, roadmap items, bug fixes
-2. Cleanliness check: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
+2. Cleanliness check (as above) — **including `cyrius fmt --check` on `tests/*.tcyr`, not just `src/`**
 3. Test + benchmark additions for new code
 4. Run benchmarks (`./scripts/bench-history.sh`)
 5. Internal review — performance, memory, security, throughput, correctness
@@ -39,8 +60,8 @@ Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran
 7. Deeper tests/benchmarks from audit observations
 8. Run benchmarks again — prove the wins
 9. If audit heavy → return to step 5
-10. Documentation — update CHANGELOG, roadmap, docs
-11. Version check — VERSION, Cargo.toml, recipe all in sync
+10. Documentation — update CHANGELOG, roadmap, state.md, docs
+11. Version check — VERSION, cyrius.cyml, recipe all in sync
 12. Return to step 1
 
 ### Task Sizing
@@ -58,27 +79,33 @@ Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran
 
 ### Key Principles
 
+- **Cross-check against `rust-old/`.** The correctness bar is "matches what Rust did". Diverge only with an ADR.
+- **Correctness over cleverness** — a Cyrius behavior that diverges *silently* from Rust is the worst outcome
 - **Never skip benchmarks.** Numbers don't lie. The CSV history is the proof.
 - **Tests + benchmarks are the way.** Minimum 80%+ coverage target.
 - **Own the stack.** If an AGNOS crate wraps an external lib, depend on the AGNOS crate.
 - **No magic.** Every operation is measurable, auditable, traceable.
-- **`#[non_exhaustive]`** on all public enums.
-- **`#[must_use]`** on all pure functions.
-- **`#[inline]`** on hot-path functions.
-- **`write!` over `format!`** — avoid temporary allocations.
-- **Cow over clone** — borrow when you can, allocate only when you must.
-- **Vec arena over HashMap** — when indices are known, direct access beats hashing.
-- **Feature-gate optional deps** — consumers pull only what they need.
-- **tracing on all operations** — structured logging for audit trail.
+- ONE change at a time — never bundle unrelated changes
+- **`str_builder_*` over string concatenation** — avoid temporary allocations (the Cyrius form of "`write!` over `format!`")
+- **Borrow pointers over copies** — allocate only when you must (the Cyrius form of "Cow over clone")
+- **Vec arena over HashMap** — when indices are known, direct access beats hashing
+- **Thread the `_a` allocator variants** — a per-request arena with one `reset_via` exit path. Bare `sandhi_server_*` / `_send_*` wrappers allocate on the no-free global bump; see port plan blocker #3
+- **sakshi on all operations** — structured logging for audit trail
+- **Prefix every public symbol `agnosai_*`.** Cyrius has ONE flat namespace and last-definition-wins. Short names (`add`, `run`) also get falsely credited by coverage's substring matching. `_`-prefix genuine internals so they leave the coverage denominator
+- `var buf[N]` = N **bytes**, not N entries
 
 ## DO NOT
-- **Do not commit or push** — the user handles all git operations (commit, push, tag)
 
+- **Do not commit or push** — the user handles all git operations (commit, push, tag)
 - **NEVER use `gh` CLI** — use `curl` to GitHub API only
+- **Do not modify `rust-old/`** — it is the frozen parity oracle
+- Do not modify `lib/` — `cyrius deps` owns it
 - Do not add unnecessary dependencies — keep it lean
-- Do not `unwrap()` or `panic!()` in library code
 - Do not skip benchmarks before claiming performance improvements
-- Do not commit `target/` or `Cargo.lock` (library crates only)
+- Do not hardcode toolchain versions in CI YAML — `cyrius = "X.Y.Z"` in `cyrius.cyml` is the source of truth
+- Do not use the stock `proj-tcyr` epilogue — the exit code is masked `& 0xFF`, so exactly 256/512/768 failures score PASS. Every `.tcyr` ends `var f = main(); if (f > 0) { f = 1; } syscall(60, f);`
+- Do not put `.bcyr` files in subdirectories — `cyrius bench` no-arg discovery is **not** recursive
+- Do not `include "lib/syscalls.cyr"` (or any stdlib module) in a `.tcyr`/`.bcyr` — the stdlib is auto-prepended, so an explicit include lands *after* it and single-passes into an undefined-symbol error
 
 ## Documentation Structure
 
@@ -86,18 +113,21 @@ Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran
 Root files (required):
   README.md          — quick start, features, dependency stack, consumers, license
   CHANGELOG.md       — per-version changes (Added/Changed/Fixed/Removed)
-  CLAUDE.md          — this file (development process, principles, DO NOTs)
-  CONTRIBUTING.md    — fork, branch, make check, PR workflow
+  CLAUDE.md          — this file (durable process, principles, DO NOTs)
+  CONTRIBUTING.md    — fork, branch, check, PR workflow
   SECURITY.md        — supported versions, scope, reporting
   CODE_OF_CONDUCT.md — Contributor Covenant
   LICENSE            — GPL-3.0
+  VERSION            — source of truth for the version number
 
 docs/ (required):
   architecture/
     overview.md      — module map, data flow, consumers, dependency stack
     math.md          — (if applicable) mathematical reference for algorithms/formulas
   development/
-    roadmap.md       — completed items, backlog, future features (demand-gated), v1.0 criteria
+    state.md         — VOLATILE state: version, port progress, test counts (refreshed every release)
+    roadmap.md       — milestones through v1.0, dependency gates
+    cyrius-port-plan.md — the port's plan of record: phases, blockers, corrections
 
 docs/ (when earned — not scaffolded empty):
   adr/
@@ -149,3 +179,10 @@ Rules:
 - Breaking changes get a **Breaking** section with migration guide
 - Group by module when multiple changes in one release
 - Link to ADR if a change was driven by an architectural decision
+- **Do not compare Cyrius benchmarks to the frozen Rust `rust-old/bench-history.csv`.** The tokio-era numbers are not comparable across the port; the Cyrius line starts its own baseline
+
+## Rust-era principles (apply when reading `rust-old/`)
+
+These governed the Rust tree and have no Cyrius equivalent, but explain what you
+will find there: `#[non_exhaustive]` on all public enums, `#[must_use]` on all
+pure functions, `#[inline]` on hot-path functions, feature-gated optional deps.

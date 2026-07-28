@@ -5,6 +5,26 @@ All notable changes to AgnosAI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **orchestrator/crew_runner**: `cargo check --no-default-features --features kavach` failed to
+  compile. The `sandbox_strength` block was gated on `kavach` alone but reaches into
+  `crate::sandbox::`, which `lib.rs:27` gates on `sandbox`; only the `full` feature (which enables
+  both) hid the breakage. Gate is now `all(feature = "kavach", feature = "sandbox")`. This was
+  blocker #7 of the Cyrius port plan — the Rust tree must be green before it can serve as the
+  port's parity oracle.
+- **server/ssrf**: collapsed the private-IP `match` into a single boolean so the IPv4 and IPv6
+  arms share one return path (clears `clippy::collapsible_match` on Rust 1.96).
+- **orchestrator/scheduler**: `ready_tasks` sorts with `sort_by_key(Reverse(priority))` instead of
+  a hand-written comparator (clears `clippy::unnecessary_sort_by` on Rust 1.96). Ordering is
+  unchanged — both are stable sorts, highest priority first.
+
+### Changed
+- Final Rust release line before the Cyrius port. `bench-history.csv` is frozen at this point and
+  moves to `rust-old/`; the Cyrius tree starts a fresh baseline. tokio-era numbers are **not**
+  comparable across the port — see `docs/development/cyrius-port-plan.md`.
+
 ## [1.1.0] — 2026-04-02
 
 ### Changed
