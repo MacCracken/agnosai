@@ -159,6 +159,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     misbehaving peer). The port also keeps the oracle's zero-length-frame rejection, which majra
     lacks; without it a peer can hold a reader in a loop that consumes four bytes and yields
     nothing.
+  - **orch_scoring** — five weighted factors scoring an agent's fit for a task. The weights are
+    the **constants**, not the rustdoc: `score_agent`'s doc claims 0.40/0.30/0.15/0.15 over four
+    factors while the `WEIGHT_*` constants are 0.35/0.25/0.10/0.15/0.15 over five, and the
+    oracle's own `expected_score` test helper recomputes from the constants. **Personality always
+    scores the neutral 0.5** — that is the oracle's own `personality: None` arm, which is the only
+    value the default Rust build ever produced and what its test helper hardcodes; the
+    bhava-backed trait arms defer with bhava, and `agnosai_personality_score` is the single
+    function to fill in when it lands. A perfect match therefore scores 0.925, not 1.0.
+    `rank_agents` breaks ties on ascending index because the oracle sorts with `sort_by`, a
+    **stable** merge sort, while `order.cyr`'s heapsort is not stable — without the tie-break,
+    which of two equally-good agents gets the task would vary with the sort's internal swaps.
 - **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
   `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
   never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.

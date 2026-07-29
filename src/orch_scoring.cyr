@@ -1,0 +1,307 @@
+# =========================================================================
+# orch_scoring — how well an agent fits a task.
+#
+# Parity oracle: rust-old/src/orchestrator/scoring.rs
+#
+# Five weighted factors summed into a 0..1 score, then clamped. The weights are
+# the constants, not the doc comment: `score_agent`'s rustdoc claims
+# 0.40 / 0.30 / 0.15 / 0.15 and lists only four factors, while the actual
+# `WEIGHT_*` constants are 0.35 / 0.25 / 0.10 / 0.15 / 0.15 across five. The
+# constants are what runs and what the oracle's own `expected_score` test helper
+# recomputes from, so they are what is ported. The stale rustdoc is not.
+#
+# **Personality always scores 0.5 here.** The oracle reads a bhava
+# `PersonalityProfile` off the agent and maps a trait group or a single trait
+# into 0..1; `core_agent` does not carry that field, because bhava is post-v2 by
+# decision, so every agent takes the oracle's own `else` arm — "no personality →
+# neutral score". This is not an approximation: it is the branch the oracle
+# takes for `personality: None`, which is the only value the default Rust build
+# ever produced, and it is what the oracle's `expected_score` helper hardcodes.
+# When bhava lands, `agnosai_personality_score` is the single function to fill
+# in; nothing else in this module changes.
+#
+# Scores are f64 bit patterns throughout — the one place in the port where the
+# oracle's arithmetic is genuinely fractional and no integer carrier would be
+# exact. Weight sums, ratios and the 1/3 complexity step are all reproduced in
+# f64 for that reason.
+# =========================================================================
+
+# The oracle's five weights. They sum to exactly 1.0.
+fn agnosai_weight_tool_coverage(): i64 {
+    return f64_div(f64_from(35), f64_from(100));
+}
+
+# Weight of complexity alignment.
+fn agnosai_weight_complexity(): i64 {
+    return f64_div(f64_from(25), f64_from(100));
+}
+
+# Weight of GPU capability match.
+fn agnosai_weight_gpu(): i64 {
+    return f64_div(f64_from(10), f64_from(100));
+}
+
+# Weight of domain match.
+fn agnosai_weight_domain(): i64 {
+    return f64_div(f64_from(15), f64_from(100));
+}
+
+# Weight of personality fit.
+fn agnosai_weight_personality(): i64 {
+    return f64_div(f64_from(15), f64_from(100));
+}
+
+# Case-insensitive ASCII compare of a Str against a C string — the oracle's
+# `eq_ignore_ascii_case`.
+fn _agnosai_scoring_ieq(s: Str, c): i64 {
+    var n = str_len(s);
+    if (n != strlen(c)) { return 0; }
+    var d = str_data(s);
+    for (var i = 0; i < n; i = i + 1) {
+        var a = load8(d + i) & 255;
+        var b = load8(c + i) & 255;
+        if (a >= 65 && a <= 90) { a = a + 32; }
+        if (b >= 65 && b <= 90) { b = b + 32; }
+        if (a != b) { return 0; }
+    }
+    return 1;
+}
+
+# Map a complexity string to a level: low = 1, high = 3, anything else = 2.
+#
+# The fallback is deliberate in the oracle — "medium" and an unrecognised value
+# score identically, so a typo degrades to the middle rather than to an error.
+# The comparison is case-insensitive.
+fn agnosai_complexity_level(s: Str): i64 {
+    if (_agnosai_scoring_ieq(s, "low") == 1) { return 1; }
+    if (_agnosai_scoring_ieq(s, "high") == 1) { return 3; }
+    return 2;
+}
+
+# The oracle's `warn!` for a malformed required_tools.
+fn _agnosai_scoring_warn_tools(): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    sakshi_log_kv(SK_WARN, "task has malformed required_tools context", 40, "field", 5,
+    "required_tools", 14);
+    return 0;
+}
+
+# The task context's `required_tools`, as a vec of Str — or 0 when absent or
+# malformed.
+#
+# `agnosai_task_context` hands back a Str-keyed **map** of bayan values, not a
+# bayan object, so lookups here go through `map_get` rather than
+# `bayan_json_v_obj_get`. The values inside it are bayan values as usual.
+#
+# The oracle deserializes `Vec<String>` and, on failure, warns and yields None,
+# which `tool_coverage_score` then treats as "no requirement" — a full score.
+# A malformed `required_tools` therefore makes an agent look *more* suitable,
+# not less. That is the oracle's behaviour and it is reproduced; the warning is
+# the only thing that flags it.
+#
+# "Malformed" means any element that is not a string, matching serde's
+# all-or-nothing `Vec<String>` decode — a single number in the array rejects the
+# whole list rather than skipping that entry.
+fn agnosai_extract_required_tools(task): i64 {
+    var ctx = agnosai_task_context(task);
+    if (ctx == 0) { return 0; }
+    var val = map_get(ctx, str_from("required_tools"));
+    if (val == 0) { return 0; }
+    if (bayan_json_v_is_arr(val) == 0) {
+        _agnosai_scoring_warn_tools();
+        return 0;
+    }
+
+    var out = vec_new();
+    for (var i = 0; i < bayan_json_v_arr_len(val); i = i + 1) {
+        var e = bayan_json_v_arr_get(val, i);
+        if (e == 0 || bayan_json_v_is_str(e) == 0) {
+            _agnosai_scoring_warn_tools();
+            return 0;
+        }
+        vec_push(out, bayan_json_v_str(e));
+    }
+    return out;
+}
+
+# Fraction of the required tools the agent provides.
+#
+# `required` of 0 (absent or malformed) and an empty list both score 1.0 —
+# the oracle's two separate arms, same result.
+fn agnosai_tool_coverage_score(agent, required): i64 {
+    if (required == 0) { return f64_from(1); }
+    var n = vec_len(required);
+    if (n == 0) { return f64_from(1); }
+
+    var tools = agnosai_agent_tools(agent);
+    var matched = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var want = vec_get(required, i);
+        for (var j = 0; j < vec_len(tools); j = j + 1) {
+            if (str_eq(vec_get(tools, j), want) == 1) {
+                matched = matched + 1;
+                break;
+            }
+        }
+    }
+    return f64_div(f64_from(matched), f64_from(n));
+}
+
+# How closely the agent's complexity matches the task's: `1 - |diff| / 3`.
+#
+# A missing `complexity` in the task context defaults to "medium", so an agent
+# declared "medium" scores a full 1.0 against a task that says nothing.
+fn agnosai_complexity_score(agent, task): i64 {
+    var task_complexity = str_from("medium");
+    var ctx = agnosai_task_context(task);
+    if (ctx != 0) {
+        var v = map_get(ctx, str_from("complexity"));
+        if (v != 0 && bayan_json_v_is_str(v) == 1) { task_complexity = bayan_json_v_str(v); }
+    }
+
+    var agent_level = agnosai_complexity_level(agnosai_agent_complexity(agent));
+    var task_level = agnosai_complexity_level(task_complexity);
+    var diff = agent_level - task_level;
+    if (diff < 0) { diff = 0 - diff; }
+    return f64_sub(f64_from(1), f64_div(f64_from(diff), f64_from(3)));
+}
+
+# GPU compatibility.
+#
+# A task that does not require a GPU scores every agent 1.0 — an agent with a
+# GPU is not penalised for a task that does not need one.
+fn agnosai_gpu_score(agent, task): i64 {
+    var gpu_required = 0;
+    var ctx = agnosai_task_context(task);
+    if (ctx != 0) {
+        var v = map_get(ctx, str_from("gpu_required"));
+        if (v != 0 && bayan_json_v_is_bool(v) == 1) { gpu_required = bayan_json_v_bool(v); }
+    }
+    if (gpu_required == 0) { return f64_from(1); }
+
+    if (agnosai_agent_gpu_required(agent) == 1) { return f64_from(1); }
+    if (agnosai_agent_gpu_preferred(agent) == 1) { return f64_from(1); }
+    return f64_from(0);
+}
+
+# Domain match, compared case-insensitively.
+#
+# Two separate paths score 1.0: a task with no domain, and an agent with no
+# domain constraint. Only a *mismatch* between two stated domains scores 0.
+fn agnosai_domain_score(agent, task): i64 {
+    var ctx = agnosai_task_context(task);
+    if (ctx == 0) { return f64_from(1); }
+    var v = map_get(ctx, str_from("domain"));
+    if (v == 0 || bayan_json_v_is_str(v) == 0) { return f64_from(1); }
+
+    var agent_domain = agnosai_agent_domain(agent);
+    if (agent_domain == 0) { return f64_from(1); }
+    if (_agnosai_scoring_ieq(agent_domain, str_cstr(bayan_json_v_str(v))) == 1) {
+        return f64_from(1);
+    }
+    return f64_from(0);
+}
+
+# Personality fit.
+#
+# Always the oracle's neutral 0.5: see the module header. The bhava-backed
+# `personality_group` / `personality_trait` arms defer with bhava, and this is
+# the single function that changes when it lands.
+fn agnosai_personality_score(agent, task): i64 {
+    return f64_div(f64_from(1), f64_from(2));
+}
+
+# Score an agent against a task, with the required tools already extracted.
+#
+# Pass `required` from `agnosai_extract_required_tools` when scoring several
+# agents against one task — the oracle's reason for the split is avoiding N
+# deserializations, and the same saving applies here.
+fn agnosai_score_agent_with_tools(agent, task, required): i64 {
+    var score = f64_mul(agnosai_weight_tool_coverage(),
+    agnosai_tool_coverage_score(agent, required));
+    score = f64_add(score, f64_mul(agnosai_weight_complexity(),
+    agnosai_complexity_score(agent, task)));
+    score = f64_add(score, f64_mul(agnosai_weight_gpu(), agnosai_gpu_score(agent, task)));
+    score = f64_add(score, f64_mul(agnosai_weight_domain(), agnosai_domain_score(agent, task)));
+    score = f64_add(score, f64_mul(agnosai_weight_personality(),
+    agnosai_personality_score(agent, task)));
+
+    if (f64_lt(score, f64_from(0)) == 1) { return f64_from(0); }
+    if (f64_gt(score, f64_from(1)) == 1) { return f64_from(1); }
+    return score;
+}
+
+# Score an agent's suitability for a task, 0.0 to 1.0.
+fn agnosai_score_agent(agent, task): i64 {
+    return agnosai_score_agent_with_tools(agent, task, agnosai_extract_required_tools(task));
+}
+
+# A scored agent: its index in the input and its score.
+enum AgnosaiScoredOff {
+    AGN_SC_INDEX = 0;
+    AGN_SC_SCORE = 8;
+    AGN_SC_SIZE = 16;
+}
+
+# The agent's index in the vec passed to `agnosai_rank_agents`.
+fn agnosai_scored_index(s): i64 {
+    return load64(s + AGN_SC_INDEX);
+}
+
+# The agent's score, as an f64 bit pattern.
+fn agnosai_scored_score(s): i64 {
+    return load64(s + AGN_SC_SCORE);
+}
+
+# Whether `a` sorts before `b`: higher score first, lower index on a tie.
+fn _agnosai_scored_before(a, b): i64 {
+    var sa = agnosai_scored_score(a);
+    var sb = agnosai_scored_score(b);
+    if (f64_gt(sa, sb) == 1) { return 1; }
+    if (f64_lt(sa, sb) == 1) { return 0; }
+    if (agnosai_scored_index(a) < agnosai_scored_index(b)) { return 1; }
+    return 0;
+}
+
+# Rank agents by suitability, best first.
+#
+# Returns a vec of scored entries. The required tools are extracted once for the
+# whole set, which is what the oracle's `score_agent_with_tools` split exists
+# for.
+#
+# **Ties keep input order.** The oracle sorts with `sort_by`, which is a stable
+# merge sort, so two agents scoring identically come back in the order they were
+# given. `src/order.cyr`'s heapsort is *not* stable, so rather than reach for a
+# stable sort this compares on index ascending whenever the scores are equal —
+# which produces exactly the stable result and needs no extra machinery. Without
+# that tie-break, "which of two equally good agents gets the task" would vary
+# with the sort's internal swaps.
+fn agnosai_rank_agents(agents, task): i64 {
+    var required = agnosai_extract_required_tools(task);
+    var scored = vec_new();
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        var e = alloc(AGN_SC_SIZE);
+        store64(e + AGN_SC_INDEX, i);
+        store64(e + AGN_SC_SCORE,
+        agnosai_score_agent_with_tools(vec_get(agents, i), task, required));
+        vec_push(scored, e);
+    }
+
+    # Insertion sort: descending by score, ascending by index on a tie. The
+    # agent count per task is small — the oracle collects into a Vec and sorts
+    # it with no size guard either — and an insertion sort is stable by
+    # construction, so the tie-break is belt-and-braces rather than load-bearing.
+    for (var a = 1; a < vec_len(scored); a = a + 1) {
+        var cur = vec_get(scored, a);
+        var b = a - 1;
+        while (b >= 0) {
+            var other = vec_get(scored, b);
+            if (_agnosai_scored_before(cur, other) == 0) { break; }
+            vec_set(scored, b + 1, other);
+            b = b - 1;
+        }
+        vec_set(scored, b + 1, cur);
+    }
+    return scored;
+}
+
