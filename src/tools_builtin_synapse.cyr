@@ -1,0 +1,176 @@
+# =========================================================================
+# tools_builtin_synapse — the three Synapse LLM Controller tools.
+#
+# Parity oracle: rust-old/src/tools/builtin/synapse.rs
+#
+# Synapse exposes an OpenAI-compatible API for local and remote model
+# inference; the oracle's default base URL is `http://localhost:8420`. The HTTP
+# shape lives in `src/tools_agnos.cyr` — see that module's header for why the
+# SSRF guard does not run here and why the transport is a function pointer.
+#
+# Each tool is a constructor taking a client, rather than the oracle's
+# `new()` / `with_base_url()` pair. `with_base_url` is the only one of those
+# that carries information: `new()` is `with_base_url(DEFAULT_BASE_URL)`, and
+# `Default` is `new()`. `agnosai_synapse_*_tool(client)` plus
+# `agnosai_synapse_client()` covers all three without the indirection.
+# =========================================================================
+
+# A client pointed at the default Synapse base URL.
+fn agnosai_synapse_client(): i64 {
+    return agnosai_agnos_client(str_from(AGNOSAI_SYNAPSE_BASE_URL), str_from("synapse"));
+}
+
+# ---------------------------------------------------------------------------
+# synapse_infer
+# ---------------------------------------------------------------------------
+
+# The synapse_infer parameter schema.
+fn _agnosai_synapse_infer_schema(ctx): i64 {
+    var s = agnosai_tool_schema_new(str_from("synapse_infer"),
+    str_from("Run inference through the Synapse LLM controller (OpenAI-compatible chat completions)"));
+    agnosai_tool_schema_param(s, str_from("model"), str_from("Model identifier"),
+    str_from("string"), 1);
+    agnosai_tool_schema_param(s, str_from("prompt"), str_from("User prompt text"),
+    str_from("string"), 1);
+    agnosai_tool_schema_param(s, str_from("max_tokens"), str_from("Maximum tokens to generate"),
+    str_from("number"), 0);
+    agnosai_tool_schema_param(s, str_from("temperature"),
+    str_from("Sampling temperature (0.0-2.0)"), str_from("number"), 0);
+    return s;
+}
+
+# Pull the completion text out of an OpenAI-compatible response.
+#
+# The oracle's chain is `data["choices"][0]["message"]["content"].as_str()` with
+# `.unwrap_or("")` at the end, so **every** step failing yields an empty string
+# rather than an error: a missing `choices`, an empty array, a missing `message`,
+# a `content` that is not a string. A response that is not an object at all
+# takes the same path. That tolerance is deliberate on the oracle's part — the
+# raw response ships alongside — and is reproduced exactly.
+fn agnosai_synapse_completion_text(data): i64 {
+    if (bayan_json_v_is_obj(data) == 0) { return str_from(""); }
+    var choices = bayan_json_v_obj_get(data, "choices");
+    if (choices == 0 || bayan_json_v_is_arr(choices) == 0) { return str_from(""); }
+    if (bayan_json_v_arr_len(choices) == 0) { return str_from(""); }
+    var first = bayan_json_v_arr_get(choices, 0);
+    if (first == 0 || bayan_json_v_is_obj(first) == 0) { return str_from(""); }
+    var message = bayan_json_v_obj_get(first, "message");
+    if (message == 0 || bayan_json_v_is_obj(message) == 0) { return str_from(""); }
+    var content = bayan_json_v_obj_get(message, "content");
+    if (content == 0 || bayan_json_v_is_str(content) == 0) { return str_from(""); }
+    return bayan_json_v_str(content);
+}
+
+# The oracle's `json!({ "completion": text, "raw": data })`.
+fn _agnosai_synapse_shape_infer(data): i64 {
+    var out = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(out, str_from("completion"),
+    bayan_json_v_str_new(agnosai_synapse_completion_text(data)));
+    bayan_json_v_obj_set(out, str_from("raw"), data);
+    return out;
+}
+
+# Build the chat-completions request body.
+#
+# `max_tokens` and `temperature` are inserted only when present, matching the
+# oracle's `if let Some(..)` guards — sending `"max_tokens": null` to an
+# OpenAI-compatible endpoint is not the same request as omitting the key.
+fn agnosai_synapse_infer_body(model: Str, prompt: Str, max_tokens, temperature, has_temp): i64 {
+    var body = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(body, str_from("model"), bayan_json_v_str_new(model));
+
+    var msg = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(msg, str_from("role"), bayan_json_v_str_new(str_from("user")));
+    bayan_json_v_obj_set(msg, str_from("content"), bayan_json_v_str_new(prompt));
+    var messages = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(messages, msg);
+    bayan_json_v_obj_set(body, str_from("messages"), messages);
+
+    if (max_tokens != AGNOSAI_NO_LIMIT) {
+        bayan_json_v_obj_set(body, str_from("max_tokens"), bayan_json_v_int_new(max_tokens));
+    }
+    if (has_temp == 1) {
+        bayan_json_v_obj_set(body, str_from("temperature"), bayan_json_v_float_new(temperature));
+    }
+    return body;
+}
+
+# Run inference through Synapse's chat-completions endpoint.
+fn _agnosai_synapse_infer_execute(ctx, input): i64 {
+    var model = agnosai_tool_input_get_str(input, str_from("model"));
+    if (model == 0) {
+        return agnosai_tool_output_err(str_from("missing required parameter: model"));
+    }
+    var prompt = agnosai_tool_input_get_str(input, str_from("prompt"));
+    if (prompt == 0) {
+        return agnosai_tool_output_err(str_from("missing required parameter: prompt"));
+    }
+
+    var has_temp = 0;
+    var temperature = agnosai_tool_input_get_f64(input, str_from("temperature"), &has_temp);
+    var body = agnosai_synapse_infer_body(model, prompt,
+    agnosai_tool_input_get_int(input, str_from("max_tokens")), temperature, has_temp);
+
+    return agnosai_agnos_call(ctx, "POST", str_from("/v1/chat/completions"), body,
+    &_agnosai_synapse_shape_infer);
+}
+
+# The synapse_infer tool, bound to a client.
+fn agnosai_synapse_infer_tool(client): i64 {
+    return agnosai_tool_new(str_from("synapse_infer"),
+    str_from("Run inference through the Synapse LLM controller (OpenAI-compatible chat completions)"),
+    &_agnosai_synapse_infer_schema, &_agnosai_synapse_infer_execute, client);
+}
+
+# ---------------------------------------------------------------------------
+# synapse_list_models
+# ---------------------------------------------------------------------------
+
+# The synapse_list_models parameter schema — no parameters.
+fn _agnosai_synapse_list_models_schema(ctx): i64 {
+    return agnosai_tool_schema_new(str_from("synapse_list_models"),
+    str_from("List models available through the Synapse LLM controller"));
+}
+
+# List the models Synapse can serve.
+fn _agnosai_synapse_list_models_execute(ctx, input): i64 {
+    return agnosai_agnos_call(ctx, "GET", str_from("/v1/models"), 0, 0);
+}
+
+# The synapse_list_models tool, bound to a client.
+fn agnosai_synapse_list_models_tool(client): i64 {
+    return agnosai_tool_new(str_from("synapse_list_models"),
+    str_from("List models available through the Synapse LLM controller"),
+    &_agnosai_synapse_list_models_schema, &_agnosai_synapse_list_models_execute, client);
+}
+
+# ---------------------------------------------------------------------------
+# synapse_status
+# ---------------------------------------------------------------------------
+
+# The synapse_status parameter schema — no parameters.
+fn _agnosai_synapse_status_schema(ctx): i64 {
+    return agnosai_tool_schema_new(str_from("synapse_status"),
+    str_from("Get Synapse system status: loaded models, backends, and hardware info"));
+}
+
+# Report Synapse's loaded models, backends and hardware.
+fn _agnosai_synapse_status_execute(ctx, input): i64 {
+    return agnosai_agnos_call(ctx, "GET", str_from("/system/status"), 0, 0);
+}
+
+# The synapse_status tool, bound to a client.
+fn agnosai_synapse_status_tool(client): i64 {
+    return agnosai_tool_new(str_from("synapse_status"),
+    str_from("Get Synapse system status: loaded models, backends, and hardware info"),
+    &_agnosai_synapse_status_schema, &_agnosai_synapse_status_execute, client);
+}
+
+# Register all three Synapse tools against a live client. Returns the registry.
+fn agnosai_register_synapse_builtins(registry): i64 {
+    var client = agnosai_synapse_client();
+    agnosai_tool_registry_register(registry, agnosai_synapse_infer_tool(client));
+    agnosai_tool_registry_register(registry, agnosai_synapse_list_models_tool(client));
+    agnosai_tool_registry_register(registry, agnosai_synapse_status_tool(client));
+    return registry;
+}

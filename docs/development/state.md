@@ -20,7 +20,8 @@ lands, not before, so the number always names something that actually shipped.
 - **Rust reference**: 27,683 lines at `rust-old/` — frozen, do not edit. It is the parity oracle.
 - **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers),
   `llm` (router, retry, hoosh seam client + hub) and `tools` (native, registry, echo,
-  json_transform, load_testing, security_audit), plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr` and
+  json_transform, load_testing, security_audit, and the nine AGNOS ecosystem tools over a
+  shared client), plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr` and
   `src/server_ssrf.cyr`. `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
 ## Where the port is
@@ -28,8 +29,7 @@ lands, not before, so the number always names something that actually shipped.
 Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **complete**: `learning` and
 `core` both ported and green against the oracle. Phase 2 (M3 `llm`) — **complete**: router, retry
 and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools`) —
-**native, registry, the basic builtins, load_testing and security_audit done;
-three builtins and remote_registry left**.
+**every builtin done — only `remote_registry` is left**.
 
 | Gate | Status |
 |---|---|
@@ -47,14 +47,14 @@ three builtins and remote_registry left**.
 | Money representation decided | ✅ integer micro-USD (2026-07-28) — gates core BITE 8 |
 | `llm` ported (M3, Phase 2) | ✅ router + retry + hoosh seam client |
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
-| `tools` ported (M4, Phase 3) | 🟡 native + registry + echo/json_transform/load_testing/security_audit; 3 builtins + remote_registry left |
+| `tools` ported (M4, Phase 3) | 🟡 all 12 builtins done (echo, json_transform, load_testing, security_audit, 3x synapse, 3x mneme, 3x delta); remote_registry left |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
 | `server/ssrf` ported (M6 leaf, pulled forward) | ✅ two M4 modules gate on it — hardened against octal/hex/short-form bypasses |
 
 ## Tests
 
-**1234 assertions across 22 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**1365 assertions across 23 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -79,6 +79,7 @@ three builtins and remote_registry left**.
 | `server_ssrf.tcyr` | 81 | ~14 |
 | `tools_builtin_load_testing.tcyr` | 88 | 2 (both drive an axum mock server — see below) |
 | `tools_builtin_security_audit.tcyr` | 200 | 8 (5 of them drive an axum mock server) |
+| `tools_agnos.tcyr` | 140 | 27 across synapse + mneme + delta (schemas only — see below) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -103,7 +104,14 @@ risk-band boundary, the reflected-origin CORS bypass the probe origin exists to 
 test that scribbles over the released arena so a borrowed pointer would show up as corruption
 rather than passing silently.
 
-`cyrius coverage --min 80` → **100% (466/466 fns), gate OK**. Shared assertion helpers live in
+`tools_agnos.tcyr` covers the nine ecosystem tools, and it is where the seam pays off most. The
+oracle's three suites test **only** names, descriptions and schemas — every execute path needs a
+live service on loopback, so the Rust side never exercises one. Because
+`agnosai_agnos_client_new` takes its transport as a function pointer, a recording stub turns the
+whole untested half into ordinary assertions: URL construction, form encoding, body
+construction, the path-traversal guards, and the response reshaping.
+
+`cyrius coverage --min 80` → **100% (498/498 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -305,6 +313,18 @@ Open items, none blocking:
 2. **`lib/sakshi.cyr` is vendored at 2.4.3 while the 6.4.86 toolchain bundles
    2.4.6**, which every build reports as a shadow warning. `cyrius lib sync
    --full` re-syncs.
+3. **Cyrius `_int` overload misdispatch — filed 2026-07-29.**
+   `X(f(), …)` silently runs `X_int`'s body when `X_int` exists and the first
+   argument is written as a bare call result; the same value via a variable
+   dispatches correctly, with no diagnostic either way. Cost about an hour to
+   bisect in `tools_agnos`, where a helper named `_t_add` ran `_t_add_int` and
+   stored every string parameter as a JSON integer holding its own pointer.
+   Filed at `cyrius/docs/development/issues/2026-07-29-agnosai-int-overload-call-result-misdispatch.md`
+   with a standalone repro under `issues/repros/`.
+   **Nothing here is blocked** — the helper was renamed, and the one such pair
+   in our own source (`agnosai_tool_input_get` / `_get_int`) is dormant because
+   every call site passes `input` as a variable, which `tests/tools_agnos.tcyr`
+   now pins.
 
 Two API hazards worth knowing when writing the rest of core:
 

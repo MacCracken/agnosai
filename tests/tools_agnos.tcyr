@@ -1,0 +1,588 @@
+# =========================================================================
+# tools_agnos.tcyr — parity tests for the nine AGNOS ecosystem tools and the
+# shared client behind them.
+#
+# Oracles: the #[cfg(test)] blocks in
+# rust-old/src/tools/builtin/{synapse,mneme,delta}.rs
+#
+# Those blocks test names, descriptions and schemas only — every execute path
+# needs a live service on loopback, so the Rust suite never exercises one. This
+# suite does, because `agnosai_agnos_client_new` takes its transport as a
+# function pointer: `_t_capture` records the method, URL and body it was handed
+# and returns a canned response. That turns the untestable half of each tool —
+# URL construction, query encoding, body construction, the path-traversal
+# guards, the response reshaping — into ordinary assertions.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/llm_retry.cyr"
+include "src/server_ssrf.cyr"
+include "src/tools_native.cyr"
+include "src/tools_registry.cyr"
+include "src/tools_agnos.cyr"
+include "src/tools_builtin_synapse.cyr"
+include "src/tools_builtin_mneme.cyr"
+include "src/tools_builtin_delta.cyr"
+include "tests/test_helpers.cyr"
+
+# What the last synthetic exchange was handed.
+var _T_METHOD = 0;
+var _T_URL = 0;
+var _T_BODY = 0;
+var _T_CALLS = 0;
+
+# What the next synthetic exchange should return: a JSON value, 0 for a
+# transport failure, or AGNOSAI_AGNOS_BAD_JSON for an unparseable body.
+var _T_REPLY = 0;
+
+# The recording transport. Stands in for one sandhi exchange.
+fn _t_capture(c, method, url: Str, body): i64 {
+    _T_METHOD = method;
+    _T_URL = str_clone(url);
+    _T_BODY = body;
+    _T_CALLS = _T_CALLS + 1;
+    return _T_REPLY;
+}
+
+# A client wired to the recording transport.
+fn _t_client(base, service): i64 {
+    return agnosai_agnos_client_new(str_from(base), str_from(service), &_t_capture);
+}
+
+# Reset the recorder and set the canned reply.
+fn _t_reset(reply): i64 {
+    _T_METHOD = 0;
+    _T_URL = 0;
+    _T_BODY = 0;
+    _T_CALLS = 0;
+    _T_REPLY = reply;
+    return 0;
+}
+
+# A tool input carrying one string parameter.
+fn _t_in1(k, v): i64 {
+    var i = agnosai_tool_input_new();
+    agnosai_tool_input_set(i, str_from(k), bayan_json_v_str_new(str_from(v)));
+    return i;
+}
+
+# Add a string parameter to an input.
+fn _t_with_str(i, k, v): i64 {
+    agnosai_tool_input_set(i, str_from(k), bayan_json_v_str_new(str_from(v)));
+    return i;
+}
+
+# Add an integer parameter to an input.
+fn _t_with_num(i, k, v): i64 {
+    agnosai_tool_input_set(i, str_from(k), bayan_json_v_int_new(v));
+    return i;
+}
+
+# Whether the recorded URL matches.
+fn _t_url_is(want): i64 {
+    return assert_eq(str_eq(_T_URL, str_from(want)), 1, want);
+}
+
+# The serialised form of a JSON value.
+fn _t_json(v): i64 {
+    return bayan_json_v_build(v);
+}
+
+# An OpenAI-compatible chat-completions reply carrying `content`.
+fn _t_openai_reply(content): i64 {
+    var msg = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(msg, str_from("role"), bayan_json_v_str_new(str_from("assistant")));
+    bayan_json_v_obj_set(msg, str_from("content"), bayan_json_v_str_new(str_from(content)));
+    var choice = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(choice, str_from("message"), msg);
+    var choices = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(choices, choice);
+    var reply = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(reply, str_from("choices"), choices);
+    return reply;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("tools_agnos");
+
+    var ok_reply = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(ok_reply, str_from("ok"), bayan_json_v_bool_new(1));
+
+    # =====================================================================
+    # the shared client
+    # =====================================================================
+
+    # --- the oracle's three DEFAULT_BASE_URL constants ---
+    assert(str_eq(str_from(AGNOSAI_SYNAPSE_BASE_URL), str_from("http://localhost:8420")) == 1,
+    "synapse defaults to port 8420");
+    assert(str_eq(str_from(AGNOSAI_MNEME_BASE_URL), str_from("http://localhost:8400")) == 1,
+    "mneme defaults to port 8400");
+    assert(str_eq(str_from(AGNOSAI_DELTA_BASE_URL), str_from("http://localhost:8070")) == 1,
+    "delta defaults to port 8070");
+
+    # every default base URL is one the SSRF guard would reject — which is why
+    # these tools deliberately do not run it
+    assert_eq(agnosai_is_safe_url(str_from(AGNOSAI_SYNAPSE_BASE_URL)), 0,
+    "the guard would reject synapse's own default, so it must not run here");
+    assert_eq(agnosai_is_safe_url(str_from(AGNOSAI_MNEME_BASE_URL)), 0, "likewise mneme's");
+    assert_eq(agnosai_is_safe_url(str_from(AGNOSAI_DELTA_BASE_URL)), 0, "likewise delta's");
+
+    var c = _t_client("http://svc:1234", "testsvc");
+    assert(str_eq(agnosai_agnos_base_url(c), str_from("http://svc:1234")) == 1, "base url stored");
+    assert(str_eq(agnosai_agnos_service(c), str_from("testsvc")) == 1, "service label stored");
+    assert(agnosai_agnos_transport(c) != 0, "transport stored");
+    assert(str_eq(agnosai_agnos_url(c, str_from("/x/y")), str_from("http://svc:1234/x/y")) == 1,
+    "url joins base and path with no separator of its own");
+
+    # --- the path-segment guard, the oracle's two conditions ---
+    assert_eq(agnosai_agnos_segment_ok(str_from("abc123")), 1, "a plain segment passes");
+    assert_eq(agnosai_agnos_segment_ok(str_from("a/b")), 0, "a slash is rejected");
+    assert_eq(agnosai_agnos_segment_ok(str_from("..")), 0, "a bare .. is rejected");
+    assert_eq(agnosai_agnos_segment_ok(str_from("a..b")), 0, ".. anywhere is rejected");
+    assert_eq(agnosai_agnos_segment_ok(str_from("../etc/passwd")), 0, "traversal is rejected");
+    assert_eq(agnosai_agnos_segment_ok(str_from("%2e%2e")), 1,
+    "an ENCODED traversal passes — the oracle's check is on the raw bytes, and the port must not \
+    be stricter than the thing it mirrors");
+    assert_eq(agnosai_agnos_segment_ok(str_from("a.b")), 1, "a single dot is fine");
+    assert_eq(agnosai_agnos_segment_ok(str_from("")), 1, "empty passes, as it does in the oracle");
+
+    # --- form encoding, matching serde_urlencoded ---
+    var eb = str_builder_new();
+    agnosai_agnos_form_encode(eb, str_from("hello world"));
+    assert(str_eq(str_builder_build(eb), str_from("hello+world")) == 1, "space becomes plus");
+
+    var eb2 = str_builder_new();
+    agnosai_agnos_form_encode(eb2, str_from("a&b=c"));
+    assert(str_eq(str_builder_build(eb2), str_from("a%26b%3Dc")) == 1,
+    "the separators that would forge a parameter are escaped");
+
+    var eb3 = str_builder_new();
+    agnosai_agnos_form_encode(eb3, str_from("Az09*-._"));
+    assert(str_eq(str_builder_build(eb3), str_from("Az09*-._")) == 1,
+    "the unreserved set passes through unchanged");
+
+    var eb4 = str_builder_new();
+    agnosai_agnos_form_encode(eb4, str_from("caf\xc3\xa9"));
+    assert(str_eq(str_builder_build(eb4), str_from("caf%C3%A9")) == 1,
+    "UTF-8 is percent-encoded byte by byte, in upper-case hex");
+
+    var eb5 = str_builder_new();
+    agnosai_agnos_form_encode(eb5, str_from("/?#+%"));
+    assert(str_eq(str_builder_build(eb5), str_from("%2F%3F%23%2B%25")) == 1,
+    "a literal plus is escaped, so it cannot be read back as a space");
+
+    var eb6 = str_builder_new();
+    agnosai_agnos_form_encode(eb6, str_from(""));
+    assert(str_eq(str_builder_build(eb6), str_from("")) == 1, "an empty value encodes to nothing");
+
+    # --- the two error arms ---
+    _t_reset(0);
+    var fail_out = agnosai_agnos_call(c, "GET", str_from("/z"), 0, 0);
+    assert_eq(agnosai_tool_output_success(fail_out), 0, "a transport failure is not a success");
+    assert(str_eq(agnosai_tool_output_error(fail_out), str_from("testsvc request failed")) == 1,
+    "the error names the service");
+
+    _t_reset(AGNOSAI_AGNOS_BAD_JSON);
+    var bad_out = agnosai_agnos_call(c, "GET", str_from("/z"), 0, 0);
+    assert_eq(agnosai_tool_output_success(bad_out), 0, "an unparseable body is not a success");
+    assert(str_eq(agnosai_tool_output_error(bad_out), str_from("failed to parse response")) == 1,
+    "and is reported as a parse failure, not a transport one — they are different problems");
+
+    _t_reset(ok_reply);
+    var ok_out = agnosai_agnos_call(c, "GET", str_from("/z"), 0, 0);
+    assert_eq(agnosai_tool_output_success(ok_out), 1, "a parsed response succeeds");
+    assert_eq(agnosai_tool_output_result(ok_out), ok_reply,
+    "and is returned unchanged when no shaper is given");
+
+    var seg_err = agnosai_agnos_segment_err(str_from("note_id"));
+    assert(str_eq(agnosai_tool_output_error(seg_err),
+    str_from("note_id contains invalid characters")) == 1, "the segment rejection is the oracle's");
+
+    # =====================================================================
+    # synapse
+    # =====================================================================
+
+    var sc = _t_client("http://synapse:8420", "synapse");
+    var infer = agnosai_synapse_infer_tool(sc);
+    var models = agnosai_synapse_list_models_tool(sc);
+    var status = agnosai_synapse_status_tool(sc);
+
+    # --- names and descriptions ---
+    assert(str_eq(agnosai_tool_name(infer), str_from("synapse_infer")) == 1, "synapse_infer name");
+    assert(str_eq(agnosai_tool_name(models), str_from("synapse_list_models")) == 1,
+    "synapse_list_models name");
+    assert(str_eq(agnosai_tool_name(status), str_from("synapse_status")) == 1,
+    "synapse_status name");
+    assert(str_len(agnosai_tool_description(infer)) > 0, "synapse_infer description non-empty");
+    assert(str_len(agnosai_tool_description(models)) > 0, "list_models description non-empty");
+    assert(str_len(agnosai_tool_description(status)) > 0, "status description non-empty");
+
+    # --- schemas ---
+    var infer_params = agnosai_tool_schema_parameters(agnosai_tool_schema(infer));
+    assert_eq(vec_len(infer_params), 4, "synapse_infer has four parameters");
+    assert(str_eq(agnosai_param_schema_name(vec_get(infer_params, 0)), str_from("model")) == 1,
+    "model first");
+    assert_eq(agnosai_param_schema_required(vec_get(infer_params, 0)), 1, "model required");
+    assert(str_eq(agnosai_param_schema_name(vec_get(infer_params, 1)), str_from("prompt")) == 1,
+    "prompt second");
+    assert_eq(agnosai_param_schema_required(vec_get(infer_params, 1)), 1, "prompt required");
+    assert_eq(agnosai_param_schema_required(vec_get(infer_params, 2)), 0, "max_tokens optional");
+    assert_eq(agnosai_param_schema_required(vec_get(infer_params, 3)), 0, "temperature optional");
+    assert_eq(vec_len(agnosai_tool_schema_parameters(agnosai_tool_schema(models))), 0,
+    "synapse_list_models takes no parameters");
+    assert_eq(vec_len(agnosai_tool_schema_parameters(agnosai_tool_schema(status))), 0,
+    "synapse_status takes no parameters");
+
+    # --- missing required parameters ---
+    _t_reset(ok_reply);
+    var no_model = agnosai_tool_execute(infer, agnosai_tool_input_new());
+    assert_eq(agnosai_tool_output_success(no_model), 0, "a missing model fails");
+    assert(str_contains(agnosai_tool_output_error(no_model), str_from("model")) == 1,
+    "the error names model");
+    assert_eq(_T_CALLS, 0, "and no request was sent");
+
+    var no_prompt = agnosai_tool_execute(infer, _t_in1("model", "m1"));
+    assert_eq(agnosai_tool_output_success(no_prompt), 0, "a missing prompt fails");
+    assert(str_contains(agnosai_tool_output_error(no_prompt), str_from("prompt")) == 1,
+    "the error names prompt");
+    assert_eq(_T_CALLS, 0, "still no request");
+
+    # --- the minimal inference request ---
+    _t_reset(_t_openai_reply("hi there"));
+    var min_in = _t_with_str(_t_in1("model", "llama3"), "prompt", "hello");
+    var min_out = agnosai_tool_execute(infer, min_in);
+    assert_eq(_T_CALLS, 1, "one request was sent");
+    assert(str_eq_cstr(str_from(_T_METHOD), "POST") == 1, "inference is a POST");
+    _t_url_is("http://synapse:8420/v1/chat/completions");
+    assert(str_eq(_t_json(_T_BODY),
+    str_from("{\"model\":\"llama3\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}"))
+    == 1, "the body is the oracle's, and omits both optional keys");
+
+    assert_eq(agnosai_tool_output_success(min_out), 1, "inference succeeded");
+    var shaped = agnosai_tool_output_result(min_out);
+    assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(shaped, "completion")),
+    str_from("\"hi there\"")) == 1, "the completion text is extracted");
+    assert(bayan_json_v_obj_get(shaped, "raw") != 0, "and the raw response is carried alongside");
+
+    # --- the optional parameters are inserted only when present ---
+    _t_reset(_t_openai_reply("x"));
+    var full_in = _t_with_str(_t_in1("model", "m"), "prompt", "p");
+    _t_with_num(full_in, "max_tokens", 256);
+    agnosai_tool_input_set(full_in, str_from("temperature"),
+    bayan_json_v_float_new(f64_div(f64_from(7), f64_from(10))));
+    agnosai_tool_execute(infer, full_in);
+    assert(str_contains(_t_json(_T_BODY), str_from("\"max_tokens\":256")) == 1,
+    "max_tokens is sent when given");
+    assert(str_contains(_t_json(_T_BODY), str_from("\"temperature\":0.7")) == 1,
+    "temperature is sent when given, as a float");
+
+    # a fractional max_tokens is not an integer, so the oracle's as_u64 yields
+    # None and the key is omitted rather than truncated
+    _t_reset(_t_openai_reply("x"));
+    var frac_in = _t_with_str(_t_in1("model", "m"), "prompt", "p");
+    agnosai_tool_input_set(frac_in, str_from("max_tokens"),
+    bayan_json_v_float_new(f64_div(f64_from(3), f64_from(2))));
+    agnosai_tool_execute(infer, frac_in);
+    assert_eq(str_contains(_t_json(_T_BODY), str_from("max_tokens")), 0,
+    "a fractional max_tokens is omitted, not truncated to 1");
+
+    # --- completion extraction tolerates every malformed shape ---
+    # The oracle's chain ends in unwrap_or(""), so none of these is an error.
+    assert(str_eq(agnosai_synapse_completion_text(bayan_json_v_obj_new()), str_from("")) == 1,
+    "no choices key yields empty");
+    var empty_choices = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(empty_choices, str_from("choices"), bayan_json_v_arr_new());
+    assert(str_eq(agnosai_synapse_completion_text(empty_choices), str_from("")) == 1,
+    "an empty choices array yields empty");
+    var no_msg = bayan_json_v_obj_new();
+    var arr1 = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(arr1, bayan_json_v_obj_new());
+    bayan_json_v_obj_set(no_msg, str_from("choices"), arr1);
+    assert(str_eq(agnosai_synapse_completion_text(no_msg), str_from("")) == 1,
+    "a choice with no message yields empty");
+    assert(str_eq(agnosai_synapse_completion_text(bayan_json_v_arr_new()), str_from("")) == 1,
+    "a non-object response yields empty rather than crashing");
+    assert(str_eq(agnosai_synapse_completion_text(_t_openai_reply("real")), str_from("real")) == 1,
+    "a well-formed response yields its content");
+
+    # --- the two parameterless tools ---
+    _t_reset(ok_reply);
+    assert_eq(agnosai_tool_output_success(agnosai_tool_execute(models,
+    agnosai_tool_input_new())), 1, "list_models succeeded");
+    assert(str_eq_cstr(str_from(_T_METHOD), "GET") == 1, "list_models is a GET");
+    _t_url_is("http://synapse:8420/v1/models");
+    assert_eq(_T_BODY, 0, "and sends no body");
+
+    _t_reset(ok_reply);
+    agnosai_tool_execute(status, agnosai_tool_input_new());
+    _t_url_is("http://synapse:8420/system/status");
+
+    # =====================================================================
+    # mneme
+    # =====================================================================
+
+    var mc = _t_client("http://mneme:8400", "mneme");
+    var search = agnosai_mneme_search_tool(mc);
+    var get_note = agnosai_mneme_get_note_tool(mc);
+    var create_note = agnosai_mneme_create_note_tool(mc);
+
+    assert(str_eq(agnosai_tool_name(search), str_from("mneme_search")) == 1, "mneme_search name");
+    assert(str_eq(agnosai_tool_name(get_note), str_from("mneme_get_note")) == 1,
+    "mneme_get_note name");
+    assert(str_eq(agnosai_tool_name(create_note), str_from("mneme_create_note")) == 1,
+    "mneme_create_note name");
+    assert_eq(vec_len(agnosai_tool_schema_parameters(agnosai_tool_schema(search))), 2,
+    "mneme_search has two parameters");
+    assert_eq(vec_len(agnosai_tool_schema_parameters(agnosai_tool_schema(get_note))), 1,
+    "mneme_get_note has one");
+    assert_eq(vec_len(agnosai_tool_schema_parameters(agnosai_tool_schema(create_note))), 3,
+    "mneme_create_note has three");
+
+    # --- search: the query string, including the default limit ---
+    _t_reset(ok_reply);
+    agnosai_tool_execute(search, _t_in1("query", "rust ports"));
+    assert(str_eq_cstr(str_from(_T_METHOD), "GET") == 1, "search is a GET");
+    _t_url_is("http://mneme:8400/api/search?q=rust+ports&limit=10");
+
+    _t_reset(ok_reply);
+    agnosai_tool_execute(search, _t_with_num(_t_in1("query", "x"), "limit", 3));
+    _t_url_is("http://mneme:8400/api/search?q=x&limit=3");
+
+    # a query that would forge extra parameters is encoded, not passed through
+    _t_reset(ok_reply);
+    agnosai_tool_execute(search, _t_in1("query", "a&limit=999"));
+    _t_url_is("http://mneme:8400/api/search?q=a%26limit%3D999&limit=10");
+
+    _t_reset(ok_reply);
+    var no_query = agnosai_tool_execute(search, agnosai_tool_input_new());
+    assert_eq(agnosai_tool_output_success(no_query), 0, "a missing query fails");
+    assert_eq(_T_CALLS, 0, "and sends nothing");
+
+    # --- get_note: the path guard ---
+    _t_reset(ok_reply);
+    agnosai_tool_execute(get_note, _t_in1("note_id", "abc-123"));
+    _t_url_is("http://mneme:8400/api/notes/abc-123");
+
+    _t_reset(ok_reply);
+    var trav = agnosai_tool_execute(get_note, _t_in1("note_id", "../../etc/passwd"));
+    assert_eq(agnosai_tool_output_success(trav), 0, "a traversal note_id is refused");
+    assert(str_eq(agnosai_tool_output_error(trav),
+    str_from("note_id contains invalid characters")) == 1, "with the oracle's message");
+    assert_eq(_T_CALLS, 0, "and no request escapes to the service");
+
+    _t_reset(ok_reply);
+    assert_eq(agnosai_tool_output_success(agnosai_tool_execute(get_note,
+    _t_in1("note_id", "a/b"))), 0, "a slash in note_id is refused");
+    assert_eq(_T_CALLS, 0, "no request sent");
+
+    # --- create_note: the body ---
+    _t_reset(ok_reply);
+    var cn = _t_with_str(_t_in1("title", "T"), "content", "C");
+    agnosai_tool_execute(create_note, cn);
+    assert(str_eq_cstr(str_from(_T_METHOD), "POST") == 1, "create_note is a POST");
+    _t_url_is("http://mneme:8400/api/notes");
+    assert(str_eq(_t_json(_T_BODY),
+    str_from("{\"title\":\"T\",\"content\":\"C\",\"tags\":[]}")) == 1,
+    "absent tags default to an empty array, and the key order is the oracle's");
+
+    _t_reset(ok_reply);
+    var tags = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(tags, bayan_json_v_str_new(str_from("urgent")));
+    var cn2 = _t_with_str(_t_in1("title", "T"), "content", "C");
+    agnosai_tool_input_set(cn2, str_from("tags"), tags);
+    agnosai_tool_execute(create_note, cn2);
+    assert(str_contains(_t_json(_T_BODY), str_from("\"tags\":[\"urgent\"]")) == 1,
+    "supplied tags are forwarded");
+
+    # the oracle never type-checks tags, so a non-array is forwarded as-is
+    _t_reset(ok_reply);
+    var cn3 = _t_with_str(_t_in1("title", "T"), "content", "C");
+    agnosai_tool_input_set(cn3, str_from("tags"), bayan_json_v_str_new(str_from("urgent")));
+    agnosai_tool_execute(create_note, cn3);
+    assert(str_contains(_t_json(_T_BODY), str_from("\"tags\":\"urgent\"")) == 1,
+    "a non-array tags value is forwarded unchanged, as the oracle forwards it");
+
+    _t_reset(ok_reply);
+    assert_eq(agnosai_tool_output_success(agnosai_tool_execute(create_note,
+    _t_in1("title", "T"))), 0, "a missing content fails");
+    assert_eq(_T_CALLS, 0, "and sends nothing");
+
+    # =====================================================================
+    # delta
+    # =====================================================================
+
+    var dc = _t_client("http://delta:8070", "delta");
+    var repos = agnosai_delta_list_repos_tool(dc);
+    var trigger = agnosai_delta_trigger_pipeline_tool(dc);
+    var pipeline = agnosai_delta_get_pipeline_tool(dc);
+
+    assert(str_eq(agnosai_tool_name(repos), str_from("delta_list_repos")) == 1,
+    "delta_list_repos name");
+    assert(str_eq(agnosai_tool_name(trigger), str_from("delta_trigger_pipeline")) == 1,
+    "delta_trigger_pipeline name");
+    assert(str_eq(agnosai_tool_name(pipeline), str_from("delta_get_pipeline")) == 1,
+    "delta_get_pipeline name");
+    assert_eq(vec_len(agnosai_tool_schema_parameters(agnosai_tool_schema(repos))), 0,
+    "delta_list_repos takes no parameters");
+    assert_eq(vec_len(agnosai_tool_schema_parameters(agnosai_tool_schema(trigger))), 3,
+    "delta_trigger_pipeline has three");
+    assert_eq(vec_len(agnosai_tool_schema_parameters(agnosai_tool_schema(pipeline))), 3,
+    "delta_get_pipeline has three");
+
+    _t_reset(ok_reply);
+    agnosai_tool_execute(repos, agnosai_tool_input_new());
+    assert(str_eq_cstr(str_from(_T_METHOD), "GET") == 1, "list_repos is a GET");
+    _t_url_is("http://delta:8070/api/v1/repos");
+
+    # --- trigger: the body is {} when no branch is given ---
+    _t_reset(ok_reply);
+    agnosai_tool_execute(trigger, _t_with_str(_t_in1("owner", "acme"), "repo", "widgets"));
+    assert(str_eq_cstr(str_from(_T_METHOD), "POST") == 1, "trigger is a POST");
+    _t_url_is("http://delta:8070/api/v1/acme/widgets/pipelines");
+    assert(str_eq(_t_json(_T_BODY), str_from("{}")) == 1,
+    "with no branch the body is {} — the parameter description says 'defaults to main' but the \
+    oracle inserts nothing, and the code is what ships");
+
+    _t_reset(ok_reply);
+    var tb = _t_with_str(_t_in1("owner", "acme"), "repo", "widgets");
+    _t_with_str(tb, "branch", "release");
+    agnosai_tool_execute(trigger, tb);
+    assert(str_eq(_t_json(_T_BODY), str_from("{\"branch\":\"release\"}")) == 1,
+    "a supplied branch is sent");
+
+    # --- trigger: the guard, in the oracle's array order ---
+    _t_reset(ok_reply);
+    var bad_owner = agnosai_tool_execute(trigger, _t_with_str(_t_in1("owner", "a/b"), "repo", "ok"));
+    assert_eq(agnosai_tool_output_success(bad_owner), 0, "a slashed owner is refused");
+    assert(str_eq(agnosai_tool_output_error(bad_owner),
+    str_from("owner contains invalid characters")) == 1, "and named");
+    assert_eq(_T_CALLS, 0, "no request sent");
+
+    _t_reset(ok_reply);
+    var bad_repo = agnosai_tool_execute(trigger, _t_with_str(_t_in1("owner", "ok"), "repo", ".."));
+    assert(str_eq(agnosai_tool_output_error(bad_repo),
+    str_from("repo contains invalid characters")) == 1, "a traversal repo is named");
+
+    # with BOTH invalid the oracle reports the first in its array — owner
+    _t_reset(ok_reply);
+    var both_bad = agnosai_tool_execute(trigger, _t_with_str(_t_in1("owner", ".."), "repo", ".."));
+    assert(str_eq(agnosai_tool_output_error(both_bad),
+    str_from("owner contains invalid characters")) == 1,
+    "with both invalid the first is reported, matching the oracle's iteration order");
+
+    # --- get_pipeline ---
+    _t_reset(ok_reply);
+    var gp = _t_with_str(_t_in1("owner", "acme"), "repo", "widgets");
+    _t_with_str(gp, "pipeline_id", "run-42");
+    agnosai_tool_execute(pipeline, gp);
+    assert(str_eq_cstr(str_from(_T_METHOD), "GET") == 1, "get_pipeline is a GET");
+    _t_url_is("http://delta:8070/api/v1/acme/widgets/pipelines/run-42");
+
+    _t_reset(ok_reply);
+    var gp2 = _t_with_str(_t_in1("owner", "acme"), "repo", "widgets");
+    _t_with_str(gp2, "pipeline_id", "../../admin");
+    var bad_pid = agnosai_tool_execute(pipeline, gp2);
+    assert_eq(agnosai_tool_output_success(bad_pid), 0, "a traversal pipeline_id is refused");
+    assert(str_eq(agnosai_tool_output_error(bad_pid),
+    str_from("pipeline_id contains invalid characters")) == 1, "and named");
+    assert_eq(_T_CALLS, 0, "no request sent");
+
+    _t_reset(ok_reply);
+    var gp3 = _t_with_str(_t_in1("owner", "acme"), "repo", "widgets");
+    assert_eq(agnosai_tool_output_success(agnosai_tool_execute(pipeline, gp3)), 0,
+    "a missing pipeline_id fails");
+    assert_eq(_T_CALLS, 0, "and sends nothing");
+
+    # =====================================================================
+    # registration
+    # =====================================================================
+
+    var reg = agnosai_tool_registry_new();
+    agnosai_register_synapse_builtins(reg);
+    agnosai_register_mneme_builtins(reg);
+    agnosai_register_delta_builtins(reg);
+    assert_eq(agnosai_tool_registry_count(reg), 9, "all nine ecosystem tools register");
+    assert(agnosai_tool_registry_get(reg, str_from("synapse_infer")) != 0, "synapse_infer resolves");
+    assert(agnosai_tool_registry_get(reg, str_from("mneme_search")) != 0, "mneme_search resolves");
+    assert(agnosai_tool_registry_get(reg, str_from("delta_get_pipeline")) != 0,
+    "delta_get_pipeline resolves");
+
+    # the live clients carry the real transport and the oracle's base URLs
+    assert(agnosai_agnos_transport(agnosai_synapse_client()) != 0,
+    "the live synapse client has a transport");
+    assert(str_eq(agnosai_agnos_base_url(agnosai_mneme_client()),
+    str_from(AGNOSAI_MNEME_BASE_URL)) == 1, "the live mneme client uses the oracle's base URL");
+    assert(str_eq(agnosai_agnos_service(agnosai_delta_client()), str_from("delta")) == 1,
+    "the live delta client labels its errors 'delta'");
+
+    # --- the live transport fails closed on an unresolvable host ---
+    var dead = agnosai_agnos_client(str_from("http://nonexistent.invalid"), str_from("probe"));
+    var dead_out = agnosai_agnos_call(dead, "GET", str_from("/x"), 0, 0);
+    assert_eq(agnosai_tool_output_success(dead_out), 0,
+    "an unresolvable service yields a failure rather than a hang");
+    assert(str_contains(agnosai_tool_output_error(dead_out), str_from("probe request failed")) == 1,
+    "named by service, and carrying sandhi's detail after the colon");
+
+    # --- the error builders directly, both with and without a detail ---
+    var detail_err = agnosai_agnos_request_err(c, "connection refused");
+    assert(str_eq(agnosai_tool_output_error(detail_err),
+    str_from("testsvc request failed: connection refused")) == 1,
+    "a detail is appended after a colon, matching the oracle's {e}");
+    assert(str_eq(agnosai_tool_output_error(agnosai_agnos_request_err(c, 0)),
+    str_from("testsvc request failed")) == 1, "and omitted cleanly when there is none");
+    assert(str_eq(agnosai_tool_output_error(agnosai_agnos_parse_err("expected value")),
+    str_from("failed to parse response: expected value")) == 1, "likewise the parse arm");
+    assert(str_eq(agnosai_tool_output_error(agnosai_agnos_parse_err(0)),
+    str_from("failed to parse response")) == 1, "with no trailing colon when bare");
+
+    # --- the body and path builders, directly ---
+    assert(str_eq(_t_json(agnosai_synapse_infer_body(str_from("m"), str_from("p"),
+    AGNOSAI_NO_LIMIT, f64_from(0), 0)),
+    str_from("{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"p\"}]}")) == 1,
+    "the infer body omits both optional keys when neither is given");
+    assert(str_contains(_t_json(agnosai_synapse_infer_body(str_from("m"), str_from("p"), 64,
+    f64_from(1), 1)), str_from("\"max_tokens\":64")) == 1, "and carries them when they are");
+
+    assert(str_eq(agnosai_mneme_search_path(str_from("a b"), 5),
+    str_from("/api/search?q=a+b&limit=5")) == 1, "the search path encodes and orders its keys");
+    assert(str_eq(_t_json(agnosai_mneme_create_note_body(str_from("T"), str_from("C"), 0)),
+    str_from("{\"title\":\"T\",\"content\":\"C\",\"tags\":[]}")) == 1,
+    "the create-note body defaults tags to an empty array");
+
+    # --- the live transport, called directly ---
+    # `.invalid` is reserved by RFC 2606 and never resolves, so this exercises
+    # the transport-failure arm identically on and off a network.
+    assert_eq(agnosai_agnos_http_transport(agnosai_agnos_client(str_from("http://x.invalid"),
+    str_from("p")), "GET", str_from("http://x.invalid/"), 0), 0,
+    "the live transport reports an unresolvable host as a transport failure");
+
+    # --- the _int overload slot, pinned ---
+    # Cyrius routes a call `X(a, ...)` to `X_int` when `a` is a bare
+    # function-CALL RESULT at the call site; the same call with `a` held in a
+    # variable does not route. That cost real time here: a test helper named
+    # `_t_add` silently ran `_t_add_int`'s body, storing every string parameter
+    # as a JSON integer holding its own pointer.
+    #
+    # `agnosai_tool_input_get` has an `agnosai_tool_input_get_int` sibling, so
+    # it sits on exactly that trap. Every call site in src/ passes `input` as a
+    # variable and is therefore safe; this pins the dangerous spelling so a
+    # future refactor that inlines the constructor fails loudly here instead of
+    # silently returning the wrong type.
+    var inline_probe = agnosai_tool_input_new();
+    agnosai_tool_input_set(inline_probe, str_from("k"), bayan_json_v_str_new(str_from("v")));
+    assert_eq(bayan_json_v_is_str(agnosai_tool_input_get(inline_probe, str_from("k"))), 1,
+    "input_get through a variable returns the raw string value");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

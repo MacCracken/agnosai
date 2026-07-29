@@ -88,6 +88,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Information disclosure honours the oracle's `let Ok(v) = val.to_str()` gate: a header value
   carrying a non-visible-ASCII byte is skipped, so it raises no vulnerability and costs no points.
   Without the gate such a target would score 5 below the oracle.
+- **tools_agnos** — the shared client behind the nine AGNOS ecosystem tools. synapse, mneme and
+  delta are nine tools with one shape (a cloned `reqwest::Client`, a `base_url`, a JSON GET or
+  POST, and two fixed error strings); the Rust side factored out only the `OnceLock<Client>`
+  because everything else was cheap to repeat behind a derive. Repeating it nine times in Cyrius
+  is not cheap, and this is the third instance, which is where CLAUDE.md says the abstraction is
+  earned. Carries the `application/x-www-form-urlencoded` serialiser reqwest's `.query()` gave
+  the oracle for free — the stdlib has no percent-encoder — and the
+  `contains('/') || contains("..")` path-segment guard mneme and delta both apply.
+
+  **The transport is a function pointer**, so the tests drive all nine tools end to end —
+  parameter extraction, URL construction, query encoding, body construction, the traversal
+  guards, the response reshaping — with no service running. The oracle's own suites test only
+  names, descriptions and schemas, because every execute path there needs a live loopback service.
+
+  **These tools deliberately do NOT run the SSRF guard.** They target AGNOS services on loopback
+  by design, so `agnosai_is_safe_url` would reject all three default base URLs; the test asserts
+  exactly that, so the omission reads as a decision rather than an oversight. The guard belongs
+  on tools that fetch a URL the *caller* chose. What the caller does control — the path segments
+  — is guarded where the oracle guards it.
+
+  Two inherited defaults corrected: a 30s timeout, where reqwest's `Client::new()` applies none
+  at all and a hung service would hang the agent forever; and `max_response_bytes` raised off
+  sandhi's 256 KiB for the same reason as in security_audit.
+- **tools_builtin_synapse** — `synapse_infer`, `synapse_list_models`, `synapse_status` against the
+  OpenAI-compatible controller on :8420. `synapse_infer`'s completion extraction reproduces the
+  oracle's `.unwrap_or("")` tolerance exactly: a missing `choices`, an empty array, a missing
+  `message`, a non-string `content`, or a response that is not an object at all all yield an empty
+  completion rather than an error, because the raw response ships alongside it.
+- **tools_builtin_mneme** — `mneme_search`, `mneme_get_note`, `mneme_create_note` against the note
+  store on :8400. `tags` is forwarded whatever its JSON type, matching the oracle's
+  `parameters.get("tags").cloned()`, which never type-checks; validating would reject a request
+  the oracle accepts.
+- **tools_builtin_delta** — `delta_list_repos`, `delta_trigger_pipeline`, `delta_get_pipeline`
+  against the code platform on :8070. `delta_trigger_pipeline` sends `{}` when no branch is given:
+  the parameter's own description says "defaults to main", but the oracle inserts nothing and the
+  code is what ships. Guard order is the oracle's array order, so with both `owner` and `repo`
+  invalid it is `owner` that is named.
 - **server_ssrf** — `agnosai_is_safe_url` / `agnosai_is_private_host` / `agnosai_is_private_ipv4`
   / `agnosai_is_private_ipv6`. **Pulled forward from M6** because two M4 modules gate on it
   (`builtin/load_testing.rs` and `remote_registry.rs` both guard their outbound request with it).
@@ -203,6 +240,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hostname.
 - **tools**: `tool_registry_get` **467 ns** (hashmap hit behind the futex mutex),
   `tool_execute_echo` **973 ns** for a full call through the vtable including input construction.
+- **tools_agnos**: `agnos_segment_ok` **281 ns** and `agnos_form_encode_52b` **1.15 µs** over a
+  52-byte query. Both are per-call costs on the ecosystem tools, and both are dwarfed by the
+  network exchange that follows them.
 
 ### Changed
 - **Money is integer micro-USD** across the cost path (`ResourceBudget::max_cost_usd`,

@@ -131,8 +131,17 @@ thread), remote_registry, builtin/*. Defers python_tool/wasm_tool.
   [ADR 007](../adr/007-audit-redirect-revalidation.md): the SSRF guard now
   re-runs on **every redirect hop**, where the oracle validates only the URL the
   caller supplied and then lets reqwest follow up to 10 hops unchecked.
-- ⬜ **remaining builtins** (synapse 386, mneme 442, delta 471) and
-  **remote_registry** (119). remote_registry's payload path
+- ✅ **synapse + mneme + delta** — nine tools, 140 assertions, over one shared
+  client in `src/tools_agnos.cyr`. The third instance of an identical HTTP shape
+  is where CLAUDE.md says to extract, and extracting also created the seam: the
+  transport is a function pointer, so all nine execute paths are tested without
+  a service running, which the oracle's own suites never manage. These are the
+  one tool family that must **not** run the SSRF guard — they target loopback
+  services by design, and the guard would reject all three default base URLs.
+- ⬜ **remote_registry** (119) — the last M4 unit. ADR 007 applies: it fetches a
+  caller-influenced URL, so the guard must re-run per redirect hop there too.
+  Its payload path (`.agpkg` ZIP + raw WASM) defers with those formats, so it
+  can only deliver a guarded fetch. remote_registry's payload path
   (`.agpkg` ZIP + raw WASM) defers with those formats, so it can only deliver a
   guarded fetch.
 

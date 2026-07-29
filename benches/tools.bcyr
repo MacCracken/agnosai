@@ -35,6 +35,8 @@ include "src/tools_native.cyr"
 include "src/tools_registry.cyr"
 include "src/tools_builtin_basic.cyr"
 include "src/tools_builtin_load_testing.cyr"
+include "src/tools_agnos.cyr"
+include "src/tools_builtin_mneme.cyr"
 
 # `workers` workers holding `per` pseudo-random latencies each, via xorshift —
 # the same generator order.bcyr uses, so the shapes are comparable.
@@ -188,6 +190,37 @@ fn _b_tool_execute_echo(): i64 {
     return 0;
 }
 
+# The form-urlencoded serialiser the stdlib does not have. It runs once per
+# mneme_search over a user-supplied query, so its cost is bounded by query
+# length — but it is a per-byte branch chain, so the number is worth having.
+fn _b_form_encode(): i64 {
+    var q = str_from("distributed systems consensus & raft: a survey (2024)");
+    var n = 200000;
+    var b = bench_new("agnos_form_encode_52b");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var sb = str_builder_new();
+        agnosai_agnos_form_encode(sb, q);
+        str_builder_build(sb);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The path-traversal guard, which every path-interpolating ecosystem tool pays
+# before it builds a URL.
+fn _b_segment_ok(): i64 {
+    var seg = str_from("note-8f3a21c0-4b7e");
+    var n = 500000;
+    var b = bench_new("agnos_segment_ok");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_agnos_segment_ok(seg); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -199,6 +232,8 @@ fn main() {
     _b_is_safe_url_numeric();
     _b_registry_get();
     _b_tool_execute_echo();
+    _b_form_encode();
+    _b_segment_ok();
 
     return 0;
 }
