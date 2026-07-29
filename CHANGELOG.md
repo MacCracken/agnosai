@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **tools** (M4, Phase 3, in progress) — `src/tools.cyr` hub plus two submodules:
+  - **tools_native** — `agnosai_tool_*`: ParameterSchema, ToolSchema, ToolInput, ToolOutput, and
+    the tool itself. The oracle's `NativeTool` **trait** becomes a function-pointer vtable
+    (schema/execute plus an opaque ctx, dispatched with `callptr`) since Cyrius has no traits,
+    and `execute` becomes **synchronous** — there are no futures, and under
+    `sandhi_server_run_pooled` a blocking tool body on a worker thread is the direct equivalent
+    of an awaited future on a tokio task.
+  - **tools_registry** — `agnosai_tool_registry_*`: registration, lookup, allow-list gating.
+    The oracle's lock-free `DashMap` becomes a hashmap behind a **futex mutex**, which is
+    mandatory rather than optional: `run_pooled` makes every worker its own OS thread, so an
+    unguarded write during a concurrent read would corrupt the table. Schema callbacks run
+    outside the lock, since a tool's `schema_fp` is arbitrary user code.
+- **order** — `agnosai_sort` (iterative in-place heapsort) and `agnosai_select_nth` (Hoare
+  quickselect, median-of-3), plus `agnosai_percentile_i64`. **This closes port plan blocker #8**
+  and a standing Phase 0 gate. Rust had `sort_unstable` / `select_nth_unstable`; Cyrius's stdlib
+  has neither, and the plan measured an O(n^2) insertion sort over agnosai's 100k-entry
+  percentile vector at 52.6 s.
 - **llm** (M3, Phase 2) — **complete**. `src/llm.cyr` hub plus three submodules:
   - **llm_router** — `agnosai_route` / `agnosai_default_model` / `agnosai_parse_complexity`:
     task-complexity model routing over ModelTier, TaskType, Complexity and TaskProfile.
@@ -83,6 +100,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cyrius coverage` reports 100% reference coverage (56/56 fns), against the 80% gate.
 - **benches/learning.bcyr** — the 10 benchmark shapes of `rust-old/benches/learning.rs`, starting
   the Cyrius baseline. Not comparable to the frozen Rust CSV.
+
+### Performance
+- **order**: the 100k-entry percentile workload from `builtin/load_testing.rs`, against the
+  52.6 s O(n^2) baseline the port plan measured — `sort_100k_heapsort` **78.1 ms** (~670x),
+  `three_percentiles_100k` **10.6 ms** (~5,000x). Both beat the plan's predictions (87 ms and
+  ~21 ms respectively), and each timed round includes a full 100k copy, so the algorithms alone
+  are faster still. The adversarial guards hold: `sort_100k_already_sorted` is 77.7 ms, the same
+  as random input (heapsort has no worst case), and `select_nth_100k_already_sorted` is 4.12 ms,
+  *faster* than random — median-of-3 keeps sorted input off quickselect's O(n^2) path.
 
 ### Changed
 - **Money is integer micro-USD** across the cost path (`ResourceBudget::max_cost_usd`,

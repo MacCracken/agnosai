@@ -18,15 +18,17 @@ lands, not before, so the number always names something that actually shipped.
 ## Source
 
 - **Rust reference**: 27,683 lines at `rust-old/` — frozen, do not edit. It is the parity oracle.
-- **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers) and
-  `llm` (router, retry, hoosh seam client + hub), plus `src/id.cyr` and `src/units.cyr`.
-  `src/main.cyr` is still the stub entry point — no CLI surface yet.
+- **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers),
+  `llm` (router, retry, hoosh seam client + hub) and `tools` (native + registry so far), plus
+  `src/id.cyr`, `src/units.cyr` and `src/order.cyr`. `src/main.cyr` is still the stub entry
+  point — no CLI surface yet.
 
 ## Where the port is
 
 Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **complete**: `learning` and
 `core` both ported and green against the oracle. Phase 2 (M3 `llm`) — **complete**: router, retry
-and the hoosh seam client, with the live round trip verified.
+and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools`) —
+**native + registry done; remote_registry and the builtins next**.
 
 | Gate | Status |
 |---|---|
@@ -37,17 +39,18 @@ and the hoosh seam client, with the live round trip verified.
 | `cyrius lib sync` + `cyrius deps` | ✅ 43/43 stdlib modules, 9 deps resolved, 0 errors, 79 locked |
 | Hello-world builds and runs | ✅ `cyrius build src/main.cyr build/agnosai` → OK |
 | `src/id.cyr` (uuid v4/v5) | ✅ v4 + v5, verified against the published RFC 4122 vector |
-| `src/order.cyr` (`ai_sort` / `ai_select_nth`) | ⬜ not started |
+| `src/order.cyr` (sort / select_nth) | ✅ heapsort + quickselect — blocker #8 closed, benchmarked |
 | Tool-sandbox approach decided | ✅ cx + kavach — [ADR-006](../adr/006-cx-tool-sandbox.md) |
 | `learning` ported (M2, Phase 1) | ✅ 5 modules + hub, 112 assertions, 100% reference coverage |
 | `core` ported (M2, Phase 1) | ✅ 6 of 6 + shared `core_json` helpers |
 | Money representation decided | ✅ integer micro-USD (2026-07-28) — gates core BITE 8 |
 | `llm` ported (M3, Phase 2) | ✅ router + retry + hoosh seam client |
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
+| `tools` ported (M4, Phase 3) | 🟡 native + registry done; remote_registry + builtins next |
 
 ## Tests
 
-**713 assertions across 15 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**828 assertions across 17 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -66,12 +69,14 @@ and the hoosh seam client, with the live round trip verified.
 | `llm_router.tcyr` | 48 | 14 of 17 (3 are hwaccel-gated and defer) |
 | `llm_retry.tcyr` | 43 | 11 (4 of them `#[tokio::test]`) |
 | `llm_hoosh.tcyr` | 96 | — (replaces a `pub use` facade; no oracle tests) |
+| `tools_native.tcyr` | 67 | native.rs + registry.rs |
+| `order.tcyr` | 48 | — (Rust used `sort_unstable` / `select_nth_unstable`) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
 the Q-table's packed-key distinctness — none of which the Rust tests reach.
 
-`cyrius coverage --min 80` → **100% (356/356 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (406/406 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -124,9 +129,28 @@ boundary.
 trade: v4 ids must come from kernel entropy, never tyche. If id minting ever shows up hot, the
 fix is batching entropy, not changing the source.
 
+`benches/order.bcyr` — the numbers that settle **port plan blocker #8**. The plan measured an
+O(n^2) insertion sort over agnosai's 100k-entry percentile vector at **52.6 s**, and predicted
+87 ms for heapsort and ~21 ms for three quickselects. Measured here (each round includes a full
+100k copy, so the algorithms alone are faster still):
+
+| Benchmark | Time | vs plan |
+|---|---|---|
+| `select_nth_100k_already_sorted` | 4.12 ms | median-of-3 holds: *faster* than random input |
+| `sort_10k_heapsort` | 6.20 ms | |
+| `select_nth_100k` | 6.67 ms | |
+| `three_percentiles_100k` | 10.6 ms | predicted ~21 ms — **2x better** |
+| `sort_100k_already_sorted` | 77.7 ms | same as random: heapsort has no adversarial input |
+| `sort_100k_heapsort` | 78.1 ms | predicted 87 ms |
+
+Against the 52.6 s baseline that is ~670x for the full sort and ~5,000x for the three
+percentiles that `load_testing` actually needs. The two already-sorted rows are the guards on
+the algorithm choice, not padding: heapsort's worst case equals its average, and quickselect's
+median-of-3 pivot is what keeps sorted input off the O(n^2) path.
+
 **Not comparable to `rust-old/bench-history.csv`** — different allocator, different harness, no
 criterion statistics. The Cyrius line starts its own baseline, captured by
-`scripts/bench-history.sh` into the root `bench-history.csv`.
+`scripts/bench-history.sh` into the root `bench-history.csv` (27 rows).
 
 ## Dependencies
 
@@ -163,9 +187,12 @@ kiran (game AI) — none consuming the Cyrius line yet.
 
 ## Next
 
-**M4 — `tools`** ([`roadmap.md`](roadmap.md), Phase 3): native, registry (plus
-the mandatory registry mutex, since `run_pooled` makes every worker a thread),
-remote_registry, and the builtins. Defers python_tool/wasm_tool.
+**Finish M4 — `tools`** ([`roadmap.md`](roadmap.md), Phase 3). native and the
+registry (with its mandatory mutex) are done; `remote_registry.rs` (119 lines)
+and `builtin/*` (2,379 lines across echo, json_transform, load_testing,
+security_audit, synapse, mneme, delta) remain. `builtin/load_testing.rs` is
+unblocked now that `src/order.cyr` exists. python_tool / wasm_tool / wasm_loader
+defer with their features.
 
 **Live testing.** `scripts/stack.sh` brings up the services agnosai needs
 (today: hoosh only) and `scripts/stack.sh check` drives

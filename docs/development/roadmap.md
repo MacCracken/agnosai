@@ -104,6 +104,15 @@ native, registry (+ mandatory registry mutex — `run_pooled` makes every worker
 thread), remote_registry, builtin/*. Defers python_tool/wasm_tool.
 **Exit:** 94 of 115 tests green.
 
+- ✅ **native + registry done** — 67 assertions. Two forced shape changes, both
+  documented in-module: the `NativeTool` trait becomes a function-pointer vtable
+  (no traits in Cyrius) with a **synchronous** `execute` (no futures), and the
+  lock-free `DashMap` becomes a hashmap behind a futex mutex.
+- ✅ **blocker #8 closed** — `src/order.cyr` lands heapsort + quickselect ahead
+  of `builtin/load_testing.rs`, which needs them for its 100k percentile vector.
+  Benchmarked; see state.md.
+- ⬜ **remote_registry + builtin/\*** next (119 + 2,379 lines).
+
 ### M5 — `orchestrator` (Phase 4)
 
 16 of 18 bites. The default-feature runtime path: orchestrator → crew_runner →

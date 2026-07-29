@@ -1,0 +1,149 @@
+# =========================================================================
+# order.bcyr — benchmarks for src/order.cyr.
+#
+# These exist to settle port plan blocker #8 with numbers rather than an
+# assertion. The plan measured, on this box at cyrius 6.4.83:
+#
+#   * an itihas-style O(n^2) insertion sort over agnosai's 100k-entry
+#     percentile vector (builtin/load_testing.rs): **52.6 seconds**
+#   * heapsort over the same: **87 ms**
+#   * three quickselects (p50/p95/p99) over the same: **~21 ms**
+#
+# The 100k shapes below are that exact workload. The three_percentiles case is
+# the one that matters for load_testing: percentiles never needed a full sort,
+# and selecting is what makes them O(n) instead of O(n log n).
+#
+# The O(n^2) baseline is NOT benchmarked here — at 52.6 s it would dominate the
+# suite's runtime for a number the plan already recorded. It is in the header so
+# the comparison stays visible.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/order.cyr"
+
+# `n` pseudo-random latencies via xorshift — reproducible, and unsorted, which
+# is the shape a real latency sample has.
+fn _b_latencies(n, seed): i64 {
+    var v = vec_new();
+    var x = seed;
+    for (var i = 0; i < n; i = i + 1) {
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        var val = x % 1000000;
+        if (val < 0) { val = 0 - val; }
+        vec_push(v, val);
+    }
+    return v;
+}
+
+# A copy of a vec, so each timed round starts from the same unsorted shape.
+fn _b_copy(src): i64 {
+    var v = vec_new();
+    for (var i = 0; i < vec_len(src); i = i + 1) { vec_push(v, vec_get(src, i)); }
+    return v;
+}
+
+# `n` already-ascending values — quicksort's classic O(n^2) input, and the
+# shape median-of-3 pivoting exists to defuse.
+fn _b_sorted(n): i64 {
+    var v = vec_new();
+    for (var i = 0; i < n; i = i + 1) { vec_push(v, i); }
+    return v;
+}
+
+# Heapsort over the 100k percentile vector — the plan's 87 ms figure.
+fn _b_sort_100k(): i64 {
+    var src = _b_latencies(100000, 88172645463325252);
+    var n = 5;
+    var b = bench_new("sort_100k_heapsort");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The same sort over already-sorted input — heapsort has no adversarial case,
+# so this must land in the same order of magnitude as the random shape.
+fn _b_sort_100k_sorted(): i64 {
+    var src = _b_sorted(100000);
+    var n = 5;
+    var b = bench_new("sort_100k_already_sorted");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A single quickselect over 100k.
+fn _b_select_100k(): i64 {
+    var src = _b_latencies(100000, 88172645463325252);
+    var n = 20;
+    var b = bench_new("select_nth_100k");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_select_nth_i64(_b_copy(src), 50000); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The load_testing workload: p50, p95 and p99 over 100k — the plan's ~21 ms.
+fn _b_three_percentiles_100k(): i64 {
+    var src = _b_latencies(100000, 88172645463325252);
+    var n = 20;
+    var b = bench_new("three_percentiles_100k");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var v = _b_copy(src);
+        agnosai_percentile_i64(v, 50000);
+        agnosai_percentile_i64(v, 95000);
+        agnosai_percentile_i64(v, 99000);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Quickselect over already-sorted input — without median-of-3 this is the
+# O(n^2) path, so it is the guard on that choice.
+fn _b_select_100k_sorted(): i64 {
+    var src = _b_sorted(100000);
+    var n = 20;
+    var b = bench_new("select_nth_100k_already_sorted");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_select_nth_i64(_b_copy(src), 50000); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A smaller sort, for the scaling curve.
+fn _b_sort_10k(): i64 {
+    var src = _b_latencies(10000, 88172645463325252);
+    var n = 50;
+    var b = bench_new("sort_10k_heapsort");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    _b_sort_10k();
+    _b_sort_100k();
+    _b_sort_100k_sorted();
+    _b_select_100k();
+    _b_select_100k_sorted();
+    _b_three_percentiles_100k();
+
+    return 0;
+}
+
+var r = main();
+syscall(60, r);

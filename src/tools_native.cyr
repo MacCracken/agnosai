@@ -1,0 +1,319 @@
+# =========================================================================
+# tools_native — the tool interface: schemas, input, output, and the tool
+# vtable.
+#
+# Parity oracle: rust-old/src/tools/native.rs
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * **`NativeTool` is a trait; Cyrius has none.** A tool becomes a small
+#     vtable — three function pointers plus an opaque `ctx` the implementation
+#     owns — dispatched with `callptr`. `agnosai_tool_new` builds one, and the
+#     registry stores exactly that. This is the same move the compiler itself
+#     uses for COM dispatch, so it is idiomatic rather than a workaround.
+#   * **`execute` is synchronous.** The oracle returns
+#     `Pin<Box<dyn Future<Output = ToolOutput> + Send>>`; Cyrius has no futures,
+#     and the port's concurrency model is `sandhi_server_run_pooled`, where
+#     every worker is its own OS thread. A blocking tool body on a worker thread
+#     is the direct equivalent of an awaited future on a tokio task — the
+#     concurrency comes from the pool, not from the tool. Tool authors that need
+#     to fan out use the pool or lib/async.cyr client-side.
+#   * `serde_json::Value` becomes a bayan JSON value throughout, so
+#     `ToolInput`'s parameter map is Str-keyed to bayan values.
+#   * `ToolOutput::error` keeps its `skip_serializing_if = "Option::is_none"` —
+#     omitted rather than null, because that omission is wire-visible.
+# =========================================================================
+
+# ParameterSchema heap layout — 32 bytes.
+enum AgnosaiParamSchemaOff {
+    AGN_PARAM_NAME = 0;
+    AGN_PARAM_DESCRIPTION = 8;
+    AGN_PARAM_TYPE = 16;
+    AGN_PARAM_REQUIRED = 24;
+    AGN_PARAM_SIZE = 32;
+}
+
+# ToolSchema heap layout — 24 bytes.
+enum AgnosaiToolSchemaOff {
+    AGN_SCHEMA_NAME = 0;
+    AGN_SCHEMA_DESCRIPTION = 8;
+    AGN_SCHEMA_PARAMETERS = 16;
+    AGN_SCHEMA_SIZE = 24;
+}
+
+# ToolInput heap layout — 8 bytes: a Str-keyed map of bayan values.
+enum AgnosaiToolInputOff {
+    AGN_INPUT_PARAMETERS = 0;
+    AGN_INPUT_SIZE = 8;
+}
+
+# ToolOutput heap layout — 24 bytes.
+enum AgnosaiToolOutputOff {
+    AGN_OUTPUT_SUCCESS = 0;
+    AGN_OUTPUT_RESULT = 8;
+    AGN_OUTPUT_ERROR = 16;
+    AGN_OUTPUT_SIZE = 24;
+}
+
+# Tool vtable heap layout — 40 bytes. `schema_fp` and `execute_fp` are called
+# with the tool's own `ctx` as the first argument, so one implementation can
+# back many instances.
+enum AgnosaiToolOff {
+    AGN_TOOL_NAME = 0;
+    AGN_TOOL_DESCRIPTION = 8;
+    AGN_TOOL_SCHEMA_FP = 16;
+    AGN_TOOL_EXECUTE_FP = 24;
+    AGN_TOOL_CTX = 32;
+    AGN_TOOL_SIZE = 40;
+}
+
+# Describe a single tool parameter. `required` is 1 or 0.
+fn agnosai_param_schema_new(name: Str, description: Str, param_type: Str, required): i64 {
+    var p = alloc(AGN_PARAM_SIZE);
+    store64(p + AGN_PARAM_NAME, name);
+    store64(p + AGN_PARAM_DESCRIPTION, description);
+    store64(p + AGN_PARAM_TYPE, param_type);
+    store64(p + AGN_PARAM_REQUIRED, required);
+    return p;
+}
+
+# Parameter name.
+fn agnosai_param_schema_name(p): i64 {
+    return load64(p + AGN_PARAM_NAME);
+}
+
+# Human-readable description of the parameter.
+fn agnosai_param_schema_description(p): i64 {
+    return load64(p + AGN_PARAM_DESCRIPTION);
+}
+
+# JSON-schema type string ("string", "number", "array", ...).
+fn agnosai_param_schema_type(p): i64 {
+    return load64(p + AGN_PARAM_TYPE);
+}
+
+# Whether this parameter must be provided.
+fn agnosai_param_schema_required(p): i64 {
+    return load64(p + AGN_PARAM_REQUIRED);
+}
+
+# A parameter schema as a bayan JSON value.
+fn agnosai_param_schema_to_value(p): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(p + AGN_PARAM_NAME)));
+    bayan_json_v_obj_set(obj, str_from("description"),
+    bayan_json_v_str_new(load64(p + AGN_PARAM_DESCRIPTION)));
+    bayan_json_v_obj_set(obj, str_from("param_type"), bayan_json_v_str_new(load64(p + AGN_PARAM_TYPE)));
+    bayan_json_v_obj_set(obj, str_from("required"),
+    _agnosai_bool_to_value(load64(p + AGN_PARAM_REQUIRED)));
+    return obj;
+}
+
+# Create a tool schema with no parameters yet.
+fn agnosai_tool_schema_new(name: Str, description: Str): i64 {
+    var s = alloc(AGN_SCHEMA_SIZE);
+    store64(s + AGN_SCHEMA_NAME, name);
+    store64(s + AGN_SCHEMA_DESCRIPTION, description);
+    store64(s + AGN_SCHEMA_PARAMETERS, vec_new());
+    return s;
+}
+
+# Append a parameter. Returns the schema so calls chain.
+fn agnosai_tool_schema_with_param(s, param): i64 {
+    vec_push(load64(s + AGN_SCHEMA_PARAMETERS), param);
+    return s;
+}
+
+# Append a parameter built from its parts. Returns the schema.
+fn agnosai_tool_schema_param(s, name: Str, description: Str, param_type: Str, required): i64 {
+    vec_push(load64(s + AGN_SCHEMA_PARAMETERS),
+    agnosai_param_schema_new(name, description, param_type, required));
+    return s;
+}
+
+# Unique tool name.
+fn agnosai_tool_schema_name(s): i64 {
+    return load64(s + AGN_SCHEMA_NAME);
+}
+
+# Human-readable tool description.
+fn agnosai_tool_schema_description(s): i64 {
+    return load64(s + AGN_SCHEMA_DESCRIPTION);
+}
+
+# Vec of the schema's parameter definitions.
+fn agnosai_tool_schema_parameters(s): i64 {
+    return load64(s + AGN_SCHEMA_PARAMETERS);
+}
+
+# A tool schema as a bayan JSON value.
+fn agnosai_tool_schema_to_value(s): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(s + AGN_SCHEMA_NAME)));
+    bayan_json_v_obj_set(obj, str_from("description"),
+    bayan_json_v_str_new(load64(s + AGN_SCHEMA_DESCRIPTION)));
+
+    var params = load64(s + AGN_SCHEMA_PARAMETERS);
+    var arr = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(params); i = i + 1) {
+        bayan_json_v_arr_push(arr, agnosai_param_schema_to_value(vec_get(params, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("parameters"), arr);
+    return obj;
+}
+
+# Create an empty tool input.
+fn agnosai_tool_input_new(): i64 {
+    var i = alloc(AGN_INPUT_SIZE);
+    store64(i + AGN_INPUT_PARAMETERS, map_new_str());
+    return i;
+}
+
+# Set a parameter to a bayan JSON value. Returns the input so calls chain.
+fn agnosai_tool_input_set(input, key: Str, value): i64 {
+    map_set(load64(input + AGN_INPUT_PARAMETERS), str_clone(key), value);
+    return input;
+}
+
+# Str-keyed map of the input's parameter values.
+fn agnosai_tool_input_parameters(input): i64 {
+    return load64(input + AGN_INPUT_PARAMETERS);
+}
+
+# The raw bayan value for a parameter, or 0 when absent.
+fn agnosai_tool_input_get(input, key: Str): i64 {
+    return map_get(load64(input + AGN_INPUT_PARAMETERS), key);
+}
+
+# A string parameter, or 0 when absent **or not a string** — the oracle's
+# `.and_then(|v| v.as_str())`, which returns None for a wrong-typed value
+# rather than coercing it.
+fn agnosai_tool_input_get_str(input, key: Str): i64 {
+    var v = map_get(load64(input + AGN_INPUT_PARAMETERS), key);
+    if (v == 0) { return 0; }
+    if (bayan_json_v_is_str(v) == 0) { return 0; }
+    return bayan_json_v_str(v);
+}
+
+# A numeric parameter as an f64 bit pattern, with `found` set to 1 or 0.
+# Accepts both JSON floats and integers, as serde_json's `as_f64` does.
+fn agnosai_tool_input_get_f64(input, key: Str, found): i64 {
+    store64(found, 0);
+    var v = map_get(load64(input + AGN_INPUT_PARAMETERS), key);
+    if (v == 0) { return f64_from(0); }
+    if (bayan_json_v_is_float(v) == 1) {
+        store64(found, 1);
+        return bayan_json_v_float(v);
+    }
+    if (bayan_json_v_is_int(v) == 1) {
+        store64(found, 1);
+        return f64_from(bayan_json_v_int(v));
+    }
+    return f64_from(0);
+}
+
+# An integer parameter, or AGNOSAI_NO_LIMIT when absent or not an integer.
+#
+# Unlike `get_f64` this does NOT accept a float: the oracle's `as_u64` returns
+# None for `1.5`, and a tool that silently truncated a fractional count would be
+# a worse bug than a missing parameter.
+fn agnosai_tool_input_get_int(input, key: Str): i64 {
+    var v = map_get(load64(input + AGN_INPUT_PARAMETERS), key);
+    if (v == 0) { return AGNOSAI_NO_LIMIT; }
+    if (bayan_json_v_is_int(v) == 0) { return AGNOSAI_NO_LIMIT; }
+    return bayan_json_v_int(v);
+}
+
+# Build a tool input from a bayan JSON object of parameters.
+fn agnosai_tool_input_from_value(v): i64 {
+    var input = alloc(AGN_INPUT_SIZE);
+    store64(input + AGN_INPUT_PARAMETERS, _agnosai_map_from_value(v));
+    return input;
+}
+
+# A successful tool output carrying `result`.
+fn agnosai_tool_output_ok(result): i64 {
+    var o = alloc(AGN_OUTPUT_SIZE);
+    store64(o + AGN_OUTPUT_SUCCESS, 1);
+    store64(o + AGN_OUTPUT_RESULT, result);
+    store64(o + AGN_OUTPUT_ERROR, 0);
+    return o;
+}
+
+# A failed tool output. `result` is JSON null, matching the oracle.
+fn agnosai_tool_output_err(msg: Str): i64 {
+    var o = alloc(AGN_OUTPUT_SIZE);
+    store64(o + AGN_OUTPUT_SUCCESS, 0);
+    store64(o + AGN_OUTPUT_RESULT, bayan_json_v_null());
+    store64(o + AGN_OUTPUT_ERROR, msg);
+    return o;
+}
+
+# Whether execution succeeded.
+fn agnosai_tool_output_success(o): i64 {
+    return load64(o + AGN_OUTPUT_SUCCESS);
+}
+
+# The result value — meaningful when `success` is 1.
+fn agnosai_tool_output_result(o): i64 {
+    return load64(o + AGN_OUTPUT_RESULT);
+}
+
+# The error message, or 0 when the output succeeded.
+fn agnosai_tool_output_error(o): i64 {
+    return load64(o + AGN_OUTPUT_ERROR);
+}
+
+# A tool output as a bayan JSON value. `error` is **omitted** when absent,
+# matching the oracle's `skip_serializing_if = "Option::is_none"`.
+fn agnosai_tool_output_to_value(o): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("success"),
+    _agnosai_bool_to_value(load64(o + AGN_OUTPUT_SUCCESS)));
+    bayan_json_v_obj_set(obj, str_from("result"), load64(o + AGN_OUTPUT_RESULT));
+    var err = load64(o + AGN_OUTPUT_ERROR);
+    if (err != 0) {
+        bayan_json_v_obj_set(obj, str_from("error"), bayan_json_v_str_new(err));
+    }
+    return obj;
+}
+
+# Create a tool.
+#
+# `schema_fp` is `fn(ctx): ToolSchema` and `execute_fp` is
+# `fn(ctx, input): ToolOutput`; both receive the tool's own `ctx`, which may be
+# 0 for a stateless tool. This is the vtable that stands in for the oracle's
+# `dyn NativeTool`.
+fn agnosai_tool_new(name: Str, description: Str, schema_fp, execute_fp, ctx): i64 {
+    var t = alloc(AGN_TOOL_SIZE);
+    store64(t + AGN_TOOL_NAME, name);
+    store64(t + AGN_TOOL_DESCRIPTION, description);
+    store64(t + AGN_TOOL_SCHEMA_FP, schema_fp);
+    store64(t + AGN_TOOL_EXECUTE_FP, execute_fp);
+    store64(t + AGN_TOOL_CTX, ctx);
+    return t;
+}
+
+# Unique tool name.
+fn agnosai_tool_name(t): i64 {
+    return load64(t + AGN_TOOL_NAME);
+}
+
+# Human-readable description of what the tool does.
+fn agnosai_tool_description(t): i64 {
+    return load64(t + AGN_TOOL_DESCRIPTION);
+}
+
+# The tool's opaque implementation context.
+fn agnosai_tool_ctx(t): i64 {
+    return load64(t + AGN_TOOL_CTX);
+}
+
+# The tool's parameter schema, via its vtable.
+fn agnosai_tool_schema(t): i64 {
+    return callptr(load64(t + AGN_TOOL_SCHEMA_FP), load64(t + AGN_TOOL_CTX));
+}
+
+# Execute the tool, via its vtable. Synchronous — see the module note.
+fn agnosai_tool_execute(t, input): i64 {
+    return callptr(load64(t + AGN_TOOL_EXECUTE_FP), load64(t + AGN_TOOL_CTX), input);
+}

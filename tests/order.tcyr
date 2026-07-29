@@ -1,0 +1,222 @@
+# =========================================================================
+# order.tcyr — tests for src/order.cyr
+#
+# No oracle test block: Rust got sorting from `slice::sort_unstable` and
+# `select_nth_unstable`, so what must hold here is the algorithms' own
+# contract. Port plan blocker #8.
+#
+# The adversarial shapes matter more than the happy path: heapsort's whole
+# reason for being chosen over quicksort is that it has no O(n^2) input, and
+# quickselect's median-of-3 exists to keep sorted input off that path.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/order.cyr"
+include "tests/test_helpers.cyr"
+
+# A vec of the given i64s.
+fn _t_vec3(a, b, c): i64 {
+    var v = vec_new();
+    vec_push(v, a);
+    vec_push(v, b);
+    vec_push(v, c);
+    return v;
+}
+
+# Whether a vec is sorted ascending.
+fn _t_is_sorted(v): i64 {
+    for (var i = 1; i < vec_len(v); i = i + 1) {
+        if (vec_get(v, i - 1) > vec_get(v, i)) { return 0; }
+    }
+    return 1;
+}
+
+# The sum of a vec — a cheap multiset check: a sort must permute, never
+# invent or drop elements.
+fn _t_sum(v): i64 {
+    var s = 0;
+    for (var i = 0; i < vec_len(v); i = i + 1) { s = s + vec_get(v, i); }
+    return s;
+}
+
+# A vec of `n` elements produced by a xorshift, so the shape is reproducible.
+fn _t_pseudo_vec(n, seed): i64 {
+    var v = vec_new();
+    var x = seed;
+    for (var i = 0; i < n; i = i + 1) {
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        var val = x % 100000;
+        if (val < 0) { val = 0 - val; }
+        vec_push(v, val);
+    }
+    return v;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("order");
+
+    # --- comparators ---
+    assert(agnosai_cmp_i64_asc(1, 2) < 0, "asc: 1 < 2");
+    assert(agnosai_cmp_i64_asc(2, 1) > 0, "asc: 2 > 1");
+    assert_eq(agnosai_cmp_i64_asc(3, 3), 0, "asc: equal");
+    assert(agnosai_cmp_i64_desc(1, 2) > 0, "desc inverts");
+    assert_eq(agnosai_cmp_i64_desc(3, 3), 0, "desc: equal");
+
+    # --- degenerate inputs must not crash ---
+    var empty = vec_new();
+    agnosai_sort_i64(empty);
+    assert_eq(vec_len(empty), 0, "sorting an empty vec is a no-op");
+
+    var one = vec_new();
+    vec_push(one, 7);
+    agnosai_sort_i64(one);
+    assert_eq(vec_get(one, 0), 7, "sorting a single element is a no-op");
+
+    # --- basic ordering ---
+    var three = _t_vec3(3, 1, 2);
+    agnosai_sort_i64(three);
+    assert_eq(vec_get(three, 0), 1, "sorted[0]");
+    assert_eq(vec_get(three, 1), 2, "sorted[1]");
+    assert_eq(vec_get(three, 2), 3, "sorted[2]");
+
+    # --- duplicates survive; a sort permutes, it does not dedupe ---
+    var dups = vec_new();
+    vec_push(dups, 5);
+    vec_push(dups, 1);
+    vec_push(dups, 5);
+    vec_push(dups, 1);
+    vec_push(dups, 5);
+    agnosai_sort_i64(dups);
+    assert_eq(vec_len(dups), 5, "duplicates are kept, not collapsed");
+    assert(_t_is_sorted(dups), "a vec of duplicates sorts");
+    assert_eq(_t_sum(dups), 17, "the multiset is preserved");
+
+    # --- the adversarial shapes: already sorted, reversed, all-equal ---
+    var asc = vec_new();
+    for (var i = 0; i < 500; i = i + 1) { vec_push(asc, i); }
+    agnosai_sort_i64(asc);
+    assert(_t_is_sorted(asc), "already-sorted input stays sorted");
+    assert_eq(vec_get(asc, 0), 0, "already-sorted min");
+    assert_eq(vec_get(asc, 499), 499, "already-sorted max");
+
+    var desc = vec_new();
+    for (var j = 500; j > 0; j = j - 1) { vec_push(desc, j); }
+    agnosai_sort_i64(desc);
+    assert(_t_is_sorted(desc), "reverse-sorted input sorts");
+    assert_eq(vec_get(desc, 0), 1, "reverse-sorted min");
+    assert_eq(vec_get(desc, 499), 500, "reverse-sorted max");
+
+    var same = vec_new();
+    for (var k = 0; k < 300; k = k + 1) { vec_push(same, 42); }
+    agnosai_sort_i64(same);
+    assert(_t_is_sorted(same), "all-equal input sorts");
+    assert_eq(_t_sum(same), 300 * 42, "all-equal multiset preserved");
+
+    # --- negatives sort correctly ---
+    var negs = vec_new();
+    vec_push(negs, 0 - 5);
+    vec_push(negs, 3);
+    vec_push(negs, 0 - 100);
+    vec_push(negs, 0);
+    agnosai_sort_i64(negs);
+    assert_eq(vec_get(negs, 0), 0 - 100, "most negative first");
+    assert_eq(vec_get(negs, 3), 3, "largest last");
+    assert(_t_is_sorted(negs), "negatives sort");
+
+    # --- a larger pseudo-random vec sorts and preserves its multiset ---
+    var big = _t_pseudo_vec(4000, 88172645463325252);
+    var big_sum = _t_sum(big);
+    agnosai_sort_i64(big);
+    assert(_t_is_sorted(big), "4000 pseudo-random elements sort");
+    assert_eq(_t_sum(big), big_sum, "the multiset survives the sort");
+    assert_eq(vec_len(big), 4000, "no elements lost");
+
+    # --- a custom comparator drives the order ---
+    var rev = _t_vec3(1, 3, 2);
+    agnosai_sort(rev, &agnosai_cmp_i64_desc);
+    assert_eq(vec_get(rev, 0), 3, "descending comparator: first is largest");
+    assert_eq(vec_get(rev, 2), 1, "descending comparator: last is smallest");
+
+    # --- select_nth ---
+    var sel = vec_new();
+    vec_push(sel, 9);
+    vec_push(sel, 1);
+    vec_push(sel, 8);
+    vec_push(sel, 2);
+    vec_push(sel, 7);
+    assert_eq(agnosai_select_nth_i64(sel, 0), 1, "0th smallest is the min");
+    var sel2 = vec_new();
+    vec_push(sel2, 9);
+    vec_push(sel2, 1);
+    vec_push(sel2, 8);
+    vec_push(sel2, 2);
+    vec_push(sel2, 7);
+    assert_eq(agnosai_select_nth_i64(sel2, 4), 9, "4th smallest is the max");
+    var sel3 = vec_new();
+    vec_push(sel3, 9);
+    vec_push(sel3, 1);
+    vec_push(sel3, 8);
+    vec_push(sel3, 2);
+    vec_push(sel3, 7);
+    assert_eq(agnosai_select_nth_i64(sel3, 2), 7, "2nd smallest is the median");
+
+    # out-of-range and empty selection are 0, not a crash
+    assert_eq(agnosai_select_nth_i64(vec_new(), 0), 0, "select on an empty vec is 0");
+    var tiny = vec_new();
+    vec_push(tiny, 4);
+    assert_eq(agnosai_select_nth_i64(tiny, 5), 0, "select past the end is 0");
+    assert_eq(agnosai_select_nth_i64(tiny, 0 - 1), 0, "select with a negative k is 0");
+
+    # --- select_nth agrees with a full sort at every index ---
+    var agree = 1;
+    for (var q = 0; q < 200; q = q + 1) {
+        var a = _t_pseudo_vec(31, 12345 + q);
+        var b = _t_pseudo_vec(31, 12345 + q);
+        agnosai_sort_i64(b);
+        var idx = q % 31;
+        if (agnosai_select_nth_i64(a, idx) != vec_get(b, idx)) { agree = 0; }
+    }
+    assert(agree, "select_nth agrees with a full sort at every index, over 200 shapes");
+
+    # select_nth on already-sorted input — the shape median-of-3 exists for
+    var sorted_in = vec_new();
+    for (var m = 0; m < 1000; m = m + 1) { vec_push(sorted_in, m); }
+    assert_eq(agnosai_select_nth_i64(sorted_in, 500), 500, "select on sorted input is correct");
+    var rev_in = vec_new();
+    for (var r = 1000; r > 0; r = r - 1) { vec_push(rev_in, r); }
+    assert_eq(agnosai_select_nth_i64(rev_in, 0), 1, "select on reverse-sorted input is correct");
+
+    # --- percentiles ---
+    var lat = vec_new();
+    for (var t = 1; t <= 100; t = t + 1) { vec_push(lat, t); }
+    assert_eq(agnosai_percentile_i64(lat, 0), 1, "p0 is the minimum");
+    assert_eq(agnosai_percentile_i64(lat, 100000), 100, "p100 is the maximum");
+    assert_eq(agnosai_percentile_i64(lat, 50000), 50, "p50 of 1..100");
+    assert_eq(agnosai_percentile_i64(lat, 95000), 95, "p95 of 1..100");
+    assert_eq(agnosai_percentile_i64(lat, 99000), 99, "p99 of 1..100");
+
+    # p99.9 is a real SLO target, and integer milli-percent makes it exact
+    var lat2 = vec_new();
+    for (var u = 1; u <= 1000; u = u + 1) { vec_push(lat2, u); }
+    assert_eq(agnosai_percentile_i64(lat2, 99900), 999, "p99.9 of 1..1000");
+
+    assert_eq(agnosai_percentile_i64(vec_new(), 50000), 0, "the percentile of an empty vec is 0");
+    var single = vec_new();
+    vec_push(single, 42);
+    assert_eq(agnosai_percentile_i64(single, 95000), 42, "any percentile of one element is it");
+
+    # out-of-range percentiles clamp rather than indexing out of bounds
+    assert_eq(agnosai_percentile_i64(lat, 0 - 5000), 1, "a negative percentile clamps to p0");
+    assert_eq(agnosai_percentile_i64(lat, 250000), 100, "a percentile above 100 clamps to p100");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
