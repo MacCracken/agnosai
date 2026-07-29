@@ -116,11 +116,18 @@ thread), remote_registry, builtin/*. Defers python_tool/wasm_tool.
 - ✅ **`server/ssrf` pulled forward from M6** — `builtin/load_testing.rs` and
   `remote_registry.rs` both gate on `is_safe_url`, so it was port-once rather
   than stub-twice. 81 assertions, weighted toward the bypass classes.
-- ⬜ **remaining builtins** (load_testing 364, security_audit 519, synapse 386,
-  mneme 442, delta 471) and **remote_registry** (119). load_testing's two
-  blockers — `order` for percentiles, `ssrf` for its URL guard — are both
-  cleared. remote_registry's payload path (`.agpkg` ZIP + raw WASM) defers with
-  those formats, so it can only deliver a guarded fetch.
+- ✅ **load_testing** — 88 assertions, and the **first production user of the
+  blocker #3 arena pattern**: one OS thread per simulated user, each with a
+  persistent arena for its latencies plus a scratch arena `reset_via`'d after
+  every request. Both of its blockers (`order` for percentiles, `ssrf` for the
+  URL guard) were cleared ahead of it. The oracle's two tests drive an axum mock
+  server on loopback, which `is_safe_url` rightly refuses — so the port tests the
+  real thread fan-out against a synthetic executor instead, and the network seam
+  is covered separately by `scripts/stack.sh check`.
+- ⬜ **remaining builtins** (security_audit 519, synapse 386, mneme 442,
+  delta 471) and **remote_registry** (119). remote_registry's payload path
+  (`.agpkg` ZIP + raw WASM) defers with those formats, so it can only deliver a
+  guarded fetch.
 
 ### M5 — `orchestrator` (Phase 4)
 

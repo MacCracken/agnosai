@@ -23,6 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **tools_builtin_basic** — the `echo` and `json_transform` builtins, registering through the
   registry and gated by the allow-list. `echo` returns the whole JSON value rather than a string,
   matching the oracle's `Value` clone.
+- **tools_builtin_load_testing** — the `load_testing` builtin: HTTP load generation against a
+  target URL with concurrent users, reporting throughput, error rate, status-code histogram and
+  min/avg/p50/p95/p99 latency. **The first production user of the port plan's blocker #3 arena
+  pattern.** One OS thread per simulated user — a load generator that ran sequentially would not
+  be one — with each worker owning two arenas: a persistent one, sized from its request budget,
+  holding its latency samples, and a scratch one `reset_via`'d after every request. The scratch
+  arena is load-bearing, not a refinement: a single arena would accumulate every response body
+  for the whole run, which is unbounded growth the oracle does not have, since Rust drops each
+  response as it goes.
+
+  Three deliberate divergences, all documented in-module:
+  - The percentile index is the oracle's `(len * p / 100).min(len - 1)`, **not**
+    `order.cyr`'s nearest-rank convention. For n=100 they differ — index 50 against 49 — and the
+    reported figure has to be the oracle's.
+  - Throughput and error rate are carried as integers (thousandths of a request/second, parts per
+    million) and converted to float only at the wire boundary, the same treatment money gets.
+  - Status counts live in a vec of `[code, count]` pairs rather than a map, because the stdlib has
+    no `map_u64_keys`. Benchmarked rather than assumed: see **Performance**.
+
+  The worker loop checks `vec_push_a`'s return value. The arena sizing has ~2.5x headroom, so
+  exhaustion is unreachable through the public constructor — but `vec_push_a` returns -1 *and does
+  not push* when an arena is full, and the loop exits on `vec_len(latencies) >= budget`. Ignoring
+  the failure would mean spinning until the deadline issuing real HTTP requests whose results are
+  all discarded: maximum load generated, nothing measured.
+
+  The SSRF guard runs before anything touches the network, which means the tool cannot be aimed at
+  loopback. That is deliberate, and it is why the oracle's two axum-mock-server tests do not port
+  directly — the suite drives the real thread fan-out against a synthetic executor instead, and
+  `scripts/stack.sh check` covers the network seam separately.
 - **server_ssrf** — `agnosai_is_safe_url` / `agnosai_is_private_host` / `agnosai_is_private_ipv4`
   / `agnosai_is_private_ipv6`. **Pulled forward from M6** because two M4 modules gate on it
   (`builtin/load_testing.rs` and `remote_registry.rs` both guard their outbound request with it).
@@ -122,6 +151,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are faster still. The adversarial guards hold: `sort_100k_already_sorted` is 77.7 ms, the same
   as random input (heapsort has no worst case), and `select_nth_100k_already_sorted` is 4.12 ms,
   *faster* than random — median-of-3 keeps sorted input off quickselect's O(n^2) path.
+- **tools_builtin_load_testing**: the post-join aggregation at the 100k request cap is
+  `lt_aggregate_100k_10workers` **79.2 ms**, of which the 74.6 ms sort is nearly all of it — the
+  cross-worker merge costs ~5 ms. Spreading the same 100k samples over 500 workers instead of 10
+  costs 2.3 ms more (**81.5 ms**), confirming the merge is O(total) rather than O(workers), which
+  matters because each worker owns an arena freed with it, so aggregate must copy rather than
+  alias.
+- **tools_builtin_load_testing**: `lt_aggregate_100k_200codes` **149 ms** puts a number on the
+  decision to keep status counts in a linear pair vec rather than a map. 200 distinct codes cost
+  1.9x — but HTTP defines ~60 codes and a real run sees one to five, so this row is the documented
+  ceiling rather than an expected cost.
+- **server_ssrf**: `is_safe_url_public_host` **1.30 µs**, `is_safe_url_octal_host` **1.38 µs**.
+  Every load test pays one of these before it touches the network; the numeric-host path, which
+  must try four different address spellings before it can decide, costs only 6% more than a plain
+  hostname.
+- **tools**: `tool_registry_get` **467 ns** (hashmap hit behind the futex mutex),
+  `tool_execute_echo` **973 ns** for a full call through the vtable including input construction.
 
 ### Changed
 - **Money is integer micro-USD** across the cost path (`ResourceBudget::max_cost_usd`,

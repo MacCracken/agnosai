@@ -20,7 +20,7 @@ lands, not before, so the number always names something that actually shipped.
 - **Rust reference**: 27,683 lines at `rust-old/` — frozen, do not edit. It is the parity oracle.
 - **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers),
   `llm` (router, retry, hoosh seam client + hub) and `tools` (native, registry, echo,
-  json_transform), plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr` and
+  json_transform, load_testing), plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr` and
   `src/server_ssrf.cyr`. `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
 ## Where the port is
@@ -28,7 +28,8 @@ lands, not before, so the number always names something that actually shipped.
 Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **complete**: `learning` and
 `core` both ported and green against the oracle. Phase 2 (M3 `llm`) — **complete**: router, retry
 and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools`) —
-**native, registry and the basic builtins done; the remaining builtins next**.
+**native, registry, the basic builtins and load_testing done; four builtins and
+remote_registry left**.
 
 | Gate | Status |
 |---|---|
@@ -46,12 +47,13 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | Money representation decided | ✅ integer micro-USD (2026-07-28) — gates core BITE 8 |
 | `llm` ported (M3, Phase 2) | ✅ router + retry + hoosh seam client |
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
-| `tools` ported (M4, Phase 3) | 🟡 native + registry + echo/json_transform; 5 builtins + remote_registry left |
+| `tools` ported (M4, Phase 3) | 🟡 native + registry + echo/json_transform/load_testing; 4 builtins + remote_registry left |
+| Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
 | `server/ssrf` ported (M6 leaf, pulled forward) | ✅ two M4 modules gate on it — hardened against octal/hex/short-form bypasses |
 
 ## Tests
 
-**946 assertions across 20 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**1034 assertions across 21 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -74,12 +76,22 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `order.tcyr` | 48 | — (Rust used `sort_unstable` / `select_nth_unstable`) |
 | `tools_builtin_basic.tcyr` | 37 | 6 (echo.rs + json_transform.rs) |
 | `server_ssrf.tcyr` | 81 | ~14 |
+| `tools_builtin_load_testing.tcyr` | 88 | 2 (both drive an axum mock server — see below) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
 the Q-table's packed-key distinctness — none of which the Rust tests reach.
 
-`cyrius coverage --min 80` → **100% (413/413 fns), gate OK**. Shared assertion helpers live in
+`tools_builtin_load_testing.tcyr` is the one suite that could not follow its oracle's shape.
+Both Rust tests stand up an axum mock server on loopback, and `agnosai_is_safe_url` correctly
+refuses loopback — so the tool cannot be aimed at one, and pointing a test suite at a public
+host is not acceptable. Instead the **real OS-thread fan-out** runs against a synthetic
+executor, which exercises the worker threads, the per-worker arenas, the deadline and budget
+loops, status aggregation, the sort and the percentile indices with no network at all. The only
+path left untested is sandhi's own behaviour under `sandhi_http_get_a`, and the live
+`scripts/stack.sh check` covers that seam separately.
+
+`cyrius coverage --min 80` → **100% (440/440 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -151,9 +163,39 @@ percentiles that `load_testing` actually needs. The two already-sorted rows are 
 the algorithm choice, not padding: heapsort's worst case equals its average, and quickselect's
 median-of-3 pivot is what keeps sorted input off the O(n^2) path.
 
+`benches/tools.bcyr` — the tool path, principally the aggregation that runs after the
+`load_testing` worker threads join. `order.bcyr` already covers the sort and the selects in
+isolation; what is measured here is what load_testing adds on top.
+
+| Benchmark | Time |
+|---|---|
+| `tool_registry_get` | 467 ns |
+| `tool_execute_echo` | 973 ns |
+| `is_safe_url_public_host` | 1.30 µs |
+| `is_safe_url_octal_host` | 1.38 µs |
+| `lt_result_to_value` | 2.80 µs |
+| `lt_aggregate_100k_10workers` | 79.2 ms |
+| `lt_aggregate_100k_500workers` | 81.5 ms |
+| `lt_aggregate_100k_200codes` | 149 ms |
+
+Two design choices were on trial and both held:
+
+- **The cross-worker merge is O(total), not O(workers).** Spreading the same 100k samples over
+  500 workers instead of 10 costs 2.3 ms more — within noise of the 74.6 ms sort that dominates
+  both. Each worker owns an arena freed with it, so aggregate copies rather than aliases; that
+  copy is ~5 ms at the cap.
+- **Status counts as a linear pair vec, not a map.** There is no `map_u64_keys` in the stdlib,
+  so codes live in a vec of `[code, count]` pairs. At 200 distinct codes the scan costs 1.9x —
+  but real HTTP has ~60 defined codes and a real run sees one to five, so the vec is the right
+  call and the 149 ms row is the documented ceiling rather than an expected cost.
+
+The two `is_safe_url` rows matter because every load test pays one before it touches the
+network: the octal-host path, which must parse four different spellings before it can decide,
+costs only 6% more than the plain hostname path.
+
 **Not comparable to `rust-old/bench-history.csv`** — different allocator, different harness, no
 criterion statistics. The Cyrius line starts its own baseline, captured by
-`scripts/bench-history.sh` into the root `bench-history.csv` (27 rows).
+`scripts/bench-history.sh` into the root `bench-history.csv` (35 rows).
 
 ## Dependencies
 
@@ -191,16 +233,32 @@ kiran (game AI) — none consuming the Cyrius line yet.
 ## Next
 
 **Finish M4 — `tools`** ([`roadmap.md`](roadmap.md), Phase 3). native, the
-registry (with its mandatory mutex), and the two utility builtins are done.
-Remaining: `builtin/load_testing.rs` (364), `builtin/security_audit.rs` (519),
-`builtin/synapse.rs` (386), `builtin/mneme.rs` (442), `builtin/delta.rs` (471),
-and `remote_registry.rs` (119).
+registry (with its mandatory mutex), the two utility builtins and load_testing
+are done. Remaining: `builtin/security_audit.rs` (519), `builtin/synapse.rs`
+(386), `builtin/mneme.rs` (442), `builtin/delta.rs` (471), and
+`remote_registry.rs` (119).
 
-**Both of load_testing's blockers are now cleared** — `src/order.cyr` for its
-100k percentile vector, and `src/server_ssrf.cyr` for its target-URL guard.
-`remote_registry.rs` is likewise unblocked, though its payload path (`.agpkg`
-ZIP + raw WASM) defers with those formats, so it can only deliver a guarded
-fetch. python_tool / wasm_tool / wasm_loader defer with their features.
+**`load_testing` is the first production user of the port plan's blocker #3
+arena pattern.** One OS thread per simulated user (a load generator that ran
+sequentially would not be one), each owning two arenas: a persistent one sized
+from the request budget that holds its latencies, and a scratch one
+`reset_via`'d after every request. The scratch arena is not a refinement — a
+single arena would accumulate every response body for the whole run, which is
+unbounded growth the oracle does not have, since Rust drops each response as it
+goes.
+
+Two divergences from convention inside the module, both deliberate:
+`_agnosai_lt_pct_index` uses the oracle's `(len * p / 100).min(len - 1)` rather
+than `order.cyr`'s nearest-rank index, because for n=100 they differ (index 50
+vs 49) and the reported figure has to be the oracle's; and throughput and error
+rate are carried as integers (thousandths of a request/second, parts per
+million) converted to float only at the wire boundary, the same treatment money
+gets.
+
+**`remote_registry.rs` is unblocked** by `src/server_ssrf.cyr`, though its
+payload path (`.agpkg` ZIP + raw WASM) defers with those formats, so it can only
+deliver a guarded fetch. python_tool / wasm_tool / wasm_loader defer with their
+features.
 
 **`src/server_ssrf.cyr` was pulled forward from M6** because two M4 modules gate
 on `is_safe_url`; stubbing that guard twice would have been worse than porting
