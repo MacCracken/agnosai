@@ -1,0 +1,214 @@
+# =========================================================================
+# orch_plan_cache.tcyr — parity tests for src/orch_plan_cache.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/orchestrator/plan_cache.rs —
+# 7 tests, all portable.
+#
+# The key's **normalisation** gets far more attention than the oracle gives it,
+# because that is the part of `PlanKey` that is actually contractual. The hash
+# algorithm is not: the oracle uses `std::hash::DefaultHasher`, an explicitly
+# unstable std detail, and the value never leaves the process. What a consumer
+# can observe is that reordering a crew spec does not change its key, and that
+# genuinely different specs do not collide — so those are what is pinned.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/orch_plan_cache.cyr"
+include "tests/test_helpers.cyr"
+
+# A vec of Str from up to three literals; pass 0 to omit.
+fn _t_v(a, b, c): i64 {
+    var v = vec_new();
+    if (a != 0) { vec_push(v, str_from(a)); }
+    if (b != 0) { vec_push(v, str_from(b)); }
+    if (c != 0) { vec_push(v, str_from(c)); }
+    return v;
+}
+
+# The oracle's sample_key().
+fn _t_key(): i64 {
+    return agnosai_plan_key(_t_v("agent-a", "agent-b", 0), _t_v("do X", "do Y", 0),
+    str_from("sequential"));
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_plan_cache");
+
+    assert_eq(AGNOSAI_PLAN_CACHE_MAX, 256, "the cap is the oracle's 256");
+    assert_eq(AGNOSAI_PLAN_CACHE_TTL_NS, 3600 * AGNOSAI_NS_PER_SEC,
+    "and the default TTL is the oracle's one hour");
+
+    # --- order_independent_hashing ---
+    # The whole reason the key sorts before hashing.
+    assert_eq(agnosai_plan_key(_t_v("agent-a", "agent-b", 0), _t_v("do X", "do Y", 0),
+    str_from("sequential")),
+    agnosai_plan_key(_t_v("agent-b", "agent-a", 0), _t_v("do Y", "do X", 0),
+    str_from("sequential")),
+    "reordering agents and tasks does not change the key");
+    assert_eq(_t_key(), _t_key(), "and the same spec hashes the same twice");
+
+    # --- different_agents_different_key ---
+    assert(agnosai_plan_key(_t_v("agent-a", 0, 0), _t_v("do X", 0, 0), str_from("sequential"))
+    != agnosai_plan_key(_t_v("agent-z", 0, 0), _t_v("do X", 0, 0), str_from("sequential")),
+    "a different agent is a different key");
+    assert(agnosai_plan_key(_t_v("agent-a", 0, 0), _t_v("do X", 0, 0), str_from("sequential"))
+    != agnosai_plan_key(_t_v("agent-a", 0, 0), _t_v("do Z", 0, 0), str_from("sequential")),
+    "a different task is a different key");
+
+    # the process mode is NOT sorted in with the rest — the same agents and tasks
+    # under a different mode are a different plan
+    assert(agnosai_plan_key(_t_v("a", 0, 0), _t_v("t", 0, 0), str_from("sequential"))
+    != agnosai_plan_key(_t_v("a", 0, 0), _t_v("t", 0, 0), str_from("hierarchical")),
+    "the process mode changes the key");
+
+    # adding an agent changes the key
+    assert(agnosai_plan_key(_t_v("a", 0, 0), _t_v("t", 0, 0), str_from("seq"))
+    != agnosai_plan_key(_t_v("a", "b", 0), _t_v("t", 0, 0), str_from("seq")),
+    "an extra agent changes the key");
+
+    # --- the length delimiter: a split must not collide ---
+    # Without folding each string's length into the hash, ["ab","c"] and
+    # ["a","bc"] would hash alike and two unrelated crews would share a plan.
+    assert(agnosai_plan_key(_t_v("ab", "c", 0), _t_v("t", 0, 0), str_from("s"))
+    != agnosai_plan_key(_t_v("a", "bc", 0), _t_v("t", 0, 0), str_from("s")),
+    "a differently-split agent list does not collide — the length is hashed too");
+    assert(agnosai_plan_key(_t_v("a", 0, 0), _t_v("xy", "z", 0), str_from("s"))
+    != agnosai_plan_key(_t_v("a", 0, 0), _t_v("x", "yz", 0), str_from("s")),
+    "and neither does a differently-split task list");
+    # A field boundary cannot be shifted either. This is the one place the port
+    # deliberately diverges: the oracle delimits each string but NOT the agent
+    # section from the task section, so both of these pairs collide there and
+    # two different crews would share one cached plan. Closing it is free
+    # because the hash is never serialised — see the note in agnosai_plan_key.
+    assert(agnosai_plan_key(_t_v("a", 0, 0), _t_v("b", 0, 0), str_from("c"))
+    != agnosai_plan_key(_t_v("a", "b", 0), _t_v(0, 0, 0), str_from("c")),
+    "moving a value from the task list into the agent list changes the key");
+    assert(agnosai_plan_key(_t_v("a", "b", 0), _t_v("c", 0, 0), str_from("m"))
+    != agnosai_plan_key(_t_v("a", 0, 0), _t_v("b", "c", 0), str_from("m")),
+    "and so does shifting the boundary with both lists non-empty — the reachable case, \
+    needing only an agent key that reads like a task description");
+
+    # an empty spec is still a valid, stable key
+    var empty_key = agnosai_plan_key(vec_new(), vec_new(), str_from(""));
+    assert_eq(empty_key, agnosai_plan_key(vec_new(), vec_new(), str_from("")),
+    "an empty spec hashes stably");
+    assert(empty_key != _t_key(), "and differs from a populated one");
+
+    # computing a key must not reorder the caller's own vecs
+    var agents = _t_v("zebra", "alpha", 0);
+    agnosai_plan_key(agents, _t_v("t", 0, 0), str_from("s"));
+    assert(str_eq(vec_get(agents, 0), str_from("zebra")) == 1,
+    "the caller's agent vec is left in its original order — the sort works on a copy");
+
+    # --- empty_cache ---
+    var c = agnosai_plan_cache_new();
+    assert_eq(agnosai_plan_cache_is_empty(c), 1, "a new cache is empty");
+    assert_eq(agnosai_plan_cache_len(c), 0, "with nothing in it");
+    assert_eq(agnosai_plan_cache_ttl_ns(c), AGNOSAI_PLAN_CACHE_TTL_NS, "and the default TTL");
+
+    # --- miss_returns_none ---
+    assert_eq(agnosai_plan_cache_get(c, _t_key()), 0, "a miss yields 0");
+
+    # --- insert_and_get ---
+    var key = _t_key();
+    var plan = agnosai_cached_plan_empty();
+    agnosai_plan_cache_insert(c, key, plan);
+    assert_eq(agnosai_plan_cache_len(c), 1, "an insert grows the cache");
+    assert_eq(agnosai_plan_cache_is_empty(c), 0, "so it is no longer empty");
+    assert_eq(agnosai_plan_cache_get(c, key), plan, "and the plan comes back by identity");
+
+    # a key computed independently from the same spec still hits
+    assert_eq(agnosai_plan_cache_get(c, _t_key()), plan,
+    "a freshly computed key for the same spec hits the same entry");
+
+    # --- re-inserting a key replaces rather than duplicating ---
+    var plan2 = agnosai_cached_plan_empty();
+    agnosai_plan_cache_insert(c, key, plan2);
+    assert_eq(agnosai_plan_cache_len(c), 1,
+    "re-inserting an existing key replaces it — a hot key must not fill the cache with copies");
+    assert_eq(agnosai_plan_cache_get(c, key), plan2, "and the newer plan is what is returned");
+
+    # --- ttl_expiry ---
+    # A zero TTL expires everything: elapsed is > 0 by the time get() runs.
+    var quick = agnosai_plan_cache_with_ttl(0);
+    var qkey = _t_key();
+    agnosai_plan_cache_insert(quick, qkey, agnosai_cached_plan_empty());
+    assert_eq(agnosai_plan_cache_len(quick), 1, "the entry went in");
+    assert_eq(agnosai_plan_cache_get(quick, qkey), 0, "and reads back as expired");
+    assert_eq(agnosai_plan_cache_len(quick), 0,
+    "and is REMOVED on the way out, not left occupying a slot until eviction reaches it");
+
+    # a long TTL does not expire
+    var slow = agnosai_plan_cache_with_ttl(AGNOSAI_PLAN_CACHE_TTL_NS);
+    agnosai_plan_cache_insert(slow, qkey, agnosai_cached_plan_empty());
+    assert(agnosai_plan_cache_get(slow, qkey) != 0, "an hour-long TTL is not expired yet");
+
+    # --- lru_eviction_at_capacity ---
+    var full = agnosai_plan_cache_new();
+    for (var i = 0; i < AGNOSAI_PLAN_CACHE_MAX; i = i + 1) {
+        agnosai_plan_cache_insert(full, agnosai_plan_key(_t_v("a", 0, 0),
+        _t_v(str_cstr(str_from_int(i)), 0, 0), str_from("s")),
+        agnosai_cached_plan_empty());
+    }
+    assert_eq(agnosai_plan_cache_len(full), AGNOSAI_PLAN_CACHE_MAX, "the cache fills to its cap");
+
+    var overflow_key = agnosai_plan_key(_t_v("overflow", 0, 0), _t_v("t", 0, 0), str_from("s"));
+    agnosai_plan_cache_insert(full, overflow_key, agnosai_cached_plan_empty());
+    assert_eq(agnosai_plan_cache_len(full), AGNOSAI_PLAN_CACHE_MAX,
+    "inserting past the cap evicts rather than growing");
+    assert(agnosai_plan_cache_get(full, overflow_key) != 0, "and the new entry is the one kept");
+
+    # --- a hit refreshes LRU order, which is what makes it least-recently-USED ---
+    var lru = agnosai_plan_cache_new();
+    var k1 = agnosai_plan_key(_t_v("one", 0, 0), _t_v("t", 0, 0), str_from("s"));
+    var k2 = agnosai_plan_key(_t_v("two", 0, 0), _t_v("t", 0, 0), str_from("s"));
+    var p1 = agnosai_cached_plan_empty();
+    var p2 = agnosai_cached_plan_empty();
+    agnosai_plan_cache_insert(lru, k1, p1);
+    agnosai_plan_cache_insert(lru, k2, p2);
+    assert_eq(agnosai_plan_cache_len(lru), 2, "two entries");
+    # touching k1 makes k2 the least recently used
+    assert_eq(agnosai_plan_cache_get(lru, k1), p1, "touching the first entry hits");
+    assert(agnosai_plan_cache_get(lru, k2) != 0, "and the second is still present");
+
+    # --- CachedPlan carries and serialises its three decisions ---
+    var assignments = map_new_str();
+    map_set(assignments, str_from("task-1"), str_from("agent-a"));
+    var order = vec_new();
+    vec_push(order, str_from("task-1"));
+    var models = map_new_str();
+    map_set(models, str_from("task-1"), str_from("llama3"));
+    var rich = agnosai_cached_plan_new(assignments, order, models);
+
+    assert(str_eq(map_get(agnosai_cached_plan_assignments(rich), str_from("task-1")),
+    str_from("agent-a")) == 1, "the assignment round-trips");
+    assert_eq(vec_len(agnosai_cached_plan_execution_order(rich)), 1, "the order round-trips");
+    assert(str_eq(map_get(agnosai_cached_plan_model_selections(rich), str_from("task-1")),
+    str_from("llama3")) == 1, "and the model selection");
+
+    var rich_json = bayan_json_v_build(agnosai_cached_plan_to_value(rich));
+    var want = str_cat(str_from("{\"assignments\":{\"task-1\":\"agent-a\"},"),
+    str_cat(str_from("\"execution_order\":[\"task-1\"],"),
+    str_from("\"model_selections\":{\"task-1\":\"llama3\"}}")));
+    assert(str_eq(rich_json, want) == 1,
+    "and the whole plan serialises in the oracle's field order");
+
+    var blank = agnosai_cached_plan_empty();
+    assert(str_eq(bayan_json_v_build(agnosai_cached_plan_to_value(blank)),
+    str_from("{\"assignments\":{},\"execution_order\":[],\"model_selections\":{}}")) == 1,
+    "an empty plan emits empty collections rather than nulls");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

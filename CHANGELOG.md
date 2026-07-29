@@ -224,6 +224,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     it; this waiter polls and uses the entry as its liveness signal, so removing first would let a
     poll landing between the two calls see an empty channel *and* no pending entry, conclude the
     gate was cancelled, and reject a decision that was about to arrive.
+  - **orch_plan_cache** — an LRU+TTL cache of agent assignments, task ordering and model choices,
+    keyed on a normalised hash of the crew spec. **The hash algorithm is not the contract; the
+    normalisation is** — the oracle keys on `std::hash::DefaultHasher`, an explicitly unstable std
+    detail, and `PlanKey` derives no `Serialize`, so the value never leaves the process. What is
+    observable, and is reproduced, is that reordering a spec does not change its key.
+
+    **One deliberate divergence closes a real collision the oracle has.** The oracle delimits each
+    individual string but nothing delimits the agent section from the task section, so
+    `(["a","b"], ["c"], m)` and `(["a"], ["b","c"], m)` feed the hasher identical bytes and
+    collide — needing only an agent key that reads like a task description. That is not a
+    hash-quality nit: two different crews share a cache entry, so one gets the *other's* agent
+    assignments and task ordering. This port folds each section's element count in first. It is
+    free, because nothing outside the process can observe the value. Found by an assertion written
+    to check the property rather than to confirm the implementation.
+
+    Re-inserting an existing key replaces rather than appends — the oracle gets that from
+    `HashMap::insert`, and without it a hot key would fill the cache with copies of itself. An
+    expired entry is removed on read, and eviction takes the *first* minimum `last_accessed`, so
+    entries sharing a coarse-clock timestamp evict earliest-inserted first, matching `min_by_key`.
 - **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
   `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
   never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.

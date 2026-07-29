@@ -1,0 +1,347 @@
+# =========================================================================
+# orch_plan_cache — reuse a crew's execution plan instead of replanning it.
+#
+# Parity oracle: rust-old/src/orchestrator/plan_cache.rs
+#
+# Agent assignments, task ordering and model choices, cached against a
+# normalised hash of the crew spec. Submit the same agents, tasks and process
+# mode again and the plan comes back instead of re-running agent scoring and
+# topological sorting.
+#
+# **The hash function is not part of the contract; the normalisation is.** The
+# oracle keys on `std::hash::DefaultHasher`, which is SipHash-1-3 with a fixed
+# zero seed — deterministic within a build, but an explicitly unstable
+# implementation detail of the standard library, and `PlanKey` derives no
+# `Serialize`, so the value never leaves the process. Reproducing SipHash would
+# be reproducing an accident. What *is* observable, and is reproduced exactly, is
+# the normalisation: agent keys sorted, task descriptions sorted, then the
+# process mode — which is what makes the key independent of the order a crew
+# spec happens to list things in, and the oracle has a test for precisely that.
+#
+# The hash here is FNV-1a over the same normalised byte sequence, with the
+# separators the oracle gets for free from `str::hash` (which feeds the length
+# alongside the bytes, so `["ab","c"]` and `["a","bc"]` cannot collide). Keeping
+# that property matters more than the algorithm: without a separator, two
+# different crews would share a plan.
+#
+# `Instant` becomes epoch nanoseconds, the port's standing carrier. TTL is
+# compared with `>`, so an entry sitting exactly on its expiry is still live —
+# the oracle's `duration_since(created_at) > self.ttl`.
+# =========================================================================
+
+# The oracle's `MAX_CACHED_PLANS`.
+var AGNOSAI_PLAN_CACHE_MAX = 256;
+
+# The oracle's `DEFAULT_TTL`, one hour.
+var AGNOSAI_PLAN_CACHE_TTL_NS = 3600000000000;
+
+# FNV-1a 64-bit offset basis and prime.
+var AGNOSAI_FNV_OFFSET = 0 - 3750763034362895579;
+var AGNOSAI_FNV_PRIME = 1099511628211;
+
+# Mix one byte into an FNV-1a accumulator.
+fn _agnosai_fnv_byte(h, b): i64 {
+    return (h ^ (b & 255)) * AGNOSAI_FNV_PRIME;
+}
+
+# Mix a Str into an accumulator, length-prefixed.
+#
+# The length is folded in because the oracle's `str::hash` does the same — Rust
+# writes the bytes *and* a length delimiter. Without it `["ab","c"]` and
+# `["a","bc"]` hash alike, and two unrelated crews would share a cached plan.
+fn _agnosai_fnv_str(h, s: Str): i64 {
+    var n = str_len(s);
+    h = _agnosai_fnv_byte(h, n);
+    var d = str_data(s);
+    for (var i = 0; i < n; i = i + 1) { h = _agnosai_fnv_byte(h, load8(d + i)); }
+    return h;
+}
+
+# Lexicographic compare of two Strs, for the normalising sorts.
+fn _agnosai_plan_str_cmp(a: Str, b: Str): i64 {
+    var la = str_len(a);
+    var lb = str_len(b);
+    var n = la;
+    if (lb < n) { n = lb; }
+    var da = str_data(a);
+    var db = str_data(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var ca = load8(da + i) & 255;
+        var cb = load8(db + i) & 255;
+        if (ca != cb) { return ca - cb; }
+    }
+    return la - lb;
+}
+
+# A sorted copy of a vec of Str. The input is left alone — the caller's crew
+# spec must not be reordered as a side effect of computing a cache key.
+fn _agnosai_plan_sorted(v): i64 {
+    var out = vec_new();
+    for (var i = 0; i < vec_len(v); i = i + 1) { vec_push(out, vec_get(v, i)); }
+    for (var a = 1; a < vec_len(out); a = a + 1) {
+        var cur = vec_get(out, a);
+        var b = a - 1;
+        while (b >= 0) {
+            if (_agnosai_plan_str_cmp(vec_get(out, b), cur) <= 0) { break; }
+            vec_set(out, b + 1, vec_get(out, b));
+            b = b - 1;
+        }
+        vec_set(out, b + 1, cur);
+    }
+    return out;
+}
+
+# The cache key for a crew spec.
+#
+# Agent keys and task descriptions are each sorted before hashing, so the key
+# does not depend on the order the spec listed them in. The process mode is
+# folded in last and is *not* sorted with anything — a sequential crew and a
+# hierarchical one over the same agents and tasks are different plans.
+fn agnosai_plan_key(agent_keys, task_descriptions, process_mode: Str): i64 {
+    var h = AGNOSAI_FNV_OFFSET;
+
+    # Each section's element count is folded in before its elements. **This is a
+    # deliberate divergence, and it closes a real collision the oracle has.**
+    #
+    # The oracle delimits each individual string (Rust's `str::hash` writes a
+    # trailing byte after the bytes) but nothing delimits the agent section from
+    # the task section. So `(["a"], ["b"], "c")` and `(["a","b"], [], "c")` feed
+    # the hasher an identical byte sequence and collide — as do
+    # `(["a","b"], ["c"], m)` and `(["a"], ["b","c"], m)`, which needs only an
+    # agent key that reads like a task description.
+    #
+    # A collision here is not a hash-quality nit: two different crews share a
+    # cache entry, so one gets the *other's* agent assignments and task
+    # ordering. Diverging is free because the value is never serialised —
+    # `PlanKey` derives no `Serialize`, and the oracle's own hash is
+    # `DefaultHasher`, whose output std does not promise across versions. Nothing
+    # outside the process can tell.
+    var agents = _agnosai_plan_sorted(agent_keys);
+    h = _agnosai_fnv_byte(h, vec_len(agents));
+    for (var i = 0; i < vec_len(agents); i = i + 1) { h = _agnosai_fnv_str(h, vec_get(agents, i)); }
+
+    var tasks = _agnosai_plan_sorted(task_descriptions);
+    h = _agnosai_fnv_byte(h, vec_len(tasks));
+    for (var j = 0; j < vec_len(tasks); j = j + 1) { h = _agnosai_fnv_str(h, vec_get(tasks, j)); }
+
+    return _agnosai_fnv_str(h, process_mode);
+}
+
+# CachedPlan — the three decisions replanning would otherwise recompute.
+enum AgnosaiCachedPlanOff {
+    AGN_CP_ASSIGNMENTS = 0;
+    AGN_CP_EXECUTION_ORDER = 8;
+    AGN_CP_MODEL_SELECTIONS = 16;
+    AGN_CP_SIZE = 24;
+}
+
+# Build a plan. `assignments` and `model_selections` are task-id-keyed maps of
+# Str; `execution_order` is a vec of task ids.
+fn agnosai_cached_plan_new(assignments, execution_order, model_selections): i64 {
+    var p = alloc(AGN_CP_SIZE);
+    store64(p + AGN_CP_ASSIGNMENTS, assignments);
+    store64(p + AGN_CP_EXECUTION_ORDER, execution_order);
+    store64(p + AGN_CP_MODEL_SELECTIONS, model_selections);
+    return p;
+}
+
+# An empty plan — three empty collections, the oracle's test fixture.
+fn agnosai_cached_plan_empty(): i64 {
+    return agnosai_cached_plan_new(map_new_str(), vec_new(), map_new_str());
+}
+
+# task_id -> agent_key.
+fn agnosai_cached_plan_assignments(p): i64 {
+    return load64(p + AGN_CP_ASSIGNMENTS);
+}
+
+# The ordered task sequence.
+fn agnosai_cached_plan_execution_order(p): i64 {
+    return load64(p + AGN_CP_EXECUTION_ORDER);
+}
+
+# task_id -> model name.
+fn agnosai_cached_plan_model_selections(p): i64 {
+    return load64(p + AGN_CP_MODEL_SELECTIONS);
+}
+
+# Serialise a plan. `CachedPlan` derives Serialize/Deserialize, so the shape is
+# wire-visible; ids are already canonical strings, so the maps serialise as-is.
+fn agnosai_cached_plan_to_value(p): i64 {
+    var obj = bayan_json_v_obj_new();
+
+    var assignments = load64(p + AGN_CP_ASSIGNMENTS);
+    var av = bayan_json_v_obj_new();
+    var akeys = map_keys(assignments);
+    for (var i = 0; i < vec_len(akeys); i = i + 1) {
+        var ak = vec_get(akeys, i);
+        bayan_json_v_obj_set(av, ak, bayan_json_v_str_new(map_get(assignments, ak)));
+    }
+    bayan_json_v_obj_set(obj, str_from("assignments"), av);
+
+    var order = load64(p + AGN_CP_EXECUTION_ORDER);
+    var ov = bayan_json_v_arr_new();
+    for (var j = 0; j < vec_len(order); j = j + 1) {
+        bayan_json_v_arr_push(ov, bayan_json_v_str_new(vec_get(order, j)));
+    }
+    bayan_json_v_obj_set(obj, str_from("execution_order"), ov);
+
+    var models = load64(p + AGN_CP_MODEL_SELECTIONS);
+    var mv = bayan_json_v_obj_new();
+    var mkeys = map_keys(models);
+    for (var k = 0; k < vec_len(mkeys); k = k + 1) {
+        var mk = vec_get(mkeys, k);
+        bayan_json_v_obj_set(mv, mk, bayan_json_v_str_new(map_get(models, mk)));
+    }
+    bayan_json_v_obj_set(obj, str_from("model_selections"), mv);
+    return obj;
+}
+
+# A cache entry: the plan plus its LRU and TTL metadata.
+enum AgnosaiCacheEntryOff {
+    AGN_CE_KEY = 0;
+    AGN_CE_PLAN = 8;
+    AGN_CE_CREATED_AT = 16;
+    AGN_CE_LAST_ACCESSED = 24;
+    AGN_CE_SIZE = 32;
+}
+
+# PlanCache — a vec of entries plus the TTL.
+#
+# A vec rather than a map: the oracle keys a HashMap on `PlanKey`, but eviction
+# needs a scan for the minimum `last_accessed` anyway, and at 256 entries a
+# linear probe is cheaper than a hash plus a separate scan. The cap is what makes
+# that safe, and it is the oracle's own cap.
+enum AgnosaiPlanCacheOff {
+    AGN_PC_ENTRIES = 0;
+    AGN_PC_TTL_NS = 8;
+    AGN_PC_MUTEX = 16;
+    AGN_PC_SIZE = 24;
+}
+
+# Create a cache with a custom TTL, in nanoseconds.
+fn agnosai_plan_cache_with_ttl(ttl_ns): i64 {
+    var c = alloc(AGN_PC_SIZE);
+    store64(c + AGN_PC_ENTRIES, vec_new());
+    store64(c + AGN_PC_TTL_NS, ttl_ns);
+    store64(c + AGN_PC_MUTEX, mutex_new());
+    return c;
+}
+
+# Create a cache with the oracle's one-hour TTL.
+fn agnosai_plan_cache_new(): i64 {
+    return agnosai_plan_cache_with_ttl(AGNOSAI_PLAN_CACHE_TTL_NS);
+}
+
+# The cache's TTL in nanoseconds.
+fn agnosai_plan_cache_ttl_ns(c): i64 {
+    return load64(c + AGN_PC_TTL_NS);
+}
+
+# Number of cached plans.
+fn agnosai_plan_cache_len(c): i64 {
+    var mtx = load64(c + AGN_PC_MUTEX);
+    mutex_lock(mtx);
+    var n = vec_len(load64(c + AGN_PC_ENTRIES));
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Whether the cache holds nothing.
+fn agnosai_plan_cache_is_empty(c): i64 {
+    if (agnosai_plan_cache_len(c) == 0) { return 1; }
+    return 0;
+}
+
+# Index of the entry for a key, or -1. Caller holds the mutex.
+fn _agnosai_plan_find(c, key): i64 {
+    var entries = load64(c + AGN_PC_ENTRIES);
+    for (var i = 0; i < vec_len(entries); i = i + 1) {
+        if (load64(vec_get(entries, i) + AGN_CE_KEY) == key) { return i; }
+    }
+    return 0 - 1;
+}
+
+# Log a cache event.
+fn _agnosai_plan_log(msg, msg_len): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    sakshi_log_kv(SK_DEBUG, msg, msg_len, "cache", 5, "plan", 4);
+    return 0;
+}
+
+# Look up a plan, or 0 when absent or expired.
+#
+# An expired entry is **removed** on the way out, not just skipped — the oracle
+# does the same, so a stale plan does not keep occupying a slot until eviction
+# happens to reach it. A hit refreshes `last_accessed`, which is what makes the
+# eviction order least-recently-*used* rather than least-recently-inserted.
+fn agnosai_plan_cache_get(c, key): i64 {
+    var mtx = load64(c + AGN_PC_MUTEX);
+    mutex_lock(mtx);
+    var idx = _agnosai_plan_find(c, key);
+    if (idx < 0) {
+        mutex_unlock(mtx);
+        return 0;
+    }
+
+    var entries = load64(c + AGN_PC_ENTRIES);
+    var e = vec_get(entries, idx);
+    var now = clock_now_ns();
+
+    # `>` not `>=`: an entry exactly at its expiry is still live.
+    if (now - load64(e + AGN_CE_CREATED_AT) > load64(c + AGN_PC_TTL_NS)) {
+        vec_remove(entries, idx);
+        mutex_unlock(mtx);
+        _agnosai_plan_log("plan cache entry expired", 24);
+        return 0;
+    }
+
+    store64(e + AGN_CE_LAST_ACCESSED, now);
+    mutex_unlock(mtx);
+    _agnosai_plan_log("plan cache hit", 14);
+    return load64(e + AGN_CE_PLAN);
+}
+
+# Evict the least recently used entry. Caller holds the mutex.
+#
+# The oracle's `min_by_key(last_accessed)`. `min_by_key` returns the **first**
+# minimum, so with several entries sharing a timestamp — which a fast test or a
+# coarse clock will produce — the earliest-inserted one goes. Reproduced with a
+# strict `<`.
+fn _agnosai_plan_evict_lru(c): i64 {
+    var entries = load64(c + AGN_PC_ENTRIES);
+    if (vec_len(entries) == 0) { return 0; }
+    var oldest = 0;
+    for (var i = 1; i < vec_len(entries); i = i + 1) {
+        if (load64(vec_get(entries, i) + AGN_CE_LAST_ACCESSED)
+        < load64(vec_get(entries, oldest) + AGN_CE_LAST_ACCESSED)) { oldest = i; }
+    }
+    vec_remove(entries, oldest);
+    _agnosai_plan_log("plan cache: evicted LRU entry", 29);
+    return 0;
+}
+
+# Insert a plan, evicting the least recently used entry when at capacity.
+#
+# Re-inserting an existing key replaces it rather than adding a duplicate. The
+# oracle gets that from `HashMap::insert`; a vec has to do it explicitly, and
+# without it a hot key would fill the cache with copies of itself.
+fn agnosai_plan_cache_insert(c, key, plan): i64 {
+    var mtx = load64(c + AGN_PC_MUTEX);
+    mutex_lock(mtx);
+    var entries = load64(c + AGN_PC_ENTRIES);
+
+    var existing = _agnosai_plan_find(c, key);
+    if (existing >= 0) { vec_remove(entries, existing); }
+    elif (vec_len(entries) >= AGNOSAI_PLAN_CACHE_MAX) { _agnosai_plan_evict_lru(c); }
+
+    var now = clock_now_ns();
+    var e = alloc(AGN_CE_SIZE);
+    store64(e + AGN_CE_KEY, key);
+    store64(e + AGN_CE_PLAN, plan);
+    store64(e + AGN_CE_CREATED_AT, now);
+    store64(e + AGN_CE_LAST_ACCESSED, now);
+    vec_push(entries, e);
+    mutex_unlock(mtx);
+    return 0;
+}
