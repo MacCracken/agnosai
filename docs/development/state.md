@@ -49,7 +49,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
-| `orchestrator` ported (M5, Phase 4) | 🟡 4 pure leaves + scoring + scheduler done; 9 modules left |
+| `orchestrator` ported (M5, Phase 4) | 🟡 4 pure leaves + scoring + scheduler + budget done; 8 modules left |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
@@ -57,7 +57,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**1829 assertions across 30 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**1887 assertions across 31 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -90,6 +90,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `orch_ipc.tcyr` | 47 | 4 (all `#[tokio::test]`, all portable via socketpair) |
 | `orch_scoring.tcyr` | 68 | 10 |
 | `orch_scheduler.tcyr` | 77 | 16 |
+| `orch_budget.tcyr` | 47 | 6 |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -121,7 +122,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (577/577 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (592/592 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -333,7 +334,23 @@ Open items, none blocking:
    `core_agent.cyr` and `core_crew.cyr`. That name will no longer exist; switch
    each to the bare `bayan_json_v_parse(src)`. It is a compile error, not a
    silent break, so none can be missed.
-2. **`lib/sakshi.cyr` is vendored at 2.4.3 while the 6.4.86 toolchain bundles
+2. **Blocker #3 is repaired in sandhi 1.9.7, awaiting a toolchain fold-in.**
+   sandhi now carries `sandhi_server_options_req_arena` (a per-worker,
+   per-request arena), `sandhi_server_request_arena`, and allocator-threaded
+   `sandhi_router_dispatch_a` / `sandhi_server_router_handler_a`. With the
+   option set, the routing path — the method/path accessors and the 404/405
+   writes — allocates in a rewindable arena instead of the no-free global bump.
+   agnosai consumes sandhi from the **toolchain bundle**, not a git dep, so this
+   only reaches the port at the next fold-in; `lib/sandhi.cyr` here is still
+   1.9.5. Nothing in M5 is blocked by it — the gate is M6.
+
+   **Known residual, already filed and not sandhi's to fix:** with the arena on,
+   a response still grows the global bump by exactly 16 bytes — the `Result`
+   that `lib/net.cyr`'s `sock_send` returns. Filed as cyrius
+   `2026-07-28-sock-send-result-allocates-per-call.md`, re-confirmed present on
+   6.5.0, and pinned by `sandhi/tests/sandhi.tcyr::test_server_req_arena` as an
+   exact bound so the test will speak up if the stdlib fix lands.
+3. **`lib/sakshi.cyr` is vendored at 2.4.3 while the 6.4.86 toolchain bundles
    2.4.6**, which every build reports as a shadow warning. `cyrius lib sync
    --full` re-syncs.
 3. **Cyrius `_int` overload misdispatch — filed 2026-07-29.**

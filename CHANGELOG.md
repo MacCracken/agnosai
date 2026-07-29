@@ -181,6 +181,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     run, which the oracle is not, and consistent with its contract either way. The adjacency
     values are sets, not lists: a duplicated edge must not double-count an in-degree, or the
     target never becomes ready.
+### Changed
+- **Identifiers are canonical strings, not raw 16-byte UUID buffers.** `agnosai_task_id`,
+  `agnosai_crew_id`, `agnosai_message_id`, task dependencies and assigned-agent ids now hold the
+  36-char canonical form; `agnosai_uuid_v4_str` and `agnosai_uuid_canonical` are what constructors
+  and parsers use. The byte-level verbs (`agnosai_uuid_v4`, `_eq`, `_to_str`, `_parse`) are
+  unchanged for callers who genuinely want bytes.
+
+  The buffer form was the natural port of `uuid::Uuid` and it was a standing trap: Cyrius has no
+  types to stop one reaching `str_eq` or a `map_new_str` key, where its first eight bytes are read
+  as a string length. That is not a compile error and not a clean crash — it is a segfault three
+  call layers away, and it cost a full debugging session in `orch_scheduler`, whose `id_to_key`
+  map looks like it should take an id directly because the oracle's does
+  (`HashMap<TaskId, String>`). Storing the canonical string removes the trap instead of
+  documenting it: ids compare with `str_eq`, key a map directly, and serialise with no conversion.
+
+  **The wire form is unchanged** — it was already the canonical string, so every `to_json` /
+  `from_json` round trip is byte-identical. Parsing still validates and now also normalises case,
+  matching the `uuid` crate (parse any case, Display always lowercase).
+  - **orch_budget** — token/cost enforcement checked before every inference call. **The one
+    module in the port that does not use micro-USD**: the oracle carries its own unit, 1/10000
+    USD, chosen so an atomic counter needs no float — and `BudgetExceeded::Cost` derives
+    `Serialize` with `used_units`/`limit_units`, so the divisor is **on the wire** and cannot be
+    quietly widened. The two units meet at the constructor, where a micro-USD limit converts with
+    a ceil; since one cost unit is exactly 100 micro-USD that is integer ceil-division, making the
+    port's conversion *more* exact than the oracle's f64 multiply-then-ceil. Limits bite at `>=`,
+    so a tracker that has spent exactly its allowance refuses the next call — the opposite of
+    `multi_tenant`'s `>`, and both are the oracle's. The atomics become plain fields; a concurrent
+    `record_tokens` pair can lose an update where `fetch_add` would not, which is noted in-module
+    rather than hidden and is harmless for a coarse ceiling.
 - **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
   `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
   never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.

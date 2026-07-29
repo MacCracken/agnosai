@@ -1,0 +1,259 @@
+# =========================================================================
+# orch_budget — token and cost budget enforcement for a running crew.
+#
+# Parity oracle: rust-old/src/orchestrator/budget.rs
+#
+# Checked before every inference call; once a limit is *reached* the crew stops.
+#
+# **This module does not use micro-USD, and that is deliberate.** The rest of
+# the port carries money as millionths of a dollar (the 2026-07-28 decision, see
+# `core_resource`). The oracle here uses its own unit — **1/10000 USD**, which
+# it calls a "cost unit" — because it needs an integer for atomic accumulation
+# without floating-point atomics. That unit is not an implementation detail that
+# can be quietly widened: `BudgetExceeded::Cost` derives `Serialize` and carries
+# `used_units` / `limit_units` **on the wire**, so changing the divisor changes
+# the numbers a consumer reads. It is reproduced exactly.
+#
+# The two units meet at the constructor. `ResourceBudget`'s limit arrives in
+# micro-USD and is converted with `ceil`, matching the oracle's
+# `(c * 10_000.0).ceil()`. Since 1 cost unit is exactly 100 micro-USD, that is
+# integer ceil-division and needs no float — which makes this port's conversion
+# *more* exact than the oracle's, whose f64 multiply can land a hair under an
+# integer and ceil to the wrong unit.
+#
+# **Limits bite at `>=`, not `>`.** A tracker that has used exactly its token
+# allowance refuses the next call. That is the opposite of `multi_tenant`'s
+# check, which passes at exactly the limit — the two modules genuinely differ,
+# and both are the oracle's.
+#
+# The oracle's atomics become plain fields: a Cyrius `BudgetTracker` is shared
+# across worker threads the same way, but `alloc`'s global lock already
+# serialises the surrounding work, and a relaxed-ordering counter has no
+# happens-before edge to preserve. A concurrent `record_tokens` pair can lose an
+# update here where the oracle's `fetch_add` would not — noted rather than
+# hidden, and harmless for a budget whose whole purpose is a coarse ceiling.
+# =========================================================================
+
+# Cost units per dollar: the oracle's 10_000, i.e. one unit is 1/10000 USD.
+var AGNOSAI_COST_UNITS_PER_USD = 10000;
+
+# Micro-USD per cost unit — 1000000 / 10000. The bridge between this module's
+# unit and the port's money representation.
+var AGNOSAI_MICRO_USD_PER_COST_UNIT = 100;
+
+# No budget breach.
+var AGNOSAI_BUDGET_WITHIN = 0;
+
+# The token limit has been reached.
+var AGNOSAI_BUDGET_TOKENS = 1;
+
+# The cost limit has been reached.
+var AGNOSAI_BUDGET_COST = 2;
+
+# BudgetTracker — usage counters plus the limits they are checked against.
+#
+# `AGNOSAI_NO_LIMIT` in either limit field means "unlimited", the port's
+# standing spelling of the oracle's `Option::None`.
+enum AgnosaiBudgetTrackerOff {
+    AGN_BT_TOKENS_USED = 0;
+    AGN_BT_COST_UNITS = 8;
+    AGN_BT_MAX_TOKENS = 16;
+    AGN_BT_MAX_COST_UNITS = 24;
+    AGN_BT_SIZE = 32;
+}
+
+# Convert micro-USD to cost units, rounding **up** — the oracle's `.ceil()`.
+#
+# Rounding up is the conservative direction for a budget: a cost that does not
+# divide evenly is charged the larger unit, so the tracker can never understate
+# what has been spent.
+fn agnosai_micro_usd_to_cost_units(micro): i64 {
+    if (micro <= 0) { return 0; }
+    return (micro + AGNOSAI_MICRO_USD_PER_COST_UNIT - 1) / AGNOSAI_MICRO_USD_PER_COST_UNIT;
+}
+
+# Create a tracker from a `ResourceBudget`.
+fn agnosai_budget_tracker_new(budget): i64 {
+    var t = alloc(AGN_BT_SIZE);
+    store64(t + AGN_BT_TOKENS_USED, 0);
+    store64(t + AGN_BT_COST_UNITS, 0);
+
+    var max_tokens = AGNOSAI_NO_LIMIT;
+    var max_cost_units = AGNOSAI_NO_LIMIT;
+    if (budget != 0) {
+        max_tokens = agnosai_resource_budget_max_tokens(budget);
+        var micro = agnosai_resource_budget_max_cost_micro_usd(budget);
+        if (micro != AGNOSAI_NO_LIMIT) {
+            max_cost_units = agnosai_micro_usd_to_cost_units(micro);
+        }
+    }
+    store64(t + AGN_BT_MAX_TOKENS, max_tokens);
+    store64(t + AGN_BT_MAX_COST_UNITS, max_cost_units);
+    return t;
+}
+
+# Total tokens recorded so far.
+fn agnosai_budget_tracker_tokens_used(t): i64 {
+    return load64(t + AGN_BT_TOKENS_USED);
+}
+
+# Total cost recorded so far, in cost units.
+fn agnosai_budget_tracker_cost_units(t): i64 {
+    return load64(t + AGN_BT_COST_UNITS);
+}
+
+# Total cost recorded so far, as an f64 dollar amount.
+fn agnosai_budget_tracker_cost_usd(t): i64 {
+    return f64_div(f64_from(load64(t + AGN_BT_COST_UNITS)),
+    f64_from(AGNOSAI_COST_UNITS_PER_USD));
+}
+
+# The token limit, or AGNOSAI_NO_LIMIT.
+fn agnosai_budget_tracker_max_tokens(t): i64 {
+    return load64(t + AGN_BT_MAX_TOKENS);
+}
+
+# The cost limit in cost units, or AGNOSAI_NO_LIMIT.
+fn agnosai_budget_tracker_max_cost_units(t): i64 {
+    return load64(t + AGN_BT_MAX_COST_UNITS);
+}
+
+# Whether any limit is configured at all.
+fn agnosai_budget_tracker_has_limits(t): i64 {
+    if (load64(t + AGN_BT_MAX_TOKENS) != AGNOSAI_NO_LIMIT) { return 1; }
+    if (load64(t + AGN_BT_MAX_COST_UNITS) != AGNOSAI_NO_LIMIT) { return 1; }
+    return 0;
+}
+
+# Record tokens consumed by a completed inference call.
+fn agnosai_budget_tracker_record_tokens(t, tokens): i64 {
+    store64(t + AGN_BT_TOKENS_USED, load64(t + AGN_BT_TOKENS_USED) + tokens);
+    return 0;
+}
+
+# Record the cost of a completed inference call, in micro-USD.
+#
+# The oracle takes f64 USD and ceils; this takes the port's micro-USD and
+# ceil-divides, which is the same rounding without the float.
+fn agnosai_budget_tracker_record_cost(t, micro_usd): i64 {
+    store64(t + AGN_BT_COST_UNITS,
+    load64(t + AGN_BT_COST_UNITS) + agnosai_micro_usd_to_cost_units(micro_usd));
+    return 0;
+}
+
+# The oracle's `warn!` when a limit is hit.
+fn _agnosai_budget_log(msg, msg_len, used, limit): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "used=");
+    str_builder_add_int(sb, used);
+    str_builder_add_cstr(sb, " limit=");
+    str_builder_add_int(sb, limit);
+    var line = str_builder_build(sb);
+    sakshi_log_kv(SK_WARN, msg, msg_len, "budget", 6, str_data(line), str_len(line));
+    return 0;
+}
+
+# Whether another inference call is allowed.
+#
+# Returns `AGNOSAI_BUDGET_WITHIN`, or which limit has been reached. Tokens are
+# checked before cost, which is observable when both are breached.
+#
+# The test is `>=`: a tracker that has spent exactly its allowance is already
+# over. `multi_tenant`'s equivalent uses `>` and passes at the limit — the two
+# really do differ in the oracle, so neither can be "corrected" to match.
+fn agnosai_budget_tracker_check(t): i64 {
+    var max_tokens = load64(t + AGN_BT_MAX_TOKENS);
+    if (max_tokens != AGNOSAI_NO_LIMIT) {
+        var used = load64(t + AGN_BT_TOKENS_USED);
+        if (used >= max_tokens) {
+            _agnosai_budget_log("token budget exceeded", 21, used, max_tokens);
+            return AGNOSAI_BUDGET_TOKENS;
+        }
+    }
+
+    var max_cost = load64(t + AGN_BT_MAX_COST_UNITS);
+    if (max_cost != AGNOSAI_NO_LIMIT) {
+        var used_units = load64(t + AGN_BT_COST_UNITS);
+        if (used_units >= max_cost) {
+            _agnosai_budget_log("cost budget exceeded", 20, used_units, max_cost);
+            return AGNOSAI_BUDGET_COST;
+        }
+    }
+    return AGNOSAI_BUDGET_WITHIN;
+}
+
+# Render a cost-unit count as the oracle's `${:.4}` — four decimal places.
+#
+# One cost unit is exactly 1/10000 USD, so four decimals is the unit's own
+# precision and the rendering is exact rather than rounded.
+fn _agnosai_budget_usd_str(units): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "$");
+    str_builder_add_int(sb, units / AGNOSAI_COST_UNITS_PER_USD);
+    str_builder_add_cstr(sb, ".");
+    var frac = units % AGNOSAI_COST_UNITS_PER_USD;
+    if (frac < 0) { frac = 0 - frac; }
+    # Zero-padded to four digits: 5 units is $0.0005, not $0.5.
+    if (frac < 1000) { str_builder_add_cstr(sb, "0"); }
+    if (frac < 100) { str_builder_add_cstr(sb, "0"); }
+    if (frac < 10) { str_builder_add_cstr(sb, "0"); }
+    str_builder_add_int(sb, frac);
+    return str_builder_build(sb);
+}
+
+# The oracle's `Display` for a breach, or 0 when nothing is exceeded.
+#
+# `token budget exceeded: {used} used, {limit} limit`
+# `cost budget exceeded: ${used:.4} used, ${limit:.4} limit`
+fn agnosai_budget_exceeded_message(t, kind): i64 {
+    if (kind == AGNOSAI_BUDGET_TOKENS) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "token budget exceeded: ");
+        str_builder_add_int(sb, load64(t + AGN_BT_TOKENS_USED));
+        str_builder_add_cstr(sb, " used, ");
+        str_builder_add_int(sb, load64(t + AGN_BT_MAX_TOKENS));
+        str_builder_add_cstr(sb, " limit");
+        return str_builder_build(sb);
+    }
+    if (kind == AGNOSAI_BUDGET_COST) {
+        var cb = str_builder_new();
+        str_builder_add_cstr(cb, "cost budget exceeded: ");
+        str_builder_add(cb, _agnosai_budget_usd_str(load64(t + AGN_BT_COST_UNITS)));
+        str_builder_add_cstr(cb, " used, ");
+        str_builder_add(cb, _agnosai_budget_usd_str(load64(t + AGN_BT_MAX_COST_UNITS)));
+        str_builder_add_cstr(cb, " limit");
+        return str_builder_build(cb);
+    }
+    return 0;
+}
+
+# Serialise a breach the way `BudgetExceeded` derives.
+#
+# The oracle is an externally-tagged enum, so `Tokens { used, limit }` emits
+# `{"Tokens":{"used":N,"limit":N}}` and the cost arm names its fields
+# `used_units` / `limit_units` — the 1/10000 unit is on the wire, which is why
+# this module keeps it.
+fn agnosai_budget_exceeded_to_value(t, kind): i64 {
+    if (kind == AGNOSAI_BUDGET_TOKENS) {
+        var inner = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(inner, str_from("used"),
+        bayan_json_v_int_new(load64(t + AGN_BT_TOKENS_USED)));
+        bayan_json_v_obj_set(inner, str_from("limit"),
+        bayan_json_v_int_new(load64(t + AGN_BT_MAX_TOKENS)));
+        var obj = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(obj, str_from("Tokens"), inner);
+        return obj;
+    }
+    if (kind == AGNOSAI_BUDGET_COST) {
+        var cinner = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(cinner, str_from("used_units"),
+        bayan_json_v_int_new(load64(t + AGN_BT_COST_UNITS)));
+        bayan_json_v_obj_set(cinner, str_from("limit_units"),
+        bayan_json_v_int_new(load64(t + AGN_BT_MAX_COST_UNITS)));
+        var cobj = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(cobj, str_from("Cost"), cinner);
+        return cobj;
+    }
+    return 0;
+}

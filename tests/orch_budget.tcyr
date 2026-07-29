@@ -1,0 +1,198 @@
+# =========================================================================
+# orch_budget.tcyr — parity tests for src/orch_budget.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/orchestrator/budget.rs —
+# 6 tests, all portable.
+#
+# The unit boundary gets more attention than the oracle gives it, because this
+# is the one module in the port that does NOT use micro-USD: it keeps the
+# oracle's 1/10000 USD "cost unit", which is wire-visible through
+# `BudgetExceeded::Cost`. Getting the divisor wrong would be silent.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/core_resource.cyr"
+include "src/orch_budget.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's budget_with_tokens(max).
+fn _t_tokens(max): i64 {
+    return agnosai_resource_budget_new(max, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT);
+}
+
+# The oracle's budget_with_cost(max_usd), in micro-USD.
+fn _t_cost(micro): i64 {
+    return agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, micro, AGNOSAI_NO_LIMIT,
+    AGNOSAI_NO_LIMIT);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_budget");
+
+    assert_eq(AGNOSAI_COST_UNITS_PER_USD, 10000, "a cost unit is 1/10000 USD, the oracle's");
+    assert_eq(AGNOSAI_MICRO_USD_PER_COST_UNIT, 100,
+    "which is 100 micro-USD — the bridge to the port's money unit");
+    assert_eq(AGNOSAI_COST_UNITS_PER_USD * AGNOSAI_MICRO_USD_PER_COST_UNIT,
+    AGNOSAI_MICRO_USD_PER_USD, "and the two units are consistent with each other");
+
+    # --- micro-USD to cost units rounds UP, as the oracle's ceil() does ---
+    assert_eq(agnosai_micro_usd_to_cost_units(0), 0, "zero converts to zero");
+    assert_eq(agnosai_micro_usd_to_cost_units(100), 1, "100 micro-USD is exactly one unit");
+    assert_eq(agnosai_micro_usd_to_cost_units(1), 1,
+    "1 micro-USD rounds UP to a whole unit — a budget must never understate spend");
+    assert_eq(agnosai_micro_usd_to_cost_units(99), 1, "and so does 99");
+    assert_eq(agnosai_micro_usd_to_cost_units(101), 2, "101 needs two units");
+    assert_eq(agnosai_micro_usd_to_cost_units(1000000), 10000, "$1 is 10,000 units");
+    assert_eq(agnosai_micro_usd_to_cost_units(0 - 5), 0, "a negative amount converts to zero");
+
+    # --- no_limits_always_passes ---
+    var none = agnosai_budget_tracker_new(agnosai_resource_budget_new(AGNOSAI_NO_LIMIT,
+    AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT));
+    assert_eq(agnosai_budget_tracker_has_limits(none), 0, "an unlimited budget has no limits");
+    assert_eq(agnosai_budget_tracker_check(none), AGNOSAI_BUDGET_WITHIN, "and always passes");
+    agnosai_budget_tracker_record_tokens(none, 999999999);
+    agnosai_budget_tracker_record_cost(none, 999999999);
+    assert_eq(agnosai_budget_tracker_check(none), AGNOSAI_BUDGET_WITHIN,
+    "no matter how much is spent");
+
+    # a null budget is also unlimited rather than a crash
+    var nullb = agnosai_budget_tracker_new(0);
+    assert_eq(agnosai_budget_tracker_has_limits(nullb), 0, "a null budget has no limits");
+
+    # --- token_budget_enforced ---
+    var tt = agnosai_budget_tracker_new(_t_tokens(1000));
+    assert_eq(agnosai_budget_tracker_has_limits(tt), 1, "a token budget has limits");
+    assert_eq(agnosai_budget_tracker_check(tt), AGNOSAI_BUDGET_WITHIN, "and starts within");
+
+    agnosai_budget_tracker_record_tokens(tt, 500);
+    assert_eq(agnosai_budget_tracker_check(tt), AGNOSAI_BUDGET_WITHIN, "half spent is still within");
+    assert_eq(agnosai_budget_tracker_tokens_used(tt), 500, "and the counter tracks it");
+
+    agnosai_budget_tracker_record_tokens(tt, 500);
+    assert_eq(agnosai_budget_tracker_check(tt), AGNOSAI_BUDGET_TOKENS,
+    "reaching the limit EXACTLY already refuses — the test is >=, not >");
+    assert_eq(agnosai_budget_tracker_tokens_used(tt), 1000, "with the full amount recorded");
+
+    # one under the limit still passes, which pins the boundary from both sides
+    var edge = agnosai_budget_tracker_new(_t_tokens(1000));
+    agnosai_budget_tracker_record_tokens(edge, 999);
+    assert_eq(agnosai_budget_tracker_check(edge), AGNOSAI_BUDGET_WITHIN, "999 of 1000 passes");
+    agnosai_budget_tracker_record_tokens(edge, 1);
+    assert_eq(agnosai_budget_tracker_check(edge), AGNOSAI_BUDGET_TOKENS, "1000 of 1000 does not");
+
+    # a zero token budget refuses immediately
+    var zero = agnosai_budget_tracker_new(_t_tokens(0));
+    assert_eq(agnosai_budget_tracker_has_limits(zero), 1, "a zero limit is still a limit");
+    assert_eq(agnosai_budget_tracker_check(zero), AGNOSAI_BUDGET_TOKENS,
+    "and refuses before anything is spent, since 0 >= 0");
+
+    # --- cost_budget_enforced ---
+    # $0.50 = 500_000 micro-USD = 5000 cost units
+    var ct = agnosai_budget_tracker_new(_t_cost(500000));
+    assert_eq(agnosai_budget_tracker_max_cost_units(ct), 5000, "$0.50 is 5000 cost units");
+    assert_eq(agnosai_budget_tracker_check(ct), AGNOSAI_BUDGET_WITHIN, "and starts within");
+
+    agnosai_budget_tracker_record_cost(ct, 250000);
+    assert_eq(agnosai_budget_tracker_cost_units(ct), 2500, "half spent is 2500 units");
+    assert_eq(agnosai_budget_tracker_check(ct), AGNOSAI_BUDGET_WITHIN, "still within");
+
+    agnosai_budget_tracker_record_cost(ct, 250000);
+    assert_eq(agnosai_budget_tracker_check(ct), AGNOSAI_BUDGET_COST, "reaching it refuses");
+
+    # --- tokens are checked BEFORE cost ---
+    var both = agnosai_budget_tracker_new(agnosai_resource_budget_new(10, 1000,
+    AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT));
+    agnosai_budget_tracker_record_tokens(both, 10);
+    agnosai_budget_tracker_record_cost(both, 1000);
+    assert_eq(agnosai_budget_tracker_check(both), AGNOSAI_BUDGET_TOKENS,
+    "with both breached the token limit is reported, matching the oracle's order");
+
+    # --- tokens_used_accumulates ---
+    var acc = agnosai_budget_tracker_new(_t_tokens(AGNOSAI_NO_LIMIT));
+    agnosai_budget_tracker_record_tokens(acc, 100);
+    agnosai_budget_tracker_record_tokens(acc, 200);
+    assert_eq(agnosai_budget_tracker_tokens_used(acc), 300, "token usage accumulates");
+
+    # --- cost_usd_accumulates ---
+    # the oracle records 0.25 + 0.30 and expects 0.55
+    var cacc = agnosai_budget_tracker_new(_t_cost(AGNOSAI_NO_LIMIT));
+    agnosai_budget_tracker_record_cost(cacc, 250000);
+    agnosai_budget_tracker_record_cost(cacc, 300000);
+    assert_eq(agnosai_budget_tracker_cost_units(cacc), 5500, "cost accumulates in units");
+    _t_assert_f64(agnosai_budget_tracker_cost_usd(cacc),
+    f64_div(f64_from(55), f64_from(100)), "and reads back as $0.55");
+
+    # the ceil is per-record, not on the total — two 1-micro charges cost two
+    # units, which is the oracle's behaviour and slightly over-counts on purpose
+    var ceil_acc = agnosai_budget_tracker_new(_t_cost(AGNOSAI_NO_LIMIT));
+    agnosai_budget_tracker_record_cost(ceil_acc, 1);
+    agnosai_budget_tracker_record_cost(ceil_acc, 1);
+    assert_eq(agnosai_budget_tracker_cost_units(ceil_acc), 2,
+    "each record ceils on its own, so two sub-unit charges cost two units");
+
+    # --- budget_exceeded_display ---
+    var disp = agnosai_budget_tracker_new(_t_tokens(1000));
+    agnosai_budget_tracker_record_tokens(disp, 1500);
+    var msg = agnosai_budget_exceeded_message(disp, AGNOSAI_BUDGET_TOKENS);
+    assert(str_contains(msg, str_from("1500")) == 1, "the message names the amount used");
+    assert(str_contains(msg, str_from("1000")) == 1, "and the limit");
+    assert(str_eq(msg, str_from("token budget exceeded: 1500 used, 1000 limit")) == 1,
+    "in the oracle's exact wording");
+    assert_eq(agnosai_budget_exceeded_message(disp, AGNOSAI_BUDGET_WITHIN), 0,
+    "and there is no message when nothing is exceeded");
+
+    # --- the cost message renders four decimals, zero-padded ---
+    var cdisp = agnosai_budget_tracker_new(_t_cost(500000));
+    agnosai_budget_tracker_record_cost(cdisp, 750000);
+    assert(str_eq(agnosai_budget_exceeded_message(cdisp, AGNOSAI_BUDGET_COST),
+    str_from("cost budget exceeded: $0.7500 used, $0.5000 limit")) == 1,
+    "the cost message is the oracle's ${:.4} on both sides");
+
+    # a sub-cent amount must not render as $0.5 — the padding is load-bearing
+    var tiny = agnosai_budget_tracker_new(_t_cost(1000000));
+    agnosai_budget_tracker_record_cost(tiny, 500);
+    assert(str_contains(agnosai_budget_exceeded_message(tiny, AGNOSAI_BUDGET_COST),
+    str_from("$0.0005 used")) == 1, "5 units renders as $0.0005, not $0.5");
+
+    var whole = agnosai_budget_tracker_new(_t_cost(2000000));
+    agnosai_budget_tracker_record_cost(whole, 1000000);
+    assert(str_contains(agnosai_budget_exceeded_message(whole, AGNOSAI_BUDGET_COST),
+    str_from("$1.0000 used")) == 1, "and a whole dollar as $1.0000");
+
+    # --- the wire form keeps the 1/10000 unit ---
+    # This is why the module does not switch to micro-USD: the unit is what a
+    # consumer deserialises.
+    var wire = agnosai_budget_exceeded_to_value(cdisp, AGNOSAI_BUDGET_COST);
+    assert(str_eq(bayan_json_v_build(wire),
+    str_from("{\"Cost\":{\"used_units\":7500,\"limit_units\":5000}}")) == 1,
+    "the Cost arm is externally tagged and carries cost UNITS, not dollars or micro-USD");
+
+    var twire = agnosai_budget_exceeded_to_value(disp, AGNOSAI_BUDGET_TOKENS);
+    assert(str_eq(bayan_json_v_build(twire),
+    str_from("{\"Tokens\":{\"used\":1500,\"limit\":1000}}")) == 1,
+    "and the Tokens arm names its fields used/limit");
+
+    assert_eq(agnosai_budget_exceeded_to_value(disp, AGNOSAI_BUDGET_WITHIN), 0,
+    "a non-breach serialises to nothing");
+
+    # --- max_tokens accessor round-trips ---
+    assert_eq(agnosai_budget_tracker_max_tokens(tt), 1000, "the token limit is readable");
+    assert_eq(agnosai_budget_tracker_max_tokens(none), AGNOSAI_NO_LIMIT,
+    "and reads as unlimited when unset");
+    assert_eq(agnosai_budget_tracker_max_cost_units(none), AGNOSAI_NO_LIMIT,
+    "as does the cost limit");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
