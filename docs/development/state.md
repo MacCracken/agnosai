@@ -19,16 +19,16 @@ lands, not before, so the number always names something that actually shipped.
 
 - **Rust reference**: 27,683 lines at `rust-old/` — frozen, do not edit. It is the parity oracle.
 - **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers),
-  `llm` (router, retry, hoosh seam client + hub) and `tools` (native + registry so far), plus
-  `src/id.cyr`, `src/units.cyr` and `src/order.cyr`. `src/main.cyr` is still the stub entry
-  point — no CLI surface yet.
+  `llm` (router, retry, hoosh seam client + hub) and `tools` (native, registry, echo,
+  json_transform), plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr` and
+  `src/server_ssrf.cyr`. `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
 ## Where the port is
 
 Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **complete**: `learning` and
 `core` both ported and green against the oracle. Phase 2 (M3 `llm`) — **complete**: router, retry
 and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools`) —
-**native + registry done; remote_registry and the builtins next**.
+**native, registry and the basic builtins done; the remaining builtins next**.
 
 | Gate | Status |
 |---|---|
@@ -46,11 +46,12 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | Money representation decided | ✅ integer micro-USD (2026-07-28) — gates core BITE 8 |
 | `llm` ported (M3, Phase 2) | ✅ router + retry + hoosh seam client |
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
-| `tools` ported (M4, Phase 3) | 🟡 native + registry done; remote_registry + builtins next |
+| `tools` ported (M4, Phase 3) | 🟡 native + registry + echo/json_transform; 5 builtins + remote_registry left |
+| `server/ssrf` ported (M6 leaf, pulled forward) | ✅ two M4 modules gate on it — hardened against octal/hex/short-form bypasses |
 
 ## Tests
 
-**828 assertions across 17 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**946 assertions across 20 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -71,12 +72,14 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `llm_hoosh.tcyr` | 96 | — (replaces a `pub use` facade; no oracle tests) |
 | `tools_native.tcyr` | 67 | native.rs + registry.rs |
 | `order.tcyr` | 48 | — (Rust used `sort_unstable` / `select_nth_unstable`) |
+| `tools_builtin_basic.tcyr` | 37 | 6 (echo.rs + json_transform.rs) |
+| `server_ssrf.tcyr` | 81 | ~14 |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
 the Q-table's packed-key distinctness — none of which the Rust tests reach.
 
-`cyrius coverage --min 80` → **100% (406/406 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (413/413 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -187,12 +190,25 @@ kiran (game AI) — none consuming the Cyrius line yet.
 
 ## Next
 
-**Finish M4 — `tools`** ([`roadmap.md`](roadmap.md), Phase 3). native and the
-registry (with its mandatory mutex) are done; `remote_registry.rs` (119 lines)
-and `builtin/*` (2,379 lines across echo, json_transform, load_testing,
-security_audit, synapse, mneme, delta) remain. `builtin/load_testing.rs` is
-unblocked now that `src/order.cyr` exists. python_tool / wasm_tool / wasm_loader
-defer with their features.
+**Finish M4 — `tools`** ([`roadmap.md`](roadmap.md), Phase 3). native, the
+registry (with its mandatory mutex), and the two utility builtins are done.
+Remaining: `builtin/load_testing.rs` (364), `builtin/security_audit.rs` (519),
+`builtin/synapse.rs` (386), `builtin/mneme.rs` (442), `builtin/delta.rs` (471),
+and `remote_registry.rs` (119).
+
+**Both of load_testing's blockers are now cleared** — `src/order.cyr` for its
+100k percentile vector, and `src/server_ssrf.cyr` for its target-URL guard.
+`remote_registry.rs` is likewise unblocked, though its payload path (`.agpkg`
+ZIP + raw WASM) defers with those formats, so it can only deliver a guarded
+fetch. python_tool / wasm_tool / wasm_loader defer with their features.
+
+**`src/server_ssrf.cyr` was pulled forward from M6** because two M4 modules gate
+on `is_safe_url`; stubbing that guard twice would have been worse than porting
+it once. It is hardened past a literal reading of the oracle: the Rust side gets
+octal / hex / short-form / decimal-integer host normalisation free from the
+`url` crate's WHATWG parser (so `http://0177.0.0.1/` is caught), and a naive
+dotted-quad port would have classified every one of those as a hostname and let
+them through. See the module header.
 
 **Live testing.** `scripts/stack.sh` brings up the services agnosai needs
 (today: hoosh only) and `scripts/stack.sh check` drives

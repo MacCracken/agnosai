@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     mandatory rather than optional: `run_pooled` makes every worker its own OS thread, so an
     unguarded write during a concurrent read would corrupt the table. Schema callbacks run
     outside the lock, since a tool's `schema_fp` is arbitrary user code.
+- **tools_builtin_basic** — the `echo` and `json_transform` builtins, registering through the
+  registry and gated by the allow-list. `echo` returns the whole JSON value rather than a string,
+  matching the oracle's `Value` clone.
+- **server_ssrf** — `agnosai_is_safe_url` / `agnosai_is_private_host` / `agnosai_is_private_ipv4`
+  / `agnosai_is_private_ipv6`. **Pulled forward from M6** because two M4 modules gate on it
+  (`builtin/load_testing.rs` and `remote_registry.rs` both guard their outbound request with it).
+  Hardened past a literal reading of the oracle: Rust gets octal / hex / short-form /
+  decimal-integer host normalisation free from the `url` crate's WHATWG parser, so
+  `http://0177.0.0.1/`, `http://0x7f000001/`, `http://2130706433/` and `http://127.1/` all resolve
+  to loopback before the private-range check runs. A naive dotted-quad port would have classified
+  every one of those as a hostname and let them through — the classic SSRF bypass. The trigger for
+  the permissive parse is an all-numeric final label, which RFC 1123 forbids in a real domain, and
+  a host that must be an address literal but will not parse as one fails closed.
 - **order** — `agnosai_sort` (iterative in-place heapsort) and `agnosai_select_nth` (Hoare
   quickselect, median-of-3), plus `agnosai_percentile_i64`. **This closes port plan blocker #8**
   and a standing Phase 0 gate. Rust had `sort_unstable` / `select_nth_unstable`; Cyrius's stdlib

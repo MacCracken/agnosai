@@ -111,7 +111,16 @@ thread), remote_registry, builtin/*. Defers python_tool/wasm_tool.
 - ✅ **blocker #8 closed** — `src/order.cyr` lands heapsort + quickselect ahead
   of `builtin/load_testing.rs`, which needs them for its 100k percentile vector.
   Benchmarked; see state.md.
-- ⬜ **remote_registry + builtin/\*** next (119 + 2,379 lines).
+- ✅ **echo + json_transform** — 37 assertions, registering and dispatching
+  through the registry.
+- ✅ **`server/ssrf` pulled forward from M6** — `builtin/load_testing.rs` and
+  `remote_registry.rs` both gate on `is_safe_url`, so it was port-once rather
+  than stub-twice. 81 assertions, weighted toward the bypass classes.
+- ⬜ **remaining builtins** (load_testing 364, security_audit 519, synapse 386,
+  mneme 442, delta 471) and **remote_registry** (119). load_testing's two
+  blockers — `order` for percentiles, `ssrf` for its URL guard — are both
+  cleared. remote_registry's payload path (`.agpkg` ZIP + raw WASM) defers with
+  those formats, so it can only deliver a guarded fetch.
 
 ### M5 — `orchestrator` (Phase 4)
 

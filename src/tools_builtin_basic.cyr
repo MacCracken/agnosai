@@ -1,0 +1,107 @@
+# =========================================================================
+# tools_builtin_basic — the echo and json_transform built-in tools.
+#
+# Parity oracles: rust-old/src/tools/builtin/echo.rs and
+# rust-old/src/tools/builtin/json_transform.rs
+#
+# These are the two utility builtins. They are small, but they are the ones
+# that prove the whole tool path end to end — vtable dispatch, parameter
+# extraction, and the ok/err output contract — so their behaviour is pinned
+# tightly rather than loosely.
+#
+# Port note: both are unit structs in the oracle (`pub struct EchoTool;`) with
+# the behaviour on the trait impl. Here each is a pair of free functions plus a
+# constructor that binds them into a tool vtable, with `ctx` unused (0). That is
+# the direct translation of a zero-sized type implementing a trait.
+#
+# A detail worth keeping: **echo returns the whole JSON value**, not a string.
+# The oracle does `input.parameters.get("message")` and clones the `Value`, so
+# echoing `{"a":1}` returns the object, not `"[object]"`. Narrowing that to a
+# string would be a silent behaviour change.
+# =========================================================================
+
+# The echo tool's parameter schema.
+fn _agnosai_echo_schema(ctx): i64 {
+    var s = agnosai_tool_schema_new(str_from("echo"),
+    str_from("Returns the input message unchanged. Useful for testing."));
+    agnosai_tool_schema_param(s, str_from("message"), str_from("The message to echo back"),
+    str_from("string"), 1);
+    return s;
+}
+
+# Echo the `message` parameter back verbatim, whatever its JSON type.
+fn _agnosai_echo_execute(ctx, input): i64 {
+    var value = agnosai_tool_input_get(input, str_from("message"));
+    if (value == 0) {
+        return agnosai_tool_output_err(str_from("missing required parameter: message"));
+    }
+    return agnosai_tool_output_ok(value);
+}
+
+# The echo tool — returns its `message` parameter unchanged.
+fn agnosai_echo_tool(): i64 {
+    return agnosai_tool_new(str_from("echo"),
+    str_from("Returns the input message unchanged. Useful for testing."),
+    &_agnosai_echo_schema, &_agnosai_echo_execute, 0);
+}
+
+# The json_transform tool's parameter schema.
+fn _agnosai_json_transform_schema(ctx): i64 {
+    var s = agnosai_tool_schema_new(str_from("json_transform"),
+    str_from("Extracts a named field from a JSON object."));
+    agnosai_tool_schema_param(s, str_from("data"), str_from("The JSON object to extract from"),
+    str_from("object"), 1);
+    agnosai_tool_schema_param(s, str_from("field"), str_from("The name of the field to extract"),
+    str_from("string"), 1);
+    return s;
+}
+
+# Extract a named top-level field from the `data` object.
+#
+# The three failure modes are the oracle's, in its order and with its wording:
+# a missing `data`, a missing-or-non-string `field`, and a field absent from
+# the object. The last one names the field, because a tool that says only
+# "not found" is unusable in an agent transcript.
+fn _agnosai_json_transform_execute(ctx, input): i64 {
+    var data = agnosai_tool_input_get(input, str_from("data"));
+    if (data == 0) {
+        return agnosai_tool_output_err(str_from("missing required parameter: data"));
+    }
+    var field = agnosai_tool_input_get_str(input, str_from("field"));
+    if (field == 0) {
+        return agnosai_tool_output_err(
+        str_from("missing required parameter: field (must be a string)"));
+    }
+
+    if (bayan_json_v_is_obj(data) == 0) {
+        return _agnosai_field_not_found(field);
+    }
+    var value = bayan_json_v_obj_get(data, str_cstr(field));
+    if (value == 0) {
+        return _agnosai_field_not_found(field);
+    }
+    return agnosai_tool_output_ok(value);
+}
+
+# The oracle's "field '<name>' not found in data" error.
+fn _agnosai_field_not_found(field: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "field '");
+    str_builder_add(sb, field);
+    str_builder_add_cstr(sb, "' not found in data");
+    return agnosai_tool_output_err(str_builder_build(sb));
+}
+
+# The json_transform tool — extracts a named field from a JSON object.
+fn agnosai_json_transform_tool(): i64 {
+    return agnosai_tool_new(str_from("json_transform"),
+    str_from("Extracts a named field from a JSON object."),
+    &_agnosai_json_transform_schema, &_agnosai_json_transform_execute, 0);
+}
+
+# Register every built-in tool in this module. Returns the registry.
+fn agnosai_register_basic_builtins(registry): i64 {
+    agnosai_tool_registry_register(registry, agnosai_echo_tool());
+    agnosai_tool_registry_register(registry, agnosai_json_transform_tool());
+    return registry;
+}

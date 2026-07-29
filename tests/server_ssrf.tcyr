@@ -1,0 +1,176 @@
+# =========================================================================
+# server_ssrf.tcyr — parity tests for src/server_ssrf.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/server/ssrf.rs.
+#
+# This is a security boundary, so the bypass classes get more attention than
+# the happy path. The octal / hex / short-form / decimal-integer spellings of
+# 127.0.0.1 are the classic SSRF evasions; the oracle is protected from them
+# by the `url` crate's WHATWG host parser, and this port has to earn that
+# protection explicitly.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/core_error.cyr"
+include "src/llm_retry.cyr"
+include "src/server_ssrf.cyr"
+include "tests/test_helpers.cyr"
+
+# Assert a URL is accepted.
+fn _t_safe(url, name): i64 {
+    return assert_eq(agnosai_is_safe_url(str_from(url)), 1, name);
+}
+
+# Assert a URL is rejected.
+fn _t_unsafe(url, name): i64 {
+    return assert_eq(agnosai_is_safe_url(str_from(url)), 0, name);
+}
+
+# Assert a bare host is judged private.
+fn _t_private_host(host, name): i64 {
+    return assert_eq(agnosai_is_private_host(str_from(host)), 1, name);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("server_ssrf");
+
+    # --- safe_url_accepts_public_http(s) ---
+    _t_safe("https://example.com", "public https");
+    _t_safe("https://example.com/path?q=1", "public https with path and query");
+    _t_safe("http://example.com", "public http");
+    _t_safe("https://example.com:8443/x", "public https on a non-default port");
+    _t_safe("http://8.8.8.8", "a public IPv4 literal");
+    _t_safe("http://[2001:4860:4860::8888]", "a public IPv6 literal");
+
+    # --- safe_url_rejects_non_http_schemes ---
+    _t_unsafe("ftp://example.com", "ftp is rejected");
+    _t_unsafe("file:///etc/passwd", "file is rejected");
+    _t_unsafe("gopher://example.com", "gopher is rejected");
+    _t_unsafe("ssh://example.com", "ssh is rejected");
+
+    # --- safe_url_rejects_invalid_url ---
+    _t_unsafe("not a url", "a non-URL is rejected");
+    _t_unsafe("", "an empty string is rejected");
+    _t_unsafe("http://", "a URL with no host is rejected");
+
+    # --- localhost and internal names ---
+    _t_unsafe("http://localhost", "localhost");
+    _t_unsafe("http://localhost:8080/tool.wasm", "localhost with a port");
+    _t_unsafe("http://LOCALHOST", "LOCALHOST is case-insensitive");
+    _t_unsafe("http://foo.local", ".local suffix");
+    _t_unsafe("http://foo.internal", ".internal suffix");
+    _t_unsafe("http://foo.localhost", ".localhost suffix");
+    _t_unsafe("http://API.INTERNAL", ".INTERNAL is case-insensitive");
+
+    # --- private IPv4 ranges ---
+    _t_unsafe("http://127.0.0.1", "loopback");
+    _t_unsafe("http://127.1.2.3", "the whole 127/8 is loopback");
+    _t_unsafe("http://10.0.0.1", "10/8");
+    _t_unsafe("http://192.168.1.1/tool.wasm", "192.168/16");
+    _t_unsafe("http://172.16.0.1", "172.16/12 lower bound");
+    _t_unsafe("http://172.31.255.255", "172.16/12 upper bound");
+    _t_unsafe("http://169.254.1.1", "link-local");
+    _t_unsafe("http://169.254.169.254/latest/meta-data/", "the cloud metadata endpoint");
+    _t_unsafe("http://0.0.0.0", "unspecified");
+    _t_unsafe("http://0.1.2.3", "the whole 0/8");
+
+    # 172.15 and 172.32 are OUTSIDE the private block and must stay reachable
+    _t_safe("http://172.15.0.1", "172.15 is public, just below the private block");
+    _t_safe("http://172.32.0.1", "172.32 is public, just above the private block");
+    _t_safe("http://11.0.0.1", "11/8 is public");
+    _t_safe("http://192.169.0.1", "192.169 is public");
+
+    # --- the bypass classes: alternative spellings of 127.0.0.1 ---
+    # The oracle gets these from the url crate's WHATWG host parser. A strict
+    # dotted-quad parser would call them hostnames and let every one through.
+    _t_unsafe("http://0177.0.0.1", "octal-encoded loopback");
+    _t_unsafe("http://0x7f.0.0.1", "hex-encoded first octet");
+    _t_unsafe("http://0x7f000001", "fully hex-encoded loopback");
+    _t_unsafe("http://2130706433", "decimal-integer loopback");
+    _t_unsafe("http://127.1", "two-part short-form loopback");
+    _t_unsafe("http://127.0.1", "three-part short-form loopback");
+    # 010 is octal 8, so this really is 8.0.0.1 — a PUBLIC address. Reading it
+    # as decimal 10 (and rejecting it as 10/8) would be the mirror-image bug to
+    # the one the permissive parser exists to prevent.
+    _t_safe("http://010.0.0.1", "octal 010 is 8, so 010.0.0.1 is public 8.0.0.1");
+    _t_unsafe("http://0300.0250.0.1", "octal-encoded 192.168.0.1");
+    _t_unsafe("http://3232235777", "decimal-integer 192.168.1.1");
+    _t_unsafe("http://127.0.0.1.", "a trailing dot does not evade the check");
+
+    # a host whose last label is numeric but which is not a parseable address
+    # fails CLOSED rather than being treated as a name
+    _t_unsafe("http://1.2.3.4.5", "five numeric parts is not an address and is rejected");
+    _t_unsafe("http://999.999.999.999", "out-of-range octets are rejected");
+    _t_unsafe("http://0x", "a bare 0x prefix is rejected");
+
+    # a public address in decimal-integer form is still allowed — the rule is
+    # "parse it", not "reject everything numeric"
+    _t_safe("http://134744072", "decimal-integer 8.8.8.8 is public and allowed");
+
+    # --- private IPv6 ---
+    _t_unsafe("http://[::1]", "IPv6 loopback");
+    _t_unsafe("http://[::]", "IPv6 unspecified");
+    _t_unsafe("http://[fc00::1]", "fc00::/7 unique-local");
+    _t_unsafe("http://[fd12:3456::1]", "fd is inside fc00::/7");
+    _t_unsafe("http://[fe80::1]", "fe80::/10 link-local");
+    _t_unsafe("http://[::ffff:10.0.0.1]", "IPv4-mapped private address");
+    _t_unsafe("http://[::ffff:127.0.0.1]", "IPv4-mapped loopback");
+    _t_safe("http://[::ffff:8.8.8.8]", "IPv4-mapped public address is allowed");
+    _t_safe("http://[2001:db8::1]", "a documentation-range IPv6 is not private");
+    _t_safe("http://[fe00::1]", "fe00 is outside both fc00::/7 and fe80::/10");
+
+    # --- is_private_ipv4 directly ---
+    assert_eq(agnosai_is_private_ipv4((10 << 24)), 1, "10.0.0.0 is private");
+    assert_eq(agnosai_is_private_ipv4((127 << 24) | 1), 1, "127.0.0.1 is loopback");
+    assert_eq(agnosai_is_private_ipv4((172 << 24) | (16 << 16)), 1, "172.16.0.0 is private");
+    assert_eq(agnosai_is_private_ipv4((172 << 24) | (15 << 16)), 0, "172.15.0.0 is public");
+    assert_eq(agnosai_is_private_ipv4((172 << 24) | (32 << 16)), 0, "172.32.0.0 is public");
+    assert_eq(agnosai_is_private_ipv4((192 << 24) | (168 << 16)), 1, "192.168.0.0 is private");
+    assert_eq(agnosai_is_private_ipv4((169 << 24) | (254 << 16) | (169 << 8) | 254), 1,
+    "the metadata address is private");
+    assert_eq(agnosai_is_private_ipv4(0), 1, "0.0.0.0 is unspecified");
+    assert_eq(agnosai_is_private_ipv4((8 << 24) | (8 << 16) | (8 << 8) | 8), 0, "8.8.8.8 is public");
+
+    # --- is_private_ipv6 directly, on raw segment arrays ---
+    var segs: i64[8];
+    for (var z = 0; z < 8; z = z + 1) { store64(&segs + z * 8, 0); }
+    assert_eq(agnosai_is_private_ipv6(&segs), 1, ":: unspecified is private");
+    store64(&segs + 7 * 8, 1);
+    assert_eq(agnosai_is_private_ipv6(&segs), 1, "::1 loopback is private");
+
+    for (var y = 0; y < 8; y = y + 1) { store64(&segs + y * 8, 0); }
+    store64(&segs, 64512);
+    assert_eq(agnosai_is_private_ipv6(&segs), 1, "fc00:: is unique-local");
+    store64(&segs, 65152);
+    assert_eq(agnosai_is_private_ipv6(&segs), 1, "fe80:: is link-local");
+    store64(&segs, 65024);
+    assert_eq(agnosai_is_private_ipv6(&segs), 0, "fe00:: is neither");
+    store64(&segs, 8193);
+    assert_eq(agnosai_is_private_ipv6(&segs), 0, "2001:: is public");
+
+    # --- is_private_host on bare hosts ---
+    _t_private_host("127.0.0.1", "bare loopback host");
+    _t_private_host("::1", "bare IPv6 loopback host");
+    _t_private_host("", "an empty host fails closed");
+    assert_eq(agnosai_is_private_host(str_from("example.com")), 0, "a real hostname is not private");
+    assert_eq(agnosai_is_private_host(str_from("8.8.8.8")), 0, "a public literal is not private");
+
+    # a hostname whose last label is alphabetic is never parsed as an address,
+    # even when every earlier label is numeric
+    assert_eq(agnosai_is_private_host(str_from("127.0.0.com")), 0,
+    "an alphabetic final label stays a hostname");
+
+    # --- request-splitting characters are rejected by the parser ---
+    _t_unsafe("http://example.com/\r\nX-Injected: 1", "CRLF in a URL is rejected");
+    _t_unsafe("http://exa mple.com", "a space in a URL is rejected");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
