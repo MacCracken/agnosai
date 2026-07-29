@@ -21,15 +21,15 @@ lands, not before, so the number always names something that actually shipped.
 - **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers),
   `llm` (router, retry, hoosh seam client + hub) and `tools` (native, registry, echo,
   json_transform, load_testing, security_audit, and the nine AGNOS ecosystem tools over a
-  shared client), plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr` and
-  `src/server_ssrf.cyr`. `src/main.cyr` is still the stub entry point — no CLI surface yet.
+  shared client), `tools/remote_registry`, plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr`,
+  `src/server_ssrf.cyr` and `src/guarded_fetch.cyr`. `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
 ## Where the port is
 
 Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **complete**: `learning` and
 `core` both ported and green against the oracle. Phase 2 (M3 `llm`) — **complete**: router, retry
 and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools`) —
-**every builtin done — only `remote_registry` is left**.
+**complete**.
 
 | Gate | Status |
 |---|---|
@@ -47,14 +47,15 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | Money representation decided | ✅ integer micro-USD (2026-07-28) — gates core BITE 8 |
 | `llm` ported (M3, Phase 2) | ✅ router + retry + hoosh seam client |
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
-| `tools` ported (M4, Phase 3) | 🟡 all 12 builtins done (echo, json_transform, load_testing, security_audit, 3x synapse, 3x mneme, 3x delta); remote_registry left |
+| `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
+| ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
 | `server/ssrf` ported (M6 leaf, pulled forward) | ✅ two M4 modules gate on it — hardened against octal/hex/short-form bypasses |
 
 ## Tests
 
-**1365 assertions across 23 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**1446 assertions across 24 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -80,6 +81,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools_builtin_load_testing.tcyr` | 88 | 2 (both drive an axum mock server — see below) |
 | `tools_builtin_security_audit.tcyr` | 200 | 8 (5 of them drive an axum mock server) |
 | `tools_agnos.tcyr` | 140 | 27 across synapse + mneme + delta (schemas only — see below) |
+| `tools_remote_registry.tcyr` | 77 | 3 (one asserts a constant; the other two are the SSRF arm) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -111,7 +113,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (498/498 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (513/513 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -252,11 +254,24 @@ kiran (game AI) — none consuming the Cyrius line yet.
 
 ## Next
 
-**Finish M4 — `tools`** ([`roadmap.md`](roadmap.md), Phase 3). native, the
-registry (with its mandatory mutex), the two utility builtins and load_testing
-are done. Remaining: `builtin/security_audit.rs` (519), `builtin/synapse.rs`
-(386), `builtin/mneme.rs` (442), `builtin/delta.rs` (471), and
-`remote_registry.rs` (119).
+**M4 — `tools` is complete.** native, the registry (with its mandatory mutex),
+all twelve builtins and remote_registry are ported, and every one of the
+oracle's execute paths that needed a live server is covered here through a
+transport seam.
+
+**Next: M5 — `orchestrator`** ([`roadmap.md`](roadmap.md), Phase 4). Its gate,
+port-plan blocker #4, is **cleared**: `chan_try_send` is present in cyrius
+6.4.86, having shipped in 6.4.84, so the crew-event fan-out can have the
+overwrite-oldest semantics tokio's broadcast gave the oracle.
+
+**The one open upstream dependency is blocker #3, and it gates M6, not M5.**
+sandhi still exposes no `_a`-threaded router dispatch — verified against 6.4.86:
+zero hits for `sandhi_router_dispatch_a` / `sandhi_server_router_handler_a`. The
+agnosai-side mitigation is proven three times over now (`load_testing`'s
+per-worker arenas, `security_audit`'s per-hop reset, `tools_agnos`'s
+per-exchange arena), so M6 is degraded rather than stopped if nothing lands —
+but the one path we cannot mitigate is sandhi's own dispatch. **This has never
+been filed with sandhi**; the ask exists only in this repo's port plan.
 
 **`load_testing` is the first production user of the port plan's blocker #3
 arena pattern.** One OS thread per simulated user (a load generator that ran

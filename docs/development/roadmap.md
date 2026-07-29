@@ -98,11 +98,14 @@ llm **defines** the types orchestrator consumes, so it lands early.
   belongs to M9; `inference_queue.rs` is llm's, `majra`-gated, and genuinely
   zero-consumer.
 
-### M4 — `tools` (Phase 3)
+### M4 — `tools` (Phase 3) — ✅ **COMPLETE**
 
 native, registry (+ mandatory registry mutex — `run_pooled` makes every worker a
 thread), remote_registry, builtin/*. Defers python_tool/wasm_tool.
-**Exit:** 94 of 115 tests green.
+**Exit:** 94 of 115 tests green — met and exceeded; the Cyrius suites carry 1446
+assertions across 24 files, and every execute path that the Rust suites left
+untested (because it needed a live server) is covered here through a transport
+seam.
 
 - ✅ **native + registry done** — 67 assertions. Two forced shape changes, both
   documented in-module: the `NativeTool` trait becomes a function-pointer vtable
@@ -138,10 +141,15 @@ thread), remote_registry, builtin/*. Defers python_tool/wasm_tool.
   a service running, which the oracle's own suites never manage. These are the
   one tool family that must **not** run the SSRF guard — they target loopback
   services by design, and the guard would reject all three default base URLs.
-- ⬜ **remote_registry** (119) — the last M4 unit. ADR 007 applies: it fetches a
-  caller-influenced URL, so the guard must re-run per redirect hop there too.
-  Its payload path (`.agpkg` ZIP + raw WASM) defers with those formats, so it
-  can only deliver a guarded fetch. remote_registry's payload path
+- ✅ **remote_registry** — 77 assertions. **A complete port, not a partial
+  one:** the oracle's doc comment promises `.agpkg` ZIP and WASM handling plus
+  registration, but the file contains none of it and is `pub mod` with zero
+  consumers. Nothing defers with those formats here — there was never any
+  behaviour to defer. ADR 007 applies and mattered more than it did in
+  security_audit, since this fetches a payload the doc intends to become
+  executable: the guard now re-runs on every redirect hop via the shared
+  `src/guarded_fetch.cyr`, extracted from security_audit at this second
+  consumer rather than left as a copy. remote_registry's payload path
   (`.agpkg` ZIP + raw WASM) defers with those formats, so it can only deliver a
   guarded fetch.
 

@@ -125,6 +125,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the parameter's own description says "defaults to main", but the oracle inserts nothing and the
   code is what ships. Guard order is the oracle's array order, so with both `owner` and `repo`
   invalid it is `owner` that is named.
+- **guarded_fetch** — the shared implementation of
+  [ADR 007](docs/adr/007-audit-redirect-revalidation.md): an HTTP fetch that re-runs
+  `agnosai_is_safe_url` on **every redirect hop**, refuses an https→http downgrade, fails closed
+  on a `Location` it cannot resolve confidently, and bounds the whole chain by one deadline
+  rather than re-arming per hop. Extracted from `tools_builtin_security_audit` at the **second**
+  instance rather than the third, deliberately: two copies of a security control drift, and the
+  drift is silent. `tools_remote_registry` is the second consumer, and the ADR named it when it
+  was written. The 200 security_audit assertions pass unchanged across the move.
+- **tools_remote_registry** — `agnosai_fetch_package`: an SSRF-guarded GET with the oracle's
+  10 MB cap and 30s timeout, returning size, content type and bytes.
+
+  **The oracle's module doc overstates the oracle.** It claims the module "fetches `.agpkg` ZIP
+  bundles or raw WASM modules … validates them, and registers the contained tools in the
+  `ToolRegistry`". The file contains no ZIP reader, no WASM parser and no registration, and it is
+  `pub mod` with zero consumers anywhere in the Rust tree. So this is a **complete** port of the
+  unit, not one waiting on `.agpkg` and WASM support — those formats gate the unwritten half of a
+  doc comment, not any behaviour that exists to be matched. The roadmap's "can only deliver a
+  guarded fetch" was right about the outcome and wrong about the reason.
+
+  Both of the oracle's size checks are reproduced — the `Content-Length` pre-check and the
+  post-download check against what actually arrived — because the second exists precisely to catch
+  a server that under-declares. `content_type` keeps `Option<String>` semantics: absent is 0,
+  which stays distinct from an empty value. Two divergences, both documented in-module: `HTTP 404`
+  rather than the oracle's `HTTP 404 Not Found`, since sandhi carries the code but not the reason
+  phrase and inventing a reason table would be guessing at what the server sent; and the response
+  cap is set one byte above the package limit so that an exactly-10 MB package — which the
+  oracle accepts, its check being `>` — is not turned into a transport error by sandhi.
 - **server_ssrf** — `agnosai_is_safe_url` / `agnosai_is_private_host` / `agnosai_is_private_ipv4`
   / `agnosai_is_private_ipv6`. **Pulled forward from M6** because two M4 modules gate on it
   (`builtin/load_testing.rs` and `remote_registry.rs` both guard their outbound request with it).

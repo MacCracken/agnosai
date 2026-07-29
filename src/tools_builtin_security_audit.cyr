@@ -24,6 +24,10 @@
 # (subtracting 15 or 5, clamping, the `* 100.0 .round() / 100.0` pass) preserves
 # integrality, so an f64 carrier would buy nothing and could only drift.
 #
+# The redirect follower this uses lives in `src/guarded_fetch.cyr`, shared with
+# `tools_remote_registry` — see [ADR 007](../docs/adr/007-audit-redirect-revalidation.md).
+# It re-runs the SSRF guard on every hop, which the oracle never does.
+#
 # Port note on header lookup: sandhi's `sandhi_headers_get` / `_has` are already
 # case-insensitive, matching the `HeaderMap` semantics the oracle relies on. But
 # sandhi header names and values are **C strings**, not `Str` — the same hazard
@@ -94,15 +98,6 @@ var AGNOSAI_AUDIT_MAX_BYTES = 2097152;
 # instead would make the requirement scale with hop count: at 10 hops across two
 # chains that is 22 exchanges, and the fourth would already have failed.
 var AGNOSAI_AUDIT_ARENA_BYTES = 2621440;
-
-# Redirect hop limit — reqwest's default, which is what the oracle inherits.
-var AGNOSAI_AUDIT_MAX_HOPS = 10;
-
-# Returned instead of a result when a redirect pointed somewhere the SSRF guard
-# refuses. Distinguished from 0 (the request simply failed) because the two
-# deserve different error messages: one is a network problem, the other is an
-# attempted bypass and should read like one.
-var AGNOSAI_AUDIT_REDIRECT_BLOCKED = 0 - 1;
 
 # The tool description, used by both the schema and the tool itself. The oracle
 # reads it from `description()` in both places; duplicating the literal would be
@@ -178,21 +173,6 @@ fn _agnosai_audit_cstr_ieq(a, b): i64 {
         i = i + 1;
     }
     return 0;
-}
-
-# Case-insensitive ASCII compare of the first `n` bytes of two C strings.
-#
-# The bounded sibling of `_agnosai_audit_cstr_ieq`, for prefix tests where the
-# left side is a URL that continues past the prefix.
-fn _agnosai_audit_cstr_ieq_n(a, b, n): i64 {
-    for (var i = 0; i < n; i = i + 1) {
-        var ca = load8(a + i) & 255;
-        var cb = load8(b + i) & 255;
-        if (ca >= 65 && ca <= 90) { ca = ca + 32; }
-        if (cb >= 65 && cb <= 90) { cb = cb + 32; }
-        if (ca != cb) { return 0; }
-    }
-    return 1;
 }
 
 # Round `count * 100 / max` to the nearest whole percent, half away from zero.
@@ -643,166 +623,6 @@ fn _agnosai_audit_options(): i64 {
     return opts;
 }
 
-# Length of the URL's scheme prefix — 7 for `http://`, 8 for `https://`, 0 for
-# anything else — compared **case-insensitively**.
-#
-# It has to be case-insensitive because `sandhi_url_parse` is (via
-# `_sandhi_url_sceq`), and therefore so is `agnosai_is_safe_url`. A byte-exact
-# test here against a guard that accepts `HTTPS://` is a hole, not a nicety:
-# it would skip the downgrade refusal below, and slice the origin one byte short
-# so that a relative `Location` resolved against `HTTPS://example.com/` produced
-# a URL pointing at an entirely different host.
-#
-# Deliberately NOT used by the `starts_with("https://")` test in
-# `agnosai_audit_analyze` — the oracle's own HTTPS recommendation is byte-exact
-# (`!target_url.starts_with("https://")`), so an upper-case scheme is told to
-# enforce HTTPS there. That is the oracle's behaviour and parity wins over
-# tidiness on a cosmetic recommendation. Here it is a security control.
-fn _agnosai_audit_scheme_len(url: Str): i64 {
-    if (str_len(url) < 7) { return 0; }
-    var d = str_data(url);
-    if (_agnosai_audit_cstr_ieq_n(d, "https://", 8) == 1) { return 8; }
-    if (_agnosai_audit_cstr_ieq_n(d, "http://", 7) == 1) { return 7; }
-    return 0;
-}
-
-# Whether the URL's scheme is https, case-insensitively.
-fn _agnosai_audit_is_https(url: Str): i64 {
-    if (_agnosai_audit_scheme_len(url) == 8) { return 1; }
-    return 0;
-}
-
-# The redirect statuses, per RFC 9110. Same set sandhi's own follower uses.
-fn _agnosai_audit_is_redirect(status): i64 {
-    if (status == 301) { return 1; }
-    if (status == 302) { return 1; }
-    if (status == 303) { return 1; }
-    if (status == 307) { return 1; }
-    if (status == 308) { return 1; }
-    return 0;
-}
-
-# Resolve a `Location` value against the URL it came from, returning an absolute
-# URL or 0 when it cannot be resolved with confidence.
-#
-# This handles the two forms that matter — an absolute URL, and an absolute path
-# resolved against the base's authority — and **fails closed on everything
-# else**. A relative reference like `../admin` needs real RFC 3986 path merging,
-# and for a security tool "report what we already have" is a much better answer
-# than "guess where that pointed and send a request there".
-#
-# The result is built through a str_builder, so it is a fresh copy rather than a
-# borrow of the response arena.
-fn _agnosai_audit_resolve_location(base: Str, location): i64 {
-    var loc = str_from(location);
-    if (str_len(loc) == 0) { return 0; }
-    if (_agnosai_audit_scheme_len(loc) > 0) { return str_clone(loc); }
-
-    # Anything that is not an absolute path is refused rather than guessed at.
-    if (str_starts_with(loc, str_from("/")) == 0) { return 0; }
-    # A protocol-relative "//host/path" carries its own authority, so it is not
-    # the same-origin case this branch handles.
-    if (str_starts_with(loc, str_from("//")) == 1) { return 0; }
-
-    # The base's origin is its prefix up to the first '/', '?' or '#' after the
-    # scheme separator. Taken as raw bytes rather than through
-    # `sandhi_url_parse`, deliberately: that struct stores the scheme as an
-    # integer code rather than text, and defaults an absent port to 80 or 443
-    # rather than leaving it unset — so reassembling from it would both need a
-    # code-to-text mapping and would rewrite `https://example.com/` into
-    # `https://example.com:443/`. Slicing the original keeps the authority
-    # byte-for-byte as the caller wrote it.
-    var p = _agnosai_audit_scheme_len(base);
-    if (p == 0) { return 0; }
-    var data = str_data(base);
-    var n = str_len(base);
-    var origin_end = n;
-    for (var i = p; i < n; i = i + 1) {
-        var c = load8(data + i);
-        if (c == 47 || c == 63 || c == 35) { origin_end = i; break; }
-    }
-
-    var sb = str_builder_new();
-    for (var b = 0; b < origin_end; b = b + 1) { str_builder_add_byte(sb, load8(data + b)); }
-    str_builder_add(sb, loc);
-    return str_builder_build(sb);
-}
-
-# Issue a request, following redirects and **re-running the SSRF guard on every
-# hop**.
-#
-# This is the one place the port deliberately does not do what the oracle does,
-# and it diverges in both directions at once — see docs/adr/007.
-#
-# reqwest follows up to 10 redirects by default, so the oracle follows them; but
-# it validates only the URL the caller supplied. A target that passes
-# `is_safe_url` and then answers `302 Location: http://169.254.169.254/` walks
-# the oracle straight into the cloud metadata service and reports its headers
-# back to the caller. That is the textbook SSRF-via-redirect bypass, and it is a
-# hole in a tool whose entire job is to find holes.
-#
-# sandhi's default is the opposite — `sandhi_http_options_new` leaves following
-# off — and simply inheriting that would be no better, just differently wrong:
-# auditing `http://example.com` when it redirects to HTTPS would score the
-# redirect's own (header-free) response and report a well-configured site as
-# 0/7, critical risk.
-#
-# So the hops are followed, and the guard runs against each one before the
-# request is made. An https -> http downgrade is refused for the same reason
-# sandhi refuses it: the audit must not be talked down onto a cleartext channel.
-#
-# The 15s budget spans the **whole chain**, not each hop. reqwest's
-# `Client::timeout` is one deadline covering a request and every redirect it
-# follows, so giving each hop a fresh 15s would let an 11-hop chain run for 165
-# seconds against the oracle's 15 — and the audit makes two such chains.
-# `total_ms` is rewritten from the remaining budget before every request.
-#
-# `headers` must be owned outside the arena: it is reused across hops, and the
-# arena is reset between them.
-#
-# Returns the final response, 0 if a request failed or the budget ran out, or
-# AGNOSAI_AUDIT_REDIRECT_BLOCKED if a hop was refused.
-fn _agnosai_audit_fetch(arena, method, url: Str, headers, opts): i64 {
-    var current = url;
-    var verb = method;
-    var hops = 0;
-    var deadline = clock_now_ns() + AGNOSAI_AUDIT_TIMEOUT_MS * AGNOSAI_NS_PER_MS;
-
-    while (hops <= AGNOSAI_AUDIT_MAX_HOPS) {
-        var left_ms = (deadline - clock_now_ns()) / AGNOSAI_NS_PER_MS;
-        if (left_ms <= 0) { return 0; }
-        sandhi_http_options_total_ms(opts, left_ms);
-
-        var r = sandhi_http_request_auto_a(arena, verb, str_cstr(current), headers, 0, 0, opts);
-        if (r == 0 || sandhi_http_err_kind(r) != SANDHI_OK) { return 0; }
-        if (_agnosai_audit_is_redirect(sandhi_http_status(r)) == 0) { return r; }
-
-        var loc = sandhi_headers_get(sandhi_http_headers(r), "Location");
-        if (loc == 0) { return r; }
-        var next = _agnosai_audit_resolve_location(current, loc);
-        if (next == 0) { return r; }
-
-        # Refuse to be downgraded off TLS mid-audit.
-        if (_agnosai_audit_is_https(current) == 1 && _agnosai_audit_is_https(next) == 0) {
-            return AGNOSAI_AUDIT_REDIRECT_BLOCKED;
-        }
-        # The guard, on every hop. This is the check the oracle never makes.
-        if (agnosai_is_safe_url(next) == 0) { return AGNOSAI_AUDIT_REDIRECT_BLOCKED; }
-
-        # A 303 turns the next request into a GET, per RFC 9110. Only reachable
-        # on the CORS probe here, since the header fetch is already a GET.
-        if (sandhi_http_status(r) == 303) { verb = "GET"; }
-
-        # This hop's response is finished with — `next` is a fresh copy outside
-        # the arena, and nothing else here points into it. Releasing now is what
-        # keeps the arena sized for one exchange instead of for a whole chain.
-        reset_via(arena);
-        current = next;
-        hops = hops + 1;
-    }
-    return 0;
-}
-
 # Copy the handful of headers the audit actually reads into caller-owned
 # storage, so the response arena can be released.
 #
@@ -852,10 +672,11 @@ fn agnosai_run_security_audit(url: Str): i64 {
 
     # The header fetch. Its headers are snapshotted out and the arena released
     # before the CORS probe starts, so the two chains never share the arena.
-    var get_resp = _agnosai_audit_fetch(arena, "GET", url, sandhi_headers_new(), opts);
-    if (get_resp == AGNOSAI_AUDIT_REDIRECT_BLOCKED) {
+    var get_resp = agnosai_guarded_fetch(arena, "GET", url, sandhi_headers_new(), opts,
+    AGNOSAI_AUDIT_TIMEOUT_MS);
+    if (get_resp == AGNOSAI_FETCH_BLOCKED) {
         reset_via(arena);
-        return AGNOSAI_AUDIT_REDIRECT_BLOCKED;
+        return AGNOSAI_FETCH_BLOCKED;
     }
     if (get_resp == 0) {
         reset_via(arena);
@@ -874,8 +695,8 @@ fn agnosai_run_security_audit(url: Str): i64 {
     var cors_headers = 0;
     var probe = sandhi_headers_new();
     sandhi_headers_add(probe, "Origin", AGNOSAI_AUDIT_PROBE_ORIGIN);
-    var cors_resp = _agnosai_audit_fetch(arena, "OPTIONS", url, probe, opts);
-    if (cors_resp != 0 && cors_resp != AGNOSAI_AUDIT_REDIRECT_BLOCKED) {
+    var cors_resp = agnosai_guarded_fetch(arena, "OPTIONS", url, probe, opts, AGNOSAI_AUDIT_TIMEOUT_MS);
+    if (cors_resp != 0 && cors_resp != AGNOSAI_FETCH_BLOCKED) {
         cors_headers = _agnosai_audit_snapshot(sandhi_http_headers(cors_resp));
     }
     reset_via(arena);
@@ -937,7 +758,7 @@ fn _agnosai_security_audit_execute(ctx, input): i64 {
     _agnosai_audit_log("security audit starting", 23, target);
 
     var result = agnosai_run_security_audit(target);
-    if (result == AGNOSAI_AUDIT_REDIRECT_BLOCKED) {
+    if (result == AGNOSAI_FETCH_BLOCKED) {
         _agnosai_audit_log("security audit redirect refused", 31, target);
         return agnosai_tool_output_err(
         str_from("security audit failed: target redirected to a private/internal address"));

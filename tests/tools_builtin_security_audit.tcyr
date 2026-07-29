@@ -25,6 +25,7 @@ include "src/core_error.cyr"
 include "src/core_json.cyr"
 include "src/llm_retry.cyr"
 include "src/server_ssrf.cyr"
+include "src/guarded_fetch.cyr"
 include "src/tools_native.cyr"
 include "src/tools_registry.cyr"
 include "src/tools_builtin_security_audit.cyr"
@@ -484,60 +485,60 @@ fn main() {
     # The oracle inherits reqwest's follow-by-default and validates only the URL
     # the caller supplied, which is an SSRF-via-redirect bypass. This port
     # follows hops but re-runs the guard on each one; see docs/adr/007.
-    assert_eq(_agnosai_audit_is_redirect(301), 1, "301 is a redirect");
-    assert_eq(_agnosai_audit_is_redirect(302), 1, "302 is a redirect");
-    assert_eq(_agnosai_audit_is_redirect(303), 1, "303 is a redirect");
-    assert_eq(_agnosai_audit_is_redirect(307), 1, "307 is a redirect");
-    assert_eq(_agnosai_audit_is_redirect(308), 1, "308 is a redirect");
-    assert_eq(_agnosai_audit_is_redirect(200), 0, "200 is not");
-    assert_eq(_agnosai_audit_is_redirect(304), 0, "304 is not a redirect to follow");
-    assert_eq(_agnosai_audit_is_redirect(300), 0, "300 offers choices, it does not redirect");
+    assert_eq(agnosai_fetch_is_redirect(301), 1, "301 is a redirect");
+    assert_eq(agnosai_fetch_is_redirect(302), 1, "302 is a redirect");
+    assert_eq(agnosai_fetch_is_redirect(303), 1, "303 is a redirect");
+    assert_eq(agnosai_fetch_is_redirect(307), 1, "307 is a redirect");
+    assert_eq(agnosai_fetch_is_redirect(308), 1, "308 is a redirect");
+    assert_eq(agnosai_fetch_is_redirect(200), 0, "200 is not");
+    assert_eq(agnosai_fetch_is_redirect(304), 0, "304 is not a redirect to follow");
+    assert_eq(agnosai_fetch_is_redirect(300), 0, "300 offers choices, it does not redirect");
 
     var base = str_from("https://example.com/a/b?q=1");
 
     # an absolute Location is taken as-is
-    assert(str_eq(_agnosai_audit_resolve_location(base, "https://other.example.com/x"),
+    assert(str_eq(agnosai_fetch_resolve_location(base, "https://other.example.com/x"),
     str_from("https://other.example.com/x")) == 1, "an absolute https Location passes through");
-    assert(str_eq(_agnosai_audit_resolve_location(base, "http://other.example.com/x"),
+    assert(str_eq(agnosai_fetch_resolve_location(base, "http://other.example.com/x"),
     str_from("http://other.example.com/x")) == 1, "an absolute http Location passes through");
 
     # an absolute path is resolved against the base authority
-    assert(str_eq(_agnosai_audit_resolve_location(base, "/login"),
+    assert(str_eq(agnosai_fetch_resolve_location(base, "/login"),
     str_from("https://example.com/login")) == 1, "an absolute path keeps scheme and host");
-    assert(str_eq(_agnosai_audit_resolve_location(str_from("http://example.com:8080/a"), "/b"),
+    assert(str_eq(agnosai_fetch_resolve_location(str_from("http://example.com:8080/a"), "/b"),
     str_from("http://example.com:8080/b")) == 1, "a non-default port is carried across");
 
     # everything else fails closed rather than being guessed at
-    assert_eq(_agnosai_audit_resolve_location(base, "../admin"), 0,
+    assert_eq(agnosai_fetch_resolve_location(base, "../admin"), 0,
     "a relative reference is refused rather than resolved by guesswork");
-    assert_eq(_agnosai_audit_resolve_location(base, "admin"), 0, "so is a bare relative path");
-    assert_eq(_agnosai_audit_resolve_location(base, "//evil.example.com/x"), 0,
+    assert_eq(agnosai_fetch_resolve_location(base, "admin"), 0, "so is a bare relative path");
+    assert_eq(agnosai_fetch_resolve_location(base, "//evil.example.com/x"), 0,
     "a protocol-relative Location carries its own authority and is refused");
-    assert_eq(_agnosai_audit_resolve_location(base, ""), 0, "an empty Location is refused");
+    assert_eq(agnosai_fetch_resolve_location(base, ""), 0, "an empty Location is refused");
 
     # the guard would catch a resolved hop into private space — this is the
     # bypass the oracle is open to, closed here
-    assert_eq(agnosai_is_safe_url(_agnosai_audit_resolve_location(
+    assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
     str_from("http://public.example.com/"), "http://169.254.169.254/latest/meta-data/")), 0,
     "a redirect to the cloud metadata endpoint is refused by the per-hop guard");
-    assert_eq(agnosai_is_safe_url(_agnosai_audit_resolve_location(
+    assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
     str_from("http://public.example.com/"), "http://127.0.0.1:8080/admin")), 0,
     "so is one to loopback");
-    assert_eq(agnosai_is_safe_url(_agnosai_audit_resolve_location(
+    assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
     str_from("http://public.example.com/"), "http://0177.0.0.1/")), 0,
     "and one spelled in octal");
-    assert_eq(agnosai_is_safe_url(_agnosai_audit_resolve_location(
+    assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
     str_from("http://public.example.com/"), "https://other.example.com/ok")), 1,
     "a redirect to another public host is still allowed");
 
     # a same-origin absolute path inherits the base's already-validated host, so
     # it stays safe without a second lookup
-    assert_eq(agnosai_is_safe_url(_agnosai_audit_resolve_location(
+    assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
     str_from("https://example.com/a"), "/b")), 1, "a same-origin path stays allowed");
 
-    assert(AGNOSAI_AUDIT_REDIRECT_BLOCKED != 0,
+    assert(AGNOSAI_FETCH_BLOCKED != 0,
     "the blocked sentinel is distinct from the request-failed 0");
-    assert_eq(AGNOSAI_AUDIT_MAX_HOPS, 10, "the hop limit matches reqwest's default");
+    assert_eq(AGNOSAI_FETCH_MAX_HOPS, 10, "the hop limit matches reqwest's default");
 
     assert(str_eq(agnosai_audit_target_url(good), str_from("http://example.com/")) == 1,
     "the result carries the URL it audited");
@@ -580,24 +581,24 @@ fn main() {
     # origin.
     assert_eq(agnosai_is_safe_url(str_from("HTTPS://example.com/")), 1,
     "the guard accepts an upper-case scheme");
-    assert_eq(_agnosai_audit_scheme_len(str_from("https://example.com/")), 8, "https is 8 bytes");
-    assert_eq(_agnosai_audit_scheme_len(str_from("HTTPS://example.com/")), 8, "so is HTTPS");
-    assert_eq(_agnosai_audit_scheme_len(str_from("HtTpS://example.com/")), 8, "and mixed case");
-    assert_eq(_agnosai_audit_scheme_len(str_from("http://example.com/")), 7, "http is 7 bytes");
-    assert_eq(_agnosai_audit_scheme_len(str_from("HTTP://example.com/")), 7, "so is HTTP");
-    assert_eq(_agnosai_audit_scheme_len(str_from("ftp://example.com/")), 0, "ftp is neither");
-    assert_eq(_agnosai_audit_scheme_len(str_from("http:/")), 0, "a too-short URL is neither");
-    assert_eq(_agnosai_audit_is_https(str_from("HTTPS://example.com/")), 1,
+    assert_eq(agnosai_fetch_scheme_len(str_from("https://example.com/")), 8, "https is 8 bytes");
+    assert_eq(agnosai_fetch_scheme_len(str_from("HTTPS://example.com/")), 8, "so is HTTPS");
+    assert_eq(agnosai_fetch_scheme_len(str_from("HtTpS://example.com/")), 8, "and mixed case");
+    assert_eq(agnosai_fetch_scheme_len(str_from("http://example.com/")), 7, "http is 7 bytes");
+    assert_eq(agnosai_fetch_scheme_len(str_from("HTTP://example.com/")), 7, "so is HTTP");
+    assert_eq(agnosai_fetch_scheme_len(str_from("ftp://example.com/")), 0, "ftp is neither");
+    assert_eq(agnosai_fetch_scheme_len(str_from("http:/")), 0, "a too-short URL is neither");
+    assert_eq(agnosai_fetch_is_https(str_from("HTTPS://example.com/")), 1,
     "an upper-case https URL is recognised as TLS");
-    assert_eq(_agnosai_audit_is_https(str_from("HTTP://example.com/")), 0, "an http one is not");
+    assert_eq(agnosai_fetch_is_https(str_from("HTTP://example.com/")), 0, "an http one is not");
 
     # the origin slice must not be one byte short on an upper-case scheme —
     # getting this wrong resolves "/login" against "HTTPS:/" and yields a URL
     # pointing at a completely different host
-    assert(str_eq(_agnosai_audit_resolve_location(str_from("HTTPS://example.com/a"), "/login"),
+    assert(str_eq(agnosai_fetch_resolve_location(str_from("HTTPS://example.com/a"), "/login"),
     str_from("HTTPS://example.com/login")) == 1,
     "an upper-case scheme slices the origin at the right byte");
-    assert_eq(_agnosai_audit_resolve_location(str_from("ftp://example.com/a"), "/login"), 0,
+    assert_eq(agnosai_fetch_resolve_location(str_from("ftp://example.com/a"), "/login"), 0,
     "an unsupported scheme refuses to resolve rather than mis-slicing");
 
     # the analyze-side HTTPS recommendation stays BYTE-EXACT, because the

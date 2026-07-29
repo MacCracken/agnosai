@@ -1,0 +1,330 @@
+# =========================================================================
+# tools_remote_registry.tcyr — parity tests for src/tools_remote_registry.cyr
+# and the shared guarded fetch in src/guarded_fetch.cyr.
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/tools/remote_registry.rs —
+# three tests, one of which only asserts a constant. The other two check that a
+# private IP and localhost are refused, which is the SSRF arm.
+#
+# Every other arm of `fetch_package` — the 2xx check, the Content-Length
+# pre-check, the content-type capture, the post-download size check — needs a
+# server, so the Rust suite never reaches any of them. Here the transport is a
+# parameter, so a stub returning a synthetic sandhi response exercises all of
+# them with no network.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/core_error.cyr"
+include "src/llm_retry.cyr"
+include "src/server_ssrf.cyr"
+include "src/guarded_fetch.cyr"
+include "src/tools_remote_registry.cyr"
+include "tests/test_helpers.cyr"
+
+# What the next synthetic exchange should answer with.
+var _T_STATUS = 200;
+var _T_BODY = 0;
+var _T_BODY_LEN = 0;
+var _T_HDRS = 0;
+var _T_RESULT = 1;
+var _T_CALLS = 0;
+
+# Sentinels for `_T_RESULT`, mirroring the guarded fetch's own return contract.
+var _T_R_OK = 1;
+var _T_R_FAIL = 2;
+var _T_R_BLOCKED = 3;
+
+# A stub transport. Builds a real sandhi response object so the module's
+# accessors are exercised rather than bypassed.
+fn _t_transport(arena, method, url: Str, headers, opts, timeout_ms): i64 {
+    _T_CALLS = _T_CALLS + 1;
+    if (_T_RESULT == _T_R_FAIL) { return 0; }
+    if (_T_RESULT == _T_R_BLOCKED) { return AGNOSAI_FETCH_BLOCKED; }
+
+    var r = sandhi_http_response_parse_a(arena, "HTTP/1.1 200 OK\r\n\r\n", 19);
+    if (r == 0) { return 0; }
+    store64(r + SANDHI_RESP_OFF_STATUS, _T_STATUS);
+    store64(r + SANDHI_RESP_OFF_BODY_PTR, _T_BODY);
+    store64(r + SANDHI_RESP_OFF_BODY_LEN, _T_BODY_LEN);
+    if (_T_HDRS != 0) { store64(r + SANDHI_RESP_OFF_HEADERS, _T_HDRS); }
+    return r;
+}
+
+# Reset the stub to a plain 200 with the given body.
+fn _t_reset(status, body: Str): i64 {
+    _T_STATUS = status;
+    _T_BODY = str_data(body);
+    _T_BODY_LEN = str_len(body);
+    _T_HDRS = sandhi_headers_new();
+    _T_RESULT = _T_R_OK;
+    _T_CALLS = 0;
+    return 0;
+}
+
+# Add a response header the stub will return.
+fn _t_hdr(name, value): i64 {
+    sandhi_headers_add(_T_HDRS, name, value);
+    return 0;
+}
+
+# Run a fetch through the stub.
+fn _t_fetch(url): i64 {
+    return agnosai_fetch_package_via(str_from(url), &_t_transport);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("tools_remote_registry");
+
+    # --- max_download_size_is_reasonable ---
+    # The oracle asserts the constant literally as 10 * 1024 * 1024.
+    assert_eq(AGNOSAI_REMOTE_MAX_DOWNLOAD, 10485760, "the cap is 10 MB");
+    assert_eq(AGNOSAI_REMOTE_MAX_DOWNLOAD, 10 * 1024 * 1024, "spelled the oracle's way");
+    assert_eq(AGNOSAI_REMOTE_TIMEOUT_MS, 30000, "the client timeout is 30s");
+
+    # --- fetch_rejects_private_url ---
+    _t_reset(200, str_from("x"));
+    var priv_r = _t_fetch("http://192.168.1.1/tool.wasm");
+    assert_eq(agnosai_fetch_result_ok(priv_r), 0, "a private IP is refused");
+    assert(str_contains(agnosai_fetch_result_error(priv_r), str_from("private")) == 1,
+    "and the message says private");
+    assert(str_eq(agnosai_fetch_result_error(priv_r),
+    str_from("URL rejected: private/internal network")) == 1, "with the oracle's exact wording");
+    assert_eq(_T_CALLS, 0, "and nothing reached the transport");
+
+    # --- fetch_rejects_localhost ---
+    _t_reset(200, str_from("x"));
+    var lo_r = _t_fetch("http://localhost:8080/tool.wasm");
+    assert_eq(agnosai_fetch_result_ok(lo_r), 0, "localhost is refused");
+    assert(str_contains(agnosai_fetch_result_error(lo_r), str_from("private")) == 1,
+    "the localhost message says private too");
+    assert_eq(_T_CALLS, 0, "nothing reached the transport");
+
+    # the guard's harder spellings, which the oracle's own guard would also
+    # catch but which its two tests never exercise
+    _t_reset(200, str_from("x"));
+    assert_eq(agnosai_fetch_result_ok(_t_fetch("http://169.254.169.254/latest/meta-data/")), 0,
+    "the cloud metadata endpoint is refused");
+    assert_eq(agnosai_fetch_result_ok(_t_fetch("http://0177.0.0.1/tool.wasm")), 0,
+    "an octal-encoded loopback is refused");
+    assert_eq(agnosai_fetch_result_ok(_t_fetch("http://2130706433/tool.wasm")), 0,
+    "a decimal-integer loopback is refused");
+    assert_eq(agnosai_fetch_result_ok(_t_fetch("ftp://example.com/tool.wasm")), 0,
+    "a non-HTTP scheme is refused");
+    assert_eq(_T_CALLS, 0, "none of them reached the transport");
+
+    # --- the happy path ---
+    # The WASM magic, built byte-wise: it starts with a NUL, and `str_from` is
+    # strlen-based, so `str_from("\x00asm...")` would be an EMPTY Str. A tool
+    # fetcher whose payloads are binary has to carry embedded NULs, which is why
+    # the module reads the body with `str_from_buf(ptr, len)` rather than
+    # `str_from`.
+    var wasm = str_builder_new();
+    str_builder_add_byte(wasm, 0);
+    str_builder_add_byte(wasm, 97);
+    str_builder_add_byte(wasm, 115);
+    str_builder_add_byte(wasm, 109);
+    str_builder_add_byte(wasm, 1);
+    str_builder_add_byte(wasm, 0);
+    str_builder_add_byte(wasm, 0);
+    str_builder_add_byte(wasm, 0);
+    _t_reset(200, str_builder_build(wasm));
+    _t_hdr("content-type", "application/wasm");
+    var ok_r = _t_fetch("https://example.com/tool.wasm");
+    assert_eq(agnosai_fetch_result_ok(ok_r), 1, "a public 200 succeeds");
+    assert_eq(_T_CALLS, 1, "one request was made");
+    assert_eq(agnosai_fetch_result_size(ok_r), 8, "the byte count is the body length");
+    assert_eq(str_len(agnosai_fetch_result_data(ok_r)), 8, "and the data carries those bytes");
+    assert(str_eq(agnosai_fetch_result_content_type(ok_r), str_from("application/wasm")) == 1,
+    "the content type is captured");
+    assert_eq(agnosai_fetch_result_error(ok_r), 0, "and there is no error");
+
+    # the data must survive the arena reset that follows the download, and it
+    # must carry the leading NUL rather than stopping at it
+    assert_eq(load8(str_data(agnosai_fetch_result_data(ok_r))) & 255, 0,
+    "the payload keeps its leading NUL byte");
+    assert_eq(load8(str_data(agnosai_fetch_result_data(ok_r)) + 1) & 255, 97,
+    "the payload survives the scratch arena being released ('a' of \\0asm)");
+    assert_eq(load8(str_data(agnosai_fetch_result_data(ok_r)) + 4) & 255, 1,
+    "and the version byte past the magic");
+
+    # --- content_type is Option<String>: absent is not empty ---
+    _t_reset(200, str_from("x"));
+    var noct_r = _t_fetch("https://example.com/tool.wasm");
+    assert_eq(agnosai_fetch_result_ok(noct_r), 1, "a response with no content-type still succeeds");
+    assert_eq(agnosai_fetch_result_content_type(noct_r), 0,
+    "an absent content-type is 0, matching the oracle's None");
+
+    _t_reset(200, str_from("x"));
+    _t_hdr("content-type", "");
+    var emptyct_r = _t_fetch("https://example.com/tool.wasm");
+    assert(agnosai_fetch_result_content_type(emptyct_r) != 0,
+    "an EMPTY content-type is Some(\"\"), which is not None");
+    assert_eq(str_len(agnosai_fetch_result_content_type(emptyct_r)), 0, "and it is empty");
+
+    # --- non-2xx statuses ---
+    assert_eq(agnosai_remote_is_success(200), 1, "200 is success");
+    assert_eq(agnosai_remote_is_success(299), 1, "299 is success");
+    assert_eq(agnosai_remote_is_success(300), 0, "300 is not");
+    assert_eq(agnosai_remote_is_success(199), 0, "199 is not");
+    assert_eq(agnosai_remote_is_success(404), 0, "404 is not");
+
+    _t_reset(404, str_from(""));
+    var r404 = _t_fetch("https://example.com/missing.wasm");
+    assert_eq(agnosai_fetch_result_ok(r404), 0, "a 404 fails");
+    assert(str_eq(agnosai_fetch_result_error(r404), str_from("HTTP 404")) == 1,
+    "reported as HTTP <code> — the oracle also renders the reason phrase, which sandhi does not \
+    carry; see the module note");
+
+    _t_reset(500, str_from(""));
+    assert(str_eq(agnosai_fetch_result_error(_t_fetch("https://example.com/x")),
+    str_from("HTTP 500")) == 1, "a 500 likewise");
+
+    # a 3xx that reaches the result at all means the transport stopped following
+    _t_reset(302, str_from(""));
+    assert(str_eq(agnosai_fetch_result_error(_t_fetch("https://example.com/x")),
+    str_from("HTTP 302")) == 1, "an unfollowed 3xx is not a success");
+
+    # --- the Content-Length pre-check ---
+    _t_reset(200, str_from("small"));
+    _t_hdr("content-length", "20971520");
+    var big_r = _t_fetch("https://example.com/big.agpkg");
+    assert_eq(agnosai_fetch_result_ok(big_r), 0, "an over-cap Content-Length is rejected");
+    assert(str_eq(agnosai_fetch_result_error(big_r),
+    str_from("package too large: 20971520 bytes (max 10485760)")) == 1,
+    "with the oracle's exact wording, quoting the DECLARED length");
+
+    # exactly at the cap is allowed — the oracle's check is `>`, not `>=`
+    _t_reset(200, str_from("small"));
+    _t_hdr("content-length", "10485760");
+    assert_eq(agnosai_fetch_result_ok(_t_fetch("https://example.com/exact.agpkg")), 1,
+    "a Content-Length exactly at the cap passes, since the oracle compares with >");
+
+    _t_reset(200, str_from("small"));
+    _t_hdr("content-length", "10485761");
+    assert_eq(agnosai_fetch_result_ok(_t_fetch("https://example.com/over.agpkg")), 0,
+    "one byte over is rejected");
+
+    # a missing Content-Length skips the pre-check rather than failing
+    _t_reset(200, str_from("nolength"));
+    assert_eq(agnosai_fetch_result_ok(_t_fetch("https://example.com/x")), 1,
+    "an absent Content-Length is not itself an error");
+
+    # --- the post-download size check catches a lying Content-Length ---
+    # This is why the oracle checks twice, and the only way to reach the second
+    # check is a server that under-declares.
+    var big_body = str_builder_new();
+    for (var i = 0; i < 200; i = i + 1) { str_builder_add_byte(big_body, 65); }
+    var body200 = str_builder_build(big_body);
+    _t_reset(200, body200);
+    _t_hdr("content-length", "1");
+    var lied_r = _t_fetch("https://example.com/lies.agpkg");
+    assert_eq(agnosai_fetch_result_ok(lied_r), 1,
+    "200 real bytes against a declared 1 is still under the cap, so it succeeds");
+    assert_eq(agnosai_fetch_result_size(lied_r), 200,
+    "and the reported size is what ARRIVED, not what was declared");
+
+    # the error builder itself, at the boundary the stub cannot reach
+    assert(str_eq(agnosai_remote_too_large_err(10485761),
+    str_from("package too large: 10485761 bytes (max 10485760)")) == 1,
+    "the too-large message is built from the actual length");
+    assert(str_eq(agnosai_remote_status_err(503), str_from("HTTP 503")) == 1,
+    "the status message is built from the code");
+
+    # --- transport failure ---
+    _t_reset(200, str_from("x"));
+    _T_RESULT = _T_R_FAIL;
+    var fail_r = _t_fetch("https://example.com/x");
+    assert_eq(agnosai_fetch_result_ok(fail_r), 0, "a transport failure fails");
+    assert(str_eq(agnosai_fetch_result_error(fail_r), str_from("download failed")) == 1,
+    "with the oracle's download-failed wording");
+    assert_eq(agnosai_fetch_result_data(fail_r), 0, "and carries no data");
+    assert_eq(agnosai_fetch_result_size(fail_r), 0, "and no size");
+
+    # --- a redirect the guard refused ---
+    # The oracle cannot reach this state: it validates only the URL handed in,
+    # then lets reqwest follow up to ten hops unchecked. ADR 007.
+    _t_reset(200, str_from("x"));
+    _T_RESULT = _T_R_BLOCKED;
+    var blocked_r = _t_fetch("https://example.com/x");
+    assert_eq(agnosai_fetch_result_ok(blocked_r), 0, "a refused redirect fails the fetch");
+    assert(str_contains(agnosai_fetch_result_error(blocked_r), str_from("private")) == 1,
+    "and reads as the same rejection, one hop later");
+    assert(str_contains(agnosai_fetch_result_error(blocked_r), str_from("redirect")) == 1,
+    "while naming the redirect, so it is distinguishable in a log");
+
+    # --- an empty body is a success, not a failure ---
+    _t_reset(200, str_from(""));
+    var empty_r = _t_fetch("https://example.com/empty");
+    assert_eq(agnosai_fetch_result_ok(empty_r), 1, "a zero-byte 200 is still Ok");
+    assert_eq(agnosai_fetch_result_size(empty_r), 0, "with size 0");
+
+    # =====================================================================
+    # the shared guarded fetch — the part ADR 007 adds over both oracles
+    # =====================================================================
+
+    assert_eq(AGNOSAI_FETCH_MAX_HOPS, 10, "the hop limit matches reqwest's default");
+    assert(AGNOSAI_FETCH_BLOCKED != 0, "the blocked sentinel is distinct from request-failed");
+
+    assert_eq(agnosai_fetch_is_redirect(301), 1, "301 is a redirect");
+    assert_eq(agnosai_fetch_is_redirect(308), 1, "308 is a redirect");
+    assert_eq(agnosai_fetch_is_redirect(304), 0, "304 is not one to follow");
+    assert_eq(agnosai_fetch_is_redirect(200), 0, "200 is not");
+
+    assert_eq(agnosai_fetch_scheme_len(str_from("https://x/")), 8, "https is 8 bytes");
+    assert_eq(agnosai_fetch_scheme_len(str_from("HTTPS://x/")), 8, "case-insensitively");
+    assert_eq(agnosai_fetch_scheme_len(str_from("gopher://x/")), 0, "an unknown scheme is 0");
+    assert_eq(agnosai_fetch_is_https(str_from("HTTPS://x/")), 1, "upper-case https is TLS");
+    assert_eq(agnosai_fetch_is_https(str_from("http://x/")), 0, "http is not");
+
+    var base = str_from("https://example.com/a/b");
+    assert(str_eq(agnosai_fetch_resolve_location(base, "https://other.example.com/x"),
+    str_from("https://other.example.com/x")) == 1, "an absolute Location passes through");
+    assert(str_eq(agnosai_fetch_resolve_location(base, "/login"),
+    str_from("https://example.com/login")) == 1, "an absolute path keeps the authority");
+    assert_eq(agnosai_fetch_resolve_location(base, "../admin"), 0,
+    "a relative reference fails closed rather than being guessed at");
+    assert_eq(agnosai_fetch_resolve_location(base, "//evil.example.com/x"), 0,
+    "a protocol-relative Location is refused");
+
+    # the bypass this whole mechanism exists to close: a public URL that
+    # redirects into private space
+    assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
+    str_from("http://public.example.com/pkg"), "http://169.254.169.254/latest/meta-data/")), 0,
+    "a redirect to cloud metadata is refused by the per-hop guard");
+    assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
+    str_from("http://public.example.com/pkg"), "https://cdn.example.net/pkg")), 1,
+    "while a redirect to another public host is still allowed");
+
+    # --- the live entry points ---
+    # `agnosai_fetch_package` short-circuits on the guard before any network
+    # work, so this arm is fully deterministic offline.
+    var live_priv = agnosai_fetch_package(str_from("http://10.0.0.1/tool.wasm"));
+    assert_eq(agnosai_fetch_result_ok(live_priv), 0,
+    "the live entry point refuses a private target");
+    assert(str_eq(agnosai_fetch_result_error(live_priv),
+    str_from("URL rejected: private/internal network")) == 1, "with the oracle's wording");
+
+    # `.invalid` is reserved by RFC 2606 and never resolves, so the real hop
+    # loop exercises its transport-failure arm identically on and off a network.
+    var live_arena = arena_allocator(262144);
+    var live_opts = sandhi_http_options_new();
+    sandhi_http_options_total_ms(live_opts, 2000);
+    assert_eq(agnosai_guarded_fetch(live_arena, "GET", str_from("http://x.invalid/pkg"),
+    sandhi_headers_new(), live_opts, 2000), 0,
+    "the real guarded fetch reports an unresolvable host as a transport failure");
+
+    var dead = agnosai_fetch_package(str_from("http://nonexistent.invalid/tool.wasm"));
+    assert_eq(agnosai_fetch_result_ok(dead), 0, "and so does the live fetch_package");
+    assert(str_eq(agnosai_fetch_result_error(dead), str_from("download failed")) == 1,
+    "reported with the oracle's download-failed wording");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
