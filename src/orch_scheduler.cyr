@@ -1,0 +1,406 @@
+# =========================================================================
+# orch_scheduler — priority queues and DAG-aware task ordering.
+#
+# Parity oracle: rust-old/src/orchestrator/scheduler.rs
+#
+# Two independent modes sharing one struct, exactly as the oracle has them:
+# five FIFO priority tiers for independent work, and a loaded DAG whose ready
+# set is recomputed from a completed-id set. They do not interact — `len` and
+# `is_empty` report the queues only, and `ready_tasks` reads the DAG only.
+#
+# **Determinism is the whole difficulty here**, and it runs in both directions.
+#
+# `kahn_sort` is deterministic *on purpose*: the oracle sorts the initial
+# zero-in-degree set and sorts each node's successors before walking them,
+# specifically so a HashMap's arbitrary iteration order cannot leak into the
+# output. That is reproduced exactly, including the detail that nodes enqueued
+# *later* are appended without re-sorting — so the order is "sorted within each
+# wave", not globally sorted.
+#
+# `ready_tasks` and `topological_sort_tasks` are the opposite: the oracle leaves
+# their tie order genuinely unspecified. `ready_tasks` collects from a HashMap
+# and stable-sorts by priority, so equal-priority tasks come back in whatever
+# order that process's hash seed produced. `topological_sort_tasks` pops a
+# `BinaryHeap<(TaskPriority, TaskId)>`, which breaks priority ties on raw UUID
+# bytes. Neither is something a caller can rely on, and the oracle's own tests
+# never exercise either tie. This port picks a **stable, documented** order in
+# both places — insertion order for `ready_tasks`, and the same for the heap's
+# ties — which is consistent with the oracle's contract and reproducible run to
+# run, which the oracle is not.
+# =========================================================================
+
+# **Task ids are raw 16-byte UUID buffers, not Strs.** `agnosai_task_id` hands
+# back what `agnosai_uuid_v4` allocated, so they compare with `agnosai_uuid_eq`
+# and are rendered with `agnosai_uuid_to_str`. Passing one to `str_eq` or using
+# it as a `map_new_str` key reads the first eight bytes of the UUID as a length
+# and segfaults — which is exactly what the `id_to_key` map here does when built
+# carelessly, since the oracle's `HashMap<TaskId, String>` looks like it should
+# take the id directly. The canonical string is the map key.
+
+# The oracle's five priority tiers, indexed by discriminant.
+var AGNOSAI_SCHED_TIERS = 5;
+
+# Scheduler state. `queues` is a vec of five vecs, indexed by priority.
+enum AgnosaiSchedulerOff {
+    AGN_SCH_QUEUES = 0;
+    AGN_SCH_DAG_TASKS = 8;
+    AGN_SCH_DAG_KEYS = 16;
+    AGN_SCH_DEPENDENTS = 24;
+    AGN_SCH_DEPENDENCIES = 32;
+    AGN_SCH_ID_TO_KEY = 40;
+    AGN_SCH_SIZE = 48;
+}
+
+# Create an empty scheduler.
+#
+# `dag_keys` is carried alongside `dag_tasks` because the oracle iterates a
+# HashMap wherever it needs "every task key", and a Cyrius map has no ordered
+# iteration. Keeping insertion order in a vec is what makes `ready_tasks`
+# reproducible.
+fn agnosai_scheduler_new(): i64 {
+    var s = alloc(AGN_SCH_SIZE);
+    var queues = vec_new();
+    for (var i = 0; i < AGNOSAI_SCHED_TIERS; i = i + 1) { vec_push(queues, vec_new()); }
+    store64(s + AGN_SCH_QUEUES, queues);
+    store64(s + AGN_SCH_DAG_TASKS, map_new_str());
+    store64(s + AGN_SCH_DAG_KEYS, vec_new());
+    store64(s + AGN_SCH_DEPENDENTS, map_new_str());
+    store64(s + AGN_SCH_DEPENDENCIES, map_new_str());
+    store64(s + AGN_SCH_ID_TO_KEY, map_new_str());
+    return s;
+}
+
+# Push a task into its priority tier.
+#
+# A priority outside 0..4 would index past the queue vec; the oracle's `as
+# usize` cannot produce one because `TaskPriority` is a closed enum, so this
+# clamps rather than inventing an error path the oracle does not have.
+fn agnosai_scheduler_enqueue(s, task): i64 {
+    var tier = agnosai_task_priority(task);
+    if (tier < 0) { tier = 0; }
+    if (tier >= AGNOSAI_SCHED_TIERS) { tier = AGNOSAI_SCHED_TIERS - 1; }
+    vec_push(vec_get(load64(s + AGN_SCH_QUEUES), tier), task);
+    return 0;
+}
+
+# Pop the highest-priority task, or 0 when every queue is empty.
+#
+# Tier 4 (Critical) is drained first, down to tier 0 (Background); within a
+# tier the order is FIFO.
+fn agnosai_scheduler_dequeue(s): i64 {
+    var queues = load64(s + AGN_SCH_QUEUES);
+    for (var tier = AGNOSAI_SCHED_TIERS - 1; tier >= 0; tier = tier - 1) {
+        var q = vec_get(queues, tier);
+        if (vec_len(q) > 0) {
+            var task = vec_get(q, 0);
+            vec_remove(q, 0);
+            return task;
+        }
+    }
+    return 0;
+}
+
+# Total queued tasks across every tier. Excludes DAG tasks.
+fn agnosai_scheduler_len(s): i64 {
+    var queues = load64(s + AGN_SCH_QUEUES);
+    var n = 0;
+    for (var i = 0; i < AGNOSAI_SCHED_TIERS; i = i + 1) { n = n + vec_len(vec_get(queues, i)); }
+    return n;
+}
+
+# Whether every priority queue is empty. Excludes DAG tasks.
+fn agnosai_scheduler_is_empty(s): i64 {
+    if (agnosai_scheduler_len(s) == 0) { return 1; }
+    return 0;
+}
+
+# Whether a vec of Str contains a value.
+fn _agnosai_sched_has(v, want: Str): i64 {
+    for (var i = 0; i < vec_len(v); i = i + 1) {
+        if (str_eq(vec_get(v, i), want) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# Append to a Str-keyed map of Str vecs, without duplicating.
+#
+# The oracle's values are `HashSet<String>`, so an edge listed twice adds one
+# entry; a plain vec would count it twice and corrupt the in-degree.
+fn _agnosai_sched_add_edge(m, key: Str, value: Str): i64 {
+    var set = map_get(m, key);
+    if (set == 0) {
+        set = vec_new();
+        map_set(m, str_clone(key), set);
+    }
+    if (_agnosai_sched_has(set, value) == 0) { vec_push(set, str_clone(value)); }
+    return 0;
+}
+
+# Lexicographic compare of two Strs: <0, 0 or >0.
+#
+# The stdlib has `str_eq` but no ordering comparator, and `Vec<String>::sort`
+# in the oracle is a byte-wise lexicographic sort — shorter is smaller only
+# when it is a prefix of the longer.
+fn _agnosai_sched_str_cmp(a: Str, b: Str): i64 {
+    var la = str_len(a);
+    var lb = str_len(b);
+    var n = la;
+    if (lb < n) { n = lb; }
+    var da = str_data(a);
+    var db = str_data(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var ca = load8(da + i) & 255;
+        var cb = load8(db + i) & 255;
+        if (ca != cb) { return ca - cb; }
+    }
+    return la - lb;
+}
+
+# Sort a vec of Str ascending, in place.
+#
+# Insertion sort: the oracle calls `Vec::sort` on the zero-in-degree seed and on
+# each node's successor list, both of which are small, and `order.cyr`'s
+# heapsort takes i64 values rather than a comparator.
+fn _agnosai_sched_sort_strs(v): i64 {
+    for (var i = 1; i < vec_len(v); i = i + 1) {
+        var cur = vec_get(v, i);
+        var j = i - 1;
+        while (j >= 0) {
+            if (_agnosai_sched_str_cmp(vec_get(v, j), cur) <= 0) { break; }
+            vec_set(v, j + 1, vec_get(v, j));
+            j = j - 1;
+        }
+        vec_set(v, j + 1, cur);
+    }
+    return 0;
+}
+
+# Kahn's algorithm over the built adjacency. Returns a vec of keys in
+# topological order, or 0 when the graph has a cycle.
+#
+# The two sorts are the oracle's and they are load-bearing: without them the
+# output would depend on HashMap iteration order. Note that only the *initial*
+# seed is sorted — later nodes are appended as their in-degree reaches zero, so
+# the result is sorted within each wave rather than globally.
+fn agnosai_scheduler_kahn_sort(keys, dependents, dependencies): i64 {
+    var in_degree = map_new_str();
+    var queue = vec_new();
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var k = vec_get(keys, i);
+        var deps = map_get(dependencies, k);
+        var deg = 0;
+        if (deps != 0) { deg = vec_len(deps); }
+        map_set(in_degree, str_clone(k), deg);
+        if (deg == 0) { vec_push(queue, k); }
+    }
+    _agnosai_sched_sort_strs(queue);
+
+    var order = vec_new();
+    var head = 0;
+    while (head < vec_len(queue)) {
+        var node = vec_get(queue, head);
+        head = head + 1;
+        vec_push(order, node);
+
+        var succs = map_get(dependents, node);
+        if (succs != 0) {
+            var sorted = vec_new();
+            for (var a = 0; a < vec_len(succs); a = a + 1) { vec_push(sorted, vec_get(succs, a)); }
+            _agnosai_sched_sort_strs(sorted);
+            for (var b = 0; b < vec_len(sorted); b = b + 1) {
+                var succ = vec_get(sorted, b);
+                var deg2 = map_get(in_degree, succ);
+                # `get_mut` in the oracle: a successor absent from in_degree —
+                # an edge naming a task the DAG does not contain — is skipped,
+                # not treated as zero.
+                if (map_has(in_degree, succ) == 1) {
+                    deg2 = deg2 - 1;
+                    map_set(in_degree, succ, deg2);
+                    if (deg2 == 0) { vec_push(queue, succ); }
+                }
+            }
+        }
+    }
+
+    if (vec_len(order) != vec_len(keys)) { return 0; }
+    return order;
+}
+
+# Build the two adjacency maps for a DAG. `out_keys` receives the task keys in
+# insertion order.
+fn _agnosai_sched_build(dag, dependents, dependencies, out_keys): i64 {
+    var tasks = agnosai_task_dag_tasks(dag);
+    var keys = map_keys(tasks);
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var k = vec_get(keys, i);
+        vec_push(out_keys, k);
+        # Every key appears in both maps even with no edges, so a node with no
+        # dependencies is still seeded with in-degree 0.
+        if (map_get(dependents, k) == 0) { map_set(dependents, str_clone(k), vec_new()); }
+        if (map_get(dependencies, k) == 0) { map_set(dependencies, str_clone(k), vec_new()); }
+    }
+
+    var edges = agnosai_task_dag_edges(dag);
+    for (var e = 0; e < vec_len(edges); e = e + 1) {
+        var edge = vec_get(edges, e);
+        # `from` must complete before `to` may run.
+        var from = agnosai_edge_from(edge);
+        var to = agnosai_edge_to(edge);
+        _agnosai_sched_add_edge(dependents, from, to);
+        _agnosai_sched_add_edge(dependencies, to, from);
+    }
+    return 0;
+}
+
+# A topological ordering of a DAG's task keys, or 0 when it contains a cycle.
+fn agnosai_scheduler_topological_sort(dag): i64 {
+    var dependents = map_new_str();
+    var dependencies = map_new_str();
+    var keys = vec_new();
+    _agnosai_sched_build(dag, dependents, dependencies, keys);
+    _agnosai_sched_sort_strs(keys);
+    return agnosai_scheduler_kahn_sort(keys, dependents, dependencies);
+}
+
+# Load a DAG, validating acyclicity. Returns 1 on success, 0 on a cycle.
+#
+# The oracle validates **before** committing, so a cyclic DAG leaves the
+# previously loaded state untouched rather than half-replacing it.
+fn agnosai_scheduler_load_dag(s, dag): i64 {
+    var dependents = map_new_str();
+    var dependencies = map_new_str();
+    var keys = vec_new();
+    _agnosai_sched_build(dag, dependents, dependencies, keys);
+
+    var sorted_keys = vec_new();
+    for (var i = 0; i < vec_len(keys); i = i + 1) { vec_push(sorted_keys, vec_get(keys, i)); }
+    _agnosai_sched_sort_strs(sorted_keys);
+    if (agnosai_scheduler_kahn_sort(sorted_keys, dependents, dependencies) == 0) { return 0; }
+
+    var tasks = agnosai_task_dag_tasks(dag);
+    var id_to_key = map_new_str();
+    for (var j = 0; j < vec_len(keys); j = j + 1) {
+        var k = vec_get(keys, j);
+        map_set(id_to_key, agnosai_uuid_to_str(agnosai_task_id(map_get(tasks, k))),
+        str_clone(k));
+    }
+
+    store64(s + AGN_SCH_DAG_TASKS, tasks);
+    store64(s + AGN_SCH_DAG_KEYS, keys);
+    store64(s + AGN_SCH_DEPENDENTS, dependents);
+    store64(s + AGN_SCH_DEPENDENCIES, dependencies);
+    store64(s + AGN_SCH_ID_TO_KEY, id_to_key);
+    return 1;
+}
+
+# Tasks whose dependencies are all satisfied and which are not themselves done.
+#
+# `completed` is a vec of task ids. Returned highest priority first; equal
+# priorities keep the DAG's insertion order — see the module header on why the
+# oracle leaves that unspecified and this does not.
+fn agnosai_scheduler_ready_tasks(s, completed): i64 {
+    var id_to_key = load64(s + AGN_SCH_ID_TO_KEY);
+    var tasks = load64(s + AGN_SCH_DAG_TASKS);
+    var deps_map = load64(s + AGN_SCH_DEPENDENCIES);
+    var keys = load64(s + AGN_SCH_DAG_KEYS);
+
+    # The oracle maps completed ids to keys and drops any it cannot resolve.
+    var completed_keys = vec_new();
+    for (var c = 0; c < vec_len(completed); c = c + 1) {
+        var k = map_get(id_to_key, agnosai_uuid_to_str(vec_get(completed, c)));
+        if (k != 0) { vec_push(completed_keys, k); }
+    }
+
+    var ready = vec_new();
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var key = vec_get(keys, i);
+        if (_agnosai_sched_has(completed_keys, key) == 1) { continue; }
+
+        var deps = map_get(deps_map, key);
+        var satisfied = 1;
+        if (deps != 0) {
+            for (var d = 0; d < vec_len(deps); d = d + 1) {
+                if (_agnosai_sched_has(completed_keys, vec_get(deps, d)) == 0) {
+                    satisfied = 0;
+                    break;
+                }
+            }
+        }
+        if (satisfied == 1) { vec_push(ready, map_get(tasks, key)); }
+    }
+
+    # Highest priority first, stable within a tier.
+    for (var a = 1; a < vec_len(ready); a = a + 1) {
+        var cur = vec_get(ready, a);
+        var b = a - 1;
+        while (b >= 0) {
+            if (agnosai_task_priority(vec_get(ready, b)) >= agnosai_task_priority(cur)) { break; }
+            vec_set(ready, b + 1, vec_get(ready, b));
+            b = b - 1;
+        }
+        vec_set(ready, b + 1, cur);
+    }
+    return ready;
+}
+
+# Topologically order a vec of tasks by their `dependencies` field, returning a
+# vec of task ids — or 0 when the tasks contain a cycle.
+#
+# Dependencies naming a task outside the input are **ignored**, not treated as
+# unsatisfiable: the oracle guards each with `if ids.contains(dep)`. A task
+# depending only on something absent is therefore ready immediately.
+#
+# The oracle drains a max-heap of `(priority, id)`, so higher priority pops
+# first. Equal priorities tie-break on raw UUID bytes there and on input order
+# here; see the module header.
+fn agnosai_topological_sort_tasks(tasks): i64 {
+    var n = vec_len(tasks);
+    var in_degree = vec_new();
+    var dependents = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(in_degree, 0);
+        vec_push(dependents, vec_new());
+    }
+
+    for (var a = 0; a < n; a = a + 1) {
+        var deps = agnosai_task_dependencies(vec_get(tasks, a));
+        for (var d = 0; d < vec_len(deps); d = d + 1) {
+            var dep_id = vec_get(deps, d);
+            for (var b = 0; b < n; b = b + 1) {
+                if (agnosai_uuid_eq(agnosai_task_id(vec_get(tasks, b)), dep_id) == 1) {
+                    vec_set(in_degree, a, vec_get(in_degree, a) + 1);
+                    vec_push(vec_get(dependents, b), a);
+                    break;
+                }
+            }
+        }
+    }
+
+    var order = vec_new();
+    var taken = vec_new();
+    for (var t = 0; t < n; t = t + 1) { vec_push(taken, 0); }
+
+    # A linear scan for the highest-priority ready task stands in for the
+    # oracle's BinaryHeap. At the task counts a crew carries this is cheaper
+    # than a heap, and it makes the tie rule explicit rather than emergent.
+    while (vec_len(order) < n) {
+        var best = 0 - 1;
+        for (var c = 0; c < n; c = c + 1) {
+            if (vec_get(taken, c) == 1) { continue; }
+            if (vec_get(in_degree, c) != 0) { continue; }
+            if (best < 0) { best = c; }
+            elif (agnosai_task_priority(vec_get(tasks, c))
+            > agnosai_task_priority(vec_get(tasks, best))) { best = c; }
+        }
+        if (best < 0) { return 0; }
+
+        vec_set(taken, best, 1);
+        vec_push(order, agnosai_task_id(vec_get(tasks, best)));
+        var kids = vec_get(dependents, best);
+        for (var k = 0; k < vec_len(kids); k = k + 1) {
+            var child = vec_get(kids, k);
+            vec_set(in_degree, child, vec_get(in_degree, child) - 1);
+        }
+    }
+    return order;
+}

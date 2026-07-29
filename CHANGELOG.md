@@ -170,6 +170,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `rank_agents` breaks ties on ascending index because the oracle sorts with `sort_by`, a
     **stable** merge sort, while `order.cyr`'s heapsort is not stable — without the tie-break,
     which of two equally-good agents gets the task would vary with the sort's internal swaps.
+  - **orch_scheduler** — five FIFO priority tiers plus DAG-aware ordering, Kahn's algorithm for
+    both. Determinism runs in two directions here and both are reproduced deliberately.
+    `kahn_sort`'s two sorts — the zero-in-degree seed and each node's successors — exist so a
+    HashMap's arbitrary iteration order cannot leak into the output, including the detail that
+    later waves are *appended* without re-sorting, so the result is sorted within each wave rather
+    than globally. `ready_tasks` and `topological_sort_tasks` are the opposite: the oracle leaves
+    their tie order genuinely unspecified (a HashMap collect, and a `BinaryHeap` breaking ties on
+    raw UUID bytes), so the port picks a stable documented order instead — reproducible run to
+    run, which the oracle is not, and consistent with its contract either way. The adjacency
+    values are sets, not lists: a duplicated edge must not double-count an in-degree, or the
+    target never becomes ready.
 - **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
   `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
   never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.
