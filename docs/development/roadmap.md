@@ -77,11 +77,26 @@ serde, zero traits, zero I/O — it exercises tyche, f64-as-bit-patterns, and th
 
 **M2 exit met:** learning + core tests green against `rust-old/` as oracle.
 
-### M3 — `llm`, the hoosh seam (Phase 2)
+### M3 — `llm`, the hoosh seam (Phase 2) — ✅ done
 
 Cheapest group; the reference implementation already exists (`thoth/src/hoosh.cyr`).
 llm **defines** the types orchestrator consumes, so it lands early.
 **Exit:** a live chat-completion round-trip against `hoosh serve 8088`.
+
+- ✅ **router + retry + hoosh seam client**, 187 assertions green, 100% reference
+  coverage across the project. **Exit met and verified** through
+  `agnosai_hoosh_chat` itself (`scripts/stack.sh check`), not curl.
+- **Correction to the plan's open question 3.** "~20 zero-consumer re-exports"
+  is wrong: 11 have real consumers. Five are data types the seam now defines
+  locally (ProviderType, Message, Role, InferenceRequest, HooshClient); six are
+  server-side subsystems with no client-side equivalent over an HTTP seam
+  (AuditChain at 36 refs, ResponseCache, CostTracker, llm_metrics, cache_key,
+  LlmProvider). **Every consumer of that second set is in M5 or M6**, so
+  whether agnosai reimplements them locally or drops them is a decision for
+  those milestones — AuditChain especially, since it is the tamper-evident
+  audit trail. Also: `genai.rs` is `src/telemetry/genai.rs`, not llm's, so it
+  belongs to M9; `inference_queue.rs` is llm's, `majra`-gated, and genuinely
+  zero-consumer.
 
 ### M4 — `tools` (Phase 3)
 

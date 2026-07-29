@@ -1,0 +1,264 @@
+# =========================================================================
+# llm_hoosh.tcyr — tests for src/llm_hoosh.cyr
+#
+# No oracle test block: the seam replaces a `pub use hoosh::…` facade, so there
+# is nothing in rust-old to mirror. The reference for what must hold is the
+# OpenAI chat-completions wire format plus thoth/src/hoosh.cyr's own
+# builder/extractor tests.
+#
+# Everything here runs offline. `agnosai_hoosh_chat` is the one I/O call and is
+# NOT exercised here — that is M3's exit criterion and needs a running
+# `hoosh serve 8088`; use scripts/stack.sh.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/llm_retry.cyr"
+include "src/llm_hoosh.cyr"
+include "tests/test_helpers.cyr"
+
+# Assert a Str equals `expected`.
+fn _t_assert_str(actual, expected, name): i64 {
+    return assert(str_eq(actual, str_from(expected)) == 1, name);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("llm_hoosh");
+
+    # --- URL joining trims exactly one trailing slash ---
+    _t_assert_str(agnosai_hoosh_endpoint(str_from("http://127.0.0.1:8088")),
+    "http://127.0.0.1:8088/v1/chat/completions", "endpoint from a bare base");
+    _t_assert_str(agnosai_hoosh_endpoint(str_from("http://127.0.0.1:8088/")),
+    "http://127.0.0.1:8088/v1/chat/completions", "endpoint from a base with a trailing slash");
+    _t_assert_str(agnosai_hoosh_models_endpoint(str_from("http://gw.local/")),
+    "http://gw.local/v1/models", "models endpoint");
+    _t_assert_str(agnosai_hoosh_join_url(str_from(""), str_from("/v1/models")), "/v1/models",
+    "an empty base yields the bare path");
+    _t_assert_str(agnosai_hoosh_default_url(), "http://127.0.0.1:8088", "default gateway url");
+
+    # --- role wire spellings ---
+    _t_assert_str(agnosai_chat_role_to_wire(AGNOSAI_ROLE_SYSTEM), "system", "wire system");
+    _t_assert_str(agnosai_chat_role_to_wire(AGNOSAI_ROLE_USER), "user", "wire user");
+    _t_assert_str(agnosai_chat_role_to_wire(AGNOSAI_ROLE_ASSISTANT), "assistant", "wire assistant");
+    _t_assert_str(agnosai_chat_role_to_wire(AGNOSAI_ROLE_TOOL), "tool", "wire tool");
+    var role_ok = 1;
+    for (var r = AGNOSAI_ROLE_SYSTEM; r <= AGNOSAI_ROLE_TOOL; r = r + 1) {
+        if (agnosai_chat_role_from_wire(agnosai_chat_role_to_wire(r)) != r) { role_ok = 0; }
+    }
+    assert(role_ok, "every chat role round-trips");
+    assert_eq(agnosai_chat_role_from_wire(str_from("bogus")), AGNOSAI_ROLE_USER, "unknown role -> user");
+
+    # --- provider spellings ---
+    _t_assert_str(agnosai_provider_to_wire(AGNOSAI_PROVIDER_OPENAI), "open_ai", "wire open_ai");
+    _t_assert_str(agnosai_provider_to_wire(AGNOSAI_PROVIDER_DEEPSEEK), "deep_seek", "wire deep_seek");
+    _t_assert_str(agnosai_provider_to_wire(AGNOSAI_PROVIDER_ANTHROPIC), "anthropic", "wire anthropic");
+    var prov_ok = 1;
+    for (var p = AGNOSAI_PROVIDER_OPENAI; p <= AGNOSAI_PROVIDER_OLLAMA; p = p + 1) {
+        if (agnosai_provider_from_wire(agnosai_provider_to_wire(p)) != p) { prov_ok = 0; }
+    }
+    assert(prov_ok, "every provider round-trips");
+    assert_eq(agnosai_provider_from_wire(str_from("bogus")), AGNOSAI_PROVIDER_OPENAI,
+    "unknown provider -> open_ai");
+
+    # --- message value shape ---
+    var m = agnosai_chat_message_new(AGNOSAI_ROLE_USER, str_from("hello"));
+    assert_eq(agnosai_chat_message_role(m), AGNOSAI_ROLE_USER, "message role");
+    _t_assert_str(agnosai_chat_message_content(m), "hello", "message content");
+    _t_assert_str(bayan_json_v_build(agnosai_chat_message_to_value(m)),
+    "{\"role\":\"user\",\"content\":\"hello\"}", "message serializes role then content");
+
+    # --- request defaults and the minimal body ---
+    var req = agnosai_inference_request_new(str_from("llama3"));
+    assert_eq(agnosai_inference_request_max_tokens(req), AGNOSAI_NO_LIMIT, "max_tokens starts unset");
+    assert_eq(agnosai_inference_request_temperature_milli(req), AGNOSAI_NO_LIMIT,
+    "temperature starts unset");
+    assert_eq(agnosai_inference_request_stream(req), 0, "streaming starts off");
+    assert_eq(vec_len(agnosai_inference_request_messages(req)), 0, "messages start empty");
+
+    agnosai_inference_request_say(req, AGNOSAI_ROLE_SYSTEM, str_from("be terse"));
+    agnosai_inference_request_say(req, AGNOSAI_ROLE_USER, str_from("hi"));
+    assert_eq(vec_len(agnosai_inference_request_messages(req)), 2, "two messages appended");
+    _t_assert_str(agnosai_inference_request_model(req), "llama3", "request model");
+
+    # unset optionals are OMITTED, not null — a gateway may reject an explicit null
+    var minimal = agnosai_inference_request_to_value(req);
+    assert_eq(bayan_json_v_obj_get(minimal, "max_tokens"), 0, "unset max_tokens is omitted");
+    assert_eq(bayan_json_v_obj_get(minimal, "temperature"), 0, "unset temperature is omitted");
+    assert(bayan_json_v_obj_get(minimal, "stream") != 0, "stream is always present");
+    var want_head = str_cat(str_from("{\"model\":\"llama3\",\"messages\":["),
+    str_from("{\"role\":\"system\",\"content\":\"be terse\"},"));
+    var want_body = str_cat(want_head,
+    str_from("{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}"));
+    assert(str_eq(agnosai_inference_request_to_json(req), want_body) == 1,
+    "the minimal non-streaming body");
+
+    # --- populated request ---
+    var full = agnosai_inference_request_new(str_from("llama3:70b"));
+    agnosai_inference_request_say(full, AGNOSAI_ROLE_USER, str_from("x"));
+    agnosai_inference_request_with_max_tokens(full, 1024);
+    agnosai_inference_request_with_temperature_milli(full, 700);
+    var fv = agnosai_inference_request_to_value(full);
+    assert(bayan_json_v_obj_get(fv, "max_tokens") != 0, "set max_tokens is emitted");
+    _t_assert_str(bayan_json_v_build(bayan_json_v_obj_get(fv, "temperature")), "0.7",
+    "700 milli renders as 0.7");
+    assert_eq(agnosai_inference_request_max_tokens(full), 1024, "max_tokens accessor");
+    assert_eq(agnosai_inference_request_temperature_milli(full), 700, "temperature accessor");
+
+    # a temperature of exactly 0 is emitted, not mistaken for unset
+    var zero_temp = agnosai_inference_request_new(str_from("m"));
+    agnosai_inference_request_with_temperature_milli(zero_temp, 0);
+    assert(bayan_json_v_obj_get(agnosai_inference_request_to_value(zero_temp), "temperature") != 0,
+    "temperature 0.0 is emitted, not treated as unset");
+
+    # --- streaming turns on stream_options.include_usage ---
+    var streamed = agnosai_inference_request_new(str_from("m"));
+    agnosai_inference_request_say(streamed, AGNOSAI_ROLE_USER, str_from("x"));
+    agnosai_inference_request_with_stream(streamed, 1);
+    var sv = agnosai_inference_request_to_value(streamed);
+    var so = bayan_json_v_obj_get(sv, "stream_options");
+    assert(so != 0, "streaming emits stream_options");
+    assert_eq(bayan_json_v_bool(bayan_json_v_obj_get(so, "include_usage")), 1,
+    "stream_options.include_usage is set, so the stream carries a usage frame");
+    assert_eq(bayan_json_v_obj_get(agnosai_inference_request_to_value(req), "stream_options"), 0,
+    "a non-streaming request omits stream_options");
+
+    # --- content extraction from a real-shaped response ---
+    var body = str_cat(str_cat(
+    str_from("{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"model\":\"llama3\","),
+    str_from("\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello there\"},")),
+    str_cat(str_from("\"finish_reason\":\"stop\"}],"),
+    str_from("\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4,\"total_tokens\":13}}")));
+    _t_assert_str(agnosai_hoosh_extract_content(body), "Hello there", "extract message content");
+    _t_assert_str(agnosai_hoosh_extract_model(body), "llama3", "extract model");
+    _t_assert_str(agnosai_hoosh_extract_finish_reason(body), "stop", "extract finish_reason");
+
+    var pt: i64[1];
+    var ct: i64[1];
+    assert_eq(agnosai_hoosh_extract_usage(body, &pt, &ct), 1, "usage block found");
+    assert_eq(load64(&pt), 9, "prompt_tokens");
+    assert_eq(load64(&ct), 4, "completion_tokens");
+
+    var resp = agnosai_hoosh_response_from_body(body);
+    assert(resp != 0, "a full response is built from the body");
+    _t_assert_str(agnosai_inference_response_content(resp), "Hello there", "response content");
+    _t_assert_str(agnosai_inference_response_model(resp), "llama3", "response model");
+    assert_eq(agnosai_inference_response_prompt_tokens(resp), 9, "response prompt tokens");
+    assert_eq(agnosai_inference_response_completion_tokens(resp), 4, "response completion tokens");
+    assert_eq(agnosai_inference_response_total_tokens(resp), 13, "response total tokens");
+    _t_assert_str(agnosai_inference_response_finish_reason(resp), "stop", "response finish reason");
+
+    # --- malformed / missing shapes return 0 rather than crashing ---
+    assert_eq(agnosai_hoosh_extract_content(str_from("not json")), 0, "garbage body yields no content");
+    assert_eq(agnosai_hoosh_extract_content(str_from("{}")), 0, "no choices key yields no content");
+    assert_eq(agnosai_hoosh_extract_content(str_from("{\"choices\":[]}")), 0,
+    "an empty choices array yields no content");
+    assert_eq(agnosai_hoosh_extract_content(str_from("{\"choices\":[{\"message\":{}}]}")), 0,
+    "a message with no content yields no content");
+    assert_eq(agnosai_hoosh_extract_content(str_from("{\"choices\":{}}")), 0,
+    "a non-array choices yields no content");
+    assert_eq(agnosai_hoosh_response_from_body(str_from("{}")), 0, "no content means no response");
+
+    # a body with content but no usage still builds, with zero counts
+    var no_usage = str_from("{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}");
+    var nu = agnosai_hoosh_response_from_body(no_usage);
+    assert(nu != 0, "a body without usage still builds a response");
+    assert_eq(agnosai_inference_response_total_tokens(nu), 0, "missing usage counts as zero tokens");
+    assert_eq(agnosai_hoosh_extract_usage(no_usage, &pt, &ct), 0, "no usage block reports absent");
+
+    # --- streaming delta extraction ---
+    var frame = str_from("{\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"index\":0}]}");
+    _t_assert_str(agnosai_hoosh_extract_delta(frame), "Hel", "extract a delta chunk");
+    assert_eq(agnosai_hoosh_extract_delta(str_from("{\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}")), 0,
+    "the role-only opening delta has no content");
+    assert_eq(agnosai_hoosh_extract_delta(str_from("{\"choices\":[{\"finish_reason\":\"stop\"}]}")), 0,
+    "the finish frame has no delta content");
+
+    # --- SSE line framing ---
+    _t_assert_str(agnosai_hoosh_sse_data(str_from("data: {\"a\":1}")), "{\"a\":1}",
+    "data line with a space");
+    _t_assert_str(agnosai_hoosh_sse_data(str_from("data:{\"a\":1}")), "{\"a\":1}",
+    "data line without a space");
+    assert_eq(agnosai_hoosh_sse_data(str_from("data: [DONE]")), 0,
+    "the [DONE] sentinel is not a frame to parse");
+    assert_eq(agnosai_hoosh_sse_data(str_from("event: message")), 0, "a non-data field is skipped");
+    assert_eq(agnosai_hoosh_sse_data(str_from("")), 0, "an empty line is skipped");
+    assert_eq(agnosai_hoosh_sse_data(str_from("data:")), 0, "an empty data payload is skipped");
+    assert_eq(agnosai_hoosh_sse_is_done(str_from("data: [DONE]")), 1, "[DONE] is recognized");
+    assert_eq(agnosai_hoosh_sse_is_done(str_from("data:[DONE]")), 1, "[DONE] without a space");
+    assert_eq(agnosai_hoosh_sse_is_done(str_from("data: {\"a\":1}")), 0, "a real frame is not [DONE]");
+
+    # a delta round trip through the SSE framing, the way a stream reader runs it
+    var line = str_from("data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}");
+    _t_assert_str(agnosai_hoosh_extract_delta(agnosai_hoosh_sse_data(line)), "lo",
+    "an SSE line unwraps then yields its delta");
+
+    # --- error extraction ---
+    _t_assert_str(agnosai_hoosh_extract_error(
+    str_from("{\"error\":{\"message\":\"rate limit exceeded\",\"type\":\"rate_limit\"}}")),
+    "rate limit exceeded", "extract error.message");
+    assert_eq(agnosai_hoosh_extract_error(str_from("{\"ok\":true}")), 0, "no error key yields 0");
+    assert_eq(agnosai_hoosh_extract_error(str_from("not json")), 0, "garbage yields no error message");
+
+    # the extracted error text is what llm_retry classifies on, so it must stay
+    # classifiable end to end
+    assert_eq(agnosai_is_retryable(agnosai_hoosh_extract_error(
+    str_from("{\"error\":{\"message\":\"503 Service Unavailable\"}}"))), 1,
+    "a gateway 503 message classifies as retryable");
+
+    # --- model catalogue ---
+    var models_body = str_from("{\"object\":\"list\",\"data\":[{\"id\":\"llama3\"},{\"id\":\"llama3:70b\"}]}");
+    var data = agnosai_hoosh_extract_models(models_body);
+    assert(data != 0, "models data array found");
+    assert_eq(bayan_json_v_arr_len(data), 2, "two models listed");
+    _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get(bayan_json_v_arr_get(data, 0), "id")),
+    "llama3", "first model id");
+    assert_eq(agnosai_hoosh_extract_models(str_from("{}")), 0, "no data key yields 0");
+    assert_eq(agnosai_hoosh_extract_models(str_from("{\"data\":{}}")), 0, "a non-array data yields 0");
+
+    # --- the remaining public surface ---
+    _t_assert_str(agnosai_hoosh_chat_path(), "/v1/chat/completions", "chat completions path");
+    _t_assert_str(agnosai_hoosh_models_path(), "/v1/models", "models path");
+
+    var built = agnosai_inference_request_new(str_from("m"));
+    agnosai_inference_request_with_message(built, agnosai_chat_message_new(AGNOSAI_ROLE_USER, str_from("q")));
+    assert_eq(vec_len(agnosai_inference_request_messages(built)), 1,
+    "with_message appends a prebuilt message");
+
+    var manual = agnosai_inference_response_new(str_from("text"), str_from("mdl"));
+    _t_assert_str(agnosai_inference_response_content(manual), "text", "manual response content");
+    _t_assert_str(agnosai_inference_response_model(manual), "mdl", "manual response model");
+    assert_eq(agnosai_inference_response_total_tokens(manual), 0, "manual response starts at 0 tokens");
+    assert_eq(agnosai_inference_response_finish_reason(manual), 0, "manual response has no finish reason");
+
+    assert(agnosai_hoosh_parse_body(str_from("{\"a\":1}")) != 0, "parse_body accepts valid JSON");
+    assert_eq(agnosai_hoosh_parse_body(str_from("nope")), 0, "parse_body rejects garbage");
+
+    # --- headers ---
+    # These are sandhi header OBJECTS, not strings: sandhi_http_post takes the
+    # structured form. Passing a raw CRLF string segfaults inside sandhi rather
+    # than erroring, which is how this was originally caught.
+    var h_none = agnosai_hoosh_headers(0);
+    assert_eq(sandhi_headers_count(h_none), 1, "no api key means one header");
+    _t_assert_str(str_from(sandhi_headers_get(h_none, "Content-Type")), "application/json",
+    "Content-Type is set");
+    assert_eq(sandhi_headers_get(h_none, "Authorization"), 0, "no api key means no Authorization");
+
+    var h_empty = agnosai_hoosh_headers(str_from(""));
+    assert_eq(sandhi_headers_count(h_empty), 1, "an empty api key means no Authorization header");
+
+    var h_key = agnosai_hoosh_headers(str_from("sk-abc"));
+    assert_eq(sandhi_headers_count(h_key), 2, "an api key adds a second header");
+    _t_assert_str(str_from(sandhi_headers_get(h_key, "Authorization")), "Bearer sk-abc",
+    "the Authorization header is a bearer token");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

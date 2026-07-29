@@ -1,0 +1,97 @@
+# =========================================================================
+# llm_live.smcyr — the M3 exit check: a live chat-completion round trip
+# through agnosai's own seam client.
+#
+# This is the one test that exercises `agnosai_hoosh_chat`, the single I/O call
+# in src/llm_hoosh.cyr. Everything else about the seam is unit-tested offline in
+# tests/llm_hoosh.tcyr; this proves the target is real and that our request
+# shape is one the gateway actually accepts.
+#
+# Requires a running gateway:  scripts/stack.sh up
+# Run it with:                 scripts/stack.sh check
+#
+# **Exits 0 when the gateway is unreachable**, printing SKIP. A live-dependency
+# check must not fail a `cyrius smoke` run on a machine with no stack up — but
+# it does fail loudly if the gateway answers and the exchange is wrong, which is
+# the case that actually matters.
+#
+# Takes the model as argv[1]; with no argument it uses llm_router's Fast tier.
+# scripts/stack.sh passes $AGNOSAI_MODEL through.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/llm.cyr"
+
+fn main() {
+    alloc_init();
+
+    args_init();
+    var model = agnosai_default_model(AGNOSAI_TIER_FAST);
+    if (argc() > 1) {
+        var a1 = argv(1);
+        if (a1 != 0) {
+            if (strlen(a1) > 0) { model = str_from(a1); }
+        }
+    }
+
+    var req = agnosai_inference_request_new(model);
+    agnosai_inference_request_say(req, AGNOSAI_ROLE_SYSTEM, str_from("be terse"));
+    agnosai_inference_request_say(req, AGNOSAI_ROLE_USER,
+    str_from("reply with the single word: pong"));
+    agnosai_inference_request_with_max_tokens(req, 64);
+
+    syscall(1, 1, "model:   ", 9);
+    str_println(model);
+    syscall(1, 1, "request: ", 9);
+    str_println(agnosai_inference_request_to_json(req));
+
+    var out: i64[1];
+    store64(&out, 0);
+    var err = agnosai_hoosh_chat(agnosai_hoosh_default_url(), 0, req, &out);
+
+    if (err != 0) {
+        # A transport error means no gateway — skip rather than fail. Anything
+        # else (a non-2xx, or a 200 whose body we could not read) is a real
+        # failure and must stop the run.
+        if (str_starts_with(err, str_from("hoosh transport error")) == 1) {
+            syscall(1, 1, "SKIP: ", 6);
+            str_println(err);
+            println("      start the gateway with: scripts/stack.sh up");
+            return 0;
+        }
+        syscall(1, 1, "FAIL: ", 6);
+        str_println(err);
+        return 1;
+    }
+
+    var resp = load64(&out);
+    var content = agnosai_inference_response_content(resp);
+    if (str_len(content) == 0) {
+        println("FAIL: the gateway answered 2xx with empty content");
+        return 1;
+    }
+
+    syscall(1, 1, "reply:   ", 9);
+    str_println(content);
+    syscall(1, 1, "model:   ", 9);
+    str_println(agnosai_inference_response_model(resp));
+    syscall(1, 1, "finish:  ", 9);
+    str_println(agnosai_inference_response_finish_reason(resp));
+    syscall(1, 1, "tokens:  ", 9);
+    print_num(agnosai_inference_response_total_tokens(resp));
+    println("");
+
+    if (agnosai_inference_response_total_tokens(resp) <= 0) {
+        println("FAIL: no token usage reported — the usage block is missing");
+        return 1;
+    }
+
+    println("OK: live chat-completion round trip through agnosai_hoosh_chat");
+    return 0;
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

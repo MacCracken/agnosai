@@ -19,14 +19,14 @@ lands, not before, so the number always names something that actually shipped.
 
 - **Rust reference**: 27,683 lines at `rust-old/` — frozen, do not edit. It is the parity oracle.
 - **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers) and
-  `llm` (router + retry so far), plus `src/id.cyr` and `src/units.cyr`. `src/main.cyr` is still
-  the stub entry point — no CLI surface yet.
+  `llm` (router, retry, hoosh seam client + hub), plus `src/id.cyr` and `src/units.cyr`.
+  `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
 ## Where the port is
 
 Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **complete**: `learning` and
-`core` both ported and green against the oracle. Phase 2 (M3 `llm`) — **router and retry done,
-hoosh seam client next**.
+`core` both ported and green against the oracle. Phase 2 (M3 `llm`) — **complete**: router, retry
+and the hoosh seam client, with the live round trip verified.
 
 | Gate | Status |
 |---|---|
@@ -42,11 +42,12 @@ hoosh seam client next**.
 | `learning` ported (M2, Phase 1) | ✅ 5 modules + hub, 112 assertions, 100% reference coverage |
 | `core` ported (M2, Phase 1) | ✅ 6 of 6 + shared `core_json` helpers |
 | Money representation decided | ✅ integer micro-USD (2026-07-28) — gates core BITE 8 |
-| `llm` ported (M3, Phase 2) | 🟡 2 of 3 — router + retry done; hoosh seam client next |
+| `llm` ported (M3, Phase 2) | ✅ router + retry + hoosh seam client |
+| M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
 
 ## Tests
 
-**617 assertions across 14 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**713 assertions across 15 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -64,12 +65,13 @@ hoosh seam client next**.
 | `core_crew.tcyr` | 66 | 8 |
 | `llm_router.tcyr` | 48 | 14 of 17 (3 are hwaccel-gated and defer) |
 | `llm_retry.tcyr` | 43 | 11 (4 of them `#[tokio::test]`) |
+| `llm_hoosh.tcyr` | 96 | — (replaces a `pub use` facade; no oracle tests) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
 the Q-table's packed-key distinctness — none of which the Rust tests reach.
 
-`cyrius coverage --min 80` → **100% (309/309 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (356/356 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -161,14 +163,16 @@ kiran (game AI) — none consuming the Cyrius line yet.
 
 ## Next
 
-**Finish M3** — the hoosh seam client (`src/llm_hoosh.cyr`). It defines the
-inference types locally (Message, Role, ProviderType, InferenceRequest,
-InferenceResponse) and does the OpenAI-compatible chat-completions round trip
-over sandhi, following `thoth/src/hoosh.cyr`. **M3's exit criterion needs a
-running `hoosh serve 8088`** — the builders and extractors unit-test offline,
-but the round trip itself does not.
+**M4 — `tools`** ([`roadmap.md`](roadmap.md), Phase 3): native, registry (plus
+the mandatory registry mutex, since `run_pooled` makes every worker a thread),
+remote_registry, and the builtins. Defers python_tool/wasm_tool.
 
-Then **M4 — `tools`** ([`roadmap.md`](roadmap.md), Phase 3).
+**Live testing.** `scripts/stack.sh` brings up the services agnosai needs
+(today: hoosh only) and `scripts/stack.sh check` drives
+`tests/smcyr/llm_live.smcyr` — the one harness that exercises
+`agnosai_hoosh_chat` against a real gateway. It SKIPs (exit 0) when no gateway
+is up, so `cyrius smoke` stays green on a machine with no stack, but fails
+loudly if the gateway answers and the exchange is wrong.
 
 Open items, none blocking:
 

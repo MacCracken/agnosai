@@ -8,11 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **llm** (M3, Phase 2, in progress) — `src/llm.cyr` hub plus two of three submodules:
+- **llm** (M3, Phase 2) — **complete**. `src/llm.cyr` hub plus three submodules:
   - **llm_router** — `agnosai_route` / `agnosai_default_model` / `agnosai_parse_complexity`:
     task-complexity model routing over ModelTier, TaskType, Complexity and TaskProfile.
   - **llm_retry** — `agnosai_with_retry` / `agnosai_compute_delay` / `agnosai_is_retryable`:
-    exponential backoff with jitter, and the retryable-error classifier.
+    exponential backoff with jitter, and the retryable-error classifier. The oracle's async
+    generic `with_retry` becomes a function pointer plus opaque context with a zero-allocation
+    result contract — Cyrius has no futures, and a tagged `Result` per attempt would allocate on
+    the bump allocator on the hot inference path.
+  - **llm_hoosh** — the hoosh seam client. Replaces the oracle's `pub use hoosh::…` facade, which
+    cannot survive the port: hoosh in Cyrius is a binary with no `dist/`, so it is consumed as a
+    remote HTTP seam (per `thoth/src/hoosh.cyr`). Defines the inference types agnosai consumes
+    locally (`agnosai_chat_*`, `agnosai_inference_request_*`, `agnosai_inference_response_*`,
+    ProviderType), builds the OpenAI-compatible request body, extracts content / deltas / usage /
+    errors / the model catalogue, frames SSE `data:` lines, and does the round trip over sandhi.
+    One I/O call (`agnosai_hoosh_chat`); everything else is pure and unit-tested offline.
+- **scripts/stack.sh** — brings up the AGNOS services agnosai needs for live testing (today hoosh
+  only; daimon and bote hooks marked for M4/M6) and `check` drives the live round trip. Modelled
+  on `thoth/scripts/stack.sh`, sharing the same `$STACK_HOME` so both can drive one gateway.
+- **tests/smcyr/llm_live.smcyr** — the M3 exit check: a live chat-completion round trip through
+  `agnosai_hoosh_chat`, not curl, so it exercises agnosai's own client. SKIPs (exit 0) when no
+  gateway is reachable; fails loudly when one answers and the exchange is wrong.
 - **units** — the shared `AGNOSAI_NS_PER_SEC` / `_MS` / `_US` time constants. No oracle module;
   extracted once `learning_profile` and `core_error` had each grown their own — under two
   different names for the same value — and `llm_retry` would have been the third consumer.
