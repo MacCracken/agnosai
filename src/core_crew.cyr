@@ -87,7 +87,7 @@ fn agnosai_crew_status_from_wire(s: Str): i64 {
 # Create a new crew spec with the given name and default settings.
 fn agnosai_crew_new(name: Str): i64 {
     var c = alloc(AGN_CREW_SIZE);
-    store64(c + AGN_CREW_ID, agnosai_uuid_v4());
+    store64(c + AGN_CREW_ID, agnosai_uuid_v4_str());
     store64(c + AGN_CREW_NAME, name);
     store64(c + AGN_CREW_AGENTS, vec_new());
     store64(c + AGN_CREW_TASKS, vec_new());
@@ -166,7 +166,7 @@ fn agnosai_crew_trust_level(c): i64 {
 fn agnosai_crew_to_value(c): i64 {
     var obj = bayan_json_v_obj_new();
     bayan_json_v_obj_set(obj, str_from("id"),
-    bayan_json_v_str_new(agnosai_uuid_to_str(load64(c + AGN_CREW_ID))));
+    bayan_json_v_str_new(load64(c + AGN_CREW_ID)));
     bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(c + AGN_CREW_NAME)));
 
     var agents = load64(c + AGN_CREW_AGENTS);
@@ -197,7 +197,7 @@ fn agnosai_crew_from_value(v): i64 {
     if (bayan_json_v_is_obj(v) == 0) { return 0; }
     var id_v = bayan_json_v_obj_get(v, "id");
     if (id_v == 0 || bayan_json_v_is_str(id_v) == 0) { return 0; }
-    var id = agnosai_uuid_parse(bayan_json_v_str(id_v));
+    var id = agnosai_uuid_canonical(bayan_json_v_str(id_v));
     if (id == 0) { return 0; }
 
     var name = _agnosai_str_field(v, "name");
@@ -278,7 +278,7 @@ fn agnosai_crew_profile_task_ms(p): i64 {
 
 # Record a task's duration in milliseconds. Returns the profile.
 fn agnosai_crew_profile_record_task_ms(p, task_id, ms): i64 {
-    map_set(load64(p + AGN_PROF_TASK_MS), agnosai_uuid_to_str(task_id), ms);
+    map_set(load64(p + AGN_PROF_TASK_MS), task_id, ms);
     return p;
 }
 
@@ -322,7 +322,7 @@ fn agnosai_crew_profile_task_cost(p): i64 {
 
 # Record a task's cost in micro-USD. Returns the profile.
 fn agnosai_crew_profile_record_task_cost(p, task_id, micro_usd): i64 {
-    map_set(load64(p + AGN_PROF_TASK_COST), agnosai_uuid_to_str(task_id), micro_usd);
+    map_set(load64(p + AGN_PROF_TASK_COST), task_id, micro_usd);
     return p;
 }
 
@@ -499,7 +499,7 @@ fn agnosai_crew_state_with_result(s, result): i64 {
 fn agnosai_crew_state_to_value(s): i64 {
     var obj = bayan_json_v_obj_new();
     bayan_json_v_obj_set(obj, str_from("crew_id"),
-    bayan_json_v_str_new(agnosai_uuid_to_str(load64(s + AGN_CSTATE_CREW_ID))));
+    bayan_json_v_str_new(load64(s + AGN_CSTATE_CREW_ID)));
     bayan_json_v_obj_set(obj, str_from("status"),
     bayan_json_v_str_new(agnosai_crew_status_to_wire(load64(s + AGN_CSTATE_STATUS))));
 
@@ -523,7 +523,7 @@ fn agnosai_crew_state_from_value(v): i64 {
     if (bayan_json_v_is_obj(v) == 0) { return 0; }
     var id_v = bayan_json_v_obj_get(v, "crew_id");
     if (id_v == 0 || bayan_json_v_is_str(id_v) == 0) { return 0; }
-    var id = agnosai_uuid_parse(bayan_json_v_str(id_v));
+    var id = agnosai_uuid_canonical(bayan_json_v_str(id_v));
     if (id == 0) { return 0; }
 
     var status = AGNOSAI_CREW_PENDING;

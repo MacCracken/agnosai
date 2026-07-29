@@ -215,7 +215,7 @@ fn agnosai_process_to_value(p): i64 {
     if (kind == AGNOSAI_PROCESS_DAG) { return bayan_json_v_str_new(str_from("dag")); }
     if (kind == AGNOSAI_PROCESS_HIERARCHICAL) {
         var inner = bayan_json_v_obj_new();
-        var mgr = agnosai_uuid_to_str(load64(p + AGN_PROC_MANAGER));
+        var mgr = load64(p + AGN_PROC_MANAGER);
         bayan_json_v_obj_set(inner, str_from("manager"), bayan_json_v_str_new(mgr));
         var outer = bayan_json_v_obj_new();
         bayan_json_v_obj_set(outer, str_from("hierarchical"), inner);
@@ -245,7 +245,7 @@ fn agnosai_process_from_value(v): i64 {
     if (h != 0 && bayan_json_v_is_obj(h) == 1) {
         var m = bayan_json_v_obj_get(h, "manager");
         if (m != 0 && bayan_json_v_is_str(m) == 1) {
-            var id = agnosai_uuid_parse(bayan_json_v_str(m));
+            var id = agnosai_uuid_canonical(bayan_json_v_str(m));
             if (id != 0) { return agnosai_process_hierarchical(id); }
         }
         return agnosai_process_sequential();
@@ -265,7 +265,7 @@ fn agnosai_process_from_value(v): i64 {
 # default: no expected output, unassigned, Normal priority, Pending, Low risk.
 fn agnosai_task_new(description: Str): i64 {
     var t = alloc(AGN_TASK_SIZE);
-    store64(t + AGN_TASK_ID, agnosai_uuid_v4());
+    store64(t + AGN_TASK_ID, agnosai_uuid_v4_str());
     store64(t + AGN_TASK_DESCRIPTION, description);
     store64(t + AGN_TASK_EXPECTED_OUTPUT, 0);
     store64(t + AGN_TASK_ASSIGNED_AGENT, 0);
@@ -380,7 +380,7 @@ fn agnosai_task_output_schema(t): i64 {
 fn agnosai_task_to_value(t): i64 {
     var obj = bayan_json_v_obj_new();
     bayan_json_v_obj_set(obj, str_from("id"),
-    bayan_json_v_str_new(agnosai_uuid_to_str(load64(t + AGN_TASK_ID))));
+    bayan_json_v_str_new(load64(t + AGN_TASK_ID)));
     bayan_json_v_obj_set(obj, str_from("description"),
     bayan_json_v_str_new(load64(t + AGN_TASK_DESCRIPTION)));
     bayan_json_v_obj_set(obj, str_from("expected_output"),
@@ -388,7 +388,7 @@ fn agnosai_task_to_value(t): i64 {
 
     var agent = load64(t + AGN_TASK_ASSIGNED_AGENT);
     var agent_v = bayan_json_v_null();
-    if (agent != 0) { agent_v = bayan_json_v_str_new(agnosai_uuid_to_str(agent)); }
+    if (agent != 0) { agent_v = bayan_json_v_str_new(agent); }
     bayan_json_v_obj_set(obj, str_from("assigned_agent"), agent_v);
 
     bayan_json_v_obj_set(obj, str_from("priority"),
@@ -399,7 +399,7 @@ fn agnosai_task_to_value(t): i64 {
     var deps = load64(t + AGN_TASK_DEPENDENCIES);
     var deps_v = bayan_json_v_arr_new();
     for (var i = 0; i < vec_len(deps); i = i + 1) {
-        bayan_json_v_arr_push(deps_v, bayan_json_v_str_new(agnosai_uuid_to_str(vec_get(deps, i))));
+        bayan_json_v_arr_push(deps_v, bayan_json_v_str_new(vec_get(deps, i)));
     }
     bayan_json_v_obj_set(obj, str_from("dependencies"), deps_v);
 
@@ -421,7 +421,7 @@ fn agnosai_task_from_value(v): i64 {
     if (bayan_json_v_is_obj(v) == 0) { return 0; }
     var id_v = bayan_json_v_obj_get(v, "id");
     if (id_v == 0 || bayan_json_v_is_str(id_v) == 0) { return 0; }
-    var id = agnosai_uuid_parse(bayan_json_v_str(id_v));
+    var id = agnosai_uuid_canonical(bayan_json_v_str(id_v));
     if (id == 0) { return 0; }
 
     var desc = str_from("");
@@ -438,7 +438,7 @@ fn agnosai_task_from_value(v): i64 {
 
     var aa = bayan_json_v_obj_get(v, "assigned_agent");
     if (aa != 0 && bayan_json_v_is_str(aa) == 1) {
-        store64(t + AGN_TASK_ASSIGNED_AGENT, agnosai_uuid_parse(bayan_json_v_str(aa)));
+        store64(t + AGN_TASK_ASSIGNED_AGENT, agnosai_uuid_canonical(bayan_json_v_str(aa)));
     }
 
     var pr = bayan_json_v_obj_get(v, "priority");
@@ -457,7 +457,7 @@ fn agnosai_task_from_value(v): i64 {
         for (var i = 0; i < bayan_json_v_arr_len(dv); i = i + 1) {
             var e = bayan_json_v_arr_get(dv, i);
             if (bayan_json_v_is_str(e) == 1) {
-                var did = agnosai_uuid_parse(bayan_json_v_str(e));
+                var did = agnosai_uuid_canonical(bayan_json_v_str(e));
                 if (did != 0) { vec_push(deps, did); }
             }
         }
@@ -531,7 +531,7 @@ fn agnosai_task_result_with_metadata(r, key: Str, value): i64 {
 fn agnosai_task_result_to_value(r): i64 {
     var obj = bayan_json_v_obj_new();
     bayan_json_v_obj_set(obj, str_from("task_id"),
-    bayan_json_v_str_new(agnosai_uuid_to_str(load64(r + AGN_TRES_TASK_ID))));
+    bayan_json_v_str_new(load64(r + AGN_TRES_TASK_ID)));
     bayan_json_v_obj_set(obj, str_from("output"), bayan_json_v_str_new(load64(r + AGN_TRES_OUTPUT)));
     bayan_json_v_obj_set(obj, str_from("status"),
     bayan_json_v_str_new(agnosai_task_status_to_wire(load64(r + AGN_TRES_STATUS))));
@@ -546,7 +546,7 @@ fn agnosai_task_result_from_value(v): i64 {
     if (bayan_json_v_is_obj(v) == 0) { return 0; }
     var tid_v = bayan_json_v_obj_get(v, "task_id");
     if (tid_v == 0 || bayan_json_v_is_str(tid_v) == 0) { return 0; }
-    var tid = agnosai_uuid_parse(bayan_json_v_str(tid_v));
+    var tid = agnosai_uuid_canonical(bayan_json_v_str(tid_v));
     if (tid == 0) { return 0; }
 
     var output = str_from("");

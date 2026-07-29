@@ -127,3 +127,36 @@ fn agnosai_uuid_parse(s: Str): i64 {
     }
     return u;
 }
+
+# A fresh v4 identifier in canonical string form.
+#
+# This is what every `*_id` field in the port stores. See the note on
+# `agnosai_uuid_canonical` for why ids are strings rather than the 16-byte
+# buffers `agnosai_uuid_v4` returns.
+fn agnosai_uuid_v4_str(): i64 {
+    return agnosai_uuid_to_str(agnosai_uuid_v4());
+}
+
+# Validate and canonicalise a UUID string, or 0 when it is not a UUID.
+#
+# **Identifiers are stored as canonical strings, not as raw 16-byte buffers.**
+# The buffer form is the natural one — it is what `uuid::Uuid` is in the oracle,
+# it is half the size, and `agnosai_uuid_eq` is a 16-byte memcmp. It was also a
+# standing trap: Cyrius has no types to stop a buffer reaching `str_eq` or a
+# `map_new_str` key, where its first eight bytes are read as a string length.
+# That is not a compile error and not a clean crash — it is a segfault three
+# call layers away, and it cost a real debugging session in `orch_scheduler`.
+#
+# Storing the canonical string removes the trap rather than documenting it: ids
+# compare with `str_eq`, key a `map_new_str` directly, and serialise without a
+# conversion. The wire form is unchanged, because that was already the canonical
+# string. The byte-level verbs remain for callers who genuinely want bytes.
+#
+# Parsing and re-rendering also normalises case, which matches the oracle: the
+# `uuid` crate parses hex of either case into bytes and its Display always emits
+# lowercase.
+fn agnosai_uuid_canonical(s: Str): i64 {
+    var u = agnosai_uuid_parse(s);
+    if (u == 0) { return 0; }
+    return agnosai_uuid_to_str(u);
+}

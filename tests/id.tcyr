@@ -84,6 +84,34 @@ fn main() {
     "nil UUID renders as all zeros");
     assert_eq(agnosai_uuid_eq(nil, agnosai_uuid_nil()), 1, "nil equals nil");
 
+    # --- ids are canonical strings, and the wire form is unchanged ---
+    # `agnosai_uuid_v4_str` / `agnosai_uuid_canonical` are what every `*_id`
+    # field stores. The buffer verbs remain for byte-level callers.
+    var vs = agnosai_uuid_v4_str();
+    assert_eq(str_len(vs), 36, "a v4 id is a 36-char canonical string");
+    assert_eq(agnosai_uuid_version(agnosai_uuid_parse(vs)), 4, "carrying version 4");
+    assert(str_eq(vs, agnosai_uuid_v4_str()) == 0, "and two are distinct");
+
+    # canonicalisation validates and lowercases, matching the uuid crate's
+    # parse-any-case / Display-lowercase behaviour
+    assert(str_eq(agnosai_uuid_canonical(str_from("6BA7B810-9DAD-11D1-80B4-00C04FD430C8")),
+    str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8")) == 1,
+    "an upper-case UUID canonicalises to lower case, as the uuid crate's Display does");
+    assert(str_eq(agnosai_uuid_canonical(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8")),
+    str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8")) == 1, "a canonical one is unchanged");
+    assert_eq(agnosai_uuid_canonical(str_from("not-a-uuid")), 0, "a non-UUID yields 0");
+    assert_eq(agnosai_uuid_canonical(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430cg")), 0,
+    "and so does a bad hex digit");
+    assert_eq(agnosai_uuid_canonical(str_from("")), 0, "and the empty string");
+
+    # an id used the way the port uses one: str_eq and a str-keyed map. Both of
+    # these silently corrupted when ids were raw 16-byte buffers.
+    var m = map_new_str();
+    map_set(m, vs, 7);
+    assert_eq(map_get(m, vs), 7, "an id keys a map_new_str directly");
+    assert_eq(str_eq(vs, vs), 1, "and compares with str_eq");
+    assert_eq(str_eq(vs, agnosai_uuid_v4_str()), 0, "distinguishing distinct ids");
+
     return assert_summary();
 }
 

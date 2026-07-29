@@ -97,7 +97,7 @@ fn agnosai_message_target_to_value(t): i64 {
     }
     var obj = bayan_json_v_obj_new();
     if (kind == AGNOSAI_TARGET_AGENT) {
-        var id_str = agnosai_uuid_to_str(load64(t + AGN_TGT_AGENT));
+        var id_str = load64(t + AGN_TGT_AGENT);
         bayan_json_v_obj_set(obj, str_from("agent"), bayan_json_v_str_new(id_str));
         return obj;
     }
@@ -118,7 +118,7 @@ fn agnosai_message_target_from_value(v): i64 {
 
     var agent = bayan_json_v_obj_get(v, "agent");
     if (agent != 0 && bayan_json_v_is_str(agent) == 1) {
-        var id = agnosai_uuid_parse(bayan_json_v_str(agent));
+        var id = agnosai_uuid_canonical(bayan_json_v_str(agent));
         if (id == 0) { return 0; }
         return agnosai_message_target_agent(id);
     }
@@ -200,7 +200,7 @@ fn _agnosai_msg_parse_rfc3339(s: Str): i64 {
 # Create a new message with an auto-generated v4 id and the current timestamp.
 fn agnosai_message_new(from, to, payload): i64 {
     var m = alloc(AGN_MSG_SIZE);
-    store64(m + AGN_MSG_ID, agnosai_uuid_v4());
+    store64(m + AGN_MSG_ID, agnosai_uuid_v4_str());
     store64(m + AGN_MSG_FROM, from);
     store64(m + AGN_MSG_TO, to);
     store64(m + AGN_MSG_PAYLOAD, payload);
@@ -237,8 +237,8 @@ fn agnosai_message_timestamp_ns(m): i64 {
 # struct fields in declaration order.
 fn agnosai_message_to_value(m): i64 {
     var obj = bayan_json_v_obj_new();
-    var id_str = agnosai_uuid_to_str(load64(m + AGN_MSG_ID));
-    var from_str = agnosai_uuid_to_str(load64(m + AGN_MSG_FROM));
+    var id_str = load64(m + AGN_MSG_ID);
+    var from_str = load64(m + AGN_MSG_FROM);
     bayan_json_v_obj_set(obj, str_from("id"), bayan_json_v_str_new(id_str));
     bayan_json_v_obj_set(obj, str_from("from"), bayan_json_v_str_new(from_str));
     bayan_json_v_obj_set(obj, str_from("to"), agnosai_message_target_to_value(load64(m + AGN_MSG_TO)));
@@ -266,8 +266,8 @@ fn agnosai_message_from_value(v): i64 {
     if (bayan_json_v_is_str(id_v) == 0 || bayan_json_v_is_str(from_v) == 0) { return 0; }
     if (bayan_json_v_is_str(ts_v) == 0) { return 0; }
 
-    var id = agnosai_uuid_parse(bayan_json_v_str(id_v));
-    var from = agnosai_uuid_parse(bayan_json_v_str(from_v));
+    var id = agnosai_uuid_canonical(bayan_json_v_str(id_v));
+    var from = agnosai_uuid_canonical(bayan_json_v_str(from_v));
     var to = agnosai_message_target_from_value(to_v);
     var ts = _agnosai_msg_parse_rfc3339(bayan_json_v_str(ts_v));
     if (id == 0 || from == 0 || to == 0 || ts < 0) { return 0; }

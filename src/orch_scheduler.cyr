@@ -29,14 +29,6 @@
 # run, which the oracle is not.
 # =========================================================================
 
-# **Task ids are raw 16-byte UUID buffers, not Strs.** `agnosai_task_id` hands
-# back what `agnosai_uuid_v4` allocated, so they compare with `agnosai_uuid_eq`
-# and are rendered with `agnosai_uuid_to_str`. Passing one to `str_eq` or using
-# it as a `map_new_str` key reads the first eight bytes of the UUID as a length
-# and segfaults — which is exactly what the `id_to_key` map here does when built
-# carelessly, since the oracle's `HashMap<TaskId, String>` looks like it should
-# take the id directly. The canonical string is the map key.
-
 # The oracle's five priority tiers, indexed by discriminant.
 var AGNOSAI_SCHED_TIERS = 5;
 
@@ -281,8 +273,7 @@ fn agnosai_scheduler_load_dag(s, dag): i64 {
     var id_to_key = map_new_str();
     for (var j = 0; j < vec_len(keys); j = j + 1) {
         var k = vec_get(keys, j);
-        map_set(id_to_key, agnosai_uuid_to_str(agnosai_task_id(map_get(tasks, k))),
-        str_clone(k));
+        map_set(id_to_key, agnosai_task_id(map_get(tasks, k)), str_clone(k));
     }
 
     store64(s + AGN_SCH_DAG_TASKS, tasks);
@@ -307,7 +298,7 @@ fn agnosai_scheduler_ready_tasks(s, completed): i64 {
     # The oracle maps completed ids to keys and drops any it cannot resolve.
     var completed_keys = vec_new();
     for (var c = 0; c < vec_len(completed); c = c + 1) {
-        var k = map_get(id_to_key, agnosai_uuid_to_str(vec_get(completed, c)));
+        var k = map_get(id_to_key, vec_get(completed, c));
         if (k != 0) { vec_push(completed_keys, k); }
     }
 
@@ -367,7 +358,7 @@ fn agnosai_topological_sort_tasks(tasks): i64 {
         for (var d = 0; d < vec_len(deps); d = d + 1) {
             var dep_id = vec_get(deps, d);
             for (var b = 0; b < n; b = b + 1) {
-                if (agnosai_uuid_eq(agnosai_task_id(vec_get(tasks, b)), dep_id) == 1) {
+                if (str_eq(agnosai_task_id(vec_get(tasks, b)), dep_id) == 1) {
                     vec_set(in_degree, a, vec_get(in_degree, a) + 1);
                     vec_push(vec_get(dependents, b), a);
                     break;

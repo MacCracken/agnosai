@@ -29,7 +29,7 @@ fn main() {
     # --- task_new_generates_unique_ids ---
     var t1 = agnosai_task_new(str_from("task one"));
     var t2 = agnosai_task_new(str_from("task two"));
-    assert_eq(agnosai_uuid_eq(agnosai_task_id(t1), agnosai_task_id(t2)), 0, "task ids are unique");
+    assert_eq(str_eq(agnosai_task_id(t1), agnosai_task_id(t2)), 0, "task ids are unique");
 
     # --- task_new_sets_correct_defaults ---
     var t = agnosai_task_new(str_from("do something"));
@@ -55,10 +55,10 @@ fn main() {
     agnosai_task_with_risk(b, AGNOSAI_RISK_HIGH);
     agnosai_task_with_priority(b, AGNOSAI_PRIORITY_CRITICAL);
     agnosai_task_with_status(b, AGNOSAI_STATUS_RUNNING);
-    var dep = agnosai_uuid_v4();
+    var dep = agnosai_uuid_v4_str();
     agnosai_task_with_dependency(b, dep);
     agnosai_task_with_context(b, str_from("k"), bayan_json_v_int_new(9));
-    agnosai_task_with_agent(b, agnosai_uuid_v4());
+    agnosai_task_with_agent(b, agnosai_uuid_v4_str());
     agnosai_task_with_output_schema(b, bayan_json_v_obj_new());
     assert(str_eq(agnosai_task_expected_output(b), str_from("json")) == 1, "with_expected_output");
     assert_eq(agnosai_task_risk(b), AGNOSAI_RISK_HIGH, "with_risk");
@@ -109,11 +109,11 @@ fn main() {
     _t_assert_json(agnosai_process_to_value(agnosai_process_parallel(8)),
     "{\"parallel\":{\"max_concurrency\":8}}", "parallel is externally tagged");
 
-    var mgr = agnosai_uuid_v4();
+    var mgr = agnosai_uuid_v4_str();
     var hier = agnosai_process_hierarchical(mgr);
     var hier_back = agnosai_process_from_value(agnosai_process_to_value(hier));
     assert_eq(agnosai_process_kind(hier_back), AGNOSAI_PROCESS_HIERARCHICAL, "hierarchical round-trips");
-    assert_eq(agnosai_uuid_eq(agnosai_process_manager(hier_back), mgr), 1, "hierarchical keeps its manager");
+    assert_eq(str_eq(agnosai_process_manager(hier_back), mgr), 1, "hierarchical keeps its manager");
 
     var par_back = agnosai_process_from_value(agnosai_process_to_value(agnosai_process_parallel(8)));
     assert_eq(agnosai_process_kind(par_back), AGNOSAI_PROCESS_PARALLEL, "parallel round-trips");
@@ -128,7 +128,7 @@ fn main() {
     var rt = agnosai_task_new(str_from("round trip test"));
     var rt_back = agnosai_task_from_json(agnosai_task_to_json(rt));
     assert(rt_back != 0, "task parses back from its own JSON");
-    assert_eq(agnosai_uuid_eq(agnosai_task_id(rt_back), agnosai_task_id(rt)), 1, "task id survives");
+    assert_eq(str_eq(agnosai_task_id(rt_back), agnosai_task_id(rt)), 1, "task id survives");
     assert(str_eq(agnosai_task_description(rt_back), str_from("round trip test")) == 1, "description survives");
     assert_eq(agnosai_task_priority(rt_back), AGNOSAI_PRIORITY_NORMAL, "priority survives");
     assert_eq(agnosai_task_status(rt_back), AGNOSAI_STATUS_PENDING, "status survives");
@@ -139,7 +139,7 @@ fn main() {
     assert_eq(agnosai_task_risk(full_back), AGNOSAI_RISK_HIGH, "risk survives");
     assert_eq(agnosai_task_priority(full_back), AGNOSAI_PRIORITY_CRITICAL, "critical priority survives");
     assert_eq(vec_len(agnosai_task_dependencies(full_back)), 1, "dependencies survive");
-    assert_eq(agnosai_uuid_eq(vec_get(agnosai_task_dependencies(full_back), 0), dep), 1, "dependency id survives");
+    assert_eq(str_eq(vec_get(agnosai_task_dependencies(full_back), 0), dep), 1, "dependency id survives");
     assert_eq(map_size(agnosai_task_context(full_back)), 1, "context survives");
     assert(agnosai_task_assigned_agent(full_back) != 0, "assigned agent survives");
 
@@ -152,7 +152,7 @@ fn main() {
 
     # --- serde(default): missing optional fields take defaults, not failure ---
     var minimal = str_cat(str_cat(str_from("{\"id\":\""),
-    agnosai_uuid_to_str(agnosai_uuid_v4())), str_from("\",\"description\":\"m\"}"));
+    agnosai_uuid_v4_str()), str_from("\",\"description\":\"m\"}"));
     var min_back = agnosai_task_from_json(minimal);
     assert(min_back != 0, "a minimal task object parses");
     assert_eq(agnosai_task_priority(min_back), AGNOSAI_PRIORITY_NORMAL, "missing priority -> normal");
@@ -162,12 +162,12 @@ fn main() {
     assert_eq(agnosai_task_from_json(str_from("{\"description\":\"no id\"}")), 0, "missing id is rejected");
 
     # --- task_result_serde_round_trip ---
-    var task_id = agnosai_uuid_v4();
+    var task_id = agnosai_uuid_v4_str();
     var res = agnosai_task_result_new(task_id, str_from("all good"), AGNOSAI_STATUS_COMPLETED);
     agnosai_task_result_with_metadata(res, str_from("key"), bayan_json_v_str_new(str_from("value")));
     var res_back = agnosai_task_result_from_value(agnosai_task_result_to_value(res));
     assert(res_back != 0, "result round-trips");
-    assert_eq(agnosai_uuid_eq(agnosai_task_result_task_id(res_back), task_id), 1, "result task_id survives");
+    assert_eq(str_eq(agnosai_task_result_task_id(res_back), task_id), 1, "result task_id survives");
     assert(str_eq(agnosai_task_result_output(res_back), str_from("all good")) == 1, "result output survives");
     assert_eq(agnosai_task_result_status(res_back), AGNOSAI_STATUS_COMPLETED, "result status survives");
     assert_eq(map_size(agnosai_task_result_metadata(res_back)), 1, "result metadata survives");
