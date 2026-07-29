@@ -1,0 +1,185 @@
+# =========================================================================
+# orch_hierarchical.tcyr — parity tests for src/orch_hierarchical.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/orchestrator/hierarchical.rs —
+# 6 tests, all portable.
+#
+# The oracle's fixtures pick agents whose tools and domain make the intended
+# winner unambiguous, which is what lets the assertions name an expected agent
+# key rather than a score. Those are reproduced as-is; the extra cases cover the
+# manager-as-fallback rule and the positional alignment its own test relies on.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/core_message.cyr"
+include "src/core_resource.cyr"
+include "src/core_task.cyr"
+include "src/core_agent.cyr"
+include "src/orch_scoring.cyr"
+include "src/orch_hierarchical.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's make_agent(key, tools, complexity, domain).
+fn _t_agent(key, tool_a, tool_b, complexity, domain): i64 {
+    var a = agnosai_agent_new(str_from(key), str_from("worker"), str_from("do work"));
+    agnosai_agent_with_complexity(a, str_from(complexity));
+    if (domain != 0) { agnosai_agent_with_domain(a, str_from(domain)); }
+    var tools = vec_new();
+    if (tool_a != 0) { vec_push(tools, str_from(tool_a)); }
+    if (tool_b != 0) { vec_push(tools, str_from(tool_b)); }
+    agnosai_agent_with_tools(a, tools);
+    return a;
+}
+
+# A task with a JSON-literal context.
+fn _t_task(desc, ctx_src): i64 {
+    var t = agnosai_task_new(str_from(desc));
+    var ctx = bayan_json_v_parse_str(ctx_src, strlen(ctx_src));
+    for (var i = 0; i < bayan_json_v_obj_len(ctx); i = i + 1) {
+        agnosai_task_with_context(t, bayan_json_v_obj_key(ctx, i), bayan_json_v_obj_val(ctx, i));
+    }
+    return t;
+}
+
+# A vec of up to three items; pass 0 to omit.
+fn _t_v(a, b, c): i64 {
+    var v = vec_new();
+    if (a != 0) { vec_push(v, a); }
+    if (b != 0) { vec_push(v, b); }
+    if (c != 0) { vec_push(v, c); }
+    return v;
+}
+
+# Assert the i-th assignment went to a given agent key.
+fn _t_to(assignments, i, want, name): i64 {
+    return assert(str_eq(agnosai_assignment_agent_key(vec_get(assignments, i)),
+    str_from(want)) == 1, name);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_hierarchical");
+
+    var manager = _t_agent("manager", 0, 0, "high", 0);
+
+    # --- delegate_assigns_best_agent ---
+    # The coder has both required tools and the matching domain; the deployer has
+    # neither, so the winner is unambiguous without reasoning about weights.
+    var coder = _t_agent("coder", "lint", "test", "medium", "quality");
+    var deployer = _t_agent("deployer", "ssh", 0, "medium", "devops");
+    var code_task = _t_task("write code",
+    "{\"required_tools\":[\"lint\",\"test\"],\"complexity\":\"medium\",\"domain\":\"quality\"}");
+
+    var one = agnosai_delegate_tasks(manager, _t_v(coder, deployer, 0), _t_v(code_task, 0, 0));
+    assert_eq(vec_len(one), 1, "one task yields one assignment");
+    _t_to(one, 0, "coder", "and it goes to the best-scoring agent");
+    assert(str_eq(agnosai_assignment_task_id(vec_get(one, 0)), agnosai_task_id(code_task)) == 1,
+    "carrying the task's own id");
+
+    # --- delegate_multiple_tasks ---
+    # Each task is ranked independently, so two tasks in one call can land on
+    # different agents.
+    var deploy_task = _t_task("ship it",
+    "{\"required_tools\":[\"ssh\"],\"complexity\":\"medium\",\"domain\":\"devops\"}");
+    var two = agnosai_delegate_tasks(manager, _t_v(coder, deployer, 0),
+    _t_v(code_task, deploy_task, 0));
+    assert_eq(vec_len(two), 2, "two tasks yield two assignments");
+    _t_to(two, 0, "coder", "the code task goes to the coder");
+    _t_to(two, 1, "deployer", "and the deploy task to the deployer");
+
+    # --- delegate_preserves_task_ids ---
+    # The result is positionally aligned with the input, which the oracle's own
+    # test relies on.
+    assert(str_eq(agnosai_assignment_task_id(vec_get(two, 0)),
+    agnosai_task_id(code_task)) == 1, "assignment 0 is for task 0");
+    assert(str_eq(agnosai_assignment_task_id(vec_get(two, 1)),
+    agnosai_task_id(deploy_task)) == 1, "and assignment 1 for task 1");
+
+    # --- delegate_no_workers_falls_back_to_manager ---
+    # A crew with only a manager still runs: the manager quietly becomes the
+    # worker rather than the task being dropped or erroring.
+    var none = agnosai_delegate_tasks(manager, vec_new(), _t_v(code_task, 0, 0));
+    assert_eq(vec_len(none), 1, "with no workers the task is still assigned");
+    _t_to(none, 0, "manager", "to the manager itself");
+    assert(str_eq(agnosai_assignment_task_id(vec_get(none, 0)),
+    agnosai_task_id(code_task)) == 1, "with the right task id");
+
+    # every task falls back, not just the first
+    var many_none = agnosai_delegate_tasks(manager, vec_new(),
+    _t_v(code_task, deploy_task, 0));
+    assert_eq(vec_len(many_none), 2, "all tasks fall back");
+    _t_to(many_none, 0, "manager", "the first to the manager");
+    _t_to(many_none, 1, "manager", "and the second too");
+
+    # --- delegate_empty_tasks ---
+    assert_eq(vec_len(agnosai_delegate_tasks(manager, _t_v(coder, deployer, 0), vec_new())), 0,
+    "no tasks yields no assignments");
+    assert_eq(vec_len(agnosai_delegate_tasks(manager, vec_new(), vec_new())), 0,
+    "and neither does an empty crew");
+
+    # --- the manager is never a candidate, only a fallback ---
+    # The manager here is a perfect fit for the task and the sole worker is a
+    # poor one; the worker must still win, because the manager is not in the pool.
+    var perfect_mgr = _t_agent("mgr-perfect", "lint", "test", "medium", "quality");
+    var poor_worker = _t_agent("poor", 0, 0, "low", "devops");
+    var contested = agnosai_delegate_tasks(perfect_mgr, _t_v(poor_worker, 0, 0),
+    _t_v(code_task, 0, 0));
+    _t_to(contested, 0, "poor",
+    "a poorly-matched worker still beats a perfectly-matched manager — the manager does not \
+    compete, which is the whole point of hierarchical mode");
+
+    # --- one agent can take several tasks: no round-robin, no capacity limit ---
+    var solo = agnosai_delegate_tasks(manager, _t_v(coder, 0, 0),
+    _t_v(code_task, deploy_task, 0));
+    assert_eq(vec_len(solo), 2, "both tasks are assigned");
+    _t_to(solo, 0, "coder", "the only worker takes the first");
+    _t_to(solo, 1, "coder", "and the second as well — there is no spreading of load here");
+
+    # --- manager_agent_delegate_method ---
+    var worker = _t_agent("worker", "lint", "test", "medium", "quality");
+    var m = agnosai_manager_agent_new(manager, _t_v(worker, 0, 0), _t_v(code_task, 0, 0));
+    assert_eq(agnosai_manager_agent_definition(m), manager, "the manager holds its definition");
+    assert_eq(vec_len(agnosai_manager_agent_agents(m)), 1, "and its worker pool");
+    assert_eq(vec_len(agnosai_manager_agent_tasks(m)), 1, "and its tasks");
+
+    var via_method = agnosai_manager_agent_delegate(m);
+    assert_eq(vec_len(via_method), 1, "delegating through the struct yields one assignment");
+    _t_to(via_method, 0, "worker", "to the worker");
+
+    # the method and the free function agree, since one calls the other
+    var via_fn = agnosai_delegate_tasks(manager, _t_v(worker, 0, 0), _t_v(code_task, 0, 0));
+    assert(str_eq(agnosai_assignment_agent_key(vec_get(via_method, 0)),
+    agnosai_assignment_agent_key(vec_get(via_fn, 0))) == 1,
+    "and the method agrees with the free function");
+
+    # --- a task with no context still delegates ---
+    var bare = _t_task("anything", "{}");
+    var bare_result = agnosai_delegate_tasks(manager, _t_v(coder, deployer, 0),
+    _t_v(bare, 0, 0));
+    assert_eq(vec_len(bare_result), 1, "a task with no context is still assigned");
+    assert(agnosai_assignment_agent_key(vec_get(bare_result, 0)) != 0,
+    "to some agent rather than to nobody");
+
+    # --- the assignment constructor directly ---
+    # Exposed so a caller can build an assignment without going through
+    # delegation — the crew runner does this when a task carries an explicit
+    # assigned_agent and no scoring is needed.
+    var built = agnosai_assignment_new(str_from("task-9"), str_from("agent-x"));
+    assert(str_eq(agnosai_assignment_task_id(built), str_from("task-9")) == 1,
+    "the constructor stores the task id");
+    assert(str_eq(agnosai_assignment_agent_key(built), str_from("agent-x")) == 1,
+    "and the agent key");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -250,6 +250,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sacrificing the head the strategy is named for, since there is no room for both ends. The trim
     guard is `<=`, so a buffer sitting exactly at its cap is untouched, and trimming runs on every
     push so the buffer is never observed over its cap.
+  - **orch_hierarchical** — manager-driven delegation, one assignment per task in task order.
+    **The manager is the fallback, never a candidate**: it is excluded from the worker pool so it
+    cannot win a task on score, but with an empty pool it takes every task itself — so a crew with
+    only a manager still runs rather than erroring. A test pins the sharp version of that: a
+    perfectly-matched manager loses to a poorly-matched worker, which is the whole point of the
+    mode. Each task is ranked independently, so one agent can take several and there is no
+    round-robin or capacity limit.
 - **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
   `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
   never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.
