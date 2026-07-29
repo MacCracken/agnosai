@@ -257,6 +257,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     perfectly-matched manager loses to a poorly-matched worker, which is the whole point of the
     mode. Each task is ranked independently, so one agent can take several and there is no
     round-robin or capacity limit.
+  - **server_sse** (`CrewEvent`, `EventBus`) — **pulled forward from M6**, the way `server/ssrf`
+    was for M4: `crew_runner` holds a `broadcast::Sender<CrewEvent>` and `orchestrator` holds an
+    `EventBus`, so neither of M5's two largest modules compiles without them. `event_stream`,
+    which wraps a receiver in an axum SSE response, stays with M6.
+    A `broadcast` channel becomes a **vec of per-subscriber channels**, the same forced shape
+    pubsub took, since Cyrius channels are single-consumer. Three tokio behaviours a port loses
+    silently are pinned by tests: a receiver starts at the ring's **tail** (events sent before it
+    subscribed are not replayed), a send with **no receivers drops the event** rather than
+    buffering it for a future subscriber, and a send **never blocks** — a subscriber that has
+    stopped reading loses its oldest events. The last of those is why the receiver is a struct
+    rather than a bare channel: it carries the lag count that tokio reports as `Lagged(n)`, and
+    `agnosai_event_sub_lagged` takes-and-clears to match that error being delivered once.
+    `drop(rx)` becomes `agnosai_event_sender_unsubscribe`, without which `cleanup_orphans` would
+    be permanently inert.
 - **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
   `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
   never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.
@@ -410,6 +424,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **tools_agnos**: `agnos_segment_ok` **281 ns** and `agnos_form_encode_52b` **1.15 µs** over a
   52-byte query. Both are per-call costs on the ecosystem tools, and both are dwarfed by the
   network exchange that follows them.
+- **orch** (new `benches/orch.bcyr`, first numbers for the orchestration group):
+  `conv_buffer_push_sliding_32` **120 ns**, `pattern_match_wildcard` **803 ns**,
+  `event_round_trip_1_sub` **1.99 µs**, `plan_cache_get_hit` **2.11 µs**,
+  `pubsub_publish_4_patterns` **5.72 µs**, `plan_key_16x16` **11.7 µs**, `rank_agents_16`
+  **12.8 µs**, `kahn_sort_64_nodes` **57.6 µs**, `event_fanout_64_subs` **101 µs**,
+  `delegate_16_tasks_16_agents` **204 µs**.
+  **These are futex-bound, not algorithm-bound**, and finding that out is what the benchmarks
+  bought: `mutex_lock` + `mutex_unlock` costs **394 ns uncontended**, because `lib/sync.cyr`'s
+  two-state mutex issues `FUTEX_WAKE` on every release whether or not a waiter is parked. A
+  scratch build with that single line deleted measures **46 ns** — an 8.6× gap — and
+  `chan_try_send` + `chan_try_recv` at **1.59 µs** is about four mutex pairs. So
+  `event_round_trip_1_sub` is three locks and almost nothing else. Filed upstream in the cyrius
+  repo as `docs/development/issues/2026-07-29-mutex-unlock-unconditional-futex-wake.md` with a
+  repro; nothing is worked around here, so a stdlib fix lands as a straight improvement.
+- **server_sse**: `event_send_evicting` **2.40 µs** against `event_round_trip_1_sub` **1.99 µs**
+  is the number blocker #4 was about — a subscriber that has stopped reading costs **one extra
+  channel operation** to serve, not an unbounded stall. It loses events instead of wedging the
+  crew publishing to it, which a blocking `chan_send` would have done.
 
 ### Changed
 - **Money is integer micro-USD** across the cost path (`ResourceBudget::max_cost_usd`,

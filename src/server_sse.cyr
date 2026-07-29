@@ -1,0 +1,381 @@
+# =========================================================================
+# server_sse — the per-crew event bus that carries execution progress.
+#
+# Parity oracle: rust-old/src/server/sse.rs
+#
+# **Pulled forward from M6**, the same way `server_ssrf` was pulled forward for
+# M4's tools. `orchestrator/crew_runner.rs` holds a `broadcast::Sender<CrewEvent>`
+# and `orchestrator/orchestrator.rs` holds an `EventBus`, so neither of M5's two
+# largest modules compiles without these two types. What stays behind for M6 is
+# `event_stream`, which wraps a receiver in an axum SSE response — that half is
+# HTTP-shaped and has nothing M5 needs.
+#
+# **The shape change, and it is the same one pubsub made.** The oracle's
+# `broadcast::Sender` is multi-consumer: every `subscribe()` returns an
+# independent receiver over one ring, and each sees every message. Cyrius
+# channels are single-consumer FIFOs, so a crew maps to a **vec of per-subscriber
+# channels** and a send hands each its own reference to the event. Observably
+# identical: every subscriber sees every event for its crew and nobody else's.
+#
+# Three tokio behaviours worth naming, because a port that misses them looks
+# right and is not:
+#
+#   * **A receiver starts at the ring's tail.** Events sent before `subscribe()`
+#     are not delivered to it. The oracle's `event_bus_remove_cleans_channel`
+#     test depends on this, and a fresh channel per subscriber gives it for free.
+#   * **A send with no receivers fails and the event is dropped**, rather than
+#     being buffered for a future subscriber. Here the fan-out loop simply has
+#     nothing to iterate, and returns 0 where the oracle returns `Err`. Every
+#     call site discards the result, which is why this is safe to flatten.
+#   * **A send never blocks and never fails for lack of room**; a receiver that
+#     has fallen behind loses its oldest unread events and is told `Lagged(n)`.
+#     Fan-out therefore goes through `agnosai_chan_push_lossy` — see
+#     `src/chan_lossy.cyr`, this is blocker #4's second consumer — and the
+#     receiver is a small struct rather than a bare channel so it can carry the
+#     lag count that `Lagged` reports. `agnosai_event_sub_lagged` takes and
+#     clears it, matching a `Lagged` error being delivered once before the
+#     receiver resumes.
+#
+# There is no `drop`, so `receiver_count` cannot fall on its own and
+# `cleanup_orphans` would be permanently inert without a way to say "this
+# receiver is finished". `agnosai_event_sender_unsubscribe` is that way. It is
+# not an invented capability: it is `drop(rx)` spelled out, and the oracle's own
+# orphan-cleanup test is written in terms of exactly that drop.
+#
+# One mutex guards the whole bus, senders included — a sender holds a pointer to
+# the bus's lock rather than owning one. The oracle gets per-channel locks from
+# DashMap sharding plus each broadcast ring's own lock, but nesting those two
+# here would mean two locks taken in one order by `sender()` and the other by
+# `cleanup_orphans()`. Events are emitted at task boundaries, not in a hot loop,
+# so the contention that buys is not worth a deadlock. pubsub made the same call.
+# =========================================================================
+
+# The oracle's `CHANNEL_CAPACITY` — per-subscriber ring depth. Events past this
+# evict the subscriber's oldest rather than stalling the crew that emitted them.
+var AGNOSAI_SSE_CHANNEL_CAPACITY = 256;
+
+# The oracle's `MAX_EVENT_CHANNELS`, a memory-growth bound on concurrent crews.
+# Note it is advisory: at the cap the bus cleans orphans, warns, and creates the
+# channel anyway, because refusing one would silently blind a running crew.
+var AGNOSAI_SSE_MAX_EVENT_CHANNELS = 10000;
+
+# CrewEvent — one progress event for one crew.
+enum AgnosaiCrewEventOff {
+    AGN_CE_CREW_ID = 0;
+    AGN_CE_EVENT_TYPE = 8;
+    AGN_CE_DATA = 16;
+    AGN_CE_SIZE = 24;
+}
+
+# The crew that emitted the event.
+fn agnosai_crew_event_crew_id(e): i64 {
+    return load64(e + AGN_CE_CREW_ID);
+}
+
+# The event's type name — `"task_started"`, `"crew_completed"` and friends.
+fn agnosai_crew_event_event_type(e): i64 {
+    return load64(e + AGN_CE_EVENT_TYPE);
+}
+
+# The event's JSON payload.
+fn agnosai_crew_event_data(e): i64 {
+    return load64(e + AGN_CE_DATA);
+}
+
+# Build an event.
+fn agnosai_crew_event_new(crew_id: Str, event_type: Str, data): i64 {
+    var e = alloc(AGN_CE_SIZE);
+    store64(e + AGN_CE_CREW_ID, crew_id);
+    store64(e + AGN_CE_EVENT_TYPE, event_type);
+    store64(e + AGN_CE_DATA, data);
+    return e;
+}
+
+# The event as a JSON value, in the struct's field order.
+#
+# All three fields are unconditional — the oracle has no `skip_serializing_if`
+# here, so a null payload serialises as `"data":null` rather than vanishing.
+fn agnosai_crew_event_to_value(e): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("crew_id"),
+    bayan_json_v_str_new(load64(e + AGN_CE_CREW_ID)));
+    bayan_json_v_obj_set(obj, str_from("event_type"),
+    bayan_json_v_str_new(load64(e + AGN_CE_EVENT_TYPE)));
+    var data = load64(e + AGN_CE_DATA);
+    if (data == 0) { data = bayan_json_v_null(); }
+    bayan_json_v_obj_set(obj, str_from("data"), data);
+    return obj;
+}
+
+# A subscription — the oracle's `broadcast::Receiver`.
+#
+# The channel plus the count of events dropped to make room for newer ones,
+# which is the payload of tokio's `Lagged`.
+enum AgnosaiEventSubOff {
+    AGN_ER_CHAN = 0;
+    AGN_ER_LAGGED = 8;
+    AGN_ER_SIZE = 16;
+}
+
+# The subscription's channel, for a caller that wants to park on it directly.
+fn agnosai_event_sub_chan(sub): i64 {
+    return load64(sub + AGN_ER_CHAN);
+}
+
+# How many events this subscriber lost since the last call, then clear it.
+#
+# Non-zero is the oracle's `RecvError::Lagged(n)`. Taking and clearing matches
+# tokio delivering that error once and then resuming from the oldest event still
+# in the ring, rather than reporting the same gap forever.
+#
+# Note what the oracle does with it: `event_stream` is a `while let Ok(event)`
+# loop, so a `Lagged` **terminates the SSE stream** — one slow browser loses the
+# rest of its crew's events, not just the few that were overwritten. Reading the
+# count here does not terminate anything, so when M6 ports `event_stream` that
+# early exit has to be written deliberately; it will not arrive on its own.
+fn agnosai_event_sub_lagged(sub): i64 {
+    var n = load64(sub + AGN_ER_LAGGED);
+    store64(sub + AGN_ER_LAGGED, 0);
+    return n;
+}
+
+# Create a subscription over a fresh channel.
+fn _agnosai_event_sub_new(): i64 {
+    var sub = alloc(AGN_ER_SIZE);
+    store64(sub + AGN_ER_CHAN, chan_new(AGNOSAI_SSE_CHANNEL_CAPACITY));
+    store64(sub + AGN_ER_LAGGED, 0);
+    return sub;
+}
+
+# Take the next event without waiting, or 0 when none is ready.
+fn agnosai_event_sub_try_recv(sub): i64 {
+    return chan_try_recv(load64(sub + AGN_ER_CHAN));
+}
+
+# Wait for the next event. Returns 0 once the channel is closed and drained,
+# which is what `agnosai_event_bus_remove` does to a live subscriber.
+fn agnosai_event_sub_recv(sub): i64 {
+    return chan_recv(load64(sub + AGN_ER_CHAN));
+}
+
+# A sender — the oracle's `broadcast::Sender`, one per crew.
+#
+# `MUTEX` is the owning bus's lock, not its own. A sender outlives its bus entry
+# by design: `crew_runner` keeps publishing through a sender the bus has already
+# removed, exactly as holding a tokio `Sender` keeps the channel alive.
+enum AgnosaiEventSenderOff {
+    AGN_ES_SUBS = 0;
+    AGN_ES_MUTEX = 8;
+    AGN_ES_SIZE = 16;
+}
+
+# Create a sender bound to a bus's lock.
+fn _agnosai_event_sender_new(mtx): i64 {
+    var tx = alloc(AGN_ES_SIZE);
+    store64(tx + AGN_ES_SUBS, vec_new());
+    store64(tx + AGN_ES_MUTEX, mtx);
+    return tx;
+}
+
+# How many subscribers this sender feeds.
+fn agnosai_event_sender_receiver_count(tx): i64 {
+    var mtx = load64(tx + AGN_ES_MUTEX);
+    mutex_lock(mtx);
+    var n = vec_len(load64(tx + AGN_ES_SUBS));
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Subscribe to this sender — the oracle's `tx.subscribe()`.
+#
+# The new subscriber starts empty: events already sent are not replayed into it.
+fn agnosai_event_sender_subscribe(tx): i64 {
+    var sub = _agnosai_event_sub_new();
+    var mtx = load64(tx + AGN_ES_MUTEX);
+    mutex_lock(mtx);
+    vec_push(load64(tx + AGN_ES_SUBS), sub);
+    mutex_unlock(mtx);
+    return sub;
+}
+
+# Finish with a subscription — the oracle's `drop(rx)`.
+#
+# Closes the channel so a parked reader is released rather than waiting on
+# something nothing will fill, and drops the subscriber's claim on the sender so
+# `cleanup_orphans` can see the channel go idle. Returns 1 if it was found.
+fn agnosai_event_sender_unsubscribe(tx, sub): i64 {
+    var mtx = load64(tx + AGN_ES_MUTEX);
+    mutex_lock(mtx);
+    var subs = load64(tx + AGN_ES_SUBS);
+    var found = 0;
+    for (var i = 0; i < vec_len(subs); i = i + 1) {
+        if (vec_get(subs, i) == sub) {
+            vec_remove(subs, i);
+            found = 1;
+            break;
+        }
+    }
+    mutex_unlock(mtx);
+    if (found == 1) { chan_close(load64(sub + AGN_ER_CHAN)); }
+    return found;
+}
+
+# Send an event to every subscriber.
+#
+# Returns the number of subscribers reached — the oracle's `Ok(n)`. Zero is its
+# `Err(SendError)`: no live receivers, and the event is dropped rather than held
+# for whoever subscribes next. Every call site discards this.
+#
+# A subscriber whose ring is full loses its oldest event and has its lag count
+# raised. Nothing here can block, which is the whole point: a crew must not be
+# held up by a browser that stopped reading.
+fn agnosai_event_sender_send(tx, event): i64 {
+    var mtx = load64(tx + AGN_ES_MUTEX);
+    mutex_lock(mtx);
+    var subs = load64(tx + AGN_ES_SUBS);
+    var n = vec_len(subs);
+    for (var i = 0; i < n; i = i + 1) {
+        var sub = vec_get(subs, i);
+        if (agnosai_chan_push_lossy(load64(sub + AGN_ER_CHAN), event) == 1) {
+            store64(sub + AGN_ER_LAGGED, load64(sub + AGN_ER_LAGGED) + 1);
+        }
+    }
+    mutex_unlock(mtx);
+    return n;
+}
+
+# EventBus — the registry of per-crew senders.
+enum AgnosaiEventBusOff {
+    AGN_EB_CHANNELS = 0;
+    AGN_EB_MUTEX = 8;
+    AGN_EB_SIZE = 16;
+}
+
+# Create an empty bus.
+fn agnosai_event_bus_new(): i64 {
+    var bus = alloc(AGN_EB_SIZE);
+    store64(bus + AGN_EB_CHANNELS, map_new_str());
+    store64(bus + AGN_EB_MUTEX, mutex_new());
+    return bus;
+}
+
+# The number of active crew channels.
+fn agnosai_event_bus_len(bus): i64 {
+    var mtx = load64(bus + AGN_EB_MUTEX);
+    mutex_lock(mtx);
+    var n = map_size(load64(bus + AGN_EB_CHANNELS));
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Whether the bus holds no channels.
+fn agnosai_event_bus_is_empty(bus): i64 {
+    if (agnosai_event_bus_len(bus) == 0) { return 1; }
+    return 0;
+}
+
+# Whether a channel exists for a crew.
+fn agnosai_event_bus_has(bus, crew_id: Str): i64 {
+    var mtx = load64(bus + AGN_EB_MUTEX);
+    mutex_lock(mtx);
+    var found = 0;
+    if (map_get(load64(bus + AGN_EB_CHANNELS), crew_id) != 0) { found = 1; }
+    mutex_unlock(mtx);
+    return found;
+}
+
+# Drop every channel with no subscribers. The caller must hold the bus lock.
+#
+# The oracle's `retain(|_, tx| tx.receiver_count() > 0)`. A `sender()`-only
+# channel has never had a subscriber, so it is an orphan from the moment it is
+# created — the oracle's own cleanup test turns on that.
+fn _agnosai_event_bus_cleanup_locked(bus): i64 {
+    var channels = load64(bus + AGN_EB_CHANNELS);
+    var keys = map_keys(channels);
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var key = vec_get(keys, i);
+        var tx = map_get(channels, key);
+        if (vec_len(load64(tx + AGN_ES_SUBS)) == 0) { map_delete(channels, key); }
+    }
+    return 0;
+}
+
+# Drop every channel with no subscribers.
+fn agnosai_event_bus_cleanup_orphans(bus): i64 {
+    var mtx = load64(bus + AGN_EB_MUTEX);
+    mutex_lock(mtx);
+    _agnosai_event_bus_cleanup_locked(bus);
+    mutex_unlock(mtx);
+    return 0;
+}
+
+# The oracle's `warn!` when the bus is still at capacity after cleaning orphans.
+fn _agnosai_event_bus_log_capacity(n): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "channels=");
+    str_builder_add_int(sb, n);
+    str_builder_add_cstr(sb, " limit=");
+    str_builder_add_int(sb, AGNOSAI_SSE_MAX_EVENT_CHANNELS);
+    var line = str_builder_build(sb);
+    sakshi_log_kv(SK_WARN, "event bus at capacity after orphan cleanup", 41, "bus", 3,
+    str_data(line), str_len(line));
+    return 0;
+}
+
+# Get or create the sender for a crew.
+#
+# At the cap, orphans are cleaned and — if that did not help — a warning is
+# logged and the channel is created regardless. The orchestrator needs somewhere
+# to publish, and a crew running with its events silently discarded is worse
+# than a bus over its advisory bound.
+fn agnosai_event_bus_sender(bus, crew_id: Str): i64 {
+    var mtx = load64(bus + AGN_EB_MUTEX);
+    mutex_lock(mtx);
+    var channels = load64(bus + AGN_EB_CHANNELS);
+
+    var tx = map_get(channels, crew_id);
+    if (tx != 0) {
+        mutex_unlock(mtx);
+        return tx;
+    }
+
+    if (map_size(channels) >= AGNOSAI_SSE_MAX_EVENT_CHANNELS) {
+        _agnosai_event_bus_cleanup_locked(bus);
+        if (map_size(channels) >= AGNOSAI_SSE_MAX_EVENT_CHANNELS) {
+            _agnosai_event_bus_log_capacity(map_size(channels));
+        }
+    }
+
+    tx = _agnosai_event_sender_new(mtx);
+    map_set(channels, str_clone(crew_id), tx);
+    mutex_unlock(mtx);
+    return tx;
+}
+
+# Subscribe to a crew's events, creating the channel if it is new.
+fn agnosai_event_bus_subscribe(bus, crew_id: Str): i64 {
+    return agnosai_event_sender_subscribe(agnosai_event_bus_sender(bus, crew_id));
+}
+
+# Remove a crew's channel — call once the crew is finished.
+#
+# The oracle drops the map's sender, after which any receiver still holding on
+# sees `RecvError::Closed`. `chan_close` on each subscriber is that signal. A
+# `sender()` handle someone else already took keeps working against a detached
+# subscriber list, which is also what dropping the map's clone does.
+fn agnosai_event_bus_remove(bus, crew_id: Str): i64 {
+    var mtx = load64(bus + AGN_EB_MUTEX);
+    mutex_lock(mtx);
+    var channels = load64(bus + AGN_EB_CHANNELS);
+    var tx = map_get(channels, crew_id);
+    if (tx != 0) {
+        var subs = load64(tx + AGN_ES_SUBS);
+        for (var i = 0; i < vec_len(subs); i = i + 1) {
+            chan_close(load64(vec_get(subs, i) + AGN_ER_CHAN));
+        }
+        map_delete(channels, crew_id);
+    }
+    mutex_unlock(mtx);
+    return 0;
+}

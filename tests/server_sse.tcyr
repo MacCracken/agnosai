@@ -1,0 +1,246 @@
+# =========================================================================
+# server_sse.tcyr — parity tests for src/server_sse.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/server/sse.rs — 10 tests. All
+# ten port; the two that turn on `drop(rx)` port as explicit unsubscribes, which
+# is what `agnosai_event_sender_unsubscribe` exists for.
+#
+# The extra cases cover the parts of `broadcast` that are easy to lose in
+# translation and that nothing in the oracle's own suite pins: that a subscriber
+# does not see events sent before it existed, that `sender()` is get-or-create
+# rather than create, and that the lag count reports the size of the gap and
+# then clears.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/id.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "tests/test_helpers.cyr"
+
+# An event for a crew, with an empty JSON object as its payload.
+fn _t_event(crew_id, event_type): i64 {
+    return agnosai_crew_event_new(crew_id, str_from(event_type), bayan_json_v_obj_new());
+}
+
+# Assert the next event on a subscription has a given type.
+fn _t_next_is(sub, want, name): i64 {
+    var e = agnosai_event_sub_try_recv(sub);
+    if (e == 0) { return assert(0 == 1, name); }
+    return assert(str_eq(agnosai_crew_event_event_type(e), str_from(want)) == 1, name);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("server_sse");
+
+    assert_eq(AGNOSAI_SSE_CHANNEL_CAPACITY, 256, "the ring depth is the oracle's 256");
+    assert_eq(AGNOSAI_SSE_MAX_EVENT_CHANNELS, 10000, "and the channel cap its 10_000");
+
+    # --- crew_event_serializes ---
+    var payload = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(payload, str_from("status"), bayan_json_v_str_new(str_from("ok")));
+    var e = agnosai_crew_event_new(str_from("abc"), str_from("task_completed"), payload);
+    assert(str_eq(agnosai_crew_event_crew_id(e), str_from("abc")) == 1, "the crew id round-trips");
+    assert(str_eq(agnosai_crew_event_event_type(e), str_from("task_completed")) == 1,
+    "and the event type");
+    assert_eq(agnosai_crew_event_data(e), payload, "and the payload, by identity");
+    assert(str_eq(bayan_json_v_build(agnosai_crew_event_to_value(e)),
+    str_from("{\"crew_id\":\"abc\",\"event_type\":\"task_completed\",\"data\":{\"status\":\"ok\"}}"))
+    == 1, "the event serialises in the struct's field order");
+
+    # a missing payload emits null rather than dropping the field — there is no
+    # skip_serializing_if on `data`
+    assert(str_eq(bayan_json_v_build(agnosai_crew_event_to_value(
+    agnosai_crew_event_new(str_from("c"), str_from("t"), 0))),
+    str_from("{\"crew_id\":\"c\",\"event_type\":\"t\",\"data\":null}")) == 1,
+    "an absent payload serialises as null rather than vanishing");
+
+    # --- event_bus_new_is_empty ---
+    var bus = agnosai_event_bus_new();
+    assert_eq(agnosai_event_bus_is_empty(bus), 1, "a new bus is empty");
+    assert_eq(agnosai_event_bus_len(bus), 0, "with no channels");
+
+    var id = agnosai_uuid_v4_str();
+    assert_eq(agnosai_event_bus_has(bus, id), 0, "and no channel for an unseen crew");
+
+    # subscribe creates the channel lazily
+    var rx = agnosai_event_bus_subscribe(bus, id);
+    assert_eq(agnosai_event_bus_len(bus), 1, "subscribing creates the crew's channel");
+    assert_eq(agnosai_event_bus_has(bus, id), 1, "which the bus now reports");
+
+    # --- event_bus_sender_creates_channel ---
+    # A send with no receivers must not blow up; the oracle discards the Err.
+    var lonely = agnosai_uuid_v4_str();
+    var lonely_tx = agnosai_event_bus_sender(bus, lonely);
+    assert_eq(agnosai_event_bus_has(bus, lonely), 1, "sender() alone creates the channel");
+    assert_eq(agnosai_event_sender_receiver_count(lonely_tx), 0, "with no subscribers");
+    assert_eq(agnosai_event_sender_send(lonely_tx, _t_event(lonely, "test")), 0,
+    "and a send reaches nobody — 0 is the oracle's Err(SendError), not a failure to handle");
+
+    # sender() is get-or-create: a second call must not replace the channel the
+    # orchestrator is already publishing through
+    assert_eq(agnosai_event_bus_sender(bus, lonely), lonely_tx,
+    "a second sender() for the same crew returns the same sender");
+    assert_eq(agnosai_event_bus_len(bus), 2, "and does not add a channel");
+
+    # --- event_bus_subscribe_receives_events ---
+    var tx = agnosai_event_bus_sender(bus, id);
+    assert_eq(agnosai_event_sender_receiver_count(tx), 1, "the earlier subscriber is attached");
+    var started = agnosai_crew_event_new(id, str_from("task_started"), bayan_json_v_null());
+    assert_eq(agnosai_event_sender_send(tx, started), 1, "the send reaches one receiver");
+    var got = agnosai_event_sub_try_recv(rx);
+    assert_eq(got, started, "and the receiver gets that event");
+    assert(str_eq(agnosai_crew_event_crew_id(got), id) == 1, "carrying the crew id");
+    assert_eq(agnosai_event_sub_try_recv(rx), 0, "with nothing else queued");
+
+    # the raw channel is reachable, for a caller that wants to park on it with
+    # the channel verbs directly rather than through the subscription — which is
+    # what M6's `event_stream` needs to select over
+    var direct = agnosai_crew_event_new(id, str_from("direct"), bayan_json_v_null());
+    agnosai_event_sender_send(tx, direct);
+    assert_eq(chan_try_recv(agnosai_event_sub_chan(rx)), direct,
+    "the accessor exposes the same channel the subscription reads from");
+
+    # --- a receiver starts at the tail: earlier events are not replayed ---
+    # tokio's broadcast hands a new receiver the ring's current tail, so this is
+    # not a "the queue happened to be drained" result — it holds even when the
+    # ring is full of unread events.
+    var late_id = agnosai_uuid_v4_str();
+    var late_tx = agnosai_event_bus_sender(bus, late_id);
+    agnosai_event_sender_send(late_tx, _t_event(late_id, "before"));
+    var late_rx = agnosai_event_sender_subscribe(late_tx);
+    assert_eq(agnosai_event_sub_try_recv(late_rx), 0,
+    "a subscriber does not receive events sent before it subscribed");
+    agnosai_event_sender_send(late_tx, _t_event(late_id, "after"));
+    _t_next_is(late_rx, "after", "but does receive the next one");
+
+    # --- event_bus_independent_crews ---
+    var id1 = agnosai_uuid_v4_str();
+    var id2 = agnosai_uuid_v4_str();
+    var rx1 = agnosai_event_bus_subscribe(bus, id1);
+    var rx2 = agnosai_event_bus_subscribe(bus, id2);
+    agnosai_event_sender_send(agnosai_event_bus_sender(bus, id1), _t_event(id1, "e1"));
+    _t_next_is(rx1, "e1", "the first crew's subscriber receives its event");
+    assert_eq(agnosai_event_sub_try_recv(rx2), 0, "and the second crew's does not");
+
+    # --- concurrent_subscribers_same_crew ---
+    # Every subscriber sees every event. This is the property the vec-of-channels
+    # shape exists to preserve: a single FIFO would give the event to whichever
+    # reader arrived first and starve the other two.
+    var shared_id = agnosai_uuid_v4_str();
+    var stx = agnosai_event_bus_sender(bus, shared_id);
+    var s1 = agnosai_event_sender_subscribe(stx);
+    var s2 = agnosai_event_sender_subscribe(stx);
+    var s3 = agnosai_event_sender_subscribe(stx);
+    assert_eq(agnosai_event_sender_receiver_count(stx), 3, "three subscribers on one crew");
+    assert_eq(agnosai_event_sender_send(stx, _t_event(shared_id, "shared")), 3,
+    "and the send reports all three");
+    _t_next_is(s1, "shared", "the first receives it");
+    _t_next_is(s2, "shared", "the second receives it too");
+    _t_next_is(s3, "shared", "and so does the third — not one at the expense of the others");
+
+    # --- broadcast_channel_overflow_causes_lagged_error ---
+    # CHANNEL_CAPACITY + 1 events with nobody reading. The oracle reports
+    # Lagged(1) on the next recv; here the count is on the subscription.
+    var flood_id = agnosai_uuid_v4_str();
+    var ftx = agnosai_event_bus_sender(bus, flood_id);
+    var frx = agnosai_event_sender_subscribe(ftx);
+    for (var i = 0; i < AGNOSAI_SSE_CHANNEL_CAPACITY; i = i + 1) {
+        agnosai_event_sender_send(ftx, _t_event(flood_id, "evt"));
+    }
+    assert_eq(agnosai_event_sub_lagged(frx), 0, "filling the ring exactly loses nothing");
+    agnosai_event_sender_send(ftx, _t_event(flood_id, "overflow"));
+    assert_eq(agnosai_event_sub_lagged(frx), 1,
+    "one event past the ring drops one — the oracle's Lagged(1)");
+    assert_eq(agnosai_event_sub_lagged(frx), 0,
+    "and the count clears, since Lagged is delivered once and then the receiver resumes");
+
+    # the sender was never blocked by the flood, which is the whole point
+    assert_eq(agnosai_event_sender_send(ftx, _t_event(flood_id, "still_going")), 1,
+    "a full subscriber does not stall the crew publishing to it");
+    assert_eq(agnosai_event_sub_lagged(frx), 1, "it loses another event instead");
+
+    # --- cleanup_orphans_removes_channels_with_no_receivers ---
+    var orphan_id = agnosai_uuid_v4_str();
+    var otx = agnosai_event_bus_sender(bus, orphan_id);
+    var orx = agnosai_event_sender_subscribe(otx);
+    assert_eq(agnosai_event_bus_has(bus, orphan_id), 1, "the channel exists");
+    agnosai_event_bus_cleanup_orphans(bus);
+    assert_eq(agnosai_event_bus_has(bus, orphan_id), 1,
+    "and survives cleanup while it has a subscriber");
+
+    # drop the only receiver
+    assert_eq(agnosai_event_sender_unsubscribe(otx, orx), 1, "unsubscribing finds the receiver");
+    assert_eq(agnosai_event_sender_receiver_count(otx), 0, "and the count falls to zero");
+    assert_eq(agnosai_event_sender_unsubscribe(otx, orx), 0, "unsubscribing twice is a no-op");
+    assert_eq(agnosai_event_bus_has(bus, orphan_id), 1, "the channel is still registered");
+    agnosai_event_bus_cleanup_orphans(bus);
+    assert_eq(agnosai_event_bus_has(bus, orphan_id), 0,
+    "until cleanup removes it — an orphan channel is reclaimed");
+
+    # unsubscribing closes the channel, so a reader parked on it is released
+    # rather than waiting on something nothing will ever fill
+    assert_eq(agnosai_event_sub_recv(orx), 0, "a closed subscription's recv returns rather than \
+    parking forever");
+
+    # a sender()-only channel is an orphan from birth: it has never had a
+    # subscriber, so the first cleanup takes it
+    var never_id = agnosai_uuid_v4_str();
+    agnosai_event_bus_sender(bus, never_id);
+    assert_eq(agnosai_event_bus_has(bus, never_id), 1, "sender() registers the channel");
+    agnosai_event_bus_cleanup_orphans(bus);
+    assert_eq(agnosai_event_bus_has(bus, never_id), 0,
+    "and cleanup reclaims it immediately — sender() alone creates no receiver");
+
+    # --- event_bus_remove_cleans_channel ---
+    var rem = agnosai_event_bus_new();
+    var rid = agnosai_uuid_v4_str();
+    var rtx = agnosai_event_bus_sender(rem, rid);
+    var live = agnosai_event_sender_subscribe(rtx);
+    agnosai_event_sender_send(rtx, _t_event(rid, "queued"));
+    agnosai_event_bus_remove(rem, rid);
+    assert_eq(agnosai_event_bus_has(rem, rid), 0, "remove drops the crew's channel");
+    assert_eq(agnosai_event_bus_is_empty(rem), 1, "leaving the bus empty");
+
+    # a live subscriber is released rather than left parked — the oracle's
+    # RecvError::Closed. What was already queued is still drainable first, which
+    # is also what tokio does: a closed channel is drained before it ends.
+    assert(agnosai_event_sub_try_recv(live) != 0, "an already-queued event is still drainable");
+    assert_eq(agnosai_event_sub_recv(live), 0, "and then the closed channel returns");
+
+    # after remove, a fresh subscribe gets a fresh, empty channel
+    var fresh = agnosai_event_bus_subscribe(rem, rid);
+    assert_eq(agnosai_event_bus_len(rem), 1, "the channel is recreated on demand");
+    assert_eq(agnosai_event_sub_try_recv(fresh), 0, "and starts empty");
+
+    # --- channel_capacity_boundary ---
+    # 100 crews up and back down. The oracle's version proves remove() is
+    # complete rather than leaking an entry per crew.
+    var many = agnosai_event_bus_new();
+    var ids = vec_new();
+    for (var j = 0; j < 100; j = j + 1) {
+        var cid = agnosai_uuid_v4_str();
+        vec_push(ids, cid);
+        agnosai_event_bus_subscribe(many, cid);
+    }
+    assert_eq(agnosai_event_bus_len(many), 100, "a hundred crews, a hundred channels");
+    for (var k = 0; k < vec_len(ids); k = k + 1) {
+        agnosai_event_bus_remove(many, vec_get(ids, k));
+    }
+    assert_eq(agnosai_event_bus_is_empty(many), 1,
+    "and the bus is empty after removing them all — remove leaks nothing");
+
+    # removing a crew that was never registered is a no-op, not an error
+    agnosai_event_bus_remove(many, agnosai_uuid_v4_str());
+    assert_eq(agnosai_event_bus_is_empty(many), 1, "removing an unknown crew changes nothing");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

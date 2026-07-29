@@ -49,7 +49,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
-| `orchestrator` ported (M5, Phase 4) | 🟡 4 pure leaves + scoring + scheduler + budget + approval + plan_cache + memory + hierarchical done; 4 modules left |
+| `orchestrator` ported (M5, Phase 4) | 🟡 4 pure leaves + scoring + scheduler + budget + approval + plan_cache + memory + hierarchical done, `server/sse` pulled forward; 4 modules left |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
@@ -57,7 +57,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2067 assertions across 35 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**2123 assertions across 36 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -95,6 +95,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `orch_plan_cache.tcyr` | 40 | 7 |
 | `orch_memory.tcyr` | 53 | 9 |
 | `orch_hierarchical.tcyr` | 30 | 6 |
+| `server_sse.tcyr` | 56 | 10 |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -126,7 +127,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (651/651 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (672/672 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -228,9 +229,50 @@ The two `is_safe_url` rows matter because every load test pays one before it tou
 network: the octal-host path, which must parse four different spellings before it can decide,
 costs only 6% more than the plain hostname path.
 
+`benches/orch.bcyr` — the orchestration path: the event fan-out on every task boundary, the
+per-task ranking and delegation, the scheduler's DAG sort, the plan-cache key, and the
+conversation trim that runs on every push. Logging is turned down to `SK_FATAL`, since
+`agnosai_delegate_tasks` emits an INFO line per call (matching the oracle's `info!`) and left at
+the default level the number measures sakshi writing to a pipe.
+
+| Benchmark | Time |
+|---|---|
+| `conv_buffer_push_sliding_32` | 120 ns |
+| `pattern_match_wildcard` | 803 ns |
+| `event_round_trip_1_sub` | 1.99 µs |
+| `plan_cache_get_hit` | 2.11 µs |
+| `event_send_evicting` | 2.40 µs |
+| `pubsub_publish_4_patterns` | 5.72 µs |
+| `plan_key_16x16` | 11.7 µs |
+| `rank_agents_16` | 12.8 µs |
+| `kahn_sort_64_nodes` | 57.6 µs |
+| `event_fanout_64_subs` | 101 µs |
+| `delegate_16_tasks_16_agents` | 204 µs |
+
+**These numbers are futex-bound, not algorithm-bound**, and that is the finding rather than an
+excuse. `mutex_lock` + `mutex_unlock` costs **394 ns uncontended** because `lib/sync.cyr`'s
+two-state mutex calls `FUTEX_WAKE` on every release whether or not a waiter is parked; a scratch
+build with that one line deleted measures **46 ns**, an 8.6× gap. `chan_try_send` +
+`chan_try_recv` is 1.59 µs, about four mutex pairs. So `event_round_trip_1_sub` at 1.99 µs is
+three locks and almost nothing else, and `event_fanout_64_subs` is 128 channel operations.
+Filed upstream in the cyrius repo as
+`docs/development/issues/2026-07-29-mutex-unlock-unconditional-futex-wake.md`, with a repro.
+Nothing is worked around here: the rows above are the honest current baseline, and a stdlib fix
+will show up as a straight improvement rather than needing any change on this side.
+
+Two rows are worth reading together. `event_send_evicting` (2.40 µs) is a send into a subscriber
+that has stopped reading — the overwrite-oldest path blocker #4 exists for. It costs one extra
+channel operation over the healthy `event_round_trip_1_sub` (1.99 µs), which is the number that
+matters: **a stalled SSE client does not get more expensive to serve**, it just loses events. A
+blocking `chan_send` there would have wedged the crew instead.
+
+`delegate_16_tasks_16_agents` at 204 µs is 16 × `rank_agents_16` (12.8 µs) plus change, which is
+the expected shape — hierarchical mode ranks every task independently, with no memoisation
+across tasks. That is the oracle's behaviour and the reason the cost is linear in tasks × agents.
+
 **Not comparable to `rust-old/bench-history.csv`** — different allocator, different harness, no
 criterion statistics. The Cyrius line starts its own baseline, captured by
-`scripts/bench-history.sh` into the root `bench-history.csv` (35 rows).
+`scripts/bench-history.sh` into the root `bench-history.csv` (48 rows per capture).
 
 ## Dependencies
 

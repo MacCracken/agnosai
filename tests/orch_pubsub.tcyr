@@ -134,8 +134,9 @@ fn main() {
     var ch = chan_new(2);
     assert_eq(agnosai_chan_push_lossy(ch, 11), 0, "a push into a free ring succeeds");
     assert_eq(agnosai_chan_push_lossy(ch, 22), 0, "and fills it");
-    assert_eq(agnosai_chan_push_lossy(ch, 33), 0,
-    "a push into a FULL ring still succeeds — it never reports full, which is the contract");
+    assert_eq(agnosai_chan_push_lossy(ch, 33), 1,
+    "a push into a FULL ring still succeeds — it never reports full, which is the contract; the 1 \
+    says it had to evict to get there");
     assert_eq(chan_try_recv(ch), 22, "the OLDEST entry was evicted, not the newest");
     assert_eq(chan_try_recv(ch), 33, "and the newest is present");
     assert_eq(chan_try_recv(ch), 0, "leaving the ring empty");
@@ -144,7 +145,9 @@ fn main() {
     var full = chan_new(1);
     chan_try_send(full, 1);
     assert_eq(chan_try_send(full, 2), 0 - 2, "chan_try_send reports -2 on a full ring");
-    assert_eq(agnosai_chan_push_lossy(full, 2), 0, "where the lossy push makes room instead");
+    assert_eq(agnosai_chan_push_lossy(full, 2), 1,
+    "where the lossy push makes room instead, and reports the eviction so a caller can \
+    count what a slow reader lost");
     assert_eq(chan_try_recv(full), 2, "and the survivor is the newer value");
 
     var closed = chan_new(2);

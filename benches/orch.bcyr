@@ -1,0 +1,326 @@
+# =========================================================================
+# orch.bcyr — benchmarks for the orchestration group.
+#
+# No oracle bench file: rust-old/benches/ has no orchestrator.rs. These measure
+# what a crew run actually hammers — the event fan-out on every task boundary,
+# the per-task ranking and delegation, the DAG sort, the plan-cache key, and the
+# conversation trim that runs on every push.
+#
+# **Fan-out is measured as a round trip.** A subscriber's ring is 256 deep, so a
+# send-only loop saturates it after 256 iterations and then measures nothing but
+# the eviction path. Draining inside the loop keeps the reader in step and gives
+# the number a real deployment sees. `event_send_evicting` measures the other
+# case deliberately, against a ring left full on purpose: that is the cost of
+# the overwrite-oldest guarantee blocker #4 was about, and the number worth
+# knowing is that a stalled SSE client does not get more expensive to serve.
+#
+# **Logging is turned down to SK_FATAL.** `agnosai_delegate_tasks` emits an INFO
+# line per call, matching the oracle's `info!`, and `orch_pubsub` and the event
+# bus log on their rejection paths. Left at the default level a delegation
+# benchmark measures sakshi writing to a pipe, not the delegation. The log cost
+# is real in production and is worth its own number one day; it is not what
+# these shapes are for.
+#
+# These are CYRIUS baseline numbers, NOT comparable to
+# rust-old/bench-history.csv. See CLAUDE.md.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+# orch_memory builds chat messages, whose roles live in the hoosh seam.
+include "src/llm_retry.cyr"
+include "src/llm_hoosh.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/orch_pubsub.cyr"
+include "src/orch_scoring.cyr"
+include "src/orch_scheduler.cyr"
+include "src/orch_plan_cache.cyr"
+include "src/orch_memory.cyr"
+include "src/orch_hierarchical.cyr"
+
+# An agent with two tools, a complexity and a domain — the shape scoring reads.
+fn _b_agent(key: Str): i64 {
+    var a = agnosai_agent_new(key, str_from("worker"), str_from("do work"));
+    agnosai_agent_with_complexity(a, str_from("medium"));
+    agnosai_agent_with_domain(a, str_from("quality"));
+    var tools = vec_new();
+    vec_push(tools, str_from("lint"));
+    vec_push(tools, str_from("test"));
+    agnosai_agent_with_tools(a, tools);
+    return a;
+}
+
+# A task whose context exercises all three scoring signals.
+fn _b_task(): i64 {
+    var t = agnosai_task_new(str_from("review the changed files and report defects"));
+    var required = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(required, bayan_json_v_str_new(str_from("lint")));
+    bayan_json_v_arr_push(required, bayan_json_v_str_new(str_from("test")));
+    agnosai_task_with_context(t, str_from("required_tools"), required);
+    agnosai_task_with_context(t, str_from("complexity"), bayan_json_v_str_new(str_from("medium")));
+    agnosai_task_with_context(t, str_from("domain"), bayan_json_v_str_new(str_from("quality")));
+    return t;
+}
+
+# `n` agents with distinct keys.
+fn _b_agents(n): i64 {
+    var v = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(v, _b_agent(str_cat(str_from("agent-"), str_from_int(i))));
+    }
+    return v;
+}
+
+# `n` tasks.
+fn _b_tasks(n): i64 {
+    var v = vec_new();
+    for (var i = 0; i < n; i = i + 1) { vec_push(v, _b_task()); }
+    return v;
+}
+
+# One event send with a single reader keeping pace — the steady state when an
+# SSE client is connected and consuming.
+fn _b_event_round_trip(): i64 {
+    var n = 200000;
+    var bus = agnosai_event_bus_new();
+    var tx = agnosai_event_bus_sender(bus, agnosai_uuid_v4_str());
+    var rx = agnosai_event_sender_subscribe(tx);
+    var ev = agnosai_crew_event_new(str_from("crew"), str_from("task_started"),
+    bayan_json_v_null());
+
+    var b = bench_new("event_round_trip_1_sub");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_event_sender_send(tx, ev);
+        agnosai_event_sub_try_recv(rx);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The same, fanned out to 64 subscribers each of which reads.
+fn _b_event_fanout_64(): i64 {
+    var n = 5000;
+    var bus = agnosai_event_bus_new();
+    var tx = agnosai_event_bus_sender(bus, agnosai_uuid_v4_str());
+    var subs = vec_new();
+    for (var s = 0; s < 64; s = s + 1) { vec_push(subs, agnosai_event_sender_subscribe(tx)); }
+    var ev = agnosai_crew_event_new(str_from("crew"), str_from("task_started"),
+    bayan_json_v_null());
+
+    var b = bench_new("event_fanout_64_subs");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_event_sender_send(tx, ev);
+        for (var j = 0; j < 64; j = j + 1) { agnosai_event_sub_try_recv(vec_get(subs, j)); }
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A send into a subscriber that has stopped reading — the eviction path.
+fn _b_event_send_evicting(): i64 {
+    var n = 200000;
+    var bus = agnosai_event_bus_new();
+    var tx = agnosai_event_bus_sender(bus, agnosai_uuid_v4_str());
+    agnosai_event_sender_subscribe(tx);
+    var ev = agnosai_crew_event_new(str_from("crew"), str_from("task_started"),
+    bayan_json_v_null());
+
+    # Fill the ring first, so every timed send takes the evict-and-retry branch
+    # rather than the first 256 measuring the cheap one.
+    for (var f = 0; f < AGNOSAI_SSE_CHANNEL_CAPACITY; f = f + 1) {
+        agnosai_event_sender_send(tx, ev);
+    }
+
+    var b = bench_new("event_send_evicting");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_event_sender_send(tx, ev); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A publish across four patterns, one of which matches, with the reader keeping
+# pace — the shape a crew's own event topics take.
+fn _b_pubsub_publish(): i64 {
+    var n = 100000;
+    var ps = agnosai_pubsub_new();
+    var rx = agnosai_pubsub_subscribe(ps, str_from("task.#"));
+    agnosai_pubsub_subscribe(ps, str_from("agent.*"));
+    agnosai_pubsub_subscribe(ps, str_from("crew.started"));
+    agnosai_pubsub_subscribe(ps, str_from("tool.*.failed"));
+    var topic = str_from("task.completed");
+    var payload = bayan_json_v_null();
+
+    var b = bench_new("pubsub_publish_4_patterns");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_pubsub_publish(ps, topic, payload);
+        chan_try_recv(rx);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The wildcard matcher on its own, against a pattern that only fails on the
+# last segment — the worst case that still returns false.
+fn _b_pattern_match(): i64 {
+    var n = 500000;
+    var pattern = str_from("tool.*.*.failed");
+    var topic = str_from("tool.http.request.succeeded");
+
+    var b = bench_new("pattern_match_wildcard");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_matches_pattern(pattern, topic); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Ranking 16 agents for one task — what hierarchical mode pays per task.
+fn _b_rank_agents(): i64 {
+    var n = 20000;
+    var agents = _b_agents(16);
+    var task = _b_task();
+
+    var b = bench_new("rank_agents_16");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_rank_agents(agents, task); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A whole delegation pass: 16 tasks over 16 agents, one ranking each.
+fn _b_delegate(): i64 {
+    var n = 2000;
+    var manager = _b_agent(str_from("manager"));
+    var agents = _b_agents(16);
+    var tasks = _b_tasks(16);
+
+    var b = bench_new("delegate_16_tasks_16_agents");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_delegate_tasks(manager, agents, tasks); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The scheduler's topological sort over a 64-node chain-of-pairs DAG: every odd
+# node depends on the even one before it, so half the nodes seed the first wave.
+fn _b_kahn_sort(): i64 {
+    var n = 5000;
+    var keys = vec_new();
+    var dependents = map_new_str();
+    var dependencies = map_new_str();
+    for (var k = 0; k < 64; k = k + 1) {
+        var key = str_cat(str_from("task-"), str_from_int(k));
+        vec_push(keys, key);
+        map_set(dependents, key, vec_new());
+        map_set(dependencies, key, vec_new());
+    }
+    for (var e = 1; e < 64; e = e + 2) {
+        var from = vec_get(keys, e - 1);
+        var to = vec_get(keys, e);
+        vec_push(map_get(dependents, from), to);
+        vec_push(map_get(dependencies, to), from);
+    }
+
+    var b = bench_new("kahn_sort_64_nodes");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_scheduler_kahn_sort(keys, dependents, dependencies);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The plan-cache key over a 16-agent, 16-task crew — two sorts plus the FNV walk.
+fn _b_plan_key(): i64 {
+    var n = 20000;
+    var agent_keys = vec_new();
+    var descriptions = vec_new();
+    for (var k = 0; k < 16; k = k + 1) {
+        vec_push(agent_keys, str_cat(str_from("agent-"), str_from_int(k)));
+        vec_push(descriptions, str_cat(str_from("do the thing numbered "), str_from_int(k)));
+    }
+    var mode = str_from("sequential");
+
+    var b = bench_new("plan_key_16x16");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_plan_key(agent_keys, descriptions, mode); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A cache hit, including the TTL check and the LRU touch.
+fn _b_plan_cache_get(): i64 {
+    var n = 200000;
+    var cache = agnosai_plan_cache_new();
+    var keys = vec_new();
+    for (var k = 0; k < 64; k = k + 1) {
+        var one = vec_new();
+        vec_push(one, str_cat(str_from("agent-"), str_from_int(k)));
+        var key = agnosai_plan_key(one, one, str_from("sequential"));
+        vec_push(keys, key);
+        agnosai_plan_cache_insert(cache, key, agnosai_cached_plan_empty());
+    }
+
+    var b = bench_new("plan_cache_get_hit");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_plan_cache_get(cache, vec_get(keys, i % 64));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A push into a full sliding-window buffer — the trim runs on every push, so
+# this is the steady-state cost of a long tool-use loop.
+fn _b_conv_buffer_push(): i64 {
+    var n = 200000;
+    var buf = agnosai_conv_buffer_with_sliding_window(str_from("agent-a"), 32);
+    var content = str_from("call the tool again with the corrected arguments");
+    for (var f = 0; f < 32; f = f + 1) { agnosai_conv_buffer_add_user(buf, content); }
+
+    var b = bench_new("conv_buffer_push_sliding_32");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_conv_buffer_add_user(buf, content); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _b_event_round_trip();
+    _b_event_fanout_64();
+    _b_event_send_evicting();
+    _b_pubsub_publish();
+    _b_pattern_match();
+    _b_rank_agents();
+    _b_delegate();
+    _b_kahn_sort();
+    _b_plan_key();
+    _b_plan_cache_get();
+    _b_conv_buffer_push();
+
+    return 0;
+}
+
+var r = main();
+syscall(60, r);
