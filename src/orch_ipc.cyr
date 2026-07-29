@@ -1,0 +1,232 @@
+# =========================================================================
+# orch_ipc — Unix-socket IPC with length-prefixed framing.
+#
+# Parity oracle: rust-old/src/orchestrator/ipc.rs
+#
+# The wire protocol is a 4-byte big-endian length followed by that many bytes
+# of JSON. Local agent-to-orchestrator traffic only; inter-node is fleet's.
+#
+# **majra already ships this transport** — `ipc_bind` / `ipc_accept` /
+# `ipc_connect` / `ipc_send_frame` / `ipc_recv_frame`, with a byte-identical
+# frame header. Connection establishment is reused from it: it owns the
+# `sockaddr_un` construction, the stale-socket unlink, and the agnos target's
+# fail-closed path, none of which this port improves on by rewriting.
+#
+# **The framing is NOT reused, for two reasons that would both be silent.**
+#
+#   * majra caps a frame at **1 MiB** (`len > 1048576`); the oracle's
+#     `MAX_FRAME_SIZE` is **16 MiB**. Deferring to majra would refuse payloads
+#     between those bounds that the oracle accepts — and the oracle has a test
+#     for a >64 KiB payload precisely because large frames are expected.
+#   * majra collapses every failure into `ERR_IPC`. The oracle distinguishes
+#     six conditions by message, and two of them are operationally different in
+#     a way a caller acts on: "peer disconnected" is a normal shutdown, while
+#     "frame size exceeds maximum" is a misbehaving or hostile peer.
+#
+# So the frame verbs here are agnosai's, over a raw fd, carrying the oracle's
+# constants and its wording. They interoperate with majra's on the wire.
+#
+# Note on the Result verbs: majra returns tagged `Ok`/`Err`, so the predicates
+# here are `is_err_result` / `result_unwrap` from `lib/result.cyr` — **not**
+# `is_err`, which is `syscalls_*_linux.cyr`'s raw `ret < 0` check, and **not**
+# `unwrap`, which is `tagged.cyr`'s Option unwrap. All three names coexist in
+# the one flat namespace; using the wrong pair compiles and then dies at runtime
+# with "unwrap called on None".
+#
+# One further check the oracle has and majra does not: a **zero-length frame is
+# an error**, not an empty payload. Without it a peer can hold a reader in a
+# loop that consumes four bytes and produces nothing.
+# =========================================================================
+
+# The oracle's `MAX_FRAME_SIZE`: 16 MiB.
+var AGNOSAI_IPC_MAX_FRAME_SIZE = 16777216;
+
+# Returned by the frame verbs when the peer closed the connection cleanly.
+# Distinct from a read error, because a clean shutdown is not a fault.
+var AGNOSAI_IPC_EOF = 0 - 1;
+
+# Returned when a frame could not be read or written. The detail is in
+# `agnosai_ipc_last_error`.
+var AGNOSAI_IPC_ERR = 0 - 2;
+
+# The message describing the most recent framing failure, or 0.
+#
+# The oracle returns `AgnosaiError::Ipc(String)`; there is no error carrier in
+# this module's return type, so the message is parked here and read immediately
+# after a failure. Every frame verb clears it on entry, so a stale message can
+# never be attributed to a later call.
+var _AGNOSAI_IPC_ERROR = 0;
+
+# The most recent framing error message, or 0 when the last call succeeded.
+fn agnosai_ipc_last_error(): i64 {
+    return _AGNOSAI_IPC_ERROR;
+}
+
+# Record a framing failure and return the error sentinel.
+fn _agnosai_ipc_fail(msg: Str): i64 {
+    _AGNOSAI_IPC_ERROR = msg;
+    return AGNOSAI_IPC_ERR;
+}
+
+# The oracle's `frame size {len} exceeds maximum {MAX_FRAME_SIZE}`.
+fn _agnosai_ipc_too_large(len): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "frame size ");
+    str_builder_add_int(sb, len);
+    str_builder_add_cstr(sb, " exceeds maximum ");
+    str_builder_add_int(sb, AGNOSAI_IPC_MAX_FRAME_SIZE);
+    return str_builder_build(sb);
+}
+
+# Write exactly `len` bytes, looping over short writes.
+#
+# `write_all` in the oracle; a bare `write` syscall may transfer fewer bytes
+# than asked on a socket, and treating a short write as success would corrupt
+# the frame boundary for every subsequent message on the connection.
+fn _agnosai_ipc_write_all(fd, buf, len): i64 {
+    var total = 0;
+    while (total < len) {
+        var n = syscall(SYS_WRITE, fd, buf + total, len - total);
+        if (n <= 0) { return 0; }
+        total = total + n;
+    }
+    return 1;
+}
+
+# Read exactly `len` bytes. Returns 1 on success, 0 on error, -1 on a clean EOF
+# before any byte arrived.
+fn _agnosai_ipc_read_all(fd, buf, len): i64 {
+    var total = 0;
+    while (total < len) {
+        var n = syscall(SYS_READ, fd, buf + total, len - total);
+        if (n == 0) {
+            if (total == 0) { return 0 - 1; }
+            return 0;
+        }
+        if (n < 0) { return 0; }
+        total = total + n;
+    }
+    return 1;
+}
+
+# Write a length-prefixed frame.
+#
+# Returns 0 on success, or `AGNOSAI_IPC_ERR` with the reason in
+# `agnosai_ipc_last_error`.
+fn agnosai_ipc_write_frame(fd, data, len): i64 {
+    _AGNOSAI_IPC_ERROR = 0;
+
+    if (len > AGNOSAI_IPC_MAX_FRAME_SIZE) {
+        return _agnosai_ipc_fail(_agnosai_ipc_too_large(len));
+    }
+
+    # Big-endian, matching both the oracle's `to_be_bytes` and majra's header.
+    var hdr[4];
+    store8(&hdr, (len >> 24) & 255);
+    store8(&hdr + 1, (len >> 16) & 255);
+    store8(&hdr + 2, (len >> 8) & 255);
+    store8(&hdr + 3, len & 255);
+
+    if (_agnosai_ipc_write_all(fd, &hdr, 4) == 0) {
+        return _agnosai_ipc_fail(str_from("write length failed"));
+    }
+    if (len > 0) {
+        if (_agnosai_ipc_write_all(fd, data, len) == 0) {
+            return _agnosai_ipc_fail(str_from("write payload failed"));
+        }
+    }
+    return 0;
+}
+
+# Read a length-prefixed frame into a freshly allocated buffer.
+#
+# Returns the payload as a Str, `AGNOSAI_IPC_EOF` when the peer closed cleanly
+# before sending a length, or `AGNOSAI_IPC_ERR`.
+fn agnosai_ipc_read_frame(fd): i64 {
+    _AGNOSAI_IPC_ERROR = 0;
+
+    var hdr[4];
+    var rc = _agnosai_ipc_read_all(fd, &hdr, 4);
+    if (rc == 0 - 1) {
+        # The oracle's `UnexpectedEof` arm on the length read. Reported as EOF
+        # rather than an error: a peer that has finished is not a fault.
+        _AGNOSAI_IPC_ERROR = str_from("peer disconnected (EOF on length read)");
+        return AGNOSAI_IPC_EOF;
+    }
+    if (rc == 0) { return _agnosai_ipc_fail(str_from("read length failed")); }
+
+    var len = ((load8(&hdr) & 255) << 24) | ((load8(&hdr + 1) & 255) << 16)
+    | ((load8(&hdr + 2) & 255) << 8) | (load8(&hdr + 3) & 255);
+
+    # Both checks precede the allocation, so a hostile length never reserves
+    # memory. The zero check is the oracle's and majra has no equivalent.
+    if (len == 0) { return _agnosai_ipc_fail(str_from("empty frame (zero-length)")); }
+    if (len > AGNOSAI_IPC_MAX_FRAME_SIZE) {
+        return _agnosai_ipc_fail(_agnosai_ipc_too_large(len));
+    }
+
+    var buf = alloc(len);
+    if (buf == 0) { return _agnosai_ipc_fail(str_from("read payload failed")); }
+    if (_agnosai_ipc_read_all(fd, buf, len) != 1) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "peer disconnected mid-frame (expected ");
+        str_builder_add_int(sb, len);
+        str_builder_add_cstr(sb, " bytes)");
+        return _agnosai_ipc_fail(str_builder_build(sb));
+    }
+    return str_from_buf(buf, len);
+}
+
+# Send a JSON value as one frame.
+fn agnosai_ipc_send(fd, payload): i64 {
+    var encoded = bayan_json_v_build(payload);
+    return agnosai_ipc_write_frame(fd, str_data(encoded), str_len(encoded));
+}
+
+# Receive one frame and parse it as JSON.
+#
+# Returns the parsed value, or `AGNOSAI_IPC_EOF` / `AGNOSAI_IPC_ERR`. A frame
+# that arrives intact but is not JSON is an error, not EOF — the oracle's
+# `serde_json::from_slice` failure propagates through the same `?`.
+fn agnosai_ipc_recv(fd): i64 {
+    var frame = agnosai_ipc_read_frame(fd);
+    if (frame == AGNOSAI_IPC_EOF) { return AGNOSAI_IPC_EOF; }
+    if (frame == AGNOSAI_IPC_ERR) { return AGNOSAI_IPC_ERR; }
+
+    var value = bayan_json_v_parse_str(str_data(frame), str_len(frame));
+    if (value == 0) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "failed to parse frame as JSON: ");
+        str_builder_add_cstr(sb, bayan_json_last_error());
+        return _agnosai_ipc_fail(str_builder_build(sb));
+    }
+    return value;
+}
+
+# Bind a listening socket at a Unix socket path, removing any stale socket file.
+#
+# Returns the listening fd, or `AGNOSAI_IPC_ERR`. Delegates to majra, which
+# owns the `sockaddr_un` construction and the agnos fail-closed path; the
+# narrow unlink-then-bind TOCTOU window the oracle documents is majra's too.
+fn agnosai_ipc_bind(path: Str): i64 {
+    _AGNOSAI_IPC_ERROR = 0;
+    var r = ipc_bind(str_cstr(path));
+    if (is_err_result(r) == 1) { return _agnosai_ipc_fail(str_from("failed to bind socket")); }
+    return result_unwrap(r);
+}
+
+# Accept the next incoming connection, returning the client fd.
+fn agnosai_ipc_accept(server_fd): i64 {
+    _AGNOSAI_IPC_ERROR = 0;
+    var r = ipc_accept(server_fd);
+    if (is_err_result(r) == 1) { return _agnosai_ipc_fail(str_from("accept failed")); }
+    return result_unwrap(r);
+}
+
+# Connect to an IPC server, returning the connected fd.
+fn agnosai_ipc_connect(path: Str): i64 {
+    _AGNOSAI_IPC_ERROR = 0;
+    var r = ipc_connect(str_cstr(path));
+    if (is_err_result(r) == 1) { return _agnosai_ipc_fail(str_from("connect failed")); }
+    return result_unwrap(r);
+}

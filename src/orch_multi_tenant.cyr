@@ -1,0 +1,205 @@
+# =========================================================================
+# orch_multi_tenant — per-tenant budget registration and enforcement.
+#
+# Parity oracle: rust-old/src/orchestrator/multi_tenant.rs
+#
+# A registry of tenants and their limits, plus one check that answers "may this
+# tenant keep going". The oracle's `DashMap` becomes a hashmap behind a futex
+# mutex — the same forced substitution the tool registry and pubsub made, and
+# for the same reason: `run_pooled` makes every worker its own OS thread.
+#
+# `max_cost_usd` is carried as **integer micro-USD**, per the 2026-07-28 money
+# decision and matching `core_resource`'s `ResourceBudget`. That is cleaner here
+# than anywhere else it has been applied: `TenantBudget` derives only
+# `Debug, Clone` — no `Serialize` — so there is no wire boundary to convert at,
+# and the field exists purely to be compared. The oracle's `used > max` on two
+# f64s becomes an exact integer comparison with no rounding to reason about.
+#
+# `BudgetCheckResult` is a five-variant enum; Cyrius has no sum types, so it is
+# five integer constants. They are **not** a bitmask and not ordered by
+# severity — the check returns the first limit it finds breached, in the
+# oracle's order.
+# =========================================================================
+
+# Usage is within every limit.
+var AGNOSAI_BUDGET_OK = 0;
+
+# The token limit is exceeded.
+var AGNOSAI_BUDGET_TOKENS_EXCEEDED = 1;
+
+# The cost limit is exceeded.
+var AGNOSAI_BUDGET_COST_EXCEEDED = 2;
+
+# The concurrent-crew limit is exceeded.
+var AGNOSAI_BUDGET_CONCURRENCY_EXCEEDED = 3;
+
+# The tenant is not registered.
+var AGNOSAI_BUDGET_TENANT_NOT_FOUND = 4;
+
+# TenantBudget — the oracle's three limits.
+enum AgnosaiTenantBudgetOff {
+    AGN_TB_MAX_TOKENS = 0;
+    AGN_TB_MAX_COST_MICRO_USD = 8;
+    AGN_TB_MAX_CONCURRENT_CREWS = 16;
+    AGN_TB_SIZE = 24;
+}
+
+# Create a tenant budget. `max_cost_micro_usd` is millionths of a dollar.
+fn agnosai_tenant_budget_new(max_tokens, max_cost_micro_usd, max_concurrent_crews): i64 {
+    var b = alloc(AGN_TB_SIZE);
+    store64(b + AGN_TB_MAX_TOKENS, max_tokens);
+    store64(b + AGN_TB_MAX_COST_MICRO_USD, max_cost_micro_usd);
+    store64(b + AGN_TB_MAX_CONCURRENT_CREWS, max_concurrent_crews);
+    return b;
+}
+
+# Maximum total tokens the tenant may consume.
+fn agnosai_tenant_budget_max_tokens(b): i64 {
+    return load64(b + AGN_TB_MAX_TOKENS);
+}
+
+# Maximum total inference cost, in micro-USD.
+fn agnosai_tenant_budget_max_cost_micro_usd(b): i64 {
+    return load64(b + AGN_TB_MAX_COST_MICRO_USD);
+}
+
+# Maximum number of crews the tenant may run at once.
+fn agnosai_tenant_budget_max_concurrent_crews(b): i64 {
+    return load64(b + AGN_TB_MAX_CONCURRENT_CREWS);
+}
+
+# TenantRegistry — tenant id -> budget, behind a mutex.
+enum AgnosaiTenantRegistryOff {
+    AGN_TR_BUDGETS = 0;
+    AGN_TR_MUTEX = 8;
+    AGN_TR_SIZE = 16;
+}
+
+# Create an empty tenant registry.
+fn agnosai_tenant_registry_new(): i64 {
+    var r = alloc(AGN_TR_SIZE);
+    store64(r + AGN_TR_BUDGETS, map_new_str());
+    store64(r + AGN_TR_MUTEX, mutex_new());
+    return r;
+}
+
+# Number of registered tenants.
+fn agnosai_tenant_registry_len(r): i64 {
+    var mtx = load64(r + AGN_TR_MUTEX);
+    mutex_lock(mtx);
+    var n = map_size(load64(r + AGN_TR_BUDGETS));
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Whether no tenants are registered.
+fn agnosai_tenant_registry_is_empty(r): i64 {
+    if (agnosai_tenant_registry_len(r) == 0) { return 1; }
+    return 0;
+}
+
+# Log a tenant registration — the oracle's `info!`.
+fn _agnosai_tenant_log(level, msg, msg_len, tenant_id: Str, detail): i64 {
+    if (sakshi_get_level() < level) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, tenant_id);
+    if (detail != 0) {
+        str_builder_add_cstr(sb, " ");
+        str_builder_add(sb, detail);
+    }
+    var line = str_builder_build(sb);
+    sakshi_log_kv(level, msg, msg_len, "tenant", 6, str_data(line), str_len(line));
+    return 0;
+}
+
+# Format the "used=N max=N" detail the oracle's warn! fields carry.
+fn _agnosai_tenant_pair(used_key, used, max_key, max): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, used_key);
+    str_builder_add_cstr(sb, "=");
+    str_builder_add_int(sb, used);
+    str_builder_add_cstr(sb, " ");
+    str_builder_add_cstr(sb, max_key);
+    str_builder_add_cstr(sb, "=");
+    str_builder_add_int(sb, max);
+    return str_builder_build(sb);
+}
+
+# Register a tenant, replacing any existing budget for that id.
+fn agnosai_tenant_registry_register(r, tenant_id: Str, budget): i64 {
+    _agnosai_tenant_log(SK_INFO, "registering tenant", 18, tenant_id, 0);
+    var mtx = load64(r + AGN_TR_MUTEX);
+    mutex_lock(mtx);
+    map_set(load64(r + AGN_TR_BUDGETS), str_clone(tenant_id), budget);
+    mutex_unlock(mtx);
+    return 0;
+}
+
+# Look up a tenant's budget, or 0 when the tenant is not registered.
+#
+# The oracle clones the budget out of the map; this returns the stored pointer.
+# `TenantBudget` has no mutating accessor here, so the distinction is not
+# observable — and a caller that wanted to change a limit would go through
+# `register`, which is what replaces it in the oracle too.
+fn agnosai_tenant_registry_get_budget(r, tenant_id: Str): i64 {
+    var mtx = load64(r + AGN_TR_MUTEX);
+    mutex_lock(mtx);
+    var b = map_get(load64(r + AGN_TR_BUDGETS), tenant_id);
+    mutex_unlock(mtx);
+    return b;
+}
+
+# Remove a tenant, returning the removed budget or 0 when absent.
+fn agnosai_tenant_registry_remove(r, tenant_id: Str): i64 {
+    var mtx = load64(r + AGN_TR_MUTEX);
+    mutex_lock(mtx);
+    var budgets = load64(r + AGN_TR_BUDGETS);
+    var b = map_get(budgets, tenant_id);
+    if (b != 0) { map_delete(budgets, tenant_id); }
+    mutex_unlock(mtx);
+    return b;
+}
+
+# Check a tenant's usage against their budget.
+#
+# `used_cost_micro_usd` is micro-USD, matching the stored limit. Returns one of
+# the `AGNOSAI_BUDGET_*` constants.
+#
+# Every limit is breached only by **exceeding** it, never by reaching it: the
+# oracle's comparisons are all `>`, so a tenant sitting exactly on their token
+# cap is still Ok. That is worth stating because `>=` would be the more usual
+# reading of "max", and the oracle has a test pinning it.
+#
+# The order is the oracle's and is observable when more than one limit is
+# breached at once: unknown tenant, then tokens, then cost, then concurrency.
+fn agnosai_check_tenant_budget(r, tenant_id: Str, used_tokens, used_cost_micro_usd,
+active_crews): i64 {
+    var budget = agnosai_tenant_registry_get_budget(r, tenant_id);
+    if (budget == 0) {
+        _agnosai_tenant_log(SK_WARN, "budget check for unknown tenant", 31, tenant_id, 0);
+        return AGNOSAI_BUDGET_TENANT_NOT_FOUND;
+    }
+
+    if (used_tokens > agnosai_tenant_budget_max_tokens(budget)) {
+        _agnosai_tenant_log(SK_WARN, "tenant token limit exceeded", 27, tenant_id,
+        _agnosai_tenant_pair("used_tokens", used_tokens, "max_tokens",
+        agnosai_tenant_budget_max_tokens(budget)));
+        return AGNOSAI_BUDGET_TOKENS_EXCEEDED;
+    }
+
+    if (used_cost_micro_usd > agnosai_tenant_budget_max_cost_micro_usd(budget)) {
+        _agnosai_tenant_log(SK_WARN, "tenant cost limit exceeded", 26, tenant_id,
+        _agnosai_tenant_pair("used_cost_micro_usd", used_cost_micro_usd, "max_cost_micro_usd",
+        agnosai_tenant_budget_max_cost_micro_usd(budget)));
+        return AGNOSAI_BUDGET_COST_EXCEEDED;
+    }
+
+    if (active_crews > agnosai_tenant_budget_max_concurrent_crews(budget)) {
+        _agnosai_tenant_log(SK_WARN, "tenant concurrency limit exceeded", 33, tenant_id,
+        _agnosai_tenant_pair("active_crews", active_crews, "max_concurrent_crews",
+        agnosai_tenant_budget_max_concurrent_crews(budget)));
+        return AGNOSAI_BUDGET_CONCURRENCY_EXCEEDED;
+    }
+
+    return AGNOSAI_BUDGET_OK;
+}

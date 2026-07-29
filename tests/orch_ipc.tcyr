@@ -1,0 +1,263 @@
+# =========================================================================
+# orch_ipc.tcyr — parity tests for src/orch_ipc.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/orchestrator/ipc.rs — four
+# `#[tokio::test]`s that bind a socket in a temp dir, connect a client, and
+# round-trip JSON.
+#
+# Those port without a filesystem. `sys_socketpair(AF_UNIX, SOCK_STREAM)`
+# hands back two already-connected fds, which is what the oracle's
+# bind/accept/connect dance produces — so the framing, the round-trip, the
+# multi-message case and the >64 KiB payload all run with no socket file, no
+# temp dir and no cleanup. Only the bind/accept/connect wrappers themselves are
+# left uncovered by that, and they are thin delegations to majra.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/orch_ipc.cyr"
+include "tests/test_helpers.cyr"
+
+# A connected AF_UNIX stream pair. Returns 0 on failure.
+fn _t_pair(fds): i64 {
+    if (sys_socketpair(1, 1, 0, fds) != 0) { return 0; }
+    return 1;
+}
+
+# The first fd of a pair written by _t_pair.
+fn _t_fd0(fds): i64 {
+    return load32(fds) & 4294967295;
+}
+
+# The second fd.
+fn _t_fd1(fds): i64 {
+    return load32(fds + 4) & 4294967295;
+}
+
+# Send a JSON literal down an fd.
+fn _t_send_json(fd, src): i64 {
+    return agnosai_ipc_send(fd, bayan_json_v_parse_str(src, strlen(src)));
+}
+
+# The >64 KiB payload the oracle tests with.
+var _T_BIG_LEN = 100000;
+
+# Writes one large frame from its own thread.
+#
+# It has to be a thread: 100 KB will not fit in a socket buffer, so a
+# same-thread write would block forever with nobody draining the other end.
+# That is exactly the short-transfer path the write and read loops exist for.
+fn _t_big_writer(fd): i64 {
+    var buf = alloc(_T_BIG_LEN);
+    for (var i = 0; i < _T_BIG_LEN; i = i + 1) { store8(buf + i, 122); }
+    agnosai_ipc_write_frame(fd, buf, _T_BIG_LEN);
+    return 0;
+}
+
+# The socket path the bind/accept/connect test uses. `agnosai_ipc_bind`
+# unlinks any stale file first, so a fixed name is safe to re-run.
+var _T_SOCK = "/tmp/agnosai-orch-ipc-test.sock";
+
+# Connects to _T_SOCK and sends one frame, from its own thread.
+fn _t_client(unused): i64 {
+    var fd = agnosai_ipc_connect(str_from(_T_SOCK));
+    if (fd == AGNOSAI_IPC_ERR) { return 0; }
+    var body = "{\"from\":\"client\"}";
+    agnosai_ipc_send(fd, bayan_json_v_parse_str(body, strlen(body)));
+    sys_close(fd);
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_ipc");
+
+    assert_eq(AGNOSAI_IPC_MAX_FRAME_SIZE, 16777216, "the frame cap is the oracle's 16 MiB");
+    assert_eq(AGNOSAI_IPC_MAX_FRAME_SIZE, 16 * 1024 * 1024, "spelled the oracle's way");
+    assert(AGNOSAI_IPC_MAX_FRAME_SIZE > 1048576,
+    "and is larger than majra's 1 MiB, which is why the framing is not delegated");
+
+    var fds: i64[2];
+    assert_eq(_t_pair(&fds), 1, "socketpair gives a connected AF_UNIX pair");
+    var a = _t_fd0(&fds);
+    var b = _t_fd1(&fds);
+
+    # --- send_receive_json_roundtrip ---
+    assert_eq(_t_send_json(a, "{\"hello\":\"world\",\"n\":42}"), 0, "a JSON frame sends");
+    var got = agnosai_ipc_recv(b);
+    assert(got != AGNOSAI_IPC_ERR, "and is received without error");
+    assert(got != AGNOSAI_IPC_EOF, "and is not EOF");
+    assert(str_eq(bayan_json_v_build(got), str_from("{\"hello\":\"world\",\"n\":42}")) == 1,
+    "round-tripping the payload unchanged");
+    assert_eq(agnosai_ipc_last_error(), 0, "with no error recorded");
+
+    # --- multiple_messages_same_connection ---
+    # The framing must keep boundaries across back-to-back writes; a short write
+    # treated as success would desynchronise everything after it.
+    _t_send_json(a, "{\"seq\":1}");
+    _t_send_json(a, "{\"seq\":2}");
+    _t_send_json(a, "{\"seq\":3}");
+    assert(str_eq(bayan_json_v_build(agnosai_ipc_recv(b)), str_from("{\"seq\":1}")) == 1,
+    "the first of three queued frames");
+    assert(str_eq(bayan_json_v_build(agnosai_ipc_recv(b)), str_from("{\"seq\":2}")) == 1,
+    "the second, with its boundary intact");
+    assert(str_eq(bayan_json_v_build(agnosai_ipc_recv(b)), str_from("{\"seq\":3}")) == 1,
+    "and the third");
+
+    # --- large_payload_over_64kb ---
+    # The oracle tests >64 KiB specifically; this also exceeds a single socket
+    # buffer, so it only passes if the write and read loops both handle short
+    # transfers.
+    assert(_T_BIG_LEN > 65536, "the payload really is over 64 KiB");
+
+    # A pair of its own: 100 KB will not fit in the socket buffer alongside a
+    # blocking reader on the same thread, so this is written and read in halves
+    # by the frame verbs themselves.
+    var big_fds: i64[2];
+    _t_pair(&big_fds);
+    var w = _t_fd0(&big_fds);
+    var r = _t_fd1(&big_fds);
+
+    # Raw frame verbs rather than the JSON pair, so the test does not depend on
+    # a 100 KB parse to prove the transport.
+    var tid = thread_create(&_t_big_writer, w);
+    assert(tid != 0, "a writer thread starts");
+    var frame = agnosai_ipc_read_frame(r);
+    assert(frame != AGNOSAI_IPC_ERR, "a >64 KiB frame reads back without error");
+    assert(frame != AGNOSAI_IPC_EOF, "and is not EOF");
+    assert_eq(str_len(frame), _T_BIG_LEN, "with every byte accounted for");
+    assert_eq(load8(str_data(frame)) & 255, 122, "and the payload intact at the front");
+    assert_eq(load8(str_data(frame) + _T_BIG_LEN - 1) & 255, 122, "and at the back");
+    thread_join(tid);
+
+    # --- a zero-length frame is an error, not an empty payload ---
+    # majra has no such check; without it a peer can hold a reader in a loop
+    # that consumes four bytes and yields nothing.
+    var z: i64[2];
+    _t_pair(&z);
+    var zhdr[4];
+    store8(&zhdr, 0);
+    store8(&zhdr + 1, 0);
+    store8(&zhdr + 2, 0);
+    store8(&zhdr + 3, 0);
+    syscall(SYS_WRITE, _t_fd0(&z), &zhdr, 4);
+    assert_eq(agnosai_ipc_read_frame(_t_fd1(&z)), AGNOSAI_IPC_ERR, "a zero-length frame is refused");
+    assert(str_eq(agnosai_ipc_last_error(), str_from("empty frame (zero-length)")) == 1,
+    "with the oracle's exact wording");
+
+    # --- an over-cap declared length is refused before any allocation ---
+    var o: i64[2];
+    _t_pair(&o);
+    var ohdr[4];
+    store8(&ohdr, 255);
+    store8(&ohdr + 1, 255);
+    store8(&ohdr + 2, 255);
+    store8(&ohdr + 3, 255);
+    syscall(SYS_WRITE, _t_fd0(&o), &ohdr, 4);
+    assert_eq(agnosai_ipc_read_frame(_t_fd1(&o)), AGNOSAI_IPC_ERR,
+    "a 4 GiB declared length is refused");
+    assert(str_contains(agnosai_ipc_last_error(), str_from("exceeds maximum")) == 1,
+    "naming the cap rather than attempting the allocation");
+
+    # writing an over-cap frame is refused symmetrically
+    assert_eq(agnosai_ipc_write_frame(_t_fd0(&o), 0, AGNOSAI_IPC_MAX_FRAME_SIZE + 1),
+    AGNOSAI_IPC_ERR, "and an over-cap write is refused too");
+    assert(str_contains(agnosai_ipc_last_error(), str_from("exceeds maximum")) == 1,
+    "with the same message");
+    # exactly at the cap is permitted by the check — the oracle compares with >
+    assert(str_contains(_agnosai_ipc_too_large(AGNOSAI_IPC_MAX_FRAME_SIZE),
+    str_from("16777216 exceeds maximum 16777216")) == 1,
+    "the message quotes the offending length and the cap");
+
+    # --- a clean peer close is EOF, not an error ---
+    var c: i64[2];
+    _t_pair(&c);
+    sys_close(_t_fd0(&c));
+    assert_eq(agnosai_ipc_read_frame(_t_fd1(&c)), AGNOSAI_IPC_EOF,
+    "a closed peer reads as EOF rather than a failure — a finished peer is not a fault");
+    assert(str_contains(agnosai_ipc_last_error(), str_from("peer disconnected")) == 1,
+    "and says so");
+    assert_eq(agnosai_ipc_recv(_t_fd1(&c)), AGNOSAI_IPC_EOF, "recv propagates EOF too");
+
+    # --- a truncated frame is an error, not EOF ---
+    var t: i64[2];
+    _t_pair(&t);
+    var thdr[4];
+    store8(&thdr, 0);
+    store8(&thdr + 1, 0);
+    store8(&thdr + 2, 0);
+    store8(&thdr + 3, 10);
+    syscall(SYS_WRITE, _t_fd0(&t), &thdr, 4);
+    syscall(SYS_WRITE, _t_fd0(&t), "abc", 3);
+    sys_close(_t_fd0(&t));
+    assert_eq(agnosai_ipc_read_frame(_t_fd1(&t)), AGNOSAI_IPC_ERR,
+    "a frame cut off mid-payload is an ERROR, not the clean EOF above");
+    assert(str_contains(agnosai_ipc_last_error(), str_from("mid-frame")) == 1,
+    "and is reported as mid-frame");
+    assert(str_contains(agnosai_ipc_last_error(), str_from("expected 10 bytes")) == 1,
+    "naming how many bytes were promised");
+
+    # --- a frame that is not JSON is an error, not EOF ---
+    var j: i64[2];
+    _t_pair(&j);
+    agnosai_ipc_write_frame(_t_fd0(&j), "not json", 8);
+    assert_eq(agnosai_ipc_recv(_t_fd1(&j)), AGNOSAI_IPC_ERR,
+    "an intact frame carrying non-JSON is an error");
+    assert(str_contains(agnosai_ipc_last_error(), str_from("failed to parse frame as JSON")) == 1,
+    "distinguished from a transport failure");
+
+    # --- the error slot is cleared on entry, so it is never stale ---
+    var s: i64[2];
+    _t_pair(&s);
+    assert_eq(_t_send_json(_t_fd0(&s), "{\"ok\":1}"), 0, "a good send succeeds");
+    assert_eq(agnosai_ipc_last_error(), 0,
+    "and clears the error left by the failures above rather than leaving it to be misread");
+
+    # --- server_bind_and_client_connect ---
+    # The only path socketpair cannot stand in for: a real socket file, a real
+    # accept, and majra's sockaddr_un handling underneath.
+    var srv = agnosai_ipc_bind(str_from(_T_SOCK));
+    assert(srv != AGNOSAI_IPC_ERR, "binding a Unix socket succeeds");
+    assert_eq(agnosai_ipc_last_error(), 0, "with no error recorded");
+
+    var ctid = thread_create(&_t_client, 0);
+    assert(ctid != 0, "a client thread starts");
+    var conn = agnosai_ipc_accept(srv);
+    assert(conn != AGNOSAI_IPC_ERR, "and the server accepts it");
+
+    var from_client = agnosai_ipc_recv(conn);
+    assert(from_client != AGNOSAI_IPC_ERR, "a frame arrives over the real socket");
+    assert(from_client != AGNOSAI_IPC_EOF, "and is not EOF");
+    assert(str_eq(bayan_json_v_build(from_client), str_from("{\"from\":\"client\"}")) == 1,
+    "carrying the client's payload — the same framing works over a bound socket");
+
+    thread_join(ctid);
+    sys_close(conn);
+    sys_close(srv);
+    sys_unlink(str_cstr(str_from(_T_SOCK)));
+
+    # rebinding after the unlink works, which is the stale-socket path
+    var srv2 = agnosai_ipc_bind(str_from(_T_SOCK));
+    assert(srv2 != AGNOSAI_IPC_ERR, "rebinding the same path succeeds");
+    sys_close(srv2);
+    # and again WITHOUT unlinking, which is what the oracle's remove-first is for
+    var srv3 = agnosai_ipc_bind(str_from(_T_SOCK));
+    assert(srv3 != AGNOSAI_IPC_ERR,
+    "binding over an existing socket file succeeds, since bind unlinks it first");
+    sys_close(srv3);
+    sys_unlink(str_cstr(str_from(_T_SOCK)));
+
+    # --- connecting to a path with no listener fails cleanly ---
+    assert_eq(agnosai_ipc_connect(str_from("/tmp/agnosai-no-such-socket.sock")),
+    AGNOSAI_IPC_ERR, "connecting to a dead path is an error, not a hang");
+    assert(str_eq(agnosai_ipc_last_error(), str_from("connect failed")) == 1,
+    "with the oracle's wording");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

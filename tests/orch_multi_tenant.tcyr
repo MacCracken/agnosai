@@ -1,0 +1,145 @@
+# =========================================================================
+# orch_multi_tenant.tcyr — parity tests for src/orch_multi_tenant.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/orchestrator/multi_tenant.rs
+# — 12 tests, all portable, since the module is a pure leaf with no I/O.
+#
+# The oracle's `sample_budget()` is `TenantBudget::new(100_000, 10.0, 5)`. The
+# 10.0 USD becomes 10_000_000 micro-USD here, per the port's money decision.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/orch_multi_tenant.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's sample_budget(): 100k tokens, $10, 5 concurrent crews.
+fn _t_sample(): i64 {
+    return agnosai_tenant_budget_new(100000, 10000000, 5);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_multi_tenant");
+
+    # the five result constants are distinct — they are compared, not masked
+    assert_eq(AGNOSAI_BUDGET_OK, 0, "Ok is 0");
+    assert(AGNOSAI_BUDGET_TOKENS_EXCEEDED != AGNOSAI_BUDGET_COST_EXCEEDED, "tokens != cost");
+    assert(AGNOSAI_BUDGET_COST_EXCEEDED != AGNOSAI_BUDGET_CONCURRENCY_EXCEEDED,
+    "cost != concurrency");
+    assert(AGNOSAI_BUDGET_CONCURRENCY_EXCEEDED != AGNOSAI_BUDGET_TENANT_NOT_FOUND,
+    "concurrency != not-found");
+
+    # --- register_and_get_budget ---
+    var reg = agnosai_tenant_registry_new();
+    agnosai_tenant_registry_register(reg, str_from("tenant-1"), _t_sample());
+    var budget = agnosai_tenant_registry_get_budget(reg, str_from("tenant-1"));
+    assert(budget != 0, "a registered tenant is found");
+    assert_eq(agnosai_tenant_budget_max_tokens(budget), 100000, "max_tokens round-trips");
+    assert_eq(agnosai_tenant_budget_max_cost_micro_usd(budget), 10000000,
+    "$10 is carried as 10,000,000 micro-USD, exactly");
+    assert_eq(agnosai_tenant_budget_max_concurrent_crews(budget), 5,
+    "max_concurrent_crews round-trips");
+
+    # --- get_budget_unknown_tenant ---
+    assert_eq(agnosai_tenant_registry_get_budget(reg, str_from("unknown")), 0,
+    "an unregistered tenant yields 0, the port's None");
+
+    # --- register_replaces_existing ---
+    var reg2 = agnosai_tenant_registry_new();
+    agnosai_tenant_registry_register(reg2, str_from("t1"), agnosai_tenant_budget_new(100, 1000000,
+    1));
+    agnosai_tenant_registry_register(reg2, str_from("t1"), agnosai_tenant_budget_new(200, 2000000,
+    2));
+    assert_eq(agnosai_tenant_budget_max_tokens(
+    agnosai_tenant_registry_get_budget(reg2, str_from("t1"))), 200,
+    "re-registering replaces the budget rather than adding one");
+    assert_eq(agnosai_tenant_registry_len(reg2), 1, "and does not add a second tenant");
+
+    # --- check_budget_ok ---
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("tenant-1"), 50000, 5000000, 2),
+    AGNOSAI_BUDGET_OK, "usage under every limit is Ok");
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("tenant-1"), 0, 0, 0),
+    AGNOSAI_BUDGET_OK, "zero usage is Ok");
+
+    # --- check_budget_tokens_exceeded ---
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("tenant-1"), 100001, 0, 0),
+    AGNOSAI_BUDGET_TOKENS_EXCEEDED, "one token over the cap is refused");
+
+    # --- check_budget_cost_exceeded ---
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("tenant-1"), 0, 10000001, 0),
+    AGNOSAI_BUDGET_COST_EXCEEDED, "one micro-USD over the cap is refused");
+
+    # --- check_budget_concurrency_exceeded ---
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("tenant-1"), 0, 0, 6),
+    AGNOSAI_BUDGET_CONCURRENCY_EXCEEDED, "one crew over the cap is refused");
+
+    # --- check_budget_tenant_not_found ---
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("ghost"), 0, 0, 0),
+    AGNOSAI_BUDGET_TENANT_NOT_FOUND, "an unknown tenant is reported as such");
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("ghost"), 999999999, 999999999, 999),
+    AGNOSAI_BUDGET_TENANT_NOT_FOUND,
+    "and not-found wins over every other breach, since it is checked first");
+
+    # --- check_budget_at_exact_limit ---
+    # Every comparison is `>`, so sitting exactly on a cap is still Ok. `>=`
+    # would be the more usual reading of "max", which is why the oracle pins it.
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("tenant-1"), 100000, 10000000, 5),
+    AGNOSAI_BUDGET_OK, "usage exactly at every limit is Ok, not exceeded");
+
+    # --- the check order is observable when several limits are breached ---
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("tenant-1"), 100001, 10000001, 6),
+    AGNOSAI_BUDGET_TOKENS_EXCEEDED, "with all three breached, tokens is reported first");
+    assert_eq(agnosai_check_tenant_budget(reg, str_from("tenant-1"), 0, 10000001, 6),
+    AGNOSAI_BUDGET_COST_EXCEEDED, "with cost and concurrency breached, cost wins");
+
+    # --- remove_tenant ---
+    var removed = agnosai_tenant_registry_remove(reg2, str_from("t1"));
+    assert(removed != 0, "removing a tenant returns its budget");
+    assert_eq(agnosai_tenant_budget_max_tokens(removed), 200, "the budget that was in force");
+    assert_eq(agnosai_tenant_registry_get_budget(reg2, str_from("t1")), 0, "and it is gone");
+    assert_eq(agnosai_tenant_registry_len(reg2), 0, "leaving no tenants");
+    assert_eq(agnosai_check_tenant_budget(reg2, str_from("t1"), 0, 0, 0),
+    AGNOSAI_BUDGET_TENANT_NOT_FOUND, "so a check on it now reports not-found");
+
+    # --- remove_nonexistent_tenant ---
+    assert_eq(agnosai_tenant_registry_remove(reg2, str_from("never")), 0,
+    "removing an absent tenant yields 0 rather than erroring");
+    assert_eq(agnosai_tenant_registry_len(reg2), 0, "and changes nothing");
+
+    # --- len_and_is_empty / default_creates_empty_registry ---
+    var reg3 = agnosai_tenant_registry_new();
+    assert_eq(agnosai_tenant_registry_len(reg3), 0, "a new registry is empty");
+    assert_eq(agnosai_tenant_registry_is_empty(reg3), 1, "and reports so");
+    agnosai_tenant_registry_register(reg3, str_from("a"), _t_sample());
+    assert_eq(agnosai_tenant_registry_len(reg3), 1, "one tenant");
+    assert_eq(agnosai_tenant_registry_is_empty(reg3), 0, "is not empty");
+    agnosai_tenant_registry_register(reg3, str_from("b"), _t_sample());
+    assert_eq(agnosai_tenant_registry_len(reg3), 2, "two tenants");
+    agnosai_tenant_registry_remove(reg3, str_from("a"));
+    assert_eq(agnosai_tenant_registry_len(reg3), 1, "and one after a removal");
+    assert_eq(agnosai_tenant_registry_is_empty(reg3), 0, "still not empty");
+
+    # --- tenants are independent ---
+    agnosai_tenant_registry_register(reg3, str_from("small"), agnosai_tenant_budget_new(10, 100,
+    1));
+    assert_eq(agnosai_check_tenant_budget(reg3, str_from("small"), 11, 0, 0),
+    AGNOSAI_BUDGET_TOKENS_EXCEEDED, "a small tenant is held to its own cap");
+    assert_eq(agnosai_check_tenant_budget(reg3, str_from("b"), 11, 0, 0), AGNOSAI_BUDGET_OK,
+    "while a larger one is unaffected by it");
+
+    # --- a zero budget refuses any use at all, but not zero use ---
+    agnosai_tenant_registry_register(reg3, str_from("zero"), agnosai_tenant_budget_new(0, 0, 0));
+    assert_eq(agnosai_check_tenant_budget(reg3, str_from("zero"), 0, 0, 0), AGNOSAI_BUDGET_OK,
+    "a zero budget still admits zero usage, since the test is >");
+    assert_eq(agnosai_check_tenant_budget(reg3, str_from("zero"), 1, 0, 0),
+    AGNOSAI_BUDGET_TOKENS_EXCEEDED, "but not one token");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -142,6 +142,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     message, and `pattern_count` still counts patterns, which is what the 10,000 cap is expressed
     in. The oracle's 16-entry stack-array fast path is not reproduced; it is an allocation
     optimisation with no observable difference.
+  - **orch_multi_tenant** — per-tenant token/cost/concurrency limits and the check that enforces
+    them. `max_cost_usd` becomes integer micro-USD, which lands more cleanly here than anywhere
+    else it has been applied: `TenantBudget` derives no `Serialize`, so there is no wire boundary
+    to convert at and the field exists purely to be compared. Every limit is breached by
+    *exceeding* it, never by reaching it — all the oracle's comparisons are `>`, and the check
+    order (unknown tenant, tokens, cost, concurrency) is observable when several are breached at
+    once.
+  - **orch_ipc** — Unix-socket IPC, 4-byte big-endian length prefix then JSON. Connection setup
+    delegates to majra's `ipc_bind`/`ipc_accept`/`ipc_connect`, which own the `sockaddr_un`
+    construction and the agnos fail-closed path. **The framing does not**, for two reasons that
+    would both have been silent: majra caps a frame at 1 MiB where the oracle allows 16 MiB — and
+    the oracle has a test for a >64 KiB payload precisely because large frames are expected — and
+    majra collapses every failure into one error where the oracle distinguishes six, two of which
+    a caller acts on differently (a clean peer disconnect is not a fault; an over-cap frame is a
+    misbehaving peer). The port also keeps the oracle's zero-length-frame rejection, which majra
+    lacks; without it a peer can hold a reader in a loop that consumes four bytes and yields
+    nothing.
 - **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
   `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
   never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.
