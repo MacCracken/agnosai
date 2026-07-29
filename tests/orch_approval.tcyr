@@ -1,0 +1,193 @@
+# =========================================================================
+# orch_approval.tcyr — parity tests for src/orch_approval.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/orchestrator/approval.rs —
+# 9 tests, three of them `#[tokio::test]`. The async ones port because the
+# oneshot becomes a capacity-1 channel and the timeout becomes a polling wait,
+# both of which are drivable on one thread: submit first, then wait, and the
+# value is already sitting in the channel.
+#
+# The timeout test uses a millisecond gate rather than the oracle's five
+# minutes, which is what its own `with_timeout` exists for.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/core_message.cyr"
+include "src/core_resource.cyr"
+include "src/core_task.cyr"
+include "src/orch_approval.cyr"
+include "tests/test_helpers.cyr"
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_approval");
+
+    assert_eq(AGNOSAI_APPROVAL_TIMEOUT_MS, 300000, "the default timeout is the oracle's 5 minutes");
+    assert_eq(AGNOSAI_APPROVAL_MAX_PENDING, 1000, "and the pending cap is 1000");
+    assert_eq(AGNOSAI_APPROVAL_REJECTED, 0,
+    "Rejected is 0, so a zeroed field is a rejection rather than an approval");
+
+    # --- requires_approval_high_always ---
+    assert_eq(agnosai_requires_approval(AGNOSAI_RISK_HIGH, 0), 1,
+    "High risk always requires approval");
+    assert_eq(agnosai_requires_approval(AGNOSAI_RISK_HIGH, 1), 1, "regardless of the medium flag");
+
+    # --- requires_approval_medium_configurable ---
+    assert_eq(agnosai_requires_approval(AGNOSAI_RISK_MEDIUM, 1), 1,
+    "Medium requires approval when configured");
+    assert_eq(agnosai_requires_approval(AGNOSAI_RISK_MEDIUM, 0), 0, "and not when it is not");
+
+    # --- requires_approval_low_never ---
+    assert_eq(agnosai_requires_approval(AGNOSAI_RISK_LOW, 1), 0,
+    "Low risk never requires approval, even with the medium flag set");
+    assert_eq(agnosai_requires_approval(AGNOSAI_RISK_LOW, 0), 0, "nor without it");
+
+    # --- the decision wire form ---
+    assert(str_eq(agnosai_approval_decision_to_wire(AGNOSAI_APPROVAL_APPROVED),
+    str_from("approved")) == 1, "Approved is snake_case on the wire");
+    assert(str_eq(agnosai_approval_decision_to_wire(AGNOSAI_APPROVAL_REJECTED),
+    str_from("rejected")) == 1, "and so is Rejected");
+    assert_eq(agnosai_approval_decision_from_wire(str_from("approved")),
+    AGNOSAI_APPROVAL_APPROVED, "approved parses back");
+    assert_eq(agnosai_approval_decision_from_wire(str_from("rejected")),
+    AGNOSAI_APPROVAL_REJECTED, "rejected parses back");
+    assert_eq(agnosai_approval_decision_from_wire(str_from("maybe")), AGNOSAI_APPROVAL_REJECTED,
+    "and an unrecognised spelling REJECTS — a malformed callback must not approve");
+    assert_eq(agnosai_approval_decision_from_wire(str_from("")), AGNOSAI_APPROVAL_REJECTED,
+    "as does an empty one");
+
+    # --- the gate's bookkeeping ---
+    var g = agnosai_approval_gate_new();
+    assert_eq(agnosai_approval_gate_timeout_ms(g), AGNOSAI_APPROVAL_TIMEOUT_MS,
+    "a default gate carries the default timeout");
+    assert_eq(agnosai_approval_gate_pending_count(g), 0, "and nothing pending");
+    assert_eq(vec_len(agnosai_approval_gate_pending_tasks(g)), 0, "with an empty task list");
+
+    var custom = agnosai_approval_gate_with_timeout(50);
+    assert_eq(agnosai_approval_gate_timeout_ms(custom), 50, "a custom timeout round-trips");
+
+    # --- approval_flow_approved ---
+    var t1 = agnosai_uuid_v4_str();
+    var rx1 = agnosai_approval_request(g, t1);
+    assert(rx1 != 0, "requesting an approval yields a channel");
+    assert_eq(agnosai_approval_gate_pending_count(g), 1, "and registers it as pending");
+
+    assert_eq(agnosai_approval_submit_decision(g, t1, AGNOSAI_APPROVAL_APPROVED), 1,
+    "submitting a decision reports delivery");
+    assert_eq(agnosai_approval_gate_pending_count(g), 0, "and clears the pending entry");
+    assert_eq(agnosai_approval_wait_for_decision(g, rx1, t1), AGNOSAI_APPROVAL_APPROVED,
+    "and the waiter reads Approved");
+
+    # --- approval_flow_rejected ---
+    var t2 = agnosai_uuid_v4_str();
+    var rx2 = agnosai_approval_request(g, t2);
+    assert_eq(agnosai_approval_submit_decision(g, t2, AGNOSAI_APPROVAL_REJECTED), 1,
+    "a rejection is delivered too");
+    assert_eq(agnosai_approval_wait_for_decision(g, rx2, t2), AGNOSAI_APPROVAL_REJECTED,
+    "and reads back as Rejected");
+
+    # --- submit_decision_for_unknown_task_returns_false ---
+    assert_eq(agnosai_approval_submit_decision(g, agnosai_uuid_v4_str(),
+    AGNOSAI_APPROVAL_APPROVED), 0,
+    "deciding a task with no pending approval reports no delivery");
+    assert_eq(agnosai_approval_submit_decision(g, t1, AGNOSAI_APPROVAL_APPROVED), 0,
+    "and so does deciding one that was already decided");
+
+    # --- approval_timeout_rejects ---
+    # A 50 ms gate with nobody deciding: the waiter must give up and reject
+    # rather than block for the default five minutes.
+    var t3 = agnosai_uuid_v4_str();
+    var rx3 = agnosai_approval_request(custom, t3);
+    assert(rx3 != 0, "a request against the short-timeout gate registers");
+    var before = clock_now_ns();
+    assert_eq(agnosai_approval_wait_for_decision(custom, rx3, t3), AGNOSAI_APPROVAL_REJECTED,
+    "an undecided approval times out and REJECTS — silence must never approve");
+    var elapsed_ms = (clock_now_ns() - before) / AGNOSAI_NS_PER_MS;
+    assert(elapsed_ms >= 50, "the waiter honoured its deadline rather than returning early");
+    assert(elapsed_ms < 5000, "and did not fall back to the default five minutes");
+    assert_eq(agnosai_approval_gate_pending_count(custom), 0,
+    "and the timed-out entry is cleaned up, so a late decision finds nothing");
+    assert_eq(agnosai_approval_submit_decision(custom, t3, AGNOSAI_APPROVAL_APPROVED), 0,
+    "which is what a late approval sees");
+
+    # --- cancel_removes_pending ---
+    var t4 = agnosai_uuid_v4_str();
+    var rx4 = agnosai_approval_request(g, t4);
+    assert_eq(agnosai_approval_gate_pending_count(g), 1, "one pending before the cancel");
+    assert_eq(agnosai_approval_cancel(g, t4), 1, "cancelling reports success");
+    assert_eq(agnosai_approval_gate_pending_count(g), 0, "and removes the entry");
+    assert_eq(agnosai_approval_cancel(g, t4), 0, "cancelling twice reports nothing to cancel");
+    assert_eq(agnosai_approval_cancel(g, agnosai_uuid_v4_str()), 0,
+    "as does cancelling an unknown task");
+
+    # a cancelled waiter rejects immediately rather than waiting out the clock
+    var cancel_before = clock_now_ns();
+    assert_eq(agnosai_approval_wait_for_decision(g, rx4, t4), AGNOSAI_APPROVAL_REJECTED,
+    "a cancelled approval rejects");
+    assert((clock_now_ns() - cancel_before) / AGNOSAI_NS_PER_MS < 1000,
+    "and does so promptly — it does not sit out the five-minute default");
+
+    # --- a null channel is already a rejection ---
+    assert_eq(agnosai_approval_wait_for_decision(g, 0, agnosai_uuid_v4_str()),
+    AGNOSAI_APPROVAL_REJECTED,
+    "a gate at capacity hands back 0, which waits to a rejection rather than crashing");
+
+    # --- pending_tasks_lists_all ---
+    var multi = agnosai_approval_gate_new();
+    var a = agnosai_uuid_v4_str();
+    var b = agnosai_uuid_v4_str();
+    var c = agnosai_uuid_v4_str();
+    agnosai_approval_request(multi, a);
+    agnosai_approval_request(multi, b);
+    agnosai_approval_request(multi, c);
+    assert_eq(agnosai_approval_gate_pending_count(multi), 3, "three pending approvals");
+    var listed = agnosai_approval_gate_pending_tasks(multi);
+    assert_eq(vec_len(listed), 3, "all three are listed");
+    assert(str_eq(vec_get(listed, 0), a) == 1, "in registration order, which the oracle leaves \
+    arbitrary because it iterates a DashMap");
+    assert(str_eq(vec_get(listed, 1), b) == 1, "second");
+    assert(str_eq(vec_get(listed, 2), c) == 1, "third");
+
+    # deciding one removes just that one, and the rest keep their order
+    agnosai_approval_submit_decision(multi, b, AGNOSAI_APPROVAL_APPROVED);
+    var after = agnosai_approval_gate_pending_tasks(multi);
+    assert_eq(vec_len(after), 2, "two remain");
+    assert(str_eq(vec_get(after, 0), a) == 1, "the first is still first");
+    assert(str_eq(vec_get(after, 1), c) == 1, "and the third is now second");
+
+    # --- ApprovalRequest, the SSE payload ---
+    var req = agnosai_approval_request_new(str_from("task-1"), str_from("the output"),
+    AGNOSAI_RISK_HIGH, str_from("agent-7"));
+    assert(str_eq(agnosai_approval_request_task_id(req), str_from("task-1")) == 1,
+    "the request carries its task id");
+    assert(str_eq(agnosai_approval_request_output(req), str_from("the output")) == 1,
+    "and the output under review");
+    assert_eq(agnosai_approval_request_risk(req), AGNOSAI_RISK_HIGH, "and the risk level");
+    assert(str_eq(agnosai_approval_request_agent(req), str_from("agent-7")) == 1,
+    "and the agent");
+
+    assert(str_eq(bayan_json_v_build(agnosai_approval_request_to_value(req)),
+    str_from("{\"task_id\":\"task-1\",\"output\":\"the output\",\"risk\":\"high\",\"agent\":\"agent-7\"}"))
+    == 1, "and serialises with the risk in its wire spelling");
+
+    # an absent agent emits null rather than being omitted — no skip_serializing_if
+    var noagent = agnosai_approval_request_new(str_from("task-2"), str_from("o"),
+    AGNOSAI_RISK_MEDIUM, 0);
+    assert_eq(agnosai_approval_request_agent(noagent), 0, "an absent agent reads as 0");
+    assert(str_contains(bayan_json_v_build(agnosai_approval_request_to_value(noagent)),
+    str_from("\"agent\":null")) == 1,
+    "and serialises as null, since the field has no skip_serializing_if");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

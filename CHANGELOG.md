@@ -210,6 +210,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `multi_tenant`'s `>`, and both are the oracle's. The atomics become plain fields; a concurrent
     `record_tokens` pair can lose an update where `fetch_add` would not, which is noted in-module
     rather than hidden and is harmless for a coarse ceiling.
+  - **orch_approval** — human-in-the-loop gates for High-risk (and optionally Medium-risk) task
+    results. **Every failure mode rejects**: a timeout, a cancelled gate, a gate at capacity, and
+    an unrecognised decision spelling all come back `Rejected`, which is the oracle's behaviour
+    across three separate arms and the only safe default for a gate whose job is to stop something
+    unreviewed. `Rejected` is deliberately 0 so a zeroed field is a refusal, not an approval.
+
+    `oneshot::Sender/Receiver` becomes a capacity-1 channel — exact, since a oneshot *is* a
+    one-slot channel — and `tokio::time::timeout` becomes a polling wait with a 25 ms interval,
+    because there is no runtime to race a sleep against a future. That change forced one ordering
+    inversion worth naming: `submit_decision` sends **before** clearing the pending entry, the
+    reverse of the oracle. The oracle's waiter awaits a future so the map entry is irrelevant to
+    it; this waiter polls and uses the entry as its liveness signal, so removing first would let a
+    poll landing between the two calls see an empty channel *and* no pending entry, conclude the
+    gate was cancelled, and reject a decision that was about to arrive.
 - **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
   `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
   never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.
