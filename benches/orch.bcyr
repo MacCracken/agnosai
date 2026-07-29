@@ -42,6 +42,7 @@ include "src/orch_scheduler.cyr"
 include "src/orch_plan_cache.cyr"
 include "src/orch_memory.cyr"
 include "src/orch_hierarchical.cyr"
+include "src/orch_durable_state.cyr"
 
 # An agent with two tools, a complexity and a domain — the shape scoring reads.
 fn _b_agent(key: Str): i64 {
@@ -303,6 +304,128 @@ fn _b_conv_buffer_push(): i64 {
     return 0;
 }
 
+# A crew state in the oracle's sample_state() shape.
+fn _b_crew_state(): i64 {
+    return agnosai_crew_state_new(agnosai_uuid_v4_str(), AGNOSAI_CREW_RUNNING);
+}
+
+# The pretty-print that produces a snapshot.
+fn _b_serialize_state(): i64 {
+    var n = 50000;
+    var st = _b_crew_state();
+
+    var b = bench_new("durable_serialize_crew_state");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_serialize_crew_state(st); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Parsing a snapshot back, including the required-field gate.
+fn _b_deserialize_state(): i64 {
+    var n = 50000;
+    var doc = agnosai_serialize_crew_state(_b_crew_state());
+    var out = 0;
+    store64(&out, 0);
+
+    var b = bench_new("durable_deserialize_crew_state");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_deserialize_crew_state(str_data(doc), str_len(doc), &out);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A full save: mkdir_p over an existing tree, then the atomic write. This one is
+# fsync-bound by construction — file_write_atomic writes a temp, fsyncs it, and
+# renames — so the iteration count is low on purpose and the number is a disk
+# measurement, not a CPU one.
+fn _b_state_save(): i64 {
+    var n = 300;
+    var store = agnosai_state_store_new(str_from("/tmp/agnosai-bench-durable"));
+    var doc = agnosai_serialize_crew_state(_b_crew_state());
+    var cid = str_from("bench-crew");
+
+    var b = bench_new("durable_save_atomic");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_state_store_save(store, cid, str_data(doc), str_len(doc));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A hit: open, seek for the size, one read, close.
+fn _b_state_load(): i64 {
+    var n = 20000;
+    var store = agnosai_state_store_new(str_from("/tmp/agnosai-bench-durable"));
+    var cid = str_from("bench-crew");
+    var bytes = 0;
+    var len = 0;
+    store64(&bytes, 0);
+    store64(&len, 0);
+
+    var b = bench_new("durable_load_hit");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_state_store_load(store, cid, &bytes, &len);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A miss — the open fails ENOENT and nothing is allocated. This is the path a
+# crew takes on every cold start, so it wants to be cheap.
+fn _b_state_load_miss(): i64 {
+    var n = 20000;
+    var store = agnosai_state_store_new(str_from("/tmp/agnosai-bench-durable"));
+    var cid = str_from("no-such-crew");
+    var bytes = 0;
+    var len = 0;
+    store64(&bytes, 0);
+    store64(&len, 0);
+
+    var b = bench_new("durable_load_miss");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_state_store_load(store, cid, &bytes, &len);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The hand-rolled create_dir_all over a tree that already exists: every save
+# pays this, and every component costs one mkdir that returns EEXIST plus an
+# is_dir stat to confirm it really is a directory.
+fn _b_mkdir_p(): i64 {
+    var n = 20000;
+    var path = str_from("/tmp/agnosai-bench-durable/a/b/c");
+    _agnosai_mkdir_p(path);
+
+    var b = bench_new("durable_mkdir_p_existing_4deep");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { _agnosai_mkdir_p(path); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Remove everything the durable benchmarks created.
+fn _b_durable_teardown(): i64 {
+    sys_unlink(str_data(str_from("/tmp/agnosai-bench-durable/bench-crew.json")));
+    sys_rmdir(str_data(str_from("/tmp/agnosai-bench-durable/a/b/c")));
+    sys_rmdir(str_data(str_from("/tmp/agnosai-bench-durable/a/b")));
+    sys_rmdir(str_data(str_from("/tmp/agnosai-bench-durable/a")));
+    sys_rmdir(str_data(str_from("/tmp/agnosai-bench-durable")));
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -318,6 +441,13 @@ fn main(): i64 {
     _b_plan_key();
     _b_plan_cache_get();
     _b_conv_buffer_push();
+    _b_serialize_state();
+    _b_deserialize_state();
+    _b_state_save();
+    _b_state_load();
+    _b_state_load_miss();
+    _b_mkdir_p();
+    _b_durable_teardown();
 
     return 0;
 }

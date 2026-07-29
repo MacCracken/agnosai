@@ -257,6 +257,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     perfectly-matched manager loses to a poorly-matched worker, which is the whole point of the
     mode. Each task is ranked independently, so one agent can take several and there is no
     round-robin or capacity limit.
+  - **orch_durable_state** — one pretty-printed JSON snapshot per crew at
+    `{base_dir}/{crew_id}.json`, plus the `CrewState` (de)serialisers.
+    `bayan_json_v_build_pretty(v, 2)` turns out to be **byte-identical** to
+    `serde_json::to_vec_pretty` for this shape — 95 bytes for the oracle's own sample, 2-space
+    indent, no trailing newline — so the snapshot format is exact rather than approximated.
+    **Not built on patra**, contrary to the port plan's `durable_state (→ patra)`: patra is a full
+    embedded SQL database over its own paged format with no export verb, and its `jsonl` mode is
+    append-only, so it cannot produce the overwritable readable file the oracle's own tests assert.
+    Plan line corrected; **no M5 module touches patra.** `StateStore` is not ported either — it is
+    RPITIT, so not even `dyn`-compatible, with one implementor and zero callers tree-wide.
+    Three stdlib gaps were filled locally: a recursive `mkdir -p` (the stdlib has only single-level
+    `sys_mkdir`), a whole-file read that keeps `Err(EISDIR)` distinct from `Ok(vec![])` (which
+    `file_read_all` collapses to 0, along with silently truncating), and a portable `mkdir` wrapper
+    (`sys_mkdir`'s second argument is the mode on Linux and the path length on agnos — same name,
+    and it compiles either way). Both stdlib gaps filed upstream.
+    Two deliberate divergences, both tested: `crew_id` is validated
+    ([ADR 008](docs/adr/008-durable-state-crew-id-validation.md)) because the oracle validates
+    nothing and `save`/`load` are otherwise an arbitrary write and an arbitrary read for a caller
+    passing a wire-supplied id; and `agnosai_deserialize_crew_state` requires `status` and
+    `results`, which `serde` does and `agnosai_crew_state_from_value` does not — it defaults a
+    missing `status` to `Pending` and maps an unknown spelling to `Pending`, silently rewriting a
+    corrupt snapshot into a plausible one.
   - **server_sse** (`CrewEvent`, `EventBus`) — **pulled forward from M6**, the way `server/ssrf`
     was for M4: `crew_runner` holds a `broadcast::Sender<CrewEvent>` and `orchestrator` holds an
     `EventBus`, so neither of M5's two largest modules compiles without them. `event_stream`,
@@ -438,6 +460,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `event_round_trip_1_sub` is three locks and almost nothing else. Filed upstream in the cyrius
   repo as `docs/development/issues/2026-07-29-mutex-unlock-unconditional-futex-wake.md` with a
   repro; nothing is worked around here, so a stdlib fix lands as a straight improvement.
+- **orch_durable_state**: `durable_serialize_crew_state` **3.88 µs**,
+  `durable_deserialize_crew_state` **2.68 µs**, `durable_load_hit` **4.43 µs**,
+  `durable_load_miss` **2.80 µs**, `durable_save_atomic` **21.5 µs** (fsync-bound by construction —
+  `file_write_atomic` writes a temp, fsyncs, renames).
+- **orch_durable_state**: `durable_mkdir_p_existing_4deep` **43.0 µs → 6.0 µs (−86%)**, and
+  `durable_save_atomic` **39.1 µs → 21.5 µs (−45%)** with it, since every save pays one. The first
+  implementation walked every path component unconditionally — two syscalls each, even when the whole
+  tree already existed, which made the directory check cost more than the fsync'd write after it.
+  `std::fs::create_dir_all` tries `mkdir` on the **full path first** and only walks parents on
+  `ENOENT`; adopting that ordering is both faster and closer to the oracle.
 - **server_sse**: `event_send_evicting` **2.40 µs** against `event_round_trip_1_sub` **1.99 µs**
   is the number blocker #4 was about — a subscriber that has stopped reading costs **one extra
   channel operation** to serve, not an unbounded stall. It loses events instead of wedging the

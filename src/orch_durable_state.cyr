@@ -1,0 +1,497 @@
+# =========================================================================
+# orch_durable_state — durable crew state persistence and recovery.
+#
+# Parity oracle: rust-old/src/orchestrator/durable_state.rs
+#
+# One pretty-printed JSON file per crew at `{base_dir}/{crew_id}.json`, so a
+# crew can be resumed after a crash or a restart and a human can read the
+# snapshot with `cat`.
+#
+# **`durable_state` has zero consumers in the whole Rust tree** — `pub mod
+# durable_state;` in `orchestrator/mod.rs` is its only mention. Like
+# `tools/remote_registry`, it is public API for the four downstream consumers
+# rather than internal wiring, so the whole surface is the deliverable and
+# nothing here can be trimmed as unreachable.
+#
+# ## `StateStore` is not ported, and that is not a shortcut
+#
+# The oracle's `StateStore` trait uses `impl Future` in return position, so it
+# is not even `dyn`-compatible: no `Box<dyn StateStore>` can exist. It has one
+# implementor, zero callers, and no `<S: StateStore>` bound anywhere in the
+# tree. It is pluggability that was declared and never used. This is therefore
+# a flat module, and if a second backend ever lands the port's established
+# pattern is an fnptr field plus `callptr` (`src/tools_agnos.cyr`), added at
+# that point rather than in advance.
+#
+# The `async` goes the same way. `tokio::fs::{create_dir_all, write, read}` are
+# blocking syscalls handed to a thread pool; a blocking Cyrius implementation
+# issues the identical syscalls with the identical filesystem effect. `Send +
+# Sync` is vacuous over one immutable `base_dir`.
+#
+# ## Not patra
+#
+# The port plan's phase-4 line reads `durable_state (→ patra)`. That does not
+# survive contact with the oracle's contract. patra is a full embedded SQL
+# database over its own format — `PATRA_MAGIC` at byte 0, 4096-byte pages, a
+# sibling `.wal`, and a header verifier that rejects anything without the magic.
+# It has no dump or export verb, and its `jsonl_open` opens `O_APPEND` with no
+# `O_TRUNC`, so it can only append where the oracle overwrites. The oracle's own
+# tests assert that a nested directory exists on disk and that raw non-JSON
+# bytes round-trip byte-for-byte; patra structurally cannot produce that
+# artifact. So this module is built on `lib/io.cyr`, and the plan line is
+# corrected rather than obeyed. (Noted for whoever does reach for patra later:
+# `patra_init` calls `sakshi_set_level(SK_WARN)`, which will stomp the
+# application's log level.)
+#
+# ## Three places the stdlib does not reach, and what is built instead
+#
+#   * **No recursive mkdir.** The whole stdlib offers `sys_mkdir` and
+#     `sys_mkdirat` and nothing else; `lib/io.cyr`'s portable `x*` set has no
+#     entry for it. `_agnosai_mkdir_p` reproduces std's algorithm, including its
+#     try-the-whole-path-first fast path — see the note there, the naive
+#     component walk cost more than the fsync it precedes. Measured behaviour it
+#     has to absorb: `sys_mkdir` on an existing directory returns **-17**
+#     (`-EEXIST`) and on a missing parent **-2** (`-ENOENT`).
+#   * **`file_read_all` cannot tell a directory from an empty file** — both
+#     return 0 — and it silently truncates at `maxlen` without saying so. The
+#     oracle distinguishes `Err(EISDIR)` from `Ok(vec![])`, so
+#     `_agnosai_read_file_exact` is built on `file_open`/`xlseek`/`file_read`,
+#     treats a negative read as an error rather than as end-of-file, and takes
+#     its size from the fd so there is no cap — matching `tokio::fs::read`.
+#     Measured: opening a directory *succeeds* (a live fd comes back), the
+#     **seek** then fails `-EINVAL`, and only a read would have said `-EISDIR`.
+#     Since std reports "Is a directory (os error 21)", the seek failure is
+#     classified back to `-EISDIR` rather than passing through whichever
+#     syscall happened to fail first — the errno is what a caller matches on.
+#   * **The write goes through `file_write_atomic`, not `file_write_all`.**
+#     This is usually framed as a safety upgrade, and it is, but it is also the
+#     *more faithful* of the two: `file_write_all` issues a single `file_write`
+#     and returns whatever it got, so a short write silently persists a partial
+#     snapshot, while `tokio::fs::write` writes all the bytes. `file_write_atomic`
+#     loops, fsyncs, and renames over the target. The visible difference from
+#     the oracle is that a concurrent reader sees the old file or the new one
+#     and never a half-written one.
+#
+# ## Two deliberate divergences from the oracle
+#
+#   1. **`crew_id` is validated.** The oracle validates nothing, anywhere —
+#      not in `new`, `path_for`, `save` or `load`. `Path::join` with an absolute
+#      argument *discards* `base_dir` entirely, and `..` traverses in any case,
+#      so a caller that passes a wire-supplied id has an arbitrary write and an
+#      arbitrary read of any path ending `.json`. Unreachable inside `rust-old`
+#      (zero non-test callers) and squarely reachable by the four consumers this
+#      module exists for. See `docs/adr/008-durable-state-crew-id-validation.md`;
+#      every one of the oracle's own test ids still passes.
+#   2. **`agnosai_deserialize_crew_state` requires `status` and `results`.**
+#      The oracle is `serde_json::from_slice::<CrewState>`, and only `profile`
+#      carries `#[serde(default)]` — the other three fields are mandatory and
+#      an unknown `status` spelling is an error. `agnosai_crew_state_from_value`
+#      is more forgiving: it defaults a missing `status` to `Pending`, tolerates
+#      a missing `results`, and maps an unknown spelling to `Pending`, which
+#      silently *rewrites* a corrupt snapshot into a plausible one. The gate
+#      lives here, at the boundary the oracle defines, so this module matches
+#      `from_slice` exactly. It leaves `core_crew`'s own deserialiser lax for
+#      every other caller — a real divergence, recorded rather than hidden.
+#
+# ## One residual
+#
+# `sakshi_log_kv` is sakshi's only kv logger, carries exactly **one** key/value
+# pair, and composes into a 256-byte buffer. The oracle's five `tracing` events
+# each carry two fields and never truncate. Both fields are folded into the one
+# value slot with `crew_id` **first** and the path last, so what a long path
+# truncates is the path rather than the id that correlates the event.
+# =========================================================================
+
+# `load`'s out-value meaning the oracle's `Ok(None)` — no snapshot for this crew.
+var AGNOSAI_STATE_ABSENT = 0;
+
+# The errno a missing path reports, and the one an existing directory reports.
+var AGNOSAI_STATE_ENOENT = 0 - 2;
+var AGNOSAI_STATE_EEXIST = 0 - 17;
+
+# FileStateStore — one immutable base directory.
+enum AgnosaiStateStoreOff {
+    AGN_SSTORE_BASE_DIR = 0;
+    AGN_SSTORE_SIZE = 8;
+}
+
+# Log one of the oracle's `tracing` events.
+#
+# Level-gated first so an unselected level costs nothing. `extra == 0` renders
+# `crew_id` alone, which is the shape of the cache-miss event.
+fn _agnosai_durable_log(level, msg, msg_len, crew_id: Str, extra: Str): i64 {
+    if (sakshi_get_level() < level) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, crew_id);
+    if (extra != 0) {
+        str_builder_add_cstr(sb, " ");
+        str_builder_add(sb, extra);
+    }
+    var line = str_builder_build(sb);
+    sakshi_log_kv(level, msg, msg_len, "crew_id", 7, str_data(line), str_len(line));
+    return 0;
+}
+
+# An errno as text, or 0 when it is not one this module can produce.
+#
+# `std::io::Error`'s `Display` has no Cyrius equivalent — there is no strerror
+# table in the stdlib at all (`fdlopen_strerror` is dlopen-specific, and
+# `lib/io.cyr`'s classifier discards the number). These are the errnos a state
+# store actually hits; anything else falls back to the bare number, which is
+# what std does too for an unrecognised code.
+fn _agnosai_errno_text(errn): i64 {
+    if (errn == 0 - 2) { return str_from("no such file or directory"); }
+    if (errn == 0 - 13) { return str_from("permission denied"); }
+    if (errn == 0 - 17) { return str_from("file exists"); }
+    if (errn == 0 - 20) { return str_from("not a directory"); }
+    if (errn == 0 - 21) { return str_from("is a directory"); }
+    if (errn == 0 - 22) { return str_from("invalid argument"); }
+    if (errn == 0 - 28) { return str_from("no space left on device"); }
+    if (errn == 0 - 36) { return str_from("file name too long"); }
+    return 0;
+}
+
+# Render the detail string `agnosai_error_io` wants: what failed, where, why.
+#
+# The variant *prefix* is the parity surface — `core_error.cyr` renders
+# "I/O error: " either way — and the detail is sanctioned free-form, so this
+# reads like std's without pretending to be byte-identical to it.
+fn _agnosai_io_detail(op, path: Str, errn): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, op);
+    str_builder_add_cstr(sb, " ");
+    str_builder_add(sb, path);
+    str_builder_add_cstr(sb, ": ");
+    var text = _agnosai_errno_text(errn);
+    if (text != 0) { str_builder_add(sb, text); }
+    else {
+        str_builder_add_cstr(sb, "os error ");
+        str_builder_add_int(sb, 0 - errn);
+    }
+    return str_builder_build(sb);
+}
+
+# One `mkdir`, portably.
+#
+# `sys_mkdir`'s second argument is the **mode** on Linux/macOS/Windows and the
+# **path length** on agnos, and the name is the same on both — so a bare
+# `sys_mkdir(path, 0x1FF)` compiles everywhere and silently means "pathlen 511"
+# on one target. `lib/io.cyr`'s `x*` set exists to absorb exactly this kind of
+# divergence (`xopen`, `xunlink`, `xstat`, `xlseek`, ...) and has no `xmkdir`, so
+# the branch is here. Filed upstream as
+# `2026-07-29-no-portable-xmkdir-in-io-cyr.md`; `lib/kavach.cyr` has the
+# unguarded form at eight sites.
+fn _agnosai_mkdir_one(cpath): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var n = 0;
+    while (load8(cpath + n) != 0) { n = n + 1; }
+    return sys_mkdir(cpath, n);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_mkdir(cpath, 0x1FF);
+    #endif
+}
+
+# Create a directory and every missing parent — the oracle's `create_dir_all`.
+#
+# Returns 0, or a negative errno. This follows std's algorithm rather than
+# inventing one, and the order matters for both speed and behaviour:
+#
+#   1. Try `mkdir` on the **whole path**. If it succeeds, done — one syscall.
+#   2. On `-EEXIST`, confirm with `is_dir`. `create_dir_all` FAILS when a
+#      component exists as a plain file, so swallowing `-EEXIST` blindly would
+#      turn that into a confusing write error two steps later instead.
+#   3. Only on `-ENOENT` is there a missing parent to walk.
+#
+# Getting step 1 first is what keeps the common case cheap: a store saving into
+# a directory that already exists pays two syscalls, not two per component. The
+# first version of this walked unconditionally and benchmarked at **43 µs** on a
+# four-deep existing tree — slower than the fsync'd atomic write it precedes.
+#
+# An empty path is success, matching `create_dir_all("")`, which does nothing.
+fn _agnosai_mkdir_p(path: Str): i64 {
+    var len = str_len(path);
+    if (len == 0) { return 0; }
+
+    var rc = _agnosai_mkdir_one(str_data(path));
+    if (rc == 0) { return 0; }
+    if (rc == AGNOSAI_STATE_EEXIST) {
+        if (is_dir(path) == 1) { return 0; }
+        return 0 - 20;
+    }
+    if (rc != AGNOSAI_STATE_ENOENT) { return rc; }
+
+    # A parent is missing. Walk the components, creating each in turn.
+    #
+    # A private mutable copy: each prefix is created by NUL-terminating it in
+    # place and restoring the separator afterwards, because `sys_mkdir` needs a
+    # C string and there is no `str_slice` in the stdlib to cut one with — and a
+    # borrowed view would carry no terminator anyway.
+    var src = str_data(path);
+    var work = alloc(len + 1);
+    for (var c = 0; c < len; c = c + 1) { store8(work + c, load8(src + c)); }
+    store8(work + len, 0);
+
+    # Start at 1 so a leading '/' is never itself a create target.
+    for (var i = 1; i <= len; i = i + 1) {
+        var at_end = 0;
+        if (i == len) { at_end = 1; }
+        if (at_end == 1 || load8(work + i) == 47) {
+            # Skip a repeated separator: "a//b" has nothing to create at the
+            # second slash, and a trailing '/' names the component already made.
+            if (at_end == 1 || load8(work + i - 1) != 47) {
+                var saved = load8(work + i);
+                store8(work + i, 0);
+                var prc = _agnosai_mkdir_one(work);
+                if (prc == AGNOSAI_STATE_EEXIST) {
+                    prc = 0;
+                    if (is_dir(str_from(work)) == 0) { prc = 0 - 20; }
+                }
+                store8(work + i, saved);
+                if (prc != 0) { return prc; }
+            }
+        }
+    }
+    return 0;
+}
+
+# Read a whole file. Returns a heap pointer and stores the length through
+# `out_len`, or a negative errno.
+#
+# Built on the fd verbs rather than `file_read_all` for two reasons the oracle
+# depends on: a directory must be an error (`file_read_all` reports it as a
+# 0-byte success, indistinguishable from an empty file) and there must be no
+# size cap (`file_read_all` truncates at `maxlen` and says nothing). A negative
+# `file_read` is therefore treated as an error, never as end-of-file.
+#
+# A zero-length file returns a valid non-zero pointer, so the caller can tell
+# "empty snapshot" from "no snapshot".
+fn _agnosai_read_file_exact(path: Str, out_len): i64 {
+    var fd = file_open(str_data(path), 0, 0);
+    if (fd < 0) { return fd; }
+
+    var size = xlseek(fd, 0, 2);
+    if (size < 0) {
+        file_close(fd);
+        # A directory opens fine and then fails HERE, with -EINVAL from the
+        # seek, before the read that would have said -EISDIR. std's `read`
+        # reports "Is a directory (os error 21)", so classify rather than pass
+        # through whichever syscall happened to fail first — the errno is what
+        # a caller matches on.
+        if (is_dir(path) == 1) { return 0 - 21; }
+        return size;
+    }
+    if (xlseek(fd, 0, 0) < 0) {
+        file_close(fd);
+        return 0 - 5;
+    }
+
+    # One spare byte so the payload is NUL-terminated and usable as a cstring.
+    var buf = alloc(size + 1);
+    store8(buf + size, 0);
+
+    var total = 0;
+    while (total < size) {
+        var n = file_read(fd, buf + total, size - total);
+        if (n < 0) {
+            file_close(fd);
+            return n;
+        }
+        # A short file (someone truncated it under us) is not an error; the
+        # oracle's read returns what was there.
+        if (n == 0) { size = total; }
+        else { total = total + n; }
+    }
+
+    file_close(fd);
+    store64(out_len, total);
+    return buf;
+}
+
+# Whether a crew id is safe to use as a filename component.
+#
+# **No oracle counterpart** — see divergence 1 in the module header and ADR 008.
+# Rejects an empty id, an embedded NUL, either separator, any component that is
+# `.` or `..`, and a leading `.`. Every id the oracle's own tests use passes:
+# `crew-1`, `crew-x`, `nonexistent-crew`, `my-crew-123`, and uuid strings.
+fn agnosai_crew_id_is_safe(crew_id: Str): i64 {
+    var len = str_len(crew_id);
+    if (len == 0) { return 0; }
+    var data = str_data(crew_id);
+    if (load8(data) == 46) { return 0; }
+
+    for (var i = 0; i < len; i = i + 1) {
+        var c = load8(data + i) & 255;
+        if (c == 0 || c == 47 || c == 92) { return 0; }
+    }
+    return 1;
+}
+
+# Create a store rooted at `base_dir`.
+#
+# Stores the path verbatim — no canonicalisation, no existence check, no
+# trailing-separator fixup. The oracle's `new` does the same, and the directory
+# is created on first write rather than here.
+fn agnosai_state_store_new(base_dir: Str): i64 {
+    var s = alloc(AGN_SSTORE_SIZE);
+    store64(s + AGN_SSTORE_BASE_DIR, base_dir);
+    return s;
+}
+
+# The store's base directory. Private in the oracle; exposed here for tests.
+fn agnosai_state_store_base_dir(store): i64 {
+    return load64(store + AGN_SSTORE_BASE_DIR);
+}
+
+# The file path for a crew — the oracle's `path_for`.
+#
+# `{base_dir}/{crew_id}.json`. Note this is plain concatenation where the
+# oracle uses `Path::join`, which *replaces* the base when the joined component
+# is absolute; `agnosai_crew_id_is_safe` refuses separators, so that case cannot
+# arise here. `str_builder_build` NUL-terminates, so `str_data` on the result is
+# a valid cstring for free.
+fn agnosai_state_path_for(store, crew_id: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, load64(store + AGN_SSTORE_BASE_DIR));
+    str_builder_add_cstr(sb, "/");
+    str_builder_add(sb, crew_id);
+    str_builder_add_cstr(sb, ".json");
+    return str_builder_build(sb);
+}
+
+# Save a crew's state bytes — the oracle's `StateStore::save`.
+#
+# Returns 0 on success or an `AgnosaiError` pointer, which is `core_error`'s
+# documented stand-in for `Result<()>`. Takes `(buf, len)` rather than a Str
+# because the oracle takes `&[u8]` and its own tests pass non-UTF-8 payloads.
+#
+# The order is the oracle's: debug log, create the directory tree, build the
+# path, write, info log. Neither failure path logs anything, because the oracle
+# does not — the error carries the detail instead.
+fn agnosai_state_store_save(store, crew_id: Str, buf, len): i64 {
+    if (agnosai_crew_id_is_safe(crew_id) == 0) {
+        return agnosai_error_io(str_cat(str_from("unsafe crew id: "), crew_id));
+    }
+
+    var base = load64(store + AGN_SSTORE_BASE_DIR);
+    _agnosai_durable_log(SK_DEBUG, "saving crew state to file", 25, crew_id, base);
+
+    var rc = _agnosai_mkdir_p(base);
+    if (rc != 0) {
+        return agnosai_error_io(_agnosai_io_detail("create_dir_all", base, rc));
+    }
+
+    var path = agnosai_state_path_for(store, crew_id);
+    var wr = file_write_atomic(str_data(path), buf, len);
+    if (wr != 0) {
+        return agnosai_error_io(_agnosai_io_detail("write", path, wr));
+    }
+
+    _agnosai_durable_log(SK_INFO, "crew state saved", 16, crew_id, path);
+    return 0;
+}
+
+# Load a crew's state bytes — the oracle's `StateStore::load`.
+#
+# Returns 0 for the oracle's `Ok` or an `AgnosaiError` pointer for its `Err`.
+# On `Ok`, `*out_bytes` is the payload pointer or `AGNOSAI_STATE_ABSENT` for
+# `Ok(None)`, and `*out_len` is the length.
+#
+# Splitting the Option out into a parameter is what keeps the two zeroes apart:
+# a bare return would have to use 0 for both "no error" and "no snapshot",
+# which are opposite answers, and `save` already spends 0 on success.
+#
+# `-ENOENT` is the miss. Every other errno is an error, logged nowhere, exactly
+# as the oracle's `Err(e)` arm is silent.
+fn agnosai_state_store_load(store, crew_id: Str, out_bytes, out_len): i64 {
+    store64(out_bytes, AGNOSAI_STATE_ABSENT);
+    store64(out_len, 0);
+
+    if (agnosai_crew_id_is_safe(crew_id) == 0) {
+        return agnosai_error_io(str_cat(str_from("unsafe crew id: "), crew_id));
+    }
+
+    var path = agnosai_state_path_for(store, crew_id);
+    _agnosai_durable_log(SK_DEBUG, "loading crew state from file", 28, crew_id, path);
+
+    var len = 0;
+    var data = _agnosai_read_file_exact(path, &len);
+    if (data == AGNOSAI_STATE_ENOENT) {
+        _agnosai_durable_log(SK_DEBUG, "no saved state found", 20, crew_id, 0);
+        return 0;
+    }
+    if (data < 0) {
+        return agnosai_error_io(_agnosai_io_detail("read", path, data));
+    }
+
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "bytes=");
+    str_builder_add_int(sb, len);
+    _agnosai_durable_log(SK_INFO, "crew state loaded", 17, crew_id, str_builder_build(sb));
+
+    store64(out_bytes, data);
+    store64(out_len, len);
+    return 0;
+}
+
+# Serialize a crew state to pretty JSON bytes — the oracle's
+# `serialize_crew_state`.
+#
+# Returns a Str. `bayan_json_v_build_pretty(v, 2)` was checked against
+# `serde_json::to_vec_pretty` and is byte-identical for this shape: 2-space
+# indent, one space after each colon, `[]` and `{}` for empty containers, and
+# **no trailing newline** — 95 bytes for the oracle's own `sample_state()`.
+#
+# No error return. The oracle's `Serialization` arm is unreachable for a
+# `CrewState`: the writer is a `Vec` that cannot fail, every map key is a uuid,
+# and non-finite floats are already dropped by `CrewProfile`'s `is_zero` skip.
+# Returning a bare Str rather than a fake Result keeps that honest.
+fn agnosai_serialize_crew_state(state): i64 {
+    return bayan_json_v_build_pretty(agnosai_crew_state_to_value(state), 2);
+}
+
+# Deserialize a crew state from JSON bytes — the oracle's
+# `deserialize_crew_state`.
+#
+# Returns 0 with `*out_state` set, or an `AgnosaiError` pointer. Takes
+# `(buf, len)` because the oracle takes `&[u8]`.
+#
+# The `status`/`results` presence checks and the status-spelling check are
+# divergence 2 in the module header: they restore `serde`'s required-field
+# semantics, which `agnosai_crew_state_from_value` does not have. Unknown extra
+# fields are accepted, since `CrewState` has no `deny_unknown_fields`.
+fn agnosai_deserialize_crew_state(buf, len, out_state): i64 {
+    store64(out_state, 0);
+
+    var v = bayan_json_v_parse_str(buf, len);
+    if (v == 0) {
+        return agnosai_error_serialization(str_from(bayan_json_last_error()));
+    }
+    if (bayan_json_v_is_obj(v) == 0) {
+        return agnosai_error_serialization(str_from("expected a JSON object"));
+    }
+
+    var sv = bayan_json_v_obj_get(v, "status");
+    if (sv == 0 || bayan_json_v_is_str(sv) == 0) {
+        return agnosai_error_serialization(str_from("missing field `status`"));
+    }
+    var spelling = bayan_json_v_str(sv);
+    if (str_eq(agnosai_crew_status_to_wire(
+    agnosai_crew_status_from_wire(spelling)), spelling) == 0) {
+        return agnosai_error_serialization(str_cat(
+        str_from("unknown variant for field `status`: "), spelling));
+    }
+
+    var rv = bayan_json_v_obj_get(v, "results");
+    if (rv == 0 || bayan_json_v_is_arr(rv) == 0) {
+        return agnosai_error_serialization(str_from("missing field `results`"));
+    }
+
+    var state = agnosai_crew_state_from_value(v);
+    if (state == 0) {
+        return agnosai_error_serialization(str_from("missing or malformed field `crew_id`"));
+    }
+
+    store64(out_state, state);
+    return 0;
+}

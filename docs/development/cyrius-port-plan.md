@@ -131,7 +131,15 @@ a thread), remote_registry, builtin/*. Defers python_tool/wasm_tool.
 ### Phase 4 — `orchestrator`
 16 of 18 bites. The default-feature runtime path: orchestrator → crew_runner →
 scoring/scheduler/output_validation, + approval, budget, audit, memory,
-multi_tenant, plan_cache, durable_state (→ patra), hierarchical.
+multi_tenant, plan_cache, durable_state, hierarchical.
+**Correction (2026-07-29, verified while porting):** this line read
+`durable_state (→ patra)`. It does not. patra is a full embedded SQL database
+over its own paged `.patra` format with no dump/export verb, and its `jsonl`
+mode opens `O_APPEND` with no `O_TRUNC`; `durable_state`'s contract is one
+overwritable, human-readable JSON file per crew at a caller-chosen path, which
+patra structurally cannot produce. It is built on `lib/io.cyr` instead, and
+**no M5 module touches patra** — `grep -rn 'patra_\|jsonl_' src/ tests/` is
+empty. patra stays a declared stdlib dep for later phases.
 **Exit:** a crew runs end-to-end headless.
 
 ### Phase 5 — `server`
