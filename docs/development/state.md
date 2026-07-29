@@ -49,7 +49,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
-| `orchestrator` ported (M5, Phase 4) | 🟡 4 pure leaves + scoring + scheduler + budget + approval + plan_cache done; 6 modules left |
+| `orchestrator` ported (M5, Phase 4) | 🟡 4 pure leaves + scoring + scheduler + budget + approval + plan_cache + memory done; 5 modules left |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
@@ -57,7 +57,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**1984 assertions across 33 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**2037 assertions across 34 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -93,6 +93,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `orch_budget.tcyr` | 47 | 6 |
 | `orch_approval.tcyr` | 57 | 9 (3 of them `#[tokio::test]`) |
 | `orch_plan_cache.tcyr` | 40 | 7 |
+| `orch_memory.tcyr` | 53 | 9 |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -124,7 +125,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (624/624 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (642/642 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 

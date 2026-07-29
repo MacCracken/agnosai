@@ -243,6 +243,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `HashMap::insert`, and without it a hot key would fill the cache with copies of itself. An
     expired entry is removed on read, and eviction takes the *first* minimum `last_accessed`, so
     entries sharing a coarse-clock timestamp evict earliest-inserted first, matching `min_by_key`.
+  - **orch_memory** — a per-agent conversation buffer for tasks needing more than one round trip,
+    with three eviction strategies. Two asymmetries pinned because they read like bugs and are
+    not: **`Full` ignores a configured cap entirely** (the cap is inert unless a trimming strategy
+    is chosen), and **`HeadTail` at `max_messages == 1` keeps the LAST message, not the first** —
+    sacrificing the head the strategy is named for, since there is no room for both ends. The trim
+    guard is `<=`, so a buffer sitting exactly at its cap is untouched, and trimming runs on every
+    push so the buffer is never observed over its cap.
 - **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
   `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
   never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.
