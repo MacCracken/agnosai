@@ -1,0 +1,34 @@
+# =========================================================================
+# orch — task scheduling, agent coordination, and crew execution.
+#
+# Parity oracle: rust-old/src/orchestrator/mod.rs
+#
+# The runtime core: crew lifecycles, priority-tiered task scheduling, DAG
+# dependency resolution, agent scoring for assignment, and pub/sub events.
+#
+# Named `orch` rather than `orchestrator` because Cyrius has one flat namespace
+# and `agnosai_orchestrator_*` is the prefix the hub's own submodule wants; a
+# file and a symbol family with the same stem invite exactly the shadowing this
+# port has already been bitten by.
+#
+# Include order is a dependency constraint (resolution is single-pass). The
+# oracle's own graph, verified by reading each module's `use` lines:
+#   * pure leaves, no crate deps — output_validation, pubsub, multi_tenant, ipc
+#   * core-dependent          — scoring, scheduler, approval, budget,
+#                               plan_cache, memory, durable_state
+#   * sibling-dependent       — hierarchical (→ scoring),
+#                               crew_runner (→ scoring), orchestrator
+#                               (→ crew_runner, scheduler)
+#
+# PORT IN PROGRESS:
+#   * output_validation — done
+#   * everything else   — not started
+#
+# `crew_runner` and `orchestrator` both reach into `crate::server::sse` for
+# `CrewEvent` / `EventBus`. Those will be pulled forward from M6 the way
+# `server/ssrf` was for M4, and `EventBus` is where port-plan blocker #4 lives:
+# the fan-out needs tokio broadcast's **overwrite-oldest** semantics, which is
+# `chan_try_send` (shipped in cyrius 6.4.84), not a blocking `chan_send`.
+# =========================================================================
+
+include "src/orch_output_validation.cyr"
