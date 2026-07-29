@@ -20,7 +20,7 @@ lands, not before, so the number always names something that actually shipped.
 - **Rust reference**: 27,683 lines at `rust-old/` — frozen, do not edit. It is the parity oracle.
 - **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers),
   `llm` (router, retry, hoosh seam client + hub) and `tools` (native, registry, echo,
-  json_transform, load_testing), plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr` and
+  json_transform, load_testing, security_audit), plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr` and
   `src/server_ssrf.cyr`. `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
 ## Where the port is
@@ -28,8 +28,8 @@ lands, not before, so the number always names something that actually shipped.
 Phase 0 (M1 scaffold) — **complete**. Phase 1 (M2 beachhead) — **complete**: `learning` and
 `core` both ported and green against the oracle. Phase 2 (M3 `llm`) — **complete**: router, retry
 and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools`) —
-**native, registry, the basic builtins and load_testing done; four builtins and
-remote_registry left**.
+**native, registry, the basic builtins, load_testing and security_audit done;
+three builtins and remote_registry left**.
 
 | Gate | Status |
 |---|---|
@@ -47,13 +47,14 @@ remote_registry left**.
 | Money representation decided | ✅ integer micro-USD (2026-07-28) — gates core BITE 8 |
 | `llm` ported (M3, Phase 2) | ✅ router + retry + hoosh seam client |
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
-| `tools` ported (M4, Phase 3) | 🟡 native + registry + echo/json_transform/load_testing; 4 builtins + remote_registry left |
+| `tools` ported (M4, Phase 3) | 🟡 native + registry + echo/json_transform/load_testing/security_audit; 3 builtins + remote_registry left |
+| SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
 | `server/ssrf` ported (M6 leaf, pulled forward) | ✅ two M4 modules gate on it — hardened against octal/hex/short-form bypasses |
 
 ## Tests
 
-**1034 assertions across 21 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**1234 assertions across 22 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -77,6 +78,7 @@ remote_registry left**.
 | `tools_builtin_basic.tcyr` | 37 | 6 (echo.rs + json_transform.rs) |
 | `server_ssrf.tcyr` | 81 | ~14 |
 | `tools_builtin_load_testing.tcyr` | 88 | 2 (both drive an axum mock server — see below) |
+| `tools_builtin_security_audit.tcyr` | 200 | 8 (5 of them drive an axum mock server) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -91,7 +93,17 @@ loops, status aggregation, the sort and the percentile indices with no network a
 path left untested is sandhi's own behaviour under `sandhi_http_get_a`, and the live
 `scripts/stack.sh check` covers that seam separately.
 
-`cyrius coverage --min 80` → **100% (440/440 fns), gate OK**. Shared assertion helpers live in
+`tools_builtin_security_audit.tcyr` solves the same problem the same way, and it pays off
+better: five of its eight oracle tests stand up an axum mock server, and because the module is
+split at the network boundary all five port exactly — `_t_mock_headers` is a direct
+transcription of the oracle's `mock_audit_server(security_headers, cors_wildcard)`, down to the
+`Apache/2.4.99` it always sets. The suite then goes well past the oracle: both sides of every
+risk-band boundary, the reflected-origin CORS bypass the probe origin exists to catch, the
+`to_str()` visible-ASCII gate, case-insensitive scheme handling, and a snapshot-survives-reset
+test that scribbles over the released arena so a borrowed pointer would show up as corruption
+rather than passing silently.
+
+`cyrius coverage --min 80` → **100% (466/466 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 

@@ -52,6 +52,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loopback. That is deliberate, and it is why the oracle's two axum-mock-server tests do not port
   directly — the suite drives the real thread fan-out against a synthetic executor instead, and
   `scripts/stack.sh check` covers the network seam separately.
+- **tools_builtin_security_audit** — the `security_audit` builtin: HTTP security-header analysis,
+  a CORS probe via OPTIONS, information-disclosure detection, scoring and a risk band. Split at
+  the network boundary — `agnosai_audit_analyze` takes two already-fetched header sets and
+  `agnosai_run_security_audit` is the thin shell that fetches them — which is what makes the
+  oracle's five loopback-mock-server tests portable, since the tool's own SSRF guard rightly
+  refuses loopback. Scores are carried as integer percentages and converted to f64 only at the
+  wire boundary, the same treatment money and load_testing's throughput get; the oracle's
+  arithmetic is integral at every step, so an f64 carrier could only drift.
+
+  **Redirect handling deliberately diverges from the oracle in both directions —
+  [ADR 007](docs/adr/007-audit-redirect-revalidation.md).** reqwest follows up to 10 redirects
+  and validates only the URL the caller supplied, so a target that passes `is_safe_url` and then
+  answers `302 Location: http://169.254.169.254/` walks the oracle into the cloud metadata
+  service and reports its headers back — an SSRF bypass in a tool whose job is finding them.
+  sandhi's opposite default (never follow) would have been differently wrong: auditing
+  `http://example.com` when it redirects to HTTPS would score the redirect stub and report a
+  well-configured site as 0/7, critical. The port follows hops and re-runs the guard on each one,
+  refuses an https→http downgrade, fails closed on a `Location` it cannot resolve confidently,
+  and reports a refused hop as a distinct error rather than a generic failure.
+
+  Three inherited defaults were corrected rather than absorbed, each of which would have produced
+  a silently wrong answer:
+  - `max_response_bytes` is raised off sandhi's 256 KiB, which treats an over-cap response as a
+    hard protocol error. The oracle cannot fail that way at all — reqwest's `send()` resolves on
+    the response head and never reads the body — so any homepage over 256 KiB would have returned
+    "security audit failed" where the oracle returns a full result.
+  - The 15s budget spans the whole redirect chain, matching `Client::timeout`, rather than being
+    re-armed per hop. Per-hop would have allowed 165 seconds against the oracle's 15, twice over.
+  - Scheme comparison on the security paths is case-insensitive, because `sandhi_url_parse` is and
+    therefore `is_safe_url` accepts `HTTPS://`. A byte-exact test would have skipped the downgrade
+    refusal and sliced the origin one byte short, resolving a relative `Location` against
+    `HTTPS:/` and pointing the next request at a different host.
+
+  Information disclosure honours the oracle's `let Ok(v) = val.to_str()` gate: a header value
+  carrying a non-visible-ASCII byte is skipped, so it raises no vulnerability and costs no points.
+  Without the gate such a target would score 5 below the oracle.
 - **server_ssrf** — `agnosai_is_safe_url` / `agnosai_is_private_host` / `agnosai_is_private_ipv4`
   / `agnosai_is_private_ipv6`. **Pulled forward from M6** because two M4 modules gate on it
   (`builtin/load_testing.rs` and `remote_registry.rs` both guard their outbound request with it).

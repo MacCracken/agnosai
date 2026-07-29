@@ -1,0 +1,965 @@
+# =========================================================================
+# tools_builtin_security_audit — the security_audit built-in tool.
+#
+# Parity oracle: rust-old/src/tools/builtin/security_audit.rs
+#
+# A non-destructive assessment of a target URL: which security headers are
+# present, whether CORS is misconfigured, and whether the server discloses its
+# own identity. Two requests, a GET and an OPTIONS, and everything else is
+# arithmetic over the response headers.
+#
+# **The module is split at the network boundary**, which the oracle is not.
+# `agnosai_audit_analyze` takes two already-fetched header sets and returns the
+# whole result; `agnosai_run_security_audit` is the thin shell that fetches them.
+# That split is what makes the oracle's five mock-server tests portable: they
+# stand up an axum server on loopback, and `agnosai_is_safe_url` correctly
+# refuses loopback, so the tool cannot be aimed at one. Building the same header
+# sets with `sandhi_headers_new` + `sandhi_headers_add` reproduces every one of
+# those tests exactly, with no network and no timing.
+#
+# Scores are **integer percentages**, converted to f64 only at the wire
+# boundary — the same treatment money and load_testing's throughput get. This is
+# exact rather than approximately exact: the oracle rounds
+# `header_score / 7.0 * 100.0` to a whole number and every later step
+# (subtracting 15 or 5, clamping, the `* 100.0 .round() / 100.0` pass) preserves
+# integrality, so an f64 carrier would buy nothing and could only drift.
+#
+# Port note on header lookup: sandhi's `sandhi_headers_get` / `_has` are already
+# case-insensitive, matching the `HeaderMap` semantics the oracle relies on. But
+# sandhi header names and values are **C strings**, not `Str` — the same hazard
+# class as bayan's `obj_set`-takes-Str / `obj_get`-takes-cstr asymmetry, and the
+# reason every lookup here passes a bare literal.
+# =========================================================================
+
+# The oracle's SECURITY_HEADERS table. Seven headers, each with the severity
+# reported when it is absent. Kept as index accessors rather than a built vec:
+# the table is constant, and building it per call would allocate on every audit.
+var AGNOSAI_AUDIT_SEC_HEADER_COUNT = 7;
+
+# Name of the i-th expected security header, as a C string.
+fn _agnosai_audit_sec_header(i): i64 {
+    if (i == 0) { return "content-security-policy"; }
+    if (i == 1) { return "strict-transport-security"; }
+    if (i == 2) { return "x-frame-options"; }
+    if (i == 3) { return "x-content-type-options"; }
+    if (i == 4) { return "referrer-policy"; }
+    if (i == 5) { return "permissions-policy"; }
+    return "x-xss-protection";
+}
+
+# Severity reported when the i-th security header is missing.
+fn _agnosai_audit_sec_severity(i): i64 {
+    if (i == 0) { return "critical"; }
+    if (i == 1) { return "critical"; }
+    if (i == 2) { return "high"; }
+    if (i == 3) { return "high"; }
+    if (i == 4) { return "medium"; }
+    if (i == 5) { return "medium"; }
+    return "low";
+}
+
+# The oracle's DISCLOSURE_HEADERS table — headers that leak server identity.
+var AGNOSAI_AUDIT_DISCLOSURE_COUNT = 4;
+
+# Name of the i-th information-disclosure header, as a C string.
+fn _agnosai_audit_disclosure_header(i): i64 {
+    if (i == 0) { return "server"; }
+    if (i == 1) { return "x-powered-by"; }
+    if (i == 2) { return "x-aspnet-version"; }
+    return "x-generator";
+}
+
+# The oracle's 15-second reqwest timeout.
+var AGNOSAI_AUDIT_TIMEOUT_MS = 15000;
+
+# Response size cap.
+#
+# sandhi's default is 256 KiB and it treats an over-cap response as a hard
+# protocol error, not a truncation — so inheriting it would turn "this homepage
+# is large" into "the audit failed". The oracle cannot fail that way at all:
+# reqwest's `send()` resolves once the response head arrives and the body is
+# never read, so no body size can defeat it. sandhi has no headers-only mode
+# short of a HEAD request, which servers are free to answer differently, so the
+# next best thing is a cap high enough that real pages clear it. 2 MiB is
+# deliberate slack: sandhi sends `Accept-Encoding: identity` unless told
+# otherwise, so these bytes arrive uncompressed.
+var AGNOSAI_AUDIT_MAX_BYTES = 2097152;
+
+# Scratch arena for one HTTP exchange.
+#
+# Sized for a single response, **not** for a whole audit, because the arena is
+# reset between every redirect hop and again between the two request chains. The
+# receive buffer is `AGNOSAI_AUDIT_MAX_BYTES + 1` and the rest covers the parsed
+# response, the header table and the request string. Sizing this per-audit
+# instead would make the requirement scale with hop count: at 10 hops across two
+# chains that is 22 exchanges, and the fourth would already have failed.
+var AGNOSAI_AUDIT_ARENA_BYTES = 2621440;
+
+# Redirect hop limit — reqwest's default, which is what the oracle inherits.
+var AGNOSAI_AUDIT_MAX_HOPS = 10;
+
+# Returned instead of a result when a redirect pointed somewhere the SSRF guard
+# refuses. Distinguished from 0 (the request simply failed) because the two
+# deserve different error messages: one is a network problem, the other is an
+# attempted bypass and should read like one.
+var AGNOSAI_AUDIT_REDIRECT_BLOCKED = 0 - 1;
+
+# The tool description, used by both the schema and the tool itself. The oracle
+# reads it from `description()` in both places; duplicating the literal would be
+# a chance for them to drift. Built from two halves only because the whole
+# sentence exceeds the line limit — Cyrius has no adjacent-literal concatenation.
+fn _agnosai_audit_description(): i64 {
+    return str_cat(str_from("Assess security posture of a target URL: HTTP headers, "),
+    str_from("TLS grade, CORS policy, and information disclosure."));
+}
+
+# The probe origin the CORS check sends. A server that reflects this back is
+# echoing an arbitrary origin, which is what makes it a finding.
+var AGNOSAI_AUDIT_PROBE_ORIGIN = "https://evil.example.com";
+
+# CorsAnalysis — the oracle's struct, four fields.
+enum AgnosaiCorsOff {
+    AGN_CORS_MISCONFIGURED = 0;
+    AGN_CORS_ALLOWS_ALL = 8;
+    AGN_CORS_ALLOWS_CREDS = 16;
+    AGN_CORS_DETAIL = 24;
+    AGN_CORS_SIZE = 32;
+}
+
+# Vulnerability — the oracle's struct. `kind` is its `r#type`, which serializes
+# as "type"; `type` is not usable as a field name here either.
+enum AgnosaiVulnOff {
+    AGN_VULN_KIND = 0;
+    AGN_VULN_SEVERITY = 8;
+    AGN_VULN_DESCRIPTION = 16;
+    AGN_VULN_REMEDIATION = 24;
+    AGN_VULN_SIZE = 32;
+}
+
+# MissingHeader — a header name plus the severity of its absence.
+enum AgnosaiMissingOff {
+    AGN_MISS_HEADER = 0;
+    AGN_MISS_SEVERITY = 8;
+    AGN_MISS_SIZE = 16;
+}
+
+# AuditResult. `header_analysis` is inlined rather than given its own struct —
+# it is three fields used in one place, and the wire shape is rebuilt in
+# `agnosai_audit_result_to_value` regardless.
+enum AgnosaiAuditOff {
+    AGN_AUD_TARGET_URL = 0;
+    AGN_AUD_SECURITY_SCORE = 8;
+    AGN_AUD_RISK_LEVEL = 16;
+    AGN_AUD_HDR_PRESENT = 24;
+    AGN_AUD_HDR_MISSING = 32;
+    AGN_AUD_HDR_SCORE = 40;
+    AGN_AUD_CORS = 48;
+    AGN_AUD_DISCLOSURE = 56;
+    AGN_AUD_VULNS = 64;
+    AGN_AUD_RECOMMENDATIONS = 72;
+    AGN_AUD_SIZE = 80;
+}
+
+# Case-insensitive ASCII compare of two C strings. The oracle's
+# `eq_ignore_ascii_case`, used only for the `true` credentials check.
+#
+# sandhi has an equivalent but keeps it private, and lowering through
+# `str_lower_cstr` would allocate on a path that runs once per audit for a
+# four-byte comparison.
+fn _agnosai_audit_cstr_ieq(a, b): i64 {
+    var i = 0;
+    while (1 == 1) {
+        var ca = load8(a + i);
+        var cb = load8(b + i);
+        if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+        if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+        if (ca != cb) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Case-insensitive ASCII compare of the first `n` bytes of two C strings.
+#
+# The bounded sibling of `_agnosai_audit_cstr_ieq`, for prefix tests where the
+# left side is a URL that continues past the prefix.
+fn _agnosai_audit_cstr_ieq_n(a, b, n): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var ca = load8(a + i) & 255;
+        var cb = load8(b + i) & 255;
+        if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+        if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+        if (ca != cb) { return 0; }
+    }
+    return 1;
+}
+
+# Round `count * 100 / max` to the nearest whole percent, half away from zero.
+#
+# This is the integer form of the oracle's
+# `(header_score / max_score * 100.0).round()`. Both operands are non-negative,
+# so half-up and half-away-from-zero coincide. For max = 7 the sequence is
+# 0, 14, 29, 43, 57, 71, 86, 100 — none of which is a tie, so the tie rule is
+# belt-and-braces rather than load-bearing.
+fn _agnosai_audit_pct(count, max): i64 {
+    if (max <= 0) { return 0; }
+    return (count * 100 * 2 + max) / (max * 2);
+}
+
+# Build a MissingHeader.
+fn _agnosai_audit_missing_new(header: Str, severity: Str): i64 {
+    var m = alloc(AGN_MISS_SIZE);
+    store64(m + AGN_MISS_HEADER, header);
+    store64(m + AGN_MISS_SEVERITY, severity);
+    return m;
+}
+
+# The header name a MissingHeader names.
+fn agnosai_missing_header_name(m): i64 {
+    return load64(m + AGN_MISS_HEADER);
+}
+
+# The severity of that header's absence.
+fn agnosai_missing_header_severity(m): i64 {
+    return load64(m + AGN_MISS_SEVERITY);
+}
+
+# Build a Vulnerability.
+fn _agnosai_audit_vuln_new(kind: Str, severity: Str, description: Str, remediation: Str): i64 {
+    var v = alloc(AGN_VULN_SIZE);
+    store64(v + AGN_VULN_KIND, kind);
+    store64(v + AGN_VULN_SEVERITY, severity);
+    store64(v + AGN_VULN_DESCRIPTION, description);
+    store64(v + AGN_VULN_REMEDIATION, remediation);
+    return v;
+}
+
+# The vulnerability's type — the oracle's `r#type`.
+fn agnosai_vuln_kind(v): i64 {
+    return load64(v + AGN_VULN_KIND);
+}
+
+# The vulnerability's severity.
+fn agnosai_vuln_severity(v): i64 {
+    return load64(v + AGN_VULN_SEVERITY);
+}
+
+# The vulnerability's description.
+fn agnosai_vuln_description(v): i64 {
+    return load64(v + AGN_VULN_DESCRIPTION);
+}
+
+# The vulnerability's remediation advice.
+fn agnosai_vuln_remediation(v): i64 {
+    return load64(v + AGN_VULN_REMEDIATION);
+}
+
+# Whether CORS is misconfigured: all origins allowed *with* credentials.
+fn agnosai_cors_misconfigured(c): i64 {
+    return load64(c + AGN_CORS_MISCONFIGURED);
+}
+
+# Whether the server echoed the probe origin or a wildcard.
+fn agnosai_cors_allows_all_origins(c): i64 {
+    return load64(c + AGN_CORS_ALLOWS_ALL);
+}
+
+# Whether the server allows credentialed cross-origin requests.
+fn agnosai_cors_allows_credentials(c): i64 {
+    return load64(c + AGN_CORS_ALLOWS_CREDS);
+}
+
+# The human-readable CORS verdict.
+fn agnosai_cors_detail(c): i64 {
+    return load64(c + AGN_CORS_DETAIL);
+}
+
+# Analyse an OPTIONS response's headers for CORS misconfiguration.
+#
+# `headers` is 0 when the OPTIONS request failed, which is the oracle's `Err`
+# arm: everything false, and a detail saying so. A failed preflight is not
+# evidence of a problem, so it must not score as one.
+#
+# The oracle treats a reflected probe origin exactly like a wildcard. That is
+# the point of sending one — a server that echoes `https://evil.example.com`
+# back is allowing all origins, it is just doing so one request at a time.
+fn agnosai_analyze_cors(headers): i64 {
+    var c = alloc(AGN_CORS_SIZE);
+
+    if (headers == 0) {
+        store64(c + AGN_CORS_MISCONFIGURED, 0);
+        store64(c + AGN_CORS_ALLOWS_ALL, 0);
+        store64(c + AGN_CORS_ALLOWS_CREDS, 0);
+        store64(c + AGN_CORS_DETAIL,
+        str_from("OPTIONS request failed (CORS may not be configured)"));
+        return c;
+    }
+
+    # The oracle defaults a missing origin header to "" and a missing
+    # credentials header to "false", then compares. Absent and empty are
+    # therefore indistinguishable, which is the behaviour being matched.
+    var acao = sandhi_headers_get(headers, "access-control-allow-origin");
+    if (acao == 0) { acao = ""; }
+    var acac = sandhi_headers_get(headers, "access-control-allow-credentials");
+    if (acac == 0) { acac = "false"; }
+
+    var allows_all = 0;
+    if (_agnosai_audit_cstr_ieq(acao, "*") == 1) { allows_all = 1; }
+    if (str_eq_cstr(str_from(acao), AGNOSAI_AUDIT_PROBE_ORIGIN) == 1) { allows_all = 1; }
+
+    var allows_creds = _agnosai_audit_cstr_ieq(acac, "true");
+
+    var misconfigured = 0;
+    if (allows_all == 1 && allows_creds == 1) { misconfigured = 1; }
+
+    store64(c + AGN_CORS_MISCONFIGURED, misconfigured);
+    store64(c + AGN_CORS_ALLOWS_ALL, allows_all);
+    store64(c + AGN_CORS_ALLOWS_CREDS, allows_creds);
+
+    if (misconfigured == 1) {
+        store64(c + AGN_CORS_DETAIL,
+        str_from("Wildcard origin with credentials — critical misconfiguration"));
+    } else {
+        if (allows_all == 1) {
+            store64(c + AGN_CORS_DETAIL, str_from("Wildcard origin allowed (no credentials)"));
+        } else {
+            store64(c + AGN_CORS_DETAIL, str_from("CORS properly configured"));
+        }
+    }
+    return c;
+}
+
+# The "<header>: <value>" line the oracle formats for each disclosure.
+# Whether every byte of a C string would survive Rust's `HeaderValue::to_str`.
+#
+# That is `is_visible_ascii`: printable ASCII, plus tab. The oracle gates each
+# disclosure line on `let Ok(v) = val.to_str()`, so a `Server` header carrying a
+# Latin-1 or UTF-8 byte is silently skipped there — no disclosure line, no
+# `information_disclosure` vulnerability, and no 5-point deduction. Dropping
+# that gate would score such a target 5 points below what the oracle scores it.
+#
+# The byte is masked because load8 sign-extends: without it a 0x80-or-higher
+# byte arrives negative and would still fail the range test, but for the wrong
+# reason, which is the kind of accident that survives a refactor.
+fn _agnosai_audit_is_visible_ascii(s): i64 {
+    var i = 0;
+    while (1 == 1) {
+        var c = load8(s + i) & 255;
+        if (c == 0) { return 1; }
+        if (c != 9 && (c < 32 || c > 126)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _agnosai_audit_disclosure_line(name, value): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, name);
+    str_builder_add_cstr(sb, ": ");
+    str_builder_add_cstr(sb, value);
+    return str_builder_build(sb);
+}
+
+# Join a vec of Str with ", " — the oracle's `disclosure.join(", ")`.
+fn _agnosai_audit_join(items): i64 {
+    var sb = str_builder_new();
+    for (var i = 0; i < vec_len(items); i = i + 1) {
+        if (i > 0) { str_builder_add_cstr(sb, ", "); }
+        str_builder_add(sb, vec_get(items, i));
+    }
+    return str_builder_build(sb);
+}
+
+# The oracle's `format!("Only {:.0}% of ... are present", score)`. The score is
+# integral, so `{:.0}` renders it with no decimal point at all.
+fn _agnosai_audit_missing_headers_desc(score): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Only ");
+    str_builder_add_int(sb, score);
+    str_builder_add_cstr(sb, "% of recommended security headers are present");
+    return str_builder_build(sb);
+}
+
+# The oracle's `format!("Server discloses: {}", disclosure.join(", "))`.
+fn _agnosai_audit_disclosure_desc(disclosure): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Server discloses: ");
+    str_builder_add(sb, _agnosai_audit_join(disclosure));
+    return str_builder_build(sb);
+}
+
+# The oracle's risk bands: >=80 low, >=60 medium, >=40 high, else critical.
+fn _agnosai_audit_risk_level(score): i64 {
+    if (score >= 80) { return str_from("low"); }
+    if (score >= 60) { return str_from("medium"); }
+    if (score >= 40) { return str_from("high"); }
+    return str_from("critical");
+}
+
+# The whole audit, over two already-fetched header sets.
+#
+# `get_headers` is the GET response's headers; `cors_headers` is the OPTIONS
+# response's, or 0 if that request failed. Neither is retained: everything the
+# result keeps is either a literal or a fresh `str_builder` copy, so the caller
+# is free to release the response memory the moment this returns. That is what
+# lets `agnosai_run_security_audit` run both requests through a scratch arena
+# and reset it before returning.
+fn agnosai_audit_analyze(url: Str, get_headers, cors_headers): i64 {
+    var present = vec_new();
+    var missing = vec_new();
+    var found = 0;
+
+    for (var i = 0; i < AGNOSAI_AUDIT_SEC_HEADER_COUNT; i = i + 1) {
+        var name = _agnosai_audit_sec_header(i);
+        if (get_headers != 0 && sandhi_headers_has(get_headers, name) == 1) {
+            vec_push(present, str_from(name));
+            found = found + 1;
+        } else {
+            vec_push(missing,
+            _agnosai_audit_missing_new(str_from(name), str_from(_agnosai_audit_sec_severity(i))));
+        }
+    }
+    var header_score = _agnosai_audit_pct(found, AGNOSAI_AUDIT_SEC_HEADER_COUNT);
+
+    var disclosure = vec_new();
+    for (var d = 0; d < AGNOSAI_AUDIT_DISCLOSURE_COUNT; d = d + 1) {
+        var dname = _agnosai_audit_disclosure_header(d);
+        if (get_headers != 0) {
+            var dval = sandhi_headers_get(get_headers, dname);
+            # The second condition is the oracle's `let Ok(v) = val.to_str()`.
+            if (dval != 0 && _agnosai_audit_is_visible_ascii(dval) == 1) {
+                vec_push(disclosure, _agnosai_audit_disclosure_line(dname, dval));
+            }
+        }
+    }
+
+    var cors = agnosai_analyze_cors(cors_headers);
+
+    # Vulnerabilities, in the oracle's order. The order is wire-visible.
+    var vulns = vec_new();
+    if (header_score < 50) {
+        vec_push(vulns, _agnosai_audit_vuln_new(str_from("missing_security_headers"),
+        str_from("high"), _agnosai_audit_missing_headers_desc(header_score),
+        str_from("Add missing security headers to all responses")));
+    }
+    if (agnosai_cors_allows_all_origins(cors) == 1 && agnosai_cors_allows_credentials(cors) == 1) {
+        vec_push(vulns, _agnosai_audit_vuln_new(str_from("cors_misconfiguration"),
+        str_from("critical"), str_from("CORS allows all origins with credentials"),
+        str_from("Restrict Access-Control-Allow-Origin to specific trusted domains")));
+    }
+    if (vec_len(disclosure) > 0) {
+        vec_push(vulns, _agnosai_audit_vuln_new(str_from("information_disclosure"),
+        str_from("low"), _agnosai_audit_disclosure_desc(disclosure),
+        str_from("Remove or obfuscate server identification headers")));
+    }
+
+    # The overall score starts from the header score and is docked for the two
+    # other findings, then clamped. The oracle's trailing
+    # `(x * 100.0).round() / 100.0` is a two-decimal rounding pass on a value
+    # that is already whole, so it has no effect and is not reproduced.
+    var security_score = header_score;
+    if (agnosai_cors_misconfigured(cors) == 1) { security_score = security_score - 15; }
+    if (vec_len(disclosure) > 0) { security_score = security_score - 5; }
+    if (security_score < 0) { security_score = 0; }
+    if (security_score > 100) { security_score = 100; }
+
+    # Recommendations, in the oracle's order — also wire-visible.
+    var recs = vec_new();
+    if (header_score < 100) {
+        vec_push(recs, str_from(
+        "Add all recommended security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options)"));
+    }
+    if (agnosai_cors_misconfigured(cors) == 1) {
+        vec_push(recs, str_from("Fix CORS configuration: restrict allowed origins"));
+    }
+    if (vec_len(disclosure) > 0) {
+        vec_push(recs, str_from("Remove server version headers to reduce attack surface"));
+    }
+    if (str_starts_with(url, str_from("https://")) == 0) {
+        vec_push(recs, str_from("Enforce HTTPS for all endpoints"));
+    }
+
+    var r = alloc(AGN_AUD_SIZE);
+    store64(r + AGN_AUD_TARGET_URL, url);
+    store64(r + AGN_AUD_SECURITY_SCORE, security_score);
+    store64(r + AGN_AUD_RISK_LEVEL, _agnosai_audit_risk_level(security_score));
+    store64(r + AGN_AUD_HDR_PRESENT, present);
+    store64(r + AGN_AUD_HDR_MISSING, missing);
+    store64(r + AGN_AUD_HDR_SCORE, header_score);
+    store64(r + AGN_AUD_CORS, cors);
+    store64(r + AGN_AUD_DISCLOSURE, disclosure);
+    store64(r + AGN_AUD_VULNS, vulns);
+    store64(r + AGN_AUD_RECOMMENDATIONS, recs);
+    return r;
+}
+
+# The audited URL.
+fn agnosai_audit_target_url(r): i64 {
+    return load64(r + AGN_AUD_TARGET_URL);
+}
+
+# The overall score, 0-100, as a whole percent.
+fn agnosai_audit_security_score(r): i64 {
+    return load64(r + AGN_AUD_SECURITY_SCORE);
+}
+
+# The risk band the score falls in.
+fn agnosai_audit_risk_level(r): i64 {
+    return load64(r + AGN_AUD_RISK_LEVEL);
+}
+
+# The security headers that were present, as a vec of Str.
+fn agnosai_audit_headers_present(r): i64 {
+    return load64(r + AGN_AUD_HDR_PRESENT);
+}
+
+# The security headers that were absent, as a vec of MissingHeader.
+fn agnosai_audit_headers_missing(r): i64 {
+    return load64(r + AGN_AUD_HDR_MISSING);
+}
+
+# The header sub-score, 0-100, before the CORS and disclosure deductions.
+fn agnosai_audit_header_score(r): i64 {
+    return load64(r + AGN_AUD_HDR_SCORE);
+}
+
+# The CORS analysis.
+fn agnosai_audit_cors(r): i64 {
+    return load64(r + AGN_AUD_CORS);
+}
+
+# The information-disclosure lines, as a vec of Str.
+fn agnosai_audit_disclosure(r): i64 {
+    return load64(r + AGN_AUD_DISCLOSURE);
+}
+
+# The vulnerabilities found, as a vec of Vulnerability.
+fn agnosai_audit_vulnerabilities(r): i64 {
+    return load64(r + AGN_AUD_VULNS);
+}
+
+# The recommendations, as a vec of Str.
+fn agnosai_audit_recommendations(r): i64 {
+    return load64(r + AGN_AUD_RECOMMENDATIONS);
+}
+
+# Serialize the result, matching the oracle's serde output field for field.
+#
+# The scores are the only conversion: they are carried as whole percents and
+# emitted as floats, which is what `f64` fields serialized to. bayan's Grisu2
+# renders 57 as `57.0`, the same shortest round-tripping form serde emits.
+fn agnosai_audit_result_to_value(r): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("target_url"),
+    bayan_json_v_str_new(load64(r + AGN_AUD_TARGET_URL)));
+    bayan_json_v_obj_set(obj, str_from("security_score"),
+    bayan_json_v_float_new(f64_from(load64(r + AGN_AUD_SECURITY_SCORE))));
+    bayan_json_v_obj_set(obj, str_from("risk_level"),
+    bayan_json_v_str_new(load64(r + AGN_AUD_RISK_LEVEL)));
+
+    var ha = bayan_json_v_obj_new();
+    var present = load64(r + AGN_AUD_HDR_PRESENT);
+    var present_v = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(present); i = i + 1) {
+        bayan_json_v_arr_push(present_v, bayan_json_v_str_new(vec_get(present, i)));
+    }
+    bayan_json_v_obj_set(ha, str_from("present"), present_v);
+
+    var missing = load64(r + AGN_AUD_HDR_MISSING);
+    var missing_v = bayan_json_v_arr_new();
+    for (var m = 0; m < vec_len(missing); m = m + 1) {
+        var entry = vec_get(missing, m);
+        var mo = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(mo, str_from("header"),
+        bayan_json_v_str_new(agnosai_missing_header_name(entry)));
+        bayan_json_v_obj_set(mo, str_from("severity"),
+        bayan_json_v_str_new(agnosai_missing_header_severity(entry)));
+        bayan_json_v_arr_push(missing_v, mo);
+    }
+    bayan_json_v_obj_set(ha, str_from("missing"), missing_v);
+    bayan_json_v_obj_set(ha, str_from("score"),
+    bayan_json_v_float_new(f64_from(load64(r + AGN_AUD_HDR_SCORE))));
+    bayan_json_v_obj_set(obj, str_from("header_analysis"), ha);
+
+    var cors = load64(r + AGN_AUD_CORS);
+    var co = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(co, str_from("misconfigured"),
+    bayan_json_v_bool_new(agnosai_cors_misconfigured(cors)));
+    bayan_json_v_obj_set(co, str_from("allows_all_origins"),
+    bayan_json_v_bool_new(agnosai_cors_allows_all_origins(cors)));
+    bayan_json_v_obj_set(co, str_from("allows_credentials"),
+    bayan_json_v_bool_new(agnosai_cors_allows_credentials(cors)));
+    bayan_json_v_obj_set(co, str_from("detail"),
+    bayan_json_v_str_new(agnosai_cors_detail(cors)));
+    bayan_json_v_obj_set(obj, str_from("cors_analysis"), co);
+
+    var disclosure = load64(r + AGN_AUD_DISCLOSURE);
+    var disc_v = bayan_json_v_arr_new();
+    for (var d = 0; d < vec_len(disclosure); d = d + 1) {
+        bayan_json_v_arr_push(disc_v, bayan_json_v_str_new(vec_get(disclosure, d)));
+    }
+    bayan_json_v_obj_set(obj, str_from("information_disclosure"), disc_v);
+
+    var vulns = load64(r + AGN_AUD_VULNS);
+    var vulns_v = bayan_json_v_arr_new();
+    for (var v = 0; v < vec_len(vulns); v = v + 1) {
+        var vuln = vec_get(vulns, v);
+        var vo = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(vo, str_from("type"), bayan_json_v_str_new(agnosai_vuln_kind(vuln)));
+        bayan_json_v_obj_set(vo, str_from("severity"),
+        bayan_json_v_str_new(agnosai_vuln_severity(vuln)));
+        bayan_json_v_obj_set(vo, str_from("description"),
+        bayan_json_v_str_new(agnosai_vuln_description(vuln)));
+        bayan_json_v_obj_set(vo, str_from("remediation"),
+        bayan_json_v_str_new(agnosai_vuln_remediation(vuln)));
+        bayan_json_v_arr_push(vulns_v, vo);
+    }
+    bayan_json_v_obj_set(obj, str_from("vulnerabilities"), vulns_v);
+
+    var recs = load64(r + AGN_AUD_RECOMMENDATIONS);
+    var recs_v = bayan_json_v_arr_new();
+    for (var c = 0; c < vec_len(recs); c = c + 1) {
+        bayan_json_v_arr_push(recs_v, bayan_json_v_str_new(vec_get(recs, c)));
+    }
+    bayan_json_v_obj_set(obj, str_from("recommendations"), recs_v);
+    return obj;
+}
+
+# Request options matching the oracle's reqwest client: a 15s total budget and
+# certificate validation left on.
+#
+# `danger_accept_invalid_certs(false)` is reqwest's default and
+# `SANDHI_TLS_POLICY_DEFAULT` is sandhi's, so this is a no-op either way — it is
+# set explicitly because "we validate certificates" is the kind of property that
+# should be stated in the code rather than inherited from a default that could
+# change underneath us.
+fn _agnosai_audit_options(): i64 {
+    var opts = sandhi_http_options_new();
+    if (opts == 0) { return 0; }
+    sandhi_http_options_total_ms(opts, AGNOSAI_AUDIT_TIMEOUT_MS);
+    sandhi_http_options_max_response_bytes(opts, AGNOSAI_AUDIT_MAX_BYTES);
+    sandhi_http_options_tls_policy(opts, SANDHI_TLS_POLICY_DEFAULT);
+    return opts;
+}
+
+# Length of the URL's scheme prefix — 7 for `http://`, 8 for `https://`, 0 for
+# anything else — compared **case-insensitively**.
+#
+# It has to be case-insensitive because `sandhi_url_parse` is (via
+# `_sandhi_url_sceq`), and therefore so is `agnosai_is_safe_url`. A byte-exact
+# test here against a guard that accepts `HTTPS://` is a hole, not a nicety:
+# it would skip the downgrade refusal below, and slice the origin one byte short
+# so that a relative `Location` resolved against `HTTPS://example.com/` produced
+# a URL pointing at an entirely different host.
+#
+# Deliberately NOT used by the `starts_with("https://")` test in
+# `agnosai_audit_analyze` — the oracle's own HTTPS recommendation is byte-exact
+# (`!target_url.starts_with("https://")`), so an upper-case scheme is told to
+# enforce HTTPS there. That is the oracle's behaviour and parity wins over
+# tidiness on a cosmetic recommendation. Here it is a security control.
+fn _agnosai_audit_scheme_len(url: Str): i64 {
+    if (str_len(url) < 7) { return 0; }
+    var d = str_data(url);
+    if (_agnosai_audit_cstr_ieq_n(d, "https://", 8) == 1) { return 8; }
+    if (_agnosai_audit_cstr_ieq_n(d, "http://", 7) == 1) { return 7; }
+    return 0;
+}
+
+# Whether the URL's scheme is https, case-insensitively.
+fn _agnosai_audit_is_https(url: Str): i64 {
+    if (_agnosai_audit_scheme_len(url) == 8) { return 1; }
+    return 0;
+}
+
+# The redirect statuses, per RFC 9110. Same set sandhi's own follower uses.
+fn _agnosai_audit_is_redirect(status): i64 {
+    if (status == 301) { return 1; }
+    if (status == 302) { return 1; }
+    if (status == 303) { return 1; }
+    if (status == 307) { return 1; }
+    if (status == 308) { return 1; }
+    return 0;
+}
+
+# Resolve a `Location` value against the URL it came from, returning an absolute
+# URL or 0 when it cannot be resolved with confidence.
+#
+# This handles the two forms that matter — an absolute URL, and an absolute path
+# resolved against the base's authority — and **fails closed on everything
+# else**. A relative reference like `../admin` needs real RFC 3986 path merging,
+# and for a security tool "report what we already have" is a much better answer
+# than "guess where that pointed and send a request there".
+#
+# The result is built through a str_builder, so it is a fresh copy rather than a
+# borrow of the response arena.
+fn _agnosai_audit_resolve_location(base: Str, location): i64 {
+    var loc = str_from(location);
+    if (str_len(loc) == 0) { return 0; }
+    if (_agnosai_audit_scheme_len(loc) > 0) { return str_clone(loc); }
+
+    # Anything that is not an absolute path is refused rather than guessed at.
+    if (str_starts_with(loc, str_from("/")) == 0) { return 0; }
+    # A protocol-relative "//host/path" carries its own authority, so it is not
+    # the same-origin case this branch handles.
+    if (str_starts_with(loc, str_from("//")) == 1) { return 0; }
+
+    # The base's origin is its prefix up to the first '/', '?' or '#' after the
+    # scheme separator. Taken as raw bytes rather than through
+    # `sandhi_url_parse`, deliberately: that struct stores the scheme as an
+    # integer code rather than text, and defaults an absent port to 80 or 443
+    # rather than leaving it unset — so reassembling from it would both need a
+    # code-to-text mapping and would rewrite `https://example.com/` into
+    # `https://example.com:443/`. Slicing the original keeps the authority
+    # byte-for-byte as the caller wrote it.
+    var p = _agnosai_audit_scheme_len(base);
+    if (p == 0) { return 0; }
+    var data = str_data(base);
+    var n = str_len(base);
+    var origin_end = n;
+    for (var i = p; i < n; i = i + 1) {
+        var c = load8(data + i);
+        if (c == 47 || c == 63 || c == 35) { origin_end = i; break; }
+    }
+
+    var sb = str_builder_new();
+    for (var b = 0; b < origin_end; b = b + 1) { str_builder_add_byte(sb, load8(data + b)); }
+    str_builder_add(sb, loc);
+    return str_builder_build(sb);
+}
+
+# Issue a request, following redirects and **re-running the SSRF guard on every
+# hop**.
+#
+# This is the one place the port deliberately does not do what the oracle does,
+# and it diverges in both directions at once — see docs/adr/007.
+#
+# reqwest follows up to 10 redirects by default, so the oracle follows them; but
+# it validates only the URL the caller supplied. A target that passes
+# `is_safe_url` and then answers `302 Location: http://169.254.169.254/` walks
+# the oracle straight into the cloud metadata service and reports its headers
+# back to the caller. That is the textbook SSRF-via-redirect bypass, and it is a
+# hole in a tool whose entire job is to find holes.
+#
+# sandhi's default is the opposite — `sandhi_http_options_new` leaves following
+# off — and simply inheriting that would be no better, just differently wrong:
+# auditing `http://example.com` when it redirects to HTTPS would score the
+# redirect's own (header-free) response and report a well-configured site as
+# 0/7, critical risk.
+#
+# So the hops are followed, and the guard runs against each one before the
+# request is made. An https -> http downgrade is refused for the same reason
+# sandhi refuses it: the audit must not be talked down onto a cleartext channel.
+#
+# The 15s budget spans the **whole chain**, not each hop. reqwest's
+# `Client::timeout` is one deadline covering a request and every redirect it
+# follows, so giving each hop a fresh 15s would let an 11-hop chain run for 165
+# seconds against the oracle's 15 — and the audit makes two such chains.
+# `total_ms` is rewritten from the remaining budget before every request.
+#
+# `headers` must be owned outside the arena: it is reused across hops, and the
+# arena is reset between them.
+#
+# Returns the final response, 0 if a request failed or the budget ran out, or
+# AGNOSAI_AUDIT_REDIRECT_BLOCKED if a hop was refused.
+fn _agnosai_audit_fetch(arena, method, url: Str, headers, opts): i64 {
+    var current = url;
+    var verb = method;
+    var hops = 0;
+    var deadline = clock_now_ns() + AGNOSAI_AUDIT_TIMEOUT_MS * AGNOSAI_NS_PER_MS;
+
+    while (hops <= AGNOSAI_AUDIT_MAX_HOPS) {
+        var left_ms = (deadline - clock_now_ns()) / AGNOSAI_NS_PER_MS;
+        if (left_ms <= 0) { return 0; }
+        sandhi_http_options_total_ms(opts, left_ms);
+
+        var r = sandhi_http_request_auto_a(arena, verb, str_cstr(current), headers, 0, 0, opts);
+        if (r == 0 || sandhi_http_err_kind(r) != SANDHI_OK) { return 0; }
+        if (_agnosai_audit_is_redirect(sandhi_http_status(r)) == 0) { return r; }
+
+        var loc = sandhi_headers_get(sandhi_http_headers(r), "Location");
+        if (loc == 0) { return r; }
+        var next = _agnosai_audit_resolve_location(current, loc);
+        if (next == 0) { return r; }
+
+        # Refuse to be downgraded off TLS mid-audit.
+        if (_agnosai_audit_is_https(current) == 1 && _agnosai_audit_is_https(next) == 0) {
+            return AGNOSAI_AUDIT_REDIRECT_BLOCKED;
+        }
+        # The guard, on every hop. This is the check the oracle never makes.
+        if (agnosai_is_safe_url(next) == 0) { return AGNOSAI_AUDIT_REDIRECT_BLOCKED; }
+
+        # A 303 turns the next request into a GET, per RFC 9110. Only reachable
+        # on the CORS probe here, since the header fetch is already a GET.
+        if (sandhi_http_status(r) == 303) { verb = "GET"; }
+
+        # This hop's response is finished with — `next` is a fresh copy outside
+        # the arena, and nothing else here points into it. Releasing now is what
+        # keeps the arena sized for one exchange instead of for a whole chain.
+        reset_via(arena);
+        current = next;
+        hops = hops + 1;
+    }
+    return 0;
+}
+
+# Copy the handful of headers the audit actually reads into caller-owned
+# storage, so the response arena can be released.
+#
+# `sandhi_headers_add` duplicates both name and value through the default
+# allocator, so the returned set survives `reset_via`. Only the eleven headers
+# in the two oracle tables plus the two CORS headers are copied — the audit
+# never looks at anything else, and copying a whole response's header table to
+# keep thirteen of them would defeat the point.
+fn _agnosai_audit_snapshot(src): i64 {
+    var out = sandhi_headers_new();
+    if (src == 0) { return out; }
+    for (var i = 0; i < AGNOSAI_AUDIT_SEC_HEADER_COUNT; i = i + 1) {
+        var sname = _agnosai_audit_sec_header(i);
+        var sval = sandhi_headers_get(src, sname);
+        if (sval != 0) { sandhi_headers_add(out, sname, sval); }
+    }
+    for (var d = 0; d < AGNOSAI_AUDIT_DISCLOSURE_COUNT; d = d + 1) {
+        var dname = _agnosai_audit_disclosure_header(d);
+        var dval = sandhi_headers_get(src, dname);
+        if (dval != 0) { sandhi_headers_add(out, dname, dval); }
+    }
+    var acao = sandhi_headers_get(src, "access-control-allow-origin");
+    if (acao != 0) { sandhi_headers_add(out, "access-control-allow-origin", acao); }
+    var acac = sandhi_headers_get(src, "access-control-allow-credentials");
+    if (acac != 0) { sandhi_headers_add(out, "access-control-allow-credentials", acac); }
+    return out;
+}
+
+# Run the audit against a live URL: one GET for headers, one OPTIONS for CORS.
+#
+# Returns 0 if the GET fails, which is the oracle's `Err` arm — an audit with no
+# response to analyse is not a zero score, it is no result. A failing OPTIONS is
+# different and is handled inside `agnosai_analyze_cors`: preflight is optional,
+# so its absence is reported, not scored.
+#
+# Both responses are allocated in a scratch arena that is released before
+# returning. `agnosai_audit_analyze` copies everything it keeps, so nothing in
+# the result points into the freed region.
+fn agnosai_run_security_audit(url: Str): i64 {
+    var arena = arena_allocator(AGNOSAI_AUDIT_ARENA_BYTES);
+    if (arena == 0) { return 0; }
+    var opts = _agnosai_audit_options();
+    if (opts == 0) {
+        reset_via(arena);
+        return 0;
+    }
+
+    # The header fetch. Its headers are snapshotted out and the arena released
+    # before the CORS probe starts, so the two chains never share the arena.
+    var get_resp = _agnosai_audit_fetch(arena, "GET", url, sandhi_headers_new(), opts);
+    if (get_resp == AGNOSAI_AUDIT_REDIRECT_BLOCKED) {
+        reset_via(arena);
+        return AGNOSAI_AUDIT_REDIRECT_BLOCKED;
+    }
+    if (get_resp == 0) {
+        reset_via(arena);
+        return 0;
+    }
+    var get_headers = _agnosai_audit_snapshot(sandhi_http_headers(get_resp));
+    reset_via(arena);
+
+    # The CORS probe. A server that reflects this Origin back is treated exactly
+    # as if it had sent a wildcard.
+    #
+    # A failed or refused preflight is not an audit failure — CORS is optional,
+    # so its absence is reported by `agnosai_analyze_cors` rather than scored.
+    # That includes a blocked redirect: the GET already passed the guard, so a
+    # probe that wanders somewhere it should not is dropped, not escalated.
+    var cors_headers = 0;
+    var probe = sandhi_headers_new();
+    sandhi_headers_add(probe, "Origin", AGNOSAI_AUDIT_PROBE_ORIGIN);
+    var cors_resp = _agnosai_audit_fetch(arena, "OPTIONS", url, probe, opts);
+    if (cors_resp != 0 && cors_resp != AGNOSAI_AUDIT_REDIRECT_BLOCKED) {
+        cors_headers = _agnosai_audit_snapshot(sandhi_http_headers(cors_resp));
+    }
+    reset_via(arena);
+
+    return agnosai_audit_analyze(url, get_headers, cors_headers);
+}
+
+# Trace the start of an audit. The oracle has no tracing here — this follows
+# the house rule that every operation leaves an audit trail, and an outbound
+# request to a user-supplied URL is exactly the kind of operation that should.
+fn _agnosai_audit_log(msg, msg_len, url: Str): i64 {
+    if (sakshi_get_level() < SK_INFO) { return 0; }
+    sakshi_log_kv(SK_INFO, msg, msg_len, "audit", 5, str_data(url), str_len(url));
+    return 0;
+}
+
+# Trace a completed audit with its score and risk band.
+fn _agnosai_audit_log_done(url: Str, score, risk: Str): i64 {
+    if (sakshi_get_level() < SK_INFO) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, url);
+    str_builder_add_cstr(sb, " score=");
+    str_builder_add_int(sb, score);
+    str_builder_add_cstr(sb, " risk=");
+    str_builder_add(sb, risk);
+    var line = str_builder_build(sb);
+    sakshi_log_kv(SK_INFO, "security audit completed", 24, "audit", 5, str_data(line),
+    str_len(line));
+    return 0;
+}
+
+# The security_audit tool's parameter schema.
+fn _agnosai_security_audit_schema(ctx): i64 {
+    var s = agnosai_tool_schema_new(str_from("security_audit"),
+    _agnosai_audit_description());
+    agnosai_tool_schema_param(s, str_from("target_url"), str_from("URL to audit"),
+    str_from("string"), 1);
+    agnosai_tool_schema_param(s, str_from("scan_profile"),
+    str_from("Scan depth: quick, standard, or deep (default: standard)"), str_from("string"), 0);
+    return s;
+}
+
+# Execute an audit from tool input.
+#
+# `scan_profile` is accepted and ignored, which is what the oracle does — it
+# binds the parameter to `_profile`. The schema advertises it, so dropping it
+# would change the tool's declared surface; honouring it would invent behaviour
+# the oracle does not have.
+fn _agnosai_security_audit_execute(ctx, input): i64 {
+    var target = agnosai_tool_input_get_str(input, str_from("target_url"));
+    if (target == 0) {
+        return agnosai_tool_output_err(str_from("missing required parameter: target_url"));
+    }
+    if (agnosai_is_safe_url(target) == 0) {
+        return agnosai_tool_output_err(
+        str_from("target_url rejected: cannot target private/internal networks"));
+    }
+
+    _agnosai_audit_log("security audit starting", 23, target);
+
+    var result = agnosai_run_security_audit(target);
+    if (result == AGNOSAI_AUDIT_REDIRECT_BLOCKED) {
+        _agnosai_audit_log("security audit redirect refused", 31, target);
+        return agnosai_tool_output_err(
+        str_from("security audit failed: target redirected to a private/internal address"));
+    }
+    if (result == 0) {
+        return agnosai_tool_output_err(str_from("security audit failed: request failed"));
+    }
+
+    _agnosai_audit_log_done(target, agnosai_audit_security_score(result),
+    agnosai_audit_risk_level(result));
+
+    return agnosai_tool_output_ok(agnosai_audit_result_to_value(result));
+}
+
+# The security_audit tool.
+fn agnosai_security_audit_tool(): i64 {
+    return agnosai_tool_new(str_from("security_audit"), _agnosai_audit_description(),
+    &_agnosai_security_audit_schema, &_agnosai_security_audit_execute, 0);
+}
+
+# Register the security_audit built-in. Returns the registry.
+fn agnosai_register_security_audit_builtin(registry): i64 {
+    agnosai_tool_registry_register(registry, agnosai_security_audit_tool());
+    return registry;
+}

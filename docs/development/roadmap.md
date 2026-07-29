@@ -124,8 +124,15 @@ thread), remote_registry, builtin/*. Defers python_tool/wasm_tool.
   server on loopback, which `is_safe_url` rightly refuses — so the port tests the
   real thread fan-out against a synthetic executor instead, and the network seam
   is covered separately by `scripts/stack.sh check`.
-- ⬜ **remaining builtins** (security_audit 519, synapse 386, mneme 442,
-  delta 471) and **remote_registry** (119). remote_registry's payload path
+- ✅ **security_audit** — 200 assertions. Split at the network boundary like
+  load_testing, which here lets all five of the oracle's mock-server tests port
+  exactly rather than being replaced. Four inherited-default corrections and one
+  deliberate security divergence, all in
+  [ADR 007](../adr/007-audit-redirect-revalidation.md): the SSRF guard now
+  re-runs on **every redirect hop**, where the oracle validates only the URL the
+  caller supplied and then lets reqwest follow up to 10 hops unchecked.
+- ⬜ **remaining builtins** (synapse 386, mneme 442, delta 471) and
+  **remote_registry** (119). remote_registry's payload path
   (`.agpkg` ZIP + raw WASM) defers with those formats, so it can only deliver a
   guarded fetch.
 
