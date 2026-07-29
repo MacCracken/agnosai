@@ -1,0 +1,268 @@
+# =========================================================================
+# orch_pubsub.tcyr — parity tests for src/orch_pubsub.cyr and the blocker #4
+# primitive in src/chan_lossy.cyr.
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/orchestrator/pubsub.rs.
+#
+# Its 13 wildcard tests port verbatim. Its 6 integration tests are
+# `#[tokio::test]`s over `broadcast::Receiver`; the receiver here is a plain
+# channel, so they port with `chan_try_recv` in place of `rx.try_recv()` and
+# without an await. The one that cannot port as written is the lag test — tokio
+# reports `RecvError::Lagged(n)` and a Cyrius channel has no such signal — so
+# the eviction is asserted directly against `agnosai_chan_push_lossy` instead,
+# which is where the behaviour actually lives.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/chan_lossy.cyr"
+include "src/orch_pubsub.cyr"
+include "tests/test_helpers.cyr"
+
+# Assert a pattern matches a topic.
+fn _t_match(pattern, topic, name): i64 {
+    return assert_eq(agnosai_matches_pattern(str_from(pattern), str_from(topic)), 1, name);
+}
+
+# Assert a pattern does not match a topic.
+fn _t_nomatch(pattern, topic, name): i64 {
+    return assert_eq(agnosai_matches_pattern(str_from(pattern), str_from(topic)), 0, name);
+}
+
+# The topic of the next message on a channel, or 0 when empty.
+fn _t_next_topic(ch): i64 {
+    var m = chan_try_recv(ch);
+    if (m == 0) { return 0; }
+    return agnosai_topic_message_topic(m);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_pubsub");
+
+    assert_eq(AGNOSAI_PUBSUB_CHANNEL_CAPACITY, 256, "the channel capacity is the oracle's 256");
+    assert_eq(AGNOSAI_PUBSUB_MAX_PATTERNS, 10000, "the pattern cap is the oracle's 10,000");
+    assert_eq(AGNOSAI_PUBSUB_MAX_MATCH_DEPTH, 32, "the recursion bound is the oracle's 32");
+
+    # =====================================================================
+    # wildcard matching — the oracle's 13 tests
+    # =====================================================================
+
+    # --- exact_match / exact_no_match ---
+    _t_match("task.completed", "task.completed", "an exact pattern matches");
+    _t_nomatch("task.completed", "task.failed", "and does not match a different topic");
+
+    # --- star_matches_one_segment ---
+    _t_match("task.*", "task.completed", "* matches one segment");
+    _t_match("task.*", "task.failed", "* matches any one segment");
+
+    # --- star_does_not_match_zero_segments ---
+    _t_nomatch("task.*", "task", "* does not match zero segments");
+
+    # --- star_does_not_match_multiple_segments ---
+    _t_nomatch("task.*", "task.sub.completed", "* does not match two segments");
+
+    # --- star_in_middle ---
+    _t_match("task.*.done", "task.build.done", "* in the middle matches one segment");
+    _t_nomatch("task.*.done", "task.build.not_done", "the literal tail must still match");
+    _t_nomatch("task.*.done", "task.a.b.done", "* in the middle is still exactly one");
+
+    # --- hash_matches_zero_segments ---
+    _t_match("agent.#", "agent", "# matches zero segments");
+
+    # --- hash_matches_one_segment ---
+    _t_match("agent.#", "agent.status", "# matches one segment");
+
+    # --- hash_matches_multiple_segments ---
+    _t_match("agent.#", "agent.status.changed", "# matches two segments");
+    _t_match("agent.#", "agent.a.b.c.d", "# matches four segments");
+
+    # --- hash_alone_matches_everything ---
+    _t_match("#", "anything", "a bare # matches a single segment");
+    _t_match("#", "a.b.c", "a bare # matches several");
+    _t_match("#", "", "a bare # matches the empty topic");
+
+    # --- hash_in_middle ---
+    _t_match("task.#.done", "task.done", "# in the middle matches zero segments");
+    _t_match("task.#.done", "task.build.done", "# in the middle matches one");
+    _t_match("task.#.done", "task.a.b.done", "# in the middle matches two");
+    _t_nomatch("task.#.done", "task.a.b.failed", "but the literal tail must still match");
+
+    # --- mixed_wildcards ---
+    _t_match("*.#.done", "task.a.b.done", "* then # then a literal");
+    _t_match("*.status.#", "agent.status", "trailing # matches zero after a literal");
+    _t_match("*.status.#", "agent.status.changed", "and one");
+
+    # --- no_match_different_prefix ---
+    _t_nomatch("task.*", "agent.completed", "a different first segment does not match");
+
+    # --- no_match_shorter_topic ---
+    _t_nomatch("task.sub.*", "task", "a topic shorter than the pattern does not match");
+
+    # --- beyond the oracle: the arms its tests leave uncovered ---
+    _t_match("", "", "an empty pattern matches an empty topic");
+    _t_nomatch("", "a", "an empty pattern does not match a non-empty topic");
+    _t_nomatch("a.b", "a", "a pattern longer than the topic fails unless the rest is #");
+    _t_match("a.#.#", "a", "trailing #s all match zero segments");
+    _t_match("a.#", "a.", "an empty trailing segment is still a segment");
+    _t_match("a.*", "a.", "a trailing dot yields an empty segment, and * matches it");
+    _t_match("*", "x", "a bare * matches exactly one segment");
+    _t_nomatch("*", "x.y", "and not two");
+    _t_match("*", "", "an empty topic is ONE empty segment, as Rust's split yields, so * matches");
+
+    # --- the depth bound returns "no match" rather than erroring ---
+    # 40 segments of `#` against 40 topic segments drives the recursion past 32.
+    var deep_pat = str_builder_new();
+    var deep_topic = str_builder_new();
+    for (var d = 0; d < 40; d = d + 1) {
+        if (d > 0) {
+            str_builder_add_cstr(deep_pat, ".");
+            str_builder_add_cstr(deep_topic, ".");
+        }
+        str_builder_add_cstr(deep_pat, "*");
+        str_builder_add_cstr(deep_topic, "s");
+    }
+    assert_eq(agnosai_matches_pattern(str_builder_build(deep_pat), str_builder_build(deep_topic)), 0,
+    "a pattern deeper than the recursion bound fails closed rather than overflowing");
+
+    # =====================================================================
+    # the blocker #4 primitive
+    # =====================================================================
+
+    var ch = chan_new(2);
+    assert_eq(agnosai_chan_push_lossy(ch, 11), 0, "a push into a free ring succeeds");
+    assert_eq(agnosai_chan_push_lossy(ch, 22), 0, "and fills it");
+    assert_eq(agnosai_chan_push_lossy(ch, 33), 0,
+    "a push into a FULL ring still succeeds — it never reports full, which is the contract");
+    assert_eq(chan_try_recv(ch), 22, "the OLDEST entry was evicted, not the newest");
+    assert_eq(chan_try_recv(ch), 33, "and the newest is present");
+    assert_eq(chan_try_recv(ch), 0, "leaving the ring empty");
+
+    # a blocking chan_send here would have wedged; try_send would have refused
+    var full = chan_new(1);
+    chan_try_send(full, 1);
+    assert_eq(chan_try_send(full, 2), 0 - 2, "chan_try_send reports -2 on a full ring");
+    assert_eq(agnosai_chan_push_lossy(full, 2), 0, "where the lossy push makes room instead");
+    assert_eq(chan_try_recv(full), 2, "and the survivor is the newer value");
+
+    var closed = chan_new(2);
+    chan_close(closed);
+    assert_eq(agnosai_chan_push_lossy(closed, 1), AGNOSAI_CHAN_CLOSED,
+    "a closed channel is reported, since that is not a capacity problem");
+
+    # =====================================================================
+    # the hub
+    # =====================================================================
+
+    var ps = agnosai_pubsub_new();
+    assert_eq(agnosai_pubsub_pattern_count(ps), 0, "a new hub has no patterns");
+
+    # --- publish reaches a matching subscriber ---
+    var rx = agnosai_pubsub_subscribe(ps, str_from("task.*"));
+    assert(rx != 0, "subscribing yields a channel");
+    assert_eq(agnosai_pubsub_pattern_count(ps), 1, "and registers the pattern");
+
+    var payload = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(payload, str_from("id"), bayan_json_v_int_new(1));
+    agnosai_pubsub_publish(ps, str_from("task.completed"), payload);
+
+    var msg = chan_try_recv(rx);
+    assert(msg != 0, "the subscriber received the message");
+    assert(str_eq(agnosai_topic_message_topic(msg), str_from("task.completed")) == 1,
+    "carrying the CONCRETE topic, not the pattern");
+    assert_eq(agnosai_topic_message_payload(msg), payload, "and the payload unchanged");
+    assert(agnosai_topic_message_timestamp(msg) > 0, "with a publish timestamp");
+
+    # --- a non-matching topic is not delivered ---
+    agnosai_pubsub_publish(ps, str_from("agent.status.changed"), payload);
+    assert_eq(chan_try_recv(rx), 0, "a topic the pattern does not match is not delivered");
+
+    # --- two subscribers on the SAME pattern both receive ---
+    # The oracle shares one broadcast channel; this port gives each subscriber
+    # its own, and the observable contract is what is asserted.
+    var a = agnosai_pubsub_subscribe(ps, str_from("task.done"));
+    var b = agnosai_pubsub_subscribe(ps, str_from("task.done"));
+    assert(a != b, "two subscribers get distinct channels");
+    assert_eq(agnosai_pubsub_pattern_count(ps), 2,
+    "but only one pattern — the cap counts patterns, not subscribers");
+    agnosai_pubsub_publish(ps, str_from("task.done"), payload);
+    assert(str_eq(_t_next_topic(a), str_from("task.done")) == 1, "the first subscriber received");
+    assert(str_eq(_t_next_topic(b), str_from("task.done")) == 1, "and so did the second");
+
+    # --- one publish reaches every matching pattern ---
+    var wide = agnosai_pubsub_subscribe(ps, str_from("#"));
+    agnosai_pubsub_publish(ps, str_from("task.done"), payload);
+    assert(str_eq(_t_next_topic(wide), str_from("task.done")) == 1, "# received it");
+    assert(str_eq(_t_next_topic(a), str_from("task.done")) == 1, "and so did the exact pattern");
+
+    # --- the message is shared, not copied, across subscribers ---
+    # Drain both first: `b` is still holding the message from the fan-out above,
+    # and comparing a fresh delivery against a stale one would pass or fail for
+    # the wrong reason.
+    while (chan_try_recv(a) != 0) { }
+    while (chan_try_recv(b) != 0) { }
+    agnosai_pubsub_publish(ps, str_from("task.done"), payload);
+    var ma = chan_try_recv(a);
+    var mb = chan_try_recv(b);
+    assert(ma != 0, "both subscribers received the fresh message");
+    assert_eq(ma, mb, "every subscriber gets the same message object — no per-subscriber clone");
+
+    # --- unsubscribe_all closes the channels and drops the pattern ---
+    agnosai_pubsub_unsubscribe_all(ps, str_from("task.done"));
+    assert_eq(agnosai_pubsub_pattern_count(ps), 2, "the pattern is gone");
+    assert_eq(agnosai_chan_push_lossy(a, 1), AGNOSAI_CHAN_CLOSED,
+    "and its subscribers' channels are closed, so a parked reader is released");
+
+    agnosai_pubsub_publish(ps, str_from("task.done"), payload);
+    assert(str_eq(_t_next_topic(wide), str_from("task.done")) == 1,
+    "an unrelated pattern still receives after another is dropped");
+
+    # unsubscribing a pattern nobody holds is a no-op, not a crash
+    agnosai_pubsub_unsubscribe_all(ps, str_from("never.subscribed"));
+    assert_eq(agnosai_pubsub_pattern_count(ps), 2, "removing an absent pattern changes nothing");
+
+    # --- resubscribing to an existing pattern reuses it ---
+    # A fresh hub: `rx` above is subscribed to `task.*`, which has been matching
+    # every `task.done` publish in this suite, so it carries a backlog.
+    var ps2 = agnosai_pubsub_new();
+    var first_sub = agnosai_pubsub_subscribe(ps2, str_from("task.*"));
+    var again = agnosai_pubsub_subscribe(ps2, str_from("task.*"));
+    assert(again != 0, "resubscribing succeeds");
+    assert(again != first_sub, "with a fresh channel");
+    assert_eq(agnosai_pubsub_pattern_count(ps2), 1, "and no new pattern");
+    agnosai_pubsub_publish(ps2, str_from("task.x"), payload);
+    assert(str_eq(_t_next_topic(first_sub), str_from("task.x")) == 1,
+    "the original subscriber receives");
+    assert(str_eq(_t_next_topic(again), str_from("task.x")) == 1, "and so does the new one");
+
+    # --- a slow subscriber loses its oldest, and the publisher does not stall ---
+    # 300 publishes into a 256-deep ring: the survivors are the last 256, so the
+    # first message read is #44 rather than #0.
+    var ps3 = agnosai_pubsub_new();
+    var slow = agnosai_pubsub_subscribe(ps3, str_from("flood"));
+    for (var i = 0; i < 300; i = i + 1) {
+        agnosai_pubsub_publish(ps3, str_from("flood"), bayan_json_v_int_new(i));
+    }
+    var first = chan_try_recv(slow);
+    assert(first != 0, "a flooded subscriber still has messages");
+    assert_eq(bayan_json_v_int(agnosai_topic_message_payload(first)), 44,
+    "and they are the NEWEST 256 — the oldest were evicted, matching tokio broadcast's lag");
+
+    # --- the message constructor directly ---
+    # Exposed so a fan-out can be driven without a publisher; the timestamp is
+    # the caller's, which is what lets a test pin it rather than race the clock.
+    var built = agnosai_topic_message_new(str_from("t.x"), payload, 12345);
+    assert(str_eq(agnosai_topic_message_topic(built), str_from("t.x")) == 1,
+    "the constructor stores the topic");
+    assert_eq(agnosai_topic_message_payload(built), payload, "and the payload by reference");
+    assert_eq(agnosai_topic_message_timestamp(built), 12345,
+    "and the timestamp verbatim rather than reading the clock");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -1,0 +1,249 @@
+# =========================================================================
+# orch_pubsub — topic-based publish/subscribe with wildcard matching.
+#
+# Parity oracle: rust-old/src/orchestrator/pubsub.rs
+#
+# Dot-separated topics with two wildcards: `*` matches exactly one segment,
+# `#` matches zero or more. So `task.*` catches `task.completed` but not
+# `task.sub.completed`, while `agent.#` catches `agent`, `agent.status` and
+# `agent.status.changed` alike.
+#
+# **Two shape changes, both forced.**
+#
+# The oracle keys `DashMap<String, broadcast::Sender<TopicMessage>>` — one
+# sender per pattern, and every `subscribe()` on that pattern returns an
+# independent receiver over the *same* channel. Cyrius channels are
+# single-consumer FIFOs: a value taken by one receiver is gone for the others.
+# So a pattern maps to a **vec of per-subscriber channels**, and `publish` hands
+# each one its own reference to the message. Observably this is the same
+# contract — every subscriber sees every matching message — and `pattern_count`
+# still counts patterns rather than subscribers, which is what the oracle's cap
+# is expressed in.
+#
+# Fan-out goes through `agnosai_chan_push_lossy`, not `chan_send`: see
+# `src/chan_lossy.cyr` for why blocking here would wedge a publisher whose
+# subscriber has stopped reading. The oracle discards its send result for the
+# same reason, and so does `agnosai_pubsub_publish`.
+#
+# The message is shared, not copied. The oracle does `msg.clone()` per
+# subscriber because `TopicMessage` owns its `String` and `Value`; here the
+# struct is immutable after construction and nothing mutates it, so one
+# allocation is handed to every matching channel.
+# =========================================================================
+
+# The oracle's `CHANNEL_CAPACITY` — per-subscription ring depth.
+var AGNOSAI_PUBSUB_CHANNEL_CAPACITY = 256;
+
+# The oracle's `MAX_SUBSCRIPTION_PATTERNS`, a memory-growth bound.
+var AGNOSAI_PUBSUB_MAX_PATTERNS = 10000;
+
+# The oracle's `MAX_MATCH_DEPTH` — a recursion bound against adversarial
+# patterns. Exceeding it returns "no match" rather than erroring, so a pattern
+# too deep to evaluate simply never fires.
+var AGNOSAI_PUBSUB_MAX_MATCH_DEPTH = 32;
+
+# TopicMessage — the oracle's struct.
+enum AgnosaiTopicMsgOff {
+    AGN_TM_TOPIC = 0;
+    AGN_TM_PAYLOAD = 8;
+    AGN_TM_TIMESTAMP = 16;
+    AGN_TM_SIZE = 24;
+}
+
+# The concrete topic a message was published to.
+fn agnosai_topic_message_topic(m): i64 {
+    return load64(m + AGN_TM_TOPIC);
+}
+
+# The message's JSON payload.
+fn agnosai_topic_message_payload(m): i64 {
+    return load64(m + AGN_TM_PAYLOAD);
+}
+
+# Publish time, as epoch nanoseconds — the port's `DateTime<Utc>` carrier.
+fn agnosai_topic_message_timestamp(m): i64 {
+    return load64(m + AGN_TM_TIMESTAMP);
+}
+
+# Build a message. Exposed because the fan-out is testable without a publisher.
+fn agnosai_topic_message_new(topic: Str, payload, timestamp): i64 {
+    var m = alloc(AGN_TM_SIZE);
+    store64(m + AGN_TM_TOPIC, topic);
+    store64(m + AGN_TM_PAYLOAD, payload);
+    store64(m + AGN_TM_TIMESTAMP, timestamp);
+    return m;
+}
+
+# Whether a pattern segment is the `#` multi-segment wildcard.
+fn _agnosai_pubsub_is_hash(seg: Str): i64 {
+    return str_eq_cstr(seg, "#");
+}
+
+# The recursive matcher, over two vecs of segments and a start index into each.
+#
+# The oracle slices (`&pattern[1..]`); slicing a Cyrius vec would copy, so the
+# indices are carried instead. The arms are the oracle's `match` in its order,
+# which matters: `#` is tested before the topic-exhausted arm, so a pattern of
+# `#` against an empty topic takes the `#` arm and returns true.
+fn _agnosai_pubsub_match_at(pat, topic, pi, ti, depth): i64 {
+    if (depth > AGNOSAI_PUBSUB_MAX_MATCH_DEPTH) { return 0; }
+
+    var pat_done = 0;
+    if (pi >= vec_len(pat)) { pat_done = 1; }
+    var topic_done = 0;
+    if (ti >= vec_len(topic)) { topic_done = 1; }
+
+    # Both exhausted — match.
+    if (pat_done == 1 && topic_done == 1) { return 1; }
+    # Pattern exhausted, topic remaining — no match.
+    if (pat_done == 1) { return 0; }
+
+    # `#` matches zero or more remaining segments.
+    if (_agnosai_pubsub_is_hash(vec_get(pat, pi)) == 1) {
+        # A trailing `#` swallows everything left, including nothing.
+        if (pi + 1 >= vec_len(pat)) { return 1; }
+        # Otherwise try consuming 0, 1, 2, ... topic segments.
+        for (var i = ti; i <= vec_len(topic); i = i + 1) {
+            if (_agnosai_pubsub_match_at(pat, topic, pi + 1, i, depth + 1) == 1) { return 1; }
+        }
+        return 0;
+    }
+
+    # Topic exhausted with pattern left — only `#` segments may remain.
+    if (topic_done == 1) {
+        for (var j = pi; j < vec_len(pat); j = j + 1) {
+            if (_agnosai_pubsub_is_hash(vec_get(pat, j)) == 0) { return 0; }
+        }
+        return 1;
+    }
+
+    # `*` matches exactly one segment.
+    if (str_eq_cstr(vec_get(pat, pi), "*") == 1) {
+        return _agnosai_pubsub_match_at(pat, topic, pi + 1, ti + 1, depth + 1);
+    }
+
+    # Literal.
+    if (str_eq(vec_get(pat, pi), vec_get(topic, ti)) == 0) { return 0; }
+    return _agnosai_pubsub_match_at(pat, topic, pi + 1, ti + 1, depth + 1);
+}
+
+# Whether a dot-separated wildcard pattern matches a concrete topic.
+#
+# The oracle splits into a 16-entry stack array when both sides are short and
+# falls back to a heap Vec otherwise. That is an allocation optimisation with no
+# observable difference, so it is not reproduced — both paths run the same
+# matcher on the same segments.
+fn agnosai_matches_pattern(pattern: Str, topic: Str): i64 {
+    return _agnosai_pubsub_match_at(str_split(pattern, 46), str_split(topic, 46), 0, 0, 0);
+}
+
+# PubSub — pattern -> vec of per-subscriber channels.
+enum AgnosaiPubSubOff {
+    AGN_PS_SUBS = 0;
+    AGN_PS_MUTEX = 8;
+    AGN_PS_SIZE = 16;
+}
+
+# Create an empty pub/sub hub.
+#
+# The oracle's `DashMap` is lock-free; here it is a hashmap behind a futex
+# mutex, the same forced substitution the tool registry made and for the same
+# reason — `run_pooled` makes every worker its own OS thread.
+fn agnosai_pubsub_new(): i64 {
+    var ps = alloc(AGN_PS_SIZE);
+    store64(ps + AGN_PS_SUBS, map_new_str());
+    store64(ps + AGN_PS_MUTEX, mutex_new());
+    return ps;
+}
+
+# The number of active subscription patterns — not subscribers.
+fn agnosai_pubsub_pattern_count(ps): i64 {
+    var mtx = load64(ps + AGN_PS_MUTEX);
+    mutex_lock(mtx);
+    var n = map_size(load64(ps + AGN_PS_SUBS));
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Subscribe to a pattern, returning a channel — or 0 when the pattern cap is
+# reached and the pattern is new.
+#
+# An existing pattern never hits the cap, matching the oracle's early return:
+# the limit bounds distinct patterns, not subscribers to one.
+fn agnosai_pubsub_subscribe(ps, pattern: Str): i64 {
+    var mtx = load64(ps + AGN_PS_MUTEX);
+    mutex_lock(mtx);
+    var subs = load64(ps + AGN_PS_SUBS);
+    var list = map_get(subs, pattern);
+
+    if (list == 0) {
+        if (map_size(subs) >= AGNOSAI_PUBSUB_MAX_PATTERNS) {
+            mutex_unlock(mtx);
+            _agnosai_pubsub_log_reject(pattern);
+            return 0;
+        }
+        list = vec_new();
+        map_set(subs, str_clone(pattern), list);
+    }
+
+    var ch = chan_new(AGNOSAI_PUBSUB_CHANNEL_CAPACITY);
+    vec_push(list, ch);
+    mutex_unlock(mtx);
+    return ch;
+}
+
+# Publish a payload to a concrete topic.
+#
+# Every subscriber whose pattern matches receives the message. Delivery failures
+# are ignored — the oracle's `let _ = ...send(...)`, which for a broadcast
+# sender means "no live receivers", and here means the channel was closed.
+fn agnosai_pubsub_publish(ps, topic: Str, payload): i64 {
+    var msg = agnosai_topic_message_new(topic, payload, clock_now_ns());
+
+    var mtx = load64(ps + AGN_PS_MUTEX);
+    mutex_lock(mtx);
+    var subs = load64(ps + AGN_PS_SUBS);
+    var keys = map_keys(subs);
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var pattern = vec_get(keys, i);
+        if (agnosai_matches_pattern(pattern, topic) == 1) {
+            var list = map_get(subs, pattern);
+            for (var j = 0; j < vec_len(list); j = j + 1) {
+                agnosai_chan_push_lossy(vec_get(list, j), msg);
+            }
+        }
+    }
+    mutex_unlock(mtx);
+    return 0;
+}
+
+# Remove every subscriber channel for a pattern.
+#
+# The oracle drops the sender, after which existing receivers see
+# `RecvError::Closed`. `chan_close` is the equivalent, so a parked reader is
+# released rather than left waiting on a channel nothing will ever fill.
+fn agnosai_pubsub_unsubscribe_all(ps, pattern: Str): i64 {
+    var mtx = load64(ps + AGN_PS_MUTEX);
+    mutex_lock(mtx);
+    var subs = load64(ps + AGN_PS_SUBS);
+    var list = map_get(subs, pattern);
+    if (list != 0) {
+        for (var i = 0; i < vec_len(list); i = i + 1) { chan_close(vec_get(list, i)); }
+        map_delete(subs, pattern);
+    }
+    mutex_unlock(mtx);
+    return 0;
+}
+
+# The oracle's `warn!` when a subscription is refused at the pattern cap.
+fn _agnosai_pubsub_log_reject(pattern: Str): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, pattern);
+    str_builder_add_cstr(sb, " limit=");
+    str_builder_add_int(sb, AGNOSAI_PUBSUB_MAX_PATTERNS);
+    var line = str_builder_build(sb);
+    sakshi_log_kv(SK_WARN, "pubsub subscription rejected: pattern limit reached", 49, "pattern", 7,
+    str_data(line), str_len(line));
+    return 0;
+}

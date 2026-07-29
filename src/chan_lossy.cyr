@@ -1,0 +1,55 @@
+# =========================================================================
+# chan_lossy — overwrite-oldest channel push.
+#
+# **This is port-plan blocker #4.** No single Rust file is the oracle; the
+# behaviour being reproduced is `tokio::sync::broadcast::Sender::send`, which
+# the oracle uses in two places that M5 needs: `orchestrator/pubsub.rs` and
+# `server/sse.rs`'s `EventBus`.
+#
+# tokio's broadcast send has three properties a blocking `chan_send` does not:
+# it **never blocks**, it **never fails for lack of room**, and when a receiver
+# has fallen behind it **drops that receiver's oldest** unread messages rather
+# than stalling the sender. A 1:1 port of `tx.send(...)` onto `chan_send`
+# converts never-block-lossy into block-forever: a crew whose event stream has
+# no live reader would wedge the thread publishing to it, which is the failure
+# the plan flagged before any of this was written.
+#
+# The oracle discards the send result at every call site (`let _ = ...send(...)`)
+# precisely because it cannot meaningfully fail. That is the contract to match.
+#
+# Built entirely from the public channel verbs. `chan_try_send` returns 0 on
+# success, -1 closed, -2 full; `chan_try_recv` returns the oldest value or 0
+# when empty. Reaching into the 56-byte `{buf, cap, head, tail, count, mutex,
+# closed}` layout to move `head` directly would be marginally cheaper and would
+# couple this module to an internal detail of two separate thread backends.
+# =========================================================================
+
+# The channel was closed — `chan_try_send`'s -1.
+var AGNOSAI_CHAN_CLOSED = 0 - 1;
+
+# Push a value, evicting the oldest entry when the ring is full.
+#
+# Returns 0 when the value was stored, or `AGNOSAI_CHAN_CLOSED` when the channel
+# is closed. It cannot report "full", which is the point.
+#
+# The eviction is a `chan_try_recv` that discards what it takes. Under
+# concurrency a receiver may consume that slot first, in which case the retry
+# simply finds the room a reader made instead of the room this call made — the
+# outcome either way is "one message was dropped to make space", which is the
+# semantic tokio guarantees. It does not guarantee *which* writer's message is
+# dropped, and neither does this.
+#
+# The retry runs once. A second failure means other producers refilled the ring
+# between the two calls, and spinning until one wins would reintroduce exactly
+# the unbounded stall this exists to remove.
+fn agnosai_chan_push_lossy(ch, val): i64 {
+    var rc = chan_try_send(ch, val);
+    if (rc == 0) { return 0; }
+    if (rc == AGNOSAI_CHAN_CLOSED) { return AGNOSAI_CHAN_CLOSED; }
+
+    # Full. Drop the oldest and try once more.
+    chan_try_recv(ch);
+    rc = chan_try_send(ch, val);
+    if (rc == AGNOSAI_CHAN_CLOSED) { return AGNOSAI_CHAN_CLOSED; }
+    return 0;
+}

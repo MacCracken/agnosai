@@ -125,6 +125,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the parameter's own description says "defaults to main", but the oracle inserts nothing and the
   code is what ships. Guard order is the oracle's array order, so with both `owner` and `repo`
   invalid it is `owner` that is named.
+- **orch** (M5, Phase 4, in progress) — `src/orch.cyr` hub. Two modules so far:
+  - **orch_output_validation** — the structured-output check a task's `output_schema` drives, plus
+    the retry prompt built from a failure. `ValidationResult` flattens to the port's
+    `Option<String>` convention, so **0 means Valid**. The fence extractor reproduces two
+    behaviours that are one character apart in Rust: the `?` on the closing-fence lookup abandons
+    the whole search rather than trying the next opening marker, while an *empty* block does fall
+    through — and the fall-through's re-scan can capture a block that still contains a fence,
+    which is pinned as-is rather than tidied. Divergences are message text only: the parse error
+    carries bayan's detail behind the oracle's wrapper wording, and the schema renders in
+    insertion order where serde_json (BTreeMap-backed, no `preserve_order`) sorts keys.
+  - **orch_pubsub** — topic pub/sub with `*` (one segment) and `#` (zero or more) wildcards.
+    A pattern maps to a **vec of per-subscriber channels** rather than the oracle's single
+    broadcast sender, because Cyrius channels are single-consumer: a value one receiver takes is
+    gone for the rest. The observable contract is unchanged — every subscriber sees every matching
+    message, and `pattern_count` still counts patterns, which is what the 10,000 cap is expressed
+    in. The oracle's 16-entry stack-array fast path is not reproduced; it is an allocation
+    optimisation with no observable difference.
+- **chan_lossy** — **this closes port-plan blocker #4.** `agnosai_chan_push_lossy` gives
+  `tokio::sync::broadcast::Sender::send`'s three properties that a blocking `chan_send` lacks: it
+  never blocks, never fails for lack of room, and evicts the *oldest* entry when the ring is full.
+  A 1:1 port of `tx.send(...)` onto `chan_send` would have converted never-block-lossy into
+  block-forever — a crew whose event stream has no live reader would wedge the thread publishing
+  to it. Built from the public channel verbs (`chan_try_send` reports -2 on full, `chan_try_recv`
+  discards the oldest) rather than reaching into the 56-byte channel layout, which two separate
+  thread backends implement. `orch_pubsub` is the first consumer; `EventBus` will be the second.
 - **guarded_fetch** — the shared implementation of
   [ADR 007](docs/adr/007-audit-redirect-revalidation.md): an HTTP fetch that re-runs
   `agnosai_is_safe_url` on **every redirect hop**, refuses an https→http downgrade, fails closed
