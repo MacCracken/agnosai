@@ -36,6 +36,8 @@ include "src/llm_retry.cyr"
 include "src/llm_hoosh.cyr"
 # crew_runner's select_model routes through the router's tier matrix.
 include "src/llm_router.cyr"
+# execute_task will sanitize through the prompt guard on every task.
+include "src/server_prompt_guard.cyr"
 include "src/chan_lossy.cyr"
 include "src/server_sse.cyr"
 include "src/orch_pubsub.cyr"
@@ -469,6 +471,39 @@ fn _b_infer_provider(): i64 {
     return 0;
 }
 
+# The prompt guard's scan: 31 anchored-anywhere patterns, each a sliding
+# case-blind window. The worst case is CLEAN input, which tries all 31 and
+# matches none — and every user-supplied field pays it on every task.
+fn _b_prompt_scan_clean(): i64 {
+    var n = 50000;
+    var text = str_from("Summarize the quarterly revenue report and highlight any anomalies.");
+
+    var b = bench_new("prompt_scan_clean_67b");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_scan_input(text); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The same over a 4 KB field, which is where the O(len x patterns) window scan
+# starts to show.
+fn _b_prompt_scan_4k(): i64 {
+    var n = 2000;
+    var sb = str_builder_new();
+    for (var f = 0; f < 64; f = f + 1) {
+        str_builder_add_cstr(sb, "the quick brown fox jumps over the lazy dog. ");
+    }
+    var text = str_builder_build(sb);
+
+    var b = bench_new("prompt_scan_clean_4k");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_scan_input(text); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 # Remove everything the durable benchmarks created.
 fn _b_durable_teardown(): i64 {
     sys_unlink(str_data(str_from("/tmp/agnosai-bench-durable/bench-crew.json")));
@@ -504,6 +539,8 @@ fn main(): i64 {
     _b_system_prompt();
     _b_select_model();
     _b_infer_provider();
+    _b_prompt_scan_clean();
+    _b_prompt_scan_4k();
 
     return 0;
 }

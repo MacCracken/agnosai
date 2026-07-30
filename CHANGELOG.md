@@ -285,6 +285,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     perfectly-matched manager loses to a poorly-matched worker, which is the whole point of the
     mode. Each task is ranked independently, so one agent can take several and there is no
     round-robin or capacity limit.
+  - **server_prompt_guard** — **pulled forward from M6**, the third module to come across that way
+    after `server_ssrf` and `server_sse`. It is a hard blocker for `execute_task`, which calls it
+    five times: `wrap_system_prompt` once and `sanitize` four times (context, task_description,
+    expected_output, failed_output). 31 injection patterns, matched ASCII-case-blind over raw
+    bytes, first match in table order wins.
+    Output is **byte-exact**, and the reason is new since the oracle was written: hoosh caches
+    responses server-side keyed on a hash of the whole request body, so this module's wrappers are
+    now part of the cache key and a single byte of drift silently drops the hit rate to zero
+    rather than failing anything. Every literal is pinned by a full-string assertion.
+    **The port cannot panic where the oracle can.** The oracle truncates with
+    `&text[..MAX_INPUT_LENGTH]`, and slicing a Rust `str` off a UTF-8 boundary panics — reachable
+    from a user-supplied task description longer than 50,000 bytes whose 50,000th byte lands
+    mid-codepoint. Cyrius Strs are byte slices, so the port truncates and carries on with one
+    mangled character. A test covers exactly that input.
+    Two byte-oriented bypasses are reproduced rather than fixed, because the oracle's own tests pin
+    them as expected: a zero-width space or a newline between the words of a pattern defeats it.
   - **orch_crew_runner** (bite 1 of 3) — the module's **pure leaves**:
     `pick_best_agent`, `infer_provider`, `build_system_prompt`,
     `strip_provider_prefix`, `select_model`. crew_runner is 1468 lines, the largest in the port, so
@@ -509,6 +525,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `event_round_trip_1_sub` is three locks and almost nothing else. Filed upstream in the cyrius
   repo as `docs/development/issues/2026-07-29-mutex-unlock-unconditional-futex-wake.md` with a
   repro; nothing is worked around here, so a stdlib fix lands as a straight improvement.
+- **server_prompt_guard**: `prompt_scan_clean_67b` **8.04 µs**, `prompt_scan_clean_4k`
+  **555 µs → 273 µs (−51%)**. The scan is O(len × 31 patterns) and `execute_task` runs it on up to
+  four fields per task, so the naive form cost ~27 ms of CPU for a task at the 50,000-byte field
+  cap. Hoisting a first-byte guard — compare the needle's folded first byte before entering the
+  inner comparison — halves it with nothing observable changed. Deliberately not optimised further;
+  the module header records why, and what the next step would be if it ever matters.
 - **orch_crew_runner**: `crew_select_model_routed` **301 ns** (the non-override path, so it pays
   `parse_complexity` plus the routing matrix on every task), `crew_infer_provider_fallthrough`
   **594 ns** (the worst case — a lowercase fold plus all nine anchored prefix tests),
