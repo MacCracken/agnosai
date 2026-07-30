@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **M6 (`server`) — first bite.**
+  - **server_output_filter** — the return leg of `server_prompt_guard`: that guards what goes *to*
+    the model, this scans what comes *back*. Detection and redaction of system-prompt leakage, ten
+    API-key prefixes, and PII (email, phone, SSN). Substring-based rather than regex, which the
+    port has no choice about since cyrius 6.5.0 removed the `regex_*` surface — and which is what
+    the oracle chose anyway.
+    **Three oracle behaviours are reproduced rather than fixed**, each pinned by a test so a
+    tidy-up fails loudly: a system prompt of **50 bytes or fewer is never checked** (the window
+    loop's range is empty at that length, and the oracle's own test asserts this as intended); the
+    **last window is never checked**, so leaking exactly the prompt's tail goes unseen; and
+    **`Bearer ` redacts only itself**, because its own trailing space is the first whitespace the
+    span-bounding scan finds — the token survives and is only removed if it happens to match
+    another prefix like `sk-`.
+    **One divergence, and it is a fix.** The oracle's SSN redactor walks bytes and pushes each as a
+    `char`, silently mangling any multi-byte UTF-8 that passes through — its email redactor does
+    not, because it walks `chars`. Cyrius Strs are byte slices with no re-encoding step, so
+    non-ASCII survives; a test drives a two-byte character through redaction to prove it.
+
 - **tools** (M4, Phase 3, in progress) — `src/tools.cyr` hub plus two submodules:
   - **tools_native** — `agnosai_tool_*`: ParameterSchema, ToolSchema, ToolInput, ToolOutput, and
     the tool itself. The oracle's `NativeTool` **trait** becomes a function-pointer vtable

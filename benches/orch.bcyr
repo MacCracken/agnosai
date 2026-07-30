@@ -38,6 +38,7 @@ include "src/llm_hoosh.cyr"
 include "src/llm_router.cyr"
 # execute_task will sanitize through the prompt guard on every task.
 include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
 include "src/chan_lossy.cyr"
 include "src/server_sse.cyr"
 include "src/orch_pubsub.cyr"
@@ -542,6 +543,35 @@ fn _b_audit_verify(): i64 {
     return 0;
 }
 
+# The output filter's scan: a leakage window walk plus ten substring searches
+# plus three PII detectors. Every LLM response pays it on the way back.
+fn _b_output_scan(): i64 {
+    var n = 20000;
+    var resp = str_from("The quarterly revenue rose 12% year over year, driven by the "
+    );
+    var sys = str_from("You are a helpful assistant that answers questions about finance.");
+
+    var b = bench_new("output_scan_clean");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_output_scan(resp, sys); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Redaction over clean text — the common case, where every pattern misses.
+fn _b_output_redact(): i64 {
+    var n = 20000;
+    var resp = str_from("The quarterly revenue rose 12% year over year with no secrets.");
+
+    var b = bench_new("output_redact_clean");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_output_redact(resp); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 # Remove everything the durable benchmarks created.
 fn _b_durable_teardown(): i64 {
     sys_unlink(str_data(str_from("/tmp/agnosai-bench-durable/bench-crew.json")));
@@ -581,6 +611,8 @@ fn main(): i64 {
     _b_prompt_scan_4k();
     _b_audit_record();
     _b_audit_verify();
+    _b_output_scan();
+    _b_output_redact();
 
     return 0;
 }

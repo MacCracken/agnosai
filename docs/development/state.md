@@ -57,7 +57,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2582 assertions across 41 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**2649 assertions across 42 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -101,6 +101,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `server_prompt_guard.tcyr` | 62 | 22 |
 | `orch_audit.tcyr` | 52 | — (hoosh's audit.rs tests) |
 | `orch_orchestrator.tcyr` | 51 | 5 |
+| `server_output_filter.tcyr` | 67 | 16 |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -132,7 +133,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (727/727 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (739/739 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -266,6 +267,8 @@ the default level the number measures sakshi writing to a pipe.
 | `prompt_scan_clean_4k` | 273 µs |
 | `audit_record` | 27.9 µs |
 | `audit_verify_256` | 2.65 ms |
+| `output_scan_clean` | 6.98 µs |
+| `output_redact_clean` | 9.69 µs |
 
 **These numbers are futex-bound, not algorithm-bound**, and that is the finding rather than an
 excuse. `mutex_lock` + `mutex_unlock` costs **394 ns uncontended** because `lib/sync.cyr`'s
@@ -290,7 +293,7 @@ across tasks. That is the oracle's behaviour and the reason the cost is linear i
 
 **Not comparable to `rust-old/bench-history.csv`** — different allocator, different harness, no
 criterion statistics. The Cyrius line starts its own baseline, captured by
-`scripts/bench-history.sh` into the root `bench-history.csv` (61 rows per capture).
+`scripts/bench-history.sh` into the root `bench-history.csv` (63 rows per capture).
 
 ## Dependencies
 
