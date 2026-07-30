@@ -1,0 +1,429 @@
+# =========================================================================
+# orch_crew_runner.tcyr — parity tests for src/orch_crew_runner.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/orchestrator/crew_runner.rs.
+# Twelve of its thirty tests cover this bite's pure leaves; the other eighteen
+# belong to `execute_task` and the three process modes, in later bites.
+#
+# **Five of those twelve are `contains`-only or single-agent**, which means a
+# byte-wrong or tie-wrong port passes the oracle's own suite. Each is
+# strengthened here: every `contains` on a built string becomes full `str_eq`
+# plus an explicit length, and the single-agent picker tests gain a mixed-score
+# and a fully-tied roster. The oracle's rosters are always two identical agents,
+# so its suite is structurally blind to both the sort direction and the tie rule.
+#
+# The oracle also leaves three of `infer_provider`'s nine needles completely
+# untested (`gemini`, `grok`, `mistral`/`mixtral`) and never exercises
+# `strip_provider_prefix`'s case sensitivity or whole-segment matching. Matching
+# its test set would not have been sufficient diligence.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/core_message.cyr"
+include "src/core_resource.cyr"
+include "src/core_task.cyr"
+include "src/core_agent.cyr"
+include "src/llm_retry.cyr"
+include "src/llm_hoosh.cyr"
+include "src/llm_router.cyr"
+include "src/orch_scoring.cyr"
+include "src/orch_crew_runner.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's test_agent(key), field for field: name = key, role "tester",
+# goal "test things", complexity "medium", and **no tools, no backstory, no
+# domain**. The empty tool vec is load-bearing — it is what makes the oracle's
+# minimal-prompt test assert `!contains("Available tools")`, and adding a tool
+# here would also silently change every scoring result below.
+fn _t_agent(key): i64 {
+    var a = agnosai_agent_new(str_from(key), str_from("tester"), str_from("test things"));
+    agnosai_agent_with_name(a, str_from(key));
+    return a;
+}
+
+# The same, plus one tool — for the cases that need tool coverage to differ.
+fn _t_agent_tooled(key, tool): i64 {
+    var a = _t_agent(key);
+    var tools = vec_new();
+    vec_push(tools, str_from(tool));
+    agnosai_agent_with_tools(a, tools);
+    return a;
+}
+
+# A bare task, the oracle's test_task(desc).
+fn _t_task(desc): i64 {
+    return agnosai_task_new(str_from(desc));
+}
+
+# A vec of up to three agents.
+fn _t_roster(a, b, c): i64 {
+    var v = vec_new();
+    if (a != 0) { vec_push(v, a); }
+    if (b != 0) { vec_push(v, b); }
+    if (c != 0) { vec_push(v, c); }
+    return v;
+}
+
+# Assert infer_provider maps a model name to a provider.
+fn _t_prov(model, want, name): i64 {
+    return assert_eq(_agnosai_crew_infer_provider(str_from(model)), want, name);
+}
+
+# Assert strip_provider_prefix's output.
+fn _t_strip(model, want, name): i64 {
+    return assert(str_eq(_agnosai_crew_strip_provider_prefix(str_from(model)),
+    str_from(want)) == 1, name);
+}
+
+# Assert select_model's output for an agent whose llm_model is set.
+fn _t_model_override(model, want, name): i64 {
+    var a = _t_agent("m");
+    agnosai_agent_with_llm_model(a, str_from(model));
+    return assert(str_eq(_agnosai_crew_select_model(a), str_from(want)) == 1, name);
+}
+
+# Assert select_model's output for an agent routed by complexity.
+fn _t_model_complexity(complexity, want, name): i64 {
+    var a = _t_agent("c");
+    agnosai_agent_with_complexity(a, str_from(complexity));
+    return assert(str_eq(_agnosai_crew_select_model(a), str_from(want)) == 1, name);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_crew_runner");
+
+    # =====================================================================
+    # pick_best_agent
+    # =====================================================================
+
+    # --- test_pick_best_agent_empty_roster ---
+    assert_eq(_agnosai_crew_pick_best_agent(vec_new(), _t_task("anything")), 0,
+    "an empty roster picks no agent — 0, and NOT index 0, which is a real agent");
+
+    # --- test_pick_best_agent_returns_some ---
+    var solo = _t_agent("a1");
+    var picked = _agnosai_crew_pick_best_agent(_t_roster(solo, 0, 0), _t_task("do it"));
+    assert(picked != 0, "a one-agent roster picks that agent");
+    assert(str_eq(agnosai_agent_key(picked), str_from("a1")) == 1, "by key");
+    assert_eq(picked, solo,
+    "and it is the same pointer, not a copy — the oracle clones, but nothing mutates an agent \
+    definition mid-crew and its own benchmark takes the borrow");
+
+    # --- PORT-ADDED: a mixed roster proves the sort is DESCENDING ---
+    # The oracle only ever passes identical agents, so its suite would pass with
+    # the comparison inverted.
+    var poor = _t_agent("poor");
+    agnosai_agent_with_complexity(poor, str_from("high"));
+    agnosai_agent_with_domain(poor, str_from("devops"));
+    var good = _t_agent_tooled("good", "hammer");
+    agnosai_agent_with_domain(good, str_from("quality"));
+    var fitted = agnosai_task_new(str_from("review the code"));
+    agnosai_task_with_context(fitted, str_from("domain"),
+    bayan_json_v_str_new(str_from("quality")));
+    var tools_req = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(tools_req, bayan_json_v_str_new(str_from("hammer")));
+    agnosai_task_with_context(fitted, str_from("required_tools"), tools_req);
+
+    var best_of_two = _agnosai_crew_pick_best_agent(_t_roster(poor, good, 0), fitted);
+    assert(str_eq(agnosai_agent_key(best_of_two), str_from("good")) == 1,
+    "the better-scoring agent wins even when it is second in the roster — proving the sort is \
+    descending, which the oracle's identical-agent rosters cannot show");
+
+    # --- PORT-ADDED: a fully tied roster proves the stable tie rule ---
+    var tie_a = _t_agent("agent-a");
+    var tie_b = _t_agent("agent-b");
+    var tied = _agnosai_crew_pick_best_agent(_t_roster(tie_a, tie_b, 0), _t_task("bare"));
+    assert(str_eq(agnosai_agent_key(tied), str_from("agent-a")) == 1,
+    "a tie goes to the earlier roster entry — Rust's sort_by is stable, and this is the property \
+    the oracle's suite is structurally blind to");
+
+    # =====================================================================
+    # infer_provider — the default is OLLAMA, not OPENAI
+    # =====================================================================
+
+    # --- test_infer_provider_openai ---
+    _t_prov("gpt-4o", AGNOSAI_PROVIDER_OPENAI, "gpt-4o is OpenAI");
+    _t_prov("gpt-4o-mini", AGNOSAI_PROVIDER_OPENAI, "and gpt-4o-mini");
+    _t_prov("o1", AGNOSAI_PROVIDER_OPENAI, "a bare o1 is OpenAI — the needle has no hyphen");
+    _t_prov("o3-mini", AGNOSAI_PROVIDER_OPENAI, "and o3-mini");
+
+    # --- test_infer_provider_anthropic ---
+    _t_prov("claude-sonnet-4", AGNOSAI_PROVIDER_ANTHROPIC, "claude-sonnet-4 is Anthropic");
+    _t_prov("claude-sonnet-4-20250514", AGNOSAI_PROVIDER_ANTHROPIC,
+    "and a dated variant — it is a prefix test, not a model table");
+    _t_prov("claude-opus-4", AGNOSAI_PROVIDER_ANTHROPIC, "and claude-opus-4");
+
+    # --- test_infer_provider_deepseek ---
+    _t_prov("deepseek-chat", AGNOSAI_PROVIDER_DEEPSEEK, "deepseek-chat is DeepSeek");
+    _t_prov("deepseek-coder", AGNOSAI_PROVIDER_DEEPSEEK, "and deepseek-coder");
+
+    # --- test_infer_provider_local_models ---
+    _t_prov("llama3", AGNOSAI_PROVIDER_OLLAMA, "llama3 falls through to Ollama");
+    _t_prov("llama3:70b", AGNOSAI_PROVIDER_OLLAMA, "and llama3:70b");
+    _t_prov("phi3", AGNOSAI_PROVIDER_OLLAMA, "and phi3");
+    _t_prov("unknown-model", AGNOSAI_PROVIDER_OLLAMA,
+    "and anything unrecognised — this is the assertion standing between the port and a bare \
+    `return 0`, which would silently mean OpenAI");
+
+    # --- test_infer_provider_case_insensitive ---
+    _t_prov("GPT-4o", AGNOSAI_PROVIDER_OPENAI, "matching ignores case");
+    _t_prov("Claude-Opus-4", AGNOSAI_PROVIDER_ANTHROPIC, "for the Anthropic arm too");
+    _t_prov("DEEPSEEK-CHAT", AGNOSAI_PROVIDER_DEEPSEEK, "and DeepSeek");
+
+    # --- PORT-ADDED: the three arms the oracle never tests ---
+    _t_prov("gemini-1.5-pro", AGNOSAI_PROVIDER_GOOGLE, "gemini is Google — untested upstream");
+    _t_prov("grok-2", AGNOSAI_PROVIDER_GROK, "grok is Grok — untested upstream");
+    _t_prov("mistral-large-latest", AGNOSAI_PROVIDER_MISTRAL, "mistral is Mistral");
+    _t_prov("mixtral-8x7b", AGNOSAI_PROVIDER_MISTRAL,
+    "and so is mixtral — one letter from mistral, so a transcription slip reads as correct at a \
+    glance and would send Mixtral traffic to the free Ollama arm");
+    _t_prov("GEMINI-1.5-PRO", AGNOSAI_PROVIDER_GOOGLE, "the untested arms fold case as well");
+    _t_prov("MIXTRAL-8X7B", AGNOSAI_PROVIDER_MISTRAL, "including mixtral");
+
+    # --- PORT-ADDED: the anchoring and boundary guards ---
+    _t_prov("", AGNOSAI_PROVIDER_OLLAMA, "an empty model name is Ollama, and does not fault");
+    _t_prov("gpt4", AGNOSAI_PROVIDER_OLLAMA, "gpt4 without the hyphen misses the needle");
+    _t_prov("gpt", AGNOSAI_PROVIDER_OLLAMA, "and a bare gpt");
+    _t_prov("o4-mini", AGNOSAI_PROVIDER_OLLAMA, "o4 is not o1 or o3 — there is no generalisation");
+    _t_prov("groq", AGNOSAI_PROVIDER_OLLAMA,
+    "groq is not grok — q is not k, and the oracle's provider enum has no Groq variant at all");
+    _t_prov("openai/gpt-4o", AGNOSAI_PROVIDER_OLLAMA,
+    "a prefixed id is Ollama — the match is anchored at position 0, with no substring fallback");
+    _t_prov("anthropic/claude-3", AGNOSAI_PROVIDER_OLLAMA, "for Anthropic too");
+    _t_prov(" gpt-4o", AGNOSAI_PROVIDER_OLLAMA, "a leading space defeats it — nothing is trimmed");
+    _t_prov("gpt-4o ", AGNOSAI_PROVIDER_OPENAI, "but a trailing space does not");
+
+    # the caller's Str is untouched: the fold works on a copy
+    var orig = str_from("GPT-4o");
+    _agnosai_crew_infer_provider(orig);
+    assert(str_eq(orig, str_from("GPT-4o")) == 1,
+    "the caller's model string is unchanged — the lowercase fold allocates rather than mutating");
+
+    # =====================================================================
+    # build_system_prompt — full equality, never `contains`
+    # =====================================================================
+
+    # --- test_build_system_prompt_no_agent ---
+    var generic = _agnosai_crew_build_system_prompt(0);
+    assert(str_eq(generic,
+    str_from("You are a helpful AI assistant executing tasks within a crew.")) == 1,
+    "no agent yields the generic prompt, byte for byte");
+    assert_eq(str_len(generic), 61, "which is 61 bytes");
+
+    # --- test_build_system_prompt_minimal_agent ---
+    # The oracle asserts three `contains` negatives and one positive. Full
+    # equality catches what they cannot: a stray separator.
+    var minimal = _t_agent("min");
+    var min_prompt = _agnosai_crew_build_system_prompt(minimal);
+    assert(str_eq(min_prompt, str_from("You are min, a tester.\n\nGoal: test things")) == 1,
+    "a minimal agent renders name, role and goal — and nothing else");
+    assert_eq(str_len(min_prompt), 41, "which is 41 bytes");
+    assert(str_contains(min_prompt, str_from("Backstory")) == 0, "no backstory section");
+    assert(str_contains(min_prompt, str_from("Domain")) == 0, "no domain section");
+    assert(str_contains(min_prompt, str_from("Available tools")) == 0,
+    "and no tools section — the oracle's fixture has an EMPTY tool vec, which is the one field \
+    gated on emptiness rather than presence");
+
+    # --- test_build_system_prompt_full_agent ---
+    var full = agnosai_agent_new(str_from("qa"), str_from("quality assurance"),
+    str_from("ensure zero defects"));
+    agnosai_agent_with_name(full, str_from("QA Lead"));
+    agnosai_agent_with_backstory(full, str_from("10 years in QA"));
+    agnosai_agent_with_domain(full, str_from("testing"));
+    var qa_tools = vec_new();
+    vec_push(qa_tools, str_from("selenium"));
+    vec_push(qa_tools, str_from("pytest"));
+    agnosai_agent_with_tools(full, qa_tools);
+
+    var full_prompt = _agnosai_crew_build_system_prompt(full);
+    assert(str_eq(full_prompt, str_cat(
+    str_from("You are QA Lead, a quality assurance.\n\nGoal: ensure zero defects"),
+    str_cat(str_from("\n\nBackstory: 10 years in QA\n\nDomain expertise: testing"),
+    str_from("\n\nAvailable tools: selenium, pytest")))) == 1,
+    "every section renders in the oracle's order, separated by \\n\\n, with tools joined by ', ' \
+    — the oracle's only format assertion is a `contains` on the join separator");
+    assert_eq(str_len(full_prompt), 153, "at the oracle's exact byte length");
+
+    # --- PORT-ADDED: presence, not emptiness, gates each section ---
+    # `if let Some(ref backstory)` fires for Some(""), so an explicitly empty
+    # backstory emits the header with nothing after it.
+    var empty_fields = _t_agent("e");
+    agnosai_agent_with_backstory(empty_fields, str_from(""));
+    agnosai_agent_with_domain(empty_fields, str_from(""));
+    var ef_prompt = _agnosai_crew_build_system_prompt(empty_fields);
+    assert(str_eq(ef_prompt, str_cat(str_from("You are e, a tester.\n\nGoal: test things"),
+    str_from("\n\nBackstory: \n\nDomain expertise: "))) == 1,
+    "an explicitly EMPTY backstory or domain still emits its header — the gate is presence, not \
+    non-emptiness, so Some(\"\") and None are different answers");
+
+    # tools, by contrast, gate on non-empty — the oracle uses !is_empty()
+    var no_tools = _t_agent("n");
+    assert(str_eq(_agnosai_crew_build_system_prompt(no_tools),
+    str_from("You are n, a tester.\n\nGoal: test things")) == 1,
+    "an EMPTY tool vec emits no tools section at all — the one field gated on emptiness rather \
+    than presence");
+
+    # a single empty tool string is a non-empty vec, so the section IS emitted
+    var blank_tool = _t_agent_tooled("b", "");
+    assert(str_eq(_agnosai_crew_build_system_prompt(blank_tool),
+    str_from("You are b, a tester.\n\nGoal: test things\n\nAvailable tools: ")) == 1,
+    "but a vec holding one empty string is non-empty, so the header ships with nothing after it");
+
+    # one tool means no trailing separator
+    var one_tool = _t_agent_tooled("o", "hammer");
+    assert(str_contains(_agnosai_crew_build_system_prompt(one_tool), str_from("hammer, ")) == 0,
+    "a single tool leaves no trailing ', '");
+
+    # the article is not agreed with the role, and that is the oracle's output
+    var vowel = agnosai_agent_new(str_from("v"), str_from("engineer"), str_from("g"));
+    agnosai_agent_with_name(vowel, str_from("v"));
+    # (built directly rather than via _t_agent, since the role differs)
+    assert(str_contains(_agnosai_crew_build_system_prompt(vowel),
+    str_from("You are v, a engineer.")) == 1,
+    "\"a engineer\", not \"an engineer\" — pinned so nobody corrects the grammar and diverges");
+
+    # =====================================================================
+    # strip_provider_prefix
+    # =====================================================================
+
+    # --- test_strip_provider_prefix_preserves_unknown ---
+    _t_strip("custom/model", "custom/model", "an unknown segment is left alone");
+    _t_strip("llama3:70b", "llama3:70b", "and a model with no slash at all");
+
+    # every one of the twelve known segments strips
+    _t_strip("ollama/llama3", "llama3", "ollama/ strips");
+    _t_strip("openai/gpt-4o", "gpt-4o", "openai/ strips");
+    _t_strip("anthropic/claude-3", "claude-3", "anthropic/ strips");
+    _t_strip("groq/mixtral", "mixtral", "groq/ strips");
+    _t_strip("deepseek/chat", "chat", "deepseek/ strips");
+    _t_strip("mistral/large", "large", "mistral/ strips");
+    _t_strip("together/x", "x", "together/ strips");
+    _t_strip("fireworks/x", "x", "fireworks/ strips");
+    _t_strip("anyscale/x", "x", "anyscale/ strips");
+    _t_strip("perplexity/x", "x", "perplexity/ strips");
+    _t_strip("bedrock/x", "x", "bedrock/ strips");
+    _t_strip("azure/x", "x", "azure/ strips");
+
+    # --- PORT-ADDED: the boundary and case cases the oracle never touches ---
+    var empty_model = _agnosai_crew_strip_provider_prefix(str_from(""));
+    assert_eq(str_len(empty_model), 0, "an empty model yields an empty result");
+    assert(empty_model != 0, "as a valid zero-length Str rather than 0");
+
+    _t_strip("/model", "/model",
+    "a leading slash is an EMPTY segment, which matches nothing — index 0 is a real hit, so the \
+    guard has to be `idx < 0` and not `idx <= 0`");
+    _t_strip("/", "/", "and a bare slash");
+
+    var bare_prefix = _agnosai_crew_strip_provider_prefix(str_from("ollama/"));
+    assert_eq(str_len(bare_prefix), 0,
+    "`ollama/` yields the EMPTY remainder — the oracle ships it as-is, with no validation and no \
+    fallback to the default model");
+
+    _t_strip("ollama/openai/gpt-4o", "openai/gpt-4o",
+    "only ONE level is stripped — a while loop here would be wrong and no oracle test catches it");
+    _t_strip("anthropic/models/claude-3", "models/claude-3", "the remainder keeps its own slashes");
+
+    _t_strip("Ollama/llama3", "Ollama/llama3",
+    "matching is case-SENSITIVE — reusing the ASCII-case-insensitive helper would break this");
+    _t_strip("OPENAI/gpt-4o", "OPENAI/gpt-4o", "for openai too");
+
+    _t_strip("open_ai/foo", "open_ai/foo",
+    "the WIRE spelling open_ai is not a strippable segment — the two vocabularies differ");
+    _t_strip("deep_seek/foo", "deep_seek/foo",
+    "and neither is deep_seek, though `deepseek/` above does strip");
+
+    _t_strip("openai-custom/foo", "openai-custom/foo",
+    "matching is whole-segment — a str_starts_with(\"openai\") reformulation would break this");
+    _t_strip("ollama", "ollama", "a bare segment name with no slash is untouched");
+    _t_strip("ollama-custom:7b", "ollama-custom:7b", "and a model that merely begins with one");
+
+    _t_strip(" ollama/x", " ollama/x", "nothing is trimmed on the left");
+    _t_strip("ollama/ x", " x", "nor on the right of the slash");
+
+    _t_strip("google/gemini-pro", "google/gemini-pro",
+    "google is a provider but NOT a strippable prefix — the twelve-name list is deliberately \
+    narrower than the enum, so do not complete it from agnosai_provider_to_wire");
+    _t_strip("grok/grok-2", "grok/grok-2", "and neither is grok");
+    _t_strip("cohere/command-r", "cohere/command-r", "nor cohere");
+    _t_strip("vertex_ai/x", "vertex_ai/x", "nor vertex_ai");
+
+    # =====================================================================
+    # select_model
+    # =====================================================================
+
+    # --- test_select_model_no_agent ---
+    assert(str_eq(_agnosai_crew_select_model(0),
+    agnosai_default_model(AGNOSAI_TIER_CAPABLE)) == 1,
+    "no agent uses the Capable tier default");
+    assert(str_eq(_agnosai_crew_select_model(0), str_from("llama3:70b")) == 1,
+    "which is llama3:70b");
+
+    # --- test_select_model_agent_override ---
+    _t_model_override("gpt-4o", "gpt-4o", "an agent's llm_model overrides the routing");
+
+    # --- test_select_model_strips_provider_prefix ---
+    _t_model_override("ollama/llama3.2:1b", "llama3.2:1b",
+    "and the override runs THROUGH the strip, not around it");
+    _t_model_override("openai/gpt-4o", "gpt-4o", "for openai/");
+    _t_model_override("anthropic/claude-sonnet-4-20250514", "claude-sonnet-4-20250514",
+    "and anthropic/ — this is the case that catches a strip list built from the wire spellings");
+
+    # --- test_select_model_routes_by_complexity ---
+    _t_model_complexity("low", "llama3:70b",
+    "low complexity routes to CAPABLE, not Fast — Simple + Reason never reaches the fast tier, \
+    so a direct complexity-to-model table would write llama3 here and pass every other test");
+    _t_model_complexity("high", "llama3:405b", "high complexity routes to Premium");
+
+    # --- PORT-ADDED: the complexity spellings the oracle skips ---
+    _t_model_complexity("medium", "llama3:70b", "medium routes to Capable");
+    _t_model_complexity("MEDIUM", "llama3:70b", "case-insensitively");
+    _t_model_complexity("simple", "llama3:70b", "simple is Simple, which still routes Capable");
+    _t_model_complexity("complex", "llama3:405b", "complex is Complex, which routes Premium");
+    _t_model_complexity("HIGH", "llama3:405b", "and HIGH");
+    _t_model_complexity("CoMpLeX", "llama3:405b", "and mixed case");
+    _t_model_complexity("", "llama3:70b", "an empty complexity falls back to Medium");
+    _t_model_complexity("unknown", "llama3:70b", "as does an unrecognised spelling");
+    _t_model_complexity("lowe", "llama3:70b",
+    "and a near-miss — parse_complexity compares whole strings, not prefixes");
+
+    # the Fast tier's model is unreachable from select_model at all
+    assert(str_eq(agnosai_default_model(AGNOSAI_TIER_FAST), str_from("llama3")) == 1,
+    "the Fast tier's model is llama3 — recorded here because select_model can never return it: \
+    every complexity level routes Reason to Capable or Premium");
+
+    # --- PORT-ADDED: precedence proven on visibly different answers ---
+    var high_override = _t_agent("h");
+    agnosai_agent_with_complexity(high_override, str_from("high"));
+    agnosai_agent_with_llm_model(high_override, str_from("gpt-4o"));
+    assert(str_eq(_agnosai_crew_select_model(high_override), str_from("gpt-4o")) == 1,
+    "an override beats a HIGH-complexity route — the oracle's medium fixture makes its own \
+    precedence evidence weaker than it looks, since both arms could agree");
+
+    # --- PORT-ADDED: an explicitly empty override survives ---
+    var blank_override = _t_agent("z");
+    agnosai_agent_with_llm_model(blank_override, str_from(""));
+    var blank_model = _agnosai_crew_select_model(blank_override);
+    assert_eq(str_len(blank_model), 0,
+    "an llm_model of \"\" yields \"\", NOT the routed default — the presence test is `!= 0`, and \
+    `if (m != 0 && str_len(m) > 0)` is the likeliest silent divergence in this function");
+
+    # an agent with no llm_model set is genuinely absent, not empty
+    var routed = _t_agent("r");
+    assert_eq(agnosai_agent_llm_model(routed), 0, "an unset llm_model is 0");
+    assert(str_eq(_agnosai_crew_select_model(routed), str_from("llama3:70b")) == 1,
+    "so it routes by complexity instead");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

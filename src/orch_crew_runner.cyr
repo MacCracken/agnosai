@@ -1,0 +1,293 @@
+# =========================================================================
+# orch_crew_runner — crew lifecycle: assemble → execute → aggregate.
+#
+# Parity oracle: rust-old/src/orchestrator/crew_runner.rs (1468 lines)
+#
+# **PORT IN PROGRESS — this file currently holds the module's pure leaves
+# only.** crew_runner is the largest module in the port and CLAUDE.md's task
+# sizing says large items go in small verified bites. The split, in dependency
+# order:
+#
+#   * bite 14 (here) — the pure leaves: `pick_best_agent`, `infer_provider`,
+#     `build_system_prompt`, `strip_provider_prefix`, `select_model`,
+#     `topological_sort`. No async, no I/O, no struct, and 12 of the module's
+#     30 tests land on them.
+#   * bite 15 — `execute_task` (crew_runner.rs:619-898), the LLM call path.
+#   * bite 16 — the `CrewRunner` struct, its builders, and the three process
+#     modes (`run`, `run_sequential`, `run_parallel`, `run_dag`).
+#
+# Bites 15 and 16 have an open question that does not touch this one:
+# `ResponseCache`, `CostTracker`, `AuditChain` and `cache_key` are **re-exports
+# from the hoosh crate** (`rust-old/src/llm/mod.rs:14-20`), not agnosai code.
+# Whether the port reaches them across the hoosh HTTP seam or needs local
+# equivalents is a decision to take before the runner core is written.
+#
+# ## Two functions are NOT implemented here, deliberately
+#
+# **`topological_sort` (crew_runner.rs:1004) is a one-line delegation** to
+# `scheduler::topological_sort_tasks`, which the port already has as
+# `agnosai_topological_sort_tasks` (`src/orch_scheduler.cyr:347`). Writing a
+# second sorter would be the classic port mistake: two implementations of one
+# algorithm that drift. `run_dag` in bite 16 calls the scheduler's directly.
+# Its tests already live in `tests/orch_scheduler.tcyr` and are not duplicated.
+#
+# **`mood_adjusted_temperature` (crew_runner.rs:985) is skipped.** It takes a
+# `bhava::traits::PersonalityProfile`, and bhava is deferred in this port — the
+# same reason `src/orch_scoring.cyr`'s personality score is pinned at the
+# oracle's `None` arm. It is unreachable rather than merely unported: nothing
+# can supply a profile, because `AgentDefinition`'s `personality` field is not
+# in the ported struct at all (`src/core_agent.cyr` has no
+# `agnosai_agent_personality`). Porting the arithmetic now would mean writing
+# f64 clamp code that no caller can reach and no test can honestly exercise.
+# When bhava lands, this and `agnosai_personality_score` come back together.
+#
+# ## Three provider vocabularies that are NOT the same list
+#
+# This is the highest drift risk in the module, so it is written down rather
+# than left for a reviewer to "tidy":
+#
+#   1. `_agnosai_crew_infer_provider`'s **model-name needles** — `gpt-`, `o1`,
+#      `o3`, `claude`, `deepseek`, `gemini`, `grok`, `mistral`, `mixtral`.
+#      Matched case-INSENSITIVELY, anchored at position 0.
+#   2. `_agnosai_crew_strip_provider_prefix`'s **twelve litellm segment names**
+#      — `ollama`, `openai`, `anthropic`, `groq`, `deepseek`, `mistral`,
+#      `together`, `fireworks`, `anyscale`, `perplexity`, `bedrock`, `azure`.
+#      Matched case-SENSITIVELY and as a whole segment.
+#   3. `agnosai_provider_to_wire` / `_from_wire` (`src/llm_hoosh.cyr`) — the
+#      **wire spellings**: `open_ai`, `anthropic`, `google`, `mistral`,
+#      `deep_seek`, `grok`, `ollama`.
+#
+# The collisions that would drift: `deepseek` is one word in (1) and (2) but
+# `deep_seek` in (3), and `openai` is one word in (2) but `open_ai` in (3).
+# Copying (3)'s spellings into (2) makes `openai/gpt-4o` and `deepseek/x` stop
+# stripping — and `openai/gpt-4o` is one of the three cases the oracle's own
+# `test_select_model_strips_provider_prefix` asserts. Set (3) also carries
+# `google` and `grok`, which are not strippable prefixes, and lacks six of set
+# (2)'s twelve. Separately, `groq` in (2) is one letter from `grok` in (1) and
+# (3), and the oracle's provider enum has no Groq variant at all.
+#
+# ## Two complexity vocabularies, and the asymmetry is the contract
+#
+# `agnosai_parse_complexity` (`src/llm_router.cyr`) takes four spellings —
+# `low`/`simple` → Simple, `high`/`complex` → Complex, else Medium — while
+# `agnosai_complexity_level` (`src/orch_scoring.cyr`) takes two, `low` → 1,
+# `high` → 3, else 2. Both mirror their own oracle function faithfully. The
+# consequence looks like a bug and is not: an agent with `complexity =
+# "simple"` routes as Simple for **model selection** but scores as level 2
+# (medium) for **agent selection**. `select_model` must call
+# `agnosai_parse_complexity` and must never call `agnosai_complexity_level`;
+# pointing both at one helper would silently change agent-selection scores.
+# =========================================================================
+
+# Pick the highest-scoring agent for a task, or 0 when the roster is empty.
+#
+# Returns the agent POINTER, not an index: index 0 is a real agent and in fact
+# the most common winner, since `agnosai_rank_agents` breaks ties on ascending
+# index. A `-1` index sentinel would work too but every call site would have to
+# remember it, and 0-as-absent is the port's convention everywhere else.
+#
+# The oracle clones the winner; this returns the borrow. Nothing mutates an
+# agent definition after a crew starts, and `rust-old/benches/orchestrator.rs`
+# benchmarks this very function as `rank_agents(...).first()` taking
+# `&agents[*idx]` — the clone is not semantic.
+#
+# **This is `agnosai_rank_agents` plus `.first()`, and reusing it is the point.**
+# The oracle's body calls `scoring::score_agent` per agent, which re-extracts
+# `required_tools` from the task each time; `rank_agents` hoists that extraction
+# out of the loop. The extraction is a pure read of the task context, so the
+# scores are bit-identical — `rank_agents` is simply the newer path that
+# `pick_best_agent` was never updated to use. One visible consequence: on a
+# malformed `required_tools` the oracle emits N warnings for N agents and this
+# emits exactly one. Log volume only, but sakshi is an audit trail here, so it
+# is said out loud rather than left to be found in a log diff.
+#
+# **Do not route this through `agnosai_delegate_tasks`.** That shares the same
+# three-line picker core but has a different empty arm — it falls back to the
+# manager, which is `hierarchical.rs`'s contract and not this one. Here an empty
+# roster means no agent, and the callers turn that into the generic system
+# prompt and the label "unassigned".
+fn _agnosai_crew_pick_best_agent(agents, task): i64 {
+    if (vec_len(agents) == 0) { return 0; }
+
+    var ranked = agnosai_rank_agents(agents, task);
+    if (vec_len(ranked) == 0) { return 0; }
+
+    var best = vec_get(agents, agnosai_scored_index(vec_get(ranked, 0)));
+    if (sakshi_get_level() >= SK_DEBUG) {
+        var sb = str_builder_new();
+        str_builder_add(sb, agnosai_agent_key(best));
+        str_builder_add_cstr(sb, " task=");
+        str_builder_add(sb, agnosai_task_id(task));
+        var line = str_builder_build(sb);
+        sakshi_log_kv(SK_DEBUG, "picked best agent for task", 26, "agent_key", 9,
+        str_data(line), str_len(line));
+    }
+    return best;
+}
+
+# Infer the provider from a model name, for cost tracking.
+#
+# The arms are the oracle's, in the oracle's order, all anchored at position 0
+# (`starts_with`, never a substring search). Order matters where patterns could
+# overlap, and the `mistral`/`mixtral` pair shares one arm.
+#
+# The default is **Ollama**, not OpenAI. That matters because `AGNOSAI_PROVIDER_
+# OPENAI` is 0, so a port that fell through to a bare `return 0` would silently
+# bill every local model to OpenAI.
+#
+# The oracle uses `to_lowercase()` (full Unicode) where this uses
+# `_agnosai_to_ascii_lower`. Not a reachable difference: every needle is ASCII
+# and anchored at byte 0, so a non-ASCII leading byte fails all nine arms either
+# way, and lowering it cannot create or destroy an ASCII prefix match.
+fn _agnosai_crew_infer_provider(model: Str): i64 {
+    var m = _agnosai_to_ascii_lower(model);
+
+    if (str_starts_with(m, str_from("gpt-")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
+    if (str_starts_with(m, str_from("o1")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
+    if (str_starts_with(m, str_from("o3")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
+    if (str_starts_with(m, str_from("claude")) == 1) { return AGNOSAI_PROVIDER_ANTHROPIC; }
+    if (str_starts_with(m, str_from("deepseek")) == 1) { return AGNOSAI_PROVIDER_DEEPSEEK; }
+    if (str_starts_with(m, str_from("gemini")) == 1) { return AGNOSAI_PROVIDER_GOOGLE; }
+    if (str_starts_with(m, str_from("grok")) == 1) { return AGNOSAI_PROVIDER_GROK; }
+    if (str_starts_with(m, str_from("mistral")) == 1) { return AGNOSAI_PROVIDER_MISTRAL; }
+    if (str_starts_with(m, str_from("mixtral")) == 1) { return AGNOSAI_PROVIDER_MISTRAL; }
+
+    # Local models (llama and friends) — free via Ollama.
+    return AGNOSAI_PROVIDER_OLLAMA;
+}
+
+# Build the system prompt from an agent definition, or the generic one when
+# there is no agent.
+#
+# Byte-exact against the oracle. The separator between every section is `\n\n`;
+# a field that is absent contributes **nothing at all**, not an empty section.
+# The presence test is on the field being set, NOT on it being non-empty — an
+# agent with `backstory = ""` emits `\n\nBackstory: ` with nothing after it,
+# which is what the oracle's `if let Some(ref backstory)` does. The one
+# exception is `tools`, which the oracle gates on `!is_empty()`, so an empty
+# tool vec emits nothing while a vec holding one empty string emits
+# `\n\nAvailable tools: `.
+#
+# `You are {name}, a {role}.` produces "a engineer" for a vowel-initial role.
+# That is the oracle's output and it stays; a test pins it so nobody "fixes" it.
+#
+# The oracle has a fifth block after tools: when `agent.personality` is set it
+# appends a single `\n` (not `\n\n`) plus `profile.compose_prompt()`. That block
+# is **unreachable in this port** — bhava is deferred and the ported
+# `AgentDefinition` has no personality field — so it is not written here. It is
+# the only part of this function that is not ported, and it comes back with
+# bhava alongside `agnosai_personality_score`.
+fn _agnosai_crew_build_system_prompt(agent): i64 {
+    if (agent == 0) {
+        return str_from("You are a helpful AI assistant executing tasks within a crew.");
+    }
+
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "You are ");
+    str_builder_add(sb, agnosai_agent_name(agent));
+    str_builder_add_cstr(sb, ", a ");
+    str_builder_add(sb, agnosai_agent_role(agent));
+    str_builder_add_cstr(sb, ".\n\nGoal: ");
+    str_builder_add(sb, agnosai_agent_goal(agent));
+
+    var backstory = agnosai_agent_backstory(agent);
+    if (backstory != 0) {
+        str_builder_add_cstr(sb, "\n\nBackstory: ");
+        str_builder_add(sb, backstory);
+    }
+
+    var domain = agnosai_agent_domain(agent);
+    if (domain != 0) {
+        str_builder_add_cstr(sb, "\n\nDomain expertise: ");
+        str_builder_add(sb, domain);
+    }
+
+    var tools = agnosai_agent_tools(agent);
+    if (vec_len(tools) > 0) {
+        str_builder_add_cstr(sb, "\n\nAvailable tools: ");
+        for (var i = 0; i < vec_len(tools); i = i + 1) {
+            if (i > 0) { str_builder_add_cstr(sb, ", "); }
+            str_builder_add(sb, vec_get(tools, i));
+        }
+    }
+
+    return str_builder_build(sb);
+}
+
+# The twelve litellm provider segments the oracle strips, and only those.
+#
+# Case-SENSITIVE and whole-segment: `Ollama/x` and `openai-custom/x` are both
+# left alone. The list is deliberately narrower than the provider enum — it has
+# no `google` or `grok`, and it does have `groq`, `together`, `fireworks`,
+# `anyscale`, `perplexity`, `bedrock` and `azure`, which are not enum variants.
+# Do not "complete" it from `agnosai_provider_to_wire`; see the module header.
+fn _agnosai_crew_is_provider_segment(seg: Str): i64 {
+    if (str_eq(seg, str_from("ollama")) == 1) { return 1; }
+    if (str_eq(seg, str_from("openai")) == 1) { return 1; }
+    if (str_eq(seg, str_from("anthropic")) == 1) { return 1; }
+    if (str_eq(seg, str_from("groq")) == 1) { return 1; }
+    if (str_eq(seg, str_from("deepseek")) == 1) { return 1; }
+    if (str_eq(seg, str_from("mistral")) == 1) { return 1; }
+    if (str_eq(seg, str_from("together")) == 1) { return 1; }
+    if (str_eq(seg, str_from("fireworks")) == 1) { return 1; }
+    if (str_eq(seg, str_from("anyscale")) == 1) { return 1; }
+    if (str_eq(seg, str_from("perplexity")) == 1) { return 1; }
+    if (str_eq(seg, str_from("bedrock")) == 1) { return 1; }
+    if (str_eq(seg, str_from("azure")) == 1) { return 1; }
+    return 0;
+}
+
+# Strip a known `provider/` prefix from a model identifier.
+#
+# litellm-style ids use `provider/model`, but most inference endpoints — Ollama's
+# OpenAI-compatible API included — want the bare model name.
+#
+# Returns a **view** into the input, matching the oracle's `&str` return: no
+# copy, no allocation. Only the FIRST `/` is considered and only one level is
+# stripped, so `ollama/openai/gpt-4o` yields `openai/gpt-4o`. A `while` loop
+# here would be wrong and no oracle test would catch it.
+#
+# The guard is `idx < 0`, not `idx <= 0`: `/model` has its slash at index 0,
+# whose prefix is the empty segment, which matches nothing and so falls through
+# to returning the input unchanged. And `ollama/` yields an empty Str rather
+# than the input — the oracle ships the empty remainder as-is with no
+# validation and no fallback.
+fn _agnosai_crew_strip_provider_prefix(model: Str): i64 {
+    var idx = str_index_of(model, 47);
+    if (idx < 0) { return model; }
+    if (_agnosai_crew_is_provider_segment(str_sub(model, 0, idx)) == 0) { return model; }
+    return str_sub(model, idx + 1, str_len(model) - idx - 1);
+}
+
+# Select the model for an agent: its own override, else routed by complexity.
+#
+# Returns a view, like the oracle. Three arms, in the oracle's precedence:
+#
+#   1. An agent with `llm_model` set — stripped of any provider prefix. The
+#      override runs THROUGH the strip, not around it.
+#   2. An agent without one — `parse_complexity` on the agent's complexity, then
+#      the router's Reason-task matrix, then that tier's default model.
+#   3. No agent at all — the Capable tier default.
+#
+# The presence test in arm 1 is `!= 0`, never `str_len(...) > 0`: an agent whose
+# `llm_model` is explicitly `""` gets `""`, not the routed default. `str_from("")`
+# is a real 16-byte header with length 0, so absent and empty are genuinely
+# distinguishable here and conflating them is the likeliest silent divergence.
+#
+# Arm 2 goes through the full router rather than a direct complexity→model
+# table, and the reason is the counter-intuitive `low` case: Simple + Reason
+# routes to **Capable**, never Fast. A shortcut table would write
+# `low → fast → "llama3"` and pass every test that does not cover `low`. As a
+# consequence `AGNOSAI_TIER_FAST`'s `"llama3"` is unreachable from here at all.
+fn _agnosai_crew_select_model(agent): i64 {
+    if (agent == 0) { return agnosai_default_model(AGNOSAI_TIER_CAPABLE); }
+
+    var override_model = agnosai_agent_llm_model(agent);
+    if (override_model != 0) {
+        return _agnosai_crew_strip_provider_prefix(override_model);
+    }
+
+    var complexity = agnosai_parse_complexity(agnosai_agent_complexity(agent));
+    var profile = agnosai_task_profile_new(AGNOSAI_TASKTYPE_REASON, complexity);
+    return agnosai_default_model(agnosai_route(profile));
+}

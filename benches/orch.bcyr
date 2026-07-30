@@ -34,6 +34,8 @@ include "src/core.cyr"
 # orch_memory builds chat messages, whose roles live in the hoosh seam.
 include "src/llm_retry.cyr"
 include "src/llm_hoosh.cyr"
+# crew_runner's select_model routes through the router's tier matrix.
+include "src/llm_router.cyr"
 include "src/chan_lossy.cyr"
 include "src/server_sse.cyr"
 include "src/orch_pubsub.cyr"
@@ -43,6 +45,7 @@ include "src/orch_plan_cache.cyr"
 include "src/orch_memory.cyr"
 include "src/orch_hierarchical.cyr"
 include "src/orch_durable_state.cyr"
+include "src/orch_crew_runner.cyr"
 
 # An agent with two tools, a complexity and a domain — the shape scoring reads.
 fn _b_agent(key: Str): i64 {
@@ -416,6 +419,56 @@ fn _b_mkdir_p(): i64 {
     return 0;
 }
 
+# The only allocating crew_runner leaf: a fully-populated agent's system prompt,
+# built once per task execution.
+fn _b_system_prompt(): i64 {
+    var n = 100000;
+    var a = agnosai_agent_new(str_from("qa"), str_from("quality assurance"),
+    str_from("ensure zero defects"));
+    agnosai_agent_with_name(a, str_from("QA Lead"));
+    agnosai_agent_with_backstory(a, str_from("ten years in QA"));
+    agnosai_agent_with_domain(a, str_from("testing"));
+    var tools = vec_new();
+    vec_push(tools, str_from("selenium"));
+    vec_push(tools, str_from("pytest"));
+    agnosai_agent_with_tools(a, tools);
+
+    var b = bench_new("crew_build_system_prompt");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { _agnosai_crew_build_system_prompt(a); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Model selection through the router — the non-override path, so it pays
+# parse_complexity plus the routing matrix on every task.
+fn _b_select_model(): i64 {
+    var n = 200000;
+    var a = agnosai_agent_new(str_from("c"), str_from("tester"), str_from("test things"));
+
+    var b = bench_new("crew_select_model_routed");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { _agnosai_crew_select_model(a); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Provider inference: a lowercase fold plus up to nine anchored prefix tests.
+# The worst case is the fall-through, which tries all nine.
+fn _b_infer_provider(): i64 {
+    var n = 200000;
+    var model = str_from("llama3:70b");
+
+    var b = bench_new("crew_infer_provider_fallthrough");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { _agnosai_crew_infer_provider(model); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 # Remove everything the durable benchmarks created.
 fn _b_durable_teardown(): i64 {
     sys_unlink(str_data(str_from("/tmp/agnosai-bench-durable/bench-crew.json")));
@@ -448,6 +501,9 @@ fn main(): i64 {
     _b_state_load_miss();
     _b_mkdir_p();
     _b_durable_teardown();
+    _b_system_prompt();
+    _b_select_model();
+    _b_infer_provider();
 
     return 0;
 }

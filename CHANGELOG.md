@@ -285,6 +285,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     perfectly-matched manager loses to a poorly-matched worker, which is the whole point of the
     mode. Each task is ranked independently, so one agent can take several and there is no
     round-robin or capacity limit.
+  - **orch_crew_runner** (bite 1 of 3) — the module's **pure leaves**:
+    `pick_best_agent`, `infer_provider`, `build_system_prompt`,
+    `strip_provider_prefix`, `select_model`. crew_runner is 1468 lines, the largest in the port, so
+    it goes in verified bites: `execute_task` next, then the runner struct and the three process
+    modes.
+    **Two of the seven leaves are deliberately not written.** `topological_sort` is a one-line
+    delegation to the scheduler, which the port already has as `agnosai_topological_sort_tasks` —
+    a second sorter would be two implementations of one algorithm that drift.
+    `mood_adjusted_temperature` is unreachable: it needs a bhava `PersonalityProfile`, and the
+    ported `AgentDefinition` has no personality field at all, so porting the f64 clamp arithmetic
+    now would mean code no caller can reach and no test can honestly exercise.
+    `pick_best_agent` **reuses `agnosai_rank_agents`** rather than scoring again — `rust-old`'s own
+    benchmark benchmarks it as `rank_agents(...).first()`, which is both the licence and the proof.
+    One visible consequence, recorded because sakshi is an audit trail here: on a malformed
+    `required_tools` the oracle emits one warning per agent and this emits exactly one, because
+    `rank_agents` hoists the extraction the oracle repeats per agent.
+    Three provider vocabularies and two complexity vocabularies are documented as **deliberately
+    different lists** in the module header, because unifying any pair is a silent divergence:
+    `deepseek` is one word as a model needle and a strip segment but `deep_seek` on the wire, and
+    an agent with `complexity = "simple"` correctly routes as Simple for model selection while
+    scoring as medium for agent selection.
   - **orch_durable_state** — one pretty-printed JSON snapshot per crew at
     `{base_dir}/{crew_id}.json`, plus the `CrewState` (de)serialisers.
     `bayan_json_v_build_pretty(v, 2)` turns out to be **byte-identical** to
@@ -488,6 +509,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `event_round_trip_1_sub` is three locks and almost nothing else. Filed upstream in the cyrius
   repo as `docs/development/issues/2026-07-29-mutex-unlock-unconditional-futex-wake.md` with a
   repro; nothing is worked around here, so a stdlib fix lands as a straight improvement.
+- **orch_crew_runner**: `crew_select_model_routed` **301 ns** (the non-override path, so it pays
+  `parse_complexity` plus the routing matrix on every task), `crew_infer_provider_fallthrough`
+  **594 ns** (the worst case — a lowercase fold plus all nine anchored prefix tests),
+  `crew_build_system_prompt` **1.47 µs** for a fully-populated agent, the only allocating leaf.
 - **orch_durable_state**: `durable_serialize_crew_state` **3.88 µs**,
   `durable_deserialize_crew_state` **2.68 µs**, `durable_load_hit` **4.43 µs**,
   `durable_load_miss` **2.80 µs**, `durable_save_atomic` **21.5 µs** (fsync-bound by construction —
