@@ -145,10 +145,40 @@ empty. patra stays a declared stdlib dep for later phases.
 
 ### Phase 5 — `server`
 22 bites. Start with the pure leaves (ssrf → prompt_guard → output_filter →
-prometheus — string/number work, independently testable). Then auth
-(shared-secret half first; JWT half waits on sigil `pem_decode_pubkey` + bote
-`jwt_verify_rs256`), hot_config, sse/EventBus, routes/*, router, main.
+prometheus — string/number work, independently testable). Then auth, hot_config,
+sse/EventBus, routes/*, router, main.
 **Exit:** the 11-route API serves; SSE streams; load-tested (blocker #3 measured).
+
+**Correction (2026-07-30, verified by running it):** this line read *"JWT half
+waits on sigil `pem_decode_pubkey` + bote `jwt_verify_rs256`"*. **Neither gate
+exists.** Both were checked by compiling and executing an RS256 verification
+inside agnosai against its own vendored `lib/`:
+
+* **sigil needs nothing.** `rsa_pubkey_from_der` already accepts an X.509
+  SubjectPublicKeyInfo, not just a bare PKCS#1 key — sigil's own X.509 parser
+  uses that branch — and the PEM helpers (`_pem_find`, `_pem_b64_decode`,
+  `_pem_match_at`) are generic over the label, which `pem_decode_privkey` proves
+  by handling three of them. So `pem_decode_pubkey` is ~15 lines of agnosai-side
+  glue, not an upstream feature. A first-class sigil export would be *nice*, and
+  is filed there, but nothing waits on it.
+* **bote is the wrong dependency entirely.** Its only JWT is **HS256** — a
+  different algorithm — and `src/jwt.cyr` is in neither `[lib]` nor `[lib.core]`,
+  so `dist/bote-core.cyr` (which is what agnosai pins) ships zero `jwt_*`
+  symbols. agnosai calls nothing from bote today. Filed upstream; drop it from
+  the ask list.
+* **The topology assumption was also wrong.** sigil is a **git-tag dep with a
+  local path override** (`[deps.sigil] path = "../sigil", tag = "3.12.1"`), not a
+  cyrius stdlib fold — so even a real upstream change would be a tag away, not a
+  toolchain release away.
+
+Measured end to end with a real 2048-bit key and an openssl-signed token: SPKI
+PEM → 294-byte DER → 256-byte modulus + 3-byte exponent → `1` for a valid
+signature, `0` for a tampered input and `0` for a tampered signature.
+
+**`auth.rs` therefore ports whole, in one module, with zero upstream change.**
+Splitting it into bites is a size-discipline choice (the shared-secret half alone
+unlocks 5 of the 11 oracle tests with no crypto), not a constraint. See the
+blocker table below, which already said this and was not read.
 
 ### Phase 6 — `sandbox` (77%)
 policy (rename first — blocker #5), kavach_bridge, exec, process, python, oci,
