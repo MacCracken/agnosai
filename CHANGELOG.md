@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **M6 (`server`) — first bite.**
+  - **server_prometheus** — six counters plus the Prometheus text exposition `/metrics` serves.
+    **Atomics, not a mutex.** The oracle's counters are `AtomicU64`/`Relaxed`, and the port uses
+    `atomic_fetch_add` for the same reason rather than locking: the crew runner's parallel and DAG
+    modes record from real worker threads, and an uncontended mutex pair costs ~394 ns here against
+    a measured **5 ns** for the atomic — ~79× on a path that fires once per task. The one
+    non-additive operation, the active-crews decrement, is a CAS loop, since Cyrius has no
+    `fetch_update`; it saturates at zero, because a plain decrement would *wrap* and the gauge would
+    read as nonsense rather than merely wrong.
+    **Cost is integer micro-USD end to end.** The oracle already stores micro-USD, but its entry
+    point takes an f64 USD and multiplies while `gather` divides back to format `{:.6}` — two float
+    conversions bracketing an integer store. The port takes micro directly (the one signature
+    change) and formats by splitting the integer, so the value that arrives is the value stored and
+    printed. That matters because hoosh 2.6.0 reports `usage.cost_micro_usd` as an integer and the
+    port carries micro-USD everywhere: the f64 round trip would have been the *only* place in the
+    cost path where representation error could enter. Tests pin `0.000001`, `0.999999`, `2.000000`
+    and `1234.567890` rendering exactly.
   - **server_output_filter** — the return leg of `server_prompt_guard`: that guards what goes *to*
     the model, this scans what comes *back*. Detection and redaction of system-prompt leakage, ten
     API-key prefixes, and PII (email, phone, SSN). Substring-based rather than regex, which the

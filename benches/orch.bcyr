@@ -39,6 +39,7 @@ include "src/llm_router.cyr"
 # execute_task will sanitize through the prompt guard on every task.
 include "src/server_prompt_guard.cyr"
 include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
 include "src/chan_lossy.cyr"
 include "src/server_sse.cyr"
 include "src/orch_pubsub.cyr"
@@ -572,6 +573,34 @@ fn _b_output_redact(): i64 {
     return 0;
 }
 
+# One metrics record — an atomic add, on the crew and task hot paths.
+fn _b_metrics_record(): i64 {
+    var n = 500000;
+    var m = agnosai_metrics_new();
+
+    var b = bench_new("metrics_record_task");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_metrics_record_task_completed(m); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A full /metrics scrape: six families rendered into one string.
+fn _b_metrics_gather(): i64 {
+    var n = 50000;
+    var m = agnosai_metrics_new();
+    agnosai_metrics_record_crew_started(m);
+    agnosai_metrics_record_inference(m, 12345, 1234567);
+
+    var b = bench_new("metrics_gather");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_metrics_gather(m); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 # Remove everything the durable benchmarks created.
 fn _b_durable_teardown(): i64 {
     sys_unlink(str_data(str_from("/tmp/agnosai-bench-durable/bench-crew.json")));
@@ -613,6 +642,8 @@ fn main(): i64 {
     _b_audit_verify();
     _b_output_scan();
     _b_output_redact();
+    _b_metrics_record();
+    _b_metrics_gather();
 
     return 0;
 }
