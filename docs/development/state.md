@@ -12,7 +12,7 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.4.86` (`cyrius.cyml`) — folds sandhi 1.9.5
+- **Cyrius pin**: `6.5.2` (`cyrius.cyml`) — folds bayan 1.3.0, sandhi 1.9.7, sakshi 2.4.7
 - Rust (for `rust-old/` only): `channel = "stable"`, currently rustc 1.96.0
 
 ## Source
@@ -35,7 +35,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 |---|---|
 | Rust baseline green (the oracle) | ✅ fmt + clippy clean, all 9 feature combos compile, 863 + 2 + 1 tests pass |
 | Terminal Rust benchmark capture | ✅ 112 rows at v1.1.0, frozen into `rust-old/bench-history.csv` |
-| Blockers re-verified vs 6.4.86 | ✅ see [`cyrius-port-plan.md`](cyrius-port-plan.md) |
+| Blockers re-verified vs 6.5.2 | ✅ see [`cyrius-port-plan.md`](cyrius-port-plan.md) |
 | `cyrius port` run | ✅ 2026-07-28 |
 | `cyrius lib sync` + `cyrius deps` | ✅ 43/43 stdlib modules, 9 deps resolved, 0 errors, 79 locked |
 | Hello-world builds and runs | ✅ `cyrius build src/main.cyr build/agnosai` → OK |
@@ -140,7 +140,7 @@ Rust oracle for comparison: **863 unit + 2 integration + 1 doctest, all passing.
 ## Benchmarks
 
 `benches/learning.bcyr` — the 10 shapes of `rust-old/benches/learning.rs`. First Cyrius numbers
-(x86_64 Linux, cyrius 6.4.86):
+(x86_64 Linux, cyrius 6.5.2):
 
 | Benchmark | Time |
 |---|---|
@@ -323,17 +323,20 @@ transport seam.
 
 **Next: M5 — `orchestrator`** ([`roadmap.md`](roadmap.md), Phase 4). Its gate,
 port-plan blocker #4, is **cleared**: `chan_try_send` is present in cyrius
-6.4.86, having shipped in 6.4.84, so the crew-event fan-out can have the
+6.5.2, having shipped in 6.4.84, so the crew-event fan-out can have the
 overwrite-oldest semantics tokio's broadcast gave the oracle.
 
-**The one open upstream dependency is blocker #3, and it gates M6, not M5.**
-sandhi still exposes no `_a`-threaded router dispatch — verified against 6.4.86:
-zero hits for `sandhi_router_dispatch_a` / `sandhi_server_router_handler_a`. The
-agnosai-side mitigation is proven three times over now (`load_testing`'s
-per-worker arenas, `security_audit`'s per-hop reset, `tools_agnos`'s
-per-exchange arena), so M6 is degraded rather than stopped if nothing lands —
-but the one path we cannot mitigate is sandhi's own dispatch. **This has never
-been filed with sandhi**; the ask exists only in this repo's port plan.
+**Blocker #3 is closed as of the 6.5.2 fold-in (2026-07-29).** It was the one
+open upstream dependency and it gated M6, not M5. sandhi exposed no `_a`-threaded
+router dispatch through 6.4.86 — the one path the agnosai side could not mitigate,
+since the allocation happened inside sandhi's own dispatch rather than in code we
+write. Repaired in sandhi 1.9.7 and shipped in the 6.5.2 bundle:
+`sandhi_router_dispatch_a` and `sandhi_server_router_handler_a` are both present
+in `lib/sandhi.cyr` here, alongside the per-request arena option. The three
+agnosai-side mitigations built while it was open stay valuable in their own right
+(`load_testing`'s per-worker arenas, `security_audit`'s per-hop reset,
+`tools_agnos`'s per-exchange arena) — they were never workarounds for the
+dispatch path, they are the right shape for those modules regardless.
 
 **`load_testing` is the first production user of the port plan's blocker #3
 arena pattern.** One OS thread per simulated user (a load generator that ran
@@ -374,28 +377,27 @@ loudly if the gateway answers and the exchange is wrong.
 
 Open items, none blocking:
 
-1. **Awaiting the bayan 1.3.0 fold-in.** Root-caused and fixed upstream
-   2026-07-28: Cyrius routes a call `X(a, …)` to `X_str` whenever `a` is
-   Str-typed at the call site and `X_str` exists (the same overload dispatch
-   that routes `&IDENT` to `_ptr`). Because bayan's cstr+len forms were named
-   `bayan_json_v_parse_str` / `bayan_yaml_parse_str`, every bare
-   `bayan_json_v_parse(someStr)` was rewritten into a 1-arg call to a 2-arg fn
-   and returned 0 for valid JSON — silently, across ~26 files ecosystem-wide.
-   bayan 1.3.0 renames those forms `_str` → `_buf`.
-   **Action here when the fold lands:** four `*_from_json` entries currently
-   call `bayan_json_v_parse_str` — in `core_message.cyr`, `core_task.cyr`,
-   `core_agent.cyr` and `core_crew.cyr`. That name will no longer exist; switch
-   each to the bare `bayan_json_v_parse(src)`. It is a compile error, not a
-   silent break, so none can be missed.
-2. **Blocker #3 is repaired in sandhi 1.9.7, awaiting a toolchain fold-in.**
-   sandhi now carries `sandhi_server_options_req_arena` (a per-worker,
-   per-request arena), `sandhi_server_request_arena`, and allocator-threaded
-   `sandhi_router_dispatch_a` / `sandhi_server_router_handler_a`. With the
-   option set, the routing path — the method/path accessors and the 404/405
-   writes — allocates in a rewindable arena instead of the no-free global bump.
-   agnosai consumes sandhi from the **toolchain bundle**, not a git dep, so this
-   only reaches the port at the next fold-in; `lib/sandhi.cyr` here is still
-   1.9.5. Nothing in M5 is blocked by it — the gate is M6.
+1. ~~**Awaiting the bayan 1.3.0 fold-in.**~~ ✅ **DONE 2026-07-29 with the 6.5.2 fold-in.**
+   Cyrius routes a call `X(a, …)` to `X_str` whenever `a` is Str-typed at the call
+   site and `X_str` exists (the same dispatch that routes `&IDENT` to `_ptr`).
+   Because bayan's cstr+len forms were named `bayan_json_v_parse_str` /
+   `bayan_yaml_parse_str`, every bare `bayan_json_v_parse(someStr)` was rewritten
+   into a 1-arg call to a 2-arg fn and returned 0 for valid JSON — silently,
+   across ~26 files ecosystem-wide. bayan 1.3.0 renames those forms `_str` →
+   `_buf`, and **23 call sites here moved from `bayan_json_v_parse_str` to
+   `bayan_json_v_parse_buf`** across nine `src/` modules and seven suites. The
+   bodies are byte-identical, so this was a pure rename with no semantic change,
+   and a compile error rather than a silent break, so none could be missed.
+2. ~~**Blocker #3 awaiting a toolchain fold-in.**~~ ✅ **CLOSED 2026-07-29.**
+   Repaired in sandhi 1.9.7 and now shipped in the 6.5.2 bundle, so it has
+   reached the port: `lib/sandhi.cyr` here carries
+   `sandhi_server_options_req_arena` and `_get_req_arena` (a per-worker,
+   per-request arena, default off), `sandhi_server_request_arena`, and the
+   allocator-threaded `sandhi_router_dispatch_a` / `sandhi_server_router_handler_a`
+   — all five verified present after the sync. With the option set, the routing
+   path (the method/path accessors and the 404/405 writes) allocates in a
+   rewindable arena instead of the no-free global bump. **M6 can now be built
+   against it rather than around it.**
 
    **Known residual, already filed and not sandhi's to fix:** with the arena on,
    a response still grows the global bump by exactly 16 bytes — the `Result`
@@ -403,10 +405,17 @@ Open items, none blocking:
    `2026-07-28-sock-send-result-allocates-per-call.md`, re-confirmed present on
    6.5.0, and pinned by `sandhi/tests/sandhi.tcyr::test_server_req_arena` as an
    exact bound so the test will speak up if the stdlib fix lands.
-3. **`lib/sakshi.cyr` is vendored at 2.4.3 while the 6.4.86 toolchain bundles
-   2.4.6**, which every build reports as a shadow warning. `cyrius lib sync
-   --full` re-syncs.
-3. **Cyrius `_int` overload misdispatch — filed 2026-07-29.**
+3. **`lib/sakshi.cyr` lands at 2.4.3 even after `cyrius lib sync --full`**, which
+   every build reports as a shadow warning against the 6.5.2 bundle's 2.4.7.
+   This is **not agnosai's to fix and not a correctness problem.** Each git dep
+   vendors its own sakshi distribution and `cyrius deps` copies them into `lib/`
+   with last-write-wins: bote / majra / ai-hwaccel carry 2.4.6, sigil and kavach
+   carry 2.4.3, tyche carries 2.2.10. A 2.4.3 copy wins. The 2.4.3 → 2.4.7 diff
+   is three added public verbs (`sakshi_trace_id_hi`, `_lo`, `_trace_set_128`)
+   plus `_`-prefixed internal churn, and the older bundle is a superset of the
+   symbols anything here calls, so nothing breaks. It clears when sigil, kavach
+   and tyche re-cut their bundles.
+4. **Cyrius `_int` overload misdispatch — filed 2026-07-29.**
    `X(f(), …)` silently runs `X_int`'s body when `X_int` exists and the first
    argument is written as a bare call result; the same value via a variable
    dispatches correctly, with no diagnostic either way. Cost about an hour to

@@ -16,7 +16,8 @@
 > blocker #1 fixed upstream in **sandhi 1.9.4** (three silent-truncation paths,
 > not one); blocker #4 shipped in cyrius 6.4.84; blocker #5 downgraded to
 > hygiene; blocker #8 (sort) discovered and quantified; blocker #6 **resolved by decision** — the tool sandbox rides **cx** +
-> kavach, recorded in ADR-006. Blocker #3 remains genuinely blocking, with a
+> kavach, recorded in ADR-006. Blocker #3 is **closed** as of the cyrius 6.5.2
+> fold-in (2026-07-29); it was previously the one genuinely blocking item, with a
 > known agnosai-side mitigation.
 
 ## Verdict
@@ -215,7 +216,7 @@ included later (last-definition-wins, silently). Real modules **are** includable
 | sigil | `pem_decode_pubkey` — a ~20-line clone of `pem_decode_privkey`. **Nice-to-have, not a blocker** (see below) |
 | bote | `jwt_verify_rs256` — **its stated premise is stale**: jwt.cyr:9-11 says "RS256 needs an asymmetric primitive sigil doesn't yet expose", but sigil has `rsa_pkcs1v15_verify_sha256` and `rsa_pubkey_from_der` already accepts SPKI. **Do not wait on this** — verified 2026-07-28 by *compiling and running* a scratch RS256 verify against the real toolchain. Implement the JWT half locally in agnosai over `bayan_base64url_decode` + `clock_epoch_secs` + sigil's existing RSA/SHA-256 primitives |
 | majra | ✅ **hub-mutex-across-blocking-sends fixed in 2.5.3**. Still open: relay's file-scope globals make `relay_receive` non-reentrant (its own comment says they're vestigial) |
-| sandhi | ✅ **body cap/413 shipped in 1.9.4** (blocker #1) — plus the two adjacent silent paths found while fixing it (peer-hangup, TE-chunked-only) and a configurable `max_request`. **Still open:** per-request allocation (blocker #3) — ask for `sandhi_router_dispatch_a(a, ...)` / `_c_a` plus an optional per-request arena hook on `run_pooled` (the TLS pool already proves the pattern), and `_a` variants for the two bare `send_status` calls inside `_sandhi_server_pool_worker`; `backlog` silently ignored by run_opts/run_async; chunked start hardcodes " OK"; **inbound** chunked decoding (1.9.4 answers 501, which is honest but not the same as support) |
+| sandhi | ✅ **body cap/413 shipped in 1.9.4** (blocker #1) — plus the two adjacent silent paths found while fixing it (peer-hangup, TE-chunked-only) and a configurable `max_request`. ✅ **per-request allocation (blocker #3) shipped in 1.9.7, folded in with cyrius 6.5.2 on 2026-07-29** — `sandhi_server_options_req_arena` / `_get_req_arena` (per-worker, per-request, default off), `sandhi_server_request_arena`, and the allocator-threaded `sandhi_router_dispatch_a` / `sandhi_server_router_handler_a`, all five verified present in agnosai's `lib/sandhi.cyr`. Residual: 16 B/response from `lib/net.cyr`'s `sock_send` `Result`, filed as a cyrius issue and pinned by an exact-bound test in sandhi. **Still open:** `backlog` silently ignored by run_opts/run_async; chunked start hardcodes " OK"; **inbound** chunked decoding (1.9.4 answers 501, which is honest but not the same as support) |
 
 ## Corrections to earlier claims (recorded so they are not re-derived)
 

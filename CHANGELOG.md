@@ -182,6 +182,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     values are sets, not lists: a duplicated edge must not double-count an in-degree, or the
     target never becomes ready.
 ### Changed
+- **toolchain: cyrius `6.4.86` → `6.5.2`** (`cyrius.cyml`), folding in bayan 1.3.0, sandhi 1.9.7
+  and sakshi 2.4.7.
+  - **bayan 1.3.0 renames the cstr+len parsers `_str` → `_buf`**, so **23 call sites moved from
+    `bayan_json_v_parse_str` to `bayan_json_v_parse_buf`** across nine `src/` modules and seven
+    suites. The bodies are byte-identical — a pure rename, no semantic change. The rename exists
+    because `X_str` is a *reserved overload slot*: Cyrius routes `X(a, …)` to `X_str` whenever `a`
+    is Str-typed at the call site, so a cstr+len form may never occupy that name. While it did,
+    every bare `bayan_json_v_parse(someStr)` in the ecosystem was silently rewritten into a 1-arg
+    call to a 2-arg function and returned 0 for valid JSON. Here it was a compile error rather
+    than a silent break, so no call site could be missed.
+  - **sandhi 1.9.7 closes port-plan blocker #3, and it has now reached the port.**
+    `lib/sandhi.cyr` carries `sandhi_server_options_req_arena` / `_get_req_arena` (a per-worker,
+    per-request arena, default off), `sandhi_server_request_arena`, and the allocator-threaded
+    `sandhi_router_dispatch_a` / `sandhi_server_router_handler_a` — all five verified present.
+    The routing path can now allocate in a rewindable arena instead of the no-free global bump,
+    so **M6 can be built against it rather than around it.** Residual, filed upstream and not
+    sandhi's to fix: 16 B/response from the `Result` that `lib/net.cyr`'s `sock_send` returns.
+  - **sakshi 2.4.7** in the bundle, though `lib/sakshi.cyr` still lands at 2.4.3 and the shadow
+    warning persists — each git dep vendors its own sakshi distribution and `cyrius deps` copies
+    them last-write-wins (sigil and kavach carry 2.4.3, tyche 2.2.10). Not a correctness problem:
+    the diff is three added public verbs plus `_`-prefixed internal churn, and the older bundle is
+    a superset of what anything here calls.
+  - Two upstream issues filed the same day were **re-verified as still present on 6.5.2** rather
+    than assumed fixed: `mutex_unlock`'s unconditional `FUTEX_WAKE` (392 ns, unchanged) and
+    `fmt_int_buf`'s `i64::MIN` corruption (still emits `{"n":-}`). Every orchestration benchmark
+    re-ran within run-to-run noise of its 6.5.1 value, which independently confirms the mutex
+    path did not change.
+
 - **Identifiers are canonical strings, not raw 16-byte UUID buffers.** `agnosai_task_id`,
   `agnosai_crew_id`, `agnosai_message_id`, task dependencies and assigned-agent ids now hold the
   36-char canonical form; `agnosai_uuid_v4_str` and `agnosai_uuid_canonical` are what constructors
