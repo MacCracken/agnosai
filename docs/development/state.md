@@ -49,7 +49,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | M3 exit: live chat-completion round trip | ✅ verified through `agnosai_hoosh_chat` (`scripts/stack.sh check`) |
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
-| `orchestrator` ported (M5, Phase 4) | 🟡 4 pure leaves + scoring + scheduler + budget + approval + plan_cache + memory + hierarchical + durable_state done, `server/sse` pulled forward, `crew_runner` leaves landed (bite 1 of 3); `crew_runner` core + `orchestrator` left |
+| `orchestrator` ported (M5, Phase 4) | 🟡 4 pure leaves + scoring + scheduler + budget + approval + plan_cache + memory + hierarchical ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
@@ -57,7 +57,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2399 assertions across 39 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**2582 assertions across 41 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -97,8 +97,10 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `orch_hierarchical.tcyr` | 30 | 6 |
 | `server_sse.tcyr` | 56 | 10 |
 | `orch_durable_state.tcyr` | 82 | 8 |
-| `orch_crew_runner.tcyr` | 108 | 12 |
+| `orch_crew_runner.tcyr` | 184 | 30 |
 | `server_prompt_guard.tcyr` | 62 | 22 |
+| `orch_audit.tcyr` | 52 | — (hoosh's audit.rs tests) |
+| `orch_orchestrator.tcyr` | 51 | 5 |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -130,7 +132,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (688/688 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (727/727 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -262,6 +264,8 @@ the default level the number measures sakshi writing to a pipe.
 | `crew_build_system_prompt` | 1.47 µs |
 | `prompt_scan_clean_67b` | 8.04 µs |
 | `prompt_scan_clean_4k` | 273 µs |
+| `audit_record` | 27.9 µs |
+| `audit_verify_256` | 2.65 ms |
 
 **These numbers are futex-bound, not algorithm-bound**, and that is the finding rather than an
 excuse. `mutex_lock` + `mutex_unlock` costs **394 ns uncontended** because `lib/sync.cyr`'s
@@ -286,7 +290,7 @@ across tasks. That is the oracle's behaviour and the reason the cost is linear i
 
 **Not comparable to `rust-old/bench-history.csv`** — different allocator, different harness, no
 criterion statistics. The Cyrius line starts its own baseline, captured by
-`scripts/bench-history.sh` into the root `bench-history.csv` (59 rows per capture).
+`scripts/bench-history.sh` into the root `bench-history.csv` (61 rows per capture).
 
 ## Dependencies
 

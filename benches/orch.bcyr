@@ -47,6 +47,9 @@ include "src/orch_plan_cache.cyr"
 include "src/orch_memory.cyr"
 include "src/orch_hierarchical.cyr"
 include "src/orch_durable_state.cyr"
+# crew_runner needs the validation loop, the prompt guard and the audit chain.
+include "src/orch_output_validation.cyr"
+include "src/orch_audit.cyr"
 include "src/orch_crew_runner.cyr"
 
 # An agent with two tools, a complexity and a domain — the shape scoring reads.
@@ -504,6 +507,41 @@ fn _b_prompt_scan_4k(): i64 {
     return 0;
 }
 
+# The audit chain's record path: a uuid, a JSON build, a SHA-256 and an
+# HMAC-SHA256 per entry. Every sequential task pays one.
+fn _b_audit_record(): i64 {
+    var n = 20000;
+    var chain = agnosai_audit_chain_new();
+    var event = str_from("task_completed");
+    var level = str_from("info");
+    var msg = str_from("summarize the quarterly revenue report");
+
+    var b = bench_new("audit_record");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_audit_record(chain, event, level, msg, 0, 0, 0); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Verifying a full 256-entry chain — the operation an auditor runs, which
+# re-hashes and re-signs every entry.
+fn _b_audit_verify(): i64 {
+    var n = 200;
+    var chain = agnosai_audit_chain_with_key(alloc(AGNOSAI_AUDIT_KEY_BYTES), 256);
+    for (var f = 0; f < 256; f = f + 1) {
+        agnosai_audit_record(chain, str_from("task_completed"), str_from("info"),
+        str_from("done"), 0, 0, 0);
+    }
+
+    var b = bench_new("audit_verify_256");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_audit_verify(chain); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 # Remove everything the durable benchmarks created.
 fn _b_durable_teardown(): i64 {
     sys_unlink(str_data(str_from("/tmp/agnosai-bench-durable/bench-crew.json")));
@@ -541,6 +579,8 @@ fn main(): i64 {
     _b_infer_provider();
     _b_prompt_scan_clean();
     _b_prompt_scan_4k();
+    _b_audit_record();
+    _b_audit_verify();
 
     return 0;
 }

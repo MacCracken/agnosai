@@ -222,6 +222,19 @@ fn main() {
     "a string where an integer belongs is rejected rather than coerced");
     assert_eq(load64(&cost), AGNOSAI_NO_LIMIT, "leaving it absent");
 
+    # --- the client handle ---
+    # execute_task takes `Option<&Arc<HooshClient>>` in the oracle, so 0 has to
+    # mean "no client, use the placeholder path". This is the minimum that shape
+    # needs: hoosh's own client is a provider registry, a cache and a cost
+    # tracker, all of which live on the far side of the seam here.
+    var hc = agnosai_hoosh_client_new(str_from("http://127.0.0.1:8088"), str_from("sk-test"));
+    assert(hc != 0, "a client handle is non-zero, so 0 unambiguously means absent");
+    _t_assert_str(agnosai_hoosh_client_base_url(hc), "http://127.0.0.1:8088", "base url round-trips");
+    _t_assert_str(agnosai_hoosh_client_api_key(hc), "sk-test", "and the api key");
+    var hc_anon = agnosai_hoosh_client_new(str_from("http://gw"), str_from(""));
+    assert_eq(str_len(agnosai_hoosh_client_api_key(hc_anon)), 0,
+    "an unauthenticated gateway takes an empty key, which is still a present Str");
+
     # --- the cache signal ---
     assert_eq(agnosai_hoosh_cache_from_header(str_from("HIT")), AGNOSAI_HOOSH_CACHE_HIT,
     "HIT maps to the exact-cache constant");

@@ -29,10 +29,17 @@ include "src/core_message.cyr"
 include "src/core_resource.cyr"
 include "src/core_task.cyr"
 include "src/core_agent.cyr"
+include "src/core_crew.cyr"
+include "src/orch_scheduler.cyr"
+include "src/orch_audit.cyr"
 include "src/llm_retry.cyr"
 include "src/llm_hoosh.cyr"
 include "src/llm_router.cyr"
 include "src/orch_scoring.cyr"
+include "src/orch_output_validation.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
 include "src/orch_crew_runner.cyr"
 include "tests/test_helpers.cyr"
 
@@ -420,6 +427,358 @@ fn main() {
     assert_eq(agnosai_agent_llm_model(routed), 0, "an unset llm_model is 0");
     assert(str_eq(_agnosai_crew_select_model(routed), str_from("llama3:70b")) == 1,
     "so it routes by complexity instead");
+
+    # =====================================================================
+    # execute_task (bite 15)
+    # =====================================================================
+
+    # --- test_execute_task_placeholder_when_no_llm ---
+    # client == 0 is the oracle's `llm: None`.
+    var ph_task = agnosai_task_new(str_from("summarize the document"));
+    var ph = agnosai_execute_task(ph_task, 0, 0, 0);
+    assert(ph != 0, "the placeholder path returns a result");
+    assert_eq(agnosai_task_result_status(ph), AGNOSAI_STATUS_COMPLETED, "marked completed");
+    assert(str_eq(agnosai_task_result_output(ph), str_from("summarize the document")) == 1,
+    "with the task description echoed VERBATIM as the output — not a message about it");
+    assert(str_eq(agnosai_task_result_task_id(ph), agnosai_task_id(ph_task)) == 1,
+    "carrying the task's own id");
+
+    # --- test_execute_task_placeholder_has_duration ---
+    var ph_md = agnosai_task_result_metadata(ph);
+    assert(map_get(ph_md, str_from("task_duration_ms")) != 0,
+    "the placeholder still reports a duration");
+    assert_eq(map_size(ph_md), 1,
+    "and NOTHING else — no model, no provider, no cost, because none were involved");
+
+    # a placeholder with an agent behaves identically: the agent only shapes the
+    # prompt, which the placeholder path never builds
+    var ph_agent = agnosai_execute_task(ph_task, _t_agent("a1"), 0, 0);
+    assert(str_eq(agnosai_task_result_output(ph_agent), str_from("summarize the document")) == 1,
+    "an agent does not change the placeholder output");
+
+    # --- the request the LLM path would send ---
+    # Built directly, since driving a real inference needs a gateway.
+    var rq_task = agnosai_task_new(str_from("write the report"));
+    var rq = _agnosai_crew_build_request(rq_task, 0, str_from("llama3:70b"), 0);
+    var msgs = agnosai_inference_request_messages(rq);
+    assert_eq(vec_len(msgs), 2,
+    "a context-free task sends exactly two turns: system, then user");
+    assert_eq(agnosai_chat_message_role(vec_get(msgs, 0)), AGNOSAI_ROLE_SYSTEM,
+    "the system prompt is folded into messages[0] — the port's request has no separate `system` \
+    field, so execute_task does the merge the Rust hoosh client used to do at the wire");
+    assert(str_contains(agnosai_chat_message_content(vec_get(msgs, 0)),
+    str_from("<system_instructions>")) == 1, "and it is the guarded wrapper, not the raw prompt");
+    assert_eq(agnosai_chat_message_role(vec_get(msgs, 1)), AGNOSAI_ROLE_USER, "then the user turn");
+    assert(str_contains(agnosai_chat_message_content(vec_get(msgs, 1)),
+    str_from("<user_input field=\"task_description\">")) == 1,
+    "sanitized — every user-supplied field is wrapped before it reaches the model");
+
+    assert_eq(agnosai_inference_request_max_tokens(rq), 4096, "max_tokens is the oracle's 4096");
+    assert_eq(agnosai_inference_request_temperature_milli(rq), 700,
+    "and the temperature is the oracle's flat 0.7 — the personality adjustment needs bhava, which \
+    is deferred, so that arm is unreachable rather than skipped");
+
+    # --- a task WITH context gains the preamble pair ---
+    var ctx_task = agnosai_task_new(str_from("continue"));
+    agnosai_task_with_context(ctx_task, str_from("prior"),
+    bayan_json_v_str_new(str_from("step one done")));
+    var ctx_rq = _agnosai_crew_build_request(ctx_task, 0, str_from("m"), 0);
+    var ctx_msgs = agnosai_inference_request_messages(ctx_rq);
+    assert_eq(vec_len(ctx_msgs), 4,
+    "a task with context sends FOUR turns — system, the context as a user turn, a canned \
+    assistant acknowledgement, then the real user turn");
+    assert_eq(agnosai_chat_message_role(vec_get(ctx_msgs, 2)), AGNOSAI_ROLE_ASSISTANT,
+    "the third is the assistant acknowledgement");
+    assert(str_eq(agnosai_chat_message_content(vec_get(ctx_msgs, 2)),
+    str_from("Understood, I have the context.")) == 1, "with the oracle's exact wording");
+    assert(str_contains(agnosai_chat_message_content(vec_get(ctx_msgs, 1)),
+    str_from("<user_input field=\"context\">")) == 1,
+    "and the context itself is sanitized too — it can carry upstream task output");
+
+    # --- expected_output is appended to the user turn ---
+    var eo_task = agnosai_task_new(str_from("do it"));
+    agnosai_task_with_expected_output(eo_task, str_from("a markdown table"));
+    var eo_msg = _agnosai_crew_user_message(eo_task);
+    assert(str_contains(eo_msg, str_from("<user_input field=\"task_description\">")) == 1,
+    "the description is present");
+    assert(str_contains(eo_msg, str_from("<user_input field=\"expected_output\">")) == 1,
+    "and the expected output, separately sanitized under its own field name");
+    assert(str_contains(eo_msg, str_from("</user_input>\n\n<user_input")) == 1,
+    "joined by a blank line");
+
+    # --- a retry request rebuilds from the ORIGINAL prompt ---
+    # The oracle rebuilds rather than accumulating, so a second retry's prompt is
+    # not the first retry's prompt plus more. Passing the retry text explicitly
+    # is what makes that structural rather than a discipline the caller must keep.
+    var rt = _agnosai_crew_build_request(rq_task, 0, str_from("m"), str_from("RETRY PROMPT"));
+    var rt_msgs = agnosai_inference_request_messages(rt);
+    assert(str_eq(agnosai_chat_message_content(vec_get(rt_msgs, vec_len(rt_msgs) - 1)),
+    str_from("RETRY PROMPT")) == 1,
+    "the retry prompt REPLACES the user turn rather than being appended, which is what stops the \
+    prompt growing exponentially across validation retries");
+
+    # --- the crew id for events comes from the task context, not the spec ---
+    assert(str_eq(_agnosai_crew_event_crew_id(rq_task), str_from("unknown")) == 1,
+    "a task with no crew_id in its context emits events under the literal \"unknown\" — the \
+    oracle reads task.context, NOT the crew spec's own id, and this reproduces that quirk");
+    var stamped = agnosai_task_new(str_from("t"));
+    agnosai_task_with_context(stamped, str_from("crew_id"),
+    bayan_json_v_str_new(str_from("crew-7")));
+    assert(str_eq(_agnosai_crew_event_crew_id(stamped), str_from("crew-7")) == 1,
+    "a stamped task uses its own crew id");
+
+    # --- the agent label ---
+    assert(str_eq(_agnosai_crew_agent_label(0), str_from("unassigned")) == 1,
+    "no agent logs as \"unassigned\"");
+    assert(str_eq(_agnosai_crew_agent_label(_t_agent("worker")), str_from("worker")) == 1,
+    "and an agent by its key");
+
+    # --- the error result ---
+    var er = _agnosai_crew_error_result(rq_task, str_from("connection refused"), clock_now_ns());
+    assert_eq(agnosai_task_result_status(er), AGNOSAI_STATUS_FAILED, "a failed inference FAILS");
+    assert(str_eq(agnosai_task_result_output(er),
+    str_from("LLM error: connection refused")) == 1, "with the oracle's exact output prefix");
+    var er_md = agnosai_task_result_metadata(er);
+    assert_eq(map_size(er_md), 2, "and exactly two metadata keys");
+    assert(map_get(er_md, str_from("error")) != 0, "the error");
+    assert(map_get(er_md, str_from("task_duration_ms")) != 0, "and the duration");
+
+    # --- success metadata, including the cost decision ---
+    var ok_body = str_cat(str_cat(
+    str_from("{\"model\":\"gpt-4o-mini\",\"choices\":[{\"message\":{\"content\":\"done\"}}],"),
+    str_from("\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,")),
+    str_from("\"cost_micro_usd\":450,\"provider\":\"openai\"}}"));
+    var ok_resp = agnosai_hoosh_response_from_body(ok_body);
+    var ok_r = agnosai_task_result_new(agnosai_task_id(rq_task), str_from("done"),
+    AGNOSAI_STATUS_COMPLETED);
+    _agnosai_crew_success_metadata(ok_r, ok_resp, clock_now_ns());
+    var ok_md = agnosai_task_result_metadata(ok_r);
+    assert(map_get(ok_md, str_from("model")) != 0, "success metadata carries the model");
+    assert(map_get(ok_md, str_from("tokens")) != 0, "the token breakdown");
+    assert(map_get(ok_md, str_from("task_duration_ms")) != 0, "the duration");
+    assert(map_get(ok_md, str_from("cost_micro_usd")) != 0,
+    "and cost_micro_usd — NOT the oracle's cost_usd, because the value is integer micro-USD and \
+    emitting it under the old key would multiply every consumer's dashboard by 1e6");
+    assert_eq(map_get(ok_md, str_from("cost_usd")), 0, "the old f64 key is gone");
+    assert(str_eq(bayan_json_v_str(map_get(ok_md, str_from("provider"))),
+    str_from("openai")) == 1, "the provider is hoosh's real serving route");
+
+    # a pre-2.6.0 gateway reports no cost, and the key is OMITTED rather than
+    # defaulted to zero — zero is a real cost for a local model
+    var old_body = str_cat(
+    str_from("{\"model\":\"llama3\",\"choices\":[{\"message\":{\"content\":\"d\"}}],"),
+    str_from("\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}"));
+    var old_r = agnosai_task_result_new(agnosai_task_id(rq_task), str_from("d"),
+    AGNOSAI_STATUS_COMPLETED);
+    _agnosai_crew_success_metadata(old_r, agnosai_hoosh_response_from_body(old_body),
+    clock_now_ns());
+    assert_eq(map_get(agnosai_task_result_metadata(old_r), str_from("cost_micro_usd")), 0,
+    "an older gateway's response OMITS cost_micro_usd rather than publishing a fabricated 0 — a \
+    real 0 means a free local inference, and the two must stay distinguishable");
+    assert(str_eq(bayan_json_v_str(map_get(agnosai_task_result_metadata(old_r),
+    str_from("provider"))), str_from("ollama")) == 1,
+    "and the provider falls back to the model-name inference, which is what the oracle did");
+
+    # =====================================================================
+    # the CrewRunner (bite 16)
+    # =====================================================================
+
+    # A crew of `n` placeholder tasks, sequential.
+    var seq_spec = agnosai_crew_new(str_from("seq-crew"));
+    var seq_tasks = vec_new();
+    vec_push(seq_tasks, agnosai_task_new(str_from("first")));
+    vec_push(seq_tasks, agnosai_task_new(str_from("second")));
+    agnosai_crew_with_tasks(seq_spec, seq_tasks);
+
+    var runner = agnosai_crew_runner_new(seq_spec);
+    var run_err: i64[1];
+    store64(&run_err, 0);
+    var state = agnosai_crew_runner_run(runner, &run_err);
+    assert_eq(load64(&run_err), 0, "a sequential crew runs without error");
+    assert(state != 0, "and returns a state");
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED, "completed");
+    assert_eq(vec_len(agnosai_crew_state_results(state)), 2, "with a result per task");
+    assert(str_eq(agnosai_task_result_output(vec_get(agnosai_crew_state_results(state), 0)),
+    str_from("first")) == 1, "in task order");
+
+    # --- test_sequential_empty ---
+    var empty_spec = agnosai_crew_new(str_from("empty"));
+    var empty_state = agnosai_crew_runner_run(agnosai_crew_runner_new(empty_spec), &run_err);
+    assert_eq(load64(&run_err), 0, "an empty crew is not an error");
+    assert_eq(agnosai_crew_state_status(empty_state), AGNOSAI_CREW_COMPLETED,
+    "and completes — `all()` over an empty result set is TRUE, so it must not read as failed");
+    assert_eq(vec_len(agnosai_crew_state_results(empty_state)), 0, "with no results");
+
+    # --- the profile ---
+    var prof = agnosai_crew_state_profile(state);
+    assert(prof != 0, "a completed run carries a profile");
+    assert_eq(agnosai_crew_profile_task_count(prof), 2, "counting the tasks");
+    assert_eq(map_size(agnosai_crew_profile_task_ms(prof)), 2,
+    "with a duration per task, taken from each result's metadata");
+    assert_eq(agnosai_crew_profile_cost_micro_usd(prof), 0,
+    "and zero cost — the placeholder path never calls an LLM, so no task reports one");
+
+    # --- test_parallel_execution / test_parallel_single_concurrency ---
+    # Real OS threads: alloc has been thread-safe since cyrius 6.0.64.
+    var par_spec = agnosai_crew_new(str_from("par-crew"));
+    var par_tasks = vec_new();
+    for (var pi = 0; pi < 5; pi = pi + 1) {
+        vec_push(par_tasks, agnosai_task_new(str_cat(str_from("job-"), str_from_int(pi))));
+    }
+    agnosai_crew_with_tasks(par_spec, par_tasks);
+    agnosai_crew_with_process(par_spec, agnosai_process_parallel(2));
+    var par_state = agnosai_crew_runner_run(agnosai_crew_runner_new(par_spec), &run_err);
+    assert_eq(load64(&run_err), 0, "a parallel crew runs");
+    assert_eq(vec_len(agnosai_crew_state_results(par_state)), 5,
+    "every task produces a result even though only 2 run at a time");
+    assert_eq(agnosai_crew_state_status(par_state), AGNOSAI_CREW_COMPLETED, "and the crew completes");
+
+    var single = agnosai_crew_new(str_from("single"));
+    agnosai_crew_with_tasks(single, par_tasks);
+    agnosai_crew_with_process(single, agnosai_process_parallel(1));
+    assert_eq(vec_len(agnosai_crew_state_results(
+    agnosai_crew_runner_run(agnosai_crew_runner_new(single), &run_err))), 5,
+    "concurrency 1 still runs all five — it is a limit, not a cap on the work");
+
+    # --- test_dag_execution_with_dependencies ---
+    var dag_spec = agnosai_crew_new(str_from("dag"));
+    var a_task = agnosai_task_new(str_from("A"));
+    var b_task = agnosai_task_new(str_from("B"));
+    agnosai_task_with_dependency(b_task, agnosai_task_id(a_task));
+    var dag_tasks = vec_new();
+    vec_push(dag_tasks, b_task);
+    vec_push(dag_tasks, a_task);
+    agnosai_crew_with_tasks(dag_spec, dag_tasks);
+    agnosai_crew_with_process(dag_spec, agnosai_process_dag());
+    var dag_state = agnosai_crew_runner_run(agnosai_crew_runner_new(dag_spec), &run_err);
+    assert_eq(load64(&run_err), 0, "a DAG crew runs");
+    var dag_results = agnosai_crew_state_results(dag_state);
+    assert_eq(vec_len(dag_results), 2, "both tasks run");
+    assert(str_eq(agnosai_task_result_task_id(vec_get(dag_results, 0)),
+    agnosai_task_id(a_task)) == 1,
+    "the DEPENDENCY runs first even though it was listed second — dependency order, not spec order");
+
+    # --- test_dag_no_deps_runs_all: one wave ---
+    var flat = agnosai_crew_new(str_from("flat"));
+    var flat_tasks = vec_new();
+    vec_push(flat_tasks, agnosai_task_new(str_from("x")));
+    vec_push(flat_tasks, agnosai_task_new(str_from("y")));
+    vec_push(flat_tasks, agnosai_task_new(str_from("z")));
+    agnosai_crew_with_tasks(flat, flat_tasks);
+    agnosai_crew_with_process(flat, agnosai_process_dag());
+    assert_eq(vec_len(agnosai_crew_state_results(
+    agnosai_crew_runner_run(agnosai_crew_runner_new(flat), &run_err))), 3,
+    "independent tasks all run in a single wave");
+
+    # --- test_topo_sort_detects_cycle, at the run() layer ---
+    var cyc = agnosai_crew_new(str_from("cyclic"));
+    var c1 = agnosai_task_new(str_from("c1"));
+    var c2 = agnosai_task_new(str_from("c2"));
+    agnosai_task_with_dependency(c1, agnosai_task_id(c2));
+    agnosai_task_with_dependency(c2, agnosai_task_id(c1));
+    var cyc_tasks = vec_new();
+    vec_push(cyc_tasks, c1);
+    vec_push(cyc_tasks, c2);
+    agnosai_crew_with_tasks(cyc, cyc_tasks);
+    agnosai_crew_with_process(cyc, agnosai_process_dag());
+    store64(&run_err, 0);
+    var cyc_state = agnosai_crew_runner_run(agnosai_crew_runner_new(cyc), &run_err);
+    assert_eq(cyc_state, 0,
+    "a cyclic DAG returns NO STATE — the oracle's `?` means it never builds one, so a consumer \
+    can tell \"the spec was wrong\" from \"the work failed\"");
+    assert(load64(&run_err) != 0, "and reports an error instead");
+    assert_eq(agnosai_error_kind(load64(&run_err)), AGNOSAI_ERR_CYCLIC_DAG, "a CyclicDAG error");
+
+    # --- test_hierarchical_falls_back_to_sequential ---
+    var hier = agnosai_crew_new(str_from("hier"));
+    agnosai_crew_with_tasks(hier, seq_tasks);
+    agnosai_crew_with_process(hier, agnosai_process_hierarchical(_t_agent("mgr")));
+    store64(&run_err, 0);
+    var hier_state = agnosai_crew_runner_run(agnosai_crew_runner_new(hier), &run_err);
+    assert_eq(load64(&run_err), 0, "hierarchical mode runs");
+    assert_eq(vec_len(agnosai_crew_state_results(hier_state)), 2,
+    "by falling back to SEQUENTIAL — orch_hierarchical's delegation exists and is tested, but the \
+    oracle has not wired it in, and doing so here would diverge from Phase 2 upstream");
+
+    # --- cancellation ---
+    var cancel_spec = agnosai_crew_new(str_from("cancelled"));
+    agnosai_crew_with_tasks(cancel_spec, seq_tasks);
+    var cancel_runner = agnosai_crew_runner_new(cancel_spec);
+    assert_eq(agnosai_crew_runner_is_cancelled(cancel_runner), 0, "a new runner is not cancelled");
+    agnosai_crew_runner_cancel(cancel_runner);
+    assert_eq(agnosai_crew_runner_is_cancelled(cancel_runner), 1, "until it is");
+    store64(&run_err, 0);
+    var cancel_state = agnosai_crew_runner_run(cancel_runner, &run_err);
+    assert_eq(agnosai_crew_state_status(cancel_state), AGNOSAI_CREW_CANCELLED,
+    "a cancelled crew reports CANCELLED, which beats both completed and failed");
+    assert_eq(vec_len(agnosai_crew_state_results(cancel_state)), 0,
+    "and runs nothing — cancellation is checked BEFORE each task, so results hold what actually \
+    ran rather than a set of synthetic failures");
+
+    # --- the client and the shared cancel flag ---
+    # with_llm attaches the gateway; without it every task takes the placeholder
+    # path, which is what the whole test file above relies on.
+    var llm_runner = agnosai_crew_runner_with_llm(agnosai_crew_runner_new(seq_spec),
+    agnosai_hoosh_client_new(str_from("http://127.0.0.1:8088"), str_from("")));
+    assert(llm_runner != 0, "a client can be attached");
+    var flag = agnosai_crew_runner_cancel_flag(llm_runner);
+    assert(flag != 0, "the cancel flag is a shared pointer, not a copy");
+    assert_eq(load64(flag), 0, "starting clear");
+    agnosai_crew_runner_cancel(llm_runner);
+    assert_eq(load64(flag), 1,
+    "and cancelling writes THROUGH it — which is what lets a worker thread spawned earlier see a \
+    cancellation raised while its wave is in flight");
+
+    # --- events ---
+    var bus = agnosai_event_bus_new();
+    var ev_spec = agnosai_crew_new(str_from("evented"));
+    agnosai_crew_with_tasks(ev_spec, seq_tasks);
+    var tx = agnosai_event_bus_sender(bus, agnosai_crew_id(ev_spec));
+    var sub = agnosai_event_sender_subscribe(tx);
+    var ev_runner = agnosai_crew_runner_with_events(agnosai_crew_runner_new(ev_spec), tx);
+    agnosai_crew_runner_run(ev_runner, &run_err);
+
+    var first_ev = agnosai_event_sub_try_recv(sub);
+    assert(first_ev != 0, "the run emits events");
+    assert(str_eq(agnosai_crew_event_event_type(first_ev), str_from("crew_started")) == 1,
+    "starting with crew_started");
+    var seen_completed = 0;
+    var seen_task_started = 0;
+    for (var e = 0; e < 12; e = e + 1) {
+        var ev = agnosai_event_sub_try_recv(sub);
+        if (ev == 0) { break; }
+        if (str_eq(agnosai_crew_event_event_type(ev), str_from("task_started")) == 1) {
+            seen_task_started = seen_task_started + 1;
+        }
+        if (str_eq(agnosai_crew_event_event_type(ev), str_from("crew_completed")) == 1) {
+            seen_completed = 1;
+        }
+    }
+    assert_eq(seen_task_started, 2, "one task_started per task");
+    assert_eq(seen_completed, 1, "and a closing crew_completed");
+
+    # --- audit ---
+    var chain = agnosai_audit_chain_new();
+    var au_spec = agnosai_crew_new(str_from("audited"));
+    agnosai_crew_with_tasks(au_spec, seq_tasks);
+    agnosai_crew_runner_run(
+    agnosai_crew_runner_with_audit(agnosai_crew_runner_new(au_spec), chain), &run_err);
+    assert_eq(agnosai_audit_chain_count(chain), 2,
+    "the sequential path audits one entry per task");
+    assert_eq(agnosai_audit_verify(chain), 0, "and the chain verifies");
+    assert(str_eq(agnosai_audit_entry_event(vec_get(agnosai_audit_chain_recent(chain, 1), 0)),
+    str_from("task_completed")) == 1, "under the task_completed event name");
+
+    # the parallel path does NOT audit — the oracle's asymmetry, reproduced
+    var au2 = agnosai_audit_chain_new();
+    var au_par = agnosai_crew_new(str_from("audited-par"));
+    agnosai_crew_with_tasks(au_par, seq_tasks);
+    agnosai_crew_with_process(au_par, agnosai_process_parallel(2));
+    agnosai_crew_runner_run(
+    agnosai_crew_runner_with_audit(agnosai_crew_runner_new(au_par), au2), &run_err);
+    assert_eq(agnosai_audit_chain_count(au2), 0,
+    "the PARALLEL path audits nothing — only run_sequential calls audit_record in the oracle, and \
+    making the others audit would change what a consumer's trail contains");
 
     return assert_summary();
 }

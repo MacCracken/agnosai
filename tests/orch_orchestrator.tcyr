@@ -1,0 +1,229 @@
+# =========================================================================
+# orch_orchestrator.tcyr — parity tests for src/orch_orchestrator.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/orchestrator/orchestrator.rs.
+#
+# The registry's lifecycle ORDER is what these pin: a crew is audited as
+# accepted before it is registered, registered Pending before it runs, and its
+# cancel token and event channel are cleaned up after. Getting the order wrong
+# still produces a working crew run and a broken audit trail.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core_error.cyr"
+include "src/core_json.cyr"
+include "src/core_message.cyr"
+include "src/core_resource.cyr"
+include "src/core_task.cyr"
+include "src/core_agent.cyr"
+include "src/core_crew.cyr"
+include "src/llm_retry.cyr"
+include "src/llm_hoosh.cyr"
+include "src/llm_router.cyr"
+include "src/orch_scoring.cyr"
+include "src/orch_scheduler.cyr"
+include "src/orch_output_validation.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/orch_audit.cyr"
+include "src/orch_crew_runner.cyr"
+include "src/orch_orchestrator.cyr"
+include "tests/test_helpers.cyr"
+
+# A budget with no duration limit, so the default timeout applies.
+fn _t_budget(): i64 {
+    return agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT,
+    AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT);
+}
+
+# A crew of one trivial task.
+fn _t_spec(name): i64 {
+    var spec = agnosai_crew_new(str_from(name));
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("do the thing")));
+    agnosai_crew_with_tasks(spec, tasks);
+    return spec;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_orchestrator");
+
+    assert_eq(AGNOSAI_MAX_RETAINED_CREWS, 1000, "the registry cap is the oracle's 1000");
+    assert_eq(AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS, 3600, "and the fallback timeout its one hour");
+
+    # --- construction ---
+    var budget = _t_budget();
+    var o = agnosai_orchestrator_new(budget);
+    assert(o != 0, "an orchestrator is created");
+    assert_eq(agnosai_orchestrator_budget(o), budget, "holding its budget");
+    assert_eq(agnosai_orchestrator_crew_count(o), 0, "with an empty registry");
+    assert(agnosai_orchestrator_audit(o) != 0,
+    "and its OWN audit chain, minted with a fresh key — separate from hoosh's inference trail by \
+    construction, which is why the two can never be merged");
+    assert_eq(agnosai_audit_chain_count(agnosai_orchestrator_audit(o)), 0, "starting empty");
+
+    # --- an externally-supplied chain replaces the minted one ---
+    # A caller that already has a chain (from another orchestrator, or restored)
+    # attaches it rather than accumulating two trails.
+    var shared_chain = agnosai_audit_chain_new();
+    var shared_o = agnosai_orchestrator_with_audit(agnosai_orchestrator_new(_t_budget()),
+    shared_chain);
+    assert_eq(agnosai_orchestrator_audit(shared_o), shared_chain,
+    "with_audit replaces the minted chain, so two orchestrators can share ONE trail");
+    agnosai_orchestrator_run_crew(shared_o, _t_spec("shared"));
+    assert(agnosai_audit_chain_count(shared_chain) > 0, "and events land in it");
+    assert_eq(agnosai_audit_verify(shared_chain), 0, "verifying");
+
+    # --- crew_state_with_status, the setter cancel_crew needs ---
+    var st = agnosai_crew_state_new(agnosai_uuid_v4_str(), AGNOSAI_CREW_RUNNING);
+    assert_eq(agnosai_crew_state_status(agnosai_crew_state_with_status(st,
+    AGNOSAI_CREW_CANCELLED)), AGNOSAI_CREW_CANCELLED,
+    "a crew state's status can be set in place — the oracle mutates it through the registry's \
+    write lock, so the port needs a setter for cancel_crew to mark a registered crew");
+
+    # --- the timeout comes from the budget when set ---
+    assert_eq(agnosai_orchestrator_timeout_secs(o), AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS,
+    "an unset max_duration falls back to the one-hour default");
+    var bounded = agnosai_orchestrator_new(
+    agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, 30, AGNOSAI_NO_LIMIT));
+    assert_eq(agnosai_orchestrator_timeout_secs(bounded), 30, "a budgeted duration is used");
+
+    # --- run_crew ---
+    var spec = _t_spec("first-crew");
+    var crew_id = agnosai_crew_id(spec);
+    var state = agnosai_orchestrator_run_crew(o, spec);
+    assert(state != 0, "running a crew returns its state");
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED, "completed");
+    assert_eq(vec_len(agnosai_crew_state_results(state)), 1, "with one result");
+
+    assert_eq(agnosai_orchestrator_crew_count(o), 1, "and the crew is registered");
+    assert_eq(agnosai_orchestrator_crew(o, crew_id), state,
+    "under its id, holding the FINAL state rather than the Pending one it was registered with");
+    assert_eq(agnosai_orchestrator_crew(o, agnosai_uuid_v4_str()), 0,
+    "an unknown id is not registered");
+
+    # --- the audit trail, in order ---
+    var chain = agnosai_orchestrator_audit(o);
+    assert_eq(agnosai_audit_chain_count(chain), 3,
+    "three entries: crew_accepted, the runner's per-task task_completed, and crew_finished");
+    assert_eq(agnosai_audit_verify(chain), 0, "and the chain verifies");
+
+    var entries = agnosai_audit_chain_recent(chain, 3);
+    assert(str_eq(agnosai_audit_entry_event(vec_get(entries, 0)),
+    str_from("crew_accepted")) == 1,
+    "crew_accepted is FIRST — audited before the crew is even registered, so a crash mid-run \
+    still leaves the acceptance in the trail");
+    assert(str_eq(agnosai_audit_entry_event(vec_get(entries, 1)),
+    str_from("task_completed")) == 1, "then the task");
+    assert(str_eq(agnosai_audit_entry_event(vec_get(entries, 2)),
+    str_from("crew_finished")) == 1, "and crew_finished last");
+    assert(str_eq(agnosai_audit_entry_message(vec_get(entries, 0)),
+    str_from("first-crew")) == 1, "the message is the crew NAME, not its id");
+    assert(str_eq(agnosai_audit_entry_level(vec_get(entries, 2)), str_from("info")) == 1,
+    "a completed crew is audited at info");
+
+    # the finished entry carries the profile figures
+    var fin_md = agnosai_audit_entry_metadata(vec_get(entries, 2));
+    assert(bayan_json_v_obj_get(fin_md, "wall_ms") != 0, "crew_finished reports wall_ms");
+    assert(bayan_json_v_obj_get(fin_md, "cost_micro_usd") != 0, "and the cost, in micro-USD");
+    assert(bayan_json_v_obj_get(fin_md, "task_count") != 0, "and the task count");
+
+    # --- cancel_crew ---
+    var c_spec = _t_spec("cancel-me");
+    var c_id = agnosai_crew_id(c_spec);
+    agnosai_orchestrator_run_crew(o, c_spec);
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, c_id)),
+    AGNOSAI_CREW_COMPLETED, "the crew completed");
+
+    assert_eq(agnosai_orchestrator_cancel_crew(o, c_id), 0, "cancelling a registered crew works");
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, c_id)),
+    AGNOSAI_CREW_CANCELLED, "and marks its registered state Cancelled IN PLACE");
+
+    var unknown = agnosai_orchestrator_cancel_crew(o, agnosai_uuid_v4_str());
+    assert(unknown != 0,
+    "cancelling an UNKNOWN crew is an ERROR, not a silent no-op — a caller cancelling something \
+    that was never registered has a bug and should hear about it");
+    assert_eq(agnosai_error_kind(unknown), AGNOSAI_ERR_CREW_NOT_FOUND, "a CrewNotFound error");
+
+    # --- a cyclic DAG never reaches the registry ---
+    var cyc = agnosai_crew_new(str_from("cyclic"));
+    var t1 = agnosai_task_new(str_from("t1"));
+    var t2 = agnosai_task_new(str_from("t2"));
+    agnosai_task_with_dependency(t1, agnosai_task_id(t2));
+    agnosai_task_with_dependency(t2, agnosai_task_id(t1));
+    var cyc_tasks = vec_new();
+    vec_push(cyc_tasks, t1);
+    vec_push(cyc_tasks, t2);
+    agnosai_crew_with_tasks(cyc, cyc_tasks);
+    agnosai_crew_with_process(cyc, agnosai_process_dag());
+
+    var before_entries = agnosai_audit_chain_count(chain);
+    assert_eq(agnosai_orchestrator_run_crew(o, cyc), 0, "a cyclic spec returns no state");
+    var after_entries = agnosai_audit_chain_count(chain);
+    assert_eq(after_entries - before_entries, 1,
+    "and audits ONLY crew_accepted — no crew_finished, because the crew never ran; the oracle's \
+    `?` propagates before it can be recorded as having finished anything");
+    assert(str_eq(agnosai_audit_entry_event(
+    vec_get(agnosai_audit_chain_recent(chain, 1), 0)), str_from("crew_accepted")) == 1,
+    "the last entry is the acceptance");
+
+    # --- events: the channel is removed when the crew finishes ---
+    var bus = agnosai_event_bus_new();
+    var eo = agnosai_orchestrator_with_events(agnosai_orchestrator_new(_t_budget()), bus);
+    var e_spec = _t_spec("evented");
+    var e_id = agnosai_crew_id(e_spec);
+    agnosai_orchestrator_run_crew(eo, e_spec);
+    assert_eq(agnosai_event_bus_has(bus, e_id), 0,
+    "the crew's event channel is REMOVED once it finishes — otherwise a long-lived orchestrator \
+    accumulates one channel per crew it has ever run");
+
+    # --- the llm url gates the placeholder path ---
+    var no_llm = agnosai_orchestrator_new(_t_budget());
+    var np = agnosai_orchestrator_run_crew(no_llm, _t_spec("placeholder"));
+    assert(str_eq(agnosai_task_result_output(vec_get(agnosai_crew_state_results(np), 0)),
+    str_from("do the thing")) == 1,
+    "with no gateway configured every task takes the placeholder path, echoing its description");
+
+    var with_llm = agnosai_orchestrator_with_llm_url(agnosai_orchestrator_new(_t_budget()),
+    str_from("http://127.0.0.1:8088"), str_from(""));
+    assert(with_llm != 0, "a gateway url can be configured");
+
+    # --- eviction only takes FINISHED crews ---
+    var ev = agnosai_orchestrator_new(_t_budget());
+    var running = agnosai_crew_state_new(agnosai_uuid_v4_str(), AGNOSAI_CREW_RUNNING);
+    assert_eq(_agnosai_orch_is_finished(running), 0, "a Running crew is not evictable");
+    assert_eq(_agnosai_orch_is_finished(
+    agnosai_crew_state_new(agnosai_uuid_v4_str(), AGNOSAI_CREW_PENDING)), 0,
+    "nor a Pending one");
+    assert_eq(_agnosai_orch_is_finished(
+    agnosai_crew_state_new(agnosai_uuid_v4_str(), AGNOSAI_CREW_COMPLETED)), 1,
+    "a Completed crew is");
+    assert_eq(_agnosai_orch_is_finished(
+    agnosai_crew_state_new(agnosai_uuid_v4_str(), AGNOSAI_CREW_FAILED)), 1, "and a Failed one");
+    assert_eq(_agnosai_orch_is_finished(
+    agnosai_crew_state_new(agnosai_uuid_v4_str(), AGNOSAI_CREW_CANCELLED)), 1,
+    "and a Cancelled one — so a registry full of RUNNING crews grows past the cap rather than \
+    dropping live state, which is the oracle's behaviour and the safe reading of a memory bound");
+    assert_eq(agnosai_orchestrator_crew_count(ev), 0, "an untouched registry stays empty");
+
+    # --- the audit level tracks the crew's outcome ---
+    assert(str_eq(_agnosai_orch_level_for(AGNOSAI_CREW_COMPLETED), str_from("info")) == 1,
+    "completed audits at info");
+    assert(str_eq(_agnosai_orch_level_for(AGNOSAI_CREW_FAILED), str_from("error")) == 1,
+    "failed at error");
+    assert(str_eq(_agnosai_orch_level_for(AGNOSAI_CREW_CANCELLED), str_from("warn")) == 1,
+    "and cancelled at warn — three levels, not two, so a cancelled crew is not filed as a failure");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

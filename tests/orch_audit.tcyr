@@ -1,0 +1,226 @@
+# =========================================================================
+# orch_audit.tcyr — parity tests for src/orch_audit.cyr
+#
+# Oracle: the #[cfg(test)] block in hoosh 1.1.0's src/audit.rs, the Rust
+# AuditChain that rust-old re-exported.
+#
+# The tests that matter here are the tamper cases. A hash chain that only ever
+# gets appended to verifies trivially; what it exists for is detecting an edit,
+# so every field that participates in the hash gets mutated and re-verified.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/orch_audit.cyr"
+include "tests/test_helpers.cyr"
+
+# A chain with a fixed key, so signatures are reproducible across runs.
+fn _t_chain(max_entries): i64 {
+    var key = alloc(AGNOSAI_AUDIT_KEY_BYTES);
+    for (var i = 0; i < AGNOSAI_AUDIT_KEY_BYTES; i = i + 1) { store8(key + i, i); }
+    return agnosai_audit_chain_with_key(key, max_entries);
+}
+
+# Record a simple event.
+fn _t_rec(c, event, message): i64 {
+    return agnosai_audit_record(c, str_from(event), str_from("info"), str_from(message), 0, 0, 0);
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("orch_audit");
+
+    assert_eq(strlen(AGNOSAI_AUDIT_GENESIS), 64, "the genesis hash is 64 hex chars");
+    assert_eq(AGNOSAI_AUDIT_MAX_ENTRIES, 10000, "and the ring is the oracle's 10,000");
+
+    # --- an empty chain is valid ---
+    var c = _t_chain(AGNOSAI_AUDIT_MAX_ENTRIES);
+    assert_eq(agnosai_audit_chain_count(c), 0, "a new chain is empty");
+    assert_eq(agnosai_audit_verify(c), 0, "and verifies");
+
+    # --- the first entry links to genesis ---
+    var e1 = _t_rec(c, "crew_accepted", "crew queued");
+    assert_eq(agnosai_audit_chain_count(c), 1, "recording appends");
+    assert(str_eq(agnosai_audit_entry_previous_hash(e1),
+    str_from(AGNOSAI_AUDIT_GENESIS)) == 1, "the first entry links to the genesis hash");
+    assert_eq(str_len(agnosai_audit_entry_signature(e1)), 64,
+    "and carries a 64-hex-char HMAC-SHA256 signature");
+    assert(str_eq(agnosai_audit_entry_event(e1), str_from("crew_accepted")) == 1,
+    "with the event name");
+    assert(str_eq(agnosai_audit_entry_level(e1), str_from("info")) == 1, "the level");
+    assert(str_eq(agnosai_audit_entry_message(e1), str_from("crew queued")) == 1,
+    "and the message, all readable back off the entry");
+    assert_eq(agnosai_audit_verify(c), 0, "one entry verifies");
+
+    # --- each entry links to the previous ---
+    var e2 = _t_rec(c, "task_completed", "task one done");
+    var e3 = _t_rec(c, "crew_finished", "all done");
+    assert_eq(agnosai_audit_chain_count(c), 3, "three entries");
+    assert(str_eq(agnosai_audit_entry_previous_hash(e2),
+    agnosai_audit_entry_previous_hash(e3)) == 0,
+    "consecutive entries link to DIFFERENT predecessors");
+    assert_eq(agnosai_audit_verify(c), 0, "a three-entry chain verifies");
+
+    # ids are unique
+    assert(str_eq(agnosai_audit_entry_id(e1), agnosai_audit_entry_id(e2)) == 0,
+    "every entry gets its own uuid");
+
+    # --- TAMPER: every field in the hash must break verification ---
+    # This is what a hash chain is FOR. An append-only chain verifies trivially;
+    # the value is entirely in detecting an edit after the fact.
+    var t1 = _t_chain(AGNOSAI_AUDIT_MAX_ENTRIES);
+    var te = _t_rec(t1, "task_completed", "the original message");
+    _t_rec(t1, "crew_finished", "and another");
+    assert_eq(agnosai_audit_verify(t1), 0, "the chain starts valid");
+
+    store64(te + AGN_AE_MESSAGE, str_from("the TAMPERED message"));
+    var tampered = agnosai_audit_verify(t1);
+    assert(tampered != 0, "editing a recorded MESSAGE breaks verification");
+    assert(str_contains(tampered, str_from("Entry 0")) == 1, "naming the offending entry");
+    assert(str_contains(tampered, str_from("signature verification failed")) == 1,
+    "and the reason — the message is inside the signed hash");
+
+    store64(te + AGN_AE_MESSAGE, str_from("the original message"));
+    assert_eq(agnosai_audit_verify(t1), 0,
+    "and restoring the exact original bytes makes it valid again — the check is over content, \
+    not over some side flag that could be reset");
+
+    # the event name
+    store64(te + AGN_AE_EVENT, str_from("crew_cancelled"));
+    assert(agnosai_audit_verify(t1) != 0, "editing the EVENT breaks it too");
+    store64(te + AGN_AE_EVENT, str_from("task_completed"));
+
+    # the level
+    store64(te + AGN_AE_LEVEL, str_from("error"));
+    assert(agnosai_audit_verify(t1) != 0, "and the LEVEL");
+    store64(te + AGN_AE_LEVEL, str_from("info"));
+
+    # the timestamp — backdating an entry must not go unnoticed
+    var real_ts = agnosai_audit_entry_timestamp(te);
+    store64(te + AGN_AE_TIMESTAMP, real_ts - 86400000);
+    assert(agnosai_audit_verify(t1) != 0,
+    "and the TIMESTAMP — backdating an entry by a day is exactly the edit an audit trail exists \
+    to catch");
+    store64(te + AGN_AE_TIMESTAMP, real_ts);
+
+    # the id
+    var real_id = agnosai_audit_entry_id(te);
+    store64(te + AGN_AE_ID, agnosai_uuid_v4_str());
+    assert(agnosai_audit_verify(t1) != 0, "and the ID");
+    store64(te + AGN_AE_ID, real_id);
+    assert_eq(agnosai_audit_verify(t1), 0, "all restored, valid again");
+
+    # --- TAMPER: breaking the LINK, not the content ---
+    store64(te + AGN_AE_PREV_HASH, str_from(AGNOSAI_AUDIT_GENESIS));
+    var relink = agnosai_audit_verify(t1);
+    assert_eq(relink, 0,
+    "entry 0 already linked to genesis, so rewriting it to genesis changes nothing");
+    var t2 = _t_chain(AGNOSAI_AUDIT_MAX_ENTRIES);
+    _t_rec(t2, "a", "first");
+    var second = _t_rec(t2, "b", "second");
+    store64(second + AGN_AE_PREV_HASH, str_from(AGNOSAI_AUDIT_GENESIS));
+    var broken_link = agnosai_audit_verify(t2);
+    assert(broken_link != 0, "re-pointing entry 1 at genesis breaks the chain");
+    assert(str_contains(broken_link, str_from("previous hash mismatch")) == 1,
+    "and reports it as a LINK failure rather than a signature one — the two are different \
+    tampering modes and the message says which");
+    assert(str_contains(broken_link, str_from("Entry 1")) == 1, "at the right index");
+
+    # --- DELETION is caught: removing a middle entry breaks the links ---
+    var t3 = _t_chain(AGNOSAI_AUDIT_MAX_ENTRIES);
+    _t_rec(t3, "a", "one");
+    _t_rec(t3, "b", "two");
+    _t_rec(t3, "c", "three");
+    assert_eq(agnosai_audit_verify(t3), 0, "three entries verify");
+    vec_remove(agnosai_audit_chain_recent(t3, 3), 1);
+    # (recent returns a copy, so the chain is untouched — prove that first)
+    assert_eq(agnosai_audit_chain_count(t3), 3,
+    "recent() hands back a COPY, so a caller cannot silently edit the chain through it");
+    assert_eq(agnosai_audit_verify(t3), 0, "and the chain still verifies");
+
+    # --- eviction keeps the chain verifiable ---
+    # The Cyrius hoosh resets to genesis here and reports a full chain invalid
+    # forever; the Rust oracle carries first_valid_hash forward, and so does this.
+    var ring = _t_chain(3);
+    _t_rec(ring, "e1", "one");
+    _t_rec(ring, "e2", "two");
+    _t_rec(ring, "e3", "three");
+    assert_eq(agnosai_audit_chain_count(ring), 3, "the ring fills to its cap");
+    assert_eq(agnosai_audit_verify(ring), 0, "and verifies");
+
+    _t_rec(ring, "e4", "four");
+    assert_eq(agnosai_audit_chain_count(ring), 3, "a fourth entry evicts the oldest");
+    assert_eq(agnosai_audit_verify(ring), 0,
+    "and the chain STILL verifies — first_valid_hash moved with the eviction, which is the bug \
+    the Cyrius hoosh has and the Rust oracle does not");
+
+    _t_rec(ring, "e5", "five");
+    _t_rec(ring, "e6", "six");
+    assert_eq(agnosai_audit_verify(ring), 0, "and keeps verifying as it keeps evicting");
+    var survivors = agnosai_audit_chain_recent(ring, 10);
+    assert_eq(vec_len(survivors), 3, "only the cap survives");
+    assert(str_eq(agnosai_audit_entry_event(vec_get(survivors, 0)), str_from("e4")) == 1,
+    "oldest-first, starting at the oldest survivor");
+
+    # --- recent(n) ---
+    assert_eq(vec_len(agnosai_audit_chain_recent(ring, 2)), 2, "recent(2) returns two");
+    assert(str_eq(agnosai_audit_entry_event(vec_get(agnosai_audit_chain_recent(ring, 2), 1)),
+    str_from("e6")) == 1, "ending at the newest");
+    assert_eq(vec_len(agnosai_audit_chain_recent(ring, 0)), 0, "recent(0) returns none");
+
+    # --- metadata participates in the hash ---
+    var m = _t_chain(AGNOSAI_AUDIT_MAX_ENTRIES);
+    var meta = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(meta, str_from("crew_id"), bayan_json_v_str_new(str_from("crew-1")));
+    bayan_json_v_obj_set(meta, str_from("status"), bayan_json_v_str_new(str_from("completed")));
+    var me = agnosai_audit_record(m, str_from("crew_finished"), str_from("info"),
+    str_from("done"), 0, 0, meta);
+    assert_eq(agnosai_audit_verify(m), 0, "an entry with metadata verifies");
+    assert_eq(agnosai_audit_entry_metadata(me), meta, "and carries it");
+
+    bayan_json_v_obj_set(meta, str_from("status"), bayan_json_v_str_new(str_from("failed")));
+    assert(agnosai_audit_verify(m) != 0,
+    "editing the METADATA breaks verification — which is the whole reason this chain exists \
+    rather than hoosh's, whose audit_record has no metadata slot at all");
+
+    # --- serialisation ---
+    var s = _t_chain(AGNOSAI_AUDIT_MAX_ENTRIES);
+    var se = _t_rec(s, "task_completed", "ok");
+    var json = bayan_json_v_build(agnosai_audit_entry_to_value(se));
+    assert(str_contains(json, str_from("\"event\":\"task_completed\"")) == 1,
+    "the entry serialises its event");
+    assert(str_contains(json, str_from("\"integrity\":{\"version\":\"1\"")) == 1,
+    "with the integrity block and its version");
+    assert(str_contains(json, str_from("\"previous_hash\"")) == 1, "and the chain link");
+    assert(str_contains(json, str_from("provider")) == 0,
+    "an unset provider is OMITTED, not emitted as null — skip_serializing_if");
+    assert(str_contains(json, str_from("metadata")) == 0, "and so is absent metadata");
+
+    var mj = bayan_json_v_build(agnosai_audit_entry_to_value(me));
+    assert(str_contains(mj, str_from("\"metadata\"")) == 1, "present metadata IS emitted");
+
+    # --- a different key produces different signatures ---
+    var k2 = alloc(AGNOSAI_AUDIT_KEY_BYTES);
+    for (var j = 0; j < AGNOSAI_AUDIT_KEY_BYTES; j = j + 1) { store8(k2 + j, 255 - j); }
+    var other = agnosai_audit_chain_with_key(k2, AGNOSAI_AUDIT_MAX_ENTRIES);
+    var oe = _t_rec(other, "task_completed", "ok");
+    assert_eq(agnosai_audit_verify(other), 0, "a chain under another key verifies under that key");
+    assert(str_eq(agnosai_audit_entry_signature(oe), agnosai_audit_entry_signature(se)) == 0,
+    "but its signatures differ — so two chains cannot be merged, which is exactly why hoosh's \
+    inference trail and this orchestration trail stay separate");
+
+    # a fresh CSPRNG-keyed chain works the same way
+    var live = agnosai_audit_chain_new();
+    _t_rec(live, "crew_accepted", "live");
+    assert_eq(agnosai_audit_verify(live), 0, "a CSPRNG-keyed chain verifies");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

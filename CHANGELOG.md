@@ -285,6 +285,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     perfectly-matched manager loses to a poorly-matched worker, which is the whole point of the
     mode. Each task is ranked independently, so one agent can take several and there is no
     round-robin or capacity limit.
+  - **orch_orchestrator** — the crew registry and lifecycle, **completing M5's 15 modules**.
+    Accepts a spec, audits `crew_accepted` **before** registering it, registers it Pending, runs it
+    through a `CrewRunner`, audits `crew_finished`, stores the final state, then removes the cancel
+    token and the crew's event channel. That order is the contract: getting it wrong still produces
+    a working crew run and a broken audit trail, so the tests pin the sequence rather than the
+    outcome.
+    A **cyclic spec never reaches the registry** — it audits only the acceptance and returns no
+    state, because the oracle's `?` propagates before anything can be recorded as finished.
+    Cancelling an **unknown** crew is an error rather than a silent no-op.
+    Eviction at `MAX_RETAINED_CREWS` takes only **finished** crews, so a registry full of running
+    ones grows past the cap rather than dropping live state.
+    The seam removes what was never agnosai's: the shared `ResponseCache` and `CostTracker` are
+    gone, and the `OnceLock` lazy client init with them — the port's client is two Strs, so there
+    is nothing expensive to defer.
+  - **orch_crew_runner** (bites 2 and 3 of 3) — `execute_task` and the `CrewRunner`, completing
+    **M5**. The runner carries the crew spec plus the optional client, event sender, cancel flag
+    and audit chain, and dispatches to the three process modes.
+    **Parallel and DAG waves use real OS threads** — `alloc` has been thread-safe since cyrius
+    6.0.64, which is what makes that viable. There is no semaphore in the port, so the batch size
+    *is* the concurrency limit: tasks run in batches of `max_concurrency`, every thread joined
+    before the next batch, none left detached. A thread that fails to spawn runs inline rather than
+    dropping the task, because a missing result would silently shorten the crew's output.
+    Cancellation is a shared flag pointer, checked before each sequential task and again inside
+    each worker — so a crew cancelled mid-wave does not start work that was merely queued.
+    Behaviours pinned because they are easy to get wrong: an **empty crew completes** (`all()` over
+    an empty set is true, so it must not read as failed); a **cyclic DAG returns no state at all**,
+    only an error, so a consumer can tell "the spec was wrong" from "the work failed"; only
+    **successful** tasks enter the DAG's completed set, which is what makes a failure cascade;
+    **hierarchical falls back to sequential** with a warning, matching the oracle's unimplemented
+    Phase 2 rather than wiring in `orch_hierarchical`'s delegation; and the **parallel path does
+    not audit**, reproducing the oracle's asymmetry rather than "fixing" what a consumer's trail
+    contains.
+    `execute_task` carries the placeholder arm, the prompt-guard sanitisation of all four
+    user-supplied fields, the retry seam via `callptr`, and the output-schema validation loop —
+    which rebuilds each retry prompt from the **original**, never the accumulated one, so the
+    prompt cannot grow exponentially. `metadata` reports **`cost_micro_usd`**, not the oracle's
+    f64 `cost_usd`; the key is **omitted entirely** when the gateway reports no cost, because 0 is
+    a real cost for a local model and a fabricated zero would be indistinguishable from a free
+    inference.
+  - **orch_audit** — a tamper-evident HMAC-SHA256 hash chain for crew and task events.
+    agnosai owns this rather than delegating across the seam, and not by preference: hoosh's
+    `/v1/audit` is **GET-only** and its `audit_record` has **no metadata slot**, so every agnosai
+    event's payload would be discarded. That is parity, not divergence — in the Rust build the two
+    chains were already separate instances with separate keys.
+    **One deliberate fix to the Cyrius hoosh**, which resets `expect_prev` to genesis
+    unconditionally in `verify` and so reports any evicted chain invalid forever. The Rust oracle
+    carries a `first_valid_hash` forward on eviction; that is what is ported, and a test drives the
+    ring past its cap to prove the chain still verifies. Where the two hoosh implementations
+    disagree, the Rust one is the oracle.
+    The entry hash uses the oracle's **sorted** key order (`BTreeMap`), not declaration order —
+    getting that wrong yields a chain that verifies against itself and nothing else.
   - **llm_hoosh** — speaks hoosh **2.6.0**: `usage.cost_micro_usd`, `usage.provider`, and the
     `X-Hoosh-Cache` response header, surfaced as `agnosai_inference_response_cost_micro_usd`,
     `_provider` and `_cache`.
@@ -541,6 +592,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `event_round_trip_1_sub` is three locks and almost nothing else. Filed upstream in the cyrius
   repo as `docs/development/issues/2026-07-29-mutex-unlock-unconditional-futex-wake.md` with a
   repro; nothing is worked around here, so a stdlib fix lands as a straight improvement.
+- **orch_audit**: `audit_record` **27.9 µs** (a uuid, a JSON build, a SHA-256 and an HMAC-SHA256
+  per entry — one per sequential task), `audit_verify_256` **2.65 ms** for a full 256-entry chain,
+  which re-hashes and re-signs every entry and is an auditor-triggered operation rather than a hot
+  path.
 - **server_prompt_guard**: `prompt_scan_clean_67b` **8.04 µs**, `prompt_scan_clean_4k`
   **555 µs → 273 µs (−51%)**. The scan is O(len × 31 patterns) and `execute_task` runs it on up to
   four fields per task, so the naive form cost ~27 ms of CPU for a task at the 50,000-byte field
