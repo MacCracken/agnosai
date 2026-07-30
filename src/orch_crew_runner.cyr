@@ -16,11 +16,28 @@
 #   * bite 16 — the `CrewRunner` struct, its builders, and the three process
 #     modes (`run`, `run_sequential`, `run_parallel`, `run_dag`).
 #
-# Bites 15 and 16 have an open question that does not touch this one:
 # `ResponseCache`, `CostTracker`, `AuditChain` and `cache_key` are **re-exports
-# from the hoosh crate** (`rust-old/src/llm/mod.rs:14-20`), not agnosai code.
-# Whether the port reaches them across the hoosh HTTP seam or needs local
-# equivalents is a decision to take before the runner core is written.
+# from the hoosh crate** (`rust-old/src/llm/mod.rs:14-20`), not agnosai code, so
+# each had to be resolved against the HTTP seam before the runner core could be
+# written. Settled 2026-07-30:
+#
+#   * **Cache — nothing to build.** hoosh caches server-side automatically, keyed
+#     on the whole request body. The oracle's client-side `cache_key` hashed only
+#     `messages`, while `execute_task` puts the task description in
+#     `request.prompt` and the agent prompt in `request.system` — neither of
+#     which is in `messages` — so for a context-free task the key collapsed to
+#     `{model}:{hash(model)}` and task 2 was served task 1's output. Deleting the
+#     client cache removes a wrong-answer bug, not just code.
+#   * **Cost — read it off the response.** hoosh 2.6.0 reports
+#     `usage.cost_micro_usd` and the real serving `usage.provider`, so the port
+#     reads them via `src/llm_hoosh.cyr` instead of porting hoosh's pricing table.
+#     Bill on `X-Hoosh-Cache: MISS`: a hit replays the cached body verbatim,
+#     cost included, and that is what the *cached* inference cost.
+#   * **Audit — agnosai owns a chain.** `/v1/audit` is GET-only and hoosh's
+#     `audit_record` has no metadata slot, so appends cannot be delegated. This
+#     is parity, not divergence: in the Rust build the two chains were already
+#     separate instances with separate keys. It gets its own bite before 16,
+#     where `run_sequential` needs it.
 #
 # ## Two functions are NOT implemented here, deliberately
 #

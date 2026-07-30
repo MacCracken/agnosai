@@ -170,6 +170,80 @@ fn main() {
     assert_eq(agnosai_inference_response_total_tokens(nu), 0, "missing usage counts as zero tokens");
     assert_eq(agnosai_hoosh_extract_usage(no_usage, &pt, &ct), 0, "no usage block reports absent");
 
+    # =====================================================================
+    # hoosh 2.6.0: usage.cost_micro_usd, usage.provider, X-Hoosh-Cache
+    # =====================================================================
+    # Before 2.6.0 a client could not tell a cache hit from a fresh inference,
+    # and the cost hoosh had computed never left the gateway — which is why this
+    # port was about to re-implement hoosh's pricing table. It no longer needs to.
+
+    var v26 = str_cat(str_cat(
+    str_from("{\"choices\":[{\"message\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],"),
+    str_from("\"model\":\"gpt-4o-mini\",\"usage\":{\"prompt_tokens\":1000,")),
+    str_from("\"completion_tokens\":500,\"total_tokens\":1500,\"cost_micro_usd\":450,\"provider\":\"openai\"}}"));
+
+    var cost: i64[1];
+    var prov: i64[1];
+    assert_eq(agnosai_hoosh_extract_cost(v26, &cost, &prov), 1, "a 2.6.0 usage block reports a cost");
+    assert_eq(load64(&cost), 450, "in integer micro-USD, exactly as hoosh accumulates it");
+    _t_assert_str(load64(&prov), "openai", "and names the real serving provider");
+
+    var r26 = agnosai_hoosh_response_from_body(v26);
+    assert_eq(agnosai_inference_response_cost_micro_usd(r26), 450, "the response carries the cost");
+    _t_assert_str(agnosai_inference_response_provider(r26), "openai", "and the provider");
+
+    # A pre-2.6.0 gateway sends neither. That is NOT an error, and the absent
+    # cost must be -1 rather than 0 — see the next case for why.
+    assert_eq(agnosai_hoosh_extract_cost(body, &cost, &prov), 0,
+    "a pre-2.6.0 usage block reports no cost");
+    assert_eq(load64(&cost), AGNOSAI_NO_LIMIT, "leaving the cost ABSENT rather than zero");
+    assert_eq(load64(&prov), 0, "and no provider");
+    assert_eq(agnosai_inference_response_cost_micro_usd(resp), AGNOSAI_NO_LIMIT,
+    "so an older gateway's response reports an absent cost, and a caller can omit the field \
+    rather than publishing a fabricated zero");
+
+    # ZERO IS A REAL COST. A local model served through Ollama is genuinely free,
+    # so a caller treating 0 as \"unknown\" under-reports every local inference —
+    # which is exactly why the absent sentinel is -1.
+    var free_body = str_cat(
+    str_from("{\"choices\":[{\"message\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":10,"),
+    str_from("\"completion_tokens\":10,\"cost_micro_usd\":0,\"provider\":\"ollama\"}}"));
+    assert_eq(agnosai_hoosh_extract_cost(free_body, &cost, &prov), 1,
+    "a zero cost is still a REPORTED cost");
+    assert_eq(load64(&cost), 0, "and its value is zero, distinct from absent");
+    _t_assert_str(load64(&prov), "ollama", "served locally");
+
+    # provider without cost, and cost of the wrong type, both degrade safely
+    var prov_only = str_from("{\"choices\":[{\"message\":{\"content\":\"h\"}}],\"usage\":{\"provider\":\"grok\"}}");
+    assert_eq(agnosai_hoosh_extract_cost(prov_only, &cost, &prov), 0, "provider alone is not a cost");
+    _t_assert_str(load64(&prov), "grok", "but the provider is still captured");
+    var bad_cost = str_from("{\"choices\":[{\"message\":{\"content\":\"h\"}}],\"usage\":{\"cost_micro_usd\":\"450\"}}");
+    assert_eq(agnosai_hoosh_extract_cost(bad_cost, &cost, &prov), 0,
+    "a string where an integer belongs is rejected rather than coerced");
+    assert_eq(load64(&cost), AGNOSAI_NO_LIMIT, "leaving it absent");
+
+    # --- the cache signal ---
+    assert_eq(agnosai_hoosh_cache_from_header(str_from("HIT")), AGNOSAI_HOOSH_CACHE_HIT,
+    "HIT maps to the exact-cache constant");
+    assert_eq(agnosai_hoosh_cache_from_header(str_from("SEMANTIC")), AGNOSAI_HOOSH_CACHE_SEMANTIC,
+    "SEMANTIC maps to the similarity-cache constant");
+    assert_eq(agnosai_hoosh_cache_from_header(str_from("MISS")), AGNOSAI_HOOSH_CACHE_MISS,
+    "MISS maps to a real forward");
+    assert_eq(agnosai_hoosh_cache_from_header(str_from("")), AGNOSAI_HOOSH_CACHE_UNKNOWN,
+    "an empty value is UNKNOWN");
+    assert_eq(agnosai_hoosh_cache_from_header(str_from("STALE")), AGNOSAI_HOOSH_CACHE_UNKNOWN,
+    "and so is an unrecognised tier a FUTURE hoosh might add — a new cache state must never be \
+    mistaken for a billable inference, so anything unknown falls to UNKNOWN and not to MISS");
+    assert_eq(agnosai_hoosh_cache_from_header(str_from("hit")), AGNOSAI_HOOSH_CACHE_UNKNOWN,
+    "the value is matched case-sensitively — hoosh emits upper case");
+
+    assert_eq(agnosai_inference_response_cache(r26), AGNOSAI_HOOSH_CACHE_UNKNOWN,
+    "a response built from a body alone has no cache state — the signal is a HEADER, so only \
+    agnosai_hoosh_chat can set it");
+    assert(AGNOSAI_HOOSH_CACHE_UNKNOWN != AGNOSAI_HOOSH_CACHE_MISS,
+    "UNKNOWN and MISS are DIFFERENT: \"a real inference\" and \"this gateway cannot tell me\" are \
+    different facts, and only the first justifies billing");
+
     # --- streaming delta extraction ---
     var frame = str_from("{\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"index\":0}]}");
     _t_assert_str(agnosai_hoosh_extract_delta(frame), "Hel", "extract a delta chunk");

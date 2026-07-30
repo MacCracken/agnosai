@@ -57,7 +57,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2375 assertions across 39 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**2399 assertions across 39 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -75,7 +75,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `core_crew.tcyr` | 66 | 8 |
 | `llm_router.tcyr` | 48 | 14 of 17 (3 are hwaccel-gated and defer) |
 | `llm_retry.tcyr` | 43 | 11 (4 of them `#[tokio::test]`) |
-| `llm_hoosh.tcyr` | 96 | — (replaces a `pub use` facade; no oracle tests) |
+| `llm_hoosh.tcyr` | 120 | — (replaces a `pub use` facade; no oracle tests) |
 | `tools_native.tcyr` | 67 | native.rs + registry.rs |
 | `order.tcyr` | 48 | — (Rust used `sort_unstable` / `select_nth_unstable`) |
 | `tools_builtin_basic.tcyr` | 37 | 6 (echo.rs + json_transform.rs) |
@@ -130,7 +130,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (683/683 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (688/688 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -295,7 +295,10 @@ base substrate · general utilities · bayan · patra · concurrency+crypto floo
 dynamic-link floor · async · net/http/tls/ws/sakshi/sandhi
 
 **git deps** (declare-ahead pattern): sigil 3.12.1 · bote 3.1.4 (core profile) ·
-majra 2.5.3 · kavach 3.9.3 · ai-hwaccel 2.3.15 · tyche 1.0.0.
+majra 2.5.3 · kavach 3.9.3 · ai-hwaccel 2.3.16 · tyche 1.0.0.
+The hoosh seam targets **hoosh 2.6.0** — `usage.cost_micro_usd`, `usage.provider` and
+`X-Hoosh-Cache` are read when present, and an older gateway degrades to an absent cost
+rather than a fabricated one.
 libro 2.8.2 arrives transitively via bote.
 
 ## Known issues in the current build

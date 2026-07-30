@@ -285,6 +285,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     perfectly-matched manager loses to a poorly-matched worker, which is the whole point of the
     mode. Each task is ranked independently, so one agent can take several and there is no
     round-robin or capacity limit.
+  - **llm_hoosh** — speaks hoosh **2.6.0**: `usage.cost_micro_usd`, `usage.provider`, and the
+    `X-Hoosh-Cache` response header, surfaced as `agnosai_inference_response_cost_micro_usd`,
+    `_provider` and `_cache`.
+    **This deletes a planned module.** M5 bite 15b was going to port hoosh's pricing table into
+    `src/llm_pricing.cyr` — 16 rows, per-provider fallbacks and a truncating cost expression copied
+    verbatim so the numbers would reconcile against `/v1/costs`. A copy of another project's price
+    list, guaranteed to drift the first time hoosh changed one. The gateway now reports the figure
+    it already computed, so the port reads it instead. Filed as a hoosh issue on 2026-07-29, fixed
+    upstream in 2.6.0, consumed here the same day.
+    Two representation decisions that a caller can get wrong:
+    an absent cost is **`AGNOSAI_NO_LIMIT` (-1), never 0** — a local model served through Ollama is
+    genuinely free, so treating 0 as "unknown" would under-report every local inference; and
+    `AGNOSAI_HOOSH_CACHE_UNKNOWN` is **distinct from `_MISS`** — "this was a real inference" and
+    "this gateway is too old to tell me" are different facts, and only the first justifies billing.
+    An unrecognised header value, including a cache tier a future hoosh might add, reads as UNKNOWN
+    rather than MISS, so a new tier can never be mistaken for billable work.
   - **server_prompt_guard** — **pulled forward from M6**, the third module to come across that way
     after `server_ssrf` and `server_sse`. It is a hard blocker for `execute_task`, which calls it
     five times: `wrap_system_prompt` once and `sanitize` four times (context, task_description,

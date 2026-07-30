@@ -81,7 +81,10 @@ enum AgnosaiInferenceRespOff {
     AGN_RESP_PROMPT_TOKENS = 16;
     AGN_RESP_COMPLETION_TOKENS = 24;
     AGN_RESP_FINISH_REASON = 32;
-    AGN_RESP_SIZE = 40;
+    AGN_RESP_COST_MICRO_USD = 40;
+    AGN_RESP_PROVIDER = 48;
+    AGN_RESP_CACHE = 56;
+    AGN_RESP_SIZE = 64;
 }
 
 # The default gateway base URL — a local `hoosh serve 8088`.
@@ -312,6 +315,9 @@ fn agnosai_inference_response_new(content: Str, model: Str): i64 {
     store64(r + AGN_RESP_PROMPT_TOKENS, 0);
     store64(r + AGN_RESP_COMPLETION_TOKENS, 0);
     store64(r + AGN_RESP_FINISH_REASON, 0);
+    store64(r + AGN_RESP_COST_MICRO_USD, AGNOSAI_NO_LIMIT);
+    store64(r + AGN_RESP_PROVIDER, 0);
+    store64(r + AGN_RESP_CACHE, AGNOSAI_HOOSH_CACHE_UNKNOWN);
     return r;
 }
 
@@ -422,6 +428,81 @@ fn agnosai_hoosh_extract_model(body: Str): i64 {
     return bayan_json_v_str(m);
 }
 
+# What the gateway said about its response cache — hoosh 2.6.0's `X-Hoosh-Cache`.
+#
+# UNKNOWN means the header was absent, which is what a pre-2.6.0 gateway sends.
+# It is deliberately distinct from MISS: "this was a real inference" and "this
+# gateway cannot tell me" are different facts, and only the first justifies
+# billing the call.
+var AGNOSAI_HOOSH_CACHE_UNKNOWN = 0;
+var AGNOSAI_HOOSH_CACHE_MISS = 1;
+var AGNOSAI_HOOSH_CACHE_HIT = 2;
+var AGNOSAI_HOOSH_CACHE_SEMANTIC = 3;
+
+# Map an `X-Hoosh-Cache` value to its constant. Unrecognised values — including
+# anything a future hoosh adds — read as UNKNOWN rather than as a MISS, so a new
+# cache tier can never be mistaken for a billable inference.
+fn agnosai_hoosh_cache_from_header(v: Str): i64 {
+    if (str_eq(v, str_from("HIT")) == 1) { return AGNOSAI_HOOSH_CACHE_HIT; }
+    if (str_eq(v, str_from("SEMANTIC")) == 1) { return AGNOSAI_HOOSH_CACHE_SEMANTIC; }
+    if (str_eq(v, str_from("MISS")) == 1) { return AGNOSAI_HOOSH_CACHE_MISS; }
+    return AGNOSAI_HOOSH_CACHE_UNKNOWN;
+}
+
+# The response's cost in integer micro-USD, or `AGNOSAI_NO_LIMIT` when the
+# gateway did not report one.
+#
+# **0 is a real cost**, not an absence — a local model served through Ollama is
+# genuinely free — so the absent sentinel has to be -1. A caller that treats 0
+# as "unknown" under-reports every local inference.
+fn agnosai_inference_response_cost_micro_usd(r): i64 {
+    return load64(r + AGN_RESP_COST_MICRO_USD);
+}
+
+# The provider that actually served the response, or 0 when unreported.
+#
+# This is the **serving route**, not a guess from the model name — the two
+# differ whenever hoosh's DLP re-routes a confidential request to a local
+# provider, in which case hoosh bills nothing and a name-based guess would
+# price it as remote.
+fn agnosai_inference_response_provider(r): i64 {
+    return load64(r + AGN_RESP_PROVIDER);
+}
+
+# Whether the response came from hoosh's cache — one of the
+# `AGNOSAI_HOOSH_CACHE_*` constants.
+fn agnosai_inference_response_cache(r): i64 {
+    return load64(r + AGN_RESP_CACHE);
+}
+
+# Pull `usage.cost_micro_usd` / `usage.provider` into the out-params — hoosh
+# 2.6.0. Returns 1 when a cost was reported, 0 otherwise.
+#
+# Both fields are absent on a pre-2.6.0 gateway, which is not an error: the
+# caller then simply has no cost to report, which is more honest than
+# re-deriving one from a copy of hoosh's pricing table that would drift.
+fn agnosai_hoosh_extract_cost(body: Str, out_cost, out_provider): i64 {
+    store64(out_cost, AGNOSAI_NO_LIMIT);
+    store64(out_provider, 0);
+
+    var v = agnosai_hoosh_parse_body(body);
+    if (v == 0) { return 0; }
+    var usage = bayan_json_v_obj_get(v, "usage");
+    if (usage == 0) { return 0; }
+    if (bayan_json_v_is_obj(usage) == 0) { return 0; }
+
+    var prov = bayan_json_v_obj_get(usage, "provider");
+    if (prov != 0 && bayan_json_v_is_str(prov) == 1) {
+        store64(out_provider, bayan_json_v_str(prov));
+    }
+
+    var cost = bayan_json_v_obj_get(usage, "cost_micro_usd");
+    if (cost == 0) { return 0; }
+    if (bayan_json_v_is_int(cost) == 0) { return 0; }
+    store64(out_cost, bayan_json_v_int(cost));
+    return 1;
+}
+
 # Pull `usage.prompt_tokens` / `usage.completion_tokens` into the out-params.
 # Returns 1 when a usage block was present, 0 otherwise — a streamed turn
 # without `stream_options.include_usage` has none.
@@ -467,6 +548,14 @@ fn agnosai_hoosh_response_from_body(body: Str): i64 {
         store64(resp + AGN_RESP_PROMPT_TOKENS, load64(&prompt));
         store64(resp + AGN_RESP_COMPLETION_TOKENS, load64(&completion));
     }
+
+    var cost: i64[1];
+    var provider: i64[1];
+    store64(&cost, AGNOSAI_NO_LIMIT);
+    store64(&provider, 0);
+    agnosai_hoosh_extract_cost(body, &cost, &provider);
+    store64(resp + AGN_RESP_COST_MICRO_USD, load64(&cost));
+    store64(resp + AGN_RESP_PROVIDER, load64(&provider));
     return resp;
 }
 
@@ -572,6 +661,15 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
     if (parsed == 0) {
         return str_from("hoosh returned a body with no choices[0].message.content");
     }
+
+    # hoosh 2.6.0's cache signal. A HIT replays the cached body verbatim, cost
+    # included — that is what the ORIGINAL inference cost, not this request — so
+    # the header, not the body, is what a caller bills on.
+    var cache_hdr = sandhi_headers_get(sandhi_http_headers(r), "X-Hoosh-Cache");
+    if (cache_hdr != 0) {
+        store64(parsed + AGN_RESP_CACHE, agnosai_hoosh_cache_from_header(str_from(cache_hdr)));
+    }
+
     store64(out_response, parsed);
     return 0;
 }
