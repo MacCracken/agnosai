@@ -47,6 +47,16 @@ jobs:
         # unprefixed exports.
         run: ./scripts/check-symbols.sh
 
+      - name: Cleanliness check
+        # fmt, lint, doc, vet, deny — CLAUDE.md's work loop runs these at steps
+        # 2 and 6, but until 2026-07-31 CI ran none of them. `cyrius doc --check`
+        # had drifted to 31 undocumented public symbols across five modules and
+        # `cyrius lint` to four untracked deferrals, entirely unreported.
+        #
+        # fmt/lint/doc each take a FILE — bare, they print usage and exit 1 — so
+        # the script loops rather than invoking them once.
+        run: ./scripts/check-clean.sh
+
       - name: Build
         run: |
           mkdir -p build
@@ -59,3 +69,10 @@ jobs:
         # stub didn't exist (Issue 1) and also wouldn't ever exercise
         # tests/${proj}.tcyr.
         run: cyrius test
+
+      - name: Coverage
+        # CLAUDE.md specifies this as its own CI step. It is reference coverage —
+        # a floor, not a correctness proof — which is exactly why it earns a
+        # gate rather than a claim: it catches a public symbol no test names at
+        # all, and nothing more.
+        run: cyrius coverage --min 80

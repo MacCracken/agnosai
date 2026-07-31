@@ -335,16 +335,63 @@ fn _t_stream_is_501_not_404(): i64 {
     return 0;
 }
 
-# --- Path segmentation ---------------------------------------------------
+# A segment must match in FULL. A prefix is a different path, and so is a
+# suffix — `/heal` must not reach `/health`, and `/xhealth` must not either.
+fn _t_partial_segments_do_not_match(): i64 {
+    assert(agnosai_route_match_id(agnosai_route_resolve(AGNOSAI_METHOD_GET,
+    str_from("/heal"))) == AGN_ROUTE_NONE,
+    "a strict prefix of a route segment does not match it");
+    assert(agnosai_route_match_id(agnosai_route_resolve(AGNOSAI_METHOD_GET,
+    str_from("/health2"))) == AGN_ROUTE_NONE, "a strict extension does not match either");
+    assert(agnosai_route_match_id(agnosai_route_resolve(AGNOSAI_METHOD_GET,
+    str_from("/healthh"))) == AGN_ROUTE_NONE, "nor a repeated final byte");
+    assert(agnosai_route_match_id(agnosai_route_resolve(AGNOSAI_METHOD_GET,
+    str_from("/api/v1/tool"))) == AGN_ROUTE_NONE, "a truncated deep segment does not match");
+    assert(agnosai_route_match_id(agnosai_route_resolve(AGNOSAI_METHOD_GET,
+    str_from("/api/v/tools"))) == AGN_ROUTE_NONE,
+    "a truncated interior segment does not match");
 
-fn _t_segments(): i64 {
-    assert(vec_len(_agnosai_path_segments(str_from("/"))) == 0, "`/` has no segments");
-    assert(vec_len(_agnosai_path_segments(str_from("/a"))) == 1, "`/a` has one");
-    assert(vec_len(_agnosai_path_segments(str_from("/a/b/c"))) == 3, "`/a/b/c` has three");
-    var s = _agnosai_path_segments(str_from("/api/v1/tools"));
-    assert(str_eq(vec_get(s, 0), str_from("api")) == 1, "first segment");
-    assert(str_eq(vec_get(s, 1), str_from("v1")) == 1, "second segment");
-    assert(str_eq(vec_get(s, 2), str_from("tools")) == 1, "third segment");
+    # A near-miss is a 404, not a 405 — the path is genuinely unknown, so
+    # `seen` must stay clear rather than reporting a method mismatch.
+    assert(agnosai_route_match_method_mismatch(agnosai_route_resolve(AGNOSAI_METHOD_GET,
+    str_from("/heal"))) == 0, "a near-miss is 404, not 405");
+
+    assert(agnosai_route_match_id(agnosai_route_resolve(AGNOSAI_METHOD_GET,
+    str_from("/health"))) == AGN_ROUTE_HEALTH, "...while the exact path still resolves");
+    return 0;
+}
+
+# --- Matching is allocation-free -----------------------------------------
+
+# The matcher walks both sides in place. The obvious vec-of-Str implementation
+# cost **4,352 bytes per request** — more than the whole `/health` handler —
+# because it re-split every pattern on every check and a miss walks all 18.
+fn _t_matching_is_allocation_free(): i64 {
+    agnosai_route_resolve(AGNOSAI_METHOD_GET, str_from("/api/v1/dashboard/agents"));
+
+    # A full-table miss: the worst case, touching every pattern.
+    var before = alloc_used();
+    for (var i = 0; i < 64; i = i + 1) {
+        agnosai_route_resolve(AGNOSAI_METHOD_GET, str_from("/no/such/path/here"));
+    }
+    assert((alloc_used() - before) / 64 < 64,
+    "a full-table miss allocates essentially nothing");
+
+    # A hit with no parameter allocates only the match struct.
+    var b2 = alloc_used();
+    for (var j = 0; j < 64; j = j + 1) {
+        agnosai_route_resolve(AGNOSAI_METHOD_GET, str_from("/api/v1/dashboard/agents"));
+    }
+    assert((alloc_used() - b2) / 64 < 128, "a deep hit allocates only the match struct");
+
+    # A hit WITH a parameter allocates the captured Str as well, and only one —
+    # not one per pattern tried.
+    var b3 = alloc_used();
+    for (var k = 0; k < 64; k = k + 1) {
+        agnosai_route_resolve(AGNOSAI_METHOD_POST, str_from("/api/v1/crews/abc/cancel"));
+    }
+    assert((alloc_used() - b3) / 64 < 192,
+    "a parameterised hit captures one Str, not one per pattern tried");
     return 0;
 }
 
@@ -363,7 +410,8 @@ fn main(): i64 {
     _t_param_reaches_the_handler();
     _t_dispatch();
     _t_stream_is_501_not_404();
-    _t_segments();
+    _t_partial_segments_do_not_match();
+    _t_matching_is_allocation_free();
 
     return assert_summary();
 }

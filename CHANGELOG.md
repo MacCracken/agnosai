@@ -43,6 +43,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed CLI printed on every invocation. 43/43 suites still green after.
 
 ### Fixed
+- **server_serve — sandhi's accessors return NUL-terminated cstrings, not `Str`,
+  and the adapter passed all three straight through.** `sandhi_server_get_method`,
+  `_get_path`, and `_find_header` each `alloc_via` a NUL-terminated copy
+  (`lib/sandhi.cyr:12358-12427`); reading one as a `Str` reads its first eight
+  bytes as a data pointer and the next eight as a length. The method compare
+  silently answered "no method" — **every request would have been 405** — and
+  `str_len(path)` returned 21815634, faulting in the router. Fixed by wrapping
+  with `str_from_a` (which borrows the bytes, no copy) and comparing the method
+  with `streq` rather than `str_eq`. All three are mutation-verified: reverting
+  any one fails the end-to-end suite.
+- **server_router — path matching re-split every pattern on every request.** The
+  matcher built a vec of `Str` for both sides, so each of the 18 patterns was
+  re-segmented per call and a request matching nothing walked all of them.
+  Rewritten to walk both sides in place, allocating only the captured parameter
+  on the one pattern that matches. A segment must now match in full — mutation
+  testing found `/heal` reaching `/health` had no covering test.
+- **The doc, lint, and coverage gates were never in CI.** `.github/workflows/ci.yml`
+  ran the symbol check, build, and test — not `fmt`, `lint`, `doc`, `vet`,
+  `deny`, or `coverage`, despite CLAUDE.md's work loop specifying them at steps
+  2 and 6 and calling coverage out as "its own CI step". The drift was real:
+  **31 undocumented public symbols** across five modules and four untracked lint
+  deferrals, none of which any pipeline would have reported. All 35 fixed, and
+  `scripts/check-clean.sh` now gates the class — verified to fail on an
+  undocumented symbol, a formatting violation, and an untracked deferral.
 - **`cyrius.cyml` pinned `ai-hwaccel = "2.3.15"` while `lib/` and `cyrius.lock`
   carried 2.3.16.** The manifest was the only stale copy, so a clean checkout would
   have resolved **2.3.15 — the version that still carries the bayan-1.3.0
@@ -81,9 +105,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and listed the `vec_sort_by` / `vec_select_nth` ask as "still to file" — it had
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
+### Performance
+- **Route resolution: 4352 → 48 bytes per request (−99%).** A full-table miss was
+  the expensive case at 4304 B, twelve times a hit; it is now 352 B end to end,
+  the same as a hit. `/health` end to end: 720 → 352 B (−51%); `/api/v1/tools`:
+  4808 → 1920 B (−60%). Measured with `alloc_used()` over 64 iterations after
+  warm-up. Writing bite 15b's allocation test is what surfaced it — routing cost
+  six times the handler it was dispatching to.
+
 ### Added
+- **server_serve (M6 bite 15b) — the sandhi adapter, and the port's first
+  `sandhi_server_*` call site.** 80 assertions. Four things had to land
+  together: blocker #3's per-request arena, the allocation measurement, the a2a
+  callback dispatch bite 12 left open, and the `rate_limit` mounting decision.
+
+  **The handler is tested end to end over a pipe.** `agnosai_serve_handler`
+  writes to a raw fd, so a pipe stands in for the socket and the whole adapter
+  runs for real — sandhi's request parse, the router, the handler, the response
+  encoder — everything but the accept loop. That test is what caught the
+  cstring defects below; none of them is visible from reading the module, and
+  all three would have shipped as a server that answered nothing correctly.
+
+  **`rate_limit` is NOT mounted by default**, matching the oracle, which never
+  installs the middleware. `agnosai_serve_with_rate_limit` is the opt-in path.
+  Mounting it silently would be a wire change: clients fine today would start
+  seeing 429s at a threshold agnosai chose, not one the oracle documents.
+
+  **The arena covers sandhi's half only.** Every sandhi call threads `_a` and the
+  worker rewinds between requests, so the transport half is flat. But
+  `bayan_json_v_parse_buf` / `_build` thread no allocator and bayan ships no
+  `_a` variants (verified: zero matches for
+  `^fn bayan_json_v_(parse_buf_a|build_a)\(` in `lib/bayan.cyr`), so every
+  handler that reads a body or builds a JSON response still grows the no-free
+  global bump. The honest statement is *the transport is flat; the handlers are
+  not* — measured, not asserted, and the residual is a bayan filing rather than
+  a claim.
+
 - **server_router (M6 bite 15a) — the route table, path matching, and the auth
-  boundary.** 86 assertions against an oracle that has **no `#[cfg(test)]`
+  boundary.** 90 assertions against an oracle that has **no `#[cfg(test)]`
   module at all**, so every routing rule is covered for the first time.
 
   **Split from the sandhi adapter deliberately.** This is the router's

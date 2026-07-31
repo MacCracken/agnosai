@@ -1,0 +1,464 @@
+# =========================================================================
+# server_serve — the sandhi adapter (M6 bite 15b).
+#
+# The oracle has no test for this layer: `main.rs`'s `axum::serve` and
+# `mod.rs`'s layer stack are both untested there.
+#
+# What is testable in-process is tested here — method mapping, the response
+# encoder's status/content-type/reason choices, the a2a callback gate, and the
+# **allocation measurement** that says what the arena actually bought. What
+# needs a live socket (`run_pooled` itself, the per-worker arena being rewound
+# between requests) is exercised by `scripts/stack.sh check`, not by a `.tcyr`
+# — pointing a test suite at a listening socket is what
+# `tools_builtin_load_testing` already refused to do, and for the same reason.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_routes_tools.cyr"
+include "src/server_routes_agents.cyr"
+include "src/server_routes_approval.cyr"
+include "src/server_routes_dashboard.cyr"
+include "src/server_routes_crews.cyr"
+include "src/server_routes_a2a.cyr"
+include "src/server_routes_mcp.cyr"
+include "src/server_hot_config.cyr"
+include "src/server_rate_limit.cyr"
+include "src/server_router.cyr"
+include "src/server_serve.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_state(): i64 {
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_echo_tool());
+    return agnosai_app_state_new(agnosai_orchestrator_new(0), reg,
+    agnosai_auth_config_new(), agnosai_event_bus_new(),
+    agnosai_audit_chain_new(), agnosai_approval_gate_new());
+}
+
+# --- Method mapping ------------------------------------------------------
+
+fn _t_method_mapping(): i64 {
+    assert(_agnosai_serve_method("GET") == AGNOSAI_METHOD_GET, "GET");
+    assert(_agnosai_serve_method("POST") == AGNOSAI_METHOD_POST, "POST");
+    assert(_agnosai_serve_method("DELETE") == AGNOSAI_METHOD_DELETE, "DELETE");
+
+    # An unmapped verb becomes a value no route registers, so the router answers
+    # 405 (path known, method not) rather than dispatching anything.
+    assert(_agnosai_serve_method("PUT") == 0, "PUT maps to no route method");
+    assert(_agnosai_serve_method("PATCH") == 0, "PATCH likewise");
+    assert(_agnosai_serve_method("get") == 0, "method matching is case-sensitive");
+    assert(_agnosai_serve_method(0) == 0, "an unparsed method line is 0");
+    assert(_agnosai_serve_method("") == 0, "and so is the empty cstring sandhi returns");
+
+    var s = _t_state();
+    assert(agnosai_route_status(agnosai_route_dispatch(s, 0, str_from("/health"),
+    str_from(""), 0, str_from(""))) == HTTP_METHOD_NOT_ALLOWED,
+    "an unmapped verb on a known path is 405, not a dispatch");
+    return 0;
+}
+
+# --- The response encoder ------------------------------------------------
+
+fn _t_reason_phrases(): i64 {
+    assert(str_eq(str_from(_agnosai_serve_reason(HTTP_OK)), str_from("OK")) == 1, "200");
+    assert(str_eq(str_from(_agnosai_serve_reason(AGNOSAI_HTTP_CREATED)),
+    str_from("Created")) == 1, "201");
+    assert(str_eq(str_from(_agnosai_serve_reason(HTTP_NO_CONTENT)),
+    str_from("No Content")) == 1, "204");
+    assert(str_eq(str_from(_agnosai_serve_reason(HTTP_BAD_REQUEST)),
+    str_from("Bad Request")) == 1, "400");
+    assert(str_eq(str_from(_agnosai_serve_reason(HTTP_UNAUTHORIZED)),
+    str_from("Unauthorized")) == 1, "401");
+    assert(str_eq(str_from(_agnosai_serve_reason(HTTP_NOT_FOUND)),
+    str_from("Not Found")) == 1, "404");
+    assert(str_eq(str_from(_agnosai_serve_reason(HTTP_METHOD_NOT_ALLOWED)),
+    str_from("Method Not Allowed")) == 1, "405");
+    assert(str_eq(str_from(_agnosai_serve_reason(HTTP_PAYLOAD_TOO_LARGE)),
+    str_from("Payload Too Large")) == 1, "413");
+    assert(str_eq(str_from(_agnosai_serve_reason(AGNOSAI_HTTP_UNPROCESSABLE)),
+    str_from("Unprocessable Entity")) == 1, "422");
+    assert(str_eq(str_from(_agnosai_serve_reason(AGNOSAI_HTTP_TOO_MANY_REQUESTS)),
+    str_from("Too Many Requests")) == 1, "429");
+    assert(str_eq(str_from(_agnosai_serve_reason(HTTP_INTERNAL)),
+    str_from("Internal Server Error")) == 1, "500 is the fallback");
+    # Every status the router can emit has a phrase — an unmapped one would
+    # silently ship as "Internal Server Error" alongside a 2xx code.
+    assert(str_eq(str_from(_agnosai_serve_reason(HTTP_NOT_IMPLEMENTED)),  #skip-lint: status
+    str_from("Not Implemented")) == 1, "501");
+    return 0;
+}
+
+# --- Options -------------------------------------------------------------
+
+# The blocker #3 setting, and the reason this is not `options_new()` alone.
+fn _t_options(): i64 {
+    var o = agnosai_serve_options();
+    assert(sandhi_server_options_get_req_arena(o) == AGNOSAI_SERVE_ARENA_BYTES,
+    "the per-request arena is enabled — blocker #3's whole point");
+    assert(sandhi_server_options_get_req_arena(o) > 0, "...and non-zero, which is what enables it");
+    assert(AGNOSAI_SERVE_ARENA_BYTES == 65536, "64 KiB, matching sandhi's request cap");
+    assert(AGNOSAI_SERVE_WORKERS == AGNOSAI_MAX_CONCURRENT_REQUESTS,
+    "the pool is sized from the oracle's concurrency limit rather than an invented number");
+    return 0;
+}
+
+# --- The a2a callback gate ----------------------------------------------
+
+fn _t_callback_body(url): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"t1\",\"description\":\"d\",\"callback_url\":\"");
+    str_builder_add_cstr(sb, url);
+    str_builder_add_cstr(sb, "\"}");
+    return str_builder_build(sb);
+}
+
+# The dispatcher reuses `agnosai_route_a2a_callback_allowed`, so the SSRF gate
+# has one implementation and one set of tests — a URL rejected there is 0 here.
+fn _t_callback_gate(): i64 {
+    assert(agnosai_serve_callback_url(_t_callback_body("https://example.com/cb")) != 0,
+    "a public callback URL is dispatchable");
+    assert(agnosai_serve_callback_url(_t_callback_body("http://127.0.0.1/cb")) == 0,
+    "a loopback callback URL is refused — the same gate a2a applies");
+    assert(agnosai_serve_callback_url(_t_callback_body("http://169.254.169.254/x")) == 0,
+    "the metadata IP is refused");
+    assert(agnosai_serve_callback_url(_t_callback_body("file:///etc/passwd")) == 0,
+    "a non-http scheme is refused");
+
+    # No callback asked for, and bodies that are not A2A requests at all.
+    assert(agnosai_serve_callback_url(
+    str_from("{\"task_id\":\"t\",\"description\":\"d\"}")) == 0,
+    "a body with no callback_url dispatches nothing");
+    assert(agnosai_serve_callback_url(str_from("not json")) == 0, "malformed JSON is 0");
+    assert(agnosai_serve_callback_url(str_from("{}")) == 0, "a non-A2A body is 0");
+    assert(agnosai_serve_callback_url(str_from("")) == 0, "an empty body is 0");
+
+    # And the URL that comes back is the one that was asked for.
+    assert(str_eq(agnosai_serve_callback_url(_t_callback_body("https://example.com/cb")),
+    str_from("https://example.com/cb")) == 1, "the dispatchable URL round-trips");
+    return 0;
+}
+
+# A refused URL must not spawn a thread, and must not be reported as dispatched.
+fn _t_callback_dispatch_is_gated(): i64 {
+    assert(agnosai_serve_dispatch_callback(_t_callback_body("http://127.0.0.1/cb")) == 0,
+    "a refused URL dispatches nothing");
+    assert(agnosai_serve_dispatch_callback(str_from("{}")) == 0,
+    "a non-A2A body dispatches nothing");
+    assert(agnosai_serve_dispatch_callback(str_from("not json")) == 0,
+    "malformed JSON dispatches nothing");
+    assert(AGNOSAI_SERVE_CALLBACK_TIMEOUT_MS == 30000,
+    "the callback timeout is the oracle's 30 seconds");
+    return 0;
+}
+
+# --- rate_limit is NOT mounted by default -------------------------------
+
+# Matching the oracle, which never installs the middleware. Mounting it would be
+# a wire change — clients fine today would start seeing 429s at a threshold
+# agnosai chose.
+fn _t_rate_limit_off_by_default(): i64 {
+    _agnosai_serve_limiter = 0;
+    assert(_agnosai_serve_limiter == 0, "the limiter is unset by default");
+    # With no limiter the check passes everything, however often.
+    for (var i = 0; i < 200; i = i + 1) {
+        if (agnosai_rate_limit_check_request(0, str_from("c")) != HTTP_OK) {
+            assert(0, "an unmounted limiter must never refuse a request");
+        }
+    }
+    assert(agnosai_rate_limit_check_request(0, str_from("c")) == HTTP_OK,
+    "200 consecutive requests pass with no limiter mounted");
+
+    # The opt-in path builds one.
+    var lim = agnosai_rate_limit_new(10000, 2);
+    assert(agnosai_rate_limit_check_request(lim, str_from("c")) == HTTP_OK, "opt-in: first");
+    assert(agnosai_rate_limit_check_request(lim, str_from("c")) == HTTP_OK, "opt-in: second");
+    assert(agnosai_rate_limit_check_request(lim, str_from("c"))
+    == AGNOSAI_HTTP_TOO_MANY_REQUESTS, "opt-in: third is 429");
+    return 0;
+}
+
+# --- The handler, end to end over a pipe --------------------------------
+
+# `agnosai_serve_handler` writes its response to a raw fd, so a pipe stands in
+# for the socket and the whole adapter runs for real: sandhi's request parse,
+# the router, the handler, and the response encoder. Everything except the
+# accept loop.
+#
+# Outside a sandhi worker `sandhi_server_request_arena()` is 0, which is exactly
+# the fallback path the handler carries — so this also proves the bare-allocator
+# branch works rather than leaving it to a live server to discover.
+fn _t_serve_over_pipe(req: Str, out): i64 {
+    var fds[8];
+    if (sys_pipe(&fds) < 0) { return -1; }
+    var rfd = load32(&fds);
+    var wfd = load32(&fds + 4);
+    agnosai_serve_handler(0, wfd, str_data(req), str_len(req));
+    sys_close(wfd);
+    var n = file_read(rfd, out, 8192);
+    sys_close(rfd);
+    if (n < 0) { n = 0; }
+    return n;
+}
+
+fn _t_starts_with(hay, n, needle): i64 {
+    var m = str_len(str_from(needle));
+    if (n < m) { return 0; }
+    for (var i = 0; i < m; i = i + 1) {
+        if ((load8(hay + i) & 255) != (load8(str_data(str_from(needle)) + i) & 255)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+fn _t_contains(hay, n, needle): i64 {
+    var nd = str_from(needle);
+    var m = str_len(nd);
+    if (m == 0 || n < m) { return 0; }
+    for (var i = 0; i <= n - m; i = i + 1) {
+        if (_t_starts_with(hay + i, n - i, needle) == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn _t_handler_end_to_end(): i64 {
+    var s = _t_state();
+    agnosai_serve_mount(s, 0);
+    var out[8192];
+
+    # A public route: parsed, routed, handled, encoded.
+    var n = _t_serve_over_pipe(str_from(
+    "GET /health HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(n > 0, "the handler wrote a response");
+    assert(_t_starts_with(&out, n, "HTTP/1.1 200 OK\r\n") == 1, "a status line, with reason");
+    assert(_t_contains(&out, n, "Content-Type: application/json") == 1,
+    "the JSON content type");
+    assert(_t_contains(&out, n, "Content-Length:") == 1, "and a length — not a dangling body");
+    assert(_t_contains(&out, n, "\"status\"") == 1, "the health body itself");
+
+    # An unknown path is 404 with the reason phrase, not a bare code.
+    var n2 = _t_serve_over_pipe(str_from(
+    "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, n2, "HTTP/1.1 404 Not Found\r\n") == 1, "404 with its reason");
+
+    # A known path with an unregistered verb is 405, not 404.
+    var n3 = _t_serve_over_pipe(str_from(
+    "PUT /health HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, n3, "HTTP/1.1 405 Method Not Allowed\r\n") == 1,
+    "405 for a known path with an unmapped verb");
+
+    # A protected route reaches its handler when auth is not configured — the
+    # oracle's default, and the case that proves the transport routes at all.
+    var n4 = _t_serve_over_pipe(str_from(
+    "GET /api/v1/tools HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, n4, "HTTP/1.1 200 OK\r\n") == 1,
+    "with auth unconfigured a protected route answers normally");
+    assert(_t_contains(&out, n4, "echo") == 1, "...and the handler's real body came back");
+
+    # **The auth boundary, exercised through the transport.** With a secret
+    # configured, the same request must not reach the handler.
+    var guarded = agnosai_app_state_new(agnosai_orchestrator_new(0),
+    agnosai_app_state_tools(s), agnosai_auth_config_with_secret(str_from("s3cr3t")),
+    agnosai_event_bus_new(), agnosai_audit_chain_new(), agnosai_approval_gate_new());
+    agnosai_serve_mount(guarded, 0);
+
+    var n5 = _t_serve_over_pipe(str_from(
+    "GET /api/v1/tools HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, n5, "HTTP/1.1 401 Unauthorized\r\n") == 1,
+    "a protected route without credentials is 401 at the transport");
+    assert(_t_contains(&out, n5, "echo") == 0,
+    "...and the tool list did not leak into the 401 body");
+
+    # A wrong secret is 401 too — the header was read, not merely counted.
+    var n6 = _t_serve_over_pipe(str_from(
+    "GET /api/v1/tools HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, n6, "HTTP/1.1 401 Unauthorized\r\n") == 1,
+    "a wrong bearer token is 401");
+
+    # The right one passes, which is what proves the header value survived the
+    # cstring-to-Str conversion intact rather than arriving empty.
+    var n7 = _t_serve_over_pipe(str_from(
+    "GET /api/v1/tools HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cr3t\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, n7, "HTTP/1.1 200 OK\r\n") == 1,
+    "the correct bearer token reaches the handler");
+    assert(_t_contains(&out, n7, "echo") == 1, "...and gets the real body");
+
+    # A present-but-empty `Authorization:` is 401, same as an absent one. The
+    # two differ only in the audit reason sakshi records, not on the wire.
+    var ne = _t_serve_over_pipe(str_from(
+    "GET /api/v1/tools HTTP/1.1\r\nHost: x\r\nAuthorization:\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, ne, "HTTP/1.1 401 Unauthorized\r\n") == 1,
+    "an empty Authorization header is 401");
+    var nb = _t_serve_over_pipe(str_from(
+    "GET /api/v1/tools HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dXNlcjpwdw==\r\n\r\n"),
+    &out);
+    assert(_t_starts_with(&out, nb, "HTTP/1.1 401 Unauthorized\r\n") == 1,
+    "a non-Bearer scheme is 401 — the scheme is checked, not just presence");
+
+    # A public route is still public with auth configured.
+    var n8 = _t_serve_over_pipe(str_from(
+    "GET /health HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, n8, "HTTP/1.1 200 OK\r\n") == 1,
+    "/health stays public behind a configured secret");
+    agnosai_serve_mount(s, 0);
+
+    # A body arrives at the handler: this POST is rejected on its CONTENT, which
+    # can only happen if the body offset and length were computed correctly.
+    var n9 = _t_serve_over_pipe(str_from(
+    "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\nnot json!"), &out);
+    assert(n9 > 0, "a POST with a body gets a response");
+    assert(_t_starts_with(&out, n9, "HTTP/1.1 200 ") == 0,
+    "a malformed body is not answered 200");
+    return 0;
+}
+
+# --- Mounting, and the bind-failure contract ----------------------------
+
+fn _t_mount(): i64 {
+    var s = _t_state();
+
+    # The default entry point mounts no limiter — the oracle's behaviour.
+    var o = agnosai_serve_mount(s, 0);
+    assert(_agnosai_serve_state == s, "the handler's state is the one mounted");
+    assert(_agnosai_serve_limiter == 0, "the default mount installs no limiter");
+    assert(sandhi_server_options_get_req_arena(o) == AGNOSAI_SERVE_ARENA_BYTES,
+    "mount returns the options the listener runs under");
+
+    # The opt-in path installs one, and mounting again clears it — so a second
+    # `agnosai_serve` call cannot inherit a limiter from a previous one.
+    var lim = agnosai_rate_limit_new(10000, 2);
+    agnosai_serve_mount(s, lim);
+    assert(_agnosai_serve_limiter == lim, "the opt-in mount installs the limiter");
+    agnosai_serve_mount(s, 0);
+    assert(_agnosai_serve_limiter == 0, "re-mounting clears it rather than accumulating");
+
+    # Metrics are registered by mounting, not lazily on first scrape — so a
+    # `/metrics` request before any traffic renders the registry, not an error.
+    assert(agnosai_metrics_global() != 0, "the metrics registry exists after mounting");
+    return 0;
+}
+
+# The doc comment promises a bind failure RETURNS rather than looping, and a
+# caller must treat that as fatal. TEST-NET-1 is never assigned to a host, so
+# the bind fails with EADDRNOTAVAIL at any privilege level — this cannot
+# accidentally start listening, even as root.
+fn _t_bind_failure_returns(): i64 {
+    var s = _t_state();
+    assert(agnosai_serve(s, str_from("192.0.2.1"), 9) == 1,
+    "an unbindable address returns 1 rather than looping forever");
+    assert(agnosai_serve_with_rate_limit(s, str_from("192.0.2.1"), 9, 10000, 2) == 1,
+    "the opt-in entry point reports the same failure");
+    # ...and the failed opt-in attempt still left the limiter mounted, which is
+    # why `agnosai_serve` clears it rather than assuming a fresh process.
+    assert(_agnosai_serve_limiter != 0, "a failed opt-in start still mounted its limiter");
+    assert(agnosai_serve(s, str_from("192.0.2.1"), 9) == 1, "and a retry re-reports");
+    assert(_agnosai_serve_limiter == 0, "...having cleared it");
+    return 0;
+}
+
+# --- The allocation measurement -----------------------------------------
+
+# **What the arena bought, stated as two numbers rather than one claim.**
+#
+# Blocker #3's mitigation threads `_a` through every sandhi call, and sandhi's
+# worker rewinds the arena between requests — so the transport half costs
+# nothing per request. But `bayan_json_v_parse_buf` / `_build` thread no
+# allocator and bayan ships no `_a` variants, so every handler that reads a body
+# or builds a JSON response still grows the no-free global bump.
+#
+# Measured here so the residual is a number in the record rather than a
+# hand-wave. Writing this test is what caught the router re-splitting all 18
+# patterns per request — routing cost 4,352 B/request, six times the handler it
+# was dispatching to, and now costs 48.
+fn _t_allocation_profile(): i64 {
+    var s = _t_state();
+    # Warm every one-time path first.
+    agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, str_from("/health"),
+    str_from(""), 0, str_from(""));
+    agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, str_from("/api/v1/tools"),
+    str_from(""), 0, str_from(""));
+
+    # The routing half — what the arena would cover under sandhi.
+    var before = alloc_used();
+    for (var i = 0; i < 64; i = i + 1) {
+        agnosai_route_resolve(AGNOSAI_METHOD_GET, str_from("/api/v1/dashboard/agents"));
+    }
+    var per_resolve = (alloc_used() - before) / 64;
+    assert(per_resolve < 128, "routing is ~48 B/request — the match struct, nothing more");
+
+    # The handler half — what bayan still charges, and the part that is NOT flat.
+    var b2 = alloc_used();
+    for (var j = 0; j < 64; j = j + 1) {
+        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, str_from("/health"),
+        str_from(""), 0, str_from(""));
+    }
+    var per_health = (alloc_used() - b2) / 64;
+    assert(per_health > 0, "building a JSON response does allocate — not a zero claim");
+    assert(per_health < 1024, "...but bounded per call, at ~352 B");
+    assert(per_health > per_resolve * 2,
+    "the handler half dominates: bayan's build, not the route table, is the residual");
+
+    # A miss costs the same as a hit now. Before the allocation-free matcher it
+    # cost twelve times as much, because a miss walked the whole table.
+    var b3 = alloc_used();
+    for (var k = 0; k < 64; k = k + 1) {
+        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, str_from("/nonexistent"),
+        str_from(""), 0, str_from(""));
+    }
+    var per_404 = (alloc_used() - b3) / 64;
+    assert(per_404 < 1024, "a full-table miss is no longer the expensive case");
+
+    # And a response that grows with content costs more than a fixed one, which
+    # is the shape that IS acceptable: proportional to the answer, not to the
+    # number of routes registered.
+    var b4 = alloc_used();
+    for (var m = 0; m < 64; m = m + 1) {
+        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, str_from("/api/v1/tools"),
+        str_from(""), 0, str_from(""));
+    }
+    var per_list = (alloc_used() - b4) / 64;
+    assert(per_list > per_health,
+    "a list response costs more than a fixed one — proportional to the answer");
+    assert(per_list < 8192, "...and still bounded");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_method_mapping();
+    _t_reason_phrases();
+    _t_options();
+    _t_callback_gate();
+    _t_callback_dispatch_is_gated();
+    _t_rate_limit_off_by_default();
+    _t_handler_end_to_end();
+    _t_mount();
+    _t_bind_failure_returns();
+    _t_allocation_profile();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
