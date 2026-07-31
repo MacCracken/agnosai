@@ -1,15 +1,22 @@
 # =========================================================================
-# server_routes_crews — the crew-creation request types and their validation.
+# server_routes_crews — crew creation, retrieval and cancellation.
 #
-# Parity oracle: rust-old/src/server/routes/crews.rs (lines 12-146)
+# Parity oracle: rust-old/src/server/routes/crews.rs
 #
-# **Bite 11a of 2.** This is the half of `crews.rs` that is pure functions of a
-# request: `TaskRequest`, `CrewRunRequest`, `validate_crew_request` and
-# `has_dependency_cycle`. It is split out because **6 of the oracle's 10 tests
-# in this file are plain `#[test]`, not `#[tokio::test]`, and all six test only
-# this half** — so it lands complete and verified before any handler exists.
+# **Landed in two bites, and the file is written in that order.** The first half
+# — `TaskRequest`, `CrewRunRequest`, `validate_crew_request` and
+# `has_dependency_cycle` — is pure functions of a request, and is where **all 6
+# of the oracle's plain `#[test]`s live**; the handlers below it own the 4
+# `#[tokio::test]`s. Splitting on that seam let the validation land complete and
+# verified before any handler existed, which is what CLAUDE.md's sizing rule
+# asks for on a 528-line file.
 #
-# The handlers (`create_crew`, `get_crew`, `cancel_crew`) are bite 11b.
+# ## One enum, two spellings, both deliberate
+#
+# `create_crew` renders statuses with `serde_json::to_value` (`crews.rs:207-222`),
+# so this file emits the **snake_case** wire forms — `completed`. `dashboard.rs`
+# formats the same enum with `{:?}` and emits `Completed`. Neither is a mistake;
+# see `server_routes_dashboard.cyr`'s header.
 # =========================================================================
 
 # The oracle's three request caps (`crews.rs:74-81`).
@@ -354,4 +361,210 @@ fn _agnosai_crew_err_indexed(prefix, index, suffix): Str {
     str_builder_add_int(sb, index);
     str_builder_add_cstr(sb, suffix);
     return str_builder_build(sb);
+}
+
+# =========================================================================
+# Bite 11b — the handlers.
+# =========================================================================
+
+# The oracle's `Some("parallel")` default and clamp (`crews.rs:168`):
+# `req.max_concurrency.unwrap_or(4).clamp(1, 64)`.
+var AGNOSAI_CREW_DEFAULT_CONCURRENCY = 4;
+var AGNOSAI_CREW_MAX_CONCURRENCY = 64;
+
+# Map the request's `process` string onto a ProcessMode.
+#
+# **The catch-all is the oracle's and is load-bearing**: anything that is not
+# exactly `"hierarchical"`, `"dag"` or `"parallel"` — including an absent field,
+# an empty string, and any misspelling — runs **Sequential**. That is why
+# `agnosai_crew_req_from_value` does not validate the field; rejecting an
+# unrecognised name would turn a silent fall-through into a 422.
+#
+# `"hierarchical"` gets a **fresh UUID as its manager**, matching the oracle's
+# `manager: Uuid::new_v4()` — a placeholder that names no real agent. Carried
+# across rather than improved: it is what the Rust does, and inventing a real
+# manager here would change which agent runs the crew.
+fn _agnosai_route_process_for(r): i64 {
+    var p = agnosai_crew_req_process(r);
+    if (p == 0) { return agnosai_process_sequential(); }
+    if (str_eq(p, str_from("hierarchical")) == 1) {
+        return agnosai_process_hierarchical(agnosai_uuid_v4_str());
+    }
+    if (str_eq(p, str_from("dag")) == 1) { return agnosai_process_dag(); }
+    if (str_eq(p, str_from("parallel")) == 1) {
+        var n = AGNOSAI_CREW_DEFAULT_CONCURRENCY;
+        if (agnosai_crew_req_has_concurrency(r) == 1) {
+            n = agnosai_crew_req_max_concurrency(r);
+        }
+        if (n < 1) { n = 1; }
+        if (n > AGNOSAI_CREW_MAX_CONCURRENCY) { n = AGNOSAI_CREW_MAX_CONCURRENCY; }
+        return agnosai_process_parallel(n);
+    }
+    return agnosai_process_sequential();
+}
+
+# Build the `CrewSpec` a validated request describes.
+#
+# **Dependencies are index-based on the wire and UUID-based in the spec**, so
+# this resolves them in a second pass: the oracle collects `task_ids` first
+# specifically "to avoid simultaneous borrow", and the two-pass shape is
+# required here too because a task's id does not exist until it is built.
+#
+# The `dep_idx < task_ids.len()` guard is the oracle's and is redundant after
+# `agnosai_validate_crew_request` — which rejects out-of-range indices — but is
+# kept because the oracle keeps it and because this fn is reachable from a
+# caller that skipped validation.
+fn _agnosai_route_build_spec(r): i64 {
+    var spec = agnosai_crew_new(agnosai_crew_req_name(r));
+    agnosai_crew_with_agents(spec, agnosai_crew_req_agents(r));
+    agnosai_crew_with_process(spec, _agnosai_route_process_for(r));
+
+    var reqs = agnosai_crew_req_tasks(r);
+    var tasks = vec_new();
+    for (var i = 0; i < vec_len(reqs); i = i + 1) {
+        var tr = vec_get(reqs, i);
+        var t = agnosai_task_new(agnosai_task_req_description(tr));
+        var eo = agnosai_task_req_expected_output(tr);
+        if (eo != 0) { agnosai_task_with_expected_output(t, eo); }
+        # `if let Some(priority)` — an absent priority leaves Task::new's default
+        # rather than overwriting it with Normal.
+        if (agnosai_task_req_has_priority(tr) == 1) {
+            agnosai_task_with_priority(t, agnosai_task_req_priority(tr));
+        }
+        vec_push(tasks, t);
+    }
+
+    for (var j = 0; j < vec_len(reqs); j = j + 1) {
+        var deps = agnosai_task_req_dependencies(vec_get(reqs, j));
+        for (var k = 0; k < vec_len(deps); k = k + 1) {
+            var idx = vec_get(deps, k);
+            if (idx < vec_len(tasks)) {
+                agnosai_task_with_dependency(vec_get(tasks, j),
+                agnosai_task_id(vec_get(tasks, idx)));
+            }
+        }
+    }
+
+    agnosai_crew_with_tasks(spec, tasks);
+    return spec;
+}
+
+# `POST /api/v1/crews` — create and run a crew, returning its results.
+#
+# Status contract: **400** for a request that deserializes but fails
+# `validate_crew_request` (the oracle's `Err(msg)` arm, carrying that exact
+# message); **422** for one serde would not deserialize at all; **400** for a
+# body that is not JSON; **500** when the run itself fails; **200** otherwise.
+#
+# **Note the status spellings here are serde's, not Debug.** The oracle uses
+# `serde_json::to_value(status)` for both the crew and each task result
+# (`crews.rs:207-222`), so these are the snake_case wire forms — unlike
+# `dashboard.rs`, which formats the same enum with `{:?}` and gets
+# `Completed`. Two endpoints, one enum, two spellings, both deliberate.
+fn agnosai_route_create_crew(state, body: Str): i64 {
+    var v = bayan_json_v_parse_buf(str_data(body), str_len(body));
+    if (v == 0) {
+        return agnosai_route_error(HTTP_BAD_REQUEST, str_from("malformed JSON body"));
+    }
+    var req = agnosai_crew_req_from_value(v);
+    if (req == 0) {
+        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from("body is not a valid crew run request"));
+    }
+
+    var err = agnosai_validate_crew_request(req);
+    if (err != 0) {
+        _agnosai_route_crew_warn(agnosai_crew_req_name(req), err);
+        return agnosai_route_error(HTTP_BAD_REQUEST, err);
+    }
+
+    var st = agnosai_orchestrator_run_crew(
+    agnosai_app_state_orchestrator(state), _agnosai_route_build_spec(req));
+    if (st == 0) {
+        return agnosai_route_error(HTTP_INTERNAL, str_from("crew execution failed"));
+    }
+
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("crew_id"),
+    bayan_json_v_str_new(agnosai_crew_state_crew_id(st)));
+    bayan_json_v_obj_set(obj, str_from("status"),
+    bayan_json_v_str_new(agnosai_crew_status_to_wire(agnosai_crew_state_status(st))));
+
+    var results = agnosai_crew_state_results(st);
+    var arr = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        var res = vec_get(results, i);
+        var ro = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(ro, str_from("task_id"),
+        bayan_json_v_str_new(agnosai_task_result_task_id(res)));
+        bayan_json_v_obj_set(ro, str_from("output"),
+        bayan_json_v_str_new(agnosai_task_result_output(res)));
+        bayan_json_v_obj_set(ro, str_from("status"),
+        bayan_json_v_str_new(agnosai_task_status_to_wire(agnosai_task_result_status(res))));
+        bayan_json_v_arr_push(arr, ro);
+    }
+    bayan_json_v_obj_set(obj, str_from("results"), arr);
+
+    # `#[serde(skip_serializing_if = "Option::is_none")]` — an absent profile is
+    # OMITTED, not rendered as null.
+    #
+    # **Not reachable through this handler today**: `agnosai_orchestrator_run_crew`
+    # always attaches one (`orch_crew_runner.cyr:1066`), so no test isolates this
+    # branch and a mutation that renders unconditionally passes the suite. Kept
+    # for the oracle's shape and because `CrewRunResponse.profile` is genuinely
+    # `Option`; same judgement as the unreachable skip in `agents.rs`.
+    var prof = agnosai_crew_state_profile(st);
+    if (prof != 0) {
+        bayan_json_v_obj_set(obj, str_from("profile"),
+        agnosai_crew_profile_to_value(prof));
+    }
+    return agnosai_route_json(HTTP_OK, obj);
+}
+
+# The oracle's `tracing::warn!(crew = .., error = .., "crew request validation failed")`.
+fn _agnosai_route_crew_warn(name: Str, err: Str): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    sakshi_log_kv(SK_WARN, "crew request validation failed", 30, "crew", 4,
+    str_data(name), str_len(name));
+    return 0;
+}
+
+# `GET /api/v1/crews/{id}` — the crew's state, or 404.
+#
+# The oracle's `Path<Uuid>` extractor rejects a malformed id before the handler
+# runs, so an unparseable id is **422**, not 404 — the same extractor-owns-the-
+# status situation `agents.rs` and `approval.rs` have.
+fn agnosai_route_get_crew(state, id: Str): i64 {
+    if (agnosai_uuid_parse(id) == 0) {
+        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from("crew id is not a valid UUID"));
+    }
+    var c = agnosai_orchestrator_crew(agnosai_app_state_orchestrator(state), id);
+    if (c == 0) {
+        return agnosai_route_error(HTTP_NOT_FOUND, str_from("crew not found"));
+    }
+    return agnosai_route_json(HTTP_OK, agnosai_crew_state_to_value(c));
+}
+
+# `POST /api/v1/crews/{id}/cancel` — cancel a running crew.
+#
+# 200 with `{"status":"cancelled","crew_id":"<id>"}`, or 404 when the
+# orchestrator reports it does not know the crew.
+fn agnosai_route_cancel_crew(state, id: Str): i64 {
+    if (agnosai_uuid_parse(id) == 0) {
+        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from("crew id is not a valid UUID"));
+    }
+    # `agnosai_orchestrator_cancel_crew` follows the port's error convention:
+    # **0 is success**, a non-zero value is the error object it built. The
+    # oracle's `match .. { Ok(()) => .., Err(_) => 404 }` maps onto that, not
+    # onto a truthy success flag.
+    if (agnosai_orchestrator_cancel_crew(agnosai_app_state_orchestrator(state), id) != 0) {
+        return agnosai_route_error(HTTP_NOT_FOUND, str_from("crew not found"));
+    }
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("status"),
+    bayan_json_v_str_new(str_from("cancelled")));
+    bayan_json_v_obj_set(obj, str_from("crew_id"), bayan_json_v_str_new(id));
+    return agnosai_route_json(HTTP_OK, obj);
 }

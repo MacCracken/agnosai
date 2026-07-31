@@ -82,6 +82,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_routes_crews, handlers (M6 bite 11b) — `crews.rs` is now ported
+  whole.** `create_crew`, `get_crew`, `cancel_crew`, and the oracle's 4
+  `#[tokio::test]`s. **124 assertions across both bites**, against the oracle's
+  10.
+
+  **One enum, two spellings, both deliberate and both now pinned.**
+  `create_crew` renders statuses with `serde_json::to_value`
+  (`crews.rs:207-222`), so this file emits the **snake_case** wire form
+  (`completed`), while `dashboard.rs` formats the same enum with `{:?}` and
+  emits `Completed`. A test asserts each spelling *and* the absence of the
+  other, so collapsing them into one renderer fails loudly.
+
+  **`process` maps through a catch-all, which is why the reader does not
+  validate it**: anything that is not exactly `hierarchical` / `dag` /
+  `parallel` — absent, empty, or misspelled — runs Sequential. `hierarchical`
+  gets a fresh UUID as its manager, matching the oracle's placeholder
+  `Uuid::new_v4()` that names no real agent; carried across rather than
+  improved, since inventing a real manager would change which agent runs the
+  crew. Concurrency follows `unwrap_or(4).clamp(1, 64)`, with all four boundary
+  cases tested.
+
+  **Index-based dependencies on the wire become UUID-based in the spec**, in the
+  two-pass shape the oracle needs "to avoid simultaneous borrow" and this one
+  needs because a task's id does not exist until it is built.
+
+  **A bug caught while reading, not by a test**: `agnosai_orchestrator_cancel_crew`
+  follows the port's error convention where **0 is success** and non-zero is the
+  error object — the first draft checked `!= 1` and would have answered 404 for
+  every successful cancellation. `cancel_crew` has **no oracle test at all**, so
+  nothing upstream would have caught it either; it now has five assertions.
+
+  Also new relative to the oracle: `get_crew`'s found path, and that a malformed
+  id is **422 rather than 404** on both id-taking routes — axum's `Path<Uuid>`
+  extractor rejects before the handler, the same extractor-owns-the-status
+  situation `agents.rs` and `approval.rs` have.
+
+  One honest note: the `skip_serializing_if` profile omission is **not reachable
+  through this handler**, because `run_crew` always attaches a profile
+  (`orch_crew_runner.cyr:1066`). No test isolates it and a mutation rendering
+  unconditionally passes the suite; kept for the oracle's shape, and said so.
+
 - **server_routes_crews, validation half (M6 bite 11a) — the request types,
   `validate_crew_request` and the cycle detector.** 73 assertions.
 

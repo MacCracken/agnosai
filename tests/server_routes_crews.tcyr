@@ -405,6 +405,243 @@ fn _t_process_is_not_validated(): i64 {
     return 0;
 }
 
+# =========================================================================
+# Bite 11b — the handlers. The oracle's four `#[tokio::test]`s live here.
+# =========================================================================
+
+fn _t_state_with(o): i64 {
+    return agnosai_app_state_new(o, agnosai_tool_registry_new(),
+    agnosai_auth_config_new(), agnosai_event_bus_new(),
+    agnosai_audit_chain_new(), agnosai_approval_gate_new());
+}
+
+# The oracle's `post_crews_with_valid_body_returns_result` body.
+fn _t_valid_body(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"test-crew\",\"agents\":[{\"agent_key\":\"tester\",");
+    str_builder_add_cstr(sb, "\"name\":\"Tester\",\"role\":\"tester\",\"goal\":\"test things\"}],");
+    str_builder_add_cstr(sb, "\"tasks\":[{\"description\":\"Run tests\",");
+    str_builder_add_cstr(sb, "\"expected_output\":\"test results\"}]}");
+    return str_builder_build(sb);
+}
+
+fn _t_rbody_str(r, key): Str {
+    var v = bayan_json_v_obj_get(agnosai_route_body(r), key);
+    if (v == 0 || bayan_json_v_is_str(v) == 0) { return str_from(""); }
+    return bayan_json_v_str(v);
+}
+
+# Oracle: `post_crews_with_valid_body_returns_result`.
+fn _t_create_crew_valid(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var r = agnosai_route_create_crew(_t_state_with(o), _t_valid_body());
+    assert(agnosai_route_status(r) == HTTP_OK, "a valid crew run is 200");
+    assert(str_len(_t_rbody_str(r, "crew_id")) > 0, "crew_id is a string");
+    assert(str_len(_t_rbody_str(r, "status")) > 0, "status is a string");
+
+    # **serde spelling here, not Debug** — the distinction from dashboard.rs.
+    assert(str_eq(_t_rbody_str(r, "status"), str_from("completed")) == 1,
+    "the status is the snake_case wire form");
+    assert(str_eq(_t_rbody_str(r, "status"), str_from("Completed")) == 0,
+    "...NOT the Debug form dashboard.rs emits for the same enum");
+
+    var results = bayan_json_v_obj_get(agnosai_route_body(r), "results");
+    assert(bayan_json_v_is_arr(results) == 1, "results is an array");
+    assert(bayan_json_v_arr_len(results) == 1, "...with one entry for the one task");
+    var e0 = bayan_json_v_arr_get(results, 0);
+    assert(bayan_json_v_obj_get(e0, "task_id") != 0, "an entry carries task_id");
+    assert(bayan_json_v_obj_get(e0, "output") != 0, "...output");
+    assert(bayan_json_v_obj_get(e0, "status") != 0, "...and status");
+
+    # And the crew is registered, so get_crew can find it.
+    assert(agnosai_orchestrator_crew(o, _t_rbody_str(r, "crew_id")) != 0,
+    "the crew is registered under the id the response reports");
+    return 0;
+}
+
+# Oracle: `post_crews_with_empty_agents_returns_bad_request`.
+fn _t_create_crew_empty_agents(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var body = str_from("{\"name\":\"empty-crew\",\"agents\":[],\"tasks\":[{\"description\":\"d\"}]}");
+    var r = agnosai_route_create_crew(_t_state_with(o), body);
+    assert(agnosai_route_status(r) == HTTP_BAD_REQUEST, "empty agents is 400");
+    assert(str_eq(_t_rbody_str(r, "error"),
+    str_from("at least one agent is required")) == 1,
+    "...carrying validate_crew_request's own message");
+    assert(agnosai_orchestrator_crew_count(o) == 0, "...and nothing ran");
+    return 0;
+}
+
+# Oracle: `post_crews_dag_mode`.
+fn _t_create_crew_dag(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"dag-crew\",\"agents\":[{\"agent_key\":\"worker\",");
+    str_builder_add_cstr(sb, "\"name\":\"Worker\",\"role\":\"worker\",\"goal\":\"do work\"}],");
+    str_builder_add_cstr(sb, "\"tasks\":[{\"description\":\"first task\"},");
+    str_builder_add_cstr(sb, "{\"description\":\"second task\",\"dependencies\":[0]}],");
+    str_builder_add_cstr(sb, "\"process\":\"dag\"}");
+    var r = agnosai_route_create_crew(_t_state_with(o), str_builder_build(sb));
+    assert(agnosai_route_status(r) == HTTP_OK, "dag mode is 200");
+    assert(str_len(_t_rbody_str(r, "crew_id")) > 0, "...with a crew_id");
+    var results = bayan_json_v_obj_get(agnosai_route_body(r), "results");
+    assert(bayan_json_v_arr_len(results) == 2, "both tasks ran");
+    return 0;
+}
+
+# Oracle: `get_crew_returns_not_found`.
+fn _t_get_crew_not_found(): i64 {
+    var r = agnosai_route_get_crew(_t_state_with(agnosai_orchestrator_new(0)),
+    agnosai_uuid_v4_str());
+    assert(agnosai_route_status(r) == HTTP_NOT_FOUND, "an unknown crew is 404");
+    assert(str_contains(_t_rbody_str(r, "error"), str_from("not found")) == 1,
+    "...with an error containing 'not found'");
+    return 0;
+}
+
+# --- Beyond the oracle ---------------------------------------------------
+
+fn _t_get_crew_found(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var s = _t_state_with(o);
+    var created = agnosai_route_create_crew(s, _t_valid_body());
+    var id = _t_rbody_str(created, "crew_id");
+
+    var r = agnosai_route_get_crew(s, id);
+    assert(agnosai_route_status(r) == HTTP_OK, "a known crew is 200");
+    var b = agnosai_route_body(r);
+    assert(bayan_json_v_is_obj(b) == 1, "the body is the serialized crew state");
+    assert(bayan_json_v_obj_get(b, "crew_id") != 0, "...carrying crew_id");
+    assert(bayan_json_v_obj_get(b, "status") != 0, "...and status");
+    return 0;
+}
+
+# The oracle's `Path<Uuid>` extractor rejects a malformed id BEFORE the handler,
+# so it is 422 rather than 404 — the same extractor-owns-the-status situation
+# agents.rs and approval.rs have.
+fn _t_malformed_id_is_422(): i64 {
+    var s = _t_state_with(agnosai_orchestrator_new(0));
+    assert(agnosai_route_status(agnosai_route_get_crew(s, str_from("not-a-uuid")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "get with a malformed id is 422, not 404");
+    assert(agnosai_route_status(agnosai_route_cancel_crew(s, str_from("not-a-uuid")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "cancel with a malformed id is 422");
+    assert(agnosai_route_status(agnosai_route_get_crew(s, str_from("")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an empty id is 422");
+    return 0;
+}
+
+# `cancel_crew` — the oracle has NO test for it at all.
+fn _t_cancel_crew(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var s = _t_state_with(o);
+    var id = _t_rbody_str(agnosai_route_create_crew(s, _t_valid_body()), "crew_id");
+
+    var r = agnosai_route_cancel_crew(s, id);
+    assert(agnosai_route_status(r) == HTTP_OK, "cancelling a known crew is 200");
+    assert(str_eq(_t_rbody_str(r, "status"), str_from("cancelled")) == 1,
+    "...with status cancelled");
+    assert(str_eq(_t_rbody_str(r, "crew_id"), id) == 1, "...and the crew id echoed");
+    assert(agnosai_crew_state_status(agnosai_orchestrator_crew(o, id))
+    == AGNOSAI_CREW_CANCELLED, "...and the registered crew is marked Cancelled");
+
+    assert(agnosai_route_status(agnosai_route_cancel_crew(s, agnosai_uuid_v4_str()))
+    == HTTP_NOT_FOUND, "cancelling an unknown crew is 404");
+    return 0;
+}
+
+# The handler's own rejection surface.
+fn _t_create_crew_rejections(): i64 {
+    var s = _t_state_with(agnosai_orchestrator_new(0));
+    assert(agnosai_route_status(agnosai_route_create_crew(s, str_from("not json")))
+    == HTTP_BAD_REQUEST, "malformed JSON is 400");
+    assert(agnosai_route_status(agnosai_route_create_crew(s, str_from("{}")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "a body serde would reject is 422");
+    assert(agnosai_route_status(agnosai_route_create_crew(s, str_from("[]")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an array body is 422");
+
+    # 400 vs 422 is the distinction between "deserialized but invalid" and
+    # "did not deserialize", and both are reachable from a plausible body.
+    var eb = str_builder_new();
+    str_builder_add_cstr(eb, "{\"name\":\"\",\"agents\":[{\"agent_key\":\"k\",\"name\":\"n\",");
+    str_builder_add_cstr(eb, "\"role\":\"r\",\"goal\":\"g\"}],\"tasks\":[{\"description\":\"d\"}]}");
+    var b = str_builder_build(eb);
+    assert(agnosai_route_status(agnosai_route_create_crew(s, b)) == HTTP_BAD_REQUEST,
+    "an empty name deserializes fine and fails validation with 400");
+    return 0;
+}
+
+# `process` mapping, including the catch-all the reader deliberately allows
+# through.
+fn _t_process_mapping(): i64 {
+    var seq = agnosai_crew_req_new(str_from("c"));
+    assert(agnosai_process_kind(_agnosai_route_process_for(seq))
+    == AGNOSAI_PROCESS_SEQUENTIAL, "an absent process is Sequential");
+
+    var bad = agnosai_crew_req_new(str_from("c"));
+    store64(bad + AGN_CREQ_PROCESS, str_from("nonsense"));
+    assert(agnosai_process_kind(_agnosai_route_process_for(bad))
+    == AGNOSAI_PROCESS_SEQUENTIAL,
+    "an unrecognised process falls through to Sequential — the oracle's `_ =>` arm");
+
+    var dag = agnosai_crew_req_new(str_from("c"));
+    store64(dag + AGN_CREQ_PROCESS, str_from("dag"));
+    assert(agnosai_process_kind(_agnosai_route_process_for(dag)) == AGNOSAI_PROCESS_DAG, "dag");
+
+    var h = agnosai_crew_req_new(str_from("c"));
+    store64(h + AGN_CREQ_PROCESS, str_from("hierarchical"));
+    var hp = _agnosai_route_process_for(h);
+    assert(agnosai_process_kind(hp) == AGNOSAI_PROCESS_HIERARCHICAL, "hierarchical");
+    assert(str_len(agnosai_process_manager(hp)) > 0,
+    "...with a placeholder manager UUID, as the oracle's Uuid::new_v4() gives");
+    return 0;
+}
+
+# The oracle's `unwrap_or(4).clamp(1, 64)`.
+fn _t_concurrency_clamp(): i64 {
+    var p = agnosai_crew_req_new(str_from("c"));
+    store64(p + AGN_CREQ_PROCESS, str_from("parallel"));
+    assert(agnosai_process_max_concurrency(_agnosai_route_process_for(p)) == 4,
+    "an absent max_concurrency defaults to 4");
+
+    store64(p + AGN_CREQ_HAS_CONCURRENCY, 1);
+    store64(p + AGN_CREQ_MAX_CONCURRENCY, 0);
+    assert(agnosai_process_max_concurrency(_agnosai_route_process_for(p)) == 1,
+    "0 clamps up to 1");
+    store64(p + AGN_CREQ_MAX_CONCURRENCY, 1000);
+    assert(agnosai_process_max_concurrency(_agnosai_route_process_for(p)) == 64,
+    "1000 clamps down to 64");
+    store64(p + AGN_CREQ_MAX_CONCURRENCY, 16);
+    assert(agnosai_process_max_concurrency(_agnosai_route_process_for(p)) == 16,
+    "an in-range value passes through");
+    store64(p + AGN_CREQ_MAX_CONCURRENCY, 64);
+    assert(agnosai_process_max_concurrency(_agnosai_route_process_for(p)) == 64,
+    "exactly 64 is in range");
+    return 0;
+}
+
+# Index-based dependencies on the wire become UUID-based in the spec.
+fn _t_dependency_resolution(): i64 {
+    var r = _t_req("c", 3);
+    _t_dep(r, 1, 0);
+    _t_dep(r, 2, 1);
+    var spec = _agnosai_route_build_spec(r);
+    var tasks = agnosai_crew_tasks(spec);
+    assert(vec_len(tasks) == 3, "three tasks built");
+
+    var t0 = vec_get(tasks, 0);
+    var t1 = vec_get(tasks, 1);
+    var t2 = vec_get(tasks, 2);
+    assert(vec_len(agnosai_task_dependencies(t0)) == 0, "task 0 has no dependencies");
+    assert(vec_len(agnosai_task_dependencies(t1)) == 1, "task 1 has one");
+    assert(str_eq(vec_get(agnosai_task_dependencies(t1), 0), agnosai_task_id(t0)) == 1,
+    "...resolved to task 0's UUID, not the index 0");
+    assert(str_eq(vec_get(agnosai_task_dependencies(t2), 0), agnosai_task_id(t1)) == 1,
+    "task 2 depends on task 1's UUID");
+    assert(str_eq(agnosai_task_id(t0), agnosai_task_id(t1)) == 0,
+    "the task ids are distinct");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -424,6 +661,18 @@ fn main(): i64 {
     _t_crew_req_reader();
     _t_crew_req_rejections();
     _t_process_is_not_validated();
+
+    _t_create_crew_valid();
+    _t_create_crew_empty_agents();
+    _t_create_crew_dag();
+    _t_get_crew_not_found();
+    _t_get_crew_found();
+    _t_malformed_id_is_422();
+    _t_cancel_crew();
+    _t_create_crew_rejections();
+    _t_process_mapping();
+    _t_concurrency_clamp();
+    _t_dependency_resolution();
 
     return assert_summary();
 }
