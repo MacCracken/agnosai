@@ -1,0 +1,223 @@
+# =========================================================================
+# server_auth_vectors — frozen RS256 token vectors for tests/server_auth.tcyr.
+#
+# NOT a test file (`cyrius tests` only picks up .tcyr) and NOT part of the
+# coverage corpus. Kept in a `.cyr` deliberately: the port plan caps total
+# `.tcyr` bytes under tests/ at 1,048,575 before `cyrius coverage` silently
+# under-reports, and ~16 KB of base64 does not belong in that budget.
+#
+# **Generated once, committed, never regenerated at test time.** Every token
+# below was signed with `rust-old/tests/fixtures/test_rsa_private.pem` — the
+# oracle's own 2048-bit test keypair — and the `valid` one was independently
+# confirmed with `openssl dgst -sha256 -verify` against the public key before
+# being baked in. agnosai therefore only ever VERIFIES: there is no RSA signing
+# anywhere in the port, and no test depends on a private key. RSA PKCS#1 v1.5
+# signing is deterministic, so regenerating reproduces these bytes exactly.
+#
+# Every symbol is `_t_`-prefixed so it can never shadow a src/ symbol and
+# stays out of the coverage denominator.
+# =========================================================================
+
+# The oracle's public key, PEM-encoded (rust-old/tests/fixtures/test_rsa_public.pem).
+fn _t_jwt_pubkey_pem(): Str {
+    return str_from("-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5Wu/jjUwgB2e1/Bn0jBo\nczAuTktZwACUz1PtlMmpuuOxKvfGjGbVOW+mQVzAn7BTCEdfNEDN19tHgYkMHjhn\nycj0oho63oGYtwmHUqka4pk+3Vk8Tif9Cnw2OTTx0ng4ntNwvl2FToLvq4RLyfpJ\no0D3M4g/wgjY5znUezqzJGq68f0BK/e5qldF0O842rK4bb+IkfPGJYoUL+LKqUEy\ne1doAJrUdOm/bQ+QeDV/26SyFGvLHx8CVfO2du79GvFGRrZKkWwLz3t5Z2r94RXG\n8lKMhsRSWu+BKEfzg1jnpF93E+4GrapNhQit5QkgQD4Eeazahbx18L6RinrQqCrw\nOQIDAQAB\n-----END PUBLIC KEY-----\n");
+}
+
+# Decision 2 (maintainer): the oracle's fixture uses `exp: u64::MAX`, which is
+# 2*i64::MAX+1 and does not fit Cyrius's signed i64. This is
+# 9999-12-31T23:59:59Z — the conventional JWT never-expires sentinel, ~27x
+# below i64::MAX so no signed-boundary handling is in play.
+var AGNOSAI_T_FAR_FUTURE = 253402300799;
+
+# The `exp` carried by `_t_jwt_leeway()`. The suite drives `now` to base+30,
+# +60, +61 and +90, which is the only way to test the 60s leeway boundary
+# against a frozen vector.
+var AGNOSAI_T_LEEWAY_EXP = 1000000000;
+
+# The oracle's `valid_claims()`: sub=user-123, iss=test-issuer,
+# aud=agnosai, exp=far-future, iat=0. Oracle test `jwt_valid_token_passes`.
+fn _t_jwt_valid(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9.O_d2RmELAJEGbJBAgHjmnPOtZa8omZyVMJOuVmi65kSQ3Q8pE-gUZEKoy43ADXrB6Gixgb3QLDFPXw29ZSjevTdrL_DyqnaIsDENM-PDPGGFADbEdlwG8Z8nfzGckTFWI4rNrcVtdTu9UtYoHP4PB8yWxGTebk3JBl8q7xRLuNs7tB9CmxmhaYX2uAFcXOYE9tlcmCE4W4gnEhGBsShns2cCl0b7IPYQ8o4wJKK6HEAs-euzekAcKnlF_i0ozTpOTTR7U2PZeUHf2BIQ3MrXK52GpxpePczd19DiRRZx2LzrdAPTdtDj1wAawlU-Pq_DKJF8I8elGcD9INb8aEcGYw");
+}
+
+# Oracle `jwt_expired_token_rejected` — exp=0.
+fn _t_jwt_expired(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjowLCJpYXQiOjAsImlzcyI6InRlc3QtaXNzdWVyIiwic3ViIjoidXNlci0xMjMifQ.M-A2YbMjF4vys0mp2eC5FOnOEVOhdKxHbatB-XuguflNz7VTju2TeqBqyutuCBuudJVIJHO7AGsiA03VnKsqQNaU_PULBfPHC_ETEhUA92WiXWeZqgvglzYYQ9TwvNjN5aQPWvV3si5JRh8uu0B6aQLGu8sj3GSfz-L_kgBmu4AXDmz-LtMWswT0kygOADRsMrB4PKIFQirW9xBArEkms0OW39kiG-sUKkBIlEROn0K3lt037bZcHhai_Ws-k4x81algtui6TAg3YM5MDxiebZs68jIGdOZP1uyllJj1HqUsYbNlc38VcwKOd1vB27GjRipsSYoUxrtJszFHS1sqYA");
+}
+
+# Oracle `jwt_wrong_issuer_rejected` — iss=wrong-issuer.
+fn _t_jwt_wrong_issuer(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoid3JvbmctaXNzdWVyIiwic3ViIjoidXNlci0xMjMifQ.ZTyXjcRVwURy1Sjnrlu0l-HcYIfgkdpwasWNPuH0HWUrDDome2bZmVkDgOOhOmfxZPngvC0a84N6tKyc8J_Ip7rIjf_EV7ALj2XuuoXEEfAi2471J97Ln-Eu3USiX2Aqks-_6WM59votkqWPuhmr10UjLt02wt1FKHbzsWmE7y1ILRSmmWJd4llBgs72VoKqR2kkajL1vyAMiE5Abgteb1bLwwnBtUXEczL3orCRJ3CL0wSYPftZb58U6PP0yWXIV-JWNClRiEHnaJuyyCZbdy6c15WXvoBClGkJpmyJbPvs6OxkfTB-6r29KEpcuboM7woqEtgqOXOJEgUYvL7qeQ");
+}
+
+# Oracle `jwt_wrong_audience_rejected` — aud=wrong-audience.
+fn _t_jwt_wrong_audience(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJ3cm9uZy1hdWRpZW5jZSIsImV4cCI6MjUzNDAyMzAwNzk5LCJpYXQiOjAsImlzcyI6InRlc3QtaXNzdWVyIiwic3ViIjoidXNlci0xMjMifQ.VzTnxJVKZLYUAgjonQ_B-2c5jYHzya4xSM3arg9kLiErMdvZPoSGYu-diuUf8n8zbAF8Z1BC6QD-SF7Dq5Vf34qzuBsm4tSeNZzpB0qwDniKj_C0e1BICP6O8GZji9RnfuNuHpTOX7mCBgisxxiqMhVcyXngAMk8NonZ-rmll16ovpXOUKt2s5g-Ni8drPhnOYLgDjYgc25Bgycv1gw8J-r1yRudXD8pU0B7sVJSj8PKGE8OTH5hxvnPBSFSYkaBeVSJdubg1cN0x5rkbaROYZAKCLJxb5PpSryXVQziHJxGWH9bR6DJ-hjGjLD4GsDiUr2ImdLpe6fNzMqZrjyQlQ");
+}
+
+# **Decision 1, TIGHTENED.** No `iss` claim at all. jsonwebtoken ACCEPTS
+# this even with an issuer configured, because `set_issuer` does not add `iss`
+# to `required_spec_claims` (validation.rs:143-145). agnosai rejects it. ADR 010.
+fn _t_jwt_no_iss(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwic3ViIjoidXNlci0xMjMifQ.VaKNOMAc8Qjy3Mc2f7rP9UNtW9Yo_yqflEw1jUdVxeYkxdssE_4AuMV-u7z4L2wDqtYtz2tf1_CfZFhw_pGu7rRRXPpmgmPOEcp0E1HhosMXS38e-WGHBm2mau_XT4mjVi1dLbMfiPEs-v0SzhL5rdQP0C2-h3bfSltVxfnoa0YBoK9fG5hch2DlDI04Lpoxx9Atb1e1eaVr5WbKGHbi7qDgDvire97Ltin4RqC-zGbmw5uFggrVmyuoNsY9PnYDzAbgXCTWcU_8mZ7ERby5jyvnCoZuXosYAErgDQcZH1vCGhaOQjE_n-rGbJe2R_YR6pBX_CPQV6yJqnnuka_ygg");
+}
+
+# **Decision 1, TIGHTENED.** No `aud` claim at all. Same story as `no_iss`.
+fn _t_jwt_no_aud(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjI1MzQwMjMwMDc5OSwiaWF0IjowLCJpc3MiOiJ0ZXN0LWlzc3VlciIsInN1YiI6InVzZXItMTIzIn0.OAZfjL7LnQ0qkCtaL2OL6nCGLnBbT8LaIyoXQSKN3tCCCwuYgpVfh2moYAdMiwAg4WLxgM8a3SswvK8yv5iJ3L8r3oAYbUg3HdQyz16s5IcqEHIzaqsPHCTuSjLjY1v0PamYiP6Abk7QDITxkPsFSN_2BtogHjuAAKMAIv5CSa1QnGJ-favS7wI-4My12au-s-fXjL1h8JpeihG69BoRo6Zoll2OcFDJCKZQ5w4g_UvEeZy1qL87mAZ2SATEhiqsSFuZ3GS1HPmevv8ubAhWxTkWvuxnzp1Rz474a3Fp5PY2YolaUTGnv3p-7qGOAIKgnHsRjrbFKaJuu5NxneAGzg");
+}
+
+# No `exp` claim. Rejected by jsonwebtoken's `required_spec_claims={exp}`
+# default, and again by the oracle's defense-in-depth check at auth.rs:143-146.
+fn _t_jwt_no_exp(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiaWF0IjowLCJpc3MiOiJ0ZXN0LWlzc3VlciIsInN1YiI6InVzZXItMTIzIn0.AMxwgo8doAHPytEJ_mmfUjkchKjkkJoIPPaAGbHndm9Z8CMFHnYXPVEHR7XsLNAkIqhMo9igK-47W8m_dl-DwV1LEWLIlrsu2CvQ3VKwXG75EBowqQ5jHbCm8DKpDjbJguR1lX2atyA3l9xjG1hArLY8ind31sLivIW9UGXBs9VT20XQ1QBjsLunggIiAbKZJauNeenGR7dvMe1yBsqr0jo1KMnfLB8YsANpHX6Ai0nJ0zXOGWIA7vDOZwc71WVLGe1ifn7JqnMu1s0Zmalt_iVgqbrvBaV2KSskoHvwTMGbZjFJ18ZP4dCFoD1gBdxb7LiIRJEjSP5gn2pkaevvBw");
+}
+
+# **Decision 4.** exp=AGNOSAI_T_LEEWAY_EXP, for driving the 60s leeway
+# boundary from both sides with an injected `now`.
+fn _t_jwt_leeway(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoxMDAwMDAwMDAwLCJpYXQiOjAsImlzcyI6InRlc3QtaXNzdWVyIiwic3ViIjoidXNlci0xMjMifQ.iwHo_eiQZjJPU0vOAnEEcjAptA0a_gzTzZqryeO3Eb7O6C5X7B4_vyGo7zhJ6R2mg97FzQmq64ty3qlPsK7S6OZo96uNUyk15HOZUygX0EooIk2WQpcRJa0Ij57GhVxjiyan_EmeMavys5FGg0LpbFU7KNHsk0u98EGXpUaOALP-crbuR0vN7R_0fFE2bxPm2hmSbxt5Fp5S4KE35WDquG6gy_T0f2HOYizZs5pjkoJP5tqlzexOHvp48vjZN3DFb2WokKdF8InG2VG1Ag0YaEpMexHXWmZqMo-iGCmD5BDfE0GjgYxP1sz1tpcu4QnKasYeOCQwc_urtmX1pZEYuA");
+}
+
+# Algorithm confusion: `alg:none`, **empty** signature segment. Note this
+# is caught by the structural empty-signature check before `alg` is ever
+# consulted — see `alg_missing` for a vector that isolates the alg check.
+fn _t_jwt_alg_none(): Str {
+    return str_from("eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9.");
+}
+
+# `alg:none` with `kid:\"RS256-2024\"` — defeats any implementation that
+# scans the header for the substring \"RS256\" instead of reading the parsed
+# field. bote's HS256 verifier does exactly that substring scan; that shape must
+# not be copied into a module exposing two auth paths on one endpoint.
+fn _t_jwt_alg_none_kid_rs256(): Str {
+    return str_from("eyJhbGciOiJub25lIiwia2lkIjoiUlMyNTYtMjAyNCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9.");
+}
+
+# Header claims HS256 while the body is genuinely RS256-signed, so the
+# signature verifies and only the `alg` check can reject it.
+fn _t_jwt_alg_hs256(): Str {
+    return str_from("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9.ieIeWoaOQzNcQWNXRZL_VmuXimwt5ocBvfMsFHKBNeKqYR_ZtUDboyVsPDCVOAa3q-JBe03AA4kAeHn8pMlMau_4wrRn5QS613CTQGy820R9LSDWTTtl6gnyGOWYQdfOwOH__18Px46paORUSnIwV0gArMmNTmoedkkxZRe-S3qx1mh5L5VJwSGjQDdhSil6YL9FiH9RYklb_88J3seTwGA8vqFN7etTTNTeFmdWNOI0ywAZ0PRsvycukVWXDo33IH6qhD5smd8O_70nQv3Tu3VV7coi7x91QRdr78_v4NlcxqhDEho5T45-COaqCoVsopap6VIDObrK-25rUf4Sjg");
+}
+
+# **Isolates the alg check.** No `alg` member at all, genuinely
+# RS256-signed — the signature verifies, so nothing but the alg check rejects it.
+fn _t_jwt_alg_missing(): Str {
+    return str_from("eyJ0eXAiOiJKV1QifQ.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9.nILuz-_wYUuDvfp2hGvr383sP6bIOXRExSFT2DMTPYhu6Ob7cxirN5mttC3EeLbxYTas0KIwPJiGccbiJ4zk_Wmkg3yfRueGrsF1DVqM4zkOno3KsA9iqnOWG2t1FPkwRRKmexqjZAZ8T-7B4YgsLYZ-Tv3HqCmpdi_nit6WY9xqHEGKgjTQf6wqkSyKEVtfe2B7EWr2tx-AlOZBckT-ERgaG3qIi5Ih09Viw45nmvilTT5WP2gOR5qObYKkOaVFcxkbQiKGNUN8STCZj3SJdTyFXVUSEDLH5DPWKwxnLC4vO85rBJnK879JPIXHayqEtDtGTZQ-IvFyMoCUQDMl9w");
+}
+
+# **Isolates the alg check.** `alg: 256` (a JSON number, not a string),
+# genuinely RS256-signed. Pins that the check reads a *typed* field.
+fn _t_jwt_alg_not_string(): Str {
+    return str_from("eyJhbGciOjI1NiwidHlwIjoiSldUIn0.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9.QHyXL1F2_-_ExxC-irT9z6gO6UMLF3CDZBED_-CCZ802oQpwdQ79jllCgyTXENdGbU-03jKteZ5kiWMt1INEwk-A6LkmF_QnNguAw601sUJykV3cCl31eLLT7UgpfXPWefGws51JJvAFKYgY0kjPwo7_4NCxdeF6MuTotDrPIUDln_0q2yiuhUFCTte3498YXoLLDiUlUxwJjDm_xTXWkpUjji84bdInjk7PXCRTV-ntejYa7Z0BhWm2oH94eNAJZkMoBNa_O9UF1LpY43tYHVqf87IHrykn0UE3zJJFkF9GdRev23YfvE4PqsM35HQXj7H_yPAbCeWd0DOUuH5ghA");
+}
+
+# **Decision 3, INHERITED.** `aud: [\"agnosai\",\"other\"]`. jsonwebtoken
+# deserializes into `Claims` BEFORE validating (decoding.rs:285-287), and
+# `Claims.aud` is `Option<String>`, so an array fails as ErrorKind::Json -> 401.
+fn _t_jwt_aud_array(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiYWdub3NhaSIsIm90aGVyIl0sImV4cCI6MjUzNDAyMzAwNzk5LCJpYXQiOjAsImlzcyI6InRlc3QtaXNzdWVyIiwic3ViIjoidXNlci0xMjMifQ.ZB6pK7YY9ZswMidW3wASOmZuZkIuxAkt6Butd5MnrN2t9JRfiOBrJ74NFa4MrKMrIp76CKUNOI4r3Ct1yhJhEi-MAG2x4geNT1aXgFufFOtXvrrn9zGbuzzybyqkKlOxIzdOMucJ072ecuYq4K2YCG_1-pB80g07fFyENb4JUNEdNnvCLlCw5JIRggm8ZZ4Yyf2rcZqfRh_weozTFkzd2gFvWHLGZIzeyXudUMei7auAn1x5n9Zt9pAVtWSztG-BMXpH1Jcu7cL5gmrhAjUlw_OQpup8ZMAPevzkQrxW4iX1lzlPv-9vv8_XkZ2oDR7uHY4rnU-yg9sn-nzQqrcjXQ");
+}
+
+# **Decision 3, INHERITED.** `aud: [\"agnosai\"]` — the single-element
+# array fails too, which is the surprising half. Auth0 and Cognito emit this.
+fn _t_jwt_aud_array_single(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiYWdub3NhaSJdLCJleHAiOjI1MzQwMjMwMDc5OSwiaWF0IjowLCJpc3MiOiJ0ZXN0LWlzc3VlciIsInN1YiI6InVzZXItMTIzIn0.oe4M2EBeQB44OauxV5CkGdn2EmpKi_1aqFK-dF63h7e9ViVD4gW2YSfh5tjKAEESACVbjHMlbmdzsaCyvmcvr3rHDMqXl2KCuQLJeyj0nymmvYD88GLDKwTIawjNRqhNojcoyodtV7a4g5kDIfLOQSLa_aOHvRRmkS4C-MNRJ2o7LDdfL3TO12B_lnIrhiOAcjjKlvAJUNctNVge7zyBXPgkEHuvgWkJAyjLVEjyywafcl38D6WDKbjt-J8cxO3QakFf1XEbRbkUUvQLSdO-Y2GMI8_Zidev1TKOX8vO6O4Ey_z__ZF0DpHCKlBbw4aCjEZxR0InNJSoJJYb3wDwpA");
+}
+
+# The `valid` token with one signature character changed.
+fn _t_jwt_tampered_sig(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9.O_d2RmELAJEGbJBAgHjmnPOtZa8omZyVMJOuVmi65kSQ3Q8pE-gUZEKoy43ADXrB6Gixgb3QLDFPXw29ZSjevTdrL_DyqnaIsDENM-PDPGGFADbEdlwG8Z8nfzGckTFWI4rNrcVtdTu9UtYoHP4PB8yWxGTebk3JBl8q7xRLuNs7tB9CmxmhaYX2uAFcXOYE9tlcmCE4W4gnEhGBsShns2cCl0b7IPYQ8o4wJKK6HEAs-euzekAcKnlF_i0ozTpOTTR7U2PZeUHf2BIQ3MrXK52GpxpePczd19DiRRZx2LzrdAPTdtDj1wAawlU-Pq_DKJF8I8elGcD9INb8aEcGYB");
+}
+
+# The `valid` token's signature over a payload whose `sub` is
+# `attacker` — the signature no longer covers the body.
+fn _t_jwt_tampered_payload(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJhdHRhY2tlciJ9.O_d2RmELAJEGbJBAgHjmnPOtZa8omZyVMJOuVmi65kSQ3Q8pE-gUZEKoy43ADXrB6Gixgb3QLDFPXw29ZSjevTdrL_DyqnaIsDENM-PDPGGFADbEdlwG8Z8nfzGckTFWI4rNrcVtdTu9UtYoHP4PB8yWxGTebk3JBl8q7xRLuNs7tB9CmxmhaYX2uAFcXOYE9tlcmCE4W4gnEhGBsShns2cCl0b7IPYQ8o4wJKK6HEAs-euzekAcKnlF_i0ozTpOTTR7U2PZeUHf2BIQ3MrXK52GpxpePczd19DiRRZx2LzrdAPTdtDj1wAawlU-Pq_DKJF8I8elGcD9INb8aEcGYw");
+}
+
+# Oracle `jwt_garbage_token_rejected` — asserts **401, not 500**, so it
+# only passes if the PEM genuinely parsed.
+fn _t_jwt_garbage(): Str {
+    return str_from("not.a.jwt");
+}
+
+# Header and payload, no signature segment.
+fn _t_jwt_two_segments(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9");
+}
+
+# A valid token with a fourth segment appended.
+fn _t_jwt_four_segments(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9.O_d2RmELAJEGbJBAgHjmnPOtZa8omZyVMJOuVmi65kSQ3Q8pE-gUZEKoy43ADXrB6Gixgb3QLDFPXw29ZSjevTdrL_DyqnaIsDENM-PDPGGFADbEdlwG8Z8nfzGckTFWI4rNrcVtdTu9UtYoHP4PB8yWxGTebk3JBl8q7xRLuNs7tB9CmxmhaYX2uAFcXOYE9tlcmCE4W4gnEhGBsShns2cCl0b7IPYQ8o4wJKK6HEAs-euzekAcKnlF_i0ozTpOTTR7U2PZeUHf2BIQ3MrXK52GpxpePczd19DiRRZx2LzrdAPTdtDj1wAawlU-Pq_DKJF8I8elGcD9INb8aEcGYw.extra");
+}
+
+# Valid header and signature, empty payload segment.
+fn _t_jwt_empty_payload(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..O_d2RmELAJEGbJBAgHjmnPOtZa8omZyVMJOuVmi65kSQ3Q8pE-gUZEKoy43ADXrB6Gixgb3QLDFPXw29ZSjevTdrL_DyqnaIsDENM-PDPGGFADbEdlwG8Z8nfzGckTFWI4rNrcVtdTu9UtYoHP4PB8yWxGTebk3JBl8q7xRLuNs7tB9CmxmhaYX2uAFcXOYE9tlcmCE4W4gnEhGBsShns2cCl0b7IPYQ8o4wJKK6HEAs-euzekAcKnlF_i0ozTpOTTR7U2PZeUHf2BIQ3MrXK52GpxpePczd19DiRRZx2LzrdAPTdtDj1wAawlU-Pq_DKJF8I8elGcD9INb8aEcGYw");
+}
+
+# A payload segment whose length mod 4 is 1 — not valid base64url at any
+# padding. bayan's decoder silently drops the stray character; this must not.
+fn _t_jwt_bad_b64_len(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9A.O_d2RmELAJEGbJBAgHjmnPOtZa8omZyVMJOuVmi65kSQ3Q8pE-gUZEKoy43ADXrB6Gixgb3QLDFPXw29ZSjevTdrL_DyqnaIsDENM-PDPGGFADbEdlwG8Z8nfzGckTFWI4rNrcVtdTu9UtYoHP4PB8yWxGTebk3JBl8q7xRLuNs7tB9CmxmhaYX2uAFcXOYE9tlcmCE4W4gnEhGBsShns2cCl0b7IPYQ8o4wJKK6HEAs-euzekAcKnlF_i0ozTpOTTR7U2PZeUHf2BIQ3MrXK52GpxpePczd19DiRRZx2LzrdAPTdtDj1wAawlU-Pq_DKJF8I8elGcD9INb8aEcGYw");
+}
+
+# A payload segment carrying `==`. jsonwebtoken decodes with
+# URL_SAFE_NO_PAD, under which `=` is an invalid character, so this is rejected.
+fn _t_jwt_padded_segment(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9==.O_d2RmELAJEGbJBAgHjmnPOtZa8omZyVMJOuVmi65kSQ3Q8pE-gUZEKoy43ADXrB6Gixgb3QLDFPXw29ZSjevTdrL_DyqnaIsDENM-PDPGGFADbEdlwG8Z8nfzGckTFWI4rNrcVtdTu9UtYoHP4PB8yWxGTebk3JBl8q7xRLuNs7tB9CmxmhaYX2uAFcXOYE9tlcmCE4W4gnEhGBsShns2cCl0b7IPYQ8o4wJKK6HEAs-euzekAcKnlF_i0ozTpOTTR7U2PZeUHf2BIQ3MrXK52GpxpePczd19DiRRZx2LzrdAPTdtDj1wAawlU-Pq_DKJF8I8elGcD9INb8aEcGYw");
+}
+
+# **Range guard.** `exp` = 20000000000000000000, above `u64::MAX`.
+# bayan's `_jp_atoi` wraps it to a positive year-51-billion value and still tags
+# it JTAG_INT, so without an explicit bound the port ACCEPTED this where the
+# oracle 401s (it exceeds u64, so `Option<u64>` fails to deserialize).
+fn _t_jwt_exp_overflow(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyMDAwMDAwMDAwMDAwMDAwMDAwMCwiaWF0IjowLCJpc3MiOiJ0ZXN0LWlzc3VlciIsInN1YiI6InVzZXItMTIzIn0.0_xaku3FTCyxsCGSxt0oJ-fq5HgXD5VwWPIYc32DTgMlWv9aIWJ6JZK57D3O489zZH5EUalk0Mu3HbvYfIsIia0WuhkhPsulSLVvY-vSuSnYVwdSypCBfCYLUtPnU2Az0iB0iViro4T8jJuxy230b-ZceUIWwoRCetIqIVvjZxt_V3hqaNR18Sfvpc0s8OB-p13LCajJ5UK01wR1djXNOeQkr1-7ru52Q-Ho22-q-nPf4v_C6OsGAleos9aGk2TspMFJzGev9m7e3_u7dMEiPzJVfLh_hbPR4RoipkihD_nA7tUNDLuLQ0XJs92ToxRzRprz-8xEfgQnNvVe3GbEDg");
+}
+
+# **Range guard, mirror case.** `exp` = u64::MAX exactly. The oracle
+# accepts it; in i64 it wraps negative. Rejected here — fail-closed, and the
+# only direction worth erring in. This is why Decision 2 replaced it in the
+# fixtures rather than trying to represent it.
+fn _t_jwt_exp_u64_max(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoxODQ0Njc0NDA3MzcwOTU1MTYxNSwiaWF0IjowLCJpc3MiOiJ0ZXN0LWlzc3VlciIsInN1YiI6InVzZXItMTIzIn0.TylFVWtLyGDwGo9sj3kDKgNnK0mb77InRYiFfVOFH_LAbL48tp00Kz39hLYdRLwa6atsqWf4TCbCiG3PyNRNaqJZmOk0LpOsJDNqnrvVPjlWX9jtCkKH2sf7RsWXM63XMsTfUb1505BcDPI_ZDXngxB5IJGtEEq_ao4kKgG7QaiOil_J0Hf5rjSMB56mmnOx3ePKqkcYVt7dLC-FqXYHwk_Xq1jlg7dMgnj8wVXD189qknR4VZbv4fpVESBTdAOQ-e4tyYSt29PU3tAwDdPxya3lKxyhohxO3Dd1kGZYj1TW_RfGvUTvWjssDvr_CBdEvReiYhTzJ1qDn5PUHWfjvw");
+}
+
+# **Claim type.** `sub` as a JSON number. The oracle's `Claims.sub` is
+# `Option<String>`, so deserialization fails and jsonwebtoken 401s before
+# validation runs.
+fn _t_jwt_sub_number(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOjEyM30.VL0HJQ0ife-JqG62b7ucEMCgYRlv9PM-k6T9RWfM9QIcyXIYML2nFHeo1GTSL-blEkMvTWOwb0dlRzDjwk3K6DKY_MkFSy9A4oG-bbvpBUvF5fQsnq-qVAWX6WxM5vnBUqrSSVmnCvSyTdis4rOPBVviNJgTkBJqLv4iDSPvWFY-MtJBAqLw-OMsye_G0ewMcGRJb-cIClPtoRQLvF-lUjHELqLqsETxlvxAP9D4lIDdRP38zzZ9SrHMTrViqDF93mzNIkaH9Sj4qs9KX7O2CJBTOINmyk1t9e2mWSbWbhyuHArGLt51EqXmmnVtRmAoJv2LzOF5YsBiELeKu5yKFA");
+}
+
+# **Claim type.** `iat` = -1 against an `Option<u64>` field.
+fn _t_jwt_iat_negative(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6LTEsImlzcyI6InRlc3QtaXNzdWVyIiwic3ViIjoidXNlci0xMjMifQ.KTOygG7rm4pAcA12JQEmGIgIVa6SPZvOYBElnx_ZTOiSNAcuJV-1CehVqqJpLAE8mYlKPvPHKt8CiFI2jKQ67uQT8xeeYhV1ylN1msEkF3EsSbYnj63e3zEHw9KzV58Kp_Cif1nYuFIQ95RRpRdy4nXDOLO7NqW-8Jkx4EJlDyGaYJrkMG_y5Ow8ECM4owBuPad5BtmqxPpDPm3fpSQTkfhAdVsDxhlBcorwbFAxjPUgSmmugYJ3isVphJGFY7EzCHOVLm8QBTfaQoQg4gFVglwwtUKgbvBhgo7ENLWnPbJS8uBA3quVopqlFI78ORtbTAHGq1duHD3qZEP6MqRA8w");
+}
+
+# **Claim type.** `scope` as a number against `Option<String>`. Notable
+# because the port never reads `scope` — only a type check catches it.
+fn _t_jwt_scope_number(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzY29wZSI6NSwic3ViIjoidXNlci0xMjMifQ.TVpkR9B2PbTpQiPGZB5pPv5HWcn7hIpPfurjMff0X3vroBSW6fv6OuvrgHEloVvrrJEN2JAMXoFMm4LjHW0f4tv5ZFSdJvIMm3cGwBRkE9976LqENBq6GFv7A_tQ08OXyQIt2vJYfPH98_Qd1lLm_BTPkAeVU8vMcS_B1NRCi5_JWwj190T3zGOs9hTcnyFYo7WtbrBvDQUOLQNTd7Yw1apP5OiXjKwdfF6JbR1e07TFSCe1hosPq54ldPgUECZ3CuA3NL2zgv7w7qML1HLTdxoyHROJlfPFOKuL5FhajXDhHeG9-YbjrU7iDN2QgziGA-hVLfGSHLJRneSNeCdYzw");
+}
+
+# **Claim type.** `iss` as a number. Caught by the type pass even when no
+# issuer is configured, which the conditional `iss` comparison alone would miss.
+fn _t_jwt_iss_number(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjo5OSwic3ViIjoidXNlci0xMjMifQ.uh4daNkdvO2ygxDmcHi5a3hlwpJTY2ZRA8Xl0ZsMgicuDNv0UNY-0manHFYFnSh3-KS0akGSpy_6hYnw97b4pr4CykkRby23JFcB9Qr022aGVtT_XrXBRLc9sTsyQ_-7_SBzFdJgvlw0nynSx1HmvpF2TUnkn8je8eDuRDPyyhdF2mpW9-HwmfVidUfvgmUFYcwcKLkZMx77l2UbxX2XlO2eTjMXDzteQqdIJEcpivICL7B0zdSjilDsGz7qn1fBWV_8UnyhWRVDcXOWakideG2lI4yX32ZUv2AIkIVxqFsl32mBivkq5gbSZKXc3P_9YAS1q6fRWtcKsn4QBzQWAQ");
+}
+
+# A 512-bit RSA public key. The oracle verifies through ring's
+# `RSA_PKCS1_2048_8192_SHA256`, which refuses any modulus under 2048 bits; sigil
+# imposes no minimum at all, so without an explicit floor this key was accepted
+# and its tokens verified — a straight security regression against the oracle.
+fn _t_jwt_weak_pubkey_pem(): Str {
+    return str_from("-----BEGIN PUBLIC KEY-----\nMFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALrral3bt2PMXkjH/Um5EA7DxeUQ/tWE\nprtNN0XDcbwstmtIxIBbxbHFh7JI/lVyXTKGNC0xIXlXUrTJMFIOm/UCAwEAAQ==\n-----END PUBLIC KEY-----\n");
+}
+
+# A structurally valid RS256 token signed with the 512-bit key above.
+fn _t_jwt_weak_key_token(): Str {
+    return str_from("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ25vc2FpIiwiZXhwIjoyNTM0MDIzMDA3OTksImlhdCI6MCwiaXNzIjoidGVzdC1pc3N1ZXIiLCJzdWIiOiJ1c2VyLTEyMyJ9.UWEIeBnfmENnKUlaetU7fSsPs59acb8VDxch8LX9IFc9-UA-m5DoplFp0q9v9v9QCE3nbl6Pwsrfeeey3y2JBg");
+}

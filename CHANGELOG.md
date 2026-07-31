@@ -55,6 +55,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_auth (M6 bite 4) — the RS256 JWT half. `auth.rs` is now ported whole.**
+  PEM → `(n, e)` decoding, strict base64url, field-based `alg` pinning, signature
+  verification, and claim validation. 112 assertions in total across both bites,
+  against the oracle's 10.
+
+  **`pem_decode_pubkey` really was ~15 lines of local glue**, as the port plan
+  said: `_pem_find` / `_pem_b64_decode` take the label as a parameter and
+  `rsa_pubkey_from_der` already accepts SPKI, so only the `PUBLIC KEY` label pair
+  was missing. Both it and `RSA PUBLIC KEY` are accepted, matching
+  `DecodingKey::from_rsa_pem`.
+
+  **Two maintainer decisions landed, both recorded:**
+  - **`iss`/`aud` TIGHTENED** ([ADR 010](docs/adr/010-jwt-require-configured-iss-aud.md)).
+    jsonwebtoken's `set_issuer`/`set_audience` set only the expected value and
+    never add the claim to `required_spec_claims` (`validation.rs:143-145`), so
+    the oracle accepts a token carrying **no `iss` at all** even with an issuer
+    configured. Since `JwtConfig` holds one static key with no `kid` routing,
+    `iss`/`aud` are the only cross-tenant separation the design has. Now required
+    when configured — conditionally, mirroring the oracle's `if let Some` shape,
+    so the unconfigured path is unchanged. Zero oracle assertions change.
+  - **The 60-second `exp` leeway REPRODUCED** as a named constant citing
+    `validation.rs:120`. It is invisible from `auth.rs` — the oracle never sets
+    it, it comes from `Validation::new` — so a port written faithfully from the
+    oracle *source* would have compared `exp < now` and silently shipped a
+    stricter server.
+  - Array-valued `aud` is **inherited** as a rejection (fail-closed), including
+    the single-element `["agnosai"]` form that Auth0 and Cognito emit.
+  - The fixture `exp` is `253402300799` (9999-12-31), replacing the oracle's
+    `u64::MAX`, which is `2*i64::MAX+1` and does not fit Cyrius's signed i64.
+
+  **`alg` is pinned as a parsed JSON field, never a substring.** sigil exposes
+  only the raw RSA primitive, so there is no `Validation::new(Algorithm::RS256)`
+  to inherit; without this the port would ship an `alg:none` bypass the oracle
+  does not have, and the oracle's own tests never exercise `alg`, so test parity
+  would not have caught it. A vector with `{"alg":"none","kid":"RS256-2024"}`
+  pins that a substring scan would not do. Verified by mutation: deleting the
+  check fails exactly the three assertions that isolate it.
+
+  **`now` is injectable** (`agnosai_auth_check_at`), which is the only way to
+  drive the leeway boundary against a frozen token vector — the suite checks
+  exp+30, exp+60 (accepted) and exp+61, exp+90 (rejected).
+
+  **The key is parsed once, not per request.** The oracle rebuilds
+  `DecodingKey::from_rsa_pem` inside `validate_jwt` on every authenticated
+  request (`auth.rs:120-123`). `agnosai_jwt_config_prepare` hoists it — both the
+  performance fix and the fix for a real hazard, since sigil's `_pem_init` guards
+  its table build with a plain non-atomic flag and `run_pooled` makes every
+  worker a thread. Observable behaviour is unchanged: a PEM that does not parse
+  still answers 500 on every request reaching the JWT path.
+
+  **base64url is decoded locally rather than through `bayan_base64url_decode`.**
+  bayan's allocates three times per call on the no-free global bump
+  (`lib/bayan.cyr:132`, `:150`, `:180`) — a per-request leak against the arena
+  discipline the rest of the server follows — and is lax where a token verifier
+  must not be: it strips trailing `=` and silently drops the stray character of a
+  segment whose length is 1 mod 4. The local decoder allocates nothing, rejects
+  both, and rejects non-canonical trailing bits, matching the `base64` crate's
+  default that the oracle inherits.
+
+  Frozen vectors live in `tests/server_auth_vectors.cyr`, signed once with the
+  oracle's own keypair and confirmed with `openssl dgst -verify` before being
+  committed — **agnosai contains no RSA signing and no test needs a private key.**
+
+### Security
+- **server_auth — six defects found by an adversarial review of the first cut of
+  the JWT half, all fixed and all pinned by a test that fails if the fix is
+  removed** (verified by mutation, not assumed). Recorded in full because five of
+  the six were introduced in this release and would otherwise leave no trace.
+  - **Unauthenticated heap exhaustion, ~53× amplification.** The header was
+    parsed *before* the signature was verified, and `bayan_json_v_parse_buf`
+    builds its tree on the no-free global bump. A 1,164-byte header segment
+    leaked **62,248 bytes per request** on a path returning 401 — no credential
+    required, and nothing reclaims it. Fixed by verifying the signature first,
+    which is cryptographically safe here because the algorithm is never *chosen*
+    from the header: this path always runs RSASSA-PKCS1-v1.5/SHA-256 with the
+    configured key, so a token declaring `alg:none` still needs a valid RSA
+    signature to get anywhere. Measured after: **32 bytes, flat**, independent of
+    header size, and pinned by `_t_jwt_preauth_allocation_is_bounded`.
+  - **A second unauthenticated leak, 536 bytes/request.** `agnosai_jwt_config_prepare`
+    memoized success but not failure, so `AGNOSAI_JWT_KEY_BAD` was written and
+    never read: a PEM that base64-decoded and then failed RSA parsing was
+    re-decoded on every request. One mistyped `AGNOSAI_JWT_PUBLIC_KEY` was enough.
+  - **`exp` overflow, fail-open.** bayan's `_jp_atoi` computes `n = n*10 + digit`
+    in wrapping i64 with no overflow detection and still tags the result
+    `JTAG_INT`, so the `is_int` gate did not catch it. A payload carrying
+    `"exp":20000000000000000000` wrapped to `1553255926290448384` — a
+    year-51-billion timestamp — and the token was **accepted** where the oracle
+    answers 401. Now range-guarded to `[0, 253402300799]`.
+  - **Weak keys accepted.** The oracle verifies through ring's
+    `RSA_PKCS1_2048_8192_SHA256`, which refuses any modulus under 2048 bits;
+    sigil enforces no minimum at all. A **512-bit** key was accepted and its
+    tokens verified. Now floored at 2048-bit.
+  - **A zero clock silently disabled expiry.** `clock_epoch_secs` is documented
+    to return 0 when the RTC is unreadable — "unknown", not 1970 — and on the
+    agnos target it is a bare `sys_time_unix` with no retry. Fed through, the
+    expiry test became `exp < -60`, false for every non-negative `exp`. Now
+    refused with a 500. Note this one initially had a test that *looked* right
+    and caught nothing: on a host with a working clock the branch is unreachable,
+    so the guard was split into `agnosai_auth_check_clocked` to make it drivable.
+  - **Claim types unchecked.** The oracle deserializes the payload into a typed
+    `Claims` before validating, so any type mismatch is a 401; the port read it
+    untyped and accepted `"sub":123`, a negative `iat`, and a non-string `scope`
+    or `iss`. Now type-checked against every field the oracle declares.
+
+  Still divergent and **documented rather than fixed**: duplicate JSON members
+  resolve first-wins where serde errors; unknown JWS header members are not
+  type-checked; the modulus ceiling is 4096-bit against the oracle's 8192-bit,
+  because sigil's `_rsa_recover_em` refuses anything wider.
+
 - **server_auth (M6 bite 3) — the shared-secret half of `auth.rs`.** `AuthConfig`,
   `JwtConfig` and its builders, case-sensitive `Bearer ` extraction, the
   `HeaderValue::to_str()` visible-ASCII gate, and the shared-secret comparison.
@@ -673,6 +782,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Cyrius baseline. Not comparable to the frozen Rust CSV.
 
 ### Performance
+- **server_auth (JWT)**: `auth_jwt_verify_ok` **3.31 ms**, of which the raw
+  `rsa_pkcs1v15_verify_sha256` is **3.29 ms** — measured in isolation, so the
+  port's own parsing, base64 and JSON work is the remaining ~20 µs.
+  `auth_jwt_key_prepare` is **10.7 µs**, which is the per-request cost the oracle
+  pays and this port does not.
+
+  **The RSA figure is a sigil finding, not an agnosai one, and it is large.**
+  OpenSSL on this box does an RSA-2048 verify in **14 µs** (`openssl speed
+  rsa2048`, 70,445/s) — sigil is **~235× slower**. Part is inherent (a portable
+  bignum against hand-tuned assembly), but part is not:
+  `bn_mont_modexp` (`lib/sigil.cyr:10790`) runs a **constant-time always-multiply
+  ladder over the full `exp_blen * 8` bit range**, with no leading-zero skip —
+  where the sibling `bn_modexp` (`:10508`) does locate the high bit first. For
+  the public exponent 65537 that is 24 iterations × 2 multiplies = 48, against
+  the ~17 a conditional ladder needs, and the call site's own comment
+  (`lib/sigil.cyr:17632-17636`) says the operands are public and "Montgomery is
+  used purely for speed, not for the side-channel posture (no secret to protect
+  on the verify path)" — so it is paying ~2.8× for protection it states it does
+  not need. Worth filing against sigil.
+
+  **The operational consequence is agnosai's**: at 3.3 ms a core sustains only
+  ~300 JWT verifies/second. `auth_jwt_reject_bad_alg` is **3.29 ms** — the same
+  cost — because the `alg` check deliberately sits *after* signature
+  verification, so a rejected token pays the modexp too. An earlier ordering
+  rejected in 3.75 µs but parsed attacker-controlled JSON before authenticating,
+  which measured as a ~53x unauthenticated heap amplification (see **Security**).
+  Permanent memory exhaustion is the worse failure, so the CPU cost is accepted
+  and the answer to a flood is a rate limiter rather than check ordering. That
+  makes `rate_limit.rs` materially more important to M6 than its never-mounted
+  status in `server/mod.rs` suggests.
 - **server_auth**: the full auth decision — `Bearer ` extraction, the visible-ASCII
   gate over the whole header, two SHA-256 digests and a 32-byte constant-time
   compare — is `auth_check_secret_ok` **945 ns**. The disabled short-circuit is

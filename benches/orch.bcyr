@@ -41,6 +41,7 @@ include "src/server_prompt_guard.cyr"
 include "src/server_output_filter.cyr"
 include "src/server_prometheus.cyr"
 include "src/server_auth.cyr"
+include "tests/server_auth_vectors.cyr"
 include "src/chan_lossy.cyr"
 include "src/server_sse.cyr"
 include "src/orch_pubsub.cyr"
@@ -612,6 +613,14 @@ fn _b_durable_teardown(): i64 {
     return 0;
 }
 
+# Build an `Authorization: Bearer <token>` value.
+fn _b_bearer(token: Str): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Bearer ");
+    str_builder_add_str(sb, token);
+    return str_builder_build(sb);
+}
+
 # The auth decision on the happy path: `Bearer ` extraction, the visible-ASCII
 # gate over the whole header, and two SHA-256 digests compared constant-time.
 #
@@ -681,6 +690,68 @@ fn _b_auth_check_disabled(): i64 {
     return 0;
 }
 
+# The RS256 verify path end to end: three base64url decodes, two JSON parses,
+# an RSA public-key operation over SHA-256, and the claim checks.
+#
+# The point of the row is that it is dominated by the RSA modexp, which is why
+# `agnosai_jwt_config_prepare` hoists the PEM parse out of the request — the
+# oracle re-parses the key on every call (auth.rs:120-123), and that is pure
+# addition on top of this.
+fn _b_auth_jwt_valid(): i64 {
+    var n = 2000;
+    var j = agnosai_jwt_config_new(_t_jwt_pubkey_pem());
+    agnosai_jwt_config_with_issuer(j, str_from("test-issuer"));
+    agnosai_jwt_config_with_audience(j, str_from("agnosai"));
+    agnosai_jwt_config_prepare(j);
+    var c = agnosai_auth_config_with_jwt(j);
+    var h = _b_bearer(_t_jwt_valid());
+
+    var b = bench_new("auth_jwt_verify_ok");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check_at(c, 1, h, 1700000000); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Rejection of a token whose header declares the wrong algorithm.
+#
+# **This row costs a full RSA verify, and that is the deliberate trade.** The
+# `alg` check sits AFTER signature verification, because parsing the header
+# first meant parsing attacker JSON before authentication — and
+# `bayan_json_v_parse_buf` allocates on the no-free global bump, which measured
+# as a ~53x unauthenticated heap amplification. Memory exhaustion is permanent;
+# CPU exhaustion is not. So every malformed token pays the modexp, and the
+# answer to a flood is `rate_limit.rs`, not check ordering.
+fn _b_auth_jwt_bad_alg(): i64 {
+    var n = 20000;
+    var j = agnosai_jwt_config_new(_t_jwt_pubkey_pem());
+    agnosai_jwt_config_prepare(j);
+    var c = agnosai_auth_config_with_jwt(j);
+    var h = _b_bearer(_t_jwt_alg_hs256());
+
+    var b = bench_new("auth_jwt_reject_bad_alg");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check_at(c, 1, h, 1700000000); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Preparing the key — the work the oracle repeats per request and this port does
+# once. PEM scan, base64 decode, DER walk, two INTEGER magnitudes.
+fn _b_auth_jwt_prepare(): i64 {
+    var n = 20000;
+    var b = bench_new("auth_jwt_key_prepare");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_jwt_config_prepare(agnosai_jwt_config_new(_t_jwt_pubkey_pem()));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -718,6 +789,9 @@ fn main(): i64 {
     _b_auth_check_reject();
     _b_auth_check_short_token();
     _b_auth_check_disabled();
+    _b_auth_jwt_valid();
+    _b_auth_jwt_bad_alg();
+    _b_auth_jwt_prepare();
 
     return 0;
 }

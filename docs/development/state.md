@@ -26,9 +26,9 @@ lands, not before, so the number always names something that actually shipped.
 - **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers),
   `llm` (router, retry, hoosh seam client + hub), `tools` (native, registry, echo,
   json_transform, load_testing, security_audit, and the nine AGNOS ecosystem tools over a
-  shared client) + `tools/remote_registry`, and `orch` (15 modules + hub). Five `server`
+  shared client) + `tools/remote_registry`, and `orch` (15 modules + hub). Six `server`
   modules have landed — `server_ssrf`, `server_prompt_guard`, `server_sse`,
-  `server_output_filter`, `server_prometheus`. Support modules: `src/id.cyr`,
+  `server_output_filter`, `server_prometheus`, `server_auth`. Support modules: `src/id.cyr`,
   `src/units.cyr`, `src/order.cyr`, `src/chan_lossy.cyr` and `src/guarded_fetch.cyr`.
   `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
@@ -58,8 +58,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | `orchestrator` ported (M5, Phase 4) | ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
-| `server` ported (M6, Phase 5) | 🟡 **5.5 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), and `auth`'s **shared-secret half** is bite 3. Two remainders inside counted files: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier, and `auth.rs`'s RS256 half is bite 4 — its branch is a loud 500, never a silent pass |
-| `server/auth` shared-secret half | ✅ 5 oracle tests + 47 beyond; constant-time compare fixed vs the oracle ([ADR 009](../adr/009-auth-constant-time-secret-compare.md)) |
+| `server` ported (M6, Phase 5) | 🟡 **6 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), and `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
+| `server/auth` ported whole | ✅ all 10 oracle tests + 123 beyond; six defects found by adversarial review, fixed, and each pinned by a mutation-verified test. Two decided divergences: constant-time compare fixed ([ADR 009](../adr/009-auth-constant-time-secret-compare.md)) and configured `iss`/`aud` required ([ADR 010](../adr/010-jwt-require-configured-iss-aud.md)) |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
@@ -67,8 +67,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2734 assertions across 43 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
-smoke — **2736 across 44 files**, which is the figure `cyrius tests tests` reports:
+**2815 assertions across 43 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
+smoke — **2817 across 44 files**, which is the figure `cyrius tests tests` reports:
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -114,7 +114,7 @@ smoke — **2736 across 44 files**, which is the figure `cyrius tests tests` rep
 | `orch_orchestrator.tcyr` | 49 | 5 |
 | `server_output_filter.tcyr` | 63 | 16 |
 | `server_prometheus.tcyr` | 35 | 8 |
-| `server_auth.tcyr` | 52 | 5 of 10 (the shared-secret half; the 5 JWT tests wait on bite 4) |
+| `server_auth.tcyr` | 133 | 10 of 10 (all of `auth.rs`) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -146,7 +146,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (752/752 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (771/771 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -288,6 +288,9 @@ the default level the number measures sakshi writing to a pipe.
 | `auth_check_secret_short_token` | 917 ns |
 | `auth_check_secret_ok` | 945 ns |
 | `auth_check_secret_reject` | 955 ns |
+| `auth_jwt_reject_bad_alg` | 3.29 ms |
+| `auth_jwt_key_prepare` | 10.7 µs |
+| `auth_jwt_verify_ok` | 3.31 ms |
 
 The three `auth_check_secret_*` rows are the evidence for
 [ADR 009](../adr/009-auth-constant-time-secret-compare.md), not padding. They sit within
@@ -296,7 +299,31 @@ The three `auth_check_secret_*` rows are the evidence for
 row track the *secret's* length, which is the timing leak the ADR closes; the residual
 ~28 ns spread tracks the **token's** length, which the attacker chose and already knows.
 `auth_check_disabled` at 6 ns is the first branch, and it is what every deployment that
-has not configured auth pays per request.
+has not configured auth pays per request. **That row is also why
+`agnosai_auth_check` reads the clock only on the JWT path**: the obvious spelling,
+`check_at(..., clock_epoch_secs())`, reads it before the config is inspected, and the bench
+caught that turning this row into 1.35 µs and `auth_check_secret_ok` into 2.35 µs — both
+paths where `now` is never looked at.
+
+**`auth_jwt_verify_ok` at 3.31 ms is a sigil finding, not an agnosai one.** Measured in
+isolation, the raw `rsa_pkcs1v15_verify_sha256` is **3.29 ms**, so the port's own parsing,
+base64 and JSON work is the remaining ~20 µs. OpenSSL on this box does the same RSA-2048
+verify in **14 µs** (`openssl speed rsa2048`, 70,445/s) — **~235×**. See the upstream table
+for the diagnosis; part is the inherent portable-bignum gap, but ~2.8× of it is a
+constant-time ladder the call site's own comment says is unnecessary on the public verify
+path.
+
+The operational consequence is agnosai's, though. At 3.3 ms a core sustains only ~300 JWT
+verifies/second, and `auth_jwt_reject_bad_alg` costs the **same 3.29 ms** — the `alg` check
+sits *after* signature verification, so a rejected token pays the modexp too.
+
+That ordering was chosen against the cheaper one. Checking `alg` first rejected in 3.75 µs,
+but it meant parsing attacker-controlled JSON before authenticating, and
+`bayan_json_v_parse_buf` allocates on the no-free global bump — measured at **62,248 bytes
+per rejected request, ~53x amplification**, with no credential required. Permanent memory
+exhaustion is a worse failure than recoverable CPU exhaustion, so the modexp is paid on every
+malformed token and the answer to a flood is **`rate_limit.rs`**, which this makes materially
+more important to M6 than its never-mounted status in `server/mod.rs` suggests.
 
 **These numbers are futex-bound, not algorithm-bound**, and that is the finding rather than an
 excuse. `mutex_lock` + `mutex_unlock` costs **394 ns uncontended** because `lib/sync.cyr`'s
@@ -389,10 +416,10 @@ kiran (game AI) — none consuming the Cyrius line yet.
 from M6 (`server/sse`, `server/prompt_guard`) and an `orch_audit` chain the
 hoosh seam cannot delegate.
 
-**M6 — `server` is 5 of 21 files** (1,860 of 4,977 Rust lines). The plan's
-pure-leaf sequence is finished: `ssrf` and `prompt_guard` and `sse` came forward
-as M5 blockers, then `output_filter` and `prometheus` landed as M6 bites 1 and 2.
-16 files remain, carrying 69 oracle tests of which **43 are `#[tokio::test]`**.
+**M6 — `server` is 6 of 21 files.** The plan's pure-leaf sequence is finished:
+`ssrf`, `prompt_guard` and `sse` came forward as M5 blockers, `output_filter` and
+`prometheus` landed as M6 bites 1-2, and `auth.rs` is complete across bites 3-4.
+15 files remain, carrying 59 oracle tests of which **43 are `#[tokio::test]`**.
 
 **The structural call that shapes the rest of M6:** most of those tokio tests are
 async only because axum's `app.oneshot(...)` is, not because the handler logic is.
@@ -407,14 +434,59 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 
 ### Pick up here
 
-> **Bite 3 (auth, shared-secret half) is DONE** — `src/server_auth.cyr`,
-> 52 assertions, 15/15 fns covered, benchmarked. **Next is bite 4: the RS256
-> JWT half.** Read the four decisions below *before* writing it; they are the
-> whole risk in that bite. The five items under "~15 lines of glue undersells
-> the bite" still apply — the `alg` check and the base64url allocator posture
-> in particular, neither of which bite 3 touched.
+> **`server/auth.rs` is DONE** — both bites. `src/server_auth.cyr`, 133
+> assertions (all 10 oracle tests plus 123 beyond), 19/19 fns covered, 7
+> benchmarks. Two divergences decided by the maintainer and recorded as
+> [ADR 009](../adr/009-auth-constant-time-secret-compare.md) and
+> [ADR 010](../adr/010-jwt-require-configured-iss-aud.md); the 60-second leeway
+> and the array-`aud` rejection are reproduced, not tightened.
 >
-> The background below is kept because it is what makes bite 4 straightforward.
+> **An adversarial review found six defects in the first cut, five of them
+> introduced by this session.** All fixed, all pinned by a test that fails when
+> the fix is removed — verified by mutation rather than assumed. Two were
+> unauthenticated memory-exhaustion channels (a ~53x heap amplification from
+> parsing the header before verifying the signature, and a 536 B/request leak
+> from memoizing only the *success* of key preparation); one was an `exp`
+> fail-open through bayan's silently-wrapping `_jp_atoi`; one accepted 512-bit
+> keys where the oracle floors at 2048; one let a zero clock reading disable
+> expiry entirely; one skipped the claim type-checking the oracle gets free from
+> serde. The CHANGELOG's **Security** section carries the detail.
+>
+> **Two process lessons worth carrying into the routes tier**, both cheap and
+> both discovered the hard way here:
+> 1. **Mutation-test every security check.** The `alg` check looked covered by
+>    three assertions; only one actually isolated it — the other two were caught
+>    earlier by a structural check. And the first clock-sentinel test passed
+>    against a deliberately broken implementation, because on a host with a
+>    working clock the branch is unreachable. A guard no test can reach is a
+>    guard that silently rots; splitting `agnosai_auth_check_clocked` out was the
+>    fix.
+> 2. **Anything parsed before authentication allocates on the no-free global
+>    bump.** `bayan_json_v_parse_buf` threads no allocator and has no `_a`
+>    variant, so every `routes/*` handler that parses a request body has this
+>    exact exposure until blocker #3's per-request arena lands with the router
+>    bite. Assert an `alloc_used()` bound in each handler's suite the way
+>    `_t_jwt_preauth_allocation_is_bounded` does.
+>
+> **Next: `state.rs` (34 lines), then the `routes/*` tier.** `state.rs` is the
+> keystone — 13 of the 18 route entries in `server/mod.rs:48-99` take
+> `State<SharedState>`, and seven of its eight fields already exist in the tree
+> (`orchestrator`, `tools`, `events`, `audit`, `approval_gate`, and now `auth`);
+> only `definitions: DashMap` is new, and `lib/hashmap.cyr` covers it.
+>
+> **Keep writing handlers as `fn(state, inputs) -> (status, json)`.** That is
+> what made `auth.rs`'s ten `#[tokio::test]`s port as ordinary assertions, and
+> ~30 of M6's remaining 43 tokio tests are async for the same incidental reason
+> (axum's `oneshot`), not because the logic is. Nothing should touch sandhi's
+> server transport until every pure-leaf test is green.
+>
+> **Decide once, before the routes tier starts:** four request types carry
+> `#[serde(deny_unknown_fields)]` (`routes/crews.rs:14`, `:32`, `a2a.rs:34`,
+> `approval.rs:12`) and bayan has no equivalent. Either write explicit
+> unknown-key rejection into the `*_from_value` readers or file an ADR accepting
+> the divergence — once, up front, rather than four times inconsistently.
+>
+> The background below is kept because it is what made the auth bites cheap.
 
 **`server/auth.rs` (452 lines) is NOT blocked** — see the
 correction in [`cyrius-port-plan.md`](cyrius-port-plan.md) Phase 5, which
@@ -484,11 +556,15 @@ upstream dependency:
   comment at `auth.rs:16-17` claims it does not. This is a defect to fix, not a
   parity question — fix the loop and the comment together.
 
-### Four decisions waiting on the maintainer
+### Four decisions — ALL DECIDED 2026-07-30, all shipped in bite 4
 
-> Items 1-3 were re-verified 2026-07-30 against the **pinned jsonwebtoken 10.3.0
-> source**, not against the summary. Item 3's stated mechanism was wrong and is
-> corrected below. Item 4 is new and was missed entirely by the earlier pass.
+> Verified against the **pinned jsonwebtoken 10.3.0 source**, not a summary.
+> Kept in full because the reasoning must not be re-derived, and because items 1
+> and 4 are live divergences a future reader will need explained.
+>
+> **Maintainer's calls:** (1) **tighten**, (2) `253402300799`, (3) **inherit**,
+> (4) **reproduce the 60 s**. Items 1 and 4 are the two that change behaviour;
+> ADR 010 records item 1, and item 4 is a named constant in the module.
 
 1. **`iss`/`aud` absent passes.** jsonwebtoken's `set_issuer`/`set_audience` do
    not add those claims to `required_spec_claims`, so a token carrying **no
@@ -572,7 +648,8 @@ under `docs/development/issues/` are open; those under `issues/archive/` are res
 | ai-hwaccel | `load_models` returns 1 model instead of 26 | open — two candidate fixes, a compatibility call |
 | bayan | YAML parse into the tagged value tree | open (`2026-07-16-agnosai-yaml-parse-into-tagged-value-tree.md`); gates M10's YAML half, nothing sooner |
 | bote | `src/jwt.cyr` orphaned + documents an `exp` check it does not perform | **written but not yet upstream** — the file is untracked in the bote worktree and bote's HEAD is still 2026-07-17. The `exp` half is a false security claim, so this one is worth pushing |
-| sigil | *(none filed)* | `pem_decode_pubkey` would be nice-to-have; nothing waits on it |
+| sigil | `bn_mont_modexp` runs a constant-time always-multiply ladder over the full `exp_blen * 8` range with no leading-zero skip | **not yet filed — worth filing.** Measured 2026-07-30: RSA-2048 verify is **3.29 ms** against OpenSSL's **14 µs** on the same box (~235×). The sibling `bn_modexp` (`lib/sigil.cyr:10508`) *does* locate the high bit first; `bn_mont_modexp` (`:10790`) does not, so e=65537 costs 24 iterations × 2 multiplies = 48 rather than ~17. The call site's own comment (`:17632-17636`) says the operands are public and Montgomery is "used purely for speed, not for the side-channel posture", so it is paying ~2.8× for protection it states it does not need. The remainder is the inherent portable-bignum-vs-tuned-assembly gap |
+| sigil | *(none filed)* | `pem_decode_pubkey` — still nice-to-have; agnosai's local glue is ~15 lines over `_pem_find` / `_pem_b64_decode`, now written and working |
 
 **Never filed, still just port-plan asks:** sankoch ZIP container, majra relay
 reentrancy (confirmed live at `dist/majra.cyr:2105-2107`), sandhi `backlog` ignored
