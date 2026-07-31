@@ -1,0 +1,248 @@
+# =========================================================================
+# server_routes_health — rust-old/src/server/routes/health.rs, plus the
+# routes-tier response vocabulary and the `deny_unknown_fields` helper that
+# lands with it.
+#
+# All three of the oracle's `#[tokio::test]`s port as ordinary assertions,
+# because the handlers are `fn() -> response` rather than transport callbacks.
+# The oracle needs `oneshot` only to reach an `async fn`; the decisions these
+# make are synchronous.
+#
+# The oracle's metrics test asserts only that every line is a comment, contains
+# a space, or is empty — it never inspects a metric name. That is transcribed
+# exactly, and then gone well past, because the body under
+# [ADR 011](../docs/adr/011-metrics-endpoint-serves-agnosai-metrics.md) is
+# agnosai's registry rather than hoosh's and deserves its own pinning.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "tests/test_helpers.cyr"
+
+# Read a string member off a response's JSON body, or 0.
+fn _t_body_str(resp, key): Str {
+    var v = bayan_json_v_obj_get(agnosai_route_body(resp), key);
+    if (v == 0) { return str_from(""); }
+    if (bayan_json_v_is_str(v) == 0) { return str_from(""); }
+    return bayan_json_v_str(v);
+}
+
+# --- The oracle's three tests --------------------------------------------
+
+# Oracle: `get_health_returns_200`.
+fn _t_health(): i64 {
+    var r = agnosai_route_health();
+    assert(agnosai_route_status(r) == HTTP_OK, "GET /health is 200");
+    assert(str_eq(_t_body_str(r, "status"), str_from("ok")) == 1,
+    "...and its status field is ok");
+    assert(agnosai_route_is_text(r) == 0, "...and the body is JSON");
+    assert(bayan_json_v_obj_len(agnosai_route_body(r)) == 1,
+    "...with exactly the one member the oracle emits");
+    return 0;
+}
+
+# Oracle: `get_ready_returns_200_with_version`.
+fn _t_ready(): i64 {
+    var r = agnosai_route_ready();
+    assert(agnosai_route_status(r) == HTTP_OK, "GET /ready is 200");
+    assert(str_eq(_t_body_str(r, "status"), str_from("ready")) == 1,
+    "...and its status field is ready");
+    assert(str_eq(_t_body_str(r, "version"), str_from(AGNOSAI_VERSION)) == 1,
+    "...and it reports the build version");
+    assert(str_len(_t_body_str(r, "version")) > 0, "...which is not empty");
+    assert(bayan_json_v_obj_len(agnosai_route_body(r)) == 2,
+    "...with exactly the two members the oracle emits");
+    return 0;
+}
+
+# Oracle: `get_metrics_returns_200_with_prometheus_format` — every line is a
+# comment, contains a space, or is empty. Transcribed as written.
+fn _t_metrics_format(): i64 {
+    var r = agnosai_route_metrics();
+    assert(agnosai_route_status(r) == HTTP_OK, "GET /metrics is 200");
+    assert(agnosai_route_is_text(r) == 1, "...and the body is text, not JSON");
+
+    var body = agnosai_route_body(r);
+    var p = str_data(body);
+    var n = str_len(body);
+    var bad = 0;
+    var start = 0;
+    var i = 0;
+    while (i <= n) {
+        if (i == n || (load8(p + i) & 255) == 10) {
+            var len = i - start;
+            # A line passes if it is empty, starts with '#', or contains a space.
+            var ok = 0;
+            if (len == 0) { ok = 1; }
+            if (len > 0 && (load8(p + start) & 255) == 35) { ok = 1; }
+            for (var k = 0; k < len; k = k + 1) {
+                if ((load8(p + start + k) & 255) == 32) { ok = 1; }
+            }
+            if (ok == 0) { bad = bad + 1; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    assert(bad == 0, "every /metrics line is a comment, has a space, or is empty");
+    assert(n > 0, "the exposition is not empty");
+    return 0;
+}
+
+# --- Beyond the oracle: what ADR 011 actually serves ---------------------
+
+# The body is agnosai's registry, so it carries agnosai's metric names. The
+# oracle's own test could not have caught a wrong body — it inspects no names.
+fn _t_metrics_is_agnosai_registry(): i64 {
+    var body = agnosai_route_body(agnosai_route_metrics());
+    assert(str_contains(body, str_from("agnosai_crews_total")) == 1,
+    "the exposition carries agnosai_crews_total");
+    assert(str_contains(body, str_from("agnosai_tasks_completed_total")) == 1,
+    "...and agnosai_tasks_completed_total");
+    assert(str_contains(body, str_from("agnosai_inference_cost_usd_total")) == 1,
+    "...and the cost counter");
+    assert(str_contains(body, str_from("# HELP")) == 1, "...with HELP lines");
+    assert(str_contains(body, str_from("# TYPE")) == 1, "...and TYPE lines");
+    return 0;
+}
+
+# `/metrics` reads the process-global registry, so recording into it is visible
+# at the endpoint. That is the property which makes wiring the producer side
+# (ADR 011's "Consequences", and CHANGELOG [Unreleased]) a wiring job rather
+# than a redesign.
+fn _t_metrics_reflects_the_global(): i64 {
+    var m = agnosai_metrics_global();
+    assert(agnosai_metrics_global() == m, "the global is a singleton");
+
+    var before = agnosai_metrics_crews_total(m);
+    agnosai_metrics_record_crew_started(m);
+    assert(agnosai_metrics_crews_total(m) == before + 1, "recording moves the counter");
+
+    var body = agnosai_route_body(agnosai_route_metrics());
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "agnosai_crews_total ");
+    str_builder_add_int(sb, before + 1);
+    assert(str_contains(body, str_builder_build(sb)) == 1,
+    "...and the endpoint renders the new value");
+    return 0;
+}
+
+# --- The response vocabulary ---------------------------------------------
+
+fn _t_response_shape(): i64 {
+    var obj = bayan_json_v_obj_new();
+    var j = agnosai_route_json(201, obj);
+    assert(agnosai_route_status(j) == 201, "json response carries its status");
+    assert(agnosai_route_body(j) == obj, "...and its body");
+    assert(agnosai_route_is_text(j) == 0, "...and is not text");
+
+    var t = agnosai_route_text(HTTP_OK, str_from("hello"));
+    assert(agnosai_route_is_text(t) == 1, "text response is text");
+    assert(str_eq(agnosai_route_body(t), str_from("hello")) == 1, "...and carries its body");
+
+    var e = agnosai_route_error(HTTP_UNAUTHORIZED, str_from("nope"));
+    assert(agnosai_route_status(e) == HTTP_UNAUTHORIZED, "error carries its status");
+    assert(agnosai_route_is_text(e) == 0, "error is JSON");
+    var msg = bayan_json_v_obj_get(agnosai_route_body(e), "error");
+    assert(msg != 0, "error body has an `error` member");
+    assert(str_eq(bayan_json_v_str(msg), str_from("nope")) == 1,
+    "...carrying the message, matching the oracle's json!({\"error\": ..}) shape");
+    return 0;
+}
+
+# --- deny_unknown_fields --------------------------------------------------
+
+# serde enforces this during deserialization on four request types; bayan has no
+# equivalent, so without the helper the port would ACCEPT bodies the oracle
+# rejects. Pinned here, where the helper lives, so all four future readers
+# inherit a tested guard rather than four hand-rolled ones.
+fn _t_deny_unknown_fields(): i64 {
+    var allowed = agnosai_route_fields();
+    agnosai_route_field(allowed, "description");
+    agnosai_route_field(allowed, "agent");
+
+    var ok = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(ok, str_from("description"), bayan_json_v_str_new(str_from("d")));
+    assert(agnosai_route_no_unknown_fields(ok, allowed) == 1, "a known subset passes");
+
+    bayan_json_v_obj_set(ok, str_from("agent"), bayan_json_v_str_new(str_from("a")));
+    assert(agnosai_route_no_unknown_fields(ok, allowed) == 1, "all known fields pass");
+
+    var bad = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(bad, str_from("description"), bayan_json_v_str_new(str_from("d")));
+    bayan_json_v_obj_set(bad, str_from("typo"), bayan_json_v_str_new(str_from("x")));
+    assert(agnosai_route_no_unknown_fields(bad, allowed) == 0, "one unknown field fails");
+
+    var empty = bayan_json_v_obj_new();
+    assert(agnosai_route_no_unknown_fields(empty, allowed) == 1, "an empty object passes");
+
+    # Case-sensitive, like serde's field matching.
+    var cased = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(cased, str_from("Description"), bayan_json_v_str_new(str_from("d")));
+    assert(agnosai_route_no_unknown_fields(cased, allowed) == 0,
+    "field matching is case-sensitive");
+
+    # A non-object is not a valid body for a struct type.
+    assert(agnosai_route_no_unknown_fields(bayan_json_v_arr_new(), allowed) == 0,
+    "an array is not an object");
+    assert(agnosai_route_no_unknown_fields(bayan_json_v_null(), allowed) == 0,
+    "null is not an object");
+
+    # An empty allow-list rejects everything but an empty object — the shape a
+    # unit struct would have, and the case a `for` bug would silently pass.
+    var none = agnosai_route_fields();
+    assert(agnosai_route_no_unknown_fields(empty, none) == 1, "empty object, empty list");
+    assert(agnosai_route_no_unknown_fields(ok, none) == 0, "any field against an empty list fails");
+    return 0;
+}
+
+# The probes read no state, matching the oracle's handlers, which take no
+# `State`. Pinned because it is what lets the router mount them outside the
+# auth middleware.
+fn _t_probes_are_stateless(): i64 {
+    var a = agnosai_route_health();
+    var b = agnosai_route_health();
+    assert(agnosai_route_status(a) == agnosai_route_status(b), "health is repeatable");
+    assert(str_eq(_t_body_str(a, "status"), _t_body_str(b, "status")) == 1,
+    "...with a stable body");
+    var c = agnosai_route_ready();
+    assert(str_eq(_t_body_str(c, "version"), str_from(AGNOSAI_VERSION)) == 1,
+    "ready is repeatable");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_health();
+    _t_ready();
+    _t_metrics_format();
+    _t_metrics_is_agnosai_registry();
+    _t_metrics_reflects_the_global();
+    _t_response_shape();
+    _t_deny_unknown_fields();
+    _t_probes_are_stateless();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

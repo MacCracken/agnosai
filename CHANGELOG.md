@@ -82,6 +82,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_routes + server_routes_health (M6 bite 6) — the routes tier opens.**
+  The response vocabulary every handler will speak, the shared
+  `deny_unknown_fields` guard, and `health.rs`'s three probes. 42 assertions
+  against the oracle's 3.
+
+  **Handlers are `fn(state, inputs) -> response`.** The oracle's are
+  `async fn(State<..>, Json<T>) -> impl IntoResponse` and its tests drive them
+  through `app.oneshot(..)`, which is why 43 of M6's remaining oracle tests are
+  `#[tokio::test]` — almost none because the *logic* is async. All three of
+  `health.rs`'s ported as ordinary assertions, as `server_auth`'s ten did.
+
+  **`deny_unknown_fields` is written once, here, not four times later.** serde
+  enforces it during deserialization on `TaskRequest` (`crews.rs:14`),
+  `CrewRunRequest` (`:32`), `A2ARequest` (`a2a.rs:34`) and `ApprovalSubmission`
+  (`approval.rs:12`); bayan has no equivalent, so without it the port would
+  **accept request bodies the oracle rejects** — a fail-open divergence that no
+  oracle test guards. Pinned by 10 assertions including the empty-allow-list case
+  a loop bug would silently pass; mutation-verified.
+
+  **`/metrics` serves agnosai's registry, not hoosh's —
+  [ADR 011](docs/adr/011-metrics-endpoint-serves-agnosai-metrics.md).** The
+  oracle returns `crate::llm::llm_metrics::gather()`, and `llm/mod.rs:26` is
+  `pub use hoosh::metrics` — so in the Rust build the endpoint exposes the
+  **hoosh crate's in-process registry**. Under the HTTP seam
+  ([ADR 003](docs/adr/003-llm-native-http.md)) there is no in-process hoosh and
+  nothing to read, so it serves `server/prometheus.rs`'s port instead. That also
+  gives `AgnosMetrics` its first consumer: it has **zero references** anywhere in
+  the Rust tree — dead code the oracle carried but never wired. Names are all
+  `agnosai_`-prefixed, so scraping agnosai and hoosh into one Prometheus needs no
+  relabeling. **Producer side is a separate bite**: the oracle records at
+  `crew_runner.rs:810`/`:864` into hoosh's registry, so until the equivalent
+  calls land in `src/orch_crew_runner.cyr`, `/metrics` renders a well-formed
+  exposition of zeros — which the oracle's own test still accepts, since it
+  inspects no metric names.
+
+  `AGNOSAI_VERSION` is the one place the version number is duplicated — Cyrius
+  has no `env!("CARGO_PKG_VERSION")` equivalent — and must track the root
+  `VERSION` file; CLAUDE.md's work-loop version check covers it.
+
 - **server_state (M6 bite 5) — `AppState`, the keystone for the routes tier.**
   Small file, load-bearing position: **13 of the 18 route entries registered in
   `server/mod.rs:48-99` take `State<SharedState>`**, so no `routes/*` handler can

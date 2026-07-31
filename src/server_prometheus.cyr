@@ -34,6 +34,30 @@
 # Micro-USD per USD — the oracle's `MICRODOLLAR`, as an integer divisor.
 var AGNOSAI_MICRO_PER_USD = 1000000;
 
+# The process-wide metrics set `/metrics` serves.
+#
+# A singleton rather than an `AppState` field, matching the shape the oracle's
+# `/metrics` handler has: `pub async fn metrics() -> String` takes no `State`,
+# because `llm_metrics::gather()` reads a process-global registry. Keeping that
+# shape means the route needs no state and the recording sites — which are deep
+# inside the crew runner's worker threads — need nothing threaded down to them.
+var _agnosai_metrics_singleton = 0;
+
+# The process-wide metrics set, created on first use.
+#
+# **Not thread-safe to *create* concurrently**, and it does not need to be: the
+# server builds its state at startup, before any worker thread exists, and
+# `agnosai_metrics_gather` / the record verbs are called on it afterwards. Call
+# this once during boot to make the initialization explicit rather than relying
+# on whichever request arrives first — the same reason
+# `agnosai_jwt_config_prepare` is a startup call.
+fn agnosai_metrics_global(): i64 {
+    if (_agnosai_metrics_singleton == 0) {
+        _agnosai_metrics_singleton = agnosai_metrics_new();
+    }
+    return _agnosai_metrics_singleton;
+}
+
 enum AgnosaiMetricsOff {
     AGN_MT_CREWS_TOTAL = 0;
     AGN_MT_CREWS_ACTIVE = 8;

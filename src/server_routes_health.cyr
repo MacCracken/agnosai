@@ -1,0 +1,57 @@
+# =========================================================================
+# server_routes_health — the liveness, readiness and metrics probes.
+#
+# Parity oracle: rust-old/src/server/routes/health.rs
+#
+# Three handlers, none of which reads `AppState` — matching the oracle, whose
+# `health`, `ready` and `metrics` all take no `State`. They are the smallest
+# complete shape in the routes tier, which is why they land first.
+#
+# ## `/metrics` serves agnosai's own metrics, not hoosh's — [ADR 011]
+#
+# The oracle's `metrics()` returns `crate::llm::llm_metrics::gather()`, and
+# `llm/mod.rs:26` is `pub use hoosh::metrics as llm_metrics` — so in the Rust
+# build `/metrics` exposes the **hoosh crate's in-process registry**, because
+# hoosh is linked in.
+#
+# The Cyrius port reaches hoosh over an HTTP seam ([ADR 003]), so there is no
+# in-process hoosh and no registry to read. `/metrics` therefore serves
+# `agnosai_metrics_gather` — the `server/prometheus.rs` port — which also gives
+# that module the consumer it never had: `AgnosMetrics` has **zero references**
+# in the entire Rust tree, dead code the oracle carried but never wired.
+#
+# See [ADR 011](../docs/adr/011-metrics-endpoint-serves-agnosai-metrics.md) for
+# the full reasoning and for what an operator scraping both should expect.
+# =========================================================================
+
+# `GET /health` — liveness. The oracle's `Json(json!({"status": "ok"}))`.
+fn agnosai_route_health(): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("status"), bayan_json_v_str_new(str_from("ok")));
+    return agnosai_route_json(HTTP_OK, obj);
+}
+
+# `GET /ready` — readiness, with the build's version.
+#
+# The oracle interpolates `env!("CARGO_PKG_VERSION")` at compile time; Cyrius has
+# no equivalent, so the number comes from `AGNOSAI_VERSION` in `server_routes`,
+# which must track the root `VERSION` file. Key order is `status` then
+# `version`, matching the oracle's `json!` literal — `bayan_json_v_obj_set`
+# preserves insertion order, and the oracle's own test reads both by name rather
+# than by position, so this is tidiness rather than a contract.
+fn agnosai_route_ready(): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("status"), bayan_json_v_str_new(str_from("ready")));
+    bayan_json_v_obj_set(obj, str_from("version"),
+    bayan_json_v_str_new(str_from(AGNOSAI_VERSION)));
+    return agnosai_route_json(HTTP_OK, obj);
+}
+
+# `GET /metrics` — Prometheus text exposition.
+#
+# Text, not JSON: the oracle returns `String` rather than `Json<Value>`, and
+# Prometheus has its own content type. See the module header and ADR 011 for why
+# the body is agnosai's registry rather than hoosh's.
+fn agnosai_route_metrics(): i64 {
+    return agnosai_route_text(HTTP_OK, agnosai_metrics_gather(agnosai_metrics_global()));
+}
