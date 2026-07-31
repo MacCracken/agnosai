@@ -82,6 +82,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_router (M6 bite 15a) — the route table, path matching, and the auth
+  boundary.** 86 assertions against an oracle that has **no `#[cfg(test)]`
+  module at all**, so every routing rule is covered for the first time.
+
+  **Split from the sandhi adapter deliberately.** This is the router's
+  *decision* — which handler runs, whether auth gates it, what comes back — and
+  it touches no sandhi, so it is fully testable now. Bite 15b is the transport:
+  `sandhi_server_run_pooled`, the per-worker arena (blocker #3), the
+  `alloc_used()`-flat regression test, and the a2a callback dispatch.
+
+  **The auth boundary is the security-critical part, and it is inverted on
+  purpose.** `mod.rs:79-88` nests `/api/v1` plus the bare `/mcp` inside the auth
+  middleware and merges that into a public router. The port writes the predicate
+  as an allow-list of the **public** routes rather than of the protected ones,
+  so a route added to the table without thought defaults to **protected** — the
+  safe direction. Mutation-verified: flipping that default fails **20**
+  assertions, and quietly dropping `/mcp` from the protected set fails 2.
+
+  Three behaviours worth stating rather than discovering:
+  - **`/health`, `/ready` and `/metrics` are always public**, even with auth
+    enabled. `/metrics` unauthenticated exposes crew counts, task counts and
+    inference cost.
+  - **`/mcp` is protected but is not under `/api/v1`** — the entry most easily
+    missed when transcribing the router.
+  - **Routing precedes middleware**, so an unauthenticated request to a
+    nonexistent path is **404, not 401** — an information disclosure the oracle
+    accepts. And `DefaultBodyLimit` is the *outermost* layer, so an oversized
+    body is **413 before routing**, hence before auth, even on an unknown path.
+
+  A known path under an unregistered method is **405, not 404**. Path parameters
+  match exactly one non-empty segment and never span `/`, so `/crews//cancel`
+  and `/crews/a/b/cancel` both miss; the captured value reaches the handler,
+  which is why a malformed crew id is the handler's 422 rather than the router's
+  404.
+
+  **`/api/v1/crews/{id}/stream` answers 501, not 404** — the route exists and
+  only its handler is missing (SSE is bite 15c); a 404 would tell a client the
+  endpoint is not part of the API, which is a different and wrong statement. It
+  is still auth-gated.
+
+  **`ConcurrencyLimitLayer` has no sandhi analogue** — tower queues above the
+  limit, while sandhi's pooled server bounds work in flight by worker count and
+  does not queue. `AGNOSAI_MAX_CONCURRENT_REQUESTS` is carried as a constant so
+  bite 15b sizes its pool against the oracle's intent rather than inventing a
+  number, and so the divergence is stated rather than dropped.
+
 - **server_hot_config + server_rate_limit (M6 bite 14) — the last two pure
   files of the transport tier.** 28 and 41 assertions against the oracle's 5
   and 7. Both are still `fn(inputs) -> decision`; neither needs sandhi.

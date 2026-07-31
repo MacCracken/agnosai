@@ -1,0 +1,373 @@
+# =========================================================================
+# server_router — rust-old/src/server/mod.rs.
+#
+# **`mod.rs` has no `#[cfg(test)]` module at all**, so every routing rule here
+# is covered for the first time: all 18 table entries, the public/protected
+# boundary, path-parameter capture, 404-vs-405, and the layer ordering that
+# decides whether a bad request sees 413, 404 or 401.
+#
+# The auth boundary is the part worth the most scrutiny — a route that silently
+# fell out of the protected set would be an authentication bypass, and nothing
+# upstream would catch it.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_routes_tools.cyr"
+include "src/server_routes_agents.cyr"
+include "src/server_routes_approval.cyr"
+include "src/server_routes_dashboard.cyr"
+include "src/server_routes_crews.cyr"
+include "src/server_routes_a2a.cyr"
+include "src/server_routes_mcp.cyr"
+include "src/server_hot_config.cyr"
+include "src/server_rate_limit.cyr"
+include "src/server_router.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_state_auth(auth): i64 {
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_echo_tool());
+    return agnosai_app_state_new(agnosai_orchestrator_new(0), reg, auth,
+    agnosai_event_bus_new(), agnosai_audit_chain_new(), agnosai_approval_gate_new());
+}
+
+fn _t_open(): i64 { return _t_state_auth(agnosai_auth_config_new()); }
+fn _t_guarded(): i64 {
+    return _t_state_auth(agnosai_auth_config_with_secret(str_from("s3cret")));
+}
+
+# Dispatch with no Authorization header.
+fn _t_go(s, method, path): i64 {
+    return agnosai_route_dispatch(s, method, str_from(path), str_from(""), 0, str_from(""));
+}
+
+# Dispatch with a valid Bearer token.
+fn _t_go_auth(s, method, path): i64 {
+    return agnosai_route_dispatch(s, method, str_from(path),
+    str_from("Bearer s3cret"), 1, str_from(""));
+}
+
+fn _t_id(method, path): i64 {
+    return agnosai_route_match_id(agnosai_route_resolve(method, str_from(path)));
+}
+
+fn _t_param(method, path): Str {
+    var p = agnosai_route_match_param(agnosai_route_resolve(method, str_from(path)));
+    if (p == 0) { return str_from(""); }
+    return p;
+}
+
+# --- The table: all 18 entries -------------------------------------------
+
+fn _t_table(): i64 {
+    assert(_t_id(AGNOSAI_METHOD_GET, "/health") == AGN_ROUTE_HEALTH, "GET /health");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/ready") == AGN_ROUTE_READY, "GET /ready");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/metrics") == AGN_ROUTE_METRICS, "GET /metrics");
+    assert(_t_id(AGNOSAI_METHOD_POST, "/mcp") == AGN_ROUTE_MCP, "POST /mcp");
+    assert(_t_id(AGNOSAI_METHOD_POST, "/api/v1/crews") == AGN_ROUTE_CREATE_CREW,
+    "POST /api/v1/crews");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/crews/abc") == AGN_ROUTE_GET_CREW,
+    "GET /api/v1/crews/{id}");
+    assert(_t_id(AGNOSAI_METHOD_POST, "/api/v1/crews/abc/cancel") == AGN_ROUTE_CANCEL_CREW,
+    "POST /api/v1/crews/{id}/cancel");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/crews/abc/stream") == AGN_ROUTE_CREW_STREAM,
+    "GET /api/v1/crews/{id}/stream");
+    assert(_t_id(AGNOSAI_METHOD_POST, "/api/v1/a2a/receive") == AGN_ROUTE_A2A_RECEIVE,
+    "POST /api/v1/a2a/receive");
+    # POST, not GET — the oracle registers `post(routes::a2a::status)`.
+    assert(_t_id(AGNOSAI_METHOD_POST, "/api/v1/a2a/status") == AGN_ROUTE_A2A_STATUS,
+    "POST /api/v1/a2a/status");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/agents/definitions")
+    == AGN_ROUTE_LIST_DEFINITIONS, "GET definitions");
+    assert(_t_id(AGNOSAI_METHOD_POST, "/api/v1/agents/definitions")
+    == AGN_ROUTE_CREATE_DEFINITION, "POST definitions — same path, different method");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/tools") == AGN_ROUTE_LIST_TOOLS, "GET tools");
+    assert(_t_id(AGNOSAI_METHOD_DELETE, "/api/v1/tools/echo") == AGN_ROUTE_REMOVE_TOOL,
+    "DELETE /api/v1/tools/{name}");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/approvals") == AGN_ROUTE_LIST_PENDING,
+    "GET approvals");
+    assert(_t_id(AGNOSAI_METHOD_POST, "/api/v1/approvals") == AGN_ROUTE_SUBMIT_APPROVAL,
+    "POST approvals");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/presets") == AGN_ROUTE_LIST_PRESETS,
+    "GET presets");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/dashboard/crews") == AGN_ROUTE_CREW_HISTORY,
+    "GET dashboard/crews");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/dashboard/agents")
+    == AGN_ROUTE_AGENT_PERFORMANCE, "GET dashboard/agents");
+    return 0;
+}
+
+# --- The auth boundary ---------------------------------------------------
+
+# **`/health`, `/ready` and `/metrics` are ALWAYS public**, even with auth
+# enabled. `/metrics` being unauthenticated exposes crew counts, task counts and
+# inference cost — worth knowing rather than discovering.
+fn _t_probes_are_public(): i64 {
+    var s = _t_guarded();
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET, "/health")) == HTTP_OK,
+    "/health needs no auth even when auth is enabled");
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET, "/ready")) == HTTP_OK,
+    "/ready needs no auth");
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET, "/metrics")) == HTTP_OK,
+    "/metrics needs no auth — it is unauthenticated by design");
+
+    assert(agnosai_route_needs_auth(AGN_ROUTE_HEALTH) == 0, "health is public");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_READY) == 0, "ready is public");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_METRICS) == 0, "metrics is public");
+    return 0;
+}
+
+# **Every other route is protected**, `/mcp` included — it is not under
+# `/api/v1` and is the one most easily missed when transcribing the router.
+fn _t_everything_else_is_protected(): i64 {
+    assert(agnosai_route_needs_auth(AGN_ROUTE_MCP) == 1,
+    "/mcp is protected despite not being under /api/v1");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_CREATE_CREW) == 1, "create_crew");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_GET_CREW) == 1, "get_crew");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_CANCEL_CREW) == 1, "cancel_crew");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_CREW_STREAM) == 1, "crew_stream");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_A2A_RECEIVE) == 1, "a2a receive");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_A2A_STATUS) == 1, "a2a status");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_LIST_DEFINITIONS) == 1, "list definitions");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_CREATE_DEFINITION) == 1, "create definition");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_LIST_TOOLS) == 1, "list tools");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_REMOVE_TOOL) == 1, "remove tool");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_LIST_PENDING) == 1, "list pending");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_SUBMIT_APPROVAL) == 1, "submit approval");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_LIST_PRESETS) == 1, "list presets");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_CREW_HISTORY) == 1, "crew history");
+    assert(agnosai_route_needs_auth(AGN_ROUTE_AGENT_PERFORMANCE) == 1, "agent performance");
+    return 0;
+}
+
+# The boundary in effect, end to end.
+fn _t_auth_gate_runs(): i64 {
+    var s = _t_guarded();
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET, "/api/v1/tools"))
+    == HTTP_UNAUTHORIZED, "a protected route with no header is 401");
+    assert(agnosai_route_status(_t_go_auth(s, AGNOSAI_METHOD_GET, "/api/v1/tools"))
+    == HTTP_OK, "...and passes with a valid token");
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_POST, "/mcp"))
+    == HTTP_UNAUTHORIZED, "/mcp with no header is 401");
+
+    var wrong = agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, str_from("/api/v1/tools"),
+    str_from("Bearer wrong"), 1, str_from(""));
+    assert(agnosai_route_status(wrong) == HTTP_UNAUTHORIZED, "a wrong token is 401");
+
+    # With auth disabled every route is open, which is the default posture.
+    var open = _t_open();
+    assert(agnosai_route_status(_t_go(open, AGNOSAI_METHOD_GET, "/api/v1/tools")) == HTTP_OK,
+    "with auth disabled a protected route is open");
+    return 0;
+}
+
+# --- Layer ordering ------------------------------------------------------
+
+# **Routing happens before middleware**, so an unauthenticated request to a
+# path that does not exist is 404, not 401 — an information disclosure the
+# oracle accepts and the port reproduces.
+fn _t_routing_precedes_auth(): i64 {
+    var s = _t_guarded();
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET, "/api/v1/nope"))
+    == HTTP_NOT_FOUND, "an unknown path is 404 even without auth, not 401");
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET, "/nope")) == HTTP_NOT_FOUND,
+    "...at the top level too");
+    return 0;
+}
+
+# `DefaultBodyLimit` is the OUTERMOST layer, so it fires before routing and
+# therefore before auth — an oversized body is 413 regardless of path or token.
+fn _t_body_limit_is_outermost(): i64 {
+    var s = _t_guarded();
+    var sb = str_builder_new();
+    for (var i = 0; i < AGNOSAI_MAX_BODY_BYTES + 1; i = i + 1) { str_builder_putc(sb, 120); }
+    var big = str_builder_build(sb);
+
+    assert(agnosai_route_status(agnosai_route_dispatch(s, AGNOSAI_METHOD_POST,
+    str_from("/api/v1/crews"), str_from(""), 0, big)) == HTTP_PAYLOAD_TOO_LARGE,
+    "an oversized body is 413 before auth is consulted");
+    assert(agnosai_route_status(agnosai_route_dispatch(s, AGNOSAI_METHOD_GET,
+    str_from("/nonexistent"), str_from(""), 0, big)) == HTTP_PAYLOAD_TOO_LARGE,
+    "...and before routing, so even an unknown path is 413 not 404");
+    assert(AGNOSAI_MAX_BODY_BYTES == 10485760, "the cap is the oracle's 10 MiB");
+    return 0;
+}
+
+# A known path under an unregistered method is **405**, not 404.
+fn _t_method_mismatch_is_405(): i64 {
+    var s = _t_open();
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_POST, "/health"))
+    == HTTP_METHOD_NOT_ALLOWED, "POST /health is 405");
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET, "/mcp"))
+    == HTTP_METHOD_NOT_ALLOWED, "GET /mcp is 405");
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_DELETE, "/api/v1/crews"))
+    == HTTP_METHOD_NOT_ALLOWED, "DELETE /api/v1/crews is 405");
+    # a2a/status is POST-only.
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET, "/api/v1/a2a/status"))
+    == HTTP_METHOD_NOT_ALLOWED, "GET a2a/status is 405 — it is registered POST-only");
+    # ...but a genuinely unknown path is still 404.
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_POST, "/api/v1/zzz"))
+    == HTTP_NOT_FOUND, "an unknown path is 404, not 405");
+    return 0;
+}
+
+# --- Path parameters -----------------------------------------------------
+
+fn _t_path_params(): i64 {
+    assert(str_eq(_t_param(AGNOSAI_METHOD_GET, "/api/v1/crews/xyz"), str_from("xyz")) == 1,
+    "the crew id is captured");
+    assert(str_eq(_t_param(AGNOSAI_METHOD_POST, "/api/v1/crews/abc/cancel"),
+    str_from("abc")) == 1, "the id is captured from a mid-path parameter");
+    assert(str_eq(_t_param(AGNOSAI_METHOD_DELETE, "/api/v1/tools/echo"),
+    str_from("echo")) == 1, "the tool name is captured");
+
+    # A parameter matches exactly one NON-EMPTY segment and never spans `/`.
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/crews//") == AGN_ROUTE_NONE,
+    "an empty parameter segment does not match");
+    assert(_t_id(AGNOSAI_METHOD_POST, "/api/v1/crews//cancel") == AGN_ROUTE_NONE,
+    "an empty mid-path parameter does not match");
+    assert(_t_id(AGNOSAI_METHOD_POST, "/api/v1/crews/a/b/cancel") == AGN_ROUTE_NONE,
+    "a parameter does not span a slash");
+    assert(_t_id(AGNOSAI_METHOD_GET, "/api/v1/crews/a/b") == AGN_ROUTE_NONE,
+    "an extra segment does not match");
+
+    # A trailing slash is a distinct path, as in axum.
+    assert(_t_id(AGNOSAI_METHOD_GET, "/health/") == AGN_ROUTE_NONE,
+    "a trailing slash is not the same route");
+
+    # `/api/v1/crews/{id}` and `/api/v1/crews` are different routes, and the
+    # literal `/api/v1/crews` must not be swallowed by the parameter pattern.
+    assert(_t_id(AGNOSAI_METHOD_POST, "/api/v1/crews") == AGN_ROUTE_CREATE_CREW,
+    "the bare collection path is its own route");
+    return 0;
+}
+
+# The parameter reaches the handler, which validates it — `get_crew` answers 422
+# for a malformed UUID rather than 404, because axum's `Path<Uuid>` extractor
+# runs AFTER routing.
+fn _t_param_reaches_the_handler(): i64 {
+    var s = _t_open();
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET, "/api/v1/crews/not-a-uuid"))
+    == AGNOSAI_HTTP_UNPROCESSABLE,
+    "a malformed crew id is 422 from the handler, not 404 from the router");
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_GET,
+    "/api/v1/crews/00000000-0000-0000-0000-000000000001")) == HTTP_NOT_FOUND,
+    "a well-formed but unknown crew id is 404 from the handler");
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_DELETE, "/api/v1/tools/echo"))
+    == HTTP_NO_CONTENT, "DELETE reaches remove_tool with the right name");
+    assert(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_DELETE, "/api/v1/tools/nope"))
+    == HTTP_NOT_FOUND, "...and an unknown tool is the handler's 404");
+    return 0;
+}
+
+# --- Dispatch reaches the right handler ----------------------------------
+
+fn _t_dispatch(): i64 {
+    var s = _t_open();
+    var health = _t_go(s, AGNOSAI_METHOD_GET, "/health");
+    assert(bayan_json_v_obj_get(agnosai_route_body(health), "status") != 0,
+    "/health returns the health body");
+
+    var tools = _t_go(s, AGNOSAI_METHOD_GET, "/api/v1/tools");
+    assert(bayan_json_v_arr_len(agnosai_route_body(tools)) == 1,
+    "/api/v1/tools returns the registered tool");
+
+    var presets = _t_go(s, AGNOSAI_METHOD_GET, "/api/v1/presets");
+    assert(bayan_json_v_arr_len(agnosai_route_body(presets)) == 0,
+    "/api/v1/presets returns the empty default-build array");
+
+    var metrics = _t_go(s, AGNOSAI_METHOD_GET, "/metrics");
+    assert(agnosai_route_is_text(metrics) == 1, "/metrics returns text, not JSON");
+
+    var mcp = agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, str_from("/mcp"),
+    str_from(""), 0, str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"));
+    assert(bayan_json_v_obj_get(agnosai_route_body(mcp), "result") != 0,
+    "/mcp dispatches to the JSON-RPC handler with the body");
+
+    var a2a = _t_go(s, AGNOSAI_METHOD_POST, "/api/v1/a2a/status");
+    assert(bayan_json_v_obj_get(agnosai_route_body(a2a), "status") != 0,
+    "a2a/status dispatches");
+    return 0;
+}
+
+# `/api/v1/crews/{id}/stream` resolves but has no handler. **501, not 404** —
+# the route exists, and a 404 would tell a client the endpoint is not part of
+# the API, which is a different and wrong statement. Bite 15b wires it; see
+# docs/development/state.md and CHANGELOG [Unreleased].
+fn _t_stream_is_501_not_404(): i64 {
+    var s = _t_open();
+    var r = _t_go(s, AGNOSAI_METHOD_GET, "/api/v1/crews/abc/stream");
+    assert(agnosai_route_status(r) == HTTP_NOT_IMPLEMENTED,  #skip-lint: HTTP 501 status code
+    "the stream route answers 501 — the route exists, the handler does not");
+
+    # The mismatch flag distinguishes a known path under a wrong method from an
+    # unknown path, and is what the 405/404 split reads.
+    assert(agnosai_route_match_method_mismatch(
+    agnosai_route_resolve(AGNOSAI_METHOD_POST, str_from("/health"))) == 1,
+    "a known path with a wrong method sets the mismatch flag");
+    assert(agnosai_route_match_method_mismatch(
+    agnosai_route_resolve(AGNOSAI_METHOD_GET, str_from("/zzz"))) == 0,
+    "...and an unknown path does not");
+    assert(agnosai_route_status(r) != HTTP_NOT_FOUND,
+    "...specifically NOT 404, which would deny the endpoint exists");
+    # And it is still behind auth, so an unauthenticated caller sees 401 first.
+    var g = _t_guarded();
+    assert(agnosai_route_status(_t_go(g, AGNOSAI_METHOD_GET, "/api/v1/crews/abc/stream"))
+    == HTTP_UNAUTHORIZED, "the unwired route is still auth-gated");
+    return 0;
+}
+
+# --- Path segmentation ---------------------------------------------------
+
+fn _t_segments(): i64 {
+    assert(vec_len(_agnosai_path_segments(str_from("/"))) == 0, "`/` has no segments");
+    assert(vec_len(_agnosai_path_segments(str_from("/a"))) == 1, "`/a` has one");
+    assert(vec_len(_agnosai_path_segments(str_from("/a/b/c"))) == 3, "`/a/b/c` has three");
+    var s = _agnosai_path_segments(str_from("/api/v1/tools"));
+    assert(str_eq(vec_get(s, 0), str_from("api")) == 1, "first segment");
+    assert(str_eq(vec_get(s, 1), str_from("v1")) == 1, "second segment");
+    assert(str_eq(vec_get(s, 2), str_from("tools")) == 1, "third segment");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_table();
+    _t_probes_are_public();
+    _t_everything_else_is_protected();
+    _t_auth_gate_runs();
+    _t_routing_precedes_auth();
+    _t_body_limit_is_outermost();
+    _t_method_mismatch_is_405();
+    _t_path_params();
+    _t_param_reaches_the_handler();
+    _t_dispatch();
+    _t_stream_is_501_not_404();
+    _t_segments();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
