@@ -45,10 +45,11 @@ lands, not before, so the number always names something that actually shipped.
 - **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers),
   `llm` (router, retry, hoosh seam client + hub), `tools` (native, registry, echo,
   json_transform, load_testing, security_audit, and the nine AGNOS ecosystem tools over a
-  shared client) + `tools/remote_registry`, and `orch` (15 modules + hub). Six `server`
-  modules have landed — `server_ssrf`, `server_prompt_guard`, `server_sse`,
-  `server_output_filter`, `server_prometheus`, `server_auth`, `server_state`. Support
-  modules: `src/id.cyr`,
+  shared client) + `tools/remote_registry`, and `orch` (15 modules + hub). The `server`
+  group is **15 modules** — `server_ssrf`, `server_prompt_guard`, `server_sse`,
+  `server_output_filter`, `server_prometheus`, `server_auth`, `server_state`, the
+  `server_routes` hub, and seven route modules (`health`, `tools`, `agents`,
+  `approval`, `dashboard`, `crews`, `a2a`). Support modules: `src/id.cyr`,
   `src/units.cyr`, `src/order.cyr`, `src/chan_lossy.cyr` and `src/guarded_fetch.cyr`.
   `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
@@ -78,7 +79,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | `orchestrator` ported (M5, Phase 4) | ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
-| `server` ported (M6, Phase 5) | 🟡 **14 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and the routes tier is open — `routes/health.rs` + the hub (bite 6), `routes/tools.rs` + `routes/definitions.rs` (bite 7), `routes/agents.rs` (bite 8), `routes/approval.rs` (bite 9), `routes/dashboard.rs` (bite 10), `routes/crews.rs` (bites 11a+11b). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
+| `server` ported (M6, Phase 5) | 🟡 **15 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and the routes tier is open — `routes/health.rs` + the hub (bite 6), `routes/tools.rs` + `routes/definitions.rs` (bite 7), `routes/agents.rs` (bite 8), `routes/approval.rs` (bite 9), `routes/dashboard.rs` (bite 10), `routes/crews.rs` (bites 11a+11b), `routes/a2a.rs` (bite 12). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
 | `server/auth` ported whole | ✅ all 10 oracle tests + 123 beyond; six defects found by adversarial review, fixed, and each pinned by a mutation-verified test. Two decided divergences: constant-time compare fixed ([ADR 009](../adr/009-auth-constant-time-secret-compare.md)) and configured `iss`/`aud` required ([ADR 010](../adr/010-jwt-require-configured-iss-aud.md)) |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
@@ -87,8 +88,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**3164 assertions across 50 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
-smoke — **3166 across 51 files**, which is the figure `cyrius tests tests` reports:
+**3236 assertions across 51 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
+smoke — **3238 across 52 files**, which is the figure `cyrius tests tests` reports:
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -142,6 +143,7 @@ smoke — **3166 across 51 files**, which is the figure `cyrius tests tests` rep
 | `server_routes_approval.tcyr` | 41 | 2 (both the empty/undelivered case) |
 | `server_routes_dashboard.tcyr` | 39 | 2 (**both** the empty case — nothing populated) |
 | `server_routes_crews.tcyr` | 124 | 10 of 10 (all of `crews.rs`; `cancel_crew` has none) |
+| `server_routes_a2a.tcyr` | 72 | 5 (all SSRF delegates; `receive` has none) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -173,7 +175,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (825/825 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (837/837 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -523,13 +525,16 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 > assertions** against the oracle's 10, 100% covered. The largest file in the
 > routes tier is behind us.
 >
-> **Next: `a2a.rs` (398), then `mcp.rs` (319)** — the last two pure handlers.
-> `a2a.rs` carries a `deny_unknown_fields` request type and an SSRF-guarded
-> callback (`src/server_ssrf.cyr` and `src/guarded_fetch.cyr` are both already
-> in place for it); its 8 sync tests are largely covered by `server_ssrf.tcyr`
-> already, so only the length/metadata caps are new. `mcp.rs` needs a
-> flat-namespace collision audit against `lib/bote-core.cyr`'s unprefixed
-> `req_*` / `resp_*` / `registry_*` / `schema_*` / `tool_def_*` before landing.
+> **`a2a.rs` (bite 12) is DONE** — 72 assertions. Its callback **dispatch** is
+> the one thing deliberately left for the transport tier: the SSRF gate that
+> decides whether to POST is ported and tested, but the POST itself needs
+> `guarded_fetch`'s per-request arena and a thread-pool decision. When the
+> router lands it reads `agnosai_route_a2a_callback_allowed` and does the send.
+>
+> **Next: `mcp.rs` (319)** — the last pure handler. It needs a flat-namespace
+> collision audit against `lib/bote-core.cyr`'s unprefixed `req_*` / `resp_*` /
+> `registry_*` / `schema_*` / `tool_def_*` **before** any code lands, since
+> Cyrius is last-definition-wins and bote-core is included ahead of `src/`.
 >
 > After those, the tier is done and only the **transport** remains:
 > `server/mod.rs`'s router + `routes/mod.rs`, `sse.rs::event_stream` +

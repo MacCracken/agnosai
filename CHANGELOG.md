@@ -82,6 +82,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_routes_a2a (M6 bite 12) — Agent-to-Agent task delegation.**
+  72 assertions against the oracle's 5.
+
+  **The callback's SSRF decision is ported; its dispatch is not, deliberately.**
+  The oracle ends `receive` by `tokio::spawn`-ing a fire-and-forget POST to
+  `callback_url` under a 30-second timeout, explicitly ignoring the result. This
+  module ports the **decision** — `agnosai_route_a2a_callback_allowed`, the SSRF
+  gate, which is the security-relevant half and the half all five oracle tests
+  cover — and leaves the POST to the transport tier, for two reasons that point
+  the same way: outbound HTTP goes through `agnosai_guarded_fetch`, which needs
+  the per-request arena the router bite introduces, and spawning a thread per
+  callback is a resource decision belonging to whoever owns the thread pool.
+  The handler is complete without it — the oracle's own response does not depend
+  on the callback either — and a test pins that an **SSRF-rejected URL does not
+  fail the request**, matching the oracle's warn-and-fall-through.
+
+  **The failure arms keep the `A2AResponse` shape**, not the routes tier's
+  `{"error": ..}`: the oracle types this handler `(StatusCode, Json<A2AResponse>)`,
+  so a 400 still carries `task_id`, `status: "failed"`, a null `result` and the
+  message in `error`. Pinned, because returning the tier's generic error shape
+  is the obvious thing to do and it changes the wire.
+
+  **The metadata cap is measured on the re-serialized value**, matching
+  `serde_json::to_vec(&req.metadata)` — so whitespace in the incoming body does
+  not count against the 64 KiB limit. `metadata` is the one field with no type
+  constraint (`serde_json::Value`), and object, array, scalar and null are all
+  tested as valid.
+
+  The oracle has **no test for `receive` at all**, so the length caps, the
+  metadata cap, the crew-name construction (`a2a-{domain|general}-{task_id}`),
+  the response shape and every rejection arm are new. Its five tests are all
+  `is_safe_callback_url`, a one-line delegate to the SSRF module already covered
+  by `server_ssrf.tcyr`'s 81 assertions; ported anyway, so a refactor that
+  stopped delegating is caught at this level too.
+
 - **server_routes_crews, handlers (M6 bite 11b) — `crews.rs` is now ported
   whole.** `create_crew`, `get_crew`, `cancel_crew`, and the oracle's 4
   `#[tokio::test]`s. **124 assertions across both bites**, against the oracle's
