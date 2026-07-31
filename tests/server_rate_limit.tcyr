@@ -1,0 +1,228 @@
+# =========================================================================
+# server_rate_limit — rust-old/src/server/rate_limit.rs.
+#
+# All seven oracle tests are plain `#[test]`s and all seven port. The rate is
+# integer thousandths here, so the oracle's `RateLimitState::new(10.0, 5)` is
+# `agnosai_rate_limit_new(10000, 5)`.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_hot_config.cyr"
+include "src/server_rate_limit.cyr"
+include "tests/test_helpers.cyr"
+
+# --- Oracle: rate_limit_state_allows_within_burst ------------------------
+
+fn _t_allows_within_burst(): i64 {
+    var s = agnosai_rate_limit_new(10000, 5);
+    for (var i = 0; i < 5; i = i + 1) {
+        assert(agnosai_rate_limit_check(s, str_from("client-1")) == 1,
+        "each of the first 5 requests is inside the burst");
+    }
+    assert(agnosai_rate_limit_check(s, str_from("client-1")) == 0,
+    "the 6th exhausts the burst and is rejected");
+    return 0;
+}
+
+# --- Oracle: rate_limit_separate_keys ------------------------------------
+
+fn _t_separate_keys(): i64 {
+    var s = agnosai_rate_limit_new(10000, 2);
+    assert(agnosai_rate_limit_check(s, str_from("client-a")) == 1, "a's first");
+    assert(agnosai_rate_limit_check(s, str_from("client-a")) == 1, "a's second");
+    assert(agnosai_rate_limit_check(s, str_from("client-a")) == 0, "a is exhausted");
+    assert(agnosai_rate_limit_check(s, str_from("client-b")) == 1,
+    "b has its own bucket and still has tokens");
+    return 0;
+}
+
+# --- Oracle: rate_limit_stats --------------------------------------------
+
+fn _t_stats(): i64 {
+    var s = agnosai_rate_limit_new(10000, 1);
+    agnosai_rate_limit_check(s, str_from("key"));
+    agnosai_rate_limit_check(s, str_from("key"));
+    assert(agnosai_rate_limit_total_allowed(s) == 1, "one allowed");
+    assert(agnosai_rate_limit_total_rejected(s) == 1, "one rejected");
+    assert(agnosai_rate_limit_active_keys(s) == 1, "one active key");
+    return 0;
+}
+
+# --- Oracle: evict_stale_returns_count -----------------------------------
+
+fn _t_evict_stale(): i64 {
+    var s = agnosai_rate_limit_new(10000, 1);
+    agnosai_rate_limit_check(s, str_from("k1"));
+    agnosai_rate_limit_check(s, str_from("k2"));
+    assert(agnosai_rate_limit_active_keys(s) == 2, "two keys held");
+    # Nothing is stale yet — the interval is 300s and these were just created.
+    assert(agnosai_rate_limit_evict_stale(s) == 0, "fresh buckets are not evicted");
+    assert(agnosai_rate_limit_active_keys(s) == 2, "...and both survive");
+    return 0;
+}
+
+# --- Oracle: extract_key_from_xff / _xri / _fallback ---------------------
+
+fn _t_key_from_xff(): i64 {
+    assert(str_eq(agnosai_rate_limit_client_key(str_from("203.0.113.7"), 1,
+    str_from(""), 0), str_from("203.0.113.7")) == 1, "X-Forwarded-For is used");
+
+    # `s.split(',').next()` — the FIRST entry, which is the original client.
+    assert(str_eq(agnosai_rate_limit_client_key(
+    str_from("203.0.113.7, 198.51.100.2, 192.0.2.9"), 1, str_from(""), 0),
+    str_from("203.0.113.7")) == 1, "the first XFF entry wins, not the last");
+
+    # `.trim()`.
+    assert(str_eq(agnosai_rate_limit_client_key(str_from("  203.0.113.7  , x"), 1,
+    str_from(""), 0), str_from("203.0.113.7")) == 1, "the entry is trimmed");
+    # Tab is trimmed — it is the one non-space byte `to_str()` permits.
+    assert(str_eq(agnosai_rate_limit_client_key(str_from("\t203.0.113.7\t"), 1,
+    str_from(""), 0), str_from("203.0.113.7")) == 1, "tabs are trimmed");
+
+    # **CR and LF are not**, because they never reach the trim: `is_visible_ascii`
+    # admits only 0x20-0x7E plus tab, so a header carrying CRLF fails `to_str()`
+    # and is treated as ABSENT. The two gates compose, and the order matters —
+    # trimming first would have silently accepted a header-injection shape.
+    assert(str_eq(agnosai_rate_limit_client_key(str_from("203.0.113.7\r\n"), 1,
+    str_from(""), 0), str_from("unknown")) == 1,
+    "a CRLF in XFF fails the to_str gate before trimming, so the header is absent");
+    assert(str_eq(agnosai_rate_limit_client_key(str_from("203.0.113.7\n"), 1,
+    str_from("198.51.100.4"), 1), str_from("198.51.100.4")) == 1,
+    "...and falls through to X-Real-IP rather than yielding a trimmed value");
+    return 0;
+}
+
+fn _t_key_from_xri(): i64 {
+    assert(str_eq(agnosai_rate_limit_client_key(str_from(""), 0,
+    str_from("198.51.100.4"), 1), str_from("198.51.100.4")) == 1,
+    "X-Real-IP is used when XFF is absent");
+    assert(str_eq(agnosai_rate_limit_client_key(str_from(""), 0,
+    str_from("  198.51.100.4 "), 1), str_from("198.51.100.4")) == 1,
+    "...and is trimmed");
+
+    # XFF takes precedence when both are present.
+    assert(str_eq(agnosai_rate_limit_client_key(str_from("203.0.113.7"), 1,
+    str_from("198.51.100.4"), 1), str_from("203.0.113.7")) == 1,
+    "XFF is checked before X-Real-IP");
+    return 0;
+}
+
+# **`"unknown"` is a single shared bucket for every client presenting neither
+# header.** Behind a proxy that sets XFF it never fires; exposed directly it
+# collapses all traffic into one bucket, so one noisy client rate-limits
+# everyone. The oracle's own comment says "single-bucket for all clients".
+fn _t_key_fallback(): i64 {
+    assert(str_eq(agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0),
+    str_from("unknown")) == 1, "no headers falls back to `unknown`");
+
+    var s = agnosai_rate_limit_new(10000, 1);
+    var k = agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0);
+    assert(agnosai_rate_limit_check(s, k) == 1, "the first unheadered client is allowed");
+    assert(agnosai_rate_limit_check(s,
+    agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0)) == 0,
+    "a SECOND, unrelated unheadered client shares the same bucket and is refused");
+    assert(agnosai_rate_limit_active_keys(s) == 1, "...because there is only one bucket");
+    return 0;
+}
+
+# The `to_str()` gate: a header with a byte outside visible ASCII is treated as
+# absent, the same rule `server_auth` applies to `Authorization`.
+fn _t_key_to_str_gate(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "203.0.113.7");
+    str_builder_putc(sb, 200);
+    var high = str_builder_build(sb);
+    assert(str_eq(agnosai_rate_limit_client_key(high, 1, str_from(""), 0),
+    str_from("unknown")) == 1, "a high byte in XFF makes it absent");
+    assert(str_eq(agnosai_rate_limit_client_key(high, 1, str_from("198.51.100.4"), 1),
+    str_from("198.51.100.4")) == 1, "...and falls through to X-Real-IP");
+    assert(str_eq(agnosai_rate_limit_client_key(str_from(""), 0, high, 1),
+    str_from("unknown")) == 1, "a high byte in X-Real-IP makes it absent too");
+    return 0;
+}
+
+# An empty XFF keys the EMPTY-STRING bucket rather than falling through:
+# `s.split(',').next()` always yields at least `""`, and the oracle returns it
+# trimmed without checking for emptiness.
+fn _t_empty_xff_does_not_fall_through(): i64 {
+    var k = agnosai_rate_limit_client_key(str_from(""), 1, str_from("198.51.100.4"), 1);
+    assert(str_eq(k, str_from("")) == 1,
+    "an empty XFF yields the empty-string key, not X-Real-IP");
+    assert(str_eq(k, str_from("198.51.100.4")) == 0, "...it does NOT fall through");
+    assert(str_eq(k, str_from("unknown")) == 0, "...nor to the unknown bucket");
+    return 0;
+}
+
+# --- The middleware decision ---------------------------------------------
+
+fn _t_middleware(): i64 {
+    var s = agnosai_rate_limit_new(10000, 2);
+    assert(agnosai_rate_limit_check_request(s, str_from("c")) == HTTP_OK,
+    "the first request passes");
+    assert(agnosai_rate_limit_check_request(s, str_from("c")) == HTTP_OK,
+    "the second passes");
+    assert(agnosai_rate_limit_check_request(s, str_from("c"))
+    == AGNOSAI_HTTP_TOO_MANY_REQUESTS, "the third is 429");
+    assert(AGNOSAI_HTTP_TOO_MANY_REQUESTS == 429, "...which is 429");
+
+    # A different key is unaffected.
+    assert(agnosai_rate_limit_check_request(s, str_from("other")) == HTTP_OK,
+    "a different client still passes");
+
+    # **No limiter installed passes the request through**, rather than failing
+    # closed — a router that did not install the layer must not start rejecting
+    # traffic. The oracle's `if let Some(limiter)` arm.
+    assert(agnosai_rate_limit_check_request(0, str_from("c")) == HTTP_OK,
+    "a request with no limiter installed passes through");
+    for (var i = 0; i < 100; i = i + 1) {
+        assert_silent_ok(agnosai_rate_limit_check_request(0, str_from("c")) == HTTP_OK);
+    }
+    return 0;
+}
+
+# A no-op wrapper so the loop above does not add 100 assertions to the count
+# while still failing loudly if the property breaks.
+fn assert_silent_ok(cond): i64 {
+    if (cond == 0) { assert(0, "no-limiter passthrough failed under repetition"); }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_allows_within_burst();
+    _t_separate_keys();
+    _t_stats();
+    _t_evict_stale();
+    _t_key_from_xff();
+    _t_key_from_xri();
+    _t_key_fallback();
+    _t_key_to_str_gate();
+    _t_empty_xff_does_not_fall_through();
+    _t_middleware();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -1,0 +1,218 @@
+# =========================================================================
+# server_hot_config — rust-old/src/server/hot_config.rs.
+#
+# All five oracle tests are plain `#[test]`s and all five port. Three of them
+# instantiate the generic holder at `u32` / `String` / `u64` purely to prove the
+# container round-trips; Cyrius has no generics and the tree has exactly one
+# instantiation, so those port as `RuntimeConfig` round trips — proving the same
+# property about the only type that ships.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_hot_config.cyr"
+include "tests/test_helpers.cyr"
+
+# --- Oracle: runtime_config_defaults -------------------------------------
+
+fn _t_defaults(): i64 {
+    var c = agnosai_runtime_config_new();
+    assert(agnosai_runtime_config_max_concurrent_crews(c) == 10, "max_concurrent_crews is 10");
+    assert(agnosai_runtime_config_inference_timeout_secs(c) == 300,
+    "inference_timeout_secs is 300");
+    assert(agnosai_runtime_config_auth_enabled(c) == 0, "auth_enabled defaults FALSE");
+    assert(str_eq(agnosai_runtime_config_log_level(c), str_from("agnosai=info")) == 1,
+    "log_level is agnosai=info");
+    return 0;
+}
+
+fn _t_builders(): i64 {
+    var c = agnosai_runtime_config_new();
+    agnosai_runtime_config_with_max_crews(c, 64);
+    agnosai_runtime_config_with_timeout_secs(c, 30);
+    agnosai_runtime_config_with_auth_enabled(c, 1);
+    agnosai_runtime_config_with_log_level(c, str_from("agnosai=debug"));
+    assert(agnosai_runtime_config_max_concurrent_crews(c) == 64, "max crews set");
+    assert(agnosai_runtime_config_inference_timeout_secs(c) == 30, "timeout set");
+    assert(agnosai_runtime_config_auth_enabled(c) == 1, "auth enabled set");
+    assert(str_eq(agnosai_runtime_config_log_level(c), str_from("agnosai=debug")) == 1,
+    "log level set");
+    return 0;
+}
+
+# --- Oracle: runtime_config_serde_roundtrip ------------------------------
+
+fn _t_serde_roundtrip(): i64 {
+    var c = agnosai_runtime_config_new();
+    agnosai_runtime_config_with_max_crews(c, 7);
+    agnosai_runtime_config_with_auth_enabled(c, 1);
+    var v = agnosai_runtime_config_to_value(c);
+
+    var back = agnosai_runtime_config_from_value(v);
+    assert(back != 0, "a serialized config deserializes");
+    assert(agnosai_runtime_config_max_concurrent_crews(back) == 7, "max_concurrent_crews");
+    assert(agnosai_runtime_config_inference_timeout_secs(back) == 300, "timeout");
+    assert(agnosai_runtime_config_auth_enabled(back) == 1, "auth_enabled");
+    assert(str_eq(agnosai_runtime_config_log_level(back),
+    str_from("agnosai=info")) == 1, "log_level");
+    assert(bayan_json_v_obj_len(v) == 4, "exactly the oracle's four fields");
+    return 0;
+}
+
+# **Every field is required.** `RuntimeConfig` carries no `#[serde(default)]`,
+# so `Default` applies only when nothing is deserialized at all — a partial
+# object is a failure, not a merge with the defaults. That is the tempting
+# misreading, and it would silently accept configs the oracle rejects.
+fn _t_deserialize_is_strict(): i64 {
+    var full_sb = str_builder_new();
+    str_builder_add_cstr(full_sb, "{\"max_concurrent_crews\":1,\"inference_timeout_secs\":2,");
+    str_builder_add_cstr(full_sb, "\"auth_enabled\":true,\"log_level\":\"x\"}");
+    var full = str_builder_build(full_sb);
+    assert(agnosai_runtime_config_from_value(
+    bayan_json_v_parse_buf(str_data(full), str_len(full))) != 0, "a full object reads");
+
+    var partial = str_from("{\"max_concurrent_crews\":1}");
+    assert(agnosai_runtime_config_from_value(
+    bayan_json_v_parse_buf(str_data(partial), str_len(partial))) == 0,
+    "a partial object is REJECTED, not merged with defaults");
+
+    var empty = str_from("{}");
+    assert(agnosai_runtime_config_from_value(
+    bayan_json_v_parse_buf(str_data(empty), str_len(empty))) == 0,
+    "an empty object is rejected");
+
+    var wrong_sb = str_builder_new();
+    str_builder_add_cstr(wrong_sb, "{\"max_concurrent_crews\":\"ten\",\"inference_timeout_secs\":2,");
+    str_builder_add_cstr(wrong_sb, "\"auth_enabled\":true,\"log_level\":\"x\"}");
+    var wrong = str_builder_build(wrong_sb);
+    assert(agnosai_runtime_config_from_value(
+    bayan_json_v_parse_buf(str_data(wrong), str_len(wrong))) == 0,
+    "a non-integer max_concurrent_crews is rejected");
+
+    # `usize` / `u64` — a negative literal does not deserialize.
+    var neg_sb = str_builder_new();
+    str_builder_add_cstr(neg_sb, "{\"max_concurrent_crews\":-1,\"inference_timeout_secs\":2,");
+    str_builder_add_cstr(neg_sb, "\"auth_enabled\":true,\"log_level\":\"x\"}");
+    var neg = str_builder_build(neg_sb);
+    assert(agnosai_runtime_config_from_value(
+    bayan_json_v_parse_buf(str_data(neg), str_len(neg))) == 0,
+    "a negative max_concurrent_crews is rejected");
+
+    assert(agnosai_runtime_config_from_value(bayan_json_v_arr_new()) == 0,
+    "an array is not a RuntimeConfig");
+    return 0;
+}
+
+# --- Oracle: config_holder_initial_value / _update / _receiver_sees_updates
+
+fn _t_holder(): i64 {
+    var first = agnosai_runtime_config_new();
+    var h = agnosai_config_holder_new(first);
+    assert(agnosai_config_holder_get(h) == first, "the holder returns its initial value");
+
+    var second = agnosai_runtime_config_with_max_crews(agnosai_runtime_config_new(), 99);
+    agnosai_config_holder_update(h, second);
+    assert(agnosai_config_holder_get(h) == second, "update publishes the new value");
+    assert(agnosai_config_holder_get(h) != first, "...and the old one is no longer returned");
+    assert(agnosai_runtime_config_max_concurrent_crews(agnosai_config_holder_get(h)) == 99,
+    "a reader sees the updated field");
+
+    # The oracle's `receiver()` test: a read taken before the update still sees
+    # the new value afterwards, because the read is of the holder, not a copy.
+    var third = agnosai_runtime_config_with_max_crews(agnosai_runtime_config_new(), 3);
+    agnosai_config_holder_update(h, third);
+    assert(agnosai_runtime_config_max_concurrent_crews(agnosai_config_holder_get(h)) == 3,
+    "a later read sees the later update");
+
+    # An earlier snapshot the caller still holds is unaffected — the oracle's
+    # `Arc<T>` semantics, and why update is a pointer swap rather than a mutation.
+    assert(agnosai_runtime_config_max_concurrent_crews(second) == 99,
+    "a config a reader already holds is not mutated by a later publish");
+    return 0;
+}
+
+# --- The property tokio's watch gave the oracle free ---------------------
+
+var _T_HC_THREADS = 8;
+var _T_HC_READS = 500;
+var _t_hc_holder = 0;
+var _t_hc_bad = 0;
+
+# Each reader loops on `get()` and asserts it always sees a WHOLE config —
+# never a torn mix — which is what the atomic pointer swap buys. A mutex-free
+# read that observed a half-published struct would show up as a field that does
+# not match its sibling.
+fn _t_hc_reader(id): i64 {
+    for (var i = 0; i < _T_HC_READS; i = i + 1) {
+        var c = agnosai_config_holder_get(_t_hc_holder);
+        var crews = agnosai_runtime_config_max_concurrent_crews(c);
+        var secs = agnosai_runtime_config_inference_timeout_secs(c);
+        # Every published config is built with secs == crews * 2, so any mix of
+        # fields from two different configs breaks the invariant.
+        if (secs != crews * 2) { atomic_fetch_add(&_t_hc_bad, 1); }
+    }
+    return 0;
+}
+
+fn _t_holder_is_torn_free(): i64 {
+    _t_hc_holder = agnosai_config_holder_new(
+    agnosai_runtime_config_with_timeout_secs(
+    agnosai_runtime_config_with_max_crews(agnosai_runtime_config_new(), 1), 2));
+    _t_hc_bad = 0;
+
+    var threads = vec_new();
+    for (var t = 0; t < _T_HC_THREADS; t = t + 1) {
+        vec_push(threads, thread_create(&_t_hc_reader, t));
+    }
+    # Publish a stream of fresh configs while the readers run.
+    for (var k = 1; k < 400; k = k + 1) {
+        agnosai_config_holder_update(_t_hc_holder,
+        agnosai_runtime_config_with_timeout_secs(
+        agnosai_runtime_config_with_max_crews(agnosai_runtime_config_new(), k), k * 2));
+    }
+    for (var j = 0; j < _T_HC_THREADS; j = j + 1) { thread_join(vec_get(threads, j)); }
+
+    assert(_t_hc_bad == 0,
+    "8 concurrent readers never observed a torn config across 400 publishes");
+    assert(agnosai_runtime_config_inference_timeout_secs(
+    agnosai_config_holder_get(_t_hc_holder))
+    == agnosai_runtime_config_max_concurrent_crews(
+    agnosai_config_holder_get(_t_hc_holder)) * 2,
+    "...and the final value is internally consistent");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_defaults();
+    _t_builders();
+    _t_serde_roundtrip();
+    _t_deserialize_is_strict();
+    _t_holder();
+    _t_holder_is_torn_free();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

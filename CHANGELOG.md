@@ -82,6 +82,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_hot_config + server_rate_limit (M6 bite 14) — the last two pure
+  files of the transport tier.** 28 and 41 assertions against the oracle's 5
+  and 7. Both are still `fn(inputs) -> decision`; neither needs sandhi.
+
+  **`ConfigHolder<T>` is monomorphised, and `watch` becomes an atomic pointer
+  swap.** The oracle's holder is generic and its tests instantiate it at `u32` /
+  `String` / `u64` purely to prove the container round-trips; Cyrius has no
+  generics and the tree has exactly one instantiation, so those port as
+  `RuntimeConfig` round trips. tokio's `watch` is single-writer/many-reader with
+  no reader contention — under `run_pooled` every worker reads this per request,
+  so the equivalent is an **atomic store**, not a mutex. A whole config is
+  published by one 8-byte pointer store, so a reader sees the old one or the new
+  one, never a torn mix; **8 threads × 500 reads against 400 concurrent
+  publishes** pin it. The previous config is deliberately not freed — a reader
+  may still hold it, which is what the `Arc` was for, and reloads are
+  operator-driven so the bound is reload count, not traffic.
+
+  **`RuntimeConfig` has no `#[serde(default)]` on any field**, so `Default`
+  applies only when nothing is deserialized at all — a **partial object is a
+  failure, not a merge with the defaults**. That is the tempting misreading and
+  it would silently accept configs the oracle rejects.
+
+  **`rate` is integer thousandths**, not an f64: majra's `ratelimit_new` takes
+  `rate_x1000`, so the oracle's `10.0` is `10000`, and the bucket arithmetic
+  stays exact — the same treatment money and throughput already get.
+
+  Two oracle behaviours reproduced with the reasoning written down rather than
+  quietly improved: **`"unknown"` is a single shared bucket** for every client
+  presenting neither `X-Forwarded-For` nor `X-Real-IP`, so exposed directly one
+  noisy client rate-limits everyone (the oracle's own comment says
+  "single-bucket for all clients"); and an **empty XFF keys the empty-string
+  bucket rather than falling through** to `X-Real-IP`, because
+  `s.split(',').next()` always yields at least `""` and the oracle returns it
+  trimmed without an emptiness check.
+
+  **A test caught the gate ordering, not the code.** `to_str()`'s
+  `is_visible_ascii` admits 0x20-0x7E plus tab, so a header carrying CRLF fails
+  it and is treated as **absent** — the trim never runs. My first test expected
+  CRLF to be trimmed; the implementation was right and the expectation wrong.
+  Now pinned as the interaction: tab is trimmed, CR/LF make the header absent
+  and fall through. Trimming first would have silently accepted a
+  header-injection shape.
+
+  `rate_limit` is still **not mounted** — `server/mod.rs:47-99` never installs
+  it, and the port reproduces that. But `auth_jwt_verify_ok`'s 3.3 ms means a
+  core sustains ~300 JWT verifies/second, and the `alg` check sits after the
+  signature so a malformed token costs the same — making an unauthenticated
+  flood a real amplification vector. Mounting it is a decision for the router
+  bite, recorded in state.md.
+
 - **server_routes_mcp (M6 bite 13) — Model Context Protocol over JSON-RPC 2.0.
   The routes tier is complete.** 80 assertions against the oracle's 5.
 
