@@ -1,0 +1,68 @@
+# =========================================================================
+# server_routes_tools — tool listing and runtime unregistration, plus the
+# preset listing that shares its shape.
+#
+# Parity oracles: rust-old/src/server/routes/tools.rs
+#                 rust-old/src/server/routes/definitions.rs
+#
+# Two files in one module because `definitions.rs` is four lines of behaviour in
+# the default build and does not earn its own translation unit.
+# =========================================================================
+
+# `GET /api/v1/tools` — every registered tool's schema.
+#
+# The oracle returns `Json(state.tools.list())`, serializing `Vec<ToolSchema>`
+# through serde. Here `agnosai_tool_registry_list` already yields the schemas
+# and `agnosai_tool_schema_to_value` is the serde equivalent, so this is the
+# `.map(to_value)` the oracle's `Json` does implicitly.
+#
+# An empty registry answers `[]`, not `null` — the oracle's `Vec` serializes to
+# an empty array and a client parsing the response would break on `null`.
+fn agnosai_route_list_tools(state): i64 {
+    var schemas = agnosai_tool_registry_list(agnosai_app_state_tools(state));
+    var arr = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(schemas); i = i + 1) {
+        bayan_json_v_arr_push(arr, agnosai_tool_schema_to_value(vec_get(schemas, i)));
+    }
+    return agnosai_route_json(HTTP_OK, arr);
+}
+
+# `DELETE /api/v1/tools/{name}` — unregister a tool at runtime.
+#
+# **204 on success, 404 when it was not registered** — the oracle branches on
+# `ToolRegistry::remove`'s bool, and the distinction is the whole handler.
+# `agnosai_tool_registry_remove` returns the same 1/0.
+#
+# The body is empty in both arms, matching the oracle's bare `StatusCode`
+# returns — `agnosai_route_json` with a null body renders nothing.
+fn agnosai_route_remove_tool(state, name: Str): i64 {
+    if (agnosai_tool_registry_remove(agnosai_app_state_tools(state), name) == 1) {
+        _agnosai_route_tool_removed(name);
+        return agnosai_route_json(HTTP_NO_CONTENT, bayan_json_v_null());
+    }
+    return agnosai_route_json(HTTP_NOT_FOUND, bayan_json_v_null());
+}
+
+# The oracle's `tracing::info!(tool = %name, "tool unregistered")`.
+# Level-checked first so the formatting is only paid when it would be emitted.
+fn _agnosai_route_tool_removed(name: Str): i64 {
+    if (sakshi_get_level() < SK_INFO) { return 0; }
+    sakshi_log_kv(SK_INFO, "tool unregistered", 17, "tool", 4,
+    str_data(name), str_len(name));
+    return 0;
+}
+
+# `GET /api/v1/presets` — the built-in preset specifications.
+#
+# **`[]` is the correct answer here, not a stub.** The oracle's body is
+# `#[cfg(feature = "definitions")]` / `#[cfg(not(..))]`, and agnosai's
+# `default = []` leaves that feature **off** — so the default cargo build, which
+# is what the port targets for parity, returns an empty array. The oracle's own
+# test asserts exactly that under the default feature set.
+#
+# The populated arm arrives with M10 (`definitions`, partial — Phase 9), which
+# ports the preset loader. When it does, this becomes the branch rather than the
+# whole function.
+fn agnosai_route_list_presets(): i64 {
+    return agnosai_route_json(HTTP_OK, bayan_json_v_arr_new());
+}

@@ -78,7 +78,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | `orchestrator` ported (M5, Phase 4) | ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
-| `server` ported (M6, Phase 5) | 🟡 **8 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and `routes/health.rs` + the routes hub are bite 6. One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
+| `server` ported (M6, Phase 5) | 🟡 **11 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and the routes tier is open — `routes/health.rs` + the hub (bite 6), `routes/tools.rs` + `routes/definitions.rs` (bite 7), `routes/agents.rs` (bite 8). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
 | `server/auth` ported whole | ✅ all 10 oracle tests + 123 beyond; six defects found by adversarial review, fixed, and each pinned by a mutation-verified test. Two decided divergences: constant-time compare fixed ([ADR 009](../adr/009-auth-constant-time-secret-compare.md)) and configured `iss`/`aud` required ([ADR 010](../adr/010-jwt-require-configured-iss-aud.md)) |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
@@ -87,8 +87,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2888 assertions across 45 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
-smoke — **2890 across 46 files**, which is the figure `cyrius tests tests` reports:
+**2960 assertions across 47 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
+smoke — **2962 across 48 files**, which is the figure `cyrius tests tests` reports:
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -137,6 +137,8 @@ smoke — **2890 across 46 files**, which is the figure `cyrius tests tests` rep
 | `server_auth.tcyr` | 133 | 10 of 10 (all of `auth.rs`) |
 | `server_state.tcyr` | 31 | — (`state.rs` has no `#[cfg(test)]` module) |
 | `server_routes_health.tcyr` | 42 | 3 (all `#[tokio::test]`) |
+| `server_routes_tools.tcyr` | 34 | 4 (3 tools + 1 presets; `remove_tool` has none) |
+| `server_routes_agents.tcyr` | 38 | 5 (3 of them test the extractor, not the handler) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -168,7 +170,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (795/795 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (800/800 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -503,12 +505,27 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 > default and it closes a fail-open gap), and `/metrics` got the decision it
 > needed as [ADR 011](../adr/011-metrics-endpoint-serves-agnosai-metrics.md).
 >
+> **`tools.rs` + `definitions.rs` (bite 7) and `agents.rs` (bite 8) are DONE** —
+> `src/server_routes_tools.cyr` (34 assertions) and
+> `src/server_routes_agents.cyr` (38). Both went past their oracles, which have
+> no test for `remove_tool`'s 204/404 branch and none for `create_definition`'s
+> success path at all.
+>
 > **Next, in order** — every one is `fn(state, inputs) -> response`, none needs
-> sandhi: `tools.rs` (154), `definitions.rs` (41, a `[]` stub until M10),
-> `agents.rs` (190, the first real consumer of
-> `agnosai_app_state_definition_*`), `approval.rs` (130), `dashboard.rs` (150),
-> then the two big ones `crews.rs` (528) and `a2a.rs` (398), and `mcp.rs` (319)
-> last of the pure handlers.
+> sandhi: `approval.rs` (130), `dashboard.rs` (150), then the two big ones
+> `crews.rs` (528) and `a2a.rs` (398), and `mcp.rs` (319) last of the pure
+> handlers.
+>
+> **Two conventions the tier now has, worth following rather than re-deciding:**
+> * A handler takes already-parsed inputs **unless the parse failure is itself
+>   part of the status contract**. `agents.rs` is the first such case — axum's
+>   extractor answers 400/422 before its handler runs, so the port's handler
+>   takes the raw body. `crews.rs`, `a2a.rs` and `approval.rs` all have
+>   `deny_unknown_fields` request types and will need the same treatment, using
+>   `agnosai_route_no_unknown_fields`.
+> * Empty collections answer `[]`, never `null`. The oracle's `Vec` serializes
+>   to an empty array; a handler returning an unconverted empty vec produces
+>   `null` and breaks clients. Pinned in both route suites so far.
 >
 > **Still owed, both small and both flagged rather than done:**
 > 1. **`agnosai_orchestrator_crew_ids(o)`** (~6 lines) in

@@ -1,0 +1,242 @@
+# =========================================================================
+# server_routes_tools — rust-old/src/server/routes/tools.rs and
+# rust-old/src/server/routes/definitions.rs.
+#
+# The oracle's three tools tests and its one presets test all port as ordinary
+# assertions. Its `remove_tool` handler has **no test at all**, so the 204/404
+# branch — the whole substance of that handler — is covered here for the first
+# time.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_routes_tools.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's `test_app()`: a state whose registry carries the two basic
+# builtins.
+fn _t_state_with_tools(): i64 {
+    return agnosai_app_state_new(
+    agnosai_orchestrator_new(0),
+    agnosai_register_basic_builtins(agnosai_tool_registry_new()),
+    agnosai_auth_config_new(),
+    agnosai_event_bus_new(),
+    agnosai_audit_chain_new(),
+    agnosai_approval_gate_new());
+}
+
+# The oracle's `get_tools_with_no_tools_returns_empty_array` fixture.
+fn _t_state_no_tools(): i64 {
+    return agnosai_app_state_new(
+    agnosai_orchestrator_new(0),
+    agnosai_tool_registry_new(),
+    agnosai_auth_config_new(),
+    agnosai_event_bus_new(),
+    agnosai_audit_chain_new(),
+    agnosai_approval_gate_new());
+}
+
+# Whether `arr` holds an object whose `name` member equals `want`.
+fn _t_arr_has_name(arr, want: Str): i64 {
+    for (var i = 0; i < bayan_json_v_arr_len(arr); i = i + 1) {
+        var o = bayan_json_v_arr_get(arr, i);
+        var n = bayan_json_v_obj_get(o, "name");
+        if (n != 0 && bayan_json_v_is_str(n) == 1) {
+            if (str_eq(bayan_json_v_str(n), want) == 1) { return 1; }
+        }
+    }
+    return 0;
+}
+
+# --- Oracle: get_tools_returns_tool_list ---------------------------------
+
+fn _t_list_tools(): i64 {
+    var r = agnosai_route_list_tools(_t_state_with_tools());
+    assert(agnosai_route_status(r) == HTTP_OK, "GET /api/v1/tools is 200");
+    var arr = agnosai_route_body(r);
+    assert(bayan_json_v_is_arr(arr) == 1, "the body is an array");
+    assert(bayan_json_v_arr_len(arr) == 2, "both registered builtins are listed");
+    assert(_t_arr_has_name(arr, str_from("echo")) == 1, "echo is listed");
+    assert(_t_arr_has_name(arr, str_from("json_transform")) == 1,
+    "json_transform is listed");
+    assert(_t_arr_has_name(arr, str_from("nonexistent")) == 0,
+    "a tool that was never registered is not listed");
+    return 0;
+}
+
+# --- Oracle: get_tools_returns_correct_schema_fields ---------------------
+
+# Every entry carries name, description and parameters, and the two strings are
+# non-empty. Transcribed from the oracle's loop as written.
+fn _t_schema_fields(): i64 {
+    var arr = agnosai_route_body(agnosai_route_list_tools(_t_state_with_tools()));
+    var n = bayan_json_v_arr_len(arr);
+    assert(n > 0, "there is something to check");
+
+    var missing = 0;
+    var empty = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var t = bayan_json_v_arr_get(arr, i);
+        var nm = bayan_json_v_obj_get(t, "name");
+        var ds = bayan_json_v_obj_get(t, "description");
+        var ps = bayan_json_v_obj_get(t, "parameters");
+        if (nm == 0 || ds == 0 || ps == 0) { missing = missing + 1; }
+        if (nm != 0 && bayan_json_v_is_str(nm) == 1) {
+            if (str_len(bayan_json_v_str(nm)) == 0) { empty = empty + 1; }
+        }
+        if (ds != 0 && bayan_json_v_is_str(ds) == 1) {
+            if (str_len(bayan_json_v_str(ds)) == 0) { empty = empty + 1; }
+        }
+    }
+    assert(missing == 0, "every tool has name, description and parameters");
+    assert(empty == 0, "name and description are non-empty on every tool");
+    return 0;
+}
+
+# --- Oracle: get_tools_with_no_tools_returns_empty_array -----------------
+
+# `[]`, not `null`. The oracle's `Vec` serializes to an empty array and a client
+# parsing the response would break on null — which is exactly what a handler
+# returning the registry's empty vec unconverted would produce.
+fn _t_list_tools_empty(): i64 {
+    var r = agnosai_route_list_tools(_t_state_no_tools());
+    assert(agnosai_route_status(r) == HTTP_OK, "an empty registry still answers 200");
+    var arr = agnosai_route_body(r);
+    assert(bayan_json_v_is_arr(arr) == 1, "the body is an array, not null");
+    assert(bayan_json_v_is_null(arr) == 0, "...definitely not null");
+    assert(bayan_json_v_arr_len(arr) == 0, "...and it is empty");
+    return 0;
+}
+
+# --- DELETE /api/v1/tools/{name} — untested in the oracle ----------------
+
+fn _t_remove_tool(): i64 {
+    var s = _t_state_with_tools();
+    var reg = agnosai_app_state_tools(s);
+    assert(agnosai_tool_registry_count(reg) == 2, "two tools to start");
+
+    var r = agnosai_route_remove_tool(s, str_from("echo"));
+    assert(agnosai_route_status(r) == HTTP_NO_CONTENT, "removing a live tool is 204");
+    assert(agnosai_tool_registry_has(reg, str_from("echo")) == 0,
+    "...and it is actually gone from the registry");
+    assert(agnosai_tool_registry_count(reg) == 1, "...leaving one");
+    assert(agnosai_tool_registry_has(reg, str_from("json_transform")) == 1,
+    "...and the other is untouched");
+
+    # The branch that is the whole point of the handler.
+    var r2 = agnosai_route_remove_tool(s, str_from("echo"));
+    assert(agnosai_route_status(r2) == HTTP_NOT_FOUND,
+    "removing it twice is 404 the second time");
+    var r3 = agnosai_route_remove_tool(s, str_from("never-registered"));
+    assert(agnosai_route_status(r3) == HTTP_NOT_FOUND, "removing an unknown tool is 404");
+    assert(agnosai_tool_registry_count(reg) == 1, "a 404 does not change the registry");
+    return 0;
+}
+
+# The removal is reflected by the listing endpoint — the two handlers share the
+# registry rather than each holding their own view.
+fn _t_remove_then_list(): i64 {
+    var s = _t_state_with_tools();
+    agnosai_route_remove_tool(s, str_from("json_transform"));
+    var arr = agnosai_route_body(agnosai_route_list_tools(s));
+    assert(bayan_json_v_arr_len(arr) == 1, "the listing drops the removed tool");
+    assert(_t_arr_has_name(arr, str_from("echo")) == 1, "...and keeps the other");
+    assert(_t_arr_has_name(arr, str_from("json_transform")) == 0,
+    "...and the removed one is gone");
+    return 0;
+}
+
+# Name matching is exact — the oracle looks the name up in a map, so neither
+# case nor whitespace is forgiven.
+fn _t_remove_is_exact(): i64 {
+    var s = _t_state_with_tools();
+    assert(agnosai_route_status(agnosai_route_remove_tool(s, str_from("Echo")))
+    == HTTP_NOT_FOUND, "removal is case-sensitive");
+    assert(agnosai_route_status(agnosai_route_remove_tool(s, str_from("echo ")))
+    == HTTP_NOT_FOUND, "a trailing space does not match");
+    assert(agnosai_route_status(agnosai_route_remove_tool(s, str_from("")))
+    == HTTP_NOT_FOUND, "an empty name is 404");
+    assert(agnosai_tool_registry_count(agnosai_app_state_tools(s)) == 2,
+    "none of those removed anything");
+    return 0;
+}
+
+# --- Oracle: list_presets_returns_array ----------------------------------
+
+# `[]` is the DEFAULT-BUILD answer, not a stub: the oracle's body is
+# cfg-gated on the `definitions` feature and agnosai's `default = []` leaves it
+# off, so the build the port targets for parity returns an empty array. The
+# oracle's own test asserts exactly this under the default feature set.
+fn _t_list_presets(): i64 {
+    var r = agnosai_route_list_presets();
+    assert(agnosai_route_status(r) == HTTP_OK, "GET /api/v1/presets is 200");
+    var arr = agnosai_route_body(r);
+    assert(bayan_json_v_is_arr(arr) == 1, "the body is an array");
+    assert(bayan_json_v_arr_len(arr) == 0,
+    "...and empty, matching the default build with the definitions feature off");
+    return 0;
+}
+
+# --- Allocation bound ----------------------------------------------------
+
+# The routes-tier exposure `server_routes.cyr`'s header records: every handler
+# that builds JSON grows the no-free global bump until blocker #3's per-request
+# arena lands with the router bite. This does not assert zero — it asserts the
+# cost is bounded and proportional to the response, so a handler that leaked per
+# *registered tool* on a repeated call would show up.
+fn _t_list_is_bounded(): i64 {
+    var s = _t_state_with_tools();
+    agnosai_route_list_tools(s);
+
+    var before = alloc_used();
+    for (var i = 0; i < 64; i = i + 1) { agnosai_route_list_tools(s); }
+    var per = (alloc_used() - before) / 64;
+    assert(per > 0, "building a response does allocate — this is not a zero claim");
+    assert(per < 4096, "...but bounded per call, not growing with repetition");
+
+    # 404 removals build no body at all, so they must be far cheaper.
+    var before2 = alloc_used();
+    for (var j = 0; j < 64; j = j + 1) {
+        agnosai_route_remove_tool(s, str_from("never-registered"));
+    }
+    var per2 = (alloc_used() - before2) / 64;
+    assert(per2 < per, "a 404 with an empty body costs less than building a list");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_list_tools();
+    _t_schema_fields();
+    _t_list_tools_empty();
+    _t_remove_tool();
+    _t_remove_then_list();
+    _t_remove_is_exact();
+    _t_list_presets();
+    _t_list_is_bounded();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

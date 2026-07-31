@@ -82,6 +82,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_routes_agents (M6 bite 8) — agent-definition listing and creation.**
+  The first real consumer of `server_state`'s `definitions` map. 38 assertions
+  against the oracle's 5.
+
+  **This handler owns its own deserialization, unlike the rest of the tier.**
+  Three of the oracle's five tests assert the status of a body that never
+  reaches its handler — axum's `Json<AgentDefinition>` extractor rejects it
+  first — so `agnosai_route_create_definition` takes the **raw body** and owns
+  the whole contract: **400** for malformed JSON (the oracle's test accepts 400
+  or 422; 400 is the more precise for a syntax error), **422** for valid JSON
+  that is not an `AgentDefinition`, **500** for the oracle's unreachable
+  serialization arm, **201** with the definition echoed back. Splitting it the
+  other way would have left the port's most commonly hit failure paths
+  untestable until the transport bite. `agnosai_agent_from_value` already gates
+  on exactly serde's required set, so the 422 boundary agrees with the oracle by
+  construction rather than by a second list kept in sync.
+
+  **The oracle never tests the success path** — it has no test that posts a
+  valid definition. That half is covered here for the first time: the 201 body,
+  storage keyed by `agent_key` (not by `name`), replace-on-duplicate, optional
+  fields surviving the round trip, and create-then-list agreement.
+
+  One honest note in the module header: the `filter_map`-equivalent skip in
+  `list_definitions` is **unreachable**, because `agnosai_agent_to_value` has no
+  failure path where serde's `to_value` does. It is kept for the oracle's shape
+  and because it would matter if that ever changes, but it is documented as
+  unreachable rather than implied to fire — a mutation deleting it passes the
+  whole suite, which is exactly why the comment says so.
+
+- **server_routes_tools (M6 bite 7) — tool listing, runtime unregistration, and
+  preset listing.** 34 assertions against the oracle's 4. `tools.rs` and
+  `definitions.rs` land together because the latter is four lines of behaviour.
+
+  **The oracle has no test for `remove_tool`**, so its 204/404 branch — the
+  whole substance of that handler — is covered here for the first time,
+  including remove-twice, unknown-name, and that a 404 leaves the registry
+  untouched.
+
+  **`GET /api/v1/presets` returning `[]` is exact parity, not a stub.** The
+  oracle's body is `#[cfg(feature = "definitions")]`-gated and agnosai's
+  `default = []` leaves that feature off, so the default cargo build — which is
+  what the port targets — returns an empty array, and the oracle's own test
+  asserts precisely that. The populated arm arrives with M10.
+
+  Empty collections answer `[]` and never `null`, pinned explicitly: the
+  oracle's `Vec` serializes to an empty array, and a handler returning the
+  registry's empty vec unconverted would produce `null` and break clients.
+
 - **server_routes + server_routes_health (M6 bite 6) — the routes tier opens.**
   The response vocabulary every handler will speak, the shared
   `deny_unknown_fields` guard, and `health.rs`'s three probes. 42 assertions

@@ -1,0 +1,270 @@
+# =========================================================================
+# server_routes_agents — rust-old/src/server/routes/agents.rs.
+#
+# All five oracle tests port. Three of them assert the status of a body that
+# never reaches the oracle's handler — axum's `Json<AgentDefinition>` extractor
+# rejects it first — which is why `agnosai_route_create_definition` takes the
+# raw body and owns the whole 400 / 422 / 201 contract.
+#
+# The oracle never tests the SUCCESS path: it has no test that posts a valid
+# definition. That half is covered here for the first time.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_routes_tools.cyr"
+include "src/server_routes_agents.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_state(): i64 {
+    return agnosai_app_state_new(
+    agnosai_orchestrator_new(0),
+    agnosai_tool_registry_new(),
+    agnosai_auth_config_new(),
+    agnosai_event_bus_new(),
+    agnosai_audit_chain_new(),
+    agnosai_approval_gate_new());
+}
+
+# A minimal valid definition body — the four fields serde requires.
+fn _t_valid_body(): Str {
+    return str_from("{\"agent_key\":\"writer\",\"name\":\"Writer\",\"role\":\"author\",\"goal\":\"write\"}");
+}
+
+fn _t_body_error(resp): Str {
+    var e = bayan_json_v_obj_get(agnosai_route_body(resp), "error");
+    if (e == 0) { return str_from(""); }
+    if (bayan_json_v_is_str(e) == 0) { return str_from(""); }
+    return bayan_json_v_str(e);
+}
+
+# --- Oracle: list_definitions_returns_empty_array ------------------------
+
+fn _t_list_empty(): i64 {
+    var r = agnosai_route_list_definitions(_t_state());
+    assert(agnosai_route_status(r) == HTTP_OK, "GET definitions is 200");
+    var arr = agnosai_route_body(r);
+    assert(bayan_json_v_is_arr(arr) == 1, "the body is an array");
+    assert(bayan_json_v_is_null(arr) == 0, "...not null");
+    assert(bayan_json_v_arr_len(arr) == 0, "...and empty");
+    return 0;
+}
+
+# --- Oracle: create_definition_with_malformed_json_returns_error ---------
+
+# The oracle accepts 400 or 422 here; the port answers 400, the more precise of
+# the two for a syntax error.
+fn _t_create_malformed_json(): i64 {
+    var s = _t_state();
+    var r = agnosai_route_create_definition(s, str_from("this is not json at all"));
+    var st = agnosai_route_status(r);
+    assert(st == HTTP_BAD_REQUEST || st == AGNOSAI_HTTP_UNPROCESSABLE,
+    "malformed JSON is 400 or 422, as the oracle allows");
+    assert(st == HTTP_BAD_REQUEST, "...and this port picks 400");
+    assert(str_len(_t_body_error(r)) > 0, "...with an error message");
+    assert(agnosai_app_state_definition_count(s) == 0, "...and stores nothing");
+    return 0;
+}
+
+# --- Oracle: create_definition_rejects_invalid_body ----------------------
+
+# `{"not":"valid"}` — valid JSON, wrong shape. serde's 422.
+fn _t_create_invalid_body(): i64 {
+    var s = _t_state();
+    var r = agnosai_route_create_definition(s, str_from("{\"not\":\"valid\"}"));
+    assert(agnosai_route_status(r) == AGNOSAI_HTTP_UNPROCESSABLE,
+    "valid JSON of the wrong shape is 422");
+    assert(agnosai_app_state_definition_count(s) == 0, "...and stores nothing");
+    return 0;
+}
+
+# --- Oracle: create_definition_missing_required_fields_returns_422 -------
+
+# Each of the four fields serde requires, omitted one at a time — so a reader
+# that dropped any single check would fail here rather than only on the
+# all-missing case.
+fn _t_create_missing_required(): i64 {
+    var s = _t_state();
+    assert(agnosai_route_status(agnosai_route_create_definition(s,
+    str_from("{\"agent_key\":\"incomplete\",\"name\":\"Incomplete\"}")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "the oracle's own missing-fields body is 422");
+
+    assert(agnosai_route_status(agnosai_route_create_definition(s,
+    str_from("{\"name\":\"N\",\"role\":\"r\",\"goal\":\"g\"}")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "missing agent_key is 422");
+    assert(agnosai_route_status(agnosai_route_create_definition(s,
+    str_from("{\"agent_key\":\"k\",\"role\":\"r\",\"goal\":\"g\"}")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "missing name is 422");
+    assert(agnosai_route_status(agnosai_route_create_definition(s,
+    str_from("{\"agent_key\":\"k\",\"name\":\"N\",\"goal\":\"g\"}")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "missing role is 422");
+    assert(agnosai_route_status(agnosai_route_create_definition(s,
+    str_from("{\"agent_key\":\"k\",\"name\":\"N\",\"role\":\"r\"}")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "missing goal is 422");
+
+    # Present but wrong-typed is equally unprocessable — serde types these as
+    # String, so a number is a deserialization failure, not a coercion.
+    assert(agnosai_route_status(agnosai_route_create_definition(s,
+    str_from("{\"agent_key\":1,\"name\":\"N\",\"role\":\"r\",\"goal\":\"g\"}")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "a non-string agent_key is 422");
+
+    # A JSON array or scalar is not a struct body either.
+    assert(agnosai_route_status(agnosai_route_create_definition(s, str_from("[]")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an array body is 422");
+    assert(agnosai_route_status(agnosai_route_create_definition(s, str_from("42")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "a scalar body is 422");
+
+    assert(agnosai_app_state_definition_count(s) == 0, "none of those stored anything");
+    return 0;
+}
+
+# --- The success path, which the oracle never tests ----------------------
+
+fn _t_create_success(): i64 {
+    var s = _t_state();
+    var r = agnosai_route_create_definition(s, _t_valid_body());
+    assert(agnosai_route_status(r) == AGNOSAI_HTTP_CREATED, "a valid definition is 201");
+
+    # The body echoes the definition back, as the oracle's `Json(value)` does.
+    var b = agnosai_route_body(r);
+    assert(bayan_json_v_is_obj(b) == 1, "the body is the serialized definition");
+    var k = bayan_json_v_obj_get(b, "agent_key");
+    assert(k != 0 && str_eq(bayan_json_v_str(k), str_from("writer")) == 1,
+    "...carrying the agent_key that was posted");
+
+    # And it is stored, keyed by agent_key — the oracle's
+    # `state.definitions.insert(def.agent_key.clone(), def)`.
+    assert(agnosai_app_state_definition_count(s) == 1, "the definition is stored");
+    assert(agnosai_app_state_definition_get(s, str_from("writer")) != 0,
+    "...under its agent_key");
+    return 0;
+}
+
+# The key is the definition's `agent_key`, not anything else in the body.
+fn _t_create_keys_by_agent_key(): i64 {
+    var s = _t_state();
+    agnosai_route_create_definition(s,
+    str_from("{\"agent_key\":\"the-key\",\"name\":\"the-name\",\"role\":\"r\",\"goal\":\"g\"}"));
+    assert(agnosai_app_state_definition_get(s, str_from("the-key")) != 0,
+    "stored under agent_key");
+    assert(agnosai_app_state_definition_get(s, str_from("the-name")) == 0,
+    "...not under name");
+    return 0;
+}
+
+# Posting the same key twice replaces rather than duplicating — the oracle's
+# `insert` semantics, now reachable through the route.
+fn _t_create_replaces(): i64 {
+    var s = _t_state();
+    agnosai_route_create_definition(s,
+    str_from("{\"agent_key\":\"w\",\"name\":\"First\",\"role\":\"r\",\"goal\":\"g\"}"));
+    var r = agnosai_route_create_definition(s,
+    str_from("{\"agent_key\":\"w\",\"name\":\"Second\",\"role\":\"r\",\"goal\":\"g\"}"));
+    assert(agnosai_route_status(r) == AGNOSAI_HTTP_CREATED, "the second post is also 201");
+    assert(agnosai_app_state_definition_count(s) == 1, "...and does not duplicate");
+
+    var stored = agnosai_app_state_definition_get(s, str_from("w"));
+    assert(str_eq(agnosai_agent_name(stored), str_from("Second")) == 1,
+    "the later definition wins");
+    return 0;
+}
+
+# Create then list — the two handlers share the map, and the listing serializes
+# what creation stored.
+fn _t_create_then_list(): i64 {
+    var s = _t_state();
+    agnosai_route_create_definition(s, _t_valid_body());
+    agnosai_route_create_definition(s,
+    str_from("{\"agent_key\":\"ed\",\"name\":\"Editor\",\"role\":\"r\",\"goal\":\"g\"}"));
+
+    var arr = agnosai_route_body(agnosai_route_list_definitions(s));
+    assert(bayan_json_v_arr_len(arr) == 2, "both definitions list");
+
+    var found = 0;
+    for (var i = 0; i < bayan_json_v_arr_len(arr); i = i + 1) {
+        var k = bayan_json_v_obj_get(bayan_json_v_arr_get(arr, i), "agent_key");
+        if (k != 0 && bayan_json_v_is_str(k) == 1) {
+            if (str_eq(bayan_json_v_str(k), str_from("writer")) == 1) { found = found + 1; }
+            if (str_eq(bayan_json_v_str(k), str_from("ed")) == 1) { found = found + 1; }
+        }
+    }
+    assert(found == 2, "both agent_keys appear in the listing");
+
+    # Each entry is a full definition object, not just a key.
+    var first = bayan_json_v_arr_get(arr, 0);
+    assert(bayan_json_v_obj_get(first, "role") != 0, "entries carry role");
+    assert(bayan_json_v_obj_get(first, "goal") != 0, "...and goal");
+    return 0;
+}
+
+# Optional fields survive the round trip through the route, so the handler is
+# not quietly reconstructing a minimal definition.
+fn _t_create_preserves_optional_fields(): i64 {
+    var s = _t_state();
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"agent_key\":\"k\",\"name\":\"N\",\"role\":\"r\",\"goal\":\"g\",");
+    str_builder_add_cstr(sb, "\"domain\":\"quality\",\"tools\":[\"lint\",\"test\"]}");
+    var r = agnosai_route_create_definition(s, str_builder_build(sb));
+    assert(agnosai_route_status(r) == AGNOSAI_HTTP_CREATED, "201 with optional fields");
+
+    var stored = agnosai_app_state_definition_get(s, str_from("k"));
+    assert(str_eq(agnosai_agent_domain(stored), str_from("quality")) == 1,
+    "domain survived the round trip");
+    assert(vec_len(agnosai_agent_tools(stored)) == 2, "both tools survived");
+    return 0;
+}
+
+# The response is built BEFORE the insert, matching the oracle, which computes
+# `value` first and only then moves `def` into the map. A 4xx therefore never
+# leaves a partial entry behind — checked across every rejection shape.
+fn _t_rejections_never_store(): i64 {
+    var s = _t_state();
+    agnosai_route_create_definition(s, str_from("not json"));
+    agnosai_route_create_definition(s, str_from("{\"not\":\"valid\"}"));
+    agnosai_route_create_definition(s, str_from("[]"));
+    agnosai_route_create_definition(s, str_from("{\"agent_key\":\"k\"}"));
+    assert(agnosai_app_state_definition_count(s) == 0,
+    "no rejected body left anything in the map");
+    assert(bayan_json_v_arr_len(agnosai_route_body(agnosai_route_list_definitions(s))) == 0,
+    "...and the listing agrees");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_list_empty();
+    _t_create_malformed_json();
+    _t_create_invalid_body();
+    _t_create_missing_required();
+    _t_create_success();
+    _t_create_keys_by_agent_key();
+    _t_create_replaces();
+    _t_create_then_list();
+    _t_create_preserves_optional_fields();
+    _t_rejections_never_store();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
