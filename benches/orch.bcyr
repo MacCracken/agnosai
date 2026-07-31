@@ -40,6 +40,7 @@ include "src/llm_router.cyr"
 include "src/server_prompt_guard.cyr"
 include "src/server_output_filter.cyr"
 include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
 include "src/chan_lossy.cyr"
 include "src/server_sse.cyr"
 include "src/orch_pubsub.cyr"
@@ -611,6 +612,75 @@ fn _b_durable_teardown(): i64 {
     return 0;
 }
 
+# The auth decision on the happy path: `Bearer ` extraction, the visible-ASCII
+# gate over the whole header, and two SHA-256 digests compared constant-time.
+#
+# This is the number [ADR 009](../docs/adr/009-auth-constant-time-secret-compare.md)
+# is accountable for — it trades the oracle's single byte loop for two hashes to
+# close a length-timing leak, and the cost of that trade should be a measurement
+# rather than an assertion.
+fn _b_auth_check_ok(): i64 {
+    var n = 200000;
+    var c = agnosai_auth_config_with_secret(str_from("my-secret"));
+    var h = str_from("Bearer my-secret");
+
+    var b = bench_new("auth_check_secret_ok");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check(c, 1, h); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The rejection path, which is what a credential-stuffing flood actually hits.
+# It must not be cheaper than the accept path in a way that distinguishes a
+# wrong-length token from a wrong-content one — both run the same two hashes and
+# the same 32-byte compare.
+fn _b_auth_check_reject(): i64 {
+    var n = 200000;
+    var c = agnosai_auth_config_with_secret(str_from("my-secret"));
+    var h = str_from("Bearer wrong-token");
+
+    var b = bench_new("auth_check_secret_reject");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check(c, 1, h); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# A 1-byte token against the same secret. Paired with the two above, this is the
+# evidence for ADR 009: the oracle's loop would run `secret.len()` times here and
+# `token.len()` times for a long token, so its cost would track the secret's
+# length. These three rows should sit on top of each other.
+fn _b_auth_check_short_token(): i64 {
+    var n = 200000;
+    var c = agnosai_auth_config_with_secret(str_from("my-secret"));
+    var h = str_from("Bearer x");
+
+    var b = bench_new("auth_check_secret_short_token");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check(c, 1, h); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The disabled short-circuit — the first branch, and the one every deployment
+# that has not configured auth pays on every request.
+fn _b_auth_check_disabled(): i64 {
+    var n = 500000;
+    var c = agnosai_auth_config_new();
+    var h = str_from("Bearer my-secret");
+
+    var b = bench_new("auth_check_disabled");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check(c, 1, h); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -644,6 +714,10 @@ fn main(): i64 {
     _b_output_redact();
     _b_metrics_record();
     _b_metrics_gather();
+    _b_auth_check_ok();
+    _b_auth_check_reject();
+    _b_auth_check_short_token();
+    _b_auth_check_disabled();
 
     return 0;
 }

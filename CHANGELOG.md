@@ -55,6 +55,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_auth (M6 bite 3) — the shared-secret half of `auth.rs`.** `AuthConfig`,
+  `JwtConfig` and its builders, case-sensitive `Bearer ` extraction, the
+  `HeaderValue::to_str()` visible-ASCII gate, and the shared-secret comparison.
+  All five of the oracle's shared-secret tests port directly, plus 47 assertions
+  the oracle has no equivalent for — 52 in total.
+
+  **Shaped as `fn(config, inputs) -> status`, not as a transport handler.** The
+  oracle's five tests are `#[tokio::test]` + axum `oneshot` only because its
+  middleware signature is async; the decision it makes is synchronous. Writing it
+  as a pure function makes the whole thing testable before any sandhi adapter
+  exists, and it is the pattern the remaining `routes/*` bites should follow —
+  most of M6's 43 remaining `#[tokio::test]`s are async for the same incidental
+  reason.
+
+  **The secret comparison is constant time; the oracle's is not.** `constant_time_eq`
+  (`auth.rs:18-31`) bounds its loop with `a.len().max(b.len())` while its own doc
+  comment claims "no early return on length mismatch that would leak secret
+  length" — the content compare is constant time, the loop bound is not, so an
+  attacker who controls the token length can recover the secret's by timing.
+  `ct_eq_bytes_lens` is not the fix either; it early-returns on a length mismatch
+  (`lib/ct.cyr:76`), a sharper signal of the same fact. The port compares SHA-256
+  digests over a fixed 32 bytes instead. **This is not a wire divergence** — the
+  accept/reject set is byte-identical, since `sha256(a) == sha256(b)` iff `a == b`
+  — only the timing leak is gone. Recorded as
+  [ADR 009](docs/adr/009-auth-constant-time-secret-compare.md).
+
+  **The JWT branch is a loud 500, never a silent pass.** `validate_jwt` is bite 4.
+  A stub returning 401 would be indistinguishable from a working rejection and one
+  returning 200 would be an authentication bypass, so the unported path answers
+  `HTTP_INTERNAL` and `_t_jwt_path_is_a_loud_stub` pins that it is never `HTTP_OK`.
+  Read state.md's "Four decisions waiting on the maintainer" before writing bite 4:
+  `iss`/`aud`-absent-passes, the `exp: u64::MAX` fixture, the array-`aud` 401, and
+  jsonwebtoken's 60-second default leeway are all deliberate calls.
+
+  Three oracle behaviours reproduced rather than fixed, each pinned by a test: the
+  `Bearer ` prefix is **case-sensitive** (RFC 7235 says the scheme is not, but the
+  oracle's `starts_with` is, so `bearer ` is a 401 in Rust today); `AuthConfig`'s
+  default is **fail-open**; and a header failing `to_str()` takes the
+  missing-header arm rather than being compared.
+
 - **M6 (`server`) — first bite.**
   - **server_prometheus** — six counters plus the Prometheus text exposition `/metrics` serves.
     **Atomics, not a mutex.** The oracle's counters are `AtomicU64`/`Relaxed`, and the port uses
@@ -633,6 +673,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Cyrius baseline. Not comparable to the frozen Rust CSV.
 
 ### Performance
+- **server_auth**: the full auth decision — `Bearer ` extraction, the visible-ASCII
+  gate over the whole header, two SHA-256 digests and a 32-byte constant-time
+  compare — is `auth_check_secret_ok` **945 ns**. The disabled short-circuit is
+  `auth_check_disabled` **6 ns**, so a deployment that has not configured auth pays
+  essentially nothing.
+
+  **The three secret-compare rows are the evidence for [ADR 009](docs/adr/009-auth-constant-time-secret-compare.md),
+  not padding**: accept is 945 ns, reject 955 ns, and a 1-byte token against the
+  same 9-byte secret 917 ns — within 4% of each other. The oracle's
+  `max(a.len(), b.len())` loop would have made that last row track the *secret's*
+  length, which is the leak the ADR closes. The residual ~28 ns spread tracks the
+  **token's** length, which the attacker chose and already knows.
 - **order**: the 100k-entry percentile workload from `builtin/load_testing.rs`, against the
   52.6 s O(n^2) baseline the port plan measured — `sort_100k_heapsort` **78.1 ms** (~670x),
   `three_percentiles_100k` **10.6 ms** (~5,000x). Both beat the plan's predictions (87 ms and

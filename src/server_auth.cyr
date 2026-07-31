@@ -67,10 +67,10 @@ fn agnosai_auth_config_new(): i64 {
 }
 
 # The oracle's `AuthConfig::with_secret` — enabled, shared-secret mode.
-fn agnosai_auth_config_with_secret(secret: Str): i64 {
+fn agnosai_auth_config_with_secret(sec: Str): i64 {
     var c = alloc(AGN_AC_SIZE);
     store64(c + AGN_AC_ENABLED, 1);
-    store64(c + AGN_AC_SECRET, secret);
+    store64(c + AGN_AC_SECRET, sec);
     store64(c + AGN_AC_JWT, 0);
     return c;
 }
@@ -109,7 +109,8 @@ fn agnosai_auth_config_set_enabled(c, enabled): i64 {
 # --- JwtConfig -----------------------------------------------------------
 #
 # Declared here so `AuthConfig` is complete and `state.rs` can be written
-# against it. `agnosai_auth_check` cannot yet *use* it — see the module header.
+# against it. `agnosai_auth_check` does not *use* it — the RS256 half is bite 2,
+# tracked in docs/development/roadmap.md (M6) and CHANGELOG [Unreleased].
 
 enum AgnosaiJwtConfigOff {
     AGN_JC_PUBLIC_KEY_PEM = 0;
@@ -215,9 +216,9 @@ var AGNOSAI_AUTH_DIGEST_LEN = 32;
 fn _agnosai_auth_secret_eq(a: Str, b: Str): i64 {
     var ha[32];
     var hb[32];
-    sha256(str_data(a), str_len(a), ha);
-    sha256(str_data(b), str_len(b), hb);
-    return ct_eq_bytes(ha, hb, AGNOSAI_AUTH_DIGEST_LEN);
+    sha256(str_data(a), str_len(a), &ha);
+    sha256(str_data(b), str_len(b), &hb);
+    return ct_eq_bytes(&ha, &hb, AGNOSAI_AUTH_DIGEST_LEN);
 }
 
 # --- The middleware ------------------------------------------------------
@@ -257,12 +258,16 @@ fn agnosai_auth_check(c, has_header, header: Str): i64 {
 
     var jwt = agnosai_auth_config_jwt(c);
     if (jwt != 0) {
-        # Bite 2 replaces this with `_agnosai_auth_validate_jwt(token, jwt)`.
+        # Bite 2 replaces this with `_agnosai_auth_validate_jwt(token, jwt)` —
+        # tracked in docs/development/roadmap.md (M6) and CHANGELOG [Unreleased],
+        # with the semantics it must pin in docs/development/state.md, "Four
+        # decisions waiting on the maintainer".
+        #
         # A 500 rather than a 401 because the request is not what is wrong: the
-        # server is not yet able to answer. Loud on purpose — a stub that
-        # returned 401 would be indistinguishable from a working rejection, and
-        # one that returned HTTP_OK would be a silent authentication bypass.
-        _agnosai_auth_warn("auth unavailable", 16, "jwt path not yet ported", 23);
+        # server is unable to answer. Loud on purpose — a stub returning 401
+        # would be indistinguishable from a working rejection, and one returning
+        # HTTP_OK would be a silent authentication bypass.
+        _agnosai_auth_warn("auth unavailable", 16, "jwt path unimplemented", 22);
         return HTTP_INTERNAL;
     }
 

@@ -1,0 +1,273 @@
+# =========================================================================
+# server_auth — the shared-secret half of rust-old/src/server/auth.rs.
+#
+# All five of the oracle's shared-secret tests port directly, because
+# `agnosai_auth_check` is shaped as `fn(config, inputs) -> status` rather than
+# as a transport handler. The oracle needs `#[tokio::test]` + an axum
+# `oneshot` only because its middleware signature is async; the decision it
+# makes is synchronous, and here it is tested as such.
+#
+# The suite then goes well past the oracle, which never exercises: the
+# `to_str()` visible-ASCII gate, case-sensitivity of the `Bearer ` prefix, the
+# length-independence of the secret compare, or any of the JwtConfig builders.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "tests/test_helpers.cyr"
+
+# Build an `Authorization: Bearer <token>` value.
+fn _t_bearer(token: Str): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Bearer ");
+    str_builder_add_str(sb, token);
+    return str_builder_build(sb);
+}
+
+# --- The oracle's five shared-secret tests -------------------------------
+
+# Oracle: `passes_when_disabled`. No header at all, auth off -> 200.
+fn _t_passes_when_disabled(): i64 {
+    var c = agnosai_auth_config_new();
+    assert(agnosai_auth_config_enabled(c) == 0, "default config is disabled");
+    assert(agnosai_auth_check(c, 0, str_from("")) == HTTP_OK,
+    "disabled passes with no header");
+    # ...and stays open even when a wrong token *is* supplied, which is what
+    # "passes through unconditionally" means.
+    assert(agnosai_auth_check(c, 1, _t_bearer(str_from("anything"))) == HTTP_OK,
+    "disabled passes with a wrong token");
+    return 0;
+}
+
+# Oracle: `rejects_missing_token_when_enabled`.
+fn _t_rejects_missing_token(): i64 {
+    var c = agnosai_auth_config_with_secret(str_from("my-secret"));
+    assert(agnosai_auth_check(c, 0, str_from("")) == HTTP_UNAUTHORIZED,
+    "missing header rejected");
+    return 0;
+}
+
+# Oracle: `rejects_wrong_token_when_enabled`.
+fn _t_rejects_wrong_token(): i64 {
+    var c = agnosai_auth_config_with_secret(str_from("my-secret"));
+    assert(agnosai_auth_check(c, 1, _t_bearer(str_from("wrong-token"))) == HTTP_UNAUTHORIZED,
+    "wrong token rejected");
+    return 0;
+}
+
+# Oracle: `passes_with_correct_token`.
+fn _t_passes_with_correct_token(): i64 {
+    var c = agnosai_auth_config_with_secret(str_from("my-secret"));
+    assert(agnosai_auth_check(c, 1, _t_bearer(str_from("my-secret"))) == HTTP_OK,
+    "correct token passes");
+    return 0;
+}
+
+# Oracle: `rejects_empty_bearer_token` — the header is exactly `Bearer `.
+fn _t_rejects_empty_bearer(): i64 {
+    var c = agnosai_auth_config_with_secret(str_from("my-secret"));
+    assert(agnosai_auth_check(c, 1, str_from("Bearer ")) == HTTP_UNAUTHORIZED,
+    "empty bearer token rejected");
+    # The distinction that makes this test non-redundant: an empty *secret*
+    # would otherwise match an empty token. It must still be rejected, because
+    # the oracle bails before it ever compares.
+    var c2 = agnosai_auth_config_with_secret(str_from(""));
+    assert(agnosai_auth_check(c2, 1, str_from("Bearer ")) == HTTP_UNAUTHORIZED,
+    "empty bearer rejected even against an empty secret");
+    return 0;
+}
+
+# --- Beyond the oracle: header parsing -----------------------------------
+
+fn _t_bearer_extraction(): i64 {
+    assert(str_eq(agnosai_auth_bearer_token(str_from("Bearer abc")), str_from("abc")) == 1,
+    "extracts the token after the prefix");
+    assert(str_len(agnosai_auth_bearer_token(str_from("Bearer a b c"))) == 5,
+    "token keeps interior spaces");
+    assert(agnosai_auth_bearer_token(str_from("Bearer ")) == 0, "empty token is 0");
+    assert(agnosai_auth_bearer_token(str_from("")) == 0, "empty header is 0");
+    assert(agnosai_auth_bearer_token(str_from("Bearer")) == 0,
+    "prefix without its trailing space is 0");
+    assert(agnosai_auth_bearer_token(str_from("Basic abc")) == 0, "wrong scheme is 0");
+    assert(agnosai_auth_bearer_token(str_from(" Bearer abc")) == 0,
+    "leading space defeats the prefix match");
+    return 0;
+}
+
+# The oracle's `starts_with("Bearer ")` is case-SENSITIVE, so RFC 7235's
+# case-insensitive scheme rule does not apply. Reproduced deliberately: a client
+# sending `bearer ` gets a 401 from Rust today, and must here too.
+fn _t_bearer_is_case_sensitive(): i64 {
+    var c = agnosai_auth_config_with_secret(str_from("s"));
+    assert(agnosai_auth_bearer_token(str_from("bearer s")) == 0, "lowercase rejected");
+    assert(agnosai_auth_bearer_token(str_from("BEARER s")) == 0, "uppercase rejected");
+    assert(agnosai_auth_bearer_token(str_from("BeArEr s")) == 0, "mixed case rejected");
+    assert(agnosai_auth_check(c, 1, str_from("bearer s")) == HTTP_UNAUTHORIZED,
+    "lowercase scheme is a 401, not a pass");
+    return 0;
+}
+
+# The oracle's `.and_then(|v| v.to_str().ok())`: a header carrying a byte
+# outside visible ASCII is `None`, so it takes the missing-header arm.
+fn _t_to_str_gate(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Bearer ok");
+    str_builder_putc(sb, 200);
+    var high = str_builder_build(sb);
+    assert(agnosai_auth_bearer_token(high) == 0, "high byte fails the to_str gate");
+
+    var sb2 = str_builder_new();
+    str_builder_add_cstr(sb2, "Bearer a");
+    str_builder_putc(sb2, 9);
+    str_builder_add_cstr(sb2, "b");
+    assert(agnosai_auth_bearer_token(str_builder_build(sb2)) != 0,
+    "tab is visible-ASCII for to_str and passes the gate");
+
+    var sb3 = str_builder_new();
+    str_builder_add_cstr(sb3, "Bearer a");
+    str_builder_putc(sb3, 0);
+    str_builder_add_cstr(sb3, "b");
+    assert(agnosai_auth_bearer_token(str_builder_build(sb3)) == 0,
+    "an embedded NUL fails the gate");
+
+    var c = agnosai_auth_config_with_secret(str_from("ok"));
+    assert(agnosai_auth_check(c, 1, high) == HTTP_UNAUTHORIZED,
+    "a header failing to_str is a 401");
+    return 0;
+}
+
+# --- Beyond the oracle: the secret comparison ----------------------------
+
+# The compare is over SHA-256 digests, so it is total on the value and
+# independent of length. These pin the accept/reject set the oracle asserts.
+fn _t_secret_compare(): i64 {
+    var c = agnosai_auth_config_with_secret(str_from("my-secret"));
+    assert(agnosai_auth_check(c, 1, _t_bearer(str_from("my-secre"))) == HTTP_UNAUTHORIZED,
+    "prefix of the secret rejected");
+    assert(agnosai_auth_check(c, 1, _t_bearer(str_from("my-secret "))) == HTTP_UNAUTHORIZED,
+    "secret plus a trailing space rejected");
+    assert(agnosai_auth_check(c, 1, _t_bearer(str_from("my-secretX"))) == HTTP_UNAUTHORIZED,
+    "secret plus a trailing byte rejected");
+    assert(agnosai_auth_check(c, 1, _t_bearer(str_from("My-Secret"))) == HTTP_UNAUTHORIZED,
+    "secret compare is case-sensitive");
+    assert(agnosai_auth_check(c, 1, _t_bearer(str_from("my-secret"))) == HTTP_OK,
+    "exact match accepted");
+    return 0;
+}
+
+# A long secret and a 1-byte token must both be rejected and must exercise the
+# same fixed-width compare. This is the regression guard on the module header's
+# claim: if someone "simplifies" this to `ct_eq_bytes_lens` or to the oracle's
+# max-length loop, behaviour here is unchanged but the timing leak returns — so
+# this test cannot catch that alone, and the ADR is what carries the reasoning.
+# What it *does* catch is a compare that reads past a short input.
+fn _t_secret_length_extremes(): i64 {
+    var sb = str_builder_new();
+    var i = 0;
+    while (i < 4096) { str_builder_putc(sb, 97 + (i % 26)); i = i + 1; }
+    var long = str_builder_build(sb);
+
+    var c = agnosai_auth_config_with_secret(long);
+    assert(agnosai_auth_check(c, 1, _t_bearer(str_from("a"))) == HTTP_UNAUTHORIZED,
+    "1-byte token against a 4096-byte secret rejected");
+    assert(agnosai_auth_check(c, 1, _t_bearer(long)) == HTTP_OK,
+    "4096-byte secret matches itself");
+
+    var c2 = agnosai_auth_config_with_secret(str_from("a"));
+    assert(agnosai_auth_check(c2, 1, _t_bearer(long)) == HTTP_UNAUTHORIZED,
+    "4096-byte token against a 1-byte secret rejected");
+    return 0;
+}
+
+# --- Config surface ------------------------------------------------------
+
+fn _t_config_surface(): i64 {
+    var d = agnosai_auth_config_new();
+    assert(agnosai_auth_config_enabled(d) == 0, "default disabled");
+    assert(str_len(agnosai_auth_config_secret(d)) == 0, "default secret empty");
+    assert(agnosai_auth_config_jwt(d) == 0, "default has no jwt");
+
+    var s = agnosai_auth_config_with_secret(str_from("k"));
+    assert(agnosai_auth_config_enabled(s) == 1, "with_secret enables");
+    assert(str_eq(agnosai_auth_config_secret(s), str_from("k")) == 1, "with_secret stores");
+    assert(agnosai_auth_config_jwt(s) == 0, "with_secret has no jwt");
+
+    agnosai_auth_config_set_enabled(s, 0);
+    assert(agnosai_auth_config_enabled(s) == 0, "set_enabled disables");
+    agnosai_auth_config_set_enabled(s, 1);
+    assert(agnosai_auth_config_enabled(s) == 1, "set_enabled re-enables");
+
+    var j = agnosai_jwt_config_new(str_from("-----BEGIN PUBLIC KEY-----"));
+    var w = agnosai_auth_config_with_jwt(j);
+    assert(agnosai_auth_config_enabled(w) == 1, "with_jwt enables");
+    assert(agnosai_auth_config_jwt(w) == j, "with_jwt stores the config");
+    assert(str_len(agnosai_auth_config_secret(w)) == 0, "with_jwt leaves the secret empty");
+    return 0;
+}
+
+fn _t_jwt_config_builders(): i64 {
+    var j = agnosai_jwt_config_new(str_from("PEM"));
+    assert(str_eq(agnosai_jwt_config_public_key_pem(j), str_from("PEM")) == 1, "pem stored");
+    assert(agnosai_jwt_config_issuer(j) == 0, "issuer defaults to none");
+    assert(agnosai_jwt_config_audience(j) == 0, "audience defaults to none");
+
+    agnosai_jwt_config_with_issuer(j, str_from("test-issuer"));
+    assert(str_eq(agnosai_jwt_config_issuer(j), str_from("test-issuer")) == 1, "issuer set");
+    assert(agnosai_jwt_config_audience(j) == 0, "audience untouched by with_issuer");
+
+    agnosai_jwt_config_with_audience(j, str_from("agnosai"));
+    assert(str_eq(agnosai_jwt_config_audience(j), str_from("agnosai")) == 1, "audience set");
+    return 0;
+}
+
+# The JWT arm is not ported yet and must fail loudly rather than pass. Pinned so
+# that bite 2 replacing it is a deliberate, visible change to this assertion
+# rather than a silent one — and so a stub that returned HTTP_OK could never
+# survive a test run.
+fn _t_jwt_path_is_a_loud_stub(): i64 {
+    var j = agnosai_jwt_config_new(str_from("PEM"));
+    var c = agnosai_auth_config_with_jwt(j);
+    var got = agnosai_auth_check(c, 1, _t_bearer(str_from("a.b.c")));
+    assert(got != HTTP_OK, "the unported jwt path must never pass a request");
+    assert(got == HTTP_INTERNAL, "the unported jwt path answers 500");
+    # Everything before the JWT branch still applies in JWT mode.
+    assert(agnosai_auth_check(c, 0, str_from("")) == HTTP_UNAUTHORIZED,
+    "missing header is a 401 even in jwt mode");
+    assert(agnosai_auth_check(c, 1, str_from("Bearer ")) == HTTP_UNAUTHORIZED,
+    "empty bearer is a 401 even in jwt mode");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_passes_when_disabled();
+    _t_rejects_missing_token();
+    _t_rejects_wrong_token();
+    _t_passes_with_correct_token();
+    _t_rejects_empty_bearer();
+    _t_bearer_extraction();
+    _t_bearer_is_case_sensitive();
+    _t_to_str_gate();
+    _t_secret_compare();
+    _t_secret_length_extremes();
+    _t_config_surface();
+    _t_jwt_config_builders();
+    _t_jwt_path_is_a_loud_stub();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

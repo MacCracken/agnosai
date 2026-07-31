@@ -58,7 +58,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | `orchestrator` ported (M5, Phase 4) | ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
-| `server` ported (M6, Phase 5) | 🟡 **5 of 21 files** (1,860 of 4,977 Rust lines) — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`, ~18 lines) is deliberately held back by `src/server_sse.cyr:9-11` because it wraps a receiver in an axum SSE response, so it lands with the transport tier, not with M5. `auth` is next and is **not** blocked — see the Phase 5 correction in the port plan |
+| `server` ported (M6, Phase 5) | 🟡 **5.5 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), and `auth`'s **shared-secret half** is bite 3. Two remainders inside counted files: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier, and `auth.rs`'s RS256 half is bite 4 — its branch is a loud 500, never a silent pass |
+| `server/auth` shared-secret half | ✅ 5 oracle tests + 47 beyond; constant-time compare fixed vs the oracle ([ADR 009](../adr/009-auth-constant-time-secret-compare.md)) |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
@@ -66,8 +67,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2682 assertions across 42 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
-smoke — **2684 across 43 files**, which is the figure `cyrius tests tests` reports:
+**2734 assertions across 43 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
+smoke — **2736 across 44 files**, which is the figure `cyrius tests tests` reports:
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -113,6 +114,7 @@ smoke — **2684 across 43 files**, which is the figure `cyrius tests tests` rep
 | `orch_orchestrator.tcyr` | 49 | 5 |
 | `server_output_filter.tcyr` | 63 | 16 |
 | `server_prometheus.tcyr` | 35 | 8 |
+| `server_auth.tcyr` | 52 | 5 of 10 (the shared-secret half; the 5 JWT tests wait on bite 4) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -282,6 +284,19 @@ the default level the number measures sakshi writing to a pipe.
 | `output_redact_clean` | 9.69 µs |
 | `metrics_record_task` | 5 ns |
 | `metrics_gather` | 7.94 µs |
+| `auth_check_disabled` | 6 ns |
+| `auth_check_secret_short_token` | 917 ns |
+| `auth_check_secret_ok` | 945 ns |
+| `auth_check_secret_reject` | 955 ns |
+
+The three `auth_check_secret_*` rows are the evidence for
+[ADR 009](../adr/009-auth-constant-time-secret-compare.md), not padding. They sit within
+**4%** of each other — accept 945 ns, reject 955 ns, and a 1-byte token against the same
+9-byte secret 917 ns. The oracle's `max(a.len(), b.len())` loop would have made that last
+row track the *secret's* length, which is the timing leak the ADR closes; the residual
+~28 ns spread tracks the **token's** length, which the attacker chose and already knows.
+`auth_check_disabled` at 6 ns is the first branch, and it is what every deployment that
+has not configured auth pays per request.
 
 **These numbers are futex-bound, not algorithm-bound**, and that is the finding rather than an
 excuse. `mutex_lock` + `mutex_unlock` costs **394 ns uncontended** because `lib/sync.cyr`'s
@@ -392,7 +407,16 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 
 ### Pick up here
 
-**Next bite: `server/auth.rs` (452 lines). It is NOT blocked** — see the
+> **Bite 3 (auth, shared-secret half) is DONE** — `src/server_auth.cyr`,
+> 52 assertions, 15/15 fns covered, benchmarked. **Next is bite 4: the RS256
+> JWT half.** Read the four decisions below *before* writing it; they are the
+> whole risk in that bite. The five items under "~15 lines of glue undersells
+> the bite" still apply — the `alg` check and the base64url allocator posture
+> in particular, neither of which bite 3 touched.
+>
+> The background below is kept because it is what makes bite 4 straightforward.
+
+**`server/auth.rs` (452 lines) is NOT blocked** — see the
 correction in [`cyrius-port-plan.md`](cyrius-port-plan.md) Phase 5, which
 replaces a stale gate that cost a session's worth of investigation to disprove.
 Both named dependencies dissolve:
@@ -409,9 +433,14 @@ tampered signature. Every primitive is already resolved into `lib/`.
 
 Suggested split, smallest verifiable bite first:
 
-1. **Shared-secret half** — `AuthConfig`, case-sensitive `Bearer ` extraction,
-   constant-time compare, the disabled short-circuit. Unlocks 5 of the 11 oracle
-   tests with no crypto and no fixtures.
+1. ~~**Shared-secret half**~~ — ✅ **DONE (bite 3).** `AuthConfig`, `JwtConfig` and
+   its builders, case-sensitive `Bearer ` extraction, the `to_str()`
+   visible-ASCII gate, constant-time compare, the disabled short-circuit. All 5
+   shared-secret oracle tests plus 47 assertions beyond them. The compare is
+   SHA-256-digest-based rather than the oracle's loop —
+   [ADR 009](../adr/009-auth-constant-time-secret-compare.md) — because the
+   oracle's loop bound leaks the secret's length while its own comment claims it
+   does not. Same accept/reject set, no timing leak, 945 ns.
 2. **PEM → `(n, e)`** — unlocks `jwt_garbage_token_rejected`, which asserts
    **401 not 500**, so it only passes if the PEM genuinely parses.
 3. **Commit four RS256 token vectors** generated once from the frozen oracle
