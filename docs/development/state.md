@@ -87,8 +87,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**3040 assertions across 49 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
-smoke — **3042 across 50 files**, which is the figure `cyrius tests tests` reports:
+**3113 assertions across 50 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
+smoke — **3115 across 51 files**, which is the figure `cyrius tests tests` reports:
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -141,6 +141,7 @@ smoke — **3042 across 50 files**, which is the figure `cyrius tests tests` rep
 | `server_routes_agents.tcyr` | 38 | 5 (3 of them test the extractor, not the handler) |
 | `server_routes_approval.tcyr` | 41 | 2 (both the empty/undelivered case) |
 | `server_routes_dashboard.tcyr` | 39 | 2 (**both** the empty case — nothing populated) |
+| `server_routes_crews.tcyr` | 73 | 6 of 10 (every plain `#[test]`; the 4 async ones are bite 11b) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -172,7 +173,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (805/805 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (822/822 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -518,10 +519,15 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 > path and an empty list, dashboard tests **only** the two empty cases. The
 > `agnosai_orchestrator_crew_ids` accessor that was owed is added and tested.
 >
-> **Next, in order** — every one is `fn(state, inputs) -> response`, none needs
-> sandhi: `crews.rs` (528) and `a2a.rs` (398), then `mcp.rs` (319) last of the
-> pure handlers. All three carry `deny_unknown_fields` request types, so they
-> follow the raw-body pattern with `agnosai_route_no_unknown_fields`.
+> **`crews.rs` validation half (bite 11a) is DONE** — `src/server_routes_crews.cyr`,
+> 73 assertions, covering all 6 of that file's plain `#[test]`s plus the request
+> readers the oracle never tested (serde generated them).
+>
+> **Next: `crews.rs` handlers (bite 11b)** — `create_crew`, `get_crew`,
+> `cancel_crew`, and the 4 `#[tokio::test]`s. The request types, validation and
+> cycle detection they need are already in place and green, so the bite is the
+> process-mode mapping, index-to-UUID dependency resolution, and the response
+> shape. Then `a2a.rs` (398) and `mcp.rs` (319) last of the pure handlers.
 >
 > **Two conventions the tier now has, worth following rather than re-deciding:**
 > * A handler takes already-parsed inputs **unless the parse failure is itself

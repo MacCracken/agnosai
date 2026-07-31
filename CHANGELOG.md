@@ -82,6 +82,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_routes_crews, validation half (M6 bite 11a) — the request types,
+  `validate_crew_request` and the cycle detector.** 73 assertions.
+
+  **Split because the oracle's own tests split.** `crews.rs` is 528 lines, the
+  largest remaining handler, and CLAUDE.md's sizing rule says break it up. The
+  natural seam is the oracle's: **6 of its 10 tests are plain `#[test]`, not
+  `#[tokio::test]`, and all six cover only this half** — so it lands complete
+  and verified before any handler exists. `create_crew` / `get_crew` /
+  `cancel_crew` are bite 11b.
+
+  **`priority` is validated; `process` deliberately is not.** Both are
+  `Option<String>`-ish in shape, and the correct treatments are opposite.
+  `TaskPriority` is a typed enum, so serde rejects `"priority":"urgent"` — and
+  `agnosai_task_priority_from_wire` would have silently answered Normal, the
+  same coercion trap `approval.rs` hit. `process` really is `Option<String>` in
+  the oracle, matched *after* deserialization with a `_ => Sequential`
+  catch-all (`crews.rs:161-171`), so an unrecognised name is accepted and runs
+  sequentially; rejecting it in the reader would have been the divergence.
+
+  **`agents` and `tasks` are required, not defaulted** — neither carries
+  `#[serde(default)]` — so an absent one is a 422 with no message while a
+  present-but-empty one reaches validation and produces a 400 with a specific
+  one. Both paths pinned, because collapsing them is the obvious simplification
+  and it changes the wire.
+
+  Error-message text and check *order* are both reproduced: agents are tested
+  before tasks, so a request missing both reports the agent message, and every
+  dependency index is range- and self-checked before the cycle sweep.
+
+  One honest note in the module header: the cycle detector's two marks carry
+  different weight. `== 1` (in-progress) is the correctness property — deleting
+  it recurses forever and the suite catches the stack overflow. `== 2` (done) is
+  **purely an optimisation**: deleting it changes no answer, so no assertion
+  isolates it and a mutation removing it passes the whole suite. It is kept
+  because without it the walk is exponential on a graph where each task depends
+  on the previous two — 45 such tasks is ~10⁹ visits, inside the oracle's
+  1000-task cap and reachable from an unauthenticated body.
+
 - **server_routes_dashboard (M6 bite 10) — crew history and agent performance.**
   39 assertions against the oracle's 2 — **and both of the oracle's are the
   empty case**, so it never renders a single crew or agent. Every populated path

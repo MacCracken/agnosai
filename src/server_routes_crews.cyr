@@ -1,0 +1,357 @@
+# =========================================================================
+# server_routes_crews — the crew-creation request types and their validation.
+#
+# Parity oracle: rust-old/src/server/routes/crews.rs (lines 12-146)
+#
+# **Bite 11a of 2.** This is the half of `crews.rs` that is pure functions of a
+# request: `TaskRequest`, `CrewRunRequest`, `validate_crew_request` and
+# `has_dependency_cycle`. It is split out because **6 of the oracle's 10 tests
+# in this file are plain `#[test]`, not `#[tokio::test]`, and all six test only
+# this half** — so it lands complete and verified before any handler exists.
+#
+# The handlers (`create_crew`, `get_crew`, `cancel_crew`) are bite 11b.
+# =========================================================================
+
+# The oracle's three request caps (`crews.rs:74-81`).
+var AGNOSAI_CREW_MAX_AGENTS = 100;
+var AGNOSAI_CREW_MAX_TASKS = 1000;
+var AGNOSAI_CREW_MAX_STRING_LEN = 10000;
+
+# --- TaskRequest ----------------------------------------------------------
+
+enum AgnosaiTaskReqOff {
+    AGN_TREQ_DESCRIPTION = 0;
+    AGN_TREQ_EXPECTED_OUTPUT = 8;
+    AGN_TREQ_PRIORITY = 16;
+    AGN_TREQ_HAS_PRIORITY = 24;
+    AGN_TREQ_DEPENDENCIES = 32;
+    AGN_TREQ_SIZE = 40;
+}
+
+# `description` is the only required field; the rest are `#[serde(default)]`.
+# `priority` is `Option<TaskPriority>`, so absence is distinct from
+# `Normal` — hence the separate `has_priority` flag rather than defaulting.
+fn agnosai_task_req_new(description: Str): i64 {
+    var t = alloc(AGN_TREQ_SIZE);
+    store64(t + AGN_TREQ_DESCRIPTION, description);
+    store64(t + AGN_TREQ_EXPECTED_OUTPUT, 0);
+    store64(t + AGN_TREQ_PRIORITY, AGNOSAI_PRIORITY_NORMAL);
+    store64(t + AGN_TREQ_HAS_PRIORITY, 0);
+    store64(t + AGN_TREQ_DEPENDENCIES, vec_new());
+    return t;
+}
+
+fn agnosai_task_req_description(t): Str { return load64(t + AGN_TREQ_DESCRIPTION); }
+fn agnosai_task_req_expected_output(t): i64 { return load64(t + AGN_TREQ_EXPECTED_OUTPUT); }
+fn agnosai_task_req_priority(t): i64 { return load64(t + AGN_TREQ_PRIORITY); }
+fn agnosai_task_req_has_priority(t): i64 { return load64(t + AGN_TREQ_HAS_PRIORITY); }
+fn agnosai_task_req_dependencies(t): i64 { return load64(t + AGN_TREQ_DEPENDENCIES); }
+
+# The fields serde accepts on `TaskRequest`, which is `deny_unknown_fields`.
+fn _agnosai_task_req_fields(): i64 {
+    var f = agnosai_route_fields();
+    agnosai_route_field(f, "description");
+    agnosai_route_field(f, "expected_output");
+    agnosai_route_field(f, "priority");
+    agnosai_route_field(f, "dependencies");
+    return f;
+}
+
+# Read a `TaskRequest` from a JSON value, or 0 when serde would reject it.
+#
+# Rejection cases, all of which are serde deserialization failures and so 422 at
+# the endpoint: not an object, an unknown field, a missing or non-string
+# `description`, a non-string `expected_output`, a `priority` that is not one of
+# the five wire spellings, or a `dependencies` that is not an array of
+# non-negative integers.
+#
+# **`priority` is validated, not coerced.** `agnosai_task_priority_from_wire`
+# falls back to Normal on an unknown spelling, which is right for a stored
+# record and wrong here — serde rejects `"priority":"urgent"` rather than
+# quietly running the task at Normal. Same distinction `approval.rs` drew.
+fn agnosai_task_req_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    if (agnosai_route_no_unknown_fields(v, _agnosai_task_req_fields()) == 0) { return 0; }
+
+    var d = bayan_json_v_obj_get(v, "description");
+    if (d == 0 || bayan_json_v_is_str(d) == 0) { return 0; }
+    var t = agnosai_task_req_new(bayan_json_v_str(d));
+
+    var eo = bayan_json_v_obj_get(v, "expected_output");
+    if (eo != 0 && bayan_json_v_is_null(eo) == 0) {
+        if (bayan_json_v_is_str(eo) == 0) { return 0; }
+        store64(t + AGN_TREQ_EXPECTED_OUTPUT, bayan_json_v_str(eo));
+    }
+
+    var pr = bayan_json_v_obj_get(v, "priority");
+    if (pr != 0 && bayan_json_v_is_null(pr) == 0) {
+        if (bayan_json_v_is_str(pr) == 0) { return 0; }
+        var ps = bayan_json_v_str(pr);
+        if (_agnosai_priority_is_known(ps) == 0) { return 0; }
+        store64(t + AGN_TREQ_PRIORITY, agnosai_task_priority_from_wire(ps));
+        store64(t + AGN_TREQ_HAS_PRIORITY, 1);
+    }
+
+    var dv = bayan_json_v_obj_get(v, "dependencies");
+    if (dv != 0 && bayan_json_v_is_null(dv) == 0) {
+        if (bayan_json_v_is_arr(dv) == 0) { return 0; }
+        var deps = load64(t + AGN_TREQ_DEPENDENCIES);
+        for (var i = 0; i < bayan_json_v_arr_len(dv); i = i + 1) {
+            var e = bayan_json_v_arr_get(dv, i);
+            if (bayan_json_v_is_int(e) == 0) { return 0; }
+            # The field is `Vec<usize>`, so a negative index is a
+            # deserialization failure rather than an out-of-range error.
+            if (bayan_json_v_int(e) < 0) { return 0; }
+            vec_push(deps, bayan_json_v_int(e));
+        }
+    }
+    return t;
+}
+
+# Whether a string is one of `TaskPriority`'s five wire spellings. Needed
+# because `agnosai_task_priority_from_wire` cannot report failure.
+fn _agnosai_priority_is_known(s: Str): i64 {
+    if (str_eq(s, str_from("background")) == 1) { return 1; }
+    if (str_eq(s, str_from("low")) == 1) { return 1; }
+    if (str_eq(s, str_from("normal")) == 1) { return 1; }
+    if (str_eq(s, str_from("high")) == 1) { return 1; }
+    if (str_eq(s, str_from("critical")) == 1) { return 1; }
+    return 0;
+}
+
+# --- CrewRunRequest -------------------------------------------------------
+
+enum AgnosaiCrewReqOff {
+    AGN_CREQ_NAME = 0;
+    AGN_CREQ_AGENTS = 8;
+    AGN_CREQ_TASKS = 16;
+    AGN_CREQ_PROCESS = 24;
+    AGN_CREQ_MAX_CONCURRENCY = 32;
+    AGN_CREQ_HAS_CONCURRENCY = 40;
+    AGN_CREQ_SIZE = 48;
+}
+
+fn agnosai_crew_req_new(name: Str): i64 {
+    var r = alloc(AGN_CREQ_SIZE);
+    store64(r + AGN_CREQ_NAME, name);
+    store64(r + AGN_CREQ_AGENTS, vec_new());
+    store64(r + AGN_CREQ_TASKS, vec_new());
+    store64(r + AGN_CREQ_PROCESS, 0);
+    store64(r + AGN_CREQ_MAX_CONCURRENCY, 0);
+    store64(r + AGN_CREQ_HAS_CONCURRENCY, 0);
+    return r;
+}
+
+fn agnosai_crew_req_name(r): Str { return load64(r + AGN_CREQ_NAME); }
+fn agnosai_crew_req_agents(r): i64 { return load64(r + AGN_CREQ_AGENTS); }
+fn agnosai_crew_req_tasks(r): i64 { return load64(r + AGN_CREQ_TASKS); }
+fn agnosai_crew_req_process(r): i64 { return load64(r + AGN_CREQ_PROCESS); }
+fn agnosai_crew_req_max_concurrency(r): i64 { return load64(r + AGN_CREQ_MAX_CONCURRENCY); }
+fn agnosai_crew_req_has_concurrency(r): i64 { return load64(r + AGN_CREQ_HAS_CONCURRENCY); }
+
+fn _agnosai_crew_req_fields(): i64 {
+    var f = agnosai_route_fields();
+    agnosai_route_field(f, "name");
+    agnosai_route_field(f, "agents");
+    agnosai_route_field(f, "tasks");
+    agnosai_route_field(f, "process");
+    agnosai_route_field(f, "max_concurrency");
+    return f;
+}
+
+# Read a `CrewRunRequest`, or 0 when serde would reject it.
+#
+# **`process` is NOT validated here, deliberately.** The oracle types it
+# `Option<String>` and matches on it *after* deserialization with a `_ =>
+# Sequential` catch-all (`crews.rs:161-171`), so an unrecognised process name is
+# accepted and silently runs sequentially. That is a fall-through in the handler,
+# not a serde failure, so rejecting it here would be a divergence — the opposite
+# call from `priority`, which serde genuinely does type.
+fn agnosai_crew_req_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    if (agnosai_route_no_unknown_fields(v, _agnosai_crew_req_fields()) == 0) { return 0; }
+
+    var n = bayan_json_v_obj_get(v, "name");
+    if (n == 0 || bayan_json_v_is_str(n) == 0) { return 0; }
+    var r = agnosai_crew_req_new(bayan_json_v_str(n));
+
+    # `agents: Vec<AgentDefinition>` and `tasks: Vec<TaskRequest>` are both
+    # required — no `#[serde(default)]` on either, so an absent one is a
+    # deserialization failure rather than an empty vec. That matters: an empty
+    # vec would reach `validate_crew_request` and produce a 400 with a specific
+    # message, where a missing field is a 422 with none.
+    var av = bayan_json_v_obj_get(v, "agents");
+    if (av == 0 || bayan_json_v_is_arr(av) == 0) { return 0; }
+    var agents = load64(r + AGN_CREQ_AGENTS);
+    for (var i = 0; i < bayan_json_v_arr_len(av); i = i + 1) {
+        var a = agnosai_agent_from_value(bayan_json_v_arr_get(av, i));
+        if (a == 0) { return 0; }
+        vec_push(agents, a);
+    }
+
+    var tv = bayan_json_v_obj_get(v, "tasks");
+    if (tv == 0 || bayan_json_v_is_arr(tv) == 0) { return 0; }
+    var tasks = load64(r + AGN_CREQ_TASKS);
+    for (var j = 0; j < bayan_json_v_arr_len(tv); j = j + 1) {
+        var t = agnosai_task_req_from_value(bayan_json_v_arr_get(tv, j));
+        if (t == 0) { return 0; }
+        vec_push(tasks, t);
+    }
+
+    var pv = bayan_json_v_obj_get(v, "process");
+    if (pv != 0 && bayan_json_v_is_null(pv) == 0) {
+        if (bayan_json_v_is_str(pv) == 0) { return 0; }
+        store64(r + AGN_CREQ_PROCESS, bayan_json_v_str(pv));
+    }
+
+    var mc = bayan_json_v_obj_get(v, "max_concurrency");
+    if (mc != 0 && bayan_json_v_is_null(mc) == 0) {
+        if (bayan_json_v_is_int(mc) == 0) { return 0; }
+        # `Option<usize>` — a negative value does not deserialize.
+        if (bayan_json_v_int(mc) < 0) { return 0; }
+        store64(r + AGN_CREQ_MAX_CONCURRENCY, bayan_json_v_int(mc));
+        store64(r + AGN_CREQ_HAS_CONCURRENCY, 1);
+    }
+    return r;
+}
+
+# --- Validation -----------------------------------------------------------
+
+# DFS cycle detection over the index-based dependency graph.
+#
+# Marks: 0 unvisited, 1 in-progress, 2 done — the oracle's own encoding. The
+# `state` vec is shared across every root, so a node settled as 2 is never
+# re-walked and the whole sweep is O(V+E).
+#
+# **The two marks carry different weight, and only one is a correctness
+# property.** `== 1` (in-progress) is what detects a cycle: deleting it makes
+# the walk recurse forever, and the suite catches that as a stack overflow.
+# `== 2` (done) is **purely an optimisation** — deleting it changes no answer,
+# because a settled node's subtree is acyclic and re-walking it returns the same
+# 0. So no assertion isolates it, and a mutation that removes it passes the
+# whole suite.
+#
+# It is kept because without it the walk is exponential on a graph where each
+# task depends on the previous two — 45 such tasks is ~10^9 visits, well inside
+# the oracle's 1000-task cap and reachable from an unauthenticated request body.
+# `_t_cycle_memoization_shape` exercises that shape; it cannot fail on the
+# mutant, only take unboundedly longer, which is why this note exists instead.
+#
+# Robust on its own rather than relying on its caller: `validate_crew_request`
+# rejects out-of-range and self-dependencies before calling this, but the oracle
+# exposes `has_dependency_cycle` as `pub(crate)` and tests it directly, so the
+# `dep < n` guard is kept exactly as the oracle has it.
+fn agnosai_crew_has_dependency_cycle(tasks): i64 {
+    var n = vec_len(tasks);
+    var state = vec_new();
+    for (var i = 0; i < n; i = i + 1) { vec_push(state, 0); }
+    for (var j = 0; j < n; j = j + 1) {
+        if (_agnosai_crew_cycle_visit(j, tasks, state, n) == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn _agnosai_crew_cycle_visit(node, tasks, state, n): i64 {
+    if (vec_get(state, node) == 1) { return 1; }
+    if (vec_get(state, node) == 2) { return 0; }
+    vec_set(state, node, 1);
+    var deps = agnosai_task_req_dependencies(vec_get(tasks, node));
+    for (var i = 0; i < vec_len(deps); i = i + 1) {
+        var dep = vec_get(deps, i);
+        if (dep < n) {
+            if (_agnosai_crew_cycle_visit(dep, tasks, state, n) == 1) { return 1; }
+        }
+    }
+    vec_set(state, node, 2);
+    return 0;
+}
+
+# Validate a crew request. Returns 0 when valid, or the error message the
+# oracle's `Err(String)` carries — which becomes the 400 body.
+#
+# Check order is the oracle's and is load-bearing: an empty `agents` is reported
+# before an oversized one, and every dependency index is range- and
+# self-checked before the cycle sweep runs. A caller that reordered these would
+# still reject the same requests but would report a different message, and the
+# messages are wire-visible.
+fn agnosai_validate_crew_request(r): i64 {
+    var name = agnosai_crew_req_name(r);
+    if (str_len(name) == 0 || str_len(name) > AGNOSAI_CREW_MAX_STRING_LEN) {
+        return _agnosai_crew_err_len("name must be 1-");
+    }
+
+    var agents = agnosai_crew_req_agents(r);
+    if (vec_len(agents) == 0) { return str_from("at least one agent is required"); }
+    if (vec_len(agents) > AGNOSAI_CREW_MAX_AGENTS) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "at most ");
+        str_builder_add_int(sb, AGNOSAI_CREW_MAX_AGENTS);
+        str_builder_add_cstr(sb, " agents allowed");
+        return str_builder_build(sb);
+    }
+
+    var tasks = agnosai_crew_req_tasks(r);
+    if (vec_len(tasks) == 0) { return str_from("at least one task is required"); }
+    if (vec_len(tasks) > AGNOSAI_CREW_MAX_TASKS) {
+        var sb2 = str_builder_new();
+        str_builder_add_cstr(sb2, "at most ");
+        str_builder_add_int(sb2, AGNOSAI_CREW_MAX_TASKS);
+        str_builder_add_cstr(sb2, " tasks allowed");
+        return str_builder_build(sb2);
+    }
+
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        var a = vec_get(agents, i);
+        if (str_len(agnosai_agent_key(a)) > AGNOSAI_CREW_MAX_STRING_LEN
+        || str_len(agnosai_agent_role(a)) > AGNOSAI_CREW_MAX_STRING_LEN) {
+            return _agnosai_crew_err_indexed("agent ", i, ": field exceeds max length");
+        }
+    }
+
+    var n = vec_len(tasks);
+    for (var j = 0; j < n; j = j + 1) {
+        var t = vec_get(tasks, j);
+        if (str_len(agnosai_task_req_description(t)) > AGNOSAI_CREW_MAX_STRING_LEN) {
+            return _agnosai_crew_err_indexed("task ", j, ": description exceeds max length");
+        }
+        var deps = agnosai_task_req_dependencies(t);
+        for (var k = 0; k < vec_len(deps); k = k + 1) {
+            var dep = vec_get(deps, k);
+            if (dep >= n) {
+                var sb3 = str_builder_new();
+                str_builder_add_cstr(sb3, "task ");
+                str_builder_add_int(sb3, j);
+                str_builder_add_cstr(sb3, ": dependency index ");
+                str_builder_add_int(sb3, dep);
+                str_builder_add_cstr(sb3, " out of range");
+                return str_builder_build(sb3);
+            }
+            if (dep == j) {
+                return _agnosai_crew_err_indexed("task ", j, ": self-dependency");
+            }
+        }
+    }
+
+    if (agnosai_crew_has_dependency_cycle(tasks) == 1) {
+        return str_from("task dependencies contain a cycle");
+    }
+    return 0;
+}
+
+# `name must be 1-{MAX_STRING_LEN} characters`.
+fn _agnosai_crew_err_len(prefix): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, prefix);
+    str_builder_add_int(sb, AGNOSAI_CREW_MAX_STRING_LEN);
+    str_builder_add_cstr(sb, " characters");
+    return str_builder_build(sb);
+}
+
+# `{prefix}{index}{suffix}` — the oracle's `format!("agent {i}: ..")` shape.
+fn _agnosai_crew_err_indexed(prefix, index, suffix): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, prefix);
+    str_builder_add_int(sb, index);
+    str_builder_add_cstr(sb, suffix);
+    return str_builder_build(sb);
+}

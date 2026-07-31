@@ -1,0 +1,433 @@
+# =========================================================================
+# server_routes_crews — rust-old/src/server/routes/crews.rs, validation half.
+#
+# All **six** of the oracle's plain `#[test]` functions live in this half and
+# all six port here (`validate_rejects_empty_name`, `_missing_tasks`,
+# `_self_dependency`, `_out_of_range_dependency`, `_dependency_cycle`,
+# `validate_accepts_valid_dag`). The four `#[tokio::test]`s belong to the
+# handlers, which are bite 11b.
+#
+# The oracle has no test at all for the request READERS — serde generated them —
+# so `deny_unknown_fields` on two types, the `Option` vs required distinction,
+# and every wrong-type rejection are covered here for the first time.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_routes_tools.cyr"
+include "src/server_routes_agents.cyr"
+include "src/server_routes_approval.cyr"
+include "src/server_routes_dashboard.cyr"
+include "src/server_routes_crews.cyr"
+include "tests/test_helpers.cyr"
+
+# Parse a JSON body — length from the Str, never hardcoded.
+fn _t_parse(src: Str): i64 {
+    return bayan_json_v_parse_buf(str_data(src), str_len(src));
+}
+
+# The oracle's `make_agent()`.
+fn _t_agent(): i64 {
+    return agnosai_agent_new(str_from("a1"), str_from("role"), str_from("goal"));
+}
+
+# A request with `n` tasks and one agent, no dependencies.
+fn _t_req(name, n): i64 {
+    var r = agnosai_crew_req_new(str_from(name));
+    vec_push(agnosai_crew_req_agents(r), _t_agent());
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(agnosai_crew_req_tasks(r), agnosai_task_req_new(str_from("do it")));
+    }
+    return r;
+}
+
+# Add a dependency edge: task `from` depends on task `to`.
+fn _t_dep(r, from, to): i64 {
+    vec_push(agnosai_task_req_dependencies(vec_get(agnosai_crew_req_tasks(r), from)), to);
+    return r;
+}
+
+fn _t_str_of(n, ch): Str {
+    var sb = str_builder_new();
+    for (var i = 0; i < n; i = i + 1) { str_builder_putc(sb, ch); }
+    return str_builder_build(sb);
+}
+
+# --- The oracle's six sync tests -----------------------------------------
+
+# Oracle: `validate_rejects_empty_name`.
+fn _t_rejects_empty_name(): i64 {
+    var r = _t_req("", 1);
+    var e = agnosai_validate_crew_request(r);
+    assert(e != 0, "an empty name is rejected");
+    assert(str_contains(e, str_from("name must be 1-")) == 1, "...with the oracle's message");
+    assert(str_contains(e, str_from("10000")) == 1, "...naming the cap");
+
+    # And the other end of the same check.
+    var long = agnosai_crew_req_new(_t_str_of(AGNOSAI_CREW_MAX_STRING_LEN + 1, 97));
+    vec_push(agnosai_crew_req_agents(long), _t_agent());
+    vec_push(agnosai_crew_req_tasks(long), agnosai_task_req_new(str_from("d")));
+    assert(agnosai_validate_crew_request(long) != 0, "an over-long name is rejected");
+
+    # Exactly at the cap is accepted — the boundary the `>` guards.
+    var at = agnosai_crew_req_new(_t_str_of(AGNOSAI_CREW_MAX_STRING_LEN, 97));
+    vec_push(agnosai_crew_req_agents(at), _t_agent());
+    vec_push(agnosai_crew_req_tasks(at), agnosai_task_req_new(str_from("d")));
+    assert(agnosai_validate_crew_request(at) == 0, "a name exactly at the cap is accepted");
+    return 0;
+}
+
+# Oracle: `validate_rejects_missing_tasks`.
+fn _t_rejects_missing_tasks(): i64 {
+    var r = _t_req("crew", 0);
+    var e = agnosai_validate_crew_request(r);
+    assert(e != 0, "no tasks is rejected");
+    assert(str_eq(e, str_from("at least one task is required")) == 1,
+    "...with the oracle's exact message");
+    return 0;
+}
+
+# The agents arm of the same shape — the oracle tests it through the handler
+# (`post_crews_with_empty_agents_returns_bad_request`) rather than directly.
+fn _t_rejects_missing_agents(): i64 {
+    var r = agnosai_crew_req_new(str_from("crew"));
+    vec_push(agnosai_crew_req_tasks(r), agnosai_task_req_new(str_from("d")));
+    assert(str_eq(agnosai_validate_crew_request(r),
+    str_from("at least one agent is required")) == 1, "no agents is rejected");
+
+    # Order matters and is the oracle's: agents are checked before tasks, so a
+    # request missing both reports the AGENT message.
+    var both = agnosai_crew_req_new(str_from("crew"));
+    assert(str_eq(agnosai_validate_crew_request(both),
+    str_from("at least one agent is required")) == 1,
+    "with both missing, the agent message wins — the oracle's check order");
+    return 0;
+}
+
+# Oracle: `validate_rejects_self_dependency`.
+fn _t_rejects_self_dependency(): i64 {
+    var r = _t_req("crew", 2);
+    _t_dep(r, 1, 1);
+    var e = agnosai_validate_crew_request(r);
+    assert(e != 0, "a self-dependency is rejected");
+    assert(str_contains(e, str_from("task 1: self-dependency")) == 1,
+    "...with the oracle's indexed message");
+    return 0;
+}
+
+# Oracle: `validate_rejects_out_of_range_dependency`.
+fn _t_rejects_out_of_range_dependency(): i64 {
+    var r = _t_req("crew", 2);
+    _t_dep(r, 0, 5);
+    var e = agnosai_validate_crew_request(r);
+    assert(e != 0, "an out-of-range dependency is rejected");
+    assert(str_contains(e, str_from("task 0: dependency index 5 out of range")) == 1,
+    "...with the oracle's indexed message");
+
+    # The boundary: index == len is out of range, index == len-1 is not.
+    var edge = _t_req("crew", 2);
+    _t_dep(edge, 0, 2);
+    assert(agnosai_validate_crew_request(edge) != 0, "index == task count is out of range");
+    var ok = _t_req("crew", 2);
+    _t_dep(ok, 0, 1);
+    assert(agnosai_validate_crew_request(ok) == 0, "index == count-1 is in range");
+    return 0;
+}
+
+# Oracle: `validate_rejects_dependency_cycle`.
+fn _t_rejects_dependency_cycle(): i64 {
+    var r = _t_req("crew", 2);
+    _t_dep(r, 0, 1);
+    _t_dep(r, 1, 0);
+    var e = agnosai_validate_crew_request(r);
+    assert(e != 0, "a two-node cycle is rejected");
+    assert(str_eq(e, str_from("task dependencies contain a cycle")) == 1,
+    "...with the oracle's message");
+
+    # A longer cycle, so a detector that only catches the 2-cycle fails.
+    var three = _t_req("crew", 3);
+    _t_dep(three, 0, 1);
+    _t_dep(three, 1, 2);
+    _t_dep(three, 2, 0);
+    assert(agnosai_validate_crew_request(three) != 0, "a three-node cycle is rejected");
+    return 0;
+}
+
+# Oracle: `validate_accepts_valid_dag`.
+fn _t_accepts_valid_dag(): i64 {
+    var r = _t_req("crew", 3);
+    _t_dep(r, 1, 0);
+    _t_dep(r, 2, 0);
+    _t_dep(r, 2, 1);
+    assert(agnosai_validate_crew_request(r) == 0, "a valid DAG is accepted");
+
+    # A diamond, which a naive visited-set (rather than in-progress) detector
+    # would wrongly call a cycle: 3 depends on 1 and 2, both of which depend on 0.
+    var d = _t_req("crew", 4);
+    _t_dep(d, 1, 0);
+    _t_dep(d, 2, 0);
+    _t_dep(d, 3, 1);
+    _t_dep(d, 3, 2);
+    assert(agnosai_validate_crew_request(d) == 0,
+    "a diamond is a DAG, not a cycle — the in-progress/done distinction");
+    return 0;
+}
+
+# --- The cycle detector on its own ---------------------------------------
+
+# The oracle exposes `has_dependency_cycle` as `pub(crate)` and tests it
+# indirectly. Driven directly here, including the `dep < n` guard that
+# `validate_crew_request` would otherwise have made unreachable.
+fn _t_cycle_detector_direct(): i64 {
+    var empty = vec_new();
+    assert(agnosai_crew_has_dependency_cycle(empty) == 0, "no tasks, no cycle");
+
+    var one = vec_new();
+    vec_push(one, agnosai_task_req_new(str_from("a")));
+    assert(agnosai_crew_has_dependency_cycle(one) == 0, "one task, no deps, no cycle");
+    vec_push(agnosai_task_req_dependencies(vec_get(one, 0)), 0);
+    assert(agnosai_crew_has_dependency_cycle(one) == 1, "a self-loop is a cycle");
+
+    # Out-of-range deps are skipped rather than crashing — the `dep < n` guard.
+    var oor = vec_new();
+    vec_push(oor, agnosai_task_req_new(str_from("a")));
+    vec_push(agnosai_task_req_dependencies(vec_get(oor, 0)), 99);
+    assert(agnosai_crew_has_dependency_cycle(oor) == 0,
+    "an out-of-range dependency is skipped, not followed");
+
+    # A long chain, so the shared state vec proves it is not re-walking roots.
+    var chain = vec_new();
+    for (var i = 0; i < 200; i = i + 1) {
+        vec_push(chain, agnosai_task_req_new(str_from("t")));
+    }
+    for (var j = 1; j < 200; j = j + 1) {
+        vec_push(agnosai_task_req_dependencies(vec_get(chain, j)), j - 1);
+    }
+    assert(agnosai_crew_has_dependency_cycle(chain) == 0, "a 200-long chain is acyclic");
+    vec_push(agnosai_task_req_dependencies(vec_get(chain, 0)), 199);
+    assert(agnosai_crew_has_dependency_cycle(chain) == 1,
+    "...and closing it into a ring is a cycle");
+    return 0;
+}
+
+# The shape that makes the `state == 2` memoization matter: each task depends on
+# the previous two, so the number of distinct paths from the last node is
+# Fibonacci in the node count. With memoization this is O(V+E); without it, a
+# 45-node version is ~10^9 visits — inside the oracle's 1000-task cap and
+# reachable from an unauthenticated body.
+#
+# **This test cannot fail on a de-memoized implementation**, only take
+# unboundedly longer, so it does not stand in for a mutation kill. It is here to
+# exercise the shape and to keep a concrete example of why the mark is not
+# redundant. See the note on `agnosai_crew_has_dependency_cycle`.
+fn _t_cycle_memoization_shape(): i64 {
+    var n = 32;
+    var tasks = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(tasks, agnosai_task_req_new(str_from("t")));
+    }
+    for (var j = 2; j < n; j = j + 1) {
+        vec_push(agnosai_task_req_dependencies(vec_get(tasks, j)), j - 1);
+        vec_push(agnosai_task_req_dependencies(vec_get(tasks, j)), j - 2);
+    }
+    assert(agnosai_crew_has_dependency_cycle(tasks) == 0,
+    "a Fibonacci-shaped dependency graph is acyclic");
+
+    # And closing it is still detected on the same shape.
+    vec_push(agnosai_task_req_dependencies(vec_get(tasks, 0)), n - 1);
+    assert(agnosai_crew_has_dependency_cycle(tasks) == 1,
+    "...and a back-edge through it is a cycle");
+    return 0;
+}
+
+# --- Caps ----------------------------------------------------------------
+
+fn _t_caps(): i64 {
+    assert(AGNOSAI_CREW_MAX_AGENTS == 100, "the oracle's agent cap");
+    assert(AGNOSAI_CREW_MAX_TASKS == 1000, "the oracle's task cap");
+    assert(AGNOSAI_CREW_MAX_STRING_LEN == 10000, "the oracle's string cap");
+
+    var r = agnosai_crew_req_new(str_from("crew"));
+    for (var i = 0; i < AGNOSAI_CREW_MAX_AGENTS + 1; i = i + 1) {
+        vec_push(agnosai_crew_req_agents(r), _t_agent());
+    }
+    vec_push(agnosai_crew_req_tasks(r), agnosai_task_req_new(str_from("d")));
+    assert(str_contains(agnosai_validate_crew_request(r),
+    str_from("at most 100 agents allowed")) == 1, "101 agents is rejected");
+
+    # An over-long agent field.
+    var f = _t_req("crew", 1);
+    vec_push(agnosai_crew_req_agents(f), agnosai_agent_new(
+    _t_str_of(AGNOSAI_CREW_MAX_STRING_LEN + 1, 98), str_from("r"), str_from("g")));
+    assert(str_contains(agnosai_validate_crew_request(f),
+    str_from("agent 1: field exceeds max length")) == 1,
+    "an over-long agent_key is rejected, naming its index");
+
+    # An over-long task description.
+    var t = _t_req("crew", 1);
+    vec_push(agnosai_crew_req_tasks(t),
+    agnosai_task_req_new(_t_str_of(AGNOSAI_CREW_MAX_STRING_LEN + 1, 99)));
+    assert(str_contains(agnosai_validate_crew_request(t),
+    str_from("task 1: description exceeds max length")) == 1,
+    "an over-long description is rejected, naming its index");
+    return 0;
+}
+
+# --- The readers, which the oracle never tests ---------------------------
+
+fn _t_task_req_reader(): i64 {
+    var ok = _t_parse(str_from(
+    "{\"description\":\"d\",\"expected_output\":\"e\",\"priority\":\"high\",\"dependencies\":[0,2]}"));
+    var t = agnosai_task_req_from_value(ok);
+    assert(t != 0, "a full TaskRequest reads");
+    assert(str_eq(agnosai_task_req_description(t), str_from("d")) == 1, "description");
+    assert(str_eq(agnosai_task_req_expected_output(t), str_from("e")) == 1, "expected_output");
+    assert(agnosai_task_req_priority(t) == AGNOSAI_PRIORITY_HIGH, "priority");
+    assert(agnosai_task_req_has_priority(t) == 1, "...and it was present");
+    assert(vec_len(agnosai_task_req_dependencies(t)) == 2, "dependencies");
+
+    # Only `description` is required.
+    var min = agnosai_task_req_from_value(
+    _t_parse(str_from("{\"description\":\"d\"}")));
+    assert(min != 0, "description alone is enough");
+    assert(agnosai_task_req_expected_output(min) == 0, "expected_output defaults to absent");
+    assert(agnosai_task_req_has_priority(min) == 0, "priority defaults to absent");
+    assert(agnosai_task_req_priority(min) == AGNOSAI_PRIORITY_NORMAL,
+    "...reading as Normal, which is TaskPriority's own default");
+    assert(vec_len(agnosai_task_req_dependencies(min)) == 0, "dependencies defaults to empty");
+    return 0;
+}
+
+fn _t_task_req_rejections(): i64 {
+    assert(agnosai_task_req_from_value(
+    _t_parse(str_from("{}"))) == 0, "no description is rejected");
+    assert(agnosai_task_req_from_value(
+    _t_parse(str_from("{\"description\":1}"))) == 0,
+    "a non-string description is rejected");
+    assert(agnosai_task_req_from_value(bayan_json_v_arr_new()) == 0,
+    "an array is not a TaskRequest");
+
+    # `deny_unknown_fields`.
+    assert(agnosai_task_req_from_value(_t_parse(str_from(
+    "{\"description\":\"d\",\"nope\":1}"))) == 0, "an unknown field is rejected");
+
+    # **`priority` is validated, not coerced.** `agnosai_task_priority_from_wire`
+    # would silently answer Normal for "urgent"; serde rejects it.
+    assert(agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"priority\":\"urgent\"}"))) == 0,
+    "an unknown priority is rejected, NOT coerced to Normal");
+    assert(agnosai_task_priority_from_wire(str_from("urgent")) == AGNOSAI_PRIORITY_NORMAL,
+    "...even though from_wire on its own would answer Normal");
+
+    # `dependencies: Vec<usize>` — negatives and non-integers do not deserialize.
+    assert(agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"dependencies\":[-1]}"))) == 0,
+    "a negative dependency index is rejected");
+    assert(agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"dependencies\":[\"a\"]}"))) == 0,
+    "a non-integer dependency is rejected");
+    assert(agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"dependencies\":5}"))) == 0,
+    "a non-array dependencies is rejected");
+    return 0;
+}
+
+fn _t_crew_req_reader(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"c\",\"agents\":[{\"agent_key\":\"k\",");
+    str_builder_add_cstr(sb, "\"name\":\"n\",\"role\":\"r\",\"goal\":\"g\"}],");
+    str_builder_add_cstr(sb, "\"tasks\":[{\"description\":\"d\"}],");
+    str_builder_add_cstr(sb, "\"process\":\"dag\",\"max_concurrency\":8}");
+    var body = str_builder_build(sb);
+    var r = agnosai_crew_req_from_value(_t_parse(body));
+    assert(r != 0, "a full CrewRunRequest reads");
+    assert(str_eq(agnosai_crew_req_name(r), str_from("c")) == 1, "name");
+    assert(vec_len(agnosai_crew_req_agents(r)) == 1, "one agent");
+    assert(vec_len(agnosai_crew_req_tasks(r)) == 1, "one task");
+    assert(str_eq(agnosai_crew_req_process(r), str_from("dag")) == 1, "process");
+    assert(agnosai_crew_req_max_concurrency(r) == 8, "max_concurrency");
+    assert(agnosai_crew_req_has_concurrency(r) == 1, "...and it was present");
+    assert(agnosai_validate_crew_request(r) == 0, "...and the whole thing validates");
+    return 0;
+}
+
+fn _t_crew_req_rejections(): i64 {
+    # `agents` and `tasks` are REQUIRED — no `#[serde(default)]` on either — so
+    # an absent one is a deserialization failure, not an empty vec that would
+    # reach validation and produce a different (400, specific) answer.
+    assert(agnosai_crew_req_from_value(_t_parse(str_from(
+    "{\"name\":\"c\",\"tasks\":[]}"))) == 0, "missing agents is rejected");
+    assert(agnosai_crew_req_from_value(_t_parse(str_from(
+    "{\"name\":\"c\",\"agents\":[]}"))) == 0, "missing tasks is rejected");
+    assert(agnosai_crew_req_from_value(_t_parse(str_from(
+    "{\"agents\":[],\"tasks\":[]}"))) == 0, "missing name is rejected");
+
+    # But present-and-empty DOES read, and is validation's problem, not serde's.
+    var e = agnosai_crew_req_from_value(_t_parse(str_from("{\"name\":\"c\",\"agents\":[],\"tasks\":[]}")));
+    assert(e != 0, "present-but-empty agents/tasks deserialize fine");
+    assert(agnosai_validate_crew_request(e) != 0, "...and are caught by validation instead");
+
+    assert(agnosai_crew_req_from_value(_t_parse(str_from("{\"name\":\"c\",\"agents\":[],\"tasks\":[],\"x\":1}"))) == 0,
+    "an unknown field is rejected");
+    assert(agnosai_crew_req_from_value(_t_parse(str_from("{\"name\":\"c\",\"agents\":[{}],\"tasks\":[]}"))) == 0,
+    "an invalid agent inside the array is rejected");
+    assert(agnosai_crew_req_from_value(_t_parse(str_from("{\"name\":\"c\",\"agents\":[],\"tasks\":[{}]}"))) == 0,
+    "an invalid task inside the array is rejected");
+    assert(agnosai_crew_req_from_value(_t_parse(str_from(
+    "{\"name\":\"c\",\"agents\":[],\"tasks\":[],\"max_concurrency\":-1}"))) == 0,
+    "a negative max_concurrency is rejected");
+    return 0;
+}
+
+# **`process` is NOT validated by the reader**, unlike `priority`. The oracle
+# types it `Option<String>` and matches with a `_ => Sequential` catch-all after
+# deserialization, so an unrecognised name is accepted and silently runs
+# sequentially. Rejecting it here would be the divergence.
+fn _t_process_is_not_validated(): i64 {
+    var r = agnosai_crew_req_from_value(_t_parse(str_from(
+    "{\"name\":\"c\",\"agents\":[],\"tasks\":[],\"process\":\"nonsense\"}")));
+    assert(r != 0, "an unrecognised process name still deserializes");
+    assert(str_eq(agnosai_crew_req_process(r), str_from("nonsense")) == 1,
+    "...and is carried through verbatim, for the handler's catch-all to map");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_rejects_empty_name();
+    _t_rejects_missing_tasks();
+    _t_rejects_missing_agents();
+    _t_rejects_self_dependency();
+    _t_rejects_out_of_range_dependency();
+    _t_rejects_dependency_cycle();
+    _t_accepts_valid_dag();
+    _t_cycle_detector_direct();
+    _t_cycle_memoization_shape();
+    _t_caps();
+    _t_task_req_reader();
+    _t_task_req_rejections();
+    _t_crew_req_reader();
+    _t_crew_req_rejections();
+    _t_process_is_not_validated();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
