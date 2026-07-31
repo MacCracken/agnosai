@@ -1,0 +1,224 @@
+# =========================================================================
+# llm/router — task-complexity model routing.
+#
+# Parity oracle: rust-old/src/llm/router.rs
+#
+# Automatically selects a model tier from a task profile:
+#   * Fast    — summarization, classification, simple tasks
+#   * Capable — code generation, planning, reasoning (medium complexity)
+#   * Premium — research, multi-step workflows, complex reasoning
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * `suggest_quantization` and `estimate_model_memory` are **not ported**.
+#     Both are `#[cfg(feature = "hwaccel")]` and both delegate straight into
+#     ai-hwaccel's `AcceleratorRegistry`. `hwaccel` is not in the default build,
+#     so they sit outside the v2.0.0 parity bar — the same call made for the
+#     hwaccel half of core_resource. They are also the port plan's only
+#     genuinely zero-consumer router functions (verified: referenced nowhere but
+#     their own tests).
+#   * `parse_complexity` matches ASCII-case-insensitively, as the oracle's
+#     `eq_ignore_ascii_case` does.
+# =========================================================================
+
+# Model tier — maps to concrete models per provider.
+enum AgnosaiModelTier {
+    AGNOSAI_TIER_FAST = 0;
+    AGNOSAI_TIER_CAPABLE = 1;
+    AGNOSAI_TIER_PREMIUM = 2;
+}
+
+# What kind of task is being performed.
+enum AgnosaiTaskType {
+    AGNOSAI_TASKTYPE_SUMMARIZE = 0;
+    AGNOSAI_TASKTYPE_CLASSIFY = 1;
+    AGNOSAI_TASKTYPE_CODE = 2;
+    AGNOSAI_TASKTYPE_PLAN = 3;
+    AGNOSAI_TASKTYPE_REASON = 4;
+    AGNOSAI_TASKTYPE_RESEARCH = 5;
+    AGNOSAI_TASKTYPE_MULTI_STEP = 6;
+}
+
+# How complex the task is.
+enum AgnosaiComplexity {
+    AGNOSAI_COMPLEXITY_SIMPLE = 0;
+    AGNOSAI_COMPLEXITY_MEDIUM = 1;
+    AGNOSAI_COMPLEXITY_COMPLEX = 2;
+}
+
+# TaskProfile heap layout — 16 bytes.
+enum AgnosaiTaskProfileOff {
+    AGN_TP_TASK_TYPE = 0;
+    AGN_TP_COMPLEXITY = 8;
+    AGN_TP_SIZE = 16;
+}
+
+# The snake_case wire spelling of a model tier.
+fn agnosai_model_tier_to_wire(tier): i64 {
+    if (tier == AGNOSAI_TIER_CAPABLE) { return str_from("capable"); }
+    if (tier == AGNOSAI_TIER_PREMIUM) { return str_from("premium"); }
+    return str_from("fast");
+}
+
+# A model tier from its wire spelling. Unknown spellings read as Fast.
+fn agnosai_model_tier_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("capable")) == 1) { return AGNOSAI_TIER_CAPABLE; }
+    if (str_eq(s, str_from("premium")) == 1) { return AGNOSAI_TIER_PREMIUM; }
+    return AGNOSAI_TIER_FAST;
+}
+
+# The snake_case wire spelling of a task type. Note `MultiStep` renders
+# `multi_step`, not `multistep`.
+fn agnosai_task_type_to_wire(task_type): i64 {
+    if (task_type == AGNOSAI_TASKTYPE_CLASSIFY) { return str_from("classify"); }
+    if (task_type == AGNOSAI_TASKTYPE_CODE) { return str_from("code"); }
+    if (task_type == AGNOSAI_TASKTYPE_PLAN) { return str_from("plan"); }
+    if (task_type == AGNOSAI_TASKTYPE_REASON) { return str_from("reason"); }
+    if (task_type == AGNOSAI_TASKTYPE_RESEARCH) { return str_from("research"); }
+    if (task_type == AGNOSAI_TASKTYPE_MULTI_STEP) { return str_from("multi_step"); }
+    return str_from("summarize");
+}
+
+# A task type from its wire spelling. Unknown spellings read as Summarize.
+fn agnosai_task_type_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("classify")) == 1) { return AGNOSAI_TASKTYPE_CLASSIFY; }
+    if (str_eq(s, str_from("code")) == 1) { return AGNOSAI_TASKTYPE_CODE; }
+    if (str_eq(s, str_from("plan")) == 1) { return AGNOSAI_TASKTYPE_PLAN; }
+    if (str_eq(s, str_from("reason")) == 1) { return AGNOSAI_TASKTYPE_REASON; }
+    if (str_eq(s, str_from("research")) == 1) { return AGNOSAI_TASKTYPE_RESEARCH; }
+    if (str_eq(s, str_from("multi_step")) == 1) { return AGNOSAI_TASKTYPE_MULTI_STEP; }
+    return AGNOSAI_TASKTYPE_SUMMARIZE;
+}
+
+# The snake_case wire spelling of a complexity level.
+fn agnosai_complexity_to_wire(complexity): i64 {
+    if (complexity == AGNOSAI_COMPLEXITY_SIMPLE) { return str_from("simple"); }
+    if (complexity == AGNOSAI_COMPLEXITY_COMPLEX) { return str_from("complex"); }
+    return str_from("medium");
+}
+
+# Create a new task profile.
+fn agnosai_task_profile_new(task_type, complexity): i64 {
+    var p = alloc(AGN_TP_SIZE);
+    store64(p + AGN_TP_TASK_TYPE, task_type);
+    store64(p + AGN_TP_COMPLEXITY, complexity);
+    return p;
+}
+
+# The kind of task being performed.
+fn agnosai_task_profile_task_type(p): i64 {
+    return load64(p + AGN_TP_TASK_TYPE);
+}
+
+# How complex the task is.
+fn agnosai_task_profile_complexity(p): i64 {
+    return load64(p + AGN_TP_COMPLEXITY);
+}
+
+# A task profile as a bayan JSON value.
+fn agnosai_task_profile_to_value(p): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("task_type"),
+    bayan_json_v_str_new(agnosai_task_type_to_wire(load64(p + AGN_TP_TASK_TYPE))));
+    bayan_json_v_obj_set(obj, str_from("complexity"),
+    bayan_json_v_str_new(agnosai_complexity_to_wire(load64(p + AGN_TP_COMPLEXITY))));
+    return obj;
+}
+
+# Emit the debug trace the oracle's `tracing::debug!` carries. Guarded on the
+# live level so the formatting cost is only paid when it would be emitted.
+fn _agnosai_router_log(task_type, complexity, tier): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, agnosai_task_type_to_wire(task_type));
+    str_builder_add_cstr(sb, "/");
+    str_builder_add(sb, agnosai_complexity_to_wire(complexity));
+    str_builder_add_cstr(sb, " -> ");
+    str_builder_add(sb, agnosai_model_tier_to_wire(tier));
+    var line = str_builder_build(sb);
+    sakshi_log_kv(SK_DEBUG, "model tier selected", 19, "route", 5, str_data(line), str_len(line));
+    return 0;
+}
+
+# Select the appropriate model tier for a task profile.
+#
+# The routing matrix, held exactly to the oracle's:
+#
+#   | TaskType    | Simple  | Medium  | Complex |
+#   |-------------|---------|---------|---------|
+#   | Summarize   | Fast    | Fast    | Capable |
+#   | Classify    | Fast    | Fast    | Capable |
+#   | Code        | Capable | Capable | Premium |
+#   | Plan        | Capable | Capable | Premium |
+#   | Reason      | Capable | Capable | Premium |
+#   | Research    | Capable | Premium | Premium |
+#   | MultiStep   | Capable | Premium | Premium |
+fn agnosai_route(profile): i64 {
+    var task_type = load64(profile + AGN_TP_TASK_TYPE);
+    var complexity = load64(profile + AGN_TP_COMPLEXITY);
+    var tier = AGNOSAI_TIER_CAPABLE;
+
+    if (task_type == AGNOSAI_TASKTYPE_SUMMARIZE || task_type == AGNOSAI_TASKTYPE_CLASSIFY) {
+        # Light tasks stay on the fast tier unless complex.
+        if (complexity == AGNOSAI_COMPLEXITY_COMPLEX) {
+            tier = AGNOSAI_TIER_CAPABLE;
+        } else {
+            tier = AGNOSAI_TIER_FAST;
+        }
+    } elif (task_type == AGNOSAI_TASKTYPE_RESEARCH || task_type == AGNOSAI_TASKTYPE_MULTI_STEP) {
+        # Research and multi-step escalate earlier — premium from Medium up.
+        if (complexity == AGNOSAI_COMPLEXITY_SIMPLE) {
+            tier = AGNOSAI_TIER_CAPABLE;
+        } else {
+            tier = AGNOSAI_TIER_PREMIUM;
+        }
+    } else {
+        # Code / Plan / Reason need at least capable; complex goes premium.
+        if (complexity == AGNOSAI_COMPLEXITY_COMPLEX) {
+            tier = AGNOSAI_TIER_PREMIUM;
+        } else {
+            tier = AGNOSAI_TIER_CAPABLE;
+        }
+    }
+
+    _agnosai_router_log(task_type, complexity, tier);
+    return tier;
+}
+
+# Map a model tier to a default model identifier.
+#
+# These are the defaults when no explicit `llm_model` is set on the agent; the
+# hoosh server resolves them to whichever provider is configured.
+fn agnosai_default_model(tier): i64 {
+    if (tier == AGNOSAI_TIER_CAPABLE) { return str_from("llama3:70b"); }
+    if (tier == AGNOSAI_TIER_PREMIUM) { return str_from("llama3:405b"); }
+    return str_from("llama3");
+}
+
+# Whether two Strs match ignoring ASCII case.
+fn _agnosai_eq_ignore_ascii_case(a: Str, b: Str): i64 {
+    var alen = str_len(a);
+    if (alen != str_len(b)) { return 0; }
+    var ad = str_data(a);
+    var bd = str_data(b);
+    for (var i = 0; i < alen; i = i + 1) {
+        var ca = load8(ad + i);
+        var cb = load8(bd + i);
+        if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+        if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+        if (ca != cb) { return 0; }
+    }
+    return 1;
+}
+
+# Map an agent's complexity string to a complexity level.
+#
+# "low" and "simple" are Simple; "high" and "complex" are Complex; everything
+# else — including unrecognized input — is Medium. Matching ignores ASCII case,
+# as the oracle's `eq_ignore_ascii_case` does.
+fn agnosai_parse_complexity(s: Str): i64 {
+    if (_agnosai_eq_ignore_ascii_case(s, str_from("low")) == 1) { return AGNOSAI_COMPLEXITY_SIMPLE; }
+    if (_agnosai_eq_ignore_ascii_case(s, str_from("simple")) == 1) { return AGNOSAI_COMPLEXITY_SIMPLE; }
+    if (_agnosai_eq_ignore_ascii_case(s, str_from("high")) == 1) { return AGNOSAI_COMPLEXITY_COMPLEX; }
+    if (_agnosai_eq_ignore_ascii_case(s, str_from("complex")) == 1) { return AGNOSAI_COMPLEXITY_COMPLEX; }
+    return AGNOSAI_COMPLEXITY_MEDIUM;
+}

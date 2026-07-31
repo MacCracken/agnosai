@@ -1,0 +1,76 @@
+# =========================================================================
+# orchestrator/mod — task scheduling, agent coordination, and crew execution.
+#
+# Parity oracle: rust-old/src/orchestrator/mod.rs
+#
+# The runtime core: crew lifecycles, priority-tiered task scheduling, DAG
+# dependency resolution, agent scoring for assignment, and pub/sub events.
+#
+# Named `orch` rather than `orchestrator` because Cyrius has one flat namespace
+# and `agnosai_orchestrator_*` is the prefix the hub's own submodule wants; a
+# file and a symbol family with the same stem invite exactly the shadowing this
+# port has already been bitten by.
+#
+# Include order is a dependency constraint (resolution is single-pass). The
+# oracle's own graph, verified by reading each module's `use` lines:
+#   * pure leaves, no crate deps — output_validation, pubsub, multi_tenant, ipc
+#   * core-dependent          — scoring, scheduler, approval, budget,
+#                               plan_cache, memory, durable_state
+#   * sibling-dependent       — hierarchical (→ scoring),
+#                               crew_runner (→ scoring), orchestrator
+#                               (→ crew_runner, scheduler)
+#
+# PORT IN PROGRESS:
+#   * output_validation — done
+#   * pubsub            — done, and with it blocker #4's `agnosai_chan_push_lossy`
+#                          (src/chan_lossy.cyr), which EventBus will reuse
+#   * multi_tenant      — done
+#   * ipc               — done (framing is ours; connection setup reuses majra)
+#   * scoring           — done (personality is the oracle's None arm; bhava defers)
+#   * scheduler         — done
+#   * budget            — done (keeps the oracle's 1/10000 USD unit, not micro-USD)
+#   * approval          — done (oneshot -> cap-1 chan; every failure rejects)
+#   * plan_cache        — done (FNV over the oracle's normalisation; hash algo is not the contract)
+#   * memory            — done
+#   * hierarchical      — done (manager is the fallback, never a candidate)
+#   * durable_state     — done, and NOT on patra: the plan's `durable_state (→ patra)`
+#                          does not survive the oracle's contract (a readable JSON file
+#                          per crew), so it is built on lib/io.cyr. See the module header.
+#   * crew_runner      — done, in three bites: the pure leaves, `execute_task`,
+#                          then the runner and its three process modes.
+#                          `topological_sort` reuses the scheduler's rather than
+#                          being written twice, and `mood_adjusted_temperature`
+#                          waits on bhava — it is unreachable, not merely
+#                          unported, since the ported AgentDefinition has no
+#                          personality field.
+#   * audit             — done. NOT in the oracle's orchestrator/: it was a
+#                          `pub use hoosh::audit::AuditChain`, and the HTTP seam
+#                          cannot carry appends (GET-only endpoint, no metadata
+#                          slot), so agnosai owns a chain. Parity — the Rust
+#                          build already had two separate chain instances.
+#   * orchestrator      — the crew registry and lifecycle; the last M5 module.
+#
+# `crew_runner` and `orchestrator` both reach into `crate::server::sse` for
+# `CrewEvent` / `EventBus`. Those are now pulled forward from M6, the way
+# `server/ssrf` was for M4 — `src/server/sse.cyr`, included by `main.cyr` ahead
+# of this hub along with `src/chan_lossy.cyr`, since both belong to M6's HTTP
+# layer as much as to this one and a second hub must not include them twice.
+# `EventBus`'s fan-out is where port-plan blocker #4 lands: it needs tokio
+# broadcast's **overwrite-oldest** semantics, not a blocking `chan_send`.
+# =========================================================================
+
+include "src/orchestrator/output_validation.cyr"
+include "src/orchestrator/pubsub.cyr"
+include "src/orchestrator/multi_tenant.cyr"
+include "src/orchestrator/ipc.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/budget.cyr"
+include "src/orchestrator/approval.cyr"
+include "src/orchestrator/plan_cache.cyr"
+include "src/orchestrator/memory.cyr"
+include "src/orchestrator/hierarchical.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/orchestrator/durable_state.cyr"
+include "src/orchestrator/crew_runner.cyr"
+include "src/orchestrator/orchestrator.cyr"

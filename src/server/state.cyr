@@ -1,0 +1,152 @@
+# =========================================================================
+# server/state — the shared application state every route handler reads.
+#
+# Parity oracle: rust-old/src/server/state.rs
+#
+# Small file, load-bearing position: **13 of the 18 route entries registered in
+# `server/mod.rs:48-99` take `State<SharedState>`**, so nothing in the routes
+# tier can be written until this exists. Seven of the oracle's eight fields
+# already had a Cyrius counterpart before this bite; the eighth is discussed
+# below.
+#
+# ## `Arc<T>` is a raw pointer here
+#
+# The oracle wraps `tools` and `audit` in `Arc` and the whole struct in
+# `Arc<AppState>`. The port plan settled this: of 52 `Arc<` in the Rust tree, 49
+# are process-lifetime shared-immutable state, which is a raw pointer in a flat
+# address space. `AppState` is built once at startup and outlives every request,
+# so there is nothing to refcount — `SharedState` is just the pointer this
+# module's constructor returns.
+#
+# ## `http_client` has no counterpart, deliberately
+#
+# `reqwest::Client` is a connection-pool handle, and the oracle keeps one so
+# A2A callbacks can share it. agnosai's outbound HTTP goes through
+# `agnosai_guarded_fetch(arena, method, url, headers, opts, timeout_ms)`, which
+# takes a per-request arena and no client object — there is no handle to store.
+# Worth noting how thin the loss is: of the twelve `http_client` references in
+# `rust-old/src/server/`, **eleven are test fixtures** constructing an
+# `AppState`, and the only real consumer is `a2a.rs:153`. If connection pooling
+# is ever wanted, it belongs in `guarded_fetch`, not here.
+#
+# ## `definitions` is a map behind a mutex, for the same reason the registry is
+#
+# The oracle uses `DashMap`, which is lock-free and concurrent. Under
+# `sandhi_server_run_pooled` every worker is a real OS thread, so an unguarded
+# write during a concurrent read would corrupt the table. `tools_registry` set
+# this precedent and this follows it: `map_new_str` behind `mutex_new`, with
+# every access bracketed.
+# =========================================================================
+
+enum AgnosaiAppStateOff {
+    AGN_ST_ORCHESTRATOR = 0;
+    AGN_ST_TOOLS = 8;
+    AGN_ST_AUTH = 16;
+    AGN_ST_EVENTS = 24;
+    AGN_ST_AUDIT = 32;
+    AGN_ST_APPROVAL_GATE = 40;
+    AGN_ST_DEFINITIONS = 48;
+    AGN_ST_DEF_MUTEX = 56;
+    AGN_ST_SIZE = 64;
+}
+
+# Build the shared state from its already-constructed parts.
+#
+# `definitions` starts empty and is created here rather than passed in, matching
+# the oracle's `definitions: dashmap::DashMap::new()` at `main.rs:115` — every
+# other field is handed in fully built, exactly as `main.rs:107-116` does it.
+fn agnosai_app_state_new(orchestrator, tools, auth, events, audit, approval_gate): i64 {
+    var s = alloc(AGN_ST_SIZE);
+    store64(s + AGN_ST_ORCHESTRATOR, orchestrator);
+    store64(s + AGN_ST_TOOLS, tools);
+    store64(s + AGN_ST_AUTH, auth);
+    store64(s + AGN_ST_EVENTS, events);
+    store64(s + AGN_ST_AUDIT, audit);
+    store64(s + AGN_ST_APPROVAL_GATE, approval_gate);
+    store64(s + AGN_ST_DEFINITIONS, map_new_str());
+    store64(s + AGN_ST_DEF_MUTEX, mutex_new());
+    return s;
+}
+
+# The crew orchestrator.
+fn agnosai_app_state_orchestrator(s): i64 {
+    return load64(s + AGN_ST_ORCHESTRATOR);
+}
+
+# The tool registry.
+fn agnosai_app_state_tools(s): i64 {
+    return load64(s + AGN_ST_TOOLS);
+}
+
+# The auth configuration every guarded route checks against.
+fn agnosai_app_state_auth(s): i64 {
+    return load64(s + AGN_ST_AUTH);
+}
+
+# The SSE event bus crew streaming publishes through.
+fn agnosai_app_state_events(s): i64 {
+    return load64(s + AGN_ST_EVENTS);
+}
+
+# The tamper-evident audit chain.
+fn agnosai_app_state_audit(s): i64 {
+    return load64(s + AGN_ST_AUDIT);
+}
+
+# The human-in-the-loop approval gate.
+fn agnosai_app_state_approval_gate(s): i64 {
+    return load64(s + AGN_ST_APPROVAL_GATE);
+}
+
+# --- Agent definitions ---------------------------------------------------
+
+# Store a definition under `key`, replacing any existing one — the oracle's
+# `state.definitions.insert(def.agent_key.clone(), def)` (`agents.rs:30`).
+#
+# The key is cloned, matching that `.clone()`: the caller's Str may be borrowed
+# from a request buffer that does not outlive the handler, while the map entry
+# is process-lifetime.
+fn agnosai_app_state_definition_insert(s, key: Str, def): i64 {
+    mutex_lock(load64(s + AGN_ST_DEF_MUTEX));
+    map_set(load64(s + AGN_ST_DEFINITIONS), str_clone(key), def);
+    mutex_unlock(load64(s + AGN_ST_DEF_MUTEX));
+    return 0;
+}
+
+# Look up a definition by agent key, or 0 when absent.
+fn agnosai_app_state_definition_get(s, key: Str): i64 {
+    mutex_lock(load64(s + AGN_ST_DEF_MUTEX));
+    var d = map_get(load64(s + AGN_ST_DEFINITIONS), key);
+    mutex_unlock(load64(s + AGN_ST_DEF_MUTEX));
+    return d;
+}
+
+# How many definitions are stored.
+fn agnosai_app_state_definition_count(s): i64 {
+    mutex_lock(load64(s + AGN_ST_DEF_MUTEX));
+    var n = vec_len(map_keys(load64(s + AGN_ST_DEFINITIONS)));
+    mutex_unlock(load64(s + AGN_ST_DEF_MUTEX));
+    return n;
+}
+
+# Every stored definition, as a vec — what `GET /api/v1/agents/definitions`
+# serializes (`agents.rs:8-13`).
+#
+# A **snapshot**, taken under the lock and returned unlocked. The oracle's
+# `DashMap::iter()` holds per-shard guards while the caller walks it, which
+# would mean holding this mutex across `serde_json::to_value` on every entry —
+# a lock held across arbitrary serialization work, on the path every worker
+# thread shares. Copying the pointers out first is cheaper and cannot deadlock;
+# the definitions themselves are process-lifetime, so the pointers stay valid.
+fn agnosai_app_state_definitions(s): i64 {
+    mutex_lock(load64(s + AGN_ST_DEF_MUTEX));
+    var m = load64(s + AGN_ST_DEFINITIONS);
+    var keys = map_keys(m);
+    var out = vec_new();
+    var n = vec_len(keys);
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(out, map_get(m, vec_get(keys, i)));
+    }
+    mutex_unlock(load64(s + AGN_ST_DEF_MUTEX));
+    return out;
+}

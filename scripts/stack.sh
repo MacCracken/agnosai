@@ -5,7 +5,7 @@
 # Modelled on thoth/scripts/stack.sh (same helpers, same $STACK_HOME layout) but
 # scoped to what agnosai actually consumes. Today that is **hoosh only**: the
 # port plan makes hoosh a remote HTTP seam rather than a linked crate, so
-# `src/llm_hoosh.cyr` POSTs OpenAI-compatible chat completions at it. daimon and
+# `src/llm/hoosh.cyr` POSTs OpenAI-compatible chat completions at it. daimon and
 # bote enter when agnosai grows tool calling (M4) and its own server (M6) —
 # the hooks are marked TODO below rather than started early.
 #
@@ -30,7 +30,7 @@ HOOSH_DIR="${HOOSH_DIR:-$HOME/Repos/hoosh}"
 AGNOSAI_DIR="${AGNOSAI_DIR:-$HOME/Repos/agnosai}"
 KEY_FILE="${AGNOS_KEY_FILE:-$HOME/.ssh/.api_keys}"
 HOOSH_PORT="${HOOSH_PORT:-8088}"
-# The default_model() Fast tier from src/llm_router.cyr. Override for a
+# The default_model() Fast tier from src/llm/router.cyr. Override for a
 # provider-backed model (e.g. AGNOSAI_MODEL=claude-opus-4-8).
 MODEL="${AGNOSAI_MODEL:-llama3}"
 
@@ -145,7 +145,7 @@ cmd_status() {
 #
 # That distinction is the whole point: a curl POST proves the gateway is up, but
 # only tests/smcyr/llm_live.smcyr exercises `agnosai_hoosh_chat` — the one I/O
-# call in src/llm_hoosh.cyr. Everything else about the seam is unit-tested
+# call in src/llm/hoosh.cyr. Everything else about the seam is unit-tested
 # offline in tests/llm_hoosh.tcyr.
 cmd_check() {
   if ! listening "$HOOSH_PORT"; then err "hoosh is not up on :$HOOSH_PORT — run '$0 up'"; return 1; fi

@@ -21,7 +21,7 @@ note() { printf '  %s\n' "$1"; }
 # `src/`-only sweep is the easy mistake, and `.tcyr` files are two-fifths of the
 # tree by count.
 n=0
-for f in src/*.cyr tests/*.tcyr; do
+for f in $(find src -name "*.cyr" | sort) $(find tests -name "*.tcyr" | sort); do
     [ -e "$f" ] || continue
     n=$((n + 1))
     if ! cyrius fmt "$f" --check >/dev/null 2>&1; then
@@ -36,7 +36,7 @@ echo "fmt: $n files"
 # CHANGELOG, issue, or roadmap entry on the SAME line, or carry `#skip-lint`.
 # The rule is what keeps a deferral from quietly becoming permanent.
 n=0
-for f in src/*.cyr; do
+for f in $(find src -name "*.cyr" | sort); do
     [ -e "$f" ] || continue
     n=$((n + 1))
     out=$(cyrius lint "$f" 2>&1)
@@ -52,7 +52,7 @@ echo "lint: $n files"
 
 # --- doc: every public symbol documented ---------------------------------
 n=0
-for f in src/*.cyr; do
+for f in $(find src -name "*.cyr" | sort); do
     [ -e "$f" ] || continue
     n=$((n + 1))
     if ! out=$(cyrius doc --check "$f" 2>&1); then

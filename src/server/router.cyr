@@ -1,0 +1,390 @@
+# =========================================================================
+# server/router — the route table, path matching, and the auth boundary.
+#
+# Parity oracle: rust-old/src/server/mod.rs
+#
+# **Bite 15a of 2.** This is the router's *decision*: given a method, a path, an
+# `Authorization` header and a body, which handler runs, whether auth gates it
+# first, and what comes back. It touches **no sandhi** and is therefore fully
+# testable — which matters because `mod.rs` has **no `#[cfg(test)]` module at
+# all**, so every routing rule below is covered here for the first time.
+#
+# Bite 15b is the sandhi adapter — `sandhi_server_run_pooled`, the per-worker
+# arena (blocker #3), the `alloc_used()`-flat regression test, and the a2a
+# callback dispatch — tracked in docs/development/state.md and
+# CHANGELOG [Unreleased].
+#
+# ## The auth boundary is the security-critical part of this file
+#
+# `mod.rs:79-88` nests everything under `/api/v1` plus the bare `/mcp` inside a
+# `middleware::from_fn(auth_middleware)`, and merges that into a public router
+# carrying `/health`, `/ready` and `/metrics`. So:
+#
+#   * **`/health`, `/ready`, `/metrics` are ALWAYS public** — no auth, even when
+#     auth is enabled. `/metrics` being unauthenticated is worth knowing rather
+#     than discovering: it exposes crew counts, task counts and inference cost.
+#   * **Everything else requires auth when it is enabled**, including `/mcp`,
+#     which is not under `/api/v1` and so is easy to miss when transcribing.
+#
+# A path that matches nothing is a 404 **without** consulting auth, matching
+# axum: the router resolves the route before any layer runs, so an unauthorized
+# request to a nonexistent path is a 404, not a 401. That is an information
+# disclosure the oracle accepts, and the port reproduces it.
+#
+# ## Path parameters
+#
+# axum's `{id}` / `{name}` segments match exactly one non-empty segment and do
+# not span `/`. `_agnosai_route_match` implements that literally, and the
+# extracted value is handed to the handler which validates it — `get_crew`
+# answers 422 for a malformed UUID, not 404, because axum's `Path<Uuid>`
+# extractor runs after routing.
+# =========================================================================
+
+# The oracle's `MAX_BODY_BYTES` (`mod.rs:38`) — 10 MiB.
+var AGNOSAI_MAX_BODY_BYTES = 10485760;
+
+# The oracle's `MAX_CONCURRENT_REQUESTS` (`mod.rs:41`).
+#
+# **sandhi has no `ConcurrencyLimitLayer` analogue.** tower's layer queues
+# requests above the limit rather than rejecting them; sandhi's pooled server
+# bounds concurrency by its worker count instead, which is a different shape —
+# it bounds work in flight but does not queue. Carried as a constant so the
+# transport bite (15b) can size its worker pool against the oracle's intent
+# rather than inventing a number, and so the divergence is stated rather than
+# silently dropped.
+var AGNOSAI_MAX_CONCURRENT_REQUESTS = 100;
+
+# --- Route identifiers ----------------------------------------------------
+#
+# One per entry in the oracle's table. An enum rather than fn pointers because
+# the handlers have different arities — some take state, some take a body, some
+# take a path parameter, some take nothing.
+
+enum AgnosaiRouteId {
+    AGN_ROUTE_NONE = 0;
+    AGN_ROUTE_HEALTH = 1;
+    AGN_ROUTE_READY = 2;
+    AGN_ROUTE_METRICS = 3;
+    AGN_ROUTE_MCP = 4;
+    AGN_ROUTE_CREATE_CREW = 5;
+    AGN_ROUTE_GET_CREW = 6;
+    AGN_ROUTE_CANCEL_CREW = 7;
+    AGN_ROUTE_CREW_STREAM = 8;
+    AGN_ROUTE_A2A_RECEIVE = 9;
+    AGN_ROUTE_A2A_STATUS = 10;
+    AGN_ROUTE_LIST_DEFINITIONS = 11;
+    AGN_ROUTE_CREATE_DEFINITION = 12;
+    AGN_ROUTE_LIST_TOOLS = 13;
+    AGN_ROUTE_REMOVE_TOOL = 14;
+    AGN_ROUTE_LIST_PENDING = 15;
+    AGN_ROUTE_SUBMIT_APPROVAL = 16;
+    AGN_ROUTE_LIST_PRESETS = 17;
+    AGN_ROUTE_CREW_HISTORY = 18;
+    AGN_ROUTE_AGENT_PERFORMANCE = 19;
+}
+
+# HTTP methods the table distinguishes.
+var AGNOSAI_METHOD_GET = 1;
+var AGNOSAI_METHOD_POST = 2;
+var AGNOSAI_METHOD_DELETE = 3;
+
+# A resolved route: which handler, and the path parameter if the pattern had one.
+enum AgnosaiRouteMatchOff {
+    AGN_RM_ID = 0;
+    AGN_RM_PARAM = 8;
+    AGN_RM_METHOD_MISMATCH = 16;
+    AGN_ROUTE_MATCH_SIZE = 24;
+}
+
+# The resolved route, or `AGN_ROUTE_NONE` when nothing matched.
+fn agnosai_route_match_id(m): i64 { return load64(m + AGN_RM_ID); }
+# The captured path parameter, or 0 for a route that takes none.
+fn agnosai_route_match_param(m): i64 { return load64(m + AGN_RM_PARAM); }
+
+# Whether the path matched a known route but the method did not — axum answers
+# **405**, not 404, when a path exists under a different method.
+fn agnosai_route_match_method_mismatch(m): i64 {
+    return load64(m + AGN_RM_METHOD_MISMATCH);
+}
+
+fn _agnosai_rm_new(id, param, mismatch): i64 {
+    var m = alloc(AGN_ROUTE_MATCH_SIZE);
+    store64(m + AGN_RM_ID, id);
+    store64(m + AGN_RM_PARAM, param);
+    store64(m + AGN_RM_METHOD_MISMATCH, mismatch);
+    return m;
+}
+
+# --- Path matching --------------------------------------------------------
+
+# Whether `path` matches `pattern`, a `/`-joined literal where a segment of
+# exactly `*` is a parameter. On a match with a parameter, the captured value is
+# stored through `out_param`.
+#
+# **Allocation-free, and that is the point.** The obvious implementation splits
+# both sides into vecs of Str and compares them — which allocates a fresh vec
+# plus a Str per segment for the *pattern* on every check, and a request that
+# matches nothing walks all 18 patterns. Measured at **4,352 bytes per request**
+# of pure garbage on the no-free global bump, more than the entire `/health`
+# handler costs (720 B). This walks both sides in place instead and allocates
+# only the captured parameter, on the one pattern that matches.
+#
+# A parameter matches exactly one **non-empty** segment and never spans `/`,
+# which is axum's `{id}` behaviour: `/crews//cancel` does not match
+# `/crews/*/cancel`, and `/crews/a/b/cancel` does not either. A trailing slash
+# is a distinct path — `/health/` has an empty final segment and `/health` does
+# not — so the two never match each other.
+fn _agnosai_path_matches(path: Str, pattern, out_param): i64 {
+    var p = str_data(path);
+    var n = str_len(path);
+    store64(out_param, 0);
+
+    # Skip exactly one leading `/` on each side.
+    var pi = 0;
+    if (n > 0 && (load8(p) & 255) == 47) { pi = 1; }
+    var qi = 0;
+    if ((load8(pattern) & 255) == 47) { qi = 1; }
+
+    # `has` is "there is another segment to read", which is NOT the same as
+    # "there are bytes left": after consuming a separator at the end of the
+    # path there is one more, empty, segment.
+    var p_has = 0;
+    if (pi < n) { p_has = 1; }
+    var q_has = 0;
+    if ((load8(pattern + qi) & 255) != 0) { q_has = 1; }
+
+    while (1 == 1) {
+        if (p_has == 0 && q_has == 0) { return 1; }
+        if (p_has == 0 || q_has == 0) { return 0; }
+
+        var pe = pi;
+        while (pe < n && (load8(p + pe) & 255) != 47) { pe = pe + 1; }
+        var qe = qi;
+        while ((load8(pattern + qe) & 255) != 0 && (load8(pattern + qe) & 255) != 47) {
+            qe = qe + 1;
+        }
+        var plen = pe - pi;
+        var qlen = qe - qi;
+
+        if (qlen == 1 && (load8(pattern + qi) & 255) == 42) {
+            if (plen == 0) { return 0; }
+            store64(out_param, str_sub(path, pi, plen));
+        } else {
+            if (plen != qlen) { return 0; }
+            for (var k = 0; k < plen; k = k + 1) {
+                if ((load8(p + pi + k) & 255) != (load8(pattern + qi + k) & 255)) {
+                    return 0;
+                }
+            }
+        }
+
+        if (pe >= n) { p_has = 0; } else { pi = pe + 1; }
+        if ((load8(pattern + qe) & 255) == 0) { q_has = 0; } else { qi = qe + 1; }
+    }
+    return 0;
+}
+
+# Resolve a method and path to a route.
+#
+# The table is the oracle's, in its order. `/api/v1` is written out rather than
+# modelled as a `nest`, because the port has one flat table and nesting is only
+# a way of writing a prefix.
+fn agnosai_route_resolve(method, path: Str): i64 {
+    var param = alloc(8);
+    var seen = 0;
+
+    # Public probes.
+    if (_agnosai_path_matches(path, "/health", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) { return _agnosai_rm_new(AGN_ROUTE_HEALTH, 0, 0); }
+    }
+    if (_agnosai_path_matches(path, "/ready", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) { return _agnosai_rm_new(AGN_ROUTE_READY, 0, 0); }
+    }
+    if (_agnosai_path_matches(path, "/metrics", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) { return _agnosai_rm_new(AGN_ROUTE_METRICS, 0, 0); }
+    }
+
+    # `/mcp` is protected and is NOT under /api/v1 — easy to miss.
+    if (_agnosai_path_matches(path, "/mcp", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_POST) { return _agnosai_rm_new(AGN_ROUTE_MCP, 0, 0); }
+    }
+
+    # /api/v1/*
+    if (_agnosai_path_matches(path, "/api/v1/crews", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_CREATE_CREW, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/crews/*", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_GET_CREW, load64(param), 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/crews/*/cancel", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_CANCEL_CREW, load64(param), 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/crews/*/stream", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_CREW_STREAM, load64(param), 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/a2a/receive", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_A2A_RECEIVE, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/a2a/status", param) == 1) {
+        seen = 1;
+        # POST, not GET — the oracle registers `post(routes::a2a::status)`.
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_A2A_STATUS, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/agents/definitions", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_LIST_DEFINITIONS, 0, 0);
+        }
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_CREATE_DEFINITION, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/tools", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_LIST_TOOLS, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/tools/*", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_DELETE) {
+            return _agnosai_rm_new(AGN_ROUTE_REMOVE_TOOL, load64(param), 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/approvals", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_LIST_PENDING, 0, 0);
+        }
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_SUBMIT_APPROVAL, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/presets", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_LIST_PRESETS, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/dashboard/crews", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_CREW_HISTORY, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/dashboard/agents", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_AGENT_PERFORMANCE, 0, 0);
+        }
+    }
+
+    # Path known, method not — axum answers 405 rather than 404.
+    if (seen == 1) { return _agnosai_rm_new(AGN_ROUTE_NONE, 0, 1); }
+    return _agnosai_rm_new(AGN_ROUTE_NONE, 0, 0);
+}
+
+# --- The auth boundary ----------------------------------------------------
+
+# Whether a resolved route sits behind the auth middleware.
+#
+# The oracle's structure inverted into a predicate: everything under
+# `/api/v1` **plus `/mcp`** is protected; the three probes are not. Written as
+# an explicit allow-list of the *public* routes rather than of the protected
+# ones, so a route added to the table without thought defaults to **protected**
+# — the safe direction.
+fn agnosai_route_needs_auth(id): i64 {
+    if (id == AGN_ROUTE_HEALTH) { return 0; }
+    if (id == AGN_ROUTE_READY) { return 0; }
+    if (id == AGN_ROUTE_METRICS) { return 0; }
+    if (id == AGN_ROUTE_NONE) { return 0; }
+    return 1;
+}
+
+# --- Dispatch -------------------------------------------------------------
+
+# Route and run a request, returning the handler's response.
+#
+# `body` is the raw request body; `auth_header` / `has_auth` are the
+# `Authorization` header as `server_auth` expects them.
+#
+# Order is the oracle's, and each step's status is the one axum produces:
+#   1. **413** if the body exceeds `MAX_BODY_BYTES` — `DefaultBodyLimit` is the
+#      outermost layer, so it fires before routing and therefore before auth.
+#   2. **404** / **405** from routing, which happens *before* any middleware —
+#      so an unauthenticated request to a nonexistent path is 404, not 401.
+#   3. **401** (or 500) from auth, for protected routes only.
+#   4. the handler.
+fn agnosai_route_dispatch(state, method, path: Str, auth_header: Str, has_auth, body: Str): i64 {
+    if (str_len(body) > AGNOSAI_MAX_BODY_BYTES) {
+        return agnosai_route_error(HTTP_PAYLOAD_TOO_LARGE,
+        str_from("request body exceeds the 10 MiB limit"));
+    }
+
+    var m = agnosai_route_resolve(method, path);
+    var id = agnosai_route_match_id(m);
+    if (id == AGN_ROUTE_NONE) {
+        if (agnosai_route_match_method_mismatch(m) == 1) {
+            return agnosai_route_error(HTTP_METHOD_NOT_ALLOWED,
+            str_from("method not allowed"));
+        }
+        return agnosai_route_error(HTTP_NOT_FOUND, str_from("not found"));
+    }
+
+    if (agnosai_route_needs_auth(id) == 1) {
+        var st = agnosai_auth_check(agnosai_app_state_auth(state), has_auth, auth_header);
+        if (st != HTTP_OK) { return agnosai_route_error(st, str_from("unauthorized")); }
+    }
+
+    var param = agnosai_route_match_param(m);
+    if (id == AGN_ROUTE_HEALTH) { return agnosai_route_health(); }
+    if (id == AGN_ROUTE_READY) { return agnosai_route_ready(); }
+    if (id == AGN_ROUTE_METRICS) { return agnosai_route_metrics(); }
+    if (id == AGN_ROUTE_MCP) { return agnosai_route_mcp(state, body); }
+    if (id == AGN_ROUTE_CREATE_CREW) { return agnosai_route_create_crew(state, body); }
+    if (id == AGN_ROUTE_GET_CREW) { return agnosai_route_get_crew(state, param); }
+    if (id == AGN_ROUTE_CANCEL_CREW) { return agnosai_route_cancel_crew(state, param); }
+    if (id == AGN_ROUTE_A2A_RECEIVE) { return agnosai_route_a2a_receive(state, body); }
+    if (id == AGN_ROUTE_A2A_STATUS) { return agnosai_route_a2a_status(); }
+    if (id == AGN_ROUTE_LIST_DEFINITIONS) { return agnosai_route_list_definitions(state); }
+    if (id == AGN_ROUTE_CREATE_DEFINITION) {
+        return agnosai_route_create_definition(state, body);
+    }
+    if (id == AGN_ROUTE_LIST_TOOLS) { return agnosai_route_list_tools(state); }
+    if (id == AGN_ROUTE_REMOVE_TOOL) { return agnosai_route_remove_tool(state, param); }
+    if (id == AGN_ROUTE_LIST_PENDING) { return agnosai_route_list_pending(state); }
+    if (id == AGN_ROUTE_SUBMIT_APPROVAL) { return agnosai_route_submit_approval(state, body); }
+    if (id == AGN_ROUTE_LIST_PRESETS) { return agnosai_route_list_presets(); }
+    if (id == AGN_ROUTE_CREW_HISTORY) { return agnosai_route_crew_history(state); }
+    if (id == AGN_ROUTE_AGENT_PERFORMANCE) { return agnosai_route_agent_performance(state); }
+
+    # `/api/v1/crews/{id}/stream` resolves but has no handler — SSE belongs to
+    # the transport tier (`sse.rs::event_stream`, held back by
+    # `src/server/sse.cyr:9-11`, scheduled in docs/development/state.md and
+    # CHANGELOG [Unreleased]). A 501 rather than a 404 because the route
+    # EXISTS; answering 404 would tell a client the endpoint is not part of the
+    # API, which is a different and wrong statement.
+    return agnosai_route_error(HTTP_NOT_IMPLEMENTED,  #skip-lint: HTTP 501 status code
+    str_from("crew streaming is unavailable in this build"));
+}

@@ -1,0 +1,150 @@
+# =========================================================================
+# server/routes/dashboard — crew history and agent performance summaries.
+#
+# Parity oracle: rust-old/src/server/routes/dashboard.rs
+#
+# ## The read guard does not port, and the difference is visible
+#
+# Both oracle handlers open with `state.orchestrator.state().read().await` and
+# then walk `active_crews.values()` while holding that guard — so they see one
+# consistent snapshot of every crew.
+#
+# Holding the equivalent mutex across the whole walk would stall every worker
+# thread's crew lookups for the duration of a dashboard render, which is the
+# same trade `tools_registry.list` and `server_state`'s definitions snapshot
+# already refused. So `agnosai_orchestrator_crew_ids` takes the id list under
+# the lock and this walks it unlocked, fetching each state as it goes.
+#
+# **The observable consequence**: a crew that is removed between the id snapshot
+# and its fetch is skipped rather than rendered. A crew whose state *changes*
+# mid-walk renders its newer value, where the oracle would have rendered the
+# value as of the guard. Both are dashboard reads of live data that is stale the
+# moment it is serialized, so neither matters — but the port is not pretending
+# to the oracle's consistency, and a reader should know which one they have.
+#
+# ## `{:?}` again, not serde
+#
+# `status: format!("{:?}", c.status)` is the derived `Debug`, so the dashboard
+# emits the **capitalized** variant name — `Completed`, not the `completed` that
+# `agnosai_crew_status_to_wire` produces for every other endpoint. Reproduced
+# because it is wire-visible, and given its own renderer so the two spellings
+# cannot be confused at a call site.
+# =========================================================================
+
+# The `Debug` spelling of a crew status — capitalized variant names.
+#
+# Deliberately NOT `agnosai_crew_status_to_wire`, which is the serde
+# `rename_all = "snake_case"` spelling every other route uses. This one exists
+# only because `dashboard.rs` formats with `{:?}`.
+fn _agnosai_route_status_debug(status): i64 {
+    if (status == AGNOSAI_CREW_RUNNING) { return str_from("Running"); }
+    if (status == AGNOSAI_CREW_COMPLETED) { return str_from("Completed"); }
+    if (status == AGNOSAI_CREW_FAILED) { return str_from("Failed"); }
+    if (status == AGNOSAI_CREW_CANCELLED) { return str_from("Cancelled"); }
+    return str_from("Pending");
+}
+
+# `GET /api/v1/dashboard/crews` — a summary per registered crew.
+#
+# `wall_ms` and `cost_usd` are `map_or(0, ..)` / `map_or(0.0, ..)` over an
+# absent profile, matching the oracle exactly: a crew that has not finished has
+# no profile and reports zeros rather than being omitted.
+#
+# **`cost_usd` is rendered from integer micro-USD**, the representation the port
+# carries end to end (see `server_prometheus`). The oracle's field is an f64 and
+# this is the wire boundary where it becomes one, so the conversion happens here
+# and nowhere earlier.
+fn agnosai_route_crew_history(state): i64 {
+    var o = agnosai_app_state_orchestrator(state);
+    var ids = agnosai_orchestrator_crew_ids(o);
+    var arr = bayan_json_v_arr_new();
+
+    for (var i = 0; i < vec_len(ids); i = i + 1) {
+        var c = agnosai_orchestrator_crew(o, vec_get(ids, i));
+        # Skipped rather than rendered when the crew left between the snapshot
+        # and this fetch — see the module header.
+        if (c != 0) {
+            var obj = bayan_json_v_obj_new();
+            bayan_json_v_obj_set(obj, str_from("crew_id"),
+            bayan_json_v_str_new(agnosai_crew_state_crew_id(c)));
+            bayan_json_v_obj_set(obj, str_from("status"),
+            bayan_json_v_str_new(_agnosai_route_status_debug(agnosai_crew_state_status(c))));
+            bayan_json_v_obj_set(obj, str_from("task_count"),
+            bayan_json_v_int_new(vec_len(agnosai_crew_state_results(c))));
+
+            var prof = agnosai_crew_state_profile(c);
+            var wall = 0;
+            var micro = 0;
+            if (prof != 0) {
+                wall = agnosai_crew_profile_wall_ms(prof);
+                micro = agnosai_crew_profile_cost_micro_usd(prof);
+            }
+            bayan_json_v_obj_set(obj, str_from("wall_ms"), bayan_json_v_int_new(wall));
+            bayan_json_v_obj_set(obj, str_from("cost_usd"),
+            bayan_json_v_float_new(agnosai_micro_usd_to_f64(micro)));
+            bayan_json_v_arr_push(arr, obj);
+        }
+    }
+    return agnosai_route_json(HTTP_OK, arr);
+}
+
+# `GET /api/v1/dashboard/agents` — one summary per distinct agent seen in a
+# crew result, in first-seen order.
+#
+# The oracle builds a `HashSet` of agent keys and pushes only on first insert,
+# so a repeated agent appears once. `name` falls back to the agent key and
+# `role` to the empty string when the metadata does not carry them, and
+# **`tool_count` is hardcoded 0** in the oracle — not derived from anything.
+# Reproduced rather than "fixed": the field is wire-visible and a dashboard
+# consumer reading a real count would be reading something the Rust never sent.
+fn agnosai_route_agent_performance(state): i64 {
+    var o = agnosai_app_state_orchestrator(state);
+    var ids = agnosai_orchestrator_crew_ids(o);
+    var seen = map_new_str();
+    var arr = bayan_json_v_arr_new();
+
+    for (var i = 0; i < vec_len(ids); i = i + 1) {
+        var c = agnosai_orchestrator_crew(o, vec_get(ids, i));
+        if (c != 0) {
+            var results = agnosai_crew_state_results(c);
+            for (var j = 0; j < vec_len(results); j = j + 1) {
+                var meta = agnosai_task_result_metadata(vec_get(results, j));
+                var key = _agnosai_route_meta_str(meta, str_from("agent"));
+                # The oracle's `if let Some(agent_key) = .. && seen.insert(..)`:
+                # no agent key, or one already recorded, contributes nothing.
+                if (str_len(key) > 0 && map_has(seen, key) == 0) {
+                    map_set(seen, str_clone(key), 1);
+                    var obj = bayan_json_v_obj_new();
+                    bayan_json_v_obj_set(obj, str_from("agent_key"),
+                    bayan_json_v_str_new(key));
+
+                    var name = _agnosai_route_meta_str(meta, str_from("agent_name"));
+                    if (str_len(name) == 0) { name = key; }
+                    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(name));
+                    bayan_json_v_obj_set(obj, str_from("role"),
+                    bayan_json_v_str_new(_agnosai_route_meta_str(meta, str_from("agent_role"))));
+                    # Hardcoded 0 in the oracle. See the fn header.
+                    bayan_json_v_obj_set(obj, str_from("tool_count"), bayan_json_v_int_new(0));
+                    bayan_json_v_arr_push(arr, obj);
+                }
+            }
+        }
+    }
+    return agnosai_route_json(HTTP_OK, arr);
+}
+
+# A string member of a result's metadata, or "" — the oracle's
+# `.get(k).and_then(|v| v.as_str())`, where a non-string is the same as absent.
+#
+# **`agnosai_task_result_metadata` is a stdlib Str-keyed `map`, not a bayan
+# JSON object**, mirroring the oracle's `HashMap<String, serde_json::Value>`:
+# the container is a map and only the *values* are JSON. So the lookup is
+# `map_get`, and `bayan_json_v_obj_get` — which is what the shape of the
+# surrounding code invites — silently finds nothing.
+fn _agnosai_route_meta_str(meta, key: Str): Str {
+    if (meta == 0) { return str_from(""); }
+    var v = map_get(meta, key);
+    if (v == 0) { return str_from(""); }
+    if (bayan_json_v_is_str(v) == 0) { return str_from(""); }
+    return bayan_json_v_str(v);
+}

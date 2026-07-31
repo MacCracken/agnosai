@@ -1,0 +1,285 @@
+# =========================================================================
+# tools/agnos — the shared client behind the AGNOS ecosystem tools.
+#
+# Parity oracles: the `shared_client()` / `base_url` scaffolding repeated in
+# rust-old/src/tools/builtin/{synapse,mneme,delta}.rs
+#
+# Those three modules are nine tools with one shape. Each holds a cloned
+# `reqwest::Client` and a `base_url`, formats a path onto it, sends a JSON GET
+# or POST, parses the response as a `Value`, and reports one of two errors:
+# `"<service> request failed: {e}"` or `"failed to parse response: {e}"`. The
+# Rust side factored out only the client, because `OnceLock<Client>` was the
+# only part that had to be shared; everything else was cheap to repeat behind a
+# derive. Repeating it nine times here is not cheap, and this is the third
+# instance, which is the point at which the abstraction is earned rather than
+# guessed at.
+#
+# **These tools do NOT run the SSRF guard, and that is deliberate.** They exist
+# to talk to AGNOS services on loopback — synapse on 8420, mneme on 8400, delta
+# on 8070 — so `agnosai_is_safe_url` would reject every one of their default
+# base URLs. The guard belongs on tools that fetch a URL the *caller* chose
+# (security_audit, remote_registry); here the URL is configuration, and the
+# operator pointing a tool at a host is the authorisation. What the caller does
+# control is the path segments interpolated into the URL, and those are guarded
+# by `agnosai_agnos_segment_ok` exactly where the oracle guards them.
+#
+# **The transport is a function pointer.** `agnosai_agnos_client_new` takes the
+# function that actually performs the exchange, so a test can drive the whole
+# tool — parameter extraction, URL construction, body construction, response
+# handling — against a synthetic responder. The alternative is nine tools whose
+# only tested surface is their schema, since none of these services is running
+# in CI. It is the same seam `load_testing` uses for its request executor and
+# the same reason.
+# =========================================================================
+
+# The oracle's per-service defaults, one `DEFAULT_BASE_URL` each.
+var AGNOSAI_SYNAPSE_BASE_URL = "http://localhost:8420";
+var AGNOSAI_MNEME_BASE_URL = "http://localhost:8400";
+var AGNOSAI_DELTA_BASE_URL = "http://localhost:8070";
+
+# How long an AGNOS service call may take. reqwest's default client — which is
+# what `Client::new()` gives the oracle — applies no timeout at all, so a hung
+# service would hang the agent forever. A bound is the one place this client
+# improves on the oracle unprompted, and 30s is generous enough that inference
+# through synapse still fits.
+var AGNOSAI_AGNOS_TIMEOUT_MS = 30000;
+
+# Response cap. As in security_audit, sandhi's 256 KiB default treats an
+# over-cap response as a hard error rather than a truncation, and a model
+# listing or a note body can exceed it.
+var AGNOSAI_AGNOS_MAX_BYTES = 4194304;
+
+# Scratch arena for one exchange, sized for a full response plus its parse.
+var AGNOSAI_AGNOS_ARENA_BYTES = 5242880;
+
+# The client: a base URL, the service label used in error strings, and the
+# transport.
+enum AgnosaiAgnosOff {
+    AGN_CL_BASE_URL = 0;
+    AGN_CL_SERVICE = 8;
+    AGN_CL_TRANSPORT = 16;
+    AGN_CL_SIZE = 24;
+}
+
+# Create a client. `service` is the label in "<service> request failed";
+# `transport_fp` is `fn(client, method, url: Str, body) -> i64` returning a
+# parsed JSON value, or 0 for a transport failure.
+fn agnosai_agnos_client_new(base_url: Str, service: Str, transport_fp): i64 {
+    var c = alloc(AGN_CL_SIZE);
+    store64(c + AGN_CL_BASE_URL, base_url);
+    store64(c + AGN_CL_SERVICE, service);
+    store64(c + AGN_CL_TRANSPORT, transport_fp);
+    return c;
+}
+
+# The client's base URL.
+fn agnosai_agnos_base_url(c): i64 {
+    return load64(c + AGN_CL_BASE_URL);
+}
+
+# The service label used in error messages.
+fn agnosai_agnos_service(c): i64 {
+    return load64(c + AGN_CL_SERVICE);
+}
+
+# The client's transport function pointer.
+fn agnosai_agnos_transport(c): i64 {
+    return load64(c + AGN_CL_TRANSPORT);
+}
+
+# Whether a caller-supplied value is safe to interpolate into a URL path.
+#
+# The oracle's guard, character for character: `val.contains('/') ||
+# val.contains("..")`. mneme applies it to `note_id`, delta to `owner`, `repo`
+# and `pipeline_id`. It is a path-traversal guard, not an encoder — a segment
+# that passes is inserted raw, exactly as the oracle inserts it.
+#
+# The empty string passes here because it passes in the oracle. It produces a
+# double slash in the URL and a 404 from the service, which is the oracle's
+# behaviour and not this function's problem to improve on.
+fn agnosai_agnos_segment_ok(v: Str): i64 {
+    if (str_contains(v, str_from("/")) == 1) { return 0; }
+    if (str_contains(v, str_from("..")) == 1) { return 0; }
+    return 1;
+}
+
+# The oracle's "<name> contains invalid characters" rejection.
+fn agnosai_agnos_segment_err(name: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, name);
+    str_builder_add_cstr(sb, " contains invalid characters");
+    return agnosai_tool_output_err(str_builder_build(sb));
+}
+
+# Append one byte percent-encoded, uppercase hex.
+fn _agnosai_agnos_pct_byte(sb, b): i64 {
+    var hex = "0123456789ABCDEF";
+    str_builder_add_byte(sb, 37);
+    str_builder_add_byte(sb, load8(hex + ((b >> 4) & 15)));
+    str_builder_add_byte(sb, load8(hex + (b & 15)));
+    return 0;
+}
+
+# Append a value in `application/x-www-form-urlencoded` form.
+#
+# This is what reqwest's `.query(&[(k, v)])` does — it serialises through
+# `serde_urlencoded`, which is the URL standard's form serialiser: ASCII
+# alphanumerics and `*`, `-`, `.`, `_` pass through, a space becomes `+`, and
+# everything else becomes `%XX` in uppercase hex. The stdlib has no
+# percent-encoder, so it is written out here rather than approximated — getting
+# it wrong would send a query the service silently mis-parses.
+fn agnosai_agnos_form_encode(sb, v: Str): i64 {
+    var d = str_data(v);
+    var n = str_len(v);
+    for (var i = 0; i < n; i = i + 1) {
+        var b = load8(d + i) & 255;
+        if (b >= 48 && b <= 57) { str_builder_add_byte(sb, b); }
+        elif (b >= 65 && b <= 90) { str_builder_add_byte(sb, b); }
+        elif (b >= 97 && b <= 122) { str_builder_add_byte(sb, b); }
+        elif (b == 42 || b == 45 || b == 46 || b == 95) { str_builder_add_byte(sb, b); }
+        elif (b == 32) { str_builder_add_byte(sb, 43); }
+        else { _agnosai_agnos_pct_byte(sb, b); }
+    }
+    return 0;
+}
+
+# Join the client's base URL with a path, producing the oracle's
+# `format!("{}{}", base_url, path)`.
+fn agnosai_agnos_url(c, path: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, agnosai_agnos_base_url(c));
+    str_builder_add(sb, path);
+    return str_builder_build(sb);
+}
+
+# The oracle's "<service> request failed: <detail>".
+#
+# The oracle interpolates reqwest's own `{e}`, which names the underlying I/O
+# condition. sandhi's equivalent is `sandhi_http_err_message`, threaded through
+# by the live transport; a synthetic transport passes 0 and the message stops
+# at the colon-free form.
+fn agnosai_agnos_request_err(c, detail): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, agnosai_agnos_service(c));
+    str_builder_add_cstr(sb, " request failed");
+    if (detail != 0) {
+        str_builder_add_cstr(sb, ": ");
+        str_builder_add_cstr(sb, detail);
+    }
+    return agnosai_tool_output_err(str_builder_build(sb));
+}
+
+# The oracle's "failed to parse response: <detail>".
+#
+# In the oracle this is a distinct arm — the request succeeded and the body was
+# not JSON. The live transport preserves that distinction by returning a
+# sentinel rather than folding it into a transport failure, because "the service
+# answered with something that is not JSON" and "the service did not answer" are
+# different operational problems.
+fn agnosai_agnos_parse_err(detail): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "failed to parse response");
+    if (detail != 0) {
+        str_builder_add_cstr(sb, ": ");
+        str_builder_add_cstr(sb, detail);
+    }
+    return agnosai_tool_output_err(str_builder_build(sb));
+}
+
+# Returned by a transport when the exchange succeeded but the body would not
+# parse as JSON — the oracle's `Err(e)` from `resp.json::<Value>()`.
+var AGNOSAI_AGNOS_BAD_JSON = 0 - 1;
+
+# Perform an exchange through the client's transport and turn the result into a
+# ToolOutput, applying the oracle's two error arms.
+#
+# `method` is a C string verb, `path` is appended to the base URL, and `body` is
+# a bayan JSON value or 0. On success the parsed response is handed to
+# `shape_fp` — `fn(value) -> value` — which is where a tool that reshapes the
+# response (only `synapse_infer` does) puts that logic. Pass 0 to return the
+# response unchanged, which is what seven of the nine tools do.
+fn agnosai_agnos_call(c, method, path: Str, body, shape_fp): i64 {
+    var url = agnosai_agnos_url(c, path);
+    var data = callptr(agnosai_agnos_transport(c), c, method, url, body);
+    if (data == 0) { return agnosai_agnos_request_err(c, _agnosai_agnos_last_detail()); }
+    if (data == AGNOSAI_AGNOS_BAD_JSON) { return agnosai_agnos_parse_err(0); }
+    if (shape_fp == 0) { return agnosai_tool_output_ok(data); }
+    return agnosai_tool_output_ok(callptr(shape_fp, data));
+}
+
+# The live transport's error detail for the most recent failure, or 0.
+#
+# A thread-local would be the right home for this; Cyrius has `thread_local`,
+# but these tools run one exchange per call on the calling thread and the value
+# is consumed immediately after the call that sets it, so a plain global is
+# sufficient and honest. It is reset on entry to every exchange so a stale
+# message can never be attributed to a later failure.
+var _AGNOSAI_AGNOS_DETAIL = 0;
+
+# Read the detail recorded by the last live exchange.
+fn _agnosai_agnos_last_detail(): i64 {
+    return _AGNOSAI_AGNOS_DETAIL;
+}
+
+# The live transport: one sandhi exchange against an AGNOS service.
+#
+# Redirects are **not** followed. The oracle inherits reqwest's follow-by-default
+# here too, but an AGNOS service answering a redirect is a misconfiguration
+# rather than a route, and following one would take a loopback-scoped tool
+# somewhere it was never pointed — the same reasoning as ADR 007, reaching the
+# opposite conclusion because there is no legitimate redirect to preserve.
+fn agnosai_agnos_http_transport(c, method, url: Str, body): i64 {
+    _AGNOSAI_AGNOS_DETAIL = 0;
+
+    var arena = arena_allocator(AGNOSAI_AGNOS_ARENA_BYTES);
+    if (arena == 0) { return 0; }
+
+    var opts = sandhi_http_options_new_a(arena);
+    if (opts == 0) {
+        reset_via(arena);
+        return 0;
+    }
+    sandhi_http_options_total_ms(opts, AGNOSAI_AGNOS_TIMEOUT_MS);
+    sandhi_http_options_max_response_bytes(opts, AGNOSAI_AGNOS_MAX_BYTES);
+    sandhi_http_options_tls_policy(opts, SANDHI_TLS_POLICY_DEFAULT);
+
+    var headers = sandhi_headers_new_a(arena);
+    var payload = 0;
+    var payload_len = 0;
+    if (body != 0) {
+        sandhi_headers_add_a(arena, headers, "Content-Type", "application/json");
+        var encoded = bayan_json_v_build(body);
+        payload = str_data(encoded);
+        payload_len = str_len(encoded);
+    }
+
+    var r = sandhi_http_request_auto_a(arena, method, str_cstr(url), headers, payload, payload_len,
+    opts);
+    if (r == 0) {
+        reset_via(arena);
+        return 0;
+    }
+    if (sandhi_http_err_kind(r) != SANDHI_OK) {
+        # Copied out before the arena goes: the message lives in it. sandhi
+        # returns 0 when it has no message to give, and an unresolvable host is
+        # exactly that case — so the null check is the common path, not the
+        # defensive one.
+        var msg = sandhi_http_err_message(r);
+        if (msg != 0) { _AGNOSAI_AGNOS_DETAIL = str_cstr(str_clone(str_from(msg))); }
+        reset_via(arena);
+        return 0;
+    }
+
+    # bayan parses into the default allocator, so the value outlives the arena.
+    var body_len = sandhi_http_body_len(r);
+    var data = 0;
+    if (body_len > 0) { data = bayan_json_v_parse_buf(sandhi_http_body(r), body_len); }
+    reset_via(arena);
+    if (data == 0) { return AGNOSAI_AGNOS_BAD_JSON; }
+    return data;
+}
+
+# A client pointed at an AGNOS service over real HTTP.
+fn agnosai_agnos_client(base_url: Str, service: Str): i64 {
+    return agnosai_agnos_client_new(base_url, service, &agnosai_agnos_http_transport);
+}

@@ -1,0 +1,150 @@
+# =========================================================================
+# server/routes/mod — the routes-tier hub: the response vocabulary every handler
+# speaks, plus the shared request-validation helpers.
+#
+# Parity oracle: rust-old/src/server/routes/mod.rs (a pure `pub mod` list) and
+# the axum return types the handlers use.
+#
+# ## Handlers are `fn(state, inputs) -> response`, not transport callbacks
+#
+# The oracle's handlers are `async fn(State<SharedState>, Json<T>) -> impl
+# IntoResponse`, and its tests drive them through `app.oneshot(..)`, which is
+# why **43 of M6's remaining oracle tests are `#[tokio::test]`**. Almost none of
+# them is async because the *logic* is: it is async because `oneshot` is.
+#
+# Writing each handler as a pure function of the state and the already-parsed
+# inputs makes that whole tier synchronously testable before any sandhi adapter
+# exists, and leaves the transport bite a thin translation layer rather than a
+# rewrite. `server_auth` proved the shape — all ten of its oracle
+# `#[tokio::test]`s ported as ordinary assertions.
+#
+# ## Nothing here allocates in an arena yet, and that is temporary
+#
+# `bayan_json_v_*` builds on the no-free global bump and threads no allocator.
+# Every handler that parses a request body therefore grows the heap per request
+# until blocker #3's per-worker arena lands with the router bite. `server_auth`
+# has the same exposure and closed the *unauthenticated* half by verifying
+# before parsing; the authenticated half is the router's to close. Each route
+# suite should assert an `alloc_used()` bound the way
+# `server_auth.tcyr::_t_jwt_preauth_allocation_is_bounded` does.
+# =========================================================================
+
+# The agnosai version `/ready` reports — the oracle's `env!("CARGO_PKG_VERSION")`.
+#
+# **Must track the root `VERSION` file**, which is the source of truth and which
+# `cyrius.cyml` interpolates. Cyrius has no compile-time env interpolation, so
+# this is the one place the number is duplicated; CLAUDE.md's work-loop version
+# check covers it. It reads 1.1.0 deliberately — the Cyrius line targets 2.0.0
+# but VERSION bumps only once parity lands, so the number always names something
+# that actually shipped.
+var AGNOSAI_VERSION = "1.1.0";
+
+# --- Status codes sandhi does not define -----------------------------------
+#
+# `lib/sandhi.cyr` carries the statuses a server needs to *emit itself*
+# (200/204/400/401/404/405/413/500/501) but not the two this tier returns from
+# handler logic. Defined here rather than patched into sandhi: they are
+# agnosai's route semantics, not a gap in the HTTP layer.
+
+# 201 Created — `POST /api/v1/agents/definitions` on success.
+var AGNOSAI_HTTP_CREATED = 201;
+
+# 422 Unprocessable Entity — syntactically valid JSON that is not the type the
+# route expects. This is what axum's `Json<T>` extractor answers when serde
+# rejects a body, and three oracle tests assert it directly.
+var AGNOSAI_HTTP_UNPROCESSABLE = 422;
+
+# --- Response --------------------------------------------------------------
+
+enum AgnosaiRouteRespOff {
+    AGN_RR_STATUS = 0;
+    AGN_RR_BODY = 8;
+    AGN_RR_IS_TEXT = 16;
+    AGN_ROUTE_RESP_SIZE = 24;
+}
+
+# A handler's answer: an HTTP status plus a JSON body.
+#
+# Cyrius has no tuples, so the `(status, json)` shape the tier is written
+# against is this 24-byte struct. `body` is a `bayan_json_v` value.
+fn agnosai_route_json(status, body): i64 {
+    var r = alloc(AGN_ROUTE_RESP_SIZE);
+    store64(r + AGN_RR_STATUS, status);
+    store64(r + AGN_RR_BODY, body);
+    store64(r + AGN_RR_IS_TEXT, 0);
+    return r;
+}
+
+# A handler's answer when the body is **not** JSON — `/metrics` is the only one,
+# since Prometheus text exposition is its own content type. The oracle expresses
+# this by returning `String` instead of `Json<Value>`.
+fn agnosai_route_text(status, body: Str): i64 {
+    var r = alloc(AGN_ROUTE_RESP_SIZE);
+    store64(r + AGN_RR_STATUS, status);
+    store64(r + AGN_RR_BODY, body);
+    store64(r + AGN_RR_IS_TEXT, 1);
+    return r;
+}
+
+# The HTTP status this response carries.
+fn agnosai_route_status(r): i64 {
+    return load64(r + AGN_RR_STATUS);
+}
+
+# The body — a `bayan_json_v` value, or a `Str` when `agnosai_route_is_text`.
+fn agnosai_route_body(r): i64 {
+    return load64(r + AGN_RR_BODY);
+}
+
+# Whether the body is preformatted text rather than a JSON value.
+fn agnosai_route_is_text(r): i64 {
+    return load64(r + AGN_RR_IS_TEXT);
+}
+
+# The oracle's error shape, which every failing handler returns:
+# `Json(json!({"error": "..."}))` alongside a status.
+fn agnosai_route_error(status, message: Str): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("error"), bayan_json_v_str_new(message));
+    return agnosai_route_json(status, obj);
+}
+
+# --- Request validation ----------------------------------------------------
+
+# Whether `obj` contains only keys drawn from `allowed` (a vec of Str).
+#
+# This is `#[serde(deny_unknown_fields)]`, which four request types carry —
+# `routes/crews.rs:14` (TaskRequest), `:32` (CrewRunRequest), `a2a.rs:34`
+# (A2ARequest) and `approval.rs:12` (ApprovalSubmission). serde enforces it
+# during deserialization; bayan has no equivalent, so without this the port
+# would **accept** request bodies the oracle rejects with 422 — a fail-open
+# divergence, and one no oracle test guards.
+#
+# Written once here rather than four times in the readers, so the four cannot
+# drift apart. Callers pass the same key list they read.
+fn agnosai_route_no_unknown_fields(obj, allowed): i64 {
+    if (bayan_json_v_is_obj(obj) == 0) { return 0; }
+    var n = bayan_json_v_obj_len(obj);
+    var m = vec_len(allowed);
+    for (var i = 0; i < n; i = i + 1) {
+        var k = bayan_json_v_obj_key(obj, i);
+        var ok = 0;
+        for (var j = 0; j < m; j = j + 1) {
+            if (str_eq(k, vec_get(allowed, j)) == 1) { ok = 1; }
+        }
+        if (ok == 0) { return 0; }
+    }
+    return 1;
+}
+
+# Build the allow-list a `deny_unknown_fields` type is validated against.
+# Variadic-free: callers push onto the vec this returns.
+fn agnosai_route_fields(): i64 {
+    return vec_new();
+}
+
+# Add one permitted field name to an allow-list.
+fn agnosai_route_field(allowed, name): i64 {
+    vec_push(allowed, str_from(name));
+    return allowed;
+}

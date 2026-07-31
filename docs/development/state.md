@@ -79,7 +79,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | `orchestrator` ported (M5, Phase 4) | ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
-| `server` ported (M6, Phase 5) | 🟡 **20 of 21 files — only SSE and `main.rs` remain** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and the routes tier is done — `routes/health.rs` + the hub (bite 6), `routes/tools.rs` + `routes/definitions.rs` (bite 7), `routes/agents.rs` (bite 8), `routes/approval.rs` (bite 9), `routes/dashboard.rs` (bite 10), `routes/crews.rs` (bites 11a+11b), `routes/a2a.rs` (bite 12), `routes/mcp.rs` (bite 13), plus `hot_config.rs` and `rate_limit.rs` (bite 14). `server/mod.rs` is complete across bites 15a (routing, auth boundary, path matching) and 15b (the sandhi adapter). Remaining: `sse.rs::event_stream` + `routes/sse.rs` (15c), and `main.rs` (bite 16). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
+| `server` ported (M6, Phase 5) | 🟡 **20 of 21 files — only SSE and `main.rs` remain** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and the routes tier is done — `routes/health.rs` + the hub (bite 6), `routes/tools.rs` + `routes/definitions.rs` (bite 7), `routes/agents.rs` (bite 8), `routes/approval.rs` (bite 9), `routes/dashboard.rs` (bite 10), `routes/crews.rs` (bites 11a+11b), `routes/a2a.rs` (bite 12), `routes/mcp.rs` (bite 13), plus `hot_config.rs` and `rate_limit.rs` (bite 14). `server/mod.rs` is complete across bites 15a (routing, auth boundary, path matching) and 15b (the sandhi adapter). Remaining: `sse.rs::event_stream` + `routes/sse.rs` (15c), and `main.rs` (bite 16). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server/sse.cyr:9-11` for the transport tier |
 | `server/auth` ported whole | ✅ all 10 oracle tests + 123 beyond; six defects found by adversarial review, fixed, and each pinned by a mutation-verified test. Two decided divergences: constant-time compare fixed ([ADR 009](../adr/009-auth-constant-time-secret-compare.md)) and configured `iss`/`aud` required ([ADR 010](../adr/010-jwt-require-configured-iss-aud.md)) |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
@@ -500,7 +500,7 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 
 ### Pick up here
 
-> **`server/auth.rs` is DONE** — both bites. `src/server_auth.cyr`, 133
+> **`server/auth.rs` is DONE** — both bites. `src/server/auth.cyr`, 133
 > assertions (all 10 oracle tests plus 123 beyond), 19/19 fns covered, 7
 > benchmarks. Two divergences decided by the maintainer and recorded as
 > [ADR 009](../adr/009-auth-constant-time-secret-compare.md) and
@@ -534,22 +534,22 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 >    bite. Assert an `alloc_used()` bound in each handler's suite the way
 >    `_t_jwt_preauth_allocation_is_bounded` does.
 >
-> **`state.rs` is DONE** (bite 5) — `src/server_state.cyr`, 31 assertions,
+> **`state.rs` is DONE** (bite 5) — `src/server/state.cyr`, 31 assertions,
 > 11/11 fns covered. `http_client` is dropped with a reason recorded in the
 > module header; `definitions` is a mutex-guarded map, tested with 8 real
 > threads because that is the one property `DashMap` gave the oracle free.
 >
-> **The routes tier is open** (bite 6). `src/server_routes.cyr` carries the
+> **The routes tier is open** (bite 6). `src/server/routes/mod.cyr` carries the
 > response vocabulary and the shared `deny_unknown_fields` guard;
-> `src/server_routes_health.cyr` is `health.rs`. 42 assertions, 12/12 fns.
+> `src/server/routes/health.cyr` is `health.rs`. 42 assertions, 12/12 fns.
 > **Both prerequisites are discharged**: `deny_unknown_fields` is decided and
 > written once (matching the oracle — no ADR needed, since matching is the
 > default and it closes a fail-open gap), and `/metrics` got the decision it
 > needed as [ADR 011](../adr/011-metrics-endpoint-serves-agnosai-metrics.md).
 >
 > **`tools.rs` + `definitions.rs` (bite 7) and `agents.rs` (bite 8) are DONE** —
-> `src/server_routes_tools.cyr` (34 assertions) and
-> `src/server_routes_agents.cyr` (38). Both went past their oracles, which have
+> `src/server/routes/tools.cyr` (34 assertions) and
+> `src/server/routes/agents.cyr` (38). Both went past their oracles, which have
 > no test for `remove_tool`'s 204/404 branch and none for `create_definition`'s
 > success path at all.
 >
@@ -558,7 +558,7 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 > path and an empty list, dashboard tests **only** the two empty cases. The
 > `agnosai_orchestrator_crew_ids` accessor that was owed is added and tested.
 >
-> **`crews.rs` is DONE** — both bites, `src/server_routes_crews.cyr`, **124
+> **`crews.rs` is DONE** — both bites, `src/server/routes/crews.cyr`, **124
 > assertions** against the oracle's 10, 100% covered. The largest file in the
 > routes tier is behind us.
 >
@@ -580,12 +580,12 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 >    whether to mount it is a decision the router bite must make, and the
 >    ~300 JWT-verifies/sec ceiling argues for yes.
 > 2. ~~**`server/mod.rs` routing logic**~~ — ✅ **DONE (bite 15a)**,
->    `src/server_router.cyr`, 90 assertions against an oracle with no test
+>    `src/server/router.cyr`, 90 assertions against an oracle with no test
 >    module. The route table, the auth boundary, path parameters, 404/405/413
 >    layer ordering — all pure, all verified. The auth predicate is written as
 >    an allow-list of the PUBLIC routes, so a new route defaults to protected.
 >
-> 3. ~~**Bite 15b — the sandhi adapter.**~~ — ✅ **DONE**, `src/server_serve.cyr`,
+> 3. ~~**Bite 15b — the sandhi adapter.**~~ — ✅ **DONE**, `src/server/serve.cyr`,
 >    80 assertions. All four items landed together: the per-request arena
 >    (`sandhi_server_options_req_arena`, 64 KiB) with `_a` on every sandhi call,
 >    the allocation measurement, the a2a callback dispatch, and the `rate_limit`
@@ -665,12 +665,12 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 >
 > **Still owed, both small and both flagged rather than done:**
 > 1. **`agnosai_orchestrator_crew_ids(o)`** (~6 lines) in
->    `src/orch_orchestrator.cyr` — `dashboard.rs` needs it and nothing else
+>    `src/orchestrator/orchestrator.cyr` — `dashboard.rs` needs it and nothing else
 >    exposes the crew list. Do it as the first step of that bite.
 > 2. **Wire the metrics producer.** ADR 011 gives `/metrics` agnosai's registry,
 >    but nothing records into it yet, so it renders zeros. The oracle records at
 >    `crew_runner.rs:810` and `:864`; the equivalent
->    `agnosai_metrics_record_*` calls belong in `src/orch_crew_runner.cyr`.
+>    `agnosai_metrics_record_*` calls belong in `src/orchestrator/crew_runner.cyr`.
 >    Deliberately staged — `crew_runner` is finished M5 code and this was an M6
 >    route decision, so widening one to satisfy the other in the same bite would
 >    blur what each milestone verified.
@@ -886,12 +886,12 @@ rate are carried as integers (thousandths of a request/second, parts per
 million) converted to float only at the wire boundary, the same treatment money
 gets.
 
-**`remote_registry.rs` is unblocked** by `src/server_ssrf.cyr`, though its
+**`remote_registry.rs` is unblocked** by `src/server/ssrf.cyr`, though its
 payload path (`.agpkg` ZIP + raw WASM) defers with those formats, so it can only
 deliver a guarded fetch. python_tool / wasm_tool / wasm_loader defer with their
 features.
 
-**`src/server_ssrf.cyr` was pulled forward from M6** because two M4 modules gate
+**`src/server/ssrf.cyr` was pulled forward from M6** because two M4 modules gate
 on `is_safe_url`; stubbing that guard twice would have been worse than porting
 it once. It is hardened past a literal reading of the oracle: the Rust side gets
 octal / hex / short-form / decimal-integer host normalisation free from the

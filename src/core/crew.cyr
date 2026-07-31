@@ -1,0 +1,562 @@
+# =========================================================================
+# core/crew — crew specifications, runtime state and execution profiles.
+#
+# Parity oracle: rust-old/src/core/crew.rs
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * **Every cost field is integer micro-USD**, matching core_resource: the
+#     oracle's `cost_usd: f64` and the two `HashMap<_, f64>` breakdowns become
+#     i64 millionths of a dollar. They still serialize under their original
+#     `*_usd` names as JSON numbers in dollars, so the wire is unchanged.
+#   * The oracle's `skip_serializing_if` markers are honoured exactly, because
+#     they are wire-visible: `profile`, `sandbox_strength` and the two cost maps
+#     are **omitted** when empty/absent, and `cost_usd` is omitted when zero.
+#     That last one also swallowed NaN and infinities in the oracle (`is_zero`
+#     returns true for any non-finite value); integer micro-USD has no such
+#     values, so the guard reduces to `== 0`.
+#   * `HashMap<TaskId, _>` keys become the task's canonical UUID string, which
+#     is what serde emitted for a Uuid map key.
+# =========================================================================
+
+# Lifecycle status of a crew execution.
+enum AgnosaiCrewStatus {
+    AGNOSAI_CREW_PENDING = 0;
+    AGNOSAI_CREW_RUNNING = 1;
+    AGNOSAI_CREW_COMPLETED = 2;
+    AGNOSAI_CREW_FAILED = 3;
+    AGNOSAI_CREW_CANCELLED = 4;
+}
+
+# CrewSpec heap layout — 56 bytes.
+enum AgnosaiCrewSpecOff {
+    AGN_CREW_ID = 0;
+    AGN_CREW_NAME = 8;
+    AGN_CREW_AGENTS = 16;
+    AGN_CREW_TASKS = 24;
+    AGN_CREW_PROCESS = 32;
+    AGN_CREW_METADATA = 40;
+    AGN_CREW_TRUST_LEVEL = 48;
+    AGN_CREW_SIZE = 56;
+}
+
+# CrewState heap layout — 32 bytes.
+enum AgnosaiCrewStateOff {
+    AGN_CSTATE_CREW_ID = 0;
+    AGN_CSTATE_STATUS = 8;
+    AGN_CSTATE_RESULTS = 16;
+    AGN_CSTATE_PROFILE = 24;
+    AGN_CSTATE_SIZE = 32;
+}
+
+# CrewProfile heap layout — 56 bytes.
+enum AgnosaiCrewProfileOff {
+    AGN_PROF_WALL_MS = 0;
+    AGN_PROF_TASK_MS = 8;
+    AGN_PROF_TASK_COUNT = 16;
+    AGN_PROF_COST_MICRO_USD = 24;
+    AGN_PROF_AGENT_COST = 32;
+    AGN_PROF_TASK_COST = 40;
+    AGN_PROF_SANDBOX_STRENGTH = 48;
+    AGN_PROF_SIZE = 56;
+}
+
+# The oracle's `default_trust_level()`.
+fn agnosai_default_trust_level(): i64 {
+    return str_from("basic");
+}
+
+# The snake_case wire spelling of a crew status.
+fn agnosai_crew_status_to_wire(status): i64 {
+    if (status == AGNOSAI_CREW_RUNNING) { return str_from("running"); }
+    if (status == AGNOSAI_CREW_COMPLETED) { return str_from("completed"); }
+    if (status == AGNOSAI_CREW_FAILED) { return str_from("failed"); }
+    if (status == AGNOSAI_CREW_CANCELLED) { return str_from("cancelled"); }
+    return str_from("pending");
+}
+
+# A crew status from its wire spelling. Unknown spellings fall back to the
+# oracle's default, Pending.
+fn agnosai_crew_status_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("running")) == 1) { return AGNOSAI_CREW_RUNNING; }
+    if (str_eq(s, str_from("completed")) == 1) { return AGNOSAI_CREW_COMPLETED; }
+    if (str_eq(s, str_from("failed")) == 1) { return AGNOSAI_CREW_FAILED; }
+    if (str_eq(s, str_from("cancelled")) == 1) { return AGNOSAI_CREW_CANCELLED; }
+    return AGNOSAI_CREW_PENDING;
+}
+
+# Create a new crew spec with the given name and default settings.
+fn agnosai_crew_new(name: Str): i64 {
+    var c = alloc(AGN_CREW_SIZE);
+    store64(c + AGN_CREW_ID, agnosai_uuid_v4_str());
+    store64(c + AGN_CREW_NAME, name);
+    store64(c + AGN_CREW_AGENTS, vec_new());
+    store64(c + AGN_CREW_TASKS, vec_new());
+    store64(c + AGN_CREW_PROCESS, agnosai_process_sequential());
+    store64(c + AGN_CREW_METADATA, map_new_str());
+    store64(c + AGN_CREW_TRUST_LEVEL, agnosai_default_trust_level());
+    return c;
+}
+
+# Set the crew's agent roster (a vec of agent definitions). Returns the crew.
+fn agnosai_crew_with_agents(c, agents): i64 {
+    store64(c + AGN_CREW_AGENTS, agents);
+    return c;
+}
+
+# Set the crew's task list (a vec of tasks). Returns the crew.
+fn agnosai_crew_with_tasks(c, tasks): i64 {
+    store64(c + AGN_CREW_TASKS, tasks);
+    return c;
+}
+
+# Set the crew's execution mode. Returns the crew.
+fn agnosai_crew_with_process(c, process): i64 {
+    store64(c + AGN_CREW_PROCESS, process);
+    return c;
+}
+
+# Set the crew's trust level ("minimal", "basic", "strict"). Returns the crew.
+fn agnosai_crew_with_trust_level(c, level: Str): i64 {
+    store64(c + AGN_CREW_TRUST_LEVEL, level);
+    return c;
+}
+
+# Attach a metadata key-value pair. `value` is a bayan JSON value.
+fn agnosai_crew_with_metadata(c, key: Str, value): i64 {
+    map_set(load64(c + AGN_CREW_METADATA), str_clone(key), value);
+    return c;
+}
+
+# Unique crew identifier.
+fn agnosai_crew_id(c): i64 {
+    return load64(c + AGN_CREW_ID);
+}
+
+# Human-readable crew name.
+fn agnosai_crew_name(c): i64 {
+    return load64(c + AGN_CREW_NAME);
+}
+
+# Vec of agent definitions participating in this crew.
+fn agnosai_crew_agents(c): i64 {
+    return load64(c + AGN_CREW_AGENTS);
+}
+
+# Vec of tasks to be executed by the crew.
+fn agnosai_crew_tasks(c): i64 {
+    return load64(c + AGN_CREW_TASKS);
+}
+
+# The crew's execution mode.
+fn agnosai_crew_process(c): i64 {
+    return load64(c + AGN_CREW_PROCESS);
+}
+
+# Str-keyed map of arbitrary crew metadata.
+fn agnosai_crew_metadata(c): i64 {
+    return load64(c + AGN_CREW_METADATA);
+}
+
+# Trust level for sandbox isolation policy.
+fn agnosai_crew_trust_level(c): i64 {
+    return load64(c + AGN_CREW_TRUST_LEVEL);
+}
+
+# The crew spec as a bayan JSON value, fields in declaration order.
+fn agnosai_crew_to_value(c): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("id"),
+    bayan_json_v_str_new(load64(c + AGN_CREW_ID)));
+    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(c + AGN_CREW_NAME)));
+
+    var agents = load64(c + AGN_CREW_AGENTS);
+    var agents_v = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        bayan_json_v_arr_push(agents_v, agnosai_agent_to_value(vec_get(agents, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("agents"), agents_v);
+
+    var tasks = load64(c + AGN_CREW_TASKS);
+    var tasks_v = bayan_json_v_arr_new();
+    for (var j = 0; j < vec_len(tasks); j = j + 1) {
+        bayan_json_v_arr_push(tasks_v, agnosai_task_to_value(vec_get(tasks, j)));
+    }
+    bayan_json_v_obj_set(obj, str_from("tasks"), tasks_v);
+
+    bayan_json_v_obj_set(obj, str_from("process"), agnosai_process_to_value(load64(c + AGN_CREW_PROCESS)));
+    bayan_json_v_obj_set(obj, str_from("metadata"), _agnosai_map_to_value(load64(c + AGN_CREW_METADATA)));
+    bayan_json_v_obj_set(obj, str_from("trust_level"),
+    bayan_json_v_str_new(load64(c + AGN_CREW_TRUST_LEVEL)));
+    return obj;
+}
+
+# Rebuild a crew spec from a bayan JSON value. Returns 0 when the value is not
+# an object or `id` is missing or malformed; every other field is
+# `#[serde(default)]` or required-with-a-default in the oracle.
+fn agnosai_crew_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var id_v = bayan_json_v_obj_get(v, "id");
+    if (id_v == 0 || bayan_json_v_is_str(id_v) == 0) { return 0; }
+    var id = agnosai_uuid_canonical(bayan_json_v_str(id_v));
+    if (id == 0) { return 0; }
+
+    var name = _agnosai_str_field(v, "name");
+    if (name == 0) { name = str_from(""); }
+
+    var c = agnosai_crew_new(name);
+    store64(c + AGN_CREW_ID, id);
+
+    var av = bayan_json_v_obj_get(v, "agents");
+    if (av != 0 && bayan_json_v_is_arr(av) == 1) {
+        var agents = load64(c + AGN_CREW_AGENTS);
+        for (var i = 0; i < bayan_json_v_arr_len(av); i = i + 1) {
+            var a = agnosai_agent_from_value(bayan_json_v_arr_get(av, i));
+            if (a != 0) { vec_push(agents, a); }
+        }
+    }
+
+    var tv = bayan_json_v_obj_get(v, "tasks");
+    if (tv != 0 && bayan_json_v_is_arr(tv) == 1) {
+        var tasks = load64(c + AGN_CREW_TASKS);
+        for (var j = 0; j < bayan_json_v_arr_len(tv); j = j + 1) {
+            var t = agnosai_task_from_value(bayan_json_v_arr_get(tv, j));
+            if (t != 0) { vec_push(tasks, t); }
+        }
+    }
+
+    var pv = bayan_json_v_obj_get(v, "process");
+    if (pv != 0) { store64(c + AGN_CREW_PROCESS, agnosai_process_from_value(pv)); }
+
+    store64(c + AGN_CREW_METADATA, _agnosai_map_from_value(bayan_json_v_obj_get(v, "metadata")));
+
+    var tl = _agnosai_str_field(v, "trust_level");
+    if (tl != 0) { store64(c + AGN_CREW_TRUST_LEVEL, tl); }
+    return c;
+}
+
+# The crew spec serialized to JSON text.
+fn agnosai_crew_to_json(c): i64 {
+    return bayan_json_v_build(agnosai_crew_to_value(c));
+}
+
+# Parse a crew spec from JSON text. Returns 0 on a parse error or a malformed
+# crew. See core_message.cyr for why this calls `bayan_json_v_parse_buf`.
+fn agnosai_crew_from_json(src: Str): i64 {
+    var v = bayan_json_v_parse_buf(str_data(src), str_len(src));
+    if (v == 0) { return 0; }
+    return agnosai_crew_from_value(v);
+}
+
+# Create an empty execution profile.
+fn agnosai_crew_profile_new(): i64 {
+    var p = alloc(AGN_PROF_SIZE);
+    store64(p + AGN_PROF_WALL_MS, 0);
+    store64(p + AGN_PROF_TASK_MS, map_new_str());
+    store64(p + AGN_PROF_TASK_COUNT, 0);
+    store64(p + AGN_PROF_COST_MICRO_USD, 0);
+    store64(p + AGN_PROF_AGENT_COST, map_new_str());
+    store64(p + AGN_PROF_TASK_COST, map_new_str());
+    store64(p + AGN_PROF_SANDBOX_STRENGTH, AGNOSAI_NO_LIMIT);
+    return p;
+}
+
+# Total wall-clock time in milliseconds.
+fn agnosai_crew_profile_wall_ms(p): i64 {
+    return load64(p + AGN_PROF_WALL_MS);
+}
+
+# Set the total wall-clock time in milliseconds. Returns the profile.
+fn agnosai_crew_profile_with_wall_ms(p, ms): i64 {
+    store64(p + AGN_PROF_WALL_MS, ms);
+    return p;
+}
+
+# Str-keyed map of per-task durations in milliseconds, keyed by task UUID.
+fn agnosai_crew_profile_task_ms(p): i64 {
+    return load64(p + AGN_PROF_TASK_MS);
+}
+
+# Record a task's duration in milliseconds. Returns the profile.
+fn agnosai_crew_profile_record_task_ms(p, task_id, ms): i64 {
+    map_set(load64(p + AGN_PROF_TASK_MS), task_id, ms);
+    return p;
+}
+
+# Number of tasks that ran.
+fn agnosai_crew_profile_task_count(p): i64 {
+    return load64(p + AGN_PROF_TASK_COUNT);
+}
+
+# Set the number of tasks that ran. Returns the profile.
+fn agnosai_crew_profile_with_task_count(p, count): i64 {
+    store64(p + AGN_PROF_TASK_COUNT, count);
+    return p;
+}
+
+# Total estimated inference cost in micro-USD.
+fn agnosai_crew_profile_cost_micro_usd(p): i64 {
+    return load64(p + AGN_PROF_COST_MICRO_USD);
+}
+
+# Set the total estimated inference cost in micro-USD. Returns the profile.
+fn agnosai_crew_profile_with_cost(p, micro_usd): i64 {
+    store64(p + AGN_PROF_COST_MICRO_USD, micro_usd);
+    return p;
+}
+
+# Str-keyed map of per-agent cost in micro-USD, keyed by agent_key.
+fn agnosai_crew_profile_agent_cost(p): i64 {
+    return load64(p + AGN_PROF_AGENT_COST);
+}
+
+# Record an agent's cost in micro-USD. Returns the profile.
+fn agnosai_crew_profile_record_agent_cost(p, agent_key: Str, micro_usd): i64 {
+    map_set(load64(p + AGN_PROF_AGENT_COST), str_clone(agent_key), micro_usd);
+    return p;
+}
+
+# Str-keyed map of per-task cost in micro-USD, keyed by task UUID.
+fn agnosai_crew_profile_task_cost(p): i64 {
+    return load64(p + AGN_PROF_TASK_COST);
+}
+
+# Record a task's cost in micro-USD. Returns the profile.
+fn agnosai_crew_profile_record_task_cost(p, task_id, micro_usd): i64 {
+    map_set(load64(p + AGN_PROF_TASK_COST), task_id, micro_usd);
+    return p;
+}
+
+# Kavach sandbox strength score (0-100), or AGNOSAI_NO_LIMIT when unset.
+fn agnosai_crew_profile_sandbox_strength(p): i64 {
+    return load64(p + AGN_PROF_SANDBOX_STRENGTH);
+}
+
+# Set the kavach sandbox strength score. Returns the profile.
+fn agnosai_crew_profile_with_sandbox_strength(p, strength): i64 {
+    store64(p + AGN_PROF_SANDBOX_STRENGTH, strength);
+    return p;
+}
+
+# Serialize a Str-keyed map of micro-USD amounts as a JSON object of dollar
+# numbers — the shape the oracle's `HashMap<_, f64>` emitted.
+fn _agnosai_cost_map_to_value(m): i64 {
+    var obj = bayan_json_v_obj_new();
+    var keys = map_keys(m);
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var k = vec_get(keys, i);
+        bayan_json_v_obj_set(obj, k, bayan_json_v_float_new(agnosai_micro_usd_to_f64(map_get(m, k))));
+    }
+    return obj;
+}
+
+# Rebuild a Str-keyed map of micro-USD amounts from a JSON object of dollar
+# numbers. Integers and floats are both accepted.
+fn _agnosai_cost_map_from_value(v): i64 {
+    var m = map_new_str();
+    if (v == 0) { return m; }
+    if (bayan_json_v_is_obj(v) == 0) { return m; }
+    for (var i = 0; i < bayan_json_v_obj_len(v); i = i + 1) {
+        var val = bayan_json_v_obj_val(v, i);
+        var micro = 0;
+        if (bayan_json_v_is_float(val) == 1) {
+            micro = agnosai_f64_to_micro_usd(bayan_json_v_float(val));
+        } elif (bayan_json_v_is_int(val) == 1) {
+            micro = bayan_json_v_int(val) * AGNOSAI_MICRO_USD_PER_USD;
+        }
+        map_set(m, str_clone(bayan_json_v_obj_key(v, i)), micro);
+    }
+    return m;
+}
+
+# Serialize a Str-keyed map of plain integers as a JSON object.
+fn _agnosai_int_map_to_value(m): i64 {
+    var obj = bayan_json_v_obj_new();
+    var keys = map_keys(m);
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var k = vec_get(keys, i);
+        bayan_json_v_obj_set(obj, k, bayan_json_v_int_new(map_get(m, k)));
+    }
+    return obj;
+}
+
+# Rebuild a Str-keyed map of plain integers from a JSON object.
+fn _agnosai_int_map_from_value(v): i64 {
+    var m = map_new_str();
+    if (v == 0) { return m; }
+    if (bayan_json_v_is_obj(v) == 0) { return m; }
+    for (var i = 0; i < bayan_json_v_obj_len(v); i = i + 1) {
+        var val = bayan_json_v_obj_val(v, i);
+        if (bayan_json_v_is_int(val) == 1) {
+            map_set(m, str_clone(bayan_json_v_obj_key(v, i)), bayan_json_v_int(val));
+        }
+    }
+    return m;
+}
+
+# The profile as a bayan JSON value.
+#
+# `cost_usd` is omitted when zero and the two cost maps are omitted when empty,
+# matching the oracle's `skip_serializing_if`. Those omissions are wire-visible,
+# so they are held exactly.
+fn agnosai_crew_profile_to_value(p): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("wall_ms"), bayan_json_v_int_new(load64(p + AGN_PROF_WALL_MS)));
+    bayan_json_v_obj_set(obj, str_from("task_ms"), _agnosai_int_map_to_value(load64(p + AGN_PROF_TASK_MS)));
+    bayan_json_v_obj_set(obj, str_from("task_count"),
+    bayan_json_v_int_new(load64(p + AGN_PROF_TASK_COUNT)));
+
+    var cost = load64(p + AGN_PROF_COST_MICRO_USD);
+    if (cost != 0) {
+        bayan_json_v_obj_set(obj, str_from("cost_usd"),
+        bayan_json_v_float_new(agnosai_micro_usd_to_f64(cost)));
+    }
+
+    var agent_cost = load64(p + AGN_PROF_AGENT_COST);
+    if (map_size(agent_cost) > 0) {
+        bayan_json_v_obj_set(obj, str_from("agent_cost_usd"), _agnosai_cost_map_to_value(agent_cost));
+    }
+
+    var task_cost = load64(p + AGN_PROF_TASK_COST);
+    if (map_size(task_cost) > 0) {
+        bayan_json_v_obj_set(obj, str_from("task_cost_usd"), _agnosai_cost_map_to_value(task_cost));
+    }
+
+    var strength = load64(p + AGN_PROF_SANDBOX_STRENGTH);
+    if (strength != AGNOSAI_NO_LIMIT) {
+        bayan_json_v_obj_set(obj, str_from("sandbox_strength"), bayan_json_v_int_new(strength));
+    }
+    return obj;
+}
+
+# Rebuild a profile from a bayan JSON value. Every field is `#[serde(default)]`
+# or plainly present, so a missing one takes its default.
+fn agnosai_crew_profile_from_value(v): i64 {
+    var p = agnosai_crew_profile_new();
+    if (bayan_json_v_is_obj(v) == 0) { return p; }
+    store64(p + AGN_PROF_WALL_MS, _agnosai_int_field(v, "wall_ms", 0));
+    store64(p + AGN_PROF_TASK_MS, _agnosai_int_map_from_value(bayan_json_v_obj_get(v, "task_ms")));
+    store64(p + AGN_PROF_TASK_COUNT, _agnosai_int_field(v, "task_count", 0));
+
+    var cv = bayan_json_v_obj_get(v, "cost_usd");
+    if (cv != 0) {
+        if (bayan_json_v_is_float(cv) == 1) {
+            store64(p + AGN_PROF_COST_MICRO_USD, agnosai_f64_to_micro_usd(bayan_json_v_float(cv)));
+        } elif (bayan_json_v_is_int(cv) == 1) {
+            store64(p + AGN_PROF_COST_MICRO_USD, bayan_json_v_int(cv) * AGNOSAI_MICRO_USD_PER_USD);
+        }
+    }
+
+    store64(p + AGN_PROF_AGENT_COST, _agnosai_cost_map_from_value(bayan_json_v_obj_get(v, "agent_cost_usd")));
+    store64(p + AGN_PROF_TASK_COST, _agnosai_cost_map_from_value(bayan_json_v_obj_get(v, "task_cost_usd")));
+    store64(p + AGN_PROF_SANDBOX_STRENGTH, _agnosai_opt_int_field(v, "sandbox_strength"));
+    return p;
+}
+
+# Create a crew execution state.
+fn agnosai_crew_state_new(crew_id, status): i64 {
+    var s = alloc(AGN_CSTATE_SIZE);
+    store64(s + AGN_CSTATE_CREW_ID, crew_id);
+    store64(s + AGN_CSTATE_STATUS, status);
+    store64(s + AGN_CSTATE_RESULTS, vec_new());
+    store64(s + AGN_CSTATE_PROFILE, 0);
+    return s;
+}
+
+# ID of the crew this state belongs to.
+fn agnosai_crew_state_crew_id(s): i64 {
+    return load64(s + AGN_CSTATE_CREW_ID);
+}
+
+# Current overall status of the crew run.
+fn agnosai_crew_state_status(s): i64 {
+    return load64(s + AGN_CSTATE_STATUS);
+}
+
+# Vec of task results collected so far.
+fn agnosai_crew_state_results(s): i64 {
+    return load64(s + AGN_CSTATE_RESULTS);
+}
+
+# Execution profile, or 0 when unset.
+fn agnosai_crew_state_profile(s): i64 {
+    return load64(s + AGN_CSTATE_PROFILE);
+}
+
+# Attach an execution profile. Returns the state.
+# Set the crew's status. Returns the state.
+#
+# The oracle mutates `crew.status` directly through the registry's write lock;
+# the port needs a setter because `orch_orchestrator`'s `cancel_crew` marks a
+# registered crew Cancelled in place.
+fn agnosai_crew_state_with_status(s, status): i64 {
+    store64(s + AGN_CSTATE_STATUS, status);
+    return s;
+}
+
+# Attach a resource profile to a crew state, returning it for chaining.
+fn agnosai_crew_state_with_profile(s, profile): i64 {
+    store64(s + AGN_CSTATE_PROFILE, profile);
+    return s;
+}
+
+# Append a task result. Returns the state.
+fn agnosai_crew_state_with_result(s, result): i64 {
+    vec_push(load64(s + AGN_CSTATE_RESULTS), result);
+    return s;
+}
+
+# The crew state as a bayan JSON value. `profile` is **omitted** when unset,
+# matching the oracle's `skip_serializing_if = "Option::is_none"`.
+fn agnosai_crew_state_to_value(s): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("crew_id"),
+    bayan_json_v_str_new(load64(s + AGN_CSTATE_CREW_ID)));
+    bayan_json_v_obj_set(obj, str_from("status"),
+    bayan_json_v_str_new(agnosai_crew_status_to_wire(load64(s + AGN_CSTATE_STATUS))));
+
+    var results = load64(s + AGN_CSTATE_RESULTS);
+    var results_v = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        bayan_json_v_arr_push(results_v, agnosai_task_result_to_value(vec_get(results, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("results"), results_v);
+
+    var profile = load64(s + AGN_CSTATE_PROFILE);
+    if (profile != 0) {
+        bayan_json_v_obj_set(obj, str_from("profile"), agnosai_crew_profile_to_value(profile));
+    }
+    return obj;
+}
+
+# Rebuild a crew state from a bayan JSON value. Returns 0 when `crew_id` is
+# missing or malformed.
+fn agnosai_crew_state_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var id_v = bayan_json_v_obj_get(v, "crew_id");
+    if (id_v == 0 || bayan_json_v_is_str(id_v) == 0) { return 0; }
+    var id = agnosai_uuid_canonical(bayan_json_v_str(id_v));
+    if (id == 0) { return 0; }
+
+    var status = AGNOSAI_CREW_PENDING;
+    var sv = bayan_json_v_obj_get(v, "status");
+    if (sv != 0 && bayan_json_v_is_str(sv) == 1) {
+        status = agnosai_crew_status_from_wire(bayan_json_v_str(sv));
+    }
+
+    var s = agnosai_crew_state_new(id, status);
+
+    var rv = bayan_json_v_obj_get(v, "results");
+    if (rv != 0 && bayan_json_v_is_arr(rv) == 1) {
+        var results = load64(s + AGN_CSTATE_RESULTS);
+        for (var i = 0; i < bayan_json_v_arr_len(rv); i = i + 1) {
+            var r = agnosai_task_result_from_value(bayan_json_v_arr_get(rv, i));
+            if (r != 0) { vec_push(results, r); }
+        }
+    }
+
+    var pv = bayan_json_v_obj_get(v, "profile");
+    if (pv != 0 && bayan_json_v_is_obj(pv) == 1) {
+        store64(s + AGN_CSTATE_PROFILE, agnosai_crew_profile_from_value(pv));
+    }
+    return s;
+}

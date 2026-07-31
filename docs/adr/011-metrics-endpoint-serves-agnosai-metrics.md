@@ -25,13 +25,13 @@ writing into the same process-global registry the endpoint reads.
 
 **The Cyrius port reaches hoosh over an HTTP seam** ([ADR 003](003-llm-native-http.md)).
 There is no in-process hoosh, no linked registry, and nothing for
-`llm_metrics::gather()` to map onto. `src/llm_hoosh.cyr:16-21` already records
+`llm_metrics::gather()` to map onto. `src/llm/hoosh.cyr:16-21` already records
 this consequence for the whole family — audit chain, response cache, cost
 tracker, token budget, DLP scanner, rate-limit registry and the metrics registry
 are all hoosh-side under the seam — and notes that every agnosai consumer of them
 lands in M5 or M6. This is that reckoning for the metrics one.
 
-Meanwhile the port already contains `src/server_prometheus.cyr`, a complete port
+Meanwhile the port already contains `src/server/prometheus.cyr`, a complete port
 of `rust-old/src/server/prometheus.rs`: six counters and a Prometheus text
 renderer. In the Rust tree that module is **dead code** — `grep -rn AgnosMetrics
 rust-old/src/` outside its own file returns nothing. It was written and never
@@ -80,7 +80,7 @@ orchestrator should expose.
 **The producer side is not wired yet, and that is the follow-up.** The oracle
 records at `crew_runner.rs:810` and `:864` into hoosh's registry; the equivalent
 calls into `agnosai_metrics_record_*` are a separate bite in
-`src/orch_crew_runner.cyr`. Until then `/metrics` renders a well-formed
+`src/orchestrator/crew_runner.cyr`. Until then `/metrics` renders a well-formed
 exposition of zeros. Deliberately staged: `crew_runner` is finished M5 code and
 this ADR is an M6 route decision, so widening one to satisfy the other in the
 same bite would blur what each milestone verified. Tracked in

@@ -1,0 +1,212 @@
+# =========================================================================
+# orchestrator/memory — multi-turn conversation memory for one agent's task run.
+#
+# Parity oracle: rust-old/src/orchestrator/memory.rs
+#
+# A buffer that accumulates messages within a single task execution, for the
+# cases where an agent needs more than one round trip — tool-use loops,
+# clarification, chain-of-thought refinement — and a strategy for what to drop
+# when it outgrows its budget.
+#
+# The three strategies are the oracle's, and the two trimming ones are less
+# symmetric than their names suggest:
+#
+#   * `Full` never trims, even with `max_messages` set. The cap is inert unless
+#     a trimming strategy is chosen, which is easy to read as a bug and is not.
+#   * `SlidingWindow` drops from the front until the length fits.
+#   * `HeadTail` keeps the **first** message plus the last `max - 1`, on the
+#     theory that message zero carries the task framing. At `max == 1` there is
+#     no room for both, and the oracle's special case keeps the **last** message
+#     rather than the first — so the head is what gets sacrificed, not the tail.
+#
+# Trimming runs on every push, so the buffer is never observed over its cap
+# rather than being trimmed lazily on read.
+# =========================================================================
+
+# Keep everything. `max_messages` is ignored under this strategy.
+var AGNOSAI_MEMORY_FULL = 0;
+
+# Keep the most recent `max_messages`, dropping from the front.
+var AGNOSAI_MEMORY_SLIDING_WINDOW = 1;
+
+# Keep the first message plus the most recent `max_messages - 1`.
+var AGNOSAI_MEMORY_HEAD_TAIL = 2;
+
+# A strategy's wire spelling — `serde(rename_all = "snake_case")`.
+fn agnosai_memory_strategy_to_wire(strategy): i64 {
+    if (strategy == AGNOSAI_MEMORY_SLIDING_WINDOW) { return str_from("sliding_window"); }
+    if (strategy == AGNOSAI_MEMORY_HEAD_TAIL) { return str_from("head_tail"); }
+    return str_from("full");
+}
+
+# A strategy from its wire spelling. Unknown spellings fall back to the
+# `#[default]` variant, `Full`, which is the non-destructive one.
+fn agnosai_memory_strategy_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("sliding_window")) == 1) { return AGNOSAI_MEMORY_SLIDING_WINDOW; }
+    if (str_eq(s, str_from("head_tail")) == 1) { return AGNOSAI_MEMORY_HEAD_TAIL; }
+    return AGNOSAI_MEMORY_FULL;
+}
+
+# ConversationBuffer.
+enum AgnosaiConvBufOff {
+    AGN_CB_MESSAGES = 0;
+    AGN_CB_MAX_MESSAGES = 8;
+    AGN_CB_STRATEGY = 16;
+    AGN_CB_AGENT_ID = 24;
+    AGN_CB_SIZE = 32;
+}
+
+# Create a buffer with an explicit cap and strategy.
+#
+# `max_messages` of 0 means unlimited, which is the oracle's spelling and is why
+# `Full` and "no cap" are separate ideas here.
+fn agnosai_conv_buffer_with_strategy(agent_id: Str, max_messages, strategy): i64 {
+    var b = alloc(AGN_CB_SIZE);
+    store64(b + AGN_CB_MESSAGES, vec_new());
+    store64(b + AGN_CB_MAX_MESSAGES, max_messages);
+    store64(b + AGN_CB_STRATEGY, strategy);
+    store64(b + AGN_CB_AGENT_ID, agent_id);
+    return b;
+}
+
+# Create an unlimited buffer — the oracle's `new`.
+fn agnosai_conv_buffer_new(agent_id: Str): i64 {
+    return agnosai_conv_buffer_with_strategy(agent_id, 0, AGNOSAI_MEMORY_FULL);
+}
+
+# Create a buffer that keeps the most recent `max_messages`.
+fn agnosai_conv_buffer_with_sliding_window(agent_id: Str, max_messages): i64 {
+    return agnosai_conv_buffer_with_strategy(agent_id, max_messages,
+    AGNOSAI_MEMORY_SLIDING_WINDOW);
+}
+
+# Create a buffer that keeps the first message plus the most recent ones.
+fn agnosai_conv_buffer_with_head_tail(agent_id: Str, max_messages): i64 {
+    return agnosai_conv_buffer_with_strategy(agent_id, max_messages, AGNOSAI_MEMORY_HEAD_TAIL);
+}
+
+# The buffer's messages, as a vec. This is the live vec, not a copy — the
+# oracle's `messages()` returns a borrowed slice with the same aliasing.
+fn agnosai_conv_buffer_messages(b): i64 {
+    return load64(b + AGN_CB_MESSAGES);
+}
+
+# The buffer's cap. 0 means unlimited.
+fn agnosai_conv_buffer_max_messages(b): i64 {
+    return load64(b + AGN_CB_MAX_MESSAGES);
+}
+
+# The buffer's eviction strategy.
+fn agnosai_conv_buffer_strategy(b): i64 {
+    return load64(b + AGN_CB_STRATEGY);
+}
+
+# The agent this buffer belongs to.
+fn agnosai_conv_buffer_agent_id(b): i64 {
+    return load64(b + AGN_CB_AGENT_ID);
+}
+
+# How many messages the buffer holds.
+fn agnosai_conv_buffer_len(b): i64 {
+    return vec_len(load64(b + AGN_CB_MESSAGES));
+}
+
+# Whether the buffer holds nothing.
+fn agnosai_conv_buffer_is_empty(b): i64 {
+    if (agnosai_conv_buffer_len(b) == 0) { return 1; }
+    return 0;
+}
+
+# Drop every message.
+fn agnosai_conv_buffer_clear(b): i64 {
+    store64(b + AGN_CB_MESSAGES, vec_new());
+    return 0;
+}
+
+# A copy of the messages, for building an inference request.
+#
+# The oracle's `to_vec` clones so the caller can hold the messages past the
+# buffer's next mutation; this copies the vec for the same reason. The messages
+# themselves are shared, which matches `Message: Clone` being a deep copy of
+# immutable data — nothing mutates a message once pushed.
+fn agnosai_conv_buffer_to_vec(b): i64 {
+    var src = load64(b + AGN_CB_MESSAGES);
+    var out = vec_new();
+    for (var i = 0; i < vec_len(src); i = i + 1) { vec_push(out, vec_get(src, i)); }
+    return out;
+}
+
+# Log an eviction — the oracle's `debug!`.
+fn _agnosai_memory_log(msg, msg_len, agent_id: Str, evicted): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, agent_id);
+    str_builder_add_cstr(sb, " evicted=");
+    str_builder_add_int(sb, evicted);
+    var line = str_builder_build(sb);
+    sakshi_log_kv(SK_DEBUG, msg, msg_len, "agent", 5, str_data(line), str_len(line));
+    return 0;
+}
+
+# Drop `count` messages starting at `start` — the oracle's `Vec::drain`.
+fn _agnosai_memory_drain(messages, start, count): i64 {
+    for (var i = 0; i < count; i = i + 1) { vec_remove(messages, start); }
+    return 0;
+}
+
+# Apply the eviction strategy.
+#
+# A no-op under `Full`, and a no-op for any strategy while the buffer is within
+# its cap. Note the guard is `<=`: a buffer exactly at its cap is not trimmed.
+fn agnosai_conv_buffer_trim(b): i64 {
+    var max = load64(b + AGN_CB_MAX_MESSAGES);
+    var messages = load64(b + AGN_CB_MESSAGES);
+    var n = vec_len(messages);
+    if (max == 0 || n <= max) { return 0; }
+
+    var strategy = load64(b + AGN_CB_STRATEGY);
+    var agent_id = load64(b + AGN_CB_AGENT_ID);
+
+    # Full ignores the cap entirely — the oracle's empty match arm.
+    if (strategy == AGNOSAI_MEMORY_FULL) { return 0; }
+
+    if (strategy == AGNOSAI_MEMORY_SLIDING_WINDOW) {
+        var excess = n - max;
+        _agnosai_memory_log("sliding window: evicting oldest messages", 40, agent_id, excess);
+        _agnosai_memory_drain(messages, 0, excess);
+        return 0;
+    }
+
+    # HeadTail. At max == 1 there is no room for both ends, and the oracle keeps
+    # the LAST message rather than the first — the head is what is sacrificed.
+    if (max == 1) {
+        _agnosai_memory_drain(messages, 0, n - 1);
+        return 0;
+    }
+
+    # Otherwise keep message 0 plus the last `max - 1`, dropping the middle.
+    var keep_tail = max - 1;
+    var remove_end = n - keep_tail;
+    if (remove_end > 1) {
+        _agnosai_memory_log("head-tail: evicting middle messages", 34, agent_id, remove_end - 1);
+        _agnosai_memory_drain(messages, 1, remove_end - 1);
+    }
+    return 0;
+}
+
+# Append a message and apply the strategy.
+fn agnosai_conv_buffer_push(b, message): i64 {
+    vec_push(load64(b + AGN_CB_MESSAGES), message);
+    agnosai_conv_buffer_trim(b);
+    return 0;
+}
+
+# Append a user message.
+fn agnosai_conv_buffer_add_user(b, content: Str): i64 {
+    return agnosai_conv_buffer_push(b, agnosai_chat_message_new(AGNOSAI_ROLE_USER, content));
+}
+
+# Append an assistant message.
+fn agnosai_conv_buffer_add_assistant(b, content: Str): i64 {
+    return agnosai_conv_buffer_push(b, agnosai_chat_message_new(AGNOSAI_ROLE_ASSISTANT, content));
+}

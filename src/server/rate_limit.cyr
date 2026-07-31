@@ -1,0 +1,185 @@
+# =========================================================================
+# server/rate_limit — per-client token-bucket rate limiting.
+#
+# Parity oracle: rust-old/src/server/rate_limit.rs
+#
+# Backed by majra's `ratelimit_*`, which is what the oracle uses too
+# (`majra::ratelimit::RateLimiter`), so this is a thin adapter rather than a
+# reimplementation.
+#
+# ## This module is not mounted, in the oracle or here — and it should be
+#
+# `server/mod.rs:47-99` never installs `rate_limit_middleware`. The port
+# reproduces that (the router bite will not mount it either, absent a decision),
+# but it is worth stating why the file still earns its place: `auth_jwt_verify_ok`
+# measures a **3.3 ms** RSA verify, so a core sustains only ~300 JWT
+# verifies/second, and the `alg` check deliberately sits *after* the signature
+# (see `server_routes_a2a`'s sibling reasoning in `server_auth`) so a malformed
+# token costs the same. That makes an unauthenticated flood a real amplification
+# vector, and a rate limiter the answer to it. Mounting it is a decision for the
+# router bite, recorded in docs/development/state.md.
+#
+# ## `rate` is integer thousandths, not a float
+#
+# The oracle takes `rate: f64` requests/second. majra's `ratelimit_new` takes
+# `rate_x1000` — an integer — and the port carries it that way end to end, the
+# same treatment money and throughput already get. `10.0` requests/second is
+# `10000`. Converting at the boundary rather than carrying an f64 keeps the
+# bucket arithmetic exact.
+# =========================================================================
+
+# The oracle's `eviction_interval: Duration::from_secs(300)`.
+var AGNOSAI_RL_EVICTION_SECS = 300;
+
+# HTTP 429, which `lib/sandhi.cyr` does not define.
+var AGNOSAI_HTTP_TOO_MANY_REQUESTS = 429;
+
+enum AgnosaiRateLimitOff {
+    AGN_RL_LIMITER = 0;
+    AGN_RL_EVICTION_NS = 8;
+    AGN_RATE_LIMIT_SIZE = 16;
+}
+
+# The oracle's `RateLimitState::new(rate, burst)`, with `rate` as integer
+# thousandths of a request per second — so the oracle's `10.0` is `10000`.
+fn agnosai_rate_limit_new(rate_x1000, burst): i64 {
+    var s = alloc(AGN_RATE_LIMIT_SIZE);
+    store64(s + AGN_RL_LIMITER, ratelimit_new(rate_x1000, burst));
+    store64(s + AGN_RL_EVICTION_NS, AGNOSAI_RL_EVICTION_SECS * AGNOSAI_NS_PER_SEC);
+    return s;
+}
+
+# Whether a request from `key` is allowed, consuming a token if so.
+fn agnosai_rate_limit_check(s, key: Str): i64 {
+    return ratelimit_check(load64(s + AGN_RL_LIMITER), key);
+}
+
+# Evict buckets idle longer than the configured interval; returns the count.
+fn agnosai_rate_limit_evict_stale(s): i64 {
+    return ratelimit_evict_stale(load64(s + AGN_RL_LIMITER),
+    load64(s + AGN_RL_EVICTION_NS));
+}
+
+# Total requests allowed since construction.
+fn agnosai_rate_limit_total_allowed(s): i64 {
+    return load64(ratelimit_stats(load64(s + AGN_RL_LIMITER)));
+}
+
+# Total requests rejected since construction.
+fn agnosai_rate_limit_total_rejected(s): i64 {
+    return load64(ratelimit_stats(load64(s + AGN_RL_LIMITER)) + 8);
+}
+
+# How many distinct keys currently hold a bucket.
+fn agnosai_rate_limit_active_keys(s): i64 {
+    return load64(ratelimit_stats(load64(s + AGN_RL_LIMITER)) + 16);
+}
+
+# --- Client key extraction ------------------------------------------------
+
+# The oracle's `extract_client_key`: `X-Forwarded-For`'s **first** entry, then
+# `X-Real-IP`, then the literal `"unknown"`.
+#
+# **`"unknown"` is a single shared bucket for every client that presents
+# neither header**, which is the oracle's behaviour and a real property to
+# understand rather than a placeholder: behind a proxy that sets XFF it never
+# fires, but exposed directly it collapses all traffic into one bucket, so one
+# noisy client can rate-limit everyone. The oracle's comment says as much
+# ("single-bucket for all clients"). Reproduced; changing it is a decision for
+# whoever mounts the middleware.
+#
+# The oracle reads both headers through `to_str()`, so a header carrying a byte
+# outside visible ASCII is treated as absent — the same gate `server_auth`
+# applies to `Authorization`.
+fn agnosai_rate_limit_client_key(xff, has_xff, xri, has_xri): Str {
+    if (has_xff == 1) {
+        if (_agnosai_rl_visible_ascii(xff) == 1) {
+            var first = _agnosai_rl_before_comma(xff);
+            # `s.split(',').next()` always yields at least the empty string, and
+            # the oracle returns it trimmed without checking for emptiness — so
+            # an `X-Forwarded-For: ` header keys the empty-string bucket rather
+            # than falling through to X-Real-IP.
+            return _agnosai_rl_trim(first);
+        }
+    }
+    if (has_xri == 1) {
+        if (_agnosai_rl_visible_ascii(xri) == 1) {
+            return _agnosai_rl_trim(xri);
+        }
+    }
+    return str_from("unknown");
+}
+
+# The part of `s` before the first comma, or all of it.
+fn _agnosai_rl_before_comma(s: Str): Str {
+    var p = str_data(s);
+    var n = str_len(s);
+    for (var i = 0; i < n; i = i + 1) {
+        if ((load8(p + i) & 255) == 44) { return str_sub(s, 0, i); }
+    }
+    return s;
+}
+
+# Rust's `str::trim` — Unicode whitespace, but every byte an HTTP header may
+# legally carry that `trim` would strip is ASCII, so space / tab / CR / LF / FF
+# / VT is the complete set here.
+fn _agnosai_rl_trim(s: Str): Str {
+    var p = str_data(s);
+    var n = str_len(s);
+    var start = 0;
+    while (start < n && _agnosai_rl_is_space(load8(p + start) & 255) == 1) {
+        start = start + 1;
+    }
+    var end = n;
+    while (end > start && _agnosai_rl_is_space(load8(p + end - 1) & 255) == 1) {
+        end = end - 1;
+    }
+    return str_sub(s, start, end - start);
+}
+
+fn _agnosai_rl_is_space(c): i64 {
+    if (c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11) { return 1; }
+    return 0;
+}
+
+# Whether every byte would survive `HeaderValue::to_str()` — printable ASCII
+# plus tab. Third instance of this shape in the tree (`server_auth`,
+# `tools_builtin_security_audit`); the two earlier ones take different argument
+# types, so this is the point at which extracting one is finally worth it — see
+# the note in docs/development/state.md rather than doing it inside this bite.
+fn _agnosai_rl_visible_ascii(s: Str): i64 {
+    var p = str_data(s);
+    var n = str_len(s);
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(p + i) & 255;
+        if (c != 9 && (c < 32 || c > 126)) { return 0; }
+    }
+    return 1;
+}
+
+# --- The middleware -------------------------------------------------------
+
+# The oracle's `rate_limit_middleware`, as a pure decision.
+#
+# Returns `HTTP_OK` to let the request through or **429** to refuse it. The
+# oracle returns a bare `StatusCode::TOO_MANY_REQUESTS` with no body, so the
+# refusal carries nothing to serialize.
+#
+# `s` of 0 is the oracle's "no limiter in extensions" arm — it passes the
+# request through untouched rather than failing closed, because a router that
+# did not install the layer must not start rejecting traffic.
+fn agnosai_rate_limit_check_request(s, key: Str): i64 {
+    if (s == 0) { return HTTP_OK; }
+    if (agnosai_rate_limit_check(s, key) == 0) {
+        _agnosai_rl_warn(key);
+        return AGNOSAI_HTTP_TOO_MANY_REQUESTS;
+    }
+    return HTTP_OK;
+}
+
+fn _agnosai_rl_warn(key: Str): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    sakshi_log_kv(SK_WARN, "rate limit exceeded", 19, "client", 6,
+    str_data(key), str_len(key));
+    return 0;
+}

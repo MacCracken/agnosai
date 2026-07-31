@@ -2,8 +2,8 @@
 
 ## Status: Accepted
 
-Date: 2026-07-28. Applies to `src/tools_builtin_security_audit.cyr`, and to
-`src/tools_remote_registry.cyr` when it lands.
+Date: 2026-07-28. Applies to `src/tools/builtin/security_audit.cyr`, and to
+`src/tools/remote_registry.cyr` when it lands.
 
 ## Context
 
@@ -129,7 +129,7 @@ ever revived, `analyze_cors` and `run_security_audit` need the same treatment.
 ## Related
 
 - [ADR 006](006-cx-tool-sandbox.md) — the tool sandbox story this sits inside.
-- `src/server_ssrf.cyr` — the guard itself, pulled forward from M6, already
+- `src/server/ssrf.cyr` — the guard itself, pulled forward from M6, already
   hardened past the oracle on octal/hex/short-form host spellings for the same
   reason: a bypass in the guard is worth more attention than a bug in the
   thing it guards.

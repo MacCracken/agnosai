@@ -1,0 +1,178 @@
+# =========================================================================
+# server/hot_config — runtime-reloadable configuration.
+#
+# Parity oracle: rust-old/src/server/hot_config.rs
+#
+# ## `ConfigHolder<T>` is monomorphised to `RuntimeConfig`
+#
+# The oracle's holder is generic over `T: Clone + Send + Sync` and its tests
+# instantiate it at `u32`, `String` and `u64` purely to exercise the container.
+# Cyrius has no generics, and the production tree has exactly one instantiation
+# — `RuntimeConfig`. So the holder is monomorphised rather than faked with a
+# void pointer: the three oracle tests that only prove "the box holds what you
+# put in it" port as `RuntimeConfig` round trips, which proves the same thing
+# about the only instantiation that ships.
+#
+# ## `watch::Sender` becomes an atomic pointer swap
+#
+# tokio's `watch` channel is single-writer / many-reader with no reader
+# contention: `borrow()` takes the latest value. Under
+# `sandhi_server_run_pooled` every worker is an OS thread reading this on each
+# request, so the equivalent is an **atomic pointer store**, not a mutex —
+# readers never block, and a reader either sees the old config or the new one,
+# never a torn mix, because a whole `RuntimeConfig` is published by a single
+# 8-byte store of its pointer.
+#
+# The oracle's `receiver()` returns a clonable `watch::Receiver` for tasks that
+# want to *await* a change. Nothing in the tree does — `grep -rn "\.receiver()"
+# rust-old/src/` finds only the one test — so the port exposes the read side as
+# `agnosai_config_holder_get` and does not model change notification. If a
+# consumer ever needs to wake on reload, that is a channel, and it should be
+# added then rather than guessed at now.
+# =========================================================================
+
+# The oracle's `Default for RuntimeConfig` (`hot_config.rs:60-68`).
+var AGNOSAI_CFG_DEFAULT_MAX_CREWS = 10;
+var AGNOSAI_CFG_DEFAULT_TIMEOUT_SECS = 300;
+var AGNOSAI_CFG_DEFAULT_LOG_LEVEL = "agnosai=info";
+
+enum AgnosaiRuntimeConfigOff {
+    AGN_RCFG_MAX_CONCURRENT_CREWS = 0;
+    AGN_RCFG_INFERENCE_TIMEOUT_SECS = 8;
+    AGN_RCFG_AUTH_ENABLED = 16;
+    AGN_RCFG_LOG_LEVEL = 24;
+    AGN_RUNTIME_CFG_SIZE = 32;
+}
+
+# A config with the oracle's defaults. Note `auth_enabled` defaults **false** —
+# the same fail-open posture `AuthConfig::default()` has, and worth reading
+# alongside it.
+fn agnosai_runtime_config_new(): i64 {
+    var c = alloc(AGN_RUNTIME_CFG_SIZE);
+    store64(c + AGN_RCFG_MAX_CONCURRENT_CREWS, AGNOSAI_CFG_DEFAULT_MAX_CREWS);
+    store64(c + AGN_RCFG_INFERENCE_TIMEOUT_SECS, AGNOSAI_CFG_DEFAULT_TIMEOUT_SECS);
+    store64(c + AGN_RCFG_AUTH_ENABLED, 0);
+    store64(c + AGN_RCFG_LOG_LEVEL, str_from(AGNOSAI_CFG_DEFAULT_LOG_LEVEL));
+    return c;
+}
+
+# The crew concurrency ceiling.
+fn agnosai_runtime_config_max_concurrent_crews(c): i64 {
+    return load64(c + AGN_RCFG_MAX_CONCURRENT_CREWS);
+}
+
+# The per-inference timeout, in seconds.
+fn agnosai_runtime_config_inference_timeout_secs(c): i64 {
+    return load64(c + AGN_RCFG_INFERENCE_TIMEOUT_SECS);
+}
+
+# Whether auth is switched on. 1 or 0, never a truthy pointer.
+fn agnosai_runtime_config_auth_enabled(c): i64 {
+    return load64(c + AGN_RCFG_AUTH_ENABLED);
+}
+
+# The sakshi level name this config asks for.
+fn agnosai_runtime_config_log_level(c): Str {
+    return load64(c + AGN_RCFG_LOG_LEVEL);
+}
+
+# Set the crew concurrency ceiling, returning `c` for chaining.
+fn agnosai_runtime_config_with_max_crews(c, n): i64 {
+    store64(c + AGN_RCFG_MAX_CONCURRENT_CREWS, n);
+    return c;
+}
+
+# Set the per-inference timeout, returning `c` for chaining.
+fn agnosai_runtime_config_with_timeout_secs(c, secs): i64 {
+    store64(c + AGN_RCFG_INFERENCE_TIMEOUT_SECS, secs);
+    return c;
+}
+
+# Set the auth flag, returning `c` for chaining.
+fn agnosai_runtime_config_with_auth_enabled(c, enabled): i64 {
+    store64(c + AGN_RCFG_AUTH_ENABLED, enabled);
+    return c;
+}
+
+# Set the sakshi level name, returning `c` for chaining.
+fn agnosai_runtime_config_with_log_level(c, level: Str): i64 {
+    store64(c + AGN_RCFG_LOG_LEVEL, level);
+    return c;
+}
+
+# The oracle's `Serialize` — field order as declared.
+fn agnosai_runtime_config_to_value(c): i64 {
+    var o = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(o, str_from("max_concurrent_crews"),
+    bayan_json_v_int_new(agnosai_runtime_config_max_concurrent_crews(c)));
+    bayan_json_v_obj_set(o, str_from("inference_timeout_secs"),
+    bayan_json_v_int_new(agnosai_runtime_config_inference_timeout_secs(c)));
+    bayan_json_v_obj_set(o, str_from("auth_enabled"),
+    bayan_json_v_bool_new(agnosai_runtime_config_auth_enabled(c)));
+    bayan_json_v_obj_set(o, str_from("log_level"),
+    bayan_json_v_str_new(agnosai_runtime_config_log_level(c)));
+    return o;
+}
+
+# The oracle's `Deserialize`, or 0. **Every field is required** — `RuntimeConfig`
+# carries no `#[serde(default)]`, so `Default` applies only when nothing is
+# deserialized at all. A partial object is a deserialization failure, not a
+# merge with the defaults, which is the tempting misreading.
+fn agnosai_runtime_config_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var mc = bayan_json_v_obj_get(v, "max_concurrent_crews");
+    var it = bayan_json_v_obj_get(v, "inference_timeout_secs");
+    var ae = bayan_json_v_obj_get(v, "auth_enabled");
+    var ll = bayan_json_v_obj_get(v, "log_level");
+    if (mc == 0 || it == 0 || ae == 0 || ll == 0) { return 0; }
+    if (bayan_json_v_is_int(mc) == 0 || bayan_json_v_is_int(it) == 0) { return 0; }
+    if (bayan_json_v_is_bool(ae) == 0 || bayan_json_v_is_str(ll) == 0) { return 0; }
+    # `usize` and `u64` — a negative literal does not deserialize.
+    if (bayan_json_v_int(mc) < 0 || bayan_json_v_int(it) < 0) { return 0; }
+
+    var c = agnosai_runtime_config_new();
+    agnosai_runtime_config_with_max_crews(c, bayan_json_v_int(mc));
+    agnosai_runtime_config_with_timeout_secs(c, bayan_json_v_int(it));
+    agnosai_runtime_config_with_auth_enabled(c, bayan_json_v_bool(ae));
+    agnosai_runtime_config_with_log_level(c, bayan_json_v_str(ll));
+    return c;
+}
+
+# --- ConfigHolder ---------------------------------------------------------
+
+enum AgnosaiConfigHolderOff {
+    AGN_HOLD_CURRENT = 0;
+    AGN_CONFIG_HOLDER_SIZE = 8;
+}
+
+# A holder seeded with `initial` — the oracle's `ConfigHolder::new`.
+fn agnosai_config_holder_new(initial): i64 {
+    var h = alloc(AGN_CONFIG_HOLDER_SIZE);
+    atomic_store(h + AGN_HOLD_CURRENT, initial);
+    return h;
+}
+
+# The current config — the oracle's `get()`, which clones an `Arc`.
+#
+# An **atomic load**, so a reader on a `run_pooled` worker never blocks and
+# never observes a half-published value: the config is swapped by a single
+# pointer store, so a reader sees either the whole old one or the whole new one.
+fn agnosai_config_holder_get(h): i64 {
+    return atomic_load(h + AGN_HOLD_CURRENT);
+}
+
+# Publish a new config — the oracle's `update()`.
+#
+# The oracle discards the send result (`let _ = self.tx.send(..)`), which in
+# tokio can only fail when every receiver is gone; there is no such failure mode
+# here, so this returns nothing to check.
+#
+# **The previous config is not freed.** A reader may still be holding it — that
+# is exactly what the `Arc` in `watch::Sender<Arc<T>>` is for — and the port has
+# no refcount to decide when the last reader is done. Configs are published on
+# operator action, not per request, so the leak is bounded by reload count
+# rather than by traffic.
+fn agnosai_config_holder_update(h, new_config): i64 {
+    atomic_store(h + AGN_HOLD_CURRENT, new_config);
+    return 0;
+}

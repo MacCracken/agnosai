@@ -8,6 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`src/` now mirrors `rust-old/src/`.** 65 of 71 modules moved out of the flat
+  scaffold layout into the oracle's directory shape: `src/server_routes_crews.cyr`
+  → `src/server/routes/crews.cyr`, `src/orch_crew_runner.cyr` →
+  `src/orchestrator/crew_runner.cyr`, and a group's hub → `mod.cyr`. Directories
+  take the oracle's spelling, so `orch_*` lands under `orchestrator/`.
+
+  Nothing forced the flat layout — Cyrius `include` is textual and takes a path,
+  and the cyrius compiler's own tree uses `src/backend/x86/emit.cyr`. The scaffold
+  default had encoded the oracle's directories into filename prefixes, and
+  `CLAUDE.md` then recorded that as if it were a language constraint. It read
+  as one for the whole port. The correctness bar here is "matches what Rust did",
+  judged file-against-file; the tree now shows that correspondence instead of
+  requiring a reviewer to parse prefixes to recover it.
+
+  **Verified by a byte-identical binary** — `sha256` unchanged at
+  `dd151e53…f342a8` before and after. `include` is textual, so the same files in
+  the same order preprocess to the same source; a hash match is proof the include
+  order survived, which is the only way this refactor could have silently broken
+  anything (a wrong order can resolve to a *different but still-compiling* symbol
+  under last-definition-wins). All other gates unchanged: 1386 top-level
+  definitions across 71 files, 57 suites green, coverage 100% (873/873 fns,
+  64/64 files). All 65 are `git mv` renames, so `git log --follow` still works.
+
+  Six files needed a decision rather than the rule, each noted where it lands:
+  `server_router.cyr` + `server_serve.cyr` split the oracle's single
+  `server/mod.rs` (bites 15a/15b), so neither claims `mod.cyr`;
+  `server_routes.cyr` → `routes/mod.cyr`; `tools_builtin_basic.cyr` merges the
+  oracle's `builtin/echo.rs` + `builtin/json_transform.rs`; `core_json.cyr` and
+  `orch_audit.cyr` are port-local with no `rust-old/` counterpart. Port-local
+  support modules (`units`, `order`, `id`, `guarded_fetch`, `chan_lossy`) stay at
+  `src/` root.
+
+  **Anything walking `src/` must now recurse.** `scripts/check-symbols.sh` and
+  `scripts/check-clean.sh` had seven `src/*.cyr` globs that would have matched
+  **nothing** after the move and passed — failing open, the dangerous direction.
+  Both now use `find src -name '*.cyr'` / `glob(recursive=True)`, confirmed by the
+  symbol count reproducing exactly. `cyrius coverage` and `cyrius tests` already
+  recursed (`cyrius/cbt/quality.cyr:83`, `dir_walk_with_prunes`).
+
+  No symbol renames: Cyrius has one flat namespace regardless of directory, so
+  every `agnosai_*` prefix is untouched.
 - **Toolchain pin 6.5.3 → 6.5.4, and sigil 3.12.1 → 3.12.2 with it.** Unlike the
   6.5.3 bump, this one **moves real stdlib source** and needed
   `cyrius lib sync --full`: `cyrius deps` re-layers the git deps but does not
@@ -88,7 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `O_RDONLY`. A path that exists but is unreadable answers 1 under one and 0 under
   the other. agnosai has no `path_exists` call sites, so nothing misbehaves today.
 - **`_agnosai_is_digit` is defined twice in our own source** —
-  `src/server_ssrf.cyr:39` and `src/server_output_filter.cyr:140` — and is the 36th
+  `src/server/ssrf.cyr:39` and `src/server/output_filter.cyr:140` — and is the 36th
   duplicate-fn warning, the only one that is not a dep's. The bodies are
   semantically identical today, so nothing misbehaves, but two copies of a scanner
   that agree by accident is the condition ADR 007 exists to prevent. Documented for
@@ -392,7 +433,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty case**, so it never renders a single crew or agent. Every populated path
   is covered here for the first time.
 
-  Adds `agnosai_orchestrator_crew_ids` (`src/orch_orchestrator.cyr`), the
+  Adds `agnosai_orchestrator_crew_ids` (`src/orchestrator/orchestrator.cyr`), the
   accessor this route needed. **The oracle's read guard does not port**: both
   handlers hold `state.orchestrator.state().read().await` across the whole walk,
   which here would stall every worker's crew lookups for a dashboard render —
@@ -520,7 +561,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agnosai_`-prefixed, so scraping agnosai and hoosh into one Prometheus needs no
   relabeling. **Producer side is a separate bite**: the oracle records at
   `crew_runner.rs:810`/`:864` into hoosh's registry, so until the equivalent
-  calls land in `src/orch_crew_runner.cyr`, `/metrics` renders a well-formed
+  calls land in `src/orchestrator/crew_runner.cyr`, `/metrics` renders a well-formed
   exposition of zeros — which the oracle's own test still accepts, since it
   inspects no metric names.
 
@@ -792,7 +833,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     not, because it walks `chars`. Cyrius Strs are byte slices with no re-encoding step, so
     non-ASCII survives; a test drives a two-byte character through redaction to prove it.
 
-- **tools** (M4, Phase 3, in progress) — `src/tools.cyr` hub plus two submodules:
+- **tools** (M4, Phase 3, in progress) — `src/tools/mod.cyr` hub plus two submodules:
   - **tools_native** — `agnosai_tool_*`: ParameterSchema, ToolSchema, ToolInput, ToolOutput, and
     the tool itself. The oracle's `NativeTool` **trait** becomes a function-pointer vtable
     (schema/execute plus an opaque ctx, dispatched with `callptr`) since Cyrius has no traits,
@@ -909,7 +950,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the parameter's own description says "defaults to main", but the oracle inserts nothing and the
   code is what ships. Guard order is the oracle's array order, so with both `owner` and `repo`
   invalid it is `owner` that is named.
-- **orch** (M5, Phase 4, in progress) — `src/orch.cyr` hub. Two modules so far:
+- **orch** (M5, Phase 4, in progress) — `src/orchestrator/mod.cyr` hub. Two modules so far:
   - **orch_output_validation** — the structured-output check a task's `output_schema` drives, plus
     the retry prompt built from a failure. `ValidationResult` flattens to the port's
     `Option<String>` convention, so **0 means Valid**. The fence extractor reproduces two
@@ -1124,7 +1165,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `X-Hoosh-Cache` response header, surfaced as `agnosai_inference_response_cost_micro_usd`,
     `_provider` and `_cache`.
     **This deletes a planned module.** M5 bite 15b was going to port hoosh's pricing table into
-    `src/llm_pricing.cyr` — 16 rows, per-provider fallbacks and a truncating cost expression copied
+    `src/llm/pricing.cyr` — 16 rows, per-provider fallbacks and a truncating cost expression copied
     verbatim so the numbers would reconcile against `/v1/costs`. A copy of another project's price
     list, guaranteed to drift the first time hoosh changed one. The gateway now reports the figure
     it already computed, so the port reads it instead. Filed as a hoosh issue on 2026-07-29, fixed
@@ -1259,7 +1300,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a standing Phase 0 gate. Rust had `sort_unstable` / `select_nth_unstable`; Cyrius's stdlib
   has neither, and the plan measured an O(n^2) insertion sort over agnosai's 100k-entry
   percentile vector at 52.6 s.
-- **llm** (M3, Phase 2) — **complete**. `src/llm.cyr` hub plus three submodules:
+- **llm** (M3, Phase 2) — **complete**. `src/llm/mod.cyr` hub plus three submodules:
   - **llm_router** — `agnosai_route` / `agnosai_default_model` / `agnosai_parse_complexity`:
     task-complexity model routing over ModelTier, TaskType, Complexity and TaskProfile.
   - **llm_retry** — `agnosai_with_retry` / `agnosai_compute_delay` / `agnosai_is_retryable`:
@@ -1288,7 +1329,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency because **mneme is unusable** — no lib block, no `dist/` bundle, and AGPL-3.0 against
   agnosai's GPL-3.0-only. No mneme text was copied. Verified against the published
   v5(DNS, "www.example.com") vector.
-- **core** (M2, Phase 1) — **complete**. `src/core.cyr` hub plus all six oracle submodules:
+- **core** (M2, Phase 1) — **complete**. `src/core/mod.cyr` hub plus all six oracle submodules:
   - **core_error** — `agnosai_error_*`: all 15 `AgnosaiError` variants with byte-exact `Display`
     parity, including a reimplementation of Rust's `Duration` `Debug` rendering for `Timeout`
     (`30s`, `1.5s`, `100ms`, `1.5µs`, `100ns`).
@@ -1316,7 +1357,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pairing logic is gone. The Rust-era harness is preserved verbatim at
   `rust-old/scripts/bench-history.sh`.
 - **learning** — the first real Cyrius code of the port (M2 beachhead, Phase 1). All five
-  submodules of `rust-old/src/learning/` ported, with `src/learning.cyr` as the hub mirroring
+  submodules of `rust-old/src/learning/` ported, with `src/learning/mod.cyr` as the hub mirroring
   `mod.rs`:
   - **learning_capability** — `agnosai_capability_scorer_*`: confidence scoring over a Str-keyed
     map, with the bounded 64-observation recent window and the 5-observation trend verdict.

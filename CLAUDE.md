@@ -9,7 +9,7 @@
 
 **AgnosAI** (AGNOS + AI) — Provider-agnostic AI orchestration — crews, tasks, tools, agent delegation
 
-- **Type**: Port (Rust → Cyrius). Flat module tree with binary
+- **Type**: Port (Rust → Cyrius). Module tree **mirrors `rust-old/`** — binary
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (toolchain pinned in `cyrius.cyml [package].cyrius`)
 - **Version**: `VERSION` at the project root is the source of truth — do not inline the number here
@@ -26,6 +26,34 @@ The plan of record is
 [`docs/development/cyrius-port-plan.md`](docs/development/cyrius-port-plan.md) —
 read it before starting any bite; it carries the verified blocker status and the
 corrections that must not be re-derived.
+
+### Layout — `src/` mirrors `rust-old/src/`
+
+`rust-old/src/server/routes/crews.rs` → `src/server/routes/crews.cyr`. A group's
+hub is `mod.cyr`, matching the oracle's `mod.rs`. Directories use the oracle's
+spelling (`orchestrator/`, not `orch/`).
+
+Cyrius `include` is textual and takes a path — the cyrius compiler's own tree does
+this (`src/backend/x86/emit.cyr`). There was never a flat-layout constraint; the
+correctness bar is "matches what Rust did", judged file-against-file, so the tree
+has to show that correspondence.
+
+Two things this does **not** change:
+
+- **Symbol prefixes.** Cyrius has ONE flat namespace regardless of directory.
+  `agnosai_*` on every public symbol is unaffected by where the file sits.
+- **Include order.** Resolution is single-pass, callees before callers. Moving a
+  file never reorders `src/main.cyr` — the same files in the same order preprocess
+  to the same source, which is why the reorg was verifiable by a byte-identical
+  binary.
+
+Port-local modules with no oracle counterpart (`units`, `order`, `id`,
+`guarded_fetch`, `chan_lossy`) stay at `src/` root — the directory tree means
+"this mirrors rust-old", and inventing a home for them would dilute that.
+
+Anything walking `src/` must recurse: `find src -name '*.cyr'`, not `src/*.cyr`,
+which now matches **nothing** and fails open. `cyrius coverage` and `cyrius tests`
+already recurse.
 
 ```sh
 cyrius deps                                 # resolve dependencies into lib/

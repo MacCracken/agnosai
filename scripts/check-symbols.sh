@@ -31,7 +31,7 @@ fail=0
 dupes=$(python3 - <<'PY'
 import re, glob, collections
 defs = collections.defaultdict(list)
-for path in sorted(glob.glob("src/*.cyr")):
+for path in sorted(glob.glob("src/**/*.cyr", recursive=True)):
     in_enum = None
     for lineno, line in enumerate(open(path), 1):
         m = re.match(r'^enum\s+(\w+)\s*\{', line)
@@ -72,7 +72,7 @@ fi
 unprefixed=$(python3 - <<'PY'
 import re, glob
 bad = []
-for path in sorted(glob.glob("src/*.cyr")):
+for path in sorted(glob.glob("src/**/*.cyr", recursive=True)):
     in_enum = False
     for lineno, line in enumerate(open(path), 1):
         if re.match(r'^enum\s+\w+\s*\{', line):
@@ -102,7 +102,7 @@ if [ -n "$unprefixed" ]; then
 fi
 
 if [ "$fail" -eq 0 ]; then
-    n=$(grep -hcE '^(fn|var|enum) ' src/*.cyr | awk '{s+=$1} END {print s}')
-    echo "symbol check OK — $n top-level definitions across $(ls src/*.cyr | wc -l) files, no duplicates, all prefixed"
+    n=$(find src -name '*.cyr' -exec grep -hcE '^(fn|var|enum) ' {} + | awk '{s+=$1} END {print s}')
+    echo "symbol check OK — $n top-level definitions across $(find src -name "*.cyr" | wc -l) files, no duplicates, all prefixed"
 fi
 exit "$fail"

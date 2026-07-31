@@ -135,7 +135,7 @@ seam.
   re-runs on **every redirect hop**, where the oracle validates only the URL the
   caller supplied and then lets reqwest follow up to 10 hops unchecked.
 - ✅ **synapse + mneme + delta** — nine tools, 140 assertions, over one shared
-  client in `src/tools_agnos.cyr`. The third instance of an identical HTTP shape
+  client in `src/tools/agnos.cyr`. The third instance of an identical HTTP shape
   is where CLAUDE.md says to extract, and extracting also created the seam: the
   transport is a function pointer, so all nine execute paths are tested without
   a service running, which the oracle's own suites never manage. These are the
@@ -184,6 +184,17 @@ routes/*, router, main. **Gates:** per-worker arena + `_a` variants throughout
 `rsa_pkcs1v15_verify_sha256` + SPKI decoder rather than waiting upstream.
 **Exit:** the 11-route API serves; SSE streams; load-tested with `alloc_used()` asserted flat.
 
+**Status:** 20 of 21 files. Bites 1-15b are done — the routes tier, the router,
+and the sandhi adapter all land. Remaining: **15c (SSE)** and **16 (`main.rs`)**;
+both, plus everything else still owed, are enumerated under
+[Open blockers and owed work](#open-blockers-and-owed-work).
+
+The `alloc_used()`-flat exit criterion is **partly met and cannot be fully met
+here.** Blocker #3's arena makes sandhi's half flat, but bayan threads no
+allocator on parse/build, so the handler half still grows the global bump —
+measured, and owed upstream as B3. The exit bar should read "transport flat,
+handler cost bounded and measured" until that filing lands.
+
 ### M7 — `sandbox`, 77% (Phase 6)
 
 policy (rename to `AgnSandboxPolicy` first), kavach_bridge, exec, process, python,
@@ -214,6 +225,66 @@ globals.
 assembler, loader-JSON, presets, versioning, k8s_crd (which parses **JSON** only —
 the ` ```yaml ` in its doc comment is a doc comment). Defers ZIP container +
 packaging + YAML.
+
+## Open blockers and owed work
+
+**Status as of 2026-07-31, after M6 bite 15b.** Every item below is open. Each is
+self-contained: file paths, measured numbers, and what "done" means, so it can be
+picked up without reading the session that found it. Ordered by what blocks what.
+
+Nothing here is a discovery in progress — this is the complete list. If an item is
+not on it, it is not owed.
+
+### A. Blocks M6 completion
+
+| # | Item | Effort | Notes |
+|---|------|--------|-------|
+| A1 | **Bite 15c — `sse.rs::event_stream` + `routes/sse.rs`** (241 lines) | Large — own session | The last hard bite. Thread-per-connection capacity is a **design decision, not a transcription**: there is no async runtime, so each stream holds a worker from the `run_pooled` pool of 100. Held back at `src/server/sse.cyr:9-11`. Until it lands, `/api/v1/crews/{id}/stream` answers **501** deliberately (`src/server/router.cyr:388`) — not 404, because the route exists and only its handler is missing. |
+| A2 | **Bite 16 — `src/main.cyr` bind** | Small | `getenv` is at `lib/io.cyr:587`. Graceful shutdown needs a raw `rt_sigaction`; **no signal helper exists in `lib/`** — either write one locally or file it upstream. `agnosai_serve(state, addr, port)` is ready and returns 1 on bind failure (tested). |
+
+### B. Owed — flagged in earlier bites, never done
+
+| # | Item | Effort | Notes |
+|---|------|--------|-------|
+| B1 | **Wire the metrics producer** | Small | [ADR 011](../adr/011-metrics-endpoint-serves-agnosai-metrics.md) gave `/metrics` agnosai's own registry, but **nothing records into it** — verified: zero `agnosai_metrics_record*` calls in `src/orchestrator/crew_runner.cyr`. The endpoint renders zeros. The oracle records at `rust-old/.../crew_runner.rs:810` and `:864`. Staged deliberately (M5 code, M6 decision); the staging has now outlived its reason. |
+| B2 | **Decide `[deps.bote]`** | Decision + small | `mcp.rs` was its only intended consumer and builds its own JSON-RPC envelope, so agnosai calls **zero bote symbols** (verified) while carrying ~93 KB / 233 fns in every build. Either drop the dep or find it a job. |
+| B3 | **File the bayan `_a` parse/build ask** | Small | Bite 15b measured the residual and named it; **the filing was never written.** `bayan_json_v_parse_buf` / `_build` thread no allocator and bayan ships no `_a` variants (verified: zero matches for `^fn bayan_json_v_(parse_buf_a|build_a)\(` in `lib/bayan.cyr`). Consequence: the per-request arena covers sandhi's half only — the transport is flat, the handlers are not. Measured handler cost: routing 48 B/request, `/health` 352 B, `/api/v1/tools` 1920 B, all on the no-free global bump. |
+| B4 | **Migrate `src/order.cyr` to the stdlib sort** | Small | `vec_sort_by` / `vec_select_nth` shipped in cyrius 6.5.4, closing agnosai's own filing. Measured head-to-head at 100k: stdlib introsort **3.85× faster** (20.0 ms vs 77.1 ms), quickselect **1.34×** (4.22 ms vs 5.65 ms). No name collision — `src/order.cyr` is fully `agnosai_*`-prefixed. Flagged at the 6.5.4 bump, not taken. |
+
+### C. Upstream — filed and waiting
+
+Nothing here blocks agnosai today; each is a residual agnosai measured and handed off.
+
+| Dep | Open filings |
+|---|---|
+| cyrius | `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md` — ✅ **resolved in 6.5.4** (see B4, consumption still owed). Still open: `2026-07-28-sock-send-result-allocates-per-call.md` (16 B/response, pinned by an exact-bound test in sandhi), `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md`, `2026-07-29-fmt-int-buf-i64-min.md` |
+| sandhi | `backlog` silently ignored by `run_opts`/`run_async`; chunked start hardcodes `" OK"`; **inbound** chunked decoding unsupported (1.9.4 answers 501 — honest, but not support) |
+| bayan | YAML parse into the tagged value tree (`2026-07-16-...`) — gates M10's YAML half, nothing sooner. Plus B3, unfiled. |
+| sigil | `2026-07-30-rsa-verify-uses-secret-exponent-ladder.md` — ✅ **archived upstream**, fixed in sigil's "rsa repairs" commit and contained in the pinned **3.12.2**. See C1 below. |
+
+**C1 — re-resolve deps and re-measure the RS256 verify path.** agnosai pins sigil
+3.12.2, which contains the fix, but the vendored `lib/sigil.cyr` still documents
+`bn_mont_modexp` (the constant-time secret-exponent ladder) as carrying "the live
+RSA verify + sign paths" — so **`cyrius deps` has not been re-run since the fix
+landed.** Everything downstream of the old measurement is therefore unverified:
+the 3.29 ms verify, the ~235× gap against OpenSSL, and the **~300
+JWT-verifies/sec ceiling that was the entire argument for mounting `rate_limit`**.
+Re-resolve, re-measure, then revisit D1.
+
+### D. Decisions deferred to a human
+
+| # | Decision | Where it stands |
+|---|---|---|
+| D1 | **Mount `rate_limit`?** | Ported and tested (bite 14), **not mounted** — matching the oracle, which never installs the middleware. `agnosai_serve_with_rate_limit` is the opt-in path. Mounting it by default is a **wire change**: clients fine today would start seeing 429s at a threshold agnosai chose, not one the oracle documents. The argument for mounting rested on the JWT-verify ceiling — see C1, now unverified. |
+| D2 | **`"personality": null` on the wire** | bhava is a *hard* dep in the oracle, so the default Rust build emits an explicit null. Emitting the literal keeps byte-exact default-build parity; omitting it is the line between "bhava deferred" and "the wire changed." See `cyrius-port-plan.md:274`. |
+
+### E. Known-unreachable code kept for oracle shape
+
+Not defects and not owed — recorded so nobody re-derives them as findings. Each is
+documented in place as unreachable rather than implied to fire: `agents.rs`'s
+serialize skip, the cycle-detector's `== 2` memoization arm, `crews.rs`'s profile
+skip, and `crew_runner.rs`'s personality prompt block (bhava, post-v2 per the
+user decree at line 18 of this file).
 
 ## Carried over from the Rust line
 

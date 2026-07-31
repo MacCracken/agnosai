@@ -1,0 +1,329 @@
+# =========================================================================
+# orchestrator/approval — human-in-the-loop gates for risky task results.
+#
+# Parity oracle: rust-old/src/orchestrator/approval.rs
+#
+# A task whose risk is High — or Medium, when the crew asks for it — suspends
+# after the LLM answers and waits for a person to approve or reject via an HTTP
+# callback. The gate holds one channel per pending task: the crew runner waits on
+# it, the HTTP endpoint sends the decision.
+#
+# **Every failure mode rejects.** A dropped channel, a timeout, a gate at
+# capacity — all of them come back `Rejected`, and the oracle is explicit about
+# it in three separate arms. That is the only safe default for a gate whose
+# purpose is to stop something risky from proceeding unreviewed, and it is worth
+# stating because "no answer" defaulting to "yes" is the classic version of this
+# bug.
+#
+# Two forced shape changes:
+#
+#   * `oneshot::Sender/Receiver` becomes a capacity-1 Cyrius channel. A oneshot
+#     is a one-slot channel, so the depth is exact rather than approximate; what
+#     is lost is the oracle's ability to distinguish "sender dropped" from
+#     "nothing sent yet", since a Cyrius channel has no drop hook. `cancel`
+#     therefore closes the channel, which a waiter observes as a closed read and
+#     turns into the same `Rejected` the oracle's dropped-sender arm produces.
+#   * `tokio::time::timeout` becomes a polling wait. There is no async runtime to
+#     race a sleep against a future, so `agnosai_approval_wait_for_decision`
+#     polls the channel and sleeps between attempts until its deadline. The poll
+#     interval is a tunable rather than a constant because the deadline is
+#     minutes by default and a tight spin would burn a core for the whole window.
+# =========================================================================
+
+# The oracle's `DEFAULT_APPROVAL_TIMEOUT`, five minutes.
+var AGNOSAI_APPROVAL_TIMEOUT_MS = 300000;
+
+# The oracle's `MAX_PENDING_APPROVALS`.
+var AGNOSAI_APPROVAL_MAX_PENDING = 1000;
+
+# How long a waiter sleeps between polls of its channel.
+#
+# The oracle has no equivalent — `tokio::time::timeout` races a sleep against
+# the future and wakes exactly once. 25 ms keeps a decision's observed latency
+# under a frame while costing a few thousand wakeups across a five-minute
+# window, which is nothing next to the human it is waiting for.
+var AGNOSAI_APPROVAL_POLL_MS = 25;
+
+# The reviewer rejected the result — also every failure mode's answer.
+var AGNOSAI_APPROVAL_REJECTED = 0;
+
+# The reviewer approved the result.
+var AGNOSAI_APPROVAL_APPROVED = 1;
+
+# A decision's wire spelling. `serde(rename_all = "snake_case")` on a unit-only
+# enum emits the bare variant name.
+fn agnosai_approval_decision_to_wire(decision): i64 {
+    if (decision == AGNOSAI_APPROVAL_APPROVED) { return str_from("approved"); }
+    return str_from("rejected");
+}
+
+# A decision from its wire spelling. Anything unrecognised is Rejected, which
+# keeps the fail-closed property across a malformed callback body.
+fn agnosai_approval_decision_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("approved")) == 1) { return AGNOSAI_APPROVAL_APPROVED; }
+    return AGNOSAI_APPROVAL_REJECTED;
+}
+
+# Whether a task's risk requires human sign-off.
+#
+# High always does; Medium does when the crew configured it; Low never does.
+fn agnosai_requires_approval(risk, require_medium): i64 {
+    if (risk == AGNOSAI_RISK_HIGH) { return 1; }
+    if (risk == AGNOSAI_RISK_MEDIUM) { return require_medium; }
+    return 0;
+}
+
+# ApprovalRequest — the payload an SSE subscriber sees. Serialize only.
+enum AgnosaiApprovalReqOff {
+    AGN_AR_TASK_ID = 0;
+    AGN_AR_OUTPUT = 8;
+    AGN_AR_RISK = 16;
+    AGN_AR_AGENT = 24;
+    AGN_AR_SIZE = 32;
+}
+
+# Build an approval request. `agent` is 0 when the task had none.
+fn agnosai_approval_request_new(task_id: Str, output: Str, risk, agent): i64 {
+    var r = alloc(AGN_AR_SIZE);
+    store64(r + AGN_AR_TASK_ID, task_id);
+    store64(r + AGN_AR_OUTPUT, output);
+    store64(r + AGN_AR_RISK, risk);
+    store64(r + AGN_AR_AGENT, agent);
+    return r;
+}
+
+# The task awaiting approval.
+fn agnosai_approval_request_task_id(r): i64 {
+    return load64(r + AGN_AR_TASK_ID);
+}
+
+# The output a reviewer must judge.
+fn agnosai_approval_request_output(r): i64 {
+    return load64(r + AGN_AR_OUTPUT);
+}
+
+# The task's risk level.
+fn agnosai_approval_request_risk(r): i64 {
+    return load64(r + AGN_AR_RISK);
+}
+
+# The agent that produced the output, or 0.
+fn agnosai_approval_request_agent(r): i64 {
+    return load64(r + AGN_AR_AGENT);
+}
+
+# Serialise an approval request.
+#
+# `agent` is `Option<String>` with no `skip_serializing_if`, so it emits as null
+# when absent rather than being omitted.
+fn agnosai_approval_request_to_value(r): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("task_id"),
+    bayan_json_v_str_new(load64(r + AGN_AR_TASK_ID)));
+    bayan_json_v_obj_set(obj, str_from("output"),
+    bayan_json_v_str_new(load64(r + AGN_AR_OUTPUT)));
+    bayan_json_v_obj_set(obj, str_from("risk"),
+    bayan_json_v_str_new(agnosai_task_risk_to_wire(load64(r + AGN_AR_RISK))));
+    var agent = load64(r + AGN_AR_AGENT);
+    if (agent == 0) {
+        bayan_json_v_obj_set(obj, str_from("agent"), bayan_json_v_null());
+    } else {
+        bayan_json_v_obj_set(obj, str_from("agent"), bayan_json_v_str_new(agent));
+    }
+    return obj;
+}
+
+# ApprovalGate — pending task id -> its decision channel.
+enum AgnosaiApprovalGateOff {
+    AGN_AG_PENDING = 0;
+    AGN_AG_KEYS = 8;
+    AGN_AG_TIMEOUT_MS = 16;
+    AGN_AG_MUTEX = 24;
+    AGN_AG_SIZE = 32;
+}
+
+# Create a gate with a custom timeout, in milliseconds.
+#
+# `keys` mirrors the pending map so `pending_tasks` has a defined order; the
+# oracle iterates a DashMap, whose order is arbitrary.
+fn agnosai_approval_gate_with_timeout(timeout_ms): i64 {
+    var g = alloc(AGN_AG_SIZE);
+    store64(g + AGN_AG_PENDING, map_new_str());
+    store64(g + AGN_AG_KEYS, vec_new());
+    store64(g + AGN_AG_TIMEOUT_MS, timeout_ms);
+    store64(g + AGN_AG_MUTEX, mutex_new());
+    return g;
+}
+
+# Create a gate with the oracle's five-minute timeout.
+fn agnosai_approval_gate_new(): i64 {
+    return agnosai_approval_gate_with_timeout(AGNOSAI_APPROVAL_TIMEOUT_MS);
+}
+
+# The gate's decision timeout, in milliseconds.
+fn agnosai_approval_gate_timeout_ms(g): i64 {
+    return load64(g + AGN_AG_TIMEOUT_MS);
+}
+
+# How many approvals are currently pending.
+fn agnosai_approval_gate_pending_count(g): i64 {
+    var mtx = load64(g + AGN_AG_MUTEX);
+    mutex_lock(mtx);
+    var n = map_size(load64(g + AGN_AG_PENDING));
+    mutex_unlock(mtx);
+    return n;
+}
+
+# The task ids currently awaiting a decision, in registration order.
+fn agnosai_approval_gate_pending_tasks(g): i64 {
+    var mtx = load64(g + AGN_AG_MUTEX);
+    mutex_lock(mtx);
+    var pending = load64(g + AGN_AG_PENDING);
+    var keys = load64(g + AGN_AG_KEYS);
+    var out = vec_new();
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var k = vec_get(keys, i);
+        if (map_has(pending, k) == 1) { vec_push(out, k); }
+    }
+    mutex_unlock(mtx);
+    return out;
+}
+
+# Drop a task id from the key mirror. Caller holds the mutex.
+fn _agnosai_approval_forget(g, task_id: Str): i64 {
+    var keys = load64(g + AGN_AG_KEYS);
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        if (str_eq(vec_get(keys, i), task_id) == 1) {
+            vec_remove(keys, i);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+# Log an approval event.
+fn _agnosai_approval_log(level, msg, msg_len, task_id: Str): i64 {
+    if (sakshi_get_level() < level) { return 0; }
+    sakshi_log_kv(level, msg, msg_len, "task", 4, str_data(task_id), str_len(task_id));
+    return 0;
+}
+
+# Register a pending approval, returning the channel to wait on — or 0 when the
+# gate is at capacity.
+#
+# A refusal here is not "try again later": the oracle logs
+# "auto-rejecting", and the caller is expected to treat 0 as `Rejected`.
+fn agnosai_approval_request(g, task_id: Str): i64 {
+    var mtx = load64(g + AGN_AG_MUTEX);
+    mutex_lock(mtx);
+    var pending = load64(g + AGN_AG_PENDING);
+    if (map_size(pending) >= AGNOSAI_APPROVAL_MAX_PENDING) {
+        mutex_unlock(mtx);
+        _agnosai_approval_log(SK_WARN, "approval gate at capacity, auto-rejecting", 40, task_id);
+        return 0;
+    }
+
+    # Capacity 1: a oneshot is a one-slot channel.
+    var ch = chan_new(1);
+    var key = str_clone(task_id);
+    map_set(pending, key, ch);
+    vec_push(load64(g + AGN_AG_KEYS), key);
+    mutex_unlock(mtx);
+    _agnosai_approval_log(SK_DEBUG, "approval requested", 18, task_id);
+    return ch;
+}
+
+# Deliver a reviewer's decision.
+#
+# Returns 1 when it reached a waiter, 0 when there was no pending approval for
+# that task — which the oracle treats as "timed out or cancelled", not an error.
+fn agnosai_approval_submit_decision(g, task_id: Str, decision): i64 {
+    var mtx = load64(g + AGN_AG_MUTEX);
+    mutex_lock(mtx);
+    var pending = load64(g + AGN_AG_PENDING);
+    var ch = map_get(pending, task_id);
+    if (ch == 0) {
+        mutex_unlock(mtx);
+        _agnosai_approval_log(SK_WARN, "no pending approval found", 25, task_id);
+        return 0;
+    }
+    # Send BEFORE clearing the entry, which is the reverse of the oracle's
+    # order and has to be. The oracle's waiter awaits a future, so removing the
+    # map entry cannot affect it; this waiter polls, and uses the entry's
+    # presence as its liveness signal. Removing first would let a poll landing
+    # between the two calls see an empty channel AND no pending entry, conclude
+    # the gate was cancelled, and reject a decision that was about to arrive.
+    #
+    # `+ 1` so an Approved decision is never the 0 that `chan_try_recv` returns
+    # for "empty". The waiter subtracts it back.
+    var sent = chan_try_send(ch, decision + 1);
+    map_delete(pending, task_id);
+    _agnosai_approval_forget(g, task_id);
+    mutex_unlock(mtx);
+
+    if (sent != 0) { return 0; }
+    _agnosai_approval_log(SK_INFO, "approval decision submitted", 27, task_id);
+    return 1;
+}
+
+# Cancel a pending approval without deciding it.
+#
+# Returns 1 when something was cancelled. The channel is closed rather than just
+# dropped, so a waiter is released immediately and rejects — the oracle relies on
+# `Sender` drop for the same effect.
+fn agnosai_approval_cancel(g, task_id: Str): i64 {
+    var mtx = load64(g + AGN_AG_MUTEX);
+    mutex_lock(mtx);
+    var pending = load64(g + AGN_AG_PENDING);
+    var ch = map_get(pending, task_id);
+    if (ch == 0) {
+        mutex_unlock(mtx);
+        return 0;
+    }
+    map_delete(pending, task_id);
+    _agnosai_approval_forget(g, task_id);
+    mutex_unlock(mtx);
+    chan_close(ch);
+    return 1;
+}
+
+# Wait for a decision, rejecting on timeout.
+#
+# Returns `AGNOSAI_APPROVAL_APPROVED` only when a reviewer said so. A timeout, a
+# cancelled gate and a null channel all return `AGNOSAI_APPROVAL_REJECTED` —
+# the oracle's three separate arms, all landing in the same place.
+#
+# On timeout the pending entry is removed, matching the oracle's cleanup, so a
+# decision arriving afterwards is answered "no pending approval" rather than
+# being delivered to nobody.
+fn agnosai_approval_wait_for_decision(g, ch, task_id: Str): i64 {
+    # A gate at capacity handed back 0; that is already a rejection.
+    if (ch == 0) { return AGNOSAI_APPROVAL_REJECTED; }
+
+    var deadline = clock_now_ns() + load64(g + AGN_AG_TIMEOUT_MS) * AGNOSAI_NS_PER_MS;
+    while (1 == 1) {
+        var got = chan_try_recv(ch);
+        if (got != 0) { return got - 1; }
+
+        # A cancelled gate closed the channel: nothing will ever arrive.
+        var mtx = load64(g + AGN_AG_MUTEX);
+        mutex_lock(mtx);
+        var still_pending = map_has(load64(g + AGN_AG_PENDING), task_id);
+        mutex_unlock(mtx);
+        if (still_pending == 0) {
+            _agnosai_approval_log(SK_WARN, "approval channel dropped, rejecting", 35, task_id);
+            return AGNOSAI_APPROVAL_REJECTED;
+        }
+
+        if (clock_now_ns() >= deadline) {
+            mutex_lock(mtx);
+            map_delete(load64(g + AGN_AG_PENDING), task_id);
+            _agnosai_approval_forget(g, task_id);
+            mutex_unlock(mtx);
+            _agnosai_approval_log(SK_WARN, "approval timed out, rejecting", 29, task_id);
+            return AGNOSAI_APPROVAL_REJECTED;
+        }
+        sleep_ms(AGNOSAI_APPROVAL_POLL_MS);
+    }
+    return AGNOSAI_APPROVAL_REJECTED;
+}

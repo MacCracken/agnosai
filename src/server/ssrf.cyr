@@ -1,0 +1,386 @@
+# =========================================================================
+# server/ssrf — Server-Side Request Forgery protection.
+#
+# Parity oracle: rust-old/src/server/ssrf.rs
+#
+# **Ported ahead of its milestone.** This belongs to M6 (`server`), where it is
+# the first pure leaf. It lands during M4 because *two* tools modules gate on
+# it — `builtin/load_testing.rs` and `remote_registry.rs` both call
+# `is_safe_url` before making an outbound request, and stubbing that guard
+# twice would have been worse than porting it once.
+#
+# This is a security boundary. Every check below is fail-closed: anything that
+# cannot be positively established as a safe public host is rejected.
+#
+# Port notes:
+#   * URL parsing uses `sandhi_url_parse`, which already rejects any scheme but
+#     http/https (returning 0) and strips the brackets from an IPv6 literal, so
+#     callers see `::1` rather than `[::1]`. It also rejects a URL containing
+#     CR, LF, TAB or SPACE — a request-splitting guard the oracle got from the
+#     `url` crate.
+#   * **The octal/hex/short-form IPv4 parser is load-bearing and is NOT
+#     over-engineering.** The oracle gets it for free: `url::Url::parse` uses
+#     the WHATWG host parser, which resolves `0177.0.0.1`, `0x7f.0.0.1`,
+#     `2130706433` and `127.1` all to 127.0.0.1 *before* `is_private_ipv4` ever
+#     sees them. A naive strict dotted-quad parser would classify those as
+#     hostnames and let every one of them through — the classic SSRF bypass.
+#     `_agnosai_parse_ipv4_whatwg` reproduces that normalisation.
+#   * The trigger for that permissive parse is "the last label is entirely
+#     numeric". RFC 1123 forbids an all-numeric top-level domain, so a host
+#     ending in a numeric label cannot be a real name and must be treated as an
+#     address literal — and if it will not parse as one, it is rejected rather
+#     than passed through.
+# =========================================================================
+
+# Returned by the address parsers when the input is not an address literal.
+var AGNOSAI_NOT_AN_IP = 0 - 1;
+
+# The value of a hex digit, or -1.
+fn _agnosai_hex_val(c): i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+
+# Parse one WHATWG IPv4 part from `s[start..end)`: `0x`/`0X` prefixed is hex,
+# a leading `0` is octal, anything else decimal. Returns the value, or
+# AGNOSAI_NOT_AN_IP when the part is empty or contains a digit invalid for its
+# base.
+fn _agnosai_parse_ipv4_part(s, start, end): i64 {
+    var len = end - start;
+    if (len <= 0) { return AGNOSAI_NOT_AN_IP; }
+
+    var base = 10;
+    var i = start;
+    if (len >= 2) {
+        if (load8(s + start) == 48) {
+            var c1 = load8(s + start + 1);
+            if (c1 == 120 || c1 == 88) {
+                base = 16;
+                i = start + 2;
+                if (i >= end) { return AGNOSAI_NOT_AN_IP; }
+            } else {
+                base = 8;
+                i = start + 1;
+            }
+        }
+    }
+
+    var value = 0;
+    while (i < end) {
+        var d = _agnosai_hex_val(load8(s + i));
+        if (d < 0) { return AGNOSAI_NOT_AN_IP; }
+        if (d >= base) { return AGNOSAI_NOT_AN_IP; }
+        value = value * base + d;
+        # An IPv4 literal cannot exceed 32 bits; bail before overflowing.
+        if (value > 4294967295) { return AGNOSAI_NOT_AN_IP; }
+        i = i + 1;
+    }
+    return value;
+}
+
+# Parse a host as a WHATWG IPv4 address, returning the packed 32-bit value or
+# AGNOSAI_NOT_AN_IP.
+#
+# Accepts every form the WHATWG host parser does, because every one of them is
+# a live SSRF bypass otherwise:
+#   4 parts  a.b.c.d      each < 256
+#   3 parts  a.b.c        c occupies the low 16 bits
+#   2 parts  a.b          b occupies the low 24 bits
+#   1 part   a            the whole 32-bit value  (e.g. 2130706433)
+# with each part independently decimal, octal (leading 0) or hex (0x). One
+# trailing dot is permitted.
+fn _agnosai_parse_ipv4_whatwg(host: Str): i64 {
+    var len = str_len(host);
+    if (len == 0) { return AGNOSAI_NOT_AN_IP; }
+    var d = str_data(host);
+
+    # A single trailing dot is allowed and ignored.
+    if (load8(d + len - 1) == 46) {
+        len = len - 1;
+        if (len == 0) { return AGNOSAI_NOT_AN_IP; }
+    }
+
+    var parts: i64[4];
+    var count = 0;
+    var start = 0;
+    for (var i = 0; i <= len; i = i + 1) {
+        var at_end = 0;
+        if (i == len) { at_end = 1; }
+        if (at_end == 1 || load8(d + i) == 46) {
+            if (count >= 4) { return AGNOSAI_NOT_AN_IP; }
+            var v = _agnosai_parse_ipv4_part(d, start, i);
+            if (v == AGNOSAI_NOT_AN_IP) { return AGNOSAI_NOT_AN_IP; }
+            store64(&parts + count * 8, v);
+            count = count + 1;
+            start = i + 1;
+        }
+    }
+    if (count == 0) { return AGNOSAI_NOT_AN_IP; }
+
+    # Every part but the last must fit in one octet; the last absorbs the rest.
+    var addr = 0;
+    for (var j = 0; j < count - 1; j = j + 1) {
+        var pj = load64(&parts + j * 8);
+        if (pj > 255) { return AGNOSAI_NOT_AN_IP; }
+        addr = addr | (pj << (8 * (3 - j)));
+    }
+    var last = load64(&parts + (count - 1) * 8);
+    var remaining_bytes = 4 - (count - 1);
+    if (remaining_bytes < 4) {
+        var limit = 1 << (8 * remaining_bytes);
+        if (last >= limit) { return AGNOSAI_NOT_AN_IP; }
+    }
+    return addr | last;
+}
+
+# Whether a packed 32-bit IPv4 address is private, loopback, link-local,
+# cloud-metadata or unspecified.
+#
+# The ranges are the oracle's: 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16
+# (which covers the 169.254.169.254 metadata endpoint), and 0/8.
+fn agnosai_is_private_ipv4(addr): i64 {
+    var a = (addr >> 24) & 255;
+    var b = (addr >> 16) & 255;
+
+    if (a == 10) { return 1; }
+    if (a == 172 && b >= 16 && b <= 31) { return 1; }
+    if (a == 192 && b == 168) { return 1; }
+    if (a == 127) { return 1; }
+    if (a == 169 && b == 254) { return 1; }
+    if (a == 0) { return 1; }
+    return 0;
+}
+
+# Parse a host as an IPv6 address into `out` (8 i64 segments). Returns 1 on
+# success, 0 otherwise. Handles `::` compression and an IPv4-mapped tail such
+# as `::ffff:10.0.0.1`.
+fn _agnosai_parse_ipv6(host: Str, out): i64 {
+    var len = str_len(host);
+    if (len < 2) { return 0; }
+    var d = str_data(host);
+
+    for (var z = 0; z < 8; z = z + 1) { store64(out + z * 8, 0); }
+
+    var head: i64[8];
+    var tail: i64[8];
+    var head_n = 0;
+    var tail_n = 0;
+    var seen_double = 0;
+    var i = 0;
+
+    # A leading "::" is the only way a group may start empty.
+    if (load8(d) == 58) {
+        if (load8(d + 1) != 58) { return 0; }
+        seen_double = 1;
+        i = 2;
+    }
+
+    while (i < len) {
+        if (load8(d + i) == 58) {
+            if (seen_double == 1) { return 0; }
+            seen_double = 1;
+            i = i + 1;
+            continue;
+        }
+
+        # A group containing '.' is an embedded IPv4 tail, which must be last.
+        var gstart = i;
+        var is_v4 = 0;
+        while (i < len) {
+            var c = load8(d + i);
+            if (c == 58) { break; }
+            if (c == 46) { is_v4 = 1; }
+            i = i + 1;
+        }
+        if (i == gstart) { return 0; }
+
+        if (is_v4 == 1) {
+            if (i != len) { return 0; }
+            var v4 = _agnosai_parse_ipv4_whatwg(str_new(d + gstart, i - gstart));
+            if (v4 == AGNOSAI_NOT_AN_IP) { return 0; }
+            if (seen_double == 1) {
+                if (tail_n + 2 > 8) { return 0; }
+                store64(&tail + tail_n * 8, (v4 >> 16) & 65535);
+                store64(&tail + (tail_n + 1) * 8, v4 & 65535);
+                tail_n = tail_n + 2;
+            } else {
+                if (head_n + 2 > 8) { return 0; }
+                store64(&head + head_n * 8, (v4 >> 16) & 65535);
+                store64(&head + (head_n + 1) * 8, v4 & 65535);
+                head_n = head_n + 2;
+            }
+        } else {
+            if (i - gstart > 4) { return 0; }
+            var seg = 0;
+            for (var k = gstart; k < i; k = k + 1) {
+                var hv = _agnosai_hex_val(load8(d + k));
+                if (hv < 0) { return 0; }
+                seg = seg * 16 + hv;
+            }
+            if (seen_double == 1) {
+                if (tail_n >= 8) { return 0; }
+                store64(&tail + tail_n * 8, seg);
+                tail_n = tail_n + 1;
+            } else {
+                if (head_n >= 8) { return 0; }
+                store64(&head + head_n * 8, seg);
+                head_n = head_n + 1;
+            }
+        }
+
+        if (i < len) {
+            if (load8(d + i) != 58) { return 0; }
+            i = i + 1;
+            # A trailing single ':' is malformed.
+            if (i == len) { return 0; }
+        }
+    }
+
+    if (seen_double == 0) {
+        if (head_n != 8) { return 0; }
+    } else {
+        if (head_n + tail_n > 7) { return 0; }
+    }
+
+    for (var h = 0; h < head_n; h = h + 1) {
+        store64(out + h * 8, load64(&head + h * 8));
+    }
+    for (var t = 0; t < tail_n; t = t + 1) {
+        store64(out + (8 - tail_n + t) * 8, load64(&tail + t * 8));
+    }
+    return 1;
+}
+
+# Whether 8 IPv6 segments are loopback, IPv4-mapped-private, unique-local
+# (fc00::/7) or link-local (fe80::/10).
+fn agnosai_is_private_ipv6(segs): i64 {
+    # ::1 — loopback
+    var all_zero_but_last = 1;
+    for (var i = 0; i < 7; i = i + 1) {
+        if (load64(segs + i * 8) != 0) { all_zero_but_last = 0; }
+    }
+    if (all_zero_but_last == 1) {
+        if (load64(segs + 7 * 8) == 1) { return 1; }
+        # :: — unspecified
+        if (load64(segs + 7 * 8) == 0) { return 1; }
+    }
+
+    # ::ffff:a.b.c.d — IPv4-mapped, so judge it as the IPv4 it carries
+    var mapped = 1;
+    for (var j = 0; j < 5; j = j + 1) {
+        if (load64(segs + j * 8) != 0) { mapped = 0; }
+    }
+    if (mapped == 1 && load64(segs + 5 * 8) == 65535) {
+        var addr = (load64(segs + 6 * 8) << 16) | load64(segs + 7 * 8);
+        return agnosai_is_private_ipv4(addr);
+    }
+
+    var first = load64(segs);
+    # fc00::/7 — unique local
+    if ((first & 65024) == 64512) { return 1; }
+    # fe80::/10 — link local
+    if ((first & 65472) == 65152) { return 1; }
+    return 0;
+}
+
+# Whether a host string's final label is entirely numeric.
+#
+# RFC 1123 forbids an all-numeric top-level domain, so such a host cannot be a
+# real name and must be treated as an address literal. This is what routes
+# `0177.0.0.1` and `2130706433` into the WHATWG parser instead of letting them
+# through as hostnames.
+fn _agnosai_last_label_numeric(host: Str): i64 {
+    var len = str_len(host);
+    if (len == 0) { return 0; }
+    var d = str_data(host);
+
+    var end = len;
+    if (load8(d + end - 1) == 46) {
+        end = end - 1;
+        if (end == 0) { return 0; }
+    }
+    var start = end;
+    while (start > 0) {
+        if (load8(d + start - 1) == 46) { break; }
+        start = start - 1;
+    }
+    if (start >= end) { return 0; }
+
+    # `0x`-prefixed counts as numeric too — it is a hex address literal. The
+    # bare prefix `0x` with no digits qualifies deliberately: routing it here
+    # makes the parser reject it and the host fail closed, which is what the
+    # WHATWG parser does (an empty hex number is a parse failure, not a name).
+    if (end - start >= 2) {
+        if (load8(d + start) == 48) {
+            var c1 = load8(d + start + 1);
+            if (c1 == 120 || c1 == 88) { return 1; }
+        }
+    }
+    for (var i = start; i < end; i = i + 1) {
+        if (_agnosai_is_digit(load8(d + i)) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# Whether a host is blocked by name: localhost, the loopback literals, or a
+# `.local` / `.internal` / `.localhost` suffix. Case-insensitive, as the
+# oracle's `to_ascii_lowercase` makes it.
+fn _agnosai_is_blocked_hostname(host: Str): i64 {
+    var lower = _agnosai_to_ascii_lower(host);
+    if (str_eq(lower, str_from("localhost")) == 1) { return 1; }
+    if (str_eq(lower, str_from("127.0.0.1")) == 1) { return 1; }
+    if (str_eq(lower, str_from("::1")) == 1) { return 1; }
+    if (str_eq(lower, str_from("[::1]")) == 1) { return 1; }
+    if (str_ends_with(lower, str_from(".local")) == 1) { return 1; }
+    if (str_ends_with(lower, str_from(".internal")) == 1) { return 1; }
+    if (str_ends_with(lower, str_from(".localhost")) == 1) { return 1; }
+    return 0;
+}
+
+# Whether a host string resolves to a private, loopback, link-local, metadata
+# or unspecified address. Hostnames that are not address literals return 0 —
+# name resolution is deliberately not attempted here.
+fn agnosai_is_private_host(host: Str): i64 {
+    if (str_len(host) == 0) { return 1; }
+
+    var segs: i64[8];
+    if (_agnosai_parse_ipv6(host, &segs) == 1) {
+        return agnosai_is_private_ipv6(&segs);
+    }
+
+    if (_agnosai_last_label_numeric(host) == 1) {
+        var addr = _agnosai_parse_ipv4_whatwg(host);
+        # Fail closed: a host that must be an address literal but will not
+        # parse as one is rejected rather than treated as a name.
+        if (addr == AGNOSAI_NOT_AN_IP) { return 1; }
+        return agnosai_is_private_ipv4(addr);
+    }
+    return 0;
+}
+
+# Whether a URL is safe for an outbound HTTP request.
+#
+# Rejects non-HTTP(S) schemes, a missing host, the blocked hostnames, and any
+# host that resolves to a private, loopback, link-local, cloud-metadata or
+# unspecified address — including the octal, hex and short-form spellings of
+# those addresses.
+fn agnosai_is_safe_url(url: Str): i64 {
+    if (url == 0) { return 0; }
+    if (str_len(url) == 0) { return 0; }
+
+    # sandhi_url_parse returns 0 for any scheme but http/https, for a URL
+    # containing CR/LF/TAB/SPACE, and for a malformed authority.
+    var parsed = sandhi_url_parse(str_cstr(url));
+    if (parsed == 0) { return 0; }
+
+    var host_cstr = sandhi_url_host(parsed);
+    if (host_cstr == 0) { return 0; }
+    var host = str_from(host_cstr);
+    if (str_len(host) == 0) { return 0; }
+
+    if (_agnosai_is_blocked_hostname(host) == 1) { return 0; }
+    if (agnosai_is_private_host(host) == 1) { return 0; }
+    return 1;
+}

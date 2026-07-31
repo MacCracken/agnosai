@@ -1,0 +1,613 @@
+# =========================================================================
+# core/resource — hardware devices, requirements, inventories and budgets.
+#
+# Parity oracle: rust-old/src/core/resource.rs
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * **Money is integer micro-USD** (user decision, 2026-07-28). The oracle's
+#     `max_cost_usd: Option<f64>` becomes an i64 count of millionths of a
+#     dollar, so a crew's cost path accumulates exactly with no float drift.
+#     Serialization still goes out through an f64 under the *same* wire name
+#     `max_cost_usd`, so bayan's Grisu2 emits the shortest round-tripping form —
+#     `0.0025`, byte-identical to serde. (The port plan predicted a `0.002500`
+#     divergence; routing through f64 only at the boundary avoids it while
+#     keeping arithmetic exact.)
+#   * `Option<u64>` / `Option<usize>` fields use **-1 for None**. Every one of
+#     them is a non-negative count or limit, so the sentinel is unambiguous and
+#     keeps these structs allocation-free.
+#   * The `#[cfg(feature = "hwaccel")]` half of the oracle — the ai-hwaccel
+#     re-exports, `TrainingMemoryEstimate`, `HardwareInventory::detect` /
+#     `from_hwaccel`, and `AcceleratorType::from_hwaccel` — is **not ported**.
+#     `hwaccel` is not in the default build, so it is outside the v2.0.0 parity
+#     bar, like bhava.
+# =========================================================================
+
+# Broad accelerator family for requirement matching.
+enum AgnosaiAcceleratorFamily {
+    AGNOSAI_FAMILY_CPU = 0;
+    AGNOSAI_FAMILY_GPU = 1;
+    AGNOSAI_FAMILY_NPU = 2;
+    AGNOSAI_FAMILY_TPU = 3;
+    AGNOSAI_FAMILY_AI_ASIC = 4;
+}
+
+# Hardware accelerator type — the oracle's 6 broad categories.
+enum AgnosaiAcceleratorType {
+    AGNOSAI_ACCEL_CPU = 0;
+    AGNOSAI_ACCEL_CUDA = 1;
+    AGNOSAI_ACCEL_ROCM = 2;
+    AGNOSAI_ACCEL_METAL = 3;
+    AGNOSAI_ACCEL_VULKAN = 4;
+    AGNOSAI_ACCEL_TPU = 5;
+}
+
+# Micro-USD per whole dollar — the money scale factor.
+var AGNOSAI_MICRO_USD_PER_USD = 1000000;
+
+# ComputeDevice heap layout — 40 bytes.
+enum AgnosaiComputeDeviceOff {
+    AGN_DEV_INDEX = 0;
+    AGN_DEV_NAME = 8;
+    AGN_DEV_ACCELERATOR = 16;
+    AGN_DEV_MEMORY_TOTAL_MB = 24;
+    AGN_DEV_MEMORY_AVAILABLE_MB = 32;
+    AGN_DEV_SIZE = 40;
+}
+
+# HardwareRequirement heap layout — 40 bytes.
+enum AgnosaiHwRequirementOff {
+    AGN_REQ_ACCELERATORS = 0;
+    AGN_REQ_MIN_MEMORY_MB = 8;
+    AGN_REQ_MIN_DEVICE_COUNT = 16;
+    AGN_REQ_MIN_CPU_CORES = 24;
+    AGN_REQ_REQUIRED_FAMILY = 32;
+    AGN_HW_REQ_SIZE = 40;
+}
+
+# HardwareInventory heap layout — 24 bytes.
+enum AgnosaiHwInventoryOff {
+    AGN_INV_CPU_CORES = 0;
+    AGN_INV_MEMORY_TOTAL_MB = 8;
+    AGN_INV_DEVICES = 16;
+    AGN_INV_SIZE = 24;
+}
+
+# ResourceBudget heap layout — 32 bytes.
+enum AgnosaiResourceBudgetOff {
+    AGN_BUD_MAX_TOKENS = 0;
+    AGN_BUD_MAX_COST_MICRO_USD = 8;
+    AGN_BUD_MAX_DURATION_SECS = 16;
+    AGN_BUD_MAX_CONCURRENT_TASKS = 24;
+    AGN_BUD_SIZE = 32;
+}
+
+# GpuDevice heap layout — 32 bytes.
+enum AgnosaiGpuDeviceOff {
+    AGN_GPU_INDEX = 0;
+    AGN_GPU_NAME = 8;
+    AGN_GPU_VRAM_TOTAL_MB = 16;
+    AGN_GPU_VRAM_AVAILABLE_MB = 24;
+    AGN_GPU_SIZE = 32;
+}
+
+# The snake_case wire spelling of an accelerator family.
+fn agnosai_accelerator_family_to_wire(family): i64 {
+    if (family == AGNOSAI_FAMILY_GPU) { return str_from("gpu"); }
+    if (family == AGNOSAI_FAMILY_NPU) { return str_from("npu"); }
+    if (family == AGNOSAI_FAMILY_TPU) { return str_from("tpu"); }
+    if (family == AGNOSAI_FAMILY_AI_ASIC) { return str_from("ai_asic"); }
+    return str_from("cpu");
+}
+
+# An accelerator family from its wire spelling. Unknown spellings read as Cpu.
+fn agnosai_accelerator_family_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("gpu")) == 1) { return AGNOSAI_FAMILY_GPU; }
+    if (str_eq(s, str_from("npu")) == 1) { return AGNOSAI_FAMILY_NPU; }
+    if (str_eq(s, str_from("tpu")) == 1) { return AGNOSAI_FAMILY_TPU; }
+    if (str_eq(s, str_from("ai_asic")) == 1) { return AGNOSAI_FAMILY_AI_ASIC; }
+    return AGNOSAI_FAMILY_CPU;
+}
+
+# The snake_case wire spelling of an accelerator type.
+fn agnosai_accelerator_type_to_wire(accel): i64 {
+    if (accel == AGNOSAI_ACCEL_CUDA) { return str_from("cuda"); }
+    if (accel == AGNOSAI_ACCEL_ROCM) { return str_from("rocm"); }
+    if (accel == AGNOSAI_ACCEL_METAL) { return str_from("metal"); }
+    if (accel == AGNOSAI_ACCEL_VULKAN) { return str_from("vulkan"); }
+    if (accel == AGNOSAI_ACCEL_TPU) { return str_from("tpu"); }
+    return str_from("cpu");
+}
+
+# An accelerator type from its wire spelling. Unknown spellings read as Cpu.
+fn agnosai_accelerator_type_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("cuda")) == 1) { return AGNOSAI_ACCEL_CUDA; }
+    if (str_eq(s, str_from("rocm")) == 1) { return AGNOSAI_ACCEL_ROCM; }
+    if (str_eq(s, str_from("metal")) == 1) { return AGNOSAI_ACCEL_METAL; }
+    if (str_eq(s, str_from("vulkan")) == 1) { return AGNOSAI_ACCEL_VULKAN; }
+    if (str_eq(s, str_from("tpu")) == 1) { return AGNOSAI_ACCEL_TPU; }
+    return AGNOSAI_ACCEL_CPU;
+}
+
+# Broad family an accelerator belongs to.
+fn agnosai_accelerator_family_of(accel): i64 {
+    if (accel == AGNOSAI_ACCEL_CPU) { return AGNOSAI_FAMILY_CPU; }
+    if (accel == AGNOSAI_ACCEL_TPU) { return AGNOSAI_FAMILY_TPU; }
+    return AGNOSAI_FAMILY_GPU;
+}
+
+# Whether this is a GPU variant.
+fn agnosai_accelerator_is_gpu(accel): i64 {
+    if (agnosai_accelerator_family_of(accel) == AGNOSAI_FAMILY_GPU) { return 1; }
+    return 0;
+}
+
+# Whether this is a TPU variant.
+fn agnosai_accelerator_is_tpu(accel): i64 {
+    if (agnosai_accelerator_family_of(accel) == AGNOSAI_FAMILY_TPU) { return 1; }
+    return 0;
+}
+
+# Create a new compute device. Available memory starts equal to total.
+fn agnosai_compute_device_new(index, name: Str, accelerator, memory_total_mb): i64 {
+    var d = alloc(AGN_DEV_SIZE);
+    store64(d + AGN_DEV_INDEX, index);
+    store64(d + AGN_DEV_NAME, name);
+    store64(d + AGN_DEV_ACCELERATOR, accelerator);
+    store64(d + AGN_DEV_MEMORY_TOTAL_MB, memory_total_mb);
+    store64(d + AGN_DEV_MEMORY_AVAILABLE_MB, memory_total_mb);
+    return d;
+}
+
+# Set the device's available memory. Returns the device so calls chain.
+fn agnosai_compute_device_with_available(d, memory_available_mb): i64 {
+    store64(d + AGN_DEV_MEMORY_AVAILABLE_MB, memory_available_mb);
+    return d;
+}
+
+# Zero-based device index.
+fn agnosai_compute_device_index(d): i64 {
+    return load64(d + AGN_DEV_INDEX);
+}
+
+# Human-readable device name.
+fn agnosai_compute_device_name(d): i64 {
+    return load64(d + AGN_DEV_NAME);
+}
+
+# Accelerator type of this device.
+fn agnosai_compute_device_accelerator(d): i64 {
+    return load64(d + AGN_DEV_ACCELERATOR);
+}
+
+# Total device memory in megabytes.
+fn agnosai_compute_device_memory_total_mb(d): i64 {
+    return load64(d + AGN_DEV_MEMORY_TOTAL_MB);
+}
+
+# Available (free) device memory in megabytes.
+fn agnosai_compute_device_memory_available_mb(d): i64 {
+    return load64(d + AGN_DEV_MEMORY_AVAILABLE_MB);
+}
+
+# A compute device as a bayan JSON value.
+fn agnosai_compute_device_to_value(d): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("index"), bayan_json_v_int_new(load64(d + AGN_DEV_INDEX)));
+    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(d + AGN_DEV_NAME)));
+    var accel = agnosai_accelerator_type_to_wire(load64(d + AGN_DEV_ACCELERATOR));
+    bayan_json_v_obj_set(obj, str_from("accelerator"), bayan_json_v_str_new(accel));
+    bayan_json_v_obj_set(obj, str_from("memory_total_mb"),
+    bayan_json_v_int_new(load64(d + AGN_DEV_MEMORY_TOTAL_MB)));
+    bayan_json_v_obj_set(obj, str_from("memory_available_mb"),
+    bayan_json_v_int_new(load64(d + AGN_DEV_MEMORY_AVAILABLE_MB)));
+    return obj;
+}
+
+# Rebuild a compute device from a bayan JSON value, or 0 when not an object.
+fn agnosai_compute_device_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var name = str_from("");
+    var nv = bayan_json_v_obj_get(v, "name");
+    if (nv != 0 && bayan_json_v_is_str(nv) == 1) { name = bayan_json_v_str(nv); }
+
+    var accel = AGNOSAI_ACCEL_CPU;
+    var av = bayan_json_v_obj_get(v, "accelerator");
+    if (av != 0 && bayan_json_v_is_str(av) == 1) {
+        accel = agnosai_accelerator_type_from_wire(bayan_json_v_str(av));
+    }
+
+    var d = agnosai_compute_device_new(_agnosai_int_field(v, "index", 0), name, accel,
+    _agnosai_int_field(v, "memory_total_mb", 0));
+    store64(d + AGN_DEV_MEMORY_AVAILABLE_MB,
+    _agnosai_int_field(v, "memory_available_mb", load64(d + AGN_DEV_MEMORY_TOTAL_MB)));
+    return d;
+}
+
+# An empty hardware requirement — matches anything, including CPU-only.
+fn agnosai_hw_requirement_new(): i64 {
+    var r = alloc(AGN_HW_REQ_SIZE);
+    store64(r + AGN_REQ_ACCELERATORS, vec_new());
+    store64(r + AGN_REQ_MIN_MEMORY_MB, 0);
+    store64(r + AGN_REQ_MIN_DEVICE_COUNT, 0);
+    store64(r + AGN_REQ_MIN_CPU_CORES, 0);
+    store64(r + AGN_REQ_REQUIRED_FAMILY, AGNOSAI_NO_LIMIT);
+    return r;
+}
+
+# A requirement for specific accelerator types. `accelerators` is a vec.
+fn agnosai_hw_requirement_for_accelerators(accelerators): i64 {
+    var r = agnosai_hw_requirement_new();
+    store64(r + AGN_REQ_ACCELERATORS, accelerators);
+    return r;
+}
+
+# Set minimum device memory in MB. Returns the requirement.
+fn agnosai_hw_requirement_with_min_memory(r, mb): i64 {
+    store64(r + AGN_REQ_MIN_MEMORY_MB, mb);
+    return r;
+}
+
+# Set minimum device count. Returns the requirement.
+fn agnosai_hw_requirement_with_min_devices(r, count): i64 {
+    store64(r + AGN_REQ_MIN_DEVICE_COUNT, count);
+    return r;
+}
+
+# Set minimum CPU cores. Returns the requirement.
+fn agnosai_hw_requirement_with_min_cpu_cores(r, cores): i64 {
+    store64(r + AGN_REQ_MIN_CPU_CORES, cores);
+    return r;
+}
+
+# Set the required accelerator family. Returns the requirement.
+fn agnosai_hw_requirement_with_family(r, family): i64 {
+    store64(r + AGN_REQ_REQUIRED_FAMILY, family);
+    return r;
+}
+
+# Vec of acceptable accelerator types (empty = any).
+fn agnosai_hw_requirement_accelerators(r): i64 {
+    return load64(r + AGN_REQ_ACCELERATORS);
+}
+
+# Minimum device memory in MB (0 = no requirement).
+fn agnosai_hw_requirement_min_memory_mb(r): i64 {
+    return load64(r + AGN_REQ_MIN_MEMORY_MB);
+}
+
+# Minimum number of devices needed (0 = no requirement).
+fn agnosai_hw_requirement_min_device_count(r): i64 {
+    return load64(r + AGN_REQ_MIN_DEVICE_COUNT);
+}
+
+# Minimum CPU cores (0 = no requirement).
+fn agnosai_hw_requirement_min_cpu_cores(r): i64 {
+    return load64(r + AGN_REQ_MIN_CPU_CORES);
+}
+
+# Required accelerator family, or AGNOSAI_NO_LIMIT when unset.
+fn agnosai_hw_requirement_required_family(r): i64 {
+    return load64(r + AGN_REQ_REQUIRED_FAMILY);
+}
+
+# A hardware requirement as a bayan JSON value. `required_family` is **omitted**
+# rather than emitted as null when unset — the oracle marks that one field
+# `skip_serializing_if = "Option::is_none"`.
+fn agnosai_hw_requirement_to_value(r): i64 {
+    var obj = bayan_json_v_obj_new();
+    var accels = load64(r + AGN_REQ_ACCELERATORS);
+    var arr = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(accels); i = i + 1) {
+        var w = agnosai_accelerator_type_to_wire(vec_get(accels, i));
+        bayan_json_v_arr_push(arr, bayan_json_v_str_new(w));
+    }
+    bayan_json_v_obj_set(obj, str_from("accelerators"), arr);
+    bayan_json_v_obj_set(obj, str_from("min_memory_mb"),
+    bayan_json_v_int_new(load64(r + AGN_REQ_MIN_MEMORY_MB)));
+    bayan_json_v_obj_set(obj, str_from("min_device_count"),
+    bayan_json_v_int_new(load64(r + AGN_REQ_MIN_DEVICE_COUNT)));
+    bayan_json_v_obj_set(obj, str_from("min_cpu_cores"),
+    bayan_json_v_int_new(load64(r + AGN_REQ_MIN_CPU_CORES)));
+
+    var fam = load64(r + AGN_REQ_REQUIRED_FAMILY);
+    if (fam != AGNOSAI_NO_LIMIT) {
+        bayan_json_v_obj_set(obj, str_from("required_family"),
+        bayan_json_v_str_new(agnosai_accelerator_family_to_wire(fam)));
+    }
+    return obj;
+}
+
+# Rebuild a hardware requirement from a bayan JSON value. Every field is
+# `#[serde(default)]` in the oracle, so missing ones take their defaults.
+fn agnosai_hw_requirement_from_value(v): i64 {
+    var r = agnosai_hw_requirement_new();
+    if (bayan_json_v_is_obj(v) == 0) { return r; }
+
+    var av = bayan_json_v_obj_get(v, "accelerators");
+    if (av != 0 && bayan_json_v_is_arr(av) == 1) {
+        var accels = load64(r + AGN_REQ_ACCELERATORS);
+        for (var i = 0; i < bayan_json_v_arr_len(av); i = i + 1) {
+            var e = bayan_json_v_arr_get(av, i);
+            if (bayan_json_v_is_str(e) == 1) {
+                vec_push(accels, agnosai_accelerator_type_from_wire(bayan_json_v_str(e)));
+            }
+        }
+    }
+    store64(r + AGN_REQ_MIN_MEMORY_MB, _agnosai_int_field(v, "min_memory_mb", 0));
+    store64(r + AGN_REQ_MIN_DEVICE_COUNT, _agnosai_int_field(v, "min_device_count", 0));
+    store64(r + AGN_REQ_MIN_CPU_CORES, _agnosai_int_field(v, "min_cpu_cores", 0));
+
+    var fv = bayan_json_v_obj_get(v, "required_family");
+    if (fv != 0 && bayan_json_v_is_str(fv) == 1) {
+        store64(r + AGN_REQ_REQUIRED_FAMILY, agnosai_accelerator_family_from_wire(bayan_json_v_str(fv)));
+    }
+    return r;
+}
+
+# Create a hardware inventory. `devices` is a vec of compute devices.
+fn agnosai_hw_inventory_new(cpu_cores, memory_total_mb, devices): i64 {
+    var inv = alloc(AGN_INV_SIZE);
+    store64(inv + AGN_INV_CPU_CORES, cpu_cores);
+    store64(inv + AGN_INV_MEMORY_TOTAL_MB, memory_total_mb);
+    store64(inv + AGN_INV_DEVICES, devices);
+    return inv;
+}
+
+# Number of CPU cores available.
+fn agnosai_hw_inventory_cpu_cores(inv): i64 {
+    return load64(inv + AGN_INV_CPU_CORES);
+}
+
+# Total system memory in megabytes.
+fn agnosai_hw_inventory_memory_total_mb(inv): i64 {
+    return load64(inv + AGN_INV_MEMORY_TOTAL_MB);
+}
+
+# Vec of accelerator devices present on this node.
+fn agnosai_hw_inventory_devices(inv): i64 {
+    return load64(inv + AGN_INV_DEVICES);
+}
+
+# Vec of devices of a specific accelerator type.
+fn agnosai_hw_inventory_devices_of_type(inv, accel): i64 {
+    var out = vec_new();
+    var devices = load64(inv + AGN_INV_DEVICES);
+    for (var i = 0; i < vec_len(devices); i = i + 1) {
+        var d = vec_get(devices, i);
+        if (load64(d + AGN_DEV_ACCELERATOR) == accel) { vec_push(out, d); }
+    }
+    return out;
+}
+
+# Total device memory in MB across all devices of a type.
+fn agnosai_hw_inventory_total_memory_mb(inv, accel): i64 {
+    var total = 0;
+    var matching = agnosai_hw_inventory_devices_of_type(inv, accel);
+    for (var i = 0; i < vec_len(matching); i = i + 1) {
+        total = total + load64(vec_get(matching, i) + AGN_DEV_MEMORY_TOTAL_MB);
+    }
+    return total;
+}
+
+# Whether any device in `matching` has at least `min_memory_mb` total memory.
+fn _agnosai_any_device_meets_memory(matching, min_memory_mb): i64 {
+    for (var i = 0; i < vec_len(matching); i = i + 1) {
+        if (load64(vec_get(matching, i) + AGN_DEV_MEMORY_TOTAL_MB) >= min_memory_mb) { return 1; }
+    }
+    return 0;
+}
+
+# Whether this inventory satisfies a hardware requirement.
+#
+# The branch order is the oracle's and is observable: CPU cores first, then
+# family-based matching (which returns outright), then specific-type matching.
+# An empty `accelerators` list with no family means "anything satisfies".
+fn agnosai_hw_inventory_satisfies(inv, req): i64 {
+    var min_cores = load64(req + AGN_REQ_MIN_CPU_CORES);
+    if (min_cores > 0 && load64(inv + AGN_INV_CPU_CORES) < min_cores) { return 0; }
+
+    var min_count = load64(req + AGN_REQ_MIN_DEVICE_COUNT);
+    var min_mem = load64(req + AGN_REQ_MIN_MEMORY_MB);
+    var devices = load64(inv + AGN_INV_DEVICES);
+
+    var family = load64(req + AGN_REQ_REQUIRED_FAMILY);
+    if (family != AGNOSAI_NO_LIMIT) {
+        var fam_match = vec_new();
+        for (var i = 0; i < vec_len(devices); i = i + 1) {
+            var d = vec_get(devices, i);
+            if (agnosai_accelerator_family_of(load64(d + AGN_DEV_ACCELERATOR)) == family) {
+                vec_push(fam_match, d);
+            }
+        }
+        if (vec_len(fam_match) == 0) { return 0; }
+        if (min_count > 0 && vec_len(fam_match) < min_count) { return 0; }
+        if (min_mem > 0 && _agnosai_any_device_meets_memory(fam_match, min_mem) == 0) { return 0; }
+        return 1;
+    }
+
+    var accels = load64(req + AGN_REQ_ACCELERATORS);
+    if (vec_len(accels) == 0) { return 1; }
+
+    var type_match = vec_new();
+    for (var j = 0; j < vec_len(devices); j = j + 1) {
+        var dev = vec_get(devices, j);
+        if (vec_find(accels, load64(dev + AGN_DEV_ACCELERATOR)) >= 0) { vec_push(type_match, dev); }
+    }
+    if (min_count > 0 && vec_len(type_match) < min_count) { return 0; }
+    if (min_mem > 0 && _agnosai_any_device_meets_memory(type_match, min_mem) == 0) { return 0; }
+    if (vec_len(type_match) == 0) { return 0; }
+    return 1;
+}
+
+# Create a resource budget. Pass AGNOSAI_NO_LIMIT for any unset field.
+# `max_cost_micro_usd` is millionths of a dollar.
+fn agnosai_resource_budget_new(max_tokens, max_cost_micro_usd, max_duration_secs,
+max_concurrent_tasks): i64 {
+    var b = alloc(AGN_BUD_SIZE);
+    store64(b + AGN_BUD_MAX_TOKENS, max_tokens);
+    store64(b + AGN_BUD_MAX_COST_MICRO_USD, max_cost_micro_usd);
+    store64(b + AGN_BUD_MAX_DURATION_SECS, max_duration_secs);
+    store64(b + AGN_BUD_MAX_CONCURRENT_TASKS, max_concurrent_tasks);
+    return b;
+}
+
+# The oracle's `Default`: no token, cost or duration ceiling, but at most 10
+# concurrent tasks.
+fn agnosai_resource_budget_default(): i64 {
+    return agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, 10);
+}
+
+# Maximum total LLM tokens, or AGNOSAI_NO_LIMIT.
+fn agnosai_resource_budget_max_tokens(b): i64 {
+    return load64(b + AGN_BUD_MAX_TOKENS);
+}
+
+# Maximum total cost in micro-USD, or AGNOSAI_NO_LIMIT.
+fn agnosai_resource_budget_max_cost_micro_usd(b): i64 {
+    return load64(b + AGN_BUD_MAX_COST_MICRO_USD);
+}
+
+# Maximum wall-clock seconds for the crew run, or AGNOSAI_NO_LIMIT.
+fn agnosai_resource_budget_max_duration_secs(b): i64 {
+    return load64(b + AGN_BUD_MAX_DURATION_SECS);
+}
+
+# Maximum number of concurrent crew executions, or AGNOSAI_NO_LIMIT.
+fn agnosai_resource_budget_max_concurrent_tasks(b): i64 {
+    return load64(b + AGN_BUD_MAX_CONCURRENT_TASKS);
+}
+
+# Micro-USD as the f64 dollar amount the wire carries.
+fn agnosai_micro_usd_to_f64(micro): i64 {
+    return f64_div(f64_from(micro), f64_from(AGNOSAI_MICRO_USD_PER_USD));
+}
+
+# An f64 dollar amount as micro-USD, rounded to the nearest millionth.
+fn agnosai_f64_to_micro_usd(usd): i64 {
+    return f64_to(f64_round(f64_mul(usd, f64_from(AGNOSAI_MICRO_USD_PER_USD))));
+}
+
+# A resource budget as a bayan JSON value. `max_cost_usd` keeps the oracle's
+# wire name and goes out as a JSON number in dollars — bayan's Grisu2 emits the
+# shortest round-tripping form, so 2500 micro-USD renders as `0.0025`, exactly
+# as serde rendered the f64.
+fn agnosai_resource_budget_to_value(b): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("max_tokens"),
+    _agnosai_opt_int_to_value(load64(b + AGN_BUD_MAX_TOKENS)));
+
+    var micro = load64(b + AGN_BUD_MAX_COST_MICRO_USD);
+    var cost_v = bayan_json_v_null();
+    if (micro != AGNOSAI_NO_LIMIT) {
+        cost_v = bayan_json_v_float_new(agnosai_micro_usd_to_f64(micro));
+    }
+    bayan_json_v_obj_set(obj, str_from("max_cost_usd"), cost_v);
+
+    bayan_json_v_obj_set(obj, str_from("max_duration_secs"),
+    _agnosai_opt_int_to_value(load64(b + AGN_BUD_MAX_DURATION_SECS)));
+    bayan_json_v_obj_set(obj, str_from("max_concurrent_tasks"),
+    _agnosai_opt_int_to_value(load64(b + AGN_BUD_MAX_CONCURRENT_TASKS)));
+    return obj;
+}
+
+# Rebuild a resource budget from a bayan JSON value. `max_cost_usd` is accepted
+# as either a JSON float or a whole-dollar integer.
+fn agnosai_resource_budget_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return agnosai_resource_budget_default(); }
+
+    var micro = AGNOSAI_NO_LIMIT;
+    var cv = bayan_json_v_obj_get(v, "max_cost_usd");
+    if (cv != 0) {
+        if (bayan_json_v_is_float(cv) == 1) {
+            micro = agnosai_f64_to_micro_usd(bayan_json_v_float(cv));
+        } elif (bayan_json_v_is_int(cv) == 1) {
+            micro = bayan_json_v_int(cv) * AGNOSAI_MICRO_USD_PER_USD;
+        }
+    }
+
+    return agnosai_resource_budget_new(_agnosai_opt_int_field(v, "max_tokens"), micro,
+    _agnosai_opt_int_field(v, "max_duration_secs"),
+    _agnosai_opt_int_field(v, "max_concurrent_tasks"));
+}
+
+# Create a GPU device with VRAM capacity information.
+fn agnosai_gpu_device_new(index, name: Str, vram_total_mb, vram_available_mb): i64 {
+    var g = alloc(AGN_GPU_SIZE);
+    store64(g + AGN_GPU_INDEX, index);
+    store64(g + AGN_GPU_NAME, name);
+    store64(g + AGN_GPU_VRAM_TOTAL_MB, vram_total_mb);
+    store64(g + AGN_GPU_VRAM_AVAILABLE_MB, vram_available_mb);
+    return g;
+}
+
+# Zero-based GPU index.
+fn agnosai_gpu_device_index(g): i64 {
+    return load64(g + AGN_GPU_INDEX);
+}
+
+# GPU device name.
+fn agnosai_gpu_device_name(g): i64 {
+    return load64(g + AGN_GPU_NAME);
+}
+
+# Total VRAM in megabytes.
+fn agnosai_gpu_device_vram_total_mb(g): i64 {
+    return load64(g + AGN_GPU_VRAM_TOTAL_MB);
+}
+
+# Available (free) VRAM in megabytes.
+fn agnosai_gpu_device_vram_available_mb(g): i64 {
+    return load64(g + AGN_GPU_VRAM_AVAILABLE_MB);
+}
+
+# A GPU device as a bayan JSON value.
+fn agnosai_gpu_device_to_value(g): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("index"), bayan_json_v_int_new(load64(g + AGN_GPU_INDEX)));
+    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(g + AGN_GPU_NAME)));
+    bayan_json_v_obj_set(obj, str_from("vram_total_mb"),
+    bayan_json_v_int_new(load64(g + AGN_GPU_VRAM_TOTAL_MB)));
+    bayan_json_v_obj_set(obj, str_from("vram_available_mb"),
+    bayan_json_v_int_new(load64(g + AGN_GPU_VRAM_AVAILABLE_MB)));
+    return obj;
+}
+
+# Rebuild a GPU device from a bayan JSON value, or 0 when not an object.
+fn agnosai_gpu_device_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var name = str_from("");
+    var nv = bayan_json_v_obj_get(v, "name");
+    if (nv != 0 && bayan_json_v_is_str(nv) == 1) { name = bayan_json_v_str(nv); }
+    return agnosai_gpu_device_new(_agnosai_int_field(v, "index", 0), name,
+    _agnosai_int_field(v, "vram_total_mb", 0), _agnosai_int_field(v, "vram_available_mb", 0));
+}
+
+# A hardware inventory as a bayan JSON value.
+fn agnosai_hw_inventory_to_value(inv): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("cpu_cores"), bayan_json_v_int_new(load64(inv + AGN_INV_CPU_CORES)));
+    bayan_json_v_obj_set(obj, str_from("memory_total_mb"),
+    bayan_json_v_int_new(load64(inv + AGN_INV_MEMORY_TOTAL_MB)));
+    var devices = load64(inv + AGN_INV_DEVICES);
+    var arr = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(devices); i = i + 1) {
+        bayan_json_v_arr_push(arr, agnosai_compute_device_to_value(vec_get(devices, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("devices"), arr);
+    return obj;
+}
+
+# Rebuild a hardware inventory from a bayan JSON value.
+fn agnosai_hw_inventory_from_value(v): i64 {
+    var devices = vec_new();
+    if (bayan_json_v_is_obj(v) == 0) { return agnosai_hw_inventory_new(0, 0, devices); }
+    var dv = bayan_json_v_obj_get(v, "devices");
+    if (dv != 0 && bayan_json_v_is_arr(dv) == 1) {
+        for (var i = 0; i < bayan_json_v_arr_len(dv); i = i + 1) {
+            var d = agnosai_compute_device_from_value(bayan_json_v_arr_get(dv, i));
+            if (d != 0) { vec_push(devices, d); }
+        }
+    }
+    return agnosai_hw_inventory_new(_agnosai_int_field(v, "cpu_cores", 0),
+    _agnosai_int_field(v, "memory_total_mb", 0), devices);
+}

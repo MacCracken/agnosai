@@ -1,0 +1,149 @@
+# =========================================================================
+# tools/registry — tool registration, lookup, and allow-list gating.
+#
+# Parity oracle: rust-old/src/tools/registry.rs
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * **The oracle uses `DashMap` for lock-free concurrency. Cyrius has no
+#     concurrent map, so this is a hashmap behind a futex mutex** — and the
+#     mutex is mandatory, not optional. `sandhi_server_run_pooled` makes every
+#     worker its own OS thread (port plan, the concurrency decision), so an
+#     unguarded `map_set` during a concurrent `map_get` is a live data race
+#     that would corrupt the table. Every entry point below takes the lock.
+#     On Linux `lib/sync.cyr` gives a real 2-state futex mutex; the agnos
+#     build's no-op is correct there because agnos threads run serially.
+#   * Lock granularity is the whole registry. That is right for this workload:
+#     registration happens at startup and lookups are a hash plus a pointer
+#     read, so the critical sections are nanoseconds. A sharded or read-biased
+#     lock would be speculative until a benchmark says otherwise.
+#   * `Arc<dyn NativeTool>` becomes the plain tool-vtable pointer from
+#     tools_native. Tools are process-lifetime and shared-immutable, which the
+#     port plan already established is a raw pointer rather than a refcount
+#     ("52 `Arc<` in src/, of which 49 are process-lifetime shared-immutable").
+# =========================================================================
+
+# ToolRegistry heap layout — 16 bytes.
+enum AgnosaiToolRegistryOff {
+    AGN_REG_TOOLS = 0;
+    AGN_REG_MUTEX = 8;
+    AGN_REG_SIZE = 16;
+}
+
+# Create an empty registry with its own lock.
+fn agnosai_tool_registry_new(): i64 {
+    var r = alloc(AGN_REG_SIZE);
+    store64(r + AGN_REG_TOOLS, map_new_str());
+    store64(r + AGN_REG_MUTEX, mutex_new());
+    return r;
+}
+
+# Register a tool, keyed by its name. An existing tool of the same name is
+# replaced, matching the oracle's `insert`.
+fn agnosai_tool_registry_register(r, tool): i64 {
+    var name = agnosai_tool_name(tool);
+    _agnosai_registry_log(SK_DEBUG, "registering tool", 16, name);
+    mutex_lock(load64(r + AGN_REG_MUTEX));
+    map_set(load64(r + AGN_REG_TOOLS), str_clone(name), tool);
+    mutex_unlock(load64(r + AGN_REG_MUTEX));
+    return 0;
+}
+
+# Look up a tool by name, or 0 when not registered.
+fn agnosai_tool_registry_get(r, name: Str): i64 {
+    mutex_lock(load64(r + AGN_REG_MUTEX));
+    var tool = map_get(load64(r + AGN_REG_TOOLS), name);
+    mutex_unlock(load64(r + AGN_REG_MUTEX));
+    return tool;
+}
+
+# Whether a tool with the given name is registered.
+fn agnosai_tool_registry_has(r, name: Str): i64 {
+    mutex_lock(load64(r + AGN_REG_MUTEX));
+    var present = map_has(load64(r + AGN_REG_TOOLS), name);
+    mutex_unlock(load64(r + AGN_REG_MUTEX));
+    return present;
+}
+
+# Remove a tool by name. Returns 1 if it was present, 0 otherwise.
+fn agnosai_tool_registry_remove(r, name: Str): i64 {
+    mutex_lock(load64(r + AGN_REG_MUTEX));
+    var tools = load64(r + AGN_REG_TOOLS);
+    var present = map_has(tools, name);
+    if (present == 1) { map_delete(tools, name); }
+    mutex_unlock(load64(r + AGN_REG_MUTEX));
+    return present;
+}
+
+# Number of currently registered tools.
+fn agnosai_tool_registry_count(r): i64 {
+    mutex_lock(load64(r + AGN_REG_MUTEX));
+    var n = map_size(load64(r + AGN_REG_TOOLS));
+    mutex_unlock(load64(r + AGN_REG_MUTEX));
+    return n;
+}
+
+# Vec of the schemas of all registered tools, unordered.
+#
+# The schema callbacks run **outside** the lock: a tool's `schema_fp` is
+# arbitrary user code, and calling it while holding the registry lock would let
+# one tool stall every other worker's lookups. The key snapshot is taken under
+# the lock, then released.
+fn agnosai_tool_registry_list(r): i64 {
+    mutex_lock(load64(r + AGN_REG_MUTEX));
+    var tools = load64(r + AGN_REG_TOOLS);
+    var keys = map_keys(tools);
+    var found = vec_new();
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        vec_push(found, map_get(tools, vec_get(keys, i)));
+    }
+    mutex_unlock(load64(r + AGN_REG_MUTEX));
+
+    var schemas = vec_new();
+    for (var j = 0; j < vec_len(found); j = j + 1) {
+        vec_push(schemas, agnosai_tool_schema(vec_get(found, j)));
+    }
+    return schemas;
+}
+
+# Vec of the names of all registered tools, unordered.
+fn agnosai_tool_registry_names(r): i64 {
+    mutex_lock(load64(r + AGN_REG_MUTEX));
+    var keys = map_keys(load64(r + AGN_REG_TOOLS));
+    mutex_unlock(load64(r + AGN_REG_MUTEX));
+    return keys;
+}
+
+# Whether a tool name is permitted by an agent's allow-list.
+#
+# **An empty list means no restriction** — every tool is allowed. That is the
+# oracle's rule and it is security-relevant in both directions: callers must
+# not treat an empty list as "deny all", and must not pass an empty list
+# expecting a default-deny.
+fn agnosai_is_tool_allowed(tool_name: Str, allowed_tools): i64 {
+    if (vec_len(allowed_tools) == 0) { return 1; }
+    for (var i = 0; i < vec_len(allowed_tools); i = i + 1) {
+        if (str_eq(vec_get(allowed_tools, i), tool_name) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# Look up a tool by name, enforcing an agent's allow-list.
+#
+# Returns 0 when the tool is not registered **or** not permitted. A blocked
+# lookup is logged at WARN, as the oracle does — a silently-empty result on a
+# denied tool call is exactly the thing an audit trail needs to see.
+fn agnosai_tool_registry_get_allowed(r, name: Str, allowed_tools): i64 {
+    if (agnosai_is_tool_allowed(name, allowed_tools) == 0) {
+        _agnosai_registry_log(SK_WARN, "tool call blocked: not in agent allow-list", 42, name);
+        return 0;
+    }
+    return agnosai_tool_registry_get(r, name);
+}
+
+# Emit a registry trace. Guarded on the live level so the formatting cost is
+# only paid when the message would actually be emitted.
+fn _agnosai_registry_log(level, msg, msg_len, tool_name: Str): i64 {
+    if (sakshi_get_level() < level) { return 0; }
+    sakshi_log_kv(level, msg, msg_len, "tool", 4, str_data(tool_name), str_len(tool_name));
+    return 0;
+}

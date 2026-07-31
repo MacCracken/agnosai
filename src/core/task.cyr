@@ -1,0 +1,673 @@
+# =========================================================================
+# core/task — tasks, priorities, statuses, results and the task DAG.
+#
+# Parity oracle: rust-old/src/core/task.rs
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * The four enums keep the oracle's **explicit discriminants**. For
+#     TaskPriority that is load-bearing: the oracle derives `Ord`, so
+#     `Critical > High > Normal > Low > Background` is observable behaviour and
+#     falls out of plain integer comparison here.
+#   * `Option<T>` fields are 0 when absent. On the wire they emit `null`, which
+#     is what serde does for an `Option` without `skip_serializing_if`.
+#   * The `with_*` builders mutate in place and return the task pointer, so they
+#     still chain. The oracle's take-by-value/return-Self form has no Cyrius
+#     equivalent and would copy the struct on every call.
+#   * `Vec<(String, String)>` edges become a vec of 2-slot heap pairs, emitted
+#     as JSON arrays `[["t1","t2"]]` exactly as serde emits a tuple.
+#
+# Every wire spelling below is the oracle's `rename_all = "snake_case"` form.
+# Unit variants serialize as bare strings; the two ProcessMode struct variants
+# are externally tagged, e.g. `{"parallel":{"max_concurrency":8}}`.
+# =========================================================================
+
+# Risk level for human-in-the-loop approval gating.
+enum AgnosaiTaskRisk {
+    AGNOSAI_RISK_LOW = 0;
+    AGNOSAI_RISK_MEDIUM = 1;
+    AGNOSAI_RISK_HIGH = 2;
+}
+
+# Priority tier for task scheduling (higher = more urgent).
+enum AgnosaiTaskPriority {
+    AGNOSAI_PRIORITY_BACKGROUND = 0;
+    AGNOSAI_PRIORITY_LOW = 1;
+    AGNOSAI_PRIORITY_NORMAL = 2;
+    AGNOSAI_PRIORITY_HIGH = 3;
+    AGNOSAI_PRIORITY_CRITICAL = 4;
+}
+
+# Lifecycle status of a task.
+enum AgnosaiTaskStatus {
+    AGNOSAI_STATUS_PENDING = 0;
+    AGNOSAI_STATUS_QUEUED = 1;
+    AGNOSAI_STATUS_RUNNING = 2;
+    AGNOSAI_STATUS_COMPLETED = 3;
+    AGNOSAI_STATUS_FAILED = 4;
+    AGNOSAI_STATUS_CANCELLED = 5;
+}
+
+# How tasks within a crew should be executed.
+enum AgnosaiProcessKind {
+    AGNOSAI_PROCESS_SEQUENTIAL = 0;
+    AGNOSAI_PROCESS_HIERARCHICAL = 1;
+    AGNOSAI_PROCESS_DAG = 2;
+    AGNOSAI_PROCESS_PARALLEL = 3;
+}
+
+# Task heap layout — 80 bytes.
+enum AgnosaiTaskOff {
+    AGN_TASK_ID = 0;
+    AGN_TASK_DESCRIPTION = 8;
+    AGN_TASK_EXPECTED_OUTPUT = 16;
+    AGN_TASK_ASSIGNED_AGENT = 24;
+    AGN_TASK_PRIORITY = 32;
+    AGN_TASK_STATUS = 40;
+    AGN_TASK_DEPENDENCIES = 48;
+    AGN_TASK_CONTEXT = 56;
+    AGN_TASK_RISK = 64;
+    AGN_TASK_OUTPUT_SCHEMA = 72;
+    AGN_TASK_SIZE = 80;
+}
+
+# TaskResult heap layout — 32 bytes.
+enum AgnosaiTaskResultOff {
+    AGN_TRES_TASK_ID = 0;
+    AGN_TRES_OUTPUT = 8;
+    AGN_TRES_STATUS = 16;
+    AGN_TRES_METADATA = 24;
+    AGN_TRES_SIZE = 32;
+}
+
+# ProcessMode heap layout — 24 bytes.
+enum AgnosaiProcessModeOff {
+    AGN_PROC_KIND = 0;
+    AGN_PROC_MANAGER = 8;
+    AGN_PROC_MAX_CONCURRENCY = 16;
+    AGN_PROC_SIZE = 24;
+}
+
+# TaskDAG heap layout — 24 bytes.
+enum AgnosaiTaskDagOff {
+    AGN_DAG_TASKS = 0;
+    AGN_DAG_EDGES = 8;
+    AGN_DAG_PROCESS = 16;
+    AGN_DAG_SIZE = 24;
+}
+
+# Edge heap layout — a (from, to) pair of Str, 16 bytes.
+enum AgnosaiEdgeOff {
+    AGN_EDGE_FROM = 0;
+    AGN_EDGE_TO = 8;
+    AGN_EDGE_SIZE = 16;
+}
+
+# The snake_case wire spelling of a risk level.
+fn agnosai_task_risk_to_wire(risk): i64 {
+    if (risk == AGNOSAI_RISK_MEDIUM) { return str_from("medium"); }
+    if (risk == AGNOSAI_RISK_HIGH) { return str_from("high"); }
+    return str_from("low");
+}
+
+# A risk level from its wire spelling. Unknown spellings fall back to the
+# oracle's default, Low.
+fn agnosai_task_risk_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("medium")) == 1) { return AGNOSAI_RISK_MEDIUM; }
+    if (str_eq(s, str_from("high")) == 1) { return AGNOSAI_RISK_HIGH; }
+    return AGNOSAI_RISK_LOW;
+}
+
+# The snake_case wire spelling of a priority tier.
+fn agnosai_task_priority_to_wire(priority): i64 {
+    if (priority == AGNOSAI_PRIORITY_BACKGROUND) { return str_from("background"); }
+    if (priority == AGNOSAI_PRIORITY_LOW) { return str_from("low"); }
+    if (priority == AGNOSAI_PRIORITY_HIGH) { return str_from("high"); }
+    if (priority == AGNOSAI_PRIORITY_CRITICAL) { return str_from("critical"); }
+    return str_from("normal");
+}
+
+# A priority tier from its wire spelling. Unknown spellings fall back to the
+# oracle's default, Normal.
+fn agnosai_task_priority_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("background")) == 1) { return AGNOSAI_PRIORITY_BACKGROUND; }
+    if (str_eq(s, str_from("low")) == 1) { return AGNOSAI_PRIORITY_LOW; }
+    if (str_eq(s, str_from("high")) == 1) { return AGNOSAI_PRIORITY_HIGH; }
+    if (str_eq(s, str_from("critical")) == 1) { return AGNOSAI_PRIORITY_CRITICAL; }
+    return AGNOSAI_PRIORITY_NORMAL;
+}
+
+# The snake_case wire spelling of a lifecycle status.
+fn agnosai_task_status_to_wire(status): i64 {
+    if (status == AGNOSAI_STATUS_QUEUED) { return str_from("queued"); }
+    if (status == AGNOSAI_STATUS_RUNNING) { return str_from("running"); }
+    if (status == AGNOSAI_STATUS_COMPLETED) { return str_from("completed"); }
+    if (status == AGNOSAI_STATUS_FAILED) { return str_from("failed"); }
+    if (status == AGNOSAI_STATUS_CANCELLED) { return str_from("cancelled"); }
+    return str_from("pending");
+}
+
+# A lifecycle status from its wire spelling. Unknown spellings fall back to the
+# oracle's default, Pending.
+fn agnosai_task_status_from_wire(s: Str): i64 {
+    if (str_eq(s, str_from("queued")) == 1) { return AGNOSAI_STATUS_QUEUED; }
+    if (str_eq(s, str_from("running")) == 1) { return AGNOSAI_STATUS_RUNNING; }
+    if (str_eq(s, str_from("completed")) == 1) { return AGNOSAI_STATUS_COMPLETED; }
+    if (str_eq(s, str_from("failed")) == 1) { return AGNOSAI_STATUS_FAILED; }
+    if (str_eq(s, str_from("cancelled")) == 1) { return AGNOSAI_STATUS_CANCELLED; }
+    return AGNOSAI_STATUS_PENDING;
+}
+
+# Execute tasks one after another in order.
+fn agnosai_process_sequential(): i64 {
+    var p = alloc(AGN_PROC_SIZE);
+    store64(p + AGN_PROC_KIND, AGNOSAI_PROCESS_SEQUENTIAL);
+    store64(p + AGN_PROC_MANAGER, 0);
+    store64(p + AGN_PROC_MAX_CONCURRENCY, 0);
+    return p;
+}
+
+# A manager agent delegates and coordinates sub-tasks.
+fn agnosai_process_hierarchical(manager): i64 {
+    var p = alloc(AGN_PROC_SIZE);
+    store64(p + AGN_PROC_KIND, AGNOSAI_PROCESS_HIERARCHICAL);
+    store64(p + AGN_PROC_MANAGER, manager);
+    store64(p + AGN_PROC_MAX_CONCURRENCY, 0);
+    return p;
+}
+
+# Execute respecting a directed acyclic graph of dependencies.
+fn agnosai_process_dag(): i64 {
+    var p = alloc(AGN_PROC_SIZE);
+    store64(p + AGN_PROC_KIND, AGNOSAI_PROCESS_DAG);
+    store64(p + AGN_PROC_MANAGER, 0);
+    store64(p + AGN_PROC_MAX_CONCURRENCY, 0);
+    return p;
+}
+
+# Execute tasks concurrently up to a concurrency limit.
+fn agnosai_process_parallel(max_concurrency): i64 {
+    var p = alloc(AGN_PROC_SIZE);
+    store64(p + AGN_PROC_KIND, AGNOSAI_PROCESS_PARALLEL);
+    store64(p + AGN_PROC_MANAGER, 0);
+    store64(p + AGN_PROC_MAX_CONCURRENCY, max_concurrency);
+    return p;
+}
+
+# Which execution mode this is.
+fn agnosai_process_kind(p): i64 {
+    return load64(p + AGN_PROC_KIND);
+}
+
+# The delegating manager's agent id, or 0 unless this is Hierarchical.
+fn agnosai_process_manager(p): i64 {
+    return load64(p + AGN_PROC_MANAGER);
+}
+
+# The concurrency ceiling, or 0 unless this is Parallel.
+fn agnosai_process_max_concurrency(p): i64 {
+    return load64(p + AGN_PROC_MAX_CONCURRENCY);
+}
+
+# A process mode as a bayan JSON value. Unit variants are bare snake_case
+# strings; the two data-carrying variants are externally tagged.
+fn agnosai_process_to_value(p): i64 {
+    var kind = load64(p + AGN_PROC_KIND);
+    if (kind == AGNOSAI_PROCESS_DAG) { return bayan_json_v_str_new(str_from("dag")); }
+    if (kind == AGNOSAI_PROCESS_HIERARCHICAL) {
+        var inner = bayan_json_v_obj_new();
+        var mgr = load64(p + AGN_PROC_MANAGER);
+        bayan_json_v_obj_set(inner, str_from("manager"), bayan_json_v_str_new(mgr));
+        var outer = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(outer, str_from("hierarchical"), inner);
+        return outer;
+    }
+    if (kind == AGNOSAI_PROCESS_PARALLEL) {
+        var pinner = bayan_json_v_obj_new();
+        var cap = bayan_json_v_int_new(load64(p + AGN_PROC_MAX_CONCURRENCY));
+        bayan_json_v_obj_set(pinner, str_from("max_concurrency"), cap);
+        var pouter = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(pouter, str_from("parallel"), pinner);
+        return pouter;
+    }
+    return bayan_json_v_str_new(str_from("sequential"));
+}
+
+# Rebuild a process mode from its JSON value. Anything unrecognized falls back
+# to the oracle's default, Sequential.
+fn agnosai_process_from_value(v): i64 {
+    if (bayan_json_v_is_str(v) == 1) {
+        if (str_eq(bayan_json_v_str(v), str_from("dag")) == 1) { return agnosai_process_dag(); }
+        return agnosai_process_sequential();
+    }
+    if (bayan_json_v_is_obj(v) == 0) { return agnosai_process_sequential(); }
+
+    var h = bayan_json_v_obj_get(v, "hierarchical");
+    if (h != 0 && bayan_json_v_is_obj(h) == 1) {
+        var m = bayan_json_v_obj_get(h, "manager");
+        if (m != 0 && bayan_json_v_is_str(m) == 1) {
+            var id = agnosai_uuid_canonical(bayan_json_v_str(m));
+            if (id != 0) { return agnosai_process_hierarchical(id); }
+        }
+        return agnosai_process_sequential();
+    }
+
+    var par = bayan_json_v_obj_get(v, "parallel");
+    if (par != 0 && bayan_json_v_is_obj(par) == 1) {
+        var mc = bayan_json_v_obj_get(par, "max_concurrency");
+        if (mc != 0 && bayan_json_v_is_int(mc) == 1) {
+            return agnosai_process_parallel(bayan_json_v_int(mc));
+        }
+    }
+    return agnosai_process_sequential();
+}
+
+# Create a new task with a description. Every other field takes the oracle's
+# default: no expected output, unassigned, Normal priority, Pending, Low risk.
+fn agnosai_task_new(description: Str): i64 {
+    var t = alloc(AGN_TASK_SIZE);
+    store64(t + AGN_TASK_ID, agnosai_uuid_v4_str());
+    store64(t + AGN_TASK_DESCRIPTION, description);
+    store64(t + AGN_TASK_EXPECTED_OUTPUT, 0);
+    store64(t + AGN_TASK_ASSIGNED_AGENT, 0);
+    store64(t + AGN_TASK_PRIORITY, AGNOSAI_PRIORITY_NORMAL);
+    store64(t + AGN_TASK_STATUS, AGNOSAI_STATUS_PENDING);
+    store64(t + AGN_TASK_DEPENDENCIES, vec_new());
+    store64(t + AGN_TASK_CONTEXT, map_new_str());
+    store64(t + AGN_TASK_RISK, AGNOSAI_RISK_LOW);
+    store64(t + AGN_TASK_OUTPUT_SCHEMA, 0);
+    return t;
+}
+
+# Set the expected output. Returns the task so calls chain.
+fn agnosai_task_with_expected_output(t, output: Str): i64 {
+    store64(t + AGN_TASK_EXPECTED_OUTPUT, output);
+    return t;
+}
+
+# Set the risk level for human-in-the-loop gating. Returns the task.
+fn agnosai_task_with_risk(t, risk): i64 {
+    store64(t + AGN_TASK_RISK, risk);
+    return t;
+}
+
+# Set a JSON Schema for output validation with retry. Returns the task.
+fn agnosai_task_with_output_schema(t, schema): i64 {
+    store64(t + AGN_TASK_OUTPUT_SCHEMA, schema);
+    return t;
+}
+
+# Set the task priority. Returns the task.
+fn agnosai_task_with_priority(t, priority): i64 {
+    store64(t + AGN_TASK_PRIORITY, priority);
+    return t;
+}
+
+# Assign an agent to execute this task. Returns the task.
+fn agnosai_task_with_agent(t, agent_id): i64 {
+    store64(t + AGN_TASK_ASSIGNED_AGENT, agent_id);
+    return t;
+}
+
+# Set the lifecycle status. Returns the task.
+fn agnosai_task_with_status(t, status): i64 {
+    store64(t + AGN_TASK_STATUS, status);
+    return t;
+}
+
+# Add a dependency on another task. Returns the task.
+fn agnosai_task_with_dependency(t, dep): i64 {
+    vec_push(load64(t + AGN_TASK_DEPENDENCIES), dep);
+    return t;
+}
+
+# Add a context key-value pair. `value` is a bayan JSON value. Returns the task.
+fn agnosai_task_with_context(t, key: Str, value): i64 {
+    map_set(load64(t + AGN_TASK_CONTEXT), str_clone(key), value);
+    return t;
+}
+
+# Unique task identifier.
+fn agnosai_task_id(t): i64 {
+    return load64(t + AGN_TASK_ID);
+}
+
+# Human-readable description of the task.
+fn agnosai_task_description(t): i64 {
+    return load64(t + AGN_TASK_DESCRIPTION);
+}
+
+# Description of the expected output format, or 0 when unset.
+fn agnosai_task_expected_output(t): i64 {
+    return load64(t + AGN_TASK_EXPECTED_OUTPUT);
+}
+
+# Agent assigned to execute this task, or 0 when unassigned.
+fn agnosai_task_assigned_agent(t): i64 {
+    return load64(t + AGN_TASK_ASSIGNED_AGENT);
+}
+
+# Execution priority tier.
+fn agnosai_task_priority(t): i64 {
+    return load64(t + AGN_TASK_PRIORITY);
+}
+
+# Current execution status.
+fn agnosai_task_status(t): i64 {
+    return load64(t + AGN_TASK_STATUS);
+}
+
+# Vec of task ids that must complete before this one.
+fn agnosai_task_dependencies(t): i64 {
+    return load64(t + AGN_TASK_DEPENDENCIES);
+}
+
+# Str-keyed map of arbitrary context passed to the executing agent.
+fn agnosai_task_context(t): i64 {
+    return load64(t + AGN_TASK_CONTEXT);
+}
+
+# Risk level for human-in-the-loop approval gating.
+fn agnosai_task_risk(t): i64 {
+    return load64(t + AGN_TASK_RISK);
+}
+
+# JSON Schema the task output must conform to, or 0 when unset.
+fn agnosai_task_output_schema(t): i64 {
+    return load64(t + AGN_TASK_OUTPUT_SCHEMA);
+}
+
+# The task as a bayan JSON value, fields in the oracle's declaration order.
+fn agnosai_task_to_value(t): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("id"),
+    bayan_json_v_str_new(load64(t + AGN_TASK_ID)));
+    bayan_json_v_obj_set(obj, str_from("description"),
+    bayan_json_v_str_new(load64(t + AGN_TASK_DESCRIPTION)));
+    bayan_json_v_obj_set(obj, str_from("expected_output"),
+    _agnosai_opt_str_to_value(load64(t + AGN_TASK_EXPECTED_OUTPUT)));
+
+    var agent = load64(t + AGN_TASK_ASSIGNED_AGENT);
+    var agent_v = bayan_json_v_null();
+    if (agent != 0) { agent_v = bayan_json_v_str_new(agent); }
+    bayan_json_v_obj_set(obj, str_from("assigned_agent"), agent_v);
+
+    bayan_json_v_obj_set(obj, str_from("priority"),
+    bayan_json_v_str_new(agnosai_task_priority_to_wire(load64(t + AGN_TASK_PRIORITY))));
+    bayan_json_v_obj_set(obj, str_from("status"),
+    bayan_json_v_str_new(agnosai_task_status_to_wire(load64(t + AGN_TASK_STATUS))));
+
+    var deps = load64(t + AGN_TASK_DEPENDENCIES);
+    var deps_v = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(deps); i = i + 1) {
+        bayan_json_v_arr_push(deps_v, bayan_json_v_str_new(vec_get(deps, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("dependencies"), deps_v);
+
+    bayan_json_v_obj_set(obj, str_from("context"), _agnosai_map_to_value(load64(t + AGN_TASK_CONTEXT)));
+    bayan_json_v_obj_set(obj, str_from("risk"),
+    bayan_json_v_str_new(agnosai_task_risk_to_wire(load64(t + AGN_TASK_RISK))));
+
+    var schema = load64(t + AGN_TASK_OUTPUT_SCHEMA);
+    if (schema == 0) { schema = bayan_json_v_null(); }
+    bayan_json_v_obj_set(obj, str_from("output_schema"), schema);
+    return obj;
+}
+
+# Rebuild a task from a bayan JSON value. Every field but `id` and
+# `description` is `#[serde(default)]` in the oracle, so a missing one takes
+# the default rather than failing. Returns 0 when the value is not an object or
+# `id` is missing or malformed.
+fn agnosai_task_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var id_v = bayan_json_v_obj_get(v, "id");
+    if (id_v == 0 || bayan_json_v_is_str(id_v) == 0) { return 0; }
+    var id = agnosai_uuid_canonical(bayan_json_v_str(id_v));
+    if (id == 0) { return 0; }
+
+    var desc = str_from("");
+    var desc_v = bayan_json_v_obj_get(v, "description");
+    if (desc_v != 0 && bayan_json_v_is_str(desc_v) == 1) { desc = bayan_json_v_str(desc_v); }
+
+    var t = agnosai_task_new(desc);
+    store64(t + AGN_TASK_ID, id);
+
+    var eo = bayan_json_v_obj_get(v, "expected_output");
+    if (eo != 0 && bayan_json_v_is_str(eo) == 1) {
+        store64(t + AGN_TASK_EXPECTED_OUTPUT, bayan_json_v_str(eo));
+    }
+
+    var aa = bayan_json_v_obj_get(v, "assigned_agent");
+    if (aa != 0 && bayan_json_v_is_str(aa) == 1) {
+        store64(t + AGN_TASK_ASSIGNED_AGENT, agnosai_uuid_canonical(bayan_json_v_str(aa)));
+    }
+
+    var pr = bayan_json_v_obj_get(v, "priority");
+    if (pr != 0 && bayan_json_v_is_str(pr) == 1) {
+        store64(t + AGN_TASK_PRIORITY, agnosai_task_priority_from_wire(bayan_json_v_str(pr)));
+    }
+
+    var st = bayan_json_v_obj_get(v, "status");
+    if (st != 0 && bayan_json_v_is_str(st) == 1) {
+        store64(t + AGN_TASK_STATUS, agnosai_task_status_from_wire(bayan_json_v_str(st)));
+    }
+
+    var dv = bayan_json_v_obj_get(v, "dependencies");
+    if (dv != 0 && bayan_json_v_is_arr(dv) == 1) {
+        var deps = load64(t + AGN_TASK_DEPENDENCIES);
+        for (var i = 0; i < bayan_json_v_arr_len(dv); i = i + 1) {
+            var e = bayan_json_v_arr_get(dv, i);
+            if (bayan_json_v_is_str(e) == 1) {
+                var did = agnosai_uuid_canonical(bayan_json_v_str(e));
+                if (did != 0) { vec_push(deps, did); }
+            }
+        }
+    }
+
+    store64(t + AGN_TASK_CONTEXT, _agnosai_map_from_value(bayan_json_v_obj_get(v, "context")));
+
+    var rk = bayan_json_v_obj_get(v, "risk");
+    if (rk != 0 && bayan_json_v_is_str(rk) == 1) {
+        store64(t + AGN_TASK_RISK, agnosai_task_risk_from_wire(bayan_json_v_str(rk)));
+    }
+
+    var os = bayan_json_v_obj_get(v, "output_schema");
+    if (os != 0 && bayan_json_v_is_null(os) == 0) {
+        store64(t + AGN_TASK_OUTPUT_SCHEMA, os);
+    }
+    return t;
+}
+
+# The task serialized to JSON text.
+fn agnosai_task_to_json(t): i64 {
+    return bayan_json_v_build(agnosai_task_to_value(t));
+}
+
+# Parse a task from JSON text. Returns 0 on a parse error or a malformed task.
+# See core_message.cyr for why this calls `bayan_json_v_parse_buf` rather than
+# the bare entry — it switches at the next bayan fold-in.
+fn agnosai_task_from_json(src: Str): i64 {
+    var v = bayan_json_v_parse_buf(str_data(src), str_len(src));
+    if (v == 0) { return 0; }
+    return agnosai_task_from_value(v);
+}
+
+# Create a result produced by executing a task.
+fn agnosai_task_result_new(task_id, output: Str, status): i64 {
+    var r = alloc(AGN_TRES_SIZE);
+    store64(r + AGN_TRES_TASK_ID, task_id);
+    store64(r + AGN_TRES_OUTPUT, output);
+    store64(r + AGN_TRES_STATUS, status);
+    store64(r + AGN_TRES_METADATA, map_new_str());
+    return r;
+}
+
+# ID of the task that produced this result.
+fn agnosai_task_result_task_id(r): i64 {
+    return load64(r + AGN_TRES_TASK_ID);
+}
+
+# Output text or data from execution.
+fn agnosai_task_result_output(r): i64 {
+    return load64(r + AGN_TRES_OUTPUT);
+}
+
+# Final status of the task.
+fn agnosai_task_result_status(r): i64 {
+    return load64(r + AGN_TRES_STATUS);
+}
+
+# Str-keyed map of metadata attached to the result.
+fn agnosai_task_result_metadata(r): i64 {
+    return load64(r + AGN_TRES_METADATA);
+}
+
+# Attach a metadata key-value pair. `value` is a bayan JSON value.
+fn agnosai_task_result_with_metadata(r, key: Str, value): i64 {
+    map_set(load64(r + AGN_TRES_METADATA), str_clone(key), value);
+    return r;
+}
+
+# The result as a bayan JSON value, fields in declaration order.
+fn agnosai_task_result_to_value(r): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("task_id"),
+    bayan_json_v_str_new(load64(r + AGN_TRES_TASK_ID)));
+    bayan_json_v_obj_set(obj, str_from("output"), bayan_json_v_str_new(load64(r + AGN_TRES_OUTPUT)));
+    bayan_json_v_obj_set(obj, str_from("status"),
+    bayan_json_v_str_new(agnosai_task_status_to_wire(load64(r + AGN_TRES_STATUS))));
+    bayan_json_v_obj_set(obj, str_from("metadata"),
+    _agnosai_map_to_value(load64(r + AGN_TRES_METADATA)));
+    return obj;
+}
+
+# Rebuild a result from a bayan JSON value. Returns 0 when `task_id` is missing
+# or malformed.
+fn agnosai_task_result_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var tid_v = bayan_json_v_obj_get(v, "task_id");
+    if (tid_v == 0 || bayan_json_v_is_str(tid_v) == 0) { return 0; }
+    var tid = agnosai_uuid_canonical(bayan_json_v_str(tid_v));
+    if (tid == 0) { return 0; }
+
+    var output = str_from("");
+    var ov = bayan_json_v_obj_get(v, "output");
+    if (ov != 0 && bayan_json_v_is_str(ov) == 1) { output = bayan_json_v_str(ov); }
+
+    var status = AGNOSAI_STATUS_PENDING;
+    var sv = bayan_json_v_obj_get(v, "status");
+    if (sv != 0 && bayan_json_v_is_str(sv) == 1) {
+        status = agnosai_task_status_from_wire(bayan_json_v_str(sv));
+    }
+
+    var r = agnosai_task_result_new(tid, output, status);
+    store64(r + AGN_TRES_METADATA, _agnosai_map_from_value(bayan_json_v_obj_get(v, "metadata")));
+    return r;
+}
+
+# Create a new DAG. `tasks` is a Str-keyed map of task pointers, `edges` a vec
+# of (from, to) pairs, `process` a process mode.
+fn agnosai_task_dag_new(tasks, edges, process): i64 {
+    var d = alloc(AGN_DAG_SIZE);
+    store64(d + AGN_DAG_TASKS, tasks);
+    store64(d + AGN_DAG_EDGES, edges);
+    store64(d + AGN_DAG_PROCESS, process);
+    return d;
+}
+
+# A (from, to) edge pair.
+fn agnosai_edge_new(from: Str, to: Str): i64 {
+    var e = alloc(AGN_EDGE_SIZE);
+    store64(e + AGN_EDGE_FROM, from);
+    store64(e + AGN_EDGE_TO, to);
+    return e;
+}
+
+# The source end of an edge.
+fn agnosai_edge_from(e): i64 {
+    return load64(e + AGN_EDGE_FROM);
+}
+
+# The destination end of an edge.
+fn agnosai_edge_to(e): i64 {
+    return load64(e + AGN_EDGE_TO);
+}
+
+# Str-keyed map of the DAG's tasks.
+fn agnosai_task_dag_tasks(d): i64 {
+    return load64(d + AGN_DAG_TASKS);
+}
+
+# Vec of the DAG's (from, to) edges.
+fn agnosai_task_dag_edges(d): i64 {
+    return load64(d + AGN_DAG_EDGES);
+}
+
+# The DAG's execution mode.
+fn agnosai_task_dag_process(d): i64 {
+    return load64(d + AGN_DAG_PROCESS);
+}
+
+# The DAG as a bayan JSON value. Edges emit as two-element arrays, matching
+# serde's rendering of a `(String, String)` tuple.
+fn agnosai_task_dag_to_value(d): i64 {
+    var obj = bayan_json_v_obj_new();
+
+    var tasks = load64(d + AGN_DAG_TASKS);
+    var tasks_v = bayan_json_v_obj_new();
+    var keys = map_keys(tasks);
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var k = vec_get(keys, i);
+        bayan_json_v_obj_set(tasks_v, k, agnosai_task_to_value(map_get(tasks, k)));
+    }
+    bayan_json_v_obj_set(obj, str_from("tasks"), tasks_v);
+
+    var edges = load64(d + AGN_DAG_EDGES);
+    var edges_v = bayan_json_v_arr_new();
+    for (var j = 0; j < vec_len(edges); j = j + 1) {
+        var e = vec_get(edges, j);
+        var pair = bayan_json_v_arr_new();
+        bayan_json_v_arr_push(pair, bayan_json_v_str_new(load64(e + AGN_EDGE_FROM)));
+        bayan_json_v_arr_push(pair, bayan_json_v_str_new(load64(e + AGN_EDGE_TO)));
+        bayan_json_v_arr_push(edges_v, pair);
+    }
+    bayan_json_v_obj_set(obj, str_from("edges"), edges_v);
+
+    bayan_json_v_obj_set(obj, str_from("process"), agnosai_process_to_value(load64(d + AGN_DAG_PROCESS)));
+    return obj;
+}
+
+# Rebuild a DAG from a bayan JSON value. Returns 0 when the value is not an
+# object; missing `tasks`/`edges`/`process` take empty/default values.
+fn agnosai_task_dag_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+
+    var tasks = map_new_str();
+    var tv = bayan_json_v_obj_get(v, "tasks");
+    if (tv != 0 && bayan_json_v_is_obj(tv) == 1) {
+        for (var i = 0; i < bayan_json_v_obj_len(tv); i = i + 1) {
+            var t = agnosai_task_from_value(bayan_json_v_obj_val(tv, i));
+            if (t != 0) { map_set(tasks, str_clone(bayan_json_v_obj_key(tv, i)), t); }
+        }
+    }
+
+    var edges = vec_new();
+    var ev = bayan_json_v_obj_get(v, "edges");
+    if (ev != 0 && bayan_json_v_is_arr(ev) == 1) {
+        for (var j = 0; j < bayan_json_v_arr_len(ev); j = j + 1) {
+            var pair = bayan_json_v_arr_get(ev, j);
+            if (bayan_json_v_is_arr(pair) == 1 && bayan_json_v_arr_len(pair) == 2) {
+                var a = bayan_json_v_arr_get(pair, 0);
+                var b = bayan_json_v_arr_get(pair, 1);
+                if (bayan_json_v_is_str(a) == 1 && bayan_json_v_is_str(b) == 1) {
+                    vec_push(edges, agnosai_edge_new(bayan_json_v_str(a), bayan_json_v_str(b)));
+                }
+            }
+        }
+    }
+
+    var pv = bayan_json_v_obj_get(v, "process");
+    var process = agnosai_process_sequential();
+    if (pv != 0) { process = agnosai_process_from_value(pv); }
+
+    return agnosai_task_dag_new(tasks, edges, process);
+}

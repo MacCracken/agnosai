@@ -1,0 +1,306 @@
+# =========================================================================
+# orchestrator/orchestrator — the crew registry and lifecycle.
+#
+# Parity oracle: rust-old/src/orchestrator/orchestrator.rs
+#
+# The layer above `orch_crew_runner`: it accepts a crew spec, registers it,
+# hands it to a runner, records the result, and lets a caller cancel it by id.
+# The last M5 module.
+#
+# ## What the HTTP seam removes
+#
+# The oracle's struct carries a `ResponseCache` and a `CostTracker`, both
+# `pub use hoosh::…` re-exports shared across every crew execution. Neither is
+# here: hoosh caches and costs server-side, and `orch_crew_runner`'s header
+# records why deleting the client cache is a correctness fix rather than a
+# simplification. What remains is genuinely agnosai's — the registry, the
+# cancellation tokens, the budget, the audit chain and the event bus.
+#
+# The `OnceLock<Arc<HooshClient>>` lazy-init also goes: the port's client is two
+# Strs, so there is nothing expensive to defer. `llm_url` of 0 keeps its meaning
+# — no gateway configured, so every task takes the placeholder path.
+#
+# ## Concurrency
+#
+# The oracle bounds concurrent crews with a `Semaphore` and a per-crew
+# `RwLock`-guarded registry. This runs a crew on the calling thread, so the
+# bound is the caller's; the registry is mutex-guarded because
+# `orch_crew_runner`'s parallel and DAG modes spawn real threads and a caller
+# may drive several crews from several threads. `MAX_RETAINED_CREWS` eviction is
+# reproduced exactly, including that it only evicts **finished** crews — a
+# registry full of running crews grows past the cap rather than dropping live
+# state, which is the oracle's behaviour and the safe one.
+# =========================================================================
+
+# The oracle's `MAX_RETAINED_CREWS`.
+var AGNOSAI_MAX_RETAINED_CREWS = 1000;
+
+# The oracle's fallback execution timeout when the budget sets none — one hour.
+var AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS = 3600;
+
+enum AgnosaiOrchestratorOff {
+    AGN_OR_CREWS = 0;
+    AGN_OR_BUDGET = 8;
+    AGN_OR_EVENTS = 16;
+    AGN_OR_LLM_URL = 24;
+    AGN_OR_LLM_KEY = 32;
+    AGN_OR_CANCEL = 40;
+    AGN_OR_AUDIT = 48;
+    AGN_OR_MUTEX = 56;
+    AGN_OR_SIZE = 64;
+}
+
+# Create an orchestrator over a resource budget.
+#
+# The audit chain is minted here with its own CSPRNG key, exactly as the
+# oracle's `Orchestrator::new` does — it is the orchestration trail, separate by
+# construction from hoosh's inference trail.
+fn agnosai_orchestrator_new(budget): i64 {
+    var o = alloc(AGN_OR_SIZE);
+    store64(o + AGN_OR_CREWS, map_new_str());
+    store64(o + AGN_OR_BUDGET, budget);
+    store64(o + AGN_OR_EVENTS, 0);
+    store64(o + AGN_OR_LLM_URL, 0);
+    store64(o + AGN_OR_LLM_KEY, str_from(""));
+    store64(o + AGN_OR_CANCEL, map_new_str());
+    store64(o + AGN_OR_AUDIT, agnosai_audit_chain_new());
+    store64(o + AGN_OR_MUTEX, mutex_new());
+    return o;
+}
+
+# Attach an event bus. Each crew gets its own sender, removed when it finishes.
+fn agnosai_orchestrator_with_events(o, bus): i64 {
+    store64(o + AGN_OR_EVENTS, bus);
+    return o;
+}
+
+# Point the orchestrator at a hoosh gateway. Without one, every task takes the
+# placeholder path — the oracle's `llm_url: None`.
+fn agnosai_orchestrator_with_llm_url(o, url: Str, api_key: Str): i64 {
+    store64(o + AGN_OR_LLM_URL, url);
+    store64(o + AGN_OR_LLM_KEY, api_key);
+    return o;
+}
+
+# Replace the audit chain — the oracle's `with_audit`.
+fn agnosai_orchestrator_with_audit(o, chain): i64 {
+    store64(o + AGN_OR_AUDIT, chain);
+    return o;
+}
+
+# The orchestrator's audit chain.
+fn agnosai_orchestrator_audit(o): i64 {
+    return load64(o + AGN_OR_AUDIT);
+}
+
+# The resource budget.
+fn agnosai_orchestrator_budget(o): i64 {
+    return load64(o + AGN_OR_BUDGET);
+}
+
+# A crew's last known state by id, or 0 when it is not registered.
+fn agnosai_orchestrator_crew(o, crew_id: Str): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var s = map_get(load64(o + AGN_OR_CREWS), crew_id);
+    mutex_unlock(mtx);
+    return s;
+}
+
+# The ids of every crew the registry holds, as a vec of Str.
+#
+# The oracle has no equivalent: its handlers hold an `RwLock` read guard and
+# walk `orch_state.active_crews.values()` directly. That shape does not port —
+# holding this mutex across a caller's arbitrary work would stall every worker
+# thread's crew lookups, which is the same reasoning `tools_registry.list` and
+# `server_state`'s definitions snapshot already follow.
+#
+# So callers take the ids under the lock, then fetch each state with
+# `agnosai_orchestrator_crew` afterwards. A crew that finishes between the two
+# calls answers 0 and the caller skips it — which is the behaviour a read guard
+# would have prevented, and is worth less than the contention it costs.
+# Added for `routes/dashboard.rs`, its only consumer today.
+fn agnosai_orchestrator_crew_ids(o): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var ids = map_keys(load64(o + AGN_OR_CREWS));
+    mutex_unlock(mtx);
+    return ids;
+}
+
+# How many crews the registry holds.
+fn agnosai_orchestrator_crew_count(o): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var n = map_size(load64(o + AGN_OR_CREWS));
+    mutex_unlock(mtx);
+    return n;
+}
+
+# The crew execution timeout in seconds — the budget's, or the one-hour default.
+fn agnosai_orchestrator_timeout_secs(o): i64 {
+    var secs = agnosai_resource_budget_max_duration_secs(load64(o + AGN_OR_BUDGET));
+    if (secs == AGNOSAI_NO_LIMIT || secs <= 0) { return AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS; }
+    return secs;
+}
+
+# Whether a crew state is in a terminal state and so evictable.
+fn _agnosai_orch_is_finished(state): i64 {
+    var s = agnosai_crew_state_status(state);
+    if (s == AGNOSAI_CREW_COMPLETED) { return 1; }
+    if (s == AGNOSAI_CREW_FAILED) { return 1; }
+    if (s == AGNOSAI_CREW_CANCELLED) { return 1; }
+    return 0;
+}
+
+# Drop finished crews when the registry is at capacity. The caller holds the
+# lock.
+#
+# Only **finished** crews go. A registry full of running crews grows past the
+# cap rather than dropping live state — the oracle's `retain`, and the safe
+# reading of a cap that exists to bound memory rather than to bound work.
+fn _agnosai_orch_evict_locked(o): i64 {
+    var crews = load64(o + AGN_OR_CREWS);
+    if (map_size(crews) < AGNOSAI_MAX_RETAINED_CREWS) { return 0; }
+    var keys = map_keys(crews);
+    var evicted = 0;
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var k = vec_get(keys, i);
+        if (_agnosai_orch_is_finished(map_get(crews, k)) == 1) {
+            map_delete(crews, k);
+            evicted = evicted + 1;
+        }
+    }
+    return evicted;
+}
+
+# Record one of the orchestrator's three audit events.
+fn _agnosai_orch_audit(o, event: Str, level: Str, message: Str, metadata): i64 {
+    var chain = load64(o + AGN_OR_AUDIT);
+    if (chain == 0) { return 0; }
+    return agnosai_audit_record(chain, event, level, message, 0, 0, metadata);
+}
+
+# The audit level for a finished crew's status.
+fn _agnosai_orch_level_for(status): i64 {
+    if (status == AGNOSAI_CREW_FAILED) { return str_from("error"); }
+    if (status == AGNOSAI_CREW_CANCELLED) { return str_from("warn"); }
+    return str_from("info");
+}
+
+# Accept a crew spec, run it, and return its final state.
+#
+# Order matters and is the oracle's: audit `crew_accepted` **before** the crew
+# is registered and long before it runs, so a crash mid-run still leaves the
+# acceptance in the trail; register as `Pending`; run; audit `crew_finished`;
+# store the final state; then clean up the cancel token and the event channel.
+#
+# The event channel is removed at the end, which is what stops a long-lived
+# orchestrator accumulating one channel per crew ever run.
+fn agnosai_orchestrator_run_crew(o, spec): i64 {
+    var crew_id = agnosai_crew_id(spec);
+    var crew_name = agnosai_crew_name(spec);
+    var tasks = agnosai_crew_tasks(spec);
+
+    var accepted = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(accepted, str_from("crew_id"), bayan_json_v_str_new(crew_id));
+    bayan_json_v_obj_set(accepted, str_from("task_count"), bayan_json_v_int_new(vec_len(tasks)));
+    _agnosai_orch_audit(o, str_from("crew_accepted"), str_from("info"), crew_name, accepted);
+
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    _agnosai_orch_evict_locked(o);
+    map_set(load64(o + AGN_OR_CREWS), str_clone(crew_id),
+    agnosai_crew_state_new(crew_id, AGNOSAI_CREW_PENDING));
+    mutex_unlock(mtx);
+
+    var runner = agnosai_crew_runner_new(spec);
+    agnosai_crew_runner_with_audit(runner, load64(o + AGN_OR_AUDIT));
+
+    # Publish the cancel flag so `cancel_crew` can reach a running crew.
+    mutex_lock(mtx);
+    map_set(load64(o + AGN_OR_CANCEL), str_clone(crew_id),
+    agnosai_crew_runner_cancel_flag(runner));
+    mutex_unlock(mtx);
+
+    var url = load64(o + AGN_OR_LLM_URL);
+    if (url != 0) {
+        agnosai_crew_runner_with_llm(runner,
+        agnosai_hoosh_client_new(url, load64(o + AGN_OR_LLM_KEY)));
+    }
+
+    var bus = load64(o + AGN_OR_EVENTS);
+    if (bus != 0) {
+        agnosai_crew_runner_with_events(runner, agnosai_event_bus_sender(bus, crew_id));
+    }
+
+    var run_err: i64[1];
+    store64(&run_err, 0);
+    var state = agnosai_crew_runner_run(runner, &run_err);
+
+    # A cyclic DAG errors out. The oracle's `?` propagates it, so no state is
+    # stored and no `crew_finished` is audited — the crew never ran.
+    if (state == 0) {
+        mutex_lock(mtx);
+        map_delete(load64(o + AGN_OR_CANCEL), crew_id);
+        mutex_unlock(mtx);
+        return 0;
+    }
+
+    var status = agnosai_crew_state_status(state);
+    var profile = agnosai_crew_state_profile(state);
+    var wall_ms = 0;
+    var cost = 0;
+    if (profile != 0) {
+        wall_ms = agnosai_crew_profile_wall_ms(profile);
+        cost = agnosai_crew_profile_cost_micro_usd(profile);
+    }
+
+    var finished = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(finished, str_from("crew_id"), bayan_json_v_str_new(crew_id));
+    bayan_json_v_obj_set(finished, str_from("status"),
+    bayan_json_v_str_new(agnosai_crew_status_to_wire(status)));
+    bayan_json_v_obj_set(finished, str_from("task_count"),
+    bayan_json_v_int_new(vec_len(agnosai_crew_state_results(state))));
+    bayan_json_v_obj_set(finished, str_from("wall_ms"), bayan_json_v_int_new(wall_ms));
+    bayan_json_v_obj_set(finished, str_from("cost_micro_usd"), bayan_json_v_int_new(cost));
+    _agnosai_orch_audit(o, str_from("crew_finished"), _agnosai_orch_level_for(status),
+    crew_name, finished);
+
+    mutex_lock(mtx);
+    map_set(load64(o + AGN_OR_CREWS), str_clone(crew_id), state);
+    map_delete(load64(o + AGN_OR_CANCEL), crew_id);
+    mutex_unlock(mtx);
+
+    if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
+    return state;
+}
+
+# Cancel a crew by id. Returns 0, or a CrewNotFound error.
+#
+# Sets the shared flag so a running crew stops scheduling new tasks — work
+# already in flight finishes — and marks the registered state Cancelled.
+#
+# An unknown id is an ERROR, not a silent no-op: a caller cancelling a crew that
+# was never registered has a bug, and the oracle says so.
+fn agnosai_orchestrator_cancel_crew(o, crew_id: Str): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+
+    var flag = map_get(load64(o + AGN_OR_CANCEL), crew_id);
+    if (flag != 0) { store64(flag, 1); }
+
+    var state = map_get(load64(o + AGN_OR_CREWS), crew_id);
+    if (state == 0) {
+        mutex_unlock(mtx);
+        return agnosai_error_crew_not_found(crew_id);
+    }
+    agnosai_crew_state_with_status(state, AGNOSAI_CREW_CANCELLED);
+    mutex_unlock(mtx);
+
+    var md = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(md, str_from("crew_id"), bayan_json_v_str_new(crew_id));
+    _agnosai_orch_audit(o, str_from("crew_cancelled"), str_from("warn"),
+    str_from("crew cancelled by caller"), md);
+    return 0;
+}

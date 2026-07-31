@@ -1,0 +1,200 @@
+# =========================================================================
+# learning/profile — per-agent success rates and duration tracking.
+#
+# Parity oracle: rust-old/src/learning/profile.rs
+#
+# Port notes (divergences from the Rust shape, all deliberate):
+#   * `Duration` becomes a plain i64 **nanosecond** count. i64 ns spans ~292
+#     years, so the range Rust's Duration covered in practice is preserved, and
+#     averaging is one integer division instead of Duration's split secs/nanos
+#     arithmetic. `avg` is floor(total_ns / count), which is exact where Rust's
+#     `Duration / u32` is exact and never less accurate where it is not.
+#   * `DateTime<Utc>` becomes nanoseconds since the Unix epoch (clock_epoch_ns).
+#   * `Option<T>` returns become presence-return + out-param: the fn returns 1
+#     and writes through `out` where Rust returned `Some(v)`, and returns 0
+#     without touching `out` where Rust returned `None`. This keeps the query
+#     path allocation-free, which a tagged Option could not.
+# =========================================================================
+
+# Maximum number of action records retained per agent.
+# Mirrors profile.rs's MAX_RECORDS_PER_AGENT.
+var AGNOSAI_MAX_RECORDS_PER_AGENT = 10000;
+
+# ActionRecord heap layout — 32 bytes.
+enum AgnosaiActionRecOff {
+    AGN_REC_ACTION_TYPE = 0;
+    AGN_REC_DURATION_NS = 8;
+    AGN_REC_SUCCESS = 16;
+    AGN_REC_TIMESTAMP_NS = 24;
+    AGN_REC_SIZE = 32;
+}
+
+# Allocate an ActionRecord stamped with the current wall-clock time.
+fn _agnosai_action_record_new(action_type: Str, duration_ns, success): i64 {
+    var r = alloc(AGN_REC_SIZE);
+    store64(r + AGN_REC_ACTION_TYPE, action_type);
+    store64(r + AGN_REC_DURATION_NS, duration_ns);
+    store64(r + AGN_REC_SUCCESS, success);
+    store64(r + AGN_REC_TIMESTAMP_NS, clock_epoch_ns());
+    return r;
+}
+
+# The record vec for an agent, inserting an empty one when absent.
+# The key is cloned on insert, matching the Rust `agent_key.to_string()`.
+fn _agnosai_profile_entry(p, agent_key: Str): i64 {
+    var records = load64(p);
+    var v = map_get(records, agent_key);
+    if (v != 0) { return v; }
+    v = vec_new();
+    map_set(records, str_clone(agent_key), v);
+    return v;
+}
+
+# Emit the debug trace Rust's `debug!(agent_key, action_type, success,
+# duration_ms)` carries. Guarded on the live level so the formatting cost is
+# only paid when the message would be emitted.
+fn _agnosai_profile_log(agent_key: Str, action_type: Str, duration_ns, success): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, agent_key);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add(sb, action_type);
+    str_builder_add_cstr(sb, " success=");
+    str_builder_add_int(sb, success);
+    str_builder_add_cstr(sb, " duration_ms=");
+    str_builder_add_int(sb, duration_ns / AGNOSAI_NS_PER_MS);
+    var line = str_builder_build(sb);
+    sakshi_log_kv(SK_DEBUG, "action recorded", 15, "agent", 5, str_data(line), str_len(line));
+    return 0;
+}
+
+# Create an empty performance profile.
+fn agnosai_profile_new(): i64 {
+    var p = alloc(8);
+    store64(p, map_new_str());
+    return p;
+}
+
+# Record an action outcome for the given agent. `duration_ns` is nanoseconds;
+# `success` is 1 or 0. Evicts the oldest records once the agent is at capacity.
+fn agnosai_profile_record(p, agent_key: Str, action_type: Str, duration_ns, success): i64 {
+    var records = _agnosai_profile_entry(p, agent_key);
+
+    # Evict oldest records when at capacity — Rust drains
+    # `len - MAX + 1` from the front so the following push lands at exactly MAX.
+    var len = vec_len(records);
+    if (len >= AGNOSAI_MAX_RECORDS_PER_AGENT) {
+        var drain = len - AGNOSAI_MAX_RECORDS_PER_AGENT + 1;
+        for (var d = 0; d < drain; d = d + 1) {
+            vec_remove(records, 0);
+        }
+    }
+
+    _agnosai_profile_log(agent_key, action_type, duration_ns, success);
+    vec_push(records, _agnosai_action_record_new(str_clone(action_type), duration_ns, success));
+    return 0;
+}
+
+# Overall success rate for the agent across all action types.
+# Returns 1 and writes the f64 bit pattern to `out`; returns 0 (Rust `None`)
+# for an unknown agent or one with no records.
+fn agnosai_profile_success_rate(p, agent_key: Str, out): i64 {
+    var records = map_get(load64(p), agent_key);
+    if (records == 0) { return 0; }
+    var len = vec_len(records);
+    if (len == 0) { return 0; }
+
+    var hits = 0;
+    for (var i = 0; i < len; i = i + 1) {
+        if (load64(vec_get(records, i) + AGN_REC_SUCCESS) == 1) { hits = hits + 1; }
+    }
+    store64(out, f64_div(f64_from(hits), f64_from(len)));
+    return 1;
+}
+
+# Success rate for one action type. Returns 1 and writes the f64 bit pattern to
+# `out`; returns 0 (Rust `None`) when the agent has no records of that type.
+fn agnosai_profile_success_rate_for_action(p, agent_key: Str, action_type: Str, out): i64 {
+    var records = map_get(load64(p), agent_key);
+    if (records == 0) { return 0; }
+
+    var total = 0;
+    var hits = 0;
+    var len = vec_len(records);
+    for (var i = 0; i < len; i = i + 1) {
+        var r = vec_get(records, i);
+        if (str_eq(load64(r + AGN_REC_ACTION_TYPE), action_type) == 1) {
+            total = total + 1;
+            if (load64(r + AGN_REC_SUCCESS) == 1) { hits = hits + 1; }
+        }
+    }
+    if (total == 0) { return 0; }
+    store64(out, f64_div(f64_from(hits), f64_from(total)));
+    return 1;
+}
+
+# Average duration in nanoseconds across all actions for the agent.
+# Returns 1 and writes the ns count to `out`; returns 0 (Rust `None`) for an
+# unknown agent or one with no records.
+fn agnosai_profile_avg_duration(p, agent_key: Str, out): i64 {
+    var records = map_get(load64(p), agent_key);
+    if (records == 0) { return 0; }
+    var len = vec_len(records);
+    if (len == 0) { return 0; }
+
+    var total = 0;
+    for (var i = 0; i < len; i = i + 1) {
+        total = total + load64(vec_get(records, i) + AGN_REC_DURATION_NS);
+    }
+    store64(out, total / len);
+    return 1;
+}
+
+# Average duration in nanoseconds for one action type. Returns 1 and writes the
+# ns count to `out`; returns 0 (Rust `None`) when the agent has no records of
+# that type.
+fn agnosai_profile_avg_duration_for_action(p, agent_key: Str, action_type: Str, out): i64 {
+    var records = map_get(load64(p), agent_key);
+    if (records == 0) { return 0; }
+
+    var total = 0;
+    var count = 0;
+    var len = vec_len(records);
+    for (var i = 0; i < len; i = i + 1) {
+        var r = vec_get(records, i);
+        if (str_eq(load64(r + AGN_REC_ACTION_TYPE), action_type) == 1) {
+            total = total + load64(r + AGN_REC_DURATION_NS);
+            count = count + 1;
+        }
+    }
+    if (count == 0) { return 0; }
+    store64(out, total / count);
+    return 1;
+}
+
+# Total number of recorded actions for the agent. 0 for an unknown agent.
+fn agnosai_profile_total_actions(p, agent_key: Str): i64 {
+    var records = map_get(load64(p), agent_key);
+    if (records == 0) { return 0; }
+    return vec_len(records);
+}
+
+# The action type an ActionRecord was recorded under.
+fn agnosai_action_record_action_type(r): i64 {
+    return load64(r + AGN_REC_ACTION_TYPE);
+}
+
+# Wall-clock duration of the recorded action, in nanoseconds.
+fn agnosai_action_record_duration_ns(r): i64 {
+    return load64(r + AGN_REC_DURATION_NS);
+}
+
+# Whether the recorded action succeeded (1) or failed (0).
+fn agnosai_action_record_success(r): i64 {
+    return load64(r + AGN_REC_SUCCESS);
+}
+
+# When the action occurred, as nanoseconds since the Unix epoch.
+fn agnosai_action_record_timestamp_ns(r): i64 {
+    return load64(r + AGN_REC_TIMESTAMP_NS);
+}

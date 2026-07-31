@@ -1,0 +1,50 @@
+# =========================================================================
+# tools/mod — tool registry and execution.
+#
+# Parity oracle: rust-old/src/tools/mod.rs
+#
+# Tools are the actions agents can perform. In the oracle every tool implements
+# the `NativeTool` trait and lives in a `DashMap`-backed registry; here a tool
+# is a small function-pointer vtable and the registry is a hashmap behind a
+# futex mutex. Both changes are forced — Cyrius has neither traits nor a
+# concurrent map — and both are documented at the top of their modules.
+#
+# Include order is a dependency constraint (resolution is single-pass):
+# tools_registry calls into tools_native, and both use core_json's helpers, so
+# `src/core/mod.cyr` must precede this hub. src/main.cyr does that.
+#
+# PORT IN PROGRESS:
+#   * native   — done (schemas, input, output, the tool vtable)
+#   * registry — done (registration, lookup, allow-list gating, the mutex)
+#   * builtin/echo + builtin/json_transform — done (tools_builtin_basic)
+#   * builtin/load_testing — done. It is the first module to use the blocker #3
+#     per-worker arena pattern for real: one OS thread per simulated user, each
+#     with a persistent arena for its latencies and a scratch arena reset after
+#     every request.
+#   * builtin/security_audit — done. Split at the network boundary so the
+#     oracle's mock-server tests port without loopback, which is_safe_url
+#     rightly refuses.
+#   * builtin/{synapse,mneme,delta} — done. Nine tools with one shape, so the
+#     shape lives once in tools_agnos.cyr rather than nine times. These are the
+#     one tool family that must NOT run the SSRF guard: they target loopback
+#     services by design, and the guard would reject every default base URL.
+#   * remote_registry — done. A guarded fetch, which is all the oracle ever
+#     was: its doc comment promises ZIP/WASM handling and registration, but the
+#     file contains none of it and has zero consumers.
+#
+# Deferred with their features, per docs/development/roadmap.md ("What v2.0.0
+# is"): `python_tool.rs`, `wasm_tool.rs` and `wasm_loader.rs`. WASM as a format
+# is an explicit cyrius non-goal; the capability rides cx + kavach per ADR-006,
+# which is M7's work, not M4's.
+# =========================================================================
+
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tools/builtin/basic.cyr"
+include "src/tools/builtin/load_testing.cyr"
+include "src/tools/agnos.cyr"
+include "src/tools/builtin/security_audit.cyr"
+include "src/tools/builtin/synapse.cyr"
+include "src/tools/builtin/mneme.cyr"
+include "src/tools/builtin/delta.cyr"
+include "src/tools/remote_registry.cyr"

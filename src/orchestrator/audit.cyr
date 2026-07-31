@@ -1,0 +1,346 @@
+# =========================================================================
+# orchestrator/audit — tamper-evident hash chain for crew and task events.
+#
+# Parity oracle: hoosh 1.1.0's `src/audit.rs` (the Rust `AuditChain` that
+# `rust-old/src/llm/mod.rs:14` re-exported), as used by
+# `rust-old/src/orchestrator/{crew_runner,orchestrator}.rs`.
+#
+# ## Why agnosai owns a chain rather than delegating across the seam
+#
+# `AuditChain` was a `pub use hoosh::audit::AuditChain` in the Rust build, so
+# the natural question at the HTTP seam was whether appends could be delegated
+# to the gateway. They cannot, for two independent reasons:
+#
+#   1. **hoosh's `/v1/audit` is GET-only** — `main.cyr:175` dispatches it from
+#      the GET block and `handle_audit(cfd)` never reads a body. There is no
+#      append endpoint.
+#   2. **hoosh's `audit_record` has no metadata slot.** Its signature is
+#      `(chain, event, level, message, provider, model)` and its serialiser
+#      emits `{id, timestamp, event, level, message}`. Every agnosai event
+#      passes `provider = None, model = None` and always `Some(metadata)`
+#      carrying `crew_id`, `task_id`, `status`, `task_count`, `wall_ms`. The
+#      entire payload would be discarded.
+#
+# **This is parity, not divergence.** In the Rust build the two chains were
+# already separate *instances*: `Orchestrator::new` mints its own with its own
+# CSPRNG key. agnosai shared the type with hoosh, never the chain. hoosh's chain
+# is the inference trail; this is the orchestration trail. Two chains, two
+# owners — and that stays true when hoosh becomes a library.
+#
+# ## One deliberate fix to the oracle
+#
+# The Cyrius hoosh's own `audit.cyr` resets `expect_prev` to the genesis hash
+# unconditionally in `verify`, so a chain that has evicted past `max_entries`
+# reports invalid forever. The **Rust** oracle got this right with a
+# `first_valid_hash` field updated on eviction, and that is what is ported here.
+# Where the two hoosh implementations disagree, the Rust one is the oracle.
+#
+# ## The signing key
+#
+# `random_bytes` — never tyche, whose PRNG is not cryptographic (the port plan
+# carries this correction). The key is per-process and never persisted, matching
+# the oracle: a chain that outlived its key would be unverifiable, so
+# `agnosai_durable_state` deliberately does not snapshot it. Persisting a chain
+# would need a configured key and its own ADR.
+# =========================================================================
+
+# The chain's genesis hash — 64 hex zeros, the oracle's `GENESIS_HASH`.
+var AGNOSAI_AUDIT_GENESIS =
+"0000000000000000000000000000000000000000000000000000000000000000";
+
+# The integrity block's version tag, the oracle's `CHAIN_VERSION`.
+var AGNOSAI_AUDIT_CHAIN_VERSION = "1";
+
+# The oracle's `Orchestrator::new` ring size.
+var AGNOSAI_AUDIT_MAX_ENTRIES = 10000;
+
+# The signing key's length in bytes — 32, matching the oracle's CSPRNG fill.
+var AGNOSAI_AUDIT_KEY_BYTES = 32;
+
+# One entry. `provider` and `model` are always 0 for agnosai's events (the
+# oracle passes `None` at every call site) but are kept so the entry shape and
+# its hash input match hoosh's byte for byte.
+enum AgnosaiAuditEntryOff {
+    AGN_AE_ID = 0;
+    AGN_AE_TIMESTAMP = 8;
+    AGN_AE_EVENT = 16;
+    AGN_AE_LEVEL = 24;
+    AGN_AE_MESSAGE = 32;
+    AGN_AE_PROVIDER = 40;
+    AGN_AE_MODEL = 48;
+    AGN_AE_METADATA = 56;
+    AGN_AE_SIGNATURE = 64;
+    AGN_AE_PREV_HASH = 72;
+    AGN_AE_SIZE = 80;
+}
+
+# The entry's id — a uuid v4 string.
+fn agnosai_audit_entry_id(e): i64 {
+    return load64(e + AGN_AE_ID);
+}
+
+# Epoch milliseconds at which the entry was recorded.
+fn agnosai_audit_entry_timestamp(e): i64 {
+    return load64(e + AGN_AE_TIMESTAMP);
+}
+
+# The event name, e.g. `task_completed`.
+fn agnosai_audit_entry_event(e): i64 {
+    return load64(e + AGN_AE_EVENT);
+}
+
+# The severity label the caller passed.
+fn agnosai_audit_entry_level(e): i64 {
+    return load64(e + AGN_AE_LEVEL);
+}
+
+# The human-readable message.
+fn agnosai_audit_entry_message(e): i64 {
+    return load64(e + AGN_AE_MESSAGE);
+}
+
+# The entry's JSON metadata, or 0.
+fn agnosai_audit_entry_metadata(e): i64 {
+    return load64(e + AGN_AE_METADATA);
+}
+
+# The HMAC-SHA256 signature, hex.
+fn agnosai_audit_entry_signature(e): i64 {
+    return load64(e + AGN_AE_SIGNATURE);
+}
+
+# The hash of the entry before this one, hex — the chain link.
+fn agnosai_audit_entry_previous_hash(e): i64 {
+    return load64(e + AGN_AE_PREV_HASH);
+}
+
+# The entry as a JSON value, in the oracle's field order.
+#
+# `provider`, `model` and `metadata` carry `skip_serializing_if =
+# "Option::is_none"`, so an unset field is omitted rather than emitted as null.
+fn agnosai_audit_entry_to_value(e): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("id"), bayan_json_v_str_new(load64(e + AGN_AE_ID)));
+    bayan_json_v_obj_set(obj, str_from("timestamp"),
+    bayan_json_v_int_new(load64(e + AGN_AE_TIMESTAMP)));
+    bayan_json_v_obj_set(obj, str_from("event"), bayan_json_v_str_new(load64(e + AGN_AE_EVENT)));
+    bayan_json_v_obj_set(obj, str_from("level"), bayan_json_v_str_new(load64(e + AGN_AE_LEVEL)));
+    bayan_json_v_obj_set(obj, str_from("message"),
+    bayan_json_v_str_new(load64(e + AGN_AE_MESSAGE)));
+
+    var provider = load64(e + AGN_AE_PROVIDER);
+    if (provider != 0) {
+        bayan_json_v_obj_set(obj, str_from("provider"), bayan_json_v_str_new(provider));
+    }
+    var model = load64(e + AGN_AE_MODEL);
+    if (model != 0) { bayan_json_v_obj_set(obj, str_from("model"), bayan_json_v_str_new(model)); }
+    var metadata = load64(e + AGN_AE_METADATA);
+    if (metadata != 0) { bayan_json_v_obj_set(obj, str_from("metadata"), metadata); }
+
+    var integrity = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(integrity, str_from("version"),
+    bayan_json_v_str_new(str_from(AGNOSAI_AUDIT_CHAIN_VERSION)));
+    bayan_json_v_obj_set(integrity, str_from("signature"),
+    bayan_json_v_str_new(load64(e + AGN_AE_SIGNATURE)));
+    bayan_json_v_obj_set(integrity, str_from("previous_hash"),
+    bayan_json_v_str_new(load64(e + AGN_AE_PREV_HASH)));
+    bayan_json_v_obj_set(obj, str_from("integrity"), integrity);
+    return obj;
+}
+
+# The hash of an entry's DATA fields — the oracle's `compute_entry_hash`.
+#
+# Deliberately excludes the integrity block, which is what makes the chain a
+# chain: an entry's hash is stable regardless of what it links to.
+#
+# The oracle builds a `BTreeMap<&str, Value>`, so the keys are hashed in
+# **sorted** order — `event, id, level, message, metadata, model, provider,
+# timestamp` — not in declaration order. Getting that wrong produces a chain
+# that verifies against itself and against nothing else, which is the failure a
+# port would not notice until it tried to check a chain from elsewhere.
+fn _agnosai_audit_entry_hash(e): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("event"), bayan_json_v_str_new(load64(e + AGN_AE_EVENT)));
+    bayan_json_v_obj_set(obj, str_from("id"), bayan_json_v_str_new(load64(e + AGN_AE_ID)));
+    bayan_json_v_obj_set(obj, str_from("level"), bayan_json_v_str_new(load64(e + AGN_AE_LEVEL)));
+    bayan_json_v_obj_set(obj, str_from("message"),
+    bayan_json_v_str_new(load64(e + AGN_AE_MESSAGE)));
+
+    var metadata = load64(e + AGN_AE_METADATA);
+    if (metadata != 0) { bayan_json_v_obj_set(obj, str_from("metadata"), metadata); }
+    var model = load64(e + AGN_AE_MODEL);
+    if (model != 0) { bayan_json_v_obj_set(obj, str_from("model"), bayan_json_v_str_new(model)); }
+    var provider = load64(e + AGN_AE_PROVIDER);
+    if (provider != 0) {
+        bayan_json_v_obj_set(obj, str_from("provider"), bayan_json_v_str_new(provider));
+    }
+    bayan_json_v_obj_set(obj, str_from("timestamp"),
+    bayan_json_v_int_new(load64(e + AGN_AE_TIMESTAMP)));
+
+    var json = bayan_json_v_build(obj);
+    return str_from(sha256_hex(str_data(json), str_len(json)));
+}
+
+# The signature over `"{entry_hash}:{previous_hash}"`, HMAC-SHA256, hex.
+fn _agnosai_audit_sign(key, entry_hash: Str, prev_hash: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, entry_hash);
+    str_builder_add_cstr(sb, ":");
+    str_builder_add(sb, prev_hash);
+    var input = str_builder_build(sb);
+
+    var mac = alloc(32);
+    hmac_sha256(key, AGNOSAI_AUDIT_KEY_BYTES, str_data(input), str_len(input), mac);
+
+    var hex = str_builder_new();
+    for (var i = 0; i < 32; i = i + 1) {
+        var b = load8(mac + i) & 255;
+        str_builder_putc(hex, _agnosai_hex_digit(b / 16));
+        str_builder_putc(hex, _agnosai_hex_digit(b % 16));
+    }
+    return str_builder_build(hex);
+}
+
+# The chain itself.
+enum AgnosaiAuditChainOff {
+    AGN_AC_KEY = 0;
+    AGN_AC_LAST_HASH = 8;
+    AGN_AC_ENTRIES = 16;
+    AGN_AC_MAX_ENTRIES = 24;
+    AGN_AC_FIRST_VALID_HASH = 32;
+    AGN_AC_MUTEX = 40;
+    AGN_AUDIT_CHAIN_SIZE = 48;
+}
+
+# Create a chain over a caller-supplied 32-byte signing key.
+fn agnosai_audit_chain_with_key(key, max_entries): i64 {
+    var c = alloc(AGN_AUDIT_CHAIN_SIZE);
+    store64(c + AGN_AC_KEY, key);
+    store64(c + AGN_AC_LAST_HASH, str_from(AGNOSAI_AUDIT_GENESIS));
+    store64(c + AGN_AC_ENTRIES, vec_new());
+    store64(c + AGN_AC_MAX_ENTRIES, max_entries);
+    store64(c + AGN_AC_FIRST_VALID_HASH, str_from(AGNOSAI_AUDIT_GENESIS));
+    store64(c + AGN_AC_MUTEX, mutex_new());
+    return c;
+}
+
+# Create a chain with a fresh CSPRNG key — the oracle's `Orchestrator::new`.
+#
+# The key is per-process and never leaves memory. A persisted chain would be
+# unverifiable after a restart, which is why `orch_durable_state` does not
+# snapshot one.
+fn agnosai_audit_chain_new(): i64 {
+    var key = alloc(AGNOSAI_AUDIT_KEY_BYTES);
+    random_bytes(key, AGNOSAI_AUDIT_KEY_BYTES);
+    return agnosai_audit_chain_with_key(key, AGNOSAI_AUDIT_MAX_ENTRIES);
+}
+
+# How many entries the chain currently holds.
+fn agnosai_audit_chain_count(c): i64 {
+    var mtx = load64(c + AGN_AC_MUTEX);
+    mutex_lock(mtx);
+    var n = vec_len(load64(c + AGN_AC_ENTRIES));
+    mutex_unlock(mtx);
+    return n;
+}
+
+# The last `n` entries, oldest first. Fewer when the chain is shorter.
+fn agnosai_audit_chain_recent(c, n): i64 {
+    var mtx = load64(c + AGN_AC_MUTEX);
+    mutex_lock(mtx);
+    var entries = load64(c + AGN_AC_ENTRIES);
+    var len = vec_len(entries);
+    var start = 0;
+    if (len > n) { start = len - n; }
+    var out = vec_new();
+    for (var i = start; i < len; i = i + 1) { vec_push(out, vec_get(entries, i)); }
+    mutex_unlock(mtx);
+    return out;
+}
+
+# Append an event and return its entry.
+#
+# `provider`, `model` and `metadata` may be 0. The entry hash is computed before
+# the lock is taken and the signature inside it, matching the oracle's
+# minimise-lock-hold shape — here it also keeps `last_hash` consistent under
+# concurrent recorders, which `run_parallel` produces.
+fn agnosai_audit_record(c, event: Str, level: Str, message: Str, provider, model,
+metadata): i64 {
+    var e = alloc(AGN_AE_SIZE);
+    store64(e + AGN_AE_ID, agnosai_uuid_v4_str());
+    store64(e + AGN_AE_TIMESTAMP, clock_now_ns() / AGNOSAI_NS_PER_MS);
+    store64(e + AGN_AE_EVENT, event);
+    store64(e + AGN_AE_LEVEL, level);
+    store64(e + AGN_AE_MESSAGE, message);
+    store64(e + AGN_AE_PROVIDER, provider);
+    store64(e + AGN_AE_MODEL, model);
+    store64(e + AGN_AE_METADATA, metadata);
+    store64(e + AGN_AE_SIGNATURE, 0);
+    store64(e + AGN_AE_PREV_HASH, 0);
+
+    var entry_hash = _agnosai_audit_entry_hash(e);
+
+    var mtx = load64(c + AGN_AC_MUTEX);
+    mutex_lock(mtx);
+    var prev = load64(c + AGN_AC_LAST_HASH);
+    store64(e + AGN_AE_PREV_HASH, prev);
+    store64(e + AGN_AE_SIGNATURE, _agnosai_audit_sign(load64(c + AGN_AC_KEY), entry_hash, prev));
+    store64(c + AGN_AC_LAST_HASH, entry_hash);
+
+    # Evict the oldest at capacity, carrying its hash forward so `verify` still
+    # has a valid anchor. Dropping this is what makes hoosh's Cyrius port report
+    # a full chain as invalid forever.
+    var entries = load64(c + AGN_AC_ENTRIES);
+    if (vec_len(entries) >= load64(c + AGN_AC_MAX_ENTRIES)) {
+        store64(c + AGN_AC_FIRST_VALID_HASH, _agnosai_audit_entry_hash(vec_get(entries, 0)));
+        vec_remove(entries, 0);
+    }
+    vec_push(entries, e);
+    mutex_unlock(mtx);
+    return e;
+}
+
+# The oracle's failure text: `Entry {i} ({id}): {reason}`.
+fn _agnosai_audit_failure(index, id: Str, reason): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Entry ");
+    str_builder_add_int(sb, index);
+    str_builder_add_cstr(sb, " (");
+    str_builder_add(sb, id);
+    str_builder_add_cstr(sb, "): ");
+    str_builder_add_cstr(sb, reason);
+    return str_builder_build(sb);
+}
+
+# Verify the whole chain. Returns 0 when valid, or a Str describing the first
+# entry that failed and how.
+#
+# Walks from `first_valid_hash` rather than from genesis, so a chain that has
+# evicted still verifies — the oracle's behaviour, and the one the Cyrius hoosh
+# gets wrong.
+fn agnosai_audit_verify(c): i64 {
+    var mtx = load64(c + AGN_AC_MUTEX);
+    mutex_lock(mtx);
+    var entries = load64(c + AGN_AC_ENTRIES);
+    var key = load64(c + AGN_AC_KEY);
+    var prev = load64(c + AGN_AC_FIRST_VALID_HASH);
+    var failure = 0;
+
+    for (var i = 0; i < vec_len(entries); i = i + 1) {
+        var e = vec_get(entries, i);
+        if (str_eq(load64(e + AGN_AE_PREV_HASH), prev) == 0) {
+            failure = _agnosai_audit_failure(i, load64(e + AGN_AE_ID), "previous hash mismatch");
+            break;
+        }
+        var entry_hash = _agnosai_audit_entry_hash(e);
+        if (str_eq(load64(e + AGN_AE_SIGNATURE),
+        _agnosai_audit_sign(key, entry_hash, prev)) == 0) {
+            failure = _agnosai_audit_failure(i, load64(e + AGN_AE_ID),
+            "signature verification failed");
+            break;
+        }
+        prev = entry_hash;
+    }
+    mutex_unlock(mtx);
+    return failure;
+}
