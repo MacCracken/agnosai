@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Toolchain pin 6.5.2 → 6.5.3.** `lib/` is byte-identical between the two tags
+  (`git diff 6.5.2 6.5.3 -- lib/` is empty), so the bump moves no stdlib source and
+  needed no re-verification beyond a full rebuild. It is bugfix-only upstream —
+  correct diagnostic line numbers after an `include`, and an `install.sh` fix — and
+  it clears the `manifest-pin: 6.5.2 (drift — wrapper is 6.5.3)` banner the
+  installed CLI printed on every invocation. 43/43 suites still green after.
+
+### Fixed
+- **`cyrius.cyml` pinned `ai-hwaccel = "2.3.15"` while `lib/` and `cyrius.lock`
+  carried 2.3.16.** The manifest was the only stale copy, so a clean checkout would
+  have resolved **2.3.15 — the version that still carries the bayan-1.3.0
+  `json_v_parse_str` break** this project filed and consumed the fix for. The build
+  in the working tree was correct; it simply was not reproducible from the manifest.
+  Now pinned 2.3.16, matching upstream's current tag.
+- **docs/development/state.md — table drift.** The gates all reproduced exactly
+  (2684 assertions across 43 files, 752/752 coverage, fmt/vet/deny clean), but every
+  hand-transcribed table had drifted: six per-suite assertion rows (`id` 26→37,
+  `llm_hoosh` 120→124, `orch_audit` 52→54, `orch_crew_runner` 184→188,
+  `orch_orchestrator` 51→49, `server_output_filter` 67→63 — the deltas happened to
+  cancel, which is why the headline stayed right), the locked-dep count (79→105),
+  libro's version (2.8.2→2.8.4), and the duplicate-fn count (35→36).
+- **`path_exists` duplicate-fn verdict was inverted.** state.md said kavach's wins
+  and that the two are "same contract, different implementation". Both are wrong,
+  and both were disproved by running a probe: **ai-hwaccel's wins** (it is included
+  later), and the contracts genuinely differ — kavach's `sys_access(path, 0)` tests
+  existence only, while ai-hwaccel's delegates to `file_exists`, which opens
+  `O_RDONLY`. A path that exists but is unreadable answers 1 under one and 0 under
+  the other. agnosai has no `path_exists` call sites, so nothing misbehaves today.
+- **`_agnosai_is_digit` is defined twice in our own source** —
+  `src/server_ssrf.cyr:39` and `src/server_output_filter.cyr:140` — and is the 36th
+  duplicate-fn warning, the only one that is not a dep's. The bodies are
+  semantically identical today, so nothing misbehaves, but two copies of a scanner
+  that agree by accident is the condition ADR 007 exists to prevent. Documented for
+  hoisting at the next touch of either module.
+- **docs/development/roadmap.md** still described M5 as "16 of 18 bites" with
+  `durable_state (→ patra)`, a mapping the port plan corrected on 2026-07-29 and
+  which the roadmap never picked up. M5 is complete and touches no patra.
+- **CLAUDE.md work-loop step 2 said bare `cyrius lint`**, which takes a file — bare
+  it prints usage and exits 1, so a gate written that way lints nothing. Step 11
+  gated on a "recipe" file that exists nowhere in the repo; it now names the real
+  sync set, and flags that `scripts/version-bump.sh` is the un-ported Rust-era
+  script (it still edits a root `Cargo.toml` that no longer exists).
+- **docs/development/cyrius-port-plan.md** was still headed "Phase 0 in progress"
+  and listed the `vec_sort_by` / `vec_select_nth` ask as "still to file" — it had
+  been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
+
 ### Added
 - **M6 (`server`) — first bite.**
   - **server_prometheus** — six counters plus the Prometheus text exposition `/metrics` serves.

@@ -40,7 +40,8 @@ cyrius coverage --min 80                    # the 80% gate — its own CI step
 
 0. Read roadmap, CHANGELOG, and open issues — know what was intended before auditing what was built
 1. Test + benchmark sweep of existing code
-2. Cleanliness check: `cyrius fmt <file> --check`, `cyrius lint`, `cyrius vet src/main.cyr`, `cyrius deny src/main.cyr`, `cyrius doc --check`
+2. Cleanliness check: `cyrius fmt <file> --check`, `cyrius lint <file>`, `cyrius vet src/main.cyr`, `cyrius deny src/main.cyr`, `cyrius doc --check`
+   — **`cyrius lint` takes a file**; bare, it prints usage and exits 1, so a gate written without one never lints anything
 3. Get baseline benchmarks (`./scripts/bench-history.sh`)
 4. Internal deep review — gaps, optimizations, security, logging/errors, docs
 5. External research — domain completeness, missing capabilities, best practices, world-class accuracy
@@ -61,7 +62,10 @@ cyrius coverage --min 80                    # the 80% gate — its own CI step
 8. Run benchmarks again — prove the wins
 9. If audit heavy → return to step 5
 10. Documentation — update CHANGELOG, roadmap, state.md, docs
-11. Version check — VERSION, cyrius.cyml, recipe all in sync
+11. Version check — `VERSION` is the source of truth; `cyrius.cyml` interpolates it
+    (`version = "${file:VERSION}"`) so it cannot drift; confirm the CHANGELOG's top
+    released heading matches. **Do not use `scripts/version-bump.sh` as-is** — it is
+    the Rust-era script and still edits a root `Cargo.toml` that no longer exists
 12. Return to step 1
 
 ### Task Sizing

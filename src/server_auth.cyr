@@ -1,0 +1,275 @@
+# =========================================================================
+# server_auth — Bearer-token authentication: config, extraction, shared secret.
+#
+# Parity oracle: rust-old/src/server/auth.rs
+#
+# **This is bite 1 of 2.** It ports the config types, the `Bearer ` extraction
+# and the shared-secret comparison — the five oracle tests that need no crypto
+# and no fixtures. The RS256 JWT half (`validate_jwt`, `Claims`) lands next; the
+# `jwt` branch of `agnosai_auth_check` is a loud 500 until then, never a silent
+# pass. See docs/development/state.md, "Four decisions waiting on the
+# maintainer", before writing that half — the `iss`/`aud`/`exp`/leeway semantics
+# are all deliberate calls, not transcription.
+#
+# ## The comparison is genuinely constant time, and the oracle's is not
+#
+# The oracle's `constant_time_eq` (auth.rs:18-31) bounds its loop with
+# `a.len().max(b.len())` while its own doc comment at auth.rs:16-17 claims
+# "no early return on length mismatch that would leak secret length". The
+# content compare is constant time; the **loop bound is not**. An attacker
+# controls the token length, so sending a 1-byte token makes the loop run
+# `secret.len()` times — the secret's length is recoverable by timing, which is
+# exactly what the comment promises it is not.
+#
+# `ct_eq_bytes_lens` is not the fix either: it returns 0 *immediately* on a
+# length mismatch (`lib/ct.cyr:76`), which leaks the same fact through a much
+# sharper signal.
+#
+# So this port hashes both sides and compares the digests:
+# `sha256` is fixed-output, so the compare runs over exactly 32 bytes no matter
+# what either input's length is, and `ct_eq_bytes` over those 32 bytes is
+# constant time in the content.
+#
+# **This is not a wire divergence.** The accept/reject set is byte-identical to
+# the oracle's — `sha256(a) == sha256(b)` iff `a == b` for any input an attacker
+# can construct — so every oracle assertion holds unchanged. Only the timing
+# profile differs, and only by removing a leak. Recorded as
+# [ADR 009](../docs/adr/009-auth-constant-time-secret-compare.md).
+#
+# ## `to_str()` is a real gate, not a formality
+#
+# The oracle reads the header through `.and_then(|v| v.to_str().ok())`, so a
+# header carrying any byte outside visible ASCII is `None` and takes the
+# missing-header arm — a 401, not a comparison. Dropping that gate would let a
+# byte sequence that `http` refuses to expose as a `&str` reach the compare.
+# =========================================================================
+
+# --- AuthConfig ----------------------------------------------------------
+
+enum AgnosaiAuthConfigOff {
+    AGN_AC_ENABLED = 0;
+    AGN_AC_SECRET = 8;
+    AGN_AC_JWT = 16;
+    AGN_AC_SIZE = 24;
+}
+
+# The oracle's `#[derive(Default)] AuthConfig` — **disabled**, empty secret, no
+# JWT. Worth naming plainly: the default is fail-**open**, so a caller that
+# forgets to configure auth serves every route unauthenticated. That is the
+# oracle's behaviour and the port reproduces it; the place to change it, if it
+# is ever changed, is here and with an ADR.
+fn agnosai_auth_config_new(): i64 {
+    var c = alloc(AGN_AC_SIZE);
+    store64(c + AGN_AC_ENABLED, 0);
+    store64(c + AGN_AC_SECRET, str_from(""));
+    store64(c + AGN_AC_JWT, 0);
+    return c;
+}
+
+# The oracle's `AuthConfig::with_secret` — enabled, shared-secret mode.
+fn agnosai_auth_config_with_secret(secret: Str): i64 {
+    var c = alloc(AGN_AC_SIZE);
+    store64(c + AGN_AC_ENABLED, 1);
+    store64(c + AGN_AC_SECRET, secret);
+    store64(c + AGN_AC_JWT, 0);
+    return c;
+}
+
+# The oracle's `AuthConfig::with_jwt` — enabled, RS256 mode, empty secret.
+fn agnosai_auth_config_with_jwt(jwt): i64 {
+    var c = alloc(AGN_AC_SIZE);
+    store64(c + AGN_AC_ENABLED, 1);
+    store64(c + AGN_AC_SECRET, str_from(""));
+    store64(c + AGN_AC_JWT, jwt);
+    return c;
+}
+
+# Whether auth is enforced at all.
+fn agnosai_auth_config_enabled(c): i64 {
+    return load64(c + AGN_AC_ENABLED);
+}
+
+# The shared secret. Meaningful only when `agnosai_auth_config_jwt` is 0.
+fn agnosai_auth_config_secret(c): Str {
+    return load64(c + AGN_AC_SECRET);
+}
+
+# The JWT config, or 0 for the oracle's `None` (shared-secret mode).
+fn agnosai_auth_config_jwt(c): i64 {
+    return load64(c + AGN_AC_JWT);
+}
+
+# Enable or disable auth in place — the oracle mutates the struct field
+# directly in its tests, which build `AuthConfig { enabled, .. }` literals.
+fn agnosai_auth_config_set_enabled(c, enabled): i64 {
+    store64(c + AGN_AC_ENABLED, enabled);
+    return 0;
+}
+
+# --- JwtConfig -----------------------------------------------------------
+#
+# Declared here so `AuthConfig` is complete and `state.rs` can be written
+# against it. `agnosai_auth_check` cannot yet *use* it — see the module header.
+
+enum AgnosaiJwtConfigOff {
+    AGN_JC_PUBLIC_KEY_PEM = 0;
+    AGN_JC_ISSUER = 8;
+    AGN_JC_AUDIENCE = 16;
+    AGN_JC_SIZE = 24;
+}
+
+# The oracle's `JwtConfig::new` — key only, no issuer or audience pinned.
+# 0 stands in for `None`, the convention the rest of the port uses.
+fn agnosai_jwt_config_new(public_key_pem: Str): i64 {
+    var j = alloc(AGN_JC_SIZE);
+    store64(j + AGN_JC_PUBLIC_KEY_PEM, public_key_pem);
+    store64(j + AGN_JC_ISSUER, 0);
+    store64(j + AGN_JC_AUDIENCE, 0);
+    return j;
+}
+
+# The oracle's builder `with_issuer`. Mutates and returns, since Cyrius has no
+# move semantics to consume `self`.
+fn agnosai_jwt_config_with_issuer(j, issuer: Str): i64 {
+    store64(j + AGN_JC_ISSUER, issuer);
+    return j;
+}
+
+# The oracle's builder `with_audience`.
+fn agnosai_jwt_config_with_audience(j, audience: Str): i64 {
+    store64(j + AGN_JC_AUDIENCE, audience);
+    return j;
+}
+
+# The PEM-encoded RSA public key.
+fn agnosai_jwt_config_public_key_pem(j): Str {
+    return load64(j + AGN_JC_PUBLIC_KEY_PEM);
+}
+
+# The expected `iss`, or 0 for none configured.
+fn agnosai_jwt_config_issuer(j): i64 {
+    return load64(j + AGN_JC_ISSUER);
+}
+
+# The expected `aud`, or 0 for none configured.
+fn agnosai_jwt_config_audience(j): i64 {
+    return load64(j + AGN_JC_AUDIENCE);
+}
+
+# --- Header handling -----------------------------------------------------
+
+# The `Bearer ` prefix, including its trailing space. Case-sensitive, matching
+# the oracle's `header.starts_with("Bearer ")` — RFC 7235 says the scheme is
+# case-insensitive, but the oracle is not, and a client sending `bearer ` gets a
+# 401 from Rust today. Reproduced deliberately.
+var AGNOSAI_AUTH_BEARER_LEN = 7;
+
+# Whether every byte of `s` would survive `HeaderValue::to_str()` — that is,
+# `is_visible_ascii`: printable ASCII plus tab.
+#
+# The byte is masked because `load8` sign-extends: without it a 0x80-or-higher
+# byte arrives negative and would still fail the range test, but for the wrong
+# reason — the kind of accident that survives a refactor.
+#
+# `tools_builtin_security_audit` has the cstr-shaped twin of this
+# (`_agnosai_audit_is_visible_ascii`). Two instances in different shapes is not
+# yet an abstraction; if a third appears, hoist all three.
+fn _agnosai_auth_is_visible_ascii(s: Str): i64 {
+    var n = str_len(s);
+    var p = str_data(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(p + i) & 255;
+        if (c != 9 && (c < 32 || c > 126)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Extract the token from an `Authorization` header value, or 0 if there is none
+# to extract.
+#
+# 0 is returned for all three of the oracle's rejection shapes — a value that
+# fails `to_str()`, a value not starting with `Bearer `, and `Bearer ` with an
+# empty token — because the oracle answers 401 to all three. The caller does not
+# need to tell them apart; only the log line differs, and that is `check`'s job.
+fn agnosai_auth_bearer_token(header: Str): i64 {
+    if (_agnosai_auth_is_visible_ascii(header) == 0) { return 0; }
+    if (str_starts_with(header, str_from("Bearer ")) == 0) { return 0; }
+    var n = str_len(header);
+    if (n == AGNOSAI_AUTH_BEARER_LEN) { return 0; }
+    return str_sub(header, AGNOSAI_AUTH_BEARER_LEN, n - AGNOSAI_AUTH_BEARER_LEN);
+}
+
+# --- Shared-secret comparison --------------------------------------------
+
+# SHA-256 digest length, in bytes — the width every secret comparison runs over
+# regardless of input length.
+var AGNOSAI_AUTH_DIGEST_LEN = 32;
+
+# Whether `a` and `b` are equal, in time independent of both their lengths and
+# their contents.
+#
+# See the module header for why this hashes rather than transcribing the
+# oracle's loop: the accept/reject set is identical, the timing leak is not.
+fn _agnosai_auth_secret_eq(a: Str, b: Str): i64 {
+    var ha[32];
+    var hb[32];
+    sha256(str_data(a), str_len(a), ha);
+    sha256(str_data(b), str_len(b), hb);
+    return ct_eq_bytes(ha, hb, AGNOSAI_AUTH_DIGEST_LEN);
+}
+
+# --- The middleware ------------------------------------------------------
+
+# Emit one WARN with a reason, matching the oracle's `tracing::warn!` calls.
+# Level-checked first so the formatting is only paid when it would be emitted.
+fn _agnosai_auth_warn(msg, msg_len, reason, reason_len): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    sakshi_log_kv(SK_WARN, msg, msg_len, "reason", 6, reason, reason_len);
+    return 0;
+}
+
+# The oracle's `auth_middleware`, as a pure function of the config and the
+# request's `Authorization` header.
+#
+# Returns an HTTP status: `HTTP_OK` to let the request through, `HTTP_UNAUTHORIZED`
+# to reject it. `has_header` is the oracle's `Option` — 0 when the request
+# carried no `Authorization` header at all, in which case `header` is ignored.
+#
+# Shaped as `fn(config, inputs) -> status` rather than as a sandhi handler on
+# purpose: it keeps the whole decision synchronously testable before any
+# transport exists, which is what turns the oracle's five `#[tokio::test]`s into
+# ordinary assertions here.
+fn agnosai_auth_check(c, has_header, header: Str): i64 {
+    if (agnosai_auth_config_enabled(c) == 0) { return HTTP_OK; }
+
+    if (has_header == 0) {
+        _agnosai_auth_warn("auth rejected", 13, "missing authorization header", 28);
+        return HTTP_UNAUTHORIZED;
+    }
+
+    var token = agnosai_auth_bearer_token(header);
+    if (token == 0) {
+        _agnosai_auth_warn("auth rejected", 13, "malformed or empty bearer token", 31);
+        return HTTP_UNAUTHORIZED;
+    }
+
+    var jwt = agnosai_auth_config_jwt(c);
+    if (jwt != 0) {
+        # Bite 2 replaces this with `_agnosai_auth_validate_jwt(token, jwt)`.
+        # A 500 rather than a 401 because the request is not what is wrong: the
+        # server is not yet able to answer. Loud on purpose — a stub that
+        # returned 401 would be indistinguishable from a working rejection, and
+        # one that returned HTTP_OK would be a silent authentication bypass.
+        _agnosai_auth_warn("auth unavailable", 16, "jwt path not yet ported", 23);
+        return HTTP_INTERNAL;
+    }
+
+    if (_agnosai_auth_secret_eq(token, agnosai_auth_config_secret(c)) == 0) {
+        _agnosai_auth_warn("auth rejected", 13, "invalid shared secret", 21);
+        return HTTP_UNAUTHORIZED;
+    }
+
+    return HTTP_OK;
+}

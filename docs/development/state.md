@@ -12,17 +12,25 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.2` (`cyrius.cyml`) — folds bayan 1.3.0, sandhi 1.9.7, sakshi 2.4.7
+- **Cyrius pin**: `6.5.3` (`cyrius.cyml`) — folds bayan 1.3.0, sandhi 1.9.7, sakshi 2.4.7.
+  Bumped from 6.5.2 on 2026-07-30: `lib/` is **byte-identical** between the two tags
+  (`git diff 6.5.2 6.5.3 -- lib/` is empty), so the bump moves no stdlib source. It is
+  bugfix-only — correct diagnostic line numbers after an `include`, and an `install.sh`
+  fix — and it clears the `manifest-pin: 6.5.2 (drift)` banner the installed CLI printed
+  on every invocation
 - Rust (for `rust-old/` only): `channel = "stable"`, currently rustc 1.96.0
 
 ## Source
 
 - **Rust reference**: 27,683 lines at `rust-old/` — frozen, do not edit. It is the parity oracle.
 - **Cyrius port**: `learning` (5 modules + hub), `core` (6 modules + hub + shared helpers),
-  `llm` (router, retry, hoosh seam client + hub) and `tools` (native, registry, echo,
+  `llm` (router, retry, hoosh seam client + hub), `tools` (native, registry, echo,
   json_transform, load_testing, security_audit, and the nine AGNOS ecosystem tools over a
-  shared client), `tools/remote_registry`, plus `src/id.cyr`, `src/units.cyr`, `src/order.cyr`,
-  `src/server_ssrf.cyr` and `src/guarded_fetch.cyr`. `src/main.cyr` is still the stub entry point — no CLI surface yet.
+  shared client) + `tools/remote_registry`, and `orch` (15 modules + hub). Five `server`
+  modules have landed — `server_ssrf`, `server_prompt_guard`, `server_sse`,
+  `server_output_filter`, `server_prometheus`. Support modules: `src/id.cyr`,
+  `src/units.cyr`, `src/order.cyr`, `src/chan_lossy.cyr` and `src/guarded_fetch.cyr`.
+  `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
 ## Where the port is
 
@@ -37,7 +45,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | Terminal Rust benchmark capture | ✅ 112 rows at v1.1.0, frozen into `rust-old/bench-history.csv` |
 | Blockers re-verified vs 6.5.2 | ✅ see [`cyrius-port-plan.md`](cyrius-port-plan.md) |
 | `cyrius port` run | ✅ 2026-07-28 |
-| `cyrius lib sync` + `cyrius deps` | ✅ 43/43 stdlib modules, 9 deps resolved, 0 errors, 79 locked |
+| `cyrius lib sync` + `cyrius deps` | ✅ 43/43 stdlib modules, 9 deps resolved, 0 errors, 105 locked |
 | Hello-world builds and runs | ✅ `cyrius build src/main.cyr build/agnosai` → OK |
 | `src/id.cyr` (uuid v4/v5) | ✅ v4 + v5, verified against the published RFC 4122 vector |
 | `src/order.cyr` (sort / select_nth) | ✅ heapsort + quickselect — blocker #8 closed, benchmarked |
@@ -50,7 +58,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | `orchestrator` ported (M5, Phase 4) | ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
-| `server` ported (M6, Phase 5) | 🟡 **5 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2). `auth` is next and is **not** blocked — see the Phase 5 correction in the port plan |
+| `server` ported (M6, Phase 5) | 🟡 **5 of 21 files** (1,860 of 4,977 Rust lines) — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`, ~18 lines) is deliberately held back by `src/server_sse.cyr:9-11` because it wraps a receiver in an axum SSE response, so it lands with the transport tier, not with M5. `auth` is next and is **not** blocked — see the Phase 5 correction in the port plan |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
 | Blocker #3 arena pattern in production | ✅ `load_testing` is the first real user — per-worker persistent + scratch arenas, one `reset_via` per request |
@@ -58,7 +66,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2684 assertions across 43 `.tcyr` suites, all passing** (plus the 2-assertion scaffold smoke):
+**2682 assertions across 42 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
+smoke — **2684 across 43 files**, which is the figure `cyrius tests tests` reports:
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -69,14 +78,14 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `learning_optimizer.tcyr` | 21 | 7 |
 | `core_error.tcyr` | 30 | 16 |
 | `core_message.tcyr` | 39 | 6 |
-| `id.tcyr` | 26 | — (reimplementation; the `uuid` crate is the reference) |
+| `id.tcyr` | 37 | — (reimplementation; the `uuid` crate is the reference) |
 | `core_task.tcyr` | 82 | 13 |
 | `core_resource.tcyr` | 83 | 19 of 28 (9 are hwaccel-gated and defer) |
 | `core_agent.tcyr` | 88 | 12 |
 | `core_crew.tcyr` | 66 | 8 |
 | `llm_router.tcyr` | 48 | 14 of 17 (3 are hwaccel-gated and defer) |
 | `llm_retry.tcyr` | 43 | 11 (4 of them `#[tokio::test]`) |
-| `llm_hoosh.tcyr` | 120 | — (replaces a `pub use` facade; no oracle tests) |
+| `llm_hoosh.tcyr` | 124 | — (replaces a `pub use` facade; no oracle tests) |
 | `tools_native.tcyr` | 67 | native.rs + registry.rs |
 | `order.tcyr` | 48 | — (Rust used `sort_unstable` / `select_nth_unstable`) |
 | `tools_builtin_basic.tcyr` | 37 | 6 (echo.rs + json_transform.rs) |
@@ -98,11 +107,11 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `orch_hierarchical.tcyr` | 30 | 6 |
 | `server_sse.tcyr` | 56 | 10 |
 | `orch_durable_state.tcyr` | 82 | 8 |
-| `orch_crew_runner.tcyr` | 184 | 30 |
+| `orch_crew_runner.tcyr` | 188 | 30 |
 | `server_prompt_guard.tcyr` | 62 | 22 |
-| `orch_audit.tcyr` | 52 | — (hoosh's audit.rs tests) |
-| `orch_orchestrator.tcyr` | 51 | 5 |
-| `server_output_filter.tcyr` | 67 | 16 |
+| `orch_audit.tcyr` | 54 | — (hoosh's audit.rs tests) |
+| `orch_orchestrator.tcyr` | 49 | 5 |
+| `server_output_filter.tcyr` | 63 | 16 |
 | `server_prometheus.tcyr` | 35 | 8 |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
@@ -306,15 +315,16 @@ base substrate · general utilities · bayan · patra · concurrency+crypto floo
 dynamic-link floor · async · net/http/tls/ws/sakshi/sandhi
 
 **git deps** (declare-ahead pattern): sigil 3.12.1 · bote 3.1.4 (core profile) ·
-majra 2.5.3 · kavach 3.9.3 · ai-hwaccel 2.3.16 · tyche 1.0.0.
+majra 2.5.3 · kavach 3.9.3 · ai-hwaccel 2.3.16 · tyche 1.0.0 — each matching its
+repo's newest tag as of 2026-07-30.
 The hoosh seam targets **hoosh 2.6.0** — `usage.cost_micro_usd`, `usage.provider` and
 `X-Hoosh-Cache` are read when present, and an older gateway degrades to an absent cost
 rather than a fabricated one.
-libro 2.8.2 arrives transitively via bote.
+libro 2.8.4 arrives transitively via bote.
 
 ## Known issues in the current build
 
-1. **35 duplicate-fn warnings at build — all benign, but know the rule.**
+1. **36 duplicate-fn warnings at build — all benign today, but know the rule.**
    Cyrius is single-pass: a redefinition only rebinds call sites parsed *after*
    it. A dep's internal calls therefore keep binding to its own definition even
    when a later bundle redefines the name. Verified by probe — majra's
@@ -324,11 +334,25 @@ libro 2.8.2 arrives transitively via bote.
    **What this does mean for us:** agnosai's own modules are included last, so
    *our* calls bind to the last definition of everything. When we call a name
    that appears in more than one bundle, check which one wins. The current
-   duplicates: 33 are kavach re-exporting symbols sigil also defines, with
-   byte-identical bodies (no behavioural difference either way); `_sub_new`
-   (majra/libro — we should never call it, it is a dep-private helper); and
-   `path_exists` (ai-hwaccel uses `file_exists`, kavach uses `sys_access` —
-   same contract, different implementation, **kavach's wins for our code**).
+   duplicates:
+
+   - **33 from kavach** re-exporting symbols sigil also defines, with
+     byte-identical bodies (no behavioural difference either way).
+   - **`_sub_new`** (majra/libro) — we should never call it, it is a dep-private
+     helper.
+   - **`path_exists`** — `lib/kavach.cyr:2640` uses `sys_access(path, 0)` (F_OK,
+     existence only); `lib/ai-hwaccel.cyr:1385` delegates to `file_exists`, which
+     opens `O_RDONLY`. **ai-hwaccel's wins for our code** — it is included after
+     kavach — and the two are *not* the same contract: a path that exists but is
+     unreadable answers 1 under kavach's and 0 under ai-hwaccel's. Corrected
+     2026-07-30; the earlier entry had this backwards on both counts.
+   - **`_agnosai_is_digit`** — **ours, not a dep's**. Defined at
+     `src/server_ssrf.cyr:39` and again at `src/server_output_filter.cyr:140`.
+     The bodies are semantically identical today (only the parameter name
+     differs, `c` vs `b`), so nothing misbehaves — but two copies of a scanner
+     that agree by accident is exactly the condition
+     [ADR 007](../adr/007-audit-redirect-revalidation.md) was written about.
+     Hoist it into a shared helper at the next touch of either module.
 
 ## Consumers
 
@@ -337,17 +361,34 @@ kiran (game AI) — none consuming the Cyrius line yet.
 
 ## Next
 
-> **Session handoff — 2026-07-30.** Everything below is verified against the
-> live tree, not remembered. Test/coverage/bench figures are the ones the gates
-> printed on the last run.
+> **Session handoff — 2026-07-30**, re-audited against the live tree the same
+> day. The gate figures (tests, coverage, fmt/vet/deny) all reproduced exactly;
+> what had drifted was every hand-transcribed table — six assertion rows, the
+> duplicate-fn count and its `path_exists` verdict, the locked-dep count, libro's
+> version, and the ai-hwaccel pin. All are corrected above. **Lesson for the next
+> refresh: regenerate the tables from command output rather than editing rows by
+> hand** — `cyrius tests tests` prints a per-file `N passed` line, and the six
+> stale rows were all transcription drift, not real change.
 
 **M5 — `orchestrator` is COMPLETE.** All 15 modules, plus two pulled forward
 from M6 (`server/sse`, `server/prompt_guard`) and an `orch_audit` chain the
 hoosh seam cannot delegate.
 
-**M6 — `server` is 5 of 21 files.** The plan's pure-leaf sequence is finished:
-`ssrf` and `prompt_guard` and `sse` came forward as M5 blockers, then
-`output_filter` and `prometheus` landed as M6 bites 1 and 2.
+**M6 — `server` is 5 of 21 files** (1,860 of 4,977 Rust lines). The plan's
+pure-leaf sequence is finished: `ssrf` and `prompt_guard` and `sse` came forward
+as M5 blockers, then `output_filter` and `prometheus` landed as M6 bites 1 and 2.
+16 files remain, carrying 69 oracle tests of which **43 are `#[tokio::test]`**.
+
+**The structural call that shapes the rest of M6:** most of those tokio tests are
+async only because axum's `app.oneshot(...)` is, not because the handler logic is.
+Writing each handler as a pure `fn(state, inputs) -> (status, json)` *before* any
+sandhi adapter exists converts the majority of them into ordinary sync `.tcyr`
+assertions, so the transport bite arrives with its logic already proven. The
+ordering rule that follows: **nothing that needs sandhi's server transport until
+every pure-leaf test is green.** Note that `src/` has zero `sandhi_server_*` call
+sites today — agnosai uses sandhi purely as an HTTP *client* — so the router bite
+is the first server-side use in the whole port, and it is where blocker #3's
+per-worker arena and the `alloc_used()`-flat regression test must land together.
 
 ### Pick up here
 
@@ -383,48 +424,143 @@ Suggested split, smallest verifiable bite first:
 5. **Claims** — `exp`/`iss`/`aud` with jsonwebtoken's exact semantics. Biggest
    and riskiest; goes last, on green foundations.
 
-### Three decisions waiting on the maintainer
+**"~15 lines of glue" undersells the bite.** Re-verified 2026-07-30 by compiling
+and running a throwaway `.tcyr` inside agnosai against its own `lib/` (27/27
+green). Nothing is blocked, but five items belong in the work and none is an
+upstream dependency:
+
+* **Write the `alg == "RS256"` check by hand.** sigil exposes the raw primitive
+  only; there is no JWT layer anywhere in `lib/` to inherit
+  `Validation::new(Algorithm::RS256)` from. Without it the port ships an
+  `alg: none` bypass the oracle does **not** have — and the oracle's own tests
+  never exercise `alg`, so test parity will not catch its absence. Needs an
+  explicit divergence test.
+* **Decide the allocator posture for base64url first.** `bayan_base64url_decode`
+  (`lib/bayan.cyr:131`) has no `_a` variant and allocates three times per call on
+  the global bump — a decode table, the output buffer, and a `{ptr,len}` pair. On
+  a per-request auth path that leaks forever, against the arena discipline the
+  rest of the server follows. Either write a decode-into-caller-buffer local, or
+  accept it consciously and file it in bayan.
+* **Parse the public key once at startup**, not per request. The oracle re-parses
+  the PEM inside `validate_jwt` on every authenticated request
+  (`auth.rs:120-123`). Hoisting it is both the perf fix and the fix for sigil's
+  non-atomic `_pem_init` once-guard — but it moves the failure mode from a
+  per-request 500 to a boot-time abort, which the oracle suite cannot tell apart,
+  so it must be deliberate.
+* **Use `bayan_json_v_parse` + `bayan_json_v_obj_get`**, never the flat
+  `bayan_json_parse` — the flat one desyncs on an escaped quote, and the two take
+  different key types (Str vs cstr; see the API hazards at the end of this file).
+* **`constant_time_eq` is not constant time in the oracle.** `auth.rs:24` bounds
+  its loop with `a.len().max(b.len())`, leaking the secret's length, while its own
+  comment at `auth.rs:16-17` claims it does not. This is a defect to fix, not a
+  parity question — fix the loop and the comment together.
+
+### Four decisions waiting on the maintainer
+
+> Items 1-3 were re-verified 2026-07-30 against the **pinned jsonwebtoken 10.3.0
+> source**, not against the summary. Item 3's stated mechanism was wrong and is
+> corrected below. Item 4 is new and was missed entirely by the earlier pass.
 
 1. **`iss`/`aud` absent passes.** jsonwebtoken's `set_issuer`/`set_audience` do
    not add those claims to `required_spec_claims`, so a token carrying **no
    `iss` at all** passes issuer validation even when an issuer is configured.
-   Reproduce for parity, or tighten with an ADR? Tightening is safer; either way
-   it must be deliberate, since CLAUDE.md calls silent divergence the worst
-   outcome.
-2. **`exp: u64::MAX`** in the oracle's fixtures does not fit i64. Pick a concrete
-   far-future `exp` before generating the token vectors — cheaper now than after
-   they are baked in.
+   **Recommendation: tighten, with an ADR.** It is the only one of the four that
+   is a live security weakness rather than a quirk, and the cost is lopsided —
+   tightening changes **zero** oracle assertions (`auth.rs:332-341` always
+   populates both claims), while reproducing means an operator who sets
+   `AGNOSAI_JWT_ISSUER` gets no issuer enforcement at all against any token that
+   omits `iss`. With one static key and no `kid` routing (`auth.rs:68-75`),
+   `iss`/`aud` are the only cross-tenant separation that exists. Implement it
+   conditionally, mirroring the oracle's `if let Some` shape, so
+   `JwtConfig::new(key)` with neither configured keeps passing.
+2. **`exp: u64::MAX`** in the oracle's fixtures (`auth.rs:337`) does not fit i64 —
+   it is `2 × i64::MAX + 1`. Rust copes because jsonwebtoken holds `exp` as
+   `TryParse<u64>` and compares in u64. **Recommendation: `253402300799`**
+   (9999-12-31T23:59:59Z), the conventional JWT never-expires sentinel, ~27× below
+   i64::MAX. `4102444800` (2100-01-01) is equally safe. Decide before generating
+   the four vectors in step 3 above. **Corollary:** a frozen vector cannot test
+   the leeway boundary at all, so covering it needs an injectable `now` in the
+   Cyrius validator — a design constraint on the claims bite that is much cheaper
+   to accept now than to retrofit.
 3. **`Claims.aud` is `Option<String>`** while the validator accepts
-   `Audience::Multiple`, so `"aud": ["agnosai","other"]` passes validation then
-   fails deserialization → 401. Arguably an oracle bug. Inherit or fix?
+   `Audience::Multiple`. **The mechanism recorded earlier was backwards.**
+   Deserialization runs *first* (`decoding.rs:285-287`), so any array-valued `aud`
+   fails as `ErrorKind::Json` with validation never running — including the
+   single-element form `["agnosai"]`. **Recommendation: inherit, and file it as a
+   separate follow-up.** It is fail-closed, so inheriting adds no risk, and
+   "reproduce" is simpler than it looked: reject any non-string `aud`. Fixing it
+   properly would force an intersection-vs-membership decision at the same time,
+   because jsonwebtoken's `is_subset` (`validation.rs:249-256`) accepts a
+   single-element overlap despite its name — so naively widening `Claims.aud`
+   turns a harmless compatibility bug into real audience confusion. Record in the
+   module header that arrays are rejected and that this is **inherited, not
+   designed**, or it will be re-discovered as a bug the first time an Auth0 or
+   Cognito token hits the endpoint.
+4. **NEW — jsonwebtoken's 60-second default leeway.** `Validation::new` seeds
+   `leeway: 60` (`validation.rs:120`) and the oracle never overrides it. This is
+   **invisible from `auth.rs` alone**, so a Cyrius port written faithfully from
+   the oracle source will compare `exp < now` and ship a silently *stricter*
+   server — precisely the failure mode CLAUDE.md calls the worst outcome.
+   **Recommendation: reproduce the 60 s** (standard clock-skew practice, matches
+   the oracle) as a **named constant with a comment citing `validation.rs:120`**,
+   so the number is stated rather than implied.
 
-### Cheap insurance before writing the module
+Lower-priority calls worth making in the same pass, not separately: `nbf` is
+silently ignored; `Bearer ` is case-sensitive; `AuthConfig::default()` fails
+**open**; `/metrics` is unauthenticated (`mod.rs:88`); and validated claims are
+discarded at `auth.rs:187` rather than passed downstream. Also note the
+`exp.is_none()` guard at `auth.rs:143-146` is unreachable dead code — keep it, but
+do not mistake it for the mechanism enforcing `exp`, which is the
+`required_spec_claims = {exp}` default the port must reimplement **explicitly**.
 
-Compile and **run** a scratch RS256 `.tcyr` first. bote documents a
-`thread_local`-before-`sigil` ordering constraint where binaries link clean and
-then SIGILL at first crypto use. `orch_audit` already calls `hmac_sha256` green,
-which is strong evidence the ordering is fine, but the RSA path touches more of
-sigil's scratch than HMAC does. The scratch program from this session's
-investigation is the template.
+### Cheap insurance before writing the module — ✅ DISCHARGED 2026-07-30
+
+bote documents a `thread_local`-before-`sigil` ordering constraint where binaries
+link clean and then SIGILL at first crypto use. This was cleared by execution: a
+throwaway `.tcyr` compiled inside agnosai against its own `lib/` ran **27/27
+green**, covering SPKI PEM → DER → `(n, e)` → `rsa_pkcs1v15_verify_sha256` (1 for
+valid, 0 for tampered), plus `bayan_base64url_decode`, JSON claim extraction,
+`clock_epoch_secs`, `ct_eq_bytes_lens` and `sandhi_server_find_header`. The RSA
+path touches more of sigil's scratch than `orch_audit`'s `hmac_sha256` does, and
+it is fine. No further insurance needed — go straight to the shared-secret half.
 
 ### Filed upstream this session, none blocking
 
+Status re-verified against each repo's issue directory on 2026-07-30. cyrius files
+under `docs/development/issues/` are open; those under `issues/archive/` are resolved.
+
 | Repo | Issue | Status |
 |---|---|---|
-| cyrius | `mutex_unlock` unconditional `FUTEX_WAKE` — 394 ns, measured 8.6× | open, re-verified on 6.5.2 |
-| cyrius | `fmt_int_buf` renders `i64::MIN` as bare `-`, corrupting bayan JSON | open, candidate fix supplied and run (11/11) |
+| cyrius | `mutex_unlock` unconditional `FUTEX_WAKE` — 394 ns, measured 8.6× | open (`2026-07-29-mutex-unlock-unconditional-futex-wake.md`); still verbatim in `lib/sync.cyr:72-75` on 6.5.3 |
+| cyrius | `fmt_int_buf` renders `i64::MIN` as bare `-`, corrupting bayan JSON | open (`2026-07-29-fmt-int-buf-i64-min.md`), candidate fix supplied and run (11/11); still present in `lib/fmt.cyr:99` on 6.5.3 |
+| cyrius | no O(n log n) sort in `lib/vec.cyr` — 18+ consumers each rolled their own O(n²) | open (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`) — **filed 2026-07-28**; the port plan's "still to file" line was stale |
+| cyrius | `sock_send` `Result` allocates per call — 16 B/response survives the arena | open (`2026-07-28-sock-send-result-allocates-per-call.md`); pinned by an exact-bound test in sandhi |
+| cyrius | no portable `xmkdir` in `io.cyr` | open (`2026-07-29-no-portable-xmkdir-in-io-cyr.md`) |
+| cyrius | `chan_try_send` absent on all three backends (blocker #4) | ✅ **resolved in 6.4.84**, archived upstream |
+| cyrius | `_int` overload misdispatch on a bare call-result argument | ✅ **resolved in 6.5.2**, archived upstream |
 | hoosh | chat response hid cache-hit and cost | ✅ resolved in **2.6.0**, consumed here |
-| ai-hwaccel | `json_v_parse_str` removed in bayan 1.3.0 | ✅ resolved in **2.3.16** |
+| ai-hwaccel | `json_v_parse_str` removed in bayan 1.3.0 | ✅ resolved in **2.3.16** — pin corrected here 2026-07-30 (the manifest still said 2.3.15) |
 | ai-hwaccel | `load_models` returns 1 model instead of 26 | open — two candidate fixes, a compatibility call |
-| bote | `src/jwt.cyr` orphaned + documents an `exp` check it does not perform | open — the `exp` half is a false security claim |
+| bayan | YAML parse into the tagged value tree | open (`2026-07-16-agnosai-yaml-parse-into-tagged-value-tree.md`); gates M10's YAML half, nothing sooner |
+| bote | `src/jwt.cyr` orphaned + documents an `exp` check it does not perform | **written but not yet upstream** — the file is untracked in the bote worktree and bote's HEAD is still 2026-07-17. The `exp` half is a false security claim, so this one is worth pushing |
 | sigil | *(none filed)* | `pem_decode_pubkey` would be nice-to-have; nothing waits on it |
 
-### Repo state at handoff
+**Never filed, still just port-plan asks:** sankoch ZIP container, majra relay
+reentrancy (confirmed live at `dist/majra.cyr:2105-2107`), sandhi `backlog` ignored
+by `run_opts`/`run_async` (`dist/sandhi.cyr:13310`, `:13469`), sigil
+`pem_decode_pubkey`, kavach exec timeout. The kavach one needs re-scoping before
+filing: `SandboxConfig_set_timeout_ms`, `config_timeout_ms` and `KAVACH_ERR_TIMEOUT`
+are all present in the shipped 3.9.3 bundle, so "the Cyrius port dropped exec
+timeout" as written would be filed against a surface that partly exists.
 
-agnosai and bote have uncommitted doc edits from this session; cyrius has
-unrelated work in flight (VERSION 6.5.3, lexer changes) alongside this session's
-two issue files. hoosh 2.6.0, ai-hwaccel 2.3.16 and sigil 3.12.1 are clean and
-tagged.
+### Repo state
+
+As of 2026-07-30, agnosai is clean at `76c4ded` plus this session's pin bump and
+doc corrections. **cyrius 6.5.3 shipped** — tagged, clean, release-gated — and
+agnosai now pins it; the bump is free because `lib/` is byte-identical to 6.5.2.
+hoosh 2.6.0, ai-hwaccel 2.3.16 and sigil 3.12.1 are clean and tagged. bote has
+two untracked issue files and an unstaged roadmap edit that have not reached
+upstream (see the table above).
 
 **`load_testing` is the first production user of the port plan's blocker #3
 arena pattern.** One OS thread per simulated user (a load generator that ran

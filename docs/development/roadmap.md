@@ -155,13 +155,24 @@ seam.
 
 ### M5 — `orchestrator` (Phase 4)
 
-16 of 18 bites. The default-feature runtime path: orchestrator → crew_runner →
+✅ **COMPLETE.** The default-feature runtime path: orchestrator → crew_runner →
 scoring/scheduler/output_validation, + approval, budget, audit, memory,
-multi_tenant, plan_cache, durable_state (→ patra), hierarchical. **Gate:** the
-crew-event fan-out needs **overwrite-oldest** semantics
-(`agnosai_chan_push_lossy`), not `chan_send` — a 1:1 port of tokio's broadcast
-`tx.send` onto a blocking send converts never-block-lossy into block-forever.
-See port-plan blocker #4.
+multi_tenant, plan_cache, durable_state, hierarchical — all 15 modules, plus
+`server/sse` and `server/prompt_guard` pulled forward from M6 and an `orch_audit`
+chain the hoosh seam cannot delegate. **Gate (met):** the crew-event fan-out needs
+**overwrite-oldest** semantics (`agnosai_chan_push_lossy`), not `chan_send` — a
+1:1 port of tokio's broadcast `tx.send` onto a blocking send converts
+never-block-lossy into block-forever. See port-plan blocker #4.
+
+**Correction (2026-07-29, verified while porting):** this line read
+`durable_state (→ patra)`. It does not use patra. patra is a full embedded SQL
+database over its own paged format with no dump/export verb, and its `jsonl` mode
+opens `O_APPEND` with no `O_TRUNC`; `durable_state`'s contract is one overwritable,
+human-readable JSON file per crew at a caller-chosen path, which patra
+structurally cannot produce. It is built on `lib/io.cyr` instead, and **no M5
+module touches patra** — `grep -rn 'patra_\|jsonl_' src/ tests/` is empty. patra
+stays a declared stdlib dep for later phases.
+
 **Exit:** a crew runs end-to-end headless.
 
 ### M6 — `server` (Phase 5)

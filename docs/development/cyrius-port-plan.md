@@ -1,7 +1,13 @@
 # AgnosAI — Rust → Cyrius Port Plan (v2.0.0)
 
-> Status: **Phase 0 in progress** (2026-07-28). Baseline greened, blockers
-> re-verified against cyrius 6.4.83 (now pinned 6.4.85), two upstream fixes shipped.
+> Status: **Phase 5 (`server`) in progress** — Phases 0-4 complete, 5 of 21
+> `server` files done. Pinned **cyrius 6.5.3** (2026-07-30). The blocker table
+> below was re-verified against 6.4.83 when it was written and its verdicts still
+> hold; blockers #1, #2, #4, #5, #6, #7 are closed and **#3 closed with the 6.5.2
+> fold-in**, leaving only #8, which `src/order.cyr` discharges locally.
+> Original 2026-07-28 framing follows, kept because the reasoning must not be
+> re-derived: baseline greened, blockers re-verified against cyrius 6.4.83, two
+> upstream fixes shipped.
 > Baseline: Rust v1.1.0, GREEN — `cargo fmt --check` clean,
 > `cargo clippy --all-features --all-targets -D warnings` clean, all 9 feature
 > combinations compile, **863 + 2 + 1 tests pass**. That green tree is the
@@ -241,7 +247,7 @@ included later (last-definition-wins, silently). Real modules **are** includable
 |---|---|
 | bayan | ✅ **both filed 2026-07-16** — YAML parse → the existing tagged value tree: `bayan/docs/development/issues/2026-07-16-agnosai-yaml-parse-into-tagged-value-tree.md` (also accepted onto bayan's roadmap as `bayan_yaml_*`; the "draft written" here never materialized as a file — the filing supersedes it); JSON recursion-depth cap (blocker #2): `bayan/docs/development/issues/2026-07-16-agnosai-json-no-recursion-depth-cap.md` — ✅ **resolved in bayan 1.1.1** (cap 128, serde_json parity; 101/101 asserts green) |
 | sankoch | ZIP archive container (deflate + crc32 already there; ~250 lines) |
-| cyrius | ✅ **`chan_try_send` filed 2026-07-28** — `docs/development/issues/2026-07-28-agnosai-chan-try-send.md` (blocker #4; the load-bearing evidence is majra's hub-mutex-across-blocking-send, not agnosai's own call sites). **Still to file:** `vec_sort_by` / `vec_select_nth` in `lib/vec.cyr` — 18+ consumers (itihas, sankhya, goonj, naad, agora, mela, mneme, samay, stiva, takumi, sit, shakti, varna, chakshu, darshini, hisab, nous, dhvani) have each independently reimplemented an O(n²) insertion sort, which is the strongest possible argument that this is a stdlib gap rather than an app concern |
+| cyrius | ✅ **`chan_try_send` filed 2026-07-28** and **resolved in 6.4.84** (blocker #4; the load-bearing evidence is majra's hub-mutex-across-blocking-send, not agnosai's own call sites) — archived upstream. ✅ **`vec_sort_by` / `vec_select_nth` filed 2026-07-28** as `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`, still open — 18+ consumers (itihas, sankhya, goonj, naad, agora, mela, mneme, samay, stiva, takumi, sit, shakti, varna, chakshu, darshini, hisab, nous, dhvani) have each independently reimplemented an O(n²) insertion sort, which is the strongest possible argument that this is a stdlib gap rather than an app concern. *(This row previously read "still to file" — it had already been filed the same day.)* Also open from agnosai: `2026-07-28-sock-send-result-allocates-per-call.md`, `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md`, `2026-07-29-fmt-int-buf-i64-min.md` |
 | kavach | WASM availability one-liner; stderr capture; **exec timeout — an undocumented regression** (Rust 2.0.0 shipped it, the Cyrius port dropped it, ADR-004 omits it) |
 | sigil | `pem_decode_pubkey` — a ~20-line clone of `pem_decode_privkey`. **Nice-to-have, not a blocker** (see below) |
 | bote | `jwt_verify_rs256` — **its stated premise is stale**: jwt.cyr:9-11 says "RS256 needs an asymmetric primitive sigil doesn't yet expose", but sigil has `rsa_pkcs1v15_verify_sha256` and `rsa_pubkey_from_der` already accepts SPKI. **Do not wait on this** — verified 2026-07-28 by *compiling and running* a scratch RS256 verify against the real toolchain. Implement the JWT half locally in agnosai over `bayan_base64url_decode` + `clock_epoch_secs` + sigil's existing RSA/SHA-256 primitives |
