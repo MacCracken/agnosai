@@ -1,0 +1,341 @@
+# =========================================================================
+# server_routes_mcp — rust-old/src/server/routes/mcp.rs.
+#
+# All five of the oracle's `#[tokio::test]`s port as ordinary assertions. The
+# envelope shapes are transcribed from the **Rust** bote 0.91.0 the oracle pins,
+# not from the Cyrius bundle, because the oracle's wire format is whatever serde
+# emits there — so this suite pins `skip_serializing_if` behaviour that no
+# oracle test checks: a success OMITS `error`, an error OMITS `result`, and the
+# error object OMITS `data`.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_routes_tools.cyr"
+include "src/server_routes_agents.cyr"
+include "src/server_routes_approval.cyr"
+include "src/server_routes_dashboard.cyr"
+include "src/server_routes_crews.cyr"
+include "src/server_routes_a2a.cyr"
+include "src/server_routes_mcp.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's `test_app()`: a registry carrying the echo tool.
+fn _t_state(): i64 {
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_echo_tool());
+    return agnosai_app_state_new(agnosai_orchestrator_new(0), reg,
+    agnosai_auth_config_new(), agnosai_event_bus_new(),
+    agnosai_audit_chain_new(), agnosai_approval_gate_new());
+}
+
+fn _t_state_no_tools(): i64 {
+    return agnosai_app_state_new(agnosai_orchestrator_new(0),
+    agnosai_tool_registry_new(), agnosai_auth_config_new(),
+    agnosai_event_bus_new(), agnosai_audit_chain_new(),
+    agnosai_approval_gate_new());
+}
+
+fn _t_rpc(method, extra): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"");
+    str_builder_add_cstr(sb, method);
+    str_builder_add_cstr(sb, "\"");
+    str_builder_add_cstr(sb, extra);
+    str_builder_add_cstr(sb, "}");
+    return str_builder_build(sb);
+}
+
+fn _t_obj(v, key): i64 { return bayan_json_v_obj_get(v, key); }
+
+fn _t_str(v, key): Str {
+    var x = bayan_json_v_obj_get(v, key);
+    if (x == 0 || bayan_json_v_is_str(x) == 0) { return str_from(""); }
+    return bayan_json_v_str(x);
+}
+
+# --- The envelope, which no oracle test inspects -------------------------
+
+fn _t_envelope(): i64 {
+    var r = agnosai_route_mcp(_t_state(), _t_rpc("initialize", ""));
+    assert(agnosai_route_status(r) == HTTP_OK, "every MCP arm is HTTP 200");
+    var b = agnosai_route_body(r);
+    assert(str_eq(_t_str(b, "jsonrpc"), str_from("2.0")) == 1, "jsonrpc is 2.0");
+    assert(_t_obj(b, "id") != 0, "id is echoed");
+    assert(_t_obj(b, "result") != 0, "a success carries result");
+    # `#[serde(skip_serializing_if = "Option::is_none")]` — omitted, not null.
+    assert(_t_obj(b, "error") == 0, "...and OMITS error entirely, not null");
+    assert(bayan_json_v_obj_len(b) == 3, "exactly jsonrpc, id, result");
+
+    var e = agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("nope", "")));
+    assert(_t_obj(e, "error") != 0, "an error carries error");
+    assert(_t_obj(e, "result") == 0, "...and OMITS result entirely");
+    assert(bayan_json_v_obj_len(e) == 3, "exactly jsonrpc, id, error");
+    var eo = _t_obj(e, "error");
+    assert(_t_obj(eo, "code") != 0, "the error object carries code");
+    assert(_t_obj(eo, "message") != 0, "...and message");
+    assert(_t_obj(eo, "data") == 0, "...and OMITS data, which the oracle never sets");
+    assert(bayan_json_v_obj_len(eo) == 2, "exactly code and message");
+    return 0;
+}
+
+# `id` is echoed on every arm, including errors, and defaults to JSON null.
+fn _t_id_handling(): i64 {
+    var s = _t_state();
+    var b = agnosai_route_body(agnosai_route_mcp(s, _t_rpc("initialize", "")));
+    assert(bayan_json_v_int(_t_obj(b, "id")) == 1, "a numeric id round-trips");
+
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"initialize\"}");
+    var b2 = agnosai_route_body(agnosai_route_mcp(s, str_builder_build(sb)));
+    assert(str_eq(_t_str(b2, "id"), str_from("abc")) == 1, "a string id round-trips");
+
+    # `req.id.clone().unwrap_or(Value::Null)` — absent becomes null, not omitted.
+    var sb2 = str_builder_new();
+    str_builder_add_cstr(sb2, "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}");
+    var b3 = agnosai_route_body(agnosai_route_mcp(s, str_builder_build(sb2)));
+    assert(_t_obj(b3, "id") != 0, "an absent id is still present in the response");
+    assert(bayan_json_v_is_null(_t_obj(b3, "id")) == 1, "...as JSON null");
+
+    # And on the error arm too, since JsonRpcResponse.id is not Option.
+    var b4 = agnosai_route_body(agnosai_route_mcp(s, _t_rpc("bogus", "")));
+    assert(bayan_json_v_int(_t_obj(b4, "id")) == 1, "the id is echoed on an error too");
+    return 0;
+}
+
+# --- Oracle: initialize_returns_server_info_and_capabilities -------------
+
+fn _t_initialize(): i64 {
+    var b = agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("initialize", "")));
+    var r = _t_obj(b, "result");
+    assert(str_eq(_t_str(r, "protocolVersion"), str_from("2025-03-26")) == 1,
+    "the protocol version is the oracle's literal");
+
+    var info = _t_obj(r, "serverInfo");
+    assert(info != 0, "serverInfo is present");
+    # **The reason this module does not delegate to bote's dispatcher**, whose
+    # _build_initialize_result hardcodes "bote".
+    assert(str_eq(_t_str(info, "name"), str_from("agnosai")) == 1,
+    "serverInfo.name is agnosai, NOT bote");
+    assert(str_eq(_t_str(info, "name"), str_from("bote")) == 0,
+    "...explicitly not bote");
+    assert(str_eq(_t_str(info, "version"), str_from(AGNOSAI_VERSION)) == 1,
+    "serverInfo.version is the build version");
+
+    var caps = _t_obj(r, "capabilities");
+    assert(caps != 0, "capabilities is present");
+    var tools = _t_obj(caps, "tools");
+    assert(tools != 0, "capabilities.tools is present");
+    # An empty OBJECT — not null, not absent. A client reads the key's presence
+    # as the capability.
+    assert(bayan_json_v_is_obj(tools) == 1, "...and is an object");
+    assert(bayan_json_v_is_null(tools) == 0, "...not null");
+    assert(bayan_json_v_obj_len(tools) == 0, "...and empty");
+    return 0;
+}
+
+# --- Oracle: tools_list_returns_registered_tools_in_mcp_format -----------
+
+fn _t_tools_list(): i64 {
+    var b = agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("tools/list", "")));
+    var arr = _t_obj(_t_obj(b, "result"), "tools");
+    assert(bayan_json_v_is_arr(arr) == 1, "result.tools is an array");
+    assert(bayan_json_v_arr_len(arr) == 1, "...with the one registered tool");
+
+    var t = bayan_json_v_arr_get(arr, 0);
+    assert(str_eq(_t_str(t, "name"), str_from("echo")) == 1, "the echo tool is listed");
+    assert(str_len(_t_str(t, "description")) > 0, "...with a description");
+    # camelCase, and NOT `input_schema` — MCP's own key.
+    var sc = _t_obj(t, "inputSchema");
+    assert(sc != 0, "...and an inputSchema");
+    assert(bayan_json_v_obj_len(t) == 3, "exactly name, description, inputSchema");
+
+    # `#[serde(rename = "type")]` on `schema_type` — a literal transcription of
+    # the Rust field name would emit `schema_type` and no client would parse it.
+    assert(str_eq(_t_str(sc, "type"), str_from("object")) == 1,
+    "the schema's type key is `type`, from serde's rename");
+    assert(_t_obj(sc, "schema_type") == 0, "...NOT the Rust field name");
+    assert(_t_obj(sc, "properties") != 0, "properties is present");
+    assert(_t_obj(sc, "required") != 0, "required is present");
+    assert(bayan_json_v_is_arr(_t_obj(sc, "required")) == 1, "...as an array");
+
+    # echo takes one required `message` parameter.
+    var props = _t_obj(sc, "properties");
+    var m = _t_obj(props, "message");
+    assert(m != 0, "the message parameter is a property");
+    assert(str_len(_t_str(m, "type")) > 0, "...carrying a type");
+    assert(str_len(_t_str(m, "description")) > 0, "...and a description");
+    assert(bayan_json_v_obj_len(m) == 2, "...and only those two");
+    var req = _t_obj(sc, "required");
+    assert(bayan_json_v_arr_len(req) == 1, "one required parameter");
+    assert(str_eq(bayan_json_v_str(bayan_json_v_arr_get(req, 0)), str_from("message")) == 1,
+    "...named message");
+    return 0;
+}
+
+fn _t_tools_list_empty(): i64 {
+    var b = agnosai_route_body(agnosai_route_mcp(_t_state_no_tools(), _t_rpc("tools/list", "")));
+    var arr = _t_obj(_t_obj(b, "result"), "tools");
+    assert(bayan_json_v_is_arr(arr) == 1, "an empty registry still answers an array");
+    assert(bayan_json_v_is_null(arr) == 0, "...not null");
+    assert(bayan_json_v_arr_len(arr) == 0, "...and empty");
+    return 0;
+}
+
+# --- Oracle: tools_call_executes_echo_tool -------------------------------
+
+fn _t_tools_call(): i64 {
+    var b = agnosai_route_body(agnosai_route_mcp(_t_state(),
+    _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hello\"}}")));
+    var r = _t_obj(b, "result");
+    assert(r != 0, "a tool call is a JSON-RPC success");
+    var content = _t_obj(r, "content");
+    assert(bayan_json_v_is_arr(content) == 1, "result.content is an array");
+    assert(bayan_json_v_arr_len(content) == 1, "...with one item");
+    var item = bayan_json_v_arr_get(content, 0);
+    assert(str_eq(_t_str(item, "type"), str_from("text")) == 1, "the item type is text");
+
+    # **The unwrap the oracle's own test pins**: a String result is emitted
+    # bare, not as a quoted JSON string.
+    assert(str_eq(_t_str(item, "text"), str_from("hello")) == 1,
+    "a string result is unwrapped to bare text");
+    assert(str_eq(_t_str(item, "text"), str_from("\"hello\"")) == 0,
+    "...NOT re-quoted as JSON");
+
+    assert(bayan_json_v_bool(_t_obj(r, "isError")) == 0, "isError is false on success");
+    assert(bayan_json_v_obj_len(r) == 2, "exactly content and isError");
+    return 0;
+}
+
+# --- Oracle: tools_call_unknown_tool_returns_is_error --------------------
+
+# **The asymmetry that is easiest to flatten by mistake**: an unknown tool is a
+# JSON-RPC *success* carrying `isError: true`, while a missing tool NAME is a
+# protocol-level `-32602`. Tool-level fault versus protocol-level fault.
+fn _t_tools_call_unknown_tool(): i64 {
+    var b = agnosai_route_body(agnosai_route_mcp(_t_state(),
+    _t_rpc("tools/call", ",\"params\":{\"name\":\"nope\"}")));
+    assert(_t_obj(b, "error") == 0,
+    "an unknown TOOL is not a JSON-RPC error");
+    var r = _t_obj(b, "result");
+    assert(r != 0, "...it is a success");
+    assert(bayan_json_v_bool(_t_obj(r, "isError")) == 1, "...carrying isError true");
+    var item = bayan_json_v_arr_get(_t_obj(r, "content"), 0);
+    assert(str_eq(_t_str(item, "text"), str_from("Tool not found: nope")) == 1,
+    "...and the oracle's message, naming the tool");
+    return 0;
+}
+
+fn _t_tools_call_missing_name(): i64 {
+    var s = _t_state();
+    var b = agnosai_route_body(agnosai_route_mcp(s, _t_rpc("tools/call", ",\"params\":{}")));
+    var e = _t_obj(b, "error");
+    assert(e != 0, "a missing tool NAME is a JSON-RPC error, unlike an unknown tool");
+    assert(bayan_json_v_int(_t_obj(e, "code")) == 0 - 32602, "...with code -32602");
+    assert(str_eq(_t_str(e, "message"), str_from("Missing tool name")) == 1,
+    "...and the oracle's message");
+    assert(_t_obj(b, "result") == 0, "...and no result");
+
+    # Absent params entirely, and a non-string name, are the same fault.
+    assert(_t_obj(agnosai_route_body(agnosai_route_mcp(s, _t_rpc("tools/call", ""))),
+    "error") != 0, "absent params is -32602");
+    assert(_t_obj(agnosai_route_body(agnosai_route_mcp(s,
+    _t_rpc("tools/call", ",\"params\":{\"name\":7}"))), "error") != 0,
+    "a non-string name is -32602");
+    return 0;
+}
+
+# `arguments.as_object()` — a non-object `arguments` yields an EMPTY parameter
+# map rather than an error, so the tool runs with no arguments.
+fn _t_tools_call_argument_handling(): i64 {
+    var s = _t_state();
+    # Absent arguments: echo runs and reports its own missing-parameter error.
+    var b = agnosai_route_body(agnosai_route_mcp(s,
+    _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\"}")));
+    assert(_t_obj(b, "error") == 0, "absent arguments is not a protocol error");
+    assert(bayan_json_v_bool(_t_obj(_t_obj(b, "result"), "isError")) == 1,
+    "...the tool reports the fault itself");
+
+    # A non-object `arguments` takes the same path, not an error.
+    var b2 = agnosai_route_body(agnosai_route_mcp(s,
+    _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\",\"arguments\":42}")));
+    assert(_t_obj(b2, "error") == 0,
+    "a non-object arguments is not a protocol error either");
+    assert(_t_obj(b2, "result") != 0, "...it runs with an empty parameter map");
+    return 0;
+}
+
+# --- Unknown method and malformed bodies ---------------------------------
+
+fn _t_unknown_method(): i64 {
+    var b = agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("tools/destroy", "")));
+    var e = _t_obj(b, "error");
+    assert(e != 0, "an unknown method is a JSON-RPC error");
+    assert(bayan_json_v_int(_t_obj(e, "code")) == 0 - 32601, "...with code -32601");
+    assert(str_eq(_t_str(e, "message"), str_from("Method not found")) == 1,
+    "...and the oracle's message");
+    # Method matching is exact — no prefix or case tolerance.
+    assert(_t_obj(agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("Initialize", ""))),
+    "error") != 0, "method matching is case-sensitive");
+    assert(_t_obj(agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("tools/", ""))),
+    "error") != 0, "a truncated method is not found");
+    assert(_t_obj(agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("", ""))),
+    "error") != 0, "an empty method is not found");
+    return 0;
+}
+
+# A body that is not JSON at all, or not a JSON-RPC request, never reaches the
+# dispatch — those are HTTP-level faults the extractor owns, as in agents.rs.
+fn _t_malformed_body(): i64 {
+    var s = _t_state();
+    assert(agnosai_route_status(agnosai_route_mcp(s, str_from("not json")))
+    == HTTP_BAD_REQUEST, "malformed JSON is 400");
+    assert(agnosai_route_status(agnosai_route_mcp(s, str_from("[]")))
+    == HTTP_BAD_REQUEST, "an array body is 400");
+    assert(agnosai_route_status(agnosai_route_mcp(s, str_from("{}")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an object with no method is 422");
+    assert(agnosai_route_status(agnosai_route_mcp(s,
+    str_from("{\"jsonrpc\":\"2.0\",\"method\":7}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
+    "a non-string method is 422");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_envelope();
+    _t_id_handling();
+    _t_initialize();
+    _t_tools_list();
+    _t_tools_list_empty();
+    _t_tools_call();
+    _t_tools_call_unknown_tool();
+    _t_tools_call_missing_name();
+    _t_tools_call_argument_handling();
+    _t_unknown_method();
+    _t_malformed_body();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

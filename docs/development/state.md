@@ -79,7 +79,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | `orchestrator` ported (M5, Phase 4) | ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
-| `server` ported (M6, Phase 5) | 🟡 **15 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and the routes tier is open — `routes/health.rs` + the hub (bite 6), `routes/tools.rs` + `routes/definitions.rs` (bite 7), `routes/agents.rs` (bite 8), `routes/approval.rs` (bite 9), `routes/dashboard.rs` (bite 10), `routes/crews.rs` (bites 11a+11b), `routes/a2a.rs` (bite 12). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
+| `server` ported (M6, Phase 5) | 🟡 **16 of 21 files — the routes tier is COMPLETE** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and the routes tier is open — `routes/health.rs` + the hub (bite 6), `routes/tools.rs` + `routes/definitions.rs` (bite 7), `routes/agents.rs` (bite 8), `routes/approval.rs` (bite 9), `routes/dashboard.rs` (bite 10), `routes/crews.rs` (bites 11a+11b), `routes/a2a.rs` (bite 12), `routes/mcp.rs` (bite 13). **All nine route files are done**; only the transport tier remains. One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
 | `server/auth` ported whole | ✅ all 10 oracle tests + 123 beyond; six defects found by adversarial review, fixed, and each pinned by a mutation-verified test. Two decided divergences: constant-time compare fixed ([ADR 009](../adr/009-auth-constant-time-secret-compare.md)) and configured `iss`/`aud` required ([ADR 010](../adr/010-jwt-require-configured-iss-aud.md)) |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
@@ -88,8 +88,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**3236 assertions across 51 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
-smoke — **3238 across 52 files**, which is the figure `cyrius tests tests` reports:
+**3316 assertions across 52 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
+smoke — **3318 across 53 files**, which is the figure `cyrius tests tests` reports:
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -144,6 +144,7 @@ smoke — **3238 across 52 files**, which is the figure `cyrius tests tests` rep
 | `server_routes_dashboard.tcyr` | 39 | 2 (**both** the empty case — nothing populated) |
 | `server_routes_crews.tcyr` | 124 | 10 of 10 (all of `crews.rs`; `cancel_crew` has none) |
 | `server_routes_a2a.tcyr` | 72 | 5 (all SSRF delegates; `receive` has none) |
+| `server_routes_mcp.tcyr` | 80 | 5 (all `#[tokio::test]`) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -175,7 +176,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (837/837 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (838/838 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -538,10 +539,37 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 > `guarded_fetch`'s per-request arena and a thread-pool decision. When the
 > router lands it reads `agnosai_route_a2a_callback_allowed` and does the send.
 >
-> **Next: `mcp.rs` (319)** — the last pure handler. It needs a flat-namespace
-> collision audit against `lib/bote-core.cyr`'s unprefixed `req_*` / `resp_*` /
-> `registry_*` / `schema_*` / `tool_def_*` **before** any code lands, since
-> Cyrius is last-definition-wins and bote-core is included ahead of `src/`.
+> **`mcp.rs` (bite 13) is DONE, and with it the whole routes tier** — all nine
+> route files, 9 modules, 3316 assertions across the project. The prerequisite
+> namespace audit ran first and found the src/-vs-lib/ intersection **empty**;
+> what it did find was four duplicated constants inside `src/` itself, now fixed
+> and gated (see Known issues #1).
+>
+> **Next: the transport tier — the last 5 files of M6.** In dependency order:
+> 1. **`hot_config.rs` (112)** and **`rate_limit.rs` (152)** — still pure, no
+>    sandhi. `rate_limit` is never mounted by `server/mod.rs:47-99`, but the
+>    ~300 JWT-verifies/sec ceiling measured in `auth_jwt_verify_ok` makes it
+>    matter more than its unmounted status suggests.
+> 2. **`server/mod.rs` router (100) + `routes/mod.rs` (31)** — the first
+>    `sandhi_server_*` call site in the whole port. Three things land together
+>    here and should not be split: blocker #3's per-worker arena with one
+>    `reset_via` exit path, the `alloc_used()`-flat regression test, and the
+>    a2a callback dispatch that bite 12 deliberately deferred (it reads
+>    `agnosai_route_a2a_callback_allowed`, already ported and tested). Note
+>    **sandhi 1.9.8 changed the serve-loop return contract** — see Toolchain.
+> 3. **`sse.rs::event_stream` + `routes/sse.rs` (241)** — hardest, budget its own
+>    session; thread-per-connection capacity is a design decision, not a
+>    transcription.
+> 4. **`src/main.cyr` bind** — `getenv` is in `lib/io.cyr:587`, but graceful
+>    shutdown needs a raw `rt_sigaction`; no signal helper exists in `lib/`.
+>
+> **Two things owed that the transport tier should clear:**
+> * The **metrics producer** is still unwired — ADR 011 gave `/metrics`
+>   agnosai's registry but nothing records into it, so it renders zeros. The
+>   oracle records at `crew_runner.rs:810`/`:864`.
+> * **`[deps.bote]` earns nothing today.** `mcp.rs` was its only intended
+>   consumer and builds its own envelope, so agnosai calls zero bote symbols
+>   while carrying ~93 KB and 233 fns in every build. Worth a decision.
 >
 > After those, the tier is done and only the **transport** remains:
 > `server/mod.rs`'s router + `routes/mod.rs`, `sse.rs::event_stream` +

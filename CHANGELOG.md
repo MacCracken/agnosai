@@ -82,6 +82,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_routes_mcp (M6 bite 13) — Model Context Protocol over JSON-RPC 2.0.
+  The routes tier is complete.** 80 assertions against the oracle's 5.
+
+  **The envelope is built here, not delegated to bote.** The oracle uses
+  `bote::protocol::{JsonRpcRequest, JsonRpcResponse}` and
+  `bote::registry::{ToolDef, ToolSchema}` **as types only** — it says so at
+  `mcp.rs:3-5` and never calls bote's dispatcher. The Cyrius side makes that
+  sharper: `lib/bote-core.cyr`'s `dispatcher_dispatch` (`:1713`) hardcodes
+  `"serverInfo":{"name":"bote"` in `_build_initialize_result`, where the oracle
+  emits `"agnosai"`. Delegating would have changed the wire.
+
+  **The shapes are transcribed from the Rust bote 0.91.0 the oracle pins**, not
+  from the Cyrius bundle, because the oracle's wire format is whatever serde
+  emits there. That surfaced three `skip_serializing_if` behaviours **no oracle
+  test checks**, now pinned: a success **omits** `error` (not null), an error
+  **omits** `result`, and the error object **omits** `data`. Likewise
+  `ToolSchema`'s `#[serde(rename = "type")]` — a literal transcription of the
+  Rust field name would have emitted `schema_type`, which no MCP client parses.
+
+  **The asymmetry most likely to be flattened**, and the mutation that proves it
+  is tested: a **missing tool name** is a protocol-level JSON-RPC `-32602`,
+  while an **unknown tool** is a JSON-RPC *success* carrying `isError: true`.
+  Tool-level fault versus protocol-level fault. Similarly a non-object
+  `arguments` yields an empty parameter map rather than an error, so the tool
+  runs and reports the fault itself.
+
+  Also pinned: a **string** tool result is emitted bare, not re-quoted as JSON
+  (the oracle's own `tools_call_executes_echo_tool` asserts `"hello"`, not
+  `"\"hello\""`); every arm is HTTP 200, since JSON-RPC carries faults in the
+  body; and `id` is echoed on every arm including errors, defaulting to JSON
+  null when absent.
+
+  **agnosai still calls nothing from bote.** This module was its only intended
+  consumer and it consumes none of it — worth weighing against the ~93 KB and
+  233 fns `[deps.bote]` adds to every build.
+
 - **server_routes_a2a (M6 bite 12) — Agent-to-Agent task delegation.**
   72 assertions against the oracle's 5.
 
