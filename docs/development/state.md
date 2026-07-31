@@ -78,7 +78,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | `orchestrator` ported (M5, Phase 4) | ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
-| `server` ported (M6, Phase 5) | 🟡 **11 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and the routes tier is open — `routes/health.rs` + the hub (bite 6), `routes/tools.rs` + `routes/definitions.rs` (bite 7), `routes/agents.rs` (bite 8). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
+| `server` ported (M6, Phase 5) | 🟡 **13 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), `state.rs` is bite 5, and the routes tier is open — `routes/health.rs` + the hub (bite 6), `routes/tools.rs` + `routes/definitions.rs` (bite 7), `routes/agents.rs` (bite 8), `routes/approval.rs` (bite 9), `routes/dashboard.rs` (bite 10). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
 | `server/auth` ported whole | ✅ all 10 oracle tests + 123 beyond; six defects found by adversarial review, fixed, and each pinned by a mutation-verified test. Two decided divergences: constant-time compare fixed ([ADR 009](../adr/009-auth-constant-time-secret-compare.md)) and configured `iss`/`aud` required ([ADR 010](../adr/010-jwt-require-configured-iss-aud.md)) |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
@@ -87,8 +87,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2960 assertions across 47 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
-smoke — **2962 across 48 files**, which is the figure `cyrius tests tests` reports:
+**3040 assertions across 49 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
+smoke — **3042 across 50 files**, which is the figure `cyrius tests tests` reports:
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -139,6 +139,8 @@ smoke — **2962 across 48 files**, which is the figure `cyrius tests tests` rep
 | `server_routes_health.tcyr` | 42 | 3 (all `#[tokio::test]`) |
 | `server_routes_tools.tcyr` | 34 | 4 (3 tools + 1 presets; `remove_tool` has none) |
 | `server_routes_agents.tcyr` | 38 | 5 (3 of them test the extractor, not the handler) |
+| `server_routes_approval.tcyr` | 41 | 2 (both the empty/undelivered case) |
+| `server_routes_dashboard.tcyr` | 39 | 2 (**both** the empty case — nothing populated) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -170,7 +172,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (800/800 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (805/805 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -511,10 +513,15 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 > no test for `remove_tool`'s 204/404 branch and none for `create_definition`'s
 > success path at all.
 >
+> **`approval.rs` (bite 9) and `dashboard.rs` (bite 10) are DONE** — 41 and 39
+> assertions. Both oracles are near-empty: approval tests only the undelivered
+> path and an empty list, dashboard tests **only** the two empty cases. The
+> `agnosai_orchestrator_crew_ids` accessor that was owed is added and tested.
+>
 > **Next, in order** — every one is `fn(state, inputs) -> response`, none needs
-> sandhi: `approval.rs` (130), `dashboard.rs` (150), then the two big ones
-> `crews.rs` (528) and `a2a.rs` (398), and `mcp.rs` (319) last of the pure
-> handlers.
+> sandhi: `crews.rs` (528) and `a2a.rs` (398), then `mcp.rs` (319) last of the
+> pure handlers. All three carry `deny_unknown_fields` request types, so they
+> follow the raw-body pattern with `agnosai_route_no_unknown_fields`.
 >
 > **Two conventions the tier now has, worth following rather than re-deciding:**
 > * A handler takes already-parsed inputs **unless the parse failure is itself
@@ -525,7 +532,21 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 >   `agnosai_route_no_unknown_fields`.
 > * Empty collections answer `[]`, never `null`. The oracle's `Vec` serializes
 >   to an empty array; a handler returning an unconverted empty vec produces
->   `null` and breaks clients. Pinned in both route suites so far.
+>   `null` and breaks clients. Pinned in every route suite so far.
+> * **`{:?}` is Debug, not serde.** Two routes format an enum with `{:?}` and so
+>   emit the **capitalized** Rust variant name where every other endpoint emits
+>   the snake_case wire spelling: `approval.rs`'s message (`Decision Approved
+>   delivered`) and `dashboard.rs`'s crew status (`Completed`). Each got its own
+>   renderer rather than sharing `*_to_wire`, so the two spellings cannot be
+>   confused at a call site. Expect the same in `crews.rs`.
+> * **A `*_from_wire` helper is not a request validator.** They coerce unknown
+>   input to a safe default, which is right for a callback body and wrong for an
+>   endpoint where serde would answer 422. `approval.rs` is the worked example:
+>   reusing `agnosai_approval_decision_from_wire` would have turned a typo'd
+>   decision into a silent rejection reported as 200.
+> * **Result metadata is a stdlib `map`, not a bayan JSON object** — the values
+>   are JSON, the container is not. `bayan_json_v_obj_get` on it silently finds
+>   nothing, which cost a real (test-caught) defect in `dashboard.rs`.
 >
 > **Still owed, both small and both flagged rather than done:**
 > 1. **`agnosai_orchestrator_crew_ids(o)`** (~6 lines) in

@@ -82,6 +82,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_routes_dashboard (M6 bite 10) — crew history and agent performance.**
+  39 assertions against the oracle's 2 — **and both of the oracle's are the
+  empty case**, so it never renders a single crew or agent. Every populated path
+  is covered here for the first time.
+
+  Adds `agnosai_orchestrator_crew_ids` (`src/orch_orchestrator.cyr`), the
+  accessor this route needed. **The oracle's read guard does not port**: both
+  handlers hold `state.orchestrator.state().read().await` across the whole walk,
+  which here would stall every worker's crew lookups for a dashboard render —
+  the same trade `tools_registry.list` and the definitions snapshot already
+  refused. The ids come out under the lock and the walk runs unlocked, so a crew
+  removed mid-walk is skipped rather than rendered. Documented rather than
+  glossed: the port is not claiming the oracle's snapshot consistency.
+
+  Two oracle behaviours reproduced rather than tidied, each pinned:
+  `format!("{:?}", c.status)` emits the **capitalized** `Debug` variant name —
+  `Completed`, not the `completed` every other endpoint emits via
+  `agnosai_crew_status_to_wire` — so it gets its own renderer rather than
+  sharing one; and **`tool_count` is hardcoded 0** in the oracle, not derived
+  from anything, so a dashboard consumer reading a real count would be reading
+  something the Rust never sent.
+
+  **The tests caught a real defect before it shipped.** `agent_performance` read
+  result metadata with `bayan_json_v_obj_get`, but
+  `agnosai_task_result_metadata` is a stdlib Str-keyed `map` whose *values* are
+  JSON — mirroring the oracle's `HashMap<String, serde_json::Value>` — so the
+  lookup silently found nothing and the endpoint would have returned `[]` for
+  every request. Now `map_get`, with the trap written into the accessor's header.
+
+- **server_routes_approval (M6 bite 9) — the human-in-the-loop endpoints.**
+  41 assertions against the oracle's 2. The first request type carrying
+  `#[serde(deny_unknown_fields)]`, so the first real consumer of
+  `agnosai_route_no_unknown_fields`.
+
+  **`ApprovalDecision` is validated, never coerced — and that distinction is the
+  whole bite.** `agnosai_approval_decision_from_wire` maps anything unrecognised
+  to **Rejected**, which is the right fail-closed answer for its own caller (a
+  crew callback, where a garbled decision must not become an approval). Reusing
+  it here would have turned `{"decision":"aproved"}` — a typo — into a rejection
+  the operator never asked for, answered 200, and cleared the pending approval.
+  So the route validates the spelling explicitly and 422s otherwise; a test pins
+  that the task is *still pending* afterwards.
+
+  **200 with `delivered: false` for an unknown task**, not 404 — the tempting
+  shape and the wrong one; the oracle's own test asserts it. And the message
+  carries the capitalized `Debug` variant name (`Decision Approved delivered`)
+  even though the request spelled it snake_case, the same `{:?}`-vs-serde
+  asymmetry the dashboard has.
+
+  The oracle only ever exercises the undelivered path and an empty pending list,
+  so the delivered path, the populated listing, and the whole 400/422 rejection
+  surface — malformed JSON, unknown field, missing fields, invalid UUID,
+  wrong-typed fields — are new.
+
 - **server_routes_agents (M6 bite 8) — agent-definition listing and creation.**
   The first real consumer of `server_state`'s `definitions` map. 38 assertions
   against the oracle's 5.

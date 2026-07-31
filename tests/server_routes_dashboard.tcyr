@@ -1,0 +1,287 @@
+# =========================================================================
+# server_routes_dashboard — rust-old/src/server/routes/dashboard.rs.
+#
+# The oracle has exactly two tests and **both are the empty case**
+# (`crew_history_empty`, `agent_performance_empty`) — it never renders a single
+# crew or a single agent. So every populated path here is covered for the first
+# time, including the two behaviours a reimplementation would most likely get
+# wrong: the `{:?}` capitalized status spelling, and `tool_count` being
+# hardcoded 0 rather than derived.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_routes_tools.cyr"
+include "src/server_routes_agents.cyr"
+include "src/server_routes_approval.cyr"
+include "src/server_routes_dashboard.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_state_with(o): i64 {
+    return agnosai_app_state_new(o, agnosai_tool_registry_new(),
+    agnosai_auth_config_new(), agnosai_event_bus_new(),
+    agnosai_audit_chain_new(), agnosai_approval_gate_new());
+}
+
+fn _t_state(): i64 {
+    return _t_state_with(agnosai_orchestrator_new(0));
+}
+
+# A crew spec that runs headlessly — one task, no LLM.
+fn _t_spec(name): i64 {
+    var spec = agnosai_crew_new(str_from(name));
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("do the thing")));
+    agnosai_crew_with_tasks(spec, tasks);
+    return spec;
+}
+
+fn _t_obj_str(o, key): Str {
+    var v = bayan_json_v_obj_get(o, key);
+    if (v == 0 || bayan_json_v_is_str(v) == 0) { return str_from(""); }
+    return bayan_json_v_str(v);
+}
+
+fn _t_obj_int(o, key): i64 {
+    var v = bayan_json_v_obj_get(o, key);
+    if (v == 0 || bayan_json_v_is_int(v) == 0) { return 0 - 1; }
+    return bayan_json_v_int(v);
+}
+
+# --- Oracle: crew_history_empty / agent_performance_empty ---------------
+
+fn _t_empty(): i64 {
+    var s = _t_state();
+    var r = agnosai_route_crew_history(s);
+    assert(agnosai_route_status(r) == HTTP_OK, "GET dashboard/crews is 200");
+    assert(bayan_json_v_is_arr(agnosai_route_body(r)) == 1, "the body is an array");
+    assert(bayan_json_v_is_null(agnosai_route_body(r)) == 0, "...not null");
+    assert(bayan_json_v_arr_len(agnosai_route_body(r)) == 0, "...and empty");
+
+    var r2 = agnosai_route_agent_performance(s);
+    assert(agnosai_route_status(r2) == HTTP_OK, "GET dashboard/agents is 200");
+    assert(bayan_json_v_is_arr(agnosai_route_body(r2)) == 1, "the body is an array");
+    assert(bayan_json_v_arr_len(agnosai_route_body(r2)) == 0, "...and empty");
+    return 0;
+}
+
+# --- Populated crew history, which the oracle never renders --------------
+
+fn _t_crew_history_populated(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var s = _t_state_with(o);
+    agnosai_orchestrator_run_crew(o, _t_spec("alpha"));
+    agnosai_orchestrator_run_crew(o, _t_spec("beta"));
+
+    var arr = agnosai_route_body(agnosai_route_crew_history(s));
+    assert(bayan_json_v_arr_len(arr) == 2, "both crews are summarized");
+
+    var c = bayan_json_v_arr_get(arr, 0);
+    assert(str_len(_t_obj_str(c, "crew_id")) > 0, "a summary carries a crew_id");
+    assert(_t_obj_int(c, "task_count") == 1, "...its result count");
+    assert(bayan_json_v_obj_get(c, "wall_ms") != 0, "...a wall_ms");
+    assert(bayan_json_v_obj_get(c, "cost_usd") != 0, "...and a cost_usd");
+    assert(bayan_json_v_is_float(bayan_json_v_obj_get(c, "cost_usd")) == 1,
+    "cost_usd is a float at the wire boundary, matching the oracle's f64");
+    assert(bayan_json_v_obj_len(c) == 5, "exactly the oracle's five fields");
+    return 0;
+}
+
+# **`{:?}` is Debug, not serde.** The dashboard emits the CAPITALIZED variant
+# name where every other endpoint emits the snake_case wire spelling. Getting
+# this wrong is the single most likely reimplementation slip in this file.
+fn _t_status_is_debug_spelling(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var s = _t_state_with(o);
+    agnosai_orchestrator_run_crew(o, _t_spec("done"));
+
+    var c = bayan_json_v_arr_get(agnosai_route_body(agnosai_route_crew_history(s)), 0);
+    var st = _t_obj_str(c, "status");
+    assert(str_eq(st, str_from("Completed")) == 1,
+    "the dashboard status is the Debug variant name");
+    assert(str_eq(st, str_from("completed")) == 0,
+    "...NOT the snake_case wire spelling every other route uses");
+
+    # And the serde spelling still is what it always was, so the two renderers
+    # genuinely differ rather than one having been redefined.
+    assert(str_eq(agnosai_crew_status_to_wire(AGNOSAI_CREW_COMPLETED),
+    str_from("completed")) == 1, "crew_status_to_wire is unchanged");
+
+    # Every variant, so a partial renderer is caught.
+    assert(str_eq(_agnosai_route_status_debug(AGNOSAI_CREW_PENDING), str_from("Pending")) == 1,
+    "Pending");
+    assert(str_eq(_agnosai_route_status_debug(AGNOSAI_CREW_RUNNING), str_from("Running")) == 1,
+    "Running");
+    assert(str_eq(_agnosai_route_status_debug(AGNOSAI_CREW_FAILED), str_from("Failed")) == 1,
+    "Failed");
+    assert(str_eq(_agnosai_route_status_debug(AGNOSAI_CREW_CANCELLED),
+    str_from("Cancelled")) == 1, "Cancelled");
+    return 0;
+}
+
+# --- Agent performance, entirely untested in the oracle ------------------
+
+# A crew state carrying results whose metadata names agents.
+fn _t_crew_with_agents(o, crew_name, a1, a2): i64 {
+    var st = agnosai_crew_state_new(agnosai_uuid_v4_str(), AGNOSAI_CREW_COMPLETED);
+    var r1 = agnosai_task_result_new(agnosai_uuid_v4_str(), str_from("out"),
+    AGNOSAI_STATUS_COMPLETED);
+    agnosai_task_result_with_metadata(r1, str_from("agent"),
+    bayan_json_v_str_new(str_from(a1)));
+    agnosai_task_result_with_metadata(r1, str_from("agent_name"),
+    bayan_json_v_str_new(str_from("The First")));
+    agnosai_task_result_with_metadata(r1, str_from("agent_role"),
+    bayan_json_v_str_new(str_from("writer")));
+    agnosai_crew_state_with_result(st, r1);
+
+    var r2 = agnosai_task_result_new(agnosai_uuid_v4_str(), str_from("out"),
+    AGNOSAI_STATUS_COMPLETED);
+    agnosai_task_result_with_metadata(r2, str_from("agent"),
+    bayan_json_v_str_new(str_from(a2)));
+    agnosai_crew_state_with_result(st, r2);
+    return st;
+}
+
+# Runs a crew so the orchestrator has a registered id, then rewrites that
+# entry's state to one carrying agent metadata — the shape `crew_runner`
+# produces in production.
+fn _t_orch_with_agent_results(a1, a2): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var spec = _t_spec("crew");
+    var id = agnosai_crew_id(spec);
+    agnosai_orchestrator_run_crew(o, spec);
+    var st = agnosai_orchestrator_crew(o, id);
+    var built = _t_crew_with_agents(o, "crew", a1, a2);
+    # Copy the built results onto the registered state, so the registry entry is
+    # the one the handler will find.
+    var results = agnosai_crew_state_results(built);
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        agnosai_crew_state_with_result(st, vec_get(results, i));
+    }
+    return o;
+}
+
+fn _t_agent_performance(): i64 {
+    var o = _t_orch_with_agent_results("writer", "editor");
+    var arr = agnosai_route_body(agnosai_route_agent_performance(_t_state_with(o)));
+    assert(bayan_json_v_arr_len(arr) >= 2, "both named agents are summarized");
+
+    var found_writer = 0;
+    var found_editor = 0;
+    for (var i = 0; i < bayan_json_v_arr_len(arr); i = i + 1) {
+        var a = bayan_json_v_arr_get(arr, i);
+        if (str_eq(_t_obj_str(a, "agent_key"), str_from("writer")) == 1) {
+            found_writer = 1;
+            assert(str_eq(_t_obj_str(a, "name"), str_from("The First")) == 1,
+            "agent_name is used when present");
+            assert(str_eq(_t_obj_str(a, "role"), str_from("writer")) == 1,
+            "agent_role is used when present");
+        }
+        if (str_eq(_t_obj_str(a, "agent_key"), str_from("editor")) == 1) {
+            found_editor = 1;
+            # The oracle's `.unwrap_or(agent_key)` and `.unwrap_or("")`.
+            assert(str_eq(_t_obj_str(a, "name"), str_from("editor")) == 1,
+            "name falls back to the agent key when agent_name is absent");
+            assert(str_eq(_t_obj_str(a, "role"), str_from("")) == 1,
+            "role falls back to the empty string");
+        }
+        # Hardcoded 0 in the oracle — NOT derived from anything.
+        assert(_t_obj_int(a, "tool_count") == 0, "tool_count is 0, as the oracle hardcodes");
+        assert(bayan_json_v_obj_len(a) == 4, "exactly the oracle's four fields");
+    }
+    assert(found_writer == 1, "the writer summary is present");
+    assert(found_editor == 1, "the editor summary is present");
+    return 0;
+}
+
+# The oracle's `HashSet::insert` guard: an agent appearing in several results is
+# summarized once.
+fn _t_agents_deduplicated(): i64 {
+    var o = _t_orch_with_agent_results("same", "same");
+    var arr = agnosai_route_body(agnosai_route_agent_performance(_t_state_with(o)));
+    var n = 0;
+    for (var i = 0; i < bayan_json_v_arr_len(arr); i = i + 1) {
+        if (str_eq(_t_obj_str(bayan_json_v_arr_get(arr, i), "agent_key"),
+        str_from("same")) == 1) { n = n + 1; }
+    }
+    assert(n == 1, "an agent appearing twice is summarized once");
+    return 0;
+}
+
+# A result with no `agent` metadata contributes nothing — the oracle's
+# `if let Some(agent_key) = ..`.
+fn _t_results_without_agent_are_skipped(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var spec = _t_spec("plain");
+    var id = agnosai_crew_id(spec);
+    agnosai_orchestrator_run_crew(o, spec);
+    var st = agnosai_orchestrator_crew(o, id);
+    var r = agnosai_task_result_new(agnosai_uuid_v4_str(), str_from("out"),
+    AGNOSAI_STATUS_COMPLETED);
+    agnosai_crew_state_with_result(st, r);
+
+    var arr = agnosai_route_body(agnosai_route_agent_performance(_t_state_with(o)));
+    assert(bayan_json_v_arr_len(arr) == 0, "a result with no agent metadata adds nothing");
+
+    # A non-string `agent` is the same as absent — the oracle's `.and_then(as_str)`.
+    var r2 = agnosai_task_result_new(agnosai_uuid_v4_str(), str_from("out"),
+    AGNOSAI_STATUS_COMPLETED);
+    agnosai_task_result_with_metadata(r2, str_from("agent"), bayan_json_v_int_new(7));
+    agnosai_crew_state_with_result(st, r2);
+    assert(bayan_json_v_arr_len(
+    agnosai_route_body(agnosai_route_agent_performance(_t_state_with(o)))) == 0,
+    "a non-string agent is treated as absent");
+    return 0;
+}
+
+# --- The accessor added for this route ------------------------------------
+
+fn _t_crew_ids(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    assert(vec_len(agnosai_orchestrator_crew_ids(o)) == 0, "an empty registry has no ids");
+    var spec = _t_spec("one");
+    var id = agnosai_crew_id(spec);
+    agnosai_orchestrator_run_crew(o, spec);
+    var ids = agnosai_orchestrator_crew_ids(o);
+    assert(vec_len(ids) == 1, "one crew, one id");
+    assert(str_eq(vec_get(ids, 0), id) == 1, "...and it is the crew's own id");
+    assert(vec_len(ids) == agnosai_orchestrator_crew_count(o),
+    "crew_ids and crew_count agree");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_empty();
+    _t_crew_history_populated();
+    _t_status_is_debug_spelling();
+    _t_agent_performance();
+    _t_agents_deduplicated();
+    _t_results_without_agent_are_skipped();
+    _t_crew_ids();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

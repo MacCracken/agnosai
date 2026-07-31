@@ -107,6 +107,27 @@ fn agnosai_orchestrator_crew(o, crew_id: Str): i64 {
     return s;
 }
 
+# The ids of every crew the registry holds, as a vec of Str.
+#
+# The oracle has no equivalent: its handlers hold an `RwLock` read guard and
+# walk `orch_state.active_crews.values()` directly. That shape does not port —
+# holding this mutex across a caller's arbitrary work would stall every worker
+# thread's crew lookups, which is the same reasoning `tools_registry.list` and
+# `server_state`'s definitions snapshot already follow.
+#
+# So callers take the ids under the lock, then fetch each state with
+# `agnosai_orchestrator_crew` afterwards. A crew that finishes between the two
+# calls answers 0 and the caller skips it — which is the behaviour a read guard
+# would have prevented, and is worth less than the contention it costs.
+# Added for `routes/dashboard.rs`, its only consumer today.
+fn agnosai_orchestrator_crew_ids(o): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var ids = map_keys(load64(o + AGN_OR_CREWS));
+    mutex_unlock(mtx);
+    return ids;
+}
+
 # How many crews the registry holds.
 fn agnosai_orchestrator_crew_count(o): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);

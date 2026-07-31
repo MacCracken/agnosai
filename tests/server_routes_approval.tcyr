@@ -1,0 +1,284 @@
+# =========================================================================
+# server_routes_approval — rust-old/src/server/routes/approval.rs.
+#
+# Both oracle tests port. The oracle only ever exercises the **undelivered**
+# path (`submit_approval_unknown_task`) and an **empty** pending list, so the
+# delivered path, the pending listing with entries, and the whole 400/422
+# rejection surface are covered here for the first time.
+#
+# This is the first route whose request type carries
+# `#[serde(deny_unknown_fields)]`, so it is where the shared
+# `agnosai_route_no_unknown_fields` helper first has to earn its keep.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "src/server_routes.cyr"
+include "src/server_routes_health.cyr"
+include "src/server_routes_tools.cyr"
+include "src/server_routes_agents.cyr"
+include "src/server_routes_approval.cyr"
+include "tests/test_helpers.cyr"
+
+var _T_AP_ID = "00000000-0000-0000-0000-000000000001";
+
+fn _t_state(): i64 {
+    return agnosai_app_state_new(
+    agnosai_orchestrator_new(0),
+    agnosai_tool_registry_new(),
+    agnosai_auth_config_new(),
+    agnosai_event_bus_new(),
+    agnosai_audit_chain_new(),
+    agnosai_approval_gate_new());
+}
+
+# `{"task_id":"<id>","decision":"<d>"}`
+fn _t_body(id, decision): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"");
+    str_builder_add_cstr(sb, id);
+    str_builder_add_cstr(sb, "\",\"decision\":\"");
+    str_builder_add_cstr(sb, decision);
+    str_builder_add_cstr(sb, "\"}");
+    return str_builder_build(sb);
+}
+
+fn _t_bool(resp, key): i64 {
+    var v = bayan_json_v_obj_get(agnosai_route_body(resp), key);
+    if (v == 0) { return 0 - 1; }
+    if (bayan_json_v_is_bool(v) == 0) { return 0 - 1; }
+    return bayan_json_v_bool(v);
+}
+
+fn _t_msg(resp): Str {
+    var v = bayan_json_v_obj_get(agnosai_route_body(resp), "message");
+    if (v == 0 || bayan_json_v_is_str(v) == 0) { return str_from(""); }
+    return bayan_json_v_str(v);
+}
+
+# --- Oracle: submit_approval_unknown_task --------------------------------
+
+# 200 with `delivered: false`. A 404 would be the tempting shape and is wrong —
+# the oracle answers OK and reports non-delivery in the body.
+fn _t_submit_unknown_task(): i64 {
+    var s = _t_state();
+    var r = agnosai_route_submit_approval(s, _t_body(_T_AP_ID, "approved"));
+    assert(agnosai_route_status(r) == HTTP_OK, "an unknown task is still 200");
+    assert(_t_bool(r, "delivered") == 0, "...with delivered false");
+    assert(str_contains(_t_msg(r), str_from("No pending approval found")) == 1,
+    "...and the oracle's not-found message");
+    assert(str_contains(_t_msg(r), str_from(_T_AP_ID)) == 1, "...naming the task");
+    return 0;
+}
+
+# --- Oracle: list_pending_empty ------------------------------------------
+
+fn _t_list_pending_empty(): i64 {
+    var r = agnosai_route_list_pending(_t_state());
+    assert(agnosai_route_status(r) == HTTP_OK, "GET approvals is 200");
+    var arr = agnosai_route_body(r);
+    assert(bayan_json_v_is_arr(arr) == 1, "the body is an array");
+    assert(bayan_json_v_is_null(arr) == 0, "...not null");
+    assert(bayan_json_v_arr_len(arr) == 0, "...and empty");
+    return 0;
+}
+
+# --- The delivered path, which the oracle never exercises ----------------
+
+fn _t_submit_delivered(): i64 {
+    var s = _t_state();
+    var g = agnosai_app_state_approval_gate(s);
+    agnosai_approval_request(g, str_from(_T_AP_ID));
+    assert(agnosai_approval_gate_pending_count(g) == 1, "one approval is pending");
+
+    var r = agnosai_route_submit_approval(s, _t_body(_T_AP_ID, "approved"));
+    assert(agnosai_route_status(r) == HTTP_OK, "delivering a decision is 200");
+    assert(_t_bool(r, "delivered") == 1, "...with delivered true");
+    assert(agnosai_approval_gate_pending_count(g) == 0, "...and clears the pending entry");
+
+    # `{:?}` is Debug, not serde: the message carries the CAPITALIZED Rust
+    # variant name even though the request spelled it snake_case. Reproduced
+    # because the message is wire-visible.
+    assert(str_contains(_t_msg(r), str_from("Decision Approved delivered")) == 1,
+    "the message uses the Debug variant name, not the wire spelling");
+    assert(str_contains(_t_msg(r), str_from("approved delivered")) == 0,
+    "...so the snake_case spelling does not appear");
+    return 0;
+}
+
+fn _t_submit_delivered_rejected(): i64 {
+    var s = _t_state();
+    var g = agnosai_app_state_approval_gate(s);
+    agnosai_approval_request(g, str_from(_T_AP_ID));
+    var r = agnosai_route_submit_approval(s, _t_body(_T_AP_ID, "rejected"));
+    assert(_t_bool(r, "delivered") == 1, "a rejection is delivered too");
+    assert(str_contains(_t_msg(r), str_from("Decision Rejected delivered")) == 1,
+    "...and names the Rejected variant");
+    return 0;
+}
+
+# The listing reflects registered approvals, and drops them as they are decided.
+fn _t_list_pending_with_entries(): i64 {
+    var s = _t_state();
+    var g = agnosai_app_state_approval_gate(s);
+    agnosai_approval_request(g, str_from(_T_AP_ID));
+    agnosai_approval_request(g, str_from("00000000-0000-0000-0000-000000000002"));
+
+    var arr = agnosai_route_body(agnosai_route_list_pending(s));
+    assert(bayan_json_v_arr_len(arr) == 2, "both pending approvals list");
+    var first = bayan_json_v_arr_get(arr, 0);
+    assert(bayan_json_v_is_str(first) == 1, "entries are id strings");
+    assert(str_eq(bayan_json_v_str(first), str_from(_T_AP_ID)) == 1,
+    "...in registration order");
+
+    agnosai_route_submit_approval(s, _t_body(_T_AP_ID, "approved"));
+    var arr2 = agnosai_route_body(agnosai_route_list_pending(s));
+    assert(bayan_json_v_arr_len(arr2) == 1, "a decided approval leaves the list");
+    return 0;
+}
+
+# --- Rejections: the surface the oracle has no test for ------------------
+
+fn _t_malformed_json(): i64 {
+    var s = _t_state();
+    var r = agnosai_route_submit_approval(s, str_from("not json at all"));
+    assert(agnosai_route_status(r) == HTTP_BAD_REQUEST, "malformed JSON is 400");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, str_from("[]")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an array body is 422");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, str_from("7")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "a scalar body is 422");
+    return 0;
+}
+
+# `deny_unknown_fields` — the reason the shared helper exists.
+fn _t_unknown_field_rejected(): i64 {
+    var s = _t_state();
+    var g = agnosai_app_state_approval_gate(s);
+    agnosai_approval_request(g, str_from(_T_AP_ID));
+
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"");
+    str_builder_add_cstr(sb, _T_AP_ID);
+    str_builder_add_cstr(sb, "\",\"decision\":\"approved\",\"extra\":1}");
+    var r = agnosai_route_submit_approval(s, str_builder_build(sb));
+    assert(agnosai_route_status(r) == AGNOSAI_HTTP_UNPROCESSABLE,
+    "an unknown field is 422, matching serde's deny_unknown_fields");
+    assert(agnosai_approval_gate_pending_count(g) == 1,
+    "...and the approval is still pending — the decision never reached the gate");
+    return 0;
+}
+
+fn _t_missing_fields(): i64 {
+    var s = _t_state();
+    assert(agnosai_route_status(agnosai_route_submit_approval(s,
+    str_from("{\"decision\":\"approved\"}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
+    "missing task_id is 422");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"");
+    str_builder_add_cstr(sb, _T_AP_ID);
+    str_builder_add_cstr(sb, "\"}");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, str_builder_build(sb)))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "missing decision is 422");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, str_from("{}")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an empty object is 422");
+    return 0;
+}
+
+# `task_id: uuid::Uuid` — serde parses it, so a malformed id never reaches the
+# gate.
+fn _t_invalid_uuid(): i64 {
+    var s = _t_state();
+    assert(agnosai_route_status(agnosai_route_submit_approval(s,
+    _t_body("not-a-uuid", "approved"))) == AGNOSAI_HTTP_UNPROCESSABLE,
+    "a non-UUID task_id is 422");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s,
+    _t_body("00000000000000000000000000000001", "approved")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an unhyphenated UUID is 422");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s,
+    _t_body("0000000Z-0000-0000-0000-000000000001", "approved")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "a non-hex character is 422");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, _t_body("", "approved")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an empty task_id is 422");
+    return 0;
+}
+
+# **The one that matters most.** `agnosai_approval_decision_from_wire` coerces
+# anything unrecognised to Rejected — correct for a crew callback, catastrophic
+# here. A typo'd decision must be 422, not a silent rejection reported as 200.
+fn _t_invalid_decision_is_not_coerced(): i64 {
+    var s = _t_state();
+    var g = agnosai_app_state_approval_gate(s);
+    agnosai_approval_request(g, str_from(_T_AP_ID));
+
+    var r = agnosai_route_submit_approval(s, _t_body(_T_AP_ID, "aproved"));
+    assert(agnosai_route_status(r) == AGNOSAI_HTTP_UNPROCESSABLE,
+    "a typo'd decision is 422, NOT silently coerced to a rejection");
+    assert(agnosai_approval_gate_pending_count(g) == 1,
+    "...and the task is still pending — nothing was decided on the caller's behalf");
+
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, _t_body(_T_AP_ID, "")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an empty decision is 422");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, _t_body(_T_AP_ID, "Approved")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "decision matching is case-sensitive, like serde's");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, _t_body(_T_AP_ID, "yes")))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "an arbitrary word is 422");
+    assert(agnosai_approval_gate_pending_count(g) == 1, "none of those decided anything");
+
+    # And the two valid spellings still work, so the guard is not over-tight.
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, _t_body(_T_AP_ID, "approved")))
+    == HTTP_OK, "the valid spelling still passes");
+    return 0;
+}
+
+# Wrong-typed fields are deserialization failures, not coercions.
+fn _t_wrong_types(): i64 {
+    var s = _t_state();
+    assert(agnosai_route_status(agnosai_route_submit_approval(s,
+    str_from("{\"task_id\":1,\"decision\":\"approved\"}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
+    "a numeric task_id is 422");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"");
+    str_builder_add_cstr(sb, _T_AP_ID);
+    str_builder_add_cstr(sb, "\",\"decision\":true}");
+    assert(agnosai_route_status(agnosai_route_submit_approval(s, str_builder_build(sb)))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "a boolean decision is 422");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_submit_unknown_task();
+    _t_list_pending_empty();
+    _t_submit_delivered();
+    _t_submit_delivered_rejected();
+    _t_list_pending_with_entries();
+    _t_malformed_json();
+    _t_unknown_field_rejected();
+    _t_missing_fields();
+    _t_invalid_uuid();
+    _t_invalid_decision_is_not_coerced();
+    _t_wrong_types();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

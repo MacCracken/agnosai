@@ -1,0 +1,136 @@
+# =========================================================================
+# server_routes_approval — the human-in-the-loop approval endpoints.
+#
+# Parity oracle: rust-old/src/server/routes/approval.rs
+#
+# The first route whose request type carries `#[serde(deny_unknown_fields)]`
+# (`approval.rs:12`), so the first real consumer of
+# `agnosai_route_no_unknown_fields`.
+#
+# ## `ApprovalDecision` must be VALIDATED here, not coerced
+#
+# `agnosai_approval_decision_from_wire` maps anything unrecognised to
+# **Rejected**, which is the right fail-closed answer for its own caller — a
+# crew callback body, where a garbled decision must not become an approval.
+#
+# It is the wrong answer at this endpoint. `ApprovalSubmission.decision` is a
+# typed `ApprovalDecision`, so serde **rejects** an unknown string with 422
+# rather than deciding on the operator's behalf. Reusing `from_wire` here would
+# silently turn `{"decision":"aproved"}` — a typo — into a rejection the caller
+# never asked for, and answer 200 while doing it. So this module validates the
+# spelling explicitly and only then converts.
+# =========================================================================
+
+# The fields `ApprovalSubmission` accepts. serde rejects any other key outright,
+# and the type is `deny_unknown_fields`.
+fn _agnosai_route_approval_fields(): i64 {
+    var f = agnosai_route_fields();
+    agnosai_route_field(f, "task_id");
+    agnosai_route_field(f, "decision");
+    return f;
+}
+
+# `POST /api/v1/approvals` — submit a decision for a pending task.
+#
+# Takes the raw body for the same reason `agents.rs` does: axum's `Json<T>`
+# extractor answers 400/422 before the oracle's handler runs, so the status
+# contract belongs here or it is untestable until the transport bite.
+#
+# **Always 200 on a well-formed submission**, whether or not a pending approval
+# was waiting — `delivered` is the flag that distinguishes them, and the
+# oracle's `submit_approval_unknown_task` test asserts exactly that (200 with
+# `delivered: false`). A 404 would have been the tempting shape and is wrong.
+fn agnosai_route_submit_approval(state, body: Str): i64 {
+    var v = bayan_json_v_parse_buf(str_data(body), str_len(body));
+    if (v == 0) {
+        return agnosai_route_error(HTTP_BAD_REQUEST, str_from("malformed JSON body"));
+    }
+    if (bayan_json_v_is_obj(v) == 0) {
+        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from("body is not an object"));
+    }
+    if (agnosai_route_no_unknown_fields(v, _agnosai_route_approval_fields()) == 0) {
+        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from("unknown field in approval submission"));
+    }
+
+    # `task_id: uuid::Uuid` — serde parses it, so a malformed id is 422 and
+    # never reaches the gate.
+    var tid_v = bayan_json_v_obj_get(v, "task_id");
+    if (tid_v == 0 || bayan_json_v_is_str(tid_v) == 0) {
+        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from("task_id is required and must be a string"));
+    }
+    var task_id = bayan_json_v_str(tid_v);
+    if (agnosai_uuid_parse(task_id) == 0) {
+        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from("task_id is not a valid UUID"));
+    }
+
+    # `decision: ApprovalDecision` — a typed enum, so only the two snake_case
+    # spellings deserialize. See the module header for why this does not go
+    # through `from_wire`.
+    var dec_v = bayan_json_v_obj_get(v, "decision");
+    if (dec_v == 0 || bayan_json_v_is_str(dec_v) == 0) {
+        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from("decision is required and must be a string"));
+    }
+    var dec_s = bayan_json_v_str(dec_v);
+    var approved = str_eq(dec_s, str_from("approved"));
+    var rejected = str_eq(dec_s, str_from("rejected"));
+    if (approved == 0 && rejected == 0) {
+        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from("decision must be \"approved\" or \"rejected\""));
+    }
+    var decision = AGNOSAI_APPROVAL_REJECTED;
+    if (approved == 1) { decision = AGNOSAI_APPROVAL_APPROVED; }
+
+    var delivered = agnosai_approval_submit_decision(
+    agnosai_app_state_approval_gate(state), task_id, decision);
+
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("delivered"), bayan_json_v_bool_new(delivered));
+    bayan_json_v_obj_set(obj, str_from("message"),
+    bayan_json_v_str_new(_agnosai_route_approval_message(delivered, decision, task_id)));
+    return agnosai_route_json(HTTP_OK, obj);
+}
+
+# The oracle's two `format!` strings, verbatim.
+#
+# **`{:?}` is Debug, not serde**, so the delivered message carries the
+# capitalized Rust variant name — `Approved` / `Rejected` — not the snake_case
+# wire spelling the request used. That asymmetry looks like a bug and is not:
+# `#[serde(rename_all = "snake_case")]` governs serialization, while `{:?}`
+# prints the derived `Debug`, which is the variant identifier. Reproduced
+# because the message is wire-visible.
+fn _agnosai_route_approval_message(delivered, decision, task_id: Str): Str {
+    var sb = str_builder_new();
+    if (delivered == 1) {
+        str_builder_add_cstr(sb, "Decision ");
+        if (decision == AGNOSAI_APPROVAL_APPROVED) {
+            str_builder_add_cstr(sb, "Approved");
+        } else {
+            str_builder_add_cstr(sb, "Rejected");
+        }
+        str_builder_add_cstr(sb, " delivered for task ");
+        str_builder_add_str(sb, task_id);
+        return str_builder_build(sb);
+    }
+    str_builder_add_cstr(sb, "No pending approval found for task ");
+    str_builder_add_str(sb, task_id);
+    return str_builder_build(sb);
+}
+
+# `GET /api/v1/approvals` — the task ids currently awaiting a decision.
+#
+# `[]` when none are pending, not `null` — the oracle's `Vec<Uuid>` and its
+# `list_pending_empty` test.
+fn agnosai_route_list_pending(state): i64 {
+    var pending = agnosai_approval_gate_pending_tasks(
+    agnosai_app_state_approval_gate(state));
+    var arr = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(pending); i = i + 1) {
+        bayan_json_v_arr_push(arr, bayan_json_v_str_new(vec_get(pending, i)));
+    }
+    return agnosai_route_json(HTTP_OK, arr);
+}
