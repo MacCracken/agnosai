@@ -439,6 +439,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   oracle's own keypair and confirmed with `openssl dgst -verify` before being
   committed — **agnosai contains no RSA signing and no test needs a private key.**
 
+### Fixed
+- **Four duplicated top-level constants in `src/`, three with different values —
+  and the compiler warns about none of them.** Found by a flat-namespace audit
+  run as the prerequisite for porting `mcp.rs`.
+
+  Cyrius has one global symbol table and last-definition-wins. It emits
+  `warning: duplicate fn` for a repeated **fn** and is **silent** for a repeated
+  `var` or enum member — so `grep "duplicate fn"` on the build log, the obvious
+  check, structurally cannot catch this class.
+
+  | constant | | |
+  |---|---|---|
+  | `AGN_AC_SIZE` | `server_auth.cyr` = **24** | `orch_audit.cyr` = **48** |
+  | `AGN_CE_SIZE` | `server_sse.cyr` = **24** | `orch_plan_cache.cyr` = **32** |
+  | `AGN_RR_SIZE` | `server_routes.cyr` = **24** | `tools_remote_registry.cyr` = **40** |
+  | `AGN_REQ_SIZE` | `core_resource.cyr` = 40 | `llm_hoosh.cyr` = 40 |
+
+  Three of the four are **struct sizes passed straight to `alloc()`**. Nothing
+  misbehaved, but only by accident of include order: each file's own `alloc()`
+  happens to be parsed after its own definition and before the redefinition.
+  Reordering `src/main.cyr`'s includes, or adding a module that used one of these
+  names, would have silently under-allocated a heap struct with no diagnostic.
+  All eight now carry module-unique names; behaviour is unchanged (52/52 suites,
+  837/837 coverage, before and after).
+
+- **`_agnosai_is_digit` hoisted into `src/units.cyr`.** It was defined
+  byte-identically in both `server_ssrf.cyr` and `server_output_filter.cyr` — a
+  silent last-definition-wins pair, benign only while the bodies agreed. This was
+  documented as "hoist at the next touch" and the new gate forced the issue.
+  agnosai's own duplicate-fn warnings are now **zero** (build total 36 → 35; the
+  remaining 35 are all lib-vs-lib).
+
+- **`src/main.cyr`'s entry-point `var r` renamed** to `_agnosai_exit_code`. A
+  bare single-letter top-level `var` is a global in the flat namespace.
+
+### Added
+- **`scripts/check-symbols.sh` + a CI gate.** Two rules the compiler cannot
+  enforce: no name defined twice in `src/` across **all** definition kinds (fn,
+  var, enum member), and every top-level symbol `agnosai_*`/`_`-prefixed. The
+  second rule closes the entire ~180-name unprefixed export surface of
+  `lib/bote-core.cyr` at once, with no denylist to maintain. Runs before Build.
+
 ### Security
 - **server_auth — six defects found by an adversarial review of the first cut of
   the JWT half, all fixed and all pinned by a test that fails if the fix is
@@ -1328,7 +1370,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-#### Security — Prompt Injection & Tool Allow-Lists
+#### Fixed
+- **Four duplicated top-level constants in `src/`, three with different values —
+  and the compiler warns about none of them.** Found by a flat-namespace audit
+  run as the prerequisite for porting `mcp.rs`.
+
+  Cyrius has one global symbol table and last-definition-wins. It emits
+  `warning: duplicate fn` for a repeated **fn** and is **silent** for a repeated
+  `var` or enum member — so `grep "duplicate fn"` on the build log, the obvious
+  check, structurally cannot catch this class.
+
+  | constant | | |
+  |---|---|---|
+  | `AGN_AC_SIZE` | `server_auth.cyr` = **24** | `orch_audit.cyr` = **48** |
+  | `AGN_CE_SIZE` | `server_sse.cyr` = **24** | `orch_plan_cache.cyr` = **32** |
+  | `AGN_RR_SIZE` | `server_routes.cyr` = **24** | `tools_remote_registry.cyr` = **40** |
+  | `AGN_REQ_SIZE` | `core_resource.cyr` = 40 | `llm_hoosh.cyr` = 40 |
+
+  Three of the four are **struct sizes passed straight to `alloc()`**. Nothing
+  misbehaved, but only by accident of include order: each file's own `alloc()`
+  happens to be parsed after its own definition and before the redefinition.
+  Reordering `src/main.cyr`'s includes, or adding a module that used one of these
+  names, would have silently under-allocated a heap struct with no diagnostic.
+  All eight now carry module-unique names; behaviour is unchanged (52/52 suites,
+  837/837 coverage, before and after).
+
+- **`_agnosai_is_digit` hoisted into `src/units.cyr`.** It was defined
+  byte-identically in both `server_ssrf.cyr` and `server_output_filter.cyr` — a
+  silent last-definition-wins pair, benign only while the bodies agreed. This was
+  documented as "hoist at the next touch" and the new gate forced the issue.
+  agnosai's own duplicate-fn warnings are now **zero** (build total 36 → 35; the
+  remaining 35 are all lib-vs-lib).
+
+- **`src/main.cyr`'s entry-point `var r` renamed** to `_agnosai_exit_code`. A
+  bare single-letter top-level `var` is a global in the flat namespace.
+
+### Added
+- **`scripts/check-symbols.sh` + a CI gate.** Two rules the compiler cannot
+  enforce: no name defined twice in `src/` across **all** definition kinds (fn,
+  var, enum member), and every top-level symbol `agnosai_*`/`_`-prefixed. The
+  second rule closes the entire ~180-name unprefixed export surface of
+  `lib/bote-core.cyr` at once, with no denylist to maintain. Runs before Build.
+
+### Security — Prompt Injection & Tool Allow-Lists
 - **Prompt injection detection** (`server::prompt_guard`): heuristic scanner for 30+ injection patterns (instruction override, role hijack, prompt leak, delimiter injection) with case-insensitive matching
 - **Input sanitization**: `sanitize()` truncates inputs to 50K chars, wraps in `<user_input>` boundary markers, logs warnings on suspicious content
 - **System prompt hardening**: `wrap_system_prompt()` adds `<system_instructions>` delimiters and anti-injection directive to all LLM system prompts
@@ -1413,6 +1497,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fleet::state`: `get`, `active_runs`, `overall_progress`
 - `fleet::coordinator`: `tasks_for_node`, `is_complete`, `completion_pct`, `pending_reassignment`, `state_manager`
 - `definitions::versioning`: `get`, `latest`, `list_versions`
+
+### Fixed
+- **Four duplicated top-level constants in `src/`, three with different values —
+  and the compiler warns about none of them.** Found by a flat-namespace audit
+  run as the prerequisite for porting `mcp.rs`.
+
+  Cyrius has one global symbol table and last-definition-wins. It emits
+  `warning: duplicate fn` for a repeated **fn** and is **silent** for a repeated
+  `var` or enum member — so `grep "duplicate fn"` on the build log, the obvious
+  check, structurally cannot catch this class.
+
+  | constant | | |
+  |---|---|---|
+  | `AGN_AC_SIZE` | `server_auth.cyr` = **24** | `orch_audit.cyr` = **48** |
+  | `AGN_CE_SIZE` | `server_sse.cyr` = **24** | `orch_plan_cache.cyr` = **32** |
+  | `AGN_RR_SIZE` | `server_routes.cyr` = **24** | `tools_remote_registry.cyr` = **40** |
+  | `AGN_REQ_SIZE` | `core_resource.cyr` = 40 | `llm_hoosh.cyr` = 40 |
+
+  Three of the four are **struct sizes passed straight to `alloc()`**. Nothing
+  misbehaved, but only by accident of include order: each file's own `alloc()`
+  happens to be parsed after its own definition and before the redefinition.
+  Reordering `src/main.cyr`'s includes, or adding a module that used one of these
+  names, would have silently under-allocated a heap struct with no diagnostic.
+  All eight now carry module-unique names; behaviour is unchanged (52/52 suites,
+  837/837 coverage, before and after).
+
+- **`_agnosai_is_digit` hoisted into `src/units.cyr`.** It was defined
+  byte-identically in both `server_ssrf.cyr` and `server_output_filter.cyr` — a
+  silent last-definition-wins pair, benign only while the bodies agreed. This was
+  documented as "hoist at the next touch" and the new gate forced the issue.
+  agnosai's own duplicate-fn warnings are now **zero** (build total 36 → 35; the
+  remaining 35 are all lib-vs-lib).
+
+- **`src/main.cyr`'s entry-point `var r` renamed** to `_agnosai_exit_code`. A
+  bare single-letter top-level `var` is a global in the flat namespace.
+
+### Added
+- **`scripts/check-symbols.sh` + a CI gate.** Two rules the compiler cannot
+  enforce: no name defined twice in `src/` across **all** definition kinds (fn,
+  var, enum member), and every top-level symbol `agnosai_*`/`_`-prefixed. The
+  second rule closes the entire ~180-name unprefixed export surface of
+  `lib/bote-core.cyr` at once, with no denylist to maintain. Runs before Build.
 
 ### Security
 - **Prompt injection defence-in-depth**: boundary markers, anti-injection directives, heuristic scanning
@@ -1522,6 +1648,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Domain scoring uses case-insensitive comparison
 - Duplicate `topological_sort` in crew_runner eliminated — delegates to `scheduler::topological_sort_tasks()`
 - Shared `reqwest::Client` via `OnceLock` in synapse/mneme/delta tools (was per-instance)
+
+### Fixed
+- **Four duplicated top-level constants in `src/`, three with different values —
+  and the compiler warns about none of them.** Found by a flat-namespace audit
+  run as the prerequisite for porting `mcp.rs`.
+
+  Cyrius has one global symbol table and last-definition-wins. It emits
+  `warning: duplicate fn` for a repeated **fn** and is **silent** for a repeated
+  `var` or enum member — so `grep "duplicate fn"` on the build log, the obvious
+  check, structurally cannot catch this class.
+
+  | constant | | |
+  |---|---|---|
+  | `AGN_AC_SIZE` | `server_auth.cyr` = **24** | `orch_audit.cyr` = **48** |
+  | `AGN_CE_SIZE` | `server_sse.cyr` = **24** | `orch_plan_cache.cyr` = **32** |
+  | `AGN_RR_SIZE` | `server_routes.cyr` = **24** | `tools_remote_registry.cyr` = **40** |
+  | `AGN_REQ_SIZE` | `core_resource.cyr` = 40 | `llm_hoosh.cyr` = 40 |
+
+  Three of the four are **struct sizes passed straight to `alloc()`**. Nothing
+  misbehaved, but only by accident of include order: each file's own `alloc()`
+  happens to be parsed after its own definition and before the redefinition.
+  Reordering `src/main.cyr`'s includes, or adding a module that used one of these
+  names, would have silently under-allocated a heap struct with no diagnostic.
+  All eight now carry module-unique names; behaviour is unchanged (52/52 suites,
+  837/837 coverage, before and after).
+
+- **`_agnosai_is_digit` hoisted into `src/units.cyr`.** It was defined
+  byte-identically in both `server_ssrf.cyr` and `server_output_filter.cyr` — a
+  silent last-definition-wins pair, benign only while the bodies agreed. This was
+  documented as "hoist at the next touch" and the new gate forced the issue.
+  agnosai's own duplicate-fn warnings are now **zero** (build total 36 → 35; the
+  remaining 35 are all lib-vs-lib).
+
+- **`src/main.cyr`'s entry-point `var r` renamed** to `_agnosai_exit_code`. A
+  bare single-letter top-level `var` is a global in the flat namespace.
+
+### Added
+- **`scripts/check-symbols.sh` + a CI gate.** Two rules the compiler cannot
+  enforce: no name defined twice in `src/` across **all** definition kinds (fn,
+  var, enum member), and every top-level symbol `agnosai_*`/`_`-prefixed. The
+  second rule closes the entire ~180-name unprefixed export surface of
+  `lib/bote-core.cyr` at once, with no denylist to maintain. Runs before Build.
 
 ### Security
 - **Constant-time comparison**: length comparison uses full `usize` (was truncated to `u8`)
@@ -1719,6 +1887,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Quick start commands and usage imports corrected
 - `CONTRIBUTING.md` rewritten for actual single-crate structure
 - Configurable server port via `PORT` / `AGNOSAI_PORT` env vars (was hardcoded 8080)
+
+### Fixed
+- **Four duplicated top-level constants in `src/`, three with different values —
+  and the compiler warns about none of them.** Found by a flat-namespace audit
+  run as the prerequisite for porting `mcp.rs`.
+
+  Cyrius has one global symbol table and last-definition-wins. It emits
+  `warning: duplicate fn` for a repeated **fn** and is **silent** for a repeated
+  `var` or enum member — so `grep "duplicate fn"` on the build log, the obvious
+  check, structurally cannot catch this class.
+
+  | constant | | |
+  |---|---|---|
+  | `AGN_AC_SIZE` | `server_auth.cyr` = **24** | `orch_audit.cyr` = **48** |
+  | `AGN_CE_SIZE` | `server_sse.cyr` = **24** | `orch_plan_cache.cyr` = **32** |
+  | `AGN_RR_SIZE` | `server_routes.cyr` = **24** | `tools_remote_registry.cyr` = **40** |
+  | `AGN_REQ_SIZE` | `core_resource.cyr` = 40 | `llm_hoosh.cyr` = 40 |
+
+  Three of the four are **struct sizes passed straight to `alloc()`**. Nothing
+  misbehaved, but only by accident of include order: each file's own `alloc()`
+  happens to be parsed after its own definition and before the redefinition.
+  Reordering `src/main.cyr`'s includes, or adding a module that used one of these
+  names, would have silently under-allocated a heap struct with no diagnostic.
+  All eight now carry module-unique names; behaviour is unchanged (52/52 suites,
+  837/837 coverage, before and after).
+
+- **`_agnosai_is_digit` hoisted into `src/units.cyr`.** It was defined
+  byte-identically in both `server_ssrf.cyr` and `server_output_filter.cyr` — a
+  silent last-definition-wins pair, benign only while the bodies agreed. This was
+  documented as "hoist at the next touch" and the new gate forced the issue.
+  agnosai's own duplicate-fn warnings are now **zero** (build total 36 → 35; the
+  remaining 35 are all lib-vs-lib).
+
+- **`src/main.cyr`'s entry-point `var r` renamed** to `_agnosai_exit_code`. A
+  bare single-letter top-level `var` is a global in the flat namespace.
+
+### Added
+- **`scripts/check-symbols.sh` + a CI gate.** Two rules the compiler cannot
+  enforce: no name defined twice in `src/` across **all** definition kinds (fn,
+  var, enum member), and every top-level symbol `agnosai_*`/`_`-prefixed. The
+  second rule closes the entire ~180-name unprefixed export surface of
+  `lib/bote-core.cyr` at once, with no denylist to maintain. Runs before Build.
 
 ### Security
 - Constant-time auth comparison (prevents timing attacks on shared secret)

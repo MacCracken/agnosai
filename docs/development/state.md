@@ -417,13 +417,20 @@ libro 2.8.4 arrives transitively via bote.
      kavach — and the two are *not* the same contract: a path that exists but is
      unreadable answers 1 under kavach's and 0 under ai-hwaccel's. Corrected
      2026-07-30; the earlier entry had this backwards on both counts.
-   - **`_agnosai_is_digit`** — **ours, not a dep's**. Defined at
-     `src/server_ssrf.cyr:39` and again at `src/server_output_filter.cyr:140`.
-     The bodies are semantically identical today (only the parameter name
-     differs, `c` vs `b`), so nothing misbehaves — but two copies of a scanner
-     that agree by accident is exactly the condition
-     [ADR 007](../adr/007-audit-redirect-revalidation.md) was written about.
-     Hoist it into a shared helper at the next touch of either module.
+   - ~~**`_agnosai_is_digit`**~~ — ✅ **FIXED 2026-07-31.** Hoisted into
+     `src/units.cyr`; both local copies removed. **agnosai's own duplicate-fn
+     count is now zero** — all 35 remaining warnings are lib-vs-lib.
+
+   **The compiler only warns for `fn`.** A duplicate `var` or enum member is
+   **silent**, which a 2026-07-31 audit found the hard way: four duplicated
+   top-level constants in `src/`, three with *different* values, three of them
+   struct sizes passed straight to `alloc()`. Nothing misbehaved — purely because
+   each file's own `alloc()` was parsed after its own definition and before the
+   redefinition — but reordering `src/main.cyr`'s includes would have silently
+   under-allocated a heap struct. All renamed to module-unique names, and
+   `scripts/check-symbols.sh` now gates the whole class in CI ahead of the build.
+   **`grep "duplicate fn"` on the build log is not a sufficient check** and
+   should not be treated as one.
 
 ## Consumers
 

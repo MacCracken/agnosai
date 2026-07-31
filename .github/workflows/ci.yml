@@ -36,6 +36,17 @@ jobs:
       - name: Resolve dependencies
         run: cyrius deps
 
+      - name: Symbol check
+        # Cyrius has ONE flat namespace and last-definition-wins. The compiler
+        # warns on a duplicate `fn` and is SILENT on a duplicate `var` or enum
+        # member — so grepping the build log structurally cannot catch the worst
+        # case. An audit on 2026-07-31 found four duplicated enum constants,
+        # three with different values and three of them struct sizes passed
+        # straight to alloc(). This gate covers all definition kinds, and also
+        # enforces the agnosai_* prefix that keeps src/ clear of lib/'s ~180
+        # unprefixed exports.
+        run: ./scripts/check-symbols.sh
+
       - name: Build
         run: |
           mkdir -p build
