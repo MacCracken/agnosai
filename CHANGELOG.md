@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Toolchain pin 6.5.3 → 6.5.4, and sigil 3.12.1 → 3.12.2 with it.** Unlike the
+  6.5.3 bump, this one **moves real stdlib source** and needed
+  `cyrius lib sync --full`: `cyrius deps` re-layers the git deps but does not
+  refresh the stdlib, so `lib/` sat at the 6.5.3 snapshot until the sync ran.
+  The sigil pin had to move in the same commit — `cyrius deps` copies each git
+  dep's vendored bundle into `lib/` with last-write-wins, so leaving the pin at
+  3.12.1 would have overwritten the fold's 3.12.2 back down.
+
+  Three items land on agnosai:
+  - **`vec_sort_by` / `vec_select_nth` shipped**, closing agnosai's own filing
+    `2026-07-28-agnosai-no-nlogn-sort-in-stdlib`. No collision — `src/order.cyr`
+    is entirely `agnosai_*`-prefixed. Measured head-to-head at 100k, the stdlib
+    introsort is **3.85× faster** than our heapsort (20.0 ms vs 77.1 ms) and its
+    quickselect 1.34× (4.22 ms vs 5.65 ms); migrating is recorded as an open
+    decision in state.md rather than taken here.
+  - **sandhi 1.9.7 → 1.9.8 changes a return contract** the transport tier will
+    depend on: the five serve loops previously spun a core forever on a
+    persistent accept error and never returned once listening, and now return 1
+    on a dead listener or after 200 consecutive resource failures. Nothing here
+    calls `sandhi_server_*` yet, so it is a note for the router bite.
+  - **sigil 3.12.2 fixes a 144-byte-per-call `sha256_init` leak** that **never
+    affected us**: `_agnosai_auth_secret_eq` uses the banked, allocator-free
+    `sha256()` one-shot. Confirmed by measuring the shared-secret path at
+    **32 bytes/request** before and after.
+
+  The long-standing `lib/sakshi.cyr` 2.4.3 shadow warning also cleared — it is
+  now 2.4.7, matching the bundle. 44/44 suites and 771/771 coverage green after.
 - **Toolchain pin 6.5.2 → 6.5.3.** `lib/` is byte-identical between the two tags
   (`git diff 6.5.2 6.5.3 -- lib/` is empty), so the bump moves no stdlib source and
   needed no re-verification beyond a full rebuild. It is bugfix-only upstream —
@@ -55,6 +82,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
 
 ### Added
+- **server_state (M6 bite 5) — `AppState`, the keystone for the routes tier.**
+  Small file, load-bearing position: **13 of the 18 route entries registered in
+  `server/mod.rs:48-99` take `State<SharedState>`**, so no `routes/*` handler can
+  be written until it exists. 31 assertions against an oracle that has **no test
+  module at all** — `state.rs` is a struct plus a type alias, and every route test
+  builds one as a fixture.
+
+  **`Arc<T>` is a raw pointer.** The oracle wraps `tools` and `audit` in `Arc` and
+  the struct in `Arc<AppState>`; the port plan already settled that 49 of the
+  tree's 52 `Arc<` are process-lifetime shared-immutable state. `AppState` is
+  built once at startup and outlives every request, so there is nothing to
+  refcount.
+
+  **`http_client` is dropped, deliberately.** `reqwest::Client` is a
+  connection-pool handle; agnosai's outbound HTTP goes through
+  `agnosai_guarded_fetch(arena, ...)`, which takes a per-request arena and no
+  client object. The loss is thinner than it looks: of the twelve `http_client`
+  references in `rust-old/src/server/`, **eleven are test fixtures** and the only
+  real consumer is `a2a.rs:153`. If pooling is ever wanted it belongs in
+  `guarded_fetch`, not in the state struct.
+
+  **`definitions` is a map behind a mutex, and the mutex is the whole bite.** The
+  oracle uses `DashMap`, which is lock-free and concurrent; under
+  `sandhi_server_run_pooled` every worker is a real OS thread, so an unguarded
+  write during a concurrent read corrupts the table. `tools_registry` set the
+  precedent and this follows it. That is the one property `DashMap` gave the
+  oracle free and this port has to earn, so it is tested with **8 real threads
+  inserting 200 disjoint keys each** and asserted for an exact final count —
+  removing the lock fails it reproducibly, 3 runs out of 3.
+
+  Two further behaviours are pinned because they are easy to regress silently:
+  the key is **cloned** on insert (a caller's Str may borrow from a request
+  buffer that does not outlive the handler — the test scribbles over the caller's
+  bytes and requires the stored key to survive), and `agnosai_app_state_definitions`
+  returns a **detached snapshot** taken under the lock rather than a live view.
+  The oracle's `DashMap::iter()` holds per-shard guards while the caller walks it,
+  which here would mean holding the mutex across serialization of every entry, on
+  a path every worker shares.
+
 - **server_auth (M6 bite 4) — the RS256 JWT half. `auth.rs` is now ported whole.**
   PEM → `(n, e)` decoding, strict base64url, field-based `alg` pinning, signature
   verification, and claim validation. 112 assertions in total across both bites,

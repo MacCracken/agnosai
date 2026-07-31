@@ -1,0 +1,232 @@
+# =========================================================================
+# server_state — rust-old/src/server/state.rs.
+#
+# The oracle has **no `#[cfg(test)]` module** for this file: it is a struct
+# definition plus a type alias, and every route test constructs one as a
+# fixture. So there is no oracle test count to match; what is worth pinning is
+# that each field round-trips, that `definitions` behaves like the `DashMap` it
+# replaces, and that the mutex actually guards it under real threads — the one
+# property `DashMap` gave the oracle free and this port has to earn.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core.cyr"
+include "src/learning.cyr"
+include "src/llm.cyr"
+include "src/server_ssrf.cyr"
+include "src/server_prompt_guard.cyr"
+include "src/server_output_filter.cyr"
+include "src/server_prometheus.cyr"
+include "src/server_auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server_sse.cyr"
+include "src/tools.cyr"
+include "src/orch.cyr"
+include "src/server_state.cyr"
+include "tests/test_helpers.cyr"
+
+# The state `main.rs:107-116` builds, with every part real rather than stubbed.
+fn _t_state(): i64 {
+    return agnosai_app_state_new(
+    agnosai_orchestrator_new(0),
+    agnosai_tool_registry_new(),
+    agnosai_auth_config_with_secret(str_from("s3cret")),
+    agnosai_event_bus_new(),
+    agnosai_audit_chain_new(),
+    agnosai_approval_gate_new());
+}
+
+# Every field comes back as the pointer that went in — the whole contract of a
+# struct whose job is to hold six things.
+fn _t_fields_round_trip(): i64 {
+    var orch = agnosai_orchestrator_new(0);
+    var tools = agnosai_tool_registry_new();
+    var auth = agnosai_auth_config_with_secret(str_from("k"));
+    var events = agnosai_event_bus_new();
+    var audit = agnosai_audit_chain_new();
+    var gate = agnosai_approval_gate_new();
+
+    var s = agnosai_app_state_new(orch, tools, auth, events, audit, gate);
+    assert(agnosai_app_state_orchestrator(s) == orch, "orchestrator round-trips");
+    assert(agnosai_app_state_tools(s) == tools, "tools round-trips");
+    assert(agnosai_app_state_auth(s) == auth, "auth round-trips");
+    assert(agnosai_app_state_events(s) == events, "events round-trips");
+    assert(agnosai_app_state_audit(s) == audit, "audit round-trips");
+    assert(agnosai_app_state_approval_gate(s) == gate, "approval_gate round-trips");
+
+    # The fields are distinct slots, not aliases of one another — the failure a
+    # mistyped offset in the enum would produce.
+    assert(agnosai_app_state_orchestrator(s) != agnosai_app_state_tools(s),
+    "orchestrator and tools are different slots");
+    assert(agnosai_app_state_audit(s) != agnosai_app_state_events(s),
+    "audit and events are different slots");
+    return 0;
+}
+
+# The state is usable through its accessors, not just readable: the auth config
+# it carries decides requests, and the registry it carries accepts tools.
+fn _t_fields_are_live(): i64 {
+    var s = _t_state();
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Bearer s3cret");
+    assert(agnosai_auth_check(agnosai_app_state_auth(s), 1, str_builder_build(sb)) == HTTP_OK,
+    "the carried auth config accepts its own secret");
+    assert(agnosai_auth_check(agnosai_app_state_auth(s), 0, str_from("")) == HTTP_UNAUTHORIZED,
+    "...and rejects a request with no header");
+    assert(agnosai_tool_registry_has(agnosai_app_state_tools(s), str_from("nope")) == 0,
+    "the carried registry starts empty");
+    return 0;
+}
+
+# --- definitions: the DashMap replacement --------------------------------
+
+fn _t_definitions_empty(): i64 {
+    var s = _t_state();
+    assert(agnosai_app_state_definition_count(s) == 0, "definitions start empty");
+    assert(vec_len(agnosai_app_state_definitions(s)) == 0, "...and list empty");
+    assert(agnosai_app_state_definition_get(s, str_from("absent")) == 0,
+    "a missing key is 0");
+    return 0;
+}
+
+fn _t_definitions_insert_and_get(): i64 {
+    var s = _t_state();
+    var a = agnosai_agent_new(str_from("writer"), str_from("Writer"),
+    str_from("writes things"));
+    agnosai_app_state_definition_insert(s, str_from("writer"), a);
+    assert(agnosai_app_state_definition_count(s) == 1, "one definition stored");
+    assert(agnosai_app_state_definition_get(s, str_from("writer")) == a,
+    "the stored definition comes back");
+    assert(agnosai_app_state_definition_get(s, str_from("Writer")) == 0,
+    "lookup is case-sensitive");
+
+    var b = agnosai_agent_new(str_from("editor"), str_from("Editor"),
+    str_from("edits things"));
+    agnosai_app_state_definition_insert(s, str_from("editor"), b);
+    assert(agnosai_app_state_definition_count(s) == 2, "two definitions stored");
+    assert(vec_len(agnosai_app_state_definitions(s)) == 2, "...and both list");
+    return 0;
+}
+
+# The oracle's `insert` replaces on a duplicate key, and the count must not grow.
+fn _t_definitions_replace(): i64 {
+    var s = _t_state();
+    var first = agnosai_agent_new(str_from("w"), str_from("First"), str_from("d"));
+    var second = agnosai_agent_new(str_from("w"), str_from("Second"), str_from("d"));
+    agnosai_app_state_definition_insert(s, str_from("w"), first);
+    agnosai_app_state_definition_insert(s, str_from("w"), second);
+    assert(agnosai_app_state_definition_count(s) == 1, "replacing does not grow the map");
+    assert(agnosai_app_state_definition_get(s, str_from("w")) == second,
+    "the later definition wins");
+    return 0;
+}
+
+# The key is cloned on insert, matching the oracle's `def.agent_key.clone()`.
+# A caller's Str may be borrowed from a request buffer that does not outlive the
+# handler, while the map entry is process-lifetime — so scribbling over the
+# caller's bytes must not disturb the stored key.
+fn _t_definitions_key_is_cloned(): i64 {
+    var s = _t_state();
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "ephemeral");
+    var key = str_builder_build(sb);
+    var d = agnosai_agent_new(str_from("e"), str_from("E"), str_from("d"));
+    agnosai_app_state_definition_insert(s, key, d);
+
+    # Overwrite the caller's buffer in place.
+    var p = str_data(key);
+    for (var i = 0; i < str_len(key); i = i + 1) { store8(p + i, 88); }
+
+    assert(agnosai_app_state_definition_get(s, str_from("ephemeral")) == d,
+    "the stored key survives the caller's buffer being overwritten");
+    assert(agnosai_app_state_definition_count(s) == 1, "still exactly one entry");
+    return 0;
+}
+
+# The snapshot is taken under the lock and returned unlocked, so a later insert
+# must not mutate a vec the caller already holds.
+fn _t_definitions_snapshot_is_detached(): i64 {
+    var s = _t_state();
+    agnosai_app_state_definition_insert(s, str_from("a"),
+    agnosai_agent_new(str_from("a"), str_from("A"), str_from("d")));
+    var snap = agnosai_app_state_definitions(s);
+    assert(vec_len(snap) == 1, "snapshot has one entry");
+
+    agnosai_app_state_definition_insert(s, str_from("b"),
+    agnosai_agent_new(str_from("b"), str_from("B"), str_from("d")));
+    assert(vec_len(snap) == 1, "the earlier snapshot did not grow");
+    assert(vec_len(agnosai_app_state_definitions(s)) == 2, "a fresh snapshot sees both");
+    return 0;
+}
+
+# --- The property DashMap gave the oracle free ---------------------------
+
+var _T_ST_THREADS = 8;
+var _T_ST_PER_THREAD = 200;
+var _t_st_shared = 0;
+
+# Each worker inserts its own disjoint key range, so the final count is exact
+# and any lost update shows up as a shortfall rather than as a flaky value.
+fn _t_st_worker(id): i64 {
+    for (var i = 0; i < _T_ST_PER_THREAD; i = i + 1) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "k");
+        str_builder_add_int(sb, id);
+        str_builder_add_cstr(sb, "-");
+        str_builder_add_int(sb, i);
+        var key = str_builder_build(sb);
+        agnosai_app_state_definition_insert(_t_st_shared, key,
+        agnosai_agent_new(key, key, key));
+    }
+    return 0;
+}
+
+# `run_pooled` makes every worker a real OS thread, so an unguarded write during
+# a concurrent read would corrupt the table. The oracle got this from DashMap;
+# here it is a mutex, and this is the test that says the mutex is real.
+fn _t_definitions_concurrent_inserts(): i64 {
+    _t_st_shared = _t_state();
+    var threads = vec_new();
+    for (var t = 0; t < _T_ST_THREADS; t = t + 1) {
+        vec_push(threads, thread_create(&_t_st_worker, t));
+    }
+    for (var j = 0; j < _T_ST_THREADS; j = j + 1) { thread_join(vec_get(threads, j)); }
+
+    var want = _T_ST_THREADS * _T_ST_PER_THREAD;
+    assert(agnosai_app_state_definition_count(_t_st_shared) == want,
+    "every concurrent insert landed — no lost updates under 8 threads");
+    assert(vec_len(agnosai_app_state_definitions(_t_st_shared)) == want,
+    "...and the snapshot agrees");
+
+    # Spot-check that entries are the right ones, not merely the right count.
+    assert(agnosai_app_state_definition_get(_t_st_shared, str_from("k0-0")) != 0,
+    "first thread's first key is present");
+    assert(agnosai_app_state_definition_get(_t_st_shared, str_from("k7-199")) != 0,
+    "last thread's last key is present");
+    assert(agnosai_app_state_definition_get(_t_st_shared, str_from("k8-0")) == 0,
+    "a key no thread wrote is absent");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_fields_round_trip();
+    _t_fields_are_live();
+    _t_definitions_empty();
+    _t_definitions_insert_and_get();
+    _t_definitions_replace();
+    _t_definitions_key_is_cloned();
+    _t_definitions_snapshot_is_detached();
+    _t_definitions_concurrent_inserts();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

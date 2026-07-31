@@ -12,12 +12,31 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.3` (`cyrius.cyml`) — folds bayan 1.3.0, sandhi 1.9.7, sakshi 2.4.7.
-  Bumped from 6.5.2 on 2026-07-30: `lib/` is **byte-identical** between the two tags
-  (`git diff 6.5.2 6.5.3 -- lib/` is empty), so the bump moves no stdlib source. It is
-  bugfix-only — correct diagnostic line numbers after an `include`, and an `install.sh`
-  fix — and it clears the `manifest-pin: 6.5.2 (drift)` banner the installed CLI printed
-  on every invocation
+- **Cyrius pin**: `6.5.4` (`cyrius.cyml`) — folds bayan 1.3.0, **sandhi 1.9.8**,
+  **sigil 3.12.2**, sakshi 2.4.7, yukti 2.3.2, mabda 4.0.8.
+  Bumped 6.5.2 → 6.5.3 → 6.5.4 on 2026-07-30. Unlike the 6.5.3 bump (whose `lib/` was
+  byte-identical), **6.5.4 moves real stdlib source** and needed
+  `cyrius lib sync --full` — `cyrius deps` alone re-layers the git deps but does not
+  refresh the stdlib, so `lib/` sat at the 6.5.3 snapshot until the sync ran. Three
+  things in it land on agnosai:
+  - **`vec_sort_by` / `vec_select_nth` shipped**, closing agnosai's own filing
+    `2026-07-28-agnosai-no-nlogn-sort-in-stdlib`. **No collision** — every symbol in
+    `src/order.cyr` is `agnosai_*`-prefixed, and nothing here calls the new names yet.
+    See "Open: migrate order.cyr to the stdlib sort?" below.
+  - **sandhi 1.9.7 → 1.9.8** changes a **return contract** the transport tier will
+    depend on: all five serve loops previously spun a core forever on a persistent
+    accept error and never returned once listening; they now return 1 on a
+    structurally dead listener or after 200 consecutive resource failures. Nothing
+    here calls `sandhi_server_*` yet, so this is a note for the router bite, not a
+    change to absorb now.
+  - **sigil 3.12.1 → 3.12.2** fixes a 144-byte-per-call `sha256_init` leak. **It never
+    affected us** — `_agnosai_auth_secret_eq` uses the banked `sha256()` one-shot,
+    which is allocator-free — confirmed by measuring the shared-secret path at
+    **32 bytes/request** before and after.
+
+  **The sigil pin had to move with it.** `cyrius deps` copies each git dep's vendored
+  bundle into `lib/` with last-write-wins, so leaving `[deps.sigil] tag = "3.12.1"` would
+  have overwritten the 6.5.4 fold's 3.12.2 back down to 3.12.1. Bumped to 3.12.2.
 - Rust (for `rust-old/` only): `channel = "stable"`, currently rustc 1.96.0
 
 ## Source
@@ -28,7 +47,8 @@ lands, not before, so the number always names something that actually shipped.
   json_transform, load_testing, security_audit, and the nine AGNOS ecosystem tools over a
   shared client) + `tools/remote_registry`, and `orch` (15 modules + hub). Six `server`
   modules have landed — `server_ssrf`, `server_prompt_guard`, `server_sse`,
-  `server_output_filter`, `server_prometheus`, `server_auth`. Support modules: `src/id.cyr`,
+  `server_output_filter`, `server_prometheus`, `server_auth`, `server_state`. Support
+  modules: `src/id.cyr`,
   `src/units.cyr`, `src/order.cyr`, `src/chan_lossy.cyr` and `src/guarded_fetch.cyr`.
   `src/main.cyr` is still the stub entry point — no CLI surface yet.
 
@@ -58,7 +78,7 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 | `tools` ported (M4, Phase 3) | ✅ **complete** — native, registry, all 12 builtins, remote_registry |
 | ADR 007 shared, not copied | ✅ `src/guarded_fetch.cyr` — extracted at the second consumer, since two copies of a security control drift silently |
 | `orchestrator` ported (M5, Phase 4) | ✅ **COMPLETE** — all 15 modules, plus `server/sse` and `server/prompt_guard` pulled forward and an `orch_audit` chain the seam cannot delegate |
-| `server` ported (M6, Phase 5) | 🟡 **6 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), and `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT). One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
+| `server` ported (M6, Phase 5) | 🟡 **7 of 21 files** — the pure-leaf sequence is done (`ssrf`, `prompt_guard`, `sse` came forward as M5 blockers; `output_filter` and `prometheus` are M6 bites 1-2), `auth.rs` is complete across bites 3 (shared secret) and 4 (RS256 JWT), and `state.rs` is bite 5. One remainder inside a counted file: `sse.rs::event_stream` (`sse.rs:106-126`) is held back by `src/server_sse.cyr:9-11` for the transport tier |
 | `server/auth` ported whole | ✅ all 10 oracle tests + 123 beyond; six defects found by adversarial review, fixed, and each pinned by a mutation-verified test. Two decided divergences: constant-time compare fixed ([ADR 009](../adr/009-auth-constant-time-secret-compare.md)) and configured `iss`/`aud` required ([ADR 010](../adr/010-jwt-require-configured-iss-aud.md)) |
 | Blocker #4 closed | ✅ `src/chan_lossy.cyr` — `agnosai_chan_push_lossy` gives tokio broadcast's never-block, evict-oldest contract over the public channel verbs |
 | SSRF-via-redirect closed ([ADR 007](../adr/007-audit-redirect-revalidation.md)) | ✅ the guard re-runs on every hop — the oracle checks only the URL the caller supplied |
@@ -67,8 +87,8 @@ and the hoosh seam client, with the live round trip verified. Phase 3 (M4 `tools
 
 ## Tests
 
-**2815 assertions across 43 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
-smoke — **2817 across 44 files**, which is the figure `cyrius tests tests` reports:
+**2846 assertions across 44 `.tcyr` suites, all passing**, plus the 2-assertion scaffold
+smoke — **2848 across 45 files**, which is the figure `cyrius tests tests` reports:
 
 | Suite | Assertions | Oracle |
 |---|---|---|
@@ -115,6 +135,7 @@ smoke — **2817 across 44 files**, which is the figure `cyrius tests tests` rep
 | `server_output_filter.tcyr` | 63 | 16 |
 | `server_prometheus.tcyr` | 35 | 8 |
 | `server_auth.tcyr` | 133 | 10 of 10 (all of `auth.rs`) |
+| `server_state.tcyr` | 31 | — (`state.rs` has no `#[cfg(test)]` module) |
 
 The Cyrius suites deliberately exceed the oracle's coverage: they also pin the UCB1 formula
 itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN fallback branches, and
@@ -146,7 +167,7 @@ live service on loopback, so the Rust side never exercises one. Because
 whole untested half into ordinary assertions: URL construction, form encoding, body
 construction, the path-traversal guards, and the response reshaping.
 
-`cyrius coverage --min 80` → **100% (771/771 fns), gate OK**. Shared assertion helpers live in
+`cyrius coverage --min 80` → **100% (782/782 fns), gate OK**. Shared assertion helpers live in
 `tests/test_helpers.cyr` (all `_t_`-prefixed, so they can never shadow a `src/` symbol and stay
 out of the coverage denominator).
 
@@ -468,11 +489,27 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 >    bite. Assert an `alloc_used()` bound in each handler's suite the way
 >    `_t_jwt_preauth_allocation_is_bounded` does.
 >
-> **Next: `state.rs` (34 lines), then the `routes/*` tier.** `state.rs` is the
-> keystone — 13 of the 18 route entries in `server/mod.rs:48-99` take
-> `State<SharedState>`, and seven of its eight fields already exist in the tree
-> (`orchestrator`, `tools`, `events`, `audit`, `approval_gate`, and now `auth`);
-> only `definitions: DashMap` is new, and `lib/hashmap.cyr` covers it.
+> **`state.rs` is DONE** (bite 5) — `src/server_state.cyr`, 31 assertions,
+> 11/11 fns covered. `http_client` is dropped with a reason recorded in the
+> module header; `definitions` is a mutex-guarded map, tested with 8 real
+> threads because that is the one property `DashMap` gave the oracle free.
+>
+> **Next: the `routes/*` tier**, in the Tier-C order below — `health.rs` (109)
+> first as the smallest end-to-end shape, then `tools.rs` (154),
+> `definitions.rs` (41, a `[]` stub until M10), `agents.rs` (190),
+> `approval.rs` (130), `dashboard.rs` (150), then the two big ones
+> `crews.rs` (528) and `a2a.rs` (398), and `mcp.rs` (319) last of the pure
+> handlers. Every one of them is `fn(state, inputs) -> (status, json)`; none
+> needs sandhi.
+>
+> Two things to do *before* the first route handler, not during:
+> 1. **Decide `#[serde(deny_unknown_fields)]`** — four request types carry it
+>    (`routes/crews.rs:14`, `:32`, `a2a.rs:34`, `approval.rs:12`) and bayan has
+>    no equivalent. Explicit unknown-key rejection in the `*_from_value` readers,
+>    or an ADR accepting the divergence. Once, up front.
+> 2. **Add `agnosai_orchestrator_crew_ids(o)`** (~6 lines) to
+>    `src/orch_orchestrator.cyr` — `dashboard.rs` needs it and nothing else
+>    exposes the crew list.
 >
 > **Keep writing handlers as `fn(state, inputs) -> (status, json)`.** That is
 > what made `auth.rs`'s ten `#[tokio::test]`s port as ordinary assertions, and
@@ -648,7 +685,7 @@ under `docs/development/issues/` are open; those under `issues/archive/` are res
 | ai-hwaccel | `load_models` returns 1 model instead of 26 | open — two candidate fixes, a compatibility call |
 | bayan | YAML parse into the tagged value tree | open (`2026-07-16-agnosai-yaml-parse-into-tagged-value-tree.md`); gates M10's YAML half, nothing sooner |
 | bote | `src/jwt.cyr` orphaned + documents an `exp` check it does not perform | **written but not yet upstream** — the file is untracked in the bote worktree and bote's HEAD is still 2026-07-17. The `exp` half is a false security claim, so this one is worth pushing |
-| sigil | `bn_mont_modexp` runs a constant-time always-multiply ladder over the full `exp_blen * 8` range with no leading-zero skip | **not yet filed — worth filing.** Measured 2026-07-30: RSA-2048 verify is **3.29 ms** against OpenSSL's **14 µs** on the same box (~235×). The sibling `bn_modexp` (`lib/sigil.cyr:10508`) *does* locate the high bit first; `bn_mont_modexp` (`:10790`) does not, so e=65537 costs 24 iterations × 2 multiplies = 48 rather than ~17. The call site's own comment (`:17632-17636`) says the operands are public and Montgomery is "used purely for speed, not for the side-channel posture", so it is paying ~2.8× for protection it states it does not need. The remainder is the inherent portable-bignum-vs-tuned-assembly gap |
+| sigil | `bn_mont_modexp` runs a constant-time always-multiply ladder over the full `exp_blen * 8` range with no leading-zero skip | ✅ **filed 2026-07-30** as `sigil/docs/development/issues/2026-07-30-rsa-verify-uses-secret-exponent-ladder.md` (untracked in the sigil worktree — the user commits). Measured 2026-07-30: RSA-2048 verify is **3.29 ms** against OpenSSL's **14 µs** on the same box (~235×). The sibling `bn_modexp` (`lib/sigil.cyr:10508`) *does* locate the high bit first; `bn_mont_modexp` (`:10790`) does not, so e=65537 costs 24 iterations × 2 multiplies = 48 rather than ~17. The call site's own comment (`:17632-17636`) says the operands are public and Montgomery is "used purely for speed, not for the side-channel posture", so it is paying ~2.8× for protection it states it does not need. The remainder is the inherent portable-bignum-vs-tuned-assembly gap |
 | sigil | *(none filed)* | `pem_decode_pubkey` — still nice-to-have; agnosai's local glue is ~15 lines over `_pem_find` / `_pem_b64_decode`, now written and working |
 
 **Never filed, still just port-plan asks:** sankoch ZIP container, majra relay
@@ -735,7 +772,14 @@ Open items, none blocking:
    `2026-07-28-sock-send-result-allocates-per-call.md`, re-confirmed present on
    6.5.0, and pinned by `sandhi/tests/sandhi.tcyr::test_server_req_arena` as an
    exact bound so the test will speak up if the stdlib fix lands.
-3. **`lib/sakshi.cyr` lands at 2.4.3 even after `cyrius lib sync --full`**, which
+3. ~~**`lib/sakshi.cyr` lands at 2.4.3 even after `cyrius lib sync --full`**~~
+   ✅ **CLEARED 2026-07-30 with the 6.5.4 sync** — `lib/sakshi.cyr` is now 2.4.7, matching
+   the bundle, because the git deps re-cut their bundles. The only remaining shadow is
+   **mabda 4.0.7 vs 4.0.8**, which cyrius's own changelog calls a toolchain-pin-only
+   difference (upstream `src/` byte-identical, dist differs solely by its `# Version:`
+   header). Historical detail follows.
+
+   ~~**`lib/sakshi.cyr` lands at 2.4.3 even after `cyrius lib sync --full`**~~, which
    every build reports as a shadow warning against the 6.5.2 bundle's 2.4.7.
    This is **not agnosai's to fix and not a correctness problem.** Each git dep
    vendors its own sakshi distribution and `cyrius deps` copies them into `lib/`
@@ -745,7 +789,29 @@ Open items, none blocking:
    plus `_`-prefixed internal churn, and the older bundle is a superset of the
    symbols anything here calls, so nothing breaks. It clears when sigil, kavach
    and tyche re-cut their bundles.
-4. **Cyrius `_int` overload misdispatch — filed 2026-07-29.**
+4. **Open: migrate `src/order.cyr` to the stdlib sort?** — a decision, not a defect.
+   `vec_sort_by` / `vec_select_nth` shipped in 6.5.4, closing agnosai's own filing.
+   Measured head-to-head at 100k elements on this box (each round includes a full
+   100k copy, so the algorithms alone differ by more):
+
+   | | agnosai (`src/order.cyr`) | stdlib (6.5.4) | |
+   |---|---|---|---|
+   | full sort | 77.1 ms | **20.0 ms** | **3.85x** |
+   | select_nth | 5.65 ms | **4.22 ms** | 1.34x |
+
+   The sort gap is the algorithm: `agnosai_sort` is pure heapsort (chosen because its
+   worst case equals its average), while `vec_sort_by` is introsort — median-of-3
+   quicksort with a heapsort fallback at a `2*log2(n)` depth limit, so it keeps the
+   adversarial guarantee *and* gets quicksort's inner loop, plus an O(n) pre-scan that
+   returns immediately on already-ordered input.
+
+   The consumer that would notice is `load_testing`, whose 100k percentile vector is
+   what blocker #8 was measured against. **Not done, because it is a scope detour**: it
+   would retire a module with 48 passing assertions and its own benchmark row, and the
+   port plan's blocker #8 is already closed either way. Worth doing when the sort path
+   is next touched.
+
+5. **Cyrius `_int` overload misdispatch — filed 2026-07-29.**
    `X(f(), …)` silently runs `X_int`'s body when `X_int` exists and the first
    argument is written as a bare call result; the same value via a variable
    dispatches correctly, with no diagnostic either way. Cost about an hour to
