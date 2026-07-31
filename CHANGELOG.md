@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **86 `str_eq(x, str_from("lit"))` comparisons → `str_eq_cstr(x, "lit")`.** Each
+  of those sites allocated a fresh 16-byte `Str` header on the **no-free global
+  bump** just to compare against a compile-time constant, and never released it.
+  Measured on the `core/task` wire-decode path (same box, same toolchain, same
+  session, `HEAD` vs working tree, 200k rounds of three decodes):
+
+  | | ns / 3-decode round | bytes / round |
+  |---|---|---|
+  | before | 482 | 128 |
+  | after | **213** | **0** |
+
+  2.26× faster and the leak is gone outright, not reduced.
+
+  **This is a Rust reflex, not a Cyrius one.** In Rust `"medium"` is a zero-cost
+  `&'static str` and `s == "medium"` allocates nothing, so the shape is free there
+  and invisible on review. In Cyrius `str_from` is a heap constructor and `alloc()`
+  never frees an individual allocation. The density says the same thing: 910
+  `str_from("` sites in 19,671 lines is 4.6 per 100 lines, against **0.064** in the
+  cyrius stdlib (96 in 150,822) and 0.31 in vidya.
+
+  **`str_eq_cstr` already existed** (`lib/str.cyr:617`) — length guard then
+  `memeq`, zero allocation, and it derives the literal's length with `strlen` so
+  there are no hand-written lengths to get wrong. No local helper was needed; the
+  gap was in reading the stdlib, not in the stdlib. Equivalence was proved over
+  the edge cases before any site was touched — exact match, prefix either way,
+  both-empty, either-empty, and a `Str` carrying an embedded NUL (where `Str`'s
+  explicit length and a cstr's NUL terminator could have disagreed): 8/8 identical,
+  0 bytes allocated across 2000 calls.
+
+  Rewritten by a balance-scanning pass rather than a regex — three sites have a
+  call in the first argument and one of those (`str_new(d + start, len - start)`,
+  `llm/hoosh.cyr:594`) contains a comma that a naive `[^,]*` pattern would have
+  split through.
+
+  `src/` drops from 910 `str_from("` sites to 824. The remaining classes are
+  separate bites: 149 `return str_from("lit")` constant returns, and the in-loop
+  hoists. The 380 sites under `tests/` are deliberately left — a test binary is
+  short-lived, so the leak is inert there, and rewriting assertions is churn
+  against no measurable cost.
+
 ### Changed
 - **`src/` now mirrors `rust-old/src/`.** 65 of 71 modules moved out of the flat
   scaffold layout into the oracle's directory shape: `src/server_routes_crews.cyr`
