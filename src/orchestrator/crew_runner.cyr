@@ -1005,6 +1005,60 @@ fn _agnosai_crew_build_profile(r, results, wall_ms): i64 {
     return profile;
 }
 
+# Record one crew's worth of Prometheus counters from its finished results.
+#
+# **This is what makes `/metrics` render anything but zeros.** [ADR 011] gave the
+# endpoint agnosai's own registry, but nothing ever recorded into it — the
+# producer was staged behind the M6 routes decision and the staging outlived its
+# reason. The oracle records inline at `crew_runner.rs:810`/`:864`, inside the
+# per-task match arms.
+#
+# This records in **one pass after the workers join**, rather than at the four
+# result-construction sites, for three reasons: every path lands in `results`
+# (success, tool error, LLM error, and the cancellation stub at `AGN_CJ_RESULT`),
+# so one loop cannot miss an arm the way four call sites can drift; the token and
+# cost figures are already on each result's metadata, so nothing has to be
+# threaded down; and it keeps the recording off the worker threads entirely.
+#
+# The recorders are atomic regardless (`atomic_fetch_add`, and a CAS loop for the
+# saturating active gauge — see `src/server/prometheus.cyr`), so worker-thread
+# recording would have been *safe*; it is simply not needed.
+#
+# `tokens` is the nested `{prompt, completion, total}` object the success path
+# writes; a failed task has no `tokens` key and contributes nothing, matching the
+# `cost_micro_usd` convention immediately below it.
+fn _agnosai_crew_record_metrics(results): i64 {
+    var m = agnosai_metrics_global();
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        var res = vec_get(results, i);
+        if (agnosai_task_result_status(res) == AGNOSAI_STATUS_COMPLETED) {
+            agnosai_metrics_record_task_completed(m);
+        } else {
+            agnosai_metrics_record_task_failed(m);
+        }
+
+        var md = agnosai_task_result_metadata(res);
+        var total_tokens = 0;
+        var tok = map_get(md, str_from("tokens"));
+        if (tok != 0 && bayan_json_v_is_obj(tok) == 1) {
+            var t = bayan_json_v_obj_get(tok, "total");
+            if (t != 0 && bayan_json_v_is_int(t) == 1) { total_tokens = bayan_json_v_int(t); }
+        }
+        var cost_micro = 0;
+        var c = map_get(md, str_from("cost_micro_usd"));
+        if (c != 0 && bayan_json_v_is_int(c) == 1 && bayan_json_v_int(c) > 0) {
+            cost_micro = bayan_json_v_int(c);
+        }
+        # One inference per completed task. Skipped entirely when the task
+        # recorded neither — a failed task never reached a provider, and adding
+        # a zero would inflate the inference count without moving either total.
+        if (total_tokens > 0 || cost_micro > 0) {
+            agnosai_metrics_record_inference(m, total_tokens, cost_micro);
+        }
+    }
+    return 0;
+}
+
 # Run the crew end to end — the oracle's `run`.
 #
 # Returns a CrewState, or 0 with an error stored through `out_err`. The split
@@ -1028,6 +1082,13 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     bayan_json_v_obj_set(started, str_from("name"), bayan_json_v_str_new(agnosai_crew_name(spec)));
     bayan_json_v_obj_set(started, str_from("task_count"), bayan_json_v_int_new(vec_len(tasks)));
     _agnosai_crew_emit(r, str_from("crew_started"), started);
+    # Bumps crews_total and the crews_active gauge. **Every exit below must
+    # balance the gauge**, including the DAG-cycle error return — that path does
+    # not emit a `crew_completed` *event* (a cyclic spec is an error, not a crew
+    # that failed) but it must still decrement, or the gauge ratchets upward for
+    # the life of the process on a malformed spec. Event stream and gauge are
+    # different contracts; only the event one is suppressed.
+    agnosai_metrics_record_crew_started(agnosai_metrics_global());
 
     var kind = agnosai_process_kind(agnosai_crew_process(spec));
     var results = 0;
@@ -1037,6 +1098,9 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
         store64(&dag_err, 0);
         results = _agnosai_crew_run_dag(r, &dag_err);
         if (load64(&dag_err) != 0) {
+            # Balance the active gauge before the error return. No task ran, so
+            # no task/inference counters are recorded — only the gauge unwinds.
+            agnosai_metrics_record_crew_completed(agnosai_metrics_global());
             store64(out_err, load64(&dag_err));
             return 0;
         }
@@ -1062,6 +1126,12 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
             }
         }
     }
+
+    # Balance the active gauge and fold this crew's tasks into the counters.
+    # Both run for every terminal status — Completed, Failed and Cancelled — so
+    # the gauge cannot drift upward on a cancelled crew.
+    agnosai_metrics_record_crew_completed(agnosai_metrics_global());
+    _agnosai_crew_record_metrics(results);
 
     var state = agnosai_crew_state_new(agnosai_crew_id(spec), status);
     for (var j = 0; j < vec_len(results); j = j + 1) {

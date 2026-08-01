@@ -40,6 +40,7 @@ include "src/orchestrator/output_validation.cyr"
 include "src/server/prompt_guard.cyr"
 include "src/chan_lossy.cyr"
 include "src/server/sse.cyr"
+include "src/server/prometheus.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "tests/test_helpers.cyr"
 
@@ -688,6 +689,56 @@ fn main() {
     can tell \"the spec was wrong\" from \"the work failed\"");
     assert(load64(&run_err) != 0, "and reports an error instead");
     assert_eq(agnosai_error_kind(load64(&run_err)), AGNOSAI_ERR_CYCLIC_DAG, "a CyclicDAG error");
+
+    # --- ADR 011's producer side: /metrics must stop rendering zeros ---------
+    # Counters are process-global and accumulate across this whole file, so every
+    # assertion here is a DELTA around one run, never an absolute.
+    var _m = agnosai_metrics_global();
+
+    # The gauge must balance on the cyclic-DAG path too. That run returned an
+    # error before any task executed and deliberately emits no `crew_completed`
+    # EVENT — but the gauge is a different contract, and if it does not unwind
+    # here it ratchets upward for the life of the process on one malformed spec.
+    # This is the assertion that catches that; it failed on the first cut.
+    var _act_before_cyc = agnosai_metrics_crews_active(_m);
+    var cyc2 = agnosai_crew_new(str_from("cyclic-2"));
+    var d1 = agnosai_task_new(str_from("d1"));
+    var d2 = agnosai_task_new(str_from("d2"));
+    agnosai_task_with_dependency(d1, agnosai_task_id(d2));
+    agnosai_task_with_dependency(d2, agnosai_task_id(d1));
+    var cyc2_tasks = vec_new();
+    vec_push(cyc2_tasks, d1);
+    vec_push(cyc2_tasks, d2);
+    agnosai_crew_with_tasks(cyc2, cyc2_tasks);
+    agnosai_crew_with_process(cyc2, agnosai_process_dag());
+    store64(&run_err, 0);
+    agnosai_crew_runner_run(agnosai_crew_runner_new(cyc2), &run_err);
+    assert_eq(agnosai_metrics_crews_active(_m), _act_before_cyc,
+    "a cyclic DAG leaves crews_active exactly where it found it — the error return must still \
+    balance the gauge even though it emits no crew_completed event");
+
+    # A crew that actually runs moves crews_total, balances the gauge, and folds
+    # its tasks into the task counters.
+    var _tot_before = agnosai_metrics_crews_total(_m);
+    var _act_before = agnosai_metrics_crews_active(_m);
+    var _done_before = agnosai_metrics_tasks_completed(_m);
+    var mspec = agnosai_crew_new(str_from("metrics-crew"));
+    var mt = vec_new();
+    vec_push(mt, agnosai_task_new(str_from("m1")));
+    vec_push(mt, agnosai_task_new(str_from("m2")));
+    agnosai_crew_with_tasks(mspec, mt);
+    store64(&run_err, 0);
+    # No LLM client, exactly like the sequential test above: each task falls to
+    # the placeholder path and still lands a COMPLETED result, which is all the
+    # counters read.
+    agnosai_crew_runner_run(agnosai_crew_runner_new(mspec), &run_err);
+    assert_eq(agnosai_metrics_crews_total(_m) - _tot_before, 1,
+    "one completed run increments crews_total exactly once");
+    assert_eq(agnosai_metrics_crews_active(_m), _act_before,
+    "and leaves crews_active balanced");
+    assert_eq(agnosai_metrics_tasks_completed(_m) - _done_before, 2,
+    "with both tasks folded into tasks_completed — the counter ADR 011 staged and \
+    left rendering zeros");
 
     # --- test_hierarchical_falls_back_to_sequential ---
     var hier = agnosai_crew_new(str_from("hier"));

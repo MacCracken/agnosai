@@ -239,24 +239,33 @@ boundary.
 trade: v4 ids must come from kernel entropy, never tyche. If id minting ever shows up hot, the
 fix is batching entropy, not changing the source.
 
-`benches/order.bcyr` — the numbers that settle **port plan blocker #8**. The plan measured an
-O(n^2) insertion sort over agnosai's 100k-entry percentile vector at **52.6 s**, and predicted
-87 ms for heapsort and ~21 ms for three quickselects. Measured here (each round includes a full
-100k copy, so the algorithms alone are faster still):
+`benches/order.bcyr` — the numbers that settled **port plan blocker #8**, and
+then retired the code that settled it. The plan measured an O(n^2) insertion sort
+over agnosai's 100k percentile vector at **52.6 s**. `src/order.cyr` first
+vendored heapsort + quickselect to fix that; at cyrius **6.5.4** `vec_sort_by` /
+`vec_select_nth` shipped (closing agnosai's own filing) and the module became a
+thin wrapper. Both transitions, measured on this box:
 
-| Benchmark | Time | vs plan |
-|---|---|---|
-| `select_nth_100k_already_sorted` | 4.12 ms | median-of-3 holds: *faster* than random input |
-| `sort_10k_heapsort` | 6.20 ms | |
-| `select_nth_100k` | 6.67 ms | |
-| `three_percentiles_100k` | 10.6 ms | predicted ~21 ms — **2x better** |
-| `sort_100k_already_sorted` | 77.7 ms | same as random: heapsort has no adversarial input |
-| `sort_100k_heapsort` | 78.1 ms | predicted 87 ms |
+| Benchmark | plan baseline | vendored | stdlib (current) |
+|---|---|---|---|
+| `sort_100k` | 52.6 s | 79.6 ms | **20.3 ms** |
+| `sort_10k` | — | 6.30 ms | **1.71 ms** |
+| `sort_100k_already_sorted` | — | 79.1 ms | **3.31 ms** |
+| `three_percentiles_100k` | ~21 ms predicted | 10.7 ms | **7.81 ms** |
+| `select_nth_100k` | — | 6.89 ms | **5.09 ms** |
+| `select_nth_100k_already_sorted` | — | 4.29 ms | **3.77 ms** |
 
-Against the 52.6 s baseline that is ~670x for the full sort and ~5,000x for the three
-percentiles that `load_testing` actually needs. The two already-sorted rows are the guards on
-the algorithm choice, not padding: heapsort's worst case equals its average, and quickselect's
-median-of-3 pivot is what keeps sorted input off the O(n^2) path.
+Against the 52.6 s baseline that is **~2,600x** for the full sort. The
+already-sorted row moved 23.9x in the last step alone and is a difference in
+kind: heapsort's worst case equals its average so it had no fast path, while
+introsort checks for pre-sorted input first. A latency vector that arrives
+roughly ordered now costs a scan.
+
+`src/order.cyr` is **98 lines, down from 184** — the vendored algorithms are
+gone. What did NOT delegate is the bounds contract: `vec_select_nth` aborts the
+process on `k < 0` or `k >= len`, where `agnosai_select_nth` returns 0, pinned by
+three assertions in `tests/order.tcyr`. An empty latency vector is an ordinary
+state for a load test that recorded no samples.
 
 `benches/tools.bcyr` — the tool path, principally the aggregation that runs after the
 `load_testing` worker threads join. `order.bcyr` already covers the sort and the selects in
@@ -627,12 +636,21 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 > **Three things owed that the transport tier should clear:**
 > * **File the bayan `_a` parse/build ask.** Bite 15b measured the residual and
 >   named it; the filing itself has not been written.
-> * The **metrics producer** is still unwired — ADR 011 gave `/metrics`
->   agnosai's registry but nothing records into it, so it renders zeros. The
->   oracle records at `crew_runner.rs:810`/`:864`.
-> * **`[deps.bote]` earns nothing today.** `mcp.rs` was its only intended
->   consumer and builds its own envelope, so agnosai calls zero bote symbols
->   while carrying ~93 KB and 233 fns in every build. Worth a decision.
+> * ~~The **metrics producer** is still unwired.~~ ✅ **DONE 2026-07-31** —
+>   `/metrics` reports real numbers; see the M6 note below.
+> * **`[deps.bote]` — the MCP surface is a thin slice, not a dead dep.**
+>   *(Corrected 2026-07-31; this previously read "earns nothing today" and
+>   proposed dropping it.)* bote **is** the MCP layer for an agent-orchestration
+>   system. `src/server/routes/mcp.cyr` answers the oracle's three methods —
+>   `initialize`, `tools/list`, `tools/call` — which is full parity, and builds
+>   the envelope directly because `dispatcher_dispatch` hardcodes
+>   `"serverInfo":{"name":"bote"` (`lib/bote-core.cyr:1559`) where the oracle
+>   emits `"name":"agnosai"`. Zero bote symbols called today is a statement about
+>   how little of MCP is exposed so far, not about the library: the bundle
+>   already carries 18 `prompt_*` and 15 `resource_*` fns, which are the obvious
+>   next surface. ✅ **Upstream fixed: bote 3.3.0** adds
+>   `dispatcher_set_server_info(d, name, version)` in the `core` profile agnosai
+>   pins; bump `[deps.bote]` to `tag = "3.3.0"` once tagged.
 >
 > After those, the tier is done and only the **transport** remains:
 > `server/mod.rs`'s router + `routes/mod.rs`, `sse.rs::event_stream` +
@@ -667,13 +685,19 @@ per-worker arena and the `alloc_used()`-flat regression test must land together.
 > 1. **`agnosai_orchestrator_crew_ids(o)`** (~6 lines) in
 >    `src/orchestrator/orchestrator.cyr` — `dashboard.rs` needs it and nothing else
 >    exposes the crew list. Do it as the first step of that bite.
-> 2. **Wire the metrics producer.** ADR 011 gives `/metrics` agnosai's registry,
->    but nothing records into it yet, so it renders zeros. The oracle records at
->    `crew_runner.rs:810` and `:864`; the equivalent
->    `agnosai_metrics_record_*` calls belong in `src/orchestrator/crew_runner.cyr`.
->    Deliberately staged — `crew_runner` is finished M5 code and this was an M6
->    route decision, so widening one to satisfy the other in the same bite would
->    blur what each milestone verified.
+> 2. ~~**Wire the metrics producer.**~~ ✅ **DONE 2026-07-31.** The crew gauge is
+>    recorded on entry and every exit of `agnosai_crew_runner_run`, and
+>    `_agnosai_crew_record_metrics` folds each run's results into the task and
+>    inference counters in one pass after the workers join — one loop rather than
+>    the four result-construction sites, because every path lands in `results` and
+>    four call sites drift. A gauge leak on the cyclic-DAG error path was found
+>    and fixed inside the same change (a malformed spec permanently inflated
+>    `crews_active`), pinned by a mutation-verified assertion. Note the oracle
+>    defines `record_crew_started`/`_completed` and never calls them, so its
+>    `/metrics` reports zero crews too; ADR 011 names "crews created and active"
+>    in its decision, so this is completing an accepted ADR, not a new divergence.
+>    Include-order consequence: `src/server/prometheus.cyr` must precede
+>    `src/orchestrator/crew_runner.cyr`.
 >
 > **Keep writing handlers as `fn(state, inputs) -> (status, json)`.** That is
 > what made `auth.rs`'s ten `#[tokio::test]`s port as ordinary assertions, and

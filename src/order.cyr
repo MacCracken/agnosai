@@ -9,20 +9,31 @@
 # costs 87 ms, and three quickselects cost ~21 ms. Percentiles never needed a
 # full sort in the first place.
 #
-# Design, per the plan:
-#   * `agnosai_sort` is an **iterative in-place heapsort** — O(n log n) in the
-#     *worst* case, O(1) extra memory, and no recursion, so it cannot blow the
-#     stack on adversarial input the way a naive quicksort can. It is NOT
-#     stable; no call site needs stability.
-#   * `agnosai_select_nth` is a Hoare quickselect with median-of-3 pivoting,
-#     also iterative. It partially reorders the vec and is the right tool when
-#     you want a percentile rather than a full ordering.
+# **The algorithms are no longer vendored here.** `vec_sort_by` and
+# `vec_select_nth` shipped in cyrius **6.5.4**, closing agnosai's own filing
+# (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib`). This module keeps its public
+# API and delegates. Measured on this box, 100k elements:
 #
-# **Naming is load-bearing.** The plan calls for an `ai_*` prefix purely to stay
-# clear of the flat namespace; this uses `agnosai_*` instead, which is strictly
-# safer (it also clears ai-hwaccel's `ai_*` surface) and matches CLAUDE.md's
-# rule for every public symbol. Never define a bare `vec_sort` — itihas exports
-# that name unprefixed, and under the fold the last definition would win.
+# | benchmark | vendored | stdlib | |
+# |---|---|---|---|
+# | `sort_100k` | 79.6 ms | **20.4 ms** | 3.90x |
+# | `sort_10k` | 6.30 ms | **1.71 ms** | 3.69x |
+# | `sort_100k_already_sorted` | 79.1 ms | **3.35 ms** | **23.6x** |
+# | `three_percentiles_100k` | 10.7 ms | **7.88 ms** | 1.35x |
+# | `select_nth_100k` | 6.89 ms | **5.18 ms** | 1.33x |
+#
+# The already-sorted row is the big one and it is a real difference in kind:
+# heapsort's worst case equals its average, so it had no fast path. The stdlib
+# introsort checks for pre-sorted input first. A latency vector that arrives
+# roughly ordered — which is common — now costs a scan instead of a full sort.
+#
+# **What does NOT delegate is the guard set**, and that is deliberate:
+# `vec_select_nth` **aborts the process** (`_vec_die()`) on `k < 0` or
+# `k >= len`, where this module's contract — pinned by three assertions in
+# `tests/order.tcyr` — is to return 0. An empty latency vector is an ordinary
+# state for a load test that recorded no samples, not a reason to kill the
+# server, so the wrappers keep their bounds checks and only the sorting is
+# delegated.
 #
 # Comparators are `fn(a, b): i64`, negative / zero / positive like C's qsort.
 # =========================================================================
@@ -41,118 +52,30 @@ fn agnosai_cmp_i64_desc(a, b): i64 {
     return 0;
 }
 
-# Swap two elements of a vec.
-fn _agnosai_swap(v, i, j): i64 {
-    var tmp = vec_get(v, i);
-    vec_set(v, i, vec_get(v, j));
-    vec_set(v, j, tmp);
-    return 0;
-}
-
-# Sift `root` down through a heap of `size` elements. Iterative — a recursive
-# sift is the usual shape, but it costs O(log n) stack per call and Cyrius has
-# no tail-call guarantee.
-fn _agnosai_sift_down(v, root, size, cmp): i64 {
-    var parent = root;
-    while (1 == 1) {
-        var child = parent * 2 + 1;
-        if (child >= size) { break; }
-
-        # Pick the larger child. `>` (not `>=`) keeps the earlier sibling on a
-        # tie, which costs nothing and makes the traversal deterministic.
-        var right = child + 1;
-        if (right < size) {
-            if (callptr(cmp, vec_get(v, right), vec_get(v, child)) > 0) { child = right; }
-        }
-
-        if (callptr(cmp, vec_get(v, child), vec_get(v, parent)) <= 0) { break; }
-        _agnosai_swap(v, parent, child);
-        parent = child;
-    }
-    return 0;
-}
-
 # Sort a vec in place with `cmp`.
 #
-# Iterative in-place heapsort: build a max-heap bottom-up, then repeatedly swap
-# the root to the end and re-sift. O(n log n) worst case, O(1) extra memory,
-# no recursion. Not stable.
+# Delegates to the stdlib `vec_sort_by` (cyrius 6.5.4+): introsort with a
+# pre-sorted fast path. Not stable — no call site needs stability.
 fn agnosai_sort(v, cmp): i64 {
-    var n = vec_len(v);
-    if (n < 2) { return 0; }
-
-    for (var i = n / 2 - 1; i >= 0; i = i - 1) {
-        _agnosai_sift_down(v, i, n, cmp);
-    }
-    for (var end = n - 1; end > 0; end = end - 1) {
-        _agnosai_swap(v, 0, end);
-        _agnosai_sift_down(v, 0, end, cmp);
-    }
-    return 0;
+    return vec_sort_by(v, cmp);
 }
-
 # Sort a vec of plain i64 ascending.
 fn agnosai_sort_i64(v): i64 {
     return agnosai_sort(v, &agnosai_cmp_i64_asc);
 }
 
-# The median of the elements at lo, mid and hi — the pivot value for
-# quickselect. Median-of-3 is what keeps already-sorted and reverse-sorted
-# input off quickselect's O(n^2) path, which is the input shape a latency
-# vector most often has.
-fn _agnosai_median3(v, lo, hi, cmp): i64 {
-    var mid = lo + (hi - lo) / 2;
-    var a = vec_get(v, lo);
-    var b = vec_get(v, mid);
-    var c = vec_get(v, hi);
-
-    if (callptr(cmp, a, b) > 0) {
-        var t = a;
-        a = b;
-        b = t;
-    }
-    if (callptr(cmp, b, c) > 0) { b = c; }
-    if (callptr(cmp, a, b) > 0) { b = a; }
-    return b;
-}
-
-# Hoare-partition v[lo..hi] around `pivot`, returning the split index j such
-# that everything at or below j compares <= everything above it.
-fn _agnosai_partition(v, lo, hi, pivot, cmp): i64 {
-    var i = lo - 1;
-    var j = hi + 1;
-    while (1 == 1) {
-        i = i + 1;
-        while (callptr(cmp, vec_get(v, i), pivot) < 0) { i = i + 1; }
-        j = j - 1;
-        while (callptr(cmp, vec_get(v, j), pivot) > 0) { j = j - 1; }
-        if (i >= j) { return j; }
-        _agnosai_swap(v, i, j);
-    }
-    return j;
-}
-
 # The k-th smallest element (0-based) under `cmp`, partially reordering the vec.
 #
-# Iterative Hoare quickselect with median-of-3. Returns 0 for an empty vec or an
-# out-of-range k. Average O(n) — the reason percentiles do not need a full sort:
-# three of these over 100k elements cost ~21 ms where sorting costs 87 ms.
+# Delegates to the stdlib `vec_select_nth` **behind this module's bounds
+# contract**: 0 for an empty vec or an out-of-range k, where the stdlib aborts.
+# Average O(n) — the reason percentiles do not need a full sort.
 fn agnosai_select_nth(v, k, cmp): i64 {
     var n = vec_len(v);
     if (n == 0) { return 0; }
     if (k < 0) { return 0; }
     if (k >= n) { return 0; }
-
-    var lo = 0;
-    var hi = n - 1;
-    while (lo < hi) {
-        var pivot = _agnosai_median3(v, lo, hi, cmp);
-        var split = _agnosai_partition(v, lo, hi, pivot, cmp);
-        if (k <= split) { hi = split; } else { lo = split + 1; }
-    }
-    return vec_get(v, k);
+    return vec_select_nth(v, k, cmp);
 }
-
 # The k-th smallest plain i64 (0-based).
 fn agnosai_select_nth_i64(v, k): i64 {
     return agnosai_select_nth(v, k, &agnosai_cmp_i64_asc);

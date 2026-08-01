@@ -6,7 +6,8 @@
 #
 #   * an itihas-style O(n^2) insertion sort over agnosai's 100k-entry
 #     percentile vector (builtin/load_testing.rs): **52.6 seconds**
-#   * heapsort over the same: **87 ms**
+#   * heapsort over the same: **87 ms** (the vendored implementation, retired at
+#     6.5.4 in favour of the stdlib introsort — see src/order.cyr)
 #   * three quickselects (p50/p95/p99) over the same: **~21 ms**
 #
 # The 100k shapes below are that exact workload. The three_percentiles case is
@@ -57,7 +58,7 @@ fn _b_sorted(n): i64 {
 fn _b_sort_100k(): i64 {
     var src = _b_latencies(100000, 88172645463325252);
     var n = 5;
-    var b = bench_new("sort_100k_heapsort");
+    var b = bench_new("sort_100k");
     bench_batch_start(b);
     for (var i = 0; i < n; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
     bench_batch_stop(b, n);
@@ -65,7 +66,9 @@ fn _b_sort_100k(): i64 {
     return 0;
 }
 
-# The same sort over already-sorted input — heapsort has no adversarial case,
+# The same sort over already-sorted input. Until 6.5.4 this measured the same as
+# random input (heapsort has no adversarial case AND no fast case); the stdlib
+# introsort adds a pre-sorted check, which is why this row now diverges sharply,
 # so this must land in the same order of magnitude as the random shape.
 fn _b_sort_100k_sorted(): i64 {
     var src = _b_sorted(100000);
@@ -124,7 +127,7 @@ fn _b_select_100k_sorted(): i64 {
 fn _b_sort_10k(): i64 {
     var src = _b_latencies(10000, 88172645463325252);
     var n = 50;
-    var b = bench_new("sort_10k_heapsort");
+    var b = bench_new("sort_10k");
     bench_batch_start(b);
     for (var i = 0; i < n; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
     bench_batch_stop(b, n);

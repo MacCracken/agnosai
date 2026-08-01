@@ -32,9 +32,30 @@
 # and **omits** `result`, and `data` is omitted throughout — the oracle never
 # sets it. `id` is required on both, even on an error.
 #
-# **This module is agnosai's only intended consumer of bote**, and it consumes
-# none of it. Worth knowing when weighing whether the `[deps.bote]` pin earns
-# its ~93 KB and 233 fns in every build.
+# **What this does NOT mean is that the bote pin is dead weight.** bote *is* the
+# MCP layer — `dist/bote-core.cyr` ships the protocol, registry, dispatcher,
+# schema validation, and 18 `prompt_*` + 15 `resource_*` fns. This route answers
+# the three methods the oracle answers (`initialize`, `tools/list`,
+# `tools/call`), which is full parity — and MCP's prompts, resources and
+# subscriptions are the obvious next surface for an agent orchestrator, all of
+# them already sitting in the pinned bundle. The correct reading of "zero bote
+# symbols called today" is that this route is a **thin slice of MCP**, not that
+# the protocol library is unnecessary.
+#
+# The one thing that must not be delegated is `dispatcher_dispatch`: verified at
+# `lib/bote-core.cyr:1559`, `_build_initialize_result` hardcodes
+# `"serverInfo":{"name":"bote"` where the oracle emits `"name":"agnosai"`. That
+# is a single-site wire divergence. **Filed and shipped: bote 3.3.0 adds
+# `dispatcher_set_server_info(d, name, version)`**, so the hardcode is no longer
+# a permanent reason to hand-roll — it becomes a one-line call whenever this
+# route grows past the oracle's three methods.
+#
+# **Today it should still NOT delegate**, and that is parity, not inertia: the
+# oracle uses bote's protocol *types* while explicitly declining its Dispatcher
+# (`mcp.rs:3-5`, "agnosai tools require async execution"). Matching the oracle
+# means building the envelope here. The 3.3.0 fix removes the blocker for the
+# surface that comes after — MCP prompts and resources, which bote already
+# ships (18 + 15 fns in the pinned core bundle).
 # =========================================================================
 
 # The MCP protocol revision the oracle advertises (`mcp.rs:69`). A literal

@@ -77,14 +77,20 @@ That is a point in favour rather than an accident: the module exists, is tested,
 is benchmarked at 5 ns per record, and measures exactly the things a crew
 orchestrator should expose.
 
-**The producer side is not wired yet, and that is the follow-up.** The oracle
+**The producer side is wired as of 2026-07-31.** The oracle
 records at `crew_runner.rs:810` and `:864` into hoosh's registry; the equivalent
-calls into `agnosai_metrics_record_*` are a separate bite in
-`src/orchestrator/crew_runner.cyr`. Until then `/metrics` renders a well-formed
-exposition of zeros. Deliberately staged: `crew_runner` is finished M5 code and
-this ADR is an M6 route decision, so widening one to satisfy the other in the
-same bite would blur what each milestone verified. Tracked in
-`docs/development/state.md`.
+calls into `agnosai_metrics_record_*` landed as a separate bite in
+`src/orchestrator/crew_runner.cyr`. It was deliberately staged — `crew_runner` is finished
+M5 code and this ADR is an M6 route decision, so widening one to satisfy the
+other in the same bite would have blurred what each milestone verified.
+
+`agnosai_crew_runner_run` now records the crew gauge on entry and on every exit,
+and `_agnosai_crew_record_metrics` folds each run's results into the task and
+inference counters in one pass after the workers join. One consequence this ADR
+did not anticipate: it makes `src/orchestrator/` depend on
+`src/server/prometheus.cyr`, so prometheus must precede crew_runner in include
+order. That was already true in `src/main.cyr`; two `.tcyr` files needed it
+added.
 
 **The oracle's own test still passes.** `get_metrics_returns_200_with_prometheus_format`
 (`health.rs:88-108`) asserts only that every line is a comment, contains a space,

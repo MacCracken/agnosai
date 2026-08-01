@@ -7,7 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`/metrics` reports real numbers — the ADR 011 producer is wired.**
+  [ADR 011](docs/adr/011-metrics-endpoint-serves-agnosai-metrics.md) gave the
+  endpoint agnosai's own registry and explicitly staged the recording side as a
+  separate `crew_runner` bite; until now it served a well-formed exposition of
+  **zeros**. `agnosai_crew_runner_run` records the crew gauge on entry and on
+  every exit, and a new `_agnosai_crew_record_metrics` folds each run's results
+  into `tasks_completed`, `tasks_failed`, `tokens_total` and `cost_micro_usd`.
+
+  Recorded in **one pass after the workers join**, not at the four
+  result-construction sites. Every path lands in `results` — success, tool error,
+  LLM error, and the cancellation stub — so one loop cannot miss an arm the way
+  four call sites drift, and the token and cost figures are already on each
+  result's metadata, so nothing has to be threaded down. The recorders were
+  already atomic (`atomic_fetch_add`, plus a CAS loop for the saturating active
+  gauge), so worker-thread recording would have been safe; it is simply not needed.
+
+  Note the oracle defines `record_crew_started` / `record_crew_completed` and
+  **never calls them** — its `/metrics` reports zero crews too. Wiring them is
+  not a new divergence: ADR 011 names "crews created and active" in its decision
+  and its Consequences section stages exactly this bite.
+
 ### Fixed
+- **A cyclic DAG ratcheted the `crews_active` gauge upward forever.** Introduced
+  and caught within this change: the first cut recorded `crew_started` before the
+  DAG-cycle early return, which exits without recording a completion — so one
+  malformed spec permanently inflated the gauge for the life of the process. The
+  error path now balances it. It still emits no `crew_completed` **event** (a
+  cyclic spec is an error, not a crew that failed); the event stream and the
+  gauge are different contracts and only the event one is suppressed. Pinned by a
+  mutation-verified assertion in `tests/orch_crew_runner.tcyr` — deleting the
+  balancing call fails it.
 - **`agnosai_chan_push_lossy` reported a dropped event as delivered.** When the
   post-eviction retry also came back full — another producer refilled the ring
   between the two calls — it fell through to `return 1`, which the contract
@@ -41,6 +72,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from command output rather than editing rows by hand").
 
 ### Performance
+- **`src/order.cyr` now delegates to the stdlib sort — 184 → 98 lines.**
+  `vec_sort_by` / `vec_select_nth` shipped in cyrius **6.5.4**, closing agnosai's
+  own filing (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib`). The vendored
+  heapsort, Hoare quickselect, median-of-3, partition and swap are deleted.
+
+  Measured same-box before/after (`benches/order.bcyr`):
+
+  | benchmark | vendored | stdlib | |
+  |---|---|---|---|
+  | `sort_100k` | 79.6 ms | **20.3 ms** | 3.9× |
+  | `sort_10k` | 6.30 ms | **1.71 ms** | 3.7× |
+  | `sort_100k_already_sorted` | 79.1 ms | **3.31 ms** | **23.9×** |
+  | `three_percentiles_100k` | 10.7 ms | **7.81 ms** | 1.4× |
+  | `select_nth_100k` | 6.89 ms | **5.09 ms** | 1.4× |
+
+  The already-sorted row is a difference in kind, not degree: heapsort's worst
+  case equals its average, so it had no fast path at all. Introsort checks for
+  pre-sorted input first, and a latency vector that arrives roughly ordered —
+  common — now costs a scan instead of a full sort. `builtin/load_testing` is the
+  consumer that pays this on every run.
+
+  **The public API and its bounds contract are unchanged, deliberately.** This is
+  a wrapper, not a rename: `vec_select_nth` **aborts the process** (`_vec_die()`)
+  on `k < 0` or `k >= len`, where `agnosai_select_nth` returns 0 — a contract
+  three assertions in `tests/order.tcyr` already pinned (empty vec, past-the-end,
+  negative k). An empty latency vector is an ordinary state for a load test that
+  recorded no samples, not a reason to kill the server. The guards stay in front;
+  only the sorting is delegated.
+
+  Bench labels lost their now-wrong `_heapsort` suffix. 57 suites green, all 48
+  order assertions unchanged.
 - **86 `str_eq(x, str_from("lit"))` comparisons → `str_eq_cstr(x, "lit")`.** Each
   of those sites allocated a fresh 16-byte `Str` header on the **no-free global
   bump** just to compare against a compile-time constant, and never released it.
