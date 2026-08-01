@@ -72,6 +72,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from command output rather than editing rows by hand").
 
 ### Performance
+- **A task response can now be built entirely on a per-request arena — 1944 → 0
+  bytes on the global bump.** Toolchain pin **6.5.4 → 6.5.5**, which folds
+  **bayan 1.4.0** and its completed `_a` JSON surface. `lib/` matches the pin
+  exactly (0 of 99 stdlib files differ, 0 drift warnings).
+
+  Measured same-box, `agnosai_task_to_json` over 20k iterations:
+
+  | path | bytes/response | ns/response |
+  |---|---|---|
+  | global (back-compat wrapper) | 1792 | 7758 |
+  | arena + `reset_via` per response | **0** | **6922** |
+
+  Wire is **byte-identical** between the two paths — asserted, not assumed.
+
+  Threaded: the five allocating helpers in `src/core/json.cyr`, the three
+  `*_to_wire` spellings, `agnosai_task_to_value` and `agnosai_task_to_json`, each
+  as an `_a` body with the bare name delegating through `default_alloc()` — the
+  stdlib's own convention (`str_from_a`, `alloc_via`).
+
+  **The last 152 bytes were `map_keys`.** After everything else moved,
+  `_agnosai_map_to_value` still called it, and it materialises a key vec through
+  `vec_new()` on the global bump with no `_a` form to thread. It now walks the
+  map's slots directly — that is the **documented public layout**
+  (`lib/hashmap.cyr:22-35`: header `{entries_ptr, capacity, count, key_type}`,
+  slot `{key_ptr, value, state}`, 24 bytes, `state == 1` occupied), not a reach
+  into internals, and it skips the intermediate vec entirely so it helps the
+  global path too — that is why the non-arena row above reads 1792 rather than
+  the previously measured 1944. Guarded on `key_type == 2`: the u64 map has a
+  16-byte slot and no state field, and the same header notes `map_keys` /
+  `map_values` / `map_iter` do not work on it either.
+
+  Pinned by assertions in `tests/core_task.tcyr` and **mutation-verified twice** —
+  putting a single key Str back on the global bump fails the zero-growth
+  assertion, and so does restoring the `map_keys` call.
+
+  This is one module. 48 more `*_to_value` fns and ~645 constructor call sites
+  remain; `core/json` + `core/task` was the first bite because it is the one with
+  an existing benchmark to measure against.
 - **`src/order.cyr` now delegates to the stdlib sort — 184 → 98 lines.**
   `vec_sort_by` / `vec_select_nth` shipped in cyrius **6.5.4**, closing agnosai's
   own filing (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib`). The vendored

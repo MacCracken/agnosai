@@ -12,31 +12,43 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.4` (`cyrius.cyml`) — folds bayan 1.3.0, **sandhi 1.9.8**,
-  **sigil 3.12.2**, sakshi 2.4.7, yukti 2.3.2, mabda 4.0.8.
-  Bumped 6.5.2 → 6.5.3 → 6.5.4 on 2026-07-30. Unlike the 6.5.3 bump (whose `lib/` was
-  byte-identical), **6.5.4 moves real stdlib source** and needed
-  `cyrius lib sync --full` — `cyrius deps` alone re-layers the git deps but does not
-  refresh the stdlib, so `lib/` sat at the 6.5.3 snapshot until the sync ran. Three
-  things in it land on agnosai:
-  - **`vec_sort_by` / `vec_select_nth` shipped**, closing agnosai's own filing
-    `2026-07-28-agnosai-no-nlogn-sort-in-stdlib`. **No collision** — every symbol in
-    `src/order.cyr` is `agnosai_*`-prefixed, and nothing here calls the new names yet.
-    See "Open: migrate order.cyr to the stdlib sort?" below.
-  - **sandhi 1.9.7 → 1.9.8** changes a **return contract** the transport tier will
-    depend on: all five serve loops previously spun a core forever on a persistent
-    accept error and never returned once listening; they now return 1 on a
-    structurally dead listener or after 200 consecutive resource failures. Nothing
-    here calls `sandhi_server_*` yet, so this is a note for the router bite, not a
-    change to absorb now.
-  - **sigil 3.12.1 → 3.12.2** fixes a 144-byte-per-call `sha256_init` leak. **It never
-    affected us** — `_agnosai_auth_secret_eq` uses the banked `sha256()` one-shot,
-    which is allocator-free — confirmed by measuring the shared-secret path at
-    **32 bytes/request** before and after.
+- **Cyrius pin**: `6.5.5` (`cyrius.cyml`) — bumped 2026-07-31. Folds **bayan 1.4.0**,
+  sandhi 1.9.8, sigil 3.12.2, sakshi 2.4.7, yukti 2.3.2, mabda 4.0.8.
+- **`lib/` matches the pin exactly**: 0 of 99 stdlib files differ from
+  `~/.cyrius/versions/6.5.5/lib`; build and test emit no drift or shadow warning.
+  The six files outside the snapshot (ai-hwaccel, bote-core, kavach, libro, majra,
+  tyche) are declared git deps, not staleness.
 
-  **The sigil pin had to move with it.** `cyrius deps` copies each git dep's vendored
-  bundle into `lib/` with last-write-wins, so leaving `[deps.sigil] tag = "3.12.1"` would
-  have overwritten the 6.5.4 fold's 3.12.2 back down to 3.12.1. Bumped to 3.12.2.
+  **Verify a bump by diffing the trees, not by a green `lib sync --full`.** On the
+  bayan repo the same command reported success and left five files stale; here it
+  was clean, but the check is cheap and the failure is silent.
+
+### What 6.5.5 lands on agnosai
+
+- **bayan 1.4.0 completes the `_a` JSON surface** — `obj_set_a`, `build_a`,
+  `build_pretty_a`, `parse_a`, `parse_buf_a`, `parse_ctx_a`, joining the eight value
+  constructors that already had `_a` forms. This is the one that mattered: before it,
+  a per-request arena could hold part of a response tree and the pair cells, the parse
+  and the serialized text still landed on the no-free global bump. **Blocker #3's
+  handler half is now closed** and needs no further upstream work. First consumer:
+  `src/core/task.cyr`, measured **1792 → 0 bytes/response**. See roadmap B3.
+
+### Carried forward from 6.5.4
+
+- **`vec_sort_by` / `vec_select_nth`** closed agnosai's own sort filing.
+  ✅ **Consumed** — `src/order.cyr` is now a 98-line wrapper over them (was 184).
+- **sandhi 1.9.7 → 1.9.8** changed a **return contract** the transport tier depends on:
+  all five serve loops previously spun a core forever on a persistent accept error and
+  never returned once listening; they now return 1 on a structurally dead listener or
+  after 200 consecutive resource failures. `src/server/serve.cyr` is the caller.
+- **sigil 3.12.1 → 3.12.2** fixed a 144-byte-per-call `sha256_init` leak. **It never
+  affected us** — `_agnosai_auth_secret_eq` uses the banked `sha256()` one-shot, which
+  is allocator-free — confirmed by measuring the shared-secret path at **32
+  bytes/request** before and after.
+
+  **The sigil pin has to move with the fold.** `cyrius deps` copies each git dep's
+  vendored bundle into `lib/` with last-write-wins, so leaving `[deps.sigil] tag =
+  "3.12.1"` would overwrite the fold's 3.12.2 back down to 3.12.1.
 - Rust (for `rust-old/` only): `channel = "stable"`, currently rustc 1.96.0
 
 ## Source

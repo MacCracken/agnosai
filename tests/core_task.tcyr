@@ -194,6 +194,63 @@ fn main() {
     var edges_v = bayan_json_v_obj_get(agnosai_task_dag_to_value(dag), "edges");
     _t_assert_json(edges_v, "[[\"t1\",\"t2\"]]", "edges render as nested arrays");
 
+
+    # =====================================================================
+    # [6.5.5] the arena path — bayan 1.4.0 completed the `_a` JSON surface
+    #
+    # The contract is not "the _a fns exist"; it is that a request handler can
+    # build an ENTIRE response — value tree, key strings, wire spellings and the
+    # serialized text — on a per-request arena and see ZERO growth on the no-free
+    # global bump, while emitting byte-identical JSON.
+    # =====================================================================
+
+    var ar_t = agnosai_task_new(str_from("desc"));
+    agnosai_task_with_context(ar_t, str_from("k1"), bayan_json_v_str_new(str_from("v1")));
+    agnosai_task_with_dependency(ar_t, str_from("dep-a"));
+    agnosai_task_with_priority(ar_t, AGNOSAI_PRIORITY_HIGH);
+    agnosai_task_with_risk(ar_t, AGNOSAI_RISK_MEDIUM);
+
+    var ar = arena_allocator(262144);
+    # warm: first touch of any lazily-built global must not count as leakage
+    agnosai_task_to_json_a(ar, ar_t);
+    reset_via(ar);
+
+    var ar_before = alloc_used();
+    var ar_i = 0;
+    while (ar_i < 100) {
+        agnosai_task_to_json_a(ar, ar_t);
+        reset_via(ar);
+        ar_i = ar_i + 1;
+    }
+    assert_eq(alloc_used() - ar_before, 0,
+    "100 full task serializations through an arena grow the global bump by 0 bytes — tree, keys, \
+    wire spellings AND the serialized text, which only became possible at bayan 1.4.0");
+
+    # The value-tree form on its own, not just through to_json — the serializer
+    # would otherwise be the only thing keeping it referenced.
+    var ar_v = agnosai_task_to_value_a(ar, ar_t);
+    assert(bayan_json_v_is_obj(ar_v) == 1, "task_to_value_a builds an object");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(ar_v, "description")), "desc") == 1,
+    "with the task's fields on it");
+
+    # Byte-identical wire, which is the whole point of doing this without an ADR.
+    assert_eq(str_eq(agnosai_task_to_json(ar_t), agnosai_task_to_json_a(ar, ar_t)), 1,
+    "the arena path emits byte-identical JSON to the global path");
+
+    # The wire fns are the piece that looked negligible at 48 of 1944 bytes and
+    # became the remainder once everything else moved.
+    var ar_b2 = alloc_used();
+    var ar_j = 0;
+    while (ar_j < 100) {
+        agnosai_task_priority_to_wire_a(ar, AGNOSAI_PRIORITY_CRITICAL);
+        agnosai_task_status_to_wire_a(ar, AGNOSAI_STATUS_RUNNING);
+        agnosai_task_risk_to_wire_a(ar, AGNOSAI_RISK_HIGH);
+        ar_j = ar_j + 1;
+    }
+    assert_eq(alloc_used() - ar_b2, 0, "the _a wire spellings allocate nothing globally");
+    assert(str_eq_cstr(agnosai_task_risk_to_wire_a(ar, AGNOSAI_RISK_HIGH), "high") == 1,
+    "and still return the oracle's snake_case spelling");
+
     return assert_summary();
 }
 

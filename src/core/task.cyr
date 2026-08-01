@@ -103,10 +103,15 @@ enum AgnosaiEdgeOff {
 }
 
 # The snake_case wire spelling of a risk level.
+fn agnosai_task_risk_to_wire_a(a, risk): i64 {
+    if (risk == AGNOSAI_RISK_MEDIUM) { return str_from_a(a, "medium"); }
+    if (risk == AGNOSAI_RISK_HIGH) { return str_from_a(a, "high"); }
+    return str_from_a(a, "low");
+}
+
+# The snake_case wire spelling of a risk level (global-allocator form).
 fn agnosai_task_risk_to_wire(risk): i64 {
-    if (risk == AGNOSAI_RISK_MEDIUM) { return str_from("medium"); }
-    if (risk == AGNOSAI_RISK_HIGH) { return str_from("high"); }
-    return str_from("low");
+    return agnosai_task_risk_to_wire_a(default_alloc(), risk);
 }
 
 # A risk level from its wire spelling. Unknown spellings fall back to the
@@ -118,12 +123,17 @@ fn agnosai_task_risk_from_wire(s: Str): i64 {
 }
 
 # The snake_case wire spelling of a priority tier.
+fn agnosai_task_priority_to_wire_a(a, priority): i64 {
+    if (priority == AGNOSAI_PRIORITY_BACKGROUND) { return str_from_a(a, "background"); }
+    if (priority == AGNOSAI_PRIORITY_LOW) { return str_from_a(a, "low"); }
+    if (priority == AGNOSAI_PRIORITY_HIGH) { return str_from_a(a, "high"); }
+    if (priority == AGNOSAI_PRIORITY_CRITICAL) { return str_from_a(a, "critical"); }
+    return str_from_a(a, "normal");
+}
+
+# The snake_case wire spelling of a priority tier (global-allocator form).
 fn agnosai_task_priority_to_wire(priority): i64 {
-    if (priority == AGNOSAI_PRIORITY_BACKGROUND) { return str_from("background"); }
-    if (priority == AGNOSAI_PRIORITY_LOW) { return str_from("low"); }
-    if (priority == AGNOSAI_PRIORITY_HIGH) { return str_from("high"); }
-    if (priority == AGNOSAI_PRIORITY_CRITICAL) { return str_from("critical"); }
-    return str_from("normal");
+    return agnosai_task_priority_to_wire_a(default_alloc(), priority);
 }
 
 # A priority tier from its wire spelling. Unknown spellings fall back to the
@@ -137,13 +147,18 @@ fn agnosai_task_priority_from_wire(s: Str): i64 {
 }
 
 # The snake_case wire spelling of a lifecycle status.
+fn agnosai_task_status_to_wire_a(a, status): i64 {
+    if (status == AGNOSAI_STATUS_QUEUED) { return str_from_a(a, "queued"); }
+    if (status == AGNOSAI_STATUS_RUNNING) { return str_from_a(a, "running"); }
+    if (status == AGNOSAI_STATUS_COMPLETED) { return str_from_a(a, "completed"); }
+    if (status == AGNOSAI_STATUS_FAILED) { return str_from_a(a, "failed"); }
+    if (status == AGNOSAI_STATUS_CANCELLED) { return str_from_a(a, "cancelled"); }
+    return str_from_a(a, "pending");
+}
+
+# The snake_case wire spelling of a lifecycle status (global-allocator form).
 fn agnosai_task_status_to_wire(status): i64 {
-    if (status == AGNOSAI_STATUS_QUEUED) { return str_from("queued"); }
-    if (status == AGNOSAI_STATUS_RUNNING) { return str_from("running"); }
-    if (status == AGNOSAI_STATUS_COMPLETED) { return str_from("completed"); }
-    if (status == AGNOSAI_STATUS_FAILED) { return str_from("failed"); }
-    if (status == AGNOSAI_STATUS_CANCELLED) { return str_from("cancelled"); }
-    return str_from("pending");
+    return agnosai_task_status_to_wire_a(default_alloc(), status);
 }
 
 # A lifecycle status from its wire spelling. Unknown spellings fall back to the
@@ -377,40 +392,52 @@ fn agnosai_task_output_schema(t): i64 {
 }
 
 # The task as a bayan JSON value, fields in the oracle's declaration order.
-fn agnosai_task_to_value(t): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("id"),
-    bayan_json_v_str_new(load64(t + AGN_TASK_ID)));
-    bayan_json_v_obj_set(obj, str_from("description"),
-    bayan_json_v_str_new(load64(t + AGN_TASK_DESCRIPTION)));
-    bayan_json_v_obj_set(obj, str_from("expected_output"),
-    _agnosai_opt_str_to_value(load64(t + AGN_TASK_EXPECTED_OUTPUT)));
+# Serialize a task to a bayan JSON value.
+#
+# The `_a` form is the real body: every cell, every key Str and every wire
+# spelling comes from `a`, so a per-request arena reclaims the entire tree on
+# `reset_via`. Complete only since bayan 1.4.0 / cyrius 6.5.5 — before that
+# `obj_set`, the parse and the serializer had no `_a`, so an arena covered part
+# of a response and the rest leaked.
+fn agnosai_task_to_value_a(a, t): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "id"),
+    bayan_json_v_str_new_a(a, load64(t + AGN_TASK_ID)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "description"),
+    bayan_json_v_str_new_a(a, load64(t + AGN_TASK_DESCRIPTION)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "expected_output"),
+    _agnosai_opt_str_to_value_a(a, load64(t + AGN_TASK_EXPECTED_OUTPUT)));
 
     var agent = load64(t + AGN_TASK_ASSIGNED_AGENT);
-    var agent_v = bayan_json_v_null();
-    if (agent != 0) { agent_v = bayan_json_v_str_new(agent); }
-    bayan_json_v_obj_set(obj, str_from("assigned_agent"), agent_v);
+    var agent_v = bayan_json_v_null_a(a);
+    if (agent != 0) { agent_v = bayan_json_v_str_new_a(a, agent); }
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "assigned_agent"), agent_v);
 
-    bayan_json_v_obj_set(obj, str_from("priority"),
-    bayan_json_v_str_new(agnosai_task_priority_to_wire(load64(t + AGN_TASK_PRIORITY))));
-    bayan_json_v_obj_set(obj, str_from("status"),
-    bayan_json_v_str_new(agnosai_task_status_to_wire(load64(t + AGN_TASK_STATUS))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "priority"),
+    bayan_json_v_str_new_a(a, agnosai_task_priority_to_wire_a(a, load64(t + AGN_TASK_PRIORITY))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"),
+    bayan_json_v_str_new_a(a, agnosai_task_status_to_wire_a(a, load64(t + AGN_TASK_STATUS))));
 
     var deps = load64(t + AGN_TASK_DEPENDENCIES);
-    var deps_v = bayan_json_v_arr_new();
+    var deps_v = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(deps); i = i + 1) {
-        bayan_json_v_arr_push(deps_v, bayan_json_v_str_new(vec_get(deps, i)));
+        bayan_json_v_arr_push_a(a, deps_v, bayan_json_v_str_new_a(a, vec_get(deps, i)));
     }
-    bayan_json_v_obj_set(obj, str_from("dependencies"), deps_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "dependencies"), deps_v);
 
-    bayan_json_v_obj_set(obj, str_from("context"), _agnosai_map_to_value(load64(t + AGN_TASK_CONTEXT)));
-    bayan_json_v_obj_set(obj, str_from("risk"),
-    bayan_json_v_str_new(agnosai_task_risk_to_wire(load64(t + AGN_TASK_RISK))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "context"), _agnosai_map_to_value_a(a, load64(t + AGN_TASK_CONTEXT)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "risk"),
+    bayan_json_v_str_new_a(a, agnosai_task_risk_to_wire_a(a, load64(t + AGN_TASK_RISK))));
 
     var schema = load64(t + AGN_TASK_OUTPUT_SCHEMA);
-    if (schema == 0) { schema = bayan_json_v_null(); }
-    bayan_json_v_obj_set(obj, str_from("output_schema"), schema);
+    if (schema == 0) { schema = bayan_json_v_null_a(a); }
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "output_schema"), schema);
     return obj;
+}
+
+# Back-compat wrapper — allocates the whole tree on the global bump.
+fn agnosai_task_to_value(t): i64 {
+    return agnosai_task_to_value_a(default_alloc(), t);
 }
 
 # Rebuild a task from a bayan JSON value. Every field but `id` and
@@ -478,6 +505,17 @@ fn agnosai_task_from_value(v): i64 {
 }
 
 # The task serialized to JSON text.
+# Serialize a task to JSON text.
+#
+# `_a` routes BOTH halves through the arena — the value tree and the serializer's
+# builder. `bayan_json_v_build_a` is new in bayan 1.4.0; before it the tree could
+# be arena'd but the text could not, which is why the residual was 36% rather
+# than zero.
+fn agnosai_task_to_json_a(a, t): i64 {
+    return bayan_json_v_build_a(a, agnosai_task_to_value_a(a, t));
+}
+
+# Serialize a task to JSON text on the global allocator (back-compat form).
 fn agnosai_task_to_json(t): i64 {
     return bayan_json_v_build(agnosai_task_to_value(t));
 }

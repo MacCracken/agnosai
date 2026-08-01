@@ -23,15 +23,29 @@
 var AGNOSAI_NO_LIMIT = 0 - 1;
 
 # An Option<String> as a JSON value: the string, or null when unset.
+#
+# **The `_a` form is the real body throughout this file; the bare name delegates
+# with `default_alloc()`.** bayan 1.4.0 (cyrius 6.5.5) completed the `_a` JSON
+# surface, so a caller holding a per-request arena can now build a whole
+# response tree on it — before that, every cell landed on the no-free global
+# bump and stayed there for the life of the process.
+fn _agnosai_opt_str_to_value_a(a, s): i64 {
+    if (s == 0) { return bayan_json_v_null_a(a); }
+    return bayan_json_v_str_new_a(a, s);
+}
+
 fn _agnosai_opt_str_to_value(s): i64 {
-    if (s == 0) { return bayan_json_v_null(); }
-    return bayan_json_v_str_new(s);
+    return _agnosai_opt_str_to_value_a(default_alloc(), s);
 }
 
 # An optional count as a JSON value: the integer, or null when unset.
+fn _agnosai_opt_int_to_value_a(a, n): i64 {
+    if (n == AGNOSAI_NO_LIMIT) { return bayan_json_v_null_a(a); }
+    return bayan_json_v_int_new_a(a, n);
+}
+
 fn _agnosai_opt_int_to_value(n): i64 {
-    if (n == AGNOSAI_NO_LIMIT) { return bayan_json_v_null(); }
-    return bayan_json_v_int_new(n);
+    return _agnosai_opt_int_to_value_a(default_alloc(), n);
 }
 
 # Read an integer field, falling back to `fallback` when missing or non-integer.
@@ -51,9 +65,13 @@ fn _agnosai_opt_int_field(v, key): i64 {
 }
 
 # A bool as the JSON literal serde emits.
+fn _agnosai_bool_to_value_a(a, b): i64 {
+    if (b == 1) { return bayan_json_v_bool_new_a(a, 1); }
+    return bayan_json_v_bool_new_a(a, 0);
+}
+
 fn _agnosai_bool_to_value(b): i64 {
-    if (b == 1) { return bayan_json_v_bool_new(1); }
-    return bayan_json_v_bool_new(0);
+    return _agnosai_bool_to_value_a(default_alloc(), b);
 }
 
 # Read a bool field, defaulting to 0 when missing or non-bool.
@@ -73,14 +91,43 @@ fn _agnosai_str_field(v, key): i64 {
 }
 
 # Serialize a Str-keyed map of JSON values into a bayan object.
-fn _agnosai_map_to_value(m): i64 {
-    var obj = bayan_json_v_obj_new();
-    var keys = map_keys(m);
-    for (var i = 0; i < vec_len(keys); i = i + 1) {
-        var k = vec_get(keys, i);
-        bayan_json_v_obj_set(obj, k, map_get(m, k));
+#
+# The VALUES are borrowed from the map, not copied — they are already JSON
+# values. Only the object shell and its pair cells come from `a`, so a caller
+# arena-ing this must not `reset_via` while the source map is still live.
+fn _agnosai_map_to_value_a(a, m): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+
+    # Walks the map's slots directly instead of calling `map_keys`, which
+    # materialises a key vec through `vec_new()` — on the GLOBAL bump, with no
+    # `_a` form to thread. That vec was the entire residual after the rest of
+    # this path moved onto the arena: 152 of 1944 bytes per response, which is
+    # small per call and still unbounded growth at request rates.
+    #
+    # This is the documented public layout, not a reach into internals
+    # (`lib/hashmap.cyr:22-35`): header `{entries_ptr, capacity, count,
+    # key_type}`, slot `{key_ptr, value, state}` at 24 bytes, `state == 1`
+    # meaning occupied. Slot order is the same order `map_keys` returns, so the
+    # emitted key order is unchanged.
+    #
+    # **key_type 2 (u64) has a 16-byte slot and no state field** — the header
+    # says map_keys/map_values/map_iter do not work on it either. Guarded rather
+    # than assumed: a u64 map here would read values as states and emit garbage.
+    if (load64(m + 24) == 2) { return obj; }
+
+    var entries = load64(m);
+    var cap = load64(m + 8);
+    for (var i = 0; i < cap; i = i + 1) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            bayan_json_v_obj_set_a(a, obj, load64(ep), load64(ep + 8));
+        }
     }
     return obj;
+}
+
+fn _agnosai_map_to_value(m): i64 {
+    return _agnosai_map_to_value_a(default_alloc(), m);
 }
 
 # Rebuild a Str-keyed map of JSON values from a bayan object. A missing or
@@ -96,12 +143,16 @@ fn _agnosai_map_from_value(v): i64 {
 }
 
 # Serialize a vec of Str into a JSON array.
-fn _agnosai_str_vec_to_value(v): i64 {
-    var arr = bayan_json_v_arr_new();
+fn _agnosai_str_vec_to_value_a(a, v): i64 {
+    var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(v); i = i + 1) {
-        bayan_json_v_arr_push(arr, bayan_json_v_str_new(vec_get(v, i)));
+        bayan_json_v_arr_push_a(a, arr, bayan_json_v_str_new_a(a, vec_get(v, i)));
     }
     return arr;
+}
+
+fn _agnosai_str_vec_to_value(v): i64 {
+    return _agnosai_str_vec_to_value_a(default_alloc(), v);
 }
 
 # Append every string element of a JSON array onto `dst`. A missing or
