@@ -225,26 +225,31 @@ fn agnosai_process_max_concurrency(p): i64 {
 
 # A process mode as a bayan JSON value. Unit variants are bare snake_case
 # strings; the two data-carrying variants are externally tagged.
-fn agnosai_process_to_value(p): i64 {
+fn agnosai_process_to_value_a(a, p): i64 {
     var kind = load64(p + AGN_PROC_KIND);
-    if (kind == AGNOSAI_PROCESS_DAG) { return bayan_json_v_str_new(str_from("dag")); }
+    if (kind == AGNOSAI_PROCESS_DAG) { return bayan_json_v_str_new_a(a, str_from_a(a, "dag")); }
     if (kind == AGNOSAI_PROCESS_HIERARCHICAL) {
-        var inner = bayan_json_v_obj_new();
+        var inner = bayan_json_v_obj_new_a(a);
         var mgr = load64(p + AGN_PROC_MANAGER);
-        bayan_json_v_obj_set(inner, str_from("manager"), bayan_json_v_str_new(mgr));
-        var outer = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(outer, str_from("hierarchical"), inner);
+        bayan_json_v_obj_set_a(a, inner, str_from_a(a, "manager"), bayan_json_v_str_new_a(a, mgr));
+        var outer = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, outer, str_from_a(a, "hierarchical"), inner);
         return outer;
     }
     if (kind == AGNOSAI_PROCESS_PARALLEL) {
-        var pinner = bayan_json_v_obj_new();
-        var cap = bayan_json_v_int_new(load64(p + AGN_PROC_MAX_CONCURRENCY));
-        bayan_json_v_obj_set(pinner, str_from("max_concurrency"), cap);
-        var pouter = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(pouter, str_from("parallel"), pinner);
+        var pinner = bayan_json_v_obj_new_a(a);
+        var cap = bayan_json_v_int_new_a(a, load64(p + AGN_PROC_MAX_CONCURRENCY));
+        bayan_json_v_obj_set_a(a, pinner, str_from_a(a, "max_concurrency"), cap);
+        var pouter = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, pouter, str_from_a(a, "parallel"), pinner);
         return pouter;
     }
-    return bayan_json_v_str_new(str_from("sequential"));
+    return bayan_json_v_str_new_a(a, str_from_a(a, "sequential"));
+}
+
+# Global-allocator form of `agnosai_process_to_value_a`.
+fn agnosai_process_to_value(p): i64 {
+    return agnosai_process_to_value_a(default_alloc(), p);
 }
 
 # Rebuild a process mode from its JSON value. Anything unrecognized falls back
@@ -566,16 +571,21 @@ fn agnosai_task_result_with_metadata(r, key: Str, value): i64 {
 }
 
 # The result as a bayan JSON value, fields in declaration order.
-fn agnosai_task_result_to_value(r): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("task_id"),
-    bayan_json_v_str_new(load64(r + AGN_TRES_TASK_ID)));
-    bayan_json_v_obj_set(obj, str_from("output"), bayan_json_v_str_new(load64(r + AGN_TRES_OUTPUT)));
-    bayan_json_v_obj_set(obj, str_from("status"),
-    bayan_json_v_str_new(agnosai_task_status_to_wire(load64(r + AGN_TRES_STATUS))));
-    bayan_json_v_obj_set(obj, str_from("metadata"),
-    _agnosai_map_to_value(load64(r + AGN_TRES_METADATA)));
+fn agnosai_task_result_to_value_a(a, r): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_id"),
+    bayan_json_v_str_new_a(a, load64(r + AGN_TRES_TASK_ID)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "output"), bayan_json_v_str_new_a(a, load64(r + AGN_TRES_OUTPUT)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"),
+    bayan_json_v_str_new_a(a, agnosai_task_status_to_wire_a(a, load64(r + AGN_TRES_STATUS))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "metadata"),
+    _agnosai_map_to_value_a(a, load64(r + AGN_TRES_METADATA)));
     return obj;
+}
+
+# Global-allocator form of `agnosai_task_result_to_value_a`.
+fn agnosai_task_result_to_value(r): i64 {
+    return agnosai_task_result_to_value_a(default_alloc(), r);
 }
 
 # Rebuild a result from a bayan JSON value. Returns 0 when `task_id` is missing
@@ -647,31 +657,40 @@ fn agnosai_task_dag_process(d): i64 {
 
 # The DAG as a bayan JSON value. Edges emit as two-element arrays, matching
 # serde's rendering of a `(String, String)` tuple.
-fn agnosai_task_dag_to_value(d): i64 {
-    var obj = bayan_json_v_obj_new();
+fn agnosai_task_dag_to_value_a(a, d): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
 
     var tasks = load64(d + AGN_DAG_TASKS);
-    var tasks_v = bayan_json_v_obj_new();
-    var keys = map_keys(tasks);
-    for (var i = 0; i < vec_len(keys); i = i + 1) {
-        var k = vec_get(keys, i);
-        bayan_json_v_obj_set(tasks_v, k, agnosai_task_to_value(map_get(tasks, k)));
+    var tasks_v = bayan_json_v_obj_new_a(a);
+    # Slot walk, not map_keys — see _agnosai_map_slots in src/core/json.cyr.
+    var tn = _agnosai_map_slots(tasks);
+    for (var i = 0; i < tn; i = i + 1) {
+        if (_agnosai_map_slot_live(tasks, i) == 1) {
+            bayan_json_v_obj_set_a(a, tasks_v, _agnosai_map_slot_key(tasks, i),
+            agnosai_task_to_value_a(a, _agnosai_map_slot_val(tasks, i)));
+        }
     }
-    bayan_json_v_obj_set(obj, str_from("tasks"), tasks_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "tasks"), tasks_v);
 
     var edges = load64(d + AGN_DAG_EDGES);
-    var edges_v = bayan_json_v_arr_new();
+    var edges_v = bayan_json_v_arr_new_a(a);
     for (var j = 0; j < vec_len(edges); j = j + 1) {
         var e = vec_get(edges, j);
-        var pair = bayan_json_v_arr_new();
-        bayan_json_v_arr_push(pair, bayan_json_v_str_new(load64(e + AGN_EDGE_FROM)));
-        bayan_json_v_arr_push(pair, bayan_json_v_str_new(load64(e + AGN_EDGE_TO)));
-        bayan_json_v_arr_push(edges_v, pair);
+        var pair = bayan_json_v_arr_new_a(a);
+        bayan_json_v_arr_push_a(a, pair, bayan_json_v_str_new_a(a, load64(e + AGN_EDGE_FROM)));
+        bayan_json_v_arr_push_a(a, pair, bayan_json_v_str_new_a(a, load64(e + AGN_EDGE_TO)));
+        bayan_json_v_arr_push_a(a, edges_v, pair);
     }
-    bayan_json_v_obj_set(obj, str_from("edges"), edges_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "edges"), edges_v);
 
-    bayan_json_v_obj_set(obj, str_from("process"), agnosai_process_to_value(load64(d + AGN_DAG_PROCESS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "process"),
+    agnosai_process_to_value_a(a, load64(d + AGN_DAG_PROCESS)));
     return obj;
+}
+
+# Global-allocator form of `agnosai_task_dag_to_value_a`.
+fn agnosai_task_dag_to_value(d): i64 {
+    return agnosai_task_dag_to_value_a(default_alloc(), d);
 }
 
 # Rebuild a DAG from a bayan JSON value. Returns 0 when the value is not an

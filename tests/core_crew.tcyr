@@ -169,6 +169,74 @@ fn main() {
     "nested profile cost survives");
     assert_eq(agnosai_crew_state_from_value(bayan_json_v_obj_new()), 0, "state without a crew_id is rejected");
 
+
+    # =====================================================================
+    # [6.5.5] the whole core group on one arena
+    #
+    # core/task went first (its own suite pins that). This is the group result:
+    # a crew carries agents, tasks, a process, a profile with three maps, and
+    # every one of those has to be threaded or the response still grows the
+    # global bump. Serializing a 10x10 crew is the widest core path there is.
+    # =====================================================================
+    var g_c = agnosai_crew_new(str_from("arena-crew"));
+    var g_ts = vec_new();
+    var g_as = vec_new();
+    for (var gi = 0; gi < 10; gi = gi + 1) {
+        vec_push(g_ts, agnosai_task_new(str_from("t")));
+        vec_push(g_as, agnosai_agent_new(str_from("k"), str_from("r"), str_from("g")));
+    }
+    agnosai_crew_with_tasks(g_c, g_ts);
+    agnosai_crew_with_agents(g_c, g_as);
+
+    var g_ar = arena_allocator(4194304);
+    agnosai_crew_to_json_a(g_ar, g_c);       # warm any lazily-built global
+    reset_via(g_ar);
+
+    var g_before = alloc_used();
+    var g_i = 0;
+    while (g_i < 20) {
+        agnosai_crew_to_json_a(g_ar, g_c);
+        reset_via(g_ar);
+        g_i = g_i + 1;
+    }
+    assert_eq(alloc_used() - g_before, 0,
+    "20 serializations of a 10-agent 10-task crew through an arena grow the global bump by 0 \
+    bytes — agents, tasks, process, profile maps, wire spellings and the serialized text");
+
+    assert_eq(str_eq(agnosai_crew_to_json(g_c), agnosai_crew_to_json_a(g_ar, g_c)), 1,
+    "and the arena path emits byte-identical JSON");
+
+    # The profile's three maps are the piece that needed a slot walk rather than
+    # map_keys — that helper allocates its key vec on the global bump.
+    var g_p = agnosai_crew_profile_new();
+    agnosai_crew_profile_record_task_cost(g_p, str_from("t1"), 1500);
+    agnosai_crew_profile_record_agent_cost(g_p, str_from("a1"), 2500);
+    agnosai_crew_profile_record_task_ms(g_p, str_from("t1"), 42);
+    reset_via(g_ar);
+    var g_pb = alloc_used();
+    var g_j = 0;
+    while (g_j < 20) { agnosai_crew_profile_to_value_a(g_ar, g_p); reset_via(g_ar); g_j = g_j + 1; }
+    assert_eq(alloc_used() - g_pb, 0,
+    "a profile carrying all three maps serializes with zero global growth");
+
+
+    # [6.5.5] crew's remaining `_a` forms agree with their global twins.
+    var cw_ar = arena_allocator(262144);
+    assert_eq(str_eq(agnosai_crew_status_to_wire_a(cw_ar, AGNOSAI_CREW_FAILED),
+    agnosai_crew_status_to_wire(AGNOSAI_CREW_FAILED)), 1, "crew_status_to_wire_a agrees");
+    assert_eq(str_eq(bayan_json_v_build(agnosai_crew_to_value_a(cw_ar, g_c)),
+    bayan_json_v_build(agnosai_crew_to_value(g_c))), 1, "crew_to_value_a agrees byte-for-byte");
+    var cw_st = agnosai_crew_state_new(str_from("cid"), AGNOSAI_CREW_COMPLETED);
+    assert_eq(str_eq(bayan_json_v_build(agnosai_crew_state_to_value_a(cw_ar, cw_st)),
+    bayan_json_v_build(agnosai_crew_state_to_value(cw_st))), 1, "crew_state_to_value_a agrees");
+    var cw_cm = map_new_str();
+    map_set(cw_cm, str_from("a1"), 2500);
+    assert_eq(str_eq(bayan_json_v_build(_agnosai_cost_map_to_value_a(cw_ar, cw_cm)),
+    bayan_json_v_build(_agnosai_cost_map_to_value(cw_cm))), 1, "cost_map_to_value_a agrees");
+    var cw_im = map_new_str();
+    map_set(cw_im, str_from("t1"), 42);
+    assert_eq(str_eq(bayan_json_v_build(_agnosai_int_map_to_value_a(cw_ar, cw_im)),
+    bayan_json_v_build(_agnosai_int_map_to_value(cw_im))), 1, "int_map_to_value_a agrees");
     return assert_summary();
 }
 

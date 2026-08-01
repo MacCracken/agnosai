@@ -66,12 +66,17 @@ fn agnosai_default_trust_level(): i64 {
 }
 
 # The snake_case wire spelling of a crew status.
+fn agnosai_crew_status_to_wire_a(a, status): i64 {
+    if (status == AGNOSAI_CREW_RUNNING) { return str_from_a(a, "running"); }
+    if (status == AGNOSAI_CREW_COMPLETED) { return str_from_a(a, "completed"); }
+    if (status == AGNOSAI_CREW_FAILED) { return str_from_a(a, "failed"); }
+    if (status == AGNOSAI_CREW_CANCELLED) { return str_from_a(a, "cancelled"); }
+    return str_from_a(a, "pending");
+}
+
+# Global-allocator form of `agnosai_crew_status_to_wire_a`.
 fn agnosai_crew_status_to_wire(status): i64 {
-    if (status == AGNOSAI_CREW_RUNNING) { return str_from("running"); }
-    if (status == AGNOSAI_CREW_COMPLETED) { return str_from("completed"); }
-    if (status == AGNOSAI_CREW_FAILED) { return str_from("failed"); }
-    if (status == AGNOSAI_CREW_CANCELLED) { return str_from("cancelled"); }
-    return str_from("pending");
+    return agnosai_crew_status_to_wire_a(default_alloc(), status);
 }
 
 # A crew status from its wire spelling. Unknown spellings fall back to the
@@ -163,31 +168,38 @@ fn agnosai_crew_trust_level(c): i64 {
 }
 
 # The crew spec as a bayan JSON value, fields in declaration order.
-fn agnosai_crew_to_value(c): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("id"),
-    bayan_json_v_str_new(load64(c + AGN_CREW_ID)));
-    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(c + AGN_CREW_NAME)));
+fn agnosai_crew_to_value_a(a, c): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "id"),
+    bayan_json_v_str_new_a(a, load64(c + AGN_CREW_ID)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "name"), bayan_json_v_str_new_a(a, load64(c + AGN_CREW_NAME)));
 
     var agents = load64(c + AGN_CREW_AGENTS);
-    var agents_v = bayan_json_v_arr_new();
+    var agents_v = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(agents); i = i + 1) {
-        bayan_json_v_arr_push(agents_v, agnosai_agent_to_value(vec_get(agents, i)));
+        bayan_json_v_arr_push_a(a, agents_v, agnosai_agent_to_value_a(a, vec_get(agents, i)));
     }
-    bayan_json_v_obj_set(obj, str_from("agents"), agents_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "agents"), agents_v);
 
     var tasks = load64(c + AGN_CREW_TASKS);
-    var tasks_v = bayan_json_v_arr_new();
+    var tasks_v = bayan_json_v_arr_new_a(a);
     for (var j = 0; j < vec_len(tasks); j = j + 1) {
-        bayan_json_v_arr_push(tasks_v, agnosai_task_to_value(vec_get(tasks, j)));
+        bayan_json_v_arr_push_a(a, tasks_v, agnosai_task_to_value_a(a, vec_get(tasks, j)));
     }
-    bayan_json_v_obj_set(obj, str_from("tasks"), tasks_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "tasks"), tasks_v);
 
-    bayan_json_v_obj_set(obj, str_from("process"), agnosai_process_to_value(load64(c + AGN_CREW_PROCESS)));
-    bayan_json_v_obj_set(obj, str_from("metadata"), _agnosai_map_to_value(load64(c + AGN_CREW_METADATA)));
-    bayan_json_v_obj_set(obj, str_from("trust_level"),
-    bayan_json_v_str_new(load64(c + AGN_CREW_TRUST_LEVEL)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "process"),
+    agnosai_process_to_value_a(a, load64(c + AGN_CREW_PROCESS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "metadata"),
+    _agnosai_map_to_value_a(a, load64(c + AGN_CREW_METADATA)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "trust_level"),
+    bayan_json_v_str_new_a(a, load64(c + AGN_CREW_TRUST_LEVEL)));
     return obj;
+}
+
+# Global-allocator form of `agnosai_crew_to_value_a`.
+fn agnosai_crew_to_value(c): i64 {
+    return agnosai_crew_to_value_a(default_alloc(), c);
 }
 
 # Rebuild a crew spec from a bayan JSON value. Returns 0 when the value is not
@@ -235,8 +247,13 @@ fn agnosai_crew_from_value(v): i64 {
 }
 
 # The crew spec serialized to JSON text.
+fn agnosai_crew_to_json_a(a, c): i64 {
+    return bayan_json_v_build_a(a, agnosai_crew_to_value_a(a, c));
+}
+
+# Global-allocator form of `agnosai_crew_to_json_a`.
 fn agnosai_crew_to_json(c): i64 {
-    return bayan_json_v_build(agnosai_crew_to_value(c));
+    return agnosai_crew_to_json_a(default_alloc(), c);
 }
 
 # Parse a crew spec from JSON text. Returns 0 on a parse error or a malformed
@@ -339,14 +356,22 @@ fn agnosai_crew_profile_with_sandbox_strength(p, strength): i64 {
 
 # Serialize a Str-keyed map of micro-USD amounts as a JSON object of dollar
 # numbers — the shape the oracle's `HashMap<_, f64>` emitted.
-fn _agnosai_cost_map_to_value(m): i64 {
-    var obj = bayan_json_v_obj_new();
-    var keys = map_keys(m);
-    for (var i = 0; i < vec_len(keys); i = i + 1) {
-        var k = vec_get(keys, i);
-        bayan_json_v_obj_set(obj, k, bayan_json_v_float_new(agnosai_micro_usd_to_f64(map_get(m, k))));
+fn _agnosai_cost_map_to_value_a(a, m): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    # Slot walk, not map_keys — see _agnosai_map_slots in src/core/json.cyr.
+    var n = _agnosai_map_slots(m);
+    for (var i = 0; i < n; i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            bayan_json_v_obj_set_a(a, obj, _agnosai_map_slot_key(m, i),
+            bayan_json_v_float_new_a(a, agnosai_micro_usd_to_f64(_agnosai_map_slot_val(m, i))));
+        }
     }
     return obj;
+}
+
+# Global-allocator form of `_agnosai_cost_map_to_value_a`.
+fn _agnosai_cost_map_to_value(m): i64 {
+    return _agnosai_cost_map_to_value_a(default_alloc(), m);
 }
 
 # Rebuild a Str-keyed map of micro-USD amounts from a JSON object of dollar
@@ -369,14 +394,22 @@ fn _agnosai_cost_map_from_value(v): i64 {
 }
 
 # Serialize a Str-keyed map of plain integers as a JSON object.
-fn _agnosai_int_map_to_value(m): i64 {
-    var obj = bayan_json_v_obj_new();
-    var keys = map_keys(m);
-    for (var i = 0; i < vec_len(keys); i = i + 1) {
-        var k = vec_get(keys, i);
-        bayan_json_v_obj_set(obj, k, bayan_json_v_int_new(map_get(m, k)));
+fn _agnosai_int_map_to_value_a(a, m): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    # Slot walk, not map_keys — see _agnosai_map_slots in src/core/json.cyr.
+    var n = _agnosai_map_slots(m);
+    for (var i = 0; i < n; i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            bayan_json_v_obj_set_a(a, obj, _agnosai_map_slot_key(m, i),
+            bayan_json_v_int_new_a(a, _agnosai_map_slot_val(m, i)));
+        }
     }
     return obj;
+}
+
+# Global-allocator form of `_agnosai_int_map_to_value_a`.
+fn _agnosai_int_map_to_value(m): i64 {
+    return _agnosai_int_map_to_value_a(default_alloc(), m);
 }
 
 # Rebuild a Str-keyed map of plain integers from a JSON object.
@@ -398,34 +431,40 @@ fn _agnosai_int_map_from_value(v): i64 {
 # `cost_usd` is omitted when zero and the two cost maps are omitted when empty,
 # matching the oracle's `skip_serializing_if`. Those omissions are wire-visible,
 # so they are held exactly.
-fn agnosai_crew_profile_to_value(p): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("wall_ms"), bayan_json_v_int_new(load64(p + AGN_PROF_WALL_MS)));
-    bayan_json_v_obj_set(obj, str_from("task_ms"), _agnosai_int_map_to_value(load64(p + AGN_PROF_TASK_MS)));
-    bayan_json_v_obj_set(obj, str_from("task_count"),
-    bayan_json_v_int_new(load64(p + AGN_PROF_TASK_COUNT)));
+fn agnosai_crew_profile_to_value_a(a, p): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "wall_ms"), bayan_json_v_int_new_a(a, load64(p + AGN_PROF_WALL_MS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_ms"),
+    _agnosai_int_map_to_value_a(a, load64(p + AGN_PROF_TASK_MS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_count"),
+    bayan_json_v_int_new_a(a, load64(p + AGN_PROF_TASK_COUNT)));
 
     var cost = load64(p + AGN_PROF_COST_MICRO_USD);
     if (cost != 0) {
-        bayan_json_v_obj_set(obj, str_from("cost_usd"),
-        bayan_json_v_float_new(agnosai_micro_usd_to_f64(cost)));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "cost_usd"),
+        bayan_json_v_float_new_a(a, agnosai_micro_usd_to_f64(cost)));
     }
 
     var agent_cost = load64(p + AGN_PROF_AGENT_COST);
     if (map_size(agent_cost) > 0) {
-        bayan_json_v_obj_set(obj, str_from("agent_cost_usd"), _agnosai_cost_map_to_value(agent_cost));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "agent_cost_usd"), _agnosai_cost_map_to_value_a(a, agent_cost));
     }
 
     var task_cost = load64(p + AGN_PROF_TASK_COST);
     if (map_size(task_cost) > 0) {
-        bayan_json_v_obj_set(obj, str_from("task_cost_usd"), _agnosai_cost_map_to_value(task_cost));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_cost_usd"), _agnosai_cost_map_to_value_a(a, task_cost));
     }
 
     var strength = load64(p + AGN_PROF_SANDBOX_STRENGTH);
     if (strength != AGNOSAI_NO_LIMIT) {
-        bayan_json_v_obj_set(obj, str_from("sandbox_strength"), bayan_json_v_int_new(strength));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "sandbox_strength"), bayan_json_v_int_new_a(a, strength));
     }
     return obj;
+}
+
+# Global-allocator form of `agnosai_crew_profile_to_value_a`.
+fn agnosai_crew_profile_to_value(p): i64 {
+    return agnosai_crew_profile_to_value_a(default_alloc(), p);
 }
 
 # Rebuild a profile from a bayan JSON value. Every field is `#[serde(default)]`
@@ -507,25 +546,30 @@ fn agnosai_crew_state_with_result(s, result): i64 {
 
 # The crew state as a bayan JSON value. `profile` is **omitted** when unset,
 # matching the oracle's `skip_serializing_if = "Option::is_none"`.
-fn agnosai_crew_state_to_value(s): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("crew_id"),
-    bayan_json_v_str_new(load64(s + AGN_CSTATE_CREW_ID)));
-    bayan_json_v_obj_set(obj, str_from("status"),
-    bayan_json_v_str_new(agnosai_crew_status_to_wire(load64(s + AGN_CSTATE_STATUS))));
+fn agnosai_crew_state_to_value_a(a, s): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "crew_id"),
+    bayan_json_v_str_new_a(a, load64(s + AGN_CSTATE_CREW_ID)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"),
+    bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire_a(a, load64(s + AGN_CSTATE_STATUS))));
 
     var results = load64(s + AGN_CSTATE_RESULTS);
-    var results_v = bayan_json_v_arr_new();
+    var results_v = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(results); i = i + 1) {
-        bayan_json_v_arr_push(results_v, agnosai_task_result_to_value(vec_get(results, i)));
+        bayan_json_v_arr_push_a(a, results_v, agnosai_task_result_to_value_a(a, vec_get(results, i)));
     }
-    bayan_json_v_obj_set(obj, str_from("results"), results_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "results"), results_v);
 
     var profile = load64(s + AGN_CSTATE_PROFILE);
     if (profile != 0) {
-        bayan_json_v_obj_set(obj, str_from("profile"), agnosai_crew_profile_to_value(profile));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "profile"), agnosai_crew_profile_to_value_a(a, profile));
     }
     return obj;
+}
+
+# Global-allocator form of `agnosai_crew_state_to_value_a`.
+fn agnosai_crew_state_to_value(s): i64 {
+    return agnosai_crew_state_to_value_a(default_alloc(), s);
 }
 
 # Rebuild a crew state from a bayan JSON value. Returns 0 when `crew_id` is

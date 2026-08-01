@@ -53,13 +53,18 @@ fn agnosai_default_complexity(): i64 {
 }
 
 # The snake_case wire spelling of an agent state.
+fn agnosai_agent_state_to_wire_a(a, state): i64 {
+    if (state == AGNOSAI_AGENT_ASSIGNED) { return str_from_a(a, "assigned"); }
+    if (state == AGNOSAI_AGENT_WORKING) { return str_from_a(a, "working"); }
+    if (state == AGNOSAI_AGENT_BLOCKED) { return str_from_a(a, "blocked"); }
+    if (state == AGNOSAI_AGENT_COMPLETED) { return str_from_a(a, "completed"); }
+    if (state == AGNOSAI_AGENT_FAILED) { return str_from_a(a, "failed"); }
+    return str_from_a(a, "idle");
+}
+
+# Global-allocator form of `agnosai_agent_state_to_wire_a`.
 fn agnosai_agent_state_to_wire(state): i64 {
-    if (state == AGNOSAI_AGENT_ASSIGNED) { return str_from("assigned"); }
-    if (state == AGNOSAI_AGENT_WORKING) { return str_from("working"); }
-    if (state == AGNOSAI_AGENT_BLOCKED) { return str_from("blocked"); }
-    if (state == AGNOSAI_AGENT_COMPLETED) { return str_from("completed"); }
-    if (state == AGNOSAI_AGENT_FAILED) { return str_from("failed"); }
-    return str_from("idle");
+    return agnosai_agent_state_to_wire_a(default_alloc(), state);
 }
 
 # An agent state from its wire spelling. Unknown spellings fall back to the
@@ -231,41 +236,48 @@ fn agnosai_agent_hardware_requirement(a): i64 {
 
 # The agent definition as a bayan JSON value, fields in declaration order.
 # `personality` is emitted as null — see the module note.
-fn agnosai_agent_to_value(a): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("agent_key"), bayan_json_v_str_new(load64(a + AGN_AGENT_KEY)));
-    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(a + AGN_AGENT_NAME)));
-    bayan_json_v_obj_set(obj, str_from("role"), bayan_json_v_str_new(load64(a + AGN_AGENT_ROLE)));
-    bayan_json_v_obj_set(obj, str_from("goal"), bayan_json_v_str_new(load64(a + AGN_AGENT_GOAL)));
-    bayan_json_v_obj_set(obj, str_from("backstory"),
-    _agnosai_opt_str_to_value(load64(a + AGN_AGENT_BACKSTORY)));
-    bayan_json_v_obj_set(obj, str_from("domain"), _agnosai_opt_str_to_value(load64(a + AGN_AGENT_DOMAIN)));
+fn agnosai_agent_to_value_a(_al, a): i64 {
+    var obj = bayan_json_v_obj_new_a(_al);
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "agent_key"),
+    bayan_json_v_str_new_a(_al, load64(a + AGN_AGENT_KEY)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "name"), bayan_json_v_str_new_a(_al, load64(a + AGN_AGENT_NAME)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "role"), bayan_json_v_str_new_a(_al, load64(a + AGN_AGENT_ROLE)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "goal"), bayan_json_v_str_new_a(_al, load64(a + AGN_AGENT_GOAL)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "backstory"),
+    _agnosai_opt_str_to_value_a(_al, load64(a + AGN_AGENT_BACKSTORY)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "domain"),
+    _agnosai_opt_str_to_value_a(_al, load64(a + AGN_AGENT_DOMAIN)));
 
     var tools = load64(a + AGN_AGENT_TOOLS);
-    var tools_v = bayan_json_v_arr_new();
+    var tools_v = bayan_json_v_arr_new_a(_al);
     for (var i = 0; i < vec_len(tools); i = i + 1) {
-        bayan_json_v_arr_push(tools_v, bayan_json_v_str_new(vec_get(tools, i)));
+        bayan_json_v_arr_push_a(_al, tools_v, bayan_json_v_str_new_a(_al, vec_get(tools, i)));
     }
-    bayan_json_v_obj_set(obj, str_from("tools"), tools_v);
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "tools"), tools_v);
 
-    bayan_json_v_obj_set(obj, str_from("complexity"),
-    bayan_json_v_str_new(load64(a + AGN_AGENT_COMPLEXITY)));
-    bayan_json_v_obj_set(obj, str_from("llm_model"),
-    _agnosai_opt_str_to_value(load64(a + AGN_AGENT_LLM_MODEL)));
-    bayan_json_v_obj_set(obj, str_from("gpu_required"),
-    _agnosai_bool_to_value(load64(a + AGN_AGENT_GPU_REQUIRED)));
-    bayan_json_v_obj_set(obj, str_from("gpu_preferred"),
-    _agnosai_bool_to_value(load64(a + AGN_AGENT_GPU_PREFERRED)));
-    bayan_json_v_obj_set(obj, str_from("gpu_memory_min_mb"),
-    _agnosai_opt_int_to_value(load64(a + AGN_AGENT_GPU_MEMORY_MIN_MB)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "complexity"),
+    bayan_json_v_str_new_a(_al, load64(a + AGN_AGENT_COMPLEXITY)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "llm_model"),
+    _agnosai_opt_str_to_value_a(_al, load64(a + AGN_AGENT_LLM_MODEL)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "gpu_required"),
+    _agnosai_bool_to_value_a(_al, load64(a + AGN_AGENT_GPU_REQUIRED)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "gpu_preferred"),
+    _agnosai_bool_to_value_a(_al, load64(a + AGN_AGENT_GPU_PREFERRED)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "gpu_memory_min_mb"),
+    _agnosai_opt_int_to_value_a(_al, load64(a + AGN_AGENT_GPU_MEMORY_MIN_MB)));
 
     var hw = load64(a + AGN_AGENT_HARDWARE);
-    var hw_v = bayan_json_v_null();
-    if (hw != 0) { hw_v = agnosai_hw_requirement_to_value(hw); }
-    bayan_json_v_obj_set(obj, str_from("hardware"), hw_v);
+    var hw_v = bayan_json_v_null_a(_al);
+    if (hw != 0) { hw_v = agnosai_hw_requirement_to_value_a(_al, hw); }
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "hardware"), hw_v);
 
-    bayan_json_v_obj_set(obj, str_from("personality"), bayan_json_v_null());
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "personality"), bayan_json_v_null_a(_al));
     return obj;
+}
+
+# Global-allocator form of `agnosai_agent_to_value_a`.
+fn agnosai_agent_to_value(a): i64 {
+    return agnosai_agent_to_value_a(default_alloc(), a);
 }
 
 # Rebuild an agent definition from a bayan JSON value. Returns 0 when the value
@@ -318,8 +330,13 @@ fn agnosai_agent_from_value(v): i64 {
 }
 
 # The agent definition serialized to JSON text.
+fn agnosai_agent_to_json_a(_al, a): i64 {
+    return bayan_json_v_build_a(_al, agnosai_agent_to_value_a(_al, a));
+}
+
+# Global-allocator form of `agnosai_agent_to_json_a`.
 fn agnosai_agent_to_json(a): i64 {
-    return bayan_json_v_build(agnosai_agent_to_value(a));
+    return agnosai_agent_to_json_a(default_alloc(), a);
 }
 
 # Deserialize an agent definition from JSON text. Returns 0 on a parse error or

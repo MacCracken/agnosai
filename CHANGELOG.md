@@ -72,6 +72,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from command output rather than editing rows by hand").
 
 ### Performance
+- **The whole `core` group builds on a per-request arena — a 10-agent, 10-task
+  crew serialization drops 44,032 → 0 bytes on the global bump**, and runs 11%
+  faster (171 → 152 µs). `core/json`, `core/task`, `core/resource`, `core/agent`,
+  `core/message` and `core/crew` are threaded end to end: 27 `_a` forms, each with
+  the bare name delegating through `default_alloc()`.
+
+  Every `_a` form is pinned as **agreeing byte-for-byte with its global twin** —
+  that is the correctness claim the whole conversion rests on, and it is the only
+  assertion that would catch a substitution which silently changed a *value*
+  rather than just where it was allocated.
+
+  **Two bugs found doing it, both worth recording:**
+
+  1. **`fn agnosai_agent_to_value_a(a, a)` — Cyrius accepted a duplicate parameter
+     name silently.** The original parameter was already `a` (the agent pointer),
+     and prepending an allocator also called `a` compiled clean; every
+     `load64(a + AGN_AGENT_OFFSET)` then read the *allocator* and the suite
+     SIGSEGV'd with no assertion output. The conversion now picks a non-colliding
+     allocator name. This is the sharp edge of one flat namespace plus no arity or
+     shadowing diagnostic — a rename that looks mechanical is not.
+  2. **`map_keys` is the recurring residue.** It materialises a key vec through
+     `vec_new()` on the global bump and has no `_a` form, so it survives every
+     other substitution and silently caps the win. It appeared again in
+     `agnosai_task_dag_to_value` and in crew's two cost/int map helpers after the
+     first fix. `src/core/json.cyr` now exposes `_agnosai_map_slots` /
+     `_slot_live` / `_slot_key` / `_slot_val` over the documented hashmap layout
+     (`lib/hashmap.cyr:22-35`), guarded on `key_type == 2`, so the layout has one
+     place to be wrong instead of four. Expect it in any module that serialises a
+     map.
+
 - **A task response can now be built entirely on a per-request arena — 1944 → 0
   bytes on the global bump.** Toolchain pin **6.5.4 → 6.5.5**, which folds
   **bayan 1.4.0** and its completed `_a` JSON surface. `lib/` matches the pin

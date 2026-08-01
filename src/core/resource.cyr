@@ -91,12 +91,17 @@ enum AgnosaiGpuDeviceOff {
 }
 
 # The snake_case wire spelling of an accelerator family.
+fn agnosai_accelerator_family_to_wire_a(a, family): i64 {
+    if (family == AGNOSAI_FAMILY_GPU) { return str_from_a(a, "gpu"); }
+    if (family == AGNOSAI_FAMILY_NPU) { return str_from_a(a, "npu"); }
+    if (family == AGNOSAI_FAMILY_TPU) { return str_from_a(a, "tpu"); }
+    if (family == AGNOSAI_FAMILY_AI_ASIC) { return str_from_a(a, "ai_asic"); }
+    return str_from_a(a, "cpu");
+}
+
+# Global-allocator form of `agnosai_accelerator_family_to_wire_a`.
 fn agnosai_accelerator_family_to_wire(family): i64 {
-    if (family == AGNOSAI_FAMILY_GPU) { return str_from("gpu"); }
-    if (family == AGNOSAI_FAMILY_NPU) { return str_from("npu"); }
-    if (family == AGNOSAI_FAMILY_TPU) { return str_from("tpu"); }
-    if (family == AGNOSAI_FAMILY_AI_ASIC) { return str_from("ai_asic"); }
-    return str_from("cpu");
+    return agnosai_accelerator_family_to_wire_a(default_alloc(), family);
 }
 
 # An accelerator family from its wire spelling. Unknown spellings read as Cpu.
@@ -109,13 +114,18 @@ fn agnosai_accelerator_family_from_wire(s: Str): i64 {
 }
 
 # The snake_case wire spelling of an accelerator type.
+fn agnosai_accelerator_type_to_wire_a(a, accel): i64 {
+    if (accel == AGNOSAI_ACCEL_CUDA) { return str_from_a(a, "cuda"); }
+    if (accel == AGNOSAI_ACCEL_ROCM) { return str_from_a(a, "rocm"); }
+    if (accel == AGNOSAI_ACCEL_METAL) { return str_from_a(a, "metal"); }
+    if (accel == AGNOSAI_ACCEL_VULKAN) { return str_from_a(a, "vulkan"); }
+    if (accel == AGNOSAI_ACCEL_TPU) { return str_from_a(a, "tpu"); }
+    return str_from_a(a, "cpu");
+}
+
+# Global-allocator form of `agnosai_accelerator_type_to_wire_a`.
 fn agnosai_accelerator_type_to_wire(accel): i64 {
-    if (accel == AGNOSAI_ACCEL_CUDA) { return str_from("cuda"); }
-    if (accel == AGNOSAI_ACCEL_ROCM) { return str_from("rocm"); }
-    if (accel == AGNOSAI_ACCEL_METAL) { return str_from("metal"); }
-    if (accel == AGNOSAI_ACCEL_VULKAN) { return str_from("vulkan"); }
-    if (accel == AGNOSAI_ACCEL_TPU) { return str_from("tpu"); }
-    return str_from("cpu");
+    return agnosai_accelerator_type_to_wire_a(default_alloc(), accel);
 }
 
 # An accelerator type from its wire spelling. Unknown spellings read as Cpu.
@@ -190,17 +200,22 @@ fn agnosai_compute_device_memory_available_mb(d): i64 {
 }
 
 # A compute device as a bayan JSON value.
-fn agnosai_compute_device_to_value(d): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("index"), bayan_json_v_int_new(load64(d + AGN_DEV_INDEX)));
-    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(d + AGN_DEV_NAME)));
-    var accel = agnosai_accelerator_type_to_wire(load64(d + AGN_DEV_ACCELERATOR));
-    bayan_json_v_obj_set(obj, str_from("accelerator"), bayan_json_v_str_new(accel));
-    bayan_json_v_obj_set(obj, str_from("memory_total_mb"),
-    bayan_json_v_int_new(load64(d + AGN_DEV_MEMORY_TOTAL_MB)));
-    bayan_json_v_obj_set(obj, str_from("memory_available_mb"),
-    bayan_json_v_int_new(load64(d + AGN_DEV_MEMORY_AVAILABLE_MB)));
+fn agnosai_compute_device_to_value_a(a, d): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "index"), bayan_json_v_int_new_a(a, load64(d + AGN_DEV_INDEX)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "name"), bayan_json_v_str_new_a(a, load64(d + AGN_DEV_NAME)));
+    var accel = agnosai_accelerator_type_to_wire_a(a, load64(d + AGN_DEV_ACCELERATOR));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "accelerator"), bayan_json_v_str_new_a(a, accel));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "memory_total_mb"),
+    bayan_json_v_int_new_a(a, load64(d + AGN_DEV_MEMORY_TOTAL_MB)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "memory_available_mb"),
+    bayan_json_v_int_new_a(a, load64(d + AGN_DEV_MEMORY_AVAILABLE_MB)));
     return obj;
+}
+
+# Global-allocator form of `agnosai_compute_device_to_value_a`.
+fn agnosai_compute_device_to_value(d): i64 {
+    return agnosai_compute_device_to_value_a(default_alloc(), d);
 }
 
 # Rebuild a compute device from a bayan JSON value, or 0 when not an object.
@@ -293,28 +308,33 @@ fn agnosai_hw_requirement_required_family(r): i64 {
 # A hardware requirement as a bayan JSON value. `required_family` is **omitted**
 # rather than emitted as null when unset — the oracle marks that one field
 # `skip_serializing_if = "Option::is_none"`.
-fn agnosai_hw_requirement_to_value(r): i64 {
-    var obj = bayan_json_v_obj_new();
+fn agnosai_hw_requirement_to_value_a(a, r): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
     var accels = load64(r + AGN_REQ_ACCELERATORS);
-    var arr = bayan_json_v_arr_new();
+    var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(accels); i = i + 1) {
-        var w = agnosai_accelerator_type_to_wire(vec_get(accels, i));
-        bayan_json_v_arr_push(arr, bayan_json_v_str_new(w));
+        var w = agnosai_accelerator_type_to_wire_a(a, vec_get(accels, i));
+        bayan_json_v_arr_push_a(a, arr, bayan_json_v_str_new_a(a, w));
     }
-    bayan_json_v_obj_set(obj, str_from("accelerators"), arr);
-    bayan_json_v_obj_set(obj, str_from("min_memory_mb"),
-    bayan_json_v_int_new(load64(r + AGN_REQ_MIN_MEMORY_MB)));
-    bayan_json_v_obj_set(obj, str_from("min_device_count"),
-    bayan_json_v_int_new(load64(r + AGN_REQ_MIN_DEVICE_COUNT)));
-    bayan_json_v_obj_set(obj, str_from("min_cpu_cores"),
-    bayan_json_v_int_new(load64(r + AGN_REQ_MIN_CPU_CORES)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "accelerators"), arr);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "min_memory_mb"),
+    bayan_json_v_int_new_a(a, load64(r + AGN_REQ_MIN_MEMORY_MB)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "min_device_count"),
+    bayan_json_v_int_new_a(a, load64(r + AGN_REQ_MIN_DEVICE_COUNT)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "min_cpu_cores"),
+    bayan_json_v_int_new_a(a, load64(r + AGN_REQ_MIN_CPU_CORES)));
 
     var fam = load64(r + AGN_REQ_REQUIRED_FAMILY);
     if (fam != AGNOSAI_NO_LIMIT) {
-        bayan_json_v_obj_set(obj, str_from("required_family"),
-        bayan_json_v_str_new(agnosai_accelerator_family_to_wire(fam)));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "required_family"),
+        bayan_json_v_str_new_a(a, agnosai_accelerator_family_to_wire_a(a, fam)));
     }
     return obj;
+}
+
+# Global-allocator form of `agnosai_hw_requirement_to_value_a`.
+fn agnosai_hw_requirement_to_value(r): i64 {
+    return agnosai_hw_requirement_to_value_a(default_alloc(), r);
 }
 
 # Rebuild a hardware requirement from a bayan JSON value. Every field is
@@ -491,23 +511,28 @@ fn agnosai_f64_to_micro_usd(usd): i64 {
 # wire name and goes out as a JSON number in dollars — bayan's Grisu2 emits the
 # shortest round-tripping form, so 2500 micro-USD renders as `0.0025`, exactly
 # as serde rendered the f64.
-fn agnosai_resource_budget_to_value(b): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("max_tokens"),
-    _agnosai_opt_int_to_value(load64(b + AGN_BUD_MAX_TOKENS)));
+fn agnosai_resource_budget_to_value_a(a, b): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_tokens"),
+    _agnosai_opt_int_to_value_a(a, load64(b + AGN_BUD_MAX_TOKENS)));
 
     var micro = load64(b + AGN_BUD_MAX_COST_MICRO_USD);
-    var cost_v = bayan_json_v_null();
+    var cost_v = bayan_json_v_null_a(a);
     if (micro != AGNOSAI_NO_LIMIT) {
-        cost_v = bayan_json_v_float_new(agnosai_micro_usd_to_f64(micro));
+        cost_v = bayan_json_v_float_new_a(a, agnosai_micro_usd_to_f64(micro));
     }
-    bayan_json_v_obj_set(obj, str_from("max_cost_usd"), cost_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_cost_usd"), cost_v);
 
-    bayan_json_v_obj_set(obj, str_from("max_duration_secs"),
-    _agnosai_opt_int_to_value(load64(b + AGN_BUD_MAX_DURATION_SECS)));
-    bayan_json_v_obj_set(obj, str_from("max_concurrent_tasks"),
-    _agnosai_opt_int_to_value(load64(b + AGN_BUD_MAX_CONCURRENT_TASKS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_duration_secs"),
+    _agnosai_opt_int_to_value_a(a, load64(b + AGN_BUD_MAX_DURATION_SECS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_concurrent_tasks"),
+    _agnosai_opt_int_to_value_a(a, load64(b + AGN_BUD_MAX_CONCURRENT_TASKS)));
     return obj;
+}
+
+# Global-allocator form of `agnosai_resource_budget_to_value_a`.
+fn agnosai_resource_budget_to_value(b): i64 {
+    return agnosai_resource_budget_to_value_a(default_alloc(), b);
 }
 
 # Rebuild a resource budget from a bayan JSON value. `max_cost_usd` is accepted
@@ -561,15 +586,20 @@ fn agnosai_gpu_device_vram_available_mb(g): i64 {
 }
 
 # A GPU device as a bayan JSON value.
-fn agnosai_gpu_device_to_value(g): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("index"), bayan_json_v_int_new(load64(g + AGN_GPU_INDEX)));
-    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(g + AGN_GPU_NAME)));
-    bayan_json_v_obj_set(obj, str_from("vram_total_mb"),
-    bayan_json_v_int_new(load64(g + AGN_GPU_VRAM_TOTAL_MB)));
-    bayan_json_v_obj_set(obj, str_from("vram_available_mb"),
-    bayan_json_v_int_new(load64(g + AGN_GPU_VRAM_AVAILABLE_MB)));
+fn agnosai_gpu_device_to_value_a(a, g): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "index"), bayan_json_v_int_new_a(a, load64(g + AGN_GPU_INDEX)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "name"), bayan_json_v_str_new_a(a, load64(g + AGN_GPU_NAME)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "vram_total_mb"),
+    bayan_json_v_int_new_a(a, load64(g + AGN_GPU_VRAM_TOTAL_MB)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "vram_available_mb"),
+    bayan_json_v_int_new_a(a, load64(g + AGN_GPU_VRAM_AVAILABLE_MB)));
     return obj;
+}
+
+# Global-allocator form of `agnosai_gpu_device_to_value_a`.
+fn agnosai_gpu_device_to_value(g): i64 {
+    return agnosai_gpu_device_to_value_a(default_alloc(), g);
 }
 
 # Rebuild a GPU device from a bayan JSON value, or 0 when not an object.
@@ -583,18 +613,24 @@ fn agnosai_gpu_device_from_value(v): i64 {
 }
 
 # A hardware inventory as a bayan JSON value.
-fn agnosai_hw_inventory_to_value(inv): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("cpu_cores"), bayan_json_v_int_new(load64(inv + AGN_INV_CPU_CORES)));
-    bayan_json_v_obj_set(obj, str_from("memory_total_mb"),
-    bayan_json_v_int_new(load64(inv + AGN_INV_MEMORY_TOTAL_MB)));
+fn agnosai_hw_inventory_to_value_a(a, inv): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "cpu_cores"),
+    bayan_json_v_int_new_a(a, load64(inv + AGN_INV_CPU_CORES)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "memory_total_mb"),
+    bayan_json_v_int_new_a(a, load64(inv + AGN_INV_MEMORY_TOTAL_MB)));
     var devices = load64(inv + AGN_INV_DEVICES);
-    var arr = bayan_json_v_arr_new();
+    var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(devices); i = i + 1) {
-        bayan_json_v_arr_push(arr, agnosai_compute_device_to_value(vec_get(devices, i)));
+        bayan_json_v_arr_push_a(a, arr, agnosai_compute_device_to_value_a(a, vec_get(devices, i)));
     }
-    bayan_json_v_obj_set(obj, str_from("devices"), arr);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "devices"), arr);
     return obj;
+}
+
+# Global-allocator form of `agnosai_hw_inventory_to_value_a`.
+fn agnosai_hw_inventory_to_value(inv): i64 {
+    return agnosai_hw_inventory_to_value_a(default_alloc(), inv);
 }
 
 # Rebuild a hardware inventory from a bayan JSON value.
