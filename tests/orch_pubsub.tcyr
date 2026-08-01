@@ -155,6 +155,24 @@ fn main() {
     assert_eq(agnosai_chan_push_lossy(closed, 1), AGNOSAI_CHAN_CLOSED,
     "a closed channel is reported, since that is not a capacity problem");
 
+    # The three non-zero returns must be mutually distinct, or a caller counting
+    # lag cannot tell "stored, evicted one" from "dropped this one" from "gone".
+    # AGNOSAI_CHAN_DROPPED is only reachable with concurrent producers on one
+    # topic — a single producer always wins the slot its own eviction freed — so
+    # what is pinned here is the contract, not a reachable race.
+    assert_neq(AGNOSAI_CHAN_DROPPED, AGNOSAI_CHAN_CLOSED,
+    "DROPPED and CLOSED are distinct — the first cut returned 1 for a drop, which \
+    reported a lost event as delivered");
+    assert_neq(AGNOSAI_CHAN_DROPPED, 1,
+    "DROPPED is distinct from the stored-after-evicting case");
+    assert_eq(AGNOSAI_CHAN_DROPPED, 0 - 2, "DROPPED is -2");
+
+    # A ring that has room takes the value with no eviction and no drop, so the
+    # normal path still reports 0 after the added branch.
+    var okch = chan_new(2);
+    assert_eq(agnosai_chan_push_lossy(okch, 7), 0,
+    "the added DROPPED branch does not disturb the ordinary success path");
+
     # =====================================================================
     # the hub
     # =====================================================================

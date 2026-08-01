@@ -396,7 +396,7 @@ criterion statistics. The Cyrius line starts its own baseline, captured by
 base substrate · general utilities · bayan · patra · concurrency+crypto floor ·
 dynamic-link floor · async · net/http/tls/ws/sakshi/sandhi
 
-**git deps** (declare-ahead pattern): sigil 3.12.1 · bote 3.1.4 (core profile) ·
+**git deps** (declare-ahead pattern, read from `cyrius.cyml` 2026-07-31): sigil 3.12.2 · bote 3.2.1 (core profile) ·
 majra 2.5.3 · kavach 3.9.3 · ai-hwaccel 2.3.16 · tyche 1.0.0 — each matching its
 repo's newest tag as of 2026-07-30.
 The hoosh seam targets **hoosh 2.6.0** — `usage.cost_micro_usd`, `usage.provider` and
@@ -482,7 +482,7 @@ kiran (game AI) — none consuming the Cyrius line yet.
 from M6 (`server/sse`, `server/prompt_guard`) and an `orch_audit` chain the
 hoosh seam cannot delegate.
 
-**M6 — `server` is 6 of 21 files.** The plan's pure-leaf sequence is finished:
+**M6 — `server` is 20 of 21 files.** The plan's pure-leaf sequence is finished:
 `ssrf`, `prompt_guard` and `sse` came forward as M5 blockers, `output_filter` and
 `prometheus` landed as M6 bites 1-2, and `auth.rs` is complete across bites 3-4.
 15 files remain, carrying 59 oracle tests of which **43 are `#[tokio::test]`**.

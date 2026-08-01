@@ -236,7 +236,13 @@ fn agnosai_event_sender_send(tx, event): i64 {
     var n = vec_len(subs);
     for (var i = 0; i < n; i = i + 1) {
         var sub = vec_get(subs, i);
-        if (agnosai_chan_push_lossy(load64(sub + AGN_ER_CHAN), event) == 1) {
+        # Both non-closed failure shapes mean this subscriber lost a message and
+        # both must count: 1 = stored after evicting the oldest, AGNOSAI_CHAN_DROPPED
+        # = the ring refilled before the retry, so THIS value went instead. Testing
+        # only `== 1` would have silently under-reported the second, which is the
+        # worse of the two to lose track of.
+        var _rc = agnosai_chan_push_lossy(load64(sub + AGN_ER_CHAN), event);
+        if (_rc == 1 || _rc == AGNOSAI_CHAN_DROPPED) {
             store64(sub + AGN_ER_LAGGED, load64(sub + AGN_ER_LAGGED) + 1);
         }
     }

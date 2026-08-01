@@ -27,17 +27,31 @@
 # The channel was closed — `chan_try_send`'s -1.
 var AGNOSAI_CHAN_CLOSED = 0 - 1;
 
+# The ring was still full after evicting the oldest, so this value was dropped
+# outright. Distinct from `AGNOSAI_CHAN_CLOSED` (the channel is gone) and from
+# 1 (stored, having evicted one). Only reachable with concurrent producers on
+# one topic: a single producer always wins the slot its own eviction freed.
+var AGNOSAI_CHAN_DROPPED = 0 - 2;
+
 # Push a value, evicting the oldest entry when the ring is full.
 #
-# Returns 0 when the value was stored with room to spare, **1 when it was stored
-# after evicting the oldest**, or `AGNOSAI_CHAN_CLOSED` when the channel is
-# closed. It cannot report "full", which is the point.
+# Returns:
 #
-# Distinguishing the two success cases is what lets a caller count what a slow
-# reader lost. tokio carries that count in `RecvError::Lagged(n)`, and a port
-# that collapsed both cases to 0 would drop events with no way to say so —
-# see `agnosai_event_sub_lagged` in `src/server/sse.cyr`. Callers that only care
-# whether the value landed can keep testing against `AGNOSAI_CHAN_CLOSED`.
+# | value | meaning |
+# |---|---|
+# | `0` | stored, with room to spare |
+# | `1` | stored, **after evicting the oldest** |
+# | `AGNOSAI_CHAN_DROPPED` (-2) | not stored — the ring refilled before the retry |
+# | `AGNOSAI_CHAN_CLOSED` (-1) | the channel is closed |
+#
+# It never blocks and never reports plain "full", which is the point.
+#
+# Distinguishing these is what lets a caller count what a slow reader lost.
+# tokio carries that count in `RecvError::Lagged(n)`, and a port that collapsed
+# them to 0 would drop events with no way to say so — see
+# `agnosai_event_sub_lagged` in `src/server/sse.cyr`, which counts **both** 1 and
+# `AGNOSAI_CHAN_DROPPED` because a message was lost either way. Callers that only
+# care whether the value landed can test `rc >= 0`.
 #
 # The eviction is a `chan_try_recv` that discards what it takes. Under
 # concurrency a receiver may consume that slot first, in which case the retry
@@ -49,6 +63,14 @@ var AGNOSAI_CHAN_CLOSED = 0 - 1;
 # The retry runs once. A second failure means other producers refilled the ring
 # between the two calls, and spinning until one wins would reintroduce exactly
 # the unbounded stall this exists to remove.
+#
+# When that retry also comes back full, the value was **not** stored — it was
+# dropped, and `AGNOSAI_CHAN_DROPPED` says so. The first cut returned 1 there,
+# claiming "stored after evicting", which made a dropped event look delivered to
+# the one caller that exists to count what a slow reader lost
+# (`agnosai_event_sub_lagged`). Single-producer-per-topic — the common case — can
+# never reach it, which is exactly why it needed writing down rather than
+# discovering later from a lag count that did not add up.
 fn agnosai_chan_push_lossy(ch, val): i64 {
     var rc = chan_try_send(ch, val);
     if (rc == 0) { return 0; }
@@ -58,5 +80,6 @@ fn agnosai_chan_push_lossy(ch, val): i64 {
     chan_try_recv(ch);
     rc = chan_try_send(ch, val);
     if (rc == AGNOSAI_CHAN_CLOSED) { return AGNOSAI_CHAN_CLOSED; }
+    if (rc != 0) { return AGNOSAI_CHAN_DROPPED; }
     return 1;
 }

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`agnosai_chan_push_lossy` reported a dropped event as delivered.** When the
+  post-eviction retry also came back full — another producer refilled the ring
+  between the two calls — it fell through to `return 1`, which the contract
+  defines as "stored, after evicting the oldest". Nothing was stored. The single
+  consumer of that distinction is `agnosai_event_sender_send`, whose whole job is
+  counting what a slow SSE reader lost, so the one caller that exists to measure
+  loss was told a lost message had landed.
+
+  New `AGNOSAI_CHAN_DROPPED` (-2), distinct from `AGNOSAI_CHAN_CLOSED` (-1) and
+  from 1. `agnosai_event_sender_send` now counts **both** 1 and
+  `AGNOSAI_CHAN_DROPPED` toward `AGN_ER_LAGGED`, because a message was lost
+  either way — testing only `== 1` would have under-reported the worse of the two.
+
+  Only reachable with concurrent producers on one topic: a single producer always
+  wins the slot its own eviction freed. That is exactly why it was worth writing
+  down rather than discovering later from a lag count that did not add up. Pinned
+  by four asserts in `tests/orch_pubsub.tcyr` on the contract (the three non-zero
+  returns are mutually distinct, and the ordinary success path still returns 0).
+
+### Changed
+- **`lib/mabda.cyr` re-synced 4.0.7 → 4.0.8** to match the 6.5.4 pin; `cyrius.lock`
+  updated. `lib/` now matches the pinned snapshot exactly — 0 of the stdlib files
+  differ — and the build emits no shadow or drift warning. (The remaining
+  not-in-snapshot entries are the git deps: ai-hwaccel, bote-core, kavach, libro,
+  majra, tyche.)
+- **`docs/development/state.md`: two internal contradictions corrected.** The gate
+  table said `server` was **20 of 21 files** while the handoff section 400 lines
+  later said **6 of 21**; 20 is right. And the git-dep list said sigil 3.12.1 /
+  bote 3.1.4 against `cyrius.cyml`'s 3.12.2 / 3.2.1 — the same hand-transcription
+  drift the file's own 2026-07-30 handoff note warns about ("regenerate the tables
+  from command output rather than editing rows by hand").
+
 ### Performance
 - **86 `str_eq(x, str_from("lit"))` comparisons → `str_eq_cstr(x, "lit")`.** Each
   of those sites allocated a fresh 16-byte `Str` header on the **no-free global
