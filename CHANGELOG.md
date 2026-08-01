@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
 - **`/metrics` reports real numbers — the ADR 011 producer is wired.**
   [ADR 011](docs/adr/011-metrics-endpoint-serves-agnosai-metrics.md) gave the
   endpoint agnosai's own registry and explicitly staged the recording side as a
@@ -29,336 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not a new divergence: ADR 011 names "crews created and active" in its decision
   and its Consequences section stages exactly this bite.
 
-### Fixed
-- **A cyclic DAG ratcheted the `crews_active` gauge upward forever.** Introduced
-  and caught within this change: the first cut recorded `crew_started` before the
-  DAG-cycle early return, which exits without recording a completion — so one
-  malformed spec permanently inflated the gauge for the life of the process. The
-  error path now balances it. It still emits no `crew_completed` **event** (a
-  cyclic spec is an error, not a crew that failed); the event stream and the
-  gauge are different contracts and only the event one is suppressed. Pinned by a
-  mutation-verified assertion in `tests/orch_crew_runner.tcyr` — deleting the
-  balancing call fails it.
-- **`agnosai_chan_push_lossy` reported a dropped event as delivered.** When the
-  post-eviction retry also came back full — another producer refilled the ring
-  between the two calls — it fell through to `return 1`, which the contract
-  defines as "stored, after evicting the oldest". Nothing was stored. The single
-  consumer of that distinction is `agnosai_event_sender_send`, whose whole job is
-  counting what a slow SSE reader lost, so the one caller that exists to measure
-  loss was told a lost message had landed.
-
-  New `AGNOSAI_CHAN_DROPPED` (-2), distinct from `AGNOSAI_CHAN_CLOSED` (-1) and
-  from 1. `agnosai_event_sender_send` now counts **both** 1 and
-  `AGNOSAI_CHAN_DROPPED` toward `AGN_ER_LAGGED`, because a message was lost
-  either way — testing only `== 1` would have under-reported the worse of the two.
-
-  Only reachable with concurrent producers on one topic: a single producer always
-  wins the slot its own eviction freed. That is exactly why it was worth writing
-  down rather than discovering later from a lag count that did not add up. Pinned
-  by four asserts in `tests/orch_pubsub.tcyr` on the contract (the three non-zero
-  returns are mutually distinct, and the ordinary success path still returns 0).
-
-### Changed
-- **`lib/mabda.cyr` re-synced 4.0.7 → 4.0.8** to match the 6.5.4 pin; `cyrius.lock`
-  updated. `lib/` now matches the pinned snapshot exactly — 0 of the stdlib files
-  differ — and the build emits no shadow or drift warning. (The remaining
-  not-in-snapshot entries are the git deps: ai-hwaccel, bote-core, kavach, libro,
-  majra, tyche.)
-- **`docs/development/state.md`: two internal contradictions corrected.** The gate
-  table said `server` was **20 of 21 files** while the handoff section 400 lines
-  later said **6 of 21**; 20 is right. And the git-dep list said sigil 3.12.1 /
-  bote 3.1.4 against `cyrius.cyml`'s 3.12.2 / 3.2.1 — the same hand-transcription
-  drift the file's own 2026-07-30 handoff note warns about ("regenerate the tables
-  from command output rather than editing rows by hand").
-
-### Performance
-- **The whole `core` group builds on a per-request arena — a 10-agent, 10-task
-  crew serialization drops 44,032 → 0 bytes on the global bump**, and runs 11%
-  faster (171 → 152 µs). `core/json`, `core/task`, `core/resource`, `core/agent`,
-  `core/message` and `core/crew` are threaded end to end: 27 `_a` forms, each with
-  the bare name delegating through `default_alloc()`.
-
-  Every `_a` form is pinned as **agreeing byte-for-byte with its global twin** —
-  that is the correctness claim the whole conversion rests on, and it is the only
-  assertion that would catch a substitution which silently changed a *value*
-  rather than just where it was allocated.
-
-  **Two bugs found doing it, both worth recording:**
-
-  1. **`fn agnosai_agent_to_value_a(a, a)` — Cyrius accepted a duplicate parameter
-     name silently.** The original parameter was already `a` (the agent pointer),
-     and prepending an allocator also called `a` compiled clean; every
-     `load64(a + AGN_AGENT_OFFSET)` then read the *allocator* and the suite
-     SIGSEGV'd with no assertion output. The conversion now picks a non-colliding
-     allocator name. This is the sharp edge of one flat namespace plus no arity or
-     shadowing diagnostic — a rename that looks mechanical is not.
-  2. **`map_keys` is the recurring residue.** It materialises a key vec through
-     `vec_new()` on the global bump and has no `_a` form, so it survives every
-     other substitution and silently caps the win. It appeared again in
-     `agnosai_task_dag_to_value` and in crew's two cost/int map helpers after the
-     first fix. `src/core/json.cyr` now exposes `_agnosai_map_slots` /
-     `_slot_live` / `_slot_key` / `_slot_val` over the documented hashmap layout
-     (`lib/hashmap.cyr:22-35`), guarded on `key_type == 2`, so the layout has one
-     place to be wrong instead of four. Expect it in any module that serialises a
-     map.
-
-- **A task response can now be built entirely on a per-request arena — 1944 → 0
-  bytes on the global bump.** Toolchain pin **6.5.4 → 6.5.5**, which folds
-  **bayan 1.4.0** and its completed `_a` JSON surface. `lib/` matches the pin
-  exactly (0 of 99 stdlib files differ, 0 drift warnings).
-
-  Measured same-box, `agnosai_task_to_json` over 20k iterations:
-
-  | path | bytes/response | ns/response |
-  |---|---|---|
-  | global (back-compat wrapper) | 1792 | 7758 |
-  | arena + `reset_via` per response | **0** | **6922** |
-
-  Wire is **byte-identical** between the two paths — asserted, not assumed.
-
-  Threaded: the five allocating helpers in `src/core/json.cyr`, the three
-  `*_to_wire` spellings, `agnosai_task_to_value` and `agnosai_task_to_json`, each
-  as an `_a` body with the bare name delegating through `default_alloc()` — the
-  stdlib's own convention (`str_from_a`, `alloc_via`).
-
-  **The last 152 bytes were `map_keys`.** After everything else moved,
-  `_agnosai_map_to_value` still called it, and it materialises a key vec through
-  `vec_new()` on the global bump with no `_a` form to thread. It now walks the
-  map's slots directly — that is the **documented public layout**
-  (`lib/hashmap.cyr:22-35`: header `{entries_ptr, capacity, count, key_type}`,
-  slot `{key_ptr, value, state}`, 24 bytes, `state == 1` occupied), not a reach
-  into internals, and it skips the intermediate vec entirely so it helps the
-  global path too — that is why the non-arena row above reads 1792 rather than
-  the previously measured 1944. Guarded on `key_type == 2`: the u64 map has a
-  16-byte slot and no state field, and the same header notes `map_keys` /
-  `map_values` / `map_iter` do not work on it either.
-
-  Pinned by assertions in `tests/core_task.tcyr` and **mutation-verified twice** —
-  putting a single key Str back on the global bump fails the zero-growth
-  assertion, and so does restoring the `map_keys` call.
-
-  This is one module. 48 more `*_to_value` fns and ~645 constructor call sites
-  remain; `core/json` + `core/task` was the first bite because it is the one with
-  an existing benchmark to measure against.
-- **`src/order.cyr` now delegates to the stdlib sort — 184 → 98 lines.**
-  `vec_sort_by` / `vec_select_nth` shipped in cyrius **6.5.4**, closing agnosai's
-  own filing (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib`). The vendored
-  heapsort, Hoare quickselect, median-of-3, partition and swap are deleted.
-
-  Measured same-box before/after (`benches/order.bcyr`):
-
-  | benchmark | vendored | stdlib | |
-  |---|---|---|---|
-  | `sort_100k` | 79.6 ms | **20.3 ms** | 3.9× |
-  | `sort_10k` | 6.30 ms | **1.71 ms** | 3.7× |
-  | `sort_100k_already_sorted` | 79.1 ms | **3.31 ms** | **23.9×** |
-  | `three_percentiles_100k` | 10.7 ms | **7.81 ms** | 1.4× |
-  | `select_nth_100k` | 6.89 ms | **5.09 ms** | 1.4× |
-
-  The already-sorted row is a difference in kind, not degree: heapsort's worst
-  case equals its average, so it had no fast path at all. Introsort checks for
-  pre-sorted input first, and a latency vector that arrives roughly ordered —
-  common — now costs a scan instead of a full sort. `builtin/load_testing` is the
-  consumer that pays this on every run.
-
-  **The public API and its bounds contract are unchanged, deliberately.** This is
-  a wrapper, not a rename: `vec_select_nth` **aborts the process** (`_vec_die()`)
-  on `k < 0` or `k >= len`, where `agnosai_select_nth` returns 0 — a contract
-  three assertions in `tests/order.tcyr` already pinned (empty vec, past-the-end,
-  negative k). An empty latency vector is an ordinary state for a load test that
-  recorded no samples, not a reason to kill the server. The guards stay in front;
-  only the sorting is delegated.
-
-  Bench labels lost their now-wrong `_heapsort` suffix. 57 suites green, all 48
-  order assertions unchanged.
-- **86 `str_eq(x, str_from("lit"))` comparisons → `str_eq_cstr(x, "lit")`.** Each
-  of those sites allocated a fresh 16-byte `Str` header on the **no-free global
-  bump** just to compare against a compile-time constant, and never released it.
-  Measured on the `core/task` wire-decode path (same box, same toolchain, same
-  session, `HEAD` vs working tree, 200k rounds of three decodes):
-
-  | | ns / 3-decode round | bytes / round |
-  |---|---|---|
-  | before | 482 | 128 |
-  | after | **213** | **0** |
-
-  2.26× faster and the leak is gone outright, not reduced.
-
-  **This is a Rust reflex, not a Cyrius one.** In Rust `"medium"` is a zero-cost
-  `&'static str` and `s == "medium"` allocates nothing, so the shape is free there
-  and invisible on review. In Cyrius `str_from` is a heap constructor and `alloc()`
-  never frees an individual allocation. The density says the same thing: 910
-  `str_from("` sites in 19,671 lines is 4.6 per 100 lines, against **0.064** in the
-  cyrius stdlib (96 in 150,822) and 0.31 in vidya.
-
-  **`str_eq_cstr` already existed** (`lib/str.cyr:617`) — length guard then
-  `memeq`, zero allocation, and it derives the literal's length with `strlen` so
-  there are no hand-written lengths to get wrong. No local helper was needed; the
-  gap was in reading the stdlib, not in the stdlib. Equivalence was proved over
-  the edge cases before any site was touched — exact match, prefix either way,
-  both-empty, either-empty, and a `Str` carrying an embedded NUL (where `Str`'s
-  explicit length and a cstr's NUL terminator could have disagreed): 8/8 identical,
-  0 bytes allocated across 2000 calls.
-
-  Rewritten by a balance-scanning pass rather than a regex — three sites have a
-  call in the first argument and one of those (`str_new(d + start, len - start)`,
-  `llm/hoosh.cyr:594`) contains a comma that a naive `[^,]*` pattern would have
-  split through.
-
-  `src/` drops from 910 `str_from("` sites to 824. The remaining classes are
-  separate bites: 149 `return str_from("lit")` constant returns, and the in-loop
-  hoists. The 380 sites under `tests/` are deliberately left — a test binary is
-  short-lived, so the leak is inert there, and rewriting assertions is churn
-  against no measurable cost.
-
-### Changed
-- **`src/` now mirrors `rust-old/src/`.** 65 of 71 modules moved out of the flat
-  scaffold layout into the oracle's directory shape: `src/server_routes_crews.cyr`
-  → `src/server/routes/crews.cyr`, `src/orch_crew_runner.cyr` →
-  `src/orchestrator/crew_runner.cyr`, and a group's hub → `mod.cyr`. Directories
-  take the oracle's spelling, so `orch_*` lands under `orchestrator/`.
-
-  Nothing forced the flat layout — Cyrius `include` is textual and takes a path,
-  and the cyrius compiler's own tree uses `src/backend/x86/emit.cyr`. The scaffold
-  default had encoded the oracle's directories into filename prefixes, and
-  `CLAUDE.md` then recorded that as if it were a language constraint. It read
-  as one for the whole port. The correctness bar here is "matches what Rust did",
-  judged file-against-file; the tree now shows that correspondence instead of
-  requiring a reviewer to parse prefixes to recover it.
-
-  **Verified by a byte-identical binary** — `sha256` unchanged at
-  `dd151e53…f342a8` before and after. `include` is textual, so the same files in
-  the same order preprocess to the same source; a hash match is proof the include
-  order survived, which is the only way this refactor could have silently broken
-  anything (a wrong order can resolve to a *different but still-compiling* symbol
-  under last-definition-wins). All other gates unchanged: 1386 top-level
-  definitions across 71 files, 57 suites green, coverage 100% (873/873 fns,
-  64/64 files). All 65 are `git mv` renames, so `git log --follow` still works.
-
-  Six files needed a decision rather than the rule, each noted where it lands:
-  `server_router.cyr` + `server_serve.cyr` split the oracle's single
-  `server/mod.rs` (bites 15a/15b), so neither claims `mod.cyr`;
-  `server_routes.cyr` → `routes/mod.cyr`; `tools_builtin_basic.cyr` merges the
-  oracle's `builtin/echo.rs` + `builtin/json_transform.rs`; `core_json.cyr` and
-  `orch_audit.cyr` are port-local with no `rust-old/` counterpart. Port-local
-  support modules (`units`, `order`, `id`, `guarded_fetch`, `chan_lossy`) stay at
-  `src/` root.
-
-  **Anything walking `src/` must now recurse.** `scripts/check-symbols.sh` and
-  `scripts/check-clean.sh` had seven `src/*.cyr` globs that would have matched
-  **nothing** after the move and passed — failing open, the dangerous direction.
-  Both now use `find src -name '*.cyr'` / `glob(recursive=True)`, confirmed by the
-  symbol count reproducing exactly. `cyrius coverage` and `cyrius tests` already
-  recursed (`cyrius/cbt/quality.cyr:83`, `dir_walk_with_prunes`).
-
-  No symbol renames: Cyrius has one flat namespace regardless of directory, so
-  every `agnosai_*` prefix is untouched.
-- **Toolchain pin 6.5.3 → 6.5.4, and sigil 3.12.1 → 3.12.2 with it.** Unlike the
-  6.5.3 bump, this one **moves real stdlib source** and needed
-  `cyrius lib sync --full`: `cyrius deps` re-layers the git deps but does not
-  refresh the stdlib, so `lib/` sat at the 6.5.3 snapshot until the sync ran.
-  The sigil pin had to move in the same commit — `cyrius deps` copies each git
-  dep's vendored bundle into `lib/` with last-write-wins, so leaving the pin at
-  3.12.1 would have overwritten the fold's 3.12.2 back down.
-
-  Three items land on agnosai:
-  - **`vec_sort_by` / `vec_select_nth` shipped**, closing agnosai's own filing
-    `2026-07-28-agnosai-no-nlogn-sort-in-stdlib`. No collision — `src/order.cyr`
-    is entirely `agnosai_*`-prefixed. Measured head-to-head at 100k, the stdlib
-    introsort is **3.85× faster** than our heapsort (20.0 ms vs 77.1 ms) and its
-    quickselect 1.34× (4.22 ms vs 5.65 ms); migrating is recorded as an open
-    decision in state.md rather than taken here.
-  - **sandhi 1.9.7 → 1.9.8 changes a return contract** the transport tier will
-    depend on: the five serve loops previously spun a core forever on a
-    persistent accept error and never returned once listening, and now return 1
-    on a dead listener or after 200 consecutive resource failures. Nothing here
-    calls `sandhi_server_*` yet, so it is a note for the router bite.
-  - **sigil 3.12.2 fixes a 144-byte-per-call `sha256_init` leak** that **never
-    affected us**: `_agnosai_auth_secret_eq` uses the banked, allocator-free
-    `sha256()` one-shot. Confirmed by measuring the shared-secret path at
-    **32 bytes/request** before and after.
-
-  The long-standing `lib/sakshi.cyr` 2.4.3 shadow warning also cleared — it is
-  now 2.4.7, matching the bundle. 44/44 suites and 771/771 coverage green after.
-- **Toolchain pin 6.5.2 → 6.5.3.** `lib/` is byte-identical between the two tags
-  (`git diff 6.5.2 6.5.3 -- lib/` is empty), so the bump moves no stdlib source and
-  needed no re-verification beyond a full rebuild. It is bugfix-only upstream —
-  correct diagnostic line numbers after an `include`, and an `install.sh` fix — and
-  it clears the `manifest-pin: 6.5.2 (drift — wrapper is 6.5.3)` banner the
-  installed CLI printed on every invocation. 43/43 suites still green after.
-
-### Fixed
-- **server_serve — sandhi's accessors return NUL-terminated cstrings, not `Str`,
-  and the adapter passed all three straight through.** `sandhi_server_get_method`,
-  `_get_path`, and `_find_header` each `alloc_via` a NUL-terminated copy
-  (`lib/sandhi.cyr:12358-12427`); reading one as a `Str` reads its first eight
-  bytes as a data pointer and the next eight as a length. The method compare
-  silently answered "no method" — **every request would have been 405** — and
-  `str_len(path)` returned 21815634, faulting in the router. Fixed by wrapping
-  with `str_from_a` (which borrows the bytes, no copy) and comparing the method
-  with `streq` rather than `str_eq`. All three are mutation-verified: reverting
-  any one fails the end-to-end suite.
-- **server_router — path matching re-split every pattern on every request.** The
-  matcher built a vec of `Str` for both sides, so each of the 18 patterns was
-  re-segmented per call and a request matching nothing walked all of them.
-  Rewritten to walk both sides in place, allocating only the captured parameter
-  on the one pattern that matches. A segment must now match in full — mutation
-  testing found `/heal` reaching `/health` had no covering test.
-- **The doc, lint, and coverage gates were never in CI.** `.github/workflows/ci.yml`
-  ran the symbol check, build, and test — not `fmt`, `lint`, `doc`, `vet`,
-  `deny`, or `coverage`, despite CLAUDE.md's work loop specifying them at steps
-  2 and 6 and calling coverage out as "its own CI step". The drift was real:
-  **31 undocumented public symbols** across five modules and four untracked lint
-  deferrals, none of which any pipeline would have reported. All 35 fixed, and
-  `scripts/check-clean.sh` now gates the class — verified to fail on an
-  undocumented symbol, a formatting violation, and an untracked deferral.
-- **`cyrius.cyml` pinned `ai-hwaccel = "2.3.15"` while `lib/` and `cyrius.lock`
-  carried 2.3.16.** The manifest was the only stale copy, so a clean checkout would
-  have resolved **2.3.15 — the version that still carries the bayan-1.3.0
-  `json_v_parse_str` break** this project filed and consumed the fix for. The build
-  in the working tree was correct; it simply was not reproducible from the manifest.
-  Now pinned 2.3.16, matching upstream's current tag.
-- **docs/development/state.md — table drift.** The gates all reproduced exactly
-  (2684 assertions across 43 files, 752/752 coverage, fmt/vet/deny clean), but every
-  hand-transcribed table had drifted: six per-suite assertion rows (`id` 26→37,
-  `llm_hoosh` 120→124, `orch_audit` 52→54, `orch_crew_runner` 184→188,
-  `orch_orchestrator` 51→49, `server_output_filter` 67→63 — the deltas happened to
-  cancel, which is why the headline stayed right), the locked-dep count (79→105),
-  libro's version (2.8.2→2.8.4), and the duplicate-fn count (35→36).
-- **`path_exists` duplicate-fn verdict was inverted.** state.md said kavach's wins
-  and that the two are "same contract, different implementation". Both are wrong,
-  and both were disproved by running a probe: **ai-hwaccel's wins** (it is included
-  later), and the contracts genuinely differ — kavach's `sys_access(path, 0)` tests
-  existence only, while ai-hwaccel's delegates to `file_exists`, which opens
-  `O_RDONLY`. A path that exists but is unreadable answers 1 under one and 0 under
-  the other. agnosai has no `path_exists` call sites, so nothing misbehaves today.
-- **`_agnosai_is_digit` is defined twice in our own source** —
-  `src/server/ssrf.cyr:39` and `src/server/output_filter.cyr:140` — and is the 36th
-  duplicate-fn warning, the only one that is not a dep's. The bodies are
-  semantically identical today, so nothing misbehaves, but two copies of a scanner
-  that agree by accident is the condition ADR 007 exists to prevent. Documented for
-  hoisting at the next touch of either module.
-- **docs/development/roadmap.md** still described M5 as "16 of 18 bites" with
-  `durable_state (→ patra)`, a mapping the port plan corrected on 2026-07-29 and
-  which the roadmap never picked up. M5 is complete and touches no patra.
-- **CLAUDE.md work-loop step 2 said bare `cyrius lint`**, which takes a file — bare
-  it prints usage and exits 1, so a gate written that way lints nothing. Step 11
-  gated on a "recipe" file that exists nowhere in the repo; it now names the real
-  sync set, and flags that `scripts/version-bump.sh` is the un-ported Rust-era
-  script (it still edits a root `Cargo.toml` that no longer exists).
-- **docs/development/cyrius-port-plan.md** was still headed "Phase 0 in progress"
-  and listed the `vec_sort_by` / `vec_select_nth` ask as "still to file" — it had
-  been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
-
-### Performance
-- **Route resolution: 4352 → 48 bytes per request (−99%).** A full-table miss was
-  the expensive case at 4304 B, twelve times a hit; it is now 352 B end to end,
-  the same as a hit. `/health` end to end: 720 → 352 B (−51%); `/api/v1/tools`:
-  4808 → 1920 B (−60%). Measured with `alloc_used()` over 64 iterations after
-  warm-up. Writing bite 15b's allocation test is what surfaced it — routing cost
-  six times the handler it was dispatching to.
-
-### Added
 - **server_serve (M6 bite 15b) — the sandhi adapter, and the port's first
   `sandhi_server_*` call site.** 80 assertions. Four things had to land
   together: blocker #3's per-request arena, the allocation measurement, the a2a
@@ -875,342 +546,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   oracle's own keypair and confirmed with `openssl dgst -verify` before being
   committed — **agnosai contains no RSA signing and no test needs a private key.**
 
-### Fixed
-- **Four duplicated top-level constants in `src/`, three with different values —
-  and the compiler warns about none of them.** Found by a flat-namespace audit
-  run as the prerequisite for porting `mcp.rs`.
-
-  Cyrius has one global symbol table and last-definition-wins. It emits
-  `warning: duplicate fn` for a repeated **fn** and is **silent** for a repeated
-  `var` or enum member — so `grep "duplicate fn"` on the build log, the obvious
-  check, structurally cannot catch this class.
-
-  | constant | | |
-  |---|---|---|
-  | `AGN_AC_SIZE` | `server_auth.cyr` = **24** | `orch_audit.cyr` = **48** |
-  | `AGN_CE_SIZE` | `server_sse.cyr` = **24** | `orch_plan_cache.cyr` = **32** |
-  | `AGN_RR_SIZE` | `server_routes.cyr` = **24** | `tools_remote_registry.cyr` = **40** |
-  | `AGN_REQ_SIZE` | `core_resource.cyr` = 40 | `llm_hoosh.cyr` = 40 |
-
-  Three of the four are **struct sizes passed straight to `alloc()`**. Nothing
-  misbehaved, but only by accident of include order: each file's own `alloc()`
-  happens to be parsed after its own definition and before the redefinition.
-  Reordering `src/main.cyr`'s includes, or adding a module that used one of these
-  names, would have silently under-allocated a heap struct with no diagnostic.
-  All eight now carry module-unique names; behaviour is unchanged (52/52 suites,
-  837/837 coverage, before and after).
-
-- **`_agnosai_is_digit` hoisted into `src/units.cyr`.** It was defined
-  byte-identically in both `server_ssrf.cyr` and `server_output_filter.cyr` — a
-  silent last-definition-wins pair, benign only while the bodies agreed. This was
-  documented as "hoist at the next touch" and the new gate forced the issue.
-  agnosai's own duplicate-fn warnings are now **zero** (build total 36 → 35; the
-  remaining 35 are all lib-vs-lib).
-
-- **`src/main.cyr`'s entry-point `var r` renamed** to `_agnosai_exit_code`. A
-  bare single-letter top-level `var` is a global in the flat namespace.
-
-### Added
 - **`scripts/check-symbols.sh` + a CI gate.** Two rules the compiler cannot
   enforce: no name defined twice in `src/` across **all** definition kinds (fn,
   var, enum member), and every top-level symbol `agnosai_*`/`_`-prefixed. The
   second rule closes the entire ~180-name unprefixed export surface of
   `lib/bote-core.cyr` at once, with no denylist to maintain. Runs before Build.
 
-### Security
-- **server_auth — six defects found by an adversarial review of the first cut of
-  the JWT half, all fixed and all pinned by a test that fails if the fix is
-  removed** (verified by mutation, not assumed). Recorded in full because five of
-  the six were introduced in this release and would otherwise leave no trace.
-  - **Unauthenticated heap exhaustion, ~53× amplification.** The header was
-    parsed *before* the signature was verified, and `bayan_json_v_parse_buf`
-    builds its tree on the no-free global bump. A 1,164-byte header segment
-    leaked **62,248 bytes per request** on a path returning 401 — no credential
-    required, and nothing reclaims it. Fixed by verifying the signature first,
-    which is cryptographically safe here because the algorithm is never *chosen*
-    from the header: this path always runs RSASSA-PKCS1-v1.5/SHA-256 with the
-    configured key, so a token declaring `alg:none` still needs a valid RSA
-    signature to get anywhere. Measured after: **32 bytes, flat**, independent of
-    header size, and pinned by `_t_jwt_preauth_allocation_is_bounded`.
-  - **A second unauthenticated leak, 536 bytes/request.** `agnosai_jwt_config_prepare`
-    memoized success but not failure, so `AGNOSAI_JWT_KEY_BAD` was written and
-    never read: a PEM that base64-decoded and then failed RSA parsing was
-    re-decoded on every request. One mistyped `AGNOSAI_JWT_PUBLIC_KEY` was enough.
-  - **`exp` overflow, fail-open.** bayan's `_jp_atoi` computes `n = n*10 + digit`
-    in wrapping i64 with no overflow detection and still tags the result
-    `JTAG_INT`, so the `is_int` gate did not catch it. A payload carrying
-    `"exp":20000000000000000000` wrapped to `1553255926290448384` — a
-    year-51-billion timestamp — and the token was **accepted** where the oracle
-    answers 401. Now range-guarded to `[0, 253402300799]`.
-  - **Weak keys accepted.** The oracle verifies through ring's
-    `RSA_PKCS1_2048_8192_SHA256`, which refuses any modulus under 2048 bits;
-    sigil enforces no minimum at all. A **512-bit** key was accepted and its
-    tokens verified. Now floored at 2048-bit.
-  - **A zero clock silently disabled expiry.** `clock_epoch_secs` is documented
-    to return 0 when the RTC is unreadable — "unknown", not 1970 — and on the
-    agnos target it is a bare `sys_time_unix` with no retry. Fed through, the
-    expiry test became `exp < -60`, false for every non-negative `exp`. Now
-    refused with a 500. Note this one initially had a test that *looked* right
-    and caught nothing: on a host with a working clock the branch is unreachable,
-    so the guard was split into `agnosai_auth_check_clocked` to make it drivable.
-  - **Claim types unchecked.** The oracle deserializes the payload into a typed
-    `Claims` before validating, so any type mismatch is a 401; the port read it
-    untyped and accepted `"sub":123`, a negative `iat`, and a non-string `scope`
-    or `iss`. Now type-checked against every field the oracle declares.
-
-  Still divergent and **documented rather than fixed**: duplicate JSON members
-  resolve first-wins where serde errors; unknown JWS header members are not
-  type-checked; the modulus ceiling is 4096-bit against the oracle's 8192-bit,
-  because sigil's `_rsa_recover_em` refuses anything wider.
-
-- **server_auth (M6 bite 3) — the shared-secret half of `auth.rs`.** `AuthConfig`,
-  `JwtConfig` and its builders, case-sensitive `Bearer ` extraction, the
-  `HeaderValue::to_str()` visible-ASCII gate, and the shared-secret comparison.
-  All five of the oracle's shared-secret tests port directly, plus 47 assertions
-  the oracle has no equivalent for — 52 in total.
-
-  **Shaped as `fn(config, inputs) -> status`, not as a transport handler.** The
-  oracle's five tests are `#[tokio::test]` + axum `oneshot` only because its
-  middleware signature is async; the decision it makes is synchronous. Writing it
-  as a pure function makes the whole thing testable before any sandhi adapter
-  exists, and it is the pattern the remaining `routes/*` bites should follow —
-  most of M6's 43 remaining `#[tokio::test]`s are async for the same incidental
-  reason.
-
-  **The secret comparison is constant time; the oracle's is not.** `constant_time_eq`
-  (`auth.rs:18-31`) bounds its loop with `a.len().max(b.len())` while its own doc
-  comment claims "no early return on length mismatch that would leak secret
-  length" — the content compare is constant time, the loop bound is not, so an
-  attacker who controls the token length can recover the secret's by timing.
-  `ct_eq_bytes_lens` is not the fix either; it early-returns on a length mismatch
-  (`lib/ct.cyr:76`), a sharper signal of the same fact. The port compares SHA-256
-  digests over a fixed 32 bytes instead. **This is not a wire divergence** — the
-  accept/reject set is byte-identical, since `sha256(a) == sha256(b)` iff `a == b`
-  — only the timing leak is gone. Recorded as
-  [ADR 009](docs/adr/009-auth-constant-time-secret-compare.md).
-
-  **The JWT branch is a loud 500, never a silent pass.** `validate_jwt` is bite 4.
-  A stub returning 401 would be indistinguishable from a working rejection and one
-  returning 200 would be an authentication bypass, so the unported path answers
-  `HTTP_INTERNAL` and `_t_jwt_path_is_a_loud_stub` pins that it is never `HTTP_OK`.
-  Read state.md's "Four decisions waiting on the maintainer" before writing bite 4:
-  `iss`/`aud`-absent-passes, the `exp: u64::MAX` fixture, the array-`aud` 401, and
-  jsonwebtoken's 60-second default leeway are all deliberate calls.
-
-  Three oracle behaviours reproduced rather than fixed, each pinned by a test: the
-  `Bearer ` prefix is **case-sensitive** (RFC 7235 says the scheme is not, but the
-  oracle's `starts_with` is, so `bearer ` is a 401 in Rust today); `AuthConfig`'s
-  default is **fail-open**; and a header failing `to_str()` takes the
-  missing-header arm rather than being compared.
-
-- **M6 (`server`) — first bite.**
-  - **server_prometheus** — six counters plus the Prometheus text exposition `/metrics` serves.
-    **Atomics, not a mutex.** The oracle's counters are `AtomicU64`/`Relaxed`, and the port uses
-    `atomic_fetch_add` for the same reason rather than locking: the crew runner's parallel and DAG
-    modes record from real worker threads, and an uncontended mutex pair costs ~394 ns here against
-    a measured **5 ns** for the atomic — ~79× on a path that fires once per task. The one
-    non-additive operation, the active-crews decrement, is a CAS loop, since Cyrius has no
-    `fetch_update`; it saturates at zero, because a plain decrement would *wrap* and the gauge would
-    read as nonsense rather than merely wrong.
-    **Cost is integer micro-USD end to end.** The oracle already stores micro-USD, but its entry
-    point takes an f64 USD and multiplies while `gather` divides back to format `{:.6}` — two float
-    conversions bracketing an integer store. The port takes micro directly (the one signature
-    change) and formats by splitting the integer, so the value that arrives is the value stored and
-    printed. That matters because hoosh 2.6.0 reports `usage.cost_micro_usd` as an integer and the
-    port carries micro-USD everywhere: the f64 round trip would have been the *only* place in the
-    cost path where representation error could enter. Tests pin `0.000001`, `0.999999`, `2.000000`
-    and `1234.567890` rendering exactly.
-  - **server_output_filter** — the return leg of `server_prompt_guard`: that guards what goes *to*
-    the model, this scans what comes *back*. Detection and redaction of system-prompt leakage, ten
-    API-key prefixes, and PII (email, phone, SSN). Substring-based rather than regex, which the
-    port has no choice about since cyrius 6.5.0 removed the `regex_*` surface — and which is what
-    the oracle chose anyway.
-    **Three oracle behaviours are reproduced rather than fixed**, each pinned by a test so a
-    tidy-up fails loudly: a system prompt of **50 bytes or fewer is never checked** (the window
-    loop's range is empty at that length, and the oracle's own test asserts this as intended); the
-    **last window is never checked**, so leaking exactly the prompt's tail goes unseen; and
-    **`Bearer ` redacts only itself**, because its own trailing space is the first whitespace the
-    span-bounding scan finds — the token survives and is only removed if it happens to match
-    another prefix like `sk-`.
-    **One divergence, and it is a fix.** The oracle's SSN redactor walks bytes and pushes each as a
-    `char`, silently mangling any multi-byte UTF-8 that passes through — its email redactor does
-    not, because it walks `chars`. Cyrius Strs are byte slices with no re-encoding step, so
-    non-ASCII survives; a test drives a two-byte character through redaction to prove it.
-
-- **tools** (M4, Phase 3, in progress) — `src/tools/mod.cyr` hub plus two submodules:
-  - **tools_native** — `agnosai_tool_*`: ParameterSchema, ToolSchema, ToolInput, ToolOutput, and
-    the tool itself. The oracle's `NativeTool` **trait** becomes a function-pointer vtable
-    (schema/execute plus an opaque ctx, dispatched with `callptr`) since Cyrius has no traits,
-    and `execute` becomes **synchronous** — there are no futures, and under
-    `sandhi_server_run_pooled` a blocking tool body on a worker thread is the direct equivalent
-    of an awaited future on a tokio task.
-  - **tools_registry** — `agnosai_tool_registry_*`: registration, lookup, allow-list gating.
-    The oracle's lock-free `DashMap` becomes a hashmap behind a **futex mutex**, which is
-    mandatory rather than optional: `run_pooled` makes every worker its own OS thread, so an
-    unguarded write during a concurrent read would corrupt the table. Schema callbacks run
-    outside the lock, since a tool's `schema_fp` is arbitrary user code.
-- **tools_builtin_basic** — the `echo` and `json_transform` builtins, registering through the
-  registry and gated by the allow-list. `echo` returns the whole JSON value rather than a string,
-  matching the oracle's `Value` clone.
-- **tools_builtin_load_testing** — the `load_testing` builtin: HTTP load generation against a
-  target URL with concurrent users, reporting throughput, error rate, status-code histogram and
-  min/avg/p50/p95/p99 latency. **The first production user of the port plan's blocker #3 arena
-  pattern.** One OS thread per simulated user — a load generator that ran sequentially would not
-  be one — with each worker owning two arenas: a persistent one, sized from its request budget,
-  holding its latency samples, and a scratch one `reset_via`'d after every request. The scratch
-  arena is load-bearing, not a refinement: a single arena would accumulate every response body
-  for the whole run, which is unbounded growth the oracle does not have, since Rust drops each
-  response as it goes.
-
-  Three deliberate divergences, all documented in-module:
-  - The percentile index is the oracle's `(len * p / 100).min(len - 1)`, **not**
-    `order.cyr`'s nearest-rank convention. For n=100 they differ — index 50 against 49 — and the
-    reported figure has to be the oracle's.
-  - Throughput and error rate are carried as integers (thousandths of a request/second, parts per
-    million) and converted to float only at the wire boundary, the same treatment money gets.
-  - Status counts live in a vec of `[code, count]` pairs rather than a map, because the stdlib has
-    no `map_u64_keys`. Benchmarked rather than assumed: see **Performance**.
-
-  The worker loop checks `vec_push_a`'s return value. The arena sizing has ~2.5x headroom, so
-  exhaustion is unreachable through the public constructor — but `vec_push_a` returns -1 *and does
-  not push* when an arena is full, and the loop exits on `vec_len(latencies) >= budget`. Ignoring
-  the failure would mean spinning until the deadline issuing real HTTP requests whose results are
-  all discarded: maximum load generated, nothing measured.
-
-  The SSRF guard runs before anything touches the network, which means the tool cannot be aimed at
-  loopback. That is deliberate, and it is why the oracle's two axum-mock-server tests do not port
-  directly — the suite drives the real thread fan-out against a synthetic executor instead, and
-  `scripts/stack.sh check` covers the network seam separately.
-- **tools_builtin_security_audit** — the `security_audit` builtin: HTTP security-header analysis,
-  a CORS probe via OPTIONS, information-disclosure detection, scoring and a risk band. Split at
-  the network boundary — `agnosai_audit_analyze` takes two already-fetched header sets and
-  `agnosai_run_security_audit` is the thin shell that fetches them — which is what makes the
-  oracle's five loopback-mock-server tests portable, since the tool's own SSRF guard rightly
-  refuses loopback. Scores are carried as integer percentages and converted to f64 only at the
-  wire boundary, the same treatment money and load_testing's throughput get; the oracle's
-  arithmetic is integral at every step, so an f64 carrier could only drift.
-
-  **Redirect handling deliberately diverges from the oracle in both directions —
-  [ADR 007](docs/adr/007-audit-redirect-revalidation.md).** reqwest follows up to 10 redirects
-  and validates only the URL the caller supplied, so a target that passes `is_safe_url` and then
-  answers `302 Location: http://169.254.169.254/` walks the oracle into the cloud metadata
-  service and reports its headers back — an SSRF bypass in a tool whose job is finding them.
-  sandhi's opposite default (never follow) would have been differently wrong: auditing
-  `http://example.com` when it redirects to HTTPS would score the redirect stub and report a
-  well-configured site as 0/7, critical. The port follows hops and re-runs the guard on each one,
-  refuses an https→http downgrade, fails closed on a `Location` it cannot resolve confidently,
-  and reports a refused hop as a distinct error rather than a generic failure.
-
-  Three inherited defaults were corrected rather than absorbed, each of which would have produced
-  a silently wrong answer:
-  - `max_response_bytes` is raised off sandhi's 256 KiB, which treats an over-cap response as a
-    hard protocol error. The oracle cannot fail that way at all — reqwest's `send()` resolves on
-    the response head and never reads the body — so any homepage over 256 KiB would have returned
-    "security audit failed" where the oracle returns a full result.
-  - The 15s budget spans the whole redirect chain, matching `Client::timeout`, rather than being
-    re-armed per hop. Per-hop would have allowed 165 seconds against the oracle's 15, twice over.
-  - Scheme comparison on the security paths is case-insensitive, because `sandhi_url_parse` is and
-    therefore `is_safe_url` accepts `HTTPS://`. A byte-exact test would have skipped the downgrade
-    refusal and sliced the origin one byte short, resolving a relative `Location` against
-    `HTTPS:/` and pointing the next request at a different host.
-
-  Information disclosure honours the oracle's `let Ok(v) = val.to_str()` gate: a header value
-  carrying a non-visible-ASCII byte is skipped, so it raises no vulnerability and costs no points.
-  Without the gate such a target would score 5 below the oracle.
-- **tools_agnos** — the shared client behind the nine AGNOS ecosystem tools. synapse, mneme and
-  delta are nine tools with one shape (a cloned `reqwest::Client`, a `base_url`, a JSON GET or
-  POST, and two fixed error strings); the Rust side factored out only the `OnceLock<Client>`
-  because everything else was cheap to repeat behind a derive. Repeating it nine times in Cyrius
-  is not cheap, and this is the third instance, which is where CLAUDE.md says the abstraction is
-  earned. Carries the `application/x-www-form-urlencoded` serialiser reqwest's `.query()` gave
-  the oracle for free — the stdlib has no percent-encoder — and the
-  `contains('/') || contains("..")` path-segment guard mneme and delta both apply.
-
-  **The transport is a function pointer**, so the tests drive all nine tools end to end —
-  parameter extraction, URL construction, query encoding, body construction, the traversal
-  guards, the response reshaping — with no service running. The oracle's own suites test only
-  names, descriptions and schemas, because every execute path there needs a live loopback service.
-
-  **These tools deliberately do NOT run the SSRF guard.** They target AGNOS services on loopback
-  by design, so `agnosai_is_safe_url` would reject all three default base URLs; the test asserts
-  exactly that, so the omission reads as a decision rather than an oversight. The guard belongs
-  on tools that fetch a URL the *caller* chose. What the caller does control — the path segments
-  — is guarded where the oracle guards it.
-
-  Two inherited defaults corrected: a 30s timeout, where reqwest's `Client::new()` applies none
-  at all and a hung service would hang the agent forever; and `max_response_bytes` raised off
-  sandhi's 256 KiB for the same reason as in security_audit.
-- **tools_builtin_synapse** — `synapse_infer`, `synapse_list_models`, `synapse_status` against the
-  OpenAI-compatible controller on :8420. `synapse_infer`'s completion extraction reproduces the
-  oracle's `.unwrap_or("")` tolerance exactly: a missing `choices`, an empty array, a missing
-  `message`, a non-string `content`, or a response that is not an object at all all yield an empty
-  completion rather than an error, because the raw response ships alongside it.
-- **tools_builtin_mneme** — `mneme_search`, `mneme_get_note`, `mneme_create_note` against the note
-  store on :8400. `tags` is forwarded whatever its JSON type, matching the oracle's
-  `parameters.get("tags").cloned()`, which never type-checks; validating would reject a request
-  the oracle accepts.
-- **tools_builtin_delta** — `delta_list_repos`, `delta_trigger_pipeline`, `delta_get_pipeline`
-  against the code platform on :8070. `delta_trigger_pipeline` sends `{}` when no branch is given:
-  the parameter's own description says "defaults to main", but the oracle inserts nothing and the
-  code is what ships. Guard order is the oracle's array order, so with both `owner` and `repo`
-  invalid it is `owner` that is named.
-- **orch** (M5, Phase 4, in progress) — `src/orchestrator/mod.cyr` hub. Two modules so far:
-  - **orch_output_validation** — the structured-output check a task's `output_schema` drives, plus
-    the retry prompt built from a failure. `ValidationResult` flattens to the port's
-    `Option<String>` convention, so **0 means Valid**. The fence extractor reproduces two
-    behaviours that are one character apart in Rust: the `?` on the closing-fence lookup abandons
-    the whole search rather than trying the next opening marker, while an *empty* block does fall
-    through — and the fall-through's re-scan can capture a block that still contains a fence,
-    which is pinned as-is rather than tidied. Divergences are message text only: the parse error
-    carries bayan's detail behind the oracle's wrapper wording, and the schema renders in
-    insertion order where serde_json (BTreeMap-backed, no `preserve_order`) sorts keys.
-  - **orch_pubsub** — topic pub/sub with `*` (one segment) and `#` (zero or more) wildcards.
-    A pattern maps to a **vec of per-subscriber channels** rather than the oracle's single
-    broadcast sender, because Cyrius channels are single-consumer: a value one receiver takes is
-    gone for the rest. The observable contract is unchanged — every subscriber sees every matching
-    message, and `pattern_count` still counts patterns, which is what the 10,000 cap is expressed
-    in. The oracle's 16-entry stack-array fast path is not reproduced; it is an allocation
-    optimisation with no observable difference.
-  - **orch_multi_tenant** — per-tenant token/cost/concurrency limits and the check that enforces
-    them. `max_cost_usd` becomes integer micro-USD, which lands more cleanly here than anywhere
-    else it has been applied: `TenantBudget` derives no `Serialize`, so there is no wire boundary
-    to convert at and the field exists purely to be compared. Every limit is breached by
-    *exceeding* it, never by reaching it — all the oracle's comparisons are `>`, and the check
-    order (unknown tenant, tokens, cost, concurrency) is observable when several are breached at
-    once.
-  - **orch_ipc** — Unix-socket IPC, 4-byte big-endian length prefix then JSON. Connection setup
-    delegates to majra's `ipc_bind`/`ipc_accept`/`ipc_connect`, which own the `sockaddr_un`
-    construction and the agnos fail-closed path. **The framing does not**, for two reasons that
-    would both have been silent: majra caps a frame at 1 MiB where the oracle allows 16 MiB — and
-    the oracle has a test for a >64 KiB payload precisely because large frames are expected — and
-    majra collapses every failure into one error where the oracle distinguishes six, two of which
-    a caller acts on differently (a clean peer disconnect is not a fault; an over-cap frame is a
-    misbehaving peer). The port also keeps the oracle's zero-length-frame rejection, which majra
-    lacks; without it a peer can hold a reader in a loop that consumes four bytes and yields
-    nothing.
-  - **orch_scoring** — five weighted factors scoring an agent's fit for a task. The weights are
-    the **constants**, not the rustdoc: `score_agent`'s doc claims 0.40/0.30/0.15/0.15 over four
-    factors while the `WEIGHT_*` constants are 0.35/0.25/0.10/0.15/0.15 over five, and the
-    oracle's own `expected_score` test helper recomputes from the constants. **Personality always
-    scores the neutral 0.5** — that is the oracle's own `personality: None` arm, which is the only
-    value the default Rust build ever produced and what its test helper hardcodes; the
-    bhava-backed trait arms defer with bhava, and `agnosai_personality_score` is the single
-    function to fill in when it lands. A perfect match therefore scores 0.925, not 1.0.
-    `rank_agents` breaks ties on ascending index because the oracle sorts with `sort_by`, a
-    **stable** merge sort, while `order.cyr`'s heapsort is not stable — without the tie-break,
-    which of two equally-good agents gets the task would vary with the sort's internal swaps.
-  - **orch_scheduler** — five FIFO priority tiers plus DAG-aware ordering, Kahn's algorithm for
-    both. Determinism runs in two directions here and both are reproduced deliberately.
-    `kahn_sort`'s two sorts — the zero-in-degree seed and each node's successors — exist so a
-    HashMap's arbitrary iteration order cannot leak into the output, including the detail that
-    later waves are *appended* without re-sorting, so the result is sorted within each wave rather
-    than globally. `ready_tasks` and `topological_sort_tasks` are the opposite: the oracle leaves
-    their tie order genuinely unspecified (a HashMap collect, and a `BinaryHeap` breaking ties on
-    raw UUID bytes), so the port picks a stable documented order instead — reproducible run to
-    run, which the oracle is not, and consistent with its contract either way. The adjacency
-    values are sets, not lists: a duplicated edge must not double-count an in-degree, or the
-    target never becomes ready.
 ### Changed
+
+- **`lib/mabda.cyr` re-synced 4.0.7 → 4.0.8** to match the 6.5.4 pin; `cyrius.lock`
+  updated. `lib/` now matches the pinned snapshot exactly — 0 of the stdlib files
+  differ — and the build emits no shadow or drift warning. (The remaining
+  not-in-snapshot entries are the git deps: ai-hwaccel, bote-core, kavach, libro,
+  majra, tyche.)
+- **`docs/development/state.md`: two internal contradictions corrected.** The gate
+  table said `server` was **20 of 21 files** while the handoff section 400 lines
+  later said **6 of 21**; 20 is right. And the git-dep list said sigil 3.12.1 /
+  bote 3.1.4 against `cyrius.cyml`'s 3.12.2 / 3.2.1 — the same hand-transcription
+  drift the file's own 2026-07-30 handoff note warns about ("regenerate the tables
+  from command output rather than editing rows by hand").
+
+- **`src/` now mirrors `rust-old/src/`.** 65 of 71 modules moved out of the flat
+  scaffold layout into the oracle's directory shape: `src/server_routes_crews.cyr`
+  → `src/server/routes/crews.cyr`, `src/orch_crew_runner.cyr` →
+  `src/orchestrator/crew_runner.cyr`, and a group's hub → `mod.cyr`. Directories
+  take the oracle's spelling, so `orch_*` lands under `orchestrator/`.
+
+  Nothing forced the flat layout — Cyrius `include` is textual and takes a path,
+  and the cyrius compiler's own tree uses `src/backend/x86/emit.cyr`. The scaffold
+  default had encoded the oracle's directories into filename prefixes, and
+  `CLAUDE.md` then recorded that as if it were a language constraint. It read
+  as one for the whole port. The correctness bar here is "matches what Rust did",
+  judged file-against-file; the tree now shows that correspondence instead of
+  requiring a reviewer to parse prefixes to recover it.
+
+  **Verified by a byte-identical binary** — `sha256` unchanged at
+  `dd151e53…f342a8` before and after. `include` is textual, so the same files in
+  the same order preprocess to the same source; a hash match is proof the include
+  order survived, which is the only way this refactor could have silently broken
+  anything (a wrong order can resolve to a *different but still-compiling* symbol
+  under last-definition-wins). All other gates unchanged: 1386 top-level
+  definitions across 71 files, 57 suites green, coverage 100% (873/873 fns,
+  64/64 files). All 65 are `git mv` renames, so `git log --follow` still works.
+
+  Six files needed a decision rather than the rule, each noted where it lands:
+  `server_router.cyr` + `server_serve.cyr` split the oracle's single
+  `server/mod.rs` (bites 15a/15b), so neither claims `mod.cyr`;
+  `server_routes.cyr` → `routes/mod.cyr`; `tools_builtin_basic.cyr` merges the
+  oracle's `builtin/echo.rs` + `builtin/json_transform.rs`; `core_json.cyr` and
+  `orch_audit.cyr` are port-local with no `rust-old/` counterpart. Port-local
+  support modules (`units`, `order`, `id`, `guarded_fetch`, `chan_lossy`) stay at
+  `src/` root.
+
+  **Anything walking `src/` must now recurse.** `scripts/check-symbols.sh` and
+  `scripts/check-clean.sh` had seven `src/*.cyr` globs that would have matched
+  **nothing** after the move and passed — failing open, the dangerous direction.
+  Both now use `find src -name '*.cyr'` / `glob(recursive=True)`, confirmed by the
+  symbol count reproducing exactly. `cyrius coverage` and `cyrius tests` already
+  recursed (`cyrius/cbt/quality.cyr:83`, `dir_walk_with_prunes`).
+
+  No symbol renames: Cyrius has one flat namespace regardless of directory, so
+  every `agnosai_*` prefix is untouched.
+- **Toolchain pin 6.5.3 → 6.5.4, and sigil 3.12.1 → 3.12.2 with it.** Unlike the
+  6.5.3 bump, this one **moves real stdlib source** and needed
+  `cyrius lib sync --full`: `cyrius deps` re-layers the git deps but does not
+  refresh the stdlib, so `lib/` sat at the 6.5.3 snapshot until the sync ran.
+  The sigil pin had to move in the same commit — `cyrius deps` copies each git
+  dep's vendored bundle into `lib/` with last-write-wins, so leaving the pin at
+  3.12.1 would have overwritten the fold's 3.12.2 back down.
+
+  Three items land on agnosai:
+  - **`vec_sort_by` / `vec_select_nth` shipped**, closing agnosai's own filing
+    `2026-07-28-agnosai-no-nlogn-sort-in-stdlib`. No collision — `src/order.cyr`
+    is entirely `agnosai_*`-prefixed. Measured head-to-head at 100k, the stdlib
+    introsort is **3.85× faster** than our heapsort (20.0 ms vs 77.1 ms) and its
+    quickselect 1.34× (4.22 ms vs 5.65 ms); migrating is recorded as an open
+    decision in state.md rather than taken here.
+  - **sandhi 1.9.7 → 1.9.8 changes a return contract** the transport tier will
+    depend on: the five serve loops previously spun a core forever on a
+    persistent accept error and never returned once listening, and now return 1
+    on a dead listener or after 200 consecutive resource failures. Nothing here
+    calls `sandhi_server_*` yet, so it is a note for the router bite.
+  - **sigil 3.12.2 fixes a 144-byte-per-call `sha256_init` leak** that **never
+    affected us**: `_agnosai_auth_secret_eq` uses the banked, allocator-free
+    `sha256()` one-shot. Confirmed by measuring the shared-secret path at
+    **32 bytes/request** before and after.
+
+  The long-standing `lib/sakshi.cyr` 2.4.3 shadow warning also cleared — it is
+  now 2.4.7, matching the bundle. 44/44 suites and 771/771 coverage green after.
+- **Toolchain pin 6.5.2 → 6.5.3.** `lib/` is byte-identical between the two tags
+  (`git diff 6.5.2 6.5.3 -- lib/` is empty), so the bump moves no stdlib source and
+  needed no re-verification beyond a full rebuild. It is bugfix-only upstream —
+  correct diagnostic line numbers after an `include`, and an `install.sh` fix — and
+  it clears the `manifest-pin: 6.5.2 (drift — wrapper is 6.5.3)` banner the
+  installed CLI printed on every invocation. 43/43 suites still green after.
+
 - **toolchain: cyrius `6.4.86` → `6.5.2`** (`cyrius.cyml`), folding in bayan 1.3.0, sandhi 1.9.7
   and sakshi 2.4.7.
   - **bayan 1.3.0 renames the cstr+len parsers `_str` → `_buf`**, so **23 call sites moved from
@@ -1580,7 +1010,622 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **benches/learning.bcyr** — the 10 benchmark shapes of `rust-old/benches/learning.rs`, starting
   the Cyrius baseline. Not comparable to the frozen Rust CSV.
 
+- **Money is integer micro-USD** across the cost path (`ResourceBudget::max_cost_usd`,
+  `CrewProfile::cost_usd` and both per-key cost breakdowns), per the 2026-07-28 decision.
+  Amounts accumulate exactly with no float drift. Serialization still routes through an f64
+  under the original `*_usd` wire names, so bayan's Grisu2 emits the shortest round-tripping
+  form — `0.0025`, `5.0`, `0.000001` — byte-identical to serde. **This corrects the port plan's
+  prediction** that micro-USD would cost a `0.002500` vs `0.0025` textual divergence: converting
+  only at the wire boundary avoids it entirely.
+- **core** — divergences from the Rust API, each documented at the top of its module:
+  `Option<T>` numeric fields use a `-1` sentinel (`AGNOSAI_NO_LIMIT`); `Option<String>` fields use
+  `0`; `from_json` returns `0` in place of `Result::Err`; `HashMap<Uuid, _>` keys become the
+  canonical UUID string, which is what serde emitted. Every `skip_serializing_if` in the oracle is
+  honoured exactly, since those omissions are wire-visible.
+- **core_agent** — `personality` is not ported (bhava is post-v2), but the field still serializes
+  as `"personality": null`, which is what the default Rust build emitted. Incoming values are
+  accepted and ignored. This resolves port plan open question 2 the conservative way, preserving
+  byte-exact default-build wire parity; say so if you want the field dropped from the wire instead.
+- **core_resource** — the `#[cfg(feature = "hwaccel")]` half is not ported (ai-hwaccel re-exports,
+  `TrainingMemoryEstimate`, the `detect`/`from_hwaccel` probes). `hwaccel` is not in the default
+  build, so it sits outside the v2.0.0 parity bar alongside bhava. 19 of the oracle's 28
+  resource tests port; the 9 hwaccel-gated ones defer with the feature.
+- **learning** — three deliberate shape divergences from the Rust API, each documented at the top
+  of its module. `Option<T>` returns become presence-return plus an out-param, keeping the query
+  paths allocation-free where a tagged `Option` would heap-allocate. `Duration` becomes an i64
+  nanosecond count and `DateTime<Utc>` becomes epoch nanoseconds. `CapabilityScorer::all_scores`
+  splits into `agnosai_capability_scorer_keys` + `_score`, which together cover the same surface
+  without minting a pair per entry. Wire behaviour is unchanged; `learning` has no consumers
+  outside itself (verified by the port plan's grep), so no downstream code is affected.
+- **tests/agnosai.tcyr**: replaced the stock `proj-tcyr` epilogue with the clamp-safe form. The
+  stock epilogue passes the raw failure count to `exit`, which the kernel masks `& 0xFF` — so
+  exactly 256, 512 or 768 failures would have scored as PASS.
+
+- Final Rust release line before the Cyrius port. `bench-history.csv` is frozen at this point and
+  moves to `rust-old/`; the Cyrius tree starts a fresh baseline. tokio-era numbers are **not**
+  comparable across the port — see `docs/development/cyrius-port-plan.md`.
+
+### Fixed
+
+- **A cyclic DAG ratcheted the `crews_active` gauge upward forever.** Introduced
+  and caught within this change: the first cut recorded `crew_started` before the
+  DAG-cycle early return, which exits without recording a completion — so one
+  malformed spec permanently inflated the gauge for the life of the process. The
+  error path now balances it. It still emits no `crew_completed` **event** (a
+  cyclic spec is an error, not a crew that failed); the event stream and the
+  gauge are different contracts and only the event one is suppressed. Pinned by a
+  mutation-verified assertion in `tests/orch_crew_runner.tcyr` — deleting the
+  balancing call fails it.
+- **`agnosai_chan_push_lossy` reported a dropped event as delivered.** When the
+  post-eviction retry also came back full — another producer refilled the ring
+  between the two calls — it fell through to `return 1`, which the contract
+  defines as "stored, after evicting the oldest". Nothing was stored. The single
+  consumer of that distinction is `agnosai_event_sender_send`, whose whole job is
+  counting what a slow SSE reader lost, so the one caller that exists to measure
+  loss was told a lost message had landed.
+
+  New `AGNOSAI_CHAN_DROPPED` (-2), distinct from `AGNOSAI_CHAN_CLOSED` (-1) and
+  from 1. `agnosai_event_sender_send` now counts **both** 1 and
+  `AGNOSAI_CHAN_DROPPED` toward `AGN_ER_LAGGED`, because a message was lost
+  either way — testing only `== 1` would have under-reported the worse of the two.
+
+  Only reachable with concurrent producers on one topic: a single producer always
+  wins the slot its own eviction freed. That is exactly why it was worth writing
+  down rather than discovering later from a lag count that did not add up. Pinned
+  by four asserts in `tests/orch_pubsub.tcyr` on the contract (the three non-zero
+  returns are mutually distinct, and the ordinary success path still returns 0).
+
+- **server_serve — sandhi's accessors return NUL-terminated cstrings, not `Str`,
+  and the adapter passed all three straight through.** `sandhi_server_get_method`,
+  `_get_path`, and `_find_header` each `alloc_via` a NUL-terminated copy
+  (`lib/sandhi.cyr:12358-12427`); reading one as a `Str` reads its first eight
+  bytes as a data pointer and the next eight as a length. The method compare
+  silently answered "no method" — **every request would have been 405** — and
+  `str_len(path)` returned 21815634, faulting in the router. Fixed by wrapping
+  with `str_from_a` (which borrows the bytes, no copy) and comparing the method
+  with `streq` rather than `str_eq`. All three are mutation-verified: reverting
+  any one fails the end-to-end suite.
+- **server_router — path matching re-split every pattern on every request.** The
+  matcher built a vec of `Str` for both sides, so each of the 18 patterns was
+  re-segmented per call and a request matching nothing walked all of them.
+  Rewritten to walk both sides in place, allocating only the captured parameter
+  on the one pattern that matches. A segment must now match in full — mutation
+  testing found `/heal` reaching `/health` had no covering test.
+- **The doc, lint, and coverage gates were never in CI.** `.github/workflows/ci.yml`
+  ran the symbol check, build, and test — not `fmt`, `lint`, `doc`, `vet`,
+  `deny`, or `coverage`, despite CLAUDE.md's work loop specifying them at steps
+  2 and 6 and calling coverage out as "its own CI step". The drift was real:
+  **31 undocumented public symbols** across five modules and four untracked lint
+  deferrals, none of which any pipeline would have reported. All 35 fixed, and
+  `scripts/check-clean.sh` now gates the class — verified to fail on an
+  undocumented symbol, a formatting violation, and an untracked deferral.
+- **`cyrius.cyml` pinned `ai-hwaccel = "2.3.15"` while `lib/` and `cyrius.lock`
+  carried 2.3.16.** The manifest was the only stale copy, so a clean checkout would
+  have resolved **2.3.15 — the version that still carries the bayan-1.3.0
+  `json_v_parse_str` break** this project filed and consumed the fix for. The build
+  in the working tree was correct; it simply was not reproducible from the manifest.
+  Now pinned 2.3.16, matching upstream's current tag.
+- **docs/development/state.md — table drift.** The gates all reproduced exactly
+  (2684 assertions across 43 files, 752/752 coverage, fmt/vet/deny clean), but every
+  hand-transcribed table had drifted: six per-suite assertion rows (`id` 26→37,
+  `llm_hoosh` 120→124, `orch_audit` 52→54, `orch_crew_runner` 184→188,
+  `orch_orchestrator` 51→49, `server_output_filter` 67→63 — the deltas happened to
+  cancel, which is why the headline stayed right), the locked-dep count (79→105),
+  libro's version (2.8.2→2.8.4), and the duplicate-fn count (35→36).
+- **`path_exists` duplicate-fn verdict was inverted.** state.md said kavach's wins
+  and that the two are "same contract, different implementation". Both are wrong,
+  and both were disproved by running a probe: **ai-hwaccel's wins** (it is included
+  later), and the contracts genuinely differ — kavach's `sys_access(path, 0)` tests
+  existence only, while ai-hwaccel's delegates to `file_exists`, which opens
+  `O_RDONLY`. A path that exists but is unreadable answers 1 under one and 0 under
+  the other. agnosai has no `path_exists` call sites, so nothing misbehaves today.
+- **`_agnosai_is_digit` is defined twice in our own source** —
+  `src/server/ssrf.cyr:39` and `src/server/output_filter.cyr:140` — and is the 36th
+  duplicate-fn warning, the only one that is not a dep's. The bodies are
+  semantically identical today, so nothing misbehaves, but two copies of a scanner
+  that agree by accident is the condition ADR 007 exists to prevent. Documented for
+  hoisting at the next touch of either module.
+- **docs/development/roadmap.md** still described M5 as "16 of 18 bites" with
+  `durable_state (→ patra)`, a mapping the port plan corrected on 2026-07-29 and
+  which the roadmap never picked up. M5 is complete and touches no patra.
+- **CLAUDE.md work-loop step 2 said bare `cyrius lint`**, which takes a file — bare
+  it prints usage and exits 1, so a gate written that way lints nothing. Step 11
+  gated on a "recipe" file that exists nowhere in the repo; it now names the real
+  sync set, and flags that `scripts/version-bump.sh` is the un-ported Rust-era
+  script (it still edits a root `Cargo.toml` that no longer exists).
+- **docs/development/cyrius-port-plan.md** was still headed "Phase 0 in progress"
+  and listed the `vec_sort_by` / `vec_select_nth` ask as "still to file" — it had
+  been filed the same day it was written (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`).
+
+- **Four duplicated top-level constants in `src/`, three with different values —
+  and the compiler warns about none of them.** Found by a flat-namespace audit
+  run as the prerequisite for porting `mcp.rs`.
+
+  Cyrius has one global symbol table and last-definition-wins. It emits
+  `warning: duplicate fn` for a repeated **fn** and is **silent** for a repeated
+  `var` or enum member — so `grep "duplicate fn"` on the build log, the obvious
+  check, structurally cannot catch this class.
+
+  | constant | | |
+  |---|---|---|
+  | `AGN_AC_SIZE` | `server_auth.cyr` = **24** | `orch_audit.cyr` = **48** |
+  | `AGN_CE_SIZE` | `server_sse.cyr` = **24** | `orch_plan_cache.cyr` = **32** |
+  | `AGN_RR_SIZE` | `server_routes.cyr` = **24** | `tools_remote_registry.cyr` = **40** |
+  | `AGN_REQ_SIZE` | `core_resource.cyr` = 40 | `llm_hoosh.cyr` = 40 |
+
+  Three of the four are **struct sizes passed straight to `alloc()`**. Nothing
+  misbehaved, but only by accident of include order: each file's own `alloc()`
+  happens to be parsed after its own definition and before the redefinition.
+  Reordering `src/main.cyr`'s includes, or adding a module that used one of these
+  names, would have silently under-allocated a heap struct with no diagnostic.
+  All eight now carry module-unique names; behaviour is unchanged (52/52 suites,
+  837/837 coverage, before and after).
+
+- **`_agnosai_is_digit` hoisted into `src/units.cyr`.** It was defined
+  byte-identically in both `server_ssrf.cyr` and `server_output_filter.cyr` — a
+  silent last-definition-wins pair, benign only while the bodies agreed. This was
+  documented as "hoist at the next touch" and the new gate forced the issue.
+  agnosai's own duplicate-fn warnings are now **zero** (build total 36 → 35; the
+  remaining 35 are all lib-vs-lib).
+
+- **`src/main.cyr`'s entry-point `var r` renamed** to `_agnosai_exit_code`. A
+  bare single-letter top-level `var` is a global in the flat namespace.
+
+- **orchestrator/crew_runner**: `cargo check --no-default-features --features kavach` failed to
+  compile. The `sandbox_strength` block was gated on `kavach` alone but reaches into
+  `crate::sandbox::`, which `lib.rs:27` gates on `sandbox`; only the `full` feature (which enables
+  both) hid the breakage. Gate is now `all(feature = "kavach", feature = "sandbox")`. This was
+  blocker #7 of the Cyrius port plan — the Rust tree must be green before it can serve as the
+  port's parity oracle.
+- **server/ssrf**: collapsed the private-IP `match` into a single boolean so the IPv4 and IPv6
+  arms share one return path (clears `clippy::collapsible_match` on Rust 1.96).
+- **orchestrator/scheduler**: `ready_tasks` sorts with `sort_by_key(Reverse(priority))` instead of
+  a hand-written comparator (clears `clippy::unnecessary_sort_by` on Rust 1.96). Ordering is
+  unchanged — both are stable sorts, highest priority first.
+
+### Security
+
+- **server_auth — six defects found by an adversarial review of the first cut of
+  the JWT half, all fixed and all pinned by a test that fails if the fix is
+  removed** (verified by mutation, not assumed). Recorded in full because five of
+  the six were introduced in this release and would otherwise leave no trace.
+  - **Unauthenticated heap exhaustion, ~53× amplification.** The header was
+    parsed *before* the signature was verified, and `bayan_json_v_parse_buf`
+    builds its tree on the no-free global bump. A 1,164-byte header segment
+    leaked **62,248 bytes per request** on a path returning 401 — no credential
+    required, and nothing reclaims it. Fixed by verifying the signature first,
+    which is cryptographically safe here because the algorithm is never *chosen*
+    from the header: this path always runs RSASSA-PKCS1-v1.5/SHA-256 with the
+    configured key, so a token declaring `alg:none` still needs a valid RSA
+    signature to get anywhere. Measured after: **32 bytes, flat**, independent of
+    header size, and pinned by `_t_jwt_preauth_allocation_is_bounded`.
+  - **A second unauthenticated leak, 536 bytes/request.** `agnosai_jwt_config_prepare`
+    memoized success but not failure, so `AGNOSAI_JWT_KEY_BAD` was written and
+    never read: a PEM that base64-decoded and then failed RSA parsing was
+    re-decoded on every request. One mistyped `AGNOSAI_JWT_PUBLIC_KEY` was enough.
+  - **`exp` overflow, fail-open.** bayan's `_jp_atoi` computes `n = n*10 + digit`
+    in wrapping i64 with no overflow detection and still tags the result
+    `JTAG_INT`, so the `is_int` gate did not catch it. A payload carrying
+    `"exp":20000000000000000000` wrapped to `1553255926290448384` — a
+    year-51-billion timestamp — and the token was **accepted** where the oracle
+    answers 401. Now range-guarded to `[0, 253402300799]`.
+  - **Weak keys accepted.** The oracle verifies through ring's
+    `RSA_PKCS1_2048_8192_SHA256`, which refuses any modulus under 2048 bits;
+    sigil enforces no minimum at all. A **512-bit** key was accepted and its
+    tokens verified. Now floored at 2048-bit.
+  - **A zero clock silently disabled expiry.** `clock_epoch_secs` is documented
+    to return 0 when the RTC is unreadable — "unknown", not 1970 — and on the
+    agnos target it is a bare `sys_time_unix` with no retry. Fed through, the
+    expiry test became `exp < -60`, false for every non-negative `exp`. Now
+    refused with a 500. Note this one initially had a test that *looked* right
+    and caught nothing: on a host with a working clock the branch is unreachable,
+    so the guard was split into `agnosai_auth_check_clocked` to make it drivable.
+  - **Claim types unchecked.** The oracle deserializes the payload into a typed
+    `Claims` before validating, so any type mismatch is a 401; the port read it
+    untyped and accepted `"sub":123`, a negative `iat`, and a non-string `scope`
+    or `iss`. Now type-checked against every field the oracle declares.
+
+  Still divergent and **documented rather than fixed**: duplicate JSON members
+  resolve first-wins where serde errors; unknown JWS header members are not
+  type-checked; the modulus ceiling is 4096-bit against the oracle's 8192-bit,
+  because sigil's `_rsa_recover_em` refuses anything wider.
+
+- **server_auth (M6 bite 3) — the shared-secret half of `auth.rs`.** `AuthConfig`,
+  `JwtConfig` and its builders, case-sensitive `Bearer ` extraction, the
+  `HeaderValue::to_str()` visible-ASCII gate, and the shared-secret comparison.
+  All five of the oracle's shared-secret tests port directly, plus 47 assertions
+  the oracle has no equivalent for — 52 in total.
+
+  **Shaped as `fn(config, inputs) -> status`, not as a transport handler.** The
+  oracle's five tests are `#[tokio::test]` + axum `oneshot` only because its
+  middleware signature is async; the decision it makes is synchronous. Writing it
+  as a pure function makes the whole thing testable before any sandhi adapter
+  exists, and it is the pattern the remaining `routes/*` bites should follow —
+  most of M6's 43 remaining `#[tokio::test]`s are async for the same incidental
+  reason.
+
+  **The secret comparison is constant time; the oracle's is not.** `constant_time_eq`
+  (`auth.rs:18-31`) bounds its loop with `a.len().max(b.len())` while its own doc
+  comment claims "no early return on length mismatch that would leak secret
+  length" — the content compare is constant time, the loop bound is not, so an
+  attacker who controls the token length can recover the secret's by timing.
+  `ct_eq_bytes_lens` is not the fix either; it early-returns on a length mismatch
+  (`lib/ct.cyr:76`), a sharper signal of the same fact. The port compares SHA-256
+  digests over a fixed 32 bytes instead. **This is not a wire divergence** — the
+  accept/reject set is byte-identical, since `sha256(a) == sha256(b)` iff `a == b`
+  — only the timing leak is gone. Recorded as
+  [ADR 009](docs/adr/009-auth-constant-time-secret-compare.md).
+
+  **The JWT branch is a loud 500, never a silent pass.** `validate_jwt` is bite 4.
+  A stub returning 401 would be indistinguishable from a working rejection and one
+  returning 200 would be an authentication bypass, so the unported path answers
+  `HTTP_INTERNAL` and `_t_jwt_path_is_a_loud_stub` pins that it is never `HTTP_OK`.
+  Read state.md's "Four decisions waiting on the maintainer" before writing bite 4:
+  `iss`/`aud`-absent-passes, the `exp: u64::MAX` fixture, the array-`aud` 401, and
+  jsonwebtoken's 60-second default leeway are all deliberate calls.
+
+  Three oracle behaviours reproduced rather than fixed, each pinned by a test: the
+  `Bearer ` prefix is **case-sensitive** (RFC 7235 says the scheme is not, but the
+  oracle's `starts_with` is, so `bearer ` is a 401 in Rust today); `AuthConfig`'s
+  default is **fail-open**; and a header failing `to_str()` takes the
+  missing-header arm rather than being compared.
+
+- **M6 (`server`) — first bite.**
+  - **server_prometheus** — six counters plus the Prometheus text exposition `/metrics` serves.
+    **Atomics, not a mutex.** The oracle's counters are `AtomicU64`/`Relaxed`, and the port uses
+    `atomic_fetch_add` for the same reason rather than locking: the crew runner's parallel and DAG
+    modes record from real worker threads, and an uncontended mutex pair costs ~394 ns here against
+    a measured **5 ns** for the atomic — ~79× on a path that fires once per task. The one
+    non-additive operation, the active-crews decrement, is a CAS loop, since Cyrius has no
+    `fetch_update`; it saturates at zero, because a plain decrement would *wrap* and the gauge would
+    read as nonsense rather than merely wrong.
+    **Cost is integer micro-USD end to end.** The oracle already stores micro-USD, but its entry
+    point takes an f64 USD and multiplies while `gather` divides back to format `{:.6}` — two float
+    conversions bracketing an integer store. The port takes micro directly (the one signature
+    change) and formats by splitting the integer, so the value that arrives is the value stored and
+    printed. That matters because hoosh 2.6.0 reports `usage.cost_micro_usd` as an integer and the
+    port carries micro-USD everywhere: the f64 round trip would have been the *only* place in the
+    cost path where representation error could enter. Tests pin `0.000001`, `0.999999`, `2.000000`
+    and `1234.567890` rendering exactly.
+  - **server_output_filter** — the return leg of `server_prompt_guard`: that guards what goes *to*
+    the model, this scans what comes *back*. Detection and redaction of system-prompt leakage, ten
+    API-key prefixes, and PII (email, phone, SSN). Substring-based rather than regex, which the
+    port has no choice about since cyrius 6.5.0 removed the `regex_*` surface — and which is what
+    the oracle chose anyway.
+    **Three oracle behaviours are reproduced rather than fixed**, each pinned by a test so a
+    tidy-up fails loudly: a system prompt of **50 bytes or fewer is never checked** (the window
+    loop's range is empty at that length, and the oracle's own test asserts this as intended); the
+    **last window is never checked**, so leaking exactly the prompt's tail goes unseen; and
+    **`Bearer ` redacts only itself**, because its own trailing space is the first whitespace the
+    span-bounding scan finds — the token survives and is only removed if it happens to match
+    another prefix like `sk-`.
+    **One divergence, and it is a fix.** The oracle's SSN redactor walks bytes and pushes each as a
+    `char`, silently mangling any multi-byte UTF-8 that passes through — its email redactor does
+    not, because it walks `chars`. Cyrius Strs are byte slices with no re-encoding step, so
+    non-ASCII survives; a test drives a two-byte character through redaction to prove it.
+
+- **tools** (M4, Phase 3, in progress) — `src/tools/mod.cyr` hub plus two submodules:
+  - **tools_native** — `agnosai_tool_*`: ParameterSchema, ToolSchema, ToolInput, ToolOutput, and
+    the tool itself. The oracle's `NativeTool` **trait** becomes a function-pointer vtable
+    (schema/execute plus an opaque ctx, dispatched with `callptr`) since Cyrius has no traits,
+    and `execute` becomes **synchronous** — there are no futures, and under
+    `sandhi_server_run_pooled` a blocking tool body on a worker thread is the direct equivalent
+    of an awaited future on a tokio task.
+  - **tools_registry** — `agnosai_tool_registry_*`: registration, lookup, allow-list gating.
+    The oracle's lock-free `DashMap` becomes a hashmap behind a **futex mutex**, which is
+    mandatory rather than optional: `run_pooled` makes every worker its own OS thread, so an
+    unguarded write during a concurrent read would corrupt the table. Schema callbacks run
+    outside the lock, since a tool's `schema_fp` is arbitrary user code.
+- **tools_builtin_basic** — the `echo` and `json_transform` builtins, registering through the
+  registry and gated by the allow-list. `echo` returns the whole JSON value rather than a string,
+  matching the oracle's `Value` clone.
+- **tools_builtin_load_testing** — the `load_testing` builtin: HTTP load generation against a
+  target URL with concurrent users, reporting throughput, error rate, status-code histogram and
+  min/avg/p50/p95/p99 latency. **The first production user of the port plan's blocker #3 arena
+  pattern.** One OS thread per simulated user — a load generator that ran sequentially would not
+  be one — with each worker owning two arenas: a persistent one, sized from its request budget,
+  holding its latency samples, and a scratch one `reset_via`'d after every request. The scratch
+  arena is load-bearing, not a refinement: a single arena would accumulate every response body
+  for the whole run, which is unbounded growth the oracle does not have, since Rust drops each
+  response as it goes.
+
+  Three deliberate divergences, all documented in-module:
+  - The percentile index is the oracle's `(len * p / 100).min(len - 1)`, **not**
+    `order.cyr`'s nearest-rank convention. For n=100 they differ — index 50 against 49 — and the
+    reported figure has to be the oracle's.
+  - Throughput and error rate are carried as integers (thousandths of a request/second, parts per
+    million) and converted to float only at the wire boundary, the same treatment money gets.
+  - Status counts live in a vec of `[code, count]` pairs rather than a map, because the stdlib has
+    no `map_u64_keys`. Benchmarked rather than assumed: see **Performance**.
+
+  The worker loop checks `vec_push_a`'s return value. The arena sizing has ~2.5x headroom, so
+  exhaustion is unreachable through the public constructor — but `vec_push_a` returns -1 *and does
+  not push* when an arena is full, and the loop exits on `vec_len(latencies) >= budget`. Ignoring
+  the failure would mean spinning until the deadline issuing real HTTP requests whose results are
+  all discarded: maximum load generated, nothing measured.
+
+  The SSRF guard runs before anything touches the network, which means the tool cannot be aimed at
+  loopback. That is deliberate, and it is why the oracle's two axum-mock-server tests do not port
+  directly — the suite drives the real thread fan-out against a synthetic executor instead, and
+  `scripts/stack.sh check` covers the network seam separately.
+- **tools_builtin_security_audit** — the `security_audit` builtin: HTTP security-header analysis,
+  a CORS probe via OPTIONS, information-disclosure detection, scoring and a risk band. Split at
+  the network boundary — `agnosai_audit_analyze` takes two already-fetched header sets and
+  `agnosai_run_security_audit` is the thin shell that fetches them — which is what makes the
+  oracle's five loopback-mock-server tests portable, since the tool's own SSRF guard rightly
+  refuses loopback. Scores are carried as integer percentages and converted to f64 only at the
+  wire boundary, the same treatment money and load_testing's throughput get; the oracle's
+  arithmetic is integral at every step, so an f64 carrier could only drift.
+
+  **Redirect handling deliberately diverges from the oracle in both directions —
+  [ADR 007](docs/adr/007-audit-redirect-revalidation.md).** reqwest follows up to 10 redirects
+  and validates only the URL the caller supplied, so a target that passes `is_safe_url` and then
+  answers `302 Location: http://169.254.169.254/` walks the oracle into the cloud metadata
+  service and reports its headers back — an SSRF bypass in a tool whose job is finding them.
+  sandhi's opposite default (never follow) would have been differently wrong: auditing
+  `http://example.com` when it redirects to HTTPS would score the redirect stub and report a
+  well-configured site as 0/7, critical. The port follows hops and re-runs the guard on each one,
+  refuses an https→http downgrade, fails closed on a `Location` it cannot resolve confidently,
+  and reports a refused hop as a distinct error rather than a generic failure.
+
+  Three inherited defaults were corrected rather than absorbed, each of which would have produced
+  a silently wrong answer:
+  - `max_response_bytes` is raised off sandhi's 256 KiB, which treats an over-cap response as a
+    hard protocol error. The oracle cannot fail that way at all — reqwest's `send()` resolves on
+    the response head and never reads the body — so any homepage over 256 KiB would have returned
+    "security audit failed" where the oracle returns a full result.
+  - The 15s budget spans the whole redirect chain, matching `Client::timeout`, rather than being
+    re-armed per hop. Per-hop would have allowed 165 seconds against the oracle's 15, twice over.
+  - Scheme comparison on the security paths is case-insensitive, because `sandhi_url_parse` is and
+    therefore `is_safe_url` accepts `HTTPS://`. A byte-exact test would have skipped the downgrade
+    refusal and sliced the origin one byte short, resolving a relative `Location` against
+    `HTTPS:/` and pointing the next request at a different host.
+
+  Information disclosure honours the oracle's `let Ok(v) = val.to_str()` gate: a header value
+  carrying a non-visible-ASCII byte is skipped, so it raises no vulnerability and costs no points.
+  Without the gate such a target would score 5 below the oracle.
+- **tools_agnos** — the shared client behind the nine AGNOS ecosystem tools. synapse, mneme and
+  delta are nine tools with one shape (a cloned `reqwest::Client`, a `base_url`, a JSON GET or
+  POST, and two fixed error strings); the Rust side factored out only the `OnceLock<Client>`
+  because everything else was cheap to repeat behind a derive. Repeating it nine times in Cyrius
+  is not cheap, and this is the third instance, which is where CLAUDE.md says the abstraction is
+  earned. Carries the `application/x-www-form-urlencoded` serialiser reqwest's `.query()` gave
+  the oracle for free — the stdlib has no percent-encoder — and the
+  `contains('/') || contains("..")` path-segment guard mneme and delta both apply.
+
+  **The transport is a function pointer**, so the tests drive all nine tools end to end —
+  parameter extraction, URL construction, query encoding, body construction, the traversal
+  guards, the response reshaping — with no service running. The oracle's own suites test only
+  names, descriptions and schemas, because every execute path there needs a live loopback service.
+
+  **These tools deliberately do NOT run the SSRF guard.** They target AGNOS services on loopback
+  by design, so `agnosai_is_safe_url` would reject all three default base URLs; the test asserts
+  exactly that, so the omission reads as a decision rather than an oversight. The guard belongs
+  on tools that fetch a URL the *caller* chose. What the caller does control — the path segments
+  — is guarded where the oracle guards it.
+
+  Two inherited defaults corrected: a 30s timeout, where reqwest's `Client::new()` applies none
+  at all and a hung service would hang the agent forever; and `max_response_bytes` raised off
+  sandhi's 256 KiB for the same reason as in security_audit.
+- **tools_builtin_synapse** — `synapse_infer`, `synapse_list_models`, `synapse_status` against the
+  OpenAI-compatible controller on :8420. `synapse_infer`'s completion extraction reproduces the
+  oracle's `.unwrap_or("")` tolerance exactly: a missing `choices`, an empty array, a missing
+  `message`, a non-string `content`, or a response that is not an object at all all yield an empty
+  completion rather than an error, because the raw response ships alongside it.
+- **tools_builtin_mneme** — `mneme_search`, `mneme_get_note`, `mneme_create_note` against the note
+  store on :8400. `tags` is forwarded whatever its JSON type, matching the oracle's
+  `parameters.get("tags").cloned()`, which never type-checks; validating would reject a request
+  the oracle accepts.
+- **tools_builtin_delta** — `delta_list_repos`, `delta_trigger_pipeline`, `delta_get_pipeline`
+  against the code platform on :8070. `delta_trigger_pipeline` sends `{}` when no branch is given:
+  the parameter's own description says "defaults to main", but the oracle inserts nothing and the
+  code is what ships. Guard order is the oracle's array order, so with both `owner` and `repo`
+  invalid it is `owner` that is named.
+- **orch** (M5, Phase 4, in progress) — `src/orchestrator/mod.cyr` hub. Two modules so far:
+  - **orch_output_validation** — the structured-output check a task's `output_schema` drives, plus
+    the retry prompt built from a failure. `ValidationResult` flattens to the port's
+    `Option<String>` convention, so **0 means Valid**. The fence extractor reproduces two
+    behaviours that are one character apart in Rust: the `?` on the closing-fence lookup abandons
+    the whole search rather than trying the next opening marker, while an *empty* block does fall
+    through — and the fall-through's re-scan can capture a block that still contains a fence,
+    which is pinned as-is rather than tidied. Divergences are message text only: the parse error
+    carries bayan's detail behind the oracle's wrapper wording, and the schema renders in
+    insertion order where serde_json (BTreeMap-backed, no `preserve_order`) sorts keys.
+  - **orch_pubsub** — topic pub/sub with `*` (one segment) and `#` (zero or more) wildcards.
+    A pattern maps to a **vec of per-subscriber channels** rather than the oracle's single
+    broadcast sender, because Cyrius channels are single-consumer: a value one receiver takes is
+    gone for the rest. The observable contract is unchanged — every subscriber sees every matching
+    message, and `pattern_count` still counts patterns, which is what the 10,000 cap is expressed
+    in. The oracle's 16-entry stack-array fast path is not reproduced; it is an allocation
+    optimisation with no observable difference.
+  - **orch_multi_tenant** — per-tenant token/cost/concurrency limits and the check that enforces
+    them. `max_cost_usd` becomes integer micro-USD, which lands more cleanly here than anywhere
+    else it has been applied: `TenantBudget` derives no `Serialize`, so there is no wire boundary
+    to convert at and the field exists purely to be compared. Every limit is breached by
+    *exceeding* it, never by reaching it — all the oracle's comparisons are `>`, and the check
+    order (unknown tenant, tokens, cost, concurrency) is observable when several are breached at
+    once.
+  - **orch_ipc** — Unix-socket IPC, 4-byte big-endian length prefix then JSON. Connection setup
+    delegates to majra's `ipc_bind`/`ipc_accept`/`ipc_connect`, which own the `sockaddr_un`
+    construction and the agnos fail-closed path. **The framing does not**, for two reasons that
+    would both have been silent: majra caps a frame at 1 MiB where the oracle allows 16 MiB — and
+    the oracle has a test for a >64 KiB payload precisely because large frames are expected — and
+    majra collapses every failure into one error where the oracle distinguishes six, two of which
+    a caller acts on differently (a clean peer disconnect is not a fault; an over-cap frame is a
+    misbehaving peer). The port also keeps the oracle's zero-length-frame rejection, which majra
+    lacks; without it a peer can hold a reader in a loop that consumes four bytes and yields
+    nothing.
+  - **orch_scoring** — five weighted factors scoring an agent's fit for a task. The weights are
+    the **constants**, not the rustdoc: `score_agent`'s doc claims 0.40/0.30/0.15/0.15 over four
+    factors while the `WEIGHT_*` constants are 0.35/0.25/0.10/0.15/0.15 over five, and the
+    oracle's own `expected_score` test helper recomputes from the constants. **Personality always
+    scores the neutral 0.5** — that is the oracle's own `personality: None` arm, which is the only
+    value the default Rust build ever produced and what its test helper hardcodes; the
+    bhava-backed trait arms defer with bhava, and `agnosai_personality_score` is the single
+    function to fill in when it lands. A perfect match therefore scores 0.925, not 1.0.
+    `rank_agents` breaks ties on ascending index because the oracle sorts with `sort_by`, a
+    **stable** merge sort, while `order.cyr`'s heapsort is not stable — without the tie-break,
+    which of two equally-good agents gets the task would vary with the sort's internal swaps.
+  - **orch_scheduler** — five FIFO priority tiers plus DAG-aware ordering, Kahn's algorithm for
+    both. Determinism runs in two directions here and both are reproduced deliberately.
+    `kahn_sort`'s two sorts — the zero-in-degree seed and each node's successors — exist so a
+    HashMap's arbitrary iteration order cannot leak into the output, including the detail that
+    later waves are *appended* without re-sorting, so the result is sorted within each wave rather
+    than globally. `ready_tasks` and `topological_sort_tasks` are the opposite: the oracle leaves
+    their tie order genuinely unspecified (a HashMap collect, and a `BinaryHeap` breaking ties on
+    raw UUID bytes), so the port picks a stable documented order instead — reproducible run to
+    run, which the oracle is not, and consistent with its contract either way. The adjacency
+    values are sets, not lists: a duplicated edge must not double-count an in-degree, or the
+    target never becomes ready.
+
 ### Performance
+
+- **The whole `core` group builds on a per-request arena — a 10-agent, 10-task
+  crew serialization drops 44,032 → 0 bytes on the global bump**, and runs 11%
+  faster (171 → 152 µs). `core/json`, `core/task`, `core/resource`, `core/agent`,
+  `core/message` and `core/crew` are threaded end to end: 27 `_a` forms, each with
+  the bare name delegating through `default_alloc()`.
+
+  Every `_a` form is pinned as **agreeing byte-for-byte with its global twin** —
+  that is the correctness claim the whole conversion rests on, and it is the only
+  assertion that would catch a substitution which silently changed a *value*
+  rather than just where it was allocated.
+
+  **Two bugs found doing it, both worth recording:**
+
+  1. **`fn agnosai_agent_to_value_a(a, a)` — Cyrius accepted a duplicate parameter
+     name silently.** The original parameter was already `a` (the agent pointer),
+     and prepending an allocator also called `a` compiled clean; every
+     `load64(a + AGN_AGENT_OFFSET)` then read the *allocator* and the suite
+     SIGSEGV'd with no assertion output. The conversion now picks a non-colliding
+     allocator name. This is the sharp edge of one flat namespace plus no arity or
+     shadowing diagnostic — a rename that looks mechanical is not.
+  2. **`map_keys` is the recurring residue.** It materialises a key vec through
+     `vec_new()` on the global bump and has no `_a` form, so it survives every
+     other substitution and silently caps the win. It appeared again in
+     `agnosai_task_dag_to_value` and in crew's two cost/int map helpers after the
+     first fix. `src/core/json.cyr` now exposes `_agnosai_map_slots` /
+     `_slot_live` / `_slot_key` / `_slot_val` over the documented hashmap layout
+     (`lib/hashmap.cyr:22-35`), guarded on `key_type == 2`, so the layout has one
+     place to be wrong instead of four. Expect it in any module that serialises a
+     map.
+
+- **A task response can now be built entirely on a per-request arena — 1944 → 0
+  bytes on the global bump.** Toolchain pin **6.5.4 → 6.5.5**, which folds
+  **bayan 1.4.0** and its completed `_a` JSON surface. `lib/` matches the pin
+  exactly (0 of 99 stdlib files differ, 0 drift warnings).
+
+  Measured same-box, `agnosai_task_to_json` over 20k iterations:
+
+  | path | bytes/response | ns/response |
+  |---|---|---|
+  | global (back-compat wrapper) | 1792 | 7758 |
+  | arena + `reset_via` per response | **0** | **6922** |
+
+  Wire is **byte-identical** between the two paths — asserted, not assumed.
+
+  Threaded: the five allocating helpers in `src/core/json.cyr`, the three
+  `*_to_wire` spellings, `agnosai_task_to_value` and `agnosai_task_to_json`, each
+  as an `_a` body with the bare name delegating through `default_alloc()` — the
+  stdlib's own convention (`str_from_a`, `alloc_via`).
+
+  **The last 152 bytes were `map_keys`.** After everything else moved,
+  `_agnosai_map_to_value` still called it, and it materialises a key vec through
+  `vec_new()` on the global bump with no `_a` form to thread. It now walks the
+  map's slots directly — that is the **documented public layout**
+  (`lib/hashmap.cyr:22-35`: header `{entries_ptr, capacity, count, key_type}`,
+  slot `{key_ptr, value, state}`, 24 bytes, `state == 1` occupied), not a reach
+  into internals, and it skips the intermediate vec entirely so it helps the
+  global path too — that is why the non-arena row above reads 1792 rather than
+  the previously measured 1944. Guarded on `key_type == 2`: the u64 map has a
+  16-byte slot and no state field, and the same header notes `map_keys` /
+  `map_values` / `map_iter` do not work on it either.
+
+  Pinned by assertions in `tests/core_task.tcyr` and **mutation-verified twice** —
+  putting a single key Str back on the global bump fails the zero-growth
+  assertion, and so does restoring the `map_keys` call.
+
+  This is one module. 48 more `*_to_value` fns and ~645 constructor call sites
+  remain; `core/json` + `core/task` was the first bite because it is the one with
+  an existing benchmark to measure against.
+- **`src/order.cyr` now delegates to the stdlib sort — 184 → 98 lines.**
+  `vec_sort_by` / `vec_select_nth` shipped in cyrius **6.5.4**, closing agnosai's
+  own filing (`2026-07-28-agnosai-no-nlogn-sort-in-stdlib`). The vendored
+  heapsort, Hoare quickselect, median-of-3, partition and swap are deleted.
+
+  Measured same-box before/after (`benches/order.bcyr`):
+
+  | benchmark | vendored | stdlib | |
+  |---|---|---|---|
+  | `sort_100k` | 79.6 ms | **20.3 ms** | 3.9× |
+  | `sort_10k` | 6.30 ms | **1.71 ms** | 3.7× |
+  | `sort_100k_already_sorted` | 79.1 ms | **3.31 ms** | **23.9×** |
+  | `three_percentiles_100k` | 10.7 ms | **7.81 ms** | 1.4× |
+  | `select_nth_100k` | 6.89 ms | **5.09 ms** | 1.4× |
+
+  The already-sorted row is a difference in kind, not degree: heapsort's worst
+  case equals its average, so it had no fast path at all. Introsort checks for
+  pre-sorted input first, and a latency vector that arrives roughly ordered —
+  common — now costs a scan instead of a full sort. `builtin/load_testing` is the
+  consumer that pays this on every run.
+
+  **The public API and its bounds contract are unchanged, deliberately.** This is
+  a wrapper, not a rename: `vec_select_nth` **aborts the process** (`_vec_die()`)
+  on `k < 0` or `k >= len`, where `agnosai_select_nth` returns 0 — a contract
+  three assertions in `tests/order.tcyr` already pinned (empty vec, past-the-end,
+  negative k). An empty latency vector is an ordinary state for a load test that
+  recorded no samples, not a reason to kill the server. The guards stay in front;
+  only the sorting is delegated.
+
+  Bench labels lost their now-wrong `_heapsort` suffix. 57 suites green, all 48
+  order assertions unchanged.
+- **86 `str_eq(x, str_from("lit"))` comparisons → `str_eq_cstr(x, "lit")`.** Each
+  of those sites allocated a fresh 16-byte `Str` header on the **no-free global
+  bump** just to compare against a compile-time constant, and never released it.
+  Measured on the `core/task` wire-decode path (same box, same toolchain, same
+  session, `HEAD` vs working tree, 200k rounds of three decodes):
+
+  | | ns / 3-decode round | bytes / round |
+  |---|---|---|
+  | before | 482 | 128 |
+  | after | **213** | **0** |
+
+  2.26× faster and the leak is gone outright, not reduced.
+
+  **This is a Rust reflex, not a Cyrius one.** In Rust `"medium"` is a zero-cost
+  `&'static str` and `s == "medium"` allocates nothing, so the shape is free there
+  and invisible on review. In Cyrius `str_from` is a heap constructor and `alloc()`
+  never frees an individual allocation. The density says the same thing: 910
+  `str_from("` sites in 19,671 lines is 4.6 per 100 lines, against **0.064** in the
+  cyrius stdlib (96 in 150,822) and 0.31 in vidya.
+
+  **`str_eq_cstr` already existed** (`lib/str.cyr:617`) — length guard then
+  `memeq`, zero allocation, and it derives the literal's length with `strlen` so
+  there are no hand-written lengths to get wrong. No local helper was needed; the
+  gap was in reading the stdlib, not in the stdlib. Equivalence was proved over
+  the edge cases before any site was touched — exact match, prefix either way,
+  both-empty, either-empty, and a `Str` carrying an embedded NUL (where `Str`'s
+  explicit length and a cstr's NUL terminator could have disagreed): 8/8 identical,
+  0 bytes allocated across 2000 calls.
+
+  Rewritten by a balance-scanning pass rather than a regex — three sites have a
+  call in the first argument and one of those (`str_new(d + start, len - start)`,
+  `llm/hoosh.cyr:594`) contains a comma that a naive `[^,]*` pattern would have
+  split through.
+
+  `src/` drops from 910 `str_from("` sites to 824. The remaining classes are
+  separate bites: 149 `return str_from("lit")` constant returns, and the in-loop
+  hoists. The 380 sites under `tests/` are deliberately left — a test binary is
+  short-lived, so the leak is inert there, and rewriting assertions is churn
+  against no measurable cost.
+
+- **Route resolution: 4352 → 48 bytes per request (−99%).** A full-table miss was
+  the expensive case at 4304 B, twelve times a hit; it is now 352 B end to end,
+  the same as a hit. `/health` end to end: 720 → 352 B (−51%); `/api/v1/tools`:
+  4808 → 1920 B (−60%). Measured with `alloc_used()` over 64 iterations after
+  warm-up. Writing bite 15b's allocation test is what surfaced it — routing cost
+  six times the handler it was dispatching to.
+
 - **server_auth (JWT)**: `auth_jwt_verify_ok` **3.31 ms**, of which the raw
   `rsa_pkcs1v15_verify_sha256` is **3.29 ms** — measured in isolation, so the
   port's own parsing, base64 and JSON work is the remaining ~20 µs.
@@ -1691,56 +1736,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the number blocker #4 was about — a subscriber that has stopped reading costs **one extra
   channel operation** to serve, not an unbounded stall. It loses events instead of wedging the
   crew publishing to it, which a blocking `chan_send` would have done.
-
-### Changed
-- **Money is integer micro-USD** across the cost path (`ResourceBudget::max_cost_usd`,
-  `CrewProfile::cost_usd` and both per-key cost breakdowns), per the 2026-07-28 decision.
-  Amounts accumulate exactly with no float drift. Serialization still routes through an f64
-  under the original `*_usd` wire names, so bayan's Grisu2 emits the shortest round-tripping
-  form — `0.0025`, `5.0`, `0.000001` — byte-identical to serde. **This corrects the port plan's
-  prediction** that micro-USD would cost a `0.002500` vs `0.0025` textual divergence: converting
-  only at the wire boundary avoids it entirely.
-- **core** — divergences from the Rust API, each documented at the top of its module:
-  `Option<T>` numeric fields use a `-1` sentinel (`AGNOSAI_NO_LIMIT`); `Option<String>` fields use
-  `0`; `from_json` returns `0` in place of `Result::Err`; `HashMap<Uuid, _>` keys become the
-  canonical UUID string, which is what serde emitted. Every `skip_serializing_if` in the oracle is
-  honoured exactly, since those omissions are wire-visible.
-- **core_agent** — `personality` is not ported (bhava is post-v2), but the field still serializes
-  as `"personality": null`, which is what the default Rust build emitted. Incoming values are
-  accepted and ignored. This resolves port plan open question 2 the conservative way, preserving
-  byte-exact default-build wire parity; say so if you want the field dropped from the wire instead.
-- **core_resource** — the `#[cfg(feature = "hwaccel")]` half is not ported (ai-hwaccel re-exports,
-  `TrainingMemoryEstimate`, the `detect`/`from_hwaccel` probes). `hwaccel` is not in the default
-  build, so it sits outside the v2.0.0 parity bar alongside bhava. 19 of the oracle's 28
-  resource tests port; the 9 hwaccel-gated ones defer with the feature.
-- **learning** — three deliberate shape divergences from the Rust API, each documented at the top
-  of its module. `Option<T>` returns become presence-return plus an out-param, keeping the query
-  paths allocation-free where a tagged `Option` would heap-allocate. `Duration` becomes an i64
-  nanosecond count and `DateTime<Utc>` becomes epoch nanoseconds. `CapabilityScorer::all_scores`
-  splits into `agnosai_capability_scorer_keys` + `_score`, which together cover the same surface
-  without minting a pair per entry. Wire behaviour is unchanged; `learning` has no consumers
-  outside itself (verified by the port plan's grep), so no downstream code is affected.
-- **tests/agnosai.tcyr**: replaced the stock `proj-tcyr` epilogue with the clamp-safe form. The
-  stock epilogue passes the raw failure count to `exit`, which the kernel masks `& 0xFF` — so
-  exactly 256, 512 or 768 failures would have scored as PASS.
-
-### Fixed
-- **orchestrator/crew_runner**: `cargo check --no-default-features --features kavach` failed to
-  compile. The `sandbox_strength` block was gated on `kavach` alone but reaches into
-  `crate::sandbox::`, which `lib.rs:27` gates on `sandbox`; only the `full` feature (which enables
-  both) hid the breakage. Gate is now `all(feature = "kavach", feature = "sandbox")`. This was
-  blocker #7 of the Cyrius port plan — the Rust tree must be green before it can serve as the
-  port's parity oracle.
-- **server/ssrf**: collapsed the private-IP `match` into a single boolean so the IPv4 and IPv6
-  arms share one return path (clears `clippy::collapsible_match` on Rust 1.96).
-- **orchestrator/scheduler**: `ready_tasks` sorts with `sort_by_key(Reverse(priority))` instead of
-  a hand-written comparator (clears `clippy::unnecessary_sort_by` on Rust 1.96). Ordering is
-  unchanged — both are stable sorts, highest priority first.
-
-### Changed
-- Final Rust release line before the Cyrius port. `bench-history.csv` is frozen at this point and
-  moves to `rust-old/`; the Cyrius tree starts a fresh baseline. tokio-era numbers are **not**
-  comparable across the port — see `docs/development/cyrius-port-plan.md`.
 
 ## [1.1.0] — 2026-04-02
 

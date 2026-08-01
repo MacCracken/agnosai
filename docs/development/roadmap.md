@@ -228,12 +228,16 @@ packaging + YAML.
 
 ## Open blockers and owed work
 
-**Status as of 2026-07-31, after M6 bite 15b.** Every item below is open. Each is
-self-contained: file paths, measured numbers, and what "done" means, so it can be
-picked up without reading the session that found it. Ordered by what blocks what.
+**Status as of 2026-07-31.** Every item below is **open**. Each is self-contained:
+file paths, measured numbers, and what "done" means, so it can be picked up without
+reading the session that found it. Ordered by what blocks what.
 
-Nothing here is a discovery in progress — this is the complete list. If an item is
-not on it, it is not owed.
+Nothing here is a discovery in progress — this is the complete list. **If an item is
+not on it, it is not owed.**
+
+Completed items are removed from these tables rather than struck through, so the
+list stays short enough to read. What shipped and why lives in `CHANGELOG.md`; the
+one-line ledger is under *Recently closed* at the end of this section.
 
 ### A. Blocks M6 completion
 
@@ -246,11 +250,21 @@ not on it, it is not owed.
 
 | # | Item | Effort | Notes |
 |---|------|--------|-------|
-| B1 | ~~**Wire the metrics producer**~~ | ✅ **DONE 2026-07-31** | [ADR 011](../adr/011-metrics-endpoint-serves-agnosai-metrics.md) gave `/metrics` agnosai's own registry and explicitly staged the producer as a `crew_runner` bite; until now the endpoint rendered a well-formed exposition of **zeros**. `agnosai_crew_runner_run` now records the crew gauge on entry and on **every** exit, and `_agnosai_crew_record_metrics` folds each run's results into `tasks_completed` / `tasks_failed` / `tokens` / `cost_micro_usd`. Recorded in **one pass after the workers join** rather than at the four result-construction sites: every path lands in `results` (success, tool error, LLM error, cancellation stub), so one loop cannot miss an arm the way four sites drift, and the token/cost figures are already on each result's metadata. The recorders were already atomic (`atomic_fetch_add`, CAS loop for the saturating gauge), so worker-thread recording would have been safe — it is simply not needed. **The bug worth recording:** the first cut recorded the start *before* the DAG-cycle early return, so a cyclic spec ratcheted `crews_active` upward for the life of the process. The error path now balances the gauge — it emits no `crew_completed` *event* (a cyclic spec is an error, not a crew that failed) but the gauge is a separate contract. Pinned by a mutation-verified assertion in `tests/orch_crew_runner.tcyr`. Note the include-order consequence: `src/server/prometheus.cyr` must precede `src/orchestrator/crew_runner.cyr` (already true in `src/main.cyr`; added to both affected `.tcyr` files). |
-| B2 | **Grow the MCP surface onto bote** *(was: "decide whether to drop `[deps.bote]`" — wrong framing, corrected 2026-07-31)* | Medium | **bote IS the MCP layer**, and this is an agent-orchestration system: `dist/bote-core.cyr` ships the JSON-RPC protocol, registry, dispatcher, schema validation, plus **18 `prompt_*`** and **15 `resource_*`** fns. The earlier row read "agnosai calls zero bote symbols, so decide whether the dep earns ~93 KB" — the observation is true, the conclusion was backwards. `src/server/routes/mcp.cyr` answers `initialize` / `tools/list` / `tools/call`, which is **exactly the oracle's three methods and therefore full parity**; it is a thin slice of MCP, not evidence the protocol library is unneeded. The real work is the reverse of dropping it: MCP prompts, resources and subscriptions are the natural next surface for a crew orchestrator, and they are already in the pinned bundle. **One genuine blocker to delegating, verified:** `dispatcher_dispatch` hardcodes `"serverInfo":{"name":"bote"` at `lib/bote-core.cyr:1559` where the oracle emits `"name":"agnosai"`, so wiring the dispatcher today would change the wire. **Fixed upstream: bote 3.3.0 adds `dispatcher_set_server_info(d, name, version)`** (ships in `[lib.core]`, which is the profile agnosai pins). Bump `[deps.bote]` to `tag = "3.3.0"` once it is tagged. Note this does **not** mean the route should delegate today — the oracle uses bote's protocol *types* but explicitly declines its Dispatcher (`mcp.rs:3-5`), so hand-building the envelope IS the parity behaviour. 3.3.0 clears the way for the surface after this one. |
-| B3 | **Thread the bayan `_a` constructors** — 🟡 **core group done, 6 of ~20 modules** | Large (small bites) | **Unblocked by cyrius 6.5.5** (bayan 1.4.0); the upstream ask this row used to carry shipped there, so nothing waits on anything. ✅ **`core` complete** — json, task, resource, agent, message, crew: **27 `_a` forms**, each with a bare-name wrapper delegating through `default_alloc()`. Measured: `agnosai_task_to_json` **1792 → 0 B/response**, `agnosai_crew_to_json` on a 10x10 crew **44,032 → 0 B** and 11% faster. Every `_a` form is pinned as agreeing byte-for-byte with its global twin. **Two traps for the next bite:** (1) **Cyrius silently accepts a duplicate parameter name** — `agnosai_agent_to_value(a)` already used `a`, and adding an allocator also named `a` compiled clean while every `load64(a + OFFSET)` read the allocator, SIGSEGV with no assertion output. Check the existing parameter names before prepending. (2) **`map_keys` survives every substitution** — it allocates its key vec via `vec_new()` on the global bump with no `_a` form, and it silently caps the win; it turned up three separate times. Use `_agnosai_map_slots` / `_slot_live` / `_slot_key` / `_slot_val` from `src/core/json.cyr`. **Remaining: orchestrator, tools, llm, server/routes** — the routes tier is where the arena actually runs, but it consumes core, which is why core went first. |
-| B4 | ~~**Migrate `src/order.cyr` to the stdlib sort**~~ | ✅ **DONE 2026-07-31** | `vec_sort_by` / `vec_select_nth` shipped in cyrius 6.5.4, closing agnosai's own filing. `src/order.cyr` **184 → 98 lines** — the vendored heapsort, quickselect, median-of-3, Hoare partition and swap are gone; the public `agnosai_*` API and its **bounds contract** stay. That contract is the whole reason this is a wrapper rather than a rename: `vec_select_nth` **aborts the process** on `k < 0` or `k >= len`, where this module returns 0, and three assertions in `tests/order.tcyr` pin that (empty vec, past-the-end, negative k). An empty latency vector is an ordinary state for a load test that recorded no samples, not a reason to kill the server. Measured same-box before/after: `sort_100k` 79.6 → **20.3 ms** (3.9x), `sort_10k` 6.30 → **1.71 ms** (3.7x), `sort_100k_already_sorted` 79.1 → **3.31 ms** (**23.9x** — introsort has a pre-sorted fast path, heapsort has none), `three_percentiles_100k` 10.7 → **7.81 ms** (1.4x), `select_nth_100k` 6.89 → **5.09 ms** (1.4x). 57 suites green. Bench labels dropped their now-wrong `_heapsort` suffix. |
-| B5 | **Remaining `str_from("lit")` classes** | Medium | 86 `str_eq(x, str_from("lit"))` sites are **done** (→ `str_eq_cstr`, which already existed at `lib/str.cyr:617`): decode path 482 ns / 128 B per 3-decode round → **213 ns / 0 B**. `src/` went 910 → 824 sites. **What is left, and why the obvious next step is NOT worth taking yet:** 149 `return str_from("lit")` constant returns look like the natural follow-on, but hoisting them to init-time globals costs **121 new top-level symbols** and buys **48 B of 1944 B (2.5%)** on the encode path — measured, not estimated. Do B3's local half first; it is 64% of the same number. Revisit this only if a profile still shows it after B3. The ~49 in-loop `str_from` hoists (11 modules, worst are `server/routes/dashboard.cyr` and `orchestrator/crew_runner.cyr` at 10 each) are the better of the two leftovers — same mechanical shape, no new symbols. The 380 sites under `tests/` are deliberately left: a test binary is short-lived, so the leak is inert. |
+| B1 | **Grow the MCP surface onto bote** *(was: "decide whether to drop `[deps.bote]`" — wrong framing, corrected 2026-07-31)* | Medium | **bote IS the MCP layer**, and this is an agent-orchestration system: `dist/bote-core.cyr` ships the JSON-RPC protocol, registry, dispatcher, schema validation, plus **18 `prompt_*`** and **15 `resource_*`** fns. The earlier row read "agnosai calls zero bote symbols, so decide whether the dep earns ~93 KB" — the observation is true, the conclusion was backwards. `src/server/routes/mcp.cyr` answers `initialize` / `tools/list` / `tools/call`, which is **exactly the oracle's three methods and therefore full parity**; it is a thin slice of MCP, not evidence the protocol library is unneeded. The real work is the reverse of dropping it: MCP prompts, resources and subscriptions are the natural next surface for a crew orchestrator, and they are already in the pinned bundle. **One genuine blocker to delegating, verified:** `dispatcher_dispatch` hardcodes `"serverInfo":{"name":"bote"` at `lib/bote-core.cyr:1559` where the oracle emits `"name":"agnosai"`, so wiring the dispatcher today would change the wire. **Fixed upstream: bote 3.3.0 adds `dispatcher_set_server_info(d, name, version)`** (ships in `[lib.core]`, which is the profile agnosai pins). Bump `[deps.bote]` to `tag = "3.3.0"` once it is tagged. Note this does **not** mean the route should delegate today — the oracle uses bote's protocol *types* but explicitly declines its Dispatcher (`mcp.rs:3-5`), so hand-building the envelope IS the parity behaviour. 3.3.0 clears the way for the surface after this one. |
+| B2 | **Thread the bayan `_a` constructors** — 🟡 **core group done, 6 of ~20 modules** | Large (small bites) | **Unblocked by cyrius 6.5.5** (bayan 1.4.0); the upstream ask this row used to carry shipped there, so nothing waits on anything. ✅ **`core` complete** — json, task, resource, agent, message, crew: **27 `_a` forms**, each with a bare-name wrapper delegating through `default_alloc()`. Measured: `agnosai_task_to_json` **1792 → 0 B/response**, `agnosai_crew_to_json` on a 10x10 crew **44,032 → 0 B** and 11% faster. Every `_a` form is pinned as agreeing byte-for-byte with its global twin. **Two traps for the next bite:** (1) **Cyrius silently accepts a duplicate parameter name** — `agnosai_agent_to_value(a)` already used `a`, and adding an allocator also named `a` compiled clean while every `load64(a + OFFSET)` read the allocator, SIGSEGV with no assertion output. Check the existing parameter names before prepending. (2) **`map_keys` survives every substitution** — it allocates its key vec via `vec_new()` on the global bump with no `_a` form, and it silently caps the win; it turned up three separate times. Use `_agnosai_map_slots` / `_slot_live` / `_slot_key` / `_slot_val` from `src/core/json.cyr`. **Remaining: orchestrator, tools, llm, server/routes** — the routes tier is where the arena actually runs, but it consumes core, which is why core went first. |
+| B3 | **Remaining `str_from("lit")` classes** | Medium | 86 `str_eq(x, str_from("lit"))` sites are **done** (→ `str_eq_cstr`, which already existed at `lib/str.cyr:617`): the decode path went 482 ns / 128 B per 3-decode round → **213 ns / 0 B**, and `src/` from 910 to 824 sites. **Re-scoped now that B2's core group has landed.** The 149 `return str_from("lit")` constant returns were measured at 48 B of 1944 B (2.5%) and deferred as not worth 121 new top-level symbols — that verdict **no longer applies to a module B2 has threaded**, because in `core` those wire spellings now come from the arena via `*_to_wire_a` and cost nothing. So: **do not hoist constant returns to globals.** Give them `_a` forms as part of each module's B2 bite, which is what `core/task` and `core/crew` did. What genuinely remains here is the ~49 **in-loop** `str_from` hoists (11 modules; worst are `server/routes/dashboard.cyr` and `orchestrator/crew_runner.cyr` at 10 each) — same mechanical shape, no new symbols, and independent of B2. The 380 sites under `tests/` stay: a test binary is short-lived, so the leak is inert. |
+
+### Recently closed
+
+One line each; the reasoning and measurements are in `CHANGELOG.md`.
+
+| Closed | What |
+|---|---|
+| 2026-07-31 | **Wire the metrics producer** — `/metrics` stopped rendering zeros; ADR 011's staged producer landed in `crew_runner`. Found and fixed a gauge leak on the cyclic-DAG path in the same change. |
+| 2026-07-31 | **`src/order.cyr` → stdlib sort** — 184 → 98 lines; `sort_100k` 79.6 → 20.3 ms, already-sorted 79.1 → 3.31 ms. Public API and bounds contract kept as a wrapper, because `vec_select_nth` aborts where this returns 0. |
+| 2026-07-31 | **`src/` mirrors `rust-old/src/`** — 65 `git mv` renames, verified by a byte-identical binary. |
+| 2026-07-31 | **bayan `_a` JSON surface** — filed, implemented and released as bayan 1.4.0, folded in cyrius 6.5.5. Was the blocker under B2. |
+| 2026-07-31 | **bote `serverInfo` hardcode** — filed and fixed as bote 3.3.0 (`dispatcher_set_server_info`). Pin bump owed under B1. |
 
 ### C. Upstream — filed and waiting
 
@@ -258,25 +272,34 @@ Nothing here blocks agnosai today; each is a residual agnosai measured and hande
 
 | Dep | Open filings |
 |---|---|
-| cyrius | `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md` — ✅ **resolved in 6.5.4** (see B4, consumption still owed). Still open: `2026-07-28-sock-send-result-allocates-per-call.md` (16 B/response, pinned by an exact-bound test in sandhi), `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md`, `2026-07-29-fmt-int-buf-i64-min.md` |
+| cyrius | `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md` — ✅ **resolved in 6.5.4 and consumed** (`src/order.cyr` is now a wrapper). Still open: `2026-07-28-sock-send-result-allocates-per-call.md` (16 B/response, pinned by an exact-bound test in sandhi), `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md`, `2026-07-29-fmt-int-buf-i64-min.md` |
 | sandhi | `backlog` silently ignored by `run_opts`/`run_async`; chunked start hardcodes `" OK"`; **inbound** chunked decoding unsupported (1.9.4 answers 501 — honest, but not support) |
-| bayan | YAML parse into the tagged value tree (`2026-07-16-...`) — gates M10's YAML half, nothing sooner. Plus B3, unfiled. |
-| sigil | `2026-07-30-rsa-verify-uses-secret-exponent-ladder.md` — ✅ **archived upstream**, fixed in sigil's "rsa repairs" commit and contained in the pinned **3.12.2**. See C1 below. |
+| bayan | YAML parse into the tagged value tree (`2026-07-16-...`) — gates M10's YAML half, nothing sooner. The `_a` JSON ask is **✅ shipped as bayan 1.4.0** and folded in cyrius 6.5.5. |
+| sigil | `2026-07-30-rsa-verify-uses-secret-exponent-ladder.md` — ✅ **archived upstream**, fixed, vendored and **measured** (see C1). |
+| bote | `serverInfo` hardcoded to `"bote"` in `dispatcher_dispatch` — ✅ **fixed as bote 3.3.0** (`dispatcher_set_server_info`). Pin bump owed under B1. |
 
-**C1 — re-resolve deps and re-measure the RS256 verify path.** agnosai pins sigil
-3.12.2, which contains the fix, but the vendored `lib/sigil.cyr` still documents
-`bn_mont_modexp` (the constant-time secret-exponent ladder) as carrying "the live
-RSA verify + sign paths" — so **`cyrius deps` has not been re-run since the fix
-landed.** Everything downstream of the old measurement is therefore unverified:
-the 3.29 ms verify, the ~235× gap against OpenSSL, and the **~300
-JWT-verifies/sec ceiling that was the entire argument for mounting `rate_limit`**.
-Re-resolve, re-measure, then revisit D1.
+**C1 — ✅ RESOLVED 2026-07-31.** This read *"`cyrius deps` has not been re-run
+since the fix landed"*, which is no longer true: `lib/sigil.cyr` is the pinned
+**3.12.2** and `lib/` matches the 6.5.5 snapshot exactly. Re-measured on this box:
+
+| benchmark | before (3.12.1 era) | now |
+|---|---|---|
+| `auth_jwt_verify_ok` | 3.31 ms | **1.202 ms** (2.75x) |
+| `auth_jwt_reject_bad_alg` | 3.29 ms | **1.201 ms** |
+| `auth_jwt_key_prepare` | 10.7 µs | 10.5 µs |
+
+The per-core JWT ceiling therefore moves from **~300/sec to ~830/sec**. The
+`alg` check still sits *after* signature verification by design — parsing
+attacker-controlled JSON before authenticating was measured at ~53x heap
+amplification — so a rejected token still pays the modexp, which is why the two
+rows match. That ordering is unchanged and deliberate; see the CHANGELOG's
+Security section for the reasoning. **D1's argument moves with these numbers.**
 
 ### D. Decisions deferred to a human
 
 | # | Decision | Where it stands |
 |---|---|---|
-| D1 | **Mount `rate_limit`?** | Ported and tested (bite 14), **not mounted** — matching the oracle, which never installs the middleware. `agnosai_serve_with_rate_limit` is the opt-in path. Mounting it by default is a **wire change**: clients fine today would start seeing 429s at a threshold agnosai chose, not one the oracle documents. The argument for mounting rested on the JWT-verify ceiling — see C1, now unverified. |
+| D1 | **Mount `rate_limit`?** | Ported and tested (bite 14), **not mounted** — matching the oracle, which never installs the middleware. `agnosai_serve_with_rate_limit` is the opt-in path. Mounting it by default is a **wire change**: clients fine today would start seeing 429s at a threshold agnosai chose, not one the oracle documents. The argument for mounting rested on the JWT-verify ceiling, which **C1 has now re-measured at 1.202 ms — ~830 verifies/sec per core, up from ~300**. That weakens the case for mounting by default without removing it: an unauthenticated flood still costs a modexp per request, because the `alg` check deliberately sits after signature verification. Still a human call. |
 | D2 | **`"personality": null` on the wire** | bhava is a *hard* dep in the oracle, so the default Rust build emits an explicit null. Emitting the literal keeps byte-exact default-build parity; omitting it is the line between "bhava deferred" and "the wire changed." See `cyrius-port-plan.md:274`. |
 
 ### E. Known-unreachable code kept for oracle shape
