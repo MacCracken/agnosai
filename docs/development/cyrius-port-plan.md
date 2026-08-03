@@ -1,9 +1,14 @@
 # AgnosAI — Rust → Cyrius Port Plan (v2.0.0)
 
-> Status: **Phase 5 (`server`) in progress — 20 of 21 files.** Phases 0-4 complete.
-> Pinned **cyrius 6.5.5** (2026-07-31). **All eight blockers are closed** — the
-> table below keeps each verdict because the reasoning must not be re-derived, but
-> none of them gates work any more:
+> Status: **Phases 0-5 complete** — `server` finished 2026-08-03, so the API
+> serves, streams, and drains. Next up: Phase 6 (`sandbox`).
+> Pinned **cyrius 6.5.6** (2026-08-03).
+>
+> **All eight numbered blockers are closed, and nothing blocks anything.** The
+> table below is kept as a *reasoning archive*, not a work list — several of its
+> verdicts shaped designs that are still live, and re-deriving them costs more
+> than reading them. **A `blocker #N` citation in `src/` points here**; it is a
+> footnote to a closed analysis, never an open issue.
 >
 > | # | Closed by |
 > |---|---|
@@ -16,9 +21,9 @@
 > | 7 live Rust bug | fixed 2026-07-28; the oracle is valid |
 > | 8 no O(n log n) sort | cyrius 6.5.4 shipped `vec_sort_by`/`vec_select_nth`; `src/order.cyr` consumes them |
 >
-> **Live owed work is not here — it is in [`roadmap.md`](roadmap.md)** under *Open
-> blockers and owed work*. This file is the plan of record and the reasoning
-> archive; the roadmap is the schedule.
+> **Live owed work is not here — it is in [`roadmap.md`](roadmap.md)** under
+> *Owed work*. This file is the plan of record and the reasoning archive; the
+> roadmap is the schedule.
 > Original 2026-07-28 framing follows, kept because the reasoning must not be
 > re-derived: baseline greened, blockers re-verified against cyrius 6.4.83, two
 > upstream fixes shipped.
@@ -74,12 +79,18 @@ Handler shape `fn(ctx, cfd, req_buf, req_len)` is identical across run/run_async
 run_pooled (sandhi.cyr:13419-13420), so it maps 1:1 onto agnosai's axum Router.
 Keep `lib/async.cyr` in scope for **client-side fan-out only**.
 
-## Blockers (must be resolved or consciously accepted)
+## Blockers — all closed (reasoning archive)
 
+> **Every row below is resolved.** Nothing in this table gates work; it is kept
+> because the *reasoning* behind several still-live designs is here and nowhere
+> else — the evict-oldest channel semantics, the per-request arena invariant,
+> the cx-is-not-a-sandbox finding. Treat it as the footnotes for
+> `blocker #N` citations in `src/`.
+>
 > **Re-verified 2026-07-28 against cyrius 6.4.83** by reading each module (not by
 > grepping crate names), with every "resolved" verdict independently refuted
-> before it was accepted. Status column is current; the Detail column keeps the
-> original finding so the reasoning is not re-derived.
+> before it was accepted. Status column records how each closed; the Detail
+> column keeps the original finding verbatim.
 
 | # | Blocker | Status | Detail |
 |---|---|---|---|

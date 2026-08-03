@@ -565,8 +565,8 @@ libro 2.8.4 arrives transitively via bote.
 ## Handoff
 
 > **Refreshed 2026-07-31.** This section is a pointer, not a diary. Everything
-> that is *owed* lives in [`roadmap.md`](roadmap.md) → *Open blockers and owed
-> work*, which is the single list; if an item is not there, it is not owed. What
+> that is *owed* lives in [`roadmap.md`](roadmap.md) → *Owed work*, which is the
+> single list; if an item is not there, it is not owed. What
 > already shipped and why is in `CHANGELOG.md`. This file carries only the numbers
 > and the standing rules.
 

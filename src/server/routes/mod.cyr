@@ -18,15 +18,19 @@
 # rewrite. `server_auth` proved the shape — all ten of its oracle
 # `#[tokio::test]`s ported as ordinary assertions.
 #
-# ## Nothing here allocates in an arena yet, and that is temporary
+# ## Nothing here allocates in an arena yet — the arena exists, this tier has
+# ## not been moved onto it
 #
-# `bayan_json_v_*` builds on the no-free global bump and threads no allocator.
-# Every handler that parses a request body therefore grows the heap per request
-# until blocker #3's per-worker arena lands with the router bite. `server_auth`
-# has the same exposure and closed the *unauthenticated* half by verifying
-# before parsing; the authenticated half is the router's to close. Each route
-# suite should assert an `alloc_used()` bound the way
-# `server_auth.tcyr::_t_jwt_preauth_allocation_is_bounded` does.
+# The per-worker arena landed with the transport (`src/server/serve.cyr`), and
+# bayan's `_a` parse/build forms shipped in 1.4.0. Neither is missing any more.
+# What is missing is the consumption: these handlers still call the bare
+# `bayan_json_v_*` forms, which build on the no-free global bump, so every one
+# that parses a request body grows the heap per request. Moving them onto `_a`
+# is roadmap **B2**, one module per bite; `core` is done and this tier is not.
+#
+# `server_auth` has the same exposure and closed the *unauthenticated* half by
+# verifying before parsing. Each route suite should assert an `alloc_used()`
+# bound the way `server_auth.tcyr::_t_jwt_preauth_allocation_is_bounded` does.
 # =========================================================================
 
 # The agnosai version `/ready` reports — the oracle's `env!("CARGO_PKG_VERSION")`.

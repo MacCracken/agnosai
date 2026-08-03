@@ -24,8 +24,9 @@ Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran
 Scaffolded with `cyrius port` on 2026-07-28. `rust-old/` is the reference oracle.
 The plan of record is
 [`docs/development/cyrius-port-plan.md`](docs/development/cyrius-port-plan.md) —
-read it before starting any bite; it carries the verified blocker status and the
-corrections that must not be re-derived.
+read it before starting any bite. Its blocker table is a **reasoning archive** —
+all eight are closed and nothing gates work — but it carries the corrections and
+the analysis behind several still-live designs, which must not be re-derived.
 
 ### Layout — `src/` mirrors `rust-old/src/`
 
@@ -121,7 +122,7 @@ cyrius coverage --min 80                    # the 80% gate — its own CI step
 - **`str_builder_*` over string concatenation** — avoid temporary allocations (the Cyrius form of "`write!` over `format!`")
 - **Borrow pointers over copies** — allocate only when you must (the Cyrius form of "Cow over clone")
 - **Vec arena over HashMap** — when indices are known, direct access beats hashing
-- **Thread the `_a` allocator variants** — a per-request arena with one `reset_via` exit path. Bare `sandhi_server_*` / `_send_*` wrappers allocate on the no-free global bump; see port plan blocker #3
+- **Thread the `_a` allocator variants** — a per-request arena with one `reset_via` exit path. Bare `sandhi_server_*` / `_send_*` wrappers allocate on the no-free global bump; the design is in the port plan under its closed blocker #3
 - **sakshi on all operations** — structured logging for audit trail
 - **Prefix every public symbol `agnosai_*`.** Cyrius has ONE flat namespace and last-definition-wins. Short names (`add`, `run`) also get falsely credited by coverage's substring matching. `_`-prefix genuine internals so they leave the coverage denominator
 - `var buf[N]` = N **bytes**, not N entries

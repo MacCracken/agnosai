@@ -243,23 +243,36 @@ assembler, loader-JSON, presets, versioning, k8s_crd (which parses **JSON** only
 the ` ```yaml ` in its doc comment is a doc comment). Defers ZIP container +
 packaging + YAML.
 
-## Open blockers and owed work
+## Owed work
 
-**Status as of 2026-07-31.** Every item below is **open**. Each is self-contained:
-file paths, measured numbers, and what "done" means, so it can be picked up without
-reading the session that found it. Ordered by what blocks what.
+**Status as of 2026-08-03. Nothing here blocks anything.** Every remaining item
+is work we owe ourselves — quality, coverage, or a decision — and any of it can
+be picked up in any order. Each entry is self-contained: file paths, measured
+numbers, and what "done" means, so it can be started without reading the session
+that found it.
 
-Nothing here is a discovery in progress — this is the complete list. **If an item is
-not on it, it is not owed.**
+> **On the word "blocker".** This section was *"Open blockers and owed work"*
+> through M6, when the distinction mattered: some items genuinely stopped the
+> next bite from starting. **All eight of the port plan's numbered blockers are
+> closed**, and so is the last thing that blocked a milestone. The numbered
+> references still scattered through `src/` comments (*"blocker #3's arena"*,
+> *"blocker #4's second consumer"*) are **historical citations, not open
+> issues** — they name the analysis that produced a design, and the port plan's
+> blocker table is where that analysis lives.
+
+Nothing here is a discovery in progress — this is the complete list. **If an item
+is not on it, it is not owed.**
 
 Completed items are removed from these tables rather than struck through, so the
 list stays short enough to read. What shipped and why lives in `CHANGELOG.md`; the
 one-line ledger is under *Recently closed* at the end of this section.
 
-### A. Blocks M6 completion
+### A. Blocked the M6 milestone — ✅ retired 2026-08-03
 
-**Empty — M6 is complete.** Bites 15c (SSE) and 16 (bind) both closed 2026-08-03.
-
+Empty by completion, and kept as a heading only so the **B/C/D/E** letters below
+stay stable: they are cited from `state.md` and from `src/` comments, and
+renumbering to close a cosmetic gap would break every one of them. A1 (SSE) and
+A2 (the `main` bind) are in *Recently closed*.
 
 ### B. Owed — flagged in earlier bites, never done
 

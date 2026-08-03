@@ -13,26 +13,27 @@
 #   3. the a2a callback dispatch `server_routes_a2a` left to this bite;
 #   4. the decision on whether to mount `rate_limit`.
 #
-# ## The arena covers sandhi's half, and bayan's half is still on the bump
+# ## The arena covers sandhi's half; the handlers are threaded module by module
 #
-# Blocker #3's mitigation is "write our own handler on the raw
-# `fn(ctx, cfd, buf, blen)` signature, take a per-worker arena, and use the `_a`
-# variants **everywhere**". This does that: `_get_method_a`, `_get_path_a`,
-# `_find_header_a`, `_send_response_a`, `_send_status_a` — every sandhi call in
-# the request path is allocator-threaded, and sandhi's worker rewinds the arena
-# before the next request, so that half costs nothing per request.
+# The design the port plan prescribed (its closed blocker #3) is "write our own
+# handler on the raw `fn(ctx, cfd, buf, blen)` signature, take a per-worker
+# arena, and use the `_a` variants **everywhere**". This does that:
+# `_get_method_a`, `_get_path_a`, `_find_header_a`, `_send_response_a`,
+# `_send_status_a` — every sandhi call in the request path is
+# allocator-threaded, and sandhi's worker rewinds the arena before the next
+# request, so that half costs nothing per request.
 #
-# **It does not make `alloc_used()` flat, and claiming so would be false.**
-# `bayan_json_v_parse_buf` and `bayan_json_v_build` thread no allocator and
-# bayan exposes **no `_a` variants for either** (verified: zero matches for
-# `^fn bayan_json_v_(parse_buf_a|build_a)\(` in `lib/bayan.cyr`). Every handler
-# that reads a request body or builds a JSON response therefore still grows the
-# no-free global bump, and the arena cannot reach it.
+# **`alloc_used()` is still not flat overall, and claiming otherwise would be
+# false.** The reason has changed, though, and the old one is worth not
+# repeating: this header used to say bayan "exposes **no** `_a` variants" for
+# parse and build. **bayan 1.4.0 shipped them** (folded in cyrius 6.5.5), so the
+# capability exists. What remains is consuming it — each module's
+# `bayan_json_v_*` calls have to be moved onto their `_a` forms one bite at a
+# time, which is roadmap **B2**, and only `core` is done.
 #
-# So the honest statement is: **the transport is flat; the handlers are not.**
-# `tests/server_serve.tcyr` measures both halves separately rather than
-# asserting a single number, and the residual is bayan's to fix — an `_a` parse
-# and build API is the filing that closes it.
+# So the honest statement is: **the transport is flat; a handler is flat once
+# its module has been threaded.** `tests/server_serve.tcyr` measures the two
+# halves separately rather than asserting a single number.
 #
 # ## `rate_limit` is NOT mounted — matching the oracle
 #
