@@ -386,6 +386,59 @@ fn _t_bind_failure_returns(): i64 {
     return 0;
 }
 
+# Graceful shutdown (ADR 013). Unblocked by cyrius 6.5.6, which vendors sandhi
+# 1.9.9's `sandhi_server_options_stop_flag` — before it, ADR 012 recorded that
+# no amount of signal handling could reach a loop parked in `accept`.
+fn _t_shutdown_flag_wired(): i64 {
+    assert(agnosai_serve_stop_requested() == 0, "no shutdown is requested at rest");
+
+    # The mount must hand sandhi the flag, or the whole mechanism is inert while
+    # looking correct — the signal thread would set a flag nobody polls.
+    var s = _t_state();
+    var o = agnosai_serve_mount(s, 0);
+    assert(sandhi_server_options_get_stop_flag(o) != 0,
+    "mount wires a stop flag into the sandhi options");
+    assert(sandhi_server_options_get_stop_flag(o) == &_agnosai_serve_stop,
+    "...and it is THIS module's flag, the one the signal thread writes");
+
+    # Wired on the opt-in entry point too — a rate-limited server must still be
+    # stoppable.
+    var o2 = agnosai_serve_mount(s, agnosai_rate_limit_new(10000, 2));
+    assert(sandhi_server_options_get_stop_flag(o2) == &_agnosai_serve_stop,
+    "the rate-limited mount wires it as well");
+    agnosai_serve_mount(s, 0);
+    return 0;
+}
+
+# The signal path end to end, in-process: install the handler, signal ourselves,
+# and confirm the flag flips.
+#
+# This runs LAST in the suite. `agnosai_serve_install_signals` blocks
+# SIGINT/SIGTERM for the whole process and parks a thread on a signalfd, so
+# anything after it inherits a changed signal mask. Ordering it last keeps that
+# contained rather than letting it leak into unrelated assertions.
+fn _t_shutdown_signal_sets_flag(): i64 {
+    assert(agnosai_serve_install_signals() == 1, "signal handlers install");
+    assert(agnosai_serve_stop_requested() == 0, "installing does not itself request a stop");
+
+    # SIGTERM to self. Blocked, so it lands on the signalfd rather than killing
+    # the test — which is exactly the property being asserted: if the mask were
+    # not installed first, this line would terminate the suite instead of
+    # failing an assertion.
+    sys_kill(sys_getpid(), SIGTERM);
+
+    # The reader thread has to be scheduled. Poll rather than sleeping a fixed
+    # amount, so a loaded box does not make this flaky.
+    var waited = 0;
+    while (waited < 2000) {
+        if (agnosai_serve_stop_requested() == 1) { waited = 5000; }
+        if (waited < 5000) { sleep_ms(10); waited = waited + 10; }
+    }
+    assert(agnosai_serve_stop_requested() == 1,
+    "a delivered SIGTERM sets the stop flag the serve loops poll");
+    return 0;
+}
+
 # `agnosai_serve_parse_port` reproduces `u16::from_str`, which neither stdlib
 # parser does. The cases that matter are the ones where the two stdlib parsers
 # answer a NUMBER rather than failing — those are the silent misbinds.
@@ -498,8 +551,11 @@ fn main(): i64 {
     _t_handler_end_to_end();
     _t_mount();
     _t_parse_port();
+    _t_shutdown_flag_wired();
     _t_bind_failure_returns();
     _t_allocation_profile();
+    # LAST — installs a process-wide signal mask; see the fn's own note.
+    _t_shutdown_signal_sets_flag();
 
     return assert_summary();
 }

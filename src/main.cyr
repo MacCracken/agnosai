@@ -9,7 +9,7 @@
 # printed `agnosai ready` and exited, so `agnosai_serve` was tested but never
 # called by anything.
 #
-# ## Five things in the oracle have no counterpart here, and none is an omission
+# ## Four things in the oracle have no counterpart here, and none is an omission
 #
 #   1. **`http_client`** (`main.rs:100-103`). `reqwest::Client::builder()
 #      .timeout(30s).pool_max_idle_per_host(10)` has nothing to construct:
@@ -19,17 +19,18 @@
 #   2. **`let app = router(state)`** (`main.rs:118`). Routing is compile-time
 #      dispatch here; `agnosai_serve_mount` is its counterpart and `serve` calls
 #      it (`src/server/serve.cyr:307`).
-#   3. **`with_graceful_shutdown` + `shutdown_signal()`** (`main.rs:130`,
-#      `:137-153`). **Not implementable on sandhi 1.9.8** — see ADR 012. This
-#      file installs no signal handler rather than one that reports a drain it
-#      cannot perform.
-#   4. **`tracing_subscriber::fmt().json()`** (`main.rs:69-72`). sakshi has no
+#   3. **`tracing_subscriber::fmt().json()`** (`main.rs:69-72`). sakshi has no
 #      JSON output mode and no `EnvFilter`, so no formatter is configured and
 #      lines emit as plain text on fd 2 at sakshi's default level. Log
 #      *content* matches the oracle line for line; log *transport and format*
 #      diverge, which is the honest way to state it.
-#   5. **`definitions: DashMap::new()`** (`main.rs:116`). Built inside
+#   4. **`definitions: DashMap::new()`** (`main.rs:116`). Built inside
 #      `agnosai_app_state_new` (`src/server/state.cyr:66`), not passed in.
+#
+# `with_graceful_shutdown` + `shutdown_signal()` (`main.rs:130`, `:137-153`)
+# **used to be a fifth** and no longer is: impossible on sandhi 1.9.8 (ADR 012),
+# implemented here once cyrius 6.5.6 vendored sandhi 1.9.9's stop flag. `main`
+# installs a `signalfd` SIGINT/SIGTERM handler and drains — see ADR 013.
 #
 # ## Nothing in this file is `.tcyr`-reachable
 #
@@ -242,7 +243,7 @@ fn _agnosai_main_log_int(level, msg, msg_len, key, key_len, n): i64 {
 # the unreachable belt-and-braces on Linux, where `exit_group` does not return.
 fn _agnosai_exit_process(code): i64 {
     #ifdef CYRIUS_TARGET_LINUX
-    syscall(SYS_EXIT_GROUP, code);
+    sys_exit_group(code);
     #endif
     syscall(SYS_EXIT, code);
     return 0;
@@ -326,10 +327,27 @@ fn main(): i64 {
         sakshi_info(str_data(line), str_len(line));
     }
 
-    # `INADDR_ANY()` is the oracle's `([0, 0, 0, 0], port)`. A return is fatal,
-    # never a clean shutdown — see the doc on `agnosai_serve` — so it maps
-    # straight onto a non-zero exit status.
-    return agnosai_serve(state, INADDR_ANY(), port);
+    # `with_graceful_shutdown(shutdown_signal())` (`main.rs:130`, `:137-153`).
+    # Installed BEFORE `agnosai_serve`, because `sys_sigprocmask` sets the
+    # calling thread's mask and workers inherit it — installed after, the pool
+    # would already be running unblocked and SIGTERM would kill a worker
+    # mid-request rather than draining.
+    #
+    # A failure here is a warning, not a boot failure: a server that cannot
+    # drain is strictly better than no server, and the oracle has no
+    # corresponding refusal.
+    if (agnosai_serve_install_signals() == 0) {
+        sakshi_warn(
+        "could not install signal handlers — shutdown will not be graceful", 65);
+    }
+
+    # `INADDR_ANY()` is the oracle's `([0, 0, 0, 0], port)`. Since cyrius 6.5.6
+    # this returns 0 for a requested stop and 1 for a failure, so it maps
+    # straight onto the exit status — and the oracle's
+    # `"server shut down gracefully"` line now has something true to report.
+    var rc = agnosai_serve(state, INADDR_ANY(), port);
+    if (rc == 0) { sakshi_info("server shut down gracefully", 28); }
+    return rc;
 }
 
 # Prefixed like everything else: this is a top-level `var` in Cyrius's single

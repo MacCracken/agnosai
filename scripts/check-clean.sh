@@ -95,8 +95,46 @@ if ! out=$(cyrius deps --verify 2>&1); then
 fi
 echo "deps --verify: $(printf '%s' "$out" | grep -oE '^[0-9]+ verified' || echo 'ok')"
 
+# --- lib/ actually matches the pinned toolchain snapshot -----------------
+# Added 2026-08-03. This is NOT redundant with `deps --verify` above, and the
+# difference is the whole reason it exists:
+#
+#   * `deps --verify` compares cyrius.lock against lib/ on disk. The lock is
+#     WRITTEN FROM disk, so it can only catch a lock that has gone stale — never
+#     a lib/ that has.
+#   * This compares lib/ against ~/.cyrius/versions/<pin>/lib, i.e. against what
+#     the pin actually says the stdlib is.
+#
+# Proven necessary the day it was added: after `cyrius lib sync --full` +
+# `cyrius deps` for the 6.5.6 bump, `lib/vani.cyr` was still 1.1.2 against the
+# snapshot's 1.1.3 — and `deps --verify` reported "105 verified, 0 failed",
+# because the lock had been regenerated from the stale file.
+#
+# Root cause, confirmed by controlled mutation: **`cyrius lib sync` skips on
+# file SIZE, not content.** A same-size edit survives `--full` (a one-character
+# swap is not restored); a size-changing edit is synced. A version-comment bump
+# like `1.1.2` -> `1.1.3` is exactly size-neutral, so a patch release whose only
+# change is the stamp never lands. Filed upstream.
+_snap="$HOME/.cyrius/versions/$(grep '^cyrius = ' cyrius.cyml | sed 's/.*"\(.*\)"/\1/')/lib"
+if [ -d "$_snap" ]; then
+    n=0
+    for f in "$_snap"/*.cyr; do
+        b=$(basename "$f")
+        [ -e "lib/$b" ] || { note "lib: $b missing from lib/"; fail=1; continue; }
+        if ! cmp -s "lib/$b" "$f"; then
+            note "lib: $b differs from the $(basename "$(dirname "$_snap")") snapshot"
+            fail=1
+        fi
+        n=$((n + 1))
+    done
+    echo "lib snapshot: $n files"
+else
+    note "lib snapshot: $_snap not found — cannot verify lib/ against the pin"
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "cleanliness check FAILED"
     exit 1
 fi
-echo "cleanliness check OK — fmt, lint, doc, vet, deny, deps --verify all clean"
+echo "cleanliness check OK — fmt, lint, doc, vet, deny, deps --verify, lib snapshot all clean"

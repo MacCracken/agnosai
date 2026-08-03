@@ -1,6 +1,22 @@
 # 012 — The server installs no signal handler and does not drain on shutdown
 
-## Status: Accepted
+## Status: Superseded by [013](013-graceful-shutdown-via-signalfd-and-stop-flag.md)
+
+**Superseded 2026-08-03, the same day it was written**, which is unusual enough
+to explain. This ADR's own Consequences section named the single upstream change
+that would reverse it. agnosai filed that change; **sandhi 1.9.9** implemented
+it and **cyrius 6.5.6** vendored it — so the decision below went from correct to
+obsolete within hours.
+
+**It is retained, not deleted**, because what it records is still true and still
+load-bearing: *why* the capability was absent, and — the part that took the
+longest to establish — that the blocker was **not** missing signal support. Two
+earlier documents asserted it was, and both were wrong. A future reader hitting
+a similar "we can't shut down" wall should read the diagnosis here before
+assuming it is theirs.
+
+See [ADR 013](013-graceful-shutdown-via-signalfd-and-stop-flag.md) for what
+agnosai actually does now.
 
 ## Context
 
@@ -99,18 +115,24 @@ The rejected alternatives, so they are not re-proposed:
   it is an ADR rather than a code comment. It does not change the *wire* — no
   request gets a different status or body — only what happens to connections
   already open when the process is asked to stop.
-- **Reversing it needs exactly one upstream change**, filed against sandhi: a
-  stop facility on the five `sandhi_server_run*` loops, e.g.
-  `sandhi_server_options_stop_flag(opts, ptr)` polled in the accept loop, or
-  simply publishing the listen fd. The teardown order 1.9.8 already ships is
-  correct for it — `lib/sandhi.cyr:14213` closes the handoff channel *before*
-  the listen fd, so workers' `chan_recv` returns 0 and they exit rather than
-  parking. When that lands, `src/main.cyr` gains a `signalfd` read and this ADR
-  is superseded, with no change to any other module.
+- **Reversing it needs exactly one upstream change**, and that change now
+  **exists**: sandhi **1.9.9** ships
+  `sandhi_server_options_stop_flag(opts, ptr)` on all five `sandhi_server_run*`
+  loops (2026-08-03). It works the way this ADR predicted — the teardown order
+  1.9.8 already shipped was correct for it, closing the handoff channel *before*
+  the listen fd so workers' `chan_recv` returns 0 and they exit rather than
+  parking. The one thing the prediction missed: a stop flag alone is not enough,
+  because blocking `accept` would only re-read it after the *next* connection.
+  1.9.9 arms the listen fd with `SO_RCVTIMEO` so `accept` surfaces periodically,
+  and the resulting EAGAIN was already classified as a non-counting retry.
+
+  ✅ **Vendored in cyrius 6.5.6 and consumed** — see
+  [ADR 013](013-graceful-shutdown-via-signalfd-and-stop-flag.md).
 
 ## Related
 
 - [ADR 004 — concurrency model](004-concurrency-model.md): why the server is
   `sandhi_server_run_pooled` in the first place.
-- `src/server/serve.cyr` — `agnosai_serve`'s doc records that a return is fatal
-  rather than a clean exit, which is the same fact from the caller's side.
+- [ADR 013](013-graceful-shutdown-via-signalfd-and-stop-flag.md) — what
+  superseded this, and the three load-bearing orderings the implementation
+  turned out to need.

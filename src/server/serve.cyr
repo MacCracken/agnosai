@@ -70,6 +70,81 @@ var AGNOSAI_SERVE_WORKERS = 100;
 var _agnosai_serve_state = 0;
 var _agnosai_serve_limiter = 0;
 
+# --- Graceful shutdown ----------------------------------------------------
+#
+# The oracle wraps its listener in `with_graceful_shutdown(shutdown_signal())`
+# (`rust-old/src/main.rs:130`), selecting over ctrl-C and SIGTERM.
+#
+# **This was impossible until cyrius 6.5.6** and is why
+# [ADR 012](../../docs/adr/012-no-graceful-shutdown-on-sandhi.md) exists: a
+# `sandhi_server_run*` loop read no flag, its only exit was a fatal accept, and
+# its listen fd was loop-local and never published — so a handler could fire
+# perfectly and the acceptor would still sit in `accept` forever. agnosai filed
+# it; sandhi 1.9.9 added `sandhi_server_options_stop_flag`, and 6.5.6 vendors
+# it. ADR 013 supersedes 012.
+#
+# The stop flag every serve loop polls. sandhi reads it and never writes it, so
+# a plain `store64` from the signal thread is sufficient — an aligned 8-byte
+# store is single-copy-atomic on every target here, with nothing to tear and no
+# ordering to establish.
+var _agnosai_serve_stop = 0;
+
+# SIGINT | SIGTERM as a sigset_t bitmask. Bit `n-1` is signal `n`, so SIGINT (2)
+# is 0x2 and SIGTERM (15) is 0x4000.
+var AGNOSAI_SHUTDOWN_SIGMASK = 0x4002;
+
+# Read one signal off `sfd` and ask the serve loop to stop.
+#
+# Runs on its own thread for the whole process lifetime. It blocks in `read`,
+# which costs nothing, and the single `read` is all it needs: the flag is
+# level-triggered, so a second signal has nothing to add — the loop is already
+# stopping and re-reporting would only race the teardown.
+#
+# `arg` is the signalfd. `signalfd_siginfo` is 128 bytes and every field is
+# discarded: *which* of the two signals arrived changes nothing about what
+# happens next, and the oracle's only use of the distinction is a log line.
+fn _agnosai_serve_signal_thread(arg): i64 {
+    var buf[128];
+    var n = sys_read(arg, &buf, 128);
+    if (n > 0) { sakshi_info("received shutdown signal, draining", 34); }
+    _agnosai_serve_stop = 1;
+    return 0;
+}
+
+# Install the SIGINT/SIGTERM handler that stops the serve loop. Returns 1 on
+# success, 0 if the process must run without graceful shutdown.
+#
+# **Call this BEFORE `agnosai_serve`.** The order is load-bearing twice over:
+#
+#   1. `sys_sigprocmask` sets the mask of the *calling thread*, and a new thread
+#      inherits its creator's. Blocking here — before `run_pooled` spawns
+#      workers — is what stops a worker from taking the signal and dying with
+#      default disposition. Installed after, the pool would already be running
+#      unblocked and SIGTERM would kill a worker mid-request.
+#   2. The signal must be blocked before the signalfd is created, or it is
+#      delivered conventionally and terminates the process instead.
+#
+# Not folded into `agnosai_serve` for one reason: the suites call `agnosai_serve`
+# with an unbindable address to prove a failed bind returns 1, and they should
+# not each leave a blocked signal mask and a parked thread behind. `main` calls
+# this; tests do not.
+fn agnosai_serve_install_signals(): i64 {
+    var mask[8];
+    store64(&mask, AGNOSAI_SHUTDOWN_SIGMASK);
+    if (sys_sigprocmask(SIG_BLOCK, &mask, 0) < 0) { return 0; }
+    var sfd = sys_signalfd(0 - 1, &mask, SFD_CLOEXEC);
+    if (sfd < 0) { return 0; }
+    thread_create(&_agnosai_serve_signal_thread, sfd);
+    return 1;
+}
+
+# Whether a shutdown has been requested. Exposed so a test can observe the flag
+# without reaching into the module's globals.
+fn agnosai_serve_stop_requested(): i64 {
+    if (_agnosai_serve_stop != 0) { return 1; }
+    return 0;
+}
+
 # --- Method mapping -------------------------------------------------------
 
 # sandhi's method string to the router's enum. Anything else is 405 — the
@@ -355,13 +430,32 @@ fn agnosai_serve_mount(state, limiter): i64 {
     _agnosai_serve_state = state;
     _agnosai_serve_limiter = limiter;
     agnosai_metrics_global();
-    return agnosai_serve_options();
+    var o = agnosai_serve_options();
+    # Wired unconditionally, and harmless when nothing installs a handler: the
+    # flag stays 0, sandhi only ever reads it, and the sole cost of pointing at
+    # it is SO_RCVTIMEO on the listen fd — 10 wakeups a second on an idle
+    # listener, which is not worth a second code path to avoid.
+    sandhi_server_options_stop_flag(o, &_agnosai_serve_stop);
+    return o;
 }
 
-# Serve `state` on `addr:port` forever. Returns 1 on a bind/listen failure, and
-# — since sandhi 1.9.8 — also on a structurally dead listener or after 200
-# consecutive resource failures, where earlier versions never returned once
-# listening. A caller must treat a return as fatal rather than as a loop exit.
+# Serve `state` on `addr:port` until stopped or the listener dies.
+#
+# **Return values, and the distinction matters as of cyrius 6.5.6:**
+#
+#   * **0** — a graceful stop was requested (see `agnosai_serve_install_signals`)
+#     and the loop wound down: it stopped accepting, closed the handoff channel
+#     so workers unpark rather than parking on a channel nobody will feed, then
+#     closed the listener.
+#   * **1** — failure. A bind/listen error, or — since sandhi 1.9.8 — a
+#     structurally dead listener or 200 consecutive resource failures.
+#
+# Before 6.5.6 there was no 0: a return was always fatal, because nothing could
+# ask the loop to stop (ADR 012). Callers written against that contract still
+# behave correctly, since the failure value is unchanged.
+#
+# In-flight requests are not drained. A worker already holding a connection
+# finishes it; `idle_ms` bounds how long that can take.
 #
 # **`addr` is a network-order IPv4 u32, not a string.** It is passed unmodified
 # to `sock_bind` → `sockaddr_in` → `store32(sa + 4, addr)` (`lib/net.cyr:99`),

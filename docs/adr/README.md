@@ -38,7 +38,8 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [009](009-auth-constant-time-secret-compare.md) | Constant-time shared-secret comparison via SHA-256 digests | Accepted |
 | [010](010-jwt-require-configured-iss-aud.md) | A configured `iss` or `aud` is required, not merely matched | Accepted |
 | [011](011-metrics-endpoint-serves-agnosai-metrics.md) | `/metrics` serves agnosai's own registry, not hoosh's | Accepted |
-| [012](012-no-graceful-shutdown-on-sandhi.md) | The server installs no signal handler and does not drain on shutdown | Accepted |
+| [012](012-no-graceful-shutdown-on-sandhi.md) | The server installs no signal handler and does not drain on shutdown | **Superseded by 013** |
+| [013](013-graceful-shutdown-via-signalfd-and-stop-flag.md) | Graceful shutdown via `signalfd` + sandhi's stop flag | Accepted |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`) and carry no `## Status` line. Left as written: renumbering

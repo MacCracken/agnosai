@@ -12,16 +12,33 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.5` (`cyrius.cyml`) — bumped 2026-07-31. Folds **bayan 1.4.0**,
-  sandhi 1.9.8, sigil 3.12.2, sakshi 2.4.7, yukti 2.3.2, mabda 4.0.8.
+- **Cyrius pin**: `6.5.6` (`cyrius.cyml`) — bumped 2026-08-03. Folds **sandhi 1.9.9**
+  (the stop facility agnosai filed), bayan 1.4.0, sigil 3.12.2, sakshi 2.4.7,
+  yukti 2.3.2, mabda 4.0.8. 6.5.6 also lands **`sys_exit_group`** and
+  **`async_await_readable_ms`**, both from agnosai filings.
 - **`lib/` matches the pin exactly**: 0 of 99 stdlib files differ from
-  `~/.cyrius/versions/6.5.5/lib`; build and test emit no drift or shadow warning.
+  `~/.cyrius/versions/6.5.6/lib`; build and test emit no drift or shadow warning.
   The six files outside the snapshot (ai-hwaccel, bote-core, kavach, libro, majra,
   tyche) are declared git deps, not staleness.
 
-  **Verify a bump by diffing the trees, not by a green `lib sync --full`.** On the
-  bayan repo the same command reported success and left five files stale; here it
-  was clean, but the check is cheap and the failure is silent.
+  **Verify a bump by diffing the trees, not by a green `lib sync --full`** — and
+  the reason is no longer folklore. The 6.5.6 bump left `lib/vani.cyr` at 1.1.2
+  against the snapshot's 1.1.3 while `lib sync --full` printed
+  `copied 99 .cyr files` and exited 0. **Root cause, confirmed by controlled
+  mutation: `cyrius lib sync` skips on file SIZE, not content.** A one-character
+  swap survives `--full`; appending one byte gets synced. A version stamp bump
+  (`1.1.2` → `1.1.3`) is exactly size-neutral, so a patch release whose only
+  change is the stamp never lands. That is also what the bayan incident
+  ("reported success and left five files stale") really was — deterministic, not
+  flaky. Filed upstream.
+
+  **`cyrius deps --verify` cannot catch this** and it is worth understanding why:
+  `cyrius.lock` is *written from* `lib/` on disk, so a stale file simply gets its
+  stale hash recorded. It reported `105 verified, 0 failed` against the stale
+  vani. `scripts/check-clean.sh` therefore gained a **separate** content-diff of
+  every `lib/*.cyr` against `~/.cyrius/versions/<pin>/lib` — mutation-verified,
+  and the two checks answer different questions:
+  lock-vs-disk versus disk-vs-pin.
 
   **One snapshot entry is genuinely absent and it is inert: `lib/unicode/`.**
   `cyrius lib sync --full` copies **99 `.cyr` files** and does not recurse into
@@ -74,7 +91,21 @@ adds `dispatcher_set_server_info` and is additive by construction — an unconfi
 dispatcher emits the pre-3.3.0 wire byte for byte. The duplicate-fn warning count is
 unchanged at **35**, and all 57 suites stayed green across the bump.
 
-### What 6.5.5 lands on agnosai
+### What 6.5.6 lands on agnosai
+
+- **sandhi 1.9.9 — the serve-loop stop facility agnosai filed.**
+  `sandhi_server_options_stop_flag(opts, ptr)` on all five loops, returning 0 for
+  a requested stop against 1 for a failure. This is what made graceful shutdown
+  possible; consumed immediately in `src/server/serve.cyr` +`src/main.cyr`, and
+  recorded as [ADR 013](../adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md).
+- **`sys_exit_group`** (`lib/syscalls_linux_common.cyr:155`) — also agnosai's
+  filing. `_agnosai_exit_process` now composes it instead of a hand-rolled
+  `syscall(SYS_EXIT_GROUP, …)`; the `#ifdef CYRIUS_TARGET_LINUX` guard stays,
+  because that file is included only by the two Linux target files.
+- **`async_await_readable_ms`** — agnosai's filing, found while building sandhi
+  1.9.9. Not used here; it removes the reason sandhi's cooperative loop polls.
+
+### What 6.5.5 landed
 
 - **bayan 1.4.0 completes the `_a` JSON surface** — `obj_set_a`, `build_a`,
   `build_pretty_a`, `parse_a`, `parse_buf_a`, `parse_ctx_a`, joining the eight value
@@ -131,9 +162,11 @@ oracle, all scheduled and none silently missing:
 | `telemetry/` | 322 | M9 (partial) |
 
 **`src/main.cyr` is no longer a stub** — as of 2026-08-03 it wires the shared
-state and calls `agnosai_serve` (roadmap A2, closed). The one thing it does not
-do is shut down gracefully; that is [ADR 012](../adr/012-no-graceful-shutdown-on-sandhi.md)
-and it is a sandhi limitation, not an omission.
+state, installs a `signalfd` SIGINT/SIGTERM handler, and calls `agnosai_serve`
+(roadmap A2, closed). **It drains on shutdown**
+([ADR 013](../adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md)); ADR 012,
+which recorded that as impossible, is superseded — the blocker was fixed upstream
+in sandhi 1.9.9 on agnosai's own filing, hours after it was written.
 
 ## Where the port is
 
@@ -555,14 +588,16 @@ libro 2.8.4 arrives transitively via bote.
 | Milestones | M0–M5 complete; **M6 (`server`) at 20 of 21 files — the binary serves** |
 | Remaining in M6 | `sse.rs::event_stream` + `routes/sse.rs` (roadmap A1) — bite 16 closed 2026-08-03 |
 | Not started | M7 `sandbox`, M8 `fleet`, M9 `telemetry`, M10 `definitions` |
-| Gates | build OK · 1,431 symbols / 71 files · fmt·lint·doc·vet·deny·deps--verify clean · 57 suites / 3,615 assertions · coverage 100% (900/900) |
+| Gates | build OK · 1,436 symbols / 71 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · 57 suites / 3,622 assertions · coverage 100% (902/902) |
 
-**The binary serves as of 2026-08-03.** `src/main.cyr` wires the state and
-calls `agnosai_serve`; it no longer prints `agnosai ready` and exits. It ships
-**no graceful shutdown**, deliberately and with an ADR
-([012](../adr/012-no-graceful-shutdown-on-sandhi.md)) — the blocker is that
-sandhi's accept loop cannot be made to return, **not** the missing signal helper
-this file and the roadmap both used to cite.
+**The binary serves as of 2026-08-03**, and **drains on SIGINT/SIGTERM** as of
+the 6.5.6 bump the same day. `src/main.cyr` wires the state, installs a
+`signalfd` handler, and calls `agnosai_serve`. ADR
+[013](../adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md) supersedes
+[012](../adr/012-no-graceful-shutdown-on-sandhi.md): the blocker was never the
+signal helper this file and the roadmap both used to cite — it was that sandhi's
+accept loop could not be made to return, which agnosai filed and sandhi 1.9.9
+fixed.
 
 ### Standing rules a new session should not re-derive
 

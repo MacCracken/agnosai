@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Graceful shutdown — the last gap in bite 16, closed by an upstream fix
+  agnosai filed itself.** `./build/agnosai` now drains on SIGINT and SIGTERM,
+  logging `"received shutdown signal, draining"` then the oracle's
+  `"server shut down gracefully"` — a line that until now had nothing true to
+  report. [ADR 013](docs/adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md)
+  supersedes [012](docs/adr/012-no-graceful-shutdown-on-sandhi.md), which shipped
+  earlier the same day recording that this was *impossible*.
+
+  It was impossible, and the reason was never missing signal support — that was
+  available all along. A `sandhi_server_run*` loop simply could not be made to
+  return: it read no flag, its only exit was a fatal accept, and its listen fd
+  was loop-local and never published. ADR 012 named the one upstream change that
+  would reverse it; agnosai filed it, **sandhi 1.9.9** implemented it, and
+  **cyrius 6.5.6** vendors it.
+
+  **Three orderings are load-bearing, and each is a real failure if inverted.**
+  (1) `sys_sigprocmask` sets the *calling thread's* mask and new threads inherit
+  it, so signals are blocked **before** `run_pooled` spawns workers — installed
+  after, SIGTERM would kill a worker mid-request instead of draining. (2) The
+  block must precede the `signalfd`, or the signal is delivered conventionally
+  and kills the process. (3) sandhi closes the handoff channel **before** the
+  listen fd, so workers' `chan_recv` returns 0 and they exit rather than parking
+  on a channel nobody will feed.
+
+  `agnosai_serve` gains a third return meaning: **0 = asked to stop**, 1 =
+  failed. Callers written against the old "any return is fatal" contract still
+  behave correctly, since the failure value is unchanged.
+
+  Installing signals is **not** folded into `agnosai_serve` — the suites call it
+  with an unbindable address to prove a failed bind returns 1, and should not
+  each leave a process-wide signal mask and a parked thread behind. A failed
+  install warns and boots anyway: a server that cannot drain beats no server,
+  and the oracle has no corresponding refusal.
+
+  Verified live: both signals exit **0** in ~100 ms, and a request racing the
+  shutdown still completes **200**. The in-process test signals itself with
+  `sys_kill(sys_getpid(), SIGTERM)` and polls the flag — which doubles as proof
+  the mask is installed, since without it that line would terminate the suite
+  rather than fail an assertion.
+
+- **`_agnosai_exit_process` now composes `sys_exit_group`** instead of a
+  hand-rolled `syscall(SYS_EXIT_GROUP, …)`. The wrapper landed in cyrius 6.5.6
+  from agnosai's filing. The `#ifdef CYRIUS_TARGET_LINUX` guard stays and is
+  still load-bearing: `syscalls_linux_common.cyr` is included only by the two
+  Linux target files, so the wrapper does not exist on agnos.
+
 - **`main` binds and serves — M6 bite 16, and the first time the binary is a
   server.** `./build/agnosai` printed `agnosai ready` and exited; it now builds
   the event bus, orchestrator, tool registry and auth config, hands them to
