@@ -184,23 +184,27 @@ routes/*, router, main. **Gates:** per-worker arena + `_a` variants throughout
 `rsa_pkcs1v15_verify_sha256` + SPKI decoder rather than waiting upstream.
 **Exit:** the 11-route API serves; SSE streams; load-tested with `alloc_used()` asserted flat.
 
-**Status:** 20 of 21 files, and **the binary now serves** — bite 16 landed
+**Status: ✅ COMPLETE (2026-08-03).** All 21 files, and **the binary serves** — bite 16 landed
 2026-08-03, so `./build/agnosai` binds, reads the oracle's environment, and
 answers the route table instead of printing `agnosai ready` and exiting. Bites
-1-15b were already done (routes tier, router, sandhi adapter). Remaining:
-**15c (SSE)** alone, enumerated under
-[Open blockers and owed work](#open-blockers-and-owed-work).
+1-15b landed earlier (routes tier, router, sandhi adapter); **15c (SSE)** and
+**16 (bind)** closed the milestone.
 
-Bite 16 ships one deliberate, documented gap: **no graceful shutdown**
-([ADR 012](../adr/012-no-graceful-shutdown-on-sandhi.md)). The reason recorded
-here previously — "needs a raw `rt_sigaction`; no signal helper exists in
-`lib/`" — was wrong twice over: `signal_ignore` exists at `lib/syscalls.cyr:98`,
-and signal *receipt* needs no `rt_sigaction` at all because `sys_signalfd4` and
-`sys_rt_sigprocmask` are both wrapped (`lib/syscalls_linux_common.cyr:330`,
-`:323`). The real blocker is that **sandhi's accept loop cannot be made to
-return**: it reads no flag, its only exit is a fatal accept, and the listen fd
-is loop-local and never published (`lib/sandhi.cyr:14205-14219`, `:14176`; zero
-matches for any stop facility). Reversing it is one upstream sandhi change.
+**Exit met**, with one qualification worth reading before deploying: SSE streams
+*do* stream, but each holds one of the 100 pool workers for its life, where the
+oracle serves effectively unbounded concurrent streams
+([ADR 014](../adr/014-sse-stream-holds-a-pooled-worker.md)).
+
+**Graceful shutdown ships too**, though it took a same-day round trip through
+two repos. Bite 16 first landed *without* it and with an ADR explaining why it
+was impossible ([012](../adr/012-no-graceful-shutdown-on-sandhi.md)) — the
+blocker being that sandhi's accept loop could not be made to return, **not** the
+missing signal helper this roadmap used to cite (`signal_ignore` exists at
+`lib/syscalls.cyr:98`, and `sys_signalfd4` / `sys_rt_sigprocmask` are both
+wrapped). agnosai filed it, sandhi 1.9.9 added the stop flag, cyrius 6.5.6
+vendored it, and `main` now installs a `signalfd` handler and drains
+([ADR 013](../adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md),
+superseding 012).
 
 The `alloc_used()`-flat exit criterion is **partly met and cannot be fully met
 here.** Blocker #3's arena makes sandhi's half flat, but bayan threads no
@@ -254,9 +258,8 @@ one-line ledger is under *Recently closed* at the end of this section.
 
 ### A. Blocks M6 completion
 
-| # | Item | Effort | Notes |
-|---|------|--------|-------|
-| A1 | **Bite 15c — `sse.rs::event_stream` + `routes/sse.rs`** (241 lines) | Large — own session | The last hard bite, and the only thing left in M6. Held back at `src/server/sse.cyr:9-11`; until it lands `/api/v1/crews/{id}/stream` answers **501** deliberately (`src/server/router.cyr:388`) — not 404, because the route exists and only its handler is missing. **A 2026-08-03 survey produced a full implementation plan and then refuted it 3/3 on adversarial review; do not implement from a fresh reading without addressing the findings below.** (1) **FATAL, and it kills the obvious design**: the tempting argument "no concurrency cap is needed because the oracle starves at 100 too" is **false**. tower's `ConcurrencyLimitLayer` holds its permit in `ResponseFuture`, which drops when the handler *returns a response* — and `crew_stream` (`rust-old/src/server/routes/sse.rs:17-92`) has **zero `.await` before `return`**: it builds a lazy `async_stream::stream!` and hands it back immediately, so the body is streamed by hyper's connection task *outside* the semaphore. The oracle therefore serves effectively **unbounded** concurrent SSE streams while the port would pin one of 100 pool workers per stream. That is a real capacity divergence and needs an ADR, not a comment. (2) `agnosai_event_bus_has` is **not** a sound proxy for tokio's `Closed`: `agnosai_event_bus_sender` is get-or-create (`src/server/sse.cyr:338`), so a removed crew id can reappear and un-fire the terminator, leaving a stream that never ends and never releases its worker. (3) The oracle reports `Lagged(n)` **at the gap, before** delivering what is still buffered, and `break`s (`routes/sse.rs:73-80`) — a drain-then-check loop emits up to 256 frames the oracle drops. (4) `agnosai_uuid_parse` accepts uppercase hex (`src/id.cyr:102`) but crew ids are minted lowercase (`:136`), and the oracle canonicalizes via `Uuid::to_string`; without canonicalization an uppercase id passes the gate and then misses the bus. (5) `routes/sse.rs` has **three** `tracing::warn!` (`:53`, `:64`, `:74`) and three serialization-failure fallback bodies, all reachable here because `bayan_json_v_build_a` returns 0 on arena OOM. (6) `agnosai_crew_event_to_value` (`src/server/sse.cyr:98`) allocates ~10 times on the **global bump** with no `_a` form, so any "flat allocation" claim needs that written first. |
+**Empty — M6 is complete.** Bites 15c (SSE) and 16 (bind) both closed 2026-08-03.
+
 
 ### B. Owed — flagged in earlier bites, never done
 
@@ -277,6 +280,7 @@ One line each; the reasoning and measurements are in `CHANGELOG.md`.
 | 2026-07-31 | **`src/` mirrors `rust-old/src/`** — 65 `git mv` renames, verified by a byte-identical binary. |
 | 2026-07-31 | **bayan `_a` JSON surface** — filed, implemented and released as bayan 1.4.0, folded in cyrius 6.5.5. Was the blocker under B2. |
 | 2026-07-31 | **bote `serverInfo` hardcode** — filed and fixed as bote 3.3.0 (`dispatcher_set_server_info`). Pin bump owed under B1. |
+| 2026-08-03 | **Bite 15c — SSE (A1), the last file in M6** — `/api/v1/crews/{id}/stream` streams for real. The plan drafted for this was refuted 3/3 on adversarial review and every finding was addressed: the capacity divergence is [ADR 014](../adr/014-sse-stream-holds-a-pooled-worker.md) (the oracle serves *unbounded* streams — tower's permit drops before the body streams), `Closed` reads a flag on our own subscription rather than the bus or chan's layout, `Lagged` terminates *before* draining, ids are canonicalised, all three oracle warns and fallbacks ported. Found and fixed an unauthenticated SIGSEGV on a malformed id while testing. |
 | 2026-08-03 | **Graceful shutdown (ADR 013, superseding 012)** — cyrius 6.5.6 vendored sandhi 1.9.9's stop flag, which agnosai had filed hours earlier. `main` installs a `signalfd` SIGINT/SIGTERM handler; `agnosai_serve` returns 0 for a requested stop vs 1 for a failure. Verified live: both signals exit 0 in ~100 ms, an in-flight request still completes 200. |
 | 2026-08-03 | **Bite 16 — `src/main.cyr` bind (A2)** — the binary serves for the first time. Env config (`PORT`/`AGNOSAI_PORT`/`HOOSH_URL`/the four auth vars) ports branch-for-branch, `agnosai_serve_parse_port` reproduces `u16::from_str` where neither stdlib parser does, and the epilogue moved to `exit_group` because `SYS_EXIT` exits one thread. Graceful shutdown is deliberately absent — [ADR 012](../adr/012-no-graceful-shutdown-on-sandhi.md). |
 | 2026-08-03 | **Dep pins corrected to name what is actually built** — `cyrius.cyml` said bote 3.2.1 / kavach 3.9.3 while `lib/` held 3.3.0 / 3.11.0, because `path = "../NAME"` beats `tag` locally and CI has no sibling checkouts. Both bundles verified byte-identical to their upstream tag dists; all six pins are now the newest upstream tag. Gated going forward by `cyrius deps --verify` in `scripts/check-clean.sh` and a *Lockfile is honest* CI step. |

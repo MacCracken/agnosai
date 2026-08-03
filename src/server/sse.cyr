@@ -114,7 +114,8 @@ fn agnosai_crew_event_to_value(e): i64 {
 enum AgnosaiEventSubOff {
     AGN_ER_CHAN = 0;
     AGN_ER_LAGGED = 8;
-    AGN_ER_SIZE = 16;
+    AGN_ER_CLOSED = 16;
+    AGN_ER_SIZE = 24;
 }
 
 # The subscription's channel, for a caller that wants to park on it directly.
@@ -144,7 +145,28 @@ fn _agnosai_event_sub_new(): i64 {
     var sub = alloc(AGN_ER_SIZE);
     store64(sub + AGN_ER_CHAN, chan_new(AGNOSAI_SSE_CHANNEL_CAPACITY));
     store64(sub + AGN_ER_LAGGED, 0);
+    store64(sub + AGN_ER_CLOSED, 0);
     return sub;
+}
+
+# Whether this subscription's channel has been closed — the oracle's
+# `RecvError::Closed`, and the signal that ends an SSE stream.
+#
+# **This is a flag on OUR struct, deliberately, rather than a read of `chan`'s
+# own closed byte.** The channel keeps that state at a fixed offset in its
+# 56-byte layout and exposes no accessor, and `src/chan_lossy.cyr` already
+# recorded the house position on reaching in: doing so "would couple this module
+# to an internal detail of two separate thread backends". Both places that close
+# a subscriber's channel are in this file, so a flag set alongside `chan_close`
+# is exact and costs nothing.
+#
+# `chan_recv` returning 0 is the same signal for a caller willing to block.
+# This exists for the caller that cannot — a stream that must also emit
+# keep-alives has to poll, and `chan_try_recv` answers 0 for both "empty" and
+# "closed".
+fn agnosai_event_sub_closed(sub): i64 {
+    if (sub == 0) { return 1; }
+    return load64(sub + AGN_ER_CLOSED);
 }
 
 # Take the next event without waiting, or 0 when none is ready.
@@ -216,7 +238,10 @@ fn agnosai_event_sender_unsubscribe(tx, sub): i64 {
         }
     }
     mutex_unlock(mtx);
-    if (found == 1) { chan_close(load64(sub + AGN_ER_CHAN)); }
+    if (found == 1) {
+        chan_close(load64(sub + AGN_ER_CHAN));
+        store64(sub + AGN_ER_CLOSED, 1);   # see agnosai_event_sub_closed
+    }
     return found;
 }
 
@@ -378,7 +403,9 @@ fn agnosai_event_bus_remove(bus, crew_id: Str): i64 {
     if (tx != 0) {
         var subs = load64(tx + AGN_ES_SUBS);
         for (var i = 0; i < vec_len(subs); i = i + 1) {
-            chan_close(load64(vec_get(subs, i) + AGN_ER_CHAN));
+            var sub = vec_get(subs, i);
+            chan_close(load64(sub + AGN_ER_CHAN));
+            store64(sub + AGN_ER_CLOSED, 1);   # see agnosai_event_sub_closed
         }
         map_delete(channels, crew_id);
     }

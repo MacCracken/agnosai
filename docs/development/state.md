@@ -21,34 +21,15 @@ lands, not before, so the number always names something that actually shipped.
   The six files outside the snapshot (ai-hwaccel, bote-core, kavach, libro, majra,
   tyche) are declared git deps, not staleness.
 
-  **Verify a bump by diffing the trees, not by a green `lib sync --full`** — and
-  the reason is no longer folklore. The 6.5.6 bump left `lib/vani.cyr` at 1.1.2
-  against the snapshot's 1.1.3 while `lib sync --full` printed
-  `copied 99 .cyr files` and exited 0. **Root cause, confirmed by controlled
-  mutation: `cyrius lib sync` skips on file SIZE, not content.** A one-character
-  swap survives `--full`; appending one byte gets synced. A version stamp bump
-  (`1.1.2` → `1.1.3`) is exactly size-neutral, so a patch release whose only
-  change is the stamp never lands. That is also what the bayan incident
-  ("reported success and left five files stale") really was — deterministic, not
-  flaky. Filed upstream.
-
-  **`cyrius deps --verify` cannot catch this** and it is worth understanding why:
-  `cyrius.lock` is *written from* `lib/` on disk, so a stale file simply gets its
-  stale hash recorded. It reported `105 verified, 0 failed` against the stale
-  vani. `scripts/check-clean.sh` therefore gained a **separate** content-diff of
-  every `lib/*.cyr` against `~/.cyrius/versions/<pin>/lib` — mutation-verified,
-  and the two checks answer different questions:
-  lock-vs-disk versus disk-vs-pin.
-
-  **One snapshot entry is genuinely absent and it is inert: `lib/unicode/`.**
-  `cyrius lib sync --full` copies **99 `.cyr` files** and does not recurse into
-  subdirectories, so the snapshot's `unicode/` directory (7 files backing
-  `unicode_category` / casefold / normalize) never lands. Its only consumer is
-  `niyama.cyr`'s `\p{NAME}` regex property support, and **agnosai does not declare
-  niyama** (`grep -c niyama cyrius.cyml` → 0). If it ever did, the failure would be
-  a loud undefined `unicode_category` at build, not silent misbehaviour — niyama's
-  own header says the consumer must include `lib/unicode/categories.cyr` too. No
-  action owed here; recorded so the diff is not re-derived as a defect.
+  **Verify a bump by diffing the trees, not by a green `lib sync --full`.**
+  `cyrius lib sync` skips on file **size**, not content, so a size-neutral change
+  — in practice a version stamp — is never copied while the command reports
+  success. The 6.5.6 bump left `lib/vani.cyr` a patch behind that way. **Impact
+  here was nil** (vani is neither declared nor called), and that is the usual
+  shape: real code edits change length and do sync. Filed as a papercut.
+  `scripts/check-clean.sh` diffs `lib/` against the pinned snapshot, which
+  `deps --verify` cannot do — the lock is written *from* disk, so a stale file
+  just gets its stale hash recorded.
 
 ### Pins must name what is actually built — corrected 2026-08-03
 
@@ -141,15 +122,15 @@ tree 2026-08-03:
 | Group | Files | Lines | Oracle |
 |---|---|---|---|
 | `orchestrator/` | 16 | 5,311 | ✅ complete (M5) |
-| `server/` | 11 | 3,835 | 🟡 M6, 20 of 21 files |
+| `server/` | 11 | 4,008 | ✅ complete (M6) |
 | `core/` | 8 | 3,129 | ✅ complete (M2) |
 | `tools/builtin/` | 6 | 2,017 | ✅ complete (M4) |
-| `server/routes/` | 9 | 1,786 | ✅ complete |
+| `server/routes/` | 10 | 2,040 | ✅ complete (M6) |
 | `llm/` | 4 | 1,198 | ✅ complete (M3) |
 | `tools/` | 5 | 1,057 | ✅ complete (M4) |
 | `learning/` | 6 | 1,018 | ✅ complete (M2) |
-| root (port-local) | 6 | 942 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
-| **total** | **71** | **20,293** | against a 27,683-line oracle |
+| root (port-local) | 6 | 961 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
+| **total** | **72** | **20,739** | against a 27,683-line oracle |
 
 **Four oracle groups have zero Cyrius counterpart** — 8,473 lines, 31% of the
 oracle, all scheduled and none silently missing:
@@ -170,13 +151,23 @@ in sandhi 1.9.9 on agnosai's own filing, hours after it was written.
 
 ## Where the port is
 
-M0–M5 complete. **M6 (`server`) is 20 of 21 files**, and since 2026-08-03 **the
-binary actually serves**: bite 16 landed, so `./build/agnosai` binds, reads the
-oracle's environment and answers the route table. One file remains —
-`sse.rs::event_stream` + `routes/sse.rs` (roadmap A1, large — its own session).
-Until it lands, `/api/v1/crews/{id}/stream` answers **501 deliberately** — not
-404, because the route exists and only its handler is missing
-(`src/server/router.cyr`).
+**M0–M6 complete.** The server tier is done: bite 16 (bind) and bite 15c (SSE)
+both landed 2026-08-03, so `./build/agnosai` binds, reads the oracle's
+environment, answers the full route table, **streams crew events**, and drains
+on SIGINT/SIGTERM.
+
+`/api/v1/crews/{id}/stream` now streams. The 501 in
+`agnosai_route_dispatch` is unreachable over the transport —
+`agnosai_serve_handler` intercepts the route first, because a dispatcher that
+returns "a status and a finished body" cannot express a stream. It remains the
+honest answer for a direct dispatch, which is what `tests/server_router.tcyr`
+still asserts.
+
+**One divergence worth knowing before deploying**: an SSE stream holds one of
+the 100 pool workers for its whole life, where the oracle serves effectively
+unbounded concurrent streams —
+[ADR 014](../adr/014-sse-stream-holds-a-pooled-worker.md) has the tower analysis
+showing why the "the oracle starves at 100 too" intuition is wrong.
 
 Verified live, not inferred: `/health` → 200 `{"status":"ok"}`, `/metrics`
 renders the registry, `/api/v1/tools` lists the four registered builtins, and
@@ -583,12 +574,12 @@ libro 2.8.4 arrives transitively via bote.
 
 | | |
 |---|---|
-| Cyrius port | **20,293 lines**, 71 files, `src/` mirroring `rust-old/src/` |
+| Cyrius port | **20,739 lines**, 72 files, `src/` mirroring `rust-old/src/` |
 | Rust oracle | 27,683 lines at `rust-old/` — frozen |
-| Milestones | M0–M5 complete; **M6 (`server`) at 20 of 21 files — the binary serves** |
-| Remaining in M6 | `sse.rs::event_stream` + `routes/sse.rs` (roadmap A1) — bite 16 closed 2026-08-03 |
+| Milestones | **M0–M6 complete** — the server tier is done and the binary serves |
+| Remaining in M6 | nothing — bites 15c (SSE) and 16 (bind) both closed 2026-08-03 |
 | Not started | M7 `sandbox`, M8 `fleet`, M9 `telemetry`, M10 `definitions` |
-| Gates | build OK · 1,436 symbols / 71 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · 57 suites / 3,622 assertions · coverage 100% (902/902) |
+| Gates | build OK · 1,444 symbols / 72 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · 57 suites / 3,645 assertions · coverage 100% (904/904) |
 
 **The binary serves as of 2026-08-03**, and **drains on SIGINT/SIGTERM** as of
 the 6.5.6 bump the same day. `src/main.cyr` wires the state, installs a

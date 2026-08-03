@@ -308,15 +308,18 @@ fn _t_dispatch(): i64 {
     return 0;
 }
 
-# `/api/v1/crews/{id}/stream` resolves but has no handler. **501, not 404** —
-# the route exists, and a 404 would tell a client the endpoint is not part of
-# the API, which is a different and wrong statement. Bite 15b wires it; see
-# docs/development/state.md and CHANGELOG [Unreleased].
+# `/api/v1/crews/{id}/stream` **is implemented** as of bite 15c — but as a
+# stream, which `agnosai_route_dispatch` cannot express: its return is a status
+# plus a finished body. `agnosai_serve_handler` intercepts the route before
+# reaching the dispatcher, so this 501 is unreachable over the transport and is
+# the honest answer only for a direct dispatch like this one. 501 rather than
+# 404 because the route exists; the SSE behaviour itself is covered in
+# `tests/server_serve.tcyr`.
 fn _t_stream_is_501_not_404(): i64 {
     var s = _t_open();
     var r = _t_go(s, AGNOSAI_METHOD_GET, "/api/v1/crews/abc/stream");
     assert(agnosai_route_status(r) == HTTP_NOT_IMPLEMENTED,  #skip-lint: HTTP 501 status code
-    "the stream route answers 501 — the route exists, the handler does not");
+    "dispatched directly the stream route answers 501 — it streams over the transport instead");
 
     # The mismatch flag distinguishes a known path under a wrong method from an
     # unknown path, and is what the 405/404 split reads.

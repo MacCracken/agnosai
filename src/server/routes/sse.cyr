@@ -1,0 +1,254 @@
+# =========================================================================
+# server/routes/sse — the SSE stream for one crew's execution events.
+#
+# Parity oracle: rust-old/src/server/routes/sse.rs (`crew_stream`), plus the
+# `event_stream` half of rust-old/src/server/sse.rs.
+#
+# **M6 bite 15c — the last file in the milestone.** Held back since M5 because
+# it is the only handler that does not return a buffered response: it writes the
+# status line, then keeps writing frames for as long as the crew lives.
+#
+# ## Capacity is a real divergence, and it is NOT "the oracle starves too"
+#
+# The tempting justification for shipping no cap — *the oracle's
+# `ConcurrencyLimitLayer(100)` would starve at 100 streams as well* — is
+# **false**, and it is worth stating because it is the mistake a reader is most
+# likely to re-derive.
+#
+# tower holds its permit in `ResponseFuture`, which drops when the handler
+# **returns a response**, not when the body finishes. `crew_stream`
+# (`routes/sse.rs:17-92`) has **zero `.await` before `return`**: it calls three
+# synchronous bus methods, builds a *lazy* `async_stream::stream!`, and hands
+# back `Sse::new(...)`. The permit is therefore held for microseconds and the
+# body is streamed afterwards by hyper's connection task, entirely outside the
+# semaphore. **The oracle serves effectively unbounded concurrent SSE streams.**
+#
+# The port cannot: there is no async runtime, so a stream occupies one
+# `run_pooled` worker for its whole life, and `AGNOSAI_SERVE_WORKERS` of them
+# ends the server's ability to accept anything at all. That is a genuine
+# behavioural difference with an operational consequence, so it is
+# [ADR 014](../../../docs/adr/014-sse-stream-holds-a-pooled-worker.md), not a
+# comment.
+#
+# ## Why this polls instead of blocking on the channel
+#
+# `chan_recv` would be the natural read and it returns 0 exactly on
+# closed-and-drained, which is the oracle's `Closed`. It is not usable here for
+# one reason: the oracle also emits a **15-second keep-alive** (`:ping`), and a
+# thread parked in `chan_recv` cannot wake to send one. So the loop polls with
+# `chan_try_recv` on a short interval and tracks elapsed seconds itself.
+#
+# `chan_try_recv` answers 0 for *both* "empty" and "closed", which is why
+# `agnosai_event_sub_closed` exists — a flag on our own subscription struct,
+# set alongside `chan_close`, rather than a read of `chan`'s internal layout.
+# See its doc for why reaching in was rejected.
+#
+# ## Lagged terminates the stream BEFORE draining what is buffered
+#
+# tokio surfaces `Lagged(n)` **at the gap** — the receiver is told before it is
+# handed anything that is still in the ring — and the oracle `break`s on it
+# (`routes/sse.rs:73-80`). Here the lag counter is raised at *send* time by
+# `agnosai_chan_push_lossy`, so up to `AGNOSAI_SSE_CHANNEL_CAPACITY` (256)
+# events can still be sitting in the channel when it is noticed.
+#
+# The lag check therefore runs **first in each iteration, before `try_recv`**.
+# Draining first and checking after would emit up to 256 frames the oracle
+# discards — a silent divergence that looks like being more helpful.
+# =========================================================================
+
+# Poll interval for the stream loop, in milliseconds.
+#
+# The floor on how fast an event reaches the client, and the granularity of the
+# keep-alive clock. 50 ms costs 20 wakeups a second per active stream — each a
+# mutex, a count check and an unlock — against a bus whose events arrive at task
+# boundaries, not in a hot loop.
+var AGNOSAI_SSE_POLL_MS = 50;
+
+# The oracle's `KeepAlive::interval(Duration::from_secs(15))`
+# (`routes/sse.rs:87-90`).
+var AGNOSAI_SSE_KEEPALIVE_SECS = 15;
+
+# The oracle's `KeepAlive::...text("ping")`, on the wire as an SSE comment.
+#
+# axum's keep-alive text is emitted as `:ping\n\n` — a comment line, which the
+# EventSource spec requires clients to ignore. It exists to keep proxies from
+# reaping an idle connection, not to carry meaning.
+var AGNOSAI_SSE_KEEPALIVE_FRAME = ":ping\n\n";
+
+# Write one `event:`/`data:` frame to `cfd`.
+#
+# The two-line shape is what `Event::default().event(name).data(payload)`
+# serialises to, and the blank line terminates the frame.
+#
+# `payload` must not contain a newline — every payload here is `bayan`-built
+# JSON, which escapes them, so the multi-line `data:` continuation the SSE spec
+# allows is unreachable and deliberately not implemented.
+fn _agnosai_sse_frame(a, cfd, name: Str, payload: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "event: ");
+    str_builder_add_a(a, sb, name);
+    str_builder_add_cstr_a(a, sb, "\ndata: ");
+    str_builder_add_a(a, sb, payload);
+    str_builder_add_cstr_a(a, sb, "\n\n");
+    var f = str_builder_build_a(a, sb);
+    sandhi_server_send_chunk(cfd, str_data(f), str_len(f));
+    return 0;
+}
+
+# Serialise a CrewEvent, or fall back the way the oracle does.
+#
+# `bayan_json_v_build_a` returns 0 on arena exhaustion, which is the port's
+# reachable analogue of `serde_json::to_string` failing. The oracle does not
+# drop the frame there — it logs and emits a reduced body
+# (`routes/sse.rs:63-70`) — so neither does this. `fallback` is that body.
+fn _agnosai_sse_event_json(a, e, fallback: Str): Str {
+    var v = agnosai_crew_event_to_value(e);
+    if (v == 0) { return fallback; }
+    var s = bayan_json_v_build_a(a, v);
+    if (s == 0) { return fallback; }
+    if (str_len(s) == 0) { return fallback; }
+    return s;
+}
+
+# Emit a warning carrying one string field, level-gated like the rest of `src/`.
+fn _agnosai_sse_warn(msg, msg_len, key, key_len, val: Str): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    sakshi_log_kv(SK_WARN, msg, msg_len, key, key_len, str_data(val), str_len(val));
+    return 0;
+}
+
+# Stream `crew_id`'s events to `cfd` until the crew ends or the client lags.
+#
+# `id_raw` is the `{id}` path segment exactly as it arrived. Returns 0 always —
+# the connection is finished either way, and the caller has nothing to decide.
+#
+# **`id_raw` is canonicalised before anything else touches it.** The oracle
+# extracts `Path<Uuid>` and immediately does `id.to_string()`
+# (`routes/sse.rs:21`), so its `crew_id` is always lowercase-hyphenated, and its
+# bus is keyed by `Uuid` — case-insensitive by construction. `agnosai_uuid_parse`
+# accepts uppercase hex while crew ids are minted lowercase, so without this an
+# uppercase id would pass the route's validity gate, then miss the bus, and the
+# client would get "crew not found" for a crew that is running.
+fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
+    var a = sandhi_server_request_arena();
+    var bus = agnosai_app_state_events(state);
+
+    # Cloned onto the global bump on purpose: the frame loop rewinds `a` after
+    # every frame, and this is referenced by all of them.
+    # The transport validates before calling (see `src/server/serve.cyr`), so
+    # this is defence in depth — but `agnosai_uuid_canonical` answers 0 on a
+    # malformed id and `str_clone(0)` faults, which is too sharp an edge to
+    # leave resting on one caller doing the right thing.
+    var canon = agnosai_uuid_canonical(id_raw);
+    if (canon == 0) { canon = id_raw; }
+    var crew_id = str_clone(canon);
+
+    # Order matters and is the oracle's: ask whether the crew exists FIRST,
+    # because `subscribe` creates the channel as a side effect and would make
+    # every id look live.
+    var crew_exists = agnosai_event_bus_has(bus, crew_id);
+    var sub = agnosai_event_bus_subscribe(bus, crew_id);
+    if (crew_exists == 0) { agnosai_event_bus_remove(bus, crew_id); }
+
+    if (a != 0) {
+        sandhi_server_send_chunked_start_a(a, cfd, HTTP_OK, "text/event-stream",
+        "Cache-Control: no-cache\r\n");
+    } else {
+        sandhi_server_send_chunked_start(cfd, HTTP_OK, "text/event-stream",
+        "Cache-Control: no-cache\r\n");
+    }
+
+    # `_a` builders fault on a 0 allocator, so fall back to the global bump when
+    # there is no worker arena — the `.tcyr` harness and the non-pooled serve
+    # loops both hit that.
+    var fa = a;
+    if (fa == 0) { fa = default_alloc(); }
+
+    if (crew_exists == 0) {
+        # `{"message": "crew not found", "crew_id": crew_id}` — the oracle's
+        # `unwrap_or_default()` here means an empty body on failure, with no
+        # warning, which is the one of the three serialisation paths that does
+        # not log.
+        var nf = bayan_json_v_obj_new_a(fa);
+        bayan_json_v_obj_set_a(fa, nf, str_from("message"),
+        bayan_json_v_str_new_a(fa, str_from("crew not found")));
+        bayan_json_v_obj_set_a(fa, nf, str_from("crew_id"),
+        bayan_json_v_str_new_a(fa, crew_id));
+        var ev = agnosai_crew_event_new(crew_id, str_from("error"), nf);
+        _agnosai_sse_frame(fa, cfd, str_from("error"),
+        _agnosai_sse_event_json(fa, ev, str_from("")));
+        sandhi_server_send_chunked_end(cfd);
+        return 0;
+    }
+
+    # `{"message": "SSE stream connected"}`.
+    var cd = bayan_json_v_obj_new_a(fa);
+    bayan_json_v_obj_set_a(fa, cd, str_from("message"),
+    bayan_json_v_str_new_a(fa, str_from("SSE stream connected")));
+    var cev = agnosai_crew_event_new(crew_id, str_from("connected"), cd);
+    var cjson = _agnosai_sse_event_json(fa, cev, str_from(""));
+    if (str_len(cjson) == 0) {
+        _agnosai_sse_warn("SSE: failed to serialize connected event", 40,
+        "crew_id", 7, crew_id);
+        cjson = str_from("{\"event_type\":\"connected\"}");
+    }
+    _agnosai_sse_frame(fa, cfd, str_from("connected"), cjson);
+
+    var last_ping = clock_epoch_secs();
+    while (1 == 1) {
+        if (a != 0) { reset_via(a); }
+
+        # BEFORE try_recv — see the module header. A lag ends the stream and the
+        # events still buffered are never delivered, matching tokio surfacing
+        # `Lagged(n)` at the gap rather than after the backlog.
+        var lag = agnosai_event_sub_lagged(sub);
+        if (lag > 0) {
+            _agnosai_sse_warn("SSE: client lagged, closing stream", 34,
+            "crew_id", 7, crew_id);
+            var ld = bayan_json_v_obj_new_a(fa);
+            bayan_json_v_obj_set_a(fa, ld, str_from("event_type"),
+            bayan_json_v_str_new_a(fa, str_from("error")));
+            var lb = str_builder_new_a(fa);
+            str_builder_add_cstr_a(fa, lb, "stream lagged, ");
+            str_builder_add_int_a(fa, lb, lag);
+            str_builder_add_cstr_a(fa, lb, " events dropped");
+            bayan_json_v_obj_set_a(fa, ld, str_from("message"),
+            bayan_json_v_str_new_a(fa, str_builder_build_a(fa, lb)));
+            var lj = bayan_json_v_build_a(fa, ld);
+            if (lj == 0) { lj = str_from("{\"event_type\":\"error\"}"); }
+            _agnosai_sse_frame(fa, cfd, str_from("error"), lj);
+            break;
+        }
+
+        var e = agnosai_event_sub_try_recv(sub);
+        if (e != 0) {
+            var etype = agnosai_crew_event_event_type(e);
+            var j = _agnosai_sse_event_json(fa, e, str_from(""));
+            if (str_len(j) == 0) {
+                _agnosai_sse_warn("SSE: failed to serialize event", 30,
+                "event_type", 10, etype);
+                var fb = str_builder_new_a(fa);
+                str_builder_add_cstr_a(fa, fb, "{\"event_type\":\"");
+                str_builder_add_a(fa, fb, etype);
+                str_builder_add_cstr_a(fa, fb, "\",\"error\":\"serialization failed\"}");
+                j = str_builder_build_a(fa, fb);
+            }
+            _agnosai_sse_frame(fa, cfd, etype, j);
+            last_ping = clock_epoch_secs();
+        } else {
+            # Empty. `chan_try_recv` cannot tell empty from closed, so the
+            # subscription's own flag is the `Closed` signal.
+            if (agnosai_event_sub_closed(sub) == 1) { break; }
+            var now = clock_epoch_secs();
+            if (now - last_ping >= AGNOSAI_SSE_KEEPALIVE_SECS) {
+                sandhi_server_send_chunk(cfd, AGNOSAI_SSE_KEEPALIVE_FRAME, 7);
+                last_ping = now;
+            }
+            sleep_ms(AGNOSAI_SSE_POLL_MS);
+        }
+    }
+
+    agnosai_event_sender_unsubscribe(agnosai_event_bus_sender(bus, crew_id), sub);
+    sandhi_server_send_chunked_end(cfd);
+    return 0;
+}

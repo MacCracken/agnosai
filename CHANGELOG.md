@@ -9,163 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Graceful shutdown — the last gap in bite 16, closed by an upstream fix
-  agnosai filed itself.** `./build/agnosai` now drains on SIGINT and SIGTERM,
-  logging `"received shutdown signal, draining"` then the oracle's
-  `"server shut down gracefully"` — a line that until now had nothing true to
-  report. [ADR 013](docs/adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md)
-  supersedes [012](docs/adr/012-no-graceful-shutdown-on-sandhi.md), which shipped
-  earlier the same day recording that this was *impossible*.
+- **SSE streaming — M6 bite 15c, and the milestone is complete.**
+  `GET /api/v1/crews/{id}/stream` streams crew events for real:
+  `text/event-stream`, chunked, `Cache-Control: no-cache`, `event:`/`data:`
+  frames carrying whole serialised `CrewEvent`s, a 15-second `:ping`
+  keep-alive, and the oracle's three termination paths. The deliberate 501 is
+  gone from the transport.
 
-  It was impossible, and the reason was never missing signal support — that was
-  available all along. A `sandhi_server_run*` loop simply could not be made to
-  return: it read no flag, its only exit was a fatal accept, and its listen fd
-  was loop-local and never published. ADR 012 named the one upstream change that
-  would reverse it; agnosai filed it, **sandhi 1.9.9** implemented it, and
-  **cyrius 6.5.6** vendors it.
+  **The plan drafted for this bite was refuted 3/3 on adversarial review, and
+  the headline finding is worth keeping.** The tempting justification for
+  shipping no concurrency cap — *the oracle's `ConcurrencyLimitLayer(100)`
+  starves at 100 streams too* — is **false**. tower holds its permit in
+  `ResponseFuture`, which drops when the handler returns a *response*, not when
+  the *body* finishes; `crew_stream` has **zero `.await` before `return`**, so
+  the permit is held for microseconds and hyper streams the body outside the
+  semaphore. The oracle therefore serves effectively **unbounded** concurrent
+  streams while the port pins one of 100 pool workers per stream. That is a real
+  operational divergence and is now
+  [ADR 014](docs/adr/014-sse-stream-holds-a-pooled-worker.md).
 
-  **Three orderings are load-bearing, and each is a real failure if inverted.**
-  (1) `sys_sigprocmask` sets the *calling thread's* mask and new threads inherit
-  it, so signals are blocked **before** `run_pooled` spawns workers — installed
-  after, SIGTERM would kill a worker mid-request instead of draining. (2) The
-  block must precede the `signalfd`, or the signal is delivered conventionally
-  and kills the process. (3) sandhi closes the handoff channel **before** the
-  listen fd, so workers' `chan_recv` returns 0 and they exit rather than parking
-  on a channel nobody will feed.
+  The other findings, each addressed rather than argued away:
 
-  `agnosai_serve` gains a third return meaning: **0 = asked to stop**, 1 =
-  failed. Callers written against the old "any return is fatal" contract still
-  behave correctly, since the failure value is unchanged.
+  - **`Closed` is a flag on our own subscription struct**, set beside
+    `chan_close` at both sites that close one. Bus membership is not a sound
+    proxy — `agnosai_event_bus_sender` is get-or-create, so a removed crew id
+    can reappear and *un-fire* the terminator, leaving a stream that never ends
+    and never releases its worker. Reading `chan`'s own closed byte was also
+    rejected: `src/chan_lossy.cyr` already recorded the house position against
+    coupling to that layout.
+  - **`Lagged` terminates *before* draining.** tokio surfaces it at the gap, and
+    the oracle `break`s; here the counter is raised at send time with up to 256
+    events still buffered, so the lag check runs **first in each iteration**.
+    Draining first would emit 256 frames the oracle discards.
+  - **Ids are canonicalised.** `agnosai_uuid_parse` accepts uppercase hex while
+    crew ids are minted lowercase, and the oracle's `Path<Uuid>` +
+    `to_string()` is case-insensitive by construction. Without
+    `agnosai_uuid_canonical` an uppercase id passed the route gate, missed the
+    bus, and reported "crew not found" for a running crew.
+  - **All three oracle `warn!`s and all three serialisation fallbacks** are
+    ported, not two — and they are reachable here, because
+    `bayan_json_v_build_a` returns 0 on arena exhaustion where
+    `serde_json::to_string` effectively cannot fail.
 
-  Installing signals is **not** folded into `agnosai_serve` — the suites call it
-  with an unbindable address to prove a failed bind returns 1, and should not
-  each leave a process-wide signal mask and a parked thread behind. A failed
-  install warns and boots anyway: a server that cannot drain beats no server,
-  and the oracle has no corresponding refusal.
+  23 assertions across four cases, including a live stream driven by a feeder
+  thread. Verified end to end against the running binary with `curl -N`.
 
-  Verified live: both signals exit **0** in ~100 ms, and a request racing the
-  shutdown still completes **200**. The in-process test signals itself with
-  `sys_kill(sys_getpid(), SIGTERM)` and polls the flag — which doubles as proof
-  the mask is installed, since without it that line would terminate the suite
-  rather than fail an assertion.
-
-- **`_agnosai_exit_process` now composes `sys_exit_group`** instead of a
-  hand-rolled `syscall(SYS_EXIT_GROUP, …)`. The wrapper landed in cyrius 6.5.6
-  from agnosai's filing. The `#ifdef CYRIUS_TARGET_LINUX` guard stays and is
-  still load-bearing: `syscalls_linux_common.cyr` is included only by the two
-  Linux target files, so the wrapper does not exist on agnos.
-
-- **`main` binds and serves — M6 bite 16, and the first time the binary is a
-  server.** `./build/agnosai` printed `agnosai ready` and exited; it now builds
-  the event bus, orchestrator, tool registry and auth config, hands them to
-  `agnosai_app_state_new`, and calls `agnosai_serve` on `INADDR_ANY:PORT`.
-  Verified live rather than inferred: `/health` → 200 `{"status":"ok"}`,
-  `/metrics` renders the registry, `/api/v1/tools` lists all four builtins, and
-  `/api/v1/crews/{id}/stream` returns the deliberate 501 that bite 15c will
-  replace.
-
-  **`agnosai_serve_parse_port` is public while the rest of the env plumbing is
-  not**, and the asymmetry is the point: nothing in `src/main.cyr` is reachable
-  from a `.tcyr` — that file runs `main()` at include time — and the `u16` parse
-  is the one piece with a real silent-divergence risk. Neither stdlib parser
-  matches Rust, in *opposite* directions: `str_to_int` (`lib/str.cyr:280`) skips
-  non-digits, so `"80a80"` answers 8080, and `atoi` (`lib/string.cyr:132`) stops
-  at the first, answering 80. Neither can report failure at all. Both would bind
-  a port the operator never asked for.
-
-  Overflow is checked **per digit against 65535, never by capping digit count**.
-  An earlier draft used a 5-digit cap and that is not `u16::from_str`'s grammar:
-  Rust bounds the *value* through `checked_mul`/`checked_add` and accepts
-  unbounded leading zeros, so `PORT=065535` is `Ok(65535)` there and the cap
-  would have silently fallen back to 8080. Both spellings are now pinned by
-  assertions and confirmed against the running binary.
-
-  **`PORT=` set-but-empty does not fall through to `AGNOSAI_PORT`.** `.or_else`
-  fires on `Err`, and `getenv` already distinguishes the cases — unset returns
-  0, `FOO=` returns a non-zero pointer to `""` (`lib/io.cyr:621`), which is
-  exactly `Err(NotPresent)` vs `Ok("")`. A `strlen(v) == 0` test in the first
-  branch would have diverged. Eight port cases and nine auth cases were each run
-  against the binary; the same distinction is why `AGNOSAI_JWT_PUBLIC_KEY=`
-  builds no JwtConfig (the oracle's `.filter(|k| !k.is_empty())`).
-
-  Two calls the oracle does not make, both deliberate. The resource budget is
-  `agnosai_resource_budget_default()` rather than the `0` every existing suite
-  passes as a shortcut — `agnosai_orchestrator_timeout_secs` dereferences it, so
-  a `0` faults the moment a crew runs. And the JWT key is decoded eagerly via
-  `agnosai_jwt_config_prepare`, which memoizes both outcomes and, because
-  `_pem_init` guards its table with a plain non-atomic flag, removes a
-  first-request race between worker threads. A bad key logs and boots anyway,
-  matching the oracle's answer-500-per-request behaviour rather than refusing to
-  start.
-
-### Fixed
-
-- **`SYS_EXIT` exits one thread, not the process — corrected before it could
-  bite.** `src/main.cyr`'s epilogue ended `syscall(SYS_EXIT, code)`, which is
-  `exit(2)`. That was harmless while `main` did nothing and stops being harmless
-  the moment `agnosai_serve` runs: `sandhi_server_run_pooled` returns 1 from
-  three places (`lib/sandhi.cyr:14192`, `:14203`, `:14213`), and the last two
-  return into a process that already has up to 100 worker threads alive — some
-  parked in `chan_recv`, some mid-request. Exiting only the main thread there
-  leaves a process running with no acceptor: a hang, not a crash.
-
-  Now `_agnosai_exit_process` calls `exit_group(2)` behind a target guard. The
-  guard is load-bearing rather than decorative — the constant exists on every
-  Linux target (231 x86_64, 94 on the aarch64 cross build named in
-  `cyrius.cyml [release].cross_bins`) but **not on agnos**, which defines
-  `SYS_EXIT` alone. Verified end to end: a privileged-port bind as a normal user
-  returns and the process exits **1**, rather than hanging.
-
-- **`tests/server_serve.tcyr` passed its bind-failure test for the wrong
-  reason.** Three sites handed `str_from("192.0.2.1")` to `agnosai_serve`, whose
-  `addr` is a **network-order IPv4 u32**, not a string — it goes unmodified to
-  `sock_bind` → `sockaddr_in` → `store32(sa + 4, addr)` (`lib/net.cyr:99`). What
-  actually landed in `sin_addr` was the low half of a 16-byte heap `Str` header
-  pointer, so the assertions held against a garbage address while the comment
-  claimed they held against TEST-NET-1. Replaced with `0x010200C0` (the same
-  byte order as `INADDR_LOOPBACK()` = `0x0100007F`), and `agnosai_serve`'s doc
-  now states the contract so the next caller cannot repeat it.
-
-  This one mattered more than a tidy-up: the test is safe **only** because the
-  bind fails before `thread_create`. A version that accidentally bound would
-  spawn 100 workers, each reserving a 10 MiB request buffer, and then never
-  return — `cyrius tests tests` would hang forever.
-
-- **The dependency pins named versions nobody was building.** `cyrius.cyml`
-  pinned **bote 3.2.1** and **kavach 3.9.3** while `lib/` held **bote 3.3.0** and
-  **kavach 3.11.0** — both vendored bundles byte-identical to their upstream tag
-  dists, verified by sha256 against `git show <tag>:dist/...`. The pins now say
-  3.3.0 and 3.11.0, which is what was already being compiled and tested.
-
-  **The mechanism matters more than the two numbers.** Every `[deps.NAME]`
-  carries `path = "../NAME"` alongside `git` + `tag`, and **the local path
-  wins**. A developer whose sibling checkout has moved ahead silently builds a
-  version the manifest does not name; CI, which has no sibling checkouts,
-  resolves the *tag* and builds something else. Here that was kavach **3.11.0
-  locally against 3.9.3 in CI**, and neither skew was same-session: the
-  `~/.cyrius/deps/kavach/3.11.0/` clone is dated **2026-08-02**, and `lib/`
-  carried bote 3.3.0 from its **2026-07-31** release onward, while `state.md`
-  went on recording it as "released and not yet pinned".
-
-  This is the **inverse** of the sigil rule already on the books, and both are
-  real: a stale tag can *overwrite* a newer folded copy (sigil's case) or be
-  quietly *overridden* by a newer local path (kavach's case). The lockfile did
-  not catch the second — `cyrius.lock` recorded 3.9.3's sha256 against a 3.11.0
-  file on disk and nothing surfaced it, because every other gate reads `src/`
-  and the build compiles whatever bytes `lib/` holds.
-
-  **Neither bump changes any path agnosai executes**, which is why the tests
-  stayed green through a version skew nobody had noticed. kavach 3.10.0/3.11.0
-  are `--agnos` target build fixes — nine additive `kv_*` shims (`kv_unlink`,
-  `kv_rmdir`, `kv_waitpid`, `kv_getgid`, `kv_lstat`, `kv_fork`, `kv_dup2`,
-  `kv_execve`, `kv_setsid`) — and agnosai calls only `score_agent`,
-  `score_agent_with_tools`, `sandbox_display` and `sandbox_strength`, none of
-  which the diff touches. bote 3.3.0 adds `dispatcher_set_server_info` and is
-  additive by construction: an unconfigured dispatcher emits the pre-3.3.0 wire
-  byte for byte. Duplicate-fn warnings held at **35**, all lib-vs-lib; 57 suites
-  and coverage 100% unchanged.
-
-### Added
 
 - **Two gates that close the version-skew class**, both mutation-verified rather
   than asserted.
@@ -1226,6 +1114,176 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comparable across the port — see `docs/development/cyrius-port-plan.md`.
 
 ### Fixed
+
+- **An unauthenticated SIGSEGV on `GET /api/v1/crews/{malformed}/stream`**,
+  found by the test written for it. `agnosai_route_resolve` matches
+  `/api/v1/crews/*/stream` on *shape* — it never parses the `*` — and every
+  other crew route validates in its own handler. The stream path did not, so a
+  non-UUID segment reached `agnosai_uuid_canonical`, which answered 0, and
+  `str_clone(0)` faulted. Any unauthenticated client could crash the process
+  with one request.
+
+  Fixed at both layers: the transport now rejects with **422** before streaming
+  (matching `agnosai_route_get_crew` and the oracle's `Path<Uuid>` extractor),
+  and `agnosai_sse_crew_stream` no longer faults on an unparseable id even if a
+  caller skips the gate. Mutation-verified — removing the gate turns the 422
+  assertion red instead of crashing, which is the second layer doing its job.
+
+- **Graceful shutdown — the last gap in bite 16, closed by an upstream fix
+  agnosai filed itself.** `./build/agnosai` now drains on SIGINT and SIGTERM,
+  logging `"received shutdown signal, draining"` then the oracle's
+  `"server shut down gracefully"` — a line that until now had nothing true to
+  report. [ADR 013](docs/adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md)
+  supersedes [012](docs/adr/012-no-graceful-shutdown-on-sandhi.md), which shipped
+  earlier the same day recording that this was *impossible*.
+
+  It was impossible, and the reason was never missing signal support — that was
+  available all along. A `sandhi_server_run*` loop simply could not be made to
+  return: it read no flag, its only exit was a fatal accept, and its listen fd
+  was loop-local and never published. ADR 012 named the one upstream change that
+  would reverse it; agnosai filed it, **sandhi 1.9.9** implemented it, and
+  **cyrius 6.5.6** vendors it.
+
+  **Three orderings are load-bearing, and each is a real failure if inverted.**
+  (1) `sys_sigprocmask` sets the *calling thread's* mask and new threads inherit
+  it, so signals are blocked **before** `run_pooled` spawns workers — installed
+  after, SIGTERM would kill a worker mid-request instead of draining. (2) The
+  block must precede the `signalfd`, or the signal is delivered conventionally
+  and kills the process. (3) sandhi closes the handoff channel **before** the
+  listen fd, so workers' `chan_recv` returns 0 and they exit rather than parking
+  on a channel nobody will feed.
+
+  `agnosai_serve` gains a third return meaning: **0 = asked to stop**, 1 =
+  failed. Callers written against the old "any return is fatal" contract still
+  behave correctly, since the failure value is unchanged.
+
+  Installing signals is **not** folded into `agnosai_serve` — the suites call it
+  with an unbindable address to prove a failed bind returns 1, and should not
+  each leave a process-wide signal mask and a parked thread behind. A failed
+  install warns and boots anyway: a server that cannot drain beats no server,
+  and the oracle has no corresponding refusal.
+
+  Verified live: both signals exit **0** in ~100 ms, and a request racing the
+  shutdown still completes **200**. The in-process test signals itself with
+  `sys_kill(sys_getpid(), SIGTERM)` and polls the flag — which doubles as proof
+  the mask is installed, since without it that line would terminate the suite
+  rather than fail an assertion.
+
+- **`_agnosai_exit_process` now composes `sys_exit_group`** instead of a
+  hand-rolled `syscall(SYS_EXIT_GROUP, …)`. The wrapper landed in cyrius 6.5.6
+  from agnosai's filing. The `#ifdef CYRIUS_TARGET_LINUX` guard stays and is
+  still load-bearing: `syscalls_linux_common.cyr` is included only by the two
+  Linux target files, so the wrapper does not exist on agnos.
+
+- **`main` binds and serves — M6 bite 16, and the first time the binary is a
+  server.** `./build/agnosai` printed `agnosai ready` and exited; it now builds
+  the event bus, orchestrator, tool registry and auth config, hands them to
+  `agnosai_app_state_new`, and calls `agnosai_serve` on `INADDR_ANY:PORT`.
+  Verified live rather than inferred: `/health` → 200 `{"status":"ok"}`,
+  `/metrics` renders the registry, `/api/v1/tools` lists all four builtins, and
+  `/api/v1/crews/{id}/stream` returns the deliberate 501 that bite 15c will
+  replace.
+
+  **`agnosai_serve_parse_port` is public while the rest of the env plumbing is
+  not**, and the asymmetry is the point: nothing in `src/main.cyr` is reachable
+  from a `.tcyr` — that file runs `main()` at include time — and the `u16` parse
+  is the one piece with a real silent-divergence risk. Neither stdlib parser
+  matches Rust, in *opposite* directions: `str_to_int` (`lib/str.cyr:280`) skips
+  non-digits, so `"80a80"` answers 8080, and `atoi` (`lib/string.cyr:132`) stops
+  at the first, answering 80. Neither can report failure at all. Both would bind
+  a port the operator never asked for.
+
+  Overflow is checked **per digit against 65535, never by capping digit count**.
+  An earlier draft used a 5-digit cap and that is not `u16::from_str`'s grammar:
+  Rust bounds the *value* through `checked_mul`/`checked_add` and accepts
+  unbounded leading zeros, so `PORT=065535` is `Ok(65535)` there and the cap
+  would have silently fallen back to 8080. Both spellings are now pinned by
+  assertions and confirmed against the running binary.
+
+  **`PORT=` set-but-empty does not fall through to `AGNOSAI_PORT`.** `.or_else`
+  fires on `Err`, and `getenv` already distinguishes the cases — unset returns
+  0, `FOO=` returns a non-zero pointer to `""` (`lib/io.cyr:621`), which is
+  exactly `Err(NotPresent)` vs `Ok("")`. A `strlen(v) == 0` test in the first
+  branch would have diverged. Eight port cases and nine auth cases were each run
+  against the binary; the same distinction is why `AGNOSAI_JWT_PUBLIC_KEY=`
+  builds no JwtConfig (the oracle's `.filter(|k| !k.is_empty())`).
+
+  Two calls the oracle does not make, both deliberate. The resource budget is
+  `agnosai_resource_budget_default()` rather than the `0` every existing suite
+  passes as a shortcut — `agnosai_orchestrator_timeout_secs` dereferences it, so
+  a `0` faults the moment a crew runs. And the JWT key is decoded eagerly via
+  `agnosai_jwt_config_prepare`, which memoizes both outcomes and, because
+  `_pem_init` guards its table with a plain non-atomic flag, removes a
+  first-request race between worker threads. A bad key logs and boots anyway,
+  matching the oracle's answer-500-per-request behaviour rather than refusing to
+  start.
+
+
+- **`SYS_EXIT` exits one thread, not the process — corrected before it could
+  bite.** `src/main.cyr`'s epilogue ended `syscall(SYS_EXIT, code)`, which is
+  `exit(2)`. That was harmless while `main` did nothing and stops being harmless
+  the moment `agnosai_serve` runs: `sandhi_server_run_pooled` returns 1 from
+  three places (`lib/sandhi.cyr:14192`, `:14203`, `:14213`), and the last two
+  return into a process that already has up to 100 worker threads alive — some
+  parked in `chan_recv`, some mid-request. Exiting only the main thread there
+  leaves a process running with no acceptor: a hang, not a crash.
+
+  Now `_agnosai_exit_process` calls `exit_group(2)` behind a target guard. The
+  guard is load-bearing rather than decorative — the constant exists on every
+  Linux target (231 x86_64, 94 on the aarch64 cross build named in
+  `cyrius.cyml [release].cross_bins`) but **not on agnos**, which defines
+  `SYS_EXIT` alone. Verified end to end: a privileged-port bind as a normal user
+  returns and the process exits **1**, rather than hanging.
+
+- **`tests/server_serve.tcyr` passed its bind-failure test for the wrong
+  reason.** Three sites handed `str_from("192.0.2.1")` to `agnosai_serve`, whose
+  `addr` is a **network-order IPv4 u32**, not a string — it goes unmodified to
+  `sock_bind` → `sockaddr_in` → `store32(sa + 4, addr)` (`lib/net.cyr:99`). What
+  actually landed in `sin_addr` was the low half of a 16-byte heap `Str` header
+  pointer, so the assertions held against a garbage address while the comment
+  claimed they held against TEST-NET-1. Replaced with `0x010200C0` (the same
+  byte order as `INADDR_LOOPBACK()` = `0x0100007F`), and `agnosai_serve`'s doc
+  now states the contract so the next caller cannot repeat it.
+
+  This one mattered more than a tidy-up: the test is safe **only** because the
+  bind fails before `thread_create`. A version that accidentally bound would
+  spawn 100 workers, each reserving a 10 MiB request buffer, and then never
+  return — `cyrius tests tests` would hang forever.
+
+- **The dependency pins named versions nobody was building.** `cyrius.cyml`
+  pinned **bote 3.2.1** and **kavach 3.9.3** while `lib/` held **bote 3.3.0** and
+  **kavach 3.11.0** — both vendored bundles byte-identical to their upstream tag
+  dists, verified by sha256 against `git show <tag>:dist/...`. The pins now say
+  3.3.0 and 3.11.0, which is what was already being compiled and tested.
+
+  **The mechanism matters more than the two numbers.** Every `[deps.NAME]`
+  carries `path = "../NAME"` alongside `git` + `tag`, and **the local path
+  wins**. A developer whose sibling checkout has moved ahead silently builds a
+  version the manifest does not name; CI, which has no sibling checkouts,
+  resolves the *tag* and builds something else. Here that was kavach **3.11.0
+  locally against 3.9.3 in CI**, and neither skew was same-session: the
+  `~/.cyrius/deps/kavach/3.11.0/` clone is dated **2026-08-02**, and `lib/`
+  carried bote 3.3.0 from its **2026-07-31** release onward, while `state.md`
+  went on recording it as "released and not yet pinned".
+
+  This is the **inverse** of the sigil rule already on the books, and both are
+  real: a stale tag can *overwrite* a newer folded copy (sigil's case) or be
+  quietly *overridden* by a newer local path (kavach's case). The lockfile did
+  not catch the second — `cyrius.lock` recorded 3.9.3's sha256 against a 3.11.0
+  file on disk and nothing surfaced it, because every other gate reads `src/`
+  and the build compiles whatever bytes `lib/` holds.
+
+  **Neither bump changes any path agnosai executes**, which is why the tests
+  stayed green through a version skew nobody had noticed. kavach 3.10.0/3.11.0
+  are `--agnos` target build fixes — nine additive `kv_*` shims (`kv_unlink`,
+  `kv_rmdir`, `kv_waitpid`, `kv_getgid`, `kv_lstat`, `kv_fork`, `kv_dup2`,
+  `kv_execve`, `kv_setsid`) — and agnosai calls only `score_agent`,
+  `score_agent_with_tools`, `sandbox_display` and `sandbox_strength`, none of
+  which the diff touches. bote 3.3.0 adds `dispatcher_set_server_info` and is
+  additive by construction: an unconfigured dispatcher emits the pre-3.3.0 wire
+  byte for byte. Duplicate-fn warnings held at **35**, all lib-vs-lib; 57 suites
+  and coverage 100% unchanged.
+
 
 - **A cyclic DAG ratcheted the `crews_active` gauge upward forever.** Introduced
   and caught within this change: the first cut recorded `crew_started` before the

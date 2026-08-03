@@ -289,6 +289,51 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
         }
     }
 
+    # SSE is intercepted before `agnosai_route_dispatch` because it is the one
+    # route that does not produce a buffered response — the dispatcher's return
+    # type is a status + body, and a stream has neither until it ends.
+    #
+    # **Routing decides before auth, and auth decides before streaming**, which
+    # is the dispatcher's own order (`src/server/router.cyr`): an unknown path is
+    # 404 even when auth is off, and a known path with bad credentials is 401
+    # before any handler runs. Reproducing that ordering here rather than
+    # short-circuiting on the path string is what keeps the two paths agreeing.
+    if (method == AGNOSAI_METHOD_GET) {
+        var sm = agnosai_route_resolve(method, path);
+        if (agnosai_route_match_id(sm) == AGN_ROUTE_CREW_STREAM) {
+            var ok = 1;
+            # `agnosai_route_resolve` matches `/api/v1/crews/*/stream` on shape
+            # alone — it does not parse the `*`. Every other crew route
+            # validates in its handler (`routes/crews.cyr:550`), and this one
+            # must too, BEFORE streaming: the oracle's `Path<Uuid>` extractor
+            # rejects a malformed id with 422 before `crew_stream` ever runs.
+            #
+            # Not merely a status question. Without it `agnosai_uuid_canonical`
+            # answers 0 and `str_clone(0)` faults — an unauthenticated crash
+            # from a path segment, found by `_t_sse_transport_gates`.
+            if (agnosai_uuid_parse(agnosai_route_match_param(sm)) == 0) {
+                _agnosai_serve_send(a, cfd,
+                agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
+                str_from("crew id is not a valid UUID")));
+                ok = 0;
+            }
+            if (ok == 1) { if (agnosai_route_needs_auth(AGN_ROUTE_CREW_STREAM) == 1) {
+                    var st = agnosai_auth_check(
+                    agnosai_app_state_auth(_agnosai_serve_state), has_auth, auth_str);
+                    if (st != HTTP_OK) {
+                        _agnosai_serve_send(a, cfd,
+                        agnosai_route_error(st, str_from("unauthorized")));
+                        ok = 0;
+                    }
+                } }
+            if (ok == 1) {
+                agnosai_sse_crew_stream(_agnosai_serve_state, cfd,
+                agnosai_route_match_param(sm));
+            }
+            return 0;
+        }
+    }
+
     var resp = agnosai_route_dispatch(_agnosai_serve_state, method, path,
     auth_str, has_auth, body);
 

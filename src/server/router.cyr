@@ -379,12 +379,19 @@ fn agnosai_route_dispatch(state, method, path: Str, auth_header: Str, has_auth, 
     if (id == AGN_ROUTE_CREW_HISTORY) { return agnosai_route_crew_history(state); }
     if (id == AGN_ROUTE_AGENT_PERFORMANCE) { return agnosai_route_agent_performance(state); }
 
-    # `/api/v1/crews/{id}/stream` resolves but has no handler — SSE belongs to
-    # the transport tier (`sse.rs::event_stream`, held back by
-    # `src/server/sse.cyr:9-11`, scheduled in docs/development/state.md and
-    # CHANGELOG [Unreleased]). A 501 rather than a 404 because the route
-    # EXISTS; answering 404 would tell a client the endpoint is not part of the
-    # API, which is a different and wrong statement.
+    # `/api/v1/crews/{id}/stream` **is implemented** — as a stream, which this
+    # function cannot express: `agnosai_route_dispatch` returns a status plus a
+    # finished body, and an SSE response has neither until the crew ends.
+    #
+    # `agnosai_serve_handler` therefore intercepts the route *before* calling
+    # here (`src/server/serve.cyr`) and hands the connection to
+    # `agnosai_sse_crew_stream`. **Over the transport this line is unreachable.**
+    #
+    # It stays as the answer for a caller that dispatches directly — a `.tcyr`,
+    # or any future non-streaming context — because 501 is the honest reply
+    # there: the route exists, and *this* path has no handler for it. A 404
+    # would say the endpoint is not part of the API, which is a different and
+    # wrong statement.
     return agnosai_route_error(HTTP_NOT_IMPLEMENTED,  #skip-lint: HTTP 501 status code
     str_from("crew streaming is unavailable in this build"));
 }

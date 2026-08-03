@@ -39,6 +39,7 @@ include "src/server/routes/dashboard.cyr"
 include "src/server/routes/crews.cyr"
 include "src/server/routes/a2a.cyr"
 include "src/server/routes/mcp.cyr"
+include "src/server/routes/sse.cyr"
 include "src/server/hot_config.cyr"
 include "src/server/rate_limit.cyr"
 include "src/server/router.cyr"
@@ -386,6 +387,176 @@ fn _t_bind_failure_returns(): i64 {
     return 0;
 }
 
+# --- SSE (M6 bite 15c) ---------------------------------------------------
+
+# The unknown-crew path terminates on its own, so it needs no thread: the
+# handler emits one error frame and ends the chunked body.
+fn _t_sse_over_pipe(state, id: Str, out): i64 {
+    var fds[8];
+    if (sys_pipe(&fds) < 0) { return -1; }
+    var rfd = load32(&fds);
+    var wfd = load32(&fds + 4);
+    agnosai_sse_crew_stream(state, wfd, id);
+    sys_close(wfd);
+    var n = file_read(rfd, out, 8192);
+    sys_close(rfd);
+    if (n < 0) { n = 0; }
+    return n;
+}
+
+# An id that parses but names no crew: `has` is 0, so the oracle yields a single
+# `error` event carrying "crew not found" and returns (`routes/sse.rs:34-44`).
+fn _t_sse_unknown_crew(): i64 {
+    var s = _t_state();
+    var out[8192];
+    var n = _t_sse_over_pipe(s, str_from("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"), &out);
+    assert(n > 0, "the stream wrote something");
+
+    assert(_t_starts_with(&out, n, "HTTP/1.1 200 OK\r\n") == 1,
+    "SSE is a 200 — an unknown crew is reported IN the stream, not as a status");
+    assert(_t_contains(&out, n, "Content-Type: text/event-stream") == 1,
+    "the SSE content type the oracle's test asserts");
+    assert(_t_contains(&out, n, "Transfer-Encoding: chunked") == 1, "streamed, not buffered");
+    assert(_t_contains(&out, n, "Cache-Control: no-cache") == 1, "and not cacheable");
+
+    assert(_t_contains(&out, n, "event: error") == 1,
+    "an error event — the oracle's sse_endpoint_sends_error_event_for_unknown_crew");
+    assert(_t_contains(&out, n, "crew not found") == 1, "...naming the reason");
+    assert(_t_contains(&out, n, "\"event_type\":\"error\"") == 1,
+    "the frame carries a whole serialised CrewEvent, not a bare message");
+    assert(_t_contains(&out, n, "0\r\n\r\n") == 1, "and the chunked terminator closes the body");
+
+    # No `connected` frame on this path — the oracle returns before emitting one.
+    assert(_t_contains(&out, n, "event: connected") == 0,
+    "an unknown crew never gets a connected event");
+    return 0;
+}
+
+# **Canonicalisation.** An uppercase id parses, and crew ids are minted
+# lowercase, so without `agnosai_uuid_canonical` the bus lookup would miss and a
+# live crew would be reported as not found. The oracle cannot have this bug: it
+# takes `Path<Uuid>` and immediately `to_string()`s it.
+fn _t_sse_uppercase_id_canonicalises(): i64 {
+    var s = _t_state();
+    var bus = agnosai_app_state_events(s);
+    var lower = str_from("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+
+    # Make the crew live under its lowercase (minted) spelling.
+    agnosai_event_bus_subscribe(bus, lower);
+    assert(agnosai_event_bus_has(bus, lower) == 1, "the crew is live under the lowercase id");
+
+    # A LIVE crew streams until its subscription closes, so this needs a closer
+    # thread exactly as the live-stream test does. Without one the handler is
+    # correct and the test hangs — which is what happened writing it.
+    _t_sse_bus = bus;
+    _t_sse_crew = lower;
+    thread_create(&_t_sse_closer, 0);
+
+    # The same id in uppercase must resolve to it, not to "not found".
+    var out[8192];
+    var n = _t_sse_over_pipe(s, str_from("AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"), &out);
+    assert(_t_contains(&out, n, "crew not found") == 0,
+    "an UPPERCASE id finds the crew — canonicalised before the bus lookup");
+    assert(_t_contains(&out, n, "\"crew_id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\"") == 1,
+    "...and the frames echo the LOWERCASE id, as Uuid::to_string does");
+    return 0;
+}
+
+# State shared with the helper threads below: they run concurrently with the
+# handler, so these cannot be stack locals.
+var _t_sse_bus = 0;
+var _t_sse_crew = 0;
+
+# End the crew after a delay, closing the handler's subscription.
+#
+# **Every test against a LIVE crew needs one of these.** A live stream is
+# correct precisely because it does not end on its own, so a suite that forgets
+# to close the crew hangs rather than failing — which is how this helper came to
+# exist.
+fn _t_sse_closer(arg) {
+    sleep_ms(150);
+    agnosai_event_bus_remove(_t_sse_bus, _t_sse_crew);
+    return 0;
+}
+
+# Publish one event, then end the crew — which closes the handler's subscription
+# and is what lets the stream terminate.
+fn _t_sse_feeder(arg) {
+    sleep_ms(120);
+    var tx = agnosai_event_bus_sender(_t_sse_bus, _t_sse_crew);
+    var d = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(d, str_from("step"), bayan_json_v_str_new(str_from("one")));
+    agnosai_event_sender_send(tx, agnosai_crew_event_new(_t_sse_crew,
+    str_from("task_started"), d));
+    sleep_ms(160);
+    agnosai_event_bus_remove(_t_sse_bus, _t_sse_crew);
+    return 0;
+}
+
+# The live path: connected frame, a forwarded event, then termination on Closed.
+#
+# This is the half the unknown-crew test cannot reach, and the one that proves
+# `agnosai_event_sub_closed` actually ends the loop — without it the handler
+# polls forever and this test hangs rather than failing.
+fn _t_sse_live_stream(): i64 {
+    var s = _t_state();
+    _t_sse_bus = agnosai_app_state_events(s);
+    _t_sse_crew = str_from("11111111-2222-4333-8444-555555555555");
+
+    agnosai_event_bus_subscribe(_t_sse_bus, _t_sse_crew);
+    thread_create(&_t_sse_feeder, 0);
+
+    var out[8192];
+    var n = _t_sse_over_pipe(s, _t_sse_crew, &out);
+    assert(n > 0, "the live stream wrote frames");
+    assert(_t_contains(&out, n, "event: connected") == 1,
+    "a live crew gets the connected event — the oracle's third test");
+    assert(_t_contains(&out, n, "SSE stream connected") == 1, "...with its message");
+    assert(_t_contains(&out, n, "event: task_started") == 1,
+    "the forwarded event uses its OWN type as the SSE event name");
+    assert(_t_contains(&out, n, "\"step\":\"one\"") == 1, "carrying the event's data verbatim");
+    assert(_t_contains(&out, n, "0\r\n\r\n") == 1,
+    "and a closed subscription ends the body rather than looping forever");
+    return 0;
+}
+
+# Routing and auth still precede the stream, exactly as in the dispatcher.
+fn _t_sse_transport_gates(): i64 {
+    var s = _t_state();
+    agnosai_serve_mount(s, 0);
+    var out[8192];
+
+    # A malformed id is 422 — the oracle's `Path<Uuid>` extractor rejects before
+    # the handler, matching `agnosai_route_get_crew`. This is the assertion that
+    # caught an unauthenticated SIGSEGV: the route matches on shape alone, so
+    # without the gate the id reached `agnosai_uuid_canonical`, which answered 0,
+    # and `str_clone(0)` faulted.
+    var n = _t_serve_over_pipe(str_from(
+    "GET /api/v1/crews/not-a-uuid/stream HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, n, "HTTP/1.1 422 Unprocessable Entity\r\n") == 1,
+    "a malformed crew id is 422, not a stream and not a crash");
+    assert(_t_contains(&out, n, "text/event-stream") == 0,
+    "...with no SSE headers written");
+
+    # With auth configured the stream is refused BEFORE any chunked header is
+    # written — a 401 must be a normal buffered response, not a stream carrying
+    # an error frame.
+    var guarded = agnosai_app_state_new(agnosai_orchestrator_new(0),
+    agnosai_app_state_tools(s), agnosai_auth_config_with_secret(str_from("s3cr3t")),
+    agnosai_event_bus_new(), agnosai_audit_chain_new(), agnosai_approval_gate_new());
+    agnosai_serve_mount(guarded, 0);
+    var n2 = _t_serve_over_pipe(str_from(
+    "GET /api/v1/crews/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/stream HTTP/1.1\r\nHost: x\r\n\r\n"),
+    &out);
+    assert(_t_starts_with(&out, n2, "HTTP/1.1 401 Unauthorized\r\n") == 1,
+    "auth precedes the stream, and refuses with a buffered 401");
+    assert(_t_contains(&out, n2, "text/event-stream") == 0,
+    "...emitting no SSE headers at all");
+
+    agnosai_serve_mount(s, 0);
+    return 0;
+}
+
 # Graceful shutdown (ADR 013). Unblocked by cyrius 6.5.6, which vendors sandhi
 # 1.9.9's `sandhi_server_options_stop_flag` — before it, ADR 012 recorded that
 # no amount of signal handling could reach a loop parked in `accept`.
@@ -552,6 +723,10 @@ fn main(): i64 {
     _t_mount();
     _t_parse_port();
     _t_shutdown_flag_wired();
+    _t_sse_unknown_crew();
+    _t_sse_uppercase_id_canonicalises();
+    _t_sse_live_stream();
+    _t_sse_transport_gates();
     _t_bind_failure_returns();
     _t_allocation_profile();
     # LAST — installs a process-wide signal mask; see the fn's own note.
