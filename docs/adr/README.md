@@ -4,7 +4,10 @@ Decisions about agnosai — what we chose, the context, and the consequences we 
 
 ## Conventions
 
-- **Filename**: `NNNN-kebab-case-title.md`, zero-padded to four digits. Never renumber.
+- **Filename**: `NNN-kebab-case-title.md`, zero-padded to **three** digits. Never renumber.
+  (This line said "four" until 2026-08-03, when every ADR on disk and CLAUDE.md's
+  own ADR-format section already used three. The files are correct; the rule was
+  not, and "never renumber" made fixing the rule the only option.)
 - **One decision per ADR.** If a decision supersedes a prior one, add a new ADR and set the old one's status to `Superseded by NNNN`.
 - **Status lifecycle**: `Proposed` → `Accepted` → (optionally) `Superseded` or `Deprecated`.
 - Use [`template.md`](template.md) as the starting point.
@@ -19,4 +22,24 @@ Decisions about agnosai — what we chose, the context, and the consequences we 
 
 ## Index
 
-_No ADRs yet. Add the first as `0001-kebab-case-title.md`._
+Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
+2026-08-03, by which point twelve existed.
+
+| # | Decision | Status |
+|---|---|---|
+| [001](001-separate-repo.md) | AgnosAI as a separate repository | Accepted |
+| [002](002-ecosystem-tools.md) | AGNOS ecosystem as optional tool backends | Accepted |
+| [003](003-llm-native-http.md) | Native HTTP for LLM providers — the hoosh seam | Accepted |
+| [004](004-concurrency-model.md) | Concurrency model — `sandhi_server_run_pooled` | Accepted |
+| [005](005-ai-hwaccel-integration.md) | ai-hwaccel for hardware detection and workload planning | Accepted |
+| [006](006-cx-tool-sandbox.md) | cx bytecode + kavach for sandboxed tool execution, replacing WASM | Accepted |
+| [007](007-audit-redirect-revalidation.md) | Re-validate the SSRF guard on every redirect hop | Accepted |
+| [008](008-durable-state-crew-id-validation.md) | `durable_state` validates `crew_id` | Accepted |
+| [009](009-auth-constant-time-secret-compare.md) | Constant-time shared-secret comparison via SHA-256 digests | Accepted |
+| [010](010-jwt-require-configured-iss-aud.md) | A configured `iss` or `aud` is required, not merely matched | Accepted |
+| [011](011-metrics-endpoint-serves-agnosai-metrics.md) | `/metrics` serves agnosai's own registry, not hoosh's | Accepted |
+| [012](012-no-graceful-shutdown-on-sandhi.md) | The server installs no signal handler and does not drain on shutdown | Accepted |
+
+ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
+than `00N — Title`) and carry no `## Status` line. Left as written: renumbering
+and reformatting accepted decisions buys nothing and breaks inbound links.

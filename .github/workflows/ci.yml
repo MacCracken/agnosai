@@ -36,6 +36,18 @@ jobs:
       - name: Resolve dependencies
         run: cyrius deps
 
+      - name: Lockfile is honest
+        # `cyrius deps` here resolves every [deps.NAME] from `git` + `tag`,
+        # because a runner has none of the sibling checkouts that `path =
+        # "../NAME"` points at locally. A developer who DOES have them builds
+        # against the path, which WINS over the tag — so the two can silently
+        # diverge, and on 2026-08-03 they had: lib/kavach.cyr was 3.11.0 locally
+        # while cyrius.cyml pinned 3.9.3, which is what this job was compiling.
+        #
+        # If the committed lock disagrees with a clean tag-only resolution, the
+        # tags no longer name what anyone is actually building. Fail loudly.
+        run: git diff --exit-code -- cyrius.lock
+
       - name: Symbol check
         # Cyrius has ONE flat namespace and last-definition-wins. The compiler
         # warns on a duplicate `fn` and is SILENT on a duplicate `var` or enum

@@ -1,5 +1,54 @@
-# agnosai — Cyrius port
-# Ported from 27683 lines of Rust
+# =========================================================================
+# agnosai — the binary's entry point.
+#
+# Parity oracle: rust-old/src/main.rs
+#
+# **Bite 16, the last of M6's transport tier.** `server/serve` connects the
+# router to a socket; this is what decides *which* socket, with what state, and
+# reads the environment the oracle reads. Until it landed, `./build/agnosai`
+# printed `agnosai ready` and exited, so `agnosai_serve` was tested but never
+# called by anything.
+#
+# ## Five things in the oracle have no counterpart here, and none is an omission
+#
+#   1. **`http_client`** (`main.rs:100-103`). `reqwest::Client::builder()
+#      .timeout(30s).pool_max_idle_per_host(10)` has nothing to construct:
+#      outbound HTTP goes through `agnosai_guarded_fetch(arena, ...)`, which
+#      takes a per-request arena and no client handle (`src/server/state.cyr:21`).
+#      The 30 s timeout survives as `AGNOSAI_SERVE_CALLBACK_TIMEOUT_MS`.
+#   2. **`let app = router(state)`** (`main.rs:118`). Routing is compile-time
+#      dispatch here; `agnosai_serve_mount` is its counterpart and `serve` calls
+#      it (`src/server/serve.cyr:307`).
+#   3. **`with_graceful_shutdown` + `shutdown_signal()`** (`main.rs:130`,
+#      `:137-153`). **Not implementable on sandhi 1.9.8** — see ADR 012. This
+#      file installs no signal handler rather than one that reports a drain it
+#      cannot perform.
+#   4. **`tracing_subscriber::fmt().json()`** (`main.rs:69-72`). sakshi has no
+#      JSON output mode and no `EnvFilter`, so no formatter is configured and
+#      lines emit as plain text on fd 2 at sakshi's default level. Log
+#      *content* matches the oracle line for line; log *transport and format*
+#      diverge, which is the honest way to state it.
+#   5. **`definitions: DashMap::new()`** (`main.rs:116`). Built inside
+#      `agnosai_app_state_new` (`src/server/state.cyr:66`), not passed in.
+#
+# ## Nothing in this file is `.tcyr`-reachable
+#
+# The lines at the foot run `main()` at include time, so a suite that included
+# this module would start a server. That is why the one piece with a real
+# silent-divergence risk — the `u16` port parse — lives in
+# `src/server/serve.cyr` as `agnosai_serve_parse_port`, where it is tested,
+# while the env plumbing below stays module-local. Acceptance for this bite is
+# a live run.
+#
+# ## `127.0.0.1`, not `localhost`
+#
+# The oracle defaults `HOOSH_URL` to `http://localhost:8088` (`main.rs:79`);
+# `agnosai_hoosh_default_url` answers `http://127.0.0.1:8088`
+# (`src/llm/hoosh.cyr:91`). Keep the numeric spelling: sandhi's resolver
+# consults no `/etc/hosts` and has no `localhost` special case, so the name
+# would take the DNS path and fail on any resolver that NXDOMAINs it. The wire
+# target is identical on every conforming host.
+# =========================================================================
 
 # Stdlib auto-included via cyrius.cyml
 
@@ -34,12 +83,253 @@ include "src/server/rate_limit.cyr"
 include "src/server/router.cyr"
 include "src/server/serve.cyr"
 
-# Entry point. Initializes the bump allocator every downstream module's heap
-# structures depend on, then reports readiness. The port has no CLI surface yet.
-fn main() {
-    alloc_init();
-    println("agnosai ready");
+# The port used when neither `PORT` nor `AGNOSAI_PORT` names a valid u16.
+# Matches `unwrap_or(8080)` at `rust-old/src/main.rs:124`.
+var AGNOSAI_DEFAULT_PORT = 8080;
+
+# --- Environment ----------------------------------------------------------
+
+# True iff `v` is ASCII-case-insensitively `"true"`, or byte-exactly `"1"`.
+#
+# `v` is a NUL-terminated cstring from `getenv`. Mirrors
+# `v.eq_ignore_ascii_case("true") || v == "1"` (`rust-old/src/main.rs:18`) —
+# note only the word is case-insensitive; `"1"` is trivially case-exact.
+#
+# Walks in place rather than lowering through `str_lower_cstr`, which would
+# allocate for a four-byte comparison. Same reasoning, same shape, as
+# `_agnosai_audit_cstr_ieq` (`src/tools/builtin/security_audit.cyr:164`).
+fn _agnosai_main_env_truthy(v): i64 {
+    if (load8(v) == 49) { if (load8(v + 1) == 0) { return 1; } }
+    var lit = "true";
+    var i = 0;
+    while (1 == 1) {
+        var a = load8(v + i);
+        var b = load8(lit + i);
+        if (a >= 65 && a <= 90) { a = a + 32; }
+        if (a != b) { return 0; }
+        if (a == 0) { return 1; }
+        i = i + 1;
+    }
     return 0;
+}
+
+# Whether `AGNOSAI_AUTH_ENABLED` asks for auth. Unset is false, which is
+# `.unwrap_or(false)` at `rust-old/src/main.rs:19`.
+fn _agnosai_main_auth_enabled(): i64 {
+    var v = getenv("AGNOSAI_AUTH_ENABLED");
+    if (v == 0) { return 0; }
+    return _agnosai_main_env_truthy(v);
+}
+
+# Build the `AuthConfig` from the environment — `load_auth_config`
+# (`rust-old/src/main.rs:16-55`), branch for branch.
+#
+# **Set-but-empty is not the same as unset, and `getenv` already distinguishes
+# them**: `FOO=` returns a non-zero pointer to `""` (`lib/io.cyr:621`) where
+# unset returns 0, which is exactly Rust's `Ok("")` vs `Err(NotPresent)`. That
+# matters here because `AGNOSAI_JWT_PUBLIC_KEY=` must NOT build a JwtConfig —
+# the oracle's `.filter(|k| !k.is_empty())` (`main.rs:26`) drops it — while
+# `AGNOSAI_AUTH_SECRET=` yields an empty secret that fails the length test
+# below and so does not select the secret arm either.
+#
+# Precedence is jwt -> secret -> enabled-without-credentials -> default, and the
+# "enabled but nothing configured" warning fires *before* the selection, not
+# inside it: it can fire in a case where the selection then returns a default
+# config, so folding it into a branch would lose it (`main.rs:37-41`).
+fn _agnosai_main_load_auth_config(): i64 {
+    var enabled = _agnosai_main_auth_enabled();
+
+    var sc = getenv("AGNOSAI_AUTH_SECRET");
+    var auth_sec = str_from("");
+    if (sc != 0) { auth_sec = str_from(sc); }
+
+    var jwt = 0;
+    var kc = getenv("AGNOSAI_JWT_PUBLIC_KEY");
+    if (kc != 0) { if (strlen(kc) > 0) {
+            jwt = agnosai_jwt_config_new(str_from(kc));
+            var iss = getenv("AGNOSAI_JWT_ISSUER");
+            if (iss != 0) { agnosai_jwt_config_with_issuer(jwt, str_from(iss)); }
+            var aud = getenv("AGNOSAI_JWT_AUDIENCE");
+            if (aud != 0) { agnosai_jwt_config_with_audience(jwt, str_from(aud)); }
+        } }
+
+    if (enabled == 1) { if (str_len(auth_sec) == 0) { if (jwt == 0) {
+                sakshi_warn(
+                "Auth enabled but no secret or JWT key configured — all requests will be rejected",
+                82);
+            } } }
+
+    if (jwt != 0) { return agnosai_auth_config_with_jwt(jwt); }
+    if (str_len(auth_sec) > 0) { return agnosai_auth_config_with_secret(auth_sec); }
+    if (enabled == 1) {
+        var c = agnosai_auth_config_new();
+        agnosai_auth_config_set_enabled(c, 1);
+        return c;
+    }
+    return agnosai_auth_config_new();
+}
+
+# The hoosh gateway base URL. Unset falls back to the port default; set-but-empty
+# yields an empty URL, because `unwrap_or_else` fires on `Err` only
+# (`rust-old/src/main.rs:79`).
+#
+# `str_from` borrows rather than copies (`lib/str.cyr:35`), and `getenv`'s buffer
+# is heap-allocated and never freed (`lib/io.cyr:624`), so the borrow outlives
+# every use.
+fn _agnosai_main_hoosh_url(): i64 {
+    var v = getenv("HOOSH_URL");
+    if (v == 0) { return agnosai_hoosh_default_url(); }
+    return str_from(v);
+}
+
+# The listening port: `PORT`, else `AGNOSAI_PORT`, else 8080
+# (`rust-old/src/main.rs:120-124`).
+#
+# **The fallthrough is on *unset* only.** `.or_else` fires on `Err`, so
+# `PORT=` does not fall through to `AGNOSAI_PORT` — it becomes `Ok("")`, fails
+# the parse, and lands on the default. A `strlen(v) == 0` test in the first
+# branch would diverge here.
+fn _agnosai_main_port(): i64 {
+    var v = getenv("PORT");
+    if (v == 0) { v = getenv("AGNOSAI_PORT"); }
+    if (v == 0) { return AGNOSAI_DEFAULT_PORT; }
+    var p = agnosai_serve_parse_port(str_from(v));
+    if (p < 0) { return AGNOSAI_DEFAULT_PORT; }
+    return p;
+}
+
+# --- Logging --------------------------------------------------------------
+
+# Emit one startup line carrying a string field, guarded on the live level so
+# the formatting cost is only paid when it would be emitted. House idiom, same
+# shape as `_agnosai_registry_log` (`src/tools/registry.cyr:145`).
+fn _agnosai_main_log_kv(level, msg, msg_len, key, key_len, val: Str): i64 {
+    if (sakshi_get_level() < level) { return 0; }
+    sakshi_log_kv(level, msg, msg_len, key, key_len, str_data(val), str_len(val));
+    return 0;
+}
+
+# The same for an integer field. The `str_builder` work sits behind the level
+# gate too, so a suppressed line allocates nothing.
+fn _agnosai_main_log_int(level, msg, msg_len, key, key_len, n): i64 {
+    if (sakshi_get_level() < level) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add_int(sb, n);
+    var v = str_builder_build(sb);
+    sakshi_log_kv(level, msg, msg_len, key, key_len, str_data(v), str_len(v));
+    return 0;
+}
+
+# --- Exit -----------------------------------------------------------------
+
+# Terminate the whole process, not just the calling thread.
+#
+# **`SYS_EXIT` is `exit(2)`, which exits one thread.** That was harmless while
+# `main` did nothing, and stops being harmless the moment `agnosai_serve` runs:
+# `sandhi_server_run_pooled` returns 1 from three places — `lib/sandhi.cyr:14192`
+# (worker-arg allocation failed, before any thread), `:14203` (accept-state
+# allocation failed) and `:14213` (a fatal accept) — and the last two return
+# into a process that already has up to `AGNOSAI_SERVE_WORKERS` threads alive,
+# some parked in `chan_recv` and some mid-request. Exiting only the main thread
+# there leaves the process running with no acceptor: a hang, not a crash.
+#
+# `exit_group(2)` is the fix and exists on every Linux target — 231 on x86_64
+# (`lib/syscalls_x86_64_linux.cyr:83`), 94 on the aarch64 cross build named in
+# `cyrius.cyml [release].cross_bins` (`lib/syscalls_aarch64_linux.cyr:101`) —
+# but **not on agnos**, which defines `SYS_EXIT` alone
+# (`lib/syscalls_x86_64_agnos.cyr:23`). The guard is therefore load-bearing
+# rather than decorative, and the trailing `SYS_EXIT` is both the agnos path and
+# the unreachable belt-and-braces on Linux, where `exit_group` does not return.
+fn _agnosai_exit_process(code): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    syscall(SYS_EXIT_GROUP, code);
+    #endif
+    syscall(SYS_EXIT, code);
+    return 0;
+}
+
+# --- Entry point ----------------------------------------------------------
+
+# Stand up the shared state and serve until the listener dies.
+#
+# Order follows `rust-old/src/main.rs:74-135` so the startup log reads the same.
+# `alloc_init()` comes first because everything below allocates — `getenv`
+# itself does (`lib/io.cyr:624`).
+#
+# Two calls the oracle does not make, both justified at their site: the resource
+# budget is explicit rather than `0`, and the JWT key is decoded eagerly.
+fn main(): i64 {
+    alloc_init();
+    sakshi_info("AgnosAI server starting", 23);
+
+    var events = agnosai_event_bus_new();
+
+    var hoosh_url = _agnosai_main_hoosh_url();
+    _agnosai_main_log_kv(SK_INFO, "LLM client configured (lazy — init on first use)", 50,
+    "hoosh_url", 9, hoosh_url);
+
+    # `Orchestrator::new(Default::default())` (`main.rs:82`). The budget is
+    # `agnosai_resource_budget_default()`, NOT 0: the existing suites pass 0 as
+    # a shortcut, but `agnosai_orchestrator_timeout_secs` dereferences it, so a
+    # 0 here would fault the moment a crew runs.
+    #
+    # `with_llm_url` takes a third `api_key` argument the oracle's does not;
+    # `""` is the documented spelling for an unauthenticated gateway
+    # (`src/llm/hoosh.cyr:692`) and reproduces the oracle's no-key request.
+    var orchestrator = agnosai_orchestrator_new(agnosai_resource_budget_default());
+    agnosai_orchestrator_with_llm_url(orchestrator, hoosh_url, str_from(""));
+    agnosai_orchestrator_with_events(orchestrator, events);
+
+    var tools = agnosai_tool_registry_new();
+    agnosai_register_basic_builtins(tools);
+    agnosai_register_load_testing_builtin(tools);
+    agnosai_register_security_audit_builtin(tools);
+    _agnosai_main_log_int(SK_INFO, "tools registered", 16, "tools", 5,
+    agnosai_tool_registry_count(tools));
+
+    var auth = _agnosai_main_load_auth_config();
+    if (agnosai_auth_config_enabled(auth) == 1) {
+        var jwt = agnosai_auth_config_jwt(auth);
+        var has_jwt = 0;
+        if (jwt != 0) { has_jwt = 1; }
+        _agnosai_main_log_int(SK_INFO, "authentication enabled", 22, "jwt", 3, has_jwt);
+        # Not in the oracle. `agnosai_jwt_config_prepare` memoizes both
+        # outcomes, closing the per-request re-decode described at
+        # `src/server/auth.cyr:275`, and — because `_pem_init` guards its table
+        # build with a plain non-atomic flag — doing it here, before any worker
+        # thread exists, removes a first-request race under `run_pooled`.
+        #
+        # A bad key logs and boots anyway. Refusing to boot would diverge: the
+        # oracle answers 500 per request rather than failing to start.
+        if (jwt != 0) { if (agnosai_jwt_config_prepare(jwt) == 0) {
+                sakshi_warn(
+                "JWT public key failed to decode — every JWT request will be rejected", 70);
+            } }
+    }
+    if (agnosai_auth_config_enabled(auth) == 0) {
+        sakshi_warn(
+        "authentication disabled — set AGNOSAI_AUTH_ENABLED=true for production", 72);
+    }
+
+    # `orchestrator.audit().clone()` (`main.rs:105`) — the SAME chain the
+    # orchestrator holds, not a fresh one. `agnosai_orchestrator_new` already
+    # minted it, so this is non-zero without a setter.
+    var state = agnosai_app_state_new(orchestrator, tools, auth, events,
+    agnosai_orchestrator_audit(orchestrator), agnosai_approval_gate_new());
+
+    var port = _agnosai_main_port();
+    if (sakshi_get_level() >= SK_INFO) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "listening on 0.0.0.0:");
+        str_builder_add_int(sb, port);
+        var line = str_builder_build(sb);
+        sakshi_info(str_data(line), str_len(line));
+    }
+
+    # `INADDR_ANY()` is the oracle's `([0, 0, 0, 0], port)`. A return is fatal,
+    # never a clean shutdown — see the doc on `agnosai_serve` — so it maps
+    # straight onto a non-zero exit status.
+    return agnosai_serve(state, INADDR_ANY(), port);
 }
 
 # Prefixed like everything else: this is a top-level `var` in Cyrius's single
@@ -48,4 +338,4 @@ fn main() {
 # enforces the rule; the `.tcyr` epilogue's bare `f` is exempt only because a
 # test binary is its own final translation unit.
 var _agnosai_exit_code = main();
-syscall(SYS_EXIT, _agnosai_exit_code);
+_agnosai_exit_process(_agnosai_exit_code);

@@ -23,6 +23,57 @@ lands, not before, so the number always names something that actually shipped.
   bayan repo the same command reported success and left five files stale; here it
   was clean, but the check is cheap and the failure is silent.
 
+  **One snapshot entry is genuinely absent and it is inert: `lib/unicode/`.**
+  `cyrius lib sync --full` copies **99 `.cyr` files** and does not recurse into
+  subdirectories, so the snapshot's `unicode/` directory (7 files backing
+  `unicode_category` / casefold / normalize) never lands. Its only consumer is
+  `niyama.cyr`'s `\p{NAME}` regex property support, and **agnosai does not declare
+  niyama** (`grep -c niyama cyrius.cyml` → 0). If it ever did, the failure would be
+  a loud undefined `unicode_category` at build, not silent misbehaviour — niyama's
+  own header says the consumer must include `lib/unicode/categories.cyr` too. No
+  action owed here; recorded so the diff is not re-derived as a defect.
+
+### Pins must name what is actually built — corrected 2026-08-03
+
+`cyrius.cyml` pinned **bote 3.2.1** and **kavach 3.9.3** while `lib/` held **bote
+3.3.0** and **kavach 3.11.0**. Both vendored bundles are byte-identical to their
+upstream tag dists (verified by sha256 against `git show <tag>:dist/...`). The pins
+are now **bote 3.3.0** / **kavach 3.11.0**, which is what was already being compiled
+and tested.
+
+**The mechanism, because it will recur.** Every `[deps.NAME]` carries
+`path = "../NAME"` alongside `git` + `tag`, and **the local path wins**. A developer
+whose sibling checkout has moved ahead silently builds a version the manifest does
+not name; CI, which has no sibling checkouts, resolves the *tag* and builds
+something else. Here that was kavach **3.11.0 locally against 3.9.3 in CI** — the
+`~/.cyrius/deps/kavach/3.11.0/` clone predates the session that found it.
+
+This is the inverse of the sigil rule recorded below, and both are live: a stale tag
+can *overwrite* a newer folded copy (sigil's case) **or** be quietly overridden by a
+newer local path (kavach's case). The lockfile does not save you from the second —
+`cyrius.lock` recorded 3.9.3's sha256 against a 3.11.0 file on disk and nothing
+surfaced it, because every other gate reads `src/` and the build compiles whatever
+bytes `lib/` holds.
+
+**Two gates now close the class**, both mutation-verified:
+
+- `scripts/check-clean.sh` runs **`cyrius deps --verify`** (lock vs. working `lib/`).
+  Restoring the stale hash makes it print `FAIL: lib/kavach.cyr (hash mismatch)` and
+  exit **1**. Note the exit code must be read directly — piping through `tail` reports
+  `tail`'s status and reads as a pass.
+- CI gains a **Lockfile is honest** step: `git diff --exit-code -- cyrius.lock` after
+  `cyrius deps`, which catches a committed lock that disagrees with a clean tag-only
+  resolution — i.e. exactly the local/CI divergence above.
+
+**What the two bumps actually change: nothing on any path agnosai executes.**
+kavach 3.10.0/3.11.0 are `--agnos` target build fixes — nine additive `kv_*` shims
+(`kv_unlink`, `kv_rmdir`, `kv_waitpid`, `kv_getgid`, `kv_lstat`, `kv_fork`, `kv_dup2`,
+`kv_execve`, `kv_setsid`); agnosai calls only `score_agent`, `score_agent_with_tools`,
+`sandbox_display`, `sandbox_strength`, and the diff touches none of them. bote 3.3.0
+adds `dispatcher_set_server_info` and is additive by construction — an unconfigured
+dispatcher emits the pre-3.3.0 wire byte for byte. The duplicate-fn warning count is
+unchanged at **35**, and all 57 suites stayed green across the bump.
+
 ### What 6.5.5 lands on agnosai
 
 - **bayan 1.4.0 completes the `_a` JSON surface** — `obj_set_a`, `build_a`,
@@ -54,20 +105,20 @@ lands, not before, so the number always names something that actually shipped.
 ## Source
 
 `src/` mirrors `rust-old/src/` — see CLAUDE.md's *Layout* rule. Generated from the
-tree 2026-07-31:
+tree 2026-08-03:
 
 | Group | Files | Lines | Oracle |
 |---|---|---|---|
 | `orchestrator/` | 16 | 5,311 | ✅ complete (M5) |
-| `server/` | 11 | 3,782 | 🟡 M6, 20 of 21 files |
+| `server/` | 11 | 3,835 | 🟡 M6, 20 of 21 files |
 | `core/` | 8 | 3,129 | ✅ complete (M2) |
 | `tools/builtin/` | 6 | 2,017 | ✅ complete (M4) |
 | `server/routes/` | 9 | 1,786 | ✅ complete |
 | `llm/` | 4 | 1,198 | ✅ complete (M3) |
 | `tools/` | 5 | 1,057 | ✅ complete (M4) |
 | `learning/` | 6 | 1,018 | ✅ complete (M2) |
-| root (port-local) | 6 | 652 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
-| **total** | **71** | **19,950** | against a 27,683-line oracle |
+| root (port-local) | 6 | 942 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
+| **total** | **71** | **20,293** | against a 27,683-line oracle |
 
 **Four oracle groups have zero Cyrius counterpart** — 8,473 lines, 31% of the
 oracle, all scheduled and none silently missing:
@@ -79,16 +130,26 @@ oracle, all scheduled and none silently missing:
 | `definitions/` | 1,460 | M10 (JSON only; ZIP + YAML excluded) |
 | `telemetry/` | 322 | M9 (partial) |
 
-**`src/main.cyr` is still a stub** — it prints `agnosai ready` and exits.
-`agnosai_serve` exists and is tested but nothing calls it (roadmap A2).
+**`src/main.cyr` is no longer a stub** — as of 2026-08-03 it wires the shared
+state and calls `agnosai_serve` (roadmap A2, closed). The one thing it does not
+do is shut down gracefully; that is [ADR 012](../adr/012-no-graceful-shutdown-on-sandhi.md)
+and it is a sandhi limitation, not an omission.
 
 ## Where the port is
 
-M0–M5 complete. **M6 (`server`) is 20 of 21 files**; the two remaining are
-`sse.rs::event_stream` + `routes/sse.rs` (roadmap A1, large — its own session) and
-the `main.rs` bind (A2, small). Until A1 lands,
-`/api/v1/crews/{id}/stream` answers **501 deliberately** — not 404, because the
-route exists and only its handler is missing (`src/server/router.cyr`).
+M0–M5 complete. **M6 (`server`) is 20 of 21 files**, and since 2026-08-03 **the
+binary actually serves**: bite 16 landed, so `./build/agnosai` binds, reads the
+oracle's environment and answers the route table. One file remains —
+`sse.rs::event_stream` + `routes/sse.rs` (roadmap A1, large — its own session).
+Until it lands, `/api/v1/crews/{id}/stream` answers **501 deliberately** — not
+404, because the route exists and only its handler is missing
+(`src/server/router.cyr`).
+
+Verified live, not inferred: `/health` → 200 `{"status":"ok"}`, `/metrics`
+renders the registry, `/api/v1/tools` lists the four registered builtins, and
+the stream route returns 501. `PORT` / `AGNOSAI_PORT` / `HOOSH_URL` and the four
+auth variables were each exercised against a running binary — see the CHANGELOG
+for the eight port cases and nine auth cases and what each proves.
 
 Standing decisions that shaped the port, each with its record:
 
@@ -397,14 +458,23 @@ criterion statistics. The Cyrius line starts its own baseline, captured by
 base substrate · general utilities · bayan · patra · concurrency+crypto floor ·
 dynamic-link floor · async · net/http/tls/ws/sakshi/sandhi
 
-**git deps** (declare-ahead pattern, read from `cyrius.cyml` 2026-07-31):
-sigil 3.12.2 · **bote 3.2.1** · majra 2.5.3 · kavach 3.9.3 · ai-hwaccel 2.3.16 ·
+**git deps** (declare-ahead pattern, read from `cyrius.cyml` 2026-08-03):
+sigil 3.12.2 · **bote 3.3.0** · majra 2.5.3 · **kavach 3.11.0** · ai-hwaccel 2.3.16 ·
 tyche 1.0.0.
 
-> **bote 3.3.0 is released and not yet pinned** — it adds
+**All six pins are now the newest upstream tag**, confirmed against the GitHub API
+rather than a local `git fetch` — the dep remotes are SSH (`git@github.com:`) and a
+keyless fetch fails *silently enough to look like "no new tags"*. Use
+`curl -sf https://api.github.com/repos/MacCracken/<dep>/tags` to check.
+
+> **bote 3.3.0 is pinned as of 2026-08-03** — it adds
 > `dispatcher_set_server_info`, which removes the `"serverInfo":{"name":"bote"}`
 > hardcode that stopped any consumer from using bote's MCP dispatcher without
-> misidentifying itself. Bump when tagged (roadmap B1).
+> misidentifying itself. This unblocks roadmap B1's *next* surface; it does **not**
+> mean `routes/mcp.cyr` should delegate to the dispatcher today, because the oracle
+> uses bote's protocol types and explicitly declines its Dispatcher
+> (`rust-old/src/server/routes/mcp.rs:3-5`), so hand-building the envelope IS the
+> parity behaviour.
 The hoosh seam targets **hoosh 2.6.0** — `usage.cost_micro_usd`, `usage.provider` and
 `X-Hoosh-Cache` are read when present, and an older gateway degrades to an absent cost
 rather than a fabricated one.
@@ -480,16 +550,19 @@ libro 2.8.4 arrives transitively via bote.
 
 | | |
 |---|---|
-| Cyrius port | **19,950 lines**, 71 files, `src/` mirroring `rust-old/src/` |
+| Cyrius port | **20,293 lines**, 71 files, `src/` mirroring `rust-old/src/` |
 | Rust oracle | 27,683 lines at `rust-old/` — frozen |
-| Milestones | M0–M5 complete; **M6 (`server`) at 20 of 21 files** |
-| Remaining in M6 | `sse.rs::event_stream` + `routes/sse.rs` (roadmap A1), `main.rs` bind (A2) |
+| Milestones | M0–M5 complete; **M6 (`server`) at 20 of 21 files — the binary serves** |
+| Remaining in M6 | `sse.rs::event_stream` + `routes/sse.rs` (roadmap A1) — bite 16 closed 2026-08-03 |
 | Not started | M7 `sandbox`, M8 `fleet`, M9 `telemetry`, M10 `definitions` |
-| Gates | build OK · 1,421 symbols / 71 files · fmt·lint·doc·vet·deny clean · 57 suites / 3,600 assertions · coverage 100% |
+| Gates | build OK · 1,431 symbols / 71 files · fmt·lint·doc·vet·deny·deps--verify clean · 57 suites / 3,615 assertions · coverage 100% (900/900) |
 
-**The binary does not serve yet.** `agnosai_serve` exists and is tested, but
-nothing calls it — `./build/agnosai` prints `agnosai ready` and exits. That is
-roadmap A2, and it is small.
+**The binary serves as of 2026-08-03.** `src/main.cyr` wires the state and
+calls `agnosai_serve`; it no longer prints `agnosai ready` and exits. It ships
+**no graceful shutdown**, deliberately and with an ADR
+([012](../adr/012-no-graceful-shutdown-on-sandhi.md)) — the blocker is that
+sandhi's accept loop cannot be made to return, **not** the missing signal helper
+this file and the roadmap both used to cite.
 
 ### Standing rules a new session should not re-derive
 

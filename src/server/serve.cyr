@@ -281,6 +281,53 @@ fn _agnosai_serve_reason(status): i64 {
 
 # --- Entry points ---------------------------------------------------------
 
+# Parse `v` as a listening port exactly the way Rust's `u16::from_str` does, or
+# return -1 if it is not a valid u16. The oracle is `p.parse().ok()` at
+# `rust-old/src/main.rs:123`.
+#
+# **This one helper is public while the rest of the bind bite's env plumbing is
+# module-local**, and the asymmetry is deliberate: nothing in `src/main.cyr` is
+# reachable from a `.tcyr` — that file runs `main()` at include time — and this
+# is the only piece with a concrete silent-divergence risk, so leaving it there
+# would leave it untested.
+#
+# **Neither stdlib parser matches Rust, in opposite directions.** `str_to_int`
+# (`lib/str.cyr:280`) *skips* non-digits rather than stopping, so `"80a80"`
+# answers 8080; `atoi` (`lib/string.cyr:132`) stops at the first non-digit and
+# answers 80. Rust rejects both. Neither can signal failure at all, and `lib/`
+# has no Result-returning integer parse, so the port would silently bind
+# something the operator never asked for.
+#
+# **Overflow is checked per digit against 65535, not by capping the digit
+# count.** `u16::from_str` accumulates through `checked_mul`/`checked_add` and
+# bounds the *value*, never the length, so `"000080"` and `"0000065535"` are
+# both `Ok` in Rust; a 5-digit cap would reject them and fall back to 8080.
+# Checking inside the loop also removes any wraparound concern — the
+# accumulator cannot exceed 655359 before the check fires.
+#
+# The sentinel is -1 rather than 0 because **0 is a legal port number**; same
+# choice, same reason, as `AGNOSAI_NO_LIMIT` at `src/core/json.cyr:23`.
+fn agnosai_serve_parse_port(v: Str): i64 {
+    var n = str_len(v);
+    var d = str_data(v);
+    var i = 0;
+    # `u16::from_str` accepts one leading `+` and no `-`. Dropping the `+` arm
+    # would be a real, if microscopic, divergence: `"+80".parse::<u16>()` is Ok.
+    if (n > 0) { if ((load8(d) & 0xFF) == 43) { i = 1; } }
+    # An empty string, or a lone "+", is Err — never the default.
+    if (i >= n) { return 0 - 1; }
+    var acc = 0;
+    while (i < n) {
+        var c = load8(d + i) & 0xFF;
+        if (c < 48) { return 0 - 1; }
+        if (c > 57) { return 0 - 1; }
+        acc = acc * 10 + (c - 48);
+        if (acc > 65535) { return 0 - 1; }
+        i = i + 1;
+    }
+    return acc;
+}
+
 # Build the sandhi options this server runs with.
 #
 # **`req_arena` is the blocker #3 setting** and is the reason this is not
@@ -315,6 +362,12 @@ fn agnosai_serve_mount(state, limiter): i64 {
 # — since sandhi 1.9.8 — also on a structurally dead listener or after 200
 # consecutive resource failures, where earlier versions never returned once
 # listening. A caller must treat a return as fatal rather than as a loop exit.
+#
+# **`addr` is a network-order IPv4 u32, not a string.** It is passed unmodified
+# to `sock_bind` → `sockaddr_in` → `store32(sa + 4, addr)` (`lib/net.cyr:99`),
+# so a `Str` handed here silently lands its *header pointer* in `sin_addr`. Use
+# `INADDR_ANY()` (`lib/net.cyr:130`) for the oracle's `[0, 0, 0, 0]`, or
+# `INADDR_LOOPBACK()` (`lib/net.cyr:132`) for 127.0.0.1.
 fn agnosai_serve(state, addr, port): i64 {
     return sandhi_server_run_pooled(addr, port, &agnosai_serve_handler, 0,
     agnosai_serve_mount(state, 0));

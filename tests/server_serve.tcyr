@@ -357,20 +357,64 @@ fn _t_mount(): i64 {
 }
 
 # The doc comment promises a bind failure RETURNS rather than looping, and a
-# caller must treat that as fatal. TEST-NET-1 is never assigned to a host, so
-# the bind fails with EADDRNOTAVAIL at any privilege level — this cannot
-# accidentally start listening, even as root.
+# caller must treat that as fatal. TEST-NET-1 (192.0.2.0/24, RFC 5737) is never
+# assigned to a host, so the bind fails with EADDRNOTAVAIL at any privilege
+# level — this cannot accidentally start listening, even as root. That matters
+# more than it looks: `sandhi_server_run_pooled` fails at `sock_bind` BEFORE any
+# `thread_create`, so a test that binds successfully would spawn 100 workers
+# — each reserving a 10 MiB request buffer — and then never return.
+#
+# **`addr` is a network-order IPv4 u32, not a `Str`.** These three sites passed
+# `str_from("192.0.2.1")` until 2026-08-03, which put a 16-byte heap `Str`
+# *header pointer* into `sin_addr`: the assertions passed, but for a garbage
+# address rather than for TEST-NET-1, so the stated rationale did not hold.
+# 0x010200C0 is 192.0.2.1 in the byte order `store32` writes little-endian at
+# `lib/net.cyr:99` — same convention as `INADDR_LOOPBACK()` = 0x0100007F.
+var _T_TESTNET1 = 0x010200C0;
+
 fn _t_bind_failure_returns(): i64 {
     var s = _t_state();
-    assert(agnosai_serve(s, str_from("192.0.2.1"), 9) == 1,
+    assert(agnosai_serve(s, _T_TESTNET1, 9) == 1,
     "an unbindable address returns 1 rather than looping forever");
-    assert(agnosai_serve_with_rate_limit(s, str_from("192.0.2.1"), 9, 10000, 2) == 1,
+    assert(agnosai_serve_with_rate_limit(s, _T_TESTNET1, 9, 10000, 2) == 1,
     "the opt-in entry point reports the same failure");
     # ...and the failed opt-in attempt still left the limiter mounted, which is
     # why `agnosai_serve` clears it rather than assuming a fresh process.
     assert(_agnosai_serve_limiter != 0, "a failed opt-in start still mounted its limiter");
-    assert(agnosai_serve(s, str_from("192.0.2.1"), 9) == 1, "and a retry re-reports");
+    assert(agnosai_serve(s, _T_TESTNET1, 9) == 1, "and a retry re-reports");
     assert(_agnosai_serve_limiter == 0, "...having cleared it");
+    return 0;
+}
+
+# `agnosai_serve_parse_port` reproduces `u16::from_str`, which neither stdlib
+# parser does. The cases that matter are the ones where the two stdlib parsers
+# answer a NUMBER rather than failing — those are the silent misbinds.
+fn _t_parse_port(): i64 {
+    assert(agnosai_serve_parse_port(str_from("8080")) == 8080, "a plain port parses");
+    assert(agnosai_serve_parse_port(str_from("0")) == 0, "0 is a legal u16, not the sentinel");
+    assert(agnosai_serve_parse_port(str_from("65535")) == 65535, "the u16 ceiling parses");
+    assert(agnosai_serve_parse_port(str_from("65536")) == 0 - 1, "one past the ceiling is Err");
+    assert(agnosai_serve_parse_port(str_from("+80")) == 80, "a single leading + is Ok, as in Rust");
+
+    # Unbounded leading zeros are Ok in Rust: from_str_radix bounds the VALUE
+    # via checked_mul/checked_add, never the digit count. A 5-digit length cap
+    # would reject these and silently fall back to 8080.
+    assert(agnosai_serve_parse_port(str_from("000080")) == 80, "leading zeros do not cap length");
+    assert(agnosai_serve_parse_port(str_from("0000065535")) == 65535,
+    "...even ten digits, so long as the value fits");
+    assert(agnosai_serve_parse_port(str_from("+000080")) == 80, "sign and zeros together");
+
+    # The two stdlib parsers answer a number for every case below. That is the
+    # whole reason this function exists rather than delegating.
+    assert(agnosai_serve_parse_port(str_from("80a80")) == 0 - 1,
+    "an embedded non-digit is Err (str_to_int skips it and answers 8080)");
+    assert(agnosai_serve_parse_port(str_from("80 ")) == 0 - 1,
+    "a trailing space is Err (atoi stops and answers 80)");
+    assert(agnosai_serve_parse_port(str_from(" 80")) == 0 - 1, "a leading space is Err");
+    assert(agnosai_serve_parse_port(str_from("-80")) == 0 - 1, "a negative is Err, not a u16");
+    assert(agnosai_serve_parse_port(str_from("")) == 0 - 1, "empty is Err, not the default");
+    assert(agnosai_serve_parse_port(str_from("+")) == 0 - 1, "a lone sign is Err");
+    assert(agnosai_serve_parse_port(str_from("99999")) == 0 - 1, "five digits over the ceiling is Err");
     return 0;
 }
 
@@ -453,6 +497,7 @@ fn main(): i64 {
     _t_rate_limit_off_by_default();
     _t_handler_end_to_end();
     _t_mount();
+    _t_parse_port();
     _t_bind_failure_returns();
     _t_allocation_profile();
 
