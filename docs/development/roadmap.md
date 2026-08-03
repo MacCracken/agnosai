@@ -212,7 +212,48 @@ allocator on parse/build, so the handler half still grows the global bump —
 measured, and owed upstream as B3. The exit bar should read "transport flat,
 handler cost bounded and measured" until that filing lands.
 
-### M7 — `sandbox`, 77% (Phase 6)
+### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
+
+**Bite 1 done (2026-08-03):** `policy` + the group hub `mod` — isolation levels,
+the five named policies, `effective_isolation`, the JSON wire, and the shared
+env-sanitization list. 90 assertions, all 11 oracle tests ported.
+
+A survey of the remaining modules was refuted 3/3 on adversarial review. The
+sequencing that came out of it, and the three findings that shape it:
+
+**Order** (each independently compilable + testable): `oci` pure half →
+`kavach_bridge` pure half → **the spawn primitive** (`envp` + sanitization →
+fork/pipes/execve → stdin feed + interleaved drain → deadline/SIGKILL/reap) →
+`process` → `oci` exec half → `python` → `manager`. The spawn primitive is the
+irreducible prerequisite: nothing in `lib/` supplies the four-tuple these
+modules need (separate stdout, separate stderr, real exit code, stdin write).
+
+**⛔ HELD — the cx confinement bites.** ADR-006 makes kavach's seccomp +
+Landlock the *entire* security boundary for untrusted tool code. On the Landlock
+half that premise is weaker than assumed: `security_apply_landlock` puts only
+**3 of Landlock's 13 filesystem rights** in `handled_access`
+(`lib/kavach.cyr:1034`), and Landlock permits every right it does not name.
+**Measured on this box: a confined process deleted files and directories outside
+its allowed path, and created directories anywhere** — while the obvious smoke
+test ("cannot read `/etc/passwd`") passed. Filed against kavach with a runnable
+repro. The cx bites wait on that, or on ADR-006 being re-characterised; the
+non-cx bites are unaffected and proceed.
+
+**⛔ Blocks spawn-failure parity:** `fork` + `execve` cannot distinguish "spawn
+failed" from "child ran and exited 127" — the whole stdlib resolves an `execve`
+failure to `sys_exit(127)`. Three oracle sites need `Err`-on-spawn-failure
+(`oci.rs:219`, `process.rs:331`, `python.rs:87`). The standard fix is a fourth
+`O_CLOEXEC` exec-errno pipe; verify whether that flag is reachable before
+committing to the design.
+
+**Smaller, recorded so they are not re-derived:** kavach's `SandboxConfig` has no
+`externalization` field, so `build_config`'s per-call policy is unrepresentable
+and one oracle test cannot port as written; `kavach_bridge::execute` cannot
+honour `max_duration_secs` because nothing on the process path reads
+`timeout_ms`; and `scan_output` is a lossy 4→2 collapse
+(`{Pass,Warn}→Pass`, `{Block,Quarantine}→Block`) that a naive port returning the
+raw verdict would get wrong in both directions.
+
 
 policy (rename to `AgnSandboxPolicy` first), kavach_bridge, exec, process, python,
 oci, manager. **`wasm.rs`'s successor rides cx** per

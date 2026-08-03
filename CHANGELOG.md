@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 1 — `sandbox/policy` + the group hub.** Isolation levels, the five
+  named policies, `effective_isolation`, the JSON wire, and the shared
+  env-sanitization list. All 11 oracle tests port directly; 90 assertions.
+
+  **Two things the oracle's tests do not cover, both pinned here.** First, the
+  wire: `IsolationLevel` derives `Serialize` with no serde attributes, so serde
+  emits the **variant name** — `"Oci"`, not `3`. The oracle's lone round-trip
+  test cannot see the difference, because a port that emitted the discriminant
+  would round-trip against itself perfectly; all four spellings are asserted in
+  both directions. Second, `effective_isolation` when a tool needs **both**
+  filesystem and network — not an oracle case, and the one where checking the
+  flags in the other order silently answers `Process` for the tool asking for
+  the most access. Both mutation-verified.
+
+  **The port plan's closed blocker #5 — "rename to `AgnSandboxPolicy`" — does
+  not apply.** That existed because Rust had two `SandboxPolicy` types in one
+  namespace. The Cyrius hazard is sharper and differently shaped: kavach exports
+  its constructors **unprefixed** (`policy_new`, `policy_basic`, `policy_strict`
+  at `lib/kavach.cyr:2972-3007`), so a module reaching for the short spelling
+  would bind to kavach's silently. The `agnosai_*` prefix rule already prevents
+  it, and `check-symbols.sh` enforces the rule.
+
+  `SANITIZED_ENV_VARS` has **no oracle test at all** — an untested security
+  control the roadmap already lists under *Carried over from the Rust line*. It
+  is tested now, before either subprocess backend lands: exact-match only, no
+  prefix matching, case-sensitive (matching the loader's own matching, rather
+  than implying a protection the loader does not provide), and the macOS pair
+  stripped on Linux too.
+
 - **SSE streaming — M6 bite 15c, and the milestone is complete.**
   `GET /api/v1/crews/{id}/stream` streams crew events for real:
   `text/event-stream`, chunked, `Cache-Control: no-cache`, `event:`/`data:`

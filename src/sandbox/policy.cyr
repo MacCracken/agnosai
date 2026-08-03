@@ -1,0 +1,280 @@
+# =========================================================================
+# sandbox/policy — isolation levels and the per-tool sandbox policy.
+#
+# Parity oracle: rust-old/src/sandbox/policy.rs
+#
+# **M7 bite 1.** Every other sandbox module reads a policy to decide which
+# backend to run a tool under, so this lands first and depends on nothing.
+#
+# ## The "rename to AgnSandboxPolicy" instruction does not apply here
+#
+# The port plan's closed blocker #5 called for renaming this type, because in
+# Rust `agnosai::sandbox::SandboxPolicy` and kavach's `SandboxPolicy` were two
+# structs with one name in one namespace. That reasoning does not carry over:
+# Cyrius has a single flat namespace and agnosai's answer to it is the
+# `agnosai_*` prefix on every public symbol, which `scripts/check-symbols.sh`
+# enforces.
+#
+# The hazard is real and worth naming precisely, because it is sharper here than
+# it was in Rust. **kavach exports its policy constructors UNPREFIXED** —
+# `policy_new`, `policy_minimal`, `policy_basic`, `policy_strict`,
+# `policy_from_preset` (`lib/kavach.cyr:2972-3007`). A Cyrius module that
+# reached for the obvious short spelling would bind to kavach's, silently,
+# because resolution is single-pass and last-definition-wins. Everything here is
+# `agnosai_sandbox_policy_*`, so the two cannot meet.
+#
+# ## Ordering is the point of `IsolationLevel`
+#
+# The oracle derives `PartialOrd`/`Ord` and the manager compares levels to pick
+# "the cheapest backend that meets the requirement". The discriminants ARE the
+# ordering (0-3), so an integer compare is the whole port — but the values are
+# load-bearing rather than arbitrary, which is why they are asserted directly
+# rather than only through the behaviour that uses them.
+#
+# ## Wire shape
+#
+# `IsolationLevel` derives `Serialize` with no serde attributes, and serde's
+# default for a unit-only enum is the **variant name as a JSON string** — so the
+# wire carries `"None"` / `"Wasm"` / `"Process"` / `"Oci"`, NOT the integer. A
+# port that emitted the discriminant would be a silent wire divergence, which is
+# why `agnosai_isolation_level_wire` exists as its own function and is tested
+# against all four spellings plus the round trip.
+# =========================================================================
+
+# Isolation levels, weakest to strongest. The numeric value IS the strength and
+# IS the ordering — `rust-old/src/sandbox/policy.rs:17-27`.
+enum AgnosaiIsolationLevel {
+    AGNOSAI_ISOLATION_NONE = 0;
+    AGNOSAI_ISOLATION_WASM = 1;
+    AGNOSAI_ISOLATION_PROCESS = 2;
+    AGNOSAI_ISOLATION_OCI = 3;
+}
+
+# Field offsets for a policy. All five are plain integers: the two `bool`s are
+# 0/1, and `max_memory_bytes` is a `usize` where 0 means "backend default".
+enum AgnosaiSandboxPolicyOff {
+    AGN_SP_MIN_ISOLATION = 0;
+    AGN_SP_NEEDS_FILESYSTEM = 8;
+    AGN_SP_NEEDS_NETWORK = 16;
+    AGN_SP_MAX_DURATION_SECS = 24;
+    AGN_SP_MAX_MEMORY_BYTES = 32;
+    AGN_SP_SIZE = 40;
+}
+
+# `IsolationLevel::strength()` — the numeric strength, 0-3.
+#
+# The oracle's is `self as u8`, i.e. the discriminant unchanged. Kept as a named
+# function rather than inlined because the manager's backend selection reads as
+# a strength comparison, and the oracle names it too.
+fn agnosai_isolation_strength(level): i64 {
+    return level;
+}
+
+# The level's wire spelling — `"None"`, `"Wasm"`, `"Process"`, `"Oci"`.
+#
+# serde emits the **variant name** for a unit-only enum, not the discriminant.
+# Anything outside 0-3 answers the default's spelling, matching how a
+# `#[non_exhaustive]` enum degrades rather than faulting.
+fn agnosai_isolation_level_wire(level): Str {
+    if (level == AGNOSAI_ISOLATION_NONE) { return str_from("None"); }
+    if (level == AGNOSAI_ISOLATION_PROCESS) { return str_from("Process"); }
+    if (level == AGNOSAI_ISOLATION_OCI) { return str_from("Oci"); }
+    return str_from("Wasm");
+}
+
+# The level a wire spelling names, or -1 if it names none.
+#
+# -1 rather than 0 because 0 is `None`, a legitimate level — the same reason
+# `agnosai_serve_parse_port` uses -1 for a port.
+fn agnosai_isolation_level_from_wire(s: Str): i64 {
+    if (str_eq_cstr(s, "None") == 1) { return AGNOSAI_ISOLATION_NONE; }
+    if (str_eq_cstr(s, "Wasm") == 1) { return AGNOSAI_ISOLATION_WASM; }
+    if (str_eq_cstr(s, "Process") == 1) { return AGNOSAI_ISOLATION_PROCESS; }
+    if (str_eq_cstr(s, "Oci") == 1) { return AGNOSAI_ISOLATION_OCI; }
+    return 0 - 1;
+}
+
+# --- Accessors ------------------------------------------------------------
+
+# The minimum isolation level the tool declares.
+fn agnosai_sandbox_policy_min_isolation(p): i64 {
+    return load64(p + AGN_SP_MIN_ISOLATION);
+}
+
+# Whether the tool needs filesystem access.
+fn agnosai_sandbox_policy_needs_filesystem(p): i64 {
+    return load64(p + AGN_SP_NEEDS_FILESYSTEM);
+}
+
+# Whether the tool needs network access.
+fn agnosai_sandbox_policy_needs_network(p): i64 {
+    return load64(p + AGN_SP_NEEDS_NETWORK);
+}
+
+# Maximum execution time, in seconds.
+fn agnosai_sandbox_policy_max_duration_secs(p): i64 {
+    return load64(p + AGN_SP_MAX_DURATION_SECS);
+}
+
+# Maximum memory in bytes; 0 means the backend's default.
+fn agnosai_sandbox_policy_max_memory_bytes(p): i64 {
+    return load64(p + AGN_SP_MAX_MEMORY_BYTES);
+}
+
+# --- Constructors ---------------------------------------------------------
+
+# Build a policy from all five fields. The four named constructors below are the
+# oracle's, and are what callers should normally use.
+fn agnosai_sandbox_policy_new(min_isolation, needs_filesystem, needs_network,
+max_duration_secs, max_memory_bytes): i64 {
+    var p = alloc(AGN_SP_SIZE);
+    store64(p + AGN_SP_MIN_ISOLATION, min_isolation);
+    store64(p + AGN_SP_NEEDS_FILESYSTEM, needs_filesystem);
+    store64(p + AGN_SP_NEEDS_NETWORK, needs_network);
+    store64(p + AGN_SP_MAX_DURATION_SECS, max_duration_secs);
+    store64(p + AGN_SP_MAX_MEMORY_BYTES, max_memory_bytes);
+    return p;
+}
+
+# `SandboxPolicy::native()` — trusted in-process tools, no sandbox.
+# 300 s, no memory cap.
+fn agnosai_sandbox_policy_native(): i64 {
+    return agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_NONE, 0, 0, 300, 0);
+}
+
+# `SandboxPolicy::wasm()` — pure compute, no I/O. 30 s, 64 MiB.
+fn agnosai_sandbox_policy_wasm(): i64 {
+    return agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_WASM, 0, 0, 30, 67108864);
+}
+
+# `SandboxPolicy::process()` — subprocess tools. 60 s, 256 MiB, filesystem.
+fn agnosai_sandbox_policy_process(): i64 {
+    return agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_PROCESS, 1, 0, 60, 268435456);
+}
+
+# `SandboxPolicy::container()` — untrusted, full container. 120 s, 512 MiB,
+# filesystem AND network.
+fn agnosai_sandbox_policy_container(): i64 {
+    return agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_OCI, 1, 1, 120, 536870912);
+}
+
+# `impl Default for SandboxPolicy` — **wasm, not native**.
+#
+# Worth stating because the safe-looking guess is wrong in the unsafe direction:
+# defaulting to `native()` would mean an unconfigured tool runs *unsandboxed*.
+# The oracle defaults to the WASM profile, so an unconfigured tool is isolated.
+fn agnosai_sandbox_policy_default(): i64 {
+    return agnosai_sandbox_policy_wasm();
+}
+
+# --- Selection ------------------------------------------------------------
+
+# `effective_isolation()` — the level actually required, after upgrading for the
+# access the tool asked for.
+#
+# The oracle's shape is an `if` / `else if`, and it is kept: network upgrades to
+# `Oci`, otherwise filesystem upgrades to `Process`, and neither ever
+# *downgrades* a policy that already asks for more. The `else if` is not
+# load-bearing here — the network arm always lands on `Oci`, which is already
+# above `Process`, so two independent `if`s compute the same answer — but there
+# is no reason to restate the oracle's logic in a different shape.
+fn agnosai_sandbox_policy_effective_isolation(p): i64 {
+    var level = load64(p + AGN_SP_MIN_ISOLATION);
+    if (load64(p + AGN_SP_NEEDS_NETWORK) == 1 && level < AGNOSAI_ISOLATION_OCI) {
+        level = AGNOSAI_ISOLATION_OCI;
+    } else {
+        if (load64(p + AGN_SP_NEEDS_FILESYSTEM) == 1
+        && level < AGNOSAI_ISOLATION_PROCESS) {
+            level = AGNOSAI_ISOLATION_PROCESS;
+        }
+    }
+    return level;
+}
+
+# --- Wire -----------------------------------------------------------------
+
+# The policy as a JSON value, in the struct's declaration order — which is the
+# order serde emits, since there is no `rename` or reordering attribute.
+#
+# The two `bool`s emit as JSON booleans, not 0/1, and `min_isolation` emits as
+# its variant-name string.
+fn agnosai_sandbox_policy_to_value_a(a, p): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "min_isolation"),
+    bayan_json_v_str_new_a(a,
+    agnosai_isolation_level_wire(load64(p + AGN_SP_MIN_ISOLATION))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "needs_filesystem"),
+    bayan_json_v_bool_new_a(a, load64(p + AGN_SP_NEEDS_FILESYSTEM)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "needs_network"),
+    bayan_json_v_bool_new_a(a, load64(p + AGN_SP_NEEDS_NETWORK)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_duration_secs"),
+    bayan_json_v_int_new_a(a, load64(p + AGN_SP_MAX_DURATION_SECS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_memory_bytes"),
+    bayan_json_v_int_new_a(a, load64(p + AGN_SP_MAX_MEMORY_BYTES)));
+    return obj;
+}
+
+# The policy as a JSON value on the global bump.
+fn agnosai_sandbox_policy_to_value(p): i64 {
+    return agnosai_sandbox_policy_to_value_a(default_alloc(), p);
+}
+
+# The policy as JSON text.
+fn agnosai_sandbox_policy_to_json_a(a, p): Str {
+    return bayan_json_v_build_a(a, agnosai_sandbox_policy_to_value_a(a, p));
+}
+
+# The policy as JSON text on the global bump.
+fn agnosai_sandbox_policy_to_json(p): Str {
+    return agnosai_sandbox_policy_to_json_a(default_alloc(), p);
+}
+
+# Parse a policy from a JSON value, or 0 if it is not an object.
+#
+# **Absent fields take the DEFAULT policy's value, not zero.** The oracle's
+# `Deserialize` derive has no `#[serde(default)]`, so serde would reject a
+# document missing any field outright — but this is also the path
+# `sandbox_policy` config flows through, and answering "0 seconds, 0 bytes, no
+# isolation" for a partial document would silently produce the weakest possible
+# sandbox from the least information. Falling back to the WASM default keeps the
+# failure direction safe, and a caller that needs strictness can compare against
+# the value it supplied.
+fn agnosai_sandbox_policy_from_value(v): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+
+    var d = agnosai_sandbox_policy_default();
+    var lvl = load64(d + AGN_SP_MIN_ISOLATION);
+    var mi = bayan_json_v_obj_get(v, "min_isolation");
+    if (mi != 0 && bayan_json_v_is_str(mi) == 1) {
+        var parsed = agnosai_isolation_level_from_wire(bayan_json_v_str(mi));
+        if (parsed >= 0) { lvl = parsed; }
+    }
+
+    # Each read is type-guarded, matching `src/core/task.cyr:275-279`. A field
+    # of the wrong JSON type falls back to the default rather than reading a
+    # value out of a tag it does not belong to — which for a *sandbox* policy is
+    # the difference between a weak confinement and a garbage one.
+    var fs = load64(d + AGN_SP_NEEDS_FILESYSTEM);
+    var fsv = bayan_json_v_obj_get(v, "needs_filesystem");
+    if (fsv != 0 && bayan_json_v_is_bool(fsv) == 1) { fs = bayan_json_v_bool(fsv); }
+
+    var nw = load64(d + AGN_SP_NEEDS_NETWORK);
+    var nwv = bayan_json_v_obj_get(v, "needs_network");
+    if (nwv != 0 && bayan_json_v_is_bool(nwv) == 1) { nw = bayan_json_v_bool(nwv); }
+
+    var dur = load64(d + AGN_SP_MAX_DURATION_SECS);
+    var durv = bayan_json_v_obj_get(v, "max_duration_secs");
+    if (durv != 0 && bayan_json_v_is_int(durv) == 1) { dur = bayan_json_v_int(durv); }
+
+    var mem = load64(d + AGN_SP_MAX_MEMORY_BYTES);
+    var memv = bayan_json_v_obj_get(v, "max_memory_bytes");
+    if (memv != 0 && bayan_json_v_is_int(memv) == 1) { mem = bayan_json_v_int(memv); }
+
+    return agnosai_sandbox_policy_new(lvl, fs, nw, dur, mem);
+}
+
+# Parse a policy from JSON text, or 0 if it does not parse as an object.
+fn agnosai_sandbox_policy_from_json(s: Str): i64 {
+    return agnosai_sandbox_policy_from_value(bayan_json_v_parse(s));
+}

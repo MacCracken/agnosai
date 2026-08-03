@@ -578,8 +578,9 @@ libro 2.8.4 arrives transitively via bote.
 | Rust oracle | 27,683 lines at `rust-old/` — frozen |
 | Milestones | **M0–M6 complete** — the server tier is done and the binary serves |
 | Remaining in M6 | nothing — bites 15c (SSE) and 16 (bind) both closed 2026-08-03 |
-| Not started | M7 `sandbox`, M8 `fleet`, M9 `telemetry`, M10 `definitions` |
-| Gates | build OK · 1,444 symbols / 72 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · 57 suites / 3,645 assertions · coverage 100% (904/904) |
+| In progress | **M7 `sandbox`** — bite 1 of ~6 (`policy` + hub) landed 2026-08-03 |
+| Not started | M8 `fleet`, M9 `telemetry`, M10 `definitions` |
+| Gates | build OK · 1,470 symbols / 74 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · 58 suites / 3,735 assertions · coverage 100% (927/927) |
 
 **The binary serves as of 2026-08-03**, and **drains on SIGINT/SIGTERM** as of
 the 6.5.6 bump the same day. `src/main.cyr` wires the state, installs a
