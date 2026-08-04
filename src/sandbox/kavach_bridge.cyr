@@ -237,3 +237,115 @@ fn agnosai_kavach_result_strength(r): i64 { return load64(r + AGN_KR_STRENGTH); 
 
 # The gate's verdict, or `AGNOSAI_KAVACH_NO_VERDICT` when nothing was scanned.
 fn agnosai_kavach_result_scan_verdict(r): i64 { return load64(r + AGN_KR_SCAN_VERDICT); }
+
+# --- Execution ------------------------------------------------------------
+
+# Whether kavach's backend registry has been populated.
+var _agnosai_kavach_ready = 0;
+
+# Register kavach's backends, once.
+#
+# **Without this every `sandbox_create` fails** with "backend not available":
+# kavach's backend table is populated by `kavach_init`, and nothing calls it for
+# a consumer that only ever reaches the library through this bridge. It is done
+# lazily rather than at server startup so the bridge is self-contained — a test
+# or a tool that calls `agnosai_kavach_execute` directly does not have to know
+# about an initialization step.
+#
+# `kavach_init` calls `alloc_init`, which has been idempotent since cyrius
+# v6.1.23 — before that a re-call mmap'd a fresh 256 MB chunk and abandoned the
+# live one, which would have made lazy initialization here a heap leak per call.
+#
+# The flag is not synchronized. A race between two threads runs `kavach_init`
+# twice, which registers the same function pointers over themselves and
+# recomputes a SHA-256 table; both are idempotent, so the race is benign rather
+# than merely unlikely.
+fn _agnosai_kavach_ensure_init(): i64 {
+    if (_agnosai_kavach_ready == 1) { return 0; }
+    kavach_init();
+    _agnosai_kavach_ready = 1;
+    return 0;
+}
+
+# Execute `command` through a kavach sandbox — `kavach_bridge::execute`,
+# `rust-old/src/sandbox/kavach_bridge.rs:94-148`.
+#
+# Create, transition to Running, exec, then **destroy on every path**, and only
+# then propagate an exec failure. The oracle's ordering is deliberate
+# (`kavach_bridge.rs:118-127`): the `?` on the exec result comes *after* the two
+# teardown transitions, so a failing exec still tears its sandbox down. A port
+# that returned early on exec failure would leak a live sandbox per failed tool
+# call — and a failing tool call is the common case this exists for.
+#
+# Teardown failures are **warned, not propagated**, also matching the oracle: a
+# sandbox that will not stop is worth saying loudly, but it is not the error the
+# caller asked about, and raising it would replace the real exec error.
+#
+# **No test can currently observe the teardown.** `process_destroy` returns 0
+# without releasing anything and transitions record no audit event, so moving
+# the early return above the teardown passes the whole suite. The ordering is
+# kept because it is the oracle's and because it starts mattering the moment a
+# backend attaches a real resource to destroy.
+#
+# ## The deadline in the config is not enforced by kavach
+#
+# `agnosai_kavach_build_config` sets `timeout_ms` from the policy's
+# `max_duration_secs`, as the oracle does. **kavach ignores it on every backend
+# except WASM.** Measured against kavach 3.11.2 on 2026-08-04: a config with
+# `timeout_ms = 1000` running `/bin/sleep 8` on the process backend took
+# **8001 ms** and reported `timed_out = 0`. Filed upstream —
+# `kavach/docs/development/issues/2026-08-04-sandbox-config-timeout-ms-is-ignored-by-every-backend-except-wasm.md`.
+#
+# It is **not** worked around here. Enforcing the deadline agnosai-side would
+# diverge from the oracle's structure and, worse, would hide an upstream defect
+# that every other kavach consumer also has. Callers needing an enforced
+# deadline today have `agnosai_sandbox_manager_execute_argv`, whose process and
+# OCI backends go through agnosai's own spawn primitive and do honour one.
+#
+# Returns 0 with `out_err` set when the sandbox cannot be created, started, or
+# executed in.
+fn agnosai_kavach_execute(command: Str, policy, agent_id, out_err): i64 {
+    _agnosai_kavach_ensure_init();
+    var config = agnosai_kavach_build_config(policy, agent_id);
+    var strength = agnosai_kavach_strength_for_policy(policy);
+
+    var sandbox = sandbox_create(config);
+    if (sandbox == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from("kavach create failed")));
+        return 0;
+    }
+
+    if (sandbox_transition(sandbox, SandboxState.RUNNING) != KAVACH_ERR_OK) {
+        # **Defensive, and currently unreachable**: kavach's `valid_transition`
+        # accepts CREATED → RUNNING unconditionally, so a freshly created
+        # sandbox always starts. Kept because the oracle has the arm and
+        # because "the transition table never changes" is not a thing to rely
+        # on. Destroys first: started or not, the sandbox exists.
+        sandbox_destroy(sandbox);
+        store64(out_err, agnosai_error_sandbox(str_from("kavach start failed")));
+        return 0;
+    }
+
+    var result = sandbox_exec(sandbox, str_cstr(command));
+
+    # Always destroy, even on exec failure — `kavach_bridge.rs:120-127`.
+    if (sandbox_transition(sandbox, SandboxState.STOPPED) != KAVACH_ERR_OK) {
+        sakshi_warn("kavach stop failed (continuing with destroy)", 43);
+    }
+    if (sandbox_transition(sandbox, SandboxState.DESTROYED) != KAVACH_ERR_OK) {
+        sakshi_warn("kavach destroy failed", 21);
+    }
+
+    if (result == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from("kavach exec failed")));
+        return 0;
+    }
+
+    # `scan_verdict: None` — the gate runs **inside** kavach's `sandbox_exec`
+    # and has already been applied to the output by the time it returns
+    # (`kavach_bridge.rs:146`). Re-scanning here would double-count it.
+    return agnosai_kavach_result_new(str_from(ExecResult_stdout(result)),
+    str_from(ExecResult_stderr(result)), ExecResult_exit_code(result),
+    ExecResult_timed_out(result), ExecResult_duration_ms(result), strength,
+    AGNOSAI_KAVACH_NO_VERDICT);
+}

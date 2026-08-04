@@ -42,6 +42,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 12 — `kavach_bridge`'s exec half.** `agnosai_kavach_execute` —
+  `kavach_bridge::execute` (`kavach_bridge.rs:94-148`) — 89 assertions in the
+  suite. Create, transition to Running, exec, then destroy on **every** path
+  before propagating an exec failure, which is the oracle's ordering and not an
+  accident of it.
+
+  **kavach's backends are registered lazily on first use.** Without
+  `kavach_init` every `sandbox_create` fails with "backend not available", and
+  nothing else in agnosai calls it. Doing it in the bridge keeps the module
+  self-contained; `alloc_init` has been idempotent since cyrius v6.1.23, which
+  is what makes lazy initialization safe rather than a 256 MB leak per call.
+
+  Five mutations, three caught: skipping the lazy init, re-scanning the output
+  instead of leaving `scan_verdict` as None, and computing the strength score
+  from a default policy rather than the caller's. The two that survive are
+  recorded in the code and the test — see below.
+
 - **M7 bite 11 — `sandbox/manager`: backend selection and dispatch.** All eight
   oracle tests ported (`manager.rs:145-217`), 69 assertions. Every module in the
   oracle's M7 sequence — `policy`, `oci`, `kavach_bridge`, spawn, `process`,

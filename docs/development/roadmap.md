@@ -222,11 +222,16 @@ complete**: `policy`, `oci`, `kavach_bridge`, spawn, `process`, `python`,
 **What is left in M7 is the work with no oracle line to copy**, and it is not
 small:
 
-- **`kavach_bridge`'s exec half** (`kavach_bridge.rs:94-148`) — create,
-  transition to Running, `exec`, then destroy on *every* path including exec
-  failure. Recorded earlier as unable to honour `max_duration_secs` "because
-  nothing on the process path reads `timeout_ms`"; **that constraint is gone** —
-  the spawn primitive has taken a deadline since bite 7.
+- ~~**`kavach_bridge`'s exec half**~~ — **done, bite 12 (2026-08-04).**
+
+  **The `max_duration_secs` constraint is NOT gone, and a note here previously
+  said it was.** That note reasoned that agnosai's spawn primitive gained a
+  deadline in bite 7 — true, and irrelevant: this path runs through kavach's
+  `sandbox_exec`, not agnosai's spawn. Measured against kavach 3.11.2 and filed:
+  `timeout_ms` is read by `wasm_exec` alone, so a 1000 ms deadline let
+  `/bin/sleep 8` run 8001 ms and report `timed_out = 0`. A second filing covers
+  the process backend reporting exit code 0 and empty stderr for everything that
+  ran. Both are kavach-side; neither is worked around here.
 - **The cx confinement bites (B13-B15)** — `wasm.rs`'s successor per
   [ADR-006](../adr/006-cx-tool-sandbox.md): `cycc_cx` → `.cyx` → `cxvm` spawned
   **inside** a kavach sandbox, with the milestone's own gate — a test asserting

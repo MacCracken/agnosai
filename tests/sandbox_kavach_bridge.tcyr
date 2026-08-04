@@ -275,6 +275,137 @@ fn _t_kv_result(): i64 {
     return 0;
 }
 
+# --- Execution ------------------------------------------------------------
+
+fn _t_kb_execute_runs_a_command(): i64 {
+    # A process-level policy maps to kavach's Process backend and really forks.
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_kavach_execute(str_from("/bin/echo bridged"),
+    agnosai_sandbox_policy_process(), 0, &e);
+
+    assert(load64(&e) == 0, "a kavach sandbox executes");
+    assert(r != 0, "...returning a result");
+    assert(str_contains_cstr(agnosai_kavach_result_output(r), "bridged") == 1,
+    "the command's stdout comes back through the bridge");
+    assert(agnosai_kavach_result_exit_code(r) == 0, "...with its exit code");
+    assert(agnosai_kavach_result_strength(r)
+    == agnosai_kavach_strength_for_policy(agnosai_sandbox_policy_process()),
+    "...and the strength score for the policy that ran it");
+    assert(agnosai_kavach_result_scan_verdict(r) == AGNOSAI_KAVACH_NO_VERDICT,
+    "scan_verdict is None - kavach applies the gate internally (kavach_bridge.rs:146)");
+    return 0;
+}
+
+fn _t_kb_execute_needs_no_explicit_init(): i64 {
+    # **Every `sandbox_create` fails with "backend not available" until
+    # `kavach_init` has run**, and nothing else in agnosai calls it. The bridge
+    # initializes lazily so a caller does not have to know that; this asserts
+    # the caller really does not have to.
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_kavach_execute(str_from("/bin/echo first-call"),
+    agnosai_sandbox_policy_process(), 0, &e);
+    assert(load64(&e) == 0,
+    "the FIRST call into the bridge works with no initialization step");
+    assert(str_contains_cstr(agnosai_kavach_result_output(r), "first-call") == 1,
+    "...and actually ran");
+
+    # And a second call is not broken by the first having initialized.
+    store64(&e, 0);
+    var again = agnosai_kavach_execute(str_from("/bin/echo second-call"),
+    agnosai_sandbox_policy_process(), 0, &e);
+    assert(load64(&e) == 0, "and so does the second");
+    assert(str_contains_cstr(agnosai_kavach_result_output(again), "second-call") == 1,
+    "...with its own output, not the first call's");
+    return 0;
+}
+
+fn _t_kb_execute_reports_the_exit_code(): i64 {
+    # **kavach's process backend reports 0 for everything that ran.**
+    # `backend_capture_finish` hardcodes `exit_code = 0` and `stderr = ""` on
+    # its success path; `exec_capture` waits on the child and discards the
+    # status. Measured 2026-08-04 against kavach 3.11.2: `/bin/false` (real
+    # exit 1) and `/bin/ls /nonexistent` (real exit 2) both report 0 with empty
+    # stderr. Filed upstream -
+    # kavach/docs/development/issues/2026-08-04-process-backend-never-reports-the-payload-exit-code-or-stderr.md
+    #
+    # So this does NOT assert the code is correct - it cannot be today. What it
+    # asserts is that the BRIDGE is a faithful conduit: a non-zero exit is a
+    # result rather than an error, and whatever kavach reports arrives
+    # unaltered. When kavach is fixed, the pinned value below fails and this
+    # test is the thing that says why.
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_kavach_execute(str_from("/bin/false"),
+    agnosai_sandbox_policy_process(), 0, &e);
+
+    assert(load64(&e) == 0,
+    "a command that EXITS non-zero is a result, not a bridge error");
+    assert(r != 0, "...so a result comes back");
+    assert(agnosai_kavach_result_exit_code(r) == 0,
+    "PINNED TO AN UPSTREAM DEFECT: kavach reports 0 for /bin/false, which really \
+    exits 1 - when this assertion starts failing, kavach has been fixed and the \
+    note above should go");
+    return 0;
+}
+
+fn _t_kb_execute_with_agent_id(): i64 {
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_kavach_execute(str_from("/bin/echo tagged"),
+    agnosai_sandbox_policy_process(), str_from("agent-7"), &e);
+    assert(load64(&e) == 0, "an agent-tagged sandbox executes");
+    assert(str_contains_cstr(agnosai_kavach_result_output(r), "tagged") == 1,
+    "...and the agent id does not disturb the command");
+    return 0;
+}
+
+fn _t_kb_repeated_failures_do_not_break_the_bridge(): i64 {
+    # **This does NOT prove the sandbox is destroyed on the failure path, and
+    # nothing available here can.** The oracle puts the `?` on the exec result
+    # after both teardown transitions (kavach_bridge.rs:120-127), and the port
+    # matches that ordering - but kavach's `process_destroy` returns 0 without
+    # releasing anything, and a transition records no audit event, so a sandbox
+    # that is never destroyed is an abandoned heap struct holding no OS
+    # resource and leaving no trace. Moving the early return above the teardown
+    # passes every assertion in this suite.
+    #
+    # It is written down rather than left implied: the ordering is correct by
+    # construction, and will start mattering the moment kavach attaches a real
+    # resource - a cgroup, a namespace, a container - to destroy.
+    #
+    # What this DOES check is that a run of failures leaves the bridge usable.
+    var e[8];
+    var i = 0;
+    while (i < 12) {
+        store64(&e, 0);
+        agnosai_kavach_execute(str_from("/nonexistent/definitely-not-a-program"),
+        agnosai_sandbox_policy_process(), 0, &e);
+        i = i + 1;
+    }
+
+    store64(&e, 0);
+    var good = agnosai_kavach_execute(str_from("/bin/echo still-working"),
+    agnosai_sandbox_policy_process(), 0, &e);
+    assert(load64(&e) == 0, "the bridge still works after a dozen failed executions");
+    assert(str_contains_cstr(agnosai_kavach_result_output(good), "still-working") == 1,
+    "...and produces correct output, so nothing was left in a bad state");
+    return 0;
+}
+
+fn _t_kb_execute_none_policy_uses_the_noop_backend(): i64 {
+    # A native policy maps to Backend::Noop, which is a real registered backend
+    # rather than an error - map_backend has no "unsupported" arm.
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_kavach_execute(str_from("/bin/echo noop"),
+    agnosai_sandbox_policy_native(), 0, &e);
+    assert(load64(&e) == 0, "the Noop backend is available and executes");
+    assert(r != 0, "...returning a result");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -289,6 +420,15 @@ fn main(): i64 {
     _t_kv_policy_for_trust();
     _t_kv_scan_output();
     _t_kv_result();
+
+    # **Order matters here.** The lazy-init assertion is only meaningful as the
+    # first call into the bridge; any earlier execute would have initialized it.
+    _t_kb_execute_needs_no_explicit_init();
+    _t_kb_execute_runs_a_command();
+    _t_kb_execute_reports_the_exit_code();
+    _t_kb_execute_with_agent_id();
+    _t_kb_repeated_failures_do_not_break_the_bridge();
+    _t_kb_execute_none_policy_uses_the_noop_backend();
 
     return assert_summary();
 }
