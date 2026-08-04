@@ -214,7 +214,9 @@ handler cost bounded and measured" until that filing lands.
 
 ### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
 
-**Bite 1 done (2026-08-03):** `policy` + the group hub `mod` — isolation levels,
+**Bites 1-2 done (2026-08-03).** Bite 2: `oci`'s pure half — config, image
+validation, and the `docker run` argv built as a testable value (75 assertions).
+Bite 1: `policy` + the group hub `mod` — isolation levels,
 the five named policies, `effective_isolation`, the JSON wire, and the shared
 env-sanitization list. 90 assertions, all 11 oracle tests ported.
 

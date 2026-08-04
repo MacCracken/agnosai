@@ -31,6 +31,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 2 — `sandbox/oci`, the pure half.** Config, image-reference
+  validation, and the `docker run` argv. 75 assertions; seven of the oracle's
+  eight tests port directly (the eighth needs a real spawn).
+
+  **The argv is built as a VALUE, and that is the point.** The oracle assembles
+  its command line inside `execute`, so `--read-only`, `--tmpfs /tmp` and
+  `--network=none` — the entire isolation posture — have no test there. Here a
+  test reads the vec, and every flag, its argument, and its *order* is pinned:
+  `--memory` must be followed by its limit, the image must be last, and
+  entrypoint arguments must come after it or the runtime would consume them.
+  Mutation-verified — deleting `--network=none` fails a named assertion.
+
+  **`validate_image_ref` is what stands between a caller string and argument
+  injection**, so it is tested character-class by character-class rather than
+  through the oracle's three examples: each shell metacharacter separately,
+  embedded whitespace and newlines, and the leading-`-` flag-injection case
+  (`--privileged`) versus a hyphen anywhere else, which is legitimate and must
+  still be accepted. Mutation-verified.
+
+  **`is_alphanumeric` is Unicode here too — no divergence.** `"unicode"` joins
+  the stdlib deps, and the validator walks **codepoints** via `_uc_decode_utf8`,
+  classifying with `unicode_category`: General Category `L*` union `N*`, which
+  is what Rust's `is_alphabetic() || is_numeric()` resolves to.
+
+  An ASCII-only validator was written first and was wrong to prefer. The
+  argument for it — that a Cyrillic homograph of a registry host is the
+  confusion an image validator should prevent — does not survive contact with
+  what the string is used for: the reference goes into an **argv element**,
+  never a shell string, so the validator's job is flag injection (the leading
+  `-`) and shell-significant characters. A homograph is neither; it is a name no
+  registry resolves, and docker fails on it either way. Rejecting it early
+  bought nothing and cost oracle parity, which is the bar.
+
+  Two things the oracle cannot express and this does: **malformed UTF-8**
+  decodes to U+FFFD (category `So`) and is refused, where a Rust `&str` cannot
+  hold invalid UTF-8 at all; and a non-ASCII **symbol** (emoji, non-breaking
+  space) is still refused, which is the assertion that fails if a port fakes
+  Unicode-awareness by accepting "any byte ≥ 0x80". One corner where they
+  genuinely differ: Rust's `is_alphabetic` is the Unicode *Alphabetic property*
+  (`L*` + `Nl` + `Other_Alphabetic`), and `unicode_category` exposes General
+  Category, so a bare combining mark is refused here and accepted by Rust — it
+  cannot appear in a resolvable reference and no test in either tree reaches it.
+
+  Also preserved: `#` **is** in the oracle's allowed set (`oci.rs:80`) even
+  though the doc comment three lines above omits it; the code is the oracle, and
+  it is noted so nobody "fixes" it out.
+
+- **`lib/unicode/` is vendored by hand, and the snapshot gate now recurses.**
+  `cyrius lib sync` copies only the top level, so declaring `"unicode"` does not
+  bring `lib/unicode/`'s seven files — they were copied manually. Nothing
+  upstream keeps them current, so `scripts/check-clean.sh`'s snapshot check was
+  made recursive; it is the only thing that notices if they go stale.
+  Mutation-verified: editing one byte of `lib/unicode/categories.cyr` now fails
+  the gate by name.
+
 - **M7 bite 1 — `sandbox/policy` + the group hub.** Isolation levels, the five
   named policies, `effective_isolation`, the JSON wire, and the shared
   env-sanitization list. All 11 oracle tests port directly; 90 assertions.

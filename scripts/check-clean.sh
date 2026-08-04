@@ -115,14 +115,19 @@ echo "deps --verify: $(printf '%s' "$out" | grep -oE '^[0-9]+ verified' || echo 
 # swap is not restored); a size-changing edit is synced. A version-comment bump
 # like `1.1.2` -> `1.1.3` is exactly size-neutral, so a patch release whose only
 # change is the stamp never lands. Filed upstream.
+# **Recursive**, and that is not cosmetic. `cyrius lib sync` copies only the
+# top level, so the snapshot's `unicode/` subdirectory never lands — and since
+# `src/sandbox/oci.cyr` began calling `unicode_category` for oracle-exact
+# `is_alphanumeric`, those files are load-bearing and vendored BY HAND. Nothing
+# upstream will keep them current, so this gate is the only thing that notices
+# when they go stale.
 _snap="$HOME/.cyrius/versions/$(grep '^cyrius = ' cyrius.cyml | sed 's/.*"\(.*\)"/\1/')/lib"
 if [ -d "$_snap" ]; then
     n=0
-    for f in "$_snap"/*.cyr; do
-        b=$(basename "$f")
-        [ -e "lib/$b" ] || { note "lib: $b missing from lib/"; fail=1; continue; }
-        if ! cmp -s "lib/$b" "$f"; then
-            note "lib: $b differs from the $(basename "$(dirname "$_snap")") snapshot"
+    for f in $(cd "$_snap" && find . -name '*.cyr' | sed 's|^\./||' | sort); do
+        [ -e "lib/$f" ] || { note "lib: $f missing from lib/"; fail=1; continue; }
+        if ! cmp -s "lib/$f" "$_snap/$f"; then
+            note "lib: $f differs from the $(basename "$(dirname "$_snap")") snapshot"
             fail=1
         fi
         n=$((n + 1))

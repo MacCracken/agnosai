@@ -16,10 +16,21 @@ lands, not before, so the number always names something that actually shipped.
   (the stop facility agnosai filed), bayan 1.4.0, sigil 3.12.2, sakshi 2.4.7,
   yukti 2.3.2, mabda 4.0.8. 6.5.6 also lands **`sys_exit_group`** and
   **`async_await_readable_ms`**, both from agnosai filings.
-- **`lib/` matches the pin exactly**: 0 of 99 stdlib files differ from
+- **`lib/` matches the pin exactly**: 0 of 106 stdlib files differ from
   `~/.cyrius/versions/6.5.6/lib`; build and test emit no drift or shadow warning.
   The six files outside the snapshot (ai-hwaccel, bote-core, kavach, libro, majra,
   tyche) are declared git deps, not staleness.
+
+  **`lib/unicode/` is vendored BY HAND and nothing upstream maintains it.**
+  `cyrius lib sync` copies only the top level, so declaring `"unicode"` in
+  `[deps].stdlib` — which agnosai now does — does **not** bring the seven files
+  under `lib/unicode/`. They were copied from the snapshot manually.
+
+  It stopped being inert on 2026-08-03: `src/sandbox/oci.cyr` calls
+  `unicode_category` to match the oracle's Unicode `is_alphanumeric` exactly, so
+  those files are load-bearing. `scripts/check-clean.sh`'s snapshot check is
+  therefore **recursive**, and is the only thing that will notice if they drift
+  from the pin — mutation-verified against a one-byte edit.
 
   **Verify a bump by diffing the trees, not by a green `lib sync --full`.**
   `cyrius lib sync` skips on file **size**, not content, so a size-neutral change
@@ -478,7 +489,7 @@ criterion statistics. The Cyrius line starts its own baseline, captured by
 
 ## Dependencies
 
-**stdlib** (43 declared, order-sensitive — rationale in [`cyrius-port-plan.md`](cyrius-port-plan.md)):
+**stdlib** (44 declared, now including `unicode`, order-sensitive — rationale in [`cyrius-port-plan.md`](cyrius-port-plan.md)):
 base substrate · general utilities · bayan · patra · concurrency+crypto floor ·
 dynamic-link floor · async · net/http/tls/ws/sakshi/sandhi
 

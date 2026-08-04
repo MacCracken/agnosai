@@ -1,0 +1,320 @@
+# =========================================================================
+# sandbox/oci — the OCI container backend: config, image validation, argv.
+#
+# Parity oracle: rust-old/src/sandbox/oci.rs
+#
+# **M7 bite 2 — the pure half.** Everything here is decidable without spawning
+# anything: the config, the image-reference validator, and the argv the runtime
+# would be invoked with. `execute` needs the spawn primitive and lands with it.
+#
+# Splitting there is not arbitrary. The argv is **wire-visible** — its order and
+# content are what a `docker run` actually receives — and it is the part most
+# worth pinning, because a flag dropped or reordered here is a container that
+# silently runs with weaker isolation. Building it as a value that a test can
+# read, rather than as a side effect of spawning, is what makes that testable at
+# all; the oracle's own tests cannot see its argv.
+#
+# ## `validate_image_ref` is a security control, and its shape is deliberate
+#
+# The image reference is interpolated straight into a runtime command line, so
+# the validator is what stands between a caller-supplied string and argument
+# injection. Two rejections carry that weight (both are oracle tests):
+#
+#   * a leading `-`, which would make the image parse as a **flag** —
+#     `--privileged` is the oracle's own example;
+#   * any character outside the allowed set, which is what stops
+#     `alpine; rm -rf /` from being one argument that a shell would split.
+#
+# ## `is_alphanumeric` is Unicode here too — no divergence
+#
+# The oracle's filter is `!c.is_alphanumeric()`, and Rust's `is_alphanumeric` is
+# **Unicode**: `café:latest` passes it, as does a Cyrillic `а` that renders
+# identically to `a`. This port matches that exactly, via `unicode_category`
+# from `lib/unicode/` — alphanumeric is General Category `L*` (Lu, Ll, Lt, Lm,
+# Lo) union `N*` (Nd, Nl, No), which is what `is_alphabetic() || is_numeric()`
+# resolves to.
+#
+# **An ASCII-only validator was written first and was wrong to prefer.** The
+# argument for it was that a Cyrillic homograph of a registry host is exactly
+# the confusion an image validator should prevent. That argument does not
+# survive contact with what this string is actually used for: the reference is
+# placed into an **argv element**, never a shell string, so the validator's job
+# is to stop *flag injection* (the leading `-`, handled separately) and
+# characters that would matter to a shell. A homograph is neither — it is a name
+# no registry resolves, so docker fails on it either way. Rejecting it early
+# buys nothing and costs oracle parity, which is the project's bar.
+#
+# The one place the two cannot agree exactly: Rust's `is_alphabetic` is the
+# Unicode **Alphabetic property**, which is `L*` plus `Nl` plus
+# `Other_Alphabetic` — and `Other_Alphabetic` includes some combining marks that
+# General Category files under `Mn`/`Mc`. `unicode_category` exposes GC, not
+# derived properties, so a bare combining mark is refused here and accepted by
+# Rust. It cannot appear in a resolvable image reference, and no test in either
+# tree reaches it.
+#
+# Malformed UTF-8 decodes to U+FFFD (category `So`), which is not alphanumeric
+# and is therefore refused — the right answer, and one the oracle cannot even
+# express, because a Rust `&str` cannot hold invalid UTF-8.
+#
+# ## `#` is in the allowed set, and the oracle's own doc comment omits it
+#
+# `oci.rs:80` allows `-_./:#@`; the comment three lines above it lists
+# "alphanumeric, /, -, _, ., :, @". The code is the oracle, so `#` is allowed
+# here too — recorded because it looks like a typo and someone will otherwise
+# "fix" it back out.
+# =========================================================================
+
+# Field offsets for the OCI sandbox config.
+enum AgnosaiOciConfigOff {
+    AGN_OCI_RUNTIME = 0;
+    AGN_OCI_IMAGE = 8;
+    AGN_OCI_TIMEOUT_SECS = 16;
+    AGN_OCI_MEMORY_LIMIT = 24;
+    AGN_OCI_ALLOW_NETWORK = 32;
+    AGN_OCI_ENV = 40;
+    AGN_OCI_VOLUMES = 48;
+    AGN_OCI_SIZE = 56;
+}
+
+# Field offsets for one execution's result.
+enum AgnosaiOciResultOff {
+    AGN_OCIR_STDOUT = 0;
+    AGN_OCIR_STDERR = 8;
+    AGN_OCIR_EXIT_CODE = 16;
+    AGN_OCIR_TIMED_OUT = 24;
+    AGN_OCIR_SIZE = 32;
+}
+
+# `OciSandboxConfig::new(image)` — the oracle's defaults, which are the
+# isolation posture and not arbitrary: docker, 60 s, 256 MiB, **no network**.
+fn agnosai_oci_config_new(image: Str): i64 {
+    var c = alloc(AGN_OCI_SIZE);
+    store64(c + AGN_OCI_RUNTIME, str_from("docker"));
+    store64(c + AGN_OCI_IMAGE, image);
+    store64(c + AGN_OCI_TIMEOUT_SECS, 60);
+    store64(c + AGN_OCI_MEMORY_LIMIT, str_from("256m"));
+    store64(c + AGN_OCI_ALLOW_NETWORK, 0);
+    store64(c + AGN_OCI_ENV, vec_new());
+    store64(c + AGN_OCI_VOLUMES, vec_new());
+    return c;
+}
+
+# The runtime binary — `"docker"` or `"podman"`.
+fn agnosai_oci_config_runtime(c): Str { return load64(c + AGN_OCI_RUNTIME); }
+
+# The container image reference.
+fn agnosai_oci_config_image(c): Str { return load64(c + AGN_OCI_IMAGE); }
+
+# Wall-clock timeout in seconds.
+fn agnosai_oci_config_timeout_secs(c): i64 { return load64(c + AGN_OCI_TIMEOUT_SECS); }
+
+# The memory limit, in the runtime's own spelling (e.g. `"256m"`).
+fn agnosai_oci_config_memory_limit(c): Str { return load64(c + AGN_OCI_MEMORY_LIMIT); }
+
+# Whether the container gets a network. Default 0 — `--network=none`.
+fn agnosai_oci_config_allow_network(c): i64 { return load64(c + AGN_OCI_ALLOW_NETWORK); }
+
+# The `--env` pairs, as a vec of alternating key/value `Str`.
+fn agnosai_oci_config_env(c): i64 { return load64(c + AGN_OCI_ENV); }
+
+# The `-v` volume mounts, as a vec of `host:container` `Str`.
+fn agnosai_oci_config_volumes(c): i64 { return load64(c + AGN_OCI_VOLUMES); }
+
+# Choose the runtime binary.
+fn agnosai_oci_config_set_runtime(c, runtime: Str): i64 {
+    store64(c + AGN_OCI_RUNTIME, runtime);
+    return 0;
+}
+
+# Set the image reference. Not validated here — `agnosai_oci_sandbox_new` is the
+# gate, matching the oracle, where the field is public and `OciSandbox::new` is
+# what refuses.
+fn agnosai_oci_config_set_image(c, image: Str): i64 {
+    store64(c + AGN_OCI_IMAGE, image);
+    return 0;
+}
+
+# Set the wall-clock timeout, in seconds.
+fn agnosai_oci_config_set_timeout_secs(c, secs): i64 {
+    store64(c + AGN_OCI_TIMEOUT_SECS, secs);
+    return 0;
+}
+
+# Set the memory limit, in the runtime's spelling.
+fn agnosai_oci_config_set_memory_limit(c, limit: Str): i64 {
+    store64(c + AGN_OCI_MEMORY_LIMIT, limit);
+    return 0;
+}
+
+# Allow or forbid container networking.
+fn agnosai_oci_config_set_allow_network(c, allow): i64 {
+    store64(c + AGN_OCI_ALLOW_NETWORK, allow);
+    return 0;
+}
+
+# Add one `--env KEY=VALUE` pair.
+fn agnosai_oci_config_add_env(c, key: Str, value: Str): i64 {
+    var e = load64(c + AGN_OCI_ENV);
+    vec_push(e, key);
+    vec_push(e, value);
+    return 0;
+}
+
+# Add one `-v host:container` mount.
+fn agnosai_oci_config_add_volume(c, spec: Str): i64 {
+    vec_push(load64(c + AGN_OCI_VOLUMES), spec);
+    return 0;
+}
+
+# --- Image validation -----------------------------------------------------
+
+# Whether codepoint `cp` may appear in an image reference.
+#
+# Unicode alphanumeric — General Category `L*` union `N*`, which is what Rust's
+# `is_alphabetic() || is_numeric()` resolves to — plus the oracle's literal set
+# `-_./:#@`. See the module header on the `Other_Alphabetic` corner and on why
+# `#` is in the set despite the oracle's own comment omitting it.
+fn _agnosai_oci_image_cp_ok(cp): i64 {
+    var g = unicode_category(cp);
+    if (g <= GC_LO) { return 1; }
+    if (g >= GC_ND && g <= GC_NO) { return 1; }
+    if (cp == 45) { return 1; }
+    if (cp == 95) { return 1; }
+    if (cp == 46) { return 1; }
+    if (cp == 47) { return 1; }
+    if (cp == 58) { return 1; }
+    if (cp == 35) { return 1; }
+    if (cp == 64) { return 1; }
+    return 0;
+}
+
+# Validate an image reference: 1 if usable, 0 if it must be refused.
+#
+# The oracle returns the *reason* as a string; this returns a verdict, because
+# every caller here does the same thing with it — refuse — and the reason is
+# reconstructed at the one site that reports it.
+fn agnosai_oci_validate_image_ref(image: Str): i64 {
+    var n = str_len(image);
+    if (n == 0) { return 0; }
+    var d = str_data(image);
+    # A leading `-` makes the image parse as a FLAG, which is argument
+    # injection rather than a bad name — the oracle's `--privileged` case.
+    if ((load8(d) & 0xFF) == 45) { return 0; }
+    # Walked as CODEPOINTS, not bytes: the oracle iterates `image.chars()`, and
+    # a per-byte test would refuse every multi-byte character outright.
+    var cp[8];
+    var i = 0;
+    while (i < n) {
+        var w = _uc_decode_utf8(d, i, n, &cp);
+        if (_agnosai_oci_image_cp_ok(load64(&cp)) == 0) { return 0; }
+        i = i + w;
+    }
+    return 1;
+}
+
+# `OciSandbox::new(config)` — the config back, or 0 if the image is refused.
+#
+# 0 rather than a config with a flag set: the oracle returns `Result`, and every
+# caller must not proceed, so an unusable sandbox should not be constructible.
+fn agnosai_oci_sandbox_new(config): i64 {
+    if (config == 0) { return 0; }
+    if (agnosai_oci_validate_image_ref(load64(config + AGN_OCI_IMAGE)) == 0) { return 0; }
+    return config;
+}
+
+# The message the oracle reports for a refused image.
+#
+# Reconstructed rather than threaded out of the validator, so the validator can
+# stay a predicate. Order matters — empty is checked before the flag case, as in
+# `oci.rs:71-83`.
+fn agnosai_oci_image_error(image: Str): Str {
+    if (str_len(image) == 0) { return str_from("image name is empty"); }
+    if ((load8(str_data(image)) & 0xFF) == 45) {
+        return str_from("image name must not start with '-' (flag injection)");
+    }
+    return str_from("image name contains invalid character");
+}
+
+# --- Argv -----------------------------------------------------------------
+
+# The full argv for one `run`, as a vec of `Str` — argv[0] is the runtime.
+#
+# **Order is the oracle's and is wire-visible** (`oci.rs:118-145`): `run --rm -i
+# --read-only --tmpfs /tmp --memory <limit>`, then `--network=none` unless
+# networking was allowed, then every `--env`, then every `-v`, then the image,
+# then the entrypoint arguments.
+#
+# `--read-only`, `--tmpfs /tmp` and `--network=none` are the isolation posture.
+# A test can read this vec, which is the point of building it as a value: the
+# oracle constructs its argv inside `execute` and cannot assert on it.
+fn agnosai_oci_build_argv(config, entrypoint_args): i64 {
+    var a = vec_new();
+    vec_push(a, load64(config + AGN_OCI_RUNTIME));
+    vec_push(a, str_from("run"));
+    vec_push(a, str_from("--rm"));
+    vec_push(a, str_from("-i"));
+    vec_push(a, str_from("--read-only"));
+    vec_push(a, str_from("--tmpfs"));
+    vec_push(a, str_from("/tmp"));
+    vec_push(a, str_from("--memory"));
+    vec_push(a, load64(config + AGN_OCI_MEMORY_LIMIT));
+
+    if (load64(config + AGN_OCI_ALLOW_NETWORK) == 0) {
+        vec_push(a, str_from("--network=none"));
+    }
+
+    var env = load64(config + AGN_OCI_ENV);
+    var i = 0;
+    while (i + 1 < vec_len(env)) {
+        vec_push(a, str_from("--env"));
+        var sb = str_builder_new();
+        str_builder_add(sb, vec_get(env, i));
+        str_builder_add_cstr(sb, "=");
+        str_builder_add(sb, vec_get(env, i + 1));
+        vec_push(a, str_builder_build(sb));
+        i = i + 2;
+    }
+
+    var vols = load64(config + AGN_OCI_VOLUMES);
+    var v = 0;
+    while (v < vec_len(vols)) {
+        vec_push(a, str_from("-v"));
+        vec_push(a, vec_get(vols, v));
+        v = v + 1;
+    }
+
+    vec_push(a, load64(config + AGN_OCI_IMAGE));
+
+    if (entrypoint_args != 0) {
+        var e = 0;
+        while (e < vec_len(entrypoint_args)) {
+            vec_push(a, vec_get(entrypoint_args, e));
+            e = e + 1;
+        }
+    }
+    return a;
+}
+
+# --- Result ---------------------------------------------------------------
+
+# Build an execution result.
+fn agnosai_oci_result_new(stdout: Str, stderr: Str, exit_code, timed_out): i64 {
+    var r = alloc(AGN_OCIR_SIZE);
+    store64(r + AGN_OCIR_STDOUT, stdout);
+    store64(r + AGN_OCIR_STDERR, stderr);
+    store64(r + AGN_OCIR_EXIT_CODE, exit_code);
+    store64(r + AGN_OCIR_TIMED_OUT, timed_out);
+    return r;
+}
+
+# The container's captured stdout.
+fn agnosai_oci_result_stdout(r): Str { return load64(r + AGN_OCIR_STDOUT); }
+
+# The container's captured stderr.
+fn agnosai_oci_result_stderr(r): Str { return load64(r + AGN_OCIR_STDERR); }
+
+# The container's exit code, or -1 when it was signalled.
+fn agnosai_oci_result_exit_code(r): i64 { return load64(r + AGN_OCIR_EXIT_CODE); }
+
+# Whether the wall-clock timeout fired.
+fn agnosai_oci_result_timed_out(r): i64 { return load64(r + AGN_OCIR_TIMED_OUT); }

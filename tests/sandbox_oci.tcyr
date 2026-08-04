@@ -1,0 +1,293 @@
+# =========================================================================
+# sandbox_oci — parity tests for src/sandbox/oci.cyr (the pure half).
+#
+# Seven of the oracle's eight tests port directly. The eighth,
+# `missing_runtime_returns_error`, needs a real spawn and lands with the spawn
+# primitive.
+#
+# Where this goes past the oracle:
+#
+#   * **The argv.** The oracle builds its command line inside `execute` and
+#     cannot assert on it, so `--read-only`, `--tmpfs /tmp` and
+#     `--network=none` — the isolation posture — are untested there. Here the
+#     argv is a value, and every flag plus its ORDER is pinned.
+#   * **The validator, character by character.** The oracle checks three
+#     rejections and six acceptances. This adds the classes those six do not
+#     reach: each shell metacharacter separately, embedded whitespace, and the
+#     non-ASCII case where this port is deliberately stricter than Rust.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/sandbox/mod.cyr"
+include "tests/test_helpers.cyr"
+
+# Whether `argv` contains `needle`, in order-independent form.
+fn _t_argv_has(argv, needle): i64 {
+    var i = 0;
+    while (i < vec_len(argv)) {
+        if (str_eq_cstr(vec_get(argv, i), needle) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The index of `needle` in `argv`, or -1.
+fn _t_argv_at(argv, needle): i64 {
+    var i = 0;
+    while (i < vec_len(argv)) {
+        if (str_eq_cstr(vec_get(argv, i), needle) == 1) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# --- Config --------------------------------------------------------------
+
+# `config_defaults`, `config_with_network`, `config_with_env`.
+fn _t_oci_config(): i64 {
+    var c = agnosai_oci_config_new(str_from("alpine:latest"));
+    assert(str_eq_cstr(agnosai_oci_config_runtime(c), "docker") == 1, "runtime defaults to docker");
+    assert(str_eq_cstr(agnosai_oci_config_image(c), "alpine:latest") == 1, "the image is kept");
+    assert(str_eq_cstr(agnosai_oci_config_memory_limit(c), "256m") == 1, "256m memory default");
+    assert(agnosai_oci_config_timeout_secs(c) == 60, "60 s timeout default");
+
+    # The default that matters most: no network unless asked.
+    assert(agnosai_oci_config_allow_network(c) == 0,
+    "networking is OFF by default — the container gets --network=none");
+    assert(vec_len(agnosai_oci_config_env(c)) == 0, "no env pairs by default");
+    assert(vec_len(agnosai_oci_config_volumes(c)) == 0, "no volumes by default");
+
+    agnosai_oci_config_set_allow_network(c, 1);
+    assert(agnosai_oci_config_allow_network(c) == 1, "networking can be turned on");
+
+    agnosai_oci_config_add_env(c, str_from("KEY"), str_from("VALUE"));
+    assert(vec_len(agnosai_oci_config_env(c)) == 2, "an env pair is two entries: key then value");
+
+    agnosai_oci_config_add_volume(c, str_from("/host:/container"));
+    assert(vec_len(agnosai_oci_config_volumes(c)) == 1, "a volume is one entry");
+
+    agnosai_oci_config_set_runtime(c, str_from("podman"));
+    assert(str_eq_cstr(agnosai_oci_config_runtime(c), "podman") == 1, "the runtime is selectable");
+
+    agnosai_oci_config_set_timeout_secs(c, 5);
+    assert(agnosai_oci_config_timeout_secs(c) == 5, "the timeout is settable");
+    agnosai_oci_config_set_memory_limit(c, str_from("1g"));
+    assert(str_eq_cstr(agnosai_oci_config_memory_limit(c), "1g") == 1, "so is the memory limit");
+    assert(_t_argv_has(agnosai_oci_build_argv(c, 0), "1g") == 1,
+    "...and the new limit reaches the argv, not just the struct");
+
+    # `set_image` does NOT validate — matching the oracle, where the field is
+    # public and `OciSandbox::new` is the gate. The gate must still refuse it.
+    agnosai_oci_config_set_image(c, str_from("--privileged"));
+    assert(str_eq_cstr(agnosai_oci_config_image(c), "--privileged") == 1,
+    "the setter stores whatever it is given, as the oracle's public field does");
+    assert(agnosai_oci_sandbox_new(c) == 0,
+    "...and the CONSTRUCTOR is what refuses it — the gate is not bypassable by setting after");
+    return 0;
+}
+
+# --- Image validation ----------------------------------------------------
+
+# `accepts_valid_image_refs` — the oracle's six, verbatim.
+fn _t_oci_accepts_valid_images(): i64 {
+    assert(agnosai_oci_validate_image_ref(str_from("alpine")) == 1, "bare name");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine:latest")) == 1, "name:tag");
+    assert(agnosai_oci_validate_image_ref(str_from("ubuntu:22.04")) == 1, "a dotted tag");
+    assert(agnosai_oci_validate_image_ref(
+    str_from("registry.example.com/myapp:v1.2.3")) == 1, "registry host + path + tag");
+    assert(agnosai_oci_validate_image_ref(
+    str_from("ghcr.io/org/repo:sha-abc123")) == 1, "nested path with a hyphen");
+    assert(agnosai_oci_validate_image_ref(
+    str_from("myimage@sha256:abcdef1234567890")) == 1, "a digest reference");
+
+    # And each is constructible through the gate.
+    assert(agnosai_oci_sandbox_new(agnosai_oci_config_new(str_from("alpine:latest"))) != 0,
+    "a valid image builds a sandbox");
+    return 0;
+}
+
+# `rejects_empty_image`, `rejects_image_with_flag_injection`,
+# `rejects_image_with_shell_metacharacters` — plus the classes they miss.
+fn _t_oci_rejects_bad_images(): i64 {
+    assert(agnosai_oci_validate_image_ref(str_from("")) == 0, "an empty image is refused");
+    assert(agnosai_oci_sandbox_new(agnosai_oci_config_new(str_from(""))) == 0,
+    "...and the sandbox does not construct");
+
+    # **Flag injection.** A leading `-` makes the image parse as an option.
+    assert(agnosai_oci_validate_image_ref(str_from("--privileged")) == 0,
+    "--privileged is refused — it would be a FLAG, not an image");
+    assert(agnosai_oci_validate_image_ref(str_from("-v")) == 0, "so is a short flag");
+    assert(agnosai_oci_validate_image_ref(str_from("-")) == 0, "and a bare hyphen");
+    # ...but a hyphen anywhere else is legitimate.
+    assert(agnosai_oci_validate_image_ref(str_from("my-image")) == 1,
+    "a hyphen that does not LEAD is fine — it is common in real names");
+
+    # **Argument/shell injection.** The oracle tests one; each is checked here,
+    # because a validator that happened to allow just one of them is still
+    # broken and the oracle's single case would not say which.
+    assert(agnosai_oci_validate_image_ref(str_from("alpine; rm -rf /")) == 0,
+    "a semicolon is refused — the oracle's own case");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine rm")) == 0, "so is a space");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine|cat")) == 0, "a pipe");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine&whoami")) == 0, "an ampersand");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine$(id)")) == 0, "command substitution");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine`id`")) == 0, "backticks");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine>out")) == 0, "a redirect");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine\nrm")) == 0, "an embedded newline");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine\trm")) == 0, "an embedded tab");
+    assert(agnosai_oci_validate_image_ref(str_from("al'pine")) == 0, "a single quote");
+    assert(agnosai_oci_validate_image_ref(str_from("al\"pine")) == 0, "a double quote");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine\\x")) == 0, "a backslash");
+
+    # `#` IS allowed — `oci.rs:80` includes it, though the doc comment above it
+    # does not list it. The code is the oracle.
+    assert(agnosai_oci_validate_image_ref(str_from("alpine#1")) == 1,
+    "'#' is allowed — the oracle's character set includes it, its comment omits it");
+    return 0;
+}
+
+# **Unicode parity, not an ASCII shortcut.** Rust's `is_alphanumeric` is
+# Unicode, so the oracle accepts non-ASCII letters — and so does this, via
+# `unicode_category`. An ASCII-only validator was written first; it was tighter
+# but diverged, and the safety argument for it did not hold: the reference goes
+# into an argv element, never a shell string, so a homograph is just a name no
+# registry resolves.
+fn _t_oci_unicode_matches_the_oracle(): i64 {
+    assert(agnosai_oci_validate_image_ref(str_from("caf\xc3\xa9:latest")) == 1,
+    "a non-ASCII letter is ACCEPTED, as Rust's Unicode is_alphanumeric accepts it");
+    assert(agnosai_oci_validate_image_ref(str_from("\xd0\xb0lpine")) == 1,
+    "...including a Cyrillic homograph — docker is what refuses to resolve it");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine")) == 1,
+    "and the ASCII spelling it imitates, obviously");
+
+    # Non-letter non-ASCII is still refused: an emoji is category So, not
+    # alphanumeric. This is the assertion that would fail if the port had
+    # accepted "any byte >= 0x80" as a shortcut to looking Unicode-aware.
+    assert(agnosai_oci_validate_image_ref(str_from("alpine\xf0\x9f\x92\xa9")) == 0,
+    "a non-ASCII SYMBOL is still refused — the test is the category, not the byte width");
+    assert(agnosai_oci_validate_image_ref(str_from("alpine\xc2\xa0x")) == 0,
+    "...and so is a non-breaking space, which is Zs and would otherwise pass as 'not ASCII'");
+
+    # Malformed UTF-8 decodes to U+FFFD (So) and is refused. The oracle cannot
+    # express this case at all — a Rust &str cannot hold invalid UTF-8.
+    assert(agnosai_oci_validate_image_ref(str_from("alp\xffine")) == 0,
+    "malformed UTF-8 is refused, a case the oracle's &str cannot even represent");
+    return 0;
+}
+
+# --- Argv ----------------------------------------------------------------
+
+# **No oracle test reaches this.** The isolation flags and their order are what
+# a container actually receives.
+fn _t_oci_argv(): i64 {
+    var c = agnosai_oci_config_new(str_from("alpine:latest"));
+    var argv = agnosai_oci_build_argv(c, 0);
+
+    assert(str_eq_cstr(vec_get(argv, 0), "docker") == 1, "argv[0] is the runtime");
+    assert(str_eq_cstr(vec_get(argv, 1), "run") == 1, "then 'run'");
+    assert(str_eq_cstr(vec_get(argv, 2), "--rm") == 1, "--rm: the container is ephemeral");
+    assert(str_eq_cstr(vec_get(argv, 3), "-i") == 1, "-i: stdin is piped in");
+
+    # The isolation posture.
+    assert(_t_argv_has(argv, "--read-only") == 1, "--read-only rootfs");
+    assert(_t_argv_has(argv, "--tmpfs") == 1, "--tmpfs...");
+    assert(_t_argv_has(argv, "/tmp") == 1, "...on /tmp, the only writable path");
+    assert(_t_argv_has(argv, "--memory") == 1, "--memory is passed");
+    assert(_t_argv_has(argv, "256m") == 1, "...with the configured limit");
+    assert(_t_argv_has(argv, "--network=none") == 1,
+    "--network=none by default — the flag whose absence silently grants a network");
+
+    # `--memory` must be immediately followed by its value, not merely present.
+    assert(_t_argv_at(argv, "256m") == _t_argv_at(argv, "--memory") + 1,
+    "the memory limit follows its flag");
+    assert(_t_argv_at(argv, "/tmp") == _t_argv_at(argv, "--tmpfs") + 1,
+    "and /tmp follows --tmpfs");
+
+    # The image is LAST of the runtime's own arguments.
+    assert(str_eq_cstr(vec_get(argv, vec_len(argv) - 1), "alpine:latest") == 1,
+    "the image is last — everything after it would belong to the container");
+    return 0;
+}
+
+fn _t_oci_argv_options(): i64 {
+    var c = agnosai_oci_config_new(str_from("alpine"));
+    agnosai_oci_config_set_allow_network(c, 1);
+    var argv = agnosai_oci_build_argv(c, 0);
+    assert(_t_argv_has(argv, "--network=none") == 0,
+    "allowing the network REMOVES the flag rather than negating it");
+
+    # env and volumes.
+    var c2 = agnosai_oci_config_new(str_from("alpine"));
+    agnosai_oci_config_add_env(c2, str_from("FOO"), str_from("bar"));
+    agnosai_oci_config_add_volume(c2, str_from("/h:/c"));
+    var a2 = agnosai_oci_build_argv(c2, 0);
+    assert(_t_argv_has(a2, "--env") == 1, "--env is emitted");
+    assert(_t_argv_has(a2, "FOO=bar") == 1, "...with the pair joined by '='");
+    assert(_t_argv_has(a2, "-v") == 1, "-v is emitted");
+    assert(_t_argv_has(a2, "/h:/c") == 1, "...with the mount spec verbatim");
+    assert(_t_argv_at(a2, "FOO=bar") == _t_argv_at(a2, "--env") + 1, "the pair follows --env");
+
+    # Entrypoint args come after the image.
+    var ep = vec_new();
+    vec_push(ep, str_from("python3"));
+    vec_push(ep, str_from("-c"));
+    var a3 = agnosai_oci_build_argv(agnosai_oci_config_new(str_from("alpine")), ep);
+    assert(_t_argv_at(a3, "python3") > _t_argv_at(a3, "alpine"),
+    "entrypoint arguments come AFTER the image, or the runtime would eat them");
+    assert(str_eq_cstr(vec_get(a3, vec_len(a3) - 1), "-c") == 1, "and in the order given");
+    return 0;
+}
+
+# --- Result --------------------------------------------------------------
+
+fn _t_oci_result(): i64 {
+    var r = agnosai_oci_result_new(str_from("out"), str_from("err"), 0, 0);
+    assert(str_eq_cstr(agnosai_oci_result_stdout(r), "out") == 1, "stdout");
+    assert(str_eq_cstr(agnosai_oci_result_stderr(r), "err") == 1, "stderr held separately");
+    assert(agnosai_oci_result_exit_code(r) == 0, "exit code");
+    assert(agnosai_oci_result_timed_out(r) == 0, "not timed out");
+
+    # -1 is the oracle's `status.code().unwrap_or(-1)` — a signalled container
+    # has no exit code, and 0 would report success.
+    var k = agnosai_oci_result_new(str_from(""), str_from(""), 0 - 1, 1);
+    assert(agnosai_oci_result_exit_code(k) == 0 - 1, "a signalled container is -1, never 0");
+    assert(agnosai_oci_result_timed_out(k) == 1, "and a timeout is flagged");
+    return 0;
+}
+
+# --- The error message ---------------------------------------------------
+
+fn _t_oci_error_message(): i64 {
+    assert(str_contains_cstr(agnosai_oci_image_error(str_from("")), "empty") == 1,
+    "an empty image reports emptiness");
+    assert(str_contains_cstr(
+    agnosai_oci_image_error(str_from("--privileged")), "flag injection") == 1,
+    "a leading hyphen reports flag injection, not a generic bad character");
+    assert(str_contains_cstr(
+    agnosai_oci_image_error(str_from("alpine;x")), "invalid character") == 1,
+    "and anything else reports the character class");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_oci_config();
+    _t_oci_accepts_valid_images();
+    _t_oci_rejects_bad_images();
+    _t_oci_unicode_matches_the_oracle();
+    _t_oci_argv();
+    _t_oci_argv_options();
+    _t_oci_result();
+    _t_oci_error_message();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
