@@ -228,16 +228,22 @@ fork/pipes/execve → stdin feed + interleaved drain → deadline/SIGKILL/reap) 
 irreducible prerequisite: nothing in `lib/` supplies the four-tuple these
 modules need (separate stdout, separate stderr, real exit code, stdin write).
 
-**⛔ HELD — the cx confinement bites.** ADR-006 makes kavach's seccomp +
-Landlock the *entire* security boundary for untrusted tool code. On the Landlock
-half that premise is weaker than assumed: `security_apply_landlock` puts only
-**3 of Landlock's 13 filesystem rights** in `handled_access`
-(`lib/kavach.cyr:1034`), and Landlock permits every right it does not name.
-**Measured on this box: a confined process deleted files and directories outside
-its allowed path, and created directories anywhere** — while the obvious smoke
-test ("cannot read `/etc/passwd`") passed. Filed against kavach with a runnable
-repro. The cx bites wait on that, or on ADR-006 being re-characterised; the
-non-cx bites are unaffected and proceed.
+**✅ CLEARED — the Landlock hole is fixed.** ADR-006 makes kavach's seccomp +
+Landlock the *entire* security boundary for untrusted tool code, and on the
+Landlock half that premise did not hold: `security_apply_landlock` named only
+**3 of Landlock's 13 filesystem rights** in `handled_access`, and Landlock
+permits every right it is not told to handle. **Measured: a confined process
+deleted files and directories outside its allowed path, and created directories
+anywhere** — while the obvious smoke test ("cannot read `/etc/passwd`") passed,
+because reading was one of the three that *were* handled.
+
+Fixed in **kavach 3.11.1** (2026-08-03, agnosai-reported and agnosai-fixed): all
+thirteen ABI v1 rights, plus `REFER` (v2) and `TRUNCATE` (v3) where the kernel
+knows them, with an ABI-version query masking down so an older kernel does not
+EINVAL. `EXECUTE` is granted inside read-only paths deliberately — it was
+permitted *everywhere* before, and a sandbox that read-only-mounts `/usr` to run
+`python3` is the ordinary case. agnosai pins 3.11.1 and re-ran the original
+probe: the victim file and directory now survive. The cx bites are unblocked.
 
 **⛔ Blocks spawn-failure parity:** `fork` + `execve` cannot distinguish "spawn
 failed" from "child ran and exited 127" — the whole stdlib resolves an `execve`

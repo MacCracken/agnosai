@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Pinned kavach 3.11.1, which closes a Landlock hole agnosai found and fixed.**
+  `security_apply_landlock` named only **3 of Landlock's 13 filesystem rights**
+  in `handled_access_fs`, and Landlock permits every right it is not told to
+  handle — so a process confined by kavach could still delete any file on the
+  host, remove any directory, create directories anywhere, and exec any binary.
+
+  **The smoke test that would normally catch this passed**, which is why it
+  survived: reading was one of the three rights that *were* handled, so "a
+  confined process cannot read `/etc/passwd`" — the exact escape test
+  [ADR-006](docs/adr/006-cx-tool-sandbox.md) specifies for M7 — reported success
+  while `unlink` was wide open. Found while planning M7's cx bites against that
+  ADR, whose premise is that kavach's seccomp + Landlock *are* the entire
+  security boundary for untrusted tool code.
+
+  Measured before the fix, and again after, with the same probe: a process
+  confined read-only to one scratch directory deleted `/tmp` files and
+  directories outside it and created new ones. On 3.11.1 the victim file and
+  directory survive. kavach's own regression test forks, confines the child for
+  real, and is mutation-verified against the three-right mask.
+
 ### Added
 
 - **M7 bite 1 — `sandbox/policy` + the group hub.** Isolation levels, the five
