@@ -42,6 +42,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 11 — `sandbox/manager`: backend selection and dispatch.** All eight
+  oracle tests ported (`manager.rs:145-217`), 69 assertions. Every module in the
+  oracle's M7 sequence — `policy`, `oci`, `kavach_bridge`, spawn, `process`,
+  `python`, `manager` — now has a Cyrius counterpart.
+
+  **Dispatch is on the EFFECTIVE isolation level, not the requested minimum.**
+  `resolve_backend` forwards to the policy and is easy to test; the dispatch path
+  computes the same thing separately, and a version reading `min_isolation` there
+  would send a policy that asks for `None` but needs the filesystem straight to
+  the passthrough — silently running an unsandboxed tool with no sandbox at all.
+  The first test round missed this, because it only exercised `resolve_backend`.
+
+  **`IsolationLevel::None` echoes the input and never touches `argv`**
+  (`manager.rs:87-93`). A native tool is already in-process, so there is nothing
+  to spawn; the passthrough is what "no sandbox needed" looks like from here. The
+  test asserts a marker that would appear if `argv` had run, so the two outcomes
+  are distinguishable rather than both looking like success.
+
+  **`max_duration_secs == 0` means "unset", not "unlimited".** The policy's
+  deadline wins when set and falls back to the manager's 30 s otherwise
+  (`manager.rs:80-84`); the other reading would let a tool run forever, so both
+  arms are asserted against a child that would sleep for a minute.
+
+  Seven mutations, all caught: ignoring the policy deadline, treating an unset
+  deadline as unlimited, running `argv` on the `None` path, dispatching WASM to a
+  backend instead of erroring, skipping OCI image validation, ignoring
+  `needs_network`, and dispatching on `min_isolation`.
+
 - **M7 bite 10 — `sandbox/python`: the interpreter bridge.** All five oracle
   tests ported (`python.rs:177-312`), 61 assertions. The third and last consumer
   of the spawn primitive.

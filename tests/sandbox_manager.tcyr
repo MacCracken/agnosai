@@ -1,0 +1,394 @@
+# =========================================================================
+# sandbox_manager — tests for src/sandbox/manager.cyr.
+#
+# All eight oracle tests (`rust-old/src/sandbox/manager.rs:145-217`) are ported:
+# resolve_native, resolve_wasm, resolve_process, resolve_container,
+# execute_native_passthrough, execute_wasm_returns_error, execute_process_echo,
+# default_manager_creation.
+#
+# What is asserted beyond them is the dispatch itself — that each level reaches
+# the backend it names and no other, and that the deadline a policy carries
+# actually reaches the child. The oracle's suite covers resolution thoroughly
+# and dispatch barely.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/sandbox/mod.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_mg_argv2(a, b): i64 {
+    var v = vec_new();
+    vec_push(v, str_from(a));
+    if (b != 0) { vec_push(v, str_from(b)); }
+    return v;
+}
+
+# --- Resolution (the oracle's four) --------------------------------------
+
+fn _t_mg_resolve(): i64 {
+    var m = agnosai_sandbox_manager_default();
+    assert(agnosai_sandbox_manager_resolve_backend(m, agnosai_sandbox_policy_native())
+    == AGNOSAI_ISOLATION_NONE, "oracle resolve_native");
+    assert(agnosai_sandbox_manager_resolve_backend(m, agnosai_sandbox_policy_wasm())
+    == AGNOSAI_ISOLATION_WASM, "oracle resolve_wasm");
+    assert(agnosai_sandbox_manager_resolve_backend(m, agnosai_sandbox_policy_process())
+    == AGNOSAI_ISOLATION_PROCESS, "oracle resolve_process");
+    assert(agnosai_sandbox_manager_resolve_backend(m, agnosai_sandbox_policy_container())
+    == AGNOSAI_ISOLATION_OCI, "oracle resolve_container");
+    return 0;
+}
+
+fn _t_mg_default_manager_creation(): i64 {
+    var m = agnosai_sandbox_manager_default();
+    assert(str_eq(agnosai_sandbox_manager_config_oci_runtime(m), str_from("docker")) == 1,
+    "oracle default_manager_creation: the runtime is docker");
+    assert(str_eq(agnosai_sandbox_manager_config_oci_default_image(m),
+    str_from("alpine:latest")) == 1, "...the image is alpine:latest");
+    assert(str_eq(agnosai_sandbox_manager_config_oci_memory_limit(m), str_from("256m")) == 1,
+    "...the memory limit is 256m");
+    assert(agnosai_sandbox_manager_config_default_timeout_secs(m) == 30,
+    "...and the fallback deadline is 30 seconds");
+    return 0;
+}
+
+fn _t_mg_config_setters(): i64 {
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_oci_runtime(c, str_from("podman"));
+    agnosai_sandbox_manager_config_set_oci_default_image(c, str_from("debian:stable"));
+    agnosai_sandbox_manager_config_set_oci_memory_limit(c, str_from("512m"));
+    agnosai_sandbox_manager_config_set_default_timeout_secs(c, 7);
+
+    assert(str_eq(agnosai_sandbox_manager_config_oci_runtime(c), str_from("podman")) == 1,
+    "the runtime is configurable");
+    assert(str_eq(agnosai_sandbox_manager_config_oci_default_image(c),
+    str_from("debian:stable")) == 1, "so is the image");
+    assert(str_eq(agnosai_sandbox_manager_config_oci_memory_limit(c), str_from("512m")) == 1,
+    "so is the memory limit");
+    assert(agnosai_sandbox_manager_config_default_timeout_secs(c) == 7,
+    "and so is the fallback deadline");
+    return 0;
+}
+
+# --- Dispatch ------------------------------------------------------------
+
+fn _t_mg_execute_native_passthrough(): i64 {
+    var m = agnosai_sandbox_manager_default();
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_native(),
+    _t_mg_argv2("true", 0), str_from("test input"), &e);
+
+    assert(load64(&e) == 0, "oracle execute_native_passthrough: native succeeds");
+    assert(agnosai_sandbox_result_backend(r) == AGNOSAI_ISOLATION_NONE, "...reporting None");
+    assert(str_eq(agnosai_sandbox_result_stdout(r), str_from("test input")) == 1,
+    "...with the input echoed as stdout");
+    assert(agnosai_sandbox_result_exit_code(r) == 0, "...and exit code 0");
+    assert(str_len(agnosai_sandbox_result_stderr(r)) == 0, "...and empty stderr");
+    assert(agnosai_sandbox_result_timed_out(r) == 0, "...and no timeout");
+    return 0;
+}
+
+fn _t_mg_native_runs_nothing(): i64 {
+    # **The passthrough must not execute argv**, and the assertion has to be
+    # able to tell. `/bin/echo` with a marker would produce that marker on
+    # stdout if it ran; the input is a different string, so the two are
+    # distinguishable.
+    var m = agnosai_sandbox_manager_default();
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_native(),
+    _t_mg_argv2("/bin/echo", "EXECUTED"), str_from("echoed-input"), &e);
+
+    assert(load64(&e) == 0, "the native path succeeds");
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(r), "EXECUTED") == 0,
+    "argv is NOT run on the None path - the policy decides, not the argv");
+    assert(str_eq(agnosai_sandbox_result_stdout(r), str_from("echoed-input")) == 1,
+    "...stdout is the input, verbatim");
+    return 0;
+}
+
+fn _t_mg_execute_wasm_returns_error(): i64 {
+    var m = agnosai_sandbox_manager_default();
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_wasm(),
+    _t_mg_argv2("noop", 0), str_from(""), &e);
+
+    assert(r == 0, "oracle execute_wasm_returns_error: WASM is an error");
+    assert(load64(&e) != 0, "...with an error set");
+    assert(agnosai_error_kind(load64(&e)) == AGNOSAI_ERR_SANDBOX, "...a sandbox error");
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "WasmSandbox") == 1,
+    "...carrying the oracle's message");
+    return 0;
+}
+
+fn _t_mg_execute_process_echo(): i64 {
+    var m = agnosai_sandbox_manager_default();
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_process(),
+    _t_mg_argv2("echo", "hello"), str_from(""), &e);
+
+    assert(load64(&e) == 0, "oracle execute_process_echo: the process backend runs");
+    assert(agnosai_sandbox_result_backend(r) == AGNOSAI_ISOLATION_PROCESS,
+    "...reporting Process");
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(r), "hello") == 1,
+    "...with the program's output");
+    assert(agnosai_sandbox_result_exit_code(r) == 0, "...and exit code 0");
+
+    # A bare `echo` here also exercises PATH resolution through the whole stack:
+    # the oracle's own test passes `&["echo", "hello"]`, not an absolute path.
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(r), "/") == 0,
+    "the bare name `echo` resolved and ran, rather than failing to spawn");
+    return 0;
+}
+
+fn _t_mg_process_dispatch_is_real(): i64 {
+    # The process arm must reach the process backend and not the passthrough:
+    # a running child produces output the input does not contain, and reports
+    # its own exit code.
+    var m = agnosai_sandbox_manager_default();
+    var e[8];
+    store64(&e, 0);
+    var argv = vec_new();
+    vec_push(argv, str_from("/bin/sh"));
+    vec_push(argv, str_from("-c"));
+    vec_push(argv, str_from("cat; echo from-child >&2; exit 5"));
+
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_process(),
+    argv, str_from("to-child"), &e);
+    assert(load64(&e) == 0, "the child runs");
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(r), "to-child") == 1,
+    "input reaches the child's stdin through the manager");
+    assert(str_contains_cstr(agnosai_sandbox_result_stderr(r), "from-child") == 1,
+    "the child's stderr comes back separately");
+    assert(agnosai_sandbox_result_exit_code(r) == 5,
+    "and its exit code is the child's, not a passthrough 0");
+    return 0;
+}
+
+fn _t_mg_process_failure_is_an_error(): i64 {
+    var m = agnosai_sandbox_manager_default();
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_process(),
+    _t_mg_argv2("/nonexistent/tool", 0), str_from(""), &e);
+    assert(r == 0, "a backend that cannot spawn propagates as an error");
+    assert(load64(&e) != 0, "...with the backend's error, not a swallowed result");
+
+    store64(&e, 0);
+    var empty = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_process(),
+    vec_new(), str_from(""), &e);
+    assert(empty == 0, "an empty argv propagates from the process backend too");
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "empty argv") == 1,
+    "...with its message intact");
+    return 0;
+}
+
+# --- The deadline --------------------------------------------------------
+
+fn _t_mg_policy_deadline_wins(): i64 {
+    # A policy's max_duration_secs overrides the manager default, and must
+    # actually reach the child - `manager.rs:80-84`.
+    var m = agnosai_sandbox_manager_default();
+    var p = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_PROCESS, 0, 0, 1, 0);
+
+    var e[8];
+    store64(&e, 0);
+    var t0 = clock_now_ms();
+    var r = agnosai_sandbox_manager_execute_argv(m, p,
+    _t_mg_argv2("/bin/sleep", "60"), str_from(""), &e);
+    var dt = clock_now_ms() - t0;
+
+    assert(load64(&e) == 0, "a timeout is a result, not an error");
+    assert(agnosai_sandbox_result_timed_out(r) == 1, "the policy's 1-second deadline fired");
+    assert(agnosai_sandbox_result_exit_code(r) == 0 - 1, "...reporting -1");
+    assert(dt < 15000, "...rather than the manager's 30-second default");
+    # SECONDS, not milliseconds: a missing x1000 would fire in 1 ms.
+    assert(dt >= 900, "...and the unit is seconds, not milliseconds");
+    return 0;
+}
+
+fn _t_mg_default_deadline_when_policy_sets_none(): i64 {
+    # max_duration_secs == 0 means "unset", NOT "no deadline" - reading it the
+    # other way would let a tool run forever.
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_default_timeout_secs(c, 1);
+    var m = agnosai_sandbox_manager_new(c);
+    var p = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_PROCESS, 0, 0, 0, 0);
+
+    assert(agnosai_sandbox_policy_max_duration_secs(p) == 0, "the policy sets no deadline");
+
+    var e[8];
+    store64(&e, 0);
+    var t0 = clock_now_ms();
+    var r = agnosai_sandbox_manager_execute_argv(m, p,
+    _t_mg_argv2("/bin/sleep", "60"), str_from(""), &e);
+    var dt = clock_now_ms() - t0;
+
+    assert(agnosai_sandbox_result_timed_out(r) == 1,
+    "an unset policy deadline falls back to the manager's - it is not unlimited");
+    assert(dt < 15000, "...and that fallback fired");
+    return 0;
+}
+
+# --- OCI dispatch --------------------------------------------------------
+
+fn _t_mg_oci_dispatch_builds_the_container_argv(): i64 {
+    # No container runtime can be assumed, so `/bin/echo` stands in as one and
+    # the argv the manager built becomes readable on stdout. This is the only
+    # way to see that the manager's config reaches the OCI backend.
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_oci_runtime(c, str_from("/bin/echo"));
+    agnosai_sandbox_manager_config_set_oci_memory_limit(c, str_from("128m"));
+    agnosai_sandbox_manager_config_set_oci_default_image(c, str_from("busybox:1.36"));
+    var m = agnosai_sandbox_manager_new(c);
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_container(),
+    _t_mg_argv2("entrypoint", 0), str_from(""), &e);
+
+    assert(load64(&e) == 0, "the OCI backend runs");
+    assert(agnosai_sandbox_result_backend(r) == AGNOSAI_ISOLATION_OCI, "...reporting Oci");
+
+    var out = agnosai_sandbox_result_stdout(r);
+    assert(str_contains_cstr(out, "run --rm -i --read-only") == 1,
+    "the isolation flags are there");
+    assert(str_contains_cstr(out, "--memory 128m") == 1,
+    "the manager's memory limit reaches the runtime");
+    assert(str_contains_cstr(out, "busybox:1.36 entrypoint") == 1,
+    "...as does its image, ahead of the entrypoint arguments");
+    return 0;
+}
+
+fn _t_mg_oci_network_follows_the_policy(): i64 {
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_oci_runtime(c, str_from("/bin/echo"));
+    var m = agnosai_sandbox_manager_new(c);
+
+    # **`policy_container()` needs the network** (`policy.rs:91`), so it is the
+    # wrong policy for the negative case - a container-level policy with
+    # needs_network false is built explicitly.
+    var e[8];
+    store64(&e, 0);
+    var quiet = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_OCI, 1, 0, 0, 0);
+    var off = agnosai_sandbox_manager_execute_argv(m, quiet, _t_mg_argv2("x", 0),
+    str_from(""), &e);
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(off), "--network=none") == 1,
+    "a policy that does not need the network gets --network=none");
+
+    # And the standard container policy, which DOES need it, must not.
+    store64(&e, 0);
+    var on = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_container(),
+    _t_mg_argv2("x", 0), str_from(""), &e);
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(on), "--network=none") == 0,
+    "a policy that needs the network does NOT - the flag is dropped, not negated");
+    return 0;
+}
+
+fn _t_mg_oci_invalid_image_is_rejected_before_spawning(): i64 {
+    # `OciSandbox::new` validates and `?` propagates (manager.rs:121), so a
+    # flag-injecting image never reaches a runtime argv.
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_oci_runtime(c, str_from("/bin/echo"));
+    agnosai_sandbox_manager_config_set_oci_default_image(c, str_from("--privileged"));
+    var m = agnosai_sandbox_manager_new(c);
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_container(),
+    _t_mg_argv2("x", 0), str_from(""), &e);
+
+    assert(r == 0, "an image that is really a flag is rejected");
+    assert(load64(&e) != 0, "...with an error");
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "flag injection") == 1,
+    "...naming the reason, before any runtime was spawned");
+    return 0;
+}
+
+# --- The result -----------------------------------------------------------
+
+fn _t_mg_result_accessors(): i64 {
+    var r = agnosai_sandbox_result_new(str_from("o"), str_from("e"), 9, 1,
+    AGNOSAI_ISOLATION_OCI);
+    assert(str_eq(agnosai_sandbox_result_stdout(r), str_from("o")) == 1, "stdout round-trips");
+    assert(str_eq(agnosai_sandbox_result_stderr(r), str_from("e")) == 1, "stderr round-trips");
+    assert(agnosai_sandbox_result_exit_code(r) == 9, "the exit code round-trips");
+    assert(agnosai_sandbox_result_timed_out(r) == 1, "timed_out round-trips");
+    assert(agnosai_sandbox_result_backend(r) == AGNOSAI_ISOLATION_OCI,
+    "and so does the backend - five distinct slots");
+    return 0;
+}
+
+fn _t_mg_backend_reports_where_it_LANDED(): i64 {
+    # `effective_isolation` raises a policy above its stated minimum. The
+    # result must report the level that actually ran, not the one requested -
+    # a caller auditing which tools were containerized reads this field.
+    var m = agnosai_sandbox_manager_default();
+    var p = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_NONE, 0, 1, 5, 0);
+    assert(agnosai_sandbox_policy_min_isolation(p) == AGNOSAI_ISOLATION_NONE,
+    "the policy ASKS for no isolation");
+    assert(agnosai_sandbox_manager_resolve_backend(m, p) != AGNOSAI_ISOLATION_NONE,
+    "...but needing the network raises it");
+    return 0;
+}
+
+fn _t_mg_dispatch_uses_the_EFFECTIVE_level(): i64 {
+    # **`resolve_backend` is not the dispatch path.** A manager that dispatched
+    # on `min_isolation` would send this policy - which asks for None but needs
+    # the filesystem, so effective_isolation raises it to Process - straight to
+    # the passthrough, echoing the input and running nothing. The policy would
+    # have been silently downgraded to no sandbox at all.
+    var m = agnosai_sandbox_manager_default();
+    var p = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_NONE, 1, 0, 10, 0);
+    assert(agnosai_sandbox_policy_min_isolation(p) == AGNOSAI_ISOLATION_NONE,
+    "the policy asks for no isolation");
+    assert(agnosai_sandbox_policy_effective_isolation(p) == AGNOSAI_ISOLATION_PROCESS,
+    "...but needing the filesystem raises it to Process");
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, p,
+    _t_mg_argv2("/bin/echo", "RAN"), str_from("not-echoed"), &e);
+    assert(load64(&e) == 0, "the run succeeds");
+    assert(agnosai_sandbox_result_backend(r) == AGNOSAI_ISOLATION_PROCESS,
+    "execute_argv dispatches on the EFFECTIVE level, not the requested minimum");
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(r), "RAN") == 1,
+    "...so the program actually ran");
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(r), "not-echoed") == 0,
+    "...rather than the input being echoed by the passthrough");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_mg_resolve();
+    _t_mg_default_manager_creation();
+    _t_mg_config_setters();
+    _t_mg_execute_native_passthrough();
+    _t_mg_native_runs_nothing();
+    _t_mg_execute_wasm_returns_error();
+    _t_mg_execute_process_echo();
+    _t_mg_process_dispatch_is_real();
+    _t_mg_process_failure_is_an_error();
+    _t_mg_policy_deadline_wins();
+    _t_mg_default_deadline_when_policy_sets_none();
+    _t_mg_oci_dispatch_builds_the_container_argv();
+    _t_mg_oci_network_follows_the_policy();
+    _t_mg_oci_invalid_image_is_rejected_before_spawning();
+    _t_mg_result_accessors();
+    _t_mg_backend_reports_where_it_LANDED();
+    _t_mg_dispatch_uses_the_EFFECTIVE_level();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

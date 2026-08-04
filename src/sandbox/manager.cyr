@@ -1,0 +1,240 @@
+# =========================================================================
+# sandbox/manager — backend selection and dispatch.
+#
+# Parity oracle: rust-old/src/sandbox/manager.rs (217 lines, 8 tests)
+#
+# The policy decides the isolation level; the manager turns that level into a
+# backend and normalises whatever the backend returns into one `SandboxResult`.
+# It is the last M7 file, and the only one whose job is entirely dispatch —
+# `process`, `oci` and `python` do the work.
+#
+# ## `IsolationLevel::None` runs nothing at all
+#
+# The `None` arm **echoes the input back as stdout** (`manager.rs:87-93`) and
+# never touches `argv`. That looks like a stub and is not: a native tool is
+# already Rust code inside the process, so there is nothing to spawn, and the
+# manager's contract is to return a `SandboxResult` shaped like every other
+# backend's. The passthrough is what "no sandbox needed" looks like from here.
+#
+# **`argv` is ignored on that path**, which is worth stating plainly: a caller
+# that hands `["rm", "-rf", "/"]` to a `None` policy gets its input echoed and
+# nothing executed. The policy, not the argv, decides whether anything runs.
+#
+# ## `IsolationLevel::Wasm` is an error, not a backend
+#
+# `manager.rs:94-97` returns "WASM tools must be executed via `WasmSandbox`
+# directly with a compiled module". In this port there is no `WasmSandbox` at
+# all — `wasm.rs` is excluded, see `sandbox/mod.cyr` — so the arm is if anything
+# more honest here than in the oracle. The level survives because it is a wire
+# value and orders between `None` and `Process`.
+# =========================================================================
+
+# ---------------------------------------------------------------------------
+# SandboxResult — rust-old/src/sandbox/manager.rs:21-27
+# ---------------------------------------------------------------------------
+
+enum AgnosaiSandboxResultOff {
+    AGN_SBR_STDOUT = 0;
+    AGN_SBR_STDERR = 8;
+    AGN_SBR_EXIT_CODE = 16;
+    AGN_SBR_TIMED_OUT = 24;
+    AGN_SBR_BACKEND = 32;
+    AGN_SBR_SIZE = 40;
+}
+
+# A finished sandboxed execution, whichever backend ran it.
+fn agnosai_sandbox_result_new(stdout: Str, stderr: Str, exit_code, timed_out, backend): i64 {
+    var r = alloc(AGN_SBR_SIZE);
+    store64(r + AGN_SBR_STDOUT, stdout);
+    store64(r + AGN_SBR_STDERR, stderr);
+    store64(r + AGN_SBR_EXIT_CODE, exit_code);
+    store64(r + AGN_SBR_TIMED_OUT, timed_out);
+    store64(r + AGN_SBR_BACKEND, backend);
+    return r;
+}
+
+# What the tool wrote to stdout.
+fn agnosai_sandbox_result_stdout(r): Str { return load64(r + AGN_SBR_STDOUT); }
+
+# What the tool wrote to stderr.
+fn agnosai_sandbox_result_stderr(r): Str { return load64(r + AGN_SBR_STDERR); }
+
+# The tool's exit code, or -1 when it was signalled or timed out.
+fn agnosai_sandbox_result_exit_code(r): i64 { return load64(r + AGN_SBR_EXIT_CODE); }
+
+# Whether the deadline fired.
+fn agnosai_sandbox_result_timed_out(r): i64 { return load64(r + AGN_SBR_TIMED_OUT); }
+
+# Which backend actually ran it.
+#
+# **The level the policy resolved to, not the level it asked for.**
+# `effective_isolation` raises a policy that needs the network or the filesystem
+# above what `min_isolation` requested, and this field reports where it landed.
+fn agnosai_sandbox_result_backend(r): i64 { return load64(r + AGN_SBR_BACKEND); }
+
+# ---------------------------------------------------------------------------
+# SandboxManagerConfig — rust-old/src/sandbox/manager.rs:31-51
+# ---------------------------------------------------------------------------
+
+enum AgnosaiSandboxMgrCfgOff {
+    AGN_SMC_DEFAULT_TIMEOUT_SECS = 0;
+    AGN_SMC_OCI_RUNTIME = 8;
+    AGN_SMC_OCI_DEFAULT_IMAGE = 16;
+    AGN_SMC_OCI_MEMORY_LIMIT = 24;
+    AGN_SMC_SIZE = 32;
+}
+
+# The oracle's `Default` — 30 s, `docker`, `alpine:latest`, `256m`.
+fn agnosai_sandbox_manager_config_default(): i64 {
+    var c = alloc(AGN_SMC_SIZE);
+    store64(c + AGN_SMC_DEFAULT_TIMEOUT_SECS, 30);
+    store64(c + AGN_SMC_OCI_RUNTIME, str_from("docker"));
+    store64(c + AGN_SMC_OCI_DEFAULT_IMAGE, str_from("alpine:latest"));
+    store64(c + AGN_SMC_OCI_MEMORY_LIMIT, str_from("256m"));
+    return c;
+}
+
+# The deadline used when a policy sets no `max_duration_secs`.
+fn agnosai_sandbox_manager_config_default_timeout_secs(c): i64 {
+    return load64(c + AGN_SMC_DEFAULT_TIMEOUT_SECS);
+}
+
+# Set the fallback deadline, in seconds.
+fn agnosai_sandbox_manager_config_set_default_timeout_secs(c, secs): i64 {
+    store64(c + AGN_SMC_DEFAULT_TIMEOUT_SECS, secs);
+    return 0;
+}
+
+# The container runtime binary — a bare name, resolved on `PATH`.
+fn agnosai_sandbox_manager_config_oci_runtime(c): Str {
+    return load64(c + AGN_SMC_OCI_RUNTIME);
+}
+
+# Set the container runtime binary.
+fn agnosai_sandbox_manager_config_set_oci_runtime(c, runtime: Str): i64 {
+    store64(c + AGN_SMC_OCI_RUNTIME, runtime);
+    return 0;
+}
+
+# The image every container-isolated tool runs in.
+fn agnosai_sandbox_manager_config_oci_default_image(c): Str {
+    return load64(c + AGN_SMC_OCI_DEFAULT_IMAGE);
+}
+
+# Set the default container image.
+fn agnosai_sandbox_manager_config_set_oci_default_image(c, image: Str): i64 {
+    store64(c + AGN_SMC_OCI_DEFAULT_IMAGE, image);
+    return 0;
+}
+
+# The container memory limit, as the runtime's `--memory` argument.
+fn agnosai_sandbox_manager_config_oci_memory_limit(c): Str {
+    return load64(c + AGN_SMC_OCI_MEMORY_LIMIT);
+}
+
+# Set the container memory limit.
+fn agnosai_sandbox_manager_config_set_oci_memory_limit(c, limit: Str): i64 {
+    store64(c + AGN_SMC_OCI_MEMORY_LIMIT, limit);
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# SandboxManager — rust-old/src/sandbox/manager.rs:54-138
+# ---------------------------------------------------------------------------
+
+# Build a manager over `config` — `SandboxManager::new`, `manager.rs:59-65`.
+#
+# Cyrius has no struct wrapping a single field, so a manager *is* its config;
+# the oracle's `SandboxManager { config }` adds nothing else. The `info!` on
+# construction is preserved because it is the line an operator looks for when a
+# container runtime turns out to be the wrong one.
+fn agnosai_sandbox_manager_new(config): i64 {
+    var m = str_cat(str_from("sandbox manager initialized, oci_runtime="),
+    load64(config + AGN_SMC_OCI_RUNTIME));
+    sakshi_info(str_data(m), str_len(m));
+    return config;
+}
+
+# A manager over the default config — the oracle's `Default`.
+fn agnosai_sandbox_manager_default(): i64 {
+    return agnosai_sandbox_manager_new(agnosai_sandbox_manager_config_default());
+}
+
+# Which isolation level a policy resolves to — `resolve_backend`,
+# `manager.rs:133-135`.
+#
+# A thin forward to the policy's own `effective_isolation`, kept because it is
+# public API and because the manager is where a caller asks the question.
+fn agnosai_sandbox_manager_resolve_backend(m, policy): i64 {
+    return agnosai_sandbox_policy_effective_isolation(policy);
+}
+
+# The deadline for this run — `manager.rs:80-84`.
+#
+# A policy's own `max_duration_secs` wins when it is set; 0 means "unset" and
+# falls back to the manager's default. **0 does not mean "no deadline"**, which
+# is the reading that would let a tool run forever.
+fn _agnosai_sandbox_manager_timeout_secs(m, policy): i64 {
+    if (agnosai_sandbox_policy_max_duration_secs(policy) > 0) {
+        return agnosai_sandbox_policy_max_duration_secs(policy);
+    }
+    return load64(m + AGN_SMC_DEFAULT_TIMEOUT_SECS);
+}
+
+# Execute a program with explicit arguments in the backend the policy selects —
+# `execute_argv`, `rust-old/src/sandbox/manager.rs:73-131`.
+#
+# **This is the safe API**: `argv` reaches `execve` as a vector, so no shell
+# parses it. There is deliberately no shell-string counterpart on the manager —
+# the oracle has none either, and `agnosai_process_execute` is reachable
+# directly by a caller that already holds a trusted command.
+#
+# Returns 0 with `out_err` set on failure.
+fn agnosai_sandbox_manager_execute_argv(m, policy, argv, input: Str, out_err): i64 {
+    var level = agnosai_sandbox_policy_effective_isolation(policy);
+    var secs = _agnosai_sandbox_manager_timeout_secs(m, policy);
+
+    if (level == AGNOSAI_ISOLATION_NONE) {
+        # A native tool is already in-process; there is nothing to spawn. The
+        # input is echoed so the result has the shape every other backend
+        # returns — `manager.rs:87-93`.
+        return agnosai_sandbox_result_new(input, str_from(""), 0, 0, AGNOSAI_ISOLATION_NONE);
+    }
+
+    if (level == AGNOSAI_ISOLATION_WASM) {
+        store64(out_err, agnosai_error_sandbox(str_from(
+        "WASM tools must be executed via WasmSandbox directly with a compiled module")));
+        return 0;
+    }
+
+    if (level == AGNOSAI_ISOLATION_PROCESS) {
+        var pc = agnosai_process_config_shell(secs * 1000);
+        var pr = agnosai_process_execute_argv(pc, argv, input, out_err);
+        if (pr == 0) { return 0; }
+        return agnosai_sandbox_result_new(agnosai_process_result_stdout(pr),
+        agnosai_process_result_stderr(pr), agnosai_process_result_exit_code(pr),
+        agnosai_process_result_timed_out(pr), AGNOSAI_ISOLATION_PROCESS);
+    }
+
+    # `IsolationLevel::Oci` — `manager.rs:111-129`.
+    var oc = agnosai_oci_config_new(load64(m + AGN_SMC_OCI_DEFAULT_IMAGE));
+    agnosai_oci_config_set_runtime(oc, load64(m + AGN_SMC_OCI_RUNTIME));
+    agnosai_oci_config_set_timeout_secs(oc, secs);
+    agnosai_oci_config_set_memory_limit(oc, load64(m + AGN_SMC_OCI_MEMORY_LIMIT));
+    agnosai_oci_config_set_allow_network(oc, agnosai_sandbox_policy_needs_network(policy));
+
+    # `OciSandbox::new` validates the image reference and the `?` propagates —
+    # so a bad image is an error before any runtime is spawned, which is the
+    # whole point of validating it.
+    if (agnosai_oci_sandbox_new(oc) == 0) {
+        store64(out_err, agnosai_error_sandbox(str_cat(str_from("invalid image: "),
+        agnosai_oci_image_error(load64(m + AGN_SMC_OCI_DEFAULT_IMAGE)))));
+        return 0;
+    }
+
+    var orr = agnosai_oci_execute(oc, argv, input, out_err);
+    if (orr == 0) { return 0; }
+    return agnosai_sandbox_result_new(agnosai_oci_result_stdout(orr),
+    agnosai_oci_result_stderr(orr), agnosai_oci_result_exit_code(orr),
+    agnosai_oci_result_timed_out(orr), AGNOSAI_ISOLATION_OCI);
+}

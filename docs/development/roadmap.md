@@ -214,8 +214,30 @@ handler cost bounded and measured" until that filing lands.
 
 ### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
 
-**Bites 1-10 done (2026-08-04).** Bite 10: `python` — the interpreter bridge and
-the last consumer of the spawn primitive. Only `manager` remains. Building it
+**Bites 1-11 done (2026-08-04).** Bite 11: `manager` — backend selection and
+dispatch, all eight oracle tests ported. **The oracle's module sequence is now
+complete**: `policy`, `oci`, `kavach_bridge`, spawn, `process`, `python`,
+`manager` all have counterparts.
+
+**What is left in M7 is the work with no oracle line to copy**, and it is not
+small:
+
+- **`kavach_bridge`'s exec half** (`kavach_bridge.rs:94-148`) — create,
+  transition to Running, `exec`, then destroy on *every* path including exec
+  failure. Recorded earlier as unable to honour `max_duration_secs` "because
+  nothing on the process path reads `timeout_ms`"; **that constraint is gone** —
+  the spawn primitive has taken a deadline since bite 7.
+- **The cx confinement bites (B13-B15)** — `wasm.rs`'s successor per
+  [ADR-006](../adr/006-cx-tool-sandbox.md): `cycc_cx` → `.cyx` → `cxvm` spawned
+  **inside** a kavach sandbox, with the milestone's own gate — a test asserting
+  a `.cyx` attempting `open("/etc/passwd")` is refused. Unblocked by kavach
+  3.11.1.
+
+An earlier note here said only `manager` remained. That was the oracle's file
+list, not the milestone.
+
+Bite 10: `python` — the interpreter bridge and
+the last consumer of the spawn primitive. Building it
 surfaced a defect in bite 9: `execve` does not search `PATH` where `Command::new`
 does, so the default runtime `"docker"` and the default interpreter `"python3"`
 — both bare names — could not be spawned at all. Resolution now happens before
