@@ -1,0 +1,363 @@
+# =========================================================================
+# sandbox/process — the subprocess sandbox.
+#
+# Parity oracle: rust-old/src/sandbox/process.rs (366 lines, 9 tests)
+#
+# `ProcessSandbox` is the backend `IsolationLevel::Process` resolves to
+# (`manager.rs:101`). It runs an executable as a child with a sanitized
+# environment, a wall-clock deadline, and captured output — all of which
+# `spawn.cyr` already provides. What lives here is the oracle's *shape*: the
+# config, the two entry points, and the result.
+#
+# ## The oracle's module doc claims a memory limit that does not exist
+#
+# `process.rs:6` advertises "Memory limit via `setrlimit` (best-effort on
+# Linux)". There is **no `setrlimit`, `rlimit`, or `RLIMIT` anywhere in
+# `rust-old/src`** — the line describes an intention. It is not ported, and it
+# is written down here so the next reader does not go looking for the code or,
+# worse, assume the limit is in force.
+#
+# ## `execute` interprets shell metacharacters; `execute_argv` does not
+#
+# The oracle is explicit about this (`process.rs:68-71`, `:170-172`): a shell
+# sandbox passes its command to `sh -c`, so `execute` is unsafe for untrusted
+# input and `execute_argv` is the alternative. Both are ported, with the same
+# warning, because the manager uses `execute_argv` and only `execute_argv`
+# (`manager.rs:102`) — the shell path exists for callers who already hold a
+# trusted command string.
+# =========================================================================
+
+# ---------------------------------------------------------------------------
+# ProcessResult — rust-old/src/sandbox/process.rs:20-25
+# ---------------------------------------------------------------------------
+
+enum AgnosaiProcResultOff {
+    AGN_PRR_STDOUT = 0;
+    AGN_PRR_STDERR = 8;
+    AGN_PRR_EXIT_CODE = 16;
+    AGN_PRR_TIMED_OUT = 24;
+    AGN_PRR_SIZE = 32;
+}
+
+# A finished sandboxed execution.
+fn agnosai_process_result_new(stdout: Str, stderr: Str, exit_code, timed_out): i64 {
+    var r = alloc(AGN_PRR_SIZE);
+    store64(r + AGN_PRR_STDOUT, stdout);
+    store64(r + AGN_PRR_STDERR, stderr);
+    store64(r + AGN_PRR_EXIT_CODE, exit_code);
+    store64(r + AGN_PRR_TIMED_OUT, timed_out);
+    return r;
+}
+
+# The child's captured stdout.
+fn agnosai_process_result_stdout(r): Str { return load64(r + AGN_PRR_STDOUT); }
+
+# The child's captured stderr.
+fn agnosai_process_result_stderr(r): Str { return load64(r + AGN_PRR_STDERR); }
+
+# The child's exit code, or -1 when it was signalled or timed out.
+#
+# `output.status.code()` is `None` for a signalled child and the oracle maps
+# that to -1 with `unwrap_or(-1)` (`process.rs:141`), so a killed child and a
+# program that genuinely returned -1 are indistinguishable here too.
+fn agnosai_process_result_exit_code(r): i64 { return load64(r + AGN_PRR_EXIT_CODE); }
+
+# Whether the deadline fired.
+fn agnosai_process_result_timed_out(r): i64 { return load64(r + AGN_PRR_TIMED_OUT); }
+
+# ---------------------------------------------------------------------------
+# ProcessSandboxConfig — rust-old/src/sandbox/process.rs:29-55
+# ---------------------------------------------------------------------------
+
+enum AgnosaiProcCfgOff {
+    AGN_PRC_EXECUTABLE = 0;
+    AGN_PRC_ARGS = 8;
+    AGN_PRC_WORK_DIR = 16;
+    AGN_PRC_TIMEOUT_MS = 24;
+    AGN_PRC_ENV = 32;
+    AGN_PRC_CLEAN_ENV = 40;
+    AGN_PRC_SIZE = 48;
+}
+
+# The oracle's `Default` — `/bin/sh -c`, 30 s, inherit everything.
+#
+# `work_dir: None` is a 0 here, which is what `spawn` already reads as "inherit
+# the parent's directory".
+fn agnosai_process_config_default(): i64 {
+    var c = alloc(AGN_PRC_SIZE);
+    store64(c + AGN_PRC_EXECUTABLE, str_from("/bin/sh"));
+    var args = vec_new();
+    vec_push(args, str_from("-c"));
+    store64(c + AGN_PRC_ARGS, args);
+    store64(c + AGN_PRC_WORK_DIR, 0);
+    store64(c + AGN_PRC_TIMEOUT_MS, 30 * 1000);
+    store64(c + AGN_PRC_ENV, vec_new());
+    store64(c + AGN_PRC_CLEAN_ENV, 0);
+    return c;
+}
+
+# `ProcessSandbox::shell(timeout)` — `process.rs:73-80`.
+#
+# The default with the deadline replaced, which is the whole of what the oracle
+# does; `manager.rs:101` builds every process-isolated sandbox this way.
+fn agnosai_process_config_shell(timeout_ms): i64 {
+    var c = agnosai_process_config_default();
+    store64(c + AGN_PRC_TIMEOUT_MS, timeout_ms);
+    return c;
+}
+
+# The executable every `agnosai_process_execute` invokes.
+fn agnosai_process_config_executable(c): Str { return load64(c + AGN_PRC_EXECUTABLE); }
+
+# Set the executable `agnosai_process_execute` invokes.
+#
+# Ignored by `agnosai_process_execute_argv`, which takes its program from
+# `argv[0]` exactly as the oracle's `Command::new(argv[0])` does.
+fn agnosai_process_config_set_executable(c, path: Str): i64 {
+    store64(c + AGN_PRC_EXECUTABLE, path);
+    return 0;
+}
+
+# Static arguments placed before the command — `["-c"]` by default.
+fn agnosai_process_config_args(c): i64 { return load64(c + AGN_PRC_ARGS); }
+
+# Replace the static arguments placed before the command.
+#
+# Emptying this turns `execute` into a direct invocation of `executable` with
+# the command as its only argument - no shell, and no `-c`.
+fn agnosai_process_config_set_args(c, args): i64 {
+    store64(c + AGN_PRC_ARGS, args);
+    return 0;
+}
+
+# The child's working directory, or 0 to inherit the parent's.
+fn agnosai_process_config_work_dir(c): i64 { return load64(c + AGN_PRC_WORK_DIR); }
+
+# Set the child's working directory, or 0 to inherit the parent's.
+#
+# Applied in the child between `fork` and `execve`. A directory that cannot be
+# entered fails the spawn rather than running the child somewhere else.
+fn agnosai_process_config_set_work_dir(c, dir): i64 {
+    store64(c + AGN_PRC_WORK_DIR, dir);
+    return 0;
+}
+
+# Wall-clock milliseconds before the child is SIGKILLed.
+fn agnosai_process_config_timeout_ms(c): i64 { return load64(c + AGN_PRC_TIMEOUT_MS); }
+
+# Set the wall-clock deadline, in milliseconds, after which the child is
+# SIGKILLed.
+#
+# `AGNOSAI_SPAWN_NO_TIMEOUT` disables it, which no sandbox should do - the
+# oracle has no untimed path and the manager always passes one
+# (`manager.rs:80-83`).
+fn agnosai_process_config_set_timeout_ms(c, ms): i64 {
+    store64(c + AGN_PRC_TIMEOUT_MS, ms);
+    return 0;
+}
+
+# Environment entries applied on top of the base, as `NAME=value` strings.
+fn agnosai_process_config_env(c): i64 { return load64(c + AGN_PRC_ENV); }
+
+# Set one variable for the child, replacing any earlier entry of that name.
+#
+# The oracle holds `Vec<(String, String)>` and applies it through
+# `cmd.env(k, v)`, which is last-write-wins per name. Joining to `NAME=value`
+# here keeps one representation all the way to `execve`, and the replace makes
+# a second `set` of the same name behave the way `cmd.env` does rather than
+# silently leaving two entries for the child to pick between.
+fn agnosai_process_config_set_env(c, name: Str, value: Str): i64 {
+    var entry = str_cat(str_cat(name, str_from("=")), value);
+    var env = load64(c + AGN_PRC_ENV);
+    var i = 0;
+    while (i < vec_len(env)) {
+        if (str_eq(_agnosai_env_str_name(vec_get(env, i)), name) == 1) {
+            vec_set(env, i, entry);
+            return 0;
+        }
+        i = i + 1;
+    }
+    vec_push(env, entry);
+    return 0;
+}
+
+# Whether the inherited environment is cleared before `env` is applied.
+fn agnosai_process_config_clean_env(c): i64 { return load64(c + AGN_PRC_CLEAN_ENV); }
+
+# Clear the inherited environment before the configured variables are applied.
+#
+# The oracle's `env_clear` (`process.rs:204`). The child then sees only what
+# `agnosai_process_config_set_env` put there, plus whatever the program
+# invents for itself - a POSIX shell assigns its own `PATH`, for instance.
+fn agnosai_process_config_set_clean_env(c, on): i64 {
+    store64(c + AGN_PRC_CLEAN_ENV, on);
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# The child's environment
+# ---------------------------------------------------------------------------
+
+# The configured `work_dir` as a NUL-terminated path, or 0 to inherit.
+#
+# `chdir` reads a C string, and a `Str` built by `str_cat` is not one — its
+# bytes are not followed by a NUL. Passing `str_data` directly would hand the
+# kernel whatever bytes came next in the arena.
+fn _agnosai_process_work_dir_cstr(c): i64 {
+    var d = load64(c + AGN_PRC_WORK_DIR);
+    if (d == 0) { return 0; }
+    return str_cstr(d);
+}
+
+# Build the child's `envp` the way the oracle's `Command` would.
+#
+# The order is the oracle's, and the order is the whole of the semantics
+# (`process.rs:194-208`): sanitize, then `env_clear` if asked, then apply the
+# configured variables.
+#
+# **The configured variables are NOT filtered, and that is deliberate.**
+# `cmd.env(k, v)` runs *after* `env_remove`, so an operator who sets
+# `LD_LIBRARY_PATH` in config gets it — the sanitization exists to stop an
+# **ambient** variable from following a request into a sandboxed child, not to
+# overrule the operator who configured the sandbox. Reading it as a blanket ban
+# would break the legitimate case (a tool shipping its own `.so` files) while
+# protecting nothing an attacker can reach: `config.env` comes from the
+# manager, and `manager.rs:101` never sets it.
+#
+# That is also the standing condition on this function. A `config` built from
+# tool-controlled input would turn the escape hatch into an injection vector,
+# so config must stay operator-owned.
+fn _agnosai_process_envp(c): i64 {
+    var base = vec_new();
+    if (load64(c + AGN_PRC_CLEAN_ENV) == 0) {
+        var src = _read_environ_envp();
+        var i = 0;
+        while (src != 0 && load64(src + i * 8) != 0) {
+            var e = load64(src + i * 8);
+            if (agnosai_env_entry_is_sanitized(e) == 0) { vec_push(base, str_from(e)); }
+            i = i + 1;
+        }
+    }
+
+    var env = load64(c + AGN_PRC_ENV);
+    var j = 0;
+    while (j < vec_len(env)) {
+        var entry = vec_get(env, j);
+        var name = _agnosai_env_str_name(entry);
+        var k = 0;
+        var placed = 0;
+        while (k < vec_len(base)) {
+            if (str_eq(_agnosai_env_str_name(vec_get(base, k)), name) == 1) {
+                vec_set(base, k, entry);
+                placed = 1;
+                k = vec_len(base);
+            }
+            k = k + 1;
+        }
+        if (placed == 0) { vec_push(base, entry); }
+        j = j + 1;
+    }
+
+    return _agnosai_envp_build(base);
+}
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+# Turn a finished spawn into a `ProcessResult`, or an error if it never ran.
+#
+# **The timeout arm discards the partial output, and that is parity, not
+# policy.** The oracle's `Err(_)` branch returns `String::new()` for both
+# streams (`process.rs:154-160`) because cancelling `wait_with_output` throws
+# the buffers away — it never had them to return. `spawn` does have them, so the
+# blanking is explicit here rather than implicit there.
+fn _agnosai_process_finish(sp, what: Str, out_err): i64 {
+    if (agnosai_spawn_status(sp) == AGNOSAI_SPAWN_FAILED) {
+        var why = str_from("failed to spawn ");
+        if (agnosai_spawn_fail_reason(sp) == AGNOSAI_SPAWN_FAIL_CHDIR) {
+            why = str_from("failed to enter the working directory for ");
+        }
+        store64(out_err, agnosai_error_sandbox(str_cat(why, what)));
+        return 0;
+    }
+
+    if (agnosai_spawn_timed_out(sp) == 1) {
+        var m = str_cat(str_from("sandboxed process timed out, killing: "), what);
+        sakshi_warn(str_data(m), str_len(m));
+        return agnosai_process_result_new(str_from(""), str_from(""), 0 - 1, 1);
+    }
+
+    return agnosai_process_result_new(agnosai_spawn_stdout(sp), agnosai_spawn_stderr(sp),
+    agnosai_spawn_exit_code(sp), 0);
+}
+
+# Run a program directly with explicit arguments, bypassing the shell.
+#
+# `ProcessSandbox::execute_argv` — `process.rs:84-164`. This is the safe entry
+# point for untrusted input: `argv` reaches `execve` as a vector, so no shell
+# ever parses it and no metacharacter can mean anything.
+#
+# **`argv[0]` is the executable, not `config.executable`.** The oracle builds
+# `Command::new(argv[0])` here and ignores both `config.executable` and
+# `config.args` (`process.rs:100-104`) — only `work_dir`, `clean_env`, `env`
+# and `timeout` are taken from the config. A version that prepended
+# `config.args` would silently turn a bypass-the-shell call back into
+# `sh -c <argv[0]>`.
+#
+# Returns 0 with `out_err` set on failure.
+fn agnosai_process_execute_argv(c, argv, input: Str, out_err): i64 {
+    if (vec_len(argv) == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from("empty argv")));
+        return 0;
+    }
+
+    var exe = vec_get(argv, 0);
+    var raw = alloc((vec_len(argv) + 1) * 8);
+    var i = 0;
+    while (i < vec_len(argv)) {
+        store64(raw + i * 8, str_cstr(vec_get(argv, i)));
+        i = i + 1;
+    }
+    store64(raw + vec_len(argv) * 8, 0);
+
+    var dm = str_cat(str_from("spawning sandboxed process (argv mode): "), exe);
+    sakshi_debug(str_data(dm), str_len(dm));
+
+    var sp = agnosai_spawn_capture_input(str_cstr(exe), raw, _agnosai_process_envp(c), input,
+    load64(c + AGN_PRC_TIMEOUT_MS), _agnosai_process_work_dir_cstr(c));
+    return _agnosai_process_finish(sp, exe, out_err);
+}
+
+# Run a command string through the configured executable.
+#
+# `ProcessSandbox::execute` — `process.rs:172-247`. The command is appended
+# after `config.args`, so for the default config this is `sh -c <command>`.
+#
+# **The shell interprets the command.** The oracle carries this warning
+# (`process.rs:170-172`) and it is repeated because it is the difference
+# between the two entry points: anything reaching here from a tool, a model or
+# a request body belongs in `agnosai_process_execute_argv` instead.
+#
+# Returns 0 with `out_err` set on failure.
+fn agnosai_process_execute(c, command: Str, input: Str, out_err): i64 {
+    var exe = load64(c + AGN_PRC_EXECUTABLE);
+    var args = load64(c + AGN_PRC_ARGS);
+
+    var raw = alloc((vec_len(args) + 3) * 8);
+    store64(raw, str_cstr(exe));
+    var i = 0;
+    while (i < vec_len(args)) {
+        store64(raw + (i + 1) * 8, str_cstr(vec_get(args, i)));
+        i = i + 1;
+    }
+    store64(raw + (vec_len(args) + 1) * 8, str_cstr(command));
+    store64(raw + (vec_len(args) + 2) * 8, 0);
+
+    var dm = str_cat(str_from("spawning sandboxed process: "), exe);
+    sakshi_debug(str_data(dm), str_len(dm));
+
+    var sp = agnosai_spawn_capture_input(str_cstr(exe), raw, _agnosai_process_envp(c), input,
+    load64(c + AGN_PRC_TIMEOUT_MS), _agnosai_process_work_dir_cstr(c));
+    return _agnosai_process_finish(sp, exe, out_err);
+}

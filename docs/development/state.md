@@ -201,11 +201,11 @@ Standing decisions that shaped the port, each with its record:
 
 ## Tests
 
-**61 suites, 4,015 assertions, all passing.** Coverage `cyrius coverage --min 80`
+**62 suites, 4,130 assertions, all passing.** Coverage `cyrius coverage --min 80`
 → **100% (899/899 fns)**, 64/64 files referenced.
 
 ```sh
-cyrius tests tests        # 61 suites; each prints "N passed" with an "(N total)" suffix
+cyrius tests tests        # 62 suites; each prints "N passed" with an "(N total)" suffix
 cyrius coverage --min 80  # its own CI step — `cyrius audit` does not run it
 ```
 
@@ -215,7 +215,7 @@ caught it said to *regenerate from command output rather than editing rows by
 hand*. A table that can only be maintained by hand will drift again, so the two
 commands above are the authority. Counting gotcha if you sum by hand:
 `cyrius tests tests` prints one line **per suite** carrying an `(N total)` suffix,
-plus a final `61 passed, 0 failed` line that counts **suites, not assertions** —
+plus a final `62 passed, 0 failed` line that counts **suites, not assertions** —
 sum only the suffixed lines.
 
 Corpus size: **807 KB** of `tests/`, against the **1,048,575-byte** coverage cliff

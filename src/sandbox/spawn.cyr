@@ -112,6 +112,22 @@ fn _agnosai_env_entry_name(entry): Str {
     return str_new(entry, i);
 }
 
+# The `NAME` half of a `NAME=value` **Str**.
+#
+# The sibling above walks a raw `char*` from `environ`; this one walks a `Str`,
+# whose bytes carry no NUL and whose first eight bytes are a length, not text.
+# Handing a `Str` to the cstr version reads the header as characters.
+fn _agnosai_env_str_name(s: Str): Str {
+    var d = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        if (load8(d + i) == 61) { return str_new(d, i); }
+        i = i + 1;
+    }
+    return s;
+}
+
 # Whether this environ entry must not reach a sandboxed child.
 #
 # Compares the **name only** — see the module header on why the value must not
@@ -164,19 +180,37 @@ fn agnosai_sanitized_envp(): i64 {
 # sanitizer that only covers the inherited case is one an attacker routes
 # around by supplying the variable instead.
 fn agnosai_sanitized_envp_from(entries): i64 {
-    var n = vec_len(entries);
-    var out = alloc((n + 1) * 8);
-    var oi = 0;
+    var kept = vec_new();
     var i = 0;
-    while (i < n) {
-        var e = str_data(vec_get(entries, i));
-        if (agnosai_env_entry_is_sanitized(e) == 0) {
-            store64(out + oi * 8, e);
-            oi = oi + 1;
-        }
+    while (i < vec_len(entries)) {
+        var e = vec_get(entries, i);
+        if (agnosai_env_entry_is_sanitized(str_data(e)) == 0) { vec_push(kept, e); }
         i = i + 1;
     }
-    store64(out + oi * 8, 0);
+    return _agnosai_envp_build(kept);
+}
+
+# A NUL-terminated `char**` from a vec of `NAME=value` strings, filtering
+# nothing.
+#
+# **Every entry is NUL-terminated individually**, which the array's own
+# terminator does not do for it.
+#
+# Measured: swapping `str_cstr` for the raw `str_data` the earlier version used
+# changes nothing observable today — a `str_cat` result happens to be followed
+# by a zero byte, because the bump allocator hands out zeroed memory and never
+# reuses it. So this is not a fix for a live bug; it is a refusal to depend on
+# an allocator's incidental behaviour for a pointer handed to `execve`. The
+# copy costs one allocation per entry against a `fork` and an `exec`.
+fn _agnosai_envp_build(entries): i64 {
+    var n = vec_len(entries);
+    var out = alloc((n + 1) * 8);
+    var i = 0;
+    while (i < n) {
+        store64(out + i * 8, str_cstr(vec_get(entries, i)));
+        i = i + 1;
+    }
+    store64(out + n * 8, 0);
     return out;
 }
 
@@ -237,7 +271,8 @@ enum AgnosaiSpawnResultOff {
     AGN_SPR_EXIT_CODE = 24;
     AGN_SPR_SIGNAL = 32;
     AGN_SPR_TIMED_OUT = 40;
-    AGN_SPR_SIZE = 48;
+    AGN_SPR_FAIL_REASON = 48;
+    AGN_SPR_SIZE = 56;
 }
 
 # Whether the spawn itself succeeded — `AGNOSAI_SPAWN_OK` or `_FAILED`.
@@ -274,12 +309,34 @@ fn agnosai_spawn_signal(r): i64 { return load64(r + AGN_SPR_SIGNAL); }
 # blanking goes.
 fn agnosai_spawn_timed_out(r): i64 { return load64(r + AGN_SPR_TIMED_OUT); }
 
+# Which step failed, when `agnosai_spawn_status` is `AGNOSAI_SPAWN_FAILED`.
+#
+# `AGNOSAI_SPAWN_FAIL_NONE` on every successful spawn, including one whose child
+# exited non-zero — a program that ran and failed is not a spawn failure.
+fn agnosai_spawn_fail_reason(r): i64 { return load64(r + AGN_SPR_FAIL_REASON); }
+
 # How long an idle iteration waits before looking again.
 #
 # The floor on how fast output is noticed, and the granularity of the deadline.
 # 5 ms costs 200 wakeups a second against a child producing nothing, versus the
 # 100%-of-a-core the unslept loop measured.
 var AGNOSAI_SPAWN_IDLE_MS = 5;
+
+# What the child reported down the errno pipe before it gave up.
+#
+# The pipe already carried eight bytes that the parent read and discarded, so
+# naming them costs a single store and turns "spawn failed" — the only thing a
+# caller could previously learn — into something actionable. A bad `work_dir` is
+# an operator's typo, and reporting it as a generic exec failure sends them
+# looking at the wrong thing.
+var AGNOSAI_SPAWN_FAIL_NONE = 0;
+var AGNOSAI_SPAWN_FAIL_EXEC = 1;
+var AGNOSAI_SPAWN_FAIL_CHDIR = 2;
+
+# The parent could not set the spawn up at all — a pipe, the `FD_CLOEXEC` mark,
+# or `fork` itself failed. No child exists, so nothing was reported down the
+# errno pipe and the reason is filled in on the parent side.
+var AGNOSAI_SPAWN_FAIL_SETUP = 3;
 
 # No deadline — run until the child finishes on its own.
 var AGNOSAI_SPAWN_NO_TIMEOUT = 0;
@@ -316,6 +373,8 @@ fn _agnosai_spawn_failure(): i64 {
     store64(r + AGN_SPR_STDERR, str_from(""));
     store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
     store64(r + AGN_SPR_SIGNAL, 0);
+    store64(r + AGN_SPR_TIMED_OUT, 0);
+    store64(r + AGN_SPR_FAIL_REASON, AGNOSAI_SPAWN_FAIL_SETUP);
     return r;
 }
 
@@ -339,7 +398,7 @@ fn _agnosai_spawn_failure(): i64 {
 #
 # **The write interleaves with the reads.** Writing the whole input first is
 # what the oracle does and what deadlocks here — see the module header.
-fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms): i64 {
+fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_dir): i64 {
     var ip[8];
     var op[8];
     var ep[8];
@@ -369,9 +428,22 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms): i64 {
         sys_close(orf);
         sys_close(erf);
         sys_close(xrf);
+        # `work_dir` is applied HERE and not in the parent: a parent-side chdir
+        # would move the whole server, every later relative path with it. A
+        # failure must not fall through to `execve` — running the child in the
+        # wrong directory is the bug this prevents — so it reports on the same
+        # errno pipe and exits.
+        if (work_dir != 0) {
+            if (syscall(SYS_CHDIR, work_dir) < 0) {
+                var ce[8];
+                store64(&ce, AGNOSAI_SPAWN_FAIL_CHDIR);
+                sys_write(xwf, &ce, 8);
+                syscall(SYS_EXIT_GROUP, 127);
+            }
+        }
         sys_execve(path, argv, envp);
         var e[8];
-        store64(&e, 1);
+        store64(&e, AGNOSAI_SPAWN_FAIL_EXEC);
         sys_write(xwf, &e, 8);
         syscall(SYS_EXIT_GROUP, 127);
     }
@@ -463,6 +535,7 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms): i64 {
         store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_FAILED);
         store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
         store64(r + AGN_SPR_SIGNAL, 0);
+        store64(r + AGN_SPR_FAIL_REASON, load64(&xb));
         return r;
     }
 
@@ -491,6 +564,6 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms): i64 {
 # **inherited** from the parent, where the oracle pipes stdin on every spawn it
 # makes (`process.rs:109`, `:189`) — a sandboxed tool could have read the
 # server's own stdin. One implementation cannot drift from itself.
-fn agnosai_spawn_capture(path, argv, envp, timeout_ms): i64 {
-    return agnosai_spawn_capture_input(path, argv, envp, str_from(""), timeout_ms);
+fn agnosai_spawn_capture(path, argv, envp, timeout_ms, work_dir): i64 {
+    return agnosai_spawn_capture_input(path, argv, envp, str_from(""), timeout_ms, work_dir);
 }

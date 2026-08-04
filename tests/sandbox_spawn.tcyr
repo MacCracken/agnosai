@@ -154,7 +154,7 @@ fn _t_sh(script): i64 {
     store64(argv + 8, "-c");
     store64(argv + 16, script);
     store64(argv + 24, 0);
-    return agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT);
+    return agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
 }
 
 fn _t_sp_capture_basics(): i64 {
@@ -182,7 +182,7 @@ fn _t_sp_failure_vs_exit_127(): i64 {
     var argv = alloc(16);
     store64(argv, "/nonexistent/binary");
     store64(argv + 8, 0);
-    var bad = agnosai_spawn_capture("/nonexistent/binary", argv, agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT);
+    var bad = agnosai_spawn_capture("/nonexistent/binary", argv, agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
     "a missing executable is a SPAWN FAILURE, not exit 127 — three oracle sites need this");
     assert(agnosai_spawn_status(bad) != agnosai_spawn_status(real),
@@ -251,7 +251,7 @@ fn _t_sh_in(script, input): i64 {
     store64(argv + 8, "-c");
     store64(argv + 16, script);
     store64(argv + 24, 0);
-    return agnosai_spawn_capture_input("/bin/sh", argv, agnosai_sanitized_envp(), input, AGNOSAI_SPAWN_NO_TIMEOUT);
+    return agnosai_spawn_capture_input("/bin/sh", argv, agnosai_sanitized_envp(), input, AGNOSAI_SPAWN_NO_TIMEOUT, 0);
 }
 
 fn _t_sp_stdin_basics(): i64 {
@@ -310,7 +310,7 @@ fn _t_sp_stdin_keeps_the_contract(): i64 {
     store64(argv, "/nonexistent/binary");
     store64(argv + 8, 0);
     var bad = agnosai_spawn_capture_input("/nonexistent/binary", argv,
-    agnosai_sanitized_envp(), str_from("ignored"), AGNOSAI_SPAWN_NO_TIMEOUT);
+    agnosai_sanitized_envp(), str_from("ignored"), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
     "spawn failure is still distinguishable when input was supplied");
     return 0;
@@ -347,7 +347,7 @@ fn _t_sp_deadline(script, ms): i64 {
     store64(argv + 8, "-c");
     store64(argv + 16, script);
     store64(argv + 24, 0);
-    return agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(), ms);
+    return agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(), ms, 0);
 }
 
 fn _t_sp_timeout_kills(): i64 {
@@ -438,6 +438,54 @@ fn _t_sp_idle_child_does_not_burn_the_cpu(): i64 {
     return 0;
 }
 
+# --- work_dir ------------------------------------------------------------
+
+fn _t_sp_work_dir(): i64 {
+    var argv = alloc(32);
+    store64(argv, "/bin/sh");
+    store64(argv + 8, "-c");
+    store64(argv + 16, "pwd");
+    store64(argv + 24, 0);
+
+    # `/tmp` is the one directory guaranteed to exist and differ from cwd.
+    var r = agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(),
+    AGNOSAI_SPAWN_NO_TIMEOUT, "/tmp");
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "a child runs in a work_dir");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "/tmp") == 1,
+    "...and it is the directory the child reports");
+
+    # **The PARENT must not have moved.** A chdir on the parent side would
+    # relocate the whole server, and every later relative path with it.
+    var here = agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(),
+    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+    assert(str_contains_cstr(agnosai_spawn_stdout(here), "/tmp") == 0,
+    "the next spawn with NO work_dir is unaffected - the parent never moved");
+
+    # A work_dir that does not exist must not silently run in the wrong place.
+    var bad = agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(),
+    AGNOSAI_SPAWN_NO_TIMEOUT, "/nonexistent/work/dir");
+    assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
+    "a missing work_dir FAILS the spawn rather than running somewhere else");
+    assert(agnosai_spawn_fail_reason(bad) == AGNOSAI_SPAWN_FAIL_CHDIR,
+    "...and says it was the chdir, not the exec - an operator typo is findable");
+    return 0;
+}
+
+fn _t_sp_fail_reason(): i64 {
+    var argv = alloc(16);
+    store64(argv, "/nonexistent/binary");
+    store64(argv + 8, 0);
+    var bad = agnosai_spawn_capture("/nonexistent/binary", argv,
+    agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+    assert(agnosai_spawn_fail_reason(bad) == AGNOSAI_SPAWN_FAIL_EXEC,
+    "a missing executable reports EXEC, distinct from a bad work_dir");
+
+    var ok = _t_sh("exit 7");
+    assert(agnosai_spawn_fail_reason(ok) == AGNOSAI_SPAWN_FAIL_NONE,
+    "a program that RAN and exited non-zero is not a spawn failure");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -461,6 +509,8 @@ fn main(): i64 {
     _t_sp_deadline_lets_fast_children_finish();
     _t_sp_timeout_keeps_partial_output();
     _t_sp_idle_child_does_not_burn_the_cpu();
+    _t_sp_work_dir();
+    _t_sp_fail_reason();
 
     return assert_summary();
 }

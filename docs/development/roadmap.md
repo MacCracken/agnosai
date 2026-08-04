@@ -214,8 +214,12 @@ handler cost bounded and measured" until that filing lands.
 
 ### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
 
-**Bites 1-7 done (2026-08-04). The spawn primitive is complete** — `process`,
-`oci`'s exec half, `python` and `manager` all build directly on it.
+**Bites 1-8 done (2026-08-04).** Bite 8: `process` — `ProcessSandbox`, all nine
+oracle tests ported, and the first consumer of the spawn primitive. It needed two
+additions there: `work_dir` (applied in the child, failing the spawn rather than
+running it elsewhere) and a failure reason carried on the errno pipe bytes the
+parent already read and threw away. `oci`'s exec half, `python` and `manager`
+follow on the same primitive.
 
 Bite 7: the deadline. Cyrius has no `kill_on_drop`, so `_agnosai_spawn_kill_and_reap`
 does by hand what tokio does on drop; a child that ignores SIGTERM proves why the

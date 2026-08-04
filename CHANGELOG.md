@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`envp` entries are NUL-terminated individually rather than by luck.**
+  `_agnosai_envp_build` handed `execve` each entry's raw `str_data`, which is
+  not a C string — a `str_cat`-built entry's bytes are followed by whatever the
+  arena holds next. **Measured: this changes nothing observable today**, because
+  the bump allocator serves zeroed memory and never reuses it, so the byte after
+  every entry happens to be 0. It is fixed as a latent defect, not a live one:
+  a pointer passed to `execve` should not depend on an allocator's incidental
+  behaviour. Both the mutation and the probe are recorded because the mutation
+  *passes* — this is one of the few changes here with no test that can fail
+  without it.
+
 - **Pinned kavach 3.11.1, which closes a Landlock hole agnosai found and fixed.**
   `security_apply_landlock` named only **3 of Landlock's 13 filesystem rights**
   in `handled_access_fs`, and Landlock permits every right it is not told to
@@ -30,6 +41,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real, and is mutation-verified against the three-right mask.
 
 ### Added
+
+- **M7 bite 8 — `sandbox/process`: the subprocess sandbox.** All nine oracle
+  tests ported (`process.rs:250-366`), 108 assertions in the suite. This is the
+  backend `IsolationLevel::Process` resolves to, and the first consumer of the
+  finished spawn primitive.
+
+  **`work_dir` and a failure reason were added to `spawn` to serve it.** The
+  `chdir` happens in the child between `fork` and `execve` — a parent-side one
+  would relocate the whole server — and a directory that cannot be entered fails
+  the spawn instead of running the child somewhere else. The errno pipe already
+  carried eight bytes the parent read and discarded; naming them distinguishes a
+  bad `work_dir` from a missing executable, so an operator's typo no longer
+  reports as a generic exec failure.
+
+  **The timeout arm discards partial output, deliberately.** The oracle returns
+  `String::new()` for both streams (`process.rs:154-160`) because cancelling
+  `wait_with_output` throws the buffers away. The spawn primitive *has* them, so
+  the blanking is explicit at this layer rather than implicit below it.
+
+  Six mutations, five caught: keeping the partial output on timeout, taking the
+  executable from config in argv mode, dropping the empty-argv guard (aborts on
+  `vec: index out of bounds`), applying `config.env` before the base instead of
+  over it, and ignoring `clean_env`. The sixth is recorded under Fixed.
 
 - **M7 bite 7 — the spawn deadline: SIGKILL, reap, and an idle loop.** 132
   assertions in the suite; `agnosai_spawn_capture` and
@@ -64,6 +98,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the deadline is checked on. Same probe after the fix: **0% CPU**. The test
   compares the parent's own `CLOCK_PROCESS_CPUTIME_ID` against the wall time it
   waited, so removing the sleep fails rather than merely slowing things down.
+
+- **`agnosai_process_config_set_env` read a `Str` as a C string.** The
+  `NAME=value` splitter it reused walks a raw `char*` from `environ`; handed a
+  `Str`, it read the 8-byte length header as characters, so setting the same
+  variable twice appended a duplicate instead of replacing it and the child got
+  two entries to choose between. A `Str`-shaped sibling now sits beside the
+  cstr one.
 
 - **A sandboxed child inherited the server's stdin.** `agnosai_spawn_capture` was
   a second copy of the drain loop that never touched fd 0, where the oracle pipes
