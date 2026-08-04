@@ -234,8 +234,10 @@ small:
   ran. Both are kavach-side; neither is worked around here.
 - **cx, compile half — done, bite 13 (2026-08-04).** `cycc_cx` through the spawn
   primitive, float-literal rejection, `.cyx` validation.
-- 🟡 **cx, execution half — UNBLOCKED (kavach 3.11.3, 2026-08-04).** The gate
-  below now passes; what remains is the agnosai-side runner. History kept
+- ✅ **cx, execution half — done, bite 14 (2026-08-04).** `agnosai_cx_run`
+  spawns `cxvm` through `persistent_spawn_confined` under a landlock policy
+  allowing only the interpreter's own directory, with an agnosai-side deadline.
+  **ADR-006's acceptance test is a suite assertion and passes.** History kept
   because the premise it tested is the milestone's whole security argument:
 - ~~🔴 **BLOCKED on kavach**~~ ADR-006's premise is that
   "kavach's seccomp + landlock *are* the security boundary", because `cxvm`
@@ -269,7 +271,10 @@ small:
   confined run looked like an escape. Probes must report the raw syscall return,
   not a comparison.
 
-  The runner is the next bite, and none of it is faked: ADR-006's hard requirement
+  **Still open, and named rather than implied**: no network isolation for a
+  rootfs-less sandbox (kavach ties namespaces to rootfs), no enforced
+  `timeout_ms` inside kavach, and no payload exit code from a non-confining
+  policy. None of it is faked: ADR-006's hard requirement
   is that "no code path may execute a `.cyx` outside a kavach sandbox — a `cxvm`
   spawn that is not wrapped is a full sandbox escape, not a degraded one."
 - **The cx confinement bites (B14-B15)** — `wasm.rs`'s successor per

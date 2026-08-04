@@ -30,7 +30,19 @@
 # `43 59 58 01` — `CYX` followed by a **format version**, not a NUL. Checking
 # for the ADR's spelling would reject every real `.cyx`.
 #
-# ## The execution half is blocked on kavach, and must not be faked
+# ## The execution half runs `cxvm` inside a kavach sandbox, never outside one
+#
+# ADR-006's hard requirement: "no code path may execute a `.cyx` outside a
+# kavach sandbox — a `cxvm` spawn that is not wrapped is a full sandbox escape,
+# not a degraded one." `agnosai_cx_run` is the only runner, and it has no
+# unconfined branch: there is no flag, no fallback, and no path that reaches
+# `cxvm` without `persistent_spawn_confined` and a policy.
+#
+# **Verified, both directions** (2026-08-04, kavach 3.11.3). A `.cyx` calling
+# `open("/etc/passwd")` and reporting the raw syscall return gets **fd 3** under
+# a bare `cxvm` and **EACCES** through this runner.
+#
+# ## Historical: the execution half was blocked on kavach
 #
 # ADR-006's premise is that "kavach's seccomp + landlock *are* the security
 # boundary", because `cxvm` dispatches guest syscalls straight to the host
@@ -40,13 +52,10 @@
 # `open("/etc/passwd")` **succeeded** through the persistent channel — which is
 # the ADR's own acceptance test, failing.
 #
-# Filed as
-# `kavach/docs/development/issues/2026-08-04-neither-exec-path-applies-seccomp-or-landlock-without-a-rootfs.md`.
-# **No `cxvm` spawn is implemented here until that lands.** ADR-006 states the
-# rule this obeys: "no code path may execute a `.cyx` outside a kavach sandbox —
-# a `cxvm` spawn that is not wrapped is a full sandbox escape, not a degraded
-# one." Shipping the runner against an unconfining kavach would satisfy the
-# letter of the milestone and none of its purpose.
+# Filed and **fixed in kavach 3.11.3**, which is the floor this module requires:
+# confinement routed on the policy rather than the rootfs, a real landlock rule
+# API, and `persistent_spawn_confined`. Against 3.11.2 or earlier the runner
+# below would spawn `cxvm` with full ambient authority.
 # =========================================================================
 
 # The compiler that turns Cyrius source into cx bytecode.
@@ -208,4 +217,177 @@ fn agnosai_cx_compile(source: Str, out_err): i64 {
         return 0;
     }
     return cyx;
+}
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+# The bytecode interpreter. A bare name, resolved on `PATH`.
+var AGNOSAI_CX_INTERPRETER = "cxvm";
+
+# How often the drain loop looks again while a guest is running.
+var AGNOSAI_CX_POLL_MS = 5;
+
+# The default wall-clock budget for a tool.
+#
+# **This is the only CPU bound cx has.** ADR-006 accepts losing wasmtime's fuel
+# metering — deterministic instruction budgets — because a wall-clock timeout
+# remains, so a tool can burn its whole budget spinning and that is a known,
+# accepted cost. Losing the timeout too would leave no bound at all.
+var AGNOSAI_CX_TIMEOUT_MS = 30 * 1000;
+
+enum AgnosaiCxResultOff {
+    AGN_CXR_STDOUT = 0;
+    AGN_CXR_EXIT_CODE = 8;
+    AGN_CXR_TIMED_OUT = 16;
+    AGN_CXR_SIZE = 24;
+}
+
+# A finished guest run.
+fn agnosai_cx_result_new(stdout: Str, exit_code, timed_out): i64 {
+    var r = alloc(AGN_CXR_SIZE);
+    store64(r + AGN_CXR_STDOUT, stdout);
+    store64(r + AGN_CXR_EXIT_CODE, exit_code);
+    store64(r + AGN_CXR_TIMED_OUT, timed_out);
+    return r;
+}
+
+# What the guest wrote to stdout.
+#
+# The only result channel. `cxvm` takes the bytecode on stdin, so that direction
+# is consumed, and `persistent_spawn` sends the guest's stderr to `/dev/null` —
+# a tool reports by writing stdout and by its exit code, nothing else.
+fn agnosai_cx_result_stdout(r): Str { return load64(r + AGN_CXR_STDOUT); }
+
+# The guest's exit code, or -1 when it was killed.
+fn agnosai_cx_result_exit_code(r): i64 { return load64(r + AGN_CXR_EXIT_CODE); }
+
+# Whether the deadline fired.
+fn agnosai_cx_result_timed_out(r): i64 { return load64(r + AGN_CXR_TIMED_OUT); }
+
+# The absolute path of `cxvm`, or 0 when it is not installed.
+#
+# **Absolute, because kavach will not resolve it.** `persistent_spawn` execs
+# `args[0]` directly with no `PATH` search, so a bare `"cxvm"` fails to spawn on
+# a machine that has it. The search reuses the spawn primitive's resolver.
+fn agnosai_cx_interpreter_path(): i64 {
+    return _agnosai_spawn_resolve(AGNOSAI_CX_INTERPRETER, agnosai_sanitized_envp());
+}
+
+# The directory holding `cxvm`, as a `Str`.
+fn _agnosai_cx_interpreter_dir(path): Str {
+    var n = 0;
+    while (load8(path + n) != 0) { n = n + 1; }
+    var cut = n;
+    while (cut > 0 && load8(path + cut - 1) != 47) { cut = cut - 1; }
+    if (cut <= 1) { return str_from("/"); }
+    return str_new(path, cut - 1);
+}
+
+# The kavach policy every `.cyx` runs under.
+#
+# **Landlock allows the interpreter's own directory and nothing else.** Not
+# `deny_all`, which is stronger and useless: measured 2026-08-04, a total-deny
+# ruleset stops the child opening `cxvm` itself, so the guest exits 127 having
+# never run — a refused *exec* that reads exactly like a refused *open*, which
+# is the shape of a test that passes for the wrong reason.
+#
+# Everything else is denied, and the guest needs nothing else: it receives its
+# bytecode on an already-open stdin, and landlock does not restrict descriptors
+# that were open before it was applied.
+#
+# seccomp is on. Network isolation is **not** claimed — kavach applies
+# namespaces only to rootfs-bearing sandboxes, and this one has no rootfs, so a
+# guest can still reach the network. That is the honest state and the next
+# thing to close.
+fn agnosai_cx_policy(interpreter_dir: Str): i64 {
+    var p = policy_basic();
+    policy_landlock_add(p, str_cstr(interpreter_dir), FS_READ_ONLY);
+    return p;
+}
+
+# Run compiled cx bytecode inside a kavach sandbox.
+#
+# `cyx` is validated before anything is spawned — `agnosai_cx_compile` already
+# validates what it returns, and this re-checks because a caller may have got
+# its bytecode from somewhere else.
+#
+# The deadline is enforced **here**. kavach's persistent API takes no timeout,
+# and `SandboxConfig.timeout_ms` is ignored by every backend except WASM (filed
+# upstream), so a runner that delegated it would have no bound at all. On expiry
+# the guest is SIGKILLed and reaped by `persistent_terminate`.
+#
+# Returns 0 with `out_err` set when the interpreter is missing, the bytecode is
+# invalid, or the sandbox cannot be created.
+fn agnosai_cx_run(cyx: Str, timeout_ms, out_err): i64 {
+    if (agnosai_cx_validate(cyx) == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from("not valid cx bytecode")));
+        return 0;
+    }
+
+    var exe = agnosai_cx_interpreter_path();
+    if (exe == 0 || sys_access(exe, 1) != 0) {
+        store64(out_err, agnosai_error_sandbox(str_from(
+        "cxvm is not installed or not executable")));
+        return 0;
+    }
+
+    var pol = agnosai_cx_policy(_agnosai_cx_interpreter_dir(exe));
+    var g = persistent_spawn_confined(exe, pol);
+    if (g == 0) {
+        # **Never fall back to an unconfined spawn.** A sandbox that cannot be
+        # created is a refusal, not a reason to run the payload anyway.
+        store64(out_err, agnosai_error_sandbox(str_from(
+        "could not create a confined sandbox for cxvm")));
+        return 0;
+    }
+
+    # Feed the bytecode, then close stdin so the guest sees EOF and runs.
+    persistent_send(g, str_data(cyx), str_len(cyx));
+    sys_close(PersistentGuest_stdin_fd(g));
+
+    _agnosai_fd_set_nonblock(PersistentGuest_stdout_fd(g));
+
+    var deadline = 0;
+    if (timeout_ms > 0) { deadline = clock_now_ms() + timeout_ms; }
+
+    var ob = str_builder_new();
+    var buf = alloc(AGNOSAI_SPAWN_CHUNK);
+    var done = 0;
+    var killed = 0;
+
+    while (done == 0) {
+        var n = sys_read(PersistentGuest_stdout_fd(g), buf, AGNOSAI_SPAWN_CHUNK);
+        if (n > 0) { str_builder_add(ob, str_new(buf, n)); }
+        if (n == 0) { done = 1; }
+        if (n < 0) {
+            if (deadline > 0 && clock_now_ms() >= deadline) {
+                persistent_terminate(g);
+                killed = 1;
+                done = 1;
+            } else {
+                sleep_ms(AGNOSAI_CX_POLL_MS);
+            }
+        }
+    }
+
+    if (killed == 1) {
+        return agnosai_cx_result_new(str_from(""), 0 - 1, 1);
+    }
+
+    var st[8];
+    store64(&st, 0);
+    sys_waitpid(PersistentGuest_pid(g), &st, 0);
+    var raw = load64(&st);
+    var code = (raw >> 8) & 255;
+    if ((raw & 127) != 0) { code = 0 - 1; }
+    return agnosai_cx_result_new(str_builder_build(ob), code, 0);
+}
+
+# Compile tool source and run it, in one step.
+fn agnosai_cx_compile_and_run(source: Str, timeout_ms, out_err): i64 {
+    var cyx = agnosai_cx_compile(source, out_err);
+    if (cyx == 0) { return 0; }
+    return agnosai_cx_run(cyx, timeout_ms, out_err);
 }

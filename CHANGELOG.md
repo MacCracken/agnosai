@@ -42,6 +42,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 14 — `sandbox/cx`'s execution half: `.cyx` inside a kavach
+  sandbox.** `agnosai_cx_run` and `agnosai_cx_compile_and_run`, 62 assertions.
+  **ADR-006's acceptance test is now a suite assertion**, not a scratch probe: a
+  `.cyx` calling `open("/etc/passwd")` is refused.
+
+  **There is no unconfined branch.** ADR-006's hard requirement is that no code
+  path executes a `.cyx` outside a kavach sandbox, because `cxvm` dispatches
+  guest syscalls straight to the host kernel with no allowlist. The runner has
+  no flag and no fallback — a sandbox that cannot be created is a refusal, not a
+  reason to run the payload anyway. Mutation-verified: swapping
+  `persistent_spawn_confined` for `persistent_spawn` fails the gate.
+
+  **Landlock allows the interpreter's directory and nothing else — not
+  `deny_all`.** A total-deny ruleset stops the child opening `cxvm` itself, so
+  the guest exits 127 having never run: a refused *exec* that reads exactly like
+  a refused *open*. The gate test asserts `code != 127` for that reason, and the
+  `deny_all` mutation fails on it.
+
+  **The deadline is enforced here, not delegated.** kavach's persistent API
+  takes no timeout and `SandboxConfig.timeout_ms` is ignored by every backend
+  except WASM (filed upstream), so a runner that delegated would have no bound
+  at all — and a wall-clock bound is the *only* CPU bound cx has, fuel having
+  gone with wasmtime. Removing it hangs the suite.
+
+  Four mutations, all caught: unconfined spawn, `deny_all` instead of a rule,
+  no deadline (hangs), and skipping bytecode re-validation.
+
+  **Not claimed: network isolation.** kavach applies namespaces only to
+  rootfs-bearing sandboxes, and this one has no rootfs, so a guest can still
+  reach the network. Written into the module rather than left implied.
+
 - **M7 bite 13 — `sandbox/cx`: compiling tool source to cx bytecode.** 33
   assertions. The compile half of `wasm.rs`'s successor per ADR-006 — source in,
   `.cyx` out, through `cycc_cx`.
