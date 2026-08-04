@@ -214,7 +214,10 @@ handler cost bounded and measured" until that filing lands.
 
 ### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
 
-**Bites 1-8 done (2026-08-04).** Bite 8: `process` — `ProcessSandbox`, all nine
+**Bites 1-9 done (2026-08-04).** Bite 9: `oci`'s exec half — the argv bite 2
+built as a value, run through the spawn primitive. `python` and `manager` remain.
+
+ Bite 8: `process` — `ProcessSandbox`, all nine
 oracle tests ported, and the first consumer of the spawn primitive. It needed two
 additions there: `work_dir` (applied in the child, failing the spawn rather than
 running it elsewhere) and a failure reason carried on the errno pipe bytes the

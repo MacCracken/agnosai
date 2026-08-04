@@ -42,6 +42,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 9 — `sandbox/oci`'s exec half.** `agnosai_oci_execute` —
+  `OciSandbox::execute` (`oci.rs:106-187`) — 100 assertions in the suite. Bite 2
+  had already built the argv as a testable value, so this runs that argv through
+  the spawn primitive and maps the result.
+
+  **The runtime inherits the server's environment unfiltered, matching the
+  oracle.** `execute` has no `env_remove` loop: `SANITIZED_ENV_VARS` belongs to
+  the *subprocess* backends (`mod.rs:6`), and a container's environment comes
+  from `--env` arguments rather than inheritance. Filtering here would sanitize
+  the trusted `docker`/`podman` binary the operator installed and change nothing
+  about what the container sees.
+
+  **`timeout_secs` is the oracle's unit and the primitive takes milliseconds.**
+  A missing ×1000 would make every container time out a thousand times early;
+  the test asserts the elapsed deadline is a second, not a millisecond.
+
+  Four mutations, all caught: dropping the ×1000, keeping partial output on
+  timeout, treating a spawn failure as a normal result, and assembling a second
+  argv inside `execute` instead of using `build_argv` — which is how the
+  `--read-only`, `--tmpfs` and `--network=none` posture would silently vanish.
+
+  The suite writes a small stand-in runtime rather than assuming a container
+  runtime exists. The obvious substitutes do not work: `build_argv` puts
+  `run --rm -i ...` ahead of everything, so `cat` tries to open a file named
+  `run` and `sleep` rejects it as a bad operand.
+
 - **M7 bite 8 — `sandbox/process`: the subprocess sandbox.** All nine oracle
   tests ported (`process.rs:250-366`), 108 assertions in the suite. This is the
   backend `IsolationLevel::Process` resolves to, and the first consumer of the

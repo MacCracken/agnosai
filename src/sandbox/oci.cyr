@@ -318,3 +318,60 @@ fn agnosai_oci_result_exit_code(r): i64 { return load64(r + AGN_OCIR_EXIT_CODE);
 
 # Whether the wall-clock timeout fired.
 fn agnosai_oci_result_timed_out(r): i64 { return load64(r + AGN_OCIR_TIMED_OUT); }
+
+# --- Execution ------------------------------------------------------------
+
+# Run the container and capture its output — `OciSandbox::execute`,
+# `rust-old/src/sandbox/oci.rs:106-187`.
+#
+# The argv comes from `agnosai_oci_build_argv`, so what runs is exactly what a
+# test can read back; the rest is the same fork/exec/drain the process sandbox
+# uses. `config` must already have passed `agnosai_oci_sandbox_new`, which is
+# where an image reference is validated — running an unvalidated one is how a
+# `--privileged` "image" becomes a runtime flag.
+#
+# **The runtime inherits the server's environment unfiltered, matching the
+# oracle.** `execute` has no `env_remove` loop; `SANITIZED_ENV_VARS` is
+# described in `mod.rs:6` as belonging to the *subprocess* backends, and the
+# container's own environment is set through `--env` arguments rather than
+# inherited at all. Filtering here would sanitize the wrong process — the
+# trusted `docker`/`podman` binary the operator installed — and change nothing
+# about what the container sees.
+#
+# Returns 0 with `out_err` set when the runtime cannot be spawned.
+fn agnosai_oci_execute(config, entrypoint_args, input: Str, out_err): i64 {
+    var argv = agnosai_oci_build_argv(config, entrypoint_args);
+    var runtime = load64(config + AGN_OCI_RUNTIME);
+
+    var raw = alloc((vec_len(argv) + 1) * 8);
+    var i = 0;
+    while (i < vec_len(argv)) {
+        store64(raw + i * 8, str_cstr(vec_get(argv, i)));
+        i = i + 1;
+    }
+    store64(raw + vec_len(argv) * 8, 0);
+
+    var dm = str_cat(str_from("launching OCI container: "), load64(config + AGN_OCI_IMAGE));
+    sakshi_debug(str_data(dm), str_len(dm));
+
+    # `timeout_secs` is the oracle's unit; the primitive takes milliseconds.
+    var sp = agnosai_spawn_capture_input(str_cstr(runtime), raw, _read_environ_envp(), input,
+    load64(config + AGN_OCI_TIMEOUT_SECS) * 1000, 0);
+
+    if (agnosai_spawn_status(sp) == AGNOSAI_SPAWN_FAILED) {
+        store64(out_err, agnosai_error_sandbox(str_cat(str_cat(str_from("failed to spawn "),
+        runtime), str_from(" container"))));
+        return 0;
+    }
+
+    if (agnosai_spawn_timed_out(sp) == 1) {
+        var wm = str_cat(str_from("OCI container timed out, killing: "),
+        load64(config + AGN_OCI_IMAGE));
+        sakshi_warn(str_data(wm), str_len(wm));
+        # Blanked for the same reason `process` blanks it — `oci.rs:180-186`.
+        return agnosai_oci_result_new(str_from(""), str_from(""), 0 - 1, 1);
+    }
+
+    return agnosai_oci_result_new(agnosai_spawn_stdout(sp), agnosai_spawn_stderr(sp),
+    agnosai_spawn_exit_code(sp), 0);
+}

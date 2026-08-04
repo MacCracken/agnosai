@@ -272,6 +272,121 @@ fn _t_oci_error_message(): i64 {
     return 0;
 }
 
+# --- Execution ------------------------------------------------------------
+
+fn _t_oci_missing_runtime_returns_error(): i64 {
+    # The oracle's `missing_runtime_returns_error`. No container runtime is
+    # assumed present in a test environment, so a bogus one is the case that
+    # can actually be asserted - and it is the one that matters, since a
+    # missing runtime must not read as "the container ran and failed".
+    var c = agnosai_oci_config_new(str_from("alpine:latest"));
+    agnosai_oci_config_set_runtime(c, str_from("/nonexistent/runtime"));
+
+    var args = vec_new();
+    vec_push(args, str_from("echo"));
+    vec_push(args, str_from("hi"));
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_oci_execute(c, args, str_from(""), &e);
+    assert(r == 0, "oracle missing_runtime_returns_error: execute() is an ERROR");
+    assert(load64(&e) != 0, "...with an error set");
+    assert(agnosai_error_kind(load64(&e)) == AGNOSAI_ERR_SANDBOX, "...a sandbox error");
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "/nonexistent/runtime") == 1,
+    "...naming the runtime it could not spawn");
+    return 0;
+}
+
+fn _t_oci_execute_runs_the_built_argv(): i64 {
+    # There is no container runtime to test against, so `/bin/echo` stands in
+    # as one: it accepts any arguments and prints them. That makes the whole
+    # argv observable end-to-end - the flags a real runtime would consume are
+    # simply echoed - and proves `execute` runs what `build_argv` built rather
+    # than assembling a second argv of its own.
+    var c = agnosai_oci_config_new(str_from("alpine:latest"));
+    agnosai_oci_config_set_runtime(c, str_from("/bin/echo"));
+    agnosai_oci_config_add_env(c, str_from("KEY"), str_from("value"));
+
+    var args = vec_new();
+    vec_push(args, str_from("entrypoint-arg"));
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_oci_execute(c, args, str_from(""), &e);
+    assert(load64(&e) == 0, "the runtime spawns");
+    assert(agnosai_oci_result_exit_code(r) == 0, "...and exits cleanly");
+
+    var out = agnosai_oci_result_stdout(r);
+    assert(str_contains_cstr(out, "run --rm -i --read-only") == 1,
+    "the isolation flags reach the runtime in the oracle's order");
+    assert(str_contains_cstr(out, "--network=none") == 1, "networking is off by default");
+    assert(str_contains_cstr(out, "--env KEY=value") == 1, "configured env is passed as --env");
+    assert(str_contains_cstr(out, "alpine:latest entrypoint-arg") == 1,
+    "the image precedes the entrypoint arguments, and both are last");
+    return 0;
+}
+
+# Write an executable stand-in runtime and return its path.
+#
+# **A real runtime cannot be assumed present, and the obvious substitutes do
+# not work**: `build_argv` puts `run --rm -i ...` in front of everything, so
+# `cat` tries to open a file called `run` and `sleep` rejects it as a bad
+# operand. A script that ignores `"$@"` is the only stand-in that behaves like
+# a runtime accepting flags it understands.
+fn _t_oci_fake_runtime(name, body): Str {
+    var path = str_cat(str_from("/tmp/agnosai-oci-test-"), str_from(name));
+    var p = str_cstr(path);
+    var src = str_cat(str_cat(str_from("#!/bin/sh\n"), str_from(body)), str_from("\n"));
+    file_write_all(p, str_data(src), str_len(src));
+    sys_chmod(p, 493);
+    return path;
+}
+
+fn _t_oci_execute_feeds_stdin_and_splits_streams(): i64 {
+    var c = agnosai_oci_config_new(str_from("alpine:latest"));
+    agnosai_oci_config_set_runtime(c,
+    _t_oci_fake_runtime("io", "cat; echo container-err >&2"));
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_oci_execute(c, vec_new(), str_from("piped to the container"), &e);
+    assert(load64(&e) == 0, "the runtime spawns");
+    assert(str_contains_cstr(agnosai_oci_result_stdout(r), "piped to the container") == 1,
+    "input reaches the container's stdin and its output comes back");
+    assert(str_contains_cstr(agnosai_oci_result_stderr(r), "container-err") == 1,
+    "stderr is captured separately");
+    assert(str_contains_cstr(agnosai_oci_result_stdout(r), "container-err") == 0,
+    "...not merged into stdout");
+    assert(agnosai_oci_result_timed_out(r) == 0, "and it did not time out");
+    return 0;
+}
+
+fn _t_oci_execute_timeout(): i64 {
+    # `timeout_secs` is the oracle's unit and the primitive takes milliseconds -
+    # a missing x1000 would make every container time out a thousand times early.
+    var c = agnosai_oci_config_new(str_from("alpine:latest"));
+    agnosai_oci_config_set_runtime(c, _t_oci_fake_runtime("slow", "echo early; echo early-err >&2; sleep 30"));
+    agnosai_oci_config_set_timeout_secs(c, 1);
+
+    var e[8];
+    store64(&e, 0);
+    var t0 = clock_now_ms();
+    var r = agnosai_oci_execute(c, vec_new(), str_from(""), &e);
+    var dt = clock_now_ms() - t0;
+
+    assert(load64(&e) == 0, "a timeout is a result, not an error");
+    assert(agnosai_oci_result_timed_out(r) == 1, "the container was killed on its deadline");
+    assert(agnosai_oci_result_exit_code(r) == 0 - 1, "...reporting -1");
+    # The runtime PRODUCES output before it hangs, so blanking is observable -
+    # a version that returned what it drained would show "early" here.
+    assert(str_len(agnosai_oci_result_stdout(r)) == 0,
+    "...with output blanked, as oci.rs:180-186 does");
+    assert(str_len(agnosai_oci_result_stderr(r)) == 0, "...both streams");
+    assert(dt >= 900, "the deadline is SECONDS, not milliseconds - 1s, not 1ms");
+    assert(dt < 10000, "...and it fired rather than hanging");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -284,6 +399,10 @@ fn main(): i64 {
     _t_oci_argv_options();
     _t_oci_result();
     _t_oci_error_message();
+    _t_oci_missing_runtime_returns_error();
+    _t_oci_execute_runs_the_built_argv();
+    _t_oci_execute_feeds_stdin_and_splits_streams();
+    _t_oci_execute_timeout();
 
     return assert_summary();
 }
