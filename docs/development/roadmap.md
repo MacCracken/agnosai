@@ -232,7 +232,47 @@ small:
   `/bin/sleep 8` run 8001 ms and report `timed_out = 0`. A second filing covers
   the process backend reporting exit code 0 and empty stderr for everything that
   ran. Both are kavach-side; neither is worked around here.
-- **The cx confinement bites (B13-B15)** — `wasm.rs`'s successor per
+- **cx, compile half — done, bite 13 (2026-08-04).** `cycc_cx` through the spawn
+  primitive, float-literal rejection, `.cyx` validation.
+- 🟡 **cx, execution half — UNBLOCKED (kavach 3.11.3, 2026-08-04).** The gate
+  below now passes; what remains is the agnosai-side runner. History kept
+  because the premise it tested is the milestone's whole security argument:
+- ~~🔴 **BLOCKED on kavach**~~ ADR-006's premise is that
+  "kavach's seccomp + landlock *are* the security boundary", because `cxvm`
+  dispatches guest syscalls straight to the host kernel. **Measured against
+  kavach 3.11.2 on 2026-08-04: it is not.** Neither `sandbox_exec` (without a
+  rootfs) nor `persistent_spawn` applies seccomp or landlock, and the ADR's own
+  acceptance test — a `.cyx` calling `open("/etc/passwd")` — **succeeded**
+  through the persistent channel, which is the only kavach API with the stdin
+  `cxvm` needs.
+
+  Three kavach filings, which together are the blocker set:
+  1. `2026-08-04-neither-exec-path-applies-seccomp-or-landlock-without-a-rootfs.md`
+     — Critical. `seccomp_enabled = 1` is stored, scored, and never applied;
+     `landlock_rules_len` is a counter with no path API, so landlock is
+     currently applied by nothing. Also: `persistent_spawn` takes no policy at
+     all.
+  2. `2026-08-04-sandbox-config-timeout-ms-is-ignored-by-every-backend-except-wasm.md`
+     — ADR-006 accepts losing wasmtime's fuel metering *because* a wall-clock
+     timeout remains. There is no wall-clock timeout either.
+  3. `2026-08-04-process-backend-never-reports-the-payload-exit-code-or-stderr.md`
+     — cx's result channel is "process stdout + exit code" per the same ADR.
+
+  (1) landed as kavach 3.11.3 — routing on the policy rather than the rootfs, a
+  real landlock rule API, and `persistent_spawn_confined`. Re-measured with the
+  ADR's own test: the `.cyx` now gets **EACCES** where it got fd 3. (2) and (3)
+  remain open; (3) is half-closed, since a confining policy now reports the
+  payload's real exit code.
+
+  **A probe gotcha worth keeping**: the first escape `.cyx` tested `fd >= 0`,
+  and cx evaluates that **unsigned**, so `-EACCES` read as success and the
+  confined run looked like an escape. Probes must report the raw syscall return,
+  not a comparison.
+
+  The runner is the next bite, and none of it is faked: ADR-006's hard requirement
+  is that "no code path may execute a `.cyx` outside a kavach sandbox — a `cxvm`
+  spawn that is not wrapped is a full sandbox escape, not a degraded one."
+- **The cx confinement bites (B14-B15)** — `wasm.rs`'s successor per
   [ADR-006](../adr/006-cx-tool-sandbox.md): `cycc_cx` → `.cyx` → `cxvm` spawned
   **inside** a kavach sandbox, with the milestone's own gate — a test asserting
   a `.cyx` attempting `open("/etc/passwd")` is refused. Unblocked by kavach

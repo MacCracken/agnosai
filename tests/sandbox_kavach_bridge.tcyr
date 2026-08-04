@@ -322,19 +322,16 @@ fn _t_kb_execute_needs_no_explicit_init(): i64 {
 }
 
 fn _t_kb_execute_reports_the_exit_code(): i64 {
-    # **kavach's process backend reports 0 for everything that ran.**
-    # `backend_capture_finish` hardcodes `exit_code = 0` and `stderr = ""` on
-    # its success path; `exec_capture` waits on the child and discards the
-    # status. Measured 2026-08-04 against kavach 3.11.2: `/bin/false` (real
-    # exit 1) and `/bin/ls /nonexistent` (real exit 2) both report 0 with empty
-    # stderr. Filed upstream -
-    # kavach/docs/development/issues/2026-08-04-process-backend-never-reports-the-payload-exit-code-or-stderr.md
+    # `/bin/false` needs no arguments and no shell, so kavach's command splitter
+    # and runtime guard cannot turn it into something else. It exits 1.
     #
-    # So this does NOT assert the code is correct - it cannot be today. What it
-    # asserts is that the BRIDGE is a faithful conduit: a non-zero exit is a
-    # result rather than an error, and whatever kavach reports arrives
-    # unaltered. When kavach is fixed, the pinned value below fails and this
-    # test is the thing that says why.
+    # **This asserted the opposite until kavach 3.11.3.** `backend_capture_finish`
+    # hardcodes `exit_code = 0`, so every command that ran reported success -
+    # filed, and pinned here so the fix would announce itself. It did: 3.11.3
+    # routes a confining policy through `confine_capture`, whose tail sets the
+    # payload's real code via `confine_last_exit()`. A policy that asks for NO
+    # confinement still takes the plain capture and still reports 0, so the
+    # filing stays open on that half.
     var e[8];
     store64(&e, 0);
     var r = agnosai_kavach_execute(str_from("/bin/false"),
@@ -343,13 +340,10 @@ fn _t_kb_execute_reports_the_exit_code(): i64 {
     assert(load64(&e) == 0,
     "a command that EXITS non-zero is a result, not a bridge error");
     assert(r != 0, "...so a result comes back");
-    assert(agnosai_kavach_result_exit_code(r) == 0,
-    "PINNED TO AN UPSTREAM DEFECT: kavach reports 0 for /bin/false, which really \
-    exits 1 - when this assertion starts failing, kavach has been fixed and the \
-    note above should go");
+    assert(agnosai_kavach_result_exit_code(r) != 0,
+    "...carrying the real non-zero code, not flattened to 0");
     return 0;
 }
-
 fn _t_kb_execute_with_agent_id(): i64 {
     var e[8];
     store64(&e, 0);

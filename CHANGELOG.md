@@ -42,6 +42,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 13 — `sandbox/cx`: compiling tool source to cx bytecode.** 33
+  assertions. The compile half of `wasm.rs`'s successor per ADR-006 — source in,
+  `.cyx` out, through `cycc_cx`.
+
+  **`cycc_cx` speaks stdin and stdout, not paths.** `cycc_cx <path>` hangs
+  forever waiting on a stdin that never closes; the working form is
+  `cycc_cx < source > out.cyx`, which is what the spawn primitive's
+  `capture_input` already does — with the sanitized environment and a deadline,
+  since a compiler fed untrusted source is itself a subprocess on
+  attacker-influenced input.
+
+  **Float literals are rejected before the compiler runs.** ADR-006 records that
+  cx miscompiles them until arc B and asks the loader to reject rather than
+  trust. Measured: `var x = 1.5;` compiles with **exit 0 and 160 bytes of
+  output** — nothing in the result to test afterwards. Strings and comments are
+  skipped, so `# 1.5x faster` and `"version 1.5"` are not rejections.
+
+  **The magic is `CYX\x01`, not `CYX\0`.** ADR-006 says `"CYX\0"`; a real
+  `cycc_cx` emits `43 59 58 01` — `CYX` plus a format version. Checking the
+  ADR's spelling would reject every real `.cyx`.
+
+  Four mutations, all caught after one correction: dropping the float check,
+  ignoring the compiler's exit code, skipping the version byte, and letting
+  prose trip the float checker.
+
 - **M7 bite 12 — `kavach_bridge`'s exec half.** `agnosai_kavach_execute` —
   `kavach_bridge::execute` (`kavach_bridge.rs:94-148`) — 89 assertions in the
   suite. Create, transition to Running, exec, then destroy on **every** path

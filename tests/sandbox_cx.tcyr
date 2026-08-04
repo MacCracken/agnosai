@@ -1,0 +1,179 @@
+# =========================================================================
+# sandbox_cx — tests for src/sandbox/cx.cyr.
+#
+# **No oracle tests exist.** `wasm.rs`'s 11 tests exercise wasmtime, which this
+# replaces rather than ports (ADR-006). What is asserted here is the compile
+# half: the float-literal rejection cx arc A requires, `.cyx` validation, and a
+# real round trip through `cycc_cx`.
+#
+# The compiling tests skip when `cycc_cx` is absent, and `_t_cx_skips_are_real`
+# makes that skip loud rather than silent.
+#
+# **There is no runner test because there is no runner.** ADR-006 forbids
+# executing a `.cyx` outside a kavach sandbox, and kavach 3.11.2 confines
+# neither of its exec paths — measured, with a `.cyx` calling
+# `open("/etc/passwd")` succeeding through `persistent_spawn`. The ADR's own
+# acceptance test arrives with the runner, once kavach can hold it up.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/sandbox/mod.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_cx_have_compiler(): i64 {
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_cx_compile(str_from("var r = 6 * 7;\nsyscall(60, r);\n"), &e);
+    if (r == 0) { return 0; }
+    return 1;
+}
+
+fn _t_cx_skips_are_real(): i64 {
+    # A regression in PATH resolution or in the stdin invocation would skip
+    # every compiling test below and still report green.
+    if (file_exists("/home/macro/.cyrius/bin/cycc_cx") == 0) { return 0; }
+    assert(_t_cx_have_compiler() == 1,
+    "cycc_cx is installed, so the compiling tests below MUST run");
+    return 0;
+}
+
+# --- Float literals ------------------------------------------------------
+
+fn _t_cx_float_literals(): i64 {
+    assert(agnosai_cx_has_float_literal(str_from("var x = 1.5;")) == 1,
+    "a float literal is found");
+    assert(agnosai_cx_has_float_literal(str_from("var x = 0.0;")) == 1, "...including 0.0");
+    assert(agnosai_cx_has_float_literal(str_from("var x = 123.456;")) == 1, "...and longer ones");
+
+    assert(agnosai_cx_has_float_literal(str_from("var x = 15;")) == 0, "an integer is not one");
+    assert(agnosai_cx_has_float_literal(str_from("var x = a.b;")) == 0,
+    "a field access is not a float");
+    assert(agnosai_cx_has_float_literal(str_from("var x = arr[1].f;")) == 0,
+    "...nor an index followed by a field");
+    assert(agnosai_cx_has_float_literal(str_from("var x = 1;\nvar y = 5;")) == 0,
+    "...nor two integers on separate lines");
+
+    # **Prose must not trip it.** A checker that fires on documentation is one
+    # a tool author routes around by rewording rather than by fixing.
+    assert(agnosai_cx_has_float_literal(str_from("# 1.5x faster now\nvar x = 2;")) == 0,
+    "a float in a COMMENT is not a float literal");
+    assert(agnosai_cx_has_float_literal(str_from("var s = \"version 1.5\";")) == 0,
+    "...nor one inside a string");
+    assert(agnosai_cx_has_float_literal(str_from("var s = \"quote \\\" 1.5\";")) == 0,
+    "...even past an escaped quote");
+
+    # But a real literal after prose is still caught.
+    assert(agnosai_cx_has_float_literal(str_from("# 1.5 in a comment\nvar x = 2.5;")) == 1,
+    "a comment does not hide a REAL literal later in the source");
+    assert(agnosai_cx_has_float_literal(str_from("var s = \"1.5\";\nvar y = 3.25;")) == 1,
+    "...and neither does a string");
+
+    assert(agnosai_cx_has_float_literal(str_from("")) == 0, "an empty source has none");
+    return 0;
+}
+
+# --- Validation ----------------------------------------------------------
+
+fn _t_cx_validate(): i64 {
+    assert(agnosai_cx_validate(0) == 0, "null is not bytecode");
+    assert(agnosai_cx_validate(str_from("")) == 0, "nor is an empty string");
+    assert(agnosai_cx_validate(str_from("CYX")) == 0, "nor a truncated header");
+
+    # 24 bytes of the right shape is the minimum acceptable.
+    var ok = str_new("CYX\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 24);
+    assert(agnosai_cx_validate(ok) == 1, "magic + version + minimum length validates");
+
+    # **`CYX\0` is the ADR's spelling and is WRONG** — a real cycc_cx emits
+    # `CYX\x01`. Checking for the ADR text would reject every real .cyx.
+    var adr = str_new("CYX\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 24);
+    assert(agnosai_cx_validate(adr) == 0,
+    "version 0 is rejected - the format version is checked, not skipped");
+
+    var wrong = str_new("ELF\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 24);
+    assert(agnosai_cx_validate(wrong) == 0, "a different magic is rejected");
+    return 0;
+}
+
+# --- Compiling -----------------------------------------------------------
+
+fn _t_cx_compile_roundtrip(): i64 {
+    if (_t_cx_have_compiler() == 0) { return 0; }
+    var e[8];
+    store64(&e, 0);
+    var cyx = agnosai_cx_compile(str_from("var r = 6 * 7;\nsyscall(60, r);\n"), &e);
+
+    assert(load64(&e) == 0, "a valid tool source compiles");
+    assert(cyx != 0, "...producing bytecode");
+    assert(agnosai_cx_validate(cyx) == 1, "...that validates");
+    assert(str_len(cyx) > AGNOSAI_CX_MIN_BYTES,
+    "...and is a real program, not just a header");
+    return 0;
+}
+
+fn _t_cx_compile_rejects_bad_source(): i64 {
+    if (_t_cx_have_compiler() == 0) { return 0; }
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_cx_compile(str_from("this is not cyrius @@@ ;;;"), &e);
+    assert(r == 0, "source that does not compile is an error");
+    assert(load64(&e) != 0, "...with an error set");
+    # The compiler's own diagnostic must survive - a tool author cannot fix a
+    # compile error they are not shown.
+    #
+    # **Not `contains "error:"`.** `agnosai_error_message` prefixes every
+    # sandbox error with "sandbox error: ", so that substring is present no
+    # matter what went wrong - it passed even with the exit-code check deleted.
+    var msg = agnosai_error_message(load64(&e));
+    assert(str_contains_cstr(msg, "failed to compile") == 1,
+    "...reported as a COMPILE failure, distinct from invalid output");
+    assert(str_len(msg) > 60,
+    "...with cycc_cx's own diagnostic appended, not just the prefix");
+    return 0;
+}
+
+fn _t_cx_compile_rejects_floats_before_invoking(): i64 {
+    # **cycc_cx accepts a float literal with exit 0 and 160 bytes of output** -
+    # measured 2026-08-04. There is nothing in its output to test afterwards, so
+    # the rejection must happen before it runs, and must not depend on the
+    # compiler being installed at all.
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_cx_compile(str_from("var x = 1.5;\nsyscall(60, 0);\n"), &e);
+    assert(r == 0, "a float literal is rejected");
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "float literal") == 1,
+    "...saying so, and citing why");
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "ADR-006") == 1,
+    "...with the decision that explains it");
+    return 0;
+}
+
+fn _t_cx_compile_rejects_empty(): i64 {
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_cx_compile(str_from(""), &e);
+    assert(r == 0, "empty source is an error, not an empty program");
+    assert(load64(&e) != 0, "...with an error set");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_cx_skips_are_real();
+    _t_cx_float_literals();
+    _t_cx_validate();
+    _t_cx_compile_roundtrip();
+    _t_cx_compile_rejects_bad_source();
+    _t_cx_compile_rejects_floats_before_invoking();
+    _t_cx_compile_rejects_empty();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

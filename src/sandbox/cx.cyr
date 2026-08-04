@@ -1,0 +1,211 @@
+# =========================================================================
+# sandbox/cx — compiling tool source to cx bytecode.
+#
+# No parity oracle. This is the compile half of `wasm.rs`'s successor per
+# [ADR 006](../../docs/adr/006-cx-tool-sandbox.md): tool source in Cyrius,
+# `cycc_cx` out to a `.cyx`, and — eventually — `cxvm` run inside a kavach
+# sandbox. **Only the compile half lives here.** The execution half is blocked;
+# see the block at the end of this header.
+#
+# ## `cycc_cx` speaks stdin and stdout, not paths
+#
+# Verified 2026-08-04: `cycc_cx <path>` **hangs forever** — the path is not read
+# as an argument and the compiler waits on a stdin that never closes. The
+# working invocation is `cycc_cx < source > out.cyx`, which is exactly what the
+# spawn primitive's `agnosai_spawn_capture_input` does: source in, bytecode out,
+# diagnostics on stderr, a real exit code, and a deadline.
+#
+# ## Float literals compile silently and must be rejected here
+#
+# ADR-006 records that `EMIT_FLOAT_LIT` emits raw rational-pair bits until cx
+# arc B, and asks the loader to "reject float literals rather than trust them".
+# Measured: `var x = 1.5;` compiles with **exit 0 and 160 bytes of output** — no
+# warning, no diagnostic. A tool doing arithmetic on that gets wrong numbers and
+# no indication of it, so the rejection has to happen before the compiler is
+# ever invoked.
+#
+# ## The magic is `CYX\x01`, not `CYX\0`
+#
+# ADR-006 says `"CYX\0" magic`. The bytes a current `cycc_cx` emits are
+# `43 59 58 01` — `CYX` followed by a **format version**, not a NUL. Checking
+# for the ADR's spelling would reject every real `.cyx`.
+#
+# ## The execution half is blocked on kavach, and must not be faked
+#
+# ADR-006's premise is that "kavach's seccomp + landlock *are* the security
+# boundary", because `cxvm` dispatches guest syscalls straight to the host
+# kernel with no allowlist. Measured against kavach 3.11.2 on 2026-08-04, that
+# premise does not hold: neither `sandbox_exec` (without a rootfs) nor
+# `persistent_spawn` applies seccomp or landlock, and a `.cyx` calling
+# `open("/etc/passwd")` **succeeded** through the persistent channel — which is
+# the ADR's own acceptance test, failing.
+#
+# Filed as
+# `kavach/docs/development/issues/2026-08-04-neither-exec-path-applies-seccomp-or-landlock-without-a-rootfs.md`.
+# **No `cxvm` spawn is implemented here until that lands.** ADR-006 states the
+# rule this obeys: "no code path may execute a `.cyx` outside a kavach sandbox —
+# a `cxvm` spawn that is not wrapped is a full sandbox escape, not a degraded
+# one." Shipping the runner against an unconfining kavach would satisfy the
+# letter of the milestone and none of its purpose.
+# =========================================================================
+
+# The compiler that turns Cyrius source into cx bytecode.
+#
+# A bare name, resolved on `PATH` by the spawn primitive — the cyrius toolchain
+# installs it in the same directory as `cyrius` itself, which is on the `PATH`
+# of anything that could have built this server.
+var AGNOSAI_CX_COMPILER = "cycc_cx";
+
+# How long a tool compile may take before it is killed.
+#
+# Generous for a compiler that handles at most a 64 KB program, and finite
+# because tool source is untrusted input: a pathological source that sends
+# `cycc_cx` into a loop must not hold a request thread forever.
+var AGNOSAI_CX_COMPILE_TIMEOUT_MS = 30 * 1000;
+
+# `.cyx` header magic — `CYX` plus a one-byte format version.
+var AGNOSAI_CX_MAGIC_0 = 67;
+var AGNOSAI_CX_MAGIC_1 = 89;
+var AGNOSAI_CX_MAGIC_2 = 88;
+
+# The format version this port has verified against.
+#
+# Checked rather than ignored: a `.cyx` from a future `cycc_cx` may lay its
+# header out differently, and a loader that accepts anything beginning `CYX`
+# would hand `cxvm` a file it will misread.
+var AGNOSAI_CX_VERSION = 1;
+
+# The smallest possible `.cyx` — magic, version, and the header fields.
+#
+# An empty program measures 24 bytes, so anything shorter is truncated rather
+# than merely trivial.
+var AGNOSAI_CX_MIN_BYTES = 24;
+
+# The `.cyx` file ceiling from ADR-006's cx-arc-A constraints (1 MB).
+var AGNOSAI_CX_MAX_BYTES = 1048576;
+
+# Whether `source` contains a floating-point literal.
+#
+# **A digit, a `.`, then a digit** — the shape `EMIT_FLOAT_LIT` miscompiles.
+# String contents and comments are skipped, because a version that did not
+# would reject `"version 1.5"` in a tool's help text and a `# 1.5x faster`
+# comment, and a checker that fires on prose is one a tool author routes around
+# by rewording rather than by fixing.
+#
+# This is a **syntactic** check and does not claim more: a float arriving as a
+# computed value or through an include is not visible here. It catches the case
+# ADR-006 names — a literal in tool source — and the boundary is stated so the
+# next reader does not mistake it for a float ban.
+fn agnosai_cx_has_float_literal(source: Str): i64 {
+    var d = str_data(source);
+    var n = str_len(source);
+    var i = 0;
+    while (i < n) {
+        var c = load8(d + i);
+
+        # Skip a comment to end of line.
+        if (c == 35) {
+            while (i < n && load8(d + i) != 10) { i = i + 1; }
+        } else {
+            # Skip a double-quoted string, honouring backslash escapes.
+            if (c == 34) {
+                i = i + 1;
+                while (i < n && load8(d + i) != 34) {
+                    if (load8(d + i) == 92) { i = i + 1; }
+                    i = i + 1;
+                }
+                i = i + 1;
+            } else {
+                if (c >= 48 && c <= 57) {
+                    # Walk the digit run, then look for `.` followed by a digit.
+                    while (i < n && load8(d + i) >= 48 && load8(d + i) <= 57) {
+                        i = i + 1;
+                    }
+                    if (i + 1 < n && load8(d + i) == 46) {
+                        if (load8(d + i + 1) >= 48 && load8(d + i + 1) <= 57) { return 1; }
+                    }
+                } else {
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# Whether `bytes` is a `.cyx` this port is prepared to hand to `cxvm`.
+#
+# Magic, format version, and both size bounds. Returns 1 for acceptable
+# bytecode, 0 otherwise — a validator that distinguished *why* would invite a
+# caller to proceed on the ones it considered minor.
+fn agnosai_cx_validate(bytes: Str): i64 {
+    if (bytes == 0) { return 0; }
+    var n = str_len(bytes);
+    if (n < AGNOSAI_CX_MIN_BYTES) { return 0; }
+    if (n > AGNOSAI_CX_MAX_BYTES) { return 0; }
+
+    var d = str_data(bytes);
+    if (load8(d) != AGNOSAI_CX_MAGIC_0) { return 0; }
+    if (load8(d + 1) != AGNOSAI_CX_MAGIC_1) { return 0; }
+    if (load8(d + 2) != AGNOSAI_CX_MAGIC_2) { return 0; }
+    if (load8(d + 3) != AGNOSAI_CX_VERSION) { return 0; }
+    return 1;
+}
+
+# Compile tool source to cx bytecode.
+#
+# Runs `cycc_cx` with the source on stdin and takes the `.cyx` off stdout. The
+# float-literal check happens **first**, before the compiler is invoked, because
+# `cycc_cx` accepts a float literal with exit 0 and there is nothing in its
+# output to test afterwards.
+#
+# The compiler runs through the ordinary spawn primitive, so it inherits the
+# sanitized environment and the deadline — a compiler fed untrusted source is
+# itself a subprocess running on attacker-influenced input.
+#
+# Returns 0 with `out_err` set on a rejected source, a compiler failure, or
+# bytecode that does not validate.
+fn agnosai_cx_compile(source: Str, out_err): i64 {
+    if (str_len(source) == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from("empty tool source")));
+        return 0;
+    }
+
+    if (agnosai_cx_has_float_literal(source) == 1) {
+        store64(out_err, agnosai_error_sandbox(str_from(
+        "tool source contains a float literal; cx miscompiles floats until arc B (ADR-006)")));
+        return 0;
+    }
+
+    var argv = alloc(2 * 8);
+    store64(argv, AGNOSAI_CX_COMPILER);
+    store64(argv + 8, 0);
+
+    var sp = agnosai_spawn_capture_input(AGNOSAI_CX_COMPILER, argv, agnosai_sanitized_envp(),
+    source, AGNOSAI_CX_COMPILE_TIMEOUT_MS, 0);
+
+    if (agnosai_spawn_status(sp) == AGNOSAI_SPAWN_FAILED) {
+        store64(out_err, agnosai_error_sandbox(str_from("failed to spawn cycc_cx")));
+        return 0;
+    }
+    if (agnosai_spawn_timed_out(sp) == 1) {
+        store64(out_err, agnosai_error_sandbox(str_from("cycc_cx timed out")));
+        return 0;
+    }
+
+    if (agnosai_spawn_exit_code(sp) != 0) {
+        # `cycc_cx` puts a real diagnostic on stderr — "error:2:6: expected '='"
+        # — and a tool author cannot fix a compile error they are not shown.
+        store64(out_err, agnosai_error_sandbox(str_cat(str_from("tool source failed to compile: "),
+        agnosai_spawn_stderr(sp))));
+        return 0;
+    }
+
+    var cyx = agnosai_spawn_stdout(sp);
+    if (agnosai_cx_validate(cyx) == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from(
+        "cycc_cx produced output that is not valid cx bytecode")));
+        return 0;
+    }
+    return cyx;
+}
