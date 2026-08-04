@@ -1,0 +1,232 @@
+# =========================================================================
+# sandbox/kavach_bridge — agnosai policies to kavach sandboxes.
+#
+# Parity oracle: rust-old/src/sandbox/kavach_bridge.rs
+#
+# **M7 bite 3 — the pure half.** Backend mapping, config construction, strength
+# scoring, the output scan, and the trust-level policy table. `execute` needs a
+# live sandbox and lands later; it has **zero test coverage in the oracle**
+# either — all 16 of its tests exercise only the functions here.
+#
+# ## `scan_output` is a lossy 4→2 collapse, and getting it "right" would be wrong
+#
+# This is the single most misportable line in the file. kavach's gate produces
+# **four** verdicts — Pass, Warn, Quarantine, Block — and Cyrius hands all four
+# back directly (`ScanResult_verdict`). Rust does not see them: `gate.apply`
+# returns a `Result`, `Ok` for {Pass, Warn} and `Err` for {Block, Quarantine},
+# and the oracle maps `Ok → Pass`, `Err → Block`.
+#
+# So the faithful port **discards information it has**:
+#
+#     {PASS, WARN}       -> PASS
+#     {QUARANTINE, BLOCK} -> BLOCK
+#
+# A port that returned `ScanResult_verdict(...)` unchanged would look more
+# precise and would be a silent divergence in **both** directions — reporting
+# WARN where the oracle reports Pass (a caller might hold an artifact the oracle
+# releases) and QUARANTINE where it reports Block. A consumer that wants the
+# four-way verdict should call `gate_apply` directly rather than have this
+# function quietly change meaning.
+#
+# ## `max_memory_bytes` is never read, and that is the oracle's behaviour
+#
+# `build_config` sets backend, network and timeout, and never touches
+# `policy.max_memory_bytes` (`kavach_bridge.rs:48-68`). It is preserved as-is:
+# "fixing" it would push a memory limit into kavach that the Rust build never
+# sent, which is a behaviour change dressed as a bug fix.
+#
+# ## The seccomp conditional in `to_kavach_policy` is dead code — deliberately
+#
+# `to_kavach_policy` starts from `policy_basic()`, which **already** sets
+# `seccomp_enabled = 1` and `seccomp_profile = "basic"`, then sets them again
+# when isolation is Process or above. The branch can never change anything.
+#
+# It is kept because the starting point is load-bearing: starting from
+# `policy_new()` instead — which zeroes everything — would drop the +5 seccomp
+# modifier and move the wasm score from **75 to 70**, silently, with every test
+# still passing. The redundant branch documents that `basic()` is required.
+#
+# ## `externalization` cannot be set on the config
+#
+# The oracle's `build_config` calls `.externalization(ExternalizationPolicy::
+# default())` unconditionally. Cyrius kavach's `SandboxConfig`
+# (`lib/kavach.cyr:3300-3310`) has **no such field** — backend, policy,
+# timeout_ms, inner_backend, agent_id, hostname, domainname, workdir, rootfs and
+# nothing else. The call has no counterpart, so the oracle's
+# `build_config_enables_externalization` test cannot port as written. Filed
+# against kavach; `agnosai_kavach_default_ext_policy` exists so the intended
+# policy is still constructible and testable at the call site.
+# =========================================================================
+
+# Field offsets for one sandboxed execution's result.
+enum AgnosaiKavachResultOff {
+    AGN_KR_OUTPUT = 0;
+    AGN_KR_STDERR = 8;
+    AGN_KR_EXIT_CODE = 16;
+    AGN_KR_TIMED_OUT = 24;
+    AGN_KR_DURATION_MS = 32;
+    AGN_KR_STRENGTH = 40;
+    AGN_KR_SCAN_VERDICT = 48;
+    AGN_KR_SIZE = 56;
+}
+
+# Sentinel for `scan_verdict: Option<ScanVerdict>` being `None`.
+#
+# -1 rather than 0 because 0 is `ScanVerdict.PASS`, a real verdict — reporting
+# "not scanned" as "passed" is the wrong direction for a security field.
+var AGNOSAI_KAVACH_NO_VERDICT = 0 - 1;
+
+# `map_backend` — the agnosai isolation level as a kavach backend.
+#
+# A total match in the oracle with no fallthrough. `None` maps to **Noop**, not
+# to Process: an unsandboxed tool must not be reported as having process
+# isolation, and Noop is what scores 0.
+fn agnosai_kavach_map_backend(level): i64 {
+    if (level == AGNOSAI_ISOLATION_NONE) { return Backend.NOOP; }
+    if (level == AGNOSAI_ISOLATION_WASM) { return Backend.WASM; }
+    if (level == AGNOSAI_ISOLATION_PROCESS) { return Backend.PROCESS; }
+    if (level == AGNOSAI_ISOLATION_OCI) { return Backend.OCI; }
+    return Backend.NOOP;
+}
+
+# The agnosai policy as a kavach policy — `to_kavach_policy`.
+#
+# **Starts from `policy_basic()`, and that is load-bearing** — see the module
+# header. The seccomp branch below is redundant against it by construction and
+# is kept as the oracle wrote it.
+fn _agnosai_kavach_to_policy(policy): i64 {
+    var kp = policy_basic();
+    SandboxPolicy_set_network_enabled(kp, agnosai_sandbox_policy_needs_network(policy));
+    if (agnosai_sandbox_policy_effective_isolation(policy) >= AGNOSAI_ISOLATION_PROCESS) {
+        SandboxPolicy_set_seccomp_enabled(kp, 1);
+        SandboxPolicy_set_seccomp_profile(kp, "basic");
+    }
+    return kp;
+}
+
+# `build_config` — a kavach `SandboxConfig` from an agnosai policy.
+#
+# `agent_id` is a `Str`, or 0 for the oracle's `None`. Note `max_memory_bytes`
+# is deliberately not read, and `externalization` has no field to set — both
+# explained in the module header.
+fn agnosai_kavach_build_config(policy, agent_id): i64 {
+    var eff = agnosai_sandbox_policy_effective_isolation(policy);
+    var c = config_new();
+    config_backend(c, agnosai_kavach_map_backend(eff));
+    config_network(c, agnosai_sandbox_policy_needs_network(policy));
+    config_timeout_ms(c, agnosai_sandbox_policy_max_duration_secs(policy) * 1000);
+    if (agent_id != 0) { config_agent_id(c, str_data(agent_id)); }
+    if (eff >= AGNOSAI_ISOLATION_PROCESS) { config_policy_seccomp(c, "basic"); }
+    return c;
+}
+
+# The externalization policy the oracle attaches to every config.
+#
+# Exposed on its own because `SandboxConfig` has nowhere to put it here — see
+# the module header. `ext_policy_default()` is kavach's own default and matches
+# the oracle's `ExternalizationPolicy::default()`: 50 MiB, block at Critical,
+# quarantine at High, redaction on.
+fn agnosai_kavach_default_ext_policy(): i64 {
+    return ext_policy_default();
+}
+
+# `strength_for_policy` — kavach's 0-100 isolation score for this policy.
+fn agnosai_kavach_strength_for_policy(policy): i64 {
+    var eff = agnosai_sandbox_policy_effective_isolation(policy);
+    return score_backend(agnosai_kavach_map_backend(eff),
+    _agnosai_kavach_to_policy(policy));
+}
+
+# The band label for a score — `"minimal"`, `"basic"`, `"standard"`,
+# `"hardened"`, `"fortress"`.
+fn agnosai_kavach_strength_label(score): i64 {
+    return score_label(score);
+}
+
+# `policy_for_trust` — the externalization policy for a crew trust level.
+#
+# **The mapping is inverted from what the names suggest, and that is correct**:
+# `"minimal"` trust gets the *strictest* thresholds (block at Medium, quarantine
+# at Low, 1 MiB), because less-trusted output warrants more scrutiny. `"strict"`
+# is the middle setting. Anything else — including `"basic"` — falls to kavach's
+# default, which is the most permissive of the three.
+#
+# Matching is **exact and case-sensitive**, as the oracle's `match` is.
+fn agnosai_kavach_policy_for_trust(trust: Str): i64 {
+    if (str_eq_cstr(trust, "minimal") == 1) {
+        var p = alloc(EXT_POLICY_SIZE);
+        ExternalizationPolicy_set_enabled(p, 1);
+        ExternalizationPolicy_set_max_artifact_size_bytes(p, 1048576);
+        ExternalizationPolicy_set_block_threshold(p, Severity.MEDIUM);
+        ExternalizationPolicy_set_quarantine_threshold(p, Severity.LOW);
+        ExternalizationPolicy_set_redact_secrets(p, 1);
+        return p;
+    }
+    if (str_eq_cstr(trust, "strict") == 1) {
+        var s = alloc(EXT_POLICY_SIZE);
+        ExternalizationPolicy_set_enabled(s, 1);
+        ExternalizationPolicy_set_max_artifact_size_bytes(s, 10485760);
+        ExternalizationPolicy_set_block_threshold(s, Severity.HIGH);
+        ExternalizationPolicy_set_quarantine_threshold(s, Severity.MEDIUM);
+        ExternalizationPolicy_set_redact_secrets(s, 1);
+        return s;
+    }
+    return ext_policy_default();
+}
+
+# `scan_output` — run the externalization gate over a raw string.
+#
+# **Returns only PASS or BLOCK.** kavach's gate produces four verdicts and this
+# collapses them, because the oracle's `gate.apply` is a `Result` that cannot
+# express more — see the module header. Deliberate information loss for parity.
+fn agnosai_kavach_scan_output(output: Str): i64 {
+    var r = exec_result_new();
+    ExecResult_set_exit_code(r, 0);
+    ExecResult_set_stdout(r, str_data(output));
+    ExecResult_set_stderr(r, "");
+    ExecResult_set_duration_ms(r, 0);
+    ExecResult_set_timed_out(r, 0);
+
+    var v = ScanResult_verdict(gate_apply(r, ext_policy_default()));
+    # Ok(_) in the oracle covers PASS and WARN; Err covers QUARANTINE and BLOCK.
+    if (v == ScanVerdict.PASS) { return ScanVerdict.PASS; }
+    if (v == ScanVerdict.WARN) { return ScanVerdict.PASS; }
+    return ScanVerdict.BLOCK;
+}
+
+# --- Result ---------------------------------------------------------------
+
+# Build a sandboxed-execution result.
+fn agnosai_kavach_result_new(output: Str, stderr: Str, exit_code, timed_out,
+duration_ms, strength, scan_verdict): i64 {
+    var r = alloc(AGN_KR_SIZE);
+    store64(r + AGN_KR_OUTPUT, output);
+    store64(r + AGN_KR_STDERR, stderr);
+    store64(r + AGN_KR_EXIT_CODE, exit_code);
+    store64(r + AGN_KR_TIMED_OUT, timed_out);
+    store64(r + AGN_KR_DURATION_MS, duration_ms);
+    store64(r + AGN_KR_STRENGTH, strength);
+    store64(r + AGN_KR_SCAN_VERDICT, scan_verdict);
+    return r;
+}
+
+# The tool's stdout.
+fn agnosai_kavach_result_output(r): Str { return load64(r + AGN_KR_OUTPUT); }
+
+# The tool's stderr, held separately.
+fn agnosai_kavach_result_stderr(r): Str { return load64(r + AGN_KR_STDERR); }
+
+# The sandbox's exit code.
+fn agnosai_kavach_result_exit_code(r): i64 { return load64(r + AGN_KR_EXIT_CODE); }
+
+# Whether the execution hit its timeout.
+fn agnosai_kavach_result_timed_out(r): i64 { return load64(r + AGN_KR_TIMED_OUT); }
+
+# Wall-clock duration in milliseconds.
+fn agnosai_kavach_result_duration_ms(r): i64 { return load64(r + AGN_KR_DURATION_MS); }
+
+# The kavach strength score of the isolation actually used.
+fn agnosai_kavach_result_strength(r): i64 { return load64(r + AGN_KR_STRENGTH); }
+
+# The gate's verdict, or `AGNOSAI_KAVACH_NO_VERDICT` when nothing was scanned.
+fn agnosai_kavach_result_scan_verdict(r): i64 { return load64(r + AGN_KR_SCAN_VERDICT); }

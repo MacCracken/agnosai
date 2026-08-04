@@ -214,7 +214,11 @@ handler cost bounded and measured" until that filing lands.
 
 ### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
 
-**Bites 1-2 done (2026-08-03).** Bite 2: `oci`'s pure half — config, image
+**Bites 1-3 done (2026-08-03).** Bite 3: `kavach_bridge`'s pure half — backend
+mapping, config, strength scoring, the 4→2 scan collapse, the trust table
+(66 assertions).
+
+Bite 2: `oci`'s pure half — config, image
 validation, and the `docker run` argv built as a testable value (75 assertions).
 Bite 1: `policy` + the group hub `mod` — isolation levels,
 the five named policies, `effective_isolation`, the JSON wire, and the shared

@@ -31,6 +31,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 3 — `sandbox/kavach_bridge`, the pure half.** Backend mapping,
+  config construction, strength scoring, the output scan, and the trust-level
+  policy table. 66 assertions; 15 of the oracle's 16 tests port.
+
+  **`scan_output` is a lossy 4→2 collapse, and porting it "better" would be a
+  silent divergence in both directions.** kavach's gate produces Pass, Warn,
+  Quarantine and Block; Cyrius hands back all four, but Rust's `gate.apply`
+  returns a `Result` — `Ok` for {Pass, Warn}, `Err` for {Block, Quarantine} —
+  and the oracle maps those to Pass and Block. So the faithful port discards
+  information it has: `{PASS,WARN}→PASS`, `{QUARANTINE,BLOCK}→BLOCK`.
+
+  Worth recording *how* that got tested, because the first attempt did not.
+  Asserting "the result is never WARN" is **vacuous** if no input produces WARN
+  — and removing the collapse entirely still passed all 66. The fix was to find
+  an input where the raw and collapsed verdicts genuinely differ: a **JWT** is
+  scanned at `Severity.HIGH` (`lib/kavach.cyr:4184`), and the default policy
+  quarantines at HIGH, so the raw verdict is QUARANTINE where the oracle answers
+  Block. With that case in, removing the collapse fails by name.
+
+  **Two oracle behaviours preserved that look like bugs.** `build_config` never
+  reads `max_memory_bytes` — forwarding it would push a limit kavach never
+  received in the Rust build. And `to_kavach_policy`'s seccomp branch is dead
+  code, because `policy_basic()` already sets both fields; it is kept because
+  the *starting point* is load-bearing — starting from `policy_new()` instead
+  drops the +5 seccomp modifier and moves the wasm score 75 → 70 silently.
+  Mutation-verified: that swap fails two exact-value assertions.
+
+  **The oracle's `strength_ordering_matches_isolation` is more careful than its
+  name.** It asserts only `native < wasm` and `native < process` — never
+  `wasm < process`, because that is false: kavach scores WASM (65 base) above
+  Process (50). A port that "completed" the ordering would fail. Asserted
+  explicitly here, in the direction that actually holds.
+
+  **One oracle test cannot port:** `build_config_enables_externalization`.
+  Cyrius kavach's `SandboxConfig` has no `externalization` field, so the
+  oracle's unconditional `.externalization(...)` has no counterpart. Filed
+  against kavach; the intended policy stays constructible and tested through
+  `agnosai_kavach_default_ext_policy`.
+
 - **M7 bite 2 — `sandbox/oci`, the pure half.** Config, image-reference
   validation, and the `docker run` argv. 75 assertions; seven of the oracle's
   eight tests port directly (the eighth needs a real spawn).

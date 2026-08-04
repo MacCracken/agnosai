@@ -1,0 +1,280 @@
+# =========================================================================
+# sandbox_kavach_bridge — parity tests for src/sandbox/kavach_bridge.cyr.
+#
+# 15 of the oracle's 16 tests port. The exception is
+# `build_config_enables_externalization`: Cyrius kavach's `SandboxConfig` has no
+# `externalization` field, so there is nothing to assert on. The intended policy
+# is still checked, through `agnosai_kavach_default_ext_policy`.
+#
+# Where this goes past the oracle:
+#
+#   * **`scan_output`'s collapse in both directions.** The oracle asserts a
+#     clean string passes and a secret blocks. It cannot assert what happens to
+#     WARN and QUARANTINE, because its `Result` never sees them — and those are
+#     exactly the two a careless port gets wrong.
+#   * **Exact strength values.** The oracle asserts `<= 20` and `>= 60` and an
+#     ordering. The concrete numbers are pinned here, because the modifier that
+#     produces them (`policy_basic()`'s seccomp) is silently droppable.
+#   * **The trust table's inversion**, which reads backwards and is correct.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/sandbox/mod.cyr"
+include "tests/test_helpers.cyr"
+
+# --- map_backend ---------------------------------------------------------
+
+# `map_backend_none_to_noop`, `_wasm`, `_process`, `_oci`.
+fn _t_kv_map_backend(): i64 {
+    assert(agnosai_kavach_map_backend(AGNOSAI_ISOLATION_NONE) == Backend.NOOP,
+    "None maps to Noop — NOT Process; an unsandboxed tool must not look isolated");
+    assert(agnosai_kavach_map_backend(AGNOSAI_ISOLATION_WASM) == Backend.WASM, "Wasm");
+    assert(agnosai_kavach_map_backend(AGNOSAI_ISOLATION_PROCESS) == Backend.PROCESS, "Process");
+    assert(agnosai_kavach_map_backend(AGNOSAI_ISOLATION_OCI) == Backend.OCI, "Oci");
+
+    # Noop is the backend that scores 0 — the mapping is what makes "no sandbox"
+    # visible in the strength number rather than merely absent.
+    assert(base_score(Backend.NOOP) == 0, "Noop's base score is 0");
+    return 0;
+}
+
+# --- Strength ------------------------------------------------------------
+
+# `strength_for_native_policy`, `_wasm`, `_process`, `strength_ordering_*`.
+fn _t_kv_strength(): i64 {
+    var native = agnosai_kavach_strength_for_policy(agnosai_sandbox_policy_native());
+    var wasm = agnosai_kavach_strength_for_policy(agnosai_sandbox_policy_wasm());
+    var process = agnosai_kavach_strength_for_policy(agnosai_sandbox_policy_process());
+    var container = agnosai_kavach_strength_for_policy(agnosai_sandbox_policy_container());
+
+    # The oracle's bounds.
+    assert(native <= 20, "native is low, as the oracle asserts");
+    assert(wasm >= 60, "wasm is >= 60, as the oracle asserts");
+
+    # The exact values. Pinned because the +5 seccomp modifier that produces
+    # them comes from `policy_basic()`, and starting from `policy_new()` instead
+    # would move wasm 75 -> 70 with every bound above still satisfied.
+    assert(native == 10, "native scores exactly 10 (Noop 0, +5 seccomp, +5 no-network)");
+    assert(wasm == 75, "wasm scores exactly 75 — the value that drops to 70 without policy_basic()");
+    assert(process == 60, "process scores exactly 60");
+    assert(container == 60, "container scores 60 — Oci 55 +5 seccomp, and NO no-network bonus");
+
+    # **The oracle's ordering test asserts only these two**, and deliberately
+    # not `wasm < process`, because that is FALSE: kavach scores WASM (65 base)
+    # above Process (50 base). A port that "completed" the ordering would fail.
+    assert(native < wasm, "native < wasm");
+    assert(native < process, "native < process");
+    assert(wasm > process,
+    "and wasm OUTSCORES process — higher isolation level, lower kavach score, by design");
+    return 0;
+}
+
+# `strength_label_ranges`.
+fn _t_kv_strength_label(): i64 {
+    assert(str_eq_cstr(str_from(agnosai_kavach_strength_label(0)), "minimal") == 1, "0 is minimal");
+    assert(str_eq_cstr(str_from(agnosai_kavach_strength_label(50)), "standard") == 1,
+    "50 is standard — the boundary is < 50 for basic, so 50 lands above it");
+    assert(str_eq_cstr(str_from(agnosai_kavach_strength_label(90)), "fortress") == 1,
+    "90 is fortress");
+    # The bands the oracle does not check.
+    assert(str_eq_cstr(str_from(agnosai_kavach_strength_label(29)), "minimal") == 1, "29 minimal");
+    assert(str_eq_cstr(str_from(agnosai_kavach_strength_label(30)), "basic") == 1, "30 basic");
+    assert(str_eq_cstr(str_from(agnosai_kavach_strength_label(69)), "standard") == 1, "69 standard");
+    assert(str_eq_cstr(str_from(agnosai_kavach_strength_label(70)), "hardened") == 1, "70 hardened");
+    assert(str_eq_cstr(str_from(agnosai_kavach_strength_label(84)), "hardened") == 1, "84 hardened");
+    assert(str_eq_cstr(str_from(agnosai_kavach_strength_label(85)), "fortress") == 1, "85 fortress");
+    return 0;
+}
+
+# --- build_config --------------------------------------------------------
+
+# `build_config_sets_backend`, plus what the oracle cannot reach.
+fn _t_kv_build_config(): i64 {
+    var c = agnosai_kavach_build_config(agnosai_sandbox_policy_process(), 0);
+    assert(SandboxConfig_backend(c) == Backend.PROCESS, "the backend comes from effective isolation");
+    assert(SandboxConfig_timeout_ms(c) == 60000,
+    "max_duration_secs is converted to MILLISECONDS — 60 s becomes 60000");
+
+    var n = agnosai_kavach_build_config(agnosai_sandbox_policy_native(), 0);
+    assert(SandboxConfig_backend(n) == Backend.NOOP, "native builds a Noop config");
+    assert(SandboxConfig_timeout_ms(n) == 300000, "and its 300 s timeout");
+
+    # `agent_id` is optional; 0 is the oracle's `None`.
+    var a = agnosai_kavach_build_config(agnosai_sandbox_policy_process(), str_from("agent-7"));
+    assert(SandboxConfig_agent_id(a) != 0, "an agent id is attached when given");
+
+    # A container policy needs network, so the config must carry it — this is
+    # the field whose default would otherwise silently isolate a tool that
+    # asked for a network, or vice versa.
+    var ct = agnosai_kavach_build_config(agnosai_sandbox_policy_container(), 0);
+    assert(SandboxPolicy_network_enabled(SandboxConfig_policy(ct)) == 1,
+    "a container policy's network requirement reaches the kavach config");
+    assert(SandboxPolicy_network_enabled(SandboxConfig_policy(c)) == 0,
+    "and a process policy's does not");
+    return 0;
+}
+
+# **`max_memory_bytes` is never read**, and that is the oracle's behaviour, not
+# an oversight to fix.
+fn _t_kv_memory_is_not_wired(): i64 {
+    var p = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_PROCESS, 1, 0, 60, 268435456);
+    var c = agnosai_kavach_build_config(p, 0);
+    assert(agnosai_sandbox_policy_max_memory_bytes(p) == 268435456,
+    "the policy carries a memory limit");
+    assert(SandboxPolicy_memory_limit_mb(SandboxConfig_policy(c)) == 0,
+    "...and build_config does NOT forward it — matching the oracle, which never reads the field");
+    return 0;
+}
+
+# The externalization policy the oracle attaches to every config. It has no
+# field to live in here, so it is asserted standalone.
+fn _t_kv_ext_policy(): i64 {
+    var e = agnosai_kavach_default_ext_policy();
+    assert(ExternalizationPolicy_enabled(e) == 1, "the default gate is enabled");
+    assert(ExternalizationPolicy_max_artifact_size_bytes(e) == 52428800, "50 MiB artifact cap");
+    assert(ExternalizationPolicy_block_threshold(e) == Severity.CRITICAL, "blocks at Critical");
+    assert(ExternalizationPolicy_quarantine_threshold(e) == Severity.HIGH, "quarantines at High");
+    assert(ExternalizationPolicy_redact_secrets(e) == 1, "and redacts secrets");
+    return 0;
+}
+
+# --- policy_for_trust ----------------------------------------------------
+
+# `policy_for_trust_minimal`, `_strict`, `_default`.
+fn _t_kv_policy_for_trust(): i64 {
+    # **The inversion**: "minimal" TRUST gets the STRICTEST thresholds.
+    var m = agnosai_kavach_policy_for_trust(str_from("minimal"));
+    assert(ExternalizationPolicy_max_artifact_size_bytes(m) == 1048576, "minimal: 1 MiB");
+    assert(ExternalizationPolicy_block_threshold(m) == Severity.MEDIUM,
+    "minimal trust BLOCKS at Medium — the strictest of the three, because least trusted");
+    assert(ExternalizationPolicy_quarantine_threshold(m) == Severity.LOW, "and quarantines at Low");
+
+    var s = agnosai_kavach_policy_for_trust(str_from("strict"));
+    assert(ExternalizationPolicy_max_artifact_size_bytes(s) == 10485760, "strict: 10 MiB");
+    assert(ExternalizationPolicy_block_threshold(s) == Severity.HIGH, "strict blocks at High");
+    assert(ExternalizationPolicy_quarantine_threshold(s) == Severity.MEDIUM, "quarantines at Medium");
+
+    # Ordering: minimal is strictly tighter than strict, which is tighter than
+    # the default. Asserting the relationship catches a table transposed.
+    var d = agnosai_kavach_policy_for_trust(str_from("basic"));
+    assert(ExternalizationPolicy_max_artifact_size_bytes(m)
+    < ExternalizationPolicy_max_artifact_size_bytes(s),
+    "minimal's cap is tighter than strict's");
+    assert(ExternalizationPolicy_max_artifact_size_bytes(s)
+    < ExternalizationPolicy_max_artifact_size_bytes(d),
+    "and strict's is tighter than the default's");
+    assert(ExternalizationPolicy_block_threshold(m) < ExternalizationPolicy_block_threshold(s),
+    "minimal blocks at a LOWER severity than strict — it is more aggressive");
+
+    # Unrecognised falls to the default, and matching is case-sensitive.
+    assert(ExternalizationPolicy_max_artifact_size_bytes(d) == 52428800,
+    "'basic' is not a table entry — it falls to the default");
+    assert(ExternalizationPolicy_max_artifact_size_bytes(
+    agnosai_kavach_policy_for_trust(str_from("nonsense"))) == 52428800, "so does anything unknown");
+    assert(ExternalizationPolicy_max_artifact_size_bytes(
+    agnosai_kavach_policy_for_trust(str_from("Minimal"))) == 52428800,
+    "matching is case-SENSITIVE, as the oracle's `match` is — 'Minimal' is not 'minimal'");
+    assert(ExternalizationPolicy_max_artifact_size_bytes(
+    agnosai_kavach_policy_for_trust(str_from(""))) == 52428800, "and empty is the default");
+    return 0;
+}
+
+# --- scan_output ---------------------------------------------------------
+
+# An ExecResult carrying `out` as stdout, for reaching kavach's gate directly.
+fn _t_kv_exec_of(out: Str): i64 {
+    var r = exec_result_new();
+    ExecResult_set_exit_code(r, 0);
+    ExecResult_set_stdout(r, str_data(out));
+    ExecResult_set_stderr(r, "");
+    ExecResult_set_duration_ms(r, 0);
+    ExecResult_set_timed_out(r, 0);
+    return r;
+}
+
+# `scan_clean_output_passes`, `scan_secret_output_blocks`, plus the collapse.
+fn _t_kv_scan_output(): i64 {
+    assert(agnosai_kavach_scan_output(str_from("hello world")) == ScanVerdict.PASS,
+    "clean output passes");
+    assert(agnosai_kavach_scan_output(str_from("")) == ScanVerdict.PASS, "so does empty");
+
+    # An AWS-shaped key is what the oracle uses to force a block.
+    var creds = str_from("AKIAIOSFODNN7EXAMPLE aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCY");
+    assert(agnosai_kavach_scan_output(creds) == ScanVerdict.BLOCK,
+    "output carrying a credential blocks");
+
+    # **The collapse.** Only two values may ever come back. A port returning
+    # `ScanResult_verdict` unchanged would emit WARN or QUARANTINE here, and
+    # both would be silent divergences — WARN where the oracle passes, and
+    # QUARANTINE where it blocks.
+    # **The case that makes the collapse observable**, and without which the
+    # assertions below are vacuous. A JWT is scanned at `Severity.HIGH`
+    # (`lib/kavach.cyr:4184`), and the default policy blocks at CRITICAL and
+    # quarantines at HIGH — so the RAW gate verdict here is QUARANTINE. The
+    # oracle's `gate.apply` returns `Err` for it, which it maps to Block.
+    #
+    # A port returning the raw verdict answers QUARANTINE (2) where the oracle
+    # answers Block (3). Verified as load-bearing: removing the collapse makes
+    # exactly this assertion fail.
+    var jwt = str_from(
+    "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+    var raw = ScanResult_verdict(gate_apply(_t_kv_exec_of(jwt), ext_policy_default()));
+    assert(raw == ScanVerdict.QUARANTINE,
+    "a JWT makes kavach's gate answer QUARANTINE — the fourth verdict the oracle cannot see");
+    assert(agnosai_kavach_scan_output(jwt) == ScanVerdict.BLOCK,
+    "...and scan_output collapses it to BLOCK, as the oracle's Err arm does");
+
+    var v1 = agnosai_kavach_scan_output(str_from("hello world"));
+    var v2 = agnosai_kavach_scan_output(creds);
+    assert(v1 == ScanVerdict.PASS || v1 == ScanVerdict.BLOCK, "clean is PASS or BLOCK, never WARN");
+    assert(v2 == ScanVerdict.PASS || v2 == ScanVerdict.BLOCK,
+    "and a secret is PASS or BLOCK, never QUARANTINE — the oracle's Result has only two arms");
+    return 0;
+}
+
+# --- Result --------------------------------------------------------------
+
+fn _t_kv_result(): i64 {
+    var r = agnosai_kavach_result_new(str_from("out"), str_from("err"), 0, 0, 42, 75,
+    ScanVerdict.PASS);
+    assert(str_eq_cstr(agnosai_kavach_result_output(r), "out") == 1, "output");
+    assert(str_eq_cstr(agnosai_kavach_result_stderr(r), "err") == 1, "stderr held separately");
+    assert(agnosai_kavach_result_exit_code(r) == 0, "exit code");
+    assert(agnosai_kavach_result_timed_out(r) == 0, "not timed out");
+    assert(agnosai_kavach_result_duration_ms(r) == 42, "duration");
+    assert(agnosai_kavach_result_strength(r) == 75, "strength travels with the result");
+    assert(agnosai_kavach_result_scan_verdict(r) == ScanVerdict.PASS, "and the verdict");
+
+    # `None` must not be confused with PASS — 0 IS PASS, so the sentinel is -1.
+    var u = agnosai_kavach_result_new(str_from(""), str_from(""), 0, 0, 0, 0,
+    AGNOSAI_KAVACH_NO_VERDICT);
+    assert(agnosai_kavach_result_scan_verdict(u) == AGNOSAI_KAVACH_NO_VERDICT,
+    "an unscanned result reports NO verdict");
+    assert(agnosai_kavach_result_scan_verdict(u) != ScanVerdict.PASS,
+    "...which is explicitly NOT 'passed' — 0 is a real verdict, so the sentinel cannot be 0");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_kv_map_backend();
+    _t_kv_strength();
+    _t_kv_strength_label();
+    _t_kv_build_config();
+    _t_kv_memory_is_not_wired();
+    _t_kv_ext_policy();
+    _t_kv_policy_for_trust();
+    _t_kv_scan_output();
+    _t_kv_result();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
