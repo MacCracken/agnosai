@@ -33,6 +33,18 @@
 # probe forking `/bin/sh -c 'exit 127'` and `/nonexistent/binary` reported
 # **spawned, exit 127** for the first and **spawn failed** for the second.
 #
+# ## Two pipes are not enough — the drain must interleave
+#
+# The oracle reads `stdout` and `stderr` through tokio's `wait_with_output`,
+# which polls both. A port that drains stdout to EOF and *then* reads stderr
+# **deadlocks**: once the stderr pipe fills (64 KiB), the child blocks writing to
+# it, so it never closes stdout, so the parent never finishes its first read.
+#
+# Both read ends are therefore `O_NONBLOCK` and drained round-robin. **Verified
+# before it was written**: a child emitting 70,700 bytes to *each* stream — both
+# past the pipe buffer — is captured whole, where the drain-then-drain shape
+# hangs.
+#
 # ## Env sanitization is the security control, and it is subtractive
 #
 # `SANITIZED_ENV_VARS` (`src/sandbox/mod.cyr`) names four loader-injection
@@ -166,4 +178,179 @@ fn agnosai_envp_has(envp, name: Str): i64 {
 fn agnosai_fd_set_cloexec(fd): i64 {
     if (syscall(SYS_FCNTL, fd, AGNOSAI_F_SETFD, AGNOSAI_FD_CLOEXEC) < 0) { return 0; }
     return 1;
+}
+
+# --- Spawn ----------------------------------------------------------------
+
+# `F_SETFL` — the `fcntl` op that sets file-status flags.
+var AGNOSAI_F_SETFL = 4;
+
+# How much is read per drain iteration.
+var AGNOSAI_SPAWN_CHUNK = 4096;
+
+# The spawn itself failed — `execve` never ran the program.
+#
+# **Distinct from any exit code, and that is the whole point.** A failed
+# `execve` leaves the child alive at 127, which is also what a program that
+# genuinely exits 127 reports. Three oracle sites require `Err` for the first
+# and `Ok(127)` for the second.
+var AGNOSAI_SPAWN_FAILED = 0 - 1;
+
+# The spawn succeeded; the child ran and was reaped.
+var AGNOSAI_SPAWN_OK = 0;
+
+# Field offsets for a completed spawn.
+enum AgnosaiSpawnResultOff {
+    AGN_SPR_STATUS = 0;
+    AGN_SPR_STDOUT = 8;
+    AGN_SPR_STDERR = 16;
+    AGN_SPR_EXIT_CODE = 24;
+    AGN_SPR_SIGNAL = 32;
+    AGN_SPR_SIZE = 40;
+}
+
+# Whether the spawn itself succeeded — `AGNOSAI_SPAWN_OK` or `_FAILED`.
+fn agnosai_spawn_status(r): i64 { return load64(r + AGN_SPR_STATUS); }
+
+# The child's captured stdout.
+fn agnosai_spawn_stdout(r): Str { return load64(r + AGN_SPR_STDOUT); }
+
+# The child's captured stderr, held separately.
+fn agnosai_spawn_stderr(r): Str { return load64(r + AGN_SPR_STDERR); }
+
+# The child's exit code, or **-1 when it was signalled**.
+#
+# -1 matches the oracle's `status.code().unwrap_or(-1)`: a signalled process has
+# no exit code, and reporting 0 would read as success.
+fn agnosai_spawn_exit_code(r): i64 { return load64(r + AGN_SPR_EXIT_CODE); }
+
+# The signal that killed the child, or 0 if it exited normally.
+fn agnosai_spawn_signal(r): i64 { return load64(r + AGN_SPR_SIGNAL); }
+
+# Mark `fd` non-blocking, so a drain loop can round-robin without parking.
+fn _agnosai_fd_set_nonblock(fd): i64 {
+    if (syscall(SYS_FCNTL, fd, AGNOSAI_F_SETFL, O_NONBLOCK) < 0) { return 0; }
+    return 1;
+}
+
+# A spawn result carrying nothing but the failure verdict.
+fn _agnosai_spawn_failure(): i64 {
+    var r = alloc(AGN_SPR_SIZE);
+    store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_FAILED);
+    store64(r + AGN_SPR_STDOUT, str_from(""));
+    store64(r + AGN_SPR_STDERR, str_from(""));
+    store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
+    store64(r + AGN_SPR_SIGNAL, 0);
+    return r;
+}
+
+# Run `path` with `argv` and `envp`, capturing stdout and stderr separately.
+#
+# `argv` and `envp` are NULL-terminated arrays of cstring pointers;
+# `agnosai_sanitized_envp` builds the latter. Returns a spawn result, never 0.
+#
+# **The child's stdin is closed**, not piped — feeding input is the next
+# sub-bite. A child that reads stdin sees EOF immediately, which is correct for
+# every caller this bite serves.
+#
+# Failure is reported through `agnosai_spawn_status`, not through an exit code:
+# see `AGNOSAI_SPAWN_FAILED`.
+fn agnosai_spawn_capture(path, argv, envp): i64 {
+    var op[8];
+    var ep[8];
+    var xp[8];
+    if (sys_pipe(&op) < 0) { return _agnosai_spawn_failure(); }
+    if (sys_pipe(&ep) < 0) { return _agnosai_spawn_failure(); }
+    if (sys_pipe(&xp) < 0) { return _agnosai_spawn_failure(); }
+    var orf = load32(&op);
+    var owf = load32(&op + 4);
+    var erf = load32(&ep);
+    var ewf = load32(&ep + 4);
+    var xrf = load32(&xp);
+    var xwf = load32(&xp + 4);
+
+    # The exec-errno pipe. Its write end closes iff `execve` succeeds, which is
+    # what makes "spawn failed" observable at all.
+    if (agnosai_fd_set_cloexec(xwf) == 0) { return _agnosai_spawn_failure(); }
+
+    var pid = sys_fork();
+    if (pid < 0) { return _agnosai_spawn_failure(); }
+    if (pid == 0) {
+        syscall(SYS_DUP2, owf, 1);
+        syscall(SYS_DUP2, ewf, 2);
+        sys_close(orf);
+        sys_close(erf);
+        sys_close(xrf);
+        sys_execve(path, argv, envp);
+        # Only reachable when `execve` failed: say so down the errno pipe, which
+        # the successful path would have closed.
+        var e[8];
+        store64(&e, 1);
+        sys_write(xwf, &e, 8);
+        syscall(SYS_EXIT_GROUP, 127);
+    }
+
+    sys_close(owf);
+    sys_close(ewf);
+    sys_close(xwf);
+    _agnosai_fd_set_nonblock(orf);
+    _agnosai_fd_set_nonblock(erf);
+
+    # Round-robin, because draining one stream to EOF before the other
+    # deadlocks on a child that fills the second pipe — see the module header.
+    var ob = str_builder_new();
+    var eb = str_builder_new();
+    var buf = alloc(AGNOSAI_SPAWN_CHUNK);
+    var odone = 0;
+    var edone = 0;
+    while (odone == 0 || edone == 0) {
+        if (odone == 0) {
+            var n = sys_read(orf, buf, AGNOSAI_SPAWN_CHUNK);
+            if (n > 0) { str_builder_add(ob, str_new(buf, n)); }
+            if (n == 0) { odone = 1; }
+        }
+        if (edone == 0) {
+            var m = sys_read(erf, buf, AGNOSAI_SPAWN_CHUNK);
+            if (m > 0) { str_builder_add(eb, str_new(buf, m)); }
+            if (m == 0) { edone = 1; }
+        }
+    }
+    sys_close(orf);
+    sys_close(erf);
+
+    # Read the errno pipe AFTER the drain: the child may have exec'd fine and
+    # written output, and this end only reports EOF once the child is gone.
+    var xb[8];
+    var xn = sys_read(xrf, &xb, 8);
+    sys_close(xrf);
+
+    var st[8];
+    store64(&st, 0);
+    sys_waitpid(pid, &st, 0);
+    var raw = load64(&st);
+
+    var r = alloc(AGN_SPR_SIZE);
+    store64(r + AGN_SPR_STDOUT, str_builder_build(ob));
+    store64(r + AGN_SPR_STDERR, str_builder_build(eb));
+
+    if (xn > 0) {
+        # The errno pipe spoke, so `execve` never ran the program.
+        store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_FAILED);
+        store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
+        store64(r + AGN_SPR_SIGNAL, 0);
+        return r;
+    }
+
+    store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_OK);
+    # Low 7 bits are the terminating signal; 0 there means a normal exit whose
+    # code is the next byte up.
+    var sig = raw & 127;
+    if (sig != 0) {
+        store64(r + AGN_SPR_SIGNAL, sig);
+        store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
+    } else {
+        store64(r + AGN_SPR_SIGNAL, 0);
+        store64(r + AGN_SPR_EXIT_CODE, (raw >> 8) & 255);
+    }
+    return r;
 }

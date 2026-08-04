@@ -31,6 +31,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 5 — `agnosai_spawn_capture`: fork, three pipes, exec, status
+  decode.** The primitive `process`, `python`, `oci`'s exec half and `manager`
+  all sit on. 99 assertions total in the suite.
+
+  **Spawn failure is now distinguishable from exit 127**, which is what the
+  exec-errno pipe was built for and what three oracle sites require. A real
+  program exiting 127 reports `SPAWN_OK` + code 127; `/nonexistent/binary`
+  reports `SPAWN_FAILED`.
+
+  **The drain interleaves, and the deadlock it avoids is real.** A child writing
+  70,700 bytes to *each* of stdout and stderr — both past the 64 KiB pipe buffer
+  — is captured whole. Mutation-verified: switching to drain-stdout-then-stderr
+  makes the suite **hang**, because the child blocks writing stderr and so never
+  closes stdout.
+
+  **A note on how the CLOEXEC assertion got honest.** The first mutation —
+  removing `FD_CLOEXEC` from the errno pipe — *passed all 97 tests*, because the
+  errno pipe is read after the drain and EOF arrives anyway once the child
+  exits. The flag only bites when a **grandchild** inherits the descriptor and
+  outlives its parent: `sh -c 'sleep 30 &'` returns immediately but leaves
+  `sleep` holding every inherited fd. With CLOEXEC the write end was closed at
+  `execve` and the parent sees EOF at once; without it the parent blocks for 30
+  seconds. With that case added, the mutation hangs the suite, which is the
+  proof the first version lacked.
+
+  A signalled child reports exit code **-1**, not 0 — matching the oracle's
+  `status.code().unwrap_or(-1)`, where 0 would read as success — plus the signal
+  number separately. stdout and stderr are captured **separately**, asserted in
+  both directions so a port that merged them cannot pass.
+
 - **M7 bite 4 — `sandbox/spawn`, sanitized `envp` + the CLOEXEC primitive.**
   77 assertions. No oracle file corresponds to this module: in Rust the work is
   `Command::env_remove` plus tokio's `Stdio` and `kill_on_drop`, spread across

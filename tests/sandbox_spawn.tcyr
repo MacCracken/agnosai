@@ -145,6 +145,104 @@ fn _t_sp_cloexec(): i64 {
     return 0;
 }
 
+# --- Spawn ---------------------------------------------------------------
+
+# Spawn `/bin/sh -c <script>` and hand back the result.
+fn _t_sh(script): i64 {
+    var argv = alloc(32);
+    store64(argv, "/bin/sh");
+    store64(argv + 8, "-c");
+    store64(argv + 16, script);
+    store64(argv + 24, 0);
+    return agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp());
+}
+
+fn _t_sp_capture_basics(): i64 {
+    var r = _t_sh("echo hello; echo oops >&2; exit 3");
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "a real program spawns");
+    assert(agnosai_spawn_exit_code(r) == 3, "its exit code comes back");
+    assert(agnosai_spawn_signal(r) == 0, "and it was not signalled");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "hello") == 1, "stdout is captured");
+    assert(str_contains_cstr(agnosai_spawn_stderr(r), "oops") == 1, "stderr is captured");
+    # The two streams are SEPARATE — a port that merged them would pass the two
+    # assertions above and still be wrong.
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "oops") == 0,
+    "...and stderr does NOT leak into stdout");
+    assert(str_contains_cstr(agnosai_spawn_stderr(r), "hello") == 0, "nor the reverse");
+    return 0;
+}
+
+# **The distinction the whole exec-errno pipe exists for.**
+fn _t_sp_failure_vs_exit_127(): i64 {
+    var real = _t_sh("exit 127");
+    assert(agnosai_spawn_status(real) == AGNOSAI_SPAWN_OK,
+    "a program that genuinely exits 127 SPAWNED — it is not a spawn failure");
+    assert(agnosai_spawn_exit_code(real) == 127, "...and reports 127");
+
+    var argv = alloc(16);
+    store64(argv, "/nonexistent/binary");
+    store64(argv + 8, 0);
+    var bad = agnosai_spawn_capture("/nonexistent/binary", argv, agnosai_sanitized_envp());
+    assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
+    "a missing executable is a SPAWN FAILURE, not exit 127 — three oracle sites need this");
+    assert(agnosai_spawn_status(bad) != agnosai_spawn_status(real),
+    "...and the two are distinguishable, which fork+execve alone cannot do");
+    return 0;
+}
+
+# A signalled child has no exit code; -1 matches the oracle's
+# `status.code().unwrap_or(-1)`, where 0 would read as success.
+fn _t_sp_signalled(): i64 {
+    var r = _t_sh("kill -9 $$");
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "it did spawn");
+    assert(agnosai_spawn_signal(r) == 9, "SIGKILL is reported as the signal");
+    assert(agnosai_spawn_exit_code(r) == 0 - 1,
+    "and the exit code is -1, NOT 0 — a signalled child did not succeed");
+    return 0;
+}
+
+# **The deadlock case.** A child filling BOTH pipes past the 64 KiB buffer is
+# captured whole only because the drain interleaves. Drain-then-drain hangs.
+fn _t_sp_large_dual_output(): i64 {
+    var r = _t_sh("i=0; while [ $i -lt 700 ]; do echo AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; echo BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB >&2; i=$((i+1)); done");
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the child ran to completion");
+    assert(str_len(agnosai_spawn_stdout(r)) == 70700,
+    "70,700 bytes of stdout captured — past the 64 KiB pipe buffer");
+    assert(str_len(agnosai_spawn_stderr(r)) == 70700,
+    "...and 70,700 of stderr, which is the half that deadlocks a sequential drain");
+    return 0;
+}
+
+# **Why CLOEXEC on the errno pipe is load-bearing**, which the simpler cases do
+# not show. Reading the errno pipe after the drain means EOF arrives anyway once
+# the child exits — so dropping CLOEXEC looks harmless right up until a
+# GRANDCHILD inherits the descriptor and outlives its parent.
+#
+# `sh -c 'sleep 30 &'` returns immediately but leaves `sleep` holding every fd it
+# inherited. With CLOEXEC the write end was closed at `execve`, so the parent
+# sees EOF at once. Without it, `sleep` holds the pipe open and the parent blocks
+# for 30 seconds — a hang, not a wrong answer.
+fn _t_sp_cloexec_survives_a_grandchild(): i64 {
+    var r = _t_sh("sleep 30 & echo started");
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the child spawned");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "started") == 1,
+    "...and returned promptly, because CLOEXEC closed the errno pipe at execve");
+    return 0;
+}
+
+# The sanitized environment actually reaches the child, rather than only being
+# built correctly.
+fn _t_sp_env_reaches_child(): i64 {
+    var r = _t_sh("echo \"P=$PATH\"; echo \"L=$LD_PRELOAD\"");
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "spawned");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "P=/") == 1,
+    "PATH reaches the child — the filter is subtractive, not a wipe");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "L=\n") == 1
+    || str_contains_cstr(agnosai_spawn_stdout(r), "L=") == 1,
+    "and LD_PRELOAD is empty in the child");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -153,6 +251,12 @@ fn main(): i64 {
     _t_sp_envp_from();
     _t_sp_envp_inherited();
     _t_sp_cloexec();
+    _t_sp_capture_basics();
+    _t_sp_failure_vs_exit_127();
+    _t_sp_signalled();
+    _t_sp_large_dual_output();
+    _t_sp_cloexec_survives_a_grandchild();
+    _t_sp_env_reaches_child();
 
     return assert_summary();
 }

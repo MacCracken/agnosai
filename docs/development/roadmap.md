@@ -214,7 +214,12 @@ handler cost bounded and measured" until that filing lands.
 
 ### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
 
-**Bites 1-4 done (2026-08-03).** Bite 4: `spawn`'s sanitized `envp` + the
+**Bites 1-5 done (2026-08-03).** Bite 5: `agnosai_spawn_capture` — fork, three
+pipes, exec, status decode. Spawn failure is distinguishable from exit 127, and
+the drain interleaves so a child filling both pipes cannot deadlock it. Two
+spawn sub-bites remain: stdin feed, then deadline/SIGKILL/reap.
+
+Bite 4: `spawn`'s sanitized `envp` + the
 CLOEXEC primitive (77 assertions) — the first of four spawn sub-bites, and the
 only one testable without forking.
 
