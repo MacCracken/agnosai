@@ -154,7 +154,7 @@ fn _t_sh(script): i64 {
     store64(argv + 8, "-c");
     store64(argv + 16, script);
     store64(argv + 24, 0);
-    return agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp());
+    return agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT);
 }
 
 fn _t_sp_capture_basics(): i64 {
@@ -182,7 +182,7 @@ fn _t_sp_failure_vs_exit_127(): i64 {
     var argv = alloc(16);
     store64(argv, "/nonexistent/binary");
     store64(argv + 8, 0);
-    var bad = agnosai_spawn_capture("/nonexistent/binary", argv, agnosai_sanitized_envp());
+    var bad = agnosai_spawn_capture("/nonexistent/binary", argv, agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT);
     assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
     "a missing executable is a SPAWN FAILURE, not exit 127 — three oracle sites need this");
     assert(agnosai_spawn_status(bad) != agnosai_spawn_status(real),
@@ -251,7 +251,7 @@ fn _t_sh_in(script, input): i64 {
     store64(argv + 8, "-c");
     store64(argv + 16, script);
     store64(argv + 24, 0);
-    return agnosai_spawn_capture_input("/bin/sh", argv, agnosai_sanitized_envp(), input);
+    return agnosai_spawn_capture_input("/bin/sh", argv, agnosai_sanitized_envp(), input, AGNOSAI_SPAWN_NO_TIMEOUT);
 }
 
 fn _t_sp_stdin_basics(): i64 {
@@ -310,9 +310,131 @@ fn _t_sp_stdin_keeps_the_contract(): i64 {
     store64(argv, "/nonexistent/binary");
     store64(argv + 8, 0);
     var bad = agnosai_spawn_capture_input("/nonexistent/binary", argv,
-    agnosai_sanitized_envp(), str_from("ignored"));
+    agnosai_sanitized_envp(), str_from("ignored"), AGNOSAI_SPAWN_NO_TIMEOUT);
     assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
     "spawn failure is still distinguishable when input was supplied");
+    return 0;
+}
+
+
+# This process's own consumed CPU time in ms, or -1 where unavailable.
+#
+# `CLOCK_PROCESS_CPUTIME_ID` (2) advances only while the process is actually
+# running on a CPU, which is exactly what separates a sleeping drain loop from a
+# spinning one. Off Linux the id and the syscall route both differ (see the
+# notes in lib/chrono.cyr), so it reports unavailable rather than a wrong number.
+fn _t_sp_self_cpu_ms(): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    var ts[16];
+    store64(&ts, 0);
+    store64(&ts + 8, 0);
+    if (syscall(228, 2, &ts) < 0) { return 0 - 1; }
+    return load64(&ts) * 1000 + load64(&ts + 8) / 1000000;
+    #endif
+    #ifndef CYRIUS_TARGET_LINUX
+    return 0 - 1;
+    #endif
+}
+
+# ---------------------------------------------------------------------------
+# The deadline: SIGKILL and reap (bite 7)
+# ---------------------------------------------------------------------------
+
+# Run `script` under `sh -c` with a deadline.
+fn _t_sp_deadline(script, ms): i64 {
+    var argv = alloc(32);
+    store64(argv, "/bin/sh");
+    store64(argv + 8, "-c");
+    store64(argv + 16, script);
+    store64(argv + 24, 0);
+    return agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(), ms);
+}
+
+fn _t_sp_timeout_kills(): i64 {
+    var t0 = clock_now_ms();
+    var r = _t_sp_deadline("sleep 60", 300);
+    var dt = clock_now_ms() - t0;
+
+    assert(agnosai_spawn_timed_out(r) == 1, "a child past its deadline reports timed_out");
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK,
+    "a timeout is a result, not a spawn failure - oracle process.rs:308");
+    assert(agnosai_spawn_exit_code(r) == 0 - 1,
+    "exit_code is -1 on timeout, matching ProcessResult");
+    assert(agnosai_spawn_signal(r) == 9, "SIGKILL is what stopped it");
+
+    # The whole point: the call RETURNED, rather than waiting out the sleep.
+    # Without the deadline check this is 60_000.
+    assert(dt < 5000, "the deadline fires instead of waiting for the child");
+    return 0;
+}
+
+fn _t_sp_timeout_reaps(): i64 {
+    # A timed-out child must be reaped, not merely killed. An unreaped child is
+    # a zombie: still in the process table, still owning its end of the pipes.
+    # `waitpid(-1)` here would find it; ECHILD means there is nothing left.
+    var r = _t_sp_deadline("sleep 60", 200);
+    assert(agnosai_spawn_timed_out(r) == 1, "the child hit its deadline");
+
+    var st[8];
+    store64(&st, 0);
+    var orphan = sys_waitpid(0 - 1, &st, WNOHANG);
+    assert(orphan <= 0, "no reapable child is left behind after a timeout");
+    return 0;
+}
+
+fn _t_sp_timeout_kills_a_child_that_traps_term(): i64 {
+    # SIGTERM is catchable and SIGKILL is not. A tool that installs a TERM
+    # handler - or ignores it, as here - would outlive a polite signal, and the
+    # reap that follows would then block forever waiting on a child that never
+    # died. The deadline has to be unignorable to mean anything.
+    var t0 = clock_now_ms();
+    var r = _t_sp_deadline("trap '' TERM; sleep 60", 300);
+    var dt = clock_now_ms() - t0;
+
+    assert(agnosai_spawn_timed_out(r) == 1, "a child IGNORING SIGTERM is still stopped");
+    assert(agnosai_spawn_signal(r) == 9, "...by SIGKILL, which it cannot trap");
+    assert(dt < 5000, "...promptly, rather than blocking on a reap that never returns");
+    return 0;
+}
+
+fn _t_sp_deadline_lets_fast_children_finish(): i64 {
+    # The deadline must not truncate work that fits inside it. A generous
+    # timeout has to be invisible.
+    var r = _t_sp_deadline("echo quick", 30000);
+    assert(agnosai_spawn_timed_out(r) == 0, "a child inside its deadline is not a timeout");
+    assert(agnosai_spawn_exit_code(r) == 0, "...and its exit code is its own");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "quick") == 1,
+    "...and its output survives");
+    return 0;
+}
+
+fn _t_sp_timeout_keeps_partial_output(): i64 {
+    # The primitive returns what it drained before the kill. `process` blanks it
+    # to match ProcessResult; spawn does not, and that split is deliberate -
+    # see the note on agnosai_spawn_timed_out.
+    var r = _t_sp_deadline("echo early; sleep 60", 500);
+    assert(agnosai_spawn_timed_out(r) == 1, "the child was killed");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "early") == 1,
+    "output produced before the deadline is still readable");
+    return 0;
+}
+
+fn _t_sp_idle_child_does_not_burn_the_cpu(): i64 {
+    # The unslept loop measured 100% of a core for as long as the child ran.
+    # Compare the parent's own CPU time against the wall time it waited: a
+    # spinning loop drives the ratio to ~1, a sleeping one keeps it near 0.
+    var c0 = _t_sp_self_cpu_ms();
+    if (c0 < 0) { return 0; }
+    var t0 = clock_now_ms();
+    var r = _t_sp_deadline("sleep 1", 30000);
+    var wall = clock_now_ms() - t0;
+    var cpu = _t_sp_self_cpu_ms() - c0;
+
+    assert(agnosai_spawn_timed_out(r) == 0, "the child finished on its own");
+    assert(wall >= 900, "...after actually sleeping");
+    # A tenth of the wall clock is enormous headroom for a loop that should be
+    # asleep, and far under the ~100% a spinning one spends.
+    assert(cpu * 10 < wall, "the drain loop sleeps instead of spinning");
     return 0;
 }
 
@@ -333,6 +455,12 @@ fn main(): i64 {
     _t_sp_stdin_basics();
     _t_sp_stdin_large_roundtrip();
     _t_sp_stdin_keeps_the_contract();
+    _t_sp_timeout_kills();
+    _t_sp_timeout_reaps();
+    _t_sp_timeout_kills_a_child_that_traps_term();
+    _t_sp_deadline_lets_fast_children_finish();
+    _t_sp_timeout_keeps_partial_output();
+    _t_sp_idle_child_does_not_burn_the_cpu();
 
     return assert_summary();
 }

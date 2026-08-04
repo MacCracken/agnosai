@@ -31,6 +31,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 7 — the spawn deadline: SIGKILL, reap, and an idle loop.** 132
+  assertions in the suite; `agnosai_spawn_capture` and
+  `agnosai_spawn_capture_input` both take a `timeout_ms`, and the result carries
+  `timed_out` alongside the exit code and signal.
+
+  **There is no `kill_on_drop` here.** The oracle gets teardown free from tokio
+  (`process.rs:112`, `python.rs:76`), so every early return in Cyrius has to kill
+  and reap by hand or leave a zombie holding the pipe ends open — after which the
+  next drain waits for an EOF that is never coming.
+  `_agnosai_spawn_kill_and_reap` is the one place that does it.
+
+  **SIGKILL, not SIGTERM, and the test now depends on the difference.** The first
+  version reported a hardcoded signal 9 on the timeout path, which made swapping
+  in SIGTERM undetectable — every mutation passed. The reap now returns the raw
+  wait status and the result reports the signal the child *actually* died from,
+  and a child running `trap '' TERM; sleep 60` proves an ignorable signal is not
+  enough.
+
+  Five mutations, each caught: no reap (a zombie survives `waitpid(WNOHANG)`), no
+  deadline check, no idle sleep, SIGTERM for SIGKILL, and `timed_out` pinned to 0.
+
+### Fixed
+
+- **The drain loop burned a full CPU core for as long as a child ran.** Both pipe
+  read ends are `O_NONBLOCK`, so a read with nothing available returns
+  immediately and the loop shipped in bites 5 and 6 simply retried. Measured
+  against a child running `sleep 2`: **100% CPU for 2.006 s** — a server running
+  sandboxed tools would have spent a core per concurrent tool doing nothing.
+
+  An iteration that moves no bytes now sleeps 5 ms, which also supplies the tick
+  the deadline is checked on. Same probe after the fix: **0% CPU**. The test
+  compares the parent's own `CLOCK_PROCESS_CPUTIME_ID` against the wall time it
+  waited, so removing the sleep fails rather than merely slowing things down.
+
+- **A sandboxed child inherited the server's stdin.** `agnosai_spawn_capture` was
+  a second copy of the drain loop that never touched fd 0, where the oracle pipes
+  stdin on every spawn it makes (`process.rs:109`, `:189`). It is now defined as
+  `agnosai_spawn_capture_input` with an empty input — one implementation, which
+  cannot drift from itself the way the copy already had.
+
 - **M7 bite 6 — `agnosai_spawn_capture_input`: the stdin feed.** 114 assertions
   in the suite. A 200,000-byte input round-trips through `cat` and comes back
   byte-for-byte.

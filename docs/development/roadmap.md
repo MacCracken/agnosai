@@ -214,10 +214,22 @@ handler cost bounded and measured" until that filing lands.
 
 ### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
 
-**Bites 1-6 done (2026-08-03).** Bite 6: the stdin feed — a second deadlock,
+**Bites 1-7 done (2026-08-04). The spawn primitive is complete** — `process`,
+`oci`'s exec half, `python` and `manager` all build directly on it.
+
+Bite 7: the deadline. Cyrius has no `kill_on_drop`, so `_agnosai_spawn_kill_and_reap`
+does by hand what tokio does on drop; a child that ignores SIGTERM proves why the
+signal is SIGKILL. Two defects in the already-shipped loop surfaced with it: it
+**burned 100% of a core** for as long as any child ran (both read ends are
+`O_NONBLOCK` and it simply retried — measured at 2.006 s of CPU against
+`sleep 2`, now 0%), and `agnosai_spawn_capture` was a second copy of the loop
+that left the child's stdin **inherited from the server**, where the oracle pipes
+stdin on every spawn. The copy is gone — `capture` is now `capture_input` with an
+empty input.
+
+Bite 6: the stdin feed — a second deadlock,
 distinct from the output one and caused by the oracle's own write-then-read
-shape; the write now interleaves with the drain. One spawn sub-bite remains:
-deadline / SIGKILL / reap.
+shape; the write now interleaves with the drain.
 
 Bite 5: `agnosai_spawn_capture` — fork, three
 pipes, exec, status decode. Spawn failure is distinguishable from exit 127, and

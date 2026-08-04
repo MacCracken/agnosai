@@ -11,7 +11,7 @@
 # It landed in pieces because the whole thing is large and each piece is
 # separately provable: sanitized `envp` and the CLOEXEC bit (bite 4, the only
 # part testable without forking), then fork/pipes/exec/status (bite 5), then the
-# stdin feed (bite 6). Deadline and kill remain.
+# stdin feed (bite 6), then the deadline, SIGKILL and reap (bite 7).
 #
 # ## The exec-errno pipe — proven before it was designed in
 #
@@ -32,6 +32,23 @@
 # FD_CLOEXEC)` is; `SYS_FCNTL` (72) and `O_CLOEXEC` (524288) are both defined. A
 # probe forking `/bin/sh -c 'exit 127'` and `/nonexistent/binary` reported
 # **spawned, exit 127** for the first and **spawn failed** for the second.
+#
+# ## The loop sleeps when idle, and that is not a nicety
+#
+# Both read ends are `O_NONBLOCK`, so a read with nothing available returns at
+# once. A loop that just retries therefore **burns a core** for as long as the
+# child is thinking. Measured on the version that shipped in bite 5, against a
+# child running `sleep 2`: **100% CPU for 2.006 s**. A short sleep on an
+# iteration that moved no bytes drops that to nothing, and doubles as the tick
+# the deadline is checked on.
+#
+# ## There is no `kill_on_drop`, so every exit path kills and reaps explicitly
+#
+# The oracle gets teardown free from tokio (`process.rs:112`, `:192`,
+# `python.rs:76`, `oci.rs:149`). Cyrius has no RAII: a child left behind after a
+# timeout keeps its pipe ends open, so the parent's next drain never sees EOF,
+# and the process table fills with zombies. `_agnosai_spawn_kill_and_reap` is
+# the single place that does it, called from the one path that can end early.
 #
 # ## Three pipes are not enough either — the stdin WRITE must interleave too
 #
@@ -219,7 +236,8 @@ enum AgnosaiSpawnResultOff {
     AGN_SPR_STDERR = 16;
     AGN_SPR_EXIT_CODE = 24;
     AGN_SPR_SIGNAL = 32;
-    AGN_SPR_SIZE = 40;
+    AGN_SPR_TIMED_OUT = 40;
+    AGN_SPR_SIZE = 48;
 }
 
 # Whether the spawn itself succeeded — `AGNOSAI_SPAWN_OK` or `_FAILED`.
@@ -239,6 +257,50 @@ fn agnosai_spawn_exit_code(r): i64 { return load64(r + AGN_SPR_EXIT_CODE); }
 
 # The signal that killed the child, or 0 if it exited normally.
 fn agnosai_spawn_signal(r): i64 { return load64(r + AGN_SPR_SIGNAL); }
+
+# Whether the deadline fired and the child was killed.
+#
+# **Distinct from being signalled.** A child that SIGKILLs itself reports signal
+# 9 and `timed_out` 0; one the deadline killed reports signal 9 and `timed_out`
+# 1. Only the second is agnosai's doing, and only the second should surface to a
+# caller as a timeout.
+#
+# **The partial output survives here on purpose, and `process` must discard it.**
+# The oracle's timeout arm returns `stdout: String::new(), stderr: String::new()`
+# (`process.rs:154-160`) because cancelling `wait_with_output` throws the buffers
+# away — it does not choose to hide them. This primitive has no oracle
+# counterpart (it stands in for tokio's `Command`), so it keeps what it drained;
+# `ProcessResult` is where the oracle's shape is owed, and that is where the
+# blanking goes.
+fn agnosai_spawn_timed_out(r): i64 { return load64(r + AGN_SPR_TIMED_OUT); }
+
+# How long an idle iteration waits before looking again.
+#
+# The floor on how fast output is noticed, and the granularity of the deadline.
+# 5 ms costs 200 wakeups a second against a child producing nothing, versus the
+# 100%-of-a-core the unslept loop measured.
+var AGNOSAI_SPAWN_IDLE_MS = 5;
+
+# No deadline — run until the child finishes on its own.
+var AGNOSAI_SPAWN_NO_TIMEOUT = 0;
+
+# SIGKILL the child and reap it, so it cannot linger holding pipe ends.
+#
+# SIGKILL rather than SIGTERM, matching tokio's `kill_on_drop`: a tool that has
+# blown its deadline has already had its chance to exit, and a catchable signal
+# it ignores would leave exactly the zombie this exists to prevent.
+# Returns the child's raw wait status, so the caller reports the signal the
+# child **actually** died from rather than the one this meant to send. The two
+# can differ — a child already dying of something else when the deadline lands
+# reports that cause — and a result that hardcoded 9 would describe the
+# intention instead of the event.
+fn _agnosai_spawn_kill_and_reap(pid): i64 {
+    sys_kill(pid, 9);
+    var st[8];
+    store64(&st, 0);
+    sys_waitpid(pid, &st, 0);
+    return load64(&st);
+}
 
 # Mark `fd` non-blocking, so a drain loop can round-robin without parking.
 fn _agnosai_fd_set_nonblock(fd): i64 {
@@ -268,105 +330,6 @@ fn _agnosai_spawn_failure(): i64 {
 #
 # Failure is reported through `agnosai_spawn_status`, not through an exit code:
 # see `AGNOSAI_SPAWN_FAILED`.
-fn agnosai_spawn_capture(path, argv, envp): i64 {
-    var op[8];
-    var ep[8];
-    var xp[8];
-    if (sys_pipe(&op) < 0) { return _agnosai_spawn_failure(); }
-    if (sys_pipe(&ep) < 0) { return _agnosai_spawn_failure(); }
-    if (sys_pipe(&xp) < 0) { return _agnosai_spawn_failure(); }
-    var orf = load32(&op);
-    var owf = load32(&op + 4);
-    var erf = load32(&ep);
-    var ewf = load32(&ep + 4);
-    var xrf = load32(&xp);
-    var xwf = load32(&xp + 4);
-
-    # The exec-errno pipe. Its write end closes iff `execve` succeeds, which is
-    # what makes "spawn failed" observable at all.
-    if (agnosai_fd_set_cloexec(xwf) == 0) { return _agnosai_spawn_failure(); }
-
-    var pid = sys_fork();
-    if (pid < 0) { return _agnosai_spawn_failure(); }
-    if (pid == 0) {
-        syscall(SYS_DUP2, owf, 1);
-        syscall(SYS_DUP2, ewf, 2);
-        sys_close(orf);
-        sys_close(erf);
-        sys_close(xrf);
-        sys_execve(path, argv, envp);
-        # Only reachable when `execve` failed: say so down the errno pipe, which
-        # the successful path would have closed.
-        var e[8];
-        store64(&e, 1);
-        sys_write(xwf, &e, 8);
-        syscall(SYS_EXIT_GROUP, 127);
-    }
-
-    sys_close(owf);
-    sys_close(ewf);
-    sys_close(xwf);
-    _agnosai_fd_set_nonblock(orf);
-    _agnosai_fd_set_nonblock(erf);
-
-    # Round-robin, because draining one stream to EOF before the other
-    # deadlocks on a child that fills the second pipe — see the module header.
-    var ob = str_builder_new();
-    var eb = str_builder_new();
-    var buf = alloc(AGNOSAI_SPAWN_CHUNK);
-    var odone = 0;
-    var edone = 0;
-    while (odone == 0 || edone == 0) {
-        if (odone == 0) {
-            var n = sys_read(orf, buf, AGNOSAI_SPAWN_CHUNK);
-            if (n > 0) { str_builder_add(ob, str_new(buf, n)); }
-            if (n == 0) { odone = 1; }
-        }
-        if (edone == 0) {
-            var m = sys_read(erf, buf, AGNOSAI_SPAWN_CHUNK);
-            if (m > 0) { str_builder_add(eb, str_new(buf, m)); }
-            if (m == 0) { edone = 1; }
-        }
-    }
-    sys_close(orf);
-    sys_close(erf);
-
-    # Read the errno pipe AFTER the drain: the child may have exec'd fine and
-    # written output, and this end only reports EOF once the child is gone.
-    var xb[8];
-    var xn = sys_read(xrf, &xb, 8);
-    sys_close(xrf);
-
-    var st[8];
-    store64(&st, 0);
-    sys_waitpid(pid, &st, 0);
-    var raw = load64(&st);
-
-    var r = alloc(AGN_SPR_SIZE);
-    store64(r + AGN_SPR_STDOUT, str_builder_build(ob));
-    store64(r + AGN_SPR_STDERR, str_builder_build(eb));
-
-    if (xn > 0) {
-        # The errno pipe spoke, so `execve` never ran the program.
-        store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_FAILED);
-        store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
-        store64(r + AGN_SPR_SIGNAL, 0);
-        return r;
-    }
-
-    store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_OK);
-    # Low 7 bits are the terminating signal; 0 there means a normal exit whose
-    # code is the next byte up.
-    var sig = raw & 127;
-    if (sig != 0) {
-        store64(r + AGN_SPR_SIGNAL, sig);
-        store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
-    } else {
-        store64(r + AGN_SPR_SIGNAL, 0);
-        store64(r + AGN_SPR_EXIT_CODE, (raw >> 8) & 255);
-    }
-    return r;
-}
 
 # Run `path` with `argv` and `envp`, feeding `input` on stdin and capturing both
 # output streams.
@@ -376,7 +339,7 @@ fn agnosai_spawn_capture(path, argv, envp): i64 {
 #
 # **The write interleaves with the reads.** Writing the whole input first is
 # what the oracle does and what deadlocks here — see the module header.
-fn agnosai_spawn_capture_input(path, argv, envp, input: Str): i64 {
+fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms): i64 {
     var ip[8];
     var op[8];
     var ep[8];
@@ -435,7 +398,13 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str): i64 {
     # forever for a byte that is never coming.
     if (ilen == 0) { sys_close(iwf); iopen = 0; }
 
+    var deadline = 0;
+    if (timeout_ms > 0) { deadline = clock_now_ms() + timeout_ms; }
+    var killed = 0;
+    var kraw = 0;
+
     while (odone == 0 || edone == 0) {
+        var moved = 0;
         if (iopen == 1) {
             var want = ilen - isent;
             if (want > AGNOSAI_SPAWN_CHUNK) { want = AGNOSAI_SPAWN_CHUNK; }
@@ -443,20 +412,32 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str): i64 {
                 var w = sys_write(iwf, idata + isent, want);
                 # A negative return is EAGAIN — the child has not drained its
                 # stdin yet. Not an error: come back next turn.
-                if (w > 0) { isent = isent + w; }
+                if (w > 0) { isent = isent + w; moved = 1; }
             }
             if (isent >= ilen) { sys_close(iwf); iopen = 0; }
         }
         if (odone == 0) {
             var n = sys_read(orf, buf, AGNOSAI_SPAWN_CHUNK);
-            if (n > 0) { str_builder_add(ob, str_new(buf, n)); }
+            if (n > 0) { str_builder_add(ob, str_new(buf, n)); moved = 1; }
             if (n == 0) { odone = 1; }
         }
         if (edone == 0) {
             var m = sys_read(erf, buf, AGNOSAI_SPAWN_CHUNK);
-            if (m > 0) { str_builder_add(eb, str_new(buf, m)); }
+            if (m > 0) { str_builder_add(eb, str_new(buf, m)); moved = 1; }
             if (m == 0) { edone = 1; }
         }
+
+        if (deadline > 0 && clock_now_ms() >= deadline) {
+            # Kill FIRST, then leave: the child's pipe ends must close or the
+            # loop below would wait on EOF that is never coming.
+            kraw = _agnosai_spawn_kill_and_reap(pid);
+            killed = 1;
+            odone = 1;
+            edone = 1;
+        }
+        # Sleeping only when nothing moved keeps a busy child at full speed and
+        # an idle one off the CPU — see the module header.
+        if (moved == 0 && killed == 0) { sleep_ms(AGNOSAI_SPAWN_IDLE_MS); }
     }
     if (iopen == 1) { sys_close(iwf); }
     sys_close(orf);
@@ -468,12 +449,15 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str): i64 {
 
     var st[8];
     store64(&st, 0);
-    sys_waitpid(pid, &st, 0);
+    # Already reaped on the timeout path — waiting again would block on a child
+    # that no longer exists.
+    if (killed == 0) { sys_waitpid(pid, &st, 0); }
     var raw = load64(&st);
 
     var r = alloc(AGN_SPR_SIZE);
     store64(r + AGN_SPR_STDOUT, str_builder_build(ob));
     store64(r + AGN_SPR_STDERR, str_builder_build(eb));
+    store64(r + AGN_SPR_TIMED_OUT, killed);
 
     if (xn > 0) {
         store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_FAILED);
@@ -483,6 +467,11 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str): i64 {
     }
 
     store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_OK);
+    if (killed == 1) {
+        store64(r + AGN_SPR_SIGNAL, kraw & 127);
+        store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
+        return r;
+    }
     var sig = raw & 127;
     if (sig != 0) {
         store64(r + AGN_SPR_SIGNAL, sig);
@@ -492,4 +481,16 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str): i64 {
         store64(r + AGN_SPR_EXIT_CODE, (raw >> 8) & 255);
     }
     return r;
+}
+
+# Run `path` with no stdin, capturing stdout and stderr.
+#
+# Exactly `agnosai_spawn_capture_input` with an empty input, and defined as that
+# call rather than a second copy of the drain loop. The duplicate that stood here
+# through bites 5 and 6 had already drifted: it left the child's stdin
+# **inherited** from the parent, where the oracle pipes stdin on every spawn it
+# makes (`process.rs:109`, `:189`) — a sandboxed tool could have read the
+# server's own stdin. One implementation cannot drift from itself.
+fn agnosai_spawn_capture(path, argv, envp, timeout_ms): i64 {
+    return agnosai_spawn_capture_input(path, argv, envp, str_from(""), timeout_ms);
 }
