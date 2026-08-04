@@ -46,16 +46,21 @@
 # modifier and move the wasm score from **75 to 70**, silently, with every test
 # still passing. The redundant branch documents that `basic()` is required.
 #
-# ## `externalization` cannot be set on the config
+# ## `externalization` is attached to the config — kavach 3.11.2
 #
 # The oracle's `build_config` calls `.externalization(ExternalizationPolicy::
-# default())` unconditionally. Cyrius kavach's `SandboxConfig`
-# (`lib/kavach.cyr:3300-3310`) has **no such field** — backend, policy,
-# timeout_ms, inner_backend, agent_id, hostname, domainname, workdir, rootfs and
-# nothing else. The call has no counterpart, so the oracle's
-# `build_config_enables_externalization` test cannot port as written. Filed
-# against kavach; `agnosai_kavach_default_ext_policy` exists so the intended
-# policy is still constructible and testable at the call site.
+# default())` unconditionally, and Cyrius kavach's `SandboxConfig` had no such
+# field until agnosai filed for one. **kavach 3.11.2 added it**
+# (`config_externalization(c, p)`, struct 72 → 80 bytes), so the call ports
+# directly and the oracle's `build_config_enables_externalization` test — the
+# one test of the sixteen that could not be written — now has something to
+# assert against.
+#
+# **kavach carries the policy; it does not apply it.** The lifecycle runs no
+# gate, so `agnosai_kavach_scan_output` still invokes `gate_apply` itself. What
+# the field buys is that two sandboxes built for different crew trust levels are
+# distinguishable from their configs, which is what `policy_for_trust` exists to
+# produce.
 # =========================================================================
 
 # Field offsets for one sandboxed execution's result.
@@ -107,8 +112,7 @@ fn _agnosai_kavach_to_policy(policy): i64 {
 # `build_config` — a kavach `SandboxConfig` from an agnosai policy.
 #
 # `agent_id` is a `Str`, or 0 for the oracle's `None`. Note `max_memory_bytes`
-# is deliberately not read, and `externalization` has no field to set — both
-# explained in the module header.
+# is deliberately not read — see the module header.
 fn agnosai_kavach_build_config(policy, agent_id): i64 {
     var eff = agnosai_sandbox_policy_effective_isolation(policy);
     var c = config_new();
@@ -116,16 +120,19 @@ fn agnosai_kavach_build_config(policy, agent_id): i64 {
     config_network(c, agnosai_sandbox_policy_needs_network(policy));
     config_timeout_ms(c, agnosai_sandbox_policy_max_duration_secs(policy) * 1000);
     if (agent_id != 0) { config_agent_id(c, str_data(agent_id)); }
+    # Unconditional, exactly as the oracle does it — every sandbox gets the
+    # default gate policy, regardless of isolation level.
+    config_externalization(c, ext_policy_default());
     if (eff >= AGNOSAI_ISOLATION_PROCESS) { config_policy_seccomp(c, "basic"); }
     return c;
 }
 
 # The externalization policy the oracle attaches to every config.
 #
-# Exposed on its own because `SandboxConfig` has nowhere to put it here — see
-# the module header. `ext_policy_default()` is kavach's own default and matches
-# the oracle's `ExternalizationPolicy::default()`: 50 MiB, block at Critical,
-# quarantine at High, redaction on.
+# `ext_policy_default()` is kavach's own default and matches the oracle's
+# `ExternalizationPolicy::default()`: 50 MiB, block at Critical, quarantine at
+# High, redaction on. Named here because `build_config` attaches it and a caller
+# wanting to scan output by hand needs the same value.
 fn agnosai_kavach_default_ext_policy(): i64 {
     return ext_policy_default();
 }

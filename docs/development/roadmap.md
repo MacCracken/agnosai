@@ -214,7 +214,11 @@ handler cost bounded and measured" until that filing lands.
 
 ### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
 
-**Bites 1-3 done (2026-08-03).** Bite 3: `kavach_bridge`'s pure half — backend
+**Bites 1-4 done (2026-08-03).** Bite 4: `spawn`'s sanitized `envp` + the
+CLOEXEC primitive (77 assertions) — the first of four spawn sub-bites, and the
+only one testable without forking.
+
+Bite 3: `kavach_bridge`'s pure half — backend
 mapping, config, strength scoring, the 4→2 scan collapse, the trust table
 (66 assertions).
 
@@ -251,12 +255,20 @@ permitted *everywhere* before, and a sandbox that read-only-mounts `/usr` to run
 `python3` is the ordinary case. agnosai pins 3.11.1 and re-ran the original
 probe: the victim file and directory now survive. The cx bites are unblocked.
 
-**⛔ Blocks spawn-failure parity:** `fork` + `execve` cannot distinguish "spawn
-failed" from "child ran and exited 127" — the whole stdlib resolves an `execve`
-failure to `sys_exit(127)`. Three oracle sites need `Err`-on-spawn-failure
-(`oci.rs:219`, `process.rs:331`, `python.rs:87`). The standard fix is a fourth
-`O_CLOEXEC` exec-errno pipe; verify whether that flag is reachable before
-committing to the design.
+**✅ CLEARED — spawn-failure parity is reachable.** `fork` + `execve` alone
+cannot distinguish "spawn failed" from "child ran and exited 127", and three
+oracle sites need `Err` on the former (`oci.rs:219`, `process.rs:331`,
+`python.rs:87`). The fix is a fourth **exec-errno pipe** whose write end carries
+`FD_CLOEXEC`, so it closes itself iff `execve` succeeds: a parent that reads
+bytes knows the exec failed, and EOF means it worked.
+
+**Proven on this box before committing to it** (2026-08-03). `pipe2` is not
+wrapped on x86_64, but `sys_pipe` + `syscall(SYS_FCNTL, wfd, F_SETFD,
+FD_CLOEXEC)` is — `SYS_FCNTL = 72` and `O_CLOEXEC = 524288` are both defined. A
+probe run against two children — `/bin/sh -c 'exit 127'` and
+`/nonexistent/binary` — reports **spawned (exit 127)** for the first and **spawn
+failed** for the second, which is exactly the distinction the three oracle sites
+need.
 
 **Smaller, recorded so they are not re-derived:** kavach's `SandboxConfig` has no
 `externalization` field, so `build_config`'s per-call policy is unrepresentable

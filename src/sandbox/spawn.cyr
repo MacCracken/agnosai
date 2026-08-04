@@ -1,0 +1,169 @@
+# =========================================================================
+# sandbox/spawn — the subprocess primitive the sandbox backends share.
+#
+# Parity oracle: the spawn halves of rust-old/src/sandbox/{process,python,oci}.rs
+#
+# **M7 bite 4 — sanitized `envp`, the first piece.** No oracle file corresponds
+# to this module: in Rust the work is `Command::env_remove` plus tokio's
+# `Stdio::piped()` and `kill_on_drop`, spread across three call sites. Cyrius
+# has none of that, so the three backends need one primitive underneath them
+# rather than three hand-rolled `fork` loops.
+#
+# It lands in pieces because the whole thing is large and each piece is
+# separately provable. This one is the only part testable **without** forking,
+# so it goes first.
+#
+# ## The exec-errno pipe — proven before it was designed in
+#
+# The rest of this module rests on one thing being possible: telling **"spawn
+# failed"** apart from **"the child ran and exited 127"**. `fork` + `execve`
+# cannot, because a failed `execve` leaves the child alive and every stdlib path
+# resolves that to `sys_exit(127)` — indistinguishable from a program that
+# legitimately exits 127. Three oracle sites require the distinction:
+# `oci.rs:219` (`missing_runtime_returns_error`), `process.rs:331`
+# (`invalid_executable`), and `python.rs:87` ("failed to spawn python process").
+#
+# The answer is a fourth pipe carrying **`FD_CLOEXEC` on its write end**, so the
+# kernel closes it exactly when `execve` succeeds. The parent then reads: bytes
+# mean the exec failed, EOF means it worked.
+#
+# **Verified on this box before committing to it** (2026-08-03). `pipe2` is not
+# wrapped on x86_64, but `sys_pipe` + `syscall(SYS_FCNTL, wfd, F_SETFD,
+# FD_CLOEXEC)` is; `SYS_FCNTL` (72) and `O_CLOEXEC` (524288) are both defined. A
+# probe forking `/bin/sh -c 'exit 127'` and `/nonexistent/binary` reported
+# **spawned, exit 127** for the first and **spawn failed** for the second.
+#
+# ## Env sanitization is the security control, and it is subtractive
+#
+# `SANITIZED_ENV_VARS` (`src/sandbox/mod.cyr`) names four loader-injection
+# vectors. The oracle removes them from an inherited environment with
+# `Command::env_remove`; here the inherited block is read and rebuilt without
+# them, which is the same operation spelled out.
+#
+# **Matching is on the NAME only — everything before the first `=`.** An entry
+# is `KEY=VALUE`, and a value that happens to contain the string `LD_PRELOAD`
+# is not a variable named `LD_PRELOAD`. Testing the whole entry would drop
+# innocent variables and, worse, would make the filter's behaviour depend on
+# data an attacker supplies.
+# =========================================================================
+
+# `F_SETFD` — the `fcntl` op that sets file-descriptor flags.
+var AGNOSAI_F_SETFD = 2;
+
+# `FD_CLOEXEC` — close this descriptor on a successful `execve`.
+#
+# The whole exec-errno mechanism is this one bit: the write end disappears iff
+# the exec worked, which turns "did it work?" into "did I read anything?".
+var AGNOSAI_FD_CLOEXEC = 1;
+
+# The name half of a `KEY=VALUE` environ entry, as a `Str` borrowing the entry.
+#
+# An entry with no `=` is malformed; the whole entry is treated as the name,
+# which is what makes such an entry testable against the sanitized list rather
+# than silently passed through.
+fn _agnosai_env_entry_name(entry): Str {
+    var i = 0;
+    while (load8(entry + i) != 0) {
+        if (load8(entry + i) == 61) { return str_new(entry, i); }
+        i = i + 1;
+    }
+    return str_new(entry, i);
+}
+
+# Whether this environ entry must not reach a sandboxed child.
+#
+# Compares the **name only** — see the module header on why the value must not
+# participate.
+fn agnosai_env_entry_is_sanitized(entry): i64 {
+    if (entry == 0) { return 0; }
+    return agnosai_is_sanitized_env_var(_agnosai_env_entry_name(entry));
+}
+
+# Build a NULL-terminated `envp` for a sandboxed child: the parent's environment
+# with every `SANITIZED_ENV_VARS` entry removed.
+#
+# Returns an array of cstring pointers terminated by 0, never 0 itself — a child
+# with no environment at all is still a valid child, and returning 0 would push
+# a null check into every caller for a case that is not an error.
+#
+# The entries point into the same heap blob `_read_environ_envp` allocated, so
+# the array survives `fork` without copying strings.
+fn agnosai_sanitized_envp(): i64 {
+    var src = _read_environ_envp();
+    if (src == 0) {
+        var empty = alloc(8);
+        store64(empty, 0);
+        return empty;
+    }
+
+    var n = 0;
+    while (load64(src + n * 8) != 0) { n = n + 1; }
+
+    var out = alloc((n + 1) * 8);
+    var oi = 0;
+    var i = 0;
+    while (i < n) {
+        var e = load64(src + i * 8);
+        if (agnosai_env_entry_is_sanitized(e) == 0) {
+            store64(out + oi * 8, e);
+            oi = oi + 1;
+        }
+        i = i + 1;
+    }
+    store64(out + oi * 8, 0);
+    return out;
+}
+
+# Build an `envp` from an explicit `KEY=VALUE` vec, sanitized the same way.
+#
+# For a caller that supplies its own environment rather than inheriting one.
+# **The filter applies here too**, deliberately: a caller passing `LD_PRELOAD`
+# explicitly is the same injection the inherited path exists to stop, and a
+# sanitizer that only covers the inherited case is one an attacker routes
+# around by supplying the variable instead.
+fn agnosai_sanitized_envp_from(entries): i64 {
+    var n = vec_len(entries);
+    var out = alloc((n + 1) * 8);
+    var oi = 0;
+    var i = 0;
+    while (i < n) {
+        var e = str_data(vec_get(entries, i));
+        if (agnosai_env_entry_is_sanitized(e) == 0) {
+            store64(out + oi * 8, e);
+            oi = oi + 1;
+        }
+        i = i + 1;
+    }
+    store64(out + oi * 8, 0);
+    return out;
+}
+
+# How many entries an `envp` array holds, not counting its terminator.
+fn agnosai_envp_len(envp): i64 {
+    if (envp == 0) { return 0; }
+    var n = 0;
+    while (load64(envp + n * 8) != 0) { n = n + 1; }
+    return n;
+}
+
+# Whether `envp` carries a variable of this name.
+fn agnosai_envp_has(envp, name: Str): i64 {
+    if (envp == 0) { return 0; }
+    var i = 0;
+    while (load64(envp + i * 8) != 0) {
+        if (str_eq(_agnosai_env_entry_name(load64(envp + i * 8)), name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Mark `fd` close-on-exec. Returns 1 on success, 0 on failure.
+#
+# The exec-errno pipe's write end needs this and nothing else does yet; it is
+# named rather than inlined because getting it wrong is silent — an unmarked
+# write end never closes, the parent's read blocks forever, and every spawn
+# hangs instead of reporting.
+fn agnosai_fd_set_cloexec(fd): i64 {
+    if (syscall(SYS_FCNTL, fd, AGNOSAI_F_SETFD, AGNOSAI_FD_CLOEXEC) < 0) { return 0; }
+    return 1;
+}

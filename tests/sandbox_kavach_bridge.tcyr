@@ -1,10 +1,9 @@
 # =========================================================================
 # sandbox_kavach_bridge — parity tests for src/sandbox/kavach_bridge.cyr.
 #
-# 15 of the oracle's 16 tests port. The exception is
-# `build_config_enables_externalization`: Cyrius kavach's `SandboxConfig` has no
-# `externalization` field, so there is nothing to assert on. The intended policy
-# is still checked, through `agnosai_kavach_default_ext_policy`.
+# **All 16 of the oracle's tests port.** `build_config_enables_externalization`
+# was the holdout — Cyrius kavach's `SandboxConfig` had no `externalization`
+# field — and agnosai filed for one, which shipped as kavach 3.11.2.
 #
 # Where this goes past the oracle:
 #
@@ -129,8 +128,26 @@ fn _t_kv_memory_is_not_wired(): i64 {
     return 0;
 }
 
-# The externalization policy the oracle attaches to every config. It has no
-# field to live in here, so it is asserted standalone.
+# `build_config_enables_externalization` — **the oracle test that could not be
+# written until kavach 3.11.2 added the field.** It is the whole reason for that
+# release, so it is asserted through `build_config`, not just standalone.
+fn _t_kv_build_config_externalization(): i64 {
+    var c = agnosai_kavach_build_config(agnosai_sandbox_policy_process(), 0);
+    var e = SandboxConfig_externalization(c);
+    assert(e != 0, "build_config attaches an externalization policy");
+    assert(ExternalizationPolicy_enabled(e) == 1, "...and it is enabled");
+    assert(ExternalizationPolicy_block_threshold(e) == Severity.CRITICAL,
+    "...with the default thresholds the oracle passes");
+
+    # Unconditional — every isolation level, not just the sandboxed ones. A
+    # native (Noop) config gets it too, which is what the oracle does.
+    var n = agnosai_kavach_build_config(agnosai_sandbox_policy_native(), 0);
+    assert(SandboxConfig_externalization(n) != 0,
+    "even a Noop config carries the gate policy — the oracle attaches it unconditionally");
+    return 0;
+}
+
+# The default policy's own values.
 fn _t_kv_ext_policy(): i64 {
     var e = agnosai_kavach_default_ext_policy();
     assert(ExternalizationPolicy_enabled(e) == 1, "the default gate is enabled");
@@ -268,6 +285,7 @@ fn main(): i64 {
     _t_kv_build_config();
     _t_kv_memory_is_not_wired();
     _t_kv_ext_policy();
+    _t_kv_build_config_externalization();
     _t_kv_policy_for_trust();
     _t_kv_scan_output();
     _t_kv_result();

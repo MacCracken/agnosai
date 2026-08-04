@@ -31,6 +31,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 4 — `sandbox/spawn`, sanitized `envp` + the CLOEXEC primitive.**
+  77 assertions. No oracle file corresponds to this module: in Rust the work is
+  `Command::env_remove` plus tokio's `Stdio` and `kill_on_drop`, spread across
+  three call sites. Cyrius has none of that, so the three backends get one
+  primitive underneath them rather than three hand-rolled `fork` loops.
+
+  **The blocker that would have derailed this is resolved, and was proven before
+  being designed in.** `fork` + `execve` cannot tell "spawn failed" from "the
+  child ran and exited 127" — a failed `execve` leaves the child alive and every
+  stdlib path resolves that to `sys_exit(127)`. Three oracle sites need the
+  distinction (`oci.rs:219`, `process.rs:331`, `python.rs:87`). The answer is a
+  fourth pipe whose write end carries `FD_CLOEXEC`, so the kernel closes it
+  exactly when `execve` succeeds: bytes mean the exec failed, EOF means it
+  worked. `pipe2` is not wrapped on x86_64, but `sys_pipe` +
+  `syscall(SYS_FCNTL, wfd, F_SETFD, FD_CLOEXEC)` is. A probe forking
+  `/bin/sh -c 'exit 127'` and `/nonexistent/binary` reported **spawned, exit
+  127** for the first and **spawn failed** for the second.
+
+  **Env sanitization matches on the NAME only** — everything before the first
+  `=`. A variable whose *value* mentions `LD_PRELOAD` is not the variable
+  `LD_PRELOAD`; testing the whole entry would drop innocent variables and, worse,
+  would let attacker-supplied data steer which variables the filter removes.
+  Mutation-verified: whole-entry matching fails four assertions.
+
+  **The filter also applies to a caller-supplied environment**, not just the
+  inherited one — a sanitizer covering only the inherited case is one an
+  attacker routes around by passing the variable explicitly. Also
+  mutation-verified. `rust-old` has **no test for any of this**; the roadmap
+  already lists env sanitization as an untested area carried over from the Rust
+  line.
+
 - **M7 bite 3 — `sandbox/kavach_bridge`, the pure half.** Backend mapping,
   config construction, strength scoring, the output scan, and the trust-level
   policy table. 66 assertions; 15 of the oracle's 16 tests port.
@@ -64,11 +95,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Process (50). A port that "completed" the ordering would fail. Asserted
   explicitly here, in the direction that actually holds.
 
-  **One oracle test cannot port:** `build_config_enables_externalization`.
-  Cyrius kavach's `SandboxConfig` has no `externalization` field, so the
-  oracle's unconditional `.externalization(...)` has no counterpart. Filed
-  against kavach; the intended policy stays constructible and tested through
-  `agnosai_kavach_default_ext_policy`.
+  **All 16 oracle tests port**, after a same-day upstream round trip.
+  `build_config_enables_externalization` was the holdout: Cyrius kavach's
+  `SandboxConfig` had nine fields and no `externalization`, so the oracle's
+  unconditional `.externalization(...)` had no counterpart and the test had
+  nothing to assert against. agnosai filed it; **kavach 3.11.2** added
+  `config_externalization(c, p)` (struct 72 → 80 bytes, defaulting to 0 so no
+  existing consumer's behaviour changes), and `build_config` now attaches the
+  policy exactly as the oracle does — unconditionally, at every isolation level
+  including Noop. Mutation-verified.
+
+  kavach carries the policy; it does not apply it. `scan_output` still calls
+  `gate_apply` itself. What the field buys is that two sandboxes built for
+  different crew trust levels are distinguishable from their configs, which is
+  what `policy_for_trust` exists to produce.
 
 - **M7 bite 2 — `sandbox/oci`, the pure half.** Config, image-reference
   validation, and the `docker run` argv. 75 assertions; seven of the oracle's

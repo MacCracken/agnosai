@@ -1,0 +1,162 @@
+# =========================================================================
+# sandbox_spawn — tests for src/sandbox/spawn.cyr.
+#
+# **No oracle tests exist for any of this.** In Rust the work is
+# `Command::env_remove` plus tokio's `Stdio` and `kill_on_drop`, and the
+# roadmap's "Carried over from the Rust line" table already records env
+# sanitization as an area `rust-old` never tested. It is a security control, so
+# it is tested here.
+#
+# The exec-errno pipe is exercised for real by the later spawn sub-bites; what
+# is asserted here is the piece that needs no fork.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/sandbox/mod.cyr"
+include "tests/test_helpers.cyr"
+
+# --- Entry name parsing --------------------------------------------------
+
+# Matching is on the NAME, and the name is everything before the first `=`.
+fn _t_sp_entry_name(): i64 {
+    assert(agnosai_env_entry_is_sanitized("LD_PRELOAD=/tmp/evil.so") == 1,
+    "a sanitized variable is caught by its NAME, with a value attached");
+    assert(agnosai_env_entry_is_sanitized("LD_LIBRARY_PATH=/x") == 1, "LD_LIBRARY_PATH");
+    assert(agnosai_env_entry_is_sanitized("DYLD_INSERT_LIBRARIES=/y") == 1,
+    "DYLD_INSERT_LIBRARIES — stripped on Linux too");
+    assert(agnosai_env_entry_is_sanitized("DYLD_LIBRARY_PATH=/z") == 1, "DYLD_LIBRARY_PATH");
+
+    assert(agnosai_env_entry_is_sanitized("PATH=/usr/bin") == 0, "PATH survives");
+    assert(agnosai_env_entry_is_sanitized("HOME=/root") == 0, "so does HOME");
+
+    # **The value must not participate.** A variable whose VALUE mentions
+    # LD_PRELOAD is not the variable LD_PRELOAD — testing the whole entry would
+    # drop innocent variables, and would let attacker-supplied data steer which
+    # variables the filter removes.
+    assert(agnosai_env_entry_is_sanitized("NOTES=see LD_PRELOAD docs") == 0,
+    "a value MENTIONING a sanitized name is not itself sanitized");
+    assert(agnosai_env_entry_is_sanitized("CFLAGS=-DLD_PRELOAD=1") == 0,
+    "...even when it looks like an assignment");
+
+    # Prefix and suffix are not matches — the loader reads exact names.
+    assert(agnosai_env_entry_is_sanitized("LD_PRELOAD_EXTRA=/x") == 0, "no prefix matching");
+    assert(agnosai_env_entry_is_sanitized("MY_LD_PRELOAD=/x") == 0, "no suffix matching");
+
+    # A malformed entry with no `=` is still testable, not silently passed.
+    assert(agnosai_env_entry_is_sanitized("LD_PRELOAD") == 1,
+    "an entry with NO '=' is matched whole — it is not waved through");
+    assert(agnosai_env_entry_is_sanitized("HARMLESS") == 0, "...and an innocent one still passes");
+
+    assert(agnosai_env_entry_is_sanitized(0) == 0, "a null entry is not a variable");
+    assert(agnosai_env_entry_is_sanitized("") == 0, "nor an empty one");
+    assert(agnosai_env_entry_is_sanitized("=value") == 0, "nor one with an empty name");
+    return 0;
+}
+
+# --- Explicit envp -------------------------------------------------------
+
+fn _t_sp_envp_from(): i64 {
+    var e = vec_new();
+    vec_push(e, str_from("PATH=/usr/bin"));
+    vec_push(e, str_from("LD_PRELOAD=/tmp/evil.so"));
+    vec_push(e, str_from("HOME=/root"));
+    vec_push(e, str_from("DYLD_INSERT_LIBRARIES=/tmp/e.dylib"));
+
+    var envp = agnosai_sanitized_envp_from(e);
+    assert(agnosai_envp_len(envp) == 2, "two of four entries survive");
+    assert(agnosai_envp_has(envp, str_from("PATH")) == 1, "PATH is kept");
+    assert(agnosai_envp_has(envp, str_from("HOME")) == 1, "HOME is kept");
+
+    # **The filter applies to an explicitly supplied environment too.** A
+    # sanitizer covering only the inherited case is one an attacker routes
+    # around by passing the variable instead.
+    assert(agnosai_envp_has(envp, str_from("LD_PRELOAD")) == 0,
+    "LD_PRELOAD is removed even when the CALLER supplied it, not the parent env");
+    assert(agnosai_envp_has(envp, str_from("DYLD_INSERT_LIBRARIES")) == 0, "and DYLD_ too");
+
+    # NULL-terminated, so execve can walk it.
+    assert(load64(envp + 2 * 8) == 0, "the array is NULL-terminated");
+
+    # An all-sanitized input yields an empty but valid envp, never 0.
+    var bad = vec_new();
+    vec_push(bad, str_from("LD_PRELOAD=/a"));
+    vec_push(bad, str_from("LD_LIBRARY_PATH=/b"));
+    var only = agnosai_sanitized_envp_from(bad);
+    assert(only != 0, "an all-sanitized environment still yields an ARRAY, not 0");
+    assert(agnosai_envp_len(only) == 0, "...an empty one");
+    assert(load64(only) == 0, "...that is properly terminated");
+
+    var none = agnosai_sanitized_envp_from(vec_new());
+    assert(agnosai_envp_len(none) == 0, "an empty input is an empty envp");
+    return 0;
+}
+
+# --- Inherited envp ------------------------------------------------------
+
+# The real parent environment, filtered. This process has a PATH, so the
+# positive half is checkable without constructing anything.
+fn _t_sp_envp_inherited(): i64 {
+    var envp = agnosai_sanitized_envp();
+    assert(envp != 0, "an envp is always returned, never 0");
+
+    # None of the four may survive, whatever this environment happens to hold.
+    assert(agnosai_envp_has(envp, str_from("LD_PRELOAD")) == 0, "no LD_PRELOAD reaches a child");
+    assert(agnosai_envp_has(envp, str_from("LD_LIBRARY_PATH")) == 0, "no LD_LIBRARY_PATH");
+    assert(agnosai_envp_has(envp, str_from("DYLD_INSERT_LIBRARIES")) == 0, "no DYLD_INSERT_LIBRARIES");
+    assert(agnosai_envp_has(envp, str_from("DYLD_LIBRARY_PATH")) == 0, "no DYLD_LIBRARY_PATH");
+
+    # And the filter is subtractive, not a wipe — an ordinary variable survives.
+    assert(agnosai_envp_has(envp, str_from("PATH")) == 1,
+    "PATH survives — the filter removes four names, it does not empty the environment");
+
+    var i = 0;
+    while (load64(envp + i * 8) != 0) {
+        assert(agnosai_env_entry_is_sanitized(load64(envp + i * 8)) == 0,
+        "every surviving entry passes the filter it was filtered by");
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- CLOEXEC -------------------------------------------------------------
+
+# The bit the exec-errno pipe is built on. Marking must succeed on a real fd and
+# fail on a bogus one — a version that reported success either way would make
+# every spawn hang rather than report.
+fn _t_sp_cloexec(): i64 {
+    var fds[8];
+    assert(sys_pipe(&fds) >= 0, "a pipe opens");
+    var rfd = load32(&fds);
+    var wfd = load32(&fds + 4);
+
+    assert(agnosai_fd_set_cloexec(wfd) == 1, "the write end is marked close-on-exec");
+    # F_GETFD = 1; the flag must actually be set, not merely reported.
+    assert((syscall(SYS_FCNTL, wfd, 1, 0) & AGNOSAI_FD_CLOEXEC) == AGNOSAI_FD_CLOEXEC,
+    "...and reading the flags back confirms it — the syscall did the thing");
+
+    sys_close(rfd);
+    sys_close(wfd);
+
+    assert(agnosai_fd_set_cloexec(0 - 1) == 0,
+    "marking a bogus fd REPORTS failure — silently succeeding would hang every spawn");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_sp_entry_name();
+    _t_sp_envp_from();
+    _t_sp_envp_inherited();
+    _t_sp_cloexec();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
