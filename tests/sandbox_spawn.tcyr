@@ -243,6 +243,79 @@ fn _t_sp_env_reaches_child(): i64 {
     return 0;
 }
 
+# --- stdin feed ----------------------------------------------------------
+
+fn _t_sh_in(script, input): i64 {
+    var argv = alloc(32);
+    store64(argv, "/bin/sh");
+    store64(argv + 8, "-c");
+    store64(argv + 16, script);
+    store64(argv + 24, 0);
+    return agnosai_spawn_capture_input("/bin/sh", argv, agnosai_sanitized_envp(), input);
+}
+
+fn _t_sp_stdin_basics(): i64 {
+    var r = _t_sh_in("cat", str_from("hello stdin"));
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "spawned with stdin");
+    assert(str_eq_cstr(agnosai_spawn_stdout(r), "hello stdin") == 1,
+    "the input is fed through and comes back verbatim");
+    assert(agnosai_spawn_exit_code(r) == 0, "and the child exited cleanly");
+
+    # A child that reads to EOF must SEE EOF — an empty input still has to close
+    # the pipe, or `cat` waits forever for a byte that is never coming.
+    var e = _t_sh_in("cat", str_from(""));
+    assert(agnosai_spawn_status(e) == AGNOSAI_SPAWN_OK, "an EMPTY input still terminates");
+    assert(str_len(agnosai_spawn_stdout(e)) == 0, "...producing nothing");
+
+    # A child that ignores stdin entirely must not hang the writer.
+    var ig = _t_sh_in("echo ignored", str_from("unread input"));
+    assert(agnosai_spawn_status(ig) == AGNOSAI_SPAWN_OK,
+    "a child that never READS stdin does not hang the parent's write");
+    assert(str_contains_cstr(agnosai_spawn_stdout(ig), "ignored") == 1, "...and still runs");
+    return 0;
+}
+
+# **The second deadlock.** The oracle writes its whole input before reading. Here
+# that hangs: the parent fills the child's 64 KiB stdin pipe while the child
+# blocks on its own full stdout pipe that nobody is draining.
+#
+# 200,000 bytes in and the same 200,000 back out — both far past the buffer.
+fn _t_sp_stdin_large_roundtrip(): i64 {
+    var sb = str_builder_new();
+    var i = 0;
+    while (i < 2000) {
+        str_builder_add_cstr(sb,
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+        i = i + 1;
+    }
+    var big = str_builder_build(sb);
+    assert(str_len(big) == 200000, "the input is 200,000 bytes");
+
+    var r = _t_sh_in("cat", big);
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the round trip completes");
+    assert(str_len(agnosai_spawn_stdout(r)) == 200000,
+    "all 200,000 bytes come back — the write interleaves with the drain");
+    assert(str_eq(agnosai_spawn_stdout(r), big) == 1, "...byte for byte, in order");
+    return 0;
+}
+
+# stdin does not disturb the other guarantees.
+fn _t_sp_stdin_keeps_the_contract(): i64 {
+    var r = _t_sh_in("cat; echo err >&2; exit 5", str_from("x"));
+    assert(agnosai_spawn_exit_code(r) == 5, "the exit code still comes back");
+    assert(str_contains_cstr(agnosai_spawn_stderr(r), "err") == 1, "stderr is still separate");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "err") == 0, "...still not merged");
+
+    var argv = alloc(16);
+    store64(argv, "/nonexistent/binary");
+    store64(argv + 8, 0);
+    var bad = agnosai_spawn_capture_input("/nonexistent/binary", argv,
+    agnosai_sanitized_envp(), str_from("ignored"));
+    assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
+    "spawn failure is still distinguishable when input was supplied");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -257,6 +330,9 @@ fn main(): i64 {
     _t_sp_large_dual_output();
     _t_sp_cloexec_survives_a_grandchild();
     _t_sp_env_reaches_child();
+    _t_sp_stdin_basics();
+    _t_sp_stdin_large_roundtrip();
+    _t_sp_stdin_keeps_the_contract();
 
     return assert_summary();
 }

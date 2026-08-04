@@ -3,15 +3,15 @@
 #
 # Parity oracle: the spawn halves of rust-old/src/sandbox/{process,python,oci}.rs
 #
-# **M7 bite 4 — sanitized `envp`, the first piece.** No oracle file corresponds
-# to this module: in Rust the work is `Command::env_remove` plus tokio's
-# `Stdio::piped()` and `kill_on_drop`, spread across three call sites. Cyrius
-# has none of that, so the three backends need one primitive underneath them
-# rather than three hand-rolled `fork` loops.
+# **M7 bites 4-6.** No oracle file corresponds to this module: in Rust the work
+# is `Command::env_remove` plus tokio's `Stdio::piped()` and `kill_on_drop`,
+# spread across three call sites. Cyrius has none of that, so the three backends
+# need one primitive underneath them rather than three hand-rolled `fork` loops.
 #
-# It lands in pieces because the whole thing is large and each piece is
-# separately provable. This one is the only part testable **without** forking,
-# so it goes first.
+# It landed in pieces because the whole thing is large and each piece is
+# separately provable: sanitized `envp` and the CLOEXEC bit (bite 4, the only
+# part testable without forking), then fork/pipes/exec/status (bite 5), then the
+# stdin feed (bite 6). Deadline and kill remain.
 #
 # ## The exec-errno pipe — proven before it was designed in
 #
@@ -32,6 +32,19 @@
 # FD_CLOEXEC)` is; `SYS_FCNTL` (72) and `O_CLOEXEC` (524288) are both defined. A
 # probe forking `/bin/sh -c 'exit 127'` and `/nonexistent/binary` reported
 # **spawned, exit 127** for the first and **spawn failed** for the second.
+#
+# ## Three pipes are not enough either — the stdin WRITE must interleave too
+#
+# The oracle writes its entire input before it ever reads
+# (`process.rs:133-139`, `python.rs:92-101`), which tokio survives only because
+# its reader is a separate task. Reproduced literally on a blocking write it is
+# a second deadlock, and a nastier one: the parent fills the child's 64 KiB
+# stdin pipe and blocks, while the child — having filled its own stdout pipe
+# that nobody is draining — blocks too. Neither moves.
+#
+# So the write is non-blocking and takes its turn in the same loop as the two
+# reads. The stdin write end is closed as soon as the input is exhausted,
+# because a child reading to EOF never finishes otherwise.
 #
 # ## Two pipes are not enough — the drain must interleave
 #
@@ -344,6 +357,132 @@ fn agnosai_spawn_capture(path, argv, envp): i64 {
     store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_OK);
     # Low 7 bits are the terminating signal; 0 there means a normal exit whose
     # code is the next byte up.
+    var sig = raw & 127;
+    if (sig != 0) {
+        store64(r + AGN_SPR_SIGNAL, sig);
+        store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
+    } else {
+        store64(r + AGN_SPR_SIGNAL, 0);
+        store64(r + AGN_SPR_EXIT_CODE, (raw >> 8) & 255);
+    }
+    return r;
+}
+
+# Run `path` with `argv` and `envp`, feeding `input` on stdin and capturing both
+# output streams.
+#
+# `agnosai_spawn_capture` is this with no input and a closed stdin. Everything
+# about the result is the same, including how spawn failure is reported.
+#
+# **The write interleaves with the reads.** Writing the whole input first is
+# what the oracle does and what deadlocks here — see the module header.
+fn agnosai_spawn_capture_input(path, argv, envp, input: Str): i64 {
+    var ip[8];
+    var op[8];
+    var ep[8];
+    var xp[8];
+    if (sys_pipe(&ip) < 0) { return _agnosai_spawn_failure(); }
+    if (sys_pipe(&op) < 0) { return _agnosai_spawn_failure(); }
+    if (sys_pipe(&ep) < 0) { return _agnosai_spawn_failure(); }
+    if (sys_pipe(&xp) < 0) { return _agnosai_spawn_failure(); }
+    var irf = load32(&ip);
+    var iwf = load32(&ip + 4);
+    var orf = load32(&op);
+    var owf = load32(&op + 4);
+    var erf = load32(&ep);
+    var ewf = load32(&ep + 4);
+    var xrf = load32(&xp);
+    var xwf = load32(&xp + 4);
+
+    if (agnosai_fd_set_cloexec(xwf) == 0) { return _agnosai_spawn_failure(); }
+
+    var pid = sys_fork();
+    if (pid < 0) { return _agnosai_spawn_failure(); }
+    if (pid == 0) {
+        syscall(SYS_DUP2, irf, 0);
+        syscall(SYS_DUP2, owf, 1);
+        syscall(SYS_DUP2, ewf, 2);
+        sys_close(iwf);
+        sys_close(orf);
+        sys_close(erf);
+        sys_close(xrf);
+        sys_execve(path, argv, envp);
+        var e[8];
+        store64(&e, 1);
+        sys_write(xwf, &e, 8);
+        syscall(SYS_EXIT_GROUP, 127);
+    }
+
+    sys_close(irf);
+    sys_close(owf);
+    sys_close(ewf);
+    sys_close(xwf);
+    _agnosai_fd_set_nonblock(orf);
+    _agnosai_fd_set_nonblock(erf);
+    _agnosai_fd_set_nonblock(iwf);
+
+    var ob = str_builder_new();
+    var eb = str_builder_new();
+    var buf = alloc(AGNOSAI_SPAWN_CHUNK);
+    var ilen = str_len(input);
+    var idata = str_data(input);
+    var isent = 0;
+    var iopen = 1;
+    var odone = 0;
+    var edone = 0;
+
+    # An empty input still needs stdin closed, or a child reading to EOF waits
+    # forever for a byte that is never coming.
+    if (ilen == 0) { sys_close(iwf); iopen = 0; }
+
+    while (odone == 0 || edone == 0) {
+        if (iopen == 1) {
+            var want = ilen - isent;
+            if (want > AGNOSAI_SPAWN_CHUNK) { want = AGNOSAI_SPAWN_CHUNK; }
+            if (want > 0) {
+                var w = sys_write(iwf, idata + isent, want);
+                # A negative return is EAGAIN — the child has not drained its
+                # stdin yet. Not an error: come back next turn.
+                if (w > 0) { isent = isent + w; }
+            }
+            if (isent >= ilen) { sys_close(iwf); iopen = 0; }
+        }
+        if (odone == 0) {
+            var n = sys_read(orf, buf, AGNOSAI_SPAWN_CHUNK);
+            if (n > 0) { str_builder_add(ob, str_new(buf, n)); }
+            if (n == 0) { odone = 1; }
+        }
+        if (edone == 0) {
+            var m = sys_read(erf, buf, AGNOSAI_SPAWN_CHUNK);
+            if (m > 0) { str_builder_add(eb, str_new(buf, m)); }
+            if (m == 0) { edone = 1; }
+        }
+    }
+    if (iopen == 1) { sys_close(iwf); }
+    sys_close(orf);
+    sys_close(erf);
+
+    var xb[8];
+    var xn = sys_read(xrf, &xb, 8);
+    sys_close(xrf);
+
+    var st[8];
+    store64(&st, 0);
+    sys_waitpid(pid, &st, 0);
+    var raw = load64(&st);
+
+    var r = alloc(AGN_SPR_SIZE);
+    store64(r + AGN_SPR_STDOUT, str_builder_build(ob));
+    store64(r + AGN_SPR_STDERR, str_builder_build(eb));
+
+    if (xn > 0) {
+        store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_FAILED);
+        store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
+        store64(r + AGN_SPR_SIGNAL, 0);
+        return r;
+    }
+
+    store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_OK);
     var sig = raw & 127;
     if (sig != 0) {
         store64(r + AGN_SPR_SIGNAL, sig);

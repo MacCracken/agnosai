@@ -31,6 +31,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 6 — `agnosai_spawn_capture_input`: the stdin feed.** 114 assertions
+  in the suite. A 200,000-byte input round-trips through `cat` and comes back
+  byte-for-byte.
+
+  **This is a second deadlock, distinct from the stdout/stderr one, and the
+  oracle's shape causes it.** `process.rs:133-139` and `python.rs:92-101` write
+  the entire input before reading anything — which tokio survives only because
+  its reader is a separate task. Reproduced literally on a blocking write, the
+  parent fills the child's 64 KiB stdin pipe and blocks, while the child blocks
+  on its own full stdout pipe that nobody is draining. Neither moves.
+
+  So the write is non-blocking and takes its turn in the same loop as the two
+  reads. Mutation-verified twice, both producing a **hang** rather than a wrong
+  answer: writing the whole input first deadlocks the 200 KB case, and failing
+  to close stdin on an *empty* input leaves `cat` waiting forever for an EOF
+  that never comes.
+
 - **M7 bite 5 — `agnosai_spawn_capture`: fork, three pipes, exec, status
   decode.** The primitive `process`, `python`, `oci`'s exec half and `manager`
   all sit on. 99 assertions total in the suite.
