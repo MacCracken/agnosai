@@ -42,6 +42,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7 bite 10 — `sandbox/python`: the interpreter bridge.** All five oracle
+  tests ported (`python.rs:177-312`), 61 assertions. The third and last consumer
+  of the spawn primitive.
+
+  **The tool source travels on stdin, never in the script**, and the test proves
+  it against a real interpreter. The wrapper is a constant; the source arrives as
+  `__tool_source__` in the JSON payload, so a source carrying `"""` and its own
+  `print` cannot close the quoting and append a statement. Mutation-verified by
+  rebuilding `execute_tool` in the vulnerable shape — the source interpolated
+  into a triple-quoted literal — at which point the injected statement runs and
+  the test fails.
+
+  The oracle's module doc (`python.rs:4`) claims "seccomp + Landlock + cgroups
+  + network namespace"; the "(future)" on that line is doing all the work, and
+  none of it exists. kavach supplies the real confinement here, which is a
+  milestone gate rather than something this module quietly does.
+
+  Four mutations, three caught after correction: interpolating the source into
+  the script, keeping partial output on timeout, and removing PATH resolution.
+  The fourth — swapping the sanitized `envp` for the raw one — cannot be caught,
+  because a test process has no `setenv` with which to plant an `LD_PRELOAD`;
+  that limitation is written into the suite rather than left implied.
+
 - **M7 bite 9 — `sandbox/oci`'s exec half.** `agnosai_oci_execute` —
   `OciSandbox::execute` (`oci.rs:106-187`) — 100 assertions in the suite. Bite 2
   had already built the argv as a testable value, so this runs that argv through

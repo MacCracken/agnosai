@@ -214,7 +214,14 @@ handler cost bounded and measured" until that filing lands.
 
 ### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
 
-**Bites 1-9 done (2026-08-04).** Bite 9: `oci`'s exec half — the argv bite 2
+**Bites 1-10 done (2026-08-04).** Bite 10: `python` — the interpreter bridge and
+the last consumer of the spawn primitive. Only `manager` remains. Building it
+surfaced a defect in bite 9: `execve` does not search `PATH` where `Command::new`
+does, so the default runtime `"docker"` and the default interpreter `"python3"`
+— both bare names — could not be spawned at all. Resolution now happens before
+the fork, `execvp`-style.
+
+ Bite 9: `oci`'s exec half — the argv bite 2
 built as a value, run through the spawn primitive. `python` and `manager` remain.
 
  Bite 8: `process` — `ProcessSandbox`, all nine

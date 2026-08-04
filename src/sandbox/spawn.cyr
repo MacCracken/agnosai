@@ -346,6 +346,63 @@ var AGNOSAI_SPAWN_NO_TIMEOUT = 0;
 # SIGKILL rather than SIGTERM, matching tokio's `kill_on_drop`: a tool that has
 # blown its deadline has already had its chance to exit, and a catchable signal
 # it ignores would leave exactly the zombie this exists to prevent.
+# `X_OK` — the `access` mode bit asking "may this be executed".
+var AGNOSAI_SPAWN_X_OK = 1;
+
+# `execvp`'s fallback when the environment carries no `PATH` at all.
+var AGNOSAI_SPAWN_DEFAULT_PATH = "/bin:/usr/bin";
+
+# Resolve a program name against `PATH`, as `Command::new` does.
+#
+# **`execve` does not search `PATH`; `Command::new` does.** The oracle's
+# defaults are bare names - `"docker"` (`oci.rs:55`, `manager.rs:47`) and
+# `"python3"` (`python.rs:36`) - so a primitive that only honours absolute paths
+# fails to launch the default container runtime and the default interpreter,
+# while reporting it as "failed to spawn", indistinguishable from the binary
+# genuinely being absent.
+#
+# The search uses the **child's** `envp` rather than the parent's environment,
+# because that is the `PATH` the program would itself see. A name containing a
+# slash is used literally, matching `execvp`. When nothing matches, the original
+# name is returned so the child's `execve` fails and reports it the usual way.
+fn _agnosai_spawn_resolve(name, envp): i64 {
+    var i = 0;
+    while (load8(name + i) != 0) {
+        if (load8(name + i) == 47) { return name; }
+        i = i + 1;
+    }
+
+    var path = 0;
+    var e = 0;
+    while (envp != 0 && path == 0 && load64(envp + e * 8) != 0) {
+        var entry = load64(envp + e * 8);
+        # `+ 5` steps over `PATH=` to the value.
+        if (str_eq_cstr(_agnosai_env_entry_name(entry), "PATH") == 1) { path = entry + 5; }
+        e = e + 1;
+    }
+    if (path == 0) { path = AGNOSAI_SPAWN_DEFAULT_PATH; }
+
+    var start = 0;
+    var j = 0;
+    while (1 == 1) {
+        var ch = load8(path + j);
+        if (ch == 58 || ch == 0) {
+            if (j > start) {
+                var sb = str_builder_new();
+                str_builder_add(sb, str_new(path + start, j - start));
+                str_builder_add_cstr(sb, "/");
+                str_builder_add_cstr(sb, name);
+                var cand = str_cstr(str_builder_build(sb));
+                if (sys_access(cand, AGNOSAI_SPAWN_X_OK) == 0) { return cand; }
+            }
+            start = j + 1;
+        }
+        if (ch == 0) { return name; }
+        j = j + 1;
+    }
+    return name;
+}
+
 # Returns the child's raw wait status, so the caller reports the signal the
 # child **actually** died from rather than the one this meant to send. The two
 # can differ — a child already dying of something else when the deadline lands
@@ -418,6 +475,10 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
 
     if (agnosai_fd_set_cloexec(xwf) == 0) { return _agnosai_spawn_failure(); }
 
+    # Resolved BEFORE the fork: the search allocates, and doing it in the child
+    # would build strings the parent can never see or free.
+    var prog = _agnosai_spawn_resolve(path, envp);
+
     var pid = sys_fork();
     if (pid < 0) { return _agnosai_spawn_failure(); }
     if (pid == 0) {
@@ -441,7 +502,7 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
                 syscall(SYS_EXIT_GROUP, 127);
             }
         }
-        sys_execve(path, argv, envp);
+        sys_execve(prog, argv, envp);
         var e[8];
         store64(&e, AGNOSAI_SPAWN_FAIL_EXEC);
         sys_write(xwf, &e, 8);

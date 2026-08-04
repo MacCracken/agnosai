@@ -486,6 +486,49 @@ fn _t_sp_fail_reason(): i64 {
     return 0;
 }
 
+# --- PATH resolution -----------------------------------------------------
+
+fn _t_sp_bare_name_resolves(): i64 {
+    # **`execve` does not search PATH; `Command::new` does.** The oracle's
+    # defaults are bare names - "docker" and "python3" - so without this the
+    # default container runtime and the default interpreter both fail to launch
+    # on a machine that has them installed.
+    var argv = alloc(24);
+    store64(argv, "echo");
+    store64(argv + 8, "resolved");
+    store64(argv + 16, 0);
+
+    var r = agnosai_spawn_capture("echo", argv, agnosai_sanitized_envp(),
+    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "a bare name is found on PATH");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "resolved") == 1, "...and it really ran");
+
+    # A bare name that is on no PATH entry still fails, and fails as an exec.
+    var b = alloc(16);
+    store64(b, "agnosai-no-such-program-anywhere");
+    store64(b + 8, 0);
+    var bad = agnosai_spawn_capture("agnosai-no-such-program-anywhere", b,
+    agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+    assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
+    "an unresolvable bare name still fails");
+    assert(agnosai_spawn_fail_reason(bad) == AGNOSAI_SPAWN_FAIL_EXEC, "...as an exec failure");
+    return 0;
+}
+
+fn _t_sp_slashed_name_is_not_searched(): i64 {
+    # `execvp` treats any name containing a slash as a path and does NOT search.
+    # Searching it would let a relative name like `bin/tool` be satisfied by
+    # some unrelated PATH entry.
+    var argv = alloc(16);
+    store64(argv, "./echo");
+    store64(argv + 8, 0);
+    var r = agnosai_spawn_capture("./echo", argv, agnosai_sanitized_envp(),
+    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_FAILED,
+    "./echo is NOT resolved against PATH - a slash makes it a path");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -511,6 +554,8 @@ fn main(): i64 {
     _t_sp_idle_child_does_not_burn_the_cpu();
     _t_sp_work_dir();
     _t_sp_fail_reason();
+    _t_sp_bare_name_resolves();
+    _t_sp_slashed_name_is_not_searched();
 
     return assert_summary();
 }

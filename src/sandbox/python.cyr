@@ -1,0 +1,208 @@
+# =========================================================================
+# sandbox/python — the sandboxed Python interpreter bridge.
+#
+# Parity oracle: rust-old/src/sandbox/python.rs (312 lines, 5 tests)
+#
+# `python3 -c <script>` with JSON on stdin and JSON on stdout. Everything the
+# spawn primitive already does — sanitized `envp`, a deadline with SIGKILL, a
+# `work_dir`, captured streams — is used as-is; what is here is the interpreter
+# invocation and the tool-bridge protocol.
+#
+# ## The tool source travels on stdin, never in the script
+#
+# `execute_tool` sends a **fixed** wrapper script and puts the tool's source in
+# the JSON payload, under `__tool_source__`. The oracle is explicit about why
+# (`python.rs:135-137`): interpolating source into the script string would let a
+# tool close the quoting and append its own statements, and Python's
+# triple-quoted strings make that a short exercise. Sent as JSON data, the
+# source is a string value no matter what it contains.
+#
+# The wrapper still `exec`s that source — the sandbox boundary is the process
+# and its confinement, not the parser. What the stdin route removes is a
+# breakout that would need no sandbox escape at all.
+#
+# ## The oracle's module doc names confinement that does not exist
+#
+# `python.rs:4` says "Sandbox: seccomp + Landlock + cgroups + network namespace
+# (future)". The "(future)" is doing the work: none of it is implemented, and a
+# `PythonSandbox` is a plain subprocess with a timeout. kavach supplies the
+# real confinement in this port — see `kavach_bridge` — and that is a milestone
+# gate, not something this module quietly does.
+# =========================================================================
+
+# ---------------------------------------------------------------------------
+# PythonResult — rust-old/src/sandbox/python.rs:16-21
+# ---------------------------------------------------------------------------
+
+enum AgnosaiPyResultOff {
+    AGN_PYR_STDOUT = 0;
+    AGN_PYR_STDERR = 8;
+    AGN_PYR_EXIT_CODE = 16;
+    AGN_PYR_TIMED_OUT = 24;
+    AGN_PYR_SIZE = 32;
+}
+
+# A finished interpreter run.
+fn agnosai_python_result_new(stdout: Str, stderr: Str, exit_code, timed_out): i64 {
+    var r = alloc(AGN_PYR_SIZE);
+    store64(r + AGN_PYR_STDOUT, stdout);
+    store64(r + AGN_PYR_STDERR, stderr);
+    store64(r + AGN_PYR_EXIT_CODE, exit_code);
+    store64(r + AGN_PYR_TIMED_OUT, timed_out);
+    return r;
+}
+
+# What the script printed.
+fn agnosai_python_result_stdout(r): Str { return load64(r + AGN_PYR_STDOUT); }
+
+# What the interpreter wrote to stderr — where a traceback lands.
+fn agnosai_python_result_stderr(r): Str { return load64(r + AGN_PYR_STDERR); }
+
+# The interpreter's exit code, or -1 when it was signalled or timed out.
+fn agnosai_python_result_exit_code(r): i64 { return load64(r + AGN_PYR_EXIT_CODE); }
+
+# Whether the deadline fired.
+fn agnosai_python_result_timed_out(r): i64 { return load64(r + AGN_PYR_TIMED_OUT); }
+
+# ---------------------------------------------------------------------------
+# PythonSandbox — rust-old/src/sandbox/python.rs:27-56
+# ---------------------------------------------------------------------------
+
+enum AgnosaiPySandboxOff {
+    AGN_PYS_PATH = 0;
+    AGN_PYS_TIMEOUT_MS = 8;
+    AGN_PYS_WORK_DIR = 16;
+    AGN_PYS_SIZE = 24;
+}
+
+# `PythonSandbox::new` — `python3`, a 30-second deadline, no working directory.
+#
+# **`python3` is a bare name, resolved against `PATH` by the spawn primitive**,
+# which is what `Command::new` does for the oracle. An absolute path here would
+# be wrong on any machine that installs the interpreter somewhere else.
+fn agnosai_python_sandbox_new(): i64 {
+    var s = alloc(AGN_PYS_SIZE);
+    store64(s + AGN_PYS_PATH, str_from("python3"));
+    store64(s + AGN_PYS_TIMEOUT_MS, 30 * 1000);
+    store64(s + AGN_PYS_WORK_DIR, 0);
+    return s;
+}
+
+# `PythonSandbox::with_config` — an explicit interpreter and deadline.
+fn agnosai_python_sandbox_with_config(python_path: Str, timeout_ms): i64 {
+    var s = agnosai_python_sandbox_new();
+    store64(s + AGN_PYS_PATH, python_path);
+    store64(s + AGN_PYS_TIMEOUT_MS, timeout_ms);
+    return s;
+}
+
+# `PythonSandbox::with_work_dir` — the directory the interpreter runs in.
+#
+# The oracle's builder consumes and returns `self`; here the sandbox is mutated
+# in place and returned, so a chained call reads the same way.
+fn agnosai_python_sandbox_with_work_dir(s, dir: Str): i64 {
+    store64(s + AGN_PYS_WORK_DIR, dir);
+    return s;
+}
+
+# The interpreter this sandbox invokes.
+fn agnosai_python_sandbox_path(s): Str { return load64(s + AGN_PYS_PATH); }
+
+# The deadline in milliseconds.
+fn agnosai_python_sandbox_timeout_ms(s): i64 { return load64(s + AGN_PYS_TIMEOUT_MS); }
+
+# The working directory, or 0 to inherit the parent's.
+fn agnosai_python_sandbox_work_dir(s): i64 { return load64(s + AGN_PYS_WORK_DIR); }
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+# Run `python3 -c <script>` with `input` on stdin — `execute_script`,
+# `rust-old/src/sandbox/python.rs:62-124`.
+#
+# The environment is sanitized: `python.rs:77-79` runs the same `env_remove`
+# loop the process sandbox does, and an interpreter is exactly the process a
+# `LD_PRELOAD` most wants to be attached to.
+#
+# Returns 0 with `out_err` set when the interpreter cannot be spawned.
+fn agnosai_python_execute_script(s, script: Str, input: Str, out_err): i64 {
+    var exe = load64(s + AGN_PYS_PATH);
+
+    var argv = alloc(4 * 8);
+    store64(argv, str_cstr(exe));
+    store64(argv + 8, str_cstr(str_from("-c")));
+    store64(argv + 16, str_cstr(script));
+    store64(argv + 24, 0);
+
+    var wd = 0;
+    if (load64(s + AGN_PYS_WORK_DIR) != 0) { wd = str_cstr(load64(s + AGN_PYS_WORK_DIR)); }
+
+    var sp = agnosai_spawn_capture_input(str_cstr(exe), argv, agnosai_sanitized_envp(), input,
+    load64(s + AGN_PYS_TIMEOUT_MS), wd);
+
+    if (agnosai_spawn_status(sp) == AGNOSAI_SPAWN_FAILED) {
+        store64(out_err, agnosai_error_sandbox(str_from("failed to spawn python process")));
+        return 0;
+    }
+
+    if (agnosai_spawn_timed_out(sp) == 1) {
+        # Blanked exactly as `process` and `oci` blank it — `python.rs:114-121`.
+        return agnosai_python_result_new(str_from(""), str_from(""), 0 - 1, 1);
+    }
+
+    return agnosai_python_result_new(agnosai_spawn_stdout(sp), agnosai_spawn_stderr(sp),
+    agnosai_spawn_exit_code(sp), 0);
+}
+
+# The tool-bridge wrapper — `rust-old/src/sandbox/python.rs:139-152`, verbatim.
+#
+# It is a **constant**, and that is the security property. Nothing a tool
+# supplies is ever concatenated into it; the source arrives as
+# `__tool_source__` in the stdin JSON, so no amount of quoting in the tool can
+# add a statement to this script.
+fn agnosai_python_bridge_script(): Str {
+    var b = str_builder_new();
+    str_builder_add_cstr(b, "\nimport sys, json, traceback\n\n");
+    str_builder_add_cstr(b, "input_data = json.loads(sys.stdin.read())\n");
+    str_builder_add_cstr(b, "tool_source = input_data[\"__tool_source__\"]\n\n");
+    str_builder_add_cstr(b, "try:\n    exec(tool_source)\n\n");
+    str_builder_add_cstr(b, "    tool = create_tool()\n");
+    str_builder_add_cstr(b, "    result = tool.execute(input_data[\"parameters\"])\n");
+    str_builder_add_cstr(b,
+    "    print(json.dumps({\"result\": result, \"success\": True, \"error\": None}))\n");
+    str_builder_add_cstr(b, "except Exception as e:\n");
+    str_builder_add_cstr(b,
+    "    print(json.dumps({\"result\": None, \"success\": False, \"error\": str(e)}))\n");
+    str_builder_add_cstr(b, "    sys.exit(1)\n");
+    return str_builder_build(b);
+}
+
+# The JSON the bridge reads on stdin — `python.rs:154-159`.
+#
+# Built as a value so a test can read it back, which is the only way to assert
+# that the tool source went into a JSON **string** rather than into the script.
+# `parameters` is a `bayan` JSON value and is embedded as-is; a tool's
+# parameters are caller data and must survive unaltered.
+fn agnosai_python_bridge_input(tool_source: Str, tool_name: Str, parameters): Str {
+    var o = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(o, str_from("__tool_source__"), bayan_json_v_str_new(tool_source));
+    bayan_json_v_obj_set(o, str_from("tool_name"), bayan_json_v_str_new(tool_name));
+    if (parameters == 0) { parameters = bayan_json_v_obj_new(); }
+    bayan_json_v_obj_set(o, str_from("parameters"), parameters);
+    return bayan_json_v_build(o);
+}
+
+# Run a Python tool through the bridge protocol — `execute_tool`,
+# `rust-old/src/sandbox/python.rs:126-168`.
+#
+# The tool source must define `create_tool()`, returning an object with an
+# `execute(params)` method. The bridge reads the JSON, `exec`s the source,
+# calls the tool, and prints
+# `{"result": ..., "success": true|false, "error": ...}`.
+#
+# Returns 0 with `out_err` set when the interpreter cannot be spawned.
+fn agnosai_python_execute_tool(s, tool_source: Str, tool_name: Str, parameters, out_err): i64 {
+    return agnosai_python_execute_script(s, agnosai_python_bridge_script(),
+    agnosai_python_bridge_input(tool_source, tool_name, parameters), out_err);
+}
