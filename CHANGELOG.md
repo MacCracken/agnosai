@@ -20,6 +20,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *passes* — this is one of the few changes here with no test that can fail
   without it.
 
+- **Pinned kavach 3.11.5, closing the last two: no network isolation without a
+  rootfs, and a `stderr` field that was always empty.**
+
+  A rootfs-less sandbox got seccomp and landlock but **no namespaces**, because
+  applying them unconditionally breaks payloads on hosts restricting
+  unprivileged user namespaces. `config_require_namespaces` makes it opt-in and
+  **fail-closed**: the payload runs inside them or exits 123/118, never
+  unisolated. Off by default, so no caller changes behaviour.
+
+  And the payload's stderr is its own stream. Both child fds went to one pipe
+  and `ExecResult.stderr` was hardcoded `""` — telling a caller the payload
+  wrote nothing, which is a different claim from "we did not keep it". Two
+  pipes, drained round-robin, because draining one to EOF then the other
+  deadlocks once the undrained pipe fills.
+
+  Four mutations, all caught after two corrections of my own tests: a
+  `contains "0"` uid check that matched **1000**, and a deadlock probe flooding
+  the wrong stream — the capture caps its own buffer, so only a *small stdout
+  with a huge stderr* can deadlock a drain-stdout-first loop.
+
+- **Pinned kavach 3.11.4. Three defects agnosai found, fixed upstream, and did
+  not work around — the last of them made ADR-006's premise false.**
+
+  **Neither kavach exec path applied seccomp or landlock without a rootfs
+  (3.11.3).** `process_exec` reached the confined capture only under
+  `rootfs != 0`, and `persistent_spawn` took no policy at all, so
+  `seccomp_enabled = 1` was stored, scored by `score_backend`, and never
+  applied. Separately `landlock_rules_len` was a bare counter with no list
+  behind it and `confine_child` passed `security_apply_landlock(0, 0)` — so
+  landlock was applied by nothing.
+
+  This is exactly what [ADR-006](docs/adr/006-cx-tool-sandbox.md) rests on:
+  `cxvm` dispatches guest syscalls straight to the host kernel, so kavach's
+  seccomp + landlock *are* the whole boundary. Measured with the ADR's own
+  acceptance test — a `.cyx` calling `open("/etc/passwd")` and reporting the raw
+  syscall return:
+
+  | | unwrapped `cxvm` | via kavach |
+  |---|---|---|
+  | 3.11.2 | fd 3 | **fd 3** |
+  | 3.11.3+ | fd 3 | **EACCES** |
+
+  Fixed by routing confinement on the policy rather than the rootfs (fail-closed
+  when a requested filter cannot be built), adding `policy_landlock_add` /
+  `policy_landlock_deny_all`, and adding `persistent_spawn_confined`, which
+  installs landlock and seccomp between the pipes and `execve` — landlock does
+  not restrict already-open descriptors, which is what lets a confined guest
+  still read its stdin. `persistent_spawn` keeps its signature and its
+  unconfined behaviour, now documented rather than implicit.
+
+  **`SandboxConfig.timeout_ms` was ignored by every backend except WASM
+  (3.11.4).** A 1000 ms deadline let `/bin/sleep 8` run **8001 ms** and report
+  `timed_out = 0` — unenforced, and the flag lying about it. `confine_capture`
+  now takes a deadline, drains non-blocking with a 5 ms idle sleep, and SIGKILLs
+  then reaps on expiry.
+
+  **The process backend never reported the payload's exit code (3.11.4).**
+  `/bin/false` (real 1) and `/bin/ls` on a missing path (real 2) both came back
+  **0**, so a failing payload was indistinguishable from a successful one. Both
+  capture paths now share one implementation, so they cannot drift apart again.
+
+  Six mutations across the two releases, all caught by kavach's suite.
+
+  **One regression of my own, caught by CI rather than locally**: routing on the
+  policy pulled namespace creation into a path that never had it, and
+  unprivileged user namespaces are restricted on stock runners — so payloads
+  that previously ran stopped running. Namespaces are now applied on the rootfs
+  path only, via a `want_ns` parameter that leaves every pre-3.11.3 caller
+  untouched, including `sandbox_spawn`'s fail-closed namespace contract.
+
 - **Pinned kavach 3.11.1, which closes a Landlock hole agnosai found and fixed.**
   `security_apply_landlock` named only **3 of Landlock's 13 filesystem rights**
   in `handled_access_fs`, and Landlock permits every right it is not told to

@@ -344,6 +344,26 @@ fn _t_kb_execute_reports_the_exit_code(): i64 {
     "...carrying the real non-zero code, not flattened to 0");
     return 0;
 }
+fn _t_kb_execute_honours_the_policy_deadline(): i64 {
+    # `max_duration_secs` -> `timeout_ms` -> kavach's process backend. Every
+    # link existed before 3.11.4 except the last, where the value was dropped:
+    # a 1-second deadline let `/bin/sleep 8` run its full 8 seconds and report
+    # timed_out = 0.
+    var p = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_PROCESS, 0, 0, 1, 0);
+    var e[8];
+    store64(&e, 0);
+    var t0 = clock_now_ms();
+    var r = agnosai_kavach_execute(str_from("/bin/sleep 8"), p, 0, &e);
+    var dt = clock_now_ms() - t0;
+
+    assert(load64(&e) == 0, "a timeout is a result, not a bridge error");
+    assert(r != 0, "...so a result comes back");
+    assert(agnosai_kavach_result_timed_out(r) == 1,
+    "the policy's 1-second deadline is ENFORCED by kavach, not merely stored");
+    assert(dt < 15000, "...and fired rather than waiting out the sleep");
+    return 0;
+}
+
 fn _t_kb_execute_with_agent_id(): i64 {
     var e[8];
     store64(&e, 0);
@@ -420,6 +440,7 @@ fn main(): i64 {
     _t_kb_execute_needs_no_explicit_init();
     _t_kb_execute_runs_a_command();
     _t_kb_execute_reports_the_exit_code();
+    _t_kb_execute_honours_the_policy_deadline();
     _t_kb_execute_with_agent_id();
     _t_kb_repeated_failures_do_not_break_the_bridge();
     _t_kb_execute_none_policy_uses_the_noop_backend();

@@ -201,7 +201,7 @@ Standing decisions that shaped the port, each with its record:
 
 ## Tests
 
-**65 suites, 4,368 assertions, all passing.** Coverage `cyrius coverage --min 80`
+**65 suites, 4,372 assertions, all passing.** Coverage `cyrius coverage --min 80`
 → **100% (899/899 fns)**, 64/64 files referenced.
 
 ```sh

@@ -287,20 +287,18 @@ fn _agnosai_kavach_ensure_init(): i64 {
 # kept because it is the oracle's and because it starts mattering the moment a
 # backend attaches a real resource to destroy.
 #
-# ## The deadline in the config is not enforced by kavach
+# ## The deadline is kavach's to enforce, and since 3.11.4 it does
 #
 # `agnosai_kavach_build_config` sets `timeout_ms` from the policy's
-# `max_duration_secs`, as the oracle does. **kavach ignores it on every backend
-# except WASM.** Measured against kavach 3.11.2 on 2026-08-04: a config with
-# `timeout_ms = 1000` running `/bin/sleep 8` on the process backend took
-# **8001 ms** and reported `timed_out = 0`. Filed upstream —
-# `kavach/docs/development/issues/2026-08-04-sandbox-config-timeout-ms-is-ignored-by-every-backend-except-wasm.md`.
+# `max_duration_secs`, as the oracle does, and kavach's process backend now
+# honours it. Until 3.11.4 it did not: measured against 3.11.2, a config with
+# `timeout_ms = 1000` running `/bin/sleep 8` took **8001 ms** and reported
+# `timed_out = 0` — the bound unenforced and the flag lying about it. Filed,
+# then fixed upstream rather than worked around here, because every other
+# kavach consumer had the same hole.
 #
-# It is **not** worked around here. Enforcing the deadline agnosai-side would
-# diverge from the oracle's structure and, worse, would hide an upstream defect
-# that every other kavach consumer also has. Callers needing an enforced
-# deadline today have `agnosai_sandbox_manager_execute_argv`, whose process and
-# OCI backends go through agnosai's own spawn primitive and do honour one.
+# **3.11.4 is the floor for this module.** Against 3.11.3 or earlier a policy's
+# `max_duration_secs` reaches kavach and is dropped.
 #
 # Returns 0 with `out_err` set when the sandbox cannot be created, started, or
 # executed in.

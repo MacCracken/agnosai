@@ -271,10 +271,18 @@ small:
   confined run looked like an escape. Probes must report the raw syscall return,
   not a comparison.
 
-  **Still open, and named rather than implied**: no network isolation for a
-  rootfs-less sandbox (kavach ties namespaces to rootfs), no enforced
-  `timeout_ms` inside kavach, and no payload exit code from a non-confining
-  policy. None of it is faked: ADR-006's hard requirement
+  **Closed in kavach 3.11.4**: `timeout_ms` is enforced on the process backend,
+  and the real payload exit code is reported on both the confined and
+  unconfined paths.
+
+  **Closed in kavach 3.11.5**: network isolation without a rootfs is available
+  opt-in and fail-closed (`config_require_namespaces`), and the payload's stderr
+  is captured on its own stream. **All kavach filings from this milestone are
+  now resolved.**
+
+  The cx runner does not yet set `require_namespaces` — a `.cyx` guest can still
+  reach the network. That is now an agnosai choice rather than a kavach
+  limitation, and the next thing to decide: ADR-006's hard requirement
   is that "no code path may execute a `.cyx` outside a kavach sandbox — a `cxvm`
   spawn that is not wrapped is a full sandbox escape, not a degraded one."
 - **The cx confinement bites (B14-B15)** — `wasm.rs`'s successor per
