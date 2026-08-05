@@ -201,7 +201,15 @@ Standing decisions that shaped the port, each with its record:
 
 ## Tests
 
-**65 suites, 4,372 assertions, all passing.** Coverage `cyrius coverage --min 80`
+**65 suites, 4,373 assertions, all passing** — but see the M7 audit: a green
+suite here proved compatible with 43 confirmed defects, three of them live
+crashes or leaks. `docs/development/m7-audit-2026-08-04.md` has the evidence and
+`roadmap.md`'s M7 section has the remediation queue (3 fixed, 40 open). **That
+queue is the next work.**
+
+⚠ The full `cyrius tests tests` run currently exceeds ~570 s and stalls in
+`server_sse`; individual sandbox suites take 1-3 s each. Run suites individually
+while working M7 rather than waiting on the whole tree. Coverage `cyrius coverage --min 80`
 → **100% (899/899 fns)**, 64/64 files referenced.
 
 ```sh

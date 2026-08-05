@@ -212,7 +212,50 @@ allocator on parse/build, so the handler half still grows the global bump —
 measured, and owed upstream as B3. The exit bar should read "transport flat,
 handler cost bounded and measured" until that filing lands.
 
-### M7 — `sandbox`, 77% (Phase 6) — 🟡 in progress
+### M7 — `sandbox`, 77% (Phase 6) — 🟡 audit remediation
+
+🔴 **START HERE. The audit of 2026-08-04 found 43 confirmed defects behind a
+green suite** — full evidence and a per-finding fix in
+[m7-audit-2026-08-04.md](m7-audit-2026-08-04.md). All eight modules are
+implemented and every oracle test is ported, but **the milestone is not done
+until this queue is worked**, because several of the findings are live defects
+and several more are security controls that can be deleted with the suite still
+passing.
+
+**3 fixed, 40 open.** Fix order, hardest-consequence first:
+
+1. **Live defects (crash / leak).** ✅ `spawn` dup2 fd leak; ✅ `cx` stdin
+   double-close; ✅ `cx` stdout fd leak per run. 🔴 **Remaining:** `python` and
+   `oci` both drop the oracle's stdin-write error handling, so a child that
+   exits without draining stdin kills the **calling process** with SIGPIPE;
+   `spawn`'s `_agnosai_spawn_failure()` early returns leak every descriptor
+   already opened.
+2. **Security controls that can be deleted with the suite green.** The
+   loader-injection filter in `process`, the inherited-env sanitizer in `spawn`,
+   the `FD_CLOEXEC` call site, and cx's network isolation. Plus
+   `kavach_bridge`'s `scan_output`, which hands the gate a raw pointer so the
+   scan length is `strlen()` not `str_len()` — **secrets after an embedded NUL
+   are never scanned.**
+3. **`cx`'s "skips are real" guard is hardcoded to `/home/macro/...`** — on CI it
+   protects nothing, so every execution test can silently skip. This one gates
+   the trustworthiness of the whole cx suite.
+4. **Fail-open divergence:** `manager` treats a 0-second timeout as *no
+   deadline*, the opposite of the "0 means unset" reading applied elsewhere.
+5. **The vacuous-assertion backlog** — the remaining ~25 findings.
+
+**Method note for whoever picks this up:** the audit's value came from asking,
+per load-bearing line, *"if I deleted this, which assertion fails?"* — and then
+**actually applying the mutation and running the suite**. Every finding in that
+document was verified that way; do the same for the fixes, because a fix whose
+test cannot fail is not a fix. Two tests written *during* remediation were
+themselves vacuous on the first attempt.
+
+**Unrelated, noticed while verifying:** the full `cyrius tests tests` run now
+exceeds ~570 s and stalls in **`server_sse`**, which no sandbox change touches.
+Every sandbox suite passes individually in 1-3 s. Worth timing before assuming
+a sandbox regression.
+
+
 
 **Bites 1-11 done (2026-08-04).** Bite 11: `manager` — backend selection and
 dispatch, all eight oracle tests ported. **The oracle's module sequence is now

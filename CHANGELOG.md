@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **M7 audit (2026-08-04): three live defects, found by adversarial review of a
+  fully green suite.** 43 findings confirmed across the eight sandbox modules,
+  each verified by applying the mutation and re-running the tests —
+  [docs/development/m7-audit-2026-08-04.md](docs/development/m7-audit-2026-08-04.md).
+  Coverage was 100% and 4,372 assertions passed throughout; reference coverage
+  counts whether a symbol is *named* by a test, not whether an assertion would
+  *fail* without it.
+
+  Fixed here:
+
+  - **`spawn`: the child leaked the descriptors it had just `dup2`'d.** `dup2`
+    duplicates, it does not consume, so `irf`/`owf`/`ewf` stayed open alongside
+    fds 0/1/2. The child held extra write-end copies of the output pipes, which
+    a grandchild inherits — so the parent's read does not see EOF until every
+    copy is gone, not when the direct child exits. Closed now, guarded so a
+    descriptor that already *is* 0/1/2 is not closed after being dup2'd onto
+    itself.
+  - **`cx`: the guest's stdin was closed twice.** The runner closed it so the
+    guest would see EOF, then `persistent_terminate` closed the same number
+    again on the timeout path — and a second close of a recycled descriptor
+    hits whatever the process opened in between. The runner now disowns the fd.
+  - **`cx`: one descriptor leaked per successful run.** The guest's stdout fd is
+    the runner's to close and nothing did.
+
+  The leak now has a test that counts descriptors via `fcntl(F_GETFD)` across
+  eight runs; reverting the `sys_close` fails it. **Its first version asserted
+  nothing** — it used `dir_open`/`dir_read`, which do not exist, so the calls
+  were dead-code-eliminated and the test reported green. That is the exact
+  failure mode the audit exists to find, committed while fixing the audit.
+
+  **40 findings remain open.** See the roadmap for the queue.
+
 ### Security
 
 - **`envp` entries are NUL-terminated individually rather than by luck.**
