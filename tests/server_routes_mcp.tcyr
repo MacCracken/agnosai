@@ -284,6 +284,117 @@ fn _t_tools_call_argument_handling(): i64 {
 
 # --- Unknown method and malformed bodies ---------------------------------
 
+# --- resources/list, resources/read (beyond the oracle — ADR 015) ---------
+
+# A state carrying two agent definitions, which is what resources project.
+fn _t_state_with_defs(): i64 {
+    var s = _t_state();
+    agnosai_app_state_definition_insert(s, str_from("researcher"),
+    agnosai_agent_new(str_from("researcher"), str_from("finds things"), str_from("research")));
+    agnosai_app_state_definition_insert(s, str_from("writer"),
+    agnosai_agent_new(str_from("writer"), str_from("writes things"), str_from("write")));
+    return s;
+}
+
+fn _t_resources_list(): i64 {
+    var s = _t_state_with_defs();
+    var v = agnosai_route_body(agnosai_route_mcp(s, _t_rpc("resources/list", "")));
+    var arr = _t_obj(_t_obj(v, "result"), "resources");
+    assert(arr != 0 && bayan_json_v_is_arr(arr) == 1, "resources/list returns a resources array");
+    assert(bayan_json_v_arr_len(arr) == 2, "...one entry per stored definition");
+
+    # The URI scheme is what resources/read round-trips on, so it is pinned
+    # here rather than left to the read test to imply.
+    var e0 = bayan_json_v_arr_get(arr, 0);
+    var uri = _t_str(e0, "uri");
+    assert(str_contains_cstr(uri, "agnosai://agents/") == 1, "...addressed by the agnosai scheme");
+    assert(str_len(_t_str(e0, "name")) > 0, "...carrying a name");
+    assert(str_eq_cstr(_t_str(e0, "mimeType"), "application/json") == 1, "...and a mime type");
+    return 0;
+}
+
+fn _t_resources_list_empty(): i64 {
+    # No definitions stored: an empty array, NOT a missing key. A client
+    # iterating `result.resources` must not have to null-check it.
+    var v = agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("resources/list", "")));
+    var arr = _t_obj(_t_obj(v, "result"), "resources");
+    assert(arr != 0 && bayan_json_v_is_arr(arr) == 1, "an empty registry still returns an array");
+    assert(bayan_json_v_arr_len(arr) == 0, "...an empty one");
+    return 0;
+}
+
+fn _t_resources_read(): i64 {
+    var s = _t_state_with_defs();
+    var v = agnosai_route_body(agnosai_route_mcp(s,
+    _t_rpc("resources/read", ",\"params\":{\"uri\":\"agnosai://agents/researcher\"}")));
+    var contents = _t_obj(_t_obj(v, "result"), "contents");
+    assert(contents != 0 && bayan_json_v_is_arr(contents) == 1, "resources/read returns contents");
+    assert(bayan_json_v_arr_len(contents) == 1, "...one item");
+
+    var item = bayan_json_v_arr_get(contents, 0);
+    assert(str_eq_cstr(_t_str(item, "uri"), "agnosai://agents/researcher") == 1,
+    "...echoing the uri it was asked for");
+    # **The payload is the definition, not a description of it.** The text is
+    # the same JSON `GET /api/v1/agents/definitions` serves, which is the whole
+    # claim of ADR 015 — re-projection, not a second representation.
+    var text = _t_str(item, "text");
+    assert(str_contains_cstr(text, "researcher") == 1, "...and the body is the definition itself");
+    assert(str_contains_cstr(text, "finds things") == 1, "...including its role");
+    assert(str_contains_cstr(text, "writer") == 0, "...and ONLY the one addressed");
+    return 0;
+}
+
+fn _t_resources_read_rejections(): i64 {
+    var s = _t_state_with_defs();
+
+    # A URI we do not own must not be claimed.
+    var foreign = agnosai_route_body(agnosai_route_mcp(s,
+    _t_rpc("resources/read", ",\"params\":{\"uri\":\"file:///etc/passwd\"}")));
+    assert(_t_obj(foreign, "error") != 0, "a foreign URI scheme is refused");
+    assert(_t_obj(foreign, "result") == 0, "...with no result alongside the error");
+
+    # **And refused as a SCHEME problem, not by accident.** `file:///etc/passwd`
+    # errors either way — its tail matches no agent — so it cannot tell a real
+    # prefix check from none at all. The discriminating case is a foreign URI
+    # whose tail IS a valid name: with the prefix compare defeated, the suffix
+    # is taken verbatim and the definition is served to a caller that never
+    # addressed it. The prefix is 17 bytes, so 17 filler bytes put "researcher"
+    # exactly where the name is read from.
+    var collide = agnosai_route_body(agnosai_route_mcp(s,
+    _t_rpc("resources/read", ",\"params\":{\"uri\":\"aaaaaaaaaaaaaaaaaresearcher\"}")));
+    assert(_t_obj(collide, "error") != 0,
+    "a foreign URI whose TAIL matches an agent name is still refused");
+    assert(_t_obj(collide, "result") == 0, "...and serves no definition");
+    assert(str_contains_cstr(_t_str(_t_obj(collide, "error"), "message"), "scheme") == 1,
+    "...rejected as a scheme mismatch, not as a missing resource");
+
+    # Our scheme, no such definition.
+    var missing = agnosai_route_body(agnosai_route_mcp(s,
+    _t_rpc("resources/read", ",\"params\":{\"uri\":\"agnosai://agents/nobody\"}")));
+    assert(_t_obj(missing, "error") != 0, "an unknown resource is an error, not empty contents");
+
+    # Missing and wrong-typed params.
+    var noparams = agnosai_route_body(agnosai_route_mcp(s, _t_rpc("resources/read", "")));
+    assert(_t_obj(noparams, "error") != 0, "absent params is invalid-params");
+    var nouri = agnosai_route_body(agnosai_route_mcp(s,
+    _t_rpc("resources/read", ",\"params\":{\"uri\":7}")));
+    assert(_t_obj(nouri, "error") != 0, "a non-string uri is invalid-params");
+    return 0;
+}
+
+fn _t_resources_capability_advertised(): i64 {
+    # A capability key is a promise; it must appear exactly because the methods
+    # are answered. `subscribe` is deliberately NOT advertised — nothing here
+    # can push notifications/resources/updated.
+    var v = agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("initialize", "")));
+    var caps = _t_obj(_t_obj(v, "result"), "capabilities");
+    assert(_t_obj(caps, "tools") != 0, "tools capability still advertised");
+    assert(_t_obj(caps, "resources") != 0, "resources capability advertised");
+    assert(_t_obj(_t_obj(caps, "resources"), "subscribe") == 0,
+    "...without subscribe, which nothing here can honour");
+    return 0;
+}
+
 fn _t_unknown_method(): i64 {
     var b = agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("tools/destroy", "")));
     var e = _t_obj(b, "error");
@@ -330,6 +441,11 @@ fn main(): i64 {
     _t_tools_call_unknown_tool();
     _t_tools_call_missing_name();
     _t_tools_call_argument_handling();
+    _t_resources_list();
+    _t_resources_list_empty();
+    _t_resources_read();
+    _t_resources_read_rejections();
+    _t_resources_capability_advertised();
     _t_unknown_method();
     _t_malformed_body();
 

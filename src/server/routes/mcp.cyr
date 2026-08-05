@@ -119,6 +119,13 @@ fn _agnosai_mcp_initialize(id): i64 {
     # absent. A client reads the presence of the `tools` key as the capability.
     var caps = bayan_json_v_obj_new();
     bayan_json_v_obj_set(caps, str_from("tools"), bayan_json_v_obj_new());
+    # `resources` alongside it (roadmap B1, [ADR 015]). **Advertised only
+    # because it is answered** — a capability key is a promise a client acts on,
+    # so it goes in exactly when `resources/list` and `resources/read` do, and
+    # `subscribe` is deliberately absent from it: nothing here can push a
+    # `notifications/resources/updated`, and claiming otherwise leaves a client
+    # waiting for an event that never comes.
+    bayan_json_v_obj_set(caps, str_from("resources"), bayan_json_v_obj_new());
 
     var r = bayan_json_v_obj_new();
     bayan_json_v_obj_set(r, str_from("protocolVersion"),
@@ -235,6 +242,107 @@ fn _agnosai_mcp_tools_call(id, params, state): i64 {
 # The distinction is wire-visible and pinned by the oracle's own
 # `tools_call_executes_echo_tool`, which asserts `content[0]["text"] == "hello"`
 # rather than `"\"hello\""`.
+# --- resources/list, resources/read ---------------------------------------
+#
+# **Beyond the oracle, and re-projection rather than invention.** `mcp.rs`
+# answers three methods and these are not among them — see
+# [ADR 015](../../../docs/adr/015-mcp-resources-project-agent-definitions.md)
+# for why the superset is allowed and what it is bounded to. Every byte served
+# here is what `GET /api/v1/agents/definitions` already serves, addressed by URI
+# instead of by path; no new state, no new lifecycle, nothing an MCP client can
+# reach that a REST client could not.
+#
+# The URI scheme is `agnosai://agents/<name>`. `<name>` is the definition's map
+# key, so `resources/read` is a single `agnosai_app_state_definition_get` and
+# cannot walk anywhere the map does not already hold.
+var AGNOSAI_MCP_RESOURCE_PREFIX = "agnosai://agents/";
+
+# The name half of `agnosai://agents/<name>`, or 0 when `uri` is not one of ours.
+#
+# Returns 0 rather than an empty `Str` for a non-match, so "not our scheme" and
+# "our scheme with an empty name" stay distinguishable — the second is a lookup
+# that will miss, the first is a URI we must not claim to own.
+fn _agnosai_mcp_resource_name(uri: Str): i64 {
+    var plen = strlen(AGNOSAI_MCP_RESOURCE_PREFIX);
+    if (str_len(uri) < plen) { return 0; }
+    var d = str_data(uri);
+    var i = 0;
+    while (i < plen) {
+        if (load8(d + i) != load8(AGNOSAI_MCP_RESOURCE_PREFIX + i)) { return 0; }
+        i = i + 1;
+    }
+    return str_new(d + plen, str_len(uri) - plen);
+}
+
+# One MCP resource descriptor for an agent definition.
+fn _agnosai_mcp_resource_of(def): i64 {
+    var name = agnosai_agent_name(def);
+    var o = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(o, str_from("uri"),
+    bayan_json_v_str_new(str_cat(str_from(AGNOSAI_MCP_RESOURCE_PREFIX), name)));
+    bayan_json_v_obj_set(o, str_from("name"), bayan_json_v_str_new(name));
+    bayan_json_v_obj_set(o, str_from("description"),
+    bayan_json_v_str_new(agnosai_agent_role(def)));
+    bayan_json_v_obj_set(o, str_from("mimeType"),
+    bayan_json_v_str_new(str_from("application/json")));
+    return o;
+}
+
+fn _agnosai_mcp_resources_list(id, state): i64 {
+    var defs = agnosai_app_state_definitions(state);
+    var arr = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(defs); i = i + 1) {
+        bayan_json_v_arr_push(arr, _agnosai_mcp_resource_of(vec_get(defs, i)));
+    }
+    var r = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(r, str_from("resources"), arr);
+    return _agnosai_mcp_success(id, r);
+}
+
+# `resources/read` — the definition's own JSON, under MCP's `contents` envelope.
+#
+# **A missing resource is a JSON-RPC error, not an empty success.** MCP has no
+# "isError" affordance here the way `tools/call` does, so the only way to say
+# "no such resource" is the error channel; answering `contents: []` would read
+# as "this resource exists and is empty".
+fn _agnosai_mcp_resources_read(id, params, state): i64 {
+    if (params == 0 || bayan_json_v_is_obj(params) == 0) {
+        return _agnosai_mcp_error(id, AGNOSAI_MCP_INVALID_PARAMS,
+        str_from("params must be an object with a uri"));
+    }
+    var uri_v = bayan_json_v_obj_get(params, "uri");
+    if (uri_v == 0 || bayan_json_v_is_str(uri_v) == 0) {
+        return _agnosai_mcp_error(id, AGNOSAI_MCP_INVALID_PARAMS,
+        str_from("uri is required and must be a string"));
+    }
+    var uri = bayan_json_v_str(uri_v);
+    var name = _agnosai_mcp_resource_name(uri);
+    if (name == 0) {
+        return _agnosai_mcp_error(id, AGNOSAI_MCP_INVALID_PARAMS,
+        str_from("unknown resource URI scheme"));
+    }
+    var def = agnosai_app_state_definition_get(state, name);
+    if (def == 0) {
+        return _agnosai_mcp_error(id, AGNOSAI_MCP_INVALID_PARAMS,
+        str_from("no such resource"));
+    }
+
+    var item = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(item, str_from("uri"), bayan_json_v_str_new(uri));
+    bayan_json_v_obj_set(item, str_from("mimeType"),
+    bayan_json_v_str_new(str_from("application/json")));
+    # `text`, not an inline object: MCP's contents item carries the payload as a
+    # string, so the definition is serialized rather than nested.
+    bayan_json_v_obj_set(item, str_from("text"),
+    bayan_json_v_str_new(bayan_json_v_build(agnosai_agent_to_value(def))));
+
+    var arr = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(arr, item);
+    var r = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(r, str_from("contents"), arr);
+    return _agnosai_mcp_success(id, r);
+}
+
 fn _agnosai_mcp_result_text(result): Str {
     if (result == 0) { return str_from(""); }
     if (bayan_json_v_is_str(result) == 1) { return bayan_json_v_str(result); }
@@ -283,6 +391,14 @@ fn agnosai_route_mcp(state, body: Str): i64 {
     if (str_eq_cstr(method, "tools/call") == 1) {
         return agnosai_route_json(HTTP_OK,
         _agnosai_mcp_tools_call(id, bayan_json_v_obj_get(v, "params"), state));
+    }
+    # Beyond the oracle's three — see ADR 015.
+    if (str_eq_cstr(method, "resources/list") == 1) {
+        return agnosai_route_json(HTTP_OK, _agnosai_mcp_resources_list(id, state));
+    }
+    if (str_eq_cstr(method, "resources/read") == 1) {
+        return agnosai_route_json(HTTP_OK,
+        _agnosai_mcp_resources_read(id, bayan_json_v_obj_get(v, "params"), state));
     }
 
     _agnosai_mcp_unknown(method);

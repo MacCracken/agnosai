@@ -236,6 +236,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spawn 144 → **169**, process 108 → **130**, python 61 → **76**, manager 69 →
   **90**, cx 62 → **87**. **627 → 727 assertions**, all green, coverage 100%.
 
+### Added
+
+- **MCP `resources/list` and `resources/read`** — roadmap B1, first half.
+  Stored agent definitions are addressable as `agnosai://agents/<name>` and
+  readable as the same JSON `GET /api/v1/agents/definitions` already serves.
+  No new state, no new lifecycle: it is a re-projection of existing surface over
+  a second protocol, which is what bounds it —
+  [ADR 015](docs/adr/015-mcp-resources-project-agent-definitions.md).
+
+  **This is a superset of the oracle**, which answers three methods and would
+  return `-32601` for these, so it is a wire-visible divergence and carries an
+  ADR per CLAUDE.md. The three ported handlers are untouched and their tests
+  unchanged.
+
+  `capabilities.resources` is advertised **without** `subscribe`. A capability
+  key is a promise a client acts on, and nothing here can push a
+  `notifications/resources/updated` — the MCP route is request/response with no
+  channel to the client.
+
+  server_routes_mcp **80 → 104 assertions**, four mutations killed. The
+  URI-scheme check needed a second attempt: `file:///etc/passwd` is refused
+  whether or not the prefix is actually compared, because its tail matches no
+  agent — so the first version of that assertion passed against a defeated
+  check. The discriminating case is a foreign URI whose **tail is a valid agent
+  name**, which a defeated check serves to a caller that never addressed it.
+
+  **B1's "subscriptions" is struck, not deferred.** `lib/bote-core.cyr` has no
+  `resources/subscribe`; what it has is `req_is_notification` /
+  `dispatcher_notifications`, which is JSON-RPC notification detection and a
+  different thing. Prompts remain owed.
+
+- **Checked and left alone: MCP notification handling.** agnosai answers a
+  request with no `id`, which JSON-RPC 2.0 §4.1 says a server must not do. The
+  oracle does the same — `req.id.clone().unwrap_or(Value::Null)` and an
+  unconditional `Json<JsonRpcResponse>` (`mcp.rs:49-65`) — so this is a faithful
+  port, and "fixing" it would be the divergence.
+
 ### Changed
 
 - **Pinned kavach 3.11.7, and deleted the gate workaround it makes
