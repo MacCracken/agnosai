@@ -197,7 +197,17 @@ fn _agnosai_orch_level_for(status): i64 {
 #
 # The event channel is removed at the end, which is what stops a long-lived
 # orchestrator accumulating one channel per crew ever run.
-fn agnosai_orchestrator_run_crew(o, spec): i64 {
+# Register a crew and build its runner, without executing it.
+#
+# **The half `run_crew` and `submit_crew` share.** Split out in the async bite
+# so the two entry points cannot drift: the registration order here is
+# load-bearing — the crew is in the map as PENDING and its cancel flag is
+# published **before** any execution starts, which is what lets `get_crew` and
+# `cancel_crew` reach a run that has not finished. That was already true of the
+# blocking path; async only makes it observable.
+#
+# Returns the runner, fully wired (audit, llm, events).
+fn _agnosai_orch_register(o, spec): i64 {
     var crew_id = agnosai_crew_id(spec);
     var crew_name = agnosai_crew_name(spec);
     var tasks = agnosai_crew_tasks(spec);
@@ -223,16 +233,34 @@ fn agnosai_orchestrator_run_crew(o, spec): i64 {
     agnosai_crew_runner_cancel_flag(runner));
     mutex_unlock(mtx);
 
-    var url = load64(o + AGN_OR_LLM_URL);
-    if (url != 0) {
+    var rurl = load64(o + AGN_OR_LLM_URL);
+    if (rurl != 0) {
         agnosai_crew_runner_with_llm(runner,
-        agnosai_hoosh_client_new(url, load64(o + AGN_OR_LLM_KEY)));
+        agnosai_hoosh_client_new(rurl, load64(o + AGN_OR_LLM_KEY)));
     }
 
-    var bus = load64(o + AGN_OR_EVENTS);
-    if (bus != 0) {
-        agnosai_crew_runner_with_events(runner, agnosai_event_bus_sender(bus, crew_id));
+    var rbus = load64(o + AGN_OR_EVENTS);
+    if (rbus != 0) {
+        agnosai_crew_runner_with_events(runner, agnosai_event_bus_sender(rbus, crew_id));
     }
+    return runner;
+}
+
+fn agnosai_orchestrator_run_crew(o, spec): i64 {
+    return _agnosai_orch_finish(o, _agnosai_orch_register(o, spec),
+    agnosai_crew_id(spec), agnosai_crew_name(spec));
+}
+
+# Run a registered crew to completion and store its outcome.
+#
+# **The other half `run_crew` and `submit_crew` share**, so the blocking and
+# async paths cannot diverge in how a finished crew is audited, stored, or
+# unregistered. Called inline by the first and on a thread by the second; it
+# touches nothing that is not already thread-safe (see the note above
+# `agnosai_orchestrator_submit_crew`).
+fn _agnosai_orch_finish(o, runner, crew_id: Str, crew_name: Str): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    var bus = load64(o + AGN_OR_EVENTS);
 
     var run_err: i64[1];
     store64(&run_err, 0);
@@ -274,6 +302,73 @@ fn agnosai_orchestrator_run_crew(o, spec): i64 {
 
     if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
     return state;
+}
+
+# --- Async submission -----------------------------------------------------
+#
+# **Beyond the oracle.** `create_crew` awaits `run_crew` inline
+# (`crews.rs:151`, `orchestrator.rs:126`), so the oracle has no async crew
+# lifecycle at all and `POST /api/v1/crews` keeps that exact blocking shape —
+# `agnosai_orchestrator_run_crew` above is untouched. This is the submit half
+# the `delegate` tool needs: a model driving subagents cannot hold a tool call
+# open for a crew that may run for minutes.
+#
+# **It adds no new concurrency class.** Crews already run concurrently — server
+# handlers execute on pool workers, so two simultaneous `POST /api/v1/crews`
+# already run two crews — and the runner itself already spawns one OS thread
+# per task (`crew_runner.cyr:851`). Every subsystem the run touches was audited
+# for it: metrics counters are `atomic_fetch_add` with the singleton pre-built
+# at `serve.cyr:478`, the audit chain locks inside `agnosai_audit_record`, the
+# event bus locks its whole fan-out and is lossy so it never blocks, and the
+# crew map locks on every access.
+
+# The payload handed to a submitted crew's thread.
+enum AgnosaiOrchJobOff {
+    AGN_OJ_ORCH = 0;
+    AGN_OJ_RUNNER = 8;
+    AGN_OJ_CREW_ID = 16;
+    AGN_OJ_NAME = 24;
+    AGN_OJ_SIZE = 32;
+}
+
+# The thread body: run the registered crew and store its outcome.
+#
+# `thread_create` passes exactly one argument, so the four values travel as a
+# heap struct — the same device `crew_runner.cyr:632` uses for its task workers.
+fn _agnosai_orch_submit_thread(job): i64 {
+    var o = load64(job + AGN_OJ_ORCH);
+    var runner = load64(job + AGN_OJ_RUNNER);
+    var crew_id = load64(job + AGN_OJ_CREW_ID);
+    var crew_name = load64(job + AGN_OJ_NAME);
+    _agnosai_orch_finish(o, runner, crew_id, crew_name);
+    return 0;
+}
+
+# Submit a crew for asynchronous execution. Returns its id immediately.
+#
+# The id is usable at once: `_agnosai_orch_register` has already put the crew in
+# the map as PENDING and published its cancel flag, so `GET /api/v1/crews/{id}`
+# answers and `cancel_crew` reaches it while it runs. Both statuses are existing
+# wire values (`crew.cyr:69-75`), so a polling client sees nothing new.
+#
+# **Returns 0 if the thread cannot be created**, leaving the crew PENDING and
+# unexecuted rather than reporting a run that never started.
+#
+# ⚠ **Owed: the thread is never joined.** `lib/thread.cyr` has `thread_create`
+# and `thread_join` and no detach, so each submitted crew leaks its 2 MiB stack.
+# Bounded work, deliberately deferred with the concurrency cap — see roadmap B1.
+fn agnosai_orchestrator_submit_crew(o, spec): i64 {
+    var crew_id = agnosai_crew_id(spec);
+    var runner = _agnosai_orch_register(o, spec);
+
+    var job = alloc(AGN_OJ_SIZE);
+    store64(job + AGN_OJ_ORCH, o);
+    store64(job + AGN_OJ_RUNNER, runner);
+    store64(job + AGN_OJ_CREW_ID, crew_id);
+    store64(job + AGN_OJ_NAME, agnosai_crew_name(spec));
+
+    if (thread_create(&_agnosai_orch_submit_thread, job) == 0) { return 0; }
+    return crew_id;
 }
 
 # Cancel a crew by id. Returns 0, or a CrewNotFound error.

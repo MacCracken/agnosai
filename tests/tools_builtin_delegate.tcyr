@@ -1,0 +1,198 @@
+# =========================================================================
+# tools_builtin_delegate — tests for src/tools/builtin/delegate.cyr.
+#
+# **No oracle tests exist**, and no oracle tool either: `rust-old/`'s registry
+# is echo, json_transform, load_testing and security_audit, and its crews are
+# driven by a human client over `POST /api/v1/crews`. This is the tool that lets
+# the *model* delegate instead.
+#
+# What is pinned here is the contract that makes it usable by a model:
+# it answers immediately with a `crew_id`, that id is live before the answer
+# comes back, and a bad `agent` is a synchronous error rather than a crew that
+# can only fail.
+#
+# **`delegate` is library surface the default binary does not register**, so
+# nothing here asserts about `tools/list` — that suite pins the oracle's four,
+# and it must keep doing so.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/learning/mod.cyr"
+include "src/llm/mod.cyr"
+include "src/server/ssrf.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/server/prometheus.cyr"
+include "src/server/auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/tools/mod.cyr"
+include "src/orchestrator/mod.cyr"
+include "src/server/state.cyr"
+include "src/tools/builtin/delegate.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_dl_state(): i64 {
+    var s = agnosai_app_state_new(agnosai_orchestrator_new(0),
+    agnosai_tool_registry_new(), agnosai_auth_config_new(),
+    agnosai_event_bus_new(), agnosai_audit_chain_new(),
+    agnosai_approval_gate_new());
+    agnosai_app_state_definition_insert(s, str_from("researcher"),
+    agnosai_agent_new(str_from("researcher"), str_from("finds things"), str_from("research")));
+    return s;
+}
+
+fn _t_dl_input(agent, task): i64 {
+    var i = agnosai_tool_input_new();
+    if (agent != 0) {
+        agnosai_tool_input_set(i, str_from("agent"), bayan_json_v_str_new(str_from(agent)));
+    }
+    if (task != 0) {
+        agnosai_tool_input_set(i, str_from("task"), bayan_json_v_str_new(str_from(task)));
+    }
+    return i;
+}
+
+fn _t_dl_schema(): i64 {
+    var s = _agnosai_delegate_schema(0);
+    assert(str_eq_cstr(agnosai_tool_schema_name(s), "delegate") == 1, "the tool is named delegate");
+    # **Two parameters, not the crew request's full shape.** Everything else a
+    # crew carries is something the model would have to invent.
+    assert(vec_len(agnosai_tool_schema_parameters(s)) == 2, "exactly agent and task");
+    return 0;
+}
+
+fn _t_dl_returns_an_id_not_a_result(): i64 {
+    var st = _t_dl_state();
+    var out = _agnosai_delegate_execute(st, _t_dl_input("researcher", "find things"));
+    assert(agnosai_tool_output_success(out) == 1, "a valid delegation succeeds");
+
+    var v = agnosai_tool_output_result(out);
+    var cid = bayan_json_v_obj_get(v, "crew_id");
+    assert(cid != 0 && bayan_json_v_is_str(cid) == 1, "it answers with a crew_id");
+    assert(agnosai_uuid_parse(bayan_json_v_str(cid)) != 0, "...a real UUID");
+    # **Not the crew's output.** The whole point is that the tool call does not
+    # wait for the crew; a `results` key here would mean it did.
+    assert(bayan_json_v_obj_get(v, "results") == 0, "and NOT the crew's results");
+    return 0;
+}
+
+fn _t_dl_id_is_live_before_the_call_returns(): i64 {
+    # The contract a polling caller depends on: the id is resolvable the moment
+    # it is handed over. `_agnosai_orch_register` puts the crew in the map as
+    # pending before execution starts, so this holds without waiting.
+    var st = _t_dl_state();
+    var out = _agnosai_delegate_execute(st, _t_dl_input("researcher", "find things"));
+    var cid = bayan_json_v_str(bayan_json_v_obj_get(agnosai_tool_output_result(out), "crew_id"));
+
+    var crew = agnosai_orchestrator_crew(agnosai_app_state_orchestrator(st), cid);
+    assert(crew != 0, "the crew is registered before delegate returns");
+    assert(str_eq(agnosai_crew_state_crew_id(crew), cid) == 1, "...under the id handed back");
+
+    # **This is the assertion that makes the tool asynchronous rather than
+    # merely id-returning**, and the first version of this suite did not have
+    # it — swapping `submit_crew` for the blocking `run_crew` passed 17/17,
+    # because every other assertion here holds for a crew that already
+    # finished. Measured: `delegate` returns in 0 ms with the crew PENDING, and
+    # the same crew reads COMPLETED 300 ms later.
+    #
+    # Narrow race, stated rather than hidden: the worker could in principle
+    # finish between `submit_crew` returning and this read, which would show a
+    # terminal status and fail spuriously. It has not been observed — the crew
+    # needs milliseconds and this is microseconds behind it — and the
+    # alternative is no assertion on the property at all, which is what the
+    # mutation caught.
+    assert(agnosai_crew_state_status(crew) == AGNOSAI_CREW_PENDING,
+    "...and still PENDING — delegate did NOT wait for the crew to finish");
+    return 0;
+}
+
+# The crew really does run, on its own thread, after delegate has returned.
+#
+# The pair matters: the assertion above proves `delegate` did not wait, and this
+# one proves the work was not simply dropped. Neither alone distinguishes async
+# execution from no execution.
+fn _t_dl_crew_completes_on_its_thread(): i64 {
+    var st = _t_dl_state();
+    var out = _agnosai_delegate_execute(st, _t_dl_input("researcher", "find things"));
+    var cid = bayan_json_v_str(bayan_json_v_obj_get(agnosai_tool_output_result(out), "crew_id"));
+
+    # Poll rather than sleep a fixed span, so a slower box does not flake.
+    var waited = 0;
+    var status = AGNOSAI_CREW_PENDING;
+    while (waited < 5000 && status != AGNOSAI_CREW_COMPLETED && status != AGNOSAI_CREW_FAILED) {
+        sleep_ms(10);
+        waited = waited + 10;
+        status = agnosai_crew_state_status(
+        agnosai_orchestrator_crew(agnosai_app_state_orchestrator(st), cid));
+    }
+    assert(status != AGNOSAI_CREW_PENDING,
+    "the submitted crew reaches a terminal status on its own thread");
+    return 0;
+}
+
+fn _t_dl_unknown_agent_is_synchronous(): i64 {
+    # A bad agent name must fail here, not become a crew that can only fail —
+    # otherwise the model has to poll to discover a typo.
+    var st = _t_dl_state();
+    var out = _agnosai_delegate_execute(st, _t_dl_input("nobody", "find things"));
+    assert(agnosai_tool_output_success(out) == 0, "an unknown agent is an error");
+    assert(str_contains_cstr(agnosai_tool_output_error(out), "no such agent") == 1,
+    "...saying so");
+
+    # And nothing was registered for it.
+    assert(vec_len(agnosai_orchestrator_crew_ids(
+    agnosai_app_state_orchestrator(st))) == 0, "...with no crew left behind");
+    return 0;
+}
+
+fn _t_dl_missing_params(): i64 {
+    var st = _t_dl_state();
+    var no_agent = _agnosai_delegate_execute(st, _t_dl_input(0, "do it"));
+    assert(agnosai_tool_output_success(no_agent) == 0, "a missing agent is an error");
+    var no_task = _agnosai_delegate_execute(st, _t_dl_input("researcher", 0));
+    assert(agnosai_tool_output_success(no_task) == 0, "a missing task is an error");
+    return 0;
+}
+
+fn _t_dl_is_not_registered_by_default(): i64 {
+    # **The parity guard.** `delegate` is library surface; a default registry
+    # must not carry it, or the binary's tools/list stops matching the oracle's
+    # four. Registration is opt-in and this proves the default is untouched.
+    var reg = agnosai_tool_registry_new();
+    agnosai_register_basic_builtins(reg);
+    agnosai_register_load_testing_builtin(reg);
+    agnosai_register_security_audit_builtin(reg);
+    assert(agnosai_tool_registry_count(reg) == 4, "the default set is the oracle's four");
+    assert(agnosai_tool_registry_get(reg, str_from("delegate")) == 0,
+    "...and delegate is NOT among them");
+
+    # Opting in adds exactly one.
+    agnosai_register_delegate_builtin(reg, _t_dl_state());
+    assert(agnosai_tool_registry_count(reg) == 5, "opting in adds it");
+    assert(agnosai_tool_registry_get(reg, str_from("delegate")) != 0, "...by name");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_dl_schema();
+    _t_dl_returns_an_id_not_a_result();
+    _t_dl_id_is_live_before_the_call_returns();
+    _t_dl_crew_completes_on_its_thread();
+    _t_dl_unknown_agent_is_synchronous();
+    _t_dl_missing_params();
+    _t_dl_is_not_registered_by_default();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

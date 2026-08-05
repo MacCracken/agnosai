@@ -1,0 +1,113 @@
+# =========================================================================
+# tools/builtin/delegate — hand a task to an agnosai crew, as a model-callable
+# tool.
+#
+# **No parity oracle.** `rust-old/` has no equivalent: the oracle's tool
+# registry is echo, json_transform, load_testing and security_audit, and its
+# crews are driven by `POST /api/v1/crews` from a human client. This is the
+# piece that lets the *model* drive delegation instead — the Claude Code shape,
+# where one tool takes the subagent as a parameter rather than the surface
+# growing one tool per agent.
+#
+# ## It is library surface, not binary surface
+#
+# `agnosai_register_delegate_builtin` exists but `src/main.cyr` does NOT call
+# it, so the default binary's `tools/list` stays byte-identical to the oracle's
+# four and wire parity is undisturbed. That mirrors `synapse`, `delta` and
+# `mneme`, which both trees carry and neither binary registers. A deployment
+# that wants model-driven delegation — thoth, in the case this was built for —
+# opts in with one call.
+#
+# ## Asynchronous, because a crew is not a function call
+#
+# `execute` returns a `crew_id` the moment the crew is registered, not when it
+# finishes. A crew can run for minutes; a tool call that blocked for that long
+# would hold the model's turn open and, through it, the caller's. The id is
+# immediately usable — the crew is in the orchestrator map as `pending` before
+# this returns — so the caller polls `GET /api/v1/crews/{id}` and can
+# `cancel_crew` mid-run. Both are existing parity surface; this adds no polling
+# API of its own.
+# =========================================================================
+
+# The delegate tool's parameter schema.
+#
+# `agent` and `task` only. A crew request carries more (process, expected
+# output, priority), and every one of those is a thing the *model* would have to
+# invent — so they are deliberately not exposed. The tool is "give this job to
+# that agent", and the orchestrator's defaults decide the rest.
+fn _agnosai_delegate_schema(ctx): i64 {
+    var s = agnosai_tool_schema_new(str_from("delegate"),
+    str_from("Delegate a task to an agnosai agent. Returns a crew_id immediately; \
+    poll GET /api/v1/crews/{crew_id} for status and results."));
+    agnosai_tool_schema_param(s, str_from("agent"),
+    str_from("The name of the agent definition to delegate to"), str_from("string"), 1);
+    agnosai_tool_schema_param(s, str_from("task"),
+    str_from("What the agent should do, in plain language"), str_from("string"), 1);
+    return s;
+}
+
+# Submit a one-task crew for `agent` and answer with its id.
+#
+# `ctx` is the app state, which is what carries both the definitions map (to
+# resolve `agent`) and the orchestrator (to submit against).
+fn _agnosai_delegate_execute(ctx, input): i64 {
+    var agent_v = agnosai_tool_input_get(input, str_from("agent"));
+    if (agent_v == 0 || bayan_json_v_is_str(agent_v) == 0) {
+        return agnosai_tool_output_err(str_from("missing required parameter: agent"));
+    }
+    var task_v = agnosai_tool_input_get(input, str_from("task"));
+    if (task_v == 0 || bayan_json_v_is_str(task_v) == 0) {
+        return agnosai_tool_output_err(str_from("missing required parameter: task"));
+    }
+    var agent_name = bayan_json_v_str(agent_v);
+
+    # **An unknown agent is an error, not an empty crew.** Submitting one would
+    # register a crew that can only fail, and the model would have to poll to
+    # discover a mistake it could have been told about synchronously.
+    var def = agnosai_app_state_definition_get(ctx, agent_name);
+    if (def == 0) {
+        return agnosai_tool_output_err(str_cat(str_from("no such agent definition: "),
+        agent_name));
+    }
+
+    var agents = vec_new();
+    vec_push(agents, def);
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(bayan_json_v_str(task_v)));
+
+    var spec = agnosai_crew_new(str_cat(str_from("delegate:"), agent_name));
+    agnosai_crew_with_agents(spec, agents);
+    agnosai_crew_with_tasks(spec, tasks);
+
+    var crew_id = agnosai_orchestrator_submit_crew(
+    agnosai_app_state_orchestrator(ctx), spec);
+    if (crew_id == 0) {
+        return agnosai_tool_output_err(str_from("could not start the delegated crew"));
+    }
+
+    var o = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(o, str_from("crew_id"), bayan_json_v_str_new(crew_id));
+    # `pending`, not `running` — the crew is registered and the thread is
+    # started, but nothing here waits to see it picked up, so claiming `running`
+    # would be a guess. It is the same wire spelling the crew map holds.
+    bayan_json_v_obj_set(o, str_from("status"), bayan_json_v_str_new(str_from("pending")));
+    return agnosai_tool_output_ok(o);
+}
+
+# The delegate tool, bound to an app state.
+fn agnosai_delegate_tool(state): i64 {
+    return agnosai_tool_new(str_from("delegate"),
+    str_from("Delegate a task to an agnosai agent. Returns a crew_id immediately; \
+    poll GET /api/v1/crews/{crew_id} for status and results."),
+    &_agnosai_delegate_schema, &_agnosai_delegate_execute, state);
+}
+
+# Opt in to model-driven delegation.
+#
+# **Deliberately not called by `src/main.cyr`** — see the module header. Calling
+# it adds a fifth entry to `tools/list`, which is a wire change against the
+# oracle's four.
+fn agnosai_register_delegate_builtin(registry, state): i64 {
+    agnosai_tool_registry_register(registry, agnosai_delegate_tool(state));
+    return 0;
+}
