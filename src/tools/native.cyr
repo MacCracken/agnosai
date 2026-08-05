@@ -67,13 +67,20 @@ enum AgnosaiToolOff {
 }
 
 # Describe a single tool parameter. `required` is 1 or 0.
-fn agnosai_param_schema_new(name: Str, description: Str, param_type: Str, required): i64 {
-    var p = alloc(AGN_PARAM_SIZE);
+fn agnosai_param_schema_new_a(a, name: Str, description: Str, param_type: Str,
+required): i64 {
+    var p = alloc_via(a, AGN_PARAM_SIZE);
     store64(p + AGN_PARAM_NAME, name);
     store64(p + AGN_PARAM_DESCRIPTION, description);
     store64(p + AGN_PARAM_TYPE, param_type);
     store64(p + AGN_PARAM_REQUIRED, required);
     return p;
+}
+
+# Global-allocator form of `agnosai_param_schema_new_a`.
+fn agnosai_param_schema_new(name: Str, description: Str, param_type: Str, required): i64 {
+    return agnosai_param_schema_new_a(default_alloc(), name, description, param_type,
+    required);
 }
 
 # Parameter name.
@@ -116,25 +123,47 @@ fn agnosai_param_schema_to_value(p): i64 {
 }
 
 # Create a tool schema with no parameters yet.
-fn agnosai_tool_schema_new(name: Str, description: Str): i64 {
-    var s = alloc(AGN_SCHEMA_SIZE);
+fn agnosai_tool_schema_new_a(a, name: Str, description: Str): i64 {
+    var s = alloc_via(a, AGN_SCHEMA_SIZE);
     store64(s + AGN_SCHEMA_NAME, name);
     store64(s + AGN_SCHEMA_DESCRIPTION, description);
-    store64(s + AGN_SCHEMA_PARAMETERS, vec_new());
+    store64(s + AGN_SCHEMA_PARAMETERS, vec_new_a(a));
     return s;
+}
+
+# Global-allocator form of `agnosai_tool_schema_new_a`.
+fn agnosai_tool_schema_new(name: Str, description: Str): i64 {
+    return agnosai_tool_schema_new_a(default_alloc(), name, description);
 }
 
 # Append a parameter. Returns the schema so calls chain.
-fn agnosai_tool_schema_with_param(s, param): i64 {
-    vec_push(load64(s + AGN_SCHEMA_PARAMETERS), param);
+fn agnosai_tool_schema_with_param_a(a, s, param): i64 {
+    vec_push_a(a, load64(s + AGN_SCHEMA_PARAMETERS), param);
     return s;
 }
 
+# Global-allocator form of `agnosai_tool_schema_with_param_a`.
+#
+# **The allocator must match the one the schema was built with.** The parameter
+# vec lives in whichever arena `agnosai_tool_schema_new_a` used, and pushing to
+# it through a different allocator grows it there instead — which is not a
+# crash, just a silent leak of the growth back onto the global bump.
+fn agnosai_tool_schema_with_param(s, param): i64 {
+    return agnosai_tool_schema_with_param_a(default_alloc(), s, param);
+}
+
 # Append a parameter built from its parts. Returns the schema.
-fn agnosai_tool_schema_param(s, name: Str, description: Str, param_type: Str, required): i64 {
-    vec_push(load64(s + AGN_SCHEMA_PARAMETERS),
-    agnosai_param_schema_new(name, description, param_type, required));
+fn agnosai_tool_schema_param_a(a, s, name: Str, description: Str, param_type: Str,
+required): i64 {
+    vec_push_a(a, load64(s + AGN_SCHEMA_PARAMETERS),
+    agnosai_param_schema_new_a(a, name, description, param_type, required));
     return s;
+}
+
+# Global-allocator form of `agnosai_tool_schema_param_a`.
+fn agnosai_tool_schema_param(s, name: Str, description: Str, param_type: Str, required): i64 {
+    return agnosai_tool_schema_param_a(default_alloc(), s, name, description, param_type,
+    required);
 }
 
 # Unique tool name.
@@ -306,7 +335,7 @@ fn agnosai_tool_output_to_value(o): i64 {
 
 # Create a tool.
 #
-# `schema_fp` is `fn(ctx): ToolSchema` and `execute_fp` is
+# `schema_fp` is `fn(a, ctx): ToolSchema` — allocator first — and `execute_fp` is
 # `fn(ctx, input): ToolOutput`; both receive the tool's own `ctx`, which may be
 # 0 for a stateless tool. This is the vtable that stands in for the oracle's
 # `dyn NativeTool`.
@@ -336,8 +365,22 @@ fn agnosai_tool_ctx(t): i64 {
 }
 
 # The tool's parameter schema, via its vtable.
+fn agnosai_tool_schema_a(a, t): i64 {
+    return callptr(load64(t + AGN_TOOL_SCHEMA_FP), a, load64(t + AGN_TOOL_CTX));
+}
+
+# Global-allocator form of `agnosai_tool_schema_a`.
+#
+# **`schema_fp` takes the allocator as its FIRST parameter**, ahead of `ctx`.
+# That is a change to the vtable's calling convention rather than an addition
+# to it, and it is what took `GET /api/v1/tools` off its 288-byte floor: the
+# callback rebuilds the schema and every parameter under it on each call, so
+# without an allocator parameter nothing in the routes or registry tier could
+# reach that allocation. agnosai ships no `[lib]` block and no `dist/` bundle —
+# it is a binary — so every implementor is in this tree and the convention has
+# no external caller to break.
 fn agnosai_tool_schema(t): i64 {
-    return callptr(load64(t + AGN_TOOL_SCHEMA_FP), load64(t + AGN_TOOL_CTX));
+    return agnosai_tool_schema_a(default_alloc(), t);
 }
 
 # Execute the tool, via its vtable. Synchronous — see the module note.

@@ -12,6 +12,17 @@
 include "src/id.cyr"
 include "tests/test_helpers.cyr"
 
+# Assert `agnosai_uuid_is_valid` and `agnosai_uuid_parse` classify `s`
+# identically, and that both say what `want` expects.
+fn _t_valid_agrees(s: Str, want, what): i64 {
+    var v = agnosai_uuid_is_valid(s);
+    var pnz = 0;
+    if (agnosai_uuid_parse(s) != 0) { pnz = 1; }
+    assert_eq(v, pnz, what);
+    assert_eq(v, want, what);
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -106,6 +117,65 @@ fn main() {
 
     # an id used the way the port uses one: str_eq and a str-keyed map. Both of
     # these silently corrupted when ids were raw 16-byte buffers.
+    # `agnosai_uuid_parse` decodes into a `var tmp[16]` before allocating, and
+    # an array size cannot be a `var` — so the 16 is a literal that this pins.
+    assert_eq(AGNOSAI_UUID_BYTES, 16,
+    "the parse scratch buffer's literal size still matches AGNOSAI_UUID_BYTES");
+
+    # --- agnosai_uuid_is_valid agrees with agnosai_uuid_parse, exactly ---
+    #
+    # **The two must not drift**, because the routes now decide 422-vs-404 on
+    # the validator where the oracle's `Path<Uuid>` extractor decided it on the
+    # parser. They share `_agnosai_uuid_scan`, so drift would take a deliberate
+    # edit — this is what would catch that edit.
+    _t_valid_agrees(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), 1, "a real v1 id");
+    _t_valid_agrees(agnosai_uuid_v4_str(), 1, "a freshly minted v4 id");
+    _t_valid_agrees(str_from("6BA7B810-9DAD-11D1-80B4-00C04FD430C8"), 1,
+    "uppercase hex, which the parser accepts");
+    _t_valid_agrees(str_from(""), 0, "the empty string");
+    _t_valid_agrees(str_from("too-short"), 0, "a short string");
+    _t_valid_agrees(str_from("6ba7b8109dad11d180b400c04fd430c8xxxx"), 0,
+    "36 characters with no hyphens");
+    _t_valid_agrees(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430cZ"), 0,
+    "a non-hex digit in the last position");
+    _t_valid_agrees(str_from("Zba7b810-9dad-11d1-80b4-00c04fd430c8"), 0,
+    "...and in the first");
+    _t_valid_agrees(str_from("6ba7b810x9dad-11d1-80b4-00c04fd430c8"), 0,
+    "a hyphen replaced by a hex digit");
+    _t_valid_agrees(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8 "), 0,
+    "a trailing space, which makes it 37");
+    _t_valid_agrees(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c"), 0,
+    "35 characters");
+
+    # **The validator allocates nothing, on both arms.** That is the whole
+    # reason it exists: every one of its five callers in `src/` was calling
+    # `agnosai_uuid_parse` and discarding the 16-byte buffer, on a request path.
+    var good = agnosai_uuid_v4_str();
+    var bad = str_from("6ba7b810-9dad-11d1-80b4-00c04fd430cZ");
+    agnosai_uuid_is_valid(good);
+    agnosai_uuid_is_valid(bad);
+    var before = alloc_used();
+    for (var vi = 0; vi < 64; vi = vi + 1) {
+        agnosai_uuid_is_valid(good);
+        agnosai_uuid_is_valid(bad);
+    }
+    assert_eq(alloc_used() - before, 0, "agnosai_uuid_is_valid allocates nothing");
+
+    # **And a rejected parse allocates nothing either.** It used to allocate the
+    # buffer first and return 0 from inside the loop, leaking 16 bytes per
+    # rejection — reachable through `agnosai_uuid_canonical` from the
+    # `*_from_json` deserialisers, so attacker-controlled and unauthenticated.
+    agnosai_uuid_parse(bad);
+    var b2 = alloc_used();
+    for (var pj = 0; pj < 64; pj = pj + 1) { agnosai_uuid_parse(bad); }
+    assert_eq(alloc_used() - b2, 0, "a rejected parse allocates nothing");
+
+    # A successful parse still hands back a real buffer, two passes and all.
+    var pu = agnosai_uuid_parse(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8"));
+    assert(pu != 0, "a valid id still parses");
+    assert_eq(load8(pu) & 255, 0x6b, "...to the right first byte");
+    assert_eq(load8(pu + 15) & 255, 0xc8, "...and the right last one");
+
     var m = map_new_str();
     map_set(m, vs, 7);
     assert_eq(map_get(m, vs), 7, "an id keys a map_new_str directly");

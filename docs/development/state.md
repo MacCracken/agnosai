@@ -624,9 +624,9 @@ pays it per request.
 | Benchmark | global | arena | Δ |
 |---|---|---|---|
 | `route_approvals_*` | 2.147 µs | **1.861 µs** | −13.3% |
-| `route_tools_*` | 3.124 µs | **2.344 µs** | −25.0% |
+| `route_tools_*` | 3.104 µs | **2.168 µs** | −30.2% |
 | `route_definitions_*` | 3.356 µs | **2.529 µs** | −24.6% |
-| `route_get_crew_*` | 5.178 µs | **3.821 µs** | −26.2% |
+| `route_get_crew_*` | 4.830 µs | **3.621 µs** | −25.0% |
 | `route_dashboard_crews_*` | 13.266 µs | **10.956 µs** | −17.4% |
 | `route_dashboard_agents_*` | 16.452 µs | **14.048 µs** | −14.6% |
 | `route_resolve` | 343 ns | — | in both |
@@ -643,26 +643,40 @@ global bump per request:
 |---|---|---|
 | `GET /api/v1/dashboard/agents` | 4,368 | **0** |
 | `GET /api/v1/dashboard/crews` | 4,160 | **0** |
-| `GET /api/v1/crews/{id}` | 2,368 | **16** |
-| `GET /api/v1/tools` | 1,720 | **288** |
+| `GET /api/v1/crews/{id}` | 2,352 | **0** |
+| `GET /api/v1/tools` | 1,720 | **0** |
 | `GET /api/v1/approvals` | 576 | **0** |
 | `GET /api/v1/agents/definitions` | 384 | **0** |
-| `GET /api/v1/crews/{unknown}` (404) | 336 | **16** |
+| `GET /api/v1/crews/{unknown}` (404) | 320 | **0** |
 
-**Four routes charge the global bump literally nothing.** Handler, router and
-response struct all land in the arena and are freed by one `reset_via`. Two
-residuals remain and neither belongs to the routes tier:
+**Every GET read route charges the global bump literally nothing.** Handler,
+router, id validation, tool schemas and the response struct all land in the
+request arena and are freed by one `reset_via`.
 
-- **16 B on any `{id}` route — `agnosai_uuid_parse`.** It allocates a 16-byte
-  buffer for the decoded UUID, and **all five callers in `src/` discard it**:
-  every one is `if (agnosai_uuid_parse(x) == 0)`, a validity test
-  (`routes/crews.cyr` ×2, `routes/approval.cyr`, `serve.cyr`). A request
-  carrying an id pays it on the 404 arm as much as the 200 one. The fix is an
-  allocation-free validator — the bytes are never wanted at any call site — but
-  it is `src/id.cyr`, so it is owed rather than done.
-- **288 B on `/api/v1/tools`** — `agnosai_tool_schema` calls the tool's own
-  `schema_fp`, and the tool vtable has no allocator parameter, so nothing in the
-  routes or registry tier can reach it. Structural.
+It took four bites and each one exposed the next residual, which is the pattern
+worth carrying forward — **a floor is only visible once everything above it is
+zero**:
+
+1. the handlers (`llm`, routes, tools, orchestrator groups) → the router's
+   32-byte match struct became the whole residual;
+2. the router (`agnosai_route_resolve_a`, plus the two-level restructure) →
+   `agnosai_uuid_parse`'s 16 bytes became the whole residual on `{id}` routes;
+3. `agnosai_uuid_is_valid` → only `/api/v1/tools` was left, at 288 B;
+4. the tool vtable — `schema_fp` is now `fn(a, ctx)`, allocator first, threaded
+   by all fourteen implementors.
+
+Step 4 is a change to a **calling convention**, not an addition to one, and it
+is safe to make because agnosai has no `[lib]` block and no `dist/` bundle:
+`bins = ["agnosai"]` is the whole package, so every implementor is in this tree.
+Consumers reach tools over HTTP and MCP, not by linking.
+
+The `{id}` routes reached zero last, and the residual was `agnosai_uuid_parse`
+allocating a buffer **all five of its callers in `src/` discarded** — every one
+was `if (agnosai_uuid_parse(x) == 0)`, a validity test.
+`agnosai_uuid_is_valid` is that test without the buffer, over the same
+`_agnosai_uuid_scan`, so the two cannot drift on what they accept — which
+matters because the routes decide **422-vs-404** on the validator where the
+oracle's `Path<Uuid>` extractor decided it on the parser.
 
 **`route_resolve` was 1.675 µs — 57% of the cheapest threaded request — and its
 32 B was 100% of that route's remaining allocation. Both are fixed.**
@@ -907,7 +921,26 @@ fixed.
    through `agnosai_spawn_capture_input` with a planted `envp`**, which is the
    only way to put a variable in this process's own environment. Reach for one
    of those before concluding a behaviour is unobservable.
-9. **Verify the mutation is a faithful revert.** One written during the M7
+9. **`callptr` does not check arity, so changing a function-pointer signature is
+   only half-caught by the compiler.** The tool vtable's `schema_fp` went from
+   `fn(ctx)` to `fn(a, ctx)`. Implementors still declaring the one-parameter
+   shape **compiled and passed** — `ctx` silently received the allocator and the
+   real ctx was dropped, which is invisible in a schema that ignores `ctx`. Two
+   test tools in `tools_native.tcyr` were in exactly that state and the suite
+   reported 71/71.
+
+   The *detectable* half is a direct call: `_agnosai_delegate_schema(0)` in
+   `tools_builtin_delegate.tcyr` then passed 0 as the **allocator**, and
+   `alloc_via` followed it — a segfault, so a failed suite with no `FAIL:` line
+   (see the crash note in the harness rules).
+
+   **Neither showed up in per-suite verification.** The change was mutation-
+   tested against `server_serve` and `tools_native`, both green; only
+   `cyrius tests tests` across the whole tree caught it. When a signature that
+   is reached through `callptr` changes, grep for every implementor and every
+   direct caller by name — the build will not.
+
+10. **Verify the mutation is a faithful revert.** One written during the M7
    remediation changed half of a two-line fix, left the tree in a state neither
    version would produce, and "killed" the mutant for the wrong reason. Read
    what the mutated file actually says before believing the failure.

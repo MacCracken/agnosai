@@ -814,30 +814,28 @@ fn _t_allocation_profile(): i64 {
     1,696 B to 384 B by threading the route, to 80 B by walking map slots instead \
     of `map_keys`, to 0 B by threading the router underneath it");
 
-    # The same, for `/api/v1/tools` — the most expensive route in the table,
-    # and the one that does NOT reach near-zero. Measured 7,384 -> 1,696 bytes
-    # per request with all four builtins registered.
+    # The same, for `/api/v1/tools` — the most expensive route in the table, and
+    # the **last** one to reach zero. 7,384 → 1,696 → 320 → 288 → 0 across four
+    # changes.
     #
-    # **The floor is the tool vtable, not this module.** `agnosai_tool_schema`
-    # calls each tool's own `schema_fp`, which rebuilds its schema and every
-    # parameter under it on the global allocator per call; the vtable has no
-    # allocator parameter, so nothing here can reach that. The ratio below is
-    # deliberately looser than the definitions one for exactly that reason —
-    # asserting near-zero would be asserting a thing that is not true.
+    # It sat at a floor for three of them, and the floor was the tool vtable
+    # rather than this module: `agnosai_tool_schema` called each tool's own
+    # `schema_fp`, which rebuilds its schema and every parameter under it per
+    # call, and the vtable passed no allocator — so nothing in the routes or
+    # registry tier could reach that allocation. `schema_fp` now takes the
+    # allocator as its first parameter and all fourteen implementors thread it.
     var tools_path = str_from("/api/v1/tools");
     var per_tools_global = _t_per_request(s, tools_path, 0);
     var per_tools_arena = _t_per_request(s, tools_path, ar);
 
-    assert(per_tools_arena < per_tools_global,
-    "the tools listing costs less through the arena than on the global bump");
-    # **5x, and the margin is measured rather than guessed.** With one echo tool
-    # registered the arena arm is 288 B against 1,720 B global — 6.0x. A 2x
-    # threshold once passed BOTH the threaded and the un-threaded case and so
-    # asserted nothing; 3x replaced it, and the router bite bought enough
-    # headroom to tighten again. Everything left is the per-tool `schema_fp`.
-    assert(per_tools_arena * 5 < per_tools_global,
-    "...by at least 5x — the schema tree and the registry vecs move to the arena; \
-    the per-tool schema_fp build cannot until the vtable takes an allocator");
+    assert(per_tools_global > 0, "the global path allocates the whole schema tree");
+    # **An equality, and it took four changes to earn it.** The threshold on
+    # this line was 2x, then 3x, then 5x — each one a bound with slack, and the
+    # 2x version passed both the threaded and the un-threaded case, so it
+    # asserted nothing at all. There is no slack in `== 0`.
+    assert(per_tools_arena == 0,
+    "the tools listing costs the global bump NOTHING — including the per-tool \
+    schema_fp build, now that the vtable passes the allocator through");
 
     # --- B2: the orchestrator group's four read routes --------------------
     #
@@ -955,29 +953,35 @@ fn _t_allocation_profile(): i64 {
     assert((alloc_used() - b11) / 64 == 0,
     "...and the captured Str lands in `a` too");
 
-    # A `{id}` route is the one pair that is **not** zero, and the residual is
-    # not this tier's.
-    #
-    # `agnosai_uuid_parse` allocates a 16-byte buffer to hold the decoded UUID,
-    # and **every one of its five callers in `src/` throws that buffer away** —
-    # all five are `if (agnosai_uuid_parse(x) == 0)`, a validity test. So a
-    # request carrying an id pays 16 bytes of pure garbage, on the 404 arm as
-    # much as the 200 one. Bounded rather than pinned to 16 so an allocator
-    # whose rounding differs does not fail it; the point is that it is small,
-    # constant, and attributable.
-    assert(p_crew_a > 0, "a {id} route is not yet zero");
-    assert(p_crew_a < 64,
-    "...and what remains is `agnosai_uuid_parse`'s discarded 16-byte buffer, \
-    not anything the route or the router allocates");
-    assert(p_404_a == p_crew_a,
-    "the 404 arm pays exactly the same residual — it validates the id too");
+    # **A `{id}` route reaches zero too, including its 404 arm.** It was the
+    # last one that did not, at 16 bytes: `agnosai_uuid_parse` allocated a
+    # buffer for the decoded UUID and **all five of its callers in `src/` threw
+    # that buffer away** — every one was `if (agnosai_uuid_parse(x) == 0)`, a
+    # validity test. `agnosai_uuid_is_valid` is that test without the buffer,
+    # over the same `_agnosai_uuid_scan`, so the two cannot drift on what they
+    # accept. The 404 arm pays the same as the 200 arm because it validates the
+    # same id — which is why it mattered: that arm is the unauthenticated one.
+    assert(p_crew_a == 0, "a {id} route costs the global bump nothing either");
+    assert(p_404_a == 0, "...and neither does its 404 arm");
     assert(p_404_g > 0, "the unthreaded 404 arm allocates its error object per request");
 
-    # `/api/v1/tools` is the other, and its floor is structural — asserted in
-    # its own block above, where both arms are already measured.
-    assert(per_tools_arena > 0,
-    "the tools listing is the one read route that does NOT reach zero, and the \
-    reason is the tool vtable rather than anything this tier owns");
+    # And `/api/v1/tools`, asserted in its own block above where both arms are
+    # already measured. **All six read routes are at zero.**
+    assert(per_tools_arena == 0, "the tools listing too — no read route allocates");
+
+    # The schema constructors' `_a` forms named directly: each is reached only
+    # through a tool's `schema_fp`, which reference coverage cannot see.
+    var sa = agnosai_tool_schema_new_a(ar, str_from_a(ar, "t"), str_from_a(ar, "d"));
+    agnosai_tool_schema_param_a(ar, sa, str_from_a(ar, "p"), str_from_a(ar, "pd"),
+    str_from_a(ar, "string"), 1);
+    agnosai_tool_schema_with_param_a(ar, sa,
+    agnosai_param_schema_new_a(ar, str_from_a(ar, "q"), str_from_a(ar, "qd"),
+    str_from_a(ar, "string"), 0));
+    assert(vec_len(agnosai_tool_schema_parameters(sa)) == 2,
+    "both append paths reach the schema through the arena");
+    assert(agnosai_tool_schema_a(ar, agnosai_echo_tool()) != 0,
+    "and a tool's schema_fp answers through the arena");
+    reset_via(ar);
 
     # Byte-identical wire on both arms, for each of the four.
     assert(str_eq(bayan_json_v_build(agnosai_route_body(

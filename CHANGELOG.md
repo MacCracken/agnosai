@@ -342,6 +342,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **The tool vtable passes the allocator, and with it `/api/v1/tools` reaches
+  zero: 1,720 → 0 bytes per request. Every GET read route now charges the
+  global bump literally nothing.**
+
+  `/api/v1/tools` sat at a floor through three bites — 7,384 → 1,696 → 320 →
+  288 — and the floor was never the routes or registry tier.
+  `agnosai_tool_schema` called the tool's own `schema_fp`, which rebuilds its
+  schema and every parameter under it on each call, and the vtable passed no
+  allocator. Nothing above it could reach that allocation.
+
+  `schema_fp` is now `fn(a, ctx)` — **allocator first**, a change to the
+  calling convention rather than an addition to it — and all **fourteen**
+  implementors thread it. New `_a` forms with bare wrappers:
+  `agnosai_param_schema_new`, `agnosai_tool_schema_new`,
+  `agnosai_tool_schema_with_param`, `agnosai_tool_schema_param`,
+  `agnosai_tool_schema`.
+
+  **This is not an API break, and the reason is worth stating rather than
+  assuming**: agnosai ships no `[lib]` block and no `dist/` bundle — `bins =
+  ["agnosai"]` is the whole of it — so every implementor of the convention is
+  in this tree and there is no external caller to break. Consumers reach tools
+  over HTTP and MCP, not by linking and registering one.
+
+  The final state of the read routes, bytes charged to the global bump per
+  request when served through a per-request arena:
+
+  | route | at the start of B2 | now |
+  |---|---|---|
+  | `GET /api/v1/dashboard/agents` | 4,368 | **0** |
+  | `GET /api/v1/dashboard/crews` | 4,160 | **0** |
+  | `GET /api/v1/crews/{id}` | 2,352 | **0** |
+  | `GET /api/v1/tools` | 1,720 | **0** |
+  | `GET /api/v1/approvals` | 576 | **0** |
+  | `GET /api/v1/agents/definitions` | 384 | **0** |
+  | `GET /api/v1/crews/{unknown}` (404) | 320 | **0** |
+
+  `route_tools_arena` across the sequence: 3,074 → 2,344 → 2,259 → 2,229 →
+  **2,168 ns**.
+
+  **The assertion on this route was a bound with slack for three bites** — 2x,
+  then 3x, then 5x — and the 2x version passed both the threaded and the
+  un-threaded case, so it asserted nothing at all. It is `== 0` now, and there
+  is no slack in that. **6 mutations applied, 6 caught.**
+
+  `server_serve` 163 → **164** assertions.
+
+  **This shipped a regression that per-suite verification missed, and the
+  whole-tree run caught.** `callptr` does not check arity: two test tools in
+  `tools_native.tcyr` still declared `fn(ctx)` and **compiled and passed
+  71/71**, with `ctx` silently receiving the allocator and the real ctx
+  dropped — invisible in a schema that ignores `ctx`. The detectable half was a
+  direct call, `_agnosai_delegate_schema(0)`, which then passed 0 as the
+  *allocator* into `alloc_via` and segfaulted: a failed suite with no `FAIL:`
+  line. Mutation-testing against `server_serve` and `tools_native` showed both
+  green. Recorded as standing rule 9 — when a signature reached through
+  `callptr` changes, grep for every implementor and direct caller by name,
+  because the build will not.
+
+  Also moved on the same run, in modules nothing here touched:
+  `qlearner_best_action_1000_state_actions` 1,253 → 1,390 ns and
+  `select_nth_100k` 4.919 → 5.337 ms, both just above their recent bands, and
+  three unrelated `*_global` route arms all at +8.5%. A uniform shift across
+  untouched code reads as a slower run rather than a regression; recorded
+  rather than explained away.
+
+- **`agnosai_uuid_is_valid` — every GET read route except `/api/v1/tools` now
+  costs the global bump literally nothing, and a rejected parse stops leaking.**
+
+  With the router threaded, the last non-zero read route was `/api/v1/crews/{id}`
+  at 16 bytes, and the residual was `agnosai_uuid_parse`: it allocates a 16-byte
+  buffer for the decoded UUID, and **all five of its callers in `src/` threw
+  that buffer away.** Every one was `if (agnosai_uuid_parse(x) == 0)` — a
+  validity test that never wanted the bytes (`routes/crews.cyr` ×2,
+  `routes/approval.cyr`, `serve.cyr`). `agnosai_uuid_is_valid` is that test
+  without the buffer.
+
+  | route | B/req before | B/req after |
+  |---|---|---|
+  | `GET /api/v1/crews/{id}` | 2,352 | **0** |
+  | `GET /api/v1/crews/{unknown}` (404) | 320 | **0** |
+
+  Both arms, because both validate the same id — and the 404 is the
+  unauthenticated one.
+
+  **The rejection path was also leaking, and that half is security-relevant.**
+  `agnosai_uuid_parse` allocated its buffer *before* validating and returned 0
+  from inside the loop, so every malformed id leaked 16 bytes with nothing to
+  reclaim them on a no-free bump. That is reachable through
+  `agnosai_uuid_canonical`, which the `*_from_json` deserialisers and
+  `routes/sse.cyr` call on attacker-controlled input — a request body full of
+  malformed ids leaked 16 bytes each, unauthenticated. It now decodes into a
+  stack buffer and allocates only on success.
+
+  **The obvious spelling of that fix was measured and rejected.** Validating
+  with one scan and then decoding with a second is the clean-looking version and
+  costs **258 → 472 ns (+83%)** — `agnosai_uuid_canonical` runs on every id in a
+  deserialised crew, so that is not free. One scan into a `var tmp[16]` plus a
+  16-byte `memcpy` gives the same guarantee at **258 → 275 ns (+6.6%)**.
+  `route_get_crew_arena` 3,821 → 3,621 ns (−5.2%).
+
+  `agnosai_uuid_is_valid` and `agnosai_uuid_parse` share `_agnosai_uuid_scan`,
+  so they cannot drift on what they accept — which matters because the routes
+  decide **422-vs-404** on the validator where the oracle's `Path<Uuid>`
+  extractor decided it on the parser. Eleven inputs assert the two agree.
+
+  The scratch buffer is `var tmp[16]`, not `var tmp[AGNOSAI_UUID_BYTES]`: an
+  array size must be a compile-time literal or an enum constant, and that name
+  is a `var`. `tests/id.tcyr` asserts the two agree so the duplication cannot
+  drift silently — **the first attempt at this claimed the constant worked**,
+  because the check grepped the build output for errors without verifying a
+  binary had been produced, and ran a stale one.
+
+  **5 mutations applied, 5 caught.** `id` 41 → **65** assertions.
+
+  Remaining, and the only read route not at zero: **`/api/v1/tools` at 288 B**,
+  the per-tool `schema_fp` build. Structural until the tool vtable takes an
+  allocator parameter.
+
 - **The router's own path matching: 1.675 µs → 343 ns (−79%), and its 32 bytes
   per request → 0.** `agnosai_route_resolve` was the single most expensive part
   of a cheap request and the *only* part of an arena-threaded read route that

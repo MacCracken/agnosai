@@ -106,13 +106,17 @@ fn _agnosai_hex_value(c): i64 {
     return 0 - 1;
 }
 
-# Parse a canonical hyphenated UUID string. Returns the 16-byte UUID, or 0 when
-# the input is not 36 characters of the expected shape.
-fn agnosai_uuid_parse(s: Str): i64 {
+# Walk a canonical hyphenated UUID string, writing the decoded bytes through
+# `out` when it is non-zero and validating only when it is 0. Answers 1 for a
+# well-formed input, 0 otherwise.
+#
+# One scan, two callers, so `agnosai_uuid_is_valid` cannot drift from what
+# `agnosai_uuid_parse` accepts — which matters because the routes decide **404
+# versus 422** on the validator and the oracle's `Path<Uuid>` extractor decided
+# it on the parser.
+fn _agnosai_uuid_scan(s: Str, out): i64 {
     if (str_len(s) != AGNOSAI_UUID_STR_LEN) { return 0; }
     var data = str_data(s);
-
-    var u = alloc(AGNOSAI_UUID_BYTES);
     var pos = 0;
     for (var i = 0; i < AGNOSAI_UUID_BYTES; i = i + 1) {
         if (i == 4 || i == 6 || i == 8 || i == 10) {
@@ -122,9 +126,45 @@ fn agnosai_uuid_parse(s: Str): i64 {
         var hi = _agnosai_hex_value(load8(data + pos));
         var lo = _agnosai_hex_value(load8(data + pos + 1));
         if (hi < 0 || lo < 0) { return 0; }
-        store8(u + i, (hi << 4) | lo);
+        if (out != 0) { store8(out + i, (hi << 4) | lo); }
         pos = pos + 2;
     }
+    return 1;
+}
+
+# Whether `s` is a canonical hyphenated UUID. **Allocates nothing.**
+#
+# Every caller of `agnosai_uuid_parse` in `src/` was throwing the parsed buffer
+# away — all five were `if (agnosai_uuid_parse(x) == 0)`, a validity test — so a
+# request carrying an id paid 16 bytes of garbage on the no-free global bump,
+# on the 404 arm as much as the 200 one. This is that test without the buffer.
+fn agnosai_uuid_is_valid(s: Str): i64 {
+    return _agnosai_uuid_scan(s, 0);
+}
+
+# Parse a canonical hyphenated UUID string. Returns the 16-byte UUID, or 0 when
+# the input is not 36 characters of the expected shape.
+#
+# **Decodes into a stack buffer and allocates only on success**, which is a fix
+# rather than a tidy-up: the previous shape allocated first and returned 0 from
+# inside the loop, leaking the buffer on every rejection.
+# `agnosai_uuid_canonical` is called from the `*_from_json` deserialisers and
+# from `routes/sse.cyr`, so those rejections are attacker-controlled and
+# unauthenticated — a body full of malformed ids leaked 16 bytes each with
+# nothing to reclaim them.
+#
+# **The obvious spelling — validate with one scan, then decode with a second —
+# was measured and rejected at 258 → 472 ns (+83%).** `agnosai_uuid_canonical`
+# runs on every id in a deserialised crew, so that is not free. One scan into
+# `tmp` plus a 16-byte `memcpy` keeps the leak fixed and the cost flat.
+fn agnosai_uuid_parse(s: Str): i64 {
+    # **16, not `AGNOSAI_UUID_BYTES`** — an array size must be a compile-time
+    # literal or an enum constant, and that name is a `var`. `tests/id.tcyr`
+    # asserts the two agree so the duplication cannot drift silently.
+    var tmp[16];
+    if (_agnosai_uuid_scan(s, &tmp) == 0) { return 0; }
+    var u = alloc(AGNOSAI_UUID_BYTES);
+    memcpy(u, &tmp, AGNOSAI_UUID_BYTES);
     return u;
 }
 

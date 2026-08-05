@@ -16,9 +16,18 @@ include "src/tools/registry.cyr"
 include "tests/test_helpers.cyr"
 
 # A stateless echo tool: returns its "text" parameter, or an error when absent.
-fn _t_echo_schema(ctx): i64 {
-    var s = agnosai_tool_schema_new(str_from("echo"), str_from("Echo the input back"));
-    agnosai_tool_schema_param(s, str_from("text"), str_from("text to echo"), str_from("string"), 1);
+#
+# **`schema_fp` is `fn(a, ctx)` — allocator first.** A test tool declaring the
+# old one-parameter shape still compiles and still passes, because `callptr`
+# does not check arity: `ctx` silently receives the allocator and the real ctx
+# is dropped. That is fine for a schema ignoring `ctx` and wrong the moment one
+# does not, so both test tools here take the allocator whether they use it or
+# not.
+fn _t_echo_schema(a, ctx): i64 {
+    var s = agnosai_tool_schema_new_a(a, str_from_a(a, "echo"),
+    str_from_a(a, "Echo the input back"));
+    agnosai_tool_schema_param_a(a, s, str_from_a(a, "text"), str_from_a(a, "text to echo"),
+    str_from_a(a, "string"), 1);
     return s;
 }
 
@@ -34,8 +43,9 @@ fn _t_echo_tool(): i64 {
 }
 
 # A stateful counter tool, to prove `ctx` reaches the implementation.
-fn _t_counter_schema(ctx): i64 {
-    return agnosai_tool_schema_new(str_from("counter"), str_from("Count calls"));
+fn _t_counter_schema(a, ctx): i64 {
+    return agnosai_tool_schema_new_a(a, str_from_a(a, "counter"),
+    str_from_a(a, "Count calls"));
 }
 
 fn _t_counter_execute(ctx, input): i64 {
