@@ -261,68 +261,19 @@ commands above are the authority. Counting gotcha if you sum by hand:
 plus a final `66 passed, 0 failed` line that counts **suites, not assertions** —
 sum only the suffixed lines.
 
-### ⚠ The coverage corpus is over the 1 MiB buffer as of 2026-08-05
+Corpus size: **1,082,744 bytes** of `.tcyr`. This crossed `cyrius coverage`'s
+fixed 1 MiB corpus buffer on 2026-08-05 and the tool began under-reporting
+silently at exit 0 — it named two fully-covered files as carrying unreferenced
+functions. **Fixed upstream in cyrius 6.5.8** (four defects, including an
+off-by-one at the corpus end and `pub fn` being invisible to the tool whose job
+is counting public functions), and verified here: at 34 KB past the old cap it
+reports 1084/1084, identical to an independent count over the untruncated
+corpus.
 
-**`tests/` holds 1,067,457 bytes of `.tcyr` against a 1,048,576-byte buffer — we
-are 18,881 bytes past it, and the reported 100% is luck rather than headroom.**
-
-`cbt/quality.cyr:59` allocates a fixed 1 MiB corpus and reads each `.tcyr` into
-whatever space is left; `if (n > 0)` makes a truncated read and a refused read
-indistinguishable, and neither is reported. **This is no longer hypothetical for
-this tree — see below.**
-
-Measured on this tree, padding one *unrelated* suite (`tests/order.tcyr`) with
-comment lines:
-
-| total `.tcyr` bytes | reported | gate |
-|---|---|---|
-| 1,053,976 | 100% (1073/1073) | OK, **exit 0** |
-| **1,067,457 (today)** | **99% (1072/1074)** — and both flagged files are fully covered | OK, **exit 0** |
-| 1,057,884 | 99% | OK, **exit 0** |
-| 1,113,884 | 94% | OK, **exit 0** |
-| 1,253,884 | 85% | OK, **exit 0** |
-| 1,376,773 | 85%, and 11 source files read as entirely unreferenced | OK, **exit 0** |
-
-The first casualty at 1,057,884 is a fn in `src/server/routes/approval.cyr` —
-a file with no relationship to `order.tcyr`. **Bytes added to one suite silently
-delete another suite's evidence**, because they compete for one buffer.
-
-**Filed upstream** as
-`2026-08-05-coverage-corpus-is-a-fixed-1-mib-buffer-and-silently-under-reports-past-it.md`
-(cyrius), with the root cause, the size table and three ordered fixes.
-
-### ⚠⚠ `cyrius coverage` is no longer evidence for this tree — use `scripts/check-coverage.sh`
-
-The corpus reached **1,067,457 bytes** on 2026-08-05 and the tool began
-under-reporting for real: it named `sandbox/python.cyr` (14/15) and
-`routes/approval.cyr` (2/3) as carrying unreferenced functions and printed 99%.
-**Every symbol in both is referenced by a test.** Nothing had regressed; the
-corpus no longer fit.
-
-`scripts/check-coverage.sh` computes the same thing with **no buffer** — same
-denominator (`^fn` in `src/**/*.cyr`, `_`-prefixed excluded), same definition of
-covered (the name appears anywhere in the corpus), so the two agree whenever the
-tool is able to answer. It reports **1074/1074 (100%)**.
-
-```sh
-./scripts/check-coverage.sh 80   # the real gate while the corpus is over
-cyrius coverage --min 80         # under-reports; keep for when upstream lands
-```
-
-`scripts/check-clean.sh` prints the overage as a **WARN** on every run rather
-than failing. Failing would leave a gate red permanently with no action
-available, which is how gates get ignored; what must not happen is the overage
-going unmentioned, because then the tool's percentage looks like evidence.
-
-**Splitting the corpus does not help.** `dir_walk` is recursive, so
-`tests/tcyr/*.tcyr` lands in the same buffer as `tests/*.tcyr`; and moving
-suites to a sibling directory removes their references from the corpus
-entirely, which makes the number *worse*. The only real fixes are the upstream
-one or a corpus under 1 MiB.
-
-The port plan's *"1 MiB corpus cliff"* hard constraint predicted this at
-`cyrius-port-plan.md:264` and estimated 0.7–1.2 MB. It landed at 1.05 MB — inside
-the predicted range, on the wrong side of the line.
+`scripts/check-coverage.sh` existed for the fortnight in between and has been
+**removed** — a second implementation of a working tool is two things to
+maintain and two things to drift. The episode's lesson is kept as standing
+rule 10.
 
 ### Test-design decisions worth not re-deriving
 
@@ -918,10 +869,26 @@ fixed.
 1. **`src/` mirrors `rust-old/src/`.** Anything walking it must recurse —
    `find src -name '*.cyr'`, never `src/*.cyr`, which now matches nothing and
    **fails open**. `cyrius coverage` and `cyrius tests` already recurse.
-2. **Verify a toolchain bump by diffing `lib/` against the snapshot.** A green
-   `cyrius lib sync --full` is not proof: on the bayan repo the same command
-   reported success and left five files stale. `cyrius deps` re-layers git deps but
-   does **not** refresh the stdlib.
+2. **Verify a toolchain bump by diffing `lib/` against the snapshot, and write
+   the lockfile last.** A green `cyrius lib sync --full` is not proof: on the
+   bayan repo the same command reported success and left five files stale.
+   `cyrius deps` re-layers git deps but does **not** refresh the stdlib — and it
+   writes `cyrius.lock` from what it just copied, so a sync afterwards leaves
+   `deps --verify` failing. The order that satisfies both gates:
+
+   ```sh
+   cyrius deps --no-lock     # resolve git deps into lib/
+   cyrius lib sync --full    # refresh the stdlib over them
+   cyrius deps --lock        # record what is actually there
+   ```
+
+   **A folded dep can be ahead of its own release, briefly.** The 6.5.8 fold
+   carried sakshi 2.4.8 before 2.4.8 was tagged, so `deps` kept restoring the
+   published 2.4.7 over it — including through the implicit resolve inside
+   `cyrius build`. That is correct behaviour, not drift: agnosai compiles
+   against the newest version that exists. Before treating a snapshot
+   difference as a defect, check whether the folded version was ever released;
+   it resolved on its own once sakshi 2.4.8 shipped.
 3. **Git-dep pins must move with the fold.** `cyrius deps` copies each dep's
    bundle into `lib/` last-write-wins, so a stale `[deps.sigil] tag` overwrites a
    newer folded copy back down.
@@ -972,7 +939,16 @@ fixed.
    is reached through `callptr` changes, grep for every implementor and every
    direct caller by name — the build will not.
 
-10. **Verify the mutation is a faithful revert.** One written during the M7
+10. **A tool that prints a number can still be lying, and the fix is upstream.**
+   `cyrius coverage` under-reported for a fortnight because this tree's `.tcyr`
+   corpus outgrew a fixed 1 MiB buffer — silently, at exit 0, naming
+   fully-covered files as uncovered. It was worth a local reimplementation only
+   until upstream shipped (6.5.8), and that reimplementation was then deleted.
+   The durable half: when a gate's number moves and nothing in the diff explains
+   it, **suspect the gate before the code** — and confirm by computing the same
+   thing a second way rather than by reasoning about it.
+
+11. **Verify the mutation is a faithful revert.** One written during the M7
    remediation changed half of a two-line fix, left the tree in a state neither
    version would produce, and "killed" the mutant for the wrong reason. Read
    what the mutated file actually says before believing the failure.

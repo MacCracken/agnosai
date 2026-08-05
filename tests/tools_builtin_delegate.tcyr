@@ -87,6 +87,80 @@ fn _t_dl_submit_crew_directly(): i64 {
     return 0;
 }
 
+# A minimal runnable crew spec.
+fn _t_dl_spec(): i64 {
+    var spec = agnosai_crew_new(str_from("leakcheck"));
+    var agents = vec_new();
+    vec_push(agents, agnosai_agent_new(str_from("a"), str_from("r"), str_from("g")));
+    agnosai_crew_with_agents(spec, agents);
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("do it")));
+    agnosai_crew_with_tasks(spec, tasks);
+    return spec;
+}
+
+# --- The detached thread leaks nothing ----------------------------------
+
+# Virtual-memory size in KiB, read from `/proc/self/statm` field 1 (pages).
+#
+# **VA, not RSS.** A thread stack is `mmap`ed and mostly untouched, so RSS
+# barely moves whether or not it is freed — the leak is address space, and
+# `statm`'s first field is the only one that shows it.
+fn _t_dl_va_kib(): i64 {
+    var fd = sys_open("/proc/self/statm", 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var buf[128];
+    var n = sys_read(fd, &buf, 127);
+    sys_close(fd);
+    if (n <= 0) { return 0 - 1; }
+    store8(&buf + n, 0);
+    var pages = 0;
+    var i = 0;
+    while (i < n && (load8(&buf + i) & 255) >= 48 && (load8(&buf + i) & 255) <= 57) {
+        pages = pages * 10 + ((load8(&buf + i) & 255) - 48);
+        i = i + 1;
+    }
+    return pages * 4;
+}
+
+# **The leak this closed, measured rather than asserted away.**
+#
+# Before cyrius 6.5.8 this called `thread_create` and never joined, stranding
+# 2 MiB of stack plus 4 KiB of TLS per submitted crew — upstream measured 100
+# unjoined threads at 210,124,800 B of VA. `thread_create_detached` has the
+# child unmap its own stack in the trampoline tail, with the TLS carved from the
+# top of that same mapping so one `munmap` frees both.
+#
+# 32 crews at the old cost would be ~67 MiB. The bound below is 16 MiB, which is
+# far under that and far above the few hundred KiB of ordinary allocator growth
+# 32 crew runs produce — so it discriminates without being tight enough to fail
+# on an unrelated allocation. Reverting to `thread_create` fails it.
+fn _t_dl_detached_threads_do_not_leak_va(): i64 {
+    var st = _t_dl_state();
+    var o = agnosai_app_state_orchestrator(st);
+
+    # Warm every one-time path first — the first thread arms the shared-heap
+    # lock and the allocator grows once.
+    agnosai_orchestrator_submit_crew(o, _t_dl_spec());
+    sleep_ms(50);
+
+    var before = _t_dl_va_kib();
+    if (before < 0) { return 0; }
+    for (var i = 0; i < 32; i = i + 1) {
+        agnosai_orchestrator_submit_crew(o, _t_dl_spec());
+        # Let each finish before the next, so what is measured is retention
+        # after exit rather than 32 live stacks.
+        sleep_ms(15);
+    }
+    sleep_ms(200);
+    var grew = _t_dl_va_kib() - before;
+
+    assert(grew < 16384,
+    "32 detached crews retain under 16 MiB of address space — at the pre-6.5.8 \
+    2 MiB per unjoined stack this would be ~67 MiB");
+    return 0;
+}
+
 fn _t_dl_schema(): i64 {
     # `schema_fp` takes the allocator first; passing 0 there is not a null
     # ctx, it is a null allocator, and `alloc_via` follows it.
@@ -216,6 +290,7 @@ fn main(): i64 {
 
     _t_dl_tool_constructor();
     _t_dl_submit_crew_directly();
+    _t_dl_detached_threads_do_not_leak_va();
     _t_dl_schema();
     _t_dl_returns_an_id_not_a_result();
     _t_dl_id_is_live_before_the_call_returns();

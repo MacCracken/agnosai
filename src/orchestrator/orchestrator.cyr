@@ -381,12 +381,25 @@ fn _agnosai_orch_submit_thread(job): i64 {
 # **Returns 0 if the thread cannot be created**, leaving the crew PENDING and
 # unexecuted rather than reporting a run that never started.
 #
-# ⚠ **Owed: the thread is never joined.** `lib/thread.cyr` has `thread_create`
-# and `thread_join` and no detach, so each submitted crew leaks its 2 MiB stack
-# and 4 KiB of TLS. Filed upstream as
-# `2026-08-05-no-thread-detach-so-a-fire-and-forget-thread-leaks-its-2-mib-stack.md`;
-# a consumer-side reaper would bound it but cannot close it — a thread cannot
-# free the stack it is running on. Deferred with the concurrency cap, roadmap B1.
+# ✅ **The thread is detached, and it leaks nothing.** This used to call
+# `thread_create` and never join, stranding 2 MiB of stack and 4 KiB of TLS per
+# submitted crew — a consumer-side reaper would have bounded it but could not
+# close it, because a thread cannot free the stack it is running on. Filed
+# upstream as
+# `2026-08-05-no-thread-detach-so-a-fire-and-forget-thread-leaks-its-2-mib-stack.md`
+# and **shipped in cyrius 6.5.8**: `thread_create_detached` has the child unmap
+# its own stack in the trampoline tail, carves the TLS from the top of that same
+# mapping so one `munmap` frees both, and allocates no handle at all. Upstream
+# measured 100 unjoined threads at 210,124,800 B of VA before and **0** after.
+#
+# **6.5.8 is therefore the floor for this function** — against 6.5.7 or earlier
+# `thread_create_detached` does not exist and the module will not compile, which
+# is the right failure mode for a change whose silent one is an unbounded leak.
+#
+# **Do not "improve" this to `thread_create` + a later `thread_join`.** The
+# handle a joiner needs is exactly what the detached path declines to allocate,
+# and the crew's result reaches the caller through the registry rather than
+# through the thread's return value — there is nothing to join *for*.
 fn agnosai_orchestrator_submit_crew(o, spec): i64 {
     var crew_id = agnosai_crew_id(spec);
     var runner = _agnosai_orch_register(o, spec);
@@ -397,7 +410,7 @@ fn agnosai_orchestrator_submit_crew(o, spec): i64 {
     store64(job + AGN_OJ_CREW_ID, crew_id);
     store64(job + AGN_OJ_NAME, agnosai_crew_name(spec));
 
-    if (thread_create(&_agnosai_orch_submit_thread, job) == 0) { return 0; }
+    if (thread_create_detached(&_agnosai_orch_submit_thread, job) == 0) { return 0; }
     return crew_id;
 }
 

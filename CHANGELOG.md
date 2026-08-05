@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **cyrius 6.5.8: the submitted-crew thread no longer leaks, and the coverage
+  gate is trustworthy again. Both were agnosai filings.**
+
+  - **`agnosai_orchestrator_submit_crew` is detached.** It called
+    `thread_create` and never joined, stranding 2 MiB of stack plus 4 KiB of
+    TLS per submitted crew — a consumer-side reaper would have bounded it but
+    could not close it, because a thread cannot free the stack it is running
+    on. `thread_create_detached` has the child unmap its own stack in the
+    trampoline tail, with the TLS carved from the top of that same mapping so
+    one `munmap` frees both, and no handle allocated at all. Upstream measured
+    100 unjoined threads at **210,124,800 B of VA before and 0 after**.
+
+    Pinned here by reading `/proc/self/statm` across 32 submitted crews and
+    asserting under 16 MiB of retained address space — at the old cost that
+    would be ~67 MiB. Reverting to `thread_create` fails it. **VA, not RSS**: a
+    thread stack is mostly untouched, so RSS barely moves either way and only
+    the address space shows the leak.
+
+    **6.5.8 is the floor for `orchestrator`** — against 6.5.7 or earlier
+    `thread_create_detached` does not exist and the module does not compile,
+    which is the right failure mode for a change whose silent one is unbounded.
+
+  - **`cyrius coverage` is authoritative again, so the local workaround is
+    gone.** 6.5.8 fixed four defects in it, including the fixed 1 MiB corpus
+    this tree crossed. Verified rather than assumed: at 1,082,744 bytes — 34 KB
+    past the old cap — the tool now reports **1084/1084**, byte-for-byte what
+    `scripts/check-coverage.sh` reported. **That script is removed** and the
+    corpus-size warning is out of `check-clean.sh`; keeping a second
+    implementation of a fixed tool is two things to maintain and two things to
+    drift.
+
+  - Also arriving with the fold and not separately verified here: the
+    `thread_join` lost-wakeup deadlock (~1 join in 150k, permanent and silent —
+    `orch_crew_runner`'s parallel and DAG modes join real threads), and all
+    twelve `i64::MIN` decimal sites via `fmt.cyr` / `string.cyr` / `log.cyr`
+    plus sakshi **2.4.8**'s `_sk_fmt_int`. agnosai has **no decimal formatter of
+    its own** — checked, not assumed — so it inherits every one of them.
+    `lib/sakshi.cyr` is byte-identical to the 6.5.8 snapshot.
+
+  **The bump order is load-bearing and was not obvious.** `cyrius deps` writes
+  the lockfile from what it just copied, and `cyrius lib sync --full` changes
+  files afterwards, so the two gates contradict each other unless the lock is
+  written last:
+
+  ```sh
+  cyrius deps --no-lock     # resolve git deps into lib/
+  cyrius lib sync --full    # refresh the stdlib over them
+  cyrius deps --lock        # record what is actually there
+  ```
+
+  Standing rule 2 said `deps` does not refresh the stdlib; what it did not say
+  is that `--no-lock` / `--lock` are what let both gates pass at once.
+
 - **M7 audit (2026-08-04): three live defects, found by adversarial review of a
   fully green suite.** 43 findings confirmed across the eight sandbox modules,
   each verified by applying the mutation and re-running the tests —
