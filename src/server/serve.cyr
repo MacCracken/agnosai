@@ -335,7 +335,7 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
         }
     }
 
-    var resp = agnosai_route_dispatch(_agnosai_serve_state, method, path,
+    var resp = agnosai_route_dispatch_a(a, _agnosai_serve_state, method, path,
     auth_str, has_auth, body);
 
     # The a2a callback, on the success path only — the oracle spawns it inside
@@ -367,7 +367,13 @@ fn _agnosai_serve_send(a, cfd, resp): i64 {
         ctype = "text/plain; version=0.0.4";
     } else {
         if (body != 0 && bayan_json_v_is_null(body) == 0) {
-            text = bayan_json_v_build(body);
+            # `_a` where the arena exists — the response text is per-request by
+            # definition, and building it on the global bump made every reply a
+            # permanent allocation. sandhi owns this arena's lifetime and resets
+            # it after the response is written, so the bytes live exactly as
+            # long as the send that consumes them.
+            if (a != 0) { text = bayan_json_v_build_a(a, body); }
+            else { text = bayan_json_v_build(body); }
         }
     }
 

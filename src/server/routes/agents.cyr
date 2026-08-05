@@ -36,14 +36,25 @@
 #
 # Empty answers `[]`, not `null`; the oracle's `Vec` serializes to an empty
 # array and the oracle has a dedicated test for it.
-fn agnosai_route_list_definitions(state): i64 {
-    var defs = agnosai_app_state_definitions(state);
-    var arr = bayan_json_v_arr_new();
+fn agnosai_route_list_definitions_a(a, state): i64 {
+    var defs = agnosai_app_state_definitions_a(a, state);
+    var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(defs); i = i + 1) {
-        var v = agnosai_agent_to_value(vec_get(defs, i));
-        if (v != 0) { bayan_json_v_arr_push(arr, v); }
+        var v = agnosai_agent_to_value_a(a, vec_get(defs, i));
+        if (v != 0) { bayan_json_v_arr_push_a(a, arr, v); }
     }
-    return agnosai_route_json(HTTP_OK, arr);
+    return agnosai_route_json_a(a, HTTP_OK, arr);
+}
+
+# Global-allocator form of `agnosai_route_list_definitions_a`.
+#
+# **The first route threaded onto sandhi's per-request arena** (roadmap B2).
+# core's `agnosai_agent_to_value_a` has existed since the core bite; nothing in
+# the request path passed it an arena, so every definitions listing left its
+# whole value tree on the global no-free bump — measured at 1,696 bytes per
+# request before this.
+fn agnosai_route_list_definitions(state): i64 {
+    return agnosai_route_list_definitions_a(default_alloc(), state);
 }
 
 # `POST /api/v1/agents/definitions` — store a definition, echoing it back.

@@ -138,15 +138,28 @@ fn agnosai_app_state_definition_count(s): i64 {
 # a lock held across arbitrary serialization work, on the path every worker
 # thread shares. Copying the pointers out first is cheaper and cannot deadlock;
 # the definitions themselves are process-lifetime, so the pointers stay valid.
-fn agnosai_app_state_definitions(s): i64 {
+fn agnosai_app_state_definitions_a(a, s): i64 {
     mutex_lock(load64(s + AGN_ST_DEF_MUTEX));
     var m = load64(s + AGN_ST_DEFINITIONS);
-    var keys = map_keys(m);
-    var out = vec_new();
-    var n = vec_len(keys);
+    var out = vec_new_a(a);
+    var n = _agnosai_map_slots(m);
     for (var i = 0; i < n; i = i + 1) {
-        vec_push(out, map_get(m, vec_get(keys, i)));
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            vec_push_a(a, out, _agnosai_map_slot_val(m, i));
+        }
     }
     mutex_unlock(load64(s + AGN_ST_DEF_MUTEX));
     return out;
+}
+
+# Global-allocator form of `agnosai_app_state_definitions_a`.
+#
+# **Walks slots rather than `map_keys`**, which is state.md's standing rule 5:
+# `map_keys` materialises its key vec through a bare `vec_new()` on the no-free
+# global bump and has no `_a` form, so it survives every other substitution and
+# silently caps the win. Threading the route without this got
+# `/api/v1/agents/definitions` from 1,696 to 384 bytes per request; the residual
+# was this function, and nothing else in the handler could have removed it.
+fn agnosai_app_state_definitions(s): i64 {
+    return agnosai_app_state_definitions_a(default_alloc(), s);
 }

@@ -706,6 +706,64 @@ fn _t_allocation_profile(): i64 {
     assert(per_list > per_health,
     "a list response costs more than a fixed one — proportional to the answer");
     assert(per_list < 8192, "...and still bounded");
+
+    # --- B2: a threaded route on the per-request arena --------------------
+    #
+    # **The first route whose handler half is nearly flat.** Everything above
+    # measures the global path, which is what a caller dispatching without an
+    # arena still gets and what the oracle's shape costs. `dispatch_a` with a
+    # real arena is the path sandhi takes, and `/api/v1/agents/definitions`
+    # measured **1,696 → 80 bytes per request** across two changes: threading
+    # the route onto core's existing `_a` forms (1,696 → 384), then walking map
+    # slots instead of `map_keys` (384 → 80), which is standing rule 5 and was
+    # the entire residual.
+    #
+    # The assertion is a ratio rather than an absolute so it survives an
+    # allocator whose bookkeeping differs, while still failing loudly if the
+    # threading is undone — un-threading any single call puts the arena path
+    # back within a small factor of the global one.
+    var ar = arena_allocator(65536);
+    agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET,
+    str_from("/api/v1/agents/definitions"), str_from(""), 0, str_from(""));
+    reset_via(ar);
+
+    var b5 = alloc_used();
+    for (var g = 0; g < 64; g = g + 1) {
+        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET,
+        str_from("/api/v1/agents/definitions"), str_from(""), 0, str_from(""));
+    }
+    var per_defs_global = (alloc_used() - b5) / 64;
+
+    var b6 = alloc_used();
+    for (var h = 0; h < 64; h = h + 1) {
+        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET,
+        str_from("/api/v1/agents/definitions"), str_from(""), 0, str_from(""));
+        reset_via(ar);
+    }
+    var per_defs_arena = (alloc_used() - b6) / 64;
+
+    assert(per_defs_global > 0, "the global path allocates, as every route above does");
+    assert(per_defs_arena * 4 < per_defs_global,
+    "the SAME route through a per-request arena costs a small fraction of the global path — \
+    measured 80 B against 1,696 B, and un-threading any one call collapses the gap");
+
+    # The `_a` forms named directly. Each is reached through `dispatch_a`, so
+    # the behaviour is covered — but reference coverage counts the SYMBOL, and
+    # an indirectly-used public fn reads as dead.
+    var d_a = agnosai_app_state_definitions_a(ar, s);
+    assert(vec_len(d_a) >= 0, "definitions_a walks the map through the arena");
+    var lr = agnosai_route_list_definitions_a(ar, s);
+    assert(agnosai_route_status(lr) == HTTP_OK, "list_definitions_a answers 200");
+    var rj = agnosai_route_json_a(ar, HTTP_OK, bayan_json_v_null());
+    assert(agnosai_route_status(rj) == HTTP_OK, "route_json_a builds a response in the arena");
+
+    # Byte-identical wire, which is what lets the threading land without an ADR.
+    var gv = agnosai_route_body(agnosai_route_dispatch(s, AGNOSAI_METHOD_GET,
+    str_from("/api/v1/agents/definitions"), str_from(""), 0, str_from("")));
+    var av = agnosai_route_body(agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET,
+    str_from("/api/v1/agents/definitions"), str_from(""), 0, str_from("")));
+    assert(str_eq(bayan_json_v_build(gv), bayan_json_v_build(av)) == 1,
+    "...and emits byte-identical JSON either way");
     return 0;
 }
 

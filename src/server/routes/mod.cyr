@@ -71,12 +71,21 @@ enum AgnosaiRouteRespOff {
 #
 # Cyrius has no tuples, so the `(status, json)` shape the tier is written
 # against is this 24-byte struct. `body` is a `bayan_json_v` value.
-fn agnosai_route_json(status, body): i64 {
-    var r = alloc(AGN_ROUTE_RESP_SIZE);
+fn agnosai_route_json_a(a, status, body): i64 {
+    var r = alloc_via(a, AGN_ROUTE_RESP_SIZE);
     store64(r + AGN_RR_STATUS, status);
     store64(r + AGN_RR_BODY, body);
     store64(r + AGN_RR_IS_TEXT, 0);
     return r;
+}
+
+# Global-allocator form of `agnosai_route_json_a`.
+#
+# The response struct is per-request like everything else it points at, so a
+# threaded route allocates it from the same arena rather than leaving a 24-byte
+# crumb on the global bump per reply.
+fn agnosai_route_json(status, body): i64 {
+    return agnosai_route_json_a(default_alloc(), status, body);
 }
 
 # A handler's answer when the body is **not** JSON — `/metrics` is the only one,

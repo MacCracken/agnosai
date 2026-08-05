@@ -336,7 +336,30 @@ fn agnosai_route_needs_auth(id): i64 {
 #      so an unauthenticated request to a nonexistent path is 404, not 401.
 #   3. **401** (or 500) from auth, for protected routes only.
 #   4. the handler.
+# Dispatch with a per-request arena.
+#
+# **`a` may be 0**, and every caller must tolerate that: sandhi only supplies a
+# request arena when `sandhi_server_options_req_arena` is configured, and the
+# direct-dispatch callers (tests, and anything driving the router without the
+# transport) pass 0 deliberately. A route threading `a` therefore uses the
+# `_a` form only when it is non-zero and its bare twin otherwise — the two emit
+# byte-identical wire, which is what lets this land without an ADR.
+#
+# The arena's lifetime is sandhi's: it is reset after the response is written,
+# so anything a route allocates in it is valid for exactly as long as the reply
+# that carries it, and no longer.
+fn agnosai_route_dispatch_a(a, state, method, path: Str, auth_header: Str, has_auth,
+body: Str): i64 {
+    return _agnosai_route_dispatch_inner(a, state, method, path, auth_header, has_auth, body);
+}
+
+# Global-allocator form of `agnosai_route_dispatch_a`.
 fn agnosai_route_dispatch(state, method, path: Str, auth_header: Str, has_auth, body: Str): i64 {
+    return _agnosai_route_dispatch_inner(0, state, method, path, auth_header, has_auth, body);
+}
+
+fn _agnosai_route_dispatch_inner(a, state, method, path: Str, auth_header: Str, has_auth,
+body: Str): i64 {
     if (str_len(body) > AGNOSAI_MAX_BODY_BYTES) {
         return agnosai_route_error(HTTP_PAYLOAD_TOO_LARGE,
         str_from("request body exceeds the 10 MiB limit"));
@@ -367,7 +390,10 @@ fn agnosai_route_dispatch(state, method, path: Str, auth_header: Str, has_auth, 
     if (id == AGN_ROUTE_CANCEL_CREW) { return agnosai_route_cancel_crew(state, param); }
     if (id == AGN_ROUTE_A2A_RECEIVE) { return agnosai_route_a2a_receive(state, body); }
     if (id == AGN_ROUTE_A2A_STATUS) { return agnosai_route_a2a_status(); }
-    if (id == AGN_ROUTE_LIST_DEFINITIONS) { return agnosai_route_list_definitions(state); }
+    if (id == AGN_ROUTE_LIST_DEFINITIONS) {
+        if (a != 0) { return agnosai_route_list_definitions_a(a, state); }
+        return agnosai_route_list_definitions(state);
+    }
     if (id == AGN_ROUTE_CREATE_DEFINITION) {
         return agnosai_route_create_definition(state, body);
     }
