@@ -297,10 +297,21 @@ fn _agnosai_cx_interpreter_dir(path): Str {
 # bytecode on an already-open stdin, and landlock does not restrict descriptors
 # that were open before it was applied.
 #
-# seccomp is on. Network isolation is **not** claimed — kavach applies
-# namespaces only to rootfs-bearing sandboxes, and this one has no rootfs, so a
-# guest can still reach the network. That is the honest state and the next
-# thing to close.
+# seccomp is on, and so is **network isolation** — `policy_basic` leaves
+# `network_enabled` at 0, and `persistent_spawn_confined_ns` (kavach 3.11.6)
+# acts on it. Until then the persistent path applied landlock and seccomp and
+# nothing else, so a `.cyx` guest could open a socket despite the policy.
+#
+# That closes the last difference from the WASI contract ADR-006 replaces:
+# `WasmSandbox` built its context with **only stdin and stdout**, so a WASM tool
+# had no network at all, and now neither does a cx tool.
+#
+# **It fails closed, and on some hosts that means tools do not run.** A network
+# namespace needs a new *user* namespace when unprivileged, and Ubuntu 24.04
+# restricts those — so `agnosai_cx_run` reports a spawn refusal there rather
+# than running a guest with a network its policy denied. That is the correct
+# trade for untrusted tool code and it is stated plainly because it is a real
+# operational cost, not a free win.
 fn agnosai_cx_policy(interpreter_dir: Str): i64 {
     var p = policy_basic();
     policy_landlock_add(p, str_cstr(interpreter_dir), FS_READ_ONLY);
@@ -334,7 +345,9 @@ fn agnosai_cx_run(cyx: Str, timeout_ms, out_err): i64 {
     }
 
     var pol = agnosai_cx_policy(_agnosai_cx_interpreter_dir(exe));
-    var g = persistent_spawn_confined(exe, pol);
+    # `require_ns = 1`: the policy's network isolation is demanded, not merely
+    # carried. Fails closed — see the note on `agnosai_cx_policy`.
+    var g = persistent_spawn_confined_ns(exe, pol, 1);
     if (g == 0) {
         # **Never fall back to an unconfined spawn.** A sandbox that cannot be
         # created is a refusal, not a reason to run the payload anyway.

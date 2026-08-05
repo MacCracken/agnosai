@@ -280,9 +280,25 @@ small:
   is captured on its own stream. **All kavach filings from this milestone are
   now resolved.**
 
-  The cx runner does not yet set `require_namespaces` — a `.cyx` guest can still
-  reach the network. That is now an agnosai choice rather than a kavach
-  limitation, and the next thing to decide: ADR-006's hard requirement
+  ✅ **Closed in kavach 3.11.6** — `persistent_spawn_confined_ns` applies the
+  policy's namespaces on the persistent path, and `agnosai_cx_run` requests
+  them. **Every kavach filing and gap from this milestone is resolved.** The
+  history below is kept because the reasoning took three wrong turns.
+
+  ~~One gap remains, and it is kavach-side after all.~~ An earlier note here
+  said the cx runner "does not yet set `require_namespaces`", implying agnosai
+  could. It cannot: `config_require_namespaces` is a **`SandboxConfig`** field
+  read by `process_exec`, while the cx runner must use
+  `persistent_spawn_confined` — the only kavach API with the stdin channel
+  `cxvm` needs — and that path applies landlock and seccomp in the child and
+  **nothing else**. It takes a `SandboxPolicy`, which carries `network_enabled`,
+  and acts on none of it.
+
+  So a `.cyx` guest can open a socket. That is the last difference between the
+  cx sandbox and the WASI contract ADR-006 replaces, where a tool got **only
+  stdin and stdout**. Closing it means teaching kavach's persistent path to
+  create namespaces, with the same opt-in fail-closed shape 3.11.5 gave
+  `process_exec`. ADR-006's hard requirement
   is that "no code path may execute a `.cyx` outside a kavach sandbox — a `cxvm`
   spawn that is not wrapped is a full sandbox escape, not a degraded one."
 - **The cx confinement bites (B14-B15)** — `wasm.rs`'s successor per

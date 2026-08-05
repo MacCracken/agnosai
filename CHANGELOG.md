@@ -20,6 +20,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *passes* — this is one of the few changes here with no test that can fail
   without it.
 
+- **Pinned kavach 3.11.6: cx tool guests now get network isolation, closing the
+  last difference from the WASI contract ADR-006 replaces.** kavach's persistent
+  path — the only API with the stdin channel `cxvm` needs — applied landlock and
+  seccomp and **nothing else**. It takes a `SandboxPolicy` carrying
+  `network_enabled` and acted on none of it, and `config_require_namespaces`
+  (3.11.5) is a `SandboxConfig` field that never reached it. So a `.cyx` guest
+  could open a socket despite its policy.
+
+  `persistent_spawn_confined_ns(command, policy, require_ns)` applies the
+  policy's namespaces, opt-in and fail-closed like `process_exec` got in 3.11.5.
+  `agnosai_cx_run` requests it, so `WasmSandbox`'s "only stdin and stdout" now
+  holds for cx tools too.
+
+  **The cost is stated rather than buried**: a network namespace needs a new
+  *user* namespace when unprivileged, and Ubuntu 24.04 restricts those — so on
+  such a host `agnosai_cx_run` reports a spawn refusal instead of running a
+  guest with a network its policy denied. Mutation-verified in kavach: ignoring
+  `require_ns` fails the uid-0-inside-the-namespace assertion.
+
 - **Pinned kavach 3.11.5, closing the last two: no network isolation without a
   rootfs, and a `stderr` field that was always empty.**
 
