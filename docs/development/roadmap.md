@@ -594,18 +594,37 @@ Nothing here blocks agnosai today; each is a residual agnosai measured and hande
 | bayan | **Nothing open.** The `_a` JSON ask shipped as bayan 1.4.0 (folded in cyrius 6.5.5). The YAML ask (`2026-07-16-...`) has **also shipped and this row was stale** — `bayan_yaml_parse` / `_parse_buf` / `_parse_ctx` return a `json_v*` tagged value tree, plus `bayan_yaml_frontmatter_split`. Verified 2026-08-03 by parsing a scalar+sequence document, resolving a key through `bayan_json_v_obj_get`, and re-serializing via `bayan_json_v_build`. **This unblocks M10's YAML half**, which the exclusion table still lists as deferred — revisit that scope call before starting M10. |
 | sigil | `2026-07-30-rsa-verify-uses-secret-exponent-ladder.md` — ✅ **archived upstream**, fixed, vendored and **measured** (see C1). |
 | bote | `serverInfo` hardcoded to `"bote"` in `dispatcher_dispatch` — ✅ **fixed as bote 3.3.0** (`dispatcher_set_server_info`). Pin bump owed under B1. |
-| kavach | All five M7 filings are **✅ resolved** (3.11.3–3.11.6 — seccomp/landlock on both exec paths, `timeout_ms` honoured, real exit code and stderr, namespaces on the persistent path). **Filed 2026-08-05:** `2026-08-05-gate-apply-measures-with-strlen-so-it-cannot-scan-a-length-carrying-string.md` — the externalization gate measures artifacts with `strlen`, so a secret after an embedded NUL is **released as PASS** (measured: identical 23 bytes PASS with a NUL, BLOCK with a space) and a borrowed slice is scanned past its own end. Asks for a length-carrying `gate_apply` or a `Str`-taking overload. **Workaround owed for deletion when it lands** — see C2. |
+| kavach | **Nothing open — all six filings resolved, and kavach's own issue queue is empty.** The five M7 ones landed in 3.11.3–3.11.6 (seccomp/landlock on both exec paths, `timeout_ms` honoured, real exit code and stderr, namespaces on the persistent path). `2026-08-05-gate-apply-measures-with-strlen-...` landed in **3.11.7** and is ✅ **consumed** — see C2. |
 
-**C2 — two local workarounds owed for deletion, both tied to a filing above.**
-Neither is a defect; each is code that exists only because an upstream API
-cannot express the thing, and each has a precise deletion condition. Recorded
-here because this list is the project's definition of "owed", and a temporary
-workaround that no list names is a permanent one.
+**C2 — one local workaround owed for deletion.**
+Not a defect; it is code that exists only because an upstream API cannot express
+the thing, and it has a precise deletion condition. Recorded here because this
+list is the project's definition of "owed", and a temporary workaround that no
+list names is a permanent one.
 
 | Workaround | Where | Delete when |
 |---|---|---|
 | `_agnosai_signal_default` | `src/sandbox/spawn.cyr` | cyrius ships `signal_default` (filed `2026-08-05-syscalls-has-signal-ignore-but-no-way-back-to-sig-dfl.md`). ~20 lines, Linux arms only; the call site in the child stays, only the local definition goes. |
-| `_agnosai_kavach_gate_bytes` | `src/sandbox/kavach_bridge.cyr` | kavach ships a length-carrying `gate_apply`. The copy can then go entirely — today it also **rewrites interior NULs to `\n`**, which is the part worth removing: it scans the whole artifact but the gate no longer sees the exact bytes. |
+
+~~`_agnosai_kavach_gate_bytes`~~ — ✅ **deleted 2026-08-05**, on the kavach
+**3.11.7** pin. `agnosai_kavach_scan_output` now calls
+`exec_result_set_stdout_n(r, str_data(output), str_len(output))`, so the
+artifact's true length crosses the API and the copy is gone. **The NUL rewrite
+went with it**, which was the part worth removing: kavach normalises its own
+scanning copy now, so the gate sees every byte *and* the artifact reaching it is
+unaltered. The two audit assertions still pass and still discriminate —
+reverting to the pre-3.11.7 `ExecResult_set_stdout(r, str_data(output))` fails
+both, one per direction.
+
+**3.11.7 is the floor for `kavach_bridge`.** Against 3.11.6 or earlier
+`exec_result_set_stdout_n` does not exist and the module does not compile, which
+is the right failure: the silent one is a released secret.
+
+The pin is verified against the published tag rather than assumed: `git show
+3.11.7:dist/kavach.cyr`, the kavach worktree, and `agnosai/cyrius.lock` all
+hash to `e959d81a…`, and the GitHub API puts the remote tag on the same commit
+(`6567a65`). So a tag-only CI resolution and the local `path = "../kavach"`
+override agree — see `state.md`.
 
 **C1 — ✅ RESOLVED 2026-07-31.** This read *"`cyrius deps` has not been re-run
 since the fix landed"*, which is no longer true: `lib/sigil.cyr` is the pinned

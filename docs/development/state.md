@@ -533,9 +533,27 @@ criterion statistics. The Cyrius line starts its own baseline, captured by
 base substrate · general utilities · bayan · patra · concurrency+crypto floor ·
 dynamic-link floor · async · net/http/tls/ws/sakshi/sandhi
 
-**git deps** (declare-ahead pattern, read from `cyrius.cyml` 2026-08-03):
-sigil 3.12.2 · **bote 3.3.0** · majra 2.5.3 · **kavach 3.11.0** · ai-hwaccel 2.3.16 ·
+**git deps** (declare-ahead pattern, read from `cyrius.cyml` 2026-08-05):
+sigil 3.12.2 · **bote 3.3.0** · majra 2.5.3 · **kavach 3.11.7** · ai-hwaccel 2.3.16 ·
 tyche 1.0.0.
+
+**kavach 3.11.7 verified end to end, 2026-08-05** — the check `state.md` itself
+prescribes, run in all three places rather than assumed:
+
+| bundle | sha256 (16) |
+|---|---|
+| `git show 3.11.7:dist/kavach.cyr` | `e959d81aa2b370f0` |
+| kavach worktree / `origin/main` (`6567a65`) | `e959d81aa2b370f0` |
+| `agnosai/cyrius.lock` | `e959d81aa2b370f0` |
+
+Remote tag confirmed at `6567a65` through the GitHub API, so the local `path =
+"../kavach"` override and a tag-only CI resolution produce the same bytes —
+which is the condition the *Pins must name what is actually built* rule exists
+to enforce, satisfied rather than merely intended.
+
+`kavach_bridge` requires 3.11.7: `exec_result_set_stdout_n` does not exist
+before it, so an older pin does not compile rather than silently under-scanning
+— see roadmap C2.
 
 **All six pins are now the newest upstream tag**, confirmed against the GitHub API
 rather than a local `git fetch` — the dep remotes are SSH (`git@github.com:`) and a

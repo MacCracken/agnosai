@@ -193,54 +193,41 @@ fn agnosai_kavach_policy_for_trust(trust: Str): i64 {
 }
 
 # A NUL-terminated copy of `output` that the gate can scan **whole**.
-#
-# **The gate is `strlen`-based end to end and a `Str` is not a C string.**
-# `gate_apply` measures with `strlen(stdout)` (`lib/kavach.cyr:5719`) and
-# `_concat_with_nl` copies with `strlen` (`:5693`), so handing it `str_data`
-# gets the length wrong in both directions at once, and the audit of 2026-08-04
-# measured both:
-#
-# - **Under-scan.** `str_new(buf, 23)` over `"ok\0AKIAIOSFODNN7EXAMPLE"` scanned
-#   two bytes and returned PASS, releasing a credential the same 23 bytes with a
-#   space in place of the NUL correctly BLOCKed.
-# - **Over-read.** `str_substr(...)` of ten clean bytes BLOCKed, because `strlen`
-#   ran off the end of the borrowed slice into the rest of the arena. `str_new`
-#   and `str_substr` do not terminate (`lib/str.cyr:42-53`, `:634-640`).
-#
-# The oracle has neither problem: `kavach_bridge.rs:159` passes a `String`, and
-# Rust carries its length. Copying is the price of a C-string API — and the
-# interior NULs become newlines rather than truncating the scan, because
-# `_concat_with_nl` already joins stdout to stderr with a newline, so it is a
-# separator the scanners are known to handle and no detector pattern matches it.
-#
-# Filed upstream as kavach
-# `2026-08-05-gate-apply-measures-with-strlen-so-it-cannot-scan-a-length-carrying-string.md`;
-# until a length-carrying `gate_apply` lands, no NUL-safe spelling exists that
-# does not copy.
-fn _agnosai_kavach_gate_bytes(output: Str): i64 {
-    var n = str_len(output);
-    var src = str_data(output);
-    var buf = alloc(n + 1);
-    var i = 0;
-    while (i < n) {
-        var c = load8(src + i);
-        if (c == 0) { c = 10; }
-        store8(buf + i, c);
-        i = i + 1;
-    }
-    store8(buf + n, 0);
-    return buf;
-}
-
 # `scan_output` — run the externalization gate over a raw string.
 #
 # **Returns only PASS or BLOCK.** kavach's gate produces four verdicts and this
 # collapses them, because the oracle's `gate.apply` is a `Result` that cannot
 # express more — see the module header. Deliberate information loss for parity.
+#
+# ## The length goes across, and that used to be impossible
+#
+# `exec_result_set_stdout_n` hands kavach the artifact's **true length**, so a
+# `Str` reaches the gate as what it is. Before kavach 3.11.7 the API took only a
+# `cstring` and measured it with `strlen`, which is a distance to the first NUL
+# and not a length — wrong in both directions at once, and the audit of
+# 2026-08-04 measured both:
+#
+# - **Under-scan.** `str_new(buf, 23)` over `"ok\0AKIAIOSFODNN7EXAMPLE"` scanned
+#   two bytes and returned PASS, **releasing a credential** the same 23 bytes
+#   with a space in place of the NUL correctly BLOCKed.
+# - **Over-read.** `str_substr(...)` of ten clean bytes BLOCKed, because `strlen`
+#   ran off the end of the borrowed slice into the rest of the arena. `str_new`
+#   and `str_substr` do not terminate (`lib/str.cyr:42-53`, `:634-640`).
+#
+# agnosai carried `_agnosai_kavach_gate_bytes` for it — a copy that rewrote
+# interior NULs to newlines so the whole artifact was at least visible. That is
+# **deleted as of kavach 3.11.7**, and the rewrite goes with it: kavach now
+# normalises its own scanning copy, so the gate sees every byte *and* the
+# artifact reaching it is unaltered. Filed and fixed upstream as
+# `2026-08-05-gate-apply-measures-with-strlen-so-it-cannot-scan-a-length-carrying-string.md`.
+#
+# **3.11.7 is therefore the floor for this module.** Against 3.11.6 or earlier
+# `exec_result_set_stdout_n` does not exist and this does not compile — which is
+# the right failure, because the silent one is a released secret.
 fn agnosai_kavach_scan_output(output: Str): i64 {
     var r = exec_result_new();
     ExecResult_set_exit_code(r, 0);
-    ExecResult_set_stdout(r, _agnosai_kavach_gate_bytes(output));
+    exec_result_set_stdout_n(r, str_data(output), str_len(output));
     ExecResult_set_stderr(r, "");
     ExecResult_set_duration_ms(r, 0);
     ExecResult_set_timed_out(r, 0);

@@ -236,6 +236,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spawn 144 → **169**, process 108 → **130**, python 61 → **76**, manager 69 →
   **90**, cx 62 → **87**. **627 → 727 assertions**, all green, coverage 100%.
 
+### Changed
+
+- **Pinned kavach 3.11.7, and deleted the gate workaround it makes
+  unnecessary.** `agnosai_kavach_scan_output` now hands the externalization gate
+  the artifact's **true length** via `exec_result_set_stdout_n`, instead of a
+  `cstring` the gate measured with `strlen`.
+
+  The audit's H2 finding was fixed on this side by
+  `_agnosai_kavach_gate_bytes` — a copy that rewrote interior NULs to newlines
+  so the whole artifact was at least visible. kavach 3.11.7 (filed by agnosai,
+  fixed upstream) carries lengths through `ExecResult`, so **the copy and the
+  rewrite are both gone**: the gate sees every byte, and the artifact reaching
+  it is no longer altered on the way. That second half is the part worth having
+  — a consumer needing the gate to scan the exact bytes could not previously
+  have both.
+
+  The two audit assertions are unchanged and still discriminate: reverting to
+  the pre-3.11.7 `ExecResult_set_stdout(r, str_data(output))` fails both, one
+  for the under-scan direction and one for the over-read. Sandbox suites all
+  green against 3.11.7; `src/` symbol count 1,656 → 1,655.
+
+  **3.11.7 is the floor for `kavach_bridge`** — against 3.11.6 or earlier
+  `exec_result_set_stdout_n` does not exist and the module does not compile,
+  which is the right failure mode for a change whose silent one is a released
+  secret.
+
 ### Performance
 
 - **The sandbox_spawn suite runs in 10.2 s against 32.6 s (−69%).** Not an
