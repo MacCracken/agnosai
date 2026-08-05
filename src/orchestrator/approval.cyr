@@ -175,18 +175,27 @@ fn agnosai_approval_gate_pending_count(g): i64 {
 }
 
 # The task ids currently awaiting a decision, in registration order.
-fn agnosai_approval_gate_pending_tasks(g): i64 {
+fn agnosai_approval_gate_pending_tasks_a(a, g): i64 {
     var mtx = load64(g + AGN_AG_MUTEX);
     mutex_lock(mtx);
     var pending = load64(g + AGN_AG_PENDING);
     var keys = load64(g + AGN_AG_KEYS);
-    var out = vec_new();
+    var out = vec_new_a(a);
     for (var i = 0; i < vec_len(keys); i = i + 1) {
         var k = vec_get(keys, i);
-        if (map_has(pending, k) == 1) { vec_push(out, k); }
+        if (map_has(pending, k) == 1) { vec_push_a(a, out, k); }
     }
     mutex_unlock(mtx);
     return out;
+}
+
+# Global-allocator form of `agnosai_approval_gate_pending_tasks_a`.
+#
+# The vec is the arena's; the ids inside it are the gate's own process-lifetime
+# Strs, borrowed rather than copied — which is why this snapshot costs the
+# request nothing beyond the vec itself.
+fn agnosai_approval_gate_pending_tasks(g): i64 {
+    return agnosai_approval_gate_pending_tasks_a(default_alloc(), g);
 }
 
 # Drop a task id from the key mirror. Caller holds the mutex.

@@ -54,6 +54,81 @@ fn _t_state(): i64 {
     agnosai_audit_chain_new(), agnosai_approval_gate_new());
 }
 
+# The same state with **content in it** — eight finished crews and eight pending
+# approvals.
+#
+# `_t_state`'s empty registry renders `[]` from every read route, and an empty
+# body allocates almost nothing whether it is threaded or not. So the empty
+# fixture cannot tell a threaded route from an un-threaded one: measuring
+# against it would be the vacuous-assertion trap again, and this is the fixture
+# `_t_allocation_profile`'s orchestrator-group numbers are taken over.
+fn _t_state_populated(): i64 {
+    var s = _t_state();
+    var o = agnosai_app_state_orchestrator(s);
+    for (var i = 0; i < 8; i = i + 1) {
+        var spec = agnosai_crew_new(str_from("profile"));
+        var tasks = vec_new();
+        vec_push(tasks, agnosai_task_new(str_from("do the thing")));
+        agnosai_crew_with_tasks(spec, tasks);
+        agnosai_orchestrator_run_crew(o, spec);
+        # **Each crew's result is given agent metadata.** Without it
+        # `agnosai_route_agent_performance` takes its `str_len(key) > 0` guard
+        # to false on every result and renders `[]` over eight crews — so its
+        # per-agent object build never runs, and un-threading that build is a
+        # mutation the measurement cannot see. It survived the sweep once for
+        # exactly this reason.
+        var st = agnosai_orchestrator_crew(o, agnosai_crew_id(spec));
+        var r = agnosai_task_result_new(agnosai_uuid_v4_str(), str_from("out"),
+        AGNOSAI_STATUS_COMPLETED);
+        var ksb = str_builder_new();
+        str_builder_add_cstr(ksb, "agent-");
+        str_builder_add_int(ksb, i);
+        agnosai_task_result_with_metadata(r, str_from("agent"),
+        bayan_json_v_str_new(str_builder_build(ksb)));
+        agnosai_task_result_with_metadata(r, str_from("agent_name"),
+        bayan_json_v_str_new(str_from("The Agent")));
+        agnosai_task_result_with_metadata(r, str_from("agent_role"),
+        bayan_json_v_str_new(str_from("writer")));
+        agnosai_crew_state_with_result(st, r);
+    }
+    for (var j = 0; j < 8; j = j + 1) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "task-");
+        str_builder_add_int(sb, j);
+        agnosai_approval_request(agnosai_app_state_approval_gate(s),
+        str_builder_build(sb));
+    }
+    return s;
+}
+
+# Bytes charged to the **global** bump by one dispatch of `path`, averaged over
+# 64 calls. `ar != 0` routes through `dispatch_a` with a reset between calls, so
+# what it returns is the part the arena did NOT absorb.
+fn _t_per_request(s, path: Str, ar): i64 {
+    # Hoisted out of the loop deliberately: a `str_from("")` per iteration is
+    # the *caller's* allocation, charged identically to both arms, and it would
+    # sit in the arena figure as a constant that has nothing to do with the
+    # route. Without the hoist the threaded arms all read 64 instead of 48.
+    var empty = str_from("");
+    # Warm every one-time path first, on whichever arm is being measured.
+    if (ar == 0) {
+        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
+    } else {
+        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
+        reset_via(ar);
+    }
+    var before = alloc_used();
+    for (var i = 0; i < 64; i = i + 1) {
+        if (ar == 0) {
+            agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
+        } else {
+            agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
+            reset_via(ar);
+        }
+    }
+    return (alloc_used() - before) / 64;
+}
+
 # --- Method mapping ------------------------------------------------------
 
 fn _t_method_mapping(): i64 {
@@ -722,30 +797,22 @@ fn _t_allocation_profile(): i64 {
     # allocator whose bookkeeping differs, while still failing loudly if the
     # threading is undone — un-threading any single call puts the arena path
     # back within a small factor of the global one.
+    #
+    # **Measured through `_t_per_request`, which hoists the argument Strs out of
+    # the timed loop.** The hand-rolled version this replaced minted the path
+    # and two empty headers on every iteration, so it charged the arena arm
+    # 48 bytes of the *caller's* allocation and could only ever be asserted as a
+    # ratio. Those 48 bytes had nothing to do with the route.
     var ar = arena_allocator(65536);
-    agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET,
-    str_from("/api/v1/agents/definitions"), str_from(""), 0, str_from(""));
-    reset_via(ar);
-
-    var b5 = alloc_used();
-    for (var g = 0; g < 64; g = g + 1) {
-        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET,
-        str_from("/api/v1/agents/definitions"), str_from(""), 0, str_from(""));
-    }
-    var per_defs_global = (alloc_used() - b5) / 64;
-
-    var b6 = alloc_used();
-    for (var h = 0; h < 64; h = h + 1) {
-        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET,
-        str_from("/api/v1/agents/definitions"), str_from(""), 0, str_from(""));
-        reset_via(ar);
-    }
-    var per_defs_arena = (alloc_used() - b6) / 64;
+    var defs_path = str_from("/api/v1/agents/definitions");
+    var per_defs_global = _t_per_request(s, defs_path, 0);
+    var per_defs_arena = _t_per_request(s, defs_path, ar);
 
     assert(per_defs_global > 0, "the global path allocates, as every route above does");
-    assert(per_defs_arena * 4 < per_defs_global,
-    "the SAME route through a per-request arena costs a small fraction of the global path — \
-    measured 80 B against 1,696 B, and un-threading any one call collapses the gap");
+    assert(per_defs_arena == 0,
+    "the SAME route through a per-request arena costs the global bump NOTHING — \
+    1,696 B to 384 B by threading the route, to 80 B by walking map slots instead \
+    of `map_keys`, to 0 B by threading the router underneath it");
 
     # The same, for `/api/v1/tools` — the most expensive route in the table,
     # and the one that does NOT reach near-zero. Measured 7,384 -> 1,696 bytes
@@ -757,39 +824,210 @@ fn _t_allocation_profile(): i64 {
     # allocator parameter, so nothing here can reach that. The ratio below is
     # deliberately looser than the definitions one for exactly that reason —
     # asserting near-zero would be asserting a thing that is not true.
-    agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, str_from("/api/v1/tools"),
-    str_from(""), 0, str_from(""));
-    reset_via(ar);
-
-    var b7 = alloc_used();
-    for (var q = 0; q < 64; q = q + 1) {
-        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, str_from("/api/v1/tools"),
-        str_from(""), 0, str_from(""));
-    }
-    var per_tools_global = (alloc_used() - b7) / 64;
-
-    var b8 = alloc_used();
-    for (var w = 0; w < 64; w = w + 1) {
-        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, str_from("/api/v1/tools"),
-        str_from(""), 0, str_from(""));
-        reset_via(ar);
-    }
-    var per_tools_arena = (alloc_used() - b8) / 64;
+    var tools_path = str_from("/api/v1/tools");
+    var per_tools_global = _t_per_request(s, tools_path, 0);
+    var per_tools_arena = _t_per_request(s, tools_path, ar);
 
     assert(per_tools_arena < per_tools_global,
     "the tools listing costs less through the arena than on the global bump");
-    # **3x, and the margin is measured rather than guessed.** With one echo tool
-    # registered: 1,768 B global against 368 B threaded (4.8x), and against
-    # 848 B with the route un-threaded (2.1x). A 2x threshold passed BOTH — the
-    # un-threaded case cleared it by 72 bytes — so it asserted nothing. 3x sits
-    # between the two measured ratios.
-    assert(per_tools_arena * 3 < per_tools_global,
-    "...by at least 3x — the schema tree and the registry vecs move to the arena; \
+    # **5x, and the margin is measured rather than guessed.** With one echo tool
+    # registered the arena arm is 288 B against 1,720 B global — 6.0x. A 2x
+    # threshold once passed BOTH the threaded and the un-threaded case and so
+    # asserted nothing; 3x replaced it, and the router bite bought enough
+    # headroom to tighten again. Everything left is the per-tool `schema_fp`.
+    assert(per_tools_arena * 5 < per_tools_global,
+    "...by at least 5x — the schema tree and the registry vecs move to the arena; \
     the per-tool schema_fp build cannot until the vtable takes an allocator");
+
+    # --- B2: the orchestrator group's four read routes --------------------
+    #
+    # `/api/v1/dashboard/crews`, `/api/v1/dashboard/agents`, `/api/v1/approvals`
+    # and `/api/v1/crews/{id}` — the last un-threaded reads in the table, and
+    # the first group whose handler half reaches **exactly zero**.
+    #
+    # Measured over `_t_state_populated` (8 finished crews each carrying agent
+    # metadata, 8 pending approvals), global against arena, bytes per request:
+    #
+    #     /api/v1/dashboard/agents   4,368 -> 32
+    #     /api/v1/dashboard/crews    4,160 -> 32
+    #     /api/v1/crews/{id}         2,368 -> 64
+    #     /api/v1/approvals            576 -> 32
+    #     /api/v1/crews/{unknown}      336 -> 64   (the 404 arm)
+    #
+    # **The 32 is not the handler.** `agnosai_route_resolve` mints the match
+    # struct on the global bump before dispatch reaches any arm, threaded or
+    # not, and `/api/v1/crews/{id}`'s extra 32 is the wildcard param Str the
+    # matcher stores. Nothing in these four handlers survives the arena — which
+    # is why the assertions below are absolute bounds rather than the ratios the
+    # two groups above use. A ratio cannot distinguish "the handler contributes
+    # nothing" from "the handler contributes a little", and at these magnitudes
+    # every un-threading mutation still clears a 4x ratio.
+    var ps = _t_state_populated();
+    var cid = vec_get(agnosai_orchestrator_crew_ids(
+    agnosai_app_state_orchestrator(ps)), 0);
+    var csb = str_builder_new();
+    str_builder_add_cstr(csb, "/api/v1/crews/");
+    str_builder_add_str(csb, cid);
+    var crew_path = str_builder_build(csb);
+
+    var p_hist_g = _t_per_request(ps, str_from("/api/v1/dashboard/crews"), 0);
+    var p_hist_a = _t_per_request(ps, str_from("/api/v1/dashboard/crews"), ar);
+    var p_perf_g = _t_per_request(ps, str_from("/api/v1/dashboard/agents"), 0);
+    var p_perf_a = _t_per_request(ps, str_from("/api/v1/dashboard/agents"), ar);
+    var p_pend_g = _t_per_request(ps, str_from("/api/v1/approvals"), 0);
+    var p_pend_a = _t_per_request(ps, str_from("/api/v1/approvals"), ar);
+    var p_crew_g = _t_per_request(ps, crew_path, 0);
+    var p_crew_a = _t_per_request(ps, crew_path, ar);
+
+    # **The 404 arm is measured too, not just its status.** A threaded route's
+    # error paths are separately threadable and separately forgettable: with the
+    # success path measured and the failure path only status-checked, reverting
+    # `route_error_a` to `route_error` inside `get_crew_a` passed the whole
+    # suite. It is also the arm an unauthenticated scan hits hardest, so it is
+    # the one least affordable as a per-request leak.
+    var p_404_g = _t_per_request(ps,
+    str_from("/api/v1/crews/00000000-0000-0000-0000-000000000000"), 0);
+    var p_404_a = _t_per_request(ps,
+    str_from("/api/v1/crews/00000000-0000-0000-0000-000000000000"), ar);
+
+    # The global arm still allocates in proportion to the answer — the oracle's
+    # shape, and what a caller dispatching without an arena gets.
+    assert(p_hist_g > 1024, "the crew history global path is the heaviest read route");
+    assert(p_perf_g > 128, "agent performance allocates per result walked");
+    assert(p_pend_g > 128, "the pending list allocates per pending id");
+    assert(p_crew_g > 512, "a single crew's state renders its whole result vec");
+
+    # **These are equalities, because the answer is exactly zero.** The bound
+    # used to be `agnosai_route_resolve`'s own cost, measured in the same run:
+    # the match struct was minted before dispatch reached any arm, so it was in
+    # both columns and no handler threading could remove it. Threading the
+    # router removed it, and five of these routes now charge the global bump
+    # **nothing at all** for a request served through an arena.
+    #
+    # An equality is also the strongest mutation detector available here. Every
+    # earlier form of this test was a bound with slack, and slack is what let
+    # three separate un-threadings pass: a route's 404 arm, a per-agent object
+    # build, and a single hoisted `str_from` worth 16 bytes. Against `== 0`
+    # there is no slack to hide in — un-threading *any* call in these handlers,
+    # or in the router beneath them, fails on the next line.
+    assert(p_hist_a == 0,
+    "crew history through the arena costs the global bump NOTHING — handler and \
+    router both");
+    assert(p_perf_a == 0, "...and so does agent performance");
+    assert(p_pend_a == 0, "...and the pending list");
+    assert(per_defs_arena == 0, "...and the definitions listing, asserted above");
+
+    # `agnosai_route_resolve` named directly on both arms, since it is what the
+    # four zeros above are actually asserting about.
+    var mpath = str_from("/api/v1/dashboard/crews");
+    var b9 = alloc_used();
+    for (var z = 0; z < 64; z = z + 1) {
+        agnosai_route_resolve(AGNOSAI_METHOD_GET, mpath);
+    }
+    var per_match = (alloc_used() - b9) / 64;
+    assert(per_match > 0,
+    "the router on the GLOBAL allocator still costs the match struct per call");
+
+    var b10 = alloc_used();
+    for (var y = 0; y < 64; y = y + 1) {
+        agnosai_route_resolve_a(ar, AGNOSAI_METHOD_GET, mpath);
+        reset_via(ar);
+    }
+    assert((alloc_used() - b10) / 64 == 0,
+    "...and nothing at all through an arena — the match struct and the parameter \
+    buffer both land in `a`");
+
+    # **A `{id}` path as well, because the four routes asserted at zero above
+    # are all parameterless.** `_agnosai_path_matches_at` only allocates when a
+    # `*` segment captures, so reverting that one `str_sub_a` to `str_sub`
+    # passed every other assertion in this file — the capture was never
+    # exercised by anything pinned at zero.
+    var ppath = str_from("/api/v1/crews/00000000-0000-0000-0000-000000000000");
+    assert(agnosai_route_match_param(agnosai_route_resolve_a(ar,
+    AGNOSAI_METHOD_GET, ppath)) != 0, "a {id} path really does capture");
+    reset_via(ar);
+
+    var b11 = alloc_used();
+    for (var x = 0; x < 64; x = x + 1) {
+        agnosai_route_resolve_a(ar, AGNOSAI_METHOD_GET, ppath);
+        reset_via(ar);
+    }
+    assert((alloc_used() - b11) / 64 == 0,
+    "...and the captured Str lands in `a` too");
+
+    # A `{id}` route is the one pair that is **not** zero, and the residual is
+    # not this tier's.
+    #
+    # `agnosai_uuid_parse` allocates a 16-byte buffer to hold the decoded UUID,
+    # and **every one of its five callers in `src/` throws that buffer away** —
+    # all five are `if (agnosai_uuid_parse(x) == 0)`, a validity test. So a
+    # request carrying an id pays 16 bytes of pure garbage, on the 404 arm as
+    # much as the 200 one. Bounded rather than pinned to 16 so an allocator
+    # whose rounding differs does not fail it; the point is that it is small,
+    # constant, and attributable.
+    assert(p_crew_a > 0, "a {id} route is not yet zero");
+    assert(p_crew_a < 64,
+    "...and what remains is `agnosai_uuid_parse`'s discarded 16-byte buffer, \
+    not anything the route or the router allocates");
+    assert(p_404_a == p_crew_a,
+    "the 404 arm pays exactly the same residual — it validates the id too");
+    assert(p_404_g > 0, "the unthreaded 404 arm allocates its error object per request");
+
+    # `/api/v1/tools` is the other, and its floor is structural — asserted in
+    # its own block above, where both arms are already measured.
+    assert(per_tools_arena > 0,
+    "the tools listing is the one read route that does NOT reach zero, and the \
+    reason is the tool vtable rather than anything this tier owns");
+
+    # Byte-identical wire on both arms, for each of the four.
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(
+    agnosai_route_crew_history(ps))), bayan_json_v_build(agnosai_route_body(
+    agnosai_route_crew_history_a(ar, ps)))) == 1, "crew history is byte-identical");
+    reset_via(ar);
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(
+    agnosai_route_agent_performance(ps))), bayan_json_v_build(agnosai_route_body(
+    agnosai_route_agent_performance_a(ar, ps)))) == 1, "agent performance likewise");
+    reset_via(ar);
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(
+    agnosai_route_list_pending(ps))), bayan_json_v_build(agnosai_route_body(
+    agnosai_route_list_pending_a(ar, ps)))) == 1, "the pending list likewise");
+    reset_via(ar);
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(
+    agnosai_route_get_crew(ps, cid))), bayan_json_v_build(agnosai_route_body(
+    agnosai_route_get_crew_a(ar, ps, cid)))) == 1, "and a single crew's state");
+    reset_via(ar);
+
+    # The failure arms too — `route_error_a` is the arm a scan hits, and it must
+    # answer the same status and body through either allocator.
+    var bad = str_from("not-a-uuid");
+    assert(agnosai_route_status(agnosai_route_get_crew_a(ar, ps, bad))
+    == AGNOSAI_HTTP_UNPROCESSABLE, "a malformed id is 422 through the arena too");
+    var missing = str_from("00000000-0000-0000-0000-000000000000");
+    assert(agnosai_route_status(agnosai_route_get_crew_a(ar, ps, missing))
+    == HTTP_NOT_FOUND, "...and an unknown one is 404");
+    var ea = agnosai_route_error_a(ar, HTTP_NOT_FOUND, str_from("gone"));
+    assert(agnosai_route_status(ea) == HTTP_NOT_FOUND, "route_error_a carries its status");
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(ea)),
+    bayan_json_v_build(agnosai_route_body(
+    agnosai_route_error(HTTP_NOT_FOUND, str_from("gone"))))) == 1,
+    "...and builds the oracle's {\"error\":..} either way");
+    reset_via(ar);
 
     # The `_a` forms named directly. Each is reached through `dispatch_a`, so
     # the behaviour is covered — but reference coverage counts the SYMBOL, and
     # an indirectly-used public fn reads as dead.
+    var ids_a = agnosai_orchestrator_crew_ids_a(ar,
+    agnosai_app_state_orchestrator(ps));
+    assert(vec_len(ids_a) == 8, "crew_ids_a slot-walks all eight through the arena");
+    var pend_a = agnosai_approval_gate_pending_tasks_a(ar,
+    agnosai_app_state_approval_gate(ps));
+    assert(vec_len(pend_a) == 8, "pending_tasks_a snapshots all eight through the arena");
+    assert(str_eq(_agnosai_route_status_debug_a(ar, AGNOSAI_CREW_COMPLETED),
+    str_from("Completed")) == 1, "status_debug_a keeps the Debug spelling");
+    assert(str_len(_agnosai_route_meta_str_a(ar, 0, str_from("agent"))) == 0,
+    "meta_str_a answers empty for absent metadata");
+    reset_via(ar);
+
     var d_a = agnosai_app_state_definitions_a(ar, s);
     assert(vec_len(d_a) >= 0, "definitions_a walks the map through the arena");
     var lr = agnosai_route_list_definitions_a(ar, s);

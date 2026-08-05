@@ -116,10 +116,21 @@ fn agnosai_route_is_text(r): i64 {
 
 # The oracle's error shape, which every failing handler returns:
 # `Json(json!({"error": "..."}))` alongside a status.
+fn agnosai_route_error_a(a, status, message: Str): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "error"),
+    bayan_json_v_str_new_a(a, message));
+    return agnosai_route_json_a(a, status, obj);
+}
+
+# Global-allocator form of `agnosai_route_error_a`.
+#
+# A threaded route's *failure* arms are per-request too. Leaving them bare would
+# put an object, a key, a value node and the response struct on the no-free
+# global bump for every 404 — which is the arm an unauthenticated scan hits
+# hardest, so it is the one least affordable as a leak.
 fn agnosai_route_error(status, message: Str): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("error"), bayan_json_v_str_new(message));
-    return agnosai_route_json(status, obj);
+    return agnosai_route_error_a(default_alloc(), status, message);
 }
 
 # --- Request validation ----------------------------------------------------

@@ -229,9 +229,9 @@ a single failure. Reference coverage counts whether a symbol is *named* by a
 test.
 
 **The whole tree is green, verified two ways on 2026-08-05.** `cyrius tests
-tests` completes and reports `65 passed, 0 failed` (suites, not assertions —
-see the counting note below). Building and running each `.tcyr` individually
-gives **4,553 assertions passed, 0 failed, 0 suites unclean**.
+tests` completes and reports `66 passed, 0 failed` (suites, not assertions —
+see the counting note below), summing to **5,403 assertions passed, 0 failed,
+0 suites unclean**.
 
 ⚠ **A note here previously said the full run "exceeds ~570 s and stalls in
 `server_sse`". It does not stall** — it completes, well inside a 25-minute
@@ -240,13 +240,16 @@ on its own. It *is* slow, so the per-suite loop is still the faster way to work:
 `cyrius build tests/<name>.tcyr <out> && <out>`. The eight sandbox suites total
 ~75 s that way.
 
-Coverage `cyrius coverage --min 80` → **100% (1050/1050 fns)**, 74/74 files
-referenced. The denominator counts public symbols only — `_`-prefixed internals
-are excluded by design, which is why adding six of them moved it by one.
+Coverage `./scripts/check-coverage.sh 80` → **100% (1074/1074 fns)**. The
+denominator counts public symbols only — `_`-prefixed internals are excluded by
+design, which is why adding six of them moved it by one. **`cyrius coverage
+--min 80` reads 99% and is wrong**; the corpus outgrew its buffer, see the
+warning below.
 
 ```sh
-cyrius tests tests        # 65 suites; each prints "N passed" with an "(N total)" suffix
-cyrius coverage --min 80  # its own CI step — `cyrius audit` does not run it
+cyrius tests tests          # 66 suites; each prints "N passed" with an "(N total)" suffix
+./scripts/check-coverage.sh 80   # the real gate — reads the whole corpus
+cyrius coverage --min 80    # its own CI step, but truncating on this tree
 ```
 
 **There is deliberately no per-suite table here any more.** One existed and it
@@ -255,11 +258,71 @@ caught it said to *regenerate from command output rather than editing rows by
 hand*. A table that can only be maintained by hand will drift again, so the two
 commands above are the authority. Counting gotcha if you sum by hand:
 `cyrius tests tests` prints one line **per suite** carrying an `(N total)` suffix,
-plus a final `65 passed, 0 failed` line that counts **suites, not assertions** —
+plus a final `66 passed, 0 failed` line that counts **suites, not assertions** —
 sum only the suffixed lines.
 
-Corpus size: **807 KB** of `tests/`, against the **1,048,575-byte** coverage cliff
-above which `--min` silently under-reports. ~77% consumed; watch it.
+### ⚠ The coverage corpus is over the 1 MiB buffer as of 2026-08-05
+
+**`tests/` holds 1,067,457 bytes of `.tcyr` against a 1,048,576-byte buffer — we
+are 18,881 bytes past it, and the reported 100% is luck rather than headroom.**
+
+`cbt/quality.cyr:59` allocates a fixed 1 MiB corpus and reads each `.tcyr` into
+whatever space is left; `if (n > 0)` makes a truncated read and a refused read
+indistinguishable, and neither is reported. **This is no longer hypothetical for
+this tree — see below.**
+
+Measured on this tree, padding one *unrelated* suite (`tests/order.tcyr`) with
+comment lines:
+
+| total `.tcyr` bytes | reported | gate |
+|---|---|---|
+| 1,053,976 | 100% (1073/1073) | OK, **exit 0** |
+| **1,067,457 (today)** | **99% (1072/1074)** — and both flagged files are fully covered | OK, **exit 0** |
+| 1,057,884 | 99% | OK, **exit 0** |
+| 1,113,884 | 94% | OK, **exit 0** |
+| 1,253,884 | 85% | OK, **exit 0** |
+| 1,376,773 | 85%, and 11 source files read as entirely unreferenced | OK, **exit 0** |
+
+The first casualty at 1,057,884 is a fn in `src/server/routes/approval.cyr` —
+a file with no relationship to `order.tcyr`. **Bytes added to one suite silently
+delete another suite's evidence**, because they compete for one buffer.
+
+**Filed upstream** as
+`2026-08-05-coverage-corpus-is-a-fixed-1-mib-buffer-and-silently-under-reports-past-it.md`
+(cyrius), with the root cause, the size table and three ordered fixes.
+
+### ⚠⚠ `cyrius coverage` is no longer evidence for this tree — use `scripts/check-coverage.sh`
+
+The corpus reached **1,067,457 bytes** on 2026-08-05 and the tool began
+under-reporting for real: it named `sandbox/python.cyr` (14/15) and
+`routes/approval.cyr` (2/3) as carrying unreferenced functions and printed 99%.
+**Every symbol in both is referenced by a test.** Nothing had regressed; the
+corpus no longer fit.
+
+`scripts/check-coverage.sh` computes the same thing with **no buffer** — same
+denominator (`^fn` in `src/**/*.cyr`, `_`-prefixed excluded), same definition of
+covered (the name appears anywhere in the corpus), so the two agree whenever the
+tool is able to answer. It reports **1074/1074 (100%)**.
+
+```sh
+./scripts/check-coverage.sh 80   # the real gate while the corpus is over
+cyrius coverage --min 80         # under-reports; keep for when upstream lands
+```
+
+`scripts/check-clean.sh` prints the overage as a **WARN** on every run rather
+than failing. Failing would leave a gate red permanently with no action
+available, which is how gates get ignored; what must not happen is the overage
+going unmentioned, because then the tool's percentage looks like evidence.
+
+**Splitting the corpus does not help.** `dir_walk` is recursive, so
+`tests/tcyr/*.tcyr` lands in the same buffer as `tests/*.tcyr`; and moving
+suites to a sibling directory removes their references from the corpus
+entirely, which makes the number *worse*. The only real fixes are the upstream
+one or a corpus under 1 MiB.
+
+The port plan's *"1 MiB corpus cliff"* hard constraint predicted this at
+`cyrius-port-plan.md:264` and estimated 0.7–1.2 MB. It landed at 1.05 MB — inside
+the predicted range, on the wrong side of the line.
 
 ### Test-design decisions worth not re-deriving
 
@@ -299,6 +362,29 @@ for arenas carries an `alloc_used()`-delta assertion (0 bytes over N iterations)
 plus a byte-identical-wire check against its global twin. Both are
 **mutation-verified** — un-threading a single call fails them. Treat that pair as
 the contract for any further threading work.
+
+**Four things that made an arena assertion look stronger than it was.** All four
+were caught by mutation, and all four generalise to any further threading:
+
+1. **An empty fixture cannot tell a threaded route from an un-threaded one.** An
+   empty collection allocates almost nothing either way. `/api/v1/dashboard/agents`
+   is the sharp case: it emits an object only for a result whose metadata *names*
+   an agent, so a fixture of eight crews with no agent metadata renders `[]` and
+   times its guard.
+2. **A route's failure arms are separately threadable and separately
+   forgettable.** Measuring only the success path let `route_error_a` revert to
+   `route_error` inside `agnosai_route_get_crew_a` with the whole suite green.
+   The 404 is also the arm an unauthenticated scan hits hardest.
+3. **Round-number thresholds assert less than they look like they do.** 128 B sat
+   above a 32 B baseline and below the 176 B of the smallest un-threading
+   mutation — and still passed one, because a single hoisted `str_from` costs
+   16 B and lands at 48. Prefer a bound **measured in the same run**:
+   `agnosai_route_resolve`'s own cost is what the arena path should equal, so
+   asserting against it is self-calibrating across allocator changes.
+4. **Ratios stop discriminating once the numerator is near zero.** At 4,160 → 32
+   every plausible mutation still clears 4x. Absolute equality against a measured
+   residual is the stronger statement and the one that is actually true: the
+   handler half is zero, not merely small.
 
 ### Harness rules
 
@@ -523,9 +609,92 @@ blocking `chan_send` there would have wedged the crew instead.
 the expected shape — hierarchical mode ranks every task independently, with no memoisation
 across tasks. That is the oracle's behaviour and the reason the cost is linear in tasks × agents.
 
+`benches/server.bcyr` — the HTTP request path, added 2026-08-05. No oracle bench
+file exists: the Rust request path is axum's, and timing it would have measured
+tokio. The port's is `agnosai_route_dispatch`, ordinary synchronous code.
+
+Each threaded read route is timed on **both** arms, because threading is not free
+by construction — every `_a` call carries an extra argument and `alloc_via` is one
+indirection past `alloc`. The paired rows are what makes "the arena bought the
+memory without costing latency" a measurement rather than an assertion. Fixture:
+8 finished crews carrying agent metadata, 8 pending approvals, 1 definition, 1
+registered tool. `reset_via` is **inside** the timed loop, since a sandhi worker
+pays it per request.
+
+| Benchmark | global | arena | Δ |
+|---|---|---|---|
+| `route_approvals_*` | 2.147 µs | **1.861 µs** | −13.3% |
+| `route_tools_*` | 3.124 µs | **2.344 µs** | −25.0% |
+| `route_definitions_*` | 3.356 µs | **2.529 µs** | −24.6% |
+| `route_get_crew_*` | 5.178 µs | **3.821 µs** | −26.2% |
+| `route_dashboard_crews_*` | 13.266 µs | **10.956 µs** | −17.4% |
+| `route_dashboard_agents_*` | 16.452 µs | **14.048 µs** | −14.6% |
+| `route_resolve` | 343 ns | — | in both |
+
+The arena arm wins on all six because the global allocator is a **no-free bump**:
+a request's garbage is never reclaimed, so a long-lived process walks an
+ever-growing heap and loses the locality a reset arena keeps.
+
+The other half of the same claim is memory, asserted rather than benchmarked —
+`tests/server_serve.tcyr` measures it over the same fixture, bytes charged to the
+global bump per request:
+
+| Route | global | arena |
+|---|---|---|
+| `GET /api/v1/dashboard/agents` | 4,368 | **0** |
+| `GET /api/v1/dashboard/crews` | 4,160 | **0** |
+| `GET /api/v1/crews/{id}` | 2,368 | **16** |
+| `GET /api/v1/tools` | 1,720 | **288** |
+| `GET /api/v1/approvals` | 576 | **0** |
+| `GET /api/v1/agents/definitions` | 384 | **0** |
+| `GET /api/v1/crews/{unknown}` (404) | 336 | **16** |
+
+**Four routes charge the global bump literally nothing.** Handler, router and
+response struct all land in the arena and are freed by one `reset_via`. Two
+residuals remain and neither belongs to the routes tier:
+
+- **16 B on any `{id}` route — `agnosai_uuid_parse`.** It allocates a 16-byte
+  buffer for the decoded UUID, and **all five callers in `src/` discard it**:
+  every one is `if (agnosai_uuid_parse(x) == 0)`, a validity test
+  (`routes/crews.cyr` ×2, `routes/approval.cyr`, `serve.cyr`). A request
+  carrying an id pays it on the 404 arm as much as the 200 one. The fix is an
+  allocation-free validator — the bytes are never wanted at any call site — but
+  it is `src/id.cyr`, so it is owed rather than done.
+- **288 B on `/api/v1/tools`** — `agnosai_tool_schema` calls the tool's own
+  `schema_fp`, and the tool vtable has no allocator parameter, so nothing in the
+  routes or registry tier can reach it. Structural.
+
+**`route_resolve` was 1.675 µs — 57% of the cheapest threaded request — and its
+32 B was 100% of that route's remaining allocation. Both are fixed.**
+
+The table was a flat list of sixteen patterns, each matched from byte 0, so
+`/api/v1/dashboard/crews` matched on attempt sixteen having re-compared `api`
+and `v1` twelve times. `/api/v1` is now consumed once and the following segment
+selects a group of at most four patterns: **1.675 µs → 343 ns (−79%)**, and
+`agnosai_route_resolve_a` puts the match struct, the parameter buffer and any
+captured Str in the arena. `/api/v1/approvals` fell 2.947 → 1.861 µs, the
+largest proportional gain, because resolve was most of it.
+
+**The restructure is a filter, not a decision**, and that is the safety
+argument: `_agnosai_seg_is` and `_agnosai_path_prefix_end` choose which patterns
+are *tried*, while what a trial *answers* is still a full pattern comparison. So
+neither selector can route a request somewhere it does not belong. This is
+verified rather than argued — `_t_resolve_is_equivalent` holds the resolver
+against the flat sixteen-attempt table it replaced, kept verbatim in
+`tests/server_router.tcyr`, across 56 paths × 4 methods on id, captured
+parameter and the 405-vs-404 flag. **Making `_agnosai_seg_is` a bare prefix test
+changes no answer it produces**, because the resolver degenerates back into the
+flat table; the two selectors therefore carry their own unit assertions, since
+what they protect is the cost and the differential cannot see cost.
+
+Not threaded, and not claimed to be: the write routes (`POST /api/v1/crews`,
+`/api/v1/agents/definitions`, `/api/v1/approvals`, `/api/v1/a2a`, `/mcp`), which
+parse a request body — the other half of the problem — and the orchestrator
+group's off-request-path modules, `crew_runner` foremost.
+
 **Not comparable to `rust-old/bench-history.csv`** — different allocator, different harness, no
 criterion statistics. The Cyrius line starts its own baseline, captured by
-`scripts/bench-history.sh` into the root `bench-history.csv` (65 rows per capture).
+`scripts/bench-history.sh` into the root `bench-history.csv` (85 rows per capture).
 
 ## Dependencies
 
@@ -681,13 +850,13 @@ libro 2.8.4 arrives transitively via bote.
 
 | | |
 |---|---|
-| Cyrius port | **20,739 lines**, 72 files, `src/` mirroring `rust-old/src/` |
+| Cyrius port | **24,694 lines**, 82 files, `src/` mirroring `rust-old/src/` |
 | Rust oracle | 27,683 lines at `rust-old/` — frozen |
 | Milestones | **M0–M6 complete** — the server tier is done and the binary serves |
 | Remaining in M6 | nothing — bites 15c (SSE) and 16 (bind) both closed 2026-08-03 |
 | In progress | **M7 `sandbox`** — all eight modules ported; the 2026-08-04 audit's 43 findings all fixed 2026-08-05 |
 | Not started | M8 `fleet`, M9 `telemetry`, M10 `definitions` |
-| Gates | build OK · 1,656 symbols / 81 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · coverage 100% (1050/1050) |
+| Gates | build OK · 1,697 symbols / 82 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot·corpus-warn clean · coverage **100% (1074/1074) via `scripts/check-coverage.sh`** — `cyrius coverage` reads 99% and is truncating |
 
 **The binary serves as of 2026-08-03**, and **drains on SIGINT/SIGTERM** as of
 the 6.5.6 bump the same day. `src/main.cyr` wires the state, installs a

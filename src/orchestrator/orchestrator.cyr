@@ -120,12 +120,28 @@ fn agnosai_orchestrator_crew(o, crew_id: Str): i64 {
 # calls answers 0 and the caller skips it — which is the behaviour a read guard
 # would have prevented, and is worth less than the contention it costs.
 # Added for `routes/dashboard.rs`, its only consumer today.
-fn agnosai_orchestrator_crew_ids(o): i64 {
+fn agnosai_orchestrator_crew_ids_a(a, o): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
-    var ids = map_keys(load64(o + AGN_OR_CREWS));
+    var m = load64(o + AGN_OR_CREWS);
+    var ids = vec_new_a(a);
+    var n = _agnosai_map_slots(m);
+    for (var i = 0; i < n; i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            vec_push_a(a, ids, _agnosai_map_slot_key(m, i));
+        }
+    }
     mutex_unlock(mtx);
     return ids;
+}
+
+# Global-allocator form of `agnosai_orchestrator_crew_ids_a`.
+#
+# Slot-walked rather than `map_keys` (standing rule 5), which is what lets the
+# dashboard routes' id snapshot land in the request arena. Both dashboard
+# handlers take this snapshot on every call.
+fn agnosai_orchestrator_crew_ids(o): i64 {
+    return agnosai_orchestrator_crew_ids_a(default_alloc(), o);
 }
 
 # How many crews the registry holds.

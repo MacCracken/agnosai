@@ -1,0 +1,226 @@
+# =========================================================================
+# server.bcyr — benchmarks for the HTTP request path.
+#
+# No oracle bench file: `rust-old/benches/` has no server harness, because the
+# Rust request path is axum's and benchmarking it would have measured tokio.
+# The port's path is `agnosai_route_dispatch`, which is ordinary synchronous
+# code, so it can be timed directly.
+#
+# ## What these exist to prove
+#
+# B2 threads the per-request arena through the read routes, and
+# `tests/server_serve.tcyr` proves the **memory** claim — dispatch through
+# `dispatch_a` charges the global bump nothing beyond the router's match
+# struct. That measurement says nothing about **time**, and threading is not
+# free by construction: every `_a` call carries an extra argument, and
+# `alloc_via` is one indirection more than `alloc`.
+#
+# So each threaded route is timed on both arms. The paired rows are the claim:
+# threading buys the memory without costing latency. A regression in either
+# direction shows up as one row moving against the other.
+#
+# ## Why the global arm is the slower one anyway
+#
+# The global allocator is a no-free bump: a request's garbage is never
+# reclaimed, so a long-lived process walks an ever-growing heap and loses cache
+# locality that the arena — reset to its base between requests — keeps. The
+# arena arm pays one `reset_via` per iteration, which is a pointer store.
+#
+# `route_resolve` is timed on its own because it is the residual: the match
+# struct is minted before dispatch reaches any arm, so it is in **both** numbers
+# and neither route threading nor any further handler work can remove it.
+#
+# These are CYRIUS baseline numbers, NOT comparable to
+# rust-old/bench-history.csv. See CLAUDE.md.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/learning/mod.cyr"
+include "src/llm/mod.cyr"
+include "src/server/ssrf.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/server/prometheus.cyr"
+include "src/server/auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/tools/mod.cyr"
+include "src/orchestrator/mod.cyr"
+include "src/server/state.cyr"
+include "src/server/routes/mod.cyr"
+include "src/server/routes/health.cyr"
+include "src/server/routes/tools.cyr"
+include "src/server/routes/agents.cyr"
+include "src/server/routes/approval.cyr"
+include "src/server/routes/dashboard.cyr"
+include "src/server/routes/crews.cyr"
+include "src/server/routes/a2a.cyr"
+include "src/server/routes/mcp.cyr"
+include "src/server/routes/sse.cyr"
+include "src/server/hot_config.cyr"
+include "src/server/rate_limit.cyr"
+include "src/server/router.cyr"
+
+# How many crews, pending approvals and agent definitions the fixture carries.
+#
+# **Eight, not one.** Three of the four routes below render one object per
+# registered crew, so a single-crew fixture would time the loop's setup rather
+# than its body — and the arena's advantage is proportional to what a request
+# builds. Eight is enough for the shape to show and small enough that the
+# global arm does not exhaust the bump over 20,000 iterations.
+var AGN_B_FIXTURE_N = 8;
+
+# The application state every benchmark below dispatches against: eight finished
+# crews carrying agent metadata, eight pending approvals, one agent definition,
+# one registered tool.
+fn _b_state(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_echo_tool());
+    var s = agnosai_app_state_new(o, reg, agnosai_auth_config_new(),
+    agnosai_event_bus_new(), agnosai_audit_chain_new(), agnosai_approval_gate_new());
+
+    for (var i = 0; i < AGN_B_FIXTURE_N; i = i + 1) {
+        var spec = agnosai_crew_new(str_from("bench"));
+        var tasks = vec_new();
+        vec_push(tasks, agnosai_task_new(str_from("do the thing")));
+        agnosai_crew_with_tasks(spec, tasks);
+        agnosai_orchestrator_run_crew(o, spec);
+
+        # `dashboard/agents` only emits an object for a result whose metadata
+        # names an agent. Without this the route renders `[]` over eight crews
+        # and times its guard, not its body.
+        var st = agnosai_orchestrator_crew(o, agnosai_crew_id(spec));
+        var r = agnosai_task_result_new(agnosai_uuid_v4_str(), str_from("out"),
+        AGNOSAI_STATUS_COMPLETED);
+        var ksb = str_builder_new();
+        str_builder_add_cstr(ksb, "agent-");
+        str_builder_add_int(ksb, i);
+        agnosai_task_result_with_metadata(r, str_from("agent"),
+        bayan_json_v_str_new(str_builder_build(ksb)));
+        agnosai_task_result_with_metadata(r, str_from("agent_name"),
+        bayan_json_v_str_new(str_from("The Agent")));
+        agnosai_task_result_with_metadata(r, str_from("agent_role"),
+        bayan_json_v_str_new(str_from("writer")));
+        agnosai_crew_state_with_result(st, r);
+
+        var tsb = str_builder_new();
+        str_builder_add_cstr(tsb, "task-");
+        str_builder_add_int(tsb, i);
+        agnosai_approval_request(agnosai_app_state_approval_gate(s),
+        str_builder_build(tsb));
+    }
+
+    agnosai_app_state_definition_insert(s, str_from("researcher"),
+    agnosai_agent_new(str_from("researcher"), str_from("Researcher"),
+    str_from("research things")));
+    return s;
+}
+
+# Time `n` dispatches of `path` on the **global** allocator — the un-threaded
+# arm, and what a caller outside a sandhi worker still gets.
+fn _b_dispatch_global(s, name, path: Str, n): i64 {
+    var empty = str_from("");
+    agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Time `n` dispatches of `path` through a per-request arena, reset between each
+# — the path a sandhi worker takes.
+#
+# The `reset_via` is **inside** the timed loop on purpose: it is work sandhi
+# does per request, so excluding it would flatter the arena arm by hiding its
+# only per-request cost.
+fn _b_dispatch_arena(s, name, path: Str, n): i64 {
+    var empty = str_from("");
+    var ar = arena_allocator(1048576);
+    agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
+    reset_via(ar);
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
+        reset_via(ar);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The router's own cost, in both arms and removable from neither.
+fn _b_resolve(): i64 {
+    var n = 200000;
+    var path = str_from("/api/v1/dashboard/crews");
+    var b = bench_new("route_resolve");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_route_resolve(AGNOSAI_METHOD_GET, path);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    # Every route logs on at least one path, and `crew_runner` emits per task.
+    # Left at the default level these would time sakshi writing to a pipe.
+    sakshi_set_level(SK_FATAL);
+
+    var s = _b_state();
+    # The crew id has to come from the registry — `/api/v1/crews/{id}` rejects a
+    # non-UUID at 422 without ever reaching the handler being measured.
+    var cid = vec_get(agnosai_orchestrator_crew_ids(
+    agnosai_app_state_orchestrator(s)), 0);
+    var csb = str_builder_new();
+    str_builder_add_cstr(csb, "/api/v1/crews/");
+    str_builder_add_str(csb, cid);
+    var crew_path = str_builder_build(csb);
+
+    _b_resolve();
+
+    # The B2 orchestrator group — the four routes threaded last.
+    _b_dispatch_global(s, "route_dashboard_crews_global",
+    str_from("/api/v1/dashboard/crews"), 20000);
+    _b_dispatch_arena(s, "route_dashboard_crews_arena",
+    str_from("/api/v1/dashboard/crews"), 20000);
+    _b_dispatch_global(s, "route_dashboard_agents_global",
+    str_from("/api/v1/dashboard/agents"), 20000);
+    _b_dispatch_arena(s, "route_dashboard_agents_arena",
+    str_from("/api/v1/dashboard/agents"), 20000);
+    _b_dispatch_global(s, "route_approvals_global",
+    str_from("/api/v1/approvals"), 50000);
+    _b_dispatch_arena(s, "route_approvals_arena",
+    str_from("/api/v1/approvals"), 50000);
+    _b_dispatch_global(s, "route_get_crew_global", crew_path, 20000);
+    _b_dispatch_arena(s, "route_get_crew_arena", crew_path, 20000);
+
+    # The two groups threaded before it, which shipped with allocation numbers
+    # and no timing. Back-filled here so all six threaded routes carry both.
+    _b_dispatch_global(s, "route_definitions_global",
+    str_from("/api/v1/agents/definitions"), 50000);
+    _b_dispatch_arena(s, "route_definitions_arena",
+    str_from("/api/v1/agents/definitions"), 50000);
+    _b_dispatch_global(s, "route_tools_global", str_from("/api/v1/tools"), 20000);
+    _b_dispatch_arena(s, "route_tools_arena", str_from("/api/v1/tools"), 20000);
+
+    return 0;
+}
+
+var r = main();
+syscall(60, r);

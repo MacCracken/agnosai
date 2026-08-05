@@ -546,16 +546,25 @@ fn _agnosai_route_crew_warn(name: Str, err: Str): i64 {
 # The oracle's `Path<Uuid>` extractor rejects a malformed id before the handler
 # runs, so an unparseable id is **422**, not 404 — the same extractor-owns-the-
 # status situation `agents.rs` and `approval.rs` have.
-fn agnosai_route_get_crew(state, id: Str): i64 {
+fn agnosai_route_get_crew_a(a, state, id: Str): i64 {
     if (agnosai_uuid_parse(id) == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("crew id is not a valid UUID"));
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "crew id is not a valid UUID"));
     }
     var c = agnosai_orchestrator_crew(agnosai_app_state_orchestrator(state), id);
     if (c == 0) {
-        return agnosai_route_error(HTTP_NOT_FOUND, str_from("crew not found"));
+        return agnosai_route_error_a(a, HTTP_NOT_FOUND, str_from_a(a, "crew not found"));
     }
-    return agnosai_route_json(HTTP_OK, agnosai_crew_state_to_value(c));
+    return agnosai_route_json_a(a, HTTP_OK, agnosai_crew_state_to_value_a(a, c));
+}
+
+# Global-allocator form of `agnosai_route_get_crew_a`.
+#
+# The only *single-entity* read route threaded so far, and the one whose body
+# grows with the crew rather than with the registry:
+# `agnosai_crew_state_to_value` renders every task result the crew accumulated.
+fn agnosai_route_get_crew(state, id: Str): i64 {
+    return agnosai_route_get_crew_a(default_alloc(), state, id);
 }
 
 # `POST /api/v1/crews/{id}/cancel` — cancel a running crew.

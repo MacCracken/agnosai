@@ -138,8 +138,41 @@ else
     fail=1
 fi
 
+# --- The coverage corpus fits the tool's buffer ---------------------------
+#
+# `cyrius coverage` concatenates every `.tcyr` under `tests/` into a **fixed
+# 1,048,576-byte** buffer (`cbt/quality.cyr:59`) and substring-searches it. Files
+# that do not fit are truncated or dropped, and `if (n > 0)` makes a short read
+# indistinguishable from a refused one — so past the cap the tool under-reports
+# with no diagnostic and **exit 0**. Measured on this tree: 100% at 1,053,976
+# bytes, 99% at 1,057,884, 85% at 1,253,884, every step reporting success.
+#
+# That is a gate reporting a number it knows is incomplete, so this makes it
+# loud. A failure here does NOT mean coverage dropped — it means the coverage
+# figure is no longer evidence either way, and must be established another way
+# until the corpus fits again.
+#
+# Filed upstream as
+# 2026-08-05-coverage-corpus-is-a-fixed-1-mib-buffer-and-silently-under-reports-past-it.md
+_corpus=$(find tests -name '*.tcyr' -exec stat -c%s {} + | awk '{s+=$1} END {print s+0}')
+_cap=1048575
+echo "coverage corpus: $_corpus bytes (cap $_cap)"
+if [ "$_corpus" -gt "$_cap" ]; then
+    # **A warning, not a failure, and only because `scripts/check-coverage.sh`
+    # covers what the tool cannot.** The overage is real and permanent until
+    # upstream fixes the buffer, so failing here would leave a gate red forever
+    # with no action available — which is how gates get ignored. What must not
+    # happen is the overage going unmentioned, because then `cyrius coverage`'s
+    # percentage looks like evidence.
+    echo "  WARN coverage corpus: $_corpus bytes exceeds the tool's $_cap-byte"
+    echo "       buffer by $((_corpus - _cap)) — \`cyrius coverage\` is truncating and its"
+    echo "       percentage is NOT evidence. Use scripts/check-coverage.sh, which"
+    echo "       reads the whole corpus. See the upstream filing named above."
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "cleanliness check FAILED"
     exit 1
 fi
-echo "cleanliness check OK — fmt, lint, doc, vet, deny, deps --verify, lib snapshot all clean"
+echo "cleanliness check OK — fmt, lint, doc, vet, deny, deps --verify, lib snapshot, \
+coverage corpus all clean"

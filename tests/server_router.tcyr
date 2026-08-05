@@ -398,6 +398,298 @@ fn _t_matching_is_allocation_free(): i64 {
     return 0;
 }
 
+# --- The flat table, kept as a differential oracle -----------------------
+
+# **The sixteen-attempt table the router used before it was split into groups**,
+# reproduced here verbatim and in its original order.
+#
+# It exists to be disagreed with. The two-level resolver is a pure performance
+# change on the port's most security-sensitive decision —
+# `agnosai_route_needs_auth` keys off the id this returns, so a path that lands
+# in the wrong group, or lands nowhere, changes who may reach a handler. That is
+# not a thing to verify by reading; `_t_resolve_is_equivalent` runs both over a
+# generated corpus and requires they agree on **id, param and the 405-vs-404
+# flag**, for every path, under every method.
+#
+# It lives in the test rather than in `src/` deliberately. A route added to the
+# real table and not to this one fails the differential immediately, which is
+# the right forcing function — the alternative is a reference that silently
+# stops covering what it claims to.
+fn _t_resolve_flat(method, path: Str): i64 {
+    var param = alloc(8);
+    var seen = 0;
+
+    if (_agnosai_path_matches(path, "/health", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) { return _agnosai_rm_new(AGN_ROUTE_HEALTH, 0, 0); }
+    }
+    if (_agnosai_path_matches(path, "/ready", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) { return _agnosai_rm_new(AGN_ROUTE_READY, 0, 0); }
+    }
+    if (_agnosai_path_matches(path, "/metrics", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) { return _agnosai_rm_new(AGN_ROUTE_METRICS, 0, 0); }
+    }
+    if (_agnosai_path_matches(path, "/mcp", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_POST) { return _agnosai_rm_new(AGN_ROUTE_MCP, 0, 0); }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/crews", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_CREATE_CREW, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/crews/*", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_GET_CREW, load64(param), 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/crews/*/cancel", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_CANCEL_CREW, load64(param), 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/crews/*/stream", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_CREW_STREAM, load64(param), 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/a2a/receive", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_A2A_RECEIVE, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/a2a/status", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_A2A_STATUS, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/agents/definitions", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_LIST_DEFINITIONS, 0, 0);
+        }
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_CREATE_DEFINITION, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/tools", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_LIST_TOOLS, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/tools/*", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_DELETE) {
+            return _agnosai_rm_new(AGN_ROUTE_REMOVE_TOOL, load64(param), 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/approvals", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_LIST_PENDING, 0, 0);
+        }
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new(AGN_ROUTE_SUBMIT_APPROVAL, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/presets", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_LIST_PRESETS, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/dashboard/crews", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_CREW_HISTORY, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches(path, "/api/v1/dashboard/agents", param) == 1) {
+        seen = 1;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new(AGN_ROUTE_AGENT_PERFORMANCE, 0, 0);
+        }
+    }
+
+    if (seen == 1) { return _agnosai_rm_new(AGN_ROUTE_NONE, 0, 1); }
+    return _agnosai_rm_new(AGN_ROUTE_NONE, 0, 0);
+}
+
+# Assert both resolvers agree on `path` under all four method values.
+#
+# **Method 0 is included.** `_agnosai_serve_method` answers 0 for any verb the
+# table does not map — PUT, PATCH, a lowercase `get`, an unparsed line — and
+# that value reaches the resolver, where it must produce 405 on a known path
+# rather than matching something. Testing only the three real methods would
+# leave the arm every unmapped verb takes unchecked on both sides.
+fn _t_same(path): i64 {
+    var s = str_from(path);
+    for (var m = 0; m <= 3; m = m + 1) {
+        var want = _t_resolve_flat(m, s);
+        var got = agnosai_route_resolve(m, s);
+        assert(agnosai_route_match_id(got) == agnosai_route_match_id(want),
+        "grouped and flat resolvers agree on the route id");
+        assert(agnosai_route_match_method_mismatch(got)
+        == agnosai_route_match_method_mismatch(want),
+        "...and on 405-vs-404");
+        var pw = agnosai_route_match_param(want);
+        var pg = agnosai_route_match_param(got);
+        if (pw == 0) {
+            assert(pg == 0, "...and neither captures a parameter");
+        } else {
+            assert(pg != 0, "...or both do");
+            assert(str_eq(pg, pw) == 1, "...with the same captured value");
+        }
+    }
+    return 0;
+}
+
+# Every path in the table, every near-miss that could cross a group boundary,
+# and the shapes that make the split's assumptions load-bearing.
+fn _t_resolve_is_equivalent(): i64 {
+    # Every registered path, and each parameterised one with a real value.
+    _t_same("/health");
+    _t_same("/ready");
+    _t_same("/metrics");
+    _t_same("/mcp");
+    _t_same("/api/v1/crews");
+    _t_same("/api/v1/crews/abc");
+    _t_same("/api/v1/crews/abc/cancel");
+    _t_same("/api/v1/crews/abc/stream");
+    _t_same("/api/v1/a2a/receive");
+    _t_same("/api/v1/a2a/status");
+    _t_same("/api/v1/agents/definitions");
+    _t_same("/api/v1/tools");
+    _t_same("/api/v1/tools/echo");
+    _t_same("/api/v1/approvals");
+    _t_same("/api/v1/presets");
+    _t_same("/api/v1/dashboard/crews");
+    _t_same("/api/v1/dashboard/agents");
+
+    # A parameter that spells another route's segment, in both positions.
+    _t_same("/api/v1/crews/cancel");
+    _t_same("/api/v1/crews/stream");
+    _t_same("/api/v1/crews/crews");
+    _t_same("/api/v1/tools/tools");
+    _t_same("/api/v1/crews/dashboard/cancel");
+
+    # **The group selector's exactness.** Each of these differs from a group
+    # name by one byte or one boundary, and each would be routed into that
+    # group by a prefix test rather than a segment test.
+    _t_same("/api/v1/crewsX");
+    _t_same("/api/v1/crews2/abc");
+    _t_same("/api/v1/crew");
+    _t_same("/api/v1/toolsy");
+    _t_same("/api/v1/dashboardz/crews");
+    _t_same("/api/v1/agentsz/definitions");
+    _t_same("/api/v1/a2ab/status");
+    _t_same("/api/v1/approvalsx");
+    _t_same("/api/v1/presetsx");
+
+    # **The prefix's exactness.** `/api/v1` must end on a segment boundary or
+    # `/api/v1x/tools` would resolve as `/api/v1/tools`.
+    _t_same("/api/v1x/tools");
+    # **No separator at all after the prefix.** The shape the boundary check's
+    # header claims still 404s without it: a loose `_agnosai_path_prefix_end`
+    # returns 7 here, `_agnosai_seg_is` reads from 8 and sees `tools`, so the
+    # group IS entered — and `/tools` then fails to match the segment `Xtools`,
+    # because the matcher does not skip a byte that is not a separator. Asserted
+    # rather than reasoned, for each group whose name could be spelled this way.
+    _t_same("/api/v1Xtools");
+    _t_same("/api/v1Xcrews");
+    _t_same("/api/v1Xapprovals");
+    _t_same("/api/v1Xdashboard/crews");
+    _t_same("/api/v1Xcrews/abc/cancel");
+    _t_same("/api/v1");
+    _t_same("/api/v1/");
+    _t_same("/api");
+    _t_same("/api/");
+    _t_same("/api/v2/tools");
+    _t_same("/api/v/tools");
+    _t_same("/apiv1/tools");
+    _t_same("/xapi/v1/tools");
+
+    # Empty segments, trailing slashes and doubled separators — the cases the
+    # matcher's `has` bookkeeping exists for, now crossing a group boundary.
+    _t_same("");
+    _t_same("/");
+    _t_same("//");
+    _t_same("/health/");
+    _t_same("/api/v1/tools/");
+    _t_same("/api/v1//tools");
+    _t_same("/api/v1/crews//cancel");
+    _t_same("/api/v1/crews/a/b/cancel");
+    _t_same("/api/v1/crews/abc/cancel/extra");
+    _t_same("/api/v1/dashboard");
+    _t_same("/api/v1/dashboard/");
+    _t_same("/api/v1/dashboard/crews/extra");
+
+    # Nothing near the table at all.
+    _t_same("/zzz");
+    _t_same("/no/such/path/here");
+    _t_same("/api/v1/nonesuch");
+    _t_same("/api/v1/nonesuch/deeper");
+    return 0;
+}
+
+# --- The two selectors, pinned directly ---------------------------------
+
+# **What `_t_resolve_is_equivalent` cannot see.** Both selectors are filters:
+# they choose which patterns get tried, and `_agnosai_path_matches_at` still
+# decides what a trial answers. So a *loose* selector costs time without
+# changing a route — making `_agnosai_seg_is` a bare prefix test degenerates
+# the resolver back into the flat table it replaced and produces identical
+# answers, and dropping the boundary check in `_agnosai_path_prefix_end` still
+# 404s `/api/v1Xtools`, because `/tools` will not match `Xtools`.
+#
+# That is the safety property, and it is why the differential test passes under
+# both mutations rather than a gap in it. But it means the differential cannot
+# pin the **cost**, which is the entire reason the two-level structure exists.
+# These assertions do that instead.
+fn _t_selectors_are_exact(): i64 {
+    var p = str_from("/api/v1/crews/abc");
+
+    # `/api/v1` ends at the `/` before `crews`.
+    assert(_agnosai_path_prefix_end(p, "/api/v1") == 7,
+    "the prefix ends at the separator that begins the remainder");
+    assert(_agnosai_path_prefix_end(str_from("/api/v1"), "/api/v1") == 0 - 1,
+    "the bare prefix has no remainder");
+    assert(_agnosai_path_prefix_end(str_from("/api/v1x/tools"), "/api/v1") == 0 - 1,
+    "the prefix must end on a segment boundary — otherwise every /api/v1* path \
+    enters the group scan and pays for it");
+    assert(_agnosai_path_prefix_end(str_from("/api/v2/tools"), "/api/v1") == 0 - 1,
+    "a differing byte inside the prefix is not the prefix");
+    assert(_agnosai_path_prefix_end(str_from("/api"), "/api/v1") == 0 - 1,
+    "a path shorter than the prefix is not the prefix");
+    assert(_agnosai_path_prefix_end(str_from("/api/v1/"), "/api/v1") == 7,
+    "a trailing separator IS a remainder — one empty segment, which matches \
+    nothing and 404s");
+
+    # The group selector matches a whole segment, never a prefix of one.
+    assert(_agnosai_seg_is(p, 7, "crews") == 1, "the segment is crews");
+    assert(_agnosai_seg_is(p, 7, "crew") == 0, "...not a prefix of it");
+    assert(_agnosai_seg_is(p, 7, "crewss") == 0, "...nor an extension of it");
+    assert(_agnosai_seg_is(str_from("/api/v1/crewsX"), 7, "crews") == 0,
+    "a longer segment is a different segment — a prefix test here would drag \
+    every /api/v1/crews* path through all four crews patterns");
+    assert(_agnosai_seg_is(str_from("/api/v1/crews"), 7, "crews") == 1,
+    "a segment at the end of the path still matches");
+    assert(_agnosai_seg_is(str_from("/api/v1/"), 7, "crews") == 0,
+    "an empty segment matches no group");
+    assert(_agnosai_seg_is(str_from("/api/v1/dashboard/crews"), 7, "dashboard") == 1,
+    "and the selector reads only its own segment, not what follows");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -415,6 +707,8 @@ fn main(): i64 {
     _t_stream_is_501_not_404();
     _t_partial_segments_do_not_match();
     _t_matching_is_allocation_free();
+    _t_resolve_is_equivalent();
+    _t_selectors_are_exact();
 
     return assert_summary();
 }

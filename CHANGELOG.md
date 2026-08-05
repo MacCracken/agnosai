@@ -236,6 +236,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spawn 144 → **169**, process 108 → **130**, python 61 → **76**, manager 69 →
   **90**, cx 62 → **87**. **627 → 727 assertions**, all green, coverage 100%.
 
+- **state.md said the test corpus was at 77% of the coverage tool's 1 MiB limit.
+  It is at 100.5%, and has been since this session's own test additions.** The
+  figure was stale, the limit is real, and crossing it is silent.
+
+  `cbt/quality.cyr:59` reads every `.tcyr` into a fixed **1,048,576-byte**
+  buffer; `if (n > 0)` makes a truncated read and a refused read the same thing,
+  and neither is reported.
+
+  **`tests/` is 1,067,457 bytes — 18,881 past the buffer, and it is no longer
+  hypothetical.** The tool now reports **99%**, naming `sandbox/python.cyr`
+  (14/15) and `routes/approval.cyr` (2/3) as carrying unreferenced functions.
+  **Every symbol in both is referenced by a test.** Nothing regressed; the
+  corpus stopped fitting.
+
+  **`scripts/check-coverage.sh` is new** — the same computation with no buffer:
+  same denominator (`^fn` in `src/**/*.cyr`, `_`-prefixed excluded), same
+  definition of covered, so the two agree whenever the tool can answer. It
+  reports **1074/1074 (100%)** and is the gate while the corpus is over.
+  `scripts/check-clean.sh` prints the overage as a WARN every run rather than
+  failing, because failing would leave a gate permanently red with no action
+  available — what must not happen is the overage going unmentioned, since then
+  the tool's percentage looks like evidence.
+
+  Splitting the corpus does not help: `dir_walk` is recursive, and moving suites
+  to a sibling directory drops their references entirely, which makes the number
+  worse. The only real fixes are upstream's or a corpus under 1 MiB.
+
+  Measured by padding one *unrelated* suite (`tests/order.tcyr`): 1,057,884 bytes
+  → 99%, 1,113,884 → 94%, 1,253,884 → 85% with eleven source files reading as
+  entirely unreferenced. Every step exits 0 and the gate says OK. The first
+  casualty is a fn in `src/server/routes/approval.cyr`, which has nothing to do
+  with `order.tcyr` — **bytes added to one suite delete another suite's
+  evidence**, because they compete for one buffer.
+
+  Filed upstream against cyrius as
+  `2026-08-05-coverage-corpus-is-a-fixed-1-mib-buffer-and-silently-under-reports-past-it.md`
+  with the root cause, the size table and three ordered fixes. Nothing is worked
+  around here; corpus size is gated by hand until it lands, and the port plan's
+  *"1 MiB corpus cliff"* constraint (`cyrius-port-plan.md:264`, predicted
+  0.7–1.2 MB) is the entry that called it.
+
 ### Added
 
 - **MCP `resources/list` and `resources/read`** — roadmap B1, first half.
@@ -300,6 +341,175 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secret.
 
 ### Performance
+
+- **The router's own path matching: 1.675 µs → 343 ns (−79%), and its 32 bytes
+  per request → 0.** `agnosai_route_resolve` was the single most expensive part
+  of a cheap request and the *only* part of an arena-threaded read route that
+  still allocated. Both are gone.
+
+  It was a flat list: sixteen `_agnosai_path_matches` calls in table order,
+  every one starting from byte 0. `/api/v1/dashboard/crews` matched on attempt
+  **sixteen**, having re-compared the segments `api` and `v1` twelve times on
+  the way, and a request matching nothing paid all sixteen. Now `/api/v1` is
+  consumed once and the segment after it selects a group of at most four
+  patterns.
+
+  What that bought, per request, on the routes B2 had already threaded:
+
+  | route | B/req before | B/req after | µs before | µs after |
+  |---|---|---|---|---|
+  | `GET /api/v1/approvals` | 32 | **0** | 2.947 | **1.861** (−37%) |
+  | `GET /api/v1/tools` | 320 | **288** | 3.074 | **2.344** (−24%) |
+  | `GET /api/v1/agents/definitions` | 32 | **0** | 3.139 | **2.529** (−19%) |
+  | `GET /api/v1/dashboard/crews` | 32 | **0** | 11.895 | **10.956** (−8%) |
+  | `GET /api/v1/dashboard/agents` | 32 | **0** | 14.639 | **14.048** (−4%) |
+  | `GET /api/v1/crews/{id}` | 64 | **16** | 3.957 | **3.821** (−3%) |
+
+  **Four routes now charge the global bump literally nothing** for a request
+  served through a per-request arena — handler, router and response struct all
+  land in the arena and are freed by one `reset_via`. `/api/v1/approvals` gains
+  most in *proportion* because resolve was 57% of it.
+
+  Two residuals remain and neither is the router's:
+
+  - **16 B on any `{id}` route — `agnosai_uuid_parse`.** It allocates a 16-byte
+    buffer for the decoded UUID, and **all five of its callers in `src/` throw
+    that buffer away**: every one is `if (agnosai_uuid_parse(x) == 0)`, a
+    validity test. A request carrying an id pays it on the 404 arm as much as
+    the 200 one. Not changed here — it is `src/id.cyr`, not the router.
+  - **288 B on `/api/v1/tools`** — the per-tool `schema_fp` build, structural
+    until the tool vtable takes an allocator. Unchanged in kind, smaller only
+    because the router's 32 B came out of it.
+
+  **The restructure is a filter, not a decision, and that is the safety
+  argument.** `_agnosai_seg_is` and `_agnosai_path_prefix_end` choose which
+  patterns get *tried*; what a trial *answers* is still a full pattern
+  comparison. So neither selector can route a request somewhere it does not
+  belong — the worst either can do is waste time. That is not a hopeful
+  reading: `_t_resolve_is_equivalent` runs the new resolver against **the flat
+  sixteen-attempt table it replaced**, kept verbatim in the test file, and
+  requires they agree on id, captured parameter and the 405-vs-404 flag across
+  56 paths × 4 methods — and making `_agnosai_seg_is` a bare prefix test
+  changes **no answer it produces**, because the resolver simply degenerates
+  back into the flat table.
+
+  That property is why the two selectors get their own unit assertions: what
+  they protect is the **cost**, not the routing, and the differential cannot
+  see cost. Writing those caught an off-by-one in this entry's own first draft
+  — `/api/v1` is seven bytes, so the separator is at index 7, and both the test
+  and the source comment had said 8.
+
+  **13 mutations applied, 13 caught**, after two rounds of strengthening: four
+  on the allocator threading, six on the routing logic, three on the selectors.
+  The un-threading of the *captured parameter* Str initially survived
+  everything, because all four routes pinned at zero are parameterless — fixed
+  by pinning `agnosai_route_resolve_a` on a `{id}` path too.
+
+  Method **0** is in the differential corpus deliberately: `_agnosai_serve_method`
+  answers 0 for any verb the table does not map, and that value reaches the
+  resolver, where a known path must still answer 405.
+
+  `server_router` 90 → **844** assertions; `server_serve` 158 → **163**.
+
+  Also measured, not attributed: `capability_scorer_record_50caps` 288 → 317 ns.
+  Nothing in `learning/` was touched and the module has ranged 270–296 ns across
+  seven prior runs, so this sits just outside its band. Binary layout is the
+  obvious suspect and is not evidence; recorded rather than explained away.
+
+- **B2: every GET read route now serves from the per-request arena — the six of
+  them charge the global bump 32–320 bytes per request instead of 384–4,368,
+  and each is 7–21% faster.** Four bites: `llm`, `server/routes` + `server/state`,
+  `tools`, and the `orchestrator` group.
+
+  Measured on a fixture of 8 finished crews (each carrying agent metadata), 8
+  pending approvals, 1 agent definition and 1 registered tool — global
+  allocator against `dispatch_a` with `reset_via` between requests, which is the
+  path a sandhi worker takes:
+
+  | route | B/req global | B/req arena | µs global | µs arena |
+  |---|---|---|---|---|
+  | `GET /api/v1/dashboard/agents` | 4,368 | **32** | 17.110 | **14.639** |
+  | `GET /api/v1/dashboard/crews` | 4,160 | **32** | 13.949 | **11.895** |
+  | `GET /api/v1/crews/{id}` | 2,368 | **64** | 4.995 | **3.957** |
+  | `GET /api/v1/tools` | 1,720 | **320** | 3.734 | **3.074** |
+  | `GET /api/v1/approvals` | 576 | **32** | 3.158 | **2.947** |
+  | `GET /api/v1/agents/definitions` | 384 | **32** | 3.911 | **3.139** |
+  | `GET /api/v1/crews/{unknown}` (404) | 336 | **64** | — | — |
+
+  **The 32 B is not the handler — it is `agnosai_route_resolve`.** The match
+  struct is minted before dispatch reaches any arm, so it is in both columns and
+  no amount of handler threading removes it; a `{id}` route pays 64 because the
+  matcher also stores the wildcard param Str. Five of the six read routes have a
+  handler half of **exactly zero**.
+
+  *(The router entry above then took that 32 B to 0 as well. The arena column
+  here is what this bite alone achieved, kept as measured rather than restated,
+  so the two entries read as the sequence they were.)*
+
+  `/api/v1/tools` is the one that does not, at 320 B, and the reason is
+  structural rather than an omission: `agnosai_tool_schema` calls the tool's own
+  `schema_fp`, which rebuilds its schema on whatever allocator it chooses, and
+  the tool vtable has no allocator parameter. Nothing in the routes or registry
+  tier can reach it.
+
+  Threading is **not** free by construction — every `_a` call carries an extra
+  argument and `alloc_via` is one indirection past `alloc` — so the latency
+  columns exist to show it did not cost anything. It did not: the arena arm wins
+  on all six, because the global allocator is a no-free bump whose ever-growing
+  heap loses the locality a reset arena keeps.
+
+  New `_a` forms, each with the bare name delegating through `default_alloc()`:
+  `agnosai_chat_message_to_value`, `agnosai_inference_request_to_value`,
+  `agnosai_inference_request_to_json`, `agnosai_chat_role_to_wire` (llm);
+  `agnosai_route_dispatch`, `agnosai_route_json`, `agnosai_route_error`,
+  `agnosai_route_list_definitions`, `agnosai_route_list_tools`,
+  `agnosai_route_list_pending`, `agnosai_route_crew_history`,
+  `agnosai_route_agent_performance`, `agnosai_route_get_crew`,
+  `agnosai_app_state_definitions` (server); `agnosai_param_schema_to_value`,
+  `agnosai_tool_schema_to_value`, `agnosai_tool_output_to_value`,
+  `agnosai_tool_registry_list` (tools); `agnosai_orchestrator_crew_ids`,
+  `agnosai_approval_gate_pending_tasks` (orchestrator).
+
+  **`benches/server.bcyr` is new** — 13 rows, the paired global/arena timings
+  above plus `route_resolve` on its own. The three earlier B2 bites shipped
+  allocation numbers and no timing; this back-fills them, so all six threaded
+  routes now carry both.
+
+  **`route_resolve` is 1.675 µs, which is 57% of the cheapest threaded
+  request.** Path matching is now the single most expensive part of a cheap
+  route — recorded as a finding, not acted on here.
+
+  Four traps this run, each caught by mutation and each the same shape as the
+  two B2 already had on record:
+
+  1. **`map_keys` again** (`agnosai_orchestrator_crew_ids`) — third and fourth
+     sighting; slot-walked per standing rule 5.
+  2. **A route's *failure* arms are separately threadable and separately
+     forgettable.** With the success path measured and the 404 only
+     status-checked, reverting `route_error_a` to `route_error` inside
+     `get_crew_a` passed the whole suite. The 404 arm is now measured too — it
+     is also the arm an unauthenticated scan hits hardest.
+  3. **An empty fixture cannot tell a threaded route from an un-threaded one.**
+     `/api/v1/dashboard/agents` renders an object only for a result whose
+     metadata names an agent; without that metadata it emits `[]` over eight
+     crews, and un-threading its per-agent object build was invisible.
+  4. **A round-number threshold asserted less than it looked like it did.** 128 B
+     sat comfortably above the 32 B baseline and below the 176 B of the smallest
+     un-threading mutation — and still let one through, because hoisting
+     `str_from_a(a, "agent")` back to `str_from` costs a single 16 B allocation
+     per request and lands at 48. The bound is now `agnosai_route_resolve`'s own
+     cost, measured in the same run, which makes it self-calibrating.
+
+  **20 mutations applied, 20 caught — but three of them only after the test was
+  strengthened.** Traps 2, 3 and 4 above are those three: each passed a suite
+  that looked like it was measuring the thing, and each is in the record because
+  the first version of this bite would have shipped with them green.
+  `server_serve` 134 → 158 assertions.
+
+  Not threaded, and not claimed to be: the write routes (`POST /api/v1/crews`,
+  `/api/v1/agents/definitions`, `/api/v1/approvals`, `/api/v1/a2a`, `/mcp`),
+  which parse a request body and are the other half of the problem; and the
+  orchestrator group's off-request-path modules, `crew_runner` foremost.
 
 - **The sandbox_spawn suite runs in 10.2 s against 32.6 s (−69%).** Not an
   optimisation: `_t_sp_cloexec_survives_a_grandchild` drove `sleep 30` on a
