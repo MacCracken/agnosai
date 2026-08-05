@@ -358,7 +358,13 @@ fn agnosai_cx_run(cyx: Str, timeout_ms, out_err): i64 {
 
     # Feed the bytecode, then close stdin so the guest sees EOF and runs.
     persistent_send(g, str_data(cyx), str_len(cyx));
+    # Close stdin so the guest sees EOF and runs — then **disown the
+    # descriptor**, because `persistent_terminate` closes `stdin_fd` too. Left
+    # as-is, the timeout path closed the same number twice, and a second close
+    # of a recycled descriptor hits whatever the process opened in between.
+    # Found by the audit of 2026-08-04.
     sys_close(PersistentGuest_stdin_fd(g));
+    PersistentGuest_set_stdin_fd(g, 0 - 1);
 
     _agnosai_fd_set_nonblock(PersistentGuest_stdout_fd(g));
 
@@ -386,8 +392,13 @@ fn agnosai_cx_run(cyx: Str, timeout_ms, out_err): i64 {
     }
 
     if (killed == 1) {
+        # `persistent_terminate` already closed stdout and reaped.
         return agnosai_cx_result_new(str_from(""), 0 - 1, 1);
     }
+
+    # The success path owns the stdout descriptor — nothing else closes it, so
+    # without this every completed run leaked one. Found by the audit.
+    sys_close(PersistentGuest_stdout_fd(g));
 
     var st[8];
     store64(&st, 0);

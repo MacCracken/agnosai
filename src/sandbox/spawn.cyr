@@ -489,6 +489,20 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
         sys_close(orf);
         sys_close(erf);
         sys_close(xrf);
+        # **And the originals the dup2s copied.** `dup2` duplicates; it does not
+        # consume. Leaving `irf`/`owf`/`ewf` open leaves the child holding extra
+        # write-end copies of the output pipes, which a grandchild then inherits
+        # — so the parent's read does not see EOF until every one of those
+        # copies is gone, not merely until the direct child exits. The audit of
+        # 2026-08-04 found this; the grandchild test passed anyway because
+        # `_t_sp_cloexec_survives_a_grandchild` is bounded by its own sleep
+        # rather than by EOF.
+        #
+        # Guarded, because a descriptor that already IS 0/1/2 must not be closed
+        # after being dup2'd onto itself.
+        if (irf != 0) { sys_close(irf); }
+        if (owf != 1) { sys_close(owf); }
+        if (ewf != 2) { sys_close(ewf); }
         # `work_dir` is applied HERE and not in the parent: a parent-side chdir
         # would move the whole server, every later relative path with it. A
         # failure must not fall through to `execve` — running the child in the

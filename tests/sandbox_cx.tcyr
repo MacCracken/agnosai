@@ -244,6 +244,51 @@ fn _t_cx_run_enforces_its_deadline(): i64 {
     return 0;
 }
 
+# How many descriptors this process currently holds.
+#
+# `/proc/self/fd` has one entry per open descriptor, so counting them across a
+# run measures leakage directly. Nothing else in the suite could observe it: a
+# leaked fd changes no output and no exit code, which is why the leak survived
+# to the audit.
+fn _t_cx_open_fds(): i64 {
+    # `F_GETFD` (1) succeeds on an open descriptor and fails on a closed one,
+    # so probing 0..255 counts them without needing a directory API.
+    var n = 0;
+    var fd = 0;
+    while (fd < 256) {
+        if (syscall(SYS_FCNTL, fd, 1, 0) >= 0) { n = n + 1; }
+        fd = fd + 1;
+    }
+    return n;
+}
+
+fn _t_cx_run_does_not_leak_descriptors(): i64 {
+    if (_t_cx_have_runner() == 0) { return 0; }
+    var e[8];
+    store64(&e, 0);
+    var cyx = agnosai_cx_compile(str_from("var r = 1;\nsyscall(60, r);\n"), &e);
+    if (cyx == 0) { return 0; }
+
+    # One run first, so any one-time setup is already paid for.
+    agnosai_cx_run(cyx, AGNOSAI_CX_TIMEOUT_MS, &e);
+    var before = _t_cx_open_fds();
+
+    var i = 0;
+    while (i < 8) {
+        agnosai_cx_run(cyx, AGNOSAI_CX_TIMEOUT_MS, &e);
+        i = i + 1;
+    }
+    var after = _t_cx_open_fds();
+
+    # **The guest's stdout descriptor is the runner's to close** - nothing else
+    # closes it on the success path, so before the audit fix every completed run
+    # leaked one and eight runs leaked eight. A small allowance covers unrelated
+    # churn without letting a per-run leak through.
+    assert(after - before < 4,
+    "eight runs do not leak a descriptor each - the guest's stdout fd is closed");
+    return 0;
+}
+
 fn _t_cx_result_accessors(): i64 {
     var r = agnosai_cx_result_new(str_from("out"), 7, 0);
     assert(str_eq(agnosai_cx_result_stdout(r), str_from("out")) == 1, "stdout round-trips");
@@ -317,6 +362,7 @@ fn main(): i64 {
     _t_cx_interpreter_is_resolved_absolutely();
     _t_cx_run_executes_the_guest();
     _t_cx_run_captures_stdout();
+    _t_cx_run_does_not_leak_descriptors();
     _t_cx_result_accessors();
     _t_cx_policy_shape();
     _t_cx_run_rejects_invalid_bytecode();
