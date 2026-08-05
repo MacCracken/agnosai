@@ -247,6 +247,66 @@ fn _t_rejections_never_store(): i64 {
     return 0;
 }
 
+# --- The retention hazard, pinned ---------------------------------------
+
+# **Why `agnosai_route_create_definition` has no `_a` form.**
+#
+# `agnosai_agent_from_value` borrows the parse tree's Strs — `bayan_json_v_str`,
+# no `str_clone` — and the definition built from them is stored in
+# `AppState.definitions`, which is process-lifetime. So a stored definition
+# points *into the parsed request body*. Threading the parse onto a per-request
+# arena would have `reset_via` reclaim it at the end of the request, and the
+# next request would be handed the same bytes.
+#
+# **That failure does not crash.** It silently rewrites a stored definition's
+# fields with whatever the next caller posted, which is why it needs a test
+# rather than a comment: someone threading this route "for consistency" with the
+# other five would see a green suite.
+#
+# This reproduces it directly — parse a definition through an arena, store it,
+# release the arena, scribble, and read the definition back. The assertion is
+# that the name is **destroyed**, which is the fact that makes the un-threaded
+# route correct. If a future change deep-copies at the retention boundary, this
+# test fails and should be replaced by its opposite.
+fn _t_retention_hazard_is_real(): i64 {
+    var s = _t_state();
+    var ar = arena_allocator(65536);
+    var body = _t_valid_body();
+
+    # The route's own first two steps, but on the arena.
+    var v = bayan_json_v_parse_buf_a(ar, str_data(body), str_len(body));
+    assert(v != 0, "the body parses");
+    var def = agnosai_agent_from_value(v);
+    assert(def != 0, "...into an agent definition");
+    assert(str_eq_cstr(agnosai_agent_name(def), "Writer") == 1,
+    "...whose name reads correctly while the arena is live");
+
+    agnosai_app_state_definition_insert(s, agnosai_agent_key(def), def);
+
+    # End of request: the arena is rewound and the next one reuses the bytes.
+    reset_via(ar);
+    var scribble = str_builder_new_a(ar);
+    for (var i = 0; i < 512; i = i + 1) { str_builder_add_cstr_a(ar, scribble, "ZZZZ"); }
+    str_builder_build_a(ar, scribble);
+
+    var stored = agnosai_app_state_definition_get(s, str_from("writer"));
+    assert(stored != 0, "the definition is still in the map");
+    assert(str_eq_cstr(agnosai_agent_name(stored), "Writer") == 0,
+    "**and its name is destroyed** — the stored definition borrowed the parse \
+    tree, so threading this route's parse would corrupt AppState rather than \
+    crash. This is why create_definition has no `_a` form.");
+
+    # The same definition through the un-threaded route survives, because the
+    # global bump never reclaims what it borrowed.
+    var s2 = _t_state();
+    agnosai_route_create_definition(s2, _t_valid_body());
+    var kept = agnosai_app_state_definition_get(s2, str_from("writer"));
+    assert(kept != 0, "the real route stores it");
+    assert(str_eq_cstr(agnosai_agent_name(kept), "Writer") == 1,
+    "...and it reads correctly, because nothing reclaims the global bump");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -261,6 +321,7 @@ fn main(): i64 {
     _t_create_then_list();
     _t_create_preserves_optional_fields();
     _t_rejections_never_store();
+    _t_retention_hazard_is_real();
 
     return assert_summary();
 }

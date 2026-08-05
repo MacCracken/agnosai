@@ -629,6 +629,8 @@ pays it per request.
 | `route_get_crew_*` | 4.830 µs | **3.621 µs** | −25.0% |
 | `route_dashboard_crews_*` | 13.266 µs | **10.956 µs** | −17.4% |
 | `route_dashboard_agents_*` | 16.452 µs | **14.048 µs** | −14.6% |
+| `route_approvals_post_*` | 3.731 µs | **2.983 µs** | −20.0% |
+| `route_mcp_*` | 5.618 µs | **3.808 µs** | −32.2% |
 | `route_resolve` | 343 ns | — | in both |
 
 The arena arm wins on all six because the global allocator is a **no-free bump**:
@@ -652,6 +654,36 @@ global bump per request:
 **Every GET read route charges the global bump literally nothing.** Handler,
 router, id validation, tool schemas and the response struct all land in the
 request arena and are freed by one `reset_via`.
+
+### ⚠ The write routes split, and three of them must NOT be threaded
+
+| write route | B/req global | B/req arena | retains borrowed parse data? |
+|---|---|---|---|
+| `POST /mcp` | 3,224 | **0** | no |
+| `POST /api/v1/approvals` | 1,352 | **0** | no |
+| `POST /api/v1/crews` | 20,984 | — | **yes** |
+| `POST /api/v1/agents/definitions` | 2,280 | — | **yes** |
+| `POST /api/v1/a2a/receive` | 1,168 | — | **yes** |
+
+`agnosai_agent_from_value` and `agnosai_crew_from_value` take
+`bayan_json_v_str(...)` **without cloning**, and what they build is stored in
+`AppState.definitions` and the orchestrator registry — both process-lifetime. So
+a stored definition points *into the parsed request body*. Threading those
+parses would make `reset_via` reclaim it at the end of the request, and the next
+request would be handed the same bytes: **a stored definition's name becomes
+whatever the next caller posted.** It corrupts, it does not crash.
+
+**The current code is correct only because the global allocator never frees.**
+That dependency was undocumented. `server_state`'s `definition_insert` had seen
+half of it — it `str_clone`s the *key*, with the comment "the caller's Str may
+be borrowed from a request buffer that does not outlive the handler" — and left
+the value borrowed.
+
+Pinned from both sides so it cannot be "fixed for consistency":
+`server_routes_agents` reproduces the corruption against a released arena, and
+`server_serve` asserts `create_definition`'s arena arm stays ≈ its global arm.
+**The real fix is a deep copy at the retention boundary**, which is owed under
+B2 — not leaving the routes un-threaded forever.
 
 It took four bites and each one exposed the next residual, which is the pattern
 worth carrying forward — **a floor is only visible once everything above it is

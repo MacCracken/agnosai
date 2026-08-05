@@ -342,6 +342,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **The write routes: two reach zero, and three must not — `agnosai_agent_from_value`
+  and `agnosai_crew_from_value` borrow the parse tree into process-lifetime state.**
+
+  A body-carrying route splits in two, and only one half is safely threadable.
+  That distinction does not exist on the read path and is the substance of this
+  bite.
+
+  | route | B/req before | B/req after | µs before | µs after |
+  |---|---|---|---|---|
+  | `POST /mcp` | 3,224 | **0** | 5.618 | **3.808** (−32%) |
+  | `POST /api/v1/approvals` | 1,352 | **0** | 3.731 | **2.983** (−20%) |
+
+  Both retain nothing — `approvals` uses `task_id` as a `map_get` key and sends
+  an int through a channel; `/mcp` executes and returns. So their parse trees go
+  in the arena with the JSON-RPC envelope, every tool schema behind
+  `tools/list`, the `deny_unknown_fields` allow-list, and the response.
+
+  **The other three are deliberately un-threaded, and this is a correctness
+  boundary rather than unfinished work.** `agnosai_agent_from_value` takes
+  `bayan_json_v_str(key_v)` and its siblings **without cloning**, and the
+  definition is then stored in `AppState.definitions`, which is
+  process-lifetime. So a stored definition points *into the parsed request
+  body*. Threading `bayan_json_v_parse_buf` there would have `reset_via` reclaim
+  it at the end of the request, and the next request would be handed the same
+  bytes — **a stored definition's name would silently become whatever the next
+  caller posted.** `POST /api/v1/crews` and `POST /api/v1/a2a/receive` have the
+  identical shape through `agnosai_crew_from_value` and the orchestrator
+  registry.
+
+  **So the current code is correct only because the global allocator never
+  frees**, and nothing stated that. `server_state`'s `definition_insert` had
+  seen half of it — it `str_clone`s the *key*, with the comment "the caller's
+  Str may be borrowed from a request buffer that does not outlive the handler" —
+  and the value was left borrowed.
+
+  It is pinned rather than described. `server_routes_agents` parses a definition
+  through an arena, stores it, releases the arena, scribbles over it, and
+  asserts the stored name is **destroyed**. Two mutations kill that test:
+  making `from_value` `str_clone` (the name survives — which is what proves the
+  test measures borrowing, and what the eventual fix will look like), and
+  dropping the scribble (reset alone leaves the bytes intact). `server_serve`
+  asserts the same boundary from the other side: `create_definition`'s arena arm
+  must stay ≈ its global arm, so "thread them for consistency" fails in the
+  suite rather than in production.
+
+  **The fix is to deep-copy at the retention boundary**, not to leave the routes
+  un-threaded forever. Owed under B2.
+
+  New `_a` forms: `agnosai_route_submit_approval`, `agnosai_route_mcp`,
+  `agnosai_route_fields`, `agnosai_route_field`, and the twelve internal
+  `_agnosai_mcp_*` builders. The two MCP logging helpers keep their bare shape —
+  they allocate nothing, so an allocator parameter would be noise on a hot guard.
+
+  **9 mutations applied, 9 caught**, two of them only after the measurement was
+  fixed:
+
+  - `str_builder_add_str` un-threaded **passed**, because the mutation landed on
+    the `delivered` branch and the fixture could not reach it: a delivered
+    approval is *consumed*, so a 32-iteration loop takes that path once and the
+    other 31 times falls through. `_agnosai_route_approval_message_a` is now
+    measured directly on both branches.
+  - Reverting `add_cstr_a` to `add_cstr` for `"Approved"` still passes, and
+    correctly: at seventeen bytes the builder has not grown, and only the call
+    that *triggers growth* allocates. Recorded in the source so the next reader
+    does not mistake the threading there for decoration.
+
+  `server_serve` 164 → **178** assertions; `server_routes_agents` 41 → **45**.
+  Four new benchmark rows.
+
 - **The tool vtable passes the allocator, and with it `/api/v1/tools` reaches
   zero: 1,720 → 0 bytes per request. Every GET read route now charges the
   global bump literally nothing.**

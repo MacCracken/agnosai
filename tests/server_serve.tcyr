@@ -98,7 +98,39 @@ fn _t_state_populated(): i64 {
         agnosai_approval_request(agnosai_app_state_approval_gate(s),
         str_builder_build(sb));
     }
+    # One pending approval under a real UUID — `submit_approval` rejects a
+    # non-UUID task_id at 422, so the eight above can never reach the gate.
+    #
+    # **This does not pin the delivered branch and is not meant to.** A
+    # delivered approval is consumed, so only the first of a measuring loop's
+    # iterations takes that path and the rest fall through to not-delivered.
+    # `_agnosai_route_approval_message_a` is measured directly instead, below.
+    agnosai_approval_request(agnosai_app_state_approval_gate(s),
+    str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8"));
     return s;
+}
+
+# Bytes charged to the global bump by one POST of `body` to `path`, averaged
+# over 32 calls. Same shape as `_t_per_request`, with the body hoisted for the
+# same reason the path is.
+fn _t_per_post(s, path: Str, body: Str, ar): i64 {
+    var e = str_from("");
+    if (ar == 0) {
+        agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, path, e, 0, body);
+    } else {
+        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_POST, path, e, 0, body);
+        reset_via(ar);
+    }
+    var before = alloc_used();
+    for (var i = 0; i < 32; i = i + 1) {
+        if (ar == 0) {
+            agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, path, e, 0, body);
+        } else {
+            agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_POST, path, e, 0, body);
+            reset_via(ar);
+        }
+    }
+    return (alloc_used() - before) / 32;
 }
 
 # Bytes charged to the **global** bump by one dispatch of `path`, averaged over
@@ -1015,6 +1047,105 @@ fn _t_allocation_profile(): i64 {
     bayan_json_v_build(agnosai_route_body(
     agnosai_route_error(HTTP_NOT_FOUND, str_from("gone"))))) == 1,
     "...and builds the oracle's {\"error\":..} either way");
+    reset_via(ar);
+
+    # --- B2: the write routes, and the line they cannot cross ----------------
+    #
+    # A body-carrying route splits in two, and only one half is safely
+    # threadable. **`POST /api/v1/approvals` and `POST /mcp` retain nothing** —
+    # the first uses `task_id` as a `map_get` key and sends an int through a
+    # channel, the second executes and returns — so their parse trees go in the
+    # arena with everything else.
+    #
+    # **The other three retain data borrowed from the parse tree.**
+    # `agnosai_agent_from_value` and `agnosai_crew_from_value` take
+    # `bayan_json_v_str(...)` without cloning, and the results are stored in
+    # `AppState.definitions` and the orchestrator registry respectively. So a
+    # threaded parse would have `reset_via` reclaim what those hold, and the
+    # next request would be handed the same bytes — corruption, not a crash.
+    # `server_routes_agents` reproduces exactly that.
+    #
+    # These assertions pin **both** sides: the two that reached zero, and the
+    # three that must not, so "thread them for consistency" fails here rather
+    # than in production.
+    var appr_body = str_from(
+    "{\"task_id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"decision\":\"approved\"}");
+    var mcp_body = str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    var defn_body = str_from(
+    "{\"agent_key\":\"w\",\"name\":\"W\",\"role\":\"r\",\"goal\":\"g\"}");
+
+    assert(_t_per_post(ps, str_from("/api/v1/approvals"), appr_body, 0) > 0,
+    "the approvals POST allocates on the global path");
+    assert(_t_per_post(ps, str_from("/api/v1/approvals"), appr_body, ar) == 0,
+    "...and NOTHING through the arena — parse tree, allow-list, message and \
+    response all land in `a`");
+
+    # The **not-delivered** branch too: a different message, built by the same
+    # builder, and the only one the eight non-UUID pending ids could reach.
+    var appr_miss = str_from(
+    "{\"task_id\":\"00000000-0000-0000-0000-000000000000\",\"decision\":\"rejected\"}");
+    assert(_t_per_post(ps, str_from("/api/v1/approvals"), appr_miss, 0) > 0,
+    "an unknown task id still allocates on the global path");
+    assert(_t_per_post(ps, str_from("/api/v1/approvals"), appr_miss, ar) == 0,
+    "...and nothing through the arena either");
+
+    # **Both message branches, measured directly.** Routing to them is not
+    # enough: a delivered approval is consumed, so a loop through the route
+    # takes that path once and the not-delivered path 31 times, leaving the
+    # delivered branch's `str_builder_add_a` free to grow on the global bump.
+    # A mutation found exactly that. Both strings pass 64 bytes once a
+    # 36-character id is appended, which is where the builder starts growing.
+    var mid = str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+    _agnosai_route_approval_message_a(ar, 1, AGNOSAI_APPROVAL_APPROVED, mid);
+    _agnosai_route_approval_message_a(ar, 0, AGNOSAI_APPROVAL_REJECTED, mid);
+    reset_via(ar);
+    var bm = alloc_used();
+    for (var mi = 0; mi < 32; mi = mi + 1) {
+        _agnosai_route_approval_message_a(ar, 1, AGNOSAI_APPROVAL_APPROVED, mid);
+        _agnosai_route_approval_message_a(ar, 1, AGNOSAI_APPROVAL_REJECTED, mid);
+        _agnosai_route_approval_message_a(ar, 0, AGNOSAI_APPROVAL_APPROVED, mid);
+        reset_via(ar);
+    }
+    assert((alloc_used() - bm) == 0,
+    "every branch of the approval message builds entirely in the arena — \
+    including the growth past its 64-byte inline buffer");
+    assert(str_len(_agnosai_route_approval_message(1, AGNOSAI_APPROVAL_APPROVED, mid)) > 64,
+    "...and the delivered message really does exceed that buffer, so the \
+    assertion above is about growth rather than about the inline case");
+
+    assert(_t_per_post(ps, str_from("/mcp"), mcp_body, 0) > 0,
+    "the MCP POST allocates on the global path");
+    assert(_t_per_post(ps, str_from("/mcp"), mcp_body, ar) == 0,
+    "...and nothing through the arena, including every tool schema behind \
+    tools/list");
+
+    # **The retaining route stays un-threaded, and this is the assertion that
+    # says so on purpose.** It is not a gap being tolerated — it is a
+    # correctness boundary. Threading `create_definition` would make this pass
+    # and `server_routes_agents`'s retention test fail.
+    var d_global = _t_per_post(ps, str_from("/api/v1/agents/definitions"), defn_body, 0);
+    var d_arena = _t_per_post(ps, str_from("/api/v1/agents/definitions"), defn_body, ar);
+    assert(d_arena > 0,
+    "create_definition is deliberately NOT threaded — its parse tree outlives \
+    the request inside AppState.definitions");
+    assert(d_arena * 2 > d_global,
+    "...and it is un-threaded in full, not half-threaded into something whose \
+    ownership no longer matches its lifetime");
+
+    # The write routes' `_a` forms named directly — both are reached only
+    # through `dispatch_a`, which reference coverage cannot see.
+    assert(agnosai_route_status(agnosai_route_submit_approval_a(ar, ps, appr_miss))
+    == HTTP_OK, "submit_approval_a answers 200 for an unknown task id");
+    assert(agnosai_route_status(agnosai_route_mcp_a(ar, ps, mcp_body)) == HTTP_OK,
+    "mcp_a answers 200 for tools/list");
+    reset_via(ar);
+
+    # And the `deny_unknown_fields` allow-list builder, which every
+    # body-carrying route rebuilds per request.
+    var fl = agnosai_route_fields_a(ar);
+    agnosai_route_field_a(ar, fl, "task_id");
+    assert(vec_len(fl) == 1, "fields_a/field_a build the allow-list in the arena");
+    assert(str_eq_cstr(vec_get(fl, 0), "task_id") == 1, "...carrying the field name");
     reset_via(ar);
 
     # The `_a` forms named directly. Each is reached through `dispatch_a`, so

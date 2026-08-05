@@ -163,12 +163,27 @@ fn agnosai_route_no_unknown_fields(obj, allowed): i64 {
 
 # Build the allow-list a `deny_unknown_fields` type is validated against.
 # Variadic-free: callers push onto the vec this returns.
+fn agnosai_route_fields_a(a): i64 {
+    return vec_new_a(a);
+}
+
+# Global-allocator form of `agnosai_route_fields_a`.
 fn agnosai_route_fields(): i64 {
-    return vec_new();
+    return agnosai_route_fields_a(default_alloc());
 }
 
 # Add one permitted field name to an allow-list.
-fn agnosai_route_field(allowed, name): i64 {
-    vec_push(allowed, str_from(name));
+fn agnosai_route_field_a(a, allowed, name): i64 {
+    vec_push_a(a, allowed, str_from_a(a, name));
     return allowed;
+}
+
+# Global-allocator form of `agnosai_route_field_a`.
+#
+# **The allow-list is rebuilt on every request that carries a body** — a vec
+# plus a Str per permitted field, for a list that is a compile-time constant of
+# the route. Threading it is what keeps `deny_unknown_fields` from being the
+# residual once the body's own parse tree moves to the arena.
+fn agnosai_route_field(allowed, name): i64 {
+    return agnosai_route_field_a(default_alloc(), allowed, name);
 }

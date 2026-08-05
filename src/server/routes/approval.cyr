@@ -23,11 +23,16 @@
 
 # The fields `ApprovalSubmission` accepts. serde rejects any other key outright,
 # and the type is `deny_unknown_fields`.
-fn _agnosai_route_approval_fields(): i64 {
-    var f = agnosai_route_fields();
-    agnosai_route_field(f, "task_id");
-    agnosai_route_field(f, "decision");
+fn _agnosai_route_approval_fields_a(a): i64 {
+    var f = agnosai_route_fields_a(a);
+    agnosai_route_field_a(a, f, "task_id");
+    agnosai_route_field_a(a, f, "decision");
     return f;
+}
+
+# Global-allocator form of `_agnosai_route_approval_fields_a`.
+fn _agnosai_route_approval_fields(): i64 {
+    return _agnosai_route_approval_fields_a(default_alloc());
 }
 
 # `POST /api/v1/approvals` — submit a decision for a pending task.
@@ -40,31 +45,31 @@ fn _agnosai_route_approval_fields(): i64 {
 # was waiting — `delivered` is the flag that distinguishes them, and the
 # oracle's `submit_approval_unknown_task` test asserts exactly that (200 with
 # `delivered: false`). A 404 would have been the tempting shape and is wrong.
-fn agnosai_route_submit_approval(state, body: Str): i64 {
-    var v = bayan_json_v_parse_buf(str_data(body), str_len(body));
+fn agnosai_route_submit_approval_a(a, state, body: Str): i64 {
+    var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
     if (v == 0) {
-        return agnosai_route_error(HTTP_BAD_REQUEST, str_from("malformed JSON body"));
+        return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
     }
     if (bayan_json_v_is_obj(v) == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("body is not an object"));
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "body is not an object"));
     }
-    if (agnosai_route_no_unknown_fields(v, _agnosai_route_approval_fields()) == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("unknown field in approval submission"));
+    if (agnosai_route_no_unknown_fields(v, _agnosai_route_approval_fields_a(a)) == 0) {
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "unknown field in approval submission"));
     }
 
     # `task_id: uuid::Uuid` — serde parses it, so a malformed id is 422 and
     # never reaches the gate.
     var tid_v = bayan_json_v_obj_get(v, "task_id");
     if (tid_v == 0 || bayan_json_v_is_str(tid_v) == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("task_id is required and must be a string"));
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "task_id is required and must be a string"));
     }
     var task_id = bayan_json_v_str(tid_v);
     if (agnosai_uuid_is_valid(task_id) == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("task_id is not a valid UUID"));
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "task_id is not a valid UUID"));
     }
 
     # `decision: ApprovalDecision` — a typed enum, so only the two snake_case
@@ -72,15 +77,15 @@ fn agnosai_route_submit_approval(state, body: Str): i64 {
     # through `from_wire`.
     var dec_v = bayan_json_v_obj_get(v, "decision");
     if (dec_v == 0 || bayan_json_v_is_str(dec_v) == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("decision is required and must be a string"));
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "decision is required and must be a string"));
     }
     var dec_s = bayan_json_v_str(dec_v);
     var approved = str_eq_cstr(dec_s, "approved");
     var rejected = str_eq_cstr(dec_s, "rejected");
     if (approved == 0 && rejected == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("decision must be \"approved\" or \"rejected\""));
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "decision must be \"approved\" or \"rejected\""));
     }
     var decision = AGNOSAI_APPROVAL_REJECTED;
     if (approved == 1) { decision = AGNOSAI_APPROVAL_APPROVED; }
@@ -88,11 +93,23 @@ fn agnosai_route_submit_approval(state, body: Str): i64 {
     var delivered = agnosai_approval_submit_decision(
     agnosai_app_state_approval_gate(state), task_id, decision);
 
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("delivered"), bayan_json_v_bool_new(delivered));
-    bayan_json_v_obj_set(obj, str_from("message"),
-    bayan_json_v_str_new(_agnosai_route_approval_message(delivered, decision, task_id)));
-    return agnosai_route_json(HTTP_OK, obj);
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "delivered"), bayan_json_v_bool_new_a(a, delivered));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "message"),
+    bayan_json_v_str_new_a(a, _agnosai_route_approval_message_a(a, delivered, decision, task_id)));
+    return agnosai_route_json_a(a, HTTP_OK, obj);
+}
+
+# Global-allocator form of `agnosai_route_submit_approval_a`.
+#
+# **This route is threaded end to end, parse tree included, and that is safe
+# only because it retains nothing.** `task_id` is a `map_get` key and the
+# decision is an int sent through a channel — neither outlives the handler.
+# The three write routes that DO retain (`create_definition`, `create_crew`,
+# `a2a_receive`) cannot have their parse tree threaded without deep-copying
+# at the retention boundary; see `agents.cyr`'s header.
+fn agnosai_route_submit_approval(state, body: Str): i64 {
+    return agnosai_route_submit_approval_a(default_alloc(), state, body);
 }
 
 # The oracle's two `format!` strings, verbatim.
@@ -103,22 +120,40 @@ fn agnosai_route_submit_approval(state, body: Str): i64 {
 # `#[serde(rename_all = "snake_case")]` governs serialization, while `{:?}`
 # prints the derived `Debug`, which is the variant identifier. Reproduced
 # because the message is wire-visible.
-fn _agnosai_route_approval_message(delivered, decision, task_id: Str): Str {
-    var sb = str_builder_new();
+fn _agnosai_route_approval_message_a(a, delivered, decision, task_id: Str): Str {
+    var sb = str_builder_new_a(a);
     if (delivered == 1) {
-        str_builder_add_cstr(sb, "Decision ");
+        str_builder_add_cstr_a(a, sb, "Decision ");
         if (decision == AGNOSAI_APPROVAL_APPROVED) {
-            str_builder_add_cstr(sb, "Approved");
+            str_builder_add_cstr_a(a, sb, "Approved");
         } else {
-            str_builder_add_cstr(sb, "Rejected");
+            str_builder_add_cstr_a(a, sb, "Rejected");
         }
-        str_builder_add_cstr(sb, " delivered for task ");
-        str_builder_add_str(sb, task_id);
-        return str_builder_build(sb);
+        str_builder_add_cstr_a(a, sb, " delivered for task ");
+        str_builder_add_a(a, sb, task_id);
+        return str_builder_build_a(a, sb);
     }
-    str_builder_add_cstr(sb, "No pending approval found for task ");
-    str_builder_add_str(sb, task_id);
-    return str_builder_build(sb);
+    str_builder_add_cstr_a(a, sb, "No pending approval found for task ");
+    str_builder_add_a(a, sb, task_id);
+    return str_builder_build_a(a, sb);
+}
+
+# Global-allocator form of `_agnosai_route_approval_message_a`.
+#
+# **`str_builder_add_a` is the `_a` form of `add_str`** — the builder does not
+# store its allocator, so `_sb_grow` takes one per call and a bare `add_str`
+# grows on the global bump however the builder was created. Both messages here
+# exceed the 64-byte inline buffer once a 36-character id is appended, so that
+# growth is not hypothetical.
+#
+# **Only the call that triggers growth is observable**, which is worth knowing
+# before someone mutation-tests this and concludes the threading is decorative:
+# reverting `add_cstr_a` to `add_cstr` for `"Approved"` changes nothing, because
+# at seventeen bytes the builder has not grown yet. The `_a` on the earlier
+# appends is defensive — it is the message length, not the call site, that
+# decides which one allocates, and the length is not this function's to fix.
+fn _agnosai_route_approval_message(delivered, decision, task_id: Str): Str {
+    return _agnosai_route_approval_message_a(default_alloc(), delivered, decision, task_id);
 }
 
 # `GET /api/v1/approvals` — the task ids currently awaiting a decision.

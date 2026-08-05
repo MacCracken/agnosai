@@ -82,6 +82,29 @@ fn agnosai_route_list_definitions(state): i64 {
 # computes `value` first and only then moves `def` into the map. That ordering
 # is what makes the 500 arm meaningful: a definition that cannot be serialized
 # is never stored.
+#
+# ## ⚠ This route has NO `_a` form, and that is deliberate
+#
+# `agnosai_agent_from_value` **borrows** the parse tree's Strs rather than
+# copying them — `bayan_json_v_str(key_v)` and its siblings, no `str_clone`. The
+# definition built from them is then stored in `AppState.definitions`, which is
+# process-lifetime. So the stored definition points *into the parsed request
+# body*, and threading `bayan_json_v_parse_buf` onto the per-request arena would
+# make `reset_via` reclaim it at the end of the request — a use-after-free that
+# does not crash, because the arena hands the same bytes to the next request.
+# A definition's name would silently become whatever the next caller posted.
+#
+# **The current code is correct only because the global allocator never frees.**
+# That is a real dependency and nothing else states it. `server_state`'s
+# `definition_insert` already saw half of this — it `str_clone`s the *key* with
+# the comment "the caller's Str may be borrowed from a request buffer that does
+# not outlive the handler" — and the value was left borrowed.
+#
+# The fix is to deep-copy at the retention boundary rather than to leave the
+# route un-threaded, and it is owed under B2 (roadmap). `POST /api/v1/crews` and
+# `POST /api/v1/a2a/receive` have the identical shape via `agnosai_crew_from_value`
+# and the orchestrator registry. `tests/server_routes_agents.tcyr` pins the
+# hazard by scribbling over a released arena.
 fn agnosai_route_create_definition(state, body: Str): i64 {
     var v = bayan_json_v_parse_buf(str_data(body), str_len(body));
     if (v == 0) {

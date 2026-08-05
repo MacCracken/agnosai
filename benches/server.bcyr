@@ -162,6 +162,39 @@ fn _b_dispatch_arena(s, name, path: Str, n): i64 {
     return 0;
 }
 
+# Time `n` POSTs of `body` to `path` on the global allocator.
+fn _b_post_global(s, name, path: Str, body: Str, n): i64 {
+    var empty = str_from("");
+    agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, path, empty, 0, body);
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, path, empty, 0, body);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The same through a per-request arena, reset between each.
+fn _b_post_arena(s, name, path: Str, body: Str, n): i64 {
+    var empty = str_from("");
+    var ar = arena_allocator(1048576);
+    agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_POST, path, empty, 0, body);
+    reset_via(ar);
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var j = 0; j < n; j = j + 1) {
+        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_POST, path, empty, 0, body);
+        reset_via(ar);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 # The router's own cost, in both arms and removable from neither.
 fn _b_resolve(): i64 {
     var n = 200000;
@@ -218,6 +251,21 @@ fn main(): i64 {
     str_from("/api/v1/agents/definitions"), 50000);
     _b_dispatch_global(s, "route_tools_global", str_from("/api/v1/tools"), 20000);
     _b_dispatch_arena(s, "route_tools_arena", str_from("/api/v1/tools"), 20000);
+
+    # The two **write** routes that retain nothing, and so are threaded parse
+    # tree and all. The other three retain data borrowed from the parse tree
+    # and are deliberately un-threaded — see `routes/agents.cyr`'s header — so
+    # timing them against an arena would measure nothing.
+    var appr = str_from(
+    "{\"task_id\":\"00000000-0000-0000-0000-000000000000\",\"decision\":\"approved\"}");
+    _b_post_global(s, "route_approvals_post_global", str_from("/api/v1/approvals"),
+    appr, 20000);
+    _b_post_arena(s, "route_approvals_post_arena", str_from("/api/v1/approvals"),
+    appr, 20000);
+
+    var mcp = str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    _b_post_global(s, "route_mcp_global", str_from("/mcp"), mcp, 20000);
+    _b_post_arena(s, "route_mcp_arena", str_from("/mcp"), mcp, 20000);
 
     return 0;
 }
