@@ -102,6 +102,13 @@ fn _t_oci_accepts_valid_images(): i64 {
     str_from("ghcr.io/org/repo:sha-abc123")) == 1, "nested path with a hyphen");
     assert(agnosai_oci_validate_image_ref(
     str_from("myimage@sha256:abcdef1234567890")) == 1, "a digest reference");
+    # **Underscore is General Category `Pc`**, so no alphanumeric branch covers
+    # it — it depends entirely on its own line in the allowed set, and it was
+    # the only member of the oracle's literal `-_./:#@` with no covering test.
+    # Deleting that line refuses `library/my_image` outright, a hard
+    # availability failure with nothing to catch it.
+    assert(agnosai_oci_validate_image_ref(str_from("library/my_image:v1")) == 1,
+    "an underscore is a legal reference character");
 
     # And each is constructible through the gate.
     assert(agnosai_oci_sandbox_new(agnosai_oci_config_new(str_from("alpine:latest"))) != 0,
@@ -229,6 +236,19 @@ fn _t_oci_argv_options(): i64 {
     assert(_t_argv_has(a2, "-v") == 1, "-v is emitted");
     assert(_t_argv_has(a2, "/h:/c") == 1, "...with the mount spec verbatim");
     assert(_t_argv_at(a2, "FOO=bar") == _t_argv_at(a2, "--env") + 1, "the pair follows --env");
+    # **Membership is not position, and for `-v` position is the whole thing.**
+    # `docker` parses options only until the first non-option argument, so an
+    # image emitted ahead of `-v` makes the mount the *container's* argv and the
+    # volume is silently never applied. The audit of 2026-08-04 hoisted the
+    # image above the volume loop and all 100 assertions passed, because the
+    # `-v` pair was checked for membership only — unlike `--env`, which already
+    # had its adjacency pinned on the line above.
+    assert(_t_argv_at(a2, "/h:/c") == _t_argv_at(a2, "-v") + 1, "the mount spec follows its flag");
+    assert(_t_argv_at(a2, "-v") < _t_argv_at(a2, "alpine"),
+    "-v precedes the image — after it, docker reads the mount as container argv");
+    assert(_t_argv_at(a2, "--env") < _t_argv_at(a2, "alpine"), "...and so does --env");
+    assert(_t_argv_at(a2, "alpine") == vec_len(a2) - 1,
+    "the image is last when there are no entrypoint arguments");
 
     # Entrypoint args come after the image.
     var ep = vec_new();
@@ -269,6 +289,18 @@ fn _t_oci_error_message(): i64 {
     assert(str_contains_cstr(
     agnosai_oci_image_error(str_from("alpine;x")), "invalid character") == 1,
     "and anything else reports the character class");
+    # **Naming the character**, as `oci.rs:82` does — it was dropped until
+    # 2026-08-05, leaving an operator with a refused image and no way to tell
+    # which byte of it was the problem.
+    assert(str_eq_cstr(agnosai_oci_image_error(str_from("alpine;x")),
+    "image name contains invalid character: ';'") == 1,
+    "...and says WHICH character, end to end");
+    assert(str_eq_cstr(agnosai_oci_image_error(str_from("alp ine")),
+    "image name contains invalid character: ' '") == 1, "...including a space");
+    # A multi-byte character comes back whole, not as its first byte — the
+    # validator walks codepoints and so must the message.
+    assert(str_contains_cstr(agnosai_oci_image_error(str_from("alpine\xe2\x80\x8b")),
+    "\xe2\x80\x8b") == 1, "...and a multi-byte character is reported whole");
     return 0;
 }
 
@@ -361,6 +393,128 @@ fn _t_oci_execute_feeds_stdin_and_splits_streams(): i64 {
     return 0;
 }
 
+# A runtime that stops draining stdin is logged and carried on with — and it
+# must not take agnosai with it.
+#
+# **`oci.rs:158-162` only `warn!`s**, where `python.rs:92-95` propagates the
+# error, so this asserts the opposite verdict to its python sibling on purpose:
+# the container ran, and what it printed before it closed stdin is still its
+# answer. Reaching the assertions at all is the other half — the audit of
+# 2026-08-04 measured this exact shape exiting 141 (128+13, `SIGPIPE`) with no
+# assertion output, because `agnosai_spawn_capture_input` wrote into a pipe with
+# no reader and the default disposition kills the writer.
+#
+# 320,000 bytes because anything inside the 64 KiB pipe buffer is accepted by
+# the kernel whether or not the runtime ever reads it.
+fn _t_oci_runtime_that_stops_reading_stdin(): i64 {
+    var sb = str_builder_new();
+    var i = 0;
+    while (i < 3200) {
+        str_builder_add_cstr(sb,
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+        i = i + 1;
+    }
+    var big = str_builder_build(sb);
+    assert(str_len(big) == 320000, "the payload is 320,000 bytes");
+
+    var c = agnosai_oci_config_new(str_from("alpine:latest"));
+    # Closes stdin and stays alive, so the write fails while the drain loop is
+    # still running rather than racing the runtime's exit.
+    agnosai_oci_config_set_runtime(c,
+    _t_oci_fake_runtime("deaf", "exec 0<&-; sleep 1; echo ran-anyway"));
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_oci_execute(c, vec_new(), big, &e);
+    assert(load64(&e) == 0,
+    "a runtime that stopped reading is NOT an error here — oci.rs warns and continues");
+    assert(r != 0, "...it returns a result");
+    if (r == 0) { return 0; }
+    assert(str_contains_cstr(agnosai_oci_result_stdout(r), "ran-anyway") == 1,
+    "...carrying everything the container wrote after it closed stdin");
+    assert(agnosai_oci_result_timed_out(r) == 0, "...and it is not reported as a timeout");
+    assert(agnosai_oci_result_exit_code(r) == 0, "...its own exit code stands");
+    return 0;
+}
+
+# --- The runtime's environment -------------------------------------------
+#
+# **`_read_environ_envp()` at `oci.cyr` is a documented parity decision**, and
+# the audit of 2026-08-04 found it pinned in neither direction: replacing it
+# with `0` (no environment at all) ran 100/100, and so did replacing it with
+# `agnosai_sanitized_envp()`. The value is load-bearing twice — the module
+# header argues it explicitly ("the runtime inherits the server's environment
+# unfiltered... filtering here would sanitize the wrong process"), and it is
+# what supplies `DOCKER_HOST`, `XDG_RUNTIME_DIR`, `HOME` and `PATH` to a real
+# docker or podman client.
+#
+# One assertion covers both directions, but it needs a variable the filter
+# WOULD strip — and a test process has no `setenv`. So the suite re-execs
+# itself through the spawn primitive, which does take an arbitrary `envp`.
+
+# The marker that tells a re-exec'd copy of this binary what it is for.
+var _T_OCI_REEXEC = "AGNOSAI_TEST_REEXEC=oci-envp";
+
+# `DYLD_LIBRARY_PATH` is on `SANITIZED_ENV_VARS` and is **inert on Linux** —
+# nothing reads it, so unlike `LD_PRELOAD` it plants no loader warnings in the
+# captured streams while still being a variable the filter removes.
+var _T_OCI_MARKER = "DYLD_LIBRARY_PATH=/tmp/agnosai-oci-marker";
+
+fn _t_oci_is_reexec(): i64 {
+    var src = _read_environ_envp();
+    var i = 0;
+    while (src != 0 && load64(src + i * 8) != 0) {
+        if (streq(load64(src + i * 8), _T_OCI_REEXEC) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# What the re-exec'd copy does: run a container and print what it saw.
+#
+# It asserts nothing itself — the parent reads this on stdout and asserts there,
+# so a failure names one assertion instead of nesting two tallies.
+fn _t_oci_reexec_body(): i64 {
+    var c = agnosai_oci_config_new(str_from("alpine:latest"));
+    agnosai_oci_config_set_runtime(c, _t_oci_fake_runtime("env", "env"));
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_oci_execute(c, vec_new(), str_from(""), &e);
+    if (r == 0) { return println("CHILD-FAILED-TO-RUN"); }
+    return println_str(agnosai_oci_result_stdout(r));
+}
+
+fn _t_oci_runtime_inherits_the_unfiltered_environment(): i64 {
+    var src = _read_environ_envp();
+    var n = 0;
+    while (src != 0 && load64(src + n * 8) != 0) { n = n + 1; }
+
+    var envp = alloc((n + 3) * 8);
+    var i = 0;
+    while (i < n) {
+        store64(envp + i * 8, load64(src + i * 8));
+        i = i + 1;
+    }
+    store64(envp + n * 8, _T_OCI_REEXEC);
+    store64(envp + (n + 1) * 8, _T_OCI_MARKER);
+    store64(envp + (n + 2) * 8, 0);
+
+    var argv = alloc(16);
+    store64(argv, "/proc/self/exe");
+    store64(argv + 8, 0);
+    var r = agnosai_spawn_capture_input("/proc/self/exe", argv, envp, str_from(""), 30000, 0);
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the suite re-execs itself");
+
+    var out = agnosai_spawn_stdout(r);
+    assert(str_contains_cstr(out, "CHILD-FAILED-TO-RUN") == 0, "...and the child ran a container");
+    assert(str_contains_cstr(out, "PATH=") == 1,
+    "the runtime gets an environment at all — envp 0 would give it none");
+    assert(str_contains_cstr(out, "/tmp/agnosai-oci-marker") == 1,
+    "...and it is the UNFILTERED one: a variable the sandbox filter strips still reaches the \
+    container runtime, because filtering here would sanitize the wrong process");
+    return 0;
+}
+
 fn _t_oci_execute_timeout(): i64 {
     # `timeout_secs` is the oracle's unit and the primitive takes milliseconds -
     # a missing x1000 would make every container time out a thousand times early.
@@ -391,6 +545,10 @@ fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
 
+    # A re-exec'd copy runs one thing and prints it — see
+    # `_t_oci_runtime_inherits_the_unfiltered_environment`.
+    if (_t_oci_is_reexec() == 1) { return _t_oci_reexec_body(); }
+
     _t_oci_config();
     _t_oci_accepts_valid_images();
     _t_oci_rejects_bad_images();
@@ -402,6 +560,8 @@ fn main(): i64 {
     _t_oci_missing_runtime_returns_error();
     _t_oci_execute_runs_the_built_argv();
     _t_oci_execute_feeds_stdin_and_splits_streams();
+    _t_oci_runtime_that_stops_reading_stdin();
+    _t_oci_runtime_inherits_the_unfiltered_environment();
     _t_oci_execute_timeout();
 
     return assert_summary();

@@ -138,15 +138,47 @@ fn agnosai_python_execute_script(s, script: Str, input: Str, out_err): i64 {
     var wd = 0;
     if (load64(s + AGN_PYS_WORK_DIR) != 0) { wd = str_cstr(load64(s + AGN_PYS_WORK_DIR)); }
 
+    # `#[tracing::instrument(skip_all)]` on the oracle's `execute_script`
+    # (`python.rs:62`), and the shape every sibling backend already used —
+    # `process.cyr:325`, `oci.cyr:355`. This module emitted **nothing at all**
+    # until 2026-08-05, on the highest-risk operation in the subsystem: running
+    # untrusted tool source through an interpreter. Against CLAUDE.md's "sakshi
+    # on all operations", silence here was the wrong default.
+    var dm = str_cat(str_from("spawning python interpreter: "), exe);
+    sakshi_debug(str_data(dm), str_len(dm));
+
     var sp = agnosai_spawn_capture_input(str_cstr(exe), argv, agnosai_sanitized_envp(), input,
     load64(s + AGN_PYS_TIMEOUT_MS), wd);
 
     if (agnosai_spawn_status(sp) == AGNOSAI_SPAWN_FAILED) {
-        store64(out_err, agnosai_error_sandbox(str_from("failed to spawn python process")));
+        # **A bad `work_dir` is an operator's typo, not a missing interpreter**,
+        # and the spawn primitive already tells them apart — `spawn.cyr:328-334`
+        # exists for this, and `_agnosai_process_finish` branches on it. Python
+        # reported everything as "failed to spawn" until 2026-08-05, sending an
+        # operator to look at the wrong thing.
+        var why = str_from("failed to spawn python process");
+        if (agnosai_spawn_fail_reason(sp) == AGNOSAI_SPAWN_FAIL_CHDIR) {
+            why = str_cat(str_from("failed to enter the working directory for "), exe);
+        }
+        store64(out_err, agnosai_error_sandbox(why));
+        return 0;
+    }
+
+    # **An undelivered stdin is an error here and a warning in the siblings**,
+    # and that asymmetry is the oracle's: `python.rs:92-95` propagates
+    # `write_all`'s `Err` with `?`, where `process.rs:133-137` and
+    # `oci.rs:158-162` only `warn!`. An interpreter that never received the data
+    # it was meant to read produced output about nothing, so returning it as
+    # success would be worse than returning nothing.
+    if (agnosai_spawn_stdin_write_failed(sp) == 1) {
+        store64(out_err, agnosai_error_sandbox(str_from(
+        "failed to write to python stdin: Broken pipe (os error 32)")));
         return 0;
     }
 
     if (agnosai_spawn_timed_out(sp) == 1) {
+        var wm = str_cat(str_from("python interpreter timed out, killing: "), exe);
+        sakshi_warn(str_data(wm), str_len(wm));
         # Blanked exactly as `process` and `oci` blank it — `python.rs:114-121`.
         return agnosai_python_result_new(str_from(""), str_from(""), 0 - 1, 1);
     }

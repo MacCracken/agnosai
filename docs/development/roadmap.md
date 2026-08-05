@@ -212,43 +212,88 @@ allocator on parse/build, so the handler half still grows the global bump —
 measured, and owed upstream as B3. The exit bar should read "transport flat,
 handler cost bounded and measured" until that filing lands.
 
-### M7 — `sandbox`, 77% (Phase 6) — 🟡 audit remediation
+### M7 — `sandbox`, 77% (Phase 6) — ✅ audit remediation complete
 
-🔴 **START HERE. The audit of 2026-08-04 found 43 confirmed defects behind a
-green suite** — full evidence and a per-finding fix in
-[m7-audit-2026-08-04.md](m7-audit-2026-08-04.md). All eight modules are
-implemented and every oracle test is ported, but **the milestone is not done
-until this queue is worked**, because several of the findings are live defects
-and several more are security controls that can be deleted with the suite still
-passing.
+**The audit of 2026-08-04 found 43 confirmed defects behind a green suite. All
+43 are now fixed** — full evidence and a per-finding fix in
+[m7-audit-2026-08-04.md](m7-audit-2026-08-04.md), where every entry is marked
+`✅ FIXED` in place.
 
-**3 fixed, 40 open.** Fix order, hardest-consequence first:
+**41 of the 43 are mutation-verified**: the stated mutation applied to a working
+tree, the suite rebuilt and re-run, the failing assertion named, the tree
+restored. The two that are not are log-only (L5, L9) — nothing in this tree
+captures sakshi output, so their mutants survive and the document says so rather
+than counting them as verified.
 
-1. **Live defects (crash / leak).** ✅ `spawn` dup2 fd leak; ✅ `cx` stdin
-   double-close; ✅ `cx` stdout fd leak per run. 🔴 **Remaining:** `python` and
-   `oci` both drop the oracle's stdin-write error handling, so a child that
-   exits without draining stdin kills the **calling process** with SIGPIPE;
-   `spawn`'s `_agnosai_spawn_failure()` early returns leak every descriptor
-   already opened.
-2. **Security controls that can be deleted with the suite green.** The
-   loader-injection filter in `process`, the inherited-env sanitizer in `spawn`,
-   the `FD_CLOEXEC` call site, and cx's network isolation. Plus
-   `kavach_bridge`'s `scan_output`, which hands the gate a raw pointer so the
-   scan length is `strlen()` not `str_len()` — **secrets after an embedded NUL
-   are never scanned.**
-3. **`cx`'s "skips are real" guard is hardcoded to `/home/macro/...`** — on CI it
-   protects nothing, so every execution test can silently skip. This one gates
-   the trustworthiness of the whole cx suite.
-4. **Fail-open divergence:** `manager` treats a 0-second timeout as *no
-   deadline*, the opposite of the "0 means unset" reading applied elsewhere.
-5. **The vacuous-assertion backlog** — the remaining ~25 findings.
+Suites, before → after: policy 90 → **102**, oci 100 → **118**, kavach_bridge
+93 → **136**, spawn 144 → **169**, process 108 → **130**, python 61 → **76**,
+manager 69 → **90**, cx 62 → **87**. **627 → 727 assertions**, and the spawn
+suite runs in **10 s against 32.6 s**, because the 30-second sleep that finding
+H5 proved was measuring nothing is gone.
 
-**Method note for whoever picks this up:** the audit's value came from asking,
-per load-bearing line, *"if I deleted this, which assertion fails?"* — and then
-**actually applying the mutation and running the suite**. Every finding in that
-document was verified that way; do the same for the fixes, because a fix whose
-test cannot fail is not a fix. Two tests written *during* remediation were
-themselves vacuous on the first attempt.
+Fix order as worked, hardest-consequence first:
+
+1. ✅ **Live defects (crash / leak) — all closed.** `spawn` dup2 fd leak; `cx`
+   stdin double-close; `cx` stdout fd leak per run (2026-08-04). Then
+   2026-08-05: the SIGPIPE pair in `python` and `oci` — `spawn` now ignores
+   `SIGPIPE` before the fork, hands the child the default back before `execve`,
+   and tells `EPIPE` apart from `EAGAIN` in the stdin write loop, so an
+   undelivered input is reported instead of killing the calling process; and
+   `spawn`'s `_agnosai_spawn_failure()` early returns, which stranded six
+   descriptors per attempt on exactly the exhausted table that triggers them.
+   All four mutations are killed by a named assertion (the missing `SIG_IGN`
+   one by an exit-141 crash, which is the defect itself).
+2. ✅ **Security controls that could be deleted with the suite green — all
+   closed (2026-08-05).** `kavach_bridge`'s `scan_output` handed the gate a raw
+   pointer, so the scan length was `strlen()` not `str_len()` and a secret after
+   an embedded NUL was released as PASS while ten borrowed clean bytes were
+   BLOCKed by an over-read; it now copies into a NUL-free, NUL-terminated buffer
+   and both directions are pinned. The two env filters — `spawn`'s inherited-env
+   sanitizer and `process`'s loader-injection filter — were **untestable, not
+   merely untested**: no dev or CI environment carries an `LD_*`, so both tests
+   were measuring the machine. Each now takes its source block as a parameter
+   and is driven with all four vectors planted, and `process` calls the shared
+   filter instead of its own copy, so a mutation in `spawn.cyr` fails the
+   `process` suite. The `FD_CLOEXEC` test's premise was false and cost 30 s a
+   run; the replacement closes the grandchild's stdio too, so the errno pipe is
+   the only descriptor left that could hold the spawn open. cx's network
+   isolation is asserted on the policy *and* through a guest reporting its own
+   uid, which is what `require_ns` actually buys.
+3. ✅ **`cx`'s skip guards are real everywhere (2026-08-05).** The hardcoded
+   `/home/macro/...` is gone — the guard resolves `cycc_cx` through the module's
+   own search — and a counter now insists the execution half really ran when
+   both binaries are installed. Renaming either binary away used to drop 22
+   assertions and still exit 0; it now fails. `agnosai_cx_interpreter_path` can
+   answer 0 again (M22), which also refuses a cwd-plantable relative name that
+   `access()` and `execve()` would otherwise resolve against the process's
+   directory.
+4. ✅ **Fail-open divergences — both closed (2026-08-05).** `manager` treated a
+   0-second timeout as *no deadline*, the opposite of the "0 means unset"
+   reading applied elsewhere, and a `/bin/sleep 3` ran to completion under it
+   (M17). The helper now works in **milliseconds** so 0 can resolve to "fires at
+   once" — and the OCI arm floors its seconds conversion at 1, because rounding
+   1 ms down to 0 would have restored the same fail-open one layer lower, which
+   only a second test caught. `policy`'s parser now refuses negative durations
+   and sizes (M1); `-1` reached kavach as `timeout_ms: -1000`, and kavach arms a
+   deadline only `if (timeout_ms > 0)`.
+5. ✅ **The vacuous-assertion backlog — all 25 worked (2026-08-05).**
+
+**Method note, because it is the transferable part.** The recurring shape was
+not a missing assertion but an **unreachable** one — the control was fine, and
+no test could be written that would fail without it. Five fixes worked by
+splitting a function so the thing under test could be handed its input
+(`_agnosai_sanitized_envp_of`, `_agnosai_process_envp_from`,
+`_agnosai_cx_resolve_interpreter`, `_agnosai_cx_budget_ms`,
+`_agnosai_sandbox_manager_timeout_ms`); two more by **re-execing the suite
+through its own spawn primitive with a planted `envp`**, which is the only way a
+process with no `setenv` can put a variable in its own environment. When an
+assertion cannot be made to fail, that is usually a statement about the shape of
+the code, not about the test.
+
+And the standing rule: *"if I deleted this, which assertion fails?"* — then
+**actually apply the mutation and run the suite**. Two tests written during
+remediation asserted nothing on the first attempt, and one mutation written to
+verify a fix was not a faithful revert and passed for the wrong reason.
 
 **Unrelated, noticed while verifying:** the full `cyrius tests tests` run now
 exceeds ~570 s and stalls in **`server_sse`**, which no sandbox change touches.
@@ -544,11 +589,23 @@ Nothing here blocks agnosai today; each is a residual agnosai measured and hande
 
 | Dep | Open filings |
 |---|---|
-| cyrius | `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md` — ✅ **resolved in 6.5.4 and consumed** (`src/order.cyr` is now a wrapper). **Filed 2026-08-03:** `2026-08-03-agnosai-no-sys-exit-group-wrapper.md` (no `sys_exit_group` wrapper — `sys_exit` ends one thread, so a threaded program's idiomatic epilogue hangs the process; repro + measured 124-vs-0 included) and `2026-08-03-sandhi-async-await-readable-has-no-timeout.md` (hardcoded `-1` epoll timeout at `lib/async.cyr:823` makes a cooperative server unwakeable; found while building sandhi 1.9.9's stop facility, worked around there with a bounded sleep). Still open: `2026-07-28-sock-send-result-allocates-per-call.md` (16 B/response, pinned by an exact-bound test in sandhi), `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md`, `2026-07-29-fmt-int-buf-i64-min.md` |
+| cyrius | `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md` — ✅ **resolved in 6.5.4 and consumed** (`src/order.cyr` is now a wrapper). **Filed 2026-08-03:** `2026-08-03-agnosai-no-sys-exit-group-wrapper.md` (no `sys_exit_group` wrapper — `sys_exit` ends one thread, so a threaded program's idiomatic epilogue hangs the process; repro + measured 124-vs-0 included) and `2026-08-03-sandhi-async-await-readable-has-no-timeout.md` (hardcoded `-1` epoll timeout at `lib/async.cyr:823` makes a cooperative server unwakeable; found while building sandhi 1.9.9's stop facility, worked around there with a bounded sleep). Still open: `2026-07-28-sock-send-result-allocates-per-call.md` (16 B/response, pinned by an exact-bound test in sandhi), `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md`, `2026-07-29-fmt-int-buf-i64-min.md`. **Filed 2026-08-05:** `2026-08-05-syscalls-has-signal-ignore-but-no-way-back-to-sig-dfl.md` (`signal_ignore` has no counterpart, so a process that ignores a signal cannot hand the default back to a child it execs — `SIG_IGN` survives `execve`; workaround owed for deletion under C2) and `2026-08-05-cyrius-bench-accepts-an-unusable-argument-and-exits-0.md` (`cyrius bench <dir>` / a misspelled path runs nothing, prints nothing, exits **0** — same root cause as the already-filed `cyrius build` missing-file bug, since `bench <file>` is build-and-run; cross-triage the two) |
 | sandhi | **Serve-loop stop facility — ✅ FILED, FIXED as sandhi 1.9.9, VENDORED in cyrius 6.5.6, and CONSUMED** (all 2026-08-03). `sandhi_server_options_stop_flag(opts, ptr)` on all five loops; agnosai now drains on SIGINT/SIGTERM ([ADR 013](../adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md), superseding 012). Still open: `backlog` silently ignored by `run_opts`/`run_async`; chunked start hardcodes `" OK"`; **inbound** chunked decoding unsupported (1.9.4 answers 501 — honest, but not support) |
 | bayan | **Nothing open.** The `_a` JSON ask shipped as bayan 1.4.0 (folded in cyrius 6.5.5). The YAML ask (`2026-07-16-...`) has **also shipped and this row was stale** — `bayan_yaml_parse` / `_parse_buf` / `_parse_ctx` return a `json_v*` tagged value tree, plus `bayan_yaml_frontmatter_split`. Verified 2026-08-03 by parsing a scalar+sequence document, resolving a key through `bayan_json_v_obj_get`, and re-serializing via `bayan_json_v_build`. **This unblocks M10's YAML half**, which the exclusion table still lists as deferred — revisit that scope call before starting M10. |
 | sigil | `2026-07-30-rsa-verify-uses-secret-exponent-ladder.md` — ✅ **archived upstream**, fixed, vendored and **measured** (see C1). |
 | bote | `serverInfo` hardcoded to `"bote"` in `dispatcher_dispatch` — ✅ **fixed as bote 3.3.0** (`dispatcher_set_server_info`). Pin bump owed under B1. |
+| kavach | All five M7 filings are **✅ resolved** (3.11.3–3.11.6 — seccomp/landlock on both exec paths, `timeout_ms` honoured, real exit code and stderr, namespaces on the persistent path). **Filed 2026-08-05:** `2026-08-05-gate-apply-measures-with-strlen-so-it-cannot-scan-a-length-carrying-string.md` — the externalization gate measures artifacts with `strlen`, so a secret after an embedded NUL is **released as PASS** (measured: identical 23 bytes PASS with a NUL, BLOCK with a space) and a borrowed slice is scanned past its own end. Asks for a length-carrying `gate_apply` or a `Str`-taking overload. **Workaround owed for deletion when it lands** — see C2. |
+
+**C2 — two local workarounds owed for deletion, both tied to a filing above.**
+Neither is a defect; each is code that exists only because an upstream API
+cannot express the thing, and each has a precise deletion condition. Recorded
+here because this list is the project's definition of "owed", and a temporary
+workaround that no list names is a permanent one.
+
+| Workaround | Where | Delete when |
+|---|---|---|
+| `_agnosai_signal_default` | `src/sandbox/spawn.cyr` | cyrius ships `signal_default` (filed `2026-08-05-syscalls-has-signal-ignore-but-no-way-back-to-sig-dfl.md`). ~20 lines, Linux arms only; the call site in the child stays, only the local definition goes. |
+| `_agnosai_kavach_gate_bytes` | `src/sandbox/kavach_bridge.cyr` | kavach ships a length-carrying `gate_apply`. The copy can then go entirely — today it also **rewrites interior NULs to `\n`**, which is the part worth removing: it scans the whole artifact but the gate no longer sees the exact bytes. |
 
 **C1 — ✅ RESOLVED 2026-07-31.** This read *"`cyrius deps` has not been re-run
 since the fix landed"*, which is no longer true: `lib/sigil.cyr` is the pinned
@@ -581,6 +638,21 @@ documented in place as unreachable rather than implied to fire: `agents.rs`'s
 serialize skip, the cycle-detector's `== 2` memoization arm, `crews.rs`'s profile
 skip, and `crew_runner.rs`'s personality prompt block (bhava, post-v2 per the
 user decree at line 18 of this file).
+
+**Added from M7 (2026-08-05), so the next audit does not re-find them.** The
+2026-08-04 audit reached both and correctly rated neither a defect; they are
+listed because "no test covers this" is true of both and will keep being true:
+
+- **`kavach_bridge`'s "start failed" arm.** kavach's `valid_transition` accepts
+  `CREATED -> RUNNING` unconditionally, so a freshly created sandbox always
+  starts. Kept because the oracle has the arm. It is the one of the three error
+  paths that *can* carry a kavach error code, and now does.
+- **Two log-only fixes whose mutants survive — L5 and L9.** Nothing in this tree
+  captures sakshi output, so `sakshi_warn`'s corrected length and the manager's
+  restored dispatch `debug!` cannot be asserted. Both are correct; neither is
+  verifiable. Said plainly in the audit document's Status section rather than
+  counted as mutation-verified, and repeated here because a future sweep will
+  otherwise flag them as untested code.
 
 ## Carried over from the Rust line
 

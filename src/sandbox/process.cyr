@@ -228,13 +228,27 @@ fn _agnosai_process_work_dir_cstr(c): i64 {
 # tool-controlled input would turn the escape hatch into an injection vector,
 # so config must stay operator-owned.
 fn _agnosai_process_envp(c): i64 {
+    return _agnosai_process_envp_from(c, _read_environ_envp());
+}
+
+# The body of `_agnosai_process_envp`, over an explicitly supplied `envp`.
+#
+# **Split out for the same reason its `spawn` sibling was, and it had a second
+# problem on top.** This function used to re-implement the loader-injection
+# filter rather than call the shared one, so `sandbox_spawn`'s coverage of
+# `agnosai_sanitized_envp` protected nothing here — the audit of 2026-08-04
+# replaced the guard with an unconditional `vec_push` and the suite stayed at
+# 108/108. It now calls `_agnosai_sanitized_envp_of`, so there is one filter and
+# one place to get it wrong, and the `src` parameter lets a test hand it a block
+# that actually carries an `LD_PRELOAD` instead of hoping the ambient
+# environment does.
+fn _agnosai_process_envp_from(c, src): i64 {
     var base = vec_new();
     if (load64(c + AGN_PRC_CLEAN_ENV) == 0) {
-        var src = _read_environ_envp();
+        var kept = _agnosai_sanitized_envp_of(src);
         var i = 0;
-        while (src != 0 && load64(src + i * 8) != 0) {
-            var e = load64(src + i * 8);
-            if (agnosai_env_entry_is_sanitized(e) == 0) { vec_push(base, str_from(e)); }
+        while (load64(kept + i * 8) != 0) {
+            vec_push(base, str_from(load64(kept + i * 8)));
             i = i + 1;
         }
     }
@@ -280,6 +294,14 @@ fn _agnosai_process_finish(sp, what: Str, out_err): i64 {
         }
         store64(out_err, agnosai_error_sandbox(str_cat(why, what)));
         return 0;
+    }
+
+    # `process.rs:133-137` logs and carries on — the program ran and its output
+    # stands, whether or not it read what it was given. Only `python` escalates
+    # this to an error; see the note there.
+    if (agnosai_spawn_stdin_write_failed(sp) == 1) {
+        var im = str_cat(str_from("failed to write to process stdin: "), what);
+        sakshi_warn(str_data(im), str_len(im));
     }
 
     if (agnosai_spawn_timed_out(sp) == 1) {

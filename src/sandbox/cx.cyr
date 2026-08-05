@@ -237,6 +237,24 @@ var AGNOSAI_CX_POLL_MS = 5;
 # accepted cost. Losing the timeout too would leave no bound at all.
 var AGNOSAI_CX_TIMEOUT_MS = 30 * 1000;
 
+# The wall-clock budget a run actually gets, resolving a non-positive request.
+#
+# **A non-positive budget is the DEFAULT, not "run forever".**
+# `AGNOSAI_CX_TIMEOUT_MS` is documented above as the default budget and was
+# applied by nothing until 2026-08-05: `agnosai_cx_run(cyx, 0, &e)` installed no
+# deadline at all, and the audit of 2026-08-04 measured a probe that never
+# returned and had to be killed by hand. Since this timeout is the only CPU
+# bound cx has — ADR-006 gave up wasmtime's fuel metering for it — "no deadline"
+# is the one value it must never resolve to.
+#
+# A separate function rather than three lines inside the runner, because the
+# alternative test costs the full 30-second default to observe once. Here the
+# resolution is a value, and a value can be asserted in microseconds.
+fn _agnosai_cx_budget_ms(timeout_ms): i64 {
+    if (timeout_ms <= 0) { return AGNOSAI_CX_TIMEOUT_MS; }
+    return timeout_ms;
+}
+
 enum AgnosaiCxResultOff {
     AGN_CXR_STDOUT = 0;
     AGN_CXR_EXIT_CODE = 8;
@@ -266,13 +284,41 @@ fn agnosai_cx_result_exit_code(r): i64 { return load64(r + AGN_CXR_EXIT_CODE); }
 # Whether the deadline fired.
 fn agnosai_cx_result_timed_out(r): i64 { return load64(r + AGN_CXR_TIMED_OUT); }
 
-# The absolute path of `cxvm`, or 0 when it is not installed.
+# Resolve `name` to an absolute executable path, or 0 if it is not one.
+#
+# **The two checks are why the public form below can answer 0 at all.**
+# `_agnosai_spawn_resolve` returns the name *unchanged* when nothing on `PATH`
+# matches (`spawn.cyr:368-404`, documented there), so before 2026-08-05 a bare
+# `"cxvm"` came back as `"cxvm"` and the documented `0` was unreachable — which
+# made `agnosai_cx_run`'s guard and both of the test suite's skip guards dead
+# code, all three found by the audit of 2026-08-04.
+#
+# It is also a live vector, and that is why it is fixed here rather than in the
+# callers. A bare relative name reaches `sys_access` and then `execve`, **both
+# resolved against the process's current directory** — the audit planted an
+# executable `cxvm-planted` beside the process, watched the guard pass, and
+# watched the run proceed with the planted script's exit code. Requiring a
+# leading `/` refuses that: a resolver that found nothing hands back something
+# with no slash, and a configured relative path is not an installed interpreter.
+#
+# Split out from the public form so the rejections can be tested — on a machine
+# that *has* `cxvm` nothing else can reach them, which is how they came to be
+# missing in the first place.
+fn _agnosai_cx_resolve_interpreter(name): i64 {
+    var p = _agnosai_spawn_resolve(name, agnosai_sanitized_envp());
+    if (load8(p) != 47) { return 0; }
+    if (sys_access(p, AGNOSAI_SPAWN_X_OK) != 0) { return 0; }
+    return p;
+}
+
+# The absolute path of `cxvm`, or 0 when it is not installed or not executable.
 #
 # **Absolute, because kavach will not resolve it.** `persistent_spawn` execs
 # `args[0]` directly with no `PATH` search, so a bare `"cxvm"` fails to spawn on
-# a machine that has it. The search reuses the spawn primitive's resolver.
+# a machine that has it. The search reuses the spawn primitive's resolver, and
+# `_agnosai_cx_resolve_interpreter` above turns its fail-open answer into a 0.
 fn agnosai_cx_interpreter_path(): i64 {
-    return _agnosai_spawn_resolve(AGNOSAI_CX_INTERPRETER, agnosai_sanitized_envp());
+    return _agnosai_cx_resolve_interpreter(AGNOSAI_CX_INTERPRETER);
 }
 
 # The directory holding `cxvm`, as a `Str`.
@@ -337,8 +383,11 @@ fn agnosai_cx_run(cyx: Str, timeout_ms, out_err): i64 {
         return 0;
     }
 
+    # `agnosai_cx_interpreter_path` now owns both halves of this question — it
+    # answers 0 for a name that resolved to nothing and for one that is not
+    # executable, where it could previously answer neither.
     var exe = agnosai_cx_interpreter_path();
-    if (exe == 0 || sys_access(exe, 1) != 0) {
+    if (exe == 0) {
         store64(out_err, agnosai_error_sandbox(str_from(
         "cxvm is not installed or not executable")));
         return 0;
@@ -368,8 +417,7 @@ fn agnosai_cx_run(cyx: Str, timeout_ms, out_err): i64 {
 
     _agnosai_fd_set_nonblock(PersistentGuest_stdout_fd(g));
 
-    var deadline = 0;
-    if (timeout_ms > 0) { deadline = clock_now_ms() + timeout_ms; }
+    var deadline = clock_now_ms() + _agnosai_cx_budget_ms(timeout_ms);
 
     var ob = str_builder_new();
     var buf = alloc(AGNOSAI_SPAWN_CHUNK);
@@ -381,7 +429,7 @@ fn agnosai_cx_run(cyx: Str, timeout_ms, out_err): i64 {
         if (n > 0) { str_builder_add(ob, str_new(buf, n)); }
         if (n == 0) { done = 1; }
         if (n < 0) {
-            if (deadline > 0 && clock_now_ms() >= deadline) {
+            if (clock_now_ms() >= deadline) {
                 persistent_terminate(g);
                 killed = 1;
                 done = 1;
@@ -393,6 +441,17 @@ fn agnosai_cx_run(cyx: Str, timeout_ms, out_err): i64 {
 
     if (killed == 1) {
         # `persistent_terminate` already closed stdout and reaped.
+        #
+        # **The drained output is discarded on purpose, and it was not written
+        # down.** The audit of 2026-08-04 found the arm unpinned in both
+        # directions — swapping `str_from("")` for `str_builder_build(ob)` left
+        # the suite at 62/62 — and unlike the same decision in the spawn
+        # primitive, which argues it against `process.rs:154-160`, this carried
+        # no comment at all. The choice matches what `process`, `oci` and
+        # `python` each do at their own timeout arm: a tool that blew its budget
+        # produced no result, and half an answer is worse than none because a
+        # caller cannot tell it is half. `agnosai_cx_result_timed_out` is how a
+        # caller learns there was output it is not being shown.
         return agnosai_cx_result_new(str_from(""), 0 - 1, 1);
     }
 

@@ -98,6 +98,14 @@ fn _t_named_policies(): i64 {
 
     var p = agnosai_sandbox_policy_process();
     assert(agnosai_sandbox_policy_needs_filesystem(p) == 1, "process: needs filesystem");
+    # **`effective_isolation` cannot see this field**, and that is why it needs
+    # its own assertion. With `needs_filesystem` set, PROCESS is re-derived from
+    # any minimum at or below it — so the audit of 2026-08-04 changed
+    # `min_isolation` to `None` and all 90 assertions still passed. `native()`
+    # and `wasm()` assert theirs directly; `process()` was the one that did not.
+    assert(agnosai_sandbox_policy_min_isolation(p) == AGNOSAI_ISOLATION_PROCESS,
+    "process: the STATED minimum is Process, not merely the derived one");
+    assert(agnosai_sandbox_policy_needs_network(p) == 0, "process: no network");
     assert(agnosai_sandbox_policy_effective_isolation(p) == AGNOSAI_ISOLATION_PROCESS,
     "process: Process");
     assert(agnosai_sandbox_policy_max_duration_secs(p) == 60, "process: 60 s");
@@ -174,6 +182,17 @@ fn _t_wire_roundtrip(): i64 {
     assert(str_contains_cstr(j, "\"needs_network\":true") == 1, "bools are JSON bools, not 0/1");
     assert(str_contains_cstr(j, "\"max_memory_bytes\":536870912") == 1, "and numbers are numbers");
 
+    # **The whole document, in order.** The three fragment checks above are
+    # order-blind and `from_value` reads by key, so the round trip is too — the
+    # audit of 2026-08-04 swapped the `needs_filesystem` and `needs_network`
+    # blocks in the builder and all 90 assertions passed, against a comment in
+    # `policy.cyr` that makes an explicit parity claim ("the struct's
+    # declaration order — which is the order serde emits"). A claim nothing can
+    # observe is a claim that drifts.
+    assert(str_eq_cstr(j,
+    "{\"min_isolation\":\"Oci\",\"needs_filesystem\":true,\"needs_network\":true,\"max_duration_secs\":120,\"max_memory_bytes\":536870912}")
+    == 1, "the wire document is serde's declaration order, end to end");
+
     var back = agnosai_sandbox_policy_from_json(j);
     assert(back != 0, "and parses back");
     assert(agnosai_sandbox_policy_min_isolation(back) == AGNOSAI_ISOLATION_OCI,
@@ -187,12 +206,28 @@ fn _t_wire_roundtrip(): i64 {
     # exist so a caller inside a per-request arena is not forced onto the global
     # bump, and a caller that already holds a parsed value is not forced to
     # re-serialise it just to parse it back.
+    #
+    # **And the arena has to be the one it was handed.** Content is byte
+    # identical either way, so a `_a` form that discards its allocator and falls
+    # back to the global bump passes every assertion about the output — the
+    # audit of 2026-08-04 rewrote `to_json_a` to `default_alloc()` and the suite
+    # stayed at 90/90. Against CLAUDE.md's standing `_a` threading rule that is
+    # an unbounded leak on a no-free allocator, so the measurement is the
+    # assertion: bytes must come out of `ar`.
+    # Measured around each call SEPARATELY: a single before/after spanning both
+    # is satisfied by whichever one still threads its allocator, so it cannot
+    # tell which of the two was un-threaded.
     var ar = arena_allocator(8192);
+    var b0 = arena_used(allocator_state(ar));
     var ja = agnosai_sandbox_policy_to_json_a(ar, c);
+    var a0 = arena_used(allocator_state(ar));
     assert(str_eq(ja, j) == 1, "the _a form serialises byte-identically to the global one");
+    assert(a0 > b0, "...out of the arena it was handed, not the global bump");
+
     var va = agnosai_sandbox_policy_to_value_a(ar, c);
     assert(va != 0, "and the _a value form builds");
     assert(bayan_json_v_is_obj(va) == 1, "...as an object");
+    assert(arena_used(allocator_state(ar)) > a0, "...also out of that arena");
 
     var v = agnosai_sandbox_policy_to_value(c);
     var fromv = agnosai_sandbox_policy_from_value(v);
@@ -208,6 +243,15 @@ fn _t_wire_roundtrip(): i64 {
     var n = agnosai_sandbox_policy_from_json(agnosai_sandbox_policy_to_json(
     agnosai_sandbox_policy_native()));
     assert(agnosai_sandbox_policy_min_isolation(n) == AGNOSAI_ISOLATION_NONE, "native round-trips");
+
+    # `process()` was the one named policy never serialised in a test, so its
+    # wire spelling was unpinned in both directions.
+    var pj = agnosai_sandbox_policy_to_json(agnosai_sandbox_policy_process());
+    assert(str_contains_cstr(pj, "\"min_isolation\":\"Process\"") == 1,
+    "process spells its level `Process` on the wire");
+    var pr = agnosai_sandbox_policy_from_json(pj);
+    assert(agnosai_sandbox_policy_min_isolation(pr) == AGNOSAI_ISOLATION_PROCESS,
+    "...and reads back as Process");
     return 0;
 }
 
@@ -229,11 +273,33 @@ fn _t_wire_malformed(): i64 {
     # A field of the wrong type is ignored rather than read through the wrong
     # tag, so it also falls back to the default.
     var bad = agnosai_sandbox_policy_from_json(str_from(
-    "{\"min_isolation\":7,\"needs_network\":\"yes\",\"max_duration_secs\":\"soon\"}"));
+    "{\"min_isolation\":7,\"needs_network\":\"yes\",\"max_duration_secs\":\"soon\",\"max_memory_bytes\":\"lots\"}"));
     assert(agnosai_sandbox_policy_min_isolation(bad) == AGNOSAI_ISOLATION_WASM,
     "a numeric min_isolation is not a valid spelling — default");
     assert(agnosai_sandbox_policy_needs_network(bad) == 0, "a string bool is ignored");
     assert(agnosai_sandbox_policy_max_duration_secs(bad) == 30, "a string duration is ignored");
+    # The wasm default's memory cap is 64 MiB and non-zero, so this one can
+    # actually fail — the audit measured the unguarded read answering 0. (The
+    # `needs_filesystem` guard is *not* testable the same way: `bayan_json_v_bool`
+    # is itself tag-safe and the default is 0, so dropping it is an equivalent
+    # mutant no input can kill. It is left in place as documentation of intent.)
+    assert(agnosai_sandbox_policy_max_memory_bytes(bad) == 67108864,
+    "a string memory cap is ignored — reading it through the wrong tag would answer 0");
+
+    # **Out of DOMAIN, not merely out of type.** The oracle's fields are `u64`
+    # and `usize`, so serde refuses a negative outright; the port read it
+    # signed, and `-1` reached kavach as `timeout_ms: -1000` — where a deadline
+    # is armed only `if (timeout_ms > 0)`, so a negative duration armed none.
+    var neg = agnosai_sandbox_policy_from_json(str_from(
+    "{\"max_duration_secs\":-1,\"max_memory_bytes\":-1}"));
+    assert(neg != 0, "the document still parses");
+    assert(agnosai_sandbox_policy_max_duration_secs(neg) == 30,
+    "a NEGATIVE duration falls back to the default — it does not become 'no deadline'");
+    assert(agnosai_sandbox_policy_max_memory_bytes(neg) == 67108864,
+    "...and so does a negative memory cap");
+    assert(agnosai_sandbox_policy_max_duration_secs(
+    agnosai_sandbox_policy_from_json(str_from("{\"max_duration_secs\":0}"))) == 0,
+    "zero is still accepted — it means 'unset', which the manager reads and bounds");
 
     # An unknown LEVEL NAME is likewise refused rather than silently accepted.
     var unk = agnosai_sandbox_policy_from_json(str_from("{\"min_isolation\":\"Nitro\"}"));

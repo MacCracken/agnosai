@@ -118,8 +118,19 @@ fn agnosai_kavach_build_config(policy, agent_id): i64 {
     var c = config_new();
     config_backend(c, agnosai_kavach_map_backend(eff));
     config_network(c, agnosai_sandbox_policy_needs_network(policy));
-    config_timeout_ms(c, agnosai_sandbox_policy_max_duration_secs(policy) * 1000);
-    if (agent_id != 0) { config_agent_id(c, str_data(agent_id)); }
+    # Guarded, as defence in depth behind `from_value`'s clamp: kavach arms a
+    # deadline only `if (timeout_ms > 0)` (`lib/kavach.cyr:8354`), so a negative
+    # duration arriving from anywhere would arm none at all. A policy built by
+    # hand does not pass through the parser.
+    var secs = agnosai_sandbox_policy_max_duration_secs(policy);
+    if (secs < 0) { secs = 0; }
+    config_timeout_ms(c, secs * 1000);
+    # `str_cstr`, not `str_data`: kavach stores the pointer verbatim
+    # (`lib/kavach.cyr:3459`) and every later reader is `strlen`-based, but a
+    # `Str`'s bytes carry no terminator — `str_new` and `str_substr` do not add
+    # one (`lib/str.cyr:42-53`, `:634-640`). A borrowed pointer therefore reads
+    # past the string into whatever the arena holds next.
+    if (agent_id != 0) { config_agent_id(c, str_cstr(agent_id)); }
     # Unconditional, exactly as the oracle does it — every sandbox gets the
     # default gate policy, regardless of isolation level.
     config_externalization(c, ext_policy_default());
@@ -181,6 +192,46 @@ fn agnosai_kavach_policy_for_trust(trust: Str): i64 {
     return ext_policy_default();
 }
 
+# A NUL-terminated copy of `output` that the gate can scan **whole**.
+#
+# **The gate is `strlen`-based end to end and a `Str` is not a C string.**
+# `gate_apply` measures with `strlen(stdout)` (`lib/kavach.cyr:5719`) and
+# `_concat_with_nl` copies with `strlen` (`:5693`), so handing it `str_data`
+# gets the length wrong in both directions at once, and the audit of 2026-08-04
+# measured both:
+#
+# - **Under-scan.** `str_new(buf, 23)` over `"ok\0AKIAIOSFODNN7EXAMPLE"` scanned
+#   two bytes and returned PASS, releasing a credential the same 23 bytes with a
+#   space in place of the NUL correctly BLOCKed.
+# - **Over-read.** `str_substr(...)` of ten clean bytes BLOCKed, because `strlen`
+#   ran off the end of the borrowed slice into the rest of the arena. `str_new`
+#   and `str_substr` do not terminate (`lib/str.cyr:42-53`, `:634-640`).
+#
+# The oracle has neither problem: `kavach_bridge.rs:159` passes a `String`, and
+# Rust carries its length. Copying is the price of a C-string API — and the
+# interior NULs become newlines rather than truncating the scan, because
+# `_concat_with_nl` already joins stdout to stderr with a newline, so it is a
+# separator the scanners are known to handle and no detector pattern matches it.
+#
+# Filed upstream as kavach
+# `2026-08-05-gate-apply-measures-with-strlen-so-it-cannot-scan-a-length-carrying-string.md`;
+# until a length-carrying `gate_apply` lands, no NUL-safe spelling exists that
+# does not copy.
+fn _agnosai_kavach_gate_bytes(output: Str): i64 {
+    var n = str_len(output);
+    var src = str_data(output);
+    var buf = alloc(n + 1);
+    var i = 0;
+    while (i < n) {
+        var c = load8(src + i);
+        if (c == 0) { c = 10; }
+        store8(buf + i, c);
+        i = i + 1;
+    }
+    store8(buf + n, 0);
+    return buf;
+}
+
 # `scan_output` — run the externalization gate over a raw string.
 #
 # **Returns only PASS or BLOCK.** kavach's gate produces four verdicts and this
@@ -189,7 +240,7 @@ fn agnosai_kavach_policy_for_trust(trust: Str): i64 {
 fn agnosai_kavach_scan_output(output: Str): i64 {
     var r = exec_result_new();
     ExecResult_set_exit_code(r, 0);
-    ExecResult_set_stdout(r, str_data(output));
+    ExecResult_set_stdout(r, _agnosai_kavach_gate_bytes(output));
     ExecResult_set_stderr(r, "");
     ExecResult_set_duration_ms(r, 0);
     ExecResult_set_timed_out(r, 0);
@@ -300,6 +351,23 @@ fn _agnosai_kavach_ensure_init(): i64 {
 # **3.11.4 is the floor for this module.** Against 3.11.3 or earlier a policy's
 # `max_duration_secs` reaches kavach and is dropped.
 #
+# ## The three error messages, and what they can and cannot say
+#
+# The oracle formats the cause into each — `format!("kavach create failed: {e}")`
+# and its two siblings (`kavach_bridge.rs:112`, `:116`, `:129`). Only one of the
+# three can be matched here, and the difference is kavach's API, not a choice:
+# `sandbox_create` and `sandbox_exec` both signal failure by **returning 0**, so
+# there is no code to interpolate, while `sandbox_transition` returns a
+# `KAVACH_ERR_*` and the start arm carries it. The audit of 2026-08-04 flagged
+# the fixed strings; this records the half that cannot be fixed on this side.
+#
+# **The exec arm is not theoretical.** `sandbox_exec` returns 0 on BLOCK and on
+# QUARANTINE (`lib/kavach.cyr:11011-11018`), so `/bin/echo <an AWS key>` — the
+# ordinary "tool output contained a secret" case — lands there. A command whose
+# *program* is missing does not: kavach's process backend answers with a
+# diagnostic `ExecResult` and exit 127, which is a successful execution
+# reporting a failure.
+#
 # Returns 0 with `out_err` set when the sandbox cannot be created, started, or
 # executed in.
 fn agnosai_kavach_execute(command: Str, policy, agent_id, out_err): i64 {
@@ -313,25 +381,35 @@ fn agnosai_kavach_execute(command: Str, policy, agent_id, out_err): i64 {
         return 0;
     }
 
-    if (sandbox_transition(sandbox, SandboxState.RUNNING) != KAVACH_ERR_OK) {
+    var started = sandbox_transition(sandbox, SandboxState.RUNNING);
+    if (started != KAVACH_ERR_OK) {
         # **Defensive, and currently unreachable**: kavach's `valid_transition`
         # accepts CREATED → RUNNING unconditionally, so a freshly created
         # sandbox always starts. Kept because the oracle has the arm and
         # because "the transition table never changes" is not a thing to rely
         # on. Destroys first: started or not, the sandbox exists.
         sandbox_destroy(sandbox);
-        store64(out_err, agnosai_error_sandbox(str_from("kavach start failed")));
+        store64(out_err, agnosai_error_sandbox(str_cat(
+        str_from("kavach start failed: "), str_from_int(started))));
         return 0;
     }
 
     var result = sandbox_exec(sandbox, str_cstr(command));
 
     # Always destroy, even on exec failure — `kavach_bridge.rs:120-127`.
+    #
+    # `str_len`, not a hand-counted literal: the count here was 43 against a
+    # 44-byte message until 2026-08-05, so the closing paren was dropped from
+    # every emission of it. The sibling backends already used the
+    # length-carrying form (`process.cyr:287`, `oci.cyr:370`); this was the one
+    # hardcoded count in `src/sandbox` and it was off by one.
     if (sandbox_transition(sandbox, SandboxState.STOPPED) != KAVACH_ERR_OK) {
-        sakshi_warn("kavach stop failed (continuing with destroy)", 43);
+        var sm = str_from("kavach stop failed (continuing with destroy)");
+        sakshi_warn(str_data(sm), str_len(sm));
     }
     if (sandbox_transition(sandbox, SandboxState.DESTROYED) != KAVACH_ERR_OK) {
-        sakshi_warn("kavach destroy failed", 21);
+        var dm = str_from("kavach destroy failed");
+        sakshi_warn(str_data(dm), str_len(dm));
     }
 
     if (result == 0) {

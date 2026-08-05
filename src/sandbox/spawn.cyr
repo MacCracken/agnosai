@@ -147,7 +147,20 @@ fn agnosai_env_entry_is_sanitized(entry): i64 {
 # The entries point into the same heap blob `_read_environ_envp` allocated, so
 # the array survives `fork` without copying strings.
 fn agnosai_sanitized_envp(): i64 {
-    var src = _read_environ_envp();
+    return _agnosai_sanitized_envp_of(_read_environ_envp());
+}
+
+# The filter itself, over an explicitly supplied `envp` array.
+#
+# **Split out so the control can be tested against a block that actually
+# contains one of the variables.** The audit of 2026-08-04 deleted the filter
+# outright — `if (agnosai_env_entry_is_sanitized(e) == 0)` replaced by
+# `if (1 == 1)` — and the suite reported 144/144, byte for byte the baseline,
+# because no developer or CI environment carries an `LD_*` for it to remove.
+# Re-running the same mutant with `LD_PRELOAD` exported produced three failures,
+# which is the point: the test was measuring the ambient environment, not the
+# code. A caller-supplied block removes the environment from the question.
+fn _agnosai_sanitized_envp_of(src): i64 {
     if (src == 0) {
         var empty = alloc(8);
         store64(empty, 0);
@@ -249,6 +262,24 @@ fn agnosai_fd_set_cloexec(fd): i64 {
 # `F_SETFL` — the `fcntl` op that sets file-status flags.
 var AGNOSAI_F_SETFL = 4;
 
+# `EPIPE` — the pipe this was written to has no reader left.
+#
+# Named here because `lib/syscalls_x86_64_linux.cyr`'s `Errno` enum stops short
+# of it and the one definition in the tree belongs to a dependency
+# (`lib/kavach.cyr:649`), whose enum agnosai must not bind to by accident. The
+# stdin write loop is the only caller and it needs to tell this apart from
+# `EAGAIN`: `EAGAIN` means come back next turn, `EPIPE` means there is no next
+# turn.
+var AGNOSAI_SPAWN_EPIPE = 32;
+
+# `rt_sigaction`'s syscall number, and the two dispositions this module sets.
+#
+# `lib/syscalls.cyr` exposes `signal_ignore` but no way back to the default, and
+# the child needs the way back — see `_agnosai_signal_default`. Filed upstream;
+# the constant is local until that lands.
+var AGNOSAI_SPAWN_SIG_DFL = 0;
+var AGNOSAI_SPAWN_SIGACTION_SIZE = 32;
+
 # How much is read per drain iteration.
 var AGNOSAI_SPAWN_CHUNK = 4096;
 
@@ -272,7 +303,8 @@ enum AgnosaiSpawnResultOff {
     AGN_SPR_SIGNAL = 32;
     AGN_SPR_TIMED_OUT = 40;
     AGN_SPR_FAIL_REASON = 48;
-    AGN_SPR_SIZE = 56;
+    AGN_SPR_STDIN_ERR = 56;
+    AGN_SPR_SIZE = 64;
 }
 
 # Whether the spawn itself succeeded — `AGNOSAI_SPAWN_OK` or `_FAILED`.
@@ -314,6 +346,18 @@ fn agnosai_spawn_timed_out(r): i64 { return load64(r + AGN_SPR_TIMED_OUT); }
 # `AGNOSAI_SPAWN_FAIL_NONE` on every successful spawn, including one whose child
 # exited non-zero — a program that ran and failed is not a spawn failure.
 fn agnosai_spawn_fail_reason(r): i64 { return load64(r + AGN_SPR_FAIL_REASON); }
+
+# Whether the input could not be delivered because the child stopped reading.
+#
+# **Not a spawn failure and not an error here.** The program ran; it simply
+# exited — or closed stdin — before draining what it was given, so `status` is
+# still `AGNOSAI_SPAWN_OK` and whatever it wrote is still captured. The oracle
+# reaches the same fork through `write_all`'s `Err`, and the three backends
+# disagree about what it means: `python.rs:92-95` turns it into an error,
+# `process.rs:133-137` and `oci.rs:158-162` log a warning and keep the output.
+# A primitive that picked one of those would be wrong for the other two, so it
+# reports the fact and lets each backend decide.
+fn agnosai_spawn_stdin_write_failed(r): i64 { return load64(r + AGN_SPR_STDIN_ERR); }
 
 # How long an idle iteration waits before looking again.
 #
@@ -432,7 +476,63 @@ fn _agnosai_spawn_failure(): i64 {
     store64(r + AGN_SPR_SIGNAL, 0);
     store64(r + AGN_SPR_TIMED_OUT, 0);
     store64(r + AGN_SPR_FAIL_REASON, AGNOSAI_SPAWN_FAIL_SETUP);
+    store64(r + AGN_SPR_STDIN_ERR, 0);
     return r;
+}
+
+# Report a setup failure, closing the `n` pipes already opened.
+#
+# **The reason this exists is that the old spelling stranded them.** Every
+# `return _agnosai_spawn_failure()` before the fork left whatever had already
+# succeeded open, and the paths that reach it are `EMFILE`/`ENFILE` — descriptor
+# exhaustion. So the failure that fires on a full table consumed six more
+# descriptors and never gave them back, and the process never recovered: the
+# audit of 2026-08-04 measured a permanent loss of six per exhausted table, with
+# every later attempt then failing at the *first* pipe.
+#
+# `pipes` is the flat 32-byte block the four `sys_pipe` calls fill; `n` is how
+# many of them succeeded, so the loop closes exactly what exists.
+fn _agnosai_spawn_setup_failure(pipes, n): i64 {
+    var i = 0;
+    while (i < n) {
+        sys_close(load32(pipes + i * 8));
+        sys_close(load32(pipes + i * 8 + 4));
+        i = i + 1;
+    }
+    return _agnosai_spawn_failure();
+}
+
+# Set a signal's disposition back to `SIG_DFL`.
+#
+# The counterpart to `lib/syscalls.cyr`'s `signal_ignore`, which the stdlib does
+# not ship — filed upstream, local until it lands.
+#
+# **It exists because ignoring a signal is inherited across `execve`, and a
+# handler is not.** `SIG_IGN` for `SIGPIPE` is the right disposition for the
+# server and the wrong one for a sandboxed tool: the oracle's children get the
+# default, because `std::process::Command` restores it in the child before exec
+# (Rust installs the process-wide `SIG_IGN` at startup for the same reason
+# agnosai installs it here). Without this, a tool running `cmd | head` would see
+# `write` return `EPIPE` where the same tool under the oracle dies on the
+# signal, and the difference is silent.
+fn _agnosai_signal_default(signum): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    var act[32];
+    var ap = &act;
+    var i = 0;
+    while (i < AGNOSAI_SPAWN_SIGACTION_SIZE) {
+        store8(ap + i, 0);
+        i = i + 1;
+    }
+    store64(ap, AGNOSAI_SPAWN_SIG_DFL);
+    #ifdef CYRIUS_ARCH_X86
+    return syscall(13, signum, ap, 0, 8);
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return syscall(134, signum, ap, 0, 8);
+    #endif
+    #endif
+    return 0;
 }
 
 # Run `path` with `argv` and `envp`, capturing stdout and stderr separately.
@@ -456,31 +556,46 @@ fn _agnosai_spawn_failure(): i64 {
 # **The write interleaves with the reads.** Writing the whole input first is
 # what the oracle does and what deadlocks here — see the module header.
 fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_dir): i64 {
-    var ip[8];
-    var op[8];
-    var ep[8];
-    var xp[8];
-    if (sys_pipe(&ip) < 0) { return _agnosai_spawn_failure(); }
-    if (sys_pipe(&op) < 0) { return _agnosai_spawn_failure(); }
-    if (sys_pipe(&ep) < 0) { return _agnosai_spawn_failure(); }
-    if (sys_pipe(&xp) < 0) { return _agnosai_spawn_failure(); }
-    var irf = load32(&ip);
-    var iwf = load32(&ip + 4);
-    var orf = load32(&op);
-    var owf = load32(&op + 4);
-    var erf = load32(&ep);
-    var ewf = load32(&ep + 4);
-    var xrf = load32(&xp);
-    var xwf = load32(&xp + 4);
+    # **Ignore `SIGPIPE` before anything can be written.** A child that exits
+    # without draining its stdin leaves the parent writing into a pipe with no
+    # reader, and the default disposition kills the *writer* — agnosai itself,
+    # not the tool. The audit of 2026-08-04 reproduced it both ways: a
+    # 320,000-byte payload to a script that exits immediately took the whole
+    # process down with 128+13, three runs out of three. Production was masked
+    # only incidentally, because sandhi installs `SIG_IGN` inside its own serve
+    # loops — nothing protected a test, a benchmark, or a consumer linking the
+    # sandbox without running a server. The oracle cannot die here because Rust
+    # installs the same disposition at startup.
+    #
+    # Set on every call rather than once behind a flag: `rt_sigaction` is
+    # idempotent and process-wide, so a guard would buy one syscall against a
+    # `fork` + `execve` and cost a racing read of shared state.
+    signal_ignore(Signal.SIGPIPE);
 
-    if (agnosai_fd_set_cloexec(xwf) == 0) { return _agnosai_spawn_failure(); }
+    # One flat block rather than four, so a setup failure can close exactly the
+    # pipes that opened — see `_agnosai_spawn_setup_failure`. Two `i32` fds each.
+    var pipes[32];
+    if (sys_pipe(&pipes) < 0) { return _agnosai_spawn_setup_failure(&pipes, 0); }
+    if (sys_pipe(&pipes + 8) < 0) { return _agnosai_spawn_setup_failure(&pipes, 1); }
+    if (sys_pipe(&pipes + 16) < 0) { return _agnosai_spawn_setup_failure(&pipes, 2); }
+    if (sys_pipe(&pipes + 24) < 0) { return _agnosai_spawn_setup_failure(&pipes, 3); }
+    var irf = load32(&pipes);
+    var iwf = load32(&pipes + 4);
+    var orf = load32(&pipes + 8);
+    var owf = load32(&pipes + 12);
+    var erf = load32(&pipes + 16);
+    var ewf = load32(&pipes + 20);
+    var xrf = load32(&pipes + 24);
+    var xwf = load32(&pipes + 28);
+
+    if (agnosai_fd_set_cloexec(xwf) == 0) { return _agnosai_spawn_setup_failure(&pipes, 4); }
 
     # Resolved BEFORE the fork: the search allocates, and doing it in the child
     # would build strings the parent can never see or free.
     var prog = _agnosai_spawn_resolve(path, envp);
 
     var pid = sys_fork();
-    if (pid < 0) { return _agnosai_spawn_failure(); }
+    if (pid < 0) { return _agnosai_spawn_setup_failure(&pipes, 4); }
     if (pid == 0) {
         syscall(SYS_DUP2, irf, 0);
         syscall(SYS_DUP2, owf, 1);
@@ -503,6 +618,11 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
         if (irf != 0) { sys_close(irf); }
         if (owf != 1) { sys_close(owf); }
         if (ewf != 2) { sys_close(ewf); }
+        # And hand the child back the *default* `SIGPIPE`, which the parent just
+        # turned off for itself. `SIG_IGN` survives `execve`; the oracle's
+        # children do not inherit it, because `Command` restores the default in
+        # the child. See `_agnosai_signal_default`.
+        _agnosai_signal_default(Signal.SIGPIPE);
         # `work_dir` is applied HERE and not in the parent: a parent-side chdir
         # would move the whole server, every later relative path with it. A
         # failure must not fall through to `execve` — running the child in the
@@ -538,6 +658,7 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
     var idata = str_data(input);
     var isent = 0;
     var iopen = 1;
+    var ierr = 0;
     var odone = 0;
     var edone = 0;
 
@@ -559,9 +680,18 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
                 var w = sys_write(iwf, idata + isent, want);
                 # A negative return is EAGAIN — the child has not drained its
                 # stdin yet. Not an error: come back next turn.
+                #
+                # **EPIPE is the one that is not EAGAIN.** The read end is gone
+                # because the child exited or closed stdin, so retrying writes
+                # into nothing forever. Before this arm the two were
+                # indistinguishable and the loop retried until the deadline; with
+                # `SIGPIPE` at its default the process never even got here.
                 if (w > 0) { isent = isent + w; moved = 1; }
+                if (w == 0 - AGNOSAI_SPAWN_EPIPE) { ierr = 1; }
             }
-            if (isent >= ilen) { sys_close(iwf); iopen = 0; }
+            # The child still gets EOF on the way out — the write end closes on
+            # a broken pipe exactly as it does on an exhausted input.
+            if (ierr == 1 || isent >= ilen) { sys_close(iwf); iopen = 0; }
         }
         if (odone == 0) {
             var n = sys_read(orf, buf, AGNOSAI_SPAWN_CHUNK);
@@ -605,6 +735,7 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
     store64(r + AGN_SPR_STDOUT, str_builder_build(ob));
     store64(r + AGN_SPR_STDERR, str_builder_build(eb));
     store64(r + AGN_SPR_TIMED_OUT, killed);
+    store64(r + AGN_SPR_STDIN_ERR, ierr);
 
     if (xn > 0) {
         store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_FAILED);

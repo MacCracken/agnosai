@@ -47,6 +47,43 @@ fn _t_pr_stdin_passthrough(): i64 {
     return 0;
 }
 
+# A child that stops draining stdin is warned about and carried on with.
+#
+# **`process.rs:133-137` only `warn!`s**, matching `oci` and unlike `python`,
+# which propagates the error — so the assertion here is that this is *not* an
+# error. The program ran, and what it wrote stands.
+#
+# Reaching the assertions at all is the other half: before the fix of
+# 2026-08-04, writing into a pipe whose reader is gone killed the *calling*
+# process with `SIGPIPE`. 320,000 bytes because anything inside the 64 KiB pipe
+# buffer is accepted whether or not the child ever reads it, and the child
+# closes stdin and lives on so the failing write is not racing its exit.
+fn _t_pr_stdin_the_child_never_reads(): i64 {
+    var sb = str_builder_new();
+    var i = 0;
+    while (i < 3200) {
+        str_builder_add_cstr(sb,
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+        i = i + 1;
+    }
+    var big = str_builder_build(sb);
+    assert(str_len(big) == 320000, "the payload is 320,000 bytes");
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_process_execute(_t_pr_shell(),
+    str_from("exec 0<&-; sleep 1; echo ran-anyway"), big, &e);
+    assert(load64(&e) == 0,
+    "an undelivered stdin is NOT an error here — process.rs warns and continues");
+    assert(r != 0, "...it returns a result");
+    if (r == 0) { return 0; }
+    assert(str_contains_cstr(agnosai_process_result_stdout(r), "ran-anyway") == 1,
+    "...carrying what the child wrote after it stopped reading");
+    assert(agnosai_process_result_timed_out(r) == 0, "...and it is not a timeout");
+    assert(agnosai_process_result_exit_code(r) == 0, "...its own exit code stands");
+    return 0;
+}
+
 fn _t_pr_nonzero_exit(): i64 {
     var e[8];
     store64(&e, 0);
@@ -107,7 +144,51 @@ fn _t_pr_invalid_executable(): i64 {
     var r = agnosai_process_execute(c, str_from("whatever"), str_from(""), &e);
     assert(r == 0, "oracle invalid_executable: a missing executable is an ERROR, not a result");
     assert(load64(&e) != 0, "...and the error is set");
+    if (load64(&e) == 0) { return 0; }
     assert(agnosai_error_kind(load64(&e)) == AGNOSAI_ERR_SANDBOX, "...as a sandbox error");
+
+    # **The message has to say WHICH failure**, and nothing checked it. The
+    # audit of 2026-08-04 collapsed `_agnosai_process_finish`'s two arms into an
+    # unconditional "failed to enter the working directory for" and the suite
+    # stayed at 108/108 — so a missing binary, a failed `fork`, and a bad
+    # `work_dir` would all have sent an operator to look at the directory. The
+    # sibling test below asserts the other arm, so the pair pins the branch.
+    var msg = agnosai_error_message(load64(&e));
+    assert(str_contains_cstr(msg, "failed to spawn") == 1, "...reported as a spawn failure");
+    assert(str_contains_cstr(msg, "working directory") == 0,
+    "...NOT as a working-directory fault, which is a different arm");
+    assert(str_contains_cstr(msg, "/nonexistent/binary") == 1, "...naming the executable");
+    return 0;
+}
+
+# The documented no-shell shape: empty args means a direct invocation.
+#
+# **`set_args` could be a no-op with the whole suite green.** `grep` found
+# exactly two references to it — the definition and one call in
+# `_t_pr_invalid_executable`, where the executable is already
+# `/nonexistent/binary`, so all three of that test's assertions hold whether
+# argv is `[binary, whatever]` or `[binary, -c, whatever]`. The behaviour the
+# docstring advertises ("emptying this turns `execute` into a direct invocation
+# ... no shell, and no `-c`") was never exercised on a path where a program ran.
+fn _t_pr_empty_args_is_a_direct_invocation(): i64 {
+    var c = agnosai_process_config_shell(5000);
+    agnosai_process_config_set_executable(c, str_from("/bin/echo"));
+    agnosai_process_config_set_args(c, vec_new());
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_process_execute(c, str_from("hi"), str_from(""), &e);
+    assert(load64(&e) == 0, "the direct invocation runs");
+    assert(str_contains_cstr(agnosai_process_result_stdout(r), "hi") == 1,
+    "the command becomes echo's ARGUMENT, not a script for a shell");
+    assert(str_contains_cstr(agnosai_process_result_stdout(r), "-c") == 0,
+    "...with no `-c` prepended — that is what emptying args means");
+
+    # And the contrast: the default config DOES prepend `-c`, which is what
+    # makes the assertion above discriminate rather than describe.
+    var d = agnosai_process_config_shell(5000);
+    assert(vec_len(agnosai_process_config_args(d)) > 0,
+    "the shell config carries args, so the empty case is a real difference");
     return 0;
 }
 
@@ -165,13 +246,74 @@ fn _t_pr_argv_ignores_config_command(): i64 {
 
 # --- Environment composition ---------------------------------------------
 
+# An environ block that actually carries all four injection vectors.
+#
+# Duplicated from `sandbox_spawn`'s copy on purpose: a `.tcyr` includes only the
+# `src/` modules it tests, so there is no shared place for it that would not
+# drag one suite's includes into another's.
+fn _t_pr_planted_envp(): i64 {
+    var src = alloc(7 * 8);
+    store64(src, "PATH=/usr/bin");
+    store64(src + 8, "LD_PRELOAD=/tmp/evil.so");
+    store64(src + 16, "HOME=/root");
+    store64(src + 24, "LD_LIBRARY_PATH=/tmp/lib");
+    store64(src + 32, "DYLD_INSERT_LIBRARIES=/tmp/x.dylib");
+    store64(src + 40, "DYLD_LIBRARY_PATH=/tmp/y");
+    store64(src + 48, 0);
+    return src;
+}
+
+# The composed envp, over an inherited block that contains what must not survive.
+#
+# **The sibling below cannot assert this and the comment there used to claim
+# `sandbox_spawn` did.** It did not: that suite's filter test was ambient too,
+# so BOTH were measuring this machine's environment. The audit of 2026-08-04
+# replaced this module's guard with an unconditional `vec_push` and the suite
+# reported 108/108; the same binary re-run with `LD_LIBRARY_PATH` exported
+# failed. `_agnosai_process_envp_from` takes the inherited block as a parameter
+# precisely so the question stops depending on who is running the tests.
+fn _t_pr_env_filter_over_a_planted_block(): i64 {
+    var envp = _agnosai_process_envp_from(agnosai_process_config_default(),
+    _t_pr_planted_envp());
+
+    assert(agnosai_envp_has(envp, str_from("LD_PRELOAD")) == 0,
+    "a PLANTED LD_PRELOAD does not reach the child");
+    assert(agnosai_envp_has(envp, str_from("LD_LIBRARY_PATH")) == 0, "nor LD_LIBRARY_PATH");
+    assert(agnosai_envp_has(envp, str_from("DYLD_INSERT_LIBRARIES")) == 0,
+    "nor DYLD_INSERT_LIBRARIES");
+    assert(agnosai_envp_has(envp, str_from("DYLD_LIBRARY_PATH")) == 0, "nor DYLD_LIBRARY_PATH");
+    assert(agnosai_envp_has(envp, str_from("PATH")) == 1, "PATH survives the filter");
+    assert(agnosai_envp_has(envp, str_from("HOME")) == 1, "and so does HOME");
+
+    var n = 0;
+    while (load64(envp + n * 8) != 0) { n = n + 1; }
+    assert(n == 2, "exactly two of the six survive — four in, four out");
+
+    # **The operator's own configured variables are NOT filtered**, and the
+    # asymmetry is the oracle's: `cmd.env(k, v)` runs after `env_remove`. This
+    # pins the escape hatch as deliberate rather than an oversight the next
+    # reader closes.
+    var c = agnosai_process_config_default();
+    agnosai_process_config_set_env(c, str_from("LD_LIBRARY_PATH"), str_from("/opt/tool/lib"));
+    var oc = _agnosai_process_envp_from(c, _t_pr_planted_envp());
+    assert(agnosai_envp_has(oc, str_from("LD_LIBRARY_PATH")) == 1,
+    "a CONFIGURED LD_LIBRARY_PATH survives — config is operator-owned, ambient is not");
+
+    # And with clean_env the inherited block is gone entirely, planted or not.
+    var cc = agnosai_process_config_default();
+    agnosai_process_config_set_clean_env(cc, 1);
+    var ce = _agnosai_process_envp_from(cc, _t_pr_planted_envp());
+    assert(load64(ce) == 0, "clean_env drops the whole inherited block");
+    return 0;
+}
+
 fn _t_pr_env_sanitizes_the_inherited_environment(): i64 {
     # **This cannot assert "LD_PRELOAD was stripped" by running a child.** The
     # test process has no way to put one in its OWN environment - there is no
     # `setenv` - so `echo [$LD_PRELOAD]` prints `[]` whether the filter runs or
-    # not, and passes against a build with no sanitization at all. The filter
-    # itself is proven in sandbox_spawn against a constructed environment; what
-    # is checkable here is that `process` composes it in.
+    # not, and passes against a build with no sanitization at all. The planted
+    # block above is where the filter is actually proven; what is checkable here
+    # is that `process` composes it in over the REAL environment.
     var envp = _agnosai_process_envp(agnosai_process_config_default());
 
     var i = 0;
@@ -208,19 +350,41 @@ fn _t_pr_env_entries_are_nul_terminated(): i64 {
 }
 
 fn _t_pr_env_overrides_inherited(): i64 {
-    # `cmd.env(k, v)` REPLACES rather than appending a duplicate. PATH exists in
-    # any real environment, so overriding it proves replacement rather than
-    # "the child picked the first of two".
+    # `cmd.env(k, v)` REPLACES rather than appending a duplicate.
+    #
+    # **A shell cannot tell you which**, and the rationale this test used to
+    # carry was backwards. Measured 2026-08-04: with `envp = [PATH=/usr/bin:/bin,
+    # HOME=/tmp, PATH=/sandbox-only]`, `sh -c 'echo $PATH'` prints
+    # `/sandbox-only` — bash takes the LAST duplicate — while glibc's `getenv`
+    # in a C child returns the FIRST. So both assertions below hold with the
+    # replace loop deleted entirely, which the audit confirmed at 108/108.
+    #
+    # The envp itself is where the question is decidable, so it is asked there:
+    # exactly one entry may be named `PATH`. That also matters beyond tidiness —
+    # `_agnosai_spawn_resolve` breaks at the first `PATH` it finds
+    # (`spawn.cyr:377-382`), so an append-only build would resolve bare program
+    # names against the *inherited* PATH while the shell used the configured one.
     var c = agnosai_process_config_shell(5000);
     agnosai_process_config_set_env(c, str_from("PATH"), str_from("/sandbox-only"));
+
+    var envp = _agnosai_process_envp_from(c, _t_pr_planted_envp());
+    var i = 0;
+    var paths = 0;
+    while (load64(envp + i * 8) != 0) {
+        if (str_eq_cstr(_agnosai_env_entry_name(load64(envp + i * 8)), "PATH") == 1) {
+            paths = paths + 1;
+        }
+        i = i + 1;
+    }
+    assert(paths == 1,
+    "exactly ONE entry is named PATH — a configured variable replaces the inherited one \
+    rather than appending a duplicate for the child to choose between");
 
     var e[8];
     store64(&e, 0);
     var r = agnosai_process_execute(c, str_from("echo $PATH"), str_from(""), &e);
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "/sandbox-only") == 1,
-    "a configured variable overrides the inherited one");
-    assert(str_contains_cstr(agnosai_process_result_stdout(r), "/usr/bin") == 0,
-    "...replacing it rather than leaving both for the child to choose between");
+    "and the value the child sees is the configured one");
     return 0;
 }
 
@@ -230,11 +394,19 @@ fn _t_pr_env_without_clean_keeps_the_rest(): i64 {
 
     var e[8];
     store64(&e, 0);
-    var r = agnosai_process_execute(c, str_from("echo $SANDBOX_VAR:$PATH"), str_from(""), &e);
-    assert(str_contains_cstr(agnosai_process_result_stdout(r), "yes:") == 1,
+    # **Not `$PATH`.** A POSIX shell assigns itself a default PATH when it
+    # inherits none, so `yes:/` is satisfied by a child with no environment at
+    # all — the audit of 2026-08-04 added `set_clean_env(c, 1)` to this very
+    # test and both assertions survived. That is the trap the sibling below
+    # documents and avoids; this one walked into it. The env COUNT is what the
+    # shell cannot invent.
+    var probe = str_from(
+    "n=$(env | wc -l); if [ \"$n\" -gt 8 ]; then echo MANY; else echo FEW; fi; echo v=$SANDBOX_VAR");
+    var r = agnosai_process_execute(c, probe, str_from(""), &e);
+    assert(str_contains_cstr(agnosai_process_result_stdout(r), "v=yes") == 1,
     "the configured variable is set");
-    assert(str_contains_cstr(agnosai_process_result_stdout(r), "yes:/") == 1,
-    "...and WITHOUT clean_env the inherited PATH is still there");
+    assert(str_contains_cstr(agnosai_process_result_stdout(r), "MANY") == 1,
+    "...and WITHOUT clean_env the inherited block is still there");
     return 0;
 }
 
@@ -376,14 +548,17 @@ fn main(): i64 {
 
     _t_pr_echo_command();
     _t_pr_stdin_passthrough();
+    _t_pr_stdin_the_child_never_reads();
     _t_pr_nonzero_exit();
     _t_pr_stderr_captured();
     _t_pr_timeout_kills_process();
     _t_pr_clean_env();
     _t_pr_invalid_executable();
+    _t_pr_empty_args_is_a_direct_invocation();
     _t_pr_execute_argv_no_shell_interpretation();
     _t_pr_execute_argv_empty_returns_error();
     _t_pr_argv_ignores_config_command();
+    _t_pr_env_filter_over_a_planted_block();
     _t_pr_env_sanitizes_the_inherited_environment();
     _t_pr_env_entries_are_nul_terminated();
     _t_pr_env_overrides_inherited();

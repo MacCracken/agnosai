@@ -104,6 +104,17 @@ fn _t_kv_build_config(): i64 {
     # `agent_id` is optional; 0 is the oracle's `None`.
     var a = agnosai_kavach_build_config(agnosai_sandbox_policy_process(), str_from("agent-7"));
     assert(SandboxConfig_agent_id(a) != 0, "an agent id is attached when given");
+    assert(streq(SandboxConfig_agent_id(a), "agent-7") == 1, "...and it is the id given");
+
+    # **kavach stores the pointer verbatim** (`lib/kavach.cyr:3459`) and every
+    # reader of it is `strlen`-based, so the id has to be a C string — and a
+    # `Str` is not one. `str_substr` shares its source's bytes and adds no
+    # terminator (`lib/str.cyr:634-640`), so until 2026-08-05 a borrowed id read
+    # on past its own length into whatever the arena held next.
+    var sliced = str_substr(str_from("agent-42|trailing-garbage"), 0, 8);
+    var b = agnosai_kavach_build_config(agnosai_sandbox_policy_process(), sliced);
+    assert(streq(SandboxConfig_agent_id(b), "agent-42") == 1,
+    "a borrowed agent id ends at ITS length, not at the next NUL further along the arena");
 
     # A container policy needs network, so the config must carry it — this is
     # the field whose default would otherwise silently isolate a tool that
@@ -174,6 +185,18 @@ fn _t_kv_policy_for_trust(): i64 {
     assert(ExternalizationPolicy_block_threshold(s) == Severity.HIGH, "strict blocks at High");
     assert(ExternalizationPolicy_quarantine_threshold(s) == Severity.MEDIUM, "quarantines at Medium");
 
+    # **`enabled` decides whether any of the above runs at all.** `gate_apply`
+    # short-circuits to PASS before it scans anything when the flag is clear
+    # (`lib/kavach.cyr:5712-5715`), so the carefully pinned thresholds are
+    # inert without it — and until 2026-08-05 both hand-built policies could be
+    # constructed disabled with the suite still at 93/93. `redact_secrets` is
+    # the sole guard on the WARN redaction block, and was equally unpinned.
+    assert(ExternalizationPolicy_enabled(m) == 1,
+    "minimal's gate is ENABLED — a disabled policy passes everything, thresholds and all");
+    assert(ExternalizationPolicy_redact_secrets(m) == 1, "...and redacts");
+    assert(ExternalizationPolicy_enabled(s) == 1, "so is strict's");
+    assert(ExternalizationPolicy_redact_secrets(s) == 1, "...and it redacts too");
+
     # Ordering: minimal is strictly tighter than strict, which is tighter than
     # the default. Asserting the relationship catches a table transposed.
     var d = agnosai_kavach_policy_for_trust(str_from("basic"));
@@ -205,7 +228,10 @@ fn _t_kv_policy_for_trust(): i64 {
 fn _t_kv_exec_of(out: Str): i64 {
     var r = exec_result_new();
     ExecResult_set_exit_code(r, 0);
-    ExecResult_set_stdout(r, str_data(out));
+    # `str_cstr`, not `str_data` — kavach measures this with `strlen`, and a
+    # `Str` built by `str_new`/`str_substr` carries no terminator. The tests
+    # below hand it exactly those.
+    ExecResult_set_stdout(r, str_cstr(out));
     ExecResult_set_stderr(r, "");
     ExecResult_set_duration_ms(r, 0);
     ExecResult_set_timed_out(r, 0);
@@ -244,11 +270,66 @@ fn _t_kv_scan_output(): i64 {
     assert(agnosai_kavach_scan_output(jwt) == ScanVerdict.BLOCK,
     "...and scan_output collapses it to BLOCK, as the oracle's Err arm does");
 
+    # **The WARN half of the collapse**, which nothing pinned until 2026-08-05.
+    # The QUARANTINE case above is real, but it only exercises the arm that maps
+    # to BLOCK; deleting the `WARN -> PASS` line left the suite at 93/93 while
+    # the port started withholding artifacts the oracle releases (`Ok(_)` covers
+    # `Warn`, `kavach_bridge.rs:164`). A weak-hash mention is scanned at
+    # `Severity.LOW`, below the default policy's quarantine threshold, so the
+    # raw verdict is WARN — the fourth value, reached from the other side.
+    var weak = str_from("digest = md5(payload)");
+    var rawwarn = ScanResult_verdict(gate_apply(_t_kv_exec_of(weak), ext_policy_default()));
+    assert(rawwarn == ScanVerdict.WARN,
+    "a weak-hash mention makes kavach's gate answer WARN");
+    assert(agnosai_kavach_scan_output(weak) == ScanVerdict.PASS,
+    "...and scan_output collapses it to PASS, as the oracle's Ok arm does");
+
     var v1 = agnosai_kavach_scan_output(str_from("hello world"));
     var v2 = agnosai_kavach_scan_output(creds);
     assert(v1 == ScanVerdict.PASS || v1 == ScanVerdict.BLOCK, "clean is PASS or BLOCK, never WARN");
     assert(v2 == ScanVerdict.PASS || v2 == ScanVerdict.BLOCK,
     "and a secret is PASS or BLOCK, never QUARANTINE — the oracle's Result has only two arms");
+    return 0;
+}
+
+# The gate measures with `strlen`, and a `Str` is not a C string.
+#
+# **Both directions were live and both released the wrong verdict.** The audit
+# of 2026-08-04 measured them: a secret after an embedded NUL was scanned as two
+# bytes and PASSed, and ten borrowed bytes were scanned as thirty-one and
+# BLOCKed. Every input in this file was a `str_from` literal, whose bytes happen
+# to be NUL-terminated in the binary, so no assertion could see either half.
+#
+# The oracle has neither problem — `kavach_bridge.rs:159` hands the gate a
+# `String`, which carries its own length.
+fn _t_kv_scan_output_measures_the_str_not_the_arena(): i64 {
+    # `"ok" NUL "AKIAIOSFODNN7EXAMPLE"` — 23 bytes, a credential after the NUL.
+    var nb = alloc(32);
+    memcpy(nb, "ok", 2);
+    store8(nb + 2, 0);
+    memcpy(nb + 3, "AKIAIOSFODNN7EXAMPLE", 20);
+    var hidden = str_new(nb, 23);
+    assert(str_len(hidden) == 23, "the payload is 23 bytes, NUL included");
+    assert(agnosai_kavach_scan_output(hidden) == ScanVerdict.BLOCK,
+    "a credential AFTER an embedded NUL is still scanned — strlen would stop at 2 and PASS it");
+
+    # The control: the same 23 bytes with a space where the NUL was. If this did
+    # not BLOCK, the assertion above would be measuring nothing.
+    var sb = alloc(32);
+    memcpy(sb, "ok", 2);
+    store8(sb + 2, 32);
+    memcpy(sb + 3, "AKIAIOSFODNN7EXAMPLE", 20);
+    assert(agnosai_kavach_scan_output(str_new(sb, 23)) == ScanVerdict.BLOCK,
+    "...and the same bytes with a space instead are BLOCKed, so the payload is detectable");
+
+    # The other direction: a borrowed slice must be scanned to ITS length, not
+    # to the next NUL somewhere further along the arena. `str_substr` shares
+    # data and adds no terminator, so `strlen` here runs on into the credential.
+    var whole = str_from("clean-part|AKIAIOSFODNN7EXAMPLE");
+    var head = str_substr(whole, 0, 10);
+    assert(str_len(head) == 10, "the slice is ten clean bytes");
+    assert(agnosai_kavach_scan_output(head) == ScanVerdict.PASS,
+    "ten clean bytes PASS — reading past the slice would find the credential behind it");
     return 0;
 }
 
@@ -375,6 +456,40 @@ fn _t_kb_execute_with_agent_id(): i64 {
     return 0;
 }
 
+# The bridge's exec-failure arm, which no test reached until 2026-08-05.
+#
+# **All eight `load64(&e)` assertions in this file asserted `== 0`** — none ever
+# checked that `out_err` was set — so the audit of 2026-08-04 deleted the
+# `store64` at the exec arm and the suite stayed at 93/93. The branch is not
+# theoretical: `sandbox_exec` returns 0 on BLOCK and on QUARANTINE
+# (`lib/kavach.cyr:11011-11018`), so the ordinary "a tool printed a credential"
+# case lands on exactly this exit.
+fn _t_kb_blocked_output_is_an_error(): i64 {
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_kavach_execute(str_from("/bin/echo AKIAIOSFODNN7EXAMPLE"),
+    agnosai_sandbox_policy_process(), 0, &e);
+
+    assert(r == 0, "an artifact the gate blocks is not released as a result");
+    assert(load64(&e) != 0, "...out_err is SET — the one thing no assertion checked");
+    if (load64(&e) == 0) { return 0; }
+    assert(agnosai_error_kind(load64(&e)) == AGNOSAI_ERR_SANDBOX, "...as a sandbox error");
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "kavach exec failed") == 1,
+    "...carrying the exec arm's message");
+
+    # And the contrast: a command whose PROGRAM is missing is not this. kavach's
+    # process backend answers with a diagnostic result and exit 127, which is a
+    # successful execution reporting a failure — the distinction the old
+    # `_t_kb_repeated_failures_do_not_break_the_bridge` was accidentally relying
+    # on while claiming the opposite.
+    store64(&e, 0);
+    var m = agnosai_kavach_execute(str_from("/nonexistent/definitely-not-a-program"),
+    agnosai_sandbox_policy_process(), 0, &e);
+    assert(m != 0, "a missing PROGRAM is not a bridge failure — kavach diagnoses it");
+    assert(load64(&e) == 0, "...so out_err stays clear");
+    return 0;
+}
+
 fn _t_kb_repeated_failures_do_not_break_the_bridge(): i64 {
     # **This does NOT prove the sandbox is destroyed on the failure path, and
     # nothing available here can.** The oracle puts the `?` on the exec result
@@ -390,12 +505,23 @@ fn _t_kb_repeated_failures_do_not_break_the_bridge(): i64 {
     # resource - a cgroup, a namespace, a container - to destroy.
     #
     # What this DOES check is that a run of failures leaves the bridge usable.
+    #
+    # **The failures have to be real ones.** This loop used to drive
+    # `/nonexistent/definitely-not-a-program`, which is not a bridge failure at
+    # all: kavach's process backend answers a missing program with a diagnostic
+    # `ExecResult` carrying exit 127, so the bridge saw twelve *successful*
+    # executions and the function repeated the happy path under a name that said
+    # otherwise. The audit of 2026-08-04 swapped the command for `/bin/true` and
+    # nothing changed. A command whose output the gate blocks is the failure
+    # that does reach the exec arm.
     var e[8];
     var i = 0;
     while (i < 12) {
         store64(&e, 0);
-        agnosai_kavach_execute(str_from("/nonexistent/definitely-not-a-program"),
+        var f = agnosai_kavach_execute(str_from("/bin/echo AKIAIOSFODNN7EXAMPLE"),
         agnosai_sandbox_policy_process(), 0, &e);
+        assert(f == 0, "a blocked artifact is a bridge FAILURE, not a result");
+        assert(load64(&e) != 0, "...with out_err set — the exec arm's message");
         i = i + 1;
     }
 
@@ -433,6 +559,7 @@ fn main(): i64 {
     _t_kv_build_config_externalization();
     _t_kv_policy_for_trust();
     _t_kv_scan_output();
+    _t_kv_scan_output_measures_the_str_not_the_arena();
     _t_kv_result();
 
     # **Order matters here.** The lazy-init assertion is only meaningful as the
@@ -442,6 +569,7 @@ fn main(): i64 {
     _t_kb_execute_reports_the_exit_code();
     _t_kb_execute_honours_the_policy_deadline();
     _t_kb_execute_with_agent_id();
+    _t_kb_blocked_output_is_an_error();
     _t_kb_repeated_failures_do_not_break_the_bridge();
     _t_kb_execute_none_policy_uses_the_noop_backend();
 

@@ -235,7 +235,81 @@ fn _t_mg_default_deadline_when_policy_sets_none(): i64 {
     return 0;
 }
 
+# A manager default of 0 is a deadline that fires at once, not the absence of one.
+#
+# **The fail-open the audit of 2026-08-04 measured.** The helper returned
+# seconds and every caller multiplied by 1000, so `default_timeout_secs = 0`
+# became `timeout_ms = 0` — `AGNOSAI_SPAWN_NO_TIMEOUT`, which arms nothing. A
+# `/bin/sleep 3` ran to completion and reported `timed_out == 0`. The oracle
+# does the opposite: `manager.rs:81-84` builds a `Duration`, and
+# `tokio::time::timeout` on `Duration::ZERO` fires immediately.
+#
+# The header at `manager.cyr` already reasoned that 0 must not mean "no
+# deadline" for the *policy* field. The same value on the manager default did
+# exactly that, and nothing said so.
+fn _t_mg_zero_default_timeout_is_not_unlimited(): i64 {
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_default_timeout_secs(c, 0);
+    var m = agnosai_sandbox_manager_new(c);
+    var p = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_PROCESS, 0, 0, 0, 0);
+
+    var e[8];
+    store64(&e, 0);
+    var t0 = clock_now_ms();
+    var r = agnosai_sandbox_manager_execute_argv(m, p,
+    _t_mg_argv2("/bin/sleep", "3"), str_from(""), &e);
+    var dt = clock_now_ms() - t0;
+
+    assert(load64(&e) == 0, "a timeout is a result, not an error");
+    assert(agnosai_sandbox_result_timed_out(r) == 1,
+    "a 0-second manager default is a deadline that fires AT ONCE — not the absence of one");
+    assert(dt < 3000, "...so the 3-second child was killed rather than run to completion");
+    return 0;
+}
+
+# The same, down the OCI arm, where the deadline has to survive a unit change.
+#
+# **This is the assertion that catches the seconds floor.** The manager works in
+# milliseconds so a 0-second default can mean "at once"; `oci.rs`'s field is
+# seconds, so the conversion back rounds 1 ms to 0 — and `oci.cyr` multiplies by
+# 1000 and hands the spawn primitive a 0, which is `AGNOSAI_SPAWN_NO_TIMEOUT`.
+# Without the floor the fail-open is restored one layer down, invisibly.
+fn _t_mg_zero_default_timeout_bounds_the_oci_arm_too(): i64 {
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_oci_runtime(c,
+    _t_mg_fake_runtime("zero", "sleep 30"));
+    agnosai_sandbox_manager_config_set_default_timeout_secs(c, 0);
+    var m = agnosai_sandbox_manager_new(c);
+    var p = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_OCI, 1, 1, 0, 0);
+
+    var e[8];
+    store64(&e, 0);
+    var t0 = clock_now_ms();
+    var r = agnosai_sandbox_manager_execute_argv(m, p, _t_mg_argv2("x", 0), str_from(""), &e);
+    var dt = clock_now_ms() - t0;
+
+    assert(load64(&e) == 0, "a timeout is a result, not an error");
+    assert(agnosai_sandbox_result_timed_out(r) == 1,
+    "a 0-second default bounds the OCI arm too — the seconds conversion must not floor to 0");
+    assert(dt < 15000, "...so the 30-second runtime was killed, not waited out");
+    return 0;
+}
+
 # --- OCI dispatch --------------------------------------------------------
+
+# Write an executable stand-in runtime and return its path.
+#
+# The same device `sandbox_oci` uses, and for the same reason: `build_argv` puts
+# `run --rm -i ...` in front of everything, so no real program stands in for a
+# container runtime. A script that ignores `"$@"` is the only thing that does.
+fn _t_mg_fake_runtime(name, body): Str {
+    var path = str_cat(str_from("/tmp/agnosai-mg-test-"), str_from(name));
+    var p = str_cstr(path);
+    var src = str_cat(str_cat(str_from("#!/bin/sh\n"), str_from(body)), str_from("\n"));
+    file_write_all(p, str_data(src), str_len(src));
+    sys_chmod(p, 493);
+    return path;
+}
 
 fn _t_mg_oci_dispatch_builds_the_container_argv(): i64 {
     # No container runtime can be assumed, so `/bin/echo` stands in as one and
@@ -305,8 +379,113 @@ fn _t_mg_oci_invalid_image_is_rejected_before_spawning(): i64 {
 
     assert(r == 0, "an image that is really a flag is rejected");
     assert(load64(&e) != 0, "...with an error");
-    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "flag injection") == 1,
-    "...naming the reason, before any runtime was spawned");
+    if (load64(&e) == 0) { return 0; }
+    # **End to end, prefix included.** A `contains "flag injection"` check is a
+    # substring of the *reason*, so it survives the prefix being emptied
+    # entirely — the audit of 2026-08-04 replaced `str_from("invalid image: ")`
+    # with `str_from("")` and the suite stayed at 69/69. The prefix is also the
+    # oracle's, `oci.rs:95-97`, and the port said `"invalid image: "` until
+    # 2026-08-05.
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)),
+    "invalid OCI image: image name must not start with '-' (flag injection)") == 1,
+    "...naming the reason under the oracle's prefix, before any runtime was spawned");
+    return 0;
+}
+
+# The deadline reaches the OCI backend too.
+#
+# **The one OCI config field nothing pinned.** The audit of 2026-08-04 deleted
+# `agnosai_oci_config_set_timeout_secs` from the dispatch and all 69 assertions
+# still passed, while `agnosai_oci_config_new` silently substituted its
+# hard-coded 60 s for whatever the policy or manager asked. The control
+# mutations proved the neighbours *were* covered — dropping the memory limit or
+# the network flag each failed a named assertion — so the deadline was the hole.
+#
+# It was invisible because `/bin/echo` is the only stand-in runtime in this
+# file and it exits instantly: 1 s and 60 s are indistinguishable against a
+# runtime that never blocks. This one blocks.
+fn _t_mg_oci_deadline_reaches_the_runtime(): i64 {
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_oci_runtime(c,
+    _t_mg_fake_runtime("slow", "sleep 30"));
+    agnosai_sandbox_manager_config_set_default_timeout_secs(c, 1);
+    var m = agnosai_sandbox_manager_new(c);
+
+    # **Not `policy_container()`** — that carries its own 120 s
+    # `max_duration_secs`, which wins over the manager default and would hide
+    # the field under test behind a two-minute wait. A container-level policy
+    # with an unset duration is what routes through the fallback.
+    var p = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_OCI, 1, 1, 0, 0);
+
+    var e[8];
+    store64(&e, 0);
+    var t0 = clock_now_ms();
+    var r = agnosai_sandbox_manager_execute_argv(m, p, _t_mg_argv2("x", 0), str_from(""), &e);
+    var dt = clock_now_ms() - t0;
+
+    assert(load64(&e) == 0, "a timeout is a result, not an error");
+    assert(agnosai_sandbox_result_timed_out(r) == 1, "the container was killed on its deadline");
+    assert(agnosai_sandbox_result_backend(r) == AGNOSAI_ISOLATION_OCI, "...through the OCI arm");
+    assert(dt < 15000,
+    "...on the MANAGER's 1 second, not oci_config_new's hard-coded 60");
+    assert(dt >= 900, "...and the unit is seconds, not milliseconds");
+    return 0;
+}
+
+# Every field of an OCI result comes from the run, not from a default.
+#
+# **Three of the five could be hardcoded with the suite green** — `timed_out`,
+# `stderr` and `exit_code`, per the audit of 2026-08-04 — because `/bin/echo`
+# writes no stderr, exits 0 and never times out, so the correct values were
+# indistinguishable from the degenerate ones. The process arm was pinned by a
+# runtime that does all three; the OCI arm had nothing equivalent.
+fn _t_mg_oci_result_fields_are_the_runtime_s(): i64 {
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_oci_runtime(c,
+    _t_mg_fake_runtime("noisy", "echo container-out; echo container-err >&2; exit 5"));
+    var m = agnosai_sandbox_manager_new(c);
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_container(),
+    _t_mg_argv2("x", 0), str_from(""), &e);
+
+    assert(load64(&e) == 0, "a non-zero container exit is a result, not an error");
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(r), "container-out") == 1,
+    "stdout comes from the runtime");
+    assert(str_contains_cstr(agnosai_sandbox_result_stderr(r), "container-err") == 1,
+    "...and so does stderr, which /bin/echo could never have shown");
+    assert(str_contains_cstr(agnosai_sandbox_result_stdout(r), "container-err") == 0,
+    "...on its own stream");
+    assert(agnosai_sandbox_result_exit_code(r) == 5, "...and the exit code is the runtime's");
+    assert(agnosai_sandbox_result_timed_out(r) == 0, "...with timed_out reporting the run");
+    return 0;
+}
+
+# A runtime that cannot be spawned is an error, and the guard that says so is live.
+#
+# **Deleting `if (orr == 0) { return 0; }` leaves the suite green and the
+# process dumps core.** The audit of 2026-08-04 ran exactly that: no test
+# reached the branch, and the probe it wrote to reach it died with a null
+# dereference once the guard was gone. The branch is ordinary operator
+# configuration — `oci.cyr:361-365` returns 0 with `out_err` set when docker is
+# not installed.
+fn _t_mg_oci_spawn_failure_is_an_error(): i64 {
+    var c = agnosai_sandbox_manager_config_default();
+    agnosai_sandbox_manager_config_set_oci_runtime(c, str_from("/nonexistent/runtime"));
+    var m = agnosai_sandbox_manager_new(c);
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_container(),
+    _t_mg_argv2("x", 0), str_from(""), &e);
+
+    assert(r == 0, "a runtime that is not installed is an error, not a result");
+    assert(load64(&e) != 0, "...with out_err set");
+    if (load64(&e) == 0) { return 0; }
+    assert(agnosai_error_kind(load64(&e)) == AGNOSAI_ERR_SANDBOX, "...as a sandbox error");
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "failed to spawn") == 1,
+    "...naming the failure, rather than dereferencing a null result");
     return 0;
 }
 
@@ -379,9 +558,14 @@ fn main(): i64 {
     _t_mg_process_failure_is_an_error();
     _t_mg_policy_deadline_wins();
     _t_mg_default_deadline_when_policy_sets_none();
+    _t_mg_zero_default_timeout_is_not_unlimited();
+    _t_mg_zero_default_timeout_bounds_the_oci_arm_too();
     _t_mg_oci_dispatch_builds_the_container_argv();
     _t_mg_oci_network_follows_the_policy();
     _t_mg_oci_invalid_image_is_rejected_before_spawning();
+    _t_mg_oci_deadline_reaches_the_runtime();
+    _t_mg_oci_result_fields_are_the_runtime_s();
+    _t_mg_oci_spawn_failure_is_an_error();
     _t_mg_result_accessors();
     _t_mg_backend_reports_where_it_LANDED();
     _t_mg_dispatch_uses_the_EFFECTIVE_level();

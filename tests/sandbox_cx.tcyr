@@ -6,14 +6,19 @@
 # half: the float-literal rejection cx arc A requires, `.cyx` validation, and a
 # real round trip through `cycc_cx`.
 #
-# The compiling tests skip when `cycc_cx` is absent, and `_t_cx_skips_are_real`
-# makes that skip loud rather than silent.
+# The execution half is here too, and **ADR-006's acceptance test is one of
+# these assertions** — a `.cyx` calling `open("/etc/passwd")` must be refused.
+# A note here used to say there was no runner test because there was no runner;
+# kavach 3.11.6 closed that and the runner landed in bite 14.
 #
-# **There is no runner test because there is no runner.** ADR-006 forbids
-# executing a `.cyx` outside a kavach sandbox, and kavach 3.11.2 confines
-# neither of its exec paths — measured, with a `.cyx` calling
-# `open("/etc/passwd")` succeeding through `persistent_spawn`. The ADR's own
-# acceptance test arrives with the runner, once kavach can hold it up.
+# ## Two guards, because a guarded suite can pass by running nothing
+#
+# `_t_cx_skips_are_real` makes an absent `cycc_cx` loud. `_t_cx_runner_tests_
+# actually_ran` does the same for `cxvm`, by counting the yeses `_t_cx_have_
+# runner` gave and insisting on them when both binaries are installed. Both
+# resolve their binaries through the module's own search rather than a literal
+# path — the first was hardcoded to one developer's home until 2026-08-05 and
+# therefore protected nothing on any other machine, including CI.
 # =========================================================================
 
 include "src/units.cyr"
@@ -31,12 +36,32 @@ fn _t_cx_have_compiler(): i64 {
     return 1;
 }
 
+# How many times `_t_cx_have_runner` answered yes.
+#
+# The execution half of this suite is guarded, and a guard that answers "no"
+# everywhere is indistinguishable from a suite that passes. This counts the
+# guard's yeses so `_t_cx_runner_tests_actually_ran` can insist on them.
+var _T_CX_RUNNER_YESES = 0;
+
 fn _t_cx_skips_are_real(): i64 {
     # A regression in PATH resolution or in the stdin invocation would skip
     # every compiling test below and still report green.
-    if (file_exists("/home/macro/.cyrius/bin/cycc_cx") == 0) { return 0; }
+    #
+    # **This guard was hardcoded to one developer's home directory** until
+    # 2026-08-05 — `/home/macro/.cyrius/bin/cycc_cx`, the only such path in the
+    # tree. CI runs as `/home/runner`, so the guard returned before asserting
+    # anything and the whole safety net was dead on every machine but one. The
+    # audit of 2026-08-04 proved the consequence on a pristine checkout: with
+    # the compiler renamed away, the suite dropped from 62 assertions to 40 and
+    # still exited 0.
+    #
+    # Resolved through the same search the module itself uses, so the guard
+    # holds wherever the toolchain is installed.
+    var p = _agnosai_spawn_resolve("cycc_cx", agnosai_sanitized_envp());
+    if (load8(p) != 47) { return 0; }
+    if (sys_access(p, AGNOSAI_SPAWN_X_OK) != 0) { return 0; }
     assert(_t_cx_have_compiler() == 1,
-    "cycc_cx is installed, so the compiling tests below MUST run");
+    "cycc_cx is on PATH, so the compiling tests below MUST run");
     return 0;
 }
 
@@ -94,6 +119,22 @@ fn _t_cx_validate(): i64 {
 
     var wrong = str_new("ELF\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 24);
     assert(agnosai_cx_validate(wrong) == 0, "a different magic is rejected");
+
+    # **The upper bound had no test at all** — deleting `if (n >
+    # AGNOSAI_CX_MAX_BYTES) { return 0; }` left the suite at 62/62, and no other
+    # file referenced the constant. Both sides of the boundary are checked, so a
+    # limit that moved by one byte in either direction fails.
+    var big = alloc(AGNOSAI_CX_MAX_BYTES + 2);
+    memcpy(big, "CYX\x01", 4);
+    var z = 4;
+    while (z < AGNOSAI_CX_MAX_BYTES + 2) {
+        store8(big + z, 0);
+        z = z + 1;
+    }
+    assert(agnosai_cx_validate(str_new(big, AGNOSAI_CX_MAX_BYTES)) == 1,
+    "bytecode exactly at the size limit is accepted");
+    assert(agnosai_cx_validate(str_new(big, AGNOSAI_CX_MAX_BYTES + 1)) == 0,
+    "...and one byte over is refused — an unbounded .cyx is a memory bound nothing enforces");
     return 0;
 }
 
@@ -164,7 +205,63 @@ fn _t_cx_compile_rejects_empty(): i64 {
 fn _t_cx_have_runner(): i64 {
     if (_t_cx_have_compiler() == 0) { return 0; }
     if (agnosai_cx_interpreter_path() == 0) { return 0; }
+    _T_CX_RUNNER_YESES = _T_CX_RUNNER_YESES + 1;
     return 1;
+}
+
+# Every execution test really ran, on a machine that can run them.
+#
+# **The counterpart to `_t_cx_skips_are_real`, for the half it does not cover.**
+# That one proves the compiler is reachable; this proves the guard those tests
+# share said yes as many times as they asked. Without it a regression in
+# `agnosai_cx_interpreter_path` silently deletes the execution half — including
+# ADR-006's acceptance test — and the suite still exits 0.
+#
+# `>=`, not `==`: adding an execution test must not fail this, only skipping
+# one must. It is called last, after every guarded test has had its turn.
+fn _t_cx_runner_tests_actually_ran(): i64 {
+    # **Asks the OS, not the module.** Guarding this on
+    # `agnosai_cx_interpreter_path` would make a regression in that very
+    # function skip the test that exists to catch it.
+    var cc = _agnosai_spawn_resolve("cycc_cx", agnosai_sanitized_envp());
+    var vm = _agnosai_spawn_resolve("cxvm", agnosai_sanitized_envp());
+    if (load8(cc) != 47 || sys_access(cc, AGNOSAI_SPAWN_X_OK) != 0) { return 0; }
+    if (load8(vm) != 47 || sys_access(vm, AGNOSAI_SPAWN_X_OK) != 0) { return 0; }
+    assert(_T_CX_RUNNER_YESES >= 6,
+    "cycc_cx and cxvm are both installed, so every execution test above MUST have run — \
+    a guard that answers no everywhere is indistinguishable from a passing suite");
+    return 0;
+}
+
+# `agnosai_cx_interpreter_path` can say "not installed", and says it correctly.
+#
+# **All three of its documented zeros were unreachable** until 2026-08-05, and
+# with them a live vector: `_agnosai_spawn_resolve` hands back the bare name
+# when `PATH` yields nothing, and a bare name is resolved by `sys_access` and
+# `execve` **against the current directory**. The audit of 2026-08-04 planted an
+# executable next to the process and watched it run as the tool interpreter.
+fn _t_cx_interpreter_path_can_answer_not_installed(): i64 {
+    # The premise, stated so the assertions below are readable: the resolver
+    # fails OPEN, handing back the name it was given.
+    var bare = _agnosai_spawn_resolve("cxvm-definitely-not-installed-zzz",
+    agnosai_sanitized_envp());
+    assert(load8(bare) != 47,
+    "an unresolvable name comes back BARE from the resolver — it does not report failure");
+
+    assert(_agnosai_cx_resolve_interpreter("cxvm-definitely-not-installed-zzz") == 0,
+    "...and the interpreter lookup turns that into 0, rather than handing a bare name \
+    to access() and execve() to resolve against the current directory");
+    assert(_agnosai_cx_resolve_interpreter("./cxvm") == 0,
+    "a cwd-relative name is refused too — a planted binary next to the process is \
+    exactly the vector, and it is indistinguishable from an installed one to execve");
+    assert(_agnosai_cx_resolve_interpreter("/etc/passwd") == 0,
+    "and an absolute path that is not executable is not an interpreter");
+
+    var p = agnosai_cx_interpreter_path();
+    if (p == 0) { return 0; }
+    assert(load8(p) == 47, "a path that IS returned is absolute");
+    assert(sys_access(p, AGNOSAI_SPAWN_X_OK) == 0, "...and executable");
+    return 0;
 }
 
 fn _t_cx_interpreter_is_resolved_absolutely(): i64 {
@@ -244,6 +341,72 @@ fn _t_cx_run_enforces_its_deadline(): i64 {
     return 0;
 }
 
+# The timeout arm's output policy, on a payload that actually produces output.
+#
+# **The test above cannot see it.** Its guest writes nothing before it spins, so
+# blanking and keeping are indistinguishable — the audit of 2026-08-04 swapped
+# `str_from("")` for `str_builder_build(ob)` and the suite stayed at 62/62. This
+# guest writes first, which makes the choice observable, and the choice is to
+# blank: a tool that blew its budget produced no result, and half an answer is
+# worse than none because a caller cannot tell it is half.
+fn _t_cx_timeout_blanks_the_output_it_drained(): i64 {
+    if (_t_cx_have_runner() == 0) { return 0; }
+    var e[8];
+    store64(&e, 0);
+    var cyx = agnosai_cx_compile(str_from(
+    "syscall(1, 1, \"before-spin\", 11);\nvar i = 0;\nwhile (1 == 1) { i = i + 1; }\nsyscall(60, 0);\n"),
+    &e);
+    if (cyx == 0) { return 0; }
+
+    var r = agnosai_cx_run(cyx, 1000, &e);
+    assert(agnosai_cx_result_timed_out(r) == 1, "the guest is killed on its deadline");
+    assert(str_len(agnosai_cx_result_stdout(r)) == 0,
+    "...and what it wrote BEFORE spinning is blanked, as every ported backend blanks it");
+    return 0;
+}
+
+# A non-positive budget takes the default, and the default is not "forever".
+#
+# `AGNOSAI_CX_TIMEOUT_MS` is documented as the default wall-clock budget and was
+# applied by nothing until 2026-08-05: `agnosai_cx_run(cyx, 0, &e)` installed no
+# deadline, and the audit's probe never returned and had to be killed by hand.
+# Since this is the only CPU bound cx has, "no deadline" is the one thing it
+# must never resolve to.
+#
+# **Asserted on the resolution, not on a run.** Observing it through
+# `agnosai_cx_run` means waiting out the 30-second default once per suite —
+# which is exactly the 30-second test the `FD_CLOEXEC` finding just removed. The
+# resolution is a value, so it is checked as one.
+fn _t_cx_budget_resolution(): i64 {
+    assert(_agnosai_cx_budget_ms(0) == AGNOSAI_CX_TIMEOUT_MS,
+    "a 0 budget resolves to the documented default, NOT to 'no deadline'");
+    assert(_agnosai_cx_budget_ms(0 - 5) == AGNOSAI_CX_TIMEOUT_MS, "...and so does a negative one");
+    assert(_agnosai_cx_budget_ms(1000) == 1000, "a real budget is used as given");
+    assert(_agnosai_cx_budget_ms(1) == 1, "...down to a single millisecond");
+    assert(AGNOSAI_CX_TIMEOUT_MS > 0,
+    "and the default is itself positive — a 0 default would defeat the whole guard");
+    return 0;
+}
+
+# And the resolved default does not kill a guest that finishes inside it.
+fn _t_cx_zero_timeout_takes_the_default(): i64 {
+    if (_t_cx_have_runner() == 0) { return 0; }
+    var e[8];
+    store64(&e, 0);
+    var cyx = agnosai_cx_compile(str_from("var i = 0;\nwhile (i < 3) { i = i + 1; }\nsyscall(60, 7);\n"), &e);
+    if (cyx == 0) { return 0; }
+
+    var t0 = clock_now_ms();
+    var r = agnosai_cx_run(cyx, 0, &e);
+    var dt = clock_now_ms() - t0;
+    assert(load64(&e) == 0, "a 0 budget is not an error");
+    assert(agnosai_cx_result_timed_out(r) == 0,
+    "...and a guest that finishes quickly is not killed by the default deadline");
+    assert(agnosai_cx_result_exit_code(r) == 7, "...its exit code stands");
+    assert(dt < 20000, "...and the run is bounded, not open-ended");
+    return 0;
+}
+
 # How many descriptors this process currently holds.
 #
 # `/proc/self/fd` has one entry per open descriptor, so counting them across a
@@ -316,6 +479,47 @@ fn _t_cx_policy_shape(): i64 {
     # itself, so the guest exits 127 having never run - a refused exec that
     # reads exactly like a refused open.
     assert(policy_wants_confinement(p) == 1, "and the policy demands the confined seam");
+
+    # **Network isolation, which nothing asserted until 2026-08-05.** The module
+    # header calls it "the last difference from the WASI contract ADR-006
+    # replaces" and the field was still unpinned: the audit of 2026-08-04
+    # dropped `require_ns` and all 62 assertions passed, handing the guest the
+    # host network stack back.
+    assert(SandboxPolicy_network_enabled(p) == 0,
+    "the policy denies the network — a WASM tool had none, and neither may a cx tool");
+    return 0;
+}
+
+# The guest really is in its own namespaces, not merely asked to be.
+#
+# **The policy field above is a request; `require_ns` is what enforces it.**
+# `_spawn_ns_flags` (`lib/kavach.cyr:7943-7956`) drops `NS_NETWORK|NS_USER`
+# without it, and the audit's mutation — `persistent_spawn_confined_ns(exe, pol,
+# 1)` to plain `persistent_spawn_confined(exe, pol)` — left the suite at 62/62.
+#
+# `getuid` is the observable. A new user namespace maps the guest to root
+# (`_spawn_write_idmaps`), so a confined guest reports 0 where an unconfined one
+# reports the host uid; the network namespace rides on the same user namespace,
+# which is what makes this the test for both.
+fn _t_cx_guest_is_in_its_own_namespaces(): i64 {
+    if (_t_cx_have_runner() == 0) { return 0; }
+    # If the tests themselves run as root the mapping is invisible — 0 either
+    # way — so the assertion would be vacuous rather than wrong. Skip loudly by
+    # not counting it rather than asserting something that cannot fail.
+    if (syscall(102) == 0) { return 0; }
+
+    var e[8];
+    store64(&e, 0);
+    # Clamped, because an exit code is one byte and the host uid may exceed it.
+    var r = agnosai_cx_compile_and_run(
+    str_from("var u = syscall(102);\nif (u > 200) { u = 200; }\nsyscall(60, u);\n"),
+    AGNOSAI_CX_TIMEOUT_MS, &e);
+    assert(load64(&e) == 0, "the guest runs");
+    assert(r != 0, "...returning a result");
+    if (r == 0) { return 0; }
+    assert(agnosai_cx_result_exit_code(r) == 0,
+    "the guest's uid is 0 — it is inside a NEW user namespace, which is what carries the \
+    network namespace the policy asked for; without require_ns it would report the host uid");
     return 0;
 }
 
@@ -360,6 +564,7 @@ fn main(): i64 {
     _t_cx_compile_rejects_floats_before_invoking();
     _t_cx_compile_rejects_empty();
     _t_cx_interpreter_is_resolved_absolutely();
+    _t_cx_interpreter_path_can_answer_not_installed();
     _t_cx_run_executes_the_guest();
     _t_cx_run_captures_stdout();
     _t_cx_run_does_not_leak_descriptors();
@@ -367,7 +572,13 @@ fn main(): i64 {
     _t_cx_policy_shape();
     _t_cx_run_rejects_invalid_bytecode();
     _t_cx_run_enforces_its_deadline();
+    _t_cx_timeout_blanks_the_output_it_drained();
+    _t_cx_budget_resolution();
+    _t_cx_zero_timeout_takes_the_default();
     _t_cx_guest_cannot_open_etc_passwd();
+    _t_cx_guest_is_in_its_own_namespaces();
+    # Last, so every guarded test above has already had its turn.
+    _t_cx_runner_tests_actually_ran();
 
     return assert_summary();
 }

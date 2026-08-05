@@ -121,6 +121,52 @@ fn _t_sp_envp_inherited(): i64 {
     return 0;
 }
 
+# An environ block that actually carries all four injection vectors.
+#
+# **The test above cannot assert the filter WORKS, only that its output is
+# consistent**, because no developer or CI environment carries an `LD_*` — this
+# box has none across 42 variables, and `.github/workflows/ci.yml` adds none.
+# The audit of 2026-08-04 replaced the filter's guard with `if (1 == 1)` and the
+# suite reported 144/144; the identical mutant with `LD_PRELOAD` exported
+# reported three failures. So the coverage was of the environment, not the code.
+fn _t_sp_planted_envp(): i64 {
+    var src = alloc(7 * 8);
+    store64(src, "PATH=/usr/bin");
+    store64(src + 8, "LD_PRELOAD=/tmp/evil.so");
+    store64(src + 16, "HOME=/root");
+    store64(src + 24, "LD_LIBRARY_PATH=/tmp/lib");
+    store64(src + 32, "DYLD_INSERT_LIBRARIES=/tmp/x.dylib");
+    store64(src + 40, "DYLD_LIBRARY_PATH=/tmp/y");
+    store64(src + 48, 0);
+    return src;
+}
+
+# The filter, over a block that contains what it exists to remove.
+fn _t_sp_envp_filter_over_a_planted_block(): i64 {
+    var envp = _agnosai_sanitized_envp_of(_t_sp_planted_envp());
+
+    assert(agnosai_envp_has(envp, str_from("LD_PRELOAD")) == 0,
+    "a PLANTED LD_PRELOAD is removed — not merely absent from this machine");
+    assert(agnosai_envp_has(envp, str_from("LD_LIBRARY_PATH")) == 0, "so is LD_LIBRARY_PATH");
+    assert(agnosai_envp_has(envp, str_from("DYLD_INSERT_LIBRARIES")) == 0,
+    "so is DYLD_INSERT_LIBRARIES");
+    assert(agnosai_envp_has(envp, str_from("DYLD_LIBRARY_PATH")) == 0, "so is DYLD_LIBRARY_PATH");
+
+    assert(agnosai_envp_has(envp, str_from("PATH")) == 1, "PATH survives");
+    assert(agnosai_envp_has(envp, str_from("HOME")) == 1, "and so does HOME");
+
+    var n = 0;
+    while (load64(envp + n * 8) != 0) { n = n + 1; }
+    assert(n == 2,
+    "exactly two of the six survive — the count pins that four were removed, not that \
+    two happened to be found");
+
+    assert(_agnosai_sanitized_envp_of(0) != 0,
+    "a null source still answers with an empty envp, never 0");
+    assert(load64(_agnosai_sanitized_envp_of(0)) == 0, "...and that envp is terminated");
+    return 0;
+}
+
 # --- CLOEXEC -------------------------------------------------------------
 
 # The bit the exec-errno pipe is built on. Marking must succeed on a real fd and
@@ -222,24 +268,71 @@ fn _t_sp_large_dual_output(): i64 {
 # inherited. With CLOEXEC the write end was closed at `execve`, so the parent
 # sees EOF at once. Without it, `sleep` holds the pipe open and the parent blocks
 # for 30 seconds — a hang, not a wrong answer.
-fn _t_sp_cloexec_survives_a_grandchild(): i64 {
-    var r = _t_sh("sleep 30 & echo started");
+# **The premise this test used to carry was false, and it cost 30 seconds a
+# run.** It drove `sleep 30 & echo started` and claimed the parent would block
+# for 30 seconds without CLOEXEC. It would not: the grandchild also inherits
+# fds 1 and 2, the output pipes' write ends, which cannot be CLOEXEC because the
+# child needs them — so on the UNMODIFIED tree `sleep 5 & echo started` already
+# took 5011 ms. Both assertions held in both worlds, the audit of 2026-08-04
+# deleted the CLOEXEC call site entirely and the suite reported 144/144 in the
+# same wall time, and that one test was ~30 s of a 32.6 s suite.
+#
+# The discriminating shape closes the output pipes in the grandchild too, so the
+# ONLY descriptor that could still hold the spawn open is the errno pipe's write
+# end — the one CLOEXEC is for. Measured 16 ms with the bit and 4003 ms without.
+#
+# It only discriminates because the child now closes the descriptors it `dup2`'d
+# (the sibling fix of 2026-08-04); before that, the child's own leaked copies
+# held the output pipes open regardless.
+fn _t_sp_cloexec_is_what_lets_a_daemon_detach(): i64 {
+    var t0 = clock_now_ms();
+    var r = _t_sh("(exec 0<&- 1>&- 2>&-; sleep 4) & echo detached");
+    var dt = clock_now_ms() - t0;
+
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the child spawned");
-    assert(str_contains_cstr(agnosai_spawn_stdout(r), "started") == 1,
-    "...and returned promptly, because CLOEXEC closed the errno pipe at execve");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "detached") == 1, "...and its output came back");
+    assert(dt < 2000,
+    "...in well under the grandchild's 4 s — nothing downstream inherited the errno pipe, \
+    because FD_CLOEXEC closed its write end at execve");
     return 0;
 }
 
-# The sanitized environment actually reaches the child, rather than only being
-# built correctly.
+# The filter's effect on a REAL child, both with and without it applied.
+#
+# **The `LD_PRELOAD` half used to be a tautology.** It asserted
+# `contains "L=\n" || contains "L="`, and the script emits the literal `L=`
+# unconditionally, so the second disjunct could never be false. The audit of
+# 2026-08-04 proved it: with the sanitizer disabled and `LD_PRELOAD` exported —
+# a child demonstrably receiving it — this test did not report a failure, and
+# removing only the `||` clause made it fail at once.
+#
+# An explicit `envp` removes the need for the ambient environment entirely: the
+# same planted block goes in filtered and unfiltered, and the child says which
+# it got.
 fn _t_sp_env_reaches_child(): i64 {
-    var r = _t_sh("echo \"P=$PATH\"; echo \"L=$LD_PRELOAD\"");
+    var argv = alloc(32);
+    store64(argv, "/bin/sh");
+    store64(argv + 8, "-c");
+    store64(argv + 16, "echo \"P=$PATH\"; echo \"L=$LD_PRELOAD\"");
+    store64(argv + 24, 0);
+
+    var r = agnosai_spawn_capture_input("/bin/sh", argv,
+    _agnosai_sanitized_envp_of(_t_sp_planted_envp()), str_from(""),
+    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "spawned");
-    assert(str_contains_cstr(agnosai_spawn_stdout(r), "P=/") == 1,
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "P=/usr/bin") == 1,
     "PATH reaches the child — the filter is subtractive, not a wipe");
-    assert(str_contains_cstr(agnosai_spawn_stdout(r), "L=\n") == 1
-    || str_contains_cstr(agnosai_spawn_stdout(r), "L=") == 1,
-    "and LD_PRELOAD is empty in the child");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "L=\n") == 1,
+    "and LD_PRELOAD is EMPTY in the child");
+
+    # **The control.** The identical block, unfiltered, DOES deliver it — so the
+    # assertion above is measuring the filter and not the shell's own output
+    # shape. `ld.so` writes a warning to stderr about the missing object here,
+    # which is expected and is itself evidence the variable arrived.
+    var raw = agnosai_spawn_capture_input("/bin/sh", argv, _t_sp_planted_envp(), str_from(""),
+    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+    assert(str_contains_cstr(agnosai_spawn_stdout(raw), "L=/tmp/evil.so") == 1,
+    "...where the SAME block unfiltered hands it straight through");
     return 0;
 }
 
@@ -313,6 +406,213 @@ fn _t_sp_stdin_keeps_the_contract(): i64 {
     agnosai_sanitized_envp(), str_from("ignored"), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
     "spawn failure is still distinguishable when input was supplied");
+    return 0;
+}
+
+# --- A reader that goes away ---------------------------------------------
+
+# 320,000 bytes — five times over the 64 KiB a pipe will hold.
+#
+# The size is the point. Anything that fits in the pipe buffer is accepted by
+# the kernel whether or not the child ever reads it, so a small payload cannot
+# reach the failure this section is about.
+fn _t_sp_big_input(): Str {
+    var sb = str_builder_new();
+    var i = 0;
+    while (i < 3200) {
+        str_builder_add_cstr(sb,
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+        i = i + 1;
+    }
+    return str_builder_build(sb);
+}
+
+# A child that closes stdin and keeps running must not take the parent with it.
+#
+# **This test's first assertion is that it is reached at all.** Before the fix
+# of 2026-08-04 this shape killed the whole process: writing to a pipe whose
+# reader is gone raises `SIGPIPE`, whose default disposition terminates the
+# *writer*. The audit measured exit 141 — 128+13 — on three runs out of three,
+# with no assertion output at all, which is what a crashed suite looks like.
+# Production was masked incidentally by sandhi installing `SIG_IGN` inside its
+# own serve loops; nothing covered a test, a benchmark, or a consumer that never
+# starts a server.
+#
+# The child closes stdin explicitly and then lives on, rather than merely
+# exiting, so the parent observes `EPIPE` while the drain loop is still running.
+# A child that just exits leaves a microsecond-wide race between the failing
+# write and the reads seeing EOF, and a test that can flake is not a test.
+fn _t_sp_stdin_to_a_child_that_stopped_reading(): i64 {
+    var big = _t_sp_big_input();
+    assert(str_len(big) == 320000, "the payload is 320,000 bytes");
+
+    var r = _t_sh_in("exec 0<&-; sleep 1; echo still-here", big);
+
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK,
+    "a child that stops reading is not a spawn failure — the program ran");
+    assert(agnosai_spawn_stdin_write_failed(r) == 1,
+    "...and the undelivered input is REPORTED, not mistaken for EAGAIN and retried");
+    assert(str_contains_cstr(agnosai_spawn_stdout(r), "still-here") == 1,
+    "...while everything it wrote afterwards is still captured");
+    assert(agnosai_spawn_exit_code(r) == 0, "...and its own exit code stands");
+    return 0;
+}
+
+# An input the child DOES read leaves the failure flag clear.
+#
+# The pair matters: without it, a flag hardcoded to 1 would pass the test above.
+fn _t_sp_stdin_delivered_reports_no_failure(): i64 {
+    var r = _t_sh_in("cat", str_from("delivered"));
+    assert(agnosai_spawn_stdin_write_failed(r) == 0,
+    "an input that arrived reports no stdin failure");
+    assert(str_eq_cstr(agnosai_spawn_stdout(r), "delivered") == 1, "...and came through");
+
+    var e = _t_sh_in("cat", str_from(""));
+    assert(agnosai_spawn_stdin_write_failed(e) == 0,
+    "nor does an empty input, whose write loop never runs");
+    return 0;
+}
+
+# A hex digit's value, or -1 if `c` is not one.
+fn _t_sp_hex(c): i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 97 + 10; }
+    if (c >= 65 && c <= 70) { return c - 65 + 10; }
+    return 0 - 1;
+}
+
+# Whether `SIGPIPE` is ignored, read out of a `/proc/<pid>/status` dump.
+#
+# The `SigIgn:` field is a 16-hex-digit mask, one bit per signal, bit `N-1` for
+# signal `N`. `SIGPIPE` is 13, so bit 12 — the low bit of hex digit 12 counting
+# from the left. Reading the single bit rather than comparing the whole field
+# keeps the test from failing if some *other* signal is ever ignored too.
+#
+# Returns -1 when no `SigIgn:` field is found, so a missing field cannot read as
+# "not ignored" and quietly pass.
+fn _t_sp_sigpipe_ignored_in(out: Str): i64 {
+    var d = str_data(out);
+    var n = str_len(out);
+    var i = 0;
+    while (i + 7 <= n) {
+        if (load8(d + i) == 83 && load8(d + i + 1) == 105 && load8(d + i + 2) == 103
+        && load8(d + i + 3) == 73 && load8(d + i + 4) == 103 && load8(d + i + 5) == 110
+        && load8(d + i + 6) == 58) {
+            var j = i + 7;
+            while (j < n && _t_sp_hex(load8(d + j)) < 0) { j = j + 1; }
+            if (j + 16 > n) { return 0 - 1; }
+            return _t_sp_hex(load8(d + j + 12)) & 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# The child gets the DEFAULT `SIGPIPE` back, not the parent's ignored one.
+#
+# `SIG_IGN` is inherited across `execve` — unlike a handler, which is reset. So
+# the parent's own protection would otherwise follow every sandboxed tool into
+# its new image, and a tool running `cmd | head` would see `write` return
+# `EPIPE` where the same tool under the oracle dies on the signal.
+# `std::process::Command` restores the default in the child for exactly this
+# reason, which makes the restore parity rather than taste.
+fn _t_sp_child_gets_the_default_sigpipe(): i64 {
+    var r = _t_sh("cat /proc/self/status");
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the status dump ran");
+    assert(_t_sp_sigpipe_ignored_in(agnosai_spawn_stdout(r)) == 0,
+    "the child does NOT inherit the parent's ignored SIGPIPE");
+    return 0;
+}
+
+# --- A setup that cannot complete ----------------------------------------
+
+# `RLIMIT_NOFILE`, and the `getrlimit`/`setrlimit` pair that reads and sets it.
+#
+# Neither call is wrapped in the stdlib and neither number is named there, so
+# they are spelled out: 97 and 160 on x86_64, against a `{rlim_cur, rlim_max}`
+# pair of 64-bit words. The limit has to move because this box's soft limit is
+# 524,288 — a table nothing could exhaust by opening descriptors in a test.
+var _T_SP_RLIMIT_NOFILE = 7;
+var _T_SP_SYS_GETRLIMIT = 97;
+var _T_SP_SYS_SETRLIMIT = 160;
+
+# How many more descriptors this process can open right now.
+#
+# Counts by `dup`ing stderr, which needs no filesystem and yields exactly one
+# descriptor per call, then hands every one of them back.
+fn _t_sp_fd_headroom(): i64 {
+    var fds = alloc(256 * 8);
+    var n = 0;
+    while (n < 256) {
+        var fd = syscall(SYS_DUP, 2);
+        if (fd < 0) { break; }
+        store64(fds + n * 8, fd);
+        n = n + 1;
+    }
+    var i = 0;
+    while (i < n) {
+        sys_close(load64(fds + i * 8));
+        i = i + 1;
+    }
+    return n;
+}
+
+# A setup failure hands back every descriptor it had already opened.
+#
+# **The failure that fires here is descriptor exhaustion, which is why leaking
+# on it is self-reinforcing.** `agnosai_spawn_capture_input` opens four pipes;
+# on a table with room for three, the fourth fails and the twelve descriptors
+# already taken were — until the fix of 2026-08-04 — never given back. The audit
+# measured six lost per attempt and no recovery: every later spawn then failed
+# at the *first* pipe, so the process stayed broken for good.
+#
+# `AGNOSAI_SPAWN_FAIL_SETUP` had no coverage at all before this test; `grep`
+# found it in `spawn.cyr` and nowhere else in the tree.
+fn _t_sp_setup_failure_returns_its_descriptors(): i64 {
+    var rl[16];
+    store64(&rl, 0);
+    store64(&rl + 8, 0);
+    if (syscall(_T_SP_SYS_GETRLIMIT, _T_SP_RLIMIT_NOFILE, &rl) < 0) { return 0; }
+    var soft = load64(&rl);
+    var hard = load64(&rl + 8);
+
+    store64(&rl, 48);
+    if (syscall(_T_SP_SYS_SETRLIMIT, _T_SP_RLIMIT_NOFILE, &rl) < 0) { return 0; }
+
+    var before = _t_sp_fd_headroom();
+    assert(before > 8, "the lowered limit still leaves headroom to measure");
+
+    # Hold all but seven: three pipes fit, the fourth cannot.
+    var hold = alloc(256 * 8);
+    var h = 0;
+    while (h < before - 7) {
+        store64(hold + h * 8, syscall(SYS_DUP, 2));
+        h = h + 1;
+    }
+
+    var argv = alloc(16);
+    store64(argv, "/bin/true");
+    store64(argv + 8, 0);
+    var r = agnosai_spawn_capture("/bin/true", argv, agnosai_sanitized_envp(),
+    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_FAILED,
+    "a spawn that cannot open its pipes reports failure");
+    assert(agnosai_spawn_fail_reason(r) == AGNOSAI_SPAWN_FAIL_SETUP,
+    "...as SETUP, distinct from a child that ran and could not exec");
+
+    var i = 0;
+    while (i < h) {
+        sys_close(load64(hold + i * 8));
+        i = i + 1;
+    }
+    var after = _t_sp_fd_headroom();
+    assert(after == before,
+    "a setup failure gives every descriptor back — the paths that reach it are \
+    exactly the paths where there are none to spare");
+
+    store64(&rl, soft);
+    store64(&rl + 8, hard);
+    syscall(_T_SP_SYS_SETRLIMIT, _T_SP_RLIMIT_NOFILE, &rl);
     return 0;
 }
 
@@ -536,16 +836,21 @@ fn main(): i64 {
     _t_sp_entry_name();
     _t_sp_envp_from();
     _t_sp_envp_inherited();
+    _t_sp_envp_filter_over_a_planted_block();
     _t_sp_cloexec();
     _t_sp_capture_basics();
     _t_sp_failure_vs_exit_127();
     _t_sp_signalled();
     _t_sp_large_dual_output();
-    _t_sp_cloexec_survives_a_grandchild();
+    _t_sp_cloexec_is_what_lets_a_daemon_detach();
     _t_sp_env_reaches_child();
     _t_sp_stdin_basics();
     _t_sp_stdin_large_roundtrip();
     _t_sp_stdin_keeps_the_contract();
+    _t_sp_stdin_to_a_child_that_stopped_reading();
+    _t_sp_stdin_delivered_reports_no_failure();
+    _t_sp_child_gets_the_default_sigpipe();
+    _t_sp_setup_failure_returns_its_descriptors();
     _t_sp_timeout_kills();
     _t_sp_timeout_reaps();
     _t_sp_timeout_kills_a_child_that_traps_term();

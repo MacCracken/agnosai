@@ -169,16 +169,32 @@ fn agnosai_sandbox_manager_resolve_backend(m, policy): i64 {
     return agnosai_sandbox_policy_effective_isolation(policy);
 }
 
-# The deadline for this run — `manager.rs:80-84`.
+# The deadline for this run, in **milliseconds** — `manager.rs:80-84`.
 #
 # A policy's own `max_duration_secs` wins when it is set; 0 means "unset" and
 # falls back to the manager's default. **0 does not mean "no deadline"**, which
 # is the reading that would let a tool run forever.
-fn _agnosai_sandbox_manager_timeout_secs(m, policy): i64 {
+#
+# **And the manager's own default of 0 does not mean it either**, which is the
+# hole this used to have. It returned seconds, and every caller multiplied by
+# 1000 — so a `default_timeout_secs` of 0 became `timeout_ms` 0, which the spawn
+# primitive reads as `AGNOSAI_SPAWN_NO_TIMEOUT` and arms nothing. The audit of
+# 2026-08-04 measured a `/bin/sleep 3` running to completion under a 0-second
+# manager and reporting `timed_out == 0`. The oracle does the opposite:
+# `manager.rs:81-84` builds a `Duration`, and `tokio::time::timeout` on
+# `Duration::ZERO` fires **immediately**.
+#
+# So 0 clamps to 1 ms — the smallest deadline this primitive can express, which
+# is "fires at once" in the same sense tokio means it. Returning milliseconds
+# rather than seconds is what makes that representable at all; the OCI arm
+# converts back, because `oci.rs` takes seconds.
+fn _agnosai_sandbox_manager_timeout_ms(m, policy): i64 {
     if (agnosai_sandbox_policy_max_duration_secs(policy) > 0) {
-        return agnosai_sandbox_policy_max_duration_secs(policy);
+        return agnosai_sandbox_policy_max_duration_secs(policy) * 1000;
     }
-    return load64(m + AGN_SMC_DEFAULT_TIMEOUT_SECS);
+    var d = load64(m + AGN_SMC_DEFAULT_TIMEOUT_SECS);
+    if (d > 0) { return d * 1000; }
+    return 1;
 }
 
 # Execute a program with explicit arguments in the backend the policy selects —
@@ -192,7 +208,17 @@ fn _agnosai_sandbox_manager_timeout_secs(m, policy): i64 {
 # Returns 0 with `out_err` set on failure.
 fn agnosai_sandbox_manager_execute_argv(m, policy, argv, input: Str, out_err): i64 {
     var level = agnosai_sandbox_policy_effective_isolation(policy);
-    var secs = _agnosai_sandbox_manager_timeout_secs(m, policy);
+    var ms = _agnosai_sandbox_manager_timeout_ms(m, policy);
+
+    # `debug!(?level, ?argv, "sandbox manager dispatching (argv)")` —
+    # `manager.rs:86`. Dropped in the port until 2026-08-05, where the sibling
+    # backends carried their `debug!` lines across (`process.cyr:325`,
+    # `oci.cyr:355`); a dispatcher that logs nothing is the one place an
+    # operator cannot see which backend a policy chose.
+    var dm = str_cat(str_cat(str_from("sandbox manager dispatching (argv): "),
+    agnosai_isolation_level_wire(level)), str_from(" "));
+    if (vec_len(argv) > 0) { dm = str_cat(dm, vec_get(argv, 0)); }
+    sakshi_debug(str_data(dm), str_len(dm));
 
     if (level == AGNOSAI_ISOLATION_NONE) {
         # A native tool is already in-process; there is nothing to spawn. The
@@ -208,7 +234,7 @@ fn agnosai_sandbox_manager_execute_argv(m, policy, argv, input: Str, out_err): i
     }
 
     if (level == AGNOSAI_ISOLATION_PROCESS) {
-        var pc = agnosai_process_config_shell(secs * 1000);
+        var pc = agnosai_process_config_shell(ms);
         var pr = agnosai_process_execute_argv(pc, argv, input, out_err);
         if (pr == 0) { return 0; }
         return agnosai_sandbox_result_new(agnosai_process_result_stdout(pr),
@@ -219,7 +245,15 @@ fn agnosai_sandbox_manager_execute_argv(m, policy, argv, input: Str, out_err): i
     # `IsolationLevel::Oci` — `manager.rs:111-129`.
     var oc = agnosai_oci_config_new(load64(m + AGN_SMC_OCI_DEFAULT_IMAGE));
     agnosai_oci_config_set_runtime(oc, load64(m + AGN_SMC_OCI_RUNTIME));
-    agnosai_oci_config_set_timeout_secs(oc, secs);
+    # `oci.rs`'s field is seconds, so the millisecond deadline converts back —
+    # with a floor of 1. Rounding a sub-second deadline down to 0 would restore
+    # exactly the fail-open above: `oci.cyr` multiplies by 1000 and the spawn
+    # primitive reads 0 as `AGNOSAI_SPAWN_NO_TIMEOUT`. A second is the smallest
+    # deadline this backend can express, and that is the oracle's granularity
+    # too — `Duration::from_secs`.
+    var osecs = ms / 1000;
+    if (osecs < 1) { osecs = 1; }
+    agnosai_oci_config_set_timeout_secs(oc, osecs);
     agnosai_oci_config_set_memory_limit(oc, load64(m + AGN_SMC_OCI_MEMORY_LIMIT));
     agnosai_oci_config_set_allow_network(oc, agnosai_sandbox_policy_needs_network(policy));
 
@@ -227,7 +261,11 @@ fn agnosai_sandbox_manager_execute_argv(m, policy, argv, input: Str, out_err): i
     # so a bad image is an error before any runtime is spawned, which is the
     # whole point of validating it.
     if (agnosai_oci_sandbox_new(oc) == 0) {
-        store64(out_err, agnosai_error_sandbox(str_cat(str_from("invalid image: "),
+        # `"invalid OCI image: {e}"` — `oci.rs:95-97` verbatim. The port said
+        # `"invalid image: "` until 2026-08-05, and the only assertion on this
+        # message checked a substring of the *reason*, so the prefix could be
+        # emptied entirely with the suite green.
+        store64(out_err, agnosai_error_sandbox(str_cat(str_from("invalid OCI image: "),
         agnosai_oci_image_error(load64(m + AGN_SMC_OCI_DEFAULT_IMAGE)))));
         return 0;
     }

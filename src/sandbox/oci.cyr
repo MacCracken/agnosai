@@ -227,10 +227,30 @@ fn agnosai_oci_sandbox_new(config): i64 {
 # Reconstructed rather than threaded out of the validator, so the validator can
 # stay a predicate. Order matters — empty is checked before the flag case, as in
 # `oci.rs:71-83`.
+#
+# **The offending character is named**, matching `oci.rs:82`'s
+# `format!("image name contains invalid character: '{ch}'")`. It was dropped
+# until 2026-08-05, which left an operator with a refused image and no way to
+# tell which byte of it was the problem — the audit of 2026-08-04 found it. The
+# scan repeats the validator's codepoint walk rather than sharing it, for the
+# same reason the rest of this function does: the validator stays a predicate.
 fn agnosai_oci_image_error(image: Str): Str {
     if (str_len(image) == 0) { return str_from("image name is empty"); }
     if ((load8(str_data(image)) & 0xFF) == 45) {
         return str_from("image name must not start with '-' (flag injection)");
+    }
+
+    var n = str_len(image);
+    var d = str_data(image);
+    var cp[8];
+    var i = 0;
+    while (i < n) {
+        var w = _uc_decode_utf8(d, i, n, &cp);
+        if (_agnosai_oci_image_cp_ok(load64(&cp)) == 0) {
+            return str_cat(str_cat(str_from("image name contains invalid character: '"),
+            str_new(d + i, w)), str_from("'"));
+        }
+        i = i + w;
     }
     return str_from("image name contains invalid character");
 }
@@ -362,6 +382,14 @@ fn agnosai_oci_execute(config, entrypoint_args, input: Str, out_err): i64 {
         store64(out_err, agnosai_error_sandbox(str_cat(str_cat(str_from("failed to spawn "),
         runtime), str_from(" container"))));
         return 0;
+    }
+
+    # `oci.rs:158-162` logs and carries on: the container ran, and whatever it
+    # printed before it stopped reading is still its answer. Only `python`
+    # escalates this to an error — see the note there.
+    if (agnosai_spawn_stdin_write_failed(sp) == 1) {
+        var im = str_from("failed to write to container stdin");
+        sakshi_warn(str_data(im), str_len(im));
     }
 
     if (agnosai_spawn_timed_out(sp) == 1) {

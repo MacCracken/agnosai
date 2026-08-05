@@ -263,13 +263,25 @@ fn agnosai_sandbox_policy_from_value(v): i64 {
     var nwv = bayan_json_v_obj_get(v, "needs_network");
     if (nwv != 0 && bayan_json_v_is_bool(nwv) == 1) { nw = bayan_json_v_bool(nwv); }
 
+    # **Negative is out of domain, not a small number.** The oracle's fields are
+    # `u64` and `usize` (`policy.rs:44-48`), so serde refuses the document
+    # outright; a signed read here accepted `-1` and carried it all the way to
+    # `kavach_bridge.cyr`'s `secs * 1000`, where `lib/kavach.cyr:8354` arms a
+    # deadline only `if (timeout_ms > 0)` — so a negative duration armed **no
+    # deadline at all**. The audit of 2026-08-04 measured `kavach timeout_ms:
+    # -1000`. Out-of-domain falls back to the default, exactly as a wrong *type*
+    # does two fields up, so the failure direction stays safe.
     var dur = load64(d + AGN_SP_MAX_DURATION_SECS);
     var durv = bayan_json_v_obj_get(v, "max_duration_secs");
-    if (durv != 0 && bayan_json_v_is_int(durv) == 1) { dur = bayan_json_v_int(durv); }
+    if (durv != 0 && bayan_json_v_is_int(durv) == 1 && bayan_json_v_int(durv) >= 0) {
+        dur = bayan_json_v_int(durv);
+    }
 
     var mem = load64(d + AGN_SP_MAX_MEMORY_BYTES);
     var memv = bayan_json_v_obj_get(v, "max_memory_bytes");
-    if (memv != 0 && bayan_json_v_is_int(memv) == 1) { mem = bayan_json_v_int(memv); }
+    if (memv != 0 && bayan_json_v_is_int(memv) == 1 && bayan_json_v_int(memv) >= 0) {
+        mem = bayan_json_v_int(memv);
+    }
 
     return agnosai_sandbox_policy_new(lvl, fs, nw, dur, mem);
 }

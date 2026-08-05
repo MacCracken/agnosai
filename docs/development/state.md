@@ -201,16 +201,48 @@ Standing decisions that shaped the port, each with its record:
 
 ## Tests
 
-**65 suites, 4,373 assertions, all passing** — but see the M7 audit: a green
-suite here proved compatible with 43 confirmed defects, three of them live
-crashes or leaks. `docs/development/m7-audit-2026-08-04.md` has the evidence and
-`roadmap.md`'s M7 section has the remediation queue (3 fixed, 40 open). **That
-queue is the next work.**
+**65 suites, all passing.** The M7 audit's 43 findings are **all fixed** as of
+2026-08-05 — `docs/development/m7-audit-2026-08-04.md` marks each one in place
+and `roadmap.md`'s M7 section has the shape of the remediation. The sandbox
+suites grew **627 → 727 assertions** working it:
 
-⚠ The full `cyrius tests tests` run currently exceeds ~570 s and stalls in
-`server_sse`; individual sandbox suites take 1-3 s each. Run suites individually
-while working M7 rather than waiting on the whole tree. Coverage `cyrius coverage --min 80`
-→ **100% (899/899 fns)**, 64/64 files referenced.
+| suite | before | after |
+|---|---|---|
+| `sandbox_policy` | 90 | **102** |
+| `sandbox_oci` | 100 | **118** |
+| `sandbox_kavach_bridge` | 93 | **136** |
+| `sandbox_spawn` | 144 | **169** |
+| `sandbox_process` | 108 | **130** |
+| `sandbox_python` | 61 | **76** |
+| `sandbox_manager` | 69 | **90** |
+| `sandbox_cx` | 62 | **87** |
+
+**41 of the 43 fixes are mutation-verified** — mutation applied, suite re-run,
+failing assertion named, tree restored. The two that are not (L5, L9) are
+log-only and their mutants survive; the audit document says so rather than
+counting them.
+
+**A green suite is not evidence and this is the standing example.** 4,372
+assertions and 100% reference coverage coexisted with three live crashes, two
+fail-open divergences, and five security controls that could be deleted without
+a single failure. Reference coverage counts whether a symbol is *named* by a
+test.
+
+**The whole tree is green, verified two ways on 2026-08-05.** `cyrius tests
+tests` completes and reports `65 passed, 0 failed` (suites, not assertions —
+see the counting note below). Building and running each `.tcyr` individually
+gives **4,553 assertions passed, 0 failed, 0 suites unclean**.
+
+⚠ **A note here previously said the full run "exceeds ~570 s and stalls in
+`server_sse`". It does not stall** — it completes, well inside a 25-minute
+bound, and `server_sse` passes **56 assertions in seconds** when built and run
+on its own. It *is* slow, so the per-suite loop is still the faster way to work:
+`cyrius build tests/<name>.tcyr <out> && <out>`. The eight sandbox suites total
+~75 s that way.
+
+Coverage `cyrius coverage --min 80` → **100% (1050/1050 fns)**, 74/74 files
+referenced. The denominator counts public symbols only — `_`-prefixed internals
+are excluded by design, which is why adding six of them moved it by one.
 
 ```sh
 cyrius tests tests        # 65 suites; each prints "N passed" with an "(N total)" suffix
@@ -562,6 +594,44 @@ libro 2.8.4 arrives transitively via bote.
    **`grep "duplicate fn"` on the build log is not a sufficient check** and
    should not be treated as one.
 
+2. **`cyrius bench` accepts an argument it cannot use and reports success —
+   same root cause as the `cyrius build` missing-file bug.** Measured 2026-08-05
+   on cyrius 6.5.6: `cyrius bench benches` (a directory), `cyrius bench
+   no-such-dir` and `cyrius bench no-such-file.bcyr` each run **zero benchmarks,
+   print no diagnostic, and exit 0**. Only the **no-arg** form prints the
+   `=== N passed, M failed ===` summary, so a gate written any other way has
+   nothing to check and passes over nothing.
+
+   **`bench <file>` builds and runs that file as a program** — it does not match
+   the argument against a benchmark registry. `cyrius bench
+   tests/sandbox_policy.tcyr` runs the *test suite* and prints `102 passed`. So
+   an argument that matched nothing is the already-filed `cyrius build` case
+   (stdlib prepended, entry file never opened, a valid empty translation unit)
+   with a run appended — the compiler output still shows the `unreachable fns`
+   note, i.e. it compiled the stdlib and ran that.
+
+   `bench` is the only command in the family that fails this way. `cyrius tests
+   <file>` and `cyrius tests no-such-dir` both exit **1** with `not a
+   directory: ...`; bare `fmt` and `lint` exit 1 with usage; `cyrius lint
+   no-such.cyr` exits 1 with `cannot read file`. Filed upstream as
+   `2026-08-05-cyrius-bench-accepts-an-unusable-argument-and-exits-0.md`,
+   cross-triaged with the `build` filing.
+
+   `scripts/bench-history.sh` calls the bare form and is therefore correct.
+
+   **CLAUDE.md's rule about subdirectories is right, and a note here previously
+   said it was stale.** No-arg discovery scans `benches/` and `tests/` at their
+   **top level only**: a probe `.bcyr` planted at `benches/zzsub/` was not found
+   (still `6 passed`, marker absent from the output), and one planted at the
+   repo root was not found either. `benches/` is a scanned location, not a
+   counter-example to the rule.
+
+   **Unexplained on the same run**: `lt_aggregate_100k_10workers` measured
+   **25.3 ms** against the 79.2 ms recorded below, with `sort_100k` unchanged at
+   20.5 ms against 20.3 — so it is not the sort, and nothing in the tools path
+   was touched. Recorded as an observation, not claimed as a win; the table
+   below is left at its published numbers until someone reproduces the gap.
+
 3. **The cleanliness gates were never in CI — only run by hand.** Until
    2026-07-31 `.github/workflows/ci.yml` ran the symbol check, build, and test
    and nothing else: no `fmt`, `lint`, `doc`, `vet`, `deny`, or `coverage`,
@@ -597,9 +667,9 @@ libro 2.8.4 arrives transitively via bote.
 | Rust oracle | 27,683 lines at `rust-old/` — frozen |
 | Milestones | **M0–M6 complete** — the server tier is done and the binary serves |
 | Remaining in M6 | nothing — bites 15c (SSE) and 16 (bind) both closed 2026-08-03 |
-| In progress | **M7 `sandbox`** — bite 1 of ~6 (`policy` + hub) landed 2026-08-03 |
+| In progress | **M7 `sandbox`** — all eight modules ported; the 2026-08-04 audit's 43 findings all fixed 2026-08-05 |
 | Not started | M8 `fleet`, M9 `telemetry`, M10 `definitions` |
-| Gates | build OK · 1,470 symbols / 74 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · 58 suites / 3,735 assertions · coverage 100% (927/927) |
+| Gates | build OK · 1,656 symbols / 81 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · coverage 100% (1050/1050) |
 
 **The binary serves as of 2026-08-03**, and **drains on SIGINT/SIGTERM** as of
 the 6.5.6 bump the same day. `src/main.cyr` wires the state, installs a
@@ -639,6 +709,21 @@ fixed.
    not worth 121 new globals; `map_keys` looked negligible and was the entire
    residual), and two bugs were caught only because the pinning assertion was
    mutation-verified.
+8. **When an assertion cannot be made to fail, that is usually a statement about
+   the code's shape, not the test's.** The M7 audit remediation's recurring
+   defect was an *unreachable* control, not an unasserted one — an env filter
+   that reads `/proc/self/environ` cannot be tested by a process with no
+   `setenv`. Five fixes worked by splitting the function so it takes its input
+   as a parameter (`_agnosai_sanitized_envp_of`, `_agnosai_process_envp_from`,
+   `_agnosai_cx_resolve_interpreter`, `_agnosai_cx_budget_ms`,
+   `_agnosai_sandbox_manager_timeout_ms`); two more by **re-execing the suite
+   through `agnosai_spawn_capture_input` with a planted `envp`**, which is the
+   only way to put a variable in this process's own environment. Reach for one
+   of those before concluding a behaviour is unobservable.
+9. **Verify the mutation is a faithful revert.** One written during the M7
+   remediation changed half of a two-line fix, left the tree in a state neither
+   version would produce, and "killed" the mutant for the wrong reason. Read
+   what the mutated file actually says before believing the failure.
 
 ### Consumers
 

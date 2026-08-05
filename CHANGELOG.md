@@ -39,7 +39,213 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were dead-code-eliminated and the test reported green. That is the exact
   failure mode the audit exists to find, committed while fixing the audit.
 
-  **40 findings remain open.** See the roadmap for the queue.
+- **M7 audit, second pass (2026-08-05): the remaining live defects. Nothing in
+  the audit crashes or leaks any more.** Findings H1, H7 and M10.
+
+  - **A tool that stops reading its stdin killed agnosai itself** (H1, H7).
+    Writing to a pipe whose reader is gone raises `SIGPIPE`, and the default
+    disposition terminates the *writer*. Measured at exit **141** (128+13) on
+    three runs out of three, for a 320,000-byte payload to a script that exits
+    early — with no assertion output at all, because a dead process prints no
+    summary. Production was masked only incidentally: the one `SIG_IGN` in the
+    process came from sandhi's serve loops, so nothing protected a test, a
+    benchmark, or a consumer that never starts a server. The oracle cannot die
+    here because Rust installs the same disposition at startup.
+
+    `agnosai_spawn_capture_input` now calls `signal_ignore(SIGPIPE)` before the
+    fork. Anything under ~64 KiB was never affected — the kernel accepts it
+    into the pipe buffer whether or not the child reads it.
+
+  - **`EPIPE` is now told apart from `EAGAIN`** (H1, H7). The write loop
+    treated every negative return as "the child has not drained yet, come back",
+    which is right for `EAGAIN` and wrong for `EPIPE`, where there is no next
+    turn. It now closes the write end and records the failure. The three
+    backends then split exactly as the oracle does: `python` returns
+    `failed to write to python stdin` (`python.rs:92-95` propagates with `?`),
+    while `process` and `oci` log a warning and keep the output
+    (`process.rs:133-137`, `oci.rs:158-162`). New accessor
+    `agnosai_spawn_stdin_write_failed`.
+
+  - **The child gets the default `SIGPIPE` back before `execve`.** `SIG_IGN` is
+    inherited across `execve` where a handler is not, so ignoring it in the
+    parent would otherwise follow every sandboxed tool into its new image — a
+    tool running `cmd | head` would see `write` return `EPIPE` where the same
+    tool outside the sandbox dies on the signal. `std::process::Command`
+    restores the default in the child for this reason, so the restore is parity,
+    not taste. The stdlib has `signal_ignore` and no counterpart; filed upstream
+    as `2026-08-05-syscalls-has-signal-ignore-but-no-way-back-to-sig-dfl.md`,
+    with `_agnosai_signal_default` local until it lands.
+
+  - **A spawn that could not set itself up stranded its descriptors** (M10).
+    Every pre-fork `return _agnosai_spawn_failure()` left whatever had already
+    opened behind — and the failures that reach it are `EMFILE`/`ENFILE`, so
+    the failure that fires on a full table consumed six more and never gave them
+    back. The audit measured no recovery at all: every later attempt then failed
+    at the *first* pipe. The four pipes now live in one flat block and
+    `_agnosai_spawn_setup_failure(pipes, n)` closes exactly the ones that
+    opened. `AGNOSAI_SPAWN_FAIL_SETUP` previously appeared in no test in the
+    tree; it has one now, under a lowered `RLIMIT_NOFILE`.
+
+  All four fixes are mutation-verified, each killed by a named assertion —
+  except the missing `SIG_IGN`, which is killed by the exit-141 crash that is
+  the defect itself. Sandbox suites: spawn 144 → **158**, process 108 → **114**,
+  python 61 → **66**, oci 100 → **106**, all green.
+
+- **M7 audit, third pass (2026-08-05): the security controls nothing held in
+  place.** Findings H2, H4, H5, H6, H9, H10, M6, M8, M9, M22. Each was a real
+  control with no assertion that would fail if it were deleted; three were also
+  live defects in their own right.
+
+  - **`kavach_bridge` scanned the wrong number of bytes, in both directions**
+    (H2). `gate_apply` measures with `strlen` and a `Str` is not a C string, so
+    `scan_output` handed it a borrowed pointer: `"ok\0AKIA…"` was scanned as two
+    bytes and **released a credential as PASS**, while ten borrowed clean bytes
+    were BLOCKed because `strlen` ran off the end into the rest of the arena.
+    The oracle has neither problem — it passes a `String`, which carries its
+    length. The gate now gets a NUL-terminated copy with interior NULs mapped to
+    the newline `_concat_with_nl` already uses as a separator, so the whole
+    artifact is scanned. `config_agent_id` had the same borrowed-pointer defect
+    and now uses `str_cstr`. Filed upstream against kavach for a
+    length-carrying `gate_apply`.
+
+  - **Both loader-injection filters were untestable, not merely untested** (H4,
+    H6). No developer or CI environment carries an `LD_*` — this box has none
+    across 42 variables — so deleting either filter left its suite green, and
+    the same mutant with `LD_PRELOAD` exported failed. Both now take the
+    inherited block as a parameter (`_agnosai_sanitized_envp_of`,
+    `_agnosai_process_envp_from`) and are driven with all four vectors planted.
+    `process` had also **re-implemented the filter** rather than calling the
+    shared one; it now calls it, so a mutation in `spawn.cyr` fails the
+    `process` suite.
+
+  - **The `FD_CLOEXEC` test's premise was false and it cost 30 s a run** (H5).
+    It drove `sleep 30 & echo started` and claimed the parent would block
+    without the bit — but the grandchild also inherits fds 1 and 2, which cannot
+    be CLOEXEC, so the unmodified tree already took the full sleep and both
+    assertions held either way. The replacement closes the grandchild's stdio
+    too, leaving the errno pipe as the only descriptor that could hold the spawn
+    open: 16 ms with the bit, 4 s without. **The spawn suite is now 10 s instead
+    of 32.6 s.**
+
+  - **cx's network isolation was a headline claim with nothing behind it**
+    (H10). Dropping `require_ns` — which is what makes kavach apply
+    `NS_NETWORK|NS_USER` — left all 62 assertions passing. It is now asserted on
+    the policy and through a guest reporting its own uid, which is 0 inside the
+    new user namespace the network namespace rides on.
+
+  - **cx's "skips are real" guard was hardcoded to one developer's home** (H9).
+    `/home/macro/.cyrius/bin/cycc_cx` was the only such path in the tree, and CI
+    runs as `/home/runner` — so the meta-test protecting the entire execution
+    half asserted nothing anywhere else. Renaming a binary away used to drop 22
+    assertions, including ADR-006's acceptance test, and still exit 0. The guard
+    now resolves through the module's own search, and a counter insists the
+    execution half ran when both binaries are present.
+
+  - **`agnosai_cx_interpreter_path` could never return 0** (M22), so its
+    documented contract, `agnosai_cx_run`'s guard and two skip guards were all
+    dead — and a bare relative name reached `access()` and `execve()`, **both
+    resolved against the process's current directory**. The audit planted an
+    executable beside the process and watched it run as the tool interpreter. It
+    now requires an absolute, executable path.
+
+  - Three more assertions that could not fail: `kavach_bridge`'s `WARN -> PASS`
+    collapse (M6, the QUARANTINE case only ever exercised the other arm),
+    `policy_for_trust`'s `enabled`/`redact_secrets` (M8 — with `enabled` clear
+    `gate_apply` short-circuits before scanning, making every pinned threshold
+    inert), and `spawn`'s `LD_PRELOAD` check (M9), whose `|| contains "L="`
+    disjunct could never be false because the script emits that literal
+    unconditionally.
+
+  Every fix is mutation-verified. Sandbox suites: kavach_bridge 93 → **106**,
+  spawn 158 → **169**, process 114 → **123**, cx 63 → **74**.
+
+- **M7 audit, fourth pass (2026-08-05): the fail-open divergences and the
+  vacuous-assertion backlog. All 43 findings are now fixed.**
+
+  - **A 0-second manager deadline was no deadline at all** (M17). The helper
+    returned seconds and every caller multiplied by 1000, so
+    `default_timeout_secs = 0` became `AGNOSAI_SPAWN_NO_TIMEOUT` and a
+    `/bin/sleep 3` ran to completion reporting `timed_out == 0`. The oracle does
+    the opposite — `tokio::time::timeout` on `Duration::ZERO` fires immediately.
+    It now works in milliseconds so 0 resolves to 1 ms, and **the OCI arm floors
+    its conversion back to seconds at 1**: rounding 1 ms down to 0 restored the
+    identical fail-open a layer lower, which only a second test caught.
+  - **`policy` accepted negative durations and sizes** (M1). The oracle's fields
+    are `u64`/`usize`, so serde refuses the document; the port read them signed
+    and `-1` reached kavach as `timeout_ms: -1000`, where a deadline is armed
+    only `if (timeout_ms > 0)` — so a negative duration armed none. Both fields
+    now fall back to the default, as a wrong *type* already did.
+  - **The OCI deadline was the one config field nothing pinned** (H8): deleting
+    it silently substituted `oci_config_new`'s hard-coded 60 s, invisible
+    because `/bin/echo` was the only stand-in runtime in the suite and it never
+    blocks. Also pinned now: the OCI result's `timed_out`, `stderr` and
+    `exit_code` (M18), all three of which could be hardcoded; the spawn-failure
+    guard, whose deletion segfaults (M19); and the image-rejection message,
+    which now matches the oracle's `"invalid OCI image: "` prefix and **names
+    the offending character** (L10).
+  - **`kavach_bridge`'s exec-failure arm had no assertion at all** (M7) — every
+    `load64(&e)` check in that file asserted `== 0`. `sandbox_exec` returns 0 on
+    BLOCK, so the ordinary "a tool printed a credential" case lands there. The
+    start arm now carries kavach's error code, matching `format!("...: {e}")`;
+    the other two cannot, because `sandbox_create` and `sandbox_exec` signal
+    failure by returning 0, and that is now written down rather than left as an
+    unexplained fixed string.
+  - **`-v` was checked for membership, not position** (M4). `docker` parses
+    options only until the first non-option argument, so an image emitted ahead
+    of the mount makes it container argv and the volume is silently never
+    applied — hoisting the image passed 100/100. And the runtime's `envp` was
+    unpinned in both directions (M5): the suite now re-execs itself with a
+    planted variable to prove the runtime inherits the **unfiltered**
+    environment, which is the module's explicit parity decision.
+  - **`python` logged nothing at all** (L7) — no `sakshi` call anywhere in the
+    module, on the highest-risk operation in the subsystem, against a
+    `#[tracing::instrument]` in the oracle and `debug!` lines carried across in
+    every sibling. It now logs the spawn and the timeout, reports a bad
+    `work_dir` as a working-directory fault rather than a missing interpreter
+    (L8), proves `work_dir` reaches the interpreter (M14), and proves the
+    sanitized `envp` does too (M15) — the last by re-exec, after a comment
+    claiming that was unobservable turned out to be wrong.
+  - **cx's timeout arm discarded output with no comment** (M23), on a test whose
+    payload produced none; a non-positive budget installed no deadline while
+    `AGNOSAI_CX_TIMEOUT_MS` was documented as the default and applied nowhere;
+    and `AGNOSAI_CX_MAX_BYTES` appeared in no test in the tree. All three fixed,
+    with the budget resolution split into `_agnosai_cx_budget_ms` so it is
+    assertable in microseconds rather than by waiting out a 30-second default.
+  - Nine more assertions that could not fail: `process()`'s `min_isolation`
+    (M2), the `_a` allocator arguments (M3, measured per call — one span across
+    both was satisfied by whichever still threaded), the wire field order (L2),
+    the memory-field type guard (L1), the underscore in the image-reference set
+    (L3), the twelve "failed executions" that all succeeded (L4), the
+    replace-vs-append env semantics (M11), the chdir-vs-exec message
+    discrimination (M12), `set_args` (M13), the `parameters` object tag (M16),
+    and a PATH assertion the shell was inventing for itself (L6).
+
+  **Two fixes are honestly unverifiable and are labelled as such**: L5 (a
+  `sakshi_warn` length one byte short of its message) and L9 (the manager's
+  missing dispatch `debug!`) are log-only, nothing here captures sakshi output,
+  and both mutants survive. 41 of 43 killed, not 43.
+
+  **The transferable finding is that the recurring defect was an
+  *unreachable* assertion, not a missing one.** Five fixes worked by splitting a
+  function so the thing under test could be handed its input; two more by
+  re-execing the suite through its own spawn primitive with a planted `envp`,
+  which is the only way a process with no `setenv` can put a variable in its own
+  environment.
+
+  Suites: policy 90 → **102**, oci 100 → **118**, kavach_bridge 93 → **136**,
+  spawn 144 → **169**, process 108 → **130**, python 61 → **76**, manager 69 →
+  **90**, cx 62 → **87**. **627 → 727 assertions**, all green, coverage 100%.
+
+### Performance
+
+- **The sandbox_spawn suite runs in 10.2 s against 32.6 s (−69%).** Not an
+  optimisation: `_t_sp_cloexec_survives_a_grandchild` drove `sleep 30` on a
+  false premise — the grandchild inherits fds 1 and 2, which cannot be
+  `FD_CLOEXEC`, so the unmodified tree already waited out the full sleep and
+  both of that test's assertions held whether or not the bit was set. The
+  replacement closes the grandchild's stdio, leaving the errno pipe as the only
+  descriptor that could hold the spawn open, and discriminates in **16 ms
+  against 4 s**. One test was 30 s of a 32.6 s suite and pinned nothing.
 
 ### Security
 

@@ -94,9 +94,17 @@ fn _t_py_bridge_input_shape(): i64 {
 
     # Absent parameters become an empty object, never a missing key — the
     # wrapper indexes `input_data["parameters"]` unconditionally.
+    #
+    # **`!= 0` cannot see the difference**, and the audit of 2026-08-04 proved
+    # it: deleting the `if (parameters == 0)` guard leaves a 0 that serialises
+    # to the literal `null`, which the parser materialises as a real `JTAG_NULL`
+    # node with a non-zero pointer. The wrapper would then index a null and the
+    # tool would fail at run time. The TAG is what discriminates.
     var none = bayan_json_v_parse(agnosai_python_bridge_input(str_from("s"), str_from("t"), 0));
-    assert(bayan_json_v_obj_get(none, "parameters") != 0,
-    "no parameters still yields a `parameters` key the wrapper can index");
+    var np = bayan_json_v_obj_get(none, "parameters");
+    assert(np != 0, "no parameters still yields a `parameters` key the wrapper can index");
+    assert(load64(np) == JTAG_OBJ,
+    "...and it is an OBJECT, not a JSON null wearing a non-zero pointer");
     return 0;
 }
 
@@ -165,10 +173,17 @@ fn _t_py_missing_interpreter(): i64 {
 
 # --- The five oracle tests (interpreter required) ------------------------
 #
-# **Env sanitization is not asserted here, and cannot be.** `execute_script`
-# passes `agnosai_sanitized_envp`, but a test process has no `setenv` with which
-# to plant an `LD_PRELOAD` for it to strip - swapping the sanitized envp for the
-# raw one changes nothing observable. The filter itself is proven in
+# **Env sanitization IS asserted here, by re-exec.** A note used to stand where
+# this one does, claiming the swap "changes nothing observable" — the audit of
+# 2026-08-04 disproved it with a probe: launched as `LD_PRELOAD=/tmp/evil.so
+# ./probe`, an interpreter under the sanitized envp printed `ABSENT` and one
+# under `_read_environ_envp()` printed `/tmp/evil.so`. The obstacle was never
+# observability, only that a test process has no `setenv` — and
+# `agnosai_spawn_capture_input` takes an arbitrary `envp`, so the suite plants
+# one and re-execs itself. See
+# `_t_py_sanitized_envp_reaches_the_interpreter`.
+#
+# The filter itself is also proven in
 # sandbox_spawn against a constructed environment; the wiring here is
 # correct-by-construction only.
 
@@ -221,6 +236,161 @@ fn _t_py_timeout(): i64 {
     assert(str_len(agnosai_python_result_stdout(r)) == 0,
     "...with output blanked, as python.rs:114-121 does");
     assert(dt < 15000, "...and it returned rather than waiting out the sleep");
+    return 0;
+}
+
+# An input the interpreter never read is an ERROR here, not a quiet result.
+#
+# **The oracle splits on this and the port must split with it.** `write_all`'s
+# `Err` is propagated with `?` at `python.rs:92-95`, where the sibling backends
+# only `warn!` (`process.rs:133-137`, `oci.rs:158-162`). A script that was meant
+# to read its input and did not produced output about nothing, so handing that
+# back as success is worse than handing back an error.
+#
+# The payload has to exceed the 64 KiB pipe buffer or the kernel accepts it
+# whether or not the interpreter ever reads it — the audit measured the
+# threshold, 32,000 bytes returning normally where 320,000 did not. Before the
+# fix of 2026-08-04 this shape did not merely misreport: it killed the calling
+# process with `SIGPIPE`, three runs out of three.
+fn _t_py_stdin_the_interpreter_never_reads(): i64 {
+    if (_t_py_have_python() == 0) { return 0; }
+    var sb = str_builder_new();
+    var i = 0;
+    while (i < 3200) {
+        str_builder_add_cstr(sb,
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+        i = i + 1;
+    }
+    var big = str_builder_build(sb);
+    assert(str_len(big) == 320000, "the payload is 320,000 bytes — past the pipe buffer");
+
+    var s = agnosai_python_sandbox_with_config(str_from("python3"), 10000);
+    var e[8];
+    store64(&e, 0);
+    # Closes stdin and stays alive, so the write fails while the drain loop is
+    # still running rather than racing the child's exit.
+    var r = agnosai_python_execute_script(s,
+    str_from("import os, sys, time; os.close(0); time.sleep(1)"), big, &e);
+
+    assert(r == 0, "an input the interpreter never read is an error, not a result");
+    assert(load64(&e) != 0, "...with out_err set");
+    # Guarded, because the two assertions below dereference it: a regression
+    # that leaves `out_err` clear should report as two failures, not as a
+    # segfault that takes the summary line with it.
+    if (load64(&e) == 0) { return 0; }
+    assert(agnosai_error_kind(load64(&e)) == AGNOSAI_ERR_SANDBOX, "...as a sandbox error");
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)),
+    "failed to write to python stdin") == 1, "...carrying the oracle's message (python.rs:94)");
+    return 0;
+}
+
+# The configured `work_dir` actually reaches the interpreter.
+#
+# **Storing it and reading it back through the accessor is not the same claim.**
+# The audit of 2026-08-04 replaced the `AGN_PYS_WORK_DIR` read in
+# `execute_script` with a bare `var wd = 0;` and the suite reported 61/61 —
+# every interpreter test builds its sandbox with `with_config`, which leaves
+# `work_dir` unset, so nothing downstream of the accessor was exercised.
+fn _t_py_work_dir_reaches_the_interpreter(): i64 {
+    if (_t_py_have_python() == 0) { return 0; }
+    var s = agnosai_python_sandbox_with_work_dir(
+    agnosai_python_sandbox_with_config(str_from("python3"), 10000), str_from("/tmp"));
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_python_execute_script(s, str_from("import os; print(os.getcwd())"),
+    str_from(""), &e);
+    assert(load64(&e) == 0, "the interpreter runs in the configured directory");
+    assert(r != 0, "...returning a result");
+    if (r == 0) { return 0; }
+    assert(str_contains_cstr(agnosai_python_result_stdout(r), "/tmp") == 1,
+    "...and it IS /tmp — the child chdir'd there, rather than inheriting the parent's cwd");
+    return 0;
+}
+
+# A bad `work_dir` says so, rather than blaming the interpreter.
+#
+# `spawn.cyr:328-334` already distinguishes the two and `_agnosai_process_finish`
+# branches on it; python reported both as "failed to spawn python process" until
+# 2026-08-05, which sends an operator to check whether python is installed when
+# the actual fault is a directory that does not exist.
+fn _t_py_bad_work_dir_names_the_directory(): i64 {
+    if (_t_py_have_python() == 0) { return 0; }
+    var s = agnosai_python_sandbox_with_work_dir(
+    agnosai_python_sandbox_with_config(str_from("python3"), 10000),
+    str_from("/nonexistent/workdir"));
+
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_python_execute_script(s, str_from("pass"), str_from(""), &e);
+    assert(r == 0, "a working directory that does not exist is an error");
+    assert(load64(&e) != 0, "...with out_err set");
+    if (load64(&e) == 0) { return 0; }
+    assert(str_contains_cstr(agnosai_error_message(load64(&e)), "working directory") == 1,
+    "...naming the working directory, not the interpreter");
+    return 0;
+}
+
+# --- Env sanitization, through a re-exec ---------------------------------
+
+# The marker that tells a re-exec'd copy of this binary what it is for.
+var _T_PY_REEXEC = "AGNOSAI_TEST_REEXEC=py-envp";
+
+# `DYLD_LIBRARY_PATH` is on `SANITIZED_ENV_VARS` and **inert on Linux**, so it
+# is a variable the filter removes that plants no loader warnings on the way.
+var _T_PY_MARKER = "DYLD_LIBRARY_PATH=/tmp/agnosai-py-marker";
+
+fn _t_py_is_reexec(): i64 {
+    var src = _read_environ_envp();
+    var i = 0;
+    while (src != 0 && load64(src + i * 8) != 0) {
+        if (streq(load64(src + i * 8), _T_PY_REEXEC) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# What the re-exec'd copy does: ask the interpreter what it sees, and print it.
+fn _t_py_reexec_body(): i64 {
+    var s = agnosai_python_sandbox_with_config(str_from("python3"), 10000);
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_python_execute_script(s,
+    str_from("import os; print('MARKER=' + os.environ.get('DYLD_LIBRARY_PATH', 'ABSENT'))"),
+    str_from(""), &e);
+    if (r == 0) { return println("CHILD-FAILED-TO-RUN"); }
+    return println_str(agnosai_python_result_stdout(r));
+}
+
+fn _t_py_sanitized_envp_reaches_the_interpreter(): i64 {
+    if (_t_py_have_python() == 0) { return 0; }
+
+    var src = _read_environ_envp();
+    var n = 0;
+    while (src != 0 && load64(src + n * 8) != 0) { n = n + 1; }
+
+    var envp = alloc((n + 3) * 8);
+    var i = 0;
+    while (i < n) {
+        store64(envp + i * 8, load64(src + i * 8));
+        i = i + 1;
+    }
+    store64(envp + n * 8, _T_PY_REEXEC);
+    store64(envp + (n + 1) * 8, _T_PY_MARKER);
+    store64(envp + (n + 2) * 8, 0);
+
+    var argv = alloc(16);
+    store64(argv, "/proc/self/exe");
+    store64(argv + 8, 0);
+    var r = agnosai_spawn_capture_input("/proc/self/exe", argv, envp, str_from(""), 60000, 0);
+    assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the suite re-execs itself");
+
+    var out = agnosai_spawn_stdout(r);
+    assert(str_contains_cstr(out, "CHILD-FAILED-TO-RUN") == 0,
+    "...and the child ran an interpreter");
+    assert(str_contains_cstr(out, "MARKER=ABSENT") == 1,
+    "the interpreter does NOT see a sanitized variable its parent was launched with — \
+    swapping agnosai_sanitized_envp for _read_environ_envp makes this the marker's value");
     return 0;
 }
 
@@ -308,6 +478,10 @@ fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
 
+    # A re-exec'd copy runs one thing and prints it — see
+    # `_t_py_sanitized_envp_reaches_the_interpreter`.
+    if (_t_py_is_reexec() == 1) { return _t_py_reexec_body(); }
+
     _t_py_skips_are_not_hiding_a_regression();
     _t_py_bridge_script_is_constant();
     _t_py_tool_source_never_enters_the_script();
@@ -319,6 +493,10 @@ fn main(): i64 {
     _t_py_echo_script();
     _t_py_json_roundtrip();
     _t_py_timeout();
+    _t_py_stdin_the_interpreter_never_reads();
+    _t_py_work_dir_reaches_the_interpreter();
+    _t_py_bad_work_dir_names_the_directory();
+    _t_py_sanitized_envp_reaches_the_interpreter();
     _t_py_nonzero_exit_code();
     _t_py_execute_tool();
     _t_py_tool_failure_is_reported_not_thrown();
