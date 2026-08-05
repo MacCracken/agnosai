@@ -18,13 +18,22 @@
 #
 # An empty registry answers `[]`, not `null` — the oracle's `Vec` serializes to
 # an empty array and a client parsing the response would break on `null`.
-fn agnosai_route_list_tools(state): i64 {
-    var schemas = agnosai_tool_registry_list(agnosai_app_state_tools(state));
-    var arr = bayan_json_v_arr_new();
+fn agnosai_route_list_tools_a(a, state): i64 {
+    var schemas = agnosai_tool_registry_list_a(a, agnosai_app_state_tools(state));
+    var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(schemas); i = i + 1) {
-        bayan_json_v_arr_push(arr, agnosai_tool_schema_to_value(vec_get(schemas, i)));
+        bayan_json_v_arr_push_a(a, arr, agnosai_tool_schema_to_value_a(a, vec_get(schemas, i)));
     }
-    return agnosai_route_json(HTTP_OK, arr);
+    return agnosai_route_json_a(a, HTTP_OK, arr);
+}
+
+# Global-allocator form of `agnosai_route_list_tools_a`.
+#
+# **The most expensive route in the table**, measured at 3,584 bytes per
+# request before threading: every registered tool's schema, plus a value per
+# parameter under it, rebuilt on the no-free global bump on every listing.
+fn agnosai_route_list_tools(state): i64 {
+    return agnosai_route_list_tools_a(default_alloc(), state);
 }
 
 # `DELETE /api/v1/tools/{name}` — unregister a tool at runtime.

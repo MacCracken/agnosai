@@ -56,7 +56,52 @@ fn _t_names(a, b): i64 {
     return v;
 }
 
+fn _t_tn_schema_fp(ctx): i64 {
+    return agnosai_tool_schema_new(str_from("t"), str_from("d"));
+}
+
+fn _t_tn_exec_fp(ctx, input): i64 {
+    return agnosai_tool_output_ok(bayan_json_v_null());
+}
+
+# The `_a` forms, named directly.
+#
+# Each is reached through its bare twin, so the behaviour is covered — but
+# reference coverage counts the SYMBOL, and an indirectly-used public fn reads
+# as dead. Asserted the way the rest of the arena work is: byte-identical wire
+# between the two paths.
+fn _t_tn_a_forms(): i64 {
+    var ar = arena_allocator(16384);
+    var s = agnosai_tool_schema_new(str_from("t"), str_from("d"));
+    agnosai_tool_schema_param(s, str_from("p"), str_from("pd"), str_from("string"), 1);
+
+    assert(str_eq(bayan_json_v_build(agnosai_tool_schema_to_value(s)),
+    bayan_json_v_build(agnosai_tool_schema_to_value_a(ar, s))) == 1,
+    "tool_schema_to_value_a emits byte-identical JSON to the global form");
+
+    var p0 = vec_get(agnosai_tool_schema_parameters(s), 0);
+    assert(str_eq(bayan_json_v_build(agnosai_param_schema_to_value(p0)),
+    bayan_json_v_build(agnosai_param_schema_to_value_a(ar, p0))) == 1,
+    "...and so does param_schema_to_value_a");
+
+    var o = agnosai_tool_output_ok(bayan_json_v_int_new(7));
+    assert(str_eq(bayan_json_v_build(agnosai_tool_output_to_value(o)),
+    bayan_json_v_build(agnosai_tool_output_to_value_a(ar, o))) == 1,
+    "...and tool_output_to_value_a");
+
+    # A locally-built tool, not a builtin — this suite deliberately includes
+    # only native + registry, and pulling in `builtin/basic` to get one would
+    # widen its scope for a coverage reference.
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_tool_new(str_from("t"), str_from("d"),
+    &_t_tn_schema_fp, &_t_tn_exec_fp, 0));
+    assert(vec_len(agnosai_tool_registry_list_a(ar, reg)) == 1,
+    "registry_list_a walks slots through the arena");
+    return 0;
+}
+
 fn main() {
+    _t_tn_a_forms();
     alloc_init();
 
     test_group("tools_native");

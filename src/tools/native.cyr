@@ -97,15 +97,22 @@ fn agnosai_param_schema_required(p): i64 {
 }
 
 # A parameter schema as a bayan JSON value.
-fn agnosai_param_schema_to_value(p): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(p + AGN_PARAM_NAME)));
-    bayan_json_v_obj_set(obj, str_from("description"),
-    bayan_json_v_str_new(load64(p + AGN_PARAM_DESCRIPTION)));
-    bayan_json_v_obj_set(obj, str_from("param_type"), bayan_json_v_str_new(load64(p + AGN_PARAM_TYPE)));
-    bayan_json_v_obj_set(obj, str_from("required"),
-    _agnosai_bool_to_value(load64(p + AGN_PARAM_REQUIRED)));
+fn agnosai_param_schema_to_value_a(a, p): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "name"),
+    bayan_json_v_str_new_a(a, load64(p + AGN_PARAM_NAME)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "description"),
+    bayan_json_v_str_new_a(a, load64(p + AGN_PARAM_DESCRIPTION)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "param_type"),
+    bayan_json_v_str_new_a(a, load64(p + AGN_PARAM_TYPE)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "required"),
+    _agnosai_bool_to_value_a(a, load64(p + AGN_PARAM_REQUIRED)));
     return obj;
+}
+
+# Global-allocator form of `agnosai_param_schema_to_value_a`.
+fn agnosai_param_schema_to_value(p): i64 {
+    return agnosai_param_schema_to_value_a(default_alloc(), p);
 }
 
 # Create a tool schema with no parameters yet.
@@ -146,19 +153,29 @@ fn agnosai_tool_schema_parameters(s): i64 {
 }
 
 # A tool schema as a bayan JSON value.
-fn agnosai_tool_schema_to_value(s): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("name"), bayan_json_v_str_new(load64(s + AGN_SCHEMA_NAME)));
-    bayan_json_v_obj_set(obj, str_from("description"),
-    bayan_json_v_str_new(load64(s + AGN_SCHEMA_DESCRIPTION)));
+fn agnosai_tool_schema_to_value_a(a, s): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "name"),
+    bayan_json_v_str_new_a(a, load64(s + AGN_SCHEMA_NAME)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "description"),
+    bayan_json_v_str_new_a(a, load64(s + AGN_SCHEMA_DESCRIPTION)));
 
     var params = load64(s + AGN_SCHEMA_PARAMETERS);
-    var arr = bayan_json_v_arr_new();
+    var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(params); i = i + 1) {
-        bayan_json_v_arr_push(arr, agnosai_param_schema_to_value(vec_get(params, i)));
+        bayan_json_v_arr_push_a(a, arr, agnosai_param_schema_to_value_a(a, vec_get(params, i)));
     }
-    bayan_json_v_obj_set(obj, str_from("parameters"), arr);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "parameters"), arr);
     return obj;
+}
+
+# Global-allocator form of `agnosai_tool_schema_to_value_a`.
+#
+# **The dependency `/api/v1/tools` was waiting on.** That route measured 3,584
+# bytes per request on the global bump — the worst in the table — because every
+# schema and every parameter under it was rebuilt there on each listing.
+fn agnosai_tool_schema_to_value(s): i64 {
+    return agnosai_tool_schema_to_value_a(default_alloc(), s);
 }
 
 # Create an empty tool input.
@@ -265,16 +282,26 @@ fn agnosai_tool_output_error(o): i64 {
 
 # A tool output as a bayan JSON value. `error` is **omitted** when absent,
 # matching the oracle's `skip_serializing_if = "Option::is_none"`.
-fn agnosai_tool_output_to_value(o): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("success"),
-    _agnosai_bool_to_value(load64(o + AGN_OUTPUT_SUCCESS)));
-    bayan_json_v_obj_set(obj, str_from("result"), load64(o + AGN_OUTPUT_RESULT));
+fn agnosai_tool_output_to_value_a(a, o): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "success"),
+    _agnosai_bool_to_value_a(a, load64(o + AGN_OUTPUT_SUCCESS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "result"), load64(o + AGN_OUTPUT_RESULT));
     var err = load64(o + AGN_OUTPUT_ERROR);
     if (err != 0) {
-        bayan_json_v_obj_set(obj, str_from("error"), bayan_json_v_str_new(err));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "error"), bayan_json_v_str_new_a(a, err));
     }
     return obj;
+}
+
+# Global-allocator form of `agnosai_tool_output_to_value_a`.
+#
+# **`result` is carried, not rebuilt.** It is whatever value the tool returned,
+# already allocated wherever the tool chose — the arena does not reach inside
+# it, and must not: a tool holding a borrowed pointer into its own state would
+# break if this copied.
+fn agnosai_tool_output_to_value(o): i64 {
+    return agnosai_tool_output_to_value_a(default_alloc(), o);
 }
 
 # Create a tool.

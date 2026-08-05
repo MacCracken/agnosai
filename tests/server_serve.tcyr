@@ -747,6 +747,46 @@ fn _t_allocation_profile(): i64 {
     "the SAME route through a per-request arena costs a small fraction of the global path — \
     measured 80 B against 1,696 B, and un-threading any one call collapses the gap");
 
+    # The same, for `/api/v1/tools` — the most expensive route in the table,
+    # and the one that does NOT reach near-zero. Measured 7,384 -> 1,696 bytes
+    # per request with all four builtins registered.
+    #
+    # **The floor is the tool vtable, not this module.** `agnosai_tool_schema`
+    # calls each tool's own `schema_fp`, which rebuilds its schema and every
+    # parameter under it on the global allocator per call; the vtable has no
+    # allocator parameter, so nothing here can reach that. The ratio below is
+    # deliberately looser than the definitions one for exactly that reason —
+    # asserting near-zero would be asserting a thing that is not true.
+    agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, str_from("/api/v1/tools"),
+    str_from(""), 0, str_from(""));
+    reset_via(ar);
+
+    var b7 = alloc_used();
+    for (var q = 0; q < 64; q = q + 1) {
+        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, str_from("/api/v1/tools"),
+        str_from(""), 0, str_from(""));
+    }
+    var per_tools_global = (alloc_used() - b7) / 64;
+
+    var b8 = alloc_used();
+    for (var w = 0; w < 64; w = w + 1) {
+        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, str_from("/api/v1/tools"),
+        str_from(""), 0, str_from(""));
+        reset_via(ar);
+    }
+    var per_tools_arena = (alloc_used() - b8) / 64;
+
+    assert(per_tools_arena < per_tools_global,
+    "the tools listing costs less through the arena than on the global bump");
+    # **3x, and the margin is measured rather than guessed.** With one echo tool
+    # registered: 1,768 B global against 368 B threaded (4.8x), and against
+    # 848 B with the route un-threaded (2.1x). A 2x threshold passed BOTH — the
+    # un-threaded case cleared it by 72 bytes — so it asserted nothing. 3x sits
+    # between the two measured ratios.
+    assert(per_tools_arena * 3 < per_tools_global,
+    "...by at least 3x — the schema tree and the registry vecs move to the arena; \
+    the per-tool schema_fp build cannot until the vtable takes an allocator");
+
     # The `_a` forms named directly. Each is reached through `dispatch_a`, so
     # the behaviour is covered — but reference coverage counts the SYMBOL, and
     # an indirectly-used public fn reads as dead.
@@ -754,6 +794,8 @@ fn _t_allocation_profile(): i64 {
     assert(vec_len(d_a) >= 0, "definitions_a walks the map through the arena");
     var lr = agnosai_route_list_definitions_a(ar, s);
     assert(agnosai_route_status(lr) == HTTP_OK, "list_definitions_a answers 200");
+    var lt = agnosai_route_list_tools_a(ar, s);
+    assert(agnosai_route_status(lt) == HTTP_OK, "list_tools_a answers 200");
     var rj = agnosai_route_json_a(ar, HTTP_OK, bayan_json_v_null());
     assert(agnosai_route_status(rj) == HTTP_OK, "route_json_a builds a response in the arena");
 

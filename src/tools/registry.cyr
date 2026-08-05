@@ -88,21 +88,38 @@ fn agnosai_tool_registry_count(r): i64 {
 # arbitrary user code, and calling it while holding the registry lock would let
 # one tool stall every other worker's lookups. The key snapshot is taken under
 # the lock, then released.
-fn agnosai_tool_registry_list(r): i64 {
+fn agnosai_tool_registry_list_a(a, r): i64 {
     mutex_lock(load64(r + AGN_REG_MUTEX));
     var tools = load64(r + AGN_REG_TOOLS);
-    var keys = map_keys(tools);
-    var found = vec_new();
-    for (var i = 0; i < vec_len(keys); i = i + 1) {
-        vec_push(found, map_get(tools, vec_get(keys, i)));
+    var found = vec_new_a(a);
+    var n = _agnosai_map_slots(tools);
+    for (var i = 0; i < n; i = i + 1) {
+        if (_agnosai_map_slot_live(tools, i) == 1) {
+            vec_push_a(a, found, _agnosai_map_slot_val(tools, i));
+        }
     }
     mutex_unlock(load64(r + AGN_REG_MUTEX));
 
-    var schemas = vec_new();
+    var schemas = vec_new_a(a);
     for (var j = 0; j < vec_len(found); j = j + 1) {
-        vec_push(schemas, agnosai_tool_schema(vec_get(found, j)));
+        vec_push_a(a, schemas, agnosai_tool_schema(vec_get(found, j)));
     }
     return schemas;
+}
+
+# Global-allocator form of `agnosai_tool_registry_list_a`.
+#
+# **The two vecs are the arena's; the schemas inside them are not.**
+# `agnosai_tool_schema` calls the tool's own `schema_fp`, which is arbitrary
+# user code allocating wherever it chooses — threading the vec does not and
+# cannot reach into what the callback returns. That is why `/api/v1/tools` does
+# not reach zero the way `agents/definitions` does: the per-call schema build is
+# the tool's, not this module's.
+#
+# Slot-walked rather than `map_keys` (standing rule 5), which is what makes the
+# vec allocation actually land in `a`.
+fn agnosai_tool_registry_list(r): i64 {
+    return agnosai_tool_registry_list_a(default_alloc(), r);
 }
 
 # Vec of the names of all registered tools, unordered.
