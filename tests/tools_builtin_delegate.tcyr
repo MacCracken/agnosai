@@ -57,6 +57,36 @@ fn _t_dl_input(agent, task): i64 {
     return i;
 }
 
+# The public constructor, named directly.
+#
+# `agnosai_register_delegate_builtin` goes through it, so the behaviour was
+# covered — but reference coverage counts the SYMBOL, and an indirectly-used
+# public fn reads as dead. Same for `agnosai_orchestrator_submit_crew` below.
+fn _t_dl_tool_constructor(): i64 {
+    var tool = agnosai_delegate_tool(_t_dl_state());
+    assert(tool != 0, "the tool constructs");
+    assert(str_eq_cstr(agnosai_tool_name(tool), "delegate") == 1, "...named delegate");
+    return 0;
+}
+
+# The orchestrator entry point the tool is a thin wrapper over.
+fn _t_dl_submit_crew_directly(): i64 {
+    var st = _t_dl_state();
+    var spec = agnosai_crew_new(str_from("direct"));
+    var agents = vec_new();
+    vec_push(agents, agnosai_agent_new(str_from("a"), str_from("r"), str_from("g")));
+    agnosai_crew_with_agents(spec, agents);
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("do it")));
+    agnosai_crew_with_tasks(spec, tasks);
+
+    var cid = agnosai_orchestrator_submit_crew(agnosai_app_state_orchestrator(st), spec);
+    assert(cid != 0, "submit_crew returns a crew id");
+    assert(agnosai_orchestrator_crew(agnosai_app_state_orchestrator(st), cid) != 0,
+    "...and the crew is registered under it");
+    return 0;
+}
+
 fn _t_dl_schema(): i64 {
     var s = _agnosai_delegate_schema(0);
     assert(str_eq_cstr(agnosai_tool_schema_name(s), "delegate") == 1, "the tool is named delegate");
@@ -182,6 +212,8 @@ fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
 
+    _t_dl_tool_constructor();
+    _t_dl_submit_crew_directly();
     _t_dl_schema();
     _t_dl_returns_an_id_not_a_result();
     _t_dl_id_is_live_before_the_call_returns();

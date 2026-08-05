@@ -127,11 +127,22 @@ fn agnosai_hoosh_models_endpoint(base: Str): i64 {
 }
 
 # The wire spelling of a chat role.
+fn agnosai_chat_role_to_wire_a(a, role): i64 {
+    if (role == AGNOSAI_ROLE_SYSTEM) { return str_from_a(a, "system"); }
+    if (role == AGNOSAI_ROLE_ASSISTANT) { return str_from_a(a, "assistant"); }
+    if (role == AGNOSAI_ROLE_TOOL) { return str_from_a(a, "tool"); }
+    return str_from_a(a, "user");
+}
+
+# Global-allocator form of `agnosai_chat_role_to_wire_a`.
+#
+# **The wire spellings were the whole residual.** With every JSON node threaded,
+# `to_json_a` still grew the global bump because each role rendered through a
+# bare `str_from` — four literals per request, invisible against the tree until
+# the tree stopped allocating. Same shape core hit, and the arena-flat assertion
+# in `llm_hoosh.tcyr` is what caught it here.
 fn agnosai_chat_role_to_wire(role): i64 {
-    if (role == AGNOSAI_ROLE_SYSTEM) { return str_from("system"); }
-    if (role == AGNOSAI_ROLE_ASSISTANT) { return str_from("assistant"); }
-    if (role == AGNOSAI_ROLE_TOOL) { return str_from("tool"); }
-    return str_from("user");
+    return agnosai_chat_role_to_wire_a(default_alloc(), role);
 }
 
 # A chat role from its wire spelling. Unknown spellings read as User.
@@ -183,12 +194,18 @@ fn agnosai_chat_message_content(m): i64 {
 }
 
 # A chat message as a bayan JSON value: `{"role":"user","content":"..."}`.
-fn agnosai_chat_message_to_value(m): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("role"),
-    bayan_json_v_str_new(agnosai_chat_role_to_wire(load64(m + AGN_CHAT_ROLE))));
-    bayan_json_v_obj_set(obj, str_from("content"), bayan_json_v_str_new(load64(m + AGN_CHAT_CONTENT)));
+fn agnosai_chat_message_to_value_a(a, m): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "role"),
+    bayan_json_v_str_new_a(a, agnosai_chat_role_to_wire_a(a, load64(m + AGN_CHAT_ROLE))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "content"),
+    bayan_json_v_str_new_a(a, load64(m + AGN_CHAT_CONTENT)));
     return obj;
+}
+
+# Global-allocator form of `agnosai_chat_message_to_value_a`.
+fn agnosai_chat_message_to_value(m): i64 {
+    return agnosai_chat_message_to_value_a(default_alloc(), m);
 }
 
 # Create an inference request for a model. `max_tokens` and `temperature` start
@@ -268,43 +285,57 @@ fn agnosai_inference_request_stream(r): i64 {
 #
 # When streaming, `stream_options.include_usage` is set so the gateway appends a
 # final usage frame — without it a streamed turn carries no token count at all.
-fn agnosai_inference_request_to_value(r): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("model"), bayan_json_v_str_new(load64(r + AGN_REQ_MODEL)));
+fn agnosai_inference_request_to_value_a(a, r): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "model"),
+    bayan_json_v_str_new_a(a, load64(r + AGN_REQ_MODEL)));
 
     var msgs = load64(r + AGN_REQ_MESSAGES);
-    var arr = bayan_json_v_arr_new();
+    var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(msgs); i = i + 1) {
-        bayan_json_v_arr_push(arr, agnosai_chat_message_to_value(vec_get(msgs, i)));
+        bayan_json_v_arr_push_a(a, arr, agnosai_chat_message_to_value_a(a, vec_get(msgs, i)));
     }
-    bayan_json_v_obj_set(obj, str_from("messages"), arr);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "messages"), arr);
 
     var max_tokens = load64(r + AGN_REQ_MAX_TOKENS);
     if (max_tokens != AGNOSAI_NO_LIMIT) {
-        bayan_json_v_obj_set(obj, str_from("max_tokens"), bayan_json_v_int_new(max_tokens));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_tokens"),
+        bayan_json_v_int_new_a(a, max_tokens));
     }
 
     var temp = load64(r + AGN_REQ_TEMPERATURE_MILLI);
     if (temp != AGNOSAI_NO_LIMIT) {
         var tv = f64_div(f64_from(temp), f64_from(1000));
-        bayan_json_v_obj_set(obj, str_from("temperature"), bayan_json_v_float_new(tv));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "temperature"),
+        bayan_json_v_float_new_a(a, tv));
     }
 
     var stream = load64(r + AGN_REQ_STREAM);
     if (stream == 1) {
-        bayan_json_v_obj_set(obj, str_from("stream"), bayan_json_v_bool_new(1));
-        var opts = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(opts, str_from("include_usage"), bayan_json_v_bool_new(1));
-        bayan_json_v_obj_set(obj, str_from("stream_options"), opts);
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "stream"), bayan_json_v_bool_new_a(a, 1));
+        var opts = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, opts, str_from_a(a, "include_usage"),
+        bayan_json_v_bool_new_a(a, 1));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "stream_options"), opts);
     } else {
-        bayan_json_v_obj_set(obj, str_from("stream"), bayan_json_v_bool_new(0));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "stream"), bayan_json_v_bool_new_a(a, 0));
     }
     return obj;
 }
 
+# Global-allocator form of `agnosai_inference_request_to_value_a`.
+fn agnosai_inference_request_to_value(r): i64 {
+    return agnosai_inference_request_to_value_a(default_alloc(), r);
+}
+
 # The request serialized to the JSON body to POST.
-fn agnosai_inference_request_to_json(r): i64 {
-    return bayan_json_v_build(agnosai_inference_request_to_value(r));
+fn agnosai_inference_request_to_json_a(a, r): Str {
+    return bayan_json_v_build_a(a, agnosai_inference_request_to_value_a(a, r));
+}
+
+# Global-allocator form of `agnosai_inference_request_to_json_a`.
+fn agnosai_inference_request_to_json(r): Str {
+    return agnosai_inference_request_to_json_a(default_alloc(), r);
 }
 
 # Create an inference response.

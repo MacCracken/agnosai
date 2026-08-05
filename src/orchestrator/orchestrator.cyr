@@ -246,6 +246,17 @@ fn _agnosai_orch_register(o, spec): i64 {
     return runner;
 }
 
+# Run a crew to completion and return its final state, or 0 if it never ran.
+#
+# `Orchestrator::run_crew` — `rust-old/src/orchestrator/orchestrator.rs:126`.
+# **Blocking, and deliberately still blocking**: the oracle's `create_crew`
+# awaits this inline (`crews.rs:151`), so `POST /api/v1/crews` returns only when
+# the crew has finished and the id it hands back names a completed run. That is
+# the wire contract, and `agnosai_orchestrator_submit_crew` below exists rather
+# than changing it.
+#
+# The body is two shared halves so the blocking and async paths cannot drift —
+# see `_agnosai_orch_register` above and `_agnosai_orch_finish` below.
 fn agnosai_orchestrator_run_crew(o, spec): i64 {
     return _agnosai_orch_finish(o, _agnosai_orch_register(o, spec),
     agnosai_crew_id(spec), agnosai_crew_name(spec));
@@ -355,8 +366,11 @@ fn _agnosai_orch_submit_thread(job): i64 {
 # unexecuted rather than reporting a run that never started.
 #
 # ⚠ **Owed: the thread is never joined.** `lib/thread.cyr` has `thread_create`
-# and `thread_join` and no detach, so each submitted crew leaks its 2 MiB stack.
-# Bounded work, deliberately deferred with the concurrency cap — see roadmap B1.
+# and `thread_join` and no detach, so each submitted crew leaks its 2 MiB stack
+# and 4 KiB of TLS. Filed upstream as
+# `2026-08-05-no-thread-detach-so-a-fire-and-forget-thread-leaks-its-2-mib-stack.md`;
+# a consumer-side reaper would bound it but cannot close it — a thread cannot
+# free the stack it is running on. Deferred with the concurrency cap, roadmap B1.
 fn agnosai_orchestrator_submit_crew(o, spec): i64 {
     var crew_id = agnosai_crew_id(spec);
     var runner = _agnosai_orch_register(o, spec);

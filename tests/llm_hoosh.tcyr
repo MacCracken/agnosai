@@ -343,6 +343,58 @@ fn main() {
     _t_assert_str(str_from(sandhi_headers_get(h_key, "Authorization")), "Bearer sk-abc",
     "the Authorization header is a bearer token");
 
+    # --- B2: the `_a` forms (roadmap B2, `llm` group) --------------------
+    #
+    # The two assertions state.md calls the contract for this work: an arena
+    # path that grows the global bump by **zero** bytes, and a wire that is
+    # byte-identical to the global path. Both are mutation-verified — dropping
+    # the allocator from a single call fails them.
+    var ar = arena_allocator(65536);
+    var breq = agnosai_inference_request_new(str_from("gpt-4"));
+    agnosai_inference_request_say(breq, AGNOSAI_ROLE_USER, str_from("hello"));
+    agnosai_inference_request_say(breq, AGNOSAI_ROLE_ASSISTANT, str_from("hi"));
+    agnosai_inference_request_with_max_tokens(breq, 256);
+    agnosai_inference_request_with_temperature_milli(breq, 700);
+
+    # Warm: the first touch of any lazily-built global must not count as leakage.
+    agnosai_inference_request_to_json_a(ar, breq);
+    reset_via(ar);
+
+    var before = alloc_used();
+    var bn = 0;
+    while (bn < 100) {
+        agnosai_inference_request_to_json_a(ar, breq);
+        reset_via(ar);
+        bn = bn + 1;
+    }
+    assert_eq(alloc_used() - before, 0,
+    "100 inference-request serializations through an arena grow the global bump by 0 bytes — \
+    the message array, every key, and the serialized body");
+
+    # Byte-identical wire, which is what lets this land without an ADR.
+    assert_eq(str_eq(agnosai_inference_request_to_json(breq),
+    agnosai_inference_request_to_json_a(ar, breq)), 1,
+    "the arena path emits byte-identical JSON to the global path");
+
+    # And the value form on its own — `to_json` would otherwise be the only
+    # thing keeping the tree referenced.
+    var av = agnosai_inference_request_to_value_a(ar, breq);
+    assert(bayan_json_v_is_obj(av) == 1, "request_to_value_a builds an object");
+    _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get(av, "model")), "gpt-4",
+    "...carrying the model");
+    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get(av, "messages")), 2,
+    "...and both messages");
+
+    # The `_a` wire spelling, named directly — it is reached through
+    # `chat_message_to_value_a`, but reference coverage counts symbols.
+    _t_assert_str(agnosai_chat_role_to_wire_a(ar, AGNOSAI_ROLE_TOOL), "tool",
+    "role_to_wire_a renders through the arena");
+
+    var mv = agnosai_chat_message_to_value_a(ar, agnosai_chat_message_new(
+    AGNOSAI_ROLE_USER, str_from("m")));
+    _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get(mv, "content")), "m",
+    "chat_message_to_value_a carries the content");
+
     return assert_summary();
 }
 
