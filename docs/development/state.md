@@ -606,7 +606,7 @@ global bump per request:
 router, id validation, tool schemas and the response struct all land in the
 request arena and are freed by one `reset_via`.
 
-### ⚠ The write routes split, and three of them must NOT be threaded
+### The write routes split — every one is threaded, three keep a floor
 
 | write route | B/req global | B/req arena | retains data from the parse tree? |
 |---|---|---|---|
@@ -614,7 +614,7 @@ request arena and are freed by one `reset_via`.
 | `POST /api/v1/approvals` | 1,352 | **0** | no |
 | `POST /api/v1/agents/definitions` | 2,280 | **392** | yes, but **cloned** |
 | `POST /api/v1/crews` | 21,184 | **17,048** | yes, but **cloned** |
-| `POST /api/v1/a2a/receive` | 1,168 | — | yes, still **borrowed** |
+| `POST /api/v1/a2a/receive` | 17,192 | **15,624** | yes, but **cloned** |
 
 `agnosai_agent_from_value` and the crew *request* deserialisers took
 `bayan_json_v_str(...)` **without cloning**, and what they build is stored in
@@ -657,8 +657,26 @@ alone: it deserialises a *persisted* crew, requires an `id` the request shape
 never carries, and **has no caller in `src/`**. Check the call chain from the
 route rather than matching on a plausible name.
 
-⏳ **Owed: `POST /api/v1/a2a/receive`**, which builds a crew from the request
-description and runs it — the same audit-chain retention, not yet threaded.
+✅ **Done for a2a.** `agnosai_a2a_req_from_value_a` clones the task id, the
+description and the four optional strings. 17,192 → **15,624 B/request**;
+`metadata` still points into the parse tree, deliberately, because it is only
+re-serialised for the size check and never retained.
+
+**Every route in the table is now threaded.** The residuals are all retained
+state rather than garbage.
+
+⚠ **`agnosai_audit_record` stores its `message` without cloning.** Every caller
+passes an owned Str today, so nothing is broken — but that is a contract held by
+convention, on a tamper-evident log, and one future caller passing a borrowed
+message reintroduces this whole class silently. Cloning inside `audit_record`
+closes it at the boundary; not done, and named here so it is a decision rather
+than an oversight.
+
+**`str_builder_build`, not `str_builder_new`, decides where a built Str lives.**
+The builder's scratch buffer can be anywhere; `build` allocates the finished Str
+and copies into it. A mutation moving `str_builder_new` to an arena changes
+nothing and passes; moving `str_builder_build` fails at once. Worth knowing
+before writing a comment about which call is load-bearing.
 
 The test that pinned the hazard was **inverted, not deleted** — it asserted a
 stored name was destroyed after its arena was released and scribbled over, and

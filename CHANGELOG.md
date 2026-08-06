@@ -395,6 +395,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`POST /api/v1/a2a/receive` 17,192 → 15,624 bytes per request — the last
+  write route, and the whole request path is now threaded.**
+
+  `agnosai_a2a_req_from_value` borrowed the task id, the description and the
+  four optional strings from the parse tree. The description reaches the
+  registered `CrewState` as a task result's output and the task id reaches the
+  audit trail through the crew name, so both outlive the request. Both are
+  cloned now, and `create`-style two-allocator wiring applies: parse tree and
+  response in the arena, the request itself from `default_alloc()`.
+
+  `metadata` is the one member still pointing into the parse tree, and
+  deliberately — it is re-serialised for the 64 KiB size check and never
+  retained.
+
+  As with `create_crew`, the reduction is small because the bulk is the crew
+  *execution* this route kicks off, which is registry state and must not move.
+
+  **A mutation corrected the source comment.** I had written that the crew-name
+  builder "stays global" and pointed at `str_builder_new`; moving that to the
+  arena changes nothing, because **`str_builder_build` is what allocates the
+  finished Str** and a bare `build` yields a global one however the builder was
+  created. Moving `str_builder_build` fails immediately. The comment now names
+  the right call.
+
+  3 mutations applied, 3 caught once aimed correctly.
+  `server_routes_a2a` 72 → **83** assertions.
+
+  New `_a` forms: `agnosai_a2a_req_new`, `agnosai_a2a_req_from_value`,
+  `_agnosai_a2a_opt_str`, `_agnosai_a2a_failed`, `agnosai_route_a2a_receive`.
+
+  **Every route in the table is now threaded**, and the residuals are all
+  retained state rather than garbage: 0 B for the seven reads plus `/mcp` and
+  `/approvals`, 392 B for a stored agent definition, and the crew-execution
+  floors on `crews` and `a2a`.
+
+  ⚠ **Left standing, and worth knowing:** `agnosai_audit_record` stores its
+  `message` **without cloning**. Every caller now passes an owned Str, so
+  nothing is wrong today — but that is a contract held by convention on a
+  tamper-evident log, and a future caller passing a borrowed message
+  reintroduces this whole class silently. Cloning inside `audit_record` would
+  close it at the boundary.
+
 - **The crew request deserialisers clone too — `POST /api/v1/crews` 21,184 →
   17,048 bytes per request (−19.5%). The thing that was actually at risk was the
   audit chain.**

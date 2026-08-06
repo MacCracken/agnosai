@@ -39,6 +39,15 @@ include "src/server/routes/crews.cyr"
 include "src/server/routes/a2a.cyr"
 include "tests/test_helpers.cyr"
 
+# The same state over a caller-supplied orchestrator, so a test can hold the
+# registry and the audit chain it wants to inspect afterwards.
+fn _t_state_with(o): i64 {
+    return agnosai_app_state_new(o,
+    agnosai_tool_registry_new(), agnosai_auth_config_new(),
+    agnosai_event_bus_new(), agnosai_audit_chain_new(),
+    agnosai_approval_gate_new());
+}
+
 fn _t_state(): i64 {
     return agnosai_app_state_new(agnosai_orchestrator_new(0),
     agnosai_tool_registry_new(), agnosai_auth_config_new(),
@@ -324,6 +333,85 @@ fn _t_status(): i64 {
     return 0;
 }
 
+# The A2A deserialiser's `_a` forms, named directly — both are reached only
+# through `agnosai_route_a2a_receive_a`, which reference coverage cannot see.
+fn _t_a2a_req_takes_an_allocator(): i64 {
+    var ar = arena_allocator(65536);
+
+    var r = agnosai_a2a_req_new_a(ar, str_from_a(ar, "t"), str_from_a(ar, "d"));
+    assert(r != 0, "a2a_req_new_a builds in the arena");
+    assert(str_eq_cstr(agnosai_a2a_req_task_id(r), "t") == 1, "...carrying the task id");
+
+    var body = str_from("{\"task_id\":\"t-9\",\"description\":\"work\",\"domain\":\"ops\"}");
+    var v = bayan_json_v_parse_buf_a(ar, str_data(body), str_len(body));
+    var req = agnosai_a2a_req_from_value_a(ar, v);
+    assert(req != 0, "a2a_req_from_value_a deserialises through the arena");
+    assert(str_eq_cstr(agnosai_a2a_req_description(req), "work") == 1, "...the description");
+    assert(str_eq_cstr(agnosai_a2a_req_domain(req), "ops") == 1,
+    "...and an optional field, which goes through the same clone");
+
+    reset_via(ar);
+    return 0;
+}
+
+# --- The retention boundary --------------------------------------------
+
+# **The description and task id outlive the request, so they are cloned.**
+#
+# `agnosai_a2a_req_from_value` borrowed both from the parse tree.
+# `agnosai_route_a2a_receive` then hands the description to `agnosai_task_new`
+# and runs the crew, and on the placeholder path `crew_runner` makes that
+# description the task result's *output* (`crew_runner.cyr:460`) — which lives in
+# the registered `CrewState`. The crew name, built from the task id, reaches
+# `agnosai_audit_record`, which stores its message **without cloning**.
+#
+# So: run the whole route through an arena, release it, scribble over it, and
+# read both back. The crew-name builder deliberately stays on the global
+# allocator for the same reason — `str_builder_build` copies, but building it in
+# the request arena would make the copy the *arena's*.
+fn _t_a2a_retained_state_survives_its_arena(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var s = _t_state_with(o);
+    var chain = agnosai_audit_chain_new();
+    agnosai_orchestrator_with_audit(o, chain);
+    var ar = arena_allocator(262144);
+
+    var r = agnosai_route_a2a_receive_a(ar, s,
+    str_from("{\"task_id\":\"t-1\",\"description\":\"do the thing\"}"));
+    assert(agnosai_route_status(r) == HTTP_OK, "the threaded route answers 200");
+
+    # Read anything from the response BEFORE the reset — it lives in `ar`.
+    assert(agnosai_audit_chain_count(chain) > 0, "the run left an audit trail");
+
+    reset_via(ar);
+    var scribble = str_builder_new_a(ar);
+    for (var i = 0; i < 2048; i = i + 1) { str_builder_add_cstr_a(ar, scribble, "ZZZZ"); }
+    str_builder_build_a(ar, scribble);
+
+    # The crew name is `a2a-general-t-1`, and it is an audit message.
+    var recent = agnosai_audit_chain_recent(chain, 16);
+    var named = 0;
+    for (var j = 0; j < vec_len(recent); j = j + 1) {
+        if (str_eq_cstr(agnosai_audit_entry_message(vec_get(recent, j)),
+        "a2a-general-t-1") == 1) { named = named + 1; }
+    }
+    assert(named > 0,
+    "the crew name in the audit trail survives the arena being released and \
+    overwritten");
+
+    # And the description, which became the task result's output.
+    var ids = agnosai_orchestrator_crew_ids(o);
+    assert(vec_len(ids) == 1, "one crew was registered");
+    var st = agnosai_orchestrator_crew(o, vec_get(ids, 0));
+    var results = agnosai_crew_state_results(st);
+    assert(vec_len(results) == 1, "...with one task result");
+    assert(str_eq_cstr(agnosai_task_result_output(vec_get(results, 0)),
+    "do the thing") == 1,
+    "**and the description carried into that result survives too** — the \
+    request owns its strings rather than borrowing the body");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -340,6 +428,9 @@ fn main(): i64 {
     _t_reader();
     _t_reader_rejections();
     _t_status();
+
+    _t_a2a_req_takes_an_allocator();
+    _t_a2a_retained_state_survives_its_arena();
 
     return assert_summary();
 }

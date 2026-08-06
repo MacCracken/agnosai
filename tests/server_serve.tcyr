@@ -1167,6 +1167,19 @@ fn _t_allocation_profile(): i64 {
     "...but most of it stays, and must: the crew's own state is registered and \
     outlives the request that created it");
 
+    # `POST /api/v1/a2a/receive` — the last write route, and the same shape:
+    # it builds a one-task crew from the request and runs it, so the bulk is
+    # execution held in the registry.
+    var a2a_body = str_from(
+    "{\"task_id\":\"t-1\",\"description\":\"do the thing\"}");
+    var as_ = _t_state();
+    var a_global = _t_per_post(as_, str_from("/api/v1/a2a/receive"), a2a_body, 0);
+    var a_arena = _t_per_post(as_, str_from("/api/v1/a2a/receive"), a2a_body, ar);
+    assert(a_global > 0, "the a2a POST allocates on the global path");
+    assert(a_arena < a_global, "the parse tree and the response move to the arena");
+    assert(a_arena * 2 > a_global,
+    "...and the crew it runs stays registered, as it must");
+
     # The write routes' `_a` forms named directly — both are reached only
     # through `dispatch_a`, which reference coverage cannot see.
     assert(agnosai_route_status(agnosai_route_submit_approval_a(ar, ps, appr_miss))

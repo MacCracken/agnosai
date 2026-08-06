@@ -48,8 +48,8 @@ enum AgnosaiA2AReqOff {
 }
 
 # A delegation request with only its two required fields set.
-fn agnosai_a2a_req_new(task_id: Str, description: Str): i64 {
-    var r = alloc(AGN_A2A_STRUCT_SIZE);
+fn agnosai_a2a_req_new_a(a, task_id: Str, description: Str): i64 {
+    var r = alloc_via(a, AGN_A2A_STRUCT_SIZE);
     store64(r + AGN_A2A_TASK_ID, task_id);
     store64(r + AGN_A2A_DESCRIPTION, description);
     store64(r + AGN_A2A_DOMAIN, 0);
@@ -58,6 +58,11 @@ fn agnosai_a2a_req_new(task_id: Str, description: Str): i64 {
     store64(r + AGN_A2A_CALLBACK_URL, 0);
     store64(r + AGN_A2A_METADATA, 0);
     return r;
+}
+
+# Global-allocator form of `agnosai_a2a_req_new_a`.
+fn agnosai_a2a_req_new(task_id: Str, description: Str): i64 {
+    return agnosai_a2a_req_new_a(default_alloc(), task_id, description);
 }
 
 # The caller's task identifier, echoed back on the response.
@@ -94,7 +99,7 @@ fn _agnosai_a2a_fields(): i64 {
 # shape is accepted there — object, array, scalar, null — and an absent one
 # defaults to `Value::Null`. That is the one field with no type constraint, and
 # it is why the size cap below exists.
-fn agnosai_a2a_req_from_value(v): i64 {
+fn agnosai_a2a_req_from_value_a(a, v): i64 {
     if (bayan_json_v_is_obj(v) == 0) { return 0; }
     if (agnosai_route_no_unknown_fields(v, _agnosai_a2a_fields()) == 0) { return 0; }
 
@@ -103,25 +108,46 @@ fn agnosai_a2a_req_from_value(v): i64 {
     var d = bayan_json_v_obj_get(v, "description");
     if (d == 0 || bayan_json_v_is_str(d) == 0) { return 0; }
 
-    var r = agnosai_a2a_req_new(bayan_json_v_str(tid), bayan_json_v_str(d));
-    if (_agnosai_a2a_opt_str(v, "domain", r, AGN_A2A_DOMAIN) == 0) { return 0; }
-    if (_agnosai_a2a_opt_str(v, "size", r, AGN_A2A_SIZE) == 0) { return 0; }
-    if (_agnosai_a2a_opt_str(v, "preset", r, AGN_A2A_PRESET) == 0) { return 0; }
-    if (_agnosai_a2a_opt_str(v, "callback_url", r, AGN_A2A_CALLBACK_URL) == 0) { return 0; }
+    var r = agnosai_a2a_req_new_a(a, str_clone_a(a, bayan_json_v_str(tid)),
+    str_clone_a(a, bayan_json_v_str(d)));
+    if (_agnosai_a2a_opt_str_a(a, v, "domain", r, AGN_A2A_DOMAIN) == 0) { return 0; }
+    if (_agnosai_a2a_opt_str_a(a, v, "size", r, AGN_A2A_SIZE) == 0) { return 0; }
+    if (_agnosai_a2a_opt_str_a(a, v, "preset", r, AGN_A2A_PRESET) == 0) { return 0; }
+    if (_agnosai_a2a_opt_str_a(a, v, "callback_url", r, AGN_A2A_CALLBACK_URL) == 0) { return 0; }
 
     var md = bayan_json_v_obj_get(v, "metadata");
     if (md != 0) { store64(r + AGN_A2A_METADATA, md); }
     return r;
 }
 
+# Global-allocator form of `agnosai_a2a_req_from_value_a`.
+#
+# **Every Str is cloned into `a`; nothing is borrowed from `v`.** The
+# `description` reaches the orchestrator through `agnosai_task_new`, and on the
+# placeholder path `crew_runner` makes it the task result's *output* — which
+# lives in the registered `CrewState`. `task_id` reaches the audit trail the
+# same way the crew name does. `metadata` is the one member left pointing into
+# `v`, and deliberately: it is only ever re-serialised for the 64 KiB size
+# check and never retained.
+#
+# Same defect and same fix as `agnosai_crew_req_from_value_a`.
+fn agnosai_a2a_req_from_value(v): i64 {
+    return agnosai_a2a_req_from_value_a(default_alloc(), v);
+}
+
 # Read an `Option<String>` field into `off`, or answer 0 when it is present and
 # not a string. An absent field, or an explicit null, leaves the slot at 0.
-fn _agnosai_a2a_opt_str(v, key, r, off): i64 {
+fn _agnosai_a2a_opt_str_a(a, v, key, r, off): i64 {
     var f = bayan_json_v_obj_get(v, key);
     if (f == 0 || bayan_json_v_is_null(f) == 1) { return 1; }
     if (bayan_json_v_is_str(f) == 0) { return 0; }
-    store64(r + off, bayan_json_v_str(f));
+    store64(r + off, str_clone_a(a, bayan_json_v_str(f)));
     return 1;
+}
+
+# Global-allocator form of `_agnosai_a2a_opt_str_a`.
+fn _agnosai_a2a_opt_str(v, key, r, off): i64 {
+    return _agnosai_a2a_opt_str_a(default_alloc(), v, key, r, off);
 }
 
 # Whether a callback URL may be posted to.
@@ -142,22 +168,22 @@ fn agnosai_route_a2a_callback_allowed(url: Str): i64 {
 # full `A2AResponse` shape rather than the routes tier's `{"error": ..}` — the
 # oracle types this handler `(StatusCode, Json<A2AResponse>)`, so every arm
 # carries `task_id`, `status`, `result` and `error`.
-fn agnosai_route_a2a_receive(state, body: Str): i64 {
-    var v = bayan_json_v_parse_buf(str_data(body), str_len(body));
+fn agnosai_route_a2a_receive_a(a, state, body: Str): i64 {
+    var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
     if (v == 0) {
-        return agnosai_route_error(HTTP_BAD_REQUEST, str_from("malformed JSON body"));
+        return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
     }
-    var req = agnosai_a2a_req_from_value(v);
+    var req = agnosai_a2a_req_from_value_a(default_alloc(), v);
     if (req == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("body is not a valid A2A request"));
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "body is not a valid A2A request"));
     }
 
     var tid = agnosai_a2a_req_task_id(req);
     if (str_len(tid) > AGNOSAI_A2A_MAX_STRING_LEN
     || str_len(agnosai_a2a_req_description(req)) > AGNOSAI_A2A_MAX_STRING_LEN) {
-        return _agnosai_a2a_failed(HTTP_BAD_REQUEST, tid,
-        str_from("field exceeds max length"));
+        return _agnosai_a2a_failed_a(a, HTTP_BAD_REQUEST, tid,
+        str_from_a(a, "field exceeds max length"));
     }
 
     # The oracle measures the metadata by **re-serializing it** and checking the
@@ -166,9 +192,9 @@ fn agnosai_route_a2a_receive(state, body: Str): i64 {
     # incoming body does not count against it.
     var md = agnosai_a2a_req_metadata(req);
     if (md != 0) {
-        if (str_len(bayan_json_v_build(md)) > AGNOSAI_A2A_MAX_METADATA_BYTES) {
-            return _agnosai_a2a_failed(HTTP_BAD_REQUEST, tid,
-            str_from("metadata exceeds 64 KiB limit"));
+        if (str_len(bayan_json_v_build_a(a, md)) > AGNOSAI_A2A_MAX_METADATA_BYTES) {
+            return _agnosai_a2a_failed_a(a, HTTP_BAD_REQUEST, tid,
+            str_from_a(a, "metadata exceeds 64 KiB limit"));
         }
     }
 
@@ -190,22 +216,22 @@ fn agnosai_route_a2a_receive(state, body: Str): i64 {
 
     var st = agnosai_orchestrator_run_crew(agnosai_app_state_orchestrator(state), spec);
     if (st == 0) {
-        return _agnosai_a2a_failed(HTTP_INTERNAL, tid, str_from("crew execution failed"));
+        return _agnosai_a2a_failed_a(a, HTTP_INTERNAL, tid, str_from_a(a, "crew execution failed"));
     }
 
-    var arr = bayan_json_v_arr_new();
+    var arr = bayan_json_v_arr_new_a(a);
     var results = agnosai_crew_state_results(st);
     for (var i = 0; i < vec_len(results); i = i + 1) {
         var res = vec_get(results, i);
-        var e = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(e, str_from("task_id"),
-        bayan_json_v_str_new(agnosai_task_result_task_id(res)));
-        bayan_json_v_obj_set(e, str_from("output"),
-        bayan_json_v_str_new(agnosai_task_result_output(res)));
-        bayan_json_v_arr_push(arr, e);
+        var e = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, e, str_from_a(a, "task_id"),
+        bayan_json_v_str_new_a(a, agnosai_task_result_task_id(res)));
+        bayan_json_v_obj_set_a(a, e, str_from_a(a, "output"),
+        bayan_json_v_str_new_a(a, agnosai_task_result_output(res)));
+        bayan_json_v_arr_push_a(a, arr, e);
     }
-    var result = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(result, str_from("tasks"), arr);
+    var result = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, result, str_from_a(a, "tasks"), arr);
 
     # The SSRF gate runs here, on the response path, exactly where the oracle
     # runs it. Only the POST itself waits for the transport tier — see the
@@ -217,23 +243,54 @@ fn agnosai_route_a2a_receive(state, body: Str): i64 {
         }
     }
 
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("task_id"), bayan_json_v_str_new(tid));
-    bayan_json_v_obj_set(obj, str_from("status"), bayan_json_v_str_new(str_from("completed")));
-    bayan_json_v_obj_set(obj, str_from("result"), result);
-    bayan_json_v_obj_set(obj, str_from("error"), bayan_json_v_null());
-    return agnosai_route_json(HTTP_OK, obj);
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_id"), bayan_json_v_str_new_a(a, tid));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"), bayan_json_v_str_new_a(a, str_from_a(a, "completed")));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "result"), result);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "error"), bayan_json_v_null_a(a));
+    return agnosai_route_json_a(a, HTTP_OK, obj);
+}
+
+# Global-allocator form of `agnosai_route_a2a_receive_a`.
+#
+# **Two allocators, like `create_crew`.** The parse tree and the response go
+# in the request arena; `agnosai_a2a_req_from_value_a` gets `default_alloc()`
+# because the description reaches the registered `CrewState` as a task
+# result's output and the task id reaches the audit trail.
+#
+# **The crew name must be *built* globally, and it is `str_builder_build` that
+# decides that — not `str_builder_new`.** The builder's scratch buffer can live
+# anywhere; `build` allocates the finished Str and copies into it, so a bare
+# `str_builder_build` yields a global Str however the builder was created.
+# Moving `str_builder_new` to the arena changes nothing and a mutation proves
+# it; moving `str_builder_build` there fails immediately, because
+# `_agnosai_orch_register` hands the name to `agnosai_audit_record`, which
+# stores its message **without cloning**. A tamper-evident log holding reclaimed
+# bytes is the worst version of this bug.
+fn agnosai_route_a2a_receive(state, body: Str): i64 {
+    return agnosai_route_a2a_receive_a(default_alloc(), state, body);
 }
 
 # The oracle's failure `A2AResponse`: same four fields, `status: "failed"`,
 # a null `result`, and the message in `error`.
+fn _agnosai_a2a_failed_a(a, status, task_id: Str, message: Str): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_id"),
+    bayan_json_v_str_new_a(a, task_id));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"),
+    bayan_json_v_str_new_a(a, str_from_a(a, "failed")));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "result"), bayan_json_v_null_a(a));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "error"),
+    bayan_json_v_str_new_a(a, message));
+    return agnosai_route_json_a(a, status, obj);
+}
+
+# Global-allocator form of `_agnosai_a2a_failed_a`.
+#
+# The A2A failure envelope is a *response*, so it is per-request like any other
+# — the oracle's 200-with-`status:"failed"` shape, not a `route_error`.
 fn _agnosai_a2a_failed(status, task_id: Str, message: Str): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("task_id"), bayan_json_v_str_new(task_id));
-    bayan_json_v_obj_set(obj, str_from("status"), bayan_json_v_str_new(str_from("failed")));
-    bayan_json_v_obj_set(obj, str_from("result"), bayan_json_v_null());
-    bayan_json_v_obj_set(obj, str_from("error"), bayan_json_v_str_new(message));
-    return agnosai_route_json(status, obj);
+    return _agnosai_a2a_failed_a(default_alloc(), status, task_id, message);
 }
 
 fn _agnosai_a2a_warn(msg, msg_len, task_id: Str): i64 {
