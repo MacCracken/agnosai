@@ -247,40 +247,32 @@ fn _t_rejections_never_store(): i64 {
     return 0;
 }
 
-# --- The retention hazard, pinned ---------------------------------------
+# --- The retention boundary, from both sides ----------------------------
 
-# **Why `agnosai_route_create_definition` has no `_a` form.**
+# **A stored definition owns its strings, so the parse tree can be reclaimed.**
 #
-# `agnosai_agent_from_value` borrows the parse tree's Strs — `bayan_json_v_str`,
-# no `str_clone` — and the definition built from them is stored in
-# `AppState.definitions`, which is process-lifetime. So a stored definition
-# points *into the parsed request body*. Threading the parse onto a per-request
-# arena would have `reset_via` reclaim it at the end of the request, and the
-# next request would be handed the same bytes.
+# This test used to assert the opposite. `agnosai_agent_from_value` borrowed the
+# parse tree's Strs — `bayan_json_v_str`, no clone — so a definition stored in
+# `AppState.definitions` pointed *into the parsed request body*. That was
+# invisible while the parse tree lived on the no-free global bump, and became a
+# silent corruption the moment the route was threaded onto a per-request arena:
+# `reset_via` reclaims the bytes, the next request is handed them, and a stored
+# definition takes on whatever that caller posted.
 #
-# **That failure does not crash.** It silently rewrites a stored definition's
-# fields with whatever the next caller posted, which is why it needs a test
-# rather than a comment: someone threading this route "for consistency" with the
-# other five would see a green suite.
-#
-# This reproduces it directly — parse a definition through an arena, store it,
-# release the arena, scribble, and read the definition back. The assertion is
-# that the name is **destroyed**, which is the fact that makes the un-threaded
-# route correct. If a future change deep-copies at the retention boundary, this
-# test fails and should be replaced by its opposite.
-fn _t_retention_hazard_is_real(): i64 {
+# `agnosai_agent_from_value_a` now clones every Str into the allocator it is
+# given, and `create_definition` hands it `default_alloc()` while parsing into
+# the arena. This is the assertion that says so — parse through an arena, store,
+# release the arena, **scribble over it**, and read the definition back intact.
+# Reverting any one of those clones fails here.
+fn _t_stored_definition_owns_its_strings(): i64 {
     var s = _t_state();
     var ar = arena_allocator(65536);
     var body = _t_valid_body();
 
-    # The route's own first two steps, but on the arena.
     var v = bayan_json_v_parse_buf_a(ar, str_data(body), str_len(body));
     assert(v != 0, "the body parses");
-    var def = agnosai_agent_from_value(v);
+    var def = agnosai_agent_from_value_a(default_alloc(), v);
     assert(def != 0, "...into an agent definition");
-    assert(str_eq_cstr(agnosai_agent_name(def), "Writer") == 1,
-    "...whose name reads correctly while the arena is live");
-
     agnosai_app_state_definition_insert(s, agnosai_agent_key(def), def);
 
     # End of request: the arena is rewound and the next one reuses the bytes.
@@ -291,19 +283,67 @@ fn _t_retention_hazard_is_real(): i64 {
 
     var stored = agnosai_app_state_definition_get(s, str_from("writer"));
     assert(stored != 0, "the definition is still in the map");
-    assert(str_eq_cstr(agnosai_agent_name(stored), "Writer") == 0,
-    "**and its name is destroyed** — the stored definition borrowed the parse \
-    tree, so threading this route's parse would corrupt AppState rather than \
-    crash. This is why create_definition has no `_a` form.");
+    assert(str_eq_cstr(agnosai_agent_name(stored), "Writer") == 1,
+    "**and it survives the arena being released and overwritten** — the stored \
+    definition owns its strings rather than borrowing the parse tree");
+    assert(str_eq_cstr(agnosai_agent_key(stored), "writer") == 1, "...key intact");
+    assert(str_eq_cstr(agnosai_agent_role(stored), "author") == 1, "...role intact");
+    assert(str_eq_cstr(agnosai_agent_goal(stored), "write") == 1, "...goal intact");
+    return 0;
+}
 
-    # The same definition through the un-threaded route survives, because the
-    # global bump never reclaims what it borrowed.
-    var s2 = _t_state();
-    agnosai_route_create_definition(s2, _t_valid_body());
-    var kept = agnosai_app_state_definition_get(s2, str_from("writer"));
-    assert(kept != 0, "the real route stores it");
-    assert(str_eq_cstr(agnosai_agent_name(kept), "Writer") == 1,
-    "...and it reads correctly, because nothing reclaims the global bump");
+# The three constructor `_a` forms named directly.
+#
+# Each is reached only through `agnosai_agent_from_value_a`, which reference
+# coverage cannot see — and `agnosai_hw_requirement_from_value_a` in particular
+# is worth naming, because it is the one deserialiser in this chain that borrows
+# **nothing**: both of its string members become enum ints on the way in.
+fn _t_agent_constructors_take_an_allocator(): i64 {
+    var ar = arena_allocator(16384);
+
+    var a = agnosai_agent_new_a(ar, str_from_a(ar, "k"), str_from_a(ar, "r"),
+    str_from_a(ar, "g"));
+    assert(a != 0, "agent_new_a builds in the arena");
+    assert(str_eq_cstr(agnosai_agent_key(a), "k") == 1, "...carrying its key");
+    assert(vec_len(agnosai_agent_tools(a)) == 0, "...with an empty tools vec");
+
+    var r = agnosai_hw_requirement_new_a(ar);
+    assert(r != 0, "hw_requirement_new_a builds in the arena");
+
+    var hv = bayan_json_v_parse_buf_a(ar,
+    str_data(str_from("{\"min_memory_mb\":512,\"required_family\":\"cuda\"}")),
+    str_len(str_from("{\"min_memory_mb\":512,\"required_family\":\"cuda\"}")));
+    var r2 = agnosai_hw_requirement_from_value_a(ar, hv);
+    assert(agnosai_hw_requirement_min_memory_mb(r2) == 512,
+    "hw_requirement_from_value_a reads through the arena");
+
+    # It borrows nothing from `hv`, so releasing the parse tree cannot hurt it.
+    reset_via(ar);
+    return 0;
+}
+
+# The whole route, through the arena, with the same scribble.
+#
+# Distinct from the assertion above: that one exercises the two calls by hand,
+# this one proves `create_definition_a` wires them together correctly — passing
+# `a` to the parse and `default_alloc()` to `from_value_a`, rather than one
+# allocator to both.
+fn _t_create_definition_through_an_arena(): i64 {
+    var s = _t_state();
+    var ar = arena_allocator(65536);
+
+    var r = agnosai_route_create_definition_a(ar, s, _t_valid_body());
+    assert(agnosai_route_status(r) == AGNOSAI_HTTP_CREATED, "the threaded route answers 201");
+
+    reset_via(ar);
+    var scribble = str_builder_new_a(ar);
+    for (var i = 0; i < 512; i = i + 1) { str_builder_add_cstr_a(ar, scribble, "QQQQ"); }
+    str_builder_build_a(ar, scribble);
+
+    var stored = agnosai_app_state_definition_get(s, str_from("writer"));
+    assert(stored != 0, "the definition is stored");
+    assert(str_eq_cstr(agnosai_agent_name(stored), "Writer") == 1,
+    "...and survives its request's arena being released and overwritten");
     return 0;
 }
 
@@ -321,7 +361,9 @@ fn main(): i64 {
     _t_create_then_list();
     _t_create_preserves_optional_fields();
     _t_rejections_never_store();
-    _t_retention_hazard_is_real();
+    _t_agent_constructors_take_an_allocator();
+    _t_stored_definition_owns_its_strings();
+    _t_create_definition_through_an_arena();
 
     return assert_summary();
 }

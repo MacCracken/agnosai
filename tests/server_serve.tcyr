@@ -1119,18 +1119,53 @@ fn _t_allocation_profile(): i64 {
     "...and nothing through the arena, including every tool schema behind \
     tools/list");
 
-    # **The retaining route stays un-threaded, and this is the assertion that
-    # says so on purpose.** It is not a gap being tolerated — it is a
-    # correctness boundary. Threading `create_definition` would make this pass
-    # and `server_routes_agents`'s retention test fail.
+    # **`create_definition` is threaded now, and its residual is the definition
+    # it deliberately keeps.** The parse tree and the response go in the arena;
+    # the agent does not, because `AppState.definitions` outlives the request —
+    # `agnosai_agent_from_value_a` is handed `default_alloc()` and clones every
+    # Str, so the stored definition survives `reset_via`.
+    #
+    # So this route cannot reach zero and should not: what remains on the global
+    # bump is exactly the retained object, which is the point. The assertion is
+    # therefore a large reduction rather than an equality — and it is bounded
+    # above too, because a residual that stopped shrinking would mean the parse
+    # tree had quietly gone back to the global allocator.
     var d_global = _t_per_post(ps, str_from("/api/v1/agents/definitions"), defn_body, 0);
     var d_arena = _t_per_post(ps, str_from("/api/v1/agents/definitions"), defn_body, ar);
     assert(d_arena > 0,
-    "create_definition is deliberately NOT threaded — its parse tree outlives \
-    the request inside AppState.definitions");
-    assert(d_arena * 2 > d_global,
-    "...and it is un-threaded in full, not half-threaded into something whose \
-    ownership no longer matches its lifetime");
+    "the threaded route still allocates — the definition it stores is retained \
+    on purpose and cannot live in a per-request arena");
+    assert(d_arena * 3 < d_global,
+    "...but everything that is NOT retained moved to the arena: the parse tree, \
+    the response value and the response struct");
+
+    # `POST /api/v1/crews`, the same shape at a very different ratio.
+    #
+    # **This route cannot approach zero and should not.** Most of what it
+    # allocates is the crew *execution* — task results accumulated by
+    # `crew_runner` and kept in the orchestrator registry — which is retained
+    # state, not per-request garbage. Only the parse tree and the response move,
+    # so the win is ~20% rather than the ~83% `create_definition` gets. The
+    # assertion is therefore a modest reduction with a floor under it: a route
+    # that suddenly dropped to near-zero here would mean retained crew state had
+    # been put in an arena, which is the corruption this whole boundary exists
+    # to prevent.
+    var crew_body = str_from(
+    "{\"name\":\"c\",\"agents\":[{\"agent_key\":\"k\",\"name\":\"N\",\"role\":\"r\",\
+    \"goal\":\"g\"}],\"tasks\":[{\"description\":\"d\"}]}");
+    # **Its own state, not `ps`.** Every POST here registers a crew, so measuring
+    # against the shared fixture would leave it holding hundreds instead of the
+    # eight `agnosai_orchestrator_crew_ids_a` is asserted on above — which is
+    # exactly how this first failed.
+    var cs = _t_state();
+    var c_global = _t_per_post(cs, str_from("/api/v1/crews"), crew_body, 0);
+    var c_arena = _t_per_post(cs, str_from("/api/v1/crews"), crew_body, ar);
+    assert(c_global > 0, "creating a crew allocates on the global path");
+    assert(c_arena < c_global,
+    "the parse tree and the response move to the arena");
+    assert(c_arena * 2 > c_global,
+    "...but most of it stays, and must: the crew's own state is registered and \
+    outlives the request that created it");
 
     # The write routes' `_a` forms named directly — both are reached only
     # through `dispatch_a`, which reference coverage cannot see.

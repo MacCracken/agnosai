@@ -83,45 +83,46 @@ fn agnosai_route_list_definitions(state): i64 {
 # is what makes the 500 arm meaningful: a definition that cannot be serialized
 # is never stored.
 #
-# ## ⚠ This route has NO `_a` form, and that is deliberate
+# ## Two allocators, deliberately
 #
-# `agnosai_agent_from_value` **borrows** the parse tree's Strs rather than
-# copying them — `bayan_json_v_str(key_v)` and its siblings, no `str_clone`. The
-# definition built from them is then stored in `AppState.definitions`, which is
-# process-lifetime. So the stored definition points *into the parsed request
-# body*, and threading `bayan_json_v_parse_buf` onto the per-request arena would
-# make `reset_via` reclaim it at the end of the request — a use-after-free that
-# does not crash, because the arena hands the same bytes to the next request.
-# A definition's name would silently become whatever the next caller posted.
+# The parse tree and the response go in the request arena; **the definition does
+# not**, because `AppState.definitions` outlives the request. So this passes
+# `default_alloc()` to `agnosai_agent_from_value_a` while everything around it
+# uses `a`.
 #
-# **The current code is correct only because the global allocator never frees.**
-# That is a real dependency and nothing else states it. `server_state`'s
-# `definition_insert` already saw half of this — it `str_clone`s the *key* with
-# the comment "the caller's Str may be borrowed from a request buffer that does
-# not outlive the handler" — and the value was left borrowed.
-#
-# The fix is to deep-copy at the retention boundary rather than to leave the
-# route un-threaded, and it is owed under B2 (roadmap). `POST /api/v1/crews` and
-# `POST /api/v1/a2a/receive` have the identical shape via `agnosai_crew_from_value`
-# and the orchestrator registry. `tests/server_routes_agents.tcyr` pins the
-# hazard by scribbling over a released arena.
-fn agnosai_route_create_definition(state, body: Str): i64 {
-    var v = bayan_json_v_parse_buf(str_data(body), str_len(body));
+# That reads like an inconsistency and is the opposite. `from_value_a` clones
+# every Str into the allocator it is handed, so the agent owns its strings and
+# is safe to keep; the parse tree it came from is then free to be reclaimed by
+# `reset_via` at end of request. Before that clone existed the definition
+# *borrowed* the parse tree, which was invisible only because the global
+# allocator never frees — on an arena the next request would have been handed
+# the same bytes and a stored definition would have taken on whatever that
+# caller posted. `tests/server_routes_agents.tcyr` pins both directions.
+fn agnosai_route_create_definition_a(a, state, body: Str): i64 {
+    var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
     if (v == 0) {
-        return agnosai_route_error(HTTP_BAD_REQUEST, str_from("malformed JSON body"));
+        return agnosai_route_error_a(a, HTTP_BAD_REQUEST,
+        str_from_a(a, "malformed JSON body"));
     }
 
-    var def = agnosai_agent_from_value(v);
+    # **`default_alloc()`, not `a`** — see the header. The definition is
+    # retained; everything else here is not.
+    var def = agnosai_agent_from_value_a(default_alloc(), v);
     if (def == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("body is not a valid agent definition"));
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "body is not a valid agent definition"));
     }
 
-    var value = agnosai_agent_to_value(def);
+    var value = agnosai_agent_to_value_a(a, def);
     if (value == 0) {
-        return agnosai_route_error(HTTP_INTERNAL, str_from("serialization failed"));
+        return agnosai_route_error_a(a, HTTP_INTERNAL, str_from_a(a, "serialization failed"));
     }
 
     agnosai_app_state_definition_insert(state, agnosai_agent_key(def), def);
-    return agnosai_route_json(AGNOSAI_HTTP_CREATED, value);
+    return agnosai_route_json_a(a, AGNOSAI_HTTP_CREATED, value);
+}
+
+# Global-allocator form of `agnosai_route_create_definition_a`.
+fn agnosai_route_create_definition(state, body: Str): i64 {
+    return agnosai_route_create_definition_a(default_alloc(), state, body);
 }

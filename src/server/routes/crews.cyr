@@ -38,14 +38,19 @@ enum AgnosaiTaskReqOff {
 # `description` is the only required field; the rest are `#[serde(default)]`.
 # `priority` is `Option<TaskPriority>`, so absence is distinct from
 # `Normal` — hence the separate `has_priority` flag rather than defaulting.
-fn agnosai_task_req_new(description: Str): i64 {
-    var t = alloc(AGN_TREQ_SIZE);
+fn agnosai_task_req_new_a(a, description: Str): i64 {
+    var t = alloc_via(a, AGN_TREQ_SIZE);
     store64(t + AGN_TREQ_DESCRIPTION, description);
     store64(t + AGN_TREQ_EXPECTED_OUTPUT, 0);
     store64(t + AGN_TREQ_PRIORITY, AGNOSAI_PRIORITY_NORMAL);
     store64(t + AGN_TREQ_HAS_PRIORITY, 0);
-    store64(t + AGN_TREQ_DEPENDENCIES, vec_new());
+    store64(t + AGN_TREQ_DEPENDENCIES, vec_new_a(a));
     return t;
+}
+
+# Global-allocator form of `agnosai_task_req_new_a`.
+fn agnosai_task_req_new(description: Str): i64 {
+    return agnosai_task_req_new_a(default_alloc(), description);
 }
 
 # What the task asks for — the one required field.
@@ -60,13 +65,18 @@ fn agnosai_task_req_has_priority(t): i64 { return load64(t + AGN_TREQ_HAS_PRIORI
 fn agnosai_task_req_dependencies(t): i64 { return load64(t + AGN_TREQ_DEPENDENCIES); }
 
 # The fields serde accepts on `TaskRequest`, which is `deny_unknown_fields`.
-fn _agnosai_task_req_fields(): i64 {
-    var f = agnosai_route_fields();
-    agnosai_route_field(f, "description");
-    agnosai_route_field(f, "expected_output");
-    agnosai_route_field(f, "priority");
-    agnosai_route_field(f, "dependencies");
+fn _agnosai_task_req_fields_a(a): i64 {
+    var f = agnosai_route_fields_a(a);
+    agnosai_route_field_a(a, f, "description");
+    agnosai_route_field_a(a, f, "expected_output");
+    agnosai_route_field_a(a, f, "priority");
+    agnosai_route_field_a(a, f, "dependencies");
     return f;
+}
+
+# Global-allocator form of `_agnosai_task_req_fields_a`.
+fn _agnosai_task_req_fields(): i64 {
+    return _agnosai_task_req_fields_a(default_alloc());
 }
 
 # Read a `TaskRequest` from a JSON value, or 0 when serde would reject it.
@@ -81,18 +91,18 @@ fn _agnosai_task_req_fields(): i64 {
 # falls back to Normal on an unknown spelling, which is right for a stored
 # record and wrong here — serde rejects `"priority":"urgent"` rather than
 # quietly running the task at Normal. Same distinction `approval.rs` drew.
-fn agnosai_task_req_from_value(v): i64 {
+fn agnosai_task_req_from_value_a(a, v): i64 {
     if (bayan_json_v_is_obj(v) == 0) { return 0; }
-    if (agnosai_route_no_unknown_fields(v, _agnosai_task_req_fields()) == 0) { return 0; }
+    if (agnosai_route_no_unknown_fields(v, _agnosai_task_req_fields_a(a)) == 0) { return 0; }
 
     var d = bayan_json_v_obj_get(v, "description");
     if (d == 0 || bayan_json_v_is_str(d) == 0) { return 0; }
-    var t = agnosai_task_req_new(bayan_json_v_str(d));
+    var t = agnosai_task_req_new_a(a, str_clone_a(a, bayan_json_v_str(d)));
 
     var eo = bayan_json_v_obj_get(v, "expected_output");
     if (eo != 0 && bayan_json_v_is_null(eo) == 0) {
         if (bayan_json_v_is_str(eo) == 0) { return 0; }
-        store64(t + AGN_TREQ_EXPECTED_OUTPUT, bayan_json_v_str(eo));
+        store64(t + AGN_TREQ_EXPECTED_OUTPUT, str_clone_a(a, bayan_json_v_str(eo)));
     }
 
     var pr = bayan_json_v_obj_get(v, "priority");
@@ -114,10 +124,22 @@ fn agnosai_task_req_from_value(v): i64 {
             # The field is `Vec<usize>`, so a negative index is a
             # deserialization failure rather than an out-of-range error.
             if (bayan_json_v_int(e) < 0) { return 0; }
-            vec_push(deps, bayan_json_v_int(e));
+            vec_push_a(a, deps, bayan_json_v_int(e));
         }
     }
     return t;
+}
+
+# Global-allocator form of `agnosai_task_req_from_value_a`.
+#
+# **`description` and `expected_output` are cloned into `a`; nothing is borrowed
+# from `v`.** `_agnosai_route_build_spec` hands both straight to
+# `agnosai_task_new` / `with_expected_output`, and the resulting spec is
+# registered by `run_crew` — so a borrow here would put parse-tree pointers in
+# the orchestrator registry. `priority` needs no clone: it becomes an enum int
+# through `agnosai_task_priority_from_wire`.
+fn agnosai_task_req_from_value(v): i64 {
+    return agnosai_task_req_from_value_a(default_alloc(), v);
 }
 
 # Whether a string is one of `TaskPriority`'s five wire spellings. Needed
@@ -144,15 +166,20 @@ enum AgnosaiCrewReqOff {
 }
 
 # A crew request with only its required name set.
-fn agnosai_crew_req_new(name: Str): i64 {
-    var r = alloc(AGN_CREQ_SIZE);
+fn agnosai_crew_req_new_a(a, name: Str): i64 {
+    var r = alloc_via(a, AGN_CREQ_SIZE);
     store64(r + AGN_CREQ_NAME, name);
-    store64(r + AGN_CREQ_AGENTS, vec_new());
-    store64(r + AGN_CREQ_TASKS, vec_new());
+    store64(r + AGN_CREQ_AGENTS, vec_new_a(a));
+    store64(r + AGN_CREQ_TASKS, vec_new_a(a));
     store64(r + AGN_CREQ_PROCESS, 0);
     store64(r + AGN_CREQ_MAX_CONCURRENCY, 0);
     store64(r + AGN_CREQ_HAS_CONCURRENCY, 0);
     return r;
+}
+
+# Global-allocator form of `agnosai_crew_req_new_a`.
+fn agnosai_crew_req_new(name: Str): i64 {
+    return agnosai_crew_req_new_a(default_alloc(), name);
 }
 
 # The crew's name — the one required field.
@@ -168,14 +195,19 @@ fn agnosai_crew_req_max_concurrency(r): i64 { return load64(r + AGN_CREQ_MAX_CON
 # Whether a concurrency was supplied, distinguishing absent from 0.
 fn agnosai_crew_req_has_concurrency(r): i64 { return load64(r + AGN_CREQ_HAS_CONCURRENCY); }
 
-fn _agnosai_crew_req_fields(): i64 {
-    var f = agnosai_route_fields();
-    agnosai_route_field(f, "name");
-    agnosai_route_field(f, "agents");
-    agnosai_route_field(f, "tasks");
-    agnosai_route_field(f, "process");
-    agnosai_route_field(f, "max_concurrency");
+fn _agnosai_crew_req_fields_a(a): i64 {
+    var f = agnosai_route_fields_a(a);
+    agnosai_route_field_a(a, f, "name");
+    agnosai_route_field_a(a, f, "agents");
+    agnosai_route_field_a(a, f, "tasks");
+    agnosai_route_field_a(a, f, "process");
+    agnosai_route_field_a(a, f, "max_concurrency");
     return f;
+}
+
+# Global-allocator form of `_agnosai_crew_req_fields_a`.
+fn _agnosai_crew_req_fields(): i64 {
+    return _agnosai_crew_req_fields_a(default_alloc());
 }
 
 # Read a `CrewRunRequest`, or 0 when serde would reject it.
@@ -186,13 +218,13 @@ fn _agnosai_crew_req_fields(): i64 {
 # accepted and silently runs sequentially. That is a fall-through in the handler,
 # not a serde failure, so rejecting it here would be a divergence — the opposite
 # call from `priority`, which serde genuinely does type.
-fn agnosai_crew_req_from_value(v): i64 {
+fn agnosai_crew_req_from_value_a(a, v): i64 {
     if (bayan_json_v_is_obj(v) == 0) { return 0; }
-    if (agnosai_route_no_unknown_fields(v, _agnosai_crew_req_fields()) == 0) { return 0; }
+    if (agnosai_route_no_unknown_fields(v, _agnosai_crew_req_fields_a(a)) == 0) { return 0; }
 
     var n = bayan_json_v_obj_get(v, "name");
     if (n == 0 || bayan_json_v_is_str(n) == 0) { return 0; }
-    var r = agnosai_crew_req_new(bayan_json_v_str(n));
+    var r = agnosai_crew_req_new_a(a, str_clone_a(a, bayan_json_v_str(n)));
 
     # `agents: Vec<AgentDefinition>` and `tasks: Vec<TaskRequest>` are both
     # required — no `#[serde(default)]` on either, so an absent one is a
@@ -203,24 +235,24 @@ fn agnosai_crew_req_from_value(v): i64 {
     if (av == 0 || bayan_json_v_is_arr(av) == 0) { return 0; }
     var agents = load64(r + AGN_CREQ_AGENTS);
     for (var i = 0; i < bayan_json_v_arr_len(av); i = i + 1) {
-        var a = agnosai_agent_from_value(bayan_json_v_arr_get(av, i));
-        if (a == 0) { return 0; }
-        vec_push(agents, a);
+        var ag = agnosai_agent_from_value_a(a, bayan_json_v_arr_get(av, i));
+        if (ag == 0) { return 0; }
+        vec_push_a(a, agents, ag);
     }
 
     var tv = bayan_json_v_obj_get(v, "tasks");
     if (tv == 0 || bayan_json_v_is_arr(tv) == 0) { return 0; }
     var tasks = load64(r + AGN_CREQ_TASKS);
     for (var j = 0; j < bayan_json_v_arr_len(tv); j = j + 1) {
-        var t = agnosai_task_req_from_value(bayan_json_v_arr_get(tv, j));
+        var t = agnosai_task_req_from_value_a(a, bayan_json_v_arr_get(tv, j));
         if (t == 0) { return 0; }
-        vec_push(tasks, t);
+        vec_push_a(a, tasks, t);
     }
 
     var pv = bayan_json_v_obj_get(v, "process");
     if (pv != 0 && bayan_json_v_is_null(pv) == 0) {
         if (bayan_json_v_is_str(pv) == 0) { return 0; }
-        store64(r + AGN_CREQ_PROCESS, bayan_json_v_str(pv));
+        store64(r + AGN_CREQ_PROCESS, str_clone_a(a, bayan_json_v_str(pv)));
     }
 
     var mc = bayan_json_v_obj_get(v, "max_concurrency");
@@ -232,6 +264,23 @@ fn agnosai_crew_req_from_value(v): i64 {
         store64(r + AGN_CREQ_HAS_CONCURRENCY, 1);
     }
     return r;
+}
+
+# Global-allocator form of `agnosai_crew_req_from_value_a`.
+#
+# **Every Str is cloned into `a`; nothing is borrowed from `v`.** The crew name
+# and `process` land here, task `description` and `expected_output` come through
+# `agnosai_task_req_from_value_a`, and the agents through
+# `agnosai_agent_from_value_a` — so the whole request is self-owned.
+#
+# That matters because `_agnosai_route_build_spec` hands these Strs straight to
+# `agnosai_crew_new` / `agnosai_task_new` and `agnosai_orchestrator_run_crew`
+# registers the result. Borrowing here put parse-tree pointers into the
+# orchestrator registry, which was invisible only because the global allocator
+# never frees; on a per-request arena the next request would be handed those
+# bytes. Same defect and same fix as `agnosai_agent_from_value_a`.
+fn agnosai_crew_req_from_value(v): i64 {
+    return agnosai_crew_req_from_value_a(default_alloc(), v);
 }
 
 # --- Validation -----------------------------------------------------------
@@ -473,49 +522,49 @@ fn _agnosai_route_build_spec(r): i64 {
 # (`crews.rs:207-222`), so these are the snake_case wire forms — unlike
 # `dashboard.rs`, which formats the same enum with `{:?}` and gets
 # `Completed`. Two endpoints, one enum, two spellings, both deliberate.
-fn agnosai_route_create_crew(state, body: Str): i64 {
-    var v = bayan_json_v_parse_buf(str_data(body), str_len(body));
+fn agnosai_route_create_crew_a(a, state, body: Str): i64 {
+    var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
     if (v == 0) {
-        return agnosai_route_error(HTTP_BAD_REQUEST, str_from("malformed JSON body"));
+        return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
     }
-    var req = agnosai_crew_req_from_value(v);
+    var req = agnosai_crew_req_from_value_a(default_alloc(), v);
     if (req == 0) {
-        return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-        str_from("body is not a valid crew run request"));
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+        str_from_a(a, "body is not a valid crew run request"));
     }
 
     var err = agnosai_validate_crew_request(req);
     if (err != 0) {
         _agnosai_route_crew_warn(agnosai_crew_req_name(req), err);
-        return agnosai_route_error(HTTP_BAD_REQUEST, err);
+        return agnosai_route_error_a(a, HTTP_BAD_REQUEST, err);
     }
 
     var st = agnosai_orchestrator_run_crew(
     agnosai_app_state_orchestrator(state), _agnosai_route_build_spec(req));
     if (st == 0) {
-        return agnosai_route_error(HTTP_INTERNAL, str_from("crew execution failed"));
+        return agnosai_route_error_a(a, HTTP_INTERNAL, str_from_a(a, "crew execution failed"));
     }
 
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("crew_id"),
-    bayan_json_v_str_new(agnosai_crew_state_crew_id(st)));
-    bayan_json_v_obj_set(obj, str_from("status"),
-    bayan_json_v_str_new(agnosai_crew_status_to_wire(agnosai_crew_state_status(st))));
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "crew_id"),
+    bayan_json_v_str_new_a(a, agnosai_crew_state_crew_id(st)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"),
+    bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire(agnosai_crew_state_status(st))));
 
     var results = agnosai_crew_state_results(st);
-    var arr = bayan_json_v_arr_new();
+    var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(results); i = i + 1) {
         var res = vec_get(results, i);
-        var ro = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(ro, str_from("task_id"),
-        bayan_json_v_str_new(agnosai_task_result_task_id(res)));
-        bayan_json_v_obj_set(ro, str_from("output"),
-        bayan_json_v_str_new(agnosai_task_result_output(res)));
-        bayan_json_v_obj_set(ro, str_from("status"),
-        bayan_json_v_str_new(agnosai_task_status_to_wire(agnosai_task_result_status(res))));
-        bayan_json_v_arr_push(arr, ro);
+        var ro = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, ro, str_from_a(a, "task_id"),
+        bayan_json_v_str_new_a(a, agnosai_task_result_task_id(res)));
+        bayan_json_v_obj_set_a(a, ro, str_from_a(a, "output"),
+        bayan_json_v_str_new_a(a, agnosai_task_result_output(res)));
+        bayan_json_v_obj_set_a(a, ro, str_from_a(a, "status"),
+        bayan_json_v_str_new_a(a, agnosai_task_status_to_wire(agnosai_task_result_status(res))));
+        bayan_json_v_arr_push_a(a, arr, ro);
     }
-    bayan_json_v_obj_set(obj, str_from("results"), arr);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "results"), arr);
 
     # `#[serde(skip_serializing_if = "Option::is_none")]` — an absent profile is
     # OMITTED, not rendered as null.
@@ -527,10 +576,28 @@ fn agnosai_route_create_crew(state, body: Str): i64 {
     # `Option`; same judgement as the unreachable skip in `agents.rs`.
     var prof = agnosai_crew_state_profile(st);
     if (prof != 0) {
-        bayan_json_v_obj_set(obj, str_from("profile"),
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "profile"),
         agnosai_crew_profile_to_value(prof));
     }
-    return agnosai_route_json(HTTP_OK, obj);
+    return agnosai_route_json_a(a, HTTP_OK, obj);
+}
+
+# Global-allocator form of `agnosai_route_create_crew_a`.
+#
+# **Two allocators, like `create_definition`.** The body's parse tree and the
+# response go in the request arena; `agnosai_crew_req_from_value_a` is handed
+# `default_alloc()` because `_agnosai_route_build_spec` passes its Strs into
+# the spec and `agnosai_orchestrator_run_crew` registers that spec — the crew
+# outlives the request that created it, which is the whole point of
+# `GET /api/v1/crews/{id}` answering later.
+#
+# **This route cannot approach zero and should not.** Most of what it
+# allocates is the crew *execution* — task results accumulated by
+# `crew_runner` and kept in the registry — which is retained state, not
+# per-request garbage. What moves to the arena is the parse tree and the
+# response.
+fn agnosai_route_create_crew(state, body: Str): i64 {
+    return agnosai_route_create_crew_a(default_alloc(), state, body);
 }
 
 # The oracle's `tracing::warn!(crew = .., error = .., "crew request validation failed")`.

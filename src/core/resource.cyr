@@ -239,14 +239,19 @@ fn agnosai_compute_device_from_value(v): i64 {
 }
 
 # An empty hardware requirement — matches anything, including CPU-only.
-fn agnosai_hw_requirement_new(): i64 {
-    var r = alloc(AGN_HW_REQ_SIZE);
-    store64(r + AGN_REQ_ACCELERATORS, vec_new());
+fn agnosai_hw_requirement_new_a(a): i64 {
+    var r = alloc_via(a, AGN_HW_REQ_SIZE);
+    store64(r + AGN_REQ_ACCELERATORS, vec_new_a(a));
     store64(r + AGN_REQ_MIN_MEMORY_MB, 0);
     store64(r + AGN_REQ_MIN_DEVICE_COUNT, 0);
     store64(r + AGN_REQ_MIN_CPU_CORES, 0);
     store64(r + AGN_REQ_REQUIRED_FAMILY, AGNOSAI_NO_LIMIT);
     return r;
+}
+
+# Global-allocator form of `agnosai_hw_requirement_new_a`.
+fn agnosai_hw_requirement_new(): i64 {
+    return agnosai_hw_requirement_new_a(default_alloc());
 }
 
 # A requirement for specific accelerator types. `accelerators` is a vec.
@@ -339,8 +344,8 @@ fn agnosai_hw_requirement_to_value(r): i64 {
 
 # Rebuild a hardware requirement from a bayan JSON value. Every field is
 # `#[serde(default)]` in the oracle, so missing ones take their defaults.
-fn agnosai_hw_requirement_from_value(v): i64 {
-    var r = agnosai_hw_requirement_new();
+fn agnosai_hw_requirement_from_value_a(a, v): i64 {
+    var r = agnosai_hw_requirement_new_a(a);
     if (bayan_json_v_is_obj(v) == 0) { return r; }
 
     var av = bayan_json_v_obj_get(v, "accelerators");
@@ -349,7 +354,7 @@ fn agnosai_hw_requirement_from_value(v): i64 {
         for (var i = 0; i < bayan_json_v_arr_len(av); i = i + 1) {
             var e = bayan_json_v_arr_get(av, i);
             if (bayan_json_v_is_str(e) == 1) {
-                vec_push(accels, agnosai_accelerator_type_from_wire(bayan_json_v_str(e)));
+                vec_push_a(a, accels, agnosai_accelerator_type_from_wire(bayan_json_v_str(e)));
             }
         }
     }
@@ -362,6 +367,16 @@ fn agnosai_hw_requirement_from_value(v): i64 {
         store64(r + AGN_REQ_REQUIRED_FAMILY, agnosai_accelerator_family_from_wire(bayan_json_v_str(fv)));
     }
     return r;
+}
+
+# Global-allocator form of `agnosai_hw_requirement_from_value_a`.
+#
+# **This one borrows nothing from `v`.** Both string-valued members go through
+# `agnosai_accelerator_type_from_wire` / `_family_from_wire`, which answer enum
+# ints — so the requirement is self-contained however `v` was allocated, and the
+# allocator here is only for its own struct and vec.
+fn agnosai_hw_requirement_from_value(v): i64 {
+    return agnosai_hw_requirement_from_value_a(default_alloc(), v);
 }
 
 # Create a hardware inventory. `devices` is a vec of compute devices.

@@ -642,6 +642,114 @@ fn _t_dependency_resolution(): i64 {
     return 0;
 }
 
+# The request deserialisers' `_a` forms, named directly.
+#
+# All three are reached only through `agnosai_route_create_crew_a`, which
+# reference coverage cannot see. Worth exercising on an arena rather than the
+# global allocator: that is the arm the route does *not* use for them, and it
+# has to work for anything that deserialises a request without keeping it.
+fn _t_crew_req_constructors_take_an_allocator(): i64 {
+    var ar = arena_allocator(65536);
+
+    var r = agnosai_crew_req_new_a(ar, str_from_a(ar, "n"));
+    assert(r != 0, "crew_req_new_a builds in the arena");
+    assert(vec_len(agnosai_crew_req_agents(r)) == 0, "...with empty agents");
+    assert(vec_len(agnosai_crew_req_tasks(r)) == 0, "...and empty tasks");
+
+    var tq = agnosai_task_req_new_a(ar, str_from_a(ar, "d"));
+    assert(tq != 0, "task_req_new_a builds in the arena");
+    assert(str_eq_cstr(agnosai_task_req_description(tq), "d") == 1, "...carrying d");
+
+    var body = _t_valid_body();
+    var v = bayan_json_v_parse_buf_a(ar, str_data(body), str_len(body));
+    var req = agnosai_crew_req_from_value_a(ar, v);
+    assert(req != 0, "crew_req_from_value_a deserialises through the arena");
+    assert(str_eq_cstr(agnosai_crew_req_name(req), "test-crew") == 1, "...with the name");
+    assert(vec_len(agnosai_crew_req_tasks(req)) == 1, "...and one task");
+
+    var tv = bayan_json_v_obj_get(v, "tasks");
+    var t1 = agnosai_task_req_from_value_a(ar, bayan_json_v_arr_get(tv, 0));
+    assert(t1 != 0, "task_req_from_value_a deserialises through the arena");
+    assert(str_eq_cstr(agnosai_task_req_description(t1), "Run tests") == 1,
+    "...carrying the description");
+
+    reset_via(ar);
+    return 0;
+}
+
+# --- The retention boundary --------------------------------------------
+
+# **The audit chain is what retains a borrowed crew name — not the registry.**
+#
+# This test first asserted on `agnosai_crew_state_crew_id`, and every mutation
+# survived it. That was the right instinct pointed at the wrong object:
+# `CrewState` holds a *minted* UUID, a status, results and a profile, and the
+# results' strings come from execution. Nothing there ever pointed at the
+# request body.
+#
+# The real path is the audit trail. `_agnosai_orch_register` and
+# `_agnosai_orch_finish` pass `agnosai_crew_name(spec)` — borrowed straight from
+# the parse tree before the fix — as the audit **message**, and
+# `agnosai_audit_record` stores that message **without cloning** into a chain
+# that lives in `AppState`. So threading the parse would have left the audit
+# chain holding pointers into a reclaimed request body: a tamper-evident log
+# whose entries silently rewrite themselves is a worse outcome than most.
+#
+# `agnosai_crew_req_from_value_a` clones the name, so the entry owns it. Run the
+# whole route through an arena, release it, scribble, and read the trail back.
+fn _t_audit_trail_owns_the_crew_name(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var s = _t_state_with(o);
+    var chain = agnosai_audit_chain_new();
+    agnosai_orchestrator_with_audit(o, chain);
+    var ar = arena_allocator(262144);
+
+    var r = agnosai_route_create_crew_a(ar, s, _t_valid_body());
+    assert(agnosai_route_status(r) == HTTP_OK, "the threaded route answers 200");
+    assert(agnosai_audit_chain_count(chain) > 0, "the run left an audit trail");
+
+    # **Read the crew id BEFORE the reset.** `r` is the response, and the
+    # response lives in `ar` — which is the point of threading the route. Doing
+    # this after `reset_via` is a use-after-free on the test's own side, and it
+    # segfaults rather than failing an assertion. `str_clone` onto the global
+    # allocator so the id itself outlives the arena too.
+    var cid = str_clone(_t_rbody_str(r, "crew_id"));
+    assert(str_len(cid) > 0, "...and returns a crew id");
+
+    # End of request: the arena is rewound and the next one reuses the bytes.
+    reset_via(ar);
+    var scribble = str_builder_new_a(ar);
+    for (var i = 0; i < 2048; i = i + 1) { str_builder_add_cstr_a(ar, scribble, "ZZZZ"); }
+    str_builder_build_a(ar, scribble);
+
+    # `crew_accepted` and `crew_finished` both carry the crew name as their
+    # message. The fixture's crew is named `test-crew`.
+    var recent = agnosai_audit_chain_recent(chain, 16);
+    var seen = 0;
+    for (var j = 0; j < vec_len(recent); j = j + 1) {
+        if (str_eq_cstr(agnosai_audit_entry_message(vec_get(recent, j)), "test-crew") == 1) {
+            seen = seen + 1;
+        }
+    }
+    assert(seen > 0,
+    "**the crew name in the audit trail survives the arena being released and \
+    overwritten** — the entry owns it rather than borrowing the request body");
+
+    # **The task description is retained too, by two routes.** On the
+    # placeholder path `crew_runner` makes it the task result's *output*
+    # (`crew_runner.cyr:460`) and also audits it (`:772`) — and results live in
+    # the registered `CrewState`. So a borrowed description outlives the request
+    # just as the crew name does; asserting only on the name left
+    # `agnosai_task_req_from_value`'s clone unpinned, which a mutation found.
+    var st = agnosai_orchestrator_crew(o, cid);
+    assert(st != 0, "the crew is registered");
+    var results = agnosai_crew_state_results(st);
+    assert(vec_len(results) == 1, "...with its one task result");
+    assert(str_eq_cstr(agnosai_task_result_output(vec_get(results, 0)), "Run tests") == 1,
+    "and the description carried into that result survives the scribble too");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -673,6 +781,9 @@ fn main(): i64 {
     _t_process_mapping();
     _t_concurrency_clamp();
     _t_dependency_resolution();
+
+    _t_crew_req_constructors_take_an_allocator();
+    _t_audit_trail_owns_the_crew_name();
 
     return assert_summary();
 }

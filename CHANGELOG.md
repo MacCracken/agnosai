@@ -395,8 +395,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- **The write routes: two reach zero, and three must not — `agnosai_agent_from_value`
-  and `agnosai_crew_from_value` borrow the parse tree into process-lifetime state.**
+- **The crew request deserialisers clone too — `POST /api/v1/crews` 21,184 →
+  17,048 bytes per request (−19.5%). The thing that was actually at risk was the
+  audit chain.**
+
+  `agnosai_crew_req_from_value` borrowed the crew name and `process` from the
+  parse tree, and `agnosai_task_req_from_value` borrowed each task's
+  `description` and `expected_output`. Both now clone into the allocator they
+  are given, and `create_crew_a` hands them `default_alloc()` while parsing and
+  responding in the request arena — the same two-allocator shape as
+  `create_definition`.
+
+  **The reduction is modest and the floor is the point.** Most of what this
+  route allocates is the crew *execution* — task results accumulated by
+  `crew_runner` and held in the orchestrator registry — which is retained state,
+  not per-request garbage. Only the parse tree and the response move. A route
+  that suddenly dropped to near-zero here would mean retained crew state had
+  been put in an arena, which is the corruption the boundary exists to prevent,
+  so the assertion has a floor under it as well as a ceiling.
+
+  **What retains the borrowed strings is not what I first assumed, and the
+  mutations are what said so.** `CrewState` holds a *minted* UUID, a status,
+  results and a profile — nothing from the request. Asserting on
+  `agnosai_crew_state_crew_id` therefore survived every mutation. The real paths
+  are two:
+
+  - **the audit chain.** `_agnosai_orch_register` and `_agnosai_orch_finish`
+    pass `agnosai_crew_name(spec)` as the audit **message**, and
+    `agnosai_audit_record` stores it **without cloning** into a chain that lives
+    in `AppState`. A tamper-evident log whose entries silently rewrite
+    themselves is a worse outcome than most.
+  - **the task result.** On the placeholder path `crew_runner` makes the task
+    description the result's *output* (`crew_runner.cyr:460`) and audits it
+    (`:772`), and results live in the registered `CrewState`.
+
+  Asserting only on the crew name left `agnosai_task_req_from_value`'s clone
+  unpinned; a mutation found that too. The test now checks both.
+
+  New `_a` forms with bare wrappers: `agnosai_crew_req_new`,
+  `agnosai_task_req_new`, `agnosai_crew_req_from_value`,
+  `agnosai_task_req_from_value`, `agnosai_route_create_crew`,
+  `_agnosai_crew_req_fields`, `_agnosai_task_req_fields`.
+
+  **Also corrected: an earlier entry named `agnosai_crew_from_value` as the
+  blocker.** That was inferred from the name. It deserialises a *persisted*
+  crew, requires an `id` no request carries, and **has no caller in `src/` at
+  all**. The live borrow was always in the request deserialisers.
+
+  6 mutations applied, 5 caught; the sixth — forcing the nested agents onto the
+  global allocator — survives correctly, since the agent is still *owned*, just
+  from a different arena. `server_routes_crews` 124 → **141** assertions.
+
+  ⚠ The first version of the new test **segfaulted**, and for its own reason
+  rather than the code's: it read the response body after `reset_via`, and the
+  response lives in the arena. Reading a threaded route's result after releasing
+  its arena is a use-after-free on the *test's* side.
+
+- **`agnosai_agent_from_value_a` clones what it keeps, which unblocks
+  `POST /api/v1/agents/definitions`: 2,280 → 392 bytes per request (−83%).**
+
+  The previous entry recorded why three write routes could not be threaded:
+  `agnosai_agent_from_value` stored `bayan_json_v_str(key_v)` and its siblings
+  **without cloning**, so a definition kept in `AppState.definitions` pointed
+  into the parsed request body. That was invisible while the parse tree lived on
+  the no-free global bump and would have become silent corruption on an arena.
+  This is the fix that entry said was owed — a deep copy at the retention
+  boundary, not a permanently un-threaded route.
+
+  `agnosai_agent_from_value_a(al, v)` clones every Str into `al`, so the caller
+  chooses the lifetime:
+
+  - `agnosai_route_create_definition_a` passes **`default_alloc()`** for the
+    definition while parsing the body and building the response in the request
+    arena — two allocators in one function, deliberately;
+  - anything that uses an agent and drops it can pass the arena instead.
+
+  **392 B is the retained definition itself and cannot go lower**, which is the
+  point: what remains on the global bump is exactly the object the route exists
+  to keep. The assertion is bounded on both sides — a residual that stopped
+  shrinking would mean the parse tree had drifted back to the global allocator.
+
+  New `_a` forms, with bare wrappers: `agnosai_agent_new`,
+  `agnosai_agent_from_value`, `agnosai_hw_requirement_new`,
+  `agnosai_hw_requirement_from_value`. The last borrows nothing from its value —
+  both of its string members become enum ints through
+  `agnosai_accelerator_type_from_wire` — so its allocator covers only its own
+  struct and vec.
+
+  **The hazard test is inverted rather than deleted.** It used to assert a
+  stored definition's name was *destroyed* after the arena it parsed from was
+  released and scribbled over; it now asserts the name, key, role and goal all
+  **survive** that. Its own comment predicted this ("if a future change
+  deep-copies at the retention boundary, this test fails and should be replaced
+  by its opposite"). A second test drives the whole route through an arena, to
+  catch the wiring rather than the two calls in isolation.
+
+  **4 mutations applied, 4 caught.** Re-borrowing the name or the key fails the
+  survive-the-scribble assertions; allocating the definition from the request
+  arena **segfaults** the suite (exit 139 — a failed suite with no `FAIL:` line,
+  which is the documented crash signature); un-threading the parse fails the
+  byte measurement in `server_serve`.
+
+  `server_routes_agents` 45 → **53** assertions.
+
+  Still owed, and now with a proven shape to follow. **The blocker is
+  `agnosai_crew_req_from_value` and `agnosai_task_req_from_value`, not
+  `agnosai_crew_from_value`** — an earlier draft of this entry named the last
+  one from its name alone, and it has no caller in `src/` at all; it
+  deserialises a *persisted* crew and requires an `id` the request shape never
+  carries. The live borrow is the crew name and `process` in the request
+  deserialiser, plus three Strs per task, all of which reach the orchestrator
+  registry through `run_crew`. The agents inside a crew request are already
+  owned, since they go through `agnosai_agent_from_value`.
+
+- **The write routes: two reach zero, and three must not — the deserialisers
+  borrow the parse tree into process-lifetime state.**
 
   A body-carrying route splits in two, and only one half is safely threadable.
   That distinction does not exist on the read path and is the substance of this
@@ -421,8 +534,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it at the end of the request, and the next request would be handed the same
   bytes — **a stored definition's name would silently become whatever the next
   caller posted.** `POST /api/v1/crews` and `POST /api/v1/a2a/receive` have the
-  identical shape through `agnosai_crew_from_value` and the orchestrator
-  registry.
+  identical shape through `agnosai_crew_req_from_value` /
+  `agnosai_task_req_from_value` and the orchestrator registry.
 
   **So the current code is correct only because the global allocator never
   frees**, and nothing stated that. `server_state`'s `definition_insert` had

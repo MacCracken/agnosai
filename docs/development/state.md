@@ -608,33 +608,62 @@ request arena and are freed by one `reset_via`.
 
 ### ⚠ The write routes split, and three of them must NOT be threaded
 
-| write route | B/req global | B/req arena | retains borrowed parse data? |
+| write route | B/req global | B/req arena | retains data from the parse tree? |
 |---|---|---|---|
 | `POST /mcp` | 3,224 | **0** | no |
 | `POST /api/v1/approvals` | 1,352 | **0** | no |
-| `POST /api/v1/crews` | 20,984 | — | **yes** |
-| `POST /api/v1/agents/definitions` | 2,280 | — | **yes** |
-| `POST /api/v1/a2a/receive` | 1,168 | — | **yes** |
+| `POST /api/v1/agents/definitions` | 2,280 | **392** | yes, but **cloned** |
+| `POST /api/v1/crews` | 21,184 | **17,048** | yes, but **cloned** |
+| `POST /api/v1/a2a/receive` | 1,168 | — | yes, still **borrowed** |
 
-`agnosai_agent_from_value` and `agnosai_crew_from_value` take
+`agnosai_agent_from_value` and the crew *request* deserialisers took
 `bayan_json_v_str(...)` **without cloning**, and what they build is stored in
 `AppState.definitions` and the orchestrator registry — both process-lifetime. So
-a stored definition points *into the parsed request body*. Threading those
+a stored definition pointed *into the parsed request body*. Threading those
 parses would make `reset_via` reclaim it at the end of the request, and the next
 request would be handed the same bytes: **a stored definition's name becomes
 whatever the next caller posted.** It corrupts, it does not crash.
 
-**The current code is correct only because the global allocator never frees.**
-That dependency was undocumented. `server_state`'s `definition_insert` had seen
-half of it — it `str_clone`s the *key*, with the comment "the caller's Str may
-be borrowed from a request buffer that does not outlive the handler" — and left
-the value borrowed.
+**That code was correct only because the global allocator never frees**, and the
+dependency was undocumented. `server_state`'s `definition_insert` had seen half
+of it — it `str_clone`s the *key*, with the comment "the caller's Str may be
+borrowed from a request buffer that does not outlive the handler" — and left the
+value borrowed.
 
-Pinned from both sides so it cannot be "fixed for consistency":
-`server_routes_agents` reproduces the corruption against a released arena, and
-`server_serve` asserts `create_definition`'s arena arm stays ≈ its global arm.
-**The real fix is a deep copy at the retention boundary**, which is owed under
-B2 — not leaving the routes un-threaded forever.
+✅ **Fixed for agents.** `agnosai_agent_from_value_a(al, v)` clones every Str
+into `al`, so the caller picks the lifetime: `create_definition_a` passes
+`default_alloc()` for the definition while parsing and responding in the request
+arena. 2,280 → **392 B/request**, and the 392 *is* the retained definition —
+what remains on the global bump is exactly the object the route exists to keep.
+
+✅ **Done for crews.** `agnosai_crew_req_from_value_a` clones the crew name and
+`process`; `agnosai_task_req_from_value_a` clones each task's `description` and
+`expected_output`. 21,184 → **17,048 B/request**. The remainder is crew
+*execution* — task results held in the orchestrator registry — which is retained
+state and must not move.
+
+**What retains a borrowed string here is not the crew registry.** `CrewState`
+holds a minted UUID, a status, results and a profile; nothing from the request.
+The two real paths are the **audit chain** (`_agnosai_orch_register` and
+`_agnosai_orch_finish` pass `agnosai_crew_name(spec)` as the audit *message*,
+and `agnosai_audit_record` stores it without cloning into `AppState`'s chain)
+and the **task result** (on the placeholder path `crew_runner` makes the
+description the result's output, `crew_runner.cyr:460`). Asserting on
+`agnosai_crew_state_crew_id` looked right and pinned nothing — every mutation
+survived it.
+
+⚠ **Not `agnosai_crew_from_value`**, which an earlier note named from its name
+alone: it deserialises a *persisted* crew, requires an `id` the request shape
+never carries, and **has no caller in `src/`**. Check the call chain from the
+route rather than matching on a plausible name.
+
+⏳ **Owed: `POST /api/v1/a2a/receive`**, which builds a crew from the request
+description and runs it — the same audit-chain retention, not yet threaded.
+
+The test that pinned the hazard was **inverted, not deleted** — it asserted a
+stored name was destroyed after its arena was released and scribbled over, and
+now asserts every field survives. Allocating the definition from the request
+arena segfaults the suite, which is the documented crash signature.
 
 It took four bites and each one exposed the next residual, which is the pattern
 worth carrying forward — **a floor is only visible once everything above it is
@@ -882,13 +911,20 @@ fixed.
    cyrius deps --lock        # record what is actually there
    ```
 
-   **A folded dep can be ahead of its own release, briefly.** The 6.5.8 fold
-   carried sakshi 2.4.8 before 2.4.8 was tagged, so `deps` kept restoring the
-   published 2.4.7 over it — including through the implicit resolve inside
-   `cyrius build`. That is correct behaviour, not drift: agnosai compiles
-   against the newest version that exists. Before treating a snapshot
-   difference as a defect, check whether the folded version was ever released;
-   it resolved on its own once sakshi 2.4.8 shipped.
+   **A sibling checkout can hold the whole tree back, and `lib sync` there is
+   not the fix.** `[deps.*] path = "../X"` makes `cyrius deps` re-layer that
+   checkout's own `lib/` over the fold — and `cyrius build` performs an implicit
+   resolve, so the file flips back on **every build**, not just on an explicit
+   `deps`. At 6.5.8 that kept `lib/sakshi.cyr` at 2.4.7 even after sakshi 2.4.8
+   shipped.
+
+   The load-bearing step is the **pin**, not the sync: `cyrius lib sync` reads
+   `~/.cyrius/versions/<the pin>/lib`, so a sibling still on an older
+   `cyrius = "X.Y.Z"` merely re-syncs its own old snapshot. Each sibling's
+   sakshi version tracked its pin exactly (sigil 6.5.3, bote 6.5.4, kavach
+   6.5.5, ai-hwaccel 6.5.2, majra 6.4.83, tyche 6.2.11), which is what
+   identified the mechanism. Bump the sibling's pin first, then run the
+   three-step there.
 3. **Git-dep pins must move with the fold.** `cyrius deps` copies each dep's
    bundle into `lib/` last-write-wins, so a stale `[deps.sigil] tag` overwrites a
    newer folded copy back down.

@@ -80,15 +80,15 @@ fn agnosai_agent_state_from_wire(s: Str): i64 {
 
 # Create a minimal agent definition. `name` defaults to `agent_key`, matching
 # the oracle's `Self { name: key.clone(), agent_key: key, .. }`.
-fn agnosai_agent_new(agent_key: Str, role: Str, goal: Str): i64 {
-    var a = alloc(AGN_AGENT_SIZE);
+fn agnosai_agent_new_a(al, agent_key: Str, role: Str, goal: Str): i64 {
+    var a = alloc_via(al, AGN_AGENT_SIZE);
     store64(a + AGN_AGENT_KEY, agent_key);
     store64(a + AGN_AGENT_NAME, agent_key);
     store64(a + AGN_AGENT_ROLE, role);
     store64(a + AGN_AGENT_GOAL, goal);
     store64(a + AGN_AGENT_BACKSTORY, 0);
     store64(a + AGN_AGENT_DOMAIN, 0);
-    store64(a + AGN_AGENT_TOOLS, vec_new());
+    store64(a + AGN_AGENT_TOOLS, vec_new_a(al));
     store64(a + AGN_AGENT_COMPLEXITY, agnosai_default_complexity());
     store64(a + AGN_AGENT_LLM_MODEL, 0);
     store64(a + AGN_AGENT_GPU_REQUIRED, 0);
@@ -96,6 +96,16 @@ fn agnosai_agent_new(agent_key: Str, role: Str, goal: Str): i64 {
     store64(a + AGN_AGENT_GPU_MEMORY_MIN_MB, AGNOSAI_NO_LIMIT);
     store64(a + AGN_AGENT_HARDWARE, 0);
     return a;
+}
+
+# Global-allocator form of `agnosai_agent_new_a`.
+#
+# **The three Strs are stored, not copied** — the agent borrows whatever the
+# caller passed. That is right for a constructor and is why
+# `agnosai_agent_from_value_a` exists separately: deserialisation is the one
+# caller whose inputs belong to a parse tree it does not control.
+fn agnosai_agent_new(agent_key: Str, role: Str, goal: Str): i64 {
+    return agnosai_agent_new_a(default_alloc(), agent_key, role, goal);
 }
 
 # Set the agent's tool list (a vec of Str). Returns the agent.
@@ -282,7 +292,7 @@ fn agnosai_agent_to_value(a): i64 {
 
 # Rebuild an agent definition from a bayan JSON value. Returns 0 when the value
 # is not an object or any of the four required fields is missing.
-fn agnosai_agent_from_value(v): i64 {
+fn agnosai_agent_from_value_a(al, v): i64 {
     if (bayan_json_v_is_obj(v) == 0) { return 0; }
 
     var key_v = bayan_json_v_obj_get(v, "agent_key");
@@ -293,30 +303,40 @@ fn agnosai_agent_from_value(v): i64 {
     if (bayan_json_v_is_str(key_v) == 0 || bayan_json_v_is_str(name_v) == 0) { return 0; }
     if (bayan_json_v_is_str(role_v) == 0 || bayan_json_v_is_str(goal_v) == 0) { return 0; }
 
-    var a = agnosai_agent_new(bayan_json_v_str(key_v), bayan_json_v_str(role_v),
-    bayan_json_v_str(goal_v));
-    store64(a + AGN_AGENT_NAME, bayan_json_v_str(name_v));
+    var a = agnosai_agent_new_a(al, str_clone_a(al, bayan_json_v_str(key_v)),
+    str_clone_a(al, bayan_json_v_str(role_v)), str_clone_a(al, bayan_json_v_str(goal_v)));
+    store64(a + AGN_AGENT_NAME, str_clone_a(al, bayan_json_v_str(name_v)));
 
     var bs = bayan_json_v_obj_get(v, "backstory");
-    if (bs != 0 && bayan_json_v_is_str(bs) == 1) { store64(a + AGN_AGENT_BACKSTORY, bayan_json_v_str(bs)); }
+    if (bs != 0 && bayan_json_v_is_str(bs) == 1) {
+        store64(a + AGN_AGENT_BACKSTORY, str_clone_a(al, bayan_json_v_str(bs)));
+    }
 
     var dm = bayan_json_v_obj_get(v, "domain");
-    if (dm != 0 && bayan_json_v_is_str(dm) == 1) { store64(a + AGN_AGENT_DOMAIN, bayan_json_v_str(dm)); }
+    if (dm != 0 && bayan_json_v_is_str(dm) == 1) {
+        store64(a + AGN_AGENT_DOMAIN, str_clone_a(al, bayan_json_v_str(dm)));
+    }
 
     var tv = bayan_json_v_obj_get(v, "tools");
     if (tv != 0 && bayan_json_v_is_arr(tv) == 1) {
         var tools = load64(a + AGN_AGENT_TOOLS);
         for (var i = 0; i < bayan_json_v_arr_len(tv); i = i + 1) {
             var e = bayan_json_v_arr_get(tv, i);
-            if (bayan_json_v_is_str(e) == 1) { vec_push(tools, bayan_json_v_str(e)); }
+            if (bayan_json_v_is_str(e) == 1) {
+                vec_push_a(al, tools, str_clone_a(al, bayan_json_v_str(e)));
+            }
         }
     }
 
     var cx = bayan_json_v_obj_get(v, "complexity");
-    if (cx != 0 && bayan_json_v_is_str(cx) == 1) { store64(a + AGN_AGENT_COMPLEXITY, bayan_json_v_str(cx)); }
+    if (cx != 0 && bayan_json_v_is_str(cx) == 1) {
+        store64(a + AGN_AGENT_COMPLEXITY, str_clone_a(al, bayan_json_v_str(cx)));
+    }
 
     var lm = bayan_json_v_obj_get(v, "llm_model");
-    if (lm != 0 && bayan_json_v_is_str(lm) == 1) { store64(a + AGN_AGENT_LLM_MODEL, bayan_json_v_str(lm)); }
+    if (lm != 0 && bayan_json_v_is_str(lm) == 1) {
+        store64(a + AGN_AGENT_LLM_MODEL, str_clone_a(al, bayan_json_v_str(lm)));
+    }
 
     store64(a + AGN_AGENT_GPU_REQUIRED, _agnosai_bool_field(v, "gpu_required"));
     store64(a + AGN_AGENT_GPU_PREFERRED, _agnosai_bool_field(v, "gpu_preferred"));
@@ -324,9 +344,36 @@ fn agnosai_agent_from_value(v): i64 {
 
     var hv = bayan_json_v_obj_get(v, "hardware");
     if (hv != 0 && bayan_json_v_is_obj(hv) == 1) {
-        store64(a + AGN_AGENT_HARDWARE, agnosai_hw_requirement_from_value(hv));
+        store64(a + AGN_AGENT_HARDWARE, agnosai_hw_requirement_from_value_a(al, hv));
     }
     return a;
+}
+
+# Global-allocator form of `agnosai_agent_from_value_a`.
+#
+# **Every Str is cloned into `al`; nothing is borrowed from `v`.** That is the
+# whole point of the `_a` split here, and it is a correctness fix rather than an
+# allocation tidy-up.
+#
+# Before it, this stored `bayan_json_v_str(key_v)` directly — so an agent
+# deserialised from a request body *pointed into that body's parse tree*. With
+# the parse tree on the no-free global bump that was invisible; with it on a
+# per-request arena, `reset_via` reclaims the strings at end of request and the
+# next request is handed the same bytes. A definition stored in
+# `AppState.definitions` would silently take on whatever the next caller posted.
+# It corrupts rather than crashing, which is why it needed a fix and not a
+# comment.
+#
+# So callers now choose the lifetime explicitly:
+#
+#   * retaining the agent — `agnosai_route_create_definition` storing into
+#     `AppState` — passes `default_alloc()`, and the agent outlives the request;
+#   * using it and dropping it passes the request arena, and it is freed with
+#     everything else.
+#
+# `tests/server_routes_agents.tcyr` pins both directions.
+fn agnosai_agent_from_value(v): i64 {
+    return agnosai_agent_from_value_a(default_alloc(), v);
 }
 
 # The agent definition serialized to JSON text.
