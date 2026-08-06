@@ -606,6 +606,31 @@ global bump per request:
 router, id validation, tool schemas and the response struct all land in the
 request arena and are freed by one `reset_via`.
 
+### ⚠ The arena is a fixed cliff, and the routes now spill rather than fault
+
+`arena_alloc` answers **0** when full. It does not grow, and the stdlib has only
+a fixed-capacity arena — no chunked or growable form. **Nothing in
+`bayan_json_v_*`, `str_from_a` or `vec_push_a` checks its allocator's answer**,
+so an exhausted arena hands out 0 and the next store segfaults.
+
+That was harmless before B2, because handlers allocated from the unbounded
+no-free global bump. Threading them onto a fixed 64 KiB per-request arena turned
+a leak into a crash: **`GET /api/v1/dashboard/crews` with 200 crews registered
+segfaults through a raw 64 KiB arena**, and `AGNOSAI_MAX_RETAINED_CREWS` is
+1,000. `GET /api/v1/crews/{id}` on a long crew and `GET /api/v1/tools` with many
+tools share the shape.
+
+`agnosai_spill_arena` (`server/serve.cyr`) serves from the arena and falls back
+to the global bump **per allocation**; `agnosai_serve_handler` wraps sandhi's
+own request arena in one, cached per worker in a thread-local. sandhi still owns
+and resets the arena — only the ceiling behaviour changes. Spilled bytes are
+global-bump bytes and are not reclaimed, which is exactly the pre-threading
+cost applied to the overflow alone.
+
+**The lesson for any future arena work here: an allocation measurement proves
+the common case and says nothing about the ceiling.** Every fixture in the suite
+was small, so nothing caught this until the ceiling was probed deliberately.
+
 ### The write routes split — every one is threaded, three keep a floor
 
 | write route | B/req global | B/req arena | retains data from the parse tree? |

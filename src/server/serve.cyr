@@ -55,6 +55,90 @@
 # against sandhi's own 64 KiB default request cap.
 var AGNOSAI_SERVE_ARENA_BYTES = 65536;
 
+# --- The arena must not be a cliff ----------------------------------------
+
+# An allocator that serves from an arena and **falls back to the global bump
+# when the arena is full**, instead of returning 0.
+#
+# ## Why this exists: threading the routes turned a leak into a crash
+#
+# `arena_alloc` answers **0** when it cannot fit a request — it does not grow,
+# and the stdlib has no chunked or growable arena. Before the routes were
+# threaded that did not matter, because every handler allocated from the no-free
+# global bump: unbounded, so a big response was a leak and never a fault.
+#
+# Threading them onto a fixed 64 KiB per-request arena inverted that. Nothing in
+# `bayan_json_v_*`, `str_from_a` or `vec_push_a` checks its allocator's answer,
+# so an exhausted arena hands out 0 and the next store **segfaults the worker**.
+#
+# That is not a theoretical edge. `GET /api/v1/dashboard/crews` renders one
+# object per registered crew and `AGNOSAI_MAX_RETAINED_CREWS` is **1,000**;
+# measured, 200 crews already crash a 64 KiB arena. `GET /api/v1/crews/{id}` on
+# a long crew and `GET /api/v1/tools` with many tools have the same shape. These
+# are ordinary operating conditions, not an attack.
+#
+# ## The trade this makes
+#
+# Falling back means a response that outgrows the arena costs what it used to —
+# global-bump bytes that are never reclaimed. That is strictly the old
+# behaviour, applied only to the overflow, and it is the right direction:
+# **degrade to the previous cost rather than fault.** The common case keeps the
+# whole win, because the fallback is per-allocation rather than per-request.
+#
+# `reset_via` still resets the arena; the spilled bytes are the bump's and are
+# not reclaimed, exactly as before this work.
+fn _agnosai_arena_or_global_alloc(state, size): i64 {
+    var p = arena_alloc(state, size);
+    if (p != 0) { return p; }
+    return alloc(size);
+}
+
+# `realloc` for the same: try the arena, else fall back. `_arena_realloc`'s own
+# fallback is to allocate-and-copy, which is what this does when the arena is
+# full — the old block simply stays where it was.
+fn _agnosai_arena_or_global_realloc(state, ptr, old_size, new_size): i64 {
+    var p = _agnosai_arena_or_global_alloc(state, new_size);
+    if (p == 0) { return 0; }
+    if (ptr != 0 && old_size > 0) {
+        var n = old_size;
+        if (new_size < n) { n = new_size; }
+        memcpy(p, ptr, n);
+    }
+    return p;
+}
+
+# Build one over a fresh arena of `capacity` bytes.
+fn agnosai_spill_arena(capacity): i64 {
+    var arena = arena_new(capacity);
+    if (arena == 0) { return 0; }
+    return allocator_new(&_agnosai_arena_or_global_alloc,
+    &_agnosai_arena_or_global_realloc, &_alloc_free_noop, &_arena_reset, arena);
+}
+
+# The worker's spill allocator over **sandhi's** request arena.
+#
+# sandhi owns the arena and resets it between requests, so this does not create
+# one — it wraps the arena `sandhi_server_request_arena()` already returns, in
+# an allocator whose `alloc` spills to the global bump rather than answering 0.
+# Built once per worker and cached in a thread-local, because building it per
+# request would itself allocate.
+#
+# The wrapped state is sandhi's arena, so sandhi's own `reset` between requests
+# still governs the lifetime — this changes only what happens at the ceiling.
+var _agnosai_spill_slot = 0 - 1;
+
+fn _agnosai_spill_for(sandhi_arena): i64 {
+    if (sandhi_arena == 0) { return 0; }
+    if (_agnosai_spill_slot < 0) { _agnosai_spill_slot = thread_local_alloc(); }
+    var cached = thread_local_get(_agnosai_spill_slot);
+    if (cached != 0) { return cached; }
+    var w = allocator_new(&_agnosai_arena_or_global_alloc,
+    &_agnosai_arena_or_global_realloc, &_alloc_free_noop, &_arena_reset,
+    allocator_state(sandhi_arena));
+    thread_local_set(_agnosai_spill_slot, w);
+    return w;
+}
+
 # Worker count. The oracle's `ConcurrencyLimitLayer(100)` queues above its
 # limit; sandhi's pool bounds work in flight instead and does not queue, so the
 # number is carried across as a pool size rather than as an equivalent — see
@@ -230,7 +314,10 @@ fn agnosai_serve_dispatch_callback(body: Str): i64 {
 # `run_async`, which have no worker to own one; the bare forms are the fallback
 # so this handler still works if it is ever mounted on a non-pooled server.
 fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
-    var a = sandhi_server_request_arena();
+    # **Wrapped so an oversized response degrades instead of faulting.** See
+    # `_agnosai_arena_or_global_alloc` — a full arena answers 0, and nothing
+    # downstream checks, so the raw arena turns a large render into a segfault.
+    var a = _agnosai_spill_for(sandhi_server_request_arena());
 
     var method_s = 0;
     var path_s = 0;

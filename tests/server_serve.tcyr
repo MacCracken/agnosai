@@ -1230,6 +1230,79 @@ fn _t_allocation_profile(): i64 {
     return 0;
 }
 
+# --- The arena must not be a cliff --------------------------------------
+
+# **A response that outgrows the request arena degrades; it does not fault.**
+#
+# `arena_alloc` answers **0** when full — it does not grow, and the stdlib has
+# no chunked arena. Before the routes were threaded that was harmless: every
+# handler allocated from the no-free global bump, so a big response was a leak.
+# Threading them onto a fixed 64 KiB arena inverted it, because nothing in
+# `bayan_json_v_*`, `str_from_a` or `vec_push_a` checks its allocator's answer —
+# an exhausted arena hands out 0 and the next store **segfaults the worker**.
+#
+# Measured before the fix: 200 registered crews crashed
+# `GET /api/v1/dashboard/crews` through a 64 KiB arena. `MAX_RETAINED_CREWS` is
+# **1,000**, so that is an ordinary operating condition and not an attack.
+#
+# `agnosai_spill_arena` serves from the arena and falls back to the global bump
+# per allocation. This asserts both halves: the big render completes **and** the
+# arena really did hit its ceiling, so the spill path is what carried it rather
+# than the response happening to fit.
+fn _t_arena_overflow_degrades_not_faults(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var s = agnosai_app_state_new(o, agnosai_tool_registry_new(),
+    agnosai_auth_config_new(), agnosai_event_bus_new(),
+    agnosai_audit_chain_new(), agnosai_approval_gate_new());
+
+    for (var i = 0; i < 200; i = i + 1) {
+        var spec = agnosai_crew_new(str_from("c"));
+        var tasks = vec_new();
+        vec_push(tasks, agnosai_task_new(str_from("t")));
+        agnosai_crew_with_tasks(spec, tasks);
+        agnosai_orchestrator_run_crew(o, spec);
+    }
+
+    var e = str_from("");
+    var sp = agnosai_spill_arena(AGNOSAI_SERVE_ARENA_BYTES);
+    assert(sp != 0, "the spill arena builds");
+    var r = agnosai_route_dispatch_a(sp, s, AGNOSAI_METHOD_GET,
+    str_from("/api/v1/dashboard/crews"), e, 0, e);
+
+    assert(agnosai_route_status(r) == HTTP_OK,
+    "**200 crews render through a 64 KiB arena instead of faulting** — the raw \
+    arena segfaults here, which is what threading the routes introduced");
+    assert(bayan_json_v_arr_len(agnosai_route_body(r)) == 200,
+    "...with every crew present, not a truncated answer");
+
+    # The spill path is what carried it: the arena is at its ceiling.
+    assert(arena_used(allocator_state(sp)) > AGNOSAI_SERVE_ARENA_BYTES - 512,
+    "...and the arena really did fill, so this exercised the fallback rather \
+    than a response that happened to fit");
+    return 0;
+}
+
+# The fallback is per-allocation, so the ordinary case keeps the whole win.
+fn _t_spill_arena_still_costs_nothing_when_it_fits(): i64 {
+    var s = _t_state_populated();
+    var e = str_from("");
+    var sp = agnosai_spill_arena(AGNOSAI_SERVE_ARENA_BYTES);
+    var path = str_from("/api/v1/dashboard/crews");
+
+    agnosai_route_dispatch_a(sp, s, AGNOSAI_METHOD_GET, path, e, 0, e);
+    reset_via(sp);
+
+    var before = alloc_used();
+    for (var i = 0; i < 32; i = i + 1) {
+        agnosai_route_dispatch_a(sp, s, AGNOSAI_METHOD_GET, path, e, 0, e);
+        reset_via(sp);
+    }
+    assert((alloc_used() - before) == 0,
+    "a response that fits still charges the global bump NOTHING — the spill is \
+    per-allocation, so it costs only what actually overflows");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -1250,6 +1323,8 @@ fn main(): i64 {
     _t_sse_transport_gates();
     _t_bind_failure_returns();
     _t_allocation_profile();
+    _t_arena_overflow_degrades_not_faults();
+    _t_spill_arena_still_costs_nothing_when_it_fits();
     # LAST — installs a process-wide signal mask; see the fn's own note.
     _t_shutdown_signal_sets_flag();
 

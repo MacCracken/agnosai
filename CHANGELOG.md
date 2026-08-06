@@ -393,6 +393,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is the right failure mode for a change whose silent one is a released
   secret.
 
+### Fixed
+
+- **The per-request arena was a cliff: threading the routes turned an unbounded
+  leak into a segfault, and 200 registered crews were enough to hit it.**
+
+  `arena_alloc` answers **0** when it cannot fit a request — it does not grow,
+  and the stdlib ships no chunked or growable arena. That was harmless while
+  every handler allocated from the no-free global bump: a large response was a
+  leak, never a fault. Threading the routes onto a fixed 64 KiB per-request
+  arena inverted it, because **nothing in `bayan_json_v_*`, `str_from_a` or
+  `vec_push_a` checks its allocator's answer** — an exhausted arena hands out 0
+  and the next store takes down the worker.
+
+  **Measured, not theorised:** `GET /api/v1/dashboard/crews` with 200 crews
+  registered segfaults through a 64 KiB arena (exit 139).
+  `AGNOSAI_MAX_RETAINED_CREWS` is **1,000**, so this is an ordinary operating
+  condition rather than an attack — and `GET /api/v1/crews/{id}` on a long crew
+  and `GET /api/v1/tools` with many tools have the same shape.
+
+  **This was introduced by the B2 threading work in this same release**, which is
+  why it is filed as Fixed rather than as a property of the design: the routes
+  went from "leaks a lot" to "crashes", and no measurement in the suite covered
+  the ceiling because every fixture was small.
+
+  `agnosai_spill_arena` serves from the arena and falls back to the global bump
+  **per allocation**, so the ordinary case keeps the whole win and only the
+  overflow costs what it used to. `agnosai_serve_handler` wraps sandhi's own
+  request arena in one, cached per worker in a thread-local — sandhi still owns
+  the arena and still resets it between requests; this changes only what happens
+  at the ceiling.
+
+  The trade is stated rather than hidden: bytes that spill are global-bump bytes
+  and are not reclaimed. That is exactly the pre-threading cost, applied only to
+  the overflow. **Degrade to the old behaviour rather than fault.**
+
+  Pinned from both sides — the 200-crew render now completes with all 200
+  objects present **and** the arena is asserted to have reached its ceiling, so
+  the fallback is what carried it rather than a response that happened to fit.
+  A second assertion holds the win: a response that fits still charges the
+  global bump **nothing**. Both mutations — removing the fallback, or having it
+  answer 0 — reproduce the segfault.
+
+  `server_serve` 184 → **189** assertions.
+
 ### Security
 
 - **`agnosai_audit_record` now owns the strings it keeps, closing the class
