@@ -393,6 +393,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is the right failure mode for a change whose silent one is a released
   secret.
 
+### Security
+
+- **`agnosai_audit_record` now owns the strings it keeps, closing the class
+  rather than relying on every caller to.**
+
+  The chain is process-lifetime and its callers are not: both of them
+  (`_agnosai_orch_audit` and `crew_runner`'s equivalent) pass strings that
+  originate in a request body, and the request path now parses onto a
+  per-request arena. `event`, `level`, `message`, `provider` and `model` were
+  **stored by reference** — so one caller passing a borrowed message would leave
+  a **tamper-evident log holding reclaimed bytes**: entries that silently
+  rewrite themselves, which is the worst place in this system for that.
+
+  Nothing was broken — every caller happened to pass an owned Str, and the
+  preceding bites made sure of it. But that is a property a log should not
+  depend on one call site at a time, and it is the same reasoning
+  `server_state`'s `definition_insert` already applies to its key. This is the
+  item the previous entry named as a decision rather than an oversight; it is
+  now done.
+
+  `_agnosai_audit_str_own` passes 0 through, which is what `provider` and
+  `model` carry today, so the guard is contract rather than defensive noise.
+
+  ⚠ **`metadata` is the exception and remains stored by reference.** It is a
+  bayan value tree and **bayan ships no deep-copy primitive**; a
+  `build`-then-`parse` round trip would be one, at the cost of a full serialise
+  per audit record on the crew hot path. The contract therefore stands for
+  metadata alone — pass a tree that outlives the chain — and both callers build
+  theirs with a bare `bayan_json_v_obj_new()`, which does. Stated in the
+  function header so the narrowed contract is visible at the call site.
+
+  **The clone is free at this scale**: `audit_record` 29,512 ns against a
+  28,335–29,785 ns band over the preceding seven runs — the SHA-256 chain hash
+  and signature dominate completely.
+
+  **4 mutations applied, 4 caught**, three of them by segfault: storing the
+  message, the event or the provider by reference fails the
+  survive-the-scribble assertions, and removing the 0-guard crashes on the
+  `provider`/`model` path both callers actually use. `orch_audit` 58 → **64**
+  assertions.
+
+  ⚠ My first version of the test asserted `agnosai_audit_verify(c) == 1`. **0 is
+  valid** — the port's error convention, which every other assertion in that
+  file already used.
+
 ### Performance
 
 - **`POST /api/v1/a2a/receive` 17,192 → 15,624 bytes per request — the last

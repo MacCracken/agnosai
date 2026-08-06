@@ -486,7 +486,7 @@ the default level the number measures sakshi writing to a pipe.
 | `crew_build_system_prompt` | 1.47 µs |
 | `prompt_scan_clean_67b` | 8.04 µs |
 | `prompt_scan_clean_4k` | 273 µs |
-| `audit_record` | 27.9 µs |
+| `audit_record` | 29.5 µs |
 | `audit_verify_256` | 2.65 ms |
 | `output_scan_clean` | 6.98 µs |
 | `output_redact_clean` | 9.69 µs |
@@ -665,12 +665,18 @@ re-serialised for the size check and never retained.
 **Every route in the table is now threaded.** The residuals are all retained
 state rather than garbage.
 
-⚠ **`agnosai_audit_record` stores its `message` without cloning.** Every caller
-passes an owned Str today, so nothing is broken — but that is a contract held by
-convention, on a tamper-evident log, and one future caller passing a borrowed
-message reintroduces this whole class silently. Cloning inside `audit_record`
-closes it at the boundary; not done, and named here so it is a decision rather
-than an oversight.
+✅ **`agnosai_audit_record` owns the strings it keeps.** `event`, `level`,
+`message`, `provider` and `model` are cloned, so the chain no longer depends on
+every caller happening to pass an owned Str — the same boundary
+`definition_insert` already applies to its key. The clone is free at this scale:
+`audit_record` stays inside its 28,335–29,785 ns band, because the SHA-256 chain
+hash and signature dominate.
+
+⚠ **`metadata` remains stored by reference**, and that contract is now narrowed
+to it alone: bayan ships **no deep-copy primitive**, and a `build`-then-`parse`
+round trip would cost a full serialise per audit record on the crew hot path.
+Callers must pass a tree that outlives the chain; both build theirs with a bare
+`bayan_json_v_obj_new()`.
 
 **`str_builder_build`, not `str_builder_new`, decides where a built Str lives.**
 The builder's scratch buffer can be anywhere; `build` allocates the finished Str

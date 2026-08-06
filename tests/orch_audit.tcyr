@@ -29,10 +29,71 @@ fn _t_rec(c, event, message): i64 {
     return agnosai_audit_record(c, str_from(event), str_from("info"), str_from(message), 0, 0, 0);
 }
 
+# **A recorded entry owns its strings.**
+#
+# The chain is process-lifetime and its callers are not: `_agnosai_orch_audit`
+# and `crew_runner`'s equivalent both pass strings that originate in a request
+# body, and the request path parses onto a per-request arena. Storing those by
+# reference would leave a tamper-evident log holding reclaimed bytes — entries
+# that silently rewrite themselves.
+#
+# So: record from an arena, release it, scribble over it, and read the entry
+# back. Removing any one clone in `agnosai_audit_record` fails here.
+fn _t_entry_owns_its_strings(): i64 {
+    var c = _t_chain(16);
+    var ar = arena_allocator(65536);
+
+    agnosai_audit_record(c, str_from_a(ar, "crew_finished"), str_from_a(ar, "warn"),
+    str_from_a(ar, "the-crew-name"), str_from_a(ar, "hoosh"),
+    str_from_a(ar, "claude-opus-5"), 0);
+
+    reset_via(ar);
+    var scribble = str_builder_new_a(ar);
+    for (var i = 0; i < 512; i = i + 1) { str_builder_add_cstr_a(ar, scribble, "ZZZZ"); }
+    str_builder_build_a(ar, scribble);
+
+    var recent = agnosai_audit_chain_recent(c, 4);
+    assert(vec_len(recent) == 1, "the entry is in the chain");
+    var e = vec_get(recent, 0);
+    assert(str_eq_cstr(agnosai_audit_entry_event(e), "crew_finished") == 1,
+    "the event survives the arena being released and overwritten");
+    assert(str_eq_cstr(agnosai_audit_entry_level(e), "warn") == 1, "...the level too");
+    assert(str_eq_cstr(agnosai_audit_entry_message(e), "the-crew-name") == 1,
+    "...and the message, which is where a borrowed crew name would have landed");
+
+    # `provider` and `model` go through the same clone, and are the two the
+    # 0-guard exists for — both callers pass 0 today. No accessor exists for
+    # either, so these read the offsets directly.
+    assert(str_eq_cstr(load64(e + AGN_AE_PROVIDER), "hoosh") == 1, "...the provider");
+    assert(str_eq_cstr(load64(e + AGN_AE_MODEL), "claude-opus-5") == 1, "...the model");
+
+    # And the chain still verifies: cloning must not change what was hashed.
+    # **0 is valid** — the port's error convention, which every other assertion
+    # in this file already uses.
+    assert(agnosai_audit_verify(c) == 0,
+    "the chain still verifies — the clone happens before the entry is hashed, \
+    so the signature covers the copy the entry actually holds");
+    return 0;
+}
+
+# 0 passes through the clone rather than faulting — the shape both callers use
+# for `provider` and `model`.
+fn _t_zero_passes_through(): i64 {
+    var c = _t_chain(16);
+    var e = _t_rec(c, "ev", "msg");
+    assert(load64(e + AGN_AE_PROVIDER) == 0, "a 0 provider stays 0");
+    assert(load64(e + AGN_AE_MODEL) == 0, "...and a 0 model");
+    assert(agnosai_audit_verify(c) == 0, "and the chain verifies");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
     test_group("orch_audit");
+
+    _t_entry_owns_its_strings();
+    _t_zero_passes_through();
 
     assert_eq(strlen(AGNOSAI_AUDIT_GENESIS), 64, "the genesis hash is 64 hex chars");
     assert_eq(AGNOSAI_AUDIT_MAX_ENTRIES, 10000, "and the ring is the oracle's 10,000");

@@ -258,22 +258,56 @@ fn agnosai_audit_chain_recent(c, n): i64 {
     return out;
 }
 
+# Copy a Str the chain is about to keep, passing 0 through unchanged.
+#
+# A chain entry is process-lifetime; its caller's Str need not be. `str_clone`
+# would fault on the 0 that `provider` and `model` carry today, so the guard is
+# part of the contract rather than defensive noise.
+fn _agnosai_audit_str_own(s): i64 {
+    if (s == 0) { return 0; }
+    return str_clone(s);
+}
+
 # Append an event and return its entry.
 #
 # `provider`, `model` and `metadata` may be 0. The entry hash is computed before
 # the lock is taken and the signature inside it, matching the oracle's
 # minimise-lock-hold shape — here it also keeps `last_hash` consistent under
 # concurrent recorders, which `run_parallel` produces.
+#
+# ## The entry owns its strings
+#
+# `event`, `level`, `message`, `provider` and `model` are **cloned**, not
+# stored. The chain is process-lifetime and its callers are not: both of them
+# (`_agnosai_orch_audit`, and `crew_runner`'s equivalent) pass strings that
+# originate in a request body, and the request path now parses onto a
+# per-request arena. Storing those by reference would leave a **tamper-evident
+# log holding reclaimed bytes** — entries that silently rewrite themselves,
+# which is the worst place in this system for that class of bug.
+#
+# It was correct by convention before this: every caller happened to pass an
+# owned Str. That is not a property a log should depend on one call site at a
+# time, and it is the same reasoning `server_state`'s `definition_insert`
+# already applies to its key.
+#
+# ⚠ **`metadata` is the exception and is stored by reference.** It is a bayan
+# value tree and bayan ships no deep-copy primitive; a `build`-then-`parse`
+# round trip would be one, at the cost of a full serialise per audit record on
+# the crew hot path. So the contract stands for metadata alone: **pass a tree
+# that outlives the chain.** Both callers build theirs with a bare
+# `bayan_json_v_obj_new()`, which does.
 fn agnosai_audit_record(c, event: Str, level: Str, message: Str, provider, model,
 metadata): i64 {
     var e = alloc(AGN_AE_SIZE);
     store64(e + AGN_AE_ID, agnosai_uuid_v4_str());
     store64(e + AGN_AE_TIMESTAMP, clock_now_ns() / AGNOSAI_NS_PER_MS);
-    store64(e + AGN_AE_EVENT, event);
-    store64(e + AGN_AE_LEVEL, level);
-    store64(e + AGN_AE_MESSAGE, message);
-    store64(e + AGN_AE_PROVIDER, provider);
-    store64(e + AGN_AE_MODEL, model);
+    # **The entry owns its strings — see the header.** `_agnosai_audit_str_own`
+    # passes 0 through, which `provider` and `model` both are today.
+    store64(e + AGN_AE_EVENT, _agnosai_audit_str_own(event));
+    store64(e + AGN_AE_LEVEL, _agnosai_audit_str_own(level));
+    store64(e + AGN_AE_MESSAGE, _agnosai_audit_str_own(message));
+    store64(e + AGN_AE_PROVIDER, _agnosai_audit_str_own(provider));
+    store64(e + AGN_AE_MODEL, _agnosai_audit_str_own(model));
     store64(e + AGN_AE_METADATA, metadata);
     store64(e + AGN_AE_SIGNATURE, 0);
     store64(e + AGN_AE_PREV_HASH, 0);
