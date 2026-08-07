@@ -668,10 +668,57 @@ is nowhere to return the failure to.
 
 Filed upstream as
 `2026-08-06-arena-is-fixed-capacity-and-answers-0-so-unbounded-work-cannot-use-one.md`,
-asking for a growable arena. **That filing also records why `crew_runner` is
-blocked**: 97% of a crew run is transient (32,608 B per 4-task run against 894 B
-retained), but the size is unbounded, so no fixed capacity works and a spilling
-wrapper would spill most of it.
+asking for a growable arena — ✅ **shipped in 6.5.9** as an exhaustion policy.
+
+**⚠ The `crew_runner` figure in the first version of that filing was wrong, and
+the correction is the useful part.** It said "97% transient", from comparing
+33 KB of allocation against 894 B of *serialised* `CrewState`. Two errors: it
+ignored the audit chain, which is the largest consumer on that path, and
+serialised size is a lower bound on allocated footprint, not a proxy for it.
+
+Decomposed properly, per 4-task crew run:
+
+| configuration | B/run |
+|---|---|
+| audit + events on | 33,008 |
+| audit only | 32,544 |
+| neither | 14,096 |
+| retained *content*, serialised (crew state + 6 audit entries) | 3,662 |
+
+So the audit path is **~18 KB of a 4-task run**, events are ~460 B, and the
+transient majority is **two thirds to four fifths — not 97%**. Pinning it
+exactly needs the retained structures on a separate allocator, which is the
+`crew_runner` work itself rather than a precondition for it.
+
+**The method is the lesson**: a serialised size is not an allocation figure, and
+subtracting one from the other measures nothing. Decomposing by switching
+subsystems off is what produced numbers worth quoting.
+
+✅ **The audit path is threaded, 2026-08-06.** `agnosai_audit_record_a` takes a
+scratch allocator for the JSON tree it builds and throws away per entry, so a
+four-task run went **33,008 → 26,296 B** and a record costs **2,432 → 496 B** on
+the global bump. Latency is unchanged — SHA-256 and HMAC dominate.
+
+Three constraints worth not re-deriving, each found by breaking something:
+
+1. **`thread_local_get` faults on the main thread.** A scratch has to be
+   per-thread, because parallel and DAG modes record from real OS threads — but
+   the main thread has no TLS block unless `thread_local_init` is called, and
+   calling that on a *worker* orphans the block `thread_create` installed,
+   taking sandhi's request-arena slot with it. So the scratch is a **parameter**,
+   which is what every other `_a` in this tree does anyway.
+2. **An arena costs its capacity permanently.** The backing chunk comes from the
+   no-free bump, so creating one per crew run unconditionally made an
+   *audit-less* run 4.2 KB **worse**. Create it only when there is something to
+   amortise it over.
+3. **Initial chunk size is measurable, so measure it.** 512 → 26,344 ·
+   **1,024 → 26,296** · 2,048 → 27,304 · 4,096 → 27,288. Too small pays for a
+   second chunk; too large is dead weight.
+
+⏳ **Parallel and DAG modes are still on the global allocator**, deliberately —
+the runner is shared across their workers, so a scratch read off it would be
+reset mid-hash by another thread. They need a per-worker scratch, which is its
+own bite.
 
 ### The write routes split — every one is threaded, three keep a floor
 

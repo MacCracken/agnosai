@@ -158,47 +158,74 @@ fn agnosai_audit_entry_to_value(e): i64 {
 # timestamp` — not in declaration order. Getting that wrong produces a chain
 # that verifies against itself and against nothing else, which is the failure a
 # port would not notice until it tried to check a chain from elsewhere.
-fn _agnosai_audit_entry_hash(e): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("event"), bayan_json_v_str_new(load64(e + AGN_AE_EVENT)));
-    bayan_json_v_obj_set(obj, str_from("id"), bayan_json_v_str_new(load64(e + AGN_AE_ID)));
-    bayan_json_v_obj_set(obj, str_from("level"), bayan_json_v_str_new(load64(e + AGN_AE_LEVEL)));
-    bayan_json_v_obj_set(obj, str_from("message"),
-    bayan_json_v_str_new(load64(e + AGN_AE_MESSAGE)));
+fn _agnosai_audit_entry_hash_a(a, e): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "event"),
+    bayan_json_v_str_new_a(a, load64(e + AGN_AE_EVENT)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "id"),
+    bayan_json_v_str_new_a(a, load64(e + AGN_AE_ID)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "level"),
+    bayan_json_v_str_new_a(a, load64(e + AGN_AE_LEVEL)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "message"),
+    bayan_json_v_str_new_a(a, load64(e + AGN_AE_MESSAGE)));
 
     var metadata = load64(e + AGN_AE_METADATA);
-    if (metadata != 0) { bayan_json_v_obj_set(obj, str_from("metadata"), metadata); }
+    if (metadata != 0) { bayan_json_v_obj_set_a(a, obj, str_from_a(a, "metadata"), metadata); }
     var model = load64(e + AGN_AE_MODEL);
-    if (model != 0) { bayan_json_v_obj_set(obj, str_from("model"), bayan_json_v_str_new(model)); }
+    if (model != 0) {
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "model"), bayan_json_v_str_new_a(a, model));
+    }
     var provider = load64(e + AGN_AE_PROVIDER);
     if (provider != 0) {
-        bayan_json_v_obj_set(obj, str_from("provider"), bayan_json_v_str_new(provider));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "provider"),
+        bayan_json_v_str_new_a(a, provider));
     }
-    bayan_json_v_obj_set(obj, str_from("timestamp"),
-    bayan_json_v_int_new(load64(e + AGN_AE_TIMESTAMP)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "timestamp"),
+    bayan_json_v_int_new_a(a, load64(e + AGN_AE_TIMESTAMP)));
 
-    var json = bayan_json_v_build(obj);
+    var json = bayan_json_v_build_a(a, obj);
+    # **The hash itself is NOT from `a`.** It becomes `last_hash` and the next
+    # entry's `prev_hash`, so it outlives every reset of the scratch.
     return str_from(sha256_hex(str_data(json), str_len(json)));
 }
 
-# The signature over `"{entry_hash}:{previous_hash}"`, HMAC-SHA256, hex.
-fn _agnosai_audit_sign(key, entry_hash: Str, prev_hash: Str): i64 {
-    var sb = str_builder_new();
-    str_builder_add(sb, entry_hash);
-    str_builder_add_cstr(sb, ":");
-    str_builder_add(sb, prev_hash);
-    var input = str_builder_build(sb);
+# Global-allocator form of `_agnosai_audit_entry_hash_a`.
+#
+# The object and its serialised form exist only to be hashed — the whole tree is
+# garbage the moment `sha256_hex` returns. That is what the scratch arena is
+# for; this form is kept for callers outside the record path.
+fn _agnosai_audit_entry_hash(e): i64 {
+    return _agnosai_audit_entry_hash_a(default_alloc(), e);
+}
 
-    var mac = alloc(32);
+# The signature over `"{entry_hash}:{previous_hash}"`, HMAC-SHA256, hex.
+fn _agnosai_audit_sign_a(a, key, entry_hash: Str, prev_hash: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, entry_hash);
+    str_builder_add_cstr_a(a, sb, ":");
+    str_builder_add_a(a, sb, prev_hash);
+    var input = str_builder_build_a(a, sb);
+
+    var mac = alloc_via(a, 32);
     hmac_sha256(key, AGNOSAI_AUDIT_KEY_BYTES, str_data(input), str_len(input), mac);
 
-    var hex = str_builder_new();
+    # **64 hex chars into a 64-byte inline buffer, so this never grows** — which
+    # matters because `str_builder_putc` has no `_a` form and would grow on the
+    # global allocator regardless of `a`. `tests/orch_audit.tcyr` asserts the
+    # length so a longer digest cannot make that silent.
+    var hex = str_builder_new_a(a);
     for (var i = 0; i < 32; i = i + 1) {
         var b = load8(mac + i) & 255;
         str_builder_putc(hex, _agnosai_hex_digit(b / 16));
         str_builder_putc(hex, _agnosai_hex_digit(b % 16));
     }
-    return str_builder_build(hex);
+    # The signature is stored on the entry, so it outlives the scratch.
+    return str_clone(str_builder_build_a(a, hex));
+}
+
+# Global-allocator form of `_agnosai_audit_sign_a`.
+fn _agnosai_audit_sign(key, entry_hash: Str, prev_hash: Str): i64 {
+    return _agnosai_audit_sign_a(default_alloc(), key, entry_hash, prev_hash);
 }
 
 # The chain itself.
@@ -263,6 +290,11 @@ fn agnosai_audit_chain_recent(c, n): i64 {
 # A chain entry is process-lifetime; its caller's Str need not be. `str_clone`
 # would fault on the 0 that `provider` and `model` carry today, so the guard is
 # part of the contract rather than defensive noise.
+# Initial scratch chunk. Small on purpose: it grows to whatever the first few
+# entries need and then stops, so the number is a starting point rather than a
+# ceiling to get right.
+var AGNOSAI_AUDIT_SCRATCH_BYTES = 4096;
+
 fn _agnosai_audit_str_own(s): i64 {
     if (s == 0) { return 0; }
     return str_clone(s);
@@ -296,8 +328,8 @@ fn _agnosai_audit_str_own(s): i64 {
 # the crew hot path. So the contract stands for metadata alone: **pass a tree
 # that outlives the chain.** Both callers build theirs with a bare
 # `bayan_json_v_obj_new()`, which does.
-fn agnosai_audit_record(c, event: Str, level: Str, message: Str, provider, model,
-metadata): i64 {
+fn agnosai_audit_record_a(scratch, c, event: Str, level: Str, message: Str, provider,
+model, metadata): i64 {
     var e = alloc(AGN_AE_SIZE);
     store64(e + AGN_AE_ID, agnosai_uuid_v4_str());
     store64(e + AGN_AE_TIMESTAMP, clock_now_ns() / AGNOSAI_NS_PER_MS);
@@ -312,13 +344,14 @@ metadata): i64 {
     store64(e + AGN_AE_SIGNATURE, 0);
     store64(e + AGN_AE_PREV_HASH, 0);
 
-    var entry_hash = _agnosai_audit_entry_hash(e);
+    var entry_hash = _agnosai_audit_entry_hash_a(scratch, e);
 
     var mtx = load64(c + AGN_AC_MUTEX);
     mutex_lock(mtx);
     var prev = load64(c + AGN_AC_LAST_HASH);
     store64(e + AGN_AE_PREV_HASH, prev);
-    store64(e + AGN_AE_SIGNATURE, _agnosai_audit_sign(load64(c + AGN_AC_KEY), entry_hash, prev));
+    store64(e + AGN_AE_SIGNATURE,
+    _agnosai_audit_sign_a(scratch, load64(c + AGN_AC_KEY), entry_hash, prev));
     store64(c + AGN_AC_LAST_HASH, entry_hash);
 
     # Evict the oldest at capacity, carrying its hash forward so `verify` still
@@ -326,12 +359,42 @@ metadata): i64 {
     # a full chain as invalid forever.
     var entries = load64(c + AGN_AC_ENTRIES);
     if (vec_len(entries) >= load64(c + AGN_AC_MAX_ENTRIES)) {
-        store64(c + AGN_AC_FIRST_VALID_HASH, _agnosai_audit_entry_hash(vec_get(entries, 0)));
+        store64(c + AGN_AC_FIRST_VALID_HASH,
+        _agnosai_audit_entry_hash_a(scratch, vec_get(entries, 0)));
         vec_remove(entries, 0);
     }
     vec_push(entries, e);
     mutex_unlock(mtx);
     return e;
+}
+
+# Global-allocator form of `agnosai_audit_record_a`.
+#
+# ## `scratch` is where the hashing garbage goes, and it is a parameter on purpose
+#
+# `_agnosai_audit_entry_hash` builds a whole JSON tree and serialises it purely
+# to feed the digest, then discards both — and this function calls it **twice**
+# when the chain is at capacity (the new entry, plus re-anchoring on the evicted
+# one). `_agnosai_audit_sign` adds two builders and a mac. Measured at **~4.6 KB
+# per task**, which made the audit path ~18 KB of a 33 KB four-task crew run:
+# the largest single consumer there, and almost all of it garbage.
+#
+# **Why a parameter rather than a thread-local.** A scratch arena has to be
+# per-thread — `_agnosai_crew_run_parallel` and `_agnosai_crew_run_dag` record
+# from real OS threads, and a shared one would have them reset each other's
+# buffers mid-hash, silently corrupting a tamper-evident log. But
+# `thread_local_get` **faults on the main thread**, which has no TLS block
+# unless `thread_local_init` is called, and calling that on a *worker* would
+# orphan the block `thread_create` already installed — taking sandhi's
+# request-arena slot with it. So the lifetime is the caller's to state, which is
+# also what every other `_a` in this tree does.
+#
+# Passing 0 is not valid; this wrapper passes `default_alloc()`, which is
+# exactly the pre-existing behaviour.
+fn agnosai_audit_record(c, event: Str, level: Str, message: Str, provider, model,
+metadata): i64 {
+    return agnosai_audit_record_a(default_alloc(), c, event, level, message, provider,
+    model, metadata);
 }
 
 # The oracle's failure text: `Entry {i} ({id}): {reason}`.

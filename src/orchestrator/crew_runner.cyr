@@ -654,12 +654,24 @@ enum AgnosaiCrewRunnerOff {
     AGN_CR_EVENT_TX = 16;
     AGN_CR_CANCELLED = 24;
     AGN_CR_AUDIT = 32;
-    AGN_CR_SIZE = 40;
+    AGN_CR_SCRATCH = 40;
+    AGN_CR_SIZE = 48;
 }
+
+# Initial chunk for the sequential run's audit scratch.
+#
+# **1 KiB, chosen by measurement rather than by feel.** The chunk comes from the
+# no-free global bump, so its capacity is a permanent per-run cost — too large
+# and it eats the saving it was meant to produce. Measured on a 4-task run:
+# 512 B -> 26,344 · **1,024 B -> 26,296** · 2,048 B -> 27,304 · 4,096 B -> 27,288.
+# Below 1 KiB the arena grows an extra time and pays for a second chunk; above
+# it, the slack is dead weight.
+var AGNOSAI_CREW_SCRATCH_BYTES = 1024;
 
 # Create a runner over a crew spec. Everything optional starts absent.
 fn agnosai_crew_runner_new(spec): i64 {
     var r = alloc(AGN_CR_SIZE);
+    store64(r + AGN_CR_SCRATCH, 0);
     store64(r + AGN_CR_SPEC, spec);
     store64(r + AGN_CR_CLIENT, 0);
     store64(r + AGN_CR_EVENT_TX, 0);
@@ -715,10 +727,26 @@ fn _agnosai_crew_emit(r, event_type: Str, data): i64 {
 }
 
 # Record an audit event, when a chain is attached.
+# ## The audit scratch, and why it is only set on one path
+#
+# `agnosai_audit_record_a` takes an allocator for the JSON tree it builds and
+# throws away per entry — measured at ~4.6 KB per task, the largest single
+# consumer in a crew run. `AGN_CR_SCRATCH` carries a growable arena for that.
+#
+# **It is set only while running sequentially, and is 0 otherwise.** The runner
+# is shared by every worker in `_agnosai_crew_run_parallel` and
+# `_agnosai_crew_run_dag`, so a scratch read off `r` would be reset by one
+# thread while another was mid-hash — silent corruption of a tamper-evident log.
+# 0 means "use the global allocator", which is what those paths get, and is
+# exactly the behaviour they had before.
 fn _agnosai_crew_audit(r, event: Str, level: Str, message: Str, metadata): i64 {
     var chain = load64(r + AGN_CR_AUDIT);
     if (chain == 0) { return 0; }
-    return agnosai_audit_record(chain, event, level, message, 0, 0, metadata);
+    var scratch = load64(r + AGN_CR_SCRATCH);
+    if (scratch == 0) { scratch = default_alloc(); }
+    var e = agnosai_audit_record_a(scratch, chain, event, level, message, 0, 0, metadata);
+    if (load64(r + AGN_CR_SCRATCH) != 0) { reset_via(scratch); }
+    return e;
 }
 
 # The `task_started` payload: id, description, and the agent key or null.
@@ -777,6 +805,19 @@ fn _agnosai_crew_audit_task(r, task, result, agent): i64 {
 # Checks cancellation before each task and stops rather than failing the rest,
 # so a cancelled crew's results hold what actually ran.
 fn _agnosai_crew_run_sequential(r): i64 {
+    # One growable scratch for the whole run, reset after every audit entry.
+    # Growable rather than fixed because an entry's metadata is caller-supplied
+    # and unbounded; because it is reset each time, it converges on the
+    # high-water mark and then stops allocating.
+    #
+    # **Only when there is a chain to write to.** An arena's backing chunk comes
+    # from the no-free global bump, so creating one costs its capacity
+    # permanently — measured, an unconditional scratch made an audit-less run
+    # *4.2 KB worse* rather than better. The whole point is to spend that once
+    # and amortise it over many entries, which cannot happen if there are none.
+    if (load64(r + AGN_CR_AUDIT) != 0) {
+        store64(r + AGN_CR_SCRATCH, arena_allocator_growable(AGNOSAI_CREW_SCRATCH_BYTES));
+    }
     var spec = load64(r + AGN_CR_SPEC);
     var tasks = agnosai_crew_tasks(spec);
     var agents = agnosai_crew_agents(spec);
@@ -800,6 +841,7 @@ fn _agnosai_crew_run_sequential(r): i64 {
         _agnosai_crew_audit_task(r, task, result, agent);
         vec_push(results, result);
     }
+    store64(r + AGN_CR_SCRATCH, 0);
     return results;
 }
 

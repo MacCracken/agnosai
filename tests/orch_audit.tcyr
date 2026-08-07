@@ -87,12 +87,96 @@ fn _t_zero_passes_through(): i64 {
     return 0;
 }
 
+# **The hashing garbage goes in the caller's scratch, not on the global bump.**
+#
+# `_agnosai_audit_entry_hash` builds a whole JSON tree and serialises it purely
+# to feed the digest, then discards both — twice per record once the chain is at
+# capacity. That was ~4.6 KB per task and the largest consumer in a crew run.
+#
+# This measures it directly: record through a growable scratch and assert the
+# global bump barely moves. It cannot be exactly zero — the entry, its cloned
+# strings, the hash and the signature are all retained by design — so the
+# assertion is that the *transient* half moved, by comparing against the same
+# work on the global allocator.
+fn _t_hashing_uses_the_scratch(): i64 {
+    var c1 = _t_chain(64);
+    var c2 = _t_chain(64);
+    var sc = arena_allocator_growable(1024);
+    var msg = str_from("a message of some length to make the hash input real");
+
+    # warm both paths
+    agnosai_audit_record(c1, str_from("ev"), str_from("info"), msg, 0, 0, 0);
+    agnosai_audit_record_a(sc, c2, str_from("ev"), str_from("info"), msg, 0, 0, 0);
+    reset_via(sc);
+
+    var b1 = alloc_used();
+    for (var i = 0; i < 16; i = i + 1) {
+        agnosai_audit_record(c1, str_from("ev"), str_from("info"), msg, 0, 0, 0);
+    }
+    var per_global = (alloc_used() - b1) / 16;
+
+    var b2 = alloc_used();
+    for (var j = 0; j < 16; j = j + 1) {
+        agnosai_audit_record_a(sc, c2, str_from("ev"), str_from("info"), msg, 0, 0, 0);
+        reset_via(sc);
+    }
+    var per_scratch = (alloc_used() - b2) / 16;
+
+    assert(per_global > 0, "recording on the global allocator costs something");
+    assert(per_scratch < per_global,
+    "recording through a scratch costs less — the hash tree and the sign \
+    builders move off the global bump");
+
+    # **528 is calibrated, not chosen, and a ratio could not do this job.**
+    # Measured per record: baseline **496 B**; un-threading the 32-byte mac
+    # buffer **528**; the sign builder **584**; the hash object **672**; the
+    # serialise **1,144**. The global arm is 2,432 throughout, so all four still
+    # clear `scratch * 2 < global` and even `* 4` — a ratio threshold passes
+    # every one of them while looking strict.
+    #
+    # ⚠ **This bound has 32 bytes of headroom, deliberately, and that is all
+    # there is to have**: the smallest transient allocation on this path is the
+    # 32-byte mac buffer, so anything looser cannot see it. If you add a small
+    # *retained* allocation to an audit entry this will fail — that is the bound
+    # doing its job, and the fix is to re-measure and move the number, not to
+    # widen it into something that asserts nothing.
+    assert(per_scratch < 528,
+    "...and what remains is the retained half — the entry, its cloned strings, \
+    the hash and the signature. Un-threading any one of the three transient \
+    allocations shows up here and nowhere else");
+
+    # Both chains still verify: hashing must be byte-identical either way, or
+    # every signature in the chain changes.
+    assert(agnosai_audit_verify(c1) == 0, "the global-allocator chain verifies");
+    assert(agnosai_audit_verify(c2) == 0, "and the scratch chain verifies too");
+    return 0;
+}
+
+# **The signature is 64 hex characters, which is the constraint the scratch
+# threading rests on.**
+#
+# `_agnosai_audit_sign_a` writes them into `str_builder_new_a`'s 64-byte inline
+# buffer, so the builder never grows — and that matters because
+# `str_builder_putc` has **no `_a` form** and would grow on the global allocator
+# regardless of which allocator the builder was created with. A longer digest
+# would silently reintroduce the leak this test exists to prevent.
+fn _t_signature_fits_the_inline_buffer(): i64 {
+    var c = _t_chain(8);
+    var e = _t_rec(c, "ev", "msg");
+    assert(str_len(agnosai_audit_entry_signature(e)) == 64,
+    "the signature is exactly 64 hex chars — `str_builder_putc` has no `_a` \
+    form, so a longer one would grow the builder on the global allocator");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
     test_group("orch_audit");
 
     _t_entry_owns_its_strings();
+    _t_hashing_uses_the_scratch();
+    _t_signature_fits_the_inline_buffer();
     _t_zero_passes_through();
 
     assert_eq(strlen(AGNOSAI_AUDIT_GENESIS), 64, "the genesis hash is 64 hex chars");

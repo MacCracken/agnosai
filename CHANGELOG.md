@@ -395,6 +395,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **The audit hashing path builds into a scratch arena: a four-task crew run
+  drops 33,008 → 26,296 bytes (−20%), and a record costs 2,432 → 496 bytes on
+  the global bump.**
+
+  `_agnosai_audit_entry_hash` builds a whole JSON tree and serialises it purely
+  to feed the digest, then discards both — and `agnosai_audit_record` calls it
+  **twice** once the chain is at capacity (the new entry, plus re-anchoring the
+  evicted one). `_agnosai_audit_sign` adds two builders and a 32-byte mac. None
+  of it outlives the call; only the two hash strings do.
+
+  Measured by decomposition — switching the audit chain and event bus off
+  independently — the audit path was **~18 KB of a 33 KB four-task run**, the
+  largest single consumer. Per crew run:
+
+  | configuration | before | after |
+  |---|---|---|
+  | 4 tasks, audit + events | 33,008 | **26,296** |
+  | 4 tasks, audit only | 32,544 | **25,832** |
+  | 4 tasks, neither | 14,096 | 14,104 |
+  | per record, global-bump cost | 2,432 | **496** |
+
+  `audit_record` latency is unchanged at 28.3 µs — SHA-256 and HMAC dominate, so
+  this was never about time.
+
+  **Three design constraints, each found the hard way:**
+
+  1. **The scratch is a parameter, not a thread-local.** It has to be
+     per-thread — `_agnosai_crew_run_parallel` and `_agnosai_crew_run_dag`
+     record from real OS threads, and a shared one would have them reset each
+     other's buffers mid-hash, silently corrupting a tamper-evident log. But
+     **`thread_local_get` faults on the main thread**, which has no TLS block
+     unless `thread_local_init` is called, and calling that on a *worker* would
+     orphan the block `thread_create` already installed — taking sandhi's
+     request-arena slot with it. The first implementation used a thread-local
+     and segfaulted immediately.
+
+  2. **An arena costs its capacity permanently, so it must be created lazily.**
+     The backing chunk comes from the no-free global bump. Creating one
+     unconditionally per crew run made an *audit-less* run **4.2 KB worse**
+     rather than better — the whole point is to amortise that cost over many
+     entries, which cannot happen when there are none. It is now created only
+     when a chain is attached, and runs without one are byte-for-byte unchanged
+     (+8 B for the struct field).
+
+  3. **1 KiB initial chunk, chosen by measurement**: 512 B → 26,344 · **1,024 B
+     → 26,296** · 2,048 B → 27,304 · 4,096 B → 27,288. Below 1 KiB the arena
+     grows an extra time and pays for a second chunk; above it the slack is dead
+     weight.
+
+  **Parallel and DAG modes are deliberately left on the global allocator.** The
+  runner is shared across their worker threads, so `AGN_CR_SCRATCH` stays 0
+  there and `_agnosai_crew_audit` falls back — exactly the behaviour they had.
+  Threading them needs a per-worker scratch, which is a separate bite.
+
+  **5 mutations applied, 5 caught — and a ratio threshold caught none of them.**
+  Baseline 496 B; un-threading the mac buffer 528, the sign builder 584, the
+  hash object 672, the serialise 1,144, against a global arm of 2,432. Every one
+  of those clears `scratch * 2 < global` and even `* 4`. The bound is absolute
+  at 528 with 32 bytes of headroom — all there is, since the smallest transient
+  allocation on the path is that 32-byte mac — and the test says so, along with
+  what to do when a future change trips it.
+
+  Also asserted: **both chains still verify**. Hashing has to stay byte-identical
+  through the scratch or every signature changes. And the signature is pinned at
+  64 hex chars, because it is written into `str_builder_new_a`'s 64-byte inline
+  buffer and **`str_builder_putc` has no `_a` form** — a longer digest would grow
+  that builder on the global allocator regardless of the scratch.
+
+  `orch_audit` 64 → **70** assertions.
+
+### Performance
+
 - **cyrius 6.5.9's three-state mutex: agnosai changed nothing and got 15–77%
   across the board.** This is the payoff on a number that was honestly
   attributed rather than worked around.
