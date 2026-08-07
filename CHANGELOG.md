@@ -395,6 +395,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A crew run builds no event payloads when nobody is subscribed:
+  `orch_crew_runner`'s own cost drops 9,360 → 6,088 bytes for a four-task crew
+  (−35%).**
+
+  `_agnosai_crew_emit` already returned early with no bus attached — but the
+  caller had built the payload by then, and `agnosai_event_sender_send` with
+  zero subscribers takes the mutex, iterates nothing and drops it. The two
+  per-task payloads measure **344 + 304 = 648 bytes**, plus the crew-level
+  `crew_started` and `crew_completed` objects.
+
+  **Zero subscribers is the normal state**, not an edge case: a client attaches
+  to `/api/v1/crews/{id}/stream` only when someone is watching that particular
+  crew. `_agnosai_crew_wants_events` checks the receiver count once per run and
+  guards all four construction sites.
+
+  **Nothing observable changes.** With zero subscribers the payload is discarded
+  either way. A subscriber attaching between the check and the send would miss
+  that one event — which is already the contract: subscriptions are
+  `chan_lossy`, a slow client is told it `Lagged` rather than served a backlog,
+  and a client attaching mid-crew never receives what preceded it. The oracle
+  also builds its `serde_json::json!` payload before checking `event_tx`, so
+  this is a divergence in *when the work happens*, not in what a client sees.
+
+  **The decomposition corrected an earlier figure of mine.** I had reported
+  `crew_runner`'s residual as "~14 KB". Measuring the spec construction
+  separately shows a four-task run at 13,832 B is **4,472 B of building the
+  spec** — the caller's, and in production it comes from the request parse — and
+  **9,360 B of `crew_runner`'s own**. The method that found it is the same one
+  that corrected the "97% transient" claim: measure the parts, never subtract a
+  serialised size from an allocation figure.
+
+  3 mutations applied, 2 caught: breaking the guard loses events the existing
+  subscriber test already requires, and removing the subscriber check fails the
+  new allocation comparison. ⚠ **Un-guarding a single one of the four sites is
+  not caught** — it moves both arms of the comparison toward each other without
+  crossing. Catching it needs an absolute bound that would need re-calibrating
+  whenever a payload changes shape; the test says so rather than leaving it as a
+  gap to be discovered.
+
+  `orch_crew_runner` 192 → **193** assertions.
+
+  ⚠ **A benchmark row in this release is a slow run, not a regression.**
+  `route_get_crew_arena` recorded 4,471 ns against a 3,126–3,883 band, and
+  `route_get_crew_global` 5,474 against 4,231–5,244. Three consecutive
+  re-measurements give **3,190 / 3,232 / 3,212** and **4,494 / 4,519 / 4,546** —
+  both inside band. `conv_buffer_push_sliding_32`, in a module nothing here
+  touches, moved with them, which is what prompted the re-run. The CSV row
+  stands as measured because it is a log; this is the note that keeps it from
+  being read as a regression.
+
 - **B3: every bare `str_from` that a loop actually *repeats* is gone — 27 → 3,
   and the 3 are error `return`s that execute at most once.**
 

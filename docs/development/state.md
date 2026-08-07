@@ -337,6 +337,38 @@ were caught by mutation, and all four generalise to any further threading:
    residual is the stronger statement and the one that is actually true: the
    handler half is zero, not merely small.
 
+### What a crew run actually allocates
+
+Decomposed 2026-08-06, and the decomposition matters more than any single
+number — an earlier note put `crew_runner`'s residual at "~14 KB" by attributing
+the whole run to it.
+
+Per **four-task** crew run, no audit chain, no event subscribers:
+
+| part | bytes | whose |
+|---|---|---|
+| building the spec (crew + 4 tasks + agent + vecs) | 4,472 | the **caller's** — in production this is the request parse |
+| `orch_crew_runner`'s own | **6,088** | this module |
+
+Within `crew_runner`'s own: `agnosai_execute_task` is ~528 B per task, the crew
+state plus four results ~200 B, and the remainder is the profile, metrics and
+what is left of the event path.
+
+Two things came off it on 2026-08-06:
+
+- **The audit hashing scratch** — the audit path was ~18 KB of a 33 KB run with
+  a chain attached, almost all of it a JSON tree built to be hashed and thrown
+  away. Now on a growable scratch.
+- **The event-payload guard** — 9,360 → **6,088 B** (−35%). Payloads were built
+  before `_agnosai_crew_emit` could decline them, and `agnosai_event_sender_send`
+  with zero subscribers drops them. Zero subscribers is the normal state.
+
+**The method, which is the reusable part**: switch subsystems off one at a time
+and measure the difference; measure sub-parts (`_spec`, `execute_task`,
+`crew_state`) directly; never subtract a serialised size from an allocation
+figure. Both of this session's wrong numbers — "97% transient" and "~14 KB
+residual" — came from skipping that and comparing incommensurable things.
+
 ### In-loop `str_from`: two classes, and three that stay
 
 B2 split what used to be one B3 item. A brace-tracking scan of `src/` finds

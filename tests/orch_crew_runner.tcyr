@@ -65,6 +65,17 @@ fn _t_agent_tooled(key, tool): i64 {
 }
 
 # A bare task, the oracle's test_task(desc).
+# A two-task sequential spec, fresh each call — `run` mutates task status, so a
+# measuring loop needs its own.
+fn _t_seq_spec(): i64 {
+    var s = agnosai_crew_new(str_from("seq-crew"));
+    var ts = vec_new();
+    vec_push(ts, agnosai_task_new(str_from("first")));
+    vec_push(ts, agnosai_task_new(str_from("second")));
+    agnosai_crew_with_tasks(s, ts);
+    return s;
+}
+
 fn _t_task(desc): i64 {
     return agnosai_task_new(str_from(desc));
 }
@@ -807,6 +818,59 @@ fn main() {
     }
     assert_eq(seen_task_started, 2, "one task_started per task");
     assert_eq(seen_completed, 1, "and a closing crew_completed");
+
+    # **A bus with nobody listening builds no payloads.**
+    #
+    # `_agnosai_crew_emit` already returned early with no bus attached, but the
+    # caller had built the payload by then, and `agnosai_event_sender_send` with
+    # zero subscribers takes the mutex, iterates nothing and drops it. The two
+    # per-task payloads measured **344 + 304 = 648 bytes** — about 28% of what
+    # this module allocates on its own — all discarded.
+    #
+    # Zero subscribers is the *normal* state: a client attaches to
+    # `/api/v1/crews/{id}/stream` only when someone is watching that crew. So
+    # this measures a bus that exists with nobody on it, which is the common
+    # case, and compares it against the same run with a live subscriber.
+    var q_bus = agnosai_event_bus_new();
+    var q_tx = agnosai_event_bus_sender(q_bus, str_from("quiet"));
+    var q_err: i64[1];
+    store64(&q_err, 0);
+
+    # warm
+    agnosai_crew_runner_run(agnosai_crew_runner_with_events(
+    agnosai_crew_runner_new(_t_seq_spec()), q_tx), &q_err);
+
+    var qb = alloc_used();
+    for (var qi = 0; qi < 4; qi = qi + 1) {
+        agnosai_crew_runner_run(agnosai_crew_runner_with_events(
+        agnosai_crew_runner_new(_t_seq_spec()), q_tx), &q_err);
+    }
+    var per_quiet = (alloc_used() - qb) / 4;
+
+    var q_sub = agnosai_event_sender_subscribe(q_tx);
+    agnosai_crew_runner_run(agnosai_crew_runner_with_events(
+    agnosai_crew_runner_new(_t_seq_spec()), q_tx), &q_err);
+    var lb = alloc_used();
+    for (var li = 0; li < 4; li = li + 1) {
+        agnosai_crew_runner_run(agnosai_crew_runner_with_events(
+        agnosai_crew_runner_new(_t_seq_spec()), q_tx), &q_err);
+        while (agnosai_event_sub_try_recv(q_sub) != 0) { }
+    }
+    var per_listened = (alloc_used() - lb) / 4;
+
+    assert(per_quiet < per_listened,
+    "**a run with nobody subscribed allocates less than the same run with a \
+    listener** — the payloads are not built when there is no one to send them \
+    to, which is the ordinary state of a server nobody is watching");
+
+    # ⚠ **What this does and does not catch.** Removing the subscriber check —
+    # or breaking the guard so it always answers no — both fail here (the
+    # second by losing events the assertions above require). Un-guarding a
+    # *single* one of the four emit sites does not: it raises `per_quiet` and
+    # `per_listened` toward each other without crossing, and it is below this
+    # comparison's resolution. Catching that needs an absolute bound, which
+    # would have to be re-calibrated whenever a payload changes shape. Stated
+    # rather than left as a gap a reader would have to find by mutating.
 
     # --- audit ---
     var chain = agnosai_audit_chain_new();
