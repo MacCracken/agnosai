@@ -393,6 +393,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is the right failure mode for a change whose silent one is a released
   secret.
 
+### Performance
+
+- **cyrius 6.5.9's three-state mutex: agnosai changed nothing and got 15–77%
+  across the board.** This is the payoff on a number that was honestly
+  attributed rather than worked around.
+
+  `lib/sync.cyr`'s two-state mutex called `FUTEX_WAKE` on every release whether
+  or not a waiter was parked — 394 ns per uncontended lock/unlock pair against
+  46 ns for a scratch build with that line deleted. agnosai filed it on
+  2026-07-29 with a repro, worked around nothing, and state.md recorded the
+  prediction: *"a stdlib fix will show up as a straight improvement rather than
+  needing any change on this side."* 6.5.9 took it to 48 ns.
+
+  | benchmark | 6.5.8 | 6.5.9 |
+  |---|---|---|
+  | `tool_registry_get` | 512 ns | **115 ns** (−77%) |
+  | `event_send_evicting` | 2,384 ns | **933 ns** (−61%) |
+  | `event_round_trip_1_sub` | 1,982 ns | **908 ns** (−54%) |
+  | `event_fanout_64_subs` | 100.6 µs | **53.4 µs** (−47%) |
+  | `route_dashboard_crews_arena` | 10,950 ns | **6,887 ns** (−37%) |
+  | `pubsub_publish_4_patterns` | 5,891 ns | **4,505 ns** (−24%) |
+  | `plan_cache_get_hit` | 2,149 ns | **1,716 ns** (−20%) |
+
+  Every route arm gained 15–37%. The registry lookup is a bare lock plus a hash,
+  which is why it moved most.
+
+  **Two conclusions in state.md were rewritten rather than left standing**: the
+  `chan_try_send`/`chan_try_recv` figure of "about four mutex pairs" is no
+  longer the right arithmetic and is flagged for re-measure, and the
+  stalled-SSE-client reading — `event_send_evicting` against
+  `event_round_trip_1_sub` — now holds with more margin but was mutex-dominated,
+  so the old numbers should not be quoted.
+
+### Changed
+
+- **The arena spill wrapper is deleted; 6.5.9 ships it as a policy.** The
+  hand-rolled `_agnosai_arena_or_global_alloc` / `_realloc` and the per-worker
+  thread-local that cached them lasted exactly one day. agnosai filed
+  `2026-08-06-arena-is-fixed-capacity-and-answers-0-so-unbounded-work-cannot-use-one.md`
+  and 6.5.9 answered it with an exhaustion *policy* on the arena itself —
+  `ARENA_FULL_SPILL` is what the wrapper did, and `ARENA_FULL_GROW` is the thing
+  it could not do at all.
+
+  `agnosai_spill_arena` is now three lines over `arena_allocator_set_on_full`,
+  and `_agnosai_spill_for` sets the policy on sandhi's own request arena rather
+  than wrapping it — idempotent, so the thread-local went too.
+
+  **SPILL rather than GROW, deliberately.** A request arena wants a bounded
+  per-worker footprint, and GROW retains its chunks across `arena_reset` — a
+  worker would converge on its worst-ever request and hold that forever, across
+  100 workers. The test now asserts `arena_capacity_total` is unchanged as well
+  as that the arena filled, so **swapping the policy to GROW fails**, which is
+  how that intent is pinned rather than merely commented.
+
+  **6.5.9 is the floor for `server/serve.cyr`** — against 6.5.8
+  `arena_allocator_set_on_full` does not exist and the module will not compile,
+  which is the right failure mode for a change whose silent one is a segfault.
+
+  3 mutations applied, 3 caught: no policy and explicit `ARENA_FULL_NULL` both
+  reproduce the segfault; `ARENA_FULL_GROW` fails the footprint assertion.
+
 ### Fixed
 
 - **The per-request arena was a cliff: threading the routes turned an unbounded

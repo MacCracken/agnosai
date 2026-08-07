@@ -1275,10 +1275,21 @@ fn _t_arena_overflow_degrades_not_faults(): i64 {
     assert(bayan_json_v_arr_len(agnosai_route_body(r)) == 200,
     "...with every crew present, not a truncated answer");
 
-    # The spill path is what carried it: the arena is at its ceiling.
-    assert(arena_used(allocator_state(sp)) > AGNOSAI_SERVE_ARENA_BYTES - 512,
-    "...and the arena really did fill, so this exercised the fallback rather \
+    # The spill path is what carried it: the arena is at its ceiling and has
+    # **not grown past it**.
+    #
+    # This distinguishes SPILL from GROW, and deliberately. GROW would also make
+    # the render succeed — but a request arena wants a bounded per-worker
+    # footprint, and GROW retains its chunks across `arena_reset`, so a worker
+    # would converge on its worst-ever request and hold that forever across all
+    # 100 of them. Swapping the policy to GROW fails here, which is the point.
+    var used = arena_used(allocator_state(sp));
+    assert(used > AGNOSAI_SERVE_ARENA_BYTES - 512,
+    "...the arena really did fill, so this exercised the overflow path rather \
     than a response that happened to fit");
+    assert(arena_capacity_total(allocator_state(sp)) == AGNOSAI_SERVE_ARENA_BYTES,
+    "...and it did NOT grow — the overflow went to the global bump, keeping the \
+    worker's arena footprint bounded");
     return 0;
 }
 

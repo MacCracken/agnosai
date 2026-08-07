@@ -432,7 +432,7 @@ isolation; what is measured here is what load_testing adds on top.
 
 | Benchmark | Time |
 |---|---|
-| `tool_registry_get` | 467 ns |
+| `tool_registry_get` | 115 ns |
 | `tool_execute_echo` | 973 ns |
 | `is_safe_url_public_host` | 1.30 µs |
 | `is_safe_url_octal_host` | 1.38 µs |
@@ -466,14 +466,14 @@ the default level the number measures sakshi writing to a pipe.
 |---|---|
 | `conv_buffer_push_sliding_32` | 120 ns |
 | `pattern_match_wildcard` | 803 ns |
-| `event_round_trip_1_sub` | 1.99 µs |
-| `plan_cache_get_hit` | 2.11 µs |
-| `event_send_evicting` | 2.40 µs |
-| `pubsub_publish_4_patterns` | 5.72 µs |
+| `event_round_trip_1_sub` | 908 ns |
+| `plan_cache_get_hit` | 1.72 µs |
+| `event_send_evicting` | 933 ns |
+| `pubsub_publish_4_patterns` | 4.50 µs |
 | `plan_key_16x16` | 11.7 µs |
 | `rank_agents_16` | 12.8 µs |
 | `kahn_sort_64_nodes` | 57.6 µs |
-| `event_fanout_64_subs` | 101 µs |
+| `event_fanout_64_subs` | 53.40 µs |
 | `delegate_16_tasks_16_agents` | 204 µs |
 | `durable_deserialize_crew_state` | 2.68 µs |
 | `durable_load_miss` | 2.80 µs |
@@ -539,22 +539,49 @@ rejected request, ~53x amplification**, no credential required. Permanent memory
 exhaustion is worse than recoverable CPU exhaustion. The answer to a flood is
 `rate_limit`, which is ported but **not mounted** (roadmap D1, a human decision).
 
-**These numbers are futex-bound, not algorithm-bound**, and that is the finding rather than an
-excuse. `mutex_lock` + `mutex_unlock` costs **394 ns uncontended** because `lib/sync.cyr`'s
-two-state mutex calls `FUTEX_WAKE` on every release whether or not a waiter is parked; a scratch
-build with that one line deleted measures **46 ns**, an 8.6× gap. `chan_try_send` +
-`chan_try_recv` is 1.59 µs, about four mutex pairs. So `event_round_trip_1_sub` at 1.99 µs is
-three locks and almost nothing else, and `event_fanout_64_subs` is 128 channel operations.
-Filed upstream in the cyrius repo as
-`docs/development/issues/2026-07-29-mutex-unlock-unconditional-futex-wake.md`, with a repro.
-Nothing is worked around here: the rows above are the honest current baseline, and a stdlib fix
-will show up as a straight improvement rather than needing any change on this side.
+**These numbers were futex-bound, not algorithm-bound — and ✅ the stdlib fix
+landed in cyrius 6.5.9, exactly as this section predicted.**
 
-Two rows are worth reading together. `event_send_evicting` (2.40 µs) is a send into a subscriber
-that has stopped reading — the overwrite-oldest path blocker #4 exists for. It costs one extra
-channel operation over the healthy `event_round_trip_1_sub` (1.99 µs), which is the number that
+`mutex_lock` + `mutex_unlock` cost **394 ns uncontended**, because
+`lib/sync.cyr`'s two-state mutex called `FUTEX_WAKE` on every release whether or
+not a waiter was parked; a scratch build with that one line deleted measured
+**46 ns**, an 8.6× gap. agnosai filed it as
+`2026-07-29-mutex-unlock-unconditional-futex-wake.md` with a repro, worked
+around nothing, and recorded: *"a stdlib fix will show up as a straight
+improvement rather than needing any change on this side."*
+
+6.5.9's three-state mutex (0 free / 1 held / 2 held-with-waiters) took it to
+**48 ns**. agnosai changed nothing and got, measured across the bump:
+
+| benchmark | 6.5.8 | 6.5.9 |
+|---|---|---|
+| `tool_registry_get` | 512 ns | **115 ns** (−77%) |
+| `event_send_evicting` | 2,384 ns | **933 ns** (−61%) |
+| `event_round_trip_1_sub` | 1,982 ns | **908 ns** (−54%) |
+| `event_fanout_64_subs` | 100.6 µs | **53.4 µs** (−47%) |
+| `route_dashboard_crews_arena` | 10,950 ns | **6,887 ns** (−37%) |
+| `pubsub_publish_4_patterns` | 5,891 ns | **4,505 ns** (−24%) |
+| `plan_cache_get_hit` | 2,149 ns | **1,716 ns** (−20%) |
+
+Every route arm gained 15–37%; the registry lookup is a bare lock plus a hash,
+which is why it moved most. **The prediction is the part worth keeping**: a
+number that is honestly attributed to a dependency does not need a workaround,
+and the tables above are now the post-fix baseline rather than an excuse.
+
+⚠ The `chan_*` figures below still date from before the bump — `chan_try_send` +
+`chan_try_recv` at 1.59 µs was "about four mutex pairs", which is no longer the
+right arithmetic. They are due a re-measure.
+
+Two rows are worth reading together. `event_send_evicting` (933 ns) is a send into a subscriber
+that has stopped reading — the overwrite-oldest path blocker #4 exists for. It costs roughly what
+the healthy `event_round_trip_1_sub` (908 ns) does, which is the number that
 matters: **a stalled SSE client does not get more expensive to serve**, it just loses events. A
 blocking `chan_send` there would have wedged the crew instead.
+
+⚠ Both figures more than halved at the 6.5.9 mutex fix and the *gap* between them
+closed with them — at 6.5.8 they were 2.40 µs against 1.99 µs. The conclusion is
+unchanged and now holds with more margin, but the arithmetic behind it was
+mutex-dominated and should not be quoted from the old numbers.
 
 `delegate_16_tasks_16_agents` at 204 µs is 16 × `rank_agents_16` (12.8 µs) plus change, which is
 the expected shape — hierarchical mode ranks every task independently, with no memoisation
@@ -574,15 +601,15 @@ pays it per request.
 
 | Benchmark | global | arena | Δ |
 |---|---|---|---|
-| `route_approvals_*` | 2.147 µs | **1.861 µs** | −13.3% |
-| `route_tools_*` | 3.104 µs | **2.168 µs** | −30.2% |
-| `route_definitions_*` | 3.356 µs | **2.529 µs** | −24.6% |
-| `route_get_crew_*` | 4.830 µs | **3.621 µs** | −25.0% |
-| `route_dashboard_crews_*` | 13.266 µs | **10.956 µs** | −17.4% |
-| `route_dashboard_agents_*` | 16.452 µs | **14.048 µs** | −14.6% |
-| `route_approvals_post_*` | 3.731 µs | **2.983 µs** | −20.0% |
-| `route_mcp_*` | 5.618 µs | **3.808 µs** | −32.2% |
-| `route_resolve` | 343 ns | — | in both |
+| `route_approvals_*` | 1.543 µs | **1.300 µs** | -15.7% |
+| `route_tools_*` | 2.444 µs | **1.659 µs** | -32.1% |
+| `route_definitions_*` | 2.674 µs | **1.997 µs** | -25.3% |
+| `route_get_crew_*` | 4.231 µs | **3.126 µs** | -26.1% |
+| `route_dashboard_crews_*` | 8.859 µs | **6.887 µs** | -22.3% |
+| `route_dashboard_agents_*` | 11.914 µs | **9.696 µs** | -18.6% |
+| `route_approvals_post_*` | 3.096 µs | **2.580 µs** | -16.7% |
+| `route_mcp_*` | 4.861 µs | **3.316 µs** | -31.8% |
+| `route_resolve` | 325 ns | — | in both |
 
 The arena arm wins on all six because the global allocator is a **no-free bump**:
 a request's garbage is never reclaimed, so a long-lived process walks an
