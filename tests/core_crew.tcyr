@@ -19,6 +19,58 @@ include "src/core/agent.cyr"
 include "src/core/crew.cyr"
 include "tests/test_helpers.cyr"
 
+# **The JSON keys are minted once, not per serialised object.**
+#
+# `AGN_JK_*` in `core/crew.cyr` and `core/task.cyr` are process-lifetime `Str`s
+# over static literals. Re-allocating them with `str_from_a` costs ~32 ns and a
+# 16-byte header *each*, and there are fifteen across the crew serialisers —
+# measured at 27% of `agnosai_crew_state_to_value_a` (1,661 → 1,216 ns) and 17%
+# of `GET /api/v1/crews/{id}`.
+#
+# The bound is on **arena bytes for one call**, because that is where a
+# re-allocated key would land now that the route is threaded. Baseline 1,488 B;
+# putting the fifteen keys back adds 15 × 16 = 240 B, so 1,600 separates them
+# with headroom on both sides.
+fn _t_crew_json_keys_are_hoisted(): i64 {
+    var st = agnosai_crew_state_new(str_from("id-1"), AGNOSAI_CREW_COMPLETED);
+    agnosai_crew_state_with_result(st, agnosai_task_result_new(str_from("t-1"),
+    str_from("out"), AGNOSAI_STATUS_COMPLETED));
+    agnosai_crew_state_with_profile(st, agnosai_crew_profile_new());
+
+    var ar = arena_allocator(65536);
+    agnosai_crew_state_to_value_a(ar, st);
+    reset_via(ar);
+    agnosai_crew_state_to_value_a(ar, st);
+    var used = arena_used(allocator_state(ar));
+
+    assert(used > 0, "the serialiser does build into the arena");
+    assert(used < 1600,
+    "one crew_state_to_value_a stays under 1,600 arena bytes — re-minting the \
+    fifteen AGN_JK_* keys per call would add 240 and cross it");
+
+    # **Pointer identity, which is exact where the byte bound is not.** A single
+    # re-allocated key is 16 bytes and vanishes inside any usable threshold; the
+    # key the object actually carries either *is* the global or it is not.
+    var v = agnosai_crew_state_to_value_a(ar, st);
+    assert(bayan_json_v_obj_key(v, 0) == AGN_JK_CREW_ID,
+    "the crew_id key in the built object IS the global — not a copy of it");
+    assert(bayan_json_v_obj_key(v, 1) == AGN_JK_CSTATUS, "...and status");
+    assert(bayan_json_v_obj_key(v, 2) == AGN_JK_RESULTS, "...and results");
+    assert(bayan_json_v_obj_key(v, 3) == AGN_JK_PROFILE, "...and profile");
+
+    var res_v = bayan_json_v_arr_get(bayan_json_v_obj_val(v, 2), 0);
+    assert(bayan_json_v_obj_key(res_v, 0) == AGN_JK_TASK_ID,
+    "...and `core/task.cyr`'s keys likewise, through the nested result");
+
+    var prof_v = bayan_json_v_obj_val(v, 3);
+    assert(bayan_json_v_obj_key(prof_v, 0) == AGN_JK_WALL_MS,
+    "...and the profile's, through the nested object");
+
+    assert(str_eq_cstr(AGN_JK_CREW_ID, "crew_id") == 1, "and the spelling is the wire key");
+    assert(str_eq_cstr(AGN_JK_TASK_ID, "task_id") == 1, "...for task.cyr too");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -237,6 +289,8 @@ fn main() {
     map_set(cw_im, str_from("t1"), 42);
     assert_eq(str_eq(bayan_json_v_build(_agnosai_int_map_to_value_a(cw_ar, cw_im)),
     bayan_json_v_build(_agnosai_int_map_to_value(cw_im))), 1, "int_map_to_value_a agrees");
+    _t_crew_json_keys_are_hoisted();
+
     return assert_summary();
 }
 

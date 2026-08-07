@@ -133,10 +133,17 @@ fn _agnosai_map_slot_val(m, i): i64 { return load64(load64(m) + i * 24 + 8); }
 fn _agnosai_map_to_value_a(a, m): i64 {
     var obj = bayan_json_v_obj_new_a(a);
     var n = _agnosai_map_slots(m);
-    for (var i = 0; i < n; i = i + 1) {
+    # **Stop once every live entry is out.** A slot walk is over *capacity*, not
+    # size, and `map_new_str` starts at 16 — a task result's metadata is
+    # typically one or two entries, so the loop was scanning 16 slots to emit
+    # one. Measured at 195 ns for a single-entry map.
+    var live = map_size(m);
+    var emitted = 0;
+    for (var i = 0; i < n && emitted < live; i = i + 1) {
         if (_agnosai_map_slot_live(m, i) == 1) {
             bayan_json_v_obj_set_a(a, obj, _agnosai_map_slot_key(m, i),
             _agnosai_map_slot_val(m, i));
+            emitted = emitted + 1;
         }
     }
     return obj;

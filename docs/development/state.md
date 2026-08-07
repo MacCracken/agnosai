@@ -343,6 +343,24 @@ target large enough to be worth a bite.
 With a chain attached the audit path adds ~7 KB per four-task run (was ~18 KB
 before the hashing scratch).
 
+### JSON keys are hoisted, and pointer identity is what pins it
+
+`AGN_JK_*` in `core/crew.cyr` and `core/task.cyr` hold the fifteen serialiser
+keys as process-lifetime `Str`s over static literals. A `str_from_a` per key per
+object costs ~32 ns and a 16-byte header; measured, four sets ran 430 ns with
+keys allocated against 314 hoisted, and `agnosai_crew_state_to_value_a` went
+**1,661 → 1,216 ns**.
+
+⚠ Distinct from the constant-*return* hoist this file declines (149 sites, 2.5%
+of bytes, 121 symbols). Fifteen keys, measured in time, on the paths every
+serialising route runs.
+
+**The assertion is pointer identity, not a byte bound.** A single re-allocated
+key is 16 bytes and disappears inside any usable threshold — a 1,600 B bound
+over a 1,488 B baseline caught a wholesale regression and missed all three
+single-key mutations. `bayan_json_v_obj_key(v, i) == AGN_JK_*` is exact and
+needs no calibration.
+
 ### In-loop `str_from`
 
 Two classes, and the distinction matters: a bare `str_from` in a loop costs 16 B

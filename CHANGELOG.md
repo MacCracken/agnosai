@@ -430,6 +430,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`GET /api/v1/crews/{id}` 3,178 → 2,634 ns (−17%), and every serialising
+  route gained with it.** The JSON keys are minted once instead of per object.
+
+  Decomposed first, because the route's cost was not where it looked:
+
+  | part | ns | share |
+  |---|---|---|
+  | `agnosai_crew_state_to_value_a` | 1,661 | **52%** |
+  | dispatch, response struct, auth | ~718 | 23% |
+  | `agnosai_route_resolve_a` | 347 | 11% |
+  | `agnosai_orchestrator_crew` (mutex + map_get) | 233 | 7% |
+  | `agnosai_uuid_is_valid` | 219 | 7% |
+
+  Inside the serialiser, `bayan_json_v_obj_set_a` is already minimal — a pair
+  and a `vec_push`, no duplicate scan. What cost was the **key**: a
+  `str_from_a("crew_id")` per call, ~32 ns and a 16-byte header each. Measured
+  directly, four sets ran 430 ns with keys allocated against **314 hoisted**.
+
+  Fifteen `AGN_JK_*` globals across `core/crew.cyr` and `core/task.cyr` now hold
+  them, minted once at startup over static literals — process-lifetime, so safe
+  to share across threads and arenas.
+  `agnosai_crew_state_to_value_a` **1,661 → 1,216 ns (−27%)**.
+
+  | route | before | after |
+  |---|---|---|
+  | `route_get_crew_arena` | 3,178 | **2,634** |
+  | `route_get_crew_global` | 4,353 | **3,744** |
+  | `route_dashboard_crews_arena` | 7,806 | **7,064** |
+  | `route_definitions_arena` | 2,268 | **2,026** |
+
+  ⚠ **This is not the constant-return hoist state.md declines.** That verdict
+  covered 149 `return str_from("lit")` sites worth 2.5% of *bytes* against 121
+  new symbols. These are fifteen keys on the hottest serialisers in the tree,
+  measured in *time*, and every route that renders a crew, a task result or an
+  agent pays them.
+
+  Also in the same pass, both smaller and both without design questions:
+
+  - **`_agnosai_uuid_scan` inlines its hex decode** — 32 calls to
+    `_agnosai_hex_value` per validation, which had no other caller, so there is
+    still one decoder. 219 → 192 ns.
+  - **`_agnosai_map_to_value_a` stops once every live entry is out.** A slot
+    walk is over *capacity*: a task result's metadata is one entry in a 16-slot
+    map. Measured 195 → 191 ns — **within noise**, kept because it is correct
+    and cannot hurt, not because it paid.
+
+  **5 mutations applied, 5 caught — after the assertion was replaced.** A byte
+  bound on arena usage (1,488 baseline, 1,600 threshold) caught a wholesale
+  regression but **not a single re-allocated key**, which is 16 bytes and
+  invisible at any usable threshold. The test now asserts **pointer identity** —
+  the key the built object carries either *is* the global or it is not — which
+  is exact, needs no calibration, and catches all three single-key mutations
+  including the one nested inside `core/task.cyr`.
+
 - **A crew run builds no event payloads when nobody is subscribed:
   `orch_crew_runner`'s own cost drops 9,360 → 6,088 bytes for a four-task crew
   (−35%).**

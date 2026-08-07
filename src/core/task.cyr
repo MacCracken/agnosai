@@ -570,15 +570,33 @@ fn agnosai_task_result_with_metadata(r, key: Str, value): i64 {
     return r;
 }
 
+# JSON keys for `agnosai_task_result_to_value_a`, minted once at startup.
+#
+# **A key is a compile-time constant, so allocating one per serialised object is
+# pure overhead.** `str_from_a` costs ~32 ns and a `Str` header each time;
+# measured, four keys were ~29% of a four-field object's build time (430 ns
+# against 314 with them hoisted). These point at static literals, so they are
+# process-lifetime and safe to share across threads and arenas alike.
+#
+# ⚠ This is **not** the constant-return hoist state.md declines. That one was
+# 149 `return str_from("lit")` sites for 2.5% of bytes and 121 new symbols;
+# these are four keys on the hottest serialiser in the tree, measured in time,
+# and every route that renders a task result pays them.
+var AGN_JK_TASK_ID = str_from("task_id");
+var AGN_JK_OUTPUT = str_from("output");
+var AGN_JK_STATUS = str_from("status");
+var AGN_JK_METADATA = str_from("metadata");
+
 # The result as a bayan JSON value, fields in declaration order.
 fn agnosai_task_result_to_value_a(a, r): i64 {
     var obj = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_id"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_TASK_ID,
     bayan_json_v_str_new_a(a, load64(r + AGN_TRES_TASK_ID)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "output"), bayan_json_v_str_new_a(a, load64(r + AGN_TRES_OUTPUT)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_OUTPUT,
+    bayan_json_v_str_new_a(a, load64(r + AGN_TRES_OUTPUT)));
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_STATUS,
     bayan_json_v_str_new_a(a, agnosai_task_status_to_wire_a(a, load64(r + AGN_TRES_STATUS))));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "metadata"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_METADATA,
     _agnosai_map_to_value_a(a, load64(r + AGN_TRES_METADATA)));
     return obj;
 }

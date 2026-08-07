@@ -433,31 +433,31 @@ fn _agnosai_int_map_from_value(v): i64 {
 # so they are held exactly.
 fn agnosai_crew_profile_to_value_a(a, p): i64 {
     var obj = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "wall_ms"), bayan_json_v_int_new_a(a, load64(p + AGN_PROF_WALL_MS)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_ms"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_WALL_MS, bayan_json_v_int_new_a(a, load64(p + AGN_PROF_WALL_MS)));
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_TASK_MS,
     _agnosai_int_map_to_value_a(a, load64(p + AGN_PROF_TASK_MS)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_count"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_TASK_COUNT,
     bayan_json_v_int_new_a(a, load64(p + AGN_PROF_TASK_COUNT)));
 
     var cost = load64(p + AGN_PROF_COST_MICRO_USD);
     if (cost != 0) {
-        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "cost_usd"),
+        bayan_json_v_obj_set_a(a, obj, AGN_JK_COST_USD,
         bayan_json_v_float_new_a(a, agnosai_micro_usd_to_f64(cost)));
     }
 
     var agent_cost = load64(p + AGN_PROF_AGENT_COST);
     if (map_size(agent_cost) > 0) {
-        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "agent_cost_usd"), _agnosai_cost_map_to_value_a(a, agent_cost));
+        bayan_json_v_obj_set_a(a, obj, AGN_JK_AGENT_COST, _agnosai_cost_map_to_value_a(a, agent_cost));
     }
 
     var task_cost = load64(p + AGN_PROF_TASK_COST);
     if (map_size(task_cost) > 0) {
-        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_cost_usd"), _agnosai_cost_map_to_value_a(a, task_cost));
+        bayan_json_v_obj_set_a(a, obj, AGN_JK_TASK_COST, _agnosai_cost_map_to_value_a(a, task_cost));
     }
 
     var strength = load64(p + AGN_PROF_SANDBOX_STRENGTH);
     if (strength != AGNOSAI_NO_LIMIT) {
-        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "sandbox_strength"), bayan_json_v_int_new_a(a, strength));
+        bayan_json_v_obj_set_a(a, obj, AGN_JK_SANDBOX_STR, bayan_json_v_int_new_a(a, strength));
     }
     return obj;
 }
@@ -544,13 +544,28 @@ fn agnosai_crew_state_with_result(s, result): i64 {
     return s;
 }
 
+# JSON keys for the crew serialisers, minted once at startup — see the banner on
+# `AGN_JK_TASK_ID` in `core/task.cyr` for why, and for why this is not the
+# constant-return hoist state.md declines.
+var AGN_JK_CREW_ID = str_from("crew_id");
+var AGN_JK_CSTATUS = str_from("status");
+var AGN_JK_RESULTS = str_from("results");
+var AGN_JK_PROFILE = str_from("profile");
+var AGN_JK_WALL_MS = str_from("wall_ms");
+var AGN_JK_TASK_MS = str_from("task_ms");
+var AGN_JK_TASK_COUNT = str_from("task_count");
+var AGN_JK_COST_USD = str_from("cost_usd");
+var AGN_JK_AGENT_COST = str_from("agent_cost_usd");
+var AGN_JK_TASK_COST = str_from("task_cost_usd");
+var AGN_JK_SANDBOX_STR = str_from("sandbox_strength");
+
 # The crew state as a bayan JSON value. `profile` is **omitted** when unset,
 # matching the oracle's `skip_serializing_if = "Option::is_none"`.
 fn agnosai_crew_state_to_value_a(a, s): i64 {
     var obj = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "crew_id"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_CREW_ID,
     bayan_json_v_str_new_a(a, load64(s + AGN_CSTATE_CREW_ID)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_CSTATUS,
     bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire_a(a, load64(s + AGN_CSTATE_STATUS))));
 
     var results = load64(s + AGN_CSTATE_RESULTS);
@@ -558,11 +573,11 @@ fn agnosai_crew_state_to_value_a(a, s): i64 {
     for (var i = 0; i < vec_len(results); i = i + 1) {
         bayan_json_v_arr_push_a(a, results_v, agnosai_task_result_to_value_a(a, vec_get(results, i)));
     }
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "results"), results_v);
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_RESULTS, results_v);
 
     var profile = load64(s + AGN_CSTATE_PROFILE);
     if (profile != 0) {
-        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "profile"), agnosai_crew_profile_to_value_a(a, profile));
+        bayan_json_v_obj_set_a(a, obj, AGN_JK_PROFILE, agnosai_crew_profile_to_value_a(a, profile));
     }
     return obj;
 }
