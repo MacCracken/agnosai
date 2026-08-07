@@ -1,8 +1,15 @@
 # AgnosAI — Rust → Cyrius Port Plan (v2.0.0)
 
-> Status: **Phases 0-5 complete** — `server` finished 2026-08-03, so the API
-> serves, streams, and drains. Next up: Phase 6 (`sandbox`).
-> Pinned **cyrius 6.5.6** (2026-08-03).
+> Status: **Phases 0-6 complete** — `server` finished 2026-08-03 (the API serves,
+> streams and drains) and `sandbox` finished 2026-08-05 (all 43 findings of the
+> 2026-08-04 audit fixed, 41 mutation-verified). Remaining: Phases 7-9.
+> Pinned **cyrius 6.5.10** (2026-08-07).
+>
+> ⚠ **Read the Phase 7-9 headings before scheduling them.** Measured against the
+> parity bar defined below — the **default cargo build**, and `default = []` —
+> `fleet` and `definitions` are `full`-feature-only and are therefore *not*
+> default-build gaps at all. Only part of `telemetry` is. That materially changes
+> what "remaining" means, and it is recorded at each phase.
 >
 > **All eight numbered blockers are closed, and nothing blocks anything.** The
 > table below is kept as a *reasoning archive*, not a work list — several of its
@@ -211,11 +218,18 @@ Splitting it into bites is a size-discipline choice (the shared-secret half alon
 unlocks 5 of the 11 oracle tests with no crypto), not a constraint. See the
 blocker table below, which already said this and was not read.
 
-### Phase 6 — `sandbox` (77%)
+### Phase 6 — `sandbox` (77%) — ✅ **COMPLETE 2026-08-05**
 policy (rename first — blocker #5), kavach_bridge, exec, process, python, oci,
-manager. **Defer wasm.rs.** Note: kavach's lossy one-shot `exec_capture` blocks
-nothing here — agnosai only consumes kavach's **scoring + gate**, which port 1:1.
-Use `persistent_spawn/send/read/terminate` for the stdin-JSON tool protocol.
+manager. **wasm.rs deferred**, per the parity definition below. Note: kavach's
+lossy one-shot `exec_capture` blocks nothing here — agnosai only consumes
+kavach's **scoring + gate**, which port 1:1. Uses
+`persistent_spawn/send/read/terminate` for the stdin-JSON tool protocol.
+
+**Exit:** all eight modules ported; the 2026-08-04 audit found **43 confirmed
+defects behind a green suite** and all 43 are fixed, 41 mutation-verified — see
+[m7-audit-2026-08-04.md](m7-audit-2026-08-04.md), where each is marked in place.
+That audit is the strongest evidence in the port that *a green suite is not a
+correctness proof*, and is worth reading before auditing any other phase.
 
 ### Phase 7 — `fleet`
 Cheapest 4,443 LOC in the port; zero consumers; sequence last. **Premise
@@ -223,16 +237,45 @@ correction:** `discovery.rs` does *not* map to `sandhi_discovery_*` (sandhi
 resolves ONE service by name, no enumerate, no metadata map) — it's 174 lines of
 stub needing no sandhi at all.
 
+⚠ **Not a default-build gap.** `fleet` appears only in
+`full = ["sandbox", "fleet", "definitions", "hwaccel", "otel", "kavach", "majra"]`
+and `default = []`, so the build this port takes as its parity oracle never
+compiles it. Porting it *extends* agnosai past the bar rather than closing a hole
+in it — a legitimate goal, but schedule it as scope, not as debt.
+
 ### Phase 8 — `telemetry` (partial)
 Copy hoosh's proven `otlp.cyr` (199 lines) — this is the one place the remote
 seam does NOT apply (OTLP export is in-process; a remote gateway cannot export
 agnosai's spans). Thread-local trace context is **mandatory** under run_pooled
 (sakshi's span stack + trace id are process globals, sakshi.cyr:1400-1407).
 
+⚠ **This is the only one of the three that touches the default build**, and only
+in part. `rust-old/src/lib.rs:25` declares `pub mod telemetry;` with **no
+`#[cfg]`**, and `main.rs` initialises logging at startup either way — the OTLP
+arm is `#[cfg(feature = "otel")]`, but the `#[cfg(not(...))]` arm still runs
+`tracing_subscriber::fmt().with_env_filter(..agnosai=info..).json().init()`.
+
+So the default-build gap is **JSON-formatted stderr logging with an `EnvFilter`**,
+not OTLP export. sakshi has neither a JSON output mode nor an env filter, so the
+port emits plain text at sakshi's default level. That is a **stated** divergence,
+documented at `src/main.cyr:22-26` — log *content* matches the oracle line for
+line, transport and format do not. Decide whether to close it (needs sakshi
+work, i.e. an upstream ask) before treating Phase 8 as purely additive.
+
 ### Phase 9 — `definitions` (partial)
 assembler, loader-JSON, presets, versioning, k8s_crd (which parses **JSON** only
 — the ```yaml at k8s_crd.rs:33 is a doc comment). **Defer** ZIP container +
 packaging + YAML.
+
+⚠ **Not a default-build gap**, same as Phase 7 — `definitions` is `full`-only.
+The visible consequence is `GET /api/v1/presets`, which the port answers `[]`.
+**That is correct parity, not a stub**: the oracle's body is
+`#[cfg(feature = "definitions")]` / `#[cfg(not(..))]`, the `not` arm returns
+`Json(vec![])`, and the oracle's own test asserts empty under default features.
+Verified 2026-08-07 against `rust-old/Cargo.toml` and
+`rust-old/src/server/routes/definitions.rs`. The port documents this in place at
+`src/server/routes/tools.cyr`. Porting the loader turns `[]` into a branch;
+until then, do not "fix" the empty array.
 
 ## Parity definition — what v2.0.0 is
 
@@ -261,7 +304,7 @@ included later (last-definition-wins, silently). Real modules **are** includable
 - Inline `#[cfg(test)]` mods testing private fns are a **non-problem** — Cyrius has no module privacy.
 - **`cyrius bench` no-arg is NON-recursive** — it lists `benches/`, `tests/bcyr/` and `tests/` one level each. Verified: `benches/nested/deep.bcyr` was silently skipped while `benches/top.bcyr` ran. Keep every `.bcyr` **flat**.
 - ~~**Build our own coverage.**~~ **CORRECTED 2026-07-28 — this claim is stale.** `cyrius coverage --min 80` walks project **`src/`** recursively and reads `tests/**/*.tcyr` as the corpus; `--min` genuinely gates (non-zero exit). CLAUDE.md's 80% gate **is** dischargeable today. (cyrius archived its own issue `2026-07-23-hoosh-coverage-reports-stdlib-not-local-repo.md` — the hoosh 7/1097 number was the bug, and it is fixed.) Two conditions: matching is **substring-based**, so keep the `agnosai_*` prefix on every public fn (a bare `add` or `run` gets falsely credited) and `_`-prefix genuine internals so they leave the denominator; and `cyrius audit` does **not** run coverage, so CI needs it as its own step.
-- **Hard constraint — the 1 MiB corpus cliff.** Total `.tcyr` bytes under `tests/` must stay under **1,048,575** or coverage silently under-reports and `--min` becomes unsatisfiable for reasons unrelated to test quality. agnosai has ~412 KB of `#[cfg(test)]` Rust today; the `.tcyr` translation (explicit includes, no macros, no `?`) plausibly lands at 0.7–1.2 MB — **right at the cliff**. Budget test text aggressively, share helpers through one included file, and if it still overflows, run the bulk suite from a sibling dir via `cyrius tests <dir>` while keeping `tests/` compact. File upstream if hit.
+- ~~**Hard constraint — the 1 MiB corpus cliff.**~~ **RETIRED 2026-08-07 — there is no corpus ceiling.** The prediction was right and the cliff was real: agnosai crossed it on 2026-08-05 at 1,053,976 bytes, coverage silently under-reported (measured 100% → 85% across seven corpus sizes, with padding to *one* suite deleting an unrelated suite's evidence), and `--min` still exited 0. Filed, and **fixed upstream in 6.5.8**; the fixed `alloc(1048576)` in `cbt/quality.cyr` is replaced by a grow-and-retry loop. Re-verified on **6.5.10** by the filing's own repro: the corpus is 1,125,915 bytes today and padded to **1,765,916** — well past the 1,376,773 that used to report 85% and 64/75 files — `cyrius coverage --min 80` still reads **75/75 files, 1099/1099 functions, 100%**. The consumer-side workaround (`scripts/check-coverage.sh` plus a corpus-size gate) is deleted. **Do not reintroduce a corpus budget**, and do not split `tests/` to dodge a cap that no longer exists.
 - **Exit-code clamp hazard**: `sys_exit(assert_summary())` & 0xFF → exactly 256/512/768 failures scores **PASS**. agnosai has 865 tests. Still live in 6.4.83 — do **not** use the stock `proj-tcyr` epilogue. Every `.tcyr` ends `var f = main(); if (f > 0) { f = 1; } syscall(60, f);`, and CI greps for the raw pattern.
 - 155 of 865 tests are `#[tokio::test]` and Cyrius has **no async test harness**.
 - **Freeze** the 124-row Rust bench-history.csv; start a fresh Cyrius baseline. tokio numbers are not comparable — do not claim wins/regressions across the port. *(A terminal v1.1.0 row set was captured 2026-07-28 before the freeze, closing the gap since the last rows at v1.0.2/2026-04-02. `scripts/bench-history.sh` also had a name-capture bug — criterion prints short names on the same line as their timing, so `time: [...]` landed inside the name field for 24 of 237 rows; fixed before the final capture.)*
@@ -272,7 +315,7 @@ included later (last-definition-wins, silently). Real modules **are** includable
 |---|---|
 | bayan | ✅ **both filed 2026-07-16** — YAML parse → the existing tagged value tree: `bayan/docs/development/issues/2026-07-16-agnosai-yaml-parse-into-tagged-value-tree.md` (also accepted onto bayan's roadmap as `bayan_yaml_*`; the "draft written" here never materialized as a file — the filing supersedes it); JSON recursion-depth cap (blocker #2): `bayan/docs/development/issues/2026-07-16-agnosai-json-no-recursion-depth-cap.md` — ✅ **resolved in bayan 1.1.1** (cap 128, serde_json parity; 101/101 asserts green) |
 | sankoch | ZIP archive container (deflate + crc32 already there; ~250 lines) |
-| cyrius | ✅ **`chan_try_send` filed 2026-07-28** and **resolved in 6.4.84** (blocker #4; the load-bearing evidence is majra's hub-mutex-across-blocking-send, not agnosai's own call sites) — archived upstream. ✅ **`vec_sort_by` / `vec_select_nth` filed 2026-07-28** as `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`, still open — 18+ consumers (itihas, sankhya, goonj, naad, agora, mela, mneme, samay, stiva, takumi, sit, shakti, varna, chakshu, darshini, hisab, nous, dhvani) have each independently reimplemented an O(n²) insertion sort, which is the strongest possible argument that this is a stdlib gap rather than an app concern. *(This row previously read "still to file" — it had already been filed the same day.)* Also open from agnosai: `2026-07-28-sock-send-result-allocates-per-call.md`, `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md`, `2026-07-29-fmt-int-buf-i64-min.md` |
+| cyrius | **Every agnosai filing to date is now resolved.** Shipped since this table was written, in order: `chan_try_send` (6.4.84), `vec_sort_by`/`vec_select_nth` (6.5.4), `sys_exit_group` + `async_await_readable_ms` (6.5.6), `thread_create_detached` and the coverage corpus buffer (6.5.8), the unconditional-futex-wake mutex and the fixed-capacity arena (6.5.9), and **`alloc_via` call-chain overhead (6.5.10)**. `2026-07-29-fmt-int-buf-i64-min.md` is also closed — `fmt.cyr`, `string.cyr`, `log.cyr` and sakshi 2.4.8 all guard `i64::MIN` now, verified by formatting it. Still open at 6.5.10: `2026-07-28-sock-send-result-allocates-per-call.md` (16 B/response) and `2026-07-29-no-portable-xmkdir-in-io-cyr.md`. Original row follows. ✅ **`chan_try_send` filed 2026-07-28** and **resolved in 6.4.84** (blocker #4; the load-bearing evidence is majra's hub-mutex-across-blocking-send, not agnosai's own call sites) — archived upstream. ✅ **`vec_sort_by` / `vec_select_nth` filed 2026-07-28** as `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`, still open — 18+ consumers (itihas, sankhya, goonj, naad, agora, mela, mneme, samay, stiva, takumi, sit, shakti, varna, chakshu, darshini, hisab, nous, dhvani) have each independently reimplemented an O(n²) insertion sort, which is the strongest possible argument that this is a stdlib gap rather than an app concern. *(This row previously read "still to file" — it had already been filed the same day.)* Also open from agnosai: `2026-07-28-sock-send-result-allocates-per-call.md`, `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md`, `2026-07-29-fmt-int-buf-i64-min.md` |
 | kavach | WASM availability one-liner; stderr capture; **exec timeout — an undocumented regression** (Rust 2.0.0 shipped it, the Cyrius port dropped it, ADR-004 omits it) |
 | sigil | `pem_decode_pubkey` — a ~20-line clone of `pem_decode_privkey`. **Nice-to-have, not a blocker** (see below) |
 | bote | `jwt_verify_rs256` — **its stated premise is stale**: jwt.cyr:9-11 says "RS256 needs an asymmetric primitive sigil doesn't yet expose", but sigil has `rsa_pkcs1v15_verify_sha256` and `rsa_pubkey_from_der` already accepts SPKI. **Do not wait on this** — verified 2026-07-28 by *compiling and running* a scratch RS256 verify against the real toolchain. Implement the JWT half locally in agnosai over `bayan_base64url_decode` + `clock_epoch_secs` + sigil's existing RSA/SHA-256 primitives |
@@ -292,6 +335,13 @@ included later (last-definition-wins, silently). Real modules **are** includable
 - ~~**`cyrius coverage` / `cyrius bench`** — structurally unusable as-is.~~ **RETRACTED 2026-07-28.** `cyrius coverage --min 80` measures project `src/` and gates properly; cyrius fixed and archived its own issue for this. `cyrius bench` is usable too — the real constraint is just that no-arg discovery is **non-recursive**, so keep `.bcyr` flat. See the rewritten Test strategy.
 - **"`cyrius fmt --check` is a no-op that always exits 0"** — FALSE (a claim that surfaced during this re-verification and was checked). It is silent by design and returns **exit 1 on drift** — confirmed live against sandhi, where it caught real drift in `tests/sandhi.tcyr`. CI should read the exit code, **not** diff `cyrius fmt`'s stdout. Related trap: `cyrius fmt FILE` (no `--check`) prints the formatted file to **stdout** and does not write in place; redirect through a temp file to apply.
 - **"agnosai's `tx.send` needs a non-blocking send"** — half-true, and the half that matters is different. They are tokio **broadcast** sends: never block, never fail, and **evict the oldest** on lag. See blocker #4 — the port needs overwrite-oldest semantics, not drop-newest.
+
+### Added 2026-08-07
+
+- **"An arena allocation is free, so wire spellings should come from `*_to_wire_a` rather than globals"** — FALSE, and it was this file's sibling guidance in roadmap B3 until 2026-08-07. An arena allocation is an `alloc_via`: **15.1 ns on 6.5.9, 11.1 ns on 6.5.10**, plus a 16-byte `Str` header. Hoisting the wire values and per-item keys to process-lifetime globals took `GET /api/v1/dashboard/crews` **6,881 → 5,217 ns (−24%)** and **160 → 112 allocations (−30%)** on one toolchain. The scope rule is **"a literal a loop body or an unconditional envelope reaches"** — not "a literal": 338 `str_from_a(a, "…")` sites over 237 strings deliberately remain, because an error *message* is built at most once per request and only for a request that already failed.
+- **`alloc_via` is the route-latency floor, and ~11 ns is where it stops.** `arena_alloc`'s fast path is ~8 instructions; the rest was the call chain. 6.5.10 inlined the two accessor loads and dropped the `_arena_*` trampolines. What remains is inherent to a vtable — hand-inlined `fncall2(load64(a), load64(a+32), size)` measures 8.9 ns and `arena_alloc(state, size)` direct measures 6.2. **Count allocations, not bytes**, when reasoning about route latency; a counting allocator wrapped around the arena's own vtable (`allocator_new(&counting_alloc, .., arena)`) gives the exact number.
+- **"A sibling's vendored `lib/` is what re-layers a stale stdlib module"** — FALSE, and it cost a wrong upstream filing that was written and then deleted. The real mechanism for `lib/sakshi.cyr` was a **transitive git-dep pin**: sigil and bote declare `[deps.sakshi]` in their *own* manifests, and `cyrius deps` overlays that resolution on top of the `lib sync --full` snapshot — on every `cyrius build`, since build performs an implicit resolve. Proven by hashing every candidate: the file on disk matched `~/.cyrius/deps/sakshi/2.4.7/dist/sakshi.cyr`, and syncing all seven siblings to 2.4.8 changed nothing until the **tags** moved. **Diagnose this class by hashing, never by reading version stamps** — several sources can hold the same version and only one is the writer.
+- **`GET /api/v1/presets` answering `[]` is correct parity, not a stub.** Verified against `rust-old/Cargo.toml` (`default = []`) and `routes/definitions.rs`, whose `#[cfg(not(feature = "definitions"))]` arm returns `Json(vec![])` and whose own test asserts empty under default features. Recorded because the empty array reads like an omission and has been re-questioned.
 
 ## Open questions (need a decision before the bites they gate)
 

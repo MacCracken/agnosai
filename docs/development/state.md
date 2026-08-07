@@ -22,17 +22,10 @@ lands, not before, so the number always names something that actually shipped.
   6.2.11). majra needed `dynlib`, `fdlopen` and `async` added to its
   `[deps].stdlib` — 6.5.10 no longer supplies them transitively via `sandhi`.
 
-  ⚠ **`[deps.sakshi]` is pinned explicitly in `cyrius.cyml`, and must move with
-  every toolchain bump.** `sakshi` being in `[deps].stdlib` is *not* sufficient:
-  sigil and bote declare `[deps.sakshi]` in their own manifests, `cyrius deps`
-  overlays that transitive resolution on top of the `lib sync --full` snapshot,
-  and `cyrius build` performs an implicit resolve — so a sibling pinned behind
-  the toolchain downgrades `lib/sakshi.cyr` on **every build**. That happened
-  under this bump (2.4.7 against a 2.4.8 pin, reverting the `i64::MIN` decimal
-  fix) and was invisible except as an unnamed "1 bundled lib(s) differ".
-  `deps --verify` cannot catch it — the lock is written *from disk*. The
-  `scripts/check-clean.sh` snapshot diff is the only gate that sees it, and its
-  `sakshi.cyr` allowance is now **removed**.
+  ⚠ **`[deps.sakshi]` is pinned explicitly in `cyrius.cyml` and must move with
+  every toolchain bump.** Listing `sakshi` in `[deps].stdlib` is not sufficient —
+  sigil and bote pin it transitively in their own manifests, which silently
+  downgraded it on every build until 2026-08-07. See standing rule 2 below.
 - **`lib/` matches the pin exactly**: 0 of 106 stdlib files differ from
   `~/.cyrius/versions/6.5.10/lib`; build and test emit no drift or shadow warning.
   The six files outside the snapshot (ai-hwaccel, bote-core, kavach, libro, majra,
@@ -896,23 +889,89 @@ libro 2.8.4 arrives transitively via bote.
 
 ## Handoff
 
-> **Refreshed 2026-07-31.** This section is a pointer, not a diary. Everything
+> **Refreshed 2026-08-07.** This section is a pointer, not a diary. Everything
 > that is *owed* lives in [`roadmap.md`](roadmap.md) → *Owed work*, which is the
 > single list; if an item is not there, it is not owed. What
 > already shipped and why is in `CHANGELOG.md`. This file carries only the numbers
 > and the standing rules.
 
+### Start here
+
+The tree is **green and idle** — nothing is half-done, and no bite is in flight.
+Read in this order:
+
+1. `CLAUDE.md` — process, principles, DO NOTs. Non-negotiable.
+2. [`cyrius-port-plan.md`](cyrius-port-plan.md) — the plan of record. Its blocker
+   table is a **closed reasoning archive**, not a work list; its *Corrections*
+   section is the list of things already got wrong once, and re-deriving any of
+   them is wasted work.
+3. [`roadmap.md`](roadmap.md) → *Owed work* — the only list of what is owed.
+4. This file for the numbers.
+
+**Then run the gate before changing anything**, so a later failure is
+attributable:
+
+```sh
+cyrius build src/main.cyr build/agnosai && cyrius tests tests && \
+  cyrius coverage --min 80 && ./scripts/check-clean.sh && ./scripts/check-symbols.sh
+```
+
+Expected as of 2026-08-07: build clean, **66 suites / 5,559 assertions / 0
+failed**, coverage **100% (1099/1099)**, cleanliness clean, **1,834 symbols
+across 82 files**. `cyrius tests tests` takes several minutes; for a single suite
+use `cyrius build tests/<name>.tcyr /tmp/t && /tmp/t`, which is seconds.
+
+**What a next session would most usefully pick up**, in rough order of value:
+
+| | Why |
+|---|---|
+| The `telemetry` half of M9 | The **only default-build parity gap** left (JSON stderr logging + `EnvFilter`; see above). Needs an upstream sakshi ask, so it starts as a filing rather than a bite. |
+| roadmap B2's remaining tail | `crew_runner`'s off-request-path bayan calls — the largest un-threaded allocator surface left. Everything request-reachable is done. |
+| D1 / D2 | Two decisions waiting on a human, not on work. Neither blocks anything. |
+| M8 `fleet` / M10 `definitions` | Real scope, but **past** the parity bar rather than debt — see the default-build table above before scheduling either as "remaining". |
+
+⚠ **Do not** start by re-auditing performance on the request path. It was
+decomposed to the floor on 2026-08-07: the remaining cost is `alloc_via` × the
+allocation count, the count is what the parity-fixed wire format requires, and
+the upstream half already shipped in 6.5.10. The measurements and the two
+dead-end levers are recorded under *Benchmarks*.
+
 ### Where the port is
 
 | | |
 |---|---|
-| Cyrius port | **24,694 lines**, 82 files, `src/` mirroring `rust-old/src/` |
+| Cyrius port | **25,830 lines**, 82 files, `src/` mirroring `rust-old/src/` |
 | Rust oracle | 27,683 lines at `rust-old/` — frozen |
-| Milestones | **M0–M6 complete** — the server tier is done and the binary serves |
-| Remaining in M6 | nothing — bites 15c (SSE) and 16 (bind) both closed 2026-08-03 |
-| In progress | **M7 `sandbox`** — all eight modules ported; the 2026-08-04 audit's 43 findings all fixed 2026-08-05 |
-| Not started | M8 `fleet`, M9 `telemetry`, M10 `definitions` |
+| Milestones | **M0–M7 complete** — the server tier serves, and M7 `sandbox`'s eight modules are ported with the 2026-08-04 audit's 43 findings all fixed 2026-08-05 (41 mutation-verified) |
+| Not started | M8 `fleet`, M9 `telemetry`, M10 `definitions` — but only part of M9 is a **default-build** gap; see below |
 | Gates | build OK · 1,834 symbols / 82 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · coverage **100% (1099/1099)** via `cyrius coverage --min 80` |
+
+### What "M8/M9/M10 not started" actually means — measured 2026-08-07
+
+The parity bar is the **default cargo build**, and `rust-old/Cargo.toml` has
+`default = []` with
+`full = ["sandbox", "fleet", "definitions", "hwaccel", "otel", "kavach", "majra"]`.
+Against that bar the three remaining milestones are not equivalent:
+
+| oracle module | lines | in the default build? |
+|---|---|---|
+| `fleet/` | 4,443 | ✗ `full` only — porting it **extends** past the bar |
+| `definitions/` | 1,460 | ✗ `full` only — its visible effect is `/api/v1/presets`, and `[]` is **correct** parity |
+| `telemetry/` | 322 | ✓ **`pub mod telemetry;` is ungated** and `main.rs` initialises logging either way |
+
+So the only default-build gap among the three is **part of** M9, and it is not
+OTLP: the oracle's `#[cfg(not(feature = "otel"))]` arm still runs
+`tracing_subscriber::fmt().with_env_filter(..agnosai=info..).json().init()`.
+sakshi has neither a JSON output mode nor an env filter, so the port emits plain
+text at sakshi's default level — a **stated** divergence documented at
+`src/main.cyr:22-26`, where log *content* matches line for line and transport and
+format do not. Closing it needs sakshi work, i.e. an upstream ask.
+
+Also verified rather than assumed, because both read like omissions:
+`tools/{python_tool,wasm_tool,wasm_loader}.rs` are `#[cfg(feature = "sandbox")]`;
+and `tools/builtin/{echo,json_transform}.rs` are **not missing** — they are folded
+into `src/tools/builtin/basic.cyr`, which is a layout divergence from the
+mirror rule worth knowing before diffing file-against-file.
 
 **The binary serves as of 2026-08-03**, and **drains on SIGINT/SIGTERM** as of
 the 6.5.6 bump the same day. `src/main.cyr` wires the state, installs a
@@ -941,20 +1000,27 @@ fixed.
    cyrius deps --lock        # record what is actually there
    ```
 
-   **A sibling checkout can hold the whole tree back, and `lib sync` there is
-   not the fix.** `[deps.*] path = "../X"` makes `cyrius deps` re-layer that
-   checkout's own `lib/` over the fold — and `cyrius build` performs an implicit
-   resolve, so the file flips back on **every build**, not just on an explicit
-   `deps`. At 6.5.8 that kept `lib/sakshi.cyr` at 2.4.7 even after sakshi 2.4.8
-   shipped.
+   **A dep's transitive pin can hold a stdlib module back, and `lib sync` is
+   not the fix.** `cyrius build` performs an implicit resolve, so a stale module
+   flips back on **every build**. Diagnose by hashing — several sources can hold
+   the same version and only one is the writer, so version stamps mislead:
 
-   The load-bearing step is the **pin**, not the sync: `cyrius lib sync` reads
-   `~/.cyrius/versions/<the pin>/lib`, so a sibling still on an older
-   `cyrius = "X.Y.Z"` merely re-syncs its own old snapshot. Each sibling's
-   sakshi version tracked its pin exactly (sigil 6.5.3, bote 6.5.4, kavach
-   6.5.5, ai-hwaccel 6.5.2, majra 6.4.83, tyche 6.2.11), which is what
-   identified the mechanism. Bump the sibling's pin first, then run the
-   three-step there.
+   ```sh
+   sha256sum lib/<mod>.cyr ../*/lib/<mod>.cyr \
+             ~/.cyrius/deps/<mod>/*/dist/<mod>.cyr \
+             ~/.cyrius/versions/<pin>/lib/<mod>.cyr
+   ```
+
+   `deps --verify` cannot catch this — the lock is written *from disk*, so a
+   downgraded file gets its downgraded hash recorded and the check passes.
+   `scripts/check-clean.sh`'s snapshot diff is the only gate that sees it, and
+   it now allows no exceptions. The reasoning and the wrong first diagnosis are
+   in [`cyrius-port-plan.md`](cyrius-port-plan.md) → *Corrections*.
+
+   Also: `cyrius lib sync` reads `~/.cyrius/versions/<the pin>/lib`, so a
+   sibling on an older `cyrius = "X.Y.Z"` merely re-syncs its own old snapshot.
+   Bump the sibling's pin first, then run the three-step there. All seven
+   siblings are on 6.5.10 as of 2026-08-07.
 3. **Git-dep pins must move with the fold.** `cyrius deps` copies each dep's
    bundle into `lib/` last-write-wins, so a stale `[deps.sigil] tag` overwrites a
    newer folded copy back down.
