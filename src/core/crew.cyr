@@ -65,13 +65,22 @@ fn agnosai_default_trust_level(): i64 {
     return str_from("basic");
 }
 
+# The two crew-spec keys no other module emits. The rest of this file's wire
+# vocabulary is shared and lives in `core/json.cyr` — see the banner there.
+var AGN_JK_AGENTS = str_from("agents");
+var AGN_JK_TRUST_LEVEL = str_from("trust_level");
+
 # The snake_case wire spelling of a crew status.
+#
+# `a` is unused: the answer is one of five process-lifetime `Str`s rather than a
+# fresh allocation. The parameter stays because every `_a` caller passes it and
+# because the bare form below must keep delegating — the signature is the API.
 fn agnosai_crew_status_to_wire_a(a, status): i64 {
-    if (status == AGNOSAI_CREW_RUNNING) { return str_from_a(a, "running"); }
-    if (status == AGNOSAI_CREW_COMPLETED) { return str_from_a(a, "completed"); }
-    if (status == AGNOSAI_CREW_FAILED) { return str_from_a(a, "failed"); }
-    if (status == AGNOSAI_CREW_CANCELLED) { return str_from_a(a, "cancelled"); }
-    return str_from_a(a, "pending");
+    if (status == AGNOSAI_CREW_RUNNING) { return AGN_JV_RUNNING; }
+    if (status == AGNOSAI_CREW_COMPLETED) { return AGN_JV_COMPLETED; }
+    if (status == AGNOSAI_CREW_FAILED) { return AGN_JV_FAILED; }
+    if (status == AGNOSAI_CREW_CANCELLED) { return AGN_JV_CANCELLED; }
+    return AGN_JV_PENDING;
 }
 
 # Global-allocator form of `agnosai_crew_status_to_wire_a`.
@@ -170,29 +179,29 @@ fn agnosai_crew_trust_level(c): i64 {
 # The crew spec as a bayan JSON value, fields in declaration order.
 fn agnosai_crew_to_value_a(a, c): i64 {
     var obj = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "id"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_ID,
     bayan_json_v_str_new_a(a, load64(c + AGN_CREW_ID)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "name"), bayan_json_v_str_new_a(a, load64(c + AGN_CREW_NAME)));
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_NAME, bayan_json_v_str_new_a(a, load64(c + AGN_CREW_NAME)));
 
     var agents = load64(c + AGN_CREW_AGENTS);
     var agents_v = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(agents); i = i + 1) {
         bayan_json_v_arr_push_a(a, agents_v, agnosai_agent_to_value_a(a, vec_get(agents, i)));
     }
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "agents"), agents_v);
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_AGENTS, agents_v);
 
     var tasks = load64(c + AGN_CREW_TASKS);
     var tasks_v = bayan_json_v_arr_new_a(a);
     for (var j = 0; j < vec_len(tasks); j = j + 1) {
         bayan_json_v_arr_push_a(a, tasks_v, agnosai_task_to_value_a(a, vec_get(tasks, j)));
     }
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "tasks"), tasks_v);
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_TASKS, tasks_v);
 
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "process"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_PROCESS,
     agnosai_process_to_value_a(a, load64(c + AGN_CREW_PROCESS)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "metadata"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_METADATA,
     _agnosai_map_to_value_a(a, load64(c + AGN_CREW_METADATA)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "trust_level"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_TRUST_LEVEL,
     bayan_json_v_str_new_a(a, load64(c + AGN_CREW_TRUST_LEVEL)));
     return obj;
 }
@@ -548,7 +557,6 @@ fn agnosai_crew_state_with_result(s, result): i64 {
 # `AGN_JK_TASK_ID` in `core/task.cyr` for why, and for why this is not the
 # constant-return hoist state.md declines.
 var AGN_JK_CREW_ID = str_from("crew_id");
-var AGN_JK_CSTATUS = str_from("status");
 var AGN_JK_RESULTS = str_from("results");
 var AGN_JK_PROFILE = str_from("profile");
 var AGN_JK_WALL_MS = str_from("wall_ms");
@@ -565,7 +573,7 @@ fn agnosai_crew_state_to_value_a(a, s): i64 {
     var obj = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, obj, AGN_JK_CREW_ID,
     bayan_json_v_str_new_a(a, load64(s + AGN_CSTATE_CREW_ID)));
-    bayan_json_v_obj_set_a(a, obj, AGN_JK_CSTATUS,
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_STATUS,
     bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire_a(a, load64(s + AGN_CSTATE_STATUS))));
 
     var results = load64(s + AGN_CSTATE_RESULTS);

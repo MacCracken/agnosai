@@ -31,17 +31,44 @@
 # cannot be confused at a call site.
 # =========================================================================
 
+# This tier's own wire vocabulary, minted once at startup — the `Debug`
+# spellings, the two dashboard-only keys, and the empty string the metadata
+# reader answers with. Everything else these routes emit is already hoisted in
+# `core/json.cyr` or `core/crew.cyr`; see the banner on the former.
+#
+# **These two routes are where it matters most.** Both loop over every
+# registered crew, so a literal in a loop body costs one allocation per crew:
+# `GET /api/v1/dashboard/crews` made 160 allocations against the eight-crew
+# bench fixture, and six per crew — five keys and the status spelling — were
+# literals like these.
+#
+# Deliberately capitalized: see the `{:?}` note in the banner.
+var AGN_JV_D_RUNNING = str_from("Running");
+var AGN_JV_D_COMPLETED = str_from("Completed");
+var AGN_JV_D_FAILED = str_from("Failed");
+var AGN_JV_D_CANCELLED = str_from("Cancelled");
+var AGN_JV_D_PENDING = str_from("Pending");
+
+var AGN_JK_AGENT = str_from("agent");
+var AGN_JK_AGENT_NAME = str_from("agent_name");
+var AGN_JK_AGENT_ROLE = str_from("agent_role");
+var AGN_JK_AGENT_KEY = str_from("agent_key");
+var AGN_JK_TOOL_COUNT = str_from("tool_count");
+
 # The `Debug` spelling of a crew status — capitalized variant names.
 #
 # Deliberately NOT `agnosai_crew_status_to_wire`, which is the serde
 # `rename_all = "snake_case"` spelling every other route uses. This one exists
 # only because `dashboard.rs` formats with `{:?}`.
+#
+# `a` is unused — the answer is a process-lifetime `Str`. The parameter stays
+# because the bare form below delegates through it.
 fn _agnosai_route_status_debug_a(a, status): i64 {
-    if (status == AGNOSAI_CREW_RUNNING) { return str_from_a(a, "Running"); }
-    if (status == AGNOSAI_CREW_COMPLETED) { return str_from_a(a, "Completed"); }
-    if (status == AGNOSAI_CREW_FAILED) { return str_from_a(a, "Failed"); }
-    if (status == AGNOSAI_CREW_CANCELLED) { return str_from_a(a, "Cancelled"); }
-    return str_from_a(a, "Pending");
+    if (status == AGNOSAI_CREW_RUNNING) { return AGN_JV_D_RUNNING; }
+    if (status == AGNOSAI_CREW_COMPLETED) { return AGN_JV_D_COMPLETED; }
+    if (status == AGNOSAI_CREW_FAILED) { return AGN_JV_D_FAILED; }
+    if (status == AGNOSAI_CREW_CANCELLED) { return AGN_JV_D_CANCELLED; }
+    return AGN_JV_D_PENDING;
 }
 
 # Global-allocator form of `_agnosai_route_status_debug_a`.
@@ -73,12 +100,12 @@ fn agnosai_route_crew_history_a(a, state): i64 {
         # and this fetch — see the module header.
         if (c != 0) {
             var obj = bayan_json_v_obj_new_a(a);
-            bayan_json_v_obj_set_a(a, obj, str_from_a(a, "crew_id"),
+            bayan_json_v_obj_set_a(a, obj, AGN_JK_CREW_ID,
             bayan_json_v_str_new_a(a, agnosai_crew_state_crew_id(c)));
-            bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"),
+            bayan_json_v_obj_set_a(a, obj, AGN_JK_STATUS,
             bayan_json_v_str_new_a(a,
             _agnosai_route_status_debug_a(a, agnosai_crew_state_status(c))));
-            bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_count"),
+            bayan_json_v_obj_set_a(a, obj, AGN_JK_TASK_COUNT,
             bayan_json_v_int_new_a(a, vec_len(agnosai_crew_state_results(c))));
 
             var prof = agnosai_crew_state_profile(c);
@@ -88,9 +115,9 @@ fn agnosai_route_crew_history_a(a, state): i64 {
                 wall = agnosai_crew_profile_wall_ms(prof);
                 micro = agnosai_crew_profile_cost_micro_usd(prof);
             }
-            bayan_json_v_obj_set_a(a, obj, str_from_a(a, "wall_ms"),
+            bayan_json_v_obj_set_a(a, obj, AGN_JK_WALL_MS,
             bayan_json_v_int_new_a(a, wall));
-            bayan_json_v_obj_set_a(a, obj, str_from_a(a, "cost_usd"),
+            bayan_json_v_obj_set_a(a, obj, AGN_JK_COST_USD,
             bayan_json_v_float_new_a(a, agnosai_micro_usd_to_f64(micro)));
             bayan_json_v_arr_push_a(a, arr, obj);
         }
@@ -121,34 +148,30 @@ fn agnosai_route_agent_performance_a(a, state): i64 {
     var ids = agnosai_orchestrator_crew_ids_a(a, o);
     var seen = map_new_str_a(a);
     var arr = bayan_json_v_arr_new_a(a);
-    var k_agent = str_from_a(a, "agent");
-    var k_name = str_from_a(a, "agent_name");
-    var k_role = str_from_a(a, "agent_role");
-
     for (var i = 0; i < vec_len(ids); i = i + 1) {
         var c = agnosai_orchestrator_crew(o, vec_get(ids, i));
         if (c != 0) {
             var results = agnosai_crew_state_results(c);
             for (var j = 0; j < vec_len(results); j = j + 1) {
                 var meta = agnosai_task_result_metadata(vec_get(results, j));
-                var key = _agnosai_route_meta_str_a(a, meta, k_agent);
+                var key = _agnosai_route_meta_str_a(a, meta, AGN_JK_AGENT);
                 # The oracle's `if let Some(agent_key) = .. && seen.insert(..)`:
                 # no agent key, or one already recorded, contributes nothing.
                 if (str_len(key) > 0 && map_has(seen, key) == 0) {
                     map_set(seen, str_clone_a(a, key), 1);
                     var obj = bayan_json_v_obj_new_a(a);
-                    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "agent_key"),
+                    bayan_json_v_obj_set_a(a, obj, AGN_JK_AGENT_KEY,
                     bayan_json_v_str_new_a(a, key));
 
-                    var name = _agnosai_route_meta_str_a(a, meta, k_name);
+                    var name = _agnosai_route_meta_str_a(a, meta, AGN_JK_AGENT_NAME);
                     if (str_len(name) == 0) { name = key; }
-                    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "name"),
+                    bayan_json_v_obj_set_a(a, obj, AGN_JK_NAME,
                     bayan_json_v_str_new_a(a, name));
-                    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "role"),
+                    bayan_json_v_obj_set_a(a, obj, AGN_JK_ROLE,
                     bayan_json_v_str_new_a(a,
-                    _agnosai_route_meta_str_a(a, meta, k_role)));
+                    _agnosai_route_meta_str_a(a, meta, AGN_JK_AGENT_ROLE)));
                     # Hardcoded 0 in the oracle. See the fn header.
-                    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "tool_count"),
+                    bayan_json_v_obj_set_a(a, obj, AGN_JK_TOOL_COUNT,
                     bayan_json_v_int_new_a(a, 0));
                     bayan_json_v_arr_push_a(a, arr, obj);
                 }
@@ -178,10 +201,10 @@ fn agnosai_route_agent_performance(state): i64 {
 # `map_get`, and `bayan_json_v_obj_get` — which is what the shape of the
 # surrounding code invites — silently finds nothing.
 fn _agnosai_route_meta_str_a(a, meta, key: Str): Str {
-    if (meta == 0) { return str_from_a(a, ""); }
+    if (meta == 0) { return AGN_JV_EMPTY; }
     var v = map_get(meta, key);
-    if (v == 0) { return str_from_a(a, ""); }
-    if (bayan_json_v_is_str(v) == 0) { return str_from_a(a, ""); }
+    if (v == 0) { return AGN_JV_EMPTY; }
+    if (bayan_json_v_is_str(v) == 0) { return AGN_JV_EMPTY; }
     return bayan_json_v_str(v);
 }
 

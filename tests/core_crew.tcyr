@@ -54,7 +54,7 @@ fn _t_crew_json_keys_are_hoisted(): i64 {
     var v = agnosai_crew_state_to_value_a(ar, st);
     assert(bayan_json_v_obj_key(v, 0) == AGN_JK_CREW_ID,
     "the crew_id key in the built object IS the global — not a copy of it");
-    assert(bayan_json_v_obj_key(v, 1) == AGN_JK_CSTATUS, "...and status");
+    assert(bayan_json_v_obj_key(v, 1) == AGN_JK_STATUS, "...and status");
     assert(bayan_json_v_obj_key(v, 2) == AGN_JK_RESULTS, "...and results");
     assert(bayan_json_v_obj_key(v, 3) == AGN_JK_PROFILE, "...and profile");
 
@@ -68,6 +68,47 @@ fn _t_crew_json_keys_are_hoisted(): i64 {
 
     assert(str_eq_cstr(AGN_JK_CREW_ID, "crew_id") == 1, "and the spelling is the wire key");
     assert(str_eq_cstr(AGN_JK_TASK_ID, "task_id") == 1, "...for task.cyr too");
+    return 0;
+}
+
+# The wire **values** are hoisted the same way the keys are, and need the same
+# exact assertion for the same reason: a status spelling re-minted per call is
+# one 16-byte allocation, invisible to any byte bound, and the only difference
+# a caller can observe is the pointer.
+#
+# These also pin the sharing. `core/json.cyr` deliberately holds ONE `"completed"`
+# for the crew status, the task status and the agent state — so if a later edit
+# gives any of them a private copy, the identity here fails even though every
+# spelling still matches. That is the point: one literal, one `Str`.
+fn _t_wire_values_are_hoisted(): i64 {
+    var ar = arena_allocator(4096);
+    assert(agnosai_crew_status_to_wire_a(ar, AGNOSAI_CREW_COMPLETED) == AGN_JV_COMPLETED,
+    "a crew status IS the global, not a fresh Str");
+    assert(agnosai_crew_status_to_wire_a(ar, AGNOSAI_CREW_PENDING) == AGN_JV_PENDING,
+    "...including the fall-through arm");
+    assert(agnosai_task_status_to_wire_a(ar, AGNOSAI_STATUS_COMPLETED) == AGN_JV_COMPLETED,
+    "a task status is the SAME global the crew status uses");
+    assert(agnosai_task_risk_to_wire_a(ar, AGNOSAI_RISK_HIGH) == AGN_JV_HIGH,
+    "risk likewise");
+    assert(agnosai_task_priority_to_wire_a(ar, AGNOSAI_PRIORITY_HIGH) == AGN_JV_HIGH,
+    "...and priority shares risk's `high`");
+
+    # The arena is the proof that nothing was drawn from it: had any arm called
+    # `str_from_a`, this would be non-zero.
+    assert_eq(arena_used(allocator_state(ar)), 0,
+    "five wire lookups allocate nothing at all");
+
+    # The bare forms delegate through `default_alloc()`, so they answer the same
+    # pointers — this is what stops the crew_runner event path from leaking a
+    # spelling per task onto the no-free global bump.
+    assert(agnosai_crew_status_to_wire(AGNOSAI_CREW_FAILED) == AGN_JV_FAILED,
+    "the bare form answers the global too");
+    assert(agnosai_task_status_to_wire(AGNOSAI_STATUS_CANCELLED) == AGN_JV_CANCELLED,
+    "...for tasks as well");
+
+    # Spelling is still the wire's, not just a shared pointer.
+    assert(str_eq_cstr(AGN_JV_COMPLETED, "completed") == 1, "and the spelling is snake_case");
+    assert(str_eq_cstr(AGN_JV_HIGH, "high") == 1, "...for the shared `high` too");
     return 0;
 }
 
@@ -221,7 +262,6 @@ fn main() {
     "nested profile cost survives");
     assert_eq(agnosai_crew_state_from_value(bayan_json_v_obj_new()), 0, "state without a crew_id is rejected");
 
-
     # =====================================================================
     # [6.5.5] the whole core group on one arena
     #
@@ -271,7 +311,6 @@ fn main() {
     assert_eq(alloc_used() - g_pb, 0,
     "a profile carrying all three maps serializes with zero global growth");
 
-
     # [6.5.5] crew's remaining `_a` forms agree with their global twins.
     var cw_ar = arena_allocator(262144);
     assert_eq(str_eq(agnosai_crew_status_to_wire_a(cw_ar, AGNOSAI_CREW_FAILED),
@@ -290,6 +329,7 @@ fn main() {
     assert_eq(str_eq(bayan_json_v_build(_agnosai_int_map_to_value_a(cw_ar, cw_im)),
     bayan_json_v_build(_agnosai_int_map_to_value(cw_im))), 1, "int_map_to_value_a agrees");
     _t_crew_json_keys_are_hoisted();
+    _t_wire_values_are_hoisted();
 
     return assert_summary();
 }

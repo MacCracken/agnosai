@@ -430,6 +430,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`GET /api/v1/dashboard/crews` 6,881 → 5,217 ns (−24%) and 160 → 112
+  allocations (−30%); `/dashboard/agents` −17%, `/mcp` −14%.** The wire
+  *values* and the remaining serialiser keys are minted once, like the crew
+  keys before them.
+
+  The previous bite hoisted fifteen keys off `crew_state_to_value_a`. This one
+  found the rest by measuring what an allocation actually costs and then
+  counting them, rather than by grepping for literals.
+
+  **`alloc_via` is 15.1 ns**, whatever it is handed — measured against a 16 ns
+  `reset_via` control, ten allocations per iteration. `arena_alloc`'s fast path
+  is about eight instructions, so that is the vtable call chain, not the bump.
+  A `str_from_a(a, "completed")` is one of those plus a 16-byte header.
+
+  **Counting them exactly**, with a counting allocator wrapped around the
+  arena's vtable (`allocator_new(&counting_alloc, .., arena)`):
+
+  | route | allocs before | after | bytes before | after |
+  |---|---|---|---|---|
+  | `GET /api/v1/dashboard/crews` | 160 | **112** | 4,160 | 3,392 |
+  | `GET /api/v1/crews/{id}` | 62 | **59** | 2,112 | 2,064 |
+  | `POST /mcp` `tools/list` | 45 | **40** | 1,596 | 1,516 |
+  | `agnosai_route_resolve_a` alone | 3 | 3 | 48 | 48 |
+
+  The dashboard's 48 are the whole story: it renders one object per registered
+  crew, and six literals sat in that loop body — five keys and a status
+  spelling — so the eight-crew fixture paid them eight times.
+
+  Timings, `benches/server.bcyr` (arena arm / global arm):
+
+  | route | before | after | |
+  |---|---|---|---|
+  | `dashboard_crews` | 6,881 / 8,963 | **5,217 / 6,828** | −24% / −24% |
+  | `dashboard_agents` | 9,874 / 12,172 | **8,187 / 9,935** | −17% / −18% |
+  | `mcp` | 3,345 / 4,923 | **2,870 / 4,276** | −14% / −13% |
+  | `approvals_post` | 2,441 / 3,162 | **2,343 / 2,968** | −4% / −6% |
+  | `get_crew` | 2,591 / 3,724 | **2,492 / 3,537** | −4% / −5% |
+  | `definitions` | 1,972 / 2,751 | **1,933 / 2,660** | −2% / −3% |
+
+  `route_resolve` (332 → 338–346 across four runs) and `tools_arena` (1,645 →
+  1,636–1,648) touch none of this and moved inside their own run-to-run range.
+
+  **The scope rule is "a literal on a per-item path", not "a literal".** The
+  tree has 338 `str_from_a(a, "…")` sites over 237 distinct strings; this
+  changes the ones a loop body or an unconditional envelope reaches, and leaves
+  every error *message* inline — those are built at most once per request, and
+  only for a request that already failed. `AGN_JK_ERROR` is the one failure-path
+  exception, because the *key* is built for every error response and the
+  unauthenticated 404 scan controls that rate.
+
+  This is still not the constant-return hoist `state.md` declines: that was 149
+  sites judged on bytes, for 2.5%, against 121 new symbols.
+
+  Placement follows Cyrius's single-pass resolution: shared vocabulary lives in
+  `core/json.cyr` and `server/routes/mod.cyr`, the first include of each tier,
+  because a global defined beside its first user is invisible to any module
+  included earlier. One literal gets exactly one `Str` — `crew.cyr`'s
+  `AGN_JK_CSTATUS` was a second `"status"` and is folded into `AGN_JK_STATUS`,
+  and `mcp.cyr`'s `AGN_JV_TEXT` aliases `AGN_JK_TEXT` rather than allocating a
+  second `"text"`.
+
+  Pinned by pointer identity, which is the only exact assertion available here —
+  a re-minted spelling is 16 bytes and invisible to any byte bound.
+  `_t_wire_values_are_hoisted` asserts the built value *is* the global, that
+  five wire lookups leave `arena_used` at 0, and that the crew status, the task
+  status and the agent state all answer the **same** `"completed"`. Six
+  mutations, six caught — including two where the spelling stays correct and
+  only the sharing breaks.
+
 - **`GET /api/v1/crews/{id}` 3,178 → 2,634 ns (−17%), and every serialising
   route gained with it.** The JSON keys are minted once instead of per object.
 

@@ -102,11 +102,52 @@ enum AgnosaiEdgeOff {
     AGN_EDGE_SIZE = 16;
 }
 
+# The wire vocabulary only the task serialisers emit. The statuses this file
+# shares with `agent` and `crew` — and the keys it shares with `crew` — live in
+# `core/json.cyr`, which is included first; see the banner there for why they
+# are hoisted at all and why the error-arm literals are not.
+var AGN_JV_LOW = str_from("low");
+var AGN_JV_MEDIUM = str_from("medium");
+var AGN_JV_HIGH = str_from("high");
+var AGN_JV_BACKGROUND = str_from("background");
+var AGN_JV_NORMAL = str_from("normal");
+var AGN_JV_CRITICAL = str_from("critical");
+var AGN_JV_DAG = str_from("dag");
+var AGN_JV_HIERARCHICAL = str_from("hierarchical");
+var AGN_JV_PARALLEL = str_from("parallel");
+var AGN_JV_SEQUENTIAL = str_from("sequential");
+
+# **A key is a compile-time constant, so allocating one per serialised object is
+# pure overhead.** Measured on `agnosai_task_result_to_value_a`: four keys were
+# ~29% of a four-field object's build time — 430 ns against 314 hoisted.
+#
+# These sit here, above every serialiser in the file, because Cyrius resolves in
+# a single pass: a global defined after its first use does not exist yet.
+var AGN_JK_TASK_ID = str_from("task_id");
+var AGN_JK_OUTPUT = str_from("output");
+var AGN_JK_STATUS = str_from("status");
+var AGN_JK_METADATA = str_from("metadata");
+var AGN_JK_MANAGER = str_from("manager");
+var AGN_JK_MAX_CONCURRENCY = str_from("max_concurrency");
+var AGN_JK_DESCRIPTION = str_from("description");
+var AGN_JK_EXPECTED_OUTPUT = str_from("expected_output");
+var AGN_JK_ASSIGNED_AGENT = str_from("assigned_agent");
+var AGN_JK_PRIORITY = str_from("priority");
+var AGN_JK_DEPENDENCIES = str_from("dependencies");
+var AGN_JK_CONTEXT = str_from("context");
+var AGN_JK_RISK = str_from("risk");
+var AGN_JK_OUTPUT_SCHEMA = str_from("output_schema");
+var AGN_JK_EDGES = str_from("edges");
+
 # The snake_case wire spelling of a risk level.
+#
+# `a` is unused — the answer is a process-lifetime `Str`, not a fresh
+# allocation. The parameter stays because the signature is the API and the bare
+# form below delegates through it.
 fn agnosai_task_risk_to_wire_a(a, risk): i64 {
-    if (risk == AGNOSAI_RISK_MEDIUM) { return str_from_a(a, "medium"); }
-    if (risk == AGNOSAI_RISK_HIGH) { return str_from_a(a, "high"); }
-    return str_from_a(a, "low");
+    if (risk == AGNOSAI_RISK_MEDIUM) { return AGN_JV_MEDIUM; }
+    if (risk == AGNOSAI_RISK_HIGH) { return AGN_JV_HIGH; }
+    return AGN_JV_LOW;
 }
 
 # The snake_case wire spelling of a risk level (global-allocator form).
@@ -124,11 +165,11 @@ fn agnosai_task_risk_from_wire(s: Str): i64 {
 
 # The snake_case wire spelling of a priority tier.
 fn agnosai_task_priority_to_wire_a(a, priority): i64 {
-    if (priority == AGNOSAI_PRIORITY_BACKGROUND) { return str_from_a(a, "background"); }
-    if (priority == AGNOSAI_PRIORITY_LOW) { return str_from_a(a, "low"); }
-    if (priority == AGNOSAI_PRIORITY_HIGH) { return str_from_a(a, "high"); }
-    if (priority == AGNOSAI_PRIORITY_CRITICAL) { return str_from_a(a, "critical"); }
-    return str_from_a(a, "normal");
+    if (priority == AGNOSAI_PRIORITY_BACKGROUND) { return AGN_JV_BACKGROUND; }
+    if (priority == AGNOSAI_PRIORITY_LOW) { return AGN_JV_LOW; }
+    if (priority == AGNOSAI_PRIORITY_HIGH) { return AGN_JV_HIGH; }
+    if (priority == AGNOSAI_PRIORITY_CRITICAL) { return AGN_JV_CRITICAL; }
+    return AGN_JV_NORMAL;
 }
 
 # The snake_case wire spelling of a priority tier (global-allocator form).
@@ -148,12 +189,12 @@ fn agnosai_task_priority_from_wire(s: Str): i64 {
 
 # The snake_case wire spelling of a lifecycle status.
 fn agnosai_task_status_to_wire_a(a, status): i64 {
-    if (status == AGNOSAI_STATUS_QUEUED) { return str_from_a(a, "queued"); }
-    if (status == AGNOSAI_STATUS_RUNNING) { return str_from_a(a, "running"); }
-    if (status == AGNOSAI_STATUS_COMPLETED) { return str_from_a(a, "completed"); }
-    if (status == AGNOSAI_STATUS_FAILED) { return str_from_a(a, "failed"); }
-    if (status == AGNOSAI_STATUS_CANCELLED) { return str_from_a(a, "cancelled"); }
-    return str_from_a(a, "pending");
+    if (status == AGNOSAI_STATUS_QUEUED) { return AGN_JV_QUEUED; }
+    if (status == AGNOSAI_STATUS_RUNNING) { return AGN_JV_RUNNING; }
+    if (status == AGNOSAI_STATUS_COMPLETED) { return AGN_JV_COMPLETED; }
+    if (status == AGNOSAI_STATUS_FAILED) { return AGN_JV_FAILED; }
+    if (status == AGNOSAI_STATUS_CANCELLED) { return AGN_JV_CANCELLED; }
+    return AGN_JV_PENDING;
 }
 
 # The snake_case wire spelling of a lifecycle status (global-allocator form).
@@ -227,24 +268,24 @@ fn agnosai_process_max_concurrency(p): i64 {
 # strings; the two data-carrying variants are externally tagged.
 fn agnosai_process_to_value_a(a, p): i64 {
     var kind = load64(p + AGN_PROC_KIND);
-    if (kind == AGNOSAI_PROCESS_DAG) { return bayan_json_v_str_new_a(a, str_from_a(a, "dag")); }
+    if (kind == AGNOSAI_PROCESS_DAG) { return bayan_json_v_str_new_a(a, AGN_JV_DAG); }
     if (kind == AGNOSAI_PROCESS_HIERARCHICAL) {
         var inner = bayan_json_v_obj_new_a(a);
         var mgr = load64(p + AGN_PROC_MANAGER);
-        bayan_json_v_obj_set_a(a, inner, str_from_a(a, "manager"), bayan_json_v_str_new_a(a, mgr));
+        bayan_json_v_obj_set_a(a, inner, AGN_JK_MANAGER, bayan_json_v_str_new_a(a, mgr));
         var outer = bayan_json_v_obj_new_a(a);
-        bayan_json_v_obj_set_a(a, outer, str_from_a(a, "hierarchical"), inner);
+        bayan_json_v_obj_set_a(a, outer, AGN_JV_HIERARCHICAL, inner);
         return outer;
     }
     if (kind == AGNOSAI_PROCESS_PARALLEL) {
         var pinner = bayan_json_v_obj_new_a(a);
         var cap = bayan_json_v_int_new_a(a, load64(p + AGN_PROC_MAX_CONCURRENCY));
-        bayan_json_v_obj_set_a(a, pinner, str_from_a(a, "max_concurrency"), cap);
+        bayan_json_v_obj_set_a(a, pinner, AGN_JK_MAX_CONCURRENCY, cap);
         var pouter = bayan_json_v_obj_new_a(a);
-        bayan_json_v_obj_set_a(a, pouter, str_from_a(a, "parallel"), pinner);
+        bayan_json_v_obj_set_a(a, pouter, AGN_JV_PARALLEL, pinner);
         return pouter;
     }
-    return bayan_json_v_str_new_a(a, str_from_a(a, "sequential"));
+    return bayan_json_v_str_new_a(a, AGN_JV_SEQUENTIAL);
 }
 
 # Global-allocator form of `agnosai_process_to_value_a`.
@@ -406,21 +447,21 @@ fn agnosai_task_output_schema(t): i64 {
 # of a response and the rest leaked.
 fn agnosai_task_to_value_a(a, t): i64 {
     var obj = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "id"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_ID,
     bayan_json_v_str_new_a(a, load64(t + AGN_TASK_ID)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "description"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_DESCRIPTION,
     bayan_json_v_str_new_a(a, load64(t + AGN_TASK_DESCRIPTION)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "expected_output"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_EXPECTED_OUTPUT,
     _agnosai_opt_str_to_value_a(a, load64(t + AGN_TASK_EXPECTED_OUTPUT)));
 
     var agent = load64(t + AGN_TASK_ASSIGNED_AGENT);
     var agent_v = bayan_json_v_null_a(a);
     if (agent != 0) { agent_v = bayan_json_v_str_new_a(a, agent); }
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "assigned_agent"), agent_v);
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_ASSIGNED_AGENT, agent_v);
 
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "priority"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_PRIORITY,
     bayan_json_v_str_new_a(a, agnosai_task_priority_to_wire_a(a, load64(t + AGN_TASK_PRIORITY))));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_STATUS,
     bayan_json_v_str_new_a(a, agnosai_task_status_to_wire_a(a, load64(t + AGN_TASK_STATUS))));
 
     var deps = load64(t + AGN_TASK_DEPENDENCIES);
@@ -428,15 +469,15 @@ fn agnosai_task_to_value_a(a, t): i64 {
     for (var i = 0; i < vec_len(deps); i = i + 1) {
         bayan_json_v_arr_push_a(a, deps_v, bayan_json_v_str_new_a(a, vec_get(deps, i)));
     }
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "dependencies"), deps_v);
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_DEPENDENCIES, deps_v);
 
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "context"), _agnosai_map_to_value_a(a, load64(t + AGN_TASK_CONTEXT)));
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "risk"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_CONTEXT, _agnosai_map_to_value_a(a, load64(t + AGN_TASK_CONTEXT)));
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_RISK,
     bayan_json_v_str_new_a(a, agnosai_task_risk_to_wire_a(a, load64(t + AGN_TASK_RISK))));
 
     var schema = load64(t + AGN_TASK_OUTPUT_SCHEMA);
     if (schema == 0) { schema = bayan_json_v_null_a(a); }
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "output_schema"), schema);
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_OUTPUT_SCHEMA, schema);
     return obj;
 }
 
@@ -570,23 +611,6 @@ fn agnosai_task_result_with_metadata(r, key: Str, value): i64 {
     return r;
 }
 
-# JSON keys for `agnosai_task_result_to_value_a`, minted once at startup.
-#
-# **A key is a compile-time constant, so allocating one per serialised object is
-# pure overhead.** `str_from_a` costs ~32 ns and a `Str` header each time;
-# measured, four keys were ~29% of a four-field object's build time (430 ns
-# against 314 with them hoisted). These point at static literals, so they are
-# process-lifetime and safe to share across threads and arenas alike.
-#
-# ⚠ This is **not** the constant-return hoist state.md declines. That one was
-# 149 `return str_from("lit")` sites for 2.5% of bytes and 121 new symbols;
-# these are four keys on the hottest serialiser in the tree, measured in time,
-# and every route that renders a task result pays them.
-var AGN_JK_TASK_ID = str_from("task_id");
-var AGN_JK_OUTPUT = str_from("output");
-var AGN_JK_STATUS = str_from("status");
-var AGN_JK_METADATA = str_from("metadata");
-
 # The result as a bayan JSON value, fields in declaration order.
 fn agnosai_task_result_to_value_a(a, r): i64 {
     var obj = bayan_json_v_obj_new_a(a);
@@ -688,7 +712,7 @@ fn agnosai_task_dag_to_value_a(a, d): i64 {
             agnosai_task_to_value_a(a, _agnosai_map_slot_val(tasks, i)));
         }
     }
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "tasks"), tasks_v);
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_TASKS, tasks_v);
 
     var edges = load64(d + AGN_DAG_EDGES);
     var edges_v = bayan_json_v_arr_new_a(a);
@@ -699,9 +723,9 @@ fn agnosai_task_dag_to_value_a(a, d): i64 {
         bayan_json_v_arr_push_a(a, pair, bayan_json_v_str_new_a(a, load64(e + AGN_EDGE_TO)));
         bayan_json_v_arr_push_a(a, edges_v, pair);
     }
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "edges"), edges_v);
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_EDGES, edges_v);
 
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "process"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_PROCESS,
     agnosai_process_to_value_a(a, load64(d + AGN_DAG_PROCESS)));
     return obj;
 }

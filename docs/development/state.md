@@ -230,7 +230,7 @@ test.
 
 **The whole tree is green, verified two ways on 2026-08-05.** `cyrius tests
 tests` completes and reports `66 passed, 0 failed` (suites, not assertions —
-see the counting note below), summing to **5,403 assertions passed, 0 failed,
+see the counting note below), summing to **5,559 assertions passed, 0 failed,
 0 suites unclean**.
 
 ⚠ **A note here previously said the full run "exceeds ~570 s and stalls in
@@ -240,16 +240,13 @@ on its own. It *is* slow, so the per-suite loop is still the faster way to work:
 `cyrius build tests/<name>.tcyr <out> && <out>`. The eight sandbox suites total
 ~75 s that way.
 
-Coverage `./scripts/check-coverage.sh 80` → **100% (1074/1074 fns)**. The
-denominator counts public symbols only — `_`-prefixed internals are excluded by
-design, which is why adding six of them moved it by one. **`cyrius coverage
---min 80` reads 99% and is wrong**; the corpus outgrew its buffer, see the
-warning below.
+Coverage `cyrius coverage --min 80` → **100% (1099/1099 fns)**. The denominator
+counts public symbols only — `_`-prefixed internals are excluded by design,
+which is why adding six of them moved it by one.
 
 ```sh
 cyrius tests tests          # 66 suites; each prints "N passed" with an "(N total)" suffix
-./scripts/check-coverage.sh 80   # the real gate — reads the whole corpus
-cyrius coverage --min 80    # its own CI step, but truncating on this tree
+cyrius coverage --min 80    # the gate, and its own CI step
 ```
 
 **There is deliberately no per-suite table here any more.** One existed and it
@@ -261,9 +258,12 @@ commands above are the authority. Counting gotcha if you sum by hand:
 plus a final `66 passed, 0 failed` line that counts **suites, not assertions** —
 sum only the suffixed lines.
 
-Corpus size: **1,082,744 bytes** of `.tcyr`. `cyrius coverage` had a fixed 1 MiB
+Corpus size: **1,125,915 bytes** of `.tcyr`. `cyrius coverage` had a fixed 1 MiB
 corpus buffer that silently under-reported past it; fixed upstream in **6.5.8**,
 so there is no corpus ceiling to work around and no local coverage script.
+Re-verified on 6.5.9 by the filing's own repro — padded to 1,765,916 bytes, well
+past the 1,376,773 that used to report 85% and 64/75 files, it still reads
+75/75 and 100%.
 
 ### Test-design decisions worth not re-deriving
 
@@ -391,6 +391,41 @@ once and hoisting would move an allocation onto the hot path. A naive
 Rust oracle for comparison: **863 unit + 2 integration + 1 doctest, all passing.**
 
 ## Benchmarks
+
+### The route-latency floor is `alloc_via`, and it is upstream — measured 2026-08-07
+
+Do not re-derive this. Every threaded route's remaining cost is dominated by the
+**number of allocations**, and `alloc_via` costs **15.1 ns** each — measured
+against a 16 ns `reset_via` control, ten per iteration, on 6.5.9.
+
+`arena_alloc`'s fast path is ~8 instructions, so that is not the bump; it is the
+five-call chain above it. `fncall2(load64(a), load64(a+32), size)` — the same
+work with the two accessor calls inlined — measures **10.0 ns**, and calling
+`arena_alloc(state, size)` directly measures **6.0 ns**. So ~9 of the 15 ns is
+plumbing. Filed upstream 2026-08-07 (`alloc-via-costs-15ns-and-two-thirds-of-it-is-call-plumbing`);
+agnosai cannot capture it locally because the allocations happen inside bayan
+and vec, not in `src/`.
+
+Counted exactly with a counting allocator wrapped around the arena's vtable:
+
+| route | allocations | `alloc_via` share of latency |
+|---|---|---|
+| `GET /api/v1/dashboard/crews` | 112 | 1,691 ns of 5,217 — **32%** |
+| `GET /api/v1/crews/{id}` | 59 | 891 ns of 2,492 — **36%** |
+| `POST /mcp` `tools/list` | 40 | 604 ns of 2,870 — 21% |
+| `agnosai_route_resolve_a` alone | 3 | 45 ns |
+
+Those counts are **post-hoist** and now structural: `bayan_json_v_obj_new_a` is
+three allocations on its own (node, vec struct, vec data) and each pair is two
+more, so a four-field object is eleven before any nesting. The response shapes
+are parity-fixed against the oracle, so the count cannot fall further without an
+ADR. **The next real win on these routes is the upstream one.**
+
+Two things that were measured and are *not* levers, so they need not be retried:
+the dispatch shell between `route_resolve_a` and the handler is **110 ns** (A/B
+in one arena: full dispatch 2,595 vs. resolve-plus-handler 2,485), and
+`bayan_json_v_obj_set_a` is already minimal — pair plus `vec_push`, no duplicate
+scan, and `vec_new_a` pre-sizes to capacity 16 so pushes never realloc.
 
 `benches/learning.bcyr` — the 10 shapes of `rust-old/benches/learning.rs`. First Cyrius numbers
 (x86_64 Linux, cyrius 6.5.2):
@@ -855,7 +890,7 @@ libro 2.8.4 arrives transitively via bote.
 | Remaining in M6 | nothing — bites 15c (SSE) and 16 (bind) both closed 2026-08-03 |
 | In progress | **M7 `sandbox`** — all eight modules ported; the 2026-08-04 audit's 43 findings all fixed 2026-08-05 |
 | Not started | M8 `fleet`, M9 `telemetry`, M10 `definitions` |
-| Gates | build OK · 1,697 symbols / 82 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot·corpus-warn clean · coverage **100% (1074/1074) via `scripts/check-coverage.sh`** — `cyrius coverage` reads 99% and is truncating |
+| Gates | build OK · 1,834 symbols / 82 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · coverage **100% (1099/1099)** via `cyrius coverage --min 80` |
 
 **The binary serves as of 2026-08-03**, and **drains on SIGINT/SIGTERM** as of
 the 6.5.6 bump the same day. `src/main.cyr` wires the state, installs a

@@ -66,27 +66,68 @@ var AGNOSAI_MCP_PROTOCOL_VERSION = "2025-03-26";
 var AGNOSAI_MCP_METHOD_NOT_FOUND = 0 - 32601;
 var AGNOSAI_MCP_INVALID_PARAMS = 0 - 32602;
 
+# The MCP wire vocabulary, minted once at startup. See the banner in
+# `core/json.cyr` for the measurement and the rule; `routes/mod.cyr` carries the
+# few this file shares with the rest of the tier.
+#
+# **The envelope is the reason this file has the most of them.** Every MCP reply
+# — success or error, every method — is wrapped in `{jsonrpc, id, result}`, so
+# those three keys and the `"2.0"` value are four allocations on the route's
+# unconditional path. The list handlers add per-item ones on top: `tools/list`
+# builds a name, description and inputSchema per registered tool, `prompts/list`
+# the same per agent definition.
+#
+# The JSON-RPC *messages* stay inline, like the rest of the tier's error arms.
+var AGN_JK_JSONRPC = str_from("jsonrpc");
+var AGN_JV_JSONRPC_20 = str_from("2.0");
+var AGN_JK_CODE = str_from("code");
+var AGN_JK_TYPE = str_from("type");
+var AGN_JK_TEXT = str_from("text");
+var AGN_JV_TEXT = AGN_JK_TEXT;
+var AGN_JK_CONTENT = str_from("content");
+var AGN_JK_IS_ERROR = str_from("isError");
+var AGN_JV_AGNOSAI = str_from("agnosai");
+var AGN_JK_VERSION = str_from("version");
+var AGN_JK_TOOLS = str_from("tools");
+var AGN_JK_PROMPTS = str_from("prompts");
+var AGN_JK_RESOURCES = str_from("resources");
+var AGN_JK_PROTOCOL_VERSION = str_from("protocolVersion");
+var AGN_JK_SERVER_INFO = str_from("serverInfo");
+var AGN_JK_CAPABILITIES = str_from("capabilities");
+var AGN_JV_OBJECT = str_from("object");
+var AGN_JK_PROPERTIES = str_from("properties");
+var AGN_JK_REQUIRED = str_from("required");
+var AGN_JK_INPUT_SCHEMA = str_from("inputSchema");
+var AGN_JK_ARGUMENTS = str_from("arguments");
+var AGN_JV_ARG_DESC = str_from("What this agent should be asked to do");
+var AGN_JV_USER = str_from("user");
+var AGN_JK_MESSAGES = str_from("messages");
+var AGN_JK_URI = str_from("uri");
+var AGN_JK_MIME_TYPE = str_from("mimeType");
+var AGN_JV_APPLICATION_JSON = str_from("application/json");
+var AGN_JK_CONTENTS = str_from("contents");
+
 # --- Envelope -------------------------------------------------------------
 
 # `JsonRpcResponse::success` — `result` present, `error` omitted.
 fn _agnosai_mcp_success(a, id, result): i64 {
     var o = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "jsonrpc"), bayan_json_v_str_new_a(a, str_from_a(a, "2.0")));
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "id"), id);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "result"), result);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_JSONRPC, bayan_json_v_str_new_a(a, AGN_JV_JSONRPC_20));
+    bayan_json_v_obj_set_a(a, o, AGN_JK_ID, id);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_RESULT, result);
     return o;
 }
 
 # `JsonRpcResponse::error` — `error` present, `result` omitted, `data` omitted.
 fn _agnosai_mcp_error(a, id, code, message: Str): i64 {
     var e = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, e, str_from_a(a, "code"), bayan_json_v_int_new_a(a, code));
-    bayan_json_v_obj_set_a(a, e, str_from_a(a, "message"), bayan_json_v_str_new_a(a, message));
+    bayan_json_v_obj_set_a(a, e, AGN_JK_CODE, bayan_json_v_int_new_a(a, code));
+    bayan_json_v_obj_set_a(a, e, AGN_JK_MESSAGE, bayan_json_v_str_new_a(a, message));
 
     var o = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "jsonrpc"), bayan_json_v_str_new_a(a, str_from_a(a, "2.0")));
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "id"), id);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "error"), e);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_JSONRPC, bayan_json_v_str_new_a(a, AGN_JV_JSONRPC_20));
+    bayan_json_v_obj_set_a(a, o, AGN_JK_ID, id);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_ERROR, e);
     return o;
 }
 
@@ -94,14 +135,14 @@ fn _agnosai_mcp_error(a, id, code, message: Str): i64 {
 # failures, which are JSON-RPC **successes** carrying `isError: true`.
 fn _agnosai_mcp_content(a, text: Str, is_error): i64 {
     var item = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, item, str_from_a(a, "type"), bayan_json_v_str_new_a(a, str_from_a(a, "text")));
-    bayan_json_v_obj_set_a(a, item, str_from_a(a, "text"), bayan_json_v_str_new_a(a, text));
+    bayan_json_v_obj_set_a(a, item, AGN_JK_TYPE, bayan_json_v_str_new_a(a, AGN_JV_TEXT));
+    bayan_json_v_obj_set_a(a, item, AGN_JK_TEXT, bayan_json_v_str_new_a(a, text));
     var arr = bayan_json_v_arr_new_a(a);
     bayan_json_v_arr_push_a(a, arr, item);
 
     var o = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "content"), arr);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "isError"), bayan_json_v_bool_new_a(a, is_error));
+    bayan_json_v_obj_set_a(a, o, AGN_JK_CONTENT, arr);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_IS_ERROR, bayan_json_v_bool_new_a(a, is_error));
     return o;
 }
 
@@ -111,33 +152,33 @@ fn _agnosai_mcp_initialize(a, id): i64 {
     var info = bayan_json_v_obj_new_a(a);
     # `"agnosai"`, NOT bote's `"bote"` — the reason this module does not
     # delegate. See the header.
-    bayan_json_v_obj_set_a(a, info, str_from_a(a, "name"), bayan_json_v_str_new_a(a, str_from_a(a, "agnosai")));
-    bayan_json_v_obj_set_a(a, info, str_from_a(a, "version"),
+    bayan_json_v_obj_set_a(a, info, AGN_JK_NAME, bayan_json_v_str_new_a(a, AGN_JV_AGNOSAI));
+    bayan_json_v_obj_set_a(a, info, AGN_JK_VERSION,
     bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_VERSION)));
 
     # `"capabilities": {"tools": {}}` — an empty object, not null and not
     # absent. A client reads the presence of the `tools` key as the capability.
     var caps = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, caps, str_from_a(a, "tools"), bayan_json_v_obj_new_a(a));
+    bayan_json_v_obj_set_a(a, caps, AGN_JK_TOOLS, bayan_json_v_obj_new_a(a));
     # `prompts` on the same terms as `resources` below: advertised because it is
     # answered. `listChanged` is deliberately absent — definitions can be added
     # by `POST /api/v1/agents/definitions` at any time and nothing here can push
     # a `notifications/prompts/list_changed`, so claiming it would leave a client
     # waiting for a notification that never comes.
-    bayan_json_v_obj_set_a(a, caps, str_from_a(a, "prompts"), bayan_json_v_obj_new_a(a));
+    bayan_json_v_obj_set_a(a, caps, AGN_JK_PROMPTS, bayan_json_v_obj_new_a(a));
     # `resources` alongside it (roadmap B1, [ADR 015]). **Advertised only
     # because it is answered** — a capability key is a promise a client acts on,
     # so it goes in exactly when `resources/list` and `resources/read` do, and
     # `subscribe` is deliberately absent from it: nothing here can push a
     # `notifications/resources/updated`, and claiming otherwise leaves a client
     # waiting for an event that never comes.
-    bayan_json_v_obj_set_a(a, caps, str_from_a(a, "resources"), bayan_json_v_obj_new_a(a));
+    bayan_json_v_obj_set_a(a, caps, AGN_JK_RESOURCES, bayan_json_v_obj_new_a(a));
 
     var r = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, r, str_from_a(a, "protocolVersion"),
+    bayan_json_v_obj_set_a(a, r, AGN_JK_PROTOCOL_VERSION,
     bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_MCP_PROTOCOL_VERSION)));
-    bayan_json_v_obj_set_a(a, r, str_from_a(a, "serverInfo"), info);
-    bayan_json_v_obj_set_a(a, r, str_from_a(a, "capabilities"), caps);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_SERVER_INFO, info);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_CAPABILITIES, caps);
     return _agnosai_mcp_success(a, id, r);
 }
 
@@ -157,9 +198,9 @@ fn _agnosai_mcp_input_schema(a, schema): i64 {
     for (var i = 0; i < vec_len(params); i = i + 1) {
         var p = vec_get(params, i);
         var entry = bayan_json_v_obj_new_a(a);
-        bayan_json_v_obj_set_a(a, entry, str_from_a(a, "type"),
+        bayan_json_v_obj_set_a(a, entry, AGN_JK_TYPE,
         bayan_json_v_str_new_a(a, agnosai_param_schema_type(p)));
-        bayan_json_v_obj_set_a(a, entry, str_from_a(a, "description"),
+        bayan_json_v_obj_set_a(a, entry, AGN_JK_DESCRIPTION,
         bayan_json_v_str_new_a(a, agnosai_param_schema_description(p)));
         bayan_json_v_obj_set_a(a, props, agnosai_param_schema_name(p), entry);
         if (agnosai_param_schema_required(p) == 1) {
@@ -168,9 +209,9 @@ fn _agnosai_mcp_input_schema(a, schema): i64 {
     }
 
     var s = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, s, str_from_a(a, "type"), bayan_json_v_str_new_a(a, str_from_a(a, "object")));
-    bayan_json_v_obj_set_a(a, s, str_from_a(a, "properties"), props);
-    bayan_json_v_obj_set_a(a, s, str_from_a(a, "required"), required);
+    bayan_json_v_obj_set_a(a, s, AGN_JK_TYPE, bayan_json_v_str_new_a(a, AGN_JV_OBJECT));
+    bayan_json_v_obj_set_a(a, s, AGN_JK_PROPERTIES, props);
+    bayan_json_v_obj_set_a(a, s, AGN_JK_REQUIRED, required);
     return s;
 }
 
@@ -180,15 +221,15 @@ fn _agnosai_mcp_tools_list(a, id, state): i64 {
     for (var i = 0; i < vec_len(schemas); i = i + 1) {
         var sc = vec_get(schemas, i);
         var t = bayan_json_v_obj_new_a(a);
-        bayan_json_v_obj_set_a(a, t, str_from_a(a, "name"),
+        bayan_json_v_obj_set_a(a, t, AGN_JK_NAME,
         bayan_json_v_str_new_a(a, agnosai_tool_schema_name(sc)));
-        bayan_json_v_obj_set_a(a, t, str_from_a(a, "description"),
+        bayan_json_v_obj_set_a(a, t, AGN_JK_DESCRIPTION,
         bayan_json_v_str_new_a(a, agnosai_tool_schema_description(sc)));
-        bayan_json_v_obj_set_a(a, t, str_from_a(a, "inputSchema"), _agnosai_mcp_input_schema(a, sc));
+        bayan_json_v_obj_set_a(a, t, AGN_JK_INPUT_SCHEMA, _agnosai_mcp_input_schema(a, sc));
         bayan_json_v_arr_push_a(a, arr, t);
     }
     var r = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, r, str_from_a(a, "tools"), arr);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_TOOLS, arr);
     return _agnosai_mcp_success(a, id, r);
 }
 
@@ -274,23 +315,23 @@ var AGNOSAI_MCP_PROMPT_ARG = "task";
 # surfaces rather than a per-surface naming scheme.
 fn _agnosai_mcp_prompt_of(a, def): i64 {
     var o = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "name"),
+    bayan_json_v_obj_set_a(a, o, AGN_JK_NAME,
     bayan_json_v_str_new_a(a, agnosai_agent_key(def)));
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "description"),
+    bayan_json_v_obj_set_a(a, o, AGN_JK_DESCRIPTION,
     bayan_json_v_str_new_a(a, agnosai_agent_role(def)));
 
     var arg = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, arg, str_from_a(a, "name"),
+    bayan_json_v_obj_set_a(a, arg, AGN_JK_NAME,
     bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_MCP_PROMPT_ARG)));
-    bayan_json_v_obj_set_a(a, arg, str_from_a(a, "description"),
-    bayan_json_v_str_new_a(a, str_from_a(a, "What this agent should be asked to do")));
+    bayan_json_v_obj_set_a(a, arg, AGN_JK_DESCRIPTION,
+    bayan_json_v_str_new_a(a, AGN_JV_ARG_DESC));
     # **Optional.** The persona is useful on its own; a client that wants the
     # agent's framing without a specific task should not have to invent one.
-    bayan_json_v_obj_set_a(a, arg, str_from_a(a, "required"),
+    bayan_json_v_obj_set_a(a, arg, AGN_JK_REQUIRED,
     bayan_json_v_bool_new_a(a, 0));
     var args = bayan_json_v_arr_new_a(a);
     bayan_json_v_arr_push_a(a, args, arg);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "arguments"), args);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_ARGUMENTS, args);
     return o;
 }
 
@@ -302,7 +343,7 @@ fn _agnosai_mcp_prompts_list(a, id, state): i64 {
         bayan_json_v_arr_push_a(a, arr, _agnosai_mcp_prompt_of(a, vec_get(defs, i)));
     }
     var r = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, r, str_from_a(a, "prompts"), arr);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_PROMPTS, arr);
     return _agnosai_mcp_success(a, id, r);
 }
 
@@ -343,26 +384,26 @@ fn _agnosai_mcp_prompts_get(a, id, params, state): i64 {
     }
 
     var content = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, content, str_from_a(a, "type"),
-    bayan_json_v_str_new_a(a, str_from_a(a, "text")));
-    bayan_json_v_obj_set_a(a, content, str_from_a(a, "text"),
+    bayan_json_v_obj_set_a(a, content, AGN_JK_TYPE,
+    bayan_json_v_str_new_a(a, AGN_JV_TEXT));
+    bayan_json_v_obj_set_a(a, content, AGN_JK_TEXT,
     bayan_json_v_str_new_a(a, str_builder_build_a(a, sb)));
 
     var msg = bayan_json_v_obj_new_a(a);
     # **`user`, not `system`.** MCP's PromptMessage role is `user` or
     # `assistant` — there is no `system` — so the persona is delivered as the
     # opening user turn, which is what the spec's own examples do.
-    bayan_json_v_obj_set_a(a, msg, str_from_a(a, "role"),
-    bayan_json_v_str_new_a(a, str_from_a(a, "user")));
-    bayan_json_v_obj_set_a(a, msg, str_from_a(a, "content"), content);
+    bayan_json_v_obj_set_a(a, msg, AGN_JK_ROLE,
+    bayan_json_v_str_new_a(a, AGN_JV_USER));
+    bayan_json_v_obj_set_a(a, msg, AGN_JK_CONTENT, content);
 
     var msgs = bayan_json_v_arr_new_a(a);
     bayan_json_v_arr_push_a(a, msgs, msg);
 
     var r = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, r, str_from_a(a, "description"),
+    bayan_json_v_obj_set_a(a, r, AGN_JK_DESCRIPTION,
     bayan_json_v_str_new_a(a, agnosai_agent_role(def)));
-    bayan_json_v_obj_set_a(a, r, str_from_a(a, "messages"), msgs);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_MESSAGES, msgs);
     return _agnosai_mcp_success(a, id, r);
 }
 
@@ -389,13 +430,13 @@ fn _agnosai_mcp_resource_name(a, uri: Str): i64 {
 fn _agnosai_mcp_resource_of(a, def): i64 {
     var name = agnosai_agent_name(def);
     var o = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "uri"),
+    bayan_json_v_obj_set_a(a, o, AGN_JK_URI,
     bayan_json_v_str_new_a(a, str_cat_a(a, str_from_a(a, AGNOSAI_MCP_RESOURCE_PREFIX), name)));
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "name"), bayan_json_v_str_new_a(a, name));
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "description"),
+    bayan_json_v_obj_set_a(a, o, AGN_JK_NAME, bayan_json_v_str_new_a(a, name));
+    bayan_json_v_obj_set_a(a, o, AGN_JK_DESCRIPTION,
     bayan_json_v_str_new_a(a, agnosai_agent_role(def)));
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "mimeType"),
-    bayan_json_v_str_new_a(a, str_from_a(a, "application/json")));
+    bayan_json_v_obj_set_a(a, o, AGN_JK_MIME_TYPE,
+    bayan_json_v_str_new_a(a, AGN_JV_APPLICATION_JSON));
     return o;
 }
 
@@ -406,7 +447,7 @@ fn _agnosai_mcp_resources_list(a, id, state): i64 {
         bayan_json_v_arr_push_a(a, arr, _agnosai_mcp_resource_of(a, vec_get(defs, i)));
     }
     var r = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, r, str_from_a(a, "resources"), arr);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_RESOURCES, arr);
     return _agnosai_mcp_success(a, id, r);
 }
 
@@ -439,23 +480,23 @@ fn _agnosai_mcp_resources_read(a, id, params, state): i64 {
     }
 
     var item = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, item, str_from_a(a, "uri"), bayan_json_v_str_new_a(a, uri));
-    bayan_json_v_obj_set_a(a, item, str_from_a(a, "mimeType"),
-    bayan_json_v_str_new_a(a, str_from_a(a, "application/json")));
+    bayan_json_v_obj_set_a(a, item, AGN_JK_URI, bayan_json_v_str_new_a(a, uri));
+    bayan_json_v_obj_set_a(a, item, AGN_JK_MIME_TYPE,
+    bayan_json_v_str_new_a(a, AGN_JV_APPLICATION_JSON));
     # `text`, not an inline object: MCP's contents item carries the payload as a
     # string, so the definition is serialized rather than nested.
-    bayan_json_v_obj_set_a(a, item, str_from_a(a, "text"),
+    bayan_json_v_obj_set_a(a, item, AGN_JK_TEXT,
     bayan_json_v_str_new_a(a, bayan_json_v_build_a(a, agnosai_agent_to_value_a(a, def))));
 
     var arr = bayan_json_v_arr_new_a(a);
     bayan_json_v_arr_push_a(a, arr, item);
     var r = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, r, str_from_a(a, "contents"), arr);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_CONTENTS, arr);
     return _agnosai_mcp_success(a, id, r);
 }
 
 fn _agnosai_mcp_result_text(a, result): Str {
-    if (result == 0) { return str_from_a(a, ""); }
+    if (result == 0) { return AGN_JV_EMPTY; }
     if (bayan_json_v_is_str(result) == 1) { return bayan_json_v_str(result); }
     return bayan_json_v_build_a(a, result);
 }

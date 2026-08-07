@@ -58,6 +58,29 @@ var AGNOSAI_HTTP_CREATED = 201;
 # rejects a body, and three oracle tests assert it directly.
 var AGNOSAI_HTTP_UNPROCESSABLE = 422;
 
+# --- Shared route vocabulary ------------------------------------------------
+#
+# The keys and strings more than one route in this tier emits, minted **once at
+# startup**. `core/json.cyr` carries the same idea for the core serialisers and
+# its banner explains why: `alloc_via` costs 15.1 ns whatever it is handed, so a
+# literal on a per-request or per-item path is an allocation per request or item.
+#
+# This file is the tier's first include, so a global defined here is visible to
+# every route — which is the whole reason the shared ones live here rather than
+# beside their first user, where Cyrius's single-pass resolution would hide them
+# from any route included earlier.
+#
+# `AGN_JK_ERROR` is hoisted despite being on a failure path, unlike the *message*
+# literals the routes keep inline. The distinction is who controls the rate: a
+# message is built once for a request that already failed, but this key is built
+# for **every** error response, and `agnosai_route_error`'s own header names the
+# unauthenticated 404 scan as the arm least affordable as a leak.
+var AGN_JV_EMPTY = str_from("");
+var AGN_JK_ERROR = str_from("error");
+var AGN_JK_MESSAGE = str_from("message");
+var AGN_JK_ROLE = str_from("role");
+var AGN_JK_RESULT = str_from("result");
+
 # --- Response --------------------------------------------------------------
 
 enum AgnosaiRouteRespOff {
@@ -118,7 +141,7 @@ fn agnosai_route_is_text(r): i64 {
 # `Json(json!({"error": "..."}))` alongside a status.
 fn agnosai_route_error_a(a, status, message: Str): i64 {
     var obj = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "error"),
+    bayan_json_v_obj_set_a(a, obj, AGN_JK_ERROR,
     bayan_json_v_str_new_a(a, message));
     return agnosai_route_json_a(a, status, obj);
 }

@@ -22,6 +22,48 @@
 # keeps the structs allocation-free where a tagged Option would not.
 var AGNOSAI_NO_LIMIT = 0 - 1;
 
+# --- Hoisted wire vocabulary ------------------------------------------------
+#
+# The enum spellings and object keys that more than one core serialiser emits,
+# minted **once at startup** instead of once per serialisation.
+#
+# Measured, not assumed. `alloc_via` costs 15.1 ns whatever it is handed, so a
+# `str_from_a(a, "completed")` inside a per-item loop costs one allocation per
+# item on top of the JSON node it wraps. `GET /crews/{id}` makes 62 allocations
+# and `GET /api/v1/dashboard/crews` makes 160; the literals reached from a loop
+# body were a measurable share of both.
+#
+# **This is not the constant-return hoist state.md declines.** That proposal was
+# 149 sites judged on *bytes* — 2.5% — against 121 new symbols. These are judged
+# on *time*, and only where `benches/server.bcyr` shows the path is hot. The
+# error-arm literals beside them stay as they are: a 400's message is built at
+# most once per request, and only for a request that already failed.
+#
+# They live **here** rather than beside their serialisers because Cyrius resolves
+# in a single pass and `core/json.cyr` is the first of the group's includes —
+# `task`, `agent` and `crew` all spell the same statuses, and a global defined in
+# any one of them would be invisible to the ones included earlier. One literal,
+# one `Str`, one place to look.
+#
+# Safe to share: nothing mutates a wire string. Every consumer either `str_eq`s
+# it or wraps it in a JSON value, and a process-lifetime `Str` is strictly safer
+# than an arena one — it cannot dangle when the arena resets.
+var AGN_JV_PENDING = str_from("pending");
+var AGN_JV_QUEUED = str_from("queued");
+var AGN_JV_RUNNING = str_from("running");
+var AGN_JV_COMPLETED = str_from("completed");
+var AGN_JV_FAILED = str_from("failed");
+var AGN_JV_CANCELLED = str_from("cancelled");
+var AGN_JV_IDLE = str_from("idle");
+var AGN_JV_ASSIGNED = str_from("assigned");
+var AGN_JV_WORKING = str_from("working");
+var AGN_JV_BLOCKED = str_from("blocked");
+
+var AGN_JK_ID = str_from("id");
+var AGN_JK_NAME = str_from("name");
+var AGN_JK_TASKS = str_from("tasks");
+var AGN_JK_PROCESS = str_from("process");
+
 # An Option<String> as a JSON value: the string, or null when unset.
 #
 # **The `_a` form is the real body throughout this file; the bare name delegates
