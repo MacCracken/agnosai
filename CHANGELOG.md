@@ -395,6 +395,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **B3: every bare `str_from` that a loop actually *repeats* is gone — 27 → 3,
+  and the 3 are error `return`s that execute at most once.**
+
+  The roadmap carried "~49 in-loop `str_from` hoists" from a hand count. A
+  brace-tracking scan puts it at **46**, close enough that the estimate held —
+  but it splits into two classes that want different treatment, and B2 is what
+  separated them:
+
+  | | count | what it costs |
+  |---|---|---|
+  | bare `str_from` in a loop | **27** | 16 B on the **no-free global bump**, per iteration, forever |
+  | `str_from_a` in a loop | 19 | arena bytes, reclaimed at the next `reset_via` |
+
+  Only the first is a leak. **24 of the 27 are fixed.** The other three sit
+  inside loops but on `return` paths — a malformed OCI image name
+  (`sandbox/oci.cyr:250-251`) and the DAG-deadlock error
+  (`crew_runner.cyr:990`) — so they run once and hoisting them would move an
+  allocation off the error path onto the hot one. Left deliberately; a scan for
+  "`str_from` inside a loop" will keep finding them, and this is why.
+
+  The 19 arena-backed ones are left too, and the distinction is now recorded
+  rather than implied.
+
+  Fixed, by where they were:
+
+  - **`orchestrator/crew_runner` (11)** — three metadata keys per task *result*
+    in `_agnosai_crew_build_profile`, two more in `_agnosai_crew_record_metrics`,
+    the two event names in both the sequential loop and the concurrent wave, and
+    one constant in the output-validation retry loop. A 4-task run drops
+    **26,296 → 26,024 B** and an 8-task run **23,128 → 22,472** — ~82 B per
+    task, scaling with task count.
+  - **`server/routes/sse` (6)** — five on the lag/error arm, and one that
+    matters much more: `_agnosai_sse_event_json(fa, e, str_from(""))` runs
+    **once per streamed event** on a connection that may live for the whole
+    crew. Every other allocation in that loop was already threaded onto the
+    per-request arena and reset each iteration; this one was not, so it was the
+    single site in the SSE path that compounded without bound.
+  - **`tools/builtin/security_audit` (6)** — two keys per missing header, four
+    per vulnerability.
+  - **`sandbox/oci` (4)** — one flag per env pair and per volume in the
+    argv builder.
+
+  ⚠ **A single-iteration loop gets marginally worse** (+16 B), because the
+  hoist pays the same allocation once whether the loop runs or not. Measured: a
+  1-task crew run went 7,336 → 7,352. That is the correct trade — the cost is
+  constant while the saving scales — but it is worth stating rather than
+  implying the change is free everywhere.
+
 - **The audit hashing path builds into a scratch arena: a four-task crew run
   drops 33,008 → 26,296 bytes (−20%), and a record costs 2,432 → 496 bytes on
   the global bump.**
@@ -444,10 +492,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      grows an extra time and pays for a second chunk; above it the slack is dead
      weight.
 
-  **Parallel and DAG modes are deliberately left on the global allocator.** The
-  runner is shared across their worker threads, so `AGN_CR_SCRATCH` stays 0
-  there and `_agnosai_crew_audit` falls back — exactly the behaviour they had.
-  Threading them needs a per-worker scratch, which is a separate bite.
+  **Parallel and DAG modes keep the global-allocator fallback, and it turns out
+  nothing is owed there.** They do not audit per task at all —
+  `_agnosai_crew_audit_task` is called only from `_agnosai_crew_run_sequential`,
+  and the oracle has exactly one `audit_record` call site, in its own
+  `run_sequential` (`rust-old/src/orchestrator/crew_runner.rs:294`). So this is
+  **parity, not a gap**, and there is no per-worker scratch to write. The
+  `AGN_CR_SCRATCH`-stays-0 path is kept because the runner genuinely is shared
+  across those workers — if they ever gain a per-task audit, a scratch read off
+  it would be reset mid-hash by a sibling — but it is belt-and-braces today.
 
   **5 mutations applied, 5 caught — and a ratio threshold caught none of them.**
   Baseline 496 B; un-threading the mac buffer 528, the sign builder 584, the

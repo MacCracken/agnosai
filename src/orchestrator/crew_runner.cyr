@@ -577,6 +577,8 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
     # exponentially across retries — and drops the temperature to 0.1.
     var schema = agnosai_task_output_schema(task);
     if (schema != 0) {
+        # Hoisted out of the retry loop — a constant minted per attempt.
+        var k_failed_output = str_from("failed_output");
         for (var attempt = 1; attempt <= AGNOSAI_MAX_VALIDATION_RETRIES; attempt = attempt + 1) {
             if (err != 0) { break; }
 
@@ -592,7 +594,7 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
             # it is model output being fed to a model, which is an injection
             # vector the oracle closes here.
             var retry_prompt = agnosai_build_retry_prompt(original_prompt,
-            agnosai_prompt_sanitize(load64(&extracted), str_from("failed_output")), verr, schema);
+            agnosai_prompt_sanitize(load64(&extracted), k_failed_output), verr, schema);
 
             var retry_req = _agnosai_crew_build_request(task, agent,
             _agnosai_crew_select_model(agent), retry_prompt);
@@ -824,20 +826,23 @@ fn _agnosai_crew_run_sequential(r): i64 {
     var client = load64(r + AGN_CR_CLIENT);
     var results = vec_new();
 
+    # Two event names, minted once rather than once per task.
+    var ev_started = str_from("task_started");
+    var ev_completed = str_from("task_completed");
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
 
         var task = vec_get(tasks, i);
         var agent = _agnosai_crew_pick_best_agent(agents, task);
         agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
-        _agnosai_crew_emit(r, str_from("task_started"),
+        _agnosai_crew_emit(r, ev_started,
         _agnosai_crew_started_data(task, agent));
 
         agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
         var result = agnosai_execute_task(task, agent, client, load64(r + AGN_CR_EVENT_TX));
         agnosai_task_with_status(task, agnosai_task_result_status(result));
 
-        _agnosai_crew_emit(r, str_from("task_completed"), _agnosai_crew_completed_data(result));
+        _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data(result));
         _agnosai_crew_audit_task(r, task, result, agent);
         vec_push(results, result);
     }
@@ -859,6 +864,10 @@ fn _agnosai_crew_run_sequential(r): i64 {
 # per-token event only ever fires from the sequential path. Emitting from a
 # worker thread would also mean two threads racing on one channel.
 fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
+    # Minted once for the wave rather than once per task, as in the
+    # sequential path.
+    var ev_started = str_from("task_started");
+    var ev_completed = str_from("task_completed");
     var client = load64(r + AGN_CR_CLIENT);
     var spec = load64(r + AGN_CR_SPEC);
     var limit = agnosai_process_max_concurrency(agnosai_crew_process(spec));
@@ -870,7 +879,7 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         var task = vec_get(tasks, i);
         var agent = _agnosai_crew_pick_best_agent(agents, task);
         agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
-        _agnosai_crew_emit(r, str_from("task_started"),
+        _agnosai_crew_emit(r, ev_started,
         _agnosai_crew_started_data(task, agent));
 
         var job = alloc(AGN_CJ_SIZE);
@@ -907,7 +916,7 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         var jb = vec_get(jobs, k);
         var res = load64(jb + AGN_CJ_RESULT);
         agnosai_task_with_status(load64(jb + AGN_CJ_TASK), agnosai_task_result_status(res));
-        _agnosai_crew_emit(r, str_from("task_completed"), _agnosai_crew_completed_data(res));
+        _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data(res));
         vec_push(results, res);
     }
     return results;
@@ -1022,22 +1031,29 @@ fn _agnosai_crew_build_profile(r, results, wall_ms): i64 {
     agnosai_crew_profile_with_task_count(profile, vec_len(results));
 
     var total = 0;
+    # **Hoisted: three metadata keys, once instead of once per result.** Each
+    # `str_from` mints a 16-byte Str on the no-free global bump, so in a loop
+    # over a crew's results they are a permanent leak proportional to task
+    # count — for a constant that never changes.
+    var k_ms = str_from("task_duration_ms");
+    var k_cost = str_from("cost_micro_usd");
+    var k_agent = str_from("agent");
     for (var i = 0; i < vec_len(results); i = i + 1) {
         var res = vec_get(results, i);
         var md = agnosai_task_result_metadata(res);
         var task_id = agnosai_task_result_task_id(res);
 
-        var ms = map_get(md, str_from("task_duration_ms"));
+        var ms = map_get(md, k_ms);
         if (ms != 0 && bayan_json_v_is_int(ms) == 1) {
             agnosai_crew_profile_record_task_ms(profile, task_id, bayan_json_v_int(ms));
         }
 
-        var cost = map_get(md, str_from("cost_micro_usd"));
+        var cost = map_get(md, k_cost);
         if (cost != 0 && bayan_json_v_is_int(cost) == 1 && bayan_json_v_int(cost) > 0) {
             var c = bayan_json_v_int(cost);
             total = total + c;
             agnosai_crew_profile_record_task_cost(profile, task_id, c);
-            var agent = map_get(md, str_from("agent"));
+            var agent = map_get(md, k_agent);
             if (agent != 0 && bayan_json_v_is_str(agent) == 1) {
                 agnosai_crew_profile_record_agent_cost(profile, bayan_json_v_str(agent), c);
             }
@@ -1071,6 +1087,10 @@ fn _agnosai_crew_build_profile(r, results, wall_ms): i64 {
 # `cost_micro_usd` convention immediately below it.
 fn _agnosai_crew_record_metrics(results): i64 {
     var m = agnosai_metrics_global();
+    # Hoisted for the same reason as `_agnosai_crew_build_profile`'s keys: two
+    # constants that would otherwise be minted once per task result.
+    var k_tokens = str_from("tokens");
+    var k_cost_m = str_from("cost_micro_usd");
     for (var i = 0; i < vec_len(results); i = i + 1) {
         var res = vec_get(results, i);
         if (agnosai_task_result_status(res) == AGNOSAI_STATUS_COMPLETED) {
@@ -1081,13 +1101,13 @@ fn _agnosai_crew_record_metrics(results): i64 {
 
         var md = agnosai_task_result_metadata(res);
         var total_tokens = 0;
-        var tok = map_get(md, str_from("tokens"));
+        var tok = map_get(md, k_tokens);
         if (tok != 0 && bayan_json_v_is_obj(tok) == 1) {
             var t = bayan_json_v_obj_get(tok, "total");
             if (t != 0 && bayan_json_v_is_int(t) == 1) { total_tokens = bayan_json_v_int(t); }
         }
         var cost_micro = 0;
-        var c = map_get(md, str_from("cost_micro_usd"));
+        var c = map_get(md, k_cost_m);
         if (c != 0 && bayan_json_v_is_int(c) == 1 && bayan_json_v_int(c) > 0) {
             cost_micro = bayan_json_v_int(c);
         }

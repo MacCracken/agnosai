@@ -206,24 +206,29 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
             _agnosai_sse_warn("SSE: client lagged, closing stream", 34,
             "crew_id", 7, crew_id);
             var ld = bayan_json_v_obj_new_a(fa);
-            bayan_json_v_obj_set_a(fa, ld, str_from("event_type"),
-            bayan_json_v_str_new_a(fa, str_from("error")));
+            bayan_json_v_obj_set_a(fa, ld, str_from_a(fa, "event_type"),
+            bayan_json_v_str_new_a(fa, str_from_a(fa, "error")));
             var lb = str_builder_new_a(fa);
             str_builder_add_cstr_a(fa, lb, "stream lagged, ");
             str_builder_add_int_a(fa, lb, lag);
             str_builder_add_cstr_a(fa, lb, " events dropped");
-            bayan_json_v_obj_set_a(fa, ld, str_from("message"),
+            bayan_json_v_obj_set_a(fa, ld, str_from_a(fa, "message"),
             bayan_json_v_str_new_a(fa, str_builder_build_a(fa, lb)));
             var lj = bayan_json_v_build_a(fa, ld);
-            if (lj == 0) { lj = str_from("{\"event_type\":\"error\"}"); }
-            _agnosai_sse_frame(fa, cfd, str_from("error"), lj);
+            if (lj == 0) { lj = str_from_a(fa, "{\"event_type\":\"error\"}"); }
+            _agnosai_sse_frame(fa, cfd, str_from_a(fa, "error"), lj);
             break;
         }
 
         var e = agnosai_event_sub_try_recv(sub);
         if (e != 0) {
             var etype = agnosai_crew_event_event_type(e);
-            var j = _agnosai_sse_event_json(fa, e, str_from(""));
+            # **`str_from_a`, not `str_from`.** This runs once per streamed
+            # event on a connection that may live for the whole crew, so a bare
+            # `str_from` here mints 16 bytes on the no-free global bump per
+            # event — the one site in this loop where that compounds without
+            # bound. The arena is reset at the top of each iteration.
+            var j = _agnosai_sse_event_json(fa, e, str_from_a(fa, ""));
             if (str_len(j) == 0) {
                 _agnosai_sse_warn("SSE: failed to serialize event", 30,
                 "event_type", 10, etype);

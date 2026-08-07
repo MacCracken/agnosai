@@ -337,6 +337,29 @@ were caught by mutation, and all four generalise to any further threading:
    residual is the stronger statement and the one that is actually true: the
    handler half is zero, not merely small.
 
+### In-loop `str_from`: two classes, and three that stay
+
+B2 split what used to be one B3 item. A brace-tracking scan of `src/` finds
+`str_from` inside a `for`/`while` body in two forms:
+
+- **bare `str_from`** — 16 B on the no-free global bump per iteration, forever.
+  A real leak. 27 found, **24 fixed** (`crew_runner` 11, `routes/sse` 6,
+  `security_audit` 6, `sandbox/oci` 4, less the three below).
+- **`str_from_a`** — arena bytes, reclaimed at the next `reset_via`. 19 remain;
+  wasted work, not a leak, and worth far less than the first class.
+
+⚠ **Three bare ones stay on purpose.** `sandbox/oci.cyr:250-251` and
+`crew_runner.cyr:990` are inside loops but on `return` paths — they execute at
+most once, and hoisting them would move an allocation off an error path onto the
+hot one. A naive "`str_from` in a loop" scan will keep reporting them; this is
+the answer.
+
+**The one that mattered most was not the most numerous.**
+`routes/sse.cyr`'s `_agnosai_sse_event_json(fa, e, str_from(""))` ran once per
+streamed event on a connection that can live for a whole crew — every other
+allocation in that loop was already on the per-request arena and reset each
+iteration, so this was the single site there that compounded without bound.
+
 ### Harness rules
 
 - Shared helpers live in `tests/test_helpers.cyr`, all `_t_`-prefixed, so they can
@@ -715,10 +738,17 @@ Three constraints worth not re-deriving, each found by breaking something:
    **1,024 → 26,296** · 2,048 → 27,304 · 4,096 → 27,288. Too small pays for a
    second chunk; too large is dead weight.
 
-⏳ **Parallel and DAG modes are still on the global allocator**, deliberately —
-the runner is shared across their workers, so a scratch read off it would be
-reset mid-hash by another thread. They need a per-worker scratch, which is its
-own bite.
+⚠ **There is no per-worker scratch owed, and an earlier note here said there
+was.** Parallel and DAG modes do not audit per task **at all**:
+`_agnosai_crew_audit_task` is called only from `_agnosai_crew_run_sequential`,
+and the oracle matches — one `audit_record` call site, in its own
+`run_sequential` (`rust-old/src/orchestrator/crew_runner.rs:294`). **Parity, not
+a gap.**
+
+The `AGN_CR_SCRATCH`-stays-0 fallback in `_agnosai_crew_audit` is still correct
+and still worth keeping — the runner *is* shared across worker threads, so if
+those paths ever gain a per-task audit, reading a scratch off it would be reset
+mid-hash by a sibling. It is belt-and-braces rather than load-bearing today.
 
 ### The write routes split — every one is threaded, three keep a floor
 
