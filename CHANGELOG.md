@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The tree was silently building sakshi 2.4.7 while its pin shipped 2.4.8**,
+  reverting the `i64::MIN` decimal fix (`n = 0 - n` is a no-op there). Fixed at
+  the cause, in the manifests.
+
+  `sakshi` is in `[deps].stdlib`, so `cyrius lib sync --full` provisioned 2.4.8
+  correctly — and then **every `cyrius build` put 2.4.7 back**, because build
+  performs an implicit resolve.
+
+  The cause was *not* the siblings' vendored `lib/`, which is what
+  `check-clean.sh`'s comment had claimed since 2026-08-05 and what the shipped
+  gate therefore excused. sigil and bote declare **`[deps.sakshi]` in their own
+  manifests** at an older tag, and `cyrius deps` overlays that transitive
+  resolution on top of the snapshot. Proven by hashing every candidate source:
+  the file on disk matched `~/.cyrius/deps/sakshi/2.4.7/dist/sakshi.cyr`, not
+  any sibling's `lib/`.
+
+  - `[deps.sakshi]` bumped to **2.4.8** in sigil, bote and majra.
+  - agnosai now pins `[deps.sakshi] = "2.4.8"` itself, so a lagging sibling
+    cannot reintroduce the downgrade. majra already carried this pin for the
+    same reason; its manifest comment described the mechanism correctly.
+  - **The `sakshi.cyr` allowance is removed from `scripts/check-clean.sh`** —
+    its own stated exit condition ("delete when a plain `cyrius build` leaves
+    sakshi.cyr matching the snapshot") is met. Mutation-verified: restoring
+    2.4.7 makes the gate exit **1** on both `deps --verify` and the snapshot
+    check, and pointing the new pin at 2.4.7 reproduces the downgrade and the
+    shadow warning.
+
+  ⚠ `deps --verify` **cannot** catch this class on its own — the lock is written
+  *from disk*, so a downgraded file simply gets its downgraded hash recorded and
+  the check reports success. The snapshot diff is the only gate that sees it.
+
+  All seven siblings were bumped to the 6.5.10 toolchain and re-synced as part of
+  this (sigil 6.5.3, bote 6.5.4, kavach 6.5.5, ai-hwaccel 6.5.2, majra 6.4.83,
+  libro 6.4.83, tyche 6.2.11 → all 6.5.10), and all still pass: sigil 64, bote
+  14, kavach 2, tyche 1, ai-hwaccel 12/13, majra 3/4. **majra needed three
+  stdlib modules declared** — `dynlib`, `fdlopen`, `async` — which 6.5.10 no
+  longer supplies transitively; its remaining failure is `test_live.tcyr`, which
+  requires Redis on :6379 and PostgreSQL on :5432 (confirmed absent).
+  ai-hwaccel's is a pre-existing count assertion against its own uncommitted
+  `BACKEND_AGNOS_GPU` work, unrelated to the toolchain.
+
 - **cyrius 6.5.8: the submitted-crew thread no longer leaks, and the coverage
   gate is trustworthy again. Both were agnosai filings.**
 
@@ -429,6 +470,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secret.
 
 ### Performance
+
+- **cyrius 6.5.10 lands the `alloc_via` fix agnosai filed — every threaded
+  route gained 5–13%.** `alloc_via` **15.1 → 11.1 ns (−26%)**, `reset_via`
+  16 → 12.
+
+  Both suggestions from the filing shipped: `alloc_via` now inlines its two
+  accessor loads (`fncall2(load64(a), load64(a+32), size)`), and
+  `arena_allocator` registers `&arena_alloc` / `&arena_reset` directly instead
+  of the `_arena_*` trampolines. What remains — `alloc_via`'s own frame plus the
+  `fncall2` indirection — is inherent to a vtable: `arena_alloc` called directly
+  still measures 6.2 ns.
+
+  | route (arena arm) | 6.5.9 | 6.5.10 | |
+  |---|---|---|---|
+  | `mcp` | 2,867 | **2,486** | −13.3% |
+  | `tools` | 1,647 | **1,431** | −13.1% |
+  | `dashboard_crews` | 5,252 | **4,656** | −11.3% |
+  | `definitions` | 1,938 | **1,742** | −10.1% |
+  | `get_crew` | 2,479 | **2,245** | −9.4% |
+  | `dashboard_agents` | 8,271 | **7,793** | −5.8% |
+  | `approvals_post` | 2,334 | **2,198** | −5.8% |
+  | `approvals` | 1,303 | **1,231** | −5.5% |
+
+  **The global arm barely moved** (−0.3% to −4.4%, two rows up inside noise),
+  which is the internal check on the claim: it allocates through `alloc()`
+  directly and never touches the vtable, so only the arena arm should gain.
+
+  `GET /api/v1/crews/{id}` is now **2,245 ns**, down from 3,178 when this
+  sequence started — **−29%** across the key hoist, the value hoist and this.
 
 - **`GET /api/v1/dashboard/crews` 6,881 → 5,217 ns (−24%) and 160 → 112
   allocations (−30%); `/dashboard/agents` −17%, `/mcp` −14%.** The wire

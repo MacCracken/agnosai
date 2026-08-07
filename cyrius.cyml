@@ -5,7 +5,7 @@ description = "AgnosAI — provider-agnostic AI orchestration: crews, tasks, too
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/agnosai"
 language = "cyrius"
-cyrius = "6.5.9"
+cyrius = "6.5.10"
 
 [build]
 entry = "src/main.cyr"
@@ -62,6 +62,30 @@ git = "https://github.com/MacCracken/tyche.git"
 path = "../tyche"
 tag = "1.0.0"
 modules = ["dist/tyche.cyr"]
+
+# sakshi is a **transitive** requirement, and pinning it here is defensive.
+#
+# `sakshi` is already in `[deps].stdlib` above, so `cyrius lib sync --full`
+# provisions whatever the toolchain pin ships. But sigil and bote declare
+# `[deps.sakshi]` in *their* manifests, and `cyrius deps` overlays that
+# resolution on top of the snapshot — so a sibling pinned behind the toolchain
+# silently **downgrades** `lib/sakshi.cyr`, on every `cyrius build`, not just on
+# `deps`. The only signal is an unnamed "1 bundled lib(s) differ" shadow
+# warning, and `deps --verify` cannot catch it because the lock is written
+# *from disk* and simply records the downgraded file's hash.
+#
+# That is not hypothetical: under the 6.5.10 bump the tree built **2.4.7** while
+# the pin shipped 2.4.8, which silently reverted the `i64::MIN` integer-format
+# fix (`n = 0 - n` is a no-op at i64::MIN). sigil and bote are now on 2.4.8 too,
+# so this pin is redundant *today* — it exists so the next sibling that lags
+# cannot reintroduce the same silent downgrade. majra carries the identical pin
+# for the identical reason; see the comment on its `[deps.sakshi]`.
+#
+# **Keep this in step with the toolchain's bundled sakshi on every pin bump.**
+[deps.sakshi]
+git = "https://github.com/MacCracken/sakshi.git"
+tag = "2.4.8"
+modules = ["dist/sakshi.cyr"]
 
 [release]
 bins = ["agnosai"]

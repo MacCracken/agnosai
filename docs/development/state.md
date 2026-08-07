@@ -12,12 +12,29 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.6` (`cyrius.cyml`) — bumped 2026-08-03. Folds **sandhi 1.9.9**
-  (the stop facility agnosai filed), bayan 1.4.0, sigil 3.12.2, sakshi 2.4.7,
-  yukti 2.3.2, mabda 4.0.8. 6.5.6 also lands **`sys_exit_group`** and
-  **`async_await_readable_ms`**, both from agnosai filings.
+- **Cyrius pin**: `6.5.10` (`cyrius.cyml`) — bumped 2026-08-07. Folds **sakshi
+  2.4.8**, bayan 1.4.0, sigil 3.12.2, sandhi 1.9.9, yukti 2.3.2, mabda 4.0.8.
+  6.5.10 lands the **`alloc_via` fix agnosai filed** (see *Benchmarks*): 15.1 →
+  11.1 ns, worth 5–13% on every arena-threaded route.
+
+  **All seven siblings were bumped to 6.5.10 with it** (from sigil 6.5.3, bote
+  6.5.4, kavach 6.5.5, ai-hwaccel 6.5.2, majra 6.4.83, libro 6.4.83, tyche
+  6.2.11). majra needed `dynlib`, `fdlopen` and `async` added to its
+  `[deps].stdlib` — 6.5.10 no longer supplies them transitively via `sandhi`.
+
+  ⚠ **`[deps.sakshi]` is pinned explicitly in `cyrius.cyml`, and must move with
+  every toolchain bump.** `sakshi` being in `[deps].stdlib` is *not* sufficient:
+  sigil and bote declare `[deps.sakshi]` in their own manifests, `cyrius deps`
+  overlays that transitive resolution on top of the `lib sync --full` snapshot,
+  and `cyrius build` performs an implicit resolve — so a sibling pinned behind
+  the toolchain downgrades `lib/sakshi.cyr` on **every build**. That happened
+  under this bump (2.4.7 against a 2.4.8 pin, reverting the `i64::MIN` decimal
+  fix) and was invisible except as an unnamed "1 bundled lib(s) differ".
+  `deps --verify` cannot catch it — the lock is written *from disk*. The
+  `scripts/check-clean.sh` snapshot diff is the only gate that sees it, and its
+  `sakshi.cyr` allowance is now **removed**.
 - **`lib/` matches the pin exactly**: 0 of 106 stdlib files differ from
-  `~/.cyrius/versions/6.5.6/lib`; build and test emit no drift or shadow warning.
+  `~/.cyrius/versions/6.5.10/lib`; build and test emit no drift or shadow warning.
   The six files outside the snapshot (ai-hwaccel, bote-core, kavach, libro, majra,
   tyche) are declared git deps, not staleness.
 
@@ -392,34 +409,39 @@ Rust oracle for comparison: **863 unit + 2 integration + 1 doctest, all passing.
 
 ## Benchmarks
 
-### The route-latency floor is `alloc_via`, and it is upstream — measured 2026-08-07
+### The route-latency floor is `alloc_via` — measured 2026-08-07, largely fixed the same day
 
 Do not re-derive this. Every threaded route's remaining cost is dominated by the
-**number of allocations**, and `alloc_via` costs **15.1 ns** each — measured
-against a 16 ns `reset_via` control, ten per iteration, on 6.5.9.
+**number of allocations**, and each one costs an `alloc_via`.
 
-`arena_alloc`'s fast path is ~8 instructions, so that is not the bump; it is the
-five-call chain above it. `fncall2(load64(a), load64(a+32), size)` — the same
-work with the two accessor calls inlined — measures **10.0 ns**, and calling
-`arena_alloc(state, size)` directly measures **6.0 ns**. So ~9 of the 15 ns is
-plumbing. Filed upstream 2026-08-07 (`alloc-via-costs-15ns-and-two-thirds-of-it-is-call-plumbing`);
-agnosai cannot capture it locally because the allocations happen inside bayan
-and vec, not in `src/`.
+On **6.5.9** that was **15.1 ns** — measured against a 16 ns `reset_via` control,
+ten per iteration. `arena_alloc`'s fast path is ~8 instructions, so that was not
+the bump; it was the five-call chain above it. Filed upstream, and **6.5.10
+shipped both suggested fixes**: `alloc_via` now inlines its two accessor loads,
+and `arena_allocator` registers `&arena_alloc` / `&arena_reset` directly instead
+of the `_arena_*` trampolines.
+
+**On 6.5.10 `alloc_via` is 11.1 ns** (−26%), `reset_via` 12. The remainder is
+inherent to a vtable and not worth chasing: the hand-inlined
+`fncall2(load64(a), load64(a+32), size)` measures 8.9 and `arena_alloc(state,
+size)` called directly measures 6.2, so what is left is `alloc_via`'s own frame
+plus one indirect call. **Treat ~11 ns per allocation as the floor.**
 
 Counted exactly with a counting allocator wrapped around the arena's vtable:
 
-| route | allocations | `alloc_via` share of latency |
+| route | allocations | `alloc_via` share of latency (6.5.10) |
 |---|---|---|
-| `GET /api/v1/dashboard/crews` | 112 | 1,691 ns of 5,217 — **32%** |
-| `GET /api/v1/crews/{id}` | 59 | 891 ns of 2,492 — **36%** |
-| `POST /mcp` `tools/list` | 40 | 604 ns of 2,870 — 21% |
-| `agnosai_route_resolve_a` alone | 3 | 45 ns |
+| `GET /api/v1/dashboard/crews` | 112 | 1,243 ns of 4,656 — **27%** |
+| `GET /api/v1/crews/{id}` | 59 | 655 ns of 2,245 — **29%** |
+| `POST /mcp` `tools/list` | 40 | 444 ns of 2,486 — 18% |
+| `agnosai_route_resolve_a` alone | 3 | 33 ns |
 
 Those counts are **post-hoist** and now structural: `bayan_json_v_obj_new_a` is
 three allocations on its own (node, vec struct, vec data) and each pair is two
 more, so a four-field object is eleven before any nesting. The response shapes
 are parity-fixed against the oracle, so the count cannot fall further without an
-ADR. **The next real win on these routes is the upstream one.**
+ADR. With the upstream fix now landed, **there is no large lever left on these
+routes** — the remaining cost is the object graph the wire format requires.
 
 Two things that were measured and are *not* levers, so they need not be retried:
 the dispatch shell between `route_resolve_a` and the handler is **110 ns** (A/B
