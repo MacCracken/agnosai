@@ -42,6 +42,7 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [013](013-graceful-shutdown-via-signalfd-and-stop-flag.md) | Graceful shutdown via `signalfd` + sandhi's stop flag | Accepted |
 | [014](014-sse-stream-holds-a-pooled-worker.md) | An SSE stream holds a pooled worker for its whole life | Accepted |
 | [015](015-mcp-resources-project-agent-definitions.md) | MCP resources project agent definitions, and nothing else | Accepted |
+| [016](016-mcp-prompts-project-agent-personas.md) | MCP prompts project agent personas | Accepted |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`) and carry no `## Status` line. Left as written: renumbering

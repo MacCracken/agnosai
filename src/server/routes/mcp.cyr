@@ -119,6 +119,12 @@ fn _agnosai_mcp_initialize(a, id): i64 {
     # absent. A client reads the presence of the `tools` key as the capability.
     var caps = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, caps, str_from_a(a, "tools"), bayan_json_v_obj_new_a(a));
+    # `prompts` on the same terms as `resources` below: advertised because it is
+    # answered. `listChanged` is deliberately absent — definitions can be added
+    # by `POST /api/v1/agents/definitions` at any time and nothing here can push
+    # a `notifications/prompts/list_changed`, so claiming it would leave a client
+    # waiting for a notification that never comes.
+    bayan_json_v_obj_set_a(a, caps, str_from_a(a, "prompts"), bayan_json_v_obj_new_a(a));
     # `resources` alongside it (roadmap B1, [ADR 015]). **Advertised only
     # because it is answered** — a capability key is a promise a client acts on,
     # so it goes in exactly when `resources/list` and `resources/read` do, and
@@ -255,6 +261,111 @@ fn _agnosai_mcp_tools_call(a, id, params, state): i64 {
 # The URI scheme is `agnosai://agents/<name>`. `<name>` is the definition's map
 # key, so `resources/read` is a single `agnosai_app_state_definition_get` and
 # cannot walk anywhere the map does not already hold.
+# --- prompts (beyond the oracle — see ADR 016) ----------------------------
+
+# The optional `task` argument every projected prompt accepts.
+var AGNOSAI_MCP_PROMPT_ARG = "task";
+
+# One `prompts/list` entry for a stored agent definition.
+#
+# The prompt's **name is the agent key**, which is what
+# `POST /api/v1/agents/definitions` stores it under and what
+# `agnosai://agents/<name>` addresses — one identifier across all three
+# surfaces rather than a per-surface naming scheme.
+fn _agnosai_mcp_prompt_of(a, def): i64 {
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "name"),
+    bayan_json_v_str_new_a(a, agnosai_agent_key(def)));
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "description"),
+    bayan_json_v_str_new_a(a, agnosai_agent_role(def)));
+
+    var arg = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, arg, str_from_a(a, "name"),
+    bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_MCP_PROMPT_ARG)));
+    bayan_json_v_obj_set_a(a, arg, str_from_a(a, "description"),
+    bayan_json_v_str_new_a(a, str_from_a(a, "What this agent should be asked to do")));
+    # **Optional.** The persona is useful on its own; a client that wants the
+    # agent's framing without a specific task should not have to invent one.
+    bayan_json_v_obj_set_a(a, arg, str_from_a(a, "required"),
+    bayan_json_v_bool_new_a(a, 0));
+    var args = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, args, arg);
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "arguments"), args);
+    return o;
+}
+
+# `prompts/list` — one prompt per stored agent definition.
+fn _agnosai_mcp_prompts_list(a, id, state): i64 {
+    var defs = agnosai_app_state_definitions_a(a, state);
+    var arr = bayan_json_v_arr_new_a(a);
+    for (var i = 0; i < vec_len(defs); i = i + 1) {
+        bayan_json_v_arr_push_a(a, arr, _agnosai_mcp_prompt_of(a, vec_get(defs, i)));
+    }
+    var r = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, r, str_from_a(a, "prompts"), arr);
+    return _agnosai_mcp_success(a, id, r);
+}
+
+# `prompts/get` — the agent's own system prompt, optionally with a task appended.
+#
+# **The text is `_agnosai_crew_build_system_prompt`, not a second renderer.**
+# That is the whole point: an MCP client gets byte-for-byte the persona the crew
+# would give that agent, so what a client previews and what a crew executes
+# cannot drift. A separate template here would be a second source of truth for
+# the same string.
+fn _agnosai_mcp_prompts_get(a, id, params, state): i64 {
+    if (params == 0 || bayan_json_v_is_obj(params) == 0) {
+        return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
+        str_from_a(a, "params must be an object"));
+    }
+    var nv = bayan_json_v_obj_get(params, "name");
+    if (nv == 0 || bayan_json_v_is_str(nv) == 0) {
+        return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
+        str_from_a(a, "name is required"));
+    }
+    var def = agnosai_app_state_definition_get(state, bayan_json_v_str(nv));
+    if (def == 0) {
+        return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
+        str_from_a(a, "unknown prompt"));
+    }
+
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, _agnosai_crew_build_system_prompt(def));
+
+    # `arguments` is optional, and so is `task` within it.
+    var av = bayan_json_v_obj_get(params, "arguments");
+    if (av != 0 && bayan_json_v_is_obj(av) == 1) {
+        var tv = bayan_json_v_obj_get(av, AGNOSAI_MCP_PROMPT_ARG);
+        if (tv != 0 && bayan_json_v_is_str(tv) == 1 && str_len(bayan_json_v_str(tv)) > 0) {
+            str_builder_add_cstr_a(a, sb, "\n\nTask: ");
+            str_builder_add_a(a, sb, bayan_json_v_str(tv));
+        }
+    }
+
+    var content = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, content, str_from_a(a, "type"),
+    bayan_json_v_str_new_a(a, str_from_a(a, "text")));
+    bayan_json_v_obj_set_a(a, content, str_from_a(a, "text"),
+    bayan_json_v_str_new_a(a, str_builder_build_a(a, sb)));
+
+    var msg = bayan_json_v_obj_new_a(a);
+    # **`user`, not `system`.** MCP's PromptMessage role is `user` or
+    # `assistant` — there is no `system` — so the persona is delivered as the
+    # opening user turn, which is what the spec's own examples do.
+    bayan_json_v_obj_set_a(a, msg, str_from_a(a, "role"),
+    bayan_json_v_str_new_a(a, str_from_a(a, "user")));
+    bayan_json_v_obj_set_a(a, msg, str_from_a(a, "content"), content);
+
+    var msgs = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, msgs, msg);
+
+    var r = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, r, str_from_a(a, "description"),
+    bayan_json_v_str_new_a(a, agnosai_agent_role(def)));
+    bayan_json_v_obj_set_a(a, r, str_from_a(a, "messages"), msgs);
+    return _agnosai_mcp_success(a, id, r);
+}
+
 var AGNOSAI_MCP_RESOURCE_PREFIX = "agnosai://agents/";
 
 # The name half of `agnosai://agents/<name>`, or 0 when `uri` is not one of ours.
@@ -392,7 +503,14 @@ fn agnosai_route_mcp_a(a, state, body: Str): i64 {
         return agnosai_route_json_a(a, HTTP_OK,
         _agnosai_mcp_tools_call(a, id, bayan_json_v_obj_get(v, "params"), state));
     }
-    # Beyond the oracle's three — see ADR 015.
+    # Beyond the oracle's three — see ADR 015 and ADR 016.
+    if (str_eq_cstr(method, "prompts/list") == 1) {
+        return agnosai_route_json_a(a, HTTP_OK, _agnosai_mcp_prompts_list(a, id, state));
+    }
+    if (str_eq_cstr(method, "prompts/get") == 1) {
+        return agnosai_route_json_a(a, HTTP_OK,
+        _agnosai_mcp_prompts_get(a, id, bayan_json_v_obj_get(v, "params"), state));
+    }
     if (str_eq_cstr(method, "resources/list") == 1) {
         return agnosai_route_json_a(a, HTTP_OK, _agnosai_mcp_resources_list(a, id, state));
     }

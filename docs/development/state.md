@@ -261,19 +261,9 @@ commands above are the authority. Counting gotcha if you sum by hand:
 plus a final `66 passed, 0 failed` line that counts **suites, not assertions** —
 sum only the suffixed lines.
 
-Corpus size: **1,082,744 bytes** of `.tcyr`. This crossed `cyrius coverage`'s
-fixed 1 MiB corpus buffer on 2026-08-05 and the tool began under-reporting
-silently at exit 0 — it named two fully-covered files as carrying unreferenced
-functions. **Fixed upstream in cyrius 6.5.8** (four defects, including an
-off-by-one at the corpus end and `pub fn` being invisible to the tool whose job
-is counting public functions), and verified here: at 34 KB past the old cap it
-reports 1084/1084, identical to an independent count over the untruncated
-corpus.
-
-`scripts/check-coverage.sh` existed for the fortnight in between and has been
-**removed** — a second implementation of a working tool is two things to
-maintain and two things to drift. The episode's lesson is kept as standing
-rule 10.
+Corpus size: **1,082,744 bytes** of `.tcyr`. `cyrius coverage` had a fixed 1 MiB
+corpus buffer that silently under-reported past it; fixed upstream in **6.5.8**,
+so there is no corpus ceiling to work around and no local coverage script.
 
 ### Test-design decisions worth not re-deriving
 
@@ -337,60 +327,33 @@ were caught by mutation, and all four generalise to any further threading:
    residual is the stronger statement and the one that is actually true: the
    handler half is zero, not merely small.
 
-### What a crew run actually allocates
-
-Decomposed 2026-08-06, and the decomposition matters more than any single
-number — an earlier note put `crew_runner`'s residual at "~14 KB" by attributing
-the whole run to it.
+### What a crew run allocates
 
 Per **four-task** crew run, no audit chain, no event subscribers:
 
 | part | bytes | whose |
 |---|---|---|
-| building the spec (crew + 4 tasks + agent + vecs) | 4,472 | the **caller's** — in production this is the request parse |
+| building the spec (crew + 4 tasks + agent + vecs) | 4,472 | the **caller's** — in production, the request parse |
 | `orch_crew_runner`'s own | **6,088** | this module |
 
-Within `crew_runner`'s own: `agnosai_execute_task` is ~528 B per task, the crew
-state plus four results ~200 B, and the remainder is the profile, metrics and
-what is left of the event path.
+Within `crew_runner`'s own: `agnosai_execute_task` ~528 B/task, crew state plus
+four results ~200 B, remainder is the profile and metrics. No single remaining
+target large enough to be worth a bite.
 
-Two things came off it on 2026-08-06:
+With a chain attached the audit path adds ~7 KB per four-task run (was ~18 KB
+before the hashing scratch).
 
-- **The audit hashing scratch** — the audit path was ~18 KB of a 33 KB run with
-  a chain attached, almost all of it a JSON tree built to be hashed and thrown
-  away. Now on a growable scratch.
-- **The event-payload guard** — 9,360 → **6,088 B** (−35%). Payloads were built
-  before `_agnosai_crew_emit` could decline them, and `agnosai_event_sender_send`
-  with zero subscribers drops them. Zero subscribers is the normal state.
+### In-loop `str_from`
 
-**The method, which is the reusable part**: switch subsystems off one at a time
-and measure the difference; measure sub-parts (`_spec`, `execute_task`,
-`crew_state`) directly; never subtract a serialised size from an allocation
-figure. Both of this session's wrong numbers — "97% transient" and "~14 KB
-residual" — came from skipping that and comparing incommensurable things.
+Two classes, and the distinction matters: a bare `str_from` in a loop costs 16 B
+on the no-free global bump per iteration; `str_from_a` costs arena bytes that the
+next `reset_via` reclaims. 27 bare ones were found and **24 fixed**; 19
+arena-backed ones remain and are not worth chasing.
 
-### In-loop `str_from`: two classes, and three that stay
-
-B2 split what used to be one B3 item. A brace-tracking scan of `src/` finds
-`str_from` inside a `for`/`while` body in two forms:
-
-- **bare `str_from`** — 16 B on the no-free global bump per iteration, forever.
-  A real leak. 27 found, **24 fixed** (`crew_runner` 11, `routes/sse` 6,
-  `security_audit` 6, `sandbox/oci` 4, less the three below).
-- **`str_from_a`** — arena bytes, reclaimed at the next `reset_via`. 19 remain;
-  wasted work, not a leak, and worth far less than the first class.
-
-⚠ **Three bare ones stay on purpose.** `sandbox/oci.cyr:250-251` and
-`crew_runner.cyr:990` are inside loops but on `return` paths — they execute at
-most once, and hoisting them would move an allocation off an error path onto the
-hot one. A naive "`str_from` in a loop" scan will keep reporting them; this is
-the answer.
-
-**The one that mattered most was not the most numerous.**
-`routes/sse.cyr`'s `_agnosai_sse_event_json(fa, e, str_from(""))` ran once per
-streamed event on a connection that can live for a whole crew — every other
-allocation in that loop was already on the per-request arena and reset each
-iteration, so this was the single site there that compounded without bound.
+⚠ **Three bare ones stay on purpose** — `sandbox/oci.cyr:250-251` and
+`crew_runner.cyr:990` are inside loops but on `return` paths, so they run at most
+once and hoisting would move an allocation onto the hot path. A naive
+"`str_from` in a loop" scan will keep reporting them.
 
 ### Harness rules
 
@@ -594,44 +557,15 @@ rejected request, ~53x amplification**, no credential required. Permanent memory
 exhaustion is worse than recoverable CPU exhaustion. The answer to a flood is
 `rate_limit`, which is ported but **not mounted** (roadmap D1, a human decision).
 
-**These numbers were futex-bound, not algorithm-bound — and ✅ the stdlib fix
-landed in cyrius 6.5.9, exactly as this section predicted.**
+**These numbers were futex-bound and the stdlib fix landed in cyrius 6.5.9.**
+`lib/sync.cyr`'s two-state mutex called `FUTEX_WAKE` on every release: 394 ns
+per uncontended pair, now **48 ns** with the three-state lock. agnosai changed
+nothing and gained 15–77% across every lock-bound benchmark — `tool_registry_get`
+512 → 115 ns, `event_round_trip_1_sub` 1,982 → 908, `event_fanout_64_subs`
+100.6 → 53.4 µs, every route arm 15–37%. The tables above are the post-fix
+baseline.
 
-`mutex_lock` + `mutex_unlock` cost **394 ns uncontended**, because
-`lib/sync.cyr`'s two-state mutex called `FUTEX_WAKE` on every release whether or
-not a waiter was parked; a scratch build with that one line deleted measured
-**46 ns**, an 8.6× gap. agnosai filed it as
-`2026-07-29-mutex-unlock-unconditional-futex-wake.md` with a repro, worked
-around nothing, and recorded: *"a stdlib fix will show up as a straight
-improvement rather than needing any change on this side."*
-
-6.5.9's three-state mutex (0 free / 1 held / 2 held-with-waiters) took it to
-**48 ns**. agnosai changed nothing and got, measured across the bump:
-
-| benchmark | 6.5.8 | 6.5.9 |
-|---|---|---|
-| `tool_registry_get` | 512 ns | **115 ns** (−77%) |
-| `event_send_evicting` | 2,384 ns | **933 ns** (−61%) |
-| `event_round_trip_1_sub` | 1,982 ns | **908 ns** (−54%) |
-| `event_fanout_64_subs` | 100.6 µs | **53.4 µs** (−47%) |
-| `route_dashboard_crews_arena` | 10,950 ns | **6,887 ns** (−37%) |
-| `pubsub_publish_4_patterns` | 5,891 ns | **4,505 ns** (−24%) |
-| `plan_cache_get_hit` | 2,149 ns | **1,716 ns** (−20%) |
-
-Every route arm gained 15–37%; the registry lookup is a bare lock plus a hash,
-which is why it moved most. **The prediction is the part worth keeping**: a
-number that is honestly attributed to a dependency does not need a workaround,
-and the tables above are now the post-fix baseline rather than an excuse.
-
-⚠ The `chan_*` figures below still date from before the bump — `chan_try_send` +
-`chan_try_recv` at 1.59 µs was "about four mutex pairs", which is no longer the
-right arithmetic. They are due a re-measure.
-
-Two rows are worth reading together. `event_send_evicting` (933 ns) is a send into a subscriber
-that has stopped reading — the overwrite-oldest path blocker #4 exists for. It costs roughly what
-the healthy `event_round_trip_1_sub` (908 ns) does, which is the number that
-matters: **a stalled SSE client does not get more expensive to serve**, it just loses events. A
-blocking `chan_send` there would have wedged the crew instead.
+⚠ The `chan_*` figures below predate the bump and are due a re-measure.
 
 ⚠ Both figures more than halved at the 6.5.9 mutex fix and the *gap* between them
 closed with them — at 6.5.8 they were 2.40 µs against 1.99 µs. The conclusion is
@@ -688,239 +622,60 @@ global bump per request:
 router, id validation, tool schemas and the response struct all land in the
 request arena and are freed by one `reset_via`.
 
-### ⚠ The arena is a fixed cliff, and the routes now spill rather than fault
+### Arena exhaustion: the request arena spills
 
-`arena_alloc` answers **0** when full. It does not grow, and the stdlib has only
-a fixed-capacity arena — no chunked or growable form. **Nothing in
-`bayan_json_v_*`, `str_from_a` or `vec_push_a` checks its allocator's answer**,
-so an exhausted arena hands out 0 and the next store segfaults.
+An exhausted arena returns 0, and a `Str` of 0 is indistinguishable from a valid
+one — there is no option type or error channel through the `_a` families, so the
+0 flows on and the next deref faults. The primitives are fine
+(`arena_alloc` → 0, `str_from_a` → 0, `vec_push_a` → -1); nothing above them can
+practically check.
 
-That was harmless before B2, because handlers allocated from the unbounded
-no-free global bump. Threading them onto a fixed 64 KiB per-request arena turned
-a leak into a crash: **`GET /api/v1/dashboard/crews` with 200 crews registered
-segfaults through a raw 64 KiB arena**, and `AGNOSAI_MAX_RETAINED_CREWS` is
-1,000. `GET /api/v1/crews/{id}` on a long crew and `GET /api/v1/tools` with many
-tools share the shape.
+**The request arena is therefore set to `ARENA_FULL_SPILL`** in
+`server/serve.cyr` — overflow goes to the global bump instead of faulting.
+Spilled bytes are not reclaimed, which is exactly the pre-threading cost applied
+to the overflow alone.
 
-`agnosai_spill_arena` (`server/serve.cyr`) serves from the arena and falls back
-to the global bump **per allocation**; `agnosai_serve_handler` wraps sandhi's
-own request arena in one, cached per worker in a thread-local. sandhi still owns
-and resets the arena — only the ceiling behaviour changes. Spilled bytes are
-global-bump bytes and are not reclaimed, which is exactly the pre-threading
-cost applied to the overflow alone.
+**SPILL, not GROW, and the test pins it.** GROW retains chunks across
+`arena_reset`, so each of 100 workers would hold its worst-ever request forever.
+`server_serve` asserts `arena_capacity_total` is unchanged as well as that the
+arena filled, so swapping the policy fails.
 
-**The lesson for any future arena work here: an allocation measurement proves
-the common case and says nothing about the ceiling.** Every fixture in the suite
-was small, so nothing caught this until the ceiling was probed deliberately.
+cyrius 6.5.9 added the policy (`ARENA_FULL_NULL`/`GROW`/`SPILL`/`ABORT`) in
+answer to an agnosai filing; there is no local wrapper any more.
 
-**Stated precisely, because "nothing checks" is wrong**: `arena_alloc` returns 0
-when full, `str_from_a` checks and returns 0, `vec_push_a` checks and returns
--1. The primitives are fine. The gap is that **a `Str` of 0 is indistinguishable
-from a valid one** — there is no option type and no error channel through the
-`_a` families — so the 0 flows on and the next deref faults. Guarding a few
-hundred `_a` calls in a route handler is not a thing anyone will do, and there
-is nowhere to return the failure to.
+### The write routes — every one threaded, three keep a floor
 
-Filed upstream as
-`2026-08-06-arena-is-fixed-capacity-and-answers-0-so-unbounded-work-cannot-use-one.md`,
-asking for a growable arena — ✅ **shipped in 6.5.9** as an exhaustion policy.
-
-**⚠ The `crew_runner` figure in the first version of that filing was wrong, and
-the correction is the useful part.** It said "97% transient", from comparing
-33 KB of allocation against 894 B of *serialised* `CrewState`. Two errors: it
-ignored the audit chain, which is the largest consumer on that path, and
-serialised size is a lower bound on allocated footprint, not a proxy for it.
-
-Decomposed properly, per 4-task crew run:
-
-| configuration | B/run |
-|---|---|
-| audit + events on | 33,008 |
-| audit only | 32,544 |
-| neither | 14,096 |
-| retained *content*, serialised (crew state + 6 audit entries) | 3,662 |
-
-So the audit path is **~18 KB of a 4-task run**, events are ~460 B, and the
-transient majority is **two thirds to four fifths — not 97%**. Pinning it
-exactly needs the retained structures on a separate allocator, which is the
-`crew_runner` work itself rather than a precondition for it.
-
-**The method is the lesson**: a serialised size is not an allocation figure, and
-subtracting one from the other measures nothing. Decomposing by switching
-subsystems off is what produced numbers worth quoting.
-
-✅ **The audit path is threaded, 2026-08-06.** `agnosai_audit_record_a` takes a
-scratch allocator for the JSON tree it builds and throws away per entry, so a
-four-task run went **33,008 → 26,296 B** and a record costs **2,432 → 496 B** on
-the global bump. Latency is unchanged — SHA-256 and HMAC dominate.
-
-Three constraints worth not re-deriving, each found by breaking something:
-
-1. **`thread_local_get` faults on the main thread.** A scratch has to be
-   per-thread, because parallel and DAG modes record from real OS threads — but
-   the main thread has no TLS block unless `thread_local_init` is called, and
-   calling that on a *worker* orphans the block `thread_create` installed,
-   taking sandhi's request-arena slot with it. So the scratch is a **parameter**,
-   which is what every other `_a` in this tree does anyway.
-2. **An arena costs its capacity permanently.** The backing chunk comes from the
-   no-free bump, so creating one per crew run unconditionally made an
-   *audit-less* run 4.2 KB **worse**. Create it only when there is something to
-   amortise it over.
-3. **Initial chunk size is measurable, so measure it.** 512 → 26,344 ·
-   **1,024 → 26,296** · 2,048 → 27,304 · 4,096 → 27,288. Too small pays for a
-   second chunk; too large is dead weight.
-
-⚠ **There is no per-worker scratch owed, and an earlier note here said there
-was.** Parallel and DAG modes do not audit per task **at all**:
-`_agnosai_crew_audit_task` is called only from `_agnosai_crew_run_sequential`,
-and the oracle matches — one `audit_record` call site, in its own
-`run_sequential` (`rust-old/src/orchestrator/crew_runner.rs:294`). **Parity, not
-a gap.**
-
-The `AGN_CR_SCRATCH`-stays-0 fallback in `_agnosai_crew_audit` is still correct
-and still worth keeping — the runner *is* shared across worker threads, so if
-those paths ever gain a per-task audit, reading a scratch off it would be reset
-mid-hash by a sibling. It is belt-and-braces rather than load-bearing today.
-
-### The write routes split — every one is threaded, three keep a floor
-
-| write route | B/req global | B/req arena | retains data from the parse tree? |
+| write route | B/req global | B/req arena | retains parse-tree data? |
 |---|---|---|---|
 | `POST /mcp` | 3,224 | **0** | no |
 | `POST /api/v1/approvals` | 1,352 | **0** | no |
-| `POST /api/v1/agents/definitions` | 2,280 | **392** | yes, but **cloned** |
-| `POST /api/v1/crews` | 21,184 | **17,048** | yes, but **cloned** |
-| `POST /api/v1/a2a/receive` | 17,192 | **15,624** | yes, but **cloned** |
+| `POST /api/v1/agents/definitions` | 2,280 | **392** | yes, cloned |
+| `POST /api/v1/crews` | 21,184 | **17,048** | yes, cloned |
+| `POST /api/v1/a2a/receive` | 17,192 | **15,624** | yes, cloned |
 
-`agnosai_agent_from_value` and the crew *request* deserialisers took
-`bayan_json_v_str(...)` **without cloning**, and what they build is stored in
-`AppState.definitions` and the orchestrator registry — both process-lifetime. So
-a stored definition pointed *into the parsed request body*. Threading those
-parses would make `reset_via` reclaim it at the end of the request, and the next
-request would be handed the same bytes: **a stored definition's name becomes
-whatever the next caller posted.** It corrupts, it does not crash.
+Every residual is **retained state, not garbage**: 392 B is the stored agent
+definition; the crew figures are execution results held in the orchestrator
+registry.
 
-**That code was correct only because the global allocator never frees**, and the
-dependency was undocumented. `server_state`'s `definition_insert` had seen half
-of it — it `str_clone`s the *key*, with the comment "the caller's Str may be
-borrowed from a request buffer that does not outlive the handler" — and left the
-value borrowed.
+**The ownership rule, which is the durable part.** A deserialiser that feeds
+process-lifetime state must **clone**, not borrow, or a threaded parse leaves the
+stored object pointing into a reclaimed request body — corruption, not a crash.
+`agnosai_agent_from_value_a`, `agnosai_crew_req_from_value_a`,
+`agnosai_task_req_from_value_a` and `agnosai_a2a_req_from_value_a` all take an
+allocator and clone into it; the routes pass `default_alloc()` for whatever is
+retained and the request arena for everything else.
 
-✅ **Fixed for agents.** `agnosai_agent_from_value_a(al, v)` clones every Str
-into `al`, so the caller picks the lifetime: `create_definition_a` passes
-`default_alloc()` for the definition while parsing and responding in the request
-arena. 2,280 → **392 B/request**, and the 392 *is* the retained definition —
-what remains on the global bump is exactly the object the route exists to keep.
+**What actually retains, on the crew path**: the **audit chain** (the crew name
+is an audit *message*) and the **task result** (the description becomes its
+output, `crew_runner.cyr:460`). `CrewState` itself holds only a minted UUID, a
+status, results and a profile — asserting on `crew_state_crew_id` pins nothing.
 
-✅ **Done for crews.** `agnosai_crew_req_from_value_a` clones the crew name and
-`process`; `agnosai_task_req_from_value_a` clones each task's `description` and
-`expected_output`. 21,184 → **17,048 B/request**. The remainder is crew
-*execution* — task results held in the orchestrator registry — which is retained
-state and must not move.
+`agnosai_audit_record` clones `event`, `level`, `message`, `provider`, `model`.
+⚠ `metadata` is stored **by reference** — bayan has no deep-copy primitive — so
+callers must pass a tree that outlives the chain.
 
-**What retains a borrowed string here is not the crew registry.** `CrewState`
-holds a minted UUID, a status, results and a profile; nothing from the request.
-The two real paths are the **audit chain** (`_agnosai_orch_register` and
-`_agnosai_orch_finish` pass `agnosai_crew_name(spec)` as the audit *message*,
-and `agnosai_audit_record` stores it without cloning into `AppState`'s chain)
-and the **task result** (on the placeholder path `crew_runner` makes the
-description the result's output, `crew_runner.cyr:460`). Asserting on
-`agnosai_crew_state_crew_id` looked right and pinned nothing — every mutation
-survived it.
-
-⚠ **Not `agnosai_crew_from_value`**, which an earlier note named from its name
-alone: it deserialises a *persisted* crew, requires an `id` the request shape
-never carries, and **has no caller in `src/`**. Check the call chain from the
-route rather than matching on a plausible name.
-
-✅ **Done for a2a.** `agnosai_a2a_req_from_value_a` clones the task id, the
-description and the four optional strings. 17,192 → **15,624 B/request**;
-`metadata` still points into the parse tree, deliberately, because it is only
-re-serialised for the size check and never retained.
-
-**Every route in the table is now threaded.** The residuals are all retained
-state rather than garbage.
-
-✅ **`agnosai_audit_record` owns the strings it keeps.** `event`, `level`,
-`message`, `provider` and `model` are cloned, so the chain no longer depends on
-every caller happening to pass an owned Str — the same boundary
-`definition_insert` already applies to its key. The clone is free at this scale:
-`audit_record` stays inside its 28,335–29,785 ns band, because the SHA-256 chain
-hash and signature dominate.
-
-⚠ **`metadata` remains stored by reference**, and that contract is now narrowed
-to it alone: bayan ships **no deep-copy primitive**, and a `build`-then-`parse`
-round trip would cost a full serialise per audit record on the crew hot path.
-Callers must pass a tree that outlives the chain; both build theirs with a bare
-`bayan_json_v_obj_new()`.
-
-**`str_builder_build`, not `str_builder_new`, decides where a built Str lives.**
-The builder's scratch buffer can be anywhere; `build` allocates the finished Str
-and copies into it. A mutation moving `str_builder_new` to an arena changes
-nothing and passes; moving `str_builder_build` fails at once. Worth knowing
-before writing a comment about which call is load-bearing.
-
-The test that pinned the hazard was **inverted, not deleted** — it asserted a
-stored name was destroyed after its arena was released and scribbled over, and
-now asserts every field survives. Allocating the definition from the request
-arena segfaults the suite, which is the documented crash signature.
-
-It took four bites and each one exposed the next residual, which is the pattern
-worth carrying forward — **a floor is only visible once everything above it is
-zero**:
-
-1. the handlers (`llm`, routes, tools, orchestrator groups) → the router's
-   32-byte match struct became the whole residual;
-2. the router (`agnosai_route_resolve_a`, plus the two-level restructure) →
-   `agnosai_uuid_parse`'s 16 bytes became the whole residual on `{id}` routes;
-3. `agnosai_uuid_is_valid` → only `/api/v1/tools` was left, at 288 B;
-4. the tool vtable — `schema_fp` is now `fn(a, ctx)`, allocator first, threaded
-   by all fourteen implementors.
-
-Step 4 is a change to a **calling convention**, not an addition to one, and it
-is safe to make because agnosai has no `[lib]` block and no `dist/` bundle:
-`bins = ["agnosai"]` is the whole package, so every implementor is in this tree.
-Consumers reach tools over HTTP and MCP, not by linking.
-
-The `{id}` routes reached zero last, and the residual was `agnosai_uuid_parse`
-allocating a buffer **all five of its callers in `src/` discarded** — every one
-was `if (agnosai_uuid_parse(x) == 0)`, a validity test.
-`agnosai_uuid_is_valid` is that test without the buffer, over the same
-`_agnosai_uuid_scan`, so the two cannot drift on what they accept — which
-matters because the routes decide **422-vs-404** on the validator where the
-oracle's `Path<Uuid>` extractor decided it on the parser.
-
-**`route_resolve` was 1.675 µs — 57% of the cheapest threaded request — and its
-32 B was 100% of that route's remaining allocation. Both are fixed.**
-
-The table was a flat list of sixteen patterns, each matched from byte 0, so
-`/api/v1/dashboard/crews` matched on attempt sixteen having re-compared `api`
-and `v1` twelve times. `/api/v1` is now consumed once and the following segment
-selects a group of at most four patterns: **1.675 µs → 343 ns (−79%)**, and
-`agnosai_route_resolve_a` puts the match struct, the parameter buffer and any
-captured Str in the arena. `/api/v1/approvals` fell 2.947 → 1.861 µs, the
-largest proportional gain, because resolve was most of it.
-
-**The restructure is a filter, not a decision**, and that is the safety
-argument: `_agnosai_seg_is` and `_agnosai_path_prefix_end` choose which patterns
-are *tried*, while what a trial *answers* is still a full pattern comparison. So
-neither selector can route a request somewhere it does not belong. This is
-verified rather than argued — `_t_resolve_is_equivalent` holds the resolver
-against the flat sixteen-attempt table it replaced, kept verbatim in
-`tests/server_router.tcyr`, across 56 paths × 4 methods on id, captured
-parameter and the 405-vs-404 flag. **Making `_agnosai_seg_is` a bare prefix test
-changes no answer it produces**, because the resolver degenerates back into the
-flat table; the two selectors therefore carry their own unit assertions, since
-what they protect is the cost and the differential cannot see cost.
-
-Not threaded, and not claimed to be: the write routes (`POST /api/v1/crews`,
-`/api/v1/agents/definitions`, `/api/v1/approvals`, `/api/v1/a2a`, `/mcp`), which
-parse a request body — the other half of the problem — and the orchestrator
-group's off-request-path modules, `crew_runner` foremost.
-
-**Not comparable to `rust-old/bench-history.csv`** — different allocator, different harness, no
-criterion statistics. The Cyrius line starts its own baseline, captured by
-`scripts/bench-history.sh` into the root `bench-history.csv` (85 rows per capture).
+⚠ `agnosai_crew_from_value` is *not* on any request path: it deserialises a
+persisted crew, needs an `id` no request carries, and has no caller in `src/`.
 
 ## Dependencies
 

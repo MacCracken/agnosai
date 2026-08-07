@@ -428,6 +428,132 @@ fn _t_malformed_body(): i64 {
     return 0;
 }
 
+# --- prompts (ADR 016) --------------------------------------------------
+
+# One definition, so `prompts/list` has a determinate count.
+#
+# **Its display name differs from its key on purpose.** `agnosai_agent_new`
+# defaults `name` to the key, so a fixture that leaves them equal cannot tell
+# `agnosai_agent_key` from `agnosai_agent_name` — and the prompt is required to
+# be named by *key*, matching the REST route and the resource URI. A mutation
+# swapping them passed until this was split.
+fn _t_state_one_def(): i64 {
+    var s = _t_state();
+    var def = agnosai_agent_new(str_from("researcher"), str_from("finds things"),
+    str_from("research"));
+    agnosai_agent_with_name(def, str_from("The Researcher"));
+    agnosai_app_state_definition_insert(s, str_from("researcher"), def);
+    return s;
+}
+
+fn _t_mcp_prompts_list(): i64 {
+    var s = _t_state_one_def();
+    var r = agnosai_route_mcp(s, str_from(
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prompts/list\"}"));
+    assert(agnosai_route_status(r) == HTTP_OK, "prompts/list answers 200");
+    var res = bayan_json_v_obj_get(agnosai_route_body(r), "result");
+    assert(res != 0, "...with a result");
+    var arr = bayan_json_v_obj_get(res, "prompts");
+    assert(bayan_json_v_is_arr(arr) == 1, "...carrying a prompts array");
+    assert(bayan_json_v_arr_len(arr) == 1, "...one per stored definition");
+
+    var p0 = bayan_json_v_arr_get(arr, 0);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(p0, "name")), "researcher") == 1,
+    "**the prompt is named by agent key** — the same identifier the REST route \
+    stores it under and `agnosai://agents/<name>` addresses");
+    var args = bayan_json_v_obj_get(p0, "arguments");
+    assert(bayan_json_v_arr_len(args) == 1, "one declared argument");
+    var a0 = bayan_json_v_arr_get(args, 0);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(a0, "name")), "task") == 1,
+    "...named task");
+    assert(bayan_json_v_bool(bayan_json_v_obj_get(a0, "required")) == 0,
+    "...and optional — the persona is useful without one");
+    return 0;
+}
+
+# **The text is the crew's own system prompt, not a second template.**
+#
+# That is the whole design: what a client previews through MCP and what a crew
+# actually sends the model are the same string, so they cannot drift. This
+# asserts the identity directly rather than re-describing the format.
+fn _t_mcp_prompts_get_matches_the_crew(): i64 {
+    var s = _t_state_one_def();
+    var def = agnosai_app_state_definition_get(s, str_from("researcher"));
+    var expected = _agnosai_crew_build_system_prompt(def);
+
+    var r = agnosai_route_mcp(s, str_from(
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\",\
+    \"params\":{\"name\":\"researcher\"}}"));
+    assert(agnosai_route_status(r) == HTTP_OK, "prompts/get answers 200");
+    var res = bayan_json_v_obj_get(agnosai_route_body(r), "result");
+    var msgs = bayan_json_v_obj_get(res, "messages");
+    assert(bayan_json_v_arr_len(msgs) == 1, "one message");
+    var m0 = bayan_json_v_arr_get(msgs, 0);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(m0, "role")), "user") == 1,
+    "**role is `user`** — MCP's PromptMessage has no `system` role");
+    var content = bayan_json_v_obj_get(m0, "content");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(content, "type")), "text") == 1,
+    "content is text");
+    assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get(content, "text")), expected) == 1,
+    "and the text is byte-identical to `_agnosai_crew_build_system_prompt` — \
+    one renderer, so preview and execution cannot diverge");
+    return 0;
+}
+
+fn _t_mcp_prompts_get_appends_the_task(): i64 {
+    var s = _t_state_one_def();
+    var r = agnosai_route_mcp(s, str_from(
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"prompts/get\",\
+    \"params\":{\"name\":\"researcher\",\"arguments\":{\"task\":\"find the thing\"}}}"));
+    var res = bayan_json_v_obj_get(agnosai_route_body(r), "result");
+    var txt = bayan_json_v_str(bayan_json_v_obj_get(bayan_json_v_obj_get(
+    bayan_json_v_arr_get(bayan_json_v_obj_get(res, "messages"), 0), "content"), "text"));
+    assert(str_contains(txt, str_from("find the thing")) == 1,
+    "the task argument is appended when supplied");
+
+    # An empty task is the same as none — no dangling "Task:" header.
+    var r2 = agnosai_route_mcp(s, str_from(
+    "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"prompts/get\",\
+    \"params\":{\"name\":\"researcher\",\"arguments\":{\"task\":\"\"}}}"));
+    var txt2 = bayan_json_v_str(bayan_json_v_obj_get(bayan_json_v_obj_get(
+    bayan_json_v_arr_get(bayan_json_v_obj_get(bayan_json_v_obj_get(
+    agnosai_route_body(r2), "result"), "messages"), 0), "content"), "text"));
+    assert(str_contains(txt2, str_from("Task:")) == 0,
+    "...and an empty one appends nothing rather than a bare `Task:` header");
+    return 0;
+}
+
+fn _t_mcp_prompts_get_rejects(): i64 {
+    var s = _t_state_one_def();
+    var bad = agnosai_route_mcp(s, str_from(
+    "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"prompts/get\",\
+    \"params\":{\"name\":\"nosuch\"}}"));
+    var e = bayan_json_v_obj_get(agnosai_route_body(bad), "error");
+    assert(e != 0, "an unknown prompt name is a JSON-RPC error");
+    assert(bayan_json_v_int(bayan_json_v_obj_get(e, "code")) == AGNOSAI_MCP_INVALID_PARAMS,
+    "...with INVALID_PARAMS");
+
+    var noname = agnosai_route_mcp(s, str_from(
+    "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"prompts/get\",\"params\":{}}"));
+    assert(bayan_json_v_obj_get(agnosai_route_body(noname), "error") != 0,
+    "and a missing name is an error, not an empty prompt");
+    return 0;
+}
+
+fn _t_mcp_advertises_prompts(): i64 {
+    var s = _t_state_one_def();
+    var r = agnosai_route_mcp(s, str_from(
+    "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}"));
+    var caps = bayan_json_v_obj_get(bayan_json_v_obj_get(
+    agnosai_route_body(r), "result"), "capabilities");
+    assert(bayan_json_v_obj_get(caps, "prompts") != 0,
+    "initialize advertises the prompts capability, because it is answered");
+    assert(bayan_json_v_obj_get(bayan_json_v_obj_get(caps, "prompts"), "listChanged") == 0,
+    "**without `listChanged`** — definitions can change at any time and nothing \
+    here can push a notification, so claiming it would strand a client");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -448,6 +574,12 @@ fn main(): i64 {
     _t_resources_capability_advertised();
     _t_unknown_method();
     _t_malformed_body();
+
+    _t_mcp_prompts_list();
+    _t_mcp_prompts_get_matches_the_crew();
+    _t_mcp_prompts_get_appends_the_task();
+    _t_mcp_prompts_get_rejects();
+    _t_mcp_advertises_prompts();
 
     return assert_summary();
 }

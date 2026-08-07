@@ -332,6 +332,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP `prompts/list` and `prompts/get` — roadmap B1 complete.** A prompt is a
+  stored agent definition, rendered by the crew's **own** system-prompt builder.
+  [ADR 016](docs/adr/016-mcp-prompts-project-agent-personas.md).
+
+  Named by **agent key** — the same identifier `POST /api/v1/agents/definitions`
+  stores it under and `agnosai://agents/<name>` addresses, so one name spans all
+  three surfaces. Each declares one **optional** `task` argument, appended as
+  `\n\nTask: …` when supplied and non-empty; the persona is useful without one.
+
+  **The text is `_agnosai_crew_build_system_prompt`, not a second template.**
+  What a client previews through MCP is byte-for-byte what a crew sends the model
+  for that agent, so the two cannot drift. The test asserts that identity
+  directly rather than re-describing the format — swapping in any other renderer
+  fails it.
+
+  Message role is **`user`**: MCP's `PromptMessage` has no `system` role, so the
+  persona is the opening user turn, matching the specification's own examples.
+
+  `capabilities.prompts` is advertised **without `listChanged`**, on the same
+  reasoning that kept `subscribe` off `resources` in ADR 015 — definitions change
+  at any time via the REST route and nothing here can push a notification, so
+  claiming it would strand a client waiting.
+
+  No new state, no new lifecycle: prompts appear and vanish exactly as
+  definitions do.
+
+  **7 mutations applied, 7 caught**, two only after a fixture fix — the fixture
+  built its definition with `agnosai_agent_new`, which defaults `name` to the
+  key, so nothing could tell `agnosai_agent_key` from `agnosai_agent_name` and
+  the "named by key" requirement was unpinned. `server_routes_mcp` 104 → **124**
+  assertions.
+
+  agnosai now answers **seven** MCP methods against the oracle's three; every
+  addition is additive, which is the basis ADR 015 was accepted on.
+
 - **MCP `resources/list` and `resources/read`** — roadmap B1, first half.
   Stored agent definitions are addressable as `agnosai://agents/<name>` and
   readable as the same JSON `GET /api/v1/agents/definitions` already serves.
