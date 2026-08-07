@@ -631,6 +631,21 @@ cost applied to the overflow alone.
 the common case and says nothing about the ceiling.** Every fixture in the suite
 was small, so nothing caught this until the ceiling was probed deliberately.
 
+**Stated precisely, because "nothing checks" is wrong**: `arena_alloc` returns 0
+when full, `str_from_a` checks and returns 0, `vec_push_a` checks and returns
+-1. The primitives are fine. The gap is that **a `Str` of 0 is indistinguishable
+from a valid one** — there is no option type and no error channel through the
+`_a` families — so the 0 flows on and the next deref faults. Guarding a few
+hundred `_a` calls in a route handler is not a thing anyone will do, and there
+is nowhere to return the failure to.
+
+Filed upstream as
+`2026-08-06-arena-is-fixed-capacity-and-answers-0-so-unbounded-work-cannot-use-one.md`,
+asking for a growable arena. **That filing also records why `crew_runner` is
+blocked**: 97% of a crew run is transient (32,608 B per 4-task run against 894 B
+retained), but the size is unbounded, so no fixed capacity works and a spilling
+wrapper would spill most of it.
+
 ### The write routes split — every one is threaded, three keep a floor
 
 | write route | B/req global | B/req arena | retains data from the parse tree? |
