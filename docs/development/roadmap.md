@@ -7,18 +7,40 @@
 
 ## What v2.0.0 is
 
-The Rust default build (core + orchestrator + llm + tools + server + learning),
-plus fleet, plus 77% of sandbox, plus JSON-only definitions, plus OTLP telemetry.
-**Wire parity is the bar**, judged against `rust-old/`.
+**The whole of `rust-old/`.** Every module, every Cargo feature, every test,
+every benchmark, every build target. **Wire parity is the bar**, judged against
+`rust-old/`.
 
-**Excluded, with reason:**
+> ### ⚠ Scope was narrowed by prior sessions and the user overturned it — 2026-08-07
+>
+> This section previously read *"the Rust default build … plus 77% of sandbox,
+> plus JSON-only definitions"* and carried an **"Excluded, with reason"** table.
+> That framing — that the **default cargo build** (`default = []`) is the parity
+> bar, so anything `full`-gated is "past the bar rather than debt" — was
+> **authored here, not decided by the user**, and it survived four handoffs
+> because each session read it as the plan of record and repeated it back.
+>
+> Its own attribution column is the evidence: of the four exclusions, only
+> `bhava` cited a **user decree**. The rest were self-issued — *"explicit cyrius
+> non-goal"*, *"behind the non-default feature"*, *"zero consumers; pending
+> sign-off"* for a sign-off nobody ever gave.
+>
+> **A cargo feature gate is not a scope boundary.** `fleet`, `definitions`
+> (ZIP and YAML included), `telemetry` with OTLP, the `sandbox`-gated tools,
+> `genai.rs`, `inference_queue.rs`, the `hwaccel` half of `core/resource.rs`,
+> the `#[tokio::test]` suites, `benches/`, `examples/` and the non-`src` surface
+> are all **owed work**, not extensions.
+>
+> **Do not add a new exclusion row.** If something looks impossible, the move is
+> to *prove* it — name the missing primitive, grep `lib/` for it, and file the
+> upstream ask. Filing upstream is ordinary work here, and it lands fast: sandhi
+> 1.9.9 and bayan 1.4.0 each shipped within hours of an agnosai filing.
 
-| Excluded | Why |
+**The one carve-out, and it is a dependency fact rather than a scope call:**
+
+| Not ported | Why |
 |---|---|
-| bhava / `personality` | user decree, post-v2 |
-| WASM **as a format** — the tool SDK and `examples/wasm-tools/` | Explicit cyrius non-goal. The *capability* ships instead: the tool sandbox rides **cx** + kavach ([ADR-006](../adr/006-cx-tool-sandbox.md)). Existing `.wasm` tools must be **rewritten in Cyrius** — not a drop-in. Linux-x86 only until cx arc C |
-| definitions ZIP + YAML | both behind the non-default `definitions` feature; both are upstream filings |
-| `genai.rs`, `inference_queue.rs` | zero consumers; pending sign-off |
+| bhava / `personality` | **bhava itself has not been ported to Cyrius yet**, so there is nothing to depend on. The wire keeps emitting `null`, which is what the default Rust build emits. Revisit the moment bhava lands in Cyrius — this is the only item the user ever set aside. |
 
 ## v2.0 criteria
 
@@ -512,21 +534,54 @@ tool protocol.
 
 ### M8 — `fleet` (Phase 7)
 
-Cheapest 4,443 lines; zero consumers; sequence last. `discovery.rs` needs no
-sandhi at all — it is 174 lines of stub.
+4,443 lines, the largest unported group. `discovery.rs` needs no sandhi at all —
+it is 174 lines of stub. `relay.rs` maps near-1:1 onto majra's `relay_*`.
 
-### M9 — `telemetry`, partial (Phase 8)
+⚠ *"zero consumers; sequence last"* used to justify deprioritising this. Zero
+consumers is a consequence of it not being ported, not a reason to leave it.
 
-Copy hoosh's proven `otlp.cyr` (199 lines) — the one place the remote seam does
-NOT apply, since OTLP export is in-process. Thread-local trace context is
-**mandatory** under `run_pooled`: sakshi's span stack and trace id are process
-globals.
+### M9 — `telemetry` (Phase 8)
 
-### M10 — `definitions`, partial (Phase 9)
+**All 322 lines, plus the logging init in `main.rs`.** Two distinct pieces:
 
-assembler, loader-JSON, presets, versioning, k8s_crd (which parses **JSON** only —
-the ` ```yaml ` in its doc comment is a doc comment). Defers ZIP container +
-packaging + YAML.
+- **OTLP export** — copy hoosh's proven `otlp.cyr` (199 lines); the one place
+  the remote seam does NOT apply, since export is in-process. Thread-local trace
+  context is **mandatory** under `run_pooled`: sakshi's span stack and trace id
+  are process globals.
+- **JSON stderr logging + `EnvFilter`** — the oracle runs
+  `tracing_subscriber::fmt().with_env_filter(..agnosai=info..).json().init()`
+  ungated. sakshi has neither, so this starts as a **sakshi filing** and is
+  consumed when it lands. Until then the divergence is stated at
+  `src/main.cyr:22-26`.
+- **`genai.rs`** lives here, not in `llm`.
+
+### M10 — `definitions` (Phase 9)
+
+**All 1,460 lines.** assembler, loader, presets, versioning, k8s_crd, **plus the
+ZIP container, packaging and YAML halves.** `GET /api/v1/presets` stops
+answering `[]` and becomes a real branch.
+
+- **YAML is unblocked** — bayan shipped `bayan_yaml_parse` / `_parse_buf` /
+  `_parse_ctx` / `bayan_yaml_frontmatter_split`, returning the same tagged value
+  tree as its JSON parser (verified 2026-08-03).
+- **ZIP** is an upstream ask to sankoch (deflate + crc32 already exist there;
+  ~250 lines). File it now so it lands before the packaging bites.
+
+### M11 — the `sandbox`-gated tools and `hwaccel` (Phase 10)
+
+`tools/python_tool.rs`, `tools/wasm_tool.rs`, `tools/wasm_loader.rs`, and the
+`#[cfg(feature = "hwaccel")]` half of `core/resource.rs`. WASM needs its own
+analysis against the current toolchain rather than the inherited "cyrius
+non-goal" verdict — [ADR-006](../adr/006-cx-tool-sandbox.md) records what
+cx + kavach substitute and what is lost (fuel metering).
+
+### M12 — `llm` residue, tests, benches and the non-`src` surface (Phase 11)
+
+`llm/inference_queue.rs`, the `llm/mod.rs` re-exports, every oracle test with no
+Cyrius assertion (including the ~155 `#[tokio::test]` suites, which need a
+synchronous re-expression — that is work, not an exemption), every oracle bench
+with no `.bcyr`, the doctest, and the non-`src` artifacts (`examples/`, the tool
+SDK, Python bindings, extra Cargo build targets).
 
 ## Owed work
 

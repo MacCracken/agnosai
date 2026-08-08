@@ -1,0 +1,185 @@
+# =========================================================================
+# fleet_cost_planning.tcyr — tests for src/fleet/cost_planning.cyr
+#
+# Oracle: rust-old/src/fleet/cost_planning.rs's ten `#[test]` fns, all ported.
+#
+# The suite then goes past the oracle in four places the Rust tests never
+# reach, each of which a plausible port gets wrong silently:
+#
+#   * case folding — the oracle lowercases before matching, so "GPT-4" must
+#     tier as large. A port that dropped the fold still passes all ten.
+#   * classification ORDER — "gpt-4" is tested before "gpt-3.5", and an
+#     identifier carrying both must resolve large.
+#   * the llama-7b / mistral-7b tie — both classify open-small, so both cost
+#     identically and the SORT decides. The oracle's assertion accepts either,
+#     which means it does not pin the behaviour; this one does.
+#   * the empty identifier, which is the needle-longer-than-haystack guard.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/order.cyr"
+include "src/fleet/cost_planning.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's cost arithmetic, spelled out: (tasks*tokens / tps / 3600) * rate.
+fn _t_expect_cost(tokens, tps, rate_num, rate_den): i64 {
+    var t = f64_div(f64_from(tokens), f64_from(tps));
+    var h = f64_div(t, f64_from(3600));
+    return f64_mul(h, f64_div(f64_from(rate_num), f64_from(rate_den)));
+}
+
+# Whether `hay` contains the literal `needle`.
+fn _t_has(hay, needle): i64 {
+    return str_contains_cstr(hay, needle);
+}
+
+fn main(): i64 {
+    var p = agnosai_gpu_pricing_default();
+
+    # --- oracle: default_pricing_values ---------------------------------
+    _t_assert_f64(agnosai_gpu_pricing_a100(p), f64_from(3), "default a100 = 3.00");
+    _t_assert_f64(agnosai_gpu_pricing_h100(p), _t_f64_ratio(9, 2), "default h100 = 4.50");
+    _t_assert_f64(agnosai_gpu_pricing_rtx4090(p), _t_f64_ratio(12, 10), "default rtx4090 = 1.20");
+    _t_assert_f64(agnosai_gpu_pricing_t4(p), _t_f64_ratio(35, 100), "default t4 = 0.35");
+    _t_assert_f64(agnosai_gpu_pricing_l4(p), _t_f64_ratio(8, 10), "default l4 = 0.80");
+
+    # --- oracle: estimate_crew_cost_gpt4 --------------------------------
+    # 10 * 1000 = 10_000 tokens at 40 tok/s = 250s = 0.0694h * $3.00
+    var c_gpt4 = agnosai_estimate_crew_cost(10, 1000, str_from("gpt-4"), p);
+    _t_assert_f64(c_gpt4, _t_expect_cost(10000, 40, 3, 1), "gpt-4: 10k tokens at 40 tok/s on A100");
+
+    # --- oracle: estimate_crew_cost_small_model -------------------------
+    # 10_000 tokens at 120 tok/s = 83.33s = 0.02315h * $0.35
+    var c_small = agnosai_estimate_crew_cost(10, 1000, str_from("llama-7b"), p);
+    _t_assert_f64(c_small, _t_expect_cost(10000, 120, 35, 100), "llama-7b: 10k tokens at 120 tok/s on T4");
+
+    # --- oracle: estimate_zero_tasks / estimate_zero_tokens -------------
+    _t_assert_f64(agnosai_estimate_crew_cost(0, 1000, str_from("gpt-4"), p), f64_from(0),
+    "zero tasks costs nothing");
+    _t_assert_f64(agnosai_estimate_crew_cost(10, 0, str_from("gpt-4"), p), f64_from(0),
+    "zero tokens per task costs nothing");
+
+    # --- oracle: unknown_model_uses_medium_tier -------------------------
+    # An unrecognised identifier falls through to 80 tok/s on L4 ($0.80/h).
+    var c_unknown = agnosai_estimate_crew_cost(10, 1000, str_from("some-custom-model"), p);
+    _t_assert_f64(c_unknown, _t_expect_cost(10000, 80, 8, 10), "unknown model uses the medium tier");
+
+    # --- oracle: select_cheapest_model_within_budget --------------------
+    var tight = agnosai_select_cheapest_model(_t_f64_ratio(1, 100), 5, 500, p);
+    assert(tight != 0, "a tight budget still finds a model");
+    assert(str_eq_cstr(tight, "llama-7b") == 1 || str_eq_cstr(tight, "mistral-7b") == 1,
+    "a tight budget picks a small open model");
+
+    # --- oracle: select_cheapest_model_large_budget ---------------------
+    assert(agnosai_select_cheapest_model(f64_from(100), 5, 500, p) != 0,
+    "a generous budget finds a model");
+
+    # --- oracle: select_cheapest_model_zero_budget ----------------------
+    assert(agnosai_select_cheapest_model(f64_from(0), 100, 10000, p) == 0,
+    "zero budget against real work fits nothing");
+
+    # --- oracle: pricing_display ----------------------------------------
+    var d = agnosai_gpu_pricing_display(p);
+    assert(_t_has(d, "A100=$3.00/h") == 1, "display carries A100 at two decimals");
+    assert(_t_has(d, "T4=$0.35/h") == 1, "display carries T4 at two decimals");
+
+    # Byte-exact, which the oracle's two `contains` checks do not pin: a port
+    # that emitted the fields in the wrong order, or separated them with a
+    # comma, passes both of the oracle's assertions.
+    assert(str_eq_cstr(d,
+    "A100=$3.00/h H100=$4.50/h RTX4090=$1.20/h T4=$0.35/h L4=$0.80/h") == 1,
+    "display is byte-exact, field order and separators included");
+
+    # --- past the oracle: case folding ----------------------------------
+    # `model.to_ascii_lowercase()` is load-bearing. Drop it and all ten oracle
+    # tests still pass, because every one of them passes a lowercase name.
+    _t_assert_f64(agnosai_estimate_crew_cost(10, 1000, str_from("GPT-4"), p), c_gpt4,
+    "classification folds case: GPT-4 tiers as gpt-4");
+    _t_assert_f64(agnosai_estimate_crew_cost(10, 1000, str_from("LLaMA-7B"), p), c_small,
+    "classification folds case: LLaMA-7B tiers as llama-7b");
+
+    # Only A-Z folds, exactly as Rust's ascii-lowercase does — a fold that
+    # blanket-ORed 0x20 would corrupt the digits and hyphens in these names.
+    _t_assert_f64(agnosai_estimate_crew_cost(10, 1000, str_from("Claude-3-Opus"), p), c_gpt4,
+    "Claude-3-Opus tiers large, digits and hyphens surviving the fold");
+
+    # --- past the oracle: classification order --------------------------
+    assert(_agnosai_cost_tier(str_from("gpt-4-tuned-from-gpt-3.5")) == AGNOSAI_COST_TIER_LARGE,
+    "gpt-4 is tested before gpt-3.5, so a name with both is large");
+
+    # --- past the oracle: every tier's mapping --------------------------
+    assert(_agnosai_cost_tier(str_from("gpt-4")) == AGNOSAI_COST_TIER_LARGE, "gpt-4 -> large");
+    assert(_agnosai_cost_tier(str_from("claude-3-opus")) == AGNOSAI_COST_TIER_LARGE, "opus -> large");
+    assert(_agnosai_cost_tier(str_from("gpt-3.5-turbo")) == AGNOSAI_COST_TIER_MEDIUM, "gpt-3.5 -> medium");
+    assert(_agnosai_cost_tier(str_from("claude-3-sonnet")) == AGNOSAI_COST_TIER_MEDIUM, "sonnet -> medium");
+    assert(_agnosai_cost_tier(str_from("llama-70b")) == AGNOSAI_COST_TIER_OPEN_LARGE, "llama-70b -> open-large");
+    assert(_agnosai_cost_tier(str_from("mixtral-8x7b")) == AGNOSAI_COST_TIER_OPEN_LARGE, "mixtral -> open-large");
+    assert(_agnosai_cost_tier(str_from("mistral-7b")) == AGNOSAI_COST_TIER_OPEN_SMALL, "mistral-7b -> open-small");
+    assert(_agnosai_cost_tier(str_from("llama-8b")) == AGNOSAI_COST_TIER_OPEN_SMALL, "llama-8b -> open-small");
+    assert(_agnosai_cost_tier(str_from("wat")) == AGNOSAI_COST_TIER_UNKNOWN, "unrecognised -> unknown");
+
+    # ⚠ mixtral-8x7b contains "l-7b" but NOT "llama-7b" or "mistral-7b", and it
+    # is matched by the mixtral arm first regardless. Pinned because a port that
+    # loosened either open-small needle would silently retier it to T4 pricing.
+    assert(_agnosai_cost_tier(str_from("mixtral-8x7b")) != AGNOSAI_COST_TIER_OPEN_SMALL,
+    "mixtral-8x7b does not fall through to the open-small needles");
+
+    # --- past the oracle: the empty identifier --------------------------
+    # needle longer than haystack — the guard in _agnosai_contains_ci. Without
+    # it the scan computes a negative bound and reads out of bounds.
+    assert(_agnosai_cost_tier(str_from("")) == AGNOSAI_COST_TIER_UNKNOWN, "an empty model tiers unknown");
+    _t_assert_f64(agnosai_estimate_crew_cost(1, 1, str_from(""), p),
+    _t_expect_cost(1, 80, 8, 10), "an empty model prices at the medium tier");
+
+    # --- past the oracle: the tie is resolved, not merely accepted ------
+    # llama-7b and mistral-7b both classify open-small, so their costs are
+    # bit-identical and the sort decides which is returned. Rust's sort_by is
+    # stable; vec_sort_by never enters its quicksort path at 8 elements and runs
+    # pure insertion sort, which is also stable. Both therefore answer with the
+    # earlier entry. The oracle's own assertion accepts either and pins nothing.
+    _t_assert_f64(agnosai_estimate_crew_cost(5, 500, str_from("llama-7b"), p),
+    agnosai_estimate_crew_cost(5, 500, str_from("mistral-7b"), p),
+    "llama-7b and mistral-7b cost identically, so the tie is real");
+    assert(str_eq_cstr(tight, "llama-7b") == 1,
+    "the tie resolves to llama-7b, the earlier BUDGET_MODELS entry");
+
+    # --- past the oracle: tier labels and rates -------------------------
+    assert(str_eq_cstr(agnosai_cost_tier_label(AGNOSAI_COST_TIER_LARGE), "large") == 1, "label large");
+    assert(str_eq_cstr(agnosai_cost_tier_label(AGNOSAI_COST_TIER_MEDIUM), "medium") == 1, "label medium");
+    assert(str_eq_cstr(agnosai_cost_tier_label(AGNOSAI_COST_TIER_OPEN_LARGE), "open-large") == 1,
+    "label open-large");
+    assert(str_eq_cstr(agnosai_cost_tier_label(AGNOSAI_COST_TIER_OPEN_SMALL), "open-small") == 1,
+    "label open-small");
+    assert(str_eq_cstr(agnosai_cost_tier_label(AGNOSAI_COST_TIER_UNKNOWN), "unknown") == 1, "label unknown");
+
+    _t_assert_f64(agnosai_cost_tier_tps(AGNOSAI_COST_TIER_LARGE), f64_from(40), "large runs at 40 tok/s");
+    _t_assert_f64(agnosai_cost_tier_tps(AGNOSAI_COST_TIER_OPEN_SMALL), f64_from(120),
+    "open-small runs at 120 tok/s");
+    _t_assert_f64(agnosai_cost_tier_tps(AGNOSAI_COST_TIER_UNKNOWN), f64_from(80),
+    "unknown falls through to the medium 80 tok/s");
+
+    _t_assert_f64(agnosai_cost_tier_rate(AGNOSAI_COST_TIER_LARGE, p), agnosai_gpu_pricing_a100(p),
+    "large bills at the A100 rate");
+    _t_assert_f64(agnosai_cost_tier_rate(AGNOSAI_COST_TIER_OPEN_LARGE, p), agnosai_gpu_pricing_a100(p),
+    "open-large also bills at the A100 rate");
+    _t_assert_f64(agnosai_cost_tier_rate(AGNOSAI_COST_TIER_OPEN_SMALL, p), agnosai_gpu_pricing_t4(p),
+    "open-small bills at the T4 rate");
+    _t_assert_f64(agnosai_cost_tier_rate(AGNOSAI_COST_TIER_UNKNOWN, p), agnosai_gpu_pricing_l4(p),
+    "unknown bills at the L4 rate");
+
+    # --- past the oracle: a custom pricing table is honoured ------------
+    # The oracle's doc says the defaults "can be overridden by constructing with
+    # custom values", and nothing tests it. Doubling every rate must double the
+    # cost, which also pins that estimate reads the table rather than constants.
+    var p2 = agnosai_gpu_pricing_new(f64_from(6), f64_from(9), _t_f64_ratio(24, 10),
+    _t_f64_ratio(70, 100), _t_f64_ratio(16, 10));
+    _t_assert_f64(agnosai_estimate_crew_cost(10, 1000, str_from("gpt-4"), p2),
+    f64_mul(c_gpt4, f64_from(2)), "doubling the A100 rate doubles a large-tier estimate");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -151,17 +151,25 @@ tree 2026-08-03:
 | `tools/` | 5 | 1,057 | ✅ complete (M4) |
 | `learning/` | 6 | 1,018 | ✅ complete (M2) |
 | root (port-local) | 6 | 961 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
-| **total** | **72** | **20,739** | against a 27,683-line oracle |
+| **total (STALE — 2026-08-03)** | **72** | **20,739** | against a 27,683-line oracle |
+| **total (current — 2026-08-07)** | **82** | **25,830** | against a **41,163**-line oracle |
 
-**Four oracle groups have zero Cyrius counterpart** — 8,473 lines, 31% of the
-oracle, all scheduled and none silently missing:
+⚠ **The per-group rows above are stale by 10 files and 5,091 lines** and are kept
+only until someone regenerates them from `find src -name '*.cyr' \| xargs wc -l`.
+This file carried two disagreeing inventory tables for four days — this one and
+the *Where the port is* table below. **The 82/25,830 figure is the correct one**,
+and the oracle denominator is **41,163**, not 27,683 (see the banner below for
+what the smaller number leaves out).
 
-| Group | Rust lines | Milestone |
-|---|---|---|
-| `fleet/` | 4,443 | M8 |
-| `sandbox/` | 2,248 | M7 (77% of it; `wasm.rs` excluded — see roadmap) |
-| `definitions/` | 1,460 | M10 (JSON only; ZIP + YAML excluded) |
-| `telemetry/` | 322 | M9 (partial) |
+**Oracle groups still owed** (`sandbox/` completed at M7, so this table is
+narrower than it was; the scope qualifiers on the rest are **removed** — see the
+corrected section below):
+
+| Group | Rust lines | Milestone | Scope |
+|---|---|---|---|
+| `fleet/` | 4,443 | M8 | whole |
+| `definitions/` | 1,460 | M10 | whole — **ZIP and YAML included**; both former blockers are already in `lib/` (sankoch, bayan) |
+| `telemetry/` | 322 | M9 | whole — OTLP **and** the ungated logging init |
 
 **`src/main.cyr` is no longer a stub** — as of 2026-08-03 it wires the shared
 state, installs a `signalfd` SIGINT/SIGTERM handler, and calls `agnosai_serve`
@@ -923,12 +931,35 @@ use `cyrius build tests/<name>.tcyr /tmp/t && /tmp/t`, which is seconds.
 
 **What a next session would most usefully pick up**, in rough order of value:
 
+> ⚠ **Rewritten 2026-08-07.** The previous version of this table ranked M8/M10
+> last as *"past the parity bar rather than debt"*. That framing is retired.
+>
+> **The oracle is 41,163 lines, not 27,683 — and 15,427 of them are unported
+> (37.5%).** The 27,683 headline counts only `rust-old/src/**/*.rs`. It excludes
+> `rust-old/` minus `src/` (11,998 lines — benches, supply-chain, fuzz, tests,
+> examples, Makefile), `src/presets/*.json` (810 lines, `include_str!`'d **into
+> the binary**), and 672 lines of Rust-era files at this repo's own root
+> (`sdk/agnosai-tool-sdk`, README, CONTRIBUTING, Dockerfile).
+>
+> **A first draft of this banner said "~6,225 lines" — fleet + definitions +
+> telemetry only. That undercounts the src figure by 24% and the true figure by
+> 2.5x.** Of the 8,206 unported *src* lines, only 6,225 are in the three
+> unstarted groups; the rest are holes inside groups this file calls complete.
+>
+> ⚠ **"M0–M7 complete" is false for five of the eight.** M2 (`hwaccel` half of
+> `core/resource.rs`), M3 (`hwaccel` half of `llm/router.rs`, all of
+> `llm/inference_queue.rs`), M4 (`tools/{python_tool,wasm_tool,wasm_loader}.rs`
+> absent), M6 (`routes/definitions.rs`'s populated arm absent; `/metrics` serves
+> a different registry than the oracle), M7 (`sandbox/wasm.rs` absent).
+
 | | Why |
 |---|---|
-| The `telemetry` half of M9 | The **only default-build parity gap** left (JSON stderr logging + `EnvFilter`; see above). Needs an upstream sakshi ask, so it starts as a filing rather than a bite. |
+| **M8 `fleet`** (4,443 lines) | The largest unported group, and the single biggest remaining chunk of the port. Break into small bites; `discovery.rs` is a 174-line stub needing no sandhi, and `relay.rs` maps near-1:1 onto majra's `relay_*`. |
+| **M10 `definitions`** (1,460 lines) | Whole, including ZIP and YAML. **Declaring `sankoch` in `cyrius.cyml` is the entire ZIP prerequisite** — 26 `zip_*` fns are already in `lib/`. bayan's YAML is already there too. Turns `/api/v1/presets` from `[]` into a real branch. |
+| **M9 `telemetry`** (322 lines) | OTLP export (copy hoosh's `otlp.cyr`, 199 lines; thread-local trace context is mandatory under `run_pooled`) plus the JSON-logging + `EnvFilter` divergence, which starts as a sakshi filing — file it early so it lands while the rest is being ported. |
+| The `sandbox`-gated tools | `tools/{python_tool,wasm_tool,wasm_loader}.rs`, plus the `hwaccel` half of `core/resource.cyr`. **kavach already has a wasmtime backend with `--fuel`** (`lib/kavach.cyr:9867`), so the WASM pair is portable now. |
 | roadmap B2's remaining tail | `crew_runner`'s off-request-path bayan calls — the largest un-threaded allocator surface left. Everything request-reachable is done. |
 | D1 / D2 | Two decisions waiting on a human, not on work. Neither blocks anything. |
-| M8 `fleet` / M10 `definitions` | Real scope, but **past** the parity bar rather than debt — see the default-build table above before scheduling either as "remaining". |
 
 ⚠ **Do not** start by re-auditing performance on the request path. It was
 decomposed to the floor on 2026-08-07: the remaining cost is `alloc_via` × the
@@ -946,21 +977,26 @@ dead-end levers are recorded under *Benchmarks*.
 | Not started | M8 `fleet`, M9 `telemetry`, M10 `definitions` — but only part of M9 is a **default-build** gap; see below |
 | Gates | build OK · 1,834 symbols / 82 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · coverage **100% (1099/1099)** via `cyrius coverage --min 80` |
 
-### What "M8/M9/M10 not started" actually means — measured 2026-08-07
+### What "M8/M9/M10 not started" actually means — corrected 2026-08-07
 
-The parity bar is the **default cargo build**, and `rust-old/Cargo.toml` has
-`default = []` with
-`full = ["sandbox", "fleet", "definitions", "hwaccel", "otel", "kavach", "majra"]`.
-Against that bar the three remaining milestones are not equivalent:
+> ⚠ **This section used to argue that only part of M9 was a real gap**, because
+> `rust-old/Cargo.toml` has `default = []` and `fleet`/`definitions` are
+> `full`-only. **That framing is retired.** It was self-issued here, never a user
+> decision, and it survived four handoffs telling each new session that two of
+> the three remaining milestones were "past the bar rather than debt". **A cargo
+> feature gate is not a scope boundary.** All three are owed, in full, along with
+> the `sandbox`-gated tools, the `hwaccel` half of `core/resource.cyr`,
+> `genai.rs`, `inference_queue.rs`, the `#[tokio::test]` suites, `benches/` and
+> the non-`src` surface.
 
-| oracle module | lines | in the default build? |
+| oracle module | lines | status |
 |---|---|---|
-| `fleet/` | 4,443 | ✗ `full` only — porting it **extends** past the bar |
-| `definitions/` | 1,460 | ✗ `full` only — its visible effect is `/api/v1/presets`, and `[]` is **correct** parity |
-| `telemetry/` | 322 | ✓ **`pub mod telemetry;` is ungated** and `main.rs` initialises logging either way |
+| `fleet/` | 4,443 | owed in full — the largest unported group |
+| `definitions/` | 1,460 | owed in full, **including ZIP and YAML**: `lib/sankoch.cyr` already exports 26 `zip_*` fns (it is merely undeclared in `cyrius.cyml`) and bayan already ships `bayan_yaml_parse`. Both were listed as upstream filings owed; neither was ever real. |
+| `telemetry/` | 322 | owed in full — OTLP export **and** the ungated logging init |
 
-So the only default-build gap among the three is **part of** M9, and it is not
-OTLP: the oracle's `#[cfg(not(feature = "otel"))]` arm still runs
+The logging half is the one that is also a *default-build* divergence, and it is
+not OTLP: the oracle's `#[cfg(not(feature = "otel"))]` arm still runs
 `tracing_subscriber::fmt().with_env_filter(..agnosai=info..).json().init()`.
 sakshi has neither a JSON output mode nor an env filter, so the port emits plain
 text at sakshi's default level — a **stated** divergence documented at

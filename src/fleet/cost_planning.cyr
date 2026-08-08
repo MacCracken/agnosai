@@ -1,0 +1,325 @@
+# =========================================================================
+# fleet/cost_planning — cost-aware crew planning and model selection.
+#
+# Parity oracle: rust-old/src/fleet/cost_planning.rs
+#
+# GPU pricing tables, crew cost estimation, and budget-aware model selection,
+# so callers can plan crew executions within a dollar budget.
+#
+# Every price, throughput and cost here is an f64 carried as its IEEE-754 bit
+# pattern in an i64 — compare with f64_lt / f64_gt / f64_eq / f64_le, never
+# with the integer operators.
+# =========================================================================
+
+# GpuPricing heap layout — 40 bytes. Five USD-per-GPU-hour rates, each an f64
+# bit pattern. Mirrors the oracle's five `pub` fields in declaration order.
+enum AgnosaiGpuPricingOff {
+    AGN_GPRC_A100 = 0;
+    AGN_GPRC_H100 = 8;
+    AGN_GPRC_RTX4090 = 16;
+    AGN_GPRC_T4 = 24;
+    AGN_GPRC_L4 = 32;
+    AGN_GPRC_SIZE = 40;
+}
+
+# The model tier `model_throughput` classifies an identifier into. The oracle
+# returns this as the first element of its `(label, tok/s, hourly)` tuple;
+# Cyrius has no tuples, so the tier is the return value and the other two are
+# derived from it by `agnosai_cost_tier_tps` / `agnosai_cost_tier_rate`.
+#
+# ⚠ Named `AgnosaiCostTier`, NOT `AgnosaiModelTier` — `src/llm/router.cyr:24`
+# already owns that name and the `AGNOSAI_TIER_` member prefix for its
+# fast/capable/premium routing tiers. Cyrius has one flat namespace and is
+# **silent** on a duplicate enum; `scripts/check-symbols.sh` is what catches it.
+enum AgnosaiCostTier {
+    AGNOSAI_COST_TIER_LARGE = 0;
+    AGNOSAI_COST_TIER_MEDIUM = 1;
+    AGNOSAI_COST_TIER_OPEN_LARGE = 2;
+    AGNOSAI_COST_TIER_OPEN_SMALL = 3;
+    AGNOSAI_COST_TIER_UNKNOWN = 4;
+}
+
+# The oracle's `BUDGET_MODELS` const slice, cheapest-intent order preserved.
+# Hoisted to process-lifetime globals rather than built per call: the selection
+# loop reaches every one of them, and a `str_from` inside a loop body costs 16
+# bytes on the no-free global bump per iteration (roadmap B3).
+var AGN_CP_M_LLAMA_7B = str_from("llama-7b");
+var AGN_CP_M_MISTRAL_7B = str_from("mistral-7b");
+var AGN_CP_M_GPT_35_TURBO = str_from("gpt-3.5-turbo");
+var AGN_CP_M_LLAMA_70B = str_from("llama-70b");
+var AGN_CP_M_MIXTRAL_8X7B = str_from("mixtral-8x7b");
+var AGN_CP_M_CLAUDE_3_SONNET = str_from("claude-3-sonnet");
+var AGN_CP_M_GPT_4 = str_from("gpt-4");
+var AGN_CP_M_CLAUDE_3_OPUS = str_from("claude-3-opus");
+
+# The tier labels the oracle's tuple carries. Every caller binds them to `_tier`
+# and discards them, so nothing in `src/` reads these — they exist because the
+# oracle's shape has them, and a later consumer would expect the same spellings.
+var AGN_CP_T_LARGE = str_from("large");
+var AGN_CP_T_MEDIUM = str_from("medium");
+var AGN_CP_T_OPEN_LARGE = str_from("open-large");
+var AGN_CP_T_OPEN_SMALL = str_from("open-small");
+var AGN_CP_T_UNKNOWN = str_from("unknown");
+
+# Number of entries in the budget-selection table above.
+var AGN_CP_BUDGET_MODEL_COUNT = 8;
+
+# --- GpuPricing --------------------------------------------------------
+
+# Construct a pricing table from five USD-per-hour f64 bit patterns.
+fn agnosai_gpu_pricing_new(a100, h100, rtx4090, t4, l4): i64 {
+    var p = alloc(AGN_GPRC_SIZE);
+    store64(p + AGN_GPRC_A100, a100);
+    store64(p + AGN_GPRC_H100, h100);
+    store64(p + AGN_GPRC_RTX4090, rtx4090);
+    store64(p + AGN_GPRC_T4, t4);
+    store64(p + AGN_GPRC_L4, l4);
+    return p;
+}
+
+# The oracle's `Default` impl — early-2026 cloud spot rates.
+# 1.20, 0.35 and 0.80 have no exact binary representation, so they are built by
+# division rather than written as literals: f64 division is correctly rounded,
+# which reproduces the same bit pattern the Rust literal parses to.
+fn agnosai_gpu_pricing_default(): i64 {
+    var a100 = f64_from(3);
+    var h100 = f64_div(f64_from(9), f64_from(2));
+    var rtx4090 = f64_div(f64_from(12), f64_from(10));
+    var t4 = f64_div(f64_from(35), f64_from(100));
+    var l4 = f64_div(f64_from(8), f64_from(10));
+    return agnosai_gpu_pricing_new(a100, h100, rtx4090, t4, l4);
+}
+
+# The NVIDIA A100 (80 GB) rate — USD per GPU-hour, as an f64 bit pattern.
+fn agnosai_gpu_pricing_a100(p): i64 {
+    return load64(p + AGN_GPRC_A100);
+}
+
+# The NVIDIA H100 (80 GB) rate — USD per GPU-hour, as an f64 bit pattern.
+fn agnosai_gpu_pricing_h100(p): i64 {
+    return load64(p + AGN_GPRC_H100);
+}
+
+# The NVIDIA RTX 4090 (24 GB) rate — USD per GPU-hour, as an f64 bit pattern.
+fn agnosai_gpu_pricing_rtx4090(p): i64 {
+    return load64(p + AGN_GPRC_RTX4090);
+}
+
+# The NVIDIA T4 (16 GB) rate — USD per GPU-hour, as an f64 bit pattern.
+fn agnosai_gpu_pricing_t4(p): i64 {
+    return load64(p + AGN_GPRC_T4);
+}
+
+# The NVIDIA L4 (24 GB) rate — USD per GPU-hour, as an f64 bit pattern.
+fn agnosai_gpu_pricing_l4(p): i64 {
+    return load64(p + AGN_GPRC_L4);
+}
+
+# Append one "<label>=$<rate>/h" field to a builder, two decimal places.
+fn _agnosai_pricing_field(sb, label, rate): i64 {
+    var buf[32];
+    str_builder_add_cstr(sb, label);
+    var n = fmt_float_buf(rate, &buf, 2);
+    store8(&buf + n, 0);
+    str_builder_add_cstr(sb, &buf);
+    str_builder_add_cstr(sb, "/h");
+    return 0;
+}
+
+# The oracle's `Display` impl, field order and separators byte for byte:
+# "A100=$3.00/h H100=$4.50/h RTX4090=$1.20/h T4=$0.35/h L4=$0.80/h"
+fn agnosai_gpu_pricing_display(p): i64 {
+    var sb = str_builder_new();
+    _agnosai_pricing_field(sb, "A100=$", load64(p + AGN_GPRC_A100));
+    str_builder_add_cstr(sb, " ");
+    _agnosai_pricing_field(sb, "H100=$", load64(p + AGN_GPRC_H100));
+    str_builder_add_cstr(sb, " ");
+    _agnosai_pricing_field(sb, "RTX4090=$", load64(p + AGN_GPRC_RTX4090));
+    str_builder_add_cstr(sb, " ");
+    _agnosai_pricing_field(sb, "T4=$", load64(p + AGN_GPRC_T4));
+    str_builder_add_cstr(sb, " ");
+    _agnosai_pricing_field(sb, "L4=$", load64(p + AGN_GPRC_L4));
+    return str_builder_build(sb);
+}
+
+# --- model classification ----------------------------------------------
+
+# The oracle's `model.to_ascii_lowercase().contains(needle)` WITHOUT
+# materialising the lowercased copy. Every needle below is already lowercase, so
+# only the haystack byte needs folding, and A-Z is the whole of Rust's
+# ascii-lowercase mapping.
+#
+# Why not the obvious spellings: `lib/str.cyr` has no case-insensitive verb, and
+# `lib/string.cyr`'s `str_lower_cstr` allocates a fresh buffer per call — 16+
+# bytes on the no-free global bump, inside a loop that runs once per candidate
+# model. Walking the haystack in place allocates nothing and copies nothing.
+#
+# ⚠ A stack buffer would ALSO have been fine, and an earlier version of this
+# comment claimed otherwise. It said an array local this size "exceeds cyrius's
+# per-fn stack budget, so the compiler keeps it in a shared global rather than
+# per-thread", making it a race under `run_pooled`. **That is false.** The
+# budget is 15,360 frame slots — 122,880 bytes, counted cumulatively per
+# function (`cyrius/src/frontend/parse_decl.cyr:89`), verified by bisection:
+# 122,864 B stays on the stack, 122,872 B relocates. A `var buf[256]` is 32
+# slots, a 480x margin. The claim came from misreading the build's two
+# `oversized array local` notes, which carry NO file:line and originate in
+# `lib/sigil.cyr`'s `argon2_hash_into` and `hash_file_into` — neither of which
+# agnosai calls. Recorded because the wrong version was persuasive.
+fn _agnosai_contains_ci(hay, needle_cstr): i64 {
+    var hlen = str_len(hay);
+    var nlen = strlen(needle_cstr);
+    if (nlen > hlen) { return 0; }
+    var hd = str_data(hay);
+    var i = 0;
+    while (i <= hlen - nlen) {
+        var j = 0;
+        var ok = 1;
+        while (j < nlen) {
+            var c = load8(hd + i + j);
+            if (c >= 65) {
+                if (c <= 90) { c = c + 32; }
+            }
+            if (c != load8(needle_cstr + j)) {
+                ok = 0;
+                j = nlen;
+            } else {
+                j = j + 1;
+            }
+        }
+        if (ok == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The oracle's `model_throughput` classification arm, tested in the SAME ORDER —
+# the order is observable, since "gpt-4" is tested before "gpt-3.5" and an
+# identifier containing both would tier as large either way only by accident.
+fn _agnosai_cost_tier(model): i64 {
+    if (_agnosai_contains_ci(model, "gpt-4") == 1) { return AGNOSAI_COST_TIER_LARGE; }
+    if (_agnosai_contains_ci(model, "claude-3-opus") == 1) { return AGNOSAI_COST_TIER_LARGE; }
+    if (_agnosai_contains_ci(model, "gpt-3.5") == 1) { return AGNOSAI_COST_TIER_MEDIUM; }
+    if (_agnosai_contains_ci(model, "claude-3-sonnet") == 1) { return AGNOSAI_COST_TIER_MEDIUM; }
+    if (_agnosai_contains_ci(model, "llama-70b") == 1) { return AGNOSAI_COST_TIER_OPEN_LARGE; }
+    if (_agnosai_contains_ci(model, "mixtral") == 1) { return AGNOSAI_COST_TIER_OPEN_LARGE; }
+    if (_agnosai_contains_ci(model, "llama-7b") == 1) { return AGNOSAI_COST_TIER_OPEN_SMALL; }
+    if (_agnosai_contains_ci(model, "llama-8b") == 1) { return AGNOSAI_COST_TIER_OPEN_SMALL; }
+    if (_agnosai_contains_ci(model, "mistral-7b") == 1) { return AGNOSAI_COST_TIER_OPEN_SMALL; }
+    return AGNOSAI_COST_TIER_UNKNOWN;
+}
+
+# The tier's label — the oracle's tuple element 0. See the globals above for why
+# this has no caller in `src/`.
+fn agnosai_cost_tier_label(tier): i64 {
+    if (tier == AGNOSAI_COST_TIER_LARGE) { return AGN_CP_T_LARGE; }
+    if (tier == AGNOSAI_COST_TIER_MEDIUM) { return AGN_CP_T_MEDIUM; }
+    if (tier == AGNOSAI_COST_TIER_OPEN_LARGE) { return AGN_CP_T_OPEN_LARGE; }
+    if (tier == AGNOSAI_COST_TIER_OPEN_SMALL) { return AGN_CP_T_OPEN_SMALL; }
+    return AGN_CP_T_UNKNOWN;
+}
+
+# Approximate tokens/second for the tier — the oracle's tuple element 1.
+fn agnosai_cost_tier_tps(tier): i64 {
+    if (tier == AGNOSAI_COST_TIER_LARGE) { return f64_from(40); }
+    if (tier == AGNOSAI_COST_TIER_MEDIUM) { return f64_from(80); }
+    if (tier == AGNOSAI_COST_TIER_OPEN_LARGE) { return f64_from(50); }
+    if (tier == AGNOSAI_COST_TIER_OPEN_SMALL) { return f64_from(120); }
+    return f64_from(80);
+}
+
+# The GPU hourly rate the tier bills at — the oracle's tuple element 2.
+fn agnosai_cost_tier_rate(tier, pricing): i64 {
+    if (tier == AGNOSAI_COST_TIER_LARGE) { return load64(pricing + AGN_GPRC_A100); }
+    if (tier == AGNOSAI_COST_TIER_MEDIUM) { return load64(pricing + AGN_GPRC_L4); }
+    if (tier == AGNOSAI_COST_TIER_OPEN_LARGE) { return load64(pricing + AGN_GPRC_A100); }
+    if (tier == AGNOSAI_COST_TIER_OPEN_SMALL) { return load64(pricing + AGN_GPRC_T4); }
+    return load64(pricing + AGN_GPRC_L4);
+}
+
+# --- estimation ---------------------------------------------------------
+
+# Estimate the total USD cost of running a crew, as an f64 bit pattern.
+#
+# ⚠ The oracle's `let Some(..) = model_throughput(..) else { return 0.0 }` arm
+# is UNREACHABLE — every branch of `model_throughput` returns `Some`, including
+# its fallthrough. There is no Cyrius counterpart because `_agnosai_cost_tier`
+# is total; the oracle's `0.0` is documented here rather than reproduced as a
+# branch nothing can enter (roadmap section E).
+fn agnosai_estimate_crew_cost(tasks, avg_tokens_per_task, model, pricing): i64 {
+    var tier = _agnosai_cost_tier(model);
+    var tps = agnosai_cost_tier_tps(tier);
+    var hourly = agnosai_cost_tier_rate(tier, pricing);
+    var total_tokens = f64_mul(f64_from(tasks), f64_from(avg_tokens_per_task));
+    var seconds = f64_div(total_tokens, tps);
+    var hours = f64_div(seconds, f64_from(3600));
+    sakshi_debug("crew cost estimate", 18);
+    return f64_mul(hours, hourly);
+}
+
+# --- budget-aware selection ---------------------------------------------
+
+# The i-th entry of the oracle's `BUDGET_MODELS`.
+fn _agnosai_budget_model(i): i64 {
+    if (i == 0) { return AGN_CP_M_LLAMA_7B; }
+    if (i == 1) { return AGN_CP_M_MISTRAL_7B; }
+    if (i == 2) { return AGN_CP_M_GPT_35_TURBO; }
+    if (i == 3) { return AGN_CP_M_LLAMA_70B; }
+    if (i == 4) { return AGN_CP_M_MIXTRAL_8X7B; }
+    if (i == 5) { return AGN_CP_M_CLAUDE_3_SONNET; }
+    if (i == 6) { return AGN_CP_M_GPT_4; }
+    return AGN_CP_M_CLAUDE_3_OPUS;
+}
+
+# (model, cost) candidate pair — 16 bytes.
+enum AgnosaiCostPairOff {
+    AGN_CPAIR_MODEL = 0;
+    AGN_CPAIR_COST = 8;
+    AGN_CPAIR_SIZE = 16;
+}
+
+# Ascending comparator over candidate cost, reproducing the oracle's
+# `a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)`: a NaN on either side makes
+# both f64_lt and f64_gt answer 0, which falls through to Equal exactly as the
+# `unwrap_or` does.
+fn _agnosai_cmp_cost_asc(x, y): i64 {
+    var ca = load64(x + AGN_CPAIR_COST);
+    var cb = load64(y + AGN_CPAIR_COST);
+    if (f64_lt(ca, cb) == 1) { return 0 - 1; }
+    if (f64_gt(ca, cb) == 1) { return 1; }
+    return 0;
+}
+
+# Select the cheapest model whose estimated cost fits `budget_usd`, or 0 for the
+# oracle's `None`.
+#
+# The tie between "llama-7b" and "mistral-7b" is REACHABLE and its resolution is
+# observable: both classify open-small, so both cost identically and the sort
+# order decides which is returned. Rust's `sort_by` is stable, and `vec_sort_by`
+# is introsort whose `while (h - l > 16)` guard is never entered at 8 elements —
+# it runs pure insertion sort, which is also stable. Both therefore return
+# "llama-7b", the earlier entry. A table that ever grows past 17 entries loses
+# that guarantee and needs a stable sort here.
+fn agnosai_select_cheapest_model(budget_usd, tasks, avg_tokens_per_task, pricing): i64 {
+    var v = vec_new();
+    var i = 0;
+    while (i < AGN_CP_BUDGET_MODEL_COUNT) {
+        var m = _agnosai_budget_model(i);
+        var pair = alloc(AGN_CPAIR_SIZE);
+        store64(pair + AGN_CPAIR_MODEL, m);
+        store64(pair + AGN_CPAIR_COST, agnosai_estimate_crew_cost(tasks, avg_tokens_per_task, m, pricing));
+        vec_push(v, pair);
+        i = i + 1;
+    }
+    agnosai_sort(v, &_agnosai_cmp_cost_asc);
+    i = 0;
+    while (i < vec_len(v)) {
+        var e = vec_get(v, i);
+        if (f64_le(load64(e + AGN_CPAIR_COST), budget_usd) == 1) {
+            sakshi_info("selected cheapest model within budget", 37);
+            return load64(e + AGN_CPAIR_MODEL);
+        }
+        i = i + 1;
+    }
+    sakshi_warn("no model fits within budget", 27);
+    return 0;
+}

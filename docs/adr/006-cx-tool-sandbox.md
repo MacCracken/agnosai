@@ -63,13 +63,28 @@ kavach instead:
 | Ambient authority | WASI ctx with only stdin/stdout | **kavach seccomp** (`strict`/`basic` profiles) + **landlock** rules |
 | Filesystem | none linked | **landlock** rules, default-deny |
 | Memory bound | `StoreLimits` | cxvm's fixed **64 KB data segment** + kavach rlimits |
-| CPU / wall-clock | fuel + epoch deadline | **kavach process timeout** — there is no fuel equivalent |
+| CPU / wall-clock | fuel + epoch deadline | **kavach process timeout** on the cx path — ⚠ see the correction below; fuel is *not* unavailable |
 | Result channel | stdout pipe, exit code | same — process stdout + exit code |
 
 Net: filesystem and network confinement get *stronger* (kernel-enforced seccomp/landlock
-rather than in-process linking choices). Fine-grained CPU metering gets *weaker* — fuel
-gave deterministic instruction budgets; a process timeout does not. Tools that need to be
-billed or bounded by instruction count lose that.
+rather than in-process linking choices). On the **cx** path, fine-grained CPU metering is
+weaker — a process timeout is not a deterministic instruction budget.
+
+> ### ⚠ Correction 2026-08-07 — "there is no fuel equivalent" is FALSE
+>
+> Verified against the pinned 6.5.10 `lib/kavach.cyr`: **kavach ships a wasmtime
+> backend.** `wasm_exec` / `wasm_health` / `wasm_destroy` at :9976-10028,
+> registered by `backend_wasm_register()` at :11208, shelling out to the
+> `wasmtime` CLI with **`--fuel`** (`_wasm_fuel_from_timeout`, :9905),
+> `--max-memory-size` (:9936) and `--dir` preopens (`_wasm_append_preopens`,
+> :9913).
+>
+> So the trade recorded here is real **only for Cyrius-authored `.cyx` tools**,
+> which is what cx is for. It is not a property of the platform, and it was used
+> to justify treating `tools/wasm_tool.rs` and `tools/wasm_loader.rs` as out of
+> scope. **They are in scope** and port onto kavach's WASM backend, where fuel,
+> memory bounds and preopens are all available. cx and WASM are complementary
+> backends, not alternatives — this ADR's decision stands, its exclusion does not.
 
 **Hard requirement: no code path may execute a `.cyx` outside a kavach sandbox.** A
 `cxvm` spawn that is not wrapped is a full sandbox escape, not a degraded one.
@@ -91,9 +106,13 @@ the Rust design and cannot be a drop-in.
 - Kernel-enforced confinement rather than in-process.
 
 **Lost / accepted risk**
-- **No fuel.** Wall-clock timeout only. A tool can burn its whole budget spinning.
-- **Not a drop-in for existing `.wasm` tools.** Anything shipped as WASM must be rewritten
-  in Cyrius. `examples/wasm-tools/` and the tool SDK do not port.
+- **No fuel *on the cx path*.** Wall-clock timeout only, so a `.cyx` tool can burn its
+  whole budget spinning. ⚠ Corrected 2026-08-07: this is a property of cx, **not** of the
+  platform — kavach's WASM backend passes `--fuel`. See the correction above.
+- **Not a drop-in for existing `.wasm` tools *onto cx*.** A tool rewritten for cx must be
+  written in Cyrius. ⚠ Corrected 2026-08-07: an existing `.wasm` artifact does **not** have
+  to be rewritten to run at all — it runs on kavach's WASM backend. `examples/wasm-tools/`
+  and the tool SDK are **in scope**, not dropped.
 - **Isolation is entirely kavach's.** A kavach misconfiguration is a full escape. This
   deserves a threat-model entry and a test that asserts a `.cyx` attempting `open("/etc/passwd")`
   is refused.

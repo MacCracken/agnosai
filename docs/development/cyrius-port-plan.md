@@ -5,11 +5,14 @@
 > 2026-08-04 audit fixed, 41 mutation-verified). Remaining: Phases 7-9.
 > Pinned **cyrius 6.5.10** (2026-08-07).
 >
-> ⚠ **Read the Phase 7-9 headings before scheduling them.** Measured against the
-> parity bar defined below — the **default cargo build**, and `default = []` —
-> `fleet` and `definitions` are `full`-feature-only and are therefore *not*
-> default-build gaps at all. Only part of `telemetry` is. That materially changes
-> what "remaining" means, and it is recorded at each phase.
+> ⚠ **The "default cargo build is the parity bar" framing is RETIRED (2026-08-07).**
+> This header used to tell you that `fleet` and `definitions` are `full`-only and
+> therefore "not default-build gaps at all". That was written here, never decided
+> by the user, and it survived four handoffs as the plan of record. **A cargo
+> feature gate is not a scope boundary.** Phases 7-9 are owed work, not
+> extensions, and so are the `sandbox`-gated tools, the `hwaccel` half of
+> `core/resource.rs`, `genai.rs`, `inference_queue.rs`, the `#[tokio::test]`
+> suites, `benches/` and the non-`src` surface. See *Parity definition* below.
 >
 > **All eight numbered blockers are closed, and nothing blocks anything.** The
 > table below is kept as a *reasoning archive*, not a work list — several of its
@@ -106,7 +109,7 @@ Keep `lib/async.cyr` in scope for **client-side fan-out only**.
 | 3 | **`sandhi_router_dispatch` allocates per request, never frees** | ✅ **CLOSED 2026-07-31** — transport half by sandhi 1.9.7, handler half by bayan 1.4.0 (cyrius 6.5.5). Original finding kept below. | Confirmed. But bypassing the router alone buys ~32 B/req out of a **~700–4096 B/req** leak: the whole bare `sandhi_server_*` accessor + `_send_*` family allocates on the global bump. Mitigation is agnosai-side and needs no upstream change: write our own handler on the raw `fn(ctx, cfd, buf, blen)` signature, take a per-worker arena, and use the `_a` variants **everywhere**, with one `reset_via` exit path. Invariant: nothing outliving the request (registry, router table, config) may come from the arena. **Residual we cannot close from a handler:** `_sandhi_server_pool_worker` itself calls bare `sandhi_server_send_status` on the smuggling rejects (~176 B/req before our handler runs) — a malformed-request flood at 10k req/s leaks ~1.76 MB/s. If internet-facing, replace `run_pooled` with a ~40-line accept loop (every primitive is in the fold); if behind a reverse proxy, accept it. Regression test: assert `alloc_used()` delta ≈ 0 over N thousand requests. |
 | 4 | **`chan_try_send` does not exist** | ✅ **SHIPPED in cyrius 6.4.84** | Was absent on all three backends. Filed 2026-07-28, shipped the same day: `chan_try_send(ch, val)` on `thread.cyr:409` / `thread_win.cyr:112` / `thread_agnos.cyr:116`, uniform contract **0** enqueued / **−1** closed / **−2** full, gated by a 20-assertion `vr01_` test on real hardware. The fix also uncovered that `chan_try_recv` and `chan_close` had been raising SIGSYS on macOS since forever — the channel fns called `SYS_FUTEX` directly, bypassing the macOS mutex backend; all three now route through `_chan_wake`. agnosai is pinned to 6.4.85. **Important correction to the mapping:** every `let _ = tx.send(..)` in agnosai is a tokio **broadcast** send, which never blocks and never fails — a lagging subscriber gets the ring's *oldest* overwritten and reads `Lagged(n)` (sse.rs:266-279). So the Cyrius equivalent is **not** "drop the newest when full", it is "**evict the oldest**". A naive `tx.send` → `chan_send` port converts never-block-lossy into block-forever, the worst possible regression for SSE fan-out. Port as a private `agnosai_chan_push_lossy` built **on top of** `chan_try_send` — the primitive gives "drop the newest when full", agnosai needs "evict the oldest", so on `-2` advance `head` and retry, keeping a lag counter. **Our filing was wrong on one point:** it proposed aliasing `chan_try_send` to `chan_send` on agnos/Windows since those never block. They return `-1` on FULL and never inspect `closed`, so that alias would have made closed and full indistinguishable on exactly those backends. Upstream wrote all three out properly instead. **Downstream status:** the majra half is **fixed in majra 2.5.3** (2026-07-28) — publish now snapshots each subscriber list under one short lock and walks it unlocked, so a lagging subscriber no longer freezes unrelated topics. 2.5.3 also closed two silent data-loss races in `pubsub_subscribe` and `mq_enqueue` (unlocked `fl_alloc` handing two subscribers the same block). agnosai is pinned to 2.5.3. |
 | 5 | **`SandboxPolicy` name collision** | 🟢 **downgraded to hygiene** | Not reachable as filed. The two structs' **field names are disjoint**, so no accessor symbol actually collides — and 6.4.83 *warns* on duplicate definitions rather than silently taking the last. Also, agnosai's strength lives on `IsolationLevel` (policy.rs:30-33), which has no kavach counterpart at all. Still do the `AgnSandboxPolicy` rename: one-line edit, cheap insurance, and the safety margin here should not depend on two type definitions staying disjoint by accident. |
-| 6 | ~~No WASM runtime anywhere~~ → **tool sandbox rides `cx`** | ✅ **DECIDED — see [ADR-006](../adr/006-cx-tool-sandbox.md)** | The earlier verdict conflated the *format* with the *capability*. WASM is an explicit cyrius non-goal, but what those 955 lines buy is **sandboxed portable execution of untrusted tool code**, and the **cx** arc — opened because a consumer "hit the wasm-shaped wall" — ships that today. Verified: `cycc_cx` compiles `.cyr` → `.cyx`, `cxvm` runs it from stdin, exit code passes through (6×7 probe → 42). Both installed. **The critical finding: `cxvm` is NOT a sandbox** — opcode `0x70` dispatches guest syscalls straight to the host kernel (`programs/cxvm.cyr:309-311`), with no allowlist, no filtering, no capability model. Every isolation guarantee therefore comes from **kavach** (seccomp `strict`/`basic` + landlock, both real). Filesystem/network confinement gets *stronger* (kernel-enforced); CPU metering gets *weaker* (wall-clock timeout, no fuel equivalent). **Hard requirement: no path may exec a `.cyx` outside a kavach sandbox** — an unwrapped `cxvm` spawn is a full escape. Arc-A limits, all verified: x86-Linux only, 64 KB caps, **float literals silently miscompile**, bare of stdlib. |
+| 6 | ~~No WASM runtime anywhere~~ → **tool sandbox rides `cx`** | ⚠ **PREMISE FALSIFIED 2026-08-07 — kavach has a wasmtime backend.** The cx decision stands on its own merits, but it was justified by a claim that is not true: `lib/kavach.cyr:9867-10033` exports `wasm_exec` / `wasm_health` / `wasm_destroy`, registered at :11208, shelling out to the `wasmtime` CLI with **`--fuel`** (`_wasm_fuel_from_timeout`, :9905), `--max-memory-size` and `--dir` preopens. So *"no WASM runtime anywhere"* is false and ADR-006's *"no fuel equivalent"* is false. **The WASM path is in scope**: `tools/wasm_tool.rs` and `tools/wasm_loader.rs` port onto kavach's WASM backend, and cx remains the sandbox for Cyrius-authored tools. Original entry follows. | The earlier verdict conflated the *format* with the *capability*. WASM is an explicit cyrius non-goal, but what those 955 lines buy is **sandboxed portable execution of untrusted tool code**, and the **cx** arc — opened because a consumer "hit the wasm-shaped wall" — ships that today. Verified: `cycc_cx` compiles `.cyr` → `.cyx`, `cxvm` runs it from stdin, exit code passes through (6×7 probe → 42). Both installed. **The critical finding: `cxvm` is NOT a sandbox** — opcode `0x70` dispatches guest syscalls straight to the host kernel (`programs/cxvm.cyr:309-311`), with no allowlist, no filtering, no capability model. Every isolation guarantee therefore comes from **kavach** (seccomp `strict`/`basic` + landlock, both real). Filesystem/network confinement gets *stronger* (kernel-enforced); CPU metering gets *weaker* (wall-clock timeout, no fuel equivalent). **Hard requirement: no path may exec a `.cyx` outside a kavach sandbox** — an unwrapped `cxvm` spawn is a full escape. Arc-A limits, all verified: x86-Linux only, 64 KB caps, **float literals silently miscompile**, bare of stdlib. |
 | 7 | **Live Rust bug, fix first** | ✅ **FIXED 2026-07-28** | `cargo check --no-default-features --features kavach` failed: crew_runner.rs:199 gated on `kavach` but reached into `crate::sandbox::`, which lib.rs:27 gates on `sandbox`; only `full` hid it. Now `all(feature = "kavach", feature = "sandbox")`. All 9 feature combos compile; fmt + clippy clean; **863 + 2 + 1 tests pass**. The baseline is now a valid oracle. |
 | 8 | **No O(n log n) sort** *(promoted from "Corrections")* | ✅ **CLOSED** — cyrius 6.5.4 shipped `vec_sort_by`/`vec_select_nth`; `src/order.cyr` is now a 98-line wrapper over them. Original measurements kept below. | Measured on this box at 6.4.83: an itihas-style insertion sort over agnosai's 100k-entry percentile vector (load_testing.rs) costs **52.6 seconds**; heapsort costs 87 ms (605×); three quickselects cost ~21 ms. Vendor both `ai_sort` (iterative in-place heapsort — O(n log n) *worst* case, O(1) extra memory, no recursion depth; not stable, and no site needs stability) and `ai_select_nth` (Hoare quickselect, median-of-3) — percentiles never needed a full sort. **Naming is load-bearing:** prefix `ai_*`; never define a bare `vec_sort`, which itihas exports unprefixed into the flat namespace. Second-order: scheduler.rs:257's `BinaryHeap` has no stdlib equivalent either — build it on the same sift primitive, or just sort the (small) ready-set each round. |
 
@@ -237,11 +240,10 @@ correction:** `discovery.rs` does *not* map to `sandhi_discovery_*` (sandhi
 resolves ONE service by name, no enumerate, no metadata map) — it's 174 lines of
 stub needing no sandhi at all.
 
-⚠ **Not a default-build gap.** `fleet` appears only in
-`full = ["sandbox", "fleet", "definitions", "hwaccel", "otel", "kavach", "majra"]`
-and `default = []`, so the build this port takes as its parity oracle never
-compiles it. Porting it *extends* agnosai past the bar rather than closing a hole
-in it — a legitimate goal, but schedule it as scope, not as debt.
+⚠ A note here read *"Not a default-build gap … porting it extends agnosai past
+the bar rather than closing a hole in it."* **Retired 2026-08-07** — the
+default-build bar was self-issued. `fleet` is the largest unported group and is
+owed. "Zero consumers" is a consequence of not having ported it.
 
 ### Phase 8 — `telemetry` (partial)
 Copy hoosh's proven `otlp.cyr` (199 lines) — this is the one place the remote
@@ -262,13 +264,21 @@ documented at `src/main.cyr:22-26` — log *content* matches the oracle line for
 line, transport and format do not. Decide whether to close it (needs sakshi
 work, i.e. an upstream ask) before treating Phase 8 as purely additive.
 
-### Phase 9 — `definitions` (partial)
-assembler, loader-JSON, presets, versioning, k8s_crd (which parses **JSON** only
-— the ```yaml at k8s_crd.rs:33 is a doc comment). **Defer** ZIP container +
-packaging + YAML.
+### Phase 9 — `definitions` (whole)
+assembler, loader, presets, versioning, k8s_crd, **plus the ZIP container,
+packaging and YAML halves**. Both former "defer" reasons are dead:
 
-⚠ **Not a default-build gap**, same as Phase 7 — `definitions` is `full`-only.
-The visible consequence is `GET /api/v1/presets`, which the port answers `[]`.
+- **ZIP** — `lib/sankoch.cyr` already exports 26 `zip_*` fns plus `tar_*`,
+  `deflate_*`, `gzip_*`, `crc32_*`. **The only gap is that `sankoch` is not
+  declared in `cyrius.cyml`.** No filing needed.
+- **YAML** — bayan shipped `bayan_yaml_parse` / `_parse_buf` / `_parse_ctx` /
+  `bayan_yaml_frontmatter_split`, returning the same tagged value tree as JSON.
+  Note `k8s_crd.rs:33`'s ` ```yaml ` really is a doc comment — that file parses
+  JSON — but the *loader's* YAML half is real and is now portable.
+
+⚠ A note here read *"Not a default-build gap, same as Phase 7 — `definitions` is
+`full`-only."* **Retired 2026-08-07.** The visible consequence is
+`GET /api/v1/presets`, which the port answers `[]`.
 **That is correct parity, not a stub**: the oracle's body is
 `#[cfg(feature = "definitions")]` / `#[cfg(not(..))]`, the `not` arm returns
 `Json(vec![])`, and the oracle's own test asserts empty under default features.
@@ -279,17 +289,38 @@ until then, do not "fix" the empty array.
 
 ## Parity definition — what v2.0.0 is
 
-**Ships** (the whole default cargo build — `default = []` → core + orchestrator +
-llm + tools + server + learning), plus fleet, plus 77% of sandbox, plus
-JSON-only definitions, plus OTLP telemetry.
+**The whole of `rust-old/`** — every module, every cargo feature, every test,
+every benchmark, every build target. **Wire parity is the bar**, judged against
+`rust-old/`.
 
-**Excluded, with reason:**
-- **bhava / `personality`** — not ported (user decree, post-v2).
-- **WASM as a FORMAT** — not ported (explicit cyrius non-goal). The *capability* ships: the tool sandbox rides **cx** + kavach per ADR-006. Existing `.wasm` tools, the tool SDK and `examples/wasm-tools/` do **not** port — they must be rewritten in Cyrius.
-- **definitions ZIP + YAML** — both behind the non-default `definitions` feature; both are upstream filings.
-- **genai.rs, inference_queue.rs** — zero consumers; pending sign-off.
+**One carve-out, and it is a dependency fact rather than a scope call:**
+**bhava / `personality`** — bhava has not been ported to Cyrius yet
+(`~/Repos/bhava` is still a Rust tree), so there is nothing to depend on. The
+wire keeps emitting `null`, which is what the default Rust build emits.
 
-**Wire parity is the bar**, judged against `rust-old/`.
+> ### ⚠ The old exclusion list was self-issued, and three of its four rows were
+> ### factually wrong — corrected 2026-08-07
+>
+> This section used to scope v2.0.0 to *"the whole default cargo build … plus
+> 77% of sandbox, plus JSON-only definitions"* and list four exclusions. Of the
+> four, only `bhava` was ever a user decision. The other three were written here
+> and then read back by every later session as settled. **All three collapse on
+> a single grep of `lib/`:**
+>
+> | Claimed | Reality on the 6.5.10 pin |
+> |---|---|
+> | *"WASM — explicit cyrius non-goal, no runtime anywhere"* (blocker #6) | **FALSE.** `lib/kavach.cyr:9867-10033` is a full wasmtime backend — `wasm_exec` / `wasm_health` / `wasm_destroy`, registered by `backend_wasm_register()` at :11208. |
+> | *"CPU metering gets weaker — no fuel equivalent"* (ADR-006) | **FALSE.** `_wasm_fuel_from_timeout` (:9905) passes `--fuel`, alongside `--max-memory-size` and `--dir` preopens. |
+> | *"definitions ZIP — an upstream filing owed to sankoch"* | **FALSE.** `lib/sankoch.cyr` already exports **26 `zip_*`** fns (`zip_open/add/extract/find/writer_init/writer_finish/enc_begin/…`), plus 10 `tar_*`, 16 `deflate_*`, 12 `gzip_*`, 7 `crc32_*`. The only real gap is that **`sankoch` is not declared in `cyrius.cyml`**. |
+> | *"definitions YAML — an upstream filing"* | **FALSE.** bayan shipped `bayan_yaml_parse` / `_parse_buf` / `_parse_ctx` / `bayan_yaml_frontmatter_split`, verified 2026-08-03. |
+> | *"genai.rs, inference_queue.rs — pending sign-off"* | No sign-off was ever requested. Both are in scope. |
+>
+> This is the *Corrections* pattern below repeating itself: eight capabilities
+> in this file were once declared absent and every one was present. **A cargo
+> feature gate is not a scope boundary, "zero consumers" is a consequence of not
+> porting rather than a reason not to, and an unverified "cyrius can't do that"
+> has been wrong every single time it has been checked.** Read the module before
+> writing another one.
 
 ## Test strategy — do NOT copy hoosh
 
@@ -314,7 +345,7 @@ included later (last-definition-wins, silently). Real modules **are** includable
 | Repo | Ask |
 |---|---|
 | bayan | ✅ **both filed 2026-07-16** — YAML parse → the existing tagged value tree: `bayan/docs/development/issues/2026-07-16-agnosai-yaml-parse-into-tagged-value-tree.md` (also accepted onto bayan's roadmap as `bayan_yaml_*`; the "draft written" here never materialized as a file — the filing supersedes it); JSON recursion-depth cap (blocker #2): `bayan/docs/development/issues/2026-07-16-agnosai-json-no-recursion-depth-cap.md` — ✅ **resolved in bayan 1.1.1** (cap 128, serde_json parity; 101/101 asserts green) |
-| sankoch | ZIP archive container (deflate + crc32 already there; ~250 lines) |
+| sankoch | ~~ZIP archive container (deflate + crc32 already there; ~250 lines)~~ — ✅ **NOTHING OWED. This ask was never real.** Verified 2026-08-07 against the 6.5.10 `lib/sankoch.cyr`: **26 `zip_*`** fns (`zip_open`, `zip_add`, `zip_add_meta`, `zip_extract`, `zip_extract_capped`, `zip_find`, `zip_count`, `zip_writer_init`, `zip_writer_finish`, `zip_enc_begin/write/end`, and the full `zip_entry_*` accessor set), plus 10 `tar_*`, 16 `deflate_*`, 12 `gzip_*`, 14 `zlib_*`, 7 `crc32_*`, `zstd_*`, `lz4f_*`, `br_*`. **`sankoch` is simply not declared in `cyrius.cyml`** — declaring it is the whole of the work. |
 | cyrius | **Every agnosai filing to date is now resolved.** Shipped since this table was written, in order: `chan_try_send` (6.4.84), `vec_sort_by`/`vec_select_nth` (6.5.4), `sys_exit_group` + `async_await_readable_ms` (6.5.6), `thread_create_detached` and the coverage corpus buffer (6.5.8), the unconditional-futex-wake mutex and the fixed-capacity arena (6.5.9), and **`alloc_via` call-chain overhead (6.5.10)**. `2026-07-29-fmt-int-buf-i64-min.md` is also closed — `fmt.cyr`, `string.cyr`, `log.cyr` and sakshi 2.4.8 all guard `i64::MIN` now, verified by formatting it. Still open at 6.5.10: `2026-07-28-sock-send-result-allocates-per-call.md` (16 B/response) and `2026-07-29-no-portable-xmkdir-in-io-cyr.md`. Original row follows. ✅ **`chan_try_send` filed 2026-07-28** and **resolved in 6.4.84** (blocker #4; the load-bearing evidence is majra's hub-mutex-across-blocking-send, not agnosai's own call sites) — archived upstream. ✅ **`vec_sort_by` / `vec_select_nth` filed 2026-07-28** as `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md`, still open — 18+ consumers (itihas, sankhya, goonj, naad, agora, mela, mneme, samay, stiva, takumi, sit, shakti, varna, chakshu, darshini, hisab, nous, dhvani) have each independently reimplemented an O(n²) insertion sort, which is the strongest possible argument that this is a stdlib gap rather than an app concern. *(This row previously read "still to file" — it had already been filed the same day.)* Also open from agnosai: `2026-07-28-sock-send-result-allocates-per-call.md`, `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md`, `2026-07-29-fmt-int-buf-i64-min.md` |
 | kavach | WASM availability one-liner; stderr capture; **exec timeout — an undocumented regression** (Rust 2.0.0 shipped it, the Cyrius port dropped it, ADR-004 omits it) |
 | sigil | `pem_decode_pubkey` — a ~20-line clone of `pem_decode_privkey`. **Nice-to-have, not a blocker** (see below) |
