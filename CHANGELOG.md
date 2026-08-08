@@ -7,6 +7,172 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **RS256 JWT verification was an authentication bypass under load. Fixed by
+  serialising the sigil call; the real fix belongs upstream.**
+
+  `_agnosai_auth_validate_jwt` now calls `_agnosai_auth_rsa_verify_locked`
+  (`src/server/auth.cyr`), which holds a process-global mutex across
+  `rsa_pkcs1v15_verify_sha256`. **Do not remove that lock as an optimisation** —
+  its header states why, at length, and `tests/server_auth_lane_race.tcyr` fails
+  if it goes.
+
+  **The mechanism.** sigil's RSA verify workspace is a set of *file-scope*
+  globals indexed by a per-thread lane, and `_rsa_pkcs1v15_check`
+  (`lib/sigil.cyr:17887`) ends
+
+  ```
+  return ct_eq_bytes(rem, rexp, n_len);
+  ```
+
+  where `rem = &_rsa_em + bk*512` and `rexp = &_rsa_expected + bk*512` — **both
+  operands of the security decision live in the same shared object**, and the
+  comment at `:17780-17789` states the workspace is never wiped per lane.
+  `ct_eq_bytes` (`lib/ct.cyr:45-53`) is a plain OR-accumulating compare with no
+  structural gate, and `_rsa_recover_em` (`:17847-17872`) performs no PKCS#1
+  validation, so that one comparison is the entire decision. A colliding thread
+  that leaves a *consistent* valid pair in the lane makes the next thread's
+  compare succeed on bytes that were never its own.
+
+  **Lanes collide structurally, and it is not a concurrency threshold.**
+  `cbank()` (`lib/sigil.cyr:4403-4418`) assigns
+  `(atomic_fetch_add(&_crypto_next_bank, 1) % 63) + 1` — 63 lanes — and **never
+  releases one**; there is no decrement anywhere in sigil. The bound is 63
+  *lifetime* crypto-touching threads. agnosai has 100 pool workers
+  (`server/serve.cyr:117` → `:529` → `lib/sandhi.cyr:14270`/`:14321`), plus a
+  detached thread per orchestrator job, plus up to 500 in
+  `tools/builtin/load_testing.cyr`.
+
+  **Measured before the fix** — 100 threads × 8000 iterations against a real
+  RSA-2048 vector, forged signature = valid signature with one byte flipped so
+  the digest, and therefore `rexp`, is identical:
+
+  | | |
+  |---|---|
+  | forged signatures **accepted** | **888 of 400,000** (~1 in 450) |
+  | valid signatures **rejected** | **281,965 of 400,000** (70%) |
+
+  Reproduced independently three times (888 / 1674 / 314) by agents that were
+  each trying to *refute* it.
+
+  ⚠ **Pinning every thread to one lane shows zero false accepts and near-total
+  false rejects. That is not evidence of fail-closed.** Extreme contention
+  corrupts the lane so continuously that no clean snapshot survives to match
+  against. The bypass lives in the *realistic* regime — 100 threads over 63
+  lanes gives low-multiplicity pair collisions, which is what produces it.
+  Anyone re-testing by hammering a single lane will wrongly conclude it is safe.
+
+  **Exposure**: RS256 mode only. `agnosai_auth_config_with_jwt`
+  (`auth.cyr:79-85`) sets `ENABLED=1` itself, so **`AGNOSAI_JWT_PUBLIC_KEY`
+  alone turns auth on** — `AGNOSAI_AUTH_ENABLED` is not required, which is worth
+  knowing because it widens who is affected. Shared-secret mode never reaches
+  the RSA path; auth-disabled never reaches it.
+
+  **Capping `AGNOSAI_SERVE_WORKERS` at 63 was considered and rejected**: lanes
+  are held for a thread's life so unbounded detached threads wrap anyway, and
+  that constant is also sandhi's connection ceiling, so it would surrender 37%
+  of concurrent connections for no guarantee.
+
+  Cost of the lock: ~0.85 ms per verify under contention, an
+  authenticated-request ceiling around ~1.2k/s on this path only.
+
+  **Owed upstream to sigil**: hold the verify workspace in function-scope
+  locals. Verified viable — it needs 1,536 bytes against a **122,880-byte**
+  per-fn stack budget (`cyrius/src/frontend/parse_decl.cyr:89`, bisected at
+  122,864 B stays / 122,872 B relocates), and sigil's own "function-scope arrays
+  are static globals" premise (`:17779`) is **stale**: probed at four recursion
+  depths with distinct addresses and 200,000 concurrent passes, zero corruption.
+
+  ⚠ **Wider than JWT, and not yet addressed.** A brace-depth scan finds **62
+  file-scope banked globals** in sigil, including the shared bignum engine
+  (`_bn_mont_*`, `_bn_exp_*`, `_bn_inv_*`) — so two aliased threads corrupt each
+  other even running *different* primitives — and the PSS/ECDSA/Ed25519 lanes
+  that `lib/tls_native_hs13.cyr:257-284` routes TLS 1.3 CertificateVerify
+  through. agnosai makes outbound HTTPS from `tools/agnos.cyr:244`,
+  `tools/remote_registry.cyr:156`, `guarded_fetch.cyr` and up to 500 concurrent
+  threads in `load_testing.cyr`, so **TLS peer authentication rides the same
+  mechanism**. Structurally identical, not probed.
+
+### Added
+
+- **`fleet/` exists** — `src/fleet/mod.cyr` (the group hub) and
+  `src/fleet/cost_planning.cyr`, the first of the oracle's eleven `fleet`
+  submodules. GPU pricing tables, crew cost estimation and budget-aware model
+  selection: `agnosai_gpu_pricing_*`, `agnosai_estimate_crew_cost`,
+  `agnosai_select_cheapest_model`, `agnosai_cost_tier_*`.
+
+  `tests/fleet_cost_planning.tcyr` carries **48 assertions** — all ten oracle
+  `#[test]` fns plus 38 the Rust tests never reach: ASCII case folding (drop it
+  and all ten oracle tests still pass, since every one passes a lowercase name),
+  the classification order that makes `gpt-4` win over `gpt-3.5`, the full tier
+  mapping, the empty-identifier guard, a byte-exact `Display` (the oracle
+  asserts only two `contains`), and the `llama-7b`/`mistral-7b` tie **resolved**
+  rather than merely accepted — both classify open-small, so their costs are
+  bit-identical and the sort decides.
+
+  Three notes worth keeping:
+  - `_agnosai_contains_ci` walks the haystack in place rather than lowercasing
+    into a buffer. `lib/string.cyr`'s `str_lower_cstr` allocates per call inside
+    a per-candidate loop, and the in-place scan copies nothing.
+  - `AgnosaiCostTier` is deliberately **not** `AgnosaiModelTier` —
+    `src/llm/router.cyr:24` already owns that name and the `AGNOSAI_TIER_`
+    member prefix. Cyrius is **silent** on a duplicate enum; only
+    `scripts/check-symbols.sh` caught it.
+  - `agnosai_gpu_pricing_default` builds 1.20 / 0.35 / 0.80 by division rather
+    than as literals, so the bit patterns match what Rust's literal parse
+    produces.
+
+### Changed
+
+- **Toolchain pinned to cyrius 6.5.11** (was 6.5.10), by the full three-step
+  (`deps --no-lock` → `lib sync --full` → `deps --lock`) with `lib/` **diffed**
+  against the snapshot rather than trusting a green sync: 100 files synced, zero
+  content differences, and the only `Only in lib/` entries the six declared git
+  deps. `[deps.sakshi]` needed no move — 2.4.8 is already what 6.5.11 folds.
+
+  **The win agnosai actually collects is `lib/fs.cyr`'s bump-allocator leak.**
+  `is_dir` and `dir_list` took their getdents scratch from `alloc()`, which the
+  default bump allocator never returns. Both are stack locals now.
+  `src/orchestrator/durable_state.cyr` calls `is_dir` at :219, :248 and :281 on
+  the crew-persistence path, so this was a live leak here.
+
+  ### Performance
+
+  **Measured on this box, not quoted.** The 6.5.10 and 6.5.11 shapes of `is_dir`
+  were compiled into **one binary** over the same fixture — the old Linux arm
+  lifted verbatim from `git show 6.5.10:lib/fs.cyr` as `_is_dir_610` — so the
+  comparison needs no cross-build baseline. Both arms agree on the answer
+  (`is_dir("/tmp") == 1`), so the delta is allocation and nothing else:
+
+  | | bytes per call |
+  |---|---|
+  | `is_dir`, 6.5.10 | **4,104** |
+  | `is_dir`, 6.5.11 | **0** |
+
+  That reproduces upstream's own figure exactly. Confirmed independently against
+  the real path: 1,000 `is_dir` calls on 6.5.11 charge the global bump **0
+  bytes**, and `agnosai_state_store_save` now costs **1,360 B/save** — the
+  residual being the save itself, not scratch.
+
+  `lib/thread.cyr`'s only change is gaining `include "lib/thread_macos.cyr"`.
+
+  Two traps worth recording, both hit doing it:
+  - `lib/unicode/` is hand-vendored and `cyrius lib sync` copies **only the top
+    level**, so `unicode/_decode.cyr` was silently left at the old revision. The
+    recursive snapshot check in `scripts/check-clean.sh` is the only gate that
+    sees this.
+  - The lockfile must be written **last**. Syncing that one file after
+    `deps --lock` produced `FAIL: lib/unicode/_decode.cyr (hash mismatch)`.
+
+  ⚠ **`~/.cyrius/versions/<pin>/lib` is not a trustworthy reference for a
+  version.** The *6.5.10* snapshot directory was found holding **6.5.11**
+  content — `fs.cyr` hashed identical to 6.5.11's and carried "v6.5.11" comments.
+  The authoritative check is the cyrius repo's git tag
+  (`git -C ~/Repos/cyrius show 6.5.10:lib/fs.cyr | sha256sum`), which is what
+  established that agnosai's `lib/` had never drifted: both allegedly-differing
+  files hashed byte-identical to tag 6.5.10.
+
 ### Fixed
 
 - **The tree was silently building sakshi 2.4.7 while its pin shipped 2.4.8**,

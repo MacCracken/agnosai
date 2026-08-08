@@ -551,6 +551,72 @@ fn _agnosai_auth_claims_well_typed(claims): i64 {
     return 1;
 }
 
+# Serialises every call into sigil's RSA verify. See the header on
+# `_agnosai_auth_rsa_verify_locked` — this is a correctness lock, not a
+# performance one, and removing it reintroduces an authentication bypass.
+var _AGNOSAI_RSA_VERIFY_MUTEX = mutex_new();
+
+# `rsa_pkcs1v15_verify_sha256` under a process-global lock.
+#
+# ⚠ **THIS LOCK IS THE ONLY THING STOPPING AN AUTH BYPASS. DO NOT REMOVE IT
+# AS A PERFORMANCE OPTIMISATION.**
+#
+# sigil's RSA verify workspace is a set of *file-scope* globals indexed by a
+# per-thread lane (`lib/sigil.cyr:17791-17797`), and `_rsa_pkcs1v15_check`
+# (`:17887-17898`) ends with
+#
+#     return ct_eq_bytes(rem, rexp, n_len);
+#
+# where `rem = &_rsa_em + bk*512` and `rexp = &_rsa_expected + bk*512` — **both
+# operands of the security decision live in the same shared object**, and the
+# comment at `:17780-17789` states the verify workspace is never wiped per lane.
+# `ct_eq_bytes` (`lib/ct.cyr:45-53`) is a plain OR-accumulating compare with no
+# structural gate, and `_rsa_recover_em` (`:17847-17872`) performs no PKCS#1
+# validation of its own, so that one comparison is the entire decision.
+#
+# Lanes collide. `cbank()` (`lib/sigil.cyr:4403-4418`) assigns
+# `(atomic_fetch_add(&_crypto_next_bank, 1) % 63) + 1`, giving 63 lanes, and
+# **never releases one** — there is no decrement anywhere in sigil, so the
+# threshold is 63 *lifetime* crypto-touching threads, not concurrent ones.
+# agnosai crosses it structurally: 100 pool workers (`server/serve.cyr:117`),
+# plus a detached thread per orchestrator job (`orchestrator/mod.cyr`), plus up
+# to 500 in `tools/builtin/load_testing.cyr`.
+#
+# Measured on this tree before the lock, 100 threads x 8000 iterations against a
+# real RSA-2048 vector, forged signature = valid signature with one byte flipped
+# (so the digest, and therefore `rexp`, is identical):
+#
+#   * **888 of 400,000 forged signatures verified as valid** (~1 in 450) — a
+#     colliding thread's correct EM landed in the shared `rem` inside the forged
+#     thread's compare window. Reproduced independently three times (888 / 1674
+#     / 314).
+#   * 281,965 of 400,000 *valid* signatures were rejected — the same race is
+#     simultaneously a 401 storm.
+#
+# ⚠ Pinning every thread to one lane instead shows **zero** false accepts and
+# near-total false rejects. Do not read that as fail-closed: extreme contention
+# corrupts the lane so continuously that no clean snapshot survives. The
+# dangerous regime is the *realistic* one — 100 threads over 63 lanes gives
+# low-multiplicity pair collisions, which is exactly what produces the bypass.
+#
+# Capping `AGNOSAI_SERVE_WORKERS` at 63 was considered and rejected: lanes are
+# held for a thread's life, so unbounded detached orchestrator threads wrap
+# anyway, and that constant is also sandhi's connection ceiling
+# (`serve.cyr:529`), so it would surrender 37% of concurrent connections for no
+# guarantee.
+#
+# Cost: ~0.85 ms per verify under contention, i.e. an authenticated-request
+# ceiling on the order of ~1.2k/s, on this path only. The fix belongs upstream —
+# sigil should hold the verify workspace in function-scope locals, which needs
+# 1,536 bytes against a 122,880-byte per-fn stack budget — and this lock comes
+# out when that lands.
+fn _agnosai_auth_rsa_verify_locked(n_be, n_len, e_be, e_len, msg, msg_len, sig, sig_len): i64 {
+    mutex_lock(_AGNOSAI_RSA_VERIFY_MUTEX);
+    var ok = rsa_pkcs1v15_verify_sha256(n_be, n_len, e_be, e_len, msg, msg_len, sig, sig_len);
+    mutex_unlock(_AGNOSAI_RSA_VERIFY_MUTEX);
+    return ok;
+}
+
 # Validate an RS256 JWT. Returns `HTTP_OK`, `HTTP_UNAUTHORIZED`, or
 # `HTTP_INTERNAL` when the configured key itself is unusable.
 #
@@ -604,7 +670,10 @@ fn _agnosai_auth_validate_jwt(token: Str, j, now): i64 {
     var sbuf[512];
     var sn = _agnosai_auth_b64u_decode(p + d2 + 1, slen, &sbuf, AGNOSAI_JWT_MAX_MODULUS);
     if (sn <= 0) { return HTTP_UNAUTHORIZED; }
-    if (rsa_pkcs1v15_verify_sha256(load64(j + AGN_JC_N), load64(j + AGN_JC_N_LEN),
+    # ⚠ `_agnosai_auth_rsa_verify_locked`, NOT the bare sigil call — the lock is
+    # what stops a lane collision turning this into an auth bypass. Read its
+    # header before touching this line.
+    if (_agnosai_auth_rsa_verify_locked(load64(j + AGN_JC_N), load64(j + AGN_JC_N_LEN),
     load64(j + AGN_JC_E), load64(j + AGN_JC_E_LEN),
     p, d2, &sbuf, sn) != 1) {
         return HTTP_UNAUTHORIZED;

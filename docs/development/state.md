@@ -12,7 +12,47 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.10` (`cyrius.cyml`) — bumped 2026-08-07. Folds **sakshi
+- **Cyrius pin**: `6.5.11` (`cyrius.cyml`) — bumped 2026-08-08 by the full
+  three-step, `lib/` **diffed** against the snapshot rather than trusting a green
+  `lib sync`. Result: 100 files synced, zero content differences, the only
+  `Only in lib/` entries being the six declared git deps (ai-hwaccel, bote-core,
+  kavach, libro, majra, tyche). `check-clean` OK, 107 files.
+
+  **What 6.5.11 lands on agnosai: `lib/fs.cyr`'s bump-allocator leak.** `is_dir`
+  and `dir_list` took their getdents scratch from `alloc()`, which the default
+  bump allocator never returns; both are now stack locals. **agnosai hits this**
+  — `src/orchestrator/durable_state.cyr` calls `is_dir` at :219, :248 and :281,
+  on the crew-persistence path.
+
+  **Measured here, both arms in one binary** (6.5.10's Linux arm lifted verbatim
+  from `git show 6.5.10:lib/fs.cyr`, renamed `_is_dir_610`, same fixture, same
+  run, both returning the same answer):
+
+  | | bytes per call |
+  |---|---|
+  | `is_dir`, 6.5.10 | **4,104** |
+  | `is_dir`, 6.5.11 | **0** |
+
+  `agnosai_state_store_save` now costs **1,360 B/save**, all of it the save
+  rather than scratch. `lib/thread.cyr`'s only change is gaining
+  `include "lib/thread_macos.cyr"`, which is why that file is new in `lib/`.
+
+  ⚠ **Two traps, both hit during this bump.** (1) `lib/unicode/` is hand-vendored
+  and `lib sync` copies **only the top level**, so `unicode/_decode.cyr` was left
+  behind and the recursive snapshot check is the only thing that caught it —
+  copy the subtree by hand after every bump. (2) The lockfile really must be
+  written **last**: syncing that one file after `deps --lock` made
+  `deps --verify` fail with `FAIL: lib/unicode/_decode.cyr (hash mismatch)`.
+
+  ⚠ **A `~/.cyrius/versions/<pin>/lib` directory is not a trustworthy 6.5.x
+  reference.** On 2026-08-08 the *6.5.10* snapshot directory was found holding
+  **6.5.11 content** — its `fs.cyr` hashed byte-identical to 6.5.11's and carried
+  comments reading "v6.5.11: STACK scratch, not alloc()". The authoritative
+  reference is the **cyrius repo's git tag**: `git -C ~/Repos/cyrius show
+  <tag>:lib/<mod>.cyr`. That check is what proved agnosai's `lib/` had not
+  drifted at all — both allegedly-differing files hashed identical to tag 6.5.10.
+
+  Previously **6.5.10**, bumped 2026-08-07. Folds **sakshi
   2.4.8**, bayan 1.4.0, sigil 3.12.2, sandhi 1.9.9, yukti 2.3.2, mabda 4.0.8.
   6.5.10 lands the **`alloc_via` fix agnosai filed** (see *Benchmarks*): 15.1 →
   11.1 ns, worth 5–13% on every arena-threaded route.
@@ -1120,6 +1160,36 @@ fixed.
    remediation changed half of a two-line fix, left the tree in a state neither
    version would produce, and "killed" the mutant for the wrong reason. Read
    what the mutated file actually says before believing the failure.
+
+   **The inverse failure happened on 2026-08-08 and cost two rounds.** The
+   mutation for `tests/server_auth_lane_race.tcyr` reverted the *call site* in
+   `_agnosai_auth_validate_jwt`, while the suite calls
+   `_agnosai_auth_rsa_verify_locked` **directly** — so the test never saw the
+   change and reported 9/9 against a knowingly-broken build. **Mutate what the
+   test actually calls**, not what the production path calls, and if a mutant
+   survives, suspect the mutation's reach before rewriting the test. (A real
+   test weakness was also found the same way: 2 threads × 200 iterations with no
+   start barrier left the unlocked build fully clean, because the workers barely
+   overlapped. The suite now uses a barrier and 2,000 iterations.)
+
+12. **sigil's crypto scratch is shared across threads, and the JWT path is the
+   only place agnosai is protected.** `cbank()` gives 63 lanes and never
+   releases one, so the bound is 63 *lifetime* crypto-touching threads — a
+   count agnosai passes with its 100 pool workers alone. Both operands of
+   `_rsa_pkcs1v15_check`'s final `ct_eq_bytes` live in that shared lane, which
+   is an authentication bypass, not merely a spurious-401 race: **888 of 400,000
+   forged signatures were accepted** before the fix. `src/server/auth.cyr`'s
+   `_agnosai_auth_rsa_verify_locked` serialises the verify; **do not remove that
+   mutex to reclaim throughput.** ⚠ 62 file-scope banked globals remain,
+   including the shared bignum engine and the TLS 1.3 peer-auth lanes every
+   outbound HTTPS call uses — those are **not** covered by agnosai's lock. Full
+   analysis in `CHANGELOG.md` under *Security*; the upstream ask is in
+   `roadmap.md` → C.
+
+   ⚠ **Do not re-test this by pinning every thread to one lane.** Max contention
+   shows zero false accepts and near-total false rejects, which reads as
+   fail-closed and is wrong — the bypass lives in the low-multiplicity regime
+   that 100 threads over 63 lanes actually produce.
 
 ### Consumers
 

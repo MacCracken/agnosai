@@ -1,0 +1,232 @@
+# =========================================================================
+# server_auth_lane_race.tcyr — the RS256 verify path is safe under lane aliasing
+#
+# No oracle counterpart: the Rust tree verifies through `jsonwebtoken`/`ring`,
+# which keeps its workspace on the stack. This defect is specific to sigil's
+# lane-banked globals and therefore to the port.
+#
+# WHAT THIS PINS. sigil's RSA verify workspace lives in FILE-SCOPE globals
+# indexed by a per-thread lane, and `_rsa_pkcs1v15_check` (lib/sigil.cyr:17887)
+# ends `return ct_eq_bytes(rem, rexp, n_len)` where BOTH operands are in that
+# shared object. `cbank()` hands out only 63 lanes and never releases one, so
+# any tree with more than 63 lifetime crypto-touching threads has colliding
+# pairs — agnosai has 100 pool workers alone. Measured before the fix, 100
+# threads x 8000 iterations: **888 of 400,000 forged signatures verified**, and
+# 281,965 of 400,000 valid ones were rejected.
+#
+# `_agnosai_auth_rsa_verify_locked` (src/server/auth.cyr) serialises the call.
+# This suite is what stops that lock being removed as an optimisation.
+#
+# WHY IT IS DETERMINISTIC RATHER THAN A RACE TEST. Both threads pin themselves
+# to lane 1 with `crypto_bank_set(1)`, reproducing by construction the aliasing
+# that 100 workers over 63 lanes reach by wrap. The gate is then an invariant
+# that must hold under EVERY interleaving — *a valid signature always verifies*
+# — rather than an attempt to win a schedule.
+#
+# MUTATION-VERIFIED. Removing `mutex_lock`/`mutex_unlock` from
+# `_agnosai_auth_rsa_verify_locked` makes the victim's genuine signature verify
+# **0 of 2000 times** and be rejected 2000/2000, failing two named assertions.
+# Restored, it is 9/9 across three runs.
+#
+# ⚠ **The first mutation attempt was not a faithful revert and the mutant
+# survived.** It reverted the CALL SITE in `_agnosai_auth_validate_jwt` while
+# this suite calls `_agnosai_auth_rsa_verify_locked` directly, so the test never
+# saw the change and reported 9/9 against an unlocked build. Mutate the WRAPPER
+# BODY, not the call site, when re-verifying this suite.
+#
+# ⚠ The forged-signature counter stays 0 here and that is expected, not a
+# weakness: two threads pinned to one lane is *max contention*, which corrupts
+# the lane so continuously that no clean snapshot survives for a forgery to
+# match against — it degenerates to pure fail-closed. The auth BYPASS appears in
+# the low-multiplicity regime (100 threads over 63 lanes, ~1 in 450 forged
+# tokens accepted). So the valid-signature invariant is the discriminating gate
+# and the forgery counter is corroboration only.
+#
+# ⚠ `thread_local_*` faults on the main thread until sigil installs its block,
+# so main calls `cbank()` before anything else touches a lane, and each worker
+# does the same before `crypto_bank_set`. A .tcyr that crashes prints NO
+# assertion output — a suite that vanishes is this trap, not a bad expectation.
+#
+# The vector is a genuine RSA-2048 PKCS#1 v1.5 SHA-256 signature, generated with
+# `openssl genrsa` + `openssl dgst -sha256 -sign` and independently confirmed
+# with `openssl dgst -sha256 -verify` -> "Verified OK". The private key is NOT
+# in the tree: only the modulus, exponent, message and signature are needed.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/server/auth.cyr"
+include "tests/test_helpers.cyr"
+
+# n, e and the signature for message "user=alice".
+var _T_LR_N[256];
+var _T_LR_E[3];
+var _T_LR_SIG[256];
+
+# Per-thread verification tallies. Written with atomic_fetch_add because both
+# workers touch them.
+var _t_lr_victim_ok = 0;
+var _t_lr_victim_rejected = 0;
+var _t_lr_attacker_accepted = 0;
+var _t_lr_iters = 2000;
+
+# Start barrier. Without it the two workers barely overlap — the first is most
+# of the way through its loop before the second is scheduled — and the aliased
+# lane is then almost never contended. Measured: 200 iterations with no barrier
+# left the UNLOCKED build fully clean (0 rejects, 0 false accepts), i.e. the
+# suite passed against the very defect it exists to catch.
+var _t_lr_go = 0;
+
+# Spin until main releases both workers together.
+fn _t_lr_await_go(): i64 {
+    while (atomic_load(&_t_lr_go) == 0) { }
+    return 0;
+}
+
+# Decode `hex` (NUL-terminated, an even number of digits) into `out`.
+fn _t_lr_unhex(hex, out): i64 {
+    var i = 0;
+    while (load8(hex + i * 2) != 0) {
+        var hi = load8(hex + i * 2);
+        var lo = load8(hex + i * 2 + 1);
+        if (hi >= 97) { hi = hi - 87; } else { hi = hi - 48; }
+        if (lo >= 97) { lo = lo - 87; } else { lo = lo - 48; }
+        store8(out + i, hi * 16 + lo);
+        i = i + 1;
+    }
+    return i;
+}
+
+# One verification through agnosai's locked wrapper — the thing under test.
+# `msg` is a raw pointer + length, matching sigil's signature.
+fn _t_lr_verify(msg, msg_len): i64 {
+    return _agnosai_auth_rsa_verify_locked(&_T_LR_N, 256, &_T_LR_E, 3, msg, msg_len,
+    &_T_LR_SIG, 256);
+}
+
+# The legitimate user: the real message against the real signature. Every one of
+# these MUST return 1, whatever the other thread is doing.
+fn _t_lr_victim(arg): i64 {
+    cbank();
+    crypto_bank_set(1);
+    _t_lr_await_go();
+    var i = 0;
+    while (i < _t_lr_iters) {
+        if (_t_lr_verify("user=alice", 10) == 1) {
+            atomic_fetch_add(&_t_lr_victim_ok, 1);
+        } else {
+            atomic_fetch_add(&_t_lr_victim_rejected, 1);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The attacker: a DIFFERENT message against the same signature, pinned to the
+# same lane. Never valid, so any acceptance is a bypass.
+fn _t_lr_attacker(arg): i64 {
+    cbank();
+    crypto_bank_set(1);
+    _t_lr_await_go();
+    var i = 0;
+    while (i < _t_lr_iters) {
+        if (_t_lr_verify("user=admin", 10) == 1) {
+            atomic_fetch_add(&_t_lr_attacker_accepted, 1);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The control pair: identical work, but taking whatever lane `cbank()` assigns
+# instead of forcing a collision. With only two threads in this process those
+# lanes are distinct, so this arm must be clean even against the unlocked call.
+fn _t_lr_victim_natural(arg): i64 {
+    cbank();
+    _t_lr_await_go();
+    var i = 0;
+    while (i < _t_lr_iters) {
+        if (_t_lr_verify("user=alice", 10) == 1) {
+            atomic_fetch_add(&_t_lr_victim_ok, 1);
+        } else {
+            atomic_fetch_add(&_t_lr_victim_rejected, 1);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _t_lr_attacker_natural(arg): i64 {
+    cbank();
+    _t_lr_await_go();
+    var i = 0;
+    while (i < _t_lr_iters) {
+        if (_t_lr_verify("user=admin", 10) == 1) {
+            atomic_fetch_add(&_t_lr_attacker_accepted, 1);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    # Install sigil's thread-local block before anything else touches a lane.
+    cbank();
+
+    _t_lr_unhex("c828361ad9f8379090e70b545935772ffbf79b8aaea58e2b197cd733c18915e2f7f1807b50d03a36a9f060a739dd5144de915db3e6d97d4ef17224a8e433390380f2c27a1ff5e207e74212adecc0f40a7fd703645fd78416607a45be0d2ca4ae85a07c34d0319741a4892ba83122dfc9eec2af013b4bed1b617b6f6f8b6d209579c442190a583911147855d7bcad6aeffa777c5181259662da23fdcca427e804abc1015131ee2ad9b4909ce7ae2f9753a8d08505f6dfe0b0f710736d75bf95fc626d3f28fe598d9020917179f4b58b8ff4d64199ff36b0ea457dc81ffc8ca61170d65b40ce91682688997397227a90f290be845d31b6e43b855d53387cdef32d",
+    &_T_LR_N);
+    _t_lr_unhex("010001", &_T_LR_E);
+    _t_lr_unhex("36ad7901ebe30ac5e1a19ebe1093cfe7d339fa6669b0d592186813398d8fe184cc075334503f846636a6bac4be306c8ccd04c38dde4a77db440ae91d232e94bc2746359a840374eaedc2cc17775bf09677d53a0a562d5a672d79cb441a0e9596b1180b0fed02b46862ffe2efc0890186e1af2177f290ff131573c14fbd6688f0129c788f8d8007bc3c088c515d8bc76f903cb890a045135427004aafe0db0a5f4d8d3a26e2b528c4a15c55b0b218f2f0a863ee43b212759440fa010f9f8bcd5f18aaa49d323abf382887132906cb22c112867673ce5fbfadfd9b8770d21943d595ae9403df58e5ade78c417ea67d2ffed5eec3226397bc389c0c49cc9df210de",
+    &_T_LR_SIG);
+
+    # --- Sanity, single-threaded ----------------------------------------
+    # Without BOTH of these the concurrent assertions below are vacuous: a
+    # mistyped vector that never verifies would make the attacker's count 0 for
+    # the wrong reason, and one that always verifies would make the victim's 200.
+    assert_eq(_t_lr_verify("user=alice", 10), 1, "the vector is real: the genuine message verifies");
+    assert_eq(_t_lr_verify("user=admin", 10), 0, "the vector discriminates: a different message does not");
+
+    # --- Both workers pinned to ONE lane --------------------------------
+    var tv = thread_create(&_t_lr_victim, 0);
+    var ta = thread_create(&_t_lr_attacker, 0);
+    assert(tv != 0, "victim thread spawned");
+    assert(ta != 0, "attacker thread spawned");
+    atomic_store(&_t_lr_go, 1);
+    thread_join(tv);
+    thread_join(ta);
+
+    # THE GATE. Against the bare `rsa_pkcs1v15_verify_sha256` this is 0 of 200.
+    assert_eq(_t_lr_victim_ok, _t_lr_iters,
+    "a valid signature verifies under every interleaving of an aliased lane");
+    assert_eq(_t_lr_victim_rejected, 0,
+    "no valid signature is spuriously rejected — the 401-storm half of the race");
+
+    # THE SECURITY CANARY. Timing-dependent, so it is asserted but is not what
+    # makes this suite discriminating: max contention can drive false accepts to
+    # zero while every valid verify fails, which is why the gate above is the
+    # invariant and this is the corroboration.
+    assert_eq(_t_lr_attacker_accepted, 0,
+    "a signature over a different message never verifies — no auth bypass");
+
+    # --- Control: distinct lanes ----------------------------------------
+    # Proves the assertions above are specific to ALIASING rather than merely to
+    # threading — with natural lane assignment the same workload is clean, so a
+    # failure above cannot be blamed on thread_create or the tally.
+    _t_lr_victim_ok = 0;
+    _t_lr_victim_rejected = 0;
+    _t_lr_attacker_accepted = 0;
+    atomic_store(&_t_lr_go, 0);
+    var tv2 = thread_create(&_t_lr_victim_natural, 0);
+    var ta2 = thread_create(&_t_lr_attacker_natural, 0);
+    atomic_store(&_t_lr_go, 1);
+    thread_join(tv2);
+    thread_join(ta2);
+    assert_eq(_t_lr_victim_ok, _t_lr_iters, "control: distinct lanes verify cleanly");
+    assert_eq(_t_lr_attacker_accepted, 0, "control: distinct lanes accept no forgery");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
