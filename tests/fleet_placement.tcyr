@@ -1,0 +1,352 @@
+# =========================================================================
+# fleet_placement.tcyr — tests for src/fleet/placement.cyr
+#
+# Oracle: rust-old/src/fleet/placement.rs's twelve `#[test]` fns, all ported.
+#
+# Past the oracle in seven places, two of which are the reason the module has
+# non-obvious code in it:
+#
+#   * **sort stability at scale.** The oracle relies on Rust's stable `sort_by`
+#     so equal scores keep input order and `place()` returns the earliest. Ties
+#     are the common case here. `vec_sort_by` is introsort and is stable ONLY
+#     below 18 elements, so the oracle's 3-node tests cannot see the divergence
+#     — `_t_rank_is_stable` drives 40 equal-scoring nodes, which is past the
+#     threshold and fails against a score-only comparator.
+#   * **the index `Balanced` scores against is PRE-filter.** `enumerate()` runs
+#     before `filter()` in the oracle, so a disqualified node still consumes its
+#     position. Filtering first would silently re-rank everything behind it.
+#
+# Plus: a hardware requirement REPLACES the legacy GPU checks rather than adding
+# to them; GpuAffinity disqualifies a CPU node even when the request never asked
+# for an accelerator; Manual with no preferred node places nowhere; Locality with
+# no capabilities scores 1.0 rather than dividing by zero; and the GpuAffinity
+# score clamps at 1.0.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/fleet/registry.cyr"
+include "src/fleet/placement.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's `gpu_node(id, vram)` — one accelerator, the given VRAM.
+fn _t_gpu_node(id, vram): i64 {
+    return agnosai_node_info_new(str_from(id), 1, vram);
+}
+
+# The oracle's `cpu_node(id)` — no accelerator, no VRAM.
+fn _t_cpu_node(id): i64 {
+    return agnosai_node_info_new(str_from(id), 0, 0);
+}
+
+# A vec of the given nodes.
+fn _t_nodes3(a, b, c): i64 {
+    var v = vec_new();
+    vec_push(v, a);
+    vec_push(v, b);
+    vec_push(v, c);
+    return v;
+}
+
+# Whether the ranked result at `i` names `id`.
+fn _t_ranked_is(ranked, i, id): i64 {
+    return str_eq_cstr(agnosai_placement_result_node_id(vec_get(ranked, i)), id);
+}
+
+fn main(): i64 {
+    var one = f64_from(1);
+    var zero = f64_from(0);
+
+    # --- oracle: gpu_affinity_picks_most_vram ---------------------------
+    var g_small = _t_gpu_node("small", 4000);
+    var g_big = _t_gpu_node("big", 48000);
+    var g_med = _t_gpu_node("medium", 16000);
+    var q_gpu = agnosai_placement_request_new(AGNOSAI_PLACE_GPU_AFFINITY);
+    var best = agnosai_place(q_gpu, _t_nodes3(g_small, g_big, g_med));
+    assert(best != 0, "gpu affinity finds a node");
+    assert(str_eq_cstr(agnosai_placement_result_node_id(best), "big") == 1,
+    "gpu affinity picks the most VRAM");
+
+    # --- oracle: rank_nodes_returns_sorted ------------------------------
+    var ranked = agnosai_rank_nodes(q_gpu, _t_nodes3(g_small, g_big, g_med));
+    assert_eq(vec_len(ranked), 3, "all three GPU nodes rank");
+    assert_eq(_t_ranked_is(ranked, 0, "big"), 1, "big ranks first");
+    assert_eq(_t_ranked_is(ranked, 1, "medium"), 1, "medium ranks second");
+    assert_eq(_t_ranked_is(ranked, 2, "small"), 1, "small ranks third");
+    for (var i = 1; i < vec_len(ranked); i = i + 1) {
+        assert(f64_lt(agnosai_placement_result_score(vec_get(ranked, i)),
+        agnosai_placement_result_score(vec_get(ranked, i - 1))) == 1,
+        "scores are strictly descending across the ranking");
+    }
+
+    # --- oracle: gpu_affinity_excludes_non_gpu_when_required ------------
+    var q_req = agnosai_placement_request_with_required_gpu(
+    agnosai_placement_request_new(AGNOSAI_PLACE_GPU_AFFINITY), 1);
+    var mixed = vec_new();
+    vec_push(mixed, _t_cpu_node("cpu"));
+    vec_push(mixed, _t_gpu_node("gpu", 8000));
+    var r_req = agnosai_rank_nodes(q_req, mixed);
+    assert_eq(vec_len(r_req), 1, "a required GPU excludes the CPU node");
+    assert_eq(_t_ranked_is(r_req, 0, "gpu"), 1, "and keeps the GPU node");
+
+    # --- past the oracle: GpuAffinity excludes CPU even UNasked ---------
+    # A second GPU test lives inside the policy, independent of required_gpu.
+    var cpus_only = vec_new();
+    vec_push(cpus_only, _t_cpu_node("c1"));
+    vec_push(cpus_only, _t_cpu_node("c2"));
+    assert_eq(vec_len(agnosai_rank_nodes(q_gpu, cpus_only)), 0,
+    "GpuAffinity disqualifies CPU nodes even when required_gpu is false");
+    assert_eq(agnosai_place(q_gpu, cpus_only), 0, "and places nowhere");
+
+    # --- past the oracle: the GpuAffinity score clamps at 1.0 -----------
+    # 1 TB is the normalisation ceiling; anything past it must not exceed 1.0,
+    # or a huge node would outrank the maximum and break score comparability.
+    var huge = vec_new();
+    vec_push(huge, _t_gpu_node("huge", 8000000));
+    var r_huge = agnosai_rank_nodes(q_gpu, huge);
+    _t_assert_f64(agnosai_placement_result_score(vec_get(r_huge, 0)), one,
+    "VRAM past the 1 TB ceiling clamps to exactly 1.0");
+
+    # --- oracle: balanced_distributes_across_nodes ----------------------
+    var b_nodes = _t_nodes3(_t_cpu_node("a"), _t_cpu_node("b"), _t_cpu_node("c"));
+    var q_bal = agnosai_placement_request_new(AGNOSAI_PLACE_BALANCED);
+    var r_bal = agnosai_rank_nodes(q_bal, b_nodes);
+    assert_eq(vec_len(r_bal), 3, "all three balance-rank");
+    assert_eq(_t_ranked_is(r_bal, 0, "a"), 1, "the first node scores highest");
+    assert(f64_gt(agnosai_placement_result_score(vec_get(r_bal, 0)),
+    agnosai_placement_result_score(vec_get(r_bal, 1))) == 1, "score decreases with position");
+    assert(f64_gt(agnosai_placement_result_score(vec_get(r_bal, 1)),
+    agnosai_placement_result_score(vec_get(r_bal, 2))) == 1, "and keeps decreasing");
+
+    # A single node scores exactly 1.0 — the `count <= 1` arm, which exists to
+    # avoid dividing by a count of one and handing back 0.0.
+    var lone = vec_new();
+    vec_push(lone, _t_cpu_node("only"));
+    _t_assert_f64(agnosai_placement_result_score(vec_get(agnosai_rank_nodes(q_bal, lone), 0)),
+    one, "a lone node balances at exactly 1.0");
+
+    # --- past the oracle: Balanced's index is PRE-filter -----------------
+    # An offline node at position 0 must still consume that position, so the
+    # node behind it keeps the score it would have had. Filtering before
+    # enumerating would promote it to index 0 and score it 1.0.
+    var withdead = vec_new();
+    vec_push(withdead, agnosai_node_info_with_status(_t_cpu_node("dead"), AGNOSAI_NODE_OFFLINE));
+    vec_push(withdead, _t_cpu_node("live1"));
+    vec_push(withdead, _t_cpu_node("live2"));
+    var r_dead = agnosai_rank_nodes(q_bal, withdead);
+    assert_eq(vec_len(r_dead), 2, "the offline node is dropped");
+    assert_eq(_t_ranked_is(r_dead, 0, "live1"), 1, "the first live node ranks first");
+    # live1 sits at index 1 of 3, so 1 - 1/3 = 2/3 — NOT 1.0.
+    _t_assert_f64(agnosai_placement_result_score(vec_get(r_dead, 0)), _t_f64_ratio(2, 3),
+    "the surviving node keeps its ORIGINAL index score, not a re-ranked one");
+
+    # --- oracle: locality_matches_capabilities --------------------------
+    var caps_both = vec_new();
+    vec_push(caps_both, str_from("inference"));
+    vec_push(caps_both, str_from("training"));
+    var n_both = agnosai_node_info_with_capabilities(_t_cpu_node("both"), caps_both);
+    var caps_one = vec_new();
+    vec_push(caps_one, str_from("inference"));
+    var n_one = agnosai_node_info_with_capabilities(_t_cpu_node("one"), caps_one);
+    var n_none = _t_cpu_node("none");
+    var want = vec_new();
+    vec_push(want, str_from("inference"));
+    vec_push(want, str_from("training"));
+    var q_loc = agnosai_placement_request_with_capabilities(
+    agnosai_placement_request_new(AGNOSAI_PLACE_LOCALITY), want);
+    var r_loc = agnosai_rank_nodes(q_loc, _t_nodes3(n_both, n_one, n_none));
+    assert_eq(vec_len(r_loc), 2, "the node matching nothing scores 0 and is dropped");
+    assert_eq(_t_ranked_is(r_loc, 0, "both"), 1, "the full match ranks first");
+    _t_assert_f64(agnosai_placement_result_score(vec_get(r_loc, 0)), one, "a full match scores 1.0");
+    _t_assert_f64(agnosai_placement_result_score(vec_get(r_loc, 1)), _t_f64_ratio(1, 2),
+    "a half match scores 1/2");
+
+    # --- past the oracle: Locality with no capabilities asked -----------
+    # Everything matches perfectly rather than dividing by zero.
+    var q_loc0 = agnosai_placement_request_new(AGNOSAI_PLACE_LOCALITY);
+    var r_loc0 = agnosai_rank_nodes(q_loc0, _t_nodes3(n_both, n_one, n_none));
+    assert_eq(vec_len(r_loc0), 3, "with no capabilities required, every node qualifies");
+    _t_assert_f64(agnosai_placement_result_score(vec_get(r_loc0, 0)), one,
+    "and each scores exactly 1.0");
+
+    # --- oracle: cost_picks_smallest_node -------------------------------
+    var q_cost = agnosai_placement_request_new(AGNOSAI_PLACE_COST);
+    var c_best = agnosai_place(q_cost,
+    _t_nodes3(_t_gpu_node("big", 48000), _t_cpu_node("tiny"), _t_gpu_node("medium", 16000)));
+    assert(str_eq_cstr(agnosai_placement_result_node_id(c_best), "tiny") == 1,
+    "cost picks the smallest node");
+
+    # --- past the oracle: Cost never disqualifies -----------------------
+    # 1/(1+w) is never 0 for a finite weight, so every Online node ranks.
+    var r_cost = agnosai_rank_nodes(q_cost,
+    _t_nodes3(_t_gpu_node("big", 48000), _t_cpu_node("tiny"), _t_gpu_node("medium", 16000)));
+    assert_eq(vec_len(r_cost), 3, "cost ranks every online node, disqualifying none");
+
+    # --- oracle: manual_returns_preferred_node --------------------------
+    var m1 = _t_cpu_node("m1");
+    var m2 = _t_cpu_node("m2");
+    var manual = vec_new();
+    vec_push(manual, m1);
+    vec_push(manual, m2);
+    var q_man = agnosai_placement_request_with_preferred_node(
+    agnosai_placement_request_new(AGNOSAI_PLACE_MANUAL), str_from("m2"));
+    var m_best = agnosai_place(q_man, manual);
+    assert(m_best != 0, "manual placement finds the preferred node");
+    assert(str_eq_cstr(agnosai_placement_result_node_id(m_best), "m2") == 1,
+    "and it is the one named");
+    assert_eq(vec_len(agnosai_rank_nodes(q_man, manual)), 1,
+    "no other node scores under Manual");
+
+    # --- oracle: manual_returns_none_if_offline -------------------------
+    var m_off = vec_new();
+    vec_push(m_off, agnosai_node_info_with_status(_t_cpu_node("m2"), AGNOSAI_NODE_OFFLINE));
+    assert_eq(agnosai_place(q_man, m_off), 0,
+    "an offline preferred node places nowhere");
+
+    # --- past the oracle: Manual with NO preferred node -----------------
+    # Places nowhere rather than falling back to an arbitrary node.
+    var q_man0 = agnosai_placement_request_new(AGNOSAI_PLACE_MANUAL);
+    assert_eq(agnosai_place(q_man0, manual), 0,
+    "Manual with no preferred node places nowhere");
+    assert_eq(vec_len(agnosai_rank_nodes(q_man0, manual)), 0, "and ranks nothing");
+
+    # --- oracle: no_online_nodes_returns_none ---------------------------
+    var all_off = vec_new();
+    vec_push(all_off, agnosai_node_info_with_status(_t_cpu_node("x"), AGNOSAI_NODE_OFFLINE));
+    vec_push(all_off, agnosai_node_info_with_status(_t_cpu_node("y"), AGNOSAI_NODE_SUSPECT));
+    assert_eq(agnosai_place(q_bal, all_off), 0, "no Online node places nowhere");
+    assert_eq(vec_len(agnosai_rank_nodes(q_bal, all_off)), 0, "and ranks nothing");
+    assert_eq(agnosai_place(q_bal, vec_new()), 0, "an empty node list places nowhere");
+
+    # --- oracle: hardware_cuda_requirement_filters_nodes ----------------
+    var devs = vec_new();
+    vec_push(devs, agnosai_compute_device_new(0, str_from("A100"), AGNOSAI_ACCEL_CUDA, 81920));
+    var cuda_inv = agnosai_hw_inventory_new(16, 65536, devs);
+    var accel_cuda = vec_new();
+    vec_push(accel_cuda, AGNOSAI_ACCEL_CUDA);
+    var hw_cuda = agnosai_hw_requirement_with_min_devices(
+    agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_for_accelerators(accel_cuda), 40960), 1);
+    var hw_nodes = vec_new();
+    vec_push(hw_nodes, _t_cpu_node("cpu-only"));
+    vec_push(hw_nodes, agnosai_node_info_with_hardware(_t_gpu_node("cuda-box", 81920), cuda_inv));
+    var q_hw = agnosai_placement_request_with_hardware(
+    agnosai_placement_request_new(AGNOSAI_PLACE_BALANCED), hw_cuda);
+    var hw_best = agnosai_place(q_hw, hw_nodes);
+    assert(hw_best != 0, "the CUDA requirement finds a node");
+    assert(str_eq_cstr(agnosai_placement_result_node_id(hw_best), "cuda-box") == 1,
+    "and it is the CUDA box");
+    assert_eq(vec_len(agnosai_rank_nodes(q_hw, hw_nodes)), 1,
+    "the CPU-only node is filtered out by the hardware requirement");
+
+    # --- oracle: hardware_tpu_requirement_returns_none_when_no_tpu ------
+    var accel_tpu = vec_new();
+    vec_push(accel_tpu, AGNOSAI_ACCEL_TPU);
+    var hw_tpu = agnosai_hw_requirement_with_min_devices(
+    agnosai_hw_requirement_for_accelerators(accel_tpu), 1);
+    var q_tpu = agnosai_placement_request_with_hardware(
+    agnosai_placement_request_new(AGNOSAI_PLACE_BALANCED), hw_tpu);
+    var tpu_nodes = vec_new();
+    vec_push(tpu_nodes, _t_gpu_node("gpu-1", 24000));
+    vec_push(tpu_nodes, _t_cpu_node("cpu-1"));
+    assert_eq(agnosai_place(q_tpu, tpu_nodes), 0,
+    "a TPU requirement places nowhere when no node has one");
+
+    # --- oracle: no_hardware_requirement_backward_compat ----------------
+    var q_legacy = agnosai_placement_request_with_min_gpu_vram_mb(
+    agnosai_placement_request_with_required_gpu(
+    agnosai_placement_request_new(AGNOSAI_PLACE_GPU_AFFINITY), 1), 16000);
+    var legacy = vec_new();
+    vec_push(legacy, _t_gpu_node("too-small", 8000));
+    vec_push(legacy, _t_gpu_node("big-enough", 32000));
+    var r_legacy = agnosai_rank_nodes(q_legacy, legacy);
+    assert_eq(vec_len(r_legacy), 1, "the legacy VRAM floor filters the small node");
+    assert_eq(_t_ranked_is(r_legacy, 0, "big-enough"), 1, "and keeps the large one");
+
+    # --- past the oracle: hardware REPLACES the legacy checks -----------
+    # The oracle's `if let Some(hw) { .. } else { legacy }` means a request
+    # carrying both has `required_gpu` and the VRAM floor IGNORED. That reads
+    # like a bug and is the documented precedence, so it is pinned rather than
+    # "fixed" — a node failing the legacy floor but meeting the hardware
+    # requirement must still place.
+    var q_both = agnosai_placement_request_with_hardware(
+    agnosai_placement_request_with_min_gpu_vram_mb(
+    agnosai_placement_request_with_required_gpu(
+    agnosai_placement_request_new(AGNOSAI_PLACE_BALANCED), 1), 999999999), hw_cuda);
+    var both_nodes = vec_new();
+    vec_push(both_nodes, agnosai_node_info_with_hardware(_t_gpu_node("cuda-box", 1), cuda_inv));
+    assert_eq(vec_len(agnosai_rank_nodes(q_both, both_nodes)), 1,
+    "a hardware requirement overrides the legacy VRAM floor rather than adding to it");
+
+    # --- past the oracle: THE SORT IS STABLE AT SCALE -------------------
+    # Rust's `sort_by` is stable, so equal scores keep input order and `place()`
+    # returns the earliest. `vec_sort_by` is introsort — stable only below 18
+    # elements — so this needs to run past that threshold to mean anything.
+    #
+    # ⚠ **40 nodes that ALL tie proves nothing**, and the first version of this
+    # test did exactly that. `vec_sort_by` opens with an already-ordered scan;
+    # an all-equal input is already in its final order, so the sort returns
+    # without permuting and the assertion passes against a comparator with no
+    # tiebreak at all. Mutation-verified: it did.
+    #
+    # So the input must FORCE a permutation and still contain tie groups. Even
+    # indices weigh 0 (score 1.0), odd indices weigh 100 (score ~1/101), which
+    # is not descending — the sort must interleave — and each parity class is a
+    # 20-element tie group, past the introsort threshold. A stable sort answers
+    # n0, n2, .. n38, n1, n3, .. n39.
+    var many = vec_new();
+    for (var i = 0; i < 40; i = i + 1) {
+        var buf[16];
+        var bn = fmt_int_buf(i, &buf);
+        store8(&buf + bn, 0);
+        var vram = 0;
+        if (i % 2 == 1) { vram = 100; }
+        vec_push(many, agnosai_node_info_new(str_cat(str_from("n"), str_from(&buf)), 0, vram));
+    }
+    var r_many = agnosai_rank_nodes(q_cost, many);
+    assert_eq(vec_len(r_many), 40, "all forty nodes rank");
+
+    # The two tie groups must each appear in input order.
+    var stable = 1;
+    for (var i = 0; i < 20; i = i + 1) {
+        # positions 0..19 are the even-index (score 1.0) nodes, in input order
+        if (str_eq(agnosai_placement_result_node_id(vec_get(r_many, i)),
+        agnosai_node_info_id(vec_get(many, i * 2))) == 0) { stable = 0; }
+        # positions 20..39 are the odd-index nodes, likewise in input order
+        if (str_eq(agnosai_placement_result_node_id(vec_get(r_many, 20 + i)),
+        agnosai_node_info_id(vec_get(many, i * 2 + 1))) == 0) { stable = 0; }
+    }
+    assert_eq(stable, 1,
+    "two 20-element tie groups each keep input order through a permuting sort");
+    assert(str_eq_cstr(agnosai_placement_result_node_id(agnosai_place(q_cost, many)), "n0") == 1,
+    "and place() returns the earliest of the tied best nodes");
+
+    # --- past the oracle: accessors and builders round-trip -------------
+    var q_all = agnosai_placement_request_new(AGNOSAI_PLACE_LOCALITY);
+    assert_eq(agnosai_placement_request_policy(q_all), AGNOSAI_PLACE_LOCALITY, "policy round-trips");
+    assert_eq(agnosai_placement_request_required_gpu(q_all), 0, "required_gpu defaults false");
+    assert_eq(agnosai_placement_request_min_gpu_vram_mb(q_all), 0, "the VRAM floor defaults 0");
+    assert_eq(vec_len(agnosai_placement_request_capabilities(q_all)), 0,
+    "capabilities default empty");
+    assert_eq(agnosai_placement_request_preferred_node(q_all), 0, "preferred_node defaults None");
+    assert_eq(agnosai_placement_request_hardware(q_all), 0, "hardware defaults None");
+    agnosai_placement_request_with_required_gpu(q_all, 1);
+    agnosai_placement_request_with_min_gpu_vram_mb(q_all, 512);
+    agnosai_placement_request_with_preferred_node(q_all, str_from("pref"));
+    agnosai_placement_request_with_hardware(q_all, hw_cuda);
+    assert_eq(agnosai_placement_request_required_gpu(q_all), 1, "with_required_gpu sets it");
+    assert_eq(agnosai_placement_request_min_gpu_vram_mb(q_all), 512, "with_min_gpu_vram_mb sets it");
+    assert(str_eq_cstr(agnosai_placement_request_preferred_node(q_all), "pref") == 1,
+    "with_preferred_node sets it");
+    assert_eq(agnosai_placement_request_hardware(q_all), hw_cuda, "with_hardware sets it");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

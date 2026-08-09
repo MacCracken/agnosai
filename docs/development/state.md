@@ -12,74 +12,38 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.12` (`cyrius.cyml`) — bumped 2026-08-08, three-step,
-  `lib/` **diffed** against the snapshot: 107 files, **zero content
-  differences**, the only `Only in lib/` entries being the six declared git deps.
-  Folds **sigil 3.12.4**.
+- **Cyrius pin**: `6.5.14` (`cyrius.cyml`) — bumped 2026-08-08, three-step,
+  `lib/` diffed after the sync AND again after a build: 107 files, zero content
+  differences. Folds **sigil 3.12.6**.
 
-  ⚠ **`lib sync --full` still skips `lib/unicode/`** — it copies only the top
-  level, so the subtree must be copied by hand after every bump
-  (`cp ~/.cyrius/versions/<pin>/lib/unicode/*.cyr lib/unicode/`). And the
-  lockfile is written **last**, after any hand copy, or `deps --verify` fails on
-  a hash mismatch.
+  **6.5.14 is not optional here.** It fixes the tail-call frame-release bug in
+  standing rule 12, and sigil 3.12.6 — which fixes an **RSA-PSS authentication
+  bypass**, the same class agnosai reported against PKCS#1 v1.5 — declares
+  `cyrius >= 6.5.14` as its floor. agnosai reaches PSS through TLS 1.3
+  CertificateVerify (`lib/tls_native_hs13.cyr:257,260`) on every outbound HTTPS
+  call from `tools/agnos.cyr`, `tools/remote_registry.cyr` and
+  `guarded_fetch.cyr`, so holding at an older sigil would ship a TLS peer-auth
+  bypass.
 
-  ⚠ **`[deps.sigil]` tracks the FOLD, not sigil's tags.** `sigil.cyr` is folded
-  into the cyrius stdlib snapshot, and `lib sync --full` runs *after* `deps`, so
-  it overwrites the git-dep copy. Bumping the tag alone changes nothing — proven
-  on 2026-08-08, when the tag was moved to 3.12.3 and `lib/sigil.cyr` stayed at
-  3.12.2. Worse, `cyrius deps` fell back to the stale bytes **silently** when the
-  tag did not resolve.
+  ⚠ **`sigil.cyr` is BOTH folded into the snapshot AND a git dep with
+  `path = "../sigil"`, and when the sibling is ahead of the fold those two
+  demands conflict.** The three-step leaves `lib/` matching the snapshot, then
+  **every `cyrius build` re-layers the sibling's dist** — build performs an
+  implicit resolve and the local path beats the tag. Seen live on 2026-08-08
+  with the fold at 3.12.5 and the sibling at 3.12.6. A `check-clean` allowance
+  was written for it and then **deleted unused**, because the next toolchain
+  snapshot carried 3.12.6 and the conflict evaporated. If it recurs, the choice
+  is a narrow newer-only allowance with a stated exit condition, or dropping
+  `path` so local resolution matches CI — not silently living with a red gate.
 
-  Previously **6.5.11**, bumped the same day: 100 files synced, zero differences.
+  ⚠ **Do not trust a single `lib sync --full` when the toolchain was installed
+  moments earlier.** The 6.5.13 bump's first sync reported `copied 107 .cyr
+  files` and left `lib/syscalls_x86_64_agnos.cyr` at the previous pin —
+  `check-clean` caught it, a second sync fixed it. **Always diff `lib/` after
+  syncing, and again after any `deps` run.**
 
-  **What 6.5.11 lands on agnosai: `lib/fs.cyr`'s bump-allocator leak.** `is_dir`
-  and `dir_list` took their getdents scratch from `alloc()`, which the default
-  bump allocator never returns; both are now stack locals. **agnosai hits this**
-  — `src/orchestrator/durable_state.cyr` calls `is_dir` at :219, :248 and :281,
-  on the crew-persistence path.
+  Previously 6.5.13 (sigil 3.12.5), 6.5.12 (3.12.4), 6.5.11.
 
-  **Measured here, both arms in one binary** (6.5.10's Linux arm lifted verbatim
-  from `git show 6.5.10:lib/fs.cyr`, renamed `_is_dir_610`, same fixture, same
-  run, both returning the same answer):
-
-  | | bytes per call |
-  |---|---|
-  | `is_dir`, 6.5.10 | **4,104** |
-  | `is_dir`, 6.5.11 | **0** |
-
-  `agnosai_state_store_save` now costs **1,360 B/save**, all of it the save
-  rather than scratch. `lib/thread.cyr`'s only change is gaining
-  `include "lib/thread_macos.cyr"`, which is why that file is new in `lib/`.
-
-  ⚠ **Two traps, both hit during this bump.** (1) `lib/unicode/` is hand-vendored
-  and `lib sync` copies **only the top level**, so `unicode/_decode.cyr` was left
-  behind and the recursive snapshot check is the only thing that caught it —
-  copy the subtree by hand after every bump. (2) The lockfile really must be
-  written **last**: syncing that one file after `deps --lock` made
-  `deps --verify` fail with `FAIL: lib/unicode/_decode.cyr (hash mismatch)`.
-
-  ⚠ **A `~/.cyrius/versions/<pin>/lib` directory is not a trustworthy 6.5.x
-  reference.** On 2026-08-08 the *6.5.10* snapshot directory was found holding
-  **6.5.11 content** — its `fs.cyr` hashed byte-identical to 6.5.11's and carried
-  comments reading "v6.5.11: STACK scratch, not alloc()". The authoritative
-  reference is the **cyrius repo's git tag**: `git -C ~/Repos/cyrius show
-  <tag>:lib/<mod>.cyr`. That check is what proved agnosai's `lib/` had not
-  drifted at all — both allegedly-differing files hashed identical to tag 6.5.10.
-
-  Previously **6.5.10**, bumped 2026-08-07. Folds **sakshi
-  2.4.8**, bayan 1.4.0, sigil 3.12.2, sandhi 1.9.9, yukti 2.3.2, mabda 4.0.8.
-  6.5.10 lands the **`alloc_via` fix agnosai filed** (see *Benchmarks*): 15.1 →
-  11.1 ns, worth 5–13% on every arena-threaded route.
-
-  **All seven siblings were bumped to 6.5.10 with it** (from sigil 6.5.3, bote
-  6.5.4, kavach 6.5.5, ai-hwaccel 6.5.2, majra 6.4.83, libro 6.4.83, tyche
-  6.2.11). majra needed `dynlib`, `fdlopen` and `async` added to its
-  `[deps].stdlib` — 6.5.10 no longer supplies them transitively via `sandhi`.
-
-  ⚠ **`[deps.sakshi]` is pinned explicitly in `cyrius.cyml` and must move with
-  every toolchain bump.** Listing `sakshi` in `[deps].stdlib` is not sufficient —
-  sigil and bote pin it transitively in their own manifests, which silently
-  downgraded it on every build until 2026-08-07. See standing rule 2 below.
 - **`lib/` matches the pin exactly**: 0 of 106 stdlib files differ from
   `~/.cyrius/versions/6.5.10/lib`; build and test emit no drift or shadow warning.
   The six files outside the snapshot (ai-hwaccel, bote-core, kavach, libro, majra,
@@ -1186,7 +1150,31 @@ fixed.
    start barrier left the unlocked build fully clean, because the workers barely
    overlapped. The suite now uses a barrier and 2,000 iterations.)
 
-12. **sigil's crypto scratch is shared across threads, and the JWT path is the
+12. ⚠ **A `return f(&local_or_pointer_into_this_frame, ...)` with EXACTLY SIX
+   arguments is a tail call, and cycc frees the frame before jumping.** The
+   callee then reads a released frame. This cost sigil three releases and cost
+   this tree a wrong diagnosis, so it is worth knowing cold:
+
+   - cycc declines TCO **above** six arguments, so the same code localised
+     cleanly in a 10-argument function and "broke the tests" in a 6-argument
+     one. **The arity was the variable, not the buffer.**
+   - cycc's own guard fires only on a `&` spelled literally in the argument
+     list, so `var p = &buf; ... return f(p)` walks straight past it.
+   - Fixed in **cyrius 6.5.14**. Below that pin, the hazard is live.
+
+   **The wrong turn, recorded because it was persuasive.** Localising sigil's
+   PSS and sign buffers regressed tests; three sigil releases (and a note in
+   this tree) recorded "cause not understood" and kept the shared lanes — and
+   those lanes *were* an authentication bypass. This tree's probe that
+   "ruled out callee-clobbers-caller" was **not a faithful reproduction**: it
+   called the callee and then did more work, which is not a tail call, so TCO
+   never applied and the probe returned a false negative. The probe that
+   settled it compares two addresses — a callee local sitting *above* every
+   caller local only happens if the caller's frame is already gone.
+
+   **When a buffer "cannot" be localised, count the callee's arguments first.**
+
+13. **sigil's crypto scratch is shared across threads, and the JWT path is the
    only place agnosai is protected.** `cbank()` gives 63 lanes and never
    releases one, so the bound is 63 *lifetime* crypto-touching threads — a
    count agnosai passes with its 100 pool workers alone. Both operands of

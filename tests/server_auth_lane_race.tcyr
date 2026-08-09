@@ -14,8 +14,22 @@
 # threads x 8000 iterations: **888 of 400,000 forged signatures verified**, and
 # 281,965 of 400,000 valid ones were rejected.
 #
-# `_agnosai_auth_rsa_verify_locked` (src/server/auth.cyr) serialises the call.
-# This suite is what stops that lock being removed as an optimisation.
+# ✅ FIXED UPSTREAM. sigil 3.12.3 moved the v1.5 verify workspace to
+# function-scope locals (closing the BYPASS), 3.12.4 did the same for the
+# Montgomery scratch, and 3.12.5 finished the job with `bn_mod`'s
+# `modrembuf`/`modn1buf` — the last shared state on the public verify path,
+# located from this suite. agnosai's serialising mutex is DELETED as of the
+# cyrius 6.5.13 fold; the call site in `src/server/auth.cyr` is direct again.
+#
+# This suite is now the REGRESSION GUARD on the vendored sigil. It has caught
+# every stage of the fix and would catch a relapse:
+#
+#   | vendored sigil | valid verified / 2000 | forged accepted |
+#   |---|---|---|
+#   | 3.12.2 | 1    | 888 of 400,000 |
+#   | 3.12.3 | 1    | 0 |
+#   | 3.12.4 | 712  | 0 |
+#   | 3.12.5 | 2000 | 0 |
 #
 # WHY IT IS DETERMINISTIC RATHER THAN A RACE TEST. Both threads pin themselves
 # to lane 1 with `crypto_bank_set(1)`, reproducing by construction the aliasing
@@ -23,16 +37,14 @@
 # that must hold under EVERY interleaving — *a valid signature always verifies*
 # — rather than an attempt to win a schedule.
 #
-# MUTATION-VERIFIED. Removing `mutex_lock`/`mutex_unlock` from
-# `_agnosai_auth_rsa_verify_locked` makes the victim's genuine signature verify
-# **0 of 2000 times** and be rejected 2000/2000, failing two named assertions.
-# Restored, it is 9/9 across three runs.
+# MUTATION-VERIFIED while the mutex existed: removing it made the victim's
+# genuine signature verify **0 of 2000 times**, failing two named assertions.
 #
 # ⚠ **The first mutation attempt was not a faithful revert and the mutant
-# survived.** It reverted the CALL SITE in `_agnosai_auth_validate_jwt` while
-# this suite calls `_agnosai_auth_rsa_verify_locked` directly, so the test never
-# saw the change and reported 9/9 against an unlocked build. Mutate the WRAPPER
-# BODY, not the call site, when re-verifying this suite.
+# survived** — it reverted the CALL SITE while this suite called the wrapper
+# directly, so the test never saw the change and reported 9/9 against a
+# knowingly-broken build. Mutate what the SUITE calls, not what production
+# calls.
 #
 # ⚠ The forged-signature counter stays 0 here and that is expected, not a
 # weakness: two threads pinned to one lane is *max contention*, which corrupts
@@ -97,10 +109,15 @@ fn _t_lr_unhex(hex, out): i64 {
     return i;
 }
 
-# One verification through agnosai's locked wrapper — the thing under test.
-# `msg` is a raw pointer + length, matching sigil's signature.
+# One verification straight through sigil — the thing under test. `msg` is a
+# raw pointer + length, matching sigil's signature.
+#
+# Until the cyrius 6.5.13 / sigil 3.12.5 fold this went through agnosai's
+# `_agnosai_auth_rsa_verify_locked` mutex; that workaround is deleted and the
+# call site in `src/server/auth.cyr` is direct again, so this drives what the
+# server actually runs.
 fn _t_lr_verify(msg, msg_len): i64 {
-    return _agnosai_auth_rsa_verify_locked(&_T_LR_N, 256, &_T_LR_E, 3, msg, msg_len,
+    return rsa_pkcs1v15_verify_sha256(&_T_LR_N, 256, &_T_LR_E, 3, msg, msg_len,
     &_T_LR_SIG, 256);
 }
 

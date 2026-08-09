@@ -1,0 +1,548 @@
+# =========================================================================
+# fleet/state — distributed crew state with barrier sync and checkpoints.
+#
+# Parity oracle: rust-old/src/fleet/state.rs
+#
+# ## Two Rust enums carry payloads; Cyrius enums are plain integers
+#
+# `CrewPhase::WaitingBarrier(String)` and `CrewPhase::Failed(String)` each carry
+# a string, and `BarrierResult::Waiting(usize)` carries a count. Cyrius has no
+# sum types, so:
+#
+# * **CrewPhase** becomes a tag in `AGN_DCS_PHASE` plus a payload Str in
+#   `AGN_DCS_PHASE_DETAIL` — the barrier name for `WaitingBarrier`, the reason
+#   for `Failed`, and 0 for every other phase. The tag alone is never enough to
+#   compare two phases: the oracle's `PartialEq` on `WaitingBarrier("a")` vs
+#   `WaitingBarrier("b")` is FALSE, and `remove_node` depends on exactly that
+#   comparison, so `agnosai_crew_phase_eq` takes both halves.
+#
+# * **BarrierResult** is encoded as a single i64: a count >= 0 is `Waiting(n)`,
+#   and three negative sentinels are the unit variants. That keeps the hot path
+#   allocation-free — `reach_barrier` runs once per node per barrier — where a
+#   returned struct would charge the no-free global bump on every call.
+#   `Waiting(0)` is unrepresentable and cannot arise: the oracle returns
+#   `AllReached` whenever `reached >= total`.
+#
+# ## `is_checkpointing` is observably always false, and that is the oracle's
+#
+# `checkpoint()` sets the flag, pushes, and clears it before returning. Since
+# every method takes `&mut self`, no caller can observe it set. The field and
+# both writes are ported anyway — the oracle's comment says it exists so barrier
+# operations can be queued against it, which is a contract for a future
+# concurrent caller rather than dead code. See roadmap section E.
+# =========================================================================
+
+# CrewPhase tags. The payload for WaitingBarrier / Failed lives in
+# `AGN_DCS_PHASE_DETAIL`; every other phase leaves it 0.
+enum AgnosaiCrewPhase {
+    AGNOSAI_PHASE_INITIALIZING = 0;
+    AGNOSAI_PHASE_RUNNING = 1;
+    AGNOSAI_PHASE_WAITING_BARRIER = 2;
+    AGNOSAI_PHASE_CHECKPOINTING = 3;
+    AGNOSAI_PHASE_COMPLETED = 4;
+    AGNOSAI_PHASE_FAILED = 5;
+    AGNOSAI_PHASE_CANCELLED = 6;
+}
+
+# BarrierResult, encoded in one i64. A value >= 0 is `Waiting(n)`.
+var AGNOSAI_BARRIER_ALL_REACHED = 0 - 1;
+var AGNOSAI_BARRIER_UNKNOWN_RUN = 0 - 2;
+var AGNOSAI_BARRIER_UNKNOWN_NODE = 0 - 3;
+
+# The oracle's `MAX_RETAINED_RUNS`.
+var AGNOSAI_MAX_RETAINED_RUNS = 1000;
+
+# NodeProgress heap layout — 40 bytes.
+enum AgnosaiNodeProgressOff {
+    AGN_NP_NODE_ID = 0;
+    AGN_NP_TASKS_COMPLETED = 8;
+    AGN_NP_TASKS_TOTAL = 16;
+    # 0 for the oracle's `None`.
+    AGN_NP_CURRENT_TASK = 24;
+    AGN_NP_LAST_UPDATE = 32;
+    AGN_NP_SIZE = 40;
+}
+
+# Checkpoint heap layout — 24 bytes.
+#
+# ⚠ `AGN_CKPT_*`, not `AGN_CP_*` — `src/orchestrator/plan_cache.cyr`'s
+# `AgnosaiCachedPlanOff` already owns `AGN_CP_SIZE`, and Cyrius is **silent** on
+# a duplicate enum member. `scripts/check-symbols.sh` is what caught it.
+enum AgnosaiCheckpointOff {
+    AGN_CKPT_NAME = 0;
+    AGN_CKPT_CREATED_AT = 8;
+    AGN_CKPT_NODE_STATES = 16;
+    AGN_CKPT_SIZE = 24;
+}
+
+# DistributedCrewState heap layout — 72 bytes.
+enum AgnosaiDistCrewStateOff {
+    AGN_DCS_RUN_ID = 0;
+    AGN_DCS_PHASE = 8;
+    AGN_DCS_PHASE_DETAIL = 16;
+    AGN_DCS_IS_CHECKPOINTING = 24;
+    # The oracle's HashSet<NodeId>, as a vec kept unique by _agnosai_dcs_set_add.
+    AGN_DCS_PARTICIPATING = 32;
+    AGN_DCS_NODE_PROGRESS = 40;
+    AGN_DCS_CHECKPOINTS = 48;
+    AGN_DCS_CREATED_AT = 56;
+    AGN_DCS_UPDATED_AT = 64;
+    AGN_DCS_SIZE = 72;
+}
+
+# CrewStateManager heap layout — 16 bytes.
+enum AgnosaiCrewStateManagerOff {
+    AGN_CSM_STATES = 0;
+    # run_id -> (barrier name -> vec of arrived node ids)
+    AGN_CSM_BARRIERS = 8;
+    AGN_CSM_SIZE = 16;
+}
+
+# --- set helpers (the oracle's HashSet<NodeId>) --------------------------
+
+# Whether `set` already holds `id`.
+fn _agnosai_dcs_set_has(set, id: Str): i64 {
+    for (var i = 0; i < vec_len(set); i = i + 1) {
+        if (str_eq(vec_get(set, i), id) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# Insert `id` if absent — a set, not a list. Returns 1 if it was added.
+fn _agnosai_dcs_set_add(set, id: Str): i64 {
+    if (_agnosai_dcs_set_has(set, id) == 1) { return 0; }
+    vec_push(set, id);
+    return 1;
+}
+
+# Remove `id`, preserving the order of the rest. Returns 1 if it was present.
+fn _agnosai_dcs_set_remove(set, id: Str): i64 {
+    for (var i = 0; i < vec_len(set); i = i + 1) {
+        if (str_eq(vec_get(set, i), id) == 1) {
+            vec_remove(set, i);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# Whether every element of `sub` is in `sup` — the oracle's `is_subset`.
+#
+# ⚠ An EMPTY `sub` is a subset of anything, and that is load-bearing: once
+# `remove_node` empties `participating_nodes`, every pending barrier becomes
+# satisfied. Reproduced from the oracle rather than guarded against.
+fn _agnosai_dcs_is_subset(sub, sup): i64 {
+    for (var i = 0; i < vec_len(sub); i = i + 1) {
+        if (_agnosai_dcs_set_has(sup, vec_get(sub, i)) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# --- CrewPhase -----------------------------------------------------------
+
+# Whether two phases are equal, payload included.
+#
+# ⚠ The tag alone is not enough. The oracle derives `PartialEq`, so
+# `WaitingBarrier("a") != WaitingBarrier("b")` and `Failed("x") != Failed("y")`.
+# `remove_node` relies on exactly that when deciding whether the phase it is
+# clearing is the barrier it just satisfied.
+fn agnosai_crew_phase_eq(tag_a, detail_a, tag_b, detail_b): i64 {
+    if (tag_a != tag_b) { return 0; }
+    if (tag_a != AGNOSAI_PHASE_WAITING_BARRIER && tag_a != AGNOSAI_PHASE_FAILED) { return 1; }
+    if (detail_a == 0 || detail_b == 0) {
+        if (detail_a == detail_b) { return 1; }
+        return 0;
+    }
+    return str_eq(detail_a, detail_b);
+}
+
+# Whether a phase tag is terminal — Completed, Failed or Cancelled.
+fn agnosai_crew_phase_is_terminal(tag): i64 {
+    if (tag == AGNOSAI_PHASE_COMPLETED) { return 1; }
+    if (tag == AGNOSAI_PHASE_FAILED) { return 1; }
+    if (tag == AGNOSAI_PHASE_CANCELLED) { return 1; }
+    return 0;
+}
+
+# --- NodeProgress --------------------------------------------------------
+
+# The node this progress belongs to.
+fn agnosai_node_progress_node_id(p): i64 {
+    return load64(p + AGN_NP_NODE_ID);
+}
+
+# Tasks finished on this node.
+fn agnosai_node_progress_tasks_completed(p): i64 {
+    return load64(p + AGN_NP_TASKS_COMPLETED);
+}
+
+# Tasks assigned to this node.
+fn agnosai_node_progress_tasks_total(p): i64 {
+    return load64(p + AGN_NP_TASKS_TOTAL);
+}
+
+# The task currently running, or 0 for the oracle's `None`.
+fn agnosai_node_progress_current_task(p): i64 {
+    return load64(p + AGN_NP_CURRENT_TASK);
+}
+
+# Wall-clock seconds of the last progress report.
+fn agnosai_node_progress_last_update(p): i64 {
+    return load64(p + AGN_NP_LAST_UPDATE);
+}
+
+# --- Checkpoint ----------------------------------------------------------
+
+# The checkpoint's name.
+fn agnosai_checkpoint_name(c): i64 {
+    return load64(c + AGN_CKPT_NAME);
+}
+
+# Wall-clock seconds at which it was taken.
+fn agnosai_checkpoint_created_at(c): i64 {
+    return load64(c + AGN_CKPT_CREATED_AT);
+}
+
+# The per-node opaque state map captured at that moment.
+fn agnosai_checkpoint_node_states(c): i64 {
+    return load64(c + AGN_CKPT_NODE_STATES);
+}
+
+# --- DistributedCrewState ------------------------------------------------
+
+# The run's id.
+fn agnosai_dist_crew_state_run_id(s): i64 {
+    return load64(s + AGN_DCS_RUN_ID);
+}
+
+# The phase tag. Pair it with `_phase_detail` to compare phases.
+fn agnosai_dist_crew_state_phase(s): i64 {
+    return load64(s + AGN_DCS_PHASE);
+}
+
+# The phase payload — barrier name, failure reason, or 0.
+fn agnosai_dist_crew_state_phase_detail(s): i64 {
+    return load64(s + AGN_DCS_PHASE_DETAIL);
+}
+
+# Whether a checkpoint is in flight. See the module header: no caller can
+# observe this set, and that matches the oracle.
+fn agnosai_dist_crew_state_is_checkpointing(s): i64 {
+    return load64(s + AGN_DCS_IS_CHECKPOINTING);
+}
+
+# The nodes taking part in this run.
+fn agnosai_dist_crew_state_participating(s): i64 {
+    return load64(s + AGN_DCS_PARTICIPATING);
+}
+
+# Per-node progress, keyed by node id.
+fn agnosai_dist_crew_state_node_progress(s): i64 {
+    return load64(s + AGN_DCS_NODE_PROGRESS);
+}
+
+# Checkpoints taken so far, oldest first.
+fn agnosai_dist_crew_state_checkpoints(s): i64 {
+    return load64(s + AGN_DCS_CHECKPOINTS);
+}
+
+# Wall-clock seconds at creation.
+fn agnosai_dist_crew_state_created_at(s): i64 {
+    return load64(s + AGN_DCS_CREATED_AT);
+}
+
+# Wall-clock seconds of the last mutation.
+fn agnosai_dist_crew_state_updated_at(s): i64 {
+    return load64(s + AGN_DCS_UPDATED_AT);
+}
+
+# Set the phase and its payload together, and stamp `updated_at`.
+fn _agnosai_dcs_set_phase(s, tag, detail): i64 {
+    store64(s + AGN_DCS_PHASE, tag);
+    store64(s + AGN_DCS_PHASE_DETAIL, detail);
+    store64(s + AGN_DCS_UPDATED_AT, clock_epoch_secs());
+    return 0;
+}
+
+# --- CrewStateManager ----------------------------------------------------
+
+# The oracle's `CrewStateManager::new` / `Default`.
+fn agnosai_crew_state_manager_new(): i64 {
+    var m = alloc(AGN_CSM_SIZE);
+    store64(m + AGN_CSM_STATES, map_new_str());
+    store64(m + AGN_CSM_BARRIERS, map_new_str());
+    return m;
+}
+
+# Drop every terminal run once the manager is at capacity.
+#
+# ⚠ The oracle checks `>=` on the count BEFORE inserting the new run, and
+# removes ALL terminal runs rather than the oldest — so a manager holding 1000
+# live runs evicts nothing and grows past the cap. That is the oracle's
+# behaviour and the cap is a floor on retention, not a hard ceiling.
+fn _agnosai_csm_evict_if_needed(m): i64 {
+    var states = load64(m + AGN_CSM_STATES);
+    if (map_size(states) < AGNOSAI_MAX_RETAINED_RUNS) { return 0; }
+    var doomed = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(states); i = i + 1) {
+        if (_agnosai_map_slot_live(states, i) == 1) {
+            var s = _agnosai_map_slot_val(states, i);
+            if (agnosai_crew_phase_is_terminal(load64(s + AGN_DCS_PHASE)) == 1) {
+                vec_push(doomed, _agnosai_map_slot_key(states, i));
+            }
+        }
+    }
+    for (var i = 0; i < vec_len(doomed); i = i + 1) {
+        map_delete(states, vec_get(doomed, i));
+        map_delete(load64(m + AGN_CSM_BARRIERS), vec_get(doomed, i));
+    }
+    return 0;
+}
+
+# Create a run over `nodes`, each starting with `tasks_per_node` tasks.
+# Returns the minted run id.
+fn agnosai_crew_state_manager_create_run(m, nodes, tasks_per_node): i64 {
+    _agnosai_csm_evict_if_needed(m);
+    var run_id = agnosai_uuid_v4_str();
+    var now = clock_epoch_secs();
+
+    var participating = vec_new();
+    var progress = map_new_str();
+    for (var i = 0; i < vec_len(nodes); i = i + 1) {
+        var id = vec_get(nodes, i);
+        # The oracle takes a HashSet, so a duplicated id collapses before it
+        # ever reaches here. Collapsing it here keeps `participating_nodes.len()`
+        # — which every barrier compares against — honest.
+        if (_agnosai_dcs_set_add(participating, id) == 1) {
+            var p = alloc(AGN_NP_SIZE);
+            store64(p + AGN_NP_NODE_ID, id);
+            store64(p + AGN_NP_TASKS_COMPLETED, 0);
+            store64(p + AGN_NP_TASKS_TOTAL, tasks_per_node);
+            store64(p + AGN_NP_CURRENT_TASK, 0);
+            store64(p + AGN_NP_LAST_UPDATE, now);
+            map_set(progress, id, p);
+        }
+    }
+
+    var s = alloc(AGN_DCS_SIZE);
+    store64(s + AGN_DCS_RUN_ID, run_id);
+    store64(s + AGN_DCS_PHASE, AGNOSAI_PHASE_INITIALIZING);
+    store64(s + AGN_DCS_PHASE_DETAIL, 0);
+    store64(s + AGN_DCS_IS_CHECKPOINTING, 0);
+    store64(s + AGN_DCS_PARTICIPATING, participating);
+    store64(s + AGN_DCS_NODE_PROGRESS, progress);
+    store64(s + AGN_DCS_CHECKPOINTS, vec_new());
+    store64(s + AGN_DCS_CREATED_AT, now);
+    store64(s + AGN_DCS_UPDATED_AT, now);
+    map_set(load64(m + AGN_CSM_STATES), run_id, s);
+    return run_id;
+}
+
+# The state of a run, or 0 for the oracle's `None`.
+fn agnosai_crew_state_manager_get(m, run_id: Str): i64 {
+    return map_get(load64(m + AGN_CSM_STATES), run_id);
+}
+
+# Report a node's progress. `current_task` of 0 is the oracle's `None`.
+# Returns 1 if applied, 0 for an unknown run or a non-participating node.
+fn agnosai_crew_state_manager_report_progress(m, run_id: Str, node_id: Str, tasks_completed,
+current_task): i64 {
+    var s = map_get(load64(m + AGN_CSM_STATES), run_id);
+    if (s == 0) { return 0; }
+    var p = map_get(load64(s + AGN_DCS_NODE_PROGRESS), node_id);
+    if (p == 0) { return 0; }
+    store64(p + AGN_NP_TASKS_COMPLETED, tasks_completed);
+    store64(p + AGN_NP_CURRENT_TASK, current_task);
+    store64(p + AGN_NP_LAST_UPDATE, clock_epoch_secs());
+    # Initializing advances to Running on the first report. Every other phase
+    # is preserved — a Completed run still accepts a progress report.
+    if (load64(s + AGN_DCS_PHASE) == AGNOSAI_PHASE_INITIALIZING) {
+        store64(s + AGN_DCS_PHASE, AGNOSAI_PHASE_RUNNING);
+        store64(s + AGN_DCS_PHASE_DETAIL, 0);
+    }
+    store64(s + AGN_DCS_UPDATED_AT, clock_epoch_secs());
+    return 1;
+}
+
+# The set of nodes that have arrived at `barrier_name` for `run_id`, creating
+# the entries on demand as the oracle's two `or_default()` calls do.
+fn _agnosai_csm_arrived(m, run_id: Str, barrier_name: Str): i64 {
+    var barriers = load64(m + AGN_CSM_BARRIERS);
+    var run_barriers = map_get(barriers, run_id);
+    if (run_barriers == 0) {
+        run_barriers = map_new_str();
+        map_set(barriers, run_id, run_barriers);
+    }
+    var arrived = map_get(run_barriers, barrier_name);
+    if (arrived == 0) {
+        arrived = vec_new();
+        map_set(run_barriers, barrier_name, arrived);
+    }
+    return arrived;
+}
+
+# Signal that a node has reached a named barrier.
+#
+# Returns a count >= 0 for `Waiting(n)`, or one of the three negative sentinels.
+fn agnosai_crew_state_manager_reach_barrier(m, run_id: Str, node_id: Str,
+barrier_name: Str): i64 {
+    var s = map_get(load64(m + AGN_CSM_STATES), run_id);
+    if (s == 0) { return AGNOSAI_BARRIER_UNKNOWN_RUN; }
+    if (_agnosai_dcs_set_has(load64(s + AGN_DCS_PARTICIPATING), node_id) == 0) {
+        return AGNOSAI_BARRIER_UNKNOWN_NODE;
+    }
+    var arrived = _agnosai_csm_arrived(m, run_id, barrier_name);
+    _agnosai_dcs_set_add(arrived, node_id);
+
+    var total = vec_len(load64(s + AGN_DCS_PARTICIPATING));
+    var reached = vec_len(arrived);
+    if (reached >= total) {
+        # ⚠ The barrier's arrival set is NOT cleared here — only `force_barrier`
+        # and `remove_node` erase it. So a second pass over the same barrier
+        # name answers AllReached immediately for every node.
+        _agnosai_dcs_set_phase(s, AGNOSAI_PHASE_RUNNING, 0);
+        return AGNOSAI_BARRIER_ALL_REACHED;
+    }
+    _agnosai_dcs_set_phase(s, AGNOSAI_PHASE_WAITING_BARRIER, barrier_name);
+    return total - reached;
+}
+
+# Force a barrier to complete even if not every node arrived — for a run whose
+# node has died and would otherwise deadlock. Returns 1 if the run exists.
+fn agnosai_crew_state_manager_force_barrier(m, run_id: Str, barrier_name: Str): i64 {
+    var s = map_get(load64(m + AGN_CSM_STATES), run_id);
+    if (s == 0) { return 0; }
+    var run_barriers = map_get(load64(m + AGN_CSM_BARRIERS), run_id);
+    if (run_barriers != 0) { map_delete(run_barriers, barrier_name); }
+    # ⚠ Unconditional: the phase becomes Running whatever it was, so forcing a
+    # barrier on a Completed run revives it. That is the oracle's behaviour.
+    _agnosai_dcs_set_phase(s, AGNOSAI_PHASE_RUNNING, 0);
+    return 1;
+}
+
+# Remove a node from a run, then auto-complete any barrier the removal now
+# satisfies. Returns 1 if the run exists.
+fn agnosai_crew_state_manager_remove_node(m, run_id: Str, node_id: Str): i64 {
+    var s = map_get(load64(m + AGN_CSM_STATES), run_id);
+    if (s == 0) { return 0; }
+    var participating = load64(s + AGN_DCS_PARTICIPATING);
+    _agnosai_dcs_set_remove(participating, node_id);
+    map_delete(load64(s + AGN_DCS_NODE_PROGRESS), node_id);
+    store64(s + AGN_DCS_UPDATED_AT, clock_epoch_secs());
+
+    var run_barriers = map_get(load64(m + AGN_CSM_BARRIERS), run_id);
+    if (run_barriers == 0) { return 1; }
+
+    # Collect first, then mutate — the oracle collects into a Vec for the same
+    # reason, and deleting from the map mid-walk would skip entries.
+    var satisfied = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(run_barriers); i = i + 1) {
+        if (_agnosai_map_slot_live(run_barriers, i) == 1) {
+            if (_agnosai_dcs_is_subset(participating,
+            _agnosai_map_slot_val(run_barriers, i)) == 1) {
+                vec_push(satisfied, _agnosai_map_slot_key(run_barriers, i));
+            }
+        }
+    }
+    for (var i = 0; i < vec_len(satisfied); i = i + 1) {
+        var name = vec_get(satisfied, i);
+        map_delete(run_barriers, name);
+        # Only clears the phase if it is THIS barrier — comparing the payload,
+        # not just the tag. Waiting on "b" survives satisfying "a".
+        if (agnosai_crew_phase_eq(load64(s + AGN_DCS_PHASE), load64(s + AGN_DCS_PHASE_DETAIL),
+        AGNOSAI_PHASE_WAITING_BARRIER, name) == 1) {
+            store64(s + AGN_DCS_PHASE, AGNOSAI_PHASE_RUNNING);
+            store64(s + AGN_DCS_PHASE_DETAIL, 0);
+        }
+    }
+    return 1;
+}
+
+# Capture a checkpoint of the run. Returns 1 if the run exists.
+fn agnosai_crew_state_manager_checkpoint(m, run_id: Str, name: Str, node_states): i64 {
+    var s = map_get(load64(m + AGN_CSM_STATES), run_id);
+    if (s == 0) { return 0; }
+    # Set and cleared within the call — see the module header on why it is
+    # ported despite being unobservable.
+    store64(s + AGN_DCS_IS_CHECKPOINTING, 1);
+    var c = alloc(AGN_CKPT_SIZE);
+    store64(c + AGN_CKPT_NAME, name);
+    store64(c + AGN_CKPT_CREATED_AT, clock_epoch_secs());
+    store64(c + AGN_CKPT_NODE_STATES, node_states);
+    vec_push(load64(s + AGN_DCS_CHECKPOINTS), c);
+    store64(s + AGN_DCS_IS_CHECKPOINTING, 0);
+    if (load64(s + AGN_DCS_PHASE) == AGNOSAI_PHASE_INITIALIZING) {
+        store64(s + AGN_DCS_PHASE, AGNOSAI_PHASE_RUNNING);
+        store64(s + AGN_DCS_PHASE_DETAIL, 0);
+    }
+    store64(s + AGN_DCS_UPDATED_AT, clock_epoch_secs());
+    return 1;
+}
+
+# Mark a run completed. Returns 1 if it exists.
+fn agnosai_crew_state_manager_complete(m, run_id: Str): i64 {
+    var s = map_get(load64(m + AGN_CSM_STATES), run_id);
+    if (s == 0) { return 0; }
+    _agnosai_dcs_set_phase(s, AGNOSAI_PHASE_COMPLETED, 0);
+    return 1;
+}
+
+# Mark a run failed with a reason. Returns 1 if it exists.
+fn agnosai_crew_state_manager_fail(m, run_id: Str, reason: Str): i64 {
+    var s = map_get(load64(m + AGN_CSM_STATES), run_id);
+    if (s == 0) { return 0; }
+    _agnosai_dcs_set_phase(s, AGNOSAI_PHASE_FAILED, reason);
+    return 1;
+}
+
+# Cancel a run. Returns 1 if it exists.
+fn agnosai_crew_state_manager_cancel(m, run_id: Str): i64 {
+    var s = map_get(load64(m + AGN_CSM_STATES), run_id);
+    if (s == 0) { return 0; }
+    _agnosai_dcs_set_phase(s, AGNOSAI_PHASE_CANCELLED, 0);
+    return 1;
+}
+
+# Every run not in a terminal phase, as a vec of run ids.
+#
+# ⚠ Order is the map's slot order, as the oracle's `HashMap::values()` is
+# arbitrary. Do not depend on it.
+fn agnosai_crew_state_manager_active_runs(m): i64 {
+    var states = load64(m + AGN_CSM_STATES);
+    var out = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(states); i = i + 1) {
+        if (_agnosai_map_slot_live(states, i) == 1) {
+            var s = _agnosai_map_slot_val(states, i);
+            if (agnosai_crew_phase_is_terminal(load64(s + AGN_DCS_PHASE)) == 0) {
+                vec_push(out, load64(s + AGN_DCS_RUN_ID));
+            }
+        }
+    }
+    return out;
+}
+
+# Overall progress as an f64 bit pattern in 0.0-1.0, or 0 for an unknown run.
+#
+# ⚠ 0 means "unknown run" (the oracle's `None`), NOT 0.0 progress — a run at 0%
+# answers `f64_from(0)`, whose bit pattern is also 0. Callers must test the run
+# exists first; `agnosai_crew_state_manager_get` is the way.
+#
+# ⚠ A run with no tasks at all answers 1.0, not 0.0 — the oracle returns
+# `Some(1.0)` when `total == 0`, treating "nothing to do" as complete rather
+# than dividing by zero.
+fn agnosai_crew_state_manager_overall_progress(m, run_id: Str): i64 {
+    var s = map_get(load64(m + AGN_CSM_STATES), run_id);
+    if (s == 0) { return 0; }
+    var progress = load64(s + AGN_DCS_NODE_PROGRESS);
+    var completed = 0;
+    var total = 0;
+    for (var i = 0; i < _agnosai_map_slots(progress); i = i + 1) {
+        if (_agnosai_map_slot_live(progress, i) == 1) {
+            var p = _agnosai_map_slot_val(progress, i);
+            completed = completed + load64(p + AGN_NP_TASKS_COMPLETED);
+            total = total + load64(p + AGN_NP_TASKS_TOTAL);
+        }
+    }
+    if (total == 0) { return f64_from(1); }
+    return f64_div(f64_from(completed), f64_from(total));
+}

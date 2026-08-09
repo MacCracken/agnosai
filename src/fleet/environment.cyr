@@ -1,0 +1,323 @@
+# =========================================================================
+# fleet/environment — container/VM detection and cgroup resource limits.
+#
+# Parity oracle: rust-old/src/fleet/environment.rs
+#
+# ## Every decision is split from the file read, deliberately
+#
+# The oracle's `detect()` and its four cgroup readers each open a path and act
+# on the bytes in one function. Ported literally, **none of them would be
+# testable**: a suite cannot make `/proc/1/cgroup` say "kubepods", cannot create
+# `/.dockerenv`, and cannot remove `/sys/hypervisor/type`. The oracle's own
+# tests concede this — `detect_returns_valid_variant` asserts only that the
+# answer is one of five, and `resource_limits_runs_without_panic` asserts
+# nothing at all. Both measure the machine the suite happens to run on.
+#
+# This is standing rule 8 in `docs/development/state.md`, and the M7 audit's
+# recurring finding: the defect is an **unreachable** assertion, not an
+# unasserted one, and the fix is to split the function so the thing under test
+# can be handed its input. So each reader here is a pair:
+#
+#   `_agnosai_env_classify_cgroup(text)`   pure, exhaustively tested
+#   `agnosai_env_detect()`                 reads the files, calls the pure half
+#
+# What is left untested is `read_file` returning bytes, which lib/ owns.
+#
+# ## Ordering is observable and is asserted
+#
+# `detect()` tests Kubernetes before container before VM before bare, and
+# `kubepods` before `docker` **within** the cgroup text. A cgroup line naming
+# both kubepods and docker must answer Kubernetes; reversing those two arms
+# passes every oracle test.
+# =========================================================================
+
+# The runtime environment of this process.
+enum AgnosaiRuntimeEnvironment {
+    AGNOSAI_ENV_BARE = 0;
+    AGNOSAI_ENV_CONTAINER = 1;
+    AGNOSAI_ENV_VM = 2;
+    AGNOSAI_ENV_KUBERNETES = 3;
+    AGNOSAI_ENV_UNKNOWN = 4;
+}
+
+# ResourceLimits heap layout — 32 bytes. Each value carries a presence flag
+# because 0 is a legitimate reading and the oracle's fields are `Option`.
+enum AgnosaiResourceLimitsOff {
+    AGN_RL_HAS_CPU_QUOTA = 0;
+    # f64 bit pattern, meaningful only when HAS_CPU_QUOTA is 1.
+    AGN_RL_CPU_QUOTA = 8;
+    AGN_RL_HAS_MEMORY_LIMIT = 16;
+    AGN_RL_MEMORY_LIMIT_BYTES = 24;
+    AGN_RL_SIZE = 32;
+}
+
+# The oracle's `u64` "this is really unlimited" threshold, `1 << 62`.
+var AGNOSAI_CGROUP_V1_MEM_UNLIMITED = 4611686018427387904;
+
+# --- RuntimeEnvironment --------------------------------------------------
+
+# The oracle's `Display` spellings. ⚠ `Bare` renders "bare-metal", not "bare" —
+# the one name that is not simply the lowercased variant.
+fn agnosai_runtime_environment_to_str(e): i64 {
+    if (e == AGNOSAI_ENV_BARE) { return str_from("bare-metal"); }
+    if (e == AGNOSAI_ENV_CONTAINER) { return str_from("container"); }
+    if (e == AGNOSAI_ENV_VM) { return str_from("vm"); }
+    if (e == AGNOSAI_ENV_KUBERNETES) { return str_from("kubernetes"); }
+    return str_from("unknown");
+}
+
+# --- ResourceLimits ------------------------------------------------------
+
+# The oracle's `Default` — both fields `None`.
+fn agnosai_resource_limits_new(): i64 {
+    var r = alloc(AGN_RL_SIZE);
+    store64(r + AGN_RL_HAS_CPU_QUOTA, 0);
+    store64(r + AGN_RL_CPU_QUOTA, 0);
+    store64(r + AGN_RL_HAS_MEMORY_LIMIT, 0);
+    store64(r + AGN_RL_MEMORY_LIMIT_BYTES, 0);
+    return r;
+}
+
+# Whether a CPU quota was readable.
+fn agnosai_resource_limits_has_cpu_quota(r): i64 {
+    return load64(r + AGN_RL_HAS_CPU_QUOTA);
+}
+
+# The CPU quota as a fraction of one core, an f64 bit pattern. Meaningful only
+# when `has_cpu_quota` is 1 — a quota of exactly 0.0 is a valid reading.
+fn agnosai_resource_limits_cpu_quota(r): i64 {
+    return load64(r + AGN_RL_CPU_QUOTA);
+}
+
+# Whether a memory limit was readable.
+fn agnosai_resource_limits_has_memory_limit(r): i64 {
+    return load64(r + AGN_RL_HAS_MEMORY_LIMIT);
+}
+
+# The memory limit in bytes. Meaningful only when `has_memory_limit` is 1.
+fn agnosai_resource_limits_memory_limit_bytes(r): i64 {
+    return load64(r + AGN_RL_MEMORY_LIMIT_BYTES);
+}
+
+# Set the CPU quota, marking it present.
+fn agnosai_resource_limits_with_cpu_quota(r, quota): i64 {
+    store64(r + AGN_RL_HAS_CPU_QUOTA, 1);
+    store64(r + AGN_RL_CPU_QUOTA, quota);
+    return r;
+}
+
+# Set the memory limit, marking it present.
+fn agnosai_resource_limits_with_memory_limit(r, bytes): i64 {
+    store64(r + AGN_RL_HAS_MEMORY_LIMIT, 1);
+    store64(r + AGN_RL_MEMORY_LIMIT_BYTES, bytes);
+    return r;
+}
+
+# --- the pure halves, which is where the behaviour is tested -------------
+
+# Classify `/proc/1/cgroup` content. Returns a RuntimeEnvironment, or -1 for
+# "no indicator found" so the caller can fall through to its next check.
+#
+# ⚠ `kubepods` is tested BEFORE the container markers, and the oracle's own
+# tests cannot see that: a cgroup naming both must answer Kubernetes. Matching
+# is case-insensitive, because the oracle lowercases the whole file first.
+fn _agnosai_env_classify_cgroup(text: Str): i64 {
+    if (_agnosai_contains_ci(text, "kubepods") == 1) { return AGNOSAI_ENV_KUBERNETES; }
+    if (_agnosai_contains_ci(text, "docker") == 1) { return AGNOSAI_ENV_CONTAINER; }
+    if (_agnosai_contains_ci(text, "containerd") == 1) { return AGNOSAI_ENV_CONTAINER; }
+    if (_agnosai_contains_ci(text, "lxc") == 1) { return AGNOSAI_ENV_CONTAINER; }
+    return 0 - 1;
+}
+
+# Parse a Str as an f64 into `out`; 1 on success, 0 on anything unparseable.
+#
+# ⚠ `f64_parse_ok` takes a **C string**, not a `Str` — it scans with
+# `load8(s + i)` to a NUL. Handing it a `Str` reads the 16-byte header as text.
+# And a `Str` from `str_trim` or `str_split` is a BORROWED slice with no NUL of
+# its own, so `str_data` alone is not enough either: the scan would run past the
+# end. Copying into a bounded NUL-terminated buffer settles both.
+#
+# ⚠ The result is assigned before returning, deliberately. `return f(&buf, out)`
+# with <= 6 arguments is cycc's tail-call shape, whose epilogue frees the frame
+# before jumping — so the callee would read a released `buf`. Fixed in cyrius
+# 6.5.14, but the shape is not worth writing. See state.md standing rule 12.
+var AGNOSAI_ENV_NUM_CAP = 64;
+
+fn _agnosai_env_f64_of(s: Str, out): i64 {
+    var buf[64];
+    var n = str_len(s);
+    if (n >= AGNOSAI_ENV_NUM_CAP) { return 0; }
+    memcpy(&buf, str_data(s), n);
+    store8(&buf + n, 0);
+    var ok = f64_parse_ok(&buf, out);
+    return ok;
+}
+
+# Parse cgroup v2 `cpu.max` — "<quota> <period>", or "max <period>" for
+# unlimited. Writes the f64 quota/period into `out` and returns 1, or returns 0
+# for unlimited/unparseable, matching the oracle's `Option<f64>`.
+#
+# ⚠ The oracle returns None when `quota < 0.0 || period <= 0.0`. "max" fails the
+# f64 parse and takes the same path, so both spellings of unlimited agree.
+fn _agnosai_env_parse_cpu_max(text: Str, out): i64 {
+    var parts = str_split(str_trim(text), 32);
+    if (vec_len(parts) < 2) { return 0; }
+    var q = alloc(8);
+    var p = alloc(8);
+    if (_agnosai_env_f64_of(vec_get(parts, 0), q) == 0) { return 0; }
+    if (_agnosai_env_f64_of(vec_get(parts, 1), p) == 0) { return 0; }
+    var quota = load64(q);
+    var period = load64(p);
+    if (f64_lt(quota, f64_from(0)) == 1) { return 0; }
+    if (f64_le(period, f64_from(0)) == 1) { return 0; }
+    store64(out, f64_div(quota, period));
+    return 1;
+}
+
+# Parse the cgroup v1 CPU pair — quota and period from two separate files.
+# Returns 1 and writes the f64 fraction, or 0 for unlimited/unparseable.
+#
+# ⚠ The oracle checks `quota < 0.0` (the `-1` sentinel) BEFORE reading the
+# period file, so an unlimited quota never opens the second file at all.
+fn _agnosai_env_parse_cpu_v1(quota_text: Str, period_text: Str, out): i64 {
+    var q = alloc(8);
+    if (_agnosai_env_f64_of(str_trim(quota_text), q) == 0) { return 0; }
+    if (f64_lt(load64(q), f64_from(0)) == 1) { return 0; }
+    var p = alloc(8);
+    if (_agnosai_env_f64_of(str_trim(period_text), p) == 0) { return 0; }
+    if (f64_le(load64(p), f64_from(0)) == 1) { return 0; }
+    store64(out, f64_div(load64(q), load64(p)));
+    return 1;
+}
+
+# Parse an unsigned decimal, rejecting anything that is not all digits.
+#
+# ⚠ `str_to_int` answers 0 for garbage, which is indistinguishable from a real
+# 0 — the oracle's `parse().ok()?` returns `None` instead. Validating first is
+# what preserves that distinction.
+fn _agnosai_env_parse_u64(text: Str, out): i64 {
+    var n = str_len(text);
+    if (n == 0) { return 0; }
+    var d = str_data(text);
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(d + i);
+        if (c < 48 || c > 57) { return 0; }
+    }
+    store64(out, str_to_int(text));
+    return 1;
+}
+
+# Parse cgroup v2 `memory.max`. Writes the byte count into `out` and returns 1,
+# or returns 0 for the literal "max" and for anything unparseable.
+fn _agnosai_env_parse_mem_v2(text: Str, out): i64 {
+    var t = str_trim(text);
+    if (str_eq_cstr(t, "max") == 1) { return 0; }
+    var v = alloc(8);
+    if (_agnosai_env_parse_u64(t, v) == 0) { return 0; }
+    store64(out, load64(v));
+    return 1;
+}
+
+# Parse cgroup v1 `memory.limit_in_bytes`.
+#
+# ⚠ v1 has no "max" spelling — unlimited is a huge number, and the oracle treats
+# anything above `1 << 62` as unlimited. Without that, an unlimited cgroup reads
+# as a ~9 exabyte limit and every downstream capacity check passes trivially.
+fn _agnosai_env_parse_mem_v1(text: Str, out): i64 {
+    var v = alloc(8);
+    if (_agnosai_env_parse_u64(str_trim(text), v) == 0) { return 0; }
+    var value = load64(v);
+    if (value > AGNOSAI_CGROUP_V1_MEM_UNLIMITED) { return 0; }
+    store64(out, value);
+    return 1;
+}
+
+# --- the reading shells --------------------------------------------------
+
+# Largest cgroup file this module will read. These are single short lines;
+# 4 KiB is two orders of magnitude of headroom.
+var AGNOSAI_ENV_READ_CAP = 4096;
+
+# Read a whole file as a Str, or 0 if it cannot be read.
+#
+# ⚠ The buffer is `alloc`d, NOT a stack array. A stack buffer here would make
+# the returned Str borrow a frame that is gone the moment this function returns
+# — `str_from` borrows, it does not copy. These run once at startup, so the
+# allocation is not on any hot path.
+fn _agnosai_env_read(path): i64 {
+    if (file_exists(path) == 0) { return 0; }
+    var buf = alloc(AGNOSAI_ENV_READ_CAP);
+    var n = file_read_all(path, buf, AGNOSAI_ENV_READ_CAP - 1);
+    if (n <= 0) { return 0; }
+    store8(buf + n, 0);
+    return str_from(buf);
+}
+
+# Detect the runtime environment of this process.
+#
+# Order, and every step is observable: `KUBERNETES_SERVICE_HOST` first, then the
+# cgroup text, then the `/.dockerenv` sentinel, then `/sys/hypervisor/type`,
+# then bare if `/proc/1/cgroup` exists at all, else unknown.
+fn agnosai_env_detect(): i64 {
+    if (getenv("KUBERNETES_SERVICE_HOST") != 0) {
+        sakshi_info("detected Kubernetes environment via KUBERNETES_SERVICE_HOST", 56);
+        return AGNOSAI_ENV_KUBERNETES;
+    }
+    var cgroup = _agnosai_env_read("/proc/1/cgroup");
+    if (cgroup != 0) {
+        var c = _agnosai_env_classify_cgroup(cgroup);
+        if (c >= 0) {
+            if (c == AGNOSAI_ENV_KUBERNETES) {
+                sakshi_info("detected Kubernetes environment via /proc/1/cgroup", 48);
+            } else {
+                sakshi_info("detected container environment via /proc/1/cgroup", 47);
+            }
+            return c;
+        }
+    }
+    if (file_exists("/.dockerenv") == 1) {
+        sakshi_info("detected container environment via /.dockerenv", 45);
+        return AGNOSAI_ENV_CONTAINER;
+    }
+    if (file_exists("/sys/hypervisor/type") == 1) {
+        sakshi_info("detected VM environment via /sys/hypervisor/type", 47);
+        return AGNOSAI_ENV_VM;
+    }
+    if (file_exists("/proc/1/cgroup") == 1) {
+        sakshi_debug("no container or VM indicators found, assuming bare-metal", 55);
+        return AGNOSAI_ENV_BARE;
+    }
+    sakshi_debug("unable to determine runtime environment", 38);
+    return AGNOSAI_ENV_UNKNOWN;
+}
+
+# Read resource limits from the cgroup filesystem, v2 first then v1.
+#
+# ⚠ The two fields fall back INDEPENDENTLY — the oracle's two `.or_else` chains
+# are separate, so a machine exposing v2 memory but v1 CPU reads both. Chaining
+# them together as "v2 or else v1" for the pair would lose one of them.
+fn agnosai_env_resource_limits(): i64 {
+    var r = agnosai_resource_limits_new();
+    var out = alloc(8);
+
+    var v2cpu = _agnosai_env_read("/sys/fs/cgroup/cpu.max");
+    var got = 0;
+    if (v2cpu != 0) { got = _agnosai_env_parse_cpu_max(v2cpu, out); }
+    if (got == 0) {
+        var q = _agnosai_env_read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us");
+        var p = _agnosai_env_read("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+        if (q != 0 && p != 0) { got = _agnosai_env_parse_cpu_v1(q, p, out); }
+    }
+    if (got == 1) { agnosai_resource_limits_with_cpu_quota(r, load64(out)); }
+
+    var v2mem = _agnosai_env_read("/sys/fs/cgroup/memory.max");
+    got = 0;
+    if (v2mem != 0) { got = _agnosai_env_parse_mem_v2(v2mem, out); }
+    if (got == 0) {
+        var m1 = _agnosai_env_read("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+        if (m1 != 0) { got = _agnosai_env_parse_mem_v1(m1, out); }
+    }
+    if (got == 1) { agnosai_resource_limits_with_memory_limit(r, load64(out)); }
+
+    return r;
+}

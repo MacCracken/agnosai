@@ -111,6 +111,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than merely accepted — both classify open-small, so their costs are
   bit-identical and the sort decides.
 
+- **`fleet/placement`** — the five scheduling policies (GpuAffinity, Balanced,
+  Locality, Cost, Manual) with `PlacementRequest` builders, `place` and
+  `rank_nodes`. **58 assertions**, all 12 oracle tests plus 46 past them.
+
+  Two behaviours the oracle's own tests structurally cannot reach:
+  - **The sort must be STABLE.** Rust's `sort_by` is, so tied scores keep input
+    order and `place()` returns the earliest — and ties are the common case
+    (equal VRAM, equal capability fraction, equal resource total). `vec_sort_by`
+    is introsort, stable only below 18 elements. The comparator falls back to
+    the node's original index, making the order total and reproducing
+    stable-descending at any size.
+  - **`Balanced`'s index is PRE-filter.** `enumerate()` runs before `filter()`,
+    so a disqualified node still consumes its position; filtering first would
+    silently re-rank everything behind an offline node.
+
+  ⚠ **The first stability test was worthless and mutation caught it.** 40
+  all-tied nodes proved nothing — `vec_sort_by` opens with an already-ordered
+  scan, so an all-equal input is already final and the sort never permutes; the
+  mutant survived. Rewritten with two 20-element tie groups in an order that
+  *forces* permutation, the mutant dies on two named assertions.
+
+  Also pinned: a hardware requirement *replaces* the legacy GPU checks rather
+  than adding to them (reads like a bug, is the documented precedence);
+  `GpuAffinity` disqualifies a CPU node even when `required_gpu` is false; and
+  `Manual` with no preferred node places nowhere rather than falling back.
+
+- **`fleet/gpu`** — `ComputeScheduler` / `ComputeAllocation` and the legacy
+  `GpuDevice` view: add_device, add_gpu, allocate, release, best_device,
+  devices_of_type, total/available memory with an optional accelerator filter.
+  **65 assertions**, all 15 oracle tests plus 50 past them.
+
+  - **`max_by_key` returns the LAST maximum**, and both `allocate` and
+    `best_device` pick that way — so with two devices holding identical free
+    memory, which wins is decided by that rule. The oracle's fixtures are always
+    24 GB + 80 GB, so no oracle test ever ties. Mutation-verified: turning the
+    comparison from `>=` to `>` fails three named assertions.
+  - **Allocating twice for one task id LEAKS the first allocation.**
+    `allocations` is keyed by task id and `allocate` ends with an insert, which
+    replaces; the first allocation's memory stays charged with no record, so
+    `release` can never return it. A real oracle defect, reproduced deliberately
+    and asserted (10 GB charged, one record, 5 GB returned).
+  - **`AGNOSAI_ACCEL_ANY` is -1, not 0**, because 0 is `AGNOSAI_ACCEL_CPU` — the
+    port's usual "0 means None" would silently mean "CPU only".
+  - Cyrius has no type aliases, so the oracle's `GpuScheduler` / `GpuAllocation`
+    / `vram_mb()` / `total_vram_mb` compat surface becomes delegating fns rather
+    than being collapsed away, which would be a silent API narrowing.
+
+  ⚠ The two `saturating_sub` guards are **unreachable** and kept for oracle
+  shape — mutation-verified (deleting one leaves all 65 green), and recorded in
+  `roadmap.md` section E rather than counted as tested.
+
 - **`fleet/registry`** — the node vocabulary `placement`, `gpu`, `state` and
   `coordinator` all speak, so it lands before them. `NodeInfo` / `NodeStatus` /
   `NodeRegistry`: register, heartbeat, unregister, get, list, list_online,
@@ -160,9 +211,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Toolchain pinned to cyrius 6.5.12**, which folds **sigil 3.12.4** — the
-  release that fixes the RSA-verify authentication bypass reported from here.
-  Three-step, `lib/` diffed: 107 files, zero content differences.
+- **Toolchain pinned to cyrius 6.5.14**, which folds **sigil 3.12.6**. Three-step,
+  `lib/` diffed after the sync AND after a build: 107 files, zero differences.
+
+  **The serialising mutex in `src/server/auth.cyr` is DELETED** — verified
+  across four sigil releases on the pinned-lane harness before removing it:
+
+  | vendored sigil | valid verified / 2000 | forged accepted |
+  |---|---|---|
+  | 3.12.2 | 1 | **888 of 400,000** |
+  | 3.12.3 | 1 | 0 |
+  | 3.12.4 | 712 | 0 |
+  | 3.12.5 | 2000 | 0 |
+
+  `tests/server_auth_lane_race.tcyr` stays as the regression guard — it caught
+  every stage, so it demonstrably detects a relapse.
+
+  **6.5.14 is a floor, not a preference.** sigil 3.12.6 fixes an **RSA-PSS
+  authentication bypass** (a forged PSS signature verifying — the same class
+  agnosai reported against PKCS#1 v1.5) and declares `cyrius >= 6.5.14`.
+  agnosai reaches PSS through TLS 1.3 CertificateVerify
+  (`lib/tls_native_hs13.cyr:257,260`) on every outbound HTTPS call from
+  `tools/agnos.cyr`, `tools/remote_registry.cyr` and `guarded_fetch.cyr`.
+
+  ⚠ **The root cause was a cyrius tail-call bug, and this tree's own probe
+  reported a false negative on it.** A `return f(pointer-into-this-frame, ...)`
+  with **exactly six arguments** is TCO'd, and the epilogue frees the frame
+  before jumping. cycc declines TCO above six args — which is why the same
+  localisation worked in a 10-argument function and "broke the KATs" in a
+  6-argument one. **Arity was the variable, not the buffer.** The probe written
+  here to rule out callee-clobbers-caller called the callee and then did more
+  work — not a tail call — so TCO never applied and it returned clean. Recorded
+  as standing rule 12 in `state.md`; fixed in cyrius 6.5.14.
+
+  Previously 6.5.13 (sigil 3.12.5), 6.5.12 (sigil 3.12.4).
 
   ⚠ **The serialising mutex in `src/server/auth.cyr` STAYS.** Re-running the
   staging that sigil 3.12.4 asks consumers to run — mutex removed, two threads

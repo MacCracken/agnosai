@@ -1,0 +1,363 @@
+# =========================================================================
+# fleet/gpu — compute device scheduling: allocation of accelerator memory
+# (GPU VRAM, TPU HBM, etc).
+#
+# Parity oracle: rust-old/src/fleet/gpu.rs
+#
+# The oracle carries a lot of backward-compatibility surface and it is ported
+# rather than collapsed: `GpuScheduler` aliases `ComputeScheduler`,
+# `GpuAllocation` aliases `ComputeAllocation`, `add_gpu` is `add_device` with
+# CUDA, `total_vram_mb` / `available_vram_mb` are the unfiltered forms, and
+# `vram_mb()` aliases `memory_mb`. Cyrius has no type aliases, so each alias
+# becomes a delegating fn; dropping them would be a silent API narrowing.
+#
+# ## `max_by_key` returns the LAST maximum, and it is observable here
+#
+# Both `allocate` and `best_device` pick with `.max_by_key(|ds|
+# ds.memory_available_mb())`. Rust's `max_by_key` returns the **last** element
+# among equal maxima (`min_by_key` returns the first) — so with two devices
+# holding identical free memory, which one gets the allocation is decided by
+# that rule, not by chance. Two fresh identical devices is the ordinary case,
+# not an exotic one. Ported as "displace only on strictly greater", which is
+# exactly last-wins. `_agnosai_gpu_max_avail_idx` is the single place it lives.
+#
+# ## Two oracle behaviours pinned rather than "fixed"
+#
+# * **Allocating twice for one task id leaks the first allocation.**
+#   `allocations` is a map keyed by task id and `allocate` ends with an
+#   `insert`, which REPLACES. The first allocation's memory stays charged to its
+#   device with no record, so `release` can never return it. That is a real
+#   defect in the oracle and it is reproduced, because the port's bar is "what
+#   Rust did" — see `docs/development/roadmap.md` if it is ever fixed here.
+# * **The two `saturating_sub` guards are UNREACHABLE, and kept for oracle
+#   shape.** `used` moves only by `allocate` (+) and `release` (-), and
+#   `release` removes the record before subtracting, so each record is
+#   subtracted exactly once and `used` is always >= any single record's size.
+#   The oracle needs `saturating_sub` because Rust's `u64` underflow panics in
+#   debug; here the branch cannot be entered. **Mutation-verified as
+#   unreachable**: deleting the guard in `release` leaves all 65 assertions
+#   green. Recorded in `docs/development/roadmap.md` section E rather than
+#   counted as tested behaviour.
+# =========================================================================
+
+# ComputeAllocation heap layout — 24 bytes.
+enum AgnosaiComputeAllocationOff {
+    AGN_CA_TASK_ID = 0;
+    AGN_CA_DEVICE_INDEX = 8;
+    AGN_CA_MEMORY_MB = 16;
+    AGN_CA_SIZE = 24;
+}
+
+# The oracle's private `DeviceState` — a ComputeDevice plus its used memory.
+enum AgnosaiDeviceStateOff {
+    AGN_DS_DEVICE = 0;
+    AGN_DS_MEMORY_USED_MB = 8;
+    AGN_DS_SIZE = 16;
+}
+
+# The oracle's legacy read-only `GpuDevice` view. ⚠ Distinct from
+# `core/resource.cyr`'s `agnosai_gpu_device_*`, which ports a DIFFERENT struct
+# of the same name (`core::resource::GpuDevice`, the serialisable one). This is
+# the fleet-internal view, hence the `fleet_` infix.
+enum AgnosaiFleetGpuDeviceOff {
+    AGN_FGD_INDEX = 0;
+    AGN_FGD_NAME = 8;
+    AGN_FGD_VRAM_TOTAL_MB = 16;
+    AGN_FGD_VRAM_USED_MB = 24;
+    AGN_FGD_SIZE = 32;
+}
+
+# ComputeScheduler heap layout — 16 bytes.
+enum AgnosaiComputeSchedulerOff {
+    AGN_CS_DEVICES = 0;
+    AGN_CS_ALLOCATIONS = 8;
+    AGN_CS_SIZE = 16;
+}
+
+# --- ComputeAllocation ---------------------------------------------------
+
+# The task this allocation belongs to.
+fn agnosai_compute_allocation_task_id(a): i64 {
+    return load64(a + AGN_CA_TASK_ID);
+}
+
+# Which device index the memory came from.
+fn agnosai_compute_allocation_device_index(a): i64 {
+    return load64(a + AGN_CA_DEVICE_INDEX);
+}
+
+# Allocated memory in megabytes.
+fn agnosai_compute_allocation_memory_mb(a): i64 {
+    return load64(a + AGN_CA_MEMORY_MB);
+}
+
+# The oracle's `vram_mb()` alias for `memory_mb`, kept for backward compat.
+fn agnosai_compute_allocation_vram_mb(a): i64 {
+    return load64(a + AGN_CA_MEMORY_MB);
+}
+
+# --- the legacy GpuDevice view -------------------------------------------
+
+# The device's index.
+fn agnosai_fleet_gpu_device_index(g): i64 {
+    return load64(g + AGN_FGD_INDEX);
+}
+
+# The device's name.
+fn agnosai_fleet_gpu_device_name(g): i64 {
+    return load64(g + AGN_FGD_NAME);
+}
+
+# Total VRAM in megabytes.
+fn agnosai_fleet_gpu_device_vram_total_mb(g): i64 {
+    return load64(g + AGN_FGD_VRAM_TOTAL_MB);
+}
+
+# VRAM currently in use, in megabytes.
+fn agnosai_fleet_gpu_device_vram_used_mb(g): i64 {
+    return load64(g + AGN_FGD_VRAM_USED_MB);
+}
+
+# Free VRAM in megabytes. The saturating guard is defensive and unreachable
+# through this module's own API — `used` never exceeds `total` — but it mirrors
+# the oracle's `saturating_sub` and costs one comparison.
+fn agnosai_fleet_gpu_device_vram_available_mb(g): i64 {
+    var total = load64(g + AGN_FGD_VRAM_TOTAL_MB);
+    var used = load64(g + AGN_FGD_VRAM_USED_MB);
+    if (used >= total) { return 0; }
+    return total - used;
+}
+
+# Build the legacy view over an internal DeviceState.
+fn _agnosai_gpu_view_of(ds): i64 {
+    var d = load64(ds + AGN_DS_DEVICE);
+    var g = alloc(AGN_FGD_SIZE);
+    store64(g + AGN_FGD_INDEX, agnosai_compute_device_index(d));
+    store64(g + AGN_FGD_NAME, agnosai_compute_device_name(d));
+    store64(g + AGN_FGD_VRAM_TOTAL_MB, agnosai_compute_device_memory_total_mb(d));
+    store64(g + AGN_FGD_VRAM_USED_MB, load64(ds + AGN_DS_MEMORY_USED_MB));
+    return g;
+}
+
+# The oracle's `DeviceState::memory_available_mb`, `saturating_sub`.
+fn _agnosai_gpu_ds_available(ds): i64 {
+    var total = agnosai_compute_device_memory_total_mb(load64(ds + AGN_DS_DEVICE));
+    var used = load64(ds + AGN_DS_MEMORY_USED_MB);
+    if (used >= total) { return 0; }
+    return total - used;
+}
+
+# --- ComputeScheduler ----------------------------------------------------
+
+# The oracle's `ComputeScheduler::new` / `Default` — no devices, no allocations.
+fn agnosai_compute_scheduler_new(): i64 {
+    var s = alloc(AGN_CS_SIZE);
+    store64(s + AGN_CS_DEVICES, vec_new());
+    store64(s + AGN_CS_ALLOCATIONS, map_new_str());
+    return s;
+}
+
+# The oracle's `GpuScheduler` type alias.
+fn agnosai_gpu_scheduler_new(): i64 {
+    return agnosai_compute_scheduler_new();
+}
+
+# Add a device of the given accelerator type. Its index is its position.
+fn agnosai_compute_scheduler_add_device(s, name: Str, accelerator, memory_total_mb): i64 {
+    var devs = load64(s + AGN_CS_DEVICES);
+    var index = vec_len(devs);
+    var ds = alloc(AGN_DS_SIZE);
+    store64(ds + AGN_DS_DEVICE,
+    agnosai_compute_device_new(index, name, accelerator, memory_total_mb));
+    store64(ds + AGN_DS_MEMORY_USED_MB, 0);
+    vec_push(devs, ds);
+    return 0;
+}
+
+# The oracle's `add_gpu` — `add_device` defaulting to CUDA.
+fn agnosai_compute_scheduler_add_gpu(s, name: Str, vram_total_mb): i64 {
+    return agnosai_compute_scheduler_add_device(s, name, AGNOSAI_ACCEL_CUDA, vram_total_mb);
+}
+
+# Every registered device as a `ComputeDevice`.
+fn agnosai_compute_scheduler_compute_devices(s): i64 {
+    var devs = load64(s + AGN_CS_DEVICES);
+    var out = vec_new();
+    for (var i = 0; i < vec_len(devs); i = i + 1) {
+        vec_push(out, load64(vec_get(devs, i) + AGN_DS_DEVICE));
+    }
+    return out;
+}
+
+# Every registered device as the legacy `GpuDevice` view.
+fn agnosai_compute_scheduler_devices(s): i64 {
+    var devs = load64(s + AGN_CS_DEVICES);
+    var out = vec_new();
+    for (var i = 0; i < vec_len(devs); i = i + 1) {
+        vec_push(out, _agnosai_gpu_view_of(vec_get(devs, i)));
+    }
+    return out;
+}
+
+# Devices of one accelerator type.
+fn agnosai_compute_scheduler_devices_of_type(s, accel): i64 {
+    var devs = load64(s + AGN_CS_DEVICES);
+    var out = vec_new();
+    for (var i = 0; i < vec_len(devs); i = i + 1) {
+        var d = load64(vec_get(devs, i) + AGN_DS_DEVICE);
+        if (agnosai_compute_device_accelerator(d) == accel) { vec_push(out, d); }
+    }
+    return out;
+}
+
+# Total memory across devices. `accel` of -1 is the oracle's `None` — no filter.
+#
+# ⚠ -1 rather than 0 for None: 0 is `AGNOSAI_ACCEL_CPU`, a real accelerator
+# type, so the port's usual "0 means None" convention would silently mean
+# "CPU only" here.
+var AGNOSAI_ACCEL_ANY = 0 - 1;
+
+# Total memory in megabytes across devices, optionally filtered by accelerator.
+fn agnosai_compute_scheduler_total_memory_mb(s, accel): i64 {
+    var devs = load64(s + AGN_CS_DEVICES);
+    var sum = 0;
+    for (var i = 0; i < vec_len(devs); i = i + 1) {
+        var d = load64(vec_get(devs, i) + AGN_DS_DEVICE);
+        if (accel == AGNOSAI_ACCEL_ANY || agnosai_compute_device_accelerator(d) == accel) {
+            sum = sum + agnosai_compute_device_memory_total_mb(d);
+        }
+    }
+    return sum;
+}
+
+# Free memory in megabytes across devices, optionally filtered by accelerator.
+fn agnosai_compute_scheduler_available_memory_mb(s, accel): i64 {
+    var devs = load64(s + AGN_CS_DEVICES);
+    var sum = 0;
+    for (var i = 0; i < vec_len(devs); i = i + 1) {
+        var ds = vec_get(devs, i);
+        var d = load64(ds + AGN_DS_DEVICE);
+        if (accel == AGNOSAI_ACCEL_ANY || agnosai_compute_device_accelerator(d) == accel) {
+            sum = sum + _agnosai_gpu_ds_available(ds);
+        }
+    }
+    return sum;
+}
+
+# The oracle's backward-compat `total_vram_mb` — unfiltered total.
+fn agnosai_compute_scheduler_total_vram_mb(s): i64 {
+    return agnosai_compute_scheduler_total_memory_mb(s, AGNOSAI_ACCEL_ANY);
+}
+
+# The oracle's backward-compat `available_vram_mb` — unfiltered free.
+fn agnosai_compute_scheduler_available_vram_mb(s): i64 {
+    return agnosai_compute_scheduler_available_memory_mb(s, AGNOSAI_ACCEL_ANY);
+}
+
+# Index of the device with the most free memory, or -1 if none qualifies.
+#
+# ⚠ **Last-wins on a tie**, reproducing Rust's `max_by_key`. The incumbent is
+# displaced whenever the candidate is `>=`, which is what "return the last of
+# equal maxima" means. Using `>` would return the FIRST and silently diverge
+# whenever two devices hold identical free memory — the ordinary case for a
+# freshly-populated scheduler.
+#
+# `accel` of AGNOSAI_ACCEL_ANY skips the type filter; `min_free` of 0 skips the
+# capacity filter, matching `best_device`, which applies neither.
+fn _agnosai_gpu_max_avail_idx(s, accel, min_free): i64 {
+    var devs = load64(s + AGN_CS_DEVICES);
+    var best = 0 - 1;
+    var best_avail = 0;
+    for (var i = 0; i < vec_len(devs); i = i + 1) {
+        var ds = vec_get(devs, i);
+        var d = load64(ds + AGN_DS_DEVICE);
+        var ok = 1;
+        if (accel != AGNOSAI_ACCEL_ANY) {
+            if (agnosai_compute_device_accelerator(d) != accel) { ok = 0; }
+        }
+        var avail = _agnosai_gpu_ds_available(ds);
+        if (min_free > 0) {
+            if (avail < min_free) { ok = 0; }
+        }
+        if (ok == 1) {
+            if (best < 0 || avail >= best_avail) {
+                best = i;
+                best_avail = avail;
+            }
+        }
+    }
+    return best;
+}
+
+# Keep the device's own `memory_available_mb` in sync, as the oracle does after
+# every allocate and release, "for external consumers".
+fn _agnosai_gpu_sync_avail(ds): i64 {
+    agnosai_compute_device_with_available(load64(ds + AGN_DS_DEVICE),
+    _agnosai_gpu_ds_available(ds));
+    return 0;
+}
+
+# Allocate `memory_mb` on the best qualifying device, or 0 for the oracle's
+# `None`. `accel` of AGNOSAI_ACCEL_ANY places on any device with room.
+#
+# ⚠ Allocating twice for one `task_id` LEAKS the first allocation — the map
+# insert replaces the record while the memory stays charged to its device, so
+# `release` can never return it. That is the oracle's behaviour, reproduced
+# deliberately; see the module header.
+fn agnosai_compute_scheduler_allocate(s, task_id: Str, memory_mb, accel): i64 {
+    var best = _agnosai_gpu_max_avail_idx(s, accel, memory_mb);
+    if (best < 0) { return 0; }
+    var ds = vec_get(load64(s + AGN_CS_DEVICES), best);
+    store64(ds + AGN_DS_MEMORY_USED_MB, load64(ds + AGN_DS_MEMORY_USED_MB) + memory_mb);
+    _agnosai_gpu_sync_avail(ds);
+    var a = alloc(AGN_CA_SIZE);
+    store64(a + AGN_CA_TASK_ID, task_id);
+    store64(a + AGN_CA_DEVICE_INDEX, best);
+    store64(a + AGN_CA_MEMORY_MB, memory_mb);
+    map_set(load64(s + AGN_CS_ALLOCATIONS), task_id, a);
+    return a;
+}
+
+# Release an allocation, returning its memory to the device. 1 if it existed.
+fn agnosai_compute_scheduler_release(s, task_id: Str): i64 {
+    var m = load64(s + AGN_CS_ALLOCATIONS);
+    var a = map_get(m, task_id);
+    if (a == 0) { return 0; }
+    map_delete(m, task_id);
+    var ds = vec_get(load64(s + AGN_CS_DEVICES), load64(a + AGN_CA_DEVICE_INDEX));
+    var used = load64(ds + AGN_DS_MEMORY_USED_MB);
+    var freed = load64(a + AGN_CA_MEMORY_MB);
+    # ⚠ UNREACHABLE saturating_sub, kept for the oracle's shape — see the module
+    # header. Removing it leaves every assertion green, so do not read this as
+    # tested behaviour.
+    if (freed >= used) {
+        store64(ds + AGN_DS_MEMORY_USED_MB, 0);
+    } else {
+        store64(ds + AGN_DS_MEMORY_USED_MB, used - freed);
+    }
+    _agnosai_gpu_sync_avail(ds);
+    return 1;
+}
+
+# The device with the most free memory as a legacy view, or 0 for `None`.
+# No capacity or type filter, matching the oracle. Last-wins on a tie.
+fn agnosai_compute_scheduler_best_device(s): i64 {
+    var best = _agnosai_gpu_max_avail_idx(s, AGNOSAI_ACCEL_ANY, 0);
+    if (best < 0) { return 0; }
+    return _agnosai_gpu_view_of(vec_get(load64(s + AGN_CS_DEVICES), best));
+}
+
+# Every active allocation.
+#
+# ⚠ Order is the map's slot order, as the oracle's `HashMap::values()` is
+# arbitrary. Do not depend on it.
+fn agnosai_compute_scheduler_allocations(s): i64 {
+    var m = load64(s + AGN_CS_ALLOCATIONS);
+    var out = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            vec_push(out, _agnosai_map_slot_val(m, i));
+        }
+    }
+    return out;
+}

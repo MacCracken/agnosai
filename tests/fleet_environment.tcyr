@@ -1,0 +1,213 @@
+# =========================================================================
+# fleet_environment.tcyr — tests for src/fleet/environment.cyr
+#
+# Oracle: rust-old/src/fleet/environment.rs's eight `#[test]` fns, all ported.
+#
+# ⚠ **Two of the oracle's eight assert essentially nothing**, and this suite
+# says so rather than inheriting it. `detect_returns_valid_variant` checks only
+# that the answer is one of five variants — true of any implementation that
+# returns a variant at all — and `resource_limits_runs_without_panic` asserts
+# nothing whatsoever. Both measure the machine the suite happens to run on.
+#
+# That is not a criticism of the oracle so much as a consequence of its shape:
+# `detect()` opens `/proc/1/cgroup` and decides in one function, so there is no
+# seam to drive. `src/fleet/environment.cyr` splits every decision from its file
+# read for exactly this reason (state.md standing rule 8), and this suite drives
+# the pure halves with inputs a real machine would never let a test produce:
+#
+#   * a cgroup naming BOTH kubepods and docker — must answer Kubernetes
+#   * `cpu.max` spelled "max 100000" — unlimited
+#   * a v1 quota of -1 — unlimited, and the period file must not even be read
+#   * a v1 memory limit above 1<<62 — unlimited, not a 9-exabyte cap
+#   * non-numeric junk — None, not 0
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/fleet/cost_planning.cyr"
+include "src/fleet/environment.cyr"
+include "tests/test_helpers.cyr"
+
+# Parse a cpu.max string; returns 1 and writes the f64 into `out`, else 0.
+fn _t_cpu_max(text, out): i64 {
+    return _agnosai_env_parse_cpu_max(str_from(text), out);
+}
+
+# Parse a v1 memory limit string.
+fn _t_mem_v1(text, out): i64 {
+    return _agnosai_env_parse_mem_v1(str_from(text), out);
+}
+
+fn main(): i64 {
+    var out = alloc(8);
+
+    # --- oracle: runtime_environment_display ----------------------------
+    assert(str_eq_cstr(agnosai_runtime_environment_to_str(AGNOSAI_ENV_BARE),
+    "bare-metal") == 1, "Bare renders bare-metal, NOT bare");
+    assert(str_eq_cstr(agnosai_runtime_environment_to_str(AGNOSAI_ENV_CONTAINER),
+    "container") == 1, "Container renders container");
+    assert(str_eq_cstr(agnosai_runtime_environment_to_str(AGNOSAI_ENV_VM), "vm") == 1,
+    "Vm renders vm");
+    assert(str_eq_cstr(agnosai_runtime_environment_to_str(AGNOSAI_ENV_KUBERNETES),
+    "kubernetes") == 1, "Kubernetes renders kubernetes");
+    assert(str_eq_cstr(agnosai_runtime_environment_to_str(AGNOSAI_ENV_UNKNOWN),
+    "unknown") == 1, "Unknown renders unknown");
+
+    # --- oracle: runtime_environment_eq / _all_variants -----------------
+    assert_eq(AGNOSAI_ENV_BARE, AGNOSAI_ENV_BARE, "a variant equals itself");
+    assert(AGNOSAI_ENV_BARE != AGNOSAI_ENV_CONTAINER, "Bare is not Container");
+    # All five are distinct — a duplicated discriminant would silently merge two
+    # environments, and Cyrius is silent on a duplicate enum member.
+    var seen = vec_new();
+    vec_push(seen, AGNOSAI_ENV_BARE);
+    vec_push(seen, AGNOSAI_ENV_CONTAINER);
+    vec_push(seen, AGNOSAI_ENV_VM);
+    vec_push(seen, AGNOSAI_ENV_KUBERNETES);
+    vec_push(seen, AGNOSAI_ENV_UNKNOWN);
+    var distinct = 1;
+    for (var i = 0; i < 5; i = i + 1) {
+        for (var j = i + 1; j < 5; j = j + 1) {
+            if (vec_get(seen, i) == vec_get(seen, j)) { distinct = 0; }
+        }
+    }
+    assert_eq(distinct, 1, "all five variants have distinct discriminants");
+
+    # --- oracle: resource_limits_default / _with_values -----------------
+    var rl = agnosai_resource_limits_new();
+    assert_eq(agnosai_resource_limits_has_cpu_quota(rl), 0, "default has no cpu quota");
+    assert_eq(agnosai_resource_limits_has_memory_limit(rl), 0, "default has no memory limit");
+    agnosai_resource_limits_with_cpu_quota(rl, _t_f64_ratio(5, 2));
+    agnosai_resource_limits_with_memory_limit(rl, 2147483648);
+    assert_eq(agnosai_resource_limits_has_cpu_quota(rl), 1, "with_cpu_quota marks it present");
+    _t_assert_f64(agnosai_resource_limits_cpu_quota(rl), _t_f64_ratio(5, 2), "and stores 2.5");
+    assert_eq(agnosai_resource_limits_has_memory_limit(rl), 1,
+    "with_memory_limit marks it present");
+    assert_eq(agnosai_resource_limits_memory_limit_bytes(rl), 2147483648, "and stores 2 GiB");
+
+    # --- past the oracle: a zero quota is PRESENT, not absent -----------
+    # This is why each field carries a flag: 0 is a legitimate reading, and the
+    # oracle distinguishes `Some(0.0)` from `None`. Collapsing them would make
+    # a fully-throttled cgroup look unlimited.
+    var rz = agnosai_resource_limits_new();
+    agnosai_resource_limits_with_cpu_quota(rz, f64_from(0));
+    assert_eq(agnosai_resource_limits_has_cpu_quota(rz), 1,
+    "a quota of exactly 0.0 is present, not absent");
+    _t_assert_f64(agnosai_resource_limits_cpu_quota(rz), f64_from(0), "and reads back as 0.0");
+
+    # --- oracle: detect_returns_valid_variant ---------------------------
+    # Ported as the oracle has it, and it is worth naming what it does NOT do:
+    # it cannot make the machine be a container, so it only pins that the answer
+    # is a variant. The real coverage is the classifier below.
+    var env = agnosai_env_detect();
+    assert(env >= AGNOSAI_ENV_BARE && env <= AGNOSAI_ENV_UNKNOWN,
+    "detect answers one of the five variants on this machine");
+
+    # --- oracle: resource_limits_runs_without_panic ---------------------
+    var live = agnosai_env_resource_limits();
+    assert(live != 0, "resource_limits returns a struct on this machine");
+    # Its FIELDS are machine-dependent, so nothing is asserted about them here —
+    # saying so beats an assertion that cannot fail.
+    assert(agnosai_resource_limits_has_cpu_quota(live) == 0
+    || agnosai_resource_limits_has_cpu_quota(live) == 1,
+    "and the cpu-quota presence flag is a clean boolean");
+
+    # --- past the oracle: the cgroup classifier, driven directly --------
+    assert_eq(_agnosai_env_classify_cgroup(str_from("0::/kubepods/besteffort/pod123")),
+    AGNOSAI_ENV_KUBERNETES, "kubepods classifies as Kubernetes");
+    assert_eq(_agnosai_env_classify_cgroup(str_from("12:pids:/docker/abc123")),
+    AGNOSAI_ENV_CONTAINER, "docker classifies as Container");
+    assert_eq(_agnosai_env_classify_cgroup(str_from("0::/system.slice/containerd.service")),
+    AGNOSAI_ENV_CONTAINER, "containerd classifies as Container");
+    assert_eq(_agnosai_env_classify_cgroup(str_from("1:name=systemd:/lxc/mybox")),
+    AGNOSAI_ENV_CONTAINER, "lxc classifies as Container");
+    assert_eq(_agnosai_env_classify_cgroup(str_from("0::/init.scope")), 0 - 1,
+    "a plain init cgroup yields no indicator");
+    assert_eq(_agnosai_env_classify_cgroup(str_from("")), 0 - 1,
+    "an empty cgroup file yields no indicator");
+
+    # ⚠ THE ORDERING ASSERTION. A real k8s pod's cgroup names both kubepods and
+    # docker; the oracle tests kubepods FIRST. Reversing those two arms passes
+    # every oracle test and misreports every Kubernetes node as a bare container.
+    assert_eq(_agnosai_env_classify_cgroup(
+    str_from("11:memory:/kubepods/burstable/pod1/docker-abc.scope")),
+    AGNOSAI_ENV_KUBERNETES,
+    "a cgroup naming BOTH kubepods and docker answers Kubernetes, not Container");
+
+    # Case-insensitive, because the oracle lowercases the whole file first.
+    assert_eq(_agnosai_env_classify_cgroup(str_from("0::/KubePods/x")),
+    AGNOSAI_ENV_KUBERNETES, "matching folds case");
+    assert_eq(_agnosai_env_classify_cgroup(str_from("0::/DOCKER/x")),
+    AGNOSAI_ENV_CONTAINER, "matching folds case for docker too");
+
+    # --- past the oracle: cgroup v2 cpu.max -----------------------------
+    assert_eq(_t_cpu_max("200000 100000", out), 1, "a real quota parses");
+    _t_assert_f64(load64(out), f64_from(2), "200000/100000 is 2.0 cores");
+    assert_eq(_t_cpu_max("50000 100000", out), 1, "a sub-core quota parses");
+    _t_assert_f64(load64(out), _t_f64_ratio(1, 2), "50000/100000 is 0.5 cores");
+    assert_eq(_t_cpu_max("max 100000", out), 0,
+    "the literal \"max\" is unlimited, i.e. None");
+    assert_eq(_t_cpu_max("-1 100000", out), 0, "a negative quota is unlimited");
+    assert_eq(_t_cpu_max("200000 0", out), 0, "a zero period is rejected, not divided by");
+    assert_eq(_t_cpu_max("200000", out), 0, "a single field is rejected");
+    assert_eq(_t_cpu_max("", out), 0, "empty input is rejected");
+    assert_eq(_t_cpu_max("junk junk", out), 0, "non-numeric input is rejected");
+
+    # --- past the oracle: cgroup v1 cpu ---------------------------------
+    assert_eq(_agnosai_env_parse_cpu_v1(str_from("400000"), str_from("100000"), out), 1,
+    "a v1 quota/period pair parses");
+    _t_assert_f64(load64(out), f64_from(4), "400000/100000 is 4.0 cores");
+    # ⚠ -1 is v1's unlimited sentinel, and the oracle tests it BEFORE reading the
+    # period file at all.
+    assert_eq(_agnosai_env_parse_cpu_v1(str_from("-1"), str_from("100000"), out), 0,
+    "a v1 quota of -1 is unlimited");
+    assert_eq(_agnosai_env_parse_cpu_v1(str_from("400000"), str_from("0"), out), 0,
+    "a zero period is rejected");
+    assert_eq(_agnosai_env_parse_cpu_v1(str_from(" 400000 \n"), str_from(" 100000 \n"), out), 1,
+    "surrounding whitespace is trimmed, as the oracle's .trim() does");
+    _t_assert_f64(load64(out), f64_from(4), "and the trimmed value parses correctly");
+
+    # --- past the oracle: cgroup v2 memory ------------------------------
+    assert_eq(_agnosai_env_parse_mem_v2(str_from("2147483648"), out), 1, "a v2 limit parses");
+    assert_eq(load64(out), 2147483648, "as its byte count");
+    assert_eq(_agnosai_env_parse_mem_v2(str_from("max"), out), 0,
+    "the literal \"max\" is unlimited");
+    assert_eq(_agnosai_env_parse_mem_v2(str_from("  max\n"), out), 0,
+    "even with surrounding whitespace");
+    assert_eq(_agnosai_env_parse_mem_v2(str_from("not-a-number"), out), 0,
+    "junk is None, not 0");
+    assert_eq(_agnosai_env_parse_mem_v2(str_from(""), out), 0, "empty is None");
+
+    # --- past the oracle: cgroup v1 memory, the 1<<62 sentinel ----------
+    assert_eq(_t_mem_v1("1073741824", out), 1, "a v1 limit parses");
+    assert_eq(load64(out), 1073741824, "as its byte count");
+    # ⚠ v1 has no "max" spelling — unlimited is a huge number. Without the
+    # threshold an unlimited cgroup reads as a ~9 exabyte cap and every
+    # downstream capacity check passes trivially.
+    assert_eq(_t_mem_v1("9223372036854771712", out), 0,
+    "a v1 limit above 1<<62 is unlimited, not a 9-exabyte cap");
+    assert_eq(_t_mem_v1("4611686018427387905", out), 0, "just above the threshold is unlimited");
+    assert_eq(_t_mem_v1("4611686018427387904", out), 1,
+    "exactly the threshold is a real limit — the test is >, not >=");
+    assert_eq(load64(out), 4611686018427387904, "and reads back exactly");
+    assert_eq(_t_mem_v1("junk", out), 0, "junk is None");
+
+    # --- past the oracle: junk is None, NOT zero ------------------------
+    # The distinction the presence flag exists for. `str_to_int` answers 0 for
+    # garbage, so a parser that skipped validation would report a 0-byte memory
+    # limit — a cgroup that permits nothing — for an unreadable file.
+    assert_eq(_agnosai_env_parse_u64(str_from("0"), out), 1, "a genuine 0 parses");
+    assert_eq(load64(out), 0, "as zero");
+    assert_eq(_agnosai_env_parse_u64(str_from("12x"), out), 0, "a trailing letter is rejected");
+    assert_eq(_agnosai_env_parse_u64(str_from("-5"), out), 0, "a negative is rejected");
+    assert_eq(_agnosai_env_parse_u64(str_from(""), out), 0, "empty is rejected");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

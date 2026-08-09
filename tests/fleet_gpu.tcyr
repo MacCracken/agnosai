@@ -1,0 +1,269 @@
+# =========================================================================
+# fleet_gpu.tcyr — tests for src/fleet/gpu.cyr
+#
+# Oracle: rust-old/src/fleet/gpu.rs's fifteen `#[test]` fns, all ported.
+#
+# Past the oracle in six places, three of which pin behaviour the Rust tests
+# cannot see because they never construct the case:
+#
+#   * **`max_by_key` returns the LAST maximum.** Both `allocate` and
+#     `best_device` pick that way, and two devices with identical free memory is
+#     the ordinary state of a freshly-populated scheduler — so which one wins is
+#     decided by that rule. The oracle's fixtures are always 24 GB + 80 GB, so
+#     no oracle test ever ties.
+#   * **Allocating twice for one task id LEAKS the first allocation.** The map
+#     insert replaces the record while the memory stays charged, so `release`
+#     can never return it. A real oracle defect, reproduced deliberately.
+#   * **`saturating_sub`** on the used counter, so nothing wraps to a huge
+#     number.
+#
+# Plus: `AGNOSAI_ACCEL_ANY` must be -1 rather than 0, because 0 is
+# `AGNOSAI_ACCEL_CPU` and the port's usual "0 means None" would silently mean
+# "CPU only"; `best_device` applies neither a type nor a capacity filter; and
+# an empty scheduler answers None rather than index 0.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/fleet/gpu.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's `scheduler_with_devices()` — RTX 4090 24 GB, A100 80 GB, both CUDA.
+fn _t_sched(): i64 {
+    var s = agnosai_compute_scheduler_new();
+    agnosai_compute_scheduler_add_device(s, str_from("RTX 4090"), AGNOSAI_ACCEL_CUDA, 24000);
+    agnosai_compute_scheduler_add_device(s, str_from("A100"), AGNOSAI_ACCEL_CUDA, 80000);
+    return s;
+}
+
+# The name of the device at `i` in the legacy view list.
+fn _t_devname(s, i): i64 {
+    return agnosai_fleet_gpu_device_name(vec_get(agnosai_compute_scheduler_devices(s), i));
+}
+
+fn main(): i64 {
+    # --- oracle: add_devices_and_verify ---------------------------------
+    var s = _t_sched();
+    assert_eq(vec_len(agnosai_compute_scheduler_devices(s)), 2, "two devices registered");
+    assert_eq(agnosai_compute_scheduler_total_vram_mb(s), 104000, "total VRAM is 104 GB");
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(s), 104000,
+    "all of it is free before any allocation");
+    assert(str_eq_cstr(_t_devname(s, 0), "RTX 4090") == 1, "device 0 is the RTX 4090");
+    assert(str_eq_cstr(_t_devname(s, 1), "A100") == 1, "device 1 is the A100");
+    assert_eq(agnosai_fleet_gpu_device_index(
+    vec_get(agnosai_compute_scheduler_devices(s), 1)), 1, "the index is the position");
+
+    # --- oracle: allocate_on_empty_returns_none -------------------------
+    var empty = agnosai_compute_scheduler_new();
+    assert_eq(agnosai_compute_scheduler_allocate(empty, str_from("t1"), 1000,
+    AGNOSAI_ACCEL_ANY), 0, "an empty scheduler allocates nothing");
+    assert_eq(agnosai_compute_scheduler_best_device(empty), 0,
+    "and has no best device");
+    assert_eq(agnosai_compute_scheduler_total_vram_mb(empty), 0, "with zero total VRAM");
+    assert_eq(vec_len(agnosai_compute_scheduler_allocations(empty)), 0, "and no allocations");
+
+    # --- oracle: allocate_picks_most_available_vram ---------------------
+    var a1 = agnosai_compute_scheduler_allocate(s, str_from("task-a"), 1000, AGNOSAI_ACCEL_ANY);
+    assert(a1 != 0, "the allocation succeeds");
+    assert_eq(agnosai_compute_allocation_device_index(a1), 1,
+    "it lands on the A100, which has the most free memory");
+    assert_eq(agnosai_compute_allocation_memory_mb(a1), 1000, "for the requested size");
+    assert(str_eq_cstr(agnosai_compute_allocation_task_id(a1), "task-a") == 1,
+    "tagged with the task id");
+
+    # --- past the oracle: the vram_mb alias -----------------------------
+    assert_eq(agnosai_compute_allocation_vram_mb(a1), agnosai_compute_allocation_memory_mb(a1),
+    "vram_mb is an alias for memory_mb, not a separate field");
+
+    # --- oracle: allocate_reduces_available_vram ------------------------
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(s), 103000,
+    "free VRAM drops by the allocated amount");
+    assert_eq(agnosai_compute_scheduler_total_vram_mb(s), 104000, "total VRAM is unchanged");
+
+    # The device's own memory_available_mb is kept in sync "for external
+    # consumers" — a caller reading ComputeDevice directly must see the update.
+    var cds = agnosai_compute_scheduler_compute_devices(s);
+    assert_eq(agnosai_compute_device_memory_available_mb(vec_get(cds, 1)), 79000,
+    "the ComputeDevice's own available figure is synced after allocate");
+
+    # --- oracle: allocate_fails_when_insufficient_vram ------------------
+    assert_eq(agnosai_compute_scheduler_allocate(s, str_from("huge"), 999999,
+    AGNOSAI_ACCEL_ANY), 0, "a request larger than any device fails");
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(s), 103000,
+    "and a failed allocation charges nothing");
+
+    # --- oracle: release_restores_vram ----------------------------------
+    assert_eq(agnosai_compute_scheduler_release(s, str_from("task-a")), 1, "release succeeds");
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(s), 104000, "and restores the memory");
+    assert_eq(agnosai_compute_scheduler_release(s, str_from("task-a")), 0,
+    "a second release of the same task reports failure");
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(s), 104000,
+    "and does not double-credit the device");
+    assert_eq(agnosai_compute_scheduler_release(s, str_from("never-allocated")), 0,
+    "releasing an unknown task reports failure");
+
+    # --- oracle: multiple_allocations_on_same_device --------------------
+    var s2 = _t_sched();
+    agnosai_compute_scheduler_allocate(s2, str_from("m1"), 10000, AGNOSAI_ACCEL_ANY);
+    agnosai_compute_scheduler_allocate(s2, str_from("m2"), 10000, AGNOSAI_ACCEL_ANY);
+    agnosai_compute_scheduler_allocate(s2, str_from("m3"), 10000, AGNOSAI_ACCEL_ANY);
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(s2), 74000,
+    "three 10 GB allocations reduce free VRAM by 30 GB");
+    assert_eq(vec_len(agnosai_compute_scheduler_allocations(s2)), 3,
+    "and three allocations are tracked");
+
+    # --- oracle: best_device_returns_correct ----------------------------
+    var s3 = _t_sched();
+    assert(str_eq_cstr(agnosai_fleet_gpu_device_name(
+    agnosai_compute_scheduler_best_device(s3)), "A100") == 1,
+    "the A100 is best while empty");
+    agnosai_compute_scheduler_allocate(s3, str_from("big"), 70000, AGNOSAI_ACCEL_ANY);
+    assert(str_eq_cstr(agnosai_fleet_gpu_device_name(
+    agnosai_compute_scheduler_best_device(s3)), "RTX 4090") == 1,
+    "the RTX 4090 becomes best once the A100 is mostly consumed");
+    assert_eq(agnosai_fleet_gpu_device_vram_used_mb(
+    agnosai_compute_scheduler_best_device(s3)), 0, "and it has nothing allocated");
+
+    # --- past the oracle: max_by_key returns the LAST maximum -----------
+    # Two identical devices tie on free memory. Rust's `max_by_key` answers the
+    # LAST of equal maxima (`min_by_key` the first), so the allocation and the
+    # best-device pick must both land on index 1. A `>` comparison instead of
+    # `>=` would answer index 0 and diverge silently — and no oracle test ever
+    # constructs a tie, so the oracle cannot catch it.
+    var tie = agnosai_compute_scheduler_new();
+    agnosai_compute_scheduler_add_device(tie, str_from("first"), AGNOSAI_ACCEL_CUDA, 16000);
+    agnosai_compute_scheduler_add_device(tie, str_from("second"), AGNOSAI_ACCEL_CUDA, 16000);
+    assert(str_eq_cstr(agnosai_fleet_gpu_device_name(
+    agnosai_compute_scheduler_best_device(tie)), "second") == 1,
+    "best_device returns the LAST of two tied devices");
+    var t_alloc = agnosai_compute_scheduler_allocate(tie, str_from("t"), 1000, AGNOSAI_ACCEL_ANY);
+    assert_eq(agnosai_compute_allocation_device_index(t_alloc), 1,
+    "allocate also picks the LAST of two tied devices");
+
+    # Three-way tie, to show it is genuinely "last" and not "second".
+    var tie3 = agnosai_compute_scheduler_new();
+    agnosai_compute_scheduler_add_device(tie3, str_from("a"), AGNOSAI_ACCEL_CUDA, 8000);
+    agnosai_compute_scheduler_add_device(tie3, str_from("b"), AGNOSAI_ACCEL_CUDA, 8000);
+    agnosai_compute_scheduler_add_device(tie3, str_from("c"), AGNOSAI_ACCEL_CUDA, 8000);
+    assert_eq(agnosai_compute_allocation_device_index(
+    agnosai_compute_scheduler_allocate(tie3, str_from("t3"), 100, AGNOSAI_ACCEL_ANY)), 2,
+    "a three-way tie resolves to the last device, not the second");
+
+    # --- past the oracle: allocating twice for one task LEAKS -----------
+    # `allocations` is keyed by task id and `allocate` ends with an insert, which
+    # REPLACES. The first allocation's memory stays charged with no record, so
+    # release can never return it. Reproduced from the oracle, not invented.
+    var leak = _t_sched();
+    agnosai_compute_scheduler_allocate(leak, str_from("dup"), 5000, AGNOSAI_ACCEL_ANY);
+    agnosai_compute_scheduler_allocate(leak, str_from("dup"), 5000, AGNOSAI_ACCEL_ANY);
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(leak), 94000,
+    "both allocations charge the devices — 10 GB is gone");
+    assert_eq(vec_len(agnosai_compute_scheduler_allocations(leak)), 1,
+    "but only ONE record survives, keyed by the task id");
+    assert_eq(agnosai_compute_scheduler_release(leak, str_from("dup")), 1, "release succeeds");
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(leak), 99000,
+    "and returns only 5 GB — the first allocation is permanently leaked");
+
+    # --- oracle: add_cuda_and_tpu_devices -------------------------------
+    var mix = agnosai_compute_scheduler_new();
+    agnosai_compute_scheduler_add_device(mix, str_from("A100"), AGNOSAI_ACCEL_CUDA, 80000);
+    agnosai_compute_scheduler_add_device(mix, str_from("TPUv4"), AGNOSAI_ACCEL_TPU, 32000);
+    assert_eq(agnosai_compute_scheduler_total_vram_mb(mix), 112000, "both types count in the total");
+    assert_eq(agnosai_compute_scheduler_total_memory_mb(mix, AGNOSAI_ACCEL_CUDA), 80000,
+    "filtering by CUDA counts only the A100");
+    assert_eq(agnosai_compute_scheduler_total_memory_mb(mix, AGNOSAI_ACCEL_TPU), 32000,
+    "filtering by TPU counts only the TPU");
+    assert_eq(agnosai_compute_scheduler_total_memory_mb(mix, AGNOSAI_ACCEL_ROCM), 0,
+    "filtering by an absent type counts nothing");
+
+    # --- past the oracle: ACCEL_ANY must not be 0 -----------------------
+    # 0 is AGNOSAI_ACCEL_CPU, a real type. If ANY were 0 this would answer 0
+    # rather than the full 112 GB, which is the whole reason it is -1.
+    assert_eq(agnosai_compute_scheduler_total_memory_mb(mix, AGNOSAI_ACCEL_CPU), 0,
+    "CPU is a real accelerator type and matches nothing here");
+    assert_eq(agnosai_compute_scheduler_total_memory_mb(mix, AGNOSAI_ACCEL_ANY), 112000,
+    "ANY is distinct from CPU and counts everything");
+
+    # --- oracle: devices_of_type_filters_correctly ----------------------
+    assert_eq(vec_len(agnosai_compute_scheduler_devices_of_type(mix, AGNOSAI_ACCEL_CUDA)), 1,
+    "one CUDA device");
+    assert_eq(vec_len(agnosai_compute_scheduler_devices_of_type(mix, AGNOSAI_ACCEL_TPU)), 1,
+    "one TPU device");
+    assert_eq(vec_len(agnosai_compute_scheduler_devices_of_type(mix, AGNOSAI_ACCEL_METAL)), 0,
+    "no Metal device");
+
+    # --- oracle: allocate_on_specific_accelerator_type / allocate_tpu ---
+    var tpu_alloc = agnosai_compute_scheduler_allocate(mix, str_from("tpu-task"), 1000,
+    AGNOSAI_ACCEL_TPU);
+    assert(tpu_alloc != 0, "a TPU-targeted allocation succeeds");
+    assert_eq(agnosai_compute_allocation_device_index(tpu_alloc), 1, "and lands on the TPU");
+    assert_eq(agnosai_compute_scheduler_available_memory_mb(mix, AGNOSAI_ACCEL_TPU), 31000,
+    "TPU free memory drops");
+    assert_eq(agnosai_compute_scheduler_available_memory_mb(mix, AGNOSAI_ACCEL_CUDA), 80000,
+    "and CUDA free memory is untouched");
+
+    # --- oracle: mixed_devices_allocate_prefers_requested_type ----------
+    # The A100 has far more free memory, so an unfiltered request would take it.
+    # A TPU-typed request must still choose the smaller TPU.
+    var mix2 = agnosai_compute_scheduler_new();
+    agnosai_compute_scheduler_add_device(mix2, str_from("A100"), AGNOSAI_ACCEL_CUDA, 80000);
+    agnosai_compute_scheduler_add_device(mix2, str_from("TPUv4"), AGNOSAI_ACCEL_TPU, 32000);
+    assert_eq(agnosai_compute_allocation_device_index(
+    agnosai_compute_scheduler_allocate(mix2, str_from("x"), 1000, AGNOSAI_ACCEL_TPU)), 1,
+    "the type filter beats the most-free-memory preference");
+    assert_eq(agnosai_compute_scheduler_allocate(mix2, str_from("y"), 1000,
+    AGNOSAI_ACCEL_ROCM), 0, "a type with no device allocates nothing");
+
+    # --- past the oracle: the type filter also applies to CAPACITY ------
+    # A TPU request larger than the TPU must fail even though the A100 could
+    # hold it — the two filters are independent and both must apply.
+    assert_eq(agnosai_compute_scheduler_allocate(mix2, str_from("z"), 50000,
+    AGNOSAI_ACCEL_TPU), 0,
+    "a TPU request past the TPU's capacity fails rather than spilling to CUDA");
+
+    # --- oracle: backward_compat_add_gpu --------------------------------
+    var compat = agnosai_gpu_scheduler_new();
+    agnosai_compute_scheduler_add_gpu(compat, str_from("legacy"), 12000);
+    assert_eq(vec_len(agnosai_compute_scheduler_devices(compat)), 1, "add_gpu registers a device");
+    assert_eq(agnosai_compute_device_accelerator(
+    vec_get(agnosai_compute_scheduler_compute_devices(compat), 0)), AGNOSAI_ACCEL_CUDA,
+    "and defaults it to CUDA");
+    assert_eq(agnosai_compute_scheduler_total_vram_mb(compat), 12000, "with its VRAM counted");
+
+    # --- oracle: gpu_allocation_type_alias_works ------------------------
+    var ca = agnosai_compute_scheduler_allocate(compat, str_from("legacy-task"), 2000,
+    AGNOSAI_ACCEL_ANY);
+    assert(ca != 0, "the legacy scheduler allocates");
+    assert_eq(agnosai_compute_allocation_vram_mb(ca), 2000, "and the alias reads the size");
+
+    # --- past the oracle: the legacy view's available is saturating -----
+    var gview = vec_get(agnosai_compute_scheduler_devices(compat), 0);
+    assert_eq(agnosai_fleet_gpu_device_vram_available_mb(gview), 10000,
+    "the legacy view reports free VRAM");
+    assert_eq(agnosai_fleet_gpu_device_vram_used_mb(gview), 2000, "and used VRAM");
+    assert_eq(agnosai_fleet_gpu_device_vram_total_mb(gview), 12000, "and total VRAM");
+
+    # --- past the oracle: exact-fit allocation succeeds -----------------
+    # The filter is `available >= requested`, so a request for exactly the free
+    # amount must succeed. A `>` would reject it and strand the last block.
+    var exact = agnosai_compute_scheduler_new();
+    agnosai_compute_scheduler_add_device(exact, str_from("tight"), AGNOSAI_ACCEL_CUDA, 1000);
+    assert(agnosai_compute_scheduler_allocate(exact, str_from("e"), 1000, AGNOSAI_ACCEL_ANY) != 0,
+    "an allocation for exactly the free memory succeeds");
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(exact), 0, "leaving nothing free");
+    assert_eq(agnosai_compute_scheduler_allocate(exact, str_from("e2"), 1, AGNOSAI_ACCEL_ANY), 0,
+    "and a full device takes nothing more");
+    # best_device applies no capacity filter, so a full device is still returned.
+    assert(agnosai_compute_scheduler_best_device(exact) != 0,
+    "best_device still answers for a fully-allocated scheduler — it has no capacity filter");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

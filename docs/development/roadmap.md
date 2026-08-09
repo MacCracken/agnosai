@@ -660,7 +660,7 @@ list names is a permanent one.
 | Workaround | Where | Delete when |
 |---|---|---|
 | `_agnosai_signal_default` | `src/sandbox/spawn.cyr` | cyrius ships `signal_default` (filed `2026-08-05-syscalls-has-signal-ignore-but-no-way-back-to-sig-dfl.md`). ~20 lines, Linux arms only; the call site in the child stays, only the local definition goes. |
-| `_agnosai_auth_rsa_verify_locked` + `_AGNOSAI_RSA_VERIFY_MUTEX` | `src/server/auth.cyr` | sigil moves the RSA verify workspace to function-scope locals (the filing owed under C). ⚠ **This one is load-bearing security, not ergonomics** — it is the only thing standing between a lane collision and an authentication bypass, and it costs ~0.85 ms/verify under contention (~1.2k authenticated req/s). Do not delete it to reclaim that until the upstream fix is *vendored and verified*, and keep `tests/server_auth_lane_race.tcyr` either way — mutation-verified, the victim's valid signature verifies 0/2000 without the lock. |
+| ~~`_agnosai_auth_rsa_verify_locked` + `_AGNOSAI_RSA_VERIFY_MUTEX`~~ | ~~`src/server/auth.cyr`~~ | ✅ **DELETED 2026-08-08**, on the cyrius 6.5.13 / sigil 3.12.5 fold. sigil moved the whole public RSA verify path to function-scope locals across three releases — 3.12.3 the v1.5 workspace (closing the bypass), 3.12.4 the Montgomery scratch, 3.12.5 `bn_mod`'s `modrembuf`/`modn1buf`, the last shared state, which this tree located and filed. The call site in `src/server/auth.cyr` is direct again and the ~0.85 ms/verify serialisation cost is reclaimed. **`tests/server_auth_lane_race.tcyr` stays** as the regression guard — it measured 1/2000 valid on 3.12.3, 712/2000 on 3.12.4 and 2000/2000 on 3.12.5, so it demonstrably detects a relapse. |
 
 ~~`_agnosai_kavach_gate_bytes`~~ — ✅ **deleted 2026-08-05**, on the kavach
 **3.11.7** pin. `agnosai_kavach_scan_output` now calls
@@ -722,6 +722,13 @@ listed because "no test covers this" is true of both and will keep being true:
   `CREATED -> RUNNING` unconditionally, so a freshly created sandbox always
   starts. Kept because the oracle has the arm. It is the one of the three error
   paths that *can* carry a kavach error code, and now does.
+- **`fleet/gpu`'s two `saturating_sub` guards (added 2026-08-08).** `used` moves
+  only by `allocate` (+) and `release` (-), and `release` removes the record
+  before subtracting, so `used` is always >= any single record and the guard
+  cannot fire. The oracle needs it because Rust's `u64` underflow panics in
+  debug. Mutation-verified as unreachable: deleting the guard in `release`
+  leaves all 65 assertions green. Kept for oracle shape, documented in place.
+
 - **Two log-only fixes whose mutants survive — L5 and L9.** Nothing in this tree
   captures sakshi output, so `sakshi_warn`'s corrected length and the manager's
   restored dispatch `debug!` cannot be asserted. Both are correct; neither is

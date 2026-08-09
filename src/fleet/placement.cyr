@@ -1,0 +1,296 @@
+# =========================================================================
+# fleet/placement — scheduling policies: gpu-affinity, balanced, locality,
+# cost, manual.
+#
+# Parity oracle: rust-old/src/fleet/placement.rs
+#
+# Pure scoring over the `NodeInfo` vocabulary `registry` defines. No I/O, no
+# allocation beyond the result vec.
+#
+# Every score is an f64 carried as its IEEE-754 bit pattern in an i64 — compare
+# with f64_lt / f64_gt / f64_eq, never with the integer operators.
+#
+# ## Two things the oracle's own tests do not pin, and both are observable
+#
+# **1. The sort must be STABLE, and cyrius's is not.** The oracle ends
+# `rank_nodes` with `results.sort_by(|a, b| b.score.partial_cmp(&a.score)
+# .unwrap_or(Equal))`, and Rust's `sort_by` is stable — so equal scores keep
+# input order and `place()` returns the earliest such node. Ties are the common
+# case here, not the exotic one: two nodes with the same VRAM tie under
+# GpuAffinity, the same capability fraction ties under Locality, and the same
+# resource total ties under Cost. `vec_sort_by` is introsort, which runs pure
+# insertion sort (stable) only while `h - l > 16` is false — at 18 nodes or more
+# it is **not** stable, and a real fleet passes 18.
+#
+# So the comparator here makes the order TOTAL by falling back to the node's
+# original index. That reproduces a stable descending sort exactly, at any size,
+# without depending on the sort algorithm's internals. `_t_rank_is_stable` in
+# the suite drives 40 equal-scoring nodes, which is past the introsort
+# threshold and fails against a score-only comparator.
+#
+# **2. The index `Balanced` scores against is the PRE-FILTER one.** The oracle
+# does `.iter().enumerate().map(..).filter(|r| r.score > 0.0)` — `enumerate`
+# runs *before* `filter`, so a disqualified node still consumes its position and
+# the nodes after it keep the scores they would have had. Filtering first and
+# then enumerating would silently re-rank every node behind an offline one.
+# =========================================================================
+
+# The five scheduling policies, in the oracle's declaration order.
+enum AgnosaiPlacementPolicy {
+    AGNOSAI_PLACE_GPU_AFFINITY = 0;
+    AGNOSAI_PLACE_BALANCED = 1;
+    AGNOSAI_PLACE_LOCALITY = 2;
+    AGNOSAI_PLACE_COST = 3;
+    AGNOSAI_PLACE_MANUAL = 4;
+}
+
+# PlacementRequest heap layout — 48 bytes. `preferred_node` and `hardware` use
+# 0 for the oracle's `None`, the convention the rest of the port uses.
+enum AgnosaiPlacementRequestOff {
+    AGN_PQ_POLICY = 0;
+    AGN_PQ_REQUIRED_GPU = 8;
+    AGN_PQ_MIN_GPU_VRAM_MB = 16;
+    AGN_PQ_REQUIRED_CAPABILITIES = 24;
+    AGN_PQ_PREFERRED_NODE = 32;
+    AGN_PQ_HARDWARE = 40;
+    AGN_PQ_SIZE = 48;
+}
+
+# PlacementResult heap layout — 24 bytes.
+#
+# ⚠ `AGN_PR_INDEX` has no oracle counterpart. It is the node's position in the
+# input slice, carried so the comparator can reproduce Rust's stable sort; see
+# the header. It is deliberately not exposed by an accessor.
+enum AgnosaiPlacementResultOff {
+    AGN_PR_NODE_ID = 0;
+    AGN_PR_SCORE = 8;
+    AGN_PR_INDEX = 16;
+    AGN_PR_SIZE = 24;
+}
+
+# The oracle's normalisation ceiling: "1 TB" expressed in MB, as an f64.
+var AGNOSAI_PLACE_MAX_VRAM_MB = 1000000;
+
+# --- PlacementRequest ----------------------------------------------------
+
+# The oracle's `PlacementRequest::new` — no GPU required, no VRAM floor, no
+# capabilities, no preferred node, no hardware requirement.
+fn agnosai_placement_request_new(policy): i64 {
+    var q = alloc(AGN_PQ_SIZE);
+    store64(q + AGN_PQ_POLICY, policy);
+    store64(q + AGN_PQ_REQUIRED_GPU, 0);
+    store64(q + AGN_PQ_MIN_GPU_VRAM_MB, 0);
+    store64(q + AGN_PQ_REQUIRED_CAPABILITIES, vec_new());
+    store64(q + AGN_PQ_PREFERRED_NODE, 0);
+    store64(q + AGN_PQ_HARDWARE, 0);
+    return q;
+}
+
+# The oracle's builder `with_required_gpu`. Mutates and returns, since Cyrius
+# has no move semantics to consume `self`.
+fn agnosai_placement_request_with_required_gpu(q, required): i64 {
+    store64(q + AGN_PQ_REQUIRED_GPU, required);
+    return q;
+}
+
+# The oracle's builder `with_min_gpu_vram_mb`.
+fn agnosai_placement_request_with_min_gpu_vram_mb(q, mb): i64 {
+    store64(q + AGN_PQ_MIN_GPU_VRAM_MB, mb);
+    return q;
+}
+
+# The oracle's builder `with_capabilities`.
+fn agnosai_placement_request_with_capabilities(q, caps): i64 {
+    store64(q + AGN_PQ_REQUIRED_CAPABILITIES, caps);
+    return q;
+}
+
+# The oracle's builder `with_preferred_node`.
+fn agnosai_placement_request_with_preferred_node(q, node_id: Str): i64 {
+    store64(q + AGN_PQ_PREFERRED_NODE, node_id);
+    return q;
+}
+
+# The oracle's builder `with_hardware`.
+fn agnosai_placement_request_with_hardware(q, hw): i64 {
+    store64(q + AGN_PQ_HARDWARE, hw);
+    return q;
+}
+
+# The policy this request will be scored under.
+fn agnosai_placement_request_policy(q): i64 {
+    return load64(q + AGN_PQ_POLICY);
+}
+
+# Whether an accelerator is a hard requirement.
+fn agnosai_placement_request_required_gpu(q): i64 {
+    return load64(q + AGN_PQ_REQUIRED_GPU);
+}
+
+# The minimum accelerator memory in megabytes, or 0 for no floor.
+fn agnosai_placement_request_min_gpu_vram_mb(q): i64 {
+    return load64(q + AGN_PQ_MIN_GPU_VRAM_MB);
+}
+
+# The capability strings a node must advertise.
+fn agnosai_placement_request_capabilities(q): i64 {
+    return load64(q + AGN_PQ_REQUIRED_CAPABILITIES);
+}
+
+# The node id a Manual placement targets, or 0 for the oracle's `None`.
+fn agnosai_placement_request_preferred_node(q): i64 {
+    return load64(q + AGN_PQ_PREFERRED_NODE);
+}
+
+# The hardware requirement, or 0 for the oracle's `None`.
+fn agnosai_placement_request_hardware(q): i64 {
+    return load64(q + AGN_PQ_HARDWARE);
+}
+
+# --- PlacementResult -----------------------------------------------------
+
+# The chosen node's id.
+fn agnosai_placement_result_node_id(p): i64 {
+    return load64(p + AGN_PR_NODE_ID);
+}
+
+# The node's score, an f64 bit pattern in 0.0–1.0.
+fn agnosai_placement_result_score(p): i64 {
+    return load64(p + AGN_PR_SCORE);
+}
+
+# --- scoring -------------------------------------------------------------
+
+# Whether `caps` contains `needle` — the oracle's `Vec<String>::contains`.
+fn _agnosai_place_caps_contain(caps, needle: Str): i64 {
+    for (var i = 0; i < vec_len(caps); i = i + 1) {
+        if (str_eq(vec_get(caps, i), needle) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# Score one node for a request, 0.0–1.0, where 0.0 means disqualified.
+#
+# `index` and `count` are positions in the ORIGINAL node slice — see the header
+# on why they must not be recomputed after filtering.
+fn _agnosai_place_score_node(q, node, index, count): i64 {
+    var zero = f64_from(0);
+    var one = f64_from(1);
+
+    # Non-Online nodes are disqualified outright, before any policy runs.
+    if (agnosai_node_info_status(node) != AGNOSAI_NODE_ONLINE) { return zero; }
+
+    var hw = load64(q + AGN_PQ_HARDWARE);
+    if (hw != 0) {
+        # ⚠ The hardware requirement REPLACES the legacy GPU checks rather than
+        # adding to them — the oracle's `if let Some(..) { .. } else { .. }`. A
+        # request carrying both a hardware requirement and `required_gpu` has
+        # the latter ignored, which reads like a bug and is the oracle's stated
+        # precedence ("takes precedence over legacy GPU fields").
+        if (agnosai_node_info_satisfies_hardware(node, hw) == 0) { return zero; }
+    } else {
+        if (load64(q + AGN_PQ_REQUIRED_GPU) != 0) {
+            if (agnosai_node_info_has_gpu(node) == 0) { return zero; }
+        }
+        var floor_mb = load64(q + AGN_PQ_MIN_GPU_VRAM_MB);
+        if (floor_mb > 0) {
+            if (agnosai_node_info_gpu_vram_mb(node) < floor_mb) { return zero; }
+        }
+    }
+
+    var policy = load64(q + AGN_PQ_POLICY);
+
+    if (policy == AGNOSAI_PLACE_GPU_AFFINITY) {
+        # ⚠ A second GPU test, independent of `required_gpu`: this policy
+        # disqualifies a CPU-only node even when the request never asked for an
+        # accelerator.
+        if (agnosai_node_info_has_gpu(node) == 0) { return zero; }
+        var vram = f64_from(agnosai_node_info_gpu_vram_mb(node));
+        var norm = f64_div(vram, f64_from(AGNOSAI_PLACE_MAX_VRAM_MB));
+        return f64_min(norm, one);
+    }
+
+    if (policy == AGNOSAI_PLACE_BALANCED) {
+        if (count <= 1) { return one; }
+        return f64_sub(one, f64_div(f64_from(index), f64_from(count)));
+    }
+
+    if (policy == AGNOSAI_PLACE_LOCALITY) {
+        var want = load64(q + AGN_PQ_REQUIRED_CAPABILITIES);
+        # No capabilities asked for means every node matches perfectly — the
+        # oracle returns 1.0 rather than dividing by zero.
+        if (vec_len(want) == 0) { return one; }
+        var have = agnosai_node_info_capabilities(node);
+        var matched = 0;
+        for (var i = 0; i < vec_len(want); i = i + 1) {
+            if (_agnosai_place_caps_contain(have, vec_get(want, i)) == 1) {
+                matched = matched + 1;
+            }
+        }
+        return f64_div(f64_from(matched), f64_from(vec_len(want)));
+    }
+
+    if (policy == AGNOSAI_PLACE_COST) {
+        # Least resources wins. `1 / (1 + weight)` is never 0 for a finite
+        # weight, so a Cost placement never disqualifies on score alone.
+        var weight = f64_add(f64_from(agnosai_node_info_gpu_count(node)),
+        f64_from(agnosai_node_info_gpu_vram_mb(node)));
+        return f64_div(one, f64_add(one, weight));
+    }
+
+    # Manual: only the preferred node scores, and an unset preference scores
+    # nothing at all — so a Manual request with no `preferred_node` places
+    # nowhere rather than falling back to some other node.
+    var pref = load64(q + AGN_PQ_PREFERRED_NODE);
+    if (pref == 0) { return zero; }
+    if (str_eq(pref, agnosai_node_info_id(node)) == 1) { return one; }
+    return zero;
+}
+
+# Descending by score, then ascending by original index.
+#
+# ⚠ The index tiebreak is what reproduces Rust's STABLE `sort_by`; see the
+# header. It also handles NaN the way the oracle's `unwrap_or(Ordering::Equal)`
+# does: `f64_gt` and `f64_lt` are both 0 for a NaN operand, so the comparison
+# falls through to the index and input order is preserved.
+fn _agnosai_place_cmp(x, y): i64 {
+    var sx = load64(x + AGN_PR_SCORE);
+    var sy = load64(y + AGN_PR_SCORE);
+    if (f64_gt(sx, sy) == 1) { return 0 - 1; }
+    if (f64_lt(sx, sy) == 1) { return 1; }
+    var ix = load64(x + AGN_PR_INDEX);
+    var iy = load64(y + AGN_PR_INDEX);
+    if (ix < iy) { return 0 - 1; }
+    if (ix > iy) { return 1; }
+    return 0;
+}
+
+# Rank every node that scores above zero, best first.
+#
+# `nodes` is a vec of `NodeInfo`. Returns a vec of `PlacementResult`.
+fn agnosai_rank_nodes(q, nodes): i64 {
+    var count = vec_len(nodes);
+    var out = vec_new();
+    for (var i = 0; i < count; i = i + 1) {
+        var node = vec_get(nodes, i);
+        var score = _agnosai_place_score_node(q, node, i, count);
+        # The oracle filters `score > 0.0`, so a node scoring exactly zero is
+        # dropped rather than ranked last.
+        if (f64_gt(score, f64_from(0)) == 1) {
+            var r = alloc(AGN_PR_SIZE);
+            store64(r + AGN_PR_NODE_ID, agnosai_node_info_id(node));
+            store64(r + AGN_PR_SCORE, score);
+            store64(r + AGN_PR_INDEX, i);
+            vec_push(out, r);
+        }
+    }
+    agnosai_sort(out, &_agnosai_place_cmp);
+    return out;
+}
+
+# The single best node for a request, or 0 for the oracle's `None`.
+fn agnosai_place(q, nodes): i64 {
+    var ranked = agnosai_rank_nodes(q, nodes);
+    if (vec_len(ranked) == 0) { return 0; }
+    return vec_get(ranked, 0);
+}
