@@ -19,6 +19,15 @@
 # `key=val` into the message text *before* `_sk_emit`, so the hook sees one
 # string), the `span` / `spans` objects, and per-module `target` values.
 #
+# ⚠ **The fields half is fixed upstream in sakshi 2.4.9 and this file has NOT
+# consumed it yet** — the pinned toolchain still vendors 2.4.8. On 2.4.9 the
+# hook's sixth argument carries a count-prefixed fields block for log events
+# (`{key, key_len, val, val_len}` records, `level` discriminating 0-5 log from
+# 10-11 span), and `msg` arrives WITHOUT the ` key=value` tail. So when cyrius
+# folds 2.4.9, `_agnosai_telemetry_json_hook` **must** be updated in the same
+# bump: not doing so silently drops every `key=value` from the output rather
+# than merely failing to structure it. Tracked in roadmap section C.
+#
 # ## The hook must not allocate, and must be reentrant
 #
 # It runs once per log line on every worker thread. The default allocator is a
@@ -49,6 +58,10 @@
 # Both are reproduced. `agnosai_telemetry_env_filter_level` is only consulted on
 # the `init_tracing` path, which is why `main` does not call it.
 # =========================================================================
+
+# `pub mod genai;` — the oracle declares it before its own code, and it depends
+# on nothing here, so it leads the single-pass include order too.
+include "src/telemetry/genai.cyr"
 
 # The oracle's `DEFAULT_SERVICE_NAME`.
 fn agnosai_telemetry_default_service_name(): i64 {

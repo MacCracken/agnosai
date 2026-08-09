@@ -96,6 +96,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`telemetry/genai`** — OpenTelemetry GenAI semantic-convention span helpers
+  (v1.37+): the 15 attribute constants, `inference_span`, `tool_span`,
+  `crew_span` and `record_usage`. **64 assertions**, all 7 oracle tests plus 57
+  past them, five mutation-verified. `telemetry/` is now **complete at source
+  level** — both oracle files ported.
+
+  **`tracing::Span` becomes a held attribute record.** The oracle returns a
+  handle whose attributes a subscriber reads at close and which `record_usage`
+  writes into later; sakshi's spans are a fixed-depth stack of name + timing
+  with no attribute channel. So the two halves are split — attributes live in a
+  record this module owns (what the OTLP exporter will encode), scope is
+  sakshi's stack, entered explicitly.
+
+  ⚠ **Creating a span does not enter it.** `tracing::info_span!` builds; entering
+  is a separate `.entered()`. The oracle's doc says "the span will be active
+  until dropped" but its own example never enters, so the port follows the code.
+  Mutation-verified against a constructor that pushes.
+
+  Four of the oracle's seven tests are **vacuous** —
+  `assert!(span.is_disabled() || !span.is_disabled())` is a tautology, and three
+  more are `let _ = span; // Verify creation doesn't panic`. The remaining three
+  check only the *shape* of the constants. So the constants are exposed as the
+  key for real accessors (`span_attr_str` / `span_attr_int`) rather than left
+  decorative, and what is pinned past the oracle is:
+
+  - **`crew_span` sets no `gen_ai.operation.name`** while the other two do, so a
+    backend grouping by operation sees crew runs as unclassified. The oracle
+    omits it; filling it in would invent a wire value.
+  - **Unset is distinguishable from zero.** The three `tracing::field::Empty`
+    fields read back unset, not 0 — otherwise "no usage recorded" and "recorded
+    0 tokens" would be the same span.
+  - A **declared-but-Empty** field and an **undeclared** one both read absent,
+    because the wire carries neither.
+  - The two prefix families **partition** the set — the oracle checks each
+    separately, so an attribute in both lists passes both its tests.
+  - Every key is asserted by **exact spelling**; `starts_with("gen_ai.")` passes
+    for a typo'd suffix, and these are names an OTLP backend matches literally.
+  - `agnosai.crew.task_count` is spelled **inline** in the oracle's `crew_span!`
+    rather than in `attrs`, so no oracle test covers it at all.
+
 - **`telemetry/mod`** — the OTLP configuration surface and, for the first time,
   **the oracle's JSON log format**. `DEFAULT_SERVICE_NAME`, `service_name`,
   `otlp_endpoint_from_env`, `TracingGuard`, `init_tracing`, plus the formatter
@@ -491,6 +531,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     produces.
 
 ### Changed
+
+- **Toolchain pinned to cyrius 6.5.15** (was 6.5.14). Three-step, `lib/` diffed
+  after the sync AND after a build: 107 files synced, 4 differ from the previous
+  snapshot (`sakshi`, and the three `syscalls_*` files), `lib/unicode/`
+  untouched as `lib sync --full` skips it, and no drift across an implicit
+  re-resolve.
+
+  ⚠ **`[deps.sakshi]`'s 2.4.8 tag is now the thing lagging.** The 6.5.15
+  snapshot ships sakshi 2.4.9 and the tag pin overlays 2.4.8 back over it on
+  every resolve — the same silent-downgrade mechanism that comment was written
+  to guard against, now pointing the other way. Deliberate for the moment:
+  2.4.9 changes what `sakshi_log_kv` hands an emit hook, and this tree's
+  formatter is written against 2.4.8. The pin bump to 2.4.10 and the
+  `_agnosai_telemetry_json_hook` update are **one change** — on 2.4.9+ a hook
+  that ignores the new sixth argument silently drops every `key=value` from the
+  JSON rather than merely failing to structure it.
 
 - **`order`: the lexicographic `Str` comparator is now shared.**
   `orchestrator/scheduler` and `orchestrator/plan_cache` each carried a

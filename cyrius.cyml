@@ -5,7 +5,7 @@ description = "AgnosAI — provider-agnostic AI orchestration: crews, tasks, too
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/agnosai"
 language = "cyrius"
-cyrius = "6.5.14"
+cyrius = "6.5.15"
 
 [build]
 entry = "src/main.cyr"
@@ -87,6 +87,25 @@ modules = ["dist/tyche.cyr"]
 # so this pin is redundant *today* — it exists so the next sibling that lags
 # cannot reintroduce the same silent downgrade. majra carries the identical pin
 # for the identical reason; see the comment on its `[deps.sakshi]`.
+#
+# ⚠ **The lib-snapshot gate's result depends on whether a build ran since the
+# last sync, and that is this pin's doing.** Observed on the 6.5.15 bump:
+# `cyrius lib sync --full` writes the snapshot's sakshi into `lib/` and
+# `check-clean` passes; the very next `cyrius build` performs an implicit
+# resolve, overwrites `lib/sakshi.cyr` back to this tag, and `check-clean`
+# fails. Neither result is wrong — the *built* artifact is always this tag, so
+# 2.4.8 is what agnosai actually runs. Do not "fix" the flap by re-syncing
+# before the gate; that hides which sakshi the binary contains.
+#
+# ⚠ **As of the 6.5.15 bump this pin is the thing doing the lagging.** The
+# toolchain snapshot ships sakshi **2.4.9** and this tag holds `lib/sakshi.cyr`
+# at 2.4.8 — visible as the same unnamed "1 bundled lib(s) differ" warning, now
+# pointing the other way. That is deliberate for the moment: 2.4.9 changes what
+# `sakshi_log_kv` hands an emit hook, and `src/telemetry/mod.cyr`'s formatter is
+# written against 2.4.8. **Bump this tag to 2.4.10 and update
+# `_agnosai_telemetry_json_hook` in the same commit** — the two are one change,
+# because on 2.4.9+ a hook that ignores the new sixth argument silently drops
+# every `key=value` from the JSON rather than merely failing to structure it.
 #
 # **Keep this in step with the toolchain's bundled sakshi on every pin bump.**
 [deps.sakshi]

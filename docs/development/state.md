@@ -163,7 +163,7 @@ the tree 2026-08-08 with `find src -maxdepth 1 -name '*.cyr'` per group:
 | `orchestrator/` | 16 | 5,632 | ✅ complete (M5) |
 | `server/` | 11 | 4,291 | ✅ complete (M6) |
 | `fleet/` | 12 | 3,676 | ✅ complete (M8) |
-| `telemetry/` | 1 | 469 | M9 — `mod` done; OTLP export and `genai` owed |
+| `telemetry/` | 2 | 751 | M9 — `mod` + `genai` done; only the OTLP exporter body owed |
 | `sandbox/` | 9 | 3,345 | ✅ complete (M7) |
 | `core/` | 8 | 3,305 | ✅ complete (M2) |
 | `server/routes/` | 10 | 2,686 | ✅ complete (M6) |
@@ -172,7 +172,7 @@ the tree 2026-08-08 with `find src -maxdepth 1 -name '*.cyr'` per group:
 | `tools/` | 5 | 1,144 | ✅ complete (M4) |
 | `learning/` | 6 | 1,018 | ✅ complete (M2) |
 | root (port-local) | 6 | 1,054 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
-| **total** | **95** | **30,023** | against a **41,163**-line oracle |
+| **total** | **96** | **30,305** | against a **41,163**-line oracle |
 
 Regenerate with:
 
@@ -190,7 +190,7 @@ corrected section below):
 | Group | Rust lines | Milestone | Scope |
 |---|---|---|---|
 | `definitions/` | 1,460 | M10 | whole — **ZIP and YAML included**; both former blockers are already in `lib/` (sankoch, bayan) |
-| `telemetry/` | 206 of 322 left | M9 | **`mod.rs` done 2026-08-08** (116 lines) — the JSON logging init landed with it. `genai.rs` (206) and the OTLP exporter body are owed. ⚠ The planned **sakshi filing for JSON output was never needed** — `sakshi_set_emit_hook` already exists; see roadmap M9. |
+| `telemetry/` | 0 of 322 left | M9 | **Source-complete 2026-08-09** — `mod.rs` (116, with the JSON logging init) and `genai.rs` (206). What remains of M9 is not an oracle file: the **OTLP exporter body**, copied from hoosh's `otlp.cyr`, behind the branch `agnosai_telemetry_init_tracing` already takes. ⚠ The planned **sakshi filing for JSON output was never needed** — `sakshi_set_emit_hook` already exists; see roadmap M9. |
 
 `fleet/` left this table on **2026-08-08**: all twelve of the oracle's modules
 are ported.
@@ -1003,10 +1003,11 @@ re-run the sweep, after adding a `.tcyr`.
 > telemetry only. That undercounts the src figure by 24% and the true figure by
 > 2.5x.** Of the 8,206 unported *src* lines it then counted, only 6,225 were in
 > the unstarted groups; the rest are holes inside groups this file calls
-> complete. With `fleet` closed and `telemetry/mod` landed the *src* remainder
-> is **3,647**: M10 `definitions` 1,460, M9's residue 206 (`genai.rs`), and
-> **1,981 that are holes inside groups this file calls complete**. The named
-> milestones are now the *smaller* half of the src work left.
+> complete. With `fleet` closed and `telemetry/` source-complete the *src*
+> remainder is **3,441**: M10 `definitions` 1,460, and **1,981 that are holes
+> inside groups this file calls complete**. M9 has no oracle *source* left — only
+> the OTLP exporter body, which is copied from hoosh rather than from
+> `rust-old/`. The one named milestone is now the *smaller* half of the work.
 >
 > ⚠ **"M0–M8 complete" is false for five of the nine.** M2 (`hwaccel` half of
 > `core/resource.rs`), M3 (`hwaccel` half of `llm/router.rs`, all of
@@ -1035,7 +1036,7 @@ dead-end levers are recorded under *Benchmarks*.
 | Cyrius port | **29,518 lines**, 94 files, `src/` mirroring `rust-old/src/` |
 | Rust oracle | **41,163 lines** at `rust-old/` — frozen. (27,683 is the `src/`-only figure this file carried until 2026-08-07; see the banner above.) |
 | Milestones | **M0–M8 complete** — the server tier serves; M7 `sandbox`'s eight modules carry the 2026-08-04 audit's 43 findings all fixed (41 mutation-verified); **M8 `fleet` closed 2026-08-08** at 12/12 modules and 719 assertions. Read the ⚠ below: "complete" is per-milestone, not per-group |
-| Not started | M10 `definitions`, M11 (sandbox-gated tools + hwaccel), M12 (llm residue, tokio tests, benches, non-`src`). **M8 `fleet` closed 2026-08-08**; **M9 `telemetry` part-done** — `mod` + JSON logging landed, `genai` and the OTLP exporter body owed |
+| Not started | M10 `definitions`, M11 (sandbox-gated tools + hwaccel), M12 (llm residue, tokio tests, benches, non-`src`). **M8 `fleet` closed 2026-08-08**; **M9 `telemetry` source-complete 2026-08-09** — only the OTLP exporter body (from hoosh, not from `rust-old/`) remains |
 | Gates | build OK · 2,189 symbols / 95 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · coverage **100% (1338/1338)** via `cyrius coverage --min 80` · 79 suites / 6,389 assertions |
 
 ### What "M8/M9/M10 not started" actually means — corrected 2026-08-07
