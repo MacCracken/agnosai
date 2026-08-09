@@ -1,0 +1,154 @@
+# =========================================================================
+# fleet_discovery.tcyr — tests for src/fleet/discovery.cyr
+#
+# Oracle: rust-old/src/fleet/discovery.rs's seven `#[test]` fns, all ported.
+# Three are `#[tokio::test]`; the port's backends are synchronous in fact, so
+# they re-express directly rather than needing an async harness.
+#
+# Past the oracle in five places:
+#
+#   * **`discover` returns an INDEPENDENT list.** The oracle's
+#     `self.nodes.clone()` means a caller that pushes to the result must not
+#     affect the backend. Returning the stored vec instead passes every oracle
+#     test — none of them mutates the result.
+#   * a repeated metadata key REPLACES rather than accumulating
+#   * `socket_addr` for a port needing no padding, and for port 0
+#   * the vtable dispatches by ctx, so two backends of the same kind stay
+#     independent
+#   * a hand-built backend works, which is the point of the vtable
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/fleet/discovery.cyr"
+include "tests/test_helpers.cyr"
+
+# A vec of the three nodes the oracle's static test uses.
+fn _t_three_nodes(): i64 {
+    var v = vec_new();
+    vec_push(v, agnosai_discovered_node_new(str_from("10.0.0.1"), 8080));
+    vec_push(v, agnosai_discovered_node_new(str_from("10.0.0.2"), 8080));
+    vec_push(v, agnosai_discovered_node_new(str_from("10.0.0.3"), 9090));
+    return v;
+}
+
+# A backend that always answers one fixed node, to prove a hand-written
+# implementation plugs into the vtable.
+fn _t_custom_discover(ctx): i64 {
+    var v = vec_new();
+    vec_push(v, agnosai_discovered_node_new(str_from("custom"), ctx));
+    return v;
+}
+
+fn main(): i64 {
+    # --- oracle: discovered_node_new ------------------------------------
+    var n = agnosai_discovered_node_new(str_from("10.0.0.1"), 8080);
+    assert(str_eq_cstr(agnosai_discovered_node_address(n), "10.0.0.1") == 1, "address round-trips");
+    assert_eq(agnosai_discovered_node_port(n), 8080, "port round-trips");
+    assert_eq(map_size(agnosai_discovered_node_metadata(n)), 0, "metadata starts empty");
+
+    # --- oracle: discovered_node_with_metadata --------------------------
+    agnosai_discovered_node_with_metadata(n, str_from("region"), str_from("us-east-1"));
+    agnosai_discovered_node_with_metadata(n, str_from("gpu"), str_from("A100"));
+    assert_eq(map_size(agnosai_discovered_node_metadata(n)), 2, "two metadata entries");
+    assert(str_eq_cstr(map_get(agnosai_discovered_node_metadata(n), str_from("region")),
+    "us-east-1") == 1, "region reads back");
+    assert(str_eq_cstr(map_get(agnosai_discovered_node_metadata(n), str_from("gpu")),
+    "A100") == 1, "gpu reads back");
+
+    # --- past the oracle: a repeated key REPLACES -----------------------
+    # `HashMap::insert` overwrites, so the count must not grow. A metadata store
+    # that appended would double-count every re-registration.
+    agnosai_discovered_node_with_metadata(n, str_from("region"), str_from("eu-west-1"));
+    assert_eq(map_size(agnosai_discovered_node_metadata(n)), 2, "a repeated key does not grow the map");
+    assert(str_eq_cstr(map_get(agnosai_discovered_node_metadata(n), str_from("region")),
+    "eu-west-1") == 1, "and the newer value wins");
+
+    # --- oracle: discovered_node_socket_addr ----------------------------
+    assert(str_eq_cstr(agnosai_discovered_node_socket_addr(
+    agnosai_discovered_node_new(str_from("10.0.0.1"), 8080)), "10.0.0.1:8080") == 1,
+    "socket_addr is address:port");
+
+    # --- past the oracle: socket_addr edge shapes -----------------------
+    assert(str_eq_cstr(agnosai_discovered_node_socket_addr(
+    agnosai_discovered_node_new(str_from("host"), 80)), "host:80") == 1,
+    "a short port is not zero-padded");
+    assert(str_eq_cstr(agnosai_discovered_node_socket_addr(
+    agnosai_discovered_node_new(str_from("h"), 0)), "h:0") == 1,
+    "port 0 renders as 0, not as an empty field");
+    assert(str_eq_cstr(agnosai_discovered_node_socket_addr(
+    agnosai_discovered_node_new(str_from("fleet.example.com"), 65535)),
+    "fleet.example.com:65535") == 1, "a hostname and the maximum port render whole");
+
+    # --- oracle: static_discovery_returns_all_nodes ---------------------
+    var sb = agnosai_static_discovery_new(_t_three_nodes());
+    var found = agnosai_discovery_discover(sb);
+    assert_eq(vec_len(found), 3, "static discovery returns all three nodes");
+    assert(str_eq_cstr(agnosai_discovered_node_address(vec_get(found, 0)), "10.0.0.1") == 1,
+    "in order, first");
+    assert(str_eq_cstr(agnosai_discovered_node_address(vec_get(found, 1)), "10.0.0.2") == 1,
+    "in order, second");
+    assert_eq(agnosai_discovered_node_port(vec_get(found, 2)), 9090, "and the third's port");
+
+    # --- oracle: static_discovery_empty ---------------------------------
+    assert_eq(vec_len(agnosai_discovery_discover(
+    agnosai_static_discovery_new(vec_new()))), 0, "an empty static backend discovers nothing");
+
+    # --- past the oracle: the result is INDEPENDENT of the backend ------
+    # The oracle returns `self.nodes.clone()`. Handing back the stored vec passes
+    # every oracle test — none of them mutates the result — but it would let a
+    # caller's push silently grow the backend's own list.
+    var nodes = _t_three_nodes();
+    var sb2 = agnosai_static_discovery_new(nodes);
+    var first = agnosai_discovery_discover(sb2);
+    vec_push(first, agnosai_discovered_node_new(str_from("intruder"), 1));
+    assert_eq(vec_len(first), 4, "the caller's copy grew");
+    assert_eq(vec_len(nodes), 3, "but the backend's list did NOT");
+    assert_eq(vec_len(agnosai_discovery_discover(sb2)), 3,
+    "and a second discovery still answers three");
+
+    # --- oracle: dns_discovery_stub_returns_empty -----------------------
+    var dns = agnosai_dns_discovery_new(str_from("_agnosai._tcp.fleet.example.com"));
+    assert_eq(vec_len(agnosai_discovery_discover(dns)), 0,
+    "DNS discovery is a stub and answers empty — upstream too, not a port gap");
+
+    # --- oracle: dns_discovery_stores_srv_name --------------------------
+    assert(str_eq_cstr(agnosai_dns_discovery_srv_name(dns),
+    "_agnosai._tcp.fleet.example.com") == 1, "the SRV name is stored and readable");
+
+    # --- past the oracle: backends are independent by ctx ---------------
+    # The vtable shares one `discover_fp` across instances, so two static
+    # backends must not see each other's list. A shared-state implementation
+    # passes every single-backend test.
+    var sa = agnosai_static_discovery_new(_t_three_nodes());
+    var sc = agnosai_static_discovery_new(vec_new());
+    assert_eq(vec_len(agnosai_discovery_discover(sa)), 3, "the populated backend answers three");
+    assert_eq(vec_len(agnosai_discovery_discover(sc)), 0, "the empty one still answers none");
+
+    var d1 = agnosai_dns_discovery_new(str_from("a.example.com"));
+    var d2 = agnosai_dns_discovery_new(str_from("b.example.com"));
+    assert(str_eq_cstr(agnosai_dns_discovery_srv_name(d1), "a.example.com") == 1,
+    "two DNS backends keep their own SRV names");
+    assert(str_eq_cstr(agnosai_dns_discovery_srv_name(d2), "b.example.com") == 1, "independently");
+
+    # --- past the oracle: a hand-written backend plugs in ---------------
+    # This is what the vtable buys over the oracle's trait — a new backend is a
+    # function, and `agnosai_discovery_discover` dispatches to it unchanged.
+    var custom = agnosai_discovery_backend_new(&_t_custom_discover, 7777);
+    var cfound = agnosai_discovery_discover(custom);
+    assert_eq(vec_len(cfound), 1, "a custom backend discovers through the same entry point");
+    assert(str_eq_cstr(agnosai_discovered_node_address(vec_get(cfound, 0)), "custom") == 1,
+    "returning its own node");
+    assert_eq(agnosai_discovered_node_port(vec_get(cfound, 0)), 7777,
+    "and its ctx reached the implementation");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

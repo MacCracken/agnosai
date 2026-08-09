@@ -1,0 +1,228 @@
+# =========================================================================
+# fleet/relay — inter-node messaging with ordered, deduplicated delivery.
+#
+# Parity oracle: rust-old/src/fleet/relay.rs
+#
+# ## This one really is a wrapper — but only as of majra 2.6.0
+#
+# The port plan predicted `relay.rs` "maps onto majra `relay_*` near-1:1". The
+# names did; the semantics did not, and wrapping 2.5.3 would have shipped four
+# defects. All four were fixed upstream on agnosai's report and this module now
+# delegates rather than reimplementing:
+#
+#   * `relay_receive` was **not reentrant** — it kept its arguments and dedup
+#     state in file-scope globals AND took no lock, while every other mutating
+#     entry point locked. agnosai runs 100 sandhi workers, so that was a live
+#     race: a threaded probe showed genuine messages being dropped as replays.
+#   * `is_broadcast` was computed and discarded, so a consumer could not tell a
+#     broadcast from a direct message. `relay_receive_ex` now returns it.
+#   * No sequence-gap detection, which the oracle warns on. `relay_last_seq`
+#     and the `sequence_gaps` counter now exist.
+#   * Bounded dedup silently opened a replay window. It is off by default and
+#     now documented at the call site.
+#
+# ## Two divergences that remain, both documented rather than papered over
+#
+# 1. **Channel capacity is ignored.** The oracle's `Relay::new(node_id,
+#    capacity)` sizes its broadcast channel; majra's `relay_subscribe` hardcodes
+#    `chan_new(256)`. Since the oracle's `with_defaults` is also 256, this only
+#    diverges for a caller that asks for something else — `agnosai_relay_new`
+#    therefore records the requested capacity and reports it, so the divergence
+#    is visible rather than silent. Owed to majra.
+#
+# 2. **The message timestamp is MONOTONIC, not wall clock.** The oracle stamps
+#    `Utc::now()`; majra's `relay_msg_new` stamps `time_now_ns()`
+#    (CLOCK_MONOTONIC). `RelayMessage` is `Serialize` in the oracle, so a
+#    serialised message would carry a different kind of number — meaningless
+#    across processes. Nothing in `src/` serialises one today, which is why this
+#    is recorded rather than worked around; it must be settled before any relay
+#    message crosses a wire. Owed to majra.
+#
+# ## Ownership
+#
+# Every function here is a thin delegation. Do NOT reimplement dedup, sequencing
+# or fan-out locally — majra owns them, its soak set covers them, and a second
+# implementation would drift.
+# =========================================================================
+
+# The oracle's default broadcast-channel capacity.
+var AGNOSAI_RELAY_DEFAULT_CAPACITY = 256;
+
+# Relay wrapper heap layout — 16 bytes. Holds majra's relay plus the capacity
+# the caller asked for, which majra does not honour (see the header).
+enum AgnosaiRelayOff {
+    AGN_RLY_INNER = 0;
+    AGN_RLY_CAPACITY = 8;
+    AGN_RLY_SIZE = 16;
+}
+
+# RelayStats heap layout — 24 bytes, the oracle's three fields.
+enum AgnosaiRelayStatsOff {
+    AGN_RS_MESSAGES_SENT = 0;
+    AGN_RS_MESSAGES_RECEIVED = 8;
+    AGN_RS_DUPLICATES_DROPPED = 16;
+    AGN_RS_SIZE = 24;
+}
+
+# --- construction --------------------------------------------------------
+
+# The oracle's `Relay::new(node_id, capacity)`.
+#
+# ⚠ `capacity` is recorded but NOT applied — majra's `relay_subscribe` hardcodes
+# 256. Read it back with `agnosai_relay_capacity` to see what was asked for; the
+# effective capacity is always 256. See the header.
+fn agnosai_relay_new(node_id: Str, capacity): i64 {
+    var r = alloc(AGN_RLY_SIZE);
+    store64(r + AGN_RLY_INNER, relay_new(str_data(node_id)));
+    store64(r + AGN_RLY_CAPACITY, capacity);
+    return r;
+}
+
+# The oracle's `Relay::with_defaults` — capacity 256, which majra honours by
+# coincidence rather than by contract.
+fn agnosai_relay_with_defaults(node_id: Str): i64 {
+    return agnosai_relay_new(node_id, AGNOSAI_RELAY_DEFAULT_CAPACITY);
+}
+
+# The capacity this relay was constructed with. Informational only.
+fn agnosai_relay_capacity(r): i64 {
+    return load64(r + AGN_RLY_CAPACITY);
+}
+
+# The underlying majra relay, for callers that need an API this wrapper does not
+# expose (`relay_evict_stale_dedup`, `relay_set_max_dedup`).
+fn agnosai_relay_inner(r): i64 {
+    return load64(r + AGN_RLY_INNER);
+}
+
+# This relay's own node id.
+fn agnosai_relay_node_id(r): i64 {
+    return str_from(relay_node_id(load64(r + AGN_RLY_INNER)));
+}
+
+# --- sending -------------------------------------------------------------
+
+# Send to a specific node, or broadcast when `to` is empty. Returns the
+# sequence number assigned, which starts at 1 and increments per send.
+fn agnosai_relay_send(r, to: Str, topic: Str, payload): i64 {
+    return relay_send(load64(r + AGN_RLY_INNER), str_data(to), str_data(topic), payload);
+}
+
+# The oracle's `broadcast` — `send` with an empty target.
+fn agnosai_relay_broadcast(r, topic: Str, payload): i64 {
+    return agnosai_relay_send(r, str_from(""), topic, payload);
+}
+
+# Subscribe to inbound messages. Returns a channel.
+#
+# ⚠ Every subscriber gets its own channel and majra fans out to all of them, so
+# a subscriber that never drains will fill and block that fan-out — majra sends
+# with the relay lock released, so it blocks the sender rather than the relay.
+fn agnosai_relay_subscribe(r): i64 {
+    return relay_subscribe(load64(r + AGN_RLY_INNER));
+}
+
+# --- receiving -----------------------------------------------------------
+
+# Process an inbound message, applying dedup. Returns an IncomingMessage, or 0
+# for the oracle's `None` — our own message, one addressed elsewhere, or a
+# duplicate sequence.
+#
+# Delegates to `relay_receive_ex` rather than `relay_receive` specifically to
+# keep the broadcast flag, which is the whole reason 2.6.0 added it.
+fn agnosai_relay_receive(r, msg): i64 {
+    return relay_receive_ex(load64(r + AGN_RLY_INNER), msg);
+}
+
+# Whether an IncomingMessage arrived without an explicit target.
+fn agnosai_incoming_is_broadcast(inc): i64 {
+    return incoming_is_broadcast(inc);
+}
+
+# The RelayMessage inside an IncomingMessage.
+fn agnosai_incoming_message(inc): i64 {
+    return incoming_msg(inc);
+}
+
+# --- messages ------------------------------------------------------------
+
+# Build a RelayMessage. An empty `to` marks it a broadcast.
+fn agnosai_relay_message_new(seq, from: Str, to: Str, topic: Str, payload): i64 {
+    return relay_msg_new(seq, str_data(from), str_data(to), str_data(topic), payload);
+}
+
+# The message's sequence number.
+fn agnosai_relay_message_seq(m): i64 {
+    return load64(m);
+}
+
+# The sending node's id.
+fn agnosai_relay_message_from(m): i64 {
+    return str_from(load64(m + 8));
+}
+
+# The target node's id; empty means broadcast.
+fn agnosai_relay_message_to(m): i64 {
+    return str_from(load64(m + 16));
+}
+
+# The routing topic.
+fn agnosai_relay_message_topic(m): i64 {
+    return str_from(load64(m + 24));
+}
+
+# The payload.
+fn agnosai_relay_message_payload(m): i64 {
+    return load64(m + 32);
+}
+
+# The message timestamp.
+#
+# ⚠ MONOTONIC nanoseconds, not wall clock — see the header. Comparable within
+# this process and meaningless outside it.
+fn agnosai_relay_message_timestamp(m): i64 {
+    return load64(m + 40);
+}
+
+# --- stats ---------------------------------------------------------------
+
+# The oracle's three counters. majra tracks three more (dedup_evicted,
+# dedup_table_size, sequence_gaps) which are reachable through
+# `agnosai_relay_sequence_gaps` and the inner relay.
+fn agnosai_relay_stats(r): i64 {
+    var m = relay_stats(load64(r + AGN_RLY_INNER));
+    var s = alloc(AGN_RS_SIZE);
+    store64(s + AGN_RS_MESSAGES_SENT, load64(m));
+    store64(s + AGN_RS_MESSAGES_RECEIVED, load64(m + 8));
+    store64(s + AGN_RS_DUPLICATES_DROPPED, load64(m + 16));
+    return s;
+}
+
+# Messages this relay has sent.
+fn agnosai_relay_stats_messages_sent(s): i64 {
+    return load64(s + AGN_RS_MESSAGES_SENT);
+}
+
+# Messages accepted after dedup.
+fn agnosai_relay_stats_messages_received(s): i64 {
+    return load64(s + AGN_RS_MESSAGES_RECEIVED);
+}
+
+# Messages dropped as duplicates.
+fn agnosai_relay_stats_duplicates_dropped(s): i64 {
+    return load64(s + AGN_RS_DUPLICATES_DROPPED);
+}
+
+# How many sequence gaps have been observed — messages lost in transit.
+#
+# The oracle emits a `warn!` per gap instead. majra's `src/` does no logging at
+# all, so this is a counter; the information is the same and it is assertable,
+# which a log line is not.
+fn agnosai_relay_sequence_gaps(r): i64 {
+    return load64(relay_stats(load64(r + AGN_RLY_INNER)) + 40);
+}
+
+# The last sequence seen from `from`, or -1 if that sender is unknown.
+fn agnosai_relay_last_seq(r, from: Str): i64 {
+    return relay_last_seq(load64(r + AGN_RLY_INNER), str_data(from));
+}

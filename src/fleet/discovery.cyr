@@ -1,0 +1,158 @@
+# =========================================================================
+# fleet/discovery — pluggable node discovery backends.
+#
+# Parity oracle: rust-old/src/fleet/discovery.rs
+#
+# ## The trait becomes a function-pointer vtable
+#
+# `DiscoveryBackend` has one method, `async fn discover(&self) -> Vec<..>`.
+# Cyrius has neither traits nor futures, so it becomes the same shape
+# `src/tools/native.cyr` uses for `dyn NativeTool`: a struct holding a
+# `discover_fp` plus the backend's own `ctx`, called as `fn(ctx): vec`. One
+# implementation can back many instances, and a new backend is a function
+# rather than a language feature.
+#
+# **Dropping `async` costs nothing here.** Both shipped backends are
+# synchronous in fact — `StaticDiscovery` returns a stored list and
+# `DnsDiscovery` returns empty. The oracle's `async` exists for the DNS backend
+# it never wrote; a real one would need the same treatment every other blocking
+# call in this port gets (an OS thread under `run_pooled`), not a future.
+#
+# ## `DnsDiscovery` is a stub in the oracle too, and stays one
+#
+# It stores its SRV name and returns an empty list. That is not an omission in
+# the port: `rust-old` says so in its own doc comment — "a structural
+# placeholder — actual DNS resolution requires a DNS client dependency". The
+# port plan's note that this module "needs no sandhi at all" is the same
+# observation. **Do not read the empty result as unfinished work here**; it is
+# unfinished upstream, and finishing it is a scope decision, not a port bite.
+# `lib/net.cyr` has no SRV resolver either — verified, not assumed.
+# =========================================================================
+
+# DiscoveredNode heap layout — 24 bytes.
+enum AgnosaiDiscoveredNodeOff {
+    AGN_DN_ADDRESS = 0;
+    AGN_DN_PORT = 8;
+    AGN_DN_METADATA = 16;
+    AGN_DN_SIZE = 24;
+}
+
+# DiscoveryBackend vtable — 16 bytes. `discover_fp` is `fn(ctx): vec` and gets
+# the backend's own `ctx`, which may be 0 for a stateless backend.
+enum AgnosaiDiscoveryBackendOff {
+    AGN_DB_DISCOVER_FP = 0;
+    AGN_DB_CTX = 8;
+    AGN_DB_SIZE = 16;
+}
+
+# --- DiscoveredNode ------------------------------------------------------
+
+# The oracle's `DiscoveredNode::new` — no metadata.
+fn agnosai_discovered_node_new(address: Str, port): i64 {
+    var n = alloc(AGN_DN_SIZE);
+    store64(n + AGN_DN_ADDRESS, address);
+    store64(n + AGN_DN_PORT, port);
+    store64(n + AGN_DN_METADATA, map_new_str());
+    return n;
+}
+
+# The oracle's builder `with_metadata`. Mutates and returns, since Cyrius has no
+# move semantics to consume `self`.
+#
+# ⚠ Re-inserting a key REPLACES it, matching `HashMap::insert`, so the metadata
+# count does not grow on a repeated key.
+fn agnosai_discovered_node_with_metadata(n, key: Str, value: Str): i64 {
+    map_set(load64(n + AGN_DN_METADATA), key, value);
+    return n;
+}
+
+# The node's hostname or IP.
+fn agnosai_discovered_node_address(n): i64 {
+    return load64(n + AGN_DN_ADDRESS);
+}
+
+# The node's port.
+fn agnosai_discovered_node_port(n): i64 {
+    return load64(n + AGN_DN_PORT);
+}
+
+# The node's metadata map.
+fn agnosai_discovered_node_metadata(n): i64 {
+    return load64(n + AGN_DN_METADATA);
+}
+
+# The oracle's `socket_addr` — `"{address}:{port}"`.
+fn agnosai_discovered_node_socket_addr(n): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, load64(n + AGN_DN_ADDRESS));
+    str_builder_add_cstr(sb, ":");
+    str_builder_add_int(sb, load64(n + AGN_DN_PORT));
+    return str_builder_build(sb);
+}
+
+# --- the backend vtable --------------------------------------------------
+
+# Build a backend from a `fn(ctx): vec` and its context.
+fn agnosai_discovery_backend_new(discover_fp, ctx): i64 {
+    var b = alloc(AGN_DB_SIZE);
+    store64(b + AGN_DB_DISCOVER_FP, discover_fp);
+    store64(b + AGN_DB_CTX, ctx);
+    return b;
+}
+
+# Run a backend's discovery, returning a vec of DiscoveredNode.
+fn agnosai_discovery_discover(b): i64 {
+    return callptr(load64(b + AGN_DB_DISCOVER_FP), load64(b + AGN_DB_CTX));
+}
+
+# --- StaticDiscovery -----------------------------------------------------
+
+# ⚠ The oracle's `discover` returns `self.nodes.clone()` — a fresh Vec. A caller
+# that pushes to or truncates the result must NOT affect the backend, and would
+# if this handed back the stored vec. Reproduced by copying the element
+# pointers into a new vec; the DiscoveredNodes themselves are still shared,
+# which matches `Clone` on a struct of owned fields closely enough for a caller
+# that only reads them.
+fn _agnosai_static_discover(ctx): i64 {
+    var out = vec_new();
+    for (var i = 0; i < vec_len(ctx); i = i + 1) {
+        vec_push(out, vec_get(ctx, i));
+    }
+    return out;
+}
+
+# A backend returning a fixed list.
+fn agnosai_static_discovery_new(nodes): i64 {
+    return agnosai_discovery_backend_new(&_agnosai_static_discover, nodes);
+}
+
+# --- DnsDiscovery --------------------------------------------------------
+
+# DnsDiscovery heap layout — 8 bytes. Only the SRV name, which is all the
+# oracle stores.
+enum AgnosaiDnsDiscoveryOff {
+    AGN_DD_SRV_NAME = 0;
+    AGN_DD_SIZE = 8;
+}
+
+# ⚠ Returns an EMPTY list, as the oracle does. See the module header: the stub
+# is upstream, not here.
+fn _agnosai_dns_discover(ctx): i64 {
+    sakshi_warn("DNS SRV discovery is a stub - no DNS client dependency available", 63);
+    return vec_new();
+}
+
+# A DNS SRV backend for `srv_name`, e.g. `_agnosai._tcp.fleet.example.com`.
+fn agnosai_dns_discovery_new(srv_name: Str): i64 {
+    var d = alloc(AGN_DD_SIZE);
+    store64(d + AGN_DD_SRV_NAME, srv_name);
+    return agnosai_discovery_backend_new(&_agnosai_dns_discover, d);
+}
+
+# The SRV record name a DNS backend was built with.
+#
+# The oracle exposes `srv_name` as a public field; here it is reached through
+# the backend's ctx, so a caller that only holds the vtable can still read it.
+fn agnosai_dns_discovery_srv_name(b): i64 {
+    return load64(load64(b + AGN_DB_CTX) + AGN_DD_SRV_NAME);
+}

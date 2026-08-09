@@ -111,6 +111,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than merely accepted — both classify open-small, so their costs are
   bit-identical and the sort decides.
 
+- **`fleet/environment`** — container/VM detection and cgroup resource limits.
+  **62 assertions**, all 8 oracle tests plus 54 past them.
+
+  ⚠ **Two of the oracle's eight assert essentially nothing** —
+  `detect_returns_valid_variant` checks only that the answer is one of five,
+  and `resource_limits_runs_without_panic` asserts nothing at all. Both measure
+  whatever machine the suite runs on, because the oracle opens `/proc/1/cgroup`
+  and decides in one function. Applying standing rule 8, every decision here is
+  split from its file read, so the pure halves take their input as a parameter
+  and can be driven with inputs a real machine never produces. Three
+  mutation-verified: testing `kubepods` after `docker` (a real k8s cgroup names
+  both, so reversing misreports every node as a bare container), dropping the
+  `1<<62` v1-memory sentinel (unlimited would read as a ~9 exabyte cap), and
+  skipping digit validation (`str_to_int` answers 0 for garbage, so an
+  unreadable file would report a **0-byte** memory limit).
+
+- **`fleet/relay`** — inter-node messaging, ordered and deduplicated.
+  **58 assertions**, all 9 oracle tests plus 49 past them.
+
+  **A genuine wrapper over majra — but only because four upstream defects were
+  fixed first.** The port plan predicted a near-1:1 mapping and the *names*
+  matched; the semantics did not. Wrapping majra 2.5.3 would have shipped a
+  `relay_receive` that was not reentrant (file-scope globals *and* no lock,
+  against agnosai's 100-worker pool), a discarded `is_broadcast`, no
+  sequence-gap detection, and an undocumented replay window. All four are fixed
+  in **majra 2.6.0**; this module delegates and does not reimplement dedup,
+  sequencing or fan-out.
+
+  Two divergences remain, documented rather than hidden and owed to majra:
+  **channel capacity is ignored** (majra hardcodes 256; the wrapper records
+  what was asked so it is visible), and **the message timestamp is monotonic,
+  not wall clock** — the oracle stamps `Utc::now()`, so a serialised message
+  would carry a meaningless number across processes. Nothing serialises one
+  today. Both asserted as they *behave*, so neither reads as accidental.
+
+  Also pinned: the payload is carried **by reference**, not copied — a caller
+  mutating it after sending changes what every receiver sees.
+
+- **`fleet/discovery`** — pluggable node discovery. **29 assertions**, all 7
+  oracle tests plus 22 past them. The `DiscoveryBackend` trait becomes the same
+  function-pointer vtable `src/tools/native.cyr` uses for `dyn NativeTool`;
+  dropping `async` costs nothing because both shipped backends are synchronous
+  in fact. Mutation-verified: the oracle's `self.nodes.clone()` means a caller
+  that pushes to the result must not affect the backend — returning the stored
+  vec passes every oracle test, because none of them mutates the result.
+
+  ⚠ `DnsDiscovery` returning empty is **the oracle's own stub**, not a port gap
+  — `rust-old` says so in its doc comment, and `lib/net.cyr` has no SRV
+  resolver either (verified, not assumed).
+
 - **`fleet/placement`** — the five scheduling policies (GpuAffinity, Balanced,
   Locality, Cost, Manual) with `PlacementRequest` builders, `place` and
   `rank_nodes`. **58 assertions**, all 12 oracle tests plus 46 past them.
@@ -210,6 +260,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     produces.
 
 ### Changed
+
+- **`[deps.majra]` 2.5.3 → 2.6.0**, which fixes the four relay defects reported
+  from here — chiefly that `relay_receive` was not reentrant. Verified after
+  vendoring: the new API is present, the file-scope globals are gone from the
+  bundle, and `lib/` still diffs clean against the pin after a build.
 
 - **Toolchain pinned to cyrius 6.5.14**, which folds **sigil 3.12.6**. Three-step,
   `lib/` diffed after the sync AND after a build: 107 files, zero differences.
