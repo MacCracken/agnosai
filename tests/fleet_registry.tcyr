@@ -1,0 +1,286 @@
+# =========================================================================
+# fleet_registry.tcyr — tests for src/fleet/registry.cyr
+#
+# Oracle: rust-old/src/fleet/registry.rs's twenty `#[test]` fns, all ported.
+#
+# Past the oracle in five places it never reaches, each a silent-wrong-answer
+# risk rather than a crash:
+#
+#   * the TTL boundary is `>=`, not `>`, on BOTH thresholds — an off-by-one
+#     there leaves a node Online exactly at its deadline forever.
+#   * Offline is tested before Suspect. The oracle's TTLs overlap by
+#     construction (90s >= 30s), so reversing the arms pins a long-dead node
+#     at Suspect. The oracle's own test sleeps past both and cannot see it.
+#   * `update_statuses` only ever DEMOTES — it never restores Online. Only a
+#     heartbeat does that.
+#   * a Draining node is not exempt from going Offline (the oracle's loop has
+#     no status guard).
+#   * `gpu_count` saturates at u32::MAX rather than wrapping.
+#
+# ⚠ The timing tests use the oracle's own generous TTL gaps (50 ms / 500 ms)
+# for the same stated reason: scheduling jitter must not skip Suspect.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/fleet/registry.cyr"
+include "tests/test_helpers.cyr"
+
+# A vec of one capability string.
+fn _t_caps1(a): i64 {
+    var v = vec_new();
+    vec_push(v, str_from(a));
+    return v;
+}
+
+# How many entries of `v` have status `st`.
+fn _t_count_status(v, st): i64 {
+    var c = 0;
+    for (var i = 0; i < vec_len(v); i = i + 1) {
+        if (agnosai_node_info_status(vec_get(v, i)) == st) { c = c + 1; }
+    }
+    return c;
+}
+
+fn main(): i64 {
+    # --- oracle: register_and_retrieve ----------------------------------
+    var reg = agnosai_node_registry_new();
+    var id = agnosai_node_registry_register(reg, str_from("node-1"),
+    str_from("10.0.0.1:8080"), 2, 16384, _t_caps1("inference"));
+    var info = agnosai_node_registry_get(reg, id);
+    assert(info != 0, "the registered node is retrievable by its id");
+    assert(str_eq_cstr(agnosai_node_info_hostname(info), "node-1") == 1, "hostname round-trips");
+    assert(str_eq_cstr(agnosai_node_info_address(info), "10.0.0.1:8080") == 1, "address round-trips");
+    assert_eq(agnosai_node_info_gpu_count(info), 2, "gpu_count round-trips");
+    assert_eq(agnosai_node_info_gpu_vram_mb(info), 16384, "gpu_vram_mb round-trips");
+    assert_eq(vec_len(agnosai_node_info_capabilities(info)), 1, "one capability stored");
+    assert(str_eq_cstr(vec_get(agnosai_node_info_capabilities(info), 0), "inference") == 1,
+    "the capability string round-trips");
+    assert_eq(agnosai_node_info_status(info), AGNOSAI_NODE_ONLINE, "a fresh node is Online");
+
+    # --- oracle: default_registry_has_zero_nodes ------------------------
+    var empty = agnosai_node_registry_new();
+    assert_eq(agnosai_node_registry_count(empty), 0, "a new registry holds no nodes");
+    assert_eq(vec_len(agnosai_node_registry_list(empty)), 0, "list of an empty registry is empty");
+
+    # --- oracle: heartbeat_updates_timestamp ----------------------------
+    var r2 = agnosai_node_registry_new();
+    var id2 = agnosai_node_registry_register(r2, str_from("n"), str_from("addr"), 0, 0, vec_new());
+    var before = agnosai_node_info_last_heartbeat_instant(agnosai_node_registry_get(r2, id2));
+    var reg_at = agnosai_node_info_registered_at(agnosai_node_registry_get(r2, id2));
+    sleep_ms(5);
+    assert_eq(agnosai_node_registry_heartbeat(r2, id2), 1, "heartbeat of a known node succeeds");
+    var after = agnosai_node_info_last_heartbeat_instant(agnosai_node_registry_get(r2, id2));
+    assert(after > before, "the monotonic heartbeat instant advances");
+
+    # --- past the oracle: registered_at is NOT a second heartbeat clock -
+    # The two monotonic fields are easy to conflate, and conflating them would
+    # make every node look freshly registered on each heartbeat — which reads
+    # fine until someone measures node age or uptime off it. `registered_at` is
+    # written once, at registration, and never again.
+    assert_eq(agnosai_node_info_registered_at(agnosai_node_registry_get(r2, id2)), reg_at,
+    "a heartbeat does not move registered_at");
+    assert(reg_at <= before, "registered_at is set no later than the first heartbeat instant");
+
+    # --- oracle: heartbeat_unknown_node_returns_false -------------------
+    assert_eq(agnosai_node_registry_heartbeat(r2, str_from("no-such-node")), 0,
+    "heartbeat of an unknown node reports failure");
+
+    # --- oracle: heartbeat_updates_last_seen_chrono ---------------------
+    # The WALL-clock field, distinct from the monotonic one above. It is what a
+    # dashboard renders; liveness must never read it.
+    var hb_wall = agnosai_node_info_last_heartbeat(agnosai_node_registry_get(r2, id2));
+    assert(hb_wall > 0, "the wall-clock heartbeat is populated");
+
+    # --- oracle: status_transitions -------------------------------------
+    # The oracle's own TTLs and sleeps, for its stated reason: wide gaps so CI
+    # jitter cannot skip Suspect.
+    var r3 = agnosai_node_registry_with_ttl(50, 500);
+    var id3 = agnosai_node_registry_register(r3, str_from("n"), str_from("a"), 0, 0, vec_new());
+    assert_eq(agnosai_node_info_status(agnosai_node_registry_get(r3, id3)), AGNOSAI_NODE_ONLINE,
+    "starts Online");
+    sleep_ms(80);
+    agnosai_node_registry_update_statuses(r3);
+    assert_eq(agnosai_node_info_status(agnosai_node_registry_get(r3, id3)), AGNOSAI_NODE_SUSPECT,
+    "past the heartbeat TTL but inside the offline TTL -> Suspect");
+    sleep_ms(500);
+    agnosai_node_registry_update_statuses(r3);
+    assert_eq(agnosai_node_info_status(agnosai_node_registry_get(r3, id3)), AGNOSAI_NODE_OFFLINE,
+    "past the offline TTL -> Offline");
+
+    # --- past the oracle: the arm ORDER is observable -------------------
+    # The oracle sleeps past BOTH thresholds, so it cannot tell whether Offline
+    # is tested first. It must be: the TTLs overlap by construction, so a
+    # Suspect-first implementation pins a long-dead node at Suspect forever.
+    # 600 ms is past both 50 and 500 — Suspect-first would answer Suspect here.
+    assert_eq(agnosai_node_info_status(agnosai_node_registry_get(r3, id3)), AGNOSAI_NODE_OFFLINE,
+    "a node past BOTH thresholds is Offline, not Suspect — Offline is tested first");
+
+    # --- past the oracle: update_statuses only demotes ------------------
+    # Nothing restores Online except a heartbeat. Re-sweeping an Offline node
+    # must leave it Offline rather than re-deriving it from a fresh clock read.
+    agnosai_node_registry_update_statuses(r3);
+    assert_eq(agnosai_node_info_status(agnosai_node_registry_get(r3, id3)), AGNOSAI_NODE_OFFLINE,
+    "a second sweep does not revive an Offline node");
+
+    # --- oracle: heartbeat_resets_to_online -----------------------------
+    assert_eq(agnosai_node_registry_heartbeat(r3, id3), 1, "the Offline node accepts a heartbeat");
+    assert_eq(agnosai_node_info_status(agnosai_node_registry_get(r3, id3)), AGNOSAI_NODE_ONLINE,
+    "a heartbeat restores Online from Offline");
+
+    # --- past the oracle: Draining is NOT exempt ------------------------
+    # The oracle's sweep has no status guard, so an operator-drained node that
+    # stops heartbeating still goes Offline. Pinned because adding a guard is
+    # the obvious "improvement" and it would be a divergence.
+    var r4 = agnosai_node_registry_with_ttl(10, 30);
+    var id4 = agnosai_node_registry_register(r4, str_from("d"), str_from("d"), 0, 0, vec_new());
+    agnosai_node_info_with_status(agnosai_node_registry_get(r4, id4), AGNOSAI_NODE_DRAINING);
+    sleep_ms(50);
+    agnosai_node_registry_update_statuses(r4);
+    assert_eq(agnosai_node_info_status(agnosai_node_registry_get(r4, id4)), AGNOSAI_NODE_OFFLINE,
+    "a Draining node still goes Offline when it stops heartbeating");
+
+    # --- oracle: unregister_removes_node / _decrements_count / _nonexistent
+    var r5 = agnosai_node_registry_new();
+    var id5 = agnosai_node_registry_register(r5, str_from("x"), str_from("x"), 0, 0, vec_new());
+    assert_eq(agnosai_node_registry_count(r5), 1, "one node registered");
+    assert_eq(agnosai_node_registry_unregister(r5, id5), 1, "unregister of a known node succeeds");
+    assert_eq(agnosai_node_registry_get(r5, id5), 0, "the node is gone");
+    assert_eq(agnosai_node_registry_count(r5), 0, "unregister decrements the count");
+    assert_eq(agnosai_node_registry_unregister(r5, id5), 0,
+    "unregister of an absent node reports failure");
+    assert_eq(agnosai_node_registry_unregister(r5, str_from("never-existed")), 0,
+    "unregister of a never-registered id reports failure");
+
+    # --- oracle: list_online_filters_correctly / count_and_count_online -
+    var r6 = agnosai_node_registry_new();
+    var a1 = agnosai_node_registry_register(r6, str_from("a"), str_from("a"), 0, 0, vec_new());
+    var b1 = agnosai_node_registry_register(r6, str_from("b"), str_from("b"), 0, 0, vec_new());
+    agnosai_node_registry_register(r6, str_from("c"), str_from("c"), 0, 0, vec_new());
+    assert_eq(agnosai_node_registry_count(r6), 3, "three nodes registered");
+    assert_eq(agnosai_node_registry_count_online(r6), 3, "all three start Online");
+    agnosai_node_info_with_status(agnosai_node_registry_get(r6, a1), AGNOSAI_NODE_OFFLINE);
+    agnosai_node_info_with_status(agnosai_node_registry_get(r6, b1), AGNOSAI_NODE_SUSPECT);
+    assert_eq(agnosai_node_registry_count(r6), 3, "count is status-blind");
+    assert_eq(agnosai_node_registry_count_online(r6), 1, "count_online excludes Offline AND Suspect");
+    assert_eq(vec_len(agnosai_node_registry_list(r6)), 3, "list returns all regardless of status");
+    assert_eq(vec_len(agnosai_node_registry_list_online(r6)), 1, "list_online returns only Online");
+
+    # --- past the oracle: Suspect is not Online -------------------------
+    # Worth its own assertion: Suspect reads as a soft state, and treating it as
+    # live is the natural mistake. It is excluded.
+    assert_eq(_t_count_status(agnosai_node_registry_list_online(r6), AGNOSAI_NODE_SUSPECT), 0,
+    "no Suspect node appears in list_online");
+
+    # --- oracle: count_online_accuracy_with_mixed_statuses --------------
+    var r7 = agnosai_node_registry_new();
+    var d1 = agnosai_node_registry_register(r7, str_from("p"), str_from("p"), 0, 0, vec_new());
+    agnosai_node_registry_register(r7, str_from("q"), str_from("q"), 0, 0, vec_new());
+    agnosai_node_info_with_status(agnosai_node_registry_get(r7, d1), AGNOSAI_NODE_DRAINING);
+    assert_eq(agnosai_node_registry_count_online(r7), 1, "Draining is not Online");
+    assert_eq(agnosai_node_registry_count(r7), 2, "but it is still registered");
+
+    # --- oracle: find_by_capability_works / _excludes_offline_nodes -----
+    var r8 = agnosai_node_registry_new();
+    var g1 = agnosai_node_registry_register(r8, str_from("g1"), str_from("g1"), 1, 1024,
+    _t_caps1("inference"));
+    agnosai_node_registry_register(r8, str_from("g2"), str_from("g2"), 0, 0, _t_caps1("training"));
+    assert_eq(vec_len(agnosai_node_registry_find_by_capability(r8, str_from("inference"))), 1,
+    "one node advertises inference");
+    assert_eq(vec_len(agnosai_node_registry_find_by_capability(r8, str_from("training"))), 1,
+    "one node advertises training");
+    assert_eq(vec_len(agnosai_node_registry_find_by_capability(r8, str_from("nope"))), 0,
+    "an unadvertised capability matches nothing");
+    agnosai_node_info_with_status(agnosai_node_registry_get(r8, g1), AGNOSAI_NODE_OFFLINE);
+    assert_eq(vec_len(agnosai_node_registry_find_by_capability(r8, str_from("inference"))), 0,
+    "an Offline node keeps its capability list but is not dispatchable");
+
+    # --- past the oracle: a duplicated capability yields one hit --------
+    # The oracle's `.any()` short-circuits; a naive loop that kept scanning
+    # would push the same node twice and inflate every caller's fan-out.
+    var r9 = agnosai_node_registry_new();
+    var dupcaps = vec_new();
+    vec_push(dupcaps, str_from("inference"));
+    vec_push(dupcaps, str_from("inference"));
+    agnosai_node_registry_register(r9, str_from("dup"), str_from("dup"), 0, 0, dupcaps);
+    assert_eq(vec_len(agnosai_node_registry_find_by_capability(r9, str_from("inference"))), 1,
+    "a node listing a capability twice is returned once");
+
+    # --- oracle: register_duplicate_hostname_creates_separate_entries ---
+    var r10 = agnosai_node_registry_new();
+    var h1 = agnosai_node_registry_register(r10, str_from("same"), str_from("a"), 0, 0, vec_new());
+    var h2 = agnosai_node_registry_register(r10, str_from("same"), str_from("b"), 0, 0, vec_new());
+    assert(str_eq(h1, h2) == 0, "two registrations of one hostname mint distinct ids");
+    assert_eq(agnosai_node_registry_count(r10), 2, "and produce two separate entries");
+
+    # --- oracle: node_info_builder_compat -------------------------------
+    var n1 = agnosai_node_info_new(str_from("bare"), 4, 8192);
+    assert(str_eq_cstr(agnosai_node_info_id(n1), "bare") == 1, "id is set");
+    assert(str_eq_cstr(agnosai_node_info_hostname(n1), "bare") == 1,
+    "hostname defaults to the id");
+    assert_eq(str_len(agnosai_node_info_address(n1)), 0, "address defaults empty");
+    assert_eq(agnosai_node_info_status(n1), AGNOSAI_NODE_ONLINE, "status defaults Online");
+    assert_eq(agnosai_node_info_has_gpu(n1), 1, "a node with 4 accelerators has_gpu");
+    agnosai_node_info_with_capabilities(n1, _t_caps1("cap"));
+    assert_eq(vec_len(agnosai_node_info_capabilities(n1)), 1, "with_capabilities sets them");
+    agnosai_node_info_with_status(n1, AGNOSAI_NODE_DRAINING);
+    assert_eq(agnosai_node_info_status(n1), AGNOSAI_NODE_DRAINING, "with_status sets it");
+
+    var n0 = agnosai_node_info_new(str_from("nogpu"), 0, 0);
+    assert_eq(agnosai_node_info_has_gpu(n0), 0, "a node with 0 accelerators does not has_gpu");
+
+    # --- oracle: node_info_default_hardware_is_empty --------------------
+    assert(agnosai_node_info_hardware(n0) != 0, "hardware is populated, not null");
+    assert_eq(agnosai_hw_inventory_cpu_cores(agnosai_node_info_hardware(n0)), 0,
+    "default inventory has no cpu cores");
+    assert_eq(agnosai_hw_inventory_memory_total_mb(agnosai_node_info_hardware(n0)), 0,
+    "default inventory has no memory");
+    assert_eq(vec_len(agnosai_hw_inventory_devices(agnosai_node_info_hardware(n0))), 0,
+    "default inventory has no devices");
+
+    # --- oracle: satisfies_hardware_with_inventory ----------------------
+    var inv = agnosai_hw_inventory_new(16, 65536, vec_new());
+    var n2 = agnosai_node_info_with_hardware(agnosai_node_info_new(str_from("hw"), 0, 0), inv);
+    var req_ok = agnosai_hw_requirement_with_min_cpu_cores(agnosai_hw_requirement_new(), 8);
+    assert_eq(agnosai_node_info_satisfies_hardware(n2, req_ok), 1,
+    "16 cores satisfies a requirement for 8");
+    var req_no = agnosai_hw_requirement_with_min_cpu_cores(agnosai_hw_requirement_new(), 32);
+    assert_eq(agnosai_node_info_satisfies_hardware(n2, req_no), 0,
+    "16 cores does not satisfy a requirement for 32");
+
+    # --- past the oracle: gpu_count saturates, it does not wrap ---------
+    # The oracle's `u32::try_from(n).unwrap_or(u32::MAX)`. A truncating cast
+    # would turn 2^32 into 0 and silently mark a huge node GPU-less.
+    var r11 = agnosai_node_registry_new();
+    var big = agnosai_node_registry_register(r11, str_from("big"), str_from("big"),
+    4294967296, 0, vec_new());
+    assert_eq(agnosai_node_info_gpu_count(agnosai_node_registry_get(r11, big)), 4294967295,
+    "a gpu_count past u32::MAX clamps rather than wrapping to 0");
+    assert_eq(agnosai_node_info_has_gpu(agnosai_node_registry_get(r11, big)), 1,
+    "and the clamped node still reports has_gpu");
+
+    # --- oracle: list_vs_list_online_after_transitions ------------------
+    var r12 = agnosai_node_registry_with_ttl(10, 50);
+    var t1 = agnosai_node_registry_register(r12, str_from("a"), str_from("a"), 0, 0, vec_new());
+    agnosai_node_registry_register(r12, str_from("b"), str_from("b"), 0, 0, vec_new());
+    assert_eq(vec_len(agnosai_node_registry_list(r12)), 2, "both registered");
+    assert_eq(vec_len(agnosai_node_registry_list_online(r12)), 2, "both start Online");
+    sleep_ms(15);
+    agnosai_node_registry_update_statuses(r12);
+    agnosai_node_registry_heartbeat(r12, t1);
+    assert_eq(vec_len(agnosai_node_registry_list(r12)), 2, "list returns all regardless of status");
+    assert_eq(vec_len(agnosai_node_registry_list_online(r12)), 1,
+    "only the heartbeated node is online");
+    assert(str_eq(agnosai_node_info_id(vec_get(agnosai_node_registry_list_online(r12), 0)), t1) == 1,
+    "and it is the one that heartbeated");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

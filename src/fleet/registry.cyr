@@ -1,0 +1,353 @@
+# =========================================================================
+# fleet/registry — node inventory with heartbeat and TTL-based liveness.
+#
+# Parity oracle: rust-old/src/fleet/registry.rs
+#
+# This is the vocabulary the rest of the group speaks: `placement`, `gpu`,
+# `state` and `coordinator` all consume `NodeInfo` / `NodeStatus`, so it lands
+# before them.
+#
+# ## Two clocks, deliberately, exactly as the oracle has it
+#
+# The oracle carries BOTH a wall clock and a monotonic one, and they are not
+# interchangeable:
+#
+#   * `last_heartbeat: DateTime<Utc>` — serialised, for an operator reading a
+#     dashboard. Here `clock_epoch_secs()`.
+#   * `last_heartbeat_instant: Instant` — `#[serde(skip)]`, and the ONLY thing
+#     `update_statuses` measures against. Here `clock_now_ns()`.
+#
+# Liveness must never be decided on the wall clock: an NTP step backwards would
+# resurrect an offline node, and one forwards would evict a healthy fleet. The
+# oracle's `#[serde(skip)]` on the instant fields says the same thing — they are
+# process-local and meaningless once serialised.
+#
+# ## Not mutex-guarded, matching the oracle
+#
+# The oracle's methods take `&mut self`, so the borrow checker serialises access
+# and `NodeRegistry` carries no lock of its own; `FleetCoordinator` owns one.
+# This port matches that. ⚠ Cyrius has no borrow checker, so **a caller that
+# shares one registry across `sandhi_server_run_pooled` workers must add the
+# lock itself** — which is exactly what `src/tools/registry.cyr` had to do once
+# `run_pooled` made every worker a thread. Nothing in `src/` shares one today.
+# =========================================================================
+
+# NodeStatus. `Suspect` is "missed a heartbeat but inside the grace period" —
+# it is not a failure state, and `list_online` excludes it.
+enum AgnosaiNodeStatus {
+    AGNOSAI_NODE_ONLINE = 0;
+    AGNOSAI_NODE_SUSPECT = 1;
+    AGNOSAI_NODE_OFFLINE = 2;
+    AGNOSAI_NODE_DRAINING = 3;
+}
+
+# NodeInfo heap layout — 88 bytes. Field order mirrors the oracle's struct.
+enum AgnosaiNodeInfoOff {
+    AGN_NI_ID = 0;
+    AGN_NI_HOSTNAME = 8;
+    AGN_NI_ADDRESS = 16;
+    AGN_NI_STATUS = 24;
+    AGN_NI_GPU_COUNT = 32;
+    AGN_NI_GPU_VRAM_MB = 40;
+    AGN_NI_CAPABILITIES = 48;
+    AGN_NI_HARDWARE = 56;
+    # Wall clock, serialised.
+    AGN_NI_LAST_HEARTBEAT = 64;
+    # Monotonic, `#[serde(skip)]` in the oracle. Liveness reads these.
+    AGN_NI_REGISTERED_AT = 72;
+    AGN_NI_LAST_HEARTBEAT_INSTANT = 80;
+    AGN_NI_SIZE = 88;
+}
+
+# NodeRegistry heap layout — 24 bytes.
+enum AgnosaiNodeRegistryOff {
+    AGN_NR_NODES = 0;
+    AGN_NR_HEARTBEAT_TTL_MS = 8;
+    AGN_NR_OFFLINE_TTL_MS = 16;
+    AGN_NR_SIZE = 24;
+}
+
+# The oracle's `Duration::from_secs(30)` / `from_secs(90)`, in milliseconds.
+var AGNOSAI_NODE_HEARTBEAT_TTL_MS = 30000;
+var AGNOSAI_NODE_OFFLINE_TTL_MS = 90000;
+
+# `u32::MAX` — the oracle saturates `gpu_count` at it via
+# `u32::try_from(gpu_count).unwrap_or(u32::MAX)`.
+var AGNOSAI_NODE_GPU_COUNT_MAX = 4294967295;
+
+# --- NodeInfo ------------------------------------------------------------
+
+# The oracle's `NodeInfo::new`: hostname defaults to the id, address is empty,
+# status is Online, hardware is `HardwareInventory::default()` (0 cores, 0 MB,
+# no devices), and both instants are now.
+fn agnosai_node_info_new(id: Str, gpu_count, gpu_vram_mb): i64 {
+    var n = alloc(AGN_NI_SIZE);
+    var now = clock_now_ns();
+    store64(n + AGN_NI_ID, id);
+    store64(n + AGN_NI_HOSTNAME, id);
+    store64(n + AGN_NI_ADDRESS, str_from(""));
+    store64(n + AGN_NI_STATUS, AGNOSAI_NODE_ONLINE);
+    store64(n + AGN_NI_GPU_COUNT, gpu_count);
+    store64(n + AGN_NI_GPU_VRAM_MB, gpu_vram_mb);
+    store64(n + AGN_NI_CAPABILITIES, vec_new());
+    store64(n + AGN_NI_HARDWARE, agnosai_hw_inventory_new(0, 0, vec_new()));
+    store64(n + AGN_NI_LAST_HEARTBEAT, clock_epoch_secs());
+    store64(n + AGN_NI_REGISTERED_AT, now);
+    store64(n + AGN_NI_LAST_HEARTBEAT_INSTANT, now);
+    return n;
+}
+
+# The oracle's builder `with_hardware`. Mutates and returns, since Cyrius has no
+# move semantics to consume `self`.
+fn agnosai_node_info_with_hardware(n, hardware): i64 {
+    store64(n + AGN_NI_HARDWARE, hardware);
+    return n;
+}
+
+# The oracle's builder `with_capabilities`.
+fn agnosai_node_info_with_capabilities(n, caps): i64 {
+    store64(n + AGN_NI_CAPABILITIES, caps);
+    return n;
+}
+
+# The oracle's builder `with_status`.
+fn agnosai_node_info_with_status(n, status): i64 {
+    store64(n + AGN_NI_STATUS, status);
+    return n;
+}
+
+# The node's id.
+fn agnosai_node_info_id(n): i64 {
+    return load64(n + AGN_NI_ID);
+}
+
+# The node's hostname.
+fn agnosai_node_info_hostname(n): i64 {
+    return load64(n + AGN_NI_HOSTNAME);
+}
+
+# The node's `"host:port"` address.
+fn agnosai_node_info_address(n): i64 {
+    return load64(n + AGN_NI_ADDRESS);
+}
+
+# The node's current status.
+fn agnosai_node_info_status(n): i64 {
+    return load64(n + AGN_NI_STATUS);
+}
+
+# How many accelerators the node reports.
+fn agnosai_node_info_gpu_count(n): i64 {
+    return load64(n + AGN_NI_GPU_COUNT);
+}
+
+# Total accelerator memory in megabytes.
+fn agnosai_node_info_gpu_vram_mb(n): i64 {
+    return load64(n + AGN_NI_GPU_VRAM_MB);
+}
+
+# The node's advertised capability strings.
+fn agnosai_node_info_capabilities(n): i64 {
+    return load64(n + AGN_NI_CAPABILITIES);
+}
+
+# The node's hardware inventory.
+fn agnosai_node_info_hardware(n): i64 {
+    return load64(n + AGN_NI_HARDWARE);
+}
+
+# Wall-clock seconds of the last heartbeat — for display, never for liveness.
+fn agnosai_node_info_last_heartbeat(n): i64 {
+    return load64(n + AGN_NI_LAST_HEARTBEAT);
+}
+
+# Monotonic nanoseconds at registration.
+fn agnosai_node_info_registered_at(n): i64 {
+    return load64(n + AGN_NI_REGISTERED_AT);
+}
+
+# Monotonic nanoseconds of the last heartbeat — what liveness measures.
+fn agnosai_node_info_last_heartbeat_instant(n): i64 {
+    return load64(n + AGN_NI_LAST_HEARTBEAT_INSTANT);
+}
+
+# Whether the node's hardware satisfies a requirement.
+fn agnosai_node_info_satisfies_hardware(n, req): i64 {
+    return agnosai_hw_inventory_satisfies(load64(n + AGN_NI_HARDWARE), req);
+}
+
+# Whether the node has any accelerator.
+fn agnosai_node_info_has_gpu(n): i64 {
+    if (load64(n + AGN_NI_GPU_COUNT) > 0) { return 1; }
+    return 0;
+}
+
+# --- NodeRegistry --------------------------------------------------------
+
+# A registry with custom TTLs, in milliseconds.
+fn agnosai_node_registry_with_ttl(heartbeat_ttl_ms, offline_ttl_ms): i64 {
+    var r = alloc(AGN_NR_SIZE);
+    store64(r + AGN_NR_NODES, map_new_str());
+    store64(r + AGN_NR_HEARTBEAT_TTL_MS, heartbeat_ttl_ms);
+    store64(r + AGN_NR_OFFLINE_TTL_MS, offline_ttl_ms);
+    return r;
+}
+
+# The oracle's `NodeRegistry::new` / `Default` — 30 s heartbeat, 90 s offline.
+fn agnosai_node_registry_new(): i64 {
+    return agnosai_node_registry_with_ttl(AGNOSAI_NODE_HEARTBEAT_TTL_MS,
+    AGNOSAI_NODE_OFFLINE_TTL_MS);
+}
+
+# Register a node and return its minted id.
+#
+# ⚠ The id is a fresh UUID per call, so registering the same hostname twice
+# yields two distinct entries — the oracle behaves the same way and pins it
+# (`register_duplicate_hostname_creates_separate_entries`). A registry keyed on
+# hostname would silently collapse a re-registering node onto its own stale
+# entry, which is why the key is minted rather than derived.
+fn agnosai_node_registry_register(r, hostname: Str, address: Str, gpu_count, gpu_vram_mb,
+capabilities): i64 {
+    var id = agnosai_uuid_v4_str();
+    var now = clock_now_ns();
+    var n = alloc(AGN_NI_SIZE);
+    store64(n + AGN_NI_ID, id);
+    store64(n + AGN_NI_HOSTNAME, hostname);
+    store64(n + AGN_NI_ADDRESS, address);
+    store64(n + AGN_NI_STATUS, AGNOSAI_NODE_ONLINE);
+    # The oracle's `u32::try_from(gpu_count).unwrap_or(u32::MAX)` — a saturating
+    # cast, not a wrapping one. Reproduced rather than dropped: a caller passing
+    # a bogus count gets the clamp, not a small number from truncated bits.
+    var gc = gpu_count;
+    if (gc > AGNOSAI_NODE_GPU_COUNT_MAX) { gc = AGNOSAI_NODE_GPU_COUNT_MAX; }
+    if (gc < 0) { gc = AGNOSAI_NODE_GPU_COUNT_MAX; }
+    store64(n + AGN_NI_GPU_COUNT, gc);
+    store64(n + AGN_NI_GPU_VRAM_MB, gpu_vram_mb);
+    store64(n + AGN_NI_CAPABILITIES, capabilities);
+    store64(n + AGN_NI_HARDWARE, agnosai_hw_inventory_new(0, 0, vec_new()));
+    store64(n + AGN_NI_LAST_HEARTBEAT, clock_epoch_secs());
+    store64(n + AGN_NI_REGISTERED_AT, now);
+    store64(n + AGN_NI_LAST_HEARTBEAT_INSTANT, now);
+    map_set(load64(r + AGN_NR_NODES), id, n);
+    return id;
+}
+
+# Record a heartbeat. Returns 1, or 0 for an unknown node.
+#
+# A heartbeat resets the status to Online unconditionally, so a Suspect or
+# Offline node recovers the moment it reports in — the oracle does the same, and
+# `heartbeat_resets_to_online` pins it.
+fn agnosai_node_registry_heartbeat(r, node_id: Str): i64 {
+    var n = map_get(load64(r + AGN_NR_NODES), node_id);
+    if (n == 0) { return 0; }
+    store64(n + AGN_NI_LAST_HEARTBEAT_INSTANT, clock_now_ns());
+    store64(n + AGN_NI_LAST_HEARTBEAT, clock_epoch_secs());
+    store64(n + AGN_NI_STATUS, AGNOSAI_NODE_ONLINE);
+    return 1;
+}
+
+# Remove a node. Returns 1 if it existed, 0 otherwise.
+fn agnosai_node_registry_unregister(r, node_id: Str): i64 {
+    var m = load64(r + AGN_NR_NODES);
+    if (map_get(m, node_id) == 0) { return 0; }
+    map_delete(m, node_id);
+    return 1;
+}
+
+# Look up a node by id, or 0 for the oracle's `None`.
+fn agnosai_node_registry_get(r, node_id: Str): i64 {
+    return map_get(load64(r + AGN_NR_NODES), node_id);
+}
+
+# Every registered node, any status.
+#
+# ⚠ Order is the map's slot order, not insertion order — the oracle returns
+# `HashMap::values()`, which is likewise arbitrary. Do not depend on it.
+fn agnosai_node_registry_list(r): i64 {
+    var m = load64(r + AGN_NR_NODES);
+    var out = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            vec_push(out, _agnosai_map_slot_val(m, i));
+        }
+    }
+    return out;
+}
+
+# Only nodes whose status is exactly Online — Suspect and Draining are excluded.
+fn agnosai_node_registry_list_online(r): i64 {
+    var m = load64(r + AGN_NR_NODES);
+    var out = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            var n = _agnosai_map_slot_val(m, i);
+            if (load64(n + AGN_NI_STATUS) == AGNOSAI_NODE_ONLINE) { vec_push(out, n); }
+        }
+    }
+    return out;
+}
+
+# Sweep every node and demote it by heartbeat age.
+#
+# ⚠ Offline is tested FIRST, and the order is observable: the two TTLs overlap
+# by construction (90 s >= 30 s), so testing Suspect first would leave a node
+# 100 s stale sitting at Suspect forever. Matches the oracle's if/else-if.
+#
+# ⚠ This only ever demotes. A node already Draining is *not* exempt — the
+# oracle's loop has no status guard, so an operator-drained node that stops
+# heartbeating still becomes Offline. Reproduced as-is.
+fn agnosai_node_registry_update_statuses(r): i64 {
+    var m = load64(r + AGN_NR_NODES);
+    var now = clock_now_ns();
+    var hb_ttl = load64(r + AGN_NR_HEARTBEAT_TTL_MS);
+    var off_ttl = load64(r + AGN_NR_OFFLINE_TTL_MS);
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            var n = _agnosai_map_slot_val(m, i);
+            var elapsed_ms = (now - load64(n + AGN_NI_LAST_HEARTBEAT_INSTANT)) / 1000000;
+            if (elapsed_ms >= off_ttl) {
+                store64(n + AGN_NI_STATUS, AGNOSAI_NODE_OFFLINE);
+            } else {
+                if (elapsed_ms >= hb_ttl) {
+                    store64(n + AGN_NI_STATUS, AGNOSAI_NODE_SUSPECT);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# Total registered nodes, any status.
+fn agnosai_node_registry_count(r): i64 {
+    return map_size(load64(r + AGN_NR_NODES));
+}
+
+# How many nodes are Online.
+fn agnosai_node_registry_count_online(r): i64 {
+    return vec_len(agnosai_node_registry_list_online(r));
+}
+
+# Online nodes advertising `capability`.
+#
+# ⚠ Online-only, and the oracle is explicit about it — an Offline node keeps its
+# capability list, so a caller that skipped the status test would dispatch work
+# to a dead node. `find_by_capability_excludes_offline_nodes` pins it.
+fn agnosai_node_registry_find_by_capability(r, capability: Str): i64 {
+    var m = load64(r + AGN_NR_NODES);
+    var out = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            var n = _agnosai_map_slot_val(m, i);
+            if (load64(n + AGN_NI_STATUS) == AGNOSAI_NODE_ONLINE) {
+                var caps = load64(n + AGN_NI_CAPABILITIES);
+                for (var j = 0; j < vec_len(caps); j = j + 1) {
+                    if (str_eq(vec_get(caps, j), capability) == 1) {
+                        vec_push(out, n);
+                        j = vec_len(caps);
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}

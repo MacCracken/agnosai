@@ -111,6 +111,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than merely accepted — both classify open-small, so their costs are
   bit-identical and the sort decides.
 
+- **`fleet/registry`** — the node vocabulary `placement`, `gpu`, `state` and
+  `coordinator` all speak, so it lands before them. `NodeInfo` / `NodeStatus` /
+  `NodeRegistry`: register, heartbeat, unregister, get, list, list_online,
+  update_statuses, count, count_online, find_by_capability.
+
+  `tests/fleet_registry.tcyr` carries **65 assertions** — all 20 oracle
+  `#[test]` fns plus 45 the Rust tests never reach:
+
+  - **The `update_statuses` arm order is observable.** The oracle sleeps past
+    *both* thresholds, so its own test cannot tell whether Offline is checked
+    first. It must be: the TTLs overlap by construction (90 s ≥ 30 s), so a
+    Suspect-first implementation pins a long-dead node at Suspect forever.
+  - **The sweep only ever demotes** — a second sweep must not revive an Offline
+    node; only a heartbeat restores Online.
+  - **A `Draining` node is not exempt** from going Offline. The oracle's loop has
+    no status guard, and adding one is the obvious "improvement" that would be a
+    divergence.
+  - **`gpu_count` saturates at `u32::MAX`**, reproducing
+    `u32::try_from(n).unwrap_or(u32::MAX)`. A truncating cast turns 2³² into 0
+    and silently marks a huge node GPU-less.
+  - **A capability listed twice yields one hit** — the oracle's `.any()`
+    short-circuits, and a naive loop would double-count and inflate fan-out.
+  - **`Suspect` is not `Online`** — it reads as a soft state and treating it as
+    live is the natural mistake.
+
+  Two clocks are carried deliberately, as the oracle does: `clock_epoch_secs()`
+  for the serialised `last_heartbeat`, and `clock_now_ns()` for the
+  `#[serde(skip)]` instants that are the **only** thing liveness measures. An
+  NTP step must never resurrect an offline node or evict a healthy fleet.
+
+  ⚠ Not mutex-guarded, matching the oracle (whose `&mut self` lets the borrow
+  checker serialise). Cyrius has no borrow checker, so a caller sharing one
+  registry across `run_pooled` workers must add the lock — exactly what
+  `src/tools/registry.cyr` had to do. Nothing in `src/` shares one today.
+
   Three notes worth keeping:
   - `_agnosai_contains_ci` walks the haystack in place rather than lowercasing
     into a buffer. `lib/string.cyr`'s `str_lower_cstr` allocates per call inside
@@ -124,6 +159,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     produces.
 
 ### Changed
+
+- **Toolchain pinned to cyrius 6.5.12**, which folds **sigil 3.12.4** — the
+  release that fixes the RSA-verify authentication bypass reported from here.
+  Three-step, `lib/` diffed: 107 files, zero content differences.
+
+  ⚠ **The serialising mutex in `src/server/auth.cyr` STAYS.** Re-running the
+  staging that sigil 3.12.4 asks consumers to run — mutex removed, two threads
+  pinned to one lane, 2,000 verifications each:
+
+  | sigil | valid verified (of 2,000) | forged accepted |
+  |---|---|---|
+  | 3.12.2 | 1 | **888** |
+  | 3.12.3 | 1 | 0 |
+  | **3.12.4** | **712** | 0 |
+
+  The **bypass is closed** — forged accepts are 0 from 3.12.3 onward. The
+  fail-closed race is 99.95% → 64%, not gone. Remaining shared state is
+  `bn_mod` (`sigil/src/bignum.cyr:313-317`), whose `_bn_modrem`/`_bn_modn1` are
+  still lane-banked; `bn_mont_modexp_pub` calls it for the R² setup, so the
+  public verify path still reaches a lane. Reported upstream with the caveat
+  that the CRT sign path scrubs that lane at `rsa.cyr:601`, so localising it
+  must zero the local before return.
+
+  Two traps this bump hit, both now in `state.md`: `lib sync --full` skips the
+  hand-vendored `lib/unicode/` subtree, and `[deps.sigil]` tracks the **fold**
+  rather than sigil's tags — bumping the tag alone changes nothing, and
+  `cyrius deps` falls back to stale bytes *silently* when a tag does not resolve.
 
 - **Toolchain pinned to cyrius 6.5.11** (was 6.5.10), by the full three-step
   (`deps --no-lock` → `lib sync --full` → `deps --lock`) with `lib/` **diffed**

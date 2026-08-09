@@ -12,11 +12,25 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.11` (`cyrius.cyml`) — bumped 2026-08-08 by the full
-  three-step, `lib/` **diffed** against the snapshot rather than trusting a green
-  `lib sync`. Result: 100 files synced, zero content differences, the only
-  `Only in lib/` entries being the six declared git deps (ai-hwaccel, bote-core,
-  kavach, libro, majra, tyche). `check-clean` OK, 107 files.
+- **Cyrius pin**: `6.5.12` (`cyrius.cyml`) — bumped 2026-08-08, three-step,
+  `lib/` **diffed** against the snapshot: 107 files, **zero content
+  differences**, the only `Only in lib/` entries being the six declared git deps.
+  Folds **sigil 3.12.4**.
+
+  ⚠ **`lib sync --full` still skips `lib/unicode/`** — it copies only the top
+  level, so the subtree must be copied by hand after every bump
+  (`cp ~/.cyrius/versions/<pin>/lib/unicode/*.cyr lib/unicode/`). And the
+  lockfile is written **last**, after any hand copy, or `deps --verify` fails on
+  a hash mismatch.
+
+  ⚠ **`[deps.sigil]` tracks the FOLD, not sigil's tags.** `sigil.cyr` is folded
+  into the cyrius stdlib snapshot, and `lib sync --full` runs *after* `deps`, so
+  it overwrites the git-dep copy. Bumping the tag alone changes nothing — proven
+  on 2026-08-08, when the tag was moved to 3.12.3 and `lib/sigil.cyr` stayed at
+  3.12.2. Worse, `cyrius deps` fell back to the stale bytes **silently** when the
+  tag did not resolve.
+
+  Previously **6.5.11**, bumped the same day: 100 files synced, zero differences.
 
   **What 6.5.11 lands on agnosai: `lib/fs.cyr`'s bump-allocator leak.** `is_dir`
   and `dir_list` took their getdents scratch from `alloc()`, which the default
