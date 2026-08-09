@@ -1,0 +1,336 @@
+# =========================================================================
+# telemetry_mod.tcyr — tests for src/telemetry/mod.cyr
+#
+# Oracle: rust-old/src/telemetry/mod.rs's four `#[test]` fns. All four are
+# **vacuous** — one asserts a constant equals its own literal, and the other
+# three call something and discard the result (`let _ = result;`, `drop(guard);
+# // Should not panic`, `let _ = filter;`). They are ported so the count is
+# honest, and then the module is actually tested.
+#
+# What is tested past them is the JSON line, because that is the whole point of
+# this module: the port emits it itself through `sakshi_set_emit_hook` rather
+# than through a subscriber, so **the byte layout is the parity surface**. A
+# formatter that produced valid-but-different JSON would satisfy every oracle
+# test and break every log shipper.
+#
+#   * the exact key order and shape `tracing_subscriber::fmt().json()` emits
+#   * RFC 3339 with microseconds, over leap years, month ends and midnight
+#   * JSON escaping — quote, backslash, newline, tab, control bytes
+#   * `RUST_LOG` parsing, including the multi-directive forms the port
+#     deliberately refuses rather than half-applying
+#
+# ⚠ **Not testable here**: the hook itself writes to fd 2, so `format_json` is
+# split out and driven directly. Installing the hook and capturing fd 2 would
+# need a pipe and a second thread; the write is one `syscall(SYS_WRITE, 2, ..)`
+# over a buffer this suite already checks.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/telemetry/mod.cyr"
+include "tests/test_helpers.cyr"
+
+# Format one line and return it as a Str for comparison.
+fn _t_json(epoch_ns, level, msg): i64 {
+    var buf = alloc(4096);
+    var n = agnosai_telemetry_format_json(buf, 4096, epoch_ns, level, msg, strlen(msg));
+    return str_new(buf, n);
+}
+
+# The same, for a message carrying bytes a literal cannot hold.
+fn _t_json_raw(epoch_ns, level, data, len): i64 {
+    var buf = alloc(4096);
+    var n = agnosai_telemetry_format_json(buf, 4096, epoch_ns, level, data, len);
+    return str_new(buf, n);
+}
+
+# The exact line `tracing_subscriber::fmt().json()` produces, assembled from
+# short pieces so the byte-exact literal does not run past 120 columns. The
+# assembly is the point: change any piece and the comparison fails.
+fn _t_expect(ts_lit, level_lit, msg_lit): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"timestamp\":\"");
+    str_builder_add_cstr(sb, ts_lit);
+    str_builder_add_cstr(sb, "\",\"level\":\"");
+    str_builder_add_cstr(sb, level_lit);
+    str_builder_add_cstr(sb, "\",\"fields\":{\"message\":\"");
+    str_builder_add_cstr(sb, msg_lit);
+    str_builder_add_cstr(sb, "\"},\"target\":\"agnosai\"}\n");
+    return str_builder_build(sb);
+}
+
+# Just the `timestamp` value, for the date tests. `{"timestamp":"` is 14
+# bytes, and the RFC 3339 value that follows is always 27.
+fn _t_ts(epoch_ns): i64 {
+    var line = _t_json(epoch_ns, SK_INFO, "x");
+    return str_new(str_data(line) + 14, 27);
+}
+
+fn main(): i64 {
+    _agnosai_telemetry_init_mdays();
+
+    # --- oracle: default_service_name_is_agnosai ------------------------
+    assert(str_eq_cstr(agnosai_telemetry_default_service_name(), "agnosai") == 1,
+    "the default service name is agnosai");
+
+    # --- oracle: otlp_endpoint_from_env_returns_none_when_unset ---------
+    # The oracle's own body is `let result = otlp_endpoint_from_env(); let _ =
+    # result;` — it asserts nothing, because the test process may have the
+    # variable set. Reproduced as a call that must not fault, and then made
+    # meaningful below by driving the parse directly.
+    var ep = agnosai_otlp_endpoint_from_env();
+    assert(ep >= 0, "reading the OTLP endpoint from the environment does not fault");
+
+    # --- oracle: tracing_guard_can_be_created_without_otel --------------
+    var g = agnosai_telemetry_init_tracing(0);
+    assert(g != 0, "a guard is returned with no OTLP endpoint");
+    assert_eq(agnosai_tracing_guard_otel_active(g), 0, "and it holds no exporter");
+    assert_eq(agnosai_telemetry_shutdown(g), 0, "shutting it down is a no-op");
+
+    # --- past the oracle: the OTLP guard ---------------------------------
+    var g2 = agnosai_telemetry_init_tracing(str_from("http://localhost:4317"));
+    assert_eq(agnosai_tracing_guard_otel_active(g2), 1, "an endpoint yields a live exporter");
+    assert(agnosai_tracing_guard_service_name(g2) != 0, "carrying a service name");
+    agnosai_telemetry_shutdown(g2);
+    assert_eq(agnosai_tracing_guard_otel_active(g2), 0, "which shutdown releases");
+    assert_eq(agnosai_telemetry_shutdown(g2), 0, "and a second shutdown is a no-op");
+
+    # --- past the oracle: the env-reading wrappers' invariants -----------
+    # None of these can be driven with a chosen value — `getenv` reads
+    # `/proc/self/environ` and there is no `setenv` — so what is pinned is what
+    # holds for *any* environment. That is not nothing: each feeds something
+    # that would misbehave on a bad answer.
+
+    # `service_name` feeds the OTLP resource attributes; a 0 here would fault
+    # the exporter rather than degrade it.
+    var sn = agnosai_telemetry_service_name();
+    assert(sn != 0, "the service name is never 0, whatever the environment");
+    assert(str_len(sn) >= 0, "and is a readable Str");
+
+    # ⚠ `env_filter_level`'s result is handed straight to `sakshi_set_level`,
+    # so it must be -1 (meaning "use the default") or a real level — never a
+    # value that would silently set an out-of-range threshold.
+    var lvl = agnosai_telemetry_env_filter_level();
+    assert(lvl >= 0 - 1, "the env filter level is never below -1");
+    assert(lvl <= SK_TRACE, "and never above TRACE — it is fed to sakshi_set_level");
+
+    # Installing the formatter is idempotent, which matters because
+    # `init_tracing` may run after something else already set a hook.
+    assert_eq(agnosai_telemetry_init_json_logging(), 0, "installing the JSON hook succeeds");
+    assert_eq(agnosai_telemetry_init_json_logging(), 0, "and installing it twice is a no-op");
+
+    # Put logging back the way the rest of the suite expects.
+    sakshi_clear_emit_hook();
+    sakshi_set_level(SK_INFO);
+
+    # --- oracle: default_env_filter_parses -------------------------------
+    # The oracle builds `EnvFilter::new("agnosai=info")` and discards it. Here
+    # the equivalent is that the string the port falls back to maps to INFO.
+    assert_eq(_agnosai_telemetry_level_of("info", 4), SK_INFO,
+    "the fallback directive's level is INFO");
+
+    # --- past the oracle: every level word, and case folding -------------
+    assert_eq(_agnosai_telemetry_level_of("trace", 5), SK_TRACE, "trace maps");
+    assert_eq(_agnosai_telemetry_level_of("debug", 5), SK_DEBUG, "debug maps");
+    assert_eq(_agnosai_telemetry_level_of("warn", 4), SK_WARN, "warn maps");
+    assert_eq(_agnosai_telemetry_level_of("error", 5), SK_ERROR, "error maps");
+    assert_eq(_agnosai_telemetry_level_of("INFO", 4), SK_INFO, "uppercase maps too");
+    assert_eq(_agnosai_telemetry_level_of("WaRn", 4), SK_WARN, "and mixed case");
+    # ⚠ `tracing` takes `warn`, not `warning` — accepting the latter would let a
+    # typo silently become a level the oracle would have rejected.
+    assert_eq(_agnosai_telemetry_level_of("warning", 7), 0 - 1, "'warning' is NOT a level");
+    assert_eq(_agnosai_telemetry_level_of("", 0), 0 - 1, "nor is the empty string");
+    assert_eq(_agnosai_telemetry_level_of("inf", 3), 0 - 1, "nor a prefix of one");
+    assert_eq(_agnosai_telemetry_level_of("infoo", 5), 0 - 1, "nor a superstring");
+
+    # --- past the oracle: RUST_LOG directive parsing ---------------------
+    # The decision half is split from the `getenv` so it can be driven with
+    # inputs a CI runner's environment never produces.
+    assert_eq(agnosai_telemetry_parse_directive("debug", 5), SK_DEBUG,
+    "a bare level is honoured");
+    assert_eq(agnosai_telemetry_parse_directive("agnosai=debug", 13), SK_DEBUG,
+    "and so is a directive naming this crate");
+    assert_eq(agnosai_telemetry_parse_directive("AGNOSAI=WARN", 12), SK_WARN,
+    "case-insensitively on both halves");
+    assert_eq(agnosai_telemetry_parse_directive("", 0), 0 - 1, "an empty RUST_LOG is ignored");
+    assert_eq(agnosai_telemetry_parse_directive("hoosh=debug", 11), 0 - 1,
+    "a directive for another crate is ignored — not applied globally");
+    assert_eq(agnosai_telemetry_parse_directive("nonsense", 8), 0 - 1,
+    "an unparseable value is ignored");
+
+    # ⚠ A multi-target filter is refused OUTRIGHT rather than partially
+    # applied. `agnosai=warn,hoosh=trace` asks for two different levels and
+    # sakshi has one; honouring the first would silently raise verbosity for a
+    # target the operator had turned down, which is worse than ignoring it.
+    assert_eq(agnosai_telemetry_parse_directive("agnosai=warn,hoosh=trace", 24), 0 - 1,
+    "a comma-separated filter is refused, not half-applied");
+    assert_eq(agnosai_telemetry_parse_directive("agnosai=debug,", 14), 0 - 1,
+    "even with an empty second directive");
+    assert_eq(agnosai_telemetry_parse_directive("a=b=c", 5), 0 - 1,
+    "and so is a second '=' — that is not a directive this binary can honour");
+    assert_eq(agnosai_telemetry_parse_directive("agnosai=", 8), 0 - 1,
+    "a directive with no level is ignored");
+    assert_eq(agnosai_telemetry_parse_directive("=info", 5), 0 - 1,
+    "as is one with no target");
+
+    # --- past the oracle: the ASCII fold is ASCII-only -------------------
+    # Folding by `| 32` would map '[' (0x5B) onto '{' and '@' onto '`'. The
+    # guarded range is what stops that.
+    assert_eq(_agnosai_telemetry_eq_ci("INFO", 4, "info"), 1, "letters fold");
+    assert_eq(_agnosai_telemetry_eq_ci("[", 1, "{"), 0, "'[' does not fold to '{'");
+    assert_eq(_agnosai_telemetry_eq_ci("@", 1, "`"), 0, "nor '@' to backtick");
+    assert_eq(_agnosai_telemetry_eq_ci("ab", 2, "abc"), 0, "a length mismatch is unequal");
+
+    # --- the JSON line ---------------------------------------------------
+    # 1786320000 is 2026-08-10T00:00:00Z.
+    assert(str_eq(_t_json(1786320000123456789, SK_INFO, "AgnosAI server starting"),
+    _t_expect("2026-08-10T00:00:00.123456Z", "INFO", "AgnosAI server starting")) == 1,
+    "the line is byte-exact against tracing_subscriber's JSON layout");
+
+    # ⚠ Every line ends with exactly one newline — a log shipper reads one
+    # object per line, and a missing or doubled terminator breaks framing.
+    var line = _t_json(1786320000000000000, SK_WARN, "x");
+    assert_eq(load8(str_data(line) + str_len(line) - 1), 10, "the line ends with a newline");
+    assert_eq(load8(str_data(line) + str_len(line) - 2), 125, "preceded by the closing brace");
+
+    # --- level names -----------------------------------------------------
+    assert(str_eq_cstr(str_from(_agnosai_telemetry_level_name(SK_ERROR)), "ERROR") == 1, "ERROR renders");
+    assert(str_eq_cstr(str_from(_agnosai_telemetry_level_name(SK_WARN)), "WARN") == 1, "WARN renders");
+    assert(str_eq_cstr(str_from(_agnosai_telemetry_level_name(SK_DEBUG)), "DEBUG") == 1, "DEBUG renders");
+    assert(str_eq_cstr(str_from(_agnosai_telemetry_level_name(SK_TRACE)), "TRACE") == 1, "TRACE renders");
+    # ⚠ sakshi has FATAL and `tracing` does not. It is emitted as FATAL rather
+    # than folded into ERROR — collapsing it would make a process-ending event
+    # indistinguishable from a handled one.
+    assert(str_eq_cstr(str_from(_agnosai_telemetry_level_name(SK_FATAL)), "FATAL") == 1,
+    "FATAL renders as itself, not as ERROR");
+    assert(str_eq_cstr(str_from(_agnosai_telemetry_level_name(99)), "UNKNOWN") == 1,
+    "and an unmapped level is UNKNOWN rather than a stray byte");
+
+    # --- timestamps ------------------------------------------------------
+    assert(str_eq_cstr(_t_ts(0), "1970-01-01T00:00:00.000000Z") == 1, "the epoch itself");
+    assert(str_eq_cstr(_t_ts(951782400000000000), "2000-02-29T00:00:00.000000Z") == 1,
+    "2000-02-29 — the century leap year the /100 rule would drop");
+    assert(str_eq_cstr(_t_ts(1709164800000000000), "2024-02-29T00:00:00.000000Z") == 1,
+    "and an ordinary leap day");
+    assert(str_eq_cstr(_t_ts(1735689599000000000), "2024-12-31T23:59:59.000000Z") == 1,
+    "the last second of a leap year");
+    assert(str_eq_cstr(_t_ts(1767225600000000000), "2026-01-01T00:00:00.000000Z") == 1,
+    "and the first of the next");
+
+    # ⚠ Sub-second digits are zero-PADDED, not truncated: 1 ms must render as
+    # `.001000`, not `.1000` or `.1`.
+    assert(str_eq_cstr(_t_ts(1000000), "1970-01-01T00:00:00.001000Z") == 1,
+    "one millisecond is .001000");
+    assert(str_eq_cstr(_t_ts(1000), "1970-01-01T00:00:00.000001Z") == 1,
+    "one microsecond is .000001");
+    assert(str_eq_cstr(_t_ts(999), "1970-01-01T00:00:00.000000Z") == 1,
+    "and sub-microsecond truncates rather than rounding up");
+    assert(str_eq_cstr(_t_ts(999999999), "1970-01-01T00:00:00.999999Z") == 1,
+    "the last microsecond before a second rolls");
+
+    # ⚠ Every field is fixed-width. A single-digit month or day must be padded,
+    # or the timestamp stops being RFC 3339 and stops sorting lexicographically.
+    assert(str_eq_cstr(_t_ts(1767225600000000000), "2026-01-01T00:00:00.000000Z") == 1,
+    "January is 01, not 1");
+    assert_eq(str_len(_t_ts(0)), 27, "the timestamp is always 27 bytes");
+    assert_eq(str_len(_t_ts(1786320000123456789)), 27, "whatever the value");
+
+    # --- JSON escaping ---------------------------------------------------
+    assert(str_eq(_t_json(0, SK_INFO, "say \"hi\""),
+    _t_expect("1970-01-01T00:00:00.000000Z", "INFO", "say \\\"hi\\\"")) == 1,
+    "a quote in the message is escaped — otherwise the line is not parseable");
+
+    var bs = alloc(8);
+    store8(bs, 92);
+    store8(bs + 1, 110);
+    assert(_t_json_raw(0, SK_INFO, bs, 2) != 0, "a literal backslash-n formats");
+    var bsline = _t_json_raw(0, SK_INFO, bs, 2);
+    assert(str_contains_cstr(bsline, "\\\\n") == 1,
+    "a literal backslash is doubled, so it does not become an escape");
+
+    var ctl = alloc(8);
+    store8(ctl, 97);
+    store8(ctl + 1, 10);
+    store8(ctl + 2, 98);
+    assert(str_contains_cstr(_t_json_raw(0, SK_INFO, ctl, 3), "a\\nb") == 1,
+    "a newline becomes \\n, keeping one JSON object per line");
+    store8(ctl + 1, 13);
+    assert(str_contains_cstr(_t_json_raw(0, SK_INFO, ctl, 3), "a\\rb") == 1,
+    "a carriage return becomes \\r");
+    store8(ctl + 1, 9);
+    assert(str_contains_cstr(_t_json_raw(0, SK_INFO, ctl, 3), "a\\tb") == 1,
+    "a tab becomes \\t");
+    store8(ctl + 1, 1);
+    assert(str_contains_cstr(_t_json_raw(0, SK_INFO, ctl, 3), "a\\u0001b") == 1,
+    "and any other control byte becomes a \\u escape");
+    store8(ctl + 1, 27);
+    assert(str_contains_cstr(_t_json_raw(0, SK_INFO, ctl, 3), "a\\u001bb") == 1,
+    "with lowercase hex, as tracing emits — ESC is 0x1b");
+    store8(ctl + 1, 31);
+    assert(str_contains_cstr(_t_json_raw(0, SK_INFO, ctl, 3), "a\\u001fb") == 1,
+    "0x1f is the last byte that needs escaping");
+    store8(ctl + 1, 32);
+    assert(str_contains_cstr(_t_json_raw(0, SK_INFO, ctl, 3), "a b") == 1,
+    "and 0x20 — space — is the first that does not");
+
+    # ⚠ Non-ASCII passes through unescaped: RFC 8259 permits raw UTF-8 inside a
+    # string, and escaping it would change bytes a consumer compares.
+    var utf = alloc(8);
+    store8(utf, 0xC3);
+    store8(utf + 1, 0xA9);
+    assert(str_contains_cstr(_t_json_raw(0, SK_INFO, utf, 2), "\"message\":\"") == 1,
+    "a UTF-8 message still formats");
+    assert_eq(str_len(_t_json_raw(0, SK_INFO, utf, 2)), str_len(_t_json(0, SK_INFO, "ab")),
+    "and its two bytes pass through unescaped — same length as two ASCII bytes");
+
+    # --- the message is length-delimited, not NUL-terminated -------------
+    # sakshi hands the hook a pointer and a length; the message may carry an
+    # embedded NUL and must not be truncated at it.
+    var nul = alloc(8);
+    store8(nul, 97);
+    store8(nul + 1, 0);
+    store8(nul + 2, 98);
+    assert(str_contains_cstr(_t_json_raw(0, SK_INFO, nul, 3), "\\u0000b") == 1,
+    "an embedded NUL is escaped and the message continues past it");
+
+    # --- the buffer bound ------------------------------------------------
+    # A message longer than the buffer must stop short, not run past `cap`.
+    var big = alloc(9000);
+    for (var i = 0; i < 9000; i = i + 1) { store8(big + i, 65); }
+    var small = alloc(4096);
+    var bn = agnosai_telemetry_format_json(small, 4096, 0, SK_INFO, big, 9000);
+    assert(bn <= 4096, "an oversized message is truncated inside the buffer");
+    assert_eq(load8(small + bn - 1), 10, "and the line still ends with a newline");
+    assert(str_contains_cstr(str_new(small, bn), "\"target\":\"agnosai\"") == 1,
+    "with the closing fields intact — truncation cannot lose the JSON tail");
+
+    # ⚠ Only the MESSAGE is bounded against `cap` — the prefix, timestamp,
+    # level and tail are written unconditionally. A buffer too small to hold
+    # them is therefore refused outright rather than half-written, which would
+    # be a stack smash in the hook's frame.
+    var tiny = alloc(AGNOSAI_TELEMETRY_MIN_CAP);
+    store8(tiny, 88);
+    assert_eq(agnosai_telemetry_format_json(tiny, AGNOSAI_TELEMETRY_MIN_CAP - 1, 0,
+    SK_INFO, "hello", 5), 0, "a buffer below the minimum is refused, not partly written");
+    assert_eq(load8(tiny), 88, "and nothing is written into it");
+    assert_eq(agnosai_telemetry_format_json(tiny, 0, 0, SK_INFO, "hello", 5), 0,
+    "a zero-length buffer likewise");
+    assert(agnosai_telemetry_format_json(tiny, AGNOSAI_TELEMETRY_MIN_CAP, 0,
+    SK_INFO, "hello", 5) > 0, "and the minimum itself does produce a line");
+    assert_eq(AGNOSAI_TELEMETRY_LINE_CAP, 4096,
+    "the hook's buffer is PIPE_BUF — a larger one would give up atomic writes to a pipe");
+
+    # --- the log target --------------------------------------------------
+    assert(str_eq_cstr(str_from(agnosai_telemetry_log_target()), "agnosai") == 1,
+    "the target is the crate name");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

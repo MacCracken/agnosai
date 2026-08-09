@@ -92,10 +92,11 @@ serde, zero traits, zero I/O — it exercises tyche, f64-as-bit-patterns, and th
   prerequisite that `message`, `task` and `crew` all key on. 100% reference
   coverage across the project. The money-representation question is settled (integer micro-USD),
   and converting to f64 only at the wire boundary means the wire stays
-  byte-identical to serde. Two documented exclusions, both outside the v2.0.0
-  parity bar: `AgentDefinition::personality` (bhava, post-v2 — still emits
+  byte-identical to serde. Two things still absent, and ⚠ this line used to
+  call them "exclusions ... outside the v2.0.0 parity bar" — **retired**:
+  `AgentDefinition::personality` (bhava, the one real carve-out — still emits
   `null` for wire parity) and the `#[cfg(feature = "hwaccel")]` half of
-  `resource.rs`.
+  `resource.rs`, which is owed under M11.
 
 **M2 exit met:** learning + core tests green against `rust-old/` as oracle.
 
@@ -564,18 +565,33 @@ pinned by an assertion so a later reader cannot "fix" it by accident.
 
 ### M9 — `telemetry` (Phase 8)
 
-**All 322 lines, plus the logging init in `main.rs`.** Two distinct pieces:
+**All 322 lines, plus the logging init in `main.rs`.** Three pieces, one done:
 
-- **OTLP export** — copy hoosh's proven `otlp.cyr` (199 lines); the one place
-  the remote seam does NOT apply, since export is in-process. Thread-local trace
-  context is **mandatory** under `run_pooled`: sakshi's span stack and trace id
-  are process globals.
-- **JSON stderr logging + `EnvFilter`** — the oracle runs
-  `tracing_subscriber::fmt().with_env_filter(..agnosai=info..).json().init()`
-  ungated. sakshi has neither, so this starts as a **sakshi filing** and is
-  consumed when it lands. Until then the divergence is stated at
-  `src/main.cyr:22-26`.
-- **`genai.rs`** lives here, not in `llm`.
+- **JSON stderr logging + `EnvFilter`** — ✅ **done 2026-08-08**
+  (`src/telemetry/mod.cyr`, `tests/telemetry_mod.tcyr`, 84 assertions).
+
+  > ⚠ **This entry used to say "sakshi has neither, so this starts as a sakshi
+  > filing".** That premise was **false and was never checked against the
+  > library.** `sakshi_set_emit_hook` (`lib/sakshi.cyr:1038`) routes every event
+  > through a caller-supplied formatter and its own doc comment names this exact
+  > use. The formatter belongs in agnosai, and `./build/agnosai` now emits the
+  > oracle's JSON byte for byte. **Nothing was filed for it.**
+  >
+  > The one real gap the work *did* surface is narrower and is filed:
+  > `sakshi_log_kv` flattens `key=val` into the message before the hook, so
+  > per-event fields cannot be recovered (section C, sakshi row).
+
+  `EnvFilter` reduces to sakshi's single process-wide level. Only a bare level
+  and `agnosai=<level>` are honoured; a multi-target `RUST_LOG` is refused
+  outright rather than half-applied.
+
+- **OTLP export** — copy hoosh's proven `otlp.cyr` (199 lines, verified present
+  at `~/Repos/hoosh/src/lib/otlp.cyr`); the one place the remote seam does NOT
+  apply, since export is in-process. Thread-local trace context is **mandatory**
+  under `run_pooled`: sakshi's span stack and trace id are process globals.
+  `agnosai_telemetry_init_tracing` already branches on the endpoint and returns
+  the guard — the exporter is what goes behind that branch.
+- **`genai.rs`** (206 lines) lives here, not in `llm`.
 
 ### M10 — `definitions` (Phase 9)
 
@@ -670,6 +686,7 @@ Nothing here blocks agnosai today; each is a residual agnosai measured and hande
 | sandhi | **Serve-loop stop facility — ✅ FILED, FIXED as sandhi 1.9.9, VENDORED in cyrius 6.5.6, and CONSUMED** (all 2026-08-03). `sandhi_server_options_stop_flag(opts, ptr)` on all five loops; agnosai now drains on SIGINT/SIGTERM ([ADR 013](../adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md), superseding 012). Still open: `backlog` silently ignored by `run_opts`/`run_async`; chunked start hardcodes `" OK"`; **inbound** chunked decoding unsupported (1.9.4 answers 501 — honest, but not support) |
 | bayan | **Nothing open.** The `_a` JSON ask shipped as bayan 1.4.0 (folded in cyrius 6.5.5). The YAML ask (`2026-07-16-...`) has **also shipped and this row was stale** — `bayan_yaml_parse` / `_parse_buf` / `_parse_ctx` return a `json_v*` tagged value tree, plus `bayan_yaml_frontmatter_split`. Verified 2026-08-03 by parsing a scalar+sequence document, resolving a key through `bayan_json_v_obj_get`, and re-serializing via `bayan_json_v_build`. **This unblocks M10's YAML half**, which the exclusion table still lists as deferred — revisit that scope call before starting M10. |
 | sigil | `2026-07-30-rsa-verify-uses-secret-exponent-ladder.md` — ✅ **archived upstream**, fixed, vendored and **measured** (see C1). 🔴 **OWED, NOT YET FILED — the RSA verify workspace is shared across threads and it is an auth bypass.** `_rsa_pkcs1v15_check` (`lib/sigil.cyr:17887`) ends `return ct_eq_bytes(rem, rexp, n_len)` with **both operands** in lane-indexed *file-scope* globals that are never wiped per lane, and `cbank()` (`:4403-4418`) hands out 63 lanes and **never releases one** — so the bound is 63 *lifetime* crypto-touching threads, which agnosai passes with its 100 pool workers alone. Measured on this tree: **888 of 400,000 forged signatures accepted** and 281,965 of 400,000 valid ones rejected (reproduced 3x: 888 / 1674 / 314). **The ask is function-scope locals, not a bigger bank count** — 1,536 B against a 122,880 B per-fn stack budget, and sigil's "function-scope arrays are static globals" premise (`:17779`) is stale, disproven by probe. ⚠ **Scope is wider than RSA verify**: 62 file-scope banked globals including the shared bignum engine (`_bn_mont_*`, `_bn_exp_*`, `_bn_inv_*`) and the PSS/ECDSA/Ed25519 lanes `lib/tls_native_hs13.cyr:257-284` uses for TLS 1.3 peer auth — which agnosai reaches on every outbound HTTPS call. agnosai is protected on the JWT path only, by the local mutex in C2. |
+| sakshi | **Filed 2026-08-08:** `2026-08-08-emit-hook-loses-structured-fields.md` — `sakshi_log_kv` renders `key=val` into the message text *before* `_sk_emit`, so the emit hook (the mechanism sakshi documents for structured consumers) receives one flat string and cannot recover the fields. agnosai's JSON therefore emits `"message":"… hoosh_url=http://…"` where the oracle emits a separate `hoosh_url` member — real output from `./build/agnosai`, in the filing. Same function also truncates silently at `var buf[256]` and takes exactly one pair. **Nothing is blocked**: `src/telemetry/mod.cyr` ships the JSON formatter without it. ⚠ This filing **replaces** the "sakshi has no JSON output mode / no EnvFilter" ask M9 used to plan — that premise was false, see M9. |
 | bote | `serverInfo` hardcoded to `"bote"` in `dispatcher_dispatch` — ✅ **fixed as bote 3.3.0** (`dispatcher_set_server_info`). Pin bump owed under B1. |
 | kavach | **Nothing open — all six filings resolved, and kavach's own issue queue is empty.** The five M7 ones landed in 3.11.3–3.11.6 (seccomp/landlock on both exec paths, `timeout_ms` honoured, real exit code and stderr, namespaces on the persistent path). `2026-08-05-gate-apply-measures-with-strlen-...` landed in **3.11.7** and is ✅ **consumed** — see C2. |
 

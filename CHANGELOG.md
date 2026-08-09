@@ -96,6 +96,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`telemetry/mod`** — the OTLP configuration surface and, for the first time,
+  **the oracle's JSON log format**. `DEFAULT_SERVICE_NAME`, `service_name`,
+  `otlp_endpoint_from_env`, `TracingGuard`, `init_tracing`, plus the formatter
+  behind it. **84 assertions**, all 4 oracle tests plus 80 past them, seven
+  mutation-verified. `./build/agnosai` now emits:
+
+  ```
+  {"timestamp":"2026-08-09T06:55:17.625833Z","level":"INFO","fields":{"message":"AgnosAI server starting"},"target":"agnosai"}
+  ```
+
+  ⚠ **The "sakshi has no JSON output mode" divergence was false and is
+  retired.** `src/main.cyr` carried it as stated divergence #3 and `roadmap.md`
+  M9 planned an upstream filing for it. Neither survived reading the library:
+  **`sakshi_set_emit_hook` (`lib/sakshi.cyr:1038`) routes every event through a
+  caller-supplied formatter**, and its own doc comment names this exact use.
+  The formatter belonged here all along; nothing was filed for it.
+
+  All four oracle tests are **vacuous** — one asserts a constant against its own
+  literal, the other three call something and discard the result. So the parity
+  surface tested here is the **byte layout of the line**, because a formatter
+  emitting valid-but-different JSON would pass every oracle test and break every
+  log shipper. Pinned: `tracing_subscriber`'s exact key order; RFC 3339 with
+  zero-padded microseconds across leap years, century leap years and second
+  rollover; escaping of quote, backslash, newline, tab and control bytes as
+  lowercase `\u00xx`; raw UTF-8 passed through; embedded NULs escaped rather
+  than terminating the message; and truncation that cannot lose the JSON tail.
+
+  Three things the hook deliberately does **not** do, each stated at its site:
+  it ignores the hook's `ts` (monotonic) and reads `clock_epoch_ns()` instead,
+  because the oracle's timestamp is wall clock; it **drops span enter/exit
+  events**, because `fmt::layer().json()` emits none without `with_span_events`;
+  and it allocates nothing — `iso8601()` and `epoch_to_date()` both allocate,
+  and this runs once per log line on a no-free bump allocator.
+
+  ⚠ **`RUST_LOG` means different things in the oracle's two init paths**, and
+  both are reproduced. `main.rs`'s non-otel branch is
+  `from_default_env().add_directive("agnosai=info")` — the added directive wins,
+  so the level is **pinned at INFO** and `RUST_LOG` cannot change it.
+  `init_tracing`'s is `try_from_default_env().unwrap_or_else(…)` — a set
+  `RUST_LOG` **replaces** the default. `main` runs the otel-enabled path because
+  it is the superset; that choice, and its one visible consequence, is stated in
+  `src/main.cyr`'s header.
+
+  ⚠ **stderr is JSON only when OTLP is OFF.** The oracle's OTLP branch builds
+  `fmt::layer().with_writer(stderr)` — the *text* formatter — and only the
+  non-OTLP branch calls `.json()`. Reproduced rather than smoothed over: an
+  operator whose shipper parses JSON needs to know that enabling the collector
+  breaks it.
+
+  ⚠ `EnvFilter` reduces to sakshi's single process-wide level. A bare level and
+  `agnosai=<level>` are honoured; **a multi-target `RUST_LOG` is refused
+  outright, not half-applied** — applying one directive globally would silently
+  raise verbosity for a target the operator had turned down.
+
 - **`fleet/` is COMPLETE** — `topology` was the last of the oracle's twelve
   modules. All 4,443 oracle lines are ported, with **721 assertions** across
   eleven suites covering all **140** oracle test fns (137 `#[test]` plus

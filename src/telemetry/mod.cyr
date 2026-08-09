@@ -1,0 +1,494 @@
+# =========================================================================
+# telemetry/mod — OpenTelemetry integration and the JSON log formatter.
+#
+# Parity oracle: rust-old/src/telemetry/mod.rs (plus the logging init at
+# rust-old/src/main.rs:69-72, which is the same subscriber built inline).
+#
+# ## The "sakshi has no JSON output mode" divergence was FALSE
+#
+# `src/main.cyr` carried it as stated divergence #3 and `roadmap.md` M9 planned
+# to open a sakshi filing for it. Neither survives contact with the library:
+# **`sakshi_set_emit_hook` (`lib/sakshi.cyr:1038`) routes every event through a
+# caller-supplied `fn(ts, level, category, msg, msg_len, elapsed_ns)`**, and its
+# own doc comment names this exact use — "downstream consumers (OTel, custom
+# aggregators, in-memory sinks) ... without sakshi knowing their format". The
+# formatter belongs here, not upstream, and nothing had to be filed for it.
+#
+# What is genuinely not reachable through the hook is narrower and is stated at
+# each site below: per-event **structured fields** (`sakshi_log_kv` flattens
+# `key=val` into the message text *before* `_sk_emit`, so the hook sees one
+# string), the `span` / `spans` objects, and per-module `target` values.
+#
+# ## The hook must not allocate, and must be reentrant
+#
+# It runs once per log line on every worker thread. The default allocator is a
+# no-free bump, so a single `alloc` here grows the process without bound over a
+# server's lifetime — which rules out `iso8601()` and `epoch_to_date()`
+# (`lib/chrono.cyr:263`, `:227`), both of which allocate. Everything below
+# formats into a stack buffer and exits through one `write(2)`, which is also
+# what sakshi's own stderr path does.
+#
+# ## Two clocks, again
+#
+# The hook's `ts` argument is **monotonic** (`_sk_now_ns`), and the oracle's
+# JSON `timestamp` is wall clock. So `ts` is deliberately ignored and the
+# formatter reads `clock_epoch_ns()` itself. On agnos that has whole-second
+# granularity (`lib/chrono.cyr:85`), so the microsecond field reads `.000000`
+# there — stated rather than hidden.
+#
+# ## RUST_LOG means different things in the oracle's two paths
+#
+# - `main.rs`'s non-otel branch is `from_default_env().add_directive("agnosai=info")`.
+#   The added directive wins for the `agnosai` target, so **the port's own level
+#   is pinned at INFO and `RUST_LOG` cannot change it** — it can only reach
+#   dependency targets, which this binary does not have.
+# - `init_tracing`'s is `try_from_default_env().unwrap_or_else(|| "agnosai=info")`.
+#   A set `RUST_LOG` **replaces** the default outright, so it does control the
+#   level there.
+#
+# Both are reproduced. `agnosai_telemetry_env_filter_level` is only consulted on
+# the `init_tracing` path, which is why `main` does not call it.
+# =========================================================================
+
+# The oracle's `DEFAULT_SERVICE_NAME`.
+fn agnosai_telemetry_default_service_name(): i64 {
+    return str_from("agnosai");
+}
+
+# The service name reported to the collector: `OTEL_SERVICE_NAME`, else the
+# default. ⚠ An **empty** `OTEL_SERVICE_NAME` is honoured as an empty name, not
+# treated as unset — `std::env::var` returns `Ok("")` and `unwrap_or_else` does
+# not fire. `otlp_endpoint_from_env` filters empties; this does not, and the
+# asymmetry is the oracle's.
+fn agnosai_telemetry_service_name(): i64 {
+    var v = getenv("OTEL_SERVICE_NAME");
+    if (v == 0) { return agnosai_telemetry_default_service_name(); }
+    return str_from(v);
+}
+
+# The OTLP endpoint from `OTEL_EXPORTER_OTLP_ENDPOINT`, or 0 for the oracle's
+# `None`. An empty value is `None`, matching the oracle's `.filter(|s| !s.is_empty())`.
+fn agnosai_otlp_endpoint_from_env(): i64 {
+    var v = getenv("OTEL_EXPORTER_OTLP_ENDPOINT");
+    if (v == 0) { return 0; }
+    if (strlen(v) == 0) { return 0; }
+    return str_from(v);
+}
+
+# --- the env filter ------------------------------------------------------
+
+# ASCII case-insensitive compare of `data[0..len]` against a NUL-terminated
+# literal. Local because this is the first *equality* of this shape in the tree
+# — `cost_planning` and `prompt_guard` each own a case-insensitive **contains**,
+# which is a different operation.
+fn _agnosai_telemetry_eq_ci(data, len, lit): i64 {
+    if (len != strlen(lit)) { return 0; }
+    for (var i = 0; i < len; i = i + 1) {
+        var a = load8(data + i);
+        if (a >= 65) { if (a <= 90) { a = a + 32; } }
+        var b = load8(lit + i);
+        if (b >= 65) { if (b <= 90) { b = b + 32; } }
+        if (a != b) { return 0; }
+    }
+    return 1;
+}
+
+# Map one level word — `data[0..len]` — to its `SK_*` value, or -1 if it is not
+# a level.
+#
+# ⚠ Case-insensitive, as `tracing`'s directive parser is. `warning` is NOT
+# accepted — `tracing` takes `warn`.
+fn _agnosai_telemetry_level_of(data, len): i64 {
+    if (_agnosai_telemetry_eq_ci(data, len, "trace") == 1) { return SK_TRACE; }
+    if (_agnosai_telemetry_eq_ci(data, len, "debug") == 1) { return SK_DEBUG; }
+    if (_agnosai_telemetry_eq_ci(data, len, "info") == 1) { return SK_INFO; }
+    if (_agnosai_telemetry_eq_ci(data, len, "warn") == 1) { return SK_WARN; }
+    if (_agnosai_telemetry_eq_ci(data, len, "error") == 1) { return SK_ERROR; }
+    return 0 - 1;
+}
+
+# The decision half: the level `data[0..len]` asks for, or -1.
+#
+# ⚠ **A reduction, and a stated one.** `EnvFilter` supports per-target
+# directives, spans, and field predicates; sakshi has a single process-wide
+# level (`lib/sakshi.cyr:1284`). So only two forms are honoured — a bare level
+# (`RUST_LOG=debug`) and a directive naming this crate (`RUST_LOG=agnosai=debug`)
+# — and anything else falls back to the default. A multi-target `RUST_LOG` is
+# **not** partially applied: applying one directive globally would silently
+# raise verbosity for targets the operator excluded, which is worse than
+# ignoring it.
+#
+# Split from the environment read under the port's standing rule 8, and for the
+# same reason `fleet/environment` splits its cgroup parsers — `getenv` reads
+# `/proc/self/environ` (`lib/io.cyr:757`) and there is no `setenv`, so a test
+# that went through the variable could only observe whatever the CI runner
+# happened to export. The oracle's own test is vacuous for exactly this reason.
+fn agnosai_telemetry_parse_directive(data, len): i64 {
+    if (len == 0) { return 0 - 1; }
+
+    var bare = _agnosai_telemetry_level_of(data, len);
+    if (bare >= 0) { return bare; }
+
+    # `agnosai=<level>` — the only target this binary emits under. Scanned by
+    # hand rather than through `str_split`, which allocates a vec and two Str
+    # headers to answer a question about one byte.
+    var eq = 0 - 1;
+    for (var i = 0; i < len; i = i + 1) {
+        if (load8(data + i) == 61) {
+            # A second `=` means a multi-directive filter — not honourable.
+            if (eq >= 0) { return 0 - 1; }
+            eq = i;
+        }
+        # A comma likewise: `RUST_LOG=a=info,b=warn` is more than one target.
+        if (load8(data + i) == 44) { return 0 - 1; }
+    }
+    if (eq < 0) { return 0 - 1; }
+    if (_agnosai_telemetry_eq_ci(data, eq, "agnosai") == 0) { return 0 - 1; }
+    return _agnosai_telemetry_level_of(data + eq + 1, len - eq - 1);
+}
+
+# The level `RUST_LOG` asks for, or -1 when it is unset or names nothing this
+# binary can honour. Thin: every decision lives in `parse_directive`.
+fn agnosai_telemetry_env_filter_level(): i64 {
+    var v = getenv("RUST_LOG");
+    if (v == 0) { return 0 - 1; }
+    return agnosai_telemetry_parse_directive(v, strlen(v));
+}
+
+# --- the JSON formatter --------------------------------------------------
+
+# The smallest buffer `agnosai_telemetry_format_json` will write into.
+#
+# The fixed part of a line is 14 (`{"timestamp":"`) + 27 (RFC 3339) + 11
+# (`","level":"`) + at most 7 (`UNKNOWN`) + 22 (`","fields":{"message":""},`
+# through `"target":"agnosai"}`) + 1 newline = 82, plus the 32 bytes of
+# headroom the message bound reserves. 128 rounds that up and leaves room for a
+# byte of message.
+var AGNOSAI_TELEMETRY_MIN_CAP = 128;
+
+# The buffer the hook formats into, and **not an arbitrary number**: `PIPE_BUF`
+# is 4096 on Linux, and a `write(2)` of at most `PIPE_BUF` to a pipe is atomic.
+# Since a supervised server's stderr is normally a pipe, this is what keeps two
+# worker threads from interleaving halves of a line. A larger buffer would
+# silently give that up.
+var AGNOSAI_TELEMETRY_LINE_CAP = 4096;
+
+# Days in each month, non-leap. Index 0 is January.
+var _agnosai_telemetry_mdays[96];
+var _agnosai_telemetry_mdays_ready = 0;
+
+# Fill the month table once. Idempotent, and called before any thread starts.
+fn _agnosai_telemetry_init_mdays(): i64 {
+    if (_agnosai_telemetry_mdays_ready == 1) { return 0; }
+    store64(&_agnosai_telemetry_mdays + 0, 31);
+    store64(&_agnosai_telemetry_mdays + 8, 28);
+    store64(&_agnosai_telemetry_mdays + 16, 31);
+    store64(&_agnosai_telemetry_mdays + 24, 30);
+    store64(&_agnosai_telemetry_mdays + 32, 31);
+    store64(&_agnosai_telemetry_mdays + 40, 30);
+    store64(&_agnosai_telemetry_mdays + 48, 31);
+    store64(&_agnosai_telemetry_mdays + 56, 31);
+    store64(&_agnosai_telemetry_mdays + 64, 30);
+    store64(&_agnosai_telemetry_mdays + 72, 31);
+    store64(&_agnosai_telemetry_mdays + 80, 30);
+    store64(&_agnosai_telemetry_mdays + 88, 31);
+    _agnosai_telemetry_mdays_ready = 1;
+    return 0;
+}
+
+# Split epoch seconds into civil fields, written into a caller-supplied
+# 48-byte buffer as {year, month, day, hour, min, sec}.
+#
+# The same loops as `lib/chrono.cyr`'s `epoch_to_date`, so the two agree — but
+# writing into the caller's buffer rather than allocating one. See the module
+# header for why that matters here and nowhere else.
+#
+# ⚠ Undefined before 1970, exactly as the oracle helper is: the year loop only
+# counts forward. Log timestamps are never negative.
+fn _agnosai_telemetry_civil(epoch_secs, out): i64 {
+    var days = epoch_secs / 86400;
+    var rem = epoch_secs % 86400;
+    store64(out + 24, rem / 3600);
+    rem = rem % 3600;
+    store64(out + 32, rem / 60);
+    store64(out + 40, rem % 60);
+
+    var y = 1970;
+    var yd = 365;
+    while (days >= yd) {
+        days = days - yd;
+        y = y + 1;
+        yd = 365;
+        if (is_leap_year(y) == 1) { yd = 366; }
+    }
+    store64(out, y);
+
+    var m = 0;
+    while (m < 12) {
+        var md = load64(&_agnosai_telemetry_mdays + m * 8);
+        if (m == 1) { if (is_leap_year(y) == 1) { md = 29; } }
+        if (days < md) { break; }
+        days = days - md;
+        m = m + 1;
+    }
+    store64(out + 8, m + 1);
+    store64(out + 16, days + 1);
+    return 0;
+}
+
+# Write `val` zero-padded to `width` digits at `buf + pos`. Returns the new pos.
+fn _agnosai_telemetry_wpad(buf, pos, val, width): i64 {
+    var scale = 1;
+    for (var i = 1; i < width; i = i + 1) { scale = scale * 10; }
+    while (scale > 0) {
+        store8(buf + pos, 48 + (val / scale) % 10);
+        pos = pos + 1;
+        scale = scale / 10;
+    }
+    return pos;
+}
+
+# Write the oracle's RFC 3339 timestamp — `YYYY-MM-DDTHH:MM:SS.uuuuuuZ` — at
+# `buf + pos`. Returns the new pos. Always 27 bytes.
+fn _agnosai_telemetry_write_ts(buf, pos, epoch_ns): i64 {
+    var civ[48];
+    _agnosai_telemetry_civil(epoch_ns / 1000000000, &civ);
+    pos = _agnosai_telemetry_wpad(buf, pos, load64(&civ), 4);
+    store8(buf + pos, 45);
+    pos = _agnosai_telemetry_wpad(buf, pos + 1, load64(&civ + 8), 2);
+    store8(buf + pos, 45);
+    pos = _agnosai_telemetry_wpad(buf, pos + 1, load64(&civ + 16), 2);
+    store8(buf + pos, 84);
+    pos = _agnosai_telemetry_wpad(buf, pos + 1, load64(&civ + 24), 2);
+    store8(buf + pos, 58);
+    pos = _agnosai_telemetry_wpad(buf, pos + 1, load64(&civ + 32), 2);
+    store8(buf + pos, 58);
+    pos = _agnosai_telemetry_wpad(buf, pos + 1, load64(&civ + 40), 2);
+    store8(buf + pos, 46);
+    pos = _agnosai_telemetry_wpad(buf, pos + 1, (epoch_ns / 1000) % 1000000, 6);
+    store8(buf + pos, 90);
+    return pos + 1;
+}
+
+# Copy `src[0..len]` into `buf` at `pos` as JSON string content, escaping what
+# RFC 8259 requires. Returns the new pos, stopping short rather than running
+# past `cap`.
+#
+# ⚠ Bytes below 0x20 become a `\u00xx` escape, so a log line carrying a newline
+# stays one JSON line. Non-ASCII is passed through unescaped — sakshi messages
+# are UTF-8 and RFC 8259 permits raw UTF-8 in a string.
+fn _agnosai_telemetry_write_escaped(buf, cap, pos, src, len): i64 {
+    for (var i = 0; i < len; i = i + 1) {
+        if (pos + 6 > cap) { return pos; }
+        var c = load8(src + i);
+        if (c == 34) {
+            store8(buf + pos, 92);
+            store8(buf + pos + 1, 34);
+            pos = pos + 2;
+        } else {
+            if (c == 92) {
+                store8(buf + pos, 92);
+                store8(buf + pos + 1, 92);
+                pos = pos + 2;
+            } else {
+                if (c == 10) {
+                    store8(buf + pos, 92);
+                    store8(buf + pos + 1, 110);
+                    pos = pos + 2;
+                } else {
+                    if (c == 13) {
+                        store8(buf + pos, 92);
+                        store8(buf + pos + 1, 114);
+                        pos = pos + 2;
+                    } else {
+                        if (c == 9) {
+                            store8(buf + pos, 92);
+                            store8(buf + pos + 1, 116);
+                            pos = pos + 2;
+                        } else {
+                            if (c < 32) {
+                                pos = _agnosai_telemetry_write_u_escape(buf, pos, c);
+                            } else {
+                                store8(buf + pos, c);
+                                pos = pos + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return pos;
+}
+
+# Write one `\u00XX` escape. Split out because the escape ladder above is
+# already at the nesting Cyrius makes comfortable.
+fn _agnosai_telemetry_write_u_escape(buf, pos, c): i64 {
+    store8(buf + pos, 92);
+    store8(buf + pos + 1, 117);
+    store8(buf + pos + 2, 48);
+    store8(buf + pos + 3, 48);
+    store8(buf + pos + 4, _agnosai_telemetry_hex_digit((c / 16) % 16));
+    store8(buf + pos + 5, _agnosai_telemetry_hex_digit(c % 16));
+    return pos + 6;
+}
+
+# One lowercase hex digit for 0-15. `tracing`'s JSON escapes lowercase.
+fn _agnosai_telemetry_hex_digit(n): i64 {
+    if (n < 10) { return 48 + n; }
+    return 87 + n;
+}
+
+# Copy a NUL-free literal into `buf` at `pos`. Returns the new pos.
+fn _agnosai_telemetry_write_lit(buf, pos, s): i64 {
+    var n = strlen(s);
+    for (var i = 0; i < n; i = i + 1) { store8(buf + pos + i, load8(s + i)); }
+    return pos + n;
+}
+
+# The level name as `tracing` spells it.
+#
+# ⚠ `SK_FATAL` has **no `tracing` counterpart** — its levels stop at ERROR. It
+# is emitted as `FATAL` rather than folded into ERROR, because collapsing it
+# would make a process-ending event indistinguishable from a handled one.
+fn _agnosai_telemetry_level_name(level): i64 {
+    if (level == SK_FATAL) { return "FATAL"; }
+    if (level == SK_ERROR) { return "ERROR"; }
+    if (level == SK_WARN) { return "WARN"; }
+    if (level == SK_INFO) { return "INFO"; }
+    if (level == SK_DEBUG) { return "DEBUG"; }
+    if (level == SK_TRACE) { return "TRACE"; }
+    return "UNKNOWN";
+}
+
+# The `target` every line carries.
+#
+# ⚠ `tracing` derives `target` from the emitting **module path**
+# (`agnosai::server::serve`), and sakshi has no target concept at all. The crate
+# name is what a top-level `tracing::info!` in `main.rs` produces, so top-level
+# lines match exactly and nested ones are coarser. Stated, not hidden.
+fn agnosai_telemetry_log_target(): i64 {
+    return "agnosai";
+}
+
+# Render one event as the oracle's JSON line into `buf`, returning its length.
+#
+# The key order is `tracing_subscriber`'s: timestamp, level, fields, target.
+# `fields` is an object because `tracing` nests every event field under it —
+# with `message` the only member here, for the reason in the module header.
+#
+# Split from the hook so it is testable: the hook itself writes to fd 2.
+#
+# ⚠ The fixed part of the line — prefix, timestamp, level, tail — is at most
+# `AGNOSAI_TELEMETRY_MIN_CAP` bytes, and only the *message* is bounded against
+# `cap`. A caller passing a smaller buffer would therefore overrun it before
+# the first bound is checked, so that case is refused outright rather than
+# half-written. Returns 0 for a buffer too small to hold any line at all.
+fn agnosai_telemetry_format_json(buf, cap, epoch_ns, level, msg, msg_len): i64 {
+    if (cap < AGNOSAI_TELEMETRY_MIN_CAP) { return 0; }
+    var pos = _agnosai_telemetry_write_lit(buf, 0, "{\"timestamp\":\"");
+    pos = _agnosai_telemetry_write_ts(buf, pos, epoch_ns);
+    pos = _agnosai_telemetry_write_lit(buf, pos, "\",\"level\":\"");
+    pos = _agnosai_telemetry_write_lit(buf, pos, _agnosai_telemetry_level_name(level));
+    pos = _agnosai_telemetry_write_lit(buf, pos, "\",\"fields\":{\"message\":\"");
+    # Leave room for the fixed tail plus the closing quote.
+    pos = _agnosai_telemetry_write_escaped(buf, cap - 32, pos, msg, msg_len);
+    pos = _agnosai_telemetry_write_lit(buf, pos, "\"},\"target\":\"");
+    pos = _agnosai_telemetry_write_lit(buf, pos, agnosai_telemetry_log_target());
+    pos = _agnosai_telemetry_write_lit(buf, pos, "\"}");
+    store8(buf + pos, 10);
+    return pos + 1;
+}
+
+# The sakshi emit hook: format each event as JSON and write it to fd 2.
+#
+# ⚠ **Span events are dropped.** `fmt::layer().json()` emits nothing on span
+# enter/exit unless `with_span_events` is configured, and the oracle does not
+# configure it — so forwarding sakshi's `SK_SPAN_ENTER` / `SK_SPAN_EXIT` would
+# add lines the oracle never produces.
+#
+# ⚠ `ts` and `elapsed_ns` are unused: see the module header on the two clocks.
+#
+# One `write(2)` per line, matching sakshi's own stderr path
+# (`lib/sakshi.cyr:604`) — the best interleaving guarantee available to a
+# multi-threaded writer, and no worse than what it replaces.
+fn _agnosai_telemetry_json_hook(ts, level, category, msg, msg_len, elapsed_ns): i64 {
+    if (level == SK_SPAN_ENTER) { return 0; }
+    if (level == SK_SPAN_EXIT) { return 0; }
+    var buf[4096];
+    var n = agnosai_telemetry_format_json(&buf, AGNOSAI_TELEMETRY_LINE_CAP,
+    clock_epoch_ns(), level, msg, msg_len);
+    # The return is ignored, as sakshi's own stderr writer does
+    # (`lib/sakshi.cyr:610`). At `PIPE_BUF` or less this cannot short-write to a
+    # pipe, which is the case that matters.
+    syscall(SYS_WRITE, 2, &buf, n);
+    return 0;
+}
+
+# Route sakshi through the JSON formatter. Idempotent.
+fn agnosai_telemetry_init_json_logging(): i64 {
+    _agnosai_telemetry_init_mdays();
+    sakshi_set_emit_hook(&_agnosai_telemetry_json_hook);
+    return 0;
+}
+
+# --- TracingGuard --------------------------------------------------------
+
+# TracingGuard heap layout — 16 bytes.
+enum AgnosaiTracingGuardOff {
+    # 1 when OTLP export is running, the oracle's `Some(OtelGuard)`.
+    AGN_TG_OTEL = 0;
+    AGN_TG_SERVICE_NAME = 8;
+    AGN_TG_SIZE = 16;
+}
+
+# Whether this guard holds a live OTLP exporter.
+fn agnosai_tracing_guard_otel_active(g): i64 {
+    return load64(g + AGN_TG_OTEL);
+}
+
+# The service name the guard was initialised with.
+fn agnosai_tracing_guard_service_name(g): i64 {
+    return load64(g + AGN_TG_SERVICE_NAME);
+}
+
+# Initialise logging, and OTLP export when `otlp_endpoint` is non-zero.
+#
+# ⚠ **stderr is JSON only when OTLP is OFF.** The oracle's OTLP branch builds
+# `fmt::layer().with_writer(stderr)` — the *text* formatter — and only its
+# non-OTLP branch calls `.json()`. So turning OTLP on silently changes the
+# stderr format. Reproduced rather than smoothed over: an operator whose log
+# shipper parses JSON needs to know that enabling the collector breaks it.
+#
+# Returns a guard the caller must keep for the process lifetime.
+fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
+    var service_name = agnosai_telemetry_service_name();
+
+    # Here — unlike `main`'s path — a set RUST_LOG replaces the default.
+    var lvl = agnosai_telemetry_env_filter_level();
+    if (lvl < 0) { lvl = SK_INFO; }
+    sakshi_set_level(lvl);
+
+    var g = alloc(AGN_TG_SIZE);
+    store64(g + AGN_TG_SERVICE_NAME, service_name);
+
+    if (otlp_endpoint == 0) {
+        agnosai_telemetry_init_json_logging();
+        store64(g + AGN_TG_OTEL, 0);
+        return g;
+    }
+
+    # Text stderr, as the oracle's OTLP branch uses.
+    sakshi_clear_emit_hook();
+    store64(g + AGN_TG_OTEL, 1);
+    sakshi_info("OpenTelemetry OTLP export initialised", 37);
+    return g;
+}
+
+# Flush and stop the exporter. The oracle's `Drop`, which Cyrius has no
+# equivalent for, so the caller runs it — `main` does, on the shutdown path.
+fn agnosai_telemetry_shutdown(g): i64 {
+    if (load64(g + AGN_TG_OTEL) == 0) { return 0; }
+    store64(g + AGN_TG_OTEL, 0);
+    return 0;
+}

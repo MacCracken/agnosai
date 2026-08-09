@@ -19,11 +19,24 @@
 #   2. **`let app = router(state)`** (`main.rs:118`). Routing is compile-time
 #      dispatch here; `agnosai_serve_mount` is its counterpart and `serve` calls
 #      it (`src/server/serve.cyr:307`).
-#   3. **`tracing_subscriber::fmt().json()`** (`main.rs:69-72`). sakshi has no
-#      JSON output mode and no `EnvFilter`, so no formatter is configured and
-#      lines emit as plain text on fd 2 at sakshi's default level. Log
-#      *content* matches the oracle line for line; log *transport and format*
-#      diverge, which is the honest way to state it.
+#   3. **`tracing_subscriber::fmt().json()`** (`main.rs:69-72`). **No longer a
+#      divergence, and the claim that it was is retired.** This entry used to
+#      read "sakshi has no JSON output mode and no `EnvFilter`" and `roadmap.md`
+#      M9 planned an upstream filing for it; `sakshi_set_emit_hook`
+#      (`lib/sakshi.cyr:1038`) routes every event through a caller-supplied
+#      formatter, which is what `src/telemetry/mod.cyr` now installs. Output is
+#      the oracle's JSON, byte for byte. What remains diverging is narrower and
+#      is stated there: per-event structured **fields** (sakshi flattens
+#      `key=val` into the message before the hook sees it), the `span`/`spans`
+#      objects, and per-module `target` values.
+#
+#      **Which of the oracle's two init paths this runs** is a choice the port
+#      has to make, because `main.rs` picks by `#[cfg(feature = "otel")]` and
+#      this binary has no features. It runs the **otel-enabled** path —
+#      `telemetry::init_tracing(otlp_endpoint_from_env())` — because that is the
+#      superset: with no endpoint set it produces exactly the non-otel branch's
+#      JSON stderr. The one visible consequence is `RUST_LOG`, which
+#      `init_tracing` honours and the non-otel branch pins at INFO.
 #   4. **`definitions: DashMap::new()`** (`main.rs:116`). Built inside
 #      `agnosai_app_state_new` (`src/server/state.cyr:66`), not passed in.
 #
@@ -56,6 +69,9 @@
 include "src/units.cyr"
 include "src/order.cyr"
 include "src/id.cyr"
+# telemetry — depends on nothing in `src/` (sakshi, chrono and io only), so it
+# sits first and is available to every module below for the JSON log formatter.
+include "src/telemetry/mod.cyr"
 include "src/core/mod.cyr"
 include "src/learning/mod.cyr"
 # fleet — after `order` (cost_planning sorts candidates through agnosai_sort)
@@ -273,6 +289,13 @@ fn _agnosai_exit_process(code): i64 {
 # budget is explicit rather than `0`, and the JWT key is decoded eagerly.
 fn main(): i64 {
     alloc_init();
+
+    # `main.rs:60-73` — the subscriber is installed before the first line is
+    # emitted, so "AgnosAI server starting" is already JSON. See divergence #3
+    # in the header for why this runs the otel-enabled path. The guard is held
+    # for the process lifetime, as the oracle's `_tracing_guard` is.
+    var tracing_guard = agnosai_telemetry_init_tracing(agnosai_otlp_endpoint_from_env());
+
     sakshi_info("AgnosAI server starting", 23);
 
     var events = agnosai_event_bus_new();
@@ -359,6 +382,11 @@ fn main(): i64 {
     # `"server shut down gracefully"` line now has something true to report.
     var rc = agnosai_serve(state, INADDR_ANY(), port);
     if (rc == 0) { sakshi_info("server shut down gracefully", 28); }
+
+    # The oracle's `_tracing_guard` flushes pending spans when it drops at the
+    # end of `main`. Cyrius has no `Drop`, so the drop is written out — and it
+    # goes AFTER the final log line, exactly where the guard's scope ends.
+    agnosai_telemetry_shutdown(tracing_guard);
     return rc;
 }
 
