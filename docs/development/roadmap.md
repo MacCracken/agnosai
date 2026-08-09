@@ -532,13 +532,35 @@ arc B (float literals miscompile) and **Linux-x86 only** until arc C. agnosai co
 which port 1:1; uses `persistent_spawn/send/read/terminate` for the stdin-JSON
 tool protocol.
 
-### M8 — `fleet` (Phase 7)
+### M8 — `fleet` (Phase 7) — ✅ **COMPLETE 2026-08-08**
 
-4,443 lines, the largest unported group. `discovery.rs` needs no sandhi at all —
-it is 174 lines of stub. `relay.rs` maps near-1:1 onto majra's `relay_*`.
+All 4,443 lines, twelve of twelve modules, **721 assertions** covering all
+**140** oracle test fns (137 `#[test]` plus `discovery`'s 3 `#[tokio::test]`). The per-module bite log is in
+[`state.md`](state.md#source).
 
 ⚠ *"zero consumers; sequence last"* used to justify deprioritising this. Zero
 consumers is a consequence of it not being ported, not a reason to leave it.
+
+Two predictions in the original plan turned out wrong, and are recorded here so
+the next milestone does not repeat the mistake:
+
+- **"`relay.rs` maps near-1:1 onto majra's `relay_*`"** — the *names* matched
+  and the semantics did not. Wrapping majra 2.5.3 would have shipped a
+  `relay_receive` that was not reentrant two ways (file-scope globals *and* no
+  lock, against agnosai's 100-worker pool), a discarded `is_broadcast`, and no
+  sequence-gap detection. All four were fixed upstream in **majra 2.6.0** before
+  the wrapper was written. A name match is not an API match — compare
+  semantics.
+- **"`discovery.rs` needs no sandhi at all — 174 lines of stub"** — true, and it
+  is the oracle's stub, not a port gap. `rust-old` says so in its own doc
+  comment and `lib/net.cyr` has no SRV resolver either (verified, not assumed).
+  Finishing it is a scope decision, not a port bite.
+
+Beyond the port, three behaviours were reproduced that read like defects and
+are the oracle's: `FleetCoordinator::max_retries` allows one fewer retry than it
+names, `FederationManager::declare_coordinator` adopts any term that is not
+stale, and `topology_score` is not clamped to the 1.0 its doc promises. Each is
+pinned by an assertion so a later reader cannot "fix" it by accident.
 
 ### M9 — `telemetry` (Phase 8)
 
@@ -728,6 +750,31 @@ listed because "no test covers this" is true of both and will keep being true:
   cannot fire. The oracle needs it because Rust's `u64` underflow panics in
   debug. Mutation-verified as unreachable: deleting the guard in `release`
   leaves all 65 assertions green. Kept for oracle shape, documented in place.
+
+- **`fleet/federation`'s `elect_by_lowest_id` `None` arm (added 2026-08-08).**
+  The candidate list is the online peers **plus this cluster's own id**, so it
+  is never empty and `candidates.first()` is always `Some`. The port returns the
+  winner and never 0; a lone cluster elects itself. Kept in the doc comment
+  only, and asserted from the reachable side (`fleet_federation.tcyr` pins that
+  a peerless manager still returns a winner).
+- **`fleet/federation`'s strict `>` liveness comparison (added 2026-08-08).**
+  `check_liveness` demotes on `elapsed > timeout` where `NodeRegistry`'s sweep
+  uses `>=`. Discriminating the two needs elapsed to land *exactly* on the
+  threshold, and the sweep reads its own `clock_now_ns()` after a test has set
+  the instant, so the boundary is unreachable from outside. Both directions are
+  asserted with a 1 ms margin; the strict comparison itself is documented in
+  place, not claimed as tested. Not a defect — the difference from `registry` is
+  the oracle's, and reproducing it is the point.
+- **`fleet/topology`'s `total_pairs == 0` guard (added 2026-08-08).** It is
+  reached only when `gpu_count >= 2`, where `n * (n - 1) / 2 >= 1`, so it cannot
+  fire. Kept because the oracle has it. Mutation-verified from the reachable
+  side: the six other topology mutants all die, and this branch has no input
+  that reaches it.
+- **`fleet/federation`'s three unread config fields (added 2026-08-08).**
+  `endpoint`, `seeds` and `election_timeout` are stored and never read by any
+  method, exactly as upstream: the oracle logs `seeds.len()` once at startup and
+  its `election_timeout` doc claims a randomization nothing performs. Accessors
+  exist so a caller that owns the election timer has one place to configure it.
 
 - **Two log-only fixes whose mutants survive — L5 and L9.** Nothing in this tree
   captures sakshi output, so `sakshi_warn`'s corrected length and the manager's

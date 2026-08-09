@@ -96,6 +96,183 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fleet/` is COMPLETE** — `topology` was the last of the oracle's twelve
+  modules. All 4,443 oracle lines are ported, with **721 assertions** across
+  eleven suites covering all **140** oracle test fns (137 `#[test]` plus
+  `discovery`'s 3 `#[tokio::test]`).
+
+- **`fleet/topology`** — NVLink/XGMI-aware placement scoring. `InterconnectType`
+  / `NodeTopology` / `DeviceLink`, `topology_score` and
+  `supports_tensor_parallel`. **39 assertions**, all 6 oracle tests plus 33 past
+  them, six mutation-verified.
+
+  Two of the oracle's own defects are reproduced rather than quietly fixed:
+
+  - **`topology_score` is not bounded by 1.0**, whatever its doc comment says.
+    Links are never validated against the inventory's device indices and never
+    deduplicated, so two GPUs — one pair — with three high-bandwidth links
+    score **3.0**. Every oracle test happens to use a consistent link set, so
+    none of them can see it. Clamping would be a silent divergence; a caller
+    ranking nodes by this number needs to know it can exceed 1.
+  - **`supports_tensor_parallel` ignores which devices a link connects.** It
+    counts high-bandwidth links against `device_count - 1`, the ring minimum,
+    so three links all between devices 0 and 1 "support" a four-way ring.
+
+  Also pinned: the 50 GB/s threshold is inclusive (`>=`), so exactly 50 counts
+  and 49.99 does not; `gpu_count <= 1` means a **CPU-only** node scores 1.0
+  rather than being penalised, and that same guard is what keeps
+  `device_count - 1` from going negative; CPU devices are excluded from the pair
+  count, so listing a node's cores as devices must not dilute its score; and
+  `interconnect` never decides anything — a 600 GB/s PCIe link counts while a
+  1 GB/s NVLink does not, which no oracle test can distinguish because all of
+  them use 600 GB/s NVLink.
+
+  ⚠ The `total_pairs == 0` guard is **unreachable** — it is reached only when
+  `gpu_count >= 2`, where `n(n-1)/2 >= 1`. Kept for oracle shape and recorded
+  in `roadmap.md` section E.
+
+- **`fleet/federation`** — multi-cluster federation: coordinator election,
+  cluster discovery and per-cluster health. `FederationRole` / `ClusterStatus` /
+  `ClusterInfo` / `ElectionState` / `FederationConfig` / `FederationManager`:
+  heartbeat, check_liveness, start_election, declare_coordinator,
+  elect_by_lowest_id, coordinator, is_coordinator, role, term, clusters,
+  online_clusters, cluster_count, evict_offline. **119 assertions**, all 19
+  oracle tests plus 100 past them, nine mutation-verified.
+
+  - **`check_liveness` compares `elapsed > timeout`; `NodeRegistry`'s sweep
+    compares `>=`.** The two sweeps look alike and are not, so porting one from
+    the other introduces an off-by-one at the boundary. For the same reason the
+    comparison runs in **nanoseconds** — truncating elapsed to whole
+    milliseconds first would delay every demotion by up to 1 ms and turn a
+    strict `>` into an accidental `>=`.
+  - **`declare_coordinator` accepts an equal OR future term.** The guard
+    refuses only a *stale* one, so a peer declaring at a higher term advances
+    this cluster's term with no election running here. Raft-inspired, not Raft:
+    no vote, no log, no quorum. The oracle tests stale and current, never
+    future.
+  - **A heartbeat does not reset an existing cluster's role.** `or_insert_with`
+    seeds Follower and the four assignments after it do not touch `role`, so a
+    coordinator that beats stays Coordinator — re-seeding would silently demote
+    the leader on its next beat.
+  - **`elect_by_lowest_id` excludes Suspect and Offline peers and cannot
+    fail.** Self is always a candidate, so the oracle's `None` arm is
+    unreachable and a lone cluster elects itself while reporting zero known
+    clusters. Ids order by **byte** — `"Zeta"` beats `"alpha"`.
+  - **`start_election` clears a good coordinator**, abandoning a leader even if
+    the election never completes.
+  - **`evict_offline` needs BOTH Offline and age**, and measures age from the
+    last heartbeat rather than from when the cluster went Offline — so the
+    offline timeout is already spent inside the TTL, and flipping an ancient
+    Suspect cluster to Offline evicts it on the very next call.
+
+  The oracle sorts the candidate list, dedups it and takes `first()`; the port
+  takes the **minimum** directly. Observably identical — `dedup` cannot change a
+  first element and the sorted list is discarded — and it allocates nothing on
+  the no-free global bump.
+
+  `ClusterInfo`'s fields are all `pub` upstream and the oracle's own tests write
+  `status` and `last_heartbeat_instant` to drive liveness without sleeping.
+  Both are ported as setters, so every liveness and eviction assertion here is
+  **deterministic** rather than sleep-timed — unlike `fleet/registry`, which
+  still sleeps.
+
+  ⚠ Three config fields — `endpoint`, `seeds`, `election_timeout` — are stored
+  and **never read by any method**, exactly as upstream. The oracle logs
+  `seeds.len()` once at startup and its `election_timeout` doc claims a
+  randomization that nothing performs. Carried rather than dropped so a caller
+  that owns the election timer has one place to configure it.
+
+  ⚠ The strict `>` is **documented, not pinned**: discriminating `>` from `>=`
+  needs elapsed to land exactly on the threshold, and the sweep reads its own
+  `clock_now_ns()` after a test sets the instant, so the boundary is
+  unreachable from outside. Both directions are asserted with a 1 ms margin and
+  the gap is recorded in `roadmap.md` section E.
+
+- **`fleet/coordinator`** — the top of the fleet group: crew fan-out, result
+  aggregation and failover. `FleetTask` / `FleetTaskStatus` / `FailoverAction`
+  and `FleetCoordinator`: fan_out, task, task_count, task_completed,
+  task_failed, tasks_for_node, is_complete, completion_pct,
+  pending_reassignment, reassign, state_manager. **81 assertions**, all 17
+  oracle tests plus 64 past them.
+
+  Four behaviours the oracle's own tests structurally cannot reach:
+
+  - **`max_retries` allows one fewer retry than it reads.** `task_failed`
+    increments the counter *before* testing `count < max_retries`, so the
+    default 3 gives Retry on failures 1 and 2 and Exhausted on failure 3 —
+    **two** retries. The oracle pins Retry at one end and Exhausted at the
+    other but never crosses a boundary, so a `<=` implementation passes every
+    oracle test. Mutation-verified: `<` → `<=` fails seven named assertions,
+    and `with_max_retries(1)` exhausts on the very first failure.
+  - **`fan_out` provisions every node for the MAX tasks-per-node**, not its own
+    count, because `CrewStateManager::create_run` takes a uniform figure. Two
+    tasks on node-a and one on node-b leaves *both* recorded as owing 2. The
+    oracle states this in a comment and asserts nothing; mutation-verified
+    against a min-per-node implementation.
+  - **`reassign` revives a terminal task and keeps its retry count.** It is
+    unconditional on status, so a Failed task returns to Assigned — and because
+    the counter is not reset, the very next failure exhausts it again.
+  - **"Complete" is not "succeeded."** An empty coordinator is complete;
+    a run with one Completed and one terminally Failed task is complete with
+    `completion_pct` at 1/2. `Reassigned` is deliberately **not** terminal — it
+    is a task awaiting another node, so it keeps `is_complete` false.
+
+  An unassigned task is stored `Pending` rather than dropped, which is what
+  lets a later `reassign` place it; `tasks_for_node` therefore has to skip the
+  0 node pointer, and dropping that guard **segfaults** rather than
+  miscounting (mutation-verified).
+
+  `plan_sharding` is `#[cfg(feature = "hwaccel")]` upstream and is **ported
+  anyway** — the full-port mandate covers feature-gated code and
+  `[deps.ai-hwaccel]` is already vendored. It stays a one-line delegation to
+  `reg_plan_sharding`, so all three oracle `hwaccel_tests` port directly on
+  ai-hwaccel's own `registry_from_profiles`. Because a one-line delegation can
+  only break by dropping or transposing an argument — and the oracle's three
+  tests each use a *different* registry, so a hardcoded quant would pass all
+  three — one assertion holds the registry and model fixed and varies only the
+  quantization.
+
+  ⚠ `_agnosai_fc_evict_completed` reproduces the oracle's shape exactly: it
+  checks the cap *before* inserting and removes **all** terminal tasks rather
+  than the oldest, so a coordinator holding 10,000 live tasks evicts nothing
+  and grows past `MAX_RETAINED_TASKS`. A retention floor, not a ceiling — the
+  same shape `CrewStateManager` already carries.
+
+- **`fleet/state`** — distributed crew state with barrier sync and checkpoints
+  (backfilled: the module shipped in `15758f0` without a CHANGELOG entry).
+  `DistributedCrewState` / `NodeProgress` / `CrewStateManager`: create_run, get,
+  report_progress, reach_barrier, force_barrier, remove_node, checkpoint,
+  active_runs, overall_progress. **95 assertions**, all 17 oracle tests plus 78
+  past them.
+
+  Two Rust enums carry payloads and Cyrius has no sum types, so the encoding is
+  where the risk lives:
+
+  - **`CrewPhase` is a tag plus a payload `Str`**, and equality must compare
+    both — `WaitingBarrier("a")` is not `WaitingBarrier("b")`, and `remove_node`
+    depends on exactly that when deciding whether the phase it clears is the
+    barrier it just satisfied. A tag-only comparison passes every oracle test.
+  - **`BarrierResult` is one i64**: a count ≥ 0 is `Waiting(n)`, and three
+    negative sentinels carry the unit variants. `reach_barrier` runs once per
+    node per barrier, so a returned struct would charge the no-free global bump
+    on every call. `Waiting(0)` is unrepresentable and cannot arise — the oracle
+    answers `AllReached` whenever `reached >= total`. The hazard this creates is
+    that **0 means "unknown run", not 0.0 progress**, and it is pinned.
+
+  Also past the oracle: an emptied participant set satisfies **every** pending
+  barrier (the empty set is a subset of anything, reachable through
+  `remove_node`); `reach_barrier` does not clear the arrival set, so a second
+  pass over one barrier name answers `AllReached` immediately; `force_barrier`
+  is unconditional and revives a Completed run to Running; and
+  `overall_progress` answers 1.0 for a run with no tasks, not 0.0.
+
+  ⚠ `is_checkpointing` is **observably always false** — `checkpoint()` sets it,
+  pushes, and clears it before returning, and every oracle method takes
+  `&mut self`. The field and both writes are ported anyway: the oracle's own
+  comment says it exists so barrier operations can be queued against it, which
+  is a contract for a future concurrent caller rather than dead code. Recorded
+  in `roadmap.md` section E.
+
 - **`fleet/` exists** — `src/fleet/mod.cyr` (the group hub) and
   `src/fleet/cost_planning.cyr`, the first of the oracle's eleven `fleet`
   submodules. GPU pricing tables, crew cost estimation and budget-aware model
@@ -217,8 +394,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NodeRegistry`: register, heartbeat, unregister, get, list, list_online,
   update_statuses, count, count_online, find_by_capability.
 
-  `tests/fleet_registry.tcyr` carries **65 assertions** — all 20 oracle
-  `#[test]` fns plus 45 the Rust tests never reach:
+  `tests/fleet_registry.tcyr` carries **67 assertions** — all 20 oracle
+  `#[test]` fns plus 47 the Rust tests never reach:
 
   - **The `update_statuses` arm order is observable.** The oracle sleeps past
     *both* thresholds, so its own test cannot tell whether Offline is checked
@@ -260,6 +437,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     produces.
 
 ### Changed
+
+- **`order`: the lexicographic `Str` comparator is now shared.**
+  `orchestrator/scheduler` and `orchestrator/plan_cache` each carried a
+  byte-identical copy; `fleet/federation` needed a third, which is CLAUDE.md's
+  extraction trigger. Both copies are deleted and `agnosai_order_str_cmp` lives
+  in `src/order.cyr`, which already precedes every caller in `src/main.cyr`'s
+  single-pass include order. Behaviour is unchanged — `orch_scheduler` (77) and
+  `orch_plan_cache` (40) stay green — and `tests/order.tcyr` gains **16
+  assertions** for the contract itself: prefix ordering, no case folding
+  (`"Z" < "a"`), unsigned bytes, and an embedded NUL that does not terminate
+  the comparison.
+
+  ⚠ Both original copies masked each byte with `& 255` "to force an unsigned
+  compare". **The mask was dead code** — `load8` zero-extends by definition of
+  the language (`movzx rax, byte [rcx]` on x86-64, `ldrb w0` on aarch64), which
+  a mutation confirmed: dropping it left all 64 assertions green, including the
+  0xFF one written specifically to catch a signed read. Removed, with the
+  reason recorded in place rather than a comment claiming it was load-bearing.
 
 - **`[deps.majra]` 2.5.3 → 2.6.0**, which fixes the four relay defects reported
   from here — chiefly that `relay_receive` was not reentrant. Verified after

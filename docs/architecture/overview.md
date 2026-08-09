@@ -38,13 +38,22 @@ agnosai
   ├── core           (foundation types — agents, tasks, crews, errors)
   ├── orchestrator   (scheduling, scoring, pub/sub, crew runner)
   ├── llm            (hoosh re-exports, task-complexity routing)
-  ├── fleet          (distribution, placement, relay, GPU) [feature: fleet]
+  ├── fleet          (registry, placement, GPU, state, relay, discovery,
+  │                   coordinator, federation, topology, cost, environment)
+  │                                                        [feature: fleet]
   ├── sandbox        (WASM, process isolation) [feature: sandbox]
   ├── tools          (tool trait, registry, builtins)
   ├── learning       (RL, profiling, capability scoring)
   ├── definitions    (loader, assembler, versioning, packaging) [feature: definitions]
   └── server         (axum HTTP, MCP, A2A, SSE)
 ```
+
+⚠ The `[feature: …]` markers describe **`rust-old/`'s `Cargo.toml`**, which is
+useful when reading the oracle. They are **not** the Cyrius port's scope: the
+port builds every module unconditionally, because a cargo feature gate is not a
+scope boundary. `fleet` is fully ported as of 2026-08-08 — all twelve of the
+oracle's modules — and `src/fleet/mod.cyr` is included from `src/main.cyr` with
+no gate. See [`roadmap.md`](../development/roadmap.md) for what remains.
 
 ## Key Data Flow
 

@@ -155,29 +155,32 @@ unchanged at **35**, and all 57 suites stayed green across the bump.
 
 ## Source
 
-`src/` mirrors `rust-old/src/` — see CLAUDE.md's *Layout* rule. Generated from the
-tree 2026-08-03:
+`src/` mirrors `rust-old/src/` — see CLAUDE.md's *Layout* rule. Regenerated from
+the tree 2026-08-08 with `find src -maxdepth 1 -name '*.cyr'` per group:
 
 | Group | Files | Lines | Oracle |
 |---|---|---|---|
-| `orchestrator/` | 16 | 5,311 | ✅ complete (M5) |
-| `server/` | 11 | 4,008 | ✅ complete (M6) |
-| `core/` | 8 | 3,129 | ✅ complete (M2) |
-| `tools/builtin/` | 6 | 2,017 | ✅ complete (M4) |
-| `server/routes/` | 10 | 2,040 | ✅ complete (M6) |
-| `llm/` | 4 | 1,198 | ✅ complete (M3) |
-| `tools/` | 5 | 1,057 | ✅ complete (M4) |
+| `orchestrator/` | 16 | 5,632 | ✅ complete (M5) |
+| `server/` | 11 | 4,291 | ✅ complete (M6) |
+| `fleet/` | 12 | 3,676 | ✅ complete (M8) |
+| `sandbox/` | 9 | 3,345 | ✅ complete (M7) |
+| `core/` | 8 | 3,305 | ✅ complete (M2) |
+| `server/routes/` | 10 | 2,686 | ✅ complete (M6) |
+| `tools/builtin/` | 7 | 2,138 | ✅ complete (M4) |
+| `llm/` | 4 | 1,229 | ✅ complete (M3) |
+| `tools/` | 5 | 1,144 | ✅ complete (M4) |
 | `learning/` | 6 | 1,018 | ✅ complete (M2) |
-| root (port-local) | 6 | 961 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
-| **total (STALE — 2026-08-03)** | **72** | **20,739** | against a 27,683-line oracle |
-| **total (current — 2026-08-07)** | **82** | **25,830** | against a **41,163**-line oracle |
+| root (port-local) | 6 | 1,054 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
+| **total** | **94** | **29,518** | against a **41,163**-line oracle |
 
-⚠ **The per-group rows above are stale by 10 files and 5,091 lines** and are kept
-only until someone regenerates them from `find src -name '*.cyr' \| xargs wc -l`.
-This file carried two disagreeing inventory tables for four days — this one and
-the *Where the port is* table below. **The 82/25,830 figure is the correct one**,
-and the oracle denominator is **41,163**, not 27,683 (see the banner below for
-what the smaller number leaves out).
+Regenerate with:
+
+```sh
+find src -name '*.cyr' | xargs wc -l | tail -1
+```
+
+⚠ The oracle denominator is **41,163**, not the 27,683 this file carried until
+2026-08-07 — see the banner below for what the smaller number leaves out.
 
 **Oracle groups still owed** (`sandbox/` completed at M7, so this table is
 narrower than it was; the scope qualifiers on the rest are **removed** — see the
@@ -185,9 +188,36 @@ corrected section below):
 
 | Group | Rust lines | Milestone | Scope |
 |---|---|---|---|
-| `fleet/` | 4,443 | M8 | whole |
 | `definitions/` | 1,460 | M10 | whole — **ZIP and YAML included**; both former blockers are already in `lib/` (sankoch, bayan) |
 | `telemetry/` | 322 | M9 | whole — OTLP **and** the ungated logging init |
+
+`fleet/` left this table on **2026-08-08**: all twelve of the oracle's modules
+are ported.
+
+**M8 `fleet` bite log — ✅ COMPLETE 2026-08-08.** Each module carries its own
+`.tcyr`; the assertion counts are the suites', not the oracle's:
+
+| module | oracle lines | assertions | oracle tests |
+|---|---|---|---|
+| `cost_planning` | 275 | 48 | 10 |
+| `registry` | 573 | 67 | 20 |
+| `placement` | 443 | 58 | 12 |
+| `gpu` | 445 | 65 | 15 |
+| `state` | 558 | 95 | 17 |
+| `environment` | 261 | 62 | 8 |
+| `relay` | 350 | 58 | 9 |
+| `discovery` | 174 | 29 | 7 |
+| `coordinator` | 530 | 81 | 17 |
+| `federation` | 587 | 119 | 19 |
+| `topology` | 219 | 39 | 6 |
+| `mod` | 28 | — | — |
+| **total** | **4,443 (100%)** | **721** | **140** |
+
+Two of the group's bites were not just ports. `relay` is a genuine wrapper over
+majra only because four upstream defects were fixed first (**majra 2.6.0**);
+`coordinator` and `federation` each reproduce oracle arithmetic that reads like
+a bug — `max_retries` allowing one fewer retry than it names, and
+`declare_coordinator` adopting any term that is not stale.
 
 **`src/main.cyr` is no longer a stub** — as of 2026-08-03 it wires the shared
 state, installs a `signalfd` SIGINT/SIGTERM handler, and calls `agnosai_serve`
@@ -942,18 +972,27 @@ cyrius build src/main.cyr build/agnosai && cyrius tests tests && \
   cyrius coverage --min 80 && ./scripts/check-clean.sh && ./scripts/check-symbols.sh
 ```
 
-Expected as of 2026-08-07: build clean, **66 suites / 5,559 assertions / 0
-failed**, coverage **100% (1099/1099)**, cleanliness clean, **1,834 symbols
-across 82 files**. `cyrius tests tests` takes several minutes; for a single suite
-use `cyrius build tests/<name>.tcyr /tmp/t && /tmp/t`, which is seconds.
+Expected as of 2026-08-08: build clean, **78 suites / 6,305 assertions / 0
+failed**, coverage **100% (1326/1326)** over 86 referenced files, cleanliness
+clean (fmt 172 · lint 94 · doc 94 · vet+deny · deps 113 verified · lib snapshot
+107), **2,160 symbols across 94 files**.
+
+`cyrius tests tests` takes several minutes; for a single suite use
+`cyrius build tests/<name>.tcyr /tmp/t && /tmp/t`, which is seconds.
+
+⚠ A backgrounded sweep enumerates its suites **once, at launch**. A suite added
+while it runs is silently excluded and the pass count still reads green — which
+happened on 2026-08-08 (77 of 78, missing `fleet_topology`). Re-enumerate, or
+re-run the sweep, after adding a `.tcyr`.
 
 **What a next session would most usefully pick up**, in rough order of value:
 
 > ⚠ **Rewritten 2026-08-07.** The previous version of this table ranked M8/M10
 > last as *"past the parity bar rather than debt"*. That framing is retired.
 >
-> **The oracle is 41,163 lines, not 27,683 — and 15,427 of them are unported
-> (37.5%).** The 27,683 headline counts only `rust-old/src/**/*.rs`. It excludes
+> **The oracle is 41,163 lines, not 27,683.** 15,427 were unported when this
+> banner was written; **M8 `fleet` closed 4,443 of them on 2026-08-08**, leaving
+> **10,984 (26.7%)**. The 27,683 headline counts only `rust-old/src/**/*.rs`. It excludes
 > `rust-old/` minus `src/` (11,998 lines — benches, supply-chain, fuzz, tests,
 > examples, Makefile), `src/presets/*.json` (810 lines, `include_str!`'d **into
 > the binary**), and 672 lines of Rust-era files at this repo's own root
@@ -961,10 +1000,14 @@ use `cyrius build tests/<name>.tcyr /tmp/t && /tmp/t`, which is seconds.
 >
 > **A first draft of this banner said "~6,225 lines" — fleet + definitions +
 > telemetry only. That undercounts the src figure by 24% and the true figure by
-> 2.5x.** Of the 8,206 unported *src* lines, only 6,225 are in the three
-> unstarted groups; the rest are holes inside groups this file calls complete.
+> 2.5x.** Of the 8,206 unported *src* lines it then counted, only 6,225 were in
+> the unstarted groups; the rest are holes inside groups this file calls
+> complete. With `fleet` closed the *src* remainder is **3,763**, of which M10
+> `definitions` is 1,460 and M9 `telemetry` 322 — leaving **1,981 that are holes
+> inside groups this file calls complete**. The two named milestones are now the
+> *smaller* half of the src work left.
 >
-> ⚠ **"M0–M7 complete" is false for five of the eight.** M2 (`hwaccel` half of
+> ⚠ **"M0–M8 complete" is false for five of the nine.** M2 (`hwaccel` half of
 > `core/resource.rs`), M3 (`hwaccel` half of `llm/router.rs`, all of
 > `llm/inference_queue.rs`), M4 (`tools/{python_tool,wasm_tool,wasm_loader}.rs`
 > absent), M6 (`routes/definitions.rs`'s populated arm absent; `/metrics` serves
@@ -972,7 +1015,6 @@ use `cyrius build tests/<name>.tcyr /tmp/t && /tmp/t`, which is seconds.
 
 | | Why |
 |---|---|
-| **M8 `fleet`** (4,443 lines) | The largest unported group, and the single biggest remaining chunk of the port. Break into small bites; `discovery.rs` is a 174-line stub needing no sandhi, and `relay.rs` maps near-1:1 onto majra's `relay_*`. |
 | **M10 `definitions`** (1,460 lines) | Whole, including ZIP and YAML. **Declaring `sankoch` in `cyrius.cyml` is the entire ZIP prerequisite** — 26 `zip_*` fns are already in `lib/`. bayan's YAML is already there too. Turns `/api/v1/presets` from `[]` into a real branch. |
 | **M9 `telemetry`** (322 lines) | OTLP export (copy hoosh's `otlp.cyr`, 199 lines; thread-local trace context is mandatory under `run_pooled`) plus the JSON-logging + `EnvFilter` divergence, which starts as a sakshi filing — file it early so it lands while the rest is being ported. |
 | The `sandbox`-gated tools | `tools/{python_tool,wasm_tool,wasm_loader}.rs`, plus the `hwaccel` half of `core/resource.cyr`. **kavach already has a wasmtime backend with `--fuel`** (`lib/kavach.cyr:9867`), so the WASM pair is portable now. |
@@ -989,10 +1031,10 @@ dead-end levers are recorded under *Benchmarks*.
 
 | | |
 |---|---|
-| Cyrius port | **25,830 lines**, 82 files, `src/` mirroring `rust-old/src/` |
-| Rust oracle | 27,683 lines at `rust-old/` — frozen |
-| Milestones | **M0–M7 complete** — the server tier serves, and M7 `sandbox`'s eight modules are ported with the 2026-08-04 audit's 43 findings all fixed 2026-08-05 (41 mutation-verified) |
-| Not started | M8 `fleet`, M9 `telemetry`, M10 `definitions` — but only part of M9 is a **default-build** gap; see below |
+| Cyrius port | **29,518 lines**, 94 files, `src/` mirroring `rust-old/src/` |
+| Rust oracle | **41,163 lines** at `rust-old/` — frozen. (27,683 is the `src/`-only figure this file carried until 2026-08-07; see the banner above.) |
+| Milestones | **M0–M8 complete** — the server tier serves; M7 `sandbox`'s eight modules carry the 2026-08-04 audit's 43 findings all fixed (41 mutation-verified); **M8 `fleet` closed 2026-08-08** at 12/12 modules and 719 assertions. Read the ⚠ below: "complete" is per-milestone, not per-group |
+| Not started | M9 `telemetry`, M10 `definitions`, M11 (sandbox-gated tools + hwaccel), M12 (llm residue, tokio tests, benches, non-`src`). **M8 `fleet` closed 2026-08-08** |
 | Gates | build OK · 1,834 symbols / 82 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · coverage **100% (1099/1099)** via `cyrius coverage --min 80` |
 
 ### What "M8/M9/M10 not started" actually means — corrected 2026-08-07

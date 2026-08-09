@@ -1,0 +1,515 @@
+# =========================================================================
+# fleet/federation — multi-cluster federation, coordinator election, health.
+#
+# Parity oracle: rust-old/src/fleet/federation.rs
+#
+# ## The liveness comparison is `>`, and `registry`'s is `>=`
+#
+# `check_liveness` demotes on `elapsed > timeout`; `NodeRegistry::update_statuses`
+# demotes on `elapsed >= ttl`. The two sweeps look alike and are not, so a
+# reader who ports one from the other introduces an off-by-one at exactly the
+# boundary. Reproduced separately and pinned separately.
+#
+# For the same reason the comparison happens in **nanoseconds**: the oracle
+# compares `Duration`s, which carry nanosecond precision, so truncating elapsed
+# to whole milliseconds first would delay every demotion by up to 1 ms and turn
+# a strict `>` at the boundary into an accidental `>=`. Timeouts are *stored*
+# in milliseconds because that is what a config file carries.
+#
+# ## `declare_coordinator` accepts an EQUAL or FUTURE term
+#
+# The guard is `term < self.election.term`, so only a **stale** declaration is
+# refused. A declaration at the current term is accepted (that is how
+# `elect_by_lowest_id` completes its own election), and one at a *higher* term
+# is accepted and **adopts** that term — a peer can advance this cluster's term
+# without an election ever running here. Raft-inspired, not Raft: there is no
+# vote, no log, and no quorum. Do not "fix" the guard to `<=` without an ADR.
+#
+# ## `elect_by_lowest_id` cannot fail, and the oracle's `None` is unreachable
+#
+# The candidate list is the online peers **plus this cluster's own id**, so it
+# is never empty and `candidates.first()` is always `Some`. The port returns the
+# winner's Str and never 0. See roadmap section E — the branch is kept in the
+# oracle's shape only in the sense that the doc comment still describes it.
+#
+# The oracle builds that list, sorts it, dedups it and takes the first element.
+# That is the **minimum** by byte-wise lexicographic order, so this takes the
+# minimum directly: observably identical, and it allocates nothing on the
+# no-free global bump. `dedup()` cannot change a first element, and the sorted
+# list is discarded.
+#
+# ## No `str_clone` anywhere
+#
+# The oracle's `cluster_id.clone()` calls exist to satisfy the borrow checker
+# while one `String` reaches both the map key and the struct field. Both
+# public entry points take their `Str` **by value** in the oracle's sense — the
+# caller has handed ownership over — so the port stores the pointer in both
+# slots. A caller passing a `Str` that borrows a stack buffer must clone it
+# first, which is the same contract every other `fleet` module carries.
+# =========================================================================
+
+# This cluster's role in the federation.
+enum AgnosaiFederationRole {
+    AGNOSAI_FED_COORDINATOR = 0;
+    AGNOSAI_FED_FOLLOWER = 1;
+    AGNOSAI_FED_CANDIDATE = 2;
+}
+
+# Health of a peer cluster. `Suspect` is "missed a heartbeat but inside the
+# grace period" — `online_clusters` excludes it, and so does the election.
+enum AgnosaiClusterStatus {
+    AGNOSAI_CLUSTER_ONLINE = 0;
+    AGNOSAI_CLUSTER_SUSPECT = 1;
+    AGNOSAI_CLUSTER_OFFLINE = 2;
+}
+
+# ClusterInfo heap layout — 56 bytes. Field order mirrors the oracle's struct.
+enum AgnosaiClusterInfoOff {
+    AGN_CLI_ID = 0;
+    AGN_CLI_ENDPOINT = 8;
+    AGN_CLI_STATUS = 16;
+    AGN_CLI_ROLE = 24;
+    AGN_CLI_NODE_COUNT = 32;
+    # Wall clock, serialised.
+    AGN_CLI_LAST_HEARTBEAT = 40;
+    # Monotonic ns, `#[serde(skip)]` in the oracle. Liveness reads only this.
+    AGN_CLI_LAST_HEARTBEAT_INSTANT = 48;
+    AGN_CLI_SIZE = 56;
+}
+
+# ElectionState heap layout — 24 bytes. `AGN_ELS_` rather than `AGN_ES_`, which
+# `src/server/sse.cyr:189` already owns.
+enum AgnosaiElectionStateOff {
+    AGN_ELS_TERM = 0;
+    # 0 for the oracle's `None` — no coordinator elected.
+    AGN_ELS_COORDINATOR = 8;
+    AGN_ELS_TERM_STARTED = 16;
+    AGN_ELS_SIZE = 24;
+}
+
+# FederationConfig heap layout — 48 bytes.
+enum AgnosaiFederationConfigOff {
+    AGN_FCF_CLUSTER_ID = 0;
+    AGN_FCF_ENDPOINT = 8;
+    AGN_FCF_SEEDS = 16;
+    AGN_FCF_SUSPECT_TIMEOUT_MS = 24;
+    AGN_FCF_OFFLINE_TIMEOUT_MS = 32;
+    AGN_FCF_ELECTION_TIMEOUT_MS = 40;
+    AGN_FCF_SIZE = 48;
+}
+
+# FederationManager heap layout — 32 bytes.
+enum AgnosaiFederationManagerOff {
+    AGN_FDM_CONFIG = 0;
+    AGN_FDM_ROLE = 8;
+    AGN_FDM_CLUSTERS = 16;
+    AGN_FDM_ELECTION = 24;
+    AGN_FDM_SIZE = 32;
+}
+
+# The oracle's `Duration::from_secs(10)` / `from_secs(30)` / `from_secs(5)`.
+var AGNOSAI_FED_SUSPECT_TIMEOUT_MS = 10000;
+var AGNOSAI_FED_OFFLINE_TIMEOUT_MS = 30000;
+var AGNOSAI_FED_ELECTION_TIMEOUT_MS = 5000;
+
+# --- FederationConfig ----------------------------------------------------
+
+# A config for this cluster, with the oracle's default timeouts and no seeds.
+fn agnosai_federation_config_new(cluster_id: Str, endpoint: Str): i64 {
+    var c = alloc(AGN_FCF_SIZE);
+    store64(c + AGN_FCF_CLUSTER_ID, cluster_id);
+    store64(c + AGN_FCF_ENDPOINT, endpoint);
+    store64(c + AGN_FCF_SEEDS, vec_new());
+    store64(c + AGN_FCF_SUSPECT_TIMEOUT_MS, AGNOSAI_FED_SUSPECT_TIMEOUT_MS);
+    store64(c + AGN_FCF_OFFLINE_TIMEOUT_MS, AGNOSAI_FED_OFFLINE_TIMEOUT_MS);
+    store64(c + AGN_FCF_ELECTION_TIMEOUT_MS, AGNOSAI_FED_ELECTION_TIMEOUT_MS);
+    return c;
+}
+
+# The oracle's `FederationConfig::default()` — empty id and endpoint.
+fn agnosai_federation_config_default(): i64 {
+    return agnosai_federation_config_new(str_from(""), str_from(""));
+}
+
+# Override the liveness and election timeouts. Mutates and returns, since
+# Cyrius has no move semantics to consume `self`.
+fn agnosai_federation_config_with_timeouts(c, suspect_ms, offline_ms, election_ms): i64 {
+    store64(c + AGN_FCF_SUSPECT_TIMEOUT_MS, suspect_ms);
+    store64(c + AGN_FCF_OFFLINE_TIMEOUT_MS, offline_ms);
+    store64(c + AGN_FCF_ELECTION_TIMEOUT_MS, election_ms);
+    return c;
+}
+
+# Append a discovery seed endpoint.
+fn agnosai_federation_config_with_seed(c, seed: Str): i64 {
+    vec_push(load64(c + AGN_FCF_SEEDS), seed);
+    return c;
+}
+
+# This cluster's id.
+fn agnosai_federation_config_cluster_id(c): i64 {
+    return load64(c + AGN_FCF_CLUSTER_ID);
+}
+
+# This cluster's control-plane endpoint.
+#
+# ⚠ Stored and never read by any method — the oracle does not use it either.
+# It exists so a caller can advertise itself; nothing in `federation` sends.
+fn agnosai_federation_config_endpoint(c): i64 {
+    return load64(c + AGN_FCF_ENDPOINT);
+}
+
+# The discovery seed endpoints.
+#
+# ⚠ Also never read by any method. The oracle logs `seeds.len()` at startup and
+# otherwise leaves discovery to the caller.
+fn agnosai_federation_config_seeds(c): i64 {
+    return load64(c + AGN_FCF_SEEDS);
+}
+
+# Milliseconds without a heartbeat before a cluster is Suspect.
+fn agnosai_federation_config_suspect_timeout_ms(c): i64 {
+    return load64(c + AGN_FCF_SUSPECT_TIMEOUT_MS);
+}
+
+# Milliseconds without a heartbeat before a cluster is Offline.
+fn agnosai_federation_config_offline_timeout_ms(c): i64 {
+    return load64(c + AGN_FCF_OFFLINE_TIMEOUT_MS);
+}
+
+# The election timeout.
+#
+# ⚠ Never read by any method here. The oracle's doc says "randomized up to 2x
+# this value" and nothing randomizes it — the timer lives in whatever drives
+# `start_election`, which `federation` does not own. Carried so a caller that
+# does own the timer has one place to configure it.
+fn agnosai_federation_config_election_timeout_ms(c): i64 {
+    return load64(c + AGN_FCF_ELECTION_TIMEOUT_MS);
+}
+
+# --- ClusterInfo ---------------------------------------------------------
+
+# The cluster's id.
+fn agnosai_cluster_info_id(c): i64 {
+    return load64(c + AGN_CLI_ID);
+}
+
+# The cluster's control-plane endpoint, as of its last heartbeat.
+fn agnosai_cluster_info_endpoint(c): i64 {
+    return load64(c + AGN_CLI_ENDPOINT);
+}
+
+# The cluster's health.
+fn agnosai_cluster_info_status(c): i64 {
+    return load64(c + AGN_CLI_STATUS);
+}
+
+# The cluster's federation role.
+fn agnosai_cluster_info_role(c): i64 {
+    return load64(c + AGN_CLI_ROLE);
+}
+
+# How many nodes the cluster reported.
+fn agnosai_cluster_info_node_count(c): i64 {
+    return load64(c + AGN_CLI_NODE_COUNT);
+}
+
+# Wall-clock seconds of the last heartbeat — the serialised field.
+fn agnosai_cluster_info_last_heartbeat(c): i64 {
+    return load64(c + AGN_CLI_LAST_HEARTBEAT);
+}
+
+# Monotonic nanoseconds of the last heartbeat. **This** is what liveness reads,
+# so an NTP step can never resurrect a dead cluster or evict a healthy one.
+fn agnosai_cluster_info_last_heartbeat_instant(c): i64 {
+    return load64(c + AGN_CLI_LAST_HEARTBEAT_INSTANT);
+}
+
+# Set the cluster's health directly, bypassing the liveness sweep.
+#
+# Every `ClusterInfo` field is `pub` in the oracle and its own tests write this
+# one (`c.status = ClusterStatus::Offline`) to reach `evict_offline` without
+# waiting out a timeout. Ported as a fn because Cyrius has no field access —
+# the surface is the oracle's, not a test hook.
+fn agnosai_cluster_info_set_status(c, status): i64 {
+    store64(c + AGN_CLI_STATUS, status);
+    return 0;
+}
+
+# Backdate (or advance) the monotonic heartbeat instant.
+#
+# The other `pub` field the oracle's tests write, for the same reason: it is how
+# `check_liveness` and `evict_offline` are driven without real sleeps.
+fn agnosai_cluster_info_set_last_heartbeat_instant(c, instant_ns): i64 {
+    store64(c + AGN_CLI_LAST_HEARTBEAT_INSTANT, instant_ns);
+    return 0;
+}
+
+# --- FederationManager ---------------------------------------------------
+
+# A manager for `config`. Starts as a Follower at term 0 with no coordinator.
+fn agnosai_federation_manager_new(config): i64 {
+    sakshi_info("federation manager initialized", 30);
+    var fm = alloc(AGN_FDM_SIZE);
+    store64(fm + AGN_FDM_CONFIG, config);
+    store64(fm + AGN_FDM_ROLE, AGNOSAI_FED_FOLLOWER);
+    store64(fm + AGN_FDM_CLUSTERS, map_new_str());
+    var e = alloc(AGN_ELS_SIZE);
+    store64(e + AGN_ELS_TERM, 0);
+    store64(e + AGN_ELS_COORDINATOR, 0);
+    store64(e + AGN_ELS_TERM_STARTED, clock_now_ns());
+    store64(fm + AGN_FDM_ELECTION, e);
+    return fm;
+}
+
+# This manager's config.
+fn agnosai_federation_config(fm): i64 {
+    return load64(fm + AGN_FDM_CONFIG);
+}
+
+# Register or refresh a peer cluster from a heartbeat.
+#
+# ⚠ The status is set Online **unconditionally**, so a Suspect or Offline
+# cluster recovers the moment it reports in.
+#
+# ⚠ The **role is written only on insert**. The oracle's `or_insert_with` seeds
+# Follower and the four assignments that follow do not touch `role`, so a
+# cluster elected Coordinator keeps that role across every later heartbeat.
+# Re-seeding it here would silently demote the coordinator on its next beat.
+fn agnosai_federation_heartbeat(fm, cluster_id: Str, endpoint: Str, node_count): i64 {
+    var now = clock_now_ns();
+    var m = load64(fm + AGN_FDM_CLUSTERS);
+    var c = map_get(m, cluster_id);
+    if (c == 0) {
+        sakshi_info("new cluster joined federation", 29);
+        c = alloc(AGN_CLI_SIZE);
+        store64(c + AGN_CLI_ID, cluster_id);
+        store64(c + AGN_CLI_ROLE, AGNOSAI_FED_FOLLOWER);
+        map_set(m, cluster_id, c);
+    }
+    store64(c + AGN_CLI_ENDPOINT, endpoint);
+    store64(c + AGN_CLI_NODE_COUNT, node_count);
+    store64(c + AGN_CLI_STATUS, AGNOSAI_CLUSTER_ONLINE);
+    store64(c + AGN_CLI_LAST_HEARTBEAT, clock_epoch_secs());
+    store64(c + AGN_CLI_LAST_HEARTBEAT_INSTANT, now);
+    sakshi_debug("heartbeat received", 18);
+    return 0;
+}
+
+# Sweep every cluster and demote it by heartbeat age.
+#
+# ⚠ Offline is tested FIRST and the arms are `if` / `else if`: the timeouts
+# overlap by construction (30 s >= 10 s), so testing Suspect first would pin a
+# long-dead cluster at Suspect forever.
+#
+# ⚠ The comparison is strictly `>`, unlike `NodeRegistry::update_statuses`'s
+# `>=`, and it runs in nanoseconds — see the module header.
+#
+# ⚠ Only ever demotes. Nothing here restores Online; only a heartbeat does.
+fn agnosai_federation_check_liveness(fm): i64 {
+    var m = load64(fm + AGN_FDM_CLUSTERS);
+    var cfg = load64(fm + AGN_FDM_CONFIG);
+    var now = clock_now_ns();
+    var off_ns = load64(cfg + AGN_FCF_OFFLINE_TIMEOUT_MS) * 1000000;
+    var sus_ns = load64(cfg + AGN_FCF_SUSPECT_TIMEOUT_MS) * 1000000;
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            var c = _agnosai_map_slot_val(m, i);
+            var elapsed = now - load64(c + AGN_CLI_LAST_HEARTBEAT_INSTANT);
+            var status = load64(c + AGN_CLI_STATUS);
+            if (elapsed > off_ns && status != AGNOSAI_CLUSTER_OFFLINE) {
+                sakshi_warn("cluster marked offline", 22);
+                store64(c + AGN_CLI_STATUS, AGNOSAI_CLUSTER_OFFLINE);
+            } else {
+                if (elapsed > sus_ns && status == AGNOSAI_CLUSTER_ONLINE) {
+                    sakshi_warn("cluster marked suspect", 22);
+                    store64(c + AGN_CLI_STATUS, AGNOSAI_CLUSTER_SUSPECT);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# Start a new election term. This cluster becomes a Candidate. Returns the term.
+#
+# ⚠ Clears the coordinator, so calling this abandons a perfectly good leader
+# even if the election never completes. The oracle does the same.
+fn agnosai_federation_start_election(fm): i64 {
+    var e = load64(fm + AGN_FDM_ELECTION);
+    store64(e + AGN_ELS_TERM, load64(e + AGN_ELS_TERM) + 1);
+    store64(e + AGN_ELS_COORDINATOR, 0);
+    store64(e + AGN_ELS_TERM_STARTED, clock_now_ns());
+    store64(fm + AGN_FDM_ROLE, AGNOSAI_FED_CANDIDATE);
+    sakshi_info("starting election", 17);
+    return load64(e + AGN_ELS_TERM);
+}
+
+# Declare a coordinator for `term`. Returns 1 if accepted, 0 if stale.
+#
+# ⚠ Only a term **below** the current one is refused. An equal term is accepted
+# — that is how `elect_by_lowest_id` finishes its own election — and a HIGHER
+# term is accepted and adopted, advancing this cluster's term with no election.
+#
+# ⚠ Every known cluster is reset to Follower before the winner is promoted, so
+# a previous coordinator is demoted even when it is not the one being replaced.
+# If the winner is not a known cluster the reset still happens and nobody holds
+# the Coordinator role, while `self`'s own role is set from the id comparison.
+fn agnosai_federation_declare_coordinator(fm, term, coordinator_id: Str): i64 {
+    var e = load64(fm + AGN_FDM_ELECTION);
+    if (term < load64(e + AGN_ELS_TERM)) {
+        sakshi_debug("ignoring stale coordinator declaration", 38);
+        return 0;
+    }
+    sakshi_info("coordinator elected", 19);
+    store64(e + AGN_ELS_TERM, term);
+    store64(e + AGN_ELS_COORDINATOR, coordinator_id);
+
+    var self_id = load64(load64(fm + AGN_FDM_CONFIG) + AGN_FCF_CLUSTER_ID);
+    if (str_eq(coordinator_id, self_id) == 1) {
+        store64(fm + AGN_FDM_ROLE, AGNOSAI_FED_COORDINATOR);
+    } else {
+        store64(fm + AGN_FDM_ROLE, AGNOSAI_FED_FOLLOWER);
+    }
+
+    var m = load64(fm + AGN_FDM_CLUSTERS);
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            store64(_agnosai_map_slot_val(m, i) + AGN_CLI_ROLE, AGNOSAI_FED_FOLLOWER);
+        }
+    }
+    var win = map_get(m, coordinator_id);
+    if (win != 0) { store64(win + AGN_CLI_ROLE, AGNOSAI_FED_COORDINATOR); }
+    return 1;
+}
+
+# Elect the lowest cluster id among this cluster and its ONLINE peers, declare
+# it, and return the winner.
+#
+# ⚠ Never returns 0: this cluster is always a candidate regardless of its own
+# health, so the oracle's `None` arm is unreachable. See the module header for
+# why taking the minimum is exactly the oracle's sort-dedup-first.
+#
+# ⚠ Suspect and Offline peers are excluded, so a suspect cluster holding the
+# lowest id cannot win — and a heartbeat from it changes the outcome.
+fn agnosai_federation_elect_by_lowest_id(fm): i64 {
+    var term = agnosai_federation_start_election(fm);
+    var m = load64(fm + AGN_FDM_CLUSTERS);
+    var best = load64(load64(fm + AGN_FDM_CONFIG) + AGN_FCF_CLUSTER_ID);
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            var c = _agnosai_map_slot_val(m, i);
+            if (load64(c + AGN_CLI_STATUS) == AGNOSAI_CLUSTER_ONLINE) {
+                var id = load64(c + AGN_CLI_ID);
+                if (agnosai_order_str_cmp(id, best) < 0) { best = id; }
+            }
+        }
+    }
+    agnosai_federation_declare_coordinator(fm, term, best);
+    return best;
+}
+
+# The elected coordinator's id, or 0 for the oracle's `None`.
+fn agnosai_federation_coordinator(fm): i64 {
+    return load64(load64(fm + AGN_FDM_ELECTION) + AGN_ELS_COORDINATOR);
+}
+
+# Whether this cluster holds the Coordinator role.
+fn agnosai_federation_is_coordinator(fm): i64 {
+    if (load64(fm + AGN_FDM_ROLE) == AGNOSAI_FED_COORDINATOR) { return 1; }
+    return 0;
+}
+
+# This cluster's role.
+fn agnosai_federation_role(fm): i64 {
+    return load64(fm + AGN_FDM_ROLE);
+}
+
+# The current election term.
+fn agnosai_federation_term(fm): i64 {
+    return load64(load64(fm + AGN_FDM_ELECTION) + AGN_ELS_TERM);
+}
+
+# When the current term started, in monotonic nanoseconds.
+fn agnosai_federation_term_started(fm): i64 {
+    return load64(load64(fm + AGN_FDM_ELECTION) + AGN_ELS_TERM_STARTED);
+}
+
+# A known cluster by id, or 0 for the oracle's `None`.
+#
+# The oracle's tests reach into the private `clusters` map; this is the public
+# equivalent, matching `NodeRegistry::get`.
+fn agnosai_federation_cluster(fm, cluster_id: Str): i64 {
+    return map_get(load64(fm + AGN_FDM_CLUSTERS), cluster_id);
+}
+
+# Every known cluster, any status.
+#
+# ⚠ Order is the map's slot order, as the oracle's `HashMap::values()` is
+# arbitrary. Do not depend on it.
+fn agnosai_federation_clusters(fm): i64 {
+    var m = load64(fm + AGN_FDM_CLUSTERS);
+    var out = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) { vec_push(out, _agnosai_map_slot_val(m, i)); }
+    }
+    return out;
+}
+
+# Only the Online clusters. Suspect is NOT online.
+fn agnosai_federation_online_clusters(fm): i64 {
+    var m = load64(fm + AGN_FDM_CLUSTERS);
+    var out = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            var c = _agnosai_map_slot_val(m, i);
+            if (load64(c + AGN_CLI_STATUS) == AGNOSAI_CLUSTER_ONLINE) { vec_push(out, c); }
+        }
+    }
+    return out;
+}
+
+# How many clusters are known.
+#
+# ⚠ Excludes this cluster, which is never in the map unless it heartbeats
+# itself — so a lone cluster answers 0 while still winning its own election.
+fn agnosai_federation_cluster_count(fm): i64 {
+    return map_size(load64(fm + AGN_FDM_CLUSTERS));
+}
+
+# Drop every cluster that is Offline **and** older than `ttl_ms`. Returns the
+# evicted ids.
+#
+# ⚠ Both conditions are required: a cluster that just went Offline survives, and
+# an ancient cluster that is merely Suspect survives too.
+#
+# ⚠ Age is measured from the last **heartbeat**, not from when the cluster went
+# Offline, so the offline timeout is already counted inside the TTL.
+#
+# The ids are collected before anything is deleted because the list **is** the
+# return value, matching the oracle's two-phase shape. It is not a safety
+# requirement: `map_delete` (`lib/hashmap.cyr:322`) writes a tombstone in place
+# — slot state 2, never compacted — so deleting mid-walk is harmless. Verified
+# by mutation, which is why this says so instead of claiming a hazard. Only
+# `map_set` may rehash, and nothing inserts here.
+fn agnosai_federation_evict_offline(fm, ttl_ms): i64 {
+    var m = load64(fm + AGN_FDM_CLUSTERS);
+    var now = clock_now_ns();
+    var ttl_ns = ttl_ms * 1000000;
+    var evicted = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            var c = _agnosai_map_slot_val(m, i);
+            if (load64(c + AGN_CLI_STATUS) == AGNOSAI_CLUSTER_OFFLINE) {
+                if (now - load64(c + AGN_CLI_LAST_HEARTBEAT_INSTANT) > ttl_ns) {
+                    vec_push(evicted, load64(c + AGN_CLI_ID));
+                }
+            }
+        }
+    }
+    for (var i = 0; i < vec_len(evicted); i = i + 1) {
+        sakshi_info("evicting offline cluster", 24);
+        map_delete(m, vec_get(evicted, i));
+    }
+    return evicted;
+}

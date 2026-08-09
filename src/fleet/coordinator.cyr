@@ -1,0 +1,350 @@
+# =========================================================================
+# fleet/coordinator — crew fan-out, result aggregation, and failover.
+#
+# Parity oracle: rust-old/src/fleet/coordinator.rs
+#
+# The top of the fleet group: it owns a `CrewStateManager` and consumes the
+# `NodeId` vocabulary `registry` defines.
+#
+# ## The retry arithmetic is off-by-one bait
+#
+# `task_failed` increments FIRST and then tests `count < max_retries`, so the
+# default `max_retries = 3` yields **two** Retry answers and Exhausted on the
+# third failure — not three retries. Reproduced exactly; the oracle's own tests
+# pin both ends.
+#
+# ## `fan_out` gives every node the MAX tasks-per-node, not its own count
+#
+# The state manager takes a single uniform `tasks_per_node`, so the oracle
+# computes the per-node counts and then passes `max()`. A node with fewer tasks
+# is therefore over-provisioned in the state manager's progress accounting —
+# deliberate, and stated in the oracle's own comment ("so every node gets a slot
+# ... the state manager uses a uniform count"). Do not "fix" it to per-node
+# without changing `CrewStateManager::create_run` too.
+#
+# ## `plan_sharding` is `#[cfg(feature = "hwaccel")]` upstream and ported anyway
+#
+# The full-port mandate covers feature-gated code, `[deps.ai-hwaccel]` is
+# already declared and vendored, and the oracle's body is a one-line delegation
+# to `registry.plan_sharding(..)`. So this is `reg_plan_sharding` and nothing
+# else — the planning lives in ai-hwaccel, and a second implementation here
+# would drift from it.
+# =========================================================================
+
+# Status of a fleet task.
+enum AgnosaiFleetTaskStatus {
+    AGNOSAI_FTASK_PENDING = 0;
+    AGNOSAI_FTASK_ASSIGNED = 1;
+    AGNOSAI_FTASK_RUNNING = 2;
+    AGNOSAI_FTASK_COMPLETED = 3;
+    AGNOSAI_FTASK_FAILED = 4;
+    AGNOSAI_FTASK_REASSIGNED = 5;
+}
+
+# What to do after a task failure.
+enum AgnosaiFailoverAction {
+    AGNOSAI_FAILOVER_RETRY = 0;
+    AGNOSAI_FAILOVER_EXHAUSTED = 1;
+    AGNOSAI_FAILOVER_UNKNOWN_TASK = 2;
+}
+
+# FleetTask heap layout — 32 bytes.
+enum AgnosaiFleetTaskOff {
+    AGN_FT_TASK_ID = 0;
+    AGN_FT_DESCRIPTION = 8;
+    # 0 for the oracle's `None` — unassigned.
+    AGN_FT_ASSIGNED_NODE = 16;
+    AGN_FT_STATUS = 24;
+    AGN_FT_SIZE = 32;
+}
+
+# FleetCoordinator heap layout — 32 bytes.
+enum AgnosaiFleetCoordinatorOff {
+    AGN_FC_STATE_MANAGER = 0;
+    AGN_FC_TASKS = 8;
+    AGN_FC_MAX_RETRIES = 16;
+    AGN_FC_RETRY_COUNTS = 24;
+    AGN_FC_SIZE = 32;
+}
+
+# The oracle's `MAX_RETAINED_TASKS`.
+var AGNOSAI_MAX_RETAINED_TASKS = 10000;
+
+# The oracle's default `max_retries`.
+var AGNOSAI_DEFAULT_MAX_RETRIES = 3;
+
+# --- FleetTask -----------------------------------------------------------
+
+# The task's id.
+fn agnosai_fleet_task_id(t): i64 {
+    return load64(t + AGN_FT_TASK_ID);
+}
+
+# The task's description.
+fn agnosai_fleet_task_description(t): i64 {
+    return load64(t + AGN_FT_DESCRIPTION);
+}
+
+# The node this task is assigned to, or 0 for the oracle's `None`.
+fn agnosai_fleet_task_assigned_node(t): i64 {
+    return load64(t + AGN_FT_ASSIGNED_NODE);
+}
+
+# The task's status.
+fn agnosai_fleet_task_status(t): i64 {
+    return load64(t + AGN_FT_STATUS);
+}
+
+# Whether a status is terminal — Completed or Failed. `Reassigned` is NOT
+# terminal: it is a task awaiting another node.
+fn agnosai_fleet_task_status_is_terminal(status): i64 {
+    if (status == AGNOSAI_FTASK_COMPLETED) { return 1; }
+    if (status == AGNOSAI_FTASK_FAILED) { return 1; }
+    return 0;
+}
+
+# --- FleetCoordinator ----------------------------------------------------
+
+# A coordinator with a custom retry ceiling.
+fn agnosai_fleet_coordinator_with_max_retries(max_retries): i64 {
+    var c = alloc(AGN_FC_SIZE);
+    store64(c + AGN_FC_STATE_MANAGER, agnosai_crew_state_manager_new());
+    store64(c + AGN_FC_TASKS, map_new_str());
+    store64(c + AGN_FC_MAX_RETRIES, max_retries);
+    store64(c + AGN_FC_RETRY_COUNTS, map_new_str());
+    return c;
+}
+
+# The oracle's `FleetCoordinator::new` / `Default` — three retries.
+fn agnosai_fleet_coordinator_new(): i64 {
+    return agnosai_fleet_coordinator_with_max_retries(AGNOSAI_DEFAULT_MAX_RETRIES);
+}
+
+# Read-only access to the underlying state manager.
+fn agnosai_fleet_coordinator_state_manager(c): i64 {
+    return load64(c + AGN_FC_STATE_MANAGER);
+}
+
+# The retry ceiling. See the module header: this many FAILURES exhausts a task,
+# so it allows `max_retries - 1` retries.
+fn agnosai_fleet_coordinator_max_retries(c): i64 {
+    return load64(c + AGN_FC_MAX_RETRIES);
+}
+
+# Drop every terminal task once at capacity.
+#
+# ⚠ Same shape as `CrewStateManager`'s: checks `>=` BEFORE inserting and removes
+# ALL terminal tasks rather than the oldest, so a coordinator holding 10,000
+# live tasks evicts nothing and grows past the cap. The cap is a retention
+# floor, not a ceiling.
+fn _agnosai_fc_evict_completed(c): i64 {
+    var tasks = load64(c + AGN_FC_TASKS);
+    if (map_size(tasks) < AGNOSAI_MAX_RETAINED_TASKS) { return 0; }
+    var doomed = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(tasks); i = i + 1) {
+        if (_agnosai_map_slot_live(tasks, i) == 1) {
+            var t = _agnosai_map_slot_val(tasks, i);
+            if (agnosai_fleet_task_status_is_terminal(load64(t + AGN_FT_STATUS)) == 1) {
+                vec_push(doomed, _agnosai_map_slot_key(tasks, i));
+            }
+        }
+    }
+    for (var i = 0; i < vec_len(doomed); i = i + 1) {
+        map_delete(tasks, vec_get(doomed, i));
+        map_delete(load64(c + AGN_FC_RETRY_COUNTS), vec_get(doomed, i));
+    }
+    return 0;
+}
+
+# Fan tasks out to nodes using pre-computed placement assignments, and create
+# the matching crew run. Returns the run id.
+#
+# `tasks` is a vec of [id, description] pairs (16 bytes each) and `assignments`
+# a vec of [id, node_id] pairs. A task with no assignment is stored `Pending`
+# with no node; one with an assignment is `Assigned`.
+fn agnosai_fleet_coordinator_fan_out(c, tasks, assignments): i64 {
+    _agnosai_fc_evict_completed(c);
+
+    var amap = map_new_str();
+    for (var i = 0; i < vec_len(assignments); i = i + 1) {
+        var a = vec_get(assignments, i);
+        map_set(amap, load64(a), load64(a + 8));
+    }
+
+    var nodes = vec_new();
+    var per_node = map_new_str();
+    var store = load64(c + AGN_FC_TASKS);
+
+    for (var i = 0; i < vec_len(tasks); i = i + 1) {
+        var pair = vec_get(tasks, i);
+        var tid = load64(pair);
+        var desc = load64(pair + 8);
+        var node = map_get(amap, tid);
+
+        var t = alloc(AGN_FT_SIZE);
+        store64(t + AGN_FT_TASK_ID, tid);
+        store64(t + AGN_FT_DESCRIPTION, desc);
+        store64(t + AGN_FT_ASSIGNED_NODE, node);
+        if (node == 0) {
+            store64(t + AGN_FT_STATUS, AGNOSAI_FTASK_PENDING);
+        } else {
+            store64(t + AGN_FT_STATUS, AGNOSAI_FTASK_ASSIGNED);
+            _agnosai_dcs_set_add(nodes, node);
+            var slot = map_get(per_node, node);
+            if (slot == 0) {
+                slot = alloc(8);
+                store64(slot, 0);
+                map_set(per_node, node, slot);
+            }
+            store64(slot, load64(slot) + 1);
+        }
+        map_set(store, tid, t);
+    }
+
+    # The MAX per-node count, not each node's own — see the module header.
+    var max_tasks = 0;
+    for (var i = 0; i < _agnosai_map_slots(per_node); i = i + 1) {
+        if (_agnosai_map_slot_live(per_node, i) == 1) {
+            var v = load64(_agnosai_map_slot_val(per_node, i));
+            if (v > max_tasks) { max_tasks = v; }
+        }
+    }
+    return agnosai_crew_state_manager_create_run(load64(c + AGN_FC_STATE_MANAGER),
+    nodes, max_tasks);
+}
+
+# Look up a task by id, or 0 if unknown.
+fn agnosai_fleet_coordinator_task(c, task_id: Str): i64 {
+    return map_get(load64(c + AGN_FC_TASKS), task_id);
+}
+
+# How many tasks the coordinator is tracking.
+fn agnosai_fleet_coordinator_task_count(c): i64 {
+    return map_size(load64(c + AGN_FC_TASKS));
+}
+
+# Mark a task completed. 1 if it existed.
+fn agnosai_fleet_coordinator_task_completed(c, task_id: Str): i64 {
+    var t = map_get(load64(c + AGN_FC_TASKS), task_id);
+    if (t == 0) { return 0; }
+    store64(t + AGN_FT_STATUS, AGNOSAI_FTASK_COMPLETED);
+    return 1;
+}
+
+# Report a task failure and decide what happens next.
+#
+# ⚠ The counter is incremented BEFORE the comparison, and the test is `<`, so
+# `max_retries = 3` gives Retry on failures 1 and 2 and Exhausted on failure 3 —
+# **two** retries, not three. Both ends are pinned by the oracle's own tests.
+fn agnosai_fleet_coordinator_task_failed(c, task_id: Str): i64 {
+    var t = map_get(load64(c + AGN_FC_TASKS), task_id);
+    if (t == 0) { return AGNOSAI_FAILOVER_UNKNOWN_TASK; }
+    var counts = load64(c + AGN_FC_RETRY_COUNTS);
+    var slot = map_get(counts, task_id);
+    if (slot == 0) {
+        slot = alloc(8);
+        store64(slot, 0);
+        map_set(counts, task_id, slot);
+    }
+    store64(slot, load64(slot) + 1);
+    if (load64(slot) < load64(c + AGN_FC_MAX_RETRIES)) {
+        store64(t + AGN_FT_STATUS, AGNOSAI_FTASK_REASSIGNED);
+        return AGNOSAI_FAILOVER_RETRY;
+    }
+    store64(t + AGN_FT_STATUS, AGNOSAI_FTASK_FAILED);
+    return AGNOSAI_FAILOVER_EXHAUSTED;
+}
+
+# Every task assigned to `node_id`.
+#
+# ⚠ Order is the map's slot order, as the oracle's `HashMap::values()` is
+# arbitrary. Do not depend on it.
+fn agnosai_fleet_coordinator_tasks_for_node(c, node_id: Str): i64 {
+    var tasks = load64(c + AGN_FC_TASKS);
+    var out = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(tasks); i = i + 1) {
+        if (_agnosai_map_slot_live(tasks, i) == 1) {
+            var t = _agnosai_map_slot_val(tasks, i);
+            var n = load64(t + AGN_FT_ASSIGNED_NODE);
+            if (n != 0) {
+                if (str_eq(n, node_id) == 1) { vec_push(out, t); }
+            }
+        }
+    }
+    return out;
+}
+
+# Whether every task is terminal.
+#
+# ⚠ An EMPTY coordinator is complete, matching the oracle's early return. A
+# caller must not read "complete" as "did work".
+fn agnosai_fleet_coordinator_is_complete(c): i64 {
+    var tasks = load64(c + AGN_FC_TASKS);
+    if (map_size(tasks) == 0) { return 1; }
+    for (var i = 0; i < _agnosai_map_slots(tasks); i = i + 1) {
+        if (_agnosai_map_slot_live(tasks, i) == 1) {
+            var t = _agnosai_map_slot_val(tasks, i);
+            if (agnosai_fleet_task_status_is_terminal(load64(t + AGN_FT_STATUS)) == 0) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+# Fraction of tasks completed, as an f64 bit pattern in 0.0-1.0.
+#
+# ⚠ Counts only `Completed` — a terminally `Failed` task makes `is_complete`
+# true while leaving this below 1.0, which is the point: "finished" and
+# "succeeded" are different questions. An empty coordinator answers 1.0.
+fn agnosai_fleet_coordinator_completion_pct(c): i64 {
+    var tasks = load64(c + AGN_FC_TASKS);
+    var total = map_size(tasks);
+    if (total == 0) { return f64_from(1); }
+    var done = 0;
+    for (var i = 0; i < _agnosai_map_slots(tasks); i = i + 1) {
+        if (_agnosai_map_slot_live(tasks, i) == 1) {
+            var t = _agnosai_map_slot_val(tasks, i);
+            if (load64(t + AGN_FT_STATUS) == AGNOSAI_FTASK_COMPLETED) { done = done + 1; }
+        }
+    }
+    return f64_div(f64_from(done), f64_from(total));
+}
+
+# Tasks marked `Reassigned` — failed but still retriable.
+fn agnosai_fleet_coordinator_pending_reassignment(c): i64 {
+    var tasks = load64(c + AGN_FC_TASKS);
+    var out = vec_new();
+    for (var i = 0; i < _agnosai_map_slots(tasks); i = i + 1) {
+        if (_agnosai_map_slot_live(tasks, i) == 1) {
+            var t = _agnosai_map_slot_val(tasks, i);
+            if (load64(t + AGN_FT_STATUS) == AGNOSAI_FTASK_REASSIGNED) { vec_push(out, t); }
+        }
+    }
+    return out;
+}
+
+# Move a task to a new node and mark it `Assigned` again. 1 if it existed.
+#
+# ⚠ Unconditional on the current status, matching the oracle — reassigning a
+# terminally Failed or Completed task revives it to Assigned. It also does NOT
+# reset the retry count, so a revived task keeps its failure history and can be
+# exhausted again immediately.
+fn agnosai_fleet_coordinator_reassign(c, task_id: Str, new_node: Str): i64 {
+    var t = map_get(load64(c + AGN_FC_TASKS), task_id);
+    if (t == 0) { return 0; }
+    store64(t + AGN_FT_ASSIGNED_NODE, new_node);
+    store64(t + AGN_FT_STATUS, AGNOSAI_FTASK_ASSIGNED);
+    return 1;
+}
+
+# --- hwaccel -------------------------------------------------------------
+
+# Plan how to distribute a model across the registry's devices.
+#
+# The oracle's `#[cfg(feature = "hwaccel")]` associated fn, a one-line
+# delegation to ai-hwaccel's planner. Returns a ShardingPlan; read it with
+# ai-hwaccel's own `plan_num_shards` / `plan_min_devices` / `plan_to_json`.
+fn agnosai_fleet_plan_sharding(registry, model_params, quant): i64 {
+    return reg_plan_sharding(registry, model_params, quant);
+}

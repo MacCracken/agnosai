@@ -1,0 +1,180 @@
+# =========================================================================
+# fleet/topology — NVLink/XGMI-aware placement scoring.
+#
+# Parity oracle: rust-old/src/fleet/topology.rs
+#
+# The last of the oracle's twelve `fleet` modules, and the smallest: two pure
+# functions over a link list. Both are ported exactly, defects included.
+#
+# ## `topology_score` is NOT bounded by 1.0, whatever its doc says
+#
+# The oracle's doc comment promises "0.0 ... to 1.0" and the body divides a raw
+# link count by the device-pair count with **no clamp and no validation** —
+# links are never checked against the inventory's device indices and never
+# deduplicated. Two GPUs give one pair, so three high-bandwidth links between
+# them score **3.0**. Reproduced as-is: clamping would be a silent divergence,
+# and a caller that ranks nodes by this number needs to know it can exceed 1.
+#
+# ## `supports_tensor_parallel` ignores WHICH devices a link connects
+#
+# It counts high-bandwidth links and compares against `device_count - 1`, the
+# ring-topology minimum. Three links all between devices 0 and 1 therefore
+# "support" a four-way ring. Also the oracle's, also reproduced.
+#
+# ## `interconnect` is stored and never read
+#
+# Neither function looks at it — the whole decision is bandwidth. The field
+# exists because the oracle serialises it, so an operator can see *why* a link
+# is fast. Carried for that reason, not because anything branches on it.
+#
+# ## The `total_pairs == 0` guard cannot fire
+#
+# It is reached only when `gpu_count >= 2`, where `n * (n - 1) / 2 >= 1`. Kept
+# for oracle shape and recorded in `roadmap.md` section E.
+# =========================================================================
+
+# How two devices are linked. ⚠ Never read by either scoring function — see the
+# module header.
+enum AgnosaiInterconnectType {
+    AGNOSAI_INTERCONNECT_PCIE = 0;
+    AGNOSAI_INTERCONNECT_NVLINK = 1;
+    AGNOSAI_INTERCONNECT_XGMI = 2;
+    AGNOSAI_INTERCONNECT_CXL = 3;
+}
+
+# DeviceLink heap layout — 32 bytes.
+enum AgnosaiDeviceLinkOff {
+    AGN_DVL_DEVICE_A = 0;
+    AGN_DVL_DEVICE_B = 8;
+    AGN_DVL_INTERCONNECT = 16;
+    # An f64 bit pattern — compare with f64_ge, never the integer operators.
+    AGN_DVL_BANDWIDTH_GBPS = 24;
+    AGN_DVL_SIZE = 32;
+}
+
+# NodeTopology heap layout — 8 bytes. The oracle's struct is one `Vec`, and it
+# stays a struct rather than a bare vec so `#[non_exhaustive]`'s room to grow
+# survives the port.
+enum AgnosaiNodeTopologyOff {
+    AGN_NTP_LINKS = 0;
+    AGN_NTP_SIZE = 8;
+}
+
+# The oracle's `50.0` GB/s NVLink3+ threshold, as an f64 bit pattern. The
+# comparison is `>=`, so a link at exactly 50 GB/s counts as high bandwidth.
+fn agnosai_topology_high_bw_threshold(): i64 {
+    return f64_from(50);
+}
+
+# --- DeviceLink ----------------------------------------------------------
+
+# A link between two device indices. `bandwidth_gbps` is an f64 bit pattern.
+fn agnosai_device_link_new(device_a, device_b, interconnect, bandwidth_gbps): i64 {
+    var l = alloc(AGN_DVL_SIZE);
+    store64(l + AGN_DVL_DEVICE_A, device_a);
+    store64(l + AGN_DVL_DEVICE_B, device_b);
+    store64(l + AGN_DVL_INTERCONNECT, interconnect);
+    store64(l + AGN_DVL_BANDWIDTH_GBPS, bandwidth_gbps);
+    return l;
+}
+
+# The first device's index.
+fn agnosai_device_link_device_a(l): i64 {
+    return load64(l + AGN_DVL_DEVICE_A);
+}
+
+# The second device's index.
+fn agnosai_device_link_device_b(l): i64 {
+    return load64(l + AGN_DVL_DEVICE_B);
+}
+
+# How the two are linked.
+fn agnosai_device_link_interconnect(l): i64 {
+    return load64(l + AGN_DVL_INTERCONNECT);
+}
+
+# The link's bandwidth in GB/s, as an f64 bit pattern.
+fn agnosai_device_link_bandwidth_gbps(l): i64 {
+    return load64(l + AGN_DVL_BANDWIDTH_GBPS);
+}
+
+# --- NodeTopology --------------------------------------------------------
+
+# The oracle's `NodeTopology::default()` — no links at all.
+fn agnosai_node_topology_new(): i64 {
+    var t = alloc(AGN_NTP_SIZE);
+    store64(t + AGN_NTP_LINKS, vec_new());
+    return t;
+}
+
+# Append a link. Mutates and returns, since Cyrius has no move semantics.
+#
+# ⚠ No validation: a link may name a device index the inventory does not have,
+# and the same pair may be added twice. Both are how the oracle's struct
+# literal behaves, and both are how `topology_score` exceeds 1.0.
+fn agnosai_node_topology_with_link(t, link): i64 {
+    vec_push(load64(t + AGN_NTP_LINKS), link);
+    return t;
+}
+
+# The topology's links.
+fn agnosai_node_topology_links(t): i64 {
+    return load64(t + AGN_NTP_LINKS);
+}
+
+# How many links are at or above the high-bandwidth threshold.
+fn _agnosai_topology_high_bw_count(t): i64 {
+    var links = load64(t + AGN_NTP_LINKS);
+    var thr = agnosai_topology_high_bw_threshold();
+    var n = 0;
+    for (var i = 0; i < vec_len(links); i = i + 1) {
+        if (f64_ge(load64(vec_get(links, i) + AGN_DVL_BANDWIDTH_GBPS), thr) == 1) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+# --- scoring -------------------------------------------------------------
+
+# Score a node's topology for multi-GPU work, as an f64 bit pattern.
+#
+# ⚠ A node with **zero or one** non-CPU device scores 1.0 — topology is
+# irrelevant there, so a CPU-only node is not penalised. The check is
+# `gpu_count <= 1`, not `== 1`.
+#
+# ⚠ Empty links score 0.0, and that is tested BEFORE the pair count, so "no
+# topology data" is pessimistic rather than unknown.
+#
+# ⚠ The result is **not clamped to 1.0** — see the module header.
+fn agnosai_topology_score(topology, inventory): i64 {
+    var devs = agnosai_hw_inventory_devices(inventory);
+    var gpu_count = 0;
+    for (var i = 0; i < vec_len(devs); i = i + 1) {
+        if (agnosai_compute_device_accelerator(vec_get(devs, i)) != AGNOSAI_ACCEL_CPU) {
+            gpu_count = gpu_count + 1;
+        }
+    }
+    if (gpu_count <= 1) { return f64_from(1); }
+    if (vec_len(load64(topology + AGN_NTP_LINKS)) == 0) { return f64_from(0); }
+
+    var total_pairs = gpu_count * (gpu_count - 1) / 2;
+    # Unreachable: gpu_count >= 2 here, so total_pairs >= 1. Oracle shape.
+    if (total_pairs == 0) { return f64_from(1); }
+
+    return f64_div(f64_from(_agnosai_topology_high_bw_count(topology)), f64_from(total_pairs));
+}
+
+# Whether the topology has enough high-bandwidth links for a `device_count`
+# ring. 1 for yes.
+#
+# ⚠ Counts links without looking at which devices they connect, so three links
+# between the same pair satisfy a four-way ring. The oracle's, reproduced.
+#
+# ⚠ `device_count <= 1` is always true — including 0, which also keeps the
+# `device_count - 1` below from going negative.
+fn agnosai_topology_supports_tensor_parallel(topology, device_count): i64 {
+    if (device_count <= 1) { return 1; }
+    if (_agnosai_topology_high_bw_count(topology) >= device_count - 1) { return 1; }
+    return 0;
+}

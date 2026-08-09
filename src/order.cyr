@@ -52,6 +52,41 @@ fn agnosai_cmp_i64_desc(a, b): i64 {
     return 0;
 }
 
+# Byte-wise lexicographic order for two `Str`s: <0, 0 or >0.
+#
+# Rust's `String: Ord` is a byte-wise compare of the UTF-8 encoding, so a
+# shorter string sorts first only when it is a **prefix** of the longer one.
+# `"Z" < "a"` and `"ab" < "b"`; case is not folded. Every oracle `Vec<String>`
+# sort in the port means exactly this.
+#
+# The bytes must compare **unsigned**, or everything above 0x7F would sort
+# before every ASCII byte and non-ASCII ids would order differently from Rust.
+# They already do: `load8` is zero-extending by definition of the language —
+# `movzx rax, byte [rcx]` on x86-64 (`backend/x86/emit.cyr:467`) and `ldrb w0`
+# on aarch64 (`backend/aarch64/emit.cyr:365`), which zeroes the upper half.
+# The two copies this was extracted from each carried an `& 255` that masked
+# nothing; dropping it leaves all 64 assertions in `tests/order.tcyr` green,
+# including the 0xFF one written specifically to catch a signed read.
+#
+# Lives here rather than in a caller because `orchestrator/scheduler`,
+# `orchestrator/plan_cache` and `fleet/federation` all need it — the third
+# instance, which is when CLAUDE.md says to extract. `src/order.cyr` already
+# precedes every one of them in `src/main.cyr`'s single-pass include order.
+fn agnosai_order_str_cmp(a: Str, b: Str): i64 {
+    var la = str_len(a);
+    var lb = str_len(b);
+    var n = la;
+    if (lb < n) { n = lb; }
+    var da = str_data(a);
+    var db = str_data(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var ca = load8(da + i);
+        var cb = load8(db + i);
+        if (ca != cb) { return ca - cb; }
+    }
+    return la - lb;
+}
+
 # Sort a vec in place with `cmp`.
 #
 # Delegates to the stdlib `vec_sort_by` (cyrius 6.5.4+): introsort with a
