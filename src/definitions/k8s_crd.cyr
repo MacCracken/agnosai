@@ -1,0 +1,684 @@
+# =========================================================================
+# definitions/k8s_crd — Kubernetes CustomResourceDefinition types.
+#
+# Parity oracle: rust-old/src/definitions/k8s_crd.rs
+#
+# serde-shaped structs matching the K8s CRD format for `Crew` and agent
+# resources, so a cluster can apply an AgnosAI crew as a manifest. No
+# Kubernetes client — type definitions and their wire form, nothing else.
+#
+# ## The wire contract IS the module
+#
+# There is no behaviour here to get wrong, only bytes. `#[serde(rename_all =
+# "camelCase")]` means the JSON keys are `apiVersion`, `processMode`,
+# `trustLevel`, `agentKey`, `expectedOutput` — **not** the snake_case field
+# names every other struct in this port serialises with. A single key spelled
+# the Rust way and `kubectl apply` rejects the manifest, or worse silently
+# drops the field into `unknown fields` and applies a default.
+#
+# So every key is asserted literally in the suite, and the camelCase set is
+# listed here for a reader who edits one:
+#
+#   api_version → apiVersion      process_mode    → processMode
+#   trust_level → trustLevel      agent_key       → agentKey
+#   expected_output → expectedOutput
+#
+# Everything else is already one word and unchanged.
+#
+# ## Five defaults, applied on DESERIALIZE only
+#
+# `process_mode` "sequential", `trust_level` "basic", `complexity` "medium",
+# `priority` "normal", `risk` "low". They fill an absent key when reading; they
+# are not "the value a new struct starts with", and the oracle's
+# `defaults_applied` test reads a minimal manifest to prove it.
+#
+# ## `Option` serialises as `null`, not as an absent key
+#
+# Neither `domain` nor `expected_output` carries `skip_serializing_if`, so the
+# oracle emits `"domain": null`. A port that omitted the key would produce a
+# manifest that round-trips through serde but differs on the wire — and k8s
+# compares manifests.
+# =========================================================================
+
+# The CRD API group and version. `agnosai.io/v1` is what `apiVersion` carries.
+fn agnosai_crd_api_group(): i64 {
+    return str_from("agnosai.io");
+}
+
+# The full `apiVersion` value — group and version, slash-separated.
+fn agnosai_crd_api_version(): i64 {
+    return str_from("agnosai.io/v1");
+}
+
+# The `kind` every Crew CRD carries.
+fn agnosai_crd_kind_crew(): i64 {
+    return str_from("Crew");
+}
+
+# ObjectMeta heap layout — 32 bytes.
+enum AgnosaiObjectMetaOff {
+    AGN_OM_NAME = 0;
+    AGN_OM_NAMESPACE = 8;
+    AGN_OM_LABELS = 16;
+    AGN_OM_ANNOTATIONS = 24;
+    AGN_OM_SIZE = 32;
+}
+
+# CrewCrd heap layout — 32 bytes.
+enum AgnosaiCrewCrdOff {
+    AGN_CCRD_API_VERSION = 0;
+    AGN_CCRD_KIND = 8;
+    AGN_CCRD_METADATA = 16;
+    AGN_CCRD_SPEC = 24;
+    AGN_CCRD_SIZE = 32;
+}
+
+# CrewCrdSpec heap layout — 40 bytes.
+enum AgnosaiCrewCrdSpecOff {
+    AGN_CSPC_NAME = 0;
+    AGN_CSPC_AGENTS = 8;
+    AGN_CSPC_TASKS = 16;
+    AGN_CSPC_PROCESS_MODE = 24;
+    AGN_CSPC_TRUST_LEVEL = 32;
+    AGN_CSPC_SIZE = 40;
+}
+
+# AgentCrdSpec heap layout — 56 bytes.
+enum AgnosaiAgentCrdSpecOff {
+    AGN_ACRD_AGENT_KEY = 0;
+    AGN_ACRD_NAME = 8;
+    AGN_ACRD_ROLE = 16;
+    AGN_ACRD_GOAL = 24;
+    AGN_ACRD_TOOLS = 32;
+    AGN_ACRD_COMPLEXITY = 40;
+    # 0 for the oracle's `None`.
+    AGN_ACRD_DOMAIN = 48;
+    AGN_ACRD_SIZE = 56;
+}
+
+# TaskCrdSpec heap layout — 40 bytes.
+enum AgnosaiTaskCrdSpecOff {
+    AGN_TCRD_DESCRIPTION = 0;
+    # 0 for the oracle's `None`.
+    AGN_TCRD_EXPECTED_OUTPUT = 8;
+    AGN_TCRD_PRIORITY = 16;
+    AGN_TCRD_RISK = 24;
+    AGN_TCRD_DEPENDENCIES = 32;
+    AGN_TCRD_SIZE = 40;
+}
+
+# --- the five serde defaults ---------------------------------------------
+
+# `default_process_mode()`.
+fn agnosai_crd_default_process_mode(): i64 {
+    return str_from("sequential");
+}
+
+# `default_trust()`.
+fn agnosai_crd_default_trust(): i64 {
+    return str_from("basic");
+}
+
+# `default_complexity()`. ⚠ Deliberately its own fn rather than reusing
+# `agnosai_default_complexity` from `core/agent`: they agree on "medium" today
+# and are independent knobs — the CRD's is a wire default, core's is a struct
+# default, and folding them would couple two contracts that can diverge.
+fn agnosai_crd_default_complexity(): i64 {
+    return str_from("medium");
+}
+
+# `default_priority()`.
+fn agnosai_crd_default_priority(): i64 {
+    return str_from("normal");
+}
+
+# `default_risk()`.
+fn agnosai_crd_default_risk(): i64 {
+    return str_from("low");
+}
+
+# --- ObjectMeta ----------------------------------------------------------
+
+# The oracle's `ObjectMeta::default()` — empty strings and empty maps.
+fn agnosai_object_meta_new(): i64 {
+    var m = alloc(AGN_OM_SIZE);
+    store64(m + AGN_OM_NAME, str_from(""));
+    store64(m + AGN_OM_NAMESPACE, str_from(""));
+    store64(m + AGN_OM_LABELS, map_new_str());
+    store64(m + AGN_OM_ANNOTATIONS, map_new_str());
+    return m;
+}
+
+# The resource name.
+fn agnosai_object_meta_name(m): i64 {
+    return load64(m + AGN_OM_NAME);
+}
+
+# The namespace.
+fn agnosai_object_meta_namespace(m): i64 {
+    return load64(m + AGN_OM_NAMESPACE);
+}
+
+# The labels map.
+fn agnosai_object_meta_labels(m): i64 {
+    return load64(m + AGN_OM_LABELS);
+}
+
+# The annotations map.
+fn agnosai_object_meta_annotations(m): i64 {
+    return load64(m + AGN_OM_ANNOTATIONS);
+}
+
+# Set the name. Mutates and returns, as Cyrius has no struct update syntax.
+fn agnosai_object_meta_with_name(m, name: Str): i64 {
+    store64(m + AGN_OM_NAME, name);
+    return m;
+}
+
+# Set the namespace.
+fn agnosai_object_meta_with_namespace(m, ns: Str): i64 {
+    store64(m + AGN_OM_NAMESPACE, ns);
+    return m;
+}
+
+# --- AgentCrdSpec --------------------------------------------------------
+
+# An agent spec. `domain` may be 0.
+fn agnosai_agent_crd_spec_new(agent_key: Str, name: Str, role: Str, goal: Str): i64 {
+    var a = alloc(AGN_ACRD_SIZE);
+    store64(a + AGN_ACRD_AGENT_KEY, agent_key);
+    store64(a + AGN_ACRD_NAME, name);
+    store64(a + AGN_ACRD_ROLE, role);
+    store64(a + AGN_ACRD_GOAL, goal);
+    store64(a + AGN_ACRD_TOOLS, vec_new());
+    store64(a + AGN_ACRD_COMPLEXITY, agnosai_crd_default_complexity());
+    store64(a + AGN_ACRD_DOMAIN, 0);
+    return a;
+}
+
+# Set the tools.
+fn agnosai_agent_crd_spec_with_tools(a, tools): i64 {
+    store64(a + AGN_ACRD_TOOLS, tools);
+    return a;
+}
+
+# Set the complexity.
+fn agnosai_agent_crd_spec_with_complexity(a, complexity: Str): i64 {
+    store64(a + AGN_ACRD_COMPLEXITY, complexity);
+    return a;
+}
+
+# Set the domain.
+fn agnosai_agent_crd_spec_with_domain(a, domain: Str): i64 {
+    store64(a + AGN_ACRD_DOMAIN, domain);
+    return a;
+}
+
+# The agent key.
+fn agnosai_agent_crd_spec_agent_key(a): i64 {
+    return load64(a + AGN_ACRD_AGENT_KEY);
+}
+
+# The display name.
+fn agnosai_agent_crd_spec_name(a): i64 {
+    return load64(a + AGN_ACRD_NAME);
+}
+
+# The role.
+fn agnosai_agent_crd_spec_role(a): i64 {
+    return load64(a + AGN_ACRD_ROLE);
+}
+
+# The goal.
+fn agnosai_agent_crd_spec_goal(a): i64 {
+    return load64(a + AGN_ACRD_GOAL);
+}
+
+# The tools.
+fn agnosai_agent_crd_spec_tools(a): i64 {
+    return load64(a + AGN_ACRD_TOOLS);
+}
+
+# The complexity.
+fn agnosai_agent_crd_spec_complexity(a): i64 {
+    return load64(a + AGN_ACRD_COMPLEXITY);
+}
+
+# The domain, or 0 for the oracle's `None`.
+fn agnosai_agent_crd_spec_domain(a): i64 {
+    return load64(a + AGN_ACRD_DOMAIN);
+}
+
+# --- TaskCrdSpec ---------------------------------------------------------
+
+# A task spec. `expected_output` starts absent.
+fn agnosai_task_crd_spec_new(description: Str): i64 {
+    var t = alloc(AGN_TCRD_SIZE);
+    store64(t + AGN_TCRD_DESCRIPTION, description);
+    store64(t + AGN_TCRD_EXPECTED_OUTPUT, 0);
+    store64(t + AGN_TCRD_PRIORITY, agnosai_crd_default_priority());
+    store64(t + AGN_TCRD_RISK, agnosai_crd_default_risk());
+    store64(t + AGN_TCRD_DEPENDENCIES, vec_new());
+    return t;
+}
+
+# Set the expected output.
+fn agnosai_task_crd_spec_with_expected_output(t, out: Str): i64 {
+    store64(t + AGN_TCRD_EXPECTED_OUTPUT, out);
+    return t;
+}
+
+# Set the priority.
+fn agnosai_task_crd_spec_with_priority(t, priority: Str): i64 {
+    store64(t + AGN_TCRD_PRIORITY, priority);
+    return t;
+}
+
+# Set the risk level.
+fn agnosai_task_crd_spec_with_risk(t, risk: Str): i64 {
+    store64(t + AGN_TCRD_RISK, risk);
+    return t;
+}
+
+# Set the dependency indices.
+fn agnosai_task_crd_spec_with_dependencies(t, deps): i64 {
+    store64(t + AGN_TCRD_DEPENDENCIES, deps);
+    return t;
+}
+
+# The description.
+fn agnosai_task_crd_spec_description(t): i64 {
+    return load64(t + AGN_TCRD_DESCRIPTION);
+}
+
+# The expected output, or 0 for the oracle's `None`.
+fn agnosai_task_crd_spec_expected_output(t): i64 {
+    return load64(t + AGN_TCRD_EXPECTED_OUTPUT);
+}
+
+# The priority.
+fn agnosai_task_crd_spec_priority(t): i64 {
+    return load64(t + AGN_TCRD_PRIORITY);
+}
+
+# The risk level.
+fn agnosai_task_crd_spec_risk(t): i64 {
+    return load64(t + AGN_TCRD_RISK);
+}
+
+# The dependency indices.
+fn agnosai_task_crd_spec_dependencies(t): i64 {
+    return load64(t + AGN_TCRD_DEPENDENCIES);
+}
+
+# --- CrewCrdSpec ---------------------------------------------------------
+
+# A crew spec with the serde defaults and no agents or tasks.
+fn agnosai_crew_crd_spec_new(name: Str): i64 {
+    var s = alloc(AGN_CSPC_SIZE);
+    store64(s + AGN_CSPC_NAME, name);
+    store64(s + AGN_CSPC_AGENTS, vec_new());
+    store64(s + AGN_CSPC_TASKS, vec_new());
+    store64(s + AGN_CSPC_PROCESS_MODE, agnosai_crd_default_process_mode());
+    store64(s + AGN_CSPC_TRUST_LEVEL, agnosai_crd_default_trust());
+    return s;
+}
+
+# Set the agents.
+fn agnosai_crew_crd_spec_with_agents(s, agents): i64 {
+    store64(s + AGN_CSPC_AGENTS, agents);
+    return s;
+}
+
+# Set the tasks.
+fn agnosai_crew_crd_spec_with_tasks(s, tasks): i64 {
+    store64(s + AGN_CSPC_TASKS, tasks);
+    return s;
+}
+
+# Set the execution mode.
+fn agnosai_crew_crd_spec_with_process_mode(s, mode: Str): i64 {
+    store64(s + AGN_CSPC_PROCESS_MODE, mode);
+    return s;
+}
+
+# Set the trust level.
+fn agnosai_crew_crd_spec_with_trust_level(s, trust: Str): i64 {
+    store64(s + AGN_CSPC_TRUST_LEVEL, trust);
+    return s;
+}
+
+# The crew name.
+fn agnosai_crew_crd_spec_name(s): i64 {
+    return load64(s + AGN_CSPC_NAME);
+}
+
+# The inline agent specs.
+fn agnosai_crew_crd_spec_agents(s): i64 {
+    return load64(s + AGN_CSPC_AGENTS);
+}
+
+# The task specs.
+fn agnosai_crew_crd_spec_tasks(s): i64 {
+    return load64(s + AGN_CSPC_TASKS);
+}
+
+# The execution mode.
+fn agnosai_crew_crd_spec_process_mode(s): i64 {
+    return load64(s + AGN_CSPC_PROCESS_MODE);
+}
+
+# The trust level.
+fn agnosai_crew_crd_spec_trust_level(s): i64 {
+    return load64(s + AGN_CSPC_TRUST_LEVEL);
+}
+
+# --- CrewCrd -------------------------------------------------------------
+
+# The oracle's `CrewCrd::new` — apiVersion and kind fixed, metadata carrying
+# only the name.
+fn agnosai_crew_crd_new(name: Str, spec): i64 {
+    var c = alloc(AGN_CCRD_SIZE);
+    store64(c + AGN_CCRD_API_VERSION, agnosai_crd_api_version());
+    store64(c + AGN_CCRD_KIND, agnosai_crd_kind_crew());
+    store64(c + AGN_CCRD_METADATA, agnosai_object_meta_with_name(
+    agnosai_object_meta_new(), name));
+    store64(c + AGN_CCRD_SPEC, spec);
+    return c;
+}
+
+# The apiVersion.
+fn agnosai_crew_crd_api_version(c): i64 {
+    return load64(c + AGN_CCRD_API_VERSION);
+}
+
+# The kind.
+fn agnosai_crew_crd_kind(c): i64 {
+    return load64(c + AGN_CCRD_KIND);
+}
+
+# The metadata.
+fn agnosai_crew_crd_metadata(c): i64 {
+    return load64(c + AGN_CCRD_METADATA);
+}
+
+# The spec.
+fn agnosai_crew_crd_spec(c): i64 {
+    return load64(c + AGN_CCRD_SPEC);
+}
+
+# --- JSON ----------------------------------------------------------------
+#
+# ⚠ Every key below is **camelCase**, unlike every other `to_value` in this
+# port. That is `#[serde(rename_all = "camelCase")]`, and it is the difference
+# between a manifest `kubectl apply` accepts and one it rejects. The suite
+# asserts each key literally for exactly that reason.
+
+# A Str-keyed map as a JSON object of strings.
+fn _agnosai_crd_map_to_value(m): i64 {
+    var obj = bayan_json_v_obj_new();
+    for (var i = 0; i < _agnosai_map_slots(m); i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) {
+            bayan_json_v_obj_set(obj, _agnosai_map_slot_key(m, i),
+            bayan_json_v_str_new(_agnosai_map_slot_val(m, i)));
+        }
+    }
+    return obj;
+}
+
+# `ObjectMeta` as a JSON value.
+fn agnosai_object_meta_to_value(m): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("name"),
+    bayan_json_v_str_new(load64(m + AGN_OM_NAME)));
+    bayan_json_v_obj_set(obj, str_from("namespace"),
+    bayan_json_v_str_new(load64(m + AGN_OM_NAMESPACE)));
+    bayan_json_v_obj_set(obj, str_from("labels"),
+    _agnosai_crd_map_to_value(load64(m + AGN_OM_LABELS)));
+    bayan_json_v_obj_set(obj, str_from("annotations"),
+    _agnosai_crd_map_to_value(load64(m + AGN_OM_ANNOTATIONS)));
+    return obj;
+}
+
+# `AgentCrdSpec` as a JSON value. `agentKey` is the camelCase one.
+fn agnosai_agent_crd_spec_to_value(a): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("agentKey"),
+    bayan_json_v_str_new(load64(a + AGN_ACRD_AGENT_KEY)));
+    bayan_json_v_obj_set(obj, str_from("name"),
+    bayan_json_v_str_new(load64(a + AGN_ACRD_NAME)));
+    bayan_json_v_obj_set(obj, str_from("role"),
+    bayan_json_v_str_new(load64(a + AGN_ACRD_ROLE)));
+    bayan_json_v_obj_set(obj, str_from("goal"),
+    bayan_json_v_str_new(load64(a + AGN_ACRD_GOAL)));
+    var tools = load64(a + AGN_ACRD_TOOLS);
+    var tv = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(tools); i = i + 1) {
+        bayan_json_v_arr_push(tv, bayan_json_v_str_new(vec_get(tools, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("tools"), tv);
+    bayan_json_v_obj_set(obj, str_from("complexity"),
+    bayan_json_v_str_new(load64(a + AGN_ACRD_COMPLEXITY)));
+    # ⚠ `null`, not an absent key — no `skip_serializing_if` upstream.
+    bayan_json_v_obj_set(obj, str_from("domain"),
+    _agnosai_opt_str_to_value(load64(a + AGN_ACRD_DOMAIN)));
+    return obj;
+}
+
+# `TaskCrdSpec` as a JSON value. `expectedOutput` is the camelCase one.
+fn agnosai_task_crd_spec_to_value(t): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("description"),
+    bayan_json_v_str_new(load64(t + AGN_TCRD_DESCRIPTION)));
+    bayan_json_v_obj_set(obj, str_from("expectedOutput"),
+    _agnosai_opt_str_to_value(load64(t + AGN_TCRD_EXPECTED_OUTPUT)));
+    bayan_json_v_obj_set(obj, str_from("priority"),
+    bayan_json_v_str_new(load64(t + AGN_TCRD_PRIORITY)));
+    bayan_json_v_obj_set(obj, str_from("risk"),
+    bayan_json_v_str_new(load64(t + AGN_TCRD_RISK)));
+    var deps = load64(t + AGN_TCRD_DEPENDENCIES);
+    var dv = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(deps); i = i + 1) {
+        bayan_json_v_arr_push(dv, bayan_json_v_int_new(vec_get(deps, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("dependencies"), dv);
+    return obj;
+}
+
+# `CrewCrdSpec` as a JSON value. `processMode` and `trustLevel` are camelCase.
+fn agnosai_crew_crd_spec_to_value(s): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("name"),
+    bayan_json_v_str_new(load64(s + AGN_CSPC_NAME)));
+    var agents = load64(s + AGN_CSPC_AGENTS);
+    var av = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        bayan_json_v_arr_push(av, agnosai_agent_crd_spec_to_value(vec_get(agents, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("agents"), av);
+    var tasks = load64(s + AGN_CSPC_TASKS);
+    var tv = bayan_json_v_arr_new();
+    for (var i = 0; i < vec_len(tasks); i = i + 1) {
+        bayan_json_v_arr_push(tv, agnosai_task_crd_spec_to_value(vec_get(tasks, i)));
+    }
+    bayan_json_v_obj_set(obj, str_from("tasks"), tv);
+    bayan_json_v_obj_set(obj, str_from("processMode"),
+    bayan_json_v_str_new(load64(s + AGN_CSPC_PROCESS_MODE)));
+    bayan_json_v_obj_set(obj, str_from("trustLevel"),
+    bayan_json_v_str_new(load64(s + AGN_CSPC_TRUST_LEVEL)));
+    return obj;
+}
+
+# `CrewCrd` as a JSON value — the manifest a cluster receives.
+fn agnosai_crew_crd_to_value(c): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("apiVersion"),
+    bayan_json_v_str_new(load64(c + AGN_CCRD_API_VERSION)));
+    bayan_json_v_obj_set(obj, str_from("kind"),
+    bayan_json_v_str_new(load64(c + AGN_CCRD_KIND)));
+    bayan_json_v_obj_set(obj, str_from("metadata"),
+    agnosai_object_meta_to_value(load64(c + AGN_CCRD_METADATA)));
+    bayan_json_v_obj_set(obj, str_from("spec"),
+    agnosai_crew_crd_spec_to_value(load64(c + AGN_CCRD_SPEC)));
+    return obj;
+}
+
+# --- deserialize ---------------------------------------------------------
+#
+# ⚠ **The key types are asymmetric and the compiler will not tell you.**
+# `bayan_json_v_obj_get` takes a **cstring**; `bayan_json_v_obj_set` takes a
+# **Str**. Passing a Str to `get` reads a 16-byte header as text and
+# segfaults — which is exactly what the first draft of this module did.
+# `src/core/message.cyr:305` documents the same trap. Use
+# `bayan_json_v_obj_get_by_str` if a Str key is genuinely what you have.
+
+# A Str field, or `fallback` when the key is absent — the shape of every
+# `#[serde(default = "..")]` here.
+fn _agnosai_crd_str_or(v, key, fallback): i64 {
+    var f = _agnosai_str_field(v, key);
+    if (f == 0) { return fallback; }
+    return f;
+}
+
+# A JSON object of strings back into a Str-keyed map.
+fn _agnosai_crd_map_from_value(v, key): i64 {
+    var m = map_new_str();
+    var o = bayan_json_v_obj_get(v, key);
+    if (o == 0) { return m; }
+    for (var i = 0; i < bayan_json_v_obj_len(o); i = i + 1) {
+        var val = bayan_json_v_obj_val(o, i);
+        if (bayan_json_v_is_str(val) == 1) {
+            map_set(m, bayan_json_v_obj_key(o, i), bayan_json_v_str(val));
+        }
+    }
+    return m;
+}
+
+# `ObjectMeta` from a JSON value. Every field is `#[serde(default)]`, so an
+# absent one is the empty string or an empty map rather than an error.
+fn agnosai_object_meta_from_value(v): i64 {
+    var m = agnosai_object_meta_new();
+    store64(m + AGN_OM_NAME, _agnosai_crd_str_or(v, "name", str_from("")));
+    store64(m + AGN_OM_NAMESPACE,
+    _agnosai_crd_str_or(v, "namespace", str_from("")));
+    store64(m + AGN_OM_LABELS, _agnosai_crd_map_from_value(v, "labels"));
+    store64(m + AGN_OM_ANNOTATIONS,
+    _agnosai_crd_map_from_value(v, "annotations"));
+    return m;
+}
+
+# `AgentCrdSpec` from a JSON value, or 0 when a required field is missing.
+#
+# ⚠ `agentKey`, `name`, `role` and `goal` have no `#[serde(default)]`, so serde
+# **fails** the whole deserialize when one is absent. Answering a struct with an
+# empty key instead would let a malformed manifest through.
+fn agnosai_agent_crd_spec_from_value(v): i64 {
+    var key = _agnosai_str_field(v, "agentKey");
+    var name = _agnosai_str_field(v, "name");
+    var role = _agnosai_str_field(v, "role");
+    var goal = _agnosai_str_field(v, "goal");
+    if (key == 0) { return 0; }
+    if (name == 0) { return 0; }
+    if (role == 0) { return 0; }
+    if (goal == 0) { return 0; }
+
+    var a = agnosai_agent_crd_spec_new(key, name, role, goal);
+    var tools = bayan_json_v_obj_get(v, "tools");
+    if (tools != 0) {
+        var tv = vec_new();
+        for (var i = 0; i < bayan_json_v_arr_len(tools); i = i + 1) {
+            var e = bayan_json_v_arr_get(tools, i);
+            if (bayan_json_v_is_str(e) == 1) { vec_push(tv, bayan_json_v_str(e)); }
+        }
+        store64(a + AGN_ACRD_TOOLS, tv);
+    }
+    store64(a + AGN_ACRD_COMPLEXITY, _agnosai_crd_str_or(v, "complexity",
+    agnosai_crd_default_complexity()));
+    store64(a + AGN_ACRD_DOMAIN, _agnosai_str_field(v, "domain"));
+    return a;
+}
+
+# `TaskCrdSpec` from a JSON value, or 0 without a `description`.
+fn agnosai_task_crd_spec_from_value(v): i64 {
+    var d = _agnosai_str_field(v, "description");
+    if (d == 0) { return 0; }
+    var t = agnosai_task_crd_spec_new(d);
+    store64(t + AGN_TCRD_EXPECTED_OUTPUT, _agnosai_str_field(v, "expectedOutput"));
+    store64(t + AGN_TCRD_PRIORITY, _agnosai_crd_str_or(v, "priority",
+    agnosai_crd_default_priority()));
+    store64(t + AGN_TCRD_RISK, _agnosai_crd_str_or(v, "risk",
+    agnosai_crd_default_risk()));
+    var deps = bayan_json_v_obj_get(v, "dependencies");
+    if (deps != 0) {
+        var dv = vec_new();
+        for (var i = 0; i < bayan_json_v_arr_len(deps); i = i + 1) {
+            var e = bayan_json_v_arr_get(deps, i);
+            if (bayan_json_v_is_int(e) == 1) { vec_push(dv, bayan_json_v_int(e)); }
+        }
+        store64(t + AGN_TCRD_DEPENDENCIES, dv);
+    }
+    return t;
+}
+
+# `CrewCrdSpec` from a JSON value, or 0 without a `name`.
+#
+# ⚠ A malformed agent or task **fails the whole spec** rather than being
+# skipped — serde aborts the deserialize, and silently dropping one would apply
+# a manifest missing the agent the operator asked for.
+fn agnosai_crew_crd_spec_from_value(v): i64 {
+    var name = _agnosai_str_field(v, "name");
+    if (name == 0) { return 0; }
+    var s = agnosai_crew_crd_spec_new(name);
+
+    var agents = bayan_json_v_obj_get(v, "agents");
+    if (agents != 0) {
+        var av = vec_new();
+        for (var i = 0; i < bayan_json_v_arr_len(agents); i = i + 1) {
+            var a = agnosai_agent_crd_spec_from_value(bayan_json_v_arr_get(agents, i));
+            if (a == 0) { return 0; }
+            vec_push(av, a);
+        }
+        store64(s + AGN_CSPC_AGENTS, av);
+    }
+
+    var tasks = bayan_json_v_obj_get(v, "tasks");
+    if (tasks != 0) {
+        var tv = vec_new();
+        for (var i = 0; i < bayan_json_v_arr_len(tasks); i = i + 1) {
+            var t = agnosai_task_crd_spec_from_value(bayan_json_v_arr_get(tasks, i));
+            if (t == 0) { return 0; }
+            vec_push(tv, t);
+        }
+        store64(s + AGN_CSPC_TASKS, tv);
+    }
+
+    store64(s + AGN_CSPC_PROCESS_MODE, _agnosai_crd_str_or(v, "processMode",
+    agnosai_crd_default_process_mode()));
+    store64(s + AGN_CSPC_TRUST_LEVEL, _agnosai_crd_str_or(v, "trustLevel",
+    agnosai_crd_default_trust()));
+    return s;
+}
+
+# `CrewCrd` from a JSON value, or 0 when a required field is missing.
+#
+# ⚠ `apiVersion`, `kind`, `metadata` and `spec` carry no defaults upstream, so
+# all four are required — a manifest without `kind` is not a Crew.
+fn agnosai_crew_crd_from_value(v): i64 {
+    var api = _agnosai_str_field(v, "apiVersion");
+    var kind = _agnosai_str_field(v, "kind");
+    if (api == 0) { return 0; }
+    if (kind == 0) { return 0; }
+    var meta_v = bayan_json_v_obj_get(v, "metadata");
+    if (meta_v == 0) { return 0; }
+    var spec_v = bayan_json_v_obj_get(v, "spec");
+    if (spec_v == 0) { return 0; }
+    var spec = agnosai_crew_crd_spec_from_value(spec_v);
+    if (spec == 0) { return 0; }
+
+    var c = alloc(AGN_CCRD_SIZE);
+    store64(c + AGN_CCRD_API_VERSION, api);
+    store64(c + AGN_CCRD_KIND, kind);
+    store64(c + AGN_CCRD_METADATA, agnosai_object_meta_from_value(meta_v));
+    store64(c + AGN_CCRD_SPEC, spec);
+    return c;
+}

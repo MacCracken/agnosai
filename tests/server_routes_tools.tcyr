@@ -1,16 +1,20 @@
 # =========================================================================
-# server_routes_tools — rust-old/src/server/routes/tools.rs and
-# rust-old/src/server/routes/definitions.rs.
+# server_routes_tools — rust-old/src/server/routes/tools.rs.
 #
-# The oracle's three tools tests and its one presets test all port as ordinary
-# assertions. Its `remove_tool` handler has **no test at all**, so the 204/404
-# branch — the whole substance of that handler — is covered here for the first
-# time.
+# The oracle's three tools tests port as ordinary assertions. Its `remove_tool`
+# handler has **no test at all**, so the 204/404 branch — the whole substance of
+# that handler — is covered here for the first time.
+#
+# The presets route lived here while it was a stub and now has its own file on
+# both sides: `tests/server_routes_definitions.tcyr`.
 # =========================================================================
 
 include "src/units.cyr"
 include "src/order.cyr"
 include "src/id.cyr"
+# strcase — `prompt_guard`, `cost_planning` and `definitions/assembler` all
+# fold ASCII case; the shared helpers live here (extracted at the third use).
+include "src/strcase.cyr"
 # telemetry — `tools/native` and `orchestrator/crew_runner` record GenAI
 # spans (ADR 017), so every suite that reaches them needs the module that
 # defines the recorder. It depends on nothing in `src/` except `id`.
@@ -182,22 +186,6 @@ fn _t_remove_is_exact(): i64 {
     return 0;
 }
 
-# --- Oracle: list_presets_returns_array ----------------------------------
-
-# `[]` is the DEFAULT-BUILD answer, not a stub: the oracle's body is
-# cfg-gated on the `definitions` feature and agnosai's `default = []` leaves it
-# off, so the build the port targets for parity returns an empty array. The
-# oracle's own test asserts exactly this under the default feature set.
-fn _t_list_presets(): i64 {
-    var r = agnosai_route_list_presets();
-    assert(agnosai_route_status(r) == HTTP_OK, "GET /api/v1/presets is 200");
-    var arr = agnosai_route_body(r);
-    assert(bayan_json_v_is_arr(arr) == 1, "the body is an array");
-    assert(bayan_json_v_arr_len(arr) == 0,
-    "...and empty, matching the default build with the definitions feature off");
-    return 0;
-}
-
 # --- Allocation bound ----------------------------------------------------
 
 # The routes-tier exposure `server/routes/mod.cyr`'s header records: these
@@ -236,7 +224,6 @@ fn main(): i64 {
     _t_remove_tool();
     _t_remove_then_list();
     _t_remove_is_exact();
-    _t_list_presets();
     _t_list_is_bounded();
 
     return assert_summary();

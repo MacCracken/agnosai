@@ -96,6 +96,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M10 `definitions` — five of six modules: `versioning`, `assembler`,
+  `k8s_crd`, `loader`, and the eighteen built-in presets.** 1,157 of the
+  group's 1,460 oracle lines, **433 assertions** across five suites, all of the
+  oracle's 36 tests for those modules plus a large margin past them. Only
+  `packaging` (303 lines) is left, and its ZIP prerequisite turns out to be a
+  missing **declaration** rather than an upstream ask — `lib/sankoch.cyr` is
+  already present with 26 `zip_*` fns, just not listed in `cyrius.cyml`'s
+  `[deps].stdlib`.
+
+  **`GET /api/v1/presets` answers eighteen presets instead of `[]`**, and the
+  handler moved from `server/routes/tools.cyr` to a new
+  `server/routes/definitions.cyr`, which is where the oracle keeps it.
+
+  ⚠ **The old `[]` was not a stub, it was a misread.** The oracle's handler is
+  cfg-gated on the `definitions` feature and `default = []` leaves it off, so
+  the *default cargo build* really does answer `[]` — and its own test asserts
+  that. But this port has no cargo features and ships the whole crate, so the
+  populated arm is the true one. `tests/server_router.tcyr`'s assertion was
+  inverted along with the handler. Reading a feature-gated oracle test as the
+  parity target is how a route stays empty for nine milestones.
+
+  Behaviours pinned that no oracle test reaches:
+
+  - **JSON and YAML failures use DIFFERENT error variants.** `load_from_json`
+    raises `Serialization`, `load_from_yaml` raises `InvalidDefinition` — the
+    oracle's two `map_err` arms — and its tests only check `is_err()`.
+    Collapsing them into one would pass everything upstream.
+  - **The extension comes from the file NAME, not the path.** `/tmp/run.d/readme`
+    has a dot in a *directory* component; a last-dot-in-the-path scan calls its
+    extension `d/readme`, skips the file, and looks correct until someone stores
+    definitions under a dotted directory. A dotfile (`.json`) has no extension
+    at all, and `.hidden.json` does.
+  - **A missing directory is an error, not an empty result.** `dir_list` returns
+    an empty vec for a directory it cannot open, so without an explicit `is_dir`
+    guard `load_all_from_dir("/no-such-dir")` is indistinguishable from loading
+    an empty one.
+  - **A preset is all-or-nothing.** `PresetSpec` has no `Option` and no
+    `#[serde(default)]`, so one malformed agent rejects the whole document —
+    the opposite of `agnosai_agent_from_value` (skips a bad `tools` entry) and
+    of `k8s_crd` (skips a bad agent). Copying either would silently truncate a
+    team.
+  - **`.json` only for presets**, where the definition walk also takes `.yaml`
+    and `.yml`; and `load_preset_from_file` checks no extension at all, so JSON
+    in a `.yaml` file loads through the direct entry and is invisible to the
+    directory walk.
+  - **The preset ORDER is domain by domain, lean → standard → large** — not the
+    alphabetical order a glob-driven generator produces. `builtin_presets()`
+    returns a `Vec`, so position is observable, and no oracle assertion looks at
+    it. Every index is asserted.
+
+  **`agnosai_str_eq_ci` / `_contains_ci` / `_contains_ci_cstr` moved to a new
+  `src/strcase.cyr`** — extracted at the third caller, which is when CLAUDE.md
+  says to (`server/prompt_guard`, `fleet/cost_planning`,
+  `definitions/assembler`). No oracle counterpart; Rust gets these from
+  `eq_ignore_ascii_case`. Nothing there allocates, which is the point — every
+  caller is inside a per-candidate loop. 41 assertions.
+
+  **`src/definitions/presets_data.cyr` is generated and committed.** The oracle
+  embeds the eighteen documents with `include_str!`; Cyrius `include` is textual
+  and takes a path to *source*, so `./scripts/gen-presets.sh` turns
+  `src/presets/*.json` into source. `scripts/check-clean.sh` now runs the
+  generator's `--check`, so an edited preset with a stale embed fails the
+  cleanliness gate instead of shipping.
+
+  ⚠ **`cyrius fmt` reindents inside a multi-line string literal and the spaces
+  land in the string.** A trailing backslash continues a literal and keeps the
+  newline; fmt then applies the statement's indentation to the continuation
+  line. It silently reindented a YAML fixture in
+  `tests/definitions_loader.tcyr` — a nesting change — and turned a passing
+  suite red on a file nobody had edited except by formatting it. Filed as
+  `cyrius/docs/development/issues/2026-08-09-cyrius-fmt-reindents-inside-multi-line-string-literals.md`.
+  Two workarounds are in the tree until it is fixed: every long fixture is
+  assembled from short literals rather than continued, and the presets generator
+  pipes its own output through `cyrius fmt` (breaking lines only at JSON token
+  boundaries) so the two `--check` gates stop contradicting each other.
+
+  ⚠ **`builtin_presets`'s `filter_map(.ok())` is reproduced, so a document that
+  fails to parse is DROPPED and the array comes back short** — 200 OK, no log.
+  That is unobservable against the real embed, where all eighteen parse, and a
+  mutation swapping "skip the failure" for "stop at the failure" survived every
+  assertion. `_agnosai_builtin_presets_from(count, json_fp)` exists to give the
+  test an accessor with one broken document; the seam is there for that reason
+  and the header says so.
+
 - **The GenAI span call sites are wired** — `llm/hoosh` (inference, CLIENT),
   `tools/native`'s vtable dispatch (tool execution, INTERNAL) and
   `orchestrator/crew_runner` (crew run, INTERNAL). **26 assertions** in

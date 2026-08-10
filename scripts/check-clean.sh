@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The cleanliness gate: fmt, lint, doc, vet, deny, deps --verify.
+# The cleanliness gate: fmt, lint, doc, vet, deny, deps --verify, generated sources.
 #
 # CLAUDE.md's work loop runs these at steps 2 and 6, but until 2026-07-31 CI ran
 # none of them — only the symbol check, build, and test. The drift that caused
@@ -153,8 +153,19 @@ else
     fail=1
 fi
 
+# --- generated sources match their inputs --------------------------------
+# `src/definitions/presets_data.cyr` is committed so a clone builds without
+# running the generator; this is what stops it drifting from `src/presets/*.json`
+# the first time someone edits a preset and forgets.
+if ./scripts/gen-presets.sh --check >/dev/null 2>&1; then
+    echo "generated: presets_data.cyr up to date"
+else
+    note "generated: src/definitions/presets_data.cyr is stale — run ./scripts/gen-presets.sh"
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "cleanliness check FAILED"
     exit 1
 fi
-echo "cleanliness check OK — fmt, lint, doc, vet, deny, deps --verify, lib snapshot all clean"
+echo "cleanliness check OK — fmt, lint, doc, vet, deny, deps --verify, lib snapshot, generated sources all clean"

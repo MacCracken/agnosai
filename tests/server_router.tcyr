@@ -14,11 +14,15 @@
 include "src/units.cyr"
 include "src/order.cyr"
 include "src/id.cyr"
+# strcase — `prompt_guard`, `cost_planning` and `definitions/assembler` all
+# fold ASCII case; the shared helpers live here (extracted at the third use).
+include "src/strcase.cyr"
 # telemetry — `tools/native` and `orchestrator/crew_runner` record GenAI
 # spans (ADR 017), so every suite that reaches them needs the module that
 # defines the recorder. It depends on nothing in `src/` except `id`.
 include "src/telemetry/mod.cyr"
 include "src/core/mod.cyr"
+include "src/definitions/mod.cyr"
 include "src/learning/mod.cyr"
 include "src/llm/mod.cyr"
 include "src/server/ssrf.cyr"
@@ -35,6 +39,7 @@ include "src/server/state.cyr"
 include "src/server/routes/mod.cyr"
 include "src/server/routes/health.cyr"
 include "src/server/routes/tools.cyr"
+include "src/server/routes/definitions.cyr"
 include "src/server/routes/agents.cyr"
 include "src/server/routes/approval.cyr"
 include "src/server/routes/dashboard.cyr"
@@ -294,9 +299,13 @@ fn _t_dispatch(): i64 {
     assert(bayan_json_v_arr_len(agnosai_route_body(tools)) == 1,
     "/api/v1/tools returns the registered tool");
 
+    # Eighteen, not the empty array this asserted while the handler was a stub:
+    # the port ships the `definitions` feature the oracle cfg-gates off by
+    # default. The contents are `tests/server_routes_definitions.tcyr`'s job;
+    # what matters here is that the dispatch reaches the populated handler.
     var presets = _t_go(s, AGNOSAI_METHOD_GET, "/api/v1/presets");
-    assert(bayan_json_v_arr_len(agnosai_route_body(presets)) == 0,
-    "/api/v1/presets returns the empty default-build array");
+    assert(bayan_json_v_arr_len(agnosai_route_body(presets)) == 18,
+    "/api/v1/presets dispatches to the built-in presets");
 
     var metrics = _t_go(s, AGNOSAI_METHOD_GET, "/metrics");
     assert(agnosai_route_is_text(metrics) == 1, "/metrics returns text, not JSON");

@@ -1,0 +1,120 @@
+# =========================================================================
+# strcase — ASCII case-insensitive string search and comparison.
+#
+# No oracle module. Rust gets these from `str::to_lowercase()` and
+# `eq_ignore_ascii_case`; the stdlib has `str_contains` and `str_eq` but nothing
+# case-folding (`lib/str.cyr` and `lib/string.cyr` both checked), so every
+# consumer grew its own.
+#
+# Extracted at the third instance, which is when CLAUDE.md says to:
+# `server/prompt_guard` had the Str/Str contains, `fleet/cost_planning` the
+# cstring-needle variant, and `definitions/assembler` would have been the third.
+# `telemetry/mod` carries a fourth shape (`data`/`len` against a literal) that
+# stays where it is — it compares a raw byte range, not a `Str`.
+#
+# ## Nothing here allocates
+#
+# That is the point, and it is why `str_lower_cstr` is not the answer: it
+# allocates per call, and every caller here is inside a per-candidate loop —
+# cost_planning scans model names per candidate, prompt_guard scans a prompt
+# against 31 patterns. Folding in place copies nothing.
+#
+# ## ASCII only, deliberately
+#
+# The fold is `A-Z` → `a-z` and nothing else. Rust's `to_lowercase()` is full
+# Unicode, so a non-ASCII pattern behaves differently — but every caller here
+# matches against ASCII literals (tool names, model families, injection
+# patterns), and a Unicode fold would need a case-mapping table for no reachable
+# gain. Stated rather than implied.
+# =========================================================================
+
+# Fold one byte from ASCII upper case to lower case, leaving everything else.
+#
+# The `& 255` is redundant — `load8` zero-extends (see `agnosai_order_str_cmp`'s
+# note) — so callers pass an already-unsigned byte.
+fn _agnosai_fold_ascii(b): i64 {
+    if (b >= 65) { if (b <= 90) { return b + 32; } }
+    return b;
+}
+
+# Whether `a` and `b` are equal ignoring ASCII case.
+fn agnosai_str_eq_ci(a: Str, b: Str): i64 {
+    var n = str_len(a);
+    if (n != str_len(b)) { return 0; }
+    var ad = str_data(a);
+    var bd = str_data(b);
+    for (var i = 0; i < n; i = i + 1) {
+        if (_agnosai_fold_ascii(load8(ad + i)) != _agnosai_fold_ascii(load8(bd + i))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+# Whether `haystack` contains `needle`, ignoring ASCII case.
+#
+# ⚠ An EMPTY needle is contained in anything, matching Rust's
+# `"abc".contains("")`. Several callers rely on it: a `TeamMember` with no role
+# would otherwise match nothing rather than everything.
+#
+# The needle's folded first byte is hoisted out of the loop — the guard tests it
+# at every offset and only walks the rest on a hit. Carried over from
+# `prompt_guard`, where it is the difference between one comparison per byte and
+# `nlen` of them.
+fn agnosai_str_contains_ci(haystack: Str, needle: Str): i64 {
+    var nlen = str_len(needle);
+    if (nlen == 0) { return 1; }
+    var hlen = str_len(haystack);
+    if (nlen > hlen) { return 0; }
+
+    var hd = str_data(haystack);
+    var nd = str_data(needle);
+    var last = hlen - nlen;
+    var n0 = _agnosai_fold_ascii(load8(nd));
+
+    for (var i = 0; i <= last; i = i + 1) {
+        if (_agnosai_fold_ascii(load8(hd + i)) == n0) {
+            var matched = 1;
+            for (var j = 1; j < nlen; j = j + 1) {
+                if (_agnosai_fold_ascii(load8(hd + i + j))
+                != _agnosai_fold_ascii(load8(nd + j))) {
+                    matched = 0;
+                    break;
+                }
+            }
+            if (matched == 1) { return 1; }
+        }
+    }
+    return 0;
+}
+
+# The same against a NUL-terminated literal needle.
+#
+# ⚠ Separate rather than `agnosai_str_contains_ci(hay, str_from(needle))`,
+# because `str_from` allocates a 16-byte header and every caller is inside a
+# per-candidate loop. `fleet/cost_planning`'s comment says exactly this.
+fn agnosai_str_contains_ci_cstr(haystack: Str, needle_cstr): i64 {
+    var nlen = strlen(needle_cstr);
+    if (nlen == 0) { return 1; }
+    var hlen = str_len(haystack);
+    if (nlen > hlen) { return 0; }
+
+    var hd = str_data(haystack);
+    var last = hlen - nlen;
+    var n0 = _agnosai_fold_ascii(load8(needle_cstr));
+
+    for (var i = 0; i <= last; i = i + 1) {
+        if (_agnosai_fold_ascii(load8(hd + i)) == n0) {
+            var matched = 1;
+            for (var j = 1; j < nlen; j = j + 1) {
+                if (_agnosai_fold_ascii(load8(hd + i + j))
+                != _agnosai_fold_ascii(load8(needle_cstr + j))) {
+                    matched = 0;
+                    break;
+                }
+            }
+            if (matched == 1) { return 1; }
+        }
+    }
+    return 0;
+}

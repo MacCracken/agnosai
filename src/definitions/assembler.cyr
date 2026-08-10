@@ -1,0 +1,179 @@
+# =========================================================================
+# definitions/assembler — crew assembly from team specs.
+#
+# Parity oracle: rust-old/src/definitions/assembler.rs
+#
+# Matches requested roles against available agent definitions by score, and
+# builds a `CrewSpec` from the winners.
+#
+# ## `max_by` returns the LAST maximum, and nothing in the oracle tests it
+#
+# Rust's `Iterator::max_by` documents that "if several elements are equally
+# maximum, the last element is returned". Every one of the oracle's seven tests
+# has a single clear winner, so the tie rule is invisible there — and ties are
+# not exotic: two agents with the same role and no tools score identically, which
+# is the default shape of a preset team. Reproduced with `>=` in the scan, and
+# pinned by a test the oracle does not have. Same trap as `fleet/gpu`'s
+# `max_by_key`.
+#
+# ## A zero score is not a match
+#
+# `max_by` always returns *something* from a non-empty list, so the filter after
+# it is what stops an unrelated agent being drafted. Drop the filter and a crew
+# asking for a "designer" gets handed the developer — silently, because the
+# scorer answers 0 rather than failing.
+#
+# ## Scores are f64
+#
+# Every weight is a whole number (10, 5, 3, 2), so integers would order
+# identically today. They stay f64 because the oracle's are, and because a
+# fractional weight added later would be silently truncated by an i64 score.
+# Same call `fleet/placement` made.
+# =========================================================================
+
+# TeamMember heap layout — 24 bytes.
+#
+# ⚠ `AGN_TMEM_`, not `AGN_TM_`: `src/orchestrator/pubsub.cyr:50`'s
+# `AgnosaiTopicMsgOff` already owns `AGN_TM_SIZE`. Cyrius has ONE flat
+# namespace and is **silent** on a duplicate enum member — only
+# `scripts/check-symbols.sh` caught it, exactly as it caught
+# `AgnosaiCostTier` and `AGN_CKPT_*` before.
+enum AgnosaiTeamMemberOff {
+    AGN_TMEM_ROLE = 0;
+    AGN_TMEM_TOOLS = 8;
+    # 0 for the oracle's `None`.
+    AGN_TMEM_COMPLEXITY = 16;
+    AGN_TMEM_SIZE = 24;
+}
+
+# The oracle's `TeamMember::new`. `complexity` may be 0.
+fn agnosai_team_member_new(role: Str, tools, complexity): i64 {
+    var m = alloc(AGN_TMEM_SIZE);
+    store64(m + AGN_TMEM_ROLE, role);
+    store64(m + AGN_TMEM_TOOLS, tools);
+    store64(m + AGN_TMEM_COMPLEXITY, complexity);
+    return m;
+}
+
+# The requested role.
+fn agnosai_team_member_role(m): i64 {
+    return load64(m + AGN_TMEM_ROLE);
+}
+
+# The requested tools.
+fn agnosai_team_member_tools(m): i64 {
+    return load64(m + AGN_TMEM_TOOLS);
+}
+
+# The requested complexity, or 0 for the oracle's `None`.
+fn agnosai_team_member_complexity(m): i64 {
+    return load64(m + AGN_TMEM_COMPLEXITY);
+}
+
+# Score how well `agent` matches `member`. Higher is better; 0 is no match.
+#
+# The weights are the oracle's, and the order they accumulate in does not
+# matter — but which branch fires does:
+#
+#   * exact role (case-insensitive) → 10, and it is `else if`, so an exact match
+#     does NOT also collect the containment 5;
+#   * either role containing the other → 5. **Bidirectional**: "tester" matches
+#     an agent whose role is "lead tester", and an agent whose role is "test"
+#     matches a member asking for "integration test" — the second direction is
+#     the one a one-way `contains` would silently drop;
+#   * the agent's NAME containing the role → 2, on top of either of the above;
+#   * 3 per overlapping tool, case-insensitive;
+#   * 2 for a matching complexity, only when one was requested.
+fn agnosai_assembler_match_score(member, agent): i64 {
+    var score = f64_from(0);
+
+    var member_role = load64(member + AGN_TMEM_ROLE);
+    var agent_role = agnosai_agent_role(agent);
+    if (agnosai_str_eq_ci(agent_role, member_role) == 1) {
+        score = f64_add(score, f64_from(10));
+    } else {
+        if (agnosai_str_contains_ci(agent_role, member_role) == 1) {
+            score = f64_add(score, f64_from(5));
+        } else {
+            if (agnosai_str_contains_ci(member_role, agent_role) == 1) {
+                score = f64_add(score, f64_from(5));
+            }
+        }
+    }
+
+    if (agnosai_str_contains_ci(agnosai_agent_name(agent), member_role) == 1) {
+        score = f64_add(score, f64_from(2));
+    }
+
+    var want = load64(member + AGN_TMEM_TOOLS);
+    var have = agnosai_agent_tools(agent);
+    for (var i = 0; i < vec_len(want); i = i + 1) {
+        for (var j = 0; j < vec_len(have); j = j + 1) {
+            if (agnosai_str_eq_ci(vec_get(have, j), vec_get(want, i)) == 1) {
+                score = f64_add(score, f64_from(3));
+                # ⚠ One point per REQUESTED tool, not per matching pair. The
+                # oracle's `.any()` short-circuits, so an agent listing the same
+                # tool twice scores it once.
+                break;
+            }
+        }
+    }
+
+    var complexity = load64(member + AGN_TMEM_COMPLEXITY);
+    if (complexity != 0) {
+        if (agnosai_str_eq_ci(agnosai_agent_complexity(agent), complexity) == 1) {
+            score = f64_add(score, f64_from(2));
+        }
+    }
+
+    return score;
+}
+
+# Pick the best agent for `member`, or 0 when nothing scores above zero.
+#
+# ⚠ `>=` so the LAST maximum wins, reproducing Rust's `max_by`. A `>` here
+# quietly picks the first instead, and every oracle test still passes.
+fn _agnosai_assembler_best(member, available): i64 {
+    var best = 0;
+    var best_score = f64_from(0);
+    for (var i = 0; i < vec_len(available); i = i + 1) {
+        var agent = vec_get(available, i);
+        var s = agnosai_assembler_match_score(member, agent);
+        if (best == 0) {
+            best = agent;
+            best_score = s;
+        } else {
+            if (f64_ge(s, best_score) == 1) {
+                best = agent;
+                best_score = s;
+            }
+        }
+    }
+    if (best == 0) { return 0; }
+    # The oracle's `.filter(|a| match_score(..) > 0.0)` — without it an
+    # unrelated agent is drafted rather than the member being skipped.
+    if (f64_gt(best_score, f64_from(0)) == 0) { return 0; }
+    return best;
+}
+
+# Assemble a team: one agent per member, skipping members nothing matches.
+#
+# ⚠ The result may contain the SAME agent twice. The oracle does not dedupe, so
+# two members asking for "tester" against one tester both get it — and a caller
+# reading `agents.len()` as "distinct people" is wrong. Reproduced as-is.
+fn agnosai_assemble_team(members, available): i64 {
+    var out = vec_new();
+    for (var i = 0; i < vec_len(members); i = i + 1) {
+        var pick = _agnosai_assembler_best(vec_get(members, i), available);
+        if (pick != 0) { vec_push(out, pick); }
+    }
+    return out;
+}
+
+# Build a complete `CrewSpec` from members, available definitions and tasks.
+fn agnosai_build_crew(name: Str, members, available, tasks): i64 {
+    var crew = agnosai_crew_new(name);
+    agnosai_crew_with_agents(crew, agnosai_assemble_team(members, available));
+    agnosai_crew_with_tasks(crew, tasks);
+    return crew;
+}

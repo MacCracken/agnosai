@@ -1,0 +1,104 @@
+# =========================================================================
+# server_routes_definitions — rust-old/src/server/routes/definitions.rs.
+#
+# One route and one oracle test, `list_presets_returns_array`. It lived in
+# `server_routes_tools.tcyr` while the handler was a stub in `routes/tools.cyr`;
+# both have moved to the file the oracle keeps them in.
+#
+# ⚠ The oracle's assertion is INVERTED here, and that is the feature gate rather
+# than a divergence. Its test is cfg-gated: with `definitions` on it asserts the
+# array is non-empty, and with it off — which `default = []` makes the default
+# cargo build — it asserts the array is EMPTY. The port has no cargo features
+# and ships the whole crate, so the non-empty arm is the true one. Reading the
+# oracle's default-build assertion as the parity target is what kept this route
+# answering `[]` until M10.
+#
+# What this covers past the oracle: the eighteen presets are actually in the
+# body, in order, each with its team — the oracle only checks `!is_empty()`, so
+# a handler returning one preset would satisfy it.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/mod.cyr"
+include "src/server/routes/mod.cyr"
+include "src/server/routes/definitions.cyr"
+include "tests/test_helpers.cyr"
+
+# The `name` of the preset at `i` in a serialized array body.
+fn _t_body_name(arr, i): i64 {
+    var obj = bayan_json_v_arr_get(arr, i);
+    if (obj == 0) { return 0; }
+    var v = bayan_json_v_obj_get(obj, "name");
+    if (v == 0) { return 0; }
+    return bayan_json_v_str(v);
+}
+
+fn main(): i64 {
+    # --- the oracle's list_presets_returns_array ---------------------------
+    var r = agnosai_route_list_presets();
+    assert(agnosai_route_status(r) == HTTP_OK, "GET /api/v1/presets is 200");
+    var arr = agnosai_route_body(r);
+    assert(bayan_json_v_is_arr(arr) == 1, "the body is an array");
+    assert_neq(bayan_json_v_arr_len(arr), 0,
+    "and is NOT empty — the port ships the definitions feature the oracle gates on");
+
+    # ⚠ Eighteen, not merely non-empty. `builtin_presets` drops a document it
+    # cannot parse, so a broken embed answers 200 with a short array.
+    assert_eq(bayan_json_v_arr_len(arr), 18, "with all eighteen presets");
+
+    # --- the body is the presets, in order ---------------------------------
+    assert(str_eq_cstr(_t_body_name(arr, 0), "quality-lean"),
+    "the first is quality-lean");
+    assert(str_eq_cstr(_t_body_name(arr, 3), "software-engineering-lean"),
+    "the fourth opens the software-engineering group");
+    assert(str_eq_cstr(_t_body_name(arr, 17), "security-large"),
+    "and the last is security-large");
+
+    # Each entry is a full PresetSpec, not a name stub.
+    var first = bayan_json_v_arr_get(arr, 0);
+    assert_neq(bayan_json_v_obj_get(first, "description"), 0, "each carries description");
+    assert_neq(bayan_json_v_obj_get(first, "domain"), 0, "and domain");
+    assert_neq(bayan_json_v_obj_get(first, "size"), 0, "and size");
+    assert_neq(bayan_json_v_obj_get(first, "version"), 0, "and version");
+    var agents = bayan_json_v_obj_get(first, "agents");
+    assert(bayan_json_v_is_arr(agents) == 1, "and an agents array");
+    assert_eq(bayan_json_v_arr_len(agents), 2, "with quality-lean's two members");
+    assert_neq(bayan_json_v_obj_get(bayan_json_v_arr_get(agents, 0), "agent_key"), 0,
+    "each of which is a full agent definition");
+
+    # Seventy-two agents across the eighteen, serialized.
+    var total = 0;
+    for (var i = 0; i < bayan_json_v_arr_len(arr); i = i + 1) {
+        var team = bayan_json_v_obj_get(bayan_json_v_arr_get(arr, i), "agents");
+        if (team != 0) { total = total + bayan_json_v_arr_len(team); }
+    }
+    assert_eq(total, 72, "and seventy-two agents in total");
+
+    # --- the arena-threaded form -------------------------------------------
+    # The route is reached through the `_a` form with a per-request arena; the
+    # two must agree, because only one of them is what the server runs.
+    var a = arena_allocator(1 << 20);
+    arena_allocator_set_on_full(a, ARENA_FULL_SPILL);
+    var ra = agnosai_route_list_presets_a(a);
+    assert(agnosai_route_status(ra) == HTTP_OK, "the arena form is 200 too");
+    assert_eq(bayan_json_v_arr_len(agnosai_route_body(ra)), 18, "with the same eighteen");
+    assert(str_eq_cstr(_t_body_name(agnosai_route_body(ra), 0), "quality-lean"),
+    "in the same order");
+    reset_via(a);
+
+    # Called twice, the route answers the same thing — nothing is consumed.
+    assert_eq(bayan_json_v_arr_len(agnosai_route_body(agnosai_route_list_presets())), 18,
+    "and a second call still answers eighteen");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

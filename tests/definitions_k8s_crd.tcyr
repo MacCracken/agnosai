@@ -1,0 +1,284 @@
+# =========================================================================
+# definitions_k8s_crd.tcyr — tests for src/definitions/k8s_crd.cyr
+#
+# Oracle: rust-old/src/definitions/k8s_crd.rs's four `#[test]` fns, all ported.
+#
+# There is no behaviour in this module, only **bytes** — it is serde structs for
+# a Kubernetes manifest. So the parity surface is the JSON key set, and the
+# thing that makes it dangerous is `#[serde(rename_all = "camelCase")]`: these
+# are the only structs in the port that do NOT serialise snake_case. One key
+# spelled the Rust way and `kubectl apply` either rejects the manifest or drops
+# the field into `unknown fields` and applies a default instead.
+#
+# The oracle's own tests check three keys (`apiVersion`, `kind`,
+# `metadata.name`) and two defaults. Every camelCase key is asserted literally
+# here, both that the right one is present and that the snake_case spelling is
+# **absent** — because a `to_value` emitting both would pass a
+# "contains the right key" test while doubling the manifest.
+#
+# Also past the oracle:
+#
+#   * **`Option` serialises as `null`, not as an absent key.** Neither `domain`
+#     nor `expectedOutput` has `skip_serializing_if`, and k8s compares
+#     manifests — an omitted key is a different manifest.
+#   * **required fields are required.** `agentKey`, `role`, `goal`,
+#     `description`, `kind` and `spec` carry no `#[serde(default)]`, so serde
+#     fails the whole deserialize. Answering a half-built struct would let a
+#     malformed manifest apply.
+#   * **a malformed agent fails the whole spec** rather than being skipped.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/mod.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_json(v): i64 {
+    return bayan_json_v_build(v);
+}
+
+fn _t_vec1(a): i64 {
+    var v = vec_new();
+    vec_push(v, a);
+    return v;
+}
+
+fn main(): i64 {
+    # --- oracle: api_constants -------------------------------------------
+    assert(str_eq_cstr(agnosai_crd_api_group(), "agnosai.io") == 1, "the API group");
+    assert(str_eq_cstr(agnosai_crd_api_version(), "agnosai.io/v1") == 1, "and version");
+
+    # --- oracle: crew_crd_serde_roundtrip --------------------------------
+    var agent = agnosai_agent_crd_spec_new(str_from("agent-a"), str_from("Agent A"),
+    str_from("tester"), str_from("test things"));
+    agnosai_agent_crd_spec_with_tools(agent, _t_vec1(str_from("echo")));
+    var task = agnosai_task_crd_spec_new(str_from("do something"));
+    var spec = agnosai_crew_crd_spec_new(str_from("Test Crew"));
+    agnosai_crew_crd_spec_with_agents(spec, _t_vec1(agent));
+    agnosai_crew_crd_spec_with_tasks(spec, _t_vec1(task));
+    var crd = agnosai_crew_crd_new(str_from("test-crew"), spec);
+
+    var json = _t_json(agnosai_crew_crd_to_value(crd));
+    assert_eq(str_contains_cstr(json, "agnosai.io/v1"), 1, "the manifest carries the version");
+    assert_eq(str_contains_cstr(json, "Crew"), 1, "and the kind");
+
+    var restored = agnosai_crew_crd_from_value(bayan_json_v_parse(json));
+    assert(restored != 0, "and round-trips back");
+    assert(str_eq_cstr(agnosai_crew_crd_spec_name(agnosai_crew_crd_spec(restored)),
+    "Test Crew") == 1, "with its name");
+    assert_eq(vec_len(agnosai_crew_crd_spec_agents(agnosai_crew_crd_spec(restored))), 1,
+    "one agent");
+    assert_eq(vec_len(agnosai_crew_crd_spec_tasks(agnosai_crew_crd_spec(restored))), 1,
+    "and one task");
+
+    # --- oracle: crew_crd_yaml_compatible --------------------------------
+    var y = agnosai_crew_crd_new(str_from("my-crew"),
+    agnosai_crew_crd_spec_with_trust_level(
+    agnosai_crew_crd_spec_with_process_mode(agnosai_crew_crd_spec_new(str_from("My Crew")),
+    str_from("parallel")), str_from("strict")));
+    var yv = agnosai_crew_crd_to_value(y);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(yv, "apiVersion")),
+    "agnosai.io/v1") == 1, "apiVersion is agnosai.io/v1");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(yv, "kind")),
+    "Crew") == 1, "kind is Crew");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(
+    bayan_json_v_obj_get(yv, "metadata"), "name")), "my-crew") == 1,
+    "and metadata.name is the resource name");
+
+    # --- oracle: defaults_applied ----------------------------------------
+    # A minimal manifest: no processMode, no trustLevel.
+    var msb = str_builder_new();
+    str_builder_add_cstr(msb, "{\"apiVersion\":\"agnosai.io/v1\",\"kind\":\"Crew\",");
+    str_builder_add_cstr(msb, "\"metadata\":{\"name\":\"minimal\"},\"spec\":{\"name\":\"Minimal\"}}");
+    var minimal = bayan_json_v_parse(str_builder_build(msb));
+    var m = agnosai_crew_crd_from_value(minimal);
+    assert(m != 0, "a minimal manifest deserializes");
+    assert(str_eq_cstr(agnosai_crew_crd_spec_process_mode(agnosai_crew_crd_spec(m)),
+    "sequential") == 1, "processMode defaults to sequential");
+    assert(str_eq_cstr(agnosai_crew_crd_spec_trust_level(agnosai_crew_crd_spec(m)),
+    "basic") == 1, "and trustLevel to basic");
+
+    # --- past the oracle: EVERY camelCase key, and the snake_case absence -
+    # ⚠ The whole module is this contract. `kubectl apply` matches on these.
+    assert_eq(str_contains_cstr(json, "\"apiVersion\""), 1, "apiVersion is camelCase");
+    assert_eq(str_contains_cstr(json, "\"api_version\""), 0, "and api_version is absent");
+    assert_eq(str_contains_cstr(json, "\"processMode\""), 1, "processMode is camelCase");
+    assert_eq(str_contains_cstr(json, "\"process_mode\""), 0, "and process_mode is absent");
+    assert_eq(str_contains_cstr(json, "\"trustLevel\""), 1, "trustLevel is camelCase");
+    assert_eq(str_contains_cstr(json, "\"trust_level\""), 0, "and trust_level is absent");
+    assert_eq(str_contains_cstr(json, "\"agentKey\""), 1, "agentKey is camelCase");
+    assert_eq(str_contains_cstr(json, "\"agent_key\""), 0, "and agent_key is absent");
+    assert_eq(str_contains_cstr(json, "\"expectedOutput\""), 1, "expectedOutput is camelCase");
+    assert_eq(str_contains_cstr(json, "\"expected_output\""), 0,
+    "and expected_output is absent");
+
+    # The already-one-word keys stay as they are.
+    assert_eq(str_contains_cstr(json, "\"metadata\""), 1, "metadata is unchanged");
+    assert_eq(str_contains_cstr(json, "\"namespace\""), 1, "namespace is unchanged");
+    assert_eq(str_contains_cstr(json, "\"annotations\""), 1, "annotations is unchanged");
+    assert_eq(str_contains_cstr(json, "\"complexity\""), 1, "complexity is unchanged");
+    assert_eq(str_contains_cstr(json, "\"dependencies\""), 1, "dependencies is unchanged");
+
+    # --- past the oracle: Option is null, not absent ---------------------
+    # ⚠ No `skip_serializing_if` upstream, and k8s compares manifests — an
+    # omitted key is a different manifest from an explicit null.
+    assert_eq(str_contains_cstr(json, "\"domain\":null"), 1,
+    "an unset domain serialises as null, not as an absent key");
+    assert_eq(str_contains_cstr(json, "\"expectedOutput\":null"), 1,
+    "and so does an unset expectedOutput");
+
+    agnosai_agent_crd_spec_with_domain(agent, str_from("qa"));
+    agnosai_task_crd_spec_with_expected_output(task, str_from("a report"));
+    var filled = _t_json(agnosai_crew_crd_to_value(crd));
+    assert_eq(str_contains_cstr(filled, "\"domain\":\"qa\""), 1, "a set domain carries through");
+    assert_eq(str_contains_cstr(filled, "\"expectedOutput\":\"a report\""), 1,
+    "as does a set expectedOutput");
+
+    # --- past the oracle: the remaining defaults --------------------------
+    # The oracle checks two of the five. `complexity`, `priority` and `risk`
+    # are never exercised at all.
+    var bare_agent = agnosai_agent_crd_spec_from_value(bayan_json_v_parse(str_from(
+    "{\"agentKey\":\"k\",\"name\":\"n\",\"role\":\"r\",\"goal\":\"g\"}")));
+    assert(bare_agent != 0, "an agent with only its required fields deserializes");
+    assert(str_eq_cstr(agnosai_agent_crd_spec_complexity(bare_agent), "medium") == 1,
+    "complexity defaults to medium");
+    assert_eq(vec_len(agnosai_agent_crd_spec_tools(bare_agent)), 0, "tools default to empty");
+    assert_eq(agnosai_agent_crd_spec_domain(bare_agent), 0, "and domain to None");
+
+    var bare_task = agnosai_task_crd_spec_from_value(bayan_json_v_parse(str_from(
+    "{\"description\":\"d\"}")));
+    assert(bare_task != 0, "a task with only a description deserializes");
+    assert(str_eq_cstr(agnosai_task_crd_spec_priority(bare_task), "normal") == 1,
+    "priority defaults to normal");
+    assert(str_eq_cstr(agnosai_task_crd_spec_risk(bare_task), "low") == 1,
+    "and risk to low");
+    assert_eq(vec_len(agnosai_task_crd_spec_dependencies(bare_task)), 0,
+    "with no dependencies");
+
+    # --- past the oracle: required fields are REQUIRED --------------------
+    # ⚠ These carry no `#[serde(default)]`, so serde fails the whole
+    # deserialize. Returning a half-built struct would apply a broken manifest.
+    assert_eq(agnosai_agent_crd_spec_from_value(bayan_json_v_parse(str_from(
+    "{\"name\":\"n\",\"role\":\"r\",\"goal\":\"g\"}"))), 0, "an agent with no agentKey fails");
+    assert_eq(agnosai_agent_crd_spec_from_value(bayan_json_v_parse(str_from(
+    "{\"agentKey\":\"k\",\"name\":\"n\",\"goal\":\"g\"}"))), 0, "with no role fails");
+    assert_eq(agnosai_task_crd_spec_from_value(bayan_json_v_parse(str_from(
+    "{\"priority\":\"high\"}"))), 0, "a task with no description fails");
+    assert_eq(agnosai_crew_crd_from_value(bayan_json_v_parse(str_from(
+    "{\"apiVersion\":\"agnosai.io/v1\",\"metadata\":{},\"spec\":{\"name\":\"x\"}}"))), 0,
+    "a manifest with no kind fails");
+    assert_eq(agnosai_crew_crd_from_value(bayan_json_v_parse(str_from(
+    "{\"apiVersion\":\"agnosai.io/v1\",\"kind\":\"Crew\",\"metadata\":{}}"))), 0,
+    "and one with no spec fails");
+
+    # ⚠ A malformed agent fails the WHOLE spec rather than being skipped —
+    # silently dropping it would apply a crew missing an agent the operator
+    # asked for.
+    assert_eq(agnosai_crew_crd_spec_from_value(bayan_json_v_parse(str_from(
+    "{\"name\":\"c\",\"agents\":[{\"name\":\"no-key\"}]}"))), 0,
+    "one malformed agent fails the entire spec");
+
+    # --- past the oracle: ObjectMeta defaults -----------------------------
+    var meta = agnosai_object_meta_from_value(bayan_json_v_parse(str_from(
+    "{}")));
+    assert_eq(str_len(agnosai_object_meta_name(meta)), 0, "an absent name is empty");
+    assert_eq(str_len(agnosai_object_meta_namespace(meta)), 0, "as is the namespace");
+    assert_eq(map_size(agnosai_object_meta_labels(meta)), 0, "labels default to empty");
+    assert_eq(map_size(agnosai_object_meta_annotations(meta)), 0, "and annotations");
+
+    var lmeta = agnosai_object_meta_from_value(bayan_json_v_parse(str_from(
+    "{\"name\":\"n\",\"namespace\":\"ns\",\"labels\":{\"app\":\"agnosai\"}}")));
+    assert(str_eq_cstr(agnosai_object_meta_name(lmeta), "n") == 1, "a name round-trips");
+    assert(str_eq_cstr(agnosai_object_meta_namespace(lmeta), "ns") == 1, "and a namespace");
+    assert_eq(map_size(agnosai_object_meta_labels(lmeta)), 1, "and one label");
+    assert(str_eq_cstr(map_get(agnosai_object_meta_labels(lmeta), str_from("app")),
+    "agnosai") == 1, "with its value");
+
+    # --- past the oracle: a full round trip preserves every field ---------
+    var rt = agnosai_crew_crd_from_value(agnosai_crew_crd_to_value(crd));
+    assert(rt != 0, "a value round-trips without going through text");
+    var rspec = agnosai_crew_crd_spec(rt);
+    var ragent = vec_get(agnosai_crew_crd_spec_agents(rspec), 0);
+    assert(str_eq_cstr(agnosai_agent_crd_spec_agent_key(ragent), "agent-a") == 1,
+    "the agent key survives");
+    assert(str_eq_cstr(agnosai_agent_crd_spec_domain(ragent), "qa") == 1, "and the domain");
+    assert_eq(vec_len(agnosai_agent_crd_spec_tools(ragent)), 1, "and the tools");
+    var rtask = vec_get(agnosai_crew_crd_spec_tasks(rspec), 0);
+    assert(str_eq_cstr(agnosai_task_crd_spec_expected_output(rtask), "a report") == 1,
+    "and the expected output");
+
+    # --- past the oracle: the rest of the surface --------------------------
+    # Builders and accessors the oracle never exercises, and the three defaults
+    # it never reads. A CRD is a wire format: a setter that stored into the
+    # wrong slot would produce a manifest that applies the wrong thing.
+    assert(str_eq_cstr(agnosai_crd_kind_crew(), "Crew") == 1, "the Crew kind constant");
+    assert(str_eq_cstr(agnosai_crd_default_process_mode(), "sequential") == 1,
+    "the processMode default");
+    assert(str_eq_cstr(agnosai_crd_default_trust(), "basic") == 1, "the trustLevel default");
+    assert(str_eq_cstr(agnosai_crd_default_complexity(), "medium") == 1,
+    "the complexity default");
+    assert(str_eq_cstr(agnosai_crd_default_priority(), "normal") == 1, "the priority default");
+    assert(str_eq_cstr(agnosai_crd_default_risk(), "low") == 1, "the risk default");
+
+    var om = agnosai_object_meta_new();
+    assert_eq(str_len(agnosai_object_meta_name(om)), 0, "a fresh ObjectMeta has no name");
+    agnosai_object_meta_with_name(om, str_from("n1"));
+    agnosai_object_meta_with_namespace(om, str_from("ns1"));
+    assert(str_eq_cstr(agnosai_object_meta_name(om), "n1") == 1, "the name setter lands");
+    assert(str_eq_cstr(agnosai_object_meta_namespace(om), "ns1") == 1, "and the namespace");
+    assert_eq(str_contains_cstr(_t_json(agnosai_object_meta_to_value(om)), "\"ns1\""), 1,
+    "and both reach the serialised metadata");
+
+    var a2 = agnosai_agent_crd_spec_new(str_from("k2"), str_from("n2"), str_from("r2"),
+    str_from("g2"));
+    assert(str_eq_cstr(agnosai_agent_crd_spec_name(a2), "n2") == 1, "the agent name reads back");
+    assert(str_eq_cstr(agnosai_agent_crd_spec_role(a2), "r2") == 1, "the role");
+    assert(str_eq_cstr(agnosai_agent_crd_spec_goal(a2), "g2") == 1, "and the goal");
+    assert(str_eq_cstr(agnosai_agent_crd_spec_complexity(a2), "medium") == 1,
+    "a new agent starts at the default complexity");
+    agnosai_agent_crd_spec_with_complexity(a2, str_from("high"));
+    assert_eq(str_contains_cstr(_t_json(agnosai_agent_crd_spec_to_value(a2)),
+    "\"complexity\":\"high\""), 1, "and the setter reaches the wire");
+
+    var t2 = agnosai_task_crd_spec_new(str_from("d2"));
+    assert(str_eq_cstr(agnosai_task_crd_spec_description(t2), "d2") == 1,
+    "the description reads back");
+    agnosai_task_crd_spec_with_priority(t2, str_from("high"));
+    agnosai_task_crd_spec_with_risk(t2, str_from("critical"));
+    var deps = vec_new();
+    vec_push(deps, 0);
+    vec_push(deps, 2);
+    agnosai_task_crd_spec_with_dependencies(t2, deps);
+    var tj = _t_json(agnosai_task_crd_spec_to_value(t2));
+    assert_eq(str_contains_cstr(tj, "\"priority\":\"high\""), 1, "priority reaches the wire");
+    assert_eq(str_contains_cstr(tj, "\"risk\":\"critical\""), 1, "risk reaches the wire");
+    # ⚠ Dependencies are indices - NUMBERS on the wire, not strings. A usize
+    # emitted as a string would fail k8s schema validation.
+    assert_eq(str_contains_cstr(tj, "\"dependencies\":[0,2]"), 1,
+    "and dependencies are a bare number array, not strings");
+
+    var s2 = agnosai_crew_crd_spec_new(str_from("S2"));
+    assert_eq(str_contains_cstr(_t_json(agnosai_crew_crd_spec_to_value(s2)),
+    "\"processMode\":\"sequential\""), 1,
+    "a fresh spec serialises the default processMode");
+
+    var c2 = agnosai_crew_crd_new(str_from("c2"), s2);
+    assert(str_eq_cstr(agnosai_crew_crd_api_version(c2), "agnosai.io/v1") == 1,
+    "the constructor fixes apiVersion");
+    assert(str_eq_cstr(agnosai_crew_crd_kind(c2), "Crew") == 1, "and kind");
+    assert(str_eq_cstr(agnosai_object_meta_name(agnosai_crew_crd_metadata(c2)), "c2") == 1,
+    "and puts the name in metadata, not the spec");
+    assert(str_eq_cstr(agnosai_crew_crd_spec_name(agnosai_crew_crd_spec(c2)), "S2") == 1,
+    "which keeps its own name");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

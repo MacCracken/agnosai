@@ -189,11 +189,41 @@ corrected section below):
 
 | Group | Rust lines | Milestone | Scope |
 |---|---|---|---|
-| `definitions/` | 1,460 | M10 | whole — **ZIP and YAML included**; both former blockers are already in `lib/` (sankoch, bayan) |
+| `definitions/` | 303 of 1,460 left | M10 | `packaging` only. The ZIP prerequisite is the last one standing: `lib/sankoch.cyr` has 26 `zip_*` fns but is **not declared** in `cyrius.cyml`'s `[deps].stdlib`. YAML is done — bayan's parser carried it. |
 | ~~`telemetry/`~~ | ✅ 0 left | M9 | **Source-complete 2026-08-09** — `mod.rs` (116, with the JSON logging init) and `genai.rs` (206). What remains of M9 is not an oracle file: the **OTLP exporter body**, copied from hoosh's `otlp.cyr`, behind the branch `agnosai_telemetry_init_tracing` already takes. ⚠ The planned **sakshi filing for JSON output was never needed** — `sakshi_set_emit_hook` already exists; see roadmap M9. |
 
 `fleet/` left this table on **2026-08-08**: all twelve of the oracle's modules
 are ported.
+
+**M10 `definitions` bite log — 🟡 five of six modules, 2026-08-09.**
+
+| module | oracle lines | assertions | oracle tests |
+|---|---|---|---|
+| `versioning` | 252 | 45 | 8 |
+| `assembler` | 236 | 40 | 7 |
+| `k8s_crd` | 238 | 84 | 4 |
+| `loader` | 415 | 127 | 15 of 17 |
+| `loader` presets | (`src/presets/*.json`) | 137 | the other 2 |
+| `mod` | 16 | — | — |
+| **ported** | **1,157 of 1,460** | **433** | **36** |
+| `packaging` | 303 | — | 7 — **not started** |
+
+Two things landed alongside the ports rather than inside them. **`src/strcase.cyr`**
+is a port-local root module extracted at the third caller
+(`server/prompt_guard`, `fleet/cost_planning`, `definitions/assembler`) — no
+oracle counterpart, since Rust gets it from `eq_ignore_ascii_case`; 41
+assertions. **`src/definitions/presets_data.cyr` is GENERATED** by
+`./scripts/gen-presets.sh` from `src/presets/*.json` and committed;
+`scripts/check-clean.sh` runs the generator's `--check` so the two cannot drift.
+It stands in for the oracle's eighteen `include_str!`s, which Cyrius has no
+equivalent for.
+
+⚠ **`GET /api/v1/presets` answers eighteen presets now, not `[]`** — and the
+handler moved from `server/routes/tools.cyr` to `server/routes/definitions.cyr`,
+which is where the oracle keeps it. The old `[]` was read off the oracle's
+*default cargo build*, where `default = []` gates the `definitions` feature off;
+this port has no features and ships the whole crate, so the populated arm is the
+true one. `tests/server_router.tcyr`'s assertion was inverted with it.
 
 **M8 `fleet` bite log — ✅ COMPLETE 2026-08-08.** Each module carries its own
 `.tcyr`; the assertion counts are the suites', not the oracle's:

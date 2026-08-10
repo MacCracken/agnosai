@@ -1,0 +1,574 @@
+# =========================================================================
+# definitions/loader — JSON/YAML agent definition and preset loading.
+#
+# Parity oracle: rust-old/src/definitions/loader.rs
+#
+# Reads `AgentDefinition`s and `PresetSpec`s off disk or out of a string, with
+# the format chosen by file extension. `builtin_presets()` — the eighteen
+# `include_str!`ed preset documents — is deliberately NOT here; it needs a
+# generated source file and lands in its own bite.
+#
+# ## Errors come back through `out_err`, and the VARIANT is the parity surface
+#
+# Every entry point returns the loaded thing or 0, storing an `AgnosaiError`
+# through `out_err` on the 0. That is `sandbox/python`'s convention
+# (`agnosai_python_execute_script`), reused rather than invented.
+#
+# Which variant is raised is parity-relevant and tested:
+#
+#   * bad JSON → **Serialization** (the oracle's `AgnosaiError::Serialization`
+#     from `serde_json`);
+#   * bad YAML → **InvalidDefinition** (the oracle maps `serde_yaml_ng`'s error
+#     through `InvalidDefinition(e.to_string())`, NOT `Serialization`);
+#   * an unsupported extension → **InvalidDefinition**;
+#   * anything the filesystem refuses → **Io**.
+#
+# The *detail* text is not. `core_error.cyr` renders the variant prefix and the
+# detail is sanctioned free-form — `durable_state` says the same about its own
+# I/O details. The one exception is the extension message, which is asserted
+# literally because the oracle interpolates the **lowercased** extension into
+# it and dropping the fold would be invisible otherwise.
+#
+# ## `out_err` may be 0
+#
+# Callers that only want "did it load" pass 0 and the store is skipped, which is
+# what `_agnosai_loader_set_err` is for. `builtin_presets` will need exactly
+# that — the oracle's body is `.filter_map(|j| load_preset_from_json(j).ok())`,
+# an error dropped on the floor.
+#
+# ## No logging, because the oracle has none
+#
+# Not an oversight against CLAUDE.md's "sakshi on all operations": loader.rs
+# carries no `tracing` call at all, and a load that logs on a path the oracle is
+# silent on is a divergence in observable behaviour for a server that ships its
+# log stream to consumers.
+# =========================================================================
+
+# Set `*out_err` when the caller asked for it.
+fn _agnosai_loader_set_err(out_err, err): i64 {
+    if (out_err != 0) { store64(out_err, err); }
+    return 0;
+}
+
+# The path component after the last `/` — Rust's `Path::file_name`.
+#
+# ⚠ The extension MUST be taken from the file name, not from the whole path.
+# `/tmp/run.d/readme` has a dot in it, and a naive last-dot-in-the-path scan
+# calls its extension `d/readme` — which is not any of the three accepted
+# spellings, so the file is skipped and the bug reads as correct behaviour until
+# the day someone stores definitions under `crew.v2/`.
+fn _agnosai_loader_file_name(path: Str): Str {
+    var n = str_len(path);
+    var d = str_data(path);
+    var start = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        if (load8(d + i) == 47) { start = i + 1; }
+    }
+    return str_sub(path, start, n - start);
+}
+
+# The extension, borrowed — Rust's `Path::extension().unwrap_or("")`.
+#
+# Rust's rule, reproduced: the text after the final dot, **unless that dot is
+# the first byte of the file name**. So `.gitignore` has no extension (it is all
+# stem) but `.hidden.json` has `json`.
+#
+# Rust distinguishes `None` from `Some("")` — `"a."` is the latter — and this
+# does not, returning an empty Str for both. That distinction is unobservable
+# here: neither is one of the three accepted spellings, and both render the same
+# `unsupported file extension: ` message.
+#
+# Shares bytes with `path`; nothing is allocated on the accepting path.
+fn _agnosai_loader_ext(path: Str): Str {
+    var name = _agnosai_loader_file_name(path);
+    var n = str_len(name);
+    var d = str_data(name);
+    var dot = 0 - 1;
+    for (var i = 0; i < n; i = i + 1) {
+        if (load8(d + i) == 46) { dot = i; }
+    }
+    if (dot <= 0) { return str_from(""); }
+    return str_sub(name, dot + 1, n - dot - 1);
+}
+
+# The extension lowercased into a fresh Str — the ERROR PATH ONLY.
+#
+# The oracle lowercases before matching, so `A.JSON` loads; the accepting side
+# gets that from `agnosai_str_eq_ci` without allocating. This exists because the
+# oracle also interpolates the lowercased text into the failure message, so
+# `README.TXT` must report `txt` and not `TXT`.
+#
+# ASCII-only, like `src/strcase.cyr` and for the same reason — Rust's
+# `to_lowercase()` is full Unicode, but an extension outside ASCII cannot equal
+# any of `json`/`yaml`/`yml` and so only ever reaches this message.
+fn _agnosai_loader_ext_lower(ext: Str): Str {
+    var n = str_len(ext);
+    var d = str_data(ext);
+    var sb = str_builder_new();
+    for (var i = 0; i < n; i = i + 1) {
+        str_builder_add_byte(sb, _agnosai_fold_ascii(load8(d + i)));
+    }
+    return str_builder_build(sb);
+}
+
+# `unsupported file extension: {ext}` — the oracle's message, verbatim.
+fn _agnosai_loader_unsupported(ext: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "unsupported file extension: ");
+    str_builder_add(sb, _agnosai_loader_ext_lower(ext));
+    return agnosai_error_invalid_definition(str_builder_build(sb));
+}
+
+# `{op} {path}: os error {n}` — the detail for an `Io` error.
+#
+# ⚠ Deliberately coarser than `orchestrator/durable_state`'s `_agnosai_io_detail`,
+# which renders `ENOENT` as "No such file or directory" from a table. Two reasons
+# not to share: Cyrius resolves includes in a single pass and `definitions`
+# precedes `orchestrator` in `src/main.cyr`, so that helper is not in scope here;
+# and reaching across for another module's `_`-prefixed internal is worse
+# coupling than a five-line local. This is the SECOND instance of the shape —
+# CLAUDE.md says extract at the third, which is when it earns a home next to
+# `src/strcase.cyr`.
+fn _agnosai_loader_io_detail(op, path: Str, errn): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, op);
+    str_builder_add_cstr(sb, " ");
+    str_builder_add(sb, path);
+    str_builder_add_cstr(sb, ": os error ");
+    str_builder_add_int(sb, 0 - errn);
+    return str_builder_build(sb);
+}
+
+# Read a whole file as a Str — the oracle's `std::fs::read_to_string`.
+#
+# Returns 0 with `*out_err` set to an `Io` error. A directory is an error, as it
+# is for std, which is why this is built on the fd verbs rather than
+# `file_read_all`: that reports a directory as a 0-byte success, and truncates
+# silently at its cap. An empty file is a valid empty Str.
+#
+# ⚠ The directory check is FIRST, before the open, and that placement is the
+# point rather than an ordering preference. Put it where it reads more
+# naturally — after the seek, as `durable_state` does — and it never fires on
+# Linux or macOS, where `lseek(SEEK_END)` on a directory fd *succeeds* and
+# returns a size; the error only surfaces from the `read` below, as -EISDIR. On
+# agnos it fires even earlier, at the open, because that kernel refuses a
+# non-regular inode without `AO_DIRECTORY` — so the same input yields three
+# different errno paths across three targets. Hoisting it makes EISDIR the
+# answer everywhere, at the cost of one extra `is_dir` per direct read.
+#
+# No UTF-8 validation. std's `read_to_string` rejects invalid UTF-8 with
+# `InvalidData`; the bytes here flow straight into a parser that will reject
+# anything it cannot read, so the residual is that a non-UTF-8 definition file
+# fails as a *parse* error rather than an *I/O* one. Recorded, not fixed —
+# validating would mean walking every byte of every file to change which of two
+# errors is returned.
+fn _agnosai_loader_read(path: Str, out_err): Str {
+    if (is_dir(path) == 1) {
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_io(_agnosai_loader_io_detail("read", path, 0 - 21)));
+        return 0;
+    }
+
+    var fd = file_open(str_data(path), 0, 0);
+    if (fd < 0) {
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_io(_agnosai_loader_io_detail("open", path, fd)));
+        return 0;
+    }
+
+    var size = xlseek(fd, 0, 2);
+    if (size < 0) {
+        file_close(fd);
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_io(_agnosai_loader_io_detail("seek", path, size)));
+        return 0;
+    }
+    if (xlseek(fd, 0, 0) < 0) {
+        file_close(fd);
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_io(_agnosai_loader_io_detail("seek", path, 0 - 5)));
+        return 0;
+    }
+
+    # One spare byte so the payload is NUL-terminated and usable as a cstring.
+    var buf = alloc(size + 1);
+    store8(buf + size, 0);
+
+    var total = 0;
+    while (total < size) {
+        var n = file_read(fd, buf + total, size - total);
+        if (n < 0) {
+            file_close(fd);
+            _agnosai_loader_set_err(out_err,
+            agnosai_error_io(_agnosai_loader_io_detail("read", path, n)));
+            return 0;
+        }
+        # A short read is end-of-file, not an error — someone may have truncated
+        # the file between the seek and here. Keep what arrived.
+        if (n == 0) { break; }
+        total = total + n;
+    }
+    file_close(fd);
+    store8(buf + total, 0);
+    return str_new(buf, total);
+}
+
+# ---------------------------------------------------------------------------
+# Agent definition loading
+# ---------------------------------------------------------------------------
+
+# Load an agent definition from a JSON string.
+#
+# Two distinct failures, both the oracle's `Serialization`: the text is not
+# JSON, and the JSON is not an agent definition. serde reports them as one
+# variant with different messages and so does this.
+fn agnosai_load_from_json(json: Str, out_err): i64 {
+    # See `core/message.cyr` for why this is the `_buf` entry point.
+    var v = bayan_json_v_parse_buf(str_data(json), str_len(json));
+    if (v == 0) {
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_serialization(str_from(bayan_json_last_error())));
+        return 0;
+    }
+    var def = agnosai_agent_from_value(v);
+    if (def == 0) {
+        _agnosai_loader_set_err(out_err, agnosai_error_serialization(
+        str_from("missing or malformed agent definition field")));
+        return 0;
+    }
+    return def;
+}
+
+# Load an agent definition from a YAML string.
+#
+# ⚠ **`InvalidDefinition`, not `Serialization`.** The oracle's JSON arm is
+# `.map_err(AgnosaiError::Serialization)` and its YAML arm is
+# `.map_err(|e| AgnosaiError::InvalidDefinition(e.to_string()))` — the same
+# failure through two different variants, which a consumer matching on the error
+# will see. Easy to "tidy" into one and no oracle test would notice.
+fn agnosai_load_from_yaml(yaml: Str, out_err): i64 {
+    var v = bayan_yaml_parse(yaml);
+    if (v == 0) {
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_invalid_definition(str_from(bayan_yaml_last_error())));
+        return 0;
+    }
+    var def = agnosai_agent_from_value(v);
+    if (def == 0) {
+        _agnosai_loader_set_err(out_err, agnosai_error_invalid_definition(
+        str_from("missing or malformed agent definition field")));
+        return 0;
+    }
+    return def;
+}
+
+# Load an agent definition from a file, choosing the format by extension.
+#
+# Supported: `.json`, `.yaml`, `.yml`, case-insensitively.
+#
+# ⚠ The extension is checked BEFORE the file is read, which is the oracle's
+# order reversed — it reads first and matches after. Observably identical for
+# every accepting case; for a rejecting one the oracle would surface an I/O
+# error from an unreadable `.txt` where this surfaces the extension error. That
+# is the better answer for the same reason it is cheaper: a name that can never
+# be loaded should not need to be openable to say so.
+fn agnosai_load_from_file(path: Str, out_err): i64 {
+    var ext = _agnosai_loader_ext(path);
+    var is_json = agnosai_str_eq_ci(ext, str_from("json"));
+    var is_yaml = agnosai_str_eq_ci(ext, str_from("yaml"));
+    var is_yml = agnosai_str_eq_ci(ext, str_from("yml"));
+    if (is_json == 0 && is_yaml == 0 && is_yml == 0) {
+        _agnosai_loader_set_err(out_err, _agnosai_loader_unsupported(ext));
+        return 0;
+    }
+
+    var content = _agnosai_loader_read(path, out_err);
+    if (content == 0) { return 0; }
+
+    if (is_json == 1) { return agnosai_load_from_json(content, out_err); }
+    return agnosai_load_from_yaml(content, out_err);
+}
+
+# Whether a directory entry is one this loader will open.
+#
+# The oracle's `path.is_file()` is a stat on the metadata; this is
+# "not a directory, and openable". The residual is a FIFO or a socket, which
+# `is_file()` calls false and this calls true — and a FIFO with no writer would
+# then block the open. No definition directory contains one, and the honest fix
+# is a portable `S_ISREG` that `lib/io.cyr` does not expose: `xstat`'s buffer
+# layout is target-specific and `-1` on Windows.
+fn _agnosai_loader_is_file(path: Str): i64 {
+    if (is_dir(path) == 1) { return 0; }
+    return file_exists(str_data(path));
+}
+
+# Load every `.json`, `.yaml` and `.yml` definition in a directory.
+#
+# Non-matching files are skipped in silence; a parse error in a matching one
+# fails the whole call, as the oracle's `?` does.
+#
+# ⚠ The ORDER is the filesystem's. Neither Rust's `read_dir` nor `dir_list`
+# sorts, so two machines can return the same definitions in different order —
+# the oracle's own test asserts with `contains` rather than by index, and so
+# does the port's.
+#
+# `dir_list` returns an empty vec for a directory it cannot open, which would
+# turn a missing path into a successful empty load. The explicit `is_dir` guard
+# is what keeps the oracle's `read_dir(dir)?` error.
+fn agnosai_load_all_from_dir(dir: Str, out_err): i64 {
+    if (is_dir(dir) == 0) {
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_io(_agnosai_loader_io_detail("read_dir", dir, 0 - 2)));
+        return 0;
+    }
+
+    var out = vec_new();
+    var names = dir_list(dir);
+    for (var i = 0; i < vec_len(names); i = i + 1) {
+        var path = path_join(dir, vec_get(names, i));
+        if (_agnosai_loader_is_file(path) == 1) {
+            var ext = _agnosai_loader_ext(path);
+            if (agnosai_str_eq_ci(ext, str_from("json")) == 1
+            || agnosai_str_eq_ci(ext, str_from("yaml")) == 1
+            || agnosai_str_eq_ci(ext, str_from("yml")) == 1) {
+                var def = agnosai_load_from_file(path, out_err);
+                if (def == 0) { return 0; }
+                vec_push(out, def);
+            }
+        }
+    }
+    return out;
+}
+
+# ---------------------------------------------------------------------------
+# Preset loading
+# ---------------------------------------------------------------------------
+
+# PresetSpec heap layout — 48 bytes.
+#
+# ⚠ `AGN_PRESET_SIZE` is the oracle's `size` FIELD ("lean" / "standard" /
+# "large"), not the struct's byte count — every other struct in the port spells
+# the byte count `_SIZE`, so the byte count here is `AGN_PRESET_BYTES`. Reading
+# it the usual way allocates 24 bytes for a 48-byte struct and corrupts the heap
+# silently.
+enum AgnosaiPresetOff {
+    AGN_PRESET_NAME = 0;
+    AGN_PRESET_DESC = 8;
+    AGN_PRESET_DOMAIN = 16;
+    AGN_PRESET_SIZE = 24;
+    AGN_PRESET_VERSION = 32;
+    AGN_PRESET_AGENTS = 40;
+    AGN_PRESET_BYTES = 48;
+}
+
+# A preset crew specification: a named team of agent definitions.
+fn agnosai_preset_new(name: Str, description: Str, domain: Str, size: Str,
+version: Str, agents): i64 {
+    var p = alloc(AGN_PRESET_BYTES);
+    store64(p + AGN_PRESET_NAME, name);
+    store64(p + AGN_PRESET_DESC, description);
+    store64(p + AGN_PRESET_DOMAIN, domain);
+    store64(p + AGN_PRESET_SIZE, size);
+    store64(p + AGN_PRESET_VERSION, version);
+    store64(p + AGN_PRESET_AGENTS, agents);
+    return p;
+}
+
+# The preset's name.
+fn agnosai_preset_name(p): i64 {
+    return load64(p + AGN_PRESET_NAME);
+}
+
+# The preset's human-readable description.
+fn agnosai_preset_description(p): i64 {
+    return load64(p + AGN_PRESET_DESC);
+}
+
+# The domain the preset covers.
+fn agnosai_preset_domain(p): i64 {
+    return load64(p + AGN_PRESET_DOMAIN);
+}
+
+# The preset's size tier — the oracle's `size` field.
+fn agnosai_preset_size(p): i64 {
+    return load64(p + AGN_PRESET_SIZE);
+}
+
+# The preset's version string.
+fn agnosai_preset_version(p): i64 {
+    return load64(p + AGN_PRESET_VERSION);
+}
+
+# The preset's agent definitions.
+fn agnosai_preset_agents(p): i64 {
+    return load64(p + AGN_PRESET_AGENTS);
+}
+
+# Serialize a preset — the oracle's derived `Serialize`, field order included.
+fn agnosai_preset_to_value_a(_al, p): i64 {
+    var obj = bayan_json_v_obj_new_a(_al);
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "name"),
+    bayan_json_v_str_new_a(_al, load64(p + AGN_PRESET_NAME)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "description"),
+    bayan_json_v_str_new_a(_al, load64(p + AGN_PRESET_DESC)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "domain"),
+    bayan_json_v_str_new_a(_al, load64(p + AGN_PRESET_DOMAIN)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "size"),
+    bayan_json_v_str_new_a(_al, load64(p + AGN_PRESET_SIZE)));
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "version"),
+    bayan_json_v_str_new_a(_al, load64(p + AGN_PRESET_VERSION)));
+
+    var agents = load64(p + AGN_PRESET_AGENTS);
+    var arr = bayan_json_v_arr_new_a(_al);
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        bayan_json_v_arr_push_a(_al, arr,
+        agnosai_agent_to_value_a(_al, vec_get(agents, i)));
+    }
+    bayan_json_v_obj_set_a(_al, obj, str_from_a(_al, "agents"), arr);
+    return obj;
+}
+
+# Global-allocator form of `agnosai_preset_to_value_a`.
+fn agnosai_preset_to_value(p): i64 {
+    return agnosai_preset_to_value_a(default_alloc(), p);
+}
+
+# Read one required string field, or 0 when it is absent or not a string.
+fn _agnosai_preset_str_field(v, key): i64 {
+    var f = bayan_json_v_obj_get(v, key);
+    if (f == 0) { return 0; }
+    if (bayan_json_v_is_str(f) == 0) { return 0; }
+    return bayan_json_v_str(f);
+}
+
+# Rebuild a preset from a bayan JSON value, or 0 when it is not one.
+#
+# ⚠ **Every one of the six fields is required and a malformed agent fails the
+# whole document.** `PresetSpec` derives `Deserialize` with no `Option`, no
+# `#[serde(default)]` and a plain `Vec<AgentDefinition>`, so serde rejects a
+# preset missing `version` and rejects one whose third agent has no `goal`.
+#
+# That is the opposite of the leniency two neighbours have, which is why it is
+# spelled out: `agnosai_agent_from_value` skips a non-string entry inside
+# `tools`, and `definitions/k8s_crd` skips a malformed agent and keeps the rest.
+# Copying either of those here would silently accept a truncated preset.
+fn agnosai_preset_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+
+    var name = _agnosai_preset_str_field(v, "name");
+    var description = _agnosai_preset_str_field(v, "description");
+    var domain = _agnosai_preset_str_field(v, "domain");
+    var size = _agnosai_preset_str_field(v, "size");
+    var version = _agnosai_preset_str_field(v, "version");
+    if (name == 0 || description == 0 || domain == 0) { return 0; }
+    if (size == 0 || version == 0) { return 0; }
+
+    var av = bayan_json_v_obj_get(v, "agents");
+    if (av == 0) { return 0; }
+    if (bayan_json_v_is_arr(av) == 0) { return 0; }
+
+    var agents = vec_new();
+    for (var i = 0; i < bayan_json_v_arr_len(av); i = i + 1) {
+        var def = agnosai_agent_from_value(bayan_json_v_arr_get(av, i));
+        if (def == 0) { return 0; }
+        vec_push(agents, def);
+    }
+    return agnosai_preset_new(name, description, domain, size, version, agents);
+}
+
+# Load a preset from a JSON string.
+fn agnosai_load_preset_from_json(json: Str, out_err): i64 {
+    var v = bayan_json_v_parse_buf(str_data(json), str_len(json));
+    if (v == 0) {
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_serialization(str_from(bayan_json_last_error())));
+        return 0;
+    }
+    var p = agnosai_preset_from_value(v);
+    if (p == 0) {
+        _agnosai_loader_set_err(out_err, agnosai_error_serialization(
+        str_from("missing or malformed preset field")));
+        return 0;
+    }
+    return p;
+}
+
+# Load a preset from a file.
+#
+# ⚠ No extension check — the oracle reads the path and parses it as JSON
+# whatever it is called, so `team.yaml` containing JSON loads here and
+# `agnosai_load_from_file` would have rejected it. Asymmetric on purpose.
+fn agnosai_load_preset_from_file(path: Str, out_err): i64 {
+    var content = _agnosai_loader_read(path, out_err);
+    if (content == 0) { return 0; }
+    return agnosai_load_preset_from_json(content, out_err);
+}
+
+# Load every `.json` preset in a directory.
+#
+# ⚠ `.json` ONLY. The agent-definition walk above takes `.yaml` and `.yml` too;
+# this one does not, because presets have no YAML arm.
+fn agnosai_load_all_presets(dir: Str, out_err): i64 {
+    if (is_dir(dir) == 0) {
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_io(_agnosai_loader_io_detail("read_dir", dir, 0 - 2)));
+        return 0;
+    }
+
+    var out = vec_new();
+    var names = dir_list(dir);
+    for (var i = 0; i < vec_len(names); i = i + 1) {
+        var path = path_join(dir, vec_get(names, i));
+        if (_agnosai_loader_is_file(path) == 1) {
+            if (agnosai_str_eq_ci(_agnosai_loader_ext(path), str_from("json")) == 1) {
+                var p = agnosai_load_preset_from_file(path, out_err);
+                if (p == 0) { return 0; }
+                vec_push(out, p);
+            }
+        }
+    }
+    return out;
+}
+
+# The built-in presets, embedded at build time.
+#
+# The eighteen documents come from `src/definitions/presets_data.cyr`, which
+# `./scripts/gen-presets.sh` generates from `src/presets/*.json` — the oracle's
+# eighteen `include_str!`s, which Cyrius has no equivalent for.
+#
+# ⚠ A document that fails to parse is DROPPED and the list is simply shorter.
+# That is the oracle's `.filter_map(|j| load_preset_from_json(j).ok())`: not an
+# error, not a panic, no log. It is reproduced rather than tightened because
+# `GET /api/v1/presets` hands the result straight to a client, and answering
+# with seventeen presets is what the oracle does. The generated file is built
+# from documents a JSON parser already accepted, so the filter can only fire on
+# a divergence between that parser and bayan — which is exactly the case where a
+# silently short answer is worst, and why the count is asserted rather than
+# `is_empty()`.
+# `filter_map(.ok())` over `count` documents fetched through `json_fp`, which is
+# `fn(i): cstring`.
+#
+# ⚠ The indirection exists so the DROP is testable. Every embedded document
+# parses, so with `agnosai_preset_json` wired in directly there is no input for
+# which "skip the failure and keep going" and "stop at the failure" differ — a
+# mutation swapping one for the other survives every assertion. The seam lets
+# `tests/definitions_loader_presets.tcyr` supply an accessor with one broken
+# document and pin which of the two this is.
+fn _agnosai_builtin_presets_from(count, json_fp): i64 {
+    var out = vec_new();
+    for (var i = 0; i < count; i = i + 1) {
+        var src = callptr(json_fp, i);
+        if (src != 0) {
+            var p = agnosai_load_preset_from_json(str_from(src), 0);
+            # Dropped, not fatal, and not logged — the oracle's `.ok()`.
+            if (p != 0) { vec_push(out, p); }
+        }
+    }
+    return out;
+}
+
+# The eighteen embedded presets, in the oracle's order.
+fn agnosai_builtin_presets(): i64 {
+    return _agnosai_builtin_presets_from(AGNOSAI_PRESET_JSON_COUNT,
+    &agnosai_preset_json);
+}

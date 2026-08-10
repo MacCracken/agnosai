@@ -1,0 +1,48 @@
+# =========================================================================
+# server/routes/definitions — the preset listing endpoint.
+#
+# Parity oracle: rust-old/src/server/routes/definitions.rs
+#
+# One route. It lived in `routes/tools.cyr` while it was a stub, because a
+# two-line `[]` did not justify a file; now that it answers with real data it
+# moves to the file the oracle keeps it in, and `src/` mirrors `rust-old/src/`
+# again.
+#
+# ## The feature gate is resolved, not carried
+#
+# The oracle's body is `#[cfg(feature = "definitions")]` over the real answer
+# and `#[cfg(not(..))]` over `vec![]`, with `default = []` leaving the feature
+# off. The port has no cargo features and ships the whole crate — `definitions`
+# included — so the populated arm is the one that is true here. The empty arm is
+# not reachable and is not reproduced; a runtime flag would be inventing a
+# switch the oracle does not have.
+#
+# ⚠ That makes the oracle's own test misleading rather than wrong: under the
+# default feature set it asserts the array is EMPTY. `tests/server_routes.tcyr`
+# asserts eighteen, and the difference is the feature, not a divergence.
+# =========================================================================
+
+# `GET /api/v1/presets` — every built-in preset specification.
+#
+# ⚠ `filter_map(.ok())` twice over. The oracle drops a preset that fails to
+# parse (in `builtin_presets`) and then drops one that fails to serialize (here),
+# so the array can be short in two independent ways and the request still
+# answers 200. Neither is logged upstream and neither is logged here.
+#
+# The serializing filter cannot fire in this port: `agnosai_preset_to_value_a`
+# has no failure path, where serde's `to_value` can fail on a map with
+# non-string keys. Kept as a straight loop rather than a guard that could never
+# be false.
+fn agnosai_route_list_presets_a(a): i64 {
+    var presets = agnosai_builtin_presets();
+    var arr = bayan_json_v_arr_new_a(a);
+    for (var i = 0; i < vec_len(presets); i = i + 1) {
+        bayan_json_v_arr_push_a(a, arr, agnosai_preset_to_value_a(a, vec_get(presets, i)));
+    }
+    return agnosai_route_json_a(a, HTTP_OK, arr);
+}
+
+# Global-allocator form of `agnosai_route_list_presets_a`.
+fn agnosai_route_list_presets(): i64 {
+    return agnosai_route_list_presets_a(default_alloc());
+}

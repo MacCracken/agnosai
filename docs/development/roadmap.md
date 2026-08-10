@@ -625,17 +625,34 @@ exporter is live, and spans reach it from the production paths.
 ported, and what remains is hoosh's `otlp.cyr` behind the branch
 `agnosai_telemetry_init_tracing` already takes.
 
-### M10 — `definitions` (Phase 9)
+### M10 — `definitions` (Phase 9) — 🟡 1,157 of 1,460, one module left
 
 **All 1,460 lines.** assembler, loader, presets, versioning, k8s_crd, **plus the
-ZIP container, packaging and YAML halves.** `GET /api/v1/presets` stops
-answering `[]` and becomes a real branch.
+ZIP container, packaging and YAML halves.**
 
-- **YAML is unblocked** — bayan shipped `bayan_yaml_parse` / `_parse_buf` /
-  `_parse_ctx` / `bayan_yaml_frontmatter_split`, returning the same tagged value
-  tree as its JSON parser (verified 2026-08-03).
-- **ZIP** is an upstream ask to sankoch (deflate + crc32 already exist there;
-  ~250 lines). File it now so it lands before the packaging bites.
+✅ **`versioning`, `assembler`, `k8s_crd`, `loader` and the eighteen presets, 2026-08-09.**
+433 assertions across five suites; the per-module table is in
+[state.md](state.md). `GET /api/v1/presets` answers eighteen presets and the
+handler now lives in `src/server/routes/definitions.cyr`, mirroring the oracle.
+
+- **YAML needed nothing** — bayan's `bayan_yaml_parse` returns the same tagged
+  value tree as its JSON parser, so `load_from_yaml` is the JSON path with a
+  different parser call and a different error variant. The variant is the part
+  worth guarding: the oracle maps YAML failures through `InvalidDefinition` and
+  JSON failures through `Serialization`, and no oracle test distinguishes them.
+- **`include_str!` has no Cyrius equivalent**, so the presets are generated into
+  source by `./scripts/gen-presets.sh` and the generated file is committed;
+  `scripts/check-clean.sh` fails on drift. ⚠ The generator has to run its own
+  output through `cyrius fmt`, because **`cyrius fmt` reindents inside
+  multi-line string literals and the spaces land in the string** — filed as
+  `cyrius/docs/development/issues/2026-08-09-cyrius-fmt-reindents-inside-multi-line-string-literals.md`.
+  It corrupted a YAML fixture before it was understood.
+
+🔴 **Remaining: `packaging` (303 lines, 7 oracle tests).** Its one prerequisite
+is a declaration, not an upstream ask: `lib/sankoch.cyr` is present with 26
+`zip_*` fns but is **not listed in `cyrius.cyml`'s `[deps].stdlib`**. The
+earlier note here said ZIP was "an upstream ask to sankoch (~250 lines)" — that
+was written before the fold and is **wrong**; nothing needs writing upstream.
 
 ### M11 — the `sandbox`-gated tools and `hwaccel` (Phase 10)
 

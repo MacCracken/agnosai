@@ -1,0 +1,152 @@
+# =========================================================================
+# strcase.tcyr — tests for src/strcase.cyr
+#
+# No oracle test block: Rust gets these from `eq_ignore_ascii_case` and
+# `to_lowercase().contains(..)`, so what must hold is the *contract* the three
+# callers depend on — `server/prompt_guard` (injection patterns),
+# `fleet/cost_planning` (model families) and `definitions/assembler` (roles,
+# tools, complexity).
+#
+# The module was extracted from prompt_guard at the third use, so these are the
+# first assertions it has had directly. Until now it was covered only
+# transitively, which is how the first-byte-hoisting fast path could regress
+# without any suite noticing.
+#
+# The edges that matter:
+#
+#   * **an empty needle is contained in anything**, matching Rust's
+#     `"abc".contains("")`. `assembler` relies on it — a member with no role
+#     must match everything rather than nothing.
+#   * **the fold is ASCII-only.** A `| 32` fold would map `[` onto `{` and `@`
+#     onto a backtick, so a pattern containing punctuation would match text that
+#     does not contain it — in a *security* module.
+#   * **a false start must not end the scan.** The hoisted first-byte guard
+#     makes it cheap to begin matching and abandon; a scan that gave up at the
+#     first failed offset would miss a later real match.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/strcase.cyr"
+include "tests/test_helpers.cyr"
+
+# A Str over bytes a literal cannot carry.
+fn _t_bytes(b0, b1, b2): i64 {
+    var p = alloc(4);
+    store8(p, b0);
+    store8(p + 1, b1);
+    store8(p + 2, b2);
+    return str_new(p, 3);
+}
+
+fn main(): i64 {
+    # --- agnosai_str_eq_ci -----------------------------------------------
+    assert_eq(agnosai_str_eq_ci(str_from("abc"), str_from("abc")), 1, "identical is equal");
+    assert_eq(agnosai_str_eq_ci(str_from("ABC"), str_from("abc")), 1, "case is folded");
+    assert_eq(agnosai_str_eq_ci(str_from("AbC"), str_from("aBc")), 1, "on both sides");
+    assert_eq(agnosai_str_eq_ci(str_from("abc"), str_from("abd")), 0, "a differing byte is not");
+    assert_eq(agnosai_str_eq_ci(str_from("abc"), str_from("ab")), 0, "nor a differing length");
+    assert_eq(agnosai_str_eq_ci(str_from(""), str_from("")), 1, "two empties are equal");
+    assert_eq(agnosai_str_eq_ci(str_from(""), str_from("a")), 0, "empty is not 'a'");
+
+    # ⚠ ASCII-ONLY. `|32` folding would make these equal: '[' is 0x5B and '{' is
+    # 0x7B, '@' is 0x40 and backtick is 0x60. prompt_guard matches injection
+    # patterns containing punctuation, so this is a security property.
+    assert_eq(agnosai_str_eq_ci(str_from("["), str_from("{")), 0, "'[' is not '{'");
+    assert_eq(agnosai_str_eq_ci(str_from("@"), str_from("`")), 0, "'@' is not a backtick");
+    assert_eq(agnosai_str_eq_ci(str_from("^"), str_from("~")), 0, "nor '^' and '~'");
+    assert_eq(agnosai_str_eq_ci(str_from("]"), str_from("}")), 0, "nor ']' and '}'");
+    assert_eq(agnosai_str_eq_ci(str_from("\\"), str_from("|")), 0, "nor backslash and pipe");
+
+    # Digits and punctuation compare exactly.
+    assert_eq(agnosai_str_eq_ci(str_from("gpt-4"), str_from("GPT-4")), 1,
+    "letters fold, the hyphen and digit do not move");
+    assert_eq(agnosai_str_eq_ci(str_from("gpt-4"), str_from("gpt-5")), 0, "and digits differ");
+
+    # Bytes above 0x7F are compared as-is, not folded.
+    assert_eq(agnosai_str_eq_ci(_t_bytes(0xC3, 0xA9, 65), _t_bytes(0xC3, 0xA9, 97)), 1,
+    "a non-ASCII prefix passes through and the ASCII tail still folds");
+    assert_eq(agnosai_str_eq_ci(_t_bytes(0xC3, 0xA9, 65), _t_bytes(0xC3, 0xA8, 65)), 0,
+    "and two different non-ASCII bytes are not equal");
+
+    # --- agnosai_str_contains_ci ------------------------------------------
+    assert_eq(agnosai_str_contains_ci(str_from("hello world"), str_from("world")), 1,
+    "a needle at the end is found");
+    assert_eq(agnosai_str_contains_ci(str_from("hello world"), str_from("hello")), 1,
+    "at the start");
+    assert_eq(agnosai_str_contains_ci(str_from("hello world"), str_from("lo wo")), 1,
+    "and across the middle");
+    assert_eq(agnosai_str_contains_ci(str_from("Hello World"), str_from("HELLO")), 1,
+    "case-insensitively");
+    assert_eq(agnosai_str_contains_ci(str_from("hello"), str_from("HELLO")), 1,
+    "in both directions of case");
+    assert_eq(agnosai_str_contains_ci(str_from("hello"), str_from("xyz")), 0,
+    "an absent needle is not found");
+
+    # ⚠ An EMPTY needle matches anything — Rust's `"abc".contains("")` is true,
+    # and `assembler` depends on it: a member with no role matches everything.
+    assert_eq(agnosai_str_contains_ci(str_from("hello"), str_from("")), 1,
+    "an empty needle is contained in anything");
+    assert_eq(agnosai_str_contains_ci(str_from(""), str_from("")), 1,
+    "including in an empty haystack");
+    assert_eq(agnosai_str_contains_ci(str_from(""), str_from("a")), 0,
+    "but an empty haystack contains nothing else");
+
+    # A needle longer than the haystack cannot match, and must not read past it.
+    assert_eq(agnosai_str_contains_ci(str_from("ab"), str_from("abc")), 0,
+    "a needle longer than the haystack is not found");
+
+    # Exact-length match — the `i <= last` bound, where `last` is 0.
+    assert_eq(agnosai_str_contains_ci(str_from("abc"), str_from("abc")), 1,
+    "a needle exactly as long as the haystack is found");
+    assert_eq(agnosai_str_contains_ci(str_from("abc"), str_from("abd")), 0,
+    "unless it differs");
+
+    # ⚠ A FALSE START must not end the scan. The first byte matches at offset 0
+    # and the rest does not; the real match is later. A scan that abandoned on
+    # the first failed offset — easy to write with the hoisted guard — would
+    # answer 0 here and pass every other assertion above.
+    assert_eq(agnosai_str_contains_ci(str_from("axxabc"), str_from("abc")), 1,
+    "a failed match at offset 0 does not stop the scan");
+    assert_eq(agnosai_str_contains_ci(str_from("aaab"), str_from("aab")), 1,
+    "nor does a run of near-misses");
+    assert_eq(agnosai_str_contains_ci(str_from("ababab"), str_from("abab")), 1,
+    "and an overlapping repeat is found");
+
+    # The last possible offset, where an off-by-one in `last` would miss it.
+    assert_eq(agnosai_str_contains_ci(str_from("xxxabc"), str_from("abc")), 1,
+    "a needle ending exactly at the last byte is found");
+
+    # --- agnosai_str_contains_ci_cstr -------------------------------------
+    # Same contract, cstring needle — the variant that avoids allocating a Str
+    # header inside a per-candidate loop.
+    assert_eq(agnosai_str_contains_ci_cstr(str_from("hello world"), "world"), 1,
+    "the cstr variant finds a needle");
+    assert_eq(agnosai_str_contains_ci_cstr(str_from("Hello World"), "HELLO"), 1,
+    "case-insensitively");
+    assert_eq(agnosai_str_contains_ci_cstr(str_from("hello"), "xyz"), 0,
+    "and reports an absent one");
+    assert_eq(agnosai_str_contains_ci_cstr(str_from("hello"), ""), 1,
+    "with the same empty-needle rule");
+    assert_eq(agnosai_str_contains_ci_cstr(str_from("ab"), "abc"), 0,
+    "the same over-long rule");
+    assert_eq(agnosai_str_contains_ci_cstr(str_from("axxabc"), "abc"), 1,
+    "and the same false-start behaviour");
+    assert_eq(agnosai_str_contains_ci_cstr(str_from("["), "{"), 0,
+    "and the same ASCII-only fold");
+
+    # ⚠ The two variants must agree. They are separate implementations, so a fix
+    # applied to one and not the other is the failure mode worth pinning.
+    assert_eq(agnosai_str_contains_ci(str_from("Model-GPT4-Turbo"), str_from("gpt4")),
+    agnosai_str_contains_ci_cstr(str_from("Model-GPT4-Turbo"), "gpt4"),
+    "Str and cstr needles agree on a real model name");
+    assert_eq(agnosai_str_contains_ci(str_from("abc"), str_from("")),
+    agnosai_str_contains_ci_cstr(str_from("abc"), ""), "and on the empty needle");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

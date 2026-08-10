@@ -1,0 +1,280 @@
+# =========================================================================
+# definitions_loader_presets.tcyr — tests for the eighteen embedded presets.
+#
+# Oracle test block: rust-old/src/definitions/loader.rs's two remaining tests,
+# `test_builtin_presets_non_empty` and `test_builtin_presets_have_valid_agents`.
+# The other fifteen are in definitions_loader.tcyr.
+#
+# Separate suite because this one covers the GENERATED source,
+# `src/definitions/presets_data.cyr`, and what can go wrong there is not what
+# can go wrong in the loader:
+#
+#   * **the ORDER.** `builtin_presets()` returns a `Vec` and the oracle's
+#     eighteen `include_str!`s go domain by domain, lean → standard → large. A
+#     generator driven by a directory glob produces alphabetical order —
+#     `data-engineering-large` first — and every oracle assertion still passes,
+#     because neither of them looks at position. Every index is pinned here.
+#   * **a silently dropped document.** `builtin_presets` is
+#     `.filter_map(|j| load_preset_from_json(j).ok())`: a document that fails to
+#     parse is dropped and the vec is simply shorter. Asserting `!is_empty()`,
+#     as the oracle does, would pass with seventeen of the eighteen gone.
+#   * **a truncated team.** A preset rejects a malformed agent outright, so a
+#     bad document costs the whole preset rather than one member — the counts
+#     per tier are what proves nothing was lost.
+#
+# The generated file matching `src/presets/*.json` is NOT tested here; that is
+# `./scripts/gen-presets.sh --check`, which diffs the two directly.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/presets_data.cyr"
+include "src/definitions/loader.cyr"
+include "tests/test_helpers.cyr"
+
+# An assertion label: the preset's name plus what is being checked.
+fn _t_label(name, what): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, name);
+    str_builder_add_cstr(sb, what);
+    return str_data(str_builder_build(sb));
+}
+
+# Check the preset at `i` against the position, name, domain, size tier and team
+# size the oracle's array fixes for it.
+fn _t_preset(presets, i, name, domain, size, agents): i64 {
+    var p = vec_get(presets, i);
+    assert(str_eq_cstr(agnosai_preset_name(p), name), _t_label(name, " is at its index"));
+    assert(str_eq_cstr(agnosai_preset_domain(p), domain), _t_label(name, " has its domain"));
+    assert(str_eq_cstr(agnosai_preset_size(p), size), _t_label(name, " has its size tier"));
+    assert(str_eq_cstr(agnosai_preset_version(p), "1.0.0"), _t_label(name, " is version 1.0.0"));
+    assert_eq(vec_len(agnosai_preset_agents(p)), agents,
+    _t_label(name, " has its full team"));
+    return 0;
+}
+
+# The oracle's test_builtin_presets_have_valid_agents, for one preset: every
+# required field non-empty, on the preset and on each of its agents.
+fn _t_valid(presets, i): i64 {
+    var p = vec_get(presets, i);
+    var name = agnosai_preset_name(p);
+    var ok = 1;
+    if (str_len(name) == 0) { ok = 0; }
+    if (str_len(agnosai_preset_domain(p)) == 0) { ok = 0; }
+    if (str_len(agnosai_preset_size(p)) == 0) { ok = 0; }
+    if (str_len(agnosai_preset_description(p)) == 0) { ok = 0; }
+
+    var agents = agnosai_preset_agents(p);
+    if (vec_len(agents) == 0) { ok = 0; }
+    for (var j = 0; j < vec_len(agents); j = j + 1) {
+        var a = vec_get(agents, j);
+        if (str_len(agnosai_agent_key(a)) == 0) { ok = 0; }
+        if (str_len(agnosai_agent_name(a)) == 0) { ok = 0; }
+        if (str_len(agnosai_agent_role(a)) == 0) { ok = 0; }
+        if (str_len(agnosai_agent_goal(a)) == 0) { ok = 0; }
+    }
+    return assert(ok, _t_label(str_data(name), ": every required field is non-empty"));
+}
+
+# A minimal valid preset document under `name`, as a NUL-terminated C string.
+fn _t_ok_doc(name): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"");
+    str_builder_add_cstr(sb, name);
+    str_builder_add_cstr(sb, "\",\"description\":\"d\",\"domain\":\"dm\",");
+    str_builder_add_cstr(sb, "\"size\":\"lean\",\"version\":\"1\",\"agents\":[]}");
+    return str_data(str_builder_build(sb));
+}
+
+# An accessor over three documents whose middle one is unparseable, for the
+# `filter_map(.ok())` seam. `fn(i): cstring`, matching `agnosai_preset_json`.
+fn _t_broken_json(i): i64 {
+    if (i == 0) { return _t_ok_doc("a"); }
+    if (i == 1) { return "{ not a document"; }
+    if (i == 2) { return _t_ok_doc("c"); }
+    return 0;
+}
+
+fn main(): i64 {
+    # --- the raw embedded documents ---------------------------------------
+    assert_eq(AGNOSAI_PRESET_JSON_COUNT, 18, "eighteen documents are embedded");
+
+    var reachable = 0;
+    for (var i = 0; i < AGNOSAI_PRESET_JSON_COUNT; i = i + 1) {
+        if (agnosai_preset_json(i) != 0) {
+            if (strlen(agnosai_preset_json(i)) > 0) { reachable = reachable + 1; }
+        }
+    }
+    assert_eq(reachable, 18, "and every index answers with a non-empty document");
+
+    # ⚠ Out of range is 0, not the last document. The accessor is a chain of
+    # `if`s and a missing final `return 0` would fall through to whatever the
+    # last branch left in the return register.
+    assert_eq(agnosai_preset_json(AGNOSAI_PRESET_JSON_COUNT), 0,
+    "one past the end is 0");
+    assert_eq(agnosai_preset_json(0 - 1), 0, "and so is a negative index");
+    assert_eq(agnosai_preset_json(1000), 0, "and so is a wild one");
+
+    # --- builtin_presets ---------------------------------------------------
+    var presets = agnosai_builtin_presets();
+    # The oracle's test_builtin_presets_non_empty.
+    assert_neq(vec_len(presets), 0, "the built-in presets are not empty");
+    # ⚠ EIGHTEEN. `filter_map(.ok())` drops a document that fails to parse, so a
+    # broken embed shortens this list in silence — `!is_empty()` alone would
+    # still pass with seventeen of them gone.
+    assert_eq(vec_len(presets), 18, "and there are exactly eighteen of them");
+
+    # ⚠ A BROKEN document is SKIPPED, not fatal. `filter_map(.ok())` keeps
+    # walking, so the list comes back short with the survivors in order — the
+    # array is 200 OK to the client either way. Unobservable against the real
+    # embed, where all eighteen parse, which is why the accessor is injected.
+    var partial = _agnosai_builtin_presets_from(3, &_t_broken_json);
+    assert_eq(vec_len(partial), 2, "an unparseable document is dropped, not fatal");
+    assert(str_eq_cstr(agnosai_preset_name(vec_get(partial, 0)), "a"),
+    "the document before it survives");
+    assert(str_eq_cstr(agnosai_preset_name(vec_get(partial, 1)), "c"),
+    "and so does the one AFTER it — the walk does not stop at the failure");
+    assert_eq(vec_len(_agnosai_builtin_presets_from(0, &_t_broken_json)), 0,
+    "and a count of zero yields nothing");
+
+    # --- the order, index by index -----------------------------------------
+    # ⚠ Domain by domain, lean → standard → large. Alphabetical order — what a
+    # glob-driven generator produces — starts `data-engineering-large` and
+    # passes every oracle assertion.
+    _t_preset(presets, 0, "quality-lean", "quality", "lean", 2);
+    _t_preset(presets, 1, "quality-standard", "quality", "standard", 4);
+    _t_preset(presets, 2, "quality-large", "quality", "large", 6);
+
+    _t_preset(presets, 3, "software-engineering-lean", "software-engineering", "lean", 2);
+    _t_preset(presets, 4, "software-engineering-standard", "software-engineering",
+    "standard", 4);
+    _t_preset(presets, 5, "software-engineering-large", "software-engineering", "large", 6);
+
+    _t_preset(presets, 6, "devops-lean", "devops", "lean", 2);
+    _t_preset(presets, 7, "devops-standard", "devops", "standard", 4);
+    _t_preset(presets, 8, "devops-large", "devops", "large", 6);
+
+    _t_preset(presets, 9, "data-engineering-lean", "data-engineering", "lean", 2);
+    _t_preset(presets, 10, "data-engineering-standard", "data-engineering", "standard", 4);
+    _t_preset(presets, 11, "data-engineering-large", "data-engineering", "large", 6);
+
+    _t_preset(presets, 12, "design-lean", "design", "lean", 2);
+    _t_preset(presets, 13, "design-standard", "design", "standard", 4);
+    _t_preset(presets, 14, "design-large", "design", "large", 6);
+
+    _t_preset(presets, 15, "security-lean", "security", "lean", 2);
+    _t_preset(presets, 16, "security-standard", "security", "standard", 4);
+    _t_preset(presets, 17, "security-large", "security", "large", 6);
+
+    # --- the oracle's validity sweep ---------------------------------------
+    for (var k = 0; k < vec_len(presets); k = k + 1) {
+        _t_valid(presets, k);
+    }
+
+    # Seventy-two agents across the eighteen. A preset rejects a malformed
+    # member outright rather than skipping it, so this total only holds if every
+    # one of the seventy-two deserialized.
+    var total = 0;
+    for (var m = 0; m < vec_len(presets); m = m + 1) {
+        total = total + vec_len(agnosai_preset_agents(vec_get(presets, m)));
+    }
+    assert_eq(total, 72, "seventy-two agents in all");
+
+    # Every agent carries its preset's domain and at least one tool — true of
+    # all eighteen source documents, and the cheapest check that the agents
+    # belong to the preset they arrived in rather than being cross-wired.
+    var mismatched = 0;
+    var toolless = 0;
+    for (var n = 0; n < vec_len(presets); n = n + 1) {
+        var pr = vec_get(presets, n);
+        var team = agnosai_preset_agents(pr);
+        for (var q = 0; q < vec_len(team); q = q + 1) {
+            var ag = vec_get(team, q);
+            if (str_eq(agnosai_agent_domain(ag), agnosai_preset_domain(pr)) == 0) {
+                mismatched = mismatched + 1;
+            }
+            if (vec_len(agnosai_agent_tools(ag)) == 0) { toolless = toolless + 1; }
+        }
+    }
+    assert_eq(mismatched, 0, "every agent carries its own preset's domain");
+    assert_eq(toolless, 0, "and every agent has at least one tool");
+
+    # Agent keys are unique within a preset — a `include_str!` pointed twice at
+    # the same document would duplicate a whole team, not just a member, but a
+    # generator that emitted the same literal twice would show up here.
+    var dupes = 0;
+    for (var r = 0; r < vec_len(presets); r = r + 1) {
+        var tm = agnosai_preset_agents(vec_get(presets, r));
+        for (var s = 0; s < vec_len(tm); s = s + 1) {
+            for (var t = s + 1; t < vec_len(tm); t = t + 1) {
+                if (str_eq(agnosai_agent_key(vec_get(tm, s)),
+                agnosai_agent_key(vec_get(tm, t))) == 1) {
+                    dupes = dupes + 1;
+                }
+            }
+        }
+    }
+    assert_eq(dupes, 0, "no preset lists the same agent_key twice");
+
+    # And no two presets are the same document: eighteen distinct names.
+    var name_dupes = 0;
+    for (var u = 0; u < vec_len(presets); u = u + 1) {
+        for (var v = u + 1; v < vec_len(presets); v = v + 1) {
+            if (str_eq(agnosai_preset_name(vec_get(presets, u)),
+            agnosai_preset_name(vec_get(presets, v))) == 1) {
+                name_dupes = name_dupes + 1;
+            }
+        }
+    }
+    assert_eq(name_dupes, 0, "and all eighteen names are distinct");
+
+    # --- the raw accessor and the vec agree --------------------------------
+    # `agnosai_preset_json(0)` must be the document `builtin_presets()[0]` came
+    # from, which is what ties the generated chain to the order asserted above.
+    var first = agnosai_load_preset_from_json(str_from(agnosai_preset_json(0)), 0);
+    assert_neq(first, 0, "the first embedded document parses on its own");
+    assert(str_eq(agnosai_preset_name(first),
+    agnosai_preset_name(vec_get(presets, 0))), "and is the preset at index 0");
+    var last = agnosai_load_preset_from_json(
+    str_from(agnosai_preset_json(AGNOSAI_PRESET_JSON_COUNT - 1)), 0);
+    assert(str_eq(agnosai_preset_name(last),
+    agnosai_preset_name(vec_get(presets, 17))), "and the last is the preset at index 17");
+
+    # --- a real preset, end to end ------------------------------------------
+    # quality-lean's exact contents, so a change to the source document is a
+    # test failure rather than a silent behaviour change for consumers.
+    var ql = vec_get(presets, 0);
+    assert(str_eq_cstr(agnosai_preset_description(ql),
+    "Lightweight quality assurance team"), "quality-lean keeps its description");
+    var qa = vec_get(agnosai_preset_agents(ql), 0);
+    assert(str_eq_cstr(agnosai_agent_key(qa), "qa-engineer"), "and leads with the QA engineer");
+    assert(str_eq_cstr(agnosai_agent_role(qa), "QA Engineer"), "in that role");
+    assert(str_eq_cstr(agnosai_agent_complexity(qa), "medium"), "at medium complexity");
+    assert_eq(vec_len(agnosai_agent_tools(qa)), 2, "with two tools");
+    assert(str_eq_cstr(vec_get(agnosai_agent_tools(qa), 0), "code_analysis"),
+    "the first being code_analysis");
+
+    # --- presets serialize, which is what the route returns ------------------
+    var arr = bayan_json_v_arr_new();
+    for (var w = 0; w < vec_len(presets); w = w + 1) {
+        bayan_json_v_arr_push(arr, agnosai_preset_to_value(vec_get(presets, w)));
+    }
+    assert_eq(bayan_json_v_arr_len(arr), 18, "all eighteen serialize to values");
+    var round = agnosai_load_preset_from_json(
+    bayan_json_v_build(bayan_json_v_arr_get(arr, 5)), 0);
+    assert_neq(round, 0, "and a serialized preset parses back");
+    assert(str_eq_cstr(agnosai_preset_name(round), "software-engineering-large"),
+    "as the same preset");
+    assert_eq(vec_len(agnosai_preset_agents(round)), 6, "with its team intact");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

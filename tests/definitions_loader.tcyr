@@ -1,0 +1,622 @@
+# =========================================================================
+# definitions_loader.tcyr — tests for src/definitions/loader.cyr
+#
+# Oracle test block: rust-old/src/definitions/loader.rs, fifteen of its
+# seventeen `#[test]`s. The two left out are `test_builtin_presets_non_empty`
+# and `test_builtin_presets_have_valid_agents`, which need the eighteen
+# `include_str!`ed documents and land with that bite.
+#
+# What the oracle cannot see, and this pins:
+#
+#   * **which error VARIANT comes back.** The oracle's own tests only
+#     `assert!(result.is_err())`, so JSON→Serialization and YAML→
+#     InvalidDefinition — two different variants for the same class of failure,
+#     visible to any consumer matching on the error — are entirely untested
+#     upstream. Collapsing them into one would pass every oracle test.
+#   * **the extension comes from the file NAME.** A dot in a *directory*
+#     component (`/tmp/x.d/readme`) must not be read as an extension.
+#   * **`.json` only for presets.** The definition walk takes yaml and yml; the
+#     preset walk does not, and no oracle test puts a `.yaml` in a preset
+#     directory to find out.
+#   * **a preset is all-or-nothing.** Its `Vec<AgentDefinition>` has no serde
+#     leniency, unlike two neighbouring loaders that skip a bad element.
+#
+# Every path lives under one root so teardown is a single sweep.
+#
+# `presets_data.cyr` is included only because `loader.cyr` reads its
+# `AGNOSAI_PRESET_JSON_COUNT`; the eighteen embedded documents are
+# `tests/definitions_loader_presets.tcyr`'s subject, not this suite's.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/presets_data.cyr"
+include "src/definitions/loader.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's tempfile::tempdir, minus the RAII.
+var _T_ROOT = "/tmp/agnosai-definitions-loader-test";
+
+# Join two pieces into a NUL-TERMINATED Str. `str_cat` does not terminate and
+# every `sys_*` path argument below is a C string.
+fn _t_join(a: Str, b: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, a);
+    str_builder_add(sb, b);
+    return str_builder_build(sb);
+}
+
+# `_T_ROOT` plus a suffix, NUL-terminated.
+fn _t_under(suffix): i64 {
+    return _t_join(str_from(_T_ROOT), str_from(suffix));
+}
+
+# Write a file under `_T_ROOT`, returning its path.
+fn _t_write(suffix, body): i64 {
+    var path = _t_under(suffix);
+    var s = str_from(body);
+    file_write_all(str_data(path), str_data(s), str_len(s));
+    return path;
+}
+
+# Assemble a fixture document from up to four pieces, NUL-terminated.
+#
+# ⚠ NOT a `\`-continued string literal, and that is deliberate. A backslash at
+# end of line inside a Cyrius literal keeps the newline AND `cyrius fmt` then
+# indents the continuation, so the spaces it adds land INSIDE the string. Between
+# JSON tokens that is harmless; in a YAML fixture it reindents the document and
+# changes what it means. Filed upstream as a `cyrius fmt` bug; every long fixture
+# here is assembled rather than continued.
+fn _t_doc(a, b, c, d): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, a);
+    str_builder_add_cstr(sb, b);
+    if (c != 0) { str_builder_add_cstr(sb, c); }
+    if (d != 0) { str_builder_add_cstr(sb, d); }
+    return str_builder_build(sb);
+}
+
+# A preset document carrying all five scalar fields, closed by `tail`. Every
+# rejection fixture below varies one thing against this baseline.
+fn _t_preset_with(tail_a, tail_b): i64 {
+    return _t_doc("{\"name\":\"n\",\"description\":\"d\",\"domain\":\"dm\",",
+    "\"size\":\"lean\",\"version\":\"1\",", tail_a, tail_b);
+}
+
+# quality-lean trimmed to two agents — the fixture the preset assertions use.
+fn _t_preset_json(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"quality-lean\",");
+    str_builder_add_cstr(sb, "\"description\":\"Lightweight quality assurance team\",");
+    str_builder_add_cstr(sb, "\"domain\":\"quality\",\"size\":\"lean\",\"version\":\"1.0.0\",");
+    str_builder_add_cstr(sb, "\"agents\":[{\"agent_key\":\"qa\",\"name\":\"QA\",");
+    str_builder_add_cstr(sb, "\"role\":\"QA Engineer\",\"goal\":\"Find defects\",");
+    str_builder_add_cstr(sb, "\"tools\":[\"code_analysis\"],\"complexity\":\"medium\"},");
+    str_builder_add_cstr(sb, "{\"agent_key\":\"auto\",\"name\":\"Auto\",");
+    str_builder_add_cstr(sb, "\"role\":\"Test Automation\",\"goal\":\"Automate\"}]}");
+    return str_builder_build(sb);
+}
+
+# Assert two Strs are equal. The stdlib's `assert_streq` compares C strings.
+fn _t_seq(a: Str, b: Str, name): i64 {
+    return assert(str_eq(a, b), name);
+}
+
+# The error kind stored through an out-param, or -1 when nothing was stored.
+fn _t_kind(slot): i64 {
+    var e = load64(slot);
+    if (e == 0) { return 0 - 1; }
+    return agnosai_error_kind(e);
+}
+
+# Whether any agent in `defs` has `key` as its agent_key — the oracle's
+# `keys.contains(&"a")`, which is how it avoids depending on readdir order.
+fn _t_has_key(defs, key): i64 {
+    for (var i = 0; i < vec_len(defs); i = i + 1) {
+        if (str_eq(agnosai_agent_key(vec_get(defs, i)), str_from(key)) == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    var err = 0;
+    store64(&err, 0);
+
+    # --- load_from_json ---------------------------------------------------
+    # The oracle's test_load_from_json, field for field.
+    var full = _t_doc("{\"agent_key\":\"lint-agent\",\"name\":\"Lint Agent\",",
+    "\"role\":\"linter\",\"goal\":\"Lint all the things\",",
+    "\"tools\":[\"ruff\",\"eslint\"],\"complexity\":\"low\"}", 0);
+    var def = agnosai_load_from_json(full, &err);
+    assert_neq(def, 0, "a complete definition loads from JSON");
+    _t_seq(agnosai_agent_key(def), str_from("lint-agent"), "agent_key round-trips");
+    _t_seq(agnosai_agent_name(def), str_from("Lint Agent"), "name round-trips");
+    _t_seq(agnosai_agent_role(def), str_from("linter"), "role round-trips");
+    _t_seq(agnosai_agent_goal(def), str_from("Lint all the things"),
+    "goal round-trips");
+    assert_eq(vec_len(agnosai_agent_tools(def)), 2, "both tools survive");
+    _t_seq(vec_get(agnosai_agent_tools(def), 0), str_from("ruff"), "in order");
+    _t_seq(vec_get(agnosai_agent_tools(def), 1), str_from("eslint"), "and complete");
+    _t_seq(agnosai_agent_complexity(def), str_from("low"), "complexity round-trips");
+    assert_eq(load64(&err), 0, "and nothing was written to out_err on success");
+
+    # The oracle's test_load_from_json_minimal — only the four required fields.
+    var minimal = agnosai_load_from_json(str_from(
+    "{\"agent_key\":\"m\",\"name\":\"M\",\"role\":\"r\",\"goal\":\"g\"}"), &err);
+    assert_neq(minimal, 0, "the four required fields are enough");
+    _t_seq(agnosai_agent_key(minimal), str_from("m"), "and the key is read");
+    assert_eq(vec_len(agnosai_agent_tools(minimal)), 0, "with no tools");
+
+    # The oracle's test_load_from_json_invalid.
+    store64(&err, 0);
+    assert_eq(agnosai_load_from_json(str_from("{ this is not json }"), &err), 0,
+    "malformed JSON does not load");
+    # ⚠ The VARIANT. The oracle asserts only `is_err()`.
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_SERIALIZATION,
+    "and reports Serialization, the oracle's serde_json arm");
+
+    # Well-formed JSON that is not a definition is the same variant — serde
+    # cannot tell the two apart either.
+    store64(&err, 0);
+    assert_eq(agnosai_load_from_json(str_from("{\"agent_key\":\"a\"}"), &err), 0,
+    "JSON missing required fields does not load");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_SERIALIZATION, "with the same variant");
+
+    store64(&err, 0);
+    assert_eq(agnosai_load_from_json(str_from("[1,2,3]"), &err), 0,
+    "nor does a JSON array");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_SERIALIZATION, "still Serialization");
+
+    # `out_err` may be 0 — `builtin_presets` will pass exactly that.
+    assert_eq(agnosai_load_from_json(str_from("nope"), 0), 0,
+    "a null out_err is accepted rather than dereferenced");
+
+    # --- load_from_yaml ---------------------------------------------------
+    # The oracle's test_load_from_yaml.
+    store64(&err, 0);
+    var ydef = agnosai_load_from_yaml(_t_doc(
+    "agent_key: yaml-agent\nname: YAML Agent\n",
+    "role: reviewer\ngoal: Review everything\n",
+    "tools:\n  - review\n  - comment\ncomplexity: high\n", 0), &err);
+    assert_neq(ydef, 0, "a complete definition loads from YAML");
+    _t_seq(agnosai_agent_key(ydef), str_from("yaml-agent"), "agent_key round-trips");
+    _t_seq(agnosai_agent_role(ydef), str_from("reviewer"), "role round-trips");
+    assert_eq(vec_len(agnosai_agent_tools(ydef)), 2, "a block sequence becomes both tools");
+    _t_seq(vec_get(agnosai_agent_tools(ydef), 0), str_from("review"), "in order");
+    _t_seq(agnosai_agent_complexity(ydef), str_from("high"), "complexity round-trips");
+
+    # The oracle's test_load_from_yaml_minimal.
+    var ymin = agnosai_load_from_yaml(str_from(
+    "agent_key: y\nname: Y\nrole: r\ngoal: g\n"), &err);
+    assert_neq(ymin, 0, "the four required fields are enough in YAML too");
+    _t_seq(agnosai_agent_key(ymin), str_from("y"), "and the key is read");
+
+    # The oracle's test_load_from_yaml_invalid.
+    store64(&err, 0);
+    assert_eq(agnosai_load_from_yaml(str_from("agent_key: [unclosed\n"), &err), 0,
+    "malformed YAML does not load");
+    # ⚠ **InvalidDefinition, NOT Serialization.** The oracle's two arms use
+    # different variants for the same class of failure, and only this asserts it.
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_INVALID_DEFINITION,
+    "and reports InvalidDefinition, which is the oracle's serde_yaml arm");
+
+    store64(&err, 0);
+    assert_eq(agnosai_load_from_yaml(str_from("agent_key: only\n"), &err), 0,
+    "YAML missing required fields does not load");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_INVALID_DEFINITION, "with the same variant");
+
+    # The two formats disagree on variant for the identical failure. Pinned as
+    # a pair so a later tidy-up cannot quietly unify them.
+    store64(&err, 0);
+    agnosai_load_from_json(str_from("{"), &err);
+    var json_kind = _t_kind(&err);
+    store64(&err, 0);
+    agnosai_load_from_yaml(str_from("a: [b\n"), &err);
+    assert_neq(json_kind, _t_kind(&err),
+    "JSON and YAML report DIFFERENT error variants for a parse failure");
+
+    # --- extension handling -----------------------------------------------
+    sys_mkdir(_T_ROOT, 0x1FF);
+
+    # The oracle's test_load_from_file_json.
+    store64(&err, 0);
+    var jpath = _t_write("/agent.json",
+    "{\"agent_key\":\"file-json\",\"name\":\"F\",\"role\":\"r\",\"goal\":\"g\"}");
+    var fdef = agnosai_load_from_file(jpath, &err);
+    assert_neq(fdef, 0, "a .json file loads");
+    _t_seq(agnosai_agent_key(fdef), str_from("file-json"), "as JSON");
+
+    # The oracle's test_load_from_file_yaml.
+    var ypath = _t_write("/agent.yaml", "agent_key: file-yaml\nname: F\nrole: r\ngoal: g\n");
+    var yfdef = agnosai_load_from_file(ypath, &err);
+    assert_neq(yfdef, 0, "a .yaml file loads");
+    _t_seq(agnosai_agent_key(yfdef), str_from("file-yaml"), "as YAML");
+
+    var ymlpath = _t_write("/agent.yml", "agent_key: file-yml\nname: F\nrole: r\ngoal: g\n");
+    assert_neq(agnosai_load_from_file(ymlpath, &err), 0, "and so does a .yml file");
+
+    # Case-insensitive, because the oracle lowercases before matching.
+    var upper = _t_write("/AGENT.JSON",
+    "{\"agent_key\":\"upper\",\"name\":\"U\",\"role\":\"r\",\"goal\":\"g\"}");
+    assert_neq(agnosai_load_from_file(upper, &err), 0, "an UPPERCASE extension loads");
+
+    # The oracle's test_load_from_file_unsupported_ext.
+    store64(&err, 0);
+    var txt = _t_write("/agent.txt", "whatever");
+    assert_eq(agnosai_load_from_file(txt, &err), 0, "an unsupported extension does not");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_INVALID_DEFINITION, "reporting InvalidDefinition");
+    # ⚠ The message interpolates the LOWERCASED extension. Asserted literally
+    # because dropping the fold is invisible everywhere else.
+    _t_seq(agnosai_error_detail(load64(&err)),
+    str_from("unsupported file extension: txt"), "with the oracle's message");
+
+    store64(&err, 0);
+    var uptxt = _t_write("/agent.TXT", "whatever");
+    agnosai_load_from_file(uptxt, &err);
+    _t_seq(agnosai_error_detail(load64(&err)),
+    str_from("unsupported file extension: txt"),
+    "and the message reports it LOWERCASED, not as it was spelled");
+
+    # No dot at all — Rust's `extension()` is None and `unwrap_or("")` empties it.
+    store64(&err, 0);
+    var noext = _t_write("/readme", "ignored");
+    assert_eq(agnosai_load_from_file(noext, &err), 0, "a file with no extension is refused");
+    _t_seq(agnosai_error_detail(load64(&err)),
+    str_from("unsupported file extension: "), "with an empty extension in the message");
+
+    # ⚠ A DOTFILE has no extension in Rust: the leading dot is stem, not
+    # separator. `.json` is a file named json, not a JSON file.
+    store64(&err, 0);
+    var dotfile = _t_write("/.json",
+    "{\"agent_key\":\"d\",\"name\":\"D\",\"role\":\"r\",\"goal\":\"g\"}");
+    assert_eq(agnosai_load_from_file(dotfile, &err), 0,
+    "a file NAMED .json has no extension and is refused");
+    _t_seq(agnosai_error_detail(load64(&err)),
+    str_from("unsupported file extension: "), "the leading dot being stem, not separator");
+
+    # ...but a second dot makes one.
+    var hidden = _t_write("/.hidden.json",
+    "{\"agent_key\":\"hidden\",\"name\":\"H\",\"role\":\"r\",\"goal\":\"g\"}");
+    assert_neq(agnosai_load_from_file(hidden, &err), 0,
+    "while .hidden.json does have a json extension");
+
+    # Only the LAST dot counts.
+    var multi = _t_write("/agent.v2.json",
+    "{\"agent_key\":\"multi\",\"name\":\"M\",\"role\":\"r\",\"goal\":\"g\"}");
+    assert_neq(agnosai_load_from_file(multi, &err), 0, "and only the final dot separates");
+
+    # ⚠ A dot in a DIRECTORY component is not an extension. The naive
+    # last-dot-in-the-whole-path scan reads this as `d/readme` and skips the
+    # file, which looks identical to correct behaviour until someone stores
+    # definitions under a dotted directory.
+    store64(&err, 0);
+    sys_mkdir(str_data(_t_under("/run.d")), 0x1FF);
+    var dotted = _t_write("/run.d/readme", "ignored");
+    assert_eq(agnosai_load_from_file(dotted, &err), 0,
+    "a dotted DIRECTORY does not give the file an extension");
+    _t_seq(agnosai_error_detail(load64(&err)),
+    str_from("unsupported file extension: "), "the extension being taken from the name alone");
+
+    var dotted_json = _t_write("/run.d/agent.json",
+    "{\"agent_key\":\"dotted\",\"name\":\"D\",\"role\":\"r\",\"goal\":\"g\"}");
+    assert_neq(agnosai_load_from_file(dotted_json, &err), 0,
+    "and a real .json under that directory still loads");
+
+    # --- filesystem errors -------------------------------------------------
+    store64(&err, 0);
+    assert_eq(agnosai_load_from_file(_t_under("/absent.json"), &err), 0,
+    "a missing file does not load");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_IO, "reporting Io, not Serialization");
+
+    # ⚠ A DIRECTORY named like a definition. `file_read_all` would call this a
+    # zero-byte success and the parse would fail as Serialization; std says
+    # "Is a directory", so the variant must be Io.
+    store64(&err, 0);
+    var dirish = _t_under("/looks-like.json");
+    sys_mkdir(str_data(dirish), 0x1FF);
+    assert_eq(agnosai_load_from_file(dirish, &err), 0,
+    "a DIRECTORY with a .json name does not load");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_IO, "and is an Io error, not a parse error");
+    # ⚠ **EISDIR specifically**, which is what std reports. Without the hoisted
+    # `is_dir` guard the errno depends on the target: Linux and macOS let
+    # `lseek(SEEK_END)` succeed on a directory and fail at the read, agnos
+    # refuses the open outright. Asserting the number is what keeps all three
+    # answering the same thing.
+    _t_seq(agnosai_error_detail(load64(&err)),
+    _t_join(_t_join(str_from("read "), dirish), str_from(": os error 21")),
+    "reporting EISDIR, the errno std renders as \"Is a directory\"");
+
+    # An empty file is readable and then fails to parse — the other side of the
+    # same distinction.
+    store64(&err, 0);
+    var empty = _t_write("/empty.json", "");
+    assert_eq(agnosai_load_from_file(empty, &err), 0, "an EMPTY .json does not load");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_SERIALIZATION,
+    "but fails as a PARSE error, which is how it differs from the directory");
+
+    # --- load_all_from_dir -------------------------------------------------
+    # The oracle's test_load_all_from_dir, with its exact fixture.
+    var d = _t_under("/all");
+    sys_mkdir(str_data(d), 0x1FF);
+    var ya = str_from("{\"agent_key\":\"a\",\"name\":\"A\",\"role\":\"r\",\"goal\":\"g\"}");
+    file_write_all(str_data(_t_join(d, str_from("/a.json"))), str_data(ya), str_len(ya));
+    var yb = str_from("agent_key: b\nname: B\nrole: r\ngoal: g\n");
+    file_write_all(str_data(_t_join(d, str_from("/b.yaml"))), str_data(yb), str_len(yb));
+    var yc = str_from("agent_key: c\nname: C\nrole: r\ngoal: g\n");
+    file_write_all(str_data(_t_join(d, str_from("/c.yml"))), str_data(yc), str_len(yc));
+    var ign = str_from("ignored");
+    file_write_all(str_data(_t_join(d, str_from("/readme.txt"))), str_data(ign), str_len(ign));
+
+    store64(&err, 0);
+    var all = agnosai_load_all_from_dir(d, &err);
+    assert_neq(all, 0, "a directory of definitions loads");
+    assert_eq(vec_len(all), 3, "three of the four files match");
+    # ⚠ By CONTAINS, not by index: neither readdir nor `dir_list` sorts, so an
+    # index assertion would pass on one machine and fail on another.
+    assert_eq(_t_has_key(all, "a"), 1, "the .json is among them");
+    assert_eq(_t_has_key(all, "b"), 1, "and the .yaml");
+    assert_eq(_t_has_key(all, "c"), 1, "and the .yml");
+    assert_eq(load64(&err), 0, "and the skipped .txt raised no error");
+
+    # A SUBDIRECTORY named like a definition is skipped, not opened — the
+    # oracle's `if !path.is_file() { continue; }`.
+    sys_mkdir(str_data(_t_join(d, str_from("/nested.json"))), 0x1FF);
+    store64(&err, 0);
+    assert_eq(vec_len(agnosai_load_all_from_dir(d, &err)), 3,
+    "a SUBDIRECTORY with a .json name is skipped rather than loaded");
+    assert_eq(load64(&err), 0, "and does not fail the walk");
+
+    # The oracle's test_load_all_from_dir_empty.
+    var edir = _t_under("/empty-dir");
+    sys_mkdir(str_data(edir), 0x1FF);
+    store64(&err, 0);
+    var none = agnosai_load_all_from_dir(edir, &err);
+    assert_neq(none, 0, "an empty directory succeeds");
+    assert_eq(vec_len(none), 0, "with no definitions");
+    assert_eq(load64(&err), 0, "and no error");
+
+    # ⚠ A MISSING directory is an error, not an empty result. `dir_list` returns
+    # an empty vec for a directory it cannot open, so without the explicit guard
+    # this would be indistinguishable from the assertion directly above.
+    store64(&err, 0);
+    assert_eq(agnosai_load_all_from_dir(_t_under("/no-such-dir"), &err), 0,
+    "a MISSING directory fails rather than loading nothing");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_IO, "with an Io error");
+
+    # A parse error inside a matching file fails the whole walk — the oracle's
+    # `?`, not a skip.
+    var bad = _t_under("/bad");
+    sys_mkdir(str_data(bad), 0x1FF);
+    var good_body = str_from("{\"agent_key\":\"ok\",\"name\":\"O\",\"role\":\"r\",\"goal\":\"g\"}");
+    file_write_all(str_data(_t_join(bad, str_from("/ok.json"))),
+    str_data(good_body), str_len(good_body));
+    var junk = str_from("{ not json");
+    file_write_all(str_data(_t_join(bad, str_from("/broken.json"))),
+    str_data(junk), str_len(junk));
+    store64(&err, 0);
+    assert_eq(agnosai_load_all_from_dir(bad, &err), 0,
+    "one unparseable file fails the WHOLE directory, rather than being skipped");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_SERIALIZATION, "with the parse error propagated");
+
+    # --- PresetSpec --------------------------------------------------------
+    var preset_json = _t_preset_json();
+
+    store64(&err, 0);
+    var pre = agnosai_load_preset_from_json(preset_json, &err);
+    assert_neq(pre, 0, "a preset loads from JSON");
+    _t_seq(agnosai_preset_name(pre), str_from("quality-lean"), "name round-trips");
+    _t_seq(agnosai_preset_description(pre),
+    str_from("Lightweight quality assurance team"), "description round-trips");
+    _t_seq(agnosai_preset_domain(pre), str_from("quality"), "domain round-trips");
+    _t_seq(agnosai_preset_size(pre), str_from("lean"), "size round-trips");
+    _t_seq(agnosai_preset_version(pre), str_from("1.0.0"), "version round-trips");
+    assert_eq(vec_len(agnosai_preset_agents(pre)), 2, "both agents are read");
+    _t_seq(agnosai_agent_key(vec_get(agnosai_preset_agents(pre), 0)),
+    str_from("qa"), "the first in order");
+    _t_seq(agnosai_agent_key(vec_get(agnosai_preset_agents(pre), 1)),
+    str_from("auto"), "and the second");
+    assert_eq(vec_len(agnosai_agent_tools(vec_get(agnosai_preset_agents(pre), 0))), 1,
+    "with each agent fully deserialized");
+
+    # ⚠ EVERY field is required — `PresetSpec` has no Option and no
+    # `#[serde(default)]`, so serde rejects a preset missing any of the six.
+    assert_eq(agnosai_load_preset_from_json(_t_doc(
+    "{\"name\":\"n\",\"description\":\"d\",\"domain\":\"dm\",",
+    "\"size\":\"lean\",\"agents\":[]}", 0, 0), 0), 0,
+    "a preset missing `version` is rejected");
+    assert_eq(agnosai_load_preset_from_json(_t_doc(
+    "{\"description\":\"d\",\"domain\":\"dm\",",
+    "\"size\":\"lean\",\"version\":\"1\",\"agents\":[]}", 0, 0), 0), 0,
+    "and one missing `name`");
+    assert_eq(agnosai_load_preset_from_json(_t_doc(
+    "{\"name\":\"n\",\"description\":\"d\",\"domain\":\"dm\",",
+    "\"size\":\"lean\",\"version\":\"1\"}", 0, 0), 0), 0,
+    "and one missing `agents`");
+
+    # A field of the wrong TYPE is rejected too, not coerced.
+    assert_eq(agnosai_load_preset_from_json(_t_doc(
+    "{\"name\":42,\"description\":\"d\",\"domain\":\"dm\",",
+    "\"size\":\"lean\",\"version\":\"1\",\"agents\":[]}", 0, 0), 0), 0,
+    "a numeric `name` is rejected rather than stringified");
+    assert_eq(agnosai_load_preset_from_json(
+    _t_preset_with("\"agents\":{}}", 0), 0), 0,
+    "and an `agents` object is not an array");
+
+    # ⚠ ONE malformed agent fails the WHOLE preset. `agnosai_agent_from_value`
+    # skips a bad entry inside `tools`, and `definitions/k8s_crd` skips a bad
+    # agent and keeps the rest — copying either here would silently truncate a
+    # preset team.
+    store64(&err, 0);
+    assert_eq(agnosai_load_preset_from_json(_t_preset_with(
+    "\"agents\":[{\"agent_key\":\"ok\",\"name\":\"O\",\"role\":\"r\",\"goal\":\"g\"},",
+    "{\"agent_key\":\"bad\"}]}"), &err), 0,
+    "one malformed agent rejects the ENTIRE preset rather than being skipped");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_SERIALIZATION, "as a Serialization error");
+
+    # An empty team is legal — `Vec` deserializes from `[]`.
+    var teamless = agnosai_load_preset_from_json(
+    _t_preset_with("\"agents\":[]}", 0), 0);
+    assert_neq(teamless, 0, "a preset with no agents is still a valid preset");
+    assert_eq(vec_len(agnosai_preset_agents(teamless)), 0, "with an empty team");
+
+    store64(&err, 0);
+    assert_eq(agnosai_load_preset_from_json(str_from("not json at all"), &err), 0,
+    "unparseable text is not a preset");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_SERIALIZATION, "reporting Serialization");
+
+    # --- preset serialization ----------------------------------------------
+    # The oracle derives Serialize, so a preset must round-trip through JSON.
+    var round = agnosai_load_preset_from_json(
+    bayan_json_v_build(agnosai_preset_to_value(pre)), 0);
+    assert_neq(round, 0, "a serialized preset parses back");
+    _t_seq(agnosai_preset_name(round), agnosai_preset_name(pre), "name survives");
+    _t_seq(agnosai_preset_size(round), agnosai_preset_size(pre), "size survives");
+    _t_seq(agnosai_preset_version(round), agnosai_preset_version(pre),
+    "version survives");
+    assert_eq(vec_len(agnosai_preset_agents(round)), 2, "and both agents survive");
+    _t_seq(agnosai_agent_goal(vec_get(agnosai_preset_agents(round), 0)),
+    str_from("Find defects"), "with their fields intact");
+
+    # The `_a` form is what the route will call with a request arena; the
+    # global-allocator wrapper must agree with it field for field.
+    var arena_v = agnosai_preset_to_value_a(default_alloc(), pre);
+    var from_arena = agnosai_preset_from_value(arena_v);
+    assert_neq(from_arena, 0, "the allocator-threaded form builds the same object");
+    _t_seq(agnosai_preset_name(from_arena), str_from("quality-lean"),
+    "carrying the same name");
+    assert_eq(vec_len(agnosai_preset_agents(from_arena)), 2, "and the same team");
+
+    # `from_value` refuses anything that is not an object, without a parse step.
+    assert_eq(agnosai_preset_from_value(bayan_json_v_arr_new()), 0,
+    "and from_value refuses a bare array");
+    assert_eq(agnosai_preset_from_value(bayan_json_v_null()), 0, "and a null");
+
+    var pv = agnosai_preset_to_value(pre);
+    assert_neq(bayan_json_v_obj_get(pv, "description"), 0, "the object carries description");
+    assert_neq(bayan_json_v_obj_get(pv, "domain"), 0, "and domain");
+    assert_eq(bayan_json_v_is_arr(bayan_json_v_obj_get(pv, "agents")), 1,
+    "and agents is an array");
+
+    # A hand-built preset serializes the same way.
+    var built = agnosai_preset_new(str_from("n"), str_from("d"), str_from("dm"),
+    str_from("large"), str_from("2.0.0"), vec_new());
+    _t_seq(agnosai_preset_domain(built), str_from("dm"), "the constructor stores domain");
+    _t_seq(agnosai_preset_size(built), str_from("large"),
+    "and `size` is the tier field, not the struct's byte count");
+    assert_eq(vec_len(agnosai_preset_agents(built)), 0, "and an empty team stays empty");
+
+    # --- preset files and directories ---------------------------------------
+    # The oracle's test_load_preset_from_file.
+    var pdir = _t_under("/presets");
+    sys_mkdir(str_data(pdir), 0x1FF);
+    var p1 = _t_join(pdir, str_from("/one.json"));
+    file_write_all(str_data(p1), str_data(preset_json), str_len(preset_json));
+    store64(&err, 0);
+    var fromfile = agnosai_load_preset_from_file(p1, &err);
+    assert_neq(fromfile, 0, "a preset loads from a file");
+    _t_seq(agnosai_preset_name(fromfile), str_from("quality-lean"), "with its name");
+
+    store64(&err, 0);
+    assert_eq(agnosai_load_preset_from_file(_t_join(pdir, str_from("/absent.json")), &err), 0,
+    "a missing preset file does not load");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_IO, "reporting Io");
+
+    # The oracle's test_load_all_presets_from_dir.
+    var p2 = _t_join(pdir, str_from("/two.json"));
+    file_write_all(str_data(p2), str_data(preset_json), str_len(preset_json));
+    # ⚠ `.yaml` and `.yml` are NOT preset extensions, even though they are
+    # definition extensions. No oracle test puts one here.
+    var pyaml = str_from("name: y\ndescription: d\ndomain: dm\nsize: lean\nversion: 1\nagents: []\n");
+    file_write_all(str_data(_t_join(pdir, str_from("/three.yaml"))),
+    str_data(pyaml), str_len(pyaml));
+    file_write_all(str_data(_t_join(pdir, str_from("/notes.txt"))),
+    str_data(ign), str_len(ign));
+
+    store64(&err, 0);
+    var presets = agnosai_load_all_presets(pdir, &err);
+    assert_neq(presets, 0, "a directory of presets loads");
+    assert_eq(vec_len(presets), 2,
+    "taking ONLY the .json files — the .yaml is skipped where a definition walk would take it");
+    assert_eq(load64(&err), 0, "and nothing errored");
+
+    store64(&err, 0);
+    var pempty = _t_under("/presets-empty");
+    sys_mkdir(str_data(pempty), 0x1FF);
+    assert_eq(vec_len(agnosai_load_all_presets(pempty, &err)), 0,
+    "an empty preset directory yields none");
+    assert_eq(load64(&err), 0, "with no error");
+
+    store64(&err, 0);
+    assert_eq(agnosai_load_all_presets(_t_under("/no-such-presets"), &err), 0,
+    "a missing preset directory fails");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_IO, "with an Io error");
+
+    # A broken preset fails the whole walk, as for definitions.
+    var pbad = _t_under("/presets-bad");
+    sys_mkdir(str_data(pbad), 0x1FF);
+    file_write_all(str_data(_t_join(pbad, str_from("/broken.json"))),
+    str_data(junk), str_len(junk));
+    store64(&err, 0);
+    assert_eq(agnosai_load_all_presets(pbad, &err), 0,
+    "one broken preset fails the whole directory");
+    assert_eq(_t_kind(&err), AGNOSAI_ERR_SERIALIZATION, "with the parse error propagated");
+
+    # ⚠ `load_preset_from_file` does NOT check the extension, unlike
+    # `load_from_file`. The oracle reads the path and parses JSON whatever it is
+    # called, so a preset in a `.yaml` file loads through the direct entry and
+    # is invisible to the directory walk. Asymmetric on purpose.
+    var mislabelled = _t_join(pdir, str_from("/four.yaml"));
+    file_write_all(str_data(mislabelled), str_data(preset_json), str_len(preset_json));
+    assert_neq(agnosai_load_preset_from_file(mislabelled, 0), 0,
+    "JSON in a .yaml file loads through load_preset_from_file");
+    assert_eq(vec_len(agnosai_load_all_presets(pdir, 0)), 2,
+    "while the directory walk still ignores it");
+
+    # --- teardown -----------------------------------------------------------
+    sys_unlink(str_data(_t_join(pdir, str_from("/one.json"))));
+    sys_unlink(str_data(_t_join(pdir, str_from("/two.json"))));
+    sys_unlink(str_data(_t_join(pdir, str_from("/three.yaml"))));
+    sys_unlink(str_data(_t_join(pdir, str_from("/four.yaml"))));
+    sys_unlink(str_data(_t_join(pdir, str_from("/notes.txt"))));
+    sys_unlink(str_data(_t_join(pbad, str_from("/broken.json"))));
+    sys_unlink(str_data(_t_join(bad, str_from("/ok.json"))));
+    sys_unlink(str_data(_t_join(bad, str_from("/broken.json"))));
+    sys_unlink(str_data(_t_join(d, str_from("/a.json"))));
+    sys_unlink(str_data(_t_join(d, str_from("/b.yaml"))));
+    sys_unlink(str_data(_t_join(d, str_from("/c.yml"))));
+    sys_unlink(str_data(_t_join(d, str_from("/readme.txt"))));
+    sys_rmdir(str_data(_t_join(d, str_from("/nested.json"))));
+    sys_unlink(str_data(_t_under("/run.d/readme")));
+    sys_unlink(str_data(_t_under("/run.d/agent.json")));
+    sys_unlink(str_data(_t_under("/agent.json")));
+    sys_unlink(str_data(_t_under("/agent.yaml")));
+    sys_unlink(str_data(_t_under("/agent.yml")));
+    sys_unlink(str_data(_t_under("/AGENT.JSON")));
+    sys_unlink(str_data(_t_under("/agent.txt")));
+    sys_unlink(str_data(_t_under("/agent.TXT")));
+    sys_unlink(str_data(_t_under("/agent.v2.json")));
+    sys_unlink(str_data(_t_under("/readme")));
+    sys_unlink(str_data(_t_under("/.json")));
+    sys_unlink(str_data(_t_under("/.hidden.json")));
+    sys_unlink(str_data(_t_under("/empty.json")));
+    sys_rmdir(str_data(_t_under("/looks-like.json")));
+    sys_rmdir(str_data(_t_under("/run.d")));
+    sys_rmdir(str_data(pdir));
+    sys_rmdir(str_data(pbad));
+    sys_rmdir(str_data(pempty));
+    sys_rmdir(str_data(bad));
+    sys_rmdir(str_data(d));
+    sys_rmdir(str_data(edir));
+    sys_rmdir(_T_ROOT);
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);
