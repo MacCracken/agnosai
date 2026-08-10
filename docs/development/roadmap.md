@@ -861,3 +861,58 @@ starts fresh (see CLAUDE.md).
 Everything in the exclusion table above, plus: inbound chunked request bodies
 (sandhi 1.9.4 answers 501 — honest, but not support), and any comparison of
 Cyrius benchmark numbers against the frozen Rust CSV.
+
+### Owed to the ecosystem, not to v2.0 — an OpenTelemetry library repo
+
+**There is no Cyrius OTel library, and two projects have now hand-rolled the
+same subset independently.** hoosh wrote `src/lib/otlp.cyr` (199 lines);
+agnosai wrote `src/telemetry/otlp.cyr` from the same shape, because the
+alternative was depending on hoosh as a *library*, which ADR 003 forbids. That
+is the second instance. The third will be whoever needs traces next, and by the
+port's own rule (`CLAUDE.md`, *Refactoring*) the third instance is when the
+abstraction gets extracted.
+
+⚠ **It is a separate repo, not a cyrius stdlib module.** Not `lib/otel.cyr` and
+not a language feature — a sibling library like sakshi, sigil, majra or bote:
+its own repo, scaffolded with `cyrius init`, publishing a `dist/<name>.cyr`
+bundle, consumed the way every other one already is —
+
+```toml
+[deps.<name>]
+git = "https://github.com/MacCracken/<name>.git"
+path = "../<name>"
+tag = "X.Y.Z"
+modules = ["dist/<name>.cyr"]
+```
+
+Naming is the user's call; the AGNOS convention is a Sanskrit/Persian word, not
+`otel`.
+
+What it would own, in rough order of value:
+
+- **OTLP/protobuf.** Both hand-rolls emit OTLP/JSON purely because there is no
+  Cyrius protobuf codec. JSON is a first-class OTLP transport so nothing is
+  broken, but it is several times the bytes on the wire and every collector
+  prefers the binary encoding. ⚠ The protobuf codec is itself probably a
+  *separate* repo — a general wire-format library, not an OTel concern — so it
+  is a prerequisite with its own decision attached, not a sub-task.
+- **The span model** — attributes, events, links, a parent, a status.
+  agnosai's `telemetry/genai` had to invent one because sakshi's spans are name
+  + timing with no attribute channel, and it is deliberately shaped for GenAI
+  rather than for anything general.
+- **Context propagation.** W3C `traceparent` parse/serialise, and — the hard
+  part — a **thread-local** current-span. sakshi's trace id and span stack are
+  process globals, so under `sandhi_server_run_pooled` two concurrent requests
+  share one trace id. That is the open question the OTLP exporter bite carries,
+  and it is not agnosai's to solve properly.
+- **A batching exporter** with a bounded queue and a drain thread. Both
+  hand-rolls have one; hoosh's is a 256-slot ring behind a mutex.
+- **Metrics and logs.** OTel is three signals; both hand-rolls do traces only.
+
+Once it exists, `src/telemetry/otlp.cyr` collapses to a thin adapter and
+`telemetry/genai`'s span record becomes that library's span type — the same way
+`fleet/relay` collapsed onto majra once majra could carry it.
+
+⚠ **This is a note, not a filing.** It is recorded here so the next consumer
+finds the prior art instead of writing a third encoder, and so the cost is
+visible when someone decides whether the ecosystem wants the repo.
