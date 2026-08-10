@@ -1,0 +1,712 @@
+# =========================================================================
+# definitions_packaging.tcyr — tests for src/definitions/packaging.cyr
+#
+# Oracle test block: rust-old/src/definitions/packaging.rs, all seven `#[test]`s.
+#
+# The oracle's seven are round trips and two `is_err()` checks. Between them they
+# touch neither of the module's two constants, neither error variant, neither
+# filter, and no ordering — so almost everything that can go wrong in a port of
+# this file is invisible upstream. What is pinned here past them:
+#
+#   * **`MAX_ENTRIES` is `>`, not `>=`** — exactly 100 entries is accepted, and
+#     the entry count is UNIQUE NAMES, not central-directory records.
+#   * **`MAX_FILE_SIZE` reads the UNCOMPRESSED size.** Reading `csize` instead
+#     compiles, round-trips, and turns the zip-bomb guard into a check on the
+#     one number an attacker shrinks.
+#   * **Which error variant.** `by_name` failing is `InvalidDefinition` for the
+#     manifest and `Other` for a definition — the same operation, two variants —
+#     and a decode failure is `Io`, not either of them.
+#   * **The `..` filter is a SUBSTRING test and a SILENT SKIP**, so
+#     `definitions/a..b.json` is dropped, no error, and the import succeeds with
+#     fewer definitions than the archive holds.
+#   * **Definition ORDER survives the round trip.** The oracle preserves it; its
+#     test asserts membership with `keys.contains(..)`, so a port returning them
+#     reversed passes upstream.
+#   * **A duplicate member name fails `export`**, because zip 8 refuses one.
+#     sankoch does not, so the port has to.
+#   * **The bound is an upper bound.** `_agnosai_pkg_bound` sizes the buffer
+#     sankoch will not grow; if it ever under-counts, export fails.
+#
+# The three divergences from the oracle are [ADR 018](../docs/adr/018-sankoch-path-check-on-import.md)
+# and are asserted here as decisions, not as parity.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/presets_data.cyr"
+include "src/definitions/loader.cyr"
+include "src/definitions/packaging.cyr"
+include "tests/test_helpers.cyr"
+
+var _T_ROOT = "/tmp/agnosai-definitions-packaging-test";
+
+# Join two pieces into a NUL-TERMINATED Str — `str_cat` does not terminate and
+# every `sys_*` path argument here is a C string.
+fn _t_join(a: Str, b: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, a);
+    str_builder_add(sb, b);
+    return str_builder_build(sb);
+}
+
+# Assert two Strs are equal. The stdlib's `assert_streq` compares C strings.
+fn _t_seq(a: Str, b: Str, name): i64 {
+    return assert(str_eq(a, b), name);
+}
+
+# The oracle's `make_definition(key)`: `Agent {key}` / tester / test things /
+# domain quality / one tool / medium.
+fn _t_def(key): i64 {
+    var d = agnosai_agent_new(str_from(key), str_from("tester"), str_from("test things"));
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Agent ");
+    str_builder_add_cstr(sb, key);
+    agnosai_agent_with_name(d, str_builder_build(sb));
+    agnosai_agent_with_domain(d, str_from("quality"));
+    var tools = vec_new();
+    vec_push(tools, str_from("tool_a"));
+    agnosai_agent_with_tools(d, tools);
+    agnosai_agent_with_complexity(d, str_from("medium"));
+    return d;
+}
+
+# Export `p`, asserting success, and hand back the bytes through `out_len`.
+fn _t_export(p, out_len, name): i64 {
+    var bytes = 0;
+    store64(&bytes, 0);
+    assert_eq(agnosai_package_export(p, &bytes, out_len), 0, name);
+    return load64(&bytes);
+}
+
+# Import bytes, asserting success, and hand back the package.
+fn _t_import(buf, len, name): i64 {
+    var pkg = 0;
+    store64(&pkg, 0);
+    assert_eq(agnosai_package_import(buf, len, &pkg), 0, name);
+    return load64(&pkg);
+}
+
+# The error kind from an import that must fail, or -1 when it did not.
+fn _t_import_kind(buf, len): i64 {
+    var pkg = 0;
+    store64(&pkg, 0);
+    var e = agnosai_package_import(buf, len, &pkg);
+    if (e == 0) { return 0 - 1; }
+    return agnosai_error_kind(e);
+}
+
+# A hand-built archive of one member, so a test can write names and payloads the
+# port's own `export` would never produce.
+fn _t_zip1(name, body: Str, out_len): i64 {
+    var cap = 4096 + str_len(body);
+    var dst = alloc(cap);
+    var w = zip_writer_init(dst, cap);
+    if (w == 0) { return 0; }
+    if (zip_add(w, name, str_data(body), str_len(body), ZIP_STORE) != 0) { return 0; }
+    var n = zip_writer_finish(w);
+    if (n < 0) { return 0; }
+    store64(out_len, n);
+    return dst;
+}
+
+# The same with two members.
+fn _t_zip2(n1, b1: Str, n2, b2: Str, out_len): i64 {
+    var cap = 8192 + str_len(b1) + str_len(b2);
+    var dst = alloc(cap);
+    var w = zip_writer_init(dst, cap);
+    if (w == 0) { return 0; }
+    if (zip_add(w, n1, str_data(b1), str_len(b1), ZIP_STORE) != 0) { return 0; }
+    if (zip_add(w, n2, str_data(b2), str_len(b2), ZIP_STORE) != 0) { return 0; }
+    var n = zip_writer_finish(w);
+    if (n < 0) { return 0; }
+    store64(out_len, n);
+    return dst;
+}
+
+# Replace byte `at` of every occurrence of `name` in `buf` with `to`, and answer
+# how many were patched.
+#
+# ⚠ This is the only way to build an archive whose member name sankoch's WRITER
+# refuses — `zip_add` runs the same `_zip_path_safe` as the reader
+# (`lib/sankoch.cyr:14774`), so a backslash cannot be written in the first place.
+# The name appears verbatim twice, in the local header and in the central
+# directory, and swapping one byte changes no length and no CRC (which covers
+# the payload only), so the archive stays well-formed.
+fn _t_patch_name(buf, len, name, at, to): i64 {
+    var nl = strlen(name);
+    var hits = 0;
+    for (var i = 0; i + nl <= len; i = i + 1) {
+        if (memeq(buf + i, name, nl) == 1) {
+            store8(buf + i + at, to);
+            hits = hits + 1;
+        }
+    }
+    return hits;
+}
+
+# Re-stamp the compression method of `name` in the CENTRAL DIRECTORY.
+#
+# `zip_open` builds its entry table from the central directory
+# (`lib/sankoch.cyr:14401`), so this is the field `zip_entry_method` answers
+# with. A CD record is `46 + nlen + elen` bytes with the name at +46 and the
+# method at +10, hence `name_off - 36`. The LOCAL header also carries a name and
+# a method — at +30 and +8 — so the CD occurrence is the SECOND hit in the file.
+#
+# Only the CD copy is patched, which is enough to make the reader refuse the
+# member and is the smallest edit that leaves every length and CRC intact.
+fn _t_patch_cd_method(buf, len, name, method): i64 {
+    var nl = strlen(name);
+    var hit = 0;
+    for (var i = 0; i + nl <= len; i = i + 1) {
+        if (memeq(buf + i, name, nl) == 1) {
+            hit = hit + 1;
+            if (hit == 2) {
+                store8(buf + i - 36, method & 255);
+                store8(buf + i - 35, (method >> 8) & 255);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+# Whether `members` fit in `cap` bytes when every one is STORED.
+#
+# The worst case `_agnosai_pkg_bound` has to cover: sankoch degrades DEFLATE to
+# STORE whenever compression does not shrink a member
+# (`lib/sankoch.cyr:14795-14810`), so a bound checked only against compressed
+# output is not checked at all.
+fn _t_store_fits(members, cap): i64 {
+    var dst = alloc(cap);
+    var w = zip_writer_init(dst, cap);
+    if (w == 0) { return 0; }
+    for (var i = 0; i < vec_len(members); i = i + AGNOSAI_PKG_MEMBER_STRIDE) {
+        var nm = vec_get(members, i);
+        var bd = vec_get(members, i + 1);
+        if (zip_add(w, str_data(nm), str_data(bd), str_len(bd), ZIP_STORE) != 0) { return 0; }
+    }
+    if (zip_writer_finish(w) < 0) { return 0; }
+    return 1;
+}
+
+# A minimal valid manifest body.
+fn _t_manifest(name, version): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"");
+    str_builder_add_cstr(sb, name);
+    str_builder_add_cstr(sb, "\",\"version\":\"");
+    str_builder_add_cstr(sb, version);
+    str_builder_add_cstr(sb, "\",\"metadata\":{}}");
+    return str_builder_build(sb);
+}
+
+# A minimal valid definition body under `key`.
+fn _t_def_json(key): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"agent_key\":\"");
+    str_builder_add_cstr(sb, key);
+    str_builder_add_cstr(sb, "\",\"name\":\"N\",\"role\":\"r\",\"goal\":\"g\"}");
+    return str_builder_build(sb);
+}
+
+fn main(): i64 {
+    var len = 0;
+    store64(&len, 0);
+
+    # --- Oracle: test_new_package_has_empty_metadata -----------------------
+    var empty = agnosai_package_new(str_from("empty"), str_from("0.1.0"));
+    assert_eq(vec_len(agnosai_package_definitions(empty)), 0, "a new package has no definitions");
+    # ⚠ An empty OBJECT, not null. A null would serialize, round-trip and read
+    # back as null, and every round-trip test would still pass.
+    assert_eq(bayan_json_v_is_obj(agnosai_package_metadata(empty)), 1,
+    "and its metadata is an object");
+    assert_eq(bayan_json_v_obj_len(agnosai_package_metadata(empty)), 0, "an EMPTY one");
+    assert_eq(bayan_json_v_is_null(agnosai_package_metadata(empty)), 0, "and not null");
+    _t_seq(agnosai_package_name(empty), str_from("empty"), "the name is kept");
+    _t_seq(agnosai_package_version(empty), str_from("0.1.0"), "and the version");
+
+    # --- Oracle: test_export_import_round_trip -----------------------------
+    var p1 = agnosai_package_new(str_from("test-pkg"), str_from("1.0.0"));
+    agnosai_package_add_definition(p1, _t_def("agent-one"));
+    var b1 = _t_export(p1, &len, "a package exports");
+    assert(load64(&len) > 0, "to a non-empty archive");
+
+    var r1 = _t_import(b1, load64(&len), "and imports back");
+    _t_seq(agnosai_package_name(r1), str_from("test-pkg"), "the name round-trips");
+    _t_seq(agnosai_package_version(r1), str_from("1.0.0"), "and the version");
+    assert_eq(vec_len(agnosai_package_definitions(r1)), 1, "with its one definition");
+    var d1 = vec_get(agnosai_package_definitions(r1), 0);
+    _t_seq(agnosai_agent_key(d1), str_from("agent-one"), "carrying its agent_key");
+    _t_seq(agnosai_agent_name(d1), str_from("Agent agent-one"), "its name");
+    _t_seq(agnosai_agent_domain(d1), str_from("quality"), "and its domain");
+    # Past the oracle, which asserts only those three of the fourteen fields.
+    _t_seq(agnosai_agent_role(d1), str_from("tester"), "and its role");
+    _t_seq(agnosai_agent_goal(d1), str_from("test things"), "and its goal");
+    _t_seq(agnosai_agent_complexity(d1), str_from("medium"), "and its complexity");
+    assert_eq(vec_len(agnosai_agent_tools(d1)), 1, "and its tool list");
+    _t_seq(vec_get(agnosai_agent_tools(d1), 0), str_from("tool_a"), "with the tool in it");
+
+    # ⚠ Export is REPRODUCIBLE here, where the oracle's is not: zip 8 stamps
+    # `now_utc()` into every header and `zip_add` passes mtime 0. Asserted
+    # because it is a documented divergence ([ADR 018]) and because it is the
+    # cheapest proof that nothing wall-clock leaked into the archive.
+    var len2 = 0;
+    store64(&len2, 0);
+    var b1again = _t_export(p1, &len2, "the same package exports again");
+    assert_eq(load64(&len2), load64(&len), "to the same length");
+    var same = 1;
+    for (var i = 0; i < load64(&len); i = i + 1) {
+        if (load8(b1 + i) != load8(b1again + i)) { same = 0; break; }
+    }
+    assert_eq(same, 1, "and byte for byte the same archive");
+
+    # --- Oracle: test_package_with_multiple_definitions --------------------
+    var p2 = agnosai_package_new(str_from("multi-pkg"), str_from("2.0.0"));
+    agnosai_package_add_definition(p2, _t_def("alpha"));
+    agnosai_package_add_definition(p2, _t_def("beta"));
+    agnosai_package_add_definition(p2, _t_def("gamma"));
+    var b2 = _t_export(p2, &len, "a three-definition package exports");
+    var r2 = _t_import(b2, load64(&len), "and imports back");
+    assert_eq(vec_len(agnosai_package_definitions(r2)), 3, "with all three");
+    # ⚠ BY INDEX. The oracle asserts `keys.contains(..)` three times, so a port
+    # that returned them in any order at all would pass it.
+    _t_seq(agnosai_agent_key(vec_get(agnosai_package_definitions(r2), 0)),
+    str_from("alpha"), "in order: alpha first");
+    _t_seq(agnosai_agent_key(vec_get(agnosai_package_definitions(r2), 1)),
+    str_from("beta"), "then beta");
+    _t_seq(agnosai_agent_key(vec_get(agnosai_package_definitions(r2), 2)),
+    str_from("gamma"), "then gamma");
+
+    # An empty package still round-trips — the manifest is written even with no
+    # definitions, and no oracle test exports an empty one.
+    var b3 = _t_export(empty, &len, "a package with NO definitions still exports");
+    var r3 = _t_import(b3, load64(&len), "and imports back");
+    assert_eq(vec_len(agnosai_package_definitions(r3)), 0, "with no definitions");
+    _t_seq(agnosai_package_name(r3), str_from("empty"), "and its name intact");
+
+    # --- Oracle: test_metadata_preserved_through_round_trip ----------------
+    var p4 = agnosai_package_new(str_from("meta-test"), str_from("1.0.0"));
+    var meta = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(meta, str_from("created_by"),
+    bayan_json_v_str_new(str_from("agnosai")));
+    var tags = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(tags, bayan_json_v_str_new(str_from("quality")));
+    bayan_json_v_arr_push(tags, bayan_json_v_str_new(str_from("lean")));
+    bayan_json_v_obj_set(meta, str_from("tags"), tags);
+    bayan_json_v_obj_set(meta, str_from("priority"), bayan_json_v_int_new(5));
+    agnosai_package_set_metadata(p4, meta);
+    agnosai_package_add_definition(p4, _t_def("m"));
+
+    var b4 = _t_export(p4, &len, "a package with nested metadata exports");
+    var r4 = _t_import(b4, load64(&len), "and imports back");
+    var m4 = agnosai_package_metadata(r4);
+    assert_eq(bayan_json_v_is_obj(m4), 1, "the metadata is still an object");
+    _t_seq(bayan_json_v_str(bayan_json_v_obj_get(m4, "created_by")), str_from("agnosai"),
+    "a string field survives");
+    var t4 = bayan_json_v_obj_get(m4, "tags");
+    assert_eq(bayan_json_v_is_arr(t4), 1, "a nested array survives");
+    _t_seq(bayan_json_v_str(bayan_json_v_arr_get(t4, 0)), str_from("quality"),
+    "with its first element");
+    # Past the oracle, which asserts only `tags[0]`.
+    assert_eq(bayan_json_v_arr_len(t4), 2, "and its length");
+    _t_seq(bayan_json_v_str(bayan_json_v_arr_get(t4, 1)), str_from("lean"),
+    "and its second element");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get(m4, "priority")), 5,
+    "and an integer survives as an integer");
+
+    # --- Oracle: test_import_invalid_data_returns_error --------------------
+    var junk = str_from("this is not a zip file");
+    assert_eq(_t_import_kind(str_data(junk), str_len(junk)), AGNOSAI_ERR_INVALID_DEFINITION,
+    "unparseable bytes are an InvalidDefinition, not an Io or a Serialization");
+
+    # --- Oracle: test_import_empty_zip_missing_manifest_returns_error ------
+    var other = _t_zip1("other.txt", str_from("hello"), &len);
+    assert_neq(other, 0, "a one-member archive builds");
+    assert_eq(_t_import_kind(other, load64(&len)), AGNOSAI_ERR_INVALID_DEFINITION,
+    "an archive with no manifest.json is an InvalidDefinition");
+
+    # --- the guards the oracle never tests ---------------------------------
+    # ⚠ A DEFINITION member that cannot be read is `Other`, where the MISSING
+    # MANIFEST above is `InvalidDefinition`. Same operation, two variants, and
+    # the oracle only ever asserts `is_err()`.
+    #
+    # Reached by naming a member with a backslash: it passes the oracle's `..`
+    # filter and the `definitions/`+`.json` test, and sankoch refuses to extract
+    # it ([ADR 018]).
+    var slash = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "definitions/aXb.json", _t_def_json("ab"), &len);
+    assert_neq(slash, 0, "an archive with a placeholder member builds");
+    # 92 is a backslash; index 13 is the `X` in `definitions/aXb.json`.
+    assert_eq(_t_patch_name(slash, load64(&len), "definitions/aXb.json", 13, 92), 2,
+    "and the name is patched in both the local header and the central directory");
+    assert_eq(_t_import_kind(slash, load64(&len)), AGNOSAI_ERR_IO,
+    "a member sankoch refuses to extract is an Io error, per ADR 018");
+
+    # ⚠ The `..` filter is a SUBSTRING test and a SILENT SKIP. `a..b` escapes
+    # nothing, and the import succeeds with the definition simply absent.
+    var dots = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "definitions/a..b.json", _t_def_json("ab"), &len);
+    assert_neq(dots, 0, "an archive with a `..` member builds");
+    var rdots = _t_import(dots, load64(&len), "a `..` member does NOT fail the import");
+    assert_eq(vec_len(agnosai_package_definitions(rdots)), 0,
+    "it is SILENTLY SKIPPED — the package comes back with no definitions at all");
+
+    # A member that is neither the manifest nor a definition is ignored.
+    var extra = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "README.md", str_from("hi"), &len);
+    var rextra = _t_import(extra, load64(&len), "an unrelated member is ignored");
+    assert_eq(vec_len(agnosai_package_definitions(rextra)), 0, "and adds no definition");
+
+    # The prefix and suffix tests are exact and case-sensitive.
+    var wrongdir = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "definitionsX/a.json", _t_def_json("a"), &len);
+    assert_eq(vec_len(agnosai_package_definitions(
+    _t_import(wrongdir, load64(&len), "a near-miss prefix imports"))), 0,
+    "`definitionsX/` is not `definitions/`");
+
+    var upper = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "definitions/a.JSON", _t_def_json("a"), &len);
+    assert_eq(vec_len(agnosai_package_definitions(
+    _t_import(upper, load64(&len), "an uppercase extension imports"))), 0,
+    "and `.JSON` is not `.json`");
+
+    # ⚠ NESTED members are INCLUDED — `starts_with` + `ends_with` says nothing
+    # about what is between them, and the nesting is not preserved.
+    var nested = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "definitions/sub/deep.json", _t_def_json("deep"), &len);
+    var rnested = _t_import(nested, load64(&len), "a NESTED definition imports");
+    assert_eq(vec_len(agnosai_package_definitions(rnested)), 1, "and is included");
+    _t_seq(agnosai_agent_key(vec_get(agnosai_package_definitions(rnested), 0)),
+    str_from("deep"), "flattened, with no record it was nested");
+
+    # There is no cross-check between the member name and the agent_key inside.
+    var mismatch = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "definitions/alpha.json", _t_def_json("omega"), &len);
+    var rmis = _t_import(mismatch, load64(&len), "a name/key mismatch imports");
+    _t_seq(agnosai_agent_key(vec_get(agnosai_package_definitions(rmis), 0)),
+    str_from("omega"), "and the key inside wins over the filename");
+
+    # --- the manifest's three required fields ------------------------------
+    # ⚠ All three. `PackageManifest` has no `Option` and no `#[serde(default)]`,
+    # so a manifest without `metadata` is a Serialization error, not an empty
+    # object — and every oracle test writes all three.
+    var nometa = _t_zip1("manifest.json",
+    str_from("{\"name\":\"p\",\"version\":\"1\"}"), &len);
+    assert_eq(_t_import_kind(nometa, load64(&len)), AGNOSAI_ERR_SERIALIZATION,
+    "a manifest with no `metadata` is a Serialization error");
+    var noname = _t_zip1("manifest.json",
+    str_from("{\"version\":\"1\",\"metadata\":{}}"), &len);
+    assert_eq(_t_import_kind(noname, load64(&len)), AGNOSAI_ERR_SERIALIZATION,
+    "and one with no `name`");
+    var badmanifest = _t_zip1("manifest.json", str_from("{ not json"), &len);
+    assert_eq(_t_import_kind(badmanifest, load64(&len)), AGNOSAI_ERR_SERIALIZATION,
+    "and an unparseable manifest");
+    # Unknown keys are ignored — no `deny_unknown_fields`.
+    var extrakey = _t_zip1("manifest.json",
+    str_from("{\"name\":\"p\",\"version\":\"1\",\"metadata\":{},\"who\":\"me\"}"), &len);
+    var rextrakey = _t_import(extrakey, load64(&len), "an unknown manifest key is ignored");
+    _t_seq(agnosai_package_name(rextrakey), str_from("p"), "and the rest still reads");
+
+    # A malformed DEFINITION is a Serialization error and fails the whole import.
+    var baddef = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "definitions/x.json", str_from("{\"agent_key\":\"x\"}"), &len);
+    assert_eq(_t_import_kind(baddef, load64(&len)), AGNOSAI_ERR_SERIALIZATION,
+    "a definition missing required fields fails the whole import");
+
+    # --- MAX_ENTRIES --------------------------------------------------------
+    # ⚠ `>`, not `>=`. Exactly 100 is accepted; 101 is not. A `>=` narrows the
+    # format by one entry and no oracle test notices.
+    assert_eq(AGNOSAI_PKG_MAX_ENTRIES, 100, "the entry cap is the oracle's 100");
+    var big = alloc(1 << 20);
+    var wbig = zip_writer_init(big, 1 << 20);
+    var mbody = _t_manifest("cap", "1");
+    zip_add(wbig, "manifest.json", str_data(mbody), str_len(mbody), ZIP_STORE);
+    for (var e = 1; e < AGNOSAI_PKG_MAX_ENTRIES; e = e + 1) {
+        var nb = str_builder_new();
+        str_builder_add_cstr(nb, "pad/");
+        str_builder_add_int(nb, e);
+        str_builder_add_cstr(nb, ".txt");
+        zip_add(wbig, str_data(str_builder_build(nb)), str_data(mbody), 1, ZIP_STORE);
+    }
+    var bign = zip_writer_finish(wbig);
+    assert(bign > 0, "a 100-entry archive builds");
+    var r100 = _t_import(big, bign, "EXACTLY 100 entries is accepted");
+    _t_seq(agnosai_package_name(r100), str_from("cap"), "and reads its manifest");
+
+    var big2 = alloc(1 << 20);
+    var wbig2 = zip_writer_init(big2, 1 << 20);
+    zip_add(wbig2, "manifest.json", str_data(mbody), str_len(mbody), ZIP_STORE);
+    for (var e2 = 1; e2 <= AGNOSAI_PKG_MAX_ENTRIES; e2 = e2 + 1) {
+        var nb2 = str_builder_new();
+        str_builder_add_cstr(nb2, "pad/");
+        str_builder_add_int(nb2, e2);
+        str_builder_add_cstr(nb2, ".txt");
+        zip_add(wbig2, str_data(str_builder_build(nb2)), str_data(mbody), 1, ZIP_STORE);
+    }
+    var bign2 = zip_writer_finish(wbig2);
+    assert_eq(_t_import_kind(big2, bign2), AGNOSAI_ERR_INVALID_DEFINITION,
+    "and 101 is refused");
+
+    # ⚠ 101 RECORDS but only 100 unique names is ACCEPTED, because the oracle
+    # counts the latter. This is the pair that separates the two readings — the
+    # 100/101 pair above passes either way.
+    var dupcap = alloc(1 << 20);
+    var wdc = zip_writer_init(dupcap, 1 << 20);
+    zip_add(wdc, "manifest.json", str_data(mbody), str_len(mbody), ZIP_STORE);
+    for (var dz = 1; dz < AGNOSAI_PKG_MAX_ENTRIES; dz = dz + 1) {
+        var dnb = str_builder_new();
+        str_builder_add_cstr(dnb, "pad/");
+        str_builder_add_int(dnb, dz);
+        str_builder_add_cstr(dnb, ".txt");
+        zip_add(wdc, str_data(str_builder_build(dnb)), str_data(mbody), 1, ZIP_STORE);
+    }
+    # The 101st RECORD repeats a name already present, so the unique count stays
+    # at 100.
+    zip_add(wdc, "pad/1.txt", str_data(mbody), 1, ZIP_STORE);
+    var dcn = zip_writer_finish(wdc);
+    assert(dcn > 0, "a 101-record / 100-name archive builds");
+    var rdc = _t_import(dupcap, dcn,
+    "101 RECORDS under 100 unique names is accepted — the oracle counts names");
+    _t_seq(agnosai_package_name(rdc), str_from("cap"), "and it reads its manifest");
+
+    # ⚠ The count is UNIQUE NAMES, not central-directory records — the oracle's
+    # `archive.len()` is an IndexMap keyed by name. Two records under one name
+    # count once, so the definition is imported ONCE rather than twice.
+    var dupname = _t_zip2("definitions/d.json", _t_def_json("d"),
+    "definitions/d.json", _t_def_json("d"), &len);
+    var wdup = zip_writer_init(alloc(8192), 8192);
+    var rdup = 0;
+    var dupfull = alloc(8192);
+    var wdup2 = zip_writer_init(dupfull, 8192);
+    var dbody = _t_def_json("d");
+    zip_add(wdup2, "manifest.json", str_data(mbody), str_len(mbody), ZIP_STORE);
+    zip_add(wdup2, "definitions/d.json", str_data(dbody), str_len(dbody), ZIP_STORE);
+    zip_add(wdup2, "definitions/d.json", str_data(dbody), str_len(dbody), ZIP_STORE);
+    var dupn = zip_writer_finish(wdup2);
+    assert(dupn > 0, "an archive with a duplicated member name builds");
+    var rdupimp = _t_import(dupfull, dupn, "and imports");
+    assert_eq(vec_len(agnosai_package_definitions(rdupimp)), 1,
+    "with the duplicate collapsed to ONE, as the oracle's name-keyed map does");
+
+    # ⚠ For a duplicated name the LAST record wins, because the oracle's map
+    # replaces the value in place. `zip_find` answers with the first, so the
+    # lookup is `_agnosai_pkg_find_last`. Built with two DIFFERENT payloads
+    # under one name, which is the only way to tell them apart.
+    var winner = alloc(8192);
+    var wwin = zip_writer_init(winner, 8192);
+    var first_body = _t_def_json("first");
+    var last_body = _t_def_json("last");
+    zip_add(wwin, "manifest.json", str_data(mbody), str_len(mbody), ZIP_STORE);
+    zip_add(wwin, "definitions/d.json", str_data(first_body), str_len(first_body), ZIP_STORE);
+    zip_add(wwin, "definitions/d.json", str_data(last_body), str_len(last_body), ZIP_STORE);
+    var winn = zip_writer_finish(wwin);
+    var rwin = _t_import(winner, winn, "an archive with two payloads under one name imports");
+    assert_eq(vec_len(agnosai_package_definitions(rwin)), 1, "as one definition");
+    _t_seq(agnosai_agent_key(vec_get(agnosai_package_definitions(rwin), 0)),
+    str_from("last"), "and it is the LAST record, not the first");
+
+    # ⚠ An UNDECODABLE member is SKIPPED, not an error — the oracle's
+    # `archive.by_index(i).ok()?` returns from the closure and the entry simply
+    # does not appear. Method 9 is deflate64, which sankoch does not decode.
+    var meth = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "definitions/x.json", _t_def_json("x"), &len);
+    assert_neq(meth, 0, "an archive to re-stamp builds");
+    assert_eq(_t_patch_cd_method(meth, load64(&len), "definitions/x.json", 9), 1,
+    "and its central-directory method field is reachable");
+    var rmeth = _t_import(meth, load64(&len),
+    "a member in a method we cannot decode does NOT fail the import");
+    assert_eq(vec_len(agnosai_package_definitions(rmeth)), 0,
+    "it is skipped, exactly as the oracle's by_index(..).ok()? skips it");
+
+    # --- MAX_FILE_SIZE ------------------------------------------------------
+    assert_eq(AGNOSAI_PKG_MAX_FILE_SIZE, 1048576, "the per-file cap is 1 MiB");
+    # ⚠ On the UNCOMPRESSED size. A 1 MiB + 1 payload of one repeated byte
+    # compresses to a few hundred bytes, so a guard reading `csize` would let it
+    # straight through — which is exactly the number an attacker shrinks.
+    var over = AGNOSAI_PKG_MAX_FILE_SIZE + 1;
+    var fat = alloc(over);
+    for (var f = 0; f < over; f = f + 1) { store8(fat + f, 65); }
+    var fatstr = str_new(fat, over);
+    var fatzip = alloc(1 << 21);
+    var wfat = zip_writer_init(fatzip, 1 << 21);
+    zip_add(wfat, "manifest.json", str_data(mbody), str_len(mbody), ZIP_STORE);
+    zip_add(wfat, "definitions/fat.json", str_data(fatstr), str_len(fatstr), ZIP_DEFLATE);
+    var fatn = zip_writer_finish(wfat);
+    assert(fatn > 0, "an over-cap member builds");
+    assert(fatn < over, "and DEFLATE really did shrink it below the cap");
+    assert_eq(_t_import_kind(fatzip, fatn), AGNOSAI_ERR_INVALID_DEFINITION,
+    "a member over 1 MiB UNCOMPRESSED is refused even though it is small on disk");
+
+    # --- export failures ----------------------------------------------------
+    # ⚠ A duplicate member name fails export. zip 8 refuses it
+    # (`Duplicate filename`); sankoch does not, so the port checks.
+    var dup2 = agnosai_package_new(str_from("dup"), str_from("1"));
+    agnosai_package_add_definition(dup2, _t_def("same"));
+    agnosai_package_add_definition(dup2, _t_def("same"));
+    var db = 0;
+    var dl = 0;
+    store64(&db, 0);
+    store64(&dl, 0);
+    var duperr = agnosai_package_export(dup2, &db, &dl);
+    assert_neq(duperr, 0, "two definitions with the same agent_key fail EXPORT");
+    assert_eq(agnosai_error_kind(duperr), AGNOSAI_ERR_OTHER,
+    "as an Other, matching the oracle's `zip error: Duplicate filename`");
+
+    # ⚠ An agent_key with a `..` component fails export, per ADR 018 — the
+    # oracle writes it and then silently loses it on the way back in.
+    var esc = agnosai_package_new(str_from("esc"), str_from("1"));
+    agnosai_package_add_definition(esc, _t_def("../evil"));
+    var eb = 0;
+    var el = 0;
+    store64(&eb, 0);
+    store64(&el, 0);
+    var escerr = agnosai_package_export(esc, &eb, &el);
+    assert_neq(escerr, 0, "an agent_key with a `..` component fails EXPORT");
+    assert_eq(agnosai_error_kind(escerr), AGNOSAI_ERR_OTHER, "as an Other");
+
+    # --- the buffer bound ---------------------------------------------------
+    # ⚠ The bound must be an UPPER bound: sankoch never grows the buffer, and an
+    # under-count turns a working export into ERR_BUFFER_TOO_SMALL.
+    var err = 0;
+    store64(&err, 0);
+    var mem1 = _agnosai_pkg_members(p1, &err);
+    assert_neq(mem1, 0, "the member list builds");
+    assert_eq(vec_len(mem1), 4, "manifest plus one definition, name and body each");
+    _t_seq(vec_get(mem1, 0), str_from("manifest.json"), "the manifest is FIRST");
+    _t_seq(vec_get(mem1, 2), str_from("definitions/agent-one.json"),
+    "then the definition, under its agent_key");
+    var b1len = 0;
+    store64(&b1len, 0);
+    _t_export(p1, &b1len, "and it exports");
+    assert(_agnosai_pkg_bound(mem1) >= load64(&b1len),
+    "the bound is at least the archive it sizes");
+
+    var mem2 = _agnosai_pkg_members(p2, &err);
+    var b2len = 0;
+    store64(&b2len, 0);
+    _t_export(p2, &b2len, "a three-definition package exports");
+    assert(_agnosai_pkg_bound(mem2) >= load64(&b2len),
+    "and the bound holds for three definitions too");
+
+    var mem0 = _agnosai_pkg_members(empty, &err);
+    var b0len = 0;
+    store64(&b0len, 0);
+    _t_export(empty, &b0len, "an empty package exports");
+    assert(_agnosai_pkg_bound(mem0) >= load64(&b0len),
+    "and for a package with none");
+
+    # ⚠ The bound must hold in the WORST case, which is every member STORED.
+    # Comparing it against a DEFLATED archive proves almost nothing — the
+    # payloads are JSON and compress to a fraction, so a bound that dropped the
+    # per-member header overhead entirely would still clear it. Writing the same
+    # members with ZIP_STORE into exactly `bound` bytes is the real assertion,
+    # and it is the case sankoch degrades to whenever deflate does not shrink.
+    assert_eq(_t_store_fits(mem1, _agnosai_pkg_bound(mem1)), 1,
+    "the bound holds when every member is STORED, not just when they compress");
+    assert_eq(_t_store_fits(mem2, _agnosai_pkg_bound(mem2)), 1, "for three definitions too");
+    assert_eq(_t_store_fits(mem0, _agnosai_pkg_bound(mem0)), 1, "and for none");
+
+    # A long member name is counted twice, once per header — the easiest term to
+    # drop, and invisible against short keys.
+    var longkey = agnosai_package_new(str_from("long"), str_from("1"));
+    agnosai_package_add_definition(longkey, _t_def(
+    "an-extremely-long-agent-key-that-appears-in-both-the-local-header-and-the-central-directory"));
+    var memlong = _agnosai_pkg_members(longkey, &err);
+    assert_eq(_t_store_fits(memlong, _agnosai_pkg_bound(memlong)), 1,
+    "and it holds for a very long member name");
+
+    # ⚠ Both overflow arms. Unreachable through the public entry point, which
+    # sizes the buffer itself, so they are driven directly — and they must
+    # report the oracle's TWO distinct messages, not one for both.
+    var stage = 0;
+    store64(&stage, 0 - 1);
+    var tiny = alloc(64);
+    assert(_agnosai_pkg_write(mem1, tiny, 64, &stage) < 0,
+    "a buffer too small is an error, not a truncated archive");
+    assert_eq(load64(&stage), AGNOSAI_PKG_STAGE_ADD, "reported against the add, not the finish");
+
+    var ob = 0;
+    var ol = 0;
+    store64(&ob, 0);
+    store64(&ol, 0);
+    var adderr = _agnosai_pkg_export_into(mem1, alloc(64), 64, &ob, &ol);
+    assert_neq(adderr, 0, "and export_into surfaces it");
+    assert_eq(str_starts_with(agnosai_error_detail(adderr), str_from("zip error: ")), 1,
+    "as the oracle's `zip error:`, from start_file");
+
+    # A buffer that fits every member and not the central directory fails in
+    # `finish` instead, with the oracle's OTHER message. Found by walking the
+    # capacity rather than computed, so the assertion does not depend on
+    # sankoch's exact record size.
+    var finish_cap = 0 - 1;
+    for (var c = 64; c < _agnosai_pkg_bound(mem1); c = c + 16) {
+        store64(&stage, 0 - 1);
+        if (_agnosai_pkg_write(mem1, alloc(c), c, &stage) < 0) {
+            if (load64(&stage) == AGNOSAI_PKG_STAGE_FINISH) { finish_cap = c; break; }
+        }
+    }
+    assert_neq(finish_cap, 0 - 1, "some capacity fails at the finish rather than an add");
+    store64(&ob, 0);
+    var finerr = _agnosai_pkg_export_into(mem1, alloc(finish_cap), finish_cap, &ob, &ol);
+    assert_neq(finerr, 0, "and export_into surfaces that too");
+    assert_eq(str_starts_with(agnosai_error_detail(finerr), str_from("zip finish error: ")), 1,
+    "as the oracle's DIFFERENT `zip finish error:` message");
+
+    # --- file round trip: the oracle's test_file_export_import_round_trip ---
+    sys_mkdir(_T_ROOT, 0x1FF);
+    var path = _t_join(str_from(_T_ROOT), str_from("/test.agpkg"));
+    var p5 = agnosai_package_new(str_from("file-pkg"), str_from("3.0.0"));
+    agnosai_package_add_definition(p5, _t_def("file-agent"));
+    var meta5 = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(meta5, str_from("author"), bayan_json_v_str_new(str_from("test")));
+    agnosai_package_set_metadata(p5, meta5);
+
+    assert_eq(agnosai_package_export_to_file(p5, path), 0, "a package writes to a file");
+    assert_eq(file_exists(str_data(path)), 1, "the file exists");
+
+    var r5 = 0;
+    store64(&r5, 0);
+    assert_eq(agnosai_package_import_from_file(path, &r5), 0, "and reads back");
+    var rp5 = load64(&r5);
+    _t_seq(agnosai_package_name(rp5), str_from("file-pkg"), "with its name");
+    _t_seq(agnosai_package_version(rp5), str_from("3.0.0"), "and version");
+    assert_eq(vec_len(agnosai_package_definitions(rp5)), 1, "and its definition");
+    _t_seq(agnosai_agent_key(vec_get(agnosai_package_definitions(rp5), 0)),
+    str_from("file-agent"), "under its key");
+    _t_seq(bayan_json_v_str(bayan_json_v_obj_get(agnosai_package_metadata(rp5), "author")),
+    str_from("test"), "and its metadata");
+
+    # A missing file is an Io error, and it is reported before any ZIP guard.
+    var absent = 0;
+    store64(&absent, 0);
+    var abserr = agnosai_package_import_from_file(
+    _t_join(str_from(_T_ROOT), str_from("/no-such.agpkg")), &absent);
+    assert_neq(abserr, 0, "a missing .agpkg does not import");
+    assert_eq(agnosai_error_kind(abserr), AGNOSAI_ERR_IO, "reporting Io");
+    assert_eq(load64(&absent), 0, "and the out-param is untouched");
+
+    # A file that exists and is not a ZIP is an InvalidDefinition — the guard
+    # order puts the read before the parse.
+    var notzip = _t_join(str_from(_T_ROOT), str_from("/not.agpkg"));
+    file_write_all(str_data(notzip), str_data(junk), str_len(junk));
+    var nz = 0;
+    store64(&nz, 0);
+    assert_eq(agnosai_error_kind(agnosai_package_import_from_file(notzip, &nz)),
+    AGNOSAI_ERR_INVALID_DEFINITION, "a readable non-archive is an InvalidDefinition");
+
+    # --- teardown -----------------------------------------------------------
+    sys_unlink(str_data(path));
+    sys_unlink(str_data(notzip));
+    sys_rmdir(_T_ROOT);
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

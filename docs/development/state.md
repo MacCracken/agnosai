@@ -189,13 +189,13 @@ corrected section below):
 
 | Group | Rust lines | Milestone | Scope |
 |---|---|---|---|
-| `definitions/` | 303 of 1,460 left | M10 | `packaging` only. The ZIP prerequisite is the last one standing: `lib/sankoch.cyr` has 26 `zip_*` fns but is **not declared** in `cyrius.cyml`'s `[deps].stdlib`. YAML is done — bayan's parser carried it. |
+| ~~`definitions/`~~ | ✅ 0 left | M10 | **COMPLETE 2026-08-09** — all six modules, 1,460 lines. Both former blockers were already in `lib/`: YAML came from bayan's parser, and ZIP needed one line in `cyrius.cyml`'s `[deps].stdlib` rather than the upstream sankoch ask the roadmap predicted. |
 | ~~`telemetry/`~~ | ✅ 0 left | M9 | **Source-complete 2026-08-09** — `mod.rs` (116, with the JSON logging init) and `genai.rs` (206). What remains of M9 is not an oracle file: the **OTLP exporter body**, copied from hoosh's `otlp.cyr`, behind the branch `agnosai_telemetry_init_tracing` already takes. ⚠ The planned **sakshi filing for JSON output was never needed** — `sakshi_set_emit_hook` already exists; see roadmap M9. |
 
 `fleet/` left this table on **2026-08-08**: all twelve of the oracle's modules
 are ported.
 
-**M10 `definitions` bite log — 🟡 five of six modules, 2026-08-09.**
+**M10 `definitions` bite log — ✅ COMPLETE 2026-08-09.**
 
 | module | oracle lines | assertions | oracle tests |
 |---|---|---|---|
@@ -204,9 +204,9 @@ are ported.
 | `k8s_crd` | 238 | 84 | 4 |
 | `loader` | 415 | 127 | 15 of 17 |
 | `loader` presets | (`src/presets/*.json`) | 137 | the other 2 |
+| `packaging` | 303 | 127 | 7 |
 | `mod` | 16 | — | — |
-| **ported** | **1,157 of 1,460** | **433** | **36** |
-| `packaging` | 303 | — | 7 — **not started** |
+| **total** | **1,460 (100%)** | **560** | **43** |
 
 Two things landed alongside the ports rather than inside them. **`src/strcase.cyr`**
 is a port-local root module extracted at the third caller
@@ -217,6 +217,13 @@ assertions. **`src/definitions/presets_data.cyr` is GENERATED** by
 `scripts/check-clean.sh` runs the generator's `--check` so the two cannot drift.
 It stands in for the oracle's eighteen `include_str!`s, which Cyrius has no
 equivalent for.
+
+`packaging` is the only module in the group that swaps a dependency rather than
+porting logic: the oracle's `zip` crate becomes `lib/sankoch.cyr`, and the two
+disagree about member names, decodable methods, encrypted archives and whether
+the 1 MiB guard is enforced. Seven differences,
+[ADR 018](../adr/018-sankoch-path-check-on-import.md), every one of them in the
+stricter direction and every one pinned by a test.
 
 ⚠ **`GET /api/v1/presets` answers eighteen presets now, not `[]`** — and the
 handler moved from `server/routes/tools.cyr` to `server/routes/definitions.cyr`,

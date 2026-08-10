@@ -625,7 +625,7 @@ exporter is live, and spans reach it from the production paths.
 ported, and what remains is hoosh's `otlp.cyr` behind the branch
 `agnosai_telemetry_init_tracing` already takes.
 
-### M10 — `definitions` (Phase 9) — 🟡 1,157 of 1,460, one module left
+### M10 — `definitions` (Phase 9) — ✅ COMPLETE 2026-08-09
 
 **All 1,460 lines.** assembler, loader, presets, versioning, k8s_crd, **plus the
 ZIP container, packaging and YAML halves.**
@@ -648,11 +648,30 @@ handler now lives in `src/server/routes/definitions.cyr`, mirroring the oracle.
   `cyrius/docs/development/issues/2026-08-09-cyrius-fmt-reindents-inside-multi-line-string-literals.md`.
   It corrupted a YAML fixture before it was understood.
 
-🔴 **Remaining: `packaging` (303 lines, 7 oracle tests).** Its one prerequisite
-is a declaration, not an upstream ask: `lib/sankoch.cyr` is present with 26
-`zip_*` fns but is **not listed in `cyrius.cyml`'s `[deps].stdlib`**. The
-earlier note here said ZIP was "an upstream ask to sankoch (~250 lines)" — that
-was written before the fold and is **wrong**; nothing needs writing upstream.
+✅ **`packaging`, 2026-08-09.** 127 assertions, all 7 oracle tests, 14 mutation
+probes and 14 kills.
+
+- **The ZIP prerequisite was one line.** This row used to say ZIP was "an
+  upstream ask to sankoch (deflate + crc32 already exist there; ~250 lines)".
+  That was written before the fold and was **wrong**: `lib/sankoch.cyr` ships 26
+  `zip_*` fns, and all the bite needed was `"sankoch"` in `cyrius.cyml`'s
+  `[deps].stdlib`. Nothing was written upstream.
+- **Seven documented divergences, all stricter than the oracle**
+  ([ADR 018](../adr/018-sankoch-path-check-on-import.md)). The two that matter:
+  the oracle's 1 MiB zip-bomb guard reads attacker-written metadata the `zip`
+  crate never enforces, so a bomb declaring `uncompressed_size = 10` inflates
+  unbounded — sankoch bounds the output and verifies the CRC, so the cap is
+  real here. And an `agent_key` containing a `..` component fails export loudly
+  instead of exporting and silently vanishing on the way back in.
+- **sankoch's writer never allocates and has no sizing API**, so `export`
+  computes an upper bound. That is only possible because DEFLATE degrades to
+  STORE rather than growing a member; the test writes every member STORED into
+  exactly the bound, because checking it against compressed output proves
+  nothing.
+- ⚠ **Upstream ask worth filing:** a `zip_bound(count, name_bytes, payload_bytes)`
+  helper in sankoch. The bound here is derived from sankoch's record layout and
+  will silently need revisiting if that layout changes — it fails loudly rather
+  than corrupting, but it is a consumer re-deriving a library's internals.
 
 ### M11 — the `sandbox`-gated tools and `hwaccel` (Phase 10)
 

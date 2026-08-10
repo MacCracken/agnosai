@@ -96,14 +96,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **M10 `definitions` — five of six modules: `versioning`, `assembler`,
-  `k8s_crd`, `loader`, and the eighteen built-in presets.** 1,157 of the
-  group's 1,460 oracle lines, **433 assertions** across five suites, all of the
-  oracle's 36 tests for those modules plus a large margin past them. Only
-  `packaging` (303 lines) is left, and its ZIP prerequisite turns out to be a
-  missing **declaration** rather than an upstream ask — `lib/sankoch.cyr` is
-  already present with 26 `zip_*` fns, just not listed in `cyrius.cyml`'s
-  `[deps].stdlib`.
+- **M10 `definitions` is COMPLETE — all six modules, all 1,460 oracle lines.**
+  `versioning`, `assembler`, `k8s_crd`, `loader`, the eighteen built-in presets
+  and `packaging`: **560 assertions** across six suites, all 43 of the oracle's
+  tests for the group plus a large margin past them.
+
+  Both of the group's long-standing blockers turned out to be already closed.
+  YAML came from bayan's parser, and ZIP needed **one line** — `"sankoch"` in
+  `cyrius.cyml`'s `[deps].stdlib` — rather than the "~250 line upstream ask to
+  sankoch" the roadmap had predicted; `lib/sankoch.cyr` already shipped 26
+  `zip_*` fns.
 
   **`GET /api/v1/presets` answers eighteen presets instead of `[]`**, and the
   handler moved from `server/routes/tools.cyr` to a new
@@ -179,6 +181,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assertion. `_agnosai_builtin_presets_from(count, json_fp)` exists to give the
   test an accessor with one broken document; the seam is there for that reason
   and the header says so.
+
+- **`definitions/packaging` — `.agpkg` ZIP bundles, on sankoch instead of the
+  `zip` crate.** 127 assertions, 14 mutation probes, 14 kills. It is the only
+  module in the group that swaps a dependency rather than porting logic, and the
+  two libraries disagree in seven places — every one of them recorded in
+  [ADR 018](docs/adr/018-sankoch-path-check-on-import.md) and every one stricter
+  than the oracle:
+
+  ⚠ **The oracle's 1 MiB zip-bomb guard does not actually bound anything.**
+  `file.size()` is attacker-written central-directory metadata and the `zip`
+  crate never checks it against the decompressed stream — so an archive
+  declaring `uncompressed_size = 10` passes the guard and then inflates
+  unbounded into RAM, CRC and all, because the attacker wrote the CRC too. The
+  CHANGELOG's own earlier claim of "decompression bomb protection, 1 MiB per
+  file" was therefore advisory upstream. sankoch bounds the output at `dst_cap`
+  and requires the produced length *and* the CRC to match, so the cap is real
+  here.
+
+  ⚠ **An `agent_key` with a `..` component now fails export loudly.** The oracle
+  interpolates the key raw into `definitions/<key>.json`, writes it happily, and
+  then drops it on the way back in via its own `..` filter — a definition that
+  vanishes silently between export and import. sankoch's writer refuses the name.
+
+  Reproduced exactly rather than tidied, none of it covered by an oracle test:
+  `MAX_ENTRIES` is `>` so exactly 100 entries is accepted, and the count is
+  **unique names** (`archive.len()` is an `IndexMap`), so 101 records under 100
+  names still imports; a duplicate name resolves to the **last** record, because
+  the map replaces in place; a `..` member is a **substring** test and a
+  **silent skip**, so `definitions/a..b.json` is dropped and the import still
+  succeeds; an undecodable member is skipped, not an error; `by_name` failing is
+  `InvalidDefinition` for the manifest and `Other` for a definition; a decode
+  failure is `Io`, not either; and `start_file` and `finish` failures carry two
+  **different** messages.
+
+  ⚠ **A duplicate `agent_key` fails export**, because zip 8 rejects a duplicate
+  member name and sankoch does not — so the port checks. Without it, export
+  succeeds where the oracle errors and the archive imports as two definitions.
+
+  **sankoch's writer never allocates and has no sizing API**, so `export`
+  computes an upper bound instead of guessing and retrying. That is only sound
+  because DEFLATE degrades to STORE rather than growing a member — and the test
+  writes every member STORED into exactly the bound, because checking a bound
+  against *compressed* output proves nothing: a bound that dropped the
+  per-member header overhead entirely still cleared the deflated archive.
 
 - **The GenAI span call sites are wired** — `llm/hoosh` (inference, CLIENT),
   `tools/native`'s vtable dispatch (tool execution, INTERNAL) and

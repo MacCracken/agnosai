@@ -1,0 +1,619 @@
+# =========================================================================
+# definitions/packaging — `.agpkg` ZIP bundle export/import.
+#
+# Parity oracle: rust-old/src/definitions/packaging.rs
+#
+# A package is a name, a version, a `metadata` JSON value and a list of agent
+# definitions, serialised as a ZIP with `manifest.json` at the root and one
+# `definitions/<agent_key>.json` per definition.
+#
+# ## `Result` shape: 0 or an `AgnosaiError`, values through out-params
+#
+# ⚠ **This is `orchestrator/durable_state`'s convention, NOT the sibling
+# `definitions/loader.cyr`'s `out_err`** — and the difference is forced rather
+# than a preference. Two of the four entry points are `Result<()>`
+# (`export_to_file`, and `import`'s effect on its out-param), and an `out_err`
+# shape has to invent a truthy success value to express those. Every entry point
+# here returns 0 for success or the error pointer, so success is one value on
+# all four. `loader.cyr` returns the loaded thing directly because all four of
+# ITS entry points are `Result<T>` with a pointer `T`.
+#
+# ## Where this DIVERGES from the oracle, deliberately
+#
+# **sankoch refuses to extract a member whose name is unsafe, and the oracle
+# would have read it.** [ADR 018](../../docs/adr/018-sankoch-path-check-on-import.md)
+# records the decision. Short version: the oracle skips entries whose name
+# *contains* the substring `..` and reads everything else, while sankoch's
+# `_zip_path_safe` (`lib/sankoch.cyr:14051`, applied on the READ path at
+# `:14541`) rejects a `..` *component*, an absolute path, a backslash, a control
+# byte and an empty interior component. The two filters differ in both
+# directions. The oracle's own filter is reproduced exactly, so the port skips
+# what the oracle skips; a name that gets past it and then trips sankoch's
+# becomes an `Other("zip read error: …")`, which is the same variant the oracle
+# raises when its own `by_name` fails.
+#
+# **The archive bytes are not byte-identical to the oracle's.** `to_string_pretty`
+# is serde's two-space form and `bayan_json_v_build_pretty(v, 2)` is bayan's;
+# they agree on shape, not on key order or escaping. Nothing observable depends
+# on it — both sides parse what they wrote, and the oracle's own tests are all
+# round trips — but an `.agpkg` written by the Rust build and one written here
+# will not hash the same.
+#
+# ## Sizing the destination buffer
+#
+# sankoch's writer never allocates: `zip_writer_init(dst, dst_cap)` takes a
+# buffer the caller owns and every write bounds-checks against `dst_cap`,
+# returning `ERR_BUFFER_TOO_SMALL` rather than growing. There is **no sizing
+# API** — no `zip_bound`, and `zip_writer_finish`'s byte count is only available
+# after the fact — so the alternative to computing a bound is guess-and-retry,
+# which means re-adding every member from scratch because a partially written
+# `dst` cannot be reused.
+#
+# `_agnosai_pkg_bound` computes an upper bound instead, which is possible only
+# because DEFLATE **falls back to STORE when it does not shrink**
+# (`lib/sankoch.cyr:14795-14810`): the stored payload is therefore never larger
+# than the input, and the rest is fixed-size headers.
+# =========================================================================
+
+# AgnosPackage heap layout — 32 bytes.
+enum AgnosaiPackageOff {
+    AGN_PKG_NAME = 0;
+    AGN_PKG_VERSION = 8;
+    AGN_PKG_DEFINITIONS = 16;
+    # A bayan JSON value, never 0 — `new` seeds it with an empty object.
+    AGN_PKG_METADATA = 24;
+    AGN_PKG_BYTES = 32;
+}
+
+# The oracle's `MAX_FILE_SIZE`: 1 MiB, per member, on the UNCOMPRESSED size.
+#
+# ⚠ Uncompressed is the whole point. The oracle reads `file.size()`, which the
+# `zip` crate documents as the decompressed size, and `zip_entry_size`
+# (`lib/sankoch.cyr:14470`) is the same. Checking `zip_entry_csize` instead
+# would compile, pass every round-trip test, and leave the zip-bomb guard
+# checking the one number an attacker controls downward.
+var AGNOSAI_PKG_MAX_FILE_SIZE = 1048576;
+
+# The oracle's `MAX_ENTRIES`.
+#
+# ⚠ The comparison is `>`, not `>=` — an archive with exactly 100 entries is
+# accepted. `archive.len() > Self::MAX_ENTRIES` in the oracle.
+var AGNOSAI_PKG_MAX_ENTRIES = 100;
+
+# Spaces per level, matching `serde_json::to_string_pretty`.
+var AGNOSAI_PKG_JSON_INDENT = 2;
+
+# Fixed ZIP overhead per member, in bytes.
+#
+# 30 local header + 20 zip64 extra + 46 central-directory record + 28 zip64
+# extra in the CD record. The member NAME is counted twice on top of this — it
+# appears in both the local header and the CD record — and the payload once.
+var AGNOSAI_PKG_ZIP_MEMBER_OVERHEAD = 124;
+
+# Fixed ZIP trailer: zip64 EOCD 56 + zip64 locator 20 + EOCD 22.
+var AGNOSAI_PKG_ZIP_TRAILER = 98;
+
+# Headroom on the computed bound.
+#
+# The bound is derived from sankoch's current record layout, and sankoch is a
+# vendored bundle that can change under a toolchain bump. An under-bound is not
+# silent — every write site returns `ERR_BUFFER_TOO_SMALL` and this module turns
+# that into an `Other` error — but a package that fails to export because a
+# header grew four bytes is a bad way to find out.
+var AGNOSAI_PKG_ZIP_SLACK = 256;
+
+# Stride of the member list `_agnosai_pkg_members` builds: name, then body.
+var AGNOSAI_PKG_MEMBER_STRIDE = 2;
+
+# Which writer call failed, so `export` can pick the oracle's message for it.
+var AGNOSAI_PKG_STAGE_ADD = 0;
+var AGNOSAI_PKG_STAGE_FINISH = 1;
+
+# Create an empty package.
+#
+# ⚠ `metadata` starts as an empty JSON **object**, not null. The oracle's `new`
+# is `serde_json::Value::Object(serde_json::Map::new())` and its own test asserts
+# `metadata.is_object()` with `len() == 0`; a null would serialise, round-trip
+# and read back as null without any round-trip test noticing.
+fn agnosai_package_new(name: Str, version: Str): i64 {
+    var p = alloc(AGN_PKG_BYTES);
+    store64(p + AGN_PKG_NAME, name);
+    store64(p + AGN_PKG_VERSION, version);
+    store64(p + AGN_PKG_DEFINITIONS, vec_new());
+    store64(p + AGN_PKG_METADATA, bayan_json_v_obj_new());
+    return p;
+}
+
+# The package name.
+fn agnosai_package_name(p): i64 {
+    return load64(p + AGN_PKG_NAME);
+}
+
+# The package version.
+fn agnosai_package_version(p): i64 {
+    return load64(p + AGN_PKG_VERSION);
+}
+
+# The package's agent definitions, in insertion order.
+fn agnosai_package_definitions(p): i64 {
+    return load64(p + AGN_PKG_DEFINITIONS);
+}
+
+# The package's free-form metadata value.
+fn agnosai_package_metadata(p): i64 {
+    return load64(p + AGN_PKG_METADATA);
+}
+
+# Replace the metadata value. The oracle's field is public and assigned
+# directly; this is that assignment.
+fn agnosai_package_set_metadata(p, v): i64 {
+    store64(p + AGN_PKG_METADATA, v);
+    return 0;
+}
+
+# Add an agent definition — the oracle's `add_definition`.
+#
+# ⚠ No dedupe HERE, deliberately: the oracle's is a plain `Vec::push` and two
+# definitions sharing an `agent_key` both land. The failure comes later, at
+# `export`, because zip 8 refuses a duplicate member name
+# (`zip-8.5.0/src/write.rs:1383` — `invalid!("Duplicate filename: {}")`). sankoch
+# would happily append both, so `_agnosai_pkg_duplicate_name` reproduces the
+# refusal rather than letting export succeed where the oracle errors. No oracle
+# test covers it.
+fn agnosai_package_add_definition(p, def): i64 {
+    vec_push(load64(p + AGN_PKG_DEFINITIONS), def);
+    return 0;
+}
+
+# `{"name":…,"version":…,"metadata":…}` — the oracle's private `PackageManifest`.
+#
+# It has no struct here because it exists only to be serialised; all three
+# fields are required on the way back in.
+fn _agnosai_pkg_manifest_value(p): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("name"),
+    bayan_json_v_str_new(load64(p + AGN_PKG_NAME)));
+    bayan_json_v_obj_set(obj, str_from("version"),
+    bayan_json_v_str_new(load64(p + AGN_PKG_VERSION)));
+    bayan_json_v_obj_set(obj, str_from("metadata"), load64(p + AGN_PKG_METADATA));
+    return obj;
+}
+
+# `definitions/<agent_key>.json`.
+fn _agnosai_pkg_member_name(agent_key: Str): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "definitions/");
+    str_builder_add(sb, agent_key);
+    str_builder_add_cstr(sb, ".json");
+    return str_builder_build(sb);
+}
+
+# The archive's members as a flat vec of `name, body, name, body, …` Strs, in
+# the oracle's write order: the manifest, then each definition.
+#
+# Built once and used twice — `_agnosai_pkg_bound` measures it and
+# `_agnosai_pkg_write` emits it — because serialising each definition twice to
+# size the buffer would double the cost of an export.
+#
+# Returns 0 with `*out_err` set when a value will not serialise; the oracle's
+# `to_string_pretty(..)?` raises `Serialization` for the same failure.
+fn _agnosai_pkg_members(p, out_err): i64 {
+    var out = vec_new();
+
+    var manifest = bayan_json_v_build_pretty(_agnosai_pkg_manifest_value(p),
+    AGNOSAI_PKG_JSON_INDENT);
+    if (manifest == 0) {
+        store64(out_err, agnosai_error_serialization(str_from(
+        "could not serialize manifest.json")));
+        return 0;
+    }
+    vec_push(out, str_from("manifest.json"));
+    vec_push(out, manifest);
+
+    var defs = load64(p + AGN_PKG_DEFINITIONS);
+    for (var i = 0; i < vec_len(defs); i = i + 1) {
+        var def = vec_get(defs, i);
+        var body = bayan_json_v_build_pretty(agnosai_agent_to_value(def),
+        AGNOSAI_PKG_JSON_INDENT);
+        if (body == 0) {
+            store64(out_err, agnosai_error_serialization(str_cat(
+            str_from("could not serialize "), agnosai_agent_key(def))));
+            return 0;
+        }
+        vec_push(out, _agnosai_pkg_member_name(agnosai_agent_key(def)));
+        vec_push(out, body);
+    }
+    return out;
+}
+
+# An upper bound on the archive `_agnosai_pkg_write` will produce.
+#
+# ⚠ This is only an upper bound because DEFLATE degrades to STORE rather than
+# growing a member (`lib/sankoch.cyr:14795-14810`, `cl > 0 && cl < len`). If
+# sankoch ever stored a compressed payload that was larger than its input, this
+# would under-count — which is why the writer's `ERR_BUFFER_TOO_SMALL` is
+# surfaced as an error rather than assumed unreachable.
+fn _agnosai_pkg_bound(members): i64 {
+    var total = AGNOSAI_PKG_ZIP_TRAILER + AGNOSAI_PKG_ZIP_SLACK;
+    for (var i = 0; i < vec_len(members); i = i + AGNOSAI_PKG_MEMBER_STRIDE) {
+        var nlen = str_len(vec_get(members, i));
+        var blen = str_len(vec_get(members, i + 1));
+        # The name is in both the local header and the central directory.
+        total = total + AGNOSAI_PKG_ZIP_MEMBER_OVERHEAD + nlen + nlen + blen;
+    }
+    return total;
+}
+
+# `zip <what>: sankoch error <n>` — the detail for a writer or reader failure.
+#
+# The oracle interpolates the `zip` crate's `Display`; the variant is the parity
+# surface and the detail is free-form, so this reports sankoch's code rather
+# than inventing prose for it.
+fn _agnosai_pkg_zip_detail(what, rc): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, what);
+    str_builder_add_cstr(sb, ": sankoch error ");
+    str_builder_add_int(sb, 0 - rc);
+    return str_builder_build(sb);
+}
+
+# The first member name that appears twice in `members`, or 0.
+#
+# The oracle gets this refusal from its ZIP writer; sankoch has no such check, so
+# it lives here. O(n^2), over at most `MAX_ENTRIES` members.
+fn _agnosai_pkg_duplicate_name(members): Str {
+    for (var i = 0; i < vec_len(members); i = i + AGNOSAI_PKG_MEMBER_STRIDE) {
+        for (var j = i + AGNOSAI_PKG_MEMBER_STRIDE; j < vec_len(members);
+        j = j + AGNOSAI_PKG_MEMBER_STRIDE) {
+            if (str_eq(vec_get(members, i), vec_get(members, j)) == 1) {
+                return vec_get(members, i);
+            }
+        }
+    }
+    return 0;
+}
+
+# Emit `members` into `dst`. Returns the archive length, or a negative sankoch
+# `ERR_*`; `0 - ERR_BUFFER_TOO_SMALL` when `cap` was short.
+#
+# `*out_stage` says which call failed — `AGNOSAI_PKG_STAGE_ADD` or
+# `AGNOSAI_PKG_STAGE_FINISH` — because the oracle uses **two different messages**
+# for them, `"zip error: {e}"` from `start_file` and `"zip finish error: {e}"`
+# from `finish`. Collapsing them into one is the easy divergence.
+#
+# Split out from `agnosai_package_export` so a test can hand it a deliberately
+# small buffer — the overflow arm is otherwise unreachable, because the public
+# entry point sizes the buffer itself.
+fn _agnosai_pkg_write(members, dst, cap, out_stage): i64 {
+    store64(out_stage, AGNOSAI_PKG_STAGE_ADD);
+    var w = zip_writer_init(dst, cap);
+    # ⚠ `zip_writer_init` answers a bare 0, not a negative code, and collapses
+    # three causes into it (`cap < 22`, and two allocation failures). Reported as
+    # the one it can actually be here.
+    if (w == 0) { return 0 - ERR_BUFFER_TOO_SMALL; }
+
+    for (var i = 0; i < vec_len(members); i = i + AGNOSAI_PKG_MEMBER_STRIDE) {
+        var name = vec_get(members, i);
+        var body = vec_get(members, i + 1);
+        # `str_builder_build` NUL-terminates, so `str_data` is a usable cstring
+        # for sankoch's `name` parameter.
+        var rc = zip_add(w, str_data(name), str_data(body), str_len(body), ZIP_DEFLATE);
+        if (rc != 0) { return rc; }
+    }
+    store64(out_stage, AGNOSAI_PKG_STAGE_FINISH);
+    return zip_writer_finish(w);
+}
+
+# Write `members` into a buffer the caller sized, mapping a writer failure onto
+# the oracle's message for the call that produced it.
+#
+# ⚠ Split out ONLY so both failure arms are reachable from a test. The public
+# entry point sizes the buffer from `_agnosai_pkg_bound`, so neither
+# `"zip error: …"` nor `"zip finish error: …"` can be produced through it — and
+# a mutant that reports one for the other survives every assertion that goes
+# through `agnosai_package_export`. The two strings are the oracle's, from
+# `start_file` (`packaging.rs:65`) and `finish` (`:79`).
+fn _agnosai_pkg_export_into(members, dst, cap, out_bytes, out_len): i64 {
+    var stage = 0;
+    store64(&stage, AGNOSAI_PKG_STAGE_ADD);
+    var n = _agnosai_pkg_write(members, dst, cap, &stage);
+    if (n < 0) {
+        if (load64(&stage) == AGNOSAI_PKG_STAGE_FINISH) {
+            return agnosai_error_other(_agnosai_pkg_zip_detail("zip finish error", n));
+        }
+        return agnosai_error_other(_agnosai_pkg_zip_detail("zip error", n));
+    }
+    store64(out_bytes, dst);
+    store64(out_len, n);
+    return 0;
+}
+
+# Export to a ZIP bundle in memory — the oracle's `export`.
+#
+# On success returns 0, storing the buffer through `out_bytes` and its length
+# through `out_len`. On failure returns an `AgnosaiError` and leaves both alone.
+fn agnosai_package_export(p, out_bytes, out_len): i64 {
+    var err = 0;
+    store64(&err, 0);
+    var members = _agnosai_pkg_members(p, &err);
+    if (members == 0) { return load64(&err); }
+
+    var dup = _agnosai_pkg_duplicate_name(members);
+    if (dup != 0) {
+        return agnosai_error_other(str_cat(str_from("zip error: duplicate filename: "), dup));
+    }
+
+    var cap = _agnosai_pkg_bound(members);
+    return _agnosai_pkg_export_into(members, alloc(cap), cap, out_bytes, out_len);
+}
+
+# Export to a file on disk — the oracle's `export_to_file`.
+fn agnosai_package_export_to_file(p, path: Str): i64 {
+    var bytes = 0;
+    var len = 0;
+    store64(&bytes, 0);
+    store64(&len, 0);
+    var e = agnosai_package_export(p, &bytes, &len);
+    if (e != 0) { return e; }
+
+    var wr = file_write_all(str_data(path), load64(&bytes), load64(&len));
+    if (wr != load64(&len)) {
+        return agnosai_error_io(_agnosai_pkg_zip_detail("write failed", wr));
+    }
+    return 0;
+}
+
+# The LAST member of `z` named `name`, or -1.
+#
+# ⚠ Not `zip_find`, which answers with the FIRST match. The oracle's archive is
+# an `IndexMap<Box<str>, ZipFileData>`, and inserting a duplicate name replaces
+# the value while keeping the original position — so `by_name` reads the LAST
+# record's data. sankoch keeps every central-directory record and searches
+# forwards. Only a hand-built archive can tell the two apart; nothing this port
+# exports can, because `export` refuses a duplicate name outright.
+fn _agnosai_pkg_find_last(z, name): i64 {
+    var found = 0 - 1;
+    for (var i = 0; i < zip_count(z); i = i + 1) {
+        var nm = zip_entry_name(z, i);
+        if (nm != 0) {
+            if (streq(nm, name) == 1) { found = i; }
+        }
+    }
+    return found;
+}
+
+# Whether this build can decode member `i` at all.
+#
+# ⚠ This is the port's stand-in for the oracle's `archive.by_index(i).ok()?`
+# (`packaging.rs:124`), which is a **silent skip**: zip 8 fails to construct a
+# reader for a method it was not built with, the `?` returns from the closure,
+# and the entry simply does not appear. Treating an undecodable member as an
+# error instead would fail imports the oracle completes.
+#
+# Residual: sankoch decodes store, deflate, bzip2, zstd and xz
+# (`zip_method_supported`, `lib/sankoch.cyr:15138`); zip 8's default features
+# add deflate64, LZMA and PPMd. A member in one of those three is skipped here
+# and read upstream.
+fn _agnosai_pkg_can_decode(z, i): i64 {
+    return zip_method_supported(zip_entry_method(z, i));
+}
+
+# Every DISTINCT member name in `z`, in first-appearance order.
+#
+# The oracle never sees a duplicate: `ZipArchive` is a map keyed by name, so
+# `archive.len()` and `by_index` both walk unique names. sankoch's reader keeps
+# every central-directory record, so the dedupe is here.
+fn _agnosai_pkg_unique_names(z): i64 {
+    var out = vec_new();
+    for (var i = 0; i < zip_count(z); i = i + 1) {
+        var nm = zip_entry_name(z, i);
+        if (nm != 0) {
+            var seen = 0;
+            for (var j = 0; j < vec_len(out); j = j + 1) {
+                if (streq(vec_get(out, j), nm) == 1) { seen = 1; break; }
+            }
+            if (seen == 0) { vec_push(out, nm); }
+        }
+    }
+    return out;
+}
+
+# Whether `name` (a cstring) is one of the definition members.
+#
+# ⚠ **The `..` test is a SUBSTRING test, not a path-component test**, because
+# the oracle's is: `if name.contains("..") { return None }`. So
+# `definitions/v1..2.json` is skipped here even though it escapes nothing, and
+# `definitions/..hidden.json` is skipped too. Reproducing it as a component
+# check would be more correct and less faithful — and would let a name through
+# that the oracle drops.
+#
+# ⚠ And it is a SILENT SKIP, not an error. It sits inside the oracle's
+# `filter_map`, so a traversing entry simply does not appear in the imported
+# package and the import succeeds.
+fn _agnosai_pkg_is_definition_member(name): i64 {
+    var s = str_from(name);
+    if (str_contains_cstr(s, "..") == 1) { return 0; }
+    if (str_starts_with(s, str_from("definitions/")) == 0) { return 0; }
+    if (str_ends_with(s, str_from(".json")) == 0) { return 0; }
+    return 1;
+}
+
+# Read one member of `z` as a Str, enforcing the per-file size cap.
+#
+# Returns 0 with `*out_err` set. `what` names the member in the cap message,
+# which the oracle spells `{name} exceeds 1 MiB size limit`.
+fn _agnosai_pkg_read_member(z, i, what: Str, out_err): Str {
+    var size = zip_entry_size(z, i);
+    if (size > AGNOSAI_PKG_MAX_FILE_SIZE) {
+        store64(out_err, agnosai_error_invalid_definition(
+        str_cat(what, str_from(" exceeds 1 MiB size limit"))));
+        return 0;
+    }
+
+    # One spare byte so the payload is NUL-terminated and usable as a cstring.
+    var buf = alloc(size + 1);
+    store8(buf + size, 0);
+    # `_any` rather than plain `zip_extract`, which handles only STORE and
+    # DEFLATE. The oracle's zip 8 is built with bzip2/zstd/xz among others, so
+    # refusing them here would be a narrower reader than the oracle's.
+    var got = zip_extract_any(z, i, buf, size);
+    if (got < 0) {
+        # ⚠ **Io, not InvalidDefinition and not Other.** The oracle's decode
+        # happens inside `read_to_string(&mut content)?`, so a truncated deflate
+        # stream, a CRC mismatch and non-UTF-8 content all arrive as
+        # `AgnosaiError::Io`. Only *malformed JSON* is `Serialization`, and only
+        # the archive being unreadable at all is `InvalidDefinition`. "Invalid
+        # zip" intuitively belongs in the last of those and does not go there.
+        store64(out_err,
+        agnosai_error_io(_agnosai_pkg_zip_detail("read failed", got)));
+        return 0;
+    }
+    return str_new(buf, got);
+}
+
+# Import from ZIP bytes — the oracle's `import`.
+#
+# On success returns 0 and stores the package through `out_pkg`.
+#
+# The guard order is the oracle's, and it is load-bearing: an archive that is
+# both over-long and missing its manifest reports the entry count, and one whose
+# manifest is oversized reports that rather than failing to parse it.
+#
+#   1. the bytes are a readable ZIP           → InvalidDefinition
+#   2. entry count is at most MAX_ENTRIES     → InvalidDefinition
+#   3. `manifest.json` is present             → InvalidDefinition
+#   4. the manifest is within MAX_FILE_SIZE   → InvalidDefinition
+#   5. the manifest reads                     → Other
+#   6. the manifest parses, all three fields  → Serialization
+#   7. per definition member, 4-6 again
+fn agnosai_package_import(buf, len, out_pkg): i64 {
+    # ⚠ `zip_open` answers a bare 0 for every failure — truncated, multi-disk,
+    # bad central directory, an ENCRYPTED member, or OOM — so there is nothing
+    # to discriminate on. The oracle interpolates the `zip` crate's message; the
+    # variant is what a caller matches.
+    var z = zip_open(buf, len);
+    if (z == 0) {
+        return agnosai_error_invalid_definition(str_from(
+        "invalid zip: not a readable archive"));
+    }
+
+    # ⚠ **UNIQUE names, not central-directory records.** The oracle's
+    # `archive.len()` is `IndexMap<Box<str>, ZipFileData>::len()`
+    # (`zip-8.5.0/src/read/zip_archive.rs:23`), so an archive with the same name
+    # twice counts it once. Counting records instead rejects packages the oracle
+    # accepts — and then reads the name twice through `by_name` and imports the
+    # same definition twice.
+    #
+    # ⚠ Residual, recorded rather than chased: for a duplicated name the oracle's
+    # map keeps the LAST record's data at the FIRST record's position, while
+    # `zip_find` answers with the first record. The two agree on how MANY there
+    # are and can disagree on WHICH, for a hostile archive only — nothing this
+    # port writes can produce one, because `export` refuses a duplicate name.
+    var names = _agnosai_pkg_unique_names(z);
+    var count = vec_len(names);
+    # ⚠ `>`, not `>=`: exactly MAX_ENTRIES is allowed.
+    if (count > AGNOSAI_PKG_MAX_ENTRIES) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "package has ");
+        str_builder_add_int(sb, count);
+        str_builder_add_cstr(sb, " entries, max is ");
+        str_builder_add_int(sb, AGNOSAI_PKG_MAX_ENTRIES);
+        return agnosai_error_invalid_definition(str_builder_build(sb));
+    }
+
+    var mi = _agnosai_pkg_find_last(z, "manifest.json");
+    if (mi < 0) {
+        return agnosai_error_invalid_definition(str_from(
+        "missing manifest.json: no such member"));
+    }
+
+    var err = 0;
+    store64(&err, 0);
+    var manifest_src = _agnosai_pkg_read_member(z, mi, str_from("manifest.json"), &err);
+    if (manifest_src == 0) { return load64(&err); }
+
+    var mv = bayan_json_v_parse_buf(str_data(manifest_src), str_len(manifest_src));
+    if (mv == 0) {
+        return agnosai_error_serialization(str_from(bayan_json_last_error()));
+    }
+    if (bayan_json_v_is_obj(mv) == 0) {
+        return agnosai_error_serialization(str_from("manifest.json is not an object"));
+    }
+    # ⚠ All three manifest fields are REQUIRED. `PackageManifest` has no
+    # `Option` and no `#[serde(default)]`, so a manifest without `metadata` is a
+    # deserialisation error rather than an empty object — and every oracle test
+    # writes all three, so nothing upstream covers it.
+    var name_v = bayan_json_v_obj_get(mv, "name");
+    var version_v = bayan_json_v_obj_get(mv, "version");
+    var metadata_v = bayan_json_v_obj_get(mv, "metadata");
+    if (name_v == 0 || version_v == 0 || metadata_v == 0) {
+        return agnosai_error_serialization(str_from(
+        "manifest.json is missing a required field"));
+    }
+    if (bayan_json_v_is_str(name_v) == 0 || bayan_json_v_is_str(version_v) == 0) {
+        return agnosai_error_serialization(str_from(
+        "manifest.json name and version must be strings"));
+    }
+
+    # `name` and `version` are CLONED out of the parse tree; `metadata` is not.
+    #
+    # ⚠ That asymmetry is deliberate and is the same hazard `core/agent.cyr`
+    # documents at `agnosai_agent_from_value_a`: a value that borrows a parse
+    # tree is only safe for as long as the tree's buffer lives. Here the buffer
+    # is `manifest_src`, allocated on the global no-free bump, so the borrow is
+    # good for the life of the process — and `metadata` is an arbitrary JSON
+    # value with no deep-copy primitive in bayan, so cloning it would mean a
+    # build-and-reparse round trip. ⛔ **If this ever moves onto a per-request
+    # arena, `metadata` becomes a dangling read after `reset_via` and the next
+    # request is handed those bytes.** It corrupts rather than crashing.
+    var pkg = agnosai_package_new(str_clone(bayan_json_v_str(name_v)),
+    str_clone(bayan_json_v_str(version_v)));
+    agnosai_package_set_metadata(pkg, metadata_v);
+
+    # ⚠ Two passes, and the second re-resolves BY NAME, because the oracle's
+    # does: it collects `Vec<String>` and then calls `by_name(&name)`. Keeping
+    # indices from the first pass and reading by index would be the obvious
+    # tidy-up and is a different program for an archive with duplicate names.
+    #
+    # ⚠ ORDER is central-directory order, which for anything this port wrote is
+    # `definitions` order. The oracle preserves it too — but its own test asserts
+    # membership with `keys.contains(..)`, so a port that returned them reversed
+    # would pass upstream and break every caller that indexes the list.
+    var defs = vec_new();
+    for (var i = 0; i < vec_len(names); i = i + 1) {
+        var nm = vec_get(names, i);
+        if (_agnosai_pkg_is_definition_member(nm) == 1) {
+            var ni = _agnosai_pkg_find_last(z, nm);
+            # The undecodable-member skip, mirroring `by_index(i).ok()?`.
+            if (ni >= 0) {
+                if (_agnosai_pkg_can_decode(z, ni) == 1) { vec_push(defs, nm); }
+            }
+        }
+    }
+
+    for (var k = 0; k < vec_len(defs); k = k + 1) {
+        var want = vec_get(defs, k);
+        var di = _agnosai_pkg_find_last(z, want);
+        if (di < 0) {
+            return agnosai_error_other(str_from("zip read error: member vanished"));
+        }
+        var src = _agnosai_pkg_read_member(z, di, str_from(want), &err);
+        if (src == 0) { return load64(&err); }
+
+        var def = agnosai_load_from_json(src, &err);
+        if (def == 0) { return load64(&err); }
+        agnosai_package_add_definition(pkg, def);
+    }
+
+    store64(out_pkg, pkg);
+    return 0;
+}
+
+# Import from a file on disk — the oracle's `import_from_file`.
+fn agnosai_package_import_from_file(path: Str, out_pkg): i64 {
+    var err = 0;
+    store64(&err, 0);
+    var content = _agnosai_loader_read(path, &err);
+    if (content == 0) { return load64(&err); }
+    return agnosai_package_import(str_data(content), str_len(content), out_pkg);
+}
