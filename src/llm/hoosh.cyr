@@ -646,6 +646,16 @@ fn agnosai_hoosh_headers(api_key: Str): i64 {
     return h;
 }
 
+# Close an inference span and hand it to the exporter. `ok` is 1 for success.
+#
+# One helper rather than the same three lines on five exit paths — and it keeps
+# the clock read next to the record, so a path that forgets to stop the timer
+# cannot report a bogus duration.
+fn _agnosai_hoosh_span_done(span, t0, ok): i64 {
+    return agnosai_telemetry_record_span(span, t0, clock_epoch_ns(),
+    agnosai_telemetry_status_of(ok));
+}
+
 # POST a chat-completions request to the gateway. **The one I/O call here.**
 #
 # Returns 0 on success, having written the InferenceResponse to `out_response`.
@@ -655,13 +665,33 @@ fn agnosai_hoosh_headers(api_key: Str): i64 {
 # Error text deliberately includes the HTTP status and the gateway's own
 # `error.message` where present, because `agnosai_is_retryable` classifies on
 # that text: a bare "request failed" would make a 503 look non-retryable.
+#
+# Records a GenAI inference span around the whole round trip — ADR 017, and the
+# reasoning is at the top of the body.
 fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
+    # ADR 017 — the oracle defines the GenAI span helpers and never calls them;
+    # this port must, or the OTLP exporter has no producers. Built before the
+    # request goes out so `start_ns` covers the whole round trip, and handed to
+    # `agnosai_telemetry_record_span` on every exit path below.
+    #
+    # ⚠ Costs one `alloc` and a dozen stores when telemetry is OFF, and nothing
+    # else — `record_span` returns immediately with no exporter. It is not
+    # guarded by a `telemetry_exporter() != 0` check here because the span has to
+    # exist before the branch that would need it, and the branch would then have
+    # to be repeated on all five exit paths.
+    var _span = agnosai_genai_inference_span(agnosai_inference_request_model(request),
+    str_from("hoosh"), str_from(""), str_from(""));
+    var _t0 = clock_epoch_ns();
+
     var url = agnosai_hoosh_endpoint(base_url);
     var headers = agnosai_hoosh_headers(api_key);
     var body = agnosai_inference_request_to_json(request);
 
     var r = sandhi_http_post(str_cstr(url), headers, str_data(body), str_len(body));
-    if (r == 0) { return str_from("hoosh transport error: no response allocated"); }
+    if (r == 0) {
+        _agnosai_hoosh_span_done(_span, _t0, 0);
+        return str_from("hoosh transport error: no response allocated");
+    }
     var kind = sandhi_http_err_kind(r);
     if (kind != SANDHI_OK) {
         var sb = str_builder_new();
@@ -670,6 +700,7 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
         str_builder_add_cstr(sb, " (");
         str_builder_add(sb, url);
         str_builder_add_cstr(sb, ")");
+        _agnosai_hoosh_span_done(_span, _t0, 0);
         return str_builder_build(sb);
     }
 
@@ -685,11 +716,13 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
             str_builder_add_cstr(esb, ": ");
             str_builder_add(esb, detail);
         }
+        _agnosai_hoosh_span_done(_span, _t0, 0);
         return str_builder_build(esb);
     }
 
     var parsed = agnosai_hoosh_response_from_body(resp_body);
     if (parsed == 0) {
+        _agnosai_hoosh_span_done(_span, _t0, 0);
         return str_from("hoosh returned a body with no choices[0].message.content");
     }
 
@@ -700,6 +733,14 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
     if (cache_hdr != 0) {
         store64(parsed + AGN_RESP_CACHE, agnosai_hoosh_cache_from_header(str_from(cache_hdr)));
     }
+
+    # The success path is the only one with usage to record: the responding
+    # model may differ from the requested one, which is exactly what
+    # `gen_ai.response.model` is for.
+    agnosai_genai_record_usage(_span, agnosai_inference_response_prompt_tokens(parsed),
+    agnosai_inference_response_completion_tokens(parsed),
+    agnosai_inference_response_model(parsed));
+    _agnosai_hoosh_span_done(_span, _t0, 1);
 
     store64(out_response, parsed);
     return 0;

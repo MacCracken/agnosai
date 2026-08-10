@@ -563,9 +563,9 @@ names, `FederationManager::declare_coordinator` adopts any term that is not
 stale, and `topology_score` is not clamped to the 1.0 its doc promises. Each is
 pinned by an assertion so a later reader cannot "fix" it by accident.
 
-### M9 — `telemetry` (Phase 8)
+### M9 — `telemetry` (Phase 8) — ✅ **COMPLETE 2026-08-10**
 
-**All 322 lines, plus the logging init in `main.rs`.** Three pieces, one done:
+**All 322 lines, plus the logging init in `main.rs`.** Three pieces:
 
 - **JSON stderr logging + `EnvFilter`** — ✅ **done 2026-08-08**
   (`src/telemetry/mod.cyr`, `tests/telemetry_mod.tcyr`, 84 assertions).
@@ -607,10 +607,14 @@ pinned by an assertion so a later reader cannot "fix" it by accident.
   work for the OpenTelemetry library repo (see *Out of scope for v2.0*), not
   for agnosai.
 
-  **What is left of M9 is a live wiring question, not a port gap**: nothing in
-  `src/` enqueues a span yet. `llm/`, `tools/` and `orchestrator/` are the three
-  call sites that would create inference, tool and crew spans, and choosing
-  where they go is a design decision rather than transcription.
+  ✅ **The call sites are wired** (2026-08-10, `tests/telemetry_wiring.tcyr`,
+  26 assertions): `llm/hoosh` for inference, `tools/native`'s vtable dispatch
+  for tool execution, `orchestrator/crew_runner` for crew runs. That is a
+  **deliberate divergence** — the oracle defines the helpers and never calls
+  them — recorded as [ADR 017](../adr/017-genai-span-call-sites.md).
+
+**M9 is complete.** `telemetry/` is source-complete against the oracle, the OTLP
+exporter is live, and spans reach it from the production paths.
 - **`genai.rs`** (206 lines) — ✅ **done 2026-08-09**
   (`src/telemetry/genai.cyr`, `tests/telemetry_genai.tcyr`, 64 assertions). It
   lives here, not in `llm`. `tracing::Span` became a held attribute record; the

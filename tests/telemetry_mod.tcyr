@@ -19,10 +19,11 @@
 #   * `RUST_LOG` parsing, including the multi-directive forms the port
 #     deliberately refuses rather than half-applying
 #
-# ⚠ **Not testable here**: the hook itself writes to fd 2, so `format_json` is
-# split out and driven directly. Installing the hook and capturing fd 2 would
-# need a pipe and a second thread; the write is one `syscall(SYS_WRITE, 2, ..)`
-# over a buffer this suite already checks.
+# The hook itself IS tested, end to end: `sys_pipe` + `sys_dup2` redirect fd 2,
+# sakshi emits through the installed hook, and the bytes are read back. That is
+# the only thing that catches a hook which ignores sakshi's fields block — it
+# passes every formatter assertion and drops every field in production, which is
+# exactly the regression the sakshi 2.4.10 bump would have caused.
 #
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
@@ -38,6 +39,14 @@ include "tests/test_helpers.cyr"
 fn _t_json(epoch_ns, level, msg): i64 {
     var buf = alloc(4096);
     var n = agnosai_telemetry_format_json(buf, 4096, epoch_ns, level, msg, strlen(msg));
+    return str_new(buf, n);
+}
+
+# Format one line with a sakshi fields block.
+fn _t_json_f(epoch_ns, level, msg, fields): i64 {
+    var buf = alloc(4096);
+    var n = agnosai_telemetry_format_json_f(buf, 4096, epoch_ns, level, msg,
+    strlen(msg), fields);
     return str_new(buf, n);
 }
 
@@ -335,6 +344,168 @@ fn main(): i64 {
     SK_INFO, "hello", 5) > 0, "and the minimum itself does produce a line");
     assert_eq(AGNOSAI_TELEMETRY_LINE_CAP, 4096,
     "the hook's buffer is PIPE_BUF — a larger one would give up atomic writes to a pipe");
+
+    # --- sakshi 2.4.10's fields block --------------------------------------
+    # The gap this port reported upstream, now consumed. A log event's sixth
+    # hook argument is 0 or `{count}{key,key_len,val,val_len}*`, and the fields
+    # become their own JSON members — which is what the Rust oracle's
+    # subscriber emits and what a log shipper can index on.
+    var f1 = alloc(40);
+    store64(f1, 1);
+    store64(f1 + 8, "hoosh_url");
+    store64(f1 + 16, 9);
+    store64(f1 + 24, "http://x");
+    store64(f1 + 32, 8);
+    var jf = _t_json_f(0, SK_INFO, "LLM client configured", f1);
+    assert_eq(str_contains_cstr(jf,
+    "\"fields\":{\"message\":\"LLM client configured\",\"hoosh_url\":\"http://x\"}"), 1,
+    "a field becomes its own member inside `fields`, beside `message`");
+
+    # ⚠ No fields block means no extra members and no stray comma — the object
+    # must close straight after `message`.
+    assert_eq(str_contains_cstr(_t_json(0, SK_INFO, "plain"),
+    "\"fields\":{\"message\":\"plain\"},\"target\""), 1,
+    "an event with no fields closes straight after message");
+    assert_eq(str_contains_cstr(_t_json(0, SK_INFO, "plain"), ",}"), 0,
+    "with no trailing comma");
+
+    # Several fields all land, in order.
+    var f2 = alloc(72);
+    store64(f2, 2);
+    store64(f2 + 8, "a");
+    store64(f2 + 16, 1);
+    store64(f2 + 24, "1");
+    store64(f2 + 32, 1);
+    store64(f2 + 40, "b");
+    store64(f2 + 48, 1);
+    store64(f2 + 56, "2");
+    store64(f2 + 64, 1);
+    assert_eq(str_contains_cstr(_t_json_f(0, SK_INFO, "m", f2),
+    "\"message\":\"m\",\"a\":\"1\",\"b\":\"2\""), 1, "two fields land in order");
+
+    # ⚠ Keys and values are both ESCAPED. A field value is caller data — an
+    # unescaped quote does not corrupt one member, it corrupts the line.
+    var f3 = alloc(40);
+    store64(f3, 1);
+    store64(f3 + 8, "k\"q");
+    store64(f3 + 16, 3);
+    store64(f3 + 24, "v\"q");
+    store64(f3 + 32, 3);
+    assert_eq(str_contains_cstr(_t_json_f(0, SK_INFO, "m", f3), "\"k\\\"q\":\"v\\\"q\""), 1,
+    "both key and value are JSON-escaped");
+
+    # ⚠ Values are emitted as STRINGS. sakshi carries every value as bytes with
+    # no type tag, so an integer field renders quoted where `tracing` would
+    # render it bare. Sniffing digits would mis-type an id like `007`, so the
+    # divergence is stated rather than guessed at.
+    var f4 = alloc(40);
+    store64(f4, 1);
+    store64(f4 + 8, "tools");
+    store64(f4 + 16, 5);
+    store64(f4 + 24, "4");
+    store64(f4 + 32, 1);
+    assert_eq(str_contains_cstr(_t_json_f(0, SK_INFO, "m", f4), "\"tools\":\"4\""), 1,
+    "an integer-valued field is quoted — sakshi has no type tag to recover");
+
+    # A zero count is the same as no block.
+    var f0 = alloc(8);
+    store64(f0, 0);
+    assert_eq(str_contains_cstr(_t_json_f(0, SK_INFO, "m", f0),
+    "\"fields\":{\"message\":\"m\"}"), 1, "a zero-count block adds nothing");
+
+    # ⚠ A field that will not fit is dropped WHOLE, never half-written — a
+    # truncated `"key":"va` is unparseable, where a missing field is merely
+    # incomplete.
+    var wide = alloc(9000);
+    for (var wi = 0; wi < 9000; wi = wi + 1) { store8(wide + wi, 65); }
+    var fbig = alloc(40);
+    store64(fbig, 1);
+    store64(fbig + 8, "k");
+    store64(fbig + 16, 1);
+    store64(fbig + 24, wide);
+    store64(fbig + 32, 9000);
+    var jbig = alloc(4096);
+    var nbig = agnosai_telemetry_format_json_f(jbig, 4096, 0, SK_INFO, "m", 1, fbig);
+    assert(nbig > 0, "an oversized field still yields a line");
+    assert_eq(load8(jbig + nbig - 1), 10, "terminated with a newline");
+    assert_eq(str_contains_cstr(str_new(jbig, nbig), "\"target\":\"agnosai\""), 1,
+    "with the JSON tail intact");
+    # The point: the field is absent ENTIRELY. Its key must not appear, because
+    # a written key with a truncated value is unparseable JSON.
+    assert_eq(str_contains_cstr(str_new(jbig, nbig), "\"k\":"), 0,
+    "and the oversized field is dropped WHOLE — not a key with a cut-off value");
+    assert_eq(str_contains_cstr(str_new(jbig, nbig), "\"message\":\"m\"}"), 1,
+    "so `fields` closes right after the message");
+
+    # --- the hook end to end, through fd 2 ----------------------------------
+    # Everything above drives the formatter directly. This installs the real
+    # hook, redirects fd 2 into a pipe, emits through sakshi, and reads the
+    # bytes back — the only thing that proves the hook forwards sakshi's fields
+    # block at all. A hook that ignores its sixth argument passes every
+    # formatter test above and drops every field in production.
+    var pfds = alloc(16);
+    if (sys_pipe(pfds) == 0) {
+        var rfd = load64(pfds) & 0xFFFFFFFF;
+        var wfd = (load64(pfds) >> 32) & 0xFFFFFFFF;
+        var saved = syscall(SYS_DUP, 2);
+        sys_dup2(wfd, 2);
+        agnosai_telemetry_init_json_logging();
+        sakshi_set_level(SK_INFO);
+        sakshi_log_kv(SK_INFO, "captured", 8, "unit", 4, "42", 2);
+        sakshi_clear_emit_hook();
+        sys_dup2(saved, 2);
+        sys_close(saved);
+        sys_close(wfd);
+        var cap_buf = alloc(4096);
+        var cn = sys_read(rfd, cap_buf, 4096);
+        sys_close(rfd);
+        assert(cn > 0, "the hook wrote a line to fd 2");
+        var captured = str_new(cap_buf, cn);
+        assert_eq(str_contains_cstr(captured, "\"message\":\"captured\""), 1,
+        "carrying the message unflattened");
+        assert_eq(str_contains_cstr(captured, "\"unit\":\"42\""), 1,
+        "and the field as its own member — the whole point of sakshi 2.4.10");
+        assert_eq(str_contains_cstr(captured, "captured unit=42"), 0,
+        "with no flattened tail left in the message");
+        assert_eq(load8(cap_buf + cn - 1), 10, "and one newline terminating it");
+    }
+
+    # --- the global exporter handle (ADR 017) --------------------------------
+    # The span call sites in `llm`, `tools` and `orchestrator` reach the
+    # exporter through a process global, the way every `info_span!` in a Rust
+    # program reaches `set_global_default`'s subscriber.
+    assert_eq(agnosai_telemetry_exporter(), 0, "no exporter is installed at rest");
+
+    # ⚠ With telemetry OFF, recording a span must be a cheap no-op rather than
+    # an error — that is the normal state, and every call site runs it.
+    var quiet = agnosai_genai_tool_span(str_from("t"), str_from("a"), str_from("1"));
+    assert_eq(agnosai_telemetry_record_span(quiet, 1, 2, AGNOSAI_OTLP_STATUS_OK), 0,
+    "recording a span with telemetry off queues nothing");
+
+    var g3 = agnosai_telemetry_init_tracing(str_from("http://localhost:4318"));
+    assert(agnosai_telemetry_exporter() != 0, "init_tracing installs the global");
+    assert_eq(agnosai_telemetry_exporter(), agnosai_tracing_guard_exporter(g3),
+    "and it is the same exporter the guard owns");
+
+    var ring3 = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
+    assert_eq(agnosai_telemetry_record_span(quiet, 1, 2, AGNOSAI_OTLP_STATUS_OK), 1,
+    "with telemetry on, a span is queued");
+    assert_eq(agnosai_otlp_ring_count(ring3), 1, "and reaches the exporter's ring");
+
+    # ⚠ Shutdown must clear the global too. A span created during shutdown would
+    # otherwise enqueue into a stopped exporter and never be drained.
+    agnosai_telemetry_shutdown(g3);
+    assert_eq(agnosai_telemetry_exporter(), 0, "shutdown clears the global");
+    assert_eq(agnosai_telemetry_record_span(quiet, 1, 2, AGNOSAI_OTLP_STATUS_OK), 0,
+    "so a span created after shutdown queues nothing");
+
+    # --- status folding ------------------------------------------------------
+    assert_eq(agnosai_telemetry_status_of(1), AGNOSAI_OTLP_STATUS_OK, "1 folds to OK");
+    assert_eq(agnosai_telemetry_status_of(0), AGNOSAI_OTLP_STATUS_ERROR, "0 folds to ERROR");
+    # ⚠ Anything that is not exactly 1 is an error. A tool returning 2 for
+    # "partial" must not be recorded as a success.
+    assert_eq(agnosai_telemetry_status_of(2), AGNOSAI_OTLP_STATUS_ERROR,
+    "and so does any other value — only 1 is success");
 
     # --- the log target --------------------------------------------------
     assert(str_eq_cstr(str_from(agnosai_telemetry_log_target()), "agnosai") == 1,

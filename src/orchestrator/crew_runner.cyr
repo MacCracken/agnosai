@@ -1184,6 +1184,15 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     var spec = load64(r + AGN_CR_SPEC);
     var tasks = agnosai_crew_tasks(spec);
 
+    # ADR 017 — the GenAI crew span. It follows the SAME discipline as the
+    # `crews_active` gauge below: **every exit must close it**, including the
+    # DAG-cycle error return, or a crew that fails to start is recorded as a
+    # span that never ended. `clock_epoch_ns` rather than the monotonic
+    # `start_ns` above, because OTLP timestamps are wall clock.
+    var span = agnosai_genai_crew_span(agnosai_crew_id(spec), agnosai_crew_name(spec),
+    vec_len(tasks));
+    var span_t0 = clock_epoch_ns();
+
     if (_agnosai_crew_wants_events(r) == 1) {
         var started = bayan_json_v_obj_new();
         bayan_json_v_obj_set(started, str_from("name"),
@@ -1211,6 +1220,8 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
             # Balance the active gauge before the error return. No task ran, so
             # no task/inference counters are recorded — only the gauge unwinds.
             agnosai_metrics_record_crew_completed(agnosai_metrics_global());
+            agnosai_telemetry_record_span(span, span_t0, clock_epoch_ns(),
+            AGNOSAI_OTLP_STATUS_ERROR);
             store64(out_err, load64(&dag_err));
             return 0;
         }
@@ -1258,5 +1269,12 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
         bayan_json_v_obj_set(done, str_from("wall_ms"), bayan_json_v_int_new(wall_ms));
         _agnosai_crew_emit(r, str_from("crew_completed"), done);
     }
+
+    # ⚠ CANCELLED is an ERROR span, not OK. A collector's error rate is what an
+    # operator alerts on, and a cancelled crew did not do what was asked — the
+    # oracle's `CrewStatus` keeps the three apart and OTLP has only two, so the
+    # fold has to pick a side and picks the honest one.
+    agnosai_telemetry_record_span(span, span_t0, clock_epoch_ns(),
+    agnosai_telemetry_status_of(status == AGNOSAI_CREW_COMPLETED));
     return state;
 }

@@ -163,7 +163,7 @@ the tree 2026-08-08 with `find src -maxdepth 1 -name '*.cyr'` per group:
 | `orchestrator/` | 16 | 5,632 | ✅ complete (M5) |
 | `server/` | 11 | 4,291 | ✅ complete (M6) |
 | `fleet/` | 12 | 3,676 | ✅ complete (M8) |
-| `telemetry/` | 3 | 1,418 | M9 — `mod` + `genai` + OTLP (encoder, ring, exporter). Only the span **call sites** are owed |
+| `telemetry/` | 3 | 1,524 | ✅ complete (M9) — `mod` + `genai` + OTLP, with the span call sites wired ([ADR 017](../adr/017-genai-span-call-sites.md)) |
 | `sandbox/` | 9 | 3,345 | ✅ complete (M7) |
 | `core/` | 8 | 3,305 | ✅ complete (M2) |
 | `server/routes/` | 10 | 2,686 | ✅ complete (M6) |
@@ -172,7 +172,7 @@ the tree 2026-08-08 with `find src -maxdepth 1 -name '*.cyr'` per group:
 | `tools/` | 5 | 1,144 | ✅ complete (M4) |
 | `learning/` | 6 | 1,018 | ✅ complete (M2) |
 | root (port-local) | 6 | 1,054 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
-| **total** | **97** | **30,972** | against a **41,163**-line oracle |
+| **total** | **97** | **31,163** | against a **41,163**-line oracle |
 
 Regenerate with:
 
@@ -190,7 +190,7 @@ corrected section below):
 | Group | Rust lines | Milestone | Scope |
 |---|---|---|---|
 | `definitions/` | 1,460 | M10 | whole — **ZIP and YAML included**; both former blockers are already in `lib/` (sankoch, bayan) |
-| `telemetry/` | 0 of 322 left | M9 | **Source-complete 2026-08-09** — `mod.rs` (116, with the JSON logging init) and `genai.rs` (206). What remains of M9 is not an oracle file: the **OTLP exporter body**, copied from hoosh's `otlp.cyr`, behind the branch `agnosai_telemetry_init_tracing` already takes. ⚠ The planned **sakshi filing for JSON output was never needed** — `sakshi_set_emit_hook` already exists; see roadmap M9. |
+| ~~`telemetry/`~~ | ✅ 0 left | M9 | **Source-complete 2026-08-09** — `mod.rs` (116, with the JSON logging init) and `genai.rs` (206). What remains of M9 is not an oracle file: the **OTLP exporter body**, copied from hoosh's `otlp.cyr`, behind the branch `agnosai_telemetry_init_tracing` already takes. ⚠ The planned **sakshi filing for JSON output was never needed** — `sakshi_set_emit_hook` already exists; see roadmap M9. |
 
 `fleet/` left this table on **2026-08-08**: all twelve of the oracle's modules
 are ported.
@@ -1036,7 +1036,7 @@ dead-end levers are recorded under *Benchmarks*.
 | Cyrius port | **29,518 lines**, 94 files, `src/` mirroring `rust-old/src/` |
 | Rust oracle | **41,163 lines** at `rust-old/` — frozen. (27,683 is the `src/`-only figure this file carried until 2026-08-07; see the banner above.) |
 | Milestones | **M0–M8 complete** — the server tier serves; M7 `sandbox`'s eight modules carry the 2026-08-04 audit's 43 findings all fixed (41 mutation-verified); **M8 `fleet` closed 2026-08-08** at 12/12 modules and 719 assertions. Read the ⚠ below: "complete" is per-milestone, not per-group |
-| Not started | M10 `definitions`, M11 (sandbox-gated tools + hwaccel), M12 (llm residue, tokio tests, benches, non-`src`). **M8 `fleet` closed 2026-08-08**; **M9 `telemetry` source-complete 2026-08-09** — only the OTLP exporter body (from hoosh, not from `rust-old/`) remains |
+| Not started | M10 `definitions`, M11 (sandbox-gated tools + hwaccel), M12 (llm residue, tokio tests, benches, non-`src`). **M8 `fleet` closed 2026-08-08**, **M9 `telemetry` closed 2026-08-10** |
 | Gates | build OK · 2,189 symbols / 95 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · coverage **100% (1338/1338)** via `cyrius coverage --min 80` · 79 suites / 6,389 assertions |
 
 ### What "M8/M9/M10 not started" actually means — corrected 2026-08-07

@@ -384,6 +384,29 @@ fn agnosai_tool_schema(t): i64 {
 }
 
 # Execute the tool, via its vtable. Synchronous — see the module note.
+#
+# ⚠ **Every tool call in the tree funnels through here**, which is why the
+# GenAI tool span is recorded at this one site rather than at each caller: the
+# vtable dispatch is the chokepoint, so a tool added later is instrumented
+# without touching it. ADR 017 covers why the port creates spans the oracle
+# does not.
+#
+# The agent name and task id are empty because the vtable carries neither — a
+# tool is invoked with an input value and nothing about who asked. Threading
+# that through would change the calling convention for every implementor, which
+# is a bigger change than this bite; the attributes are omitted rather than
+# faked, and an omitted OTLP attribute is simply absent on the wire.
 fn agnosai_tool_execute(t, input): i64 {
-    return callptr(load64(t + AGN_TOOL_EXECUTE_FP), load64(t + AGN_TOOL_CTX), input);
+    var span = agnosai_genai_tool_span(agnosai_tool_name(t), str_from(""), str_from(""));
+    var t0 = clock_epoch_ns();
+    var out = callptr(load64(t + AGN_TOOL_EXECUTE_FP), load64(t + AGN_TOOL_CTX), input);
+    # ⚠ A tool may answer 0. `agnosai_tool_output_success` would dereference it,
+    # so the null check comes FIRST — instrumenting this site must not turn a
+    # tool's 0 into a crash, which is exactly what the first draft did.
+    # A 0 output is recorded as an ERROR span: no output is not success.
+    var ok = 0;
+    if (out != 0) { ok = agnosai_tool_output_success(out); }
+    agnosai_telemetry_record_span(span, t0, clock_epoch_ns(),
+    agnosai_telemetry_status_of(ok));
+    return out;
 }

@@ -1,0 +1,157 @@
+# =========================================================================
+# telemetry_wiring.tcyr — the GenAI span call sites (ADR 017)
+#
+# No oracle: `rust-old` defines the GenAI span helpers and **never calls
+# them** — zero call sites outside `genai.rs`'s own doc comment. Calling them
+# is this port's deliberate divergence, recorded in
+# [ADR 017](../docs/adr/017-genai-span-call-sites.md), because agnosai is a
+# binary rather than a library: if `src/` does not create spans, nothing ever
+# will and the whole telemetry group is inert.
+#
+# So what this suite proves is the one thing the other telemetry suites cannot:
+# that a real call through the production path **actually reaches the
+# exporter**. `telemetry_otlp` drives the ring directly and `telemetry_mod`
+# drives the formatter directly; both would stay green if every call site were
+# deleted.
+#
+# Two of the three sites are exercised here:
+#
+#   * **tool execution** — a registered builtin through the real vtable
+#     dispatch, which is the chokepoint every tool call in the tree funnels
+#     through;
+#   * **crew run** — a real sequential crew through `agnosai_crew_runner_run`,
+#     including the discipline that every exit closes the span.
+#
+# ⚠ The **inference** site (`llm/hoosh.cyr`) is not reachable here: it records
+# its span around a live `sandhi_http_post` to a hoosh gateway. Its five exit
+# paths are each wired through one helper, `_agnosai_hoosh_span_done`, so the
+# shape is reviewable even though it is not runnable — noted rather than
+# claimed as covered.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/core/agent.cyr"
+include "src/core/crew.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/router.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/output_validation.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/ssrf.cyr"
+include "src/server/output_filter.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/server/prometheus.cyr"
+include "src/orchestrator/crew_runner.cyr"
+include "src/sandbox/mod.cyr"
+include "src/tools/mod.cyr"
+include "tests/test_helpers.cyr"
+
+fn main(): i64 {
+    var g = agnosai_telemetry_init_tracing(str_from("http://localhost:4318"));
+    var ring = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
+    assert(ring != 0, "telemetry is on and the exporter has a ring");
+
+    # --- tool execution ---------------------------------------------------
+    # Through the real registry and the real vtable, not a hand-built tool.
+    var reg = agnosai_tool_registry_new();
+    agnosai_register_basic_builtins(reg);
+    var echo = agnosai_tool_registry_get(reg, str_from("echo"));
+    assert(echo != 0, "the echo builtin is registered");
+
+    # Drain-and-discard to isolate each phase — the real API, not a test hook.
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    var input = agnosai_tool_input_new();
+    agnosai_tool_input_set(input, str_from("message"), bayan_json_v_str_new(str_from("hi")));
+    var out = agnosai_tool_execute(echo, input);
+    assert(out != 0, "the tool produced output");
+    assert_eq(agnosai_tool_output_success(out), 1, "successfully");
+    assert_eq(agnosai_otlp_ring_count(ring), 1,
+    "executing a tool through the vtable queued exactly ONE span");
+
+    var tdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(str_contains_cstr(tdoc, "gen_ai.execute_tool"), 1, "named as a tool span");
+    assert_eq(str_contains_cstr(tdoc, "\"agnosai.tool.name\""), 1, "carrying the tool name");
+    assert_eq(str_contains_cstr(tdoc, "\"echo\""), 1, "which is echo");
+    assert_eq(str_contains_cstr(tdoc, "\"kind\":1"), 1, "as an INTERNAL span");
+    assert_eq(str_contains_cstr(tdoc, "\"status\":{\"code\":1}"), 1, "with an OK status");
+
+    # ⚠ A FAILING tool is an ERROR span. `echo` with no `message` takes its
+    # error path, and a span that reported OK there would make a backend's error
+    # rate useless.
+    var bad = agnosai_tool_execute(echo, agnosai_tool_input_new());
+    assert_eq(agnosai_tool_output_success(bad), 0, "echo without a message fails");
+    var bdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(str_contains_cstr(bdoc, "\"status\":{\"code\":2}"), 1,
+    "and its span carries ERROR, not OK");
+
+    # --- crew run ---------------------------------------------------------
+    var spec = agnosai_crew_new(str_from("wired-crew"));
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("first")));
+    vec_push(tasks, agnosai_task_new(str_from("second")));
+    agnosai_crew_with_tasks(spec, tasks);
+
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    var run_err: i64[1];
+    store64(&run_err, 0);
+    var state = agnosai_crew_runner_run(agnosai_crew_runner_new(spec), &run_err);
+    assert_eq(load64(&run_err), 0, "the crew ran without error");
+    assert(state != 0, "and returned a state");
+    assert(agnosai_otlp_ring_count(ring) >= 1, "and queued at least its crew span");
+
+    var cdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(str_contains_cstr(cdoc, "agnosai.crew.run"), 1, "named as a crew span");
+    assert_eq(str_contains_cstr(cdoc, "\"agnosai.crew.name\""), 1, "carrying the crew name");
+    assert_eq(str_contains_cstr(cdoc, "\"wired-crew\""), 1, "which is the spec's");
+    assert_eq(str_contains_cstr(cdoc,
+    "{\"key\":\"agnosai.crew.task_count\",\"value\":{\"intValue\":\"2\"}}"), 1,
+    "and the task count, as a quoted OTLP intValue");
+    assert_eq(str_contains_cstr(cdoc, "\"status\":{\"code\":1}"), 1, "with an OK status");
+
+    # ⚠ Past the oracle in the sharpest way available here: a crew span must
+    # close on EVERY exit, the same discipline the `crews_active` gauge follows.
+    # An empty crew is the cheapest second path through the function.
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    var empty = agnosai_crew_new(str_from("empty-crew"));
+    agnosai_crew_with_tasks(empty, vec_new());
+    agnosai_crew_runner_run(agnosai_crew_runner_new(empty), &run_err);
+    assert_eq(agnosai_otlp_ring_count(ring), 1, "an empty crew still closes its span");
+    assert_eq(str_contains_cstr(agnosai_otlp_ring_drain(ring, str_from("agnosai")),
+    "\"agnosai.crew.task_count\",\"value\":{\"intValue\":\"0\"}"), 1,
+    "reporting a task count of 0 — present, not unset");
+
+    # --- telemetry off is the common path ---------------------------------
+    # ⚠ Every call site runs unconditionally, so with no exporter installed the
+    # same calls must be harmless. This is the configuration almost every
+    # deployment runs in.
+    agnosai_telemetry_shutdown(g);
+    assert_eq(agnosai_telemetry_exporter(), 0, "telemetry is off");
+    var quiet_out = agnosai_tool_execute(echo, input);
+    assert_eq(agnosai_tool_output_success(quiet_out), 1,
+    "a tool still executes with telemetry off");
+    var quiet_state = agnosai_crew_runner_run(agnosai_crew_runner_new(spec), &run_err);
+    assert(quiet_state != 0, "and a crew still runs");
+    assert_eq(load64(&run_err), 0, "without error");
+
+    sakshi_clear_emit_hook();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

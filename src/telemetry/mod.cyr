@@ -14,19 +14,22 @@
 # aggregators, in-memory sinks) ... without sakshi knowing their format". The
 # formatter belongs here, not upstream, and nothing had to be filed for it.
 #
-# What is genuinely not reachable through the hook is narrower and is stated at
-# each site below: per-event **structured fields** (`sakshi_log_kv` flattens
-# `key=val` into the message text *before* `_sk_emit`, so the hook sees one
-# string), the `span` / `spans` objects, and per-module `target` values.
+# ## Structured fields, consumed from sakshi 2.4.10
 #
-# ⚠ **The fields half is fixed upstream in sakshi 2.4.9 and this file has NOT
-# consumed it yet** — the pinned toolchain still vendors 2.4.8. On 2.4.9 the
-# hook's sixth argument carries a count-prefixed fields block for log events
-# (`{key, key_len, val, val_len}` records, `level` discriminating 0-5 log from
-# 10-11 span), and `msg` arrives WITHOUT the ` key=value` tail. So when cyrius
-# folds 2.4.9, `_agnosai_telemetry_json_hook` **must** be updated in the same
-# bump: not doing so silently drops every `key=value` from the output rather
-# than merely failing to structure it. Tracked in roadmap section C.
+# The gap this port reported — `sakshi_log_kv` flattening `key=val` into the
+# message before the hook could see it — is **fixed upstream and consumed here**
+# as of the 6.5.16 bump. For a log event the hook's sixth argument is 0 or a
+# count-prefixed fields block of `{key, key_len, val, val_len}` records, and
+# `msg` arrives without the ` key=value` tail. `level` discriminates: 0-5 are
+# log events, 10-11 are spans (where the sixth argument is still a duration).
+#
+# ⚠ **Consuming it was mandatory, not optional.** On 2.4.10 a hook that ignores
+# the sixth argument does not merely fail to structure the fields — it drops
+# them entirely, because they are no longer in `msg`. Verified against the real
+# binary in both directions before and after this change.
+#
+# What is still not reachable through the hook, and stated at each site below:
+# the `span` / `spans` objects, and per-module `target` values.
 #
 # ## The hook must not allocate, and must be reentrant
 #
@@ -384,11 +387,43 @@ fn agnosai_telemetry_log_target(): i64 {
     return "agnosai";
 }
 
+# Append sakshi's fields block as JSON members, each preceded by a comma so it
+# slots in after `"message":"..."`. Returns the new pos.
+#
+# `fields` layout (sakshi 2.4.10): count at offset 0, then 32-byte
+# `{key, key_len, val, val_len}` records. 0 means the event carried none.
+#
+# ⚠ Bounded against `cap` the same way the message is, and it stops on the
+# first field that will not fit rather than writing a truncated member — a
+# half-written `"key":"va` is unparseable JSON, where a dropped field is merely
+# incomplete.
+fn _agnosai_telemetry_write_fields(buf, cap, pos, fields): i64 {
+    if (fields == 0) { return pos; }
+    var n = load64(fields);
+    for (var i = 0; i < n; i = i + 1) {
+        var rec = fields + 8 + i * 32;
+        var klen = load64(rec + 8);
+        var vlen = load64(rec + 16 + 8);
+        # `,"":""` is 6 bytes of framing; escaping can double each byte.
+        if (pos + 6 + klen * 6 + vlen * 6 + 32 > cap) { return pos; }
+        pos = _agnosai_telemetry_write_lit(buf, pos, ",\"");
+        pos = _agnosai_telemetry_write_escaped(buf, cap - 32, pos, load64(rec), klen);
+        pos = _agnosai_telemetry_write_lit(buf, pos, "\":\"");
+        pos = _agnosai_telemetry_write_escaped(buf, cap - 32, pos, load64(rec + 16), vlen);
+        pos = _agnosai_telemetry_write_lit(buf, pos, "\"");
+    }
+    return pos;
+}
+
 # Render one event as the oracle's JSON line into `buf`, returning its length.
 #
 # The key order is `tracing_subscriber`'s: timestamp, level, fields, target.
-# `fields` is an object because `tracing` nests every event field under it —
-# with `message` the only member here, for the reason in the module header.
+# `fields` is an object because `tracing` nests every event field under it, and
+# since sakshi 2.4.10 that is literal rather than aspirational: `fields` carries
+# `message` plus one member per `sakshi_log_kv` pair, which is what the oracle's
+# subscriber emits.
+#
+# `fields` is 0 for an event with none, or sakshi's block — see the header.
 #
 # Split from the hook so it is testable: the hook itself writes to fd 2.
 #
@@ -398,6 +433,16 @@ fn agnosai_telemetry_log_target(): i64 {
 # the first bound is checked, so that case is refused outright rather than
 # half-written. Returns 0 for a buffer too small to hold any line at all.
 fn agnosai_telemetry_format_json(buf, cap, epoch_ns, level, msg, msg_len): i64 {
+    return agnosai_telemetry_format_json_f(buf, cap, epoch_ns, level, msg, msg_len, 0);
+}
+
+# The same, plus sakshi's fields block — 0, or `{count}{key,key_len,val,val_len}*`.
+#
+# ⚠ Each field's value is emitted as a JSON **string**, because sakshi carries
+# every value as bytes and has no type tag. `tracing` would render an integer
+# field unquoted; that distinction is not recoverable here, and inventing it by
+# sniffing digits would mis-type an id like `007` or a version like `1.2.3`.
+fn agnosai_telemetry_format_json_f(buf, cap, epoch_ns, level, msg, msg_len, fields): i64 {
     if (cap < AGNOSAI_TELEMETRY_MIN_CAP) { return 0; }
     var pos = _agnosai_telemetry_write_lit(buf, 0, "{\"timestamp\":\"");
     pos = _agnosai_telemetry_write_ts(buf, pos, epoch_ns);
@@ -406,7 +451,9 @@ fn agnosai_telemetry_format_json(buf, cap, epoch_ns, level, msg, msg_len): i64 {
     pos = _agnosai_telemetry_write_lit(buf, pos, "\",\"fields\":{\"message\":\"");
     # Leave room for the fixed tail plus the closing quote.
     pos = _agnosai_telemetry_write_escaped(buf, cap - 32, pos, msg, msg_len);
-    pos = _agnosai_telemetry_write_lit(buf, pos, "\"},\"target\":\"");
+    pos = _agnosai_telemetry_write_lit(buf, pos, "\"");
+    pos = _agnosai_telemetry_write_fields(buf, cap, pos, fields);
+    pos = _agnosai_telemetry_write_lit(buf, pos, "},\"target\":\"");
     pos = _agnosai_telemetry_write_lit(buf, pos, agnosai_telemetry_log_target());
     pos = _agnosai_telemetry_write_lit(buf, pos, "\"}");
     store8(buf + pos, 10);
@@ -425,12 +472,12 @@ fn agnosai_telemetry_format_json(buf, cap, epoch_ns, level, msg, msg_len): i64 {
 # One `write(2)` per line, matching sakshi's own stderr path
 # (`lib/sakshi.cyr:604`) — the best interleaving guarantee available to a
 # multi-threaded writer, and no worse than what it replaces.
-fn _agnosai_telemetry_json_hook(ts, level, category, msg, msg_len, elapsed_ns): i64 {
+fn _agnosai_telemetry_json_hook(ts, level, category, msg, msg_len, sixth): i64 {
     if (level == SK_SPAN_ENTER) { return 0; }
     if (level == SK_SPAN_EXIT) { return 0; }
     var buf[4096];
-    var n = agnosai_telemetry_format_json(&buf, AGNOSAI_TELEMETRY_LINE_CAP,
-    clock_epoch_ns(), level, msg, msg_len);
+    var n = agnosai_telemetry_format_json_f(&buf, AGNOSAI_TELEMETRY_LINE_CAP,
+    clock_epoch_ns(), level, msg, msg_len, sixth);
     # The return is ignored, as sakshi's own stderr writer does
     # (`lib/sakshi.cyr:610`). At `PIPE_BUF` or less this cannot short-write to a
     # pipe, which is the case that matters.
@@ -500,6 +547,7 @@ fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
     AGNOSAI_OTLP_BATCH_MS);
     agnosai_otlp_exporter_start(exporter);
     store64(g + AGN_TG_EXPORTER, exporter);
+    _agnosai_telemetry_exporter = exporter;
     store64(g + AGN_TG_OTEL, 1);
     sakshi_info("OpenTelemetry OTLP export initialised", 37);
     return g;
@@ -509,6 +557,27 @@ fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
 # enqueues spans into — `agnosai_otlp_exporter_ring(..)` gives it the ring.
 fn agnosai_tracing_guard_exporter(g): i64 {
     return load64(g + AGN_TG_EXPORTER);
+}
+
+# The process-wide exporter, or 0 when OTLP is off.
+#
+# ⚠ A **global**, deliberately, and it mirrors the oracle: `tracing`'s
+# subscriber is installed with `set_global_default` and every `info_span!` in a
+# Rust program reaches it without being threaded through anything. The span call
+# sites here — `llm/hoosh`, `tools/registry`, `orchestrator/crew_runner` — are
+# deep in the tree, and threading an exporter handle from `main` down to each
+# would be a far larger and less faithful change than one global set at init.
+#
+# See ADR 017 for why those call sites exist at all: the oracle defines the
+# genai span helpers and never calls them, and this port must.
+var _agnosai_telemetry_exporter = 0;
+
+# The exporter every span call site enqueues into, or 0 when OTLP is off.
+#
+# Callers must treat 0 as "telemetry disabled, do nothing" — it is the normal
+# state, not an error.
+fn agnosai_telemetry_exporter(): i64 {
+    return _agnosai_telemetry_exporter;
 }
 
 # Flush and stop the exporter. The oracle's `Drop`, which Cyrius has no
@@ -523,5 +592,42 @@ fn agnosai_telemetry_shutdown(g): i64 {
     if (e != 0) { agnosai_otlp_exporter_stop(e); }
     store64(g + AGN_TG_OTEL, 0);
     store64(g + AGN_TG_EXPORTER, 0);
+    # ⚠ Clear the global too, or a span created during shutdown enqueues into a
+    # stopped exporter and is never drained.
+    _agnosai_telemetry_exporter = 0;
     return 0;
+}
+
+# --- the span call sites' entry point ------------------------------------
+
+# Record a finished genai span, if telemetry is on. Returns 1 if it was queued.
+#
+# The single call every span site uses, so instrumenting a call path is two
+# lines — build the span, then hand it here with its timing — rather than
+# twenty of exporter lookup, identity minting and context construction. See
+# ADR 017.
+#
+# ⚠ **Identity is minted per span, not read from sakshi.** sakshi's trace id is
+# a process global and two concurrent requests would share it; a fresh
+# `agnosai_uuid_v4` per span is 128 random bits, which is exactly a trace id.
+# The cost is that spans do not correlate into one trace yet — see ADR 017 and
+# the roadmap's OpenTelemetry-library note, where the thread-local current-span
+# that would fix it belongs.
+#
+# ⚠ Returns 0 immediately when OTLP is off, which is the common case. Nothing
+# above this line allocates in that path.
+fn agnosai_telemetry_record_span(span, start_ns, end_ns, status): i64 {
+    var e = agnosai_telemetry_exporter();
+    if (e == 0) { return 0; }
+    var u = agnosai_uuid_v4();
+    var ctx = agnosai_otlp_ctx_new(load64(u), load64(u + 8), load64(u),
+    start_ns, end_ns, status);
+    return agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(e), span, ctx);
+}
+
+# `AGNOSAI_OTLP_STATUS_OK` when `ok` is 1, else ERROR — the mapping every call
+# site needs and none should re-derive.
+fn agnosai_telemetry_status_of(ok): i64 {
+    if (ok == 1) { return AGNOSAI_OTLP_STATUS_OK; }
+    return AGNOSAI_OTLP_STATUS_ERROR;
 }

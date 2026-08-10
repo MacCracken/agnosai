@@ -1,0 +1,191 @@
+# =========================================================================
+# definitions/versioning — versioned agent definitions with rollback.
+#
+# Parity oracle: rust-old/src/definitions/versioning.rs
+#
+# An in-memory store of `AgentDefinition` snapshots keyed by `agent_key`, each
+# with an auto-incrementing version number, a timestamp and an optional message.
+# The first module of the `definitions` group and the only one with no
+# dependency on the preset loader, which is why it lands first.
+#
+# ## Version numbers are monotonic ACROSS eviction
+#
+# The cap is per agent and eviction drops the OLDEST, but the next number comes
+# from `history.last()` — the newest survivor — not from the length. So a store
+# that has evicted 300 versions still hands out 501, 502, … and never reuses a
+# number. That is the oracle's own test (`latest.version == MAX + 1` after
+# filling past capacity) and it is the property a rollback target depends on:
+# if numbers restarted, "rollback to version 3" would be ambiguous.
+#
+# It also means `get` must **search** by version rather than index into the vec.
+# After one eviction, version N is no longer at index N-1, and an indexed
+# lookup would silently return the wrong definition — a rollback to the wrong
+# agent config, with no error.
+#
+# ## `rollback` goes through `save`
+#
+# It does not splice the old snapshot in; it copies it forward as a NEW version,
+# so history is append-only and the rollback itself is auditable. That also
+# means a rollback is subject to eviction and numbering like any other save.
+# =========================================================================
+
+# The oracle's `MAX_VERSIONS_PER_AGENT`.
+var AGNOSAI_MAX_VERSIONS_PER_AGENT = 500;
+
+# DefinitionVersion heap layout — 32 bytes.
+enum AgnosaiDefinitionVersionOff {
+    AGN_DV_VERSION = 0;
+    AGN_DV_DEFINITION = 8;
+    # Wall-clock seconds — the oracle's `DateTime<Utc>`.
+    AGN_DV_CREATED_AT = 16;
+    # 0 for the oracle's `None`.
+    AGN_DV_MESSAGE = 24;
+    AGN_DV_SIZE = 32;
+}
+
+# VersionStore heap layout — 8 bytes. A map from agent_key to a vec of versions.
+enum AgnosaiVersionStoreOff {
+    AGN_VS_VERSIONS = 0;
+    AGN_VS_SIZE = 8;
+}
+
+# --- DefinitionVersion ---------------------------------------------------
+
+# The version number.
+fn agnosai_definition_version_number(v): i64 {
+    return load64(v + AGN_DV_VERSION);
+}
+
+# The agent definition at this version.
+fn agnosai_definition_version_definition(v): i64 {
+    return load64(v + AGN_DV_DEFINITION);
+}
+
+# Wall-clock seconds when this version was saved.
+fn agnosai_definition_version_created_at(v): i64 {
+    return load64(v + AGN_DV_CREATED_AT);
+}
+
+# The commit message, or 0 for the oracle's `None`.
+fn agnosai_definition_version_message(v): i64 {
+    return load64(v + AGN_DV_MESSAGE);
+}
+
+# --- VersionStore --------------------------------------------------------
+
+# An empty store. The oracle's `new` and `Default` are the same thing.
+fn agnosai_version_store_new(): i64 {
+    var s = alloc(AGN_VS_SIZE);
+    store64(s + AGN_VS_VERSIONS, map_new_str());
+    return s;
+}
+
+# Save a new version of `definition`. `message` may be 0. Returns the number.
+#
+# ⚠ Eviction happens BEFORE the number is chosen, and the number comes from the
+# last surviving entry — so it stays monotonic across eviction. Computing it
+# from `vec_len(history) + 1` instead would reuse numbers the moment anything
+# was dropped, and a rollback target would then be ambiguous.
+#
+# ⚠ The `>=` and the `- MAX + 1` together hold the history at exactly MAX: at
+# len == MAX one entry is dropped, leaving MAX-1, and the push brings it back.
+fn agnosai_version_store_save(s, definition, message): i64 {
+    var versions = load64(s + AGN_VS_VERSIONS);
+    var key = agnosai_agent_key(definition);
+    var history = map_get(versions, key);
+    if (history == 0) {
+        history = vec_new();
+        map_set(versions, key, history);
+    }
+
+    if (vec_len(history) >= AGNOSAI_MAX_VERSIONS_PER_AGENT) {
+        var drop = vec_len(history) - AGNOSAI_MAX_VERSIONS_PER_AGENT + 1;
+        _agnosai_version_drain_front(history, drop);
+    }
+
+    var number = 1;
+    if (vec_len(history) > 0) {
+        number = load64(vec_get(history, vec_len(history) - 1) + AGN_DV_VERSION) + 1;
+    }
+
+    var v = alloc(AGN_DV_SIZE);
+    store64(v + AGN_DV_VERSION, number);
+    store64(v + AGN_DV_DEFINITION, definition);
+    store64(v + AGN_DV_CREATED_AT, clock_epoch_secs());
+    store64(v + AGN_DV_MESSAGE, message);
+    vec_push(history, v);
+    return number;
+}
+
+# Drop the first `n` entries, shifting the rest down — the oracle's
+# `history.drain(..n)`.
+#
+# `lib/vec.cyr` has no drain, and compacting in place beats allocating a new vec
+# on a path that runs once per save at capacity.
+fn _agnosai_version_drain_front(history, n): i64 {
+    var len = vec_len(history);
+    if (n >= len) {
+        # `lib/vec.cyr` has no `vec_clear` either — pop it empty.
+        for (var i = 0; i < len; i = i + 1) { vec_pop(history); }
+        return 0;
+    }
+    for (var i = 0; i < len - n; i = i + 1) {
+        vec_set(history, i, vec_get(history, i + n));
+    }
+    for (var i = 0; i < n; i = i + 1) { vec_pop(history); }
+    return 0;
+}
+
+# A specific version, or 0 for the oracle's `None`.
+#
+# ⚠ A linear search by version number, NOT an index. After any eviction the
+# version at index k is not version k+1, and indexing would hand back the wrong
+# definition with no error — a rollback to the wrong agent config.
+fn agnosai_version_store_get(s, agent_key: Str, version): i64 {
+    var history = map_get(load64(s + AGN_VS_VERSIONS), agent_key);
+    if (history == 0) { return 0; }
+    for (var i = 0; i < vec_len(history); i = i + 1) {
+        var v = vec_get(history, i);
+        if (load64(v + AGN_DV_VERSION) == version) { return v; }
+    }
+    return 0;
+}
+
+# The newest version, or 0 for an unknown agent.
+fn agnosai_version_store_latest(s, agent_key: Str): i64 {
+    var history = map_get(load64(s + AGN_VS_VERSIONS), agent_key);
+    if (history == 0) { return 0; }
+    if (vec_len(history) == 0) { return 0; }
+    return vec_get(history, vec_len(history) - 1);
+}
+
+# Every retained version, oldest first. An unknown agent gives an EMPTY vec,
+# not 0 — the oracle's `map_or_else(Vec::new, ..)`.
+fn agnosai_version_store_list(s, agent_key: Str): i64 {
+    var history = map_get(load64(s + AGN_VS_VERSIONS), agent_key);
+    if (history == 0) { return vec_new(); }
+    var out = vec_new();
+    for (var i = 0; i < vec_len(history); i = i + 1) { vec_push(out, vec_get(history, i)); }
+    return out;
+}
+
+# Roll back to `version` by copying it forward as a new latest version.
+# Returns the old definition, or 0 when the agent or version is unknown.
+#
+# ⚠ Append-only: the old snapshot is re-saved rather than spliced in, so the
+# rollback is itself a version and the history stays auditable. It therefore
+# obeys eviction and numbering like any other save.
+#
+# ⚠ Returns the DEFINITION, not the new version number — the oracle discards
+# the number (`let _ = new_version;`).
+fn agnosai_version_store_rollback(s, agent_key: Str, version): i64 {
+    var target = agnosai_version_store_get(s, agent_key, version);
+    if (target == 0) { return 0; }
+    var old_def = load64(target + AGN_DV_DEFINITION);
+
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Rollback to version ");
+    str_builder_add_int(sb, version);
+    agnosai_version_store_save(s, old_def, str_builder_build(sb));
+    return old_def;
+}

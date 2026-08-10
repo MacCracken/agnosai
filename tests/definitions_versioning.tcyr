@@ -1,0 +1,208 @@
+# =========================================================================
+# definitions_versioning.tcyr — tests for src/definitions/versioning.cyr
+#
+# Oracle: rust-old/src/definitions/versioning.rs's eleven `#[test]` fns, all
+# ported. The first suite of the `definitions` group.
+#
+# Past the oracle in nine places, the sharpest being:
+#
+#   * **`get` must SEARCH, not index.** Every oracle test either has no
+#     eviction or only checks `latest`, so a `vec_get(history, version - 1)`
+#     implementation passes all eleven — and then silently returns the wrong
+#     definition the moment a store has evicted anything. Rolling back to "the
+#     one from Tuesday" would restore a different agent's config with no error.
+#   * **version numbers survive eviction.** The oracle pins the endpoint
+#     (`MAX + 1`) but never checks what happens to `get` after it, nor that the
+#     oldest surviving number is the one it should be.
+#   * **the cap holds at exactly MAX**, not MAX-1 or MAX+1 — the `>=` and the
+#     `- MAX + 1` have to agree, and the oracle asserts only `<= MAX`.
+#   * **a failed rollback saves nothing** — the oracle checks the `None`, not
+#     that history was left alone.
+#   * `save` accepts a 0 message (the oracle's `None`) and reads it back as 0,
+#     distinct from an empty string.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/mod.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's `make_def(key, role)`.
+fn _t_def(key, role): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, key);
+    str_builder_add_cstr(sb, " Agent");
+    var d = agnosai_agent_new(str_from(key), str_from(role), str_from("test"));
+    agnosai_agent_with_name(d, str_builder_build(sb));
+    return d;
+}
+
+fn _t_role_of(v): i64 {
+    return agnosai_agent_role(agnosai_definition_version_definition(v));
+}
+
+fn main(): i64 {
+    # --- oracle: save_and_retrieve --------------------------------------
+    var s = agnosai_version_store_new();
+    assert_eq(agnosai_version_store_save(s, _t_def("agent-a", "tester"),
+    str_from("initial")), 1, "the first save is version 1");
+    var got = agnosai_version_store_get(s, str_from("agent-a"), 1);
+    assert(got != 0, "and is retrievable");
+    assert_eq(agnosai_definition_version_number(got), 1, "as version 1");
+    assert(str_eq_cstr(_t_role_of(got), "tester") == 1, "carrying its definition");
+    assert(str_eq_cstr(agnosai_definition_version_message(got), "initial") == 1,
+    "and its message");
+    assert(agnosai_definition_version_created_at(got) > 0, "stamped with a wall clock");
+
+    # --- oracle: version_numbers_increment ------------------------------
+    var inc = agnosai_version_store_new();
+    assert_eq(agnosai_version_store_save(inc, _t_def("agent-a", "tester"), 0), 1, "v1");
+    assert_eq(agnosai_version_store_save(inc, _t_def("agent-a", "senior tester"), 0), 2, "v2");
+    assert_eq(agnosai_version_store_save(inc, _t_def("agent-a", "lead tester"), 0), 3, "v3");
+
+    # --- past the oracle: a 0 message is None, not an empty string -------
+    var nomsg = agnosai_version_store_get(inc, str_from("agent-a"), 1);
+    assert_eq(agnosai_definition_version_message(nomsg), 0,
+    "a saved-with-no-message version reads back 0, the oracle's None");
+
+    # --- oracle: latest_returns_newest ----------------------------------
+    var lat = agnosai_version_store_new();
+    agnosai_version_store_save(lat, _t_def("agent-a", "v1-role"), 0);
+    agnosai_version_store_save(lat, _t_def("agent-a", "v2-role"), 0);
+    var newest = agnosai_version_store_latest(lat, str_from("agent-a"));
+    assert_eq(agnosai_definition_version_number(newest), 2, "latest is version 2");
+    assert(str_eq_cstr(_t_role_of(newest), "v2-role") == 1, "with the newest definition");
+
+    # --- oracle: latest_returns_none_for_unknown ------------------------
+    assert_eq(agnosai_version_store_latest(agnosai_version_store_new(),
+    str_from("nonexistent")), 0, "latest of an unknown agent is None");
+
+    # --- oracle: list_versions ------------------------------------------
+    var lv = agnosai_version_store_new();
+    agnosai_version_store_save(lv, _t_def("agent-a", "v1"), 0);
+    agnosai_version_store_save(lv, _t_def("agent-a", "v2"), 0);
+    var versions = agnosai_version_store_list(lv, str_from("agent-a"));
+    assert_eq(vec_len(versions), 2, "two versions listed");
+    assert_eq(agnosai_definition_version_number(vec_get(versions, 0)), 1, "oldest first");
+    assert_eq(agnosai_definition_version_number(vec_get(versions, 1)), 2, "then newest");
+
+    # --- oracle: list_versions_empty_for_unknown ------------------------
+    # ⚠ An EMPTY vec, not 0. The oracle's `map_or_else(Vec::new, ..)` means a
+    # caller can iterate the result unconditionally; answering 0 would fault it.
+    var none = agnosai_version_store_list(agnosai_version_store_new(),
+    str_from("nonexistent"));
+    assert(none != 0, "an unknown agent gives a vec, not 0");
+    assert_eq(vec_len(none), 0, "and it is empty");
+
+    # --- oracle: rollback_creates_new_version_from_old ------------------
+    var rb = agnosai_version_store_new();
+    agnosai_version_store_save(rb, _t_def("agent-a", "original"), 0);
+    agnosai_version_store_save(rb, _t_def("agent-a", "modified"), 0);
+    var rolled = agnosai_version_store_rollback(rb, str_from("agent-a"), 1);
+    assert(rolled != 0, "the rollback succeeded");
+    assert(str_eq_cstr(agnosai_agent_role(rolled), "original") == 1,
+    "returning the OLD definition, not the new version number");
+
+    var rbv = agnosai_version_store_list(rb, str_from("agent-a"));
+    assert_eq(vec_len(rbv), 3, "history grew to three — append-only, not spliced");
+    assert_eq(agnosai_definition_version_number(vec_get(rbv, 2)), 3, "the copy is version 3");
+    assert(str_eq_cstr(_t_role_of(vec_get(rbv, 2)), "original") == 1,
+    "carrying the rolled-back definition");
+    assert(str_eq_cstr(agnosai_definition_version_message(vec_get(rbv, 2)),
+    "Rollback to version 1") == 1, "and an auto-generated message naming the target");
+
+    # ⚠ Past the oracle: version 2 is STILL THERE. A rollback that truncated
+    # history would pass every oracle assertion above and destroy the audit
+    # trail — the reason the oracle re-saves instead of splicing.
+    assert(str_eq_cstr(_t_role_of(vec_get(rbv, 1)), "modified") == 1,
+    "the rolled-over-from version is retained, not discarded");
+
+    # --- oracle: rollback_nonexistent_version_returns_none --------------
+    var rbn = agnosai_version_store_new();
+    agnosai_version_store_save(rbn, _t_def("agent-a", "v1"), 0);
+    assert_eq(agnosai_version_store_rollback(rbn, str_from("agent-a"), 99), 0,
+    "rolling back to a version that does not exist is None");
+    # ⚠ Past the oracle: and it saves NOTHING. A failed rollback that still
+    # appended would corrupt the history it was asked not to change.
+    assert_eq(vec_len(agnosai_version_store_list(rbn, str_from("agent-a"))), 1,
+    "and leaves the history untouched");
+
+    # --- oracle: rollback_nonexistent_agent_returns_none ----------------
+    assert_eq(agnosai_version_store_rollback(agnosai_version_store_new(),
+    str_from("nonexistent"), 1), 0, "rolling back an unknown agent is None");
+
+    # --- oracle: separate_agents_have_independent_versions --------------
+    var sep = agnosai_version_store_new();
+    assert_eq(agnosai_version_store_save(sep, _t_def("agent-a", "role-a"), 0), 1,
+    "agent-a starts at 1");
+    assert_eq(agnosai_version_store_save(sep, _t_def("agent-b", "role-b"), 0), 1,
+    "and so does agent-b — the counters are per agent");
+    assert_eq(vec_len(agnosai_version_store_list(sep, str_from("agent-a"))), 1, "one each");
+    assert_eq(vec_len(agnosai_version_store_list(sep, str_from("agent-b"))), 1, "independently");
+
+    # --- oracle: version_store_evicts_oldest_when_at_capacity -----------
+    var cap = agnosai_version_store_new();
+    for (var i = 0; i <= AGNOSAI_MAX_VERSIONS_PER_AGENT; i = i + 1) {
+        agnosai_version_store_save(cap, _t_def("agent-a", "role"), 0);
+    }
+    var capv = agnosai_version_store_list(cap, str_from("agent-a"));
+    assert(vec_len(capv) <= AGNOSAI_MAX_VERSIONS_PER_AGENT, "history stays within the cap");
+    assert_eq(agnosai_definition_version_number(
+    agnosai_version_store_latest(cap, str_from("agent-a"))),
+    AGNOSAI_MAX_VERSIONS_PER_AGENT + 1,
+    "and the newest number is MAX + 1 — monotonic, NOT reset by eviction");
+
+    # --- past the oracle: the cap holds at EXACTLY max -------------------
+    # The oracle asserts only `<= MAX`. The `>=` test and the `- MAX + 1` drain
+    # have to agree, and an off-by-one in either leaves MAX-1 or MAX+1.
+    assert_eq(vec_len(capv), AGNOSAI_MAX_VERSIONS_PER_AGENT,
+    "the retained count is exactly MAX, not one either side");
+
+    # ⚠ And the OLDEST survivor is the right one. 501 saves with a 500 cap drops
+    # exactly one, so version 1 is gone and version 2 leads.
+    assert_eq(agnosai_definition_version_number(vec_get(capv, 0)), 2,
+    "the oldest survivor is version 2 — exactly one was evicted");
+    assert_eq(agnosai_version_store_get(cap, str_from("agent-a"), 1), 0,
+    "and version 1 is gone");
+
+    # ⚠ THE ONE THAT MATTERS: `get` after eviction. Version N is no longer at
+    # index N-1, so an indexed lookup returns the wrong snapshot — and every
+    # oracle test passes anyway.
+    var mid = agnosai_version_store_get(cap, str_from("agent-a"), 250);
+    assert(mid != 0, "a mid-history version is still retrievable after eviction");
+    assert_eq(agnosai_definition_version_number(mid), 250,
+    "and it is the version asked for, not the one at that index");
+    assert_eq(agnosai_definition_version_number(
+    agnosai_version_store_get(cap, str_from("agent-a"),
+    AGNOSAI_MAX_VERSIONS_PER_AGENT + 1)), AGNOSAI_MAX_VERSIONS_PER_AGENT + 1,
+    "the newest is retrievable by its number too");
+
+    # ⚠ Eviction keeps running past the first overflow, and numbering keeps
+    # climbing — a store that reset would collide with a live version number.
+    agnosai_version_store_save(cap, _t_def("agent-a", "role"), 0);
+    assert_eq(vec_len(agnosai_version_store_list(cap, str_from("agent-a"))),
+    AGNOSAI_MAX_VERSIONS_PER_AGENT, "a further save still holds the cap");
+    assert_eq(agnosai_definition_version_number(
+    agnosai_version_store_latest(cap, str_from("agent-a"))),
+    AGNOSAI_MAX_VERSIONS_PER_AGENT + 2, "and the number keeps climbing");
+
+    # --- past the oracle: rollback into an evicted-history store ---------
+    # Rollback is just a save, so it obeys the cap — and its target must still
+    # be found by search rather than index.
+    var target = agnosai_version_store_rollback(cap, str_from("agent-a"), 300);
+    assert(target != 0, "a rollback to a surviving mid-history version works");
+    assert_eq(vec_len(agnosai_version_store_list(cap, str_from("agent-a"))),
+    AGNOSAI_MAX_VERSIONS_PER_AGENT, "and stays within the cap");
+    assert_eq(agnosai_version_store_rollback(cap, str_from("agent-a"), 1), 0,
+    "while a rollback to an EVICTED version is None");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

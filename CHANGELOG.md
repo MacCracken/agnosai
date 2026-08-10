@@ -96,6 +96,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The GenAI span call sites are wired** — `llm/hoosh` (inference, CLIENT),
+  `tools/native`'s vtable dispatch (tool execution, INTERNAL) and
+  `orchestrator/crew_runner` (crew run, INTERNAL). **26 assertions** in
+  `tests/telemetry_wiring.tcyr`, three mutation-verified.
+
+  ⚠ **A deliberate divergence from `rust-old`, recorded as
+  [ADR 017](docs/adr/017-genai-span-call-sites.md)** and flagged before it was
+  made. The oracle defines the four GenAI span helpers and **never calls
+  them** — zero call sites outside `genai.rs`'s own doc comment, and the only
+  `telemetry::` use in the whole oracle is `main.rs`'s `init_tracing`. That is
+  coherent for a *library*, where a downstream Rust consumer instruments its own
+  calls; it is not coherent for this port, which is a binary. If `src/` does not
+  create spans, nothing ever will: the exporter runs against a permanently empty
+  ring, `genai`'s fifteen attributes describe spans nobody constructs, and
+  `OTEL_EXPORTER_OTLP_ENDPOINT` becomes a setting that only changes the stderr
+  format — which looks like it works.
+
+  The exporter is reached through a **process global** set by `init_tracing`,
+  mirroring `tracing::subscriber::set_global_default`; threading a handle from
+  `main` down into `hoosh.cyr` would be larger and less faithful. Shutdown
+  clears it, so a span created during shutdown cannot enqueue into a stopped
+  exporter.
+
+  ⚠ **The first draft of the tool site turned a tool's `0` output into a
+  crash.** `agnosai_tool_output_success(0)` dereferences null, and the old code
+  passed 0 through harmlessly. Caught by an end-to-end run, not by review; the
+  null check now precedes the status read, and a 0 output records as an ERROR
+  span. Instrumenting a chokepoint must not change what the chokepoint does.
+
+  Also pinned: a *failing* tool records ERROR, not OK (a backend's error rate is
+  what an operator alerts on); a crew span closes on **every** exit including
+  the DAG-cycle error return, the same discipline the `crews_active` gauge
+  follows; a CANCELLED crew folds to ERROR rather than OK, because OTLP has two
+  states where the oracle's `CrewStatus` has three; and with telemetry off —
+  the common deployment — every call site still runs and is harmless.
+
+  `tests/telemetry_wiring.tcyr` is the only suite that proves any of this:
+  `telemetry_otlp` drives the ring directly and `telemetry_mod` drives the
+  formatter directly, and both stay green with every call site deleted.
+
 - **`telemetry/otlp`** — OTLP/HTTP+JSON span export: encoder, ring and
   background exporter. **115 assertions**, twelve mutation-verified.
   **No oracle module**: `rust-old` gets OTLP from
@@ -609,6 +649,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     produces.
 
 ### Changed
+
+- **`[deps.sakshi]` 2.4.8 → 2.4.10, and the JSON formatter consumes it.** The
+  gap this port filed upstream — `sakshi_log_kv` flattening `key=val` into the
+  message before the emit hook could see it — is fixed in sakshi 2.4.10, shipped
+  in the released cyrius 6.5.16, and now consumed. `./build/agnosai` emits
+  `"fields":{"message":"LLM client configured …","hoosh_url":"http://…"}` where
+  it previously emitted one flat string, which is what the Rust oracle's
+  subscriber produces.
+
+  ⚠ **Consuming it was mandatory, not optional**, and this is the change that
+  closes the long-running `lib/sakshi.cyr` snapshot mismatch. On 2.4.10 a hook
+  that ignores the new sixth argument does not merely fail to structure the
+  fields, it **drops them entirely** — verified against the real binary in both
+  directions. agnosai's own `[deps.sakshi]` pin wins over sigil's and majra's,
+  which are still on 2.4.8; that is exactly what the defensive pin was written
+  for.
+
+  ⚠ Field values are emitted as JSON **strings**. sakshi carries every value as
+  bytes with no type tag, so an integer field renders quoted where `tracing`
+  renders it bare. Sniffing digits would mis-type an id like `007`, so the
+  divergence is stated rather than guessed at.
+
+  The hook is now tested **end to end** through `sys_pipe` + `sys_dup2` — fd 2
+  redirected into a pipe, sakshi emitting through the installed hook, bytes read
+  back. That is the only thing that catches a hook ignoring the fields block: it
+  passes every formatter assertion and drops every field in production.
 
 - **Toolchain pinned to cyrius 6.5.16** (was 6.5.14, via 6.5.15). Three-step, `lib/` diffed
   after the sync AND after a build: 107 files synced, `lib/unicode/` untouched
