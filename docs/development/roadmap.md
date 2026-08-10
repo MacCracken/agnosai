@@ -585,12 +585,25 @@ pinned by an assertion so a later reader cannot "fix" it by accident.
   and `agnosai=<level>` are honoured; a multi-target `RUST_LOG` is refused
   outright rather than half-applied.
 
-- **OTLP export** — copy hoosh's proven `otlp.cyr` (199 lines, verified present
-  at `~/Repos/hoosh/src/lib/otlp.cyr`); the one place the remote seam does NOT
-  apply, since export is in-process. Thread-local trace context is **mandatory**
-  under `run_pooled`: sakshi's span stack and trace id are process globals.
-  `agnosai_telemetry_init_tracing` already branches on the endpoint and returns
-  the guard — the exporter is what goes behind that branch.
+- **OTLP export** — split in two. The **encoder** is ✅ **done 2026-08-09**
+  (`src/telemetry/otlp.cyr`, `tests/telemetry_otlp.tcyr`, 63 assertions): the
+  OTLP/JSON `Span` and `ResourceSpans` shapes, ids, attributes and endpoint
+  parsing, all pure functions so the wire format is testable byte-for-byte
+  without a collector.
+
+  Still owed: the **ring buffer, batch thread and POST**, behind the branch
+  `agnosai_telemetry_init_tracing` already takes. hoosh's `otlp.cyr` is the
+  model for all three (a 256-slot ring under a mutex, a detached thread
+  draining every 1000 ms, raw socket for `http://` and sandhi for `https://`).
+
+  ⚠ **Thread-local trace context is still the open question**, and it is now
+  the *only* hard one left here. sakshi's span stack and trace id are process
+  globals (`sakshi_trace_id_hi`/`_lo`), so under `run_pooled` two concurrent
+  requests share one trace id. The encoder sidesteps it by taking the identity
+  as an explicit `agnosai_otlp_ctx_new(...)` argument rather than reading the
+  global — so a span record can carry its own ids, captured at construction.
+  Whether that is sufficient, or whether sakshi needs a genuine thread-local,
+  is the decision the next bite has to make rather than assume.
 - **`genai.rs`** (206 lines) — ✅ **done 2026-08-09**
   (`src/telemetry/genai.cyr`, `tests/telemetry_genai.tcyr`, 64 assertions). It
   lives here, not in `llm`. `tracing::Span` became a held attribute record; the

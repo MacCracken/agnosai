@@ -1,0 +1,262 @@
+# =========================================================================
+# telemetry_otlp.tcyr — tests for src/telemetry/otlp.cyr
+#
+# No oracle test block: `rust-old` gets OTLP from an OpenTelemetry SDK, so what
+# must hold here is the **OTLP/JSON wire contract**, not a Rust function's
+# behaviour. That makes the byte layout the whole parity surface — a collector
+# accepts or silently drops a batch, and there is no local symptom either way.
+#
+# The two rules that bite, both asserted literally rather than by shape:
+#
+#   * **64-bit integers are STRINGS.** `"intValue":"42"` and
+#     `"startTimeUnixNano":"..."`. A bare number is valid JSON and invalid
+#     OTLP — the protobuf JSON mapping requires the quotes because IEEE-754
+#     doubles cannot hold the int64 range.
+#   * **Ids are fixed-width lowercase hex** — 32 for a trace id, 16 for a span
+#     id, zero-padded. The collector parses by length, so a short id is not a
+#     short id, it is a rejected span.
+#
+# Also pinned: absent attributes are OMITTED rather than sent as null (OTLP has
+# no null attribute value); the comma placement that omission has to get right;
+# `SpanKind` CLIENT for inference and INTERNAL for local work; and the all-zero
+# trace id, which `sakshi_trace_id_hi`/`_lo` answer with when nothing ever set
+# one and which the W3C spec declares invalid.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/telemetry/genai.cyr"
+include "src/telemetry/otlp.cyr"
+include "tests/test_helpers.cyr"
+
+# The hex rendering of a trace id, on its own.
+fn _t_trace_hex(hi, lo): i64 {
+    var sb = str_builder_new();
+    agnosai_otlp_add_trace_id(sb, hi, lo);
+    return str_builder_build(sb);
+}
+
+fn _t_span_hex(id): i64 {
+    var sb = str_builder_new();
+    agnosai_otlp_add_span_id(sb, id);
+    return str_builder_build(sb);
+}
+
+# A context with everything fixed, so encodings are byte-comparable.
+fn _t_ctx(): i64 {
+    return agnosai_otlp_ctx_new(0x0102030405060708, 0x090a0b0c0d0e0f10,
+    0x1122334455667788, 1000, 2000, AGNOSAI_OTLP_STATUS_OK);
+}
+
+# The byte-exact OTLP Span object for the tool-span fixture, assembled from
+# short pieces so the literal stays under 120 columns. The assembly is the
+# point: change any piece and the comparison fails.
+fn _t_expect_tool_span(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"traceId\":\"0102030405060708090a0b0c0d0e0f10\"");
+    str_builder_add_cstr(sb, ",\"spanId\":\"1122334455667788\"");
+    str_builder_add_cstr(sb, ",\"name\":\"gen_ai.execute_tool\",\"kind\":1");
+    str_builder_add_cstr(sb, ",\"startTimeUnixNano\":\"1000\"");
+    str_builder_add_cstr(sb, ",\"endTimeUnixNano\":\"2000\",\"attributes\":[");
+    str_builder_add_cstr(sb, "{\"key\":\"gen_ai.operation.name\"");
+    str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"execute_tool\"}},");
+    str_builder_add_cstr(sb, "{\"key\":\"gen_ai.agent.name\"");
+    str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"agent-a\"}},");
+    str_builder_add_cstr(sb, "{\"key\":\"agnosai.task.id\"");
+    str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"task-1\"}},");
+    str_builder_add_cstr(sb, "{\"key\":\"agnosai.tool.name\"");
+    str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"echo\"}}]");
+    str_builder_add_cstr(sb, ",\"status\":{\"code\":1}}");
+    return str_builder_build(sb);
+}
+
+fn main(): i64 {
+    # --- ids are fixed-width lowercase hex ------------------------------
+    assert(str_eq_cstr(_t_trace_hex(0x0102030405060708, 0x090a0b0c0d0e0f10),
+    "0102030405060708090a0b0c0d0e0f10") == 1, "a trace id is 32 lowercase hex, high half first");
+    assert_eq(str_len(_t_trace_hex(1, 1)), 32, "and always 32 digits");
+    assert(str_eq_cstr(_t_trace_hex(0, 1), "00000000000000000000000000000001") == 1,
+    "zero-padded — a small id is not a short id");
+    assert(str_eq_cstr(_t_trace_hex(0, 0), "00000000000000000000000000000000") == 1,
+    "the all-zero id renders in full");
+    assert(str_eq_cstr(_t_trace_hex(0 - 1, 0 - 1),
+    "ffffffffffffffffffffffffffffffff") == 1, "and the all-ones id is lowercase f, not F");
+
+    assert(str_eq_cstr(_t_span_hex(0x1122334455667788), "1122334455667788") == 1,
+    "a span id is 16 lowercase hex");
+    assert_eq(str_len(_t_span_hex(1)), 16, "always 16 digits");
+    assert(str_eq_cstr(_t_span_hex(0), "0000000000000000") == 1, "zero-padded too");
+    assert(str_eq_cstr(_t_span_hex(0xabcdef), "0000000000abcdef") == 1,
+    "with the digits right-aligned");
+
+    # ⚠ The all-zero trace id is INVALID per W3C, and it is exactly what
+    # sakshi answers before anything calls `sakshi_trace_set_128` — so an
+    # un-instrumented process would export batches every collector drops.
+    assert_eq(agnosai_otlp_trace_id_is_zero(0, 0), 1, "0/0 is the invalid all-zero id");
+    assert_eq(agnosai_otlp_trace_id_is_zero(0, 1), 0, "a low-half-only id is valid");
+    assert_eq(agnosai_otlp_trace_id_is_zero(1, 0), 0, "as is a high-half-only id");
+
+    # --- span kind -------------------------------------------------------
+    var inf = agnosai_genai_inference_span(str_from("llama3"), str_from("ollama"),
+    str_from("agent-a"), str_from("task-1"));
+    var tool = agnosai_genai_tool_span(str_from("echo"), str_from("agent-a"),
+    str_from("task-1"));
+    var crew = agnosai_genai_crew_span(str_from("crew-1"), str_from("c"), 3);
+    # ⚠ A backend's service-dependency graph is built from CLIENT/SERVER pairs,
+    # so a mislabelled inference span drops the edge to the model provider.
+    assert_eq(agnosai_otlp_span_kind(inf), AGNOSAI_OTLP_KIND_CLIENT,
+    "inference is CLIENT — it leaves the process");
+    assert_eq(agnosai_otlp_span_kind(tool), AGNOSAI_OTLP_KIND_INTERNAL,
+    "tool execution is INTERNAL");
+    assert_eq(agnosai_otlp_span_kind(crew), AGNOSAI_OTLP_KIND_INTERNAL, "and so is a crew run");
+    assert_eq(AGNOSAI_OTLP_KIND_CLIENT, 3, "CLIENT is the wire value 3");
+    assert_eq(AGNOSAI_OTLP_KIND_INTERNAL, 1, "and INTERNAL is 1");
+
+    # ⚠ UNSET is not OK. A collector reads UNSET as "no opinion" and OK as an
+    # explicit success assertion, so defaulting one to the other is a lie.
+    assert_eq(AGNOSAI_OTLP_STATUS_UNSET, 0, "UNSET is 0");
+    assert_eq(AGNOSAI_OTLP_STATUS_OK, 1, "OK is 1");
+    assert_eq(AGNOSAI_OTLP_STATUS_ERROR, 2, "ERROR is 2");
+
+    # --- a whole span, byte for byte -------------------------------------
+    # A tool span carries exactly three attributes, so this pins the full
+    # object including every separator.
+    var j = agnosai_otlp_span_json(tool, _t_ctx());
+    assert(str_eq(j, _t_expect_tool_span()) == 1,
+    "a tool span encodes byte-for-byte to the OTLP/JSON Span object");
+
+    # ⚠ The timestamps are QUOTED. This is the rule that fails silently.
+    assert_eq(str_contains_cstr(j, "\"startTimeUnixNano\":\"1000\""), 1,
+    "startTimeUnixNano is a STRING, not a number");
+    assert_eq(str_contains_cstr(j, "\"endTimeUnixNano\":\"2000\""), 1,
+    "and so is endTimeUnixNano");
+    assert_eq(str_contains_cstr(j, "UnixNano\":1000"), 0,
+    "the unquoted form appears nowhere");
+
+    # --- integer attributes are quoted too -------------------------------
+    agnosai_genai_record_usage(inf, 100, 50, str_from("llama3-instruct"));
+    var ji = agnosai_otlp_span_json(inf, _t_ctx());
+    assert_eq(str_contains_cstr(ji,
+    "{\"key\":\"gen_ai.usage.input_tokens\",\"value\":{\"intValue\":\"100\"}}"), 1,
+    "intValue is a STRING — a bare number is valid JSON and invalid OTLP");
+    assert_eq(str_contains_cstr(ji, "\"intValue\":100"), 0,
+    "the unquoted form appears nowhere");
+    assert_eq(str_contains_cstr(ji,
+    "{\"key\":\"gen_ai.usage.output_tokens\",\"value\":{\"intValue\":\"50\"}}"), 1,
+    "output tokens likewise");
+    assert_eq(str_contains_cstr(ji, "\"kind\":3"), 1,
+    "but `kind` IS a bare number — it is an enum, not an int64");
+    assert_eq(str_contains_cstr(ji, "\"code\":1"), 1, "and so is the status code");
+
+    # The responding model is carried, and differs from the requested one.
+    assert_eq(str_contains_cstr(ji, "\"gen_ai.response.model\""), 1,
+    "the response model is emitted once recorded");
+    assert_eq(str_contains_cstr(ji, "\"llama3-instruct\""), 1, "with its value");
+
+    # --- absent attributes are OMITTED, not null -------------------------
+    # OTLP has no null attribute value; a collector reading one drops the span.
+    var bare = agnosai_genai_inference_span(str_from("m"), str_from("s"), str_from("a"),
+    str_from("t"));
+    var jb = agnosai_otlp_span_json(bare, _t_ctx());
+    assert_eq(str_contains_cstr(jb, "null"), 0, "an unrecorded span emits no null anywhere");
+    assert_eq(str_contains_cstr(jb, "gen_ai.usage.input_tokens"), 0,
+    "an unset integer attribute is omitted entirely");
+    assert_eq(str_contains_cstr(jb, "gen_ai.response.model"), 0,
+    "as is an unset string attribute");
+    assert_eq(str_contains_cstr(jb, "agnosai.tool.name"), 0,
+    "and an attribute this span kind never carries");
+
+    # ⚠ Omission has to get the commas right. A span with ONE attribute must
+    # have no comma at all, and none may lead or trail the array.
+    var crew_only = agnosai_genai_crew_span(str_from("only"), str_from("n"), 0);
+    var jc = agnosai_otlp_span_json(crew_only, _t_ctx());
+    assert_eq(str_contains_cstr(jc, "[,"), 0, "no leading comma in the attribute array");
+    assert_eq(str_contains_cstr(jc, ",]"), 0, "no trailing comma");
+    assert_eq(str_contains_cstr(jc, ",,"), 0, "and no doubled comma from a skipped attribute");
+    # A crew span sets no operation name, so its FIRST emitted attribute is the
+    # crew id — the omission is at the front, which is where a naive
+    # "comma before every attribute but the first index" gets it wrong.
+    assert_eq(str_contains_cstr(jc,
+    "\"attributes\":[{\"key\":\"agnosai.crew.id\""), 1,
+    "the array opens on the first PRESENT attribute, not the first possible one");
+    assert_eq(str_contains_cstr(jc,
+    "{\"key\":\"agnosai.crew.task_count\",\"value\":{\"intValue\":\"0\"}}]"), 1,
+    "and closes on the last present one — a 0 task count is present, not unset");
+
+    # --- values are JSON-escaped -----------------------------------------
+    # Model and tool names are caller data. An unescaped quote does not corrupt
+    # one attribute, it corrupts the whole batch.
+    var evil = agnosai_genai_tool_span(str_from("say \"hi\""), str_from("a\\b"),
+    str_from("t"));
+    var je = agnosai_otlp_span_json(evil, _t_ctx());
+    assert_eq(str_contains_cstr(je, "\\\"hi\\\""), 1, "a quote in a value is escaped");
+    assert_eq(str_contains_cstr(je, "a\\\\b"), 1, "and a backslash is doubled");
+
+    # --- the batch envelope ----------------------------------------------
+    var frags = alloc(24);
+    store64(frags, agnosai_otlp_span_json(tool, _t_ctx()));
+    store64(frags + 8, agnosai_otlp_span_json(crew, _t_ctx()));
+    var batch = agnosai_otlp_build_batch(str_from("agnosai"), frags, 2);
+    assert_eq(str_contains_cstr(batch, "{\"resourceSpans\":[{\"resource\":{\"attributes\":["), 1,
+    "the batch opens with a resourceSpans envelope");
+    assert_eq(str_contains_cstr(batch,
+    "{\"key\":\"service.name\",\"value\":{\"stringValue\":\"agnosai\"}}]}"), 1,
+    "whose resource carries service.name — what a backend groups by");
+    assert_eq(str_contains_cstr(batch, "\"scopeSpans\":[{\"scope\":{\"name\":\"agnosai\"},\"spans\":["), 1,
+    "and the scope names the instrumentation");
+    assert_eq(str_contains_cstr(batch, "}},{\"traceId\":"), 1,
+    "the two spans are comma-separated");
+    assert_eq(str_contains_cstr(batch, "]}]}]}"), 1, "and the envelope closes");
+
+    # A single-span batch has no separator, and an empty one is still a valid
+    # document rather than a truncated one.
+    var one = agnosai_otlp_build_batch(str_from("agnosai"), frags, 1);
+    assert_eq(str_contains_cstr(one, "},{\"traceId\":"), 0, "one span means no separator");
+    var none = agnosai_otlp_build_batch(str_from("agnosai"), frags, 0);
+    assert_eq(str_contains_cstr(none, "\"spans\":[]}]}]}"), 1,
+    "an empty batch is a well-formed document with an empty span list");
+
+    # The service name is caller-supplied too, so it is escaped.
+    assert_eq(str_contains_cstr(agnosai_otlp_build_batch(str_from("a\"b"), frags, 0),
+    "\"stringValue\":\"a\\\"b\""), 1, "the service name is escaped");
+
+    # --- endpoint parsing -------------------------------------------------
+    assert(str_eq_cstr(str_from(agnosai_otlp_path("http://localhost:4318/v1/traces")),
+    "/v1/traces") == 1, "the path is taken from the URL");
+    assert(str_eq_cstr(str_from(agnosai_otlp_path("http://localhost:4318")),
+    "/v1/traces") == 1, "and defaults when the URL has none");
+    assert(str_eq_cstr(str_from(agnosai_otlp_path("http://host/custom/path")),
+    "/custom/path") == 1, "a non-default path is honoured");
+
+    # ⚠ The scheme decides where the scan starts. hoosh hardcodes 7 because it
+    # only ever sees `http://`; on an `https://` URL that lands on the second
+    # `/` of `//` and answers `/` — a POST to the collector root, which 404s.
+    assert(str_eq_cstr(str_from(agnosai_otlp_path("https://collector:4318/v1/traces")),
+    "/v1/traces") == 1, "an https URL's path is found, not the '//' of its scheme");
+    assert(str_eq_cstr(str_from(agnosai_otlp_path("https://collector:4318")),
+    "/v1/traces") == 1, "and an https URL with no path defaults");
+
+    assert_eq(agnosai_otlp_is_https("https://c:4318"), 1, "https is detected");
+    assert_eq(agnosai_otlp_is_https("http://c:4318"), 0, "http is not");
+    assert_eq(agnosai_otlp_is_https(0), 0, "a 0 endpoint is not https");
+    assert_eq(agnosai_otlp_is_https("https"), 0,
+    "and a truncated scheme is not — the check is 8 bytes, not 5");
+    assert_eq(agnosai_otlp_is_https("httpsX//c"), 0, "nor a lookalike");
+
+    # --- the context round-trips -----------------------------------------
+    assert_eq(agnosai_otlp_ctx_status(_t_ctx()), AGNOSAI_OTLP_STATUS_OK, "the status round-trips");
+    var errctx = agnosai_otlp_ctx_new(1, 2, 3, 10, 20, AGNOSAI_OTLP_STATUS_ERROR);
+    assert_eq(agnosai_otlp_ctx_status(errctx), AGNOSAI_OTLP_STATUS_ERROR, "as does an error one");
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(tool, errctx), "\"status\":{\"code\":2}"), 1,
+    "and it reaches the encoded span");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

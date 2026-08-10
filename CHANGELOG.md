@@ -96,6 +96,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`telemetry/otlp`** — OTLP/HTTP+JSON span encoding. **63 assertions**, six
+  mutation-verified. **No oracle module**: `rust-old` gets OTLP from
+  `hoosh::telemetry::init_otel`, an OpenTelemetry SDK behind a Rust crate, and
+  there is no Cyrius OTel SDK. The shape follows hoosh's own `src/lib/otlp.cyr`
+  — **the one place ADR 003's remote-HTTP seam does not apply**, because export
+  is in-process and there is nothing to call hoosh *for*. Copying its encoder is
+  not linking hoosh.
+
+  Encoding only; the ring buffer, batch thread and POST are the next bite. That
+  split is what makes the wire format testable byte-for-byte without a
+  collector — which matters because **a collector accepts or silently drops a
+  batch, with no local symptom either way**. So the byte layout is the parity
+  surface here, and it is asserted literally rather than by shape.
+
+  The two rules of the protobuf JSON mapping that bite, both silent failures:
+
+  - **64-bit integers are STRINGS** — `"intValue":"42"`, and every
+    `*TimeUnixNano`. IEEE-754 doubles cannot hold the int64 range, so a bare
+    number is valid JSON and invalid OTLP. `kind` and `status.code` are
+    genuinely bare numbers (enums, not int64), and that distinction is pinned
+    too.
+  - **Ids are fixed-width lowercase hex** — 32 for a trace id, 16 for a span
+    id, zero-padded. The collector parses by length.
+
+  ⚠ **hoosh's `_otlp_path` hardcodes offset 7** to skip `http://`. On an
+  `https://` URL that lands on the second `/` of `//` and answers `/` — a POST
+  to the collector root, which 404s. hoosh never hits it because that path only
+  ever sees `http://`; this port takes the offset from the scheme, and the
+  mutation reproducing hoosh's shape fails two assertions.
+
+  Also pinned: absent attributes are **omitted, not null** (OTLP has no null
+  attribute value and a collector reading one drops the span), including the
+  comma placement that omission has to get right when the *first* possible
+  attribute is the absent one; `SpanKind` CLIENT for inference and INTERNAL for
+  local work, because a backend's service-dependency graph is built from
+  CLIENT/SERVER pairs; and the all-zero trace id, which is what
+  `sakshi_trace_id_hi`/`_lo` answer before anything calls `sakshi_trace_set_128`
+  and which W3C declares invalid.
+
 - **`telemetry/genai`** — OpenTelemetry GenAI semantic-convention span helpers
   (v1.37+): the 15 attribute constants, `inference_span`, `tool_span`,
   `crew_span` and `record_usage`. **64 assertions**, all 7 oracle tests plus 57
@@ -532,14 +571,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Toolchain pinned to cyrius 6.5.15** (was 6.5.14). Three-step, `lib/` diffed
-  after the sync AND after a build: 107 files synced, 4 differ from the previous
-  snapshot (`sakshi`, and the three `syscalls_*` files), `lib/unicode/`
-  untouched as `lib sync --full` skips it, and no drift across an implicit
-  re-resolve.
+- **Toolchain pinned to cyrius 6.5.16** (was 6.5.14, via 6.5.15). Three-step, `lib/` diffed
+  after the sync AND after a build: 107 files synced, `lib/unicode/` untouched
+  as `lib sync --full` skips it, and no drift across an implicit re-resolve.
+  The 6.5.16 step moved `sakshi`, `sys` and two `syscalls_*` files.
 
-  ⚠ **`[deps.sakshi]`'s 2.4.8 tag is now the thing lagging.** The 6.5.15
-  snapshot ships sakshi 2.4.9 and the tag pin overlays 2.4.8 back over it on
+  ⚠ **`[deps.sakshi]`'s 2.4.8 tag is now the thing lagging.** The 6.5.16
+  snapshot ships a newer sakshi and the tag pin overlays 2.4.8 back over it on
   every resolve — the same silent-downgrade mechanism that comment was written
   to guard against, now pointing the other way. Deliberate for the moment:
   2.4.9 changes what `sakshi_log_kv` hands an emit hook, and this tree's

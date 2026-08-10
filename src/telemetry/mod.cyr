@@ -63,6 +63,10 @@
 # on nothing here, so it leads the single-pass include order too.
 include "src/telemetry/genai.cyr"
 
+# The OTLP encoder. No oracle module — see its header. It reads genai spans, so
+# it follows genai and precedes `init_tracing`, which will drive it.
+include "src/telemetry/otlp.cyr"
+
 # The oracle's `DEFAULT_SERVICE_NAME`.
 fn agnosai_telemetry_default_service_name(): i64 {
     return str_from("agnosai");
@@ -341,15 +345,11 @@ fn _agnosai_telemetry_write_u_escape(buf, pos, c): i64 {
     store8(buf + pos + 1, 117);
     store8(buf + pos + 2, 48);
     store8(buf + pos + 3, 48);
-    store8(buf + pos + 4, _agnosai_telemetry_hex_digit((c / 16) % 16));
-    store8(buf + pos + 5, _agnosai_telemetry_hex_digit(c % 16));
+    # `src/id.cyr`'s, not a second copy — `id` precedes `telemetry` in
+    # `src/main.cyr`, and lowercase is what `tracing` emits.
+    store8(buf + pos + 4, _agnosai_hex_digit((c / 16) % 16));
+    store8(buf + pos + 5, _agnosai_hex_digit(c % 16));
     return pos + 6;
-}
-
-# One lowercase hex digit for 0-15. `tracing`'s JSON escapes lowercase.
-fn _agnosai_telemetry_hex_digit(n): i64 {
-    if (n < 10) { return 48 + n; }
-    return 87 + n;
 }
 
 # Copy a NUL-free literal into `buf` at `pos`. Returns the new pos.

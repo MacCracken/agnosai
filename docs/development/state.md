@@ -163,7 +163,7 @@ the tree 2026-08-08 with `find src -maxdepth 1 -name '*.cyr'` per group:
 | `orchestrator/` | 16 | 5,632 | ✅ complete (M5) |
 | `server/` | 11 | 4,291 | ✅ complete (M6) |
 | `fleet/` | 12 | 3,676 | ✅ complete (M8) |
-| `telemetry/` | 2 | 751 | M9 — `mod` + `genai` done; only the OTLP exporter body owed |
+| `telemetry/` | 3 | 1,029 | M9 — `mod` + `genai` + the OTLP encoder; only the ring/thread/POST owed |
 | `sandbox/` | 9 | 3,345 | ✅ complete (M7) |
 | `core/` | 8 | 3,305 | ✅ complete (M2) |
 | `server/routes/` | 10 | 2,686 | ✅ complete (M6) |
@@ -172,7 +172,7 @@ the tree 2026-08-08 with `find src -maxdepth 1 -name '*.cyr'` per group:
 | `tools/` | 5 | 1,144 | ✅ complete (M4) |
 | `learning/` | 6 | 1,018 | ✅ complete (M2) |
 | root (port-local) | 6 | 1,054 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
-| **total** | **96** | **30,305** | against a **41,163**-line oracle |
+| **total** | **97** | **30,583** | against a **41,163**-line oracle |
 
 Regenerate with:
 

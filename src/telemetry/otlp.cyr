@@ -1,0 +1,278 @@
+# =========================================================================
+# telemetry/otlp — OTLP/HTTP+JSON span encoding.
+#
+# No oracle module. `rust-old` gets OTLP from `hoosh::telemetry::init_otel`,
+# which is an OpenTelemetry SDK behind a Rust crate; there is no Cyrius OTel
+# SDK, so the encoding is written here. The shape follows hoosh's own
+# `src/lib/otlp.cyr` (199 lines), which solved the same problem for the same
+# collector — **this is the one place ADR 003's remote-HTTP seam does not
+# apply**, because export is in-process and there is nothing to call hoosh
+# *for*. Copying its proven encoder is not linking hoosh.
+#
+# ## Why JSON and not protobuf
+#
+# OTLP defines both. protobuf needs a wire-format library Cyrius does not have;
+# OTLP/HTTP+JSON is a first-class transport that every collector accepts, and it
+# is `str_builder` all the way down. hoosh made the same call for the same
+# reason.
+#
+# ## The JSON mapping is NOT "just JSON"
+#
+# Two rules bite, and both are silent failures rather than errors:
+#
+# * **64-bit integers are encoded as STRINGS.** `"intValue":"42"`, not `42`, and
+#   likewise every `*TimeUnixNano`. The protobuf JSON mapping requires it
+#   because IEEE-754 doubles cannot hold the full int64 range, and a collector
+#   fed a bare number either rejects the batch or silently truncates past 2^53.
+# * **Ids are lowercase hex of a FIXED width** — 32 for a trace id, 16 for a
+#   span id, zero-padded. A short id is not "close enough": the collector parses
+#   by length.
+#
+# ## This module encodes only
+#
+# The ring buffer, the batch thread and the POST are the next bite. Everything
+# here is a pure function over a span record, which is what makes the wire
+# format testable byte-for-byte without a collector.
+# =========================================================================
+
+# The default path when the endpoint carries none, per the OTLP/HTTP spec.
+var AGNOSAI_OTLP_DEFAULT_PATH = "/v1/traces";
+
+# OTel `SpanKind`. INTERNAL is 1 and CLIENT is 3 — the numbers are the wire
+# values, not an ordering.
+enum AgnosaiOtlpSpanKind {
+    AGNOSAI_OTLP_KIND_UNSPECIFIED = 0;
+    AGNOSAI_OTLP_KIND_INTERNAL = 1;
+    AGNOSAI_OTLP_KIND_SERVER = 2;
+    AGNOSAI_OTLP_KIND_CLIENT = 3;
+    AGNOSAI_OTLP_KIND_PRODUCER = 4;
+    AGNOSAI_OTLP_KIND_CONSUMER = 5;
+}
+
+# OTel `Status.code`. ⚠ UNSET is 0 and is NOT the same as OK — a collector
+# treats UNSET as "no opinion" and OK as an explicit success assertion.
+enum AgnosaiOtlpStatusCode {
+    AGNOSAI_OTLP_STATUS_UNSET = 0;
+    AGNOSAI_OTLP_STATUS_OK = 1;
+    AGNOSAI_OTLP_STATUS_ERROR = 2;
+}
+
+# Export context heap layout — 48 bytes. The identity and timing a span record
+# does not carry: the exporter supplies them at enqueue time.
+enum AgnosaiOtlpCtxOff {
+    AGN_OTC_TRACE_HI = 0;
+    AGN_OTC_TRACE_LO = 8;
+    AGN_OTC_SPAN_ID = 16;
+    AGN_OTC_START_NS = 24;
+    AGN_OTC_END_NS = 32;
+    AGN_OTC_STATUS = 40;
+    AGN_OTC_SIZE = 48;
+}
+
+# The identity and timing for one exported span.
+#
+# `trace_hi`/`trace_lo` are the two halves of the W3C 128-bit trace id, which is
+# exactly what `sakshi_trace_id_hi` / `_lo` hold.
+fn agnosai_otlp_ctx_new(trace_hi, trace_lo, span_id, start_ns, end_ns, status): i64 {
+    var c = alloc(AGN_OTC_SIZE);
+    store64(c + AGN_OTC_TRACE_HI, trace_hi);
+    store64(c + AGN_OTC_TRACE_LO, trace_lo);
+    store64(c + AGN_OTC_SPAN_ID, span_id);
+    store64(c + AGN_OTC_START_NS, start_ns);
+    store64(c + AGN_OTC_END_NS, end_ns);
+    store64(c + AGN_OTC_STATUS, status);
+    return c;
+}
+
+# The context's status code.
+fn agnosai_otlp_ctx_status(c): i64 {
+    return load64(c + AGN_OTC_STATUS);
+}
+
+# Whether a trace id is the all-zero id, which the W3C spec declares INVALID.
+#
+# Worth its own check because `sakshi_trace_id_hi`/`_lo` answer 0/0 when nothing
+# ever called `sakshi_trace_set_128` — so an un-instrumented process would
+# otherwise export a batch every collector drops, with no local symptom.
+fn agnosai_otlp_trace_id_is_zero(hi, lo): i64 {
+    if (hi != 0) { return 0; }
+    if (lo != 0) { return 0; }
+    return 1;
+}
+
+# --- hex ------------------------------------------------------------------
+
+# Append `n` as exactly `width` lowercase hex digits, most significant first.
+#
+# ⚠ Zero-padded and fixed-width: the collector parses ids by length, so a
+# 15-digit span id is not a span id. `_agnosai_hex_digit` is `src/id.cyr`'s —
+# `id` precedes `telemetry` in `src/main.cyr`, so this is a reuse, not a copy.
+fn _agnosai_otlp_add_hex(sb, n, width): i64 {
+    for (var i = width - 1; i >= 0; i = i - 1) {
+        str_builder_putc(sb, _agnosai_hex_digit((n >> (i * 4)) & 15));
+    }
+    return 0;
+}
+
+# Append a W3C trace id: 32 lowercase hex digits, high half first.
+fn agnosai_otlp_add_trace_id(sb, hi, lo): i64 {
+    _agnosai_otlp_add_hex(sb, hi, 16);
+    _agnosai_otlp_add_hex(sb, lo, 16);
+    return 0;
+}
+
+# Append a span id: 16 lowercase hex digits.
+fn agnosai_otlp_add_span_id(sb, id): i64 {
+    _agnosai_otlp_add_hex(sb, id, 16);
+    return 0;
+}
+
+# --- attributes -----------------------------------------------------------
+
+# One string attribute: `{"key":"k","value":{"stringValue":"v"}}`.
+#
+# The value goes through `str_builder_add_json_str` (`lib/str.cyr:114`), which
+# emits its own quotes and escapes — a model name or tool name is caller data
+# and can carry a quote or a control byte.
+fn _agnosai_otlp_attr_str(sb, k, v: Str): i64 {
+    str_builder_add_cstr(sb, "{\"key\":\"");
+    str_builder_add_cstr(sb, k);
+    str_builder_add_cstr(sb, "\",\"value\":{\"stringValue\":");
+    str_builder_add_json_str(sb, v);
+    str_builder_add_cstr(sb, "}}");
+    return 0;
+}
+
+# One integer attribute: `{"key":"k","value":{"intValue":"42"}}`.
+#
+# ⚠ The value is QUOTED. See the module header — a bare number is the silent
+# failure the JSON mapping exists to prevent.
+fn _agnosai_otlp_attr_int(sb, k, v): i64 {
+    str_builder_add_cstr(sb, "{\"key\":\"");
+    str_builder_add_cstr(sb, k);
+    str_builder_add_cstr(sb, "\",\"value\":{\"intValue\":\"");
+    str_builder_add_int(sb, v);
+    str_builder_add_cstr(sb, "\"}}");
+    return 0;
+}
+
+# Append one string attribute from the span, with a leading comma when anything
+# has already been written. Returns the updated "have written one" flag.
+fn _agnosai_otlp_emit_str(sb, span, key, wrote): i64 {
+    var v = agnosai_genai_span_attr_str(span, key);
+    if (v == 0) { return wrote; }
+    if (wrote == 1) { str_builder_add_cstr(sb, ","); }
+    _agnosai_otlp_attr_str(sb, key, v);
+    return 1;
+}
+
+# The same for an integer attribute. -1 means unset and emits nothing.
+fn _agnosai_otlp_emit_int(sb, span, key, wrote): i64 {
+    var v = agnosai_genai_span_attr_int(span, key);
+    if (v < 0) { return wrote; }
+    if (wrote == 1) { str_builder_add_cstr(sb, ","); }
+    _agnosai_otlp_attr_int(sb, key, v);
+    return 1;
+}
+
+# --- span kind ------------------------------------------------------------
+
+# The OTel `SpanKind` for a genai span, from its name.
+#
+# An inference call leaves the process for a model provider, so it is CLIENT;
+# a tool execution and a crew run are local work, so INTERNAL. ⚠ Getting this
+# wrong is not cosmetic — a backend's service-dependency graph is built from
+# CLIENT/SERVER pairs, so a mislabelled inference span drops the provider edge.
+fn agnosai_otlp_span_kind(span): i64 {
+    var n = agnosai_genai_span_name(span);
+    if (streq(n, AGNOSAI_GENAI_SPAN_INVOKE_AGENT) == 1) { return AGNOSAI_OTLP_KIND_CLIENT; }
+    return AGNOSAI_OTLP_KIND_INTERNAL;
+}
+
+# --- encoding -------------------------------------------------------------
+
+# Encode one genai span as an OTLP/JSON `Span` object.
+#
+# Only attributes the span actually carries are emitted — an absent attribute is
+# omitted rather than sent as null, because OTLP has no null attribute value and
+# a collector reading one drops the whole span.
+fn agnosai_otlp_span_json(span, ctx): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"traceId\":\"");
+    agnosai_otlp_add_trace_id(sb, load64(ctx + AGN_OTC_TRACE_HI),
+    load64(ctx + AGN_OTC_TRACE_LO));
+    str_builder_add_cstr(sb, "\",\"spanId\":\"");
+    agnosai_otlp_add_span_id(sb, load64(ctx + AGN_OTC_SPAN_ID));
+    str_builder_add_cstr(sb, "\",\"name\":");
+    str_builder_add_json_str(sb, str_from(agnosai_genai_span_name(span)));
+    str_builder_add_cstr(sb, ",\"kind\":");
+    str_builder_add_int(sb, agnosai_otlp_span_kind(span));
+    str_builder_add_cstr(sb, ",\"startTimeUnixNano\":\"");
+    str_builder_add_int(sb, load64(ctx + AGN_OTC_START_NS));
+    str_builder_add_cstr(sb, "\",\"endTimeUnixNano\":\"");
+    str_builder_add_int(sb, load64(ctx + AGN_OTC_END_NS));
+    str_builder_add_cstr(sb, "\",\"attributes\":[");
+
+    var wrote = 0;
+    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_OPERATION_NAME, wrote);
+    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_SYSTEM, wrote);
+    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_REQUEST_MODEL, wrote);
+    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_RESPONSE_MODEL, wrote);
+    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_AGENT_NAME, wrote);
+    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_TASK_ID, wrote);
+    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_TOOL_NAME, wrote);
+    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_CREW_ID, wrote);
+    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_CREW_NAME, wrote);
+    wrote = _agnosai_otlp_emit_int(sb, span, AGNOSAI_GENAI_USAGE_INPUT_TOKENS, wrote);
+    wrote = _agnosai_otlp_emit_int(sb, span, AGNOSAI_GENAI_USAGE_OUTPUT_TOKENS, wrote);
+    wrote = _agnosai_otlp_emit_int(sb, span, AGNOSAI_GENAI_CREW_TASK_COUNT, wrote);
+
+    str_builder_add_cstr(sb, "],\"status\":{\"code\":");
+    str_builder_add_int(sb, load64(ctx + AGN_OTC_STATUS));
+    str_builder_add_cstr(sb, "}}");
+    return str_builder_build(sb);
+}
+
+# Wrap `n` encoded spans (oldest first) in an OTLP `ResourceSpans` document.
+#
+# `frags` is an array of `n` Str pointers. The `service.name` resource attribute
+# is what a backend groups by, so it is the one attribute the resource carries.
+fn agnosai_otlp_build_batch(service_name: Str, frags, n): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"resourceSpans\":[{\"resource\":{\"attributes\":[");
+    _agnosai_otlp_attr_str(sb, "service.name", service_name);
+    str_builder_add_cstr(sb, "]},\"scopeSpans\":[{\"scope\":{\"name\":\"agnosai\"},\"spans\":[");
+    for (var i = 0; i < n; i = i + 1) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        str_builder_add(sb, load64(frags + i * 8));
+    }
+    str_builder_add_cstr(sb, "]}]}]}");
+    return str_builder_build(sb);
+}
+
+# --- endpoint parsing -----------------------------------------------------
+
+# Whether the endpoint is an `https://` collector.
+fn agnosai_otlp_is_https(url): i64 {
+    if (url == 0) { return 0; }
+    if (strlen(url) < 8) { return 0; }
+    return memeq(url, "https://", 8);
+}
+
+# The path component of `http://host:port/path`, or `/v1/traces` when the URL
+# carries none.
+#
+# ⚠ The scan starts after the scheme so the `//` in `http://` cannot be mistaken
+# for the path. hoosh hardcodes 7 because it only ever sees `http://`; an
+# `https://` URL is one longer, and starting at 7 would land on the second `/`
+# of `//` and answer `/` — a POST to the collector's root, which 404s. So the
+# offset comes from the scheme.
+fn agnosai_otlp_path(url): i64 {
+    var i = 7;
+    if (agnosai_otlp_is_https(url) == 1) { i = 8; }
+    while (load8(url + i) != 0) {
+        if (load8(url + i) == 47) { return url + i; }
+        i = i + 1;
+    }
+    return AGNOSAI_OTLP_DEFAULT_PATH;
+}
