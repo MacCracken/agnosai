@@ -452,7 +452,9 @@ enum AgnosaiTracingGuardOff {
     # 1 when OTLP export is running, the oracle's `Some(OtelGuard)`.
     AGN_TG_OTEL = 0;
     AGN_TG_SERVICE_NAME = 8;
-    AGN_TG_SIZE = 16;
+    # The live exporter, or 0. The oracle's `OtelGuard` itself.
+    AGN_TG_EXPORTER = 16;
+    AGN_TG_SIZE = 24;
 }
 
 # Whether this guard holds a live OTLP exporter.
@@ -484,6 +486,7 @@ fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
 
     var g = alloc(AGN_TG_SIZE);
     store64(g + AGN_TG_SERVICE_NAME, service_name);
+    store64(g + AGN_TG_EXPORTER, 0);
 
     if (otlp_endpoint == 0) {
         agnosai_telemetry_init_json_logging();
@@ -493,15 +496,32 @@ fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
 
     # Text stderr, as the oracle's OTLP branch uses.
     sakshi_clear_emit_hook();
+    var exporter = agnosai_otlp_exporter_new(otlp_endpoint, service_name,
+    AGNOSAI_OTLP_BATCH_MS);
+    agnosai_otlp_exporter_start(exporter);
+    store64(g + AGN_TG_EXPORTER, exporter);
     store64(g + AGN_TG_OTEL, 1);
     sakshi_info("OpenTelemetry OTLP export initialised", 37);
     return g;
+}
+
+# The guard's live exporter, or 0 when OTLP is off. This is what a caller
+# enqueues spans into — `agnosai_otlp_exporter_ring(..)` gives it the ring.
+fn agnosai_tracing_guard_exporter(g): i64 {
+    return load64(g + AGN_TG_EXPORTER);
 }
 
 # Flush and stop the exporter. The oracle's `Drop`, which Cyrius has no
 # equivalent for, so the caller runs it — `main` does, on the shutdown path.
 fn agnosai_telemetry_shutdown(g): i64 {
     if (load64(g + AGN_TG_OTEL) == 0) { return 0; }
+    var e = load64(g + AGN_TG_EXPORTER);
+    # ⚠ Stop BEFORE clearing the flag, so the final flush actually runs. The
+    # oracle's guard flushes pending spans on drop; the last interval's batch is
+    # the one most likely to explain the shutdown, and losing it is the whole
+    # reason `Drop` exists there.
+    if (e != 0) { agnosai_otlp_exporter_stop(e); }
     store64(g + AGN_TG_OTEL, 0);
+    store64(g + AGN_TG_EXPORTER, 0);
     return 0;
 }

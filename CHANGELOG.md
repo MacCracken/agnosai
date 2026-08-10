@@ -96,19 +96,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`telemetry/otlp`** — OTLP/HTTP+JSON span encoding. **63 assertions**, six
-  mutation-verified. **No oracle module**: `rust-old` gets OTLP from
+- **`telemetry/otlp`** — OTLP/HTTP+JSON span export: encoder, ring and
+  background exporter. **115 assertions**, twelve mutation-verified.
+  **No oracle module**: `rust-old` gets OTLP from
   `hoosh::telemetry::init_otel`, an OpenTelemetry SDK behind a Rust crate, and
   there is no Cyrius OTel SDK. The shape follows hoosh's own `src/lib/otlp.cyr`
   — **the one place ADR 003's remote-HTTP seam does not apply**, because export
   is in-process and there is nothing to call hoosh *for*. Copying its encoder is
   not linking hoosh.
 
-  Encoding only; the ring buffer, batch thread and POST are the next bite. That
-  split is what makes the wire format testable byte-for-byte without a
-  collector — which matters because **a collector accepts or silently drops a
-  batch, with no local symptom either way**. So the byte layout is the parity
-  surface here, and it is asserted literally rather than by shape.
+  Encoder, ring and exporter. The encoder is split from everything else so the
+  wire format is testable byte-for-byte without a collector — which matters
+  because **a collector accepts or silently drops a batch, with no local symptom
+  either way**. So the byte layout is the parity surface, asserted literally
+  rather than by shape.
 
   The two rules of the protobuf JSON mapping that bite, both silent failures:
 
@@ -125,6 +126,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the collector root, which 404s. hoosh never hits it because that path only
   ever sees `http://`; this port takes the offset from the scheme, and the
   mutation reproducing hoosh's shape fails two assertions.
+
+  **The ring keeps two arenas.** Every span fragment is a fresh allocation and
+  the default allocator never frees — ten spans a second is ~14 MB an hour that
+  never comes back, which hoosh accepts and this port's own "thread the `_a`
+  variants" principle does not. Fragments live in an arena written only under
+  the ring lock and reset by `drain`; the batch document lives in an arena
+  private to the draining thread and reset at the top of each drain, which makes
+  the lifetime rule one sentence — *a document is valid until the next drain*,
+  exactly the POST window.
+
+  ⚠ **Overflow is counted.** hoosh's ring overwrites the oldest span and counts
+  nothing, so loss is invisible. This one keeps the same drop-oldest policy (a
+  full ring means the exporter is behind, and the newest spans are the ones
+  being looked at) but reports the count, per the port's no-silent-truncation
+  rule.
+
+  **Identity is the caller's, never sakshi's** — the decision this bite owed.
+  sakshi's trace id is a process global, so under `run_pooled` two concurrent
+  requests share one and the traces interleave into nonsense. Rather than paper
+  over it, the export path never reads sakshi's trace context: `enqueue` takes
+  an explicit context and correlation is the caller's job. Reentrant by
+  construction, no upstream change, honest about where the responsibility sits.
+  A real OTel library would supply the thread-local; see the roadmap note.
+
+  ⚠ **The exporter's sleep is sliced, and that was a measured bug, not a
+  precaution.** One `sleep_ms(interval)` means `stop` goes unnoticed for up to a
+  full second — and because `syscall(60, ..)` exits one *thread*, a detached
+  exporter still sleeping holds the whole process open. `tests/telemetry_mod.tcyr`
+  took **1004 ms**; sliced at 25 ms it takes **26 ms**, and a SIGTERM shutdown
+  loses its one-second tail. Found because a mutation of `shutdown` hung instead
+  of failing.
+
+  Two smaller deliberate calls: the POST goes through `sandhi_http_post` for both
+  schemes rather than hoosh's raw socket for `http://` (hoosh needs that because
+  its exporter thread owns no sigil crypto bank; agnosai does not), and the SSRF
+  guard is **deliberately not applied** — the endpoint is operator configuration
+  and the standard deployment is a `localhost` sidecar, which the guard blocks by
+  design.
 
   Also pinned: absent attributes are **omitted, not null** (OTLP has no null
   attribute value and a collector reading one drops the span), including the

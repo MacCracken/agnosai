@@ -92,10 +92,22 @@ fn main(): i64 {
     assert_eq(agnosai_telemetry_shutdown(g), 0, "shutting it down is a no-op");
 
     # --- past the oracle: the OTLP guard ---------------------------------
+    assert_eq(agnosai_tracing_guard_exporter(g), 0,
+    "with no endpoint the guard holds NO exporter");
+
     var g2 = agnosai_telemetry_init_tracing(str_from("http://localhost:4317"));
     assert_eq(agnosai_tracing_guard_otel_active(g2), 1, "an endpoint yields a live exporter");
     assert(agnosai_tracing_guard_service_name(g2) != 0, "carrying a service name");
+    var gex = agnosai_tracing_guard_exporter(g2);
+    assert(gex != 0, "the guard owns the exporter — the oracle's OtelGuard");
+    assert_eq(agnosai_otlp_exporter_stopping(gex), 0, "which starts out running");
+
+    # ⚠ Shutdown must STOP the exporter, not just clear a flag. The oracle's
+    # `TracingGuard` flushes pending spans when it drops; the last interval's
+    # batch is the one most likely to explain why the process is stopping.
     agnosai_telemetry_shutdown(g2);
+    assert_eq(agnosai_otlp_exporter_stopping(gex), 1, "and shutdown stops it");
+    assert_eq(agnosai_tracing_guard_exporter(g2), 0, "releasing it from the guard");
     assert_eq(agnosai_tracing_guard_otel_active(g2), 0, "which shutdown releases");
     assert_eq(agnosai_telemetry_shutdown(g2), 0, "and a second shutdown is a no-op");
 

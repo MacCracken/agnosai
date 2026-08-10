@@ -208,6 +208,16 @@ fn agnosai_otlp_span_kind(span): i64 {
 # a collector reading one drops the whole span.
 fn agnosai_otlp_span_json(span, ctx): i64 {
     var sb = str_builder_new();
+    _agnosai_otlp_span_json_into(sb, span, ctx);
+    return str_builder_build(sb);
+}
+
+# The body of `agnosai_otlp_span_json`, writing into a caller-supplied builder.
+#
+# Split out so the ring can encode straight into its fragment arena — the
+# convenience wrapper above allocates on the global, which is exactly what the
+# ring exists to avoid.
+fn _agnosai_otlp_span_json_into(sb, span, ctx): i64 {
     str_builder_add_cstr(sb, "{\"traceId\":\"");
     agnosai_otlp_add_trace_id(sb, load64(ctx + AGN_OTC_TRACE_HI),
     load64(ctx + AGN_OTC_TRACE_LO));
@@ -240,7 +250,7 @@ fn agnosai_otlp_span_json(span, ctx): i64 {
     str_builder_add_cstr(sb, "],\"status\":{\"code\":");
     str_builder_add_int(sb, load64(ctx + AGN_OTC_STATUS));
     str_builder_add_cstr(sb, "}}");
-    return str_builder_build(sb);
+    return 0;
 }
 
 # Wrap `n` encoded spans (oldest first) in an OTLP `ResourceSpans` document.
@@ -285,4 +295,353 @@ fn agnosai_otlp_path(url): i64 {
         i = i + 1;
     }
     return AGNOSAI_OTLP_DEFAULT_PATH;
+}
+
+# --- the export ring ------------------------------------------------------
+#
+# ## Identity is the CALLER's, never sakshi's
+#
+# The decision this bite owed. sakshi's trace id and span stack are process
+# globals (`sakshi_trace_id_hi` / `_lo`), so under `sandhi_server_run_pooled`
+# two concurrent requests share one trace id and the traces interleave into
+# nonsense. There is no thread-local to reach for — that is the gap the roadmap
+# note asks a real OTel library to close.
+#
+# So **the export path never reads sakshi's trace context at all.** `enqueue`
+# takes an `agnosai_otlp_ctx_new(..)` the caller built, and correlation is the
+# caller's job: mint one trace id per request (`agnosai_uuid_v4` is already a
+# random 128-bit value) and pass it into every span's context. That is
+# reentrant by construction, needs no upstream change, and is honest about
+# where the responsibility sits.
+#
+# ## Two arenas, with single-owner rules
+#
+# Every span fragment is a fresh allocation, and the default allocator never
+# frees — at ten spans a second that is ~14 MB an hour that never comes back.
+# hoosh accepts this; agnosai's own principle ("thread the `_a` variants") does
+# not. So:
+#
+# * **`frag_arena`** holds the encoded fragments and is written **only under the
+#   ring lock** — by `enqueue` on worker threads and by nothing else. `drain`
+#   resets it while still holding the lock, so a fragment never outlives the
+#   batch that carried it.
+# * **`doc_arena`** holds the batch document and is **private to the draining
+#   thread**. It is reset at the top of each drain, which makes the lifetime
+#   rule a single sentence: *a batch document is valid until the next drain*.
+#   That is exactly the POST window.
+#
+# Encoding happens inside the critical section. It is pure string work with no
+# I/O, and doing it there is what lets the fragment arena be reset safely.
+
+# Ring capacity. hoosh uses the same 256 — a second of spans at any rate a
+# single process can actually produce.
+var AGNOSAI_OTLP_RING_MAX = 256;
+
+# Per-arena capacity in bytes. A batch of 256 spans at ~400 bytes each is
+# ~100 KB; 256 KiB leaves room for outliers before the spill policy engages.
+var AGNOSAI_OTLP_ARENA_BYTES = 262144;
+
+# Ring heap layout — 56 bytes.
+enum AgnosaiOtlpRingOff {
+    AGN_OTR_SLOTS = 0;
+    AGN_OTR_HEAD = 8;
+    AGN_OTR_COUNT = 16;
+    # Spans discarded because the ring was full. Never silently zero — see
+    # `agnosai_otlp_ring_dropped`.
+    AGN_OTR_DROPPED = 24;
+    AGN_OTR_LOCK = 32;
+    AGN_OTR_FRAG_ARENA = 40;
+    AGN_OTR_DOC_ARENA = 48;
+    AGN_OTR_SIZE = 56;
+}
+
+# How many spans the ring holds before it starts dropping.
+fn agnosai_otlp_ring_capacity(): i64 {
+    return AGNOSAI_OTLP_RING_MAX;
+}
+
+# A new export ring with its lock and both arenas.
+#
+# Both arenas are `ARENA_FULL_SPILL`: an oversized batch is served from the
+# global allocator rather than returning 0, because a dropped *allocation*
+# inside the encoder would produce a truncated JSON document — malformed output
+# is worse than an unbounded byte.
+fn agnosai_otlp_ring_new(): i64 {
+    var r = alloc(AGN_OTR_SIZE);
+    var slots = alloc(AGNOSAI_OTLP_RING_MAX * 8);
+    for (var i = 0; i < AGNOSAI_OTLP_RING_MAX; i = i + 1) { store64(slots + i * 8, 0); }
+    store64(r + AGN_OTR_SLOTS, slots);
+    store64(r + AGN_OTR_HEAD, 0);
+    store64(r + AGN_OTR_COUNT, 0);
+    store64(r + AGN_OTR_DROPPED, 0);
+    store64(r + AGN_OTR_LOCK, mutex_new());
+    var fa = arena_allocator(AGNOSAI_OTLP_ARENA_BYTES);
+    arena_allocator_set_on_full(fa, ARENA_FULL_SPILL);
+    store64(r + AGN_OTR_FRAG_ARENA, fa);
+    var da = arena_allocator(AGNOSAI_OTLP_ARENA_BYTES);
+    arena_allocator_set_on_full(da, ARENA_FULL_SPILL);
+    store64(r + AGN_OTR_DOC_ARENA, da);
+    return r;
+}
+
+# Spans currently waiting to be exported.
+fn agnosai_otlp_ring_count(r): i64 {
+    return load64(r + AGN_OTR_COUNT);
+}
+
+# The arena holding encoded fragments. Written only under the ring lock.
+#
+# Exposed because the separation from `doc_arena` is a **correctness property,
+# not an implementation detail**: if the two were the same allocator, `drain`
+# would reset the arena holding the fragments it is about to read.
+#
+# ⚠ Arena lifetime bugs are **not observable by assertion** in a bump allocator
+# — a reset rewinds an offset and leaves the bytes intact, so use-after-reset
+# reads correct data in a single-threaded test. The accessor pins that two
+# arenas exist; that enqueue targets the right one is correct by construction
+# only. Recorded in `roadmap.md` section E.
+fn agnosai_otlp_ring_frag_arena(r): i64 {
+    return load64(r + AGN_OTR_FRAG_ARENA);
+}
+
+# The arena holding the batch document. Private to the draining thread.
+fn agnosai_otlp_ring_doc_arena(r): i64 {
+    return load64(r + AGN_OTR_DOC_ARENA);
+}
+
+# Spans discarded because the ring was full, cumulative.
+#
+# ⚠ hoosh's ring drops the oldest and counts nothing, so loss is invisible. The
+# port's standing rule is no silent truncation: this is the number an operator
+# checks when a trace has holes in it.
+fn agnosai_otlp_ring_dropped(r): i64 {
+    return load64(r + AGN_OTR_DROPPED);
+}
+
+# Encode `span` under `ctx` and queue it. Returns 1 when queued, 0 when the ring
+# was full and the OLDEST span was discarded to make room.
+#
+# ⚠ Drop-oldest, not drop-newest: a full ring means the exporter is behind, and
+# the newest spans are the ones an operator is looking at. Matches hoosh.
+fn agnosai_otlp_ring_enqueue(r, span, ctx): i64 {
+    var lock = load64(r + AGN_OTR_LOCK);
+    mutex_lock(lock);
+
+    var sb = str_builder_new_a(load64(r + AGN_OTR_FRAG_ARENA));
+    _agnosai_otlp_span_json_into(sb, span, ctx);
+    var frag = str_builder_build(sb);
+
+    var head = load64(r + AGN_OTR_HEAD);
+    store64(load64(r + AGN_OTR_SLOTS) + (head % AGNOSAI_OTLP_RING_MAX) * 8, frag);
+    store64(r + AGN_OTR_HEAD, head + 1);
+
+    var count = load64(r + AGN_OTR_COUNT);
+    var queued = 1;
+    if (count >= AGNOSAI_OTLP_RING_MAX) {
+        store64(r + AGN_OTR_DROPPED, load64(r + AGN_OTR_DROPPED) + 1);
+        queued = 0;
+    } else {
+        store64(r + AGN_OTR_COUNT, count + 1);
+    }
+    mutex_unlock(lock);
+    return queued;
+}
+
+# Drain everything queued into one OTLP batch document, or 0 when empty.
+#
+# The returned Str lives in the ring's `doc_arena` and is **valid until the next
+# drain** — POST it before draining again. See the header.
+fn agnosai_otlp_ring_drain(r, service_name: Str): i64 {
+    var lock = load64(r + AGN_OTR_LOCK);
+    mutex_lock(lock);
+    var n = load64(r + AGN_OTR_COUNT);
+    if (n == 0) {
+        mutex_unlock(lock);
+        return 0;
+    }
+
+    # Oldest first. `head` has already advanced past the newest, so the oldest
+    # live slot is `head - n`.
+    var head = load64(r + AGN_OTR_HEAD);
+    var slots = load64(r + AGN_OTR_SLOTS);
+    var doc_arena = load64(r + AGN_OTR_DOC_ARENA);
+    reset_via(doc_arena);
+
+    var sb = str_builder_new_a(doc_arena);
+    str_builder_add_cstr(sb, "{\"resourceSpans\":[{\"resource\":{\"attributes\":[");
+    _agnosai_otlp_attr_str(sb, "service.name", service_name);
+    str_builder_add_cstr(sb, "]},\"scopeSpans\":[{\"scope\":{\"name\":\"agnosai\"},\"spans\":[");
+    for (var i = 0; i < n; i = i + 1) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        str_builder_add(sb, load64(slots + ((head - n + i) % AGNOSAI_OTLP_RING_MAX) * 8));
+    }
+    str_builder_add_cstr(sb, "]}]}]}");
+    var doc = str_builder_build(sb);
+
+    # The fragments are copied into `doc` now, so the arena that held them can
+    # go back to zero before any other thread gets the lock.
+    store64(r + AGN_OTR_COUNT, 0);
+    reset_via(load64(r + AGN_OTR_FRAG_ARENA));
+    mutex_unlock(lock);
+    return doc;
+}
+
+# --- the exporter ---------------------------------------------------------
+#
+# ## The POST goes through sandhi, not a raw socket
+#
+# hoosh opens a raw TCP socket for `http://` and only routes `https://` through
+# sandhi, because its exporter thread owns no sigil crypto bank and TLS needs
+# one. agnosai has no such constraint, so both schemes go through
+# `sandhi_http_post` — which brings DNS, timeouts and TLS with it and deletes
+# the hand-rolled HTTP/1.0 request builder hoosh had to write.
+#
+# ## The SSRF guard is deliberately NOT applied
+#
+# `src/guarded_fetch.cyr` exists because a *user* can influence the URLs the
+# tool layer fetches. The collector endpoint is operator configuration read from
+# `OTEL_EXPORTER_OTLP_ENDPOINT`, and the standard deployment is a sidecar on
+# `http://localhost:4318` — which the SSRF guard blocks by design. Routing this
+# through it would break the normal case to defend against a threat that does
+# not exist here. Stated rather than silently bypassed.
+#
+# ## Export is best-effort
+#
+# A collector that is down must never fail a request or block a worker. The
+# POST's result is ignored, the thread is detached, and the ring drops the
+# oldest span when it is full. Telemetry loss is preferable to backpressure on
+# the work the telemetry describes.
+
+# The oracle has no equivalent; hoosh batches every 1000 ms and so does this.
+var AGNOSAI_OTLP_BATCH_MS = 1000;
+
+# Exporter heap layout — 48 bytes.
+enum AgnosaiOtlpExporterOff {
+    AGN_OTE_RING = 0;
+    # 0 when no endpoint is configured — the exporter still drains, so a
+    # disabled collector does not grow the ring without bound.
+    AGN_OTE_ENDPOINT = 8;
+    AGN_OTE_SERVICE = 16;
+    AGN_OTE_INTERVAL_MS = 24;
+    AGN_OTE_STOP = 32;
+    AGN_OTE_EXPORTED = 40;
+    AGN_OTE_SIZE = 48;
+}
+
+# An exporter over its own ring. `endpoint` may be 0 (drain and discard).
+fn agnosai_otlp_exporter_new(endpoint, service_name: Str, interval_ms): i64 {
+    var e = alloc(AGN_OTE_SIZE);
+    store64(e + AGN_OTE_RING, agnosai_otlp_ring_new());
+    store64(e + AGN_OTE_ENDPOINT, endpoint);
+    store64(e + AGN_OTE_SERVICE, service_name);
+    store64(e + AGN_OTE_INTERVAL_MS, interval_ms);
+    store64(e + AGN_OTE_STOP, 0);
+    store64(e + AGN_OTE_EXPORTED, 0);
+    return e;
+}
+
+# The exporter's ring — what a caller enqueues into.
+fn agnosai_otlp_exporter_ring(e): i64 {
+    return load64(e + AGN_OTE_RING);
+}
+
+# Spans successfully handed to a batch, cumulative.
+fn agnosai_otlp_exporter_exported(e): i64 {
+    return load64(e + AGN_OTE_EXPORTED);
+}
+
+# Whether the exporter has been asked to stop.
+fn agnosai_otlp_exporter_stopping(e): i64 {
+    return load64(e + AGN_OTE_STOP);
+}
+
+# POST one batch document. Best-effort — the result is deliberately ignored.
+#
+# ⚠ Not reachable from the suite: it needs a listening collector. Everything
+# that decides *what* to send is in `drain` and the encoder, which are tested
+# byte-for-byte; this function only moves bytes. Recorded in roadmap section E.
+fn _agnosai_otlp_post(endpoint: Str, doc: Str): i64 {
+    var h = sandhi_headers_new();
+    sandhi_headers_add(h, "Content-Type", "application/json");
+    sandhi_http_post(str_cstr(endpoint), h, str_data(doc), str_len(doc));
+    return 0;
+}
+
+# Drain the ring once and POST whatever came out. Returns the number of spans
+# in the batch, or 0 when there was nothing to send.
+#
+# The testable half of the exporter: it decides *whether* and *what*, and only
+# the final byte-moving step needs a collector.
+fn agnosai_otlp_exporter_flush(e): i64 {
+    var ring = load64(e + AGN_OTE_RING);
+    var n = agnosai_otlp_ring_count(ring);
+    if (n == 0) { return 0; }
+    var doc = agnosai_otlp_ring_drain(ring, load64(e + AGN_OTE_SERVICE));
+    if (doc == 0) { return 0; }
+    store64(e + AGN_OTE_EXPORTED, load64(e + AGN_OTE_EXPORTED) + n);
+    var endpoint = load64(e + AGN_OTE_ENDPOINT);
+    # ⚠ The drain happens even with no endpoint. Skipping it would let the ring
+    # fill and every span report as dropped, which reads like a bug in the
+    # exporter rather than an absent collector.
+    if (endpoint != 0) { _agnosai_otlp_post(endpoint, doc); }
+    return n;
+}
+
+# How often the sleeping exporter checks whether it has been asked to stop.
+var AGNOSAI_OTLP_STOP_POLL_MS = 25;
+
+# The background loop: flush every `interval_ms` until asked to stop.
+#
+# ⚠ The sleep is **sliced**, not one `sleep_ms(interval_ms)`. A single sleep
+# means `stop` is not noticed for up to a full interval, and the process cannot
+# exit in the meantime — `.tcyr` epilogues and `_agnosai_exit_process`'s agnos
+# path both end with `syscall(60, ..)`, which exits one *thread*, so a detached
+# thread still sleeping holds the whole process open. Measured: one second of
+# dead wait on every shutdown, and on `tests/telemetry_mod.tcyr`. Slicing turns
+# that into at most `AGNOSAI_OTLP_STOP_POLL_MS`.
+#
+# ⚠ The loop does NOT flush on the way out. `agnosai_otlp_exporter_stop` does
+# the final flush on the caller's thread, so exiting here would double it.
+fn _agnosai_otlp_exporter_thread(e): i64 {
+    while (load64(e + AGN_OTE_STOP) == 0) {
+        var interval = load64(e + AGN_OTE_INTERVAL_MS);
+        var slept = 0;
+        while (slept < interval) {
+            if (load64(e + AGN_OTE_STOP) != 0) { break; }
+            var slice = AGNOSAI_OTLP_STOP_POLL_MS;
+            if (interval - slept < slice) { slice = interval - slept; }
+            sleep_ms(slice);
+            slept = slept + slice;
+        }
+        if (load64(e + AGN_OTE_STOP) != 0) { break; }
+        agnosai_otlp_exporter_flush(e);
+    }
+    return 0;
+}
+
+# Start the background exporter. Detached — nothing ever joins it.
+#
+# `thread_create_detached` rather than `thread_create`: a joinable thread nobody
+# joins leaks its 2 MiB stack for the life of the process (cyrius 6.5.8's own
+# filing from this repo).
+fn agnosai_otlp_exporter_start(e): i64 {
+    thread_create_detached(&_agnosai_otlp_exporter_thread, e);
+    return 0;
+}
+
+# Stop the loop and flush what is left. Returns the spans in the final batch.
+#
+# ⚠ Racy with a flush already in flight on the exporter thread, and benignly so:
+# the drain itself is under the ring lock, so the two threads split the pending
+# spans between two batches rather than duplicating or losing any. The only
+# casualty is `AGN_OTE_EXPORTED`, a diagnostic counter whose increment is not
+# atomic and can lose an update under that race. Not worth a second lock.
+#
+# ⚠ The final flush is the point. The oracle's `TracingGuard` exports pending
+# spans when it drops; without this, every span queued in the last interval is
+# lost on a clean shutdown — the batch most likely to explain why the process
+# is shutting down.
+fn agnosai_otlp_exporter_stop(e): i64 {
+    store64(e + AGN_OTE_STOP, 1);
+    return agnosai_otlp_exporter_flush(e);
 }

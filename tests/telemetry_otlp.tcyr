@@ -254,6 +254,179 @@ fn main(): i64 {
     assert_eq(str_contains_cstr(agnosai_otlp_span_json(tool, errctx), "\"status\":{\"code\":2}"), 1,
     "and it reaches the encoded span");
 
+    # --- the export ring --------------------------------------------------
+    var ring = agnosai_otlp_ring_new();
+    assert(ring != 0, "a ring is created");
+    assert_eq(agnosai_otlp_ring_count(ring), 0, "and starts empty");
+    assert_eq(agnosai_otlp_ring_dropped(ring), 0, "with nothing dropped");
+    assert_eq(agnosai_otlp_ring_capacity(), 256, "capacity is 256, as hoosh's is");
+
+    # ⚠ The ring holds TWO distinct arenas. This kills the obvious
+    # simplification — collapsing them into one, which would have `drain` reset
+    # the arena holding the fragments it is about to read.
+    #
+    # It does NOT kill a mis-targeted allocation (enqueue writing into the
+    # document arena): that has the same observable output, because a bump
+    # reset only rewinds an offset and the stale bytes survive intact. Neither
+    # does reading a document after its arena is reset. Both are correct by
+    # construction and **unverifiable by assertion here** — recorded in
+    # roadmap section E rather than claimed as tested.
+    assert(agnosai_otlp_ring_frag_arena(ring) != 0, "the fragment arena exists");
+    assert(agnosai_otlp_ring_doc_arena(ring) != 0, "the document arena exists");
+    assert(agnosai_otlp_ring_frag_arena(ring) != agnosai_otlp_ring_doc_arena(ring),
+    "and they are SEPARATE — fragments must not live where the document is built");
+
+    # An empty drain is 0, not an empty document — the exporter must be able to
+    # tell "nothing to send" from "send this".
+    assert_eq(agnosai_otlp_ring_drain(ring, str_from("agnosai")), 0,
+    "draining an empty ring answers 0, not an empty batch");
+
+    assert_eq(agnosai_otlp_ring_enqueue(ring, tool, _t_ctx()), 1, "a span enqueues");
+    assert_eq(agnosai_otlp_ring_count(ring), 1, "and is counted");
+    agnosai_otlp_ring_enqueue(ring, crew, _t_ctx());
+    assert_eq(agnosai_otlp_ring_count(ring), 2, "as is a second");
+
+    var doc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert(doc != 0, "the drain yields a document");
+    assert_eq(str_contains_cstr(doc, "\"service.name\""), 1, "with the resource envelope");
+    assert_eq(str_contains_cstr(doc, "gen_ai.execute_tool"), 1, "carrying the first span");
+    assert_eq(str_contains_cstr(doc, "agnosai.crew.run"), 1, "and the second");
+    assert_eq(str_contains_cstr(doc, "}},{\"traceId\":"), 1, "comma-separated");
+    assert_eq(agnosai_otlp_ring_count(ring), 0, "and the ring is emptied");
+    assert_eq(agnosai_otlp_ring_drain(ring, str_from("agnosai")), 0,
+    "a second drain has nothing left");
+
+    # ⚠ Order is OLDEST FIRST. A collector orders by timestamp, but a batch that
+    # reverses insertion order makes the ring's own arithmetic untestable — and
+    # `head - n + i` is exactly where an off-by-one hides.
+    var ord = agnosai_otlp_ring_new();
+    var s1 = agnosai_genai_tool_span(str_from("first"), str_from("a"), str_from("t"));
+    var s2 = agnosai_genai_tool_span(str_from("second"), str_from("a"), str_from("t"));
+    agnosai_otlp_ring_enqueue(ord, s1, _t_ctx());
+    agnosai_otlp_ring_enqueue(ord, s2, _t_ctx());
+    var od = agnosai_otlp_ring_drain(ord, str_from("agnosai"));
+    assert(str_index_of_cstr(od, "\"first\"") < str_index_of_cstr(od, "\"second\""),
+    "the batch is oldest-first");
+
+    # --- overflow is counted, not silent ------------------------------------
+    # ⚠ hoosh's ring overwrites and counts nothing, so loss is invisible. Fill
+    # past capacity and the excess must show up in `dropped`.
+    var full = agnosai_otlp_ring_new();
+    for (var i = 0; i < 300; i = i + 1) {
+        agnosai_otlp_ring_enqueue(full, tool, _t_ctx());
+    }
+    assert_eq(agnosai_otlp_ring_count(full), 256, "the ring holds at most its capacity");
+    assert_eq(agnosai_otlp_ring_dropped(full), 44, "and the other 44 are COUNTED as dropped");
+    assert_eq(agnosai_otlp_ring_enqueue(full, tool, _t_ctx()), 0,
+    "an enqueue into a full ring reports failure");
+    assert_eq(agnosai_otlp_ring_dropped(full), 45, "and increments the drop count");
+
+    # The overflowed ring still drains to a well-formed document of exactly
+    # capacity spans — a wrapped ring is where the modulo arithmetic breaks.
+    var fd = agnosai_otlp_ring_drain(full, str_from("agnosai"));
+    assert(fd != 0, "a wrapped ring still drains");
+    assert_eq(str_contains_cstr(fd, "]}]}]}"), 1, "to a closed document");
+    assert_eq(str_contains_cstr(fd, ",,"), 0, "with no empty slot leaking a doubled comma");
+    assert_eq(agnosai_otlp_ring_count(full), 0, "and empties");
+    # Drops are cumulative across drains — they describe the process, not the batch.
+    assert_eq(agnosai_otlp_ring_dropped(full), 45, "the drop count survives a drain");
+
+    # --- rings are independent ----------------------------------------------
+    var r1 = agnosai_otlp_ring_new();
+    var r2 = agnosai_otlp_ring_new();
+    agnosai_otlp_ring_enqueue(r1, tool, _t_ctx());
+    assert_eq(agnosai_otlp_ring_count(r1), 1, "one ring holds its span");
+    assert_eq(agnosai_otlp_ring_count(r2), 0, "and the other stays empty");
+
+    # --- a drained document survives until the NEXT drain -------------------
+    # The lifetime rule the two-arena split buys. Enqueueing after a drain must
+    # not disturb the document already handed out, because the fragments live in
+    # a different arena from the document.
+    var lr = agnosai_otlp_ring_new();
+    agnosai_otlp_ring_enqueue(lr, tool, _t_ctx());
+    var held = agnosai_otlp_ring_drain(lr, str_from("agnosai"));
+    var held_len = str_len(held);
+    for (var i = 0; i < 20; i = i + 1) {
+        agnosai_otlp_ring_enqueue(lr, crew, _t_ctx());
+    }
+    assert_eq(str_len(held), held_len, "the handed-out document is unchanged by later enqueues");
+    assert_eq(str_contains_cstr(held, "gen_ai.execute_tool"), 1, "and still holds its own span");
+    assert_eq(str_contains_cstr(held, "agnosai.crew.run"), 0,
+    "with none of the spans queued after it");
+
+    # --- the exporter -------------------------------------------------------
+    # `flush` is the testable half: it decides whether and what to send. Only
+    # the final byte-moving POST needs a collector, and it is skipped when no
+    # endpoint is configured — which is also the shape a disabled exporter has.
+    var ex = agnosai_otlp_exporter_new(0, str_from("agnosai"), 1000);
+    assert(ex != 0, "an exporter is created");
+    assert(agnosai_otlp_exporter_ring(ex) != 0, "with a ring");
+    assert_eq(agnosai_otlp_exporter_exported(ex), 0, "and nothing exported yet");
+    assert_eq(agnosai_otlp_exporter_stopping(ex), 0, "and is not stopping");
+
+    assert_eq(agnosai_otlp_exporter_flush(ex), 0, "flushing an empty exporter sends nothing");
+
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(ex), tool, _t_ctx());
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(ex), crew, _t_ctx());
+    assert_eq(agnosai_otlp_exporter_flush(ex), 2, "a flush reports the spans in the batch");
+    assert_eq(agnosai_otlp_exporter_exported(ex), 2, "and accumulates them");
+    assert_eq(agnosai_otlp_ring_count(agnosai_otlp_exporter_ring(ex)), 0,
+    "leaving the ring empty");
+    assert_eq(agnosai_otlp_exporter_flush(ex), 0, "a second flush has nothing to send");
+
+    # ⚠ The drain happens even with NO endpoint. Skipping it would let the ring
+    # fill and every span report as dropped, which reads like an exporter bug
+    # rather than an absent collector.
+    var noep = agnosai_otlp_exporter_new(0, str_from("agnosai"), 1000);
+    for (var i = 0; i < 400; i = i + 1) {
+        agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(noep), tool, _t_ctx());
+        if (i % 100 == 0) { agnosai_otlp_exporter_flush(noep); }
+    }
+    assert_eq(agnosai_otlp_ring_dropped(agnosai_otlp_exporter_ring(noep)), 0,
+    "an endpoint-less exporter still drains, so nothing is dropped");
+    assert(agnosai_otlp_exporter_exported(noep) > 0, "and it counts what it discarded");
+
+    # --- stop flushes what is left -------------------------------------------
+    # ⚠ The oracle's TracingGuard exports pending spans when it drops. Without a
+    # final flush every span queued in the last interval is lost on a clean
+    # shutdown — the batch most likely to explain why the process is stopping.
+    var st = agnosai_otlp_exporter_new(0, str_from("agnosai"), 1000);
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(st), tool, _t_ctx());
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(st), crew, _t_ctx());
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(st), tool, _t_ctx());
+    assert_eq(agnosai_otlp_exporter_stop(st), 3, "stop flushes the pending spans");
+    assert_eq(agnosai_otlp_exporter_stopping(st), 1, "and marks the exporter stopping");
+    assert_eq(agnosai_otlp_ring_count(agnosai_otlp_exporter_ring(st)), 0,
+    "leaving nothing behind");
+    assert_eq(agnosai_otlp_exporter_stop(st), 0, "and stopping twice is a no-op");
+
+    # --- the background thread actually runs --------------------------------
+    # Everything above drives `flush` directly. This starts the real detached
+    # thread on a short interval and lets it do a cycle on its own, which is the
+    # only thing that proves the loop reaches `flush` at all — and that stopping
+    # it terminates the thread rather than leaving the process unable to exit.
+    #
+    # ⚠ Cheap only because the sleep is sliced. With one `sleep_ms(interval)`
+    # this suite would wait a full interval for the stop to land, and
+    # `syscall(60, ..)` exits one thread — a still-sleeping detached thread
+    # holds the process open. That was measured at 1004 ms before slicing.
+    var bg = agnosai_otlp_exporter_new(0, str_from("agnosai"), 30);
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(bg), tool, _t_ctx());
+    agnosai_otlp_exporter_start(bg);
+    sleep_ms(200);
+    assert(agnosai_otlp_exporter_exported(bg) >= 1,
+    "the background thread flushed the queued span on its own");
+    assert_eq(agnosai_otlp_ring_count(agnosai_otlp_exporter_ring(bg)), 0,
+    "draining the ring as it went");
+
+    # It keeps going, rather than flushing once and falling out of the loop.
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(bg), crew, _t_ctx());
+    sleep_ms(200);
+    assert(agnosai_otlp_exporter_exported(bg) >= 2, "and keeps flushing on each interval");
+
+    agnosai_otlp_exporter_stop(bg);
+    assert_eq(agnosai_otlp_exporter_stopping(bg), 1, "and stops when asked");
+
     return assert_summary();
 }
 

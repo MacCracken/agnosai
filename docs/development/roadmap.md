@@ -585,25 +585,32 @@ pinned by an assertion so a later reader cannot "fix" it by accident.
   and `agnosai=<level>` are honoured; a multi-target `RUST_LOG` is refused
   outright rather than half-applied.
 
-- **OTLP export** — split in two. The **encoder** is ✅ **done 2026-08-09**
-  (`src/telemetry/otlp.cyr`, `tests/telemetry_otlp.tcyr`, 63 assertions): the
-  OTLP/JSON `Span` and `ResourceSpans` shapes, ids, attributes and endpoint
-  parsing, all pure functions so the wire format is testable byte-for-byte
-  without a collector.
+- **OTLP export** — ✅ **done 2026-08-09** (`src/telemetry/otlp.cyr`,
+  `tests/telemetry_otlp.tcyr`, 115 assertions, twelve mutation-verified).
+  Written in two halves so the wire format could be pinned first: the
+  **encoder** — OTLP/JSON `Span` and `ResourceSpans`, ids, attributes, endpoint
+  parsing — is pure functions, testable byte-for-byte without a collector.
 
-  Still owed: the **ring buffer, batch thread and POST**, behind the branch
-  `agnosai_telemetry_init_tracing` already takes. hoosh's `otlp.cyr` is the
-  model for all three (a 256-slot ring under a mutex, a detached thread
-  draining every 1000 ms, raw socket for `http://` and sandhi for `https://`).
+  The **ring, exporter thread and POST** landed the same day: a 256-slot ring
+  under a mutex with two arenas, a detached thread on a sliced sleep, and
+  `sandhi_http_post` for both schemes. `agnosai_telemetry_init_tracing` starts
+  it and `agnosai_telemetry_shutdown` stops it with a final flush, which is the
+  oracle's `TracingGuard::drop`.
 
-  ⚠ **Thread-local trace context is still the open question**, and it is now
-  the *only* hard one left here. sakshi's span stack and trace id are process
-  globals (`sakshi_trace_id_hi`/`_lo`), so under `run_pooled` two concurrent
-  requests share one trace id. The encoder sidesteps it by taking the identity
-  as an explicit `agnosai_otlp_ctx_new(...)` argument rather than reading the
-  global — so a span record can carry its own ids, captured at construction.
-  Whether that is sufficient, or whether sakshi needs a genuine thread-local,
-  is the decision the next bite has to make rather than assume.
+  ✅ **The thread-local trace-context question is answered, not deferred.**
+  sakshi's trace id is a process global, so under `run_pooled` two concurrent
+  requests share one. The export path therefore **never reads sakshi's trace
+  context**: `agnosai_otlp_ring_enqueue` takes an explicit
+  `agnosai_otlp_ctx_new(..)` and correlation is the caller's job — mint one
+  trace id per request and pass it to every span. Reentrant by construction and
+  needs no upstream change. A genuine thread-local current-span is listed as
+  work for the OpenTelemetry library repo (see *Out of scope for v2.0*), not
+  for agnosai.
+
+  **What is left of M9 is a live wiring question, not a port gap**: nothing in
+  `src/` enqueues a span yet. `llm/`, `tools/` and `orchestrator/` are the three
+  call sites that would create inference, tool and crew spans, and choosing
+  where they go is a design decision rather than transcription.
 - **`genai.rs`** (206 lines) — ✅ **done 2026-08-09**
   (`src/telemetry/genai.cyr`, `tests/telemetry_genai.tcyr`, 64 assertions). It
   lives here, not in `llm`. `tracing::Span` became a held attribute record; the
@@ -803,6 +810,16 @@ listed because "no test covers this" is true of both and will keep being true:
   asserted with a 1 ms margin; the strict comparison itself is documented in
   place, not claimed as tested. Not a defect — the difference from `registry` is
   the oracle's, and reproducing it is the point.
+- **`telemetry/otlp`'s two-arena separation (added 2026-08-09).** The export
+  ring keeps fragments and the batch document in different arenas so `drain`
+  cannot reset the arena it is about to read from. Two mutants of this survive
+  every assertion — allocating fragments into the document arena, and resetting
+  the document arena after the build instead of before — because **a bump-arena
+  reset only rewinds an offset**. The bytes stay intact, so use-after-reset
+  reads correct data in a single-threaded test and the output is identical.
+  A test pins that two arenas exist (killing the collapse-to-one
+  simplification); the rest is correct by construction and by review, not by
+  test. Do not "simplify" it on the evidence of a green suite.
 - **`fleet/topology`'s `total_pairs == 0` guard (added 2026-08-08).** It is
   reached only when `gpu_count >= 2`, where `n * (n - 1) / 2 >= 1`, so it cannot
   fire. Kept because the oracle has it. Mutation-verified from the reachable
