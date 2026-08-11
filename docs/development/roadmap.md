@@ -725,10 +725,13 @@ taken rather than estimated:
 | surface | oracle | ported | owed |
 |---|---|---|---|
 | `src/` modules | — | **all** | **0** — `llm/inference_queue` was the last |
-| test fns (`#[test]` + `#[tokio::test]`) | **863** in 84 modules | **96** suites | see bite 2 |
-| bench ids (criterion) | **117** in 19 files | 7 `.bcyr`, 79 shapes | **83** (bite 3) |
+| test fns (`#[test]` + `#[tokio::test]`) | **863** in 84 modules | **97** suites | see bite 2 |
+| bench ids (criterion) | **117** in 19 files | **9** `.bcyr`, **190** rows | **0** — closed, bite 3b |
 | `rust-old/tests/` integration | 2 fns | 1 suite | **0** (bite 4) |
-| non-`src` artifacts | examples, fuzz, sdk, 1 doctest | — | see *Not started* |
+| `rust-old/fuzz/` | 4 targets | **4** `.fcyr` | **0** (bite 6) |
+| doctests | **1** real one | 1 `# >>>` + 1 suite | **0** (bite 5) |
+| `examples/` | 1 Cyrius + 1 wasm fixture | 1 | the wasm fixture (needs wasmtime) |
+| `sdk/agnosai-tool-sdk/` | Rust, for tool authors | **stays Rust** | conformance only — see below |
 
 #### Bite 1 — `llm/inference_queue` ✅ 2026-08-10
 
@@ -779,7 +782,70 @@ a rotted benchmark and nobody noticing was someone remembering to run
 gains a `Benchmarks` step for the compile (not the numbers — CI timings are too
 noisy to gate on).
 
-#### Bite 3 — benches, in progress
+#### Bite 3b — the 83 gaps closed ✅ 2026-08-10
+
+Six agents, one per `benches/*.bcyr`, each compiling and running its own file;
+every result then handed to a separate agent told to assume it was wrong.
+**83 benchmarks added, all 9 files compile, 190 rows in `bench-history.csv`**
+against 106 before.
+
+The adversarial reports are kept verbatim in
+[`m12-bench-audit-2026-08-10.md`](m12-bench-audit-2026-08-10.md) with triage.
+**Read that file's section before editing any row** — several shipped comments
+are known-wrong and are listed there rather than fixed.
+
+Two acted on, and the pair is the lesson:
+
+- **FIXED** — four fleet placement shapes never reached the sort
+  (`vec_sort_by`'s O(n) already-ordered pre-check returns before introsort), and
+  their comments claimed they guarded the exact regression they were blind to.
+  ⚠ Reordering the input does **not** fix it: `AGN_PR_INDEX` comes from the scan
+  position, so output indices are ascending by construction. Measured 11.763us
+  vs 11.722us — no difference. Varying the *scores* prices it: **19.53us vs
+  11.80us**.
+- **REJECTED** — the verifier called `clock_epoch_secs = 1.318us` fabricated,
+  citing `lib/bench.cyr:6`'s documented ~120ns. Measured at 2,000,000
+  iterations: **1.315us**. The implementing agent was right; it is
+  `lib/bench.cyr`'s constant that is wrong on this host by 11x, and that
+  constant is what every bench in the ecosystem implicitly subtracts. Now a
+  measured row rather than a claim.
+
+#### Bite 3c — the scoring benchmarks ✅ 2026-08-11
+
+The six gaps the fan-out shipped nowhere. All seven `rust-old/benches/scoring.rs`
+ids are now in `benches/orch.bcyr`, and the ranking series **confirms an O(n²)
+sort**:
+
+| agents | measured | |
+|---|---|---|
+| 100 | 127.8 µs | sort ≈ 33% |
+| 300 | 626.0 µs | predicted 637.8 — **within 2%** |
+| 1000 | 5093.0 µs | sort ≈ 83% |
+
+The oracle sorts with `sort_by` (pdqsort, O(n log n),
+`rust-old/src/orchestrator/scoring.rs:212`); the port hand-rolls an insertion
+sort (`src/orchestrator/scoring.cyr:294-303`). Fitting `a·n + b·n²` to the 100
+and 1000 points gives a = 0.863 µs (scoring) and b = 0.00421 µs (sort); the
+**independent** 300-agent point tests that fit rather than being used to make it.
+The sort overtakes the scoring at **n ≈ 205**.
+
+⚠ **It is a performance note, NOT a DoS vector — an earlier entry here said
+otherwise and was wrong.** `AGNOSAI_CREW_MAX_AGENTS` is **100** and
+`src/server/routes/crews.cyr:353` rejects more, so nothing reachable over HTTP
+passes n = 100, where the sort is a third of a 128 µs call. The crossover is
+beyond the cap. Only a direct library caller is unbounded.
+
+⚠ Three sizes, not two: two points can be *fitted* by a quadratic but not
+*tested* against one. And the agents must be varied — identical agents tie, and a
+stable insertion sort walks a tied list in O(n), which is precisely why
+`rank_agents_16` never showed this.
+
+**Still open:** whether to replace the insertion sort. It is a real complexity
+divergence from the oracle, so under CLAUDE.md it needs a fix or an ADR — but at
+the enforced cap it costs ~42 µs, so the honest answer may be an ADR recording
+the bound rather than a change.
+
+#### Bite 3 — the gap analysis
 
 `benches/llm.bcyr` added: all three of `rust-old/benches/llm_router.rs`'s
 criterion groups plus the inference queue. `benches/` previously held six `.bcyr`
@@ -847,20 +913,108 @@ does not and would paper over the same gap upstream has.
 
 #### Not started
 
-- **The doctest.** Only **one** of the four ` ``` ` blocks under `rust-old/src/`
-  is a real doctest — `core/mod.rs`'s. The others are ` ```text ` (wasm_loader),
-  ` ```ignore ` (telemetry/genai) and ` ```yaml ` (definitions/k8s_crd), none of
-  which `cargo test` compiles.
-- **`rust-old/examples/`** — `simple_crew.rs` (15 lines) and
-  `wasm-tools/hello-tool/`, a Rust crate compiled to WASM plus its
-  `manifest.json`. The latter is the natural fixture for `tools/wasm_loader`.
-  agnosai has no `examples/` directory, though `README.md:35` documents one.
-- **`rust-old/fuzz/`** — four targets: `fuzz_agent_definition`,
-  `fuzz_crew_request`, `fuzz_preset_json`, `fuzz_tool_input`.
-- **`sdk/agnosai-tool-sdk/`** — tracked Rust, still carrying `Cargo.toml` and
-  `Cargo.lock`. It defines the `{"parameters": …}` / `{"result", "success",
-  "error"}` wire format `tools/wasm_tool.cyr` implements, so it is a live
-  compatibility surface rather than dead weight.
+#### Bite 5 — the doctest and the first example ✅ 2026-08-10
+
+- **The doctest is closed in full.** Only **one** of the four ` ``` ` blocks
+  under `rust-old/src/` is a real doctest — `core/mod.rs`'s. The others are
+  ` ```text ` (wasm_loader), ` ```ignore ` (telemetry/genai) and ` ```yaml `
+  (definitions/k8s_crd), and `cargo test` compiles none of them.
+  `tests/core_mod_doctest.tcyr`, 13 assertions, transcribes it.
+
+  ⚠ Every symbol it touches is already covered by `core_agent`/`core_task`/
+  `core_crew`, and that is not the point. A doctest asserts **the example a
+  reader is shown still works** — it is the one test that fails when an API
+  change silently invalidates the prose. `src/core/mod.cyr`'s header carries the
+  block it mirrors; if either moves, move both.
+
+- **`examples/simple_crew.cyr`** — the port of `rust-old/examples/simple_crew.rs`,
+  and the first file in a directory `README.md:35` had been documenting for
+  months. Builds and runs with nothing installed:
+
+  ```
+  Crew completed with status: completed
+    task output: Analyze the project structure
+  ```
+
+  ⚠ **Nothing discovered `examples/`** — not `cyrius tests`, not `cyrius bench`,
+  not the build entry — which is the same shape of hole that let three `.bcyr`
+  files rot. `check-clean.sh` now sweeps it for fmt, lint **and doc**, and CI
+  builds every `examples/*.cyr` as its own step.
+
+#### Bite 6 — the four fuzz targets ✅ 2026-08-10
+
+`fuzz/{agent_definition,crew_request,preset_json,tool_input}.fcyr` — **3,414
+malformed inputs, zero faults**. All four `cargo-fuzz` targets are the same four lines — arbitrary UTF-8
+into a parser, result discarded — so the property is *no panic*, and the value
+is entirely in the input distribution.
+
+⚠ **`cyrius fuzz` exists** — `fuzz/*.fcyr` harnesses, discovered from both
+`fuzz/` and `tests/`. A first draft of this bite was written around a claim that
+it did not, alongside the same wrong claim about `cyrius doctest`. Both are
+listed under *Quality* in bare `cyrius`. Verify a toolchain gap before writing
+around it.
+
+⚠ **`tests/agnosai.fcyr`, the `cyrius port` scaffold, had a `fuzz_main` that
+returned 0 without reading its input** — `cyrius fuzz` had reported `1 passed`
+for it since 2026-07-28, and nothing in CI ran it. Same story for
+`tests/agnosai.bcyr`, a scaffolded `noop` in `tests/` where an audit of
+`benches/*.bcyr` could not see it.
+
+`cyrius fuzz` does not generate input, and a random generator would be **worse**:
+a fuzz failure CI cannot reproduce is a failure nobody fixes. So the corpus is deterministic and
+uses the two generators that actually find parser bugs — a **truncation sweep**
+(every prefix of a valid document, which walks every length check and look-ahead
+straight off its boundary) and a **byte-substitution sweep** (each offset × NUL,
+`"`, `\`, `{`, `]`, 0xFF), plus 25 hand-written JSON-killers: lone surrogates,
+`1e999999`, `9223372036854775808`, an embedded NUL, 64-deep nesting opened and
+closed and opened-and-never-closed.
+
+⚠ **It goes past the oracle.** libfuzzer guards with
+`if let Ok(s) = std::str::from_utf8(data)`, so the Rust targets only ever see
+valid UTF-8. A Cyrius `Str` is bytes and `bayan_json_v_parse_buf` takes
+(ptr, len), so the **0xFF substitution reaches the parser here and cannot
+upstream**.
+
+⚠ Two design points worth not re-deriving. The suite re-parses the pristine seed
+after each sweep — a parser can survive malformed input by leaving a scratch
+buffer or a global error slot in a state that breaks the *next* caller, and that
+never shows up as a crash during the sweep. And the corpus count is asserted
+**exactly**, not as a threshold: a threshold passes while half the corpus quietly
+stops being generated, which is the failure mode a sweep is most likely to grow.
+
+It also caught a real fact about the port: **`agnosai_crew_from_value` requires
+`id`** and it is the only required field — name, agents and tasks all default —
+so a seed without one makes the entire sweep re-measure the same early return.
+
+#### Bite 7 — the user-facing docs ✅ 2026-08-10
+
+`README.md`, `docs/guides/api-reference.md` and `docs/architecture/overview.md`
+all documented **`agnosai-server`**, the Rust `[[bin]]`. The Cyrius build
+produces one binary, **`agnosai`**. Every Quick Start command was `cargo`
+against a tree with no root `Cargo.toml`, including a `make check` with no
+Makefile.
+
+⚠ **`docs/guides/adding-wasm-tools.md`'s `cargo build --target wasm32-wasip1`
+is correct and was left alone** — it is a *tool author* building against the
+Rust SDK, the surface that deliberately stays Rust. A blanket sweep of `cargo`
+out of the docs would have broken the one instruction that should keep it.
+
+#### Still not started
+
+⚠ **`sdk/agnosai-tool-sdk/` and `rust-old/examples/wasm-tools/` STAY RUST, and
+that is not a deferral.** The SDK is a crate published to *third-party tool
+authors*, who compile it to `wasm32-wasip1`; the sandbox then executes the
+resulting binary. Neither is linked into `build/agnosai` and neither has a
+Cyrius counterpart to be. Rewriting them in Cyrius would be actively wrong — it
+would break every tool author on the published protocol.
+
+What agnosai genuinely owes here is **conformance**, not translation: that
+`src/tools/wasm_tool.cyr` implements the `{"parameters": …}` stdin and
+`{"result", "success", "error"}` stdout contract the SDK documents. It does, its
+header cites the SDK as the reason, and `tests/tools_wasm.tcyr` pins both halves.
+`examples/wasm-tools/hello-tool/` is the natural fixture for an end-to-end
+`wasm_loader` test, which needs `wasmtime` installed and is the only part still
+open.
 - **Repo hygiene found in passing.** `probe_key_tmp.pem` — a tracked RSA private
   key at the root, referenced by nothing — is **deleted**, and `.gitignore` now
   carries `*.pem` / `*.key` because agnosai has no legitimate PEM in the tree.

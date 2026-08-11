@@ -1,9 +1,13 @@
 # =========================================================================
 # core.bcyr — benchmarks for the core group.
 #
-# No oracle bench file: rust-old/benches/ has no core.rs. These measure the
-# paths core actually gets hammered on — UUID minting and rendering, and the
-# JSON serialize/parse round trips every request boundary crosses.
+# Oracle bench files: rust-old/benches/resource.rs (6 ids) and the two
+# core-typed groups of rust-old/benches/serde_types.rs. There is no `core.rs` —
+# the oracle splits this group across those files — so the uuid, crew and
+# message shapes here have no oracle id at all and exist because they are the
+# paths core actually gets hammered on: UUID minting and rendering, and the JSON
+# serialize/parse round trips every request boundary crosses. The oracle's own
+# ids are reproduced below under their headings.
 #
 # These numbers start the CYRIUS baseline. They are NOT comparable to
 # rust-old/bench-history.csv. See CLAUDE.md.
@@ -58,6 +62,43 @@ fn _b_sample_crew(n): i64 {
     agnosai_crew_with_agents(c, agents);
     agnosai_crew_with_tasks(c, tasks);
     return c;
+}
+
+# The resource.rs oracle's `large_inventory()` — 8 CUDA + 1 TPU + 1 ROCm on a
+# 128-core, 1 TiB node.
+#
+# ⚠ Device NAMES are never read by satisfies / devices_of_type /
+# total_memory_mb, so one constant literal stands in for the oracle's
+# `format!("NVIDIA H100 #{i}")`. `str_from` borrows a static cstr rather than
+# copying, so this keeps string work out of setup and changes nothing the
+# benched paths can observe.
+fn _b_large_inventory(): i64 {
+    var devices = vec_new();
+    for (var i = 0; i < 8; i = i + 1) {
+        vec_push(devices,
+        agnosai_compute_device_new(i, str_from("NVIDIA H100"), AGNOSAI_ACCEL_CUDA, 81920));
+    }
+    vec_push(devices,
+    agnosai_compute_device_new(8, str_from("TPU v4"), AGNOSAI_ACCEL_TPU, 32768));
+    vec_push(devices,
+    agnosai_compute_device_new(9, str_from("AMD MI300X"), AGNOSAI_ACCEL_ROCM, 196608));
+    return agnosai_hw_inventory_new(128, 1048576, devices);
+}
+
+# The serde_types.rs oracle's inventory — 8 HOMOGENEOUS CUDA devices, no TPU and
+# no ROCm. Deliberately not `_b_large_inventory`: the two oracle files use
+# different fixtures and the JSON rows must match theirs, not each other's.
+#
+# ⚠ One constant 6-byte name for all eight is byte-identical in length to the
+# oracle's `format!("GPU #{i}")` output, so the emitted document is the same
+# size. The `index` field still varies, as it does upstream.
+fn _b_json_inventory(): i64 {
+    var devices = vec_new();
+    for (var i = 0; i < 8; i = i + 1) {
+        vec_push(devices,
+        agnosai_compute_device_new(i, str_from("GPU #0"), AGNOSAI_ACCEL_CUDA, 81920));
+    }
+    return agnosai_hw_inventory_new(128, 1048576, devices);
 }
 
 # UUID v4 minting — every task, message and crew pays this once.
@@ -189,6 +230,239 @@ fn _b_inventory_satisfies(): i64 {
     return 0;
 }
 
+# ── rust-old/benches/resource.rs ───────────
+#
+# ⚠ The counts below are NOT constrained by allocation. `vec_new_a`
+# (lib/vec.cyr:30) hands back a 16-slot buffer up front, so 8 pushes never touch
+# the grow path — one call is two `alloc_via`s and ~152 B — and `alloc`
+# (lib/alloc.cyr:216) bumps inside a 256 MiB chunk. The real per-iteration tax
+# is first-touch page faults on fresh anonymous pages, not chunk acquisition.
+# What DOES constrain them: `bench_batch_stop` reports an INTEGER ns-per-op
+# (lib/bench.cyr:223), so cheap shapes need a large batch to land on a stable
+# number. Hence "high", not "equal".
+
+# The oracle's `satisfies (10 devices, CUDA req)` — the FULL ladder at scale.
+#
+# ⚠ Nothing early-outs here and that is the point. The cpu-cores gate is reached
+# and passes (128 >= 64), required_family is unset so that arm is skipped, all
+# 10 devices are filtered into a fresh vec of 8 CUDA hits, the count gate passes
+# (8 >= 4), and the memory scan hits on the first element. Read against
+# `hw_inventory_satisfies_10dev_empty_req` below, which is the same call with
+# every gate skipped, and against `hw_inventory_satisfies` above, which is the
+# same ladder over 2 devices.
+fn _b_inventory_satisfies_10dev(): i64 {
+    var inv = _b_large_inventory();
+    var accels = vec_new();
+    vec_push(accels, AGNOSAI_ACCEL_CUDA);
+    var req = agnosai_hw_requirement_with_min_cpu_cores(
+    agnosai_hw_requirement_with_min_devices(
+    agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_for_accelerators(accels), 40960), 4), 64);
+    var n = 500000;
+    var b = bench_new("hw_inventory_satisfies_10dev_cuda");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_hw_inventory_satisfies(inv, req); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `satisfies (10 devices, empty req)` — the same call against the
+# same inventory with every gate skipped. `agnosai_hw_requirement_new` is the
+# oracle's derived `Default`: min_cpu_cores 0, required_family AGNOSAI_NO_LIMIT,
+# accelerators empty. It returns at src/core/resource.cyr:472 without touching a
+# device or allocating anything, so this is the floor the row above is read
+# against.
+fn _b_inventory_satisfies_empty_req(): i64 {
+    var inv = _b_large_inventory();
+    var req = agnosai_hw_requirement_new();
+    var n = 1000000;
+    var b = bench_new("hw_inventory_satisfies_10dev_empty_req");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_hw_inventory_satisfies(inv, req); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `devices_of_type CUDA (10 devices)` — one vec build with 8 pushes
+# plus 10 equality compares. This is the shared inner routine `total_memory_mb`
+# also calls, so the pair below isolates the summation.
+#
+# ⚠ Like the oracle it stores the device POINTER, not a copy — the allocation is
+# exactly the vec, never the devices.
+fn _b_devices_of_type(): i64 {
+    var inv = _b_large_inventory();
+    var n = 500000;
+    var b = bench_new("hw_inventory_devices_of_type_cuda_10dev");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_hw_inventory_devices_of_type(inv, AGNOSAI_ACCEL_CUDA);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `total_memory_mb CUDA (10 devices)` — `devices_of_type` PLUS a
+# sum over the 8 hits. Subtract the row above and what is left is the
+# summation; carrying both ids is the only reason either is interesting.
+fn _b_total_memory_mb(): i64 {
+    var inv = _b_large_inventory();
+    var n = 500000;
+    var b = bench_new("hw_inventory_total_memory_mb_cuda_10dev");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_hw_inventory_total_memory_mb(inv, AGNOSAI_ACCEL_CUDA);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `from_hwaccel (8 GPUs + CPU)` — a 9-profile registry: one CPU
+# profile at 512 GiB then 8 CUDA at 80 GiB each. Per iteration it enumerates all
+# 9, divides bytes to MiB, diverts the CPU profile into cpu_cores and
+# memory_total_mb and `continue`s past it, and pushes 8 devices.
+#
+# ⚠ **Runs fully offline.** `registry_from_profiles` (lib/ai-hwaccel.cyr:3911)
+# builds from literals and probes no hardware — the oracle does the same.
+# `agnosai_hw_inventory_detect` is the half that CANNOT be benched offline (it
+# shells out to nvidia-smi), and it has no oracle bench id, so it is out of
+# scope rather than skipped.
+#
+# ⚠ **Do not read this against the oracle as like-for-like work.** Rust builds
+# each device name with `format!("{:?}", profile.accelerator)` — a heap String
+# per device per iteration. Cyrius does `str_from(accel_name(atype))`
+# (src/core/resource.cyr:819) and `str_from` BORROWS the static cstr, so this
+# row legitimately excludes 8 allocations the oracle paid.
+#
+# ⚠ 20000, far below the file's usual counts: this is the only shape here that
+# issues a SYSCALL inside the timed region. `_agnosai_available_parallelism`
+# calls sched_getaffinity once per iteration (src/core/resource.cyr:750) and
+# then popcounts the returned mask one bit at a time.
+fn _b_from_hwaccel(): i64 {
+    var profiles = vec_new();
+    vec_push(profiles, profile_cpu(512 * AGNOSAI_BYTES_PER_GB));
+    for (var g = 0; g < 8; g = g + 1) {
+        vec_push(profiles, profile_cuda(g, 80 * AGNOSAI_BYTES_PER_GB));
+    }
+    var reg = registry_from_profiles(profiles);
+    var n = 20000;
+    var b = bench_new("hw_inventory_from_hwaccel_8gpu_cpu");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_hw_inventory_from_hwaccel(reg); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# ── rust-old/benches/serde_types.rs — the resource half ───────────────────
+#
+# ⚠ All four rows below COMPOSE `build(to_value(x))` and
+# `from_value(parse_buf(...))` inline, because resource.cyr is the one core
+# module with no to_json/from_json wrapper pair — task.cyr:565/572,
+# agent.cyr:385/392, crew.cyr and message.cyr all have one; this does not. The
+# composition is exactly what those wrappers do and exactly what serde's fused
+# `to_string`/`from_str` measured, so it needs no product change. If the
+# wrappers are ever added for symmetry, repoint these four at them.
+#
+# ⚠ The two inventory rows run at 20000, not the file's 50000 JSON default.
+# Every bayan object AND array node costs 176 B — a 24-byte JV plus the
+# `vec_new_a` header and its 16-slot buffer — so this tree (1 object + 1 array +
+# 8 device objects, 43 pairs, 43 value nodes, plus the built string) is roughly
+# 6 KB per iteration on the no-free global bump. 20000 holds each near 120 MB.
+# Rows are per-op ns, so the lower count costs nothing in comparability against
+# the 50000-iteration task/agent rows above.
+
+# The oracle's `hardware_inventory_json/serialize (8 devices)` — 3 top-level
+# fields plus an array of 8 objects x 5 fields, i.e. 43 key/value emissions
+# including 8 accelerator enum renders.
+fn _b_inventory_to_json(): i64 {
+    var inv = _b_json_inventory();
+    var n = 20000;
+    var b = bench_new("hw_inventory_to_json_8dev");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        bayan_json_v_build(agnosai_hw_inventory_to_value(inv));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `hardware_inventory_json/deserialize (8 devices)` — tokenizing
+# the document the row above emits, then rebuilding 8 ComputeDevice structs.
+#
+# ⚠ The deserialize side pays 8 walks of the `str_eq_cstr` accelerator ladder at
+# src/core/resource.cyr:140, which the serialize side does not — that string
+# comparison is the whole reason the oracle carries both directions.
+#
+# `parse_buf(str_data, str_len)` rather than a bare parse entry is the form
+# src/core/task.cyr:573 standardized on, so the bench measures the call the
+# product actually makes.
+fn _b_inventory_from_json(): i64 {
+    var js = bayan_json_v_build(agnosai_hw_inventory_to_value(_b_json_inventory()));
+    var n = 20000;
+    var b = bench_new("hw_inventory_from_json_8dev");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_hw_inventory_from_value(bayan_json_v_parse_buf(str_data(js), str_len(js)));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `resource_budget_json/serialize` — four Option fields, all Some,
+# in a 4-key object. The interesting one is `max_cost_usd`: it goes out as an
+# f64, so this measures a Grisu2 float render inside a tiny payload, which is a
+# genuinely different cost profile from the task and inventory documents.
+#
+# ⚠ **5000000, not 5.** Cyrius stores cost as integer MICRO-USD
+# (AGNOSAI_MICRO_USD_PER_USD = 1000000, src/core/resource.cyr:53), so the
+# oracle's `Some(5.0)` is 5000000 here. Writing 5 would mean $0.000005 and would
+# render a different float.
+#
+# ⚠ All four slots must be non-sentinel. AGNOSAI_NO_LIMIT is -1
+# (src/core/json.cyr:23) and takes the JSON-null branch at
+# src/core/resource.cyr:543, which skips the float render this row exists for.
+fn _b_budget_to_json(): i64 {
+    var bud = agnosai_resource_budget_new(100000, 5000000, 600, 8);
+    var n = 100000;
+    var b = bench_new("resource_budget_to_json");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        bayan_json_v_build(agnosai_resource_budget_to_value(bud));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `resource_budget_json/deserialize` — three integer lookups and
+# one float parse, which dominates.
+#
+# The fixture text is built from `to_value` rather than hand-written so the
+# float spelling bayan emits is the one bayan parses. That also guarantees the
+# document carries `5.0` with the `.`, so the parser sets `is_float` and
+# `agnosai_resource_budget_from_value` takes the float arm at
+# src/core/resource.cyr:569 rather than the whole-dollar integer fallback at
+# :571 — a hand-written `5` would silently bench the wrong branch.
+fn _b_budget_from_json(): i64 {
+    var js = bayan_json_v_build(agnosai_resource_budget_to_value(
+    agnosai_resource_budget_new(100000, 5000000, 600, 8)));
+    var n = 100000;
+    var b = bench_new("resource_budget_from_json");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_resource_budget_from_value(bayan_json_v_parse_buf(str_data(js), str_len(js)));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
 
@@ -202,6 +476,17 @@ fn main(): i64 {
     _b_crew_from_json();
     _b_message_round_trip();
     _b_inventory_satisfies();
+
+    _b_inventory_satisfies_10dev();
+    _b_inventory_satisfies_empty_req();
+    _b_devices_of_type();
+    _b_total_memory_mb();
+    _b_from_hwaccel();
+
+    _b_inventory_to_json();
+    _b_inventory_from_json();
+    _b_budget_to_json();
+    _b_budget_from_json();
 
     return 0;
 }

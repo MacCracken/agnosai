@@ -22,6 +22,41 @@
 # The tool-dispatch cases exist so the vtable overhead is on record: every
 # tool call in the system pays it.
 #
+# ── The ToolRegistry family (oracle: rust-old/benches/tools.rs) ───────────
+#
+# The oracle's `tools.rs` has nine criterion ids; only two had a counterpart
+# here. The seven added below are `get` at 50 and 500 entries, `has` hit and
+# miss, `list` at 50 and 500, and `register` throughput. They are what says the
+# map behind the registry mutex stays O(1) as a deployment grows, and what puts
+# a number on `GET /api/v1/tools` — the one registry operation that is linear.
+#
+# Three divergences from the oracle, all deliberate:
+#
+#   * **Keys are prebuilt, not `format!`ed inside the loop.** The oracle spends
+#     a heap allocation and an integer format per iteration; keeping that in
+#     would bury the hash+probe this family exists to show, and str_builder cost
+#     is `core.bcyr`'s subject. The existing `tool_registry_get` already made
+#     that call, so the sweep stays internally comparable.
+#   * **`list` runs through `agnosai_tool_registry_list_a` with a request arena
+#     and `reset_via` INSIDE the timed body.** That is the production path
+#     (`src/server/routes/tools.cyr:22`) and the `benches/server.bcyr:164` idiom.
+#     The global form would be ~130 KB per call on a no-free bump — 2000 calls
+#     at 500 tools would be measuring page faults, not schema construction.
+#   * **`get` cycles its key over the whole registry; `has` uses one fixed key.**
+#     That is the oracle's own split. Cycling defeats a single hot cache line so
+#     the 5/50/500 slope is real; the fixed key isolates hit-probe from
+#     miss-probe, which is the entire reason the oracle has both `has` arms.
+#
+# `get` is measured at 5/50/500 through ONE helper so the three points divide.
+# The older `tool_registry_get` (3 real builtins, fixed key) is left untouched
+# under its own id — renaming it would orphan its bench-history series.
+#
+# ⚠ `tool_execute_echo` below is unchanged but no longer measures what it did:
+# `src/tools/native.cyr:400` now mints a GenAI tool span and takes two
+# `clock_epoch_ns` readings per dispatch (ADR 017) before the exporter check
+# short-circuits. The 4.1µs is dispatch + instrumentation the oracle has no
+# counterpart for. Not a regression — a wider scope.
+#
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
 
@@ -162,6 +197,10 @@ fn _b_is_safe_url_numeric(): i64 {
 }
 
 # Registry lookup — a hashmap hit behind the futex mutex.
+#
+# The 3-real-builtins point, on a fixed key. Kept under its original id so its
+# bench-history series survives; the comparable sweep is `tool_registry_get_5`
+# / `_50` / `_500` below, which cycle keys through one shared helper.
 fn _b_registry_get(): i64 {
     var reg = agnosai_register_basic_builtins(agnosai_tool_registry_new());
     agnosai_register_load_testing_builtin(reg);
@@ -170,6 +209,176 @@ fn _b_registry_get(): i64 {
     var b = bench_new("tool_registry_get");
     bench_batch_start(b);
     for (var i = 0; i < n; i = i + 1) { agnosai_tool_registry_get(reg, name); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The Cyrius form of the oracle's `NamedEcho` wrapper (tools.rs:16-46): one
+# vtable shared by every stub, with the stub's own name handed to it as `ctx`,
+# so the schema callback reads a distinct name per tool. N stubs therefore
+# build N distinct schemas and cost what N real tools cost — the shortcut of
+# registering the same schema N times would make `list` look free.
+fn _b_named_schema(a, ctx): i64 {
+    var s = agnosai_tool_schema_new_a(a, ctx, str_from_a(a, "Named echo stub for benchmarking"));
+    agnosai_tool_schema_param_a(a, s, str_from_a(a, "message"),
+    str_from_a(a, "The message to echo back"), str_from_a(a, "string"), 1);
+    return s;
+}
+
+# "tool_0" … "tool_{n-1}" — the oracle's `format!("tool_{}", i)` keys, built
+# once so no timed loop pays for them. Returned as a vec so a lookup arm can
+# cycle keys with a vec_get instead of a str_builder.
+fn _b_tool_names(n): i64 {
+    var names = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "tool_");
+        str_builder_add_int(sb, i);
+        vec_push(names, str_builder_build(sb));
+    }
+    return names;
+}
+
+# A registry holding one named stub per name. `nm` is passed twice on purpose:
+# once as the tool's name, once as its `ctx` — that is the whole NamedEcho trick.
+fn _b_registry_of(names): i64 {
+    var reg = agnosai_tool_registry_new();
+    var desc = str_from("Named echo stub for benchmarking");
+    for (var i = 0; i < vec_len(names); i = i + 1) {
+        var nm = vec_get(names, i);
+        agnosai_tool_registry_register(reg,
+        agnosai_tool_new(nm, desc, &_b_named_schema, &_agnosai_echo_execute, nm));
+    }
+    return reg;
+}
+
+# The oracle's `ToolRegistry::get` family (tools.rs:58-82, :152-163) at one
+# size. Called at 5, 50 and 500 so the three numbers divide against each other:
+# a hashmap that has grown through ~6 doublings must not lose to one that never
+# grew, and this is the arm that would show it if it did.
+#
+# The key cycles across the whole registry, so consecutive iterations land in
+# different buckets. The `vec_get` that costs is a bounds-check and a load,
+# inside the timed body for all three arms equally.
+#
+# Measured 103ns / 112ns / 114ns at 5 / 50 / 500. A 100x registry costs 11%
+# more, and all of that is cache: `lib/hashmap.cyr` is open-addressed with
+# linear probing at a 70% load ceiling, so the probe length does not move —
+# only the working set does. The answer the family was asked for is "flat".
+fn _b_registry_get_n(name, n_tools, iters): i64 {
+    var names = _b_tool_names(n_tools);
+    var reg = _b_registry_of(names);
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < iters; i = i + 1) {
+        agnosai_tool_registry_get(reg, vec_get(names, i % n_tools));
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
+# One arm of the oracle's `ToolRegistry::has` pair (tools.rs:111-129).
+fn _b_registry_has(name, reg, key: Str, iters): i64 {
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < iters; i = i + 1) { agnosai_tool_registry_has(reg, key); }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
+# Hit and miss over ONE 50-entry registry, as the oracle does. The pair is the
+# point: an open-addressed probe stops at the key on a hit but has to walk to
+# the first empty slot on a miss, so the two are different probe lengths and a
+# single number would hide whichever is worse.
+#
+# Measured 107ns hit / 109ns miss — indistinguishable, and that is the finding.
+# Below 70% load a linear-probe miss terminates on the first empty slot, which
+# is a handful of slots at most, so both arms are dominated by the futex mutex
+# pair and the `hash_str_v` walk over the key. A registry that ever ran hot
+# enough to make these diverge would be one where the probe, not the lock, had
+# become the cost — the pair is here to detect exactly that inversion.
+fn _b_registry_has_pair(): i64 {
+    var reg = _b_registry_of(_b_tool_names(50));
+    _b_registry_has("tool_registry_has_50_hit", reg, str_from("tool_25"), 500000);
+    _b_registry_has("tool_registry_has_50_miss", reg, str_from("nonexistent"), 500000);
+    return 0;
+}
+
+# The oracle's `ToolRegistry::list` family (tools.rs:86-92, :165-171) — the
+# `GET /api/v1/tools` response body. Every entry's `schema_fp` is re-invoked per
+# call, so this is `n_tools` schema structs, `n_tools` parameter structs and
+# four `str_from_a` copies each, per request.
+#
+# The arena is 4 MB against a measured ceiling near 130 KB at 500 tools — one
+# mmap at setup, and headroom is free because `arena_allocator` is fixed
+# capacity (`lib/alloc.cyr:740`) and returns 0 rather than growing.
+#
+# The `reset_via` sits inside the timed body because a request pays it; hoisting
+# it would flatter the arena arm by hiding its only per-request cost. One
+# untimed warm-up call first, so the first-touch page faults on the fresh arena
+# land outside the measurement.
+#
+# Measured 12.19µs at 50 and 119.7µs at 500 — 243.8ns and 239.4ns per tool.
+# Linear to within 2%, with no fixed overhead worth naming, which says the whole
+# cost is the per-tool schema rebuild and none of it is the lock or the vecs.
+# It also sets the scale of the route: a 500-tool deployment pays ~120µs of pure
+# CPU on every `GET /api/v1/tools`. That is the number that would justify
+# caching the listing, and it did not exist before this arm.
+fn _b_registry_list_n(name, n_tools, iters): i64 {
+    var reg = _b_registry_of(_b_tool_names(n_tools));
+    var ar = arena_allocator(4194304);
+    agnosai_tool_registry_list_a(ar, reg);
+    reset_via(ar);
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < iters; i = i + 1) {
+        agnosai_tool_registry_list_a(ar, reg);
+        reset_via(ar);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `ToolRegistry::register` throughput (tools.rs:96-107): repeated
+# insert into an ever-growing registry, so the reported per-op figure is the
+# AMORTISED insert including every rehash — 100k entries is ~14 doublings.
+#
+# The tools and their names are built before the timer starts. The oracle builds
+# an `Arc<NamedEcho>` with a `format!`ed name inside its loop and therefore
+# reports insert+allocate; here the loop is insert only, which is the number the
+# registry can actually be held to. What remains inside the window and is the
+# port's own cost, not the oracle's, is the `str_clone(name)` at
+# `src/tools/registry.cyr:46` — Cyrius has no move, so the key is copied.
+#
+# Measured 610ns amortised, against 112ns for a `get` on the same table. The
+# 5.4x is the write side: a `str_clone` allocation per insert plus the rehash
+# amortisation, and 61ms total for 100k inserts is far under the O(n²) a
+# per-insert linear scan would produce — so grow really is amortised O(1).
+# Registration happens at startup, so this is a boot-cost number, not a
+# steady-state one; it is here so a regression in `_map_grow` has somewhere to
+# show up.
+fn _b_registry_register(): i64 {
+    var n = 100000;
+    var names = _b_tool_names(n);
+    var desc = str_from("Named echo stub for benchmarking");
+    var tools = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        var nm = vec_get(names, i);
+        vec_push(tools,
+        agnosai_tool_new(nm, desc, &_b_named_schema, &_agnosai_echo_execute, nm));
+    }
+
+    var reg = agnosai_tool_registry_new();
+    var b = bench_new("tool_registry_register");
+    bench_batch_start(b);
+    for (var k = 0; k < n; k = k + 1) {
+        agnosai_tool_registry_register(reg, vec_get(tools, k));
+    }
     bench_batch_stop(b, n);
     bench_report(b);
     return 0;
@@ -227,6 +436,13 @@ fn _b_segment_ok(): i64 {
 
 fn main() {
     alloc_init();
+    # Hygiene, not a fix: nothing on the paths below logs at or above the stock
+    # `SK_INFO`. `_agnosai_registry_log` (`src/tools/registry.cyr:163`) guards on
+    # `sakshi_get_level() < SK_DEBUG`, which is already true by default, and
+    # load_testing's only ≤INFO logger sits inside `_agnosai_load_testing_execute`,
+    # which no arm here calls. So this moves NO existing number — it is here so a
+    # future default-level change cannot silently start timing a pipe write.
+    sakshi_set_level(SK_FATAL);
 
     _b_aggregate_100k_10workers();
     _b_aggregate_100k_500workers();
@@ -235,6 +451,17 @@ fn main() {
     _b_is_safe_url();
     _b_is_safe_url_numeric();
     _b_registry_get();
+
+    _b_registry_get_n("tool_registry_get_5", 5, 500000);
+    _b_registry_get_n("tool_registry_get_50", 50, 500000);
+    _b_registry_get_n("tool_registry_get_500", 500, 500000);
+    _b_registry_has_pair();
+    _b_registry_list_n("tool_registry_list_50", 50, 20000);
+    # 10x the work per call, so 1/10th the iterations: both arms build 1e6
+    # schemas in total and the two numbers divide cleanly into a per-tool cost.
+    _b_registry_list_n("tool_registry_list_500", 500, 2000);
+    _b_registry_register();
+
     _b_tool_execute_echo();
     _b_form_encode();
     _b_segment_ok();

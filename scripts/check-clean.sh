@@ -28,7 +28,8 @@ note() { printf '  %s\n' "$1"; }
 # step), but leaving benches/ out of the sweep entirely is what let it go unseen.
 n=0
 for f in $(find src -name "*.cyr" | sort) $(find tests -name "*.tcyr" | sort) \
-         $(find benches -name "*.bcyr" | sort); do
+         $(find benches -name "*.bcyr" | sort) \
+         $(find examples -name "*.cyr" 2>/dev/null | sort); do
     [ -e "$f" ] || continue
     n=$((n + 1))
     if ! cyrius fmt "$f" --check >/dev/null 2>&1; then
@@ -43,7 +44,8 @@ echo "fmt: $n files"
 # CHANGELOG, issue, or roadmap entry on the SAME line, or carry `#skip-lint`.
 # The rule is what keeps a deferral from quietly becoming permanent.
 n=0
-for f in $(find src -name "*.cyr" | sort) $(find benches -name "*.bcyr" | sort); do
+for f in $(find src -name "*.cyr" | sort) $(find benches -name "*.bcyr" | sort) \
+         $(find examples -name "*.cyr" 2>/dev/null | sort); do
     [ -e "$f" ] || continue
     n=$((n + 1))
     out=$(cyrius lint "$f" 2>&1)
@@ -58,8 +60,11 @@ done
 echo "lint: $n files"
 
 # --- doc: every public symbol documented ---------------------------------
+# examples/ too — an example whose functions are undocumented is a worse example
+# than one that does not exist, since it is read more than it is run.
 n=0
-for f in $(find src -name "*.cyr" | sort); do
+for f in $(find src -name "*.cyr" | sort) \
+         $(find examples -name "*.cyr" 2>/dev/null | sort); do
     [ -e "$f" ] || continue
     n=$((n + 1))
     if ! out=$(cyrius doc --check "$f" 2>&1); then
@@ -69,6 +74,25 @@ for f in $(find src -name "*.cyr" | sort); do
     fi
 done
 echo "doc: $n files"
+
+# --- doctest: the `# >>>` blocks actually run ----------------------------
+# Added 2026-08-10. `cyrius doctest` EXISTS — an earlier claim in this tree that
+# "Cyrius has no doctest runner" was wrong, and nothing was running the one
+# doctest the port has. It takes a single FILE and has no sweep, so this loops.
+#
+# Only files that contain a `# >>>` block are worth invoking it on: on a file
+# with none it reports "0 passed, 0 failed" and exits 0, so a blanket sweep is
+# just slow rather than wrong.
+n=0
+for f in $(grep -rl '^# >>>' src examples 2>/dev/null | sort); do
+    n=$((n + 1))
+    if ! out=$(cyrius doctest "$f" 2>&1) || ! printf '%s' "$out" | grep -q ', 0 failed'; then
+        note "doctest: $f"
+        printf '%s\n' "$out" | tail -3 | sed 's/^/      /'
+        fail=1
+    fi
+done
+echo "doctest: $n files"
 
 # --- vet + deny: the dependency gates ------------------------------------
 if ! cyrius vet src/main.cyr >/dev/null 2>&1; then

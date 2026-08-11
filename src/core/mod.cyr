@@ -22,16 +22,94 @@
 #
 # `src/id.cyr` must be included before this hub; src/main.cyr does that.
 #
-# Not ported YET. ⚠ This list used to say "outside the v2.0.0 parity bar" — that
-# framing was self-issued, never a user decision, and is **retired**: a cargo
-# feature gate is not a scope boundary. Both are owed.
-#   * the `#[cfg(feature = "hwaccel")]` half of resource.rs — ai-hwaccel
-#     re-exports, TrainingMemoryEstimate, and the detect/from_hwaccel probes.
-#     Roadmap M11; `[deps.ai-hwaccel]` is already declared and vendored, and
-#     `fleet/coordinator` and `fleet/gpu` already call into it.
-#   * `AgentDefinition::personality` — the ONE carve-out the user actually set,
-#     and only because bhava itself is not ported to Cyrius yet. The field
-#     serializes as null meanwhile, for wire parity.
+# ✅ **The `#[cfg(feature = "hwaccel")]` half of resource.rs is PORTED** — M11,
+# 2026-08-10. `agnosai_accelerator_type_from_hwaccel` (:773),
+# `agnosai_hw_inventory_from_hwaccel` (:797) and the whole
+# `TrainingMemoryEstimate` set (:854-910) are in `core/resource.cyr`. This note
+# used to list it as owed, and before that as "outside the v2.0.0 parity bar" —
+# a framing that was self-issued, never a user decision, and is retired: a cargo
+# feature gate is not a scope boundary.
+#
+# One carve-out remains, and it is the ONE the user actually set:
+#   * `AgentDefinition::personality` — deferred; see docs/development/roadmap.md:43
+#     for why and for the exit condition. bhava has no Cyrius port, so there is
+#     nothing to depend on. The field serializes as null meanwhile, which is
+#     exactly what the default Rust build emits, so the wire form matches. It is
+#     the only item the user ever set aside.
+#
+# ## The oracle's doctest
+#
+# `core/mod.rs` carries the one real doctest under `rust-old/src/` — the other
+# three ` ``` ` blocks are `text`, `ignore` and `yaml`, none of which `cargo test`
+# compiles. It parses an `AgentDefinition` from JSON, makes a `Task` and a
+# `CrewSpec`; a doctest asserts that the documented example still runs at all,
+# which is a promise to the reader that outlives any given release.
+#
+#   agnosai_agent_from_json("{\"agent_key\":\"analyst\", \"name\":\"Analyst\",
+#                            \"role\":\"data analyst\", \"goal\":\"analyze data\"}")
+#   agnosai_task_new("Analyze quarterly revenue trends")
+#   agnosai_crew_new("analysis-crew")
+#
+# ⚠ **`cyrius doctest src/core/mod.cyr` runs the block below.** An earlier draft
+# of this note said "Cyrius has no doctest runner" and pinned the example as
+# assertions instead. That was **wrong** — `cyrius doctest <file.cyr>` exists and
+# executes the `# >>>` lines, checking the result against `# ===`. Verify a
+# claimed toolchain gap against bare `cyrius` before writing around it.
+#
+# ⚠ **`cyrius doctest` auto-prepends NOTHING** — not `[deps].stdlib`, not the
+# `[deps.NAME]` bundles, not even `lib/str.cyr`. Measured: a doctest calling
+# `str_from` in this project reports `undefined function 'str_from'`. That is why
+# 24 `include` lines precede two lines of actual example. `cyrius tests` and
+# `cyrius bench` DO prepend, so the habit built on `.tcyr` files does not carry
+# over, and the failure is a compile error rather than anything that names the
+# real cause. cyrius's own `lib/hashmap.cyr` doctest is broken by exactly this —
+# it includes `lib/string.cyr` where it needs `lib/str.cyr` — and is filed
+# upstream.
+#
+# **Keep the include list in step with `src/main.cyr`.** If a new `[deps]` entry
+# becomes reachable from `core/`, this block breaks and `check-clean.sh` will say
+# so. `tests/core_mod_doctest.tcyr` remains alongside it: a doctest can only
+# check an exit code, and the suite checks the fields.
+#
+# >>> include "lib/syscalls.cyr"
+# >>> include "lib/alloc.cyr"
+# >>> include "lib/result.cyr"
+# >>> include "lib/fmt.cyr"
+# >>> include "lib/io.cyr"
+# >>> include "lib/str.cyr"
+# >>> include "lib/string.cyr"
+# >>> include "lib/vec.cyr"
+# >>> include "lib/slice.cyr"
+# >>> include "lib/hashmap.cyr"
+# >>> include "lib/chrono.cyr"
+# >>> include "lib/args.cyr"
+# >>> include "lib/fs.cyr"
+# >>> include "lib/process.cyr"
+# >>> include "lib/atomic.cyr"
+# >>> include "lib/sync.cyr"
+# >>> include "lib/thread.cyr"
+# >>> include "lib/random.cyr"
+# >>> include "lib/sha1.cyr"
+# >>> include "lib/math.cyr"
+# >>> include "lib/bayan.cyr"
+# >>> include "lib/sakshi.cyr"
+# >>> include "lib/ai-hwaccel.cyr"
+# >>> include "src/units.cyr"
+# >>> include "src/order.cyr"
+# >>> include "src/id.cyr"
+# >>> include "src/core/mod.cyr"
+# >>> var _J = "{\"agent_key\":\"analyst\",\"name\":\"Analyst\",";
+# >>> var _K = "\"role\":\"data analyst\",\"goal\":\"analyze data\"}";
+# >>> fn main() {
+# >>>     alloc_init();
+# >>>     var j = str_cat(str_from(_J), str_from(_K));
+# >>>     if (agnosai_agent_from_json(j) == 0) { return 1; }
+# >>>     if (agnosai_task_new(str_from("Analyze quarterly revenue trends")) == 0) { return 2; }
+# >>>     if (agnosai_crew_new(str_from("analysis-crew")) == 0) { return 3; }
+# >>>     return 0;
+# >>> }
+# >>> var r = main(); syscall(60, r);
+# === 0
 # =========================================================================
 
 include "src/core/error.cyr"

@@ -175,6 +175,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a single slot passed the whole suite. Added; that suite is now **55
   assertions**.
 
+- **M12 bite 3c — the scoring benchmarks, and they confirm an O(n²) sort.**
+  All seven `rust-old/benches/scoring.rs` ids are now in `benches/orch.bcyr`.
+  The oracle sorts with `sort_by` (pdqsort, O(n log n),
+  `rust-old/src/orchestrator/scoring.rs:212`); the port hand-rolls an insertion
+  sort (`src/orchestrator/scoring.cyr:294-303`).
+
+  | agents | measured | |
+  |---|---|---|
+  | 100 | **127.8 µs** | sort ≈ 33% |
+  | 300 | **626.0 µs** | predicted 637.8 — **within 2%** |
+  | 1000 | **5093.0 µs** | sort ≈ 83% |
+
+  Fitting `a·n + b·n²` to the 100 and 1000 points gives a = 0.863 µs (scoring)
+  and b = 0.00421 µs (sort). The 300-agent row is an **independent** point that
+  tests that fit rather than being used to build it — two points can be fitted by
+  a quadratic but not tested against one. Crossover at **n ≈ 205**.
+
+  ⚠ **A performance note, not a DoS vector — the previous entry said otherwise
+  and was wrong.** `AGNOSAI_CREW_MAX_AGENTS` is **100**, enforced at
+  `src/server/routes/crews.cyr:353`, so nothing reachable over HTTP passes n=100,
+  where the sort is a third of a 128 µs call. The crossover is beyond the cap.
+  Only a direct library caller is unbounded. I had repeated the gap analysis's
+  "attacker-influenceable agent count" without checking for a cap.
+
+  ⚠ The agents must be **varied**. Identical agents tie on every score, and a
+  stable insertion sort walks a tied list in O(n) because the shift loop breaks
+  on the first comparison — which is exactly why `rank_agents_16`, 16 identical
+  agents, never showed this in two weeks of history.
+
+  **Left open deliberately:** whether to replace the sort. It is a real
+  complexity divergence, so CLAUDE.md wants a fix or an ADR — but at the enforced
+  cap it costs ~42 µs, and the honest answer may be an ADR recording the bound.
+
+- **M12 bite 3b — the 83 bench gaps are closed.** Six agents, one per
+  `benches/*.bcyr`, each compiling and running its own file; every result then
+  handed to a separate agent told to assume it was wrong. **All 9 files compile;
+  `bench-history.csv` goes 106 → 190 rows.**
+
+  The six adversarial reports are kept verbatim in
+  [`docs/development/m12-bench-audit-2026-08-10.md`](docs/development/m12-bench-audit-2026-08-10.md)
+  with triage. **Several shipped comments are known-wrong and are listed there
+  rather than fixed** — read a file's section before editing its rows.
+
+  Two acted on, and the pair is the point:
+
+  - **FIXED — four fleet placement shapes never reached the sort.**
+    `vec_sort_by` (`lib/vec.cyr:340-352`) runs an O(n) already-ordered pre-check
+    and returns before `_vec_introsort`. Their comments claimed they guarded the
+    score-only-comparator divergence at `src/fleet/placement.cyr:20-23` — with
+    which every adjacent compare returns 0, the pre-check still short-circuits,
+    and the timing is identical. Structurally blind to the one regression named.
+
+    ⚠ **Reordering the input does not fix it**, which the first attempt did:
+    `AGN_PR_INDEX` comes from the scan position (`placement.cyr:283`) and
+    survivors are pushed in scan order, so output indices are ascending *by
+    construction*. A stride shuffle measured **11.763µs** against **11.722µs** —
+    no difference, because there was none to measure. Varying the *scores* over a
+    four-tier VRAM sawtooth prices it: **19.53µs against 11.80µs.**
+
+  - **REJECTED — `clock_epoch_secs = 1.318µs` is real.** A verifier called it
+    unsourced and implausible, reasoning from `lib/bench.cyr:6`'s documented
+    `clock_gettime: ~120ns` and from `uuid_v4_generate` costing 501ns while
+    making a real `getrandom`. Measured independently at 2,000,000 iterations:
+    **1.315µs**. The implementing agent was right and the verifier — in the
+    confident, well-cited style that reads as reliable — was wrong.
+
+    ⚠ **It is `lib/bench.cyr`'s constant that does not hold here**, by 11×,
+    because Cyrius issues a raw `syscall(228, …)` rather than taking the vDSO
+    path. That constant is what every benchmark in the ecosystem implicitly
+    subtracts. The figure is now a measured row (`clock_epoch_secs_baseline`) so
+    the arithmetic is falsifiable from the CSV rather than asserted in prose.
+
+  Six of fleet's 19 gaps — the `scoring.rs` set — shipped nowhere; closed
+  2026-08-11, see the next entry.
+
 - **The remaining bench gap is mapped, by a seven-way parallel analysis with an
   adversarial audit on each.** Every oracle criterion id classified against the
   tree: **83 real gaps, 10 already covered**, targeting `core`, `orch`, `tools`,
@@ -266,6 +341,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Found by an **adversarial audit** of a benchmark-gap analysis, which flagged it
   as a blocker the analysis itself had not mentioned.
+
+- **M12 bite 7 — the user-facing docs described a binary that no longer exists.**
+  `README.md`, `docs/guides/api-reference.md` and `docs/architecture/overview.md`
+  all told a reader to run **`agnosai-server`**, the Rust tree's
+  `[[bin]]`. The Cyrius build produces one binary, **`agnosai`**
+  (`cyrius.cyml` `[build].output` / `[release].bins`). Every instruction in the
+  README's Quick Start was a `cargo` command against a tree with no root
+  `Cargo.toml`, including a `make check` with no Makefile.
+
+  Corrected across all three, plus: the "Usage as a Library" section now shows a
+  `[deps.agnosai]` stanza and Cyrius code (the Rust version is kept in a
+  `<details>` for comparison, since it is still the parity oracle); the test-suite
+  section shows `cyrius tests tests` and the real numbers; and the project-structure
+  block notes that its `[feature: …]` tags are the Rust tree's cargo features and
+  **are not scope boundaries here** — every module so tagged is built
+  unconditionally.
+
+  ⚠ **`docs/guides/adding-wasm-tools.md`'s `cargo build --target wasm32-wasip1`
+  is CORRECT and was left alone.** That instruction is for a third-party tool
+  author building against the Rust SDK, which is exactly the surface that stays
+  Rust. Sweeping every `cargo` out of the docs would have broken it.
+
+- **M12 bite 6 — the four `cargo-fuzz` targets, as real `fuzz/*.fcyr` harnesses.**
+  **3,414 malformed inputs across four harnesses, zero faults.**
+
+  ⚠ **`cyrius fuzz` EXISTS, and a first draft of this work was written around a
+  claim that it did not.** So does `cyrius doctest`. Both were asserted absent
+  without running bare `cyrius`, which lists them under *Quality*. The standing
+  rule — verify a claimed toolchain gap before writing around it — was already in
+  memory and was not followed. The draft `tests/fuzz_parsers.tcyr` is deleted in
+  favour of the idiomatic form.
+
+  ⚠ **And underneath that, a worse finding: `tests/agnosai.fcyr` — the harness
+  `cyrius port` scaffolded on 2026-07-28 — had a `fuzz_main` that returned 0
+  without reading its input.** `cyrius fuzz` had been reporting `1 passed` for it
+  ever since, for a harness that tested nothing. Nothing in CI ran it either. The
+  same was true of `tests/agnosai.bcyr`, a scaffolded `noop` benchmark sitting in
+  `tests/` where an audit of `benches/*.bcyr` could not see it — now
+  `benches/harness.bcyr`, kept because a measurement floor is genuinely useful,
+  with its bench name unchanged so its history stays continuous.
+
+  `fuzz_main(data, len)` mirrors libfuzzer's `fuzz_target!(|data: &[u8]|)`. All
+  four oracle targets are the same four lines — arbitrary UTF-8 into a parser,
+  result discarded — so the property is *no panic* and the value is entirely in
+  the input distribution. `cyrius fuzz` does not generate input, and a random
+  generator would be **worse**: a fuzz failure CI cannot reproduce is a failure
+  nobody fixes.
+
+  So the corpus is deterministic, built from the two generators that actually
+  find parser bugs: a **truncation sweep** (every prefix of a valid document,
+  which walks every length check and look-ahead straight off its boundary) and a
+  **byte-substitution sweep** (each offset × NUL, `"`, `\`, `{`, `]`, 0xFF),
+  plus 25 hand-written JSON-killers — lone surrogates, `1e999999`,
+  `9223372036854775808`, an embedded NUL, 64-deep nesting both closed and left
+  open.
+
+  ⚠ **It reaches past the oracle.** libfuzzer guards with
+  `if let Ok(s) = std::str::from_utf8(data)`, so the Rust targets only ever see
+  valid UTF-8. A Cyrius `Str` is bytes and `bayan_json_v_parse_buf` takes
+  (ptr, len), so **0xFF reaches the parser here and cannot upstream**.
+
+  ⚠ The suite re-parses the pristine seed after every sweep. A parser can survive
+  malformed input by leaving a scratch buffer or a global error slot in a state
+  that breaks the *next* caller, and that failure never appears as a crash during
+  the sweep. The corpus size is asserted **exactly** rather than as a threshold,
+  because a threshold passes while half the corpus quietly stops being generated.
+
+  Found in passing: **`agnosai_crew_from_value` requires `id`**, and it is the
+  only required field — `name`, `agents` and `tasks` all default — so a seed
+  without one makes the whole sweep re-measure the same early return. The first
+  draft of the corpus had exactly that bug.
+
+  Both `cyrius fuzz` and `cyrius doctest` are now gated: `fuzz` as its own CI
+  step, `doctest` in `check-clean.sh` over every file carrying a `# >>>` block.
+
+- **M12 bite 5 — the doctest and `examples/`.**
+
+  **`src/core/mod.cyr` now carries a real `# >>>` doctest that `cyrius doctest`
+  runs**, plus `tests/core_mod_doctest.tcyr` (13 assertions) at the assertion
+  level, since a doctest can only check an exit code. Only **one** of the four
+  fenced blocks under `rust-old/src/` is a real doctest, `core/mod.rs`'s — the
+  others are ` ```text `, ` ```ignore ` and ` ```yaml `, and `cargo test`
+  compiles none of them.
+
+  ⚠ **`cyrius doctest` auto-prepends NOTHING** — not `[deps].stdlib`, not the
+  `[deps.NAME]` bundles, not even `lib/str.cyr`, where `cyrius tests` and
+  `cyrius bench` prepend all of it. Measured: a doctest calling `str_from` in
+  this project reports `undefined function 'str_from'`. That is why **24
+  `include` lines** precede two lines of example. cyrius's own `lib/hashmap.cyr`
+  doctest is broken by exactly this — it includes `lib/string.cyr` where it needs
+  `lib/str.cyr` — and both are filed upstream as
+  `2026-08-10-doctest-does-not-auto-prepend-deps-like-tests-and-bench-do.md`.
+
+  ⚠ Every symbol it touches is already covered by `core_agent`/`core_task`/
+  `core_crew`, and that is not the point. A doctest asserts that **the example a
+  reader is shown still works** — the one test that fails when an API change
+  silently invalidates the prose. `src/core/mod.cyr` now carries the block it
+  mirrors, with a note to move both together.
+
+  **`examples/simple_crew.cyr`** is the first file in a directory `README.md:35`
+  had been documenting for months. It builds and runs against nothing:
+
+  ```
+  Crew completed with status: completed
+    task output: Analyze the project structure
+  ```
+
+  ⚠ **`sdk/agnosai-tool-sdk/` and `rust-old/examples/wasm-tools/` stay Rust, and
+  that is a decision, not a deferral.** The SDK is published to *third-party tool
+  authors* who compile it to `wasm32-wasip1`; the sandbox executes the result.
+  Neither is linked into `build/agnosai`. Rewriting them in Cyrius would break
+  every tool author on the published protocol. What agnosai owes is
+  **conformance** — that `tools/wasm_tool.cyr` implements the SDK's
+  `{"parameters": …}` / `{"result", "success", "error"}` contract, which it does
+  and `tests/tools_wasm.tcyr` pins.
+
+  Also corrected: `src/core/mod.cyr` still listed the `#[cfg(feature = "hwaccel")]`
+  half of `resource.rs` as "not ported YET". **It shipped with M11** —
+  `agnosai_hw_inventory_from_hwaccel` and the whole `TrainingMemoryEstimate` set
+  are at `core/resource.cyr:773-910`. `AgentDefinition::personality` is now the
+  only carve-out, and it is the one the user actually set.
 
 - **M12 bite 4 — `tests/integration_crew_with_tools.tcyr`.**
   `rust-old/tests/crew_with_tools.rs` sits under `rust-old/tests/` rather than in
@@ -1091,9 +1287,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `…AQEA5Wu/jjUwgB2e1/Bn…`), and both auth suites pass without it — **133 + 9
   assertions, 0 failures**.
 
-  ⚠ **Deleting the file does not remove the key**; it is reachable from
-  `bb76e67` for anyone who clones. A history rewrite is a maintainer decision and
-  is not taken here.
+  ⚠ **Deleting the file does not remove the key** — it stays reachable from
+  `bb76e67`. **Maintainer decision: no history rewrite; accepted as is.** The key
+  was generated locally for a probe and was never a credential for anything.
+  Recorded so it is not re-raised as a finding later.
 
   agnosai never signs — it only verifies — and the one keypair any test needs is
   baked into `tests/server_auth_vectors.cyr` as frozen RS256 vectors precisely so
@@ -1102,12 +1299,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The cleanliness gate and CI now cover `benches/`.** `scripts/check-clean.sh`
+- **The cleanliness gate and CI now cover `benches/` and `examples/`.** `scripts/check-clean.sh`
   swept `src/` and `tests/` and never `benches/`, and CI ran `check-clean.sh`,
   the tests and `cyrius coverage` but never `cyrius bench`. So **nothing in the
   pipeline compiled a `.bcyr`**, which is how three of them rotted for three days
-  (see Added). `.bcyr` files now join the fmt loop (207 → 214 files) and the lint
-  loop (111 → 118), and CI gains a `Benchmarks` step.
+  (see Added). `.bcyr` and `examples/*.cyr` now join the fmt loop (207 → 219
+  files), the lint loop (111 → 122) and — for examples — the doc loop
+  (111 → 112). CI gains **`Examples`**, **`Fuzz harnesses`** and **`Benchmarks`**
+  steps, and `check-clean.sh` gains a **`doctest`** pass over every file carrying
+  a `# >>>` block.
+
+  ⚠ **Four `cyrius` gates existed and exactly one was in CI.** All five are now:
+
+  | gate | what it found the day it was first run |
+  |---|---|
+  | `cyrius bench` | 3 of 6 `.bcyr` did not compile; 50 of 79 shapes dead |
+  | `cyrius fuzz` | the only harness was a scaffold whose `fuzz_main` ignored its input — passing since 2026-07-28 |
+  | `cyrius doctest` | never run; the tree had no doctest, and a note claimed the runner did not exist |
+  | `cyrius coverage` | already gated, and clean — 1561/1561 |
+
+  None of them was silent — each exits non-zero. They were never invoked, and two
+  of the three were claimed absent without running bare `cyrius`.
+
+  ⚠ **`examples/` was discovered by nothing at all** — not `cyrius tests`, not
+  `cyrius bench`, not the `[build].entry`. The first file added to it would have
+  rotted the same way, silently, which is why the gate went in alongside it
+  rather than after it.
 
   ⚠ That step is there for the **compile**, not the numbers. CI timings are too
   noisy to gate on and `bench-history.csv` is recorded from a quiet machine —

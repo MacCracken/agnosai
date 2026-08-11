@@ -1,6 +1,11 @@
 # API Reference
 
-AgnosAI exposes a REST API via the `agnosai-server` binary, built on [axum](https://github.com/tokio-rs/axum).
+AgnosAI exposes a REST API from the `agnosai` binary, served by
+[sandhi](https://github.com/MacCracken/sandhi) over a pooled worker model.
+
+> Both names in the previous sentence changed with the Cyrius port: the binary
+> was `agnosai-server` and the server was axum. The routes, status codes and
+> bodies below did not — they are held to the Rust tree as the parity oracle.
 
 ## Endpoints
 
@@ -271,7 +276,8 @@ Currently returns an empty array. The preset library endpoint is on the roadmap.
 ## Running the Server
 
 ```bash
-cargo run --bin agnosai-server
+cyrius build src/main.cyr build/agnosai
+./build/agnosai
 ```
 
 The server binds to `0.0.0.0:8080` by default. Use `PORT` or `AGNOSAI_PORT` to change the port.

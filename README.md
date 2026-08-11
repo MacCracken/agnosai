@@ -30,38 +30,75 @@ agnosai
 │   ├── learning/         Adaptive learning & reinforcement learning
 │   ├── server/           HTTP API server (REST, health probes, SSE)
 │   └── definitions/      Preset library, crew assembly, packaging [feature: definitions]
-├── benches/              Criterion benchmarks
-├── tests/                Integration tests
-├── examples/             Usage examples
+├── benches/              Benchmarks — flat *.bcyr, discovery is NOT recursive
+├── tests/                Test suites — *.tcyr, discovered recursively
+├── examples/             Runnable examples — *.cyr, built by CI
+├── rust-old/             The frozen Rust v1.1.0 tree, kept as the parity oracle
 └── docs/                 Guides, ADRs, architecture docs
 ```
+
+The `[feature: …]` tags above are the Rust tree's cargo features. **They are not
+scope boundaries here** — every one of those modules is ported and built
+unconditionally.
 
 See [Architecture Overview](docs/architecture/overview.md) for detailed design.
 
 ## Quick Start
 
 ```bash
-# Build
-cargo build
+# Resolve dependencies into lib/
+cyrius deps
+
+# Build — produces build/agnosai
+cyrius build src/main.cyr build/agnosai
 
 # Run the API server
-cargo run --bin agnosai-server
+./build/agnosai
 
-# Run tests
-cargo test
+# Run every test suite (recursive)
+cyrius tests tests
 
-# Run all CI checks locally
-make check
+# Benchmarks, and the 80% coverage gate
+cyrius bench
+cyrius coverage --min 80
+
+# Everything CI runs, locally
+./scripts/check-clean.sh && ./scripts/check-symbols.sh
 ```
+
+> **The binary is `agnosai`, not `agnosai-server`.** The Rust tree built a
+> `[[bin]] agnosai-server`; the Cyrius tree builds one binary named for the
+> project, declared in `cyrius.cyml` as `[build].output` and `[release].bins`.
+> There is no `Cargo.toml` and no `make check`.
 
 ## Usage as a Library
 
-Add to your `Cargo.toml`:
+Add to your `cyrius.cyml`:
 
 ```toml
-[dependencies]
-agnosai = { git = "https://github.com/maccracken/agnosai" }
+[deps.agnosai]
+git = "https://github.com/MacCracken/agnosai.git"
+tag = "2.0.0"
 ```
+
+Then `include` the groups you need — Cyrius resolution is single-pass, so callees
+must precede callers. A complete, runnable version of the example below is
+[`examples/simple_crew.cyr`](examples/simple_crew.cyr):
+
+```cyr
+var orchestrator = agnosai_orchestrator_new(0);
+
+var crew = agnosai_crew_new(str_from("example-crew"));
+var tasks = vec_new();
+vec_push(tasks, agnosai_task_new(str_from("Analyze the project structure")));
+agnosai_crew_with_tasks(crew, tasks);
+
+var state = agnosai_orchestrator_run_crew(orchestrator, crew);
+# -> "completed", with each task's output in agnosai_crew_state_results(state)
+```
+
+<details>
+<summary>The equivalent in the frozen Rust tree, for comparison</summary>
 
 ```rust
 use agnosai::core::{AgentDefinition, CrewSpec, Task, ProcessMode, TaskPriority};
@@ -100,6 +137,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+</details>
 
 ## Agent Definitions
 
@@ -157,12 +196,25 @@ First-class multi-node support:
 ## Test Suite
 
 ```
-$ cargo test
+$ cyrius tests tests
 ...
-test result: ok. 863 passed; 0 failed; 0 ignored
+99 passed, 0 failed
 ```
 
-Tests cover core types, orchestration (all 4 process modes), DAG cycle detection, agent scoring, priority scheduling, pub/sub, IPC, LLM provider routing, tool registry, and API routes.
+```
+$ cyrius coverage --min 80
+Functions referenced: 1561/1561 (100%)  [reference coverage — a floor, not a correctness proof]
+```
+
+Tests cover core types, orchestration (all 4 process modes), DAG cycle detection,
+agent scoring, priority scheduling, pub/sub, IPC, LLM provider routing, the tool
+registry, API routes, the WASM and process sandboxes, and a deterministic parser
+fuzz sweep.
+
+The parity bar is the frozen Rust tree at [`rust-old/`](rust-old/), which carries
+**863** test functions across 84 modules; the Cyrius suites are organised
+differently and go past it in several places — see
+[`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 ## Documentation
 

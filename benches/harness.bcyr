@@ -1,0 +1,38 @@
+# =========================================================================
+# harness.bcyr — the measurement floor every other number sits on.
+#
+# `noop` is an empty call in a tight loop: whatever it reports is what the
+# harness itself costs, and no benchmark in this tree can legitimately come in
+# below it. It has been in `bench-history.csv` since 2026-07-31 and reads **2ns**,
+# which is the direct-call cost `lib/bench.cyr:8` documents.
+#
+# ⚠ **This file was `tests/agnosai.bcyr` until 2026-08-10** — a `cyrius port`
+# scaffold living in `tests/`, which is why an audit of `benches/*.bcyr` did not
+# see it even while three files in that directory were failing to compile.
+# CLAUDE.md says benches are flat in `benches/`; this now is. The bench NAME is
+# unchanged, so its history is continuous.
+#
+# ⚠ `lib/bench.cyr:6` documents `clock_gettime: ~120ns`. On this host it is
+# **1.32us** — measured at 2,000,000 iterations as `clock_epoch_secs_baseline`
+# in `benches/fleet.bcyr`, because Cyrius issues a raw `syscall(228, ...)` rather
+# than taking the vDSO path. Anything subtracting the documented constant is
+# subtracting the wrong number by 11x.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+fn bench_noop(): i64 { return 0; }
+
+fn main(): i64 {
+    alloc_init();
+    var b = bench_new("noop");
+    bench_batch_start(b);
+    var i = 0;
+    while (i < 1000000) { bench_noop(); i = i + 1; }
+    bench_batch_stop(b, 1000000);
+    bench_report(b);
+    return 0;
+}
+
+var r = main();
+syscall(60, r);

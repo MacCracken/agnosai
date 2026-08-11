@@ -1,0 +1,292 @@
+# =========================================================================
+# definitions.bcyr — benchmarks for the definitions group.
+#
+# Oracle bench file: rust-old/benches/definitions.rs — three criterion
+# functions (`builtin_presets (18 preset parse)`,
+# `assemble_team (5 members, 20 agents)`, `load_preset_from_json (5 agents)`),
+# **none of which had a Cyrius counterpart**. Not one `.bcyr` in this tree even
+# *included* a `src/definitions/*` file, so preset parsing and crew assembly —
+# the whole declarative side of AgnosAI — had no number at all.
+#
+# ⚠ **Two things the oracle's setup hides are load-bearing and reproduced
+# exactly; do not "fix" them.** `make_agent` (definitions.rs:24-28) binds
+# `_complexity` and throws it away, so all 20 agents keep the serde default
+# `"medium"` and only member[0] ever collects the +2 complexity bonus. And the
+# agent NAMES are `"agent-{i} Agent"`, which contain none of the five role
+# words, so the +2 name-contains-role bonus never fires either. Both facts move
+# the number; a setup that "corrects" them stops measuring the oracle's shape.
+#
+# ⚠ **The 5-agent document is whitespace-collapsed** relative to the oracle's
+# indented raw literal. JSON whitespace between tokens is insignificant and
+# `src/definitions/presets_data.cyr` already collapses for exactly this reason —
+# recorded here so the divergence is on the record rather than discovered.
+#
+# Two port-local shapes have NO oracle id and are marked as such at their
+# definitions: `assembler_match_score` and `preset_to_value_18`.
+#
+# ⚠ **Finding for whoever owns benches/server.bcyr**: `GET /api/v1/presets`
+# (`agnosai_route_list_presets_a`, src/server/routes/definitions.cyr:35-42)
+# re-runs `agnosai_builtin_presets()` on EVERY request — 18 JSON parses and ~72
+# agent structs per GET, with no cache anywhere in src/definitions/loader.cyr.
+# `builtin_presets_18` plus `preset_to_value_18` below is the per-request floor
+# for that endpoint, and is the pair of numbers a memoization ADR would argue
+# from. `src/server/router.cyr:567` has no arena arm for that id, so only a
+# global-allocator `route_presets_global` bench is possible.
+#
+# These numbers start the CYRIUS baseline. They are NOT comparable to
+# rust-old/bench-history.csv. See CLAUDE.md.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+# The narrow list, NOT `src/definitions/mod.cyr`: that hub also pulls
+# `k8s_crd`, `versioning` and `packaging`, and packaging needs sankoch's `zip_*`
+# (mod.cyr:19-20) — none of which these benches touch. The relative order
+# `assembler` → `presets_data` → `loader` is the hub's own (mod.cyr:30-33) and
+# is a hard dependency constraint: Cyrius resolves in a single pass.
+#
+# `src/order.cyr` is deliberately absent even though
+# `tests/definitions_loader.tcyr` carries it: nothing in `strcase`, `core/`,
+# `assembler` or `loader` names an `agnosai_order_*` symbol, and building
+# without it was verified rather than assumed.
+include "src/units.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/assembler.cyr"
+include "src/definitions/presets_data.cyr"
+include "src/definitions/loader.cyr"
+
+# The oracle's document from definitions.rs:71-84, field for field, collapsed to
+# one logical line. Continued in `presets_data.cyr`'s style so every line stays
+# inside the 120-byte lint limit.
+var _B_PRESET_JSON_5A = "{\"name\":\"bench-preset\",\"description\":\"Benchmark preset with 5 agents\",\"domain\":\
+\"software-engineering\",\"size\":\"standard\",\"version\":\"1.0.0\",\"agents\":[{\"agent_key\":\"a1\",\"name\":\
+\"Agent 1\",\"role\":\"developer\",\"goal\":\"Write code\",\"tools\":[\"git\",\"cargo\"],\"complexity\":\"high\"},{\
+\"agent_key\":\"a2\",\"name\":\"Agent 2\",\"role\":\"tester\",\"goal\":\"Test code\",\"tools\":[\"pytest\",\"selenium\
+\"],\"complexity\":\"medium\"},{\"agent_key\":\"a3\",\"name\":\"Agent 3\",\"role\":\"reviewer\",\"goal\":\"Review PRs\
+\",\"tools\":[\"git\"],\"complexity\":\"medium\"},{\"agent_key\":\"a4\",\"name\":\"Agent 4\",\"role\":\"deployer\",\
+\"goal\":\"Deploy apps\",\"tools\":[\"docker\",\"kubectl\",\"helm\"],\"complexity\":\"high\"},{\"agent_key\":\"a5\",\
+\"name\":\"Agent 5\",\"role\":\"analyst\",\"goal\":\"Analyze data\",\"tools\":[\"sql_query\",\"chart_gen\"],\
+\"complexity\":\"low\"}]}";
+
+# ── builtin_presets ──────────
+
+# The oracle's `builtin_presets (18 preset parse)`.
+#
+# One call parses all eighteen embedded documents — ~26.6 KB of source
+# collapsed to ~20 KB, 72 agent objects — from scratch, every iteration. The
+# documents are `var` literals in `src/definitions/presets_data.cyr`, so there
+# is no IO here and nothing to hoist: the parse IS the measurement.
+#
+# ⚠ The `vec_len` guard is deliberately OUTSIDE the batch even though the
+# oracle's closure carries `assert!(!presets.is_empty())`. No `.bcyr` in this
+# tree asserts inside a timed region, and the check costs nothing hoisted. It
+# also serves as the first-touch warm-up so heap growth is not charged to
+# iteration 0, and it fails loudly if the generated file ever stops holding
+# eighteen parseable documents — which would silently make this bench cheap.
+fn _b_builtin_presets(): i64 {
+    if (vec_len(agnosai_builtin_presets()) != 18) { return 1; }
+
+    var n = 1000;
+    var b = bench_new("builtin_presets_18");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_builtin_presets(); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# ── assemble_team ────────────
+
+# The oracle's `make_agent` (definitions.rs:24-28) plus the `i % 5` / `i % 4`
+# tables from its `available` builder.
+#
+# ⚠ COMPLEXITY IS LEFT AT THE DEFAULT ("medium", src/core/agent.cyr:92) on
+# purpose: the oracle computes an `i % 3` complexity, passes it to `make_agent`
+# as `_complexity`, and never stores it. Calling `agnosai_agent_with_complexity`
+# here would change which agents collect the +2 bonus, and the reported number
+# would stop being the oracle's.
+fn _b_def_agent(i): i64 {
+    var role = str_from("analyst");
+    var m5 = i % 5;
+    if (m5 == 0) { role = str_from("tester"); }
+    if (m5 == 1) { role = str_from("developer"); }
+    if (m5 == 2) { role = str_from("reviewer"); }
+    if (m5 == 3) { role = str_from("deployer"); }
+
+    var tools = vec_new();
+    var m4 = i % 4;
+    if (m4 == 0) { vec_push(tools, str_from("selenium")); vec_push(tools, str_from("pytest")); }
+    if (m4 == 1) { vec_push(tools, str_from("git")); vec_push(tools, str_from("cargo")); }
+    if (m4 == 2) { vec_push(tools, str_from("docker")); vec_push(tools, str_from("kubectl")); }
+    if (m4 == 3) { vec_push(tools, str_from("sql_query")); vec_push(tools, str_from("chart_gen")); }
+
+    var key = str_cat(str_from("agent-"), str_from_int(i));
+    var goal = str_cat(str_from("Handle "), str_cat(role, str_from(" tasks")));
+    var a = agnosai_agent_new(key, role, goal);
+    agnosai_agent_with_name(a, str_cat(key, str_from(" Agent")));
+    agnosai_agent_with_tools(a, tools);
+    return a;
+}
+
+# The oracle's five `TeamMember`s. The `0` in members[1] and members[3] is the
+# oracle's `None`, per the `AGN_TMEM_COMPLEXITY` contract at
+# src/definitions/assembler.cyr:44-45 — not a placeholder left to fill in.
+fn _b_def_members(): i64 {
+    var t1 = vec_new();
+    vec_push(t1, str_from("selenium"));
+    var t2 = vec_new();
+    vec_push(t2, str_from("git"));
+    vec_push(t2, str_from("cargo"));
+    var t4 = vec_new();
+    vec_push(t4, str_from("docker"));
+    var t5 = vec_new();
+    vec_push(t5, str_from("sql_query"));
+
+    var members = vec_new();
+    vec_push(members, agnosai_team_member_new(str_from("tester"), t1, str_from("medium")));
+    vec_push(members, agnosai_team_member_new(str_from("developer"), t2, 0));
+    vec_push(members, agnosai_team_member_new(str_from("reviewer"), vec_new(), str_from("high")));
+    vec_push(members, agnosai_team_member_new(str_from("deployer"), t4, 0));
+    vec_push(members, agnosai_team_member_new(str_from("analyst"), t5, str_from("low")));
+    return members;
+}
+
+# The oracle's `assemble_team (5 members, 20 agents)`. Both vectors are built
+# OUTSIDE the timed region, exactly as the oracle builds them outside `b.iter`.
+#
+# One call is 5 × 20 = 100 `match_score` evaluations plus the `max_by` scan and
+# one result vec — the only allocation in the whole call, since the picks are
+# borrowed pointers into `available` (assembler.cyr:164-171).
+#
+# n=5000 puts this at 500k inner passes, the band `benches/orch.bcyr` already
+# sizes its scoring shapes to (`rank_agents_16` 320k, `delegate_16_tasks_16
+# _agents` 512k).
+fn _b_assemble_team(): i64 {
+    var available = vec_new();
+    for (var i = 0; i < 20; i = i + 1) { vec_push(available, _b_def_agent(i)); }
+    var members = _b_def_members();
+
+    # Untimed guard: every one of the five roles is present among the twenty
+    # agents, so all five members must match. A setup that quietly stopped
+    # matching would report a cheaper scan (`_agnosai_assembler_best` still
+    # walks all twenty, but nothing is pushed) against the oracle's name.
+    if (vec_len(agnosai_assemble_team(members, available)) != 5) { return 1; }
+
+    var n = 5000;
+    var b = bench_new("assemble_team_5m_20a");
+    bench_batch_start(b);
+    for (var j = 0; j < n; j = j + 1) { agnosai_assemble_team(members, available); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# NO ORACLE ID — port-local. One (member, agent) pair, isolating the string
+# folding (`agnosai_str_eq_ci` / `agnosai_str_contains_ci`, src/strcase.cyr:41
+# and :64) from the `max_by` scan and the result vec that `assemble_team`
+# wraps around it.
+#
+# The pair is the oracle's members[0] × available[0]: role "tester" against the
+# "tester" agent, one overlapping tool, and matching complexity — so it scores
+# 10 + 3 + 2 = 15 and walks every arm of the ladder except the two `contains`
+# fallbacks. Worth having on its own because the module header
+# (src/definitions/assembler.cyr:9-17) records that the `>=` last-max rule is
+# untested by the oracle: a per-pair number makes any future change to the scan
+# visible against a scan-free baseline.
+#
+# Built inline rather than reaching into `_b_assemble_team`'s locals, which are
+# not shared.
+fn _b_match_score(): i64 {
+    var agent = _b_def_agent(0);
+    var want = vec_new();
+    vec_push(want, str_from("selenium"));
+    var member = agnosai_team_member_new(str_from("tester"), want, str_from("medium"));
+
+    var n = 500000;
+    var b = bench_new("assembler_match_score");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_assembler_match_score(member, agent); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# ── load_preset_from_json ────
+
+# The oracle's `load_preset_from_json (5 agents)` — the per-document cost, where
+# `builtin_presets_18` above is the 18-document aggregate.
+#
+# `str_from` borrows the literal rather than copying it, so hoisting it out of
+# the loop is correctness and not just speed: left inside, every iteration would
+# pay a Str-header allocation the oracle's `&str` does not.
+#
+# ⚠ The untimed `== 0` guard matters more than it looks. The oracle
+# `.unwrap()`s, so a document this bench could not parse would quietly measure
+# the much cheaper error arm (`agnosai_preset_from_value` bails on the first
+# missing field) and report a fast, meaningless number.
+fn _b_load_preset_from_json(): i64 {
+    var js = str_from(_B_PRESET_JSON_5A);
+    if (agnosai_load_preset_from_json(js, 0) == 0) { return 1; }
+
+    var n = 20000;
+    var b = bench_new("load_preset_from_json_5a");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_load_preset_from_json(js, 0); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# NO ORACLE ID — port-local. The serialization half of `GET /api/v1/presets`.
+#
+# The oracle never benched it because its `definitions` cargo feature is off by
+# default, so upstream that route answers an EMPTY array and its own test
+# asserts as much (src/server/routes/definitions.cyr:19-22). The port has no
+# cargo features and ships the populated arm, so this cost is real here and
+# appears nowhere in the oracle's numbers.
+#
+# ⚠ n=500, NOT the 2000 a naive read of the other counts suggests. This is the
+# file's single largest allocator: `agnosai_agent_to_value_a`
+# (src/core/agent.cyr:249-286) emits 15 fields, each a `str_from_a` header plus
+# a jv cell plus a pair, so a preset with ~4 agents costs ~4.9 KB and the 18
+# together ~88 KB **per iteration**. At 2000 that is ~175 MB on top of
+# everything else, on an allocator that never frees (lib/alloc.cyr:13-15 —
+# bump, no individual free, `alloc_reset` is batch-only and no `.bcyr` calls it
+# mid-run). 500 keeps it near ~44 MB and still reports a stable figure.
+#
+# The 18 presets are parsed ONCE outside the batch: this measures serialization,
+# not the parse that `builtin_presets_18` already owns.
+fn _b_preset_to_value(): i64 {
+    var presets = agnosai_builtin_presets();
+    if (vec_len(presets) != 18) { return 1; }
+    var al = default_alloc();
+
+    var n = 500;
+    var b = bench_new("preset_to_value_18");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        for (var j = 0; j < 18; j = j + 1) {
+            agnosai_preset_to_value_a(al, vec_get(presets, j));
+        }
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    _b_builtin_presets();
+    _b_assemble_team();
+    _b_match_score();
+    _b_load_preset_from_json();
+    _b_preset_to_value();
+
+    return 0;
+}
+
+var r = main();
+syscall(60, r);

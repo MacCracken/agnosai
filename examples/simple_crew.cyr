@@ -1,0 +1,122 @@
+# =========================================================================
+# simple_crew — the smallest useful thing you can do with AgnosAI.
+#
+# Parity oracle: rust-old/examples/simple_crew.rs (15 lines).
+#
+# Build and run it:
+#
+#     cyrius build examples/simple_crew.cyr build/simple_crew
+#     ./build/simple_crew
+#
+# ## What it shows, and what it deliberately does not
+#
+# One crew, one task, no LLM. `agnosai_orchestrator_new(0)` takes no budget and
+# `agnosai_crew_runner_new` gets no client, so every task runs the **placeholder**
+# path: the result's output is the task description verbatim and the status is
+# Completed. That is the oracle's example too — `Orchestrator::new(Default::
+# default())` with no `.with_llm(...)` — and it is the right shape for a first
+# example, because it runs with nothing installed and no gateway reachable.
+#
+# To make it do real inference, attach a client:
+#
+#     agnosai_crew_runner_with_llm(runner,
+#         agnosai_hoosh_client_new(str_from("http://127.0.0.1:8088"), str_from("")))
+#
+# and point it at a running `hoosh serve` (see scripts/stack.sh).
+#
+# ## Why this is a `.cyr` and not a `.tcyr`
+#
+# It is an example, not a test — it has to be READ as much as run. The behaviour
+# it demonstrates is pinned by `tests/integration_crew_with_tools.tcyr`, which
+# drives the same path with assertions; if this file and that suite ever
+# disagree, the suite is right.
+#
+# ⚠ `cyrius bench` and `cyrius tests` do not discover `examples/`, and nothing
+# else compiles it either — so it can rot exactly the way three `.bcyr` files did
+# before 2026-08-10. CI builds it as its own step for that reason.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/core/agent.cyr"
+include "src/core/crew.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/router.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/output_validation.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/server/prometheus.cyr"
+include "src/orchestrator/crew_runner.cyr"
+include "src/orchestrator/orchestrator.cyr"
+
+# Write a Str to stdout, newline-terminated.
+fn _ex_println(s: Str): i64 {
+    print(str_data(s), str_len(s));
+    print("\n", 1);
+    return 0;
+}
+
+# Run one crew and print what came back. Returns 0, or 1 if the run failed.
+fn main(): i64 {
+    alloc_init();
+
+    # `Orchestrator::new(Default::default()).await?`
+    #
+    # 0 is "no resource budget", which is the port's spelling of the oracle's
+    # `Default` — `agnosai_orchestrator_timeout_secs` then falls back to the
+    # one-hour default rather than reading a limit off a budget that is not there.
+    var orchestrator = agnosai_orchestrator_new(0);
+
+    # `let mut crew = CrewSpec::new("example-crew");`
+    # `crew.tasks.push(Task::new("Analyze the project structure"));`
+    var crew = agnosai_crew_new(str_from("example-crew"));
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("Analyze the project structure")));
+    agnosai_crew_with_tasks(crew, tasks);
+
+    # `let result = orchestrator.run_crew(crew).await?;`
+    var state = agnosai_orchestrator_run_crew(orchestrator, crew);
+    if (state == 0) {
+        _ex_println(str_from("crew failed to run"));
+        return 1;
+    }
+
+    # `println!("Crew completed with status: {:?}", result.status);`
+    #
+    # The oracle prints the Debug form of the enum; the wire spelling is the
+    # closest thing the port has and is what every other surface uses.
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Crew completed with status: ");
+    str_builder_add(sb, agnosai_crew_status_to_wire(agnosai_crew_state_status(state)));
+    _ex_println(str_builder_build(sb));
+
+    # Past the oracle, because an example that prints one word teaches less than
+    # it could: the placeholder path echoes each task's description back, so this
+    # shows where a real crew's output would arrive.
+    var results = agnosai_crew_state_results(state);
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        var r = vec_get(results, i);
+        var line = str_builder_new();
+        str_builder_add_cstr(line, "  task output: ");
+        str_builder_add(line, agnosai_task_result_output(r));
+        _ex_println(str_builder_build(line));
+    }
+
+    return 0;
+}
+
+var _ex_exit_code = main();
+syscall(60, _ex_exit_code);

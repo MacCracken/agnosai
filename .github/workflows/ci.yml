@@ -89,6 +89,26 @@ jobs:
         # all, and nothing more.
         run: cyrius coverage --min 80
 
+      - name: Examples
+        # examples/ is discovered by NOTHING — not `cyrius tests`, not
+        # `cyrius bench`, not the build entry in cyrius.cyml. Added 2026-08-10
+        # together with the first example, because a file nothing compiles is
+        # exactly how three .bcyr files rotted into undefined-symbol errors
+        # without anyone noticing.
+        run: |
+          for f in examples/*.cyr; do
+            [ -e "$f" ] || continue
+            cyrius build "$f" "build/$(basename "$f" .cyr)"
+          done
+
+      - name: Fuzz harnesses
+        # `cyrius fuzz` runs fuzz/*.fcyr AND tests/*.fcyr. Added 2026-08-10 with
+        # the first real harnesses: the tree had carried a `cyrius port` scaffold
+        # (`tests/agnosai.fcyr`) whose `fuzz_main` returned 0 without reading its
+        # input, and nothing in CI ran it, so it had reported "1 passed" against
+        # a harness that tested nothing since 2026-07-28.
+        run: cyrius fuzz
+
       - name: Benchmarks
         # Added 2026-08-10, because NOTHING in CI compiled benches/ and three of
         # the six .bcyr files had rotted into hard undefined-symbol errors —

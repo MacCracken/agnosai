@@ -1,0 +1,697 @@
+# =========================================================================
+# fleet.bcyr — benchmarks for the fleet group.
+#
+# Oracle bench files: rust-old/benches/fleet.rs (seven criterion ids) and
+# rust-old/benches/placement.rs (six). **Neither had a Cyrius counterpart.**
+# Before this file, a grep across benches/ for fleet | placement | node_info |
+# compute_scheduler returned nothing at all, so the entire scheduling half of
+# the port — every crew fan-out, every node placement, every VRAM allocation —
+# had no number.
+#
+# (rust-old/benches/scoring.rs is NOT a fleet bench: it imports
+# agnosai::orchestrator::scoring, which ports to src/orchestrator/scoring.cyr.
+# Its ids belong in benches/orch.bcyr, which already includes that module.)
+#
+# ⚠ **Both retention caps in this group scan everything and remove nothing on
+# live data, so a naive flat loop is O(n²) and appears to hang.**
+# `_agnosai_csm_evict_if_needed` (src/fleet/state.cyr:283) fires once the run
+# map reaches 1000 and then walks EVERY slot on EVERY `create_run`; no run in a
+# benchmark is ever terminal, so it frees nothing. `_agnosai_fc_evict_completed`
+# (src/fleet/coordinator.cyr:140) has the identical shape at 10000 tasks. Both
+# modules call the cap "a retention floor, not a ceiling" and both reproduce the
+# oracle, so this is parity and must not be "fixed" here. It does mean
+# `create_run`, `reach_barrier` and `fan_out` use the rounds pattern documented
+# at lib/bench.cyr:198-211, with a fresh manager/coordinator per round and a
+# batch sized under the cap. `bench_batch_start`/`bench_batch_stop` accumulate
+# `total_ns` and `iterations` across rounds (lib/bench.cyr:214-228), so the
+# reported figure is still a single-call per-op time.
+#
+# ⚠ **`AGNOSAI_ACCEL_ANY` is -1, never 0.** 0 is `AGNOSAI_ACCEL_CPU`, a real
+# accelerator type (src/core/resource.cyr:44), so a 0 passed to
+# `agnosai_compute_scheduler_allocate` on a CUDA-only fleet filters out every
+# device, returns 0 every time, and silently times the reject path at a fraction
+# of the true cost. src/fleet/gpu.cyr:213-217 exists to warn about exactly this.
+#
+# Divergences from the oracle, all deliberate and all in one direction — move
+# per-iteration *fixture* out of the timed region so the number is the call:
+#
+#   * **fan_out** — the oracle mints 10 Uuids and 10 `format!` strings INSIDE
+#     `b.iter`, so its published figure is ~10 getrandom syscalls plus fan_out.
+#     Here the id/description pool is pre-built per round. `fan_out` still pays
+#     one getrandom of its own, via the `create_run` it ends with.
+#   * **reach_barrier** — the oracle builds `format!("sync-{cycle}")` inside
+#     `b.iter`. Here the 100 names are pre-built once. They must still VARY
+#     within a run: the arrival set is never cleared on AllReached
+#     (src/fleet/state.cyr:400-402), so a repeated name answers AllReached on
+#     the first arrival and measures nothing. Reuse across rounds is safe
+#     because barriers are keyed by run id first, and each round is a new run.
+#   * **allocate** — the oracle's drain-everything-and-retry when the fleet
+#     fills sits inside `b.iter` and pollutes 1 sample in 192. Here the fleet is
+#     refilled by a fresh scheduler between rounds, so the figure is pure
+#     allocate.
+#   * **task_completed** — past 2000 tasks the oracle's `b.iter` body is a dead
+#     `if idx < len` branch, diluting its number by however far criterion ran.
+#     Here the id list is cycled; re-completing an already-Completed task takes
+#     the identical path (map_get hit → store64), so every iteration counts.
+#
+# Two per-call costs the port pays where the oracle does not. Both are priced
+# here rather than left to be discovered later; neither is a behavioural
+# divergence and neither should be changed on spec:
+#
+#   * `agnosai_compute_scheduler_best_device` (src/fleet/gpu.cyr:344) builds a
+#     fresh 32-byte legacy view per call via `_agnosai_gpu_view_of`, where the
+#     oracle returns `Option<&GpuDevice>` and allocates nothing. If that shows
+#     up in `fleet_compute_best_device_8dev`, the fix is a borrowing accessor,
+#     not a bench change.
+#   * `create_run` mints a full canonical uuid STRING. The subtractable baseline
+#     is core.bcyr's `uuid_v4_generate` **plus** `uuid_to_str` — the first alone
+#     is the raw 16 bytes with no render and under-subtracts by a whole 36-char
+#     format. `fan_out`'s pool build pays ten of the pair per iteration, which
+#     is why it is hoisted.
+#
+# ⚠ **What the first run actually found: `clock_epoch_secs()` is the single
+# largest term in this half of the file.** On Linux it is a RAW
+# `syscall(228, CLOCK_REALTIME, ..)` (lib/chrono.cyr:76-78) — a real kernel
+# entry, not the vDSO fast path Rust's `Utc::now()` takes — and it measures
+# **~1.32us** on the same host as everything below.
+#
+# ⚠ That figure is a **measured row in this file** (`clock_epoch_secs`), not a
+# comment. It was challenged as implausible on the grounds that `lib/bench.cyr:6`
+# documents `clock_gettime: ~120ns` and that `uuid_v4_generate` costs 501ns while
+# making a real `getrandom` — a reasonable objection, and wrong. Re-measured
+# independently at 2,000,000 iterations: **clock_epoch_secs 1.315us,
+# clock_now_ns 1.318us**. It is `lib/bench.cyr`'s ~120ns that does not hold on
+# this host, which is worth knowing on its own since that constant is what every
+# other bench in the ecosystem implicitly subtracts.
+#
+# Against that:
+#
+#     fleet_create_run_3nodes         4.058us  <- 1 clock (1.32) + uuid (0.71)
+#     fleet_reach_barrier_3nodes      2.077us  <- 1 clock = 63% of the call
+#
+# Every timestamped state mutation pays it once: `create_run`, `reach_barrier`
+# (via `_agnosai_dcs_set_phase`), `report_progress` (TWICE), `checkpoint`
+# (twice), `complete`, `fail`, `cancel`. Nothing in src/fleet is at fault and
+# nothing here should be changed for it — it is a stdlib clock-source question,
+# and these two numbers are the evidence for raising it. Read both benches as
+# "one syscall plus the work" until it moves.
+#
+# ⚠ The shapes that run a single flat batch report min = max = avg by
+# construction — there is only one sample. Only the rounds-based shapes
+# (create_run, reach_barrier, fan_out, allocate, release_only) carry a spread.
+#
+# These numbers start the CYRIUS baseline. They are NOT comparable to
+# rust-old/bench-history.csv. See CLAUDE.md.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/fleet/registry.cyr"
+include "src/fleet/placement.cyr"
+include "src/fleet/gpu.cyr"
+include "src/fleet/state.cyr"
+include "src/fleet/coordinator.cyr"
+
+# ── fleet/state ───────────────────────────────
+
+# The oracle's `nodes(&["a", "b", "c"])`.
+fn _b_three_nodes(): i64 {
+    var v = vec_new();
+    vec_push(v, str_from("a"));
+    vec_push(v, str_from("b"));
+    vec_push(v, str_from("c"));
+    return v;
+}
+
+# The oracle's `CrewStateManager::create_run (3 nodes)`.
+#
+# One call mints a uuid string (one getrandom), a participating set, a
+# `map_new_str` progress map, three NodeProgress records, one
+# DistributedCrewState and one insert — roughly 1 KB on the no-free bump.
+#
+# ⚠ 50 rounds of 900, not a flat 45000: 900 keeps every manager under
+# AGNOSAI_MAX_RETAINED_RUNS (1000) so the eviction scan never fires. See the
+# header. A fresh manager per round also keeps the states map small enough that
+# the insert is not measuring hashmap growth.
+fn _b_create_run(): i64 {
+    var nodes = _b_three_nodes();
+    var b = bench_new("fleet_create_run_3nodes");
+    for (var r = 0; r < 50; r = r + 1) {
+        var m = agnosai_crew_state_manager_new();
+        bench_batch_start(b);
+        for (var i = 0; i < 900; i = i + 1) {
+            agnosai_crew_state_manager_create_run(m, nodes, 10);
+        }
+        bench_batch_stop(b, 900);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `CrewStateManager::reach_barrier (3 nodes)`.
+#
+# One iteration is ONE `reach_barrier` call, but the loop drives COMPLETE
+# cycles — a, b, c against one barrier name — so the third call is the one that
+# reaches the AllReached arm and writes the phase. `bench_batch_stop` is passed
+# 300 (100 cycles × 3 calls) so the reported figure stays per-call.
+#
+# Per call: a states map_get, a linear scan of the participating set, a
+# two-level barriers map_get creating the run-barriers map and the arrived vec
+# on first touch, a set_add and a phase write.
+#
+# 300 rounds leaves the manager at 300 runs, under the 1000 cap.
+fn _b_reach_barrier(): i64 {
+    var nodes = _b_three_nodes();
+    var na = str_from("a");
+    var nb = str_from("b");
+    var nc = str_from("c");
+    var names = vec_new();
+    for (var k = 0; k < 100; k = k + 1) {
+        vec_push(names, str_cat(str_from("sync-"), str_from_int(k)));
+    }
+    var m = agnosai_crew_state_manager_new();
+    var b = bench_new("fleet_reach_barrier_3nodes");
+    for (var r = 0; r < 300; r = r + 1) {
+        var run = agnosai_crew_state_manager_create_run(m, nodes, 5);
+        bench_batch_start(b);
+        for (var cy = 0; cy < 100; cy = cy + 1) {
+            var nm = vec_get(names, cy);
+            agnosai_crew_state_manager_reach_barrier(m, run, na, nm);
+            agnosai_crew_state_manager_reach_barrier(m, run, nb, nm);
+            agnosai_crew_state_manager_reach_barrier(m, run, nc, nm);
+        }
+        bench_batch_stop(b, 300);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ── fleet/coordinator ─────────────────────────────
+
+# One fan-out set: 10 [id, description] pairs and 10 [id, node_id] pairs,
+# round-robin over three nodes. The layout matches tests/fleet_coordinator.tcyr
+# `_t_task` / `_t_assign` — 16 bytes each, id first.
+fn _b_fanout_set(nodes3): i64 {
+    var tasks = vec_new();
+    var assigns = vec_new();
+    for (var i = 0; i < 10; i = i + 1) {
+        var id = agnosai_uuid_v4_str();
+        var tp = alloc(16);
+        store64(tp, id);
+        store64(tp + 8, str_cat(str_from("task-"), str_from_int(i)));
+        vec_push(tasks, tp);
+        var ap = alloc(16);
+        store64(ap, id);
+        store64(ap + 8, vec_get(nodes3, i % 3));
+        vec_push(assigns, ap);
+    }
+    var pair = alloc(16);
+    store64(pair, tasks);
+    store64(pair + 8, assigns);
+    return pair;
+}
+
+# The oracle's `FleetCoordinator::fan_out (10 tasks, 3 nodes)`.
+#
+# Per call: an assignment map, a distinct-node set, a per-node count map, 10
+# FleetTask records, a scan of the count map for the MAX, and a nested
+# `create_run` (which is itself the first benchmark in this file — subtract it
+# to isolate the fan-out proper).
+#
+# ⚠ TWO caps to stay under, both of them the O(n²) trap from the header: the
+# task map's 10000 and the nested state manager's 1000 runs. 500 fan-outs per
+# round is 500 runs and 5000 tasks, safely under both, and the coordinator is
+# fresh each round.
+#
+# The pool is built OUTSIDE the timed region — see the header on why. Building
+# it costs 5000 getrandom + 5000 str_cat per round, all untimed.
+fn _b_fan_out(): i64 {
+    var nodes3 = vec_new();
+    vec_push(nodes3, str_from("node-a"));
+    vec_push(nodes3, str_from("node-b"));
+    vec_push(nodes3, str_from("node-c"));
+    var b = bench_new("fleet_fan_out_10x3");
+    for (var r = 0; r < 40; r = r + 1) {
+        var co = agnosai_fleet_coordinator_new();
+        var pool = vec_new();
+        for (var j = 0; j < 500; j = j + 1) { vec_push(pool, _b_fanout_set(nodes3)); }
+        bench_batch_start(b);
+        for (var i = 0; i < 500; i = i + 1) {
+            var p = vec_get(pool, i);
+            agnosai_fleet_coordinator_fan_out(co, load64(p), load64(p + 8));
+        }
+        bench_batch_stop(b, 500);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `FleetCoordinator::task_completed`.
+#
+# One map_get hit plus one status store — allocation-free in the timed region,
+# so a single flat loop is correct here and the rounds pattern is not needed.
+#
+# Setup builds 8000 tasks through 800 fan-outs, which is under the 10000 task
+# cap AND under the 1000-run cap the nested `create_run` answers to. Ids are
+# deterministic rather than uuids so the setup does not pay 8000 getrandom.
+fn _b_task_completed(): i64 {
+    var co = agnosai_fleet_coordinator_new();
+    var ids = vec_new();
+    var node = str_from("node-a");
+    for (var k = 0; k < 800; k = k + 1) {
+        var tasks = vec_new();
+        var assigns = vec_new();
+        for (var j = 0; j < 10; j = j + 1) {
+            var id = str_cat(str_from("t-"), str_from_int(k * 10 + j));
+            vec_push(ids, id);
+            var tp = alloc(16);
+            store64(tp, id);
+            store64(tp + 8, id);
+            vec_push(tasks, tp);
+            var ap = alloc(16);
+            store64(ap, id);
+            store64(ap + 8, node);
+            vec_push(assigns, ap);
+        }
+        agnosai_fleet_coordinator_fan_out(co, tasks, assigns);
+    }
+    var n = 500000;
+    var b = bench_new("fleet_task_completed");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_fleet_coordinator_task_completed(co, vec_get(ids, i % 8000));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# ── fleet/gpu ────────────────────────────────
+
+# The oracle's `scheduler_8_devices()` — 8 CUDA devices of 24000 MB.
+fn _b_scheduler_8(): i64 {
+    var s = agnosai_compute_scheduler_new();
+    for (var i = 0; i < 8; i = i + 1) {
+        agnosai_compute_scheduler_add_device(s, str_cat(str_from("GPU-"), str_from_int(i)),
+        AGNOSAI_ACCEL_CUDA, 24000);
+    }
+    return s;
+}
+
+# 192 pre-minted task ids: 8 devices × 24000 MB / 1000 MB is exactly 192
+# allocations to fill the fleet, so a round ends with the last allocation that
+# can succeed and never with a reject.
+fn _b_alloc_ids(): i64 {
+    var ids = vec_new();
+    for (var i = 0; i < 192; i = i + 1) {
+        vec_push(ids, str_cat(str_from("alloc-"), str_from_int(i)));
+    }
+    return ids;
+}
+
+# The oracle's `ComputeScheduler::allocate (8 devices)`.
+#
+# Per call: an 8-element linear scan under a 1000 MB `min_free` filter with
+# last-wins on ties, a used-memory update, an available-memory sync, a 24-byte
+# ComputeAllocation and a map insert.
+#
+# ⚠ The 4th argument is AGNOSAI_ACCEL_ANY (-1). Passing 0 would mean CPU-only
+# and silently time the reject path — see the header.
+fn _b_compute_allocate(ids): i64 {
+    var b = bench_new("fleet_compute_allocate_8dev");
+    for (var r = 0; r < 200; r = r + 1) {
+        var s = _b_scheduler_8();
+        bench_batch_start(b);
+        for (var i = 0; i < 192; i = i + 1) {
+            agnosai_compute_scheduler_allocate(s, vec_get(ids, i), 1000, AGNOSAI_ACCEL_ANY);
+        }
+        bench_batch_stop(b, 192);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `ComputeScheduler::release (8 devices)` — named for what it
+# actually measures, because the oracle's `b.iter` body is `release(id)`
+# FOLLOWED BY `allocate(id, 20000, None)`. Its published number is the PAIR.
+#
+# The 8 holders land on 8 DISTINCT devices: `allocate` passes `min_free =
+# memory_mb` (src/fleet/gpu.cyr:308), so a device left with 4000 fails the
+# 20000 floor, and last-wins on ties (src/fleet/gpu.cyr:283) fills 7 down to 0.
+# The loop is therefore map-stable — 8 keys, one delete and one insert each
+# iteration, never growing — so nothing here drifts over 200k iterations.
+fn _b_compute_release_realloc(): i64 {
+    var s = _b_scheduler_8();
+    var ids = vec_new();
+    for (var i = 0; i < 8; i = i + 1) {
+        var id = str_cat(str_from("hold-"), str_from_int(i));
+        vec_push(ids, id);
+        agnosai_compute_scheduler_allocate(s, id, 20000, AGNOSAI_ACCEL_ANY);
+    }
+    var n = 200000;
+    var b = bench_new("fleet_compute_release_realloc_8dev");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var id = vec_get(ids, i % 8);
+        agnosai_compute_scheduler_release(s, id);
+        agnosai_compute_scheduler_allocate(s, id, 20000, AGNOSAI_ACCEL_ANY);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# PAST THE ORACLE. The oracle has no release-only shape, so its release figure
+# can only ever be read as a pair. This splits it: identical 192-op granularity
+# and identical fixture to `fleet_compute_allocate_8dev`, with the re-allocation
+# moved outside the timed window. Subtracting this from
+# `fleet_compute_release_realloc_8dev` is not valid (different allocation sizes
+# and a different map depth) — the pair to read against is the allocate bench
+# directly above it, which shares this one's exact shape.
+#
+# That pair is why the split earns its place: first run came back 548ns for
+# allocate against 149ns for release, on the same 8-device scan and the same
+# 192-entry map. The scan is common to both, so the ~400ns gap is insert-side —
+# the 24-byte ComputeAllocation plus growing the allocations map — and the
+# oracle's combined figure hides all of it.
+fn _b_compute_release_only(ids): i64 {
+    var b = bench_new("fleet_compute_release_only_8dev");
+    for (var r = 0; r < 200; r = r + 1) {
+        var s = _b_scheduler_8();
+        for (var i = 0; i < 192; i = i + 1) {
+            agnosai_compute_scheduler_allocate(s, vec_get(ids, i), 1000, AGNOSAI_ACCEL_ANY);
+        }
+        bench_batch_start(b);
+        for (var i = 0; i < 192; i = i + 1) {
+            agnosai_compute_scheduler_release(s, vec_get(ids, i));
+        }
+        bench_batch_stop(b, 192);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `ComputeScheduler::best_device (8 devices)`.
+#
+# A read-only 8-device scan with NO type filter and NO capacity filter. On a
+# freshly-populated scheduler every device ties at 24000, which is the worst
+# case for the `>=` last-wins tiebreak — the incumbent is displaced all 8 times.
+#
+# ⚠ This is the bench that prices the port's extra 32-byte `_agnosai_gpu_view_of`
+# allocation per call; see the header.
+fn _b_best_device(): i64 {
+    var s = _b_scheduler_8();
+    var n = 500000;
+    var b = bench_new("fleet_compute_best_device_8dev");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_compute_scheduler_best_device(s); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# ── fleet/placement ──────────────────────────────
+
+# The oracle's `gpu_node_with_hw`. ⚠ `NodeInfo::new`'s third argument is the
+# vram PER GPU (81920), not the node total — do not multiply by `num_gpus`.
+fn _b_gpu_node_hw(id: Str, num_gpus, vram_per_gpu): i64 {
+    var devices = vec_new();
+    for (var i = 0; i < num_gpus; i = i + 1) {
+        vec_push(devices, agnosai_compute_device_new(i, str_cat(str_from("GPU #"),
+        str_from_int(i)), AGNOSAI_ACCEL_CUDA, vram_per_gpu));
+    }
+    return agnosai_node_info_with_hardware(agnosai_node_info_new(id, num_gpus, vram_per_gpu),
+    agnosai_hw_inventory_new(64, 524288, devices));
+}
+
+# The oracle's `make_fleet(n)`: every third node CPU-only, the rest GPU nodes
+# with (i % 4) + 1 CUDA devices of 81920 MB. At n = 50 that is 17 CPU / 33 GPU;
+# at n = 200, 67 / 133.
+fn _b_make_fleet(n): i64 {
+    var v = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        if (i % 3 == 0) {
+            vec_push(v, agnosai_node_info_new(str_cat(str_from("cpu-"), str_from_int(i)), 0, 0));
+        } else {
+            vec_push(v, _b_gpu_node_hw(str_cat(str_from("gpu-"), str_from_int(i)),
+            (i % 4) + 1, 81920));
+        }
+    }
+    return v;
+}
+
+# `place` = rank every node, then take the first. Shared runner; the fixture and
+# the reason for each iteration count live on the callers.
+fn _b_place_case(q, fleet, n, name): i64 {
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_place(q, fleet); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# `rank_nodes` without the take-first. Same runner shape.
+fn _b_rank_case(q, fleet, n, name): i64 {
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_rank_nodes(q, fleet); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `place GpuAffinity (50 nodes)`.
+#
+# 50 score evaluations (status check, GPU check, 40000 MB VRAM floor, then
+# vram / 1e6 clamped at 1.0), 33 PlacementResult allocations, and a full sort.
+# All 33 survivors carry 81920 MB, so every score ties at 0.08192 — the sort
+# runs entirely on the index tiebreak.
+fn _b_place_gpu_affinity(fleet): i64 {
+    var q = agnosai_placement_request_with_min_gpu_vram_mb(
+    agnosai_placement_request_with_required_gpu(
+    agnosai_placement_request_new(AGNOSAI_PLACE_GPU_AFFINITY), 1), 40000);
+    return _b_place_case(q, fleet, 20000, "fleet_place_gpu_affinity_50");
+}
+
+# The oracle's `place Balanced (50 nodes)`.
+#
+# No filters at all, so every online node scores 1 - index/count: all 50 rank
+# and the sort sees 50 strictly-descending distinct scores. Best case for the
+# comparator, worst case for result-vec growth.
+#
+# Also the regression guard for src/fleet/placement.cyr:31-35 — the index
+# Balanced scores against is the PRE-filter one, so if filtering ever moved
+# ahead of enumeration this shape's scores would shift.
+fn _b_place_balanced(fleet): i64 {
+    var q = agnosai_placement_request_new(AGNOSAI_PLACE_BALANCED);
+    return _b_place_case(q, fleet, 20000, "fleet_place_balanced_50");
+}
+
+# The oracle's `place Locality (50 nodes, 3 caps)` fleet: 50 CPU-only nodes,
+# node i advertising the first (i % 4) + 1 of [python, docker, cuda, rust].
+fn _b_locality_fleet(): i64 {
+    var all_caps = vec_new();
+    vec_push(all_caps, str_from("python"));
+    vec_push(all_caps, str_from("docker"));
+    vec_push(all_caps, str_from("cuda"));
+    vec_push(all_caps, str_from("rust"));
+    var v = vec_new();
+    for (var i = 0; i < 50; i = i + 1) {
+        var caps = vec_new();
+        for (var j = 0; j < (i % 4) + 1; j = j + 1) { vec_push(caps, vec_get(all_caps, j)); }
+        vec_push(v, agnosai_node_info_with_capabilities(
+        agnosai_node_info_new(str_cat(str_from("node-"), str_from_int(i)), 0, 0), caps));
+    }
+    return v;
+}
+
+# The oracle's `place Locality (50 nodes, 3 caps)`.
+#
+# Per node a nested linear scan: 3 wanted capabilities × up to 4 advertised =
+# up to 12 `str_eq` calls, then matched / 3. Every node scores above zero so all
+# 50 rank, over only THREE distinct scores (1/3, 2/3, 1.0) — the heaviest tie
+# load of the three 50-node shapes, and therefore the one that leans hardest on
+# the index tiebreak at src/fleet/placement.cyr:261-264.
+fn _b_place_locality(lfleet): i64 {
+    var want = vec_new();
+    vec_push(want, str_from("python"));
+    vec_push(want, str_from("docker"));
+    vec_push(want, str_from("cuda"));
+    var q = agnosai_placement_request_with_capabilities(
+    agnosai_placement_request_new(AGNOSAI_PLACE_LOCALITY), want);
+    return _b_place_case(q, lfleet, 20000, "fleet_place_locality_50_3caps");
+}
+
+# The oracle's `place HW requirement (50 nodes)`.
+#
+# The hardware path REPLACES the legacy GPU checks rather than adding to them
+# (src/fleet/placement.cyr:183-190). Requirement: [Cuda], min_memory 40000,
+# min_devices 2, min_cpu_cores 32.
+#
+# ⚠ n = 5000, a quarter of the other place shapes, because
+# `agnosai_hw_inventory_satisfies` allocates a fresh `type_match` vec per node.
+# It does so for 33 nodes per call, NOT 50: the cpu-cores gate at
+# src/core/resource.cyr:449-450 returns before the allocation, and the 17 CPU
+# nodes have the 0-core default inventory `agnosai_node_info_new` installs
+# (src/fleet/registry.cyr:93). That is still ~4x the per-iteration allocation of
+# the other three, and it is the finding this bench exists to price. The oracle
+# does the same `collect()`, so it is parity, not a regression — but it is on
+# the placement hot path. 25 nodes rank: the 8 GPU nodes with only one device
+# fail min_devices.
+#
+# The single-inventory inner loop already has a number:
+# benches/core.bcyr's `hw_inventory_satisfies`. This shape adds the 50-node
+# score + filter + sort around it, plus the min_devices / min_cpu_cores
+# short-circuits that one never exercises.
+fn _b_place_hw_req(fleet): i64 {
+    var accels = vec_new();
+    vec_push(accels, AGNOSAI_ACCEL_CUDA);
+    var req = agnosai_hw_requirement_with_min_cpu_cores(
+    agnosai_hw_requirement_with_min_devices(
+    agnosai_hw_requirement_with_min_memory(
+    agnosai_hw_requirement_for_accelerators(accels), 40000), 2), 32);
+    var q = agnosai_placement_request_with_hardware(
+    agnosai_placement_request_new(AGNOSAI_PLACE_BALANCED), req);
+    return _b_place_case(q, fleet, 5000, "fleet_place_hw_req_50");
+}
+
+# The oracle's `rank_nodes GpuAffinity (200 nodes)`.
+#
+# 4x the fleet, `required_gpu` and no VRAM floor: the 133 GPU nodes all rank and
+# the 67 CPU nodes drop. Dominated by result-vec growth and the sort.
+#
+# ⚠ **This shape does NOT reach the sort, and an earlier version of this comment
+# claimed the opposite.** All 133 survivors carry 81920 MB, so every score ties
+# at 0.08192, and their `AGN_PR_INDEX` is already ascending — so
+# `_agnosai_place_cmp` returns -1 for every adjacent pair. `vec_sort_by`
+# (`lib/vec.cyr:340-352`) runs an O(n) already-ordered pre-check and **returns
+# before `_vec_introsort`**. `src/order.cyr:92-93` says so on the line this
+# comment used to cite as evidence for the opposite.
+#
+# It is worse than an inaccurate comment: the old text claimed this benchmark
+# guarded "the case `src/fleet/placement.cyr:20-23` says a score-only comparator
+# diverges on". With a score-only comparator every adjacent compare returns 0,
+# `c > 0` is still never true, the pre-check still short-circuits, and the timing
+# is **identical** — so it was structurally blind to the one regression it named.
+# `fleet_rank_nodes_gpu_affinity_200_shuffled` below is the shape that is not.
+#
+# Kept as-is, relabelled: an all-ties-already-ordered fleet is the realistic
+# homogeneous-cluster case and the O(n) pre-check is exactly what should run for
+# it. It is a fast-path number, not a sort number.
+fn _b_rank_nodes_gpu_affinity(big): i64 {
+    var q = agnosai_placement_request_with_required_gpu(
+    agnosai_placement_request_new(AGNOSAI_PLACE_GPU_AFFINITY), 1);
+    return _b_rank_case(q, big, 5000, "fleet_rank_nodes_gpu_affinity_200");
+}
+
+# The same 200-node GpuAffinity rank, but over a fleet whose GPU nodes are NOT
+# in ascending index order — so the all-ties comparator cannot short-circuit.
+#
+# ⚠ **This is the shape that actually prices the sort**, and the pair with the
+# one above is the point: subtract them and the difference is the introsort plus
+# the index tiebreak on 133 tied elements, which is the cost a score-only
+# comparator regression would move. Neither number alone shows it.
+#
+# ⚠ **Reordering the INPUT does not work, and the first attempt at this shape
+# did exactly that.** `agnosai_rank_nodes` assigns `AGN_PR_INDEX = i` from the
+# scan position (`src/fleet/placement.cyr:283`) and pushes survivors in scan
+# order, so the output indices are ascending **by construction** whatever order
+# the fleet arrives in. With every score tied, the comparator still returns -1
+# for every adjacent pair and the pre-check still short-circuits. A stride
+# shuffle measured 11.763us against the ordered fleet's 11.722us — no
+# difference, because there was no difference to measure.
+#
+# The SCORES have to vary non-monotonically. This fleet gives each GPU node one
+# of four VRAM tiers in a repeating 4-cycle, so the score sequence sawtooths and
+# `_vec_introsort` genuinely runs.
+fn _b_varied_fleet(n): i64 {
+    var v = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        if (i % 3 == 0) {
+            vec_push(v, agnosai_node_info_new(str_cat(str_from("cpu-"), str_from_int(i)), 0, 0));
+        } else {
+            # 4 tiers, cycling: 81920, 24576, 49152, 8192. Adjacent survivors
+            # step both up and down, so no prefix is ever already ordered.
+            var vram = 81920;
+            if (i % 4 == 1) { vram = 24576; }
+            if (i % 4 == 2) { vram = 49152; }
+            if (i % 4 == 3) { vram = 8192; }
+            vec_push(v, _b_gpu_node_hw(str_cat(str_from("gpu-"), str_from_int(i)),
+            (i % 4) + 1, vram));
+        }
+    }
+    return v;
+}
+
+fn _b_rank_nodes_gpu_affinity_varied(): i64 {
+    var q = agnosai_placement_request_with_required_gpu(
+    agnosai_placement_request_new(AGNOSAI_PLACE_GPU_AFFINITY), 1);
+    return _b_rank_case(q, _b_varied_fleet(200), 5000,
+    "fleet_rank_nodes_gpu_affinity_200_varied");
+}
+
+# The oracle's `rank_nodes Cost (200 nodes)`.
+#
+# score = 1 / (1 + gpu_count + gpu_vram_mb), which is never zero, so ALL 200
+# rank — the largest result vec and the largest sort in the placement set. The
+# 67 CPU nodes tie at 1.0 and the 133 GPU nodes collapse onto 4 more scores, so
+# 200 results over 5 distinct values is the heaviest tiebreak load in the file.
+#
+# The fleet is shared with the bench above: `rank_nodes` never mutates it.
+fn _b_rank_nodes_cost(big): i64 {
+    var q = agnosai_placement_request_new(AGNOSAI_PLACE_COST);
+    return _b_rank_case(q, big, 5000, "fleet_rank_nodes_cost_200");
+}
+
+# The clock the two shapes above are decomposed against.
+#
+# ⚠ This exists so the decomposition is **subtractable from bench-history.csv**
+# rather than asserted in a comment — the same job `benches/core.bcyr`'s uuid
+# baselines do. Without it the header's arithmetic is unfalsifiable, which is
+# precisely the objection that was (correctly) raised against it.
+fn _b_clock_baseline(): i64 {
+    var n = 2000000;
+    var b = bench_new("clock_epoch_secs_baseline");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { clock_epoch_secs(); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    _b_clock_baseline();
+
+    _b_create_run();
+    _b_reach_barrier();
+    _b_fan_out();
+    _b_task_completed();
+
+    var alloc_ids = _b_alloc_ids();
+    _b_compute_allocate(alloc_ids);
+    _b_compute_release_only(alloc_ids);
+    _b_compute_release_realloc();
+    _b_best_device();
+
+    var fleet50 = _b_make_fleet(50);
+    _b_place_gpu_affinity(fleet50);
+    _b_place_balanced(fleet50);
+    _b_place_locality(_b_locality_fleet());
+    _b_place_hw_req(fleet50);
+
+    var fleet200 = _b_make_fleet(200);
+    _b_rank_nodes_gpu_affinity(fleet200);
+    _b_rank_nodes_gpu_affinity_varied();
+    _b_rank_nodes_cost(fleet200);
+
+    return 0;
+}
+
+var r = main();
+syscall(60, r);

@@ -135,5 +135,5 @@ codegen-units = 1
 
 | Target | Size (est.) | Boot | Memory |
 |--------|-------------|------|--------|
-| `agnosai-server` (full) | ~15-25 MB | <2s | 50-150 MB |
+| `agnosai` (full) | ~15-25 MB | <2s | 50-150 MB |
 | Compare: Agnostic v1 | ~1.5 GB | 15-30s | 300-500 MB |

@@ -1,10 +1,64 @@
 # =========================================================================
 # orch.bcyr — benchmarks for the orchestration group.
 #
-# No oracle bench file: rust-old/benches/ has no orchestrator.rs. These measure
-# what a crew run actually hammers — the event fan-out on every task boundary,
-# the per-task ranking and delegation, the DAG sort, the plan-cache key, and the
-# conversation trim that runs on every push.
+# **Six oracle bench files land here** — rust-old/benches/scheduler.rs,
+# pubsub.rs, approval.rs, ipc.rs, orchestrator.rs and relay.rs. The rest of the
+# file has no oracle counterpart and measures what a crew run actually hammers:
+# the event fan-out on every task boundary, the per-task ranking and delegation,
+# the plan-cache key, durable state, the prompt guard and the auth check.
+#
+# ⚠ **relay.rs is a FLEET oracle bench** (rust-old/src/fleet/relay.rs), not an
+# orchestrator one, and `src/` mirrors `rust-old/` file-for-file. Its six rows
+# sit here because this file was the assigned target and `src/fleet/relay.cyr`
+# is a standalone include. `benches/fleet.bcyr` landed in the same milestone and
+# covers `fleet.rs` and `placement.rs`; **the six `relay_*` rows belong there and
+# should move as one block**, which is a decision to take deliberately rather
+# than discover later. No id collides either way — checked across all `.bcyr`.
+# And wherever they land, `.bcyr` files stay FLAT in `benches/`: `cyrius bench`
+# no-arg discovery is not recursive.
+#
+# ⚠ **The relay rows are majra numbers reached through agnosai's wrapper.**
+# Every function in `src/fleet/relay.cyr` is a one-to-three-line delegation (its
+# own header says so), so a regression in `relay_send_*`, `relay_receive_*` or
+# `relay_broadcast_*` belongs to lib/majra.cyr unless it is one of the exactly
+# three things the wrapper owns: the 24-byte stats re-pack on top of majra's
+# 48-byte one, the `str_from("")` allocated on every broadcast where majra
+# passes a bare 0, and the capacity field that is recorded and then ignored.
+# `relay_broadcast_1_sub_drained` beside `relay_send_1_sub_drained` prices the
+# second of those; `relay_stats_snapshot` prices the first.
+#
+# ⚠ **A subscribed relay channel MUST be drained inside the loop.** majra's
+# `relay_send` fans out with a BLOCKING `chan_send` into a hardcoded 256-deep
+# channel, so the oracle's subscribe-and-never-read shape — safe on a tokio
+# broadcast, which overwrites — would park this process on FUTEX_WAIT at
+# iteration 257 and hang with no output at all. Same reasoning as
+# `event_round_trip_1_sub` below. `relay_send_no_subs` isolates the fan-out cost
+# instead of pretending the drain is free.
+#
+# ⚠ **Iteration counts here are MEMORY-bound, not time-bound.** `alloc()` is a
+# no-free global bump and nothing in the added groups has an `_a` variant to
+# thread, so every allocation inside a timed loop is retained for the life of
+# the process. That — not the clock — is what sets `ipc_frame_1mib_transport` at
+# 50 and `orchestrator_new` at 20000.
+#
+# ⚠ **MEASURED peak RSS for this file: ~3.13 GB** (2026-08-11, `zsh TIMEFMT %M`).
+# An audit found 3.44 GB and pointed out that the sentence above justified only
+# two of 72 rows while the rest were sized on per-call estimates that were 2-3x
+# low. Two mis-sized rows were then cut — `scheduler_load_dag_linear_50`
+# 5000 -> 1000 (~58 KB/call, ~285 MB, and it was LARGER than the 500-task sibling
+# that had already been cut for this reason) and the four `pattern_match_*` rows
+# 4x (~69 MB each) — which recovered ~230 MB.
+#
+# **The remaining ~3 GB is spread across all 72 rows, not concentrated.** It is
+# recorded rather than fixed: CI runs bare `cyrius bench` on `ubuntu-latest`
+# (16 GB), so it holds, but anyone adding a row here should price its allocation
+# and not only its timing resolution. Measure with
+# `zsh -c 'TIMEFMT="%M"; time (cyrius bench benches/orch.bcyr)'` — `pgrep -P`
+# will not see it, because the compiled bench binary is a grandchild. The second ceiling is the audit ring:
+# `agnosai_audit_record` evicts with `vec_remove(entries, 0)` AND re-hashes the
+# evicted entry once the chain passes AGNOSAI_AUDIT_MAX_ENTRIES = 10000, so the
+# `run_crew` rows are capped where they still measure `run_crew` rather than the
+# ring shift (3 audit entries per iteration at 1 task, 12 at 10 sequential).
 #
 # **Fan-out is measured as a round trip.** A subscriber's ring is 256 deep, so a
 # send-only loop saturates it after 256 iterations and then measures nothing but
@@ -35,6 +89,9 @@ include "src/id.cyr"
 include "src/strcase.cyr"
 include "src/telemetry/mod.cyr"
 include "src/core/mod.cyr"
+# fleet/relay — a standalone majra wrapper (it references no `agnosai_*` outside
+# itself), pulled in for the six relay rows. See the header on where they belong.
+include "src/fleet/relay.cyr"
 # orch_memory builds chat messages, whose roles live in the hoosh seam.
 include "src/llm/retry.cyr"
 include "src/llm/hoosh.cyr"
@@ -49,8 +106,10 @@ include "tests/server_auth_vectors.cyr"
 include "src/chan_lossy.cyr"
 include "src/server/sse.cyr"
 include "src/orchestrator/pubsub.cyr"
+include "src/orchestrator/ipc.cyr"
 include "src/orchestrator/scoring.cyr"
 include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/approval.cyr"
 include "src/orchestrator/plan_cache.cyr"
 include "src/orchestrator/memory.cyr"
 include "src/orchestrator/hierarchical.cyr"
@@ -59,6 +118,7 @@ include "src/orchestrator/durable_state.cyr"
 include "src/orchestrator/output_validation.cyr"
 include "src/orchestrator/audit.cyr"
 include "src/orchestrator/crew_runner.cyr"
+include "src/orchestrator/orchestrator.cyr"
 
 # An agent with two tools, a complexity and a domain — the shape scoring reads.
 fn _b_agent(key: Str): i64 {
@@ -203,7 +263,198 @@ fn _b_pattern_match(): i64 {
     return 0;
 }
 
+# ── scoring.rs — the oracle's seven ids ──────────────
+#
+# Added 2026-08-11. These are the six gaps `fleet.analysis.md` routed here and
+# that the M12 bench fan-out then shipped nowhere; the audit
+# (docs/development/m12-bench-audit-2026-08-10.md, fleet finding 3) caught it.
+#
+# ⚠ **`rank_agents_varied_*` price a REAL complexity divergence from the oracle.**
+# The oracle sorts with `scored.sort_by(...)` — Rust's pdqsort, O(n log n)
+# (rust-old/src/orchestrator/scoring.rs:212). The port hand-rolls an **insertion
+# sort** (src/orchestrator/scoring.cyr:294-303), O(n^2) on unsorted input.
+#
+# **Measured at three sizes, and the quadratic is confirmed rather than inferred:**
+#
+#     rank_agents_varied_100     127.8us
+#     rank_agents_varied_300     626.0us
+#     rank_agents_varied_1000   5093.0us
+#
+# Fitting `total(n) = a*n + b*n^2` to the 100 and 1000 points gives a = 0.863us
+# (the linear scoring) and b = 0.00421us (the sort). That model predicts
+# **637.8us** at n = 300; the independent third point measured **626.0us**,
+# within 2%. So:
+#
+#   * the sort overtakes the scoring at **n ~ 205**,
+#   * at n = 1000 it is **83%** of the call.
+#
+# ⚠ **This is a performance note, NOT a DoS vector, and an earlier draft of this
+# comment said otherwise.** The claim that the agent count is
+# "attacker-influenceable" does not survive checking: `AGNOSAI_CREW_MAX_AGENTS`
+# is **100** and `src/server/routes/crews.cyr:353` rejects anything larger, so
+# nothing reachable over HTTP gets past n = 100 — where the sort is 33% of a
+# 128us call. The crossover at 205 is beyond the cap. A direct library caller is
+# unbounded, which is what the 1000 row is for.
+#
+# Three sizes rather than two because two points can be *fitted* by a quadratic
+# but not *tested* against one. And the agents must be VARIED: identical agents
+# tie on every score, and a stable insertion sort walks a tied list in O(n) since
+# the shift loop breaks on the first comparison. That is exactly why
+# `rank_agents_16` — 16 identical agents — never showed this in two weeks of
+# history.
+#
+# The agents must also be VARIED. Identical agents tie on every score, and a
+# stable insertion sort walks a tied list in O(n): the shift loop breaks on the
+# first comparison. `_b_scoring_agents` cycles tools, complexity and domain so
+# adjacent scores genuinely differ.
+
+# The oracle's `make_rich_task` — all four context signals populated.
+fn _b_rich_task(): i64 {
+    var t = agnosai_task_new(str_from("complex analytics task"));
+    var required = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(required, bayan_json_v_str_new(str_from("sql_query")));
+    bayan_json_v_arr_push(required, bayan_json_v_str_new(str_from("chart_gen")));
+    bayan_json_v_arr_push(required, bayan_json_v_str_new(str_from("report_writer")));
+    bayan_json_v_arr_push(required, bayan_json_v_str_new(str_from("data_clean")));
+    agnosai_task_with_context(t, str_from("required_tools"), required);
+    agnosai_task_with_context(t, str_from("complexity"), bayan_json_v_str_new(str_from("high")));
+    agnosai_task_with_context(t, str_from("domain"), bayan_json_v_str_new(str_from("finance")));
+    agnosai_task_with_context(t, str_from("gpu_required"), bayan_json_v_bool_new(1));
+    return t;
+}
+
+# The oracle's `make_agent(tools, complexity, domain)`.
+fn _b_scoring_agent(tools, complexity, domain): i64 {
+    var a = agnosai_agent_new(str_from("bench-agent"), str_from("bench"),
+    str_from("benchmark"));
+    agnosai_agent_with_name(a, str_from("Bench Agent"));
+    agnosai_agent_with_tools(a, tools);
+    agnosai_agent_with_complexity(a, complexity);
+    if (domain != 0) { agnosai_agent_with_domain(a, domain); }
+    return a;
+}
+
+fn _b_tool_list(n): i64 {
+    var v = vec_new();
+    if (n > 0) { vec_push(v, str_from("sql_query")); }
+    if (n > 1) { vec_push(v, str_from("chart_gen")); }
+    if (n > 2) { vec_push(v, str_from("data_clean")); }
+    if (n > 3) { vec_push(v, str_from("report_writer")); }
+    return v;
+}
+
+fn _b_scoring_complexity(i): i64 {
+    if (i % 3 == 0) { return str_from("low"); }
+    if (i % 3 == 1) { return str_from("medium"); }
+    return str_from("high");
+}
+
+fn _b_scoring_domain(i): i64 {
+    if (i % 5 == 0) { return str_from("finance"); }
+    if (i % 5 == 1) { return str_from("devops"); }
+    if (i % 5 == 2) { return str_from("quality"); }
+    return 0;
+}
+
+# `n` agents whose tool count, complexity and domain all cycle — the oracle's
+# 1000-agent fixture, generalised. Adjacent scores differ, so the insertion sort
+# actually shifts.
+fn _b_scoring_agents(n): i64 {
+    var v = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(v, _b_scoring_agent(_b_tool_list((i % 5) + 1),
+        _b_scoring_complexity(i), _b_scoring_domain(i)));
+    }
+    return v;
+}
+
+fn _b_score_case(agent, task, n, name): i64 {
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_score_agent(agent, task); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Oracle: `score_agent (rich context)` — every signal populated on both sides,
+# so all five weighted terms do real work.
+fn _b_score_rich(): i64 {
+    var tools = vec_new();
+    vec_push(tools, str_from("sql_query"));
+    vec_push(tools, str_from("chart_gen"));
+    vec_push(tools, str_from("report_writer"));
+    return _b_score_case(_b_scoring_agent(tools, str_from("high"), str_from("finance")),
+    _b_rich_task(), 200000, "score_agent_rich_context");
+}
+
+# Oracle: `score_agent (no context)` — the floor. No tools, no domain, an empty
+# task context, so every extractor takes its absent branch. Read against
+# `rich_context` it isolates what the context actually costs.
+fn _b_score_minimal(): i64 {
+    return _b_score_case(_b_scoring_agent(vec_new(), str_from("medium"), 0),
+    agnosai_task_new(str_from("simple task")), 500000, "score_agent_no_context");
+}
+
+# Oracle: `score_agent (GPU required)` — the one path where the agent's hardware
+# requirement is consulted.
+fn _b_score_gpu(): i64 {
+    var a = _b_scoring_agent(vec_new(), str_from("medium"), 0);
+    agnosai_agent_with_gpu(a, 1, 0, 0);
+    var t = agnosai_task_new(str_from("gpu task"));
+    agnosai_task_with_context(t, str_from("gpu_required"), bayan_json_v_bool_new(1));
+    return _b_score_case(a, t, 300000, "score_agent_gpu_required");
+}
+
+# Oracle: `score_agent (domain mismatch)` — devops agent, quality task. The
+# domain term takes its penalty branch rather than its credit branch.
+fn _b_score_domain_mismatch(): i64 {
+    var tools = vec_new();
+    vec_push(tools, str_from("lint"));
+    var t = agnosai_task_new(str_from("quality task"));
+    agnosai_task_with_context(t, str_from("domain"), bayan_json_v_str_new(str_from("quality")));
+    var required = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(required, bayan_json_v_str_new(str_from("lint")));
+    bayan_json_v_arr_push(required, bayan_json_v_str_new(str_from("test")));
+    agnosai_task_with_context(t, str_from("required_tools"), required);
+    return _b_score_case(_b_scoring_agent(tools, str_from("high"), str_from("devops")),
+    t, 200000, "score_agent_domain_mismatch");
+}
+
+fn _b_rank_varied(count, n, name): i64 {
+    var agents = _b_scoring_agents(count);
+    var task = _b_rich_task();
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_rank_agents(agents, task); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Oracle: `rank_agents (100 agents)` and `rank_agents (1000 agents)`.
+#
+# ⚠ **Read these three as a CURVE, not as three numbers.** The scoring is linear,
+# so anything above 10x per 10x of agents is the sort. Measured 39.5x from 100 to
+# 1000 — between O(n log n)'s ~15x and a pure O(n^2)'s 100x, because the linear
+# scoring still dominates at the low end. See the header for the fit.
+fn _b_rank_agents_varied_100(): i64 {
+    return _b_rank_varied(100, 2000, "rank_agents_varied_100");
+}
+
+fn _b_rank_agents_varied_300(): i64 {
+    return _b_rank_varied(300, 600, "rank_agents_varied_300");
+}
+
+fn _b_rank_agents_varied_1000(): i64 {
+    return _b_rank_varied(1000, 100, "rank_agents_varied_1000");
+}
+
 # Ranking 16 agents for one task — what hierarchical mode pays per task.
+#
+# ⚠ Its 16 agents are IDENTICAL, so every score ties and the insertion sort
+# performs zero shifts. Kept for its history, but it is a scoring number, not a
+# sort number — `rank_agents_varied_*` above are the sort.
 fn _b_rank_agents(): i64 {
     var n = 20000;
     var agents = _b_agents(16);
@@ -756,6 +1007,927 @@ fn _b_auth_jwt_prepare(): i64 {
     return 0;
 }
 
+# ── scheduler — rust-old/benches/scheduler.rs ──
+
+# `n` tasks whose priorities cycle Background..Critical — the oracle's `i % 5`,
+# which is literal arithmetic here because AGNOSAI_PRIORITY_* really are 0..4.
+fn _b_sched_tasks(n): i64 {
+    var v = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        var task = agnosai_task_new(str_cat(str_from("task-"), str_from_int(i)));
+        agnosai_task_with_priority(task, i % 5);
+        vec_push(v, task);
+    }
+    return v;
+}
+
+# The oracle's `enqueue 100 tasks`: a fresh scheduler plus 100 minted tasks
+# pushed into their tiers (scheduler.rs:12-27).
+#
+# ⚠ **Dominated by `agnosai_task_new`, not by the enqueue.** Every task mints a
+# v4 uuid, a vec and a context map; the enqueue itself is one `vec_push` into
+# `queues[priority]`. The oracle's row has exactly the same problem, which is
+# why `scheduler_enqueue_100_prebuilt` sits next to it — the PAIR is what
+# separates construction from queueing, and neither number means much alone.
+# Measured 193.9 µs here against 6.6 µs there: **97% of the oracle's row is
+# `Task::new`**, and any "enqueue got slower" reading of it would be wrong.
+#
+# The fresh scheduler per iteration is the oracle's and is load-bearing:
+# enqueueing into one shared scheduler grows the tier vecs without bound and
+# turns the row into a vec-realloc benchmark.
+fn _b_sched_enqueue_100(): i64 {
+    var n = 2000;
+    var b = bench_new("scheduler_enqueue_100_build");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var s = agnosai_scheduler_new();
+        for (var t = 0; t < 100; t = t + 1) {
+            var task = agnosai_task_new(str_cat(str_from("task-"), str_from_int(t)));
+            agnosai_task_with_priority(task, t % 5);
+            agnosai_scheduler_enqueue(s, task);
+        }
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The same 100 pushes with the tasks hoisted — beyond the oracle, and the only
+# row in the pair that is actually about the queue.
+fn _b_sched_enqueue_prebuilt(): i64 {
+    var n = 20000;
+    var tasks = _b_sched_tasks(100);
+
+    var b = bench_new("scheduler_enqueue_100_prebuilt");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var s = agnosai_scheduler_new();
+        for (var j = 0; j < 100; j = j + 1) { agnosai_scheduler_enqueue(s, vec_get(tasks, j)); }
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `dequeue 100 tasks (priority order)` — a full drain, tiers 4..0
+# (scheduler.rs:29-51). The oracle uses `iter_batched` so its enqueue is untimed;
+# `lib/bench.cyr` has no such thing, so every round's scheduler is pre-built here
+# instead and only the drain is inside `bench_batch_start`. The 100 tasks are
+# shared across rounds because `dequeue` does not mutate them.
+#
+# ⚠ **Measured at TWO depths on purpose, and the two are not supposed to
+# match.** `agnosai_scheduler_dequeue` pops with `vec_remove(q, 0)`, an O(n)
+# element shift (lib/vec.cyr:174), where the oracle has `VecDeque::pop_front` at
+# O(1). Draining 100 tasks costs 5 x sum(0..19) = 950 shifted slots and looks
+# fine; draining 1000 costs 5 x sum(0..199) = 99,500. The quadratic is the
+# port's, not the oracle's, and only the second depth makes it legible.
+#
+# Measured 5.59 µs at depth 100 and 229.59 µs at depth 1000 — 10x the depth for
+# 41x the cost. Solving the two for `a*calls + b*slots` puts the pop itself at
+# ~38 ns and the shift at **~1.9 ns per slot**, which is what turns a full drain
+# quadratic. If the dequeue is ever rewritten around a head index these two
+# converge to a 10x ratio, and that convergence is the regression signal.
+fn _b_sched_dequeue(name, depth, rounds): i64 {
+    var tasks = _b_sched_tasks(depth);
+    var scheds = vec_new();
+    for (var r = 0; r < rounds; r = r + 1) {
+        var s = agnosai_scheduler_new();
+        for (var j = 0; j < depth; j = j + 1) { agnosai_scheduler_enqueue(s, vec_get(tasks, j)); }
+        vec_push(scheds, s);
+    }
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < rounds; i = i + 1) {
+        var sc = vec_get(scheds, i);
+        while (agnosai_scheduler_dequeue(sc) != 0) { }
+    }
+    bench_batch_stop(b, rounds);
+    bench_report(b);
+    return 0;
+}
+
+# A linear chain of `nn` tasks: t0 -> t1 -> ... The oracle's `linear_dag`
+# (scheduler.rs:56-67). Built once, outside every timed region.
+fn _b_linear_dag(nn): i64 {
+    var tasks = map_new_str();
+    var edges = vec_new();
+    for (var i = 0; i < nn; i = i + 1) {
+        var key = str_cat(str_from("t"), str_from_int(i));
+        map_set(tasks, key, agnosai_task_new(str_cat(str_from("task "), str_from_int(i))));
+        if (i > 0) {
+            vec_push(edges, agnosai_edge_new(str_cat(str_from("t"), str_from_int(i - 1)), key));
+        }
+    }
+    return agnosai_task_dag_new(tasks, edges, agnosai_process_dag());
+}
+
+# The oracle's `wide_dag`: one root, one sink, `nn` workers, 2*nn edges
+# (scheduler.rs:69-81).
+fn _b_wide_dag(nn): i64 {
+    var tasks = map_new_str();
+    var edges = vec_new();
+    var root = str_from("root");
+    var sink = str_from("sink");
+    map_set(tasks, root, agnosai_task_new(str_from("root")));
+    map_set(tasks, sink, agnosai_task_new(str_from("sink")));
+    for (var i = 0; i < nn; i = i + 1) {
+        var key = str_cat(str_from("w"), str_from_int(i));
+        map_set(tasks, key, agnosai_task_new(str_cat(str_from("worker "), str_from_int(i))));
+        vec_push(edges, agnosai_edge_new(root, key));
+        vec_push(edges, agnosai_edge_new(key, sink));
+    }
+    return agnosai_task_dag_new(tasks, edges, agnosai_process_dag());
+}
+
+# The 100-worker wide DAG, built ONCE in `main` and shared by the wide load_dag
+# row and both ready_tasks rows. Setup in all three, timed in none.
+var _B_WIDE_DAG = 0;
+
+# `Scheduler::new() + load_dag(dag)` — the oracle's three `scheduler_dag` rows
+# (scheduler.rs:83-108). Per call: two adjacency maps over every key, one
+# `_agnosai_sched_add_edge` per edge, a key sort, `kahn_sort`, and the id_to_key
+# pass.
+#
+# ⚠ **Read the 50/500 pair as the PORT'S OWN 10x scaling curve, not as an oracle
+# comparison — it diverges in both directions and the two do not cancel.**
+#
+#   * The port sorts ALL keys before `kahn_sort` (scheduler.cyr:247-249) with an
+#     insertion sort. The oracle sorts nothing there: it passes `&dag.tasks`
+#     straight in, and `kahn_sort` sorts only the zero-in-degree SEED, which in
+#     a linear DAG is exactly one node. So this is an extra O(n²) against
+#     nothing — `map_keys` order is pseudo-random, so ~n²/4 ≈ 62,500 string
+#     comparisons at n=500.
+#   * `_agnosai_sched_add_edge` dedups with the linear `_agnosai_sched_has`
+#     where the oracle uses `HashSet::insert`. The wide-100 DAG is the shape
+#     that hurts: the scan runs BEFORE the push, so the i-th insert scans i
+#     entries — 0+1+…+99 = 4,950 per set, 9,900 for root plus sink, against 200
+#     hash inserts.
+#   * Running the other way, the oracle CLONES every task —
+#     `self.dag_tasks = dag.tasks.clone()` — where the port stores a pointer
+#     (scheduler.cyr:259). At 500 tasks that is 500 deep clones per call the
+#     port never pays. That is a design difference, not a win.
+#
+# Land linear-50 and linear-500 together or the scaling claim has no evidence.
+# Measured 155.9 µs at 50 and 3.157 ms at 500 — **10x the DAG for 20x the
+# cost**, i.e. per-task cost doubles from 3.1 µs to 6.3 µs. The extra is the key
+# sort: ~62,500 comparisons at n=500 is ~60% of that row and ~12% at n=50. The
+# wide-100 row lands at 563.5 µs for 102 tasks (5.5 µs each against linear's
+# 3.1 µs), and the 9,900 `str_eq` of edge dedup is where the difference goes.
+fn _b_load_dag(name, dag, n): i64 {
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_scheduler_load_dag(agnosai_scheduler_new(), dag);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The ids of w0..w(nn-1) in the shared wide DAG, for the half-done row.
+fn _b_wide_completed(nn): i64 {
+    var tasks = agnosai_task_dag_tasks(_B_WIDE_DAG);
+    var v = vec_new();
+    for (var c = 0; c < nn; c = c + 1) {
+        vec_push(v, agnosai_task_id(map_get(tasks, str_cat(str_from("w"), str_from_int(c)))));
+    }
+    return v;
+}
+
+# The oracle's top-level `ready_tasks (wide DAG, 100 workers)` (scheduler.rs:
+# 113-122): filter 102 tasks on "not completed && all deps satisfied", then sort
+# by descending priority.
+#
+# ⚠ **The port pushes task POINTERS into `ready` (scheduler.cyr:300) where the
+# oracle does `task.clone()`.** This row will therefore read far faster than the
+# oracle's. That is a design difference, not a win, and CLAUDE.md's rule about
+# not comparing against rust-old/bench-history.csv is the reason it is written
+# down rather than left for a reader to infer.
+#
+# ⚠ **The empty-`completed` row hides the port's actual quadratic.** With
+# nothing completed, `_agnosai_sched_has` never enters its inner loop — the
+# membership test is a linear vec scan where the oracle has `HashSet::contains`.
+# The half-done companion is where it shows: w50..w99 each pay a 50-entry
+# completed scan PLUS a 50-entry scan for "root", ~7,700 str_eq per call. (Note
+# `sink` is NOT the expensive one — the dep loop breaks at the first unsatisfied
+# dependency, scheduler.cyr:296, so sink stops after w50 for ~1,325.) Measured
+# 7.29 µs empty against 117.35 µs half-done: **16x, for a `completed` set that
+# is still only 50 entries**. On a DashSet that ratio would be ~1.
+fn _b_ready_tasks(name, completed, n): i64 {
+    var s = agnosai_scheduler_new();
+    # ⚠ Unchecked, a 0 return (cycle, scheduler.cyr:253) leaves AGN_SCH_DAG_KEYS
+    # at the empty vec `scheduler_new` installed, `ready_tasks` walks nothing,
+    # and both wide-100 rows post a ~100x "improvement" nothing would flag.
+    if (agnosai_scheduler_load_dag(s, _B_WIDE_DAG) == 0) { syscall(60, 1); }
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_scheduler_ready_tasks(s, completed); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# ── pubsub — rust-old/benches/pubsub.rs ──
+
+# One `matches_pattern` call. The oracle's four matcher rows differ only in the
+# two strings, so they share one shape (pubsub.rs:10-35).
+#
+# The existing `pattern_match_wildcard` row above is a NEAR NEIGHBOUR, not
+# coverage for any of these: it runs "tool.*.*.failed" against
+# "tool.http.request.succeeded" — four segments, two stars, and it returns FALSE
+# on a literal mismatch at the last segment. None of the oracle's four is that
+# shape.
+fn _b_pattern(name, pattern, topic, n): i64 {
+    var p = str_from(pattern);
+    var t = str_from(topic);
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_matches_pattern(p, t); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The publish ladder: 1, 10 and 100 subscribers over the oracle's exact pattern
+# mixes (pubsub.rs:39-81). Only interpretable as a set of three.
+#
+# ⚠ **The port's publish scales with SUBSCRIBERS where the oracle's scaled with
+# PATTERNS.** `src/orchestrator/pubsub.cyr:12-21` records why: Cyrius channels
+# are single-consumer, so a pattern maps to a VEC OF PER-SUBSCRIBER CHANNELS
+# rather than one tokio broadcast sender. At 100 subscribers the oracle pays 5
+# `matches_pattern` and 4 broadcast sends; this pays 5 `matches_pattern` and 80
+# individual lossy pushes (20 channels on each of the four matching patterns).
+# That was an assertion in the module header until these three rows existed.
+#
+# Measured 3.08 / 12.20 / 73.36 µs for 1 / 10 / 80 pushes — a straight line at
+# **~0.87 µs per saturated lossy push** over a ~3.5 µs fixed cost (the
+# TopicMessage, the `clock_now_ns`, the `map_keys` vec and the per-pattern
+# matches). So the ladder is 1 : 4.0 : 23.8, not the 1 : ~8 : ~80 a
+# pushes-only model predicts: the fixed half is large enough at one subscriber
+# to flatten the low end. The oracle's broadcast made the same ladder 1 : 3 : 4.
+#
+# ⚠ **Every ring is saturated before timing**, so each timed push takes
+# `agnosai_chan_push_lossy`'s evict-and-retry branch — three mutex round trips
+# (try_send, try_recv, try_send), which is the state the oracle's held-but-unread
+# receivers are in after its own first 256 iterations. Same technique as
+# `_b_event_send_evicting` above.
+#
+# ⚠ **DIVERGENCE: the payload is hoisted, the oracle builds `json!({"id": 42})`
+# inside its timed closure.** The port carries the payload BY REFERENCE and
+# never serialises it inside `publish`, so leaving the construction in would add
+# a constant that has nothing to do with fan-out and would swamp the 1-subscriber
+# row. Hoisted deliberately; the ladder's slope is the point.
+fn _b_pubsub_ladder(name, nsubs, n): i64 {
+    var ps = agnosai_pubsub_new();
+    for (var s = 0; s < nsubs; s = s + 1) {
+        if (nsubs == 1) { agnosai_pubsub_subscribe(ps, str_from("task.*")); }
+        elif (nsubs == 10) {
+            if (s % 3 == 0) { agnosai_pubsub_subscribe(ps, str_from("task.completed")); }
+            elif (s % 3 == 1) { agnosai_pubsub_subscribe(ps, str_from("task.*")); }
+            else { agnosai_pubsub_subscribe(ps, str_from("task.#")); }
+        } else {
+            if (s % 5 == 0) { agnosai_pubsub_subscribe(ps, str_from("task.completed")); }
+            elif (s % 5 == 1) { agnosai_pubsub_subscribe(ps, str_from("task.*")); }
+            elif (s % 5 == 2) { agnosai_pubsub_subscribe(ps, str_from("task.#")); }
+            elif (s % 5 == 3) { agnosai_pubsub_subscribe(ps, str_from("agent.*")); }
+            else { agnosai_pubsub_subscribe(ps, str_from("#")); }
+        }
+    }
+    var topic = str_from("task.completed");
+    var payload = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(payload, str_from("id"), bayan_json_v_int_new(42));
+
+    for (var f = 0; f < AGNOSAI_PUBSUB_CHANNEL_CAPACITY; f = f + 1) {
+        agnosai_pubsub_publish(ps, topic, payload);
+    }
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_pubsub_publish(ps, topic, payload); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `PubSub::subscribe (new pattern)` (pubsub.rs:85-96) — a fresh
+# pattern per call, so every one is a map insert plus a `chan_new(256)`.
+#
+# ⚠ **n is capped BELOW AGNOSAI_PUBSUB_MAX_PATTERNS = 10000 on purpose.** Past
+# the cap every call takes the reject branch and the row silently stops
+# measuring inserts. The cap is not a port quirk — `MAX_SUBSCRIPTION_PATTERNS`
+# is 10000 in the oracle too — so criterion's own run of this bench crosses it
+# and publishes a blended number. That is not reproduced.
+fn _b_pubsub_subscribe_new(): i64 {
+    var n = 8000;
+    var ps = agnosai_pubsub_new();
+
+    var b = bench_new("pubsub_subscribe_new_pattern");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_pubsub_subscribe(ps, str_cat(str_cat(str_from("topic."), str_from_int(i)),
+        str_from(".*")));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Beyond the oracle: the REFUSAL path, which is what a subscription flood
+# actually hits — the branch at pubsub.cyr:180-184 once the hub holds 10000
+# patterns. One fixed unseen pattern, so every call is a map miss and a reject.
+# `_agnosai_pubsub_log_reject` logs at SK_WARN and is already suppressed by this
+# file's `sakshi_set_level(SK_FATAL)`.
+fn _b_pubsub_subscribe_at_cap(): i64 {
+    var n = 100000;
+    var ps = agnosai_pubsub_new();
+    for (var f = 0; f < AGNOSAI_PUBSUB_MAX_PATTERNS; f = f + 1) {
+        agnosai_pubsub_subscribe(ps, str_cat(str_from("fill."), str_from_int(f)));
+    }
+    var rejected = str_from("no.such.pattern");
+
+    var b = bench_new("pubsub_subscribe_at_cap");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_pubsub_subscribe(ps, rejected); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# ── approval — rust-old/benches/approval.rs ──
+
+# The oracle's `ApprovalGate::request_approval` (approval.rs:10-21): mint a
+# uuid, register, cancel immediately so the 1000-entry pending cap is never
+# reached. One `chan_new(1)`, one map insert, one map delete.
+#
+# ⚠ **Run at TWO pending depths, and the second is the one worth having.**
+# `lib/hashmap.cyr:322` `map_delete` writes a TOMBSTONE and never reclaims it,
+# and `map_set_a` grows on the LIVE count only — so a gate churning
+# request/cancel at a realistic depth fills its table with tombstones and every
+# later `_map_find` probes further before reusing one. `_agnosai_approval_forget`
+# also linear-scans the key mirror, and the id it wants is the one just pushed
+# at the END. The oracle's DashMap removes properly. The parity row pins pending
+# at 1 and hides both effects entirely: measured 2.07 µs at depth 1 against
+# **16.75 µs at depth 512** — 8x, for a gate holding half its documented
+# capacity. The oracle's row would be flat across both.
+fn _b_approval_request_cancel(name, pending, n): i64 {
+    var g = agnosai_approval_gate_new();
+    for (var f = 0; f < pending; f = f + 1) {
+        agnosai_approval_request(g, agnosai_uuid_v4_str());
+    }
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var id = agnosai_uuid_v4_str();
+        agnosai_approval_request(g, id);
+        agnosai_approval_cancel(g, id);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+
+    # The oracle asserts `rx.is_some()` (approval.rs:17). Dropping that is not
+    # cosmetic: past AGNOSAI_APPROVAL_MAX_PENDING (approval.cyr:229) `request`
+    # answers 0, `cancel` takes its `ch == 0` early return, and both rows quietly
+    # become "map miss + suppressed log" — i.e. a large reported IMPROVEMENT.
+    # This row sits at 513 of a 1000 cap, so the margin is under 2x.
+    if (agnosai_approval_gate_pending_count(g) != pending) { syscall(60, 1); }
+    return 0;
+}
+
+# The oracle's `ApprovalGate::submit_decision` (approval.rs:25-35) — the full
+# register-then-deliver round trip. Pending depth stays at 0/1 because
+# `submit_decision` deletes the entry, so the gate never nears MAX_PENDING.
+#
+# `agnosai_approval_wait_for_decision` deliberately gets NO row: the oracle does
+# not bench it either, and the port's version sleeps AGNOSAI_APPROVAL_POLL_MS
+# between polls, so any bench of it would measure `sleep_ms`.
+fn _b_approval_submit_decision(): i64 {
+    var n = 100000;
+    var g = agnosai_approval_gate_new();
+
+    var b = bench_new("approval_submit_decision");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var id = agnosai_uuid_v4_str();
+        agnosai_approval_request(g, id);
+        agnosai_approval_submit_decision(g, id, AGNOSAI_APPROVAL_APPROVED);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+
+    # The oracle's `assert!(delivered)` (approval.rs:32), for the reason above:
+    # a saturated gate makes `submit_decision` a map miss and reports it as a
+    # speedup. This gate starts empty and every request is decided in-loop, so
+    # the terminal depth is 0 — anything else means entries are not being taken.
+    if (agnosai_approval_gate_pending_count(g) != 0) { syscall(60, 1); }
+    return 0;
+}
+
+# ── ipc — rust-old/benches/ipc.rs ──
+
+# The socket path the establishment rows bind. `agnosai_ipc_bind` unlinks any
+# stale file first, so a fixed name is safe to re-run — the same reasoning
+# tests/orch_ipc.tcyr uses.
+var _B_IPC_SOCK = "/tmp/agnosai-bench-ipc.sock";
+
+# 1 MiB, the oracle's large-payload size, and how many frames the writer sends.
+var _B_IPC_BIG_LEN = 1048576;
+var _B_IPC_BIG_BUF = 0;
+var _B_IPC_BIG_N = 50;
+
+# Feeds the 1 MiB row from its own thread: 1 MiB does not fit a socketpair
+# buffer (~208 KB), so a same-thread write would block forever with nobody
+# draining. ONE long-lived writer, not one per iteration.
+fn _b_ipc_big_writer(fd): i64 {
+    for (var i = 0; i < _B_IPC_BIG_N; i = i + 1) {
+        agnosai_ipc_write_frame(fd, _B_IPC_BIG_BUF, _B_IPC_BIG_LEN);
+    }
+    return 0;
+}
+
+# Connects to `_B_IPC_SOCK` `n` times and closes each fd, from its own thread.
+fn _b_ipc_connect_loop(n): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var fd = agnosai_ipc_connect(str_from(_B_IPC_SOCK));
+        if (fd != AGNOSAI_IPC_ERR) { sys_close(fd); }
+    }
+    return 0;
+}
+
+# The oracle's `IPC round-trip (single message)` (ipc.rs:11), FRAMING HALF ONLY.
+#
+# ⚠ **Split into two rows, because the oracle's one number conflates two
+# unrelated costs**: connection establishment (unlink + socket + bind + listen +
+# connect + accept, plus a tokio task spawn) and the framing + JSON of a 10-byte
+# payload. There is no tokio spawn to reproduce, so a literal port would measure
+# the sum of two things neither of which it could report. `ipc_bind_close` and
+# `ipc_accept_close_under_load` below are the establishment half.
+#
+# `sys_socketpair` stands in for bind/connect/accept — the substitution
+# tests/orch_ipc.tcyr:23-36 already proves. Per iteration: two
+# `bayan_json_v_build`, two parses and eight syscalls (write_frame is two
+# writes, read_frame two reads, on each leg).
+fn _b_ipc_roundtrip(): i64 {
+    var n = 20000;
+    var fds: i64[2];
+    if (sys_socketpair(1, 1, 0, &fds) != 0) { syscall(60, 1); }
+    var p = &fds;
+    var fd_a = load32(p) & 4294967295;
+    var fd_b = load32(p + 4) & 4294967295;
+    var src = "{\"ping\":1}";
+    var ping = bayan_json_v_parse_buf(src, strlen(src));
+
+    var b = bench_new("ipc_roundtrip_socketpair");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_ipc_send(fd_a, ping);
+        agnosai_ipc_send(fd_b, agnosai_ipc_recv(fd_b));
+        agnosai_ipc_recv(fd_a);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    sys_close(fd_a);
+    sys_close(fd_b);
+    return 0;
+}
+
+# The oracle's `IPC throughput (100 msgs, same conn)` (ipc.rs:40) — the same
+# echo, 100 times on one connection, so establishment is amortised away.
+#
+# ⚠ **`bench_batch_stop` is passed the OUTER count, not n*100.** lib/bench.cyr:220
+# divides elapsed by the batch size, so passing n*100 would silently rename the
+# row's unit from per-iteration-of-100 to per-message and nobody reading the CSV
+# later could recover which it was. This row is per-iteration-of-100, i.e.
+# directly comparable to 100x `ipc_roundtrip_socketpair`, and confirming that
+# linearity is its only job. It does: 903.0 µs against 100 x 9.144 = 914.4 µs.
+# If the parent ever wants ONE ipc row rather than two, drop this one and keep
+# the round trip.
+fn _b_ipc_throughput_100(): i64 {
+    var n = 200;
+    var fds: i64[2];
+    if (sys_socketpair(1, 1, 0, &fds) != 0) { syscall(60, 1); }
+    var p = &fds;
+    var fd_a = load32(p) & 4294967295;
+    var fd_b = load32(p + 4) & 4294967295;
+    var src = "{\"seq\":1}";
+    var seq = bayan_json_v_parse_buf(src, strlen(src));
+
+    var b = bench_new("ipc_throughput_100_same_conn");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        for (var j = 0; j < 100; j = j + 1) {
+            agnosai_ipc_send(fd_a, seq);
+            agnosai_ipc_send(fd_b, agnosai_ipc_recv(fd_b));
+            agnosai_ipc_recv(fd_a);
+        }
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    sys_close(fd_a);
+    sys_close(fd_b);
+    return 0;
+}
+
+# The establishment half of the oracle's round-trip row: unlink + socket + bind
+# + listen + close, with no peer.
+fn _b_ipc_bind_close(): i64 {
+    var n = 2000;
+    var path = str_from(_B_IPC_SOCK);
+
+    var b = bench_new("ipc_bind_close");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var fd = agnosai_ipc_bind(path);
+        # ⚠ Unguarded, this row gets FASTER when it breaks. `agnosai_ipc_bind`
+        # answers AGNOSAI_IPC_ERR (-2) on failure and `sys_close(-2)` returns
+        # EBADF for free, so a stale `/tmp/agnosai-bench-ipc.sock` owned by
+        # another user turns the whole timed body into "failed setup" and posts a
+        # smaller, entirely plausible number to bench-history.csv — permanently.
+        if (fd == AGNOSAI_IPC_ERR) { syscall(60, 1); }
+        sys_close(fd);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    sys_unlink(str_cstr(path));
+    return 0;
+}
+
+# The other establishment half: `accept(2) + close(2)` on this thread, under a
+# background connect load.
+#
+# ⚠ **Read the name literally — this is NOT the cost of a connect/accept PAIR.**
+# majra's `ipc_bind` listens with a backlog of 128 (lib/majra.cyr:2665) and
+# connect costs about what accept does, so the client thread essentially never
+# parks and the timed loop nearly always finds a connection already queued. What
+# is measured is the server side alone, with the client kept off the critical
+# path — which is the more useful of the two numbers, but only if the label says
+# which one it is.
+fn _b_ipc_accept_under_load(): i64 {
+    var n = 2000;
+    var path = str_from(_B_IPC_SOCK);
+    var srv = agnosai_ipc_bind(path);
+    # Loud, not silent: see the guard note above `_b_ipc_bind_close`.
+    if (srv == AGNOSAI_IPC_ERR) { syscall(60, 1); }
+    if (srv == AGNOSAI_IPC_ERR) { return 0; }
+    var client = thread_create(&_b_ipc_connect_loop, n);
+
+    var b = bench_new("ipc_accept_close_under_load");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var fd = agnosai_ipc_accept(srv);
+        if (fd != AGNOSAI_IPC_ERR) { sys_close(fd); }
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    thread_join(client);
+    sys_close(srv);
+    sys_unlink(str_cstr(path));
+    return 0;
+}
+
+# The oracle's `IPC large payload (1 MiB JSON)` (ipc.rs:77), TRANSPORT ONLY.
+#
+# ⚠ **DELIBERATE DIVERGENCE: this measures the FRAME at 1 MiB, not the JSON
+# encode and parse the oracle also paid.** Putting a 1 MiB bayan value through
+# `agnosai_ipc_send`/`agnosai_ipc_recv` costs ~5 MiB of no-free bump per
+# iteration and is not affordable at any n that produces a number. What is left
+# is exactly the short-write/short-read loops `_agnosai_ipc_write_all` and
+# `_agnosai_ipc_read_all` exist for, which is the interesting part at this size.
+#
+# ⚠ **n is 50 and must not be raised.** `agnosai_ipc_read_frame` allocs the
+# 1 MiB payload and then `str_from_buf` COPIES it (lib/str.cyr:609), so ~2 MiB
+# per iteration is retained for the life of the process. The frame verbs have no
+# `_a` form to thread an arena through; adding one is the prerequisite for a
+# larger n, not a bigger number here.
+fn _b_ipc_frame_1mib(): i64 {
+    _B_IPC_BIG_BUF = alloc(_B_IPC_BIG_LEN);
+    for (var f = 0; f < _B_IPC_BIG_LEN; f = f + 1) { store8(_B_IPC_BIG_BUF + f, 120); }
+    var fds: i64[2];
+    if (sys_socketpair(1, 1, 0, &fds) != 0) { syscall(60, 1); }
+    var p = &fds;
+    var w = load32(p) & 4294967295;
+    var rd = load32(p + 4) & 4294967295;
+    var tid = thread_create(&_b_ipc_big_writer, w);
+
+    var b = bench_new("ipc_frame_1mib_transport");
+    bench_batch_start(b);
+    for (var i = 0; i < _B_IPC_BIG_N; i = i + 1) { agnosai_ipc_read_frame(rd); }
+    bench_batch_stop(b, _B_IPC_BIG_N);
+    bench_report(b);
+    thread_join(tid);
+    sys_close(w);
+    sys_close(rd);
+    return 0;
+}
+
+# ── relay — rust-old/benches/relay.rs (a FLEET oracle) ──
+
+# The oracle's `Relay::send throughput` (relay.rs:14) and `Relay::send (64 KiB
+# payload)` (relay.rs:99), plus a no-subscriber companion.
+#
+# `nsubs` of 0 skips the subscribe entirely; anything else subscribes once and
+# the loop DRAINS, which is mandatory — see the header on the blocking fan-out.
+#
+# ⚠ **The 64 KiB row exists to PIN AN EQUALITY, not to show a cost.** majra's
+# `relay_msg_new` stores the payload POINTER (lib/majra.cyr:1971) rather than
+# copying it, and tests/fleet_relay.tcyr:197 asserts exactly that. So a 64 KiB
+# payload sends in the same time as a null one and this row should land on top
+# of `relay_send_1_sub_drained`. The oracle's `payload.clone()` is a 64 KiB heap
+# copy per iteration that has no counterpart here. Measured 2.418 µs against
+# 2.436 µs for the small payload — **equal within run-to-run noise, which is the
+# result**. The equality stops holding the moment a RelayMessage is serialised
+# across a wire, which the monotonic timestamp already blocks
+# (src/fleet/relay.cyr:33-39).
+#
+# The no-subscriber companion lands at 1.53-1.68 µs, so **one subscribed
+# channel costs ~0.8-0.9 µs per send** — the blocking `chan_send` plus this
+# loop's mandatory `chan_try_recv` drain, two mutex round trips. That is a third
+# of the whole send, which is why the pair exists rather than the parity row
+# alone.
+fn _b_relay_send(name, nsubs, payload, n): i64 {
+    var r = agnosai_relay_new(str_from("node-a"), 4096);
+    var rx = 0;
+    if (nsubs > 0) { rx = agnosai_relay_subscribe(r); }
+    var to = str_from("node-b");
+    var topic = str_from("task.assigned");
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_relay_send(r, to, topic, payload);
+        if (rx != 0) { chan_try_recv(rx); }
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `Relay::broadcast throughput` (relay.rs:83).
+#
+# ⚠ **The one relay row with an agnosai-owned cost.** `agnosai_relay_broadcast`
+# (src/fleet/relay.cyr:113) calls `agnosai_relay_send(r, str_from(""), ...)` — a
+# fresh allocation on every broadcast — where majra's own `relay_broadcast`
+# (lib/majra.cyr:2058) passes a bare 0 and allocates nothing. Pairing this row
+# against `relay_send_1_sub_drained` is what makes that visible, and it is the
+# only thing in the whole wrapper that benchmarks on its own merits. Measured
+# 2.485/2.436 µs and 2.614/2.489 µs on two runs: the per-broadcast allocation is
+# **50-125 ns, a few percent** — real, cheap, and near enough the run-to-run
+# spread that only the consistent SIGN of the gap should be read as signal.
+#
+# The oracle's `"load": 0.42` becomes the integer 420 (milli): the payload is
+# carried by reference and never serialised inside the loop, so its type cannot
+# affect what is measured, and an f64 literal would be risk for no information.
+fn _b_relay_broadcast(): i64 {
+    var n = 200000;
+    var r = agnosai_relay_new(str_from("node-a"), 4096);
+    var rx = agnosai_relay_subscribe(r);
+    var topic = str_from("heartbeat");
+    var payload = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(payload, str_from("ts"), bayan_json_v_int_new(1234567890));
+    bayan_json_v_obj_set(payload, str_from("load"), bayan_json_v_int_new(420));
+
+    var b = bench_new("relay_broadcast_1_sub_drained");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_relay_broadcast(r, topic, payload);
+        chan_try_recv(rx);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `Relay::receive (no dupes)` (relay.rs:31) — every message takes
+# the ACCEPT path: skip-own, target check, dedup entry update, gap comparison,
+# received counter, fan-out to zero subscribers. Sequence starts at 1 because 0
+# would be read as a first-message gap.
+#
+# The dedup map stays at ONE entry (one sender), so this is not measuring
+# rehashing. No subscriber, so no drain and no deadlock risk here.
+fn _b_relay_receive_accept(): i64 {
+    var n = 200000;
+    var r = agnosai_relay_new(str_from("node-b"), 4096);
+    var from = str_from("node-a");
+    var to = str_from("node-b");
+    var topic = str_from("task.result");
+    var payload = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(payload, str_from("status"), bayan_json_v_str_new(str_from("ok")));
+
+    var b = bench_new("relay_receive_accept");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_relay_receive(r, agnosai_relay_message_new(i + 1, from, to, topic, payload));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `Relay::receive (50% dupes)` (relay.rs:58) — seq 1..500 pre-seeded,
+# then alternating a fresh sequence (accept) with a replayed one (the
+# duplicate-drop early return, before the eviction sweep and the fan-out).
+#
+# ⚠ **The oracle's `rand::random::<u64>() % 500 + 1` is NOT reproduced, on
+# purpose.** The only PRNG in reach is `random_bytes` (lib/random.cyr:34), a real
+# `sys_getrandom` syscall that would swamp a sub-microsecond measurement. It is
+# also not load-bearing: majra's dedup is a single `seq <= last` compare against
+# ONE per-sender DedupEntry (lib/majra.cyr:2163-2170), not a set-membership test,
+# so every value in 1..500 takes the byte-identical path. A deterministic index
+# measures the same branch and is reproducible run to run.
+#
+# The `duplicates_dropped` check after the loop is not decoration: without it a
+# blend that silently degenerated to one branch would still report a plausible
+# number. `syscall(60, 1)` rather than a return, because `main` discards every
+# `_b_*` result and a returned failure would exit 0.
+fn _b_relay_receive_dupes(): i64 {
+    var n = 200000;
+    var r = agnosai_relay_new(str_from("node-b"), 4096);
+    var from = str_from("node-a");
+    var to = str_from("node-b");
+    var warmup = str_from("warmup");
+    var topic = str_from("task.result");
+    var payload = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(payload, str_from("data"), bayan_json_v_int_new(123));
+    for (var s = 1; s <= 500; s = s + 1) {
+        agnosai_relay_receive(r, agnosai_relay_message_new(s, from, to, warmup, 0));
+    }
+    var next_new = 501;
+
+    var b = bench_new("relay_receive_50pct_dupes");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var seq = (i % 500) + 1;
+        if (i % 2 == 0) {
+            seq = next_new;
+            next_new = next_new + 1;
+        }
+        agnosai_relay_receive(r, agnosai_relay_message_new(seq, from, to, topic, payload));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    if (agnosai_relay_stats_duplicates_dropped(agnosai_relay_stats(r)) != n / 2) {
+        syscall(60, 1);
+    }
+    return 0;
+}
+
+# The oracle's `Relay::stats (after 100 sends)` (relay.rs:115) — one lock and a
+# 24-byte struct copy there; O(1) regardless of history, so the 100 priming
+# sends only make the counters non-zero.
+#
+# ⚠ **The port pays more here, and the extra is agnosai's.** majra's
+# `relay_stats` already `fl_alloc`s a 48-byte snapshot and runs FIVE
+# `counter_get` calls plus a `map_size` (lib/majra.cyr:2299-2308).
+# `agnosai_relay_stats` then allocates ANOTHER 24 bytes and copies three fields
+# out of it (src/fleet/relay.cyr:192-199). Two allocations per call against the
+# oracle's one lock. That wrapper tax is what this row exists to surface.
+fn _b_relay_stats(): i64 {
+    var n = 200000;
+    var r = agnosai_relay_new(str_from("node-a"), 4096);
+    var to = str_from("node-b");
+    var t = str_from("t");
+    # No subscriber, so the priming sends fan out to nobody and cannot block.
+    for (var f = 0; f < 100; f = f + 1) { agnosai_relay_send(r, to, t, 0); }
+
+    var b = bench_new("relay_stats_snapshot");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_relay_stats(r); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# ── orchestrator — rust-old/benches/orchestrator.rs ──
+
+# The oracle's `make_agent` (orchestrator.rs:13-27). `domain` of 0 is its `None`.
+fn _b_o_agent(key: Str, complexity: Str, domain, tools): i64 {
+    var a = agnosai_agent_new(key, str_from("worker"), str_from("execute tasks"));
+    agnosai_agent_with_name(a, str_cat(str_from("Agent "), key));
+    agnosai_agent_with_tools(a, tools);
+    agnosai_agent_with_complexity(a, complexity);
+    if (domain != 0) { agnosai_agent_with_domain(a, domain); }
+    return a;
+}
+
+# One or two tool names. `t2` of 0 gives the single-tool a3.
+fn _b_o_tools(t1, t2): i64 {
+    var v = vec_new();
+    vec_push(v, str_from(t1));
+    if (t2 != 0) { vec_push(v, str_from(t2)); }
+    return v;
+}
+
+# The oracle's `make_task` (orchestrator.rs:29-37) — the two context keys
+# scoring reads.
+fn _b_o_task(i): i64 {
+    var t = agnosai_task_new(str_cat(str_from("task-"), str_from_int(i)));
+    agnosai_task_with_context(t, str_from("complexity"),
+    bayan_json_v_str_new(str_from("medium")));
+    var req = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(req, bayan_json_v_str_new(str_from("sql_query")));
+    bayan_json_v_arr_push(req, bayan_json_v_str_new(str_from("report_writer")));
+    agnosai_task_with_context(t, str_from("required_tools"), req);
+    return t;
+}
+
+# The oracle's `make_spec` (orchestrator.rs:39-58): a1 sql_query+report_writer /
+# medium / finance, a2 docker+kubectl / high / devops, a3 sql_query / low / no
+# domain, and `n_tasks` identical tasks.
+fn _b_o_spec(name: Str, n_tasks, process): i64 {
+    var c = agnosai_crew_new(name);
+    var agents = vec_new();
+    vec_push(agents, _b_o_agent(str_from("a1"), str_from("medium"), str_from("finance"),
+    _b_o_tools("sql_query", "report_writer")));
+    vec_push(agents, _b_o_agent(str_from("a2"), str_from("high"), str_from("devops"),
+    _b_o_tools("docker", "kubectl")));
+    vec_push(agents, _b_o_agent(str_from("a3"), str_from("low"), 0,
+    _b_o_tools("sql_query", 0)));
+    var tasks = vec_new();
+    for (var i = 0; i < n_tasks; i = i + 1) { vec_push(tasks, _b_o_task(i)); }
+    agnosai_crew_with_agents(c, agents);
+    agnosai_crew_with_tasks(c, tasks);
+    agnosai_crew_with_process(c, process);
+    return c;
+}
+
+# The oracle's `Orchestrator::new` (orchestrator.rs:63). Per call: two
+# `map_new_str` (416 B each), a mutex, and an audit chain whose key comes from a
+# real `sys_getrandom` — that syscall is the floor.
+#
+# ⚠ **NO PORT EXISTS for the ResponseCache, the CostTracker or the Semaphore the
+# oracle's struct also builds.** That is documented, not missing:
+# src/orchestrator/orchestrator.cyr:12-32 records that the HTTP seam moved
+# caching and cost accounting to hoosh and the concurrency bound to the caller.
+# The faster number is a smaller struct, not a faster constructor.
+#
+# n is 20000 because each iteration retains ~1.5 KB on the no-free bump.
+fn _b_orchestrator_new(): i64 {
+    var n = 20000;
+    var budget = agnosai_resource_budget_default();
+
+    var b = bench_new("orchestrator_new");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_orchestrator_new(budget); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's three `run_crew` rows (orchestrator.rs:79, 99, 119). The spec is
+# built INSIDE the timed loop because the oracle builds it inside its closure.
+# Full lifecycle: crew_accepted audit, register Pending, wire the runner, run,
+# per-task audits (sequential only), crew_finished audit, store the state.
+#
+# A FRESH orchestrator per row, which is what the oracle does — a shared one
+# would pool the audit-ring budget across rows and make each row's ceiling
+# depend on the ones before it.
+#
+# ⚠ **The parallel row is a DIFFERENT CONCURRENCY CLASS from the oracle's, and
+# comparing it to the sequential row is comparing clone(2) against a tokio
+# poll.** `_agnosai_crew_run_wave` (crew_runner.cyr:938-954) creates ONE REAL OS
+# THREAD per task in batches of `limit` and joins each batch before the next: 10
+# thread_create and 10 thread_join per iteration, in 3 waves. The oracle used
+# green threads on an already-running runtime. Two further real differences:
+# workers get `event_tx = 0`, and `run_parallel` never calls
+# `_agnosai_crew_audit_task` (crew_runner.cyr:813-817, reproduced from the
+# oracle deliberately) — so the parallel row costs 2 audit entries per crew, not
+# 12.
+#
+# The numbers make that concrete: parallel 487 µs against sequential 367 µs for
+# the SAME ten tasks, while paying ten fewer ~27 µs audit entries. Netting the
+# audits out, the ten `thread_create`/`thread_join` pairs cost ~43 µs each — so
+# the port's `Parallel` mode is a LOSS at this task size and only pays once a
+# task blocks on something. Reading it as a regression against the oracle would
+# be reading a `clone(2)` as a slow `tokio::spawn`.
+#
+# ⚠ **Every iteration also builds a GenAI crew span.** The telemetry RECORDER
+# no-ops without a configured exporter, but `agnosai_genai_crew_span`
+# (src/telemetry/genai.cyr:162) is called unconditionally at
+# crew_runner.cyr:1192 and allocates 104 B plus two `clock_epoch_ns` calls for a
+# span the recorder then discards. Including telemetry is not free; it is
+# required, because the file does not compile without it.
+#
+# ⚠ **The n are set by the audit ring, and the retention behind it is larger
+# than the ring.** `agnosai_audit_record`'s own doc measures the hashing path at
+# ~4.6 KB per entry, and the orchestrator's two audits take the GLOBAL bump
+# (only `_agnosai_crew_run_sequential`'s per-task audits get the scratch arena),
+# so crew_accepted + crew_finished alone retain ~9.2 KB per iteration.
+fn _b_run_crew(name, crew_name, n_tasks, process, n): i64 {
+    var o = agnosai_orchestrator_new(agnosai_resource_budget_default());
+
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_orchestrator_run_crew(o, _b_o_spec(str_from(crew_name), n_tasks, process));
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -765,9 +1937,74 @@ fn main(): i64 {
     _b_event_send_evicting();
     _b_pubsub_publish();
     _b_pattern_match();
+
+    # The oracle's four matcher rows, cheapest first. `pattern_match_literal` is
+    # the ZERO POINT of the ladder — the only one that isolates `str_split` from
+    # wildcard logic, which is what makes it possible to argue about the stack-
+    # array split optimisation the port deliberately did not reproduce
+    # (src/orchestrator/pubsub.cyr:132-135).
+    #
+    # The trailing-`#` row short-circuits at pubsub.cyr:104 after one literal
+    # compare; the deep row is the ONLY one that enters the interior-`#`
+    # backtracking loop at pubsub.cyr:106-108 — four failed probes (i=3,4,5,6)
+    # before i=7 hits. Nothing else in benches/ touches that path, and it is the
+    # row that would catch a matcher regression going exponential on adversarial
+    # patterns. It does NOT exercise AGNOSAI_PUBSUB_MAX_MATCH_DEPTH: this shape
+    # peaks at recursion depth 7 against a cap of 32, so the guard at
+    # pubsub.cyr:89 is evaluated on every call and never fires.
+    #
+    # ⚠ Counts cut 4x (200000/100000 -> 50000/25000) on 2026-08-11. Each call
+    # allocates two vecs plus a copied Str per segment on the no-free bump, and
+    # the deep row splits 17 segments — **measured at ~69 MB per row**, ~276 MB
+    # for the four. The original justification priced only timing resolution and
+    # never priced the allocation at all. Per-op costs are 458-1469 ns, so the
+    # resolution is still ample at a quarter of the iterations.
+    _b_pattern("pattern_match_literal", "task.completed", "task.completed", 50000);
+    _b_pattern("pattern_match_single_star", "task.*", "task.completed", 50000);
+    _b_pattern("pattern_match_trailing_hash", "agent.#", "agent.status.health.cpu.load",
+    50000);
+    _b_pattern("pattern_match_deep_mixed_10seg", "a.*.c.#.h.*.j", "a.b.c.d.e.f.g.h.i.j",
+    25000);
+
+    _b_pubsub_ladder("pubsub_publish_1_sub", 1, 100000);
+    _b_pubsub_ladder("pubsub_publish_10_subs", 10, 100000);
+    # 20000 rather than 100000: each iteration performs 80 channel pushes, so
+    # this is 1.6M pushes — comparable to the 10-sub row's total.
+    _b_pubsub_ladder("pubsub_publish_100_subs", 100, 20000);
+    _b_pubsub_subscribe_new();
+    _b_pubsub_subscribe_at_cap();
+
+    _b_approval_request_cancel("approval_request_cancel", 0, 100000);
+    _b_approval_request_cancel("approval_request_cancel_512_pending", 512, 20000);
+    _b_approval_submit_decision();
+
+    _b_score_rich();
+    _b_score_minimal();
+    _b_score_gpu();
+    _b_score_domain_mismatch();
+    _b_rank_agents_varied_100();
+    _b_rank_agents_varied_300();
+    _b_rank_agents_varied_1000();
     _b_rank_agents();
     _b_delegate();
     _b_kahn_sort();
+
+    _b_sched_enqueue_100();
+    _b_sched_enqueue_prebuilt();
+    _b_sched_dequeue("scheduler_dequeue_100_priority_order", 100, 20000);
+    _b_sched_dequeue("scheduler_dequeue_1000_priority_order", 1000, 2000);
+    _B_WIDE_DAG = _b_wide_dag(100);
+    # 5000 -> 1000: measured ~58 KB/call, so this single row was ~285 MB of the
+    # run's peak RSS — more than its 500-task sibling, which HAD been cut for
+    # exactly this reason. Per-op cost is microseconds; resolution is untouched.
+    _b_load_dag("scheduler_load_dag_linear_50", _b_linear_dag(50), 1000);
+    # 500, not 5000: the extra key sort makes each call ~1 ms and each call
+    # allocates ~220 KB. The row is only meaningful paired with linear-50.
+    _b_load_dag("scheduler_load_dag_linear_500", _b_linear_dag(500), 500);
+    _b_load_dag("scheduler_load_dag_wide_100", _B_WIDE_DAG, 2000);
+    _b_ready_tasks("scheduler_ready_tasks_wide_100", vec_new(), 100000);
+    _b_ready_tasks("scheduler_ready_tasks_wide_100_half_done", _b_wide_completed(50), 20000);
+
     _b_plan_key();
     _b_plan_cache_get();
     _b_conv_buffer_push();
@@ -796,6 +2033,42 @@ fn main(): i64 {
     _b_auth_jwt_valid();
     _b_auth_jwt_bad_alg();
     _b_auth_jwt_prepare();
+
+    _b_ipc_roundtrip();
+    _b_ipc_throughput_100();
+    _b_ipc_bind_close();
+    _b_ipc_accept_under_load();
+    _b_ipc_frame_1mib();
+
+    var relay_small = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(relay_small, str_from("agent"),
+    bayan_json_v_str_new(str_from("worker-1")));
+    bayan_json_v_obj_set(relay_small, str_from("payload_kb"), bayan_json_v_int_new(4));
+    # 64 KiB of 'x', the oracle's large payload.
+    var sb64 = str_builder_new();
+    for (var f = 0; f < 1024; f = f + 1) {
+        str_builder_add_cstr(sb64,
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    }
+    var relay_big = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(relay_big, str_from("data"),
+    bayan_json_v_str_new(str_builder_build(sb64)));
+
+    _b_relay_send("relay_send_1_sub_drained", 1, relay_small, 200000);
+    _b_relay_send("relay_send_no_subs", 0, relay_small, 200000);
+    _b_relay_send("relay_send_64k_payload_by_ref", 1, relay_big, 200000);
+    _b_relay_broadcast();
+    _b_relay_receive_accept();
+    _b_relay_receive_dupes();
+    _b_relay_stats();
+
+    _b_orchestrator_new();
+    _b_run_crew("run_crew_1_task_sequential", "bench-1", 1,
+    agnosai_process_sequential(), 2000);
+    _b_run_crew("run_crew_10_tasks_sequential", "bench-10-seq", 10,
+    agnosai_process_sequential(), 500);
+    _b_run_crew("run_crew_10_tasks_parallel_4", "bench-10-par", 10,
+    agnosai_process_parallel(4), 1000);
 
     return 0;
 }

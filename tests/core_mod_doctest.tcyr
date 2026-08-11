@@ -1,0 +1,101 @@
+# =========================================================================
+# core_mod_doctest.tcyr — the oracle's one real doctest, as assertions.
+#
+# Oracle: the ` ``` ` block in rust-old/src/core/mod.rs:9-21.
+#
+# ⚠ **It is the ONLY doctest under `rust-old/src/`.** The other three fenced
+# blocks are ` ```text ` (`tools/wasm_loader.rs`), ` ```ignore `
+# (`telemetry/genai.rs`) and ` ```yaml ` (`definitions/k8s_crd.rs`), none of
+# which `cargo test` compiles or runs. So this file closes M12's "the doctest"
+# item in full, not in part.
+#
+# ## What a doctest actually buys, and why it is not redundant here
+#
+# Every symbol below is already covered by `core_agent`, `core_task` and
+# `core_crew`. That is not the point. A doctest asserts that **the example a
+# reader is shown still works** — it is a promise about the documentation, and it
+# is the one test that fails when an API changes in a way that silently
+# invalidates the prose. Deleting it because "the units cover it" is how a
+# README's first code block ends up not compiling.
+#
+# Cyrius has no doctest runner, so the example is transcribed here and
+# `src/core/mod.cyr`'s header carries the block it mirrors. **If either moves,
+# move both.**
+#
+# ## The one deliberate difference from the Rust
+#
+# The oracle writes `AgentDefinition::from_json(...).unwrap()` — a panic on
+# failure, which is what makes a doctest a test at all. `agnosai_agent_from_json`
+# returns 0 instead, so the `unwrap()` becomes an explicit assertion. Same
+# property, and it reports better than a fault would.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's `r#"{...}"#` literal, verbatim in field order.
+fn _t_doc_agent_json(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\n    \"agent_key\": \"analyst\",\n");
+    str_builder_add_cstr(sb, "    \"name\": \"Analyst\",\n");
+    str_builder_add_cstr(sb, "    \"role\": \"data analyst\",\n");
+    str_builder_add_cstr(sb, "    \"goal\": \"analyze data\"\n}");
+    return str_builder_build(sb);
+}
+
+fn _t_seq(a: Str, b, name): i64 {
+    return assert(str_eq(a, str_from(b)), name);
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    test_group("core_mod_doctest");
+
+    # `let agent = AgentDefinition::from_json(r#"{...}"#).unwrap();`
+    var agent = agnosai_agent_from_json(_t_doc_agent_json());
+    assert_neq(agent, 0,
+    "the documented agent JSON parses — this is the oracle's `.unwrap()`, and it is the \
+    whole assertion a doctest makes");
+
+    # The doctest binds it and stops, but a parse that returned a right-shaped
+    # empty object would satisfy that and still be a broken example.
+    _t_seq(agnosai_agent_key(agent), "analyst", "with the documented agent_key");
+    _t_seq(agnosai_agent_name(agent), "Analyst", "name");
+    _t_seq(agnosai_agent_role(agent), "data analyst", "role");
+    _t_seq(agnosai_agent_goal(agent), "analyze data", "and goal");
+
+    # ⚠ The example omits `name` from nothing and omits nothing else either — it
+    # is the minimal complete definition, so a required field added to
+    # `agnosai_agent_from_json` breaks the documented example before it breaks
+    # any caller. That is exactly what this file is for.
+    assert_eq(vec_len(agnosai_agent_tools(agent)), 0,
+    "and no tools, since the documented example declares none");
+
+    # `let task = Task::new("Analyze quarterly revenue trends");`
+    var task = agnosai_task_new(str_from("Analyze quarterly revenue trends"));
+    assert_neq(task, 0, "the documented task is created");
+    _t_seq(agnosai_task_description(task), "Analyze quarterly revenue trends",
+    "carrying its description");
+    assert_eq(agnosai_task_status(task), AGNOSAI_STATUS_PENDING, "and starting Pending");
+
+    # `let crew = CrewSpec::new("analysis-crew");`
+    var crew = agnosai_crew_new(str_from("analysis-crew"));
+    assert_neq(crew, 0, "the documented crew is created");
+    _t_seq(agnosai_crew_name(crew), "analysis-crew", "under the documented name");
+    assert_neq(agnosai_crew_id(crew), 0, "with an id minted for it");
+    assert_eq(vec_len(agnosai_crew_tasks(crew)), 0,
+    "and empty — the example never attaches the task it just built, which is the \
+    oracle's shape and is transcribed rather than tidied");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

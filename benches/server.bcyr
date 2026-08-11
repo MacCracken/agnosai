@@ -30,6 +30,24 @@
 # struct is minted before dispatch reaches any arm, so it is in **both** numbers
 # and neither route threading nor any further handler work can remove it.
 #
+# ## Three rows here are deliberately SINGLE-arm, and that is not an omission
+#
+# `/health`, `/ready` and `/metrics` have no `_a` handler, and
+# `_agnosai_route_dispatch_inner` calls the bare form unconditionally
+# (`router.cyr:525-527`). An arena twin would time the 24-byte match struct and
+# nothing else — `route_resolve` already isolates exactly that — so publishing
+# the pair would make the paired-arm claim above false for those rows.
+#
+# ## The prompt_guard family lives here, not in orch.bcyr
+#
+# `benches/orch.bcyr` already carries `prompt_scan_clean_67b` and
+# `prompt_scan_clean_4k`, so the 500-byte family could have gone there. It is
+# here because the whole value of the suspicious and sanitize rows is the delta
+# against a clean scan **at the same length**, and a delta whose numerator and
+# denominator land in different report files is unreadable. All three 500-byte
+# rows are therefore in one file, self-subtracting. `main` sets `SK_FATAL`,
+# which sanitize's warn path (`prompt_guard.cyr:174`) needs suppressed anyway.
+#
 # These are CYRIUS baseline numbers, NOT comparable to
 # rust-old/bench-history.csv. See CLAUDE.md.
 #
@@ -212,6 +230,144 @@ fn _b_post_arena(s, name, path: Str, body: Str, n): i64 {
     return 0;
 }
 
+# Dispatch `body` once and stop the whole run if the handler did not answer 200.
+#
+# `_b_post_global` and `_b_post_arena` discard the response, so a body that
+# fails validation would time the 422 path with nothing to show for it. This is
+# `syscall(60, 1)` rather than a return: `main` discards every `_b_*` return
+# value, so a returned failure would exit 0 and merely omit a report line —
+# the quietest possible way for a benchmark to stop measuring what it names.
+fn _b_assert_post_ok(s, path: Str, body: Str): i64 {
+    var empty = str_from("");
+    var r = agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, path, empty, 0, body);
+    if (agnosai_route_status(r) != HTTP_OK) { syscall(60, 1); }
+    return 0;
+}
+
+# The oracle's crew request body (`rust-old/benches/server.rs:133-146`): one
+# agent, one task, no optional fields.
+#
+# Built through a `str_builder` rather than one `str_from` only because the
+# escaped literal is past the 120-byte line limit. `agent_key`/`name`/`role`/
+# `goal` are all four required by `agnosai_agent_from_value_a`
+# (`core/agent.cyr:295-302`) and `description` by `agnosai_task_req_from_value_a`
+# (`routes/crews.cyr:94-106`); every key must also be known to
+# `agnosai_route_no_unknown_fields` or the request is 422 before the handler.
+fn _b_crew_body(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"bench-crew\",\"agents\":[{");
+    str_builder_add_cstr(sb, "\"agent_key\":\"worker\",\"name\":\"Worker\",");
+    str_builder_add_cstr(sb, "\"role\":\"worker\",\"goal\":\"execute tasks\"}],");
+    str_builder_add_cstr(sb, "\"tasks\":[{\"description\":\"Run a benchmark task\",");
+    str_builder_add_cstr(sb, "\"expected_output\":\"task result\"}]}");
+    return str_builder_build(sb);
+}
+
+# The JSON-RPC `initialize` envelope (`rust-old/benches/server.rs:186`).
+#
+# `params` is kept even though `_agnosai_mcp_initialize` ignores it entirely:
+# parsing it is part of what the oracle measured, and dropping it would make the
+# row cheaper than the request a real client sends.
+fn _b_mcp_init_body(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",");
+    str_builder_add_cstr(sb, "\"params\":{\"protocolVersion\":\"2024-11-05\",");
+    str_builder_add_cstr(sb, "\"clientInfo\":{\"name\":\"bench\",\"version\":\"0.1.0\"}}}");
+    return str_builder_build(sb);
+}
+
+# The oracle's clean corpus: `"…lazy dog. ".repeat(12)` trimmed to 500 bytes
+# (`rust-old/benches/prompt_guard.rs:10-12`). The repeat unit is **45** bytes,
+# so the untrimmed build is 540.
+fn _b_clean_500(): Str {
+    var sb = str_builder_new();
+    for (var f = 0; f < 12; f = f + 1) {
+        str_builder_add_cstr(sb, "The quick brown fox jumps over the lazy dog. ");
+    }
+    return str_sub(str_builder_build(sb), 0, 500);
+}
+
+# The prompt guard's WORST case: 31 sliding case-blind window walks over clean
+# text, none matching. Every user-supplied field pays it on every task, and
+# `execute_task` sanitizes four of them per task.
+#
+# 500 bytes because that is the oracle's fixture, and because `orch.bcyr`'s two
+# existing clean rows sit at 67 B and 2,880 B — this lands between them, so the
+# three together give the O(len) slope three points instead of two.
+#
+# n=10000, not the 50000 the two `orch.bcyr` rows use: interpolating those
+# (8.0 µs at 67 B, ~273 µs at 2,880 B — both quoted in `prompt_guard.cyr:83-84`)
+# puts a clean 500 B scan near 50 µs, so 50000 would be ~2.5 s for one row.
+fn _b_prompt_scan_clean_500(): i64 {
+    var n = 10000;
+    var text = _b_clean_500();
+
+    var b = bench_new("prompt_scan_clean_500b");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_scan_input(text); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The EARLY-EXIT arm, which nothing else in `benches/` measures — both existing
+# `prompt_scan_*` rows are clean, and clean is the only case that runs all 31
+# patterns. `"ignore previous instructions"` is the FIRST table entry
+# (`prompt_guard.cyr:107`), so a match returns after one pattern.
+#
+# Measured, the pair comes out at **30.2x** (62.1 µs clean vs 2.06 µs here),
+# which is the 31-pattern ratio almost exactly — and that is worth writing down
+# because it is a statement about `agnosai_str_contains_ci`, not about the
+# patterns. The folded first-byte guard (`strcase.cyr:74-76`) rejects nearly
+# every offset in one compare in BOTH corpora, so each pattern costs ~O(len)
+# either way and the early exit simply removes 30 of the 31 passes. If that
+# ratio ever falls, the guard has stopped filtering and the inner loop is
+# running — which is the regression this row exists to catch.
+#
+# The corpus is the oracle's `"a".repeat(460)` (`prompt_guard.rs:27-28`), so it
+# is 489 bytes with the tail, not 500. The oracle's own name says 500; matching
+# the fixture beats matching the label.
+#
+# The guard below is load-bearing, not decoration: the pattern table's order is
+# contractual (`prompt_guard.cyr:42-48`), and a reorder would otherwise turn
+# this row silently into a second, slower clean row.
+fn _b_prompt_scan_suspicious_500(): i64 {
+    var n = 50000;
+    var sb = str_builder_new();
+    for (var f = 0; f < 46; f = f + 1) { str_builder_add_cstr(sb, "aaaaaaaaaa"); }
+    str_builder_add_cstr(sb, " ignore previous instructions");
+    var text = str_builder_build(sb);
+    if (agnosai_prompt_scan_input(text) == AGNOSAI_SCAN_CLEAN) { syscall(60, 1); }
+
+    var b = bench_new("prompt_scan_suspicious_500b");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_scan_input(text); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The full sanitize path on the same 500 B corpus, so the two rows subtract:
+# the difference is exactly the four-fragment `<user_input field="…">` wrap,
+# since the truncation guard is not taken at 500 B (the limit is 50,000,
+# `prompt_guard.cyr:59`) and the warn path is not reached on clean input.
+#
+# ⚠ `field` is hoisted out of the loop deliberately. The oracle passes a
+# `&'static str`; leaving `str_from("description")` inside would fold a 16-byte
+# `str` header allocation per iteration into the very delta this row isolates.
+fn _b_prompt_sanitize_clean_500(): i64 {
+    var n = 10000;
+    var text = _b_clean_500();
+    var field = str_from("description");
+
+    var b = bench_new("prompt_sanitize_clean_500b");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_sanitize(text, field); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
 # The router's own cost, in both arms and removable from neither.
 fn _b_resolve(): i64 {
     var n = 200000;
@@ -243,6 +399,23 @@ fn main(): i64 {
     var crew_path = str_builder_build(csb);
 
     _b_resolve();
+
+    # The three public probes — no auth branch at all (`agnosai_route_needs_auth`
+    # returns 0 for all three, `router.cyr:450-451`), so these are the floor:
+    # body-limit check, resolve, handler, response. Single-arm by construction —
+    # see the header.
+    #
+    # ⚠ `/metrics` reads the **process-global** registry
+    # (`prometheus.cyr:54`), not a fixture-owned one, and the rendered body's
+    # length therefore depends on what ran before it. `_b_state` runs eight
+    # crews, and `crew_runner.cyr:1210/1254-1255` record `crew_started`,
+    # `crew_completed` and `tasks_completed` on every one, so this row renders
+    # 8/0/8/0/0/0.000000. It is placed **before** the `POST /crews` rows at the
+    # bottom for that reason: those add 4,000 more crews and would widen three
+    # of the six counters. Any new row that runs a crew belongs after this one.
+    _b_dispatch_global(s, "route_health_global", str_from("/health"), 100000);
+    _b_dispatch_global(s, "route_ready_global", str_from("/ready"), 100000);
+    _b_dispatch_global(s, "route_metrics_global", str_from("/metrics"), 50000);
 
     # The B2 orchestrator group — the four routes threaded last.
     _b_dispatch_global(s, "route_dashboard_crews_global",
@@ -283,6 +456,76 @@ fn main(): i64 {
     var mcp = str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
     _b_post_global(s, "route_mcp_global", str_from("/mcp"), mcp, 20000);
     _b_post_arena(s, "route_mcp_arena", str_from("/mcp"), mcp, 20000);
+
+    # The `initialize` arm of the same route, which the two rows above do NOT
+    # cover despite the matching name: they post a `tools/list` body and take
+    # `mcp.cyr:540`, walking every registered tool's schema and every parameter
+    # under it. `initialize` takes `mcp.cyr:537` and builds a fixed six-object
+    # result with no registry walk. Same count as the pair above so the four
+    # rows sit against each other and the delta is the registry walk.
+    #
+    # ⚠ It measured **slower** than `tools/list` (4.64 µs vs 3.95 µs), which
+    # inverts the expectation and is a fact about the fixture, not the handlers:
+    # `_b_state` registers exactly ONE tool, so `tools/list`'s registry walk is
+    # a single schema, while this row parses a 135-byte nested envelope against
+    # `tools/list`'s 46 and then builds six objects. Register a second tool and
+    # the order flips. Read the pair as "envelope parse vs one-tool walk".
+    #
+    # No status guard is possible here — every arm of the method ladder,
+    # including "method not found", answers HTTP_OK inside the JSON-RPC
+    # envelope, so `agnosai_route_status` cannot tell them apart.
+    #
+    # ⚠ Not comparable in kind to the Rust number: the port's `initialize`
+    # advertises `prompts` and `resources` capabilities the oracle has no
+    # equivalent for (ADR 015, ADR 016), so this result tree is larger.
+    var mcp_init = _b_mcp_init_body();
+    _b_post_global(s, "route_mcp_initialize_global", str_from("/mcp"), mcp_init, 20000);
+    _b_post_arena(s, "route_mcp_initialize_arena", str_from("/mcp"), mcp_init, 20000);
+
+    # The prompt guard, which no route row reaches: `execute_task` calls it only
+    # after the LLM-client check, and every crew here runs on the placeholder
+    # arm (`crew_runner.cyr:556-560`). Timed directly instead.
+    _b_prompt_scan_clean_500();
+    _b_prompt_scan_suspicious_500();
+    _b_prompt_sanitize_clean_500();
+
+    # ── POST /api/v1/crews — LAST, and on states of its own ────────────────
+    #
+    # The heaviest route in the file: parse, validate, build the spec, then a
+    # BLOCKING full crew run (the oracle awaits it inline) — two mutex pairs,
+    # the DAG sort, one placeholder result, and an audit record. Fully offline:
+    # `agnosai_orchestrator_new(0)` leaves the LLM URL at 0
+    # (`orchestrator.cyr:63`), so `execute_task` returns the placeholder before
+    # any inference.
+    #
+    # ⚠ **Three reasons this cannot share `s`, and none of them fails loudly.**
+    #   1. `_agnosai_orch_finish` does `map_set` on the crew registry
+    #      (`orchestrator.cyr:326`) and never prunes. Three pairs above render
+    #      one object per REGISTERED crew — that is why `AGN_B_FIXTURE_N` is 8 —
+    #      so running this against `s` would re-time them against 8 + n.
+    #   2. The two arms cannot share a state either, or the arena arm starts
+    #      with ~2,000 crews in the registry the global arm never saw, and the
+    #      pair stops being a comparison. Hence `s2` and `s3`.
+    #   3. `_agnosai_orch_audit` fires twice per run (`orchestrator.cyr:234`
+    #      and `:322`) and the chain evicts at `AGNOSAI_AUDIT_MAX_ENTRIES`
+    #      (10000, `audit.cyr:55`) with `vec_remove(entries, 0)` — an O(n) shift
+    #      over 10,000 pointers PLUS an extra SHA-256. n=2000 puts each arm at
+    #      ~4,000 records, comfortably under the cliff. **Do not raise n past
+    #      ~4,900 without minting a fresh state**, or the row starts measuring
+    #      the ring's memmove and reads as a regression in the handler.
+    #
+    # ⚠ Expect a far smaller arena win than the read routes show, and do not
+    # read that as a defect: most of what this route allocates is the crew
+    # *execution*, which is retained state and stays on the global bump in both
+    # arms (`crews.cyr:593-598`). What moves to the arena is the parse tree and
+    # the response.
+    var crew_body = _b_crew_body();
+    var crews_path = str_from("/api/v1/crews");
+    var s2 = _b_state();
+    var s3 = _b_state();
+    _b_assert_post_ok(s2, crews_path, crew_body);
+    _b_post_global(s2, "route_create_crew_global", crews_path, crew_body, 2000);
+    _b_post_arena(s3, "route_create_crew_arena", crews_path, crew_body, 2000);
 
     return 0;
 }

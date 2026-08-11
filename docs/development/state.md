@@ -397,7 +397,10 @@ Standing decisions that shaped the port, each with its record:
 
 ## Tests
 
-**96 suites, all passing** (2026-08-10). The five most recent:
+**97 suites, all passing** (2026-08-10), plus **4 fuzz harnesses** and **1
+doctest**. The most recent: `tests/core_mod_doctest.tcyr` (13 — the ONE real
+doctest under `rust-old/src/`; the other three fenced blocks are
+`text`/`ignore`/`yaml` and `cargo test` compiles none of them), and:
 `tests/llm_inference_queue.tcyr` (69 assertions, 18 mutation probes / 18 kills),
 `tests/server_routes_sse.tcyr` (31 — the routes tier's one module that had no
 suite), `tests/integration_crew_with_tools.tcyr` (29 — the oracle's own
@@ -405,11 +408,21 @@ suite), `tests/integration_crew_with_tools.tcyr` (29 — the oracle's own
 `tests/orch_orchestrator.tcyr` (55, up from 51: it only ever ran ONE crew, so a
 single-slot registry passed it), and `tests/tools_wasm.tcyr` from M11.
 
-⚠ **`cyrius tests` runs in CI; until 2026-08-10 `cyrius bench` did not.** Both
-report `N passed, M failed` and both exit non-zero, so neither is silent — but
-only the test gate was wired into a pipeline. Three `.bcyr` files broke in the
-three days after the 2026-08-07 bench run and nothing invoked the gate again.
-CI now has a `Benchmarks` step. Read the `N passed, M failed` line on both.
+⚠ **Four `cyrius` gates existed and only ONE was wired into CI.** As of
+2026-08-10 all five are: `tests`, **`bench`**, **`fuzz`**, **`doctest`** (via
+`check-clean.sh`) and `coverage`. Everything ungated had rotted or was vacuous:
+
+| gate | what was found on 2026-08-10 |
+|---|---|
+| `cyrius bench` | 3 of 6 `.bcyr` did not compile; 50 of 79 shapes had stopped running |
+| `cyrius fuzz` | the only harness was a `cyrius port` scaffold whose `fuzz_main` ignored its input and returned 0 — passing since 2026-07-28 |
+| `cyrius doctest` | never run; the tree had no doctest at all, and a note in `src/core/mod.cyr` wrongly claimed the runner did not exist |
+
+⚠ **Two of those were claimed absent without checking.** Bare `cyrius` lists
+`fuzz` and `doctest` under *Quality*. Run it before writing around a gap.
+
+None of the three was silent — each exits non-zero. They were simply never
+invoked. Read the `N passed, M failed` line on all of them.
 
 **65 suites, all passing** was true at the M7 audit, whose 43 findings are **all fixed** as of
 2026-08-05 — `docs/development/m7-audit-2026-08-04.md` marks each one in place
@@ -628,9 +641,18 @@ Rust oracle for comparison: **863 unit + 2 integration + 1 doctest, all passing.
 
 ## Benchmarks
 
-**7 `.bcyr` files, 79 benchmarks, all compiling as of 2026-08-10** — see the
-Tests section for how three of them had stopped. `benches/llm.bcyr` is new and
-was the first to touch `src/llm/` at all.
+**9 `.bcyr` files, 190 rows in `bench-history.csv`, all compiling as of
+2026-08-10** — against 106 rows and three non-compiling files that morning. See
+the Tests section for how they had stopped. `benches/llm.bcyr`,
+`benches/fleet.bcyr` and `benches/definitions.bcyr` are new; `llm` was the first
+to touch `src/llm/` at all, and `harness.bcyr` is the relocated `noop` floor.
+
+⚠ **Several comments in the newly-added rows are known-wrong.**
+[`m12-bench-audit-2026-08-10.md`](m12-bench-audit-2026-08-10.md) carries six
+adversarial reports verbatim with triage — **read a file's section before editing
+its rows**. Two findings were acted on; one SEVERE finding in that set was itself
+**wrong**, in a confident well-cited style, so verify against the tree before
+acting on any of it.
 
 ### majra's `pq_dequeue` is O(n), so draining its priority queue is O(n²)
 
@@ -1060,9 +1082,12 @@ libro 2.8.4 arrives transitively via bote.
    `…AQEA5Wu/jjUwgB2e1/Bn…` in `tests/server_auth_vectors.cyr`); and both auth
    suites pass without it — **133 + 9 assertions, 0 failures**.
 
-   ⚠ **Deleting the file does not remove the key.** It is reachable from
-   `bb76e67` for anyone who clones. Whether that warrants a history rewrite is a
-   maintainer decision and is **still open**. Nothing in the port needs a private
+   ⚠ **Deleting the file does not remove the key** — it stays reachable from
+   `bb76e67` for anyone who clones. **Maintainer decision 2026-08-10: no history
+   rewrite. Accepted as is.** The key was generated locally for a probe and was
+   never a credential for anything, so the cost of rewriting `main` outweighs it.
+   This is recorded so nobody re-opens it as a finding: it is a known, accepted
+   artefact of history, not an oversight. Nothing in the port needs a private
    key at all: agnosai never signs, it only verifies, and the one keypair any
    test needs is baked into `tests/server_auth_vectors.cyr` as frozen RS256
    vectors precisely so no key file has to exist.
