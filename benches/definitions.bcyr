@@ -25,13 +25,19 @@
 # definitions: `assembler_match_score` and `preset_to_value_18`.
 #
 # ⚠ **Finding for whoever owns benches/server.bcyr**: `GET /api/v1/presets`
-# (`agnosai_route_list_presets_a`, src/server/routes/definitions.cyr:35-42)
+# (`agnosai_route_list_presets_a`, src/server/routes/definitions.cyr:36-43)
 # re-runs `agnosai_builtin_presets()` on EVERY request — 18 JSON parses and ~72
 # agent structs per GET, with no cache anywhere in src/definitions/loader.cyr.
 # `builtin_presets_18` plus `preset_to_value_18` below is the per-request floor
-# for that endpoint, and is the pair of numbers a memoization ADR would argue
-# from. `src/server/router.cyr:567` has no arena arm for that id, so only a
-# global-allocator `route_presets_global` bench is possible.
+# for that endpoint — ~0.74-0.79 ms parse and ~0.15 ms serialize over eight runs
+# on 2026-08-11, so ~0.9 ms of CPU per GET before the response is even framed —
+# and is the pair of numbers a memoization ADR would argue from.
+#
+# The arena arm for that route id was MISSING when these benches were written,
+# which is why an earlier version of this note said only a global-allocator
+# bench was possible. It was wired on 2026-08-11 (src/server/router.cyr:576-579),
+# so `agnosai_route_list_presets_a` is reachable with a real arena now and the
+# route can be benched in both forms.
 #
 # These numbers start the CYRIUS baseline. They are NOT comparable to
 # rust-old/bench-history.csv. See CLAUDE.md.
@@ -41,7 +47,7 @@
 
 # The narrow list, NOT `src/definitions/mod.cyr`: that hub also pulls
 # `k8s_crd`, `versioning` and `packaging`, and packaging needs sankoch's `zip_*`
-# (mod.cyr:19-20) — none of which these benches touch. The relative order
+# (mod.cyr:18-19) — none of which these benches touch. The relative order
 # `assembler` → `presets_data` → `loader` is the hub's own (mod.cyr:30-33) and
 # is a hard dependency constraint: Cyrius resolves in a single pass.
 #
@@ -81,10 +87,16 @@ var _B_PRESET_JSON_5A = "{\"name\":\"bench-preset\",\"description\":\"Benchmark 
 #
 # ⚠ The `vec_len` guard is deliberately OUTSIDE the batch even though the
 # oracle's closure carries `assert!(!presets.is_empty())`. No `.bcyr` in this
-# tree asserts inside a timed region, and the check costs nothing hoisted. It
-# also serves as the first-touch warm-up so heap growth is not charged to
-# iteration 0, and it fails loudly if the generated file ever stops holding
-# eighteen parseable documents — which would silently make this bench cheap.
+# tree asserts inside a timed region, and the check costs nothing hoisted.
+#
+# It is NOT a warm-up. `lib/alloc.cyr:12-14` is a no-free bump, so nothing an
+# untimed call touches is reused: one call takes 1,016,776 bytes of fresh heap
+# (`alloc_used()` delta, measured 2026-08-11) and all 1000 timed iterations pay
+# the same page-fault cost. What the guard buys is a failure if the generated
+# file ever stops holding eighteen parseable documents — which would otherwise
+# make this bench silently cheap. `main` propagates the non-zero return into
+# the exit status so a tripped guard fails the run instead of just dropping a
+# line from the report.
 fn _b_builtin_presets(): i64 {
     if (vec_len(agnosai_builtin_presets()) != 18) { return 1; }
 
@@ -156,13 +168,28 @@ fn _b_def_members(): i64 {
 # The oracle's `assemble_team (5 members, 20 agents)`. Both vectors are built
 # OUTSIDE the timed region, exactly as the oracle builds them outside `b.iter`.
 #
-# One call is 5 × 20 = 100 `match_score` evaluations plus the `max_by` scan and
-# one result vec — the only allocation in the whole call, since the picks are
-# borrowed pointers into `available` (assembler.cyr:164-171).
+# ⚠ This is the PORT's call cost, which is roughly half the oracle's by
+# construction — do not read the number as "what Rust did". One call here is
+# 5 × 20 = 100 `match_score` evaluations, one per (member, agent) pair, because
+# `_agnosai_assembler_best` (assembler.cyr:136-157) keeps the winner's score in
+# `best_score` and reuses it for the `> 0.0` filter. The oracle recomputes:
+# `Iterator::max_by` invokes its comparator 19 times per member and the
+# comparator scores BOTH sides (assembler.rs:39-43), then `.filter` scores the
+# winner once more (assembler.rs:44) — 39 per member, 195 per call. It then
+# `.cloned()`s each of the five picks (assembler.rs:45), a deep copy of five
+# `String`s, a `Vec<String>`, six `Option`s and two bools (agent.rs:12-58), where
+# this port pushes borrowed pointers into `available` (assembler.cyr:164-171)
+# and the result vec is the call's only allocation — 152 bytes, measured.
+# `match_score` is pure, so the selection is identical and only the cost differs.
+# The divergence is documented at `src/definitions/assembler.cyr:33-54`, added
+# 2026-08-11 as a fourth `##` section beside the three subtler traps that header
+# already carried. (This comment said it was UNRECORDED, which was true when it
+# was written and false ninety minutes later — the note landed concurrently. A
+# claim about another file's contents is a claim that can rot.)
 #
-# n=5000 puts this at 500k inner passes, the band `benches/orch.bcyr` already
-# sizes its scoring shapes to (`rank_agents_16` 320k, `delegate_16_tasks_16
-# _agents` 512k).
+# n=5000 puts this at 500k of the port's inner passes, the band
+# `benches/orch.bcyr` already sizes its scoring shapes to (`rank_agents_16`
+# 320k, `delegate_16_tasks_16_agents` 512k).
 fn _b_assemble_team(): i64 {
     var available = vec_new();
     for (var i = 0; i < 20; i = i + 1) { vec_push(available, _b_def_agent(i)); }
@@ -185,8 +212,8 @@ fn _b_assemble_team(): i64 {
 
 # NO ORACLE ID — port-local. One (member, agent) pair, isolating the string
 # folding (`agnosai_str_eq_ci` / `agnosai_str_contains_ci`, src/strcase.cyr:41
-# and :64) from the `max_by` scan and the result vec that `assemble_team`
-# wraps around it.
+# and :64) from the winner scan (`_agnosai_assembler_best`, the port's stand-in
+# for `max_by`) and the result vec that `assemble_team` wraps around it.
 #
 # The pair is the oracle's members[0] × available[0]: role "tester" against the
 # "tester" agent, one overlapping tool, and matching complexity — so it scores
@@ -243,18 +270,21 @@ fn _b_load_preset_from_json(): i64 {
 #
 # The oracle never benched it because its `definitions` cargo feature is off by
 # default, so upstream that route answers an EMPTY array and its own test
-# asserts as much (src/server/routes/definitions.cyr:19-22). The port has no
+# asserts as much (src/server/routes/definitions.cyr:13-22). The port has no
 # cargo features and ships the populated arm, so this cost is real here and
 # appears nowhere in the oracle's numbers.
 #
-# ⚠ n=500, NOT the 2000 a naive read of the other counts suggests. This is the
-# file's single largest allocator: `agnosai_agent_to_value_a`
-# (src/core/agent.cyr:249-286) emits 15 fields, each a `str_from_a` header plus
-# a jv cell plus a pair, so a preset with ~4 agents costs ~4.9 KB and the 18
-# together ~88 KB **per iteration**. At 2000 that is ~175 MB on top of
-# everything else, on an allocator that never frees (lib/alloc.cyr:13-15 —
-# bump, no individual free, `alloc_reset` is batch-only and no `.bcyr` calls it
-# mid-run). 500 keeps it near ~44 MB and still reports a stable figure.
+# ⚠ n=2000. An earlier version ran 500 on the theory that this is the file's
+# largest allocator — `agnosai_agent_to_value_a` (src/core/agent.cyr:249-286)
+# emits 14 fields per agent, each a `str_from_a` header plus a jv cell plus a
+# pair — on an allocator that never frees (lib/alloc.cyr:12-14 — bump, no
+# individual free, `alloc_reset` is batch-only and no `.bcyr` calls it
+# mid-run). Measured, that theory is backwards. One iteration of the 18 costs
+# 95,496 bytes (`alloc_used()` delta, 2026-08-11) — ~191 MB over 2000, and the
+# SMALLEST of the three heavy benches here, not the largest. Compare
+# `builtin_presets_18` at 1,016,776 bytes per call (~1.0 GB over its 1000) and
+# `load_preset_from_json_5a` at 36,448 (~729 MB over its 20000). Capping this
+# one alone bought nothing measurable, so it runs the planned count.
 #
 # The 18 presets are parsed ONCE outside the batch: this measures serialization,
 # not the parse that `builtin_presets_18` already owns.
@@ -263,7 +293,7 @@ fn _b_preset_to_value(): i64 {
     if (vec_len(presets) != 18) { return 1; }
     var al = default_alloc();
 
-    var n = 500;
+    var n = 2000;
     var b = bench_new("preset_to_value_18");
     bench_batch_start(b);
     for (var i = 0; i < n; i = i + 1) {
@@ -276,16 +306,21 @@ fn _b_preset_to_value(): i64 {
     return 0;
 }
 
+# ⚠ Every fixture guard's return is PROPAGATED. A tripped guard only drops its
+# bench line from the report, and one missing line in a ten-file sweep is easy
+# to miss — so the failure is carried into the exit status, where the harness
+# reports it. Clamped to 1: `syscall(60, ..)` masks the status with `& 0xFF`.
 fn main(): i64 {
     alloc_init();
 
-    _b_builtin_presets();
-    _b_assemble_team();
-    _b_match_score();
-    _b_load_preset_from_json();
-    _b_preset_to_value();
+    var f = _b_builtin_presets();
+    f = f + _b_assemble_team();
+    f = f + _b_match_score();
+    f = f + _b_load_preset_from_json();
+    f = f + _b_preset_to_value();
 
-    return 0;
+    if (f > 0) { f = 1; }
+    return f;
 }
 
 var r = main();

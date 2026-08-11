@@ -29,6 +29,29 @@
 # identically today. They stay f64 because the oracle's are, and because a
 # fractional weight added later would be silently truncated by an i64 score.
 # Same call `fleet/placement` made.
+#
+# ## ⚠ `_agnosai_assembler_best` scores each agent ONCE; the oracle scores it 39 times
+#
+# A divergence in work done, not in result, recorded here because the three traps
+# above are all subtler than this one and it went undocumented until 2026-08-11.
+#
+# `rust-old/src/definitions/assembler.rs:34-47` is
+# `.max_by(|a, b| match_score(member, a).partial_cmp(&match_score(member, b)))`
+# followed by `.filter(|agent| match_score(member, agent) > 0.0)`.
+# `Iterator::max_by` invokes the comparator n-1 times and the comparator scores
+# **both** sides, so 20 agents cost 19 x 2 = 38 evaluations, plus one more in the
+# filter — **39 per member, 195 per 5-member call**. It then `.cloned()`s each
+# pick, deep-copying the whole `AgentDefinition`.
+#
+# The scan below evaluates `match_score` once per agent, keeps it in
+# `best_score`, and reuses that same value for the `> 0.0` filter — **20 per
+# member, 100 per call**, and it returns borrowed pointers rather than clones.
+#
+# **The result is identical because `match_score` is pure**, which is why this is
+# a note and not an ADR: there is no behavioural difference to record a decision
+# about. It is here so nobody reads `benches/definitions.bcyr`'s
+# `assemble_team_5m_20a` figure as the oracle's cost — it is roughly half of it,
+# before the clones.
 # =========================================================================
 
 # TeamMember heap layout — 24 bytes.

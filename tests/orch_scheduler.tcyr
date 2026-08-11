@@ -198,6 +198,52 @@ fn main() {
     _t_order_is(loose_order, 1, "mike", "regardless of insertion order");
     _t_order_is(loose_order, 2, "zulu", "which is what makes the output reproducible");
 
+    # ⚠ A WIDER version of the case above, added 2026-08-11 as the guard for
+    # deleting the redundant pre-sort in `load_dag`/`topological_sort`.
+    #
+    # `agnosai_scheduler_kahn_sort` sorts the zero-in-degree seed itself
+    # (`scheduler.cyr:169`) and sorts each successor list inside its loop
+    # (`:180`), so the CALLER's key order cannot reach the output. The two
+    # callers were nonetheless insertion-sorting every key first — dead work,
+    # O(n^2), and the only thing that could have made it load-bearing is a case
+    # like this one. Twelve roots inserted in descending order, so an
+    # unsorted-seed regression would be visible at the very first element.
+    var many = _t_dag();
+    _t_dag_add(many, "l", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "k", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "j", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "i", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "h", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "g", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "f", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "e", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "d", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "c", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "b", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(many, "a", AGNOSAI_PRIORITY_NORMAL);
+    var many_order = agnosai_scheduler_topological_sort(many);
+    assert_eq(vec_len(many_order), 12, "twelve roots all sort");
+    _t_order_is(many_order, 0, "a", "and come out ascending from the FIRST element");
+    _t_order_is(many_order, 5, "f", "through the middle");
+    _t_order_is(many_order, 11, "l", "to the last — insertion order was exactly reversed");
+
+    # Roots AND dependents together: the seed is sorted, then each wave is
+    # appended as its in-degree reaches zero. `m` and `n` both depend on `z`, so
+    # they cannot appear before it however the keys arrive.
+    var mixed = _t_dag();
+    _t_dag_add(mixed, "z", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(mixed, "n", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(mixed, "m", AGNOSAI_PRIORITY_NORMAL);
+    _t_dag_add(mixed, "b", AGNOSAI_PRIORITY_NORMAL);
+    _t_edge(mixed, "z", "m");
+    _t_edge(mixed, "z", "n");
+    var mixed_order = agnosai_scheduler_topological_sort(mixed);
+    assert_eq(vec_len(mixed_order), 4, "the mixed DAG sorts");
+    _t_order_is(mixed_order, 0, "b", "the sorted seed puts b before z");
+    _t_order_is(mixed_order, 1, "z", "then z, the only other root");
+    _t_order_is(mixed_order, 2, "m", "then z's successors, themselves sorted");
+    _t_order_is(mixed_order, 3, "n", "m before n");
+
     # duplicate edges do not double-count the in-degree
     var dup = _t_dag();
     _t_dag_add(dup, "a", AGNOSAI_PRIORITY_NORMAL);

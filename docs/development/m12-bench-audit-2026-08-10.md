@@ -79,6 +79,20 @@ a documented bound, not a DoS vector. Corrected in both places.
 That makes three claims this milestone that were confident, well-cited, and wrong: this
 one, the `err_io` divergence, and the `clock_epoch_secs` rejection. Two were mine.
 
+## definitions finding 2 — CLOSED 2026-08-11, and it was a real src defect
+
+The report said `benches/definitions.bcyr:33-34` "states a src defect as an inherent
+constraint". It was right, and the defect was live: `AGN_ROUTE_LIST_PRESETS` was the only
+id in `_agnosai_route_dispatch_inner`'s ladder with an `_a` form that went unwired, so
+`GET /api/v1/presets` parsed all 18 preset documents onto the no-free global bump on every
+request. Fixed; see CHANGELOG.
+
+⚠ **The regression test took three attempts and the first two proved nothing** — both arms
+return identical bodies, and the outer dispatch allocates 32 bytes into the arena on its
+own, which satisfies a naive `> before`. Wired vs unwired arena growth is **30,464 vs 32
+bytes**; the shipped assertion is a threshold at 8 KiB, verified by reverting the fix and
+watching it fail.
+
 ## What is owed
 
 Everything else below.
@@ -87,6 +101,32 @@ Everything else below.
 was wrong, and it was wrong in the confident, well-cited style that reads as reliable.
 Verify against the tree before acting on any of it — which is the whole lesson of this
 milestone.
+
+### Known errors IN this document (found 2026-08-11 while remediating)
+
+Recorded rather than edited out, because the point of keeping the reports verbatim is
+that they can be checked:
+
+- **"nine `.bcyr`"** (findings 3 and 7, definitions section) — there are **ten**. The count
+  is used as the reason a dropped bench line is easy to miss, so it is load-bearing.
+- **The "numbers cohere" arithmetic** (definitions) assumes **15** fields per agent; the
+  serializer emits **14**, so every per-field figure derived from 1080 is wrong.
+- **The `AgentDefinition` derive citation** (definitions finding 1) is wrong in both span
+  and field inventory. The finding's substance — the oracle deep-clones each pick and the
+  port does not — stands and was applied.
+- **"the tools/list envelope is 45 bytes"** (server finding 7) — it is **46**; the file was
+  right and the audit was wrong. The neighbouring `initialize` count (135) really was a
+  file defect and is now 136.
+- **"`_agnosai_orch_audit` fires twice per run"** (server finding 2) — **three** fire. The
+  crew runner writes a `task_completed` record per task on top of the orchestrator's
+  `crew_accepted` and `crew_finished`. The audit repeated the file's own count while
+  correcting its neighbour.
+- **"the probe resolve is a small fraction of the /api/v1 resolve"** (server finding 5) —
+  it is **41–44%**. The conclusion (`route_resolve` is the wrong residual for the probe
+  rows) is right and was acted on; the magnitude is not.
+
+That is six errors in a document whose entire purpose was to find errors, which is the
+honest measure of how far to trust any single reviewing pass — including this one.
 
 ---
 

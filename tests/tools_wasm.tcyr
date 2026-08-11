@@ -276,9 +276,63 @@ fn main(): i64 {
     "parameters"), 0, "and an empty input still carries the wrapper");
 
     # --- the loader ---------------------------------------------------------
+    # ⚠ **`_T_ROOT` is created but never cleaned, and the package-count
+    # assertions below are therefore sensitive to anything left in it.** A stray
+    # directory from an earlier version of this file makes
+    # `load_all_tool_packages` report one more than expected, and the failure
+    # ("got 3, expected 2") points at the counting logic rather than at the
+    # leftover. Hit for real on 2026-08-11 while adding the oracle-fixture block;
+    # `rm -rf /tmp/agnosai-tools-wasm-*` is the fix if it ever recurs. The
+    # oracle-fixture package below deliberately lives under its OWN root so it
+    # cannot be the cause.
     sys_mkdir(_T_ROOT, 0x1FF);
 
     # A well-formed package.
+    # ⚠ **The ORACLE'S OWN shipped fixture, byte for byte.** Everything else in
+    # this suite parses manifests written for the test; this one is
+    # `rust-old/examples/wasm-tools/hello-tool/manifest.json` transcribed
+    # exactly, so it catches drift between what `sdk/agnosai-tool-sdk` publishes
+    # to tool authors and what this loader accepts. That SDK stays Rust by design
+    # — its consumers compile to `wasm32-wasip1` — so conformance is the only
+    # thing agnosai can owe it, and this is where that is checked.
+    #
+    # The `.wasm` beside it is the 8-byte header stub, not a built module:
+    # `wasmtime` is not installed here, so the manifest half is testable and the
+    # execute half is not. That is the whole of what the wasmtime gate blocks.
+    # ⚠ Its OWN root, not under `_T_ROOT`. `load_all_tool_packages` is scanned
+    # later in this file with an exact package count, and a third directory there
+    # breaks it — which is what the first version of this block did.
+    var oracle_root = str_from("/tmp/agnosai-tools-wasm-oracle");
+    sys_mkdir(str_data(oracle_root), 0x1FF);
+    var oracle_pkg = _t_join(oracle_root, str_from("/hello-tool"));
+    sys_mkdir(str_data(oracle_pkg), 0x1FF);
+    var om = str_builder_new();
+    str_builder_add_cstr(om, "{\n  \"name\": \"hello\",\n");
+    str_builder_add_cstr(om, "  \"description\": \"A greeting tool that says hello\",\n");
+    str_builder_add_cstr(om, "  \"version\": \"1.0.0\",\n  \"parameters\": [\n    {\n");
+    str_builder_add_cstr(om, "      \"name\": \"name\",\n");
+    str_builder_add_cstr(om, "      \"description\": \"Who to greet (defaults to 'world')\",\n");
+    str_builder_add_cstr(om, "      \"param_type\": \"string\",\n");
+    str_builder_add_cstr(om, "      \"required\": false\n    }\n  ]\n}\n");
+    _t_write(_t_join(oracle_pkg, str_from("/manifest.json")), str_data(str_builder_build(om)));
+    _t_write_wasm(_t_join(oracle_pkg, str_from("/hello.wasm")));
+
+    store64(&err, 0);
+    var otool = agnosai_wasm_load_tool_package(oracle_pkg, &err);
+    assert_neq(otool, 0, "the oracle's own hello-tool package loads");
+    _t_seq(agnosai_tool_name(otool), str_from("hello"), "under the manifest's name");
+    _t_seq(agnosai_tool_description(otool), str_from("A greeting tool that says hello"),
+    "with its description");
+    var oschema = agnosai_tool_schema(otool);
+    assert_eq(vec_len(agnosai_tool_schema_parameters(oschema)), 1,
+    "and the one parameter the SDK's example declares");
+    var op = vec_get(agnosai_tool_schema_parameters(oschema), 0);
+    _t_seq(agnosai_param_schema_name(op), str_from("name"), "named `name`");
+    _t_seq(agnosai_param_schema_type(op), str_from("string"), "typed string");
+    assert_eq(agnosai_param_schema_required(op), 0,
+    "and OPTIONAL — the oracle's fixture is the only place `required: false` arrives \
+    from a real published manifest rather than from a case written to test it");
+
     var pkg1 = _t_under("/hello");
     sys_mkdir(str_data(pkg1), 0x1FF);
     _t_write(_t_join(pkg1, str_from("/manifest.json")),

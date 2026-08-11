@@ -416,6 +416,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both `cyrius fuzz` and `cyrius doctest` are now gated: `fuzz` as its own CI
   step, `doctest` in `check-clean.sh` over every file carrying a `# >>>` block.
 
+- **M12's implementation work is COMPLETE — nine bites, 2026-08-10/11.** Nothing
+  is left under `src/`, `tests/`, `benches/`, `fuzz/` or `examples/`.
+
+  | | |
+  |---|---|
+  | `src/` modules | **all ported** — `llm/inference_queue` was the last |
+  | test suites | **97**, 0 failures |
+  | reference coverage | **1561/1561 (100%)** |
+  | benchmarks | **10 `.bcyr`**, ~200 rows, all compiling |
+  | fuzz harnesses | **4**, 3,414 malformed inputs, 0 faults |
+  | doctests | **1** — the only real one under `rust-old/src/` |
+
+  What remains is the WASM **execute** path (needs `wasmtime` installed; the
+  manifest half is tested) and five decisions that are the maintainer's, not owed
+  work: **D1** mount `rate_limit`, **D2** `"personality": null`, and the three
+  opened by this work — **D3** memoize `builtin_presets()`, **D4** `rounds x batch`
+  for the bench sweep, **D5** dispatch rows including body serialization.
+
+- **⚠ BENCH DISCONTINUITY 2026-08-11 — nine committed rows changed what they
+  measure. Do not compare them across this date.**
+
+  Two fixture corrections in bite 9 were right on the merits and both re-baseline
+  existing ids. Recording it because `bench-history.csv` is the proof, and a
+  silent re-baseline turns that proof into noise:
+
+  **`benches/server.bcyr`** — the fixture registered ONE tool where
+  `rust-old/benches/server.rs` registers two. Fixing it moves four rows by
+  50–108%, because `GET /api/v1/tools` and the MCP `tools/list` envelope both
+  serialize every registered tool:
+
+  | row | before | after |
+  |---|---|---|
+  | `route_tools_global` | 2223 ns | ~4500 ns |
+  | `route_tools_arena` | 1370 ns | ~2740 ns |
+  | `route_mcp_global` | 3883 ns | ~6100 ns |
+  | `route_mcp_arena` | 2339 ns | ~3520 ns |
+
+  **`benches/tools.bcyr`** — registry keys were unpadded 6-byte strings and the
+  miss key was `"nonexistent"`, so the 5/50/500 sweep conflated registry size
+  with key length and the miss probe took a different hash path from the hit.
+  Padding the keys and matching the miss key's length re-baselines
+  `tool_registry_get_5`, `_get_50`, `_get_500`, `_has_50_hit` and `_has_50_miss`.
+
+  Every other pre-existing row is within ±3%, so the discontinuity is exactly
+  these nine and nothing else. Both changes make the rows measure what their
+  names claim; neither is a regression.
+
+- **M12 bite 9 — the bench audit's remaining findings, applied file by file.**
+  Four agents, one per `.bcyr`, each told the audit had already been refuted three
+  times and to verify every finding against the tree before acting.
+
+  ⚠ **The rejections are the valuable part.** They independently re-derived my
+  `clock_epoch_secs` rejection, and caught things I had not: the audit says
+  "nine `.bcyr`" where there are ten and uses that count as the reason a dropped
+  bench line is easy to miss; its "numbers cohere" arithmetic assumes 15 fields
+  per agent where the serializer emits 14; and its citation for
+  `AgentDefinition`'s derive is wrong in both span and field inventory.
+
+  Escalations acted on:
+
+  - **`_agnosai_assembler_best` memoizes `match_score` where the oracle recomputes
+    it**, and it was undocumented. Verified against
+    `rust-old/src/definitions/assembler.rs:34-47`: `Iterator::max_by` calls its
+    comparator n−1 times and the comparator scores **both** sides, then `.filter`
+    scores the winner again — **39 evaluations per member, 195 per 5-member call**,
+    plus a deep `.cloned()` per pick. The port scores once per agent and reuses the
+    cached value — **20 per member, 100 per call**, returning borrowed pointers.
+    Identical results (`match_score` is pure), so this is a module note in
+    `src/definitions/assembler.cyr` rather than an ADR — recorded so nobody reads
+    `assemble_team_5m_20a` as the oracle's cost. It is roughly half of it.
+  - **`lib/bench.cyr:6`'s `clock_gettime: ~120ns` is wrong by 11x** — filed
+    upstream as
+    `2026-08-11-lib-bench-documents-clock-gettime-at-120ns-it-is-1300ns.md`, with
+    eight runs at 2,000,000 iterations and the reason (`lib/chrono.cyr:75` issues a
+    raw `syscall(228)`, not the vDSO path libc takes). The other three constants in
+    that block check out, so it is one wrong line rather than a stale block.
+  - **`src/server/prompt_guard.cyr` carried a stale number.** Its header claimed a
+    clean 4 KB scan costs **273 µs**; the committed row says **352 µs** — 29%
+    drift, unnoticed because a figure frozen in a comment has nothing to
+    reconcile it against. It now points at the bench id instead.
+
+  Three new open decisions, all in `roadmap.md`, none taken:
+
+  - **D3** — `GET /api/v1/presets` re-parses all 18 documents per request
+    (~744 µs parse, ~145 µs serialize, 1,016,776 bytes) for a compile-time
+    constant. **Not fixed**, because `rust-old/src/definitions/loader.rs:122`
+    does exactly the same, so memoizing would be the divergence. The leak half is
+    already gone now that the arena arm is wired.
+  - **D4** — every one of the ~200 rows in `bench-history.csv` prints
+    `min == max == avg`, by construction: each benchmark takes exactly one
+    sample. `lib/bench.cyr:198-211` documents a `rounds x batch` form that would
+    give real dispersion; measured run-to-run spread is ~5%, which is exactly what
+    a reader currently cannot see. Changing one file makes it incomparable with
+    nine others; changing all ten re-baselines the CSV. Raised independently by
+    two agents auditing different files.
+  - **D5** — the dispatch rows stop at the response object where the oracle's
+    `tower` service serializes to bytes.
+
+- **M12 bite 8 — the oracle's shipped WASM fixture is now a conformance test.**
+  `tests/tools_wasm.tcyr` loads
+  `rust-old/examples/wasm-tools/hello-tool/manifest.json`, transcribed byte for
+  byte, through `agnosai_wasm_load_tool_package` — 84 assertions.
+
+  Everything else in that suite parses manifests written for the test. This one
+  is what `sdk/agnosai-tool-sdk` actually publishes to tool authors, so it is
+  where drift between the SDK's format and this loader would surface — and it is
+  the only place `"required": false` arrives from a real published manifest
+  rather than from a case constructed to exercise it. Since the SDK stays Rust by
+  design, conformance is the only thing agnosai can owe it.
+
+  ⚠ **Only the EXECUTE half stays blocked.** `wasmtime` is not installed here, so
+  the `.wasm` beside the manifest is the 8-byte header stub. The manifest parse,
+  the `<name>.wasm` resolution, both error policies and the whole result ladder
+  need no runtime.
+
+  ⚠ Found while adding it: `_T_ROOT` in that suite is created but never cleaned,
+  so its `load_all_tool_packages` count assertions break on anything left behind
+  — and the failure ("got 3, expected 2") accuses the counting logic rather than
+  the leftover. Cost me a wrong diagnosis before I spotted it; recorded in the
+  file so the next reader does not repeat it.
+
 - **M12 bite 5 — the doctest and `examples/`.**
 
   **`src/core/mod.cyr` now carries a real `# >>>` doctest that `cyrius doctest`
@@ -1574,6 +1695,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`GET /api/v1/presets` never used the per-request arena — the dispatch arm was
+  missing.** `agnosai_route_list_presets_a` has existed since M10, but
+  `_agnosai_route_dispatch_inner` called only the global form, so all 18 preset
+  documents were parsed onto the **no-free global bump on every request** and
+  never reclaimed. `benches/definitions.bcyr` prices that parse at ~744 µs.
+
+  It was the **only** id in that ladder with an `_a` form left unwired — every
+  neighbour above and below carries the `if (a != 0)` arm. Exactly what CLAUDE.md's
+  "thread the `_a` allocator variants" rule exists to prevent. Found by the M12
+  bench audit, which had recorded it as an inherent limitation ("no arena arm
+  exists, so only a global bench is possible") rather than a defect.
+
+  ⚠ **The regression test took three attempts, and the first two were worthless.**
+  Both arms return the same 18 presets and the same 200 —
+  `agnosai_route_list_presets()` is just `_a(default_alloc())` — so asserting on
+  the body passes whether or not the wire exists, which is what version one did.
+  Version two asserted `arena_used > before` and also passed reverted, because
+  the outer dispatch allocates **32 bytes** of its own path handling into the
+  arena. Measured both ways:
+
+  | | arena growth |
+  |---|---|
+  | wired | **30,464 bytes** |
+  | unwired | **32 bytes** |
+
+  The shipped assertion is a threshold at 8 KiB — ~250× above the noise, ~4× below
+  the signal — and it is verified by reverting the fix and watching it fail. A
+  regression test that cannot fail is worse than none, and two of these three
+  could not.
+
 - **The tree was silently building sakshi 2.4.7 while its pin shipped 2.4.8**,
   reverting the `i64::MIN` decimal fix (`n = 0 - n` is a no-op there). Fixed at
   the cause, in the manifests.
@@ -2035,6 +2186,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secret.
 
 ### Performance
+
+- **`rank_agents` no longer diverges from the oracle in complexity — and got 5x
+  faster at 1000 agents.** The port hand-rolled an insertion sort where the
+  oracle uses `sort_by` (pdqsort, O(n log n),
+  `rust-old/src/orchestrator/scoring.rs:212`). Replaced with `agnosai_sort`
+  (introsort) — the same call `fleet/placement.cyr:287` already makes for the
+  same job.
+
+  | agents | insertion sort | introsort | |
+  |---|---|---|---|
+  | 100 | 127.8 µs | **95.8 µs** | −25.0% |
+  | 300 | 626.0 µs | **296.9 µs** | −52.6% |
+  | 1000 | 5093.0 µs | **1021.0 µs** | **−80.0%** |
+
+  Scaling per 10x the agents: **39.9x → 10.7x**. The quadratic term is gone, and
+  the remaining growth is the linear scoring plus the sort's log factor.
+
+  ⚠ **Behaviour-preserving, and the reason is `_agnosai_scored_cmp` being a TOTAL
+  order** — index ascending breaks every score tie, so no two entries compare
+  equal and an unstable sort cannot reorder them. The old comment argued the
+  opposite way round, treating the insertion sort's stability as what made ties
+  safe and the index tie-break as "belt-and-braces"; it is the tie-break that is
+  load-bearing, and it always was.
+
+  ⚠ **The guard had to be widened before the swap.** `tests/orch_scoring.tcyr`
+  pinned ties with **6** identical agents — below `_vec_introsort`'s 16-element
+  threshold, so it exercises introsort's own insertion path and would have passed
+  even if the partitioning path reordered. Added a 40-agent case first;
+  **109/109 identical either side of the change.**
+
+  This was left as "fix or ADR" in bite 3 pending the benchmarks. With them it is
+  plainly a fix: before the 100/300/1000 series, the only ranking bench used 16
+  **identical** agents, so the insertion sort did zero shifts and the quadratic
+  was invisible for two weeks.
+
+- **`scheduler_load_dag` is 2.46x faster at 500 tasks — by deleting dead work,
+  not by optimising anything.**
+
+  | bench | before | after | |
+  |---|---|---|---|
+  | `scheduler_load_dag_linear_50` | 154.8 µs | **136.2 µs** | −12.0% |
+  | `scheduler_load_dag_wide_100` | 561.1 µs | **485.4 µs** | −13.5% |
+  | `scheduler_load_dag_linear_500` | 3129.0 µs | **1271.0 µs** | **−59.4%** |
+
+  `agnosai_scheduler_load_dag` and `agnosai_scheduler_topological_sort` each
+  insertion-sorted **every** DAG key before calling `agnosai_scheduler_kahn_sort`
+  — and `kahn_sort` sorts the zero-in-degree seed itself
+  (`scheduler.cyr:169`) and sorts each successor list inside its loop (`:180`).
+  The caller's key order therefore could not reach the output: the seed is
+  re-sorted regardless and `in_degree` is a map. `load_dag` was worse still — it
+  **copied** all the keys into a second vec first, paying an allocation and a
+  full O(n²) insertion sort per load to produce an ordering the callee discarded.
+  `map_keys` order is pseudo-random, so that is ~n²/4 ≈ 62,500 string comparisons
+  at n=500.
+
+  ⚠ **This is NOT a parity divergence, and an audit agent reported it as one.**
+  The output is byte-identical with and without the pre-sort — which is the
+  entire reason it could be deleted rather than needing an ADR. The claim that it
+  diverged from the oracle came from reading `load_dag` without reading
+  `kahn_sort`.
+
+  ⚠ **Proven, not reasoned.** `tests/orch_scheduler.tcyr` gained a
+  twelve-roots-inserted-in-reverse case plus a mixed roots/dependents case
+  *before* the deletion — the only shapes where an unsorted seed could surface —
+  and the suite reports **86/86 identical either side of the change**. The
+  saving growing with n is the O(n²) term leaving, which is why the benchmarks
+  had to exist first: this was deliberately left unfixed in bite 3 until they did.
 
 - **cyrius 6.5.10 lands the `alloc_via` fix agnosai filed — every threaded
   route gained 5–13%.** `alloc_via` **15.1 → 11.1 ns (−26%)**, `reset_via`

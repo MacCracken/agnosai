@@ -1152,12 +1152,22 @@ var _B_WIDE_DAG = 0;
 # ⚠ **Read the 50/500 pair as the PORT'S OWN 10x scaling curve, not as an oracle
 # comparison — it diverges in both directions and the two do not cancel.**
 #
-#   * The port sorts ALL keys before `kahn_sort` (scheduler.cyr:247-249) with an
-#     insertion sort. The oracle sorts nothing there: it passes `&dag.tasks`
-#     straight in, and `kahn_sort` sorts only the zero-in-degree SEED, which in
-#     a linear DAG is exactly one node. So this is an extra O(n²) against
-#     nothing — `map_keys` order is pseudo-random, so ~n²/4 ≈ 62,500 string
-#     comparisons at n=500.
+#   * ✅ **FIXED 2026-08-11 — the port used to sort ALL keys before `kahn_sort`**
+#     with an insertion sort, where the oracle sorts nothing there. It was not a
+#     divergence, it was DEAD WORK: `kahn_sort` sorts the zero-in-degree seed
+#     itself and sorts each successor list inside its loop, so the caller's key
+#     order could not reach the output. `map_keys` order is pseudo-random, so it
+#     cost ~n²/4 ≈ 62,500 string comparisons at n=500 to produce an ordering the
+#     callee discarded. Deleting it, with `tests/orch_scheduler.tcyr`'s
+#     twelve-roots-in-reverse case as the guard (86/86 identical before and
+#     after), moved these rows:
+#
+#         scheduler_load_dag_linear_50    154.8us -> 136.2us   -12.0%
+#         scheduler_load_dag_wide_100     561.1us -> 485.4us   -13.5%
+#         scheduler_load_dag_linear_500  3129.0us -> 1271.0us  -59.4%
+#
+#     The saving growing with n is the O(n²) term leaving, which is why the
+#     benchmark had to exist before the deletion could be argued.
 #   * `_agnosai_sched_add_edge` dedups with the linear `_agnosai_sched_has`
 #     where the oracle uses `HashSet::insert`. The wide-100 DAG is the shape
 #     that hurts: the scan runs BEFORE the push, so the i-th insert scans i

@@ -308,6 +308,53 @@ fn _t_dispatch(): i64 {
     assert(bayan_json_v_arr_len(agnosai_route_body(presets)) == 18,
     "/api/v1/presets dispatches to the built-in presets");
 
+    # ⚠ **The arena arm, which was MISSING for this id until 2026-08-11.**
+    # `agnosai_route_list_presets_a` had existed since M10, and this was the only
+    # id in the dispatch ladder with an `_a` form that went unwired — so every
+    # `GET /api/v1/presets` parsed all 18 preset documents onto the no-free
+    # global bump instead of the per-request arena, and never reclaimed them.
+    # `benches/definitions.bcyr` prices that parse at ~744us per request.
+    #
+    # Nothing caught it because nothing dispatched this id WITH an arena. The
+    # global path was tested (above) and the `_a` handler was tested directly
+    # (`tests/server_routes_definitions.tcyr:88`) — the missing wire between them
+    # was the one thing neither reached. Asserting the arena result matches the
+    # global one is what pins it.
+    # ⚠ `arena_allocator_growable`, not `arena_new`. The `_a` functions take an
+    # ALLOCATOR (the fn-pointer vtable `allocator_new` builds), not a raw arena —
+    # passing the arena straight in faults, because the first `alloc_via` call
+    # reads the arena's `next` pointer as a function pointer. `lib/alloc.cyr:746`
+    # says growable is the form a route handler wants: response size is not
+    # bounded at the type level, so any fixed capacity is a guess.
+    var arena = arena_allocator_growable(65536);
+    # ⚠ **Assert the ARENA GREW, not that the body is right.** Both arms return
+    # the same 18 presets and the same 200 — `agnosai_route_list_presets()` is
+    # just `_a(default_alloc())` — so a body assertion passes whether or not the
+    # wire exists. The first version of this test did exactly that and still
+    # passed with the fix reverted, which is worth stating because it is the
+    # whole failure mode: a regression test that cannot fail.
+    #
+    # `arena_used` is the observation, and it needs a THRESHOLD rather than
+    # `> before`. Measured both ways:
+    #
+    #     wired      30,464 bytes into the arena
+    #     unwired            32 bytes
+    #
+    # The 32 is the outer dispatch's own path handling — enough to satisfy a
+    # bare `> before`, which is why the second version of this test also passed
+    # with the fix reverted. 8192 sits ~250x above the noise and ~4x below the
+    # signal, so neither a chattier dispatcher nor a slimmer preset set moves it.
+    var before = arena_used(allocator_state(arena));
+    var presets_a = agnosai_route_dispatch_a(arena, s, AGNOSAI_METHOD_GET,
+    str_from("/api/v1/presets"), str_from(""), 0, str_from(""));
+    assert(bayan_json_v_arr_len(agnosai_route_body(presets_a)) == 18,
+    "the ARENA arm reaches the same 18 presets");
+    assert(agnosai_route_status(presets_a) == HTTP_OK, "answering 200 either way");
+    assert(arena_used(allocator_state(arena)) - before > 8192,
+    "and the 18 documents were parsed INTO the arena — under 8 KiB here means the \
+    dispatch fell through to the global-allocator arm and the per-request arena was \
+    bypassed, which is what shipped from M10 until 2026-08-11");
+
     var metrics = _t_go(s, AGNOSAI_METHOD_GET, "/metrics");
     assert(agnosai_route_is_text(metrics) == 1, "/metrics returns text, not JSON");
 

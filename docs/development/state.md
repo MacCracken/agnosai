@@ -332,7 +332,15 @@ in sandhi 1.9.9 on agnosai's own filing, hours after it was written.
 `src/llm/mod.cyr`'s claim that it "defers with that feature" was wrong on the
 standing rule that a cargo feature gate is not a scope boundary.
 
-**M12 is in progress** and is no longer about `src/`. What is left is the test
+**M12's implementation work is COMPLETE as of 2026-08-11** — nine bites, nothing
+left under `src/`, `tests/`, `benches/`, `fuzz/` or `examples/`. What remains is
+the WASM **execute** path (needs `wasmtime` installed; the manifest half is
+tested) and five open decisions: **D1** mount `rate_limit`, **D2**
+`"personality": null`, **D3** memoize `builtin_presets()`, **D4** `rounds x batch`
+for the bench sweep, **D5** dispatch rows including body serialization. All five
+are the user's call, not owed work.
+
+**M12 was never about `src/`.** What is left is the test
 and bench surface plus the non-`src` artifacts; `roadmap.md`'s M12 section
 carries the measured table and the per-bite status. The headline numbers:
 **863 oracle test fns across 84 modules**, **117 oracle criterion bench ids
@@ -641,18 +649,53 @@ Rust oracle for comparison: **863 unit + 2 integration + 1 doctest, all passing.
 
 ## Benchmarks
 
-**9 `.bcyr` files, 190 rows in `bench-history.csv`, all compiling as of
-2026-08-10** — against 106 rows and three non-compiling files that morning. See
+**10 `.bcyr` files, ~200 rows in `bench-history.csv`, all compiling as of
+2026-08-11** — against 106 rows and three non-compiling files that morning. See
 the Tests section for how they had stopped. `benches/llm.bcyr`,
 `benches/fleet.bcyr` and `benches/definitions.bcyr` are new; `llm` was the first
 to touch `src/llm/` at all, and `harness.bcyr` is the relocated `noop` floor.
 
-⚠ **Several comments in the newly-added rows are known-wrong.**
-[`m12-bench-audit-2026-08-10.md`](m12-bench-audit-2026-08-10.md) carries six
-adversarial reports verbatim with triage — **read a file's section before editing
-its rows**. Two findings were acted on; one SEVERE finding in that set was itself
-**wrong**, in a confident well-cited style, so verify against the tree before
-acting on any of it.
+⚠ **The audit is remediated, and the audit itself had six errors.**
+[`m12-bench-audit-2026-08-10.md`](m12-bench-audit-2026-08-10.md) carries the six
+adversarial reports verbatim, plus a *Known errors IN this document* section —
+a wrong `.bcyr` count used as load-bearing reasoning, 15-vs-14 field arithmetic,
+a bad struct citation, a wrong envelope byte count, "fires twice" where three
+fire, and a "small fraction" that is 41–44%. **42 findings applied, 14 rejected
+with evidence, 11 escalated.** Verify against the tree before acting on any of
+it, including the corrections.
+
+⚠ **BENCH DISCONTINUITY 2026-08-11 — nine rows changed what they measure.**
+`benches/server.bcyr`'s fixture registered one tool where the oracle registers
+two (moves `route_tools_*` and `route_mcp_*` by 50–108%), and
+`benches/tools.bcyr`'s registry keys were unpadded with a mismatched miss key
+(re-baselines the five `tool_registry_*` ids). Both corrections are right on the
+merits. Every other pre-existing row is within ±3%, so the discontinuity is
+exactly those nine. **Do not compare them across this date.**
+
+### Two O(n²) removals, 2026-08-11 — both found by benchmarks that did not exist
+
+| what | before | after | |
+|---|---|---|---|
+| `rank_agents` at 1000 agents | 5093.0 µs | **1021.0 µs** | −80.0% |
+| `scheduler_load_dag` at 500 tasks | 3129.0 µs | **1271.0 µs** | −59.4% |
+
+**`agnosai_rank_agents`** hand-rolled an insertion sort where the oracle uses
+`sort_by`. Now `agnosai_sort` (introsort). Scaling per 10x the agents dropped
+**39.9x → 10.7x**. Safe because `_agnosai_scored_cmp` is a total order — index
+breaks every score tie — which is what makes stability irrelevant; the old
+comment had that backwards, treating stability as load-bearing and the tie-break
+as belt-and-braces.
+
+**`agnosai_scheduler_load_dag`** insertion-sorted every DAG key before
+`kahn_sort`, which sorts the seed and each successor list itself — so the
+caller's order could never reach the output. Not a divergence, **dead work**; an
+audit agent reported it as a divergence needing an ADR and was wrong.
+
+⚠ **Neither was visible before the benchmarks.** The only ranking bench used 16
+**identical** agents, so the insertion sort did zero shifts. Both guards were
+widened *before* the change — 40 identical agents (past introsort's 16-element
+threshold, below which a smaller case proves nothing) and twelve roots in reverse
+— and both suites report identical results either side.
 
 ### majra's `pq_dequeue` is O(n), so draining its priority queue is O(n²)
 

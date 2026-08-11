@@ -71,23 +71,33 @@
 #
 # ⚠ **What the first run actually found: `clock_epoch_secs()` is the single
 # largest term in this half of the file.** On Linux it is a RAW
-# `syscall(228, CLOCK_REALTIME, ..)` (lib/chrono.cyr:76-78) — a real kernel
+# `syscall(228, CLOCK_REALTIME, ..)` (lib/chrono.cyr:75-76) — a real kernel
 # entry, not the vDSO fast path Rust's `Utc::now()` takes — and it measures
-# **~1.32us** on the same host as everything below.
+# **~1.32-1.35us** on the same host as everything below.
 #
-# ⚠ That figure is a **measured row in this file** (`clock_epoch_secs`), not a
-# comment. It was challenged as implausible on the grounds that `lib/bench.cyr:6`
-# documents `clock_gettime: ~120ns` and that `uuid_v4_generate` costs 501ns while
-# making a real `getrandom` — a reasonable objection, and wrong. Re-measured
-# independently at 2,000,000 iterations: **clock_epoch_secs 1.315us,
-# clock_now_ns 1.318us**. It is `lib/bench.cyr`'s ~120ns that does not hold on
-# this host, which is worth knowing on its own since that constant is what every
-# other bench in the ecosystem implicitly subtracts.
+# ⚠ That figure is a **measured row in this file** (`clock_epoch_secs_baseline`),
+# not a comment. It was challenged as implausible on the grounds that
+# `lib/bench.cyr:6` documents `clock_gettime: ~120ns` and that
+# `uuid_v4_generate` costs 501ns while making a real `getrandom` — a reasonable
+# objection, and wrong. Re-measured independently at 2,000,000 iterations:
+# **clock_epoch_secs 1.315us, clock_now_ns 1.318us** — and reconfirmed by the
+# row below on 2026-08-11 at 1.317-1.347us over four runs. It is
+# `lib/bench.cyr`'s ~120ns that does not hold on this host, which is worth
+# knowing on its own since that constant is what every other bench in the
+# ecosystem implicitly subtracts.
 #
-# Against that:
+# Against that, the band observed over FOUR back-to-back runs of this file on
+# 2026-08-11. The ~7% spread between runs is host noise and is the point: the
+# RATIO is the claim, the absolutes are a dated range, and bench-history.csv is
+# the authority. A later run outside these figures is not an error in this
+# comment — a moved ratio would be.
 #
-#     fleet_create_run_3nodes         4.058us  <- 1 clock (1.32) + uuid (0.71)
-#     fleet_reach_barrier_3nodes      2.077us  <- 1 clock = 63% of the call
+#     clock_epoch_secs_baseline       1.317-1.347us
+#     fleet_create_run_3nodes         3.973-4.240us  <- 1 clock + uuid (0.71)
+#     fleet_reach_barrier_3nodes      2.006-2.139us  <- 1 clock = 62-67% of it
+#
+# The uuid term is core.bcyr's pair, same day: uuid_v4_generate 499ns +
+# uuid_to_str 210ns. See the note above on why generate alone under-subtracts.
 #
 # Every timestamped state mutation pays it once: `create_run`, `reach_barrier`
 # (via `_agnosai_dcs_set_phase`), `report_progress` (TWICE), `checkpoint`
@@ -373,11 +383,13 @@ fn _b_compute_release_realloc(): i64 {
 # and a different map depth) — the pair to read against is the allocate bench
 # directly above it, which shares this one's exact shape.
 #
-# That pair is why the split earns its place: first run came back 548ns for
-# allocate against 149ns for release, on the same 8-device scan and the same
-# 192-entry map. The scan is common to both, so the ~400ns gap is insert-side —
-# the 24-byte ComputeAllocation plus growing the allocations map — and the
-# oracle's combined figure hides all of it.
+# That pair is why the split earns its place: four 2026-08-11 runs gave allocate
+# 517-585ns against release 145-158ns, on the same 8-device scan and the same
+# 192-entry map. The scan is common to both, so allocate costing **~3.6-3.7x**
+# release — a gap of 370-430ns — is entirely insert-side: the 24-byte
+# ComputeAllocation plus growing the allocations map. The oracle's combined
+# figure hides all of it. As in the header, the ratio is the claim and the
+# absolutes are a dated snapshot; bench-history.csv carries the current pair.
 fn _b_compute_release_only(ids): i64 {
     var b = bench_new("fleet_compute_release_only_8dev");
     for (var r = 0; r < 200; r = r + 1) {
@@ -468,9 +480,16 @@ fn _b_rank_case(q, fleet, n, name): i64 {
 # The oracle's `place GpuAffinity (50 nodes)`.
 #
 # 50 score evaluations (status check, GPU check, 40000 MB VRAM floor, then
-# vram / 1e6 clamped at 1.0), 33 PlacementResult allocations, and a full sort.
-# All 33 survivors carry 81920 MB, so every score ties at 0.08192 — the sort
-# runs entirely on the index tiebreak.
+# vram / 1e6 clamped at 1.0) and 33 PlacementResult allocations.
+#
+# ⚠ **No sort runs, and an earlier version of this comment said "a full sort".**
+# All 33 survivors carry 81920 MB, so every score ties at 0.08192, and
+# `rank_nodes` pushes survivors in ascending `AGN_PR_INDEX` order
+# (src/fleet/placement.cyr:283-284) — so `_agnosai_place_cmp` returns -1 for
+# every adjacent pair and `vec_sort_by`'s O(n) already-ordered pre-check returns
+# before `_vec_introsort` (lib/vec.cyr:344-350). This is the same fast path as
+# `fleet_rank_nodes_gpu_affinity_200`; the sort proper is priced by that bench's
+# `_varied` pair, not here. Read this row as scan + filter + an O(n) check.
 fn _b_place_gpu_affinity(fleet): i64 {
     var q = agnosai_placement_request_with_min_gpu_vram_mb(
     agnosai_placement_request_with_required_gpu(
@@ -480,9 +499,13 @@ fn _b_place_gpu_affinity(fleet): i64 {
 
 # The oracle's `place Balanced (50 nodes)`.
 #
-# No filters at all, so every online node scores 1 - index/count: all 50 rank
-# and the sort sees 50 strictly-descending distinct scores. Best case for the
-# comparator, worst case for result-vec growth.
+# No filters at all, so every online node scores 1 - index/count: all 50 rank,
+# over 50 strictly-descending distinct scores. Worst case for result-vec growth.
+#
+# ⚠ **No sort runs here either.** Strictly descending IS the comparator's order,
+# so `_agnosai_place_cmp` returns -1 on every adjacent pair and the pre-check
+# short-circuits — the same fast path gpu_affinity above takes, reached by the
+# opposite route (all-distinct scores rather than all-tied).
 #
 # Also the regression guard for src/fleet/placement.cyr:31-35 — the index
 # Balanced scores against is the PRE-filter one, so if filtering ever moved
@@ -512,11 +535,32 @@ fn _b_locality_fleet(): i64 {
 
 # The oracle's `place Locality (50 nodes, 3 caps)`.
 #
-# Per node a nested linear scan: 3 wanted capabilities × up to 4 advertised =
-# up to 12 `str_eq` calls, then matched / 3. Every node scores above zero so all
-# 50 rank, over only THREE distinct scores (1/3, 2/3, 1.0) — the heaviest tie
-# load of the three 50-node shapes, and therefore the one that leans hardest on
-# the index tiebreak at src/fleet/placement.cyr:261-264.
+# Per node a nested linear scan: 3 wanted capabilities against up to 4
+# advertised, then matched / 3. The early `return 1` in
+# `_agnosai_place_caps_contain` (src/fleet/placement.cyr:165-170) caps a node at
+# 6 `str_eq` calls, not 3 × 4 = 12; over the 13/13/12/12 split of 1..4-cap nodes
+# that is 13*3 + 13*5 + 12*6 + 12*6 = **248 `str_eq` per call**.
+#
+# Every node scores above zero so all 50 rank, over only THREE distinct scores
+# (1/3, 2/3, 1.0).
+#
+# ⚠ **The only 50-node place shape that reaches `_vec_introsort`.** Scores cycle
+# 1/3, 2/3, 1, 1 with i % 4, so the very first adjacent pair — node 0 at 1/3
+# against node 1 at 2/3 — ASCENDS, `_agnosai_place_cmp` returns 1, and
+# `vec_sort_by`'s pre-check breaks at si = 1. So this is the one 50-node PLACE
+# shape that reaches the index tiebreak at src/fleet/placement.cyr:261-264.
+#
+# ⚠ Scope matters here and an earlier draft of this line dropped it, claiming
+# "the one shape in the file". It is not: `fleet_rank_nodes_cost_200` (:695)
+# carries 200 results over 5 distinct scores — a strictly heavier tie load — and
+# `fleet_rank_nodes_gpu_affinity_200_varied` reaches introsort too. Two comments
+# 145 lines apart each claiming primacy is worse than neither doing so.
+#
+# ⚠ Do NOT read the gap to `fleet_place_balanced_50` — a steady ~3.6x over four
+# 2026-08-11 runs, 12.4-13.4us against 3.4-3.7us — as the price of that sort.
+# Most of it is the 248 `str_eq` calls balanced does not make at all. The
+# sort's own cost is priced by the ordered/varied 200-node pair below, which
+# differs in nothing else.
 fn _b_place_locality(lfleet): i64 {
     var want = vec_new();
     vec_push(want, str_from("python"));
@@ -546,8 +590,10 @@ fn _b_place_locality(lfleet): i64 {
 #
 # The single-inventory inner loop already has a number:
 # benches/core.bcyr's `hw_inventory_satisfies`. This shape adds the 50-node
-# score + filter + sort around it, plus the min_devices / min_cpu_cores
-# short-circuits that one never exercises.
+# score + filter around it, plus the min_devices / min_cpu_cores short-circuits
+# that one never exercises. ⚠ NOT the sort: the policy is Balanced, so the 25
+# survivors carry strictly-descending pre-filter scores and the already-ordered
+# pre-check short-circuits exactly as in `fleet_place_balanced_50`.
 fn _b_place_hw_req(fleet): i64 {
     var accels = vec_new();
     vec_push(accels, AGNOSAI_ACCEL_CUDA);
@@ -563,7 +609,8 @@ fn _b_place_hw_req(fleet): i64 {
 # The oracle's `rank_nodes GpuAffinity (200 nodes)`.
 #
 # 4x the fleet, `required_gpu` and no VRAM floor: the 133 GPU nodes all rank and
-# the 67 CPU nodes drop. Dominated by result-vec growth and the sort.
+# the 67 CPU nodes drop. Dominated by the 200 score evaluations and by
+# result-vec growth to 133 entries — NOT by the sort, per the next paragraph.
 #
 # ⚠ **This shape does NOT reach the sort, and an earlier version of this comment
 # claimed the opposite.** All 133 survivors carry 81920 MB, so every score ties
@@ -578,7 +625,9 @@ fn _b_place_hw_req(fleet): i64 {
 # diverges on". With a score-only comparator every adjacent compare returns 0,
 # `c > 0` is still never true, the pre-check still short-circuits, and the timing
 # is **identical** — so it was structurally blind to the one regression it named.
-# `fleet_rank_nodes_gpu_affinity_200_shuffled` below is the shape that is not.
+# `fleet_rank_nodes_gpu_affinity_200_varied` below is the shape that is not.
+# (An earlier draft of this line named it `..._shuffled`, which is both a row
+# that does not exist and the approach the next bench documents as failing.)
 #
 # Kept as-is, relabelled: an all-ties-already-ordered fleet is the realistic
 # homogeneous-cluster case and the O(n) pre-check is exactly what should run for
@@ -589,13 +638,21 @@ fn _b_rank_nodes_gpu_affinity(big): i64 {
     return _b_rank_case(q, big, 5000, "fleet_rank_nodes_gpu_affinity_200");
 }
 
-# The same 200-node GpuAffinity rank, but over a fleet whose GPU nodes are NOT
-# in ascending index order — so the all-ties comparator cannot short-circuit.
+# The same 200-node GpuAffinity rank, but over a fleet whose GPU nodes carry
+# FOUR different VRAM tiers — so the survivors' scores sawtooth instead of all
+# tying and the already-ordered pre-check cannot short-circuit. The node order
+# is untouched and still ascending; it is the SCORES that vary. (An earlier
+# draft of this line said "NOT in ascending index order", which describes the
+# approach the ⚠ two paragraphs down documents as having failed.)
 #
 # ⚠ **This is the shape that actually prices the sort**, and the pair with the
-# one above is the point: subtract them and the difference is the introsort plus
-# the index tiebreak on 133 tied elements, which is the cost a score-only
-# comparator regression would move. Neither number alone shows it.
+# one above is the point: subtract them and the difference is `_vec_introsort`
+# plus the index tiebreak over 133 survivors on 4 distinct scores (~33 tied per
+# tier), which is the cost a score-only comparator regression would move.
+# Neither number alone shows it. Over five 2026-08-11 runs the varied shape held
+# 19.5-21.2us against the ordered shape's 11.8-12.7us — a **~1.65x ratio**
+# (1.62-1.67) every time. The ratio is the durable form of the claim: the
+# absolutes drift ~7% run to run with host noise, the ratio barely moves.
 #
 # ⚠ **Reordering the INPUT does not work, and the first attempt at this shape
 # did exactly that.** `agnosai_rank_nodes` assigns `AGN_PR_INDEX = i` from the
@@ -603,8 +660,9 @@ fn _b_rank_nodes_gpu_affinity(big): i64 {
 # order, so the output indices are ascending **by construction** whatever order
 # the fleet arrives in. With every score tied, the comparator still returns -1
 # for every adjacent pair and the pre-check still short-circuits. A stride
-# shuffle measured 11.763us against the ordered fleet's 11.722us — no
-# difference, because there was no difference to measure.
+# shuffle measured 11.763us against the ordered fleet's 11.722us (2026-08-10) —
+# no difference, because there was no difference to measure. That shape is not
+# in this file; the figures are the record of why it was dropped.
 #
 # The SCORES have to vary non-monotonically. This fleet gives each GPU node one
 # of four VRAM tiers in a repeating 4-cycle, so the score sequence sawtooths and

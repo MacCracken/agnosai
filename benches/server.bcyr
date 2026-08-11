@@ -30,23 +30,57 @@
 # struct is minted before dispatch reaches any arm, so it is in **both** numbers
 # and neither route threading nor any further handler work can remove it.
 #
+# It is the residual **only for the `/api/v1` rows**. There are two ladders:
+# `/api/v1/...` enters the prefix branch (`router.cyr:293`) and walks its group
+# chain, while `/health`, `/ready` and `/metrics` miss that prefix entirely and
+# are matched as bare literals below it (`router.cyr:402`). `route_resolve_probe`
+# is the probe rows' residual, and it is measured rather than assumed.
+#
+# ## What the timed region does NOT include
+#
+# `agnosai_route_dispatch` stops at the response struct. For a JSON route that
+# struct only **points at** the value tree (`agnosai_route_json_a`,
+# `routes/mod.cyr:97-108`); the bytes are rendered afterwards by
+# `bayan_json_v_build_a` in `_agnosai_serve_send` (`serve.cyr:433-434`), which is
+# outside every row in this file. `/metrics` is the one exception:
+# `agnosai_route_metrics` (`routes/health.cyr:55-56`) hands
+# `agnosai_metrics_gather`'s finished `Str` to `agnosai_route_text`, so that row
+# alone carries its whole body render.
+#
+# So a JSON row is "body-limit check, resolve, auth, handler, value tree" — not
+# a whole reply — and `route_metrics_global` is **not** subtractable against the
+# other two probes: the gap between them is a measurement-class difference, not a
+# handler-cost one. Against the oracle this is an early-out, since axum's
+# `Json` `IntoResponse` serialises inside the stack `app.oneshot` drove
+# (`rust-old/benches/server.rs:43-62`), so no row here can see a serialisation
+# regression. Building the body inside the timed region would close that gap and
+# re-baseline every JSON row in the file; it has not been done, and no comment
+# here may claim a "response" until it is.
+#
 # ## Three rows here are deliberately SINGLE-arm, and that is not an omission
 #
 # `/health`, `/ready` and `/metrics` have no `_a` handler, and
 # `_agnosai_route_dispatch_inner` calls the bare form unconditionally
 # (`router.cyr:525-527`). An arena twin would time the 24-byte match struct and
-# nothing else — `route_resolve` already isolates exactly that — so publishing
-# the pair would make the paired-arm claim above false for those rows.
+# nothing else — `route_resolve_probe` already isolates exactly that for these
+# three paths — so publishing the pair would make the paired-arm claim above
+# false for those rows.
 #
 # ## The prompt_guard family lives here, not in orch.bcyr
 #
 # `benches/orch.bcyr` already carries `prompt_scan_clean_67b` and
 # `prompt_scan_clean_4k`, so the 500-byte family could have gone there. It is
 # here because the whole value of the suspicious and sanitize rows is the delta
-# against a clean scan **at the same length**, and a delta whose numerator and
-# denominator land in different report files is unreadable. All three 500-byte
-# rows are therefore in one file, self-subtracting. `main` sets `SK_FATAL`,
-# which sanitize's warn path (`prompt_guard.cyr:174`) needs suppressed anyway.
+# against a clean scan **at the same length**, and a delta a reader is expected
+# to perform is one both halves must be printed for, in one run, on one host.
+# All three 500-byte rows are therefore in one file, self-subtracting. `main`
+# sets `SK_FATAL`, which sanitize's warn path (`prompt_guard.cyr:174`) needs
+# suppressed anyway.
+#
+# That is not an argument against ever reading across files, and the sizing note
+# on `_b_prompt_scan_clean_500` does exactly that: checking a fresh row against
+# the O(len) slope of two committed ones is a one-off design check made against
+# `bench-history.csv`, not a subtraction this file asks its reader to redo.
 #
 # These are CYRIUS baseline numbers, NOT comparable to
 # rust-old/bench-history.csv. See CLAUDE.md.
@@ -113,11 +147,18 @@ var AGN_B_FIXTURE_N = 8;
 
 # The application state every benchmark below dispatches against: eight finished
 # crews carrying agent metadata, eight pending approvals, one agent definition,
-# one registered tool.
+# and the oracle's two registered tools.
 fn _b_state(): i64 {
     var o = agnosai_orchestrator_new(0);
     var reg = agnosai_tool_registry_new();
+    # `EchoTool` **and** `JsonTransformTool` — what the oracle's `test_app`
+    # registers (`rust-old/benches/server.rs:28-29`), and the pair
+    # `agnosai_register_basic_builtins` exists for. Registered one by one rather
+    # than through that helper so the count stays this file's: `/api/v1/tools`
+    # and MCP `tools/list` each render one object per registered tool, four rows
+    # in all, and one of them is read as a statement about registry size.
     agnosai_tool_registry_register(reg, agnosai_echo_tool());
+    agnosai_tool_registry_register(reg, agnosai_json_transform_tool());
     var s = agnosai_app_state_new(o, reg, agnosai_auth_config_new(),
     agnosai_event_bus_new(), agnosai_audit_chain_new(), agnosai_approval_gate_new());
 
@@ -244,6 +285,62 @@ fn _b_assert_post_ok(s, path: Str, body: Str): i64 {
     return 0;
 }
 
+# The arena twin, because the arena arm is the one a guard is actually for.
+#
+# The global handler delegates to its `_a` form with `default_alloc()`
+# (`crews.cyr:599-601`), so on a healthy tree this cannot answer differently
+# from `_b_assert_post_ok` — which is the point: the arm that could diverge is
+# the one where the allocator changes, and leaving it unguarded because the
+# other arm passed assumes the very thing the pair exists to test.
+fn _b_assert_post_ok_a(s, path: Str, body: Str): i64 {
+    var empty = str_from("");
+    var ar = arena_allocator(1048576);
+    var st = agnosai_route_status(
+    agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_POST, path, empty, 0, body));
+    reset_via(ar);
+    if (st != HTTP_OK) { syscall(60, 1); }
+    return 0;
+}
+
+# The `result` object of one `/mcp` call, or exit(1) if the reply carried an
+# `error` instead.
+#
+# The guard the `/mcp` rows CAN have. The one they cannot is the status: every
+# arm of the method ladder answers HTTP_OK, "Method not found" included
+# (`mcp.cyr:563-566`), so `agnosai_route_status` cannot tell a measured handler
+# from the fallthrough — and the fallthrough is the *cheap* direction, since
+# `_agnosai_mcp_error` builds a two-key `code`/`message` object
+# (`mcp.cyr:122-132`) where the timed arms build a tree, and
+# `_agnosai_mcp_unknown` logs at a level `SK_FATAL` suppresses. A typo in the
+# hand-built envelope would therefore read as a win. The body tells them apart:
+# `_agnosai_mcp_success` sets `result` (`mcp.cyr:113-119`), the error shape sets
+# `error` and omits it.
+fn _b_mcp_result(s, body: Str): i64 {
+    var empty = str_from("");
+    var r = agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, str_from("/mcp"), empty, 0, body);
+    var res = bayan_json_v_obj_get(agnosai_route_body(r), "result");
+    if (res == 0) { syscall(60, 1); }
+    return res;
+}
+
+# `tools/list` answered, and answered with the fixture's TWO schemas.
+#
+# The count is asserted, not just the key: `route_mcp_global` is read as the
+# cost of walking the registry, so a fixture that quietly registered one tool
+# would make that row mean something else without changing its name.
+fn _b_assert_mcp_tools_list(s, body: Str): i64 {
+    var tools = bayan_json_v_obj_get(_b_mcp_result(s, body), "tools");
+    if (tools == 0 || bayan_json_v_arr_len(tools) != 2) { syscall(60, 1); }
+    return 0;
+}
+
+# `initialize` answered — `serverInfo` carries the nested object built first and
+# attached at `mcp.cyr:180`, so it is absent from every shape but this one.
+fn _b_assert_mcp_initialize(s, body: Str): i64 {
+    if (bayan_json_v_obj_get(_b_mcp_result(s, body), "serverInfo") == 0) { syscall(60, 1); }
+    return 0;
+}
+
 # The oracle's crew request body (`rust-old/benches/server.rs:133-146`): one
 # agent, one task, no optional fields.
 #
@@ -295,9 +392,17 @@ fn _b_clean_500(): Str {
 # existing clean rows sit at 67 B and 2,880 B — this lands between them, so the
 # three together give the O(len) slope three points instead of two.
 #
-# n=10000, not the 50000 the two `orch.bcyr` rows use: interpolating those
-# (8.0 µs at 67 B, ~273 µs at 2,880 B — both quoted in `prompt_guard.cyr:83-84`)
-# puts a clean 500 B scan near 50 µs, so 50000 would be ~2.5 s for one row.
+# ⚠ Interpolate from `bench-history.csv`, NOT from `prompt_guard.cyr:79-80`.
+# The module header's "273 us" for a 4 KB field and "8.0 us" for a 67-byte one
+# are its own older measurements; the committed rows for the same two fixtures
+# in the `2026-08-11T07:21:13Z` run are `prompt_scan_clean_67b` = 8,717 ns and
+# `prompt_scan_clean_4k` = 352,420 ns (2,880 B). Those give 122.2 ns/byte and
+# predict 61.6 us at 500 B, against that run's measured 61,736 ns — 0.2%. The
+# stale figures predict ~50 us instead, which would make a correct number here
+# look like a 25% regression.
+#
+# n=10000, not the 50000 the two `orch.bcyr` rows use: at ~62-67 us a row, 50000
+# is over three seconds for one line of output.
 fn _b_prompt_scan_clean_500(): i64 {
     var n = 10000;
     var text = _b_clean_500();
@@ -315,10 +420,12 @@ fn _b_prompt_scan_clean_500(): i64 {
 # patterns. `"ignore previous instructions"` is the FIRST table entry
 # (`prompt_guard.cyr:107`), so a match returns after one pattern.
 #
-# Measured, the pair comes out at **30.2x** (62.1 µs clean vs 2.06 µs here),
-# which is the 31-pattern ratio almost exactly — and that is worth writing down
-# because it is a statement about `agnosai_str_contains_ci`, not about the
-# patterns. The folded first-byte guard (`strcase.cyr:74-76`) rejects nearly
+# Measured, the pair comes out at **~30x** — 63.193 µs clean against 2.144 µs
+# here in one run of this file, and 61,736 ns against 2,060 ns in the committed
+# `2026-08-11T07:21:13Z` one. Quote the ratio, not the absolutes: it survives a
+# host change and they do not. That is the 31-pattern ratio almost exactly, and
+# it is worth writing down because it is a statement about
+# `agnosai_str_contains_ci`, not about the patterns. The folded first-byte guard (`strcase.cyr:74-76`) rejects nearly
 # every offset in one compare in BOTH corpora, so each pattern costs ~O(len)
 # either way and the early exit simply removes 30 of the 31 passes. If that
 # ratio ever falls, the guard has stopped filtering and the inner loop is
@@ -369,10 +476,13 @@ fn _b_prompt_sanitize_clean_500(): i64 {
 }
 
 # The router's own cost, in both arms and removable from neither.
-fn _b_resolve(): i64 {
-    var n = 200000;
-    var path = str_from("/api/v1/dashboard/crews");
-    var b = bench_new("route_resolve");
+#
+# Called twice, because there are two ladders and one row cannot be the residual
+# for both — see the header. `path` is hoisted by the caller for the same reason
+# `field` is on the sanitize row: `str_from` inside the loop would fold a header
+# allocation into a 300 ns number.
+fn _b_resolve(name, path: Str, n): i64 {
+    var b = bench_new(name);
     bench_batch_start(b);
     for (var i = 0; i < n; i = i + 1) {
         agnosai_route_resolve(AGNOSAI_METHOD_GET, path);
@@ -398,12 +508,20 @@ fn main(): i64 {
     str_builder_add_str(csb, cid);
     var crew_path = str_builder_build(csb);
 
-    _b_resolve();
+    _b_resolve("route_resolve", str_from("/api/v1/dashboard/crews"), 200000);
+    _b_resolve("route_resolve_probe", str_from("/health"), 200000);
 
     # The three public probes — no auth branch at all (`agnosai_route_needs_auth`
-    # returns 0 for all three, `router.cyr:450-451`), so these are the floor:
-    # body-limit check, resolve, handler, response. Single-arm by construction —
-    # see the header.
+    # returns 0 for all three, `router.cyr:451-453`), so these are the floor:
+    # body-limit check, resolve, handler, and the JSON **value tree** — not the
+    # rendered body, which `_agnosai_serve_send` builds after dispatch returns.
+    # `/metrics` is the exception and does carry its render; see the header, and
+    # do not subtract it against the other two. Single-arm by construction —
+    # also the header. Their residual is `route_resolve_probe`, not
+    # `route_resolve`: `/health` never enters the `/api/v1` ladder. It is not a
+    # rounding difference either — one run measured 135 ns against 328 ns, so
+    # subtracting the wrong one charges a 479 ns probe with 68% of itself when
+    # its real router share is 28%.
     #
     # ⚠ `/metrics` reads the **process-global** registry
     # (`prometheus.cyr:54`), not a fixture-owned one, and the rendered body's
@@ -411,8 +529,9 @@ fn main(): i64 {
     # crews, and `crew_runner.cyr:1210/1254-1255` record `crew_started`,
     # `crew_completed` and `tasks_completed` on every one, so this row renders
     # 8/0/8/0/0/0.000000. It is placed **before** the `POST /crews` rows at the
-    # bottom for that reason: those add 4,000 more crews and would widen three
-    # of the six counters. Any new row that runs a crew belongs after this one.
+    # bottom for that reason: those run ~4,000 more crews across three states and
+    # would widen three of the six counters. Any new row that runs a crew —
+    # including a guard that posts one — belongs after this one.
     _b_dispatch_global(s, "route_health_global", str_from("/health"), 100000);
     _b_dispatch_global(s, "route_ready_global", str_from("/ready"), 100000);
     _b_dispatch_global(s, "route_metrics_global", str_from("/metrics"), 50000);
@@ -454,6 +573,7 @@ fn main(): i64 {
     appr, 20000);
 
     var mcp = str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    _b_assert_mcp_tools_list(s, mcp);
     _b_post_global(s, "route_mcp_global", str_from("/mcp"), mcp, 20000);
     _b_post_arena(s, "route_mcp_arena", str_from("/mcp"), mcp, 20000);
 
@@ -464,21 +584,22 @@ fn main(): i64 {
     # result with no registry walk. Same count as the pair above so the four
     # rows sit against each other and the delta is the registry walk.
     #
-    # ⚠ It measured **slower** than `tools/list` (4.64 µs vs 3.95 µs), which
-    # inverts the expectation and is a fact about the fixture, not the handlers:
-    # `_b_state` registers exactly ONE tool, so `tools/list`'s registry walk is
-    # a single schema, while this row parses a 135-byte nested envelope against
-    # `tools/list`'s 46 and then builds six objects. Register a second tool and
-    # the order flips. Read the pair as "envelope parse vs one-tool walk".
-    #
-    # No status guard is possible here — every arm of the method ladder,
-    # including "method not found", answers HTTP_OK inside the JSON-RPC
-    # envelope, so `agnosai_route_status` cannot tell them apart.
+    # ⚠ The 136-byte nested envelope this row parses is three times `tools/list`'s
+    # 46, so at a small registry the envelope can outweigh the walk. It did, and
+    # it no longer does. On the one-tool fixture this file used to build,
+    # `initialize` measured **5.040 µs against `tools/list`'s 4.267**; with the
+    # oracle's second tool registered it is **4.766 against 6.217** (two runs on
+    # one host, so read the direction and not the third digit). `initialize`
+    # moved within noise, as it must with no registry to walk; `tools/list`
+    # gained ~2 µs for one more schema. Read the four rows as "fixed envelope vs
+    # per-tool walk", and expect the walk to pull further ahead as the registry
+    # grows.
     #
     # ⚠ Not comparable in kind to the Rust number: the port's `initialize`
     # advertises `prompts` and `resources` capabilities the oracle has no
     # equivalent for (ADR 015, ADR 016), so this result tree is larger.
     var mcp_init = _b_mcp_init_body();
+    _b_assert_mcp_initialize(s, mcp_init);
     _b_post_global(s, "route_mcp_initialize_global", str_from("/mcp"), mcp_init, 20000);
     _b_post_arena(s, "route_mcp_initialize_arena", str_from("/mcp"), mcp_init, 20000);
 
@@ -499,31 +620,53 @@ fn main(): i64 {
     # any inference.
     #
     # ⚠ **Three reasons this cannot share `s`, and none of them fails loudly.**
-    #   1. `_agnosai_orch_finish` does `map_set` on the crew registry
-    #      (`orchestrator.cyr:326`) and never prunes. Three pairs above render
-    #      one object per REGISTERED crew — that is why `AGN_B_FIXTURE_N` is 8 —
-    #      so running this against `s` would re-time them against 8 + n.
-    #   2. The two arms cannot share a state either, or the arena arm starts
-    #      with ~2,000 crews in the registry the global arm never saw, and the
-    #      pair stops being a comparison. Hence `s2` and `s3`.
-    #   3. `_agnosai_orch_audit` fires twice per run (`orchestrator.cyr:234`
-    #      and `:322`) and the chain evicts at `AGNOSAI_AUDIT_MAX_ENTRIES`
-    #      (10000, `audit.cyr:55`) with `vec_remove(entries, 0)` — an O(n) shift
-    #      over 10,000 pointers PLUS an extra SHA-256. n=2000 puts each arm at
-    #      ~4,000 records, comfortably under the cliff. **Do not raise n past
-    #      ~4,900 without minting a fresh state**, or the row starts measuring
-    #      the ring's memmove and reads as a regression in the handler.
+    #   1. Every run leaves a crew in the registry (`_agnosai_orch_finish`'s
+    #      `map_set`, `orchestrator.cyr:326`). Three pairs above render one
+    #      object per REGISTERED crew — that is why `AGN_B_FIXTURE_N` is 8 — so
+    #      running this against `s` would re-time them against a registry
+    #      hundreds of entries deep.
+    #      ⚠ It does **not** grow to 8 + n: `_agnosai_orch_register` calls
+    #      `_agnosai_orch_evict_locked` first (`orchestrator.cyr:238`), which at
+    #      `AGNOSAI_MAX_RETAINED_CREWS` = 1000 (`:36`) drops every FINISHED crew
+    #      (`:178-191`) — and every crew here is COMPLETED. So the registry
+    #      sawtooths 9 → 1000 → 1, and at n=2000 it crosses twice. Measured:
+    #      2,009 runs end with **9** crews and 900 runs end with 909.
+    #   2. The two arms cannot share a state either, or the arena arm starts on
+    #      the far side of a cliff the global arm never met, and the pair stops
+    #      being a comparison. Hence `s2` and `s3`.
+    #   3. Each run writes **three** audit records, not two: `crew_accepted`
+    #      (`orchestrator.cyr:234`), the runner's per-task `task_completed`
+    #      (`crew_runner.cyr:886`) and `crew_finished` (`:322`). Measured — eight
+    #      fixture runs leave 24 entries, 2,009 runs leave 6,027. The chain
+    #      evicts at `AGNOSAI_AUDIT_MAX_ENTRIES` (10000, `audit.cyr:55`) with
+    #      `vec_remove(entries, 0)` (`:364`) — an O(n) shift over 10,000 pointers
+    #      PLUS an extra SHA-256. **Do not raise n past ~3,300 on a fresh
+    #      state** (10000 / 3, not the 4,900 a two-per-run reading gives), or the
+    #      row starts measuring the ring's memmove.
+    #
+    # ⚠ n stays at 2000 even though the registry cliff falls inside it, because
+    # the cliff is not measurable: on a throwaway copy of this fixture a
+    # cliff-free n=900 ran 84.295 and 83.554 us against n=2000's 84.162 and
+    # 84.220 us — the two crossings are below run-to-run noise. What the average
+    # does blend is three registry regimes, so read this row as a handler cost,
+    # never as evidence about `map_set` at a particular depth.
     #
     # ⚠ Expect a far smaller arena win than the read routes show, and do not
     # read that as a defect: most of what this route allocates is the crew
     # *execution*, which is retained state and stays on the global bump in both
     # arms (`crews.cyr:593-598`). What moves to the arena is the parse tree and
     # the response.
+    # Both arms are guarded, and both guards run on a state neither arm uses.
+    # A guard is a crew run: pointing it at `s2` would have started the global
+    # arm one crew and three audit records ahead of the arena arm, which defeats
+    # the identical-start invariant `s2`/`s3` exist for. `sg` is thrown away.
     var crew_body = _b_crew_body();
     var crews_path = str_from("/api/v1/crews");
+    var sg = _b_state();
+    _b_assert_post_ok(sg, crews_path, crew_body);
+    _b_assert_post_ok_a(sg, crews_path, crew_body);
     var s2 = _b_state();
     var s3 = _b_state();
-    _b_assert_post_ok(s2, crews_path, crew_body);
     _b_post_global(s2, "route_create_crew_global", crews_path, crew_body, 2000);
     _b_post_arena(s3, "route_create_crew_arena", crews_path, crew_body, 2000);
 

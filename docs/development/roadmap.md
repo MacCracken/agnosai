@@ -840,10 +840,14 @@ beyond the cap. Only a direct library caller is unbounded.
 stable insertion sort walks a tied list in O(n), which is precisely why
 `rank_agents_16` never showed this.
 
-**Still open:** whether to replace the insertion sort. It is a real complexity
-divergence from the oracle, so under CLAUDE.md it needs a fix or an ADR — but at
-the enforced cap it costs ~42 µs, so the honest answer may be an ADR recording
-the bound rather than a change.
+✅ **RESOLVED 2026-08-11 — it was a fix, not an ADR.** `agnosai_rank_agents` now
+calls `agnosai_sort` (introsort), the same call `fleet/placement.cyr:287` already
+makes for the same job. **100: 127.8 → 95.8 µs (−25%) · 300: 626.0 → 296.9
+(−52.6%) · 1000: 5093.0 → 1021.0 (−80%)**, and scaling per 10x the agents drops
+from **39.9x to 10.7x**. Behaviour-preserving because `_agnosai_scored_cmp` is a
+total order (index breaks every tie), pinned by a new 40-identical-agent case —
+the existing 6-agent one sits below introsort's 16-element threshold and would
+have passed regardless. 109/109 identical either side.
 
 #### Bite 3 — the gap analysis
 
@@ -874,7 +878,15 @@ a wrong allocator model behind three iteration counts, a `sakshi` log-level trap
 that does not exist, and the compile blocker above. Read the audit before
 implementing any row; the raw analyses are not safe to follow verbatim.
 
-⚠ **A redundant O(n²) sort surfaced in passing and is NOT yet fixed.**
+✅ **The redundant O(n²) sort is FIXED — 2026-08-11.** `scheduler_load_dag`
+went **3129.0 µs → 1271.0 µs at 500 tasks (−59.4%)**, 561.1 → 485.4 at wide-100,
+154.8 → 136.2 at linear-50 — the saving growing with n, which is the O(n²) term
+leaving. `tests/orch_scheduler.tcyr` gained the twelve-roots-in-reverse and mixed
+roots/dependents cases *before* the deletion and reports **86/86 identical either
+side of it**. The original finding, kept below because the reasoning is the
+point:
+
+⚠ **A redundant O(n²) sort surfaced in passing.**
 `agnosai_scheduler_load_dag` (`src/orchestrator/scheduler.cyr:247-249`) and
 `agnosai_scheduler_topological_sort` (`:233`) each insertion-sort **all** DAG
 keys before calling `agnosai_scheduler_kahn_sort`.
@@ -910,8 +922,6 @@ a `ToolRegistry`, registers `EchoTool`, asserts on it — and then calls
 throughout and the tool assertions are standalone. Reproduced exactly rather
 than "improved", because wiring the registry in would test something the oracle
 does not and would paper over the same gap upstream has.
-
-#### Not started
 
 #### Bite 5 — the doctest and the first example ✅ 2026-08-10
 
@@ -999,6 +1009,47 @@ is correct and was left alone** — it is a *tool author* building against the
 Rust SDK, the surface that deliberately stays Rust. A blanket sweep of `cargo`
 out of the docs would have broken the one instruction that should keep it.
 
+#### Bite 8 — the oracle's shipped WASM fixture ✅ 2026-08-11
+
+`tests/tools_wasm.tcyr` loads `rust-old/examples/wasm-tools/hello-tool/manifest.json`
+byte for byte through `agnosai_wasm_load_tool_package` — **84 assertions**. See
+*Still not started* below for what remains.
+
+#### Bite 9 — the audit remediated ✅ 2026-08-11
+
+Four agents, one per file, each told the audit had already been refuted three
+times and to verify every finding against the tree. **42 applied, 14 rejected
+with evidence, 11 escalated.**
+
+⚠ **The audit itself had six errors**, listed in
+[`m12-bench-audit-2026-08-10.md`](m12-bench-audit-2026-08-10.md) under *Known
+errors IN this document* rather than edited out. A reviewing pass is not more
+reliable than the thing it reviews; it is only differently wrong.
+
+⚠ **A verifier caught a stale claim I created.** `benches/definitions.bcyr` said
+the assembler divergence was "unrecorded in `src/`" — true when written, false
+ninety minutes later because the note landed concurrently. A comment asserting
+another file's contents is a comment that rots.
+
+Escalations acted on: the assembler memoization note
+(`src/definitions/assembler.cyr:33-54`), `src/server/prompt_guard.cyr`'s 29%-stale
+scan figure, and `lib/bench.cyr:6`'s 11x-wrong `clock_gettime` constant (filed
+upstream). Three became decisions — **D3/D4/D5** under *Owed work*.
+
+#### M12 — what is left
+
+**Nothing under `src/`, `tests/`, `benches/`, `fuzz/` or `examples/`.** Every
+bite is closed. What remains is one wasmtime-gated half and five decisions:
+
+| | |
+|---|---|
+| the WASM **execute** path | needs `wasmtime` installed; the manifest half is done |
+| **D1** mount `rate_limit`? | open since M6 |
+| **D2** `"personality": null` | the user's one deliberate carve-out (bhava) |
+| **D3** memoize `builtin_presets()`? | opened 2026-08-11 |
+| **D4** `rounds x batch` for the bench sweep? | opened 2026-08-11 |
+| **D5** dispatch rows include body serialization? | opened 2026-08-11 |
+
 #### Still not started
 
 ⚠ **`sdk/agnosai-tool-sdk/` and `rust-old/examples/wasm-tools/` STAY RUST, and
@@ -1012,9 +1063,22 @@ What agnosai genuinely owes here is **conformance**, not translation: that
 `src/tools/wasm_tool.cyr` implements the `{"parameters": …}` stdin and
 `{"result", "success", "error"}` stdout contract the SDK documents. It does, its
 header cites the SDK as the reason, and `tests/tools_wasm.tcyr` pins both halves.
-`examples/wasm-tools/hello-tool/` is the natural fixture for an end-to-end
-`wasm_loader` test, which needs `wasmtime` installed and is the only part still
-open.
+✅ **The manifest half of `examples/wasm-tools/hello-tool/` is now tested**
+(2026-08-11). `tests/tools_wasm.tcyr` loads the oracle's own shipped
+`manifest.json`, transcribed byte for byte, through `load_tool_package` with an
+8-byte header stub for the `.wasm` — 84 assertions, and it is the only place
+`"required": false` arrives from a real published manifest rather than from a
+case written to test it. That is the conformance check the SDK is owed.
+
+⚠ **Only the EXECUTE half is wasmtime-gated**, and it is the whole of what
+remains here: `wasmtime` is not installed on this box, so a built module cannot
+be run. The manifest parse, the `<name>.wasm` resolution, both error policies and
+the entire result ladder are all reachable without it.
+
+⚠ Noted while adding it: `_T_ROOT` in that suite is created but never cleaned,
+so the `load_all_tool_packages` count assertions are sensitive to anything left
+behind — a stale directory reports as "got 3, expected 2" and points at the
+counting logic rather than the leftover. Recorded in the file.
 - **Repo hygiene found in passing.** `probe_key_tmp.pem` — a tracked RSA private
   key at the root, referenced by nothing — is **deleted**, and `.gitignore` now
   carries `*.pem` / `*.key` because agnosai has no legitimate PEM in the tree.
@@ -1026,6 +1090,68 @@ open.
 PEMs live on as frozen RS256 vectors in `tests/server_auth_vectors.cyr`, kept in
 a `.cyr` deliberately so ~16 KB of base64 stays out of the `.tcyr` coverage
 budget.
+
+### D3 — should `builtin_presets()` be memoized? (opened 2026-08-11)
+
+**Measured, not speculated.** Every `GET /api/v1/presets` re-parses all 18 embedded
+preset documents and re-serializes them:
+
+| | |
+|---|---|
+| parse (`builtin_presets_18`) | **~744 µs** |
+| serialize (`preset_to_value_18`) | **~145 µs** |
+| allocation per call | **1,016,776 bytes** |
+
+So ~0.9 ms of CPU and ~1 MB before the response is framed, for data that is a
+compile-time constant generated into `src/definitions/presets_data.cyr`.
+
+⚠ **The oracle does exactly the same.** `rust-old/src/definitions/loader.rs:122`
+is a plain `fn builtin_presets()` over `include_str!` with no `LazyLock` and no
+cache. So memoizing would be a **divergence needing an ADR**, not a fix — which
+is why this is a decision and not a task.
+
+⚠ **The worst half is already gone.** Until 2026-08-11 that 1 MB landed on the
+no-free global bump on every request, because the dispatch ladder was missing its
+arena arm for this id. With the arm wired the allocation is per-request and
+reclaimed by `reset_via`, so what remains is CPU and arena churn (~16 chunks at
+the 64 KiB `AGNOSAI_SERVE_ARENA_BYTES`), not a leak.
+
+The argument for memoizing is that the parse result never changes. The argument
+against is that it is the oracle's shape, the route is unlikely to be hot, and a
+process-lifetime cache of parsed structs is shared mutable state that every other
+route in this tier deliberately avoids. **No recommendation — this is D1/D2's
+kind of call.**
+
+### D4 — should the bench sweep adopt `rounds x batch`? (opened 2026-08-11)
+
+⚠ **Every one of the ~200 rows in `bench-history.csv` prints `min == max == avg`,
+by construction.** Each benchmark calls `bench_batch_start`/`bench_batch_stop`
+exactly once, so there is one sample and the reported dispersion is not
+information — `preset_to_value_18: 148.534us avg (min=148.534us max=148.534us)`
+carries no more than the average alone.
+
+`lib/bench.cyr:198-211` documents the alternative: wrap the batch in a `rounds`
+loop, so min/max span real samples. Measured run-to-run spread on this host is
+**~5%** (`builtin_presets_18` ranged 738.3–775.1 µs over eight runs), which is
+exactly the band a reader currently cannot see.
+
+⚠ **Not taken, and the reason is the reason it is a decision.** Changing one file
+makes its rows incomparable with the other nine and with every historical row;
+changing all ten re-baselines the entire CSV at once. Either is defensible, and
+neither should happen as a side effect of a bench edit. Raised independently by
+two agents auditing different files, which is what promoted it from a nit.
+
+### D5 — should the dispatch rows include body serialization? (opened 2026-08-11)
+
+`benches/server.bcyr`'s `route_*_global` / `route_*_arena` rows time
+`agnosai_route_dispatch` and stop at the response **object**.
+`rust-old/benches/server.rs:43-62` drives a real `tower` service, so the oracle's
+number includes serializing the body to bytes.
+
+Adding `bayan_json_v_build` inside the timed loop would close that gap and would
+also re-baseline every dispatch row. Left alone deliberately: the rows are
+currently a clean measure of routing plus handler, which is the part the port
+controls, and the serializer has its own coverage in `benches/core.bcyr`.
 
 ## Owed work
 

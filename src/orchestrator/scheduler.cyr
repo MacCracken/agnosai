@@ -230,7 +230,13 @@ fn agnosai_scheduler_topological_sort(dag): i64 {
     var dependencies = map_new_str();
     var keys = vec_new();
     _agnosai_sched_build(dag, dependents, dependencies, keys);
-    _agnosai_sched_sort_strs(keys);
+    # ⚠ **No pre-sort of `keys`, and there used to be one.**
+    # `agnosai_scheduler_kahn_sort` sorts the zero-in-degree seed itself (:169)
+    # and sorts each successor list inside its loop (:180), so the order `keys`
+    # arrives in cannot reach the output — the seed is re-sorted regardless and
+    # `in_degree` is a map. The pre-sort was an insertion sort over EVERY key,
+    # i.e. O(n^2) of provably dead work. Removed 2026-08-11; the guard is
+    # `tests/orch_scheduler.tcyr`'s twelve-roots-in-reverse case.
     return agnosai_scheduler_kahn_sort(keys, dependents, dependencies);
 }
 
@@ -244,10 +250,12 @@ fn agnosai_scheduler_load_dag(s, dag): i64 {
     var keys = vec_new();
     _agnosai_sched_build(dag, dependents, dependencies, keys);
 
-    var sorted_keys = vec_new();
-    for (var i = 0; i < vec_len(keys); i = i + 1) { vec_push(sorted_keys, vec_get(keys, i)); }
-    _agnosai_sched_sort_strs(sorted_keys);
-    if (agnosai_scheduler_kahn_sort(sorted_keys, dependents, dependencies) == 0) { return 0; }
+    # ⚠ See `agnosai_scheduler_topological_sort` above: no pre-sort, because
+    # `kahn_sort` sorts the seed and every successor list itself. This site was
+    # worse than that one — it COPIED all the keys into a second vec first, so it
+    # paid an allocation and a full O(n^2) insertion sort per load to produce an
+    # ordering the callee then discarded.
+    if (agnosai_scheduler_kahn_sort(keys, dependents, dependencies) == 0) { return 0; }
 
     var tasks = agnosai_task_dag_tasks(dag);
     var id_to_key = map_new_str();

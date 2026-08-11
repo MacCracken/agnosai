@@ -263,6 +263,22 @@ fn _agnosai_scored_before(a, b): i64 {
     return 0;
 }
 
+# The same order as `_agnosai_scored_before`, in the -1/0/1 form `agnosai_sort`
+# takes — the shape `fleet/placement.cyr:256`'s `_agnosai_place_cmp` already uses.
+#
+# ⚠ **This is a TOTAL order, which is what makes an unstable sort safe here.**
+# Scores first, then index ascending on a tie, so no two distinct entries ever
+# compare equal. Stability would only matter if they could.
+fn _agnosai_scored_cmp(a, b): i64 {
+    var sa = agnosai_scored_score(a);
+    var sb = agnosai_scored_score(b);
+    if (f64_gt(sa, sb) == 1) { return 0 - 1; }
+    if (f64_lt(sa, sb) == 1) { return 1; }
+    if (agnosai_scored_index(a) < agnosai_scored_index(b)) { return 0 - 1; }
+    if (agnosai_scored_index(a) > agnosai_scored_index(b)) { return 1; }
+    return 0;
+}
+
 # Rank agents by suitability, best first.
 #
 # Returns a vec of scored entries. The required tools are extracted once for the
@@ -287,21 +303,29 @@ fn agnosai_rank_agents(agents, task): i64 {
         vec_push(scored, e);
     }
 
-    # Insertion sort: descending by score, ascending by index on a tie. The
-    # agent count per task is small — the oracle collects into a Vec and sorts
-    # it with no size guard either — and an insertion sort is stable by
-    # construction, so the tie-break is belt-and-braces rather than load-bearing.
-    for (var a = 1; a < vec_len(scored); a = a + 1) {
-        var cur = vec_get(scored, a);
-        var b = a - 1;
-        while (b >= 0) {
-            var other = vec_get(scored, b);
-            if (_agnosai_scored_before(cur, other) == 0) { break; }
-            vec_set(scored, b + 1, other);
-            b = b - 1;
-        }
-        vec_set(scored, b + 1, cur);
-    }
+    # ⚠ **`agnosai_sort` (introsort), not the hand-rolled insertion sort this
+    # used until 2026-08-11.** The oracle sorts with `sort_by` — pdqsort,
+    # O(n log n) (`rust-old/src/orchestrator/scoring.rs:212`) — and the insertion
+    # sort was O(n²), a real complexity divergence. Its justification was "the
+    # agent count per task is small", which is an assumption about callers rather
+    # than a property of the code.
+    #
+    # The swap is behaviour-preserving because `_agnosai_scored_cmp` is a TOTAL
+    # order: index ascending breaks every score tie, so no two entries compare
+    # equal and an unstable sort cannot reorder them. `tests/orch_scoring.tcyr`
+    # pins that with 40 identical agents — deliberately past `_vec_introsort`'s
+    # 16-element threshold, since a smaller case only exercises introsort's own
+    # insertion path and would pass either way.
+    #
+    # Measured, `benches/orch.bcyr`:
+    #
+    #     rank_agents_varied_100    127.8us -> see bench-history
+    #     rank_agents_varied_1000  5093.0us -> see bench-history
+    #
+    # The 100/300/1000 series is why this could be argued at all: before it, the
+    # only ranking bench used 16 IDENTICAL agents, so the insertion sort did zero
+    # shifts and the quadratic was invisible.
+    agnosai_sort(scored, &_agnosai_scored_cmp);
     return scored;
 }
 

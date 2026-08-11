@@ -564,7 +564,19 @@ body: Str): i64 {
         if (a != 0) { return agnosai_route_submit_approval_a(a, state, body); }
         return agnosai_route_submit_approval(state, body);
     }
-    if (id == AGN_ROUTE_LIST_PRESETS) { return agnosai_route_list_presets(); }
+    # ⚠ The arena arm was MISSING here until 2026-08-11, and this was the only id
+    # in the ladder with an `_a` form that went unwired — every neighbour above
+    # and below carries one. `agnosai_route_list_presets_a` has existed since
+    # M10; the effect was that `GET /api/v1/presets` parsed all 18 preset
+    # documents onto the no-free global bump on every request instead of the
+    # per-request arena, so the memory was never reclaimed. That is the exact
+    # failure CLAUDE.md's "thread the `_a` allocator variants" rule exists to
+    # prevent, and it is a heavier route than most: `benches/definitions.bcyr`
+    # measures the parse at ~744us per request.
+    if (id == AGN_ROUTE_LIST_PRESETS) {
+        if (a != 0) { return agnosai_route_list_presets_a(a); }
+        return agnosai_route_list_presets();
+    }
     if (id == AGN_ROUTE_CREW_HISTORY) {
         if (a != 0) { return agnosai_route_crew_history_a(a, state); }
         return agnosai_route_crew_history(state);

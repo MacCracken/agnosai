@@ -268,6 +268,22 @@ fn main() {
         "identically-scoring agents keep their input order");
     }
 
+    # ⚠ **40 identical agents, added 2026-08-11 as the guard for replacing the
+    # hand-rolled insertion sort with `agnosai_sort`.** The six-agent case above
+    # is BELOW `_vec_introsort`'s 16-element threshold (`lib/vec.cyr`), so it
+    # exercises introsort's own insertion path and would keep passing even if the
+    # real quicksort broke ties. 40 forces the partitioning path, where an
+    # unstable sort without the index tie-break would visibly reorder.
+    var wide_tie = vec_new();
+    for (var w = 0; w < 40; w = w + 1) { vec_push(wide_tie, _t_agent(0, "medium", 0)); }
+    var wide_ranked = agnosai_rank_agents(wide_tie, bare_task);
+    assert_eq(vec_len(wide_ranked), 40, "forty identical agents all rank");
+    for (var x = 0; x < 40; x = x + 1) {
+        assert_eq(agnosai_scored_index(vec_get(wide_ranked, x)), x,
+        "and hold input order past the introsort threshold, where only the explicit \
+        index tie-break in `_agnosai_scored_before` can produce it");
+    }
+
     # a tie in the middle of a mixed set also holds its order
     var mixed = vec_new();
     vec_push(mixed, _t_agent(0, "high", 0));
