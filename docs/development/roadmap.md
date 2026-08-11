@@ -861,9 +861,12 @@ does not and would paper over the same gap upstream has.
   `Cargo.lock`. It defines the `{"parameters": …}` / `{"result", "success",
   "error"}` wire format `tools/wasm_tool.cyr` implements, so it is a live
   compatibility surface rather than dead weight.
-- **Repo hygiene found in passing** — `probe_key_tmp.pem` (a tracked private key
-  at the root, see `state.md` known issue 0), README's Rust-era Quick Start, and
-  a `.gitignore` that is still the Rust-era file apart from `/build/`.
+- **Repo hygiene found in passing.** `probe_key_tmp.pem` — a tracked RSA private
+  key at the root, referenced by nothing — is **deleted**, and `.gitignore` now
+  carries `*.pem` / `*.key` because agnosai has no legitimate PEM in the tree.
+  ⚠ **The key is still in history** (`bb76e67`); a rewrite is a maintainer call
+  and is open. See `state.md` known issue 0. Still owed: README's Rust-era Quick
+  Start, and the rest of a `.gitignore` that is otherwise the Rust-era file.
 
 ⚠ `rust-old/tests/fixtures/` is **already ported** and needs nothing: both RSA
 PEMs live on as frozen RS256 vectors in `tests/server_auth_vectors.cyr`, kept in

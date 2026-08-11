@@ -1046,26 +1046,35 @@ libro 2.8.4 arrives transitively via bote.
 
 ## Known issues in the current build
 
-0. **⚠ A PRIVATE KEY IS COMMITTED AT THE REPO ROOT — `probe_key_tmp.pem`.**
-   Found 2026-08-10. 1,704 bytes, `-----BEGIN PRIVATE KEY-----`, **tracked**
-   (`git ls-files` confirms), committed in `bb76e67 "errors and jwt work"`, and
-   **referenced by nothing** — no `.cyr`, `.tcyr`, `.sh` or doc mentions it.
+0. **⚠ A private key was committed at the repo root — `probe_key_tmp.pem`.
+   Deleted from the tree 2026-08-10; STILL IN HISTORY.**
 
-   It is not the oracle's fixture key (different sha256 from
-   `rust-old/tests/fixtures/test_rsa_private.pem`) and its public half does not
-   match the frozen vectors in `tests/server_auth_vectors.cyr` (`…lv/hFeMqWBO6…`
-   vs `…5Wu/jjUwgB2e1/Bn…`). So it is throwaway debris from the RS256 probe work,
-   not a load-bearing fixture, and deleting it breaks nothing.
+   1,704 bytes, `-----BEGIN PRIVATE KEY-----`, tracked, committed in
+   `bb76e67 "errors and jwt work"`, referenced by nothing — no `.cyr`, `.tcyr`,
+   `.bcyr`, `.sh`, `.yml` or doc.
 
-   ⚠ **Deleting the file does not remove the key** — it is in git history from
-   `bb76e67`. Whether that warrants a history rewrite is the maintainer's call;
-   agnosai never signs, so nothing in the port needs a private key at all.
+   **Verified unneeded before removal**, three ways: it is not the oracle's
+   fixture (sha256 `36c3a7e2…` vs `a5cdfea6…` for
+   `rust-old/tests/fixtures/test_rsa_private.pem`); its public half does not
+   match the frozen vectors agnosai verifies against (`…AQEAlv/hFeMqWBO6…` vs
+   `…AQEA5Wu/jjUwgB2e1/Bn…` in `tests/server_auth_vectors.cyr`); and both auth
+   suites pass without it — **133 + 9 assertions, 0 failures**.
+
+   ⚠ **Deleting the file does not remove the key.** It is reachable from
+   `bb76e67` for anyone who clones. Whether that warrants a history rewrite is a
+   maintainer decision and is **still open**. Nothing in the port needs a private
+   key at all: agnosai never signs, it only verifies, and the one keypair any
+   test needs is baked into `tests/server_auth_vectors.cyr` as frozen RS256
+   vectors precisely so no key file has to exist.
+
+   `.gitignore` now carries `*.pem` / `*.key` with that reasoning, since agnosai
+   has **no** legitimate PEM in the tree — so a future one is always debris.
 
    Also noticed alongside it, both cosmetic and both non-`src`-surface work:
    README's Quick Start is still Rust-era (`cargo build`,
    `cargo run --bin agnosai-server`, `make check`) against a tree with no root
-   `Cargo.toml`, and `.gitignore` is the Rust-era file apart from its `/build/`
-   line — it still ignores `/target`, `**/*.rs.bk`, `criterion/`, `*.profraw` and
+   `Cargo.toml`, and `.gitignore` is otherwise the Rust-era file — it still
+   ignores `/target`, `**/*.rs.bk`, `criterion/`, `*.profraw` and
    `tarpaulin-report.*`.
 
 1. **35 duplicate-fn warnings at build, none from `src/` — all benign today, but know the rule.**

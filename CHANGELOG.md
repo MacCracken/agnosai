@@ -1079,6 +1079,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     than as literals, so the bit patterns match what Rust's literal parse
     produces.
 
+### Removed
+
+- **`probe_key_tmp.pem` — a live RSA private key committed at the repo root.**
+  1,704 bytes, tracked, committed in `bb76e67 "errors and jwt work"`, and
+  referenced by **nothing** in the tree.
+
+  Verified unneeded three ways before removal: it is not the oracle's fixture
+  (sha256 `36c3a7e2…` vs `a5cdfea6…`), its public half does not match the frozen
+  vectors agnosai verifies against (`…AQEAlv/hFeMqWBO6…` vs
+  `…AQEA5Wu/jjUwgB2e1/Bn…`), and both auth suites pass without it — **133 + 9
+  assertions, 0 failures**.
+
+  ⚠ **Deleting the file does not remove the key**; it is reachable from
+  `bb76e67` for anyone who clones. A history rewrite is a maintainer decision and
+  is not taken here.
+
+  agnosai never signs — it only verifies — and the one keypair any test needs is
+  baked into `tests/server_auth_vectors.cyr` as frozen RS256 vectors precisely so
+  that no key file has to exist. `.gitignore` now carries `*.pem` / `*.key` with
+  that reasoning, since a PEM in this tree is always debris.
+
 ### Changed
 
 - **The cleanliness gate and CI now cover `benches/`.** `scripts/check-clean.sh`
