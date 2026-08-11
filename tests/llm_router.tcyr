@@ -134,6 +134,72 @@ fn main() {
     str_from("{\"task_type\":\"code\",\"complexity\":\"complex\"}")) == 1,
     "task profile serializes in declaration order");
 
+    # --- hwaccel ----------------------------------------------------------
+    # The oracle's `mod hwaccel_tests`, all three, plus what they leave open.
+    # Both fns are one-line delegations into ai-hwaccel, so what is worth
+    # asserting is the WIRING — argument order, which overload, which units —
+    # not the policy, which is the vendored library's and has its own tests.
+    test_group("llm_router hwaccel");
+
+    # The oracle's suggest_quantization_small_model_high_vram: a 7B model with
+    # an 80 GB GPU easily fits at FP16 or better.
+    var big = hw_registry_new();
+    reg_add_profile(big, profile_cpu(64 * 1024 * 1024 * 1024));
+    reg_add_profile(big, profile_cuda(0, 80 * 1024 * 1024 * 1024));
+    assert(quant_bits(agnosai_suggest_quantization(7000000000, big)) >= 16,
+    "a 7B model on 80 GB gets at least FP16");
+
+    # The oracle's suggest_quantization_large_model_small_vram: 70B at FP16 is
+    # ~140 GB against 24 GB, so it must quantize below FP16.
+    var small = hw_registry_new();
+    reg_add_profile(small, profile_cpu(32 * 1024 * 1024 * 1024));
+    reg_add_profile(small, profile_cuda(0, 24 * 1024 * 1024 * 1024));
+    assert(quant_bits(agnosai_suggest_quantization(70000000000, small)) < 16,
+    "a 70B model on 24 GB is quantized below FP16");
+
+    # ⚠ ARGUMENT ORDER. The oracle is `suggest_quantization(model_params,
+    # registry)` and ai-hwaccel's `reg_suggest_quant` is `(registry,
+    # model_params)`. Cyrius types neither parameter, so passing them straight
+    # through COMPILES and then reads a parameter count as a registry struct.
+    # The two registries above differ only in VRAM, so a swapped call cannot
+    # tell them apart — this asserts the two answers actually differ, which is
+    # only true if the registry reached the library.
+    assert(quant_bits(agnosai_suggest_quantization(70000000000, big))
+    > quant_bits(agnosai_suggest_quantization(70000000000, small)),
+    "the same model quantizes less aggressively on the bigger registry");
+
+    # An empty registry is still answerable — ai-hwaccel falls back rather than
+    # faulting, and a caller that has not run detection must not crash.
+    assert(quant_bits(agnosai_suggest_quantization(7000000000, hw_registry_new())) > 0,
+    "an empty registry still yields a quantization level");
+
+    # The oracle's estimate_model_memory_scales_with_quantization.
+    var fp32 = agnosai_estimate_model_memory(7000000000, QUANT_NONE);
+    var fp16 = agnosai_estimate_model_memory(7000000000, QUANT_FP16);
+    var int4 = agnosai_estimate_model_memory(7000000000, QUANT_INT4);
+    assert(fp32 > fp16, "FP32 needs more memory than FP16");
+    assert(fp16 > int4, "FP16 needs more memory than INT4");
+
+    # Past the oracle, which asserts only the ordering:
+    # ⚠ the estimate INCLUDES ai-hwaccel's activation/KV-cache overhead.
+    # `reg_estimate_memory` is `quant_model_bytes_with_overhead`, and the bare
+    # `quant_model_bytes` sitting next to it is weights only — a plausible
+    # wrong pick that still satisfies every ordering assertion above.
+    assert(fp32 > quant_model_bytes(7000000000, QUANT_NONE),
+    "the estimate is the WITH-OVERHEAD form, not raw weight bytes");
+    assert_eq(fp16, quant_model_bytes_with_overhead(7000000000, QUANT_FP16),
+    "and it is exactly that form");
+
+    # It is an ASSOCIATED fn — no registry, so hardware cannot change it.
+    assert_eq(agnosai_estimate_model_memory(7000000000, QUANT_FP16), fp16,
+    "the estimate does not depend on any registry");
+
+    # A zero-parameter model costs nothing, and the estimate scales with size.
+    assert_eq(agnosai_estimate_model_memory(0, QUANT_FP16), 0,
+    "a zero-parameter model estimates zero");
+    assert(agnosai_estimate_model_memory(14000000000, QUANT_FP16) > fp16,
+    "and a bigger model estimates more");
+
     return assert_summary();
 }
 

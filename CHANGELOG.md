@@ -96,6 +96,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M11 is COMPLETE — all six bites.** Both `hwaccel` halves,
+  `tools/python_tool`, `sandbox/wasm`, `tools/wasm_tool`, `tools/wasm_loader`:
+  **48 mutation probes, 48 kills**.
+
+  ⚠ **`sandbox/wasm.rs` was not in M11's scope until this work.**
+  `src/sandbox/mod.cyr` called it "excluded rather than postponed … WASM as a
+  format is an explicit cyrius non-goal", which ADR-006's own 2026-08-07
+  correction had already overturned. 521 lines and 11 oracle tests.
+
+  **The transport took three upstream round trips to settle**, all of them
+  consumed rather than merely filed:
+
+  - **kavach 3.11.8** — [ADR 006](docs/adr/006-cx-tool-sandbox.md)'s correction
+    named kavach's wasmtime backend, and against 3.11.7 that backend was
+    hardcoded unavailable, had **no stdin channel**, and reported every guest
+    failure as a **success with empty stderr**. The oracle's whole contract is
+    JSON on stdin and a meaningful exit code, so a WASM tool that cannot be
+    given parameters is not a port of that file. Fixed upstream; agnosai pins
+    3.11.8 as a **floor**.
+  - **sankoch 2.7.7** — `zip_bound` replaced the copy of sankoch's record layout
+    that `definitions/packaging` had been carrying, and `zip_last_error()` makes
+    an encrypted archive say so instead of being indistinguishable from
+    corruption ([ADR 018](docs/adr/018-sankoch-path-check-on-import.md) point 6).
+  - **cyrius 6.5.17** — `distlib`'s self-check compiled a bundle without the
+    stdlib leaves it had just written to the sidecar, which made kavach's
+    release CI red for a reason that was not in kavach.
+
+  [ADR 019](docs/adr/019-wasm-tools-spawn-wasmtime-directly.md) records the
+  transport, including the direct-`wasmtime` decision it superseded within a day
+  once 3.11.8 landed.
+
+  Behaviours pinned that no oracle test reaches:
+
+  - **The accelerator mapping is not a pass-through**, though it reads like one:
+    `ACCEL_TPU = 8` against `AGNOSAI_ACCEL_TPU = 5`, so a bare cast is right five
+    times of six and silently turns every TPU into an Intel NPU.
+  - **`suggest_quantization`'s argument order is flipped** against the oracle;
+    Cyrius types neither parameter, so passing them straight through compiles
+    and reads a parameter count as a registry struct. That mutant segfaults.
+  - **`fits_in` sums device VRAM only**, so 512 GB of RAM with no GPU fits
+    nothing — and ai-hwaccel answers training memory in **x1000 fixed point**,
+    so storing it raw makes a 14 GB model read 14000 while every ordering
+    assertion still passes.
+  - **A timeout that reports exit 0 is still a timeout.** The only input where
+    the classifier's first two checks are distinguishable, and the one that
+    matters: reversed, a run killed at the deadline reads as a clean success.
+  - **A guest's own `proc_exit(n)` survives** — mapping every non-zero code onto
+    the trap sentinel would erase it.
+  - **`load_module` validates magic AND version**, because a CLI cannot
+    pre-compile: a magic-only check accepts a version-2 module and defers the
+    failure to an exec-time trap.
+  - **The `.wasm` filename comes from the manifest's name, not the
+    directory's** — every oracle fixture has the two agree.
+  - **`load_tool_package` propagates and `load_all_tool_packages` swallows**, so
+    one broken package in a directory is a count that is quietly one lower.
+  - **`version` defaults to `"0.0.0"`, `parameters` to empty, `name` and
+    `description` are required** — four fields, three policies.
+  - **Non-JSON stdout is untrimmed here and trimmed in `python_tool`.** The two
+    result ladders are otherwise the same decoder; that is the second instance,
+    and CLAUDE.md says extract at the third.
+
+  ⚠ **`wasmtime` is a host requirement and is not installed on this box**, so
+  the end-to-end arm is guarded. Everything else is reachable without it,
+  because each piece was split out of its caller for exactly that reason — and
+  a mutant emitting the bare parameter map instead of the SDK's
+  `{"parameters": …}` wrapper survived every assertion until the marshalling was
+  split out too.
+
+- **M11, three of six bites: the `hwaccel` halves of `llm/router` and
+  `core/resource`, and `tools/python_tool`.** 25 mutation probes, 25 kills.
+
+  ⚠ **The accelerator-type mapping is not a pass-through, and it looks like
+  one.** ai-hwaccel numbers `ACCEL_TPU = 8` while `AGNOSAI_ACCEL_TPU = 5`;
+  CPU/CUDA/ROCm/Metal/Vulkan are 0-4 on both sides, so a bare cast is right five
+  times out of six and silently turns every TPU into an Intel NPU. All thirteen
+  unmapped ai-hwaccel variants clamp to CPU — deliberately, so an NPU still
+  matches CPU work and never matches a GPU requirement it cannot serve.
+
+  ⚠ **`suggest_quantization`'s argument order is FLIPPED against the oracle.**
+  Rust takes `(model_params, registry)` and ai-hwaccel's `reg_suggest_quant`
+  takes `(registry, model_params)`. Cyrius types neither parameter, so passing
+  them straight through compiles and then reads a parameter count as a registry
+  struct — the mutant for it segfaults rather than failing an assertion.
+
+  ⚠ **`HardwareInventory::from_hwaccel` does not make the CPU profile a
+  device.** It is diverted into `memory_total_mb` + `cpu_cores` and skipped, so
+  a CPU-only registry yields zero devices — and `index` is the *registry*
+  position, not a running device count, so the first real device is index 1 with
+  a gap at 0. `TrainingMemoryEstimate::fits_in` then sums **device VRAM only**:
+  a machine with 512 GB of RAM and no GPU fits nothing, which is correct and is
+  one field away from being wrong.
+
+  Units are the other trap: ai-hwaccel answers training memory in **x1000
+  fixed-point** integers, so storing them raw makes a 14 GB model read 14000 —
+  and every ordering assertion still passes, because the scale is uniform.
+
+  `python_tool` is an adapter over `src/sandbox/python.cyr`, which M7 already
+  ported whole. ⚠ **Seven of its ten oracle tests never call
+  `PythonTool::execute`** — they re-implement the result ladder inline against
+  serde_json and assert on that copy, so upstream they would pass against a
+  completely broken `execute`, which has no end-to-end test at all. The ladder
+  is split into `agnosai_python_tool_output_of` so those assertions run against
+  the real code, and an end-to-end test against a live `python3` is added.
+  Reproduced rather than fixed: a non-zero exit **shadows** the structured error
+  the shipped bridge actually sends, `success` defaults to true even when it is
+  not a boolean, an absent `result` means the whole value but a present JSON
+  null does not, non-JSON stdout is a **success**, and the sandbox error prefix
+  **doubles** (`"python sandbox error: sandbox error: …"`).
+
+  Two stale exclusions retired with this work: `src/tools/mod.cyr`'s "deferred
+  with their features … WASM as a format is an explicit cyrius non-goal", and
+  the matching claim in `src/core/resource.cyr` and `src/llm/router.cyr`.
+
 - **M10 `definitions` is COMPLETE — all six modules, all 1,460 oracle lines.**
   `versioning`, `assembler`, `k8s_crd`, `loader`, the eighteen built-in presets
   and `packaging`: **560 assertions** across six suites, all 43 of the oracle's

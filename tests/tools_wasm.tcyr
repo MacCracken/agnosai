@@ -1,0 +1,407 @@
+# =========================================================================
+# tools_wasm.tcyr — tests for src/tools/wasm_tool.cyr and wasm_loader.cyr
+#
+# Oracle test blocks: rust-old/src/tools/wasm_tool.rs (7) and
+# rust-old/src/tools/wasm_loader.rs (3). One suite because the loader's whole
+# job is to produce the tool, and every loader test needs a module.
+#
+# ⚠ `wasmtime` is not installed here, so nothing EXECUTES. That bounds what can
+# be asserted, not what can be tested: the manifest parse, the serde defaults,
+# the `<name>.wasm` resolution, both error policies, the schema and the entire
+# result ladder are all reachable without a runtime — the ladder because it is
+# split out of `execute` and fed stdout as data, which is also how the oracle's
+# own tests reach it.
+#
+# What is pinned past the oracle:
+#
+#   * **the `.wasm` stem comes from the MANIFEST's name, not the directory's.**
+#     Every oracle fixture has them agree, so no upstream test can see it.
+#   * **`version` defaults to "0.0.0" and `parameters` to empty**, while `name`
+#     and `description` are required — four fields, three different policies.
+#   * **`load_tool_package` propagates and `load_all_tool_packages` swallows.**
+#     One broken package in a directory is a count that is quietly one lower.
+#   * **non-JSON stdout is UNTRIMMED here** and trimmed in `python_tool` — the
+#     two ladders differ in exactly that one place.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/core/mod.cyr"
+include "src/telemetry/mod.cyr"
+include "src/definitions/presets_data.cyr"
+include "src/definitions/loader.cyr"
+include "src/sandbox/mod.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tools/wasm_tool.cyr"
+include "src/tools/wasm_loader.cyr"
+include "tests/test_helpers.cyr"
+
+var _T_ROOT = "/tmp/agnosai-tools-wasm-test";
+
+fn _t_seq(a: Str, b: Str, name): i64 {
+    return assert(str_eq(a, b), name);
+}
+
+fn _t_join(a: Str, b: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, a);
+    str_builder_add(sb, b);
+    return str_builder_build(sb);
+}
+
+fn _t_under(suffix): i64 {
+    return _t_join(str_from(_T_ROOT), str_from(suffix));
+}
+
+# The eight-byte WASM header — a valid module for everything that does not run.
+fn _t_wasm_bytes(): i64 {
+    var b = alloc(8);
+    store8(b + 0, 0);
+    store8(b + 1, 97);
+    store8(b + 2, 115);
+    store8(b + 3, 109);
+    store8(b + 4, 1);
+    store8(b + 5, 0);
+    store8(b + 6, 0);
+    store8(b + 7, 0);
+    return b;
+}
+
+# Write an eight-byte module at `path`.
+fn _t_write_wasm(path: Str): i64 {
+    return file_write_all(str_data(path), _t_wasm_bytes(), 8);
+}
+
+# Write a text file at `path`.
+fn _t_write(path: Str, body): i64 {
+    var s = str_from(body);
+    return file_write_all(str_data(path), str_data(s), str_len(s));
+}
+
+# The oracle's `sample_manifest`: "test_tool" / "A test WASM tool" / one
+# required string parameter "input".
+fn _t_sample_params(): i64 {
+    var params = vec_new();
+    vec_push(params, agnosai_param_schema_new(str_from("input"),
+    str_from("The input value"), str_from("string"), 1));
+    return params;
+}
+
+# The ladder's answer for a stdout string at exit 0.
+fn _t_out(stdout): i64 {
+    return agnosai_wasm_tool_output_of(str_from(stdout), 0);
+}
+
+fn main(): i64 {
+    var err = 0;
+    store64(&err, 0);
+
+    # --- the manifest parse, and its three field policies ------------------
+    var full = agnosai_wasm_pkg_from_json(str_from(
+    "{\"name\":\"hello\",\"description\":\"greets\",\"version\":\"1.0.0\",\"parameters\":[]}"));
+    assert_neq(full, 0, "a complete manifest parses");
+    _t_seq(agnosai_wasm_pkg_name(full), str_from("hello"), "name round-trips");
+    _t_seq(agnosai_wasm_pkg_description(full), str_from("greets"), "description too");
+    _t_seq(agnosai_wasm_pkg_version(full), str_from("1.0.0"), "and an explicit version");
+    assert_eq(vec_len(agnosai_wasm_pkg_parameters(full)), 0, "with no parameters");
+
+    # ⚠ `version` DEFAULTS to "0.0.0" — `#[serde(default = "default_version")]`.
+    # Absent is not an error and not an empty string.
+    var nover = agnosai_wasm_pkg_from_json(str_from(
+    "{\"name\":\"h\",\"description\":\"d\"}"));
+    assert_neq(nover, 0, "a manifest without `version` still parses");
+    _t_seq(agnosai_wasm_pkg_version(nover), str_from("0.0.0"),
+    "defaulting to 0.0.0, not to empty");
+    assert_eq(vec_len(agnosai_wasm_pkg_parameters(nover)), 0,
+    "and absent `parameters` is an empty list");
+
+    # ...while `name` and `description` have no default and ARE required.
+    assert_eq(agnosai_wasm_pkg_from_json(str_from("{\"description\":\"d\"}")), 0,
+    "a manifest without `name` is refused");
+    assert_eq(agnosai_wasm_pkg_from_json(str_from("{\"name\":\"h\"}")), 0,
+    "and one without `description`");
+    assert_eq(agnosai_wasm_pkg_from_json(str_from("{ not json")), 0,
+    "and unparseable text");
+    assert_eq(agnosai_wasm_pkg_from_json(str_from("[1,2]")), 0, "and a JSON array");
+
+    # A real parameter list is read whole.
+    var withp = agnosai_wasm_pkg_from_json(str_cat(
+    str_from("{\"name\":\"n\",\"description\":\"d\",\"parameters\":[{\"name\":\"who\","),
+    str_from("\"description\":\"target\",\"param_type\":\"string\",\"required\":false}]}")));
+    assert_neq(withp, 0, "a manifest with a parameter parses");
+    assert_eq(vec_len(agnosai_wasm_pkg_parameters(withp)), 1, "with the parameter");
+    var p0 = vec_get(agnosai_wasm_pkg_parameters(withp), 0);
+    _t_seq(agnosai_param_schema_name(p0), str_from("who"), "named");
+    _t_seq(agnosai_param_schema_type(p0), str_from("string"), "typed");
+    assert_eq(agnosai_param_schema_required(p0), 0, "and NOT required, as declared");
+
+    # ⚠ A malformed parameter fails the WHOLE manifest — `ParameterSchema` has
+    # no serde defaults, so it is not skipped the way a bad `tools` entry is in
+    # `agnosai_agent_from_value`.
+    assert_eq(agnosai_wasm_pkg_from_json(str_from(
+    "{\"name\":\"n\",\"description\":\"d\",\"parameters\":[{\"name\":\"who\"}]}")), 0,
+    "one malformed parameter rejects the ENTIRE manifest");
+
+    # --- the tool itself: the oracle's wasm_tool tests ---------------------
+    store64(&err, 0);
+    var tool = agnosai_wasm_tool_from_bytes(str_from("test_tool"),
+    str_from("A test WASM tool"), _t_sample_params(), _t_wasm_bytes(), 8, &err);
+    assert_neq(tool, 0, "a tool builds from module bytes");
+    _t_seq(agnosai_tool_name(tool), str_from("test_tool"), "carrying its name");
+    _t_seq(agnosai_tool_description(tool), str_from("A test WASM tool"),
+    "and its description");
+
+    var schema = agnosai_tool_schema(tool);
+    _t_seq(agnosai_tool_schema_name(schema), str_from("test_tool"), "the schema's name");
+    assert_eq(vec_len(agnosai_tool_schema_parameters(schema)), 1, "and its parameter");
+    var sp = vec_get(agnosai_tool_schema_parameters(schema), 0);
+    _t_seq(agnosai_param_schema_name(sp), str_from("input"), "named input");
+    assert_eq(agnosai_param_schema_required(sp), 1, "and required");
+    # The schema COPIES, as python_tool's does, because schema_fp runs in an arena.
+    assert_neq(vec_get(agnosai_tool_schema_parameters(agnosai_tool_schema(tool)), 0), sp,
+    "each schema build mints its own parameter objects");
+
+    # The ctx accessors round-trip, and the module is the one that was loaded.
+    var tctx = agnosai_tool_ctx(tool);
+    assert_neq(agnosai_wasm_tool_module(tctx), 0, "the ctx holds its module");
+    assert_eq(agnosai_wasm_module_len(agnosai_wasm_tool_module(tctx)), 8,
+    "the eight-byte one it was built from");
+    assert_eq(vec_len(agnosai_wasm_tool_parameters(tctx)), 1,
+    "and the parameter list it was given");
+
+    # ⚠ The sandbox is a process GLOBAL here, where the oracle threads an
+    # `Arc<WasmSandbox>` into every tool. It defaults on first use and is
+    # replaceable, which is how a caller sets non-default limits for every tool
+    # at once — `wasm_loader` builds a whole directory against one of them.
+    var default_sb = agnosai_wasm_tool_sandbox();
+    assert_neq(default_sb, 0, "the tool sandbox defaults on first use");
+    assert_eq(agnosai_wasm_sandbox_timeout_ms(default_sb), 30000,
+    "to the oracle's defaults");
+    assert_eq(agnosai_wasm_tool_sandbox(), default_sb,
+    "and is the SAME sandbox on a second call, not a fresh one per tool");
+
+    var replacement = agnosai_wasm_sandbox_with_limits(1048576, 5000);
+    agnosai_wasm_tool_set_sandbox(replacement);
+    assert_eq(agnosai_wasm_tool_sandbox(), replacement, "and is replaceable");
+    assert_eq(agnosai_wasm_sandbox_timeout_ms(agnosai_wasm_tool_sandbox()), 5000,
+    "so a caller can set limits for every tool at once");
+    agnosai_wasm_tool_set_sandbox(default_sb);
+
+    # A tool can also be built from an already-loaded module.
+    store64(&err, 0);
+    var premod = agnosai_wasm_load_module(agnosai_wasm_tool_sandbox(),
+    _t_wasm_bytes(), 8, &err);
+    assert_neq(premod, 0, "a module loads on its own");
+    var pretool = agnosai_wasm_tool(str_from("pre"), str_from("prebuilt"),
+    vec_new(), premod);
+    _t_seq(agnosai_tool_name(pretool), str_from("pre"),
+    "and a tool wraps it without re-reading the bytes");
+    assert_eq(agnosai_wasm_tool_module(agnosai_tool_ctx(pretool)), premod,
+    "keeping the very module it was handed");
+
+    # ⚠ Bad bytes do not build a tool, and the message is the sandbox's.
+    store64(&err, 0);
+    var junk = str_from("not wasm");
+    assert_eq(agnosai_wasm_tool_from_bytes(str_from("x"), str_from("y"), vec_new(),
+    str_data(junk), str_len(junk), &err), 0, "non-WASM bytes do not build a tool");
+    assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "expected"), 1,
+    "with the loader's own message");
+
+    # --- the result ladder ------------------------------------------------
+    var ok1 = _t_out("{\"result\":\"ok\",\"success\":true}");
+    assert_eq(agnosai_tool_output_success(ok1), 1, "an explicit success is a success");
+    _t_seq(bayan_json_v_str(agnosai_tool_output_result(ok1)), str_from("ok"),
+    "and `result` is extracted");
+
+    var bad1 = _t_out("{\"success\":false,\"error\":\"boom\"}");
+    assert_eq(agnosai_tool_output_success(bad1), 0, "an explicit failure fails");
+    _t_seq(agnosai_tool_output_error(bad1), str_from("boom"), "with its own message");
+
+    assert_eq(agnosai_tool_output_success(_t_out("{\"result\":{\"k\":\"v\"}}")), 1,
+    "an ABSENT `success` defaults to TRUE");
+    assert_eq(agnosai_tool_output_success(_t_out("{\"success\":\"yes\",\"result\":1}")), 1,
+    "and a NON-BOOLEAN one also defaults true");
+    _t_seq(agnosai_tool_output_error(_t_out("{\"success\":false}")),
+    str_from("unknown error"), "a failure with no `error` reads `unknown error`");
+    assert_neq(bayan_json_v_obj_get(agnosai_tool_output_result(
+    _t_out("{\"data\":\"x\"}")), "data"), 0,
+    "no `result` key means the WHOLE value");
+    assert_eq(bayan_json_v_is_null(agnosai_tool_output_result(
+    _t_out("{\"result\":null,\"success\":true}"))), 1,
+    "while a PRESENT null result is null, not the object");
+
+    # ⚠ Non-JSON stdout is a SUCCESS and is **UNTRIMMED** — `wasm_tool.rs:118`
+    # is `Value::String(result.stdout)` with no `.trim()`, where `python_tool`
+    # trims. The two ladders differ in exactly this one place.
+    var raw = _t_out("plain text\n");
+    assert_eq(agnosai_tool_output_success(raw), 1, "non-JSON stdout is a SUCCESS");
+    _t_seq(bayan_json_v_str(agnosai_tool_output_result(raw)), str_from("plain text\n"),
+    "carrying the raw text with its trailing newline INTACT, unlike python_tool");
+
+    # ⚠ A non-zero exit is the whole failure surface: a trap, exhausted fuel and
+    # a deadline all arrive as a negative code and the message prints the code
+    # rather than naming which.
+    _t_seq(agnosai_tool_output_error(agnosai_wasm_tool_output_of(str_from(""), 0 - 2)),
+    str_from("WASM module exited with code -2"),
+    "a fuel exhaustion reads as its raw code, not as 'out of fuel'");
+    _t_seq(agnosai_tool_output_error(agnosai_wasm_tool_output_of(str_from("part"), 1)),
+    str_from("WASM module exited with code 1"),
+    "and a non-zero exit shadows whatever stdout held");
+
+    # ⚠ The stdin payload is `{"parameters": …}`, **not the bare map** — the
+    # wire format `sdk/agnosai-tool-sdk` publishes. Reachable only because the
+    # marshalling is split out of `execute`, which cannot run without a runtime.
+    var input = agnosai_tool_input_new();
+    agnosai_tool_input_set(input, str_from("who"), bayan_json_v_str_new(str_from("world")));
+    var payload = agnosai_wasm_tool_input_payload(input);
+    var reparsed = bayan_json_v_parse_buf(str_data(payload), str_len(payload));
+    assert_neq(reparsed, 0, "the stdin payload is JSON");
+    var wrapped = bayan_json_v_obj_get(reparsed, "parameters");
+    assert_neq(wrapped, 0, "wrapped in a `parameters` object, as the SDK expects");
+    _t_seq(bayan_json_v_str(bayan_json_v_obj_get(wrapped, "who")), str_from("world"),
+    "with the caller's arguments inside it");
+    # ⚠ The arguments must NOT be at the top level — that is the shape a dropped
+    # wrapper produces, and every SDK tool would then see no parameters at all.
+    assert_eq(bayan_json_v_obj_get(reparsed, "who"), 0,
+    "and NOT at the top level, which is what dropping the wrapper looks like");
+    # An empty input still produces the wrapper rather than an empty document.
+    assert_neq(bayan_json_v_obj_get(bayan_json_v_parse_buf(
+    str_data(agnosai_wasm_tool_input_payload(agnosai_tool_input_new())),
+    str_len(agnosai_wasm_tool_input_payload(agnosai_tool_input_new()))),
+    "parameters"), 0, "and an empty input still carries the wrapper");
+
+    # --- the loader ---------------------------------------------------------
+    sys_mkdir(_T_ROOT, 0x1FF);
+
+    # A well-formed package.
+    var pkg1 = _t_under("/hello");
+    sys_mkdir(str_data(pkg1), 0x1FF);
+    _t_write(_t_join(pkg1, str_from("/manifest.json")),
+    "{\"name\":\"hello\",\"description\":\"greets\",\"version\":\"1.0.0\"}");
+    _t_write_wasm(_t_join(pkg1, str_from("/hello.wasm")));
+
+    store64(&err, 0);
+    var loaded = agnosai_wasm_load_tool_package(pkg1, &err);
+    assert_neq(loaded, 0, "a well-formed package loads");
+    _t_seq(agnosai_tool_name(loaded), str_from("hello"), "as a tool named by its manifest");
+
+    # ⚠ The `.wasm` stem is the MANIFEST's name, not the directory's. This
+    # package is `mismatch/` with manifest name `greet`, and only `greet.wasm`
+    # is looked for — `mismatch.wasm` beside it is ignored. Every oracle fixture
+    # has the two agree, so nothing upstream covers this.
+    var pkg2 = _t_under("/mismatch");
+    sys_mkdir(str_data(pkg2), 0x1FF);
+    _t_write(_t_join(pkg2, str_from("/manifest.json")),
+    "{\"name\":\"greet\",\"description\":\"d\"}");
+    _t_write_wasm(_t_join(pkg2, str_from("/mismatch.wasm")));
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_tool_package(pkg2, &err), 0,
+    "a package whose .wasm is named after the DIRECTORY does not load");
+    _t_write_wasm(_t_join(pkg2, str_from("/greet.wasm")));
+    store64(&err, 0);
+    assert_neq(agnosai_wasm_load_tool_package(pkg2, &err), 0,
+    "and does once the MANIFEST-named file exists");
+
+    # --- Oracle: load_tool_package_missing_manifest -----------------------
+    var empty = _t_under("/empty");
+    sys_mkdir(str_data(empty), 0x1FF);
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_tool_package(empty, &err), 0,
+    "a directory with no manifest does not load");
+    # ⚠ InvalidDefinition, not Io — the oracle maps the read failure rather than
+    # letting `?` pass an io::Error through.
+    assert_eq(agnosai_error_kind(load64(&err)), AGNOSAI_ERR_INVALID_DEFINITION,
+    "reporting InvalidDefinition, not the Io the read produced");
+
+    # --- Oracle: load_tool_package_missing_wasm ---------------------------
+    var nowasm = _t_under("/nowasm");
+    sys_mkdir(str_data(nowasm), 0x1FF);
+    _t_write(_t_join(nowasm, str_from("/manifest.json")),
+    "{\"name\":\"test\",\"description\":\"test\",\"parameters\":[]}");
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_tool_package(nowasm, &err), 0,
+    "a manifest with no module does not load");
+    assert_eq(agnosai_error_kind(load64(&err)), AGNOSAI_ERR_INVALID_DEFINITION,
+    "also InvalidDefinition");
+
+    # A malformed manifest is a Serialization error, distinct from both.
+    var badman = _t_under("/badman");
+    sys_mkdir(str_data(badman), 0x1FF);
+    _t_write(_t_join(badman, str_from("/manifest.json")), "{ not json");
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_tool_package(badman, &err), 0,
+    "a malformed manifest does not load");
+    assert_eq(agnosai_error_kind(load64(&err)), AGNOSAI_ERR_SERIALIZATION,
+    "as a Serialization error, distinct from a missing file");
+
+    # --- Oracle: load_all_empty_dir ---------------------------------------
+    var emptydir = _t_under("/none");
+    sys_mkdir(str_data(emptydir), 0x1FF);
+    var reg0 = agnosai_tool_registry_new();
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_all_tool_packages(emptydir, reg0, &err), 0,
+    "an empty directory registers nothing");
+    assert_eq(load64(&err), 0, "and is not an error");
+
+    # A missing directory IS an error, and is told apart from an empty one.
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_all_tool_packages(_t_under("/no-such"), reg0, &err),
+    0 - 1, "a MISSING directory answers -1");
+    assert_eq(agnosai_error_kind(load64(&err)), AGNOSAI_ERR_IO, "with an Io error");
+
+    # --- the two error policies, side by side -----------------------------
+    # ⚠ `load_all` LOGS AND SKIPS what `load_tool_package` PROPAGATES. The
+    # directory below holds one good package and two broken ones; the count is
+    # 1 and no error reaches the caller.
+    var reg = agnosai_tool_registry_new();
+    store64(&err, 0);
+    var n = agnosai_wasm_load_all_tool_packages(str_from(_T_ROOT), reg, &err);
+    assert_eq(load64(&err), 0,
+    "a directory with broken packages is NOT an error to the caller");
+    assert_eq(n, 2, "and the count silently omits them");
+    assert_neq(agnosai_tool_registry_get(reg, str_from("hello")), 0,
+    "the good package registered");
+    assert_eq(agnosai_tool_registry_get(reg, str_from("test")), 0,
+    "and the module-less one did not");
+
+    # ⚠ A subdirectory with no manifest is skipped SILENTLY — before a load is
+    # attempted, so it is not even a warning. `/empty` above is exactly that,
+    # and it did not contribute to the count or to any error.
+    assert_eq(file_exists(str_data(_t_join(empty, str_from("/manifest.json")))), 0,
+    "the manifest-less directory really has no manifest");
+
+    # A plain FILE in the tools directory is skipped too, not treated as a package.
+    _t_write(_t_under("/README.md"), "not a package");
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_all_tool_packages(str_from(_T_ROOT),
+    agnosai_tool_registry_new(), &err), 2,
+    "a loose file in the tools directory is skipped, not counted");
+
+    # --- teardown -----------------------------------------------------------
+    sys_unlink(str_data(_t_join(pkg1, str_from("/manifest.json"))));
+    sys_unlink(str_data(_t_join(pkg1, str_from("/hello.wasm"))));
+    sys_unlink(str_data(_t_join(pkg2, str_from("/manifest.json"))));
+    sys_unlink(str_data(_t_join(pkg2, str_from("/mismatch.wasm"))));
+    sys_unlink(str_data(_t_join(pkg2, str_from("/greet.wasm"))));
+    sys_unlink(str_data(_t_join(nowasm, str_from("/manifest.json"))));
+    sys_unlink(str_data(_t_join(badman, str_from("/manifest.json"))));
+    sys_unlink(str_data(_t_under("/README.md")));
+    sys_rmdir(str_data(pkg1));
+    sys_rmdir(str_data(pkg2));
+    sys_rmdir(str_data(empty));
+    sys_rmdir(str_data(nowasm));
+    sys_rmdir(str_data(badman));
+    sys_rmdir(str_data(emptydir));
+    sys_rmdir(_T_ROOT);
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

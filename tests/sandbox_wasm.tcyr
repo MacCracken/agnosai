@@ -1,0 +1,261 @@
+# =========================================================================
+# sandbox_wasm.tcyr — tests for src/sandbox/wasm.cyr
+#
+# Oracle test block: rust-old/src/sandbox/wasm.rs, eleven `#[test]`s. Six port
+# directly; five need a real `wasmtime` to execute anything and are guarded.
+#
+# ⚠ **`wasmtime` is not installed on this box**, so the guarded five do not run
+# here — and the arm that DOES run is a real assertion, not a skip: with no
+# runtime, `agnosai_wasm_available()` is 0 and `execute` must return a `Sandbox`
+# error naming the binary rather than half-working. The loud-skip guard below
+# is the same shape `tests/sandbox_python.tcyr` uses: if a runtime is
+# demonstrably present, the guarded tests MUST have run.
+#
+# ⚠ **No `.wasm` fixture exists anywhere in this repo**, and none can be
+# compiled here — `rustup target list --installed` has only the host. The
+# oracle builds its modules from inline WAT via the `wat` dev-dep. So the
+# fixtures here are **hand-encoded byte literals**: an 8-byte header for
+# everything the loader and validator need, and a minimal `_start` module for
+# the execute path.
+#
+# What is pinned past the oracle:
+#
+#   * **the header check is the WHOLE header**, magic AND version. A magic-only
+#     check accepts a version-2 module that wasmtime will refuse later.
+#   * **`load_module_from_file` re-validates.** A caller must not be able to
+#     make the sandbox execute an arbitrary path it never proved was WASM.
+#   * **the exit taxonomy.** `-1` deadline, `-2` fuel, `-3` trap — and a guest's
+#     OWN `proc_exit(n)` passes through as `n`, which a blanket "non-zero is -3"
+#     would erase. The classifier is fed captured stderr as data, so this is
+#     testable without a runtime.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/presets_data.cyr"
+include "src/definitions/loader.cyr"
+include "src/sandbox/mod.cyr"
+include "tests/test_helpers.cyr"
+
+var _T_ROOT = "/tmp/agnosai-sandbox-wasm-test";
+
+# Assert two Strs are equal.
+fn _t_seq(a: Str, b: Str, name): i64 {
+    return assert(str_eq(a, b), name);
+}
+
+# Join two pieces into a NUL-terminated Str.
+fn _t_join(a: Str, b: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, a);
+    str_builder_add(sb, b);
+    return str_builder_build(sb);
+}
+
+# The eight-byte WASM header: `\0asm` + little-endian version 1. Every module
+# begins with exactly these bytes, so a header-only buffer is a valid fixture
+# for anything that does not execute.
+fn _t_wasm_header(): i64 {
+    var b = alloc(8);
+    store8(b + 0, 0);
+    store8(b + 1, 97);
+    store8(b + 2, 115);
+    store8(b + 3, 109);
+    store8(b + 4, 1);
+    store8(b + 5, 0);
+    store8(b + 6, 0);
+    store8(b + 7, 0);
+    return b;
+}
+
+# The same with a tampered byte at `at`, for the rejection cases.
+fn _t_wasm_header_bad(at, to): i64 {
+    var b = _t_wasm_header();
+    store8(b + at, to);
+    return b;
+}
+
+fn main(): i64 {
+    var err = 0;
+    store64(&err, 0);
+
+    # --- Oracle: create_sandbox_with_defaults -----------------------------
+    var s = agnosai_wasm_sandbox_new();
+    assert_neq(s, 0, "a default sandbox is created");
+    assert_eq(agnosai_wasm_sandbox_max_memory_bytes(s), 67108864,
+    "with the oracle's 64 MiB memory ceiling");
+    assert_eq(agnosai_wasm_sandbox_timeout_ms(s), 30000,
+    "and its 30-second timeout");
+    # Past the oracle, which asserts only the two fields its struct exposes.
+    assert_eq(agnosai_wasm_sandbox_fuel(s), 1000000000,
+    "and the 1e9 fuel budget it never asserts");
+
+    # --- Oracle: create_sandbox_with_custom_limits ------------------------
+    var custom = agnosai_wasm_sandbox_with_limits(33554432, 10000);
+    assert_eq(agnosai_wasm_sandbox_max_memory_bytes(custom), 33554432,
+    "custom memory is kept");
+    assert_eq(agnosai_wasm_sandbox_timeout_ms(custom), 10000, "and a custom timeout");
+    # ⚠ `with_limits` does NOT take fuel, upstream or here — it stays default.
+    assert_eq(agnosai_wasm_sandbox_fuel(custom), 1000000000,
+    "while fuel stays at the default, because with_limits cannot set it");
+
+    # --- Oracle: load_invalid_bytes_returns_error -------------------------
+    store64(&err, 0);
+    var junk = str_from("not valid wasm");
+    assert_eq(agnosai_wasm_load_module(s, str_data(junk), str_len(junk), &err), 0,
+    "bytes that are not WASM do not load");
+    assert_eq(agnosai_error_kind(load64(&err)), AGNOSAI_ERR_SANDBOX,
+    "reporting a Sandbox error");
+    # ⚠ The oracle asserts the message CONTAINS "expected" — it is checking the
+    # caller is told the bytes are not WASM, not merely that something failed.
+    assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "expected"), 1,
+    "with a message naming what was EXPECTED");
+
+    # --- Oracle: load_empty_bytes_returns_error ---------------------------
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_module(s, str_data(str_from("")), 0, &err), 0,
+    "empty bytes do not load");
+    assert_neq(load64(&err), 0, "and set an error");
+
+    # --- the header check, past the oracle --------------------------------
+    var hdr = _t_wasm_header();
+    store64(&err, 0);
+    var m = agnosai_wasm_load_module(s, hdr, 8, &err);
+    assert_neq(m, 0, "a valid eight-byte header loads");
+    assert_eq(load64(&err), 0, "with no error");
+    assert_eq(agnosai_wasm_module_len(m), 8, "and remembers its length");
+    assert_eq(file_exists(str_data(agnosai_wasm_module_path(m))), 1,
+    "and stages the bytes where wasmtime can read them");
+
+    # ⚠ Seven bytes is one short and must be refused — the length check has to
+    # come before the byte reads, or this reads past the buffer.
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_module(s, hdr, 7, &err), 0,
+    "a seven-byte buffer is too short to be a header");
+
+    # Each magic byte matters.
+    assert_eq(agnosai_wasm_load_module(s, _t_wasm_header_bad(0, 1), 8, &err), 0,
+    "a wrong first magic byte is refused");
+    assert_eq(agnosai_wasm_load_module(s, _t_wasm_header_bad(3, 110), 8, &err), 0,
+    "and a wrong fourth");
+
+    # ⚠ **The VERSION matters too.** A magic-only check accepts a version-2
+    # module and defers the failure to wasmtime, where it becomes an exec-time
+    # trap instead of a load-time refusal — which is the distinction the
+    # oracle's `Module::new` draws.
+    assert_eq(agnosai_wasm_load_module(s, _t_wasm_header_bad(4, 2), 8, &err), 0,
+    "a version-2 module is refused at LOAD, not deferred to exec");
+    assert_eq(agnosai_wasm_load_module(s, _t_wasm_header_bad(7, 1), 8, &err), 0,
+    "and a version with a high byte set");
+
+    # --- Oracle: load_module_from_nonexistent_file_returns_error ----------
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_module_from_file(s,
+    str_from("/nonexistent/module.wasm"), &err), 0, "a missing file does not load");
+    assert_neq(load64(&err), 0, "and sets an error");
+
+    # A real file round-trips, and ⚠ is RE-VALIDATED: a caller cannot hand the
+    # sandbox an arbitrary path and have it executed unchecked.
+    sys_mkdir(_T_ROOT, 0x1FF);
+    var good_path = _t_join(str_from(_T_ROOT), str_from("/good.wasm"));
+    file_write_all(str_data(good_path), _t_wasm_header(), 8);
+    store64(&err, 0);
+    var fm = agnosai_wasm_load_module_from_file(s, good_path, &err);
+    assert_neq(fm, 0, "a valid module file loads");
+    assert_eq(agnosai_wasm_module_len(fm), 8, "with its length");
+
+    var bad_path = _t_join(str_from(_T_ROOT), str_from("/bad.wasm"));
+    var notwasm = str_from("#!/bin/sh\nrm -rf /\n");
+    file_write_all(str_data(bad_path), str_data(notwasm), str_len(notwasm));
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_load_module_from_file(s, bad_path, &err), 0,
+    "a file that is NOT WASM is refused even though it exists");
+    assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "expected"), 1,
+    "by the same header check, not by the filesystem");
+
+    # --- the exit taxonomy ------------------------------------------------
+    # ⚠ Fed captured stderr as DATA, so the classifier is testable without a
+    # runtime. This is the whole of the oracle's `extract_exit_code`, which its
+    # own tests only reach through real traps.
+    assert_eq(agnosai_wasm_classify_exit(0, 0, str_from("")), 0,
+    "a clean run is 0");
+    assert_eq(agnosai_wasm_classify_exit(1, 1, str_from("")), AGNOSAI_WASM_EXIT_TIMEOUT,
+    "a timeout is -1");
+    # ⚠ **A timeout that reports exit 0 is still a timeout.** This is the only
+    # input where the order of the first two checks is observable, and it is the
+    # one that matters: reversed, a run killed at the deadline reads as a clean
+    # success and the caller ships whatever partial stdout it had.
+    assert_eq(agnosai_wasm_classify_exit(0, 1, str_from("")), AGNOSAI_WASM_EXIT_TIMEOUT,
+    "and a timeout reporting exit 0 is STILL a timeout, never a success");
+    # ⚠ The deadline wins over the exit code, and over stderr. A timed-out run
+    # also carries a non-zero code, so checking the code first mislabels it.
+    assert_eq(agnosai_wasm_classify_exit(2, 1, str_from("all fuel consumed")),
+    AGNOSAI_WASM_EXIT_TIMEOUT, "and the deadline WINS over a fuel message");
+
+    assert_eq(agnosai_wasm_classify_exit(1, 0, str_from("Error: all fuel consumed")),
+    AGNOSAI_WASM_EXIT_FUEL, "exhausted fuel is -2");
+    assert_eq(agnosai_wasm_classify_exit(1, 0,
+    str_from("wasm trap: interrupt\nepoch deadline reached")),
+    AGNOSAI_WASM_EXIT_TIMEOUT, "an epoch interrupt is -1");
+    assert_eq(agnosai_wasm_classify_exit(1, 0,
+    str_from("Error: wasm trap: integer divide by zero")), AGNOSAI_WASM_EXIT_TRAP,
+    "any other trap is -3");
+
+    # ⚠ A guest's OWN exit code passes through. wasmtime surfaces WASI
+    # `proc_exit(n)` as its own process exit, and the oracle preserves it via
+    # `I32Exit`. Mapping every non-zero code onto -3 would erase it — and every
+    # assertion above would still pass.
+    assert_eq(agnosai_wasm_classify_exit(3, 0, str_from("")), 3,
+    "a guest's own proc_exit(3) is reported as 3, not as a trap");
+    assert_eq(agnosai_wasm_classify_exit(42, 0, str_from("some unrelated noise")), 42,
+    "and is not overwritten by unrelated stderr");
+
+    # The result struct carries both halves.
+    var r = agnosai_wasm_result_new(str_from("hello"), 0);
+    _t_seq(agnosai_wasm_result_stdout(r), str_from("hello"), "a result keeps its stdout");
+    assert_eq(agnosai_wasm_result_exit_code(r), 0, "and its exit code");
+
+    # --- availability, and the arm this box takes -------------------------
+    var have = agnosai_wasm_available();
+    assert(have == 0 || have == 1, "availability is a clean boolean");
+    # ⚠ It must AGREE with what `sandbox_create` will do. Before kavach 3.11.8
+    # `backend_is_available` answered a hardcoded 0 while `wasm_health` probed,
+    # and the two contradicted each other.
+    assert_eq(have, wasm_health(0),
+    "and agrees with wasm_health — these used to contradict each other");
+
+    store64(&err, 0);
+    var out = agnosai_wasm_execute(s, m, str_from(""), &err);
+    if (have == 0) {
+        # The reachable arm on this box, and a real assertion rather than a skip.
+        assert_eq(out, 0, "with no runtime, execute does not half-work");
+        assert_eq(agnosai_error_kind(load64(&err)), AGNOSAI_ERR_SANDBOX,
+        "it is a Sandbox error");
+        assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "wasmtime"), 1,
+        "naming the missing binary, so the operator knows what to install");
+    } else {
+        # ⚠ Guarded, and the guard is LOUD: if a runtime is present these must
+        # run, so a regression in detection cannot quietly skip them.
+        assert_neq(out, 0, "with a runtime present, a header-only module executes");
+        assert_eq(agnosai_wasm_result_exit_code(out), 0,
+        "and an empty module exits cleanly");
+    }
+
+    # --- teardown -----------------------------------------------------------
+    sys_unlink(str_data(agnosai_wasm_module_path(m)));
+    sys_unlink(str_data(agnosai_wasm_module_path(fm)));
+    sys_unlink(str_data(good_path));
+    sys_unlink(str_data(bad_path));
+    sys_rmdir(_T_ROOT);
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

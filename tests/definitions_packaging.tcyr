@@ -523,6 +523,41 @@ fn main(): i64 {
     assert_eq(vec_len(agnosai_package_definitions(rmeth)), 0,
     "it is skipped, exactly as the oracle's by_index(..).ok()? skips it");
 
+    # ⚠ An ENCRYPTED member is now told apart from corruption. sankoch 2.7.7's
+    # `zip_last_error()` is what makes this possible; before it, every open
+    # failure was one indistinguishable `InvalidDefinition`. The archive here is
+    # well-formed — only the general-purpose flag's bit 0 is set — so a message
+    # about corruption would send a caller looking for the wrong thing.
+    var enc = _t_zip2("manifest.json", _t_manifest("p", "1"),
+    "definitions/x.json", _t_def_json("x"), &len);
+    assert_neq(enc, 0, "a clean archive builds");
+    # Set bit 0 of the general-purpose flag in the FIRST central-directory
+    # record. Every length and CRC stays valid.
+    var cdp = 0;
+    var cdfound = 0;
+    while (cdp + 4 <= load64(&len)) {
+        if (_zip_le32(enc + cdp) == ZIP_SIG_CD) {
+            if (cdfound == 0) { cdfound = cdp; }
+        }
+        cdp = cdp + 1;
+    }
+    assert_neq(cdfound, 0, "and its central directory is locatable");
+    _zip_put16(enc + cdfound + 8, 1);
+    var encerr = 0;
+    store64(&encerr, 0);
+    var encpkg = 0;
+    store64(&encpkg, 0);
+    var ee = agnosai_package_import(enc, load64(&len), &encpkg);
+    assert_neq(ee, 0, "an encrypted member refuses the archive");
+    assert_eq(agnosai_error_kind(ee), AGNOSAI_ERR_INVALID_DEFINITION,
+    "as an InvalidDefinition");
+    assert_eq(str_contains_cstr(agnosai_error_detail(ee), "encrypted"), 1,
+    "but SAYING SO, rather than reporting corruption in a well-formed archive");
+    # ...and genuinely corrupt bytes still say the other thing.
+    assert_eq(str_contains_cstr(agnosai_error_detail(
+    agnosai_package_import(str_data(junk), str_len(junk), &encpkg)), "encrypted"), 0,
+    "while junk bytes do not mention encryption");
+
     # --- MAX_FILE_SIZE ------------------------------------------------------
     assert_eq(AGNOSAI_PKG_MAX_FILE_SIZE, 1048576, "the per-file cap is 1 MiB");
     # ⚠ On the UNCOMPRESSED size. A 1 MiB + 1 payload of one repeated byte

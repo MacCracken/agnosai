@@ -195,6 +195,28 @@ corrected section below):
 `fleet/` left this table on **2026-08-08**: all twelve of the oracle's modules
 are ported.
 
+**M11 bite log — ✅ COMPLETE 2026-08-10, 6 of 6.** Both `hwaccel` halves,
+`tools/python_tool`, `sandbox/wasm`, `tools/wasm_tool`, `tools/wasm_loader` —
+**48 mutation probes, 48 kills**. ⚠ `wasmtime` is a host requirement and is not
+installed here, so the execute path's end-to-end arm is guarded; everything else
+— the manifest parse, the header validator, the exit-code classifier, the SDK
+stdin wrapper and both result ladders — is reachable without it, because each
+was split out of its caller for exactly that reason.
+
+**M11 bite log — 🟡 4 of 6, 2026-08-10.** `sandbox/wasm` (43 assertions, 10/10
+mutants) landed on kavach 3.11.8's WASM backend. ⚠ Three upstream round trips
+closed to get there: kavach 3.11.8 (backend reachable, stdin, real exit codes),
+sankoch 2.7.7 (`zip_bound`, `zip_last_error`, arena-backed readers) and cyrius
+6.5.17 (the `distlib` self-check). All three are consumed, not merely filed.
+
+**M11 bite log — 🟡 3 of 6, 2026-08-09.** `llm/router` hwaccel (2 fns, 15
+assertions), `core/resource` hwaccel (6 items + a `sched_getaffinity` core
+count, ~50 assertions), `tools/python_tool` (50 assertions). 25 mutation probes,
+25 kills. Remaining: `sandbox/wasm.rs` (521 — **absent from the roadmap's M11
+row until now**), `tools/wasm_loader.rs` (169), `tools/wasm_tool.rs` (265).
+⚠ `wasmtime` is **not installed** on this box and kavach's WASM backend cannot
+carry stdin or a guest exit code; see the roadmap's M11 row.
+
 **M10 `definitions` bite log — ✅ COMPLETE 2026-08-09.**
 
 | module | oracle lines | assertions | oracle tests |

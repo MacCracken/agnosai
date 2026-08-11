@@ -1,0 +1,207 @@
+# =========================================================================
+# tools/wasm_tool — a registered tool backed by a WASM module.
+#
+# Parity oracle: rust-old/src/tools/wasm_tool.rs
+#
+# The adapter between `src/sandbox/wasm.cyr` and the tool vtable. The module
+# takes JSON on stdin as `{"parameters": …}` and answers JSON on stdout as
+# `{"result": …, "success": …, "error": …}` — the wire format
+# `sdk/agnosai-tool-sdk/src/lib.rs` publishes to tool authors, so it is a
+# compatibility surface rather than an internal choice.
+#
+# ## The result ladder is `python_tool`'s, and is NOT shared
+#
+# ⚠ `agnosai_python_tool_output_of` decodes the same four cases in the same
+# order, differing only in the error prefix. That is the **second** instance;
+# CLAUDE.md says extract at the third. Stated in both headers so the duplication
+# is a recorded decision rather than something nobody noticed — if
+# `remote_registry` ever grows one, that is the trigger.
+#
+# The one real difference: python's ladder checks `timed_out` first because its
+# sandbox reports it separately. Here the deadline is already folded into the
+# exit code by `agnosai_wasm_classify_exit`, so a timeout arrives as
+# `AGNOSAI_WASM_EXIT_TIMEOUT` and takes the non-zero arm.
+# =========================================================================
+
+# WasmTool context — 32 bytes. The tool vtable's `ctx` slot.
+enum AgnosaiWasmToolOff {
+    AGN_WT_NAME = 0;
+    AGN_WT_DESCRIPTION = 8;
+    # A vec of ParameterSchema, owned for the life of the process.
+    AGN_WT_PARAMETERS = 16;
+    AGN_WT_MODULE = 24;
+    AGN_WT_BYTES = 32;
+}
+
+# The WasmSandbox every WasmTool runs in.
+#
+# ⚠ A **process-global**, where the oracle threads an `Arc<WasmSandbox>` into
+# each tool. The sandbox carries only three integers — memory, timeout, fuel —
+# and `wasm_loader` builds every tool in a directory against one of them, so a
+# per-tool copy would be three identical numbers per tool and a fourth
+# constructor parameter for callers to get wrong. Set it once with
+# `agnosai_wasm_tool_set_sandbox`; the default is `agnosai_wasm_sandbox_new()`.
+var _agnosai_wasm_tool_sandbox = 0;
+
+# The sandbox WasmTools execute in, defaulting on first use.
+fn agnosai_wasm_tool_sandbox(): i64 {
+    if (_agnosai_wasm_tool_sandbox == 0) {
+        _agnosai_wasm_tool_sandbox = agnosai_wasm_sandbox_new();
+    }
+    return _agnosai_wasm_tool_sandbox;
+}
+
+# Replace the sandbox WasmTools execute in — the oracle's `Arc<WasmSandbox>`
+# constructor parameter, hoisted.
+fn agnosai_wasm_tool_set_sandbox(s): i64 {
+    _agnosai_wasm_tool_sandbox = s;
+    return 0;
+}
+
+# The tool's loaded module.
+fn agnosai_wasm_tool_module(ctx): i64 {
+    return load64(ctx + AGN_WT_MODULE);
+}
+
+# The tool's declared parameters.
+fn agnosai_wasm_tool_parameters(ctx): i64 {
+    return load64(ctx + AGN_WT_PARAMETERS);
+}
+
+# The oracle's `schema()` — name, description and every declared parameter.
+#
+# ⚠ Each `ParameterSchema` is rebuilt into `a`, not pushed by reference, for the
+# reason `python_tool`'s copy states: `schema_fp` runs under the per-request
+# arena and the ctx's vec is process-lifetime.
+fn _agnosai_wasm_tool_schema(a, ctx): i64 {
+    var s = agnosai_tool_schema_new_a(a, str_from_a(a, str_data(load64(ctx + AGN_WT_NAME))),
+    str_from_a(a, str_data(load64(ctx + AGN_WT_DESCRIPTION))));
+    var params = load64(ctx + AGN_WT_PARAMETERS);
+    for (var i = 0; i < vec_len(params); i = i + 1) {
+        var p = vec_get(params, i);
+        agnosai_tool_schema_with_param_a(a, s, agnosai_param_schema_new_a(a,
+        str_clone_a(a, agnosai_param_schema_name(p)),
+        str_clone_a(a, agnosai_param_schema_description(p)),
+        str_clone_a(a, agnosai_param_schema_type(p)),
+        agnosai_param_schema_required(p)));
+    }
+    return s;
+}
+
+# Turn one module run into a `ToolOutput` — `wasm_tool.rs:99-126`.
+#
+# Split out for the same reason `python_tool`'s is: the oracle's tests decode
+# this ladder inline against `serde_json` rather than calling `execute`, so
+# ported literally they would assert on a copy of the logic.
+#
+# The order is the oracle's:
+#
+#   1. **non-zero exit** — `"WASM module exited with code {n}"`. ⚠ This is the
+#      whole failure surface: a trap, an exhausted fuel budget and a deadline
+#      all arrive here as a negative code, and the message prints that code
+#      rather than naming which. The oracle does the same.
+#   2. **stdout parses as JSON** — `success` (defaulting TRUE), then `result`
+#      (defaulting to the whole value) or `error` (defaulting to
+#      "unknown error").
+#   3. **stdout is not JSON** — a **success** carrying the raw text, UNTRIMMED.
+#      ⚠ Unlike `python_tool`, which trims. `wasm_tool.rs:118` is
+#      `Value::String(result.stdout)` with no `.trim()`, so a module that
+#      `println!`s gets a trailing newline in its result. Reproduced.
+fn agnosai_wasm_tool_output_of(stdout: Str, exit_code): i64 {
+    if (exit_code != 0) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "WASM module exited with code ");
+        str_builder_add_int(sb, exit_code);
+        return agnosai_tool_output_err(str_builder_build(sb));
+    }
+
+    var v = bayan_json_v_parse_buf(str_data(stdout), str_len(stdout));
+    if (v == 0) {
+        return agnosai_tool_output_ok(bayan_json_v_str_new(stdout));
+    }
+
+    # ⚠ `success` defaults TRUE, and a NON-BOOLEAN also defaults true —
+    # `.and_then(|v| v.as_bool()).unwrap_or(true)`.
+    var ok = 1;
+    var sv = bayan_json_v_obj_get(v, "success");
+    if (sv != 0) {
+        if (bayan_json_v_is_bool(sv) == 1) { ok = bayan_json_v_bool(sv); }
+    }
+
+    if (ok == 1) {
+        # ⚠ An ABSENT `result` means the whole value; a present JSON null does
+        # not — the same distinction `python_tool` documents.
+        var rv = bayan_json_v_obj_get(v, "result");
+        if (rv == 0) { return agnosai_tool_output_ok(v); }
+        return agnosai_tool_output_ok(rv);
+    }
+
+    var ev = bayan_json_v_obj_get(v, "error");
+    if (ev != 0) {
+        if (bayan_json_v_is_str(ev) == 1) {
+            return agnosai_tool_output_err(bayan_json_v_str(ev));
+        }
+    }
+    return agnosai_tool_output_err(str_from("unknown error"));
+}
+
+# The JSON a module receives on stdin — `wasm_tool.rs:93-98`.
+#
+# ⚠ `{"parameters": …}`, **not the bare parameter map**. `sdk/agnosai-tool-sdk`
+# publishes that wrapper to tool authors, so it is a compatibility surface: drop
+# it and every SDK-built tool sees an empty parameter set and fails in its own
+# code rather than here.
+#
+# Split out of `execute` so it is reachable **without a runtime**. `wasmtime` is
+# not installed on the development box, so the execute path cannot run there —
+# and a mutant that emitted the bare map survived every assertion until this
+# existed.
+fn agnosai_wasm_tool_input_payload(input): Str {
+    var wrapper = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(wrapper, str_from("parameters"),
+    _agnosai_map_to_value_a(default_alloc(), agnosai_tool_input_parameters(input)));
+    return bayan_json_v_build(wrapper);
+}
+
+# The oracle's `execute()` — marshal the parameters, run, interpret.
+fn _agnosai_wasm_tool_execute(ctx, input): i64 {
+    var payload = agnosai_wasm_tool_input_payload(input);
+    if (payload == 0) {
+        return agnosai_tool_output_err(str_from("failed to serialize input"));
+    }
+
+    var err = 0;
+    store64(&err, 0);
+    var r = agnosai_wasm_execute(agnosai_wasm_tool_sandbox(),
+    load64(ctx + AGN_WT_MODULE), payload, &err);
+    if (r == 0) {
+        return agnosai_tool_output_err(str_cat(str_from("WASM execution failed: "),
+        agnosai_error_message(load64(&err))));
+    }
+
+    return agnosai_wasm_tool_output_of(agnosai_wasm_result_stdout(r),
+    agnosai_wasm_result_exit_code(r));
+}
+
+# A tool backed by an already-loaded module — the oracle's `WasmTool::new`.
+fn agnosai_wasm_tool(name: Str, description: Str, parameters, module): i64 {
+    var ctx = alloc(AGN_WT_BYTES);
+    store64(ctx + AGN_WT_NAME, name);
+    store64(ctx + AGN_WT_DESCRIPTION, description);
+    store64(ctx + AGN_WT_PARAMETERS, parameters);
+    store64(ctx + AGN_WT_MODULE, module);
+    return agnosai_tool_new(name, description, &_agnosai_wasm_tool_schema,
+    &_agnosai_wasm_tool_execute, ctx);
+}
+
+# A tool built from raw module bytes — the oracle's `WasmTool::from_bytes`.
+#
+# Returns 0 with `*out_err` set when the bytes are not a WASM module; the load
+# is `agnosai_wasm_load_module`'s, so the header check and its "expected"
+# message are the same ones.
+fn agnosai_wasm_tool_from_bytes(name: Str, description: Str, parameters, buf, len,
+out_err): i64 {
+    var module = agnosai_wasm_load_module(agnosai_wasm_tool_sandbox(), buf, len, out_err);
+    if (module == 0) { return 0; }
+    return agnosai_wasm_tool(name, description, parameters, module);
+}

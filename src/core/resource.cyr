@@ -15,14 +15,19 @@
 #   * `Option<u64>` / `Option<usize>` fields use **-1 for None**. Every one of
 #     them is a non-negative count or limit, so the sentinel is unambiguous and
 #     keeps these structs allocation-free.
-#   * The `#[cfg(feature = "hwaccel")]` half of the oracle — the ai-hwaccel
-#     re-exports, `TrainingMemoryEstimate`, `HardwareInventory::detect` /
-#     `from_hwaccel`, and `AcceleratorType::from_hwaccel` — is **not ported
-#     YET**. ⚠ This note used to end "hwaccel is not in the default build, so it
-#     is outside the v2.0.0 parity bar, like bhava". **Retired**: a cargo feature
-#     gate is not a scope boundary, and bhava is the only carve-out the user set.
-#     Owed under roadmap M11 — `[deps.ai-hwaccel]` is already vendored, and
-#     `fleet/gpu` and `fleet/coordinator` already call into it.
+#   * The `#[cfg(feature = "hwaccel")]` half of the oracle is **ported**, at the
+#     bottom of this file: `AcceleratorType::from_hwaccel`,
+#     `HardwareInventory::detect` / `from_hwaccel`, and `TrainingMemoryEstimate`
+#     with its three methods. A cargo feature gate is not a scope boundary, and
+#     `[deps.ai-hwaccel]` was already vendored.
+#
+#     ⚠ The oracle's ten `pub use ai_hwaccel::{...}` **re-exports have no
+#     counterpart and need none.** They exist so a Rust caller can name
+#     `QuantizationLevel` without depending on ai-hwaccel directly; Cyrius has
+#     ONE flat namespace, so `QUANT_FP16`, `TRAIN_LORA`, `est_total_x1000` and
+#     the rest are already visible to every consumer. Re-exporting would mean
+#     defining duplicate symbols, which is the one thing the flat namespace
+#     punishes.
 # =========================================================================
 
 # Broad accelerator family for requirement matching.
@@ -664,4 +669,245 @@ fn agnosai_hw_inventory_from_value(v): i64 {
     }
     return agnosai_hw_inventory_new(_agnosai_int_field(v, "cpu_cores", 0),
     _agnosai_int_field(v, "memory_total_mb", 0), devices);
+}
+
+# --- hwaccel -------------------------------------------------------------
+#
+# The oracle's `#[cfg(feature = "hwaccel")]` half. Every body here is an
+# ADAPTER over ai-hwaccel, never an implementation — the detection, the
+# quantization policy and the training-memory model all live in the vendored
+# library, and a second copy would drift from it silently. Same call
+# `fleet/coordinator` made for `plan_sharding`.
+
+# Bytes in a mebibyte and a gibibyte. ai-hwaccel reports device memory in bytes
+# and the oracle's `ComputeDevice` carries megabytes, so the conversion is the
+# oracle's `/ (1024 * 1024)` — MiB, not decimal MB.
+var AGNOSAI_BYTES_PER_MB = 1048576;
+var AGNOSAI_BYTES_PER_GB = 1073741824;
+
+# One `cpu_set_t`, in bytes — 1024 CPUs, glibc's default ceiling.
+var AGNOSAI_CPU_SET_BYTES = 128;
+
+# Bits set in a 64-bit word.
+fn _agnosai_popcount64(x): i64 {
+    var n = 0;
+    for (var i = 0; i < 64; i = i + 1) {
+        if (((x >> i) & 1) == 1) { n = n + 1; }
+    }
+    return n;
+}
+
+# The oracle's `std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1)`.
+#
+# ⚠ **The AFFINITY mask, not the machine's core count**, because that is what
+# std answers on Linux: a process under `taskset -c 0-3` on a 64-core box gets
+# 4, and so does one in a cgroup pinned the same way. Counting
+# `/sys/devices/system/cpu/online` instead would answer 64 and over-provision
+# every placement decision that reads `min_cpu_cores` — and it would look right
+# on an unconstrained developer box, which is where it would be tested.
+#
+# ⚠ Falls back to **1**, never 0, matching `unwrap_or(1)`. A zero would make
+# `agnosai_hw_inventory_satisfies` reject every requirement that names any CPU
+# cores at all.
+#
+# `sched_getaffinity` is Linux-only and its number differs per ABI — x86-64 is
+# 204, aarch64 is 123 — and a raw `syscall()` is NOT renumbered by the backend
+# the way the `sys_*` wrappers are, so the number is selected here. Every other
+# target takes the fallback, which is a real residual and not a silent one: the
+# inventory reports one core rather than a wrong number.
+# Bits set across the first `rc` BYTES of an affinity mask, or 1 when the
+# syscall failed — the oracle's `unwrap_or(1)`.
+#
+# ⚠ Split out because the fallback is otherwise **unreachable on the platform
+# that runs the tests**: this box is Linux x86, `sched_getaffinity` always
+# succeeds, and a mutant changing the fallback from 1 to 0 survives every
+# assertion. Taking `rc` and the mask as data makes both arms testable.
+#
+# ⚠ `rc` is a BYTE count, not a word count. Reading the whole 128-byte buffer
+# regardless would count whatever the kernel did not write.
+fn _agnosai_cores_from_affinity(rc, mask): i64 {
+    if (rc > 0) {
+        var cores = 0;
+        for (var w = 0; w < rc / 8; w = w + 1) {
+            cores = cores + _agnosai_popcount64(load64(mask + w * 8));
+        }
+        if (cores > 0) { return cores; }
+    }
+    return 1;
+}
+
+fn _agnosai_available_parallelism(): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    # ⚠ The size is a LITERAL 128, not `AGNOSAI_CPU_SET_BYTES` — a `var buf[N]`
+    # needs a compile-time constant and a `var` will not do. Keep the two in step.
+    var mask[128];
+    for (var z = 0; z < AGNOSAI_CPU_SET_BYTES / 8; z = z + 1) {
+        store64(&mask + z * 8, 0);
+    }
+
+    var rc = 0 - 1;
+    #ifdef CYRIUS_ARCH_X86
+    rc = syscall(204, 0, AGNOSAI_CPU_SET_BYTES, &mask);
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    rc = syscall(123, 0, AGNOSAI_CPU_SET_BYTES, &mask);
+    #endif
+
+    return _agnosai_cores_from_affinity(rc, &mask);
+    #endif
+    return 1;
+}
+
+# Narrow ai-hwaccel's accelerator type to the oracle's six.
+#
+# ⚠ **This is NOT a pass-through, and it looks like one.** ai-hwaccel numbers
+# `ACCEL_TPU = 8` while `AGNOSAI_ACCEL_TPU = 5`; CPU/CUDA/ROCM/METAL/VULKAN are
+# 0-4 on both sides and would survive a bare cast, so five of six values are
+# right by coincidence and a TPU silently becomes an Intel NPU. ai-hwaccel has
+# nineteen variants against these six.
+#
+# ⚠ Everything unmapped falls back to **CPU**, which is the oracle's choice and
+# a deliberate one: an NPU or an ASIC is still usable, and answering `Cpu` keeps
+# it from matching a GPU or TPU placement requirement it cannot serve. Answering
+# some "other" value would make it match nothing at all, including CPU work.
+fn agnosai_accelerator_type_from_hwaccel(hw): i64 {
+    if (hw == ACCEL_CPU) { return AGNOSAI_ACCEL_CPU; }
+    if (hw == ACCEL_CUDA) { return AGNOSAI_ACCEL_CUDA; }
+    if (hw == ACCEL_ROCM) { return AGNOSAI_ACCEL_ROCM; }
+    if (hw == ACCEL_METAL) { return AGNOSAI_ACCEL_METAL; }
+    if (hw == ACCEL_VULKAN) { return AGNOSAI_ACCEL_VULKAN; }
+    if (hw == ACCEL_TPU) { return AGNOSAI_ACCEL_TPU; }
+    return AGNOSAI_ACCEL_CPU;
+}
+
+# Build a `HardwareInventory` from an ai-hwaccel registry.
+#
+# ⚠ The CPU profile is **not a device**. It is diverted into the inventory's
+# `memory_total_mb` and `cpu_cores` and then `continue`d past, so a registry of
+# one CPU profile yields an inventory with ZERO devices. Pushing it as a device
+# instead would make `total_memory_mb` double-count and let a CPU satisfy a
+# `devices_of_type` query for accelerators.
+#
+# ⚠ `index` is the position in the registry's profile list, NOT a count of
+# devices pushed. The oracle enumerates before it filters, so a CPU profile at
+# position 0 leaves the first real device with index 1 and a gap at 0.
+#
+# ⚠ `memory_free_bytes` is an Option upstream and `PROFILE_NONE` (-1) here;
+# absent means "fall back to the total", not "zero available".
+fn agnosai_hw_inventory_from_hwaccel(registry): i64 {
+    var cpu_cores = 0;
+    var memory_total_mb = 0;
+    var devices = vec_new();
+
+    var profiles = reg_profiles(registry);
+    for (var i = 0; i < vec_len(profiles); i = i + 1) {
+        var p = vec_get(profiles, i);
+        var atype = profile_accel_type(p);
+        var mem_mb = profile_memory_bytes(p) / AGNOSAI_BYTES_PER_MB;
+
+        var free_bytes = profile_mem_free(p);
+        if (free_bytes == PROFILE_NONE) { free_bytes = profile_memory_bytes(p); }
+        var avail_mb = free_bytes / AGNOSAI_BYTES_PER_MB;
+
+        if (atype == ACCEL_CPU) {
+            memory_total_mb = mem_mb;
+            cpu_cores = _agnosai_available_parallelism();
+            continue;
+        }
+
+        vec_push(devices, agnosai_compute_device_with_available(
+        agnosai_compute_device_new(i, str_from(accel_name(atype)),
+        agnosai_accelerator_type_from_hwaccel(atype), mem_mb), avail_mb));
+    }
+
+    return agnosai_hw_inventory_new(cpu_cores, memory_total_mb, devices);
+}
+
+# Detect the host's hardware — the oracle's `HardwareInventory::detect`.
+#
+# ⚠ `registry_detect` shells out to `nvidia-smi` and friends. The oracle's
+# `detect()` has **no test at all**, gated or otherwise, and neither does this:
+# what it answers depends on the box. `from_hwaccel` above is the testable half
+# and is where every assertion goes.
+fn agnosai_hw_inventory_detect(): i64 {
+    return agnosai_hw_inventory_from_hwaccel(registry_detect());
+}
+
+# TrainingMemoryEstimate heap layout — 32 bytes, four f64 bit patterns in GB.
+#
+# ⚠ GB as **f64**, matching the oracle's four `f64` fields — ai-hwaccel answers
+# in x1000 fixed-point integers (`est_model_x1000` and friends), and storing
+# those raw would make `total_gb` read 14000 for a 14 GB model. The conversion
+# is one divide and it happens once, at construction.
+enum AgnosaiTrainingMemOff {
+    AGN_TRAINMEM_MODEL_GB = 0;
+    AGN_TRAINMEM_OPTIMIZER_GB = 8;
+    AGN_TRAINMEM_ACTIVATION_GB = 16;
+    AGN_TRAINMEM_TOTAL_GB = 24;
+    AGN_TRAINMEM_BYTES = 32;
+}
+
+# Estimate training memory — the oracle's `TrainingMemoryEstimate::estimate`.
+#
+# `model_params_millions` is millions (7000 for a 7B model), `method` is one of
+# ai-hwaccel's `TRAIN_*` and `target` one of its `TARGET_*`.
+fn agnosai_training_memory_estimate(model_params_millions, method, target): i64 {
+    var e = estimate_training_memory(model_params_millions, method, target);
+    var thousand = f64_from(1000);
+    var t = alloc(AGN_TRAINMEM_BYTES);
+    store64(t + AGN_TRAINMEM_MODEL_GB,
+    f64_div(f64_from(est_model_x1000(e)), thousand));
+    store64(t + AGN_TRAINMEM_OPTIMIZER_GB,
+    f64_div(f64_from(est_optimizer_x1000(e)), thousand));
+    store64(t + AGN_TRAINMEM_ACTIVATION_GB,
+    f64_div(f64_from(est_activation_x1000(e)), thousand));
+    store64(t + AGN_TRAINMEM_TOTAL_GB,
+    f64_div(f64_from(est_total_x1000(e)), thousand));
+    return t;
+}
+
+# Model weights, in GB.
+fn agnosai_training_memory_model_gb(t): i64 {
+    return load64(t + AGN_TRAINMEM_MODEL_GB);
+}
+
+# Optimizer state, in GB.
+fn agnosai_training_memory_optimizer_gb(t): i64 {
+    return load64(t + AGN_TRAINMEM_OPTIMIZER_GB);
+}
+
+# Activations, in GB.
+fn agnosai_training_memory_activation_gb(t): i64 {
+    return load64(t + AGN_TRAINMEM_ACTIVATION_GB);
+}
+
+# The three summed, in GB.
+fn agnosai_training_memory_total_gb(t): i64 {
+    return load64(t + AGN_TRAINMEM_TOTAL_GB);
+}
+
+# Whether the estimate fits in an inventory's total accelerator VRAM.
+#
+# ⚠ **DEVICE VRAM ONLY.** The sum walks `devices`, and the CPU profile never
+# becomes a device — so an inventory with 512 GB of system RAM and no GPU fits
+# nothing at all. That is the oracle's arithmetic and the right one for a
+# training estimate, but `memory_total_mb` sitting right there makes the wrong
+# version easy to write.
+#
+# ⚠ `<=`, so an estimate exactly equal to available VRAM FITS.
+fn agnosai_training_memory_fits_in(t, inventory): i64 {
+    var total_vram_gb = f64_from(0);
+    var devices = agnosai_hw_inventory_devices(inventory);
+    var mb_per_gb = f64_from(1024);
+    for (var i = 0; i < vec_len(devices); i = i + 1) {
+        total_vram_gb = f64_add(total_vram_gb, f64_div(
+        f64_from(agnosai_compute_device_memory_total_mb(vec_get(devices, i))), mb_per_gb));
+    }
+    return f64_le(load64(t + AGN_TRAINMEM_TOTAL_GB), total_vram_gb);
+}
+
+# The total in bytes — GB x 1024^3, truncated, as the oracle's `as u64` is.
+fn agnosai_training_memory_total_bytes(t): i64 {
+    return f64_to(f64_mul(load64(t + AGN_TRAINMEM_TOTAL_GB),
+    f64_from(AGNOSAI_BYTES_PER_GB)));
 }

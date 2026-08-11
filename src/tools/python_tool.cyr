@@ -1,0 +1,200 @@
+# =========================================================================
+# tools/python_tool — a registered tool backed by Python source.
+#
+# Parity oracle: rust-old/src/tools/python_tool.rs
+#
+# The whole file is an **adapter**: it holds Python source and a
+# `PythonSandbox`, and turns the sandbox's `(stdout, stderr, exit_code,
+# timed_out)` into a `ToolOutput`. Everything below it — the bridge script, env
+# sanitization, the work-dir chdir, the timeout and SIGKILL — is already
+# `src/sandbox/python.cyr` and is not touched here.
+#
+# ⚠ The tool's `source` never goes near the bridge script. It is passed as
+# *data* through `__tool_source__` in the stdin payload;
+# `src/sandbox/python.cyr:11-22` is the security property and
+# `tests/sandbox_python.tcyr` has the hostile-source test for it.
+#
+# ## The result ladder is the oracle's, dead branch included
+#
+# ⚠ **`exit_code != 0` is checked BEFORE stdout is parsed**, and the shipped
+# bridge answers a raising tool with `exit 1` plus a structured
+# `{"success": false, "error": …}` on **stdout** and an empty stderr
+# (`rust-old/src/sandbox/python.rs:157-158`). So the caller gets
+# `"python tool exited with code 1"` and the real Python exception message is
+# discarded — and the `success:false` / `error` arm below is only reachable for
+# a tool that prints `success:false` and exits **0**, which the bridge never
+# does. Reproduced in the oracle's order rather than fixed, because fixing it
+# changes what every existing consumer sees. Stated because otherwise someone
+# reads the ladder as a bug and reorders it.
+#
+# ## No `Debug`
+#
+# The oracle's `impl Debug` and its `tool_debug_format` test have no Cyrius
+# counterpart and are dropped; the test header says so.
+# =========================================================================
+
+# PythonTool context — 40 bytes. The tool vtable's `ctx` slot.
+enum AgnosaiPythonToolOff {
+    AGN_PYT_NAME = 0;
+    AGN_PYT_DESCRIPTION = 8;
+    # A vec of ParameterSchema, owned by this ctx for the life of the process.
+    AGN_PYT_PARAMETERS = 16;
+    AGN_PYT_SOURCE = 24;
+    AGN_PYT_SANDBOX = 32;
+    AGN_PYT_BYTES = 40;
+}
+
+# The tool's Python source.
+fn agnosai_python_tool_source(ctx): i64 {
+    return load64(ctx + AGN_PYT_SOURCE);
+}
+
+# The sandbox the tool runs in.
+fn agnosai_python_tool_sandbox(ctx): i64 {
+    return load64(ctx + AGN_PYT_SANDBOX);
+}
+
+# The tool's declared parameters.
+fn agnosai_python_tool_parameters(ctx): i64 {
+    return load64(ctx + AGN_PYT_PARAMETERS);
+}
+
+# The oracle's `schema()` — name, description and every declared parameter.
+#
+# ⚠ Each `ParameterSchema` is **rebuilt into `a`**, not pushed by reference.
+# `schema_fp` runs under the per-request arena (`src/tools/native.cyr:374-381`),
+# and the ctx's own vec is process-lifetime; handing the arena a pointer into it
+# would be harmless, but handing the ctx's entries to `vec_push_a` and then
+# `reset_via`-ing puts arena-owned cells in a process-lifetime schema. Copying
+# is the direction that cannot go wrong. Same ownership hazard `state.md` B2
+# records for `agnosai_agent_from_value`.
+fn _agnosai_python_tool_schema(a, ctx): i64 {
+    var s = agnosai_tool_schema_new_a(a, str_from_a(a, str_data(load64(ctx + AGN_PYT_NAME))),
+    str_from_a(a, str_data(load64(ctx + AGN_PYT_DESCRIPTION))));
+    var params = load64(ctx + AGN_PYT_PARAMETERS);
+    for (var i = 0; i < vec_len(params); i = i + 1) {
+        var p = vec_get(params, i);
+        agnosai_tool_schema_with_param_a(a, s, agnosai_param_schema_new_a(a,
+        str_clone_a(a, agnosai_param_schema_name(p)),
+        str_clone_a(a, agnosai_param_schema_description(p)),
+        str_clone_a(a, agnosai_param_schema_type(p)),
+        agnosai_param_schema_required(p)));
+    }
+    return s;
+}
+
+# Turn one sandbox result into a `ToolOutput` — `python_tool.rs:89-121`.
+#
+# ⚠ Split out of `execute` so it is reachable **without an interpreter**. Seven
+# of the oracle's ten tests cover exactly this ladder, and every one of them
+# re-implements it inline against `serde_json` rather than calling
+# `PythonTool::execute` — so upstream they assert on a copy of the logic and
+# would pass against a broken `execute`. Routed through this helper they become
+# load-bearing.
+#
+# The order is the oracle's and it matters:
+#
+#   1. **timed out** — checked FIRST. A timed-out result also carries
+#      `exit_code == -1` (`src/sandbox/python.cyr:183`), so swapping these two
+#      reports a timeout as "exited with code -1".
+#   2. **non-zero exit** — stderr if it has anything, else the code. See the
+#      header for why this shadows the structured error.
+#   3. **stdout parses as JSON** — `success` (defaulting TRUE), then `result`
+#      (defaulting to the whole value) or `error` (defaulting to
+#      "unknown error").
+#   4. **stdout is not JSON** — a **success** carrying the trimmed text.
+fn agnosai_python_tool_output_of(stdout: Str, stderr: Str, exit_code, timed_out): i64 {
+    if (timed_out == 1) {
+        return agnosai_tool_output_err(str_from("python tool execution timed out"));
+    }
+
+    if (exit_code != 0) {
+        var trimmed_err = str_trim(stderr);
+        if (str_len(trimmed_err) > 0) { return agnosai_tool_output_err(trimmed_err); }
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "python tool exited with code ");
+        str_builder_add_int(sb, exit_code);
+        return agnosai_tool_output_err(str_builder_build(sb));
+    }
+
+    # ⚠ Trimmed ONCE. `str_trim` allocates, and the oracle calls `stdout.trim()`
+    # at both the parse and the fallback.
+    var out = str_trim(stdout);
+    var v = bayan_json_v_parse_buf(str_data(out), str_len(out));
+    if (v == 0) {
+        # ⚠ Non-JSON stdout is a **SUCCESS** carrying the raw text, not an
+        # error. A tool that `print`s plain text works. Do not "improve" this.
+        return agnosai_tool_output_ok(bayan_json_v_str_new(out));
+    }
+
+    # ⚠ `success` defaults to TRUE, and so does a NON-BOOLEAN `success`:
+    # `.and_then(|v| v.as_bool()).unwrap_or(true)` means `{"success":"yes"}` is
+    # a success. Reading a non-bool through `bayan_json_v_bool` would answer 0
+    # and invert it.
+    var ok = 1;
+    var sv = bayan_json_v_obj_get(v, "success");
+    if (sv != 0) {
+        if (bayan_json_v_is_bool(sv) == 1) { ok = bayan_json_v_bool(sv); }
+    }
+
+    if (ok == 1) {
+        # ⚠ An ABSENT `result` means "the whole value"; a **present JSON null**
+        # does not — serde's `.get()` answers `Some(Value::Null)` and the output
+        # is null. bayan draws the same line: `obj_get` returns 0 for absent and
+        # a `JTAG_NULL` node for a present null. The bridge emits
+        # `"result": None` on every failure, so this path is live.
+        var rv = bayan_json_v_obj_get(v, "result");
+        if (rv == 0) { return agnosai_tool_output_ok(v); }
+        return agnosai_tool_output_ok(rv);
+    }
+
+    var ev = bayan_json_v_obj_get(v, "error");
+    if (ev != 0) {
+        if (bayan_json_v_is_str(ev) == 1) {
+            return agnosai_tool_output_err(bayan_json_v_str(ev));
+        }
+    }
+    return agnosai_tool_output_err(str_from("unknown error"));
+}
+
+# The oracle's `execute()` — marshal the parameters, run, interpret.
+fn _agnosai_python_tool_execute(ctx, input): i64 {
+    var params = _agnosai_map_to_value_a(default_alloc(),
+    agnosai_tool_input_parameters(input));
+
+    var err = 0;
+    store64(&err, 0);
+    var r = agnosai_python_execute_tool(load64(ctx + AGN_PYT_SANDBOX),
+    load64(ctx + AGN_PYT_SOURCE), load64(ctx + AGN_PYT_NAME), params, &err);
+    if (r == 0) {
+        # ⚠ The prefix DOUBLES, and that is the oracle's output. `e` is an
+        # `AgnosaiError` whose Sandbox variant Displays as
+        # `"sandbox error: <detail>"`, and the format string adds
+        # `"python sandbox error: "` in front — so the real string is
+        # `"python sandbox error: sandbox error: failed to spawn python
+        # process"`. `agnosai_error_message` reproduces Display including the
+        # prefix; `agnosai_error_detail` would drop it and quietly diverge.
+        return agnosai_tool_output_err(str_cat(str_from("python sandbox error: "),
+        agnosai_error_message(load64(&err))));
+    }
+
+    return agnosai_python_tool_output_of(agnosai_python_result_stdout(r),
+    agnosai_python_result_stderr(r), agnosai_python_result_exit_code(r),
+    agnosai_python_result_timed_out(r));
+}
+
+# A tool that runs `source` in `sandbox` — the oracle's `PythonTool::new`.
+#
+# `parameters` is a vec of `ParameterSchema` and is retained by the returned
+# tool; build it with `agnosai_param_schema_new`.
+fn agnosai_python_tool(name: Str, description: Str, parameters, source: Str,
+sandbox): i64 {
+    var ctx = alloc(AGN_PYT_BYTES);
+    store64(ctx + AGN_PYT_NAME, name);
+    store64(ctx + AGN_PYT_DESCRIPTION, description);
+    store64(ctx + AGN_PYT_PARAMETERS, parameters);
+    store64(ctx + AGN_PYT_SOURCE, source);
+    store64(ctx + AGN_PYT_SANDBOX, sandbox);
+    return agnosai_tool_new(name, description, &_agnosai_python_tool_schema,
+    &_agnosai_python_tool_execute, ctx);
+}

@@ -5,7 +5,7 @@ description = "AgnosAI — provider-agnostic AI orchestration: crews, tasks, too
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/agnosai"
 language = "cyrius"
-cyrius = "6.5.16"
+cyrius = "6.5.18"
 
 [build]
 entry = "src/main.cyr"
@@ -31,14 +31,14 @@ stdlib = [
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 path = "../sigil"
-# 3.12.4 — what cyrius 6.5.12 folds, verified: `lib/sigil.cyr` reports
-# `# Version: 3.12.4`. ⚠ agnosai does NOT get sigil from this dep — `sigil.cyr`
+# 3.12.7 — what cyrius 6.5.18 folds, verified: `lib/sigil.cyr` reports
+# `# Version: 3.12.7`. ⚠ agnosai does NOT get sigil from this dep — `sigil.cyr`
 # is FOLDED INTO the cyrius stdlib snapshot, and `lib sync --full` (which the
 # bump procedure runs *after* `deps`) overwrites the git-dep copy with the fold.
 # So this pin tracks the fold, not sigil's tags: bumping it alone changes
 # nothing, and naming a version the fold does not carry would be a pin that
 # lies about what is built.
-tag = "3.12.6"
+tag = "3.12.7"
 modules = ["dist/sigil.cyr"]
 
 [deps.bote]
@@ -56,7 +56,7 @@ modules = ["dist/majra.cyr"]
 [deps.kavach]
 git = "https://github.com/MacCracken/kavach.git"
 path = "../kavach"
-tag = "3.11.7"
+tag = "3.11.8"
 modules = ["dist/kavach.cyr"]
 
 [deps.ai-hwaccel]
@@ -84,29 +84,34 @@ modules = ["dist/tyche.cyr"]
 #
 # That is not hypothetical: under the 6.5.10 bump the tree built **2.4.7** while
 # the pin shipped 2.4.8, which silently reverted the `i64::MIN` integer-format
-# fix (`n = 0 - n` is a no-op at i64::MIN). sigil and bote are now on 2.4.8 too,
-# so this pin is redundant *today* — it exists so the next sibling that lags
-# cannot reintroduce the same silent downgrade. majra carries the identical pin
-# for the identical reason; see the comment on its `[deps.sakshi]`.
+# fix (`n = 0 - n` is a no-op at i64::MIN).
 #
-# ⚠ **The lib-snapshot gate's result depends on whether a build ran since the
+# ⚠ **Still load-bearing as of the 6.5.18 bump, and the sibling has changed.**
+# This used to say "sigil and bote"; neither declares `[deps.sakshi]` any more —
+# **sigil 3.12.7 dropped it** (sakshi is folded into the stdlib now, so the git
+# dep was downgrading every sigil consumer) and bote never replaced it. The one
+# that still lags is **majra 2.6.0, at 2.4.8**. Remove this pin and the tree
+# silently builds 2.4.8 again.
+#
+# ⚠ **The lib-snapshot gate can flap depending on whether a build ran since the
 # last sync, and that is this pin's doing.** Observed on the 6.5.15 bump:
 # `cyrius lib sync --full` writes the snapshot's sakshi into `lib/` and
 # `check-clean` passes; the very next `cyrius build` performs an implicit
 # resolve, overwrites `lib/sakshi.cyr` back to this tag, and `check-clean`
-# fails. Neither result is wrong — the *built* artifact is always this tag, so
-# 2.4.8 is what agnosai actually runs. Do not "fix" the flap by re-syncing
-# before the gate; that hides which sakshi the binary contains.
+# fails. Neither result is wrong — the *built* artifact is always this tag. Do
+# not "fix" the flap by re-syncing before the gate; that hides which sakshi the
+# binary contains.
 #
-# ⚠ **As of the 6.5.15 bump this pin is the thing doing the lagging.** The
-# toolchain snapshot ships sakshi **2.4.9** and this tag holds `lib/sakshi.cyr`
-# at 2.4.8 — visible as the same unnamed "1 bundled lib(s) differ" warning, now
-# pointing the other way. That is deliberate for the moment: 2.4.9 changes what
-# `sakshi_log_kv` hands an emit hook, and `src/telemetry/mod.cyr`'s formatter is
-# written against 2.4.8. **Bump this tag to 2.4.10 and update
-# `_agnosai_telemetry_json_hook` in the same commit** — the two are one change,
-# because on 2.4.9+ a hook that ignores the new sixth argument silently drops
-# every `key=value` from the JSON rather than merely failing to structure it.
+# ✅ **No flap as of 6.5.18**, because this tag and the snapshot are both 2.4.10:
+# the overlay rewrites the same bytes. It returns the moment they diverge, which
+# is the next time the toolchain moves sakshi and this pin does not.
+#
+# ✅ **The 2.4.9 hook change is done.** This note used to say the pin was itself
+# the laggard at 2.4.8 while the snapshot shipped 2.4.9, and that bumping it had
+# to land together with `_agnosai_telemetry_json_hook` — because on 2.4.9+ a hook
+# ignoring the new sixth argument silently drops every `key=value` from the JSON
+# rather than merely failing to structure it. Both shipped together; the tag is
+# 2.4.10 and matches the 6.5.18 snapshot.
 #
 # **Keep this in step with the toolchain's bundled sakshi on every pin bump.**
 [deps.sakshi]

@@ -83,23 +83,12 @@ var AGNOSAI_PKG_MAX_ENTRIES = 100;
 # Spaces per level, matching `serde_json::to_string_pretty`.
 var AGNOSAI_PKG_JSON_INDENT = 2;
 
-# Fixed ZIP overhead per member, in bytes.
+# Headroom on `zip_bound`'s answer.
 #
-# 30 local header + 20 zip64 extra + 46 central-directory record + 28 zip64
-# extra in the CD record. The member NAME is counted twice on top of this — it
-# appears in both the local header and the CD record — and the payload once.
-var AGNOSAI_PKG_ZIP_MEMBER_OVERHEAD = 124;
-
-# Fixed ZIP trailer: zip64 EOCD 56 + zip64 locator 20 + EOCD 22.
-var AGNOSAI_PKG_ZIP_TRAILER = 98;
-
-# Headroom on the computed bound.
-#
-# The bound is derived from sankoch's current record layout, and sankoch is a
-# vendored bundle that can change under a toolchain bump. An under-bound is not
-# silent — every write site returns `ERR_BUFFER_TOO_SMALL` and this module turns
-# that into an `Other` error — but a package that fails to export because a
-# header grew four bytes is a bad way to find out.
+# ⚠ Kept at zero-cost belt-and-braces since sankoch 2.7.7: the bound is now
+# **sankoch's own**, so it cannot drift from sankoch's record layout the way a
+# re-derived one could. The slack stays because an under-bound is a failed
+# export rather than a corrupt one, and 256 bytes on a package is nothing.
 var AGNOSAI_PKG_ZIP_SLACK = 256;
 
 # Stride of the member list `_agnosai_pkg_members` builds: name, then body.
@@ -228,20 +217,28 @@ fn _agnosai_pkg_members(p, out_err): i64 {
 
 # An upper bound on the archive `_agnosai_pkg_write` will produce.
 #
-# ⚠ This is only an upper bound because DEFLATE degrades to STORE rather than
-# growing a member (`lib/sankoch.cyr:14795-14810`, `cl > 0 && cl < len`). If
-# sankoch ever stored a compressed payload that was larger than its input, this
-# would under-count — which is why the writer's `ERR_BUFFER_TOO_SMALL` is
-# surfaced as an error rather than assumed unreachable.
+# ⚠ **`zip_bound` is sankoch's, as of 2.7.7.** This function used to reproduce
+# sankoch's record layout here — 30-byte local header, 20-byte Zip64 extra,
+# 46-byte central-directory record, 28-byte CD Zip64 extra, 22/56/20-byte
+# trailers, the name counted twice — which meant a consumer maintaining a
+# private copy of a vendored library's internals, and a silent under-count the
+# next time any of those grew. That was filed and sankoch answered with
+# `zip_bound` / `zip_bound_member`; this is the consumption.
+#
+# It remains an upper bound only because DEFLATE degrades to STORE rather than
+# growing a member, so the stored payload never exceeds its input. sankoch now
+# documents that guarantee next to `zip_bound` itself rather than leaving a
+# consumer to discover it.
 fn _agnosai_pkg_bound(members): i64 {
-    var total = AGNOSAI_PKG_ZIP_TRAILER + AGNOSAI_PKG_ZIP_SLACK;
+    var count = 0;
+    var name_bytes = 0;
+    var payload_bytes = 0;
     for (var i = 0; i < vec_len(members); i = i + AGNOSAI_PKG_MEMBER_STRIDE) {
-        var nlen = str_len(vec_get(members, i));
-        var blen = str_len(vec_get(members, i + 1));
-        # The name is in both the local header and the central directory.
-        total = total + AGNOSAI_PKG_ZIP_MEMBER_OVERHEAD + nlen + nlen + blen;
+        count = count + 1;
+        name_bytes = name_bytes + str_len(vec_get(members, i));
+        payload_bytes = payload_bytes + str_len(vec_get(members, i + 1));
     }
-    return total;
+    return zip_bound(count, name_bytes, payload_bytes) + AGNOSAI_PKG_ZIP_SLACK;
 }
 
 # `zip <what>: sankoch error <n>` — the detail for a writer or reader failure.
@@ -487,12 +484,34 @@ fn _agnosai_pkg_read_member(z, i, what: Str, out_err): Str {
 #   6. the manifest parses, all three fields  → Serialization
 #   7. per definition member, 4-6 again
 fn agnosai_package_import(buf, len, out_pkg): i64 {
-    # ⚠ `zip_open` answers a bare 0 for every failure — truncated, multi-disk,
-    # bad central directory, an ENCRYPTED member, or OOM — so there is nothing
-    # to discriminate on. The oracle interpolates the `zip` crate's message; the
-    # variant is what a caller matches.
+    # ⚠ `zip_open` used to answer a bare 0 for every failure — truncated,
+    # multi-disk, bad central directory, an ENCRYPTED member, or OOM — so there
+    # was nothing to discriminate on and every one of them became the same
+    # `InvalidDefinition`. That was filed and sankoch 2.7.7 answered with
+    # `zip_last_error()`; this is the consumption.
+    #
+    # The mapping is the oracle's variant taxonomy, not sankoch's:
+    #
+    #   * a **corrupt or truncated** archive is `InvalidDefinition`, which is
+    #     where the oracle's `ZipArchive::new` failure goes;
+    #   * an **encrypted or multi-disk** member is *also* `InvalidDefinition`,
+    #     but it is a different sentence, because the archive is well-formed and
+    #     a caller reading "invalid zip" would go looking for corruption. ⚠ The
+    #     oracle would OPEN this archive and skip only the encrypted entry —
+    #     [ADR 018](../../docs/adr/018-sankoch-path-check-on-import.md) point 6
+    #     records the divergence, which is now at least *legible* rather than
+    #     indistinguishable from corruption;
+    #   * **OOM** is `Io`, because it is not a statement about the bytes.
     var z = zip_open(buf, len);
     if (z == 0) {
+        var why = zip_last_error();
+        if (why == 0 - ERR_OOM) {
+            return agnosai_error_io(str_from("out of memory reading the archive index"));
+        }
+        if (why == 0 - ERR_UNSUPPORTED_FORMAT) {
+            return agnosai_error_invalid_definition(str_from(
+            "invalid zip: encrypted or multi-disk archives are not supported"));
+        }
         return agnosai_error_invalid_definition(str_from(
         "invalid zip: not a readable archive"));
     }

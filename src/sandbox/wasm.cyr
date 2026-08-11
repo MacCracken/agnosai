@@ -1,0 +1,319 @@
+# =========================================================================
+# sandbox/wasm — sandboxed WASM execution.
+#
+# Parity oracle: rust-old/src/sandbox/wasm.rs
+#
+# The oracle embeds wasmtime and drives it in-process. This drives the
+# `wasmtime` CLI through **kavach's WASM backend**, per
+# [ADR 019](../../docs/adr/019-wasm-tools-spawn-wasmtime-directly.md) — which
+# means kavach's seccomp and landlock wrap the runtime process, on top of
+# wasmtime's own WASI sandbox around the guest.
+#
+# ⚠ **kavach 3.11.8 is a FLOOR, not a preference.** In 3.11.7 that backend was
+# hardcoded unavailable, had no stdin channel, and reported every guest failure
+# as a success with empty stderr. All three were filed and fixed;
+# `cyrius.cyml` pins 3.11.8 and `tests/sandbox_wasm.tcyr` asserts the stdin and
+# exit-code behaviour that only 3.11.8 has.
+#
+# ## The four bounds the oracle configures, and where they live now
+#
+# | bound | oracle | here |
+# |---|---|---|
+# | memory | `StoreLimitsBuilder::memory_size` | `--max-memory-size`, via kavach |
+# | CPU | `store.set_fuel` | `--fuel`, via kavach |
+# | wall clock | epoch deadline + ticker thread | `SandboxConfig.timeout_ms` |
+# | ambient authority | WASI ctx with only stdin/stdout | no `--dir` preopens, plus seccomp/landlock |
+#
+# ## `load_module` VALIDATES rather than compiles
+#
+# The oracle's `load_module` hands the bytes to `Module::new`, so a malformed
+# module fails at LOAD. A CLI cannot pre-compile, so the failure would otherwise
+# move to `execute` — and the oracle's own tests assert that
+# `load_module(b"not valid wasm")` errors with a message naming what was
+# *expected*. So this checks the eight-byte header and persists the bytes; a
+# module that gets past the header and is still malformed fails at `execute`,
+# which is a documented residual rather than a silent one.
+#
+# ## `wasmtime` is a host requirement
+#
+# Absent, `agnosai_wasm_available()` answers 0 and `execute` returns a
+# `Sandbox` error naming the binary. That is an assertable arm, not a silent
+# skip, and it is the arm this development box actually takes.
+# =========================================================================
+
+# The oracle's four constants, unchanged.
+var AGNOSAI_WASM_DEFAULT_MAX_MEMORY_BYTES = 67108864;
+var AGNOSAI_WASM_DEFAULT_TIMEOUT_MS = 30000;
+var AGNOSAI_WASM_DEFAULT_FUEL = 1000000000;
+var AGNOSAI_WASM_STDOUT_CAPACITY = 1048576;
+
+# The oracle's `extract_exit_code` taxonomy, for failures that are not the
+# guest's own `proc_exit`.
+#
+# ⚠ These are NEGATIVE and they are not errno. `-1` is the wall-clock deadline,
+# `-2` is fuel exhaustion, `-3` is anything else. A caller matching `!= 0`
+# behaves identically either way; a caller that reports the number to a user
+# needs them to mean what the oracle's mean.
+var AGNOSAI_WASM_EXIT_TIMEOUT = 0 - 1;
+var AGNOSAI_WASM_EXIT_FUEL = 0 - 2;
+var AGNOSAI_WASM_EXIT_TRAP = 0 - 3;
+
+# The eight-byte WASM header: `\0asm` then a little-endian version of 1.
+var AGNOSAI_WASM_HEADER_LEN = 8;
+
+# WasmSandbox heap layout — 24 bytes.
+enum AgnosaiWasmSandboxOff {
+    AGN_WS_MAX_MEMORY_BYTES = 0;
+    AGN_WS_TIMEOUT_MS = 8;
+    AGN_WS_FUEL = 16;
+    AGN_WS_BYTES = 24;
+}
+
+# WasmModule heap layout — 16 bytes.
+#
+# ⚠ Holds a PATH, not a compiled module. `wasmtime run` takes a file, so the
+# bytes are written once at load and the path is what `execute` passes. The
+# oracle's `WasmModule` wraps a `Module` that was compiled at load; the
+# observable difference is *when* a malformed body is rejected, which the header
+# note above covers.
+enum AgnosaiWasmModuleOff {
+    AGN_WM_PATH = 0;
+    AGN_WM_LEN = 8;
+    AGN_WM_BYTES = 16;
+}
+
+# WasmResult heap layout — 16 bytes.
+enum AgnosaiWasmResultOff {
+    AGN_WR_STDOUT = 0;
+    AGN_WR_EXIT_CODE = 8;
+    AGN_WR_BYTES = 16;
+}
+
+# A sandbox with the oracle's default limits.
+fn agnosai_wasm_sandbox_new(): i64 {
+    return agnosai_wasm_sandbox_with_limits(AGNOSAI_WASM_DEFAULT_MAX_MEMORY_BYTES,
+    AGNOSAI_WASM_DEFAULT_TIMEOUT_MS);
+}
+
+# A sandbox with explicit memory and wall-clock limits.
+#
+# ⚠ The fuel budget is NOT a parameter, matching the oracle: `with_limits` takes
+# memory and a timeout and leaves `fuel` at its default. A caller wanting a
+# different CPU budget has no way to ask for one, upstream or here.
+fn agnosai_wasm_sandbox_with_limits(max_memory_bytes, timeout_ms): i64 {
+    var s = alloc(AGN_WS_BYTES);
+    store64(s + AGN_WS_MAX_MEMORY_BYTES, max_memory_bytes);
+    store64(s + AGN_WS_TIMEOUT_MS, timeout_ms);
+    store64(s + AGN_WS_FUEL, AGNOSAI_WASM_DEFAULT_FUEL);
+    return s;
+}
+
+# The sandbox's memory ceiling, in bytes.
+fn agnosai_wasm_sandbox_max_memory_bytes(s): i64 {
+    return load64(s + AGN_WS_MAX_MEMORY_BYTES);
+}
+
+# The sandbox's wall-clock limit, in milliseconds.
+fn agnosai_wasm_sandbox_timeout_ms(s): i64 {
+    return load64(s + AGN_WS_TIMEOUT_MS);
+}
+
+# The sandbox's fuel budget.
+fn agnosai_wasm_sandbox_fuel(s): i64 {
+    return load64(s + AGN_WS_FUEL);
+}
+
+# Whether a `wasmtime` runtime is present.
+#
+# ⚠ `backend_is_available`, not a bare `which` — it is what `sandbox_create`
+# consults, so a caller that asks this and then executes cannot be told
+# different things by the two. Before kavach 3.11.8 this answered a hardcoded 0
+# and the two DID disagree.
+fn agnosai_wasm_available(): i64 {
+    return backend_is_available(Backend.WASM);
+}
+
+# Whether `buf` opens with the eight-byte WASM header.
+fn _agnosai_wasm_header_ok(buf, len): i64 {
+    if (len < AGNOSAI_WASM_HEADER_LEN) { return 0; }
+    if (load8(buf) != 0) { return 0; }
+    if (load8(buf + 1) != 97) { return 0; }
+    if (load8(buf + 2) != 115) { return 0; }
+    if (load8(buf + 3) != 109) { return 0; }
+    # Version, little-endian u32 = 1.
+    if (load8(buf + 4) != 1) { return 0; }
+    if (load8(buf + 5) != 0) { return 0; }
+    if (load8(buf + 6) != 0) { return 0; }
+    if (load8(buf + 7) != 0) { return 0; }
+    return 1;
+}
+
+# A unique path for one module's bytes.
+fn _agnosai_wasm_module_path(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "/tmp/agnosai-wasm-");
+    str_builder_add(sb, agnosai_uuid_v4_str());
+    str_builder_add_cstr(sb, ".wasm");
+    return str_builder_build(sb);
+}
+
+# Load a module from raw bytes — the oracle's `load_module`.
+#
+# Returns 0 with `*out_err` set to a `Sandbox` error.
+#
+# ⚠ The message names what was **expected**, because the oracle's own test
+# asserts `msg.contains("expected")` — it is checking that the caller is told
+# the bytes are not WASM rather than merely that something went wrong.
+fn agnosai_wasm_load_module(s, buf, len, out_err): i64 {
+    if (_agnosai_wasm_header_ok(buf, len) == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from(
+        "invalid WASM module: expected magic bytes \\0asm and version 1")));
+        return 0;
+    }
+
+    var path = _agnosai_wasm_module_path();
+    if (file_write_all(str_data(path), buf, len) != len) {
+        store64(out_err, agnosai_error_sandbox(str_cat(
+        str_from("could not stage WASM module at "), path)));
+        return 0;
+    }
+
+    var m = alloc(AGN_WM_BYTES);
+    store64(m + AGN_WM_PATH, path);
+    store64(m + AGN_WM_LEN, len);
+    return m;
+}
+
+# Load a module from a file — the oracle's `load_module_from_file`.
+#
+# ⚠ Re-staged through `load_module` rather than handed to `wasmtime` where it
+# lies. The header is validated the same way, and a caller cannot make the
+# sandbox execute an arbitrary path it did not first prove was a WASM module.
+fn agnosai_wasm_load_module_from_file(s, path: Str, out_err): i64 {
+    # ⚠ `_agnosai_loader_read` is `definitions/loader`'s, reached across module
+    # boundaries because `src/main.cyr` puts definitions before sandbox. This is
+    # the **THIRD** whole-file read in the tree — `orchestrator/durable_state`
+    # has `_agnosai_read_file_exact` and `definitions/loader` has this one — so
+    # CLAUDE.md's rule fires: the next bite hoists one reader to a port-local
+    # root module and points all three at it. Using the existing one rather than
+    # writing a fourth copy is the smaller wrong thing meanwhile.
+    var content = _agnosai_loader_read(path, out_err);
+    if (content == 0) { return 0; }
+    return agnosai_wasm_load_module(s, str_data(content), str_len(content), out_err);
+}
+
+# The staged path of a loaded module.
+fn agnosai_wasm_module_path(m): Str {
+    return load64(m + AGN_WM_PATH);
+}
+
+# The module's byte length.
+fn agnosai_wasm_module_len(m): i64 {
+    return load64(m + AGN_WM_LEN);
+}
+
+# Classify a run that kavach reported — the oracle's `extract_exit_code`.
+#
+# ⚠ The guest's own exit code wins when it is one. wasmtime surfaces WASI
+# `proc_exit(n)` as its own process exit `n`, so a module that exits 3 reports 3
+# — the oracle's `I32Exit` arm. Only a run that FAILED without the guest saying
+# so gets the negative taxonomy.
+#
+# ⚠ The distinction between a deadline, exhausted fuel and a plain trap is read
+# out of **stderr text**, because a CLI has one exit code and the oracle had a
+# typed error chain. Best-effort and recorded as such: `timed_out` from kavach
+# is authoritative for the deadline, and the other two are string matches on
+# what wasmtime prints.
+fn agnosai_wasm_classify_exit(exit_code, timed_out, stderr: Str): i64 {
+    if (timed_out == 1) { return AGNOSAI_WASM_EXIT_TIMEOUT; }
+    if (exit_code == 0) { return 0; }
+    if (agnosai_str_contains_ci_cstr(stderr, "all fuel consumed") == 1) {
+        return AGNOSAI_WASM_EXIT_FUEL;
+    }
+    if (agnosai_str_contains_ci_cstr(stderr, "fuel") == 1) {
+        return AGNOSAI_WASM_EXIT_FUEL;
+    }
+    if (agnosai_str_contains_ci_cstr(stderr, "epoch") == 1) {
+        return AGNOSAI_WASM_EXIT_TIMEOUT;
+    }
+    if (agnosai_str_contains_ci_cstr(stderr, "interrupt") == 1) {
+        return AGNOSAI_WASM_EXIT_TIMEOUT;
+    }
+    # ⚠ A guest's OWN non-zero exit passes through unchanged. Mapping every
+    # non-zero code onto -3 would erase `proc_exit(2)`, which the oracle
+    # preserves through its `I32Exit` arm.
+    if (agnosai_str_contains_ci_cstr(stderr, "wasm trap") == 1) {
+        return AGNOSAI_WASM_EXIT_TRAP;
+    }
+    return exit_code;
+}
+
+# Build the result the oracle returns.
+fn agnosai_wasm_result_new(stdout: Str, exit_code): i64 {
+    var r = alloc(AGN_WR_BYTES);
+    store64(r + AGN_WR_STDOUT, stdout);
+    store64(r + AGN_WR_EXIT_CODE, exit_code);
+    return r;
+}
+
+# The module's captured stdout.
+fn agnosai_wasm_result_stdout(r): Str {
+    return load64(r + AGN_WR_STDOUT);
+}
+
+# The module's exit code — 0, the guest's own, or the negative taxonomy.
+fn agnosai_wasm_result_exit_code(r): i64 {
+    return load64(r + AGN_WR_EXIT_CODE);
+}
+
+# Execute a loaded module with `input` on its stdin — the oracle's `execute`.
+#
+# Returns 0 with `*out_err` set; a module that RAN and failed is a successful
+# call carrying a non-zero exit code, which is the oracle's shape.
+#
+# ⚠ The kavach lifecycle here mirrors `agnosai_kavach_execute`'s
+# (`src/sandbox/kavach_bridge.cyr:360`) rather than calling it, because that one
+# maps an agnosai isolation level onto a backend and this must pin
+# `Backend.WASM` and set `config_stdin`. That is the SECOND instance of the
+# create/RUNNING/exec/STOPPED/DESTROYED sequence — CLAUDE.md says extract at the
+# third.
+fn agnosai_wasm_execute(s, module, input: Str, out_err): i64 {
+    if (agnosai_wasm_available() == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from(
+        "wasmtime runtime not found — WASM tool execution is unavailable")));
+        return 0;
+    }
+
+    var cfg = config_new();
+    config_backend(cfg, Backend.WASM);
+    config_timeout_ms(cfg, load64(s + AGN_WS_TIMEOUT_MS));
+    # ⚠ `str_cstr`, not `str_data`: kavach stores the pointer verbatim and every
+    # later reader is `strlen`-based, but a Str's bytes carry no terminator.
+    # The same trap `kavach_bridge`'s `config_agent_id` documents.
+    config_stdin(cfg, str_cstr(input), str_len(input));
+
+    var sandbox = sandbox_create(cfg);
+    if (sandbox == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from("kavach create failed")));
+        return 0;
+    }
+    if (sandbox_transition(sandbox, SandboxState.RUNNING) != KAVACH_ERR_OK) {
+        sandbox_destroy(sandbox);
+        store64(out_err, agnosai_error_sandbox(str_from("kavach start failed")));
+        return 0;
+    }
+
+    var result = sandbox_exec(sandbox, str_data(load64(module + AGN_WM_PATH)));
+
+    sandbox_transition(sandbox, SandboxState.STOPPED);
+    sandbox_transition(sandbox, SandboxState.DESTROYED);
+
+    if (result == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from("kavach exec failed")));
+        return 0;
+    }
+
+    return agnosai_wasm_result_new(str_from(ExecResult_stdout(result)),
+    agnosai_wasm_classify_exit(ExecResult_exit_code(result),
+    ExecResult_timed_out(result), str_from(ExecResult_stderr(result))));
+}

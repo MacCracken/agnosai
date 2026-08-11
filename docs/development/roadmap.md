@@ -673,13 +673,43 @@ probes and 14 kills.
   will silently need revisiting if that layout changes — it fails loudly rather
   than corrupting, but it is a consumer re-deriving a library's internals.
 
-### M11 — the `sandbox`-gated tools and `hwaccel` (Phase 10)
+### M11 — the `sandbox`-gated tools and `hwaccel` (Phase 10) — ✅ COMPLETE 2026-08-10
 
-`tools/python_tool.rs`, `tools/wasm_tool.rs`, `tools/wasm_loader.rs`, and the
-`#[cfg(feature = "hwaccel")]` half of `core/resource.rs`. WASM needs its own
-analysis against the current toolchain rather than the inherited "cyrius
-non-goal" verdict — [ADR-006](../adr/006-cx-tool-sandbox.md) records what
-cx + kavach substitute and what is lost (fuel metering).
+✅ **`llm/router` hwaccel** (2 fns), **`core/resource` hwaccel** (6 items),
+**`tools/python_tool`** — 2026-08-09. 25 mutation probes, 25 kills.
+
+✅ **`sandbox/wasm`, 2026-08-10** — 43 assertions, 10 mutation probes, 10 kills.
+On kavach 3.11.8's backend per ADR 019, with `config_stdin` carrying the tool's
+input. ⚠ `load_module` **validates** the eight-byte header where the oracle
+compiles, because a CLI cannot pre-compile — magic *and* version, so a
+version-2 module is refused at load rather than deferred to an exec-time trap.
+
+✅ **`tools/wasm_tool` and `tools/wasm_loader`, 2026-08-10** — 66 assertions, 13
+mutation probes, 13 kills. ⚠ The `.wasm` filename comes from the **manifest's**
+name, not the directory's, which every oracle fixture hides by having the two
+agree. ⚠ `load_tool_package` propagates every failure and
+`load_all_tool_packages` logs and skips them, so one broken package in a
+directory is a count that is quietly one lower.
+
+⚠ **`sandbox/wasm.rs` was missing from this row entirely.** `src/sandbox/mod.cyr`
+called it "excluded rather than postponed"; ADR-006's own 2026-08-07 correction
+overturned that, and the full-port mandate settles it. 521 lines and 11 tests.
+
+✅ **The transport question is settled.** ADR-006's correction named kavach's
+wasmtime backend; against kavach 3.11.7 that backend was hardcoded unavailable,
+had no stdin channel and discarded the guest's exit code. All three were filed
+and **fixed in kavach 3.11.8**, which agnosai now pins — so the WASM bites go
+through kavach after all, and get seccomp and landlock around the runtime
+process on top of wasmtime's own WASI sandbox.
+[ADR 019](../adr/019-wasm-tools-spawn-wasmtime-directly.md) records the round
+trip; kavach 3.11.8 is a **floor**, because 3.11.7 reports every WASM failure as
+a success.
+
+⚠ **`wasmtime` is not installed on this box**, and no `.wasm` fixture exists
+anywhere in the tree. That blocks the *end-to-end test*, not the bite: the
+loader, the validator, the argv builder, the exit-code classifier and the whole
+output ladder are all testable, fixtures are hand-encodable as byte literals,
+and the "runtime absent" arm is itself a real assertion here.
 
 ### M12 — `llm` residue, tests, benches and the non-`src` surface (Phase 11)
 

@@ -1,0 +1,244 @@
+# =========================================================================
+# tools/wasm_loader — WASM tool package loading.
+#
+# Parity oracle: rust-old/src/tools/wasm_loader.rs
+#
+# A package is a directory holding `manifest.json` and `<name>.wasm`:
+#
+#   tools/
+#   ├── hello/
+#   │   ├── manifest.json
+#   │   └── hello.wasm
+#   └── calculator/
+#       ├── manifest.json
+#       └── calculator.wasm
+#
+# ⚠ **The `.wasm` filename comes from the MANIFEST's `name`, not the
+# directory's.** A directory `hello/` whose manifest says `"name": "greet"` is
+# searched for `greet.wasm`, and `hello.wasm` sitting beside it is ignored. The
+# oracle's `format!("{}.wasm", pkg.name)` is where that comes from, and its own
+# fixtures always agree, so no upstream test can see the difference.
+#
+# ## Two functions with opposite error policies
+#
+# ⚠ `load_tool_package` **propagates** every failure. `load_all_tool_packages`
+# **logs and skips** them and returns a count. So one bad package in a directory
+# of twenty is a warning and a count of nineteen — no error reaches the caller,
+# and the caller cannot tell "nineteen packages" from "twenty, one broken".
+# That asymmetry is the oracle's and it is reproduced; it is also exactly the
+# shape that hides a deployment mistake, which is why it is stated here.
+# =========================================================================
+
+# The on-disk manifest's default version, when the field is absent.
+#
+# ⚠ `#[serde(default = "default_version")]` — an absent `version` is
+# **"0.0.0"**, not an error and not an empty string. `parameters` is
+# `#[serde(default)]`, so an absent list is empty. `name` and `description` have
+# neither, so both are required.
+var AGNOSAI_WASM_PKG_DEFAULT_VERSION = "0.0.0";
+
+# PackageManifest heap layout — 32 bytes.
+enum AgnosaiWasmPkgOff {
+    AGN_WPKG_NAME = 0;
+    AGN_WPKG_DESCRIPTION = 8;
+    AGN_WPKG_VERSION = 16;
+    AGN_WPKG_PARAMETERS = 24;
+    AGN_WPKG_BYTES = 32;
+}
+
+# The package's tool name — and the stem of its `.wasm` file.
+fn agnosai_wasm_pkg_name(p): i64 {
+    return load64(p + AGN_WPKG_NAME);
+}
+
+# The package's description.
+fn agnosai_wasm_pkg_description(p): i64 {
+    return load64(p + AGN_WPKG_DESCRIPTION);
+}
+
+# The package's version, or "0.0.0" when the manifest omitted it.
+fn agnosai_wasm_pkg_version(p): i64 {
+    return load64(p + AGN_WPKG_VERSION);
+}
+
+# The package's declared parameters, possibly empty.
+fn agnosai_wasm_pkg_parameters(p): i64 {
+    return load64(p + AGN_WPKG_PARAMETERS);
+}
+
+# One `ParameterSchema` from a manifest entry, or 0 when it is malformed.
+#
+# ⚠ `ParameterSchema` has no serde defaults, so all four fields are required and
+# a malformed entry fails the whole manifest — it is not skipped. That differs
+# from `agnosai_agent_from_value`, which drops a bad entry inside `tools`.
+fn _agnosai_wasm_param_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var name = bayan_json_v_obj_get(v, "name");
+    var desc = bayan_json_v_obj_get(v, "description");
+    var ptype = bayan_json_v_obj_get(v, "param_type");
+    var req = bayan_json_v_obj_get(v, "required");
+    if (name == 0 || desc == 0 || ptype == 0 || req == 0) { return 0; }
+    if (bayan_json_v_is_str(name) == 0 || bayan_json_v_is_str(desc) == 0) { return 0; }
+    if (bayan_json_v_is_str(ptype) == 0 || bayan_json_v_is_bool(req) == 0) { return 0; }
+    return agnosai_param_schema_new(str_clone(bayan_json_v_str(name)),
+    str_clone(bayan_json_v_str(desc)), str_clone(bayan_json_v_str(ptype)),
+    bayan_json_v_bool(req));
+}
+
+# Parse a `manifest.json` body, or 0 when it is not one.
+fn agnosai_wasm_pkg_from_json(src: Str): i64 {
+    var v = bayan_json_v_parse_buf(str_data(src), str_len(src));
+    if (v == 0) { return 0; }
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+
+    var name = bayan_json_v_obj_get(v, "name");
+    var desc = bayan_json_v_obj_get(v, "description");
+    if (name == 0 || desc == 0) { return 0; }
+    if (bayan_json_v_is_str(name) == 0 || bayan_json_v_is_str(desc) == 0) { return 0; }
+
+    # ⚠ Absent `version` defaults, absent `parameters` is empty — neither is an
+    # error, and neither is `name`/`description`'s behaviour.
+    var version = str_from(AGNOSAI_WASM_PKG_DEFAULT_VERSION);
+    var vv = bayan_json_v_obj_get(v, "version");
+    if (vv != 0) {
+        if (bayan_json_v_is_str(vv) == 0) { return 0; }
+        version = str_clone(bayan_json_v_str(vv));
+    }
+
+    var params = vec_new();
+    var pv = bayan_json_v_obj_get(v, "parameters");
+    if (pv != 0) {
+        if (bayan_json_v_is_arr(pv) == 0) { return 0; }
+        for (var i = 0; i < bayan_json_v_arr_len(pv); i = i + 1) {
+            var one = _agnosai_wasm_param_from_value(bayan_json_v_arr_get(pv, i));
+            if (one == 0) { return 0; }
+            vec_push(params, one);
+        }
+    }
+
+    var p = alloc(AGN_WPKG_BYTES);
+    store64(p + AGN_WPKG_NAME, str_clone(bayan_json_v_str(name)));
+    store64(p + AGN_WPKG_DESCRIPTION, str_clone(bayan_json_v_str(desc)));
+    store64(p + AGN_WPKG_VERSION, version);
+    store64(p + AGN_WPKG_PARAMETERS, params);
+    return p;
+}
+
+# `<dir>/<leaf>`, NUL-terminated.
+fn _agnosai_wasm_pkg_path(dir: Str, leaf: Str): Str {
+    var sb = str_builder_new();
+    str_builder_add(sb, dir);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add(sb, leaf);
+    return str_builder_build(sb);
+}
+
+# Load one package directory — the oracle's `load_tool_package`.
+#
+# Returns 0 with `*out_err` set. Every failure PROPAGATES, unlike the directory
+# walk below.
+fn agnosai_wasm_load_tool_package(dir: Str, out_err): i64 {
+    var manifest_path = _agnosai_wasm_pkg_path(dir, str_from("manifest.json"));
+    var src = _agnosai_loader_read(manifest_path, out_err);
+    if (src == 0) {
+        # ⚠ `InvalidDefinition`, not the `Io` the reader produced. The oracle
+        # maps the read failure with `.map_err(|e| InvalidDefinition(...))`
+        # rather than letting `?` pass an `io::Error` through — so a missing
+        # manifest is a *definition* problem to the caller, not an I/O one.
+        store64(out_err, agnosai_error_invalid_definition(str_cat(
+        str_from("failed to read "), manifest_path)));
+        return 0;
+    }
+
+    var pkg = agnosai_wasm_pkg_from_json(src);
+    if (pkg == 0) {
+        store64(out_err, agnosai_error_serialization(str_cat(
+        str_from("malformed manifest: "), manifest_path)));
+        return 0;
+    }
+
+    # ⚠ The MANIFEST's name, not the directory's.
+    var wasm_path = _agnosai_wasm_pkg_path(dir, str_cat(
+    load64(pkg + AGN_WPKG_NAME), str_from(".wasm")));
+    var bytes = _agnosai_loader_read(wasm_path, out_err);
+    if (bytes == 0) {
+        store64(out_err, agnosai_error_invalid_definition(str_cat(
+        str_from("failed to read "), wasm_path)));
+        return 0;
+    }
+
+    _agnosai_wasm_pkg_log(load64(pkg + AGN_WPKG_NAME), load64(pkg + AGN_WPKG_VERSION),
+    str_len(bytes));
+
+    return agnosai_wasm_tool_from_bytes(load64(pkg + AGN_WPKG_NAME),
+    load64(pkg + AGN_WPKG_DESCRIPTION), load64(pkg + AGN_WPKG_PARAMETERS),
+    str_data(bytes), str_len(bytes), out_err);
+}
+
+# The oracle's `info!(tool, version, wasm_size, "loading WASM tool package")`.
+fn _agnosai_wasm_pkg_log(name: Str, version: Str, size): i64 {
+    if (sakshi_get_level() < SK_INFO) { return 0; }
+    # ⚠ `str_len`, never a hand-counted literal. The sibling message below
+    # shipped as 41 against a 42-byte string and silently lost its final
+    # character — the same off-by-one `sandbox/kavach_bridge.cyr:287` records
+    # having made, which is why that file's comment says to do this.
+    var m = str_from("loading WASM tool package");
+    sakshi_log_kv(SK_INFO, str_data(m), str_len(m), "tool", 4,
+    str_data(name), str_len(name));
+    return 0;
+}
+
+# Scan a directory for packages and register them all — the oracle's
+# `load_all_tool_packages`. Returns the count registered, or -1 with `*out_err`
+# set when the directory itself cannot be read.
+#
+# ⚠ **A package that fails to load is LOGGED AND SKIPPED**, not propagated. One
+# broken package among twenty yields a warning and a count of nineteen, and the
+# caller cannot tell that from a directory that only ever held nineteen. That is
+# the oracle's policy and the opposite of `load_tool_package`'s.
+#
+# ⚠ A subdirectory without `manifest.json` is skipped **before** a load is
+# attempted, so it does not even produce the warning a broken package does.
+# Non-directories are skipped too. Removing that pre-check changes only the log
+# — the count and the errors are identical — so `tests/tools_wasm.tcyr` cannot
+# pin it and does not pretend to.
+fn agnosai_wasm_load_all_tool_packages(tools_dir: Str, registry, out_err): i64 {
+    if (is_dir(tools_dir) == 0) {
+        store64(out_err, agnosai_error_io(str_cat(
+        str_from("failed to read directory "), tools_dir)));
+        return 0 - 1;
+    }
+
+    var loaded = 0;
+    var names = dir_list(tools_dir);
+    for (var i = 0; i < vec_len(names); i = i + 1) {
+        var path = path_join(tools_dir, vec_get(names, i));
+        if (is_dir(path) == 1) {
+            if (file_exists(str_data(_agnosai_wasm_pkg_path(path,
+            str_from("manifest.json")))) == 1) {
+                var perr = 0;
+                store64(&perr, 0);
+                var tool = agnosai_wasm_load_tool_package(path, &perr);
+                if (tool != 0) {
+                    agnosai_tool_registry_register(registry, tool);
+                    loaded = loaded + 1;
+                } else {
+                    _agnosai_wasm_pkg_skip_log(path);
+                }
+            }
+        }
+    }
+    return loaded;
+}
+
+# The oracle's `warn!(dir, error, "failed to load WASM tool package, skipping")`.
+#
+# The one signal a caller gets that a package was dropped — the count says
+# nothing about it.
+fn _agnosai_wasm_pkg_skip_log(dir: Str): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    var m = str_from("failed to load WASM tool package, skipping");
+    sakshi_log_kv(SK_WARN, str_data(m), str_len(m),
+    "dir", 3, str_data(dir), str_len(dir));
+    return 0;
+}

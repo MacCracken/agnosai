@@ -272,6 +272,283 @@ fn main() {
     assert_eq(str_eq(bayan_json_v_build(agnosai_gpu_device_to_value_a(tw_ar, tw_gpu)),
     bayan_json_v_build(agnosai_gpu_device_to_value(tw_gpu))), 1,
     "gpu_device_to_value_a agrees");
+    # --- hwaccel ----------------------------------------------------------
+    # The oracle's four `#[cfg(feature = "hwaccel")]` tests plus its five
+    # `mod training_tests`, and what they leave open. Every body under test is an
+    # adapter over ai-hwaccel, so what is asserted is the WIRING — the enum
+    # narrowing, the CPU diversion, the units — not the library's policy.
+    test_group("core_resource hwaccel");
+
+    # --- Oracle: hwaccel_accelerator_type_mapping -------------------------
+    assert_eq(agnosai_accelerator_type_from_hwaccel(ACCEL_CPU), AGNOSAI_ACCEL_CPU,
+    "CPU maps to CPU");
+    assert_eq(agnosai_accelerator_type_from_hwaccel(ACCEL_CUDA), AGNOSAI_ACCEL_CUDA,
+    "CUDA maps to CUDA");
+    assert_eq(agnosai_accelerator_type_from_hwaccel(ACCEL_ROCM), AGNOSAI_ACCEL_ROCM,
+    "ROCm maps to ROCm");
+    assert_eq(agnosai_accelerator_type_from_hwaccel(ACCEL_METAL), AGNOSAI_ACCEL_METAL,
+    "Metal maps to Metal");
+    assert_eq(agnosai_accelerator_type_from_hwaccel(ACCEL_VULKAN), AGNOSAI_ACCEL_VULKAN,
+    "Vulkan maps to Vulkan");
+
+    # ⚠ **THE one that a pass-through gets wrong.** ai-hwaccel numbers
+    # `ACCEL_TPU = 8` and agnosai numbers `AGNOSAI_ACCEL_TPU = 5`; the five
+    # above are 0-4 on both sides and survive a bare cast, so a cast is right
+    # five times out of six and turns every TPU into an Intel NPU.
+    assert_eq(agnosai_accelerator_type_from_hwaccel(ACCEL_TPU), AGNOSAI_ACCEL_TPU,
+    "TPU maps to TPU, which the identity mapping gets WRONG");
+    assert_neq(ACCEL_TPU, AGNOSAI_ACCEL_TPU,
+    "because the two enums genuinely disagree on TPU's number");
+
+    # ⚠ NPUs and ASICs fall back to CPU — the oracle's `_ => Self::Cpu`.
+    assert_eq(agnosai_accelerator_type_from_hwaccel(ACCEL_INTEL_NPU), AGNOSAI_ACCEL_CPU,
+    "an Intel NPU falls back to CPU");
+    assert_eq(agnosai_accelerator_type_from_hwaccel(ACCEL_GROQ), AGNOSAI_ACCEL_CPU,
+    "and a Groq LPU");
+    # Past the oracle: every one of the thirteen unmapped variants, so a
+    # partial catch-all cannot hide.
+    var fell_back = 0;
+    var unmapped = vec_new();
+    vec_push(unmapped, ACCEL_INTEL_NPU);
+    vec_push(unmapped, ACCEL_AMD_XDNA);
+    vec_push(unmapped, ACCEL_APPLE_NPU);
+    vec_push(unmapped, ACCEL_GAUDI);
+    vec_push(unmapped, ACCEL_NEURON);
+    vec_push(unmapped, ACCEL_QUALCOMM);
+    vec_push(unmapped, ACCEL_INTEL_ONEAPI);
+    vec_push(unmapped, ACCEL_CEREBRAS);
+    vec_push(unmapped, ACCEL_GRAPHCORE);
+    vec_push(unmapped, ACCEL_GROQ);
+    vec_push(unmapped, ACCEL_SAMSUNG_NPU);
+    vec_push(unmapped, ACCEL_MEDIATEK_APU);
+    vec_push(unmapped, ACCEL_WIN_GPU);
+    for (var u = 0; u < vec_len(unmapped); u = u + 1) {
+        if (agnosai_accelerator_type_from_hwaccel(vec_get(unmapped, u))
+        == AGNOSAI_ACCEL_CPU) { fell_back = fell_back + 1; }
+    }
+    assert_eq(fell_back, 13, "all thirteen unmapped variants fall back to CPU");
+
+    # ⚠ CPU is the fallback SPECIFICALLY so an NPU still matches CPU work and
+    # never matches a GPU requirement it cannot serve.
+    assert_eq(agnosai_accelerator_family_of(
+    agnosai_accelerator_type_from_hwaccel(ACCEL_CEREBRAS)), AGNOSAI_FAMILY_CPU,
+    "so an unmapped accelerator lands in the CPU family, not the GPU one");
+
+    # --- Oracle: hwaccel_inventory_from_registry --------------------------
+    var reg = hw_registry_new();
+    reg_add_profile(reg, profile_cpu(64 * 1024 * 1024 * 1024));
+    reg_add_profile(reg, profile_cuda(0, 80 * 1024 * 1024 * 1024));
+    reg_add_profile(reg, profile_cuda(1, 80 * 1024 * 1024 * 1024));
+    var inv = agnosai_hw_inventory_from_hwaccel(reg);
+
+    assert_eq(agnosai_hw_inventory_memory_total_mb(inv), 64 * 1024,
+    "the CPU profile's memory becomes SYSTEM memory");
+    assert(agnosai_hw_inventory_cpu_cores(inv) > 0, "and cpu_cores is populated");
+    assert_eq(vec_len(agnosai_hw_inventory_devices(inv)), 2,
+    "the two CUDA profiles become devices");
+    # ⚠ The CPU profile is NOT among them.
+    assert_eq(agnosai_compute_device_accelerator(
+    vec_get(agnosai_hw_inventory_devices(inv), 0)), AGNOSAI_ACCEL_CUDA,
+    "the first device is CUDA, not the CPU");
+    assert_eq(agnosai_compute_device_accelerator(
+    vec_get(agnosai_hw_inventory_devices(inv), 1)), AGNOSAI_ACCEL_CUDA,
+    "and so is the second");
+    assert_eq(agnosai_compute_device_memory_total_mb(
+    vec_get(agnosai_hw_inventory_devices(inv), 0)), 80 * 1024,
+    "with bytes converted to MiB");
+    assert_eq(agnosai_compute_device_memory_total_mb(
+    vec_get(agnosai_hw_inventory_devices(inv), 1)), 80 * 1024, "on both");
+
+    # Past the oracle:
+    # ⚠ `index` is the REGISTRY position, not a running device count. The CPU
+    # sits at 0, so the first real device is index 1 and index 0 never appears.
+    assert_eq(agnosai_compute_device_index(
+    vec_get(agnosai_hw_inventory_devices(inv), 0)), 1,
+    "the first device's index is its REGISTRY position, so 1 — not 0");
+    assert_eq(agnosai_compute_device_index(
+    vec_get(agnosai_hw_inventory_devices(inv), 1)), 2, "and the second is 2");
+
+    # ⚠ An absent `memory_free` falls back to the TOTAL, not to zero.
+    assert_eq(agnosai_compute_device_memory_available_mb(
+    vec_get(agnosai_hw_inventory_devices(inv), 0)), 80 * 1024,
+    "an unknown free-memory reading falls back to the total, not to 0");
+
+    # The device name comes from ai-hwaccel's own naming.
+    assert(str_len(agnosai_compute_device_name(
+    vec_get(agnosai_hw_inventory_devices(inv), 0))) > 0, "and the device is named");
+
+    # --- Oracle: hwaccel_empty_registry_gives_cpu_only --------------------
+    var cpu_only = hw_registry_new();
+    reg_add_profile(cpu_only, profile_cpu(16 * 1024 * 1024 * 1024));
+    var cinv = agnosai_hw_inventory_from_hwaccel(cpu_only);
+    assert_eq(vec_len(agnosai_hw_inventory_devices(cinv)), 0,
+    "a CPU-only registry yields NO devices");
+    assert_eq(agnosai_hw_inventory_memory_total_mb(cinv), 16 * 1024,
+    "and its memory is the system total");
+
+    # A wholly empty registry is neither an error nor a crash.
+    var none = agnosai_hw_inventory_from_hwaccel(hw_registry_new());
+    assert_eq(vec_len(agnosai_hw_inventory_devices(none)), 0, "an EMPTY registry has none");
+    assert_eq(agnosai_hw_inventory_memory_total_mb(none), 0, "and no system memory");
+    assert_eq(agnosai_hw_inventory_cpu_cores(none), 0,
+    "and no cores — cpu_cores is only set by a CPU profile");
+
+    # ⚠ `available_parallelism` never answers 0, matching `unwrap_or(1)`. A zero
+    # would make `satisfies` reject every requirement naming any CPU cores.
+    assert(_agnosai_available_parallelism() >= 1,
+    "available_parallelism is at least 1, never 0");
+
+    # ⚠ The FALLBACK arm is unreachable on this box — Linux x86, where
+    # `sched_getaffinity` always succeeds — so it is driven as data. Without
+    # this, a fallback of 0 instead of 1 passes every assertion above.
+    assert_eq(_agnosai_cores_from_affinity(0 - 1, 0), 1,
+    "a failed sched_getaffinity falls back to ONE, not zero");
+    assert_eq(_agnosai_cores_from_affinity(0, 0), 1, "and so does an empty answer");
+
+    # A real mask counts set bits, and only across the bytes the kernel wrote.
+    var m[16];
+    store64(&m, 7);
+    store64(&m + 8, 0 - 1);
+    assert_eq(_agnosai_cores_from_affinity(8, &m), 3,
+    "three set bits in the first word is three cores");
+    assert_eq(_agnosai_cores_from_affinity(16, &m), 67,
+    "and the second word counts only when the kernel says it was written");
+    # An all-zero mask is not zero cores — it falls back.
+    var mz[8];
+    store64(&mz, 0);
+    assert_eq(_agnosai_cores_from_affinity(8, &mz), 1,
+    "an all-zero mask falls back to one rather than reporting zero cores");
+
+    # ⚠ `detect()` has NO test in the oracle, gated or otherwise, and it cannot
+    # have a value-asserting one anywhere: it shells out to `nvidia-smi` and
+    # friends, so what it answers depends on the box. What IS assertable is that
+    # the shell-out path completes and yields a WELL-FORMED inventory — which is
+    # the failure this would otherwise hide, since a crash or a null in
+    # `registry_detect` would go unnoticed until a deployment.
+    var detected = agnosai_hw_inventory_detect();
+    assert_neq(detected, 0, "detect() returns an inventory on any box");
+    assert(agnosai_hw_inventory_cpu_cores(detected) >= 0, "with a non-negative core count");
+    assert(agnosai_hw_inventory_memory_total_mb(detected) >= 0, "and non-negative memory");
+    assert_neq(agnosai_hw_inventory_devices(detected), 0, "and a real device vec");
+    # Every device it did find is well-formed and carries a mapped type.
+    var bad_devices = 0;
+    for (var d = 0; d < vec_len(agnosai_hw_inventory_devices(detected)); d = d + 1) {
+        var dev = vec_get(agnosai_hw_inventory_devices(detected), d);
+        if (agnosai_compute_device_accelerator(dev) > AGNOSAI_ACCEL_TPU) {
+            bad_devices = bad_devices + 1;
+        }
+        if (agnosai_compute_device_accelerator(dev) < AGNOSAI_ACCEL_CPU) {
+            bad_devices = bad_devices + 1;
+        }
+    }
+    assert_eq(bad_devices, 0,
+    "and every detected device carries one of the SIX mapped types, never a raw ai-hwaccel one");
+
+    # --- Oracle: mod training_tests ---------------------------------------
+    var full = agnosai_training_memory_estimate(7000, TRAIN_FULL, TARGET_GPU);
+    var zero = f64_from(0);
+    assert(f64_gt(agnosai_training_memory_total_gb(full), zero), "a 7B full fine-tune totals > 0");
+    assert(f64_gt(agnosai_training_memory_model_gb(full), zero), "with model memory > 0");
+    assert(f64_gt(agnosai_training_memory_optimizer_gb(full), zero), "and optimizer > 0");
+    assert(f64_ge(agnosai_training_memory_total_gb(full),
+    agnosai_training_memory_model_gb(full)), "and the total is at least the model alone");
+
+    var lora = agnosai_training_memory_estimate(7000, TRAIN_LORA, TARGET_GPU);
+    assert(f64_lt(agnosai_training_memory_total_gb(lora),
+    agnosai_training_memory_total_gb(full)), "LoRA uses less than a full fine-tune");
+    var qlora = agnosai_training_memory_estimate(7000, TRAIN_QLORA_4, TARGET_GPU);
+    assert(f64_lt(agnosai_training_memory_total_gb(qlora),
+    agnosai_training_memory_total_gb(lora)), "and QLoRA less than LoRA");
+
+    # ⚠ GB as f64. ai-hwaccel answers in x1000 FIXED-POINT integers, so storing
+    # them raw would make a 14 GB model read 14000 — and every ordering
+    # assertion above would still pass, because the scale is uniform.
+    assert(f64_lt(agnosai_training_memory_total_gb(full), f64_from(1000)),
+    "the total is GB, not ai-hwaccel's x1000 fixed point");
+    assert(f64_gt(agnosai_training_memory_total_gb(full), f64_from(1)),
+    "and it is a real magnitude, not a truncated zero");
+
+    # The total is exactly the three parts summed.
+    _t_assert_f64(agnosai_training_memory_total_gb(full),
+    f64_add(f64_add(agnosai_training_memory_model_gb(full),
+    agnosai_training_memory_optimizer_gb(full)),
+    agnosai_training_memory_activation_gb(full)),
+    "the total is the three components summed");
+
+    # --- Oracle: fits_in_inventory ----------------------------------------
+    var big_dev = vec_new();
+    vec_push(big_dev, agnosai_compute_device_new(0, str_from("A100 80GB"),
+    AGNOSAI_ACCEL_CUDA, 81920));
+    var big_inv = agnosai_hw_inventory_new(8, 65536, big_dev);
+    assert_eq(agnosai_training_memory_fits_in(lora, big_inv), 1,
+    "a 7B LoRA fits in an 80 GB GPU");
+
+    var small_dev = vec_new();
+    vec_push(small_dev, agnosai_compute_device_new(0, str_from("Small GPU"),
+    AGNOSAI_ACCEL_CUDA, 4096));
+    var small_inv = agnosai_hw_inventory_new(4, 16384, small_dev);
+    assert_eq(agnosai_training_memory_fits_in(lora, small_inv), 0,
+    "and does not fit in a 4 GB one");
+
+    # ⚠ **DEVICE VRAM ONLY.** `memory_total_mb` is right there and is system
+    # RAM; summing it instead would make this inventory — 512 GB of RAM, no GPU
+    # — fit anything at all.
+    var ramrich = agnosai_hw_inventory_new(64, 524288, vec_new());
+    assert_eq(agnosai_training_memory_fits_in(lora, ramrich), 0,
+    "a machine with 512 GB of RAM and NO GPU fits nothing");
+
+    # ⚠ `<=`, so an estimate EXACTLY equal to available VRAM fits.
+    #
+    # Testing that needs an estimate whose total is a whole number of MiB, and
+    # `total_gb * 1024` is generally fractional — truncating it lands just
+    # BELOW the boundary and would assert the opposite of what is meant. So
+    # search for a model size that lands on one. Without this the `<` and `<=`
+    # versions are indistinguishable, because equality is the only input they
+    # disagree on.
+    var mb1024 = f64_from(1024);
+    var exact_est = 0;
+    var exact_mb = 0;
+    for (var m = 1000; m < 30000; m = m + 1) {
+        var e = agnosai_training_memory_estimate(m, TRAIN_LORA, TARGET_GPU);
+        var mbf = f64_mul(agnosai_training_memory_total_gb(e), mb1024);
+        var mbi = f64_to(mbf);
+        if (f64_eq(mbf, f64_from(mbi)) == 1) {
+            exact_est = e;
+            exact_mb = mbi;
+            break;
+        }
+    }
+    assert_neq(exact_est, 0, "some model size lands on a whole MiB boundary");
+    var exact_dev = vec_new();
+    vec_push(exact_dev, agnosai_compute_device_new(0, str_from("exact"),
+    AGNOSAI_ACCEL_CUDA, exact_mb));
+    assert_eq(agnosai_training_memory_fits_in(exact_est,
+    agnosai_hw_inventory_new(1, 0, exact_dev)), 1,
+    "an estimate EXACTLY equal to available VRAM fits — the comparison is <=, not <");
+
+    # And one MiB less does not, so the boundary really is where it looks.
+    var short_dev = vec_new();
+    vec_push(short_dev, agnosai_compute_device_new(0, str_from("one short"),
+    AGNOSAI_ACCEL_CUDA, exact_mb - 1));
+    assert_eq(agnosai_training_memory_fits_in(exact_est,
+    agnosai_hw_inventory_new(1, 0, short_dev)), 0, "and one MiB short does not");
+
+    # VRAM sums ACROSS devices — one 80 GB card and two 40 GB cards both fit.
+    var split = vec_new();
+    vec_push(split, agnosai_compute_device_new(0, str_from("a"), AGNOSAI_ACCEL_CUDA, 40960));
+    vec_push(split, agnosai_compute_device_new(1, str_from("b"), AGNOSAI_ACCEL_CUDA, 40960));
+    assert_eq(agnosai_training_memory_fits_in(lora, agnosai_hw_inventory_new(8, 0, split)), 1,
+    "and VRAM is summed across devices");
+
+    # --- Oracle: total_bytes_consistent -----------------------------------
+    assert(agnosai_training_memory_total_bytes(full) > 0, "the total in bytes is positive");
+    assert_eq(agnosai_training_memory_total_bytes(full),
+    f64_to(f64_mul(agnosai_training_memory_total_gb(full), f64_from(1073741824))),
+    "and is GB x 1024^3, truncated");
+    assert(agnosai_training_memory_total_bytes(full)
+    > agnosai_training_memory_total_bytes(lora),
+    "a bigger estimate is more bytes");
+
     return assert_summary();
 }
 

@@ -9,13 +9,11 @@
 #   * Premium — research, multi-step workflows, complex reasoning
 #
 # Port notes (divergences from the Rust shape, all deliberate):
-#   * `suggest_quantization` and `estimate_model_memory` are **not ported
-#     YET**. Both are `#[cfg(feature = "hwaccel")]` and both delegate straight
-#     into ai-hwaccel's `AcceleratorRegistry`. ⚠ This note used to say they "sit
-#     outside the v2.0.0 parity bar" because hwaccel is not in the default
-#     build. **Retired** — a cargo feature gate is not a scope boundary. Owed
-#     under roadmap M11, and `fleet/coordinator`'s `plan_sharding` shows the
-#     shape: a one-line delegation to the vendored `reg_*` API.
+#   * `suggest_quantization` and `estimate_model_memory` are **ported**, at the
+#     bottom of this file. Both are `#[cfg(feature = "hwaccel")]` upstream and
+#     both delegate straight into ai-hwaccel's `AcceleratorRegistry`; a cargo
+#     feature gate is not a scope boundary, `[deps.ai-hwaccel]` is declared and
+#     vendored, and `fleet/coordinator`'s `plan_sharding` already set the shape.
 #   * `parse_complexity` matches ASCII-case-insensitively, as the oracle's
 #     `eq_ignore_ascii_case` does.
 # =========================================================================
@@ -221,4 +219,41 @@ fn agnosai_parse_complexity(s: Str): i64 {
     if (_agnosai_eq_ignore_ascii_case(s, str_from("high")) == 1) { return AGNOSAI_COMPLEXITY_COMPLEX; }
     if (_agnosai_eq_ignore_ascii_case(s, str_from("complex")) == 1) { return AGNOSAI_COMPLEXITY_COMPLEX; }
     return AGNOSAI_COMPLEXITY_MEDIUM;
+}
+
+# --- hwaccel -------------------------------------------------------------
+#
+# Both of the oracle's `#[cfg(feature = "hwaccel")]` fns, and both are one-line
+# delegations into ai-hwaccel. They are here rather than reimplemented for the
+# reason `fleet/coordinator` gives for `plan_sharding`: the policy lives in
+# ai-hwaccel, and a second copy would drift from it silently.
+#
+# ⚠ Neither takes or returns an agnosai type. `registry` is an ai-hwaccel
+# `AcceleratorRegistry` and `quant` is its `QuantizationLevel`; read them with
+# ai-hwaccel's own `quant_bits` / `quant_name` / `reg_*` accessors. That is the
+# oracle's shape too — it re-exports `QuantizationLevel` from `core/resource`
+# rather than wrapping it.
+
+# Recommend a quantization level for a model on the detected hardware.
+#
+# The oracle's `suggest_quantization(model_params, registry)`. ⚠ The ARGUMENT
+# ORDER is flipped: ai-hwaccel's `reg_suggest_quant` takes the registry first,
+# as every other `reg_*` fn does, and following the oracle's order here would
+# read `reg_suggest_quant(model_params, registry)` — which compiles, because
+# Cyrius has no types on these parameters, and then walks a model's parameter
+# count as if it were a registry struct.
+fn agnosai_suggest_quantization(model_params, registry): i64 {
+    return reg_suggest_quant(registry, model_params);
+}
+
+# Estimate the bytes needed to load a model at `quant`.
+#
+# The oracle's `estimate_model_memory`, an ASSOCIATED fn on the registry rather
+# than a method — it takes no registry at all, and `reg_estimate_memory` is the
+# same. Returns bytes **including** ai-hwaccel's activation/KV-cache overhead,
+# not the raw weight size: `reg_estimate_memory` is
+# `quant_model_bytes_with_overhead`, and the bare `quant_model_bytes` next to it
+# is the one that is only weights.
+fn agnosai_estimate_model_memory(model_params, quant): i64 {
+    return reg_estimate_memory(model_params, quant);
 }
