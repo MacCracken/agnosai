@@ -81,5 +81,12 @@ behaviour disagree, and the behaviour is unobservable through the wire contract,
 the port implements the stated intent and records the gap here. Where they
 disagree and the behaviour *is* wire-observable — `iss`/`aud` absent passing, the
 array-`aud` 401, jsonwebtoken's 60-second leeway — the port reproduces the
-behaviour and the divergence is a separate, explicit decision. See
-`docs/development/state.md`, "Four decisions waiting on the maintainer".
+behaviour and the divergence is a separate, explicit decision.
+
+⚠ That sentence used to point at `docs/development/state.md`, "Four decisions
+waiting on the maintainer" — **a section that no longer exists**; state.md now
+carries a "Standing decisions that shaped the port" table instead. The four
+decisions themselves are recorded where they are implemented, as numbered
+comments in `src/server/auth.cyr`: D1 the `iss`/`aud` tightening (:702, ADR 010),
+D2 the year-9999 `exp` sentinel (:486), D3 the array-valued `aud` rejection
+(:720), D4 jsonwebtoken's 60-second leeway (:478).

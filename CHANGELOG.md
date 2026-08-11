@@ -312,7 +312,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   - `src/telemetry/mod.cyr` missing from all three. `llm/hoosh`,
     `orchestrator/crew_runner` and `tools/native` record GenAI spans
-    ([ADR 017](docs/adr/017-genai-spans.md)), which landed after these files were
+    ([ADR 017](docs/adr/017-genai-span-call-sites.md)), which landed after these files were
     last touched.
   - `src/strcase.cyr` missing from `server.bcyr` and `orch.bcyr` —
     `server/prompt_guard.cyr:93` calls `agnosai_str_contains_ci`.

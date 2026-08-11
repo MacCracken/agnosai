@@ -18,7 +18,8 @@ it; **sandhi 1.9.9** implemented it the same day, and **cyrius 6.5.6** vendors
 that sandhi into `lib/sandhi.cyr`. The blocker is gone.
 
 Two other 6.5.6 items landed from the same filing pass and are used here:
-`sys_exit_group` (`lib/syscalls_linux_common.cyr:155`), which replaces the
+`sys_exit_group` (`lib/syscalls_linux_common.cyr:176` as of the 6.5.18 bundle —
+this ADR originally cited `:155`, which was its 6.5.6 line), which replaces the
 hand-rolled `syscall(SYS_EXIT_GROUP, …)` in `src/main.cyr`, and
 `async_await_readable_ms`, which is not used by agnosai but removed the reason
 sandhi's cooperative loop had to poll.
@@ -67,20 +68,42 @@ strictly better than no server, and the oracle has no corresponding refusal.
 
 ## Consequences
 
-- **`./build/agnosai` now drains on SIGINT and SIGTERM**, logging
+- **`./build/agnosai` now stops accepting on SIGINT and SIGTERM**, logging
   `"received shutdown signal, draining"` then `"server shut down gracefully"` —
   the oracle's line, which until now had nothing true to report. Verified live:
   both signals exit **0** in ~100 ms, and a request racing the shutdown still
-  completes **200**.
+  completes **200**. ⚠ **Read that last result narrowly.** It completes because
+  the stop is only noticed at the next SO_RCVTIMEO poll, so a short request has
+  up to `SANDHI_SERVER_STOP_POLL_MS` (100 ms) of ordinary serving left — not
+  because anything waits for it. See the in-flight bullet below.
 - **`agnosai_serve`'s return value gained a third meaning.** 0 = asked to stop,
   1 = failed. Callers written against the old contract still behave correctly,
   because the failure value is unchanged — but anything treating *any* return as
   fatal now over-reports.
-- **In-flight requests are still not drained to completion by the loop itself.**
-  A worker already holding a connection finishes it; `idle_ms` bounds how long
-  that can take. The stop is "stop accepting", not "wait for quiescence". This
-  matches what the oracle's axum shutdown actually does for connections it has
-  already handed off.
+- **In-flight requests are not drained, and the binary is stricter about that
+  than this ADR originally said.** The stop is "stop accepting", not "wait for
+  quiescence".
+
+  What sandhi promises is that a worker already holding a connection *may*
+  finish it: the stop path closes the handoff channel and the listen fd and
+  returns, without killing workers (`lib/sandhi.cyr:14334-14337` — verified
+  2026-08-11), and `idle_ms` bounds how long a worker can be held.
+
+  **`./build/agnosai` does not give the worker that chance.** Nothing joins the
+  pool. `agnosai_serve` returns 0, `main` logs, calls `agnosai_telemetry_shutdown`
+  (which returns immediately unless OTLP is configured) and returns, and the
+  epilogue calls `_agnosai_exit_process` → `sys_exit_group` (`src/main.cyr:279-285`,
+  `:390-397`, epilogue `:405-406`). Every worker dies where it stands, microseconds after the acceptor
+  returned. A request that has not finished inside the ≤100 ms poll window is
+  severed, and so is an SSE stream ([ADR 014](014-sse-stream-holds-a-pooled-worker.md)),
+  which by construction never finishes on its own.
+
+  **This is a residual divergence from the oracle, not parity.** axum's
+  `with_graceful_shutdown` does await connections it has already handed off; the
+  original wording here claimed a match that the process-level exit does not
+  deliver. Closing it needs sandhi to expose the worker handles (or a join/
+  quiesce call) so `main` can wait before `exit_group` — an upstream ask, not a
+  local fix, and not filed as of 2026-08-11.
 - **Every server pays SO_RCVTIMEO on the listen fd**, because the flag is wired
   unconditionally — about ten wakeups a second on an idle listener. Measured as
   noise against the accept path, and cheaper than a second code path to avoid

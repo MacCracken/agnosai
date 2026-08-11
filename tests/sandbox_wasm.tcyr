@@ -4,12 +4,23 @@
 # Oracle test block: rust-old/src/sandbox/wasm.rs, eleven `#[test]`s. Six port
 # directly; five need a real `wasmtime` to execute anything and are guarded.
 #
-# ⚠ **`wasmtime` is not installed on this box**, so the guarded five do not run
-# here — and the arm that DOES run is a real assertion, not a skip: with no
-# runtime, `agnosai_wasm_available()` is 0 and `execute` must return a `Sandbox`
-# error naming the binary rather than half-working. The loud-skip guard below
-# is the same shape `tests/sandbox_python.tcyr` uses: if a runtime is
-# demonstrably present, the guarded tests MUST have run.
+# ⚠ **`wasmtime` 47.0.3 IS installed as of 2026-08-11**, so the guarded five now
+# run. Both arms are real assertions rather than skips: with no runtime,
+# `agnosai_wasm_available()` is 0 and `execute` must return a `Sandbox` error
+# naming the binary rather than half-working; with one, a real module must
+# actually execute. The loud-skip guard below is the same shape
+# `tests/sandbox_python.tcyr` uses: if a runtime is demonstrably present, the
+# guarded tests MUST have run.
+#
+# ⚠ **The first end-to-end run found a bug the guards could never reach.**
+# `agnosai_wasm_execute` reaches `sandbox_create`/`sandbox_exec` directly instead
+# of through `agnosai_kavach_execute`, which is the only other caller of
+# kavach's lazy initialiser — so kavach's dispatch table was empty and every
+# execute answered "backend not available: wasm". `agnosai_wasm_available()` did
+# not catch it because `backend_is_available` probes the FILESYSTEM for the
+# wasmtime binary while `backend_dispatch_exec` looks for a registered function
+# pointer: availability said 1 and the next call said missing. Fixed in
+# `src/sandbox/wasm.cyr`; `_t_execute_real_module` below is the guard.
 #
 # ⚠ **No `.wasm` fixture exists anywhere in this repo**, and none can be
 # compiled here — `rustup target list --installed` has only the host. The
@@ -78,6 +89,63 @@ fn _t_wasm_header_bad(at, to): i64 {
     var b = _t_wasm_header();
     store8(b + at, to);
     return b;
+}
+
+# A minimal valid WASM module with an exported `_start` — 36 bytes.
+# A module declaring a 4 MiB (64-page) memory — 41 bytes. Identical to the nop
+# below plus a memory section, so the pair isolates the memory bound.
+fn _t_write_mem_module(path: Str): i64 {
+    var b[64];
+    var n = 0;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 97); n = n + 1;
+    store8(&b + n, 115); n = n + 1; store8(&b + n, 109); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 4); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 96); n = n + 1;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 3); n = n + 1; store8(&b + n, 2); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 0); n = n + 1;
+    # memory section: 1 memory, limits flag 0 (min only), min = 64 pages
+    store8(&b + n, 5); n = n + 1; store8(&b + n, 3); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 64); n = n + 1;
+    store8(&b + n, 7); n = n + 1; store8(&b + n, 10); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 6); n = n + 1;
+    store8(&b + n, 95); n = n + 1; store8(&b + n, 115); n = n + 1;
+    store8(&b + n, 116); n = n + 1; store8(&b + n, 97); n = n + 1;
+    store8(&b + n, 114); n = n + 1; store8(&b + n, 116); n = n + 1;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 10); n = n + 1; store8(&b + n, 4); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 2); n = n + 1;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 11); n = n + 1;
+    file_write_all(str_data(path), &b, n);
+    return n;
+}
+
+fn _t_write_nop_module(path: Str): i64 {
+    var b[64];
+    var n = 0;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 97); n = n + 1;
+    store8(&b + n, 115); n = n + 1; store8(&b + n, 109); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 4); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 96); n = n + 1;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 3); n = n + 1; store8(&b + n, 2); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 7); n = n + 1; store8(&b + n, 10); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 6); n = n + 1;
+    store8(&b + n, 95); n = n + 1; store8(&b + n, 115); n = n + 1;
+    store8(&b + n, 116); n = n + 1; store8(&b + n, 97); n = n + 1;
+    store8(&b + n, 114); n = n + 1; store8(&b + n, 116); n = n + 1;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 0); n = n + 1;
+    store8(&b + n, 10); n = n + 1; store8(&b + n, 4); n = n + 1;
+    store8(&b + n, 1); n = n + 1; store8(&b + n, 2); n = n + 1;
+    store8(&b + n, 0); n = n + 1; store8(&b + n, 11); n = n + 1;
+    file_write_all(str_data(path), &b, n);
+    return n;
 }
 
 fn main(): i64 {
@@ -244,6 +312,53 @@ fn main(): i64 {
         assert_neq(out, 0, "with a runtime present, a header-only module executes");
         assert_eq(agnosai_wasm_result_exit_code(out), 0,
         "and an empty module exits cleanly");
+    }
+
+    # --- a REAL module, end to end -------------------------------------------
+    #
+    # ⚠ This is the only test in the tree that reaches wasmtime. It is what
+    # exposed the missing `kavach_init` — every other assertion here stops at
+    # the header check, the path resolution or the error text, all of which pass
+    # against a backend that can never run anything.
+    #
+    # The module is 36 bytes, hand-assembled: magic + version, a `() -> ()`
+    # type, one function, an exported `_start`, and a body of a single END
+    # opcode. Nothing to check in, no toolchain needed.
+    if (agnosai_wasm_available() == 1) {
+        var rp = _t_join(str_from(_T_ROOT), str_from("/real-nop.wasm"));
+        assert_eq(_t_write_nop_module(rp), 36, "a real 36-byte module is written");
+        store64(&err, 0);
+        var rs = agnosai_wasm_sandbox_new();
+        var rm = agnosai_wasm_load_module_from_file(rs, rp, &err);
+        assert_neq(rm, 0, "and loads");
+        var rr = agnosai_wasm_execute(rs, rm, str_from("{\"parameters\":{}}"), &err);
+        assert_neq(rr, 0, "and EXECUTES — no result here means kavach was never initialised");
+        assert_eq(agnosai_wasm_result_exit_code(rr), 0,
+        "and the guest exited 0, so wasmtime accepted kavach's argv");
+        sys_unlink(str_data(rp));
+
+        # ⚠ **The memory ceiling must actually REACH wasmtime.** Until
+        # 2026-08-11 `agnosai_wasm_execute` sent no policy, kavach's
+        # `_wasm_append_limits` saw `memory_limit_mb == 0` and emitted no
+        # `-W max-memory-size=`, so the guest ran unbounded while
+        # `agnosai_wasm_sandbox_max_memory_bytes` reported 64 MiB. A sandbox that
+        # advertises a limit it does not enforce is worse than one with none.
+        #
+        # The discriminator is a module declaring a 4 MiB memory: unbounded it
+        # runs, under a 1 MiB ceiling wasmtime refuses to instantiate it. A
+        # module with no memory section cannot tell the two apart, which is why
+        # the nop above is not enough.
+        var mp = _t_join(str_from(_T_ROOT), str_from("/mem4mib.wasm"));
+        assert_eq(_t_write_mem_module(mp), 41, "a module declaring 4 MiB is written");
+        store64(&err, 0);
+        var tight = agnosai_wasm_sandbox_with_limits(1048576, 10000);
+        var tm = agnosai_wasm_load_module_from_file(tight, mp, &err);
+        assert_neq(tm, 0, "it loads");
+        var tr = agnosai_wasm_execute(tight, tm, str_from("{}"), &err);
+        assert_neq(tr, 0, "and execute returns a result");
+        assert_neq(agnosai_wasm_result_exit_code(tr), 0,
+        "and the guest was REFUSED — a 0 here means the ceiling never reached wasmtime");
+        sys_unlink(str_data(mp));
     }
 
     # --- teardown -----------------------------------------------------------

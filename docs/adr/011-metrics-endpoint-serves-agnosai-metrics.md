@@ -74,8 +74,9 @@ without relabeling: everything here is prefixed `agnosai_`
 
 **`AgnosMetrics` gets a consumer for the first time.** It was dead code in Rust.
 That is a point in favour rather than an accident: the module exists, is tested,
-is benchmarked at 5 ns per record, and measures exactly the things a crew
-orchestrator should expose.
+is benchmarked at ~4 ns per record (`metrics_record_task` in
+`bench-history.csv`), and measures exactly the things a crew orchestrator should
+expose.
 
 **The producer side is wired as of 2026-07-31.** The oracle
 records at `crew_runner.rs:810` and `:864` into hoosh's registry; the equivalent

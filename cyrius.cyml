@@ -50,20 +50,41 @@ modules = ["dist/bote-core.cyr"]
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
 path = "../majra"
-# 2.6.1 fixes a **concurrent-`relay_receive` allocator race**: the result struct
-# was allocated with `fl_alloc` *after* the mutex was released, and `fl_alloc` is
-# not thread-safe, so two threads could be handed the same block. agnosai does
-# not call `relay_receive` from more than one thread today, but bote does, and
-# 2.6.1 also drops majra's `[deps.sakshi]` — see the sakshi note below.
-tag = "2.6.1"
+# 2.6.2 fixes the priority queue twice over, both reported from here:
+#
+#   * **`pq_dequeue` was O(n) per pop**, so draining was O(n²) — it popped with
+#     `vec_remove(tier, 0)`, which shifts every survivor. Now a read index per
+#     tier, amortised O(1): **198.70 µs → 33 ns** at 200,000 deep, flat across a
+#     100× range. `src/llm/inference_queue.cyr` drains through `cpq_dequeue`, and
+#     the whole point of that module is that background work is ALLOWED to pile
+#     up behind interactive work — so the deep-tier path is the design case.
+#   * **`pq_enqueue` clamped over-range priorities but not negatives**, so a −1
+#     reached `load64(pq + pri * 8)` — an OOB read before the struct, then a push
+#     through the result. `agnosai_map_priority` is exactly the compute-a-priority
+#     shape that could reach it; its ladder never emits one, which is why the
+#     module header says the ladder IS the bounds check.
+#
+# 2.6.1 fixed a concurrent-`relay_receive` allocator race and dropped majra's
+# `[deps.sakshi]` — see the sakshi note below.
+tag = "2.6.2"
 modules = ["dist/majra.cyr"]
 
 [deps.kavach]
 git = "https://github.com/MacCracken/kavach.git"
 path = "../kavach"
-# 3.11.9 is the WASM backend `src/sandbox/wasm.cyr` runs on: `confine_capture_input`
-# (stdin as a third pipe) and `backend_is_available(Backend.WASM)`. ADR 019.
-tag = "3.11.9"
+# 3.11.10 makes the WASM backend actually RUN. 3.11.9 gave it stdin, an exit code
+# and stderr (`confine_capture_input`) plus `backend_is_available(Backend.WASM)`
+# — but its argv was rejected by wasmtime outright:
+#
+#     error: unexpected argument '--max-memory-size' found
+#
+# `--max-memory-size` and `--fuel` were emitted as top-level `wasmtime run`
+# flags; both live in wasmtime's `-W` group. ⚠ **Never a version skew — the
+# spelling was never valid**, and `-W` has existed since wasmtime 14 (2023). It
+# survived because nothing had run a real module: kavach's two WASM tests both
+# fail before argv is assembled, and the backend was unreachable through the
+# public API until 3.11.8. ADR 019.
+tag = "3.11.10"
 modules = ["dist/kavach.cyr"]
 
 [deps.ai-hwaccel]

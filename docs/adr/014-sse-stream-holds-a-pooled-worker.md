@@ -103,7 +103,15 @@ Rejected alternatives:
   `sandhi_server_run_pooled` rather than an async reactor. This ADR is that
   decision's first sharp edge.
 - [ADR 013](013-graceful-shutdown-via-signalfd-and-stop-flag.md) — shutdown
-  stops *accepting*; workers holding streams finish on their own terms, so a
-  drain with live streams waits on them.
+  stops *accepting*. ⚠ **This bullet used to claim that "workers holding streams
+  finish on their own terms, so a drain with live streams waits on them". That
+  is wrong and was never true of the binary.** Nothing joins the pool:
+  `sandhi_server_run_pooled` closes the handoff channel and the listen fd and
+  returns 0, then `main` reaches `sys_exit_group` within microseconds
+  (`src/main.cyr:279-285`, `:390-397`, epilogue `:405-406`). A live stream is **severed** at
+  shutdown, not drained — which is the only outcome that terminates at all,
+  since a stream on a running crew has no reason to end on its own. Corrected
+  2026-08-11 against `lib/sandhi.cyr:14334-14337`; ADR 013 carries the full
+  statement of the gap.
 - `src/server/routes/sse.cyr` — the module header carries the short form of the
   tower analysis above.

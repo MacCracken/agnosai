@@ -162,12 +162,28 @@ fn _b_iq_enqueue(): i64 {
 # every time the depth does (2.00µs → 4.02µs → 7.92µs → 15.56µs), which is the
 # signature of a linear pop rather than cache noise.
 #
-# A single figure at one depth would hide that behind an uninterpretable
-# average — at 200k the mean pop was **198.7µs** and the drain took ~40 seconds
-# of memmove. Two depths keep the slope in the bench history, so if majra fixes
-# it these two converge, which is a better regression signal than either alone.
-# Filed as
-# `majra/docs/development/issues/2026-08-10-pq-dequeue-is-linear-so-draining-a-queue-is-quadratic.md`.
+# ✅ **FIXED in majra 2.6.2 (2026-08-11), and the two rows converged exactly as
+# this comment predicted they would.** Measured here, same host, same run:
+#
+#     majra 2.6.1:   2k = 4.431us    16k = 35.335us    slope 8.0x
+#     majra 2.6.2:   2k = 168ns      16k = 175ns       slope 1.04x
+#
+# That is the whole argument for measuring at two depths rather than one. The
+# ABSOLUTE numbers move with run conditions — the same 2.6.1 build reads
+# 1.9/15.6us inside a full `bench-history` sweep and 4.4/35.3us standalone,
+# because a sweep warms the allocator for whatever runs after it. **The SLOPE
+# does not move**: 8.1x in the sweep, 8.0x standalone. A single-depth row would
+# have been noise; the ratio was the signal.
+#
+# ⚠ Same trap caught `inference_queue_enqueue` on this bump: it read 1.24us in
+# the committed sweep and 2.4us standalone, which looks like a 2x regression from
+# majra and is not — a real 2.6.1-vs-2.6.2 bisect through the manifest shows
+# **2.394us vs 2.40us, unchanged**. Do not compare a standalone run against a
+# committed sweep row.
+#
+# ⚠ And bisecting a dep by hand-copying a bundle into `lib/` does NOT work:
+# `cyrius bench` performs an implicit resolve, and `path = "../majra"` overwrites
+# the file before compiling. Change the tag in `cyrius.cyml` and drop `path`.
 #
 # This is also the design case, not the pathological one: the queue exists so
 # that background work is ALLOWED to accumulate behind interactive work.

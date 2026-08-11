@@ -395,7 +395,7 @@ Standing decisions that shaped the port, each with its record:
 | Decision | Where |
 |---|---|
 | Money is integer micro-USD, converted to f64 only at the wire | port plan, open question 1 |
-| Tool sandbox rides **cx + kavach**, not WASM | [ADR 006](../adr/006-cx-tool-sandbox.md) |
+| Tool sandbox rides **cx + kavach**, and WASM alongside it | [ADR 006](../adr/006-cx-tool-sandbox.md), [ADR 019](../adr/019-wasm-tools-spawn-wasmtime-directly.md) |
 | LLM reached over an **HTTP seam**, not linked | [ADR 003](../adr/003-llm-native-http.md) |
 | SSRF guard re-runs on every redirect hop (oracle checks only the first) | [ADR 007](../adr/007-audit-redirect-revalidation.md) |
 | Auth compare is SHA-256-digest-based, not the oracle's length-leaking loop | [ADR 009](../adr/009-auth-constant-time-secret-compare.md) |

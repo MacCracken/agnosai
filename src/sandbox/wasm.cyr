@@ -9,11 +9,25 @@
 # means kavach's seccomp and landlock wrap the runtime process, on top of
 # wasmtime's own WASI sandbox around the guest.
 #
-# ⚠ **kavach 3.11.8 is a FLOOR, not a preference.** In 3.11.7 that backend was
-# hardcoded unavailable, had no stdin channel, and reported every guest failure
-# as a success with empty stderr. All three were filed and fixed;
-# `cyrius.cyml` pins 3.11.8 and `tests/sandbox_wasm.tcyr` asserts the stdin and
-# exit-code behaviour that only 3.11.8 has.
+# ⚠ **kavach 3.11.10 is a FLOOR, not a preference**, and it took three releases
+# to become one:
+#
+#   * **3.11.8** — in 3.11.7 the backend was hardcoded unavailable, had no stdin
+#     channel, and reported every guest failure as a success with empty stderr.
+#   * **3.11.9** — `confine_capture_input`, the stdin/exit-code/stderr fix.
+#   * **3.11.10** — `wasmtime run` **rejected kavach's argv outright**:
+#     `--max-memory-size` and `--fuel` were emitted as top-level flags where both
+#     live in wasmtime's `-W` group. Never a version skew; the spelling was never
+#     valid, and `-W` has existed since wasmtime 14.
+#
+# ⚠ **All three survived because nothing had ever run a module.** kavach's two
+# WASM tests fail before argv is assembled, and everything here sat behind
+# `if (agnosai_wasm_available() == 0)`, which returned early on a box with no
+# runtime — so the whole path was dead code that still passed its tests. Three
+# mutually-concealing defects, all exposed the day wasmtime was installed
+# (2026-08-11), including two of agnosai's own: no `kavach_init` call, and a
+# memory ceiling that never reached the runtime. Both are fixed below and both
+# have a guard in `tests/sandbox_wasm.tcyr` that fails without them.
 #
 # ## The four bounds the oracle configures, and where they live now
 #
@@ -38,7 +52,14 @@
 #
 # Absent, `agnosai_wasm_available()` answers 0 and `execute` returns a
 # `Sandbox` error naming the binary. That is an assertable arm, not a silent
-# skip, and it is the arm this development box actually takes.
+# skip. **wasmtime 47.0.3 is installed here as of 2026-08-11**, so the box now
+# takes the other arm and the execute path is exercised for real.
+#
+# ⚠ `agnosai_wasm_available()` is NOT a readiness check for execution. It asks
+# `backend_is_available`, which probes the FILESYSTEM for the binary;
+# `backend_dispatch_exec` asks whether a function pointer is registered. They
+# answered differently for months — availability 1, next call "backend not
+# available: wasm" — because kavach was never initialised from this path.
 # =========================================================================
 
 # The oracle's four constants, unchanged.
@@ -278,6 +299,24 @@ fn agnosai_wasm_result_exit_code(r): i64 {
 # create/RUNNING/exec/STOPPED/DESTROYED sequence — CLAUDE.md says extract at the
 # third.
 fn agnosai_wasm_execute(s, module, input: Str, out_err): i64 {
+    # ⚠ **Without this, every call fails with "backend not available: wasm"** —
+    # kavach's dispatch table is populated by `kavach_init`, and this function
+    # reaches `sandbox_create`/`sandbox_exec` DIRECTLY rather than through
+    # `agnosai_kavach_execute`, which is the only other place the lazy
+    # initialiser is called (`kavach_bridge.cyr:361`). Two entry points into the
+    # same library, one of them initialising it.
+    #
+    # ⚠ **`agnosai_wasm_available()` does NOT cover this, and that is why it went
+    # unnoticed.** `backend_is_available` probes the filesystem for the wasmtime
+    # binary; `backend_dispatch_exec` looks for a registered function pointer.
+    # They answer different questions, so availability reported 1 while the very
+    # next call reported the backend missing.
+    #
+    # Unreachable until 2026-08-11: with no wasmtime on the box the guard below
+    # returned early and nothing downstream ever ran. Installing wasmtime is what
+    # exposed it.
+    _agnosai_kavach_ensure_init();
+
     if (agnosai_wasm_available() == 0) {
         store64(out_err, agnosai_error_sandbox(str_from(
         "wasmtime runtime not found — WASM tool execution is unavailable")));
@@ -287,6 +326,32 @@ fn agnosai_wasm_execute(s, module, input: Str, out_err): i64 {
     var cfg = config_new();
     config_backend(cfg, Backend.WASM);
     config_timeout_ms(cfg, load64(s + AGN_WS_TIMEOUT_MS));
+
+    # ⚠ **The memory ceiling has to travel on a POLICY, and until 2026-08-11 it
+    # did not travel at all.** kavach's `_wasm_append_limits` reads
+    # `SandboxPolicy_memory_limit_mb(policy)` and emits `-W max-memory-size=` only
+    # when it is > 0. `config_new()` installs `policy_basic()`, which leaves that
+    # field at 0 — so the guest ran with **no memory bound whatsoever** while
+    # `agnosai_wasm_sandbox_max_memory_bytes` cheerfully reported one. A sandbox
+    # that advertises a limit it does not enforce is worse than one that admits
+    # it has none.
+    #
+    # It was unobservable until wasmtime was installed: with no runtime,
+    # `agnosai_wasm_available()` returned 0 above and nothing downstream ran.
+    #
+    # ⚠ kavach takes MEGABYTES and the oracle's field is BYTES
+    # (`StoreLimitsBuilder::memory_size`, which is bytes). Converting here rather
+    # than storing megabytes keeps `agnosai_wasm_sandbox_with_limits`'s signature
+    # the oracle's. Integer division truncates, so a sub-megabyte request floors
+    # to 0 and would silently mean "unlimited" — clamped to 1 MiB instead.
+    var mem_bytes = load64(s + AGN_WS_MAX_MEMORY_BYTES);
+    if (mem_bytes > 0) {
+        var mem_mb = mem_bytes / 1048576;
+        if (mem_mb < 1) { mem_mb = 1; }
+        var pol = policy_basic();
+        SandboxPolicy_set_memory_limit_mb(pol, mem_mb);
+        config_policy(cfg, pol);
+    }
     # ⚠ `str_cstr`, not `str_data`: kavach stores the pointer verbatim and every
     # later reader is `strlen`-based, but a Str's bytes carry no terminator.
     # The same trap `kavach_bridge`'s `config_agent_id` documents.

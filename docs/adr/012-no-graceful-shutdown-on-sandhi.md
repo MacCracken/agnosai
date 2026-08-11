@@ -18,6 +18,18 @@ assuming it is theirs.
 See [ADR 013](013-graceful-shutdown-via-signalfd-and-stop-flag.md) for what
 agnosai actually does now.
 
+⚠ **Every `lib/` citation below is against the superseded bundle** — sandhi
+1.9.8, pre-cyrius-6.5.6 — and most of them will **not** resolve in today's
+`lib/`. `lib/sandhi.cyr` is 1.9.9 there, the accept loop excerpt has moved and
+now carries a stop check, and the stop-facility grep that returned zero now
+returns matches. The syscall wrappers are also spelled `sys_sigprocmask` and
+`sys_signalfd` (verified 2026-08-11 at `lib/syscalls_linux_common.cyr:385` and
+`:392`); `SYS_RT_SIGPROCMASK` / `SYS_SIGNALFD4` are the syscall *numbers* they
+use, not the function names. `signal_ignore` is the one citation still exact
+(`lib/syscalls.cyr:98`). The originals are kept verbatim because they are the
+evidence that was actually checked at the time — this is a record of a
+diagnosis, not a map of the current tree.
+
 ## Context
 
 `rust-old/src/main.rs:130` wraps the listener in a graceful shutdown:

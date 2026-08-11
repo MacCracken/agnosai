@@ -24,8 +24,8 @@
 # would have read it.** [ADR 018](../../docs/adr/018-sankoch-path-check-on-import.md)
 # records the decision. Short version: the oracle skips entries whose name
 # *contains* the substring `..` and reads everything else, while sankoch's
-# `_zip_path_safe` (`lib/sankoch.cyr:14051`, applied on the READ path at
-# `:14541`) rejects a `..` *component*, an absolute path, a backslash, a control
+# `_zip_path_safe` (`lib/sankoch.cyr`, applied on the READ path by
+# `_zip_prepare`) rejects a `..` *component*, an absolute path, a backslash, a control
 # byte and an empty interior component. The two filters differ in both
 # directions. The oracle's own filter is reproduced exactly, so the port skips
 # what the oracle skips; a name that gets past it and then trips sankoch's
@@ -51,7 +51,7 @@
 #
 # `_agnosai_pkg_bound` computes an upper bound instead, which is possible only
 # because DEFLATE **falls back to STORE when it does not shrink**
-# (`lib/sankoch.cyr:14795-14810`): the stored payload is therefore never larger
+# (`lib/sankoch.cyr`, `zip_add_meta`): the stored payload is therefore never larger
 # than the input, and the rest is fixed-size headers.
 # =========================================================================
 
@@ -69,7 +69,7 @@ enum AgnosaiPackageOff {
 #
 # ⚠ Uncompressed is the whole point. The oracle reads `file.size()`, which the
 # `zip` crate documents as the decompressed size, and `zip_entry_size`
-# (`lib/sankoch.cyr:14470`) is the same. Checking `zip_entry_csize` instead
+# (`lib/sankoch.cyr`) is the same. Checking `zip_entry_csize` instead
 # would compile, pass every round-trip test, and leave the zip-bomb guard
 # checking the one number an attacker controls downward.
 var AGNOSAI_PKG_MAX_FILE_SIZE = 1048576;
@@ -388,7 +388,7 @@ fn _agnosai_pkg_find_last(z, name): i64 {
 # error instead would fail imports the oracle completes.
 #
 # Residual: sankoch decodes store, deflate, bzip2, zstd and xz
-# (`zip_method_supported`, `lib/sankoch.cyr:15138`); zip 8's default features
+# (`zip_method_supported`, `lib/sankoch.cyr`); zip 8's default features
 # add deflate64, LZMA and PPMd. A member in one of those three is skipped here
 # and read upstream.
 fn _agnosai_pkg_can_decode(z, i): i64 {

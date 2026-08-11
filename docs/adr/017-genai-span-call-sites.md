@@ -46,9 +46,26 @@ OTLP exporter:
 
 | site | span | kind |
 |---|---|---|
-| `llm/hoosh.cyr` — the chat completion call | `inference_span` + `record_usage` | CLIENT |
-| `tools/registry.cyr` — tool execution | `tool_span` | INTERNAL |
-| `orchestrator/crew_runner.cyr` — a crew run | `crew_span` | INTERNAL |
+| `llm/hoosh.cyr` — `agnosai_hoosh_chat`, the chat completion call | `inference_span` + `record_usage` | CLIENT |
+| `tools/native.cyr` — `agnosai_tool_execute`, the vtable dispatch | `tool_span` | INTERNAL |
+| `orchestrator/crew_runner.cyr` — `agnosai_crew_runner_run` | `crew_span` | INTERNAL |
+
+⚠ **The tool site is `tools/native.cyr`, not `tools/registry.cyr`.** An earlier
+draft of this table named the registry, and `src/telemetry/mod.cyr`'s comment on
+`_agnosai_telemetry_exporter` still repeats that name. The span is recorded in
+`agnosai_tool_execute`, which is the vtable chokepoint every tool call in the
+tree funnels through — instrumenting it means a tool added later is instrumented
+without touching this list, which the registry could not promise.
+
+The kind is not stored on the span: `agnosai_otlp_span_kind`
+(`src/telemetry/otlp.cyr:196`) derives it from the span *name*, returning CLIENT
+for `gen_ai.invoke_agent` and INTERNAL for everything else.
+
+The tool span carries an **empty** agent name and task id, because the vtable
+carries neither — a tool is invoked with an input value and nothing about who
+asked. Threading that through would change the calling convention for every
+implementor. The attributes are omitted rather than faked, and an omitted OTLP
+attribute is simply absent on the wire.
 
 This is a **deliberate divergence from `rust-old`**, recorded here because
 CLAUDE.md requires one for any divergence, and flagged to the user before it was
@@ -84,3 +101,30 @@ Two supporting decisions come with it:
 - **A future re-audit will find `src/` calling something `rust-old` does not.**
   That is what this record is for. Do not "fix" it back to match the oracle
   without reading the Context above.
+
+## Re-check — 2026-08-11, post-port
+
+Everything above holds except the one table row corrected in place.
+
+- **The oracle still calls nothing.** Re-grepped `rust-old/src/`: the only
+  `genai` hits outside `genai.rs` are `pub mod genai;` and the doc-comment
+  example, exactly as the Context says.
+- **All three sites exist and are the only ones.** `agnosai_telemetry_record_span`
+  has exactly three callers — `src/llm/hoosh.cyr` (via
+  `_agnosai_hoosh_span_done`), `src/tools/native.cyr:409` and
+  `src/orchestrator/crew_runner.cyr:1223`/`:1277`, the crew's error and normal
+  exits.
+- **The process global is real.** `_agnosai_telemetry_exporter`
+  (`src/telemetry/mod.cyr:573`) is set by `agnosai_telemetry_init_tracing`
+  (`:550`), read by `agnosai_telemetry_record_span` (`:620`), and cleared by
+  `agnosai_telemetry_shutdown` (`:597`) so a span created during shutdown cannot
+  enqueue into a stopped exporter.
+- **Identity is still minted per span.** `agnosai_telemetry_record_span` calls
+  `agnosai_uuid_v4` per span rather than reading sakshi's process-global trace
+  id, and the roadmap's *Out of scope for v2.0* section still owns the
+  thread-local current-span that would let spans correlate into one trace.
+- **The 104-byte figure is right.** `AGN_GAS_SIZE = 104` in
+  `src/telemetry/genai.cyr`. (That module's own header says "112 bytes" — the
+  header is wrong, not this ADR.)
+- **The off path costs no syscalls.** `agnosai_telemetry_record_span` returns 0
+  before allocating anything when the exporter is 0.

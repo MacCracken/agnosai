@@ -32,7 +32,7 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [003](003-llm-native-http.md) | Native HTTP for LLM providers — the hoosh seam | Accepted |
 | [004](004-concurrency-model.md) | Concurrency model — `sandhi_server_run_pooled` | Accepted |
 | [005](005-ai-hwaccel-integration.md) | ai-hwaccel for hardware detection and workload planning | Accepted |
-| [006](006-cx-tool-sandbox.md) | cx bytecode + kavach for sandboxed tool execution, replacing WASM | Accepted |
+| [006](006-cx-tool-sandbox.md) | cx bytecode + kavach for sandboxed tool execution | Accepted in part — see below |
 | [007](007-audit-redirect-revalidation.md) | Re-validate the SSRF guard on every redirect hop | Accepted |
 | [008](008-durable-state-crew-id-validation.md) | `durable_state` validates `crew_id` | Accepted |
 | [009](009-auth-constant-time-secret-compare.md) | Constant-time shared-secret comparison via SHA-256 digests | Accepted |
@@ -43,7 +43,19 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [014](014-sse-stream-holds-a-pooled-worker.md) | An SSE stream holds a pooled worker for its whole life | Accepted |
 | [015](015-mcp-resources-project-agent-definitions.md) | MCP resources project agent definitions, and nothing else | Accepted |
 | [016](016-mcp-prompts-project-agent-personas.md) | MCP prompts project agent personas | Accepted |
+| [017](017-genai-span-call-sites.md) | GenAI spans are recorded at the call sites the oracle only declares | Accepted |
+| [018](018-sankoch-path-check-on-import.md) | `.agpkg` import trusts sankoch's path check | Accepted |
+| [019](019-wasm-tools-spawn-wasmtime-directly.md) | WASM tools spawn wasmtime through kavach | Accepted — validated 2026-08-11 |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
-than `00N — Title`) and carry no `## Status` line. Left as written: renumbering
-and reformatting accepted decisions buys nothing and breaks inbound links.
+than `00N — Title`). The headings are left as written — renumbering accepted
+decisions buys nothing and breaks inbound links — but **all five now carry a
+`## Status` heading**, added by the 2026-08-11 review. (This paragraph used to
+say they carried none, which stopped being true the moment that review ran.)
+
+⚠ **Two rows above are deliberately not a simple "Accepted".** ADR 006's
+"replacing WASM" half is retired — kavach ships a wasmtime backend and
+[019](019-wasm-tools-spawn-wasmtime-directly.md) supersedes its transport half,
+so cx and WASM are complementary rather than alternatives. ADR 012 is superseded
+outright by 013 and is kept only as the record of a decision that turned out to
+rest on a sandhi limitation which was then fixed upstream.

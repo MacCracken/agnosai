@@ -1,14 +1,13 @@
 # 015 — MCP resources project agent definitions, and nothing else
 
-**Status**: Accepted
-**Date**: 2026-08-05
+## Status: Accepted (2026-08-05)
 
 ## Context
 
-`src/server/routes/mcp.cyr` answers exactly three JSON-RPC methods —
-`initialize`, `tools/list`, `tools/call` — because that is exactly what
-`rust-old/src/server/routes/mcp.rs` answers. Parity is met and has been since
-M6.
+When this was written, `src/server/routes/mcp.cyr` answered exactly three
+JSON-RPC methods — `initialize`, `tools/list`, `tools/call` — because that is
+exactly what `rust-old/src/server/routes/mcp.rs` answers. Parity was met and had
+been since M6. (It answers seven today; see the Neutral consequence.)
 
 Roadmap B1 asks to grow the surface, on the grounds that bote is the MCP layer
 and the pinned bundle already carries the machinery. That is true of
@@ -34,10 +33,11 @@ it needs this record whether or not it is an improvement.
 definitions and nothing else.**
 
 The URI scheme is `agnosai://agents/<name>`, where `<name>` is the definition's
-key in `AGN_ST_DEFINITIONS`. `resources/read` is a single
-`agnosai_app_state_definition_get`, and the served `text` is
-`agnosai_agent_to_value(def)` — byte for byte what
-`GET /api/v1/agents/definitions` already serves.
+key in `AGN_ST_DEFINITIONS` (`src/server/state.cyr:48`). `resources/read` is a
+single `agnosai_app_state_definition_get`, and the served `text` is
+`agnosai_agent_to_value_a(a, def)` — the same builder, on the same request
+arena, that `GET /api/v1/agents/definitions` uses (`src/server/routes/agents.cyr:43`),
+so the bytes match.
 
 In scope:
 
@@ -72,9 +72,16 @@ Out of scope, deliberately:
   place as beyond-oracle.
 - **Negative** — a wire contract we now own. `agnosai://agents/<name>` is ours
   to keep stable; the oracle offers no guidance because it has no equivalent.
-- **Neutral** — prompts remain owed under B1, and the "subscriptions" half of
-  that roadmap line should be struck rather than carried, since the bundle
-  cannot support it.
+- **Neutral, and now settled** — this said "prompts remain owed under B1, and
+  the 'subscriptions' half of that roadmap line should be struck rather than
+  carried". Both halves landed the next day: prompts shipped as `prompts/list` +
+  `prompts/get` under [ADR 016](016-mcp-prompts-project-agent-personas.md),
+  projecting the same stored definitions as personas, and roadmap B1 closed
+  2026-08-06 with subscriptions explicitly struck for the reason given above.
+  `src/server/routes/mcp.cyr` therefore answers **seven** methods today — the
+  oracle's three plus this ADR's two and ADR 016's two — and `capabilities`
+  advertises `tools`, `resources` and `prompts`, none of them carrying
+  `subscribe` or `listChanged`.
 
 ## Alternatives considered
 

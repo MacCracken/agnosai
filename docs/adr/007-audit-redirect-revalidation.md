@@ -2,8 +2,12 @@
 
 ## Status: Accepted
 
-Date: 2026-07-28. Applies to `src/tools/builtin/security_audit.cyr`, and to
-`src/tools/remote_registry.cyr` when it lands.
+Date: 2026-07-28. Both named consumers have landed, and the loop this ADR
+describes was **extracted into `src/guarded_fetch.cyr`** rather than staying
+inside the audit tool — at the second instance rather than the third, because two
+copies of a security control drift silently. The decision below is unchanged; only
+its address is. Consumers today: `src/tools/builtin/security_audit.cyr`,
+`src/tools/remote_registry.cyr`, and `src/server/serve.cyr`'s callback POST.
 
 ## Context
 
@@ -45,10 +49,12 @@ present, score 0, risk critical. Silently wrong answers on the common input.
 
 Follow redirects, up to reqwest's limit of 10 hops, and run
 `agnosai_is_safe_url` against every resolved hop **before** the request to it is
-issued. `_agnosai_audit_fetch` owns the loop; sandhi's own follower is not used,
-because its hop loop is internal and offers no per-hop callback.
+issued. `agnosai_guarded_fetch` owns the loop (`src/guarded_fetch.cyr`; it was
+`_agnosai_audit_fetch` inside the audit tool when this was written). sandhi's own
+follower is not used, because its hop loop is internal and offers no per-hop
+callback.
 
-Six supporting rules:
+Seven supporting rules:
 
 - **An https → http hop is refused.** sandhi refuses this in its own follower
   and the reasoning carries: an audit must not be talked down onto a cleartext
@@ -59,9 +65,10 @@ Six supporting rules:
   instead. Full RFC 3986 path merging is not worth the attack surface for a
   form that essentially never appears in a redirect.
 - **A refused hop is distinguishable from a failed request.**
-  `AGNOSAI_AUDIT_REDIRECT_BLOCKED` propagates to a specific error —
-  "target redirected to a private/internal address" — rather than a generic
-  failure. An attempted bypass should read like one in the logs.
+  `AGNOSAI_FETCH_BLOCKED` — named `AGNOSAI_AUDIT_REDIRECT_BLOCKED` before the
+  extraction — propagates to a specific error, "target redirected to a
+  private/internal address", rather than a generic failure. An attempted bypass
+  should read like one in the logs.
 - **The CORS preflight does not escalate.** A blocked or failed OPTIONS hop is
   dropped and CORS is reported as unconfigured, matching the oracle's treatment
   of a failed preflight. Only the header GET can fail the audit.
@@ -78,6 +85,11 @@ Six supporting rules:
   left alone: the oracle's HTTPS recommendation really is
   `!target_url.starts_with("https://")`, and parity wins on a cosmetic
   recommendation where it must not on a security control.
+- **A 303 rewrites the next request to GET**, per RFC 9110 and matching what
+  reqwest does. Added with the extraction rather than decided here: the audit's
+  header fetch is already a GET, so it is only reachable on the CORS `OPTIONS`
+  probe — but `remote_registry` and the callback POST are not, and a follower
+  shared by all three has to get it right.
 
 ## Consequences
 
@@ -128,7 +140,9 @@ ever revived, `analyze_cors` and `run_security_audit` need the same treatment.
 
 ## Related
 
-- [ADR 006](006-cx-tool-sandbox.md) — the tool sandbox story this sits inside.
+- `src/guarded_fetch.cyr` — the implementation, shared by all three consumers.
+  A port-local module with no oracle counterpart, which is why it lives at
+  `src/` root rather than in the mirrored tree.
 - `src/server/ssrf.cyr` — the guard itself, pulled forward from M6, already
   hardened past the oracle on octal/hex/short-form host spellings for the same
   reason: a bypass in the guard is worth more attention than a bug in the

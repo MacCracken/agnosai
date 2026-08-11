@@ -83,8 +83,14 @@ an array-valued `aud` is rejected (the oracle rejects it too, via a
 deserialization failure into `Option<String>` at `decoding.rs:285-287`, including
 the single-element form), and jsonwebtoken's 60-second `exp` leeway
 (`validation.rs:120`) is reproduced as a named constant. Tightening a
-fail-closed quirk buys nothing; tightening this one closes a bypass. See
-`docs/development/state.md` for the full decision record.
+fail-closed quirk buys nothing; tightening this one closes a bypass.
+
+⚠ The full decision record used to be pointed at in `docs/development/state.md`,
+under "Four decisions waiting on the maintainer" — **that section is gone**;
+state.md now carries a "Standing decisions that shaped the port" table which
+links here. The decisions live at their call sites in `src/server/auth.cyr`: this
+one as D1 (:702), the array-`aud` rejection as D3 (:720), and the leeway constant
+as D4 (`AGNOSAI_JWT_LEEWAY_SECS`, :478).
 
 **Precedent.** Where the oracle's stated intent and its actual behaviour disagree
 and the gap is a *weakening*, the port implements the intent and records it here.
