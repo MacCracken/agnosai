@@ -36,17 +36,24 @@
 # Also corrected: the port plan lists `genai.rs` among llm's zero-consumer
 # files. There is no `src/llm/genai.rs` — it is `src/telemetry/genai.rs`, it is
 # declared by `telemetry/mod.rs:13`, and it therefore belongs to M9.
-# `inference_queue.rs` IS llm's, is gated on the `majra` feature, and has no
-# consumer outside its own module. It defers with that feature, alongside the
-# other non-default-build exclusions listed in docs/development/roadmap.md
-# ("What v2.0.0 is").
+#
+# ⚠ **`inference_queue` is PORTED, and this note used to say it was not.** It
+# read "gated on the `majra` feature … it defers with that feature", which was
+# wrong on the standing rule that the port is all of `rust-old/` — a cargo
+# feature gate is not a scope boundary — and was already contradicted by its own
+# sibling: `router` ports its two `#[cfg(feature = "hwaccel")]` functions and
+# says so in its header. `[deps.majra]` is declared and vendored either way.
 #
 # Include order is a dependency constraint (Cyrius resolution is single-pass):
 # llm_hoosh's error text is classified by llm_retry's `agnosai_is_retryable`,
 # and both use core_json's field helpers, so `src/core/mod.cyr` must precede this
-# hub. src/main.cyr does that.
+# hub. src/main.cyr does that. `inference_queue` is last because it calls
+# `agnosai_hoosh_chat` and the client accessors, and it reads core_task's
+# `AGNOSAI_PRIORITY_*` — which is the same `src/core/mod.cyr` ordering, one level
+# further down.
 # =========================================================================
 
 include "src/llm/router.cyr"
 include "src/llm/retry.cyr"
 include "src/llm/hoosh.cyr"
+include "src/llm/inference_queue.cyr"

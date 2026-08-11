@@ -96,6 +96,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M12 bite 1 — `llm/inference_queue` is ported, and it was NOT out of scope.**
+  The last unported module under `src/`. **18 mutation probes, 18 kills**;
+  `tests/llm_inference_queue.tcyr` is **69 assertions**.
+
+  ⚠ **`src/llm/mod.cyr` said this file "defers with that feature", and that was
+  wrong twice over.** Wrong on the standing rule — the port is all of
+  `rust-old/`, and a cargo feature gate is not a scope boundary — and already
+  contradicted by its own sibling: `llm/router` ports its two
+  `#[cfg(feature = "hwaccel")]` functions and says so in its header. `[deps.majra]`
+  is declared and vendored either way. The note is corrected in place.
+
+  Three forced substitutions, all from the absence of an async runtime, all in
+  the module header:
+
+  - **`enqueue` is synchronous**, so `pending()` is 1 the instant it returns.
+    The oracle wraps `queue.enqueue(item)` in a `tokio::spawn`, which is why its
+    own test sleeps 10 ms before asserting `pending() == 1`. The port's
+    guarantee is strictly stronger, so the suite asserts it with **no sleep** —
+    that assertion is what pins the substitution.
+  - **`spawn_worker` returns a stop handle, not a `JoinHandle`.** `abort()` has
+    no equivalent for a detached OS thread. The handle also publishes an
+    `EXITED` flag on the way out, because `_stopped` only reads back what
+    `_stop` wrote — a worker that ignored the flag entirely passed until the
+    thread's own acknowledgement was observable.
+  - **The reply is a `chan_new(1)`**, a oneshot that does not consume itself.
+
+  ⚠ **`enqueue` holds a mutex the oracle does not need**, and it is not
+  belt-and-braces. majra's `queue_item_new` allocates with `fl_alloc`, which is
+  **not thread-safe** — `lib/freelist.cyr` pops the global `_fl_heads` lists
+  with plain loads and stores, where `alloc` has a process-wide CAS spinlock
+  (`lib/alloc.cyr:28`). The item is built by the *caller*, so `cpq_enqueue`'s
+  own mutex does not cover it. That is majra 2.6.1's `relay_receive` bug one
+  layer up. The lock fixes agnosai's self-race, not the process-wide hazard.
+
+  ⚠ **`agnosai_map_priority` is a five-arm ladder and must not become
+  arithmetic.** The two enums are exact inverses today — agnosai's Background is
+  0, majra's is 4 — so `4 - p` passes every assertion and breaks silently the
+  first time either side inserts a level. The suite asserts the inversion
+  numerically as well as through the mapping, and a `4 - p` mutant is killed by
+  the out-of-range case. The ladder is also the bounds check: majra's
+  `pq_enqueue` clamps `>= NUM_PRIORITIES` but **not** negatives, so a -1 would
+  reach `load64(pq + pri * 8)` and read before the queue.
+
+  ⚠ **The transport is a function pointer, and a survivor is why.** A mutant
+  that passed 0 to `settle` instead of the response **survived every
+  assertion**, because with no gateway listening only the failure arm is
+  reachable and the response is unused there. `agnosai_inference_queue_run_item_with`
+  takes the chat call as a `callptr` target, the way `tools/agnos.cyr` does for
+  the same reason; nothing is injected in production.
+
+- **M12 bite 2 — `tests/server_routes_sse.tcyr`, a suite that did not exist.**
+  All 863 oracle test functions were screened against the Cyrius suites. Two
+  flagged, and both were real:
+
+  ⚠ **`src/server/routes/sse.cyr` was the ONE `routes/*` module with no test
+  file.** Not a naming artifact: `tests/server_sse.tcyr` covers
+  `src/server/sse.cyr`, the event **bus**, and `tests/server_router.tcyr` only
+  pins that `GET /api/v1/crews/{id}/stream` reaches `AGN_ROUTE_CREW_STREAM`.
+  Nothing asserted anything the handler writes. **31 assertions.**
+
+  The handler streams to a raw fd rather than returning a response object, so it
+  is driven against a capture **file** — `sandhi_server_send_chunked_start` and
+  `send_chunk` only `write(2)`, so the file holds exactly the bytes a client
+  would read. The active-crew case needs the handler on its own thread, and the
+  handoff waits for the sender's **receiver count** to reach 2 rather than
+  sleeping: a sleep races in the direction that hides the bug, because tearing
+  the crew down early sends the handler down the unknown-crew path where every
+  assertion still has something to match on the wrong frame.
+
+  Past the oracle: the error frame's wire shape, that `has` is asked **before**
+  `subscribe` so probing a nonexistent crew leaves no bus entry behind, and that
+  an **uppercase** uuid reaches a crew registered in lowercase instead of
+  reporting "crew not found" for a crew that is running.
+
+  ⚠ **`multiple_crews_tracked_independently` had no counterpart either.** Every
+  other assertion in `tests/orch_orchestrator.tcyr` runs one crew, so a registry
+  with a single slot passed the whole suite. Added; that suite is now **55
+  assertions**.
+
+- **The remaining bench gap is mapped, by a seven-way parallel analysis with an
+  adversarial audit on each.** Every oracle criterion id classified against the
+  tree: **83 real gaps, 10 already covered**, targeting `core`, `orch`, `tools`,
+  `server`, and two new files (`fleet.bcyr`, `definitions.bcyr`).
+
+  ⚠ **The audits corrected the analyses in every single group**, and that is the
+  part worth keeping: a fabricated "~4,500 string comparisons" figure, a wrong
+  allocator model behind three iteration counts (`vec_new_a` preallocates 16
+  slots — there is no 1→2→4→8 growth), a `sakshi` log-level trap that does not
+  exist (`SK_INFO=3 < SK_DEBUG=4`, so the guard already returns), and the compile
+  blocker above. **The raw analyses are not safe to follow verbatim.**
+
+  ⚠ **One claim from the audits did NOT survive my own check, and the roadmap
+  records the correction rather than the claim.** An agent reported
+  `agnosai_scheduler_load_dag` sorting all DAG keys as a *parity divergence*
+  needing a fix or an ADR. Reading `agnosai_scheduler_kahn_sort` shows it sorts
+  the zero-in-degree seed itself and sorts each successor list inside its loop —
+  both faithful to the oracle — so the caller's key order affects nothing and the
+  output is identical either way. It is **redundant work, not a divergence**:
+  a per-load insertion sort over every key whose result the next sort discards,
+  ~n²/4 comparisons on a 500-task DAG against the oracle's ~0. Left unfixed
+  deliberately until the scheduler benchmarks exist, so the deletion can be shown
+  rather than argued.
+
+- **M12 bite 3 — `benches/llm.bcyr`, and `benches/` had nothing for `src/llm/`
+  at all.** Six `.bcyr` files and not one touched the LLM group, so the routing
+  matrix every crew task crosses had no number. All three of
+  `rust-old/benches/llm_router.rs`'s criterion groups are reproduced, plus the
+  inference queue.
+
+  **The benchmark immediately found a defect in a dependency.** majra's
+  `pq_dequeue` pops with `vec_remove(tier, 0)`, which shifts the whole tail — so
+  one pop is O(n) in the tier depth and a full drain is **O(n²)**. Measured, mean
+  cost of one pop while draining a tier of that depth:
+
+  | tier depth | per pop | ratio |
+  |---|---|---|
+  | 2,000 | 2.00 µs | — |
+  | 4,000 | 4.02 µs | **2.01×** |
+  | 8,000 | 7.92 µs | **1.97×** |
+  | 16,000 | 15.56 µs | **1.96×** |
+
+  Doubling the depth doubles the per-pop cost, which rules out cache effects. At
+  200,000 queued the mean pop was **198.7 µs** and the drain took ~40 s of
+  memmove. This is the design case rather than a pathological one — the queue
+  exists so background work is *allowed* to accumulate behind interactive work.
+  `benches/llm.bcyr` therefore measures the drain at **two** depths, so the slope
+  stays legible in `bench-history.csv` instead of averaging into one
+  uninterpretable figure. Filed upstream as
+  `majra/docs/development/issues/2026-08-10-pq-dequeue-is-linear-so-draining-a-queue-is-quadratic.md`.
+
+- **⚠ THREE OF THE SIX BENCHMARK FILES DID NOT COMPILE, and `cyrius bench` had
+  been reporting `5 passed, 3 failed` unnoticed.** `benches/server.bcyr`,
+  `benches/orch.bcyr` and `benches/tools.bcyr` all had include lists that had
+  gone stale against `src/`, so every benchmark in them — **50 of the 79 in the
+  tree**, including the whole 35-shape orchestration set — had stopped running.
+
+  Cyrius resolution is single-pass, callees before callers, so these were hard
+  undefined-symbol errors rather than warnings:
+
+  - `src/telemetry/mod.cyr` missing from all three. `llm/hoosh`,
+    `orchestrator/crew_runner` and `tools/native` record GenAI spans
+    ([ADR 017](docs/adr/017-genai-spans.md)), which landed after these files were
+    last touched.
+  - `src/strcase.cyr` missing from `server.bcyr` and `orch.bcyr` —
+    `server/prompt_guard.cyr:93` calls `agnosai_str_contains_ci`.
+  - the sandbox group and `definitions/loader` missing from `server.bcyr`, since
+    `tools/mod` gained a sandbox dependency when `tools/python_tool` landed.
+  - `src/server/routes/definitions.cyr` missing from `server.bcyr` —
+    `router.cyr` dispatches `AGN_ROUTE_LIST_PRESETS` to
+    `agnosai_route_list_presets`, added by M10.
+
+  All three now compile and report. **This is why "never skip benchmarks" is a
+  rule about the gate and not only about the numbers**: a benchmark that stops
+  compiling reports nothing, and nothing looks exactly like no regression.
+
+  ⚠ **The gate was never silent — it was never invoked.** `cyrius bench` exits
+  **1** on a compile error (verified against a deliberately broken `.bcyr`), and
+  `scripts/bench-history.sh` runs it under `set -euo pipefail`, so it would have
+  aborted rather than recorded partial rows. The last recorded run was
+  **2026-08-07**; `src/` moved under `benches/` in the three days after, and
+  nothing ran it again. **106 rows recorded on the fixed tree**, against 79
+  benchmark shapes — several shapes are parameterised helpers that report more
+  than once. The real hole was structural: **`check-clean.sh` did
+  not sweep `benches/` and CI never compiled it.** Both fixed —
+  `.bcyr` files join the fmt and lint loops, and CI gains a `Benchmarks` step
+  that exists for the compile rather than the numbers, since CI timings are too
+  noisy to gate on.
+
+  Found by an **adversarial audit** of a benchmark-gap analysis, which flagged it
+  as a blocker the analysis itself had not mentioned.
+
+- **M12 bite 4 — `tests/integration_crew_with_tools.tcyr`.**
+  `rust-old/tests/crew_with_tools.rs` sits under `rust-old/tests/` rather than in
+  a module's `#[cfg(test)]` block, so **the per-module screen could not see it**
+  and it had no Cyrius counterpart. Its two `#[tokio::test]`s are the only
+  end-to-end registry → crew → runner exercises in the oracle. **29 assertions.**
+
+  ⚠ The file's name oversells what it couples, in the oracle and therefore here:
+  it builds a `ToolRegistry`, registers `EchoTool`, asserts on it — and then calls
+  `CrewRunner::new(spec)` **without it**. The crew runs the placeholder path
+  throughout, so the tool assertions are standalone and the pipeline assertions
+  are about DAG ordering. Reproduced exactly rather than "improved": wiring the
+  registry in would test something the oracle does not.
+
+  Past the oracle, the DAG positions are asserted to sum to 3 — a permutation of
+  0,1,2. The oracle checks `len == 3` plus two `<` compares, which a runner that
+  emitted the same result three times would satisfy.
+
 - **M11 is COMPLETE — all six bites.** Both `hwaccel` halves,
   `tools/python_tool`, `sandbox/wasm`, `tools/wasm_tool`, `tools/wasm_loader`:
   **48 mutation probes, 48 kills**.
@@ -892,6 +1080,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     produces.
 
 ### Changed
+
+- **The cleanliness gate and CI now cover `benches/`.** `scripts/check-clean.sh`
+  swept `src/` and `tests/` and never `benches/`, and CI ran `check-clean.sh`,
+  the tests and `cyrius coverage` but never `cyrius bench`. So **nothing in the
+  pipeline compiled a `.bcyr`**, which is how three of them rotted for three days
+  (see Added). `.bcyr` files now join the fmt loop (207 → 214 files) and the lint
+  loop (111 → 118), and CI gains a `Benchmarks` step.
+
+  ⚠ That step is there for the **compile**, not the numbers. CI timings are too
+  noisy to gate on and `bench-history.csv` is recorded from a quiet machine —
+  gating on a CI benchmark number would produce exactly the flaky red that
+  teaches people to ignore a gate.
+
+- **`[deps.kavach]` 3.11.8 → 3.11.9 and `[deps.majra]` 2.6.0 → 2.6.1.** Full
+  three-step, with `lib/` diffed against the 6.5.18 snapshot **after the sync and
+  again after a build** — zero content drift. `lib/kavach.cyr` reports 3.11.9 and
+  `lib/majra.cyr` 2.6.1. Full gate on the bumped tree before any new work: **93
+  suites, 0 failures.**
+
+  majra 2.6.1 fixes a concurrent-`relay_receive` allocator race and drops its
+  `[deps.sakshi]`; kavach 3.11.9 is the WASM backend `src/sandbox/wasm.cyr` runs
+  on ([ADR 019](docs/adr/019-wasm-tools-spawn-wasmtime-directly.md)).
+
+- **The 35 `duplicate fn` warnings on every build were audited rather than
+  tolerated. Two of the four collisions are real; two of my own first readings
+  were WRONG and are recorded here so they are not re-derived.**
+
+  Cyrius has one flat namespace and last-definition-wins, and the rule that makes
+  this matter was **measured**: a caller parsed *before* the redefinition still
+  binds to the later body (`early_caller()` returns 22, not 11). So a duplicate is
+  never "harmless because our copy comes first".
+
+  ⚠ **What is NOT wrong, contrary to a first reading:**
+
+  - **`err_io` (kavach ∩ sigil) does not diverge.** The claim that kavach's body
+    won and gave sigil's callers its `CRYPTO` kind came from comparing the two
+    error tables with the prefixes stripped — and **sigil has two unrelated error
+    enums**. `err_io` uses the *syscall*-error one (`lib/sigil.cyr:26-33`, which
+    switches from `SIGIL_ERR_` to `SYSE_` mid-enum); the `CRYPTO=8` came from the
+    *verification*-error one at `:4157`. Against kavach's table the syscall enum is
+    **identical on all eight shared kinds**. Confirmed at runtime with both bundles
+    linked: `err_io(5, "probe")` → kind 8, errno 5; `err_unknown` → 7.
+  - **`_sub_new` (majra ∩ libro) is not miscompiling here.** A probe reading the
+    subscriber struct directly shows `sub + 8 == 0` — **majra's** body ran, not
+    libro's — and `pubsub_publish` delivers correctly. agnosai is doubly safe
+    anyway: `src/orchestrator/pubsub.cyr` calls no majra `pubsub_*`.
+
+  ⚠ **The mistake behind both:** the warning's `file:line` was treated as the
+  location of the later definition. It is not usable — `lib/kavach.cyr:11512` and
+  `:11588` name a file of **11,321 lines**, so the offsets are into the
+  preprocessed stream. Filed to cyrius as
+  `2026-08-10-duplicate-fn-warning-file-attribution-is-wrong.md`, with the
+  suggestion that it report *both* definitions. **Determine the winner by running
+  the symbol, not by reading the warning.**
+
+  What survives as real, both latent rather than live:
+
+  | collision | assessment |
+  |---|---|
+  | `attestation_result_new` (kavach ∩ sigil) | Two unrelated functions sharing a name — 48 bytes / 7 fields / `alloc` against 16 bytes / 2 fields / `fl_alloc`. Inert only because neither library calls it. Needs a rename regardless; there is no shared implementation to agree on. |
+  | `_sub_new` (majra ∩ libro) | Correct here **by accident of include order**, and both directions corrupt: libro winning makes majra's `pubsub_publish` `fncall1` a vec; majra winning makes libro's `stream_subscribe` write 8 bytes past a 16-byte block. `bote` links both and calls `pubsub_publish`, so it should run the probe in its own build rather than inherit this result. |
+
+  Also: `path_exists` (ai-hwaccel ∩ kavach) differs only in `file_exists` vs
+  `sys_access(F_OK)` — near-identical, though `access` resolves against the real
+  uid. And `SpawnedProcess_pid` is **kavach against itself**, two `struct
+  SpawnedProcess` declarations of 24 and 40 bytes whose only shared accessor sits
+  at offset 0 in both — benign by luck, and one field reorder from not being.
+
+  The `fl_alloc` filing also closed its own open question: **`alloc` does not
+  share the hazard** — `lib/alloc.cyr:28` documents and implements a process-wide
+  CAS spinlock. Two allocators side by side in one stdlib with opposite threading
+  contracts, and only one of them says so.
+
+- **The `[deps.sakshi]` note named the wrong sibling, and the pin is still
+  load-bearing.** It said majra 2.6.0 at 2.4.8 was what forced the defensive pin.
+  majra 2.6.1 dropped its `[deps.sakshi]`, and sigil dropped its at 3.12.7 — but
+  **bote 3.3.0 still declares sakshi 2.4.7** (`git show 3.3.0:cyrius.cyml`; its
+  working tree, which `path = "../bote"` makes the live resolution, says 2.4.8).
+  Either way it is behind the snapshot's 2.4.10, so removing the pin still
+  silently downgrades `lib/sakshi.cyr`. The note now names bote and tells the
+  next reader to re-derive it with
+  `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml` rather than trust the line —
+  it has been wrong twice.
 
 - **`[deps.sakshi]` 2.4.8 → 2.4.10, and the JSON formatter consumes it.** The
   gap this port filed upstream — `sakshi_log_kv` flattening `key=val` into the

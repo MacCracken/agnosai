@@ -1,0 +1,433 @@
+# =========================================================================
+# llm/inference_queue — priority inference queue backed by majra.
+#
+# Parity oracle: rust-old/src/llm/inference_queue.rs
+#
+# Inference requests are enqueued at a priority level and a worker drains them
+# highest-first, so background summarization waits behind interactive crew work.
+#
+# ⚠ Upstream this is `#[cfg(feature = "majra")]`. **A cargo feature gate is not
+# a scope boundary** — `[deps.majra]` is declared and vendored, and `llm/router`
+# already ported its two `#[cfg(feature = "hwaccel")]` functions on exactly that
+# reasoning. `src/llm/mod.cyr` said this file "defers with that feature"; that
+# note predated the decision and is corrected there.
+#
+# ## Three forced substitutions, all from the absence of an async runtime
+#
+# 1. **`enqueue` is synchronous.** The oracle wraps `queue.enqueue(item)` in a
+#    `tokio::spawn` because majra's Rust `enqueue` takes an async lock. majra's
+#    Cyrius `cpq_enqueue` takes a plain mutex and returns, so there is nothing to
+#    spawn. **This is observable**: after the oracle's `enqueue` returns,
+#    `pending()` is still 0 until the spawned task runs — which is why the
+#    oracle's own test sleeps 10ms before asserting `pending() == 1`. Here it is
+#    1 the moment `enqueue` returns. The port's guarantee is strictly stronger
+#    and no caller can depend on the weaker one, so this is not an ADR-level
+#    divergence; it is the substitution being better than what it replaces.
+#
+# 2. **`spawn_worker` returns a stop handle, not a `JoinHandle`.** The oracle's
+#    loop is infinite and is killed by `handle.abort()`, which has no equivalent
+#    for a detached OS thread. The handle carries a stop flag instead, the same
+#    shape `telemetry/otlp`'s exporter thread uses and for the same reason.
+#
+# 3. **The reply is a 1-slot channel, not a `oneshot`.** `chan_new(1)` is a
+#    oneshot that does not consume itself; the caller reads it with `chan_recv`.
+#
+# ## `enqueue` holds a mutex that the oracle does not need
+#
+# ⚠ majra's `queue_item_new` allocates with **`fl_alloc`, and `fl_alloc` is not
+# thread-safe** — `lib/freelist.cyr` pops the global `_fl_heads` lists with plain
+# loads and stores, no lock and no atomics, where `alloc` has a process-wide CAS
+# spinlock (`lib/alloc.cyr:28`). `cpq_enqueue`'s own mutex does not cover it,
+# because the item is built by the *caller* before the call. Two threads calling
+# `agnosai_inference_queue_enqueue` at once could be handed the same 40-byte
+# item, which is majra 2.6.1's `relay_receive` bug one layer up.
+#
+# So the queue carries a mutex covering item construction *and* the enqueue.
+# **That fixes agnosai's self-race, not the process-wide hazard** — any other
+# thread calling `fl_alloc` concurrently still races this one. The real fix is
+# upstream and is filed as
+# `cyrius/docs/development/issues/2026-08-10-fl-alloc-is-not-thread-safe-and-says-nothing.md`.
+# =========================================================================
+
+# How long the worker sleeps between stop-flag checks while idling.
+#
+# The poll interval is the caller's, and a caller that picks 5000 should not
+# make `agnosai_inference_queue_worker_stop` take five seconds — so the idle
+# wait is sliced, exactly as `telemetry/otlp`'s exporter loop slices its
+# interval and for the same reason: a test that starts a worker and stops it
+# otherwise pays the full interval.
+var AGNOSAI_INFERENCE_QUEUE_STOP_POLL_MS = 25;
+
+# The oracle's `Result<InferenceResponse, String>` as it travels the reply
+# channel — 16 bytes, with exactly one slot non-zero.
+enum AgnosaiInferenceResultOff {
+    AGN_IRES_RESPONSE = 0;
+    AGN_IRES_ERROR = 8;
+    AGN_IRES_SIZE = 16;
+}
+
+# The `Ok` arm.
+fn agnosai_inference_result_ok(response): i64 {
+    var r = alloc(AGN_IRES_SIZE);
+    store64(r + AGN_IRES_RESPONSE, response);
+    store64(r + AGN_IRES_ERROR, 0);
+    return r;
+}
+
+# The `Err` arm, carrying the message `e.to_string()` would have produced.
+fn agnosai_inference_result_err(message: Str): i64 {
+    var r = alloc(AGN_IRES_SIZE);
+    store64(r + AGN_IRES_RESPONSE, 0);
+    store64(r + AGN_IRES_ERROR, message);
+    return r;
+}
+
+# The response, or 0 on the `Err` arm.
+fn agnosai_inference_result_response(r): i64 {
+    return load64(r + AGN_IRES_RESPONSE);
+}
+
+# The error message, or 0 on the `Ok` arm.
+fn agnosai_inference_result_error(r): i64 {
+    return load64(r + AGN_IRES_ERROR);
+}
+
+# Whether this is the `Ok` arm.
+#
+# ⚠ Tests the ERROR slot, not the response slot. `agnosai_hoosh_chat` can
+# succeed with a response the parser produced from an empty body, and a null
+# response on the success arm must still read as Ok — the oracle's `Result` says
+# nothing about the payload being non-null either.
+fn agnosai_inference_result_is_ok(r): i64 {
+    if (load64(r + AGN_IRES_ERROR) == 0) { return 1; }
+    return 0;
+}
+
+# QueuedInference — the payload the priority queue carries. 24 bytes.
+enum AgnosaiQueuedInferenceOff {
+    AGN_QI_REQUEST = 0;
+    AGN_QI_REPLY = 8;
+    AGN_QI_LABEL = 16;
+    AGN_QI_SIZE = 24;
+}
+
+# The request to execute.
+fn agnosai_queued_inference_request(q): i64 {
+    return load64(q + AGN_QI_REQUEST);
+}
+
+# The reply channel the result is sent back on.
+fn agnosai_queued_inference_reply(q): i64 {
+    return load64(q + AGN_QI_REPLY);
+}
+
+# The logging label.
+fn agnosai_queued_inference_label(q): i64 {
+    return load64(q + AGN_QI_LABEL);
+}
+
+# InferenceQueue — 16 bytes.
+enum AgnosaiInferenceQueueOff {
+    AGN_IQ_CPQ = 0;
+    AGN_IQ_MUTEX = 8;
+    AGN_IQ_SIZE = 16;
+}
+
+# Create an empty inference queue — the oracle's `new()` and its `Default`.
+fn agnosai_inference_queue_new(): i64 {
+    var q = alloc(AGN_IQ_SIZE);
+    store64(q + AGN_IQ_CPQ, cpq_new());
+    store64(q + AGN_IQ_MUTEX, mutex_new());
+    return q;
+}
+
+# The queue's majra `ConcurrentPriorityQueue`.
+fn agnosai_inference_queue_cpq(q): i64 {
+    return load64(q + AGN_IQ_CPQ);
+}
+
+# Map an agnosai task priority onto a majra queue priority.
+#
+# ⚠ **The two enums run in OPPOSITE directions.** agnosai's
+# `AGNOSAI_PRIORITY_BACKGROUND` is 0 and `_CRITICAL` is 4; majra's
+# `PRIORITY_CRITICAL` is 0 and `PRIORITY_BACKGROUND` is 4. They are exact
+# inverses today, so `4 - p` would pass every assertion below — and would
+# silently break the first time either side inserts a level. The oracle writes
+# an explicit five-arm `match` and so does this.
+#
+# The ladder is also the bounds check. majra's `pq_enqueue` clamps
+# `pri >= NUM_PRIORITIES` to Normal but does **not** clamp negatives, so a -1
+# reaches `load64(pq + pri * 8)` and reads eight bytes before the queue. Nothing
+# here can emit one: every arm returns a named constant and the fallthrough is
+# Normal, which is also what majra's own clamp picks for an over-range value.
+fn agnosai_map_priority(task_priority): i64 {
+    if (task_priority == AGNOSAI_PRIORITY_BACKGROUND) { return PRIORITY_BACKGROUND; }
+    if (task_priority == AGNOSAI_PRIORITY_LOW) { return PRIORITY_LOW; }
+    if (task_priority == AGNOSAI_PRIORITY_HIGH) { return PRIORITY_HIGH; }
+    if (task_priority == AGNOSAI_PRIORITY_CRITICAL) { return PRIORITY_CRITICAL; }
+    return PRIORITY_NORMAL;
+}
+
+# The lowercase name of a majra queue priority, for logs.
+#
+# majra ships `job_state_name` for `JobState` and nothing for `Priority`, so the
+# oracle's `priority = %priority` has no upstream spelling to borrow.
+fn agnosai_queue_priority_name(priority): i64 {
+    if (priority == PRIORITY_CRITICAL) { return str_from("critical"); }
+    if (priority == PRIORITY_HIGH) { return str_from("high"); }
+    if (priority == PRIORITY_LOW) { return str_from("low"); }
+    if (priority == PRIORITY_BACKGROUND) { return str_from("background"); }
+    return str_from("normal");
+}
+
+# The oracle's `debug!(priority, label, "inference request enqueued")`.
+fn _agnosai_inference_queue_log_enqueued(label: Str, priority): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "priority=");
+    str_builder_add(sb, agnosai_queue_priority_name(priority));
+    str_builder_add_cstr(sb, " label=");
+    str_builder_add(sb, label);
+    var line = str_builder_build(sb);
+    # `str_len`, never a hand-counted literal — `tools/wasm_loader` shipped a 41
+    # against a 42-byte message and silently lost its last character.
+    var m = str_from("inference request enqueued");
+    sakshi_log_kv(SK_DEBUG, str_data(m), str_len(m), "queue", 5,
+    str_data(line), str_len(line));
+    return 0;
+}
+
+# Enqueue a request at an explicit majra priority, returning the reply channel.
+#
+# The channel holds one value — the oracle's `oneshot::Receiver`. Read it with
+# `chan_recv`; it yields an `AgnosaiInferenceResult`.
+fn agnosai_inference_queue_enqueue(q, request, priority, label: Str): i64 {
+    var reply = chan_new(1);
+
+    var queued = alloc(AGN_QI_SIZE);
+    store64(queued + AGN_QI_REQUEST, request);
+    store64(queued + AGN_QI_REPLY, reply);
+    store64(queued + AGN_QI_LABEL, label);
+
+    _agnosai_inference_queue_log_enqueued(label, priority);
+
+    # The lock covers `queue_item_new` as well as the enqueue — see the header:
+    # majra builds the item with `fl_alloc`, which carries no lock of its own.
+    var mtx = load64(q + AGN_IQ_MUTEX);
+    mutex_lock(mtx);
+    cpq_enqueue(load64(q + AGN_IQ_CPQ), queue_item_new(priority, queued));
+    mutex_unlock(mtx);
+
+    return reply;
+}
+
+# Enqueue at normal priority — the oracle's `enqueue_normal`.
+fn agnosai_inference_queue_enqueue_normal(q, request, label: Str): i64 {
+    return agnosai_inference_queue_enqueue(q, request, PRIORITY_NORMAL, label);
+}
+
+# Enqueue at background priority — the oracle's `enqueue_background`.
+fn agnosai_inference_queue_enqueue_background(q, request, label: Str): i64 {
+    return agnosai_inference_queue_enqueue(q, request, PRIORITY_BACKGROUND, label);
+}
+
+# Pending items — the oracle's `pending()`.
+fn agnosai_inference_queue_pending(q): i64 {
+    return cpq_len(load64(q + AGN_IQ_CPQ));
+}
+
+# Whether the queue is empty — the oracle's `is_empty()`.
+fn agnosai_inference_queue_is_empty(q): i64 {
+    if (cpq_len(load64(q + AGN_IQ_CPQ)) == 0) { return 1; }
+    return 0;
+}
+
+# The worker's state — 32 bytes. The oracle's `JoinHandle`, plus what a detached
+# thread needs carried to it because `thread_create` passes exactly one value.
+enum AgnosaiInferenceWorkerOff {
+    AGN_IQW_QUEUE = 0;
+    AGN_IQW_CLIENT = 8;
+    AGN_IQW_POLL_MS = 16;
+    AGN_IQW_STOP = 24;
+    AGN_IQW_EXITED = 32;
+    AGN_IQW_SIZE = 40;
+}
+
+# Whether this worker has been asked to stop.
+fn agnosai_inference_worker_stopped(w): i64 {
+    return load64(w + AGN_IQW_STOP);
+}
+
+# Whether the worker loop has actually wound down.
+#
+# `_stopped` is the request; this is the acknowledgement, and the two are not
+# the same instant — a stop raised during an inference is not observed until
+# that call returns. It is the half of `JoinHandle` that survives the
+# substitution: upstream you would `.await` the handle to learn this, and a
+# detached thread gives no such join, so the thread publishes it on the way out.
+#
+# ⚠ Without this, "the worker stopped" can only be tested by asserting that a
+# later enqueue is *not* drained — which races the loop's own stop check and is
+# exactly the shape of flaky test that hides a real defect.
+fn agnosai_inference_worker_exited(w): i64 {
+    return load64(w + AGN_IQW_EXITED);
+}
+
+# The oracle's `debug!(label, priority, "processing queued inference")`.
+fn _agnosai_inference_queue_log_processing(label: Str, priority): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "priority=");
+    str_builder_add(sb, agnosai_queue_priority_name(priority));
+    str_builder_add_cstr(sb, " label=");
+    str_builder_add(sb, label);
+    var line = str_builder_build(sb);
+    var m = str_from("processing queued inference");
+    sakshi_log_kv(SK_DEBUG, str_data(m), str_len(m), "queue", 5,
+    str_data(line), str_len(line));
+    return 0;
+}
+
+# The oracle's `info!("inference queue worker started")`.
+fn _agnosai_inference_queue_log_started(): i64 {
+    if (sakshi_get_level() < SK_INFO) { return 0; }
+    var m = str_from("inference queue worker started");
+    sakshi_info(str_data(m), str_len(m));
+    return 0;
+}
+
+# Turn one completed inference into the reply, and send it.
+#
+# `chat_rc` is `agnosai_hoosh_chat`'s return: 0 on success, with the response
+# already stored where `out_response` pointed, otherwise the error Str. That is
+# exactly the oracle's `.map_err(|e| e.to_string())`.
+#
+# Split out of the worker loop for the reason `tools/wasm_tool`'s
+# `output_of` is: the oracle's own tests never drive this through a live
+# gateway, so a port that only reached it from `spawn_worker` would be asserting
+# on nothing without a network. Returns the result that was sent.
+#
+# ⚠ The send is `let _ = queued.reply.send(result)` upstream — a dropped receiver
+# is not an error. `chan_send` returns -1 on a closed channel and that return is
+# deliberately discarded here for the same reason.
+fn agnosai_inference_queue_settle(queued, chat_rc, response): i64 {
+    var result = agnosai_inference_result_ok(response);
+    if (chat_rc != 0) { result = agnosai_inference_result_err(chat_rc); }
+    chan_send(load64(queued + AGN_QI_REPLY), result);
+    return result;
+}
+
+# The live inference call — the oracle's `client.infer(&request)`.
+#
+# `fn(client, request, out_response) -> i64`: 0 on success with the response
+# stored through `out_response`, otherwise the error Str. That is
+# `agnosai_hoosh_chat`'s contract with the client's two fields folded in, which
+# is the only reason this wrapper exists.
+fn _agnosai_inference_chat_live(client, request, out_response): i64 {
+    return agnosai_hoosh_chat(agnosai_hoosh_client_base_url(client),
+    agnosai_hoosh_client_api_key(client), request, out_response);
+}
+
+# Execute one dequeued item end to end, through `chat_fp`.
+#
+# ⚠ **The transport is a function pointer for the reason `tools/agnos.cyr`'s
+# is** — its header makes the argument at length, and this is the same problem.
+# The success path needs a gateway that answers, so with the call hard-wired the
+# only reachable arm offline is the failure one, and a mutant that dropped the
+# response on the way to `settle` **survived every assertion**. It is not a
+# hypothetical: that wiring is what decides whether a caller waiting on the
+# reply channel gets its response or a null.
+#
+# Nothing is injected in production — `agnosai_inference_queue_run_item` passes
+# the live call, and there is no settable global to get out of step.
+fn agnosai_inference_queue_run_item_with(item, client, chat_fp): i64 {
+    var queued = queue_item_payload(item);
+    _agnosai_inference_queue_log_processing(load64(queued + AGN_QI_LABEL),
+    queue_item_priority(item));
+
+    var response = 0;
+    store64(&response, 0);
+    var rc = callptr(chat_fp, client, load64(queued + AGN_QI_REQUEST), &response);
+    return agnosai_inference_queue_settle(queued, rc, load64(&response));
+}
+
+# Execute one dequeued item — the body of the oracle's `if let Some`.
+fn agnosai_inference_queue_run_item(item, client): i64 {
+    return agnosai_inference_queue_run_item_with(item, client,
+    &_agnosai_inference_chat_live);
+}
+
+# Drain whatever is queued right now, returning how many items ran.
+#
+# The oracle has no equivalent: its loop dequeues one item per iteration and
+# `sleep`s when the queue is empty, which only reads as a "drain" because the
+# iteration is free. Here the same shape needs a name so the worker loop and a
+# test can share it without the test owning a thread.
+fn agnosai_inference_queue_drain(q, client): i64 {
+    var ran = 0;
+    var item = cpq_dequeue(load64(q + AGN_IQ_CPQ));
+    while (item != 0) {
+        agnosai_inference_queue_run_item(item, client);
+        ran = ran + 1;
+        item = cpq_dequeue(load64(q + AGN_IQ_CPQ));
+    }
+    return ran;
+}
+
+# The worker loop — `thread_create` passes exactly one argument.
+#
+# ⚠ Uses `cpq_dequeue`, not `cpq_dequeue_wait`. The blocking form parks on a
+# futex and would ignore the stop flag until the next enqueue woke it, which for
+# an idle queue is never. The oracle polls too, for the matching reason: its
+# `dequeue()` returns `Option` and the `else` arm sleeps.
+fn _agnosai_inference_queue_worker(w): i64 {
+    _agnosai_inference_queue_log_started();
+    var q = load64(w + AGN_IQW_QUEUE);
+    var client = load64(w + AGN_IQW_CLIENT);
+
+    while (load64(w + AGN_IQW_STOP) == 0) {
+        var item = cpq_dequeue(load64(q + AGN_IQ_CPQ));
+        if (item != 0) {
+            agnosai_inference_queue_run_item(item, client);
+        } else {
+            var interval = load64(w + AGN_IQW_POLL_MS);
+            var slept = 0;
+            while (slept < interval) {
+                if (load64(w + AGN_IQW_STOP) != 0) { break; }
+                var slice = AGNOSAI_INFERENCE_QUEUE_STOP_POLL_MS;
+                if (interval - slept < slice) { slice = interval - slept; }
+                sleep_ms(slice);
+                slept = slept + slice;
+            }
+        }
+    }
+    store64(w + AGN_IQW_EXITED, 1);
+    return 0;
+}
+
+# Start the worker — the oracle's `spawn_worker`, returning the stop handle.
+#
+# Detached, like `telemetry/otlp`'s exporter: a joinable thread nobody joins
+# leaks its 2 MiB stack for the life of the process, which is cyrius 6.5.8's own
+# filing from this repo. Nothing here ever joins.
+fn agnosai_inference_queue_spawn_worker(q, client, poll_interval_ms): i64 {
+    var w = alloc(AGN_IQW_SIZE);
+    store64(w + AGN_IQW_QUEUE, q);
+    store64(w + AGN_IQW_CLIENT, client);
+    store64(w + AGN_IQW_POLL_MS, poll_interval_ms);
+    store64(w + AGN_IQW_STOP, 0);
+    store64(w + AGN_IQW_EXITED, 0);
+    thread_create_detached(&_agnosai_inference_queue_worker, w);
+    return w;
+}
+
+# Ask the worker to stop — the oracle's `handle.abort()`.
+#
+# ⚠ Asynchronous, and it does not interrupt an inference already in flight: the
+# flag is read at the top of the loop and inside the idle wait. `abort()` is
+# asynchronous upstream too, cancelling at the next await point rather than
+# mid-`infer`, so the weaker guarantee is the oracle's as well.
+fn agnosai_inference_queue_worker_stop(w): i64 {
+    store64(w + AGN_IQW_STOP, 1);
+    return 0;
+}

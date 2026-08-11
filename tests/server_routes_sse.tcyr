@@ -1,0 +1,245 @@
+# =========================================================================
+# server_routes_sse.tcyr — parity tests for src/server/routes/sse.cyr
+#
+# Oracle: the #[cfg(test)] block in rust-old/src/server/routes/sse.rs — 3
+# `#[tokio::test]`s.
+#
+# ⚠ **This suite did not exist, and `src/server/routes/sse.cyr` was the ONE
+# routes module with no test file.** Every other `routes/*.rs` with tests has a
+# `tests/server_routes_*.tcyr`; `routes/mod.rs` has none and is owed none. The
+# handler is not untested by accident of naming either —
+# `tests/server_sse.tcyr` covers `src/server/sse.cyr`, the event **bus**, which
+# is a different module, and `tests/server_router.tcyr` only pins that
+# `GET /api/v1/crews/{id}/stream` reaches `AGN_ROUTE_CREW_STREAM`. Nothing
+# asserted anything the handler itself writes.
+#
+# ## How a streaming handler is driven without a socket
+#
+# `agnosai_sse_crew_stream` writes to a raw fd rather than returning a response
+# object, so unlike the other routes suites there is nothing to inspect in
+# memory. The fd here is an ordinary file: `sandhi_server_send_chunked_start`
+# and `send_chunk` only `write(2)`, so the capture file ends up holding exactly
+# the bytes a client would have read, HTTP chunk framing and all. Assertions are
+# substring searches, which see through that framing.
+#
+# ## The active-crew case needs a second thread, and why it is not flaky
+#
+# The handler subscribes to the bus ITSELF, so its loop cannot be pre-closed —
+# the only lever that ends it is `agnosai_event_bus_remove`, which closes every
+# live subscriber. So the handler runs on a spawned thread and the test thread
+# removes the crew. That is not a timing race: `remove` sets `AGN_ER_CLOSED` on
+# the handler's own subscription, and the loop's `try_recv`-empty arm checks
+# exactly that flag, so the exit is caused rather than waited for. The join is
+# bounded so a handler that ignores the flag FAILS instead of hanging.
+#
+# What is pinned past the oracle:
+#
+#   * **the error frame's wire shape** — `event: error` and `data:` carrying
+#     both `crew not found` AND the `crew_id`. The oracle greps the body for two
+#     substrings and never looks at the frame structure.
+#   * **the connected frame**, which the oracle's third test never reads: it
+#     asserts a 200 and a content type and stops, because reading the body of a
+#     live stream would hang `oneshot`.
+#   * **`has` is asked BEFORE `subscribe`**, and an unknown crew leaves no entry
+#     behind. `subscribe` creates the channel as a side effect, so asking in the
+#     other order makes every id look live — and the bus would grow an entry per
+#     probe of a nonexistent crew.
+#   * **the id is canonicalised**, so an UPPERCASE uuid finds a crew registered
+#     in lowercase instead of reporting "crew not found" for a running crew.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/mod.cyr"
+include "src/learning/mod.cyr"
+include "src/llm/mod.cyr"
+include "src/server/ssrf.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/server/prometheus.cyr"
+include "src/server/auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/sandbox/mod.cyr"
+include "src/tools/mod.cyr"
+include "src/orchestrator/mod.cyr"
+include "src/server/state.cyr"
+include "src/server/routes/mod.cyr"
+include "src/server/routes/sse.cyr"
+include "tests/test_helpers.cyr"
+
+var _T_CAP = "/tmp/agnosai-routes-sse-capture";
+
+# A lowercase-hyphenated uuid, and the same value uppercased.
+var _T_CREW = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+var _T_CREW_UPPER = "3F2504E0-4F89-41D3-9A0C-0305E82C3301";
+var _T_UNKNOWN = "00000000-0000-4000-8000-000000000000";
+
+fn _t_state(): i64 {
+    return agnosai_app_state_new(agnosai_orchestrator_new(0),
+    agnosai_tool_registry_new(), agnosai_auth_config_new(),
+    agnosai_event_bus_new(), agnosai_audit_chain_new(),
+    agnosai_approval_gate_new());
+}
+
+# A truncating write fd on the capture file.
+fn _t_open_capture(): i64 {
+    return file_open(str_cstr(str_from(_T_CAP)), O_WRONLY | O_CREAT | O_TRUNC, 420);
+}
+
+# Everything the handler wrote, as a Str.
+fn _t_captured(): Str {
+    var buf = alloc(65536);
+    var n = file_read_all(str_cstr(str_from(_T_CAP)), buf, 65536);
+    if (n < 0) { n = 0; }
+    return str_from_buf(buf, n);
+}
+
+fn _t_has(hay: Str, needle, name): i64 {
+    return assert(str_contains(hay, str_from(needle)) == 1, name);
+}
+
+fn _t_lacks(hay: Str, needle, name): i64 {
+    return assert(str_contains(hay, str_from(needle)) == 0, name);
+}
+
+# Run the handler against the capture file and return what it wrote.
+fn _t_run(state, crew_id): Str {
+    var fd = _t_open_capture();
+    agnosai_sse_crew_stream(state, fd, str_from(crew_id));
+    file_close(fd);
+    return _t_captured();
+}
+
+# --- the active-crew case, which needs the handler on its own thread --------
+
+var _t_thread_state = 0;
+var _t_thread_fd = 0;
+var _t_thread_done = 0;
+var _t_thread_id = 0;
+
+fn _t_stream_thread(arg): i64 {
+    agnosai_sse_crew_stream(_t_thread_state, _t_thread_fd, _t_thread_id);
+    _t_thread_done = 1;
+    return 0;
+}
+
+# Run the handler on its own thread against `id_raw`, end it by closing the
+# subscribers of `live_id`, and return everything it wrote.
+#
+# ⚠ The handoff waits for the sender's RECEIVER COUNT to reach 2 — the
+# pre-subscribed watcher plus the handler's own subscription — rather than
+# sleeping a fixed interval. A sleep would be a race in the direction that
+# hides a bug: remove the crew before the handler subscribes and `has` answers
+# 0, the handler takes the unknown-crew path, and every assertion below still
+# has something to match on the wrong frame.
+fn _t_run_live(state, id_raw: Str, live_id: Str): Str {
+    _t_thread_state = state;
+    _t_thread_fd = _t_open_capture();
+    _t_thread_id = id_raw;
+    _t_thread_done = 0;
+    assert_eq(thread_create_detached(&_t_stream_thread, 0), 1, "the handler thread starts");
+
+    var bus = agnosai_app_state_events(state);
+    var tx = agnosai_event_bus_sender(bus, live_id);
+    var spins = 0;
+    while (spins < 400) {
+        if (agnosai_event_sender_receiver_count(tx) >= 2) { break; }
+        sleep_ms(5);
+        spins = spins + 1;
+    }
+    assert(agnosai_event_sender_receiver_count(tx) >= 2,
+    "the handler subscribed before the crew was torn down");
+
+    agnosai_event_bus_remove(bus, live_id);
+
+    var waited = 0;
+    while (waited < 200) {
+        if (_t_thread_done == 1) { break; }
+        sleep_ms(25);
+        waited = waited + 1;
+    }
+    assert_eq(_t_thread_done, 1,
+    "and the loop stops when the bus closes its subscription — NOT on a timeout");
+    file_close(_t_thread_fd);
+    return _t_captured();
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    test_group("server_routes_sse");
+
+    # --- oracle: `sse_endpoint_sends_error_event_for_unknown_crew` ----------
+    var s1 = _t_state();
+    var body = _t_run(s1, _T_UNKNOWN);
+
+    _t_has(body, "HTTP/1.1 200 OK", "an unknown crew still answers 200, not 404");
+    _t_has(body, "Transfer-Encoding: chunked", "over a chunked body");
+    _t_has(body, "text/event-stream", "with the SSE content type");
+    _t_has(body, "Cache-Control: no-cache", "and no-cache, as the oracle sets");
+    _t_has(body, "event: error", "carrying an error event");
+    _t_has(body, "crew not found", "whose data says the crew was not found");
+
+    # Past the oracle: the frame's shape, and that the id is echoed back.
+    _t_has(body, "data: ", "the error arrives as a data: line");
+    _t_has(body, _T_UNKNOWN, "which names the crew that was asked for");
+    _t_has(body, "\"event_type\":\"error\"", "and the event object types itself");
+    _t_lacks(body, "SSE stream connected", "and no connected frame is emitted");
+
+    # ⚠ `has` is asked BEFORE `subscribe`, and the speculative channel is torn
+    # down. Reversing the two makes every id look live; skipping the removal
+    # grows the bus by one entry per probe of a crew that does not exist.
+    assert_eq(agnosai_event_bus_has(agnosai_app_state_events(s1), str_from(_T_UNKNOWN)), 0,
+    "and the bus is NOT left holding an entry for a crew that does not exist");
+    assert_eq(agnosai_event_bus_len(agnosai_app_state_events(s1)), 0, "so it stays empty");
+
+    # --- oracle: `sse_endpoint_returns_event_stream_content_type` -----------
+    # Same call, asserted for what that test asserts: the status and the type.
+    # The oracle runs it against a random id, so it takes the unknown-crew path
+    # too — the header is written before the crew is known either way.
+    _t_has(body, "text/event-stream", "the content type does not depend on the crew");
+
+    # --- oracle: `sse_endpoint_for_active_crew_sends_connected_event` -------
+    var s2 = _t_state();
+    var bus = agnosai_app_state_events(s2);
+
+    # The oracle's "pre-create the event channel so the crew is known".
+    var watcher = agnosai_event_bus_subscribe(bus, str_from(_T_CREW));
+    assert_neq(watcher, 0, "the crew is pre-subscribed, so the bus knows it");
+    assert_eq(agnosai_event_bus_has(bus, str_from(_T_CREW)), 1, "and reports it live");
+
+    var live = _t_run_live(s2, str_from(_T_CREW), str_from(_T_CREW));
+    _t_has(live, "HTTP/1.1 200 OK", "an active crew answers 200");
+    _t_has(live, "text/event-stream", "with the SSE content type");
+    _t_has(live, "event: connected", "and opens with a connected event");
+    _t_has(live, "SSE stream connected", "carrying the oracle's message");
+    _t_has(live, _T_CREW, "and the crew id");
+    _t_lacks(live, "crew not found", "and never claims the crew is missing");
+
+    # --- past the oracle: an UPPERCASE id finds a lowercase crew ------------
+    # `agnosai_uuid_parse` accepts uppercase hex and crew ids are minted
+    # lowercase, so without the canonicalisation at the top of the handler this
+    # would pass the route's validity gate, miss the bus, and report "crew not
+    # found" for a crew that is running.
+    var s3 = _t_state();
+    agnosai_event_bus_subscribe(agnosai_app_state_events(s3), str_from(_T_CREW));
+    var upper = _t_run_live(s3, str_from(_T_CREW_UPPER), str_from(_T_CREW));
+    _t_lacks(upper, "crew not found",
+    "an UPPERCASE id does not report a running crew as missing");
+    _t_has(upper, "event: connected", "it connects to the lowercase crew");
+    _t_has(upper, _T_CREW, "and the frames carry the CANONICAL lowercase id");
+    _t_lacks(upper, _T_CREW_UPPER, "not the spelling the client sent");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

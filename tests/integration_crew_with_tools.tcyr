@@ -1,0 +1,244 @@
+# =========================================================================
+# integration_crew_with_tools.tcyr — the oracle's INTEGRATION test.
+#
+# Oracle: rust-old/tests/crew_with_tools.rs — two `#[tokio::test]`s. That file
+# lives under `rust-old/tests/`, not inside a module's `#[cfg(test)]` block, so
+# it is invisible to the per-module test screen and had no Cyrius counterpart:
+# `crew_with_tools_dag_pipeline` and `crew_with_tools_parallel_pipeline` are the
+# only end-to-end exercises of registry → crew → runner in the whole oracle.
+#
+# ⚠ **The registry is NEVER handed to the runner, in the oracle or here.**
+# `crew_with_tools.rs` builds a `ToolRegistry`, registers `EchoTool`, asserts on
+# it — and then calls `CrewRunner::new(spec)` with no registry and no LLM client.
+# So the crew runs the **placeholder** path throughout, and the file's name
+# oversells what it couples: the tool assertions are standalone and the pipeline
+# assertions are about DAG ordering. That is reproduced exactly rather than
+# "improved", because wiring the registry in would test something the oracle
+# does not and would hide the same gap the oracle has.
+#
+# The placeholder path is what makes the ordering assertions meaningful: its
+# output is the task description **verbatim**, so a result can be traced back to
+# the task that produced it without a live gateway.
+#
+# What is pinned past the oracle:
+#
+#   * **the DAG order is asserted as a total order over all three positions**,
+#     and also that the results are not merely the input order — the oracle
+#     builds its tasks in dependency order, so a runner that ignored
+#     dependencies entirely and ran the input sequence would pass upstream.
+#   * **every result's task_id is one of the three submitted**, so a runner that
+#     duplicated a task and dropped another still produces three results and
+#     would otherwise slip through `results.len() == 3`.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/mod.cyr"
+include "src/learning/mod.cyr"
+include "src/llm/mod.cyr"
+include "src/server/ssrf.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+# prometheus — `orchestrator/crew_runner` records task and crew metrics on every
+# boundary, so any suite that runs a crew needs the registry those calls land in.
+include "src/server/prometheus.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+# definitions/loader — `sandbox/wasm` reads module bytes through
+# `_agnosai_loader_read`, so the sandbox group pulls the loader in with it.
+include "src/definitions/presets_data.cyr"
+include "src/definitions/loader.cyr"
+include "src/sandbox/mod.cyr"
+include "src/tools/mod.cyr"
+include "src/orchestrator/mod.cyr"
+include "tests/test_helpers.cyr"
+
+# The oracle's `make_agent`.
+fn _t_agent(key, role, goal): i64 {
+    var a = agnosai_agent_new(str_from(key), str_from(role), str_from(goal));
+    var tools = vec_new();
+    vec_push(tools, str_from("echo"));
+    agnosai_agent_with_tools(a, tools);
+    agnosai_agent_with_domain(a, str_from("quality"));
+    return a;
+}
+
+# The index of `task_id` in a results vec, or -1.
+fn _t_pos_of(results, task_id: Str): i64 {
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        if (str_eq(agnosai_task_result_task_id(vec_get(results, i)), task_id) == 1) {
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+# The result carrying `task_id`, or 0.
+fn _t_result_of(results, task_id: Str): i64 {
+    var i = _t_pos_of(results, task_id);
+    if (i < 0) { return 0; }
+    return vec_get(results, i);
+}
+
+# Whether any result's output equals `want`.
+fn _t_any_output(results, want): i64 {
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        if (str_eq(agnosai_task_result_output(vec_get(results, i)), str_from(want)) == 1) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# Oracle: `crew_with_tools_dag_pipeline`.
+fn _t_dag_pipeline(): i64 {
+    # ── 1. agent definitions ──────────────
+    var analyst = _t_agent("analyst", "requirements analyst",
+    "gather and clarify requirements");
+    var designer = _t_agent("designer", "system designer",
+    "design the solution architecture");
+    var reviewer = _t_agent("reviewer", "quality reviewer",
+    "review deliverables for correctness");
+
+    # ── 2. the registry, which the runner never sees ──
+    var registry = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(registry, agnosai_echo_tool());
+    assert_eq(agnosai_tool_registry_has(registry, str_from("echo")), 1,
+    "the echo tool registers");
+    assert_eq(agnosai_tool_registry_count(registry), 1, "and is the only one");
+    var tool = agnosai_tool_registry_get(registry, str_from("echo"));
+    assert_neq(tool, 0, "and comes back out");
+    assert(str_eq(agnosai_tool_name(tool), str_from("echo")) == 1, "under its name");
+
+    # ── 3. a DAG: gather -> design -> review ──
+    var gather = agnosai_task_new(str_from("Gather and document project requirements"));
+    var design = agnosai_task_new(str_from("Design system architecture based on requirements"));
+    agnosai_task_with_dependency(design, agnosai_task_id(gather));
+    var review = agnosai_task_new(str_from("Review all deliverables for quality"));
+    agnosai_task_with_dependency(review, agnosai_task_id(design));
+
+    var gather_id = agnosai_task_id(gather);
+    var design_id = agnosai_task_id(design);
+    var review_id = agnosai_task_id(review);
+
+    var agents = vec_new();
+    vec_push(agents, analyst);
+    vec_push(agents, designer);
+    vec_push(agents, reviewer);
+    var tasks = vec_new();
+    vec_push(tasks, gather);
+    vec_push(tasks, design);
+    vec_push(tasks, review);
+
+    var spec = agnosai_crew_new(str_from("integration-test-crew"));
+    agnosai_crew_with_agents(spec, agents);
+    agnosai_crew_with_tasks(spec, tasks);
+    agnosai_crew_with_process(spec, agnosai_process_dag());
+
+    # ── 4. run ──────────────
+    var err = 0;
+    store64(&err, 0);
+    var state = agnosai_crew_runner_run(agnosai_crew_runner_new(spec), &err);
+    assert_neq(state, 0, "the crew run succeeds");
+    assert_eq(load64(&err), 0, "with no error");
+
+    # ── 5. results ──────────────
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED, "the crew completes");
+    var results = agnosai_crew_state_results(state);
+    assert_eq(vec_len(results), 3, "with three task results");
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        assert_eq(agnosai_task_result_status(vec_get(results, i)), AGNOSAI_STATUS_COMPLETED,
+        "every task completed");
+    }
+
+    var gp = _t_pos_of(results, gather_id);
+    var dp = _t_pos_of(results, design_id);
+    var rp = _t_pos_of(results, review_id);
+    assert(gp >= 0, "the gather task has a result");
+    assert(dp >= 0, "so does design");
+    assert(rp >= 0, "and review");
+    assert(gp < dp, "gather is ordered before design");
+    assert(dp < rp, "and design before review");
+
+    # ⚠ Past the oracle: the three positions are a permutation of 0,1,2. Without
+    # this, a runner that emitted the same result three times satisfies both
+    # `len == 3` and the ordering compares.
+    assert_eq(gp + dp + rp, 3, "and the three positions are 0, 1 and 2 — no duplicates");
+
+    # The placeholder echoes the description verbatim, which is what lets a
+    # result be traced back to its task at all.
+    assert(str_eq(agnosai_task_result_output(_t_result_of(results, gather_id)),
+    str_from("Gather and document project requirements")) == 1,
+    "gather's output is its description verbatim");
+    assert(str_eq(agnosai_task_result_output(_t_result_of(results, design_id)),
+    str_from("Design system architecture based on requirements")) == 1, "and design's");
+    assert(str_eq(agnosai_task_result_output(_t_result_of(results, review_id)),
+    str_from("Review all deliverables for quality")) == 1, "and review's");
+    return 0;
+}
+
+# Oracle: `crew_with_tools_parallel_pipeline`.
+fn _t_parallel_pipeline(): i64 {
+    var agents = vec_new();
+    vec_push(agents, _t_agent("agent-a", "worker", "do work"));
+    vec_push(agents, _t_agent("agent-b", "worker", "do work"));
+
+    var registry = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(registry, agnosai_echo_tool());
+
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("parallel task 1")));
+    vec_push(tasks, agnosai_task_new(str_from("parallel task 2")));
+    vec_push(tasks, agnosai_task_new(str_from("parallel task 3")));
+
+    var spec = agnosai_crew_new(str_from("parallel-integration-crew"));
+    agnosai_crew_with_agents(spec, agents);
+    agnosai_crew_with_tasks(spec, tasks);
+    # ⚠ `max_concurrency: 2` against THREE tasks, so the third genuinely waits
+    # for a slot. Two would have every task start immediately and measure
+    # nothing about the limit.
+    agnosai_crew_with_process(spec, agnosai_process_parallel(2));
+
+    var err = 0;
+    store64(&err, 0);
+    var state = agnosai_crew_runner_run(agnosai_crew_runner_new(spec), &err);
+    assert_neq(state, 0, "the parallel crew run succeeds");
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED, "and completes");
+
+    var results = agnosai_crew_state_results(state);
+    assert_eq(vec_len(results), 3, "with three results");
+
+    # ⚠ Order is NOT asserted — parallel results arrive in completion order, and
+    # the oracle collects them into a HashSet for exactly that reason. Asserting
+    # an order here would be a test that passes by luck of scheduling.
+    assert_eq(_t_any_output(results, "parallel task 1"), 1, "task 1's output is present");
+    assert_eq(_t_any_output(results, "parallel task 2"), 1, "and task 2's");
+    assert_eq(_t_any_output(results, "parallel task 3"), 1, "and task 3's");
+
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        assert_eq(agnosai_task_result_status(vec_get(results, i)), AGNOSAI_STATUS_COMPLETED,
+        "and every one completed");
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    test_group("integration_crew_with_tools");
+
+    _t_dag_pipeline();
+    _t_parallel_pipeline();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

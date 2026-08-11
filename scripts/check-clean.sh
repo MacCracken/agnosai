@@ -20,8 +20,15 @@ note() { printf '  %s\n' "$1"; }
 # Test files are covered deliberately. CLAUDE.md calls this out because a
 # `src/`-only sweep is the easy mistake, and `.tcyr` files are two-fifths of the
 # tree by count.
+#
+# `benches/*.bcyr` are covered too, added 2026-08-10. They were in neither this
+# loop nor CI, and three of the six had rotted into hard compile errors against a
+# src/ that moved under them — 50 of 79 benchmarks silently not running. fmt and
+# lint below would not have caught that (only compiling does, which is now a CI
+# step), but leaving benches/ out of the sweep entirely is what let it go unseen.
 n=0
-for f in $(find src -name "*.cyr" | sort) $(find tests -name "*.tcyr" | sort); do
+for f in $(find src -name "*.cyr" | sort) $(find tests -name "*.tcyr" | sort) \
+         $(find benches -name "*.bcyr" | sort); do
     [ -e "$f" ] || continue
     n=$((n + 1))
     if ! cyrius fmt "$f" --check >/dev/null 2>&1; then
@@ -36,7 +43,7 @@ echo "fmt: $n files"
 # CHANGELOG, issue, or roadmap entry on the SAME line, or carry `#skip-lint`.
 # The rule is what keeps a deferral from quietly becoming permanent.
 n=0
-for f in $(find src -name "*.cyr" | sort); do
+for f in $(find src -name "*.cyr" | sort) $(find benches -name "*.bcyr" | sort); do
     [ -e "$f" ] || continue
     n=$((n + 1))
     out=$(cyrius lint "$f" 2>&1)

@@ -1,0 +1,294 @@
+# =========================================================================
+# llm_inference_queue.tcyr — tests for src/llm/inference_queue.cyr
+#
+# Oracle test block: rust-old/src/llm/inference_queue.rs — four tests, three of
+# them `#[tokio::test]`. Re-expressed synchronously, which is work rather than
+# an exemption: `queue_creation`, `enqueue_increments_pending` and
+# `enqueue_background_works` are async only because `pending()`/`is_empty()`
+# take an async lock upstream.
+#
+# ⚠ **`enqueue_increments_pending` loses its `sleep(10ms)` in the port, and that
+# is the point of the test here.** Upstream, `enqueue` hands the work to
+# `tokio::spawn`, so `pending()` is 0 until that task runs and the sleep is what
+# makes the assertion true. This port's `enqueue` is synchronous — see the
+# module header — so the count is right the instant it returns. Asserting it
+# with no sleep is what proves the substitution.
+#
+# What is pinned past the oracle:
+#
+#   * **the two priority enums run in OPPOSITE directions.** agnosai's
+#     Background is 0 and majra's is 4. A pass-through would satisfy nothing,
+#     and `4 - p` would satisfy every arm — so the inversion is asserted
+#     numerically as well as through the mapping.
+#   * **the fallthrough can never emit an out-of-range priority.** majra's
+#     `pq_enqueue` clamps `>= NUM_PRIORITIES` but NOT negatives, so a -1 reaches
+#     `load64(pq + pri * 8)` and reads before the queue.
+#   * **dequeue order**, which is the module's whole reason to exist and which
+#     no oracle test covers.
+#   * **`is_ok` reads the ERROR slot, not the response slot** — a success
+#     carrying a null response is still Ok.
+#   * **the result reaches the reply channel**, which is the oneshot's contract.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/task.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/inference_queue.cyr"
+include "tests/test_helpers.cyr"
+
+# A port nothing listens on, so `agnosai_hoosh_chat` fails with ECONNREFUSED
+# immediately — no DNS, no timeout. That is the offline way to drive the whole
+# worker path and land on the Err arm.
+var _T_DEAD_URL = "http://127.0.0.1:1";
+
+fn _t_seq(a: Str, b: Str, name): i64 {
+    return assert(str_eq(a, b), name);
+}
+
+# A minimal request; the queue never inspects it.
+fn _t_req(model): i64 {
+    return agnosai_inference_request_new(str_from(model));
+}
+
+# The one response a synthetic gateway hands back, minted once so identity can
+# be asserted and not merely equality.
+var _t_canned = 0;
+
+fn _t_canned_response(): i64 {
+    if (_t_canned == 0) {
+        _t_canned = agnosai_inference_response_new(str_from("canned"), str_from("bench-model"));
+    }
+    return _t_canned;
+}
+
+# A gateway that answers — `agnosai_hoosh_chat`'s success contract exactly:
+# 0, with the response stored through `out_response`.
+fn _t_chat_ok(client, request, out_response): i64 {
+    store64(out_response, _t_canned_response());
+    return 0;
+}
+
+# A gateway that fails — the error Str, and `out_response` left untouched.
+fn _t_chat_err(client, request, out_response): i64 {
+    return str_from("synthetic transport failure");
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    test_group("llm_inference_queue");
+
+    # --- the oracle's `queue_creation` -------------------------------------
+    var q = agnosai_inference_queue_new();
+    assert_neq(q, 0, "a queue is created");
+    assert_eq(agnosai_inference_queue_is_empty(q), 1, "and starts empty");
+    assert_eq(agnosai_inference_queue_pending(q), 0, "with nothing pending");
+    assert_neq(agnosai_inference_queue_cpq(q), 0, "over a majra concurrent queue");
+
+    # --- the oracle's `priority_mapping` -----------------------------------
+    assert_eq(agnosai_map_priority(AGNOSAI_PRIORITY_BACKGROUND), PRIORITY_BACKGROUND,
+    "background maps to background");
+    assert_eq(agnosai_map_priority(AGNOSAI_PRIORITY_LOW), PRIORITY_LOW, "low to low");
+    assert_eq(agnosai_map_priority(AGNOSAI_PRIORITY_NORMAL), PRIORITY_NORMAL,
+    "normal to normal");
+    assert_eq(agnosai_map_priority(AGNOSAI_PRIORITY_HIGH), PRIORITY_HIGH, "high to high");
+    assert_eq(agnosai_map_priority(AGNOSAI_PRIORITY_CRITICAL), PRIORITY_CRITICAL,
+    "critical to critical");
+
+    # ⚠ The mapping is NOT a pass-through, and the numbers say so: the two enums
+    # are exact inverses, so identity is wrong at four of five levels.
+    assert_neq(AGNOSAI_PRIORITY_BACKGROUND, PRIORITY_BACKGROUND,
+    "the two Background constants differ numerically");
+    assert_neq(AGNOSAI_PRIORITY_CRITICAL, PRIORITY_CRITICAL, "and the two Critical ones");
+    assert_eq(AGNOSAI_PRIORITY_NORMAL, PRIORITY_NORMAL,
+    "Normal is the one value identity would get right");
+
+    # The fallthrough is also the bounds check — nothing can emit a negative or
+    # an over-range level into `pq_enqueue`.
+    assert_eq(agnosai_map_priority(99), PRIORITY_NORMAL, "an unknown level reads as normal");
+    assert_eq(agnosai_map_priority(0 - 7), PRIORITY_NORMAL, "and so does a negative one");
+
+    # --- the oracle's `enqueue_increments_pending`, with NO sleep -----------
+    var rx = agnosai_inference_queue_enqueue_normal(q, _t_req("test"), str_from("test"));
+    assert_neq(rx, 0, "enqueue_normal returns a reply channel");
+    assert_eq(agnosai_inference_queue_pending(q), 1,
+    "and pending is 1 IMMEDIATELY — no spawn to wait for");
+    assert_eq(agnosai_inference_queue_is_empty(q), 0, "so the queue is no longer empty");
+
+    # --- the oracle's `enqueue_background_works` ---------------------------
+    var q2 = agnosai_inference_queue_new();
+    assert_neq(agnosai_inference_queue_enqueue_background(q2, _t_req("test"),
+    str_from("bg")), 0, "enqueue_background returns a channel");
+    assert_eq(agnosai_inference_queue_pending(q2), 1, "and counts");
+
+    # ⚠ Both convenience wrappers are checked for the LEVEL they pick, not only
+    # for the count. The oracle asserts `pending() == 1` and nothing else, so a
+    # `enqueue_background` that quietly enqueued at Normal passes upstream — and
+    # the whole module exists to keep background work behind interactive work.
+    assert_eq(queue_item_priority(cpq_dequeue(agnosai_inference_queue_cpq(q2))),
+    PRIORITY_BACKGROUND, "at BACKGROUND priority, not merely at some priority");
+    assert_eq(queue_item_priority(cpq_dequeue(agnosai_inference_queue_cpq(q))),
+    PRIORITY_NORMAL, "and enqueue_normal at NORMAL");
+
+    # --- dequeue ORDER, which the oracle never checks ----------------------
+    var q3 = agnosai_inference_queue_new();
+    agnosai_inference_queue_enqueue(q3, _t_req("bg"), PRIORITY_BACKGROUND, str_from("bg"));
+    agnosai_inference_queue_enqueue(q3, _t_req("norm"), PRIORITY_NORMAL, str_from("norm"));
+    agnosai_inference_queue_enqueue(q3, _t_req("crit"), PRIORITY_CRITICAL, str_from("crit"));
+    assert_eq(agnosai_inference_queue_pending(q3), 3, "three queued");
+
+    var i1 = cpq_dequeue(agnosai_inference_queue_cpq(q3));
+    _t_seq(agnosai_queued_inference_label(queue_item_payload(i1)), str_from("crit"),
+    "critical comes out first, though it went in last");
+    var i2 = cpq_dequeue(agnosai_inference_queue_cpq(q3));
+    _t_seq(agnosai_queued_inference_label(queue_item_payload(i2)), str_from("norm"),
+    "then normal");
+    var i3 = cpq_dequeue(agnosai_inference_queue_cpq(q3));
+    _t_seq(agnosai_queued_inference_label(queue_item_payload(i3)), str_from("bg"),
+    "and background last");
+    assert_eq(agnosai_inference_queue_pending(q3), 0, "leaving the queue empty");
+
+    # The item carries what the worker needs.
+    var payload = queue_item_payload(i1);
+    assert_neq(agnosai_queued_inference_request(payload), 0, "the item carries its request");
+    assert_neq(agnosai_queued_inference_reply(payload), 0, "and its reply channel");
+    assert_eq(queue_item_priority(i1), PRIORITY_CRITICAL, "and its priority");
+
+    # --- the result envelope ------------------------------------------------
+    var resp = agnosai_inference_response_new(str_from("hi"), str_from("m"));
+    var ok = agnosai_inference_result_ok(resp);
+    assert_eq(agnosai_inference_result_is_ok(ok), 1, "an Ok result reads as ok");
+    assert_eq(agnosai_inference_result_response(ok), resp, "carrying the response");
+    assert_eq(agnosai_inference_result_error(ok), 0, "and no error");
+
+    var bad = agnosai_inference_result_err(str_from("boom"));
+    assert_eq(agnosai_inference_result_is_ok(bad), 0, "an Err result does not");
+    _t_seq(agnosai_inference_result_error(bad), str_from("boom"), "carrying the message");
+    assert_eq(agnosai_inference_result_response(bad), 0, "and no response");
+
+    # ⚠ `is_ok` reads the ERROR slot. A success whose response is null is still
+    # a success — swapping the test to `response != 0` breaks exactly here.
+    assert_eq(agnosai_inference_result_is_ok(agnosai_inference_result_ok(0)), 1,
+    "an Ok carrying a null response still reads as ok");
+
+    # --- settle: the oneshot's contract ------------------------------------
+    var qi = queue_item_payload(i2);
+    var settled = agnosai_inference_queue_settle(qi, 0, resp);
+    assert_eq(agnosai_inference_result_is_ok(settled), 1, "settle(0, resp) is the Ok arm");
+    var got = chan_try_recv(agnosai_queued_inference_reply(qi));
+    assert_eq(got, settled, "and the result arrives on the reply channel");
+
+    var qi2 = queue_item_payload(i3);
+    var failed = agnosai_inference_queue_settle(qi2, str_from("hoosh transport error"), 0);
+    assert_eq(agnosai_inference_result_is_ok(failed), 0, "a non-zero rc is the Err arm");
+    _t_seq(agnosai_inference_result_error(failed), str_from("hoosh transport error"),
+    "carrying hoosh's own message verbatim");
+    assert_eq(chan_try_recv(agnosai_queued_inference_reply(qi2)), failed,
+    "and it too reaches the channel");
+
+    # --- priority names -----------------------------------------------------
+    _t_seq(agnosai_queue_priority_name(PRIORITY_CRITICAL), str_from("critical"), "critical");
+    _t_seq(agnosai_queue_priority_name(PRIORITY_HIGH), str_from("high"), "high");
+    _t_seq(agnosai_queue_priority_name(PRIORITY_NORMAL), str_from("normal"), "normal");
+    _t_seq(agnosai_queue_priority_name(PRIORITY_LOW), str_from("low"), "low");
+    _t_seq(agnosai_queue_priority_name(PRIORITY_BACKGROUND), str_from("background"),
+    "background");
+    _t_seq(agnosai_queue_priority_name(42), str_from("normal"), "an unknown level as normal");
+
+    # --- drain, end to end, offline ----------------------------------------
+    # No gateway is listening, so every request lands on the Err arm — which is
+    # the path that proves `run_item` wires hoosh's return into `settle` and the
+    # reply channel. The count is what the oracle's loop would have processed.
+    var client = agnosai_hoosh_client_new(str_from(_T_DEAD_URL), str_from(""));
+    var q4 = agnosai_inference_queue_new();
+    var rxa = agnosai_inference_queue_enqueue(q4, _t_req("a"), PRIORITY_HIGH, str_from("a"));
+    var rxb = agnosai_inference_queue_enqueue(q4, _t_req("b"), PRIORITY_LOW, str_from("b"));
+    assert_eq(agnosai_inference_queue_drain(q4, client), 2, "drain runs both items");
+    assert_eq(agnosai_inference_queue_pending(q4), 0, "and empties the queue");
+
+    var ra = chan_try_recv(rxa);
+    assert_neq(ra, 0, "the first caller got a reply");
+    assert_eq(agnosai_inference_result_is_ok(ra), 0, "an Err, since nothing is listening");
+    assert_neq(agnosai_inference_result_error(ra), 0, "with a message");
+    var rb = chan_try_recv(rxb);
+    assert_neq(rb, 0, "and so did the second");
+    assert_eq(agnosai_inference_result_is_ok(rb), 0, "also an Err");
+
+    assert_eq(agnosai_inference_queue_drain(q4, client), 0, "draining an empty queue is 0");
+
+    # --- the SUCCESS path, which no offline run can reach -------------------
+    # ⚠ Every assertion above rides the Err arm, because nothing is listening.
+    # A mutant that passed 0 to `settle` instead of the response therefore
+    # SURVIVED — the response is unused on the failure arm. `run_item_with`
+    # takes the transport as a function pointer for exactly this, the way
+    # `tools/agnos.cyr` does. `_t_chat_ok` is the gateway that answers.
+    var q6 = agnosai_inference_queue_new();
+    var rxok = agnosai_inference_queue_enqueue_normal(q6, _t_req("ok"), str_from("ok"));
+    var okitem = cpq_dequeue(agnosai_inference_queue_cpq(q6));
+    var okres = agnosai_inference_queue_run_item_with(okitem, client, &_t_chat_ok);
+    assert_eq(agnosai_inference_result_is_ok(okres), 1, "a gateway that answers is the Ok arm");
+    assert_eq(agnosai_inference_result_response(okres), _t_canned_response(),
+    "carrying the response the transport produced — NOT a null");
+    _t_seq(agnosai_inference_response_content(agnosai_inference_result_response(okres)),
+    str_from("canned"), "whose content survives the hand-off");
+    assert_eq(chan_try_recv(rxok), okres, "and it reaches the waiting caller");
+
+    # The same seam on the failure arm, so the two are pinned symmetrically.
+    var q7 = agnosai_inference_queue_new();
+    var rxbad = agnosai_inference_queue_enqueue_normal(q7, _t_req("bad"), str_from("bad"));
+    var baditem = cpq_dequeue(agnosai_inference_queue_cpq(q7));
+    var badres = agnosai_inference_queue_run_item_with(baditem, client, &_t_chat_err);
+    assert_eq(agnosai_inference_result_is_ok(badres), 0, "a transport error is the Err arm");
+    _t_seq(agnosai_inference_result_error(badres), str_from("synthetic transport failure"),
+    "carrying the transport's own message");
+    assert_eq(chan_try_recv(rxbad), badres, "and that too reaches the caller");
+
+    # --- the worker thread --------------------------------------------------
+    var q5 = agnosai_inference_queue_new();
+    var rxw = agnosai_inference_queue_enqueue_normal(q5, _t_req("w"), str_from("w"));
+    var w = agnosai_inference_queue_spawn_worker(q5, client, 25);
+    assert_neq(w, 0, "spawn_worker returns a handle");
+    assert_eq(agnosai_inference_worker_stopped(w), 0, "which starts un-stopped");
+
+    # Bounded, so a worker that never runs FAILS rather than hanging the suite.
+    var waited = 0;
+    var wres = 0;
+    while (waited < 200) {
+        wres = chan_try_recv(rxw);
+        if (wres != 0) { break; }
+        sleep_ms(25);
+        waited = waited + 1;
+    }
+    assert_neq(wres, 0, "the worker drained the queue and replied");
+    assert_eq(agnosai_inference_result_is_ok(wres), 0, "with the offline Err");
+
+    assert_eq(agnosai_inference_worker_exited(w), 0, "and has not exited while running");
+    agnosai_inference_queue_worker_stop(w);
+    assert_eq(agnosai_inference_worker_stopped(w), 1, "and stop sets the flag");
+
+    # ⚠ The flag alone proves nothing about the LOOP — `_stopped` just reads
+    # back what `_stop` wrote, so a worker that ignored the flag entirely would
+    # still pass the line above. This waits for the thread's own acknowledgement,
+    # and is bounded so an ignored flag fails instead of hanging.
+    var winds = 0;
+    while (winds < 200) {
+        if (agnosai_inference_worker_exited(w) == 1) { break; }
+        sleep_ms(25);
+        winds = winds + 1;
+    }
+    assert_eq(agnosai_inference_worker_exited(w), 1, "and the loop actually winds down");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

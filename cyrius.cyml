@@ -50,13 +50,20 @@ modules = ["dist/bote-core.cyr"]
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
 path = "../majra"
-tag = "2.6.0"
+# 2.6.1 fixes a **concurrent-`relay_receive` allocator race**: the result struct
+# was allocated with `fl_alloc` *after* the mutex was released, and `fl_alloc` is
+# not thread-safe, so two threads could be handed the same block. agnosai does
+# not call `relay_receive` from more than one thread today, but bote does, and
+# 2.6.1 also drops majra's `[deps.sakshi]` — see the sakshi note below.
+tag = "2.6.1"
 modules = ["dist/majra.cyr"]
 
 [deps.kavach]
 git = "https://github.com/MacCracken/kavach.git"
 path = "../kavach"
-tag = "3.11.8"
+# 3.11.9 is the WASM backend `src/sandbox/wasm.cyr` runs on: `confine_capture_input`
+# (stdin as a third pipe) and `backend_is_available(Backend.WASM)`. ADR 019.
+tag = "3.11.9"
 modules = ["dist/kavach.cyr"]
 
 [deps.ai-hwaccel]
@@ -86,12 +93,19 @@ modules = ["dist/tyche.cyr"]
 # the pin shipped 2.4.8, which silently reverted the `i64::MIN` integer-format
 # fix (`n = 0 - n` is a no-op at i64::MIN).
 #
-# ⚠ **Still load-bearing as of the 6.5.18 bump, and the sibling has changed.**
-# This used to say "sigil and bote"; neither declares `[deps.sakshi]` any more —
-# **sigil 3.12.7 dropped it** (sakshi is folded into the stdlib now, so the git
-# dep was downgrading every sigil consumer) and bote never replaced it. The one
-# that still lags is **majra 2.6.0, at 2.4.8**. Remove this pin and the tree
-# silently builds 2.4.8 again.
+# ⚠ **Still load-bearing, and the sibling that makes it so is BOTE.**
+# Two of the three overlaying siblings have since dropped their `[deps.sakshi]`:
+# **sigil at 3.12.7** (sakshi is folded into the stdlib now, so the git dep was
+# downgrading every sigil consumer) and **majra at 2.6.1**. The one that still
+# declares it is **bote 3.3.0, at sakshi 2.4.7** — verified by
+# `git show 3.3.0:cyrius.cyml`, and bote's working tree, which `path = "../bote"`
+# makes the live resolution here, says 2.4.8. Either way it is behind the
+# snapshot's 2.4.10. Remove this pin and the tree silently builds bote's sakshi.
+#
+# ⚠ Re-verify the sibling by reading its manifest, not by trusting this line. It
+# named "sigil and bote", then "majra 2.6.0", and was **wrong at the 6.5.18 bump**
+# — it had written bote off on the strength of one of the two having dropped the
+# dep. `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml` is the whole check.
 #
 # ⚠ **The lib-snapshot gate can flap depending on whether a build ran since the
 # last sync, and that is this pin's doing.** Observed on the 6.5.15 bump:

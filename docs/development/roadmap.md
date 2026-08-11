@@ -714,10 +714,161 @@ and the "runtime absent" arm is itself a real assertion here.
 ### M12 — `llm` residue, tests, benches and the non-`src` surface (Phase 11)
 
 `llm/inference_queue.rs`, the `llm/mod.rs` re-exports, every oracle test with no
-Cyrius assertion (including the ~155 `#[tokio::test]` suites, which need a
+Cyrius assertion (including the 153 `#[tokio::test]` suites, which need a
 synchronous re-expression — that is work, not an exemption), every oracle bench
 with no `.bcyr`, the doctest, and the non-`src` artifacts (`examples/`, the tool
 SDK, Python bindings, extra Cargo build targets).
+
+**Measured scope, 2026-08-10.** The counts the phase description gestures at,
+taken rather than estimated:
+
+| surface | oracle | ported | owed |
+|---|---|---|---|
+| `src/` modules | — | **all** | **0** — `llm/inference_queue` was the last |
+| test fns (`#[test]` + `#[tokio::test]`) | **863** in 84 modules | **96** suites | see bite 2 |
+| bench ids (criterion) | **117** in 19 files | 7 `.bcyr`, 79 shapes | **83** (bite 3) |
+| `rust-old/tests/` integration | 2 fns | 1 suite | **0** (bite 4) |
+| non-`src` artifacts | examples, fuzz, sdk, 1 doctest | — | see *Not started* |
+
+#### Bite 1 — `llm/inference_queue` ✅ 2026-08-10
+
+Ported; 18 mutation probes, 18 kills; 69 assertions. `src/llm/mod.cyr`'s claim
+that it "defers with that feature" was wrong on the standing rule and was already
+contradicted by `llm/router`'s own header — corrected in place. **Nothing under
+`src/` is now unported.**
+
+#### Bite 2 — the oracle-test audit ✅ first pass 2026-08-10
+
+All 863 oracle test fns screened against the suite corpus by token match against
+the *matching* suite rather than the whole corpus. **Two flagged, both real:**
+
+- **`src/server/routes/sse.cyr` had no test file at all** — the only `routes/*`
+  module without one. `tests/server_routes_sse.tcyr` now exists, 31 assertions.
+- **`multiple_crews_tracked_independently`** had no counterpart, so
+  `tests/orch_orchestrator.tcyr` only ever ran one crew and a single-slot
+  registry would have passed it. Added; the suite is now 55 assertions.
+
+⚠ **The screen is a heuristic and its clean result is not proof.** It matches
+oracle fn-name tokens against suite prose, so a suite that covers a behaviour
+under different words scores as covered whether or not it asserts the same
+thing. It found a whole missing suite, so it earned its keep — but the remaining
+work is a **per-module read** of oracle test bodies against suite assertions, and
+that has not been done. The 15 suites that state an explicit oracle count in
+their header are the ones that can be checked cheaply; the other 79 cannot.
+
+#### Bite 3a — the bench gate was broken ✅ 2026-08-10
+
+⚠ **Three of the six `.bcyr` files did not compile**, so `cyrius bench` had been
+reporting `5 passed, 3 failed` and **50 of the tree's 79 benchmarks — including
+the entire 35-shape orchestration set — had stopped running.** Stale include
+lists against `src/`: `telemetry/mod` (ADR 017 spans) missing from all three,
+`strcase` from two, and `sandbox`/`definitions/loader`/`routes/definitions` from
+`server.bcyr`. Fixed; all seven files now compile and report.
+
+Found by an **adversarial audit** of the gap analysis below, which flagged it as
+a blocker the analysis itself had not mentioned.
+
+⚠ **The gate was never silent — it was never invoked.** `cyrius bench` exits 1 on
+a compile error (verified against a deliberately broken `.bcyr`), and
+`scripts/bench-history.sh` runs it under `set -euo pipefail`. The last recorded
+run was 2026-08-07; `src/` moved under `benches/` in the days after and nothing
+ran it again. **106 rows recorded on the fixed tree.** The structural hole was that **`check-clean.sh` did not
+sweep `benches/` and CI never compiled it** — so the only thing standing between
+a rotted benchmark and nobody noticing was someone remembering to run
+`bench-history.sh`. Both fixed: `.bcyr` joins the fmt and lint loops, and CI
+gains a `Benchmarks` step for the compile (not the numbers — CI timings are too
+noisy to gate on).
+
+#### Bite 3 — benches, in progress
+
+`benches/llm.bcyr` added: all three of `rust-old/benches/llm_router.rs`'s
+criterion groups plus the inference queue. `benches/` previously held six `.bcyr`
+and **none of them touched `src/llm/`**.
+
+That benchmark found an O(n²) drain in majra's priority queue (filed upstream;
+see CHANGELOG).
+
+**The remaining gap is mapped.** A seven-way parallel analysis, each result
+adversarially audited, classified every oracle bench id against the tree:
+
+| target | claimed gaps | already covered |
+|---|---|---|
+| `benches/core.bcyr` (resource, serde_types) | 9 | 4 |
+| `benches/orch.bcyr` (scheduler, pubsub, approval) | 16 | 0 |
+| `benches/orch.bcyr` (ipc, relay, orchestrator) | 13 | 1 |
+| `benches/fleet.bcyr` **(new)** (fleet, placement, scoring) | 19 | 1 |
+| `benches/tools.bcyr` (tools, sandbox, audit) | 15 | 3 |
+| `benches/server.bcyr` (server, prompt_guard) | 8 | 1 |
+| `benches/definitions.bcyr` **(new)** | 3 | 0 |
+| | **83** | **10** |
+
+⚠ **The audits corrected the analyses in every group**, and the corrections are
+the valuable part — a fabricated "the oracle's ~4,500 string comparisons" claim,
+a wrong allocator model behind three iteration counts, a `sakshi` log-level trap
+that does not exist, and the compile blocker above. Read the audit before
+implementing any row; the raw analyses are not safe to follow verbatim.
+
+⚠ **A redundant O(n²) sort surfaced in passing and is NOT yet fixed.**
+`agnosai_scheduler_load_dag` (`src/orchestrator/scheduler.cyr:247-249`) and
+`agnosai_scheduler_topological_sort` (`:233`) each insertion-sort **all** DAG
+keys before calling `agnosai_scheduler_kahn_sort`.
+
+**That sort is dead work, not a divergence.** An audit agent reported it as a
+parity divergence needing a fix or an ADR; reading `kahn_sort` shows otherwise.
+It sorts the zero-in-degree seed itself (`:169`) and sorts each successor list
+inside its loop (`:180`) — both faithful to `scheduler.rs:183-230`. The caller's
+key order therefore affects **nothing** in the output: the seed is re-sorted
+regardless, and `in_degree` is a map. The output is byte-identical with or
+without the pre-sort.
+
+So the port is correct and pays for it twice. The cost is real —
+`_agnosai_sched_sort_strs` is insertion sort (`:136`, and its own comment says
+it is fine "because the oracle sorts only small lists", which stopped being true
+when a caller handed it every key). On a 500-task DAG in pseudo-random `map_keys`
+order that is ~n²/4 ≈ 62,500 comparisons per load, against ~0 for the oracle.
+
+**Do not fix it blind.** It lands with the scheduler benchmarks in the
+orch-queueing group above, so the deletion can be shown rather than argued.
+
+#### Bite 4 — the oracle's integration test ✅ 2026-08-10
+
+`rust-old/tests/crew_with_tools.rs` lives under `rust-old/tests/`, not inside a
+module's `#[cfg(test)]` block, so **the per-module screen could not see it** and
+it had no counterpart. Its two `#[tokio::test]`s are the only end-to-end
+registry → crew → runner exercises in the whole oracle.
+`tests/integration_crew_with_tools.tcyr`, 29 assertions.
+
+⚠ Worth recording: the file's name oversells what it couples. The oracle builds
+a `ToolRegistry`, registers `EchoTool`, asserts on it — and then calls
+`CrewRunner::new(spec)` **without it**. So the crew runs the placeholder path
+throughout and the tool assertions are standalone. Reproduced exactly rather
+than "improved", because wiring the registry in would test something the oracle
+does not and would paper over the same gap upstream has.
+
+#### Not started
+
+- **The doctest.** Only **one** of the four ` ``` ` blocks under `rust-old/src/`
+  is a real doctest — `core/mod.rs`'s. The others are ` ```text ` (wasm_loader),
+  ` ```ignore ` (telemetry/genai) and ` ```yaml ` (definitions/k8s_crd), none of
+  which `cargo test` compiles.
+- **`rust-old/examples/`** — `simple_crew.rs` (15 lines) and
+  `wasm-tools/hello-tool/`, a Rust crate compiled to WASM plus its
+  `manifest.json`. The latter is the natural fixture for `tools/wasm_loader`.
+  agnosai has no `examples/` directory, though `README.md:35` documents one.
+- **`rust-old/fuzz/`** — four targets: `fuzz_agent_definition`,
+  `fuzz_crew_request`, `fuzz_preset_json`, `fuzz_tool_input`.
+- **`sdk/agnosai-tool-sdk/`** — tracked Rust, still carrying `Cargo.toml` and
+  `Cargo.lock`. It defines the `{"parameters": …}` / `{"result", "success",
+  "error"}` wire format `tools/wasm_tool.cyr` implements, so it is a live
+  compatibility surface rather than dead weight.
+- **Repo hygiene found in passing** — `probe_key_tmp.pem` (a tracked private key
+  at the root, see `state.md` known issue 0), README's Rust-era Quick Start, and
+  a `.gitignore` that is still the Rust-era file apart from `/build/`.
+
+⚠ `rust-old/tests/fixtures/` is **already ported** and needs nothing: both RSA
+PEMs live on as frozen RS256 vectors in `tests/server_auth_vectors.cyr`, kept in
+a `.cyr` deliberately so ~16 KB of base64 stays out of the `.tcyr` coverage
+budget.
 
 ## Owed work
 

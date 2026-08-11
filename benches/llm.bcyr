@@ -1,0 +1,230 @@
+# =========================================================================
+# llm.bcyr — benchmarks for the llm group.
+#
+# Oracle bench file: rust-old/benches/llm_router.rs — three criterion groups
+# (`llm_router_route`, `llm_router_default_model`, `llm_router_parse_complexity`),
+# **none of which had a Cyrius counterpart**. `benches/` held six `.bcyr` and
+# not one of them touched `src/llm/`, so the routing matrix — which every crew
+# task crosses once — had no number at all.
+#
+# The oracle's shapes are reproduced, then `inference_queue`'s enqueue/dequeue
+# is added because it is new in this milestone and because the priority queue is
+# the one llm path with a lock on it.
+#
+# ⚠ **`route` and `default_model` are branch ladders over small enums**, so a
+# single call is a handful of compares and lands under timer resolution. Each is
+# therefore batched over many iterations and reported per-op, exactly as
+# `core.bcyr`'s uuid shapes are. The oracle gets the same effect from
+# criterion's own sampling.
+#
+# ⚠ **`parse_complexity` is measured on all seven of the oracle's inputs**, not
+# a representative one: the ladder folds ASCII case, so `"HIGH"` walks a
+# different path from `"high"`, and `"unknown"` is the only input that runs
+# every comparison before falling through. Those are the interesting ends.
+#
+# These numbers start the CYRIUS baseline. They are NOT comparable to
+# rust-old/bench-history.csv. See CLAUDE.md.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/mod.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/router.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/inference_queue.cyr"
+
+# All 21 (task_type, complexity) profiles, built once so the loop measures the
+# routing and not the construction — the oracle pre-builds them for the same
+# reason.
+fn _b_all_profiles(): i64 {
+    var types = vec_new();
+    vec_push(types, AGNOSAI_TASKTYPE_SUMMARIZE);
+    vec_push(types, AGNOSAI_TASKTYPE_CLASSIFY);
+    vec_push(types, AGNOSAI_TASKTYPE_CODE);
+    vec_push(types, AGNOSAI_TASKTYPE_PLAN);
+    vec_push(types, AGNOSAI_TASKTYPE_REASON);
+    vec_push(types, AGNOSAI_TASKTYPE_RESEARCH);
+    vec_push(types, AGNOSAI_TASKTYPE_MULTI_STEP);
+
+    var cx = vec_new();
+    vec_push(cx, AGNOSAI_COMPLEXITY_SIMPLE);
+    vec_push(cx, AGNOSAI_COMPLEXITY_MEDIUM);
+    vec_push(cx, AGNOSAI_COMPLEXITY_COMPLEX);
+
+    var profiles = vec_new();
+    for (var i = 0; i < vec_len(types); i = i + 1) {
+        for (var j = 0; j < vec_len(cx); j = j + 1) {
+            vec_push(profiles, agnosai_task_profile_new(vec_get(types, i), vec_get(cx, j)));
+        }
+    }
+    return profiles;
+}
+
+# The oracle's `route (all 21 combinations)` — one iteration is a full sweep.
+fn _b_route_all(): i64 {
+    var profiles = _b_all_profiles();
+    var n = 100000;
+    var b = bench_new("route_all_21_combinations");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        for (var j = 0; j < 21; j = j + 1) { agnosai_route(vec_get(profiles, j)); }
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `route (Summarize × Simple)` — the ladder's FIRST arm.
+fn _b_route_fast(): i64 {
+    var p = agnosai_task_profile_new(AGNOSAI_TASKTYPE_SUMMARIZE, AGNOSAI_COMPLEXITY_SIMPLE);
+    var n = 2000000;
+    var b = bench_new("route_summarize_simple");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_route(p); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `route (Research × Complex)` — the deepest arm, so the pair
+# brackets the ladder rather than sampling one point on it.
+fn _b_route_premium(): i64 {
+    var p = agnosai_task_profile_new(AGNOSAI_TASKTYPE_RESEARCH, AGNOSAI_COMPLEXITY_COMPLEX);
+    var n = 2000000;
+    var b = bench_new("route_research_complex");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_route(p); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's three `default_model` shapes.
+#
+# ⚠ Each returns a Str built with `str_from` over a literal, so this measures
+# the ladder AND one Str header allocation per call — which is the honest cost
+# at the call site, and worth knowing precisely because it is not free the way
+# the Rust `&'static str` was.
+fn _b_default_model(tier, name): i64 {
+    var n = 1000000;
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_default_model(tier); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The oracle's `parse_complexity("…")` across all seven inputs.
+fn _b_parse_complexity(input, name): i64 {
+    var s = str_from(input);
+    var n = 1000000;
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_parse_complexity(s); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# ── inference_queue: no oracle bench file ──────────────
+
+# Enqueue throughput. Each call takes the queue's mutex, mints a majra
+# `QueueItem` and pushes onto a tier vec, so this is the cost a request handler
+# pays to hand work off.
+fn _b_iq_enqueue(): i64 {
+    var q = agnosai_inference_queue_new();
+    var req = agnosai_inference_request_new(str_from("bench-model"));
+    var label = str_from("bench");
+    var n = 200000;
+    var b = bench_new("inference_queue_enqueue");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_inference_queue_enqueue(q, req, PRIORITY_NORMAL, label);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Dequeue at the WORST tier: everything queued at Background, so `pq_dequeue`
+# walks all five tiers on every pop rather than hitting the first one.
+#
+# ⚠ **Measured at TWO depths on purpose, and the two numbers are not supposed to
+# match.** majra's `pq_dequeue` pops with `vec_remove(tier, 0)`, which shifts
+# every remaining element down a slot — so one pop is O(n) in the tier depth and
+# a full drain is **O(n²)**. Measured 2k/4k/8k/16k, the per-pop cost doubles
+# every time the depth does (2.00µs → 4.02µs → 7.92µs → 15.56µs), which is the
+# signature of a linear pop rather than cache noise.
+#
+# A single figure at one depth would hide that behind an uninterpretable
+# average — at 200k the mean pop was **198.7µs** and the drain took ~40 seconds
+# of memmove. Two depths keep the slope in the bench history, so if majra fixes
+# it these two converge, which is a better regression signal than either alone.
+# Filed as
+# `majra/docs/development/issues/2026-08-10-pq-dequeue-is-linear-so-draining-a-queue-is-quadratic.md`.
+#
+# This is also the design case, not the pathological one: the queue exists so
+# that background work is ALLOWED to accumulate behind interactive work.
+fn _b_iq_dequeue_background(n, name): i64 {
+    var q = agnosai_inference_queue_new();
+    var req = agnosai_inference_request_new(str_from("bench-model"));
+    var label = str_from("bench");
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_inference_queue_enqueue(q, req, PRIORITY_BACKGROUND, label);
+    }
+    var cpq = agnosai_inference_queue_cpq(q);
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var j = 0; j < n; j = j + 1) { cpq_dequeue(cpq); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The priority mapping — one call per enqueue from a task, and a five-arm
+# ladder that must NOT be replaced by arithmetic (see the module header).
+fn _b_map_priority(): i64 {
+    var n = 5000000;
+    var b = bench_new("map_priority_ladder");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_map_priority(AGNOSAI_PRIORITY_CRITICAL); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    _b_route_all();
+    _b_route_fast();
+    _b_route_premium();
+
+    _b_default_model(AGNOSAI_TIER_FAST, "default_model_fast");
+    _b_default_model(AGNOSAI_TIER_CAPABLE, "default_model_capable");
+    _b_default_model(AGNOSAI_TIER_PREMIUM, "default_model_premium");
+
+    _b_parse_complexity("low", "parse_complexity_low");
+    _b_parse_complexity("simple", "parse_complexity_simple");
+    _b_parse_complexity("medium", "parse_complexity_medium");
+    _b_parse_complexity("high", "parse_complexity_high");
+    _b_parse_complexity("complex", "parse_complexity_complex");
+    _b_parse_complexity("HIGH", "parse_complexity_HIGH");
+    _b_parse_complexity("unknown", "parse_complexity_unknown");
+
+    _b_iq_enqueue();
+    _b_iq_dequeue_background(2000, "inference_queue_dequeue_background_2k");
+    _b_iq_dequeue_background(16000, "inference_queue_dequeue_background_16k");
+    _b_map_priority();
+
+    return 0;
+}
+
+var r = main();
+syscall(60, r);

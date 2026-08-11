@@ -2,7 +2,7 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-07-30.
+> Last refreshed: 2026-08-10.
 
 ## Version
 
@@ -12,9 +12,48 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.14` (`cyrius.cyml`) — bumped 2026-08-08, three-step,
+- **Cyrius pin**: `6.5.18` (`cyrius.cyml`) — bumped 2026-08-10, three-step,
   `lib/` diffed after the sync AND again after a build: 107 files, zero content
-  differences. Folds **sigil 3.12.6**.
+  differences. Folds **sigil 3.12.7**, **sakshi 2.4.10** and **sankoch 2.7.7**.
+
+  **Sibling pins as of the 2026-08-10 bump**: kavach **3.11.9**, majra **2.6.1**,
+  sigil 3.12.7, bote 3.3.0, ai-hwaccel 2.3.16, tyche 1.0.0, and the defensive
+  `[deps.sakshi]` at 2.4.10.
+
+  ⚠ **The defensive `[deps.sakshi]` is still load-bearing, and its comment has
+  now been wrong twice about WHY.** It first blamed "sigil and bote", then
+  "majra 2.6.0". sigil dropped its `[deps.sakshi]` at 3.12.7 and majra at 2.6.1;
+  the sibling that still declares one is **bote 3.3.0, at sakshi 2.4.7**. Do not
+  trust the manifest comment — re-derive with
+  `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml`.
+
+  ⚠ **Every build emits 35 `duplicate fn … (last definition wins)` warnings.**
+  Audited 2026-08-10: **none is currently miscompiling**, two are latent hazards,
+  and the audit's own first two conclusions were wrong. The corrections are in
+  CHANGELOG and matter more than the finding:
+
+  - **`err_io` (kavach ∩ sigil) does NOT diverge.** sigil has two unrelated error
+    enums and comparing them with prefixes stripped merges them. The syscall-error
+    tables are identical on all eight shared kinds. Probed: `err_io(5,…)` → kind
+    8, errno 5.
+  - **`_sub_new` (majra ∩ libro) works here.** Probed: `sub + 8 == 0`, so majra's
+    body runs, and `pubsub_publish` delivers. Correct **by accident of include
+    order** — both directions corrupt if it flips. agnosai is doubly safe:
+    `src/orchestrator/pubsub.cyr` calls no majra `pubsub_*`.
+  - Genuinely latent: **`attestation_result_new`** (kavach ∩ sigil), two unrelated
+    functions sharing a name, inert only because neither library calls it.
+
+  ⚠ **The warning's `file:line` is NOT usable to decide which copy wins** —
+  `lib/kavach.cyr:11512` names a file of 11,321 lines, so the offsets are into the
+  preprocessed stream. Both wrong conclusions above came from trusting it. Filed
+  to cyrius. **Run the symbol; do not read the warning.**
+
+  ⚠ **A caller parsed BEFORE a redefinition still binds to the later body.**
+  Measured (`early_caller()` returns 22, not 11). This is why a duplicate is never
+  "harmless because our copy comes first" — but it is also not enough on its own to
+  say which copy that is.
+
+  Previously 6.5.14 (sigil 3.12.6).
 
   **6.5.14 is not optional here.** It fixes the tail-call frame-release bug in
   standing rule 12, and sigil 3.12.6 — which fixes an **RSA-PSS authentication
@@ -288,7 +327,38 @@ in sandhi 1.9.9 on agnosai's own filing, hours after it was written.
 
 ## Where the port is
 
-**M0–M6 complete.** The server tier is done: bite 16 (bind) and bite 15c (SSE)
+**M0–M11 complete. `src/` is FULLY PORTED as of 2026-08-10** —
+`llm/inference_queue` was the last module without a Cyrius counterpart, and
+`src/llm/mod.cyr`'s claim that it "defers with that feature" was wrong on the
+standing rule that a cargo feature gate is not a scope boundary.
+
+**M12 is in progress** and is no longer about `src/`. What is left is the test
+and bench surface plus the non-`src` artifacts; `roadmap.md`'s M12 section
+carries the measured table and the per-bite status. The headline numbers:
+**863 oracle test fns across 84 modules**, **117 oracle criterion bench ids
+across 19 files**, against 96 Cyrius suites and 7 `.bcyr`.
+
+⚠ **The bench gate was broken and nobody noticed.** Three of the six `.bcyr`
+files did not compile — stale include lists against `src/` — so `cyrius bench`
+reported `5 passed, 3 failed` and **50 of the tree's 79 benchmarks, including
+the entire 35-shape orchestration set, had stopped running.** Fixed 2026-08-10.
+
+The mechanism matters more than the fix. `cyrius bench` **exits 1** on a compile
+error and `bench-history.sh` runs it under `set -euo pipefail`, so it would have
+aborted rather than recorded partial rows — the gate was never silent, it was
+**never invoked**. Last recorded run: 2026-08-07, 89 rows. The structural hole
+was that `check-clean.sh` did not sweep `benches/` and CI never compiled it, so
+the only thing between a rotted benchmark and nobody noticing was someone
+remembering to run the script. Both closed: `.bcyr` joins the fmt and lint loops,
+and CI has a `Benchmarks` step for the compile (not the numbers — CI timings are
+too noisy to gate on, and `bench-history.csv` is recorded from a quiet machine).
+
+⚠ **The oracle-test screen came back nearly clean and that is not proof.** It
+matches oracle fn-name tokens against suite prose. It found a whole missing
+suite (`routes/sse`), so it earned its keep, but a per-module read of oracle
+test bodies against suite assertions has **not** been done.
+
+**M0–M6 detail.** The server tier is done: bite 16 (bind) and bite 15c (SSE)
 both landed 2026-08-03, so `./build/agnosai` binds, reads the oracle's
 environment, answers the full route table, **streams crew events**, and drains
 on SIGINT/SIGTERM.
@@ -327,7 +397,21 @@ Standing decisions that shaped the port, each with its record:
 
 ## Tests
 
-**65 suites, all passing.** The M7 audit's 43 findings are **all fixed** as of
+**96 suites, all passing** (2026-08-10). The five most recent:
+`tests/llm_inference_queue.tcyr` (69 assertions, 18 mutation probes / 18 kills),
+`tests/server_routes_sse.tcyr` (31 — the routes tier's one module that had no
+suite), `tests/integration_crew_with_tools.tcyr` (29 — the oracle's own
+`rust-old/tests/` integration file, invisible to a per-module screen),
+`tests/orch_orchestrator.tcyr` (55, up from 51: it only ever ran ONE crew, so a
+single-slot registry passed it), and `tests/tools_wasm.tcyr` from M11.
+
+⚠ **`cyrius tests` runs in CI; until 2026-08-10 `cyrius bench` did not.** Both
+report `N passed, M failed` and both exit non-zero, so neither is silent — but
+only the test gate was wired into a pipeline. Three `.bcyr` files broke in the
+three days after the 2026-08-07 bench run and nothing invoked the gate again.
+CI now has a `Benchmarks` step. Read the `N passed, M failed` line on both.
+
+**65 suites, all passing** was true at the M7 audit, whose 43 findings are **all fixed** as of
 2026-08-05 — `docs/development/m7-audit-2026-08-04.md` marks each one in place
 and `roadmap.md`'s M7 section has the shape of the remediation. The sandbox
 suites grew **627 → 727 assertions** working it:
@@ -397,6 +481,32 @@ The Cyrius suites deliberately exceed the oracle's coverage: they pin the UCB1
 formula itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN
 fallback branches, and the Q-table's packed-key distinctness — none of which the
 Rust tests reach.
+
+**Three seams exist so an offline test can reach a path that needs a network.**
+They are a pattern, not one-offs, and the third one confirmed it:
+
+| module | seam | what it makes reachable |
+|---|---|---|
+| `tools/agnos.cyr` | transport fn pointer on the client (`:67`) | URL construction, query encoding, the path-traversal guards, response reshaping |
+| `tools/wasm_tool.cyr` | `agnosai_wasm_tool_output_of` split out of `execute` | the whole result ladder, with `wasmtime` absent |
+| `llm/inference_queue.cyr` | `run_item_with(item, client, chat_fp)` | the **success** arm — see below |
+
+⚠ **The inference-queue seam exists because a mutant survived without it.** With
+no gateway listening only the failure arm is reachable, and on that arm the
+response is unused — so a mutant passing 0 to `settle` instead of the response
+passed every assertion. That is the class of defect these seams exist to catch:
+not "the code is wrong" but "no test can tell." Nothing is injected in
+production in any of the three.
+
+**A threaded test must wait on a CAUSE, not a duration.** `server_routes_sse`
+drives the streaming handler on its own thread and ends it by removing the crew
+from the bus; the handoff waits for the sender's **receiver count** to reach 2
+rather than sleeping. A sleep races in the direction that hides the bug — tear
+the crew down too early and the handler takes the unknown-crew path, where every
+assertion still has something to match on the wrong frame. Same reason
+`llm_inference_queue` gives the worker an `EXITED` flag: `_stopped` only reads
+back what `_stop` wrote, so a worker ignoring the flag entirely passed until the
+thread's own acknowledgement was observable.
 
 `tools_builtin_load_testing.tcyr` could not follow its oracle's shape. Both Rust
 tests stand up an axum mock server on loopback, and `agnosai_is_safe_url` correctly
@@ -517,6 +627,33 @@ once and hoisting would move an allocation onto the hot path. A naive
 Rust oracle for comparison: **863 unit + 2 integration + 1 doctest, all passing.**
 
 ## Benchmarks
+
+**7 `.bcyr` files, 79 benchmarks, all compiling as of 2026-08-10** — see the
+Tests section for how three of them had stopped. `benches/llm.bcyr` is new and
+was the first to touch `src/llm/` at all.
+
+### majra's `pq_dequeue` is O(n), so draining its priority queue is O(n²)
+
+Found by `benches/llm.bcyr`, which is the argument for writing the benchmark
+before assuming the dependency is fine. `pq_dequeue` pops with
+`vec_remove(tier, 0)`, shifting the whole tail. Mean cost of one pop while
+draining a tier of that depth:
+
+| depth | per pop | ratio |
+|---|---|---|
+| 2,000 | 2.00 µs | — |
+| 4,000 | 4.02 µs | **2.01×** |
+| 8,000 | 7.92 µs | **1.97×** |
+| 16,000 | 15.56 µs | **1.96×** |
+
+Doubling the depth doubles the per-pop cost, which rules out cache effects. At
+200,000 queued the mean pop was **198.7 µs** and the drain took ~40 s of memmove.
+
+⚠ **This is the design case, not a pathological one** — `llm/inference_queue`
+exists so background work is *allowed* to accumulate behind interactive work.
+Filed upstream. `benches/llm.bcyr` measures the drain at **two** depths so the
+slope stays legible here; if majra fixes it, the two rows converge, which is a
+better regression signal than either number alone.
 
 ### The route-latency floor is `alloc_via` — measured 2026-08-07, largely fixed the same day
 
@@ -909,12 +1046,45 @@ libro 2.8.4 arrives transitively via bote.
 
 ## Known issues in the current build
 
+0. **⚠ A PRIVATE KEY IS COMMITTED AT THE REPO ROOT — `probe_key_tmp.pem`.**
+   Found 2026-08-10. 1,704 bytes, `-----BEGIN PRIVATE KEY-----`, **tracked**
+   (`git ls-files` confirms), committed in `bb76e67 "errors and jwt work"`, and
+   **referenced by nothing** — no `.cyr`, `.tcyr`, `.sh` or doc mentions it.
+
+   It is not the oracle's fixture key (different sha256 from
+   `rust-old/tests/fixtures/test_rsa_private.pem`) and its public half does not
+   match the frozen vectors in `tests/server_auth_vectors.cyr` (`…lv/hFeMqWBO6…`
+   vs `…5Wu/jjUwgB2e1/Bn…`). So it is throwaway debris from the RS256 probe work,
+   not a load-bearing fixture, and deleting it breaks nothing.
+
+   ⚠ **Deleting the file does not remove the key** — it is in git history from
+   `bb76e67`. Whether that warrants a history rewrite is the maintainer's call;
+   agnosai never signs, so nothing in the port needs a private key at all.
+
+   Also noticed alongside it, both cosmetic and both non-`src`-surface work:
+   README's Quick Start is still Rust-era (`cargo build`,
+   `cargo run --bin agnosai-server`, `make check`) against a tree with no root
+   `Cargo.toml`, and `.gitignore` is the Rust-era file apart from its `/build/`
+   line — it still ignores `/target`, `**/*.rs.bk`, `criterion/`, `*.profraw` and
+   `tarpaulin-report.*`.
+
 1. **35 duplicate-fn warnings at build, none from `src/` — all benign today, but know the rule.**
-   Cyrius is single-pass: a redefinition only rebinds call sites parsed *after*
-   it. A dep's internal calls therefore keep binding to its own definition even
-   when a later bundle redefines the name. Verified by probe — majra's
-   `pubsub_subscribe` works correctly with libro in the same build, despite both
-   defining `_sub_new` with different arity.
+   ⚠ **The stated rule here was WRONG and is corrected as of 2026-08-10.** It said
+   "a redefinition only rebinds call sites parsed *after* it. A dep's internal
+   calls therefore keep binding to its own definition." **They do not.** Measured:
+
+   ```cyr
+   fn dup_fn(): i64 { return 11; }
+   fn early_caller(): i64 { return dup_fn(); }   # parsed BEFORE the redefinition
+   fn dup_fn(): i64 { return 22; }
+   ```
+
+   `early_caller()` returns **22**. Every call site binds to the last body,
+   wherever it was parsed. The conclusion this entry reached — that majra's
+   `pubsub_subscribe` is fine alongside libro — is **still correct**, re-verified
+   by probing the subscriber struct (`sub + 8 == 0` ⇒ majra's body ran). But it
+   was correct for the wrong reason, and the wrong reason would license ignoring
+   every future duplicate.
 
    **What this does mean for us:** agnosai's own modules are included last, so
    *our* calls bind to the last definition of everything. When we call a name

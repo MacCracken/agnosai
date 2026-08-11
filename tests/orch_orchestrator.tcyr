@@ -117,6 +117,29 @@ fn main() {
     assert_eq(agnosai_orchestrator_crew(o, agnosai_uuid_v4_str()), 0,
     "an unknown id is not registered");
 
+    # --- oracle: `multiple_crews_tracked_independently` ----------------------
+    # ⚠ This oracle test had NO Cyrius counterpart. Everything above runs one
+    # crew, so a registry that keyed every crew the same way — or a `run_crew`
+    # that returned the state of whichever crew ran last — passed the whole
+    # suite. Two crews at once is what separates "the registry works" from "the
+    # registry has one slot".
+    var multi = agnosai_orchestrator_new(_t_budget());
+    var m_spec1 = _t_spec("crew-1");
+    var m_spec2 = _t_spec("crew-2");
+    var m_id1 = agnosai_crew_id(m_spec1);
+    var m_id2 = agnosai_crew_id(m_spec2);
+    assert_eq(str_eq(m_id1, m_id2), 0, "two specs are minted with DIFFERENT ids");
+
+    var m_s1 = agnosai_orchestrator_run_crew(multi, m_spec1);
+    var m_s2 = agnosai_orchestrator_run_crew(multi, m_spec2);
+    assert(str_eq(agnosai_crew_state_crew_id(m_s1), m_id1) == 1,
+    "the first state carries the FIRST crew's id");
+    assert(str_eq(agnosai_crew_state_crew_id(m_s2), m_id2) == 1,
+    "and the second the second's — running one does not rewrite the other");
+    assert_eq(agnosai_orchestrator_crew_count(multi), 2, "both are registered");
+    assert_eq(agnosai_orchestrator_crew(multi, m_id1), m_s1, "each retrievable by its own id");
+    assert_eq(agnosai_orchestrator_crew(multi, m_id2), m_s2, "independently");
+
     # --- the audit trail, in order ---
     var chain = agnosai_orchestrator_audit(o);
     assert_eq(agnosai_audit_chain_count(chain), 3,
