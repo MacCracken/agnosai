@@ -21,9 +21,9 @@
 # modules call the cap "a retention floor, not a ceiling" and both reproduce the
 # oracle, so this is parity and must not be "fixed" here. It does mean
 # `create_run`, `reach_barrier` and `fan_out` use the rounds pattern documented
-# at lib/bench.cyr:198-211, with a fresh manager/coordinator per round and a
+# at lib/bench.cyr:290-296, with a fresh manager/coordinator per round and a
 # batch sized under the cap. `bench_batch_start`/`bench_batch_stop` accumulate
-# `total_ns` and `iterations` across rounds (lib/bench.cyr:214-228), so the
+# `total_ns` and `iterations` across rounds (lib/bench.cyr:374-390), so the
 # reported figure is still a single-call per-op time.
 #
 # ⚠ **`AGNOSAI_ACCEL_ANY` is -1, never 0.** 0 is `AGNOSAI_ACCEL_CPU`, a real
@@ -72,19 +72,39 @@
 # ⚠ **What the first run actually found: `clock_epoch_secs()` is the single
 # largest term in this half of the file.** On Linux it is a RAW
 # `syscall(228, CLOCK_REALTIME, ..)` (lib/chrono.cyr:75-76) — a real kernel
-# entry, not the vDSO fast path Rust's `Utc::now()` takes — and it measures
-# **~1.32-1.35us** on the same host as everything below.
+# entry — and it measures **~1.32-1.35us** on the same host as everything below.
 #
 # ⚠ That figure is a **measured row in this file** (`clock_epoch_secs_baseline`),
 # not a comment. It was challenged as implausible on the grounds that
-# `lib/bench.cyr:6` documents `clock_gettime: ~120ns` and that
+# `lib/bench.cyr:6` documented `clock_gettime: ~120ns` and that
 # `uuid_v4_generate` costs 501ns while making a real `getrandom` — a reasonable
 # objection, and wrong. Re-measured independently at 2,000,000 iterations:
 # **clock_epoch_secs 1.315us, clock_now_ns 1.318us** — and reconfirmed by the
-# row below on 2026-08-11 at 1.317-1.347us over four runs. It is
-# `lib/bench.cyr`'s ~120ns that does not hold on this host, which is worth
-# knowing on its own since that constant is what every other bench in the
-# ecosystem implicitly subtracts.
+# row below on 2026-08-11 at 1.317-1.347us over four runs.
+#
+# ✅ **Settled upstream in cyrius 6.5.19.** The constant is retired: the floor is
+# calibrated at runtime by `bench_clock_overhead_ns()` and subtracted by every
+# reporting path, so no consumer subtracts a written number any more. Two
+# corrections to what this comment used to assert, both from the upstream
+# measurement:
+#
+#   * **A corrected constant would still have been wrong.** Across the four
+#     release-gate hosts one clock read costs ~1,320-1,720ns here, ~3,550ns on
+#     aarch64 Linux, ~15-32ns on macOS arm64 and ~64-68ns on macOS x86_64 — a
+#     230x spread. "Fix it to ~1,320ns" would have been wrong on three of four.
+#   * **The cause named above is wrong on this host, and the "not the vDSO fast
+#     path" clause has been struck from it.** The filing blamed the raw
+#     `syscall(228)` versus libc's vDSO. Measured upstream, the vDSO path costs
+#     the SAME (2,456ns vs 2,277ns paired) because this box's
+#     `current_clocksource` is **hpet** — the kernel rejected the TSC at boot, and
+#     HPET has no userspace fast path, so the vDSO falls back to the syscall
+#     anyway. A bare `syscall(getpid)` is 776ns, so kernel entry is a third of it
+#     and the HPET read is the rest. The cost is the clocksource's, not cyrius's.
+#     A vDSO binding would be a real ~64x win on aarch64 and a no-op here.
+#
+# ⚠ Which also means **this row moves between reboots** — the TSC-watchdog trip
+# is per-boot, and the same machine has recorded a ~400ns floor and a ~1,700ns
+# one. The band below is one boot's.
 #
 # Against that, the band observed over FOUR back-to-back runs of this file on
 # 2026-08-11. The ~7% spread between runs is host noise and is the point: the

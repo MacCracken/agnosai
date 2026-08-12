@@ -32,21 +32,36 @@
 # 3. **The reply is a 1-slot channel, not a `oneshot`.** `chan_new(1)` is a
 #    oneshot that does not consume itself; the caller reads it with `chan_recv`.
 #
-# ## `enqueue` holds a mutex that the oracle does not need
+# ## `enqueue` held a mutex the oracle does not need — REMOVED (cyrius 6.5.19)
 #
-# ⚠ majra's `queue_item_new` allocates with **`fl_alloc`, and `fl_alloc` is not
-# thread-safe** — `lib/freelist.cyr` pops the global `_fl_heads` lists with plain
-# loads and stores, no lock and no atomics, where `alloc` has a process-wide CAS
-# spinlock (`lib/alloc.cyr:28`). `cpq_enqueue`'s own mutex does not cover it,
-# because the item is built by the *caller* before the call. Two threads calling
+# The queue is 8 bytes and `enqueue` takes no lock of its own, which matches the
+# oracle. From this module's introduction until 6.5.19 it carried an
+# `AGN_IQ_MUTEX` at offset 8, held across `queue_item_new` and `cpq_enqueue`.
+# Recorded here because the reason was real and should not be re-derived — nor
+# re-introduced.
+#
+# **Why it existed.** majra's `queue_item_new` allocates with `fl_alloc`, and
+# `fl_alloc` was **not thread-safe**: `lib/freelist.cyr` popped the global
+# `_fl_heads` lists with plain loads and stores, no lock and no atomics, where
+# `alloc` has had a process-wide CAS spinlock at `lib/alloc.cyr:28` throughout.
+# `cpq_enqueue`'s own mutex does not cover it, because the item is built by the
+# **caller** before the call. Two threads calling
 # `agnosai_inference_queue_enqueue` at once could be handed the same 40-byte
-# item, which is majra 2.6.1's `relay_receive` bug one layer up.
+# item — majra 2.6.1's `relay_receive` bug one layer up.
 #
-# So the queue carries a mutex covering item construction *and* the enqueue.
-# **That fixes agnosai's self-race, not the process-wide hazard** — any other
-# thread calling `fl_alloc` concurrently still races this one. The real fix is
-# upstream and is filed as
-# `cyrius/docs/development/issues/2026-08-10-fl-alloc-is-not-thread-safe-and-says-nothing.md`.
+# **Why it went.** agnosai filed it 2026-08-10 and cyrius 6.5.19 fixed it: a
+# process-wide CAS spinlock over the free-list splice, the arena bump and the
+# arena refill. The filing described one race; upstream found **five** (init's
+# check-then-set, the pop, the push, the arena bump, and an arena refill whose
+# mmap left a ~2us unlocked window that could hand back a block running off the
+# end of its mapping). The lock costs nothing until threads exist.
+#
+# ⚠ **It was never a complete fix, which is the part worth keeping.** It
+# serialised agnosai against ITSELF while any other thread in the process calling
+# `fl_alloc` — sandhi, telemetry, majra's own relay — still raced it. A
+# consumer-side lock cannot close an allocator-side hazard; that is why this had
+# to go upstream rather than be papered over here, and why re-adding a lock here
+# would not help if a similar defect ever recurs.
 # =========================================================================
 
 # How long the worker sleeps between stop-flag checks while idling.
@@ -126,18 +141,21 @@ fn agnosai_queued_inference_label(q): i64 {
     return load64(q + AGN_QI_LABEL);
 }
 
-# InferenceQueue — 16 bytes.
+# InferenceQueue — 8 bytes.
+#
+# ⚠ It was 16, carrying an `AGN_IQ_MUTEX` at offset 8, from the module's
+# introduction until cyrius 6.5.19. See the header: that mutex existed only to
+# serialise majra's `queue_item_new` while `fl_alloc` was not thread-safe, and
+# nothing else ever read the field.
 enum AgnosaiInferenceQueueOff {
     AGN_IQ_CPQ = 0;
-    AGN_IQ_MUTEX = 8;
-    AGN_IQ_SIZE = 16;
+    AGN_IQ_SIZE = 8;
 }
 
 # Create an empty inference queue — the oracle's `new()` and its `Default`.
 fn agnosai_inference_queue_new(): i64 {
     var q = alloc(AGN_IQ_SIZE);
     store64(q + AGN_IQ_CPQ, cpq_new());
-    store64(q + AGN_IQ_MUTEX, mutex_new());
     return q;
 }
 
@@ -211,12 +229,11 @@ fn agnosai_inference_queue_enqueue(q, request, priority, label: Str): i64 {
 
     _agnosai_inference_queue_log_enqueued(label, priority);
 
-    # The lock covers `queue_item_new` as well as the enqueue — see the header:
-    # majra builds the item with `fl_alloc`, which carries no lock of its own.
-    var mtx = load64(q + AGN_IQ_MUTEX);
-    mutex_lock(mtx);
+    # No lock. `cpq_enqueue` takes majra's own mutex, `alloc` above has a
+    # process-wide spinlock, and since cyrius 6.5.19 so does the `fl_alloc`
+    # inside `queue_item_new` — see the header for the mutex this used to hold
+    # and why it was never a complete fix.
     cpq_enqueue(load64(q + AGN_IQ_CPQ), queue_item_new(priority, queued));
-    mutex_unlock(mtx);
 
     return reply;
 }

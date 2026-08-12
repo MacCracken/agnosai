@@ -134,9 +134,15 @@ fn _b_parse_complexity(input, name): i64 {
 
 # ── inference_queue: no oracle bench file ──────────────
 
-# Enqueue throughput. Each call takes the queue's mutex, mints a majra
-# `QueueItem` and pushes onto a tier vec, so this is the cost a request handler
-# pays to hand work off.
+# Enqueue throughput — the cost a request handler pays to hand work off: mint a
+# majra `QueueItem` and push onto a tier vec, under `cpq_enqueue`'s own mutex.
+#
+# ⚠ **This row got cheaper on 2026-08-12 for a reason that is not a code
+# optimisation.** Through cyrius 6.5.18 the queue carried its own mutex here as
+# well, held across `queue_item_new` because majra builds the item with
+# `fl_alloc` and `fl_alloc` was not thread-safe. 6.5.19 fixed the allocator, the
+# lock was deleted, and `InferenceQueue` went 16 bytes -> 8. A step down in this
+# row across that boundary is the lock leaving, not the enqueue getting smarter.
 fn _b_iq_enqueue(): i64 {
     var q = agnosai_inference_queue_new();
     var req = agnosai_inference_request_new(str_from("bench-model"));
@@ -167,6 +173,16 @@ fn _b_iq_enqueue(): i64 {
 #
 #     majra 2.6.1:   2k = 4.431us    16k = 35.335us    slope 8.0x
 #     majra 2.6.2:   2k = 168ns      16k = 175ns       slope 1.04x
+#
+# ✅ **Confirmed in `bench-history.csv` on 2026-08-12**, the first committed
+# sweep carrying 2.6.2 — and the sweep/standalone gap below reproduced exactly:
+#
+#     majra 2.6.1:   2k = 1.931us    16k = 15.646us    slope 8.1x
+#     majra 2.6.2:   2k = 88ns       16k = 89ns        slope 1.01x
+#
+# Those are the ONLY two rows of 199 that moved more than 25% across that bump;
+# everything else stayed inside +/-12% host noise. A quadratic drain is now flat
+# across an 8x depth range.
 #
 # That is the whole argument for measuring at two depths rather than one. The
 # ABSOLUTE numbers move with run conditions — the same 2.6.1 build reads

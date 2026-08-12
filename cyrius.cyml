@@ -5,7 +5,7 @@ description = "AgnosAI — provider-agnostic AI orchestration: crews, tasks, too
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/agnosai"
 language = "cyrius"
-cyrius = "6.5.18"
+cyrius = "6.5.19"
 
 [build]
 entry = "src/main.cyr"
@@ -31,7 +31,7 @@ stdlib = [
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 path = "../sigil"
-# 3.12.7 — what cyrius 6.5.18 folds, verified: `lib/sigil.cyr` reports
+# 3.12.7 — what cyrius 6.5.19 folds, verified: `lib/sigil.cyr` reports
 # `# Version: 3.12.7`. ⚠ agnosai does NOT get sigil from this dep — `sigil.cyr`
 # is FOLDED INTO the cyrius stdlib snapshot, and `lib sync --full` (which the
 # bump procedure runs *after* `deps`) overwrites the git-dep copy with the fold.
@@ -44,7 +44,7 @@ modules = ["dist/sigil.cyr"]
 [deps.bote]
 git = "https://github.com/MacCracken/bote.git"
 path = "../bote"
-tag = "3.3.0"
+tag = "3.3.1"
 modules = ["dist/bote-core.cyr"]
 
 [deps.majra]
@@ -64,9 +64,12 @@ path = "../majra"
 #     shape that could reach it; its ladder never emits one, which is why the
 #     module header says the ladder IS the bounds check.
 #
-# 2.6.1 fixed a concurrent-`relay_receive` allocator race and dropped majra's
-# `[deps.sakshi]` — see the sakshi note below.
-tag = "2.6.2"
+# 2.6.3 retires the `relay_receive` allocator workaround: 2.6.1 had pulled a
+# 16-byte `fl_alloc` INSIDE the relay's critical section because `fl_alloc` was
+# not thread-safe, and cyrius 6.5.19 fixes that properly, so the allocation moves
+# back outside a lock that is held across a subscriber-list walk. 2.6.1 also
+# dropped majra's own `[deps.sakshi]` — see the sakshi note below.
+tag = "2.6.3"
 modules = ["dist/majra.cyr"]
 
 [deps.kavach]
@@ -99,60 +102,50 @@ path = "../tyche"
 tag = "1.0.0"
 modules = ["dist/tyche.cyr"]
 
-# sakshi is a **transitive** requirement, and pinning it here is defensive.
+# ✅ **`[deps.sakshi]` is GONE (2026-08-12), after several releases as a
+# defensive pin. Verified by measurement, not by reasoning: removed, full
+# three-step, then `cyrius build` — `lib/sakshi.cyr` stays at the snapshot's
+# 2.4.10 and `lib/` diffs clean. The check that matters is AFTER A BUILD; the
+# three-step alone was never the failure mode.**
 #
-# `sakshi` is already in `[deps].stdlib` above, so `cyrius lib sync --full`
-# provisions whatever the toolchain pin ships. But sigil and bote declare
-# `[deps.sakshi]` in *their* manifests, and `cyrius deps` overlays that
-# resolution on top of the snapshot — so a sibling pinned behind the toolchain
-# silently **downgrades** `lib/sakshi.cyr`, on every `cyrius build`, not just on
-# `deps`. The only signal is an unnamed "1 bundled lib(s) differ" shadow
-# warning, and `deps --verify` cannot catch it because the lock is written
-# *from disk* and simply records the downgraded file's hash.
+# The mechanism it guarded against is real and unchanged: `sakshi` is in
+# `[deps].stdlib` above, so `lib sync --full` provisions whatever the toolchain
+# folds — but `cyrius deps` overlays a git dep's resolution ON TOP of the
+# snapshot, recursing through SIBLING manifests, on every `cyrius build` and not
+# only on `deps`. A sibling pinned behind the toolchain therefore downgrades
+# `lib/sakshi.cyr` silently. The only signal is an unnamed "1 bundled lib(s)
+# differ" shadow warning, and `deps --verify` cannot catch it because the lock is
+# written *from disk* and records the downgraded file's hash. Not hypothetical:
+# under the 6.5.10 bump the tree built 2.4.7 while the pin shipped 2.4.8,
+# silently reverting sakshi's `i64::MIN` integer-format fix.
 #
-# That is not hypothetical: under the 6.5.10 bump the tree built **2.4.7** while
-# the pin shipped 2.4.8, which silently reverted the `i64::MIN` integer-format
-# fix (`n = 0 - n` is a no-op at i64::MIN).
+# ⚠ **What actually changed is that the guard MOVED, not that the hazard did.**
+# The real source was never a direct sibling — it is four links down:
 #
-# ⚠ **Still load-bearing, and the sibling that makes it so is BOTE.**
-# Two of the three overlaying siblings have since dropped their `[deps.sakshi]`:
-# **sigil at 3.12.7** (sakshi is folded into the stdlib now, so the git dep was
-# downgrading every sigil consumer) and **majra at 2.6.1**. The one that still
-# declares it is **bote 3.3.0, at sakshi 2.4.7** — verified by
-# `git show 3.3.0:cyrius.cyml`, and bote's working tree, which `path = "../bote"`
-# makes the live resolution here, says 2.4.8. Either way it is behind the
-# snapshot's 2.4.10. Remove this pin and the tree silently builds bote's sakshi.
+#     agnosai -> bote -> [deps.libro] 2.8.4 -> [deps.patra] 1.12.12
+#             -> [deps.sakshi] 2.4.2
 #
-# ⚠ Re-verify the sibling by reading its manifest, not by trusting this line. It
-# named "sigil and bote", then "majra 2.6.0", and was **wrong at the 6.5.18 bump**
-# — it had written bote off on the strength of one of the two having dropped the
-# dep. `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml` is the whole check.
+# **patra is itself FOLDED INTO the cyrius stdlib** (`lib/patra.cyr`, v1.12.12 in
+# the 6.5.19 snapshot) while carrying a git dep on a sakshi eight patch releases
+# behind the sakshi that same snapshot ships. **bote 3.3.1 now pins sakshi
+# forward at 2.4.10 to absorb it**, which is what makes this block removable
+# here. That pin is documented at length in bote's manifest and should be deleted
+# the moment patra is fixed and re-folded — at which point nothing in this chain
+# needs a pin at all.
 #
-# ⚠ **The lib-snapshot gate can flap depending on whether a build ran since the
-# last sync, and that is this pin's doing.** Observed on the 6.5.15 bump:
-# `cyrius lib sync --full` writes the snapshot's sakshi into `lib/` and
-# `check-clean` passes; the very next `cyrius build` performs an implicit
-# resolve, overwrites `lib/sakshi.cyr` back to this tag, and `check-clean`
-# fails. Neither result is wrong — the *built* artifact is always this tag. Do
-# not "fix" the flap by re-syncing before the gate; that hides which sakshi the
-# binary contains.
+# ⚠ **So agnosai's correctness here now depends on bote's pin.** That is an
+# acceptable trade only because the regression is DETECTED rather than trusted:
+# `scripts/check-clean.sh` diffs `lib/` against the toolchain snapshot and fails
+# on any drift, and CI runs it. If `lib/sakshi.cyr` ever moves off the snapshot
+# again, that gate is what catches it — re-derive the chain with
+# `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml` and follow it DOWN, not just
+# one level.
 #
-# ✅ **No flap as of 6.5.18**, because this tag and the snapshot are both 2.4.10:
-# the overlay rewrites the same bytes. It returns the moment they diverge, which
-# is the next time the toolchain moves sakshi and this pin does not.
-#
-# ✅ **The 2.4.9 hook change is done.** This note used to say the pin was itself
-# the laggard at 2.4.8 while the snapshot shipped 2.4.9, and that bumping it had
-# to land together with `_agnosai_telemetry_json_hook` — because on 2.4.9+ a hook
-# ignoring the new sixth argument silently drops every `key=value` from the JSON
-# rather than merely failing to structure it. Both shipped together; the tag is
-# 2.4.10 and matches the 6.5.18 snapshot.
-#
-# **Keep this in step with the toolchain's bundled sakshi on every pin bump.**
-[deps.sakshi]
-git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.4.10"
-modules = ["dist/sakshi.cyr"]
+# ⚠ **Do not re-derive this note from one level of manifests.** Its predecessor
+# was wrong twice for exactly that reason: it named "sigil and bote", then
+# "majra 2.6.0", and at the 6.5.18 bump had written bote off on the strength of
+# one of two siblings having dropped the dep. Sixteen repos in this workspace
+# pin `[deps.sakshi]`, spanning 2.3.0 to 2.4.10.
 
 [release]
 bins = ["agnosai"]

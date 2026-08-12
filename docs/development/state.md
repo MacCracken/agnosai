@@ -12,20 +12,71 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.18` (`cyrius.cyml`) — bumped 2026-08-10, three-step,
+- **Cyrius pin**: `6.5.19` (`cyrius.cyml`) — bumped 2026-08-11, three-step,
   `lib/` diffed after the sync AND again after a build: 107 files, zero content
   differences. Folds **sigil 3.12.7**, **sakshi 2.4.10** and **sankoch 2.7.7**.
+  Full gate on the bumped tree: **97 suites, 0 failures.**
 
-  **Sibling pins as of the 2026-08-10 bump**: kavach **3.11.9**, majra **2.6.1**,
-  sigil 3.12.7, bote 3.3.0, ai-hwaccel 2.3.16, tyche 1.0.0, and the defensive
-  `[deps.sakshi]` at 2.4.10.
+  **Sibling pins as of the 2026-08-11 bump**: kavach **3.11.10**, majra
+  **2.6.2**, sigil 3.12.7, bote 3.3.0, ai-hwaccel 2.3.16, tyche 1.0.0, and the
+  defensive `[deps.sakshi]` at 2.4.10.
 
-  ⚠ **The defensive `[deps.sakshi]` is still load-bearing, and its comment has
-  now been wrong twice about WHY.** It first blamed "sigil and bote", then
-  "majra 2.6.0". sigil dropped its `[deps.sakshi]` at 3.12.7 and majra at 2.6.1;
-  the sibling that still declares one is **bote 3.3.0, at sakshi 2.4.7**. Do not
-  trust the manifest comment — re-derive with
-  `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml`.
+  **6.5.19 consumes both defects still open against it from this tree**, and in
+  both cases went past what was filed:
+
+  - **`fl_alloc` is thread-safe** (`lib/freelist.cyr`). Filed as **one** race
+    (two threads popping the same block off `_fl_heads[cls]`); upstream found
+    **five** and locked all of them. ⚠ This makes
+    `src/llm/inference_queue.cyr`'s enqueue mutex **redundant** — it is left in
+    place pending a deliberate removal, and the module header and call site both
+    now say so.
+  - **The benchmark timer floor is measured, not declared** (`lib/bench.cyr`,
+    `bench_clock_overhead_ns()`). ⚠ Two corrections to the filing: a corrected
+    *constant* would still have been wrong (230× spread across the four gate
+    hosts), and the cause it named — raw `syscall(228)` versus the vDSO — is
+    wrong on this box, whose clocksource is **hpet**, so the vDSO falls back to
+    the syscall anyway.
+
+  ✅ `bench-history.csv` is unaffected: 6.5.19 also re-sized `bench_run`, which
+  floored 57 of 79 rows in cyrius's own history, but **all ten agnosai `.bcyr`
+  batch explicitly and none calls `bench_run`**.
+
+  ⚠ **A `~/.cyrius/versions/<v>/lib` snapshot can be overwritten in place with a
+  later version's content.** Observed here: `check-clean` failed with
+  `lib/bench.cyr differs from the 6.5.18 snapshot` while `lib/` was untouched,
+  because the 6.5.18 snapshot had been rewritten with pre-release 6.5.19 files.
+  A 6.5.18-vs-6.5.19 diff consequently reads empty. **A snapshot mismatch is not
+  automatically drift in this tree** — check the toolchain side before syncing,
+  and do not re-sync to make the gate pass.
+
+  ✅ **The defensive `[deps.sakshi]` is REMOVED (2026-08-12), and the root cause
+  was never where this file or the manifest said it was.** Both blamed a direct
+  sibling — first "sigil and bote", then "majra 2.6.0", then "bote". The actual
+  chain is four links deep and ends in a **folded stdlib module**:
+
+  ```
+  agnosai -> bote -> [deps.libro] 2.8.4 -> [deps.patra] 1.12.12
+          -> [deps.sakshi] 2.4.2
+  ```
+
+  ⚠ **patra is itself folded into the cyrius stdlib** (`lib/patra.cyr` v1.12.12
+  in the 6.5.19 snapshot) while pinning a sakshi **eight patch releases behind**
+  the one that snapshot ships. `cyrius deps` overlays it — recursing through
+  sibling manifests — on every `cyrius build`, not just on `deps`.
+
+  bote 3.3.1 pins sakshi forward at 2.4.10 to absorb it, which is what makes the
+  pin removable here. Verified after a **build**, not after the sync: sakshi
+  stays 2.4.10, `lib/` clean.
+
+  ⚠ **Re-derive by following the chain DOWN, not one level.** Three successive
+  versions of that note were wrong because each read only direct siblings.
+  `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml` is the start, not the answer —
+  **16 repos pin it, spanning 2.3.0 to 2.4.10**; only agnosai, hisab and bote are
+  current.
+
+  ⚠ **The real fix is upstream and is NOT done**: patra must drop or bump its
+  `[deps.sakshi]`, and cyrius must re-fold patra. patra's own toolchain pin is
+  **6.4.65**. Until then every libro consumer needs bote's defensive pin.
 
   ⚠ **Every build emits 35 `duplicate fn … (last definition wins)` warnings.**
   Audited 2026-08-10: **none is currently miscompiling**, two are latent hazards,
@@ -255,6 +306,22 @@ count, ~50 assertions), `tools/python_tool` (50 assertions). 25 mutation probes,
 row until now**), `tools/wasm_loader.rs` (169), `tools/wasm_tool.rs` (265).
 ⚠ `wasmtime` is **not installed** on this box and kavach's WASM backend cannot
 carry stdin or a guest exit code; see the roadmap's M11 row.
+
+> ✅ **Both halves of that last warning are now closed** (2026-08-11), and the
+> resolution is worth keeping because it exposed three mutually-concealing bugs.
+> `wasmtime` is installed (Arch package `wasmtime`); kavach **3.11.9** added
+> stdin, a guest exit code and stderr via `confine_capture_input`, plus
+> `backend_is_available(Backend.WASM)`. Installing it turned the sandbox suite
+> red and uncovered a chain that only a real module could reach:
+> kavach's WASM argv was **never valid** (`--max-memory-size` / `--fuel` emitted
+> as top-level `wasmtime run` flags when both live in its `-W` group — fixed in
+> **3.11.10**, [ADR 019](../adr/019-wasm-tools-spawn-wasmtime-directly.md));
+> `agnosai_wasm_execute` never called `_agnosai_kavach_ensure_init()`; and the
+> memory ceiling was parsed but never applied to the policy. Each hid the next.
+> ⚠ The tests that were supposed to cover this **could not fail** — the default
+> policy emits no flags at all, and a nop module declares no memory section, so
+> the suites now set a memory limit *and* a timeout and drive a 41-byte module
+> declaring 4 MiB.
 
 **M10 `definitions` bite log — ✅ COMPLETE 2026-08-09.**
 

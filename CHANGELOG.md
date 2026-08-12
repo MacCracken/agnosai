@@ -12,6 +12,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RS256 JWT verification was an authentication bypass under load. Fixed by
   serialising the sigil call; the real fix belongs upstream.**
 
+  > ⚠ **SUPERSEDED — read this box before acting on the entry below.** This is
+  > the *original discovery* entry, and `[Unreleased]` is ordered newest-first,
+  > so everything correcting it sits **lower in this same section**. Two of its
+  > instructions are now wrong:
+  >
+  > - **`_agnosai_auth_rsa_verify_locked` NO LONGER EXISTS.** The mutex was
+  >   deleted under the cyrius 6.5.14 / sigil 3.12.6 bump, after staging the
+  >   removal across four sigil releases on the pinned-lane harness (3.12.2:
+  >   888 forged accepted of 400,000; 3.12.5: 2000/2000 valid, 0 forged).
+  >   `_agnosai_auth_validate_jwt` calls `rsa_pkcs1v15_verify_sha256` directly.
+  >   "Do not remove that lock" is therefore an instruction about code that is
+  >   gone — do not re-add it on the strength of this paragraph.
+  > - **The upstream fix landed.** Re-verified against the cyrius 6.5.19 fold
+  >   (sigil 3.12.7): every buffer on the RS256 verify path is function-scope,
+  >   hence per-call and per-thread — `rsa_pkcs1v15_verify_sha256` (hbuf/dbuf),
+  >   `_rsa_pkcs1v15_check` (embuf/expbuf — *both operands of the compare this
+  >   entry names as the whole decision*), `_rsa_recover_em` (nbuf/sbuf/mbuf),
+  >   and `bn_mont_modexp_pub`, which took stack locals at 3.12.4. The banked
+  >   globals `_rsa_em` / `_rsa_expected` no longer appear in `lib/sigil.cyr`.
+  >
+  > What is still accurate and still load-bearing: the mechanism, the
+  > measurements, the `cbank()` lane analysis, and
+  > `tests/server_auth_lane_race.tcyr` as the standing regression guard — it
+  > caught every intermediate stage, so it demonstrably detects a relapse.
+  >
+  > ⚠ Still **open**, and NOT resolved by any of the above: the closing
+  > paragraph's wider claim. sigil's PSS lanes were localised in 3.12.6, but a
+  > brace-depth scan still finds file-scope banked state elsewhere — `sha256`
+  > itself keeps a `cbank()`-banked message schedule (`&W + cbank() * 512`),
+  > which is fail-closed for a verify (a corrupted digest mismatches) but is the
+  > same structural pattern. Not probed.
+
   `_agnosai_auth_validate_jwt` now calls `_agnosai_auth_rsa_verify_locked`
   (`src/server/auth.cyr`), which holds a process-global mutex across
   `rsa_pkcs1v15_verify_sha256`. **Do not remove that lock as an optimisation** —
@@ -492,6 +524,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     eight runs at 2,000,000 iterations and the reason (`lib/chrono.cyr:75` issues a
     raw `syscall(228)`, not the vDSO path libc takes). The other three constants in
     that block check out, so it is one wrong line rather than a stale block.
+
+    ✅ **RESOLVED in cyrius 6.5.19** — the constant is retired for a measured
+    `bench_clock_overhead_ns()`. ⚠ **The reason given above is wrong on this
+    host**: the vDSO path costs the same as the raw syscall, because the
+    clocksource is **hpet** and the vDSO falls back to the syscall. See the
+    6.5.19 entry under **Changed**.
   - **`src/server/prompt_guard.cyr` carried a stale number.** Its header claimed a
     clean 4 KB scan costs **273 µs**; the committed row says **352 µs** — 29%
     drift, unnoticed because a figure frozen in a comment has nothing to
@@ -1418,7 +1456,169 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that no key file has to exist. `.gitignore` now carries `*.pem` / `*.key` with
   that reasoning, since a PEM in this tree is always debris.
 
+### Performance
+
+- **`inference_queue_enqueue` 1,269 ns → 1,206 ns (−5.0%)** from deleting the
+  redundant enqueue mutex (see **Changed**). That is the uncontended cost of one
+  `mutex_lock`/`mutex_unlock` pair on this path — modest, and the honest figure:
+  the lock was removed because its justification was gone, not because it was
+  expensive. The dequeue rows are unmoved (88 → 91 ns at 2k, 89 → 88 ns at 16k),
+  which is what should happen, since only `enqueue` ever took it.
+
+  ⚠ **One row read +50.3% in that sweep and it is NOISE — recorded so it is not
+  chased later.** `prompt_scan_clean_500b` printed 95,555 ns against a
+  61,736–63,578 ns band across the five prior sweeps. Its three siblings
+  (`clean_67b`, `clean_4k`, `suspicious_500b`) did not move, and nothing in this
+  change touches `prompt_guard`. Re-measured three times immediately after:
+  **62.65 / 62.85 / 62.22 µs**. A single row jumping with no sibling movement is
+  the signature of a scheduling artifact, not a regression — the CSV keeps the
+  outlier, this note explains it.
+
+- **`inference_queue` background drain is no longer quadratic — the majra 2.6.2
+  fix is confirmed in `bench-history.csv`.** 2026-08-12 is the first committed
+  sweep carrying it, and the two rows converged as `benches/llm.bcyr` predicted:
+
+  | depth | majra 2.6.1 | majra 2.6.2 | |
+  |---|---|---|---|
+  | 2,000 | 1,931 ns | **88 ns** | −95.4% |
+  | 16,000 | 15,646 ns | **89 ns** | −99.4% |
+  | slope across the 8× depth range | 8.1× | **1.01×** | flat |
+
+  `pq_dequeue` popped with `vec_remove(tier, 0)`, shifting every survivor, so a
+  full drain was **O(n²)**; it now keeps a read index per tier. This is the
+  design case rather than a pathological one — the queue exists so background
+  work is *allowed* to pile up behind interactive work.
+
+  ⚠ **These are the only 2 of 199 rows that moved more than 25%**; the other 197
+  stayed inside ±12% host noise, which is what makes the pair a signal rather
+  than a sweep-wide shift. Measuring at **two** depths is what proved it: the
+  absolutes move with run conditions (the same 2.6.1 build reads 1.9/15.6 µs in
+  a sweep and 4.4/35.3 µs standalone, because a sweep warms the allocator), but
+  the slope held at 8.1× vs 8.0×. A single-depth row would have been noise.
+
+  ⚠ **Not comparable to the row above it in the CSV for the timer reason too**:
+  from cyrius 6.5.19 `bench_batch_stop` subtracts one measured clock read per
+  batch. At these iteration counts that is below the reported integer ns, so the
+  series stays continuous — but it is a real change in what the number means.
+
 ### Changed
+
+- **The defensive `[deps.sakshi]` pin is GONE, and the `inference_queue` mutex
+  with it. Both were workarounds for upstream defects that are now fixed.**
+
+  `[deps.majra]` 2.6.2 → **2.6.3** and `[deps.bote]` 3.3.0 → **3.3.1**.
+
+  **The mutex.** `agnosai_inference_queue_enqueue` held a process-local lock
+  across `queue_item_new` + `cpq_enqueue`, purely because majra builds the item
+  with `fl_alloc` in the *caller*, outside `cpq_enqueue`'s own mutex, and
+  `fl_alloc` was not thread-safe. cyrius 6.5.19 fixes that, so the lock is gone
+  and `InferenceQueue` drops from 16 bytes to 8 (`AGN_IQ_MUTEX` deleted).
+  ⚠ It was never a complete fix — it serialised agnosai against *agnosai* while
+  any other thread calling `fl_alloc` still raced it. A consumer-side lock cannot
+  close an allocator-side hazard, which is why re-adding one would not help if
+  this ever recurs.
+
+  **The sakshi pin — and the root cause was never where this manifest said.**
+  The note claimed the overlaying sibling was bote's own `[deps.sakshi]`. It is
+  not. The real chain is four links deep:
+
+  ```
+  agnosai -> bote -> [deps.libro] 2.8.4 -> [deps.patra] 1.12.12
+          -> [deps.sakshi] 2.4.2
+  ```
+
+  ⚠ **`patra` is itself FOLDED INTO the cyrius stdlib** (`lib/patra.cyr` v1.12.12
+  in the 6.5.19 snapshot) while carrying a git dep on a sakshi **eight patch
+  releases behind** the sakshi that same snapshot ships — and `cyrius deps`
+  overlays it, recursing through sibling manifests, on every `cyrius build`.
+
+  bote 3.3.1 now pins sakshi forward at 2.4.10 to absorb that, which is what
+  makes the pin removable here. **Verified by measurement, not reasoning**:
+  removed, full three-step, then a build — `lib/sakshi.cyr` stays at 2.4.10 and
+  `lib/` diffs clean. ⚠ The check that matters is **after a build**; the
+  three-step alone was never the failure mode.
+
+  ⚠ **A first attempt at this test was invalid and is recorded so it is not
+  repeated.** Deleting the block with a naive string match cut from a *mention of
+  `[deps.sakshi]` inside the majra comment*, silently removing `[deps.kavach]`,
+  `[deps.ai-hwaccel]` and `[deps.tyche]` as well. The build failed with
+  `undefined variable 'ACCEL_CPU'` — which reads like a sakshi-removal
+  consequence and is nothing of the kind. Anchor on `^\[deps\.sakshi\]$`.
+
+  ⚠ **agnosai's correctness here now depends on bote's pin**, which is acceptable
+  only because the regression is *detected* rather than trusted:
+  `scripts/check-clean.sh` diffs `lib/` against the toolchain snapshot and CI
+  runs it. The standing instruction to re-derive the chain still holds — and to
+  follow it **down**, not one level: the predecessor note was wrong twice for
+  exactly that reason. **Sixteen repos in this workspace pin `[deps.sakshi]`,
+  spanning 2.3.0 to 2.4.10.**
+
+- **Toolchain pinned to cyrius 6.5.19** (was 6.5.18), which consumes **both**
+  upstream defects filed from this tree. Full three-step
+  (`deps --no-lock` → `lib sync --full` → `deps --lock`), `lib/` diffed against
+  the 6.5.19 snapshot **after the sync and again after a build** — 107 files,
+  zero drift. Full gate on the bumped tree: **97 suites, 0 failures.**
+
+  - **`fl_alloc` is thread-safe** (`lib/freelist.cyr`). Filed 2026-08-10 after
+    majra's `test_relay_receive_is_reentrant` failed intermittently. The filing
+    described **one** race — two threads popping the same block off
+    `_fl_heads[cls]`; upstream found **five**, and locked all of them behind a
+    process-wide CAS spinlock: `fl_init`'s check-then-set, the pop, the push,
+    the arena bump, and an arena refill whose `mmap` left a ~2 µs unlocked
+    window that could return a block **running off the end of its mapping**.
+    The large (>4096) path still takes no lock; it touches no shared state.
+
+    ⚠ **This makes `src/llm/inference_queue.cyr`'s enqueue mutex redundant.** It
+    was added solely because `queue_item_new` builds the item with `fl_alloc` in
+    the *caller*, outside `cpq_enqueue`'s own mutex. It never closed the hazard
+    — it serialised agnosai against itself while any other thread in the process
+    calling `fl_alloc` still raced it, which is why the fix had to be upstream.
+    The lock is **left in place pending a deliberate removal** and both the
+    module header and the call site now say so; nothing below it needs it
+    (`alloc` has had its own spinlock at `lib/alloc.cyr:28` throughout).
+
+  - **The benchmark timer floor is measured, not declared** (`lib/bench.cyr`).
+    Filed 2026-08-11 after decomposing two rows as "one clock plus the work" and
+    getting the split backwards: at the documented `~120 ns` the clock is 6 % of
+    a 2.045 µs row; at the real figure it is 64 %. `bench_clock_overhead_ns()`
+    now calibrates one clock read at first use and every reporting path
+    subtracts it.
+
+    ⚠ **A corrected constant would still have been wrong**, which the filing did
+    not anticipate. One clock read costs ~1,320–1,720 ns here, ~3,550 ns on
+    aarch64 Linux, ~15–32 ns on macOS arm64 and ~64–68 ns on macOS x86_64 — a
+    **230× spread** across the four release-gate hosts.
+
+    ⚠ **And the cause the filing named is wrong on this host.** It blamed
+    cyrius's raw `syscall(228)` versus libc's vDSO. Measured upstream, the vDSO
+    path costs the same (2,456 ns vs 2,277 ns paired), because this box's
+    `current_clocksource` is **hpet** — the kernel rejected the TSC at boot, and
+    HPET has no userspace fast path, so the vDSO falls back to the syscall. The
+    cost belongs to the clocksource, not the syscall choice. Corrected in place
+    in `benches/fleet.bcyr`, `benches/harness.bcyr` and `benches/learning.bcyr`.
+
+    ⚠ **The floor also moves between reboots** (the TSC-watchdog trip is
+    per-boot; this machine has recorded ~400 ns and ~1,700 ns), so cross-run
+    comparison of micro rows is only sound within one boot.
+
+  ✅ **`bench-history.csv` is unaffected and the series stays continuous.**
+  6.5.19's other half re-sized `bench_run`, which used to wrap a clock pair
+  around every iteration and floored 57 of 79 rows in *cyrius's own* history at
+  ~2 clock reads. **All ten agnosai `.bcyr` files use
+  `bench_batch_start`/`bench_batch_stop` and none calls `bench_run`**, so that
+  inflation never entered this tree's numbers. What did change is that
+  `bench_batch_stop` now subtracts one clock read **per batch**, which at these
+  iteration counts is below the reported integer ns.
+
+  ⚠ **The 6.5.18 snapshot under `~/.cyrius/versions/` was overwritten in place
+  with 6.5.19 content**, so `check-clean` failed against it before the bump and
+  a 6.5.18-vs-6.5.19 `lib/` diff reads empty. Neither is drift in this tree; the
+  gate passes against the 6.5.19 snapshot.
+
+  `[deps.sakshi]` stays pinned at 2.4.10 and still matches the snapshot, so the
+  documented flap does not return. Re-verified the sibling that makes that pin
+  load-bearing rather than trusting the note: **bote still declares
+  `[deps.sakshi]`**, at 2.4.8 in its working tree and 2.4.7 at tag 3.3.0.
 
 - **The cleanliness gate and CI now cover `benches/` and `examples/`.** `scripts/check-clean.sh`
   swept `src/` and `tests/` and never `benches/`, and CI ran `check-clean.sh`,

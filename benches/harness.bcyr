@@ -4,7 +4,7 @@
 # `noop` is an empty call in a tight loop: whatever it reports is what the
 # harness itself costs, and no benchmark in this tree can legitimately come in
 # below it. It has been in `bench-history.csv` since 2026-07-31 and reads **2ns**,
-# which is the direct-call cost `lib/bench.cyr:8` documents.
+# which is the direct-call cost `lib/bench.cyr:43` documents.
 #
 # ⚠ **This file was `tests/agnosai.bcyr` until 2026-08-10** — a `cyrius port`
 # scaffold living in `tests/`, which is why an audit of `benches/*.bcyr` did not
@@ -12,11 +12,29 @@
 # CLAUDE.md says benches are flat in `benches/`; this now is. The bench NAME is
 # unchanged, so its history is continuous.
 #
-# ⚠ `lib/bench.cyr:6` documents `clock_gettime: ~120ns`. On this host it is
-# **1.32us** — measured at 2,000,000 iterations as `clock_epoch_secs_baseline`
-# in `benches/fleet.bcyr`, because Cyrius issues a raw `syscall(228, ...)` rather
-# than taking the vDSO path. Anything subtracting the documented constant is
-# subtracting the wrong number by 11x.
+# ✅ **The timer floor is measured by the harness now (cyrius 6.5.19), not
+# declared** — `bench_clock_overhead_ns()` (lib/bench.cyr:141) calibrates one
+# clock read at first use and `bench_batch_stop` subtracts it. This note used to
+# warn that `lib/bench.cyr:6` documented `clock_gettime: ~120ns` while this host
+# measured **1.32us** (2,000,000 iterations, `clock_epoch_secs_baseline` in
+# `benches/fleet.bcyr`) — an 11x error that anything subtracting the constant
+# inherited. agnosai filed it 2026-08-11 and it is fixed upstream; the constant
+# is gone and a single number could never have replaced it, because the four
+# release-gate hosts span 15ns to 3,550ns.
+#
+# ⚠ **What did NOT change here: every `.bcyr` in this tree already batched.**
+# 6.5.19's other half re-sized `bench_run`, which used to wrap a clock pair
+# around each iteration and floored 57 of 79 rows in *cyrius's own* history at
+# ~2 clock reads. All ten agnosai bench files use
+# `bench_batch_start`/`bench_batch_stop` and none calls `bench_run`, so that
+# inflation never entered `bench-history.csv` and the series stays continuous
+# across the bump. The floor subtraction is one clock read per BATCH, which at
+# these iteration counts is below the reported integer ns.
+#
+# ⚠ **The floor moves between reboots** — the TSC-watchdog trip is per-boot, and
+# this same box has recorded ~400ns and ~1,700ns. Cross-run comparison of micro
+# rows is only sound within one boot. `bench_report` prints the floor it
+# measured, so a row's provenance is recoverable from the run output.
 #
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
