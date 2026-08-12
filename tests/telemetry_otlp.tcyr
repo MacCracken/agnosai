@@ -427,6 +427,81 @@ fn main(): i64 {
     agnosai_otlp_exporter_stop(bg);
     assert_eq(agnosai_otlp_exporter_stopping(bg), 1, "and stops when asked");
 
+    # --- the export path allocates NOTHING on the global bump ----------------
+    #
+    # ⚠ This suite had no allocator assertion at all, and that is exactly why
+    # the module shipped constructing its builders with `str_builder_new_a` and
+    # then making 29 bare `str_builder_add*` + 4 bare `str_builder_build` calls.
+    # A `str_builder` does not remember its allocator (`lib/str.cyr:428`), so the
+    # arenas received only 88-byte headers and every fragment and document went
+    # to the no-free global bump — ~2.7 KB per span, for process lifetime.
+    #
+    # Absolute equality against ZERO, not a bound: state.md's own note is that a
+    # round-number threshold asserts less than it looks like it does.
+    #
+    # ⚠ **What this does and does NOT catch — mutation-verified 2026-08-12, and
+    # the first version of this comment overclaimed.** Reverting any call that
+    # actually allocates kills it (2 failures each):
+    #   `str_builder_build_a` -> `str_builder_build`, frag arena       KILLED
+    #   `str_builder_build_a` -> `str_builder_build`, doc arena        KILLED
+    #   `_agnosai_otlp_json_str_a` -> stdlib `add_json_str`            KILLED
+    #   `str_from_a` -> `str_from`                                     KILLED
+    # But reverting ONE small `str_builder_add_cstr_a` -> `add_cstr`   SURVIVED,
+    # because `_sb_grow` only allocates when capacity is exceeded — a short
+    # constant appended into an already-grown buffer never reaches the allocator,
+    # so which allocator it would have used is unobservable. A bare `add` is
+    # still wrong (it allocates as soon as it is the call that triggers a grow),
+    # it is simply not detectable here. Read the calls, don't rely on this alone.
+    var ar = agnosai_otlp_ring_new();
+    var asvc = str_from("alloc-probe");
+    var aspan = agnosai_genai_inference_span(str_from("gpt-4o"), str_from("openai"),
+    str_from("probe-agent"), str_from("task-1"));
+    agnosai_genai_record_usage(aspan, 1234, 567, str_from("gpt-4o"));
+    var actx = _t_ctx();
+
+    # Warm once — the first cycle faults in the arena chunks.
+    agnosai_otlp_ring_enqueue(ar, aspan, actx);
+    agnosai_otlp_ring_drain(ar, asvc);
+
+    var g_before = alloc_used();
+    for (var ai = 0; ai < 64; ai = ai + 1) {
+        agnosai_otlp_ring_enqueue(ar, aspan, actx);
+    }
+    var doc64 = agnosai_otlp_ring_drain(ar, asvc);
+    assert_eq(alloc_used() - g_before, 0,
+    "64 spans encoded, batched and drained charge the global bump ZERO bytes");
+    assert(str_len(doc64) > 0, "and still produce a document");
+
+    # A FULL ring must not spill either — ARENA_FULL_SPILL spills to the global
+    # bump, so an undersized arena silently reintroduces the leak at load.
+    # AGNOSAI_OTLP_ARENA_BYTES is sized from AGNOSAI_OTLP_RING_MAX for this.
+    var g_full = alloc_used();
+    for (var aj = 0; aj < AGNOSAI_OTLP_RING_MAX; aj = aj + 1) {
+        agnosai_otlp_ring_enqueue(ar, aspan, actx);
+    }
+    agnosai_otlp_ring_drain(ar, asvc);
+    assert_eq(alloc_used() - g_full, 0,
+    "a completely full ring drains without spilling to the global bump");
+
+    # --- the POST target carries the OTLP path -------------------------------
+    #
+    # ⚠ `agnosai_otlp_path` existed and had ZERO production callers: the exporter
+    # posted the raw endpoint, so the documented `http://localhost:4318` sidecar
+    # form received `POST /` and 404'd. The whole tier was non-functional.
+    var pa = default_alloc();
+    assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("http://localhost:4318")),
+    "http://localhost:4318/v1/traces"),
+    "a path-less endpoint gets /v1/traces appended");
+    assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("https://collector:4318")),
+    "https://collector:4318/v1/traces"),
+    "https too — the scheme offset, not a hardcoded 7");
+    assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("http://host/custom/path")),
+    "http://host/custom/path"),
+    "an endpoint that already names a path is passed through untouched");
+    assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("http://localhost:4318/v1/traces")),
+    "http://localhost:4318/v1/traces"),
+    "and is not doubled into /v1/traces/v1/traces");
+
     return assert_summary();
 }
 

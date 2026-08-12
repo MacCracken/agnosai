@@ -110,6 +110,90 @@ fn agnosai_otlp_trace_id_is_zero(hi, lo): i64 {
     return 1;
 }
 
+# --- arena-threaded builder primitives -------------------------------------
+#
+# ⚠ **A `str_builder` does NOT remember its allocator.** The header is 24 bytes
+# — `{buf, len, cap}` (`lib/str.cyr:428`) — so `str_builder_new_a(arena)` charges
+# the arena the 88-byte header and NOTHING else: every bare `str_builder_add*`
+# grows through `_sb_grow` → `default_alloc()`, and bare `str_builder_build`
+# builds there too. `lib/str.cyr:433` states the contract outright — *"Subsequent
+# grows must use the `_a` add variants to keep the same allocator threaded
+# through."*
+#
+# This module violated that from the start: it constructed with `_a` and then
+# made 29 bare `add` calls and 4 bare `build` calls, so both 256 KiB ring arenas
+# held only builder headers and every span fragment and batch document went to
+# the no-free global bump — ~3.9 KB per exported span, on a 1000 ms loop, for
+# process lifetime. Fixed 2026-08-12.
+#
+# `str_builder_putc` and `str_builder_add_json_str` have **no `_a` form**
+# upstream, so the two below are port-local stand-ins. They are the only reason
+# this section exists; delete them if `putc_a` / `add_json_str_a` ever land.
+
+# One byte, through the threaded allocator. `str_builder_add_cstr_a` copies
+# immediately, so the 2-byte NUL-terminated stack buffer is safe.
+fn _agnosai_otlp_putc_a(a, sb, ch): i64 {
+    var b[2];
+    var p = &b;
+    store8(p, ch & 0xFF);
+    store8(p + 1, 0);
+    return str_builder_add_cstr_a(a, sb, p);
+}
+
+# `str_builder_add_json_str` with the allocator threaded.
+#
+# ⚠ **Byte-for-byte identical to `lib/str.cyr:114` and must stay so** — the
+# suites assert the encoded wire, so any divergence here is a wire change. Same
+# escape set: `"`→`\"`, `\`→`\\`, the five named control escapes, `\u00XX` for
+# the remaining controls, and everything >= 0x20 verbatim (RFC 8259 §8.1).
+fn _agnosai_otlp_json_str_a(a, sb, s: Str): i64 {
+    _agnosai_otlp_putc_a(a, sb, 34);
+    var data = str_data(s);
+    var slen = str_len(s);
+    var ji = 0;
+    while (ji < slen) {
+        var bc = load8(data + ji);
+        if (bc == 34) {
+            _agnosai_otlp_putc_a(a, sb, 92);
+            _agnosai_otlp_putc_a(a, sb, 34);
+        } else { if (bc == 92) {
+                _agnosai_otlp_putc_a(a, sb, 92);
+                _agnosai_otlp_putc_a(a, sb, 92);
+            } else { if (bc == 8) {
+                    _agnosai_otlp_putc_a(a, sb, 92);
+                    _agnosai_otlp_putc_a(a, sb, 98);
+                } else { if (bc == 9) {
+                        _agnosai_otlp_putc_a(a, sb, 92);
+                        _agnosai_otlp_putc_a(a, sb, 116);
+                    } else { if (bc == 10) {
+                            _agnosai_otlp_putc_a(a, sb, 92);
+                            _agnosai_otlp_putc_a(a, sb, 110);
+                        } else { if (bc == 12) {
+                                _agnosai_otlp_putc_a(a, sb, 92);
+                                _agnosai_otlp_putc_a(a, sb, 102);
+                            } else { if (bc == 13) {
+                                    _agnosai_otlp_putc_a(a, sb, 92);
+                                    _agnosai_otlp_putc_a(a, sb, 114);
+                                } else { if (bc < 32) {
+                                        _agnosai_otlp_putc_a(a, sb, 92);
+                                        _agnosai_otlp_putc_a(a, sb, 117);
+                                        _agnosai_otlp_putc_a(a, sb, 48);
+                                        _agnosai_otlp_putc_a(a, sb, 48);
+                                        var hi = (bc >> 4) & 0xF;
+                                        var lo = bc & 0xF;
+                                        if (hi < 10) { _agnosai_otlp_putc_a(a, sb, 48 + hi); }
+                                        else { _agnosai_otlp_putc_a(a, sb, 87 + hi); }
+                                        if (lo < 10) { _agnosai_otlp_putc_a(a, sb, 48 + lo); }
+                                        else { _agnosai_otlp_putc_a(a, sb, 87 + lo); }
+                                    } else {
+                                        _agnosai_otlp_putc_a(a, sb, bc);
+                                    } } } } } } } }
+        ji = ji + 1;
+    }
+    _agnosai_otlp_putc_a(a, sb, 34);
+    return 0;
+}
+
 # --- hex ------------------------------------------------------------------
 
 # Append `n` as exactly `width` lowercase hex digits, most significant first.
@@ -117,24 +201,36 @@ fn agnosai_otlp_trace_id_is_zero(hi, lo): i64 {
 # ⚠ Zero-padded and fixed-width: the collector parses ids by length, so a
 # 15-digit span id is not a span id. `_agnosai_hex_digit` is `src/id.cyr`'s —
 # `id` precedes `telemetry` in `src/main.cyr`, so this is a reuse, not a copy.
-fn _agnosai_otlp_add_hex(sb, n, width): i64 {
+fn _agnosai_otlp_add_hex_a(a, sb, n, width): i64 {
     for (var i = width - 1; i >= 0; i = i - 1) {
-        str_builder_putc(sb, _agnosai_hex_digit((n >> (i * 4)) & 15));
+        _agnosai_otlp_putc_a(a, sb, _agnosai_hex_digit((n >> (i * 4)) & 15));
     }
     return 0;
 }
 
 # Append a W3C trace id: 32 lowercase hex digits, high half first.
-fn agnosai_otlp_add_trace_id(sb, hi, lo): i64 {
-    _agnosai_otlp_add_hex(sb, hi, 16);
-    _agnosai_otlp_add_hex(sb, lo, 16);
+fn agnosai_otlp_add_trace_id_a(a, sb, hi, lo): i64 {
+    _agnosai_otlp_add_hex_a(a, sb, hi, 16);
+    _agnosai_otlp_add_hex_a(a, sb, lo, 16);
     return 0;
 }
 
+# Global-allocator form. Kept because the encoder tests build against a bare
+# `str_builder_new()`, where threading would be a lie.
+fn agnosai_otlp_add_trace_id(sb, hi, lo): i64 {
+    return agnosai_otlp_add_trace_id_a(default_alloc(), sb, hi, lo);
+}
+
 # Append a span id: 16 lowercase hex digits.
-fn agnosai_otlp_add_span_id(sb, id): i64 {
-    _agnosai_otlp_add_hex(sb, id, 16);
+fn agnosai_otlp_add_span_id_a(a, sb, id): i64 {
+    _agnosai_otlp_add_hex_a(a, sb, id, 16);
     return 0;
+}
+
+# Global-allocator form of `agnosai_otlp_add_span_id_a`, for a builder that was
+# constructed with a bare `str_builder_new()`.
+fn agnosai_otlp_add_span_id(sb, id): i64 {
+    return agnosai_otlp_add_span_id_a(default_alloc(), sb, id);
 }
 
 # --- attributes -----------------------------------------------------------
@@ -144,44 +240,52 @@ fn agnosai_otlp_add_span_id(sb, id): i64 {
 # The value goes through `str_builder_add_json_str` (`lib/str.cyr:114`), which
 # emits its own quotes and escapes — a model name or tool name is caller data
 # and can carry a quote or a control byte.
-fn _agnosai_otlp_attr_str(sb, k, v: Str): i64 {
-    str_builder_add_cstr(sb, "{\"key\":\"");
-    str_builder_add_cstr(sb, k);
-    str_builder_add_cstr(sb, "\",\"value\":{\"stringValue\":");
-    str_builder_add_json_str(sb, v);
-    str_builder_add_cstr(sb, "}}");
+fn _agnosai_otlp_attr_str_a(a, sb, k, v: Str): i64 {
+    str_builder_add_cstr_a(a, sb, "{\"key\":\"");
+    str_builder_add_cstr_a(a, sb, k);
+    str_builder_add_cstr_a(a, sb, "\",\"value\":{\"stringValue\":");
+    _agnosai_otlp_json_str_a(a, sb, v);
+    str_builder_add_cstr_a(a, sb, "}}");
     return 0;
+}
+
+fn _agnosai_otlp_attr_str(sb, k, v: Str): i64 {
+    return _agnosai_otlp_attr_str_a(default_alloc(), sb, k, v);
 }
 
 # One integer attribute: `{"key":"k","value":{"intValue":"42"}}`.
 #
 # ⚠ The value is QUOTED. See the module header — a bare number is the silent
 # failure the JSON mapping exists to prevent.
-fn _agnosai_otlp_attr_int(sb, k, v): i64 {
-    str_builder_add_cstr(sb, "{\"key\":\"");
-    str_builder_add_cstr(sb, k);
-    str_builder_add_cstr(sb, "\",\"value\":{\"intValue\":\"");
-    str_builder_add_int(sb, v);
-    str_builder_add_cstr(sb, "\"}}");
+fn _agnosai_otlp_attr_int_a(a, sb, k, v): i64 {
+    str_builder_add_cstr_a(a, sb, "{\"key\":\"");
+    str_builder_add_cstr_a(a, sb, k);
+    str_builder_add_cstr_a(a, sb, "\",\"value\":{\"intValue\":\"");
+    str_builder_add_int_a(a, sb, v);
+    str_builder_add_cstr_a(a, sb, "\"}}");
     return 0;
+}
+
+fn _agnosai_otlp_attr_int(sb, k, v): i64 {
+    return _agnosai_otlp_attr_int_a(default_alloc(), sb, k, v);
 }
 
 # Append one string attribute from the span, with a leading comma when anything
 # has already been written. Returns the updated "have written one" flag.
-fn _agnosai_otlp_emit_str(sb, span, key, wrote): i64 {
+fn _agnosai_otlp_emit_str_a(a, sb, span, key, wrote): i64 {
     var v = agnosai_genai_span_attr_str(span, key);
     if (v == 0) { return wrote; }
-    if (wrote == 1) { str_builder_add_cstr(sb, ","); }
-    _agnosai_otlp_attr_str(sb, key, v);
+    if (wrote == 1) { str_builder_add_cstr_a(a, sb, ","); }
+    _agnosai_otlp_attr_str_a(a, sb, key, v);
     return 1;
 }
 
 # The same for an integer attribute. -1 means unset and emits nothing.
-fn _agnosai_otlp_emit_int(sb, span, key, wrote): i64 {
+fn _agnosai_otlp_emit_int_a(a, sb, span, key, wrote): i64 {
     var v = agnosai_genai_span_attr_int(span, key);
     if (v < 0) { return wrote; }
-    if (wrote == 1) { str_builder_add_cstr(sb, ","); }
-    _agnosai_otlp_attr_int(sb, key, v);
+    if (wrote == 1) { str_builder_add_cstr_a(a, sb, ","); }
+    _agnosai_otlp_attr_int_a(a, sb, key, v);
     return 1;
 }
 
@@ -207,9 +311,10 @@ fn agnosai_otlp_span_kind(span): i64 {
 # omitted rather than sent as null, because OTLP has no null attribute value and
 # a collector reading one drops the whole span.
 fn agnosai_otlp_span_json(span, ctx): i64 {
-    var sb = str_builder_new();
-    _agnosai_otlp_span_json_into(sb, span, ctx);
-    return str_builder_build(sb);
+    var a = default_alloc();
+    var sb = str_builder_new_a(a);
+    _agnosai_otlp_span_json_into_a(a, sb, span, ctx);
+    return str_builder_build_a(a, sb);
 }
 
 # The body of `agnosai_otlp_span_json`, writing into a caller-supplied builder.
@@ -217,39 +322,43 @@ fn agnosai_otlp_span_json(span, ctx): i64 {
 # Split out so the ring can encode straight into its fragment arena — the
 # convenience wrapper above allocates on the global, which is exactly what the
 # ring exists to avoid.
-fn _agnosai_otlp_span_json_into(sb, span, ctx): i64 {
-    str_builder_add_cstr(sb, "{\"traceId\":\"");
-    agnosai_otlp_add_trace_id(sb, load64(ctx + AGN_OTC_TRACE_HI),
+fn _agnosai_otlp_span_json_into_a(a, sb, span, ctx): i64 {
+    str_builder_add_cstr_a(a, sb, "{\"traceId\":\"");
+    agnosai_otlp_add_trace_id_a(a, sb, load64(ctx + AGN_OTC_TRACE_HI),
     load64(ctx + AGN_OTC_TRACE_LO));
-    str_builder_add_cstr(sb, "\",\"spanId\":\"");
-    agnosai_otlp_add_span_id(sb, load64(ctx + AGN_OTC_SPAN_ID));
-    str_builder_add_cstr(sb, "\",\"name\":");
-    str_builder_add_json_str(sb, str_from(agnosai_genai_span_name(span)));
-    str_builder_add_cstr(sb, ",\"kind\":");
-    str_builder_add_int(sb, agnosai_otlp_span_kind(span));
-    str_builder_add_cstr(sb, ",\"startTimeUnixNano\":\"");
-    str_builder_add_int(sb, load64(ctx + AGN_OTC_START_NS));
-    str_builder_add_cstr(sb, "\",\"endTimeUnixNano\":\"");
-    str_builder_add_int(sb, load64(ctx + AGN_OTC_END_NS));
-    str_builder_add_cstr(sb, "\",\"attributes\":[");
+    str_builder_add_cstr_a(a, sb, "\",\"spanId\":\"");
+    agnosai_otlp_add_span_id_a(a, sb, load64(ctx + AGN_OTC_SPAN_ID));
+    str_builder_add_cstr_a(a, sb, "\",\"name\":");
+    # ⚠ `str_from_a`, not `str_from`. A bare `str_from` here was the LAST
+    # per-span allocation on the no-free global bump after the arena threading
+    # landed — 16 bytes of Str header per span, measured, and the only thing
+    # standing between a 1-span cycle and 0 global bytes.
+    _agnosai_otlp_json_str_a(a, sb, str_from_a(a, agnosai_genai_span_name(span)));
+    str_builder_add_cstr_a(a, sb, ",\"kind\":");
+    str_builder_add_int_a(a, sb, agnosai_otlp_span_kind(span));
+    str_builder_add_cstr_a(a, sb, ",\"startTimeUnixNano\":\"");
+    str_builder_add_int_a(a, sb, load64(ctx + AGN_OTC_START_NS));
+    str_builder_add_cstr_a(a, sb, "\",\"endTimeUnixNano\":\"");
+    str_builder_add_int_a(a, sb, load64(ctx + AGN_OTC_END_NS));
+    str_builder_add_cstr_a(a, sb, "\",\"attributes\":[");
 
     var wrote = 0;
-    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_OPERATION_NAME, wrote);
-    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_SYSTEM, wrote);
-    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_REQUEST_MODEL, wrote);
-    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_RESPONSE_MODEL, wrote);
-    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_AGENT_NAME, wrote);
-    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_TASK_ID, wrote);
-    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_TOOL_NAME, wrote);
-    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_CREW_ID, wrote);
-    wrote = _agnosai_otlp_emit_str(sb, span, AGNOSAI_GENAI_CREW_NAME, wrote);
-    wrote = _agnosai_otlp_emit_int(sb, span, AGNOSAI_GENAI_USAGE_INPUT_TOKENS, wrote);
-    wrote = _agnosai_otlp_emit_int(sb, span, AGNOSAI_GENAI_USAGE_OUTPUT_TOKENS, wrote);
-    wrote = _agnosai_otlp_emit_int(sb, span, AGNOSAI_GENAI_CREW_TASK_COUNT, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_OPERATION_NAME, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_SYSTEM, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_REQUEST_MODEL, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_RESPONSE_MODEL, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_AGENT_NAME, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_TASK_ID, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_TOOL_NAME, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_CREW_ID, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_CREW_NAME, wrote);
+    wrote = _agnosai_otlp_emit_int_a(a, sb, span, AGNOSAI_GENAI_USAGE_INPUT_TOKENS, wrote);
+    wrote = _agnosai_otlp_emit_int_a(a, sb, span, AGNOSAI_GENAI_USAGE_OUTPUT_TOKENS, wrote);
+    wrote = _agnosai_otlp_emit_int_a(a, sb, span, AGNOSAI_GENAI_CREW_TASK_COUNT, wrote);
 
-    str_builder_add_cstr(sb, "],\"status\":{\"code\":");
-    str_builder_add_int(sb, load64(ctx + AGN_OTC_STATUS));
-    str_builder_add_cstr(sb, "}}");
+    str_builder_add_cstr_a(a, sb, "],\"status\":{\"code\":");
+    str_builder_add_int_a(a, sb, load64(ctx + AGN_OTC_STATUS));
+    str_builder_add_cstr_a(a, sb, "}}");
     return 0;
 }
 
@@ -257,17 +366,26 @@ fn _agnosai_otlp_span_json_into(sb, span, ctx): i64 {
 #
 # `frags` is an array of `n` Str pointers. The `service.name` resource attribute
 # is what a backend groups by, so it is the one attribute the resource carries.
-fn agnosai_otlp_build_batch(service_name: Str, frags, n): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "{\"resourceSpans\":[{\"resource\":{\"attributes\":[");
-    _agnosai_otlp_attr_str(sb, "service.name", service_name);
-    str_builder_add_cstr(sb, "]},\"scopeSpans\":[{\"scope\":{\"name\":\"agnosai\"},\"spans\":[");
+fn agnosai_otlp_build_batch_a(a, service_name: Str, frags, n): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "{\"resourceSpans\":[{\"resource\":{\"attributes\":[");
+    _agnosai_otlp_attr_str_a(a, sb, "service.name", service_name);
+    str_builder_add_cstr_a(a, sb, "]},\"scopeSpans\":[{\"scope\":{\"name\":\"agnosai\"},\"spans\":[");
     for (var i = 0; i < n; i = i + 1) {
-        if (i > 0) { str_builder_add_cstr(sb, ","); }
-        str_builder_add(sb, load64(frags + i * 8));
+        if (i > 0) { str_builder_add_cstr_a(a, sb, ","); }
+        str_builder_add_a(a, sb, load64(frags + i * 8));
     }
-    str_builder_add_cstr(sb, "]}]}]}");
-    return str_builder_build(sb);
+    str_builder_add_cstr_a(a, sb, "]}]}]}");
+    return str_builder_build_a(a, sb);
+}
+
+# Global-allocator form of `agnosai_otlp_build_batch_a`.
+#
+# ⚠ The ring does NOT use this — `agnosai_otlp_ring_drain` builds the same
+# document straight into its `doc_arena`. This form exists for the encoder tests,
+# which assert the wire bytes without standing up a ring.
+fn agnosai_otlp_build_batch(service_name: Str, frags, n): i64 {
+    return agnosai_otlp_build_batch_a(default_alloc(), service_name, frags, n);
 }
 
 # --- endpoint parsing -----------------------------------------------------
@@ -337,9 +455,26 @@ fn agnosai_otlp_path(url): i64 {
 # single process can actually produce.
 var AGNOSAI_OTLP_RING_MAX = 256;
 
-# Per-arena capacity in bytes. A batch of 256 spans at ~400 bytes each is
-# ~100 KB; 256 KiB leaves room for outliers before the spill policy engages.
-var AGNOSAI_OTLP_ARENA_BYTES = 262144;
+# Per-arena capacity in bytes, sized from the RING's capacity so a full ring
+# never spills.
+#
+# ⚠ **Size this against amplified cost, not final size.** `str_builder` starts
+# at a 64-byte inline buffer and doubles, and an arena has no free — so every
+# intermediate buffer stays. Measured 2026-08-12: a span fragment of ~700 bytes
+# costs **2,736 bytes** of arena (64+128+256+512+1024 of abandoned grows, plus
+# the built copy). Flat across 1, 10, 32 and 64 spans.
+#
+# 256 slots x 2,736 B = ~700 KB, so 768 KiB covers a completely full ring with
+# headroom. The previous 256 KiB held ~95 spans and then spilled — and
+# ARENA_FULL_SPILL spills to the **no-free global bump**, which is the leak this
+# module was fixed for. Measured at 128 spans on the old size: 180,928 bytes
+# spilled to the global in a single cycle.
+#
+# ⚠ The cost is VIRTUAL, not resident: arena chunks are anonymous overcommitted
+# mmaps and only touched pages count against RSS (`lib/alloc.cyr:150-155`). Two
+# arenas at 768 KiB is 1.5 MB of address space reserved once at startup, against
+# the per-operation global-bump growth it removes.
+var AGNOSAI_OTLP_ARENA_BYTES = 786432;
 
 # Ring heap layout — 56 bytes.
 enum AgnosaiOtlpRingOff {
@@ -427,9 +562,10 @@ fn agnosai_otlp_ring_enqueue(r, span, ctx): i64 {
     var lock = load64(r + AGN_OTR_LOCK);
     mutex_lock(lock);
 
-    var sb = str_builder_new_a(load64(r + AGN_OTR_FRAG_ARENA));
-    _agnosai_otlp_span_json_into(sb, span, ctx);
-    var frag = str_builder_build(sb);
+    var fa = load64(r + AGN_OTR_FRAG_ARENA);
+    var sb = str_builder_new_a(fa);
+    _agnosai_otlp_span_json_into_a(fa, sb, span, ctx);
+    var frag = str_builder_build_a(fa, sb);
 
     var head = load64(r + AGN_OTR_HEAD);
     store64(load64(r + AGN_OTR_SLOTS) + (head % AGNOSAI_OTLP_RING_MAX) * 8, frag);
@@ -468,15 +604,17 @@ fn agnosai_otlp_ring_drain(r, service_name: Str): i64 {
     reset_via(doc_arena);
 
     var sb = str_builder_new_a(doc_arena);
-    str_builder_add_cstr(sb, "{\"resourceSpans\":[{\"resource\":{\"attributes\":[");
-    _agnosai_otlp_attr_str(sb, "service.name", service_name);
-    str_builder_add_cstr(sb, "]},\"scopeSpans\":[{\"scope\":{\"name\":\"agnosai\"},\"spans\":[");
+    str_builder_add_cstr_a(doc_arena, sb, "{\"resourceSpans\":[{\"resource\":{\"attributes\":[");
+    _agnosai_otlp_attr_str_a(doc_arena, sb, "service.name", service_name);
+    str_builder_add_cstr_a(doc_arena, sb,
+    "]},\"scopeSpans\":[{\"scope\":{\"name\":\"agnosai\"},\"spans\":[");
     for (var i = 0; i < n; i = i + 1) {
-        if (i > 0) { str_builder_add_cstr(sb, ","); }
-        str_builder_add(sb, load64(slots + ((head - n + i) % AGNOSAI_OTLP_RING_MAX) * 8));
+        if (i > 0) { str_builder_add_cstr_a(doc_arena, sb, ","); }
+        str_builder_add_a(doc_arena, sb,
+        load64(slots + ((head - n + i) % AGNOSAI_OTLP_RING_MAX) * 8));
     }
-    str_builder_add_cstr(sb, "]}]}]}");
-    var doc = str_builder_build(sb);
+    str_builder_add_cstr_a(doc_arena, sb, "]}]}]}");
+    var doc = str_builder_build_a(doc_arena, sb);
 
     # The fragments are copied into `doc` now, so the arena that held them can
     # go back to zero before any other thread gets the lock.
@@ -560,10 +698,112 @@ fn agnosai_otlp_exporter_stopping(e): i64 {
 # ⚠ Not reachable from the suite: it needs a listening collector. Everything
 # that decides *what* to send is in `drain` and the encoder, which are tested
 # byte-for-byte; this function only moves bytes. Recorded in roadmap section E.
+# --- OTEL_EXPORTER_OTLP_HEADERS -------------------------------------------
+#
+# ⚠ **Without this, no hosted collector is reachable.** Honeycomb, Grafana Cloud
+# and Datadog all authenticate through a header carried in this variable, and
+# the module read only `OTEL_EXPORTER_OTLP_ENDPOINT` — so the exporter worked
+# against an unauthenticated local sidecar and against nothing else.
+#
+# ⚠ There is **no oracle counterpart to port from**:
+# `rust-old/src/telemetry/mod.rs:50` hands the whole transport to
+# `hoosh::telemetry::init_otel`, so the oracle never implements headers, paths
+# or retry — it inherits them from an SDK. ADR 003 keeps hoosh as a remote seam
+# rather than linking it, so this file is port-original and its bar is the
+# OTLP/HTTP spec, not a Rust line.
+#
+# Format is the spec's: `key1=value1,key2=value2`. Whitespace around either side
+# is trimmed; an entry with no `=` is skipped.
+var AGNOSAI_OTLP_HDR_MAX = 16;
+var AGNOSAI_OTLP_HDR_KEY_MAX = 128;
+var AGNOSAI_OTLP_HDR_VAL_MAX = 512;
+
+# Parse `OTEL_EXPORTER_OTLP_HEADERS` onto `h`. Returns the number added.
+#
+# ⚠ An over-long key or value is **SKIPPED, never truncated**. These carry API
+# tokens: a truncated token authenticates as nothing and fails at the collector
+# with a 401 that looks like a credential problem rather than a parser one.
+fn _agnosai_otlp_add_env_headers(h): i64 {
+    var raw = getenv("OTEL_EXPORTER_OTLP_HEADERS");
+    if (raw == 0) { return 0; }
+
+    var kbuf[128];
+    var vbuf[512];
+    var kp = &kbuf;
+    var vp = &vbuf;
+    var i = 0;
+    var n = 0;
+
+    while (load8(raw + i) != 0 && n < AGNOSAI_OTLP_HDR_MAX) {
+        while (load8(raw + i) == 32 || load8(raw + i) == 44) { i = i + 1; }
+        if (load8(raw + i) == 0) { return n; }
+
+        var kl = 0;
+        var kover = 0;
+        while (load8(raw + i) != 0 && load8(raw + i) != 61 && load8(raw + i) != 44) {
+            if (kl < AGNOSAI_OTLP_HDR_KEY_MAX - 1) {
+                store8(kp + kl, load8(raw + i));
+                kl = kl + 1;
+            } else { kover = 1; }
+            i = i + 1;
+        }
+        while (kl > 0 && load8(kp + kl - 1) == 32) { kl = kl - 1; }
+        store8(kp + kl, 0);
+
+        if (load8(raw + i) == 61) {
+            i = i + 1;
+            while (load8(raw + i) == 32) { i = i + 1; }
+
+            var vl = 0;
+            var vover = 0;
+            while (load8(raw + i) != 0 && load8(raw + i) != 44) {
+                if (vl < AGNOSAI_OTLP_HDR_VAL_MAX - 1) {
+                    store8(vp + vl, load8(raw + i));
+                    vl = vl + 1;
+                } else { vover = 1; }
+                i = i + 1;
+            }
+            while (vl > 0 && load8(vp + vl - 1) == 32) { vl = vl - 1; }
+            store8(vp + vl, 0);
+
+            if (kl > 0 && vl > 0 && kover == 0 && vover == 0) {
+                sandhi_headers_add(h, kp, vp);
+                n = n + 1;
+            }
+        }
+    }
+    return n;
+}
+
+# The URL to POST to: the configured endpoint, with `/v1/traces` appended when
+# it carries no path of its own.
+#
+# ⚠ **`agnosai_otlp_path` existed for this and had ZERO production callers** —
+# only five assertions in `tests/telemetry_otlp.tcyr`. `_agnosai_otlp_post`
+# posted `str_cstr(endpoint)` raw, so the documented deployment
+# (`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`, the sidecar form this
+# module's own header describes) sent `POST /` and every collector answered 404.
+# The whole telemetry tier was silently non-functional. Fixed 2026-08-12.
+#
+# An endpoint that already names a path is passed through untouched — the OTLP
+# spec treats `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` as complete, and appending to
+# it would produce `/v1/traces/v1/traces`.
+fn _agnosai_otlp_post_url(a, endpoint: Str): Str {
+    var raw = str_cstr(endpoint);
+    if (agnosai_otlp_path(raw) != AGNOSAI_OTLP_DEFAULT_PATH) { return endpoint; }
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, endpoint);
+    str_builder_add_cstr_a(a, sb, AGNOSAI_OTLP_DEFAULT_PATH);
+    return str_builder_build_a(a, sb);
+}
+
 fn _agnosai_otlp_post(endpoint: Str, doc: Str): i64 {
+    var a = default_alloc();
+    var url = _agnosai_otlp_post_url(a, endpoint);
     var h = sandhi_headers_new();
     sandhi_headers_add(h, "Content-Type", "application/json");
-    sandhi_http_post(str_cstr(endpoint), h, str_data(doc), str_len(doc));
+    _agnosai_otlp_add_env_headers(h);
+    sandhi_http_post(str_cstr(url), h, str_data(doc), str_len(doc));
     return 0;
 }
 

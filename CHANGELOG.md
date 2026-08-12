@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — OTLP export was silently non-functional, and leaked every span it encoded
+
+Three defects in `src/telemetry/otlp.cyr`, found by the 2026-08-12 P(-1) sweep.
+⚠ **There is no oracle counterpart to any of this**: `rust-old/src/telemetry/mod.rs:50`
+hands the whole transport to `hoosh::telemetry::init_otel`, and ADR 003 keeps hoosh
+a remote seam rather than linking it — so this file is port-original and its bar is
+the OTLP/HTTP spec, not a Rust line.
+
+- **The exporter POSTed to the collector ROOT, so nothing was ever ingested.**
+  `_agnosai_otlp_post` sent `str_cstr(endpoint)` raw. `agnosai_otlp_path` — which
+  exists solely to append the spec's `/v1/traces` — **had zero production
+  callers**, only five assertions in `tests/telemetry_otlp.tcyr`. The documented
+  deployment (`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`, the sidecar
+  form this module's own header describes) received `POST /` and 404'd.
+  `_agnosai_otlp_post_url` now appends the path when the endpoint carries none
+  and passes a path-bearing endpoint through untouched, so a
+  `..._TRACES_ENDPOINT` is not doubled into `/v1/traces/v1/traces`.
+
+- **`OTEL_EXPORTER_OTLP_HEADERS` was unread, so no hosted collector was
+  reachable.** Honeycomb, Grafana Cloud and Datadog all authenticate through it.
+  Now parsed per the spec (`key=value` pairs, comma-separated, whitespace
+  trimmed). ⚠ An over-long key or value is **skipped, never truncated** — these
+  carry API tokens, and a truncated token fails at the collector as a 401 that
+  reads like a credential problem rather than a parser one.
+
+- **Both 256 KiB ring arenas held only builder headers; every span fragment and
+  batch document went to the no-free global bump.** A `str_builder` does not
+  remember its allocator — the header is 24 bytes (`lib/str.cyr:428`) — so
+  `str_builder_new_a(arena)` charged the arena 88 bytes and the module's **29
+  bare `str_builder_add*` and 4 bare `str_builder_build`** calls all grew through
+  `default_alloc()`. `lib/str.cyr:433` states the contract; this module never
+  honoured it. The encoder, escaper, hex writer and batch builder are now
+  threaded end to end.
+
+  `str_builder_putc` and `str_builder_add_json_str` have **no `_a` form**
+  upstream, so `_agnosai_otlp_putc_a` and `_agnosai_otlp_json_str_a` are
+  port-local stand-ins. The escaper is byte-for-byte the stdlib's — the suites
+  assert the wire, and all four telemetry suites passed unchanged.
+
+### Performance
+
+- **OTLP export: ~2,736 bytes per span on the no-free global bump → 0.** Measured
+  across a full enqueue+drain cycle at 1, 10, 32, 64, 128 and **256** spans (the
+  ring's whole capacity): **0 bytes** at every rate, against ~1,496 B/span
+  before. The residual 16 B in an earlier reading was the probe's own `str_from`,
+  not the module's.
+
+  **Time cost of the threading, measured A/B on the same tree** (the new
+  `benches/telemetry.bcyr`, 20,000 iterations each):
+
+  | shape | before | after | |
+  |---|---|---|---|
+  | `ring_enqueue` + periodic drain — **the production path** | 16.805 µs | **15.712 µs** | **−6.5%** |
+  | `agnosai_otlp_span_json` — global form, encoder tests only | 11.964 µs | 13.112 µs | +9.6% |
+
+  The production path got **faster**: arena bump allocation beats the global
+  allocator by more than the vtable indirection costs. The convenience wrapper
+  got ~10% slower because it now dispatches through an allocator handle where it
+  used to call `default_alloc()` directly — it is on no production path, and
+  paying there to make the ring both leak-free and faster is the right trade.
+
+  `AGNOSAI_OTLP_ARENA_BYTES` 256 KiB → **768 KiB**, sized from
+  `AGNOSAI_OTLP_RING_MAX` rather than from final document size. ⚠ A span fragment
+  of ~700 bytes costs **2,736 bytes of arena** — `str_builder` doubles from a
+  64-byte inline buffer and an arena has no free, so every abandoned intermediate
+  stays. At 256 KiB the arena held ~95 spans and then spilled, and
+  `ARENA_FULL_SPILL` spills to the global bump — reintroducing the leak at
+  exactly the load that matters. Measured: 180,928 bytes spilled in one cycle at
+  128 spans on the old size. The cost is virtual, not resident (anonymous
+  overcommitted mmap; only touched pages count).
+
+### Added
+
+- **`tests/telemetry_otlp.tcyr` gains an allocator assertion — it had none**,
+  which is why the un-threaded builders shipped. 115 → **122 assertions**:
+  zero-global-bytes over a 64-span cycle, the same over a **full ring** (so an
+  undersized arena cannot silently reintroduce the spill), and four
+  `_agnosai_otlp_post_url` cases.
+
+  ⚠ **Mutation-verified, and the first version of the comment overclaimed.**
+  Four mutations killed it — `str_builder_build_a` → `build` on either arena,
+  the escaper reverted to the stdlib's, and `str_from_a` → `str_from`. One
+  **survived**: reverting a single short `str_builder_add_cstr_a`, because
+  `_sb_grow` only allocates when capacity is exceeded, so an append into an
+  already-grown buffer never reaches the allocator. The test says so rather than
+  claiming to catch everything.
+
 ### Changed
 
 - **Toolchain pinned to cyrius 6.5.20** (was 6.5.19). Full three-step, `lib/`

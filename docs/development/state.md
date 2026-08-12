@@ -149,8 +149,9 @@ assertions, and have zero production call sites. A green suite plus 100% coverag
 did not catch any of them, because *reference* coverage counts whether a symbol is
 named by a **test**, which these all are.
 
-0a. **The OTLP exporter posts to the collector ROOT, so the whole telemetry tier
-    is silently non-functional in the documented configuration.**
+0a. ✅ **FIXED 2026-08-12.** **The OTLP exporter posted to the collector ROOT, so
+    the whole telemetry tier was silently non-functional in the documented
+    configuration.**
     `_agnosai_otlp_post` (`src/telemetry/otlp.cyr:563`) calls
     `sandhi_http_post(str_cstr(endpoint), …)` on the raw configured endpoint.
     **`agnosai_otlp_path` (`:290`) — which exists solely to append the spec's
@@ -159,7 +160,8 @@ named by a **test**, which these all are.
     `http://localhost:4318` (the documented form, and what `:48`'s comment
     describes) receives `POST /` and answers 404. **One line to fix.**
 
-0a-bis. **No `OTEL_EXPORTER_OTLP_HEADERS`, so no hosted collector is reachable.**
+0a-bis. ✅ **FIXED 2026-08-12.** **No `OTEL_EXPORTER_OTLP_HEADERS`, so no hosted
+    collector was reachable.**
     `src/telemetry/mod.cyr` reads `OTEL_SERVICE_NAME` (`:84`) and
     `OTEL_EXPORTER_OTLP_ENDPOINT` (`:92`) and nothing else; every hosted collector
     (Honeycomb, Grafana Cloud, Datadog) authenticates via that header.
@@ -204,7 +206,8 @@ anonymous overcommitted mmaps and `arena_new` touches only the header
 12 MiB of VA and only the pages actually written in RSS. RSS still grows
 monotonically — the correction is to the magnitude, not to the defect.
 
-1. **`str_builder_new_a` is threaded, then every add/build is BARE — the arena
+1. 🟠 **PARTLY FIXED 2026-08-12 — `telemetry/otlp.cyr` done, `orchestrator/audit.cyr` NOT.**
+   **`str_builder_new_a` is threaded, then every add/build is BARE — the arena
    receives only the 88-byte header.** The builder struct is 24 bytes
    `{buf,len,cap}` and **stores no allocator** (`lib/str.cyr:428`), so bare
    `_sb_grow` and `str_builder_build` hardcode `default_alloc()`. `lib/str.cyr:433`
@@ -216,7 +219,7 @@ monotonically — the correction is to the magnitude, not to the defect.
    | `server/routes/sse.cyr` | 3 | 0 / 10 | 0 / 3 | ✅ clean |
    | `server/routes/mcp.cyr` | 2 | 0 / 5 | 0 / 2 | ✅ clean |
    | `server/routes/approval.cyr` | 1 | 0 / 7 | 0 / 2 | ✅ clean |
-   | **`telemetry/otlp.cyr`** | 2 | **29 / 0** | **4 / 0** | 🔴 totally un-threaded |
+   | `telemetry/otlp.cyr` | 2 | 0 / 33 | 0 / 4 | ✅ fixed 2026-08-12 |
    | **`orchestrator/audit.cyr`** | 2 | **5** / 3 | **1** / 2 | 🟠 partial |
 
    Measured cost in otlp: **~3.9 KB permanently leaked per exported span**, and
@@ -1135,11 +1138,18 @@ Rust oracle for comparison: **863 unit + 2 integration + 1 doctest, all passing.
 
 ## Benchmarks
 
-**10 `.bcyr` files, 199 rows per sweep, all compiling — re-run 2026-08-12 on
-6.5.20: `10 passed, 0 failed`, and a row-by-row diff against the pre-bump sweep
-shows 199/199 ids in common with ZERO regressions past 15% and one improvement
-(`prompt_scan_clean_500b`, 95,555 → 63,109 ns, −34.0%). Previously verified
-2026-08-11** — against 106 rows and three non-compiling files that morning. See
+**11 `.bcyr` files, 207 rows per sweep, all compiling — re-run 2026-08-12 on
+6.5.20 after the OTLP fix: `11 passed, 0 failed`. `benches/telemetry.bcyr` is NEW (8 ids) — `grep
+'agnosai_otlp_' benches/*.bcyr` was empty, so the span encoder every instrumented
+operation crosses had never been timed.
+
+Row-by-row against the pre-bump sweep: 199/199 prior ids in common, ZERO
+regressions past 15% on the toolchain bump, one improvement
+(`prompt_scan_clean_500b`, 95,555 → 63,109 ns, −34.0%). After the OTLP fix, two
+ids move past 15% — `default_model_premium` 40 → 54 ns and `metrics_record_task`
+4 → 5 ns. ⚠ Both are **noise, not regressions**: sub-100 ns shapes against a
+measured ~1.3 µs timer floor, where one nanosecond is 25%, and neither is on the
+telemetry path. Previously verified 2026-08-11** — against 106 rows and three non-compiling files that morning. See
 the Tests section for how they had stopped. `benches/llm.bcyr`,
 `benches/fleet.bcyr` and `benches/definitions.bcyr` are new; `llm` was the first
 to touch `src/llm/` at all, and `harness.bcyr` is the relocated `noop` floor.

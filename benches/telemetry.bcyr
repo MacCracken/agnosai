@@ -1,0 +1,159 @@
+# =========================================================================
+# telemetry.bcyr — benchmarks for the telemetry group.
+#
+# ⚠ **No bench had ever timed `src/telemetry/`.** `grep 'agnosai_otlp_'
+# benches/*.bcyr` came back empty on 2026-08-12, so the span encoder — which
+# every instrumented operation crosses — had no number at all, and the arena
+# threading landed that day could have regressed it invisibly.
+#
+# There is NO oracle bench file to reproduce: `rust-old/benches/` has nothing
+# for telemetry, because the oracle hands the whole transport to
+# `hoosh::telemetry::init_otel` (`rust-old/src/telemetry/mod.rs:50`). ADR 003
+# keeps hoosh a remote seam rather than linking it, so `otlp.cyr` is
+# port-original and these shapes are chosen from what it actually does.
+#
+# ⚠ **What the threading change was expected to cost.** Every builder call now
+# passes an allocator and dispatches through its vtable, where before it went
+# straight to `default_alloc()`. That is real indirection on a hot path, and the
+# reason `encode_span` and `ring_enqueue` are measured separately: the first
+# isolates the encoder, the second adds the lock and the arena.
+#
+# ⚠ **`drain` is measured at two ring depths** so the slope stays legible. It
+# concatenates every queued fragment, so it is linear in queue depth by
+# construction; a single depth could hide a change in the constant.
+#
+# These numbers start the CYRIUS baseline. They are NOT comparable to
+# rust-old/bench-history.csv. See CLAUDE.md.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/core/mod.cyr"
+include "src/telemetry/genai.cyr"
+include "src/telemetry/otlp.cyr"
+
+# One fully-populated inference span. Built once so the loops measure encoding
+# rather than construction.
+fn _b_tel_span(): i64 {
+    var s = agnosai_genai_inference_span(str_from("gpt-4o"), str_from("openai"),
+    str_from("bench-agent"), str_from("task-1"));
+    agnosai_genai_record_usage(s, 1234, 567, str_from("gpt-4o"));
+    return s;
+}
+
+fn _b_tel_ctx(): i64 {
+    return agnosai_otlp_ctx_new(0x0123456789abcdef, 0xfedcba9876543210,
+    0x1122334455667788, 1000000, 2000000, AGNOSAI_OTLP_STATUS_OK);
+}
+
+# The encoder alone, on the global allocator — the `agnosai_otlp_span_json`
+# convenience form the encoder tests use.
+fn _b_tel_encode_span(): i64 {
+    var span = _b_tel_span();
+    var ctx = _b_tel_ctx();
+    var n = 20000;
+    var b = bench_new("otlp_encode_span");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { agnosai_otlp_span_json(span, ctx); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Encode + queue through the ring: the production path, so it carries the mutex
+# and the arena-threaded builders.
+fn _b_tel_ring_enqueue(): i64 {
+    var r = agnosai_otlp_ring_new();
+    var span = _b_tel_span();
+    var ctx = _b_tel_ctx();
+    var svc = str_from("bench-svc");
+    var n = 20000;
+    var b = bench_new("otlp_ring_enqueue");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_otlp_ring_enqueue(r, span, ctx);
+        # Drain on the ring's own capacity so the arena is recycled rather than
+        # spilling — spilling measures the global allocator, not this path.
+        if (i % AGNOSAI_OTLP_RING_MAX == 0) { agnosai_otlp_ring_drain(r, svc); }
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# Drain at a fixed queue depth. `depth` spans are queued, then one drain is
+# timed; repeated so the mean is stable.
+fn _b_tel_ring_drain(depth, name): i64 {
+    var r = agnosai_otlp_ring_new();
+    var span = _b_tel_span();
+    var ctx = _b_tel_ctx();
+    var svc = str_from("bench-svc");
+    var rounds = 200;
+    var b = bench_new(name);
+    for (var k = 0; k < rounds; k = k + 1) {
+        for (var i = 0; i < depth; i = i + 1) { agnosai_otlp_ring_enqueue(r, span, ctx); }
+        bench_start(b);
+        agnosai_otlp_ring_drain(r, svc);
+        bench_stop(b);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# The JSON escaper, on a value that actually escapes. The clean path and the
+# escaping path are different loops, so both are worth a number.
+fn _b_tel_json_escape(clean, name): i64 {
+    var a = default_alloc();
+    var v = str_from("plain agent name");
+    if (clean == 0) { v = str_from("quote\" backslash\\ newline\n tab\t ctl\x01"); }
+    var n = 50000;
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) {
+        var sb = str_builder_new_a(a);
+        _agnosai_otlp_json_str_a(a, sb, v);
+        str_builder_build_a(a, sb);
+    }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# The POST URL construction added when the missing `/v1/traces` was fixed. It
+# runs once per export, so it only has to be not-slow — but it allocates, and an
+# unmeasured allocation on the export path is how the last one got missed.
+fn _b_tel_post_url(): i64 {
+    var a = default_alloc();
+    var bare = str_from("http://localhost:4318");
+    var pathed = str_from("http://localhost:4318/v1/traces");
+    var n = 50000;
+    var b = bench_new("otlp_post_url_append");
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { _agnosai_otlp_post_url(a, bare); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+
+    var b2 = bench_new("otlp_post_url_passthrough");
+    bench_batch_start(b2);
+    for (var j = 0; j < n; j = j + 1) { _agnosai_otlp_post_url(a, pathed); }
+    bench_batch_stop(b2, n);
+    bench_report(b2);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    _b_tel_encode_span();
+    _b_tel_ring_enqueue();
+    _b_tel_ring_drain(16, "otlp_ring_drain_16");
+    _b_tel_ring_drain(256, "otlp_ring_drain_256");
+    _b_tel_json_escape(1, "otlp_json_escape_clean");
+    _b_tel_json_escape(0, "otlp_json_escape_escaping");
+    _b_tel_post_url();
+
+    return 0;
+}
