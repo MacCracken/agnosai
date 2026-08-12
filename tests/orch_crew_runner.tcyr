@@ -45,6 +45,7 @@ include "src/llm/router.cyr"
 include "src/orchestrator/scoring.cyr"
 include "src/orchestrator/output_validation.cyr"
 include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
 include "src/chan_lossy.cyr"
 include "src/server/sse.cyr"
 include "src/server/prometheus.cyr"
@@ -901,6 +902,64 @@ fn main() {
     assert_eq(agnosai_audit_chain_count(au2), 0,
     "the PARALLEL path audits nothing — only run_sequential calls audit_record in the oracle, and \
     making the others audit would change what a consumer's trail contains");
+
+    # --- output_filter is WIRED (ADR 020) ------------------------------------
+    #
+    # ⚠ This is a DELIBERATE DIVERGENCE. The oracle never calls `output_filter`:
+    # `rust-old/src/server/mod.rs:11` is `pub mod output_filter;` and that is the
+    # module's only mention in the whole Rust tree, so the port was at parity
+    # with 20 functions and no caller. `prompt_guard` — the inbound half — IS
+    # wired in the oracle and here, which is the asymmetry ADR 020 closes.
+    #
+    # Scanning is unconditional; REDACTION is off unless AGNOSAI_OUTPUT_REDACT=1,
+    # because redaction rewrites a legitimate answer that happens to look like a
+    # secret. These assert the gate in both positions.
+    var of_agent = agnosai_agent_new(str_from("filter-agent"), str_from("tester"),
+    str_from("test output filtering"));
+    var of_task = str_from("task-of");
+    var leaky = str_from("here is the key sk-ABCDEFGHIJKLMNOPQRST0123 and mail a@b.com");
+
+    # Default: content passes through untouched, findings are only logged.
+    assert_eq(agnosai_output_redact_enabled(), 0, "redaction is OFF by default");
+    assert(str_eq(_agnosai_crew_filter_output(leaky, of_agent, of_task), leaky) == 1,
+    "with redaction off the response is returned verbatim");
+
+    # ⚠ **This is the assertion that pins the WIRING, not just the helper.** It
+    # drives `agnosai_execute_task` — the real entry point — and checks the
+    # result content changed. An earlier version of this block tested
+    # `_agnosai_crew_filter_output` directly, and a mutation that unwired the
+    # filter from `agnosai_execute_task` passed the whole suite: exactly the
+    # "built, tested, never called" failure ADR 020 exists to end.
+    #
+    # The no-client placeholder path is the offline-reachable arm; the LLM arm
+    # needs a gateway. A test process has no `setenv`, which is why the gate is a
+    # settable flag rather than a getenv.
+    #
+    # ⚠ **Mutation coverage is PARTIAL and the gap is real.** Unwiring the filter
+    # from the placeholder path fails 2 assertions; unwiring it from the LLM path
+    # in `agnosai_execute_task` passes the entire suite, because nothing offline
+    # reaches it — the same limitation `_agnosai_otlp_post` carries. Read that
+    # call site rather than trusting this suite for the LLM half.
+    agnosai_output_redact_set_enabled(1);
+    assert_eq(agnosai_output_redact_enabled(), 1, "the gate flips");
+    var of_leaky_task = agnosai_task_new(leaky);
+    var of_res = agnosai_execute_task(of_leaky_task, of_agent, 0, 0);
+    assert(str_eq(agnosai_task_result_output(of_res), leaky) == 0,
+    "agnosai_execute_task ROUTES its output through the filter — the key is gone");
+    assert(agnosai_str_contains_ci_cstr(agnosai_task_result_output(of_res),
+    "sk-ABCDEFGHIJKLMNOPQRST0123") == 0, "and specifically the API key is not present");
+    agnosai_output_redact_set_enabled(0);
+    assert_eq(agnosai_output_redact_enabled(), 0, "and flips back");
+
+    # The scan itself must actually find something, or the assertion above is
+    # vacuous — it would pass for a filter that scanned nothing at all.
+    var of_findings = agnosai_output_scan(leaky, str_from("unrelated system prompt"));
+    assert(vec_len(of_findings) > 0,
+    "and the scan DOES flag that content — otherwise the pass-through proves nothing");
+
+    # Clean content produces no findings, so the flag path is not a constant.
+    assert_eq(vec_len(agnosai_output_scan(str_from("an ordinary answer"),
+    str_from("unrelated system prompt"))), 0, "clean output flags nothing");
 
     return assert_summary();
 }

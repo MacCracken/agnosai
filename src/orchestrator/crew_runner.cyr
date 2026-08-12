@@ -353,6 +353,46 @@ fn _agnosai_crew_infer_ctx_new(client, request): i64 {
 # Local rather than reusing `orch_hierarchical`'s: that would make this module
 # depend on hierarchical for a log line, and the test file would have to include
 # a module it does not otherwise need.
+# Scan model output for leaked secrets and PII, log what it finds, and redact
+# when enabled. Returns the content to use as the task result.
+#
+# ⚠ **This is a DELIBERATE DIVERGENCE from the oracle — see ADR 020.** The
+# oracle never calls `output_filter` at all: `rust-old/src/server/mod.rs:11` is
+# `pub mod output_filter;` and that is the module's ONLY mention in the entire
+# Rust tree. The port reproduced that faithfully, so the module was 20 functions
+# with passing tests and no caller. Compare `prompt_guard`, whose oracle DOES
+# wire it (`rust-old/src/orchestrator/crew_runner.rs:651`) and which this file
+# wires at four sites — the inbound half was live while the outbound half was
+# not, which is the asymmetry this closes.
+#
+# The system prompt comes from the agent so `agnosai_contains_prompt_leak` can
+# tell a genuine leak from ordinary text, exactly as the module's own signature
+# asks for.
+fn _agnosai_crew_filter_output(content: Str, agent, task_id: Str): i64 {
+    var findings = agnosai_output_scan(content,
+    agnosai_wrap_system_prompt(_agnosai_crew_build_system_prompt(agent)));
+    var n = vec_len(findings);
+    if (n == 0) { return content; }
+
+    if (sakshi_get_level() >= SK_WARN) {
+        for (var i = 0; i < n; i = i + 1) {
+            var f = vec_get(findings, i);
+            var sb = str_builder_new();
+            str_builder_add(sb, task_id);
+            str_builder_add_cstr(sb, " category=");
+            str_builder_add(sb, agnosai_finding_category(f));
+            str_builder_add_cstr(sb, " pattern=");
+            str_builder_add(sb, agnosai_finding_pattern(f));
+            var line = str_builder_build(sb);
+            sakshi_log_kv(SK_WARN, "sensitive content in model output", 33,
+            "task_id", 7, str_data(line), str_len(line));
+        }
+    }
+
+    if (agnosai_output_redact_enabled() == 0) { return content; }
+    return agnosai_output_redact(content);
+}
+
 fn _agnosai_crew_log(level, msg, msg_len, task_id: Str, agent_label: Str): i64 {
     if (sakshi_get_level() < level) { return 0; }
     var sb = str_builder_new();
@@ -456,8 +496,23 @@ fn _agnosai_crew_build_request(task, agent, model: Str, user_msg: Str): i64 {
 #
 # Output is the task description **verbatim**, status Completed, and metadata
 # carrying exactly `task_duration_ms`. Two oracle tests pin this shape.
-fn _agnosai_crew_placeholder_result(task, start_ns): i64 {
-    var r = agnosai_task_result_new(agnosai_task_id(task), agnosai_task_description(task),
+fn _agnosai_crew_placeholder_result(task, agent, start_ns): i64 {
+    # ⚠ The placeholder ECHOES the task description, which is request input — so
+    # a key a user pasted into a description lands in crew output and the audit
+    # trail. It goes through the same filter as model output for that reason.
+    # ⚠ Filtered ONLY when redaction is enabled, unlike the LLM path which always
+    # scans. There is no model output here — the placeholder echoes the task
+    # description, which `prompt_guard` already sanitised on the way in — so the
+    # only reason to touch it is the operator's opt-in data-destruction policy.
+    # Measured: an unconditional scan costs **16.7 us** against a ~40 us/task
+    # crew path, i.e. +90% on `run_crew_10_tasks_sequential`. Paying that on a
+    # path with nothing to protect is not a trade worth making; the LLM path is
+    # network-dominated, so the same scan is noise there.
+    var placeholder = agnosai_task_description(task);
+    if (agnosai_output_redact_enabled() == 1) {
+        placeholder = _agnosai_crew_filter_output(placeholder, agent, agnosai_task_id(task));
+    }
+    var r = agnosai_task_result_new(agnosai_task_id(task), placeholder,
     AGNOSAI_STATUS_COMPLETED);
     agnosai_task_result_with_metadata(r, str_from("task_duration_ms"),
     bayan_json_v_int_new(_agnosai_crew_elapsed_ms(start_ns)));
@@ -556,7 +611,7 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
     if (client == 0) {
         _agnosai_crew_log(SK_DEBUG, "executing task (placeholder - no LLM client)", 42,
         task_id, _agnosai_crew_agent_label(agent));
-        return _agnosai_crew_placeholder_result(task, start_ns);
+        return _agnosai_crew_placeholder_result(task, agent, start_ns);
     }
 
     _agnosai_crew_log(SK_DEBUG, "executing task via LLM", 22, task_id,
@@ -611,10 +666,11 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
     }
 
     var response = load64(&resp);
-    _agnosai_crew_emit_token(event_tx, task, agnosai_inference_response_content(response));
+    var content = _agnosai_crew_filter_output(
+    agnosai_inference_response_content(response), agent, task_id);
+    _agnosai_crew_emit_token(event_tx, task, content);
 
-    var result = agnosai_task_result_new(task_id,
-    agnosai_inference_response_content(response), AGNOSAI_STATUS_COMPLETED);
+    var result = agnosai_task_result_new(task_id, content, AGNOSAI_STATUS_COMPLETED);
     return _agnosai_crew_success_metadata(result, response, start_ns);
 }
 
@@ -657,7 +713,13 @@ enum AgnosaiCrewRunnerOff {
     AGN_CR_CANCELLED = 24;
     AGN_CR_AUDIT = 32;
     AGN_CR_SCRATCH = 40;
-    AGN_CR_SIZE = 48;
+    # Monotonic nanosecond deadline, or 0 for none. Set by the orchestrator from
+    # the resource budget — see `agnosai_crew_runner_set_deadline_ns`.
+    AGN_CR_DEADLINE_NS = 48;
+    # Raised to 1 when a loop head observes the deadline has passed, so the
+    # orchestrator can tell a timeout from an ordinary cancellation.
+    AGN_CR_TIMED_OUT = 56;
+    AGN_CR_SIZE = 64;
 }
 
 # Initial chunk for the sequential run's audit scratch.
@@ -680,6 +742,8 @@ fn agnosai_crew_runner_new(spec): i64 {
     store64(r + AGN_CR_CANCELLED, alloc(8));
     store64(load64(r + AGN_CR_CANCELLED), 0);
     store64(r + AGN_CR_AUDIT, 0);
+    store64(r + AGN_CR_DEADLINE_NS, 0);
+    store64(r + AGN_CR_TIMED_OUT, 0);
     return r;
 }
 
@@ -705,6 +769,53 @@ fn agnosai_crew_runner_with_audit(r, chain): i64 {
 # cancellation raised after it was spawned.
 fn agnosai_crew_runner_cancel_flag(r): i64 {
     return load64(r + AGN_CR_CANCELLED);
+}
+
+# Set the execution deadline as a monotonic nanosecond timestamp, or 0 for none.
+#
+# ⚠ **This is a COOPERATIVE deadline, checked at the two loop heads that already
+# check cancellation** — not the oracle's `tokio::time::timeout`, which drops the
+# whole `runner.run()` future and so aborts work in flight
+# (`rust-old/src/orchestrator/orchestrator.rs:204`). The observable contract
+# matches for a multi-task crew: no task starts after the deadline, and the
+# orchestrator substitutes the same `Failed` state with empty results.
+#
+# ⚠ **What does NOT match: a single task that hangs forever.** Cyrius has no way
+# to abort a thread mid-syscall, so the check cannot fire until the current task
+# returns. `src/llm/hoosh.cyr` sets no per-request timeout, so a wedged gateway
+# connection is exactly that case and still holds the worker. Closing it needs a
+# request timeout on the LLM transport, which is its own bite.
+fn agnosai_crew_runner_set_deadline_ns(r, ns): i64 {
+    store64(r + AGN_CR_DEADLINE_NS, ns);
+    return r;
+}
+
+# Whether a loop head observed the deadline pass. Distinct from cancellation:
+# the orchestrator reports a timeout differently, and only a timeout discards
+# results.
+fn agnosai_crew_runner_timed_out(r): i64 {
+    if (load64(r + AGN_CR_TIMED_OUT) != 0) { return 1; }
+    return 0;
+}
+
+# True when a deadline is set and has passed. Raises the timed-out flag as a
+# side effect so the orchestrator can distinguish it from a cancel.
+#
+# ⚠ `>=` rather than `>` is the correct comparison but is **NOT observable**, and
+# an earlier version of this comment claimed otherwise. Mutation-verified
+# 2026-08-12: flipping it to `>` leaves `tests/orch_orchestrator.tcyr` fully
+# green. The case it would matter for — a deadline landing on exactly the
+# current nanosecond — needs `clock_now_ns()` to hit one specific value, and the
+# zero-second budget that motivated the claim is unreachable anyway, because
+# `agnosai_orchestrator_timeout_secs` maps any `secs <= 0` to the 3600 s default.
+fn _agnosai_crew_deadline_passed(r): i64 {
+    var dl = load64(r + AGN_CR_DEADLINE_NS);
+    if (dl == 0) { return 0; }
+    if (clock_now_ns() >= dl) {
+        store64(r + AGN_CR_TIMED_OUT, 1);
+        return 1;
+    }
+    return 0;
 }
 
 # Request cancellation. The runner stops scheduling new work; tasks already
@@ -868,6 +979,7 @@ fn _agnosai_crew_run_sequential(r): i64 {
     var wants_events = _agnosai_crew_wants_events(r);
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
+        if (_agnosai_crew_deadline_passed(r) == 1) { break; }
 
         var task = vec_get(tasks, i);
         var agent = _agnosai_crew_pick_best_agent(agents, task);
@@ -1015,6 +1127,7 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
 
     while (vec_len(remaining) > 0) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
+        if (_agnosai_crew_deadline_passed(r) == 1) { break; }
 
         # Partition into the ready front and the rest, preserving order.
         var ready = vec_new();

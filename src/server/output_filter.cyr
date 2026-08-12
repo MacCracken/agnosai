@@ -61,6 +61,32 @@ enum AgnosaiFindingOff {
 }
 
 # The finding's category.
+# Whether outbound redaction rewrites the response. See ADR 020.
+#
+# ⚠ **Default OFF, deliberately.** `agnosai_output_redact` rewrites model output,
+# so a task whose legitimate job is to return an email address or a key-shaped
+# token gets its answer mangled with no way for the caller to tell. Scanning is
+# unconditional and only logs; destroying data is the operator's call.
+#
+# A settable flag rather than a direct `getenv` at the call site because a test
+# process has no `setenv` — the gate would otherwise be undrivable, and the
+# wiring it guards is exactly what went un-called in the first place.
+# `src/main.cyr` seeds it from `AGNOSAI_OUTPUT_REDACT` at startup.
+var _AGNOSAI_OUTPUT_REDACT_ENABLED = 0;
+
+# Whether redaction is enabled.
+fn agnosai_output_redact_enabled(): i64 {
+    if (_AGNOSAI_OUTPUT_REDACT_ENABLED != 0) { return 1; }
+    return 0;
+}
+
+# Enable or disable redaction. Returns the value set.
+fn agnosai_output_redact_set_enabled(v): i64 {
+    if (v != 0) { _AGNOSAI_OUTPUT_REDACT_ENABLED = 1; } else { _AGNOSAI_OUTPUT_REDACT_ENABLED = 0; }
+    return _AGNOSAI_OUTPUT_REDACT_ENABLED;
+}
+
+# A finding's category — one of `system_prompt`, `api_key` or `pii`.
 fn agnosai_finding_category(f): i64 {
     return load64(f + AGN_FD_CATEGORY);
 }

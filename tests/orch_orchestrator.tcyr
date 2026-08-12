@@ -35,6 +35,7 @@ include "src/orchestrator/scoring.cyr"
 include "src/orchestrator/scheduler.cyr"
 include "src/orchestrator/output_validation.cyr"
 include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
 include "src/chan_lossy.cyr"
 include "src/server/sse.cyr"
 include "src/orchestrator/audit.cyr"
@@ -251,6 +252,77 @@ fn main() {
     "failed at error");
     assert(str_eq(_agnosai_orch_level_for(AGNOSAI_CREW_CANCELLED), str_from("warn")) == 1,
     "and cancelled at warn — three levels, not two, so a cancelled crew is not filed as a failure");
+
+    # --- the execution timeout is ENFORCED, not merely computed --------------
+    #
+    # ⚠ `agnosai_orchestrator_timeout_secs` had ZERO call sites in `src/` until
+    # 2026-08-12 — it was computed and thrown away, so a wedged crew held one of
+    # the 100 pool workers forever with no Failed state and no log line. The
+    # oracle wraps the run in `tokio::time::timeout`
+    # (`rust-old/src/orchestrator/orchestrator.rs:204`).
+    #
+    # ⚠ Mutation matrix, 2026-08-12 — three of four killed:
+    #   drop the deadline check from a loop head        KILLED (2 failures)
+    #   timeout state reports Completed not Failed      KILLED (1 failure)
+    #   drop the NULL-budget guard                      KILLED (SIGSEGV, exit 139)
+    #   `>=` becomes `>` in `_agnosai_crew_deadline_passed`   SURVIVED
+    # The survivor is not a hole worth closing: it needs `clock_now_ns()` to land
+    # on the deadline's exact nanosecond, and the zero-second budget that would
+    # otherwise expose it is unreachable because `<= 0` maps to the default.
+    var to_budget = agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT,
+    0, AGNOSAI_NO_LIMIT);
+    assert_eq(agnosai_orchestrator_timeout_secs(agnosai_orchestrator_new(to_budget)),
+    AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS,
+    "a zero max_duration means unset, so the 3600s default applies");
+
+    # A NULL budget must not fault now that this runs on every crew.
+    assert_eq(agnosai_orchestrator_timeout_secs(agnosai_orchestrator_new(0)),
+    AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS,
+    "a budget-less orchestrator falls back to the default rather than faulting");
+
+    # The runner-level deadline, which is what the orchestrator sets.
+    var dl_err: i64[1];
+    store64(&dl_err, 0);
+    var dl_runner = agnosai_crew_runner_new(_t_spec("deadline"));
+    assert_eq(agnosai_crew_runner_timed_out(dl_runner), 0, "a fresh runner has not timed out");
+    agnosai_crew_runner_set_deadline_ns(dl_runner, clock_now_ns() - 1);
+    var dl_state = agnosai_crew_runner_run(dl_runner, &dl_err);
+    assert_eq(agnosai_crew_runner_timed_out(dl_runner), 1,
+    "a deadline already in the past is observed at the first loop head");
+    assert_eq(vec_len(agnosai_crew_state_results(dl_state)), 0,
+    "and no task ran");
+
+    # A deadline far in the future must NOT trip — otherwise the assertion above
+    # would pass for a runner that always reports timed-out.
+    var ok_runner = agnosai_crew_runner_new(_t_spec("no-deadline"));
+    agnosai_crew_runner_set_deadline_ns(ok_runner,
+    clock_now_ns() + 3600 * AGNOSAI_NS_PER_SEC);
+    var ok_err: i64[1];
+    store64(&ok_err, 0);
+    var ok_state = agnosai_crew_runner_run(ok_runner, &ok_err);
+    assert_eq(agnosai_crew_runner_timed_out(ok_runner), 0, "a live deadline does not trip");
+    assert(vec_len(agnosai_crew_state_results(ok_state)) > 0, "and the crew runs normally");
+
+    # The substitution the orchestrator applies on expiry. Reached through the
+    # extracted helper because the end-to-end path is not reachable offline:
+    # `agnosai_orchestrator_timeout_secs` treats <= 0 as unset, so the smallest
+    # real budget is one second and a trivial crew finishes in microseconds.
+    var to_state = _agnosai_orch_timeout_state(str_from("crew-x"), 5);
+    assert_eq(agnosai_crew_state_status(to_state), AGNOSAI_CREW_FAILED,
+    "a timed-out crew reports Failed");
+    assert_eq(vec_len(agnosai_crew_state_results(to_state)), 0,
+    "with partial results DISCARDED, as the oracle does");
+    assert_eq(agnosai_crew_state_profile(to_state), 0, "and no profile");
+    assert(str_eq_cstr(agnosai_crew_state_crew_id(to_state), "crew-x"),
+    "carrying the crew id");
+
+    # A normal run must still complete — otherwise every assertion above would
+    # pass for an orchestrator that failed everything.
+    var live_o = agnosai_orchestrator_new(_t_budget());
+    var live = agnosai_orchestrator_run_crew(live_o, _t_spec("not-timed-out"));
+    assert_eq(agnosai_crew_state_status(live), AGNOSAI_CREW_COMPLETED,
+    "a crew inside its deadline still completes");
+    assert(vec_len(agnosai_crew_state_results(live)) > 0, "with its results intact");
 
     return assert_summary();
 }

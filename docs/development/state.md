@@ -175,13 +175,25 @@ named by a **test**, which these all are.
     it is therefore "what an OTLP/HTTP SDK does", not "what a Rust line does" —
     and both 0a and this item are places it falls short of the spec.
 
-0b. **`src/server/output_filter.cyr` — 20 functions, fully tested, never
+0b. ✅ **FIXED 2026-08-12 as a DELIBERATE DIVERGENCE — [ADR 020](../adr/020-output-filter-wired-into-task-output.md).**
+    ⚠ **The sweep's fact was right and its implication was wrong: the ORACLE
+    never calls it either** (`rust-old/src/server/mod.rs:11` is the only mention
+    in the whole Rust tree), so the port was at PARITY, not defective. What
+    justified changing it is the asymmetry with `prompt_guard`, whose oracle DOES
+    wire it. Scanning is now unconditional; redaction is opt-in via
+    `AGNOSAI_OUTPUT_REDACT` because it rewrites legitimate answers.
+    **`src/server/output_filter.cyr` was 20 functions, fully tested, never
     called.** The file is `include`d at `src/main.cyr:90` and that is its only
     appearance outside itself; a per-symbol sweep of every public name finds
     **zero** references anywhere in `src/`. This is the *outbound* half of the
     prompt-injection defence — the inbound half (`prompt_guard`) is wired.
 
-0c. **The crew execution timeout is computed and never enforced.**
+0c. ✅ **FIXED 2026-08-12.** **The crew execution timeout was computed and never
+    enforced.** ⚠ The port's deadline is COOPERATIVE (checked at loop heads),
+    where the oracle's `tokio::time::timeout` aborts work in flight — so a single
+    task that hangs forever still holds the worker. That needs a request timeout
+    on the LLM transport and is its own bite.
+    **The original finding:**
     `agnosai_orchestrator_timeout_secs` (`src/orchestrator/orchestrator.cyr:157`)
     resolves the budget or `AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS = 3600`, and has
     **zero call sites in `src/`** — its only `src/` mention is a *comment* at
@@ -1149,7 +1161,17 @@ regressions past 15% on the toolchain bump, one improvement
 ids move past 15% — `default_model_premium` 40 → 54 ns and `metrics_record_task`
 4 → 5 ns. ⚠ Both are **noise, not regressions**: sub-100 ns shapes against a
 measured ~1.3 µs timer floor, where one nanosecond is 25%, and neither is on the
-telemetry path. Previously verified 2026-08-11** — against 106 rows and three non-compiling files that morning. See
+telemetry path.
+
+After the crew-timeout and `output_filter` work: **0 regressions past 15% across
+all 207 ids**. The crew path moves `run_crew_1_task_sequential` +6.4%,
+`run_crew_10_tasks_sequential` +8.0%, `run_crew_10_tasks_parallel_4` +1.7% —
+that is the timeout's per-loop-head deadline check, not the filter, which is free
+on this path with redaction off. ⚠ An earlier shape of the filter — scanning the
+placeholder path unconditionally — measured **+90%** on the 10-task sequential
+run and was restructured rather than shipped; `agnosai_output_scan` alone is
+16.7 µs against a ~40 µs/task crew path. See ADR 020. Previously verified
+2026-08-11** — against 106 rows and three non-compiling files that morning. See
 the Tests section for how they had stopped. `benches/llm.bcyr`,
 `benches/fleet.bcyr` and `benches/definitions.bcyr` are new; `llm` was the first
 to touch `src/llm/` at all, and `harness.bcyr` is the relocated `noop` floor.

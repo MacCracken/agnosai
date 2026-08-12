@@ -155,7 +155,17 @@ fn agnosai_orchestrator_crew_count(o): i64 {
 
 # The crew execution timeout in seconds — the budget's, or the one-hour default.
 fn agnosai_orchestrator_timeout_secs(o): i64 {
-    var secs = agnosai_resource_budget_max_duration_secs(load64(o + AGN_OR_BUDGET));
+    # ⚠ **The NULL-budget guard is load-bearing as of 2026-08-12.** Until the
+    # timeout was actually enforced this function had zero callers, so a
+    # `agnosai_orchestrator_new(0)` was harmless — and four suites construct one
+    # exactly that way (`server_router`, `server_routes_sse`, `server_routes_a2a`).
+    # Wiring the timeout put this on every crew run, where the old unguarded
+    # `load64(0 + AGN_BUD_MAX_DURATION_SECS)` would fault. A budget-less
+    # orchestrator gets the oracle's own 3600 s default, which is also what
+    # `ResourceBudget::default()` yields.
+    var budget = load64(o + AGN_OR_BUDGET);
+    if (budget == 0) { return AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS; }
+    var secs = agnosai_resource_budget_max_duration_secs(budget);
     if (secs == AGNOSAI_NO_LIMIT || secs <= 0) { return AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS; }
     return secs;
 }
@@ -285,13 +295,62 @@ fn agnosai_orchestrator_run_crew(o, spec): i64 {
 # unregistered. Called inline by the first and on a thread by the second; it
 # touches nothing that is not already thread-safe (see the note above
 # `agnosai_orchestrator_submit_crew`).
+# The state a timed-out crew reports, and the warning that goes with it.
+#
+# Split out of `_agnosai_orch_finish` so a suite can reach it: the orchestrator's
+# own timeout needs a budget of at least one second (`agnosai_orchestrator_timeout_secs`
+# treats <= 0 as unset), and a trivial crew finishes in microseconds — so the
+# substitution is unreachable end to end without a one-second sleep. Same reason
+# the three seams in `docs/development/state.md` exist; nothing is injected in
+# production.
+#
+# ⚠ The oracle's `warn!` carries TWO fields (`crew_id`, `timeout_secs`), and
+# `sakshi_log_kv` carries exactly ONE pair, flattening it into the message before
+# the emit hook. `crew_id` is the pair — it is the correlation key an operator
+# greps — and the timeout is folded into the message text, so no information is
+# dropped even though the shape differs.
+fn _agnosai_orch_timeout_state(crew_id: Str, timeout_secs): i64 {
+    # Level-gated so the message is not built when nothing will emit it — the
+    # same shape as `_agnosai_rl_warn` in `src/server/rate_limit.cyr`.
+    if (sakshi_get_level() >= SK_WARN) {
+        var msg = str_builder_new();
+        str_builder_add_cstr(msg, "crew execution timed out after ");
+        str_builder_add_int(msg, timeout_secs);
+        str_builder_add_cstr(msg, "s");
+        var m = str_builder_build(msg);
+        sakshi_log_kv(SK_WARN, str_data(m), str_len(m),
+        "crew_id", 7, str_data(crew_id), str_len(crew_id));
+    }
+    return agnosai_crew_state_new(crew_id, AGNOSAI_CREW_FAILED);
+}
+
 fn _agnosai_orch_finish(o, runner, crew_id: Str, crew_name: Str): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     var bus = load64(o + AGN_OR_EVENTS);
 
+    # Enforce the execution timeout from the budget, matching
+    # `rust-old/src/orchestrator/orchestrator.rs:197-214`.
+    #
+    # ⚠ **This was computed and never applied.** `agnosai_orchestrator_timeout_secs`
+    # existed with ZERO call sites in `src/` — its only mention was a comment in
+    # `main.cyr` — so a wedged crew held one of the 100 pool workers forever, with
+    # no `Failed` state, no sakshi event and no audit record. `POST /api/v1/crews`
+    # runs the crew inline, so that worker never came back. Fixed 2026-08-12.
+    var timeout_secs = agnosai_orchestrator_timeout_secs(o);
+    agnosai_crew_runner_set_deadline_ns(runner,
+    clock_now_ns() + timeout_secs * AGNOSAI_NS_PER_SEC);
+
     var run_err: i64[1];
     store64(&run_err, 0);
     var state = agnosai_crew_runner_run(runner, &run_err);
+
+    # On expiry the oracle DISCARDS partial results and reports a bare `Failed`
+    # — `CrewState { status: Failed, results: vec![], profile: None }`. Matched
+    # exactly: a caller must not read a timed-out crew's partial output as if the
+    # crew had finished.
+    if (state != 0 && agnosai_crew_runner_timed_out(runner) == 1) {
+        state = _agnosai_orch_timeout_state(crew_id, timeout_secs);
+    }
 
     # A cyclic DAG errors out. The oracle's `?` propagates it, so no state is
     # stored and no `crew_finished` is audited — the crew never ran.

@@ -157,6 +157,19 @@ fn _agnosai_main_auth_enabled(): i64 {
     return _agnosai_main_env_truthy(v);
 }
 
+# Whether `AGNOSAI_OUTPUT_REDACT` asks for outbound redaction. Unset is false.
+#
+# ⚠ **Port-only, no oracle counterpart** — the oracle never calls `output_filter`
+# at all. See [ADR 020](../docs/adr/020-output-filter-wired-into-task-output.md)
+# for why the port wires it and why redaction is opt-in: it REWRITES model
+# output, so a task legitimately returning an email or a key-shaped token would
+# have its answer mangled.
+fn _agnosai_main_output_redact_enabled(): i64 {
+    var v = getenv("AGNOSAI_OUTPUT_REDACT");
+    if (v == 0) { return 0; }
+    return _agnosai_main_env_truthy(v);
+}
+
 # Build the `AuthConfig` from the environment — `load_auth_config`
 # (`rust-old/src/main.rs:16-55`), branch for branch.
 #
@@ -303,6 +316,11 @@ fn main(): i64 {
     # for the process lifetime, as the oracle's `_tracing_guard` is.
     var tracing_guard = agnosai_telemetry_init_tracing(agnosai_otlp_endpoint_from_env());
 
+    # Seed the outbound-redaction gate once at startup rather than reading the
+    # environment per task. Scanning is unconditional either way — this only
+    # controls whether findings rewrite the response. ADR 020.
+    agnosai_output_redact_set_enabled(_agnosai_main_output_redact_enabled());
+
     sakshi_info("AgnosAI server starting", 23);
 
     var events = agnosai_event_bus_new();
@@ -312,9 +330,15 @@ fn main(): i64 {
     "hoosh_url", 9, hoosh_url);
 
     # `Orchestrator::new(Default::default())` (`main.rs:82`). The budget is
-    # `agnosai_resource_budget_default()`, NOT 0: the existing suites pass 0 as
-    # a shortcut, but `agnosai_orchestrator_timeout_secs` dereferences it, so a
-    # 0 here would fault the moment a crew runs.
+    # `agnosai_resource_budget_default()`, NOT 0 — that is what the oracle
+    # constructs, and the budget is read for cost and concurrency limits besides
+    # the timeout.
+    #
+    # ⚠ **This comment used to say a 0 "would fault the moment a crew runs".
+    # That was false when written** — `agnosai_orchestrator_timeout_secs` had no
+    # callers at all, so nothing dereferenced the budget. It became reachable on
+    # 2026-08-12 when the timeout was finally enforced, and the accessor now
+    # guards a NULL budget explicitly, so the suites that pass 0 keep working.
     #
     # `with_llm_url` takes a third `api_key` argument the oracle's does not;
     # `""` is the documented spelling for an unauthenticated gateway

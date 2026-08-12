@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — the crew execution timeout was computed and never applied
+
+`agnosai_orchestrator_timeout_secs` resolved the budget's `max_duration_secs` or
+the oracle's 3600 s default, and had **zero call sites in `src/`** — its only
+mention was a comment in `main.cyr`. The oracle wraps the run in
+`tokio::time::timeout` and, on expiry, logs `crew execution timed out` and
+returns `CrewState { status: Failed, results: vec![], profile: None }`
+(`rust-old/src/orchestrator/orchestrator.rs:197-214`).
+
+`POST /api/v1/crews` runs the crew inline, so a wedged crew held one of the 100
+pool workers **forever** — no `Failed` state, no sakshi event, no audit record.
+
+- `_agnosai_orch_finish` now stamps a monotonic deadline before the run, and the
+  runner checks it at the two loop heads that already check cancellation. On
+  expiry the orchestrator substitutes the oracle's bare `Failed` state, so
+  **partial results are DISCARDED** rather than read as a finished crew.
+- ⚠ **The deadline is COOPERATIVE, and this is a real divergence.** The oracle's
+  `tokio::time::timeout` drops the whole future and aborts work in flight;
+  Cyrius cannot abort a thread mid-syscall, so the check cannot fire until the
+  current task returns. **A single task that hangs forever still holds the
+  worker** — `src/llm/hoosh.cyr` sets no per-request timeout, so a wedged gateway
+  connection is exactly that case. Closing it needs a request timeout on the LLM
+  transport and is its own bite. Documented at the call site, not glossed.
+- ⚠ **`agnosai_orchestrator_timeout_secs` gained a NULL-budget guard**, and it is
+  load-bearing: three suites construct `agnosai_orchestrator_new(0)`, which was
+  harmless only because nothing called the accessor. Wiring it put an unguarded
+  `load64(0 + …)` on every crew run. `main.cyr`'s claim that a 0 "would fault the
+  moment a crew runs" was **false when written** — nothing dereferenced it — and
+  is corrected in place.
+
+### Added — `output_filter` is wired into task output ([ADR 020](docs/adr/020-output-filter-wired-into-task-output.md))
+
+⚠ **A deliberate divergence, not a bug fix.** `src/server/output_filter.cyr` —
+20 functions, its own passing assertions — had no caller. **Neither does the
+oracle's**: `rust-old/src/server/mod.rs:11` is `pub mod output_filter;` and that
+is the module's only mention in the entire Rust tree. The port was at parity.
+
+What made it worth changing is the asymmetry: `prompt_guard`, the *inbound* half
+of the same defence, **is** wired in the oracle
+(`rust-old/src/orchestrator/crew_runner.rs:651`) and at four sites here. agnosai
+sanitised everything going into a model and inspected nothing coming out.
+
+- **Scanning is unconditional on model output** — every finding is logged at
+  `SK_WARN` with task id, category and pattern.
+
+  ⚠ **But NOT on the no-LLM placeholder path, and that split is measured.**
+  `agnosai_output_scan` costs **16.7 µs** against a ~40 µs/task crew path;
+  scanning the placeholder unconditionally measured **+90%** on
+  `run_crew_10_tasks_sequential` (394 → 749 µs) and +43% at one task. The
+  placeholder echoes the task description — request input `prompt_guard` has
+  already sanitised — so there is no model output there to protect. It is
+  filtered only when redaction is enabled.
+- **Redaction is OFF by default**, behind `AGNOSAI_OUTPUT_REDACT=1`.
+  `agnosai_output_redact` rewrites the response, so a task legitimately returning
+  an email address or a key-shaped token would have its answer mangled with no
+  way for the caller to tell. Silently corrupting correct output is the worse
+  failure. The gate is a settable flag seeded from the environment at startup
+  rather than a per-call `getenv`, because a test process has no `setenv` and an
+  undrivable gate is how the module went un-called in the first place.
+- **Measured cost: +3.4% at one task, +1.0% at ten** (`run_crew_1_task_sequential`
+  94.5 → 97.8 µs, `run_crew_10_tasks_sequential` 394.4 → 398.4 µs,
+  `run_crew_10_tasks_parallel_4` flat) — and most of that residual is the crew
+  timeout landing in the same release, not the filter.
+- ⚠ **The LLM arm of the wiring is not mutation-covered**: reverting
+  `agnosai_execute_task` to the raw response passes the whole suite, because that
+  arm needs a live gateway — the same limitation `_agnosai_otlp_post` carries.
+  The placeholder arm is covered (unwiring it fails two assertions).
+
 ### Fixed — OTLP export was silently non-functional, and leaked every span it encoded
 
 Three defects in `src/telemetry/otlp.cyr`, found by the 2026-08-12 P(-1) sweep.
