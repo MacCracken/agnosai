@@ -448,14 +448,31 @@ fn _t_matching_is_allocation_free(): i64 {
     }
     assert((alloc_used() - b2) / 64 < 128, "a deep hit allocates only the match struct");
 
-    # A hit WITH a parameter allocates the captured Str as well, and only one —
-    # not one per pattern tried.
+    # A hit WITH a parameter allocates the captured Str as well, and EXACTLY one
+    # — not one per pattern tried.
+    #
+    # ⚠ **This assertion used to state a property the matcher violated, under a
+    # bound too loose to notice.** `_agnosai_path_matches_at` ran
+    # `str_sub_a` the moment it reached a `*` segment and only afterwards compared
+    # the remaining segments, so a pattern that matched its `*` and then failed —
+    # `/api/v1/crews/*` against `/api/v1/crews/abc/cancel` — had already captured.
+    # Measured 64 B/resolve, i.e. FOUR captures, against a `< 192` threshold that
+    # stayed green up to eleven. The matcher now defers the capture to a confirmed
+    # full match: **48 B, exactly three**, one of which is the match struct.
+    #
+    # ⚠ The bound is `deep hit + one Str header`, both measured in THIS run, per
+    # state.md's rule that a round-number threshold asserts less than it looks
+    # like it does. `str_sub_a` BORROWS rather than copying — verified: a 1-char
+    # and a 46-char parameter cost identically — so one capture is exactly 16 B
+    # regardless of the path, and a second capture is unmissable.
     var b3 = alloc_used();
     for (var k = 0; k < 64; k = k + 1) {
         agnosai_route_resolve(AGNOSAI_METHOD_POST, str_from("/api/v1/crews/abc/cancel"));
     }
-    assert((alloc_used() - b3) / 64 < 192,
-    "a parameterised hit captures one Str, not one per pattern tried");
+    var param_bytes = (alloc_used() - b3) / 64;
+    var deep_bytes = (b3 - b2) / 64;
+    assert_eq(param_bytes - deep_bytes, 16,
+    "a parameterised hit costs the deep hit plus EXACTLY ONE captured Str");
     return 0;
 }
 

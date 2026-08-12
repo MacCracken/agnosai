@@ -218,7 +218,7 @@ anonymous overcommitted mmaps and `arena_new` touches only the header
 12 MiB of VA and only the pages actually written in RSS. RSS still grows
 monotonically — the correction is to the magnitude, not to the defect.
 
-1. 🟠 **PARTLY FIXED 2026-08-12 — `telemetry/otlp.cyr` done, `orchestrator/audit.cyr` NOT.**
+1. ✅ **FIXED 2026-08-12 — and `orchestrator/audit.cyr` turned out to be a FALSE POSITIVE.**
    **`str_builder_new_a` is threaded, then every add/build is BARE — the arena
    receives only the 88-byte header.** The builder struct is 24 bytes
    `{buf,len,cap}` and **stores no allocator** (`lib/str.cyr:428`), so bare
@@ -232,7 +232,7 @@ monotonically — the correction is to the magnitude, not to the defect.
    | `server/routes/mcp.cyr` | 2 | 0 / 5 | 0 / 2 | ✅ clean |
    | `server/routes/approval.cyr` | 1 | 0 / 7 | 0 / 2 | ✅ clean |
    | `telemetry/otlp.cyr` | 2 | 0 / 33 | 0 / 4 | ✅ fixed 2026-08-12 |
-   | **`orchestrator/audit.cyr`** | 2 | **5** / 3 | **1** / 2 | 🟠 partial |
+   | `orchestrator/audit.cyr` | 2 | 5 / 3 | 1 / 2 | ✅ correct — see below |
 
    Measured cost in otlp: **~3.9 KB permanently leaked per exported span**, and
    `agnosai_otlp_exporter_start` (`:627`) runs the drain on a **1000 ms loop even
@@ -245,6 +245,21 @@ monotonically — the correction is to the magnitude, not to the defect.
    mutation-verified — un-threading a single call fails them."* `tests/telemetry_otlp.tcyr`
    contains **no `alloc_used` assertion at all**, which is exactly why 29 bare
    calls went unnoticed. `tests/orch_audit.tcyr` has 4 and still missed 6.
+
+   ⚠ **`orchestrator/audit.cyr` needed no change — the sweep's grep miscounted it.**
+   Checked 2026-08-12, per site:
+   * `_agnosai_audit_sign_a` is **already fully threaded** (`add_a`, `add_cstr_a`,
+     `build_a`). Its two bare `str_builder_putc` calls are safe and documented at
+     the site: 64 hex chars into the builder's 64-byte inline buffer is an exact
+     fit, so it never grows. **Measured: 88 B/sign on the global bump, and that
+     is entirely the deliberate `str_clone`** (16-byte header + 72 rounded from
+     65) which exists because the signature outlives the scratch arena. `putc`
+     contributes zero.
+   * All 5 bare adds + 1 bare build are in `_agnosai_audit_failure`, which builds
+     the text `agnosai_audit_verify` returns on a **corrupted chain**. It is an
+     error path, `agnosai_audit_verify` has no `_a` form and no caller in `src/`
+     at all, and the returned Str must outlive any request arena. Global is
+     correct there.
 
    ⚠ `str_builder_putc` has **no `_a` form**, so the hex trace/span id path needs
    either its own short-lived `str_builder_new_a` + `str_builder_add_a`, or an
@@ -268,6 +283,29 @@ monotonically — the correction is to the magnitude, not to the defect.
    Correct by contrast, and the shape to copy: `serve.cyr:95` (once per pool
    worker), `telemetry/otlp.cyr:378,381` (module-level), `crew_runner.cyr:856`.
 
+   🔴 **STILL OPEN — and the obvious fix is BLOCKED, which is why it is not done.**
+   Investigated 2026-08-12:
+
+   * **A thread-local arena is unavailable.** `src/orchestrator/audit.cyr:386`
+     records it, measured: `thread_local_get` **faults on the main thread**,
+     which has no TLS block unless `thread_local_init` runs — and calling that on
+     a *worker* orphans the block `thread_create` already installed, **taking
+     sandhi's request-arena slot with it**. So the pattern that would make these
+     per-thread is off the table until that is fixed upstream.
+   * **Threading the caller's arena down is a tools-tier signature change.**
+     `agnos.cyr`'s arena sits inside `agnosai_agnos_http_transport`, which is a
+     *function pointer* with a fixed shape, reached through `agnosai_agnos_call`
+     from every builtin (`tools/builtin/mneme.cyr` and siblings). Passing an
+     arena in means changing the transport contract and every caller.
+   * **A process-wide arena under a mutex would serialize outbound HTTP** across
+     the 100 pool workers — a worse defect than the one it fixes.
+
+   The shape that actually fits is a **bounded pool of reusable arenas**, taken
+   and returned under a short lock: memory becomes `N x size` instead of
+   unbounded, with no serialization. That is a new port-local module plus wiring
+   at five sites, its own suite and its own benchmark — a real bite, not a
+   cleanup, and it is not started.
+
    ⚠ Two comments assert the opposite of the truth and must be fixed with it:
    `load_testing.cyr:476` — *"Every worker arena is released here"* over a loop
    that is a literal no-op — and the Benchmarks note further down this file.
@@ -278,8 +316,13 @@ monotonically — the correction is to the magnitude, not to the defect.
    flat steady state. Port-introduced, sanctioned by no ADR, and the opposite of
    the port plan's closed blocker #3, which specifies a **per-worker** arena.
 
-3. **`server_router.tcyr:453` asserts a property the matcher already violates,
-   under a bound 2.4× too loose to notice.** It claims *"a parameterised hit
+3. ✅ **FIXED 2026-08-12 — in the MATCHER, not just the assertion.** The capture
+   is deferred to a confirmed full match: **64 B → 48 B per parameterised
+   resolve**, one `Str` header saved. The assertion now reads `deep hit + exactly
+   one Str`, both measured in the same run. `str_sub_a` **borrows**, so a capture
+   is 16 B regardless of parameter length — verified with 1-char vs 46-char.
+   **The original finding:** `server_router.tcyr:453` asserted a property the
+   matcher already violated, under a bound 2.4x too loose to notice. It claims *"a parameterised hit
    captures one Str, not one per pattern tried"*, but
    `_agnosai_path_matches_at` (`src/server/router.cyr:180-183`) runs
    `str_sub_a` on reaching a `*` segment and only then compares the remaining
@@ -287,8 +330,11 @@ monotonically — the correction is to the magnitude, not to the defect.
    threshold stays green up to seven captures. Fix the assertion to the true
    property, or fix the matcher to capture only on a confirmed match.
 
-4. **`agnosai_prompt_scan_input` allocates 560 B of `Str` headers per CLEAN
-   scan.** `src/server/prompt_guard.cyr:112-174` holds 36 textual `str_from`
+4. ✅ **FIXED 2026-08-12 — 560 B → 0 B per clean scan**, 16 B only on a
+   detection. Needles go through `agnosai_str_contains_ci_cstr`; messages are
+   built only on the branch that returns them. Mutation-verified both ways.
+   **The original finding:** `agnosai_prompt_scan_input` allocated 560 B of `Str`
+   headers per CLEAN scan. `src/server/prompt_guard.cyr:112-174` holds 36 textual `str_from`
    calls, 35 on the clean path. `agnosai_str_contains_ci_cstr`
    (`src/strcase.cyr:96`) already exists for exactly this and is already used in
    this literal shape at `sandbox/wasm.cyr:251-266` (5 sites) and

@@ -163,8 +163,15 @@ fn _agnosai_path_matches_at(a, path: Str, start, pattern, out_param): i64 {
     var q_has = 0;
     if ((load8(pattern + qi) & 255) != 0) { q_has = 1; }
 
+    # Where the `*` segment sat, materialised only on a full match.
+    var cap_at = 0 - 1;
+    var cap_len = 0;
+
     while (1 == 1) {
-        if (p_has == 0 && q_has == 0) { return 1; }
+        if (p_has == 0 && q_has == 0) {
+            if (cap_at >= 0) { store64(out_param, str_sub_a(a, path, cap_at, cap_len)); }
+            return 1;
+        }
         if (p_has == 0 || q_has == 0) { return 0; }
 
         var pe = pi;
@@ -178,7 +185,14 @@ fn _agnosai_path_matches_at(a, path: Str, start, pattern, out_param): i64 {
 
         if (qlen == 1 && (load8(pattern + qi) & 255) == 42) {
             if (plen == 0) { return 0; }
-            store64(out_param, str_sub_a(a, path, pi, plen));
+            # ⚠ The capture is REMEMBERED, not materialised — `str_sub_a` runs
+            # once, at the bottom, only if the whole pattern matched. It used to
+            # allocate here, so every pattern that matched its `*` and then failed
+            # a later segment left a Str behind: `POST /api/v1/crews/abc/cancel`
+            # is tried against `/api/v1/crews/*` first, captures "abc", fails on
+            # the trailing segment, and allocates again on the next pattern.
+            cap_at = pi;
+            cap_len = plen;
         } else {
             if (plen != qlen) { return 0; }
             for (var k = 0; k < plen; k = k + 1) {

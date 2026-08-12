@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — three allocation defects found by the P(-1) sweep
+
+- **`agnosai_prompt_scan_input`: 560 B per CLEAN scan → 0.** It ran 35 `str_from`
+  calls on the clean path — 31 literal needles, plus four message `Str`s built
+  eagerly at the top whether or not anything matched. The oracle allocates
+  **none**: `rust-old/src/server/prompt_guard.rs:30` is a
+  `const INJECTION_PATTERNS: &[(&str, &str)]` static table.
+
+  Needles now go through `agnosai_str_contains_ci_cstr` (`src/strcase.cyr:96`,
+  which exists for exactly this and whose comment says so), and a message is
+  built only on the branch returning it — 16 B on a detection, 0 otherwise. This
+  runs on every task description, expected output and context blob, so the old
+  cost was per-request. Mutation-verified both ways.
+
+- **`_agnosai_path_matches_at` captured on every pattern TRIED, not on the match.**
+  It ran `str_sub_a` the moment it reached a `*` segment and only afterwards
+  compared the remaining segments, so `/api/v1/crews/*` tried against
+  `/api/v1/crews/abc/cancel` captured `"abc"` and then failed. The capture is now
+  deferred to a confirmed full match: **64 B → 48 B per parameterised resolve**
+  (−25%), which is exactly one `Str` header saved.
+
+  ⚠ **`tests/server_router.tcyr:453` asserted a property the matcher violated**,
+  under a `< 192` bound that stayed green up to eleven captures. It now asserts
+  `deep hit + exactly one Str`, both measured in the same run. `str_sub_a`
+  **borrows** rather than copying — verified, a 1-char and a 46-char parameter
+  cost identically — so one capture is 16 B regardless of path length.
+
+- ⚠ **`orchestrator/audit.cyr` was a FALSE POSITIVE** and needed no change. Its
+  `_agnosai_audit_sign_a` is already fully threaded, and the two bare
+  `str_builder_putc` calls are documented as safe at the site: 64 hex chars into
+  the 64-byte inline buffer is an exact fit. **Measured 88 B/sign, entirely the
+  deliberate `str_clone`** that exists because the signature outlives the scratch
+  arena; `putc` contributes zero. The 5 bare adds + 1 bare build the sweep counted
+  are all in `_agnosai_audit_failure`, an error path whose result must outlive any
+  request arena and which `agnosai_audit_verify` — no `_a` form, no caller in
+  `src/` — reaches only on a corrupted chain.
+
 ### Fixed — the crew execution timeout was computed and never applied
 
 `agnosai_orchestrator_timeout_secs` resolved the budget's `max_duration_secs` or
