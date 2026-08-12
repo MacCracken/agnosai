@@ -2,7 +2,332 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-08-10.
+> Last refreshed: 2026-08-12.
+
+## ✅ RESOLVED 2026-08-12 — the four-repo chain is closed at every root
+
+**The handoff below is complete.** All four repos landed in order, each verified
+before the next, and agnosai is on **cyrius 6.5.20** with `lib/sakshi.cyr`
+holding at the snapshot's 2.4.10 after a build. What each repo needs from the
+project owner is a **commit + tag** — nothing is left to build.
+
+| repo | version | tagged on GitHub? | action |
+|---|---|---|---|
+| **patra** | 1.13.0 | ✅ yes | none — already released |
+| **majra** | **2.6.3** | ❌ no (2.6.2 is) | commit + tag `2.6.3` |
+| **libro** | **2.8.5** | ❌ no (2.8.4 is) | commit + tag `2.8.5` |
+| **bote** | **3.3.1** | ❌ no (3.3.0 is) | commit + tag `3.3.1` |
+| **agnosai** | 1.1.0 (unchanged) | — | commit |
+
+Version rule applied: a version already published on GitHub got a **patch bump**
+(libro 2.8.4 → 2.8.5); a version prepared but never tagged absorbed the new work
+**without a second bump** (majra 2.6.3, bote 3.3.1). Confirmed against the GitHub
+tags API, not local tags — local and remote agreed in all four cases.
+
+⚠ **Until those tags exist, every `[deps.*]` in this chain resolves through
+`path = "../NAME"`, not the tag** — that is the local-path-beats-tag hazard
+recorded further down this file, and it is live right now by construction, since
+each manifest names a tag that has not been pushed yet. **It was checked rather
+than assumed**: every vendored bundle is byte-identical to the `dist/` its repo
+will publish, so a clean CI checkout resolving tags builds exactly what was
+tested here.
+
+| consumer's vendored copy | source `dist/` | sha256 (first 16) |
+|---|---|---|
+| `bote/lib/libro.cyr` | `libro/dist/libro.cyr` | `ad03fe77af2b4ac4` |
+| `agnosai/lib/libro.cyr` | `libro/dist/libro.cyr` | `ad03fe77af2b4ac4` |
+| `agnosai/lib/bote-core.cyr` | `bote/dist/bote-core.cyr` | `f87c7696e69b96b8` |
+| `agnosai/lib/majra.cyr` | `majra/dist/majra.cyr` | `491c0bfadfb0df31` |
+
+⚠ **Re-run that comparison if any of the three trees is edited before tagging** —
+it is only true while the working trees and the bundles agree.
+
+### ⚠ Four corrections to the plan this section used to carry
+
+Each was established by measurement and each is the **opposite** of what the
+handoff instructed. Do not restore the originals.
+
+1. **cyrius 6.5.20 was never the blocker — 6.5.19 already folded patra 1.13.0.**
+   patra 1.13.0 was committed and tagged **2026-08-11 20:02:27**; 6.5.19's
+   binary was built **2026-08-11 20:09:37**, seven minutes later. All three of
+   `6.5.19/lib/patra.cyr`, `6.5.20/lib/patra.cyr` and `git show
+   1.13.0:dist/patra.cyr` hash to `b21cfd17…`. **The work was unblocked before
+   the release it was waiting on shipped.**
+
+   ⚠ This also retires the "snapshot overwritten in place" suspicion for this
+   case: `6.5.19/lib` holding patra 1.13.0 is **correct**, not corruption.
+   6.5.18 → 6.5.19 differs by exactly **one** file (patra.cyr), and
+   **6.5.19/lib → 6.5.20/lib differs by zero** — 6.5.20 is a pure compiler
+   release.
+
+2. **libro must KEEP `[deps.patra]`, bumped rather than deleted.** The handoff
+   said to drop it in favour of a `[deps].stdlib` entry. bote consumes
+   `dist/libro.cyr`, which calls `patra_*` **54 times and defines none**, and
+   bote declares no patra of its own — so bote can only obtain patra by
+   resolving libro's block transitively. Deleting it strands bote.
+
+3. **libro must KEEP its THIN `[deps.sigil]` sub-bundle selection.** The handoff
+   said to add `"sigil"` to `[deps].stdlib`. The fold is the **monolith**:
+   `lib/sigil.cyr` is 27,550 lines / 1,079,160 bytes carrying the x509+RSA
+   bignum banks. Measured both ways — majra, which takes `dist/sigil.cyr`,
+   builds with `warning: large static data (10794336 bytes)`; libro's thin build
+   is `.bss` **80,224 bytes**. Only the **tag** needed to move, 3.12.1 → 3.12.7.
+
+4. **libro fed the stale-sakshi overlay through TWO pins, not one.** Alongside
+   patra 1.12.12's `[deps.sakshi]` 2.4.2, **sigil 3.12.1's own manifest declared
+   `[deps.sakshi]` at 2.4.3**. Both terminate at the tags now pinned (patra
+   1.13.0 and sigil 3.12.7 each declare zero `[deps.*]`).
+
+### ⚠ Two defects surfaced by this work, neither blocking
+
+- **libro's `dist/libro.deps` no longer declares `sakshi`, and never did on its
+  own merits.** The leaf reached the sidecar only via patra 1.12.12's
+  `[deps.sakshi]` block — the defect being fixed — so fixing it *unmasked* a
+  latent hole. Measured: **27** leaves on patra 1.12.12, **26** on 1.13.0, **26**
+  with the block removed entirely. `dist/libro.cyr` calls `sakshi_*` 44 times and
+  defines none. Consumers are fine today (bote and agnosai each declare
+  `"sakshi"` in their own `[deps].stdlib`), but a clean-room consumer relying
+  only on the sidecar would fail where 2.8.4 worked. ⚠ `cyrius distlib`'s
+  self-check **cannot** catch this class: undefined *functions* are downgraded to
+  warnings, so only an undefined *variable* fails a bundle.
+- **A `#` comment INSIDE a manifest array silently truncates the list.** No
+  error. Hit while editing libro's `[deps].stdlib`: a comment after `"sakshi",`
+  cut the sidecar from 27 leaves to 21 and the only symptom appeared much later,
+  as `distlib` failing on an unrelated undefined variable. Keep manifest comments
+  outside the brackets.
+
+### Original handoff, kept for the reasoning
+
+A four-repo dependency defect was traced to its root and fixed at the root.
+
+### The defect, once, so it is not re-derived
+
+`cyrius deps` overlays a git dep's resolution **on top of** the
+`lib sync --full` snapshot, **recursing through sibling manifests**, on **every
+`cyrius build`** — not only on `deps`. So any repo pinning a module that is also
+folded into the cyrius stdlib silently **downgrades** that module for every
+consumer that reaches it, however many levels away.
+
+`patra` — itself folded into the stdlib — pinned `[deps.sakshi]` at **2.4.2**
+while the snapshot shipped **2.4.10**. It reached agnosai four levels down:
+
+```
+agnosai -> bote -> [deps.libro] -> [deps.patra] -> [deps.sakshi] 2.4.2
+```
+
+⚠ **Verification rule, learned the hard way: check AFTER a `cyrius build`, never
+after the three-step.** The three-step ends correct and the next build silently
+reverts it. `deps --verify` cannot catch it — the lock is written *from disk*, so
+it records the downgraded file's hash. The only signal is an unnamed
+"1 bundled lib(s) differ" shadow warning.
+
+⚠ **Trace chains DOWN, not one level.** agnosai's manifest note named the culprit
+three times and was wrong every time ("sigil and bote", "majra 2.6.0", "bote"),
+because each version read only direct siblings.
+
+### Repo status
+
+| repo | version | pin | state |
+|---|---|---|---|
+| **patra** | **1.13.0** | 6.5.19 | ✅ **committed + tagged** (`9aed017`, 2026-08-11 20:02). Zero `[deps.*]` blocks; sakshi from the fold. 893 tests, 7/7 fuzz, benches, fmt/lint/vet/deny clean. |
+| **majra** | **2.6.3** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.6.2. **218 assertions** (159 core + 42 backends + 17 patra_queue), `cyrius audit` green, all 4 `dist/` bundles regenerated at v2.6.3. Content: `relay_receive_ex` allocates outside the lock again, + the toolchain bump. ⚠ `tests/test_live.tcyr` is unrunnable here — `redis-server` and `postgres` are **not installed**, and it **exits 139 (SIGSEGV)** rather than failing cleanly. Environment, and a pre-existing harness defect. |
+| **libro** | **2.8.5** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.8.4, so this took a **patch bump**. **512 assertions** (524 with `-D LIBRO_TPM`), fmt clean, 23 files lint / 0 warnings, vet 45 deps / 0 untrusted, deny 0 violations, 3 bench binaries green, `.bss` held at **80,224 bytes**. Content: pin 6.5.10 → 6.5.20, `[deps.patra]` 1.12.12 → **1.13.0**, `[deps.sigil]` + `[deps.sigil_tpm]` 3.12.1 → **3.12.7** with the thin selection kept. |
+| **bote** | **3.3.1** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.3.0. **867 assertions across 13 suites** + the core-only drift guard, 14 benchmarks, both `dist/` bundles at v3.3.1. Content: defensive `[deps.sakshi]` **DELETED**, `[deps.libro]` → 2.8.5, `[deps.majra]` → 2.6.3, pin → 6.5.20. |
+| **agnosai** | 1.1.0 | **6.5.20** | ✅ **done, awaiting commit.** 97 suites, coverage **1561/1561 (100%)**, `check-clean.sh` green, `deps --verify` 113/0, duplicate-fn count unchanged at 35. VERSION stays 1.1.0 by design — it bumps at parity, not before. |
+| **cyrius** | 6.5.20 | — | ✅ not a blocker, and **never was**: 6.5.19 already folded patra 1.13.0. |
+
+## 🔎 Open findings — P(-1) sweep, 2026-08-12 (cyrius 6.5.20)
+
+Five dimensions reviewed with an adversarial verifier on every finding. **None of
+these is fixed** — they are deliberately not bundled with the toolchain bump
+(CLAUDE.md: ONE change at a time). Ordered by what to do first. Every number
+below was re-measured locally, not taken from the reviewer.
+
+⚠ **The most serious class is not allocation — it is code that is BUILT, TESTED,
+and NEVER CALLED.** Three separate features are fully implemented, carry passing
+assertions, and have zero production call sites. A green suite plus 100% coverage
+did not catch any of them, because *reference* coverage counts whether a symbol is
+named by a **test**, which these all are.
+
+0a. **The OTLP exporter posts to the collector ROOT, so the whole telemetry tier
+    is silently non-functional in the documented configuration.**
+    `_agnosai_otlp_post` (`src/telemetry/otlp.cyr:563`) calls
+    `sandhi_http_post(str_cstr(endpoint), …)` on the raw configured endpoint.
+    **`agnosai_otlp_path` (`:290`) — which exists solely to append the spec's
+    `/v1/traces` — has ZERO callers in `src/`**; its only references are five
+    assertions in `tests/telemetry_otlp.tcyr:228-240`. A collector configured as
+    `http://localhost:4318` (the documented form, and what `:48`'s comment
+    describes) receives `POST /` and answers 404. **One line to fix.**
+
+0a-bis. **No `OTEL_EXPORTER_OTLP_HEADERS`, so no hosted collector is reachable.**
+    `src/telemetry/mod.cyr` reads `OTEL_SERVICE_NAME` (`:84`) and
+    `OTEL_EXPORTER_OTLP_ENDPOINT` (`:92`) and nothing else; every hosted collector
+    (Honeycomb, Grafana Cloud, Datadog) authenticates via that header.
+
+    ⚠ **Frame this precisely — there is NO oracle counterpart to compare against.**
+    `rust-old/src/telemetry/mod.rs:50` delegates the entire transport to
+    `hoosh::telemetry::init_otel(endpoint, &service_name)`, so the oracle never
+    implements path construction, headers, or retry; it inherits them from an SDK.
+    Because ADR 003 consumes hoosh as a **remote HTTP seam rather than linking
+    it**, `src/telemetry/otlp.cyr` is hand-rolled and port-original. The bar for
+    it is therefore "what an OTLP/HTTP SDK does", not "what a Rust line does" —
+    and both 0a and this item are places it falls short of the spec.
+
+0b. **`src/server/output_filter.cyr` — 20 functions, fully tested, never
+    called.** The file is `include`d at `src/main.cyr:90` and that is its only
+    appearance outside itself; a per-symbol sweep of every public name finds
+    **zero** references anywhere in `src/`. This is the *outbound* half of the
+    prompt-injection defence — the inbound half (`prompt_guard`) is wired.
+
+0c. **The crew execution timeout is computed and never enforced.**
+    `agnosai_orchestrator_timeout_secs` (`src/orchestrator/orchestrator.cyr:157`)
+    resolves the budget or `AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS = 3600`, and has
+    **zero call sites in `src/`** — its only `src/` mention is a *comment* at
+    `main.cyr:316`. `_agnosai_orch_finish` calls `agnosai_crew_runner_run` with no
+    deadline, and the runner's loops poll only cancellation
+    (`crew_runner.cyr:870`, `:1017`). The oracle wraps the run in
+    `tokio::time::timeout` (`rust-old/src/orchestrator/orchestrator.rs:197-214`)
+    and on expiry logs `"crew execution timed out"` and returns a `Failed`
+    `CrewState`. `POST /api/v1/crews` runs the crew inline, so a wedged crew holds
+    one of the 100 pool workers **forever**, with no Failed state, no sakshi
+    event, and no audit record. ⚠ `main.cyr:316` and `CHANGELOG.md` both claim
+    the function "dereferences it, so a 0 faults the moment a crew runs" — false
+    as written, since it never runs; correct both with the fix.
+
+**The four allocation findings below share one root**: allocating on the
+**no-free global bump** inside a long-running server. That is not a leak Cyrius
+can collect; the process grows monotonically.
+
+⚠ **Read the arena figures as VIRTUAL ADDRESS SPACE, not RSS.** Arena chunks are
+anonymous overcommitted mmaps and `arena_new` touches only the header
+(`lib/alloc.cyr:150-155`, "only touched pages cost RAM"), so a 12 MiB arena costs
+12 MiB of VA and only the pages actually written in RSS. RSS still grows
+monotonically — the correction is to the magnitude, not to the defect.
+
+1. **`str_builder_new_a` is threaded, then every add/build is BARE — the arena
+   receives only the 88-byte header.** The builder struct is 24 bytes
+   `{buf,len,cap}` and **stores no allocator** (`lib/str.cyr:428`), so bare
+   `_sb_grow` and `str_builder_build` hardcode `default_alloc()`. `lib/str.cyr:433`
+   says so outright: *"Subsequent grows must use the `_a` add variants."* This is
+   a usage defect here, not a stdlib one. Swept the whole tree:
+
+   | file | `new_a` | add bare / `_a` | build bare / `_a` | |
+   |---|---|---|---|---|
+   | `server/routes/sse.cyr` | 3 | 0 / 10 | 0 / 3 | ✅ clean |
+   | `server/routes/mcp.cyr` | 2 | 0 / 5 | 0 / 2 | ✅ clean |
+   | `server/routes/approval.cyr` | 1 | 0 / 7 | 0 / 2 | ✅ clean |
+   | **`telemetry/otlp.cyr`** | 2 | **29 / 0** | **4 / 0** | 🔴 totally un-threaded |
+   | **`orchestrator/audit.cyr`** | 2 | **5** / 3 | **1** / 2 | 🟠 partial |
+
+   Measured cost in otlp: **~3.9 KB permanently leaked per exported span**, and
+   `agnosai_otlp_exporter_start` (`:627`) runs the drain on a **1000 ms loop even
+   with no endpoint configured** (`:584-586`). Both 256 KiB arenas at `:378-383`
+   are dead reservation, and the `drain` header's contract — "the returned Str
+   lives in the ring's `doc_arena`" — is false.
+
+   ⚠ **This is also a false claim in this very file.** The Tests section states
+   *"Every module threaded for arenas carries an `alloc_used()`-delta assertion …
+   mutation-verified — un-threading a single call fails them."* `tests/telemetry_otlp.tcyr`
+   contains **no `alloc_used` assertion at all**, which is exactly why 29 bare
+   calls went unnoticed. `tests/orch_audit.tcyr` has 4 and still missed 6.
+
+   ⚠ `str_builder_putc` has **no `_a` form**, so the hex trace/span id path needs
+   either its own short-lived `str_builder_new_a` + `str_builder_add_a`, or an
+   upstream `putc_a` filing.
+
+2. **Per-operation `arena_allocator(...)` arenas are never returned.**
+   `arena_allocator` → `arena_new` → `alloc(56) + alloc(cap+16)` **on the global
+   bump** (its own comment says so, `lib/alloc.cyr:741`), and `arena_reset` only
+   rewinds pointers. Measured on this tree: **2,621,552 bytes** charged per
+   `arena_allocator(2.5 MiB) + reset_via`, i.e. the whole capacity plus 112 B,
+   every iteration.
+
+   | site | per call | called | |
+   |---|---|---|---|
+   | `tools/agnos.cyr:234` | **5 MiB** | **every outbound HTTP request** — it *is* the transport fn ptr | 🔴 |
+   | `tools/remote_registry.cyr:179` | **12 MiB** | every remote package fetch | 🔴 |
+   | `tools/builtin/security_audit.cyr:673` | 2.5 MiB | per audit | 🟠 |
+   | `tools/builtin/load_testing.cyr:114,115` | 1 MiB + persistent | **per user**, in the loop at `:461` | 🟠 |
+   | `server/serve.cyr:259` | 64 KiB | per call | 🟡 |
+
+   Correct by contrast, and the shape to copy: `serve.cyr:95` (once per pool
+   worker), `telemetry/otlp.cyr:378,381` (module-level), `crew_runner.cyr:856`.
+
+   ⚠ Two comments assert the opposite of the truth and must be fixed with it:
+   `load_testing.cyr:476` — *"Every worker arena is released here"* over a loop
+   that is a literal no-op — and the Benchmarks note further down this file.
+   Error paths also call `reset_via(arena)` believing it frees.
+
+   **Oracle is not doing this**: `rust-old/src/tools/builtin/load_testing.rs:137-165`
+   gives each task a plain `Vec::new()`/`HashMap::new()` dropped at task end —
+   flat steady state. Port-introduced, sanctioned by no ADR, and the opposite of
+   the port plan's closed blocker #3, which specifies a **per-worker** arena.
+
+3. **`server_router.tcyr:453` asserts a property the matcher already violates,
+   under a bound 2.4× too loose to notice.** It claims *"a parameterised hit
+   captures one Str, not one per pattern tried"*, but
+   `_agnosai_path_matches_at` (`src/server/router.cyr:180-183`) runs
+   `str_sub_a` on reaching a `*` segment and only then compares the remaining
+   segments — so a trial that subsequently fails has already captured. The
+   threshold stays green up to seven captures. Fix the assertion to the true
+   property, or fix the matcher to capture only on a confirmed match.
+
+4. **`agnosai_prompt_scan_input` allocates 560 B of `Str` headers per CLEAN
+   scan.** `src/server/prompt_guard.cyr:112-174` holds 36 textual `str_from`
+   calls, 35 on the clean path. `agnosai_str_contains_ci_cstr`
+   (`src/strcase.cyr:96`) already exists for exactly this and is already used in
+   this literal shape at `sandbox/wasm.cyr:251-266` (5 sites) and
+   `fleet/cost_planning.cyr:169` — prompt_guard is the outlier. The oracle
+   allocates **nothing**: `rust-old/src/server/prompt_guard.rs:30` is a
+   `const INJECTION_PATTERNS: &[(&str,&str)]` static table.
+
+5. **SSE on an unknown crew id orphans a 256-slot channel + sender per request.**
+   `src/server/routes/sse.cyr:149-151` does has → subscribe → remove, which is
+   **parity** with `rust-old/src/server/routes/sse.rs:24-32` in *order* — but not
+   in reclamation: Rust's `remove` drops the `broadcast::Sender` and the receiver
+   drops at scope end, while `agnosai_event_bus_remove` (`src/server/sse.cyr:398-410`)
+   only `map_delete`s, leaving the sender (`:195`), the subscriber `chan_new(256)`
+   (`:144`) and the cloned key (`:385`) on the global bump. Unauthenticated
+   requests to a nonexistent crew id reach this.
+
+### Still outstanding, not blocking
+
+- **14 repos still declare `[deps.sakshi]`** — re-enumerated 2026-08-12 with
+  `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml`, which is the count to trust
+  over any figure carried forward in prose:
+
+  | tag | repos |
+  |---|---|
+  | 2.3.0 | shakti |
+  | 2.4.2 | argonaut |
+  | 2.4.3 | ghurni, prani, garjan |
+  | 2.4.4 | owl, vidya |
+  | 2.4.6 | anuenue, yukti, daimon, stiva, phylax |
+  | 2.4.7 | sit |
+  | **2.4.10** | **hisab** — current, so 13 are stale, not 14 |
+
+  **agnosai, bote, libro, majra, patra and sigil now declare none at all**, which
+  is the stronger end state than "pinned current": there is no block to go stale.
+  Each of the 13 is the same one-line fix patra took; none is in agnosai's
+  dependency path, so none blocks the port.
+- **`sha256` keeps a `cbank()`-banked message schedule** (`&W + cbank() * 512`)
+  in sigil. Fail-closed for a verify (a corrupted digest mismatches), but the
+  same structural pattern as the RSA lane bug. Not probed.
+- ⚠ **A `~/.cyrius/versions/<v>/lib` snapshot can be overwritten in place with a
+  later version's content** — observed with 6.5.18 on 2026-08-11, which made
+  `check-clean` fail against it while `lib/` was untouched. A snapshot mismatch
+  is not automatically drift in this tree; check the toolchain side first, and do
+  not re-sync just to make the gate pass.
+
+  ⚠ **But do not reach for this explanation first — it was wrong on 2026-08-12.**
+  `6.5.19/lib/patra.cyr` reading **1.13.0** looked exactly like an in-place
+  overwrite (6.5.18 and earlier read 1.12.12, and `6.5.19/lib` is byte-identical
+  to `6.5.20/lib`). It was not. patra 1.13.0 was tagged **2026-08-11 20:02:27**
+  and 6.5.19's binary was built **20:09:37**, seven minutes later, so 6.5.19
+  folded it legitimately. **Check the dependency's tag date against the
+  toolchain binary's build date before concluding corruption** — and note that
+  `~/.cyrius/versions/<v>/bin/cyrius --version` self-reports correctly, so the
+  binary is a reliable witness even when the `lib/` tree looks suspicious.
 
 ## Version
 
@@ -12,16 +337,57 @@ lands, not before, so the number always names something that actually shipped.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.19` (`cyrius.cyml`) — bumped 2026-08-11, three-step,
+- **Cyrius pin**: `6.5.20` (`cyrius.cyml`) — bumped 2026-08-12, three-step,
   `lib/` diffed after the sync AND again after a build: 107 files, zero content
-  differences. Folds **sigil 3.12.7**, **sakshi 2.4.10** and **sankoch 2.7.7**.
-  Full gate on the bumped tree: **97 suites, 0 failures.**
+  differences, `deps --verify` **113 verified / 0 failed**, duplicate-fn warning
+  count unchanged at **35**. Folds **patra 1.13.0**, **sigil 3.12.7**, **sakshi
+  2.4.10**, **bayan 1.4.1**, **sandhi 1.9.9** and **sankoch 2.7.7**. Full gate on
+  the bumped tree: **97 suites**, coverage **1561/1561 (100%)**, `check-clean.sh`
+  green, bench sweep **199 rows, 0 regressions**.
 
-  **Sibling pins as of the 2026-08-11 bump**: kavach **3.11.10**, majra
-  **2.6.2**, sigil 3.12.7, bote 3.3.0, ai-hwaccel 2.3.16, tyche 1.0.0, and the
-  defensive `[deps.sakshi]` at 2.4.10.
+  **Sibling pins as of the 2026-08-12 bump**: bote **3.3.1**, majra **2.6.3**,
+  kavach 3.11.10, sigil 3.12.7, ai-hwaccel 2.3.16, tyche 1.0.0. No
+  `[deps.sakshi]` anywhere in the chain — see the RESOLVED banner at the top.
 
-  **6.5.19 consumes both defects still open against it from this tree**, and in
+  ⚠ **6.5.20's stdlib snapshot is byte-identical to 6.5.19's.** `diff -rq`
+  across both `lib/` trees reports **0 differing files**, so this is a **pure
+  compiler release** and the bump buys code generation, not modules. It also
+  means the thing the handoff was waiting for — a re-fold of patra 1.13.0 — had
+  **already happened in 6.5.19** (6.5.18 → 6.5.19 differs by exactly one file,
+  `patra.cyr`).
+
+  **What 6.5.20 fixes:**
+
+  - **P1 — a `switch` / `match` case body could only be left safely by
+    `return`.** Falling through after a store to a local gave a **wrong answer
+    with no diagnostic**, or a segfault, on every target. Cause: the v5.6.27
+    regalloc NOP-harvest compactor repairs jump disp32s and fixup CPs but never
+    knew the switch jump table existed, so entries shifted **+4 per preceding
+    case body** (`16, 30, 47, 64` where correct is `16, 26, 39, 52`). `case 0`
+    alone worked; `{ return N; }` bodies never saw it — no local store, no NOP.
+
+    ⚠ **agnosai's own source is not exposed** — zero statement-position
+    `switch`/`match` across `src/`, `tests/`, `benches/`. Three *vendored* sites
+    carry the trigger shape: `lib/sakshi.cyr:1101` (`_sk_level_str`, ten arms,
+    every one a `store64` pair with fallthrough — it formats **every sakshi log
+    line**), `lib/kavach.cyr:795` and `lib/sigil.cyr:221` (both `syserr_print`,
+    arms declaring locals, no `_ =>` default).
+
+    ⚠ **Whether any of the three actually miscompiled under 6.5.19 is
+    undetermined, and a green suite does not settle it.** A minimal repro
+    compiles correctly on 6.5.18, .19 and .20 alike — the defect needs enough
+    register pressure for the picker to leave harvestable NOPs, which a small
+    function does not create. The failure mode is a silent wrong answer, so the
+    97-suite baseline being green on 6.5.19 is evidence, not proof.
+  - **`#derive` no longer inflates line numbering**, freeing one file-map entry
+    per derive against the 1024 cap. agnosai authors **zero** `#derive`
+    directives, but **93** expand upstream of it: `lib/kavach.cyr` 35,
+    `lib/libro.cyr` 27, `lib/ai-hwaccel.cyr` 16, `lib/sigil.cyr` 15.
+
+  **Previously 6.5.19**, whose two consumed filings are recorded below because
+  the corrections still matter:
+
+  **6.5.19 consumed both defects then open against it from this tree**, and in
   both cases went past what was filed:
 
   - **`fl_alloc` is thread-safe** (`lib/freelist.cyr`). Filed as **one** race
@@ -245,33 +611,67 @@ unchanged at **35**, and all 57 suites stayed green across the bump.
 
 ## Source
 
-`src/` mirrors `rust-old/src/` — see CLAUDE.md's *Layout* rule. Regenerated from
-the tree 2026-08-08 with `find src -maxdepth 1 -name '*.cyr'` per group:
+`src/` mirrors `rust-old/src/` — see CLAUDE.md's *Layout* rule. **Regenerated
+from the tree 2026-08-12**; every number below was measured, not carried forward:
 
 | Group | Files | Lines | Oracle |
 |---|---|---|---|
-| `orchestrator/` | 16 | 5,632 | ✅ complete (M5) |
-| `server/` | 11 | 4,291 | ✅ complete (M6) |
-| `fleet/` | 12 | 3,676 | ✅ complete (M8) |
-| `telemetry/` | 3 | 1,524 | ✅ complete (M9) — `mod` + `genai` + OTLP, with the span call sites wired ([ADR 017](../adr/017-genai-span-call-sites.md)) |
-| `sandbox/` | 9 | 3,345 | ✅ complete (M7) |
-| `core/` | 8 | 3,305 | ✅ complete (M2) |
-| `server/routes/` | 10 | 2,686 | ✅ complete (M6) |
+| `orchestrator/` | 16 | 5,682 | ✅ complete (M5) |
+| `server/` | 11 | 4,276 | ✅ complete (M6) |
+| `sandbox/` | 10 | 3,739 | ✅ complete (M7) |
+| `fleet/` | 12 | 3,653 | ✅ complete (M8) |
+| `core/` | 8 | 3,637 | ✅ complete (M2) |
+| `definitions/` | 7 | 2,757 | ✅ complete (M10) |
+| `server/routes/` | 11 | 2,720 | ✅ complete (M6) |
 | `tools/builtin/` | 7 | 2,138 | ✅ complete (M4) |
-| `llm/` | 4 | 1,229 | ✅ complete (M3) |
-| `tools/` | 5 | 1,144 | ✅ complete (M4) |
+| `tools/` | 8 | 1,830 | ✅ complete (M4) |
+| `llm/` | 5 | 1,762 | ✅ complete (M3) |
+| `telemetry/` | 3 | 1,529 | ✅ complete (M9) — `mod` + `genai` + OTLP, with the span call sites wired ([ADR 017](../adr/017-genai-span-call-sites.md)) |
 | `learning/` | 6 | 1,018 | ✅ complete (M2) |
-| root (port-local) | 6 | 1,054 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy` |
-| **total** | **97** | **31,163** | against a **41,163**-line oracle |
+| root (port-local) | 7 | 1,209 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy`, `strcase` |
+| **total** | **111** | **35,950** | against **27,683** lines of `rust-old/src/` |
 
 Regenerate with:
 
 ```sh
+find src -name '*.cyr' | wc -l
 find src -name '*.cyr' | xargs wc -l | tail -1
+for d in $(find src -type d | sort); do
+  n=$(find "$d" -maxdepth 1 -name '*.cyr' | wc -l); [ "$n" -gt 0 ] || continue
+  printf '%-22s %2s %6s\n' "${d#src}" "$n" \
+    "$(find "$d" -maxdepth 1 -name '*.cyr' | xargs wc -l | tail -1 | awk '{print $1}')"
+done
 ```
 
-⚠ The oracle denominator is **41,163**, not the 27,683 this file carried until
-2026-08-07 — see the banner below for what the smaller number leaves out.
+⚠ **The previous table was stale in every row and omitted a whole group.** It
+read 97 files / 31,163 lines from 2026-08-08 and had no `definitions/` row at
+all, despite M10 completing on 2026-08-09 — so it under-counted by 14 files and
+4,787 lines. The `find … -maxdepth 1` per-group form it documented cannot find a
+group nobody adds a row for; the loop above enumerates directories instead, so a
+new group cannot go missing.
+
+⚠ **The oracle denominator is 27,683; the "41,163" this file asserted counts the
+wrong things.** Measured 2026-08-12:
+
+| what | lines |
+|---|---|
+| `rust-old/src` `.rs` (98 files) | **27,683** |
+| all `rust-old` `.rs` — + tests 161, benches 2,494, examples 39, fuzz 46 (124 files) | 30,423 |
+| **every file type** in `rust-old` — also `.json` fixtures, `.toml`, `.lock`, `.pem`, `.md` | **40,491** |
+
+41,163 is within 672 of that last row, so it most likely came from an all-files
+count taken earlier — **not** from nothing, but from the wrong denominator for a
+*source* port: it counts JSON fixtures, manifests and lockfiles as lines to port.
+27,683 is what CLAUDE.md has said all along and is the number to use.
+
+⚠ The per-milestone oracle sub-tables further down are **not** affected — the
+error was confined to this one headline figure. Spot-checked 2026-08-12: `fleet/`
+is exactly 4,443 and `definitions/` exactly 1,460, as they claim.
+
+⚠ **The port being LONGER than the oracle (35,950 vs 27,683) is expected, not
+scope creep.** Cyrius sits below Rust: no `?`, no derives, no iterator
+combinators, and manual arena threading, so a faithful port of a given module
+runs longer. Do not read the ratio as a completeness signal in either direction.
 
 **Oracle groups still owed** (`sandbox/` completed at M7, so this table is
 narrower than it was; the scope qualifiers on the rest are **removed** — see the
@@ -472,8 +872,8 @@ Standing decisions that shaped the port, each with its record:
 
 ## Tests
 
-**97 suites, all passing** (2026-08-10), plus **4 fuzz harnesses** and **1
-doctest**. The most recent: `tests/core_mod_doctest.tcyr` (13 — the ONE real
+**97 suites, all passing** — re-verified 2026-08-12 on cyrius 6.5.20 — plus
+**4 fuzz harnesses** and **1 doctest**. The most recent: `tests/core_mod_doctest.tcyr` (13 — the ONE real
 doctest under `rust-old/src/`; the other three fenced blocks are
 `text`/`ignore`/`yaml` and `cargo test` compiles none of them), and:
 `tests/llm_inference_queue.tcyr` (69 assertions, 18 mutation probes / 18 kills),
@@ -526,10 +926,17 @@ fail-open divergences, and five security controls that could be deleted without
 a single failure. Reference coverage counts whether a symbol is *named* by a
 test.
 
-**The whole tree is green, verified two ways on 2026-08-05.** `cyrius tests
-tests` completes and reports `66 passed, 0 failed` (suites, not assertions —
-see the counting note below), summing to **5,559 assertions passed, 0 failed,
-0 suites unclean**.
+**The whole tree is green on cyrius 6.5.20, re-run 2026-08-12**: `cyrius tests
+tests` reports **`97 passed, 0 failed`** (suites, not assertions — see the
+counting note below), with zero `FAIL:` lines anywhere in the run. Identical to
+the pre-bump baseline on 6.5.19, so the toolchain bump is behaviour-neutral here.
+
+⚠ **No assertion total is recorded for that run.** It was captured through
+`| tail -25`, which discards the per-suite `(N total)` lines the sum needs — so
+quoting one would be inventing it. The earlier figure of **5,559 assertions
+across 66 suites (2026-08-05)** is the last one actually measured; it predates
+31 suites and must not be presented as current. To get a real total, run without
+truncating and sum only the `(N total)`-suffixed lines.
 
 ⚠ **A note here previously said the full run "exceeds ~570 s and stalls in
 `server_sse`". It does not stall** — it completes, well inside a 25-minute
@@ -538,12 +945,14 @@ on its own. It *is* slow, so the per-suite loop is still the faster way to work:
 `cyrius build tests/<name>.tcyr <out> && <out>`. The eight sandbox suites total
 ~75 s that way.
 
-Coverage `cyrius coverage --min 80` → **100% (1099/1099 fns)**. The denominator
-counts public symbols only — `_`-prefixed internals are excluded by design,
-which is why adding six of them moved it by one.
+Coverage `cyrius coverage --min 80` → **100% (1561/1561 fns, 102/102 files)**,
+re-measured 2026-08-12 on 6.5.20. The denominator counts public symbols only —
+`_`-prefixed internals are excluded by design, which is why adding six of them
+moved it by one. (The **1099/1099** this line carried until now was the
+2026-08-05 figure and had gone stale by 462 functions.)
 
 ```sh
-cyrius tests tests          # 66 suites; each prints "N passed" with an "(N total)" suffix
+cyrius tests tests          # 97 suites; each prints "N passed" with an "(N total)" suffix
 cyrius coverage --min 80    # the gate, and its own CI step
 ```
 
@@ -553,8 +962,10 @@ caught it said to *regenerate from command output rather than editing rows by
 hand*. A table that can only be maintained by hand will drift again, so the two
 commands above are the authority. Counting gotcha if you sum by hand:
 `cyrius tests tests` prints one line **per suite** carrying an `(N total)` suffix,
-plus a final `66 passed, 0 failed` line that counts **suites, not assertions** —
-sum only the suffixed lines.
+plus a final `97 passed, 0 failed` line that counts **suites, not assertions** —
+sum only the suffixed lines. ⚠ And do not pipe the run through `tail`: it drops
+the very lines the sum needs, which is how the 2026-08-12 run ended up with no
+recorded assertion total.
 
 Corpus size: **1,125,915 bytes** of `.tcyr`. `cyrius coverage` had a fixed 1 MiB
 corpus buffer that silently under-reported past it; fixed upstream in **6.5.8**,
@@ -622,11 +1033,19 @@ function pointer, a recording stub turns the whole untested half into ordinary
 assertions: URL construction, form encoding, body construction, path-traversal
 guards, response reshaping.
 
-**Allocator assertions are a first-class test category now.** Every module threaded
-for arenas carries an `alloc_used()`-delta assertion (0 bytes over N iterations)
-plus a byte-identical-wire check against its global twin. Both are
-**mutation-verified** — un-threading a single call fails them. Treat that pair as
-the contract for any further threading work.
+**Allocator assertions are a first-class test category now.** A module threaded
+for arenas should carry an `alloc_used()`-delta assertion (0 bytes over N
+iterations) plus a byte-identical-wire check against its global twin. Both are
+**mutation-verified** where they exist — un-threading a single call fails them.
+Treat that pair as the contract for any further threading work.
+
+⚠ **"Every module" was FALSE, corrected 2026-08-12.** `tests/telemetry_otlp.tcyr`
+has **no `alloc_used` assertion at all**, and `src/telemetry/otlp.cyr` accordingly
+threads `str_builder_new_a` and then makes **29 bare `str_builder_add*` and 4 bare
+`str_builder_build`** calls, every one of which lands on the global bump.
+`tests/orch_audit.tcyr` has 4 such assertions and still missed 6 bare calls in
+`orchestrator/audit.cyr`. Verify per module with the sweep in the *Open findings*
+section near the top of this file; do not trust this paragraph's old claim.
 
 **Four things that made an arena assertion look stronger than it was.** All four
 were caught by mutation, and all four generalise to any further threading:
@@ -716,7 +1135,10 @@ Rust oracle for comparison: **863 unit + 2 integration + 1 doctest, all passing.
 
 ## Benchmarks
 
-**10 `.bcyr` files, ~200 rows in `bench-history.csv`, all compiling as of
+**10 `.bcyr` files, 199 rows per sweep, all compiling — re-run 2026-08-12 on
+6.5.20: `10 passed, 0 failed`, and a row-by-row diff against the pre-bump sweep
+shows 199/199 ids in common with ZERO regressions past 15% and one improvement
+(`prompt_scan_clean_500b`, 95,555 → 63,109 ns, −34.0%). Previously verified
 2026-08-11** — against 106 rows and three non-compiling files that morning. See
 the Tests section for how they had stopped. `benches/llm.bcyr`,
 `benches/fleet.bcyr` and `benches/definitions.bcyr` are new; `llm` was the first

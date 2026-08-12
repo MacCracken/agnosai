@@ -5,7 +5,7 @@ description = "AgnosAI — provider-agnostic AI orchestration: crews, tasks, too
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/agnosai"
 language = "cyrius"
-cyrius = "6.5.19"
+cyrius = "6.5.20"
 
 [build]
 entry = "src/main.cyr"
@@ -119,33 +119,50 @@ modules = ["dist/tyche.cyr"]
 # under the 6.5.10 bump the tree built 2.4.7 while the pin shipped 2.4.8,
 # silently reverting sakshi's `i64::MIN` integer-format fix.
 #
-# ⚠ **What actually changed is that the guard MOVED, not that the hazard did.**
-# The real source was never a direct sibling — it is four links down:
+# ⚠ **The real source was never a direct sibling — it was four links down**, and
+# as of the 6.5.20 bump every link is fixed at its own root rather than absorbed
+# by a downstream counter-pin:
 #
-#     agnosai -> bote -> [deps.libro] 2.8.4 -> [deps.patra] 1.12.12
-#             -> [deps.sakshi] 2.4.2
+#     agnosai -> bote -> [deps.libro] -> [deps.patra] -> [deps.sakshi] 2.4.2
+#                 ✅ 3.3.1    ✅ 2.8.5      ✅ 1.13.0        ✅ gone
 #
-# **patra is itself FOLDED INTO the cyrius stdlib** (`lib/patra.cyr`, v1.12.12 in
-# the 6.5.19 snapshot) while carrying a git dep on a sakshi eight patch releases
-# behind the sakshi that same snapshot ships. **bote 3.3.1 now pins sakshi
-# forward at 2.4.10 to absorb it**, which is what makes this block removable
-# here. That pin is documented at length in bote's manifest and should be deleted
-# the moment patra is fixed and re-folded — at which point nothing in this chain
-# needs a pin at all.
+# **patra is itself FOLDED INTO the cyrius stdlib** while it carried that git dep
+# on a sakshi eight patch releases behind the sakshi the same snapshot ships.
+# The sequence that closed it, in order, each verified before the next:
 #
-# ⚠ **So agnosai's correctness here now depends on bote's pin.** That is an
-# acceptable trade only because the regression is DETECTED rather than trusted:
-# `scripts/check-clean.sh` diffs `lib/` against the toolchain snapshot and fails
-# on any drift, and CI runs it. If `lib/sakshi.cyr` ever moves off the snapshot
-# again, that gate is what catches it — re-derive the chain with
-# `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml` and follow it DOWN, not just
-# one level.
+#   1. **patra 1.13.0** — zero `[deps.*]` blocks, sakshi from the fold.
+#   2. **cyrius 6.5.20** — re-folds patra 1.13.0 (`lib/patra.cyr` reads 1.13.0).
+#   3. **libro 2.8.5** — `[deps.patra]` 1.12.12 -> 1.13.0. ⚠ Also
+#      `[deps.sigil]`/`[deps.sigil_tpm]` 3.12.1 -> 3.12.7: **sigil 3.12.1's own
+#      manifest declared `[deps.sakshi]` at 2.4.3**, so libro fed the overlay
+#      through TWO pins, which no earlier analysis here had found.
+#   4. **bote 3.3.1** — the defensive `[deps.sakshi]` 2.4.10 is DELETED, its
+#      reason removed. Re-verified after a build: sakshi holds at 2.4.10.
 #
-# ⚠ **Do not re-derive this note from one level of manifests.** Its predecessor
-# was wrong twice for exactly that reason: it named "sigil and bote", then
-# "majra 2.6.0", and at the 6.5.18 bump had written bote off on the strength of
-# one of two siblings having dropped the dep. Sixteen repos in this workspace
-# pin `[deps.sakshi]`, spanning 2.3.0 to 2.4.10.
+# ⚠ **Two corrections to the plan that state.md carried**, both established by
+# measurement rather than reasoning, and both the opposite of what it said:
+#
+#   * **libro must KEEP `[deps.patra]`** (bumped, not deleted). bote consumes
+#     `dist/libro.cyr`, which calls `patra_*` 54 times and defines none, and bote
+#     declares no patra of its own — deleting the block strands bote.
+#   * **libro must KEEP its THIN `[deps.sigil]` sub-bundle selection.** The fold
+#     is the monolith (`lib/sigil.cyr`, 27,550 lines, x509/RSA bignum banks). A
+#     consumer taking `dist/sigil.cyr` builds with `warning: large static data
+#     (10794336 bytes)`; libro's thin build is `.bss` 80,224 bytes. Only the tag
+#     needed to move.
+#
+# The hazard mechanism itself is unchanged and will recur: a sibling pinned
+# behind the toolchain silently downgrades a folded module for every consumer
+# that reaches it, however many levels away. `scripts/check-clean.sh` diffs
+# `lib/` against the toolchain snapshot and fails on any drift, and CI runs it —
+# that gate is what catches a recurrence.
+#
+# ⚠ **Do not re-derive this note from one level of manifests.** Its predecessors
+# were wrong three times for exactly that reason: they named "sigil and bote",
+# then "majra 2.6.0", then "bote". Follow the chain DOWN — start with
+# `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml`, then read each hit's OWN
+# manifest, recursively. **13 repos still pin `[deps.sakshi]` at stale tags**
+# (2.3.0-2.4.7); none is in agnosai's dependency path.
 
 [release]
 bins = ["agnosai"]

@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Toolchain pinned to cyrius 6.5.20** (was 6.5.19). Full three-step, `lib/`
+  diffed against the 6.5.20 snapshot **after the sync and again after a build**:
+  zero drift, `cyrius deps --verify` **113 verified / 0 failed**, duplicate-fn
+  warning count unchanged at **35**. Gate on the bumped tree: **97 suites**,
+  coverage **1561/1561 (100%)**, `check-clean.sh` green (fmt 219, lint 122,
+  doc 112, doctest 1).
+
+  ⚠ **6.5.20's stdlib snapshot is byte-identical to 6.5.19's** — `diff -rq`
+  across both `lib/` trees reports **0 differing files**. This is a pure
+  compiler release, so the bump buys code generation, not modules. What it
+  fixes:
+
+  - **P1 — a `switch` / `match` case body could only be left safely by
+    `return`.** A body that fell through after storing to a local produced a
+    **wrong answer with no diagnostic**, or a segfault; broken on every target.
+    Cause was the v5.6.27 regalloc NOP-harvest compactor, which repairs jump
+    disp32s and fixup CPs but never knew the switch jump table existed —
+    entries came out `16, 30, 47, 64` where correct is `16, 26, 39, 52`, off by
+    exactly +4 per preceding case body. `case 0` alone worked, and bodies of
+    `{ return N; }` never saw it: no local store, no NOP, no shift.
+
+    **agnosai's own source is not exposed** — zero statement-position
+    `switch` / `match` across `src/`, `tests/` and `benches/`. Three sites in
+    the *vendored* surface carry the trigger shape: `lib/sakshi.cyr:1101`
+    (`_sk_level_str`, ten arms, every one a `store64` pair with fallthrough —
+    it formats every sakshi log line), `lib/kavach.cyr:795` and
+    `lib/sigil.cyr:221` (both `syserr_print`, arms declaring locals, no `_ =>`
+    default). ⚠ **Whether any of the three actually miscompiled under 6.5.19 is
+    undetermined** — a minimal repro compiles correctly on 6.5.18, .19 and .20
+    alike, because the defect needs enough register pressure for the picker to
+    leave harvestable NOPs. The 97-suite baseline was green on 6.5.19, which is
+    evidence against a live functional break but not proof, since the failure
+    mode is a silent wrong answer.
+  - `#derive` no longer inflates line numbering, removing one file-map entry
+    per derive against the 1024 cap. agnosai authors **zero** `#derive`
+    directives, but 93 real ones expand upstream of it across `lib/kavach.cyr`
+    (35), `lib/libro.cyr` (27), `lib/ai-hwaccel.cyr` (16) and `lib/sigil.cyr`
+    (15).
+
+- **`[deps.bote]` → 3.3.1, `[deps.majra]` → 2.6.3**, both released as part of
+  this chain rather than consumed from an existing tag.
+
+### Fixed
+
+- **The four-level dependency defect is CLOSED at every root, not absorbed by a
+  counter-pin.** agnosai's own `[deps.sakshi]` was already gone; what landed now
+  is the rest of the chain:
+
+  ```
+  agnosai -> bote -> [deps.libro] -> [deps.patra] -> [deps.sakshi] 2.4.2
+              ✅ 3.3.1    ✅ 2.8.5      ✅ 1.13.0        ✅ gone
+  ```
+
+  In order, each verified before the next: **patra 1.13.0** (zero `[deps.*]`),
+  **cyrius re-folds it**, **libro 2.8.5** (`[deps.patra]` 1.12.12 → 1.13.0),
+  **bote 3.3.1** (defensive `[deps.sakshi]` 2.4.10 deleted). Re-confirmed here
+  **after a build**: `lib/sakshi.cyr` holds at **2.4.10**, `lib/patra.cyr` at
+  1.13.0, `lib/sigil.cyr` at 3.12.7.
+
+- **A second stale-sakshi path, never previously identified.** libro fed the
+  overlay through **two** pins, not one: **sigil 3.12.1's own manifest declared
+  `[deps.sakshi]` at 2.4.3**, alongside patra 1.12.12's 2.4.2. libro 2.8.5 moves
+  sigil to 3.12.7 (zero `[deps.*]`), which also closes the **3.12.5 PKCS#1 v1.5**
+  and **3.12.6 RSA-PSS** authentication bypasses libro had been pinned behind.
+
 ### Security
 
 - **RS256 JWT verification was an authentication bypass under load. Fixed by
