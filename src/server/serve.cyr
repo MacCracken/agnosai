@@ -415,15 +415,28 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
     # Rate limiting runs before routing, matching where a tower layer would sit.
     # Mounted by default (ADR 021); `_agnosai_serve_limiter` is 0 only when an
     # operator set `AGNOSAI_RATE_LIMIT=0` or a suite drives the handler directly.
-    if (_agnosai_serve_limiter != 0) {
+    #
+    # ⚠ **The three unauthenticated probes are exempt.** `/health`, `/ready` and
+    # `/metrics` are precisely the routes `agnosai_route_needs_auth` leaves open,
+    # and a kubelet sends neither `X-Forwarded-For` nor `X-Real-IP`, so its probe
+    # keys as `"unknown"` — the single shared bucket every header-less client
+    # lands in. Limiting them means an unauthenticated flood of `GET /health`
+    # drains that shared bucket, the liveness probe starts taking 429, and the
+    # orchestrator kills the pod: a crash loop manufactured by the very control
+    # meant to prevent one. Exempting them costs nothing an attacker wants —
+    # they read no state and touch no crypto — and it is the difference between
+    # a limiter that sheds load and one that takes the service down.
+    if (_agnosai_serve_limiter != 0 && _agnosai_serve_rl_exempt(method, path) == 0) {
+        var ka = a;
+        if (ka == 0) { ka = default_alloc(); }
         var xff_s = str_from("");
         var has_xff = 0;
-        if (xff != 0) { has_xff = 1; if (a != 0) { xff_s = str_from_a(a, xff); } else { xff_s = str_from(xff); } }
+        if (xff != 0) { has_xff = 1; xff_s = str_from_a(ka, xff); }
         var xri_s = str_from("");
         var has_xri = 0;
-        if (xri != 0) { has_xri = 1; if (a != 0) { xri_s = str_from_a(a, xri); } else { xri_s = str_from(xri); } }
-        var key = agnosai_rate_limit_client_key(xff_s, has_xff, xri_s, has_xri);
-        if (agnosai_rate_limit_check_request(_agnosai_serve_limiter, key) != HTTP_OK) {
+        if (xri != 0) { has_xri = 1; xri_s = str_from_a(ka, xri); }
+        var key = agnosai_rate_limit_client_key_a(ka, xff_s, has_xff, xri_s, has_xri);
+        if (agnosai_rate_limit_check_request_a(a, _agnosai_serve_limiter, key) != HTTP_OK) {
             _agnosai_serve_send_status(a, cfd, AGNOSAI_HTTP_TOO_MANY_REQUESTS,
             "Too Many Requests");
             return 0;
@@ -523,6 +536,18 @@ fn _agnosai_serve_send(a, cfd, resp): i64 {
     }
     return sandhi_server_send_response(cfd, status, _agnosai_serve_reason(status),
     ctype, str_data(text), str_len(text), 0);
+}
+
+# Whether this request is one of the three unauthenticated probes, which the
+# limiter must not refuse. Resolved through the router rather than compared
+# against path literals, so it cannot drift from `agnosai_route_needs_auth`.
+fn _agnosai_serve_rl_exempt(method, path: Str): i64 {
+    if (method != AGNOSAI_METHOD_GET) { return 0; }
+    var id = agnosai_route_match_id(agnosai_route_resolve(method, path));
+    if (id == AGN_ROUTE_HEALTH) { return 1; }
+    if (id == AGN_ROUTE_READY) { return 1; }
+    if (id == AGN_ROUTE_METRICS) { return 1; }
+    return 0;
 }
 
 fn _agnosai_serve_send_status(a, cfd, code, msg): i64 {

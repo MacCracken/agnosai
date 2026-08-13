@@ -1,0 +1,108 @@
+# Isolated: retention attributable to majra's bucket map alone.
+# The key is formatted into a fixed stack buffer, so nothing but majra
+# allocates inside the loop.
+
+include "src/units.cyr"
+include "src/arena_pool.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/mod.cyr"
+include "src/learning/mod.cyr"
+include "src/llm/mod.cyr"
+include "src/server/ssrf.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/server/prometheus.cyr"
+include "src/server/auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/sandbox/mod.cyr"
+include "src/tools/mod.cyr"
+include "src/orchestrator/mod.cyr"
+include "src/server/state.cyr"
+include "src/server/routes/mod.cyr"
+include "src/server/routes/health.cyr"
+include "src/server/hot_config.cyr"
+include "src/server/rate_limit.cyr"
+include "tests/test_helpers.cyr"
+
+fn _rp_rss_kb(): i64 {
+    var buf[256];
+    var n = file_read_all("/proc/self/statm", &buf, 255);
+    if (n <= 0) { return 0 - 1; }
+    var i = 0;
+    while (i < n && (load8(&buf + i) & 255) != 32) { i = i + 1; }
+    while (i < n && (load8(&buf + i) & 255) == 32) { i = i + 1; }
+    var pages = 0;
+    while (i < n) {
+        var c = load8(&buf + i) & 255;
+        if (c < 48 || c > 57) { i = n; } else {
+            pages = pages * 10 + (c - 48); i = i + 1;
+        }
+    }
+    return pages * 4;
+}
+
+fn _rp_say(label: cstring, v): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, label);
+    str_builder_add_int(sb, v);
+    str_builder_add_cstr(sb, "\n");
+    var s = str_builder_build(sb);
+    file_write(1, str_data(s), str_len(s));
+    return 0;
+}
+
+# "10.0.0.<i>" into `buf`, NUL-terminated. Returns nothing.
+fn _rp_fmt(buf, i): i64 {
+    var p = buf;
+    store8(p, 49); store8(p + 1, 48); store8(p + 2, 46);        # "10."
+    store8(p + 3, 48); store8(p + 4, 46);                        # "0."
+    store8(p + 5, 48); store8(p + 6, 46);                        # "0."
+    var off = 7;
+    var digits[24];
+    var nd = 0;
+    var v = i;
+    if (v == 0) { store8(&digits, 48); nd = 1; }
+    while (v > 0) { store8(&digits + nd, 48 + v - (v / 10) * 10); v = v / 10; nd = nd + 1; }
+    var k = nd;
+    while (k > 0) { k = k - 1; store8(p + off, load8(&digits + k)); off = off + 1; }
+    store8(p + off, 0);
+    return 0;
+}
+
+fn _rp_run(n): i64 {
+    var s = agnosai_rate_limit_new(100000, 200);   # shipped defaults
+    var lim = load64(s + AGN_RL_LIMITER);
+    var kbuf[64];
+    var rss0 = _rp_rss_kb();
+    for (var i = 0; i < n; i = i + 1) {
+        _rp_fmt(&kbuf, i);
+        ratelimit_check(lim, &kbuf);               # cstr, as majra requires
+    }
+    var rss1 = _rp_rss_kb();
+    _rp_say("unique keys                = ", n);
+    _rp_say("rejected                   = ", agnosai_rate_limit_total_rejected(s));
+    _rp_say("active_keys                = ", agnosai_rate_limit_active_keys(s));
+    _rp_say("rss growth (KiB)           = ", rss1 - rss0);
+    _rp_say("bytes retained per key     = ", (rss1 - rss0) * 1024 / n);
+    _rp_say("evict_stale returned       = ", agnosai_rate_limit_evict_stale(s));
+    _rp_say("active_keys after evict    = ", agnosai_rate_limit_active_keys(s));
+    assert(agnosai_rate_limit_active_keys(s) == n, "every unique key retains a bucket");
+    assert(agnosai_rate_limit_total_rejected(s) == 0, "the flood is never throttled");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    _rp_run(1000000);
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

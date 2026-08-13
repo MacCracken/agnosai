@@ -1044,16 +1044,16 @@ upstream). Three became decisions — **D3/D4/D5** under *Owed work*.
 #### M12 — what is left
 
 **Nothing under `src/`, `tests/`, `benches/`, `fuzz/` or `examples/`.** Every
-bite is closed. What remains is one wasmtime-gated half and five decisions:
+bite is closed. What remains is one wasmtime-gated half; **all five decisions are closed.**
 
 | | |
 |---|---|
 | the WASM **execute** path | needs `wasmtime` installed; the manifest half is done |
-| **D1** mount `rate_limit`? | open since M6 |
+| ~~**D1**~~ mount `rate_limit`? | ✅ **DECIDED, closed 2026-08-13 — yes, by default.** [ADR 021](../adr/021-rate-limit-mounted-by-default.md). Not a question. |
 | ~~**D2**~~ `"personality": null` | ✅ **DECIDED, closed — defer, do not drop.** bhava is coming; the wire keeps `null`. Not a question. |
-| **D3** memoize `builtin_presets()`? | opened 2026-08-11 |
-| **D4** `rounds x batch` for the bench sweep? | opened 2026-08-11 |
-| **D5** dispatch rows include body serialization? | opened 2026-08-11 |
+| ~~**D3**~~ memoize `builtin_presets()`? | ✅ **DECIDED, closed 2026-08-13 — no. Leave it cold.** Not a question. |
+| ~~**D4**~~ `rounds x batch` for the bench sweep? | ✅ **DECIDED AND DONE 2026-08-13 — yes, across all eleven `.bcyr`.** Not a question. |
+| ~~**D5**~~ dispatch rows include body serialization? | ✅ **DECIDED AND DONE 2026-08-13 — full route confirmation, not half.** Not a question. |
 
 #### Still not started
 
@@ -1096,7 +1096,19 @@ PEMs live on as frozen RS256 vectors in `tests/server_auth_vectors.cyr`, kept in
 a `.cyr` deliberately so ~16 KB of base64 stays out of the `.tcyr` coverage
 budget.
 
-### D3 — should `builtin_presets()` be memoized? (opened 2026-08-11)
+### ~~D3~~ — ✅ **DECIDED 2026-08-13: NO. Leave `builtin_presets()` cold. Do not re-raise it.**
+
+The user's reasoning, recorded verbatim: *"presets can be cold; as agent might
+get different instruction sets than presets and seems a waste of speed
+improvements."* The route is not hot, the parse is not on any agent's critical
+path, and a process-lifetime cache of parsed structs buys speed nowhere it is
+needed while adding the one thing this tier deliberately avoids. **The oracle's
+shape stands and no ADR is owed** — the divergence is not taken.
+
+The measurements below are kept as the reasoning archive for why the question
+was worth asking, not as an open question.
+
+#### (archived) the numbers behind the question
 
 **Measured, not speculated.** Every `GET /api/v1/presets` re-parses all 18 embedded
 preset documents and re-serializes them:
@@ -1124,8 +1136,7 @@ the 64 KiB `AGNOSAI_SERVE_ARENA_BYTES`), not a leak.
 The argument for memoizing is that the parse result never changes. The argument
 against is that it is the oracle's shape, the route is unlikely to be hot, and a
 process-lifetime cache of parsed structs is shared mutable state that every other
-route in this tier deliberately avoids. **No recommendation — this is D1's
-kind of call.** (D2 is closed, not a comparator: bhava is decided.)
+route in this tier deliberately avoids. **The argument against won.**
 
 ### ~~D4~~ — ✅ **DECIDED AND DONE 2026-08-13: yes, across all eleven `.bcyr`.**
 
@@ -1307,7 +1318,7 @@ Security section for the reasoning. **D1's argument moves with these numbers.**
 
 | # | Decision | Where it stands |
 |---|---|---|
-| D1 | **Mount `rate_limit`?** | Ported and tested (bite 14), **not mounted** — matching the oracle, which never installs the middleware. `agnosai_serve_with_rate_limit` is the opt-in path. Mounting it by default is a **wire change**: clients fine today would start seeing 429s at a threshold agnosai chose, not one the oracle documents. The argument for mounting rested on the JWT-verify ceiling, which **C1 has now re-measured at 1.202 ms — ~830 verifies/sec per core, up from ~300**. That weakens the case for mounting by default without removing it: an unauthenticated flood still costs a modexp per request, because the `alg` check deliberately sits after signature verification. Still a human call. |
+| ~~D1~~ | ~~**Mount `rate_limit`?**~~ | ✅ **DECIDED 2026-08-13 — YES, mounted by default. Do not re-raise it.** The user's reasoning, recorded verbatim: *"agnosai ships safe-by-default for operators who don't read docs; cause most people and even agents TLDR."* 100 req/s per client key, burst 200, `AGNOSAI_RATE_LIMIT=0` restores the oracle's exact wire. The full argument, the numbers, and the wire-divergence accounting are in [ADR 021](../adr/021-rate-limit-mounted-by-default.md). ⚠ Two defects had to be fixed first or the default would have been actively harmful — the handler ignored the headers and keyed everything as `"unknown"` (one shared bucket for the whole world), and the key was passed to majra as a `Str` where a cstr was expected, so **the limiter refused nothing at all**. Both closed 2026-08-13; majra 2.6.4 carries its half. |
 | ~~D2~~ | ~~**`"personality": null` on the wire**~~ | ✅ **DECIDED — NOT an open question. Do not re-raise it.** bhava is **coming** and is simply not ported to Cyrius yet, so there is nothing to depend on: `personality` stays unported and the wire **keeps emitting `null`**, which is what the default Rust build emits. **DEFER, never DROP.** Revisit only when bhava lands in Cyrius. This is the ONE carve-out the user ever set (see line 43 and `cyrius-port-plan.md:297`); listing it under *Decisions deferred to a human* was a documentation error that caused it to be asked again. |
 
 ### E. Known-unreachable code kept for oracle shape

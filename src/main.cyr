@@ -175,41 +175,6 @@ fn _agnosai_main_output_redact_enabled(): i64 {
 
 # --- Rate limiting: ON by default (ADR 021) --------------------------------
 
-# Requests per second per client key, and the burst allowance.
-#
-# ⚠ **The oracle sets NO default** — `rust-old/src/server/rate_limit.rs` defines
-# no constants at all, because `mod.rs:47-99` never installs the middleware. So
-# these numbers are agnosai's, and they are chosen to be invisible to a
-# legitimate client while still blunting a flood: 100 req/s sustained with a 200
-# burst is far above any UI or agent poll rate, and far below what an
-# unauthenticated attacker needs to make the RSA verify path hurt (1.202 ms per
-# verify, ~830/sec/core, and the `alg` check deliberately sits AFTER the
-# signature so an invalid token costs the same as a valid one).
-#
-# `rate_x1000` is thousandths of a request per second, matching
-# `agnosai_rate_limit_new` and the oracle's `RateLimitState::new(10.0, ..)`.
-var AGNOSAI_DEFAULT_RATE_LIMIT_X1000 = 100000;
-var AGNOSAI_DEFAULT_RATE_LIMIT_BURST = 200;
-
-# `AGNOSAI_RATE_LIMIT` in whole requests/second. **`0` disables it entirely**,
-# which is the escape hatch for anyone who wants the oracle's exact wire.
-fn _agnosai_main_rate_limit_x1000(): i64 {
-    var v = getenv("AGNOSAI_RATE_LIMIT");
-    if (v == 0) { return AGNOSAI_DEFAULT_RATE_LIMIT_X1000; }
-    var n = agnosai_serve_parse_port(str_from(v));
-    if (n < 0) { return AGNOSAI_DEFAULT_RATE_LIMIT_X1000; }
-    return n * 1000;
-}
-
-# `AGNOSAI_RATE_LIMIT_BURST`, defaulting alongside the rate.
-fn _agnosai_main_rate_limit_burst(): i64 {
-    var v = getenv("AGNOSAI_RATE_LIMIT_BURST");
-    if (v == 0) { return AGNOSAI_DEFAULT_RATE_LIMIT_BURST; }
-    var n = agnosai_serve_parse_port(str_from(v));
-    if (n <= 0) { return AGNOSAI_DEFAULT_RATE_LIMIT_BURST; }
-    return n;
-}
-
 # Build the `AuthConfig` from the environment — `load_auth_config`
 # (`rust-old/src/main.rs:16-55`), branch for branch.
 #
@@ -456,14 +421,14 @@ fn main(): i64 {
     # installs it; agnosai ships safe-by-default because an operator who does not
     # read the docs should still not be trivially floodable. `AGNOSAI_RATE_LIMIT=0`
     # restores the oracle's exact wire.
-    var rl_x1000 = _agnosai_main_rate_limit_x1000();
+    var rl_x1000 = agnosai_rate_limit_env_x1000();
     var rc = 0;
     if (rl_x1000 <= 0) {
-        sakshi_warn("rate limiting DISABLED by AGNOSAI_RATE_LIMIT=0", 44);
+        sakshi_warn("rate limiting DISABLED by AGNOSAI_RATE_LIMIT=0", 46);
         rc = agnosai_serve(state, INADDR_ANY(), port);
     } else {
         rc = agnosai_serve_with_rate_limit(state, INADDR_ANY(), port,
-        rl_x1000, _agnosai_main_rate_limit_burst());
+        rl_x1000, agnosai_rate_limit_env_burst());
     }
     if (rc == 0) { sakshi_info("server shut down gracefully", 28); }
 

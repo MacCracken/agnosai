@@ -29,8 +29,25 @@ Two facts made the default worth revisiting:
    wanted the oracle's exact wire and got a limit sees 429s under a load no
    ordinary client generates, and can turn it off with one variable.
 
-⚠ **A prerequisite defect had to be fixed first, and it would have made this
-change actively harmful.** `agnosai_serve_handler` called
+⚠ **Two prerequisite defects had to be fixed first, and either would have made
+this change actively harmful — or, in the second case, purely decorative.**
+
+**The limiter refused nothing at all.** `agnosai_rate_limit_check` handed its
+key to majra's `ratelimit_check` as a `Str`, but majra keys its bucket map on a
+**cstr** — `KeyTypeCstr` hashes with `hash_str` and compares with `streq`, both
+reading bytes straight from the pointer. Given a `Str` VALUE, both read the Str
+**header**, whose first eight bytes are the data pointer, so identical content
+at two addresses hashed two different ways. The key is derived per request, so
+**every request got its own bucket with a full burst**: three identical requests
+through the handler produced 3 active keys and 0 rejections. Mounting that by
+default would have added a per-request map insert, a warning path and an ADR's
+worth of divergence in exchange for **no limiting whatsoever** — the worst
+outcome, because the wire would look protected. Fixed here by converting through
+`_agnosai_rl_cstr_a` (built in the request arena, not the global bump); majra
+2.6.4 carries the other half, owning its copy of the key rather than borrowing
+one the caller may reuse.
+
+**Every client shared one bucket.** `agnosai_serve_handler` called
 `agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0)` — both
 `has_*` flags hardcoded to 0 — so the key was **always `"unknown"`** whatever
 headers arrived, and every client shared **one bucket**. The oracle reaches that
@@ -67,14 +84,53 @@ numbers and this ADR is where that is recorded.
   not claim it does. It bounds a single misbehaving or compromised client; it is
   not a defence against a distributed attacker, and the RSA-verify cost per
   invalid token is unchanged for the first request from each new key.
-- ⚠ **The key is only as trustworthy as the proxy in front.** `X-Forwarded-For`
-  is client-settable when nothing strips it, so a direct-to-internet deployment
-  lets an attacker mint a fresh bucket per request by varying the header. This
-  is the oracle's own key derivation and is kept for parity; behind a proxy that
-  overwrites the header it is correct, and in front of one it degrades to
-  no-limiting rather than to over-limiting. Deployments exposed directly should
-  set `AGNOSAI_RATE_LIMIT=0` and limit upstream, or run behind a proxy.
-- Buckets are evicted after `AGNOSAI_RL_EVICTION_SECS` (300) idle, so key
-  cardinality is bounded in time rather than growing without limit.
+- ⚠ **The key is only as trustworthy as the proxy in front, and it cuts BOTH
+  ways.** `X-Forwarded-For` is client-settable when nothing strips it.
+  - *Under*-limiting: a direct-to-internet deployment lets an attacker mint a
+    fresh bucket per request by varying the header, so it degrades to no
+    limiting for that attacker.
+  - ⚠ *Over*-limiting, which an earlier draft of this ADR wrongly said could not
+    happen: because the key is taken **verbatim** from the header's first entry
+    and the limiter runs **before auth**, an unauthenticated client can drain a
+    *named victim's* bucket by sending `X-Forwarded-For: <victim-ip>`. **"Run
+    behind a proxy" does not fix this on the most common configuration** —
+    nginx's documented `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`
+    **appends**, producing `client-supplied, real-ip`, and the oracle's
+    derivation takes the *first* entry, which is the attacker's. Only a proxy
+    that **overwrites** the header (`proxy_set_header X-Forwarded-For $remote_addr`)
+    makes the key trustworthy.
+
+  This is the oracle's own key derivation, kept for parity. Deployments that
+  cannot guarantee an overwriting proxy should set `AGNOSAI_RATE_LIMIT=0` and
+  limit upstream. Revisiting the derivation itself — a trusted-proxy count, or
+  preferring `X-Real-IP` — is a change to `extract_client_key` and therefore a
+  separate decision with its own ADR.
+- **Memory is bounded by three mechanisms, because the obvious one is not
+  enough.** ⚠ An earlier version of this ADR claimed cardinality was "bounded in
+  time" by idle eviction. **That was false**: `agnosai_rate_limit_evict_stale`
+  had exactly one caller in the whole tree and it was a test, so nothing swept
+  at all — and even once it did, idle eviction alone cannot bound a client that
+  presents a *fresh* key every request, because every bucket stays well inside
+  the idle window. What actually bounds it:
+  1. **The key is capped at `AGNOSAI_RL_MAX_KEY_BYTES` (64)** — enough for a
+     textual IPv6 address with a zone id. Without it a single request could hand
+     majra a megabyte-long key, of which majra takes a *permanent* copy, and
+     anything over 4 KiB takes the freelist's large path and mmaps a VMA that is
+     never unmapped — an unauthenticated route to exhausting `vm.max_map_count`.
+  2. **The sweep runs**, amortised one walk per `AGNOSAI_RL_SWEEP_EVERY` (256)
+     checks, at the oracle's 300 s idle threshold.
+  3. **Above `AGNOSAI_RL_MAX_KEYS` (4096) the sweep escalates** to a 1 s
+     threshold and then to 0. ⚠ The zero rung discards live clients' consumed
+     tokens, letting them briefly burst again; that is the deliberate trade,
+     since the alternative is unbounded attacker-controlled growth and a flood
+     of fresh keys is already outside what per-key limiting can meter.
+- **The three unauthenticated probes are exempt.** `/health`, `/ready` and
+  `/metrics` — exactly the routes `agnosai_route_needs_auth` leaves open — are
+  never refused. ⚠ Without this the default is a self-inflicted outage: a kubelet
+  sends neither proxy header, so it keys as the shared `"unknown"` bucket, and an
+  unauthenticated flood of `GET /health` drains that bucket until the liveness
+  probe takes 429 and the orchestrator kills the pod — a crash loop manufactured
+  by the control meant to prevent one. The exemption costs nothing an attacker
+  wants: the probes read no state and touch no crypto.
 - If the oracle ever installs its own middleware, revisit against whatever rate
   Rust picks and narrow the divergence to whatever remains.

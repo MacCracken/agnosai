@@ -571,6 +571,107 @@ fn _b_resolve(name, path: Str, n): i64 {
     return 0;
 }
 
+# --- Rate limiting -------------------------------------------------------
+#
+# ⚠ These rows did not exist until 2026-08-13, when [ADR 021](../docs/adr/021-rate-limit-mounted-by-default.md)
+# put the limiter on the default request path. Until then it was opt-in and
+# unmeasured, which is exactly the state in which an unmeasured cost becomes
+# every operator's cost.
+#
+# What each row is for:
+#   * `rate_limit_check_hot`  — the steady state: one client, bucket already
+#     minted, no sweep. This is what a real request pays.
+#   * `rate_limit_check_new_key` — the first request from a key, which mints a
+#     bucket AND takes majra's permanent `fl_alloc` copy of the key.
+#   * `rate_limit_client_key_*` — deriving the key from a header, the global-bump
+#     form against the arena form, since the leak fix turned one into the other.
+#   * `rate_limit_sweep_*` — the sweep's own cost, which is amortised over
+#     `AGNOSAI_RL_SWEEP_EVERY` checks but paid in one lump by whichever request
+#     lands on it.
+
+fn _b_rate_limit_check_hot(n): i64 {
+    var lim = agnosai_rate_limit_new(1000000000, 1000000000);
+    var key = str_from("203.0.113.7");
+    agnosai_rate_limit_check(lim, key);
+
+    var b = bench_new("rate_limit_check_hot");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_rate_limit_check(lim, key);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+fn _b_rate_limit_check_new_key(n): i64 {
+    var lim = agnosai_rate_limit_new(1000000000, 1000000000);
+    var b = bench_new("rate_limit_check_new_key");
+    var seq = 0;
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_rate_limit_check(lim, str_from_int(seq));
+            seq = seq + 1;
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+fn _b_rate_limit_client_key(n): i64 {
+    var xff = str_from("203.0.113.7, 10.0.0.1");
+    var none = str_from("");
+
+    var b = bench_new("rate_limit_client_key_global");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_rate_limit_client_key(xff, 1, none, 0);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+
+    # The arena form the handler actually uses. `reset_via` is inside the timed
+    # loop for the same reason `_b_dispatch_arena` keeps it there: it is work the
+    # request pays.
+    var ar = arena_allocator(65536);
+    var b2 = bench_new("rate_limit_client_key_arena");
+    for (var _r2 = 0; _r2 < _BR; _r2 = _r2 + 1) {
+        bench_batch_start(b2);
+        for (var j = 0; j < n / _BR; j = j + 1) {
+            agnosai_rate_limit_client_key_a(ar, xff, 1, none, 0);
+            reset_via(ar);
+        }
+        bench_batch_stop(b2, n / _BR);
+    }
+    bench_report(b2);
+    return 0;
+}
+
+# The sweep over a populated map, with nothing stale — the common case, and the
+# one that must stay cheap because every 256th request pays it.
+fn _b_rate_limit_sweep(keys, n): i64 {
+    var lim = agnosai_rate_limit_new(1000000000, 1000000000);
+    for (var i = 0; i < keys; i = i + 1) {
+        agnosai_rate_limit_check(lim, str_from_int(i));
+    }
+    var b = bench_new("rate_limit_sweep_1k_live");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var j = 0; j < n / _BR; j = j + 1) {
+            agnosai_rate_limit_evict_stale(lim);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     # Every route logs on at least one path, and `crew_runner` emits per task.
@@ -586,6 +687,11 @@ fn main(): i64 {
     str_builder_add_cstr(csb, "/api/v1/crews/");
     str_builder_add_str(csb, cid);
     var crew_path = str_builder_build(csb);
+
+    _b_rate_limit_check_hot(200000);
+    _b_rate_limit_check_new_key(50000);
+    _b_rate_limit_client_key(200000);
+    _b_rate_limit_sweep(1000, 500);
 
     _b_resolve("route_resolve", str_from("/api/v1/dashboard/crews"), 200000);
     _b_resolve("route_resolve_probe", str_from("/health"), 200000);

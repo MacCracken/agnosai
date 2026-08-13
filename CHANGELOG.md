@@ -7,6 +7,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — rate limiting is mounted by default ([ADR 021](docs/adr/021-rate-limit-mounted-by-default.md))
+
+**A deliberate wire divergence from the oracle**, which ports
+`rate_limit_middleware` and never installs it. `agnosai_serve` now mounts a
+limiter at **100 req/s per client key, burst 200**, tunable with
+`AGNOSAI_RATE_LIMIT` and `AGNOSAI_RATE_LIMIT_BURST`; **`AGNOSAI_RATE_LIMIT=0`
+disables it and restores the oracle's exact wire**. The reasoning, the numbers,
+and what per-key limiting does *not* defend against are in the ADR.
+
+⚠ **Two defects had to be fixed first — mounting on top of either would have
+been worse than not mounting at all.** Both are below.
+
+### Fixed — the rate limiter refused nothing at all
+
+`agnosai_rate_limit_check` passed its `key` to majra's `ratelimit_check` as a
+`Str`. majra keys its bucket map on a **cstr**: `KeyTypeCstr` hashes with
+`hash_str` and compares with `streq`, both reading bytes straight from the
+pointer. Handed a `Str` VALUE, both read the Str **header** instead — whose
+first eight bytes are the data pointer — so identical content at two addresses
+hashed two different ways.
+
+Since the key is derived per request, **every request minted its own bucket with
+a full burst and no request was ever refused.** Measured through the handler:
+three identical requests produced **3 active keys and 0 rejections**; after the
+fix, 1 key and the third request 429s.
+
+The key is now converted with `_agnosai_rl_cstr_a`, built through the **request
+arena** rather than the stdlib's `str_cstr`, which allocates on the no-free
+global bump and would leak on every request. Safe because **majra 2.6.4 owns its
+copy of the key** — the other half of this fix, released upstream.
+
+Proven rather than asserted: two `Str`s with identical content at different
+addresses hash to `-5808573365828332785` and `-5808599754107409849` under
+`hash_str`, to the same `790097504932053221` over their actual bytes, and
+`streq` on the `Str` values returns `0`.
+
+### Fixed — every client shared one rate-limit bucket
+
+`agnosai_serve_handler` called
+`agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0)` — both
+"header present" flags hardcoded to `0` — so the key was **always the
+`"unknown"` fallback** whatever headers arrived. The oracle reaches that value
+only when neither header is present; the port made it the only outcome, so one
+noisy client could 429 everyone, `/health` included. The handler now reads
+`X-Forwarded-For` and `X-Real-IP` through `sandhi_server_find_header{,_a}` and
+passes them, matching the oracle's `extract_client_key`.
+
+⚠ **A helper-level test cannot catch this** — an earlier suite asserted
+`agnosai_rate_limit_client_key` and bucket independence directly, and a mutation
+reverting the handler passed the whole suite. The regression drives
+`agnosai_serve_handler` over a pipe with two different `X-Forwarded-For` values,
+which is the real path.
+
+### Fixed — the mounted-by-default limiter had no bound on memory
+
+Found by an adversarial review of the mount itself, and every one of these was
+inert while the middleware was unmounted.
+
+- ⚠ **Nothing ever swept.** `agnosai_rate_limit_evict_stale` had exactly one
+  caller in the tree and it was a test, so every distinct key a client presented
+  was retained for the life of the process — majra keeps a permanent copy of the
+  key plus a bucket plus a map slot, and the key comes from an unauthenticated,
+  client-settable header. A sweep now runs amortised, one walk per 256 checks.
+  The sweep counter is an `atomic_fetch_add` against a modulus, not a
+  `load`/`store` pair: every request thread runs it on the shared limiter, so a
+  plain read-modify-write loses counts and delays the sweep by an unbounded
+  amount exactly when load is highest. ⚠ **Not mutation-covered** — the suite is
+  single-threaded, where the racy and atomic forms are indistinguishable, so
+  reverting it passes all 260 assertions. Recorded as reasoning, not as a
+  verified claim.
+- ⚠ **Idle eviction alone does not bound cardinality.** A client presenting a
+  fresh key on every request keeps every bucket well inside the 300 s window, so
+  the sweep dutifully finds nothing while the map grows without limit. Above
+  `AGNOSAI_RL_MAX_KEYS` (4096) the sweep now escalates to a 1 s threshold and
+  then to 0.
+- ⚠ **The key had no length cap.** `X-Forwarded-For` is copied whole and the
+  request ceiling is 10 MiB, so one request could hand majra a megabyte-long key
+  it then copies permanently — and anything over 4 KiB takes the freelist's
+  large path and mmaps a VMA that is never unmapped, an unauthenticated route to
+  exhausting `vm.max_map_count`. Keys are now truncated to
+  `AGNOSAI_RL_MAX_KEY_BYTES` (64), enough for a textual IPv6 address with a zone.
+- **`agnosai_rate_limit_client_key` leaked on every request.** `str_sub` and
+  `str_from` are `default_alloc()` wrappers — the global **no-free** bump — so
+  each call stranded 16 to 32 bytes permanently, and a *refused* request builds
+  its key before the 429, so the attacker set the leak rate rather than the
+  configured limit. Added `agnosai_rate_limit_client_key_a` and the `_a` helper
+  variants beneath it; the handler passes its request arena.
+
+### Fixed — `/health`, `/ready` and `/metrics` are exempt from the limiter
+
+⚠ **Mounting by default without this is a self-inflicted outage.** A kubelet
+sends neither proxy header, so its probe keys as the shared `"unknown"` bucket;
+an unauthenticated flood of `GET /health` drains that bucket, the liveness probe
+starts taking 429, and the orchestrator kills the pod — a crash loop manufactured
+by the control meant to prevent one. The exemption is resolved through the router
+rather than by comparing path literals, so it cannot drift from
+`agnosai_route_needs_auth`.
+
+### Fixed — `AGNOSAI_RATE_LIMIT` was parsed by the u16 **port** parser
+
+`agnosai_serve_parse_port` returns its -1 sentinel above 65535, so an operator
+setting `AGNOSAI_RATE_LIMIT=200000` — asking for effectively no limit — silently
+got the 100 req/s default and 429s on almost all legitimate traffic, `/health`
+included, with nothing logged. Same for `AGNOSAI_RATE_LIMIT_BURST`. Replaced with
+a strict parser that rejects empty, non-digit and overflowing input.
+
+⚠ **`str_to_int` would have been worse, not better**: it skips non-digits rather
+than rejecting them and answers **0** on garbage — and `0` is the value that
+*disables* rate limiting, so a typo would have quietly turned the control off.
+
+The rate-limit defaults and their env parsing moved from `src/main.cyr` to
+`src/server/rate_limit.cyr` (`agnosai_rate_limit_env_x1000` /
+`agnosai_rate_limit_env_burst`), where they belong and where a test can reach
+them — `src/main.cyr` cannot be included by a `.tcyr`.
+
+### Fixed — the `AGNOSAI_RATE_LIMIT=0` audit line was truncated
+
+`sakshi_warn(..., 44)` against a 46-byte message, so the single log record that a
+security control had been switched off read `...by AGNOSAI_RATE_LIMIT` — naming
+the variable but dropping the `=0` that identifies the setting responsible.
+
+### Performance — the limiter's cost on the default request path, measured
+
+⚠ **`benches/server.bcyr` included `src/server/rate_limit.cyr` and benchmarked
+nothing from it**, so mounting the limiter by default put a cost on every
+request that no row covered — and a bench sweep showing "no regressions" was
+never evidence about this change. Four rows added:
+
+| row | measured |
+|---|---|
+| `rate_limit_check_hot` | **1.511 µs** (min 1.508, max 1.517) — steady state, bucket already minted |
+| `rate_limit_check_new_key` | **2.189 µs** — first request from a key: mints a bucket and majra's permanent key copy |
+| `rate_limit_client_key_global` | **190 ns** — key derivation on the global bump |
+| `rate_limit_client_key_arena` | **174 ns** — the same through the request arena |
+| `rate_limit_sweep_1k_live` | **7.227 µs** over 1,000 live keys with nothing stale |
+
+Two things worth reading off these:
+
+- ⚠ **The check is dominated by a single clock read, not by the bucket.**
+  `time_now_ns` is unavoidable for a lazy-refill token bucket, and this box
+  measures a clock read at **1.211 µs** (`clock_epoch_secs_baseline` = 1.210 µs,
+  and the harness reports the same figure as its own timer floor). So ~80% of
+  `rate_limit_check_hot` is the clock; the mutex, map lookup, arithmetic and
+  counters together are the remaining ~300 ns. Optimising the bucket would move
+  almost nothing.
+- **The arena fix is faster as well as leak-free** — 174 ns against 190 ns, so
+  routing the key through the request arena costs nothing and saves the 16-to-32
+  bytes per request the global-bump form stranded permanently.
+- **The sweep amortises to ~28 ns per check** (7.227 µs / `AGNOSAI_RL_SWEEP_EVERY`
+  = 256), and roughly 113 ns per check at the `AGNOSAI_RL_MAX_KEYS` ceiling.
+
+### Changed
+
+- **`[deps.majra]` 2.6.3 -> 2.6.4** — carries the limiter's half of the key fix:
+  it now owns its copy of the bucket key instead of borrowing the caller's,
+  eviction returns both key and bucket to the freelist instead of leaking them,
+  and the sweep itself no longer leaks its own scratch vecs on the global bump —
+  which matters now that agnosai calls it on a timer rather than never.
+
+### Added
+
+- Four decisions closed, all five now settled: **D1** (mount `rate_limit`) —
+  **yes**, per ADR 021; **D3** (memoize `builtin_presets()`) — **no**, the route
+  is cold and the oracle's shape stands, so no ADR is owed.
+
 ### Added — `src/arena_pool.cyr`, a bounded pool of reusable arenas
 
 Port-local; no oracle counterpart is possible, since Rust frees on drop and

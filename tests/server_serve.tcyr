@@ -408,31 +408,187 @@ fn _t_rate_limit_handler_keys_per_client(): i64 {
     var out[8192];
     _agnosai_serve_limiter = agnosai_rate_limit_new(10000, 2);
 
-    var a1 = str_from("GET /health HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.9.9.1\r\n\r\n");
-    var b1 = str_from("GET /health HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.9.9.2\r\n\r\n");
+    # ⚠ NOT `/health` — the three unauthenticated probes are exempt from the
+    # limiter (`_agnosai_serve_rl_exempt`), so a probe route can never produce
+    # the 429 this test is about.
+    # ⚠ NOT `/health` — the three unauthenticated probes are exempt from the
+    # limiter (`_agnosai_serve_rl_exempt`), so a probe route can never produce
+    # the 429 this test is about.
+    #
+    # The route answers 405 (GET is not its method) and that is deliberate: the
+    # limiter runs BEFORE routing, so "not 429" is exactly the evidence that it
+    # let the request through, and asserting it this way keeps the test
+    # independent of whatever app state a real handler would need.
+    var a1 = str_from("GET /api/v1/crews HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.9.9.1\r\n\r\n");
+    var b1 = str_from("GET /api/v1/crews HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.9.9.2\r\n\r\n");
 
     var n1 = _t_serve_over_pipe(a1, &out);
-    assert(_t_starts_with(&out, n1, "HTTP/1.1 200") == 1, "client A request 1 → 200");
+    assert(_t_starts_with(&out, n1, "HTTP/1.1 429") == 0, "client A request 1 is allowed");
     var n2 = _t_serve_over_pipe(a1, &out);
-    assert(_t_starts_with(&out, n2, "HTTP/1.1 200") == 1, "client A request 2 → 200");
+    assert(_t_starts_with(&out, n2, "HTTP/1.1 429") == 0, "client A request 2 is allowed");
     var n3 = _t_serve_over_pipe(a1, &out);
-    var pl = 0; while (pl < n3 && load8(&out + pl) != 13) { pl = pl + 1; }
-    store8(&out + pl, 0);
-    println(&out);
-    fmt_int(agnosai_rate_limit_total_allowed(_agnosai_serve_limiter));
-    println("  <- allowed counter");
-    fmt_int(agnosai_rate_limit_total_rejected(_agnosai_serve_limiter));
-    println("  <- rejected counter");
-    fmt_int(agnosai_rate_limit_active_keys(_agnosai_serve_limiter));
-    println("  <- active keys (1 = one bucket, 3 = a bucket per request)");
     assert(_t_starts_with(&out, n3, "HTTP/1.1 429") == 1,
     "client A request 3 → 429, its burst of 2 is spent");
 
     var n4 = _t_serve_over_pipe(b1, &out);
-    assert(_t_starts_with(&out, n4, "HTTP/1.1 200") == 1,
+    assert(_t_starts_with(&out, n4, "HTTP/1.1 429") == 0,
     "client B is UNAFFECTED — the HANDLER derived a distinct key from the header");
 
     _agnosai_serve_limiter = 0;
+    return 0;
+}
+
+# A key longer than an address is truncated, at the one point keys are built.
+#
+# ⚠ Without this, majra 2.6.4 takes a PERMANENT `fl_alloc` copy of whatever
+# arrives: `X-Forwarded-For` is client-settable, the request ceiling is 10 MiB,
+# and anything over 4096 bytes takes the freelist's large path and mmaps a fresh
+# VMA that is never unmapped. One request could pin a megabyte for the life of
+# the process.
+fn _t_rate_limit_key_is_capped(): i64 {
+    var long = str_builder_new();
+    for (var i = 0; i < 4096; i = i + 1) { str_builder_add_cstr(long, "a"); }
+    var huge = str_builder_build(long);
+    assert_eq(str_len(huge), 4096, "precondition: a 4096-byte header value");
+
+    var k = agnosai_rate_limit_client_key(huge, 1, str_from(""), 0);
+    assert_eq(str_len(k), AGNOSAI_RL_MAX_KEY_BYTES, "an oversized key is truncated to the cap");
+    assert_eq(AGNOSAI_RL_MAX_KEY_BYTES, 64, "the cap is 64 bytes — an IPv6 address plus a zone id");
+
+    # A real address is well under the cap and must pass through untouched.
+    var v6 = str_from("2001:0db8:85a3:0000:0000:8a2e:0370:7334");
+    assert(str_eq(agnosai_rate_limit_client_key(v6, 1, str_from(""), 0), v6) == 1,
+    "a full-length IPv6 address is NOT truncated");
+    println("  rate_limit_key_is_capped: ok");
+    return 0;
+}
+
+# The sweep actually runs from the check path, and bounds key cardinality.
+#
+# ⚠ Before this, `agnosai_rate_limit_evict_stale` had exactly one caller in the
+# whole tree and it was a test — so with the limiter mounted by default, every
+# distinct `X-Forwarded-For` an unauthenticated client sent was retained for the
+# life of the process. Idle eviction alone does not fix that: a fresh key per
+# request keeps every bucket inside the 300 s window, which is why there is a
+# pressure threshold as well as an idle one.
+fn _t_rate_limit_sweep_runs_and_bounds_keys(): i64 {
+    var lim = agnosai_rate_limit_new(100000000, 1000000);
+    var n = AGNOSAI_RL_MAX_KEYS * 2 + AGNOSAI_RL_SWEEP_EVERY;
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_rate_limit_check_request(lim, str_from_int(i));
+    }
+    var keys = agnosai_rate_limit_active_keys(lim);
+    assert(keys <= AGNOSAI_RL_MAX_KEYS + AGNOSAI_RL_SWEEP_EVERY,
+    "a client minting a fresh key per request cannot grow the map without bound");
+    assert(keys < n, "and the map holds fewer keys than the requests that built it");
+    assert(agnosai_rate_limit_total_evicted(lim) > 0,
+    "the sweep ran and reclaimed — not merely counted");
+    println("  rate_limit_sweep_runs_and_bounds_keys: ok");
+    return 0;
+}
+
+# The unauthenticated probes are never refused.
+#
+# ⚠ A kubelet sends neither proxy header, so it keys as `"unknown"` — the one
+# bucket every header-less client shares. Limiting `/health` means an
+# unauthenticated flood drains that bucket, the liveness probe starts taking
+# 429, and the orchestrator kills the pod: a crash loop manufactured by the
+# control meant to prevent one.
+fn _t_rate_limit_probes_are_exempt(): i64 {
+    var out[8192];
+    _agnosai_serve_limiter = agnosai_rate_limit_new(10000, 2);
+    var probe = str_from("GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    # Well past a burst of 2.
+    for (var i = 0; i < 12; i = i + 1) {
+        var n = _t_serve_over_pipe(probe, &out);
+        assert(_t_starts_with(&out, n, "HTTP/1.1 200") == 1,
+        "/health is never rate limited, however often it is polled");
+    }
+    # /ready likewise.
+    var ready = str_from("GET /ready HTTP/1.1\r\nHost: x\r\n\r\n");
+    for (var j = 0; j < 12; j = j + 1) {
+        var rn = _t_serve_over_pipe(ready, &out);
+        assert(_t_starts_with(&out, rn, "HTTP/1.1 200") == 1, "/ready is never rate limited");
+    }
+    # A limited route still is — the exemption is per route, not a global off.
+    var api = str_from("GET /api/v1/crews HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.7.7.7\r\n\r\n");
+    _t_serve_over_pipe(api, &out);
+    _t_serve_over_pipe(api, &out);
+    var last = _t_serve_over_pipe(api, &out);
+    assert(_t_starts_with(&out, last, "HTTP/1.1 429") == 1,
+    "a non-probe route is still limited — the exemption is not a global disable");
+    _agnosai_serve_limiter = 0;
+    println("  rate_limit_probes_are_exempt: ok");
+    return 0;
+}
+
+# The default IS mounted, and the escape hatch IS the value ADR 021 documents.
+#
+# This pins the ADR's central claim, which nothing covered: the assertion that
+# used to sit in `_t_rate_limit_off_by_default` compared a variable to the value
+# the test had just written to it. Reading the env helpers directly is what
+# makes it load-bearing — invert the branch in `main` or break the parser and
+# these fail.
+fn _t_rate_limit_default_is_mounted(): i64 {
+    # 100 req/s, burst 200 — the numbers ADR 021 commits to. With nothing in the
+    # environment these ARE what `main` mounts, and `> 0` is what makes it take
+    # the mounting branch rather than the disable branch.
+    assert_eq(AGNOSAI_DEFAULT_RATE_LIMIT_X1000, 100000, "the documented 100 req/s");
+    assert_eq(AGNOSAI_DEFAULT_RATE_LIMIT_BURST, 200, "the documented burst of 200");
+    assert(AGNOSAI_DEFAULT_RATE_LIMIT_X1000 > 0,
+    "the default is mounted — main's branch is `rl_x1000 <= 0` for the disable arm");
+    assert_eq(agnosai_rate_limit_env_x1000(), AGNOSAI_DEFAULT_RATE_LIMIT_X1000,
+    "with AGNOSAI_RATE_LIMIT unset the rate is the mounted default");
+    assert_eq(agnosai_rate_limit_env_burst(), AGNOSAI_DEFAULT_RATE_LIMIT_BURST,
+    "with AGNOSAI_RATE_LIMIT_BURST unset the burst is the mounted default");
+
+    # ⚠ Asserted through `_agnosai_rl_rate_from` / `_agnosai_rl_burst_from`, NOT
+    # through `_agnosai_rl_parse_count`. This process has no `setenv`, so the env
+    # branch cannot be driven directly — and testing the parser alone leaves the
+    # WIRING unpinned: a mutation swapping the callers back to the u16 port
+    # parser passed the whole suite, because the parser it asserted was still
+    # correct and simply no longer used. These take the value the env would
+    # have carried, so they cover the parse, the fallback and the x1000 scaling
+    # together.
+    assert_eq(_agnosai_rl_rate_from(0), AGNOSAI_DEFAULT_RATE_LIMIT_X1000,
+    "an absent variable is the mounted default");
+    assert_eq(_agnosai_rl_rate_from("100"), 100000, "100 req/s scales to x1000");
+    assert_eq(_agnosai_rl_rate_from("0"), 0, "0 disables — main's `<= 0` arm");
+    assert_eq(_agnosai_rl_rate_from("200000"), 200000000,
+    "a rate above 65535 is honoured, not clamped by a port parser");
+    assert_eq(_agnosai_rl_rate_from("oops"), AGNOSAI_DEFAULT_RATE_LIMIT_X1000,
+    "garbage falls back to the default rather than parsing as 0 and disabling");
+    assert_eq(_agnosai_rl_rate_from("12x"), AGNOSAI_DEFAULT_RATE_LIMIT_X1000,
+    "a trailing non-digit falls back, it is not skipped");
+    assert_eq(_agnosai_rl_burst_from(0), AGNOSAI_DEFAULT_RATE_LIMIT_BURST,
+    "an absent burst is the default");
+    assert_eq(_agnosai_rl_burst_from("500"), 500, "a burst is taken verbatim");
+    assert_eq(_agnosai_rl_burst_from("70000"), 70000,
+    "a burst above 65535 is honoured, not clamped by a port parser");
+    assert_eq(_agnosai_rl_burst_from("nope"), AGNOSAI_DEFAULT_RATE_LIMIT_BURST,
+    "a garbage burst falls back");
+
+    # And the parser itself, since it is the thing that decides.
+    assert_eq(_agnosai_rl_parse_count("100"), 100, "a plain count parses");
+    assert_eq(_agnosai_rl_parse_count("0"), 0,
+    "0 parses AS 0 — it is the documented disable value, not an error");
+
+    # Above 65535: the rate used to go through the u16 PORT parser, so an
+    # operator asking for 200k req/s silently got 100 and 429s on almost
+    # everything.
+    assert_eq(_agnosai_rl_parse_count("200000"), 200000,
+    "a value above 65535 is honoured, not clamped");
+
+    # Garbage must NOT parse as 0, because 0 turns the control OFF. `str_to_int`
+    # answers 0 for "oops" by skipping non-digits; this must reject.
+    assert_eq(_agnosai_rl_parse_count("oops"), 0 - 1, "garbage is rejected, not read as 0");
+    assert_eq(_agnosai_rl_parse_count("12x"), 0 - 1, "a trailing non-digit is rejected, not skipped");
+    assert_eq(_agnosai_rl_parse_count("x12"), 0 - 1, "a leading non-digit is rejected");
+    assert_eq(_agnosai_rl_parse_count(""), 0 - 1, "empty is rejected");
+    assert_eq(_agnosai_rl_parse_count("-5"), 0 - 1, "a negative is rejected");
+    assert_eq(_agnosai_rl_parse_count("99999999999999"), 0 - 1,
+    "an overflowing value is rejected rather than wrapping");
+    println("  rate_limit_default_is_mounted: ok");
     return 0;
 }
 
@@ -441,7 +597,11 @@ fn _t_rate_limit_handler_keys_per_client(): i64 {
 # is the escape hatch's behaviour.
 fn _t_rate_limit_off_by_default(): i64 {
     _agnosai_serve_limiter = 0;
-    assert(_agnosai_serve_limiter == 0, "the limiter is unset by default");
+    # ⚠ There was an `assert(_agnosai_serve_limiter == 0, ...)` here, one line
+    # after the assignment above — a self-comparison that could not fail, under
+    # a message ("unset by default") that ADR 021 made false. What the default
+    # actually is now lives in `_t_rate_limit_default_is_mounted`.
+    #
     # With no limiter the check passes everything, however often.
     for (var i = 0; i < 200; i = i + 1) {
         if (agnosai_rate_limit_check_request(0, str_from("c")) != HTTP_OK) {
@@ -1482,6 +1642,10 @@ fn main(): i64 {
     _t_callback_dispatch_is_gated();
     _t_detached_threads_free_their_stacks();
     _t_rate_limit_off_by_default();
+    _t_rate_limit_default_is_mounted();
+    _t_rate_limit_key_is_capped();
+    _t_rate_limit_sweep_runs_and_bounds_keys();
+    _t_rate_limit_probes_are_exempt();
     _t_rate_limit_keys_are_per_client();
     _t_rate_limit_handler_keys_per_client();
     _t_handler_end_to_end();

@@ -130,10 +130,10 @@ because each version read only direct siblings.
 | repo | version | pin | state |
 |---|---|---|---|
 | **patra** | **1.13.0** | 6.5.19 | ✅ **committed + tagged** (`9aed017`, 2026-08-11 20:02). Zero `[deps.*]` blocks; sakshi from the fold. 893 tests, 7/7 fuzz, benches, fmt/lint/vet/deny clean. |
-| **majra** | **2.6.3** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.6.2. **218 assertions** (159 core + 42 backends + 17 patra_queue), `cyrius audit` green, all 4 `dist/` bundles regenerated at v2.6.3. Content: `relay_receive_ex` allocates outside the lock again, + the toolchain bump. ⚠ `tests/test_live.tcyr` is unrunnable here — `redis-server` and `postgres` are **not installed**, and it **exits 139 (SIGSEGV)** rather than failing cleanly. Environment, and a pre-existing harness defect. |
+| **majra** | **2.6.4** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.6.3, so this took a **patch bump**. **249 assertions** (189 core + 43 backends + 17 patra_queue). ⚠ **2.6.4 fixes a rate limiter that refused nothing**: `ratelimit_check`/`sliding_window_check` stored the caller's key pointer by reference, so a key built per request — which is every real caller — minted a fresh full-burst bucket each time; and eviction leaked both key and bucket. Both limiters now own their key and `fl_free` on evict; the sweep itself no longer leaks its own scratch vecs on the global bump (it walks the entries array in place and allocates nothing), and `total_evicted` is wired to a real counter and surfaced by `_admin_ratelimit_json` as `evicted`. Reported from here, measured through agnosai's handler as 3 identical requests -> 3 keys, 0 rejections. 7 mutation probes, 7 kills. Prior content (2.6.3): **218 assertions**, `cyrius audit` green, all 4 `dist/` bundles regenerated at v2.6.3. Content: `relay_receive_ex` allocates outside the lock again, + the toolchain bump. ⚠ `tests/test_live.tcyr` is unrunnable here — `redis-server` and `postgres` are **not installed**, and it **exits 139 (SIGSEGV)** rather than failing cleanly. Environment, and a pre-existing harness defect. |
 | **libro** | **2.8.5** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.8.4, so this took a **patch bump**. **512 assertions** (524 with `-D LIBRO_TPM`), fmt clean, 23 files lint / 0 warnings, vet 45 deps / 0 untrusted, deny 0 violations, 3 bench binaries green, `.bss` held at **80,224 bytes**. Content: pin 6.5.10 → 6.5.20, `[deps.patra]` 1.12.12 → **1.13.0**, `[deps.sigil]` + `[deps.sigil_tpm]` 3.12.1 → **3.12.7** with the thin selection kept. |
-| **bote** | **3.3.1** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.3.0. **867 assertions across 13 suites** + the core-only drift guard, 14 benchmarks, both `dist/` bundles at v3.3.1. Content: defensive `[deps.sakshi]` **DELETED**, `[deps.libro]` → 2.8.5, `[deps.majra]` → 2.6.3, pin → 6.5.20. |
-| **agnosai** | 1.1.0 | **6.5.20** | ✅ **done, awaiting commit.** 97 suites, coverage **1561/1561 (100%)**, `check-clean.sh` green, `deps --verify` 113/0, duplicate-fn count unchanged at 35. VERSION stays 1.1.0 by design — it bumps at parity, not before. |
+| **bote** | **3.3.1** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.3.0. **867 assertions across 13 suites** + the core-only drift guard, 14 benchmarks, both `dist/` bundles at v3.3.1. Content: defensive `[deps.sakshi]` **DELETED**, `[deps.libro]` → 2.8.5, `[deps.majra]` → 2.6.3, pin → 6.5.20. ⚠ bote should take **majra 2.6.4** on its next touch — it is a correctness fix in a module bote republishes. |
+| **agnosai** | 1.1.0 | **6.5.20** | ✅ **done, awaiting commit.** **99 suites, 7,942 assertions, 0 failed**, `check-clean.sh` green, `deps --verify` 113/0. `[deps.majra]` → **2.6.4**. VERSION stays 1.1.0 by design — it bumps at parity, not before. |
 | **cyrius** | 6.5.20 | — | ✅ not a blocker, and **never was**: 6.5.19 already folded patra 1.13.0. |
 
 ## 🔎 Open findings — P(-1) sweep, 2026-08-12 (cyrius 6.5.20)
@@ -400,6 +400,46 @@ mutation-verified (breaking it reports `got 15, expected 0`).
 
 The 64 KiB arena at `serve.cyr:259` is a separate matter and still open — it is
 one of the five sites in the arena-pool bite above.
+
+### ⚠ A security control that is *mounted* is not a security control that *works*
+
+Learned 2026-08-13, mounting `rate_limit` by default per [ADR 021](../adr/021-rate-limit-mounted-by-default.md).
+An adversarial review of the change raised 45 findings; **21 survived double
+refutation**, and every one was in code or docs written in that same sitting.
+The pattern worth keeping is that a green suite plus 100% coverage said nothing
+about any of them, because each was a property no assertion asked about:
+
+- **The limiter refused nothing.** A `Str` was passed where a cstr-keyed map was
+  expected, so `hash_str` walked the Str header — whose first eight bytes are the
+  data pointer — and every request minted its own full-burst bucket. **A test
+  using string literals cannot catch this**: a literal is one pooled address
+  reused at every call site, so a pointer-keyed limiter passes happily. Every
+  key in a limiter test must be built at a fresh address.
+- **Nothing ever called the eviction sweep.** It had one caller in the tree and
+  it was a test. `grep -rn <fn> src/` is a five-second check that the mechanism
+  a doc credits actually runs, and it was never done — the ADR asserted memory
+  was "bounded in time" and shipped that claim as Accepted.
+- **Idle eviction cannot bound attacker-chosen keys.** A fresh key per request
+  keeps every bucket inside the idle window, so the sweep finds nothing while
+  the map grows. A cap needs a rung that fires regardless of age.
+- **Unbounded input became permanent allocation.** The key had no length cap, so
+  one 10 MiB header could pin a megabyte for the process lifetime; over 4 KiB the
+  freelist mmaps a VMA per key that is never unmapped.
+- **The default config path was untested.** The one assertion mentioning the
+  default compared a variable to the value the test had written to it one line
+  above. `src/main.cyr` cannot be included by a `.tcyr`, which is *why* the
+  config lived somewhere untestable — moving it into the module it configures
+  fixed both.
+- **Testing a helper does not test the wiring.** Asserting the strict parser
+  directly left a mutation that reverted its *callers* to the old u16 port parser
+  passing the entire suite. Split "read the environment" from "interpret the
+  value" so a test can drive the decision the caller actually makes.
+
+⚠ **Reusing a parser for a domain it was not written for is a silent clamp.**
+The rate went through `agnosai_serve_parse_port`, whose -1 sentinel fires above
+65535 — so `AGNOSAI_RATE_LIMIT=200000` silently became 100 req/s. And the obvious
+replacement is worse: `str_to_int` skips non-digits and answers **0** on garbage,
+and here `0` means *disable the control*.
 
 ### ⚠ `check-clean.sh` does NOT compile the suites — do not read it as "the tree builds"
 
@@ -1314,6 +1354,41 @@ two (moves `route_tools_*` and `route_mcp_*` by 50–108%), and
 merits. Every other pre-existing row is within ±3%, so the discontinuity is
 exactly those nine. **Do not compare them across this date.**
 
+### The rate limiter on the default path, 2026-08-13 — 212 rows (was 207)
+
+⚠ **`benches/server.bcyr` included `src/server/rate_limit.cyr` and benchmarked
+nothing from it.** Mounting the limiter by default ([ADR 021](../adr/021-rate-limit-mounted-by-default.md))
+therefore put a cost on every request that no row covered — and the sweep run
+that showed "no regressions" was never evidence about the change. Five rows now
+cover it, reproducing tightly across two independent idle-box runs:
+
+| row | run A | run B |
+|---|---|---|
+| `rate_limit_check_hot` | 1.511 µs | 1.507 µs |
+| `rate_limit_check_new_key` | 2.189 µs | 2.195 µs |
+| `rate_limit_client_key_global` | 190 ns | 190 ns |
+| `rate_limit_client_key_arena` | 174 ns | 175 ns |
+| `rate_limit_sweep_1k_live` | 7.227 µs | 7.188 µs |
+
+- ⚠ **~80% of the check is ONE clock read, not the bucket.** `time_now_ns` is
+  unavoidable for a lazy-refill token bucket, and this box measures a clock read
+  at **1.211 µs** — `clock_epoch_secs_baseline` reads 1.210 µs and the harness
+  independently reports 1.211 µs as its own timer floor. Mutex, map lookup,
+  arithmetic and counters together are the remaining ~300 ns. **There is nothing
+  worth optimising in the bucket**; do not re-derive this as a finding.
+- **The arena key fix is faster as well as leak-free** (174 ns vs 190 ns), so it
+  is not a trade.
+- **The sweep amortises to ~28 ns/check** (7.19 µs / `AGNOSAI_RL_SWEEP_EVERY` =
+  256), ~113 ns/check at the `AGNOSAI_RL_MAX_KEYS` ceiling.
+
+⚠ **Reading the sweep-to-sweep diff needs care on this tree.** Sub-10 ns rows
+(`noop` at 2 ns, `auth_check_disabled` at 6 ns) swing ±50% on a one-nanosecond
+quantum and mean nothing, and `select_nth_100k_already_sorted` carries genuine
+intra-run dispersion — one run reported +10.5%, min 3.625 / max 4.474 ms, and
+the next reverted to −8.9%. Check a row's own min/max before calling it a
+regression. On the idle-box pair above, the worst real mover was **+2.3%** and
+**zero rows moved more than 10%**.
+
 ### Two O(n²) removals, 2026-08-11 — both found by benchmarks that did not exist
 
 | what | before | after | |
@@ -1969,7 +2044,7 @@ re-run the sweep, after adding a `.tcyr`.
 | **M9 `telemetry`** (322 lines) | OTLP export (copy hoosh's `otlp.cyr`, 199 lines; thread-local trace context is mandatory under `run_pooled`) plus the JSON-logging + `EnvFilter` divergence, which starts as a sakshi filing — file it early so it lands while the rest is being ported. |
 | The `sandbox`-gated tools | `tools/{python_tool,wasm_tool,wasm_loader}.rs`, plus the `hwaccel` half of `core/resource.cyr`. **kavach already has a wasmtime backend with `--fuel`** (`lib/kavach.cyr:9867`), so the WASM pair is portable now. |
 | roadmap B2's remaining tail | `crew_runner`'s off-request-path bayan calls — the largest un-threaded allocator surface left. Everything request-reachable is done. |
-| D1 / D2 | Two decisions waiting on a human, not on work. Neither blocks anything. |
+| ~~D1 / D2~~ | ✅ **All five roadmap decisions (D1–D5) are closed as of 2026-08-13.** Nothing is waiting on a human. Do not re-open them from this table. |
 
 ⚠ **Do not** start by re-auditing performance on the request path. It was
 decomposed to the floor on 2026-08-07: the remaining cost is `alloc_via` × the

@@ -31,13 +31,64 @@
 # The oracle's `eviction_interval: Duration::from_secs(300)`.
 var AGNOSAI_RL_EVICTION_SECS = 300;
 
+# ⚠ **A cap on the key, because the key is attacker-chosen and now outlives the
+# request.** `X-Forwarded-For` is client-settable and `sandhi_server_find_header`
+# copies the whole value; the request ceiling is `AGNOSAI_MAX_BODY_BYTES`
+# (10 MiB), so without a bound one request could hand majra a megabyte-long key
+# — which majra 2.6.4 then `fl_alloc`s a PERMANENT owned copy of, and anything
+# over 4096 bytes takes the freelist's large path and mmaps a fresh VMA that is
+# never unmapped. 45 bytes holds the longest textual IPv6 address, 64 leaves
+# room for a zone id; anything longer is not an address and is truncated to it.
+var AGNOSAI_RL_MAX_KEY_BYTES = 64;
+
+# How many checks between eviction sweeps.
+#
+# ⚠ **Before this, nothing in `src/` ever called the sweep.** It was reachable
+# only from a test, so every distinct key a client presented was retained for
+# the life of the process — inert while the limiter was unmounted, and an
+# unauthenticated unbounded-growth path the moment [ADR 021](../../docs/adr/021-rate-limit-mounted-by-default.md)
+# made it the default. The sweep is amortised over the check path rather than
+# given a thread: one walk of the bucket array per 256 checks is cheap beside
+# the work a request already does, and it needs no timer, no wakeup and no
+# second thread contending for the limiter's mutex.
+var AGNOSAI_RL_SWEEP_EVERY = 256;
+
+# The hard ceiling on tracked keys.
+#
+# ⚠ **The idle sweep alone does not bound cardinality.** It only removes buckets
+# untouched for `AGNOSAI_RL_EVICTION_SECS`, so a client presenting a fresh key
+# every request keeps every bucket inside the idle window and the map grows
+# regardless. Above this count the sweep escalates to an aggressive threshold
+# that reclaims anything not touched in the last second, which bounds the map at
+# roughly one second of distinct keys instead of five minutes of them.
+var AGNOSAI_RL_MAX_KEYS = 4096;
+
+# The escalating thresholds used once `AGNOSAI_RL_MAX_KEYS` is exceeded: one
+# second, then everything.
+#
+# ⚠ **The last rung has to be 0.** A threshold only evicts buckets OLDER than
+# it, so under the exact condition the cap exists for — a client minting a fresh
+# key per request — every bucket is milliseconds old and any non-zero threshold
+# finds nothing to remove. A cap that cannot be enforced during an attack is not
+# a cap.
+#
+# Evicting everything discards live clients' consumed tokens, briefly letting
+# them burst again. That is the right trade: the alternative is unbounded
+# attacker-controlled memory growth, and a flood of fresh keys is already
+# outside what per-key limiting can meter — every new key gets a full burst by
+# construction, which ADR 021 states plainly. The cap's job is memory safety,
+# not metering, and it degrades to "forget everyone" rather than to "die".
+var AGNOSAI_RL_PRESSURE_NS = 1000000000;
+var AGNOSAI_RL_PRESSURE_FLOOR_NS = 0;
+
 # HTTP 429, which `lib/sandhi.cyr` does not define.
 var AGNOSAI_HTTP_TOO_MANY_REQUESTS = 429;
 
 enum AgnosaiRateLimitOff {
     AGN_RL_LIMITER = 0;
     AGN_RL_EVICTION_NS = 8;
-    AGN_RATE_LIMIT_SIZE = 16;
+    AGN_RL_SINCE_SWEEP = 16;
+    AGN_RATE_LIMIT_SIZE = 24;
 }
 
 # The oracle's `RateLimitState::new(rate, burst)`, with `rate` as integer
@@ -46,12 +97,49 @@ fn agnosai_rate_limit_new(rate_x1000, burst): i64 {
     var s = alloc(AGN_RATE_LIMIT_SIZE);
     store64(s + AGN_RL_LIMITER, ratelimit_new(rate_x1000, burst));
     store64(s + AGN_RL_EVICTION_NS, AGNOSAI_RL_EVICTION_SECS * AGNOSAI_NS_PER_SEC);
+    store64(s + AGN_RL_SINCE_SWEEP, 0);
     return s;
+}
+
+# A null-terminated copy of `s`'s bytes, allocated through `a`.
+#
+# ⚠ **majra's limiter keys on a cstr, not a `Str`** — its bucket map is
+# `KeyTypeCstr`, so it hashes with `hash_str` and compares with `streq`, both of
+# which read bytes straight from the pointer. Handing it a `Str` VALUE instead
+# reads the Str HEADER, whose first eight bytes are the data pointer, so two
+# keys with identical content at different addresses hash differently. That was
+# this port's bug until 2026-08-13: every request minted its own full-burst
+# bucket and the limiter refused nothing. Measured through the handler as three
+# identical requests producing 3 active keys and 0 rejections.
+#
+# `str_cstr` exists in the stdlib and does exactly this, but on the global
+# no-free bump — a permanent leak on a per-request path. majra 2.6.4 owns its
+# copy of the key, so an arena-backed cstr that dies at the next reset is safe.
+fn _agnosai_rl_cstr_a(a, s: Str): i64 {
+    if (a == 0) { a = default_alloc(); }
+    var n = str_len(s);
+    var p = alloc_via(a, n + 1);
+    if (p == 0) { return 0; }
+    memcpy(p, str_data(s), n);
+    store8(p + n, 0);
+    return p;
 }
 
 # Whether a request from `key` is allowed, consuming a token if so.
 fn agnosai_rate_limit_check(s, key: Str): i64 {
-    return ratelimit_check(load64(s + AGN_RL_LIMITER), key);
+    return agnosai_rate_limit_check_a(0, s, key);
+}
+
+# `agnosai_rate_limit_check` with the key built through `a`.
+#
+# A key that could not be allocated **fails open**, for the same reason the
+# `s == 0` arm below does: a limiter that cannot do its job must not start
+# refusing traffic. It also must not crash — majra takes the key straight to
+# `strlen`, so a null would fault inside the dependency.
+fn agnosai_rate_limit_check_a(a, s, key: Str): i64 {
+    var ckey = _agnosai_rl_cstr_a(a, key);
+    if (ckey == 0) { return 1; }
+    return ratelimit_check(load64(s + AGN_RL_LIMITER), ckey);
 }
 
 # Evict buckets idle longer than the configured interval; returns the count.
@@ -75,6 +163,85 @@ fn agnosai_rate_limit_active_keys(s): i64 {
     return load64(ratelimit_stats(load64(s + AGN_RL_LIMITER)) + 16);
 }
 
+# How many buckets every sweep so far has reclaimed, cumulatively.
+fn agnosai_rate_limit_total_evicted(s): i64 {
+    return load64(ratelimit_stats(load64(s + AGN_RL_LIMITER)) + 24);
+}
+
+# --- Configuration from the environment -----------------------------------
+
+# Requests per second per client key, and the burst allowance.
+#
+# ⚠ **The oracle sets NO default** — `rust-old/src/server/rate_limit.rs` defines
+# no constants at all, because `mod.rs:47-99` never installs the middleware. So
+# these numbers are agnosai's, and they are chosen to be invisible to a
+# legitimate client while still blunting a flood: 100 req/s sustained with a 200
+# burst is far above any UI or agent poll rate, and far below what an
+# unauthenticated attacker needs to make the RSA verify path hurt (1.202 ms per
+# verify, ~830/sec/core, and the `alg` check deliberately sits AFTER the
+# signature so an invalid token costs the same as a valid one).
+#
+# `rate_x1000` is thousandths of a request per second, matching
+# `agnosai_rate_limit_new` and the oracle's `RateLimitState::new(10.0, ..)`.
+var AGNOSAI_DEFAULT_RATE_LIMIT_X1000 = 100000;
+var AGNOSAI_DEFAULT_RATE_LIMIT_BURST = 200;
+
+# A strict non-negative integer, or -1.
+#
+# ⚠ **Neither obvious parser is safe here.** `agnosai_serve_parse_port` returns
+# its -1 sentinel above **65535**, because it parses a u16 port — so
+# `AGNOSAI_RATE_LIMIT=200000`, an operator asking for effectively no limit,
+# silently became the 100 req/s default and 429'd almost all legitimate traffic.
+# And `str_to_int` skips non-digits instead of rejecting them and answers **0**
+# on garbage — and `0` is the value that DISABLES rate limiting, so a typo would
+# quietly turn the control off. Empty, non-digit, and overflow all answer -1
+# here, which the callers read as "unset" and replace with the default.
+fn _agnosai_rl_parse_count(v): i64 {
+    var n = strlen(v);
+    if (n == 0) { return 0 - 1; }
+    var acc = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(v + i) & 255;
+        if (c < 48 || c > 57) { return 0 - 1; }
+        acc = acc * 10 + c - 48;
+        # Well below the point at which `acc * 1000` could overflow i64.
+        if (acc > 1000000000) { return 0 - 1; }
+    }
+    return acc;
+}
+
+# `AGNOSAI_RATE_LIMIT` in whole requests/second. **`0` disables it entirely**,
+# which is the escape hatch for anyone who wants the oracle's exact wire.
+# ⚠ **Reading the variable and interpreting it are separate on purpose.** This
+# process has no `setenv` (`lib/` provides `getenv` only), so a test can never
+# drive the env branch — and when the two were one function, a mutation swapping
+# the strict parser back for the u16 port parser passed the entire suite. The
+# interpretation lives here, where a test can reach it with a value.
+fn _agnosai_rl_rate_from(v): i64 {
+    if (v == 0) { return AGNOSAI_DEFAULT_RATE_LIMIT_X1000; }
+    var n = _agnosai_rl_parse_count(v);
+    if (n < 0) { return AGNOSAI_DEFAULT_RATE_LIMIT_X1000; }
+    return n * 1000;
+}
+
+# `AGNOSAI_RATE_LIMIT` as thousandths of a request per second, or the default.
+fn agnosai_rate_limit_env_x1000(): i64 {
+    return _agnosai_rl_rate_from(getenv("AGNOSAI_RATE_LIMIT"));
+}
+
+# `AGNOSAI_RATE_LIMIT_BURST`, defaulting alongside the rate.
+fn _agnosai_rl_burst_from(v): i64 {
+    if (v == 0) { return AGNOSAI_DEFAULT_RATE_LIMIT_BURST; }
+    var n = _agnosai_rl_parse_count(v);
+    if (n <= 0) { return AGNOSAI_DEFAULT_RATE_LIMIT_BURST; }
+    return n;
+}
+
+# `AGNOSAI_RATE_LIMIT_BURST` as whole requests, or the default.
+fn agnosai_rate_limit_env_burst(): i64 {
+    return _agnosai_rl_burst_from(getenv("AGNOSAI_RATE_LIMIT_BURST"));
+}
+
 # --- Client key extraction ------------------------------------------------
 
 # The oracle's `extract_client_key`: `X-Forwarded-For`'s **first** entry, then
@@ -92,30 +259,47 @@ fn agnosai_rate_limit_active_keys(s): i64 {
 # outside visible ASCII is treated as absent — the same gate `server_auth`
 # applies to `Authorization`.
 fn agnosai_rate_limit_client_key(xff, has_xff, xri, has_xri): Str {
+    return agnosai_rate_limit_client_key_a(default_alloc(), xff, has_xff, xri, has_xri);
+}
+
+# `agnosai_rate_limit_client_key` with every allocation routed through `a`.
+#
+# ⚠ **The non-`_a` form lands three Str headers on the global NO-FREE bump per
+# call** — `str_sub` and `str_from` are `default_alloc()` wrappers — which was
+# harmless while the middleware was unmounted and a permanent 16-to-32-byte
+# per-request leak the moment it became the default. The leak is not bounded by
+# the limit itself: a **refused** request still parses headers and builds its
+# key before the 429, so the attacker sets the rate, not the configured 100/s.
+# The handler must call this variant with its request arena.
+fn agnosai_rate_limit_client_key_a(a, xff, has_xff, xri, has_xri): Str {
     if (has_xff == 1) {
         if (_agnosai_rl_visible_ascii(xff) == 1) {
-            var first = _agnosai_rl_before_comma(xff);
+            var first = _agnosai_rl_before_comma_a(a, xff);
             # `s.split(',').next()` always yields at least the empty string, and
             # the oracle returns it trimmed without checking for emptiness — so
             # an `X-Forwarded-For: ` header keys the empty-string bucket rather
             # than falling through to X-Real-IP.
-            return _agnosai_rl_trim(first);
+            return _agnosai_rl_trim_a(a, first);
         }
     }
     if (has_xri == 1) {
         if (_agnosai_rl_visible_ascii(xri) == 1) {
-            return _agnosai_rl_trim(xri);
+            return _agnosai_rl_trim_a(a, xri);
         }
     }
-    return str_from("unknown");
+    return str_from_a(a, "unknown");
 }
 
 # The part of `s` before the first comma, or all of it.
 fn _agnosai_rl_before_comma(s: Str): Str {
+    return _agnosai_rl_before_comma_a(default_alloc(), s);
+}
+
+fn _agnosai_rl_before_comma_a(a, s: Str): Str {
     var p = str_data(s);
     var n = str_len(s);
     for (var i = 0; i < n; i = i + 1) {
-        if ((load8(p + i) & 255) == 44) { return str_sub(s, 0, i); }
+        if ((load8(p + i) & 255) == 44) { return str_sub_a(a, s, 0, i); }
     }
     return s;
 }
@@ -124,6 +308,10 @@ fn _agnosai_rl_before_comma(s: Str): Str {
 # legally carry that `trim` would strip is ASCII, so space / tab / CR / LF / FF
 # / VT is the complete set here.
 fn _agnosai_rl_trim(s: Str): Str {
+    return _agnosai_rl_trim_a(default_alloc(), s);
+}
+
+fn _agnosai_rl_trim_a(a, s: Str): Str {
     var p = str_data(s);
     var n = str_len(s);
     var start = 0;
@@ -134,7 +322,12 @@ fn _agnosai_rl_trim(s: Str): Str {
     while (end > start && _agnosai_rl_is_space(load8(p + end - 1) & 255) == 1) {
         end = end - 1;
     }
-    return str_sub(s, start, end - start);
+    # ⚠ The truncation, applied at the ONE point every key flows through.
+    # `AGNOSAI_RL_MAX_KEY_BYTES` carries why.
+    if (end - start > AGNOSAI_RL_MAX_KEY_BYTES) {
+        end = start + AGNOSAI_RL_MAX_KEY_BYTES;
+    }
+    return str_sub_a(a, s, start, end - start);
 }
 
 fn _agnosai_rl_is_space(c): i64 {
@@ -169,8 +362,64 @@ fn _agnosai_rl_visible_ascii(s: Str): i64 {
 # request through untouched rather than failing closed, because a router that
 # did not install the layer must not start rejecting traffic.
 fn agnosai_rate_limit_check_request(s, key: Str): i64 {
+    return agnosai_rate_limit_check_request_a(0, s, key);
+}
+
+# Run an eviction sweep if enough checks have passed since the last one.
+#
+# ⚠ **This is what makes the mounted-by-default limiter bounded.** Until it
+# existed `agnosai_rate_limit_evict_stale` had exactly one caller in the tree
+# and it was a test, so every distinct key was retained for the life of the
+# process: majra `fl_alloc`s a permanent owned copy of the key plus a 16-byte
+# bucket plus a map slot, none of it ever released. Unauthenticated and
+# client-controlled, since the key comes from `X-Forwarded-For`.
+#
+# Two thresholds, because they bound different things:
+#
+#   * the **idle** sweep is the oracle's 300 s, and reclaims clients that left;
+#   * the **pressure** sweep fires only above `AGNOSAI_RL_MAX_KEYS` and drops
+#     anything untouched for a second. Idle eviction alone cannot bound
+#     cardinality — a client presenting a fresh key on every request keeps every
+#     bucket well inside the 300 s window, so the map grows without limit while
+#     the sweep dutifully finds nothing to remove.
+#
+# Amortised over the check path rather than run from a timer: no extra thread,
+# no wakeup, and no second contender for majra's mutex. `_a`-free because it
+# allocates nothing — majra 2.6.4's sweep walks the bucket array in place.
+# ⚠ `atomic_fetch_add`, not `load` + `store`. Every request thread runs this on
+# the shared limiter, so a plain read-modify-write loses counts under
+# concurrency and the sweep fires late by an unbounded amount — precisely when
+# load is highest and the sweep matters most. The atomic makes exactly one
+# thread in each group of `AGNOSAI_RL_SWEEP_EVERY` see the threshold, so the
+# sweep runs once per interval rather than once per racing thread. `> 0` rather
+# than `== 0` on the modulus keeps the very first check from sweeping an empty
+# map.
+fn _agnosai_rl_maybe_sweep(s): i64 {
+    var n = atomic_fetch_add(s + AGN_RL_SINCE_SWEEP, 1) + 1;
+    if (n % AGNOSAI_RL_SWEEP_EVERY != 0) {
+        return 0;
+    }
+    var freed = agnosai_rate_limit_evict_stale(s);
+    if (agnosai_rate_limit_active_keys(s) <= AGNOSAI_RL_MAX_KEYS) { return freed; }
+
+    freed = freed + ratelimit_evict_stale(load64(s + AGN_RL_LIMITER),
+    AGNOSAI_RL_PRESSURE_NS);
+    if (agnosai_rate_limit_active_keys(s) > AGNOSAI_RL_MAX_KEYS) {
+        freed = freed + ratelimit_evict_stale(load64(s + AGN_RL_LIMITER),
+        AGNOSAI_RL_PRESSURE_FLOOR_NS);
+    }
+    if (sakshi_get_level() >= SK_WARN) {
+        sakshi_log_kv(SK_WARN, "rate limit key pressure sweep", 29,
+        "reason", 6, "key cardinality over cap", 24);
+    }
+    return freed;
+}
+
+# `agnosai_rate_limit_check_request` with the key built through `a`.
+fn agnosai_rate_limit_check_request_a(a, s, key: Str): i64 {
     if (s == 0) { return HTTP_OK; }
-    if (agnosai_rate_limit_check(s, key) == 0) {
+    _agnosai_rl_maybe_sweep(s);
+    if (agnosai_rate_limit_check_a(a, s, key) == 0) {
         _agnosai_rl_warn(key);
         return AGNOSAI_HTTP_TOO_MANY_REQUESTS;
     }
