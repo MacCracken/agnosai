@@ -25,6 +25,24 @@ include "src/order.cyr"
 
 # `n` pseudo-random latencies via xorshift — reproducible, and unsorted, which
 # is the shape a real latency sample has.
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn _b_latencies(n, seed): i64 {
     var v = vec_new();
     var x = seed;
@@ -59,9 +77,11 @@ fn _b_sort_100k(): i64 {
     var src = _b_latencies(100000, 88172645463325252);
     var n = 5;
     var b = bench_new("sort_100k");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -74,9 +94,11 @@ fn _b_sort_100k_sorted(): i64 {
     var src = _b_sorted(100000);
     var n = 5;
     var b = bench_new("sort_100k_already_sorted");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -86,9 +108,11 @@ fn _b_select_100k(): i64 {
     var src = _b_latencies(100000, 88172645463325252);
     var n = 20;
     var b = bench_new("select_nth_100k");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_select_nth_i64(_b_copy(src), 50000); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_select_nth_i64(_b_copy(src), 50000); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -98,14 +122,16 @@ fn _b_three_percentiles_100k(): i64 {
     var src = _b_latencies(100000, 88172645463325252);
     var n = 20;
     var b = bench_new("three_percentiles_100k");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var v = _b_copy(src);
-        agnosai_percentile_i64(v, 50000);
-        agnosai_percentile_i64(v, 95000);
-        agnosai_percentile_i64(v, 99000);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var v = _b_copy(src);
+            agnosai_percentile_i64(v, 50000);
+            agnosai_percentile_i64(v, 95000);
+            agnosai_percentile_i64(v, 99000);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -116,9 +142,11 @@ fn _b_select_100k_sorted(): i64 {
     var src = _b_sorted(100000);
     var n = 20;
     var b = bench_new("select_nth_100k_already_sorted");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_select_nth_i64(_b_copy(src), 50000); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_select_nth_i64(_b_copy(src), 50000); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -128,9 +156,11 @@ fn _b_sort_10k(): i64 {
     var src = _b_latencies(10000, 88172645463325252);
     var n = 50;
     var b = bench_new("sort_10k");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_sort_i64(_b_copy(src)); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }

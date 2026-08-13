@@ -24,6 +24,24 @@ include "src/units.cyr"
 include "src/learning/mod.cyr"
 
 # "<prefix><n>" as a Str — the benchmark's stand-in for Rust's format!.
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn _b_name(prefix, n): i64 {
     return str_cat(str_from(prefix), str_from_int(n));
 }
@@ -144,15 +162,17 @@ fn _b_capability_record(): i64 {
     var cap = str_from("capability_25");
     var n = 100000;
     var b = bench_new("capability_scorer_record_50caps");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        if (i % 2 == 0) {
-            agnosai_capability_scorer_record_success(scorer, cap);
-        } else {
-            agnosai_capability_scorer_record_failure(scorer, cap);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            if (i % 2 == 0) {
+                agnosai_capability_scorer_record_success(scorer, cap);
+            } else {
+                agnosai_capability_scorer_record_failure(scorer, cap);
+            }
         }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -164,11 +184,13 @@ fn _b_capability_confidence(): i64 {
     for (var c = 0; c < 50; c = c + 1) { vec_push(caps, _b_name("capability_", c)); }
     var n = 500000;
     var b = bench_new("capability_scorer_confidence_50caps");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_capability_scorer_confidence(scorer, vec_get(caps, i % 50));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_capability_scorer_confidence(scorer, vec_get(caps, i % 50));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -178,9 +200,11 @@ fn _b_ucb1_select_10(): i64 {
     var bandit = _b_make_explored_bandit(10);
     var n = 100000;
     var b = bench_new("ucb1_select_10arms");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_ucb1_select(bandit, 100); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_ucb1_select(bandit, 100); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -190,9 +214,11 @@ fn _b_ucb1_select_50(): i64 {
     var bandit = _b_make_explored_bandit(50);
     var n = 20000;
     var b = bench_new("ucb1_select_50arms");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_ucb1_select(bandit, 500); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_ucb1_select(bandit, 500); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -207,13 +233,15 @@ fn _b_replay_push(): i64 {
     var next = str_from("s_next");
     var n = 10000;
     var b = bench_new("replay_buffer_push_1000cap_full");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var priority = f64_add(f64_abs(f64_cos(f64_mul(f64_from(i), seven_hundredths))), half);
-        var state = _b_name("s_", i);
-        agnosai_replay_buffer_push(buf, agnosai_experience_new(state, act, F64_ONE, next, priority));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var priority = f64_add(f64_abs(f64_cos(f64_mul(f64_from(i), seven_hundredths))), half);
+            var state = _b_name("s_", i);
+            agnosai_replay_buffer_push(buf, agnosai_experience_new(state, act, F64_ONE, next, priority));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -223,9 +251,11 @@ fn _b_replay_sample(): i64 {
     var buf = _b_make_full_buffer(1000);
     var n = 200;
     var b = bench_new("replay_buffer_sample32_from1000");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_replay_buffer_sample(buf, 32); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_replay_buffer_sample(buf, 32); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -237,13 +267,15 @@ fn _b_qlearner_update(): i64 {
     var reward = F64_HALF;
     var n = 50000;
     var b = bench_new("qlearner_update_1000_state_actions");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var state = _b_name("s_", i % 50);
-        var next_state = _b_name("s_", (i + 1) % 50);
-        agnosai_qlearner_update(q, state, vec_get(actions, i % 5), reward, next_state, actions);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var state = _b_name("s_", i % 50);
+            var next_state = _b_name("s_", (i + 1) % 50);
+            agnosai_qlearner_update(q, state, vec_get(actions, i % 5), reward, next_state, actions);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -254,11 +286,13 @@ fn _b_qlearner_best_action(): i64 {
     var q = _b_make_trained_qlearner(actions);
     var n = 100000;
     var b = bench_new("qlearner_best_action_1000_state_actions");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_qlearner_best_action(q, _b_name("s_", i % 50), actions);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_qlearner_best_action(q, _b_name("s_", i % 50), actions);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -269,15 +303,17 @@ fn _b_profile_record(): i64 {
     var build = str_from("build");
     var n = 50000;
     var b = bench_new("profile_record_20agents");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var agent = _b_name("agent-", i % 20);
-        var duration = (100 + i % 150) * AGNOSAI_NS_PER_MS;
-        var success = 1;
-        if (i % 2 == 1) { success = 0; }
-        agnosai_profile_record(profile, agent, build, duration, success);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var agent = _b_name("agent-", i % 20);
+            var duration = (100 + i % 150) * AGNOSAI_NS_PER_MS;
+            var success = 1;
+            if (i % 2 == 1) { success = 0; }
+            agnosai_profile_record(profile, agent, build, duration, success);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -290,11 +326,13 @@ fn _b_profile_success_rate(): i64 {
     var out: i64[1];
     var n = 100000;
     var b = bench_new("profile_success_rate_20agents");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_profile_success_rate(profile, vec_get(agents, i % 20), &out);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_profile_success_rate(profile, vec_get(agents, i % 20), &out);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }

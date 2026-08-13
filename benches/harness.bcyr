@@ -39,15 +39,37 @@
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
 
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn bench_noop(): i64 { return 0; }
 
 fn main(): i64 {
     alloc_init();
     var b = bench_new("noop");
-    bench_batch_start(b);
-    var i = 0;
-    while (i < 1000000) { bench_noop(); i = i + 1; }
-    bench_batch_stop(b, 1000000);
+    # Hand-wrapped rather than by the D4 transform: the body is a `while`, not
+    # the `for (var i = 0; i < n; ...)` shape the other 145 sites share.
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        var i = 0;
+        while (i < 1000000 / _BR) { bench_noop(); i = i + 1; }
+        bench_batch_stop(b, 1000000 / _BR);
+    }
     bench_report(b);
     return 0;
 }

@@ -97,14 +97,34 @@ var _B_PRESET_JSON_5A = "{\"name\":\"bench-preset\",\"description\":\"Benchmark 
 # make this bench silently cheap. `main` propagates the non-zero return into
 # the exit status so a tripped guard fails the run instead of just dropping a
 # line from the report.
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn _b_builtin_presets(): i64 {
     if (vec_len(agnosai_builtin_presets()) != 18) { return 1; }
 
     var n = 1000;
     var b = bench_new("builtin_presets_18");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_builtin_presets(); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_builtin_presets(); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -203,9 +223,11 @@ fn _b_assemble_team(): i64 {
 
     var n = 5000;
     var b = bench_new("assemble_team_5m_20a");
-    bench_batch_start(b);
-    for (var j = 0; j < n; j = j + 1) { agnosai_assemble_team(members, available); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var j = 0; j < n / _BR; j = j + 1) { agnosai_assemble_team(members, available); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -233,9 +255,11 @@ fn _b_match_score(): i64 {
 
     var n = 500000;
     var b = bench_new("assembler_match_score");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_assembler_match_score(member, agent); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_assembler_match_score(member, agent); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -259,9 +283,11 @@ fn _b_load_preset_from_json(): i64 {
 
     var n = 20000;
     var b = bench_new("load_preset_from_json_5a");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_load_preset_from_json(js, 0); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_load_preset_from_json(js, 0); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -295,13 +321,15 @@ fn _b_preset_to_value(): i64 {
 
     var n = 2000;
     var b = bench_new("preset_to_value_18");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        for (var j = 0; j < 18; j = j + 1) {
-            agnosai_preset_to_value_a(al, vec_get(presets, j));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            for (var j = 0; j < 18; j = j + 1) {
+                agnosai_preset_to_value_a(al, vec_get(presets, j));
+            }
         }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }

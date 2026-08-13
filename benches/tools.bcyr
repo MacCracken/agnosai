@@ -104,6 +104,24 @@ include "src/tools/builtin/mneme.cyr"
 # registry that silently stopped containing what an arm looks up would keep
 # reporting a healthy ~110ns while measuring nothing at all. Checked once per
 # fixture, always outside the timed region.
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn _b_require(ok, msg): i64 {
     if (ok != 0) { return 0; }
     syscall(1, 2, msg, strlen(msg));
@@ -147,12 +165,14 @@ fn _b_workers(workers, per, codes, seed): i64 {
 fn _b_aggregate_100k_10workers(): i64 {
     var n = 5;
     var b = bench_new("lt_aggregate_100k_10workers");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var ws = _b_workers(10, 10000, 3, 88172645463325252);
-        agnosai_lt_aggregate(ws, str_from("http://example.com/"), 10, 10);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var ws = _b_workers(10, 10000, 3, 88172645463325252);
+            agnosai_lt_aggregate(ws, str_from("http://example.com/"), 10, 10);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -163,12 +183,14 @@ fn _b_aggregate_100k_10workers(): i64 {
 fn _b_aggregate_100k_500workers(): i64 {
     var n = 5;
     var b = bench_new("lt_aggregate_100k_500workers");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var ws = _b_workers(500, 200, 3, 88172645463325252);
-        agnosai_lt_aggregate(ws, str_from("http://example.com/"), 500, 10);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var ws = _b_workers(500, 200, 3, 88172645463325252);
+            agnosai_lt_aggregate(ws, str_from("http://example.com/"), 500, 10);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -179,12 +201,14 @@ fn _b_aggregate_100k_500workers(): i64 {
 fn _b_aggregate_many_codes(): i64 {
     var n = 5;
     var b = bench_new("lt_aggregate_100k_200codes");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var ws = _b_workers(10, 10000, 200, 88172645463325252);
-        agnosai_lt_aggregate(ws, str_from("http://example.com/"), 10, 10);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var ws = _b_workers(10, 10000, 200, 88172645463325252);
+            agnosai_lt_aggregate(ws, str_from("http://example.com/"), 10, 10);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -197,9 +221,11 @@ fn _b_result_to_value(): i64 {
     var r = agnosai_lt_aggregate(ws, str_from("http://example.com/"), 4, 10);
     var n = 20000;
     var b = bench_new("lt_result_to_value");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_lt_result_to_value(r); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_lt_result_to_value(r); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -210,9 +236,11 @@ fn _b_is_safe_url(): i64 {
     var url = str_from("https://api.example.com:8443/v1/endpoint?q=1");
     var n = 200000;
     var b = bench_new("is_safe_url_public_host");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_is_safe_url(url); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_is_safe_url(url); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -223,9 +251,11 @@ fn _b_is_safe_url_numeric(): i64 {
     var url = str_from("http://0300.0250.0.1/");
     var n = 200000;
     var b = bench_new("is_safe_url_octal_host");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_is_safe_url(url); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_is_safe_url(url); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -243,9 +273,11 @@ fn _b_registry_get(): i64 {
     "tools.bcyr: json_transform is not registered — arm would time a miss\n");
     var n = 500000;
     var b = bench_new("tool_registry_get");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_tool_registry_get(reg, name); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_tool_registry_get(reg, name); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -362,13 +394,15 @@ fn _b_registry_get_n(name, n_tools, iters): i64 {
 
     var k = 0;
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < iters; i = i + 1) {
-        agnosai_tool_registry_get(reg, vec_get(names, k));
-        k = k + 1;
-        if (k == n_tools) { k = 0; }
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < iters / _BR; i = i + 1) {
+            agnosai_tool_registry_get(reg, vec_get(names, k));
+            k = k + 1;
+            if (k == n_tools) { k = 0; }
+        }
+        bench_batch_stop(b, iters / _BR);
     }
-    bench_batch_stop(b, iters);
     bench_report(b);
     return 0;
 }
@@ -376,9 +410,11 @@ fn _b_registry_get_n(name, n_tools, iters): i64 {
 # One arm of the oracle's `ToolRegistry::has` pair (tools.rs:111-129).
 fn _b_registry_has(name, reg, key: Str, iters): i64 {
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < iters; i = i + 1) { agnosai_tool_registry_has(reg, key); }
-    bench_batch_stop(b, iters);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < iters / _BR; i = i + 1) { agnosai_tool_registry_has(reg, key); }
+        bench_batch_stop(b, iters / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -470,12 +506,14 @@ fn _b_registry_list_n(name, n_tools, iters): i64 {
     reset_via(ar);
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < iters; i = i + 1) {
-        agnosai_tool_registry_list_a(ar, reg);
-        reset_via(ar);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < iters / _BR; i = i + 1) {
+            agnosai_tool_registry_list_a(ar, reg);
+            reset_via(ar);
+        }
+        bench_batch_stop(b, iters / _BR);
     }
-    bench_batch_stop(b, iters);
     bench_report(b);
     return 0;
 }
@@ -525,6 +563,17 @@ fn _b_registry_register(): i64 {
         agnosai_tool_new(nm, desc, &_b_named_schema, &_agnosai_echo_execute, nm));
     }
 
+    # ⚠ **Deliberately NOT rounds x batch (D4), and this is the one row in the
+    # tree where rounds would be WRONG rather than merely different.** The
+    # registry ACCUMULATES: each insert grows the map the next insert hashes
+    # into. Splitting the batch into rounds either re-registers the same slice
+    # (which the `_b_require` below caught immediately — the count came back
+    # n/_BR, not n) or measures five samples at five different fill levels, so
+    # the min/max would report map growth rather than run-to-run dispersion.
+    #
+    # A single batch over a monotonically growing structure is the honest shape
+    # here. `min == max == avg` on this row is therefore expected and correct,
+    # not the artefact D4 removed everywhere else.
     var reg = agnosai_tool_registry_new();
     var b = bench_new("tool_registry_register");
     bench_batch_start(b);
@@ -546,13 +595,15 @@ fn _b_tool_execute_echo(): i64 {
     var key = str_from("message");
     var n = 200000;
     var b = bench_new("tool_execute_echo");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var input = agnosai_tool_input_new();
-        agnosai_tool_input_set(input, key, msg);
-        agnosai_tool_execute(tool, input);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var input = agnosai_tool_input_new();
+            agnosai_tool_input_set(input, key, msg);
+            agnosai_tool_execute(tool, input);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -564,13 +615,15 @@ fn _b_form_encode(): i64 {
     var q = str_from("distributed systems consensus & raft: a survey (2024)");
     var n = 200000;
     var b = bench_new("agnos_form_encode_52b");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var sb = str_builder_new();
-        agnosai_agnos_form_encode(sb, q);
-        str_builder_build(sb);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var sb = str_builder_new();
+            agnosai_agnos_form_encode(sb, q);
+            str_builder_build(sb);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -581,9 +634,11 @@ fn _b_segment_ok(): i64 {
     var seg = str_from("note-8f3a21c0-4b7e");
     var n = 500000;
     var b = bench_new("agnos_segment_ok");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_agnos_segment_ok(seg); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_agnos_segment_ok(seg); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }

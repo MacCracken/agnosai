@@ -47,15 +47,23 @@
 # `agnosai_metrics_gather`'s finished `Str` to `agnosai_route_text`, so that row
 # alone carries its whole body render.
 #
-# So a JSON row is "body-limit check, resolve, auth, handler, value tree" — not
-# a whole reply — and `route_metrics_global` is **not** subtractable against the
-# other two probes: the gap between them is a measurement-class difference, not a
-# handler-cost one. Against the oracle this is an early-out, since axum's
-# `Json` `IntoResponse` serialises inside the stack `app.oneshot` drove
-# (`rust-old/benches/server.rs:43-62`), so no row here can see a serialisation
-# regression. Building the body inside the timed region would close that gap and
-# re-baseline every JSON row in the file; it has not been done, and no comment
-# here may claim a "response" until it is.
+# ✅ **CLOSED 2026-08-13 (roadmap D5): the body IS rendered inside the timed
+# region now.** Every dispatch row calls `_b_render_body` / `_b_render_body_a`
+# on the result, reproducing `_agnosai_serve_send`'s branch set exactly — text
+# routes render nothing extra, JSON routes build their value tree to bytes, and
+# the null/204 arms are guarded the same way. So a JSON row is now the WHOLE
+# reply: body-limit check, resolve, auth, handler, value tree, **and
+# serialisation** — which is what `rust-old/benches/server.rs:43-62` always
+# measured, since axum's `Json` `IntoResponse` serialises inside the stack
+# `app.oneshot` drove. A serialisation regression is visible here for the first
+# time.
+#
+# ⚠ **This RE-BASELINED every JSON row in this file on 2026-08-13.** Rows are not
+# comparable across that date. `route_metrics_global` is unaffected — it already
+# carried its whole body render, since `agnosai_route_metrics` hands
+# `agnosai_metrics_gather`'s finished `Str` to `agnosai_route_text` — and it is
+# now genuinely comparable with its siblings rather than a measurement-class
+# outlier.
 #
 # ## Three rows here are deliberately SINGLE-arm, and that is not an omission
 #
@@ -149,6 +157,24 @@ var AGN_B_FIXTURE_N = 8;
 # The application state every benchmark below dispatches against: eight finished
 # crews carrying agent metadata, eight pending approvals, one agent definition,
 # and the oracle's two registered tools.
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn _b_state(): i64 {
     var o = agnosai_orchestrator_new(0);
     var reg = agnosai_tool_registry_new();
@@ -202,16 +228,52 @@ fn _b_state(): i64 {
 
 # Time `n` dispatches of `path` on the **global** allocator — the un-threaded
 # arm, and what a caller outside a sandhi worker still gets.
+# ────────────
+# Render a dispatch result's body exactly as `_agnosai_serve_send`
+# (`src/server/serve.cyr:470-485`) does, so a timed region covers the WHOLE
+# route rather than stopping at the response struct.
+#
+# ⚠ **This is what closes the gap with the oracle.** `rust-old/benches/server.rs:43-62`
+# drives a real `tower` service, and axum's `Json` `IntoResponse` serialises
+# inside the stack `app.oneshot` drove — so the oracle's number always included
+# the body render and no row here could see a serialisation regression. It can
+# now.
+#
+# A text route (`/metrics`) already carries its finished `Str`, so it renders
+# nothing extra and stays comparable; a JSON route builds its value tree into
+# bytes. `bayan_json_v_is_null` guards the 204/empty arms, matching the send path
+# branch for branch — a bench that rendered where production does not would be a
+# different lie from the one it replaced.
+fn _b_render_body(resp): i64 {
+    if (resp == 0) { return 0; }
+    if (agnosai_route_is_text(resp) == 1) { return 0; }
+    var body = agnosai_route_body(resp);
+    if (body == 0) { return 0; }
+    if (bayan_json_v_is_null(body) == 1) { return 0; }
+    return bayan_json_v_build(body);
+}
+
+fn _b_render_body_a(a, resp): i64 {
+    if (resp == 0) { return 0; }
+    if (agnosai_route_is_text(resp) == 1) { return 0; }
+    var body = agnosai_route_body(resp);
+    if (body == 0) { return 0; }
+    if (bayan_json_v_is_null(body) == 1) { return 0; }
+    return bayan_json_v_build_a(a, body);
+}
+
 fn _b_dispatch_global(s, name, path: Str, n): i64 {
     var empty = str_from("");
     agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            _b_render_body(agnosai_route_dispatch(s, AGNOSAI_METHOD_GET, path, empty, 0, empty));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -229,12 +291,15 @@ fn _b_dispatch_arena(s, name, path: Str, n): i64 {
     reset_via(ar);
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, path, empty, 0, empty);
-        reset_via(ar);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            _b_render_body_a(ar,
+            agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_GET, path, empty, 0, empty));
+            reset_via(ar);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -245,11 +310,13 @@ fn _b_post_global(s, name, path: Str, body: Str, n): i64 {
     agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, path, empty, 0, body);
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, path, empty, 0, body);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            _b_render_body(agnosai_route_dispatch(s, AGNOSAI_METHOD_POST, path, empty, 0, body));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -262,12 +329,15 @@ fn _b_post_arena(s, name, path: Str, body: Str, n): i64 {
     reset_via(ar);
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var j = 0; j < n; j = j + 1) {
-        agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_POST, path, empty, 0, body);
-        reset_via(ar);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var j = 0; j < n / _BR; j = j + 1) {
+            _b_render_body_a(ar,
+            agnosai_route_dispatch_a(ar, s, AGNOSAI_METHOD_POST, path, empty, 0, body));
+            reset_via(ar);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -409,9 +479,11 @@ fn _b_prompt_scan_clean_500(): i64 {
     var text = _b_clean_500();
 
     var b = bench_new("prompt_scan_clean_500b");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_scan_input(text); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_prompt_scan_input(text); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -448,9 +520,11 @@ fn _b_prompt_scan_suspicious_500(): i64 {
     if (agnosai_prompt_scan_input(text) == AGNOSAI_SCAN_CLEAN) { syscall(60, 1); }
 
     var b = bench_new("prompt_scan_suspicious_500b");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_scan_input(text); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_prompt_scan_input(text); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -469,9 +543,11 @@ fn _b_prompt_sanitize_clean_500(): i64 {
     var field = str_from("description");
 
     var b = bench_new("prompt_sanitize_clean_500b");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_sanitize(text, field); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_prompt_sanitize(text, field); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -484,11 +560,13 @@ fn _b_prompt_sanitize_clean_500(): i64 {
 # allocation into a 300 ns number.
 fn _b_resolve(name, path: Str, n): i64 {
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_route_resolve(AGNOSAI_METHOD_GET, path);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_route_resolve(AGNOSAI_METHOD_GET, path);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }

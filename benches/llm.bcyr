@@ -41,6 +41,24 @@ include "src/llm/inference_queue.cyr"
 # All 21 (task_type, complexity) profiles, built once so the loop measures the
 # routing and not the construction — the oracle pre-builds them for the same
 # reason.
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn _b_all_profiles(): i64 {
     var types = vec_new();
     vec_push(types, AGNOSAI_TASKTYPE_SUMMARIZE);
@@ -70,11 +88,13 @@ fn _b_route_all(): i64 {
     var profiles = _b_all_profiles();
     var n = 100000;
     var b = bench_new("route_all_21_combinations");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        for (var j = 0; j < 21; j = j + 1) { agnosai_route(vec_get(profiles, j)); }
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            for (var j = 0; j < 21; j = j + 1) { agnosai_route(vec_get(profiles, j)); }
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -84,9 +104,11 @@ fn _b_route_fast(): i64 {
     var p = agnosai_task_profile_new(AGNOSAI_TASKTYPE_SUMMARIZE, AGNOSAI_COMPLEXITY_SIMPLE);
     var n = 2000000;
     var b = bench_new("route_summarize_simple");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_route(p); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_route(p); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -97,9 +119,11 @@ fn _b_route_premium(): i64 {
     var p = agnosai_task_profile_new(AGNOSAI_TASKTYPE_RESEARCH, AGNOSAI_COMPLEXITY_COMPLEX);
     var n = 2000000;
     var b = bench_new("route_research_complex");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_route(p); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_route(p); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -113,9 +137,11 @@ fn _b_route_premium(): i64 {
 fn _b_default_model(tier, name): i64 {
     var n = 1000000;
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_default_model(tier); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_default_model(tier); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -125,9 +151,11 @@ fn _b_parse_complexity(input, name): i64 {
     var s = str_from(input);
     var n = 1000000;
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_parse_complexity(s); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_parse_complexity(s); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -149,11 +177,13 @@ fn _b_iq_enqueue(): i64 {
     var label = str_from("bench");
     var n = 200000;
     var b = bench_new("inference_queue_enqueue");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_inference_queue_enqueue(q, req, PRIORITY_NORMAL, label);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_inference_queue_enqueue(q, req, PRIORITY_NORMAL, label);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -212,9 +242,11 @@ fn _b_iq_dequeue_background(n, name): i64 {
     }
     var cpq = agnosai_inference_queue_cpq(q);
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var j = 0; j < n; j = j + 1) { cpq_dequeue(cpq); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var j = 0; j < n / _BR; j = j + 1) { cpq_dequeue(cpq); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -224,9 +256,11 @@ fn _b_iq_dequeue_background(n, name): i64 {
 fn _b_map_priority(): i64 {
     var n = 5000000;
     var b = bench_new("map_priority_ladder");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_map_priority(AGNOSAI_PRIORITY_CRITICAL); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_map_priority(AGNOSAI_PRIORITY_CRITICAL); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }

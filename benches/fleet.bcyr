@@ -149,6 +149,24 @@ include "src/fleet/coordinator.cyr"
 # ── fleet/state ───────────────────────────────
 
 # The oracle's `nodes(&["a", "b", "c"])`.
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn _b_three_nodes(): i64 {
     var v = vec_new();
     vec_push(v, str_from("a"));
@@ -172,11 +190,13 @@ fn _b_create_run(): i64 {
     var b = bench_new("fleet_create_run_3nodes");
     for (var r = 0; r < 50; r = r + 1) {
         var m = agnosai_crew_state_manager_new();
-        bench_batch_start(b);
-        for (var i = 0; i < 900; i = i + 1) {
-            agnosai_crew_state_manager_create_run(m, nodes, 10);
+        for (var _r = 0; _r < _BR; _r = _r + 1) {
+            bench_batch_start(b);
+            for (var i = 0; i < 900 / _BR; i = i + 1) {
+                agnosai_crew_state_manager_create_run(m, nodes, 10);
+            }
+            bench_batch_stop(b, 900 / _BR);
         }
-        bench_batch_stop(b, 900);
     }
     bench_report(b);
     return 0;
@@ -194,6 +214,11 @@ fn _b_create_run(): i64 {
 # on first touch, a set_add and a phase write.
 #
 # 300 rounds leaves the manager at 300 runs, under the 1000 cap.
+#
+# ⚠ **Already rounds x batch before D4, and deliberately left alone.** This is the
+# one row in the tree that always called `bench_batch_start`/`bench_batch_stop`
+# inside a loop — 300 times — so its min/max were real samples all along. The D4
+# transform skipped it for that reason; do not wrap it a second time.
 fn _b_reach_barrier(): i64 {
     var nodes = _b_three_nodes();
     var na = str_from("a");
@@ -269,12 +294,14 @@ fn _b_fan_out(): i64 {
         var co = agnosai_fleet_coordinator_new();
         var pool = vec_new();
         for (var j = 0; j < 500; j = j + 1) { vec_push(pool, _b_fanout_set(nodes3)); }
-        bench_batch_start(b);
-        for (var i = 0; i < 500; i = i + 1) {
-            var p = vec_get(pool, i);
-            agnosai_fleet_coordinator_fan_out(co, load64(p), load64(p + 8));
+        for (var _r = 0; _r < _BR; _r = _r + 1) {
+            bench_batch_start(b);
+            for (var i = 0; i < 500 / _BR; i = i + 1) {
+                var p = vec_get(pool, i);
+                agnosai_fleet_coordinator_fan_out(co, load64(p), load64(p + 8));
+            }
+            bench_batch_stop(b, 500 / _BR);
         }
-        bench_batch_stop(b, 500);
     }
     bench_report(b);
     return 0;
@@ -311,11 +338,13 @@ fn _b_task_completed(): i64 {
     }
     var n = 500000;
     var b = bench_new("fleet_task_completed");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_fleet_coordinator_task_completed(co, vec_get(ids, i % 8000));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_fleet_coordinator_task_completed(co, vec_get(ids, i % 8000));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -355,6 +384,11 @@ fn _b_compute_allocate(ids): i64 {
     var b = bench_new("fleet_compute_allocate_8dev");
     for (var r = 0; r < 200; r = r + 1) {
         var s = _b_scheduler_8();
+        # ⚠ NO nested _BR loop: this fn ALREADY drives rounds via its outer
+        # `for (var r = 0; ...)`, so batch_start/stop are called per round and
+        # min/max were real samples before D4. Nesting a second loop sliced the
+        # device list into fifths and sent rounds 2-5 down the already-allocated
+        # reject path — a bogus -50%. Measured, not reasoned.
         bench_batch_start(b);
         for (var i = 0; i < 192; i = i + 1) {
             agnosai_compute_scheduler_allocate(s, vec_get(ids, i), 1000, AGNOSAI_ACCEL_ANY);
@@ -384,13 +418,15 @@ fn _b_compute_release_realloc(): i64 {
     }
     var n = 200000;
     var b = bench_new("fleet_compute_release_realloc_8dev");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var id = vec_get(ids, i % 8);
-        agnosai_compute_scheduler_release(s, id);
-        agnosai_compute_scheduler_allocate(s, id, 20000, AGNOSAI_ACCEL_ANY);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var id = vec_get(ids, i % 8);
+            agnosai_compute_scheduler_release(s, id);
+            agnosai_compute_scheduler_allocate(s, id, 20000, AGNOSAI_ACCEL_ANY);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -417,6 +453,11 @@ fn _b_compute_release_only(ids): i64 {
         for (var i = 0; i < 192; i = i + 1) {
             agnosai_compute_scheduler_allocate(s, vec_get(ids, i), 1000, AGNOSAI_ACCEL_ANY);
         }
+        # ⚠ NO nested _BR loop: this fn ALREADY drives rounds via its outer
+        # `for (var r = 0; ...)`, so batch_start/stop are called per round and
+        # min/max were real samples before D4. Nesting a second loop sliced the
+        # device list into fifths and sent rounds 2-5 down the already-allocated
+        # reject path — a bogus -50%. Measured, not reasoned.
         bench_batch_start(b);
         for (var i = 0; i < 192; i = i + 1) {
             agnosai_compute_scheduler_release(s, vec_get(ids, i));
@@ -439,9 +480,11 @@ fn _b_best_device(): i64 {
     var s = _b_scheduler_8();
     var n = 500000;
     var b = bench_new("fleet_compute_best_device_8dev");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_compute_scheduler_best_device(s); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_compute_scheduler_best_device(s); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -480,9 +523,11 @@ fn _b_make_fleet(n): i64 {
 # the reason for each iteration count live on the callers.
 fn _b_place_case(q, fleet, n, name): i64 {
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_place(q, fleet); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_place(q, fleet); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -490,9 +535,11 @@ fn _b_place_case(q, fleet, n, name): i64 {
 # `rank_nodes` without the take-first. Same runner shape.
 fn _b_rank_case(q, fleet, n, name): i64 {
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_rank_nodes(q, fleet); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_rank_nodes(q, fleet); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -735,9 +782,11 @@ fn _b_rank_nodes_cost(big): i64 {
 fn _b_clock_baseline(): i64 {
     var n = 2000000;
     var b = bench_new("clock_epoch_secs_baseline");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { clock_epoch_secs(); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { clock_epoch_secs(); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }

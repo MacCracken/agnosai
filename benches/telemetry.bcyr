@@ -37,6 +37,24 @@ include "src/telemetry/otlp.cyr"
 
 # One fully-populated inference span. Built once so the loops measure encoding
 # rather than construction.
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn _b_tel_span(): i64 {
     var s = agnosai_genai_inference_span(str_from("gpt-4o"), str_from("openai"),
     str_from("bench-agent"), str_from("task-1"));
@@ -56,9 +74,11 @@ fn _b_tel_encode_span(): i64 {
     var ctx = _b_tel_ctx();
     var n = 20000;
     var b = bench_new("otlp_encode_span");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_otlp_span_json(span, ctx); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_otlp_span_json(span, ctx); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -72,14 +92,16 @@ fn _b_tel_ring_enqueue(): i64 {
     var svc = str_from("bench-svc");
     var n = 20000;
     var b = bench_new("otlp_ring_enqueue");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_otlp_ring_enqueue(r, span, ctx);
-        # Drain on the ring's own capacity so the arena is recycled rather than
-        # spilling — spilling measures the global allocator, not this path.
-        if (i % AGNOSAI_OTLP_RING_MAX == 0) { agnosai_otlp_ring_drain(r, svc); }
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_otlp_ring_enqueue(r, span, ctx);
+            # Drain on the ring's own capacity so the arena is recycled rather than
+            # spilling — spilling measures the global allocator, not this path.
+            if (i % AGNOSAI_OTLP_RING_MAX == 0) { agnosai_otlp_ring_drain(r, svc); }
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -111,13 +133,15 @@ fn _b_tel_json_escape(clean, name): i64 {
     if (clean == 0) { v = str_from("quote\" backslash\\ newline\n tab\t ctl\x01"); }
     var n = 50000;
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var sb = str_builder_new_a(a);
-        _agnosai_otlp_json_str_a(a, sb, v);
-        str_builder_build_a(a, sb);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var sb = str_builder_new_a(a);
+            _agnosai_otlp_json_str_a(a, sb, v);
+            str_builder_build_a(a, sb);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -131,15 +155,19 @@ fn _b_tel_post_url(): i64 {
     var pathed = str_from("http://localhost:4318/v1/traces");
     var n = 50000;
     var b = bench_new("otlp_post_url_append");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { _agnosai_otlp_post_url(a, bare); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { _agnosai_otlp_post_url(a, bare); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
 
     var b2 = bench_new("otlp_post_url_passthrough");
-    bench_batch_start(b2);
-    for (var j = 0; j < n; j = j + 1) { _agnosai_otlp_post_url(a, pathed); }
-    bench_batch_stop(b2, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b2);
+        for (var j = 0; j < n / _BR; j = j + 1) { _agnosai_otlp_post_url(a, pathed); }
+        bench_batch_stop(b2, n / _BR);
+    }
     bench_report(b2);
     return 0;
 }

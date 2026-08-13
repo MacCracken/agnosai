@@ -473,10 +473,19 @@ fn _agnosai_crew_build_request(task, agent, model: Str, user_msg: Str): i64 {
     # `bayan_json_v_build_pretty` produces.
     var ctx = agnosai_task_context(task);
     if (ctx != 0 && map_size(ctx) > 0) {
+        # ⚠ Slot-walked, NOT `map_keys` — standing trap #2 under roadmap B2.
+        # `map_keys` builds its key vec with `vec_new()` on the no-free global
+        # bump and has no `_a` form, so it leaks per task and silently caps any
+        # threading done around it. The walk also drops the second hash lookup:
+        # `map_get(ctx, key)` per key became `_agnosai_map_slot_val` on the slot
+        # already in hand.
         var obj = bayan_json_v_obj_new();
-        var keys = map_keys(ctx);
-        for (var i = 0; i < vec_len(keys); i = i + 1) {
-            bayan_json_v_obj_set(obj, vec_get(keys, i), map_get(ctx, vec_get(keys, i)));
+        var slots = _agnosai_map_slots(ctx);
+        for (var i = 0; i < slots; i = i + 1) {
+            if (_agnosai_map_slot_live(ctx, i) == 1) {
+                bayan_json_v_obj_set(obj, _agnosai_map_slot_key(ctx, i),
+                _agnosai_map_slot_val(ctx, i));
+            }
         }
         agnosai_inference_request_say(req, AGNOSAI_ROLE_USER,
         agnosai_prompt_sanitize(bayan_json_v_build_pretty(obj, 2), str_from("context")));

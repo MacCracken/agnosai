@@ -121,6 +121,24 @@ include "src/orchestrator/crew_runner.cyr"
 include "src/orchestrator/orchestrator.cyr"
 
 # An agent with two tools, a complexity and a domain — the shape scoring reads.
+# ────────────
+# Every row in this file used to call `bench_batch_start`/`bench_batch_stop`
+# EXACTLY ONCE, so `bench_batch_stop`'s per-op value was the only sample it ever
+# saw and `min == max == avg` by construction — the dispersion column carried no
+# information at all. `lib/bench.cyr`'s `bench_batch_stop` already folds each
+# call's per-op figure into min/max, so N rounds give N real samples for free.
+#
+# ⚠ **Total work is UNCHANGED**: the inner loop bound and the batch size are both
+# divided by `_BR`, so `rounds x batch` equals the old single batch. Integer
+# division can shave a few iterations off a batch that does not divide evenly;
+# `bench_iterations` reports the true accumulated count either way.
+#
+# ⚠ **This RE-BASELINES every row in this file.** `_bench_net` subtracts the
+# measured clock floor once per `bench_batch_stop`, so five stops subtract it
+# five times where one subtracted it once. Rows are not comparable across
+# 2026-08-13. See roadmap D4.
+var _BR = 5;
+
 fn _b_agent(key: Str): i64 {
     var a = agnosai_agent_new(key, str_from("worker"), str_from("do work"));
     agnosai_agent_with_complexity(a, str_from("medium"));
@@ -171,12 +189,14 @@ fn _b_event_round_trip(): i64 {
     bayan_json_v_null());
 
     var b = bench_new("event_round_trip_1_sub");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_event_sender_send(tx, ev);
-        agnosai_event_sub_try_recv(rx);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_event_sender_send(tx, ev);
+            agnosai_event_sub_try_recv(rx);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -192,12 +212,14 @@ fn _b_event_fanout_64(): i64 {
     bayan_json_v_null());
 
     var b = bench_new("event_fanout_64_subs");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_event_sender_send(tx, ev);
-        for (var j = 0; j < 64; j = j + 1) { agnosai_event_sub_try_recv(vec_get(subs, j)); }
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_event_sender_send(tx, ev);
+            for (var j = 0; j < 64; j = j + 1) { agnosai_event_sub_try_recv(vec_get(subs, j)); }
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -218,9 +240,11 @@ fn _b_event_send_evicting(): i64 {
     }
 
     var b = bench_new("event_send_evicting");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_event_sender_send(tx, ev); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_event_sender_send(tx, ev); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -238,12 +262,14 @@ fn _b_pubsub_publish(): i64 {
     var payload = bayan_json_v_null();
 
     var b = bench_new("pubsub_publish_4_patterns");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_pubsub_publish(ps, topic, payload);
-        chan_try_recv(rx);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_pubsub_publish(ps, topic, payload);
+            chan_try_recv(rx);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -256,9 +282,11 @@ fn _b_pattern_match(): i64 {
     var topic = str_from("tool.http.request.succeeded");
 
     var b = bench_new("pattern_match_wildcard");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_matches_pattern(pattern, topic); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_matches_pattern(pattern, topic); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -370,9 +398,11 @@ fn _b_scoring_agents(n): i64 {
 
 fn _b_score_case(agent, task, n, name): i64 {
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_score_agent(agent, task); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_score_agent(agent, task); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -425,9 +455,11 @@ fn _b_rank_varied(count, n, name): i64 {
     var agents = _b_scoring_agents(count);
     var task = _b_rich_task();
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_rank_agents(agents, task); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_rank_agents(agents, task); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -461,9 +493,11 @@ fn _b_rank_agents(): i64 {
     var task = _b_task();
 
     var b = bench_new("rank_agents_16");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_rank_agents(agents, task); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_rank_agents(agents, task); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -476,9 +510,11 @@ fn _b_delegate(): i64 {
     var tasks = _b_tasks(16);
 
     var b = bench_new("delegate_16_tasks_16_agents");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_delegate_tasks(manager, agents, tasks); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_delegate_tasks(manager, agents, tasks); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -504,11 +540,13 @@ fn _b_kahn_sort(): i64 {
     }
 
     var b = bench_new("kahn_sort_64_nodes");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_scheduler_kahn_sort(keys, dependents, dependencies);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_scheduler_kahn_sort(keys, dependents, dependencies);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -525,9 +563,11 @@ fn _b_plan_key(): i64 {
     var mode = str_from("sequential");
 
     var b = bench_new("plan_key_16x16");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_plan_key(agent_keys, descriptions, mode); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_plan_key(agent_keys, descriptions, mode); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -546,11 +586,13 @@ fn _b_plan_cache_get(): i64 {
     }
 
     var b = bench_new("plan_cache_get_hit");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_plan_cache_get(cache, vec_get(keys, i % 64));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_plan_cache_get(cache, vec_get(keys, i % 64));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -564,9 +606,11 @@ fn _b_conv_buffer_push(): i64 {
     for (var f = 0; f < 32; f = f + 1) { agnosai_conv_buffer_add_user(buf, content); }
 
     var b = bench_new("conv_buffer_push_sliding_32");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_conv_buffer_add_user(buf, content); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_conv_buffer_add_user(buf, content); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -582,9 +626,11 @@ fn _b_serialize_state(): i64 {
     var st = _b_crew_state();
 
     var b = bench_new("durable_serialize_crew_state");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_serialize_crew_state(st); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_serialize_crew_state(st); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -597,11 +643,13 @@ fn _b_deserialize_state(): i64 {
     store64(&out, 0);
 
     var b = bench_new("durable_deserialize_crew_state");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_deserialize_crew_state(str_data(doc), str_len(doc), &out);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_deserialize_crew_state(str_data(doc), str_len(doc), &out);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -617,11 +665,13 @@ fn _b_state_save(): i64 {
     var cid = str_from("bench-crew");
 
     var b = bench_new("durable_save_atomic");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_state_store_save(store, cid, str_data(doc), str_len(doc));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_state_store_save(store, cid, str_data(doc), str_len(doc));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -637,11 +687,13 @@ fn _b_state_load(): i64 {
     store64(&len, 0);
 
     var b = bench_new("durable_load_hit");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_state_store_load(store, cid, &bytes, &len);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_state_store_load(store, cid, &bytes, &len);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -658,11 +710,13 @@ fn _b_state_load_miss(): i64 {
     store64(&len, 0);
 
     var b = bench_new("durable_load_miss");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_state_store_load(store, cid, &bytes, &len);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_state_store_load(store, cid, &bytes, &len);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -676,9 +730,11 @@ fn _b_mkdir_p(): i64 {
     _agnosai_mkdir_p(path);
 
     var b = bench_new("durable_mkdir_p_existing_4deep");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { _agnosai_mkdir_p(path); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { _agnosai_mkdir_p(path); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -698,9 +754,11 @@ fn _b_system_prompt(): i64 {
     agnosai_agent_with_tools(a, tools);
 
     var b = bench_new("crew_build_system_prompt");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { _agnosai_crew_build_system_prompt(a); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { _agnosai_crew_build_system_prompt(a); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -712,9 +770,11 @@ fn _b_select_model(): i64 {
     var a = agnosai_agent_new(str_from("c"), str_from("tester"), str_from("test things"));
 
     var b = bench_new("crew_select_model_routed");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { _agnosai_crew_select_model(a); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { _agnosai_crew_select_model(a); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -726,9 +786,11 @@ fn _b_infer_provider(): i64 {
     var model = str_from("llama3:70b");
 
     var b = bench_new("crew_infer_provider_fallthrough");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { _agnosai_crew_infer_provider(model); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { _agnosai_crew_infer_provider(model); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -741,9 +803,11 @@ fn _b_prompt_scan_clean(): i64 {
     var text = str_from("Summarize the quarterly revenue report and highlight any anomalies.");
 
     var b = bench_new("prompt_scan_clean_67b");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_scan_input(text); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_prompt_scan_input(text); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -759,9 +823,11 @@ fn _b_prompt_scan_4k(): i64 {
     var text = str_builder_build(sb);
 
     var b = bench_new("prompt_scan_clean_4k");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_prompt_scan_input(text); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_prompt_scan_input(text); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -776,9 +842,11 @@ fn _b_audit_record(): i64 {
     var msg = str_from("summarize the quarterly revenue report");
 
     var b = bench_new("audit_record");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_audit_record(chain, event, level, msg, 0, 0, 0); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_audit_record(chain, event, level, msg, 0, 0, 0); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -794,9 +862,11 @@ fn _b_audit_verify(): i64 {
     }
 
     var b = bench_new("audit_verify_256");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_audit_verify(chain); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_audit_verify(chain); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -810,9 +880,11 @@ fn _b_output_scan(): i64 {
     var sys = str_from("You are a helpful assistant that answers questions about finance.");
 
     var b = bench_new("output_scan_clean");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_output_scan(resp, sys); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_output_scan(resp, sys); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -823,9 +895,11 @@ fn _b_output_redact(): i64 {
     var resp = str_from("The quarterly revenue rose 12% year over year with no secrets.");
 
     var b = bench_new("output_redact_clean");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_output_redact(resp); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_output_redact(resp); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -836,9 +910,11 @@ fn _b_metrics_record(): i64 {
     var m = agnosai_metrics_new();
 
     var b = bench_new("metrics_record_task");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_metrics_record_task_completed(m); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_metrics_record_task_completed(m); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -851,9 +927,11 @@ fn _b_metrics_gather(): i64 {
     agnosai_metrics_record_inference(m, 12345, 1234567);
 
     var b = bench_new("metrics_gather");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_metrics_gather(m); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_metrics_gather(m); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -889,9 +967,11 @@ fn _b_auth_check_ok(): i64 {
     var h = str_from("Bearer my-secret");
 
     var b = bench_new("auth_check_secret_ok");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check(c, 1, h); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_auth_check(c, 1, h); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -906,9 +986,11 @@ fn _b_auth_check_reject(): i64 {
     var h = str_from("Bearer wrong-token");
 
     var b = bench_new("auth_check_secret_reject");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check(c, 1, h); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_auth_check(c, 1, h); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -923,9 +1005,11 @@ fn _b_auth_check_short_token(): i64 {
     var h = str_from("Bearer x");
 
     var b = bench_new("auth_check_secret_short_token");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check(c, 1, h); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_auth_check(c, 1, h); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -938,9 +1022,11 @@ fn _b_auth_check_disabled(): i64 {
     var h = str_from("Bearer my-secret");
 
     var b = bench_new("auth_check_disabled");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check(c, 1, h); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_auth_check(c, 1, h); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -962,9 +1048,11 @@ fn _b_auth_jwt_valid(): i64 {
     var h = _b_bearer(_t_jwt_valid());
 
     var b = bench_new("auth_jwt_verify_ok");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check_at(c, 1, h, 1700000000); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_auth_check_at(c, 1, h, 1700000000); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -986,9 +1074,11 @@ fn _b_auth_jwt_bad_alg(): i64 {
     var h = _b_bearer(_t_jwt_alg_hs256());
 
     var b = bench_new("auth_jwt_reject_bad_alg");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_auth_check_at(c, 1, h, 1700000000); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_auth_check_at(c, 1, h, 1700000000); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -998,11 +1088,13 @@ fn _b_auth_jwt_bad_alg(): i64 {
 fn _b_auth_jwt_prepare(): i64 {
     var n = 20000;
     var b = bench_new("auth_jwt_key_prepare");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_jwt_config_prepare(agnosai_jwt_config_new(_t_jwt_pubkey_pem()));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_jwt_config_prepare(agnosai_jwt_config_new(_t_jwt_pubkey_pem()));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -1038,16 +1130,18 @@ fn _b_sched_tasks(n): i64 {
 fn _b_sched_enqueue_100(): i64 {
     var n = 2000;
     var b = bench_new("scheduler_enqueue_100_build");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var s = agnosai_scheduler_new();
-        for (var t = 0; t < 100; t = t + 1) {
-            var task = agnosai_task_new(str_cat(str_from("task-"), str_from_int(t)));
-            agnosai_task_with_priority(task, t % 5);
-            agnosai_scheduler_enqueue(s, task);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var s = agnosai_scheduler_new();
+            for (var t = 0; t < 100; t = t + 1) {
+                var task = agnosai_task_new(str_cat(str_from("task-"), str_from_int(t)));
+                agnosai_task_with_priority(task, t % 5);
+                agnosai_scheduler_enqueue(s, task);
+            }
         }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -1059,12 +1153,14 @@ fn _b_sched_enqueue_prebuilt(): i64 {
     var tasks = _b_sched_tasks(100);
 
     var b = bench_new("scheduler_enqueue_100_prebuilt");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var s = agnosai_scheduler_new();
-        for (var j = 0; j < 100; j = j + 1) { agnosai_scheduler_enqueue(s, vec_get(tasks, j)); }
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var s = agnosai_scheduler_new();
+            for (var j = 0; j < 100; j = j + 1) { agnosai_scheduler_enqueue(s, vec_get(tasks, j)); }
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -1087,6 +1183,11 @@ fn _b_sched_enqueue_prebuilt(): i64 {
 # ~38 ns and the shift at **~1.9 ns per slot**, which is what turns a full drain
 # quadratic. If the dequeue is ever rewritten around a head index these two
 # converge to a 10x ratio, and that convergence is the regression signal.
+# ⚠ The inner loop spans a DISTINCT slice per round (`_r * ...`), not 0..k. Each
+# pre-built scheduler may be drained ONCE; restarting at 0 re-drains the first
+# fifth and measures an empty queue, which showed up as a bogus -80% when D4
+# first wrapped this. Same reason `relay_receive_accept` (sequence numbers, deduped
+# on repeat) and `pubsub_subscribe_new_pattern` (pattern must be new) offset too.
 fn _b_sched_dequeue(name, depth, rounds): i64 {
     var tasks = _b_sched_tasks(depth);
     var scheds = vec_new();
@@ -1097,12 +1198,14 @@ fn _b_sched_dequeue(name, depth, rounds): i64 {
     }
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < rounds; i = i + 1) {
-        var sc = vec_get(scheds, i);
-        while (agnosai_scheduler_dequeue(sc) != 0) { }
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = _r * (rounds / _BR); i < (_r + 1) * (rounds / _BR); i = i + 1) {
+            var sc = vec_get(scheds, i);
+            while (agnosai_scheduler_dequeue(sc) != 0) { }
+        }
+        bench_batch_stop(b, rounds / _BR);
     }
-    bench_batch_stop(b, rounds);
     bench_report(b);
     return 0;
 }
@@ -1186,11 +1289,13 @@ var _B_WIDE_DAG = 0;
 # 3.1 µs), and the 9,900 `str_eq` of edge dedup is where the difference goes.
 fn _b_load_dag(name, dag, n): i64 {
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_scheduler_load_dag(agnosai_scheduler_new(), dag);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_scheduler_load_dag(agnosai_scheduler_new(), dag);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -1232,9 +1337,11 @@ fn _b_ready_tasks(name, completed, n): i64 {
     if (agnosai_scheduler_load_dag(s, _B_WIDE_DAG) == 0) { syscall(60, 1); }
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_scheduler_ready_tasks(s, completed); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_scheduler_ready_tasks(s, completed); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -1254,9 +1361,11 @@ fn _b_pattern(name, pattern, topic, n): i64 {
     var t = str_from(topic);
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_matches_pattern(p, t); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_matches_pattern(p, t); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -1315,9 +1424,11 @@ fn _b_pubsub_ladder(name, nsubs, n): i64 {
     }
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_pubsub_publish(ps, topic, payload); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_pubsub_publish(ps, topic, payload); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -1335,12 +1446,14 @@ fn _b_pubsub_subscribe_new(): i64 {
     var ps = agnosai_pubsub_new();
 
     var b = bench_new("pubsub_subscribe_new_pattern");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_pubsub_subscribe(ps, str_cat(str_cat(str_from("topic."), str_from_int(i)),
-        str_from(".*")));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = _r * (n / _BR); i < (_r + 1) * (n / _BR); i = i + 1) {
+            agnosai_pubsub_subscribe(ps, str_cat(str_cat(str_from("topic."), str_from_int(i)),
+            str_from(".*")));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -1359,9 +1472,11 @@ fn _b_pubsub_subscribe_at_cap(): i64 {
     var rejected = str_from("no.such.pattern");
 
     var b = bench_new("pubsub_subscribe_at_cap");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_pubsub_subscribe(ps, rejected); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_pubsub_subscribe(ps, rejected); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -1389,13 +1504,15 @@ fn _b_approval_request_cancel(name, pending, n): i64 {
     }
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var id = agnosai_uuid_v4_str();
-        agnosai_approval_request(g, id);
-        agnosai_approval_cancel(g, id);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var id = agnosai_uuid_v4_str();
+            agnosai_approval_request(g, id);
+            agnosai_approval_cancel(g, id);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
 
     # The oracle asserts `rx.is_some()` (approval.rs:17). Dropping that is not
@@ -1419,13 +1536,15 @@ fn _b_approval_submit_decision(): i64 {
     var g = agnosai_approval_gate_new();
 
     var b = bench_new("approval_submit_decision");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var id = agnosai_uuid_v4_str();
-        agnosai_approval_request(g, id);
-        agnosai_approval_submit_decision(g, id, AGNOSAI_APPROVAL_APPROVED);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var id = agnosai_uuid_v4_str();
+            agnosai_approval_request(g, id);
+            agnosai_approval_submit_decision(g, id, AGNOSAI_APPROVAL_APPROVED);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
 
     # The oracle's `assert!(delivered)` (approval.rs:32), for the reason above:
@@ -1491,13 +1610,15 @@ fn _b_ipc_roundtrip(): i64 {
     var ping = bayan_json_v_parse_buf(src, strlen(src));
 
     var b = bench_new("ipc_roundtrip_socketpair");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_ipc_send(fd_a, ping);
-        agnosai_ipc_send(fd_b, agnosai_ipc_recv(fd_b));
-        agnosai_ipc_recv(fd_a);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_ipc_send(fd_a, ping);
+            agnosai_ipc_send(fd_b, agnosai_ipc_recv(fd_b));
+            agnosai_ipc_recv(fd_a);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     sys_close(fd_a);
     sys_close(fd_b);
@@ -1526,15 +1647,17 @@ fn _b_ipc_throughput_100(): i64 {
     var seq = bayan_json_v_parse_buf(src, strlen(src));
 
     var b = bench_new("ipc_throughput_100_same_conn");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        for (var j = 0; j < 100; j = j + 1) {
-            agnosai_ipc_send(fd_a, seq);
-            agnosai_ipc_send(fd_b, agnosai_ipc_recv(fd_b));
-            agnosai_ipc_recv(fd_a);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            for (var j = 0; j < 100; j = j + 1) {
+                agnosai_ipc_send(fd_a, seq);
+                agnosai_ipc_send(fd_b, agnosai_ipc_recv(fd_b));
+                agnosai_ipc_recv(fd_a);
+            }
         }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     sys_close(fd_a);
     sys_close(fd_b);
@@ -1548,18 +1671,20 @@ fn _b_ipc_bind_close(): i64 {
     var path = str_from(_B_IPC_SOCK);
 
     var b = bench_new("ipc_bind_close");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var fd = agnosai_ipc_bind(path);
-        # ⚠ Unguarded, this row gets FASTER when it breaks. `agnosai_ipc_bind`
-        # answers AGNOSAI_IPC_ERR (-2) on failure and `sys_close(-2)` returns
-        # EBADF for free, so a stale `/tmp/agnosai-bench-ipc.sock` owned by
-        # another user turns the whole timed body into "failed setup" and posts a
-        # smaller, entirely plausible number to bench-history.csv — permanently.
-        if (fd == AGNOSAI_IPC_ERR) { syscall(60, 1); }
-        sys_close(fd);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var fd = agnosai_ipc_bind(path);
+            # ⚠ Unguarded, this row gets FASTER when it breaks. `agnosai_ipc_bind`
+            # answers AGNOSAI_IPC_ERR (-2) on failure and `sys_close(-2)` returns
+            # EBADF for free, so a stale `/tmp/agnosai-bench-ipc.sock` owned by
+            # another user turns the whole timed body into "failed setup" and posts a
+            # smaller, entirely plausible number to bench-history.csv — permanently.
+            if (fd == AGNOSAI_IPC_ERR) { syscall(60, 1); }
+            sys_close(fd);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     sys_unlink(str_cstr(path));
     return 0;
@@ -1585,12 +1710,14 @@ fn _b_ipc_accept_under_load(): i64 {
     var client = thread_create(&_b_ipc_connect_loop, n);
 
     var b = bench_new("ipc_accept_close_under_load");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var fd = agnosai_ipc_accept(srv);
-        if (fd != AGNOSAI_IPC_ERR) { sys_close(fd); }
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var fd = agnosai_ipc_accept(srv);
+            if (fd != AGNOSAI_IPC_ERR) { sys_close(fd); }
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     thread_join(client);
     sys_close(srv);
@@ -1623,9 +1750,11 @@ fn _b_ipc_frame_1mib(): i64 {
     var tid = thread_create(&_b_ipc_big_writer, w);
 
     var b = bench_new("ipc_frame_1mib_transport");
-    bench_batch_start(b);
-    for (var i = 0; i < _B_IPC_BIG_N; i = i + 1) { agnosai_ipc_read_frame(rd); }
-    bench_batch_stop(b, _B_IPC_BIG_N);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < _B_IPC_BIG_N / _BR; i = i + 1) { agnosai_ipc_read_frame(rd); }
+        bench_batch_stop(b, _B_IPC_BIG_N / _BR);
+    }
     bench_report(b);
     thread_join(tid);
     sys_close(w);
@@ -1665,12 +1794,14 @@ fn _b_relay_send(name, nsubs, payload, n): i64 {
     var topic = str_from("task.assigned");
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_relay_send(r, to, topic, payload);
-        if (rx != 0) { chan_try_recv(rx); }
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_relay_send(r, to, topic, payload);
+            if (rx != 0) { chan_try_recv(rx); }
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -1700,12 +1831,14 @@ fn _b_relay_broadcast(): i64 {
     bayan_json_v_obj_set(payload, str_from("load"), bayan_json_v_int_new(420));
 
     var b = bench_new("relay_broadcast_1_sub_drained");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_relay_broadcast(r, topic, payload);
-        chan_try_recv(rx);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_relay_broadcast(r, topic, payload);
+            chan_try_recv(rx);
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -1727,11 +1860,13 @@ fn _b_relay_receive_accept(): i64 {
     bayan_json_v_obj_set(payload, str_from("status"), bayan_json_v_str_new(str_from("ok")));
 
     var b = bench_new("relay_receive_accept");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_relay_receive(r, agnosai_relay_message_new(i + 1, from, to, topic, payload));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = _r * (n / _BR); i < (_r + 1) * (n / _BR); i = i + 1) {
+            agnosai_relay_receive(r, agnosai_relay_message_new(i + 1, from, to, topic, payload));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }
@@ -1767,16 +1902,18 @@ fn _b_relay_receive_dupes(): i64 {
     var next_new = 501;
 
     var b = bench_new("relay_receive_50pct_dupes");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        var seq = (i % 500) + 1;
-        if (i % 2 == 0) {
-            seq = next_new;
-            next_new = next_new + 1;
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var seq = (i % 500) + 1;
+            if (i % 2 == 0) {
+                seq = next_new;
+                next_new = next_new + 1;
+            }
+            agnosai_relay_receive(r, agnosai_relay_message_new(seq, from, to, topic, payload));
         }
-        agnosai_relay_receive(r, agnosai_relay_message_new(seq, from, to, topic, payload));
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     if (agnosai_relay_stats_duplicates_dropped(agnosai_relay_stats(r)) != n / 2) {
         syscall(60, 1);
@@ -1803,9 +1940,11 @@ fn _b_relay_stats(): i64 {
     for (var f = 0; f < 100; f = f + 1) { agnosai_relay_send(r, to, t, 0); }
 
     var b = bench_new("relay_stats_snapshot");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_relay_stats(r); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_relay_stats(r); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -1879,9 +2018,11 @@ fn _b_orchestrator_new(): i64 {
     var budget = agnosai_resource_budget_default();
 
     var b = bench_new("orchestrator_new");
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) { agnosai_orchestrator_new(budget); }
-    bench_batch_stop(b, n);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_orchestrator_new(budget); }
+        bench_batch_stop(b, n / _BR);
+    }
     bench_report(b);
     return 0;
 }
@@ -1929,11 +2070,13 @@ fn _b_run_crew(name, crew_name, n_tasks, process, n): i64 {
     var o = agnosai_orchestrator_new(agnosai_resource_budget_default());
 
     var b = bench_new(name);
-    bench_batch_start(b);
-    for (var i = 0; i < n; i = i + 1) {
-        agnosai_orchestrator_run_crew(o, _b_o_spec(str_from(crew_name), n_tasks, process));
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_orchestrator_run_crew(o, _b_o_spec(str_from(crew_name), n_tasks, process));
+        }
+        bench_batch_stop(b, n / _BR);
     }
-    bench_batch_stop(b, n);
     bench_report(b);
     return 0;
 }

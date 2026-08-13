@@ -1050,7 +1050,7 @@ bite is closed. What remains is one wasmtime-gated half and five decisions:
 |---|---|
 | the WASM **execute** path | needs `wasmtime` installed; the manifest half is done |
 | **D1** mount `rate_limit`? | open since M6 |
-| **D2** `"personality": null` | the user's one deliberate carve-out (bhava) |
+| ~~**D2**~~ `"personality": null` | ✅ **DECIDED, closed — defer, do not drop.** bhava is coming; the wire keeps `null`. Not a question. |
 | **D3** memoize `builtin_presets()`? | opened 2026-08-11 |
 | **D4** `rounds x batch` for the bench sweep? | opened 2026-08-11 |
 | **D5** dispatch rows include body serialization? | opened 2026-08-11 |
@@ -1124,10 +1124,10 @@ the 64 KiB `AGNOSAI_SERVE_ARENA_BYTES`), not a leak.
 The argument for memoizing is that the parse result never changes. The argument
 against is that it is the oracle's shape, the route is unlikely to be hot, and a
 process-lifetime cache of parsed structs is shared mutable state that every other
-route in this tier deliberately avoids. **No recommendation — this is D1/D2's
-kind of call.**
+route in this tier deliberately avoids. **No recommendation — this is D1's
+kind of call.** (D2 is closed, not a comparator: bhava is decided.)
 
-### D4 — should the bench sweep adopt `rounds x batch`? (opened 2026-08-11)
+### ~~D4~~ — ✅ **DECIDED AND DONE 2026-08-13: yes, across all eleven `.bcyr`.**
 
 ⚠ **Every one of the ~200 rows in `bench-history.csv` prints `min == max == avg`,
 by construction.** Each benchmark calls `bench_batch_start`/`bench_batch_stop`
@@ -1140,23 +1140,45 @@ loop, so min/max span real samples. Measured run-to-run spread on this host is
 **~5%** (`builtin_presets_18` ranged 738.3–775.1 µs over eight runs), which is
 exactly the band a reader currently cannot see.
 
-⚠ **Not taken, and the reason is the reason it is a decision.** Changing one file
-makes its rows incomparable with the other nine and with every historical row;
-changing all ten re-baselines the entire CSV at once. Either is defensible, and
-neither should happen as a side effect of a bench edit. Raised independently by
-two agents auditing different files, which is what promoted it from a nit.
+✅ **Taken across all eleven files at once**, which re-baselines the entire CSV on
+2026-08-13 — the deliberate choice, since changing a subset would leave rows
+mutually incomparable. `_BR = 5`; the inner loop bound and the batch size are both
+divided by it, so **total work is unchanged**.
 
-### D5 — should the dispatch rows include body serialization? (opened 2026-08-11)
+**Result: 201 of 207 rows now carry real dispersion, against 0 before.** The six
+that do not are correct as they stand — `tool_registry_register` is a
+monotonically-growing structure where rounds would measure fill level rather than
+variance, and the other five are 2–9 ns shapes where every round rounds to the
+same integer.
+
+⚠ **Six rows CONSUMED state and had to be exempted or re-indexed, and only
+measurement found them.** Wrapping them moved their averages by −22% to −80%:
+`scheduler_dequeue_{100,1000}_priority_order` re-drained already-drained
+schedulers, `relay_receive_accept` re-sent deduped sequence numbers,
+`pubsub_subscribe_new_pattern` re-subscribed existing patterns, and
+`fleet_compute_{allocate,release_only}_8dev` already had a 200-round outer loop
+that a nested one sliced into the reject path. The first three now index a
+distinct slice per round (`_r * (n / _BR)`); fleet's two had the nested loop
+removed; `tool_registry_register` stays single-batch. **`tools.bcyr`'s own
+`_b_require` caught one of them; the other five were found by diffing every
+average against the pre-change run.** Any future bench edit of this shape needs
+the same check.
+
+### ~~D5~~ — ✅ **DECIDED AND DONE 2026-08-13: yes, full route.**
 
 `benches/server.bcyr`'s `route_*_global` / `route_*_arena` rows time
 `agnosai_route_dispatch` and stop at the response **object**.
 `rust-old/benches/server.rs:43-62` drives a real `tower` service, so the oracle's
 number includes serializing the body to bytes.
 
-Adding `bayan_json_v_build` inside the timed loop would close that gap and would
-also re-baseline every dispatch row. Left alone deliberately: the rows are
-currently a clean measure of routing plus handler, which is the part the port
-controls, and the serializer has its own coverage in `benches/core.bcyr`.
+✅ **Done — the rows now measure the full route.** `_b_render_body` /
+`_b_render_body_a` reproduce `_agnosai_serve_send`'s branch set exactly (text
+routes render nothing extra; JSON routes build the tree to bytes; null/204 arms
+guarded identically), applied at all four timed dispatch call sites. This
+**re-baselines every JSON dispatch row on 2026-08-13**, and makes a serialisation
+regression visible here for the first time. `route_metrics_global` is unaffected —
+it already carried its whole body render — and is now comparable with its
+siblings instead of a measurement-class outlier.
 
 ## Owed work
 
@@ -1277,10 +1299,16 @@ Security section for the reasoning. **D1's argument moves with these numbers.**
 
 ### D. Decisions deferred to a human
 
+> ⚠ **Before adding anything here, or re-raising anything in it: a decision the
+> user has ALREADY MADE does not belong in this table.** D2 sat here for weeks
+> after bhava was settled and got asked again as a result, which is a documented
+> way to waste the user's time. If an item is decided, close it in place with the
+> decision written out — do not leave it phrased as a question.
+
 | # | Decision | Where it stands |
 |---|---|---|
 | D1 | **Mount `rate_limit`?** | Ported and tested (bite 14), **not mounted** — matching the oracle, which never installs the middleware. `agnosai_serve_with_rate_limit` is the opt-in path. Mounting it by default is a **wire change**: clients fine today would start seeing 429s at a threshold agnosai chose, not one the oracle documents. The argument for mounting rested on the JWT-verify ceiling, which **C1 has now re-measured at 1.202 ms — ~830 verifies/sec per core, up from ~300**. That weakens the case for mounting by default without removing it: an unauthenticated flood still costs a modexp per request, because the `alg` check deliberately sits after signature verification. Still a human call. |
-| D2 | **`"personality": null` on the wire** | bhava is a *hard* dep in the oracle, so the default Rust build emits an explicit null. Emitting the literal keeps byte-exact default-build parity; omitting it is the line between "bhava deferred" and "the wire changed." See `cyrius-port-plan.md:274`. |
+| ~~D2~~ | ~~**`"personality": null` on the wire**~~ | ✅ **DECIDED — NOT an open question. Do not re-raise it.** bhava is **coming** and is simply not ported to Cyrius yet, so there is nothing to depend on: `personality` stays unported and the wire **keeps emitting `null`**, which is what the default Rust build emits. **DEFER, never DROP.** Revisit only when bhava lands in Cyrius. This is the ONE carve-out the user ever set (see line 43 and `cyrius-port-plan.md:297`); listing it under *Decisions deferred to a human* was a documentation error that caused it to be asked again. |
 
 ### E. Known-unreachable code kept for oracle shape
 
