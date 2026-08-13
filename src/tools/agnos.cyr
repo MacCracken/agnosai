@@ -52,6 +52,26 @@ var AGNOSAI_AGNOS_MAX_BYTES = 4194304;
 # Scratch arena for one exchange, sized for a full response plus its parse.
 var AGNOSAI_AGNOS_ARENA_BYTES = 5242880;
 
+# The transport's arena pool. See `src/arena_pool.cyr` for why a pool rather than
+# a thread-local, sandhi's request arena, or one shared arena under a mutex.
+#
+# ⚠ **Was `arena_allocator(AGNOSAI_AGNOS_ARENA_BYTES)` per call**, which charged
+# the no-free global bump 5 MiB + 112 bytes on EVERY outbound request and never
+# gave it back — `agnosai_agnos_http_transport` IS the transport function
+# pointer, so that is once per AGNOS exchange, for process lifetime.
+#
+# **8 slots** rather than one per pool worker: an exchange holds its arena only
+# for its own duration, and the fallback path means an under-sized pool costs a
+# mint rather than a stall. Watch `agnosai_arena_pool_fallbacks` if that proves
+# low — a steady rise is the signal to raise it, and the only signal that matters.
+#
+# ⚠ Built EAGERLY at module scope, not lazily. A lazy `if (pool == 0)` double
+# constructs when two worker threads race it, and the loser's arenas leak — the
+# exact defect this replaces.
+var _AGNOSAI_AGNOS_ARENA_SLOTS = 8;
+var _AGNOSAI_AGNOS_POOL = agnosai_arena_pool_new(_AGNOSAI_AGNOS_ARENA_SLOTS,
+AGNOSAI_AGNOS_ARENA_BYTES);
+
 # The client: a base URL, the service label used in error strings, and the
 # transport.
 enum AgnosaiAgnosOff {
@@ -231,12 +251,12 @@ fn _agnosai_agnos_last_detail(): i64 {
 fn agnosai_agnos_http_transport(c, method, url: Str, body): i64 {
     _AGNOSAI_AGNOS_DETAIL = 0;
 
-    var arena = arena_allocator(AGNOSAI_AGNOS_ARENA_BYTES);
+    var arena = agnosai_arena_pool_acquire(_AGNOSAI_AGNOS_POOL);
     if (arena == 0) { return 0; }
 
     var opts = sandhi_http_options_new_a(arena);
     if (opts == 0) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return 0;
     }
     sandhi_http_options_total_ms(opts, AGNOSAI_AGNOS_TIMEOUT_MS);
@@ -256,7 +276,7 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body): i64 {
     var r = sandhi_http_request_auto_a(arena, method, str_cstr(url), headers, payload, payload_len,
     opts);
     if (r == 0) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return 0;
     }
     if (sandhi_http_err_kind(r) != SANDHI_OK) {
@@ -266,7 +286,7 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body): i64 {
         # defensive one.
         var msg = sandhi_http_err_message(r);
         if (msg != 0) { _AGNOSAI_AGNOS_DETAIL = str_cstr(str_clone(str_from(msg))); }
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return 0;
     }
 
@@ -293,11 +313,11 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body): i64 {
     var data = 0;
     if (body_len > 0 && sandhi_http_body(r) == 0) {
         _AGNOSAI_AGNOS_DETAIL = str_cstr(str_from("response body could not be buffered"));
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return AGNOSAI_AGNOS_BAD_JSON;
     }
     if (body_len > 0) { data = bayan_json_v_parse_buf(sandhi_http_body(r), body_len); }
-    reset_via(arena);
+    agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
     if (data == 0) { return AGNOSAI_AGNOS_BAD_JSON; }
     return data;
 }

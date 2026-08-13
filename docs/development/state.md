@@ -265,56 +265,31 @@ monotonically — the correction is to the magnitude, not to the defect.
    either its own short-lived `str_builder_new_a` + `str_builder_add_a`, or an
    upstream `putc_a` filing.
 
-2. **Per-operation `arena_allocator(...)` arenas are never returned.**
-   `arena_allocator` → `arena_new` → `alloc(56) + alloc(cap+16)` **on the global
-   bump** (its own comment says so, `lib/alloc.cyr:741`), and `arena_reset` only
-   rewinds pointers. Measured on this tree: **2,621,552 bytes** charged per
-   `arena_allocator(2.5 MiB) + reset_via`, i.e. the whole capacity plus 112 B,
-   every iteration.
+2. 🟡 **PARTLY FIXED 2026-08-12 — three of five sites pooled via the new
+   `src/arena_pool.cyr`.** `arena_allocator(n)` charges the no-free global bump
+   `n + 112` bytes per call and `reset_via` returns none of it.
 
-   | site | per call | called | |
-   |---|---|---|---|
-   | `tools/agnos.cyr:234` | **5 MiB** | **every outbound HTTP request** — it *is* the transport fn ptr | 🔴 |
-   | `tools/remote_registry.cyr:179` | **12 MiB** | every remote package fetch | 🔴 |
-   | `tools/builtin/security_audit.cyr:673` | 2.5 MiB | per audit | 🟠 |
-   | `tools/builtin/load_testing.cyr:114,115` | 1 MiB + persistent | **per user**, in the loop at `:461` | 🟠 |
-   | `server/serve.cyr:259` | 64 KiB | per call | 🟡 |
+   | site | was | now |
+   |---|---|---|
+   | `tools/agnos.cyr` — every outbound HTTP request | **5,242,992 B** | ✅ **0**, 8 slots |
+   | `tools/remote_registry.cyr` — per package fetch | 12 MiB + 112 B | ✅ pooled, 2 slots |
+   | `tools/builtin/security_audit.cyr` — per audit | 2.5 MiB + 112 B | ✅ pooled, 4 slots |
+   | `server/serve.cyr:259` — per a2a callback | 64 KiB | 🔴 open |
+   | `tools/builtin/load_testing.cyr:114,115` — per USER | 1 MiB + persistent | 🔴 open |
 
-   Correct by contrast, and the shape to copy: `serve.cyr:95` (once per pool
-   worker), `telemetry/otlp.cyr:378,381` (module-level), `crew_runner.cyr:856`.
+   Measured on the agnos path: **0 bytes per exchange** against 5,242,992 before,
+   over 32 cycles, 8 arenas minted, **0 fallbacks**.
 
-   🔴 **STILL OPEN — and the obvious fix is BLOCKED, which is why it is not done.**
-   Investigated 2026-08-12:
+   ⚠ **The two open sites run on threads that cannot reach a request-path pool**,
+   and each needs its own concurrency answer — `load_testing` holds TWO arenas per
+   worker and sizes its persistent one from the user count
+   (`max_requests * 40 + 65536`, ~4 MiB at 1 user, ~73 KiB at 500).
 
-   * **A thread-local arena is unavailable.** `src/orchestrator/audit.cyr:386`
-     records it, measured: `thread_local_get` **faults on the main thread**,
-     which has no TLS block unless `thread_local_init` runs — and calling that on
-     a *worker* orphans the block `thread_create` already installed, **taking
-     sandhi's request-arena slot with it**. So the pattern that would make these
-     per-thread is off the table until that is fixed upstream.
-   * **Threading the caller's arena down is a tools-tier signature change.**
-     `agnos.cyr`'s arena sits inside `agnosai_agnos_http_transport`, which is a
-     *function pointer* with a fixed shape, reached through `agnosai_agnos_call`
-     from every builtin (`tools/builtin/mneme.cyr` and siblings). Passing an
-     arena in means changing the transport contract and every caller.
-   * **A process-wide arena under a mutex would serialize outbound HTTP** across
-     the 100 pool workers — a worse defect than the one it fixes.
-
-   The shape that actually fits is a **bounded pool of reusable arenas**, taken
-   and returned under a short lock: memory becomes `N x size` instead of
-   unbounded, with no serialization. That is a new port-local module plus wiring
-   at five sites, its own suite and its own benchmark — a real bite, not a
-   cleanup, and it is not started.
-
-   ⚠ Two comments assert the opposite of the truth and must be fixed with it:
-   `load_testing.cyr:476` — *"Every worker arena is released here"* over a loop
-   that is a literal no-op — and the Benchmarks note further down this file.
-   Error paths also call `reset_via(arena)` believing it frees.
-
-   **Oracle is not doing this**: `rust-old/src/tools/builtin/load_testing.rs:137-165`
-   gives each task a plain `Vec::new()`/`HashMap::new()` dropped at task end —
-   flat steady state. Port-introduced, sanctioned by no ADR, and the opposite of
-   the port plan's closed blocker #3, which specifies a **per-worker** arena.
+   The design, the three rejected alternatives (thread-local, sandhi's request
+   arena, one shared arena under a mutex) and the reasons are in
+   `src/arena_pool.cyr`'s header. The escape analysis that made a pool the right
+   shape — **nothing escapes any of the five sites** — is what rules the
+   lifetime-oriented fixes out.
 
 3. ✅ **FIXED 2026-08-12 — in the MATCHER, not just the assertion.** The capture
    is deferred to a confirmed full match: **64 B → 48 B per parameterised
@@ -419,6 +394,31 @@ mutation-verified (breaking it reports `got 15, expected 0`).
 
 The 64 KiB arena at `serve.cyr:259` is a separate matter and still open — it is
 one of the five sites in the arena-pool bite above.
+
+### ⚠ `check-clean.sh` does NOT compile the suites — do not read it as "the tree builds"
+
+Learned the hard way 2026-08-12, wiring `src/arena_pool.cyr` into
+`src/tools/mod.cyr`'s dependents. `check-clean.sh` runs fmt, lint, doc, doctest,
+vet, deny, `deps --verify`, the lib-snapshot diff and the generated-source check.
+**Nothing in it touches `tests/` or `benches/`.** It was green while **17 suites
+and one `.bcyr` failed to compile.**
+
+The trap is specific to how Cyrius builds: `include` is textual, there are **no
+include guards**, and every compilation unit lists its own dependencies. So
+adding a module that an existing hub pulls in — here `src/tools/mod.cyr:57`
+includes `tools/agnos.cyr` — silently breaks every `.tcyr`/`.bcyr` that includes
+that hub and does not also include the new module. It is a hard compile error,
+never a warning, and it surfaces in exactly two places: `cyrius tests tests` and
+`cyrius bench`.
+
+⚠ **"N suites pass individually" says nothing about the ones not run.** The three
+suites checked directly were the three whose includes had been updated; the other
+18 units were untouched and unbuilt.
+
+**Rule: after touching any module that a `mod.cyr` hub includes, run the full
+`cyrius tests tests` AND `cyrius bench` before reporting.** This is the same
+class as the `.bcyr` rot recorded under Benchmarks — *the gate was never silent,
+it was never invoked*.
 
 ### Still outstanding, not blocking
 
@@ -746,20 +746,20 @@ from the tree 2026-08-12**; every number below was measured, not carried forward
 
 | Group | Files | Lines | Oracle |
 |---|---|---|---|
-| `orchestrator/` | 16 | 5,682 | ✅ complete (M5) |
-| `server/` | 11 | 4,276 | ✅ complete (M6) |
+| `orchestrator/` | 16 | 5,854 | ✅ complete (M5) |
+| `server/` | 11 | 4,342 | ✅ complete (M6) |
 | `sandbox/` | 10 | 3,739 | ✅ complete (M7) |
 | `fleet/` | 12 | 3,653 | ✅ complete (M8) |
 | `core/` | 8 | 3,637 | ✅ complete (M2) |
 | `definitions/` | 7 | 2,757 | ✅ complete (M10) |
 | `server/routes/` | 11 | 2,720 | ✅ complete (M6) |
-| `tools/builtin/` | 7 | 2,138 | ✅ complete (M4) |
-| `tools/` | 8 | 1,830 | ✅ complete (M4) |
+| `tools/builtin/` | 7 | 2,152 | ✅ complete (M4) |
+| `tools/` | 8 | 1,905 | ✅ complete (M4) |
 | `llm/` | 5 | 1,762 | ✅ complete (M3) |
-| `telemetry/` | 3 | 1,529 | ✅ complete (M9) — `mod` + `genai` + OTLP, with the span call sites wired ([ADR 017](../adr/017-genai-span-call-sites.md)) |
+| `telemetry/` | 3 | 1,769 | ✅ complete (M9) — `mod` + `genai` + OTLP, with the span call sites wired ([ADR 017](../adr/017-genai-span-call-sites.md)) |
 | `learning/` | 6 | 1,018 | ✅ complete (M2) |
-| root (port-local) | 7 | 1,209 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy`, `strcase` |
-| **total** | **111** | **35,950** | against **27,683** lines of `rust-old/src/` |
+| root (port-local) | 8 | 1,413 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy`, `strcase`, **`arena_pool`** |
+| **total** | **112** | **36,721** | against **27,683** lines of `rust-old/src/` |
 
 Regenerate with:
 

@@ -99,6 +99,20 @@ var AGNOSAI_AUDIT_MAX_BYTES = 2097152;
 # chains that is 22 exchanges, and the fourth would already have failed.
 var AGNOSAI_AUDIT_ARENA_BYTES = 2621440;
 
+# Pool for the audit arena. See `src/arena_pool.cyr`.
+#
+# ⚠ **Was `arena_allocator(AGNOSAI_AUDIT_ARENA_BYTES)` per audit** — 2.5 MiB + 112
+# bytes on the no-free global bump, per invocation, never returned. This tool IS
+# registered by default (`main.cyr:353`) and reachable over `POST /mcp`.
+#
+# ⚠ **This site resets its arena MID-operation**, between the GET and the CORS
+# probe. Those stay plain `reset_via` — only the terminal ones release back to
+# the pool. `_agnosai_audit_snapshot` is what makes the mid-operation reset safe,
+# and the suite proves it by scribbling over the released region.
+var _AGNOSAI_AUDIT_ARENA_SLOTS = 4;
+var _AGNOSAI_AUDIT_POOL = agnosai_arena_pool_new(_AGNOSAI_AUDIT_ARENA_SLOTS,
+AGNOSAI_AUDIT_ARENA_BYTES);
+
 # The tool description, used by both the schema and the tool itself. The oracle
 # reads it from `description()` in both places; duplicating the literal would be
 # a chance for them to drift. Built from two halves only because the whole
@@ -670,11 +684,11 @@ fn _agnosai_audit_snapshot(src): i64 {
 # returning. `agnosai_audit_analyze` copies everything it keeps, so nothing in
 # the result points into the freed region.
 fn agnosai_run_security_audit(url: Str): i64 {
-    var arena = arena_allocator(AGNOSAI_AUDIT_ARENA_BYTES);
+    var arena = agnosai_arena_pool_acquire(_AGNOSAI_AUDIT_POOL);
     if (arena == 0) { return 0; }
     var opts = _agnosai_audit_options();
     if (opts == 0) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return 0;
     }
 
@@ -683,11 +697,11 @@ fn agnosai_run_security_audit(url: Str): i64 {
     var get_resp = agnosai_guarded_fetch(arena, "GET", url, sandhi_headers_new(), opts,
     AGNOSAI_AUDIT_TIMEOUT_MS);
     if (get_resp == AGNOSAI_FETCH_BLOCKED) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return AGNOSAI_FETCH_BLOCKED;
     }
     if (get_resp == 0) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return 0;
     }
     var get_headers = _agnosai_audit_snapshot(sandhi_http_headers(get_resp));
@@ -707,7 +721,7 @@ fn agnosai_run_security_audit(url: Str): i64 {
     if (cors_resp != 0 && cors_resp != AGNOSAI_FETCH_BLOCKED) {
         cors_headers = _agnosai_audit_snapshot(sandhi_http_headers(cors_resp));
     }
-    reset_via(arena);
+    agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
 
     return agnosai_audit_analyze(url, get_headers, cors_headers);
 }

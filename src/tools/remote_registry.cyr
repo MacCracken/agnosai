@@ -38,6 +38,18 @@ var AGNOSAI_REMOTE_TIMEOUT_MS = 30000;
 # between hops, so this bounds one exchange rather than a whole redirect chain.
 var AGNOSAI_REMOTE_ARENA_BYTES = 12582912;
 
+# Pool for the download arena. See `src/arena_pool.cyr`.
+#
+# ⚠ **Was `arena_allocator(AGNOSAI_REMOTE_ARENA_BYTES)` per fetch** — 12 MiB + 112
+# bytes on the no-free global bump, per remote package, never returned. The
+# largest of the five per-operation sites.
+#
+# **2 slots**: a package fetch is an operator-initiated, rare operation, not a
+# request-path one. The fallback covers a burst without pinning 12 MiB x N.
+var _AGNOSAI_REMOTE_ARENA_SLOTS = 2;
+var _AGNOSAI_REMOTE_POOL = agnosai_arena_pool_new(_AGNOSAI_REMOTE_ARENA_SLOTS,
+AGNOSAI_REMOTE_ARENA_BYTES);
+
 # FetchResult — the oracle's two-variant enum flattened into one struct.
 #
 # Cyrius has no sum types, so `Ok { size_bytes, content_type, data }` and
@@ -176,11 +188,11 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
 
     _agnosai_remote_log("fetching remote tool package", 28, url, 0 - 1);
 
-    var arena = arena_allocator(AGNOSAI_REMOTE_ARENA_BYTES);
+    var arena = agnosai_arena_pool_acquire(_AGNOSAI_REMOTE_POOL);
     if (arena == 0) { return _agnosai_remote_err(str_from("download failed")); }
     var opts = _agnosai_remote_options();
     if (opts == 0) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
         return _agnosai_remote_err(str_from("download failed"));
     }
 
@@ -188,7 +200,7 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
     AGNOSAI_REMOTE_TIMEOUT_MS);
 
     if (resp == AGNOSAI_FETCH_BLOCKED) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
         # Not one of the oracle's messages: the oracle cannot reach this state,
         # because it never re-checks a redirect target. It reads like the
         # up-front rejection because it is the same rejection, one hop later.
@@ -196,13 +208,13 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
         str_from("URL rejected: private/internal network (via redirect)"));
     }
     if (resp == 0 || sandhi_http_err_kind(resp) != SANDHI_OK) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
         return _agnosai_remote_err(str_from("download failed"));
     }
 
     var status = sandhi_http_status(resp);
     if (agnosai_remote_is_success(status) == 0) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
         return _agnosai_remote_err(agnosai_remote_status_err(status));
     }
 
@@ -212,7 +224,7 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
     if (declared != 0) {
         var declared_len = str_to_int(str_from(declared));
         if (declared_len > AGNOSAI_REMOTE_MAX_DOWNLOAD) {
-            reset_via(arena);
+            agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
             return _agnosai_remote_err(agnosai_remote_too_large_err(declared_len));
         }
     }
@@ -229,7 +241,7 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
     # omits it entirely, gets caught here — which is the whole reason the oracle
     # checks twice.
     if (body_len > AGNOSAI_REMOTE_MAX_DOWNLOAD) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
         return _agnosai_remote_err(agnosai_remote_too_large_err(body_len));
     }
 
@@ -246,7 +258,7 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
     # because a transport's internal invariant must not be what stands between
     # this and a segfault.
     if (body_len > 0 && sandhi_http_body(resp) == 0) {
-        reset_via(arena);
+        agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
         return _agnosai_remote_err(str_from("download failed: response body could not be buffered"));
     }
 
@@ -255,7 +267,7 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
     # duplicated the whole package: ~2N bumped for an N-byte download, with the
     # first N+16 orphaned immediately on a no-free allocator.
     var data = str_from_buf(sandhi_http_body(resp), body_len);
-    reset_via(arena);
+    agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
 
     _agnosai_remote_log("remote tool package downloaded", 30, url, body_len);
 

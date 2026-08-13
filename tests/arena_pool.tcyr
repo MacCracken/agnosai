@@ -1,0 +1,141 @@
+# =========================================================================
+# arena_pool.tcyr — tests for src/arena_pool.cyr
+#
+# No oracle: the module is port-local (Rust frees on drop, so `rust-old/` never
+# needed arena ownership at all).
+#
+# ⚠ The load-bearing assertion here is **`alloc_used()` delta over a
+# acquire/release cycle == 0**. That is the entire point of the module: a fresh
+# `arena_allocator(n)` charges the no-free global bump `n + 112` bytes EVERY
+# call, and `reset_via` gives none of it back. A pool that quietly minted a new
+# arena per acquire would pass every functional test in this file and fix
+# nothing, so the byte delta is what separates "it works" from "it works and is
+# the reason the module exists".
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/arena_pool.cyr"
+include "tests/test_helpers.cyr"
+
+fn main() {
+    alloc_init();
+    test_group("arena_pool");
+
+    # --- construction --------------------------------------------------------
+    var p = agnosai_arena_pool_new(4, 65536);
+    assert(p != 0, "a pool is created");
+    assert_eq(agnosai_arena_pool_minted(p), 4, "minting exactly `slots` arenas up front");
+    assert_eq(agnosai_arena_pool_fallbacks(p), 0, "and no fallbacks yet");
+
+    assert_eq(agnosai_arena_pool_new(0, 65536), 0, "zero slots is refused");
+    assert_eq(agnosai_arena_pool_new(0 - 1, 65536), 0, "as is a negative count");
+
+    # --- acquire / release round-trips ---------------------------------------
+    var a1 = agnosai_arena_pool_acquire(p);
+    assert(a1 != 0, "acquire hands back an arena");
+    assert_eq(agnosai_arena_pool_minted(p), 4, "taken from the pool, not minted");
+    agnosai_arena_pool_release(p, a1);
+    assert_eq(agnosai_arena_pool_minted(p), 4, "and release mints nothing either");
+
+    # ⚠ The channel is **FIFO, not LIFO**, so with four slots a released arena
+    # goes to the TAIL and the next acquire takes a different one from the head.
+    # An earlier version of this test asserted identity here and failed for that
+    # reason. Identity is checked below against a ONE-slot pool, where the two
+    # orderings coincide and the property is unambiguous.
+    var a2 = agnosai_arena_pool_acquire(p);
+    assert(a2 != 0, "a second acquire also serves from the pool");
+    assert_eq(agnosai_arena_pool_minted(p), 4, "still without minting");
+    agnosai_arena_pool_release(p, a2);
+
+    # Reuse, stated as identity, on a pool where FIFO order is not a variable.
+    var one = agnosai_arena_pool_new(1, 4096);
+    assert(one != 0, "a one-slot pool");
+    var o1 = agnosai_arena_pool_acquire(one);
+    agnosai_arena_pool_release(one, o1);
+    assert_eq(agnosai_arena_pool_acquire(one), o1,
+    "the released arena is the very one handed back — reuse, not a fresh mint");
+    assert_eq(agnosai_arena_pool_minted(one), 1, "and the pool never grew");
+
+    # --- THE assertion: a cycle costs the global bump nothing ----------------
+    #
+    # ⚠ Absolute equality against ZERO, not a bound. state.md's own rule: a
+    # round-number threshold asserts less than it looks like it does, and here
+    # the thing being caught is 65,648 bytes per iteration — a bound would have
+    # to be tighter than that to mean anything, at which point it may as well be
+    # exact. Warm one cycle first so the arena's own first-touch growth is not
+    # counted as pool overhead.
+    var w = agnosai_arena_pool_acquire(p);
+    alloc_via(w, 4096);
+    agnosai_arena_pool_release(p, w);
+
+    var before = alloc_used();
+    for (var i = 0; i < 64; i = i + 1) {
+        var a = agnosai_arena_pool_acquire(p);
+        alloc_via(a, 4096);
+        agnosai_arena_pool_release(p, a);
+    }
+    assert_eq(alloc_used() - before, 0,
+    "64 acquire/use/release cycles charge the global bump ZERO bytes");
+    assert_eq(agnosai_arena_pool_minted(p), 4, "and mint nothing new across all of them");
+    assert_eq(agnosai_arena_pool_fallbacks(p), 0, "with no fallback taken");
+
+    # --- the arena is reset on the way back in -------------------------------
+    #
+    # A parked arena must hold no live bytes, or the pool would grow without
+    # bound in a different way: each slot pinned at its worst-ever occupancy.
+    var rp = agnosai_arena_pool_new(1, 4096);
+    var r1 = agnosai_arena_pool_acquire(rp);
+    var mark = alloc_via(r1, 1024);
+    assert(mark != 0, "an acquired arena allocates");
+    agnosai_arena_pool_release(rp, r1);
+    var r2 = agnosai_arena_pool_acquire(rp);
+    assert_eq(r2, r1, "same arena back");
+    assert_eq(alloc_via(r2, 1024), mark,
+    "and it was RESET — the same address is handed out again, so nothing is pinned");
+    agnosai_arena_pool_release(rp, r2);
+
+    # --- exhaustion falls back rather than blocking --------------------------
+    #
+    # ⚠ This is the property that keeps a sandhi worker alive under load, and the
+    # one that stops `load_testing` — which holds TWO arenas per worker — from
+    # deadlocking on itself. `chan_recv` would block here; `chan_try_recv` does
+    # not, and the pool mints instead.
+    var small = agnosai_arena_pool_new(2, 4096);
+    assert(small != 0, "a two-slot pool");
+    var s1 = agnosai_arena_pool_acquire(small);
+    var s2 = agnosai_arena_pool_acquire(small);
+    assert_eq(agnosai_arena_pool_fallbacks(small), 0, "two acquires drain it exactly");
+
+    var s3 = agnosai_arena_pool_acquire(small);
+    assert(s3 != 0, "a third acquire still returns an arena rather than blocking or failing");
+    assert_eq(agnosai_arena_pool_fallbacks(small), 1, "counted as a fallback");
+    assert_eq(agnosai_arena_pool_minted(small), 3, "and minted");
+    assert(s3 != s1, "which is a distinct arena");
+    assert(s3 != s2, "from both pooled ones");
+
+    # Surplus is dropped, not accumulated: releasing all three into two slots
+    # parks two and discards one, so the pool cannot grow past its capacity.
+    agnosai_arena_pool_release(small, s1);
+    agnosai_arena_pool_release(small, s2);
+    agnosai_arena_pool_release(small, s3);
+    var t1 = agnosai_arena_pool_acquire(small);
+    var t2 = agnosai_arena_pool_acquire(small);
+    assert(t1 != 0 && t2 != 0, "both slots are still serviceable");
+    assert_eq(agnosai_arena_pool_fallbacks(small), 1,
+    "and the surplus release did not inflate the pool — a third acquire would fall back again");
+
+    # --- null handling -------------------------------------------------------
+    assert_eq(agnosai_arena_pool_acquire(0), 0, "acquiring from a null pool is 0, not a fault");
+    assert_eq(agnosai_arena_pool_release(0, 0), 0, "releasing null is a no-op");
+    assert_eq(agnosai_arena_pool_release(p, 0), 0, "as is releasing a null arena");
+    assert_eq(agnosai_arena_pool_minted(0), 0, "and the counters answer 0 for a null pool");
+    assert_eq(agnosai_arena_pool_fallbacks(0), 0, "both of them");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

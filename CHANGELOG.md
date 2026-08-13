@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `src/arena_pool.cyr`, a bounded pool of reusable arenas
+
+Port-local; no oracle counterpart is possible, since Rust frees on drop and
+`rust-old/` never had to think about arena ownership.
+
+**The defect.** `arena_allocator(n)` is `alloc(56)` + `alloc(n + 16)` +
+`allocator_new`'s `alloc(40)`, all on the **no-free global bump**, and
+`reset_via` -> `arena_reset` only rewinds three pointers — the chunk is never
+returned and the next call builds a new one. Three sites did that per operation:
+
+| site | was | now |
+|---|---|---|
+| `tools/agnos.cyr` — **every outbound HTTP request** | **5,242,992 B** | **0** |
+| `tools/remote_registry.cyr` — per package fetch | 12 MiB + 112 B | pooled, 2 slots |
+| `tools/builtin/security_audit.cyr` — per audit | 2.5 MiB + 112 B | pooled, 4 slots |
+
+Measured on the agnos path: **0 bytes per exchange** against **5,242,992**
+before, over 32 cycles, with 8 arenas minted and **0 fallbacks**.
+
+**The design**, and why not the alternatives — an escape analysis over all five
+per-operation sites found **nothing escapes any of them** (each already
+deep-copies before its `reset_via`), so this is an ownership problem, not a
+lifetime one, and the lifetime fixes do not apply:
+
+- **A thread-local arena is unavailable**: `thread_local_get` faults on the main
+  thread and `thread_local_init` on a worker orphans the block `thread_create`
+  installed, taking sandhi's request-arena slot with it (`audit.cyr:386`).
+- **sandhi's request arena is worse, not better.** It is 64 KiB with
+  `ARENA_FULL_SPILL`, and sandhi allocates its receive buffer eagerly at the full
+  cap, so pointing agnos at it converts 5 MiB of untouched VA into ~4 MiB of
+  RSS-charged **permanent** bump per call. It is also reset by sandhi between
+  requests, which would rewind live state at the sites that reset mid-operation.
+- **One shared arena under a mutex** would serialize outbound HTTP across all
+  pool workers.
+
+So: a `chan_new(slots)` prefilled with growable arenas; acquire is
+`chan_try_recv`, release is `reset_via` + `chan_try_send`. The channel is already
+mutex-guarded, so the pool adds no synchronisation of its own.
+
+⚠ **Acquire never blocks** — an empty pool mints a fallback. `chan_recv` blocks
+and there is no `mutex_trylock`, so blocking would hang a sandhi worker, and
+`load_testing` holds *two* arenas per worker, which is a two-resource deadlock.
+
+⚠ **No ownership marker.** Release just tries to send; a full channel means the
+arena is surplus and is dropped. Pooled and fallback arenas are interchangeable,
+so the channel's capacity is what bounds the pool.
+
+⚠ **Arenas are growable, not fixed** — they converge on each site's true
+high-water mark and then allocate nothing. A fixed arena must either waste its
+ceiling or return 0 on an oversized request, and the latter is exactly where the
+null-body class of defect came from.
+
+⚠ **`security_audit` resets its arena MID-operation**, between the GET and the
+CORS probe. Those stay plain `reset_via`; only terminal ones release to the pool.
+
+⚠ **Pools are built eagerly at module scope.** A lazy `if (pool == 0)` double
+constructs when two worker threads race it, and the loser's arenas leak.
+
+`tests/arena_pool.tcyr` — **33 assertions**, four mutations all killed: acquire
+that never reuses, release that drops instead of parking, release that skips the
+reset, and an exhausted pool that returns 0 instead of falling back. The
+load-bearing one is `alloc_used()` delta **== 0** over 64 cycles; a pool that
+quietly minted per acquire would pass every functional assertion and fix nothing.
+
+⚠ An earlier draft asserted arena **identity** after release on a 4-slot pool and
+failed — the channel is **FIFO, not LIFO**, so a released arena goes to the tail.
+Identity is now checked against a one-slot pool, where the orderings coincide.
+
+**Still open**: `serve.cyr:259` (64 KiB per a2a callback) and
+`load_testing.cyr:114,115` (per user, and its capacity varies with the user
+count) are not yet pooled — both run on threads that cannot reach a shared pool
+built for request-path use, and each needs its own concurrency answer.
+
 ### Fixed — the a2a callback thread leaked its entire stack mapping
 
 `agnosai_serve_dispatch_callback` called `thread_create` and **discarded the

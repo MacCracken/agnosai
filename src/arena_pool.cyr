@@ -1,0 +1,177 @@
+# =========================================================================
+# arena_pool — a bounded pool of reusable arenas.
+#
+# **Port-local. No oracle counterpart**, and there cannot be one: Rust frees on
+# drop, so `rust-old/` never needed to think about arena ownership at all. Lives
+# at `src/` root per CLAUDE.md's rule for modules that do not mirror `rust-old/`.
+#
+# ## The defect this exists to close
+#
+# Five sites created a FRESH arena per operation and never got the memory back:
+#
+#   src/tools/agnos.cyr                5 MiB, per outbound HTTP request
+#   src/tools/remote_registry.cyr     12 MiB, per remote package fetch
+#   src/tools/builtin/security_audit  2.5 MiB, per audit
+#   src/tools/builtin/load_testing     1 MiB + persistent, PER USER
+#   src/server/serve.cyr              64 KiB, per a2a callback
+#
+# `arena_allocator(n)` is `alloc(56)` + `alloc(n + 16)` (`lib/alloc.cyr:745,370`)
+# plus `allocator_new`'s `alloc(40)` — all on the **global bump, which has no
+# free**. `reset_via` dispatches to `arena_reset` (`lib/alloc.cyr:493`), which
+# only rewinds `base`/`ptr`/`end`; the chunk is never returned and the next call
+# builds a new one. Measured: **2,621,552 bytes** charged per
+# `arena_allocator(2.5 MiB) + reset_via`, every iteration.
+#
+# The cost is virtual address space — chunks are anonymous overcommitted mmaps
+# and only touched pages count against RSS (`lib/alloc.cyr:150`) — but it grows
+# monotonically for process lifetime, and VMAs are a finite resource.
+#
+# ## Why a pool, and not the three obvious alternatives
+#
+# An escape analysis over all five sites (2026-08-12) found that **nothing
+# escapes any of them** — every site already deep-copies before its `reset_via`.
+# So the defect is ownership and reuse, not lifetime, and the fixes that address
+# lifetime do not apply:
+#
+# * **A thread-local arena is unavailable.** `thread_local_get` faults on the
+#   main thread, and `thread_local_init` on a worker orphans the block
+#   `thread_create` installed — taking sandhi's request-arena slot with it.
+#   Measured; recorded at `src/orchestrator/audit.cyr:386`.
+# * **sandhi's per-request arena is the wrong tool**, though it is reachable on a
+#   pool worker. It is 64 KiB with `ARENA_FULL_SPILL`, and sandhi allocates its
+#   receive buffer eagerly at the FULL `max_response_bytes` cap before a byte
+#   arrives (`lib/sandhi.cyr:4644`). Every spilled byte is a permanent global-bump
+#   `alloc`, so pointing agnos at it converts 5 MiB of untouched VA into ~4 MiB of
+#   RSS-charged permanent bump **per call** — strictly worse. It is also reset by
+#   sandhi between requests, which would rewind a caller's live state at the
+#   sites that reset mid-operation (`security_audit` does so three times).
+# * **A process-wide arena under one mutex** would serialize outbound HTTP across
+#   all pool workers — a worse defect than the leak.
+#
+# ## The design
+#
+# A `chan_new(slots)` channel prefilled with `slots` growable arenas. Acquire is
+# `chan_try_recv`; release is `reset_via` then `chan_try_send`. The channel is
+# already mutex-guarded (`lib/thread.cyr:694,617`), so the pool adds no
+# synchronisation of its own — one uncontended futex mutex per operation, against
+# the millisecond-scale HTTP exchange it wraps.
+#
+# ⚠ **Acquire NEVER blocks.** `chan_recv` blocks and there is no `mutex_trylock`,
+# so a blocking acquire would turn pool pressure into a hung request on a sandhi
+# worker — and `load_testing` holds TWO arenas per worker, which is a textbook
+# two-resource deadlock. An empty pool mints a fallback arena instead: slower and
+# unpooled, but never stuck.
+#
+# ⚠ **No "is this one mine" marker, deliberately.** Release just tries to send;
+# a full channel means the arena is surplus and is dropped. Pooled and fallback
+# arenas are interchangeable — both are growable arenas over the same initial
+# size — so which one ends up parked is irrelevant, and the channel's capacity is
+# what bounds the pool. This is why the pool needs no ownership bookkeeping.
+#
+# ⚠ **Arenas are GROWABLE, not fixed.** `arena_allocator_growable` chains a new
+# chunk instead of failing, and `arena_reset` retains the chain — so a slot
+# converges on its site's true high-water mark and then allocates nothing at all.
+# A fixed arena would have to choose between wasting its ceiling and returning 0
+# on an oversized request; the sites that took the latter are exactly where the
+# null-body class of defect came from.
+#
+# ⚠ **Build the pool EAGERLY on the main thread.** A lazy `if (pool == 0)` double
+# constructs when two spawned threads race it, and the loser's arenas leak — the
+# very thing this module exists to stop.
+# =========================================================================
+
+# Pool layout — 32 bytes.
+enum AgnosaiArenaPoolOff {
+    AGN_AP_CHAN = 0;
+    AGN_AP_INITIAL = 8;
+    # Arenas ever minted, pooled and fallback together.
+    AGN_AP_MINTED = 16;
+    # Acquisitions that found the pool empty and had to mint. A steady rise here
+    # means `slots` is below the real concurrency and the pool is not doing its
+    # job — it is the number to watch, not `minted`.
+    AGN_AP_FALLBACKS = 24;
+    AGN_AP_SIZE = 32;
+}
+
+# A pool of `slots` reusable arenas, each starting at `initial_bytes` and growing
+# to its own high-water mark. Returns 0 if the channel or any arena cannot be
+# built.
+#
+# `slots` bounds memory at roughly `slots x high_water`, replacing an unbounded
+# per-operation cost. Pick it from the real concurrency at the call site, not
+# from the worker count: an operation holds its arena only for its own duration.
+fn agnosai_arena_pool_new(slots, initial_bytes): i64 {
+    if (slots <= 0) { return 0; }
+    var ch = chan_new(slots);
+    if (ch == 0) { return 0; }
+
+    var p = alloc(AGN_AP_SIZE);
+    if (p == 0) { return 0; }
+    store64(p + AGN_AP_CHAN, ch);
+    store64(p + AGN_AP_INITIAL, initial_bytes);
+    store64(p + AGN_AP_MINTED, 0);
+    store64(p + AGN_AP_FALLBACKS, 0);
+
+    for (var i = 0; i < slots; i = i + 1) {
+        var a = arena_allocator_growable(initial_bytes);
+        if (a == 0) { return 0; }
+        atomic_fetch_add(p + AGN_AP_MINTED, 1);
+        # Cannot be full — the channel was sized for exactly `slots`.
+        chan_try_send(ch, a);
+    }
+    return p;
+}
+
+# Take an arena from the pool, or mint one when it is empty. Never blocks, never
+# returns 0 unless the process is out of memory entirely.
+#
+# ⚠ The returned arena is **already reset** — release does that, so the hot path
+# does not pay for it and a caller cannot forget. A freshly minted one is empty
+# by construction.
+fn agnosai_arena_pool_acquire(p): i64 {
+    if (p == 0) { return 0; }
+    var a = chan_try_recv(load64(p + AGN_AP_CHAN));
+    if (a != 0) { return a; }
+
+    # Empty. Mint rather than block — see the header on why blocking here
+    # deadlocks `load_testing` and hangs a sandhi worker.
+    atomic_fetch_add(p + AGN_AP_FALLBACKS, 1);
+    atomic_fetch_add(p + AGN_AP_MINTED, 1);
+    return arena_allocator_growable(load64(p + AGN_AP_INITIAL));
+}
+
+# Give an arena back, resetting it first. Safe to call with 0.
+#
+# ⚠ **Reset happens HERE, not on acquire**, so an arena parked in the pool holds
+# no live bytes — its chunks stay mapped and reusable, which is the whole point,
+# but nothing in them is retained. A caller that hands back an arena whose
+# contents are still referenced has a use-after-reset, exactly as with a bare
+# `reset_via`; the escape analysis in the header is what establishes that none of
+# the five sites does.
+fn agnosai_arena_pool_release(p, a): i64 {
+    if (p == 0 || a == 0) { return 0; }
+    reset_via(a);
+    # A full channel means this one is surplus — drop it. See the header: pooled
+    # and fallback arenas are interchangeable, so no marker is needed.
+    chan_try_send(load64(p + AGN_AP_CHAN), a);
+    return 0;
+}
+
+# ⚠ There is deliberately **no `available()`**. `lib/thread.cyr` exposes no
+# `chan_len`, and the count lives at a bare `ch + 32` that only the channel's own
+# functions should know about — reaching in would couple this module to another's
+# layout for a diagnostic. `minted` and `fallbacks` below are this module's own
+# and are exact; they also express the property that actually matters, which is
+# whether acquires are being SERVED rather than how many are parked at an instant.
+
+# Total arenas ever minted, pooled and fallback together.
+fn agnosai_arena_pool_minted(p): i64 {
+    if (p == 0) { return 0; }
+    return atomic_load(p + AGN_AP_MINTED);
+}
+
+# Acquisitions that found the pool empty. A steady rise means `slots` is too low.
+fn agnosai_arena_pool_fallbacks(p): i64 {
+    if (p == 0) { return 0; }
+    return atomic_load(p + AGN_AP_FALLBACKS);
+}
