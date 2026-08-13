@@ -353,11 +353,92 @@ fn _t_callback_dispatch_is_gated(): i64 {
     return 0;
 }
 
-# --- rate_limit is NOT mounted by default -------------------------------
+# --- rate_limit: mounted by default (ADR 021), and keyed per client ------
 
-# Matching the oracle, which never installs the middleware. Mounting it would be
-# a wire change — clients fine today would start seeing 429s at a threshold
-# agnosai chose.
+# ⚠ **The client key was ALWAYS `"unknown"` until 2026-08-13**, because the
+# handler passed `has_xff = 0, has_xri = 0` unconditionally — so every client
+# shared ONE bucket whatever headers arrived. The oracle reaches that value only
+# as a fallback when neither header is present. Mounting a shared bucket by
+# default would have meant one noisy client returning 429 to everyone,
+# `/health` included.
+#
+# This asserts the property that makes the default safe: **distinct clients get
+# distinct buckets.** Exhausting one must not affect another.
+fn _t_rate_limit_keys_are_per_client(): i64 {
+    var lim = agnosai_rate_limit_new(10000, 2);
+    var a = agnosai_rate_limit_client_key(str_from("10.0.0.1"), 1, str_from(""), 0);
+    var b = agnosai_rate_limit_client_key(str_from("10.0.0.2"), 1, str_from(""), 0);
+    assert(str_eq(a, b) == 0, "two X-Forwarded-For values give two DIFFERENT keys");
+
+    # Drain client a completely.
+    assert(agnosai_rate_limit_check_request(lim, a) == HTTP_OK, "a: first allowed");
+    assert(agnosai_rate_limit_check_request(lim, a) == HTTP_OK, "a: second allowed");
+    assert(agnosai_rate_limit_check_request(lim, a) == AGNOSAI_HTTP_TOO_MANY_REQUESTS,
+    "a: third is 429 — its bucket is empty");
+
+    # b must be untouched. This is the assertion the old single-bucket bug would
+    # have failed, and the one that makes mounting-by-default defensible.
+    assert(agnosai_rate_limit_check_request(lim, b) == HTTP_OK,
+    "b is UNAFFECTED by a exhausting its bucket — buckets are per client");
+
+    # X-Real-IP is the second source, used when X-Forwarded-For is absent.
+    var c = agnosai_rate_limit_client_key(str_from(""), 0, str_from("10.0.0.3"), 1);
+    assert(str_eq(c, str_from("10.0.0.3")) == 1, "X-Real-IP keys when XFF is absent");
+    assert(str_eq(c, a) == 0, "and gives a key distinct from the XFF client");
+
+    # Neither header present is the oracle's documented single-bucket fallback.
+    assert(str_eq(agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0),
+    str_from("unknown")) == 1,
+    "with neither header the key is the oracle's `unknown` fallback — by design, not by accident");
+    return 0;
+}
+
+# ⚠ **This is the assertion that pins the WIRING, not the helper.** An earlier
+# version tested `agnosai_rate_limit_client_key` and bucket independence only —
+# and a mutation reverting the handler to the old
+# `client_key(str_from(""), 0, str_from(""), 0)` passed the whole suite, because
+# nothing checked that the HANDLER reads the headers. It drives
+# `agnosai_serve_handler` over a pipe with two different `X-Forwarded-For`
+# values, which is the real path.
+#
+# The limiter allows 2 then refuses. If the handler keys per client, client B's
+# first request still succeeds after A is exhausted. If it keys everything as
+# `"unknown"` — the pre-2026-08-13 behaviour — B gets a 429 it did not earn.
+fn _t_rate_limit_handler_keys_per_client(): i64 {
+    var out[8192];
+    _agnosai_serve_limiter = agnosai_rate_limit_new(10000, 2);
+
+    var a1 = str_from("GET /health HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.9.9.1\r\n\r\n");
+    var b1 = str_from("GET /health HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.9.9.2\r\n\r\n");
+
+    var n1 = _t_serve_over_pipe(a1, &out);
+    assert(_t_starts_with(&out, n1, "HTTP/1.1 200") == 1, "client A request 1 → 200");
+    var n2 = _t_serve_over_pipe(a1, &out);
+    assert(_t_starts_with(&out, n2, "HTTP/1.1 200") == 1, "client A request 2 → 200");
+    var n3 = _t_serve_over_pipe(a1, &out);
+    var pl = 0; while (pl < n3 && load8(&out + pl) != 13) { pl = pl + 1; }
+    store8(&out + pl, 0);
+    println(&out);
+    fmt_int(agnosai_rate_limit_total_allowed(_agnosai_serve_limiter));
+    println("  <- allowed counter");
+    fmt_int(agnosai_rate_limit_total_rejected(_agnosai_serve_limiter));
+    println("  <- rejected counter");
+    fmt_int(agnosai_rate_limit_active_keys(_agnosai_serve_limiter));
+    println("  <- active keys (1 = one bucket, 3 = a bucket per request)");
+    assert(_t_starts_with(&out, n3, "HTTP/1.1 429") == 1,
+    "client A request 3 → 429, its burst of 2 is spent");
+
+    var n4 = _t_serve_over_pipe(b1, &out);
+    assert(_t_starts_with(&out, n4, "HTTP/1.1 200") == 1,
+    "client B is UNAFFECTED — the HANDLER derived a distinct key from the header");
+
+    _agnosai_serve_limiter = 0;
+    return 0;
+}
+
+# The limiter is OPT-OUT now, not opt-in: `main` mounts it unless
+# `AGNOSAI_RATE_LIMIT=0`. An unmounted limiter must still pass everything, which
+# is the escape hatch's behaviour.
 fn _t_rate_limit_off_by_default(): i64 {
     _agnosai_serve_limiter = 0;
     assert(_agnosai_serve_limiter == 0, "the limiter is unset by default");
@@ -1401,6 +1482,8 @@ fn main(): i64 {
     _t_callback_dispatch_is_gated();
     _t_detached_threads_free_their_stacks();
     _t_rate_limit_off_by_default();
+    _t_rate_limit_keys_are_per_client();
+    _t_rate_limit_handler_keys_per_client();
     _t_handler_end_to_end();
     _t_mount();
     _t_parse_port();

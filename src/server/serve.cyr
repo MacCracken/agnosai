@@ -35,19 +35,32 @@
 # its module has been threaded.** `tests/server_serve.tcyr` measures the two
 # halves separately rather than asserting a single number.
 #
-# ## `rate_limit` is NOT mounted — matching the oracle
+# ## `rate_limit` IS mounted by default — a deliberate divergence (ADR 021)
 #
-# `mod.rs:47-99` never installs `rate_limit_middleware`, and this does not
-# either. The temptation is real (`auth_jwt_verify_ok` is 3.3 ms, so a core
-# sustains ~300 JWT verifies/second, and the `alg` check sits after the
-# signature so a malformed token costs the same), but mounting it would be a
-# **wire divergence with no ADR** — clients that are fine today would start
-# seeing 429s at a threshold agnosai invented.
+# ⚠ **This reverses what this header said until 2026-08-13.** `mod.rs:47-99`
+# never installs `rate_limit_middleware` and the port matched that; agnosai now
+# ships safe-by-default, because an operator who does not read the docs should
+# not be trivially floodable. `src/main.cyr` mounts it at 100 req/s per client
+# key with a 200 burst; `AGNOSAI_RATE_LIMIT=0` restores the oracle's exact wire.
 #
-# `agnosai_serve_with_rate_limit` exists so an operator can opt in explicitly,
-# and it is tested; the default path matches the oracle. Turning it on by
-# default is a decision for whoever sets a rate, recorded in
-# docs/development/state.md.
+# The cost being defended is real: `src/server/auth.cyr:597` verifies the RSA
+# signature BEFORE checking `alg` (deliberately — the check is defence in depth
+# against a validly-signed token declaring another algorithm), so an invalid
+# token costs a full verify at **1.202 ms, ~830/sec/core**.
+#
+# ⚠ **A prerequisite defect was fixed in the same change**, and without it this
+# would have been harmful rather than safe: the handler passed
+# `has_xff = 0, has_xri = 0` unconditionally, so the client key was ALWAYS
+# `"unknown"` and every client shared ONE bucket. The oracle reaches that value
+# only as a fallback when neither header is present. The headers are read now.
+#
+# ⚠ **The key is only as trustworthy as the proxy in front** — `X-Forwarded-For`
+# is client-settable, so a direct-to-internet deployment degrades to
+# no-limiting, not to over-limiting. Stated in ADR 021, kept for parity with
+# `extract_client_key`.
+#
+# `agnosai_serve` (no limiter) and `agnosai_serve_with_rate_limit` both remain;
+# the choice moved from the call site to `main`.
 # =========================================================================
 
 # Per-worker request arena. Sized for the largest thing sandhi puts in it: the
@@ -342,14 +355,27 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
     var method_s = 0;
     var path_s = 0;
     var auth = 0;
+    # ⚠ Read for the rate-limit client key. Until 2026-08-13 the handler passed
+    # `has_xff = 0, has_xri = 0` unconditionally, so `agnosai_rate_limit_client_key`
+    # ALWAYS returned `"unknown"` and every client shared ONE bucket — the
+    # oracle's single-bucket *fallback* was the port's only behaviour, whatever
+    # headers arrived. Harmless while the limiter was unmounted; a self-inflicted
+    # outage the moment it was, since one noisy client would 429 everyone
+    # including `/health`. Found while mounting it by default.
+    var xff = 0;
+    var xri = 0;
     if (a != 0) {
         method_s = sandhi_server_get_method_a(a, buf, blen);
         path_s = sandhi_server_get_path_a(a, buf, blen);
         auth = sandhi_server_find_header_a(a, buf, blen, "Authorization");
+        xff = sandhi_server_find_header_a(a, buf, blen, "X-Forwarded-For");
+        xri = sandhi_server_find_header_a(a, buf, blen, "X-Real-IP");
     } else {
         method_s = sandhi_server_get_method(buf, blen);
         path_s = sandhi_server_get_path(buf, blen);
         auth = sandhi_server_find_header(buf, blen, "Authorization");
+        xff = sandhi_server_find_header(buf, blen, "X-Forwarded-For");
+        xri = sandhi_server_find_header(buf, blen, "X-Real-IP");
     }
 
     # **sandhi's accessors return NUL-terminated cstrings, not `Str`.** Passing
@@ -386,10 +412,17 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
         if (a != 0) { auth_str = str_from_a(a, auth); } else { auth_str = str_from(auth); }
     }
 
-    # Rate limiting runs before routing when it is mounted, matching where a
-    # tower layer would sit. Off by default — see the module header.
+    # Rate limiting runs before routing, matching where a tower layer would sit.
+    # Mounted by default (ADR 021); `_agnosai_serve_limiter` is 0 only when an
+    # operator set `AGNOSAI_RATE_LIMIT=0` or a suite drives the handler directly.
     if (_agnosai_serve_limiter != 0) {
-        var key = agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0);
+        var xff_s = str_from("");
+        var has_xff = 0;
+        if (xff != 0) { has_xff = 1; if (a != 0) { xff_s = str_from_a(a, xff); } else { xff_s = str_from(xff); } }
+        var xri_s = str_from("");
+        var has_xri = 0;
+        if (xri != 0) { has_xri = 1; if (a != 0) { xri_s = str_from_a(a, xri); } else { xri_s = str_from(xri); } }
+        var key = agnosai_rate_limit_client_key(xff_s, has_xff, xri_s, has_xri);
         if (agnosai_rate_limit_check_request(_agnosai_serve_limiter, key) != HTTP_OK) {
             _agnosai_serve_send_status(a, cfd, AGNOSAI_HTTP_TOO_MANY_REQUESTS,
             "Too Many Requests");
@@ -626,9 +659,9 @@ fn agnosai_serve(state, addr, port): i64 {
     agnosai_serve_mount(state, 0));
 }
 
-# The same, with rate limiting mounted. **Opt-in**: the oracle does not install
-# the middleware, so turning it on is a wire change — clients that are fine
-# today would start seeing 429s at a threshold agnosai chose.
+# The same, with rate limiting mounted — **what `src/main.cyr` calls by default**
+# as of ADR 021. `agnosai_serve` above is now the opt-OUT path, reached when
+# `AGNOSAI_RATE_LIMIT=0`.
 fn agnosai_serve_with_rate_limit(state, addr, port, rate_x1000, burst): i64 {
     return sandhi_server_run_pooled(addr, port, &agnosai_serve_handler, 0,
     agnosai_serve_mount(state, agnosai_rate_limit_new(rate_x1000, burst)));
