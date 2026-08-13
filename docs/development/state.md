@@ -351,6 +351,75 @@ monotonically — the correction is to the magnitude, not to the defect.
    (`:144`) and the cloned key (`:385`) on the global bump. Unauthenticated
    requests to a nonexistent crew id reach this.
 
+### ⚠ sandhi 1.9.10 fixes a null-body P1 — agnosai does NOT have it yet
+
+`_sandhi_resp_frame_a` reported **`SANDHI_OK` with a null `body_ptr`** and a
+positive `body_len`. Reproduced against the folded sandhi in this tree
+(8,000-byte body, 4 KiB arena): `err_kind == SANDHI_OK` -> **1**,
+`body_len` -> **8000**, `body_ptr` -> **0**.
+
+It needs no memory pressure: sandhi allocates its receive buffer **eagerly at
+the full `max_response_bytes` cap** (`lib/sandhi.cyr:4644`) before a byte
+arrives, so the body copy gets only the arena's remainder — **~1 MiB** for
+`tools/agnos.cyr` (4 MiB cap, 5 MiB arena) and **~2 MiB** for
+`tools/remote_registry.cyr` (10 MiB cap, 12 MiB arena). Above that,
+`bayan_json_v_parse_buf(0, len)` and `str_from_buf(0, len)` read from address 0.
+
+- ✅ **Both agnosai sites now guard**, fail closed, and keep the guard
+  permanently — this tree must not depend on a transport's internal invariant to
+  avoid a segfault.
+- ✅ **Fixed at the root in sandhi 1.9.10 — RELEASED and tagged 2026-08-12**,
+  confirmed published. 1,250 assertions across its four suites, fuzz 8/8, all
+  five `dist/` bundles regenerated, pin 6.5.5 -> 6.5.20.
+- 🟡 **`lib/sandhi.cyr` here is still `SANDHI_VERSION = "1.9.9"`, and that is
+  expected, not drift.** sandhi is folded into the cyrius stdlib rather than
+  taken as a git dep, so the fix lands **in the next cyrius release** (6.5.20
+  predates it). Nothing to do in this repo when it does — the three-step picks it
+  up — but re-check `SANDHI_VERSION` in `lib/sandhi.cyr` after that pin bump.
+
+  Until then the local guards are the entire protection. ⚠ `tests/tools_agnos.tcyr`
+  asserts against the **buggy** folded version deliberately, and is written to
+  stay green either way: the `err_kind == SANDHI_OK` branch is conditional, so
+  the re-fold flips it to the error path without a failure.
+- ⚠ **Not reachable from the shipped binary today**, and the sweep that found it
+  claimed it was, via `_agnosai_mcp_tools_call`.
+  `agnosai_register_{mneme,synapse,delta}_builtins` have **zero callers in
+  `src/`**; `main.cyr:351-353` registers only basic, load_testing and
+  security_audit. Latent — live the moment an agnos-backed tool is registered.
+
+### ✅ The a2a callback thread leaked its whole stack mapping — fixed 2026-08-12
+
+`agnosai_serve_dispatch_callback` called `thread_create` and **discarded the
+handle**. `thread_join` is the ONLY caller of `munmap_stack`, so nothing released
+the mapping: `mmap_stack` maps `THREAD_STACK_SIZE + THREAD_GUARD_SIZE` =
+**2,101,248 bytes** and mprotects the guard page, which splits it into **2 VMAs**
+— per callback, permanently, plus a 4 KiB TLS block and a 24-byte handle on the
+no-free bump that `thread_join` would not have reclaimed either.
+
+Measured here before the fix: **20 unjoined threads → +40 VMAs**, still present
+after they had exited. **20 detached → +0.** Now `thread_create_detached`, which
+has the child unmap its own stack and carves the TLS from the top of that same
+mapping so one `munmap` frees both. It also reports failure rather than returning
+1 for a dispatch that never started.
+
+⚠ **The identical fix already shipped in `orchestrator/submit_crew`** — see its
+header and the upstream filing behind cyrius 6.5.8's `thread_create_detached`.
+This site was missed. The rest are clean: `crew_runner:1066` and
+`load_testing:471` keep handles and join, `inference_queue:437` is already
+detached, `agnosai_serve_install_signals` is one thread for process lifetime.
+
+⚠ **The call site is NOT offline-reachable, so nothing asserts on it.**
+`agnosai_route_a2a_callback_allowed` refuses loopback and private ranges by
+design, and a public host means DNS plus a 30 s connect timeout that leaves the
+stack mapped while any assertion looks. `tests/server_serve.tcyr` pins the
+primitive instead (`_t_detached_threads_free_their_stacks`). ⚠ A first attempt
+used a loopback URL and was **vacuous** — the gate refused it before any thread
+spawned, so reverting the fix passed the entire suite. The replacement is
+mutation-verified (breaking it reports `got 15, expected 0`).
+
+The 64 KiB arena at `serve.cyr:259` is a separate matter and still open — it is
+one of the five sites in the arena-pool bite above.
+
 ### Still outstanding, not blocking
 
 - **14 repos still declare `[deps.sakshi]`** — re-enumerated 2026-08-12 with

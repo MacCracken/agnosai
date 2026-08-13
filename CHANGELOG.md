@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — the a2a callback thread leaked its entire stack mapping
+
+`agnosai_serve_dispatch_callback` called `thread_create` and **discarded the
+handle**. `thread_join` is the only caller of `munmap_stack`, so nothing ever
+released the mapping. `mmap_stack` maps `THREAD_STACK_SIZE + THREAD_GUARD_SIZE`
+= **2,101,248 bytes** and mprotects the guard page, splitting it into **2 VMAs**
+— per callback, permanently, plus a 4 KiB TLS block and a 24-byte handle on the
+no-free bump that `thread_join` would not have reclaimed either.
+
+Measured on this tree before the fix: **20 unjoined threads left +40 VMAs** that
+persisted after the threads had exited; **20 detached left +0**.
+
+Now `thread_create_detached`, which has the child unmap its own stack in the
+trampoline tail and carves the TLS from the top of that same mapping so one
+`munmap` frees both. It also **reports failure** instead of returning 1
+unconditionally for a dispatch that never started.
+
+⚠ **The identical fix already shipped in `orchestrator/submit_crew`** — see its
+header and the upstream filing that produced `thread_create_detached` in cyrius
+6.5.8. This site was simply missed. Audited the rest: `crew_runner:1066` and
+`load_testing:471` keep their handles and join; `inference_queue:437` is already
+detached; `agnosai_serve_install_signals` spawns one thread for process lifetime,
+not per operation.
+
+⚠ **The call site is not offline-reachable, so no assertion covers it** — the
+gate refuses loopback and private ranges by design, and a public host means DNS
+and a 30 s connect timeout that leaves the stack mapped while any assertion
+looks. `tests/server_serve.tcyr` pins the *primitive* instead
+(`_t_detached_threads_free_their_stacks`), and says so. An earlier version of
+that test used a loopback URL and was **vacuous**: the gate refused it before any
+thread spawned, so reverting the fix passed the whole suite. The replacement is
+mutation-verified.
+
+### Fixed — a null-pointer read on large AGNOS / remote-registry responses
+
+sandhi could return **`SANDHI_OK` with a null body pointer** and a positive
+`body_len`. `_sandhi_resp_frame_a` (`lib/sandhi.cyr:3345`) assigned
+`_sandhi_resp_body_copy_a`'s result into `body_ptr` **without checking**, and
+that copy answers 0 when the arena cannot fit it. Two agnosai call sites then
+read from address 0:
+
+- `src/tools/agnos.cyr` — `bayan_json_v_parse_buf(0, len)`;
+  `bayan_json_v_parse_ctx_a` (`lib/bayan.cyr:3773`) has no null-buf guard.
+- `src/tools/remote_registry.cyr` — `str_from_buf(0, len)` is `alloc` + `memcpy`
+  (`lib/str.cyr:609`), copying **from** address 0.
+
+⚠ **It needs no memory pressure to fire.** sandhi allocates its receive buffer
+eagerly at the full `max_response_bytes` cap (`lib/sandhi.cyr:4644`) before a
+byte arrives, so the slack left for the body copy is the arena minus that cap:
+**~1 MiB** for agnos (4 MiB cap, 5 MiB arena) and **~2 MiB** for remote_registry
+(10 MiB cap, 12 MiB arena). Any body above those took the null path. Neither
+arena sets a spill policy, so `ARENA_FULL_NULL` makes the failed alloc a 0.
+
+Both sites now check `sandhi_http_body(r) == 0` with a positive length and fail
+closed — agnos reports `AGNOSAI_AGNOS_BAD_JSON` with the detail
+`"response body could not be buffered"`, remote_registry a download failure.
+
+⚠ **The guards stay even after the upstream fix.** agnosai must not depend on a
+transport's internal invariant to avoid a segfault.
+
+**Fixed at the root in sandhi 1.9.10**, released and tagged alongside this —
+framing now returns `SANDHI_ERR_INTERNAL` rather than reporting OK, matching the
+guards that function already applies to `outp_cell` / `outl_cell`. ⚠ **agnosai
+does not have that fix yet**: `lib/sandhi.cyr` is `SANDHI_VERSION = "1.9.9"`
+because sandhi is folded into the cyrius stdlib rather than taken as a git dep,
+so it arrives in the **next cyrius release** — 6.5.20 predates it. Until then the
+local guards are the whole protection, and they stay afterwards regardless.
+
+⚠ **Not reachable from the shipped binary today** — and the sweep that found it
+claimed otherwise, via `_agnosai_mcp_tools_call`. Checked:
+`agnosai_register_{mneme,synapse,delta}_builtins` have **zero callers in `src/`**;
+`main.cyr:351-353` registers only basic, load_testing and security_audit, so no
+agnos-backed tool is ever in the registry. Latent, and live the moment one is.
+
+### Removed
+
+- **A redundant whole-package copy in `remote_registry`.** `str_from_buf` already
+  allocates on the global bump and memcpies, so the `str_clone` that followed it
+  duplicated the entire download — ~2N bumped for an N-byte package, the first
+  N+16 orphaned immediately on a no-free allocator.
+
 ### Performance — three allocation defects found by the P(-1) sweep
 
 - **`agnosai_prompt_scan_input`: 560 B per CLEAN scan → 0.** It ran 35 `str_from`

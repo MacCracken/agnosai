@@ -272,7 +272,37 @@ fn agnosai_serve_dispatch_callback(body: Str): i64 {
     var cb = alloc(AGN_CALLBACK_SIZE);
     store64(cb + AGN_CB_URL, url);
     store64(cb + AGN_CB_BODY, body);
-    thread_create(&_agnosai_serve_callback_thread, cb);
+
+    # ✅ **Detached, and it leaks nothing.** This called `thread_create` and never
+    # joined, which stranded the whole stack mapping per callback — `thread_join`
+    # is the ONLY caller of `munmap_stack`, so a discarded handle means the
+    # mapping is never released.
+    #
+    # Measured on this tree: 20 unjoined threads left **+40 VMAs** that persisted
+    # after the threads exited; 20 detached left **+0**. `mmap_stack` maps
+    # `THREAD_STACK_SIZE + THREAD_GUARD_SIZE` = **2,101,248 bytes** and mprotects
+    # the guard page, which is what splits it into the 2 VMAs each. Add the
+    # 4 KiB TLS block and the 24-byte handle, both on the no-free bump, neither
+    # of which `thread_join` would have reclaimed anyway.
+    #
+    # `thread_create_detached` has the child unmap its own stack in the trampoline
+    # tail and carves the TLS from the top of that same mapping, so one `munmap`
+    # frees both, and it allocates no handle at all.
+    #
+    # ⚠ **The identical fix already shipped in `orchestrator/submit_crew`** — see
+    # its header, and the upstream filing that produced `thread_create_detached`
+    # in cyrius 6.5.8. This site was simply missed. `crew_runner` and
+    # `load_testing` are unaffected: both keep their handles and `thread_join`.
+    # `agnosai_serve_install_signals` is also unaffected — one thread for process
+    # lifetime, not per operation.
+    #
+    # **Do not "improve" this to `thread_create` + a later `thread_join`.** The
+    # handle a joiner needs is exactly what the detached path declines to
+    # allocate, and a callback returns nothing to join *for*.
+    #
+    # Now reports failure instead of claiming a dispatch that never happened: the
+    # old form discarded the result and returned 1 unconditionally.
+    if (thread_create_detached(&_agnosai_serve_callback_thread, cb) == 0) { return 0; }
     return 1;
 }
 

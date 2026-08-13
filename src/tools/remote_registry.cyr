@@ -233,8 +233,28 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
         return _agnosai_remote_err(agnosai_remote_too_large_err(body_len));
     }
 
+    # ⚠ **Same null-body read as `tools/agnos.cyr`, and with a WIDER window.**
+    # sandhi's `_sandhi_resp_frame_a` (`lib/sandhi.cyr:3345`) assigns
+    # `body_ptr = _sandhi_resp_body_copy_a(...)` unchecked and still reports
+    # `SANDHI_OK`; that copy answers 0 when the arena cannot fit it. sandhi
+    # allocates the receive buffer eagerly at the full cap
+    # (`lib/sandhi.cyr:4644`) — 10,485,761 + 1 here — out of a 12 MiB arena,
+    # leaving only ~2 MiB for the second copy. So **any package between roughly
+    # 2 MiB and the 10 MiB ceiling** yields a null `body_ptr`, and
+    # `str_from_buf` (`lib/str.cyr:609`) is `alloc` + `memcpy` — it would copy
+    # FROM address 0. Fixed upstream in **sandhi 1.9.10**; the guard stays,
+    # because a transport's internal invariant must not be what stands between
+    # this and a segfault.
+    if (body_len > 0 && sandhi_http_body(resp) == 0) {
+        reset_via(arena);
+        return _agnosai_remote_err(str_from("download failed: response body could not be buffered"));
+    }
+
+    # ⚠ No `str_clone` here — `str_from_buf` ALREADY allocates on the global
+    # bump and memcpies (`lib/str.cyr:609-614`). The clone that used to follow
+    # duplicated the whole package: ~2N bumped for an N-byte download, with the
+    # first N+16 orphaned immediately on a no-free allocator.
     var data = str_from_buf(sandhi_http_body(resp), body_len);
-    if (body_len > 0) { data = str_clone(data); }
     reset_via(arena);
 
     _agnosai_remote_log("remote tool package downloaded", 30, url, body_len);

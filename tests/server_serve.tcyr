@@ -274,6 +274,71 @@ fn _t_callback_gate(): i64 {
     return 0;
 }
 
+fn _t_noop_thread(arg): i64 { return 0; }
+
+# Live VMA count from /proc/self/maps — one line per mapping.
+#
+# The gate for the callback thread's stack: `mmap_stack` maps
+# `THREAD_STACK_SIZE + THREAD_GUARD_SIZE` and mprotects the guard page, which
+# splits it into TWO mappings per thread. An unjoined, non-detached thread never
+# releases either, so the count is the direct observable.
+fn _t_vma_count(): i64 {
+    var fd = sys_open("/proc/self/maps", 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var buf[262144];
+    var lines = 0;
+    while (1 == 1) {
+        var n = sys_read(fd, &buf, 262144);
+        if (n <= 0) { break; }
+        for (var i = 0; i < n; i = i + 1) {
+            if (load8(&buf + i) == 10) { lines = lines + 1; }
+        }
+    }
+    sys_close(fd);
+    return lines;
+}
+
+# The thread primitive `agnosai_serve_dispatch_callback` relies on.
+#
+# ⚠ **This pins the MECHANISM, not the call site — and the distinction is the
+# point.** `agnosai_serve_dispatch_callback` used `thread_create` and discarded
+# the handle. `thread_join` is the ONLY caller of `munmap_stack`, so nothing ever
+# released the mapping: `mmap_stack` maps `THREAD_STACK_SIZE + THREAD_GUARD_SIZE`
+# = **2,101,248 bytes** and mprotects the guard page, splitting it into **2 VMAs**
+# per callback, permanently. Verified by direct measurement on this tree before
+# the fix: 20 unjoined threads left **+40 VMAs** that persisted after they had
+# exited; 20 detached left **+0**. The identical fix already shipped in
+# `orchestrator/submit_crew` (cyrius 6.5.8's `thread_create_detached`); this site
+# was simply missed.
+#
+# ⚠ **The call site itself is NOT offline-reachable, so no assertion covers it.**
+# Reaching it needs a URL that passes `agnosai_route_a2a_callback_allowed` —
+# which refuses loopback and private ranges by design — AND whose thread exits
+# promptly. A public host means DNS and real traffic; a non-routable public IP
+# means the thread sits on the 30 s connect timeout, so its stack is still mapped
+# when any assertion could look. An earlier version of this test used a loopback
+# URL and was **vacuous**: the gate refused it before any thread spawned, and
+# reverting the fix passed the whole suite. Read the call site; this test only
+# guarantees the primitive underneath it still behaves.
+fn _t_detached_threads_free_their_stacks(): i64 {
+    var before = _t_vma_count();
+    assert(before > 0, "we can read /proc/self/maps at all");
+
+    for (var i = 0; i < 8; i = i + 1) { thread_create_detached(&_t_noop_thread, 0); }
+    sleep_ms(400);
+    assert_eq(_t_vma_count() - before, 0,
+    "8 DETACHED threads leave zero mappings behind — what the callback path relies on");
+
+    # The un-detached form leaks, which is what makes the assertion above mean
+    # something rather than measuring a process that never spawns anything.
+    var mid = _t_vma_count();
+    for (var j = 0; j < 8; j = j + 1) { thread_create(&_t_noop_thread, 0); }
+    sleep_ms(400);
+    assert(_t_vma_count() - mid >= 8,
+    "and 8 UNJOINED threads demonstrably do not — 2 mappings each, still there after they exit");
+    return 0;
+}
+
 # A refused URL must not spawn a thread, and must not be reported as dispatched.
 fn _t_callback_dispatch_is_gated(): i64 {
     assert(agnosai_serve_dispatch_callback(_t_callback_body("http://127.0.0.1/cb")) == 0,
@@ -1333,6 +1398,7 @@ fn main(): i64 {
     _t_options();
     _t_callback_gate();
     _t_callback_dispatch_is_gated();
+    _t_detached_threads_free_their_stacks();
     _t_rate_limit_off_by_default();
     _t_handler_end_to_end();
     _t_mount();

@@ -585,6 +585,59 @@ fn main() {
     assert_eq(bayan_json_v_is_str(agnosai_tool_input_get(inline_probe, str_from("k"))), 1,
     "input_get through a variable returns the raw string value");
 
+    # --- sandhi can hand back SANDHI_OK with a NULL body -------------------
+    #
+    # ⚠ This is not hypothetical and it is not defensive. `_sandhi_resp_frame_a`
+    # assigns `_sandhi_resp_body_copy_a`'s result into `body_ptr` WITHOUT
+    # checking, and that copy answers 0 when the arena cannot fit `len + 1`. The
+    # framing then reports SANDHI_OK carrying the real `body_len`, so a caller
+    # doing the right thing — checking `err_kind == SANDHI_OK` — goes on to read
+    # from address 0. `bayan_json_v_parse_ctx_a` has no null-buf guard.
+    #
+    # It needs no memory pressure: sandhi allocates its receive buffer EAGERLY at
+    # the full `max_response_bytes` cap before a byte arrives, so agnos's 4 MiB
+    # cap inside a 5 MiB arena leaves ~1 MiB for the body copy. Any AGNOS
+    # response above that took the null path.
+    #
+    # ⚠ **This drives the REAL folded sandhi**, which is `SANDHI_VERSION 1.9.9` —
+    # the version with the defect — so the bad response is produced genuinely
+    # rather than faked. sandhi **1.9.10** fixes it at the root by returning
+    # SANDHI_ERR_INTERNAL, but it reaches agnosai only when cyrius re-folds it.
+    # When that lands, the first assertion below flips to reporting an error
+    # instead of OK; the guard's own assertion is written to hold either way.
+    var oom_sb = str_builder_new();
+    str_builder_add_cstr(oom_sb,
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 8000\r\n\r\n");
+    for (var oi = 0; oi < 8000; oi = oi + 1) { str_builder_putc(oom_sb, 120); }
+    var oom_raw = str_builder_build(oom_sb);
+
+    var tiny = arena_allocator(4096);
+    var bad = sandhi_http_response_parse_a(tiny, str_data(oom_raw), str_len(oom_raw));
+    assert(bad != 0, "the framing returns a response object at all");
+
+    # The hazard itself: a positive length with no buffer behind it.
+    if (sandhi_http_err_kind(bad) == SANDHI_OK) {
+        assert(sandhi_http_body_len(bad) > 0,
+        "folded sandhi 1.9.9 reports OK with a positive body_len...");
+        assert_eq(sandhi_http_body(bad), 0, "...and a NULL body pointer — the defect");
+    }
+
+    # Whichever way the folded sandhi behaves, the predicate agnos guards on must
+    # refuse this response rather than hand it to the parser.
+    var framing_errored = 0;
+    if (sandhi_http_err_kind(bad) != SANDHI_OK) { framing_errored = 1; }
+    var guard_trips = 0;
+    if (sandhi_http_body_len(bad) > 0 && sandhi_http_body(bad) == 0) { guard_trips = 1; }
+    assert(framing_errored == 1 || guard_trips == 1,
+    "agnos never reaches the parser: either framing errors, or the null-body guard trips");
+
+    # And a response that FITS is still parsed normally, so the guard is not
+    # simply refusing everything.
+    var roomy = arena_allocator(65536);
+    var good = sandhi_http_response_parse_a(roomy, str_data(oom_raw), str_len(oom_raw));
+    assert_eq(sandhi_http_err_kind(good), SANDHI_OK, "a sufficient arena still frames OK");
+    assert(sandhi_http_body(good) != 0, "with a real body pointer");
+
     return assert_summary();
 }
 

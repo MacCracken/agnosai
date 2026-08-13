@@ -271,8 +271,31 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body): i64 {
     }
 
     # bayan parses into the default allocator, so the value outlives the arena.
+    #
+    # ⚠ **The null-body guard is NOT defensive — it closes a real null-pointer
+    # read.** sandhi can return `SANDHI_OK` with `body_ptr == 0` and a positive
+    # `body_len`: `_sandhi_resp_frame_a` (`lib/sandhi.cyr:3345`) assigns
+    # `body_ptr = _sandhi_resp_body_copy_a(...)` **without checking**, and that
+    # copy answers 0 when the arena cannot fit it. It cannot fit whenever the
+    # body exceeds roughly 1 MiB, because sandhi allocates its receive buffer
+    # eagerly at the FULL cap (`lib/sandhi.cyr:4644`, `alloc_via(a, cap + 1)`)
+    # — 4 MiB here — out of a 5 MiB arena, leaving ~1 MiB for the second copy.
+    # This arena sets no spill policy, so `ARENA_FULL_NULL` makes that a 0.
+    # `bayan_json_v_parse_ctx_a` (`lib/bayan.cyr:3773`) has no null-buf guard and
+    # reads straight from address 0.
+    #
+    # Fail closed: a body that could not be materialised is not parseable, so it
+    # reports as a parse failure with a distinguishable detail rather than
+    # faulting. Fixed upstream in **sandhi 1.9.10**, which no longer reports OK
+    # with a null body — this guard stays regardless, because agnosai must not
+    # depend on a transport's internal invariant to avoid a segfault.
     var body_len = sandhi_http_body_len(r);
     var data = 0;
+    if (body_len > 0 && sandhi_http_body(r) == 0) {
+        _AGNOSAI_AGNOS_DETAIL = str_cstr(str_from("response body could not be buffered"));
+        reset_via(arena);
+        return AGNOSAI_AGNOS_BAD_JSON;
+    }
     if (body_len > 0) { data = bayan_json_v_parse_buf(sandhi_http_body(r), body_len); }
     reset_via(arena);
     if (data == 0) { return AGNOSAI_AGNOS_BAD_JSON; }
