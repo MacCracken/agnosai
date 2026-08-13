@@ -440,6 +440,54 @@ fn _t_rbody_str(r, key): Str {
     return bayan_json_v_str(v);
 }
 
+# ⚠ **An UPPERCASE crew id must find the crew, as the oracle's `Path<Uuid>` does.**
+#
+# The uuid crate parses either case and looks the entity up by VALUE, so
+# `GET /api/v1/crews/6BA7B810-…` resolves. The port validated with
+# `agnosai_uuid_is_valid` — which also accepts uppercase — and then used the RAW
+# segment as a `map_get` key on a Str-keyed map. Ids are minted lowercase, so an
+# uppercase id passed the gate and then MISSED: a 404 for a crew that exists,
+# and no test saw it because every test echoed the id the server had just
+# returned.
+fn _t_crew_id_is_case_insensitive(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var r = agnosai_route_create_crew(_t_state_with(o), _t_valid_body());
+    var id = _t_rbody_str(r, "crew_id");
+    assert(str_len(id) == 36, "the minted id is a canonical UUID");
+
+    # Upper-case every hex letter, leaving digits and dashes alone.
+    var d = str_data(id);
+    var up = alloc(36);
+    for (var i = 0; i < 36; i = i + 1) {
+        var c = load8(d + i) & 255;
+        if (c >= 97 && c <= 102) { c = c - 32; }
+        store8(up + i, c);
+    }
+    var upper = str_new(up, 36);
+    assert(str_eq(upper, id) == 0, "and the upper-cased form really differs");
+
+    var g = agnosai_route_get_crew(_t_state_with(o), upper);
+    assert(agnosai_route_status(g) == HTTP_OK,
+    "GET with an UPPERCASE id finds the crew — 404 here is the pre-2026-08-13 bug");
+
+    var c = agnosai_route_cancel_crew(_t_state_with(o), upper);
+    assert(agnosai_route_status(c) != HTTP_NOT_FOUND,
+    "and cancel resolves it too, rather than reporting it unknown");
+
+    # A genuinely unknown but well-formed id must still 404, so the fold is not
+    # simply making everything match.
+    var miss = agnosai_route_get_crew(_t_state_with(o),
+    str_from("6BA7B810-9DAD-11D1-80B4-00C04FD430C8"));
+    assert(agnosai_route_status(miss) == HTTP_NOT_FOUND,
+    "an unknown id still 404s — the fold did not make lookups promiscuous");
+
+    # And a malformed id is still 422, not 404.
+    var bad = agnosai_route_get_crew(_t_state_with(o), str_from("not-a-uuid"));
+    assert(agnosai_route_status(bad) == AGNOSAI_HTTP_UNPROCESSABLE,
+    "a malformed id is still 422");
+    return 0;
+}
+
 # Oracle: `post_crews_with_valid_body_returns_result`.
 fn _t_create_crew_valid(): i64 {
     var o = agnosai_orchestrator_new(0);
@@ -763,6 +811,7 @@ fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
 
+    _t_crew_id_is_case_insensitive();
     _t_rejects_empty_name();
     _t_rejects_missing_tasks();
     _t_rejects_missing_agents();

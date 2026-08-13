@@ -202,6 +202,49 @@ fn agnosai_uuid_v4_str(): i64 {
 # Parsing and re-rendering also normalises case, which matches the oracle: the
 # `uuid` crate parses hex of either case into bytes and its Display always emits
 # lowercase.
+# The lookup key for a UUID arriving off the wire — validated AND case-folded.
+#
+# ⚠ **`agnosai_uuid_is_valid` is not enough at a route boundary, and using it
+# alone was a silent 404.** The oracle's `Path<Uuid>` extractor parses the
+# segment into a `Uuid` and looks the entity up **by value**, and the uuid crate
+# accepts hex in either case — so `GET /api/v1/crews/6BA7B810-…` finds the crew.
+# The port validated (which also accepts uppercase, `id.cyr:127,134`) and then
+# used the RAW segment as a `map_get` key. Ids are minted lowercase by
+# `agnosai_uuid_v4_str`, so an uppercase id passed validation and then missed:
+# 404 for a crew that exists, and on `submit_approval` a 200 carrying
+# `delivered: false` on a human-in-the-loop gate.
+#
+# Returns 0 when `s` is not a UUID at all, which callers map to 422.
+#
+# **Allocates nothing on the common path.** A key that is already canonical
+# lowercase — every id this server mints — is returned as-is; only a request
+# that actually used uppercase pays for a copy, through `a`.
+fn _agnosai_uuid_key_a(a, s: Str): i64 {
+    if (agnosai_uuid_is_valid(s) == 0) { return 0; }
+    var d = str_data(s);
+    var n = str_len(s);
+    var upper = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(d + i) & 255;
+        if (c >= 65 && c <= 70) { upper = 1; }
+    }
+    if (upper == 0) { return s; }
+
+    var out = alloc_via(a, n);
+    if (out == 0) { return 0; }
+    for (var j = 0; j < n; j = j + 1) {
+        var b = load8(d + j) & 255;
+        if (b >= 65 && b <= 70) { b = b + 32; }
+        store8(out + j, b);
+    }
+    return str_new_a(a, out, n);
+}
+
+# Global-allocator form of `_agnosai_uuid_key_a`.
+fn _agnosai_uuid_key(s: Str): i64 {
+    return _agnosai_uuid_key_a(default_alloc(), s);
+}
+
 fn agnosai_uuid_canonical(s: Str): i64 {
     var u = agnosai_uuid_parse(s);
     if (u == 0) { return 0; }

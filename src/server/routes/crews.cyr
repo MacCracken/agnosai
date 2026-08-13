@@ -614,11 +614,14 @@ fn _agnosai_route_crew_warn(name: Str, err: Str): i64 {
 # runs, so an unparseable id is **422**, not 404 — the same extractor-owns-the-
 # status situation `agents.rs` and `approval.rs` have.
 fn agnosai_route_get_crew_a(a, state, id: Str): i64 {
-    if (agnosai_uuid_is_valid(id) == 0) {
+    # `Path<Uuid>` semantics: parse, then look up BY VALUE. `_agnosai_uuid_key_a`
+    # carries why validating alone was a silent 404 on an uppercase id.
+    var key = _agnosai_uuid_key_a(a, id);
+    if (key == 0) {
         return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
         str_from_a(a, "crew id is not a valid UUID"));
     }
-    var c = agnosai_orchestrator_crew(agnosai_app_state_orchestrator(state), id);
+    var c = agnosai_orchestrator_crew(agnosai_app_state_orchestrator(state), key);
     if (c == 0) {
         return agnosai_route_error_a(a, HTTP_NOT_FOUND, str_from_a(a, "crew not found"));
     }
@@ -639,7 +642,8 @@ fn agnosai_route_get_crew(state, id: Str): i64 {
 # 200 with `{"status":"cancelled","crew_id":"<id>"}`, or 404 when the
 # orchestrator reports it does not know the crew.
 fn agnosai_route_cancel_crew(state, id: Str): i64 {
-    if (agnosai_uuid_is_valid(id) == 0) {
+    var key = _agnosai_uuid_key(id);
+    if (key == 0) {
         return agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
         str_from("crew id is not a valid UUID"));
     }
@@ -647,7 +651,7 @@ fn agnosai_route_cancel_crew(state, id: Str): i64 {
     # **0 is success**, a non-zero value is the error object it built. The
     # oracle's `match .. { Ok(()) => .., Err(_) => 404 }` maps onto that, not
     # onto a truthy success flag.
-    if (agnosai_orchestrator_cancel_crew(agnosai_app_state_orchestrator(state), id) != 0) {
+    if (agnosai_orchestrator_cancel_crew(agnosai_app_state_orchestrator(state), key) != 0) {
         return agnosai_route_error(HTTP_NOT_FOUND, str_from("crew not found"));
     }
     var obj = bayan_json_v_obj_new();

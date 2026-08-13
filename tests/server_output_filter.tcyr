@@ -212,6 +212,52 @@ fn main() {
     assert_eq(agnosai_contains_ssn(str_from("short")), 0, "a string shorter than a pattern is safe");
     assert_eq(agnosai_contains_phone(str_from("short")), 0, "for phones too");
 
+    # --- ⚠ no iteration cap on redaction ---
+    #
+    # The loop was `while (guard < 1000)`, so occurrence 1001 of a prefix
+    # survived verbatim — real credentials left in a response with nothing
+    # logged to say redaction had stopped. The oracle's loop is unbounded.
+    var many = str_builder_new();
+    for (var mi = 0; mi < 1200; mi = mi + 1) {
+        str_builder_add_cstr(many, "sk-abcdefghijklmnopqrst ");
+    }
+    assert_eq(str_contains_cstr(agnosai_output_redact(str_builder_build(many)), "sk-"), 0,
+    "all 1200 keys are redacted — a survivor here is the 1000-iteration cap");
+
+    # --- ⚠ the token boundary is UNICODE whitespace ---
+    #
+    # The oracle bounds the span with `char::is_whitespace`. The port tested only
+    # space/tab/LF/CR, so a key followed by a form feed found no whitespace, fell
+    # back to the `pos + prefix + 20` ceiling and swallowed the text after it.
+    var ffb = alloc(32);
+    var ffn = 0;
+    var akia = "AKIAIOSFODNN7";
+    for (var ai = 0; ai < 13; ai = ai + 1) { store8(ffb + ffn, load8(akia + ai)); ffn = ffn + 1; }
+    store8(ffb + ffn, 12); ffn = ffn + 1;
+    var tailc = "keepme";
+    for (var ti = 0; ti < 6; ti = ti + 1) { store8(ffb + ffn, load8(tailc + ti)); ffn = ffn + 1; }
+    var ffred = agnosai_output_redact(str_new(ffb, ffn));
+    assert_eq(str_contains_cstr(ffred, "keepme"), 1,
+    "a form feed (U+000C) ends the token, so the text after it SURVIVES");
+    assert_eq(str_contains_cstr(ffred, "AKIAIOSFODNN7"), 0, "and the key itself is gone");
+
+    # U+00A0 non-breaking space — two bytes, the multi-byte decoder arm.
+    var nbb = alloc(32);
+    var nbn = 0;
+    for (var bi = 0; bi < 13; bi = bi + 1) { store8(nbb + nbn, load8(akia + bi)); nbn = nbn + 1; }
+    store8(nbb + nbn, 0xC2); nbn = nbn + 1;
+    store8(nbb + nbn, 0xA0); nbn = nbn + 1;
+    var surv = "survives";
+    for (var si = 0; si < 8; si = si + 1) { store8(nbb + nbn, load8(surv + si)); nbn = nbn + 1; }
+    var nbred = agnosai_output_redact(str_new(nbb, nbn));
+    assert_eq(str_contains_cstr(nbred, "survives"), 1,
+    "a non-breaking space ends the token too — the decoder sees the codepoint, not the bytes");
+    assert_eq(str_contains_cstr(nbred, "AKIAIOSFODNN7"), 0, "and the key is gone");
+
+    # The common path is unchanged.
+    assert_eq(str_contains_cstr(agnosai_output_redact(str_from("AKIAIOSFODNN7 tail")), "tail"), 1,
+    "an ASCII space still bounds the token");
+
     return assert_summary();
 }
 

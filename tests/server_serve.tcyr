@@ -340,16 +340,71 @@ fn _t_detached_threads_free_their_stacks(): i64 {
     return 0;
 }
 
+# Recorder for the callback transport — captures what the POST would carry.
+var _t_cb_len = 0;
+var _t_cb_url = 0;
+var _t_cb_body = 0;
+
+fn _t_record_callback(arena, method, url, headers, opts, timeout_ms, body, body_len): i64 {
+    _t_cb_url = url;
+    _t_cb_body = body;
+    _t_cb_len = body_len;
+    return 0;
+}
+
 # A refused URL must not spawn a thread, and must not be reported as dispatched.
 fn _t_callback_dispatch_is_gated(): i64 {
-    assert(agnosai_serve_dispatch_callback(_t_callback_body("http://127.0.0.1/cb")) == 0,
+    var rsp = agnosai_route_json(HTTP_OK, bayan_json_v_obj_new());
+    assert(agnosai_serve_dispatch_callback(_t_callback_body("http://127.0.0.1/cb"), rsp) == 0,
     "a refused URL dispatches nothing");
-    assert(agnosai_serve_dispatch_callback(str_from("{}")) == 0,
+    assert(agnosai_serve_dispatch_callback(str_from("{}"), rsp) == 0,
     "a non-A2A body dispatches nothing");
-    assert(agnosai_serve_dispatch_callback(str_from("not json")) == 0,
+    assert(agnosai_serve_dispatch_callback(str_from("not json"), rsp) == 0,
     "malformed JSON dispatches nothing");
     assert(AGNOSAI_SERVE_CALLBACK_TIMEOUT_MS == 30000,
     "the callback timeout is the oracle's 30 seconds");
+    return 0;
+}
+
+# ⚠ **The callback must POST the RESPONSE, and must post it at all.**
+#
+# Until 2026-08-13 it posted nothing: `agnosai_guarded_fetch` hardcoded sandhi's
+# body arguments to `0, 0`, so `AGN_CB_BODY` was written and never read and the
+# delegating system got an empty POST. Nothing caught it, because every
+# assertion above stops at "did it dispatch".
+#
+# The body is rendered at dispatch time rather than in the thread, because the
+# response value tree lives in the REQUEST arena and that arena is reset as soon
+# as the response goes out — a detached thread reading it later would be reading
+# reset memory. This pins the rendered bytes, which is the part that has to
+# survive the handoff.
+fn _t_callback_posts_the_response(): i64 {
+    var v = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(v, str_from("task_id"), bayan_json_v_str_new(str_from("t-1")));
+    bayan_json_v_obj_set(v, str_from("status"), bayan_json_v_str_new(str_from("completed")));
+    var rendered = bayan_json_v_build(agnosai_route_body(agnosai_route_json(HTTP_OK, v)));
+    assert(str_len(rendered) > 0, "the response renders to bytes before any thread runs");
+    assert(str_contains_cstr(rendered, "task_id") == 1,
+    "and those bytes are the RESPONSE — the oracle posts {task_id, status, result, error}");
+    assert(str_contains_cstr(rendered, "completed") == 1, "carrying the status");
+
+    # ⚠ **Asserted through a recorder, because the SSRF gate refuses loopback**
+    # so no local listener can observe the wire. Without this seam, reverting the
+    # transport's body arguments to `0, 0` — the exact defect being fixed —
+    # passes every other assertion in this file, which is how it survived.
+    _t_cb_len = 0;
+    _t_cb_url = 0;
+    agnosai_serve_set_callback_transport(&_t_record_callback);
+    agnosai_serve_dispatch_callback(_t_callback_body("https://example.com/cb"),
+    agnosai_route_json(HTTP_OK, v));
+    # The dispatch is a detached thread; wait for it rather than racing it.
+    var spins = 0;
+    while (_t_cb_len == 0 && spins < 20000) { spins = spins + 1; }
+    agnosai_serve_set_callback_transport(0);
+
+    assert(_t_cb_len > 0, "the callback POSTed a NON-EMPTY body");
+    assert_eq(_t_cb_len, str_len(rendered), "of exactly the rendered response's length");
+    assert(_t_cb_url != 0, "to the callback URL");
     return 0;
 }
 
@@ -1640,6 +1695,7 @@ fn main(): i64 {
     _t_options();
     _t_callback_gate();
     _t_callback_dispatch_is_gated();
+    _t_callback_posts_the_response();
     _t_detached_threads_free_their_stacks();
     _t_rate_limit_off_by_default();
     _t_rate_limit_default_is_mounted();

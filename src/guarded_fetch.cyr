@@ -168,6 +168,27 @@ fn agnosai_fetch_resolve_location(base: Str, location): i64 {
 # Returns the final response, 0 if a request failed or the budget ran out, or
 # AGNOSAI_FETCH_BLOCKED if a hop was refused.
 fn agnosai_guarded_fetch(arena, method, url: Str, headers, opts, timeout_ms): i64 {
+    return agnosai_guarded_fetch_body(arena, method, url, headers, opts, timeout_ms, 0, 0);
+}
+
+# `agnosai_guarded_fetch` carrying a request body.
+#
+# ⚠ **Added 2026-08-13 because the A2A callback was POSTing NOTHING.** This
+# function hardcoded `0, 0` for sandhi's body arguments, so
+# `_agnosai_serve_callback_thread` opened a POST to the delegator's callback URL
+# and sent an empty one — the oracle sends the serialized `A2AResponse`
+# (`rust-old/src/server/routes/a2a.rs:157`, `client.post(&url).json(&resp)`).
+# The `AGN_CB_BODY` slot was being written and never read.
+#
+# `body` is a byte pointer with `body_len`; 0/0 means no body, which is what the
+# bare `agnosai_guarded_fetch` passes and what every other caller wants.
+#
+# ⚠ **The body is dropped when a 303 rewrites the method to GET**, per RFC 9110:
+# the redirect target asked for a bodyless GET, and re-sending a JSON payload to
+# it would be both wrong and a way to replay a body at an attacker-chosen URL.
+# 307/308 keep method and body, which is the arm that matters for a callback.
+fn agnosai_guarded_fetch_body(arena, method, url: Str, headers, opts, timeout_ms,
+body, body_len): i64 {
     var current = url;
     var verb = method;
     var hops = 0;
@@ -178,7 +199,8 @@ fn agnosai_guarded_fetch(arena, method, url: Str, headers, opts, timeout_ms): i6
         if (left_ms <= 0) { return 0; }
         sandhi_http_options_total_ms(opts, left_ms);
 
-        var r = sandhi_http_request_auto_a(arena, verb, str_cstr(current), headers, 0, 0, opts);
+        var r = sandhi_http_request_auto_a(arena, verb, str_cstr(current), headers,
+        body, body_len, opts);
         if (r == 0 || sandhi_http_err_kind(r) != SANDHI_OK) { return 0; }
         if (agnosai_fetch_is_redirect(sandhi_http_status(r)) == 0) { return r; }
 
@@ -196,7 +218,11 @@ fn agnosai_guarded_fetch(arena, method, url: Str, headers, opts, timeout_ms): i6
 
         # A 303 turns the next request into a GET, per RFC 9110. Only reachable
         # on the CORS probe here, since the header fetch is already a GET.
-        if (sandhi_http_status(r) == 303) { verb = "GET"; }
+        if (sandhi_http_status(r) == 303) {
+            verb = "GET";
+            body = 0;
+            body_len = 0;
+        }
 
         # This hop's response is finished with — `next` is a fresh copy outside
         # the arena, and nothing else here points into it. Releasing now is what

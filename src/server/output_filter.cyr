@@ -422,14 +422,39 @@ fn agnosai_redact_email(text: Str): i64 {
 # from the prefix to the first whitespace at or after it, clamped to at least
 # just past the prefix — which is what makes `"Bearer "` redact only itself,
 # since its own trailing space is the first whitespace found.
+# Rust's `char::is_whitespace` — the Unicode White_Space property, which is what
+# the oracle's `.find(|c: char| c.is_whitespace())` tests.
+#
+# ⚠ **A four-byte ASCII test is not this.** The port checked only space, tab, LF
+# and CR, so a key followed by a form feed or a non-breaking space found no
+# whitespace at all, fell back to the `pos + plen + 20` ceiling, and — when the
+# key sat within 20 bytes of the end — redacted the REST OF THE RESPONSE along
+# with it. Losing the tail is the visible half; the other half is that the same
+# fallback under-redacts a longer key.
+fn _agnosai_is_unicode_space(cp): i64 {
+    if (cp >= 9 && cp <= 13) { return 1; }
+    if (cp == 32 || cp == 0x85 || cp == 0xA0) { return 1; }
+    if (cp == 0x1680) { return 1; }
+    if (cp >= 0x2000 && cp <= 0x200A) { return 1; }
+    if (cp == 0x2028 || cp == 0x2029) { return 1; }
+    if (cp == 0x202F || cp == 0x205F || cp == 0x3000) { return 1; }
+    return 0;
+}
+
 fn agnosai_output_redact(response: Str): i64 {
     var result = response;
 
     for (var i = 0; i < AGNOSAI_API_KEY_PATTERNS; i = i + 1) {
         var prefix = _agnosai_api_key_prefix(i);
         var plen = str_len(prefix);
-        var guard = 0;
-        while (guard < 1000) {
+        # ⚠ **No iteration cap.** This was `while (guard < 1000)`, which silently
+        # stopped after a thousand replacements of one prefix and left occurrence
+        # 1001 onward — real credentials — verbatim in the response, with nothing
+        # logged. The oracle's loop is `while let Some(pos) = result.find(prefix)`,
+        # unbounded, and it terminates for the same reason this does:
+        # `[REDACTED]` contains no prefix, and `find` returns the FIRST match, so
+        # every iteration strictly advances past text that can never match again.
+        while (1 == 1) {
             var pos = _agnosai_index_of_str(result, prefix);
             if (pos < 0) { break; }
 
@@ -437,11 +462,15 @@ fn agnosai_output_redact(response: Str): i64 {
             var d = str_data(result);
             var token_end = pos + plen + 20;
             if (token_end > len) { token_end = len; }
-            for (var j = pos; j < len; j = j + 1) {
-                var b = load8(d + j) & 255;
-                if (b == 32 || b == 9 || b == 10 || b == 13) {
+            var j = pos;
+            var cp: i64[1];
+            while (j < len) {
+                var used = _uc_decode_utf8(d, j, len, &cp);
+                if (_agnosai_is_unicode_space(load64(&cp)) == 1) {
                     token_end = j;
-                    break;
+                    j = len;
+                } else {
+                    j = j + used;
                 }
             }
             if (token_end < pos + plen) { token_end = pos + plen; }
@@ -451,7 +480,6 @@ fn agnosai_output_redact(response: Str): i64 {
             str_builder_add_cstr(sb, AGNOSAI_REDACTED);
             str_builder_add(sb, str_new(d + token_end, len - token_end));
             result = str_builder_build(sb);
-            guard = guard + 1;
         }
     }
 

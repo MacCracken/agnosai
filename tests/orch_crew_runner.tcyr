@@ -660,6 +660,41 @@ fn main() {
     agnosai_crew_runner_run(agnosai_crew_runner_new(single), &run_err))), 5,
     "concurrency 1 still runs all five — it is a limit, not a cap on the work");
 
+    # ⚠ **A PARALLEL crew must observe the deadline.** Until 2026-08-13 the
+    # cooperative check sat on the sequential and DAG loop heads only, so a
+    # Parallel crew ran to completion however far past its budget it went:
+    # `agnosai_crew_runner_timed_out` stayed 0 and `_agnosai_orch_finish` never
+    # substituted the Failed/empty-results state, reporting the results as if
+    # they had arrived in time.
+    #
+    # A deadline already in the past is the cleanest discriminator — the check
+    # is at the batch head, so it fires before any thread is spawned.
+    var dl_spec = agnosai_crew_new(str_from("deadline-par"));
+    var dl_tasks = vec_new();
+    for (var di = 0; di < 6; di = di + 1) {
+        vec_push(dl_tasks, agnosai_task_new(str_cat(str_from("d-"), str_from_int(di))));
+    }
+    agnosai_crew_with_tasks(dl_spec, dl_tasks);
+    agnosai_crew_with_process(dl_spec, agnosai_process_parallel(2));
+    var dl_runner = agnosai_crew_runner_new(dl_spec);
+    agnosai_crew_runner_set_deadline_ns(dl_runner, 1);
+    var dl_state = agnosai_crew_runner_run(dl_runner, &run_err);
+    assert_eq(agnosai_crew_runner_timed_out(dl_runner), 1,
+    "a PARALLEL crew past its deadline reports timed_out — 0 here is the pre-2026-08-13 bug");
+    assert(vec_len(agnosai_crew_state_results(dl_state)) < 6,
+    "and it stopped early rather than running every task to completion");
+
+    # The same runner with no deadline still runs everything, so the check is a
+    # deadline and not a blanket refusal.
+    var nd_spec = agnosai_crew_new(str_from("no-deadline-par"));
+    agnosai_crew_with_tasks(nd_spec, dl_tasks);
+    agnosai_crew_with_process(nd_spec, agnosai_process_parallel(2));
+    var nd_runner = agnosai_crew_runner_new(nd_spec);
+    assert_eq(vec_len(agnosai_crew_state_results(
+    agnosai_crew_runner_run(nd_runner, &run_err))), 6,
+    "with no deadline a parallel crew still runs all six");
+    assert_eq(agnosai_crew_runner_timed_out(nd_runner), 0, "and does not report a timeout");
+
     # --- test_dag_execution_with_dependencies ---
     var dag_spec = agnosai_crew_new(str_from("dag"));
     var a_task = agnosai_task_new(str_from("A"));

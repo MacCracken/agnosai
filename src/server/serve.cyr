@@ -278,6 +278,23 @@ enum AgnosaiCallbackOff {
     AGN_CALLBACK_SIZE = 16;
 }
 
+# The transport the callback POSTs through — normally `agnosai_guarded_fetch_body`.
+#
+# ⚠ **A seam, for the same reason `agnosai_fetch_package_via` has one.** The
+# SSRF gate refuses loopback, so a test cannot stand up a local listener and
+# watch what arrives; without this, reverting the body arguments to `0, 0` — the
+# exact defect this replaced — passes the entire suite, which is how it survived
+# in the first place. `tests/server_serve.tcyr` swaps in a recorder and asserts
+# the bytes.
+var _agnosai_serve_callback_fp = 0;
+
+# Point the callback transport at `fp`, or at the default when `fp` is 0.
+fn agnosai_serve_set_callback_transport(fp): i64 {
+    if (fp == 0) { fp = &agnosai_guarded_fetch_body; }
+    _agnosai_serve_callback_fp = fp;
+    return 0;
+}
+
 # The thread body. **Fire and forget**: the result is discarded, matching the
 # oracle, which logs a failure or a timeout and changes nothing — the response
 # went out long before.
@@ -288,22 +305,53 @@ enum AgnosaiCallbackOff {
 # dispatch queue, not an inline POST — an inline POST would put a 30-second
 # timeout on the response path.
 fn _agnosai_serve_callback_thread(cb): i64 {
+    if (_agnosai_serve_callback_fp == 0) {
+        _agnosai_serve_callback_fp = &agnosai_guarded_fetch_body;
+    }
     var arena = agnosai_arena_pool_acquire(_AGNOSAI_SERVE_POOL);
     if (arena == 0) { return 0; }
     var opts = sandhi_http_options_new();
-    agnosai_guarded_fetch(arena, str_from("POST"), load64(cb + AGN_CB_URL),
-    0, opts, AGNOSAI_SERVE_CALLBACK_TIMEOUT_MS);
+
+    # ⚠ **`Content-Type: application/json`, and a real body.** Until 2026-08-13
+    # this posted nothing at all: `agnosai_guarded_fetch` hardcoded sandhi's body
+    # arguments to `0, 0`, so the delegating system was woken by an empty POST
+    # and had to re-poll for the result the callback exists to deliver. The
+    # oracle sends the serialized `A2AResponse` (`a2a.rs:157`), which is what
+    # `AGN_CB_BODY` now carries — the slot was written and never read.
+    var headers = sandhi_headers_new();
+    sandhi_headers_add(headers, "Content-Type", "application/json");
+    var payload = load64(cb + AGN_CB_BODY);
+    var r = fncall8(_agnosai_serve_callback_fp, arena, str_from("POST"),
+    load64(cb + AGN_CB_URL), headers, opts, AGNOSAI_SERVE_CALLBACK_TIMEOUT_MS,
+    str_data(payload), str_len(payload));
+
+    # The oracle logs both failure arms and changes nothing else — the response
+    # went out long before this thread ran.
+    if (r == 0 || r == AGNOSAI_FETCH_BLOCKED) {
+        if (sakshi_get_level() >= SK_WARN) {
+            sakshi_log_kv(SK_WARN, "A2A callback failed", 19, "url", 3,
+            str_data(load64(cb + AGN_CB_URL)), str_len(load64(cb + AGN_CB_URL)));
+        }
+    }
     agnosai_arena_pool_release(_AGNOSAI_SERVE_POOL, arena);
     return 0;
 }
 
 # Dispatch a callback if the body asked for one and it passed the gate.
-fn agnosai_serve_dispatch_callback(body: Str): i64 {
+fn agnosai_serve_dispatch_callback(body: Str, resp): i64 {
     var url = agnosai_serve_callback_url(body);
     if (url == 0) { return 0; }
     var cb = alloc(AGN_CALLBACK_SIZE);
     store64(cb + AGN_CB_URL, url);
-    store64(cb + AGN_CB_BODY, body);
+
+    # ⚠ **Rendered HERE, on the global allocator, not in the thread.** The
+    # oracle posts the RESPONSE (`{task_id, status, result, error}`), not the
+    # request that this used to store — but the response is a `bayan_json_v`
+    # tree built in the REQUEST arena, and that arena is reset the moment the
+    # response goes out, long before a detached thread gets to it. Building the
+    # bytes now, while the tree is still alive, is what makes the handoff safe;
+    # `bayan_json_v_build` allocates on the global bump, which outlives both.
+    store64(cb + AGN_CB_BODY, bayan_json_v_build(agnosai_route_body(resp)));
 
     # ✅ **Detached, and it leaks nothing.** This called `thread_create` and never
     # joined, which stranded the whole stack mapping per callback — `thread_join`
@@ -465,7 +513,11 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
             # Not merely a status question. Without it `agnosai_uuid_canonical`
             # answers 0 and `str_clone(0)` faults — an unauthenticated crash
             # from a path segment, found by `_t_sse_transport_gates`.
-            if (agnosai_uuid_is_valid(agnosai_route_match_param(sm)) == 0) {
+            # Case-folded as well as validated, for the same reason the other
+            # three wire-UUID sites are — see `_agnosai_uuid_key_a`. An uppercase
+            # id would otherwise stream an empty history for a crew that exists.
+            var stream_id = _agnosai_uuid_key_a(a, agnosai_route_match_param(sm));
+            if (stream_id == 0) {
                 _agnosai_serve_send(a, cfd,
                 agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
                 str_from("crew id is not a valid UUID")));
@@ -481,8 +533,7 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
                     }
                 } }
             if (ok == 1) {
-                agnosai_sse_crew_stream(_agnosai_serve_state, cfd,
-                agnosai_route_match_param(sm));
+                agnosai_sse_crew_stream(_agnosai_serve_state, cfd, stream_id);
             }
             return 0;
         }
@@ -495,7 +546,7 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
     # the `Ok(crew_state)` arm.
     if (method == AGNOSAI_METHOD_POST && agnosai_route_status(resp) == HTTP_OK) {
         if (str_eq_cstr(path, "/api/v1/a2a/receive") == 1) {
-            agnosai_serve_dispatch_callback(body);
+            agnosai_serve_dispatch_callback(body, resp);
         }
     }
 

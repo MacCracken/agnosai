@@ -5,8 +5,12 @@
 # rust-old/src/tools/wasm_loader.rs (3). One suite because the loader's whole
 # job is to produce the tool, and every loader test needs a module.
 #
-# ⚠ `wasmtime` is not installed here, so nothing EXECUTES. That bounds what can
-# be asserted, not what can be tested: the manifest parse, the serde defaults,
+# ⚠ **`wasmtime` 47.0.3 IS installed as of 2026-08-11, and this suite executes
+# a real module as of 2026-08-13.** The header used to say "nothing EXECUTES";
+# `tests/sandbox_wasm.tcyr` un-gated its own five when wasmtime arrived and this
+# file was not updated with it, so the gate outlived its condition. What the
+# runtime was never needed for — and what the rest of this suite still covers
+# without one — is: the manifest parse, the serde defaults,
 # the `<name>.wasm` resolution, both error policies, the schema and the entire
 # result ladder are all reachable without a runtime — the ladder because it is
 # split out of `execute` and fed stdout as data, which is also how the oracle's
@@ -72,6 +76,63 @@ fn _t_wasm_bytes(): i64 {
     return b;
 }
 
+# A REAL module that writes the SDK's wire format to stdout — 152 bytes.
+#
+# ⚠ **This is the fixture the wasmtime gate was blocking.** Until 2026-08-13
+# this suite's header said "`wasmtime` is not installed here, so nothing
+# EXECUTES", and `_agnosai_wasm_tool_execute` — the adapter that marshals the
+# parameters, runs the module and interprets its stdout — had therefore never
+# run at all. `tests/sandbox_wasm.tcyr` noticed wasmtime arriving on 2026-08-11
+# and un-gated its own five; this file was not updated with it, so the gate
+# outlived the condition by two days.
+#
+# Hand-assembled, because no `.wasm` can be built here (`wat2wasm` and
+# `wasm-tools` are both absent and `rustup target list --installed` has only the
+# host). The layout, section by section:
+#
+#   type    (i32,i32,i32,i32)->i32 for `fd_write`, and ()->() for `_start`
+#   import  `wasi_snapshot_preview1.fd_write` — func 0
+#   func    one, of type 1 — `_start` is func 1
+#   memory  one page
+#   export  `memory` and `_start`, both of which wasmtime requires by name
+#   code    fd_write(1, iovs=0, iovs_len=1, nwritten=40); drop; end
+#   data    at offset 0: the iovec {ptr=8, len=38}, then the JSON at offset 8
+#
+# ⚠ The JSON is `{"result":"hi","success":true}` — the exact shape
+# `sdk/agnosai-tool-sdk` publishes, so this pins the compatibility surface
+# end-to-end rather than by feeding `agnosai_wasm_tool_output_of` a literal.
+# ⚠ `i32.const` takes a **signed** LEB128, so the nwritten pointer is 40 rather
+# than a rounder 64: anything from 64 up needs a second byte and the operand
+# would silently be a different number.
+fn _t_hello_module_bytes(): i64 {
+    var m = alloc(152);
+    store8(m + 0, 0); store8(m + 1, 97); store8(m + 2, 115); store8(m + 3, 109); store8(m + 4, 1); store8(m + 5, 0); store8(m + 6, 0); store8(m + 7, 0);
+    store8(m + 8, 1); store8(m + 9, 12); store8(m + 10, 2); store8(m + 11, 96); store8(m + 12, 4); store8(m + 13, 127); store8(m + 14, 127); store8(m + 15, 127);
+    store8(m + 16, 127); store8(m + 17, 1); store8(m + 18, 127); store8(m + 19, 96); store8(m + 20, 0); store8(m + 21, 0); store8(m + 22, 2); store8(m + 23, 35);
+    store8(m + 24, 1); store8(m + 25, 22); store8(m + 26, 119); store8(m + 27, 97); store8(m + 28, 115); store8(m + 29, 105); store8(m + 30, 95); store8(m + 31, 115);
+    store8(m + 32, 110); store8(m + 33, 97); store8(m + 34, 112); store8(m + 35, 115); store8(m + 36, 104); store8(m + 37, 111); store8(m + 38, 116); store8(m + 39, 95);
+    store8(m + 40, 112); store8(m + 41, 114); store8(m + 42, 101); store8(m + 43, 118); store8(m + 44, 105); store8(m + 45, 101); store8(m + 46, 119); store8(m + 47, 49);
+    store8(m + 48, 8); store8(m + 49, 102); store8(m + 50, 100); store8(m + 51, 95); store8(m + 52, 119); store8(m + 53, 114); store8(m + 54, 105); store8(m + 55, 116);
+    store8(m + 56, 101); store8(m + 57, 0); store8(m + 58, 0); store8(m + 59, 3); store8(m + 60, 2); store8(m + 61, 1); store8(m + 62, 1); store8(m + 63, 5);
+    store8(m + 64, 3); store8(m + 65, 1); store8(m + 66, 0); store8(m + 67, 1); store8(m + 68, 7); store8(m + 69, 19); store8(m + 70, 2); store8(m + 71, 6);
+    store8(m + 72, 109); store8(m + 73, 101); store8(m + 74, 109); store8(m + 75, 111); store8(m + 76, 114); store8(m + 77, 121); store8(m + 78, 2); store8(m + 79, 0);
+    store8(m + 80, 6); store8(m + 81, 95); store8(m + 82, 115); store8(m + 83, 116); store8(m + 84, 97); store8(m + 85, 114); store8(m + 86, 116); store8(m + 87, 0);
+    store8(m + 88, 1); store8(m + 89, 10); store8(m + 90, 15); store8(m + 91, 1); store8(m + 92, 13); store8(m + 93, 0); store8(m + 94, 65); store8(m + 95, 1);
+    store8(m + 96, 65); store8(m + 97, 0); store8(m + 98, 65); store8(m + 99, 1); store8(m + 100, 65); store8(m + 101, 40); store8(m + 102, 16); store8(m + 103, 0);
+    store8(m + 104, 26); store8(m + 105, 11); store8(m + 106, 11); store8(m + 107, 44); store8(m + 108, 1); store8(m + 109, 0); store8(m + 110, 65); store8(m + 111, 0);
+    store8(m + 112, 11); store8(m + 113, 38); store8(m + 114, 8); store8(m + 115, 0); store8(m + 116, 0); store8(m + 117, 0); store8(m + 118, 30); store8(m + 119, 0);
+    store8(m + 120, 0); store8(m + 121, 0); store8(m + 122, 123); store8(m + 123, 34); store8(m + 124, 114); store8(m + 125, 101); store8(m + 126, 115); store8(m + 127, 117);
+    store8(m + 128, 108); store8(m + 129, 116); store8(m + 130, 34); store8(m + 131, 58); store8(m + 132, 34); store8(m + 133, 104); store8(m + 134, 105); store8(m + 135, 34);
+    store8(m + 136, 44); store8(m + 137, 34); store8(m + 138, 115); store8(m + 139, 117); store8(m + 140, 99); store8(m + 141, 99); store8(m + 142, 101); store8(m + 143, 115);
+    store8(m + 144, 115); store8(m + 145, 34); store8(m + 146, 58); store8(m + 147, 116); store8(m + 148, 114); store8(m + 149, 117); store8(m + 150, 101); store8(m + 151, 125);
+    return m;
+}
+
+# Write the executing module at `path`. Returns the byte count written.
+fn _t_write_hello_module(path: Str): i64 {
+    return file_write_all(str_data(path), _t_hello_module_bytes(), 152);
+}
+
 # Write an eight-byte module at `path`.
 fn _t_write_wasm(path: Str): i64 {
     return file_write_all(str_data(path), _t_wasm_bytes(), 8);
@@ -100,6 +161,56 @@ fn _t_out(stdout): i64 {
 fn main(): i64 {
     var err = 0;
     store64(&err, 0);
+
+    # --- the execute path, against a REAL module ---------------------------
+    #
+    # ⚠ **The whole of what the wasmtime gate used to block.** Everything above
+    # reaches `agnosai_wasm_tool_output_of` as DATA — the ladder is split out of
+    # `execute` precisely so it is testable without a runtime. What that leaves
+    # untested is `_agnosai_wasm_tool_execute` itself: the marshalling of the
+    # parameters into `{"parameters": …}`, the call into the sandbox, and the
+    # handing of real captured stdout to the ladder. A mutant anywhere in that
+    # wiring survived every assertion in this file.
+    #
+    # Both arms assert. With no runtime `agnosai_wasm_available()` is 0 and the
+    # adapter must fail cleanly rather than half-work; with one, a real module
+    # must actually run. Same shape as `tests/sandbox_wasm.tcyr`, which un-gated
+    # its own five when wasmtime arrived on 2026-08-11.
+    sys_mkdir(_T_ROOT, 0x1FF);
+    var hp = _t_under("/hello-exec.wasm");
+    assert_eq(_t_write_hello_module(hp), 152, "the executing module is written");
+
+    store64(&err, 0);
+    var hmod = agnosai_wasm_load_module_from_file(agnosai_wasm_tool_sandbox(), hp, &err);
+    assert_neq(hmod, 0, "and loads through the tool's own sandbox");
+    var htool = agnosai_wasm_tool(str_from("hello"), str_from("greets"),
+    _t_sample_params(), hmod);
+    assert_neq(htool, 0, "and builds a tool");
+
+    var hin = agnosai_tool_input_new();
+    agnosai_tool_input_set(hin, str_from("input"), bayan_json_v_str_new(str_from("world")));
+    var hout = agnosai_tool_execute(htool, hin);
+    assert_neq(hout, 0, "executing through the vtable returns an output");
+
+    if (agnosai_wasm_available() == 1) {
+        # The module writes `{"result":"hi","success":true}` — the SDK's exact
+        # wire shape — so this pins the compatibility surface end to end rather
+        # than by feeding the ladder a literal.
+        assert_eq(agnosai_tool_output_success(hout), 1,
+        "a real module ran and its `success` was honoured");
+        var hres = agnosai_tool_output_result(hout);
+        assert_neq(hres, 0, "and carries a result");
+        assert_eq(bayan_json_v_is_str(hres), 1, "which is the `result` field, unwrapped");
+        _t_seq(bayan_json_v_str(hres), str_from("hi"),
+        "and its value came from the guest's stdout, not from this test");
+    } else {
+        # ⚠ Not a skip. With no wasmtime the adapter must report failure and say
+        # so — a success here would mean it invented an output.
+        assert_eq(agnosai_tool_output_success(hout), 0,
+        "with no runtime the adapter FAILS rather than fabricating a result");
+        assert_neq(agnosai_tool_output_error(hout), 0, "and carries an error message");
+    }
+    sys_unlink(str_data(hp));
 
     # --- the manifest parse, and its three field policies ------------------
     var full = agnosai_wasm_pkg_from_json(str_from(
@@ -296,9 +407,10 @@ fn main(): i64 {
     # — its consumers compile to `wasm32-wasip1` — so conformance is the only
     # thing agnosai can owe it, and this is where that is checked.
     #
-    # The `.wasm` beside it is the 8-byte header stub, not a built module:
-    # `wasmtime` is not installed here, so the manifest half is testable and the
-    # execute half is not. That is the whole of what the wasmtime gate blocks.
+    # The `.wasm` beside it is deliberately the 8-byte header stub: this block
+    # checks MANIFEST conformance against the oracle's shipped file, and a stub
+    # is enough for that. The execute half is covered separately, above, by a
+    # real 152-byte module.
     # ⚠ Its OWN root, not under `_T_ROOT`. `load_all_tool_packages` is scanned
     # later in this file with an exact package count, and a third directory there
     # breaks it — which is what the first version of this block did.

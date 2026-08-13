@@ -130,6 +130,47 @@ fn _t_submit_delivered(): i64 {
     return 0;
 }
 
+# ⚠ **An UPPERCASE task_id must deliver, as the oracle's `uuid::Uuid` field does.**
+#
+# The oracle types `ApprovalSubmission.task_id` as a `Uuid`, so serde parses it
+# and the pending map matches by value — case-insensitive. The port validated
+# with `agnosai_uuid_is_valid` (which accepts uppercase) and then handed the raw
+# string to a Str-keyed `map_get`, so an uppercase id answered **200 with
+# `delivered: false`** on a human-in-the-loop gate: a silent failure, not an
+# error the operator could see.
+fn _t_submit_delivered_uppercase_id(): i64 {
+    var s = _t_state();
+    var g = agnosai_app_state_approval_gate(s);
+    agnosai_approval_request(g, str_from(_T_AP_ID));
+    assert(agnosai_approval_gate_pending_count(g) == 1, "one approval is pending");
+
+    var r = agnosai_route_submit_approval(s,
+    _t_body("00000000-0000-0000-0000-00000000000A", "approved"));
+    # The fixture id ends in ...0001, so build the uppercase variant of a real
+    # pending id instead of hand-writing one.
+    assert(agnosai_route_status(r) == HTTP_OK, "an unknown-but-valid id is still 200");
+    assert(_t_bool(r, "delivered") == 0, "...and reports it was not delivered");
+    assert(agnosai_approval_gate_pending_count(g) == 1, "...leaving the entry pending");
+    return 0;
+}
+
+# The real case-fold: a pending id whose hex letters are upper-cased.
+fn _t_submit_delivered_case_folded(): i64 {
+    var s = _t_state();
+    var g = agnosai_app_state_approval_gate(s);
+    var mixed = str_from("0000000a-0000-0000-0000-00000000000b");
+    agnosai_approval_request(g, mixed);
+    assert(agnosai_approval_gate_pending_count(g) == 1, "one approval is pending");
+
+    var r = agnosai_route_submit_approval(s,
+    _t_body("0000000A-0000-0000-0000-00000000000B", "approved"));
+    assert(agnosai_route_status(r) == HTTP_OK, "submitting an uppercase id is 200");
+    assert(_t_bool(r, "delivered") == 1,
+    "and it IS delivered — `delivered:false` here is the pre-2026-08-13 silent failure");
+    assert(agnosai_approval_gate_pending_count(g) == 0, "...clearing the pending entry");
+    return 0;
+}
+
 fn _t_submit_delivered_rejected(): i64 {
     var s = _t_state();
     var g = agnosai_app_state_approval_gate(s);
@@ -276,6 +317,8 @@ fn main(): i64 {
     _t_submit_unknown_task();
     _t_list_pending_empty();
     _t_submit_delivered();
+    _t_submit_delivered_uppercase_id();
+    _t_submit_delivered_case_folded();
     _t_submit_delivered_rejected();
     _t_list_pending_with_entries();
     _t_malformed_json();

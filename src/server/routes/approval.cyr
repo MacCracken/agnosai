@@ -68,8 +68,12 @@ fn agnosai_route_submit_approval_a(a, state, body: Str): i64 {
         return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
         str_from_a(a, "task_id is required and must be a string"));
     }
-    var task_id = bayan_json_v_str(tid_v);
-    if (agnosai_uuid_is_valid(task_id) == 0) {
+    # Case-folded, not merely validated — the oracle types this `uuid::Uuid`, so
+    # serde parses it and the pending map matches by value. Validating alone made
+    # an uppercase task_id answer 200 with `delivered: false` on a
+    # human-in-the-loop gate. `_agnosai_uuid_key_a` carries the reasoning.
+    var task_id = _agnosai_uuid_key_a(a, bayan_json_v_str(tid_v));
+    if (task_id == 0) {
         return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
         str_from_a(a, "task_id is not a valid UUID"));
     }

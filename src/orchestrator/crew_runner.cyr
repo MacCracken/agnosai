@@ -782,12 +782,20 @@ fn agnosai_crew_runner_cancel_flag(r): i64 {
 
 # Set the execution deadline as a monotonic nanosecond timestamp, or 0 for none.
 #
-# ⚠ **This is a COOPERATIVE deadline, checked at the two loop heads that already
-# check cancellation** — not the oracle's `tokio::time::timeout`, which drops the
-# whole `runner.run()` future and so aborts work in flight
+# ⚠ **This is a COOPERATIVE deadline, checked at the loop head of all THREE
+# process modes** — sequential (`:991`), parallel/wave (`:1076`) and DAG
+# (`:1155`) — not the oracle's `tokio::time::timeout`, which drops the whole
+# `runner.run()` future and so aborts work in flight
 # (`rust-old/src/orchestrator/orchestrator.rs:204`). The observable contract
 # matches for a multi-task crew: no task starts after the deadline, and the
 # orchestrator substitutes the same `Failed` state with empty results.
+#
+# ⚠ **Parallel was missed until 2026-08-13.** The comment here used to say "the
+# two loop heads that already check cancellation", and the wave loop checked
+# cancellation per job inside `_agnosai_crew_worker` rather than at its head — so
+# the two were never co-located and Parallel observed no deadline at all.
+# `agnosai_crew_runner_timed_out` stayed 0 and a crew over its
+# `budget.max_duration_secs` reported success.
 #
 # ⚠ **What does NOT match: a single task that hangs forever.** Cyrius has no way
 # to abort a thread mid-syscall, so the check cannot fire until the current task
@@ -1056,8 +1064,24 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
 
     # Batches of `limit`. Every spawned thread is joined before the next batch,
     # so no more than `limit` run at once and none is left detached.
+    #
+    # ⚠ **The deadline is checked HERE, at the batch head.** The oracle's timeout
+    # is a `tokio::time::timeout` wrapping the whole `runner.run()`, so it fires
+    # in every process mode; the port replaced it with a cooperative check at
+    # loop heads and then put that check on only two of the three — sequential
+    # and DAG. A **Parallel** crew therefore never observed
+    # `AGN_CR_DEADLINE_NS`: `agnosai_crew_runner_timed_out` stayed 0, and
+    # `_agnosai_orch_finish` never substituted the Failed/empty-results state, so
+    # a crew that blew through `budget.max_duration_secs` reported its results as
+    # if it had finished in time.
+    #
+    # The batch head is the right granularity: it is where the sequential loop's
+    # equivalent check sits, and a running batch is joined rather than abandoned,
+    # which is the same cooperative contract the module header documents.
     var next = 0;
     while (next < vec_len(jobs)) {
+        if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
+        if (_agnosai_crew_deadline_passed(r) == 1) { break; }
         var threads = vec_new();
         var spawned = 0;
         while (spawned < limit && next < vec_len(jobs)) {
@@ -1078,11 +1102,22 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
     for (var k = 0; k < vec_len(jobs); k = k + 1) {
         var jb = vec_get(jobs, k);
         var res = load64(jb + AGN_CJ_RESULT);
-        agnosai_task_with_status(load64(jb + AGN_CJ_TASK), agnosai_task_result_status(res));
-        if (wants_events == 1) {
-            _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data(res));
+
+        # ⚠ **A job the deadline or a cancellation stopped never ran, so it has
+        # no result — skip it rather than dereferencing 0.** Every job is built
+        # up front here, unlike the sequential path which creates work as it
+        # goes, so breaking out of the batch loop leaves a tail of jobs with
+        # `AGN_CJ_RESULT == 0`. Pushing those would segfault in
+        # `agnosai_task_result_status`; skipping them gives the same observable
+        # shape the sequential break has, which is a short result list.
+        if (res != 0) {
+            agnosai_task_with_status(load64(jb + AGN_CJ_TASK),
+            agnosai_task_result_status(res));
+            if (wants_events == 1) {
+                _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data(res));
+            }
+            vec_push(results, res);
         }
-        vec_push(results, res);
     }
     return results;
 }
