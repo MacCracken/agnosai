@@ -75,10 +75,36 @@ quietly minted per acquire would pass every functional assertion and fix nothing
 failed — the channel is **FIFO, not LIFO**, so a released arena goes to the tail.
 Identity is now checked against a one-slot pool, where the orderings coincide.
 
-**Still open**: `serve.cyr:259` (64 KiB per a2a callback) and
-`load_testing.cyr:114,115` (per user, and its capacity varies with the user
-count) are not yet pooled — both run on threads that cannot reach a shared pool
-built for request-path use, and each needs its own concurrency answer.
+**All five sites are pooled** as of the follow-up below.
+
+### Added — the last two arena sites are pooled
+
+⚠ **My earlier note that these two "cannot reach a request-path pool" was wrong,
+and worth correcting rather than quietly deleting.** The pool is a process-global
+whose channel is mutex-guarded — nothing about it is request-scoped, so a
+detached callback thread or a load-test worker can acquire and release exactly
+like a sandhi worker. The caution cost a round trip and produced nothing.
+
+| site | was | now |
+|---|---|---|
+| `server/serve.cyr` — per a2a callback | 64 KiB + 112 B | pooled, 4 slots |
+| `tools/builtin/load_testing.cyr` — **twice PER USER** | `max_requests*40 + 65536` and 1 MiB | pooled, two pools, 16 slots each |
+
+`load_testing` was the only site whose cost scaled with a caller-supplied number:
+`users` workers x two arenas, none returned. It gets **two** pools because the
+two arenas have different roles, and the persistent one's size varies with the
+user count (`max_requests = 100000 / users`, so ~4 MiB at one user and ~73 KiB at
+500). A pool cannot pick one number for that — and does not need to, because
+pooled arenas are **growable** and converge on what each run actually uses. The
+now-dead size computation is removed; the constants stay as documentation of
+where that convergence lands.
+
+⚠ **Two resources per holder cannot deadlock here** because acquire never blocks:
+a worker that finds either pool empty mints a fallback instead of waiting. That
+is the property the non-blocking design was chosen for.
+
+⚠ `load_testing`'s per-request scratch reset (`:251`) stays a plain `reset_via` —
+only the terminal releases after aggregation return arenas to the pools.
 
 ### Fixed — the a2a callback thread leaked its entire stack mapping
 

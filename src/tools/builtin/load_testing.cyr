@@ -56,6 +56,31 @@ var AGNOSAI_LT_MAX_DURATION_SECS = 300;
 # default request cap is 64 KiB.
 var AGNOSAI_LT_SCRATCH_BYTES = 1048576;
 
+# Pools for the worker's two arenas. See `src/arena_pool.cyr`.
+#
+# ⚠ **Was `arena_allocator(...)` twice PER USER**, in the spawn loop — the only
+# one of the five sites whose cost scaled with a caller-supplied number. Neither
+# was ever returned.
+#
+# **Two pools, because the two arenas have different roles and sizes.** The
+# persistent one holds every latency for the run and is sized
+# `max_requests * 40 + slack`, which VARIES with the user count
+# (`max_requests = 100000 / users`): ~4 MiB at one user, ~73 KiB at 500. A pool
+# cannot pick one number for that — but it does not need to, because pooled
+# arenas are **growable** and converge on whatever each run actually needs. The
+# initial size below is the floor, not the ceiling.
+#
+# **16 slots each.** A worker holds BOTH for the whole run, so a 16-user run is
+# served entirely from the pools and anything larger falls back — which is
+# correct behaviour, not degradation. ⚠ Sizing them equally matters: two pools
+# drawn in a fixed order by every worker cannot deadlock, because acquire never
+# blocks. That is the property that makes two-resource-per-holder safe here.
+var _AGNOSAI_LT_POOL_SLOTS = 16;
+var _AGNOSAI_LT_PERSISTENT_POOL = agnosai_arena_pool_new(_AGNOSAI_LT_POOL_SLOTS,
+AGNOSAI_LT_SCRATCH_BYTES);
+var _AGNOSAI_LT_SCRATCH_POOL = agnosai_arena_pool_new(_AGNOSAI_LT_POOL_SLOTS,
+AGNOSAI_LT_SCRATCH_BYTES);
+
 # Slack on the persistent arena, over and above the latency vector.
 var AGNOSAI_LT_PERSISTENT_SLACK = 65536;
 
@@ -106,13 +131,18 @@ enum AgnosaiLtResultOff {
 fn agnosai_lt_worker_new(url: Str, deadline_ns, max_requests, executor_fp, worker_id): i64 {
     var w = alloc(AGN_LT_SIZE);
 
-    # arena_allocator, NOT arena_new: the `_a` family takes an Allocator
-    # vtable, and arena_new returns the bare {base, ptr, end} struct — passing
-    # that to alloc_via dereferences it as a vtable and segfaults.
-    var persistent_bytes = max_requests * AGNOSAI_LT_PERSISTENT_PER_REQUEST
-    + AGNOSAI_LT_PERSISTENT_SLACK;
-    var arena = arena_allocator(persistent_bytes);
-    var scratch = arena_allocator(AGNOSAI_LT_SCRATCH_BYTES);
+    # Both arenas come from pools now, so nothing here computes a size: a pooled
+    # arena is GROWABLE and converges on what the run actually needs. The old
+    # `max_requests * AGNOSAI_LT_PERSISTENT_PER_REQUEST + AGNOSAI_LT_PERSISTENT_SLACK`
+    # is what that convergence lands near, and the constants are kept for that
+    # reason — but computing it here would be dead arithmetic.
+    #
+    # (The prior note about `arena_allocator` vs `arena_new` still holds for
+    # anyone reaching for the raw form: the `_a` family takes an Allocator
+    # vtable, and `arena_new` returns the bare struct — passing that to
+    # `alloc_via` dereferences it as a vtable and segfaults.)
+    var arena = agnosai_arena_pool_acquire(_AGNOSAI_LT_PERSISTENT_POOL);
+    var scratch = agnosai_arena_pool_acquire(_AGNOSAI_LT_SCRATCH_POOL);
     if (arena == 0 || scratch == 0) { return 0; }
 
     store64(w + AGN_LT_URL, url);
@@ -477,8 +507,10 @@ fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
     # into one, because agnosai_lt_aggregate copies each latency and status
     # count into globally-allocated structures.
     for (var k = 0; k < vec_len(workers); k = k + 1) {
-        reset_via(load64(vec_get(workers, k) + AGN_LT_ARENA));
-        reset_via(load64(vec_get(workers, k) + AGN_LT_SCRATCH));
+        agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL,
+        load64(vec_get(workers, k) + AGN_LT_ARENA));
+        agnosai_arena_pool_release(_AGNOSAI_LT_SCRATCH_POOL,
+        load64(vec_get(workers, k) + AGN_LT_SCRATCH));
     }
     return result;
 }

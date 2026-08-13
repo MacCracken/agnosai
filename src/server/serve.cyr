@@ -55,6 +55,25 @@
 # against sandhi's own 64 KiB default request cap.
 var AGNOSAI_SERVE_ARENA_BYTES = 65536;
 
+# Pool for the a2a callback arena. See `src/arena_pool.cyr`.
+#
+# ⚠ **Was `arena_allocator(AGNOSAI_SERVE_ARENA_BYTES)` per callback** — 64 KiB +
+# 112 bytes on the no-free global bump, never returned. Small next to the 2 MiB
+# thread stack that used to leak alongside it (fixed separately with
+# `thread_create_detached`), but unbounded all the same.
+#
+# **4 slots.** A callback fires once per *delegation*, not per request, and the
+# thread is detached — so the concurrency here is low and bursty, which is
+# exactly the shape the fallback path covers without pinning memory.
+#
+# ⚠ Reached from a DETACHED thread, which is fine: the pool is a global whose
+# channel is mutex-guarded, so any thread may acquire and release. The earlier
+# note claiming these thread-spawning sites "cannot reach a request-path pool"
+# was over-cautious and wrong — nothing about the pool is request-scoped.
+var _AGNOSAI_SERVE_ARENA_SLOTS = 4;
+var _AGNOSAI_SERVE_POOL = agnosai_arena_pool_new(_AGNOSAI_SERVE_ARENA_SLOTS,
+AGNOSAI_SERVE_ARENA_BYTES);
+
 # --- The arena must not be a cliff ----------------------------------------
 
 # An arena allocator that **spills to the global allocator instead of answering
@@ -256,12 +275,12 @@ enum AgnosaiCallbackOff {
 # dispatch queue, not an inline POST — an inline POST would put a 30-second
 # timeout on the response path.
 fn _agnosai_serve_callback_thread(cb): i64 {
-    var arena = arena_allocator(AGNOSAI_SERVE_ARENA_BYTES);
+    var arena = agnosai_arena_pool_acquire(_AGNOSAI_SERVE_POOL);
     if (arena == 0) { return 0; }
     var opts = sandhi_http_options_new();
     agnosai_guarded_fetch(arena, str_from("POST"), load64(cb + AGN_CB_URL),
     0, opts, AGNOSAI_SERVE_CALLBACK_TIMEOUT_MS);
-    reset_via(arena);
+    agnosai_arena_pool_release(_AGNOSAI_SERVE_POOL, arena);
     return 0;
 }
 

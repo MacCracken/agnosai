@@ -265,31 +265,37 @@ monotonically — the correction is to the magnitude, not to the defect.
    either its own short-lived `str_builder_new_a` + `str_builder_add_a`, or an
    upstream `putc_a` filing.
 
-2. 🟡 **PARTLY FIXED 2026-08-12 — three of five sites pooled via the new
-   `src/arena_pool.cyr`.** `arena_allocator(n)` charges the no-free global bump
-   `n + 112` bytes per call and `reset_via` returns none of it.
+2. ✅ **FIXED — all five sites pooled via `src/arena_pool.cyr`.**
+   `arena_allocator(n)` charges the no-free global bump `n + 112` bytes per call
+   and `reset_via` returns none of it.
 
    | site | was | now |
    |---|---|---|
    | `tools/agnos.cyr` — every outbound HTTP request | **5,242,992 B** | ✅ **0**, 8 slots |
    | `tools/remote_registry.cyr` — per package fetch | 12 MiB + 112 B | ✅ pooled, 2 slots |
    | `tools/builtin/security_audit.cyr` — per audit | 2.5 MiB + 112 B | ✅ pooled, 4 slots |
-   | `server/serve.cyr:259` — per a2a callback | 64 KiB | 🔴 open |
-   | `tools/builtin/load_testing.cyr:114,115` — per USER | 1 MiB + persistent | 🔴 open |
+   | `server/serve.cyr` — per a2a callback | 64 KiB + 112 B | ✅ pooled, 4 slots |
+   | `tools/builtin/load_testing.cyr` — **twice PER USER** | varies + 1 MiB | ✅ two pools, 16 slots each |
 
    Measured on the agnos path: **0 bytes per exchange** against 5,242,992 before,
-   over 32 cycles, 8 arenas minted, **0 fallbacks**.
+   over 32 cycles, 8 arenas minted, 0 fallbacks.
 
-   ⚠ **The two open sites run on threads that cannot reach a request-path pool**,
-   and each needs its own concurrency answer — `load_testing` holds TWO arenas per
-   worker and sizes its persistent one from the user count
-   (`max_requests * 40 + 65536`, ~4 MiB at 1 user, ~73 KiB at 500).
+   ⚠ **A note here previously claimed the two thread-spawning sites "cannot reach
+   a request-path pool". That was WRONG** — the pool is a process-global whose
+   channel is mutex-guarded, so a detached callback thread or a load-test worker
+   uses it exactly like a sandhi worker. Nothing about it is request-scoped.
 
-   The design, the three rejected alternatives (thread-local, sandhi's request
-   arena, one shared arena under a mutex) and the reasons are in
-   `src/arena_pool.cyr`'s header. The escape analysis that made a pool the right
-   shape — **nothing escapes any of the five sites** — is what rules the
-   lifetime-oriented fixes out.
+   ⚠ `load_testing` holds **two** arenas per worker and gets two pools, because
+   the persistent one's size varies with the user count
+   (`max_requests = 100000 / users`: ~4 MiB at one user, ~73 KiB at 500). Pooled
+   arenas are **growable**, so no single number is needed — they converge. Two
+   resources per holder cannot deadlock because **acquire never blocks**; an empty
+   pool mints a fallback.
+
+   The design and the three rejected alternatives (thread-local, sandhi's request
+   arena, one shared arena under a mutex) are in `src/arena_pool.cyr`'s header.
+   The escape analysis that made a pool the right shape — **nothing escapes any
+   of the five sites** — is what rules the lifetime-oriented fixes out.
 
 3. ✅ **FIXED 2026-08-12 — in the MATCHER, not just the assertion.** The capture
    is deferred to a confirmed full match: **64 B → 48 B per parameterised
