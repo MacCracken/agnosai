@@ -55,7 +55,23 @@ jobs:
         #
         # If the committed lock disagrees with a clean tag-only resolution, the
         # tags no longer name what anyone is actually building. Fail loudly.
-        run: git diff --exit-code -- cyrius.lock
+        #
+        # ⚠ This fails whenever someone committed a lock produced LOCALLY, because
+        # the path overrides win there and no commit pins get written. It is not a
+        # flaky step — it is the step working. The fix is always the same, so say
+        # so rather than leaving a bare diff.
+        run: |
+          if ! git diff --exit-code -- cyrius.lock; then
+            echo
+            echo "::error::cyrius.lock is not a clean tag-only resolution."
+            echo "The committed lock was produced with the 'path = \"../NAME\"' sibling"
+            echo "overrides in effect, so it carries no commit pins. Any local"
+            echo "'cyrius deps' / 'cyrius build' / 'cyrius tests' rewrites it that way."
+            echo
+            echo "Fix, as the LAST step before committing (after all building/testing):"
+            echo "    ./scripts/lock-refresh.sh && git add cyrius.lock"
+            exit 1
+          fi
 
       - name: Symbol check
         # Cyrius has ONE flat namespace and last-definition-wins. The compiler
