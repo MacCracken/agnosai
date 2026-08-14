@@ -29,16 +29,35 @@ and with leftover state — because tmpfs takes the `-EINVAL` path. Pointing the
 suite's root at an ext4 path reproduced it on the first attempt: old code
 exit 139 (signal 11), fixed code 82 passed / 0 failed.
 
-### Fixed — a malformed ZIP member wrote one byte before its buffer
+### Fixed — a >=2 GiB definition file crashed the whole-file reader
 
-**definitions/packaging** — the same shape as the defect above, found by
-sweeping for it. `_agnosai_pkg_read_member` took its length from
-`zip_entry_size`, which answers **-1** when the entry is unreachable, and
-checked only the upper bound: `-1 > 1 MiB` is false, so `alloc(size + 1)`
-became `alloc(0)` and `store8(buf + size, 0)` wrote at `buf - 1` — heap
-corruption rather than a reported error, on a path that parses **caller-supplied
-archives**. The negative arm is now rejected as `Io`, and the allocation is
-checked before it is written through.
+**definitions/loader** — the *reachable* instance of the class above, and the
+one the first sweep missed. `_agnosai_loader_read` wrote through
+`alloc(size + 1)` without checking it. `alloc` fails closed above `ALLOC_MAX`
+(2 GiB) and returns 0, so `store8(buf + size, 0)` wrote at address `size` —
+unmapped — for a SIGSEGV. **No privilege needed**: any regular file of
+2147483648 bytes or more, and `agnosai_load_from_file` reads *before* it checks
+the extension, so the filename need not even look loadable. The same line
+faulted for an ordinary-sized file whenever the backing mmap failed. This is the
+third of the tree's three whole-file readers; the other two were hardened first
+and this one was missed in that same commit, while its comment block was open.
+
+### Hardened — allocation guards in `definitions/packaging`
+
+`_agnosai_pkg_read_member` now rejects a negative `zip_entry_size` and checks
+its allocation, and `agnosai_package_export` checks the buffer it hands to
+`zip_writer_init`, which validates `dst_cap` but never null-checks `dst`.
+
+⚠ **Correction to an earlier draft of this entry**, which claimed the negative
+arm was a live heap-corruption bug on a caller-supplied path. It is not: both
+call sites take their index from `_agnosai_pkg_find_last`, which returns either
+-1 — rejected before the call — or an index already bounded by `zip_count(z)`,
+the same field `_zip_ent` bounds against, so `zip_entry_size` cannot answer -1
+there. The guard is defensive. The mechanism was also mis-stated: `alloc(0)`
+returns 0, so an unguarded -1 would store at address -1, not one byte before a
+buffer. The out-of-memory detail no longer renders through
+`_agnosai_pkg_zip_detail` either — that printed "sankoch error 12", which is
+`ERR_UNSAFE_PATH`, the code this module emits for a real zip-slip refusal.
 
 ### Fixed — the CI per-suite bisect reported every failure as "exit 0"
 

@@ -340,8 +340,17 @@ fn agnosai_package_export(p, out_bytes, out_len): i64 {
         return agnosai_error_other(str_cat(str_from("zip error: duplicate filename: "), dup));
     }
 
+    # ⚠ The destination is checked before it is handed over. `zip_writer_init`
+    # validates `dst_cap` (`lib/sankoch.cyr:14911` rejects < 22) but never
+    # null-checks `dst`, so a failed `alloc` — `cap` over ALLOC_MAX, or a
+    # backing mmap failure — would have the writer store into low addresses
+    # rather than report anything.
     var cap = _agnosai_pkg_bound(members);
-    return _agnosai_pkg_export_into(members, alloc(cap), cap, out_bytes, out_len);
+    var dst = alloc(cap);
+    if (dst == 0) {
+        return agnosai_error_other(str_from("zip error: out of memory building archive"));
+    }
+    return _agnosai_pkg_export_into(members, dst, cap, out_bytes, out_len);
 }
 
 # Export to a file on disk — the oracle's `export_to_file`.
@@ -441,15 +450,23 @@ fn _agnosai_pkg_is_definition_member(name): i64 {
 # which the oracle spells `{name} exceeds 1 MiB size limit`.
 fn _agnosai_pkg_read_member(z, i, what: Str, out_err): Str {
     var size = zip_entry_size(z, i);
-    # ⚠ **The NEGATIVE arm is checked, and it is not theoretical.**
-    # `zip_entry_size` answers **-1** when `_zip_ent` cannot reach entry `i`
-    # (`lib/sankoch.cyr`), and `-1 > AGNOSAI_PKG_MAX_FILE_SIZE` is *false*, so
-    # the cap below waves it through: `alloc(size + 1)` becomes `alloc(0)` and
-    # `store8(buf + size, 0)` writes ONE BYTE BEFORE the buffer — heap
-    # corruption rather than an honest error, on a path that parses archives
-    # supplied by a caller. Found alongside the ext4 `lseek` segfault in
-    # `durable_state`; it is the same shape, a kernel/library size trusted
-    # straight into an allocation.
+    # The NEGATIVE arm is **defensive, not a live bug** — stated precisely
+    # because the first version of this comment claimed otherwise and was wrong.
+    #
+    # `zip_entry_size` answers -1 when `_zip_ent` cannot reach entry `i`
+    # (`lib/sankoch.cyr:14525`), and `-1 > AGNOSAI_PKG_MAX_FILE_SIZE` is false,
+    # so the cap below would wave it through. But **neither call site can
+    # produce it**: both indices come from `_agnosai_pkg_find_last`, which
+    # returns either -1 — rejected by the caller before it gets here — or an
+    # index already bounded by `zip_count(z)`, which is the very field
+    # `_zip_ent` bounds against. The guard costs one compare and holds the
+    # invariant if a future caller ever indexes differently.
+    #
+    # For the record, since the earlier claim also mis-described the mechanism:
+    # `alloc(0)` returns 0 (`lib/alloc.cyr:224`), so an unguarded -1 would make
+    # `store8(buf + size, 0)` write at address -1, not "one byte before the
+    # buffer". The reachable instance of this class is in
+    # `definitions/loader.cyr`, where a >=2 GiB file makes `alloc` return 0.
     if (size < 0) {
         store64(out_err,
         agnosai_error_io(_agnosai_pkg_zip_detail("unreadable archive member", size)));
@@ -462,10 +479,16 @@ fn _agnosai_pkg_read_member(z, i, what: Str, out_err): Str {
     }
 
     # One spare byte so the payload is NUL-terminated and usable as a cstring.
+    # ⚠ Not `_agnosai_pkg_zip_detail` — that helper renders "sankoch error N",
+    # and this is not a sankoch failure. Passing -12 through it printed
+    # "sankoch error 12", which is **`ERR_UNSAFE_PATH`** (`lib/sankoch.cyr:37`),
+    # the code this same module already emits for a genuine zip-slip refusal.
+    # An out-of-memory report that reads as a path-traversal refusal is worse
+    # than no detail at all.
     var buf = alloc(size + 1);
     if (buf == 0) {
-        store64(out_err,
-        agnosai_error_io(_agnosai_pkg_zip_detail("allocation failed", 0 - 12)));
+        store64(out_err, agnosai_error_io(str_cat(what,
+        str_from(": out of memory reading archive member"))));
         return 0;
     }
     store8(buf + size, 0);

@@ -147,20 +147,27 @@ fn _agnosai_loader_io_detail(op, path: Str, errn): Str {
 # silently at its cap. An empty file is a valid empty Str.
 #
 # ⚠ The directory check is FIRST, before the open, and that placement is the
-# point rather than an ordering preference. Put it where it reads more
-# naturally — after the seek — and it never fires on
-# Linux or macOS, where `lseek(SEEK_END)` on a directory fd *succeeds* and
-# returns a size; the error only surfaces from the `read` below, as -EISDIR. On
-# agnos it fires even earlier, at the open, because that kernel refuses a
-# non-regular inode without `AO_DIRECTORY` — so the same input yields three
-# different errno paths across three targets. Hoisting it makes EISDIR the
-# answer everywhere, at the cost of one extra `is_dir` per direct read.
+# point rather than an ordering preference. Put it where it reads more naturally
+# — after the seek — and what it does next is **filesystem-dependent, not
+# OS-dependent**, which is the trap:
 #
-# `durable_state`'s `_agnosai_read_file_exact` used to be the counter-example
-# here, checking after the seek. It reached `main` that way and segfaulted on
-# CI: ext4 answers `lseek(SEEK_END)` on a directory with **i64 MAX**, not the
-# -EINVAL a tmpfs /tmp gives a dev box, so the late check never fired and the
-# size ended up as a wild `store8`. It now hoists the check exactly as this does.
+#   * **ext4**: `lseek(SEEK_END)` on a directory fd SUCCEEDS and returns **i64
+#     MAX** (measured: 9223372036854775807). A late check never fires at all,
+#     and the size flows on into the allocation below.
+#   * **tmpfs**: the same call fails `-EINVAL`, so a late check *does* fire —
+#     which is exactly why this never showed up on a dev box, whose `/tmp` is
+#     tmpfs, while a GitHub runner's `/tmp` is ext4.
+#   * **agnos**: it fires earlier still, at the open, because that kernel
+#     refuses a non-regular inode without `AO_DIRECTORY`.
+#
+# So the same input yields three different paths across three targets, and two
+# of them are the same OS. Hoisting makes EISDIR the answer everywhere, at the
+# cost of one extra `is_dir` per direct read.
+#
+# `durable_state`'s `_agnosai_read_file_exact` was the counter-example, checking
+# after the seek. It reached `main` that way and **segfaulted on CI only**: the
+# i64 MAX above made `alloc(size + 1)` overflow negative and return 0, and
+# `store8(buf + size, 0)` wrote at 2^63-1. It now hoists the check as this does.
 #
 # No UTF-8 validation. std's `read_to_string` rejects invalid UTF-8 with
 # `InvalidData`; the bytes here flow straight into a parser that will reject
@@ -197,7 +204,29 @@ fn _agnosai_loader_read(path: Str, out_err): Str {
     }
 
     # One spare byte so the payload is NUL-terminated and usable as a cstring.
+    #
+    # ⚠ **The allocation is checked before it is written through**, and this one
+    # is REACHABLE rather than defensive. `alloc` fails closed above
+    # `ALLOC_MAX` — 2 GiB (`lib/alloc.cyr:174`, enforced at :225) — and returns
+    # 0. Unchecked, `store8(buf + size, 0)` then writes at address `size`, which
+    # for a 2 GiB file is unmapped: SIGSEGV. Any regular file of 2147483648
+    # bytes or more does it, no privilege needed, and
+    # `agnosai_load_from_file` reads BEFORE it checks the extension, so the
+    # filename does not even have to look loadable. The same line also faults
+    # for an ordinary-sized file whenever the backing mmap fails
+    # (`lib/alloc.cyr:236` returns 0 for that too).
+    #
+    # This is the THIRD whole-file reader in the tree. The other two —
+    # `durable_state`'s `_agnosai_read_file_exact` and `packaging`'s
+    # `_agnosai_pkg_read_member` — were hardened first, and this one was missed
+    # in that same commit even though its comment block was being edited.
     var buf = alloc(size + 1);
+    if (buf == 0) {
+        file_close(fd);
+        _agnosai_loader_set_err(out_err,
+        agnosai_error_io(_agnosai_loader_io_detail("allocate", path, 0 - 12)));
+        return 0;
+    }
     store8(buf + size, 0);
 
     var total = 0;
