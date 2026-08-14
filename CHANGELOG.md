@@ -287,6 +287,16 @@ review as the code it replaces.
   leaking one request's outcome into another's response. Replaced with
   `agnosai_run_security_audit_err(url, out_kind)` and a stack local.
 
+### Fixed — a flaky test that only failed in the full sweep
+
+The A2A callback test waited on the detached thread with a fixed spin count
+(`spins < 20000`). That passed whenever the suite ran alone and **failed in the
+99-suite sweep**, reading a body the thread had not written yet — a busy spin
+also starves the thread it is waiting for. Now a `sleep_ms` loop with a
+two-second wall-clock bound, asserting the bound was not hit so a genuine hang
+still fails. ⚠ 8 synthetic spinners did not reproduce it; the fix stands on
+iterations not being a duration, not on a repro.
+
 ### Changed
 
 - **`[deps.kavach]` 3.11.11 -> 3.11.12** — closes the *memory* half of ADR 019's

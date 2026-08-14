@@ -397,10 +397,23 @@ fn _t_callback_posts_the_response(): i64 {
     agnosai_serve_set_callback_transport(&_t_record_callback);
     agnosai_serve_dispatch_callback(_t_callback_body("https://example.com/cb"),
     agnosai_route_json(HTTP_OK, v));
-    # The dispatch is a detached thread; wait for it rather than racing it.
-    var spins = 0;
-    while (_t_cb_len == 0 && spins < 20000) { spins = spins + 1; }
+    # ⚠ **Wait on the CLOCK, not on a spin count.** This was
+    # `while (_t_cb_len == 0 && spins < 20000) { spins = spins + 1; }`, which
+    # passed when the suite ran alone and FAILED in a full sweep: a fixed number
+    # of iterations is not a duration, so under load the detached thread had not
+    # run yet and the assertions read a body that had not been written. A busy
+    # spin also starves the very thread it is waiting for on a loaded box.
+    #
+    # Two seconds is far beyond what a thread needs to reach a recorder that
+    # touches no I/O, and the loop exits the instant the body lands, so the
+    # common case is still microseconds.
+    var waited_ms = 0;
+    while (_t_cb_len == 0 && waited_ms < 2000) {
+        sleep_ms(1);
+        waited_ms = waited_ms + 1;
+    }
     agnosai_serve_set_callback_transport(0);
+    assert(waited_ms < 2000, "the callback thread ran within two seconds");
 
     assert(_t_cb_len > 0, "the callback POSTed a NON-EMPTY body");
     assert_eq(_t_cb_len, str_len(rendered), "of exactly the rendered response's length");

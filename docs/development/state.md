@@ -402,6 +402,21 @@ mutation-verified (breaking it reports `got 15, expected 0`).
 The 64 KiB arena at `serve.cyr:259` is a separate matter and still open — it is
 one of the five sites in the arena-pool bite above.
 
+### ⚠ A spin count is not a duration — never wait on iterations
+
+2026-08-13. A test waiting on a detached callback thread used
+`while (flag == 0 && spins < 20000) { spins = spins + 1; }`. It passed every
+time the suite ran alone and **failed in the full 99-suite sweep**, where the
+thread had not run yet and the assertions read a body nobody had written. A busy
+spin also starves the very thread it waits for on a loaded box.
+
+Wait on the **clock** (`sleep_ms` in a loop with a generous wall-clock bound) and
+assert you did not hit the bound, so a real hang still fails rather than passing
+silently. ⚠ Note the honest limit of the verification: 8 synthetic spinners did
+**not** reproduce the flake — a full sweep interleaves compiling and running 99
+binaries, which is a different environment. The fix is right because iterations
+are not time, not because a repro was produced.
+
 ### ⚠ A FIX is a change, and earns the same review as the code it replaces
 
 A second adversarial review of the first review's 22 fixes found **five more
