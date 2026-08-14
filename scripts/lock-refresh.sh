@@ -9,8 +9,14 @@
 # `cyrius deps` writes a lock with **no commit pins**, while a CI runner (which
 # has no siblings) resolves from the tags and writes one **with** them.
 #
-# CI's "Lockfile is honest" step is `git diff --exit-code -- cyrius.lock`. A
-# path-shaped lock therefore fails it every time.
+# CI's "Lockfile is honest" step compares the committed lock against that clean
+# resolution, so a path-shaped lock fails it every time.
+#
+# ⚠ The comparison is SORTED. `cyrius deps` writes the hash lines in
+# filesystem-iteration order, which differs between machines — the same files,
+# shuffled — so a byte-for-byte diff could never pass from another host. Do not
+# "fix" a CI lock failure by sorting this file's output; the ordering is already
+# normalised on both sides, and a failure there means the CONTENT differs.
 #
 # ⚠ **Any cyrius invocation that resolves deps rewrites the lock** — not just
 # `cyrius deps`, but a bare `cyrius build`, `cyrius tests`, even

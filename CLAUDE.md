@@ -149,18 +149,25 @@ to **0**. That is how a path-shaped lock reached `main` and broke CI on
 2026-08-13.
 
 **So refreshing the lock is the LAST thing before a commit, after all building
-and testing is done:**
+and testing is done — and there is a script for it:**
 
 ```sh
-sed -i '/^path = "\.\.\//d' cyrius.cyml   # drop the sibling overrides
-cyrius deps                                # resolves git+tag, writes commit pins
-git checkout cyrius.cyml                   # put the overrides back
-grep -c '^commit' cyrius.lock              # expect 8 — never 0
+./scripts/lock-refresh.sh        # expects 8 commit pins; fails loudly at 0
+git add cyrius.lock
 ```
 
-Then commit `cyrius.lock` **without running `cyrius deps` or a bare
-`cyrius build` again**. If you must build after refreshing, restore the lock
-from `git` before committing, or pass `--no-deps`.
+It holds the `path` overrides aside, resolves tag-only, restores the manifest
+from a backup, and **refuses to run while `cycc` is alive** — a concurrent build
+rewrites the lock underneath it and makes the script look non-deterministic when
+it is not.
+
+Then commit **without running `cyrius deps` or a bare `cyrius build` again**.
+
+⚠ **Do NOT try to fix a CI lock failure by reordering the file.** `cyrius deps`
+writes the hash lines in filesystem-iteration order, which differs per machine;
+CI normalises that by comparing **sorted**. A failure there means the CONTENT
+differs — a changed hash, a missing commit pin, a dep resolved from a path
+instead of its tag.
 
 ## DO NOT
 

@@ -46,32 +46,40 @@ jobs:
         run: cyrius deps
 
       - name: Lockfile is honest
-        # `cyrius deps` here resolves every [deps.NAME] from `git` + `tag`,
+        # `cyrius deps` above resolved every [deps.NAME] from `git` + `tag`,
         # because a runner has none of the sibling checkouts that `path =
         # "../NAME"` points at locally. A developer who DOES have them builds
         # against the path, which WINS over the tag — so the two can silently
         # diverge, and on 2026-08-03 they had: lib/kavach.cyr was 3.11.0 locally
         # while cyrius.cyml pinned 3.9.3, which is what this job was compiling.
         #
-        # If the committed lock disagrees with a clean tag-only resolution, the
-        # tags no longer name what anyone is actually building. Fail loudly.
+        # ⚠ **Compared SORTED, not byte-for-byte.** `cyrius deps` writes the
+        # hash lines in resolution order, which is filesystem-iteration order and
+        # therefore differs between machines — the same 113 files, shuffled. A
+        # plain `git diff --exit-code` fails on that shuffle alone and can never
+        # pass from a different host, which is what it did on 2026-08-14: every
+        # commit pin and every hash matched, only the line order moved.
         #
-        # ⚠ This fails whenever someone committed a lock produced LOCALLY, because
-        # the path overrides win there and no commit pins get written. It is not a
-        # flaky step — it is the step working. The fix is always the same, so say
-        # so rather than leaving a bare diff.
+        # Sorting costs nothing and keeps the whole guarantee: a changed hash, a
+        # changed/missing commit pin, or an added/removed file all still fail.
         run: |
-          if ! git diff --exit-code -- cyrius.lock; then
+          set -o pipefail
+          git show HEAD:cyrius.lock | sort > /tmp/lock.committed
+          sort cyrius.lock > /tmp/lock.fresh
+          if ! diff -u /tmp/lock.committed /tmp/lock.fresh; then
             echo
-            echo "::error::cyrius.lock is not a clean tag-only resolution."
-            echo "The committed lock was produced with the 'path = \"../NAME\"' sibling"
-            echo "overrides in effect, so it carries no commit pins. Any local"
-            echo "'cyrius deps' / 'cyrius build' / 'cyrius tests' rewrites it that way."
+            echo "::error::cyrius.lock does not match a clean tag-only resolution."
+            echo "The diff above is CONTENT, not ordering — ordering is normalised."
+            echo
+            echo "Most likely the lock was committed after a local build: the"
+            echo "'path = \"../NAME\"' overrides win locally, so no commit pins get"
+            echo "written. Any 'cyrius deps' / 'cyrius build' / 'cyrius tests' does it."
             echo
             echo "Fix, as the LAST step before committing (after all building/testing):"
             echo "    ./scripts/lock-refresh.sh && git add cyrius.lock"
             exit 1
           fi
+          echo "Lockfile matches a clean tag-only resolution ($(grep -c '^commit' cyrius.lock) commit pins)."
 
       - name: Symbol check
         # Cyrius has ONE flat namespace and last-definition-wins. The compiler
