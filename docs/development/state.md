@@ -133,8 +133,8 @@ because each version read only direct siblings.
 | **majra** | **2.6.5** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.6.4. **258 assertions** (198 core + 43 backends + 17 patra_queue). **2.6.5** closes both relay divergences agnosai carried as "owed to majra": `capacity` was accepted and discarded (`relay_subscribe` hardcoded `chan_new(256)`, so 4 and 4096 behaved identically) and the message timestamp was `CLOCK_MONOTONIC` where the oracle stamps `DateTime<Utc>` — meaningless once a message leaves the emitting process. New `relay_with_capacity` / `relay_capacity` / `relay_msg_timestamp`; struct 96 -> 104, appended. ⚠ **The first cut FAILED CI**: it used the stdlib's `clock_epoch_ns`, which lives in `chrono` and is not prepended by the `--no-deps` build CI runs — see the `--no-deps` lesson above. Fixed with majra's own `time_epoch_ns`. **2.6.4** fixed a rate limiter that refused nothing: both limiters stored the caller's key pointer by reference, so a key built per request minted a fresh full-burst bucket each time, and eviction leaked key, bucket and its own scratch vecs. 9 mutation probes, 9 kills across both releases. ⚠ `tests/test_live.tcyr` needs Redis and PostgreSQL, absent here. |
 | **libro** | **2.8.5** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.8.4, so this took a **patch bump**. **512 assertions** (524 with `-D LIBRO_TPM`), fmt clean, 23 files lint / 0 warnings, vet 45 deps / 0 untrusted, deny 0 violations, 3 bench binaries green, `.bss` held at **80,224 bytes**. Content: pin 6.5.10 → 6.5.20, `[deps.patra]` 1.12.12 → **1.13.0**, `[deps.sigil]` + `[deps.sigil_tpm]` 3.12.1 → **3.12.7** with the thin selection kept. |
 | **bote** | **3.3.1** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.3.0. **867 assertions across 13 suites** + the core-only drift guard, 14 benchmarks, both `dist/` bundles at v3.3.1. Content: defensive `[deps.sakshi]` **DELETED**, `[deps.libro]` → 2.8.5, `[deps.majra]` → 2.6.3, pin → 6.5.20. ⚠ bote should take **majra 2.6.4** on its next touch — it is a correctness fix in a module bote republishes. |
-| **kavach** | **3.11.11** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.11.10. Adds `config_fuel`: the WASM fuel budget was derived from `timeout_ms` (`* 1e6`, so 3e10 at the default 30 s — **30x** the oracle's `set_fuel(1e9)`), and no caller could ask for a CPU bound without also shortening its wall clock. `SandboxConfig` 104 -> 112, `fuel` appended. **676 assertions**, mutation-verified. Filed from agnosai. |
-| **agnosai** | 1.1.0 | **6.5.20** | ✅ **done, awaiting commit.** **99 suites, 7,942 assertions, 0 failed**, `check-clean.sh` green, `deps --verify` 113/0. `[deps.majra]` → **2.6.4**. VERSION stays 1.1.0 by design — it bumps at parity, not before. |
+| **kavach** | **3.11.12** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.11.10. **3.11.12** closes the WASM **memory** bound: `policy_basic()` leaves `memory_limit_mb` at 0 and the backend emitted `-W max-memory-size` only when it was > 0, so every caller on the default policy ran an **unbounded** guest — a wasm32 module can claim 4 GiB. Verified against wasmtime 47 with a 128 MiB module. Now always emitted, defaulting to the oracle's 64 MiB. **684 assertions.** **3.11.11**: Adds `config_fuel`: the WASM fuel budget was derived from `timeout_ms` (`* 1e6`, so 3e10 at the default 30 s — **30x** the oracle's `set_fuel(1e9)`), and no caller could ask for a CPU bound without also shortening its wall clock. `SandboxConfig` 104 -> 112, `fuel` appended. **676 assertions**, mutation-verified. Filed from agnosai. |
+| **agnosai** | 1.1.0 | **6.5.21** | ✅ **done, awaiting commit.** **99 suites, 8,035 assertions, 0 failed**; `check-clean.sh` green, `deps --verify` 113/0, and **every `.tcyr`/`.bcyr`/`.fcyr` compiled explicitly** — `check-clean` does not reach `tests/`, and a hub include broke two suites this session while it stayed green. `[deps.majra]` **2.6.6**, `[deps.kavach]` **3.11.12**, toolchain **6.5.21** with `lib/` re-synced (107 files) and read back AFTER a build. VERSION stays 1.1.0 by design — it bumps at parity, not before. |
 | **cyrius** | 6.5.20 | — | ✅ not a blocker, and **never was**: 6.5.19 already folded patra 1.13.0. |
 
 ## 🔎 Open findings — P(-1) sweep, 2026-08-12 (cyrius 6.5.20)
@@ -401,6 +401,35 @@ mutation-verified (breaking it reports `got 15, expected 0`).
 
 The 64 KiB arena at `serve.cyr:259` is a separate matter and still open — it is
 one of the five sites in the arena-pool bite above.
+
+### ⚠ A FIX is a change, and earns the same review as the code it replaces
+
+A second adversarial review of the first review's 22 fixes found **five more
+defects, three of them introduced BY those fixes** — two critical. 2026-08-13:
+
+- **Porting half a guard is worse than porting none.** The oracle floors the
+  load-test user count at the **divide** (`concurrent_users.max(1)`), not at the
+  clamp. Removing the port's clamp floor "for parity" without moving the guard
+  left `100000 / 0` reachable unauthenticated — **SIGFPE kills the process**,
+  it is not per-thread recoverable. When removing a guard to match an oracle,
+  find where the oracle put ITS guard.
+- **Making a parameter work can weaponise a divergence.** majra's relay capacity
+  was accepted and discarded; honouring it turned a latent blocking send into a
+  live permanent deadlock at whatever depth the caller names. ⚠ And the test
+  written for that release missed it by filling the ring with `chan_try_send`
+  **directly on the channel**, routing around the very call that blocks —
+  **exercise the API under test, not the primitive beneath it.**
+- **I violated a rule I had written myself, in the module I wrote it in.**
+  `arena_pool.cyr`'s header forbids lazy `if (pool == 0)` construction; the crew
+  runner did exactly that. Writing a rule down does not make you follow it —
+  grep for the anti-pattern.
+- **A fallback allocator must never be handed to a release path.** Substituting
+  `default_alloc()` for a pool arena and then "releasing" it calls
+  `alloc_reset()` on the **whole process heap**. Acquire failure means "no
+  arena", never "use a different one".
+- **A process global on a pooled-worker path is a race, however wide the
+  window.** The window here was two HTTP chains wide — seconds — and the payload
+  was one tenant's transport outcome appearing in another's response.
 
 ### ⚠ A green local build is not evidence about CI, and `lib/` goes stale silently
 

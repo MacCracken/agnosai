@@ -113,6 +113,20 @@ fn main() {
     # (which then defaults to 10), so this only pins that the clamp itself adds
     # no floor.
     assert_eq(agnosai_lt_clamp_users(0 - 5), 0 - 5, "and no floor is invented for a negative");
+
+    # ⚠ **The floor lives at the DIVIDE, and asserting the clamp alone missed
+    # it.** `load_testing.rs:135` is `MAX_TOTAL_REQUESTS / concurrent_users.max(1)`.
+    # Removing the clamp's floor to match `.min(500)` without porting that guard
+    # left `100000 / 0` reachable from an unauthenticated `POST /mcp`, and an
+    # i64 divide by a runtime zero raises SIGFPE — not per-thread recoverable, so
+    # the whole server dies. This drives `agnosai_load_test_run` with 0, which
+    # the clamp assertions above never did.
+    assert_neq(agnosai_load_test_run(str_from("https://example.com"), 0, 1,
+    &_t_exec_ok), 0 - 1,
+    "zero users does NOT divide by zero — a SIGFPE here kills the process");
+    assert_neq(agnosai_load_test_run(str_from("https://example.com"), 0 - 3, 1,
+    &_t_exec_ok), 0 - 1,
+    "and neither does a negative");
     assert_eq(agnosai_lt_clamp_users(10), 10, "a normal user count passes through");
     assert_eq(agnosai_lt_clamp_users(9999), 500, "user count clamps down to 500");
     assert_eq(agnosai_lt_clamp_duration(0), 1, "duration clamps up to 1s");

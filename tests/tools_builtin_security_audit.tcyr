@@ -650,6 +650,52 @@ fn main() {
     assert_eq(_agnosai_audit_snapshot(0) != 0, 1,
     "snapshotting a null header set yields an empty set, not 0");
 
+    # ⚠ **The failure message must name the REASON.** The oracle reports the
+    # underlying transport error (`security_audit.rs:132-136` maps reqwest's with
+    # `.map_err(|e| e.to_string())`); the port collapsed every non-blocked
+    # failure to the fixed string "request failed", so an operator could not tell
+    # DNS from TLS from a timeout. `agnosai_guarded_fetch` computed sandhi's
+    # error kind and dropped it — `agnosai_guarded_fetch_full` now surfaces it.
+    assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_CONNECT),
+    "connection") == 1, "a connect failure says so");
+    assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_TLS), "TLS") == 1,
+    "a TLS failure says so");
+    assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_TIMEOUT),
+    "timed out") == 1, "a timeout says so");
+    assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_DISCOVERY),
+    "resolution") == 1, "a DNS failure says so");
+    assert(str_eq(_agnosai_audit_reason(SANDHI_ERR_CONNECT),
+    _agnosai_audit_reason(SANDHI_ERR_TLS)) == 0,
+    "and the kinds are DISTINCT — one shared string would be the old behaviour");
+    assert(str_contains_cstr(_agnosai_audit_reason(0), "request failed") == 1,
+    "an unknown kind falls back to the generic message");
+
+    # ⚠ **The table above is PURE, so asserting it does not test the wiring** —
+    # dropping the `store64(out_kind, ..)` in `agnosai_guarded_fetch_full` leaves
+    # every assertion above green. This drives the real path: `.invalid` is
+    # reserved by RFC 2606 and never resolves, so the fetch fails with a kind
+    # rather than succeeding.
+    # ⚠ The kind comes back through an OUT-PARAM, not a module global. It was a
+    # global, which is a data race: the tool runs on a `run_pooled` worker and
+    # the store/load straddles two HTTP chains, so a concurrent audit could zero
+    # it (generic message) or supply its own (wrong message, and one request's
+    # outcome leaking into another's response).
+    var probe_kind: i64[1];
+    store64(&probe_kind, 0);
+    assert_eq(agnosai_run_security_audit_err(
+    str_from("http://nonexistent-agnosai.invalid/"), &probe_kind), 0,
+    "an unresolvable host fails the audit");
+    assert(load64(&probe_kind) != 0,
+    "and the sandhi error kind was CAPTURED — a 0 here means it is dropped again");
+    assert(str_eq(_agnosai_audit_reason(load64(&probe_kind)),
+    _agnosai_audit_reason(0)) == 0,
+    "so the message is specific, not the generic fallback");
+
+    # A null out_kind must be accepted, since the bare form passes one.
+    assert_eq(agnosai_run_security_audit_err(
+    str_from("http://nonexistent-agnosai.invalid/"), 0), 0,
+    "a null out_kind is accepted rather than dereferenced");
+
     return assert_summary();
 }
 

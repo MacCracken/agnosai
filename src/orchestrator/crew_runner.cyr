@@ -469,16 +469,15 @@ fn _agnosai_crew_user_message(task): i64 {
 # the tree it reclaims — the lesson the audit scratch learned
 # (`AGN_CR_SCRATCH`). Pooled arenas are mutex-guarded, so the parallel and DAG
 # workers can share them, which the audit scratch deliberately cannot.
-var _agnosai_crew_ctx_pool = 0;
-
-fn _agnosai_crew_ctx_arena(): i64 {
-    if (_agnosai_crew_ctx_pool == 0) {
-        _agnosai_crew_ctx_pool = agnosai_arena_pool_new(4, 8192);
-    }
-    var a = agnosai_arena_pool_acquire(_agnosai_crew_ctx_pool);
-    if (a == 0) { return default_alloc(); }
-    return a;
-}
+# ⚠ **Built EAGERLY, at module scope.** `src/arena_pool.cyr`'s header states the
+# rule and this code broke it: "Build the pool EAGERLY on the main thread. A lazy
+# `if (pool == 0)` double constructs when two spawned threads race it, and the
+# loser's arenas leak — the very thing this module exists to stop."
+# `_agnosai_crew_run_parallel` spawns a worker per task and every one of them
+# reaches `_agnosai_crew_build_request`, so the race is the common case on a
+# crew's first wave, not a corner. `_AGNOSAI_AUDIT_POOL` in
+# `tools/builtin/security_audit.cyr` is the pattern to copy.
+var _AGNOSAI_CREW_CTX_POOL = agnosai_arena_pool_new(4, 8192);
 
 fn _agnosai_crew_build_request(task, agent, model: Str, user_msg: Str): i64 {
     var req = agnosai_inference_request_new(model);
@@ -502,23 +501,36 @@ fn _agnosai_crew_build_request(task, agent, model: Str, user_msg: Str): i64 {
         # (960 B over a 4-task run, 8,504 -> 9,464). The rendered string is built
         # by the non-`_a` `build_pretty`, so it lands on the global bump and
         # outlives the reset — only the tree is reclaimed.
-        var ctx_arena = _agnosai_crew_ctx_arena();
+        # ⚠ **0 means "no arena" — it must NOT fall back to `default_alloc()`.**
+        # An earlier version did, and the release below then handed the GLOBAL
+        # allocator to `agnosai_arena_pool_release`, whose `reset_via` is
+        # `_bump_reset` -> `alloc_reset()`: that zeroes and rewinds the whole
+        # process heap, while every other pooled worker still holds pointers into
+        # it. A degradation under memory pressure became whole-process memory
+        # corruption. Every other `agnosai_arena_pool_acquire` site in `src/`
+        # bails on 0; this one now does too, falling back to the global bump for
+        # the tree without ever releasing it.
+        var ctx_arena = agnosai_arena_pool_acquire(_AGNOSAI_CREW_CTX_POOL);
+        var ctx_alloc = ctx_arena;
+        if (ctx_alloc == 0) { ctx_alloc = default_alloc(); }
         # ⚠ Slot-walked, NOT `map_keys` — standing trap #2 under roadmap B2.
         # `map_keys` builds its key vec with `vec_new()` on the no-free global
         # bump and has no `_a` form, so it leaks per task and silently caps any
         # threading done around it. The walk also drops the second hash lookup:
         # `map_get(ctx, key)` per key became `_agnosai_map_slot_val` on the slot
         # already in hand.
-        var obj = bayan_json_v_obj_new_a(ctx_arena);
+        var obj = bayan_json_v_obj_new_a(ctx_alloc);
         var slots = _agnosai_map_slots(ctx);
         for (var i = 0; i < slots; i = i + 1) {
             if (_agnosai_map_slot_live(ctx, i) == 1) {
-                bayan_json_v_obj_set_a(ctx_arena, obj, _agnosai_map_slot_key(ctx, i),
+                bayan_json_v_obj_set_a(ctx_alloc, obj, _agnosai_map_slot_key(ctx, i),
                 _agnosai_map_slot_val(ctx, i));
             }
         }
         var rendered = bayan_json_v_build_pretty(obj, 2);
-        agnosai_arena_pool_release(_agnosai_crew_ctx_pool, ctx_arena);
+        if (ctx_arena != 0) {
+            agnosai_arena_pool_release(_AGNOSAI_CREW_CTX_POOL, ctx_arena);
+        }
         agnosai_inference_request_say(req, AGNOSAI_ROLE_USER,
         agnosai_prompt_sanitize(rendered, str_from("context")));
         agnosai_inference_request_say(req, AGNOSAI_ROLE_ASSISTANT,

@@ -247,15 +247,98 @@ sandhi. **The three-step is `lib sync --full` -> `deps` -> `build`, and verifyin
 `lib/` AFTER a build is the only reading that counts** — bumping a dep pin and
 running `deps` alone does not refresh the snapshot.
 
-### Not fixed, and why
+### Fixed — five defects a second adversarial review found in the FIRST round's fixes
 
-- **The A2A run-failure error text and the security-audit failure detail** both
-  collapse an underlying error to a fixed string. `agnosai_orchestrator_run_crew`
-  returns 0 with no error object and `agnosai_guarded_fetch` discards sandhi's
-  error kind, so surfacing the reason is an API change across several callers,
-  not a text fix.
+⚠ **Three of these were introduced while fixing something else**, which is the
+part worth carrying forward: a fix is a change, and a change earns the same
+review as the code it replaces.
+
+- **CRITICAL — `concurrent_users: 0` killed the whole server.** Removing the
+  lower clamp to match the oracle's bare `.min(500)` was only half the change:
+  **the oracle's floor lives at the DIVIDE**, `MAX_TOTAL_REQUESTS /
+  concurrent_users.max(1)` (`load_testing.rs:135`). Without it,
+  `100000 / 0` reaches an i64 `idiv` and raises **SIGFPE**, which is not
+  per-thread recoverable — an unauthenticated `POST /mcp` with one field takes
+  down all 100 workers. Mutation exits **136**. The clamp assertions could never
+  have caught it; the test now drives `agnosai_load_test_run` with 0.
+- **CRITICAL — the crew-context arena could wipe the process heap.**
+  `_agnosai_crew_ctx_arena` fell back to `default_alloc()` when the pool could
+  not hand one out, and the caller then passed that to
+  `agnosai_arena_pool_release` — whose `reset_via` is `_bump_reset` ->
+  `alloc_reset()`, which **zeroes and rewinds the entire global heap** while
+  every other pooled worker still holds pointers into it. Degradation under
+  memory pressure became whole-process memory corruption. Acquire failure now
+  means "no arena": the tree falls back to the global bump and is never
+  released. ⚠ **Not test-covered** — with the pool built eagerly, acquire
+  returns 0 only on mmap failure, so the path is OOM-only. The fix is
+  structural, and that is recorded as reasoning rather than as a verified claim.
+- **HIGH — the arena pool was built lazily from worker threads.**
+  `src/arena_pool.cyr`'s own header says: *"Build the pool EAGERLY on the main
+  thread. A lazy `if (pool == 0)` double constructs when two spawned threads
+  race it."* This code did exactly that, and
+  `_agnosai_crew_run_parallel` spawns a worker per task, so the race is a crew's
+  first wave rather than a corner. Now a module-scope initializer, matching
+  `_AGNOSAI_AUDIT_POOL`.
+- **MEDIUM — the security-audit error kind was a process global.**
+  `_agnosai_audit_last_err` was written and read across two HTTP chains with a
+  15 s budget each, from `run_pooled` worker threads — a seconds-wide race in
+  which one audit zeroes another's kind (reverting to the generic message) or
+  supplies its own, reporting "TLS handshake failed" for a connect failure and
+  leaking one request's outcome into another's response. Replaced with
+  `agnosai_run_security_audit_err(url, out_kind)` and a stack local.
+
+### Changed
+
+- **`[deps.kavach]` 3.11.11 -> 3.11.12** — closes the *memory* half of ADR 019's
+  residual, the last thing that ADR carried as open. This port was already
+  bounded (`agnosai_wasm_execute` has sent a memory policy since 2026-08-11),
+  but a kavach caller on `policy_basic()` got **no ceiling at all** — verified
+  against wasmtime 47, where a module declaring 128 MiB instantiates freely and
+  is refused under 64 MiB. kavach now always emits one, defaulting to the same
+  64 MiB `DEFAULT_MAX_MEMORY_BYTES` the oracle's `WasmSandbox` uses.
+- **`[deps.majra]` 2.6.5 -> 2.6.6** — the same review found that honouring the
+  relay capacity (2.6.5, filed from here) turned a latent divergence into a live
+  deadlock: both fan-out paths pushed with the blocking `chan_send`, where
+  Rust's `broadcast::send` never blocks. A depth-2 relay wedged its sender on
+  the third send, permanently, since majra has no unsubscribe. ⚠ The 2.6.5 test
+  missed it because it filled the ring with `chan_try_send` **directly on the
+  channel**, routing around the blocking call.
+
+### Fixed — two error paths that could only say "it failed"
+
+Both needed the reason plumbed out of an API that discarded it, which is why
+they were held back from the first pass rather than patched as text.
+
+- **The A2A error field never said anything.** The oracle sends the
+  orchestrator's own error to the delegating system (`a2a.rs:182` is
+  `error: Some(e.to_string())`); the port answered a fixed "crew execution
+  failed" — which is the literal `crews.rs:236` uses for a *different* route.
+  ⚠ **The reason already existed and was thrown away**: `_agnosai_orch_finish`
+  builds a `run_err` for `agnosai_crew_runner_run` — the cyclic-DAG arm the
+  oracle's `?` propagates — and then returned a bare 0. New
+  `agnosai_orchestrator_run_crew_err`; the bare form delegates with `out_err`
+  of 0, which means "don't care".
+- **Every security-audit transport failure read "request failed".** The oracle
+  reports the underlying error (`security_audit.rs:132-136` maps reqwest's with
+  `.map_err(|e| e.to_string())`), so an operator sees DNS, TLS, connect or
+  timeout. `agnosai_guarded_fetch` computed `sandhi_http_err_kind` and dropped
+  it; `agnosai_guarded_fetch_full` surfaces it and the tool names the cause.
+
+  ⚠ **The first test for this was vacuous** — it asserted the reason TABLE,
+  which is pure, so dropping the `store64` that fills it left all six assertions
+  green. The test now drives the real path against an RFC 2606 `.invalid` host,
+  which fails with `SANDHI_ERR_DISCOVERY` (kind 8). Same shape as the
+  `_agnosai_rl_parse_count` lesson: **testing a helper does not test the
+  wiring.**
+
 - ~~The WASM fuel budget~~ ✅ **closed** by kavach 3.11.11 — see the dep bump
   above. ADR 019's Residual no longer describes an open gap.
+
+### Changed — toolchain pinned to cyrius 6.5.21
+
+Was 6.5.20. `lib/` re-synced from the 6.5.21 snapshot (107 files) and verified
+after a build; `cyrius --version` and the manifest pin agree, so the drift the
+wrapper had been reporting is gone.
 
 ### Performance — the limiter's cost on the default request path, measured
 

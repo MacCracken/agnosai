@@ -167,8 +167,11 @@ findable and fixable in one place.
   so the backend cannot run at all below 3.11.10. `[deps.kavach]` pins 3.11.10 in
   `cyrius.cyml`, and `_t_execute_real_module` is what fails if it ever goes below.
 
-**Residual — the memory and fuel bounds are not the oracle's.** Recorded rather than
-chased, because it is a code question and not a decision:
+**Residual — ✅ BOTH bounds are CLOSED (2026-08-13).** The fuel half was recorded here as "a code question and not a decision",
+and it is now answered: **kavach 3.11.11 adds `config_fuel`**, filed from this port,
+and `agnosai_wasm_execute` passes the configured budget. `tests/sandbox_wasm.tcyr`
+proves it end to end — a budget of 1 starves the guest, where the timeout-derived
+fallback would have run it fine. What follows describes the state BEFORE that:
 
 - `agnosai_wasm_sandbox_new` stores `max_memory_bytes = 64 MiB` and `fuel = 1e9` (the
   oracle's constants) and exposes both through accessors, but **neither is passed to
@@ -178,7 +181,17 @@ chased, because it is a code question and not a decision:
   which is **0** under the default `policy_basic()` — so no `-W max-memory-size` is
   emitted at all — and fuel from `_wasm_fuel_from_timeout(timeout_ms)`, which is
   `timeout_ms × 1e6`, i.e. **3e10** at the default 30 s timeout rather than the oracle's
-  1e9.
+  1e9. ✅ **The fuel half is fixed** — `config_fuel` now carries the sandbox's own
+  budget, and `_wasm_fuel_from_timeout` is the fallback for a caller that sets none.
+  ✅ **The memory half is closed too, in kavach 3.11.12.** `agnosai_wasm_execute`
+  has sent a memory policy since 2026-08-11, so this port was already bounded —
+  but a kavach caller on `policy_basic()` alone got **no ceiling at all**, and a
+  wasm32 guest can claim 4 GiB. Verified against wasmtime 47: a module declaring
+  **128 MiB** instantiates freely bare and is refused under 64 MiB. kavach's WASM
+  backend now always emits a ceiling, defaulting to
+  `WASM_DEFAULT_MEMORY_LIMIT_MB` = 64 MiB — the same `DEFAULT_MAX_MEMORY_BYTES`
+  the oracle's `WasmSandbox` uses, so the fallback matches the embedding host
+  rather than inventing a number.
 - The wall clock and ambient-authority bounds are intact: `timeout_ms` is passed, and no
   `--dir` preopen is emitted because agnosai never sets a workdir, which matches the
   oracle's WASI context of stdio only.

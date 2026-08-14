@@ -189,6 +189,23 @@ fn agnosai_guarded_fetch(arena, method, url: Str, headers, opts, timeout_ms): i6
 # 307/308 keep method and body, which is the arm that matters for a callback.
 fn agnosai_guarded_fetch_body(arena, method, url: Str, headers, opts, timeout_ms,
 body, body_len): i64 {
+    return agnosai_guarded_fetch_full(arena, method, url, headers, opts, timeout_ms,
+    body, body_len, 0);
+}
+
+# `agnosai_guarded_fetch_body`, reporting WHY a request failed.
+#
+# ⚠ **sandhi's error kind was computed and dropped.** `sandhi_http_err_kind(r)`
+# distinguishes connect, TLS, timeout, protocol and the rest, and this function
+# collapsed every one of them to a bare 0 — so `security_audit` could only ever
+# say "request failed" where the oracle reports the underlying reqwest error
+# (`security_audit.rs:132-136` maps it with `.map_err(|e| e.to_string())`) and an
+# operator has to guess between DNS, TLS, connect and timeout.
+#
+# `out_kind` receives a `SANDHI_ERR_*` value, or 0 when the budget ran out
+# before any request was made. Pass 0 to ignore it.
+fn agnosai_guarded_fetch_full(arena, method, url: Str, headers, opts, timeout_ms,
+body, body_len, out_kind): i64 {
     var current = url;
     var verb = method;
     var hops = 0;
@@ -201,7 +218,11 @@ body, body_len): i64 {
 
         var r = sandhi_http_request_auto_a(arena, verb, str_cstr(current), headers,
         body, body_len, opts);
-        if (r == 0 || sandhi_http_err_kind(r) != SANDHI_OK) { return 0; }
+        if (r == 0) { return 0; }
+        if (sandhi_http_err_kind(r) != SANDHI_OK) {
+            if (out_kind != 0) { store64(out_kind, sandhi_http_err_kind(r)); }
+            return 0;
+        }
         if (agnosai_fetch_is_redirect(sandhi_http_status(r)) == 0) { return r; }
 
         var loc = sandhi_headers_get(sandhi_http_headers(r), "Location");

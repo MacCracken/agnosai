@@ -683,7 +683,46 @@ fn _agnosai_audit_snapshot(src): i64 {
 # Both responses are allocated in a scratch arena that is released before
 # returning. `agnosai_audit_analyze` copies everything it keeps, so nothing in
 # the result points into the freed region.
+# The reason a `SANDHI_ERR_*` kind names, for the operator-facing message.
+#
+# ⚠ **The oracle reports the underlying transport error** —
+# `security_audit.rs:132-136` maps reqwest's with `.map_err(|e| e.to_string())`,
+# so an operator sees DNS, TLS, connect or timeout. The port collapsed every
+# failure to "request failed", which tells them only that something went wrong.
+fn _agnosai_audit_reason(kind): i64 {
+    if (kind == SANDHI_ERR_CONNECT) { return str_from("connection failed"); }
+    if (kind == SANDHI_ERR_TLS) { return str_from("TLS handshake failed"); }
+    if (kind == SANDHI_ERR_TIMEOUT) { return str_from("request timed out"); }
+    if (kind == SANDHI_ERR_PROTOCOL) { return str_from("protocol error"); }
+    if (kind == SANDHI_ERR_PARSE) { return str_from("malformed response"); }
+    if (kind == SANDHI_ERR_REMOTE) { return str_from("remote error"); }
+    if (kind == SANDHI_ERR_AUTH) { return str_from("authentication failed"); }
+    if (kind == SANDHI_ERR_DISCOVERY) { return str_from("host resolution failed"); }
+    return str_from("request failed");
+}
+
+# Run the audit against `url` — the header fetch plus the CORS probe.
+#
+# Returns the result, `AGNOSAI_FETCH_BLOCKED` when the SSRF gate refused a hop,
+# or 0 on a transport failure.
 fn agnosai_run_security_audit(url: Str): i64 {
+    return agnosai_run_security_audit_err(url, 0);
+}
+
+# `agnosai_run_security_audit`, reporting the transport failure kind through
+# `out_kind` (a `SANDHI_ERR_*` value, or 0 if the fetch never got that far).
+#
+# ⚠ **This was a module-level global, and that was a data race.** The tool is
+# reached through `agnosai_tool_execute` from `routes/mcp.cyr`, which runs on a
+# `sandhi_server_run_pooled` worker — a real OS thread — and the store/load pair
+# straddled two HTTP chains with a 15 s budget each, so the window was seconds
+# wide. Two concurrent audits could have one zero the other's kind (reverting to
+# the generic message this change exists to remove) or, worse, read the other
+# tenant's kind and report "TLS handshake failed" for a connect failure —
+# actively misdirecting the operator and leaking one request's outcome into
+# another's response. An out-param has none of that; the caller owns the slot.
+fn agnosai_run_security_audit_err(url: Str, out_kind): i64 {
+    if (out_kind != 0) { store64(out_kind, 0); }
     var arena = agnosai_arena_pool_acquire(_AGNOSAI_AUDIT_POOL);
     if (arena == 0) { return 0; }
     var opts = _agnosai_audit_options();
@@ -694,13 +733,16 @@ fn agnosai_run_security_audit(url: Str): i64 {
 
     # The header fetch. Its headers are snapshotted out and the arena released
     # before the CORS probe starts, so the two chains never share the arena.
-    var get_resp = agnosai_guarded_fetch(arena, "GET", url, sandhi_headers_new(), opts,
-    AGNOSAI_AUDIT_TIMEOUT_MS);
+    var get_kind: i64[1];
+    store64(&get_kind, 0);
+    var get_resp = agnosai_guarded_fetch_full(arena, "GET", url, sandhi_headers_new(),
+    opts, AGNOSAI_AUDIT_TIMEOUT_MS, 0, 0, &get_kind);
     if (get_resp == AGNOSAI_FETCH_BLOCKED) {
         agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return AGNOSAI_FETCH_BLOCKED;
     }
     if (get_resp == 0) {
+        if (out_kind != 0) { store64(out_kind, load64(&get_kind)); }
         agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return 0;
     }
@@ -779,14 +821,22 @@ fn _agnosai_security_audit_execute(ctx, input): i64 {
 
     _agnosai_audit_log("security audit starting", 23, target);
 
-    var result = agnosai_run_security_audit(target);
+    # The kind lands in a STACK local, not a process global — see
+    # `agnosai_run_security_audit_err` for why that distinction is load-bearing
+    # on a pooled-worker path.
+    var audit_kind: i64[1];
+    store64(&audit_kind, 0);
+    var result = agnosai_run_security_audit_err(target, &audit_kind);
     if (result == AGNOSAI_FETCH_BLOCKED) {
         _agnosai_audit_log("security audit redirect refused", 31, target);
         return agnosai_tool_output_err(
         str_from("security audit failed: target redirected to a private/internal address"));
     }
     if (result == 0) {
-        return agnosai_tool_output_err(str_from("security audit failed: request failed"));
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "security audit failed: ");
+        str_builder_add(sb, _agnosai_audit_reason(load64(&audit_kind)));
+        return agnosai_tool_output_err(str_builder_build(sb));
     }
 
     _agnosai_audit_log_done(target, agnosai_audit_security_score(result),
