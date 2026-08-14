@@ -162,40 +162,39 @@ jobs:
           rc=0
           cyrius test 2>&1 | tee /tmp/agnosai-test.log || rc=$?
           if [ "$rc" -ne 0 ]; then
-            echo "::group::Suite results"
-            # ⚠ Per-suite lines ALWAYS carry a "(N total)" suffix; the overall
-            # tally ("97 passed, 1 failed") does not. Matching both made the
-            # tally get tagged with whatever suite header came last, which
-            # pointed at an innocent suite. Match only the per-suite form.
+            # ⚠ **`cyrius test` never prints the .tcyr filename**, and a suite
+            # may emit several `=== group ===` headers of its own, so no
+            # text-matching over the aggregate log can name the failing file —
+            # an earlier attempt matched the overall tally and blamed an
+            # innocent suite. 98 result lines for 98 files, in filesystem order,
+            # with nothing tying a line to a path.
             #
-            # ⚠ A suite that CRASHES (segfault, timeout) or fails to compile
-            # prints NO result line at all — that is what an empty "Failed
-            # assertions" group with a non-zero tally means. Those are found by
-            # looking for a header with no result before the next header, and
-            # they are the ones worth naming first.
-            awk '
-              /^=== / {
-                if (name != "" && !seen) print "CRASHED-OR-DID-NOT-REPORT: " name
-                name = $2; seen = 0; next
-              }
-              /passed, [0-9]+ failed \([0-9]+ total\)/ {
-                seen = 1
-                split($0, a, " ")
-                if (a[3] + 0 != 0) print "ASSERTIONS FAILED: " name "  ->  " $0
-                next
-              }
-              END { if (name != "" && !seen) print "CRASHED-OR-DID-NOT-REPORT: " name }
-            ' /tmp/agnosai-test.log | tee /tmp/agnosai-failed.txt
+            # So on failure, re-run each suite individually. It is slow, but it
+            # only happens when CI is already red, and it names the file exactly
+            # instead of costing a round-trip to guess.
+            echo "::group::Per-suite bisect"
+            failed=""
+            for f in tests/*.tcyr; do
+              if ! cyrius build "$f" /tmp/suite_bin >/tmp/suite_build.log 2>&1; then
+                echo "COMPILE FAILED: $f"
+                grep -E '^error:|undefined function' /tmp/suite_build.log | head -5
+                failed="$failed $f"
+                continue
+              fi
+              if ! timeout 300 /tmp/suite_bin >/tmp/suite_run.log 2>&1; then
+                code=$?
+                echo "RUNTIME FAILED: $f (exit $code)"
+                grep -E 'FAIL:|passed, [0-9]+ failed' /tmp/suite_run.log | tail -5
+                tail -5 /tmp/suite_run.log
+                failed="$failed $f"
+              fi
+            done
             echo "::endgroup::"
-            echo "::group::Failed assertions"
-            grep -E 'FAIL:' /tmp/agnosai-test.log | head -40 || echo "(none — the suite did not reach an assertion)"
-            echo "::endgroup::"
-            echo "::group::Compile errors"
-            grep -E '^error:|compile error' /tmp/agnosai-test.log | head -20 || echo "(none)"
-            echo "::endgroup::"
-            while read -r line; do
-              [ -n "$line" ] && echo "::error::$line"
-            done < /tmp/agnosai-failed.txt
+            if [ -n "$failed" ]; then
+              for f in $failed; do echo "::error::suite failed: $f"; done
+            else
+              echo "::error::aggregate run failed but every suite passes individually — suspect a shared-state or ordering interaction"
+            fi
           fi
           exit "$rc"
 
