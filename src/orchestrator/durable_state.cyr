@@ -58,11 +58,24 @@
 #     `_agnosai_read_file_exact` is built on `file_open`/`xlseek`/`file_read`,
 #     treats a negative read as an error rather than as end-of-file, and takes
 #     its size from the fd so there is no cap — matching `tokio::fs::read`.
-#     Measured: opening a directory *succeeds* (a live fd comes back), the
-#     **seek** then fails `-EINVAL`, and only a read would have said `-EISDIR`.
-#     Since std reports "Is a directory (os error 21)", the seek failure is
+#     Since std reports "Is a directory (os error 21)", a directory is
 #     classified back to `-EISDIR` rather than passing through whichever
 #     syscall happened to fail first — the errno is what a caller matches on.
+#
+#     ⚠ **That classification happens BEFORE the open, and the placement is
+#     load-bearing.** This note used to read "Measured: opening a directory
+#     *succeeds*, the **seek** then fails `-EINVAL`" and the check sat after the
+#     seek on exactly that basis. The measurement was real but was taken on a
+#     **tmpfs** `/tmp`. It does not generalise: on **ext4, `lseek(SEEK_END)` on
+#     a directory fd SUCCEEDS and returns i64 MAX** (9223372036854775807). So
+#     `size` was positive, the late check never fired, `alloc(size + 1)`
+#     overflowed to a negative request and returned 0, and `store8(buf + size,
+#     0)` wrote at offset 2^63-1 — SIGSEGV.
+#
+#     It crashed **only on CI**, whose `/tmp` is ext4 while a dev box's is
+#     tmpfs; 300 local runs could not reproduce it, and pointing the suite's
+#     root at an ext4 path reproduced it on the first try. Do not "simplify"
+#     this back by folding the check into the `size < 0` arm.
 #   * **The write goes through `file_write_atomic`, not `file_write_all`.**
 #     This is usually framed as a safety upgrade, and it is, but it is also the
 #     *more faithful* of the two: `file_write_all` issues a single `file_write`
@@ -267,18 +280,30 @@ fn _agnosai_mkdir_p(path: Str): i64 {
 # A zero-length file returns a valid non-zero pointer, so the caller can tell
 # "empty snapshot" from "no snapshot".
 fn _agnosai_read_file_exact(path: Str, out_len): i64 {
+    # ⚠ **The directory check is FIRST, before the open**, and the placement is
+    # the point rather than an ordering preference — `loader.cyr` says so, and
+    # names *this* function as the one that got it wrong.
+    #
+    # It used to sit after the seek, on the belief that a directory "opens fine
+    # and then fails HERE, with -EINVAL from the seek". That is a **tmpfs**
+    # behaviour, not a Linux one. On **ext4 `lseek(SEEK_END)` on a directory fd
+    # SUCCEEDS and returns i64 MAX** (measured: 9223372036854775807), so `size`
+    # was positive, the classification never fired, `alloc(size + 1)` overflowed
+    # to a negative request and returned 0, and `store8(buf + size, 0)` wrote at
+    # offset 2^63-1 — a SIGSEGV.
+    #
+    # It crashed **only on CI**, whose /tmp is ext4, while a dev box's /tmp is
+    # tmpfs and takes the clean -EINVAL path. 300 local runs could not reproduce
+    # it. Hoisting the check makes EISDIR the answer on every filesystem, which
+    # is what std's `read` reports ("Is a directory (os error 21)").
+    if (is_dir(path) == 1) { return 0 - 21; }
+
     var fd = file_open(str_data(path), 0, 0);
     if (fd < 0) { return fd; }
 
     var size = xlseek(fd, 0, 2);
     if (size < 0) {
         file_close(fd);
-        # A directory opens fine and then fails HERE, with -EINVAL from the
-        # seek, before the read that would have said -EISDIR. std's `read`
-        # reports "Is a directory (os error 21)", so classify rather than pass
-        # through whichever syscall happened to fail first — the errno is what
-        # a caller matches on.
-        if (is_dir(path) == 1) { return 0 - 21; }
         return size;
     }
     if (xlseek(fd, 0, 0) < 0) {
@@ -287,7 +312,16 @@ fn _agnosai_read_file_exact(path: Str, out_len): i64 {
     }
 
     # One spare byte so the payload is NUL-terminated and usable as a cstring.
+    #
+    # ⚠ `size` comes from the kernel, so the allocation is checked before it is
+    # written through. Unchecked, a failed `alloc` turned the `store8` below
+    # into a wild write at `size` — which is exactly how the ext4 case above
+    # presented, as a segfault rather than a reported error.
     var buf = alloc(size + 1);
+    if (buf == 0) {
+        file_close(fd);
+        return 0 - 12;
+    }
     store8(buf + size, 0);
 
     var total = 0;

@@ -441,6 +441,20 @@ fn _agnosai_pkg_is_definition_member(name): i64 {
 # which the oracle spells `{name} exceeds 1 MiB size limit`.
 fn _agnosai_pkg_read_member(z, i, what: Str, out_err): Str {
     var size = zip_entry_size(z, i);
+    # ⚠ **The NEGATIVE arm is checked, and it is not theoretical.**
+    # `zip_entry_size` answers **-1** when `_zip_ent` cannot reach entry `i`
+    # (`lib/sankoch.cyr`), and `-1 > AGNOSAI_PKG_MAX_FILE_SIZE` is *false*, so
+    # the cap below waves it through: `alloc(size + 1)` becomes `alloc(0)` and
+    # `store8(buf + size, 0)` writes ONE BYTE BEFORE the buffer — heap
+    # corruption rather than an honest error, on a path that parses archives
+    # supplied by a caller. Found alongside the ext4 `lseek` segfault in
+    # `durable_state`; it is the same shape, a kernel/library size trusted
+    # straight into an allocation.
+    if (size < 0) {
+        store64(out_err,
+        agnosai_error_io(_agnosai_pkg_zip_detail("unreadable archive member", size)));
+        return 0;
+    }
     if (size > AGNOSAI_PKG_MAX_FILE_SIZE) {
         store64(out_err, agnosai_error_invalid_definition(
         str_cat(what, str_from(" exceeds 1 MiB size limit"))));
@@ -449,6 +463,11 @@ fn _agnosai_pkg_read_member(z, i, what: Str, out_err): Str {
 
     # One spare byte so the payload is NUL-terminated and usable as a cstring.
     var buf = alloc(size + 1);
+    if (buf == 0) {
+        store64(out_err,
+        agnosai_error_io(_agnosai_pkg_zip_detail("allocation failed", 0 - 12)));
+        return 0;
+    }
     store8(buf + size, 0);
     # `_any` rather than plain `zip_extract`, which handles only STORE and
     # DEFLATE. The oracle's zip 8 is built with bzip2/zstd/xz among others, so

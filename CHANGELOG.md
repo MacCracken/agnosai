@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `durable_state` segfaulted reading a snapshot path that is a directory
+
+**orchestrator/durable_state** — `_agnosai_read_file_exact` classified a
+directory as `-EISDIR` only *after* `xlseek(fd, 0, 2)` returned a negative,
+documented as the measured behaviour: "opening a directory succeeds, the seek
+then fails `-EINVAL`". That measurement was taken on a **tmpfs `/tmp`** and does
+not generalise. On **ext4, `lseek(SEEK_END)` on a directory fd succeeds and
+returns i64 MAX** (9223372036854775807), so the check never fired,
+`alloc(size + 1)` overflowed to a negative request and returned 0, and
+`store8(buf + size, 0)` wrote at offset 2^63-1 — SIGSEGV.
+
+The check is now hoisted **before the open**, which is the placement
+`definitions/loader.cyr` already used and documented (its comment named this
+function as the one that did not). The allocation is checked before it is
+written through, so a failed `alloc` reports `-ENOMEM` instead of a wild store.
+
+⚠ **This only ever crashed on CI**, whose `/tmp` is ext4 while a dev box's is
+tmpfs. `tests/orch_durable_state.tcyr` passed 300 consecutive local runs — clean
+and with leftover state — because tmpfs takes the `-EINVAL` path. Pointing the
+suite's root at an ext4 path reproduced it on the first attempt: old code
+exit 139 (signal 11), fixed code 82 passed / 0 failed.
+
+### Fixed — a malformed ZIP member wrote one byte before its buffer
+
+**definitions/packaging** — the same shape as the defect above, found by
+sweeping for it. `_agnosai_pkg_read_member` took its length from
+`zip_entry_size`, which answers **-1** when the entry is unreachable, and
+checked only the upper bound: `-1 > 1 MiB` is false, so `alloc(size + 1)`
+became `alloc(0)` and `store8(buf + size, 0)` wrote at `buf - 1` — heap
+corruption rather than a reported error, on a path that parses **caller-supplied
+archives**. The negative arm is now rejected as `Io`, and the allocation is
+checked before it is written through.
+
+### Fixed — the CI per-suite bisect reported every failure as "exit 0"
+
+`code=$?` inside `if ! cmd; then` is always 0 — `!` inverts the status and the
+branch runs when the inversion is 0, so `$?` reported the inversion rather than
+the program. That discarded the distinction between 139 (SIGSEGV), 124 (the
+`timeout`) and 1 (a failed assertion), which are three different
+investigations. `|| code=$?` reads the real status and signals are now named.
+
 ## [2.0.0] — 2026-08-14
 
 ### Changed — rate limiting is mounted by default ([ADR 021](docs/adr/021-rate-limit-mounted-by-default.md))

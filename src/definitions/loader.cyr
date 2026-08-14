@@ -148,13 +148,19 @@ fn _agnosai_loader_io_detail(op, path: Str, errn): Str {
 #
 # ⚠ The directory check is FIRST, before the open, and that placement is the
 # point rather than an ordering preference. Put it where it reads more
-# naturally — after the seek, as `durable_state` does — and it never fires on
+# naturally — after the seek — and it never fires on
 # Linux or macOS, where `lseek(SEEK_END)` on a directory fd *succeeds* and
 # returns a size; the error only surfaces from the `read` below, as -EISDIR. On
 # agnos it fires even earlier, at the open, because that kernel refuses a
 # non-regular inode without `AO_DIRECTORY` — so the same input yields three
 # different errno paths across three targets. Hoisting it makes EISDIR the
 # answer everywhere, at the cost of one extra `is_dir` per direct read.
+#
+# `durable_state`'s `_agnosai_read_file_exact` used to be the counter-example
+# here, checking after the seek. It reached `main` that way and segfaulted on
+# CI: ext4 answers `lseek(SEEK_END)` on a directory with **i64 MAX**, not the
+# -EINVAL a tmpfs /tmp gives a dev box, so the late check never fired and the
+# size ended up as a wild `store8`. It now hoists the check exactly as this does.
 #
 # No UTF-8 validation. std's `read_to_string` rejects invalid UTF-8 with
 # `InvalidData`; the bytes here flow straight into a parser that will reject
