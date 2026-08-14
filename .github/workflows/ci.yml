@@ -181,9 +181,19 @@ jobs:
                 failed="$failed $f"
                 continue
               fi
-              if ! timeout 300 /tmp/suite_bin >/tmp/suite_run.log 2>&1; then
-                code=$?
-                echo "RUNTIME FAILED: $f (exit $code)"
+              # ⚠ **`code=$?` inside `if ! cmd; then` is always 0.** `!` inverts
+              # the status, and the branch is entered when the inverted value is
+              # 0 — so `$?` reports the inversion, not the program. That threw
+              # away the one signal worth having: 139 is a SIGSEGV, 124 is the
+              # `timeout`, 1 is an ordinary failed assertion, and they call for
+              # three different investigations. `|| code=$?` reads the real one.
+              code=0
+              timeout 300 /tmp/suite_bin >/tmp/suite_run.log 2>&1 || code=$?
+              if [ "$code" -ne 0 ]; then
+                why=""
+                if [ "$code" -eq 124 ]; then why=" — TIMED OUT at 300 s"; fi
+                if [ "$code" -ge 128 ]; then why=" — killed by signal $((code - 128))"; fi
+                echo "RUNTIME FAILED: $f (exit $code)$why"
                 grep -E 'FAIL:|passed, [0-9]+ failed' /tmp/suite_run.log | tail -5
                 tail -5 /tmp/suite_run.log
                 failed="$failed $f"
