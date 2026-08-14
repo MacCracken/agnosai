@@ -31,14 +31,26 @@ stdlib = [
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 path = "../sigil"
-# 3.12.7 — what cyrius 6.5.19 folds, verified: `lib/sigil.cyr` reports
-# `# Version: 3.12.7`. ⚠ agnosai does NOT get sigil from this dep — `sigil.cyr`
-# is FOLDED INTO the cyrius stdlib snapshot, and `lib sync --full` (which the
-# bump procedure runs *after* `deps`) overwrites the git-dep copy with the fold.
-# So this pin tracks the fold, not sigil's tags: bumping it alone changes
-# nothing, and naming a version the fold does not carry would be a pin that
-# lies about what is built.
-tag = "3.12.7"
+# 3.12.9 — the RSA sign path is no longer banked. `_rsa_sign_*`, `_rsa_blind_*`
+# and `_rsa_crt_*` moved from shared `cbank()` lanes to function-scope locals,
+# and secret zeroization is per CALL rather than per lane. That matters here
+# and is not cosmetic: `agnosai_serve` verifies RS256 bearer tokens under
+# `sandhi_server_run_pooled`, whose workers are real OS threads, so two
+# concurrent verifies could alias a lane. 3.12.8 is the other half of the
+# `err_*` → `sigil_err_*` rename that kavach 3.11.13 completes.
+#
+# ⚠ **This pin DOES decide what is built — the previous comment here was
+# wrong.** It claimed sigil comes from the cyrius stdlib fold rather than this
+# dep, because `lib sync --full` supposedly runs *after* `deps` and overwrites
+# the git-dep copy. Both CI and `scripts/lock-refresh.sh` run them the other way
+# round — `lib sync --full` FIRST, then `cyrius deps` — so `deps` overlays the
+# fold and this tag wins. The old claim was untestable while the fold and the
+# tag both said 3.12.7; naming 3.12.9 here makes the two distinguishable, and a
+# clean tag-only resolution then reports 3.12.9 in `lib/sigil.cyr`.
+#
+# The fold (cyrius 6.5.21) still carries 3.12.7, so `lib sync --full` alone
+# leaves the older copy — it is `deps` that brings this one in.
+tag = "3.12.9"
 modules = ["dist/sigil.cyr"]
 
 [deps.bote]
@@ -87,7 +99,17 @@ path = "../kavach"
 # survived because nothing had run a real module: kavach's two WASM tests both
 # fail before argv is assembled, and the backend was unreachable through the
 # public API until 3.11.8. ADR 019.
-tag = "3.11.12"
+#
+# 3.11.13 renames kavach's fourteen bare `err_*` constructors to
+# `kavach_err_*`. kavach and sigil both fork agnosys's `sys_error.cyr`, so both
+# minted the SAME fourteen names into cyrius's one flat namespace and the
+# compiler resolved them last-def-wins — fourteen silent collisions that
+# survived the whole 3.x line behind a `duplicate fn` warning apiece. agnosai
+# calls none of them (verified: no bare `err_*`, `syserr_*`, `wrap_syscall`,
+# `is_syscall_err` or `result_print_err` anywhere in src/ or tests/), so the
+# rename is a clean bump here and simply removes the warnings. The `syserr_*`
+# accessors and the `KAVACH_ERR_*` enum are deliberately unchanged upstream.
+tag = "3.11.13"
 modules = ["dist/kavach.cyr"]
 
 [deps.ai-hwaccel]

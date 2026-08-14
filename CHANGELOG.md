@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — kavach 3.11.12 → 3.11.13, sigil 3.12.7 → 3.12.9
+
+**sigil 3.12.9 is the one with teeth here.** It moves the RSA sign, blind and
+CRT workspace off shared `cbank()` lanes into function-scope locals, and makes
+secret zeroization per-CALL rather than per-lane. `agnosai_serve` verifies RS256
+bearer tokens under `sandhi_server_run_pooled`, whose workers are **real OS
+threads**, so on the old pin two concurrent verifies could alias a lane — and
+the per-lane wipe could zero a sibling's in-flight secret mid-sign.
+
+**kavach 3.11.13** renames its fourteen bare `err_*` constructors to
+`kavach_err_*`. agnosai calls none of them — verified across `src/` and
+`tests/` for `err_*`, `syserr_*`, `wrap_syscall`, `is_syscall_err` and
+`result_print_err` — so it is a clean bump.
+
+⚠ **The `[deps.sigil]` comment was wrong and is corrected.** It claimed agnosai
+does not get sigil from that dep at all, because `sigil.cyr` is folded into the
+cyrius stdlib snapshot and `lib sync --full` runs *after* `deps` and overwrites
+the git-dep copy — concluding that "bumping it alone changes nothing". Both CI
+and `scripts/lock-refresh.sh` run `lib sync --full` **first** and `cyrius deps`
+second, so `deps` overlays the fold and the tag decides. The claim had been
+untestable while the fold and the tag both said 3.12.7; pinning 3.12.9 makes
+them distinguishable, and a clean tag-only resolution reports **3.12.9** in
+`lib/sigil.cyr` against a fold that still carries 3.12.7. Had the old comment
+been believed, the thread-safety fix above would have been assumed unreachable.
+
+Gate on the new pins: build OK, **98 passed / 0 failed**, coverage 99%,
+`vet` 39 deps / 0 untrusted / 0 missing.
+
 ### Fixed — `durable_state` segfaulted reading a snapshot path that is a directory
 
 **orchestrator/durable_state** — `_agnosai_read_file_exact` classified a
