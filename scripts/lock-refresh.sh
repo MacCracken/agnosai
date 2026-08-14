@@ -62,6 +62,16 @@ echo "Refreshing $LOCK as a clean tag-only resolution (${PATHS} sibling override
 # exactly as a runner does.
 sed -i '/^path = "\.\.\//d' "$CYML"
 
+# ⚠ **`lib sync --full` FIRST, exactly as CI does.** `lib/` holds BOTH the
+# pinned stdlib snapshot AND the resolved deps — `lib/tyche.cyr`, `lib/majra.cyr`
+# and friends are dependencies that land there, not stdlib. `cyrius deps` only
+# OVERLAYS onto whatever is already in `lib/`, and it hashes the whole directory.
+#
+# Running deps alone over a locally-accumulated `lib/` therefore hashes a
+# directory a runner never produces, and the lock disagrees on the file SET
+# rather than on any version. CI's sequence is sync-then-deps; this must be the
+# same sequence or it is not reproducing CI at all.
+cyrius lib sync --full >/dev/null
 cyrius deps >/dev/null
 
 # The manifest comes back via the EXIT trap; the lock stays as produced.
