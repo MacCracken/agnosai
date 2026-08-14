@@ -128,6 +128,135 @@ them — `src/main.cyr` cannot be included by a `.tcyr`.
 security control had been switched off read `...by AGNOSAI_RATE_LIMIT` — naming
 the variable but dropping the `=0` that identifies the setting responsible.
 
+### Fixed — a function-level parity audit of every module against `rust-old/`
+
+An eight-group sweep comparing each oracle symbol to its port raised 30 candidate
+remainders; 18 were refuted on inspection and **20 of the surviving 22 are fixed
+here**, each with a mutation that reproduces the original defect. The two left
+open are named at the end.
+
+**The limiter, the callback and the deadline — behaviour that was simply absent:**
+
+- **`POST` to an A2A callback URL sent NO BODY.** `agnosai_guarded_fetch`
+  hardcoded sandhi's body arguments to `0, 0`, so `AGN_CB_BODY` was written and
+  never read: the delegating system was woken by an empty POST and had to
+  re-poll for the result the callback exists to deliver. It also carried the
+  *request* where the oracle sends the *response* (`a2a.rs:157`). Added
+  `agnosai_guarded_fetch_body`; the payload is now rendered at dispatch time,
+  because the response value tree lives in the request arena and that arena is
+  reset before a detached thread could read it.
+  ⚠ **A seam was required to test it at all** — the SSRF gate refuses loopback,
+  so no local listener can observe the wire, and reverting the body to `0, 0`
+  passed the entire suite. `_agnosai_serve_callback_fp` is the same injectable
+  transport `agnosai_fetch_package_via` already uses.
+- **A Parallel crew never observed its deadline.** The cooperative check sat on
+  the sequential and DAG loop heads only, so a crew past `budget.max_duration_secs`
+  ran to completion and reported its results as if it had finished in time.
+  ⚠ **Adding the check crashed the server before the test caught it**: the wave
+  loop builds every job up front, so breaking early left a tail with
+  `AGN_CJ_RESULT == 0` and the collection loop dereferenced it. Both halves are
+  mutation-covered, one of them by the segfault.
+- **`CrewProfile.sandbox_strength` was computed nowhere.** The field, its setter
+  and its serialization were all ported and covered by `tests/core_crew.tcyr`,
+  and nothing outside a test ever called the setter — so every profile omitted a
+  number the oracle emits. Now scored from `SandboxPolicy::process()` (60).
+
+**Silent wrong answers:**
+
+- **An uppercase UUID 404'd a crew that exists.** Four wire sites validated with
+  `agnosai_uuid_is_valid` (which accepts uppercase) and then used the RAW segment
+  as a `map_get` key on a Str-keyed map, where ids are minted lowercase. On
+  `submit_approval` that meant **200 with `delivered: false`** on a
+  human-in-the-loop gate. `_agnosai_uuid_key_a` gives `Path<Uuid>` semantics —
+  parse, then look up by value — and allocates nothing for an already-lowercase
+  key.
+- **`redact` stopped after 1000 replacements** of a prefix, leaving occurrence
+  1001 onward verbatim with nothing logged; and it bounded the token with four
+  ASCII bytes where the oracle uses `char::is_whitespace`, so a key followed by a
+  form feed or NBSP made it swallow the rest of the response.
+- **`tool_input_get_int` passed negatives through.** The oracle's `as_u64` is
+  unsigned, so any negative is `None`; `-1` only looked right because it collides
+  with `AGNOSAI_NO_LIMIT`. It reached the wire as `"max_tokens": -5`.
+- **`from_value` was lenient where serde is strict** — `Task.description`,
+  `TaskResult.{output,status}` and three `CrewProfile` fields carry no
+  `#[serde(default)]`. Defaulting `status` to Pending was the worst of them: a
+  completed result came back reporting itself unfinished.
+- **The relay handed majra `str_data` where a cstr is required.** `str_cat`,
+  `str_sub` and `str_new` do not append a terminator, so a node id, target or
+  topic built rather than written as a literal ran off the end of its buffer.
+  Same class as the majra 2.6.4 ratelimit key bug; literals happen to be
+  terminated, which is why every test passed.
+- **`f64_max` propagated NaN** where Rust's documented contract is "ignoring
+  NaN", poisoning `max_next_q` and every Q value derived from it.
+- **The interner handed out `u32::MAX`** — the oracle's `checked_add` panics
+  before the mint returns, so 4294967294 is the largest usable id.
+- **`load_all_from_dir` chose the error by extension before reading**, so
+  `/nonexistent.txt` gave `InvalidDefinition` where the oracle gives `Io`. The
+  port argued this was better and cheaper; it is a divergence without an ADR, and
+  conforming is cheaper than justifying a saved `open` on an error path.
+- **`concurrent_users: 0` ran a real one-worker load test.** The oracle applies
+  only `.min(500)`; zero is legal and answers "no requests completed". The port
+  raised it to 1 and sent traffic the caller asked it not to send.
+
+**Records that were never written:** the A2A over-length and metadata-limit
+rejections, the crew-execution error, the `error` key on crew validation warnings
+(taken as a parameter and never emitted), the WASM package-scan completion count,
+and `endpoint`/`service_name` on the OTLP init line.
+
+**Tests for behaviour that had none:**
+
+- **A concurrent `ToolRegistry` test.** The oracle got no-lost-updates from
+  `DashMap`; the port replaced it with a mutex the module header calls mandatory,
+  and nothing drove the registry from two threads. ⚠ **The oracle's own shape
+  cannot detect a lost update** — 20 writers over two names converge whether or
+  not the map is guarded, and commenting out every `mutex_lock` left it green.
+  Rewritten with disjoint key ranges: the mutation now yields **850, 783 and 969
+  of 1000** across three runs.
+- **WASM stdout capture and stdin delivery**, the module's core contract per
+  ADR 019 and the one claim its tests did not check — `config_stdin` could have
+  been dropped entirely with the suite green. Both now run through a hand-encoded
+  184-byte WASI module that echoes stdin to stdout.
+- ⚠ **The NaN test needed its NaN LAST.** `f64_max(a, b)` returns `b` whenever
+  `f64_gt(a, b)` is false, and every comparison against NaN is false — so with
+  the NaN first the next finite value overwrites it and the bug hides.
+
+### Performance — B2's tail, and why it was smaller than advertised
+
+`crew_runner` was carried as "63 bayan calls, the largest un-threaded allocator
+surface left". Classified by **lifetime** rather than counted: 16 build event
+payloads a subscriber reads after the emit, 14 build task-result metadata, 6
+build the profile — all retained, none movable. **Exactly 4 are transient.** That
+site is now pooled: **2,504 -> 2,280 B per `build_request` with three context
+keys (-8.9%)**, no-context path unchanged at 1,744 B.
+
+⚠ The first measurement of this showed no change and was meaningless: with no LLM
+client `agnosai_execute_task` takes the placeholder arm and never calls
+`build_request`.
+
+### Fixed — `lib/` had been stale against the pinned snapshot
+
+⚠ **agnosai was building against sandhi 1.9.9 all session.** `lib/sandhi.cyr`
+still carried 1.9.9 while the pinned 6.5.20 snapshot had been refreshed to
+**1.9.10** — the null-`body_ptr` fix released earlier the same day and folded
+upstream. `cyrius lib sync --full` had never been re-run after that fold, and
+`check-clean`'s lib-snapshot gate only compared again once a dep pin changed.
+
+It masked nothing (both call sites guard the null independently), but every
+suite result and allocation measurement taken before this ran against the old
+sandhi. **The three-step is `lib sync --full` -> `deps` -> `build`, and verifying
+`lib/` AFTER a build is the only reading that counts** — bumping a dep pin and
+running `deps` alone does not refresh the snapshot.
+
+### Not fixed, and why
+
+- **The A2A run-failure error text and the security-audit failure detail** both
+  collapse an underlying error to a fixed string. `agnosai_orchestrator_run_crew`
+  returns 0 with no error object and `agnosai_guarded_fetch` discards sandhi's
+  error kind, so surfacing the reason is an API change across several callers,
+  not a text fix.
+- ~~The WASM fuel budget~~ ✅ **closed** by kavach 3.11.11 — see the dep bump
+  above. ADR 019's Residual no longer describes an open gap.
+
 ### Performance — the limiter's cost on the default request path, measured
 
 ⚠ **`benches/server.bcyr` included `src/server/rate_limit.cyr` and benchmarked
@@ -160,6 +289,21 @@ Two things worth reading off these:
 
 ### Changed
 
+- **`[deps.kavach]` 3.11.10 -> 3.11.11** — adds `config_fuel`, so
+  `agnosai_wasm_sandbox_fuel` finally advertises a limit the runtime enforces.
+  kavach derived its own budget from the timeout (`timeout_ms * 1e6` = **3e10 at
+  the default 30 s, 30x** the oracle's `store.set_fuel(1e9)`), and the two
+  cannot be conflated without capping wall time at one second. Filed from here;
+  `agnosai_wasm_execute` now sends the configured budget, and
+  `agnosai_wasm_sandbox_set_fuel` is the port-local setter the oracle does not
+  need (it builds the struct directly).
+- **`[deps.majra]` 2.6.4 -> 2.6.5** — closes both relay divergences this port
+  had been carrying as "owed to majra": `capacity` was accepted and discarded
+  (`relay_subscribe` hardcoded `chan_new(256)`), and the message timestamp was
+  `CLOCK_MONOTONIC` where the oracle stamps `DateTime<Utc>` — meaningless once
+  the message leaves the emitting process. `tests/fleet_relay.tcyr` had a block
+  deliberately asserting the *broken* behaviour so a reader saw it as known
+  rather than accidental; those two assertions now assert the oracle's.
 - **`[deps.majra]` 2.6.3 -> 2.6.4** — carries the limiter's half of the key fix:
   it now owns its copy of the bucket key instead of borrowing the caller's,
   eviction returns both key and bucket to the freelist instead of leaking them,

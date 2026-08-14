@@ -100,6 +100,47 @@ fn main() {
     "unknown priority -> normal");
     assert(agnosai_task_from_value(agnosai_task_to_value(t)) != 0,
     "agnosai_task_from_value accepts a task value tree");
+
+    # ⚠ **Required fields are REQUIRED.** `Task.description` and
+    # `TaskResult.{output,status}` carry no `#[serde(default)]` (`task.rs:17`,
+    # `:165-167` — only `metadata` does at `:169`), so serde fails the whole
+    # value. The port substituted empty/Pending and returned a valid object, so a
+    # truncated record became a task that silently does nothing, or a completed
+    # result that came back reporting itself still pending.
+    var no_desc = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(no_desc, str_from("id"),
+    bayan_json_v_str_new(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8")));
+    assert_eq(agnosai_task_from_value(no_desc), 0,
+    "a task without `description` is REJECTED, not defaulted to empty");
+
+    var bad_agent = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(bad_agent, str_from("id"),
+    bayan_json_v_str_new(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8")));
+    bayan_json_v_obj_set(bad_agent, str_from("description"), bayan_json_v_str_new(str_from("d")));
+    bayan_json_v_obj_set(bad_agent, str_from("assigned_agent"),
+    bayan_json_v_str_new(str_from("not-a-uuid")));
+    assert_eq(agnosai_task_from_value(bad_agent), 0,
+    "a present-but-unparseable `assigned_agent` is an ERROR, not silently unassigned");
+
+    var no_out = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(no_out, str_from("task_id"),
+    bayan_json_v_str_new(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8")));
+    bayan_json_v_obj_set(no_out, str_from("status"), bayan_json_v_str_new(str_from("completed")));
+    assert_eq(agnosai_task_result_from_value(no_out), 0,
+    "a result without `output` is rejected");
+
+    var no_status = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(no_status, str_from("task_id"),
+    bayan_json_v_str_new(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8")));
+    bayan_json_v_obj_set(no_status, str_from("output"), bayan_json_v_str_new(str_from("o")));
+    assert_eq(agnosai_task_result_from_value(no_status), 0,
+    "and one without `status` is rejected rather than coming back Pending");
+
+    # The round trip still works, so the strictness did not break the real shape.
+    var strict_rt = agnosai_task_result_new(str_from("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
+    str_from("out"), AGNOSAI_STATUS_COMPLETED);
+    assert(agnosai_task_result_from_value(agnosai_task_result_to_value(strict_rt)) != 0,
+    "a full result still round-trips");
     assert_eq(agnosai_task_risk_from_wire(str_from("bogus")), AGNOSAI_RISK_LOW, "unknown risk -> low");
 
     # --- process_mode_serde_* : the four variants and their wire forms ---

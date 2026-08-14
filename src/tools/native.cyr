@@ -257,16 +257,28 @@ fn agnosai_tool_input_get_f64(input, key: Str, found): i64 {
     return f64_from(0);
 }
 
-# An integer parameter, or AGNOSAI_NO_LIMIT when absent or not an integer.
+# An integer parameter, or AGNOSAI_NO_LIMIT when absent, not an integer, or
+# NEGATIVE.
 #
 # Unlike `get_f64` this does NOT accept a float: the oracle's `as_u64` returns
 # None for `1.5`, and a tool that silently truncated a fractional count would be
 # a worse bug than a missing parameter.
+#
+# ⚠ **The oracle's `as_u64` is UNSIGNED, so any negative is `None` — its own
+# `tool_input_get_u64_returns_none_for_negative` pins that** (`native.rs:190`).
+# The port returned the raw value for every JSON integer and signalled "absent"
+# only through the `AGNOSAI_NO_LIMIT` sentinel, which is `-1` — so `-1` behaved
+# correctly by coincidence and every OTHER negative was passed through as a real
+# value. That reached the wire at all three call sites: `synapse_infer` sent
+# `"max_tokens": -5` where the oracle omits the key, and `mneme_search` sent
+# `&limit=-5` where the oracle falls back to its default.
 fn agnosai_tool_input_get_int(input, key: Str): i64 {
     var v = map_get(load64(input + AGN_INPUT_PARAMETERS), key);
     if (v == 0) { return AGNOSAI_NO_LIMIT; }
     if (bayan_json_v_is_int(v) == 0) { return AGNOSAI_NO_LIMIT; }
-    return bayan_json_v_int(v);
+    var n = bayan_json_v_int(v);
+    if (n < 0) { return AGNOSAI_NO_LIMIT; }
+    return n;
 }
 
 # Build a tool input from a bayan JSON object of parameters.

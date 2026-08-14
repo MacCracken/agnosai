@@ -49,6 +49,13 @@ include "src/server/output_filter.cyr"
 include "src/chan_lossy.cyr"
 include "src/server/sse.cyr"
 include "src/server/prometheus.cyr"
+# `_agnosai_crew_build_profile` scores the crew's sandbox policy, which the
+# oracle does too (`crew_runner.rs:198-214`), so both producers are needed here.
+# `_agnosai_crew_build_request` pools an arena for the per-task context tree
+# (roadmap B2's tail), so this file needs the pool alongside crew_runner.
+include "src/arena_pool.cyr"
+include "src/sandbox/policy.cyr"
+include "src/sandbox/kavach_bridge.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "tests/test_helpers.cyr"
 
@@ -637,6 +644,20 @@ fn main() {
     "with a duration per task, taken from each result's metadata");
     assert_eq(agnosai_crew_profile_cost_micro_usd(prof), 0,
     "and zero cost — the placeholder path never calls an LLM, so no task reports one");
+
+    # ⚠ **`sandbox_strength` must be SET.** The oracle scores
+    # `SandboxPolicy::process()` through `kavach_bridge::strength_for_policy` on
+    # every crew run (`crew_runner.rs:198-214`). The port had the field, the
+    # setter and the serialization — all covered by `tests/core_crew.tcyr` — and
+    # **no caller outside a test**, so every profile the server emitted omitted a
+    # number the oracle emits. `AGNOSAI_NO_LIMIT` is the unset sentinel.
+    assert(agnosai_crew_profile_sandbox_strength(prof) != AGNOSAI_NO_LIMIT,
+    "the profile carries a sandbox strength — unset here is the pre-2026-08-13 gap");
+    assert_eq(agnosai_crew_profile_sandbox_strength(prof),
+    agnosai_kavach_strength_for_policy(agnosai_sandbox_policy_process()),
+    "and it is the score for SandboxPolicy::process(), which is what the oracle scores");
+    assert(agnosai_crew_profile_sandbox_strength(prof) > 0,
+    "a real 0-100 score, not a zero standing in for absent");
 
     # --- test_parallel_execution / test_parallel_single_concurrency ---
     # Real OS threads: alloc has been thread-safe since cyrius 6.0.64.

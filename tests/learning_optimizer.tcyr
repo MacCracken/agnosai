@@ -122,6 +122,40 @@ fn main() {
     _t_assert_f64(agnosai_qlearner_get_value(q9, a1, s1), F64_TWO, "Q(a1,s1) is its own cell");
     assert_eq(agnosai_qlearner_table_size(q9), 2, "swapped pair is a distinct key");
 
+    # ⚠ **A NaN next-state Q must be DISCARDED, as `f64::max` discards it.**
+    # `lib/math.cyr`'s `f64_max` is a bare `f64_gt` compare, and every comparison
+    # against NaN is false, so it RETURNED the NaN — poisoning `max_next_q`, then
+    # `td_target`, `td_error` and `new_q`, and every value derived from the table
+    # afterwards. Rust's `f64::max` is documented as "ignoring NaN".
+    #
+    # The NaN is injected through a reward, since values are only ever written by
+    # `update`: Q(s2,poison) becomes NaN, and the next update folds it.
+    var nan = f64_div(f64_from(0), f64_from(0));
+    assert_eq(f64_eq(nan, nan), 0, "precondition: that really is a NaN");
+
+    var nq = agnosai_qlearner_new(F64_ONE, F64_ONE);
+    var no_acts = vec_new();
+    agnosai_qlearner_update(nq, s2, str_from("poison"), nan, str_from("terminal"), no_acts);
+    var poisoned = agnosai_qlearner_get_value(nq, s2, str_from("poison"));
+    assert_eq(f64_eq(poisoned, poisoned), 0, "precondition: Q(s2,poison) is now NaN");
+
+    agnosai_qlearner_update(nq, s2, str_from("good"), F64_ONE, str_from("terminal"), no_acts);
+    # ⚠ **Order matters, and the obvious order is vacuous.** `f64_max(a, b)`
+    # returns `b` whenever `f64_gt(a, b)` is false, and every comparison against
+    # NaN is false — so with the NaN FIRST the next finite value overwrites it
+    # and the bug hides. The NaN must come LAST for the fold to carry it out.
+    # Mutation-verified: with ("poison", "good") the bare `f64_max` passes.
+    agnosai_qlearner_update(nq, s1, a1, F64_ONE, s2,
+    _t_actions2(str_from("good"), str_from("poison")));
+    var folded = agnosai_qlearner_get_value(nq, s1, a1);
+    assert_eq(f64_eq(folded, folded), 1,
+    "the updated Q is FINITE — a NaN here means the fold propagated it");
+
+    # ⚠ `u32::MAX` is never handed out: the oracle's `checked_add` overflows and
+    # panics before the mint returns, so the largest usable id is 4294967294.
+    assert_eq(AGNOSAI_INTERN_ID_LIMIT, 0xFFFFFFFF,
+    "the interner stops one BELOW 2^32 — 0x100000000 hands out u32::MAX");
+
     return assert_summary();
 }
 

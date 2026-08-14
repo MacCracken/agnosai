@@ -101,8 +101,18 @@ fn main() {
     "an octal-encoded loopback target is refused");
 
     # --- clamps ---
-    assert_eq(agnosai_lt_clamp_users(0), 1, "user count clamps up to 1");
-    assert_eq(agnosai_lt_clamp_users(0 - 5), 1, "a negative user count clamps to 1");
+    # ⚠ **There is NO lower clamp — the oracle applies only `.min(500)`.**
+    # `concurrent_users: 0` is a legal `u64`: it spawns nothing, collects no
+    # latencies, and the tool answers `"load test failed: no requests
+    # completed"`. Raising 0 to 1 made the port run a real one-worker load test
+    # against the target for the full duration — traffic the caller explicitly
+    # asked not to send, and a success where the oracle reports a failure.
+    assert_eq(agnosai_lt_clamp_users(0), 0, "zero users passes through — no lower clamp");
+    # A negative cannot arrive through the tool: `concurrent_users` is `u64` in
+    # the oracle, and `agnosai_tool_input_get_int` reads any negative as absent
+    # (which then defaults to 10), so this only pins that the clamp itself adds
+    # no floor.
+    assert_eq(agnosai_lt_clamp_users(0 - 5), 0 - 5, "and no floor is invented for a negative");
     assert_eq(agnosai_lt_clamp_users(10), 10, "a normal user count passes through");
     assert_eq(agnosai_lt_clamp_users(9999), 500, "user count clamps down to 500");
     assert_eq(agnosai_lt_clamp_duration(0), 1, "duration clamps up to 1s");

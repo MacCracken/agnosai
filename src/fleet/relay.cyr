@@ -68,12 +68,27 @@ enum AgnosaiRelayStatsOff {
 
 # The oracle's `Relay::new(node_id, capacity)`.
 #
-# ⚠ `capacity` is recorded but NOT applied — majra's `relay_subscribe` hardcodes
-# 256. Read it back with `agnosai_relay_capacity` to see what was asked for; the
-# effective capacity is always 256. See the header.
+# ✅ **`capacity` is APPLIED as of majra 2.6.5.** It was recorded and discarded
+# — majra's `relay_subscribe` hardcoded `chan_new(256)`, so a relay asking for 4
+# and one asking for 4096 behaved identically. agnosai filed it; majra added
+# `relay_with_capacity`, which this now calls.
+# ⚠ **`str_cstr`, never `str_data`, across this boundary.** majra takes these as
+# NUL-terminated C strings — `relay_new` stores `node_id` verbatim
+# (`lib/majra.cyr:2114`) and `relay_receive_ex` keys its dedup map with
+# `map_get(seen, sender)` on a **cstr-keyed** map — but `str_cat`, `str_sub` and
+# `str_new` do NOT append a terminator (`lib/str.cyr:174-183, :195-197`). A node
+# id, target or topic built rather than written as a literal therefore ran off
+# the end of its buffer into whatever followed, so `strlen`/`streq` compared
+# trailing garbage. Literals happen to be terminated, which is why every test
+# using one passed. Same class as the majra 2.6.4 ratelimit key bug, and the
+# copies are process-lifetime here (node ids and topics are set up once, not
+# per request), so the global-bump allocation is the right home for them.
+
+# The oracle's `Relay::new(node_id, capacity)` — a relay whose subscriber
+# channels hold `capacity` messages.
 fn agnosai_relay_new(node_id: Str, capacity): i64 {
     var r = alloc(AGN_RLY_SIZE);
-    store64(r + AGN_RLY_INNER, relay_new(str_data(node_id)));
+    store64(r + AGN_RLY_INNER, relay_with_capacity(str_cstr(node_id), capacity));
     store64(r + AGN_RLY_CAPACITY, capacity);
     return r;
 }
@@ -105,7 +120,7 @@ fn agnosai_relay_node_id(r): i64 {
 # Send to a specific node, or broadcast when `to` is empty. Returns the
 # sequence number assigned, which starts at 1 and increments per send.
 fn agnosai_relay_send(r, to: Str, topic: Str, payload): i64 {
-    return relay_send(load64(r + AGN_RLY_INNER), str_data(to), str_data(topic), payload);
+    return relay_send(load64(r + AGN_RLY_INNER), str_cstr(to), str_cstr(topic), payload);
 }
 
 # The oracle's `broadcast` — `send` with an empty target.
@@ -148,7 +163,7 @@ fn agnosai_incoming_message(inc): i64 {
 
 # Build a RelayMessage. An empty `to` marks it a broadcast.
 fn agnosai_relay_message_new(seq, from: Str, to: Str, topic: Str, payload): i64 {
-    return relay_msg_new(seq, str_data(from), str_data(to), str_data(topic), payload);
+    return relay_msg_new(seq, str_cstr(from), str_cstr(to), str_cstr(topic), payload);
 }
 
 # The message's sequence number.
@@ -224,5 +239,5 @@ fn agnosai_relay_sequence_gaps(r): i64 {
 
 # The last sequence seen from `from`, or -1 if that sender is unknown.
 fn agnosai_relay_last_seq(r, from: Str): i64 {
-    return relay_last_seq(load64(r + AGN_RLY_INNER), str_data(from));
+    return relay_last_seq(load64(r + AGN_RLY_INNER), str_cstr(from));
 }

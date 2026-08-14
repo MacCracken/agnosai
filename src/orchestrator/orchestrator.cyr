@@ -284,8 +284,22 @@ fn _agnosai_orch_register(o, spec): i64 {
 # The body is two shared halves so the blocking and async paths cannot drift —
 # see `_agnosai_orch_register` above and `_agnosai_orch_finish` below.
 fn agnosai_orchestrator_run_crew(o, spec): i64 {
-    return _agnosai_orch_finish(o, _agnosai_orch_register(o, spec),
-    agnosai_crew_id(spec), agnosai_crew_name(spec));
+    return agnosai_orchestrator_run_crew_err(o, spec, 0);
+}
+
+# `agnosai_orchestrator_run_crew`, reporting WHY it failed.
+#
+# ⚠ **The reason existed and was thrown away.** `_agnosai_orch_finish` already
+# builds a `run_err` for `agnosai_crew_runner_run` — a cyclic DAG is the arm the
+# oracle's `?` propagates — and then returned a bare 0, so every caller could say
+# only "it failed". `routes/a2a.cyr` sends that reason to the delegating system
+# on the wire (`a2a.rs:182` is `error: Some(e.to_string())`), which is the whole
+# point of an A2A error field.
+#
+# `out_err` of 0 means "don't care", which is what the bare form passes.
+fn agnosai_orchestrator_run_crew_err(o, spec, out_err): i64 {
+    return _agnosai_orch_finish_err(o, _agnosai_orch_register(o, spec),
+    agnosai_crew_id(spec), agnosai_crew_name(spec), out_err);
 }
 
 # Run a registered crew to completion and store its outcome.
@@ -325,6 +339,10 @@ fn _agnosai_orch_timeout_state(crew_id: Str, timeout_secs): i64 {
 }
 
 fn _agnosai_orch_finish(o, runner, crew_id: Str, crew_name: Str): i64 {
+    return _agnosai_orch_finish_err(o, runner, crew_id, crew_name, 0);
+}
+
+fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     var bus = load64(o + AGN_OR_EVENTS);
 
@@ -355,6 +373,8 @@ fn _agnosai_orch_finish(o, runner, crew_id: Str, crew_name: Str): i64 {
     # A cyclic DAG errors out. The oracle's `?` propagates it, so no state is
     # stored and no `crew_finished` is audited — the crew never ran.
     if (state == 0) {
+        # Hand the caller the reason, not just the failure.
+        if (out_err != 0) { store64(out_err, load64(&run_err)); }
         mutex_lock(mtx);
         map_delete(load64(o + AGN_OR_CANCEL), crew_id);
         mutex_unlock(mtx);

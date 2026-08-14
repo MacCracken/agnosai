@@ -115,7 +115,103 @@ fn _t_tn_a_forms(): i64 {
     return 0;
 }
 
+# --- Oracle: `concurrent_access` (registry.rs:163-195) --------------------
+#
+# ⚠ **The one behaviour the oracle pins that nothing here exercised.** The
+# oracle got no-lost-updates from `DashMap`; the port replaced it with a hashmap
+# behind a futex mutex and the module header calls that mutex mandatory, because
+# `sandhi_server_run_pooled` makes every worker a real OS thread. Until
+# 2026-08-13 no test drove the registry from more than one thread, so the mutex
+# could have been removed entirely with the suite green.
+#
+# Shaped like the oracle's: 20 workers alternating register/list/get/has/count,
+# both tools registered at the end, and a count of exactly 2 — registering the
+# same name twice must replace, not duplicate. The two tools are built locally
+# rather than pulled from `builtin/basic`, for the same reason the rest of this
+# suite does: including a builtin to get a fixture would widen the file's
+# coverage reference.
+var _T_REG_THREADS = 20;
+var _T_REG_PER_THREAD = 50;
+var _t_reg_shared = 0;
+
+fn _t_reg_worker(id): i64 {
+    if (id % 2 == 0) {
+        agnosai_tool_registry_register(_t_reg_shared, agnosai_tool_new(str_from("alpha"),
+        str_from("d"), &_t_tn_schema_fp, &_t_tn_exec_fp, 0));
+    } else {
+        agnosai_tool_registry_register(_t_reg_shared, agnosai_tool_new(str_from("beta"),
+        str_from("d"), &_t_tn_schema_fp, &_t_tn_exec_fp, 0));
+    }
+    # Concurrent reads while the writes above are in flight.
+    agnosai_tool_registry_list(_t_reg_shared);
+    agnosai_tool_registry_get(_t_reg_shared, str_from("alpha"));
+    agnosai_tool_registry_has(_t_reg_shared, str_from("beta"));
+    agnosai_tool_registry_count(_t_reg_shared);
+    return 0;
+}
+
+# Each worker owns a disjoint name range, so a lost update is a count shortfall
+# rather than a value that happens to converge.
+fn _t_reg_disjoint_worker(id): i64 {
+    for (var i = 0; i < _T_REG_PER_THREAD; i = i + 1) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "w");
+        str_builder_add_int(sb, id);
+        str_builder_add_cstr(sb, "-");
+        str_builder_add_int(sb, i);
+        var nm = str_builder_build(sb);
+        agnosai_tool_registry_register(_t_reg_shared, agnosai_tool_new(nm, nm,
+        &_t_tn_schema_fp, &_t_tn_exec_fp, 0));
+    }
+    return 0;
+}
+
+fn _t_registry_concurrent_access(): i64 {
+    _t_reg_shared = agnosai_tool_registry_new();
+    var threads = vec_new();
+    for (var t = 0; t < _T_REG_THREADS; t = t + 1) {
+        var h = thread_create(&_t_reg_worker, t);
+        if (h == 0) { _t_reg_worker(t); } else { vec_push(threads, h); }
+    }
+    for (var j = 0; j < vec_len(threads); j = j + 1) { thread_join(vec_get(threads, j)); }
+
+    assert_eq(agnosai_tool_registry_has(_t_reg_shared, str_from("alpha")), 1,
+    "alpha is registered after 20 concurrent workers");
+    assert_eq(agnosai_tool_registry_has(_t_reg_shared, str_from("beta")), 1,
+    "and so is beta");
+    assert_eq(agnosai_tool_registry_count(_t_reg_shared), 2,
+    "exactly 2 — re-registering a name REPLACES, so 20 writers leave 2 entries");
+    assert_eq(vec_len(agnosai_tool_registry_list(_t_reg_shared)), 2,
+    "and the snapshot agrees, so no torn entry survived the race");
+
+    # ⚠ **The oracle's shape alone CANNOT detect a lost update, and neither
+    # could this until the disjoint pass below.** Twenty writers contending over
+    # two names converge on the same final state whether or not the map is
+    # guarded — mutation-verified: commenting out every `mutex_lock`/`unlock` in
+    # `registry.cyr` left the assertions above green across five runs. A lost
+    # update is only visible when each writer owns keys nobody else writes, so
+    # the shortfall shows up in the count. Same construction as
+    # `_t_definitions_concurrent_inserts` in `tests/server_state.tcyr`.
+    _t_reg_shared = agnosai_tool_registry_new();
+    var dthreads = vec_new();
+    for (var d = 0; d < _T_REG_THREADS; d = d + 1) {
+        var dh = thread_create(&_t_reg_disjoint_worker, d);
+        if (dh == 0) { _t_reg_disjoint_worker(d); } else { vec_push(dthreads, dh); }
+    }
+    for (var k = 0; k < vec_len(dthreads); k = k + 1) { thread_join(vec_get(dthreads, k)); }
+
+    var want = _T_REG_THREADS * _T_REG_PER_THREAD;
+    assert_eq(agnosai_tool_registry_count(_t_reg_shared), want,
+    "every concurrent registration landed — a shortfall here is a lost update");
+    assert_eq(vec_len(agnosai_tool_registry_list(_t_reg_shared)), want,
+    "and the snapshot agrees");
+    assert_eq(agnosai_tool_registry_has(_t_reg_shared, str_from("w0-0")), 1,
+    "the first worker's first tool is present, not merely the right count");
+    return 0;
+}
+
 fn main() {
+    _t_registry_concurrent_access();
     _t_tn_a_forms();
     alloc_init();
 
@@ -174,6 +270,23 @@ fn main() {
     assert_eq(agnosai_tool_input_get_int(ratio, str_from("n")), 7, "get_int returns an integer");
     assert_eq(agnosai_tool_input_get_int(ratio, str_from("ratio")), AGNOSAI_NO_LIMIT,
     "get_int rejects a float rather than silently truncating it");
+    # ⚠ **A NEGATIVE reads as absent** — the oracle's `as_u64` is unsigned, so
+    # `Some(-5)` is `None`, pinned by its own
+    # `tool_input_get_u64_returns_none_for_negative` (`native.rs:190`). The port
+    # passed every negative through as a real value, and `-1` only looked right
+    # because it collides with the `AGNOSAI_NO_LIMIT` sentinel. It reached the
+    # wire: `synapse_infer` sent `"max_tokens": -5` where the oracle omits the
+    # key, `mneme_search` sent `&limit=-5` where the oracle sends its default.
+    agnosai_tool_input_set(ratio, str_from("neg"), bayan_json_v_int_new(0 - 5));
+    assert_eq(agnosai_tool_input_get_int(ratio, str_from("neg")), AGNOSAI_NO_LIMIT,
+    "a negative integer reads as ABSENT, not as -5");
+    agnosai_tool_input_set(ratio, str_from("negbig"), bayan_json_v_int_new(0 - 999999));
+    assert_eq(agnosai_tool_input_get_int(ratio, str_from("negbig")), AGNOSAI_NO_LIMIT,
+    "and so does a large negative");
+    agnosai_tool_input_set(ratio, str_from("zero"), bayan_json_v_int_new(0));
+    assert_eq(agnosai_tool_input_get_int(ratio, str_from("zero")), 0,
+    "but ZERO is a real value — `as_u64` accepts it, and the sentinel is -1");
+
     assert_eq(agnosai_tool_input_get_int(ratio, str_from("missing")), AGNOSAI_NO_LIMIT,
     "get_int returns no-limit for a missing key");
 

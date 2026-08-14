@@ -37,7 +37,12 @@ enum AgnosaiQLearnerOff {
 
 # One past the largest id the interner will mint — the u32 ID space Rust's
 # `checked_add` guards.
-var AGNOSAI_INTERN_ID_LIMIT = 0x100000000;
+# ⚠ **`u32::MAX` is never handed out.** The oracle mints `id = next_id` then
+# `next_id.checked_add(1).expect(..)`, so the increment overflows and panics
+# BEFORE the mint at `next_id == u32::MAX` returns — the largest usable id is
+# 4294967294. The port's limit was `0x100000000`, one too high, so it returned
+# 4294967295 successfully and panicked only on the following call.
+var AGNOSAI_INTERN_ID_LIMIT = 0xFFFFFFFF;
 
 # Returned by best_action in place of Rust's `None`.
 var AGNOSAI_Q_NO_ACTION = 0;
@@ -132,6 +137,26 @@ fn agnosai_qlearner_get_value(q, state: Str, action: Str): i64 {
 # `reward` is an f64 bit pattern; `next_actions` is a vec of Str (possibly
 # empty). max_Q folds from 0.0, so it is never negative — matching the oracle's
 # `fold(0.0_f64, f64::max)`.
+# `f64::max`'s contract — **"ignoring NaN"**, which `lib/math.cyr`'s `f64_max`
+# does not implement.
+#
+# ⚠ `f64_max(a, b)` is `if (f64_gt(a, b)) { return a; } return b;`, and every
+# comparison against NaN is false — so `f64_max(0.0, NaN)` returns **NaN**,
+# where Rust returns 0.0. In the Q fold that poisons `max_next_q`, and through
+# `td_target` -> `td_error` -> `new_q` it poisons the whole update and every
+# value derived from it afterwards. Rust discards the NaN and the fold stays
+# finite. `lib/` is owned by `cyrius deps`, so the fix belongs here.
+fn _agnosai_f64_max_nan_safe(a, b): i64 {
+    if (f64_eq(b, b) == 0) { return a; }
+    if (f64_eq(a, a) == 0) { return b; }
+    if (f64_gt(a, b) == 1) { return a; }
+    return b;
+}
+
+# The oracle's `QLearner::update` — one temporal-difference step.
+#
+# `new_q = current + lr * (reward + discount * max_next_q - current)`, folding
+# the next state's action values through `_agnosai_f64_max_nan_safe`.
 fn agnosai_qlearner_update(q, state: Str, action: Str, reward, next_state: Str, next_actions): i64 {
     var current_q = agnosai_qlearner_get_value(q, state, action);
 
@@ -139,7 +164,7 @@ fn agnosai_qlearner_update(q, state: Str, action: Str, reward, next_state: Str, 
     var n = vec_len(next_actions);
     for (var i = 0; i < n; i = i + 1) {
         var next_q = agnosai_qlearner_get_value(q, next_state, vec_get(next_actions, i));
-        max_next_q = f64_max(max_next_q, next_q);
+        max_next_q = _agnosai_f64_max_nan_safe(max_next_q, next_q);
     }
 
     var td_target = f64_add(reward, f64_mul(load64(q + AGN_Q_DISCOUNT_FACTOR), max_next_q));

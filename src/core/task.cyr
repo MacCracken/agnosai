@@ -497,9 +497,16 @@ fn agnosai_task_from_value(v): i64 {
     var id = agnosai_uuid_canonical(bayan_json_v_str(id_v));
     if (id == 0) { return 0; }
 
-    var desc = str_from("");
+    # ⚠ **`description` is REQUIRED.** `Task.description: String` carries no
+    # `#[serde(default)]` (`rust-old/src/core/task.rs:17`), so serde_json fails
+    # the whole value with `missing field "description"`. The port substituted an
+    # empty string and returned a valid task, which turns a malformed persisted
+    # record — or a malformed request body — into a task that silently does
+    # nothing, instead of an error the caller can see. `id` is already required
+    # for the same reason; this makes the two agree.
     var desc_v = bayan_json_v_obj_get(v, "description");
-    if (desc_v != 0 && bayan_json_v_is_str(desc_v) == 1) { desc = bayan_json_v_str(desc_v); }
+    if (desc_v == 0 || bayan_json_v_is_str(desc_v) == 0) { return 0; }
+    var desc = bayan_json_v_str(desc_v);
 
     var t = agnosai_task_new(desc);
     store64(t + AGN_TASK_ID, id);
@@ -509,9 +516,15 @@ fn agnosai_task_from_value(v): i64 {
         store64(t + AGN_TASK_EXPECTED_OUTPUT, bayan_json_v_str(eo));
     }
 
+    # ⚠ A present-but-unparseable `assigned_agent` is an ERROR, not "unassigned".
+    # The oracle types it `Option<Uuid>`, so serde rejects a string that is not a
+    # UUID; the port stored `agnosai_uuid_canonical`'s 0 and later read it as
+    # unassigned, silently detaching a task from the agent the record named.
     var aa = bayan_json_v_obj_get(v, "assigned_agent");
     if (aa != 0 && bayan_json_v_is_str(aa) == 1) {
-        store64(t + AGN_TASK_ASSIGNED_AGENT, agnosai_uuid_canonical(bayan_json_v_str(aa)));
+        var agent_id = agnosai_uuid_canonical(bayan_json_v_str(aa));
+        if (agent_id == 0) { return 0; }
+        store64(t + AGN_TASK_ASSIGNED_AGENT, agent_id);
     }
 
     var pr = bayan_json_v_obj_get(v, "priority");
@@ -639,15 +652,18 @@ fn agnosai_task_result_from_value(v): i64 {
     var tid = agnosai_uuid_canonical(bayan_json_v_str(tid_v));
     if (tid == 0) { return 0; }
 
-    var output = str_from("");
+    # ⚠ **`output` and `status` are REQUIRED.** Only `metadata` carries
+    # `#[serde(default)]` on `TaskResult` (`task.rs:169`), so serde rejects a
+    # record missing either of the other two. Defaulting `status` to Pending was
+    # the worse half: a completed result whose status field was lost on the wire
+    # came back as still-pending, which reads as work that never finished.
     var ov = bayan_json_v_obj_get(v, "output");
-    if (ov != 0 && bayan_json_v_is_str(ov) == 1) { output = bayan_json_v_str(ov); }
+    if (ov == 0 || bayan_json_v_is_str(ov) == 0) { return 0; }
+    var output = bayan_json_v_str(ov);
 
-    var status = AGNOSAI_STATUS_PENDING;
     var sv = bayan_json_v_obj_get(v, "status");
-    if (sv != 0 && bayan_json_v_is_str(sv) == 1) {
-        status = agnosai_task_status_from_wire(bayan_json_v_str(sv));
-    }
+    if (sv == 0 || bayan_json_v_is_str(sv) == 0) { return 0; }
+    var status = agnosai_task_status_from_wire(bayan_json_v_str(sv));
 
     var r = agnosai_task_result_new(tid, output, status);
     store64(r + AGN_TRES_METADATA, _agnosai_map_from_value(bayan_json_v_obj_get(v, "metadata")));

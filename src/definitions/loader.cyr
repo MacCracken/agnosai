@@ -266,13 +266,21 @@ fn agnosai_load_from_yaml(yaml: Str, out_err): i64 {
 #
 # Supported: `.json`, `.yaml`, `.yml`, case-insensitively.
 #
-# ⚠ The extension is checked BEFORE the file is read, which is the oracle's
-# order reversed — it reads first and matches after. Observably identical for
-# every accepting case; for a rejecting one the oracle would surface an I/O
-# error from an unreadable `.txt` where this surfaces the extension error. That
-# is the better answer for the same reason it is cheaper: a name that can never
-# be loaded should not need to be openable to say so.
+# ⚠ **Read FIRST, match the extension after** — the oracle's order
+# (`loader.rs:27-41`: `std::fs::read_to_string(path)?` precedes the `match`).
+#
+# This file used to check the extension first and argued that was better because
+# a name that can never be loaded should not need to be openable to say so. The
+# argument is reasonable and the ordering is still observably identical for
+# every accepting case — but it changes which error a rejecting one gets:
+# `load_from_file("/nonexistent.txt")` gave `InvalidDefinition("unsupported file
+# extension")` where the oracle gives `Io`. That is a divergence, and CLAUDE.md
+# allows divergences only with an ADR. Conforming is cheaper than justifying a
+# saved `open` on an error path.
 fn agnosai_load_from_file(path: Str, out_err): i64 {
+    var content = _agnosai_loader_read(path, out_err);
+    if (content == 0) { return 0; }
+
     var ext = _agnosai_loader_ext(path);
     var is_json = agnosai_str_eq_ci(ext, str_from("json"));
     var is_yaml = agnosai_str_eq_ci(ext, str_from("yaml"));
@@ -281,9 +289,6 @@ fn agnosai_load_from_file(path: Str, out_err): i64 {
         _agnosai_loader_set_err(out_err, _agnosai_loader_unsupported(ext));
         return 0;
     }
-
-    var content = _agnosai_loader_read(path, out_err);
-    if (content == 0) { return 0; }
 
     if (is_json == 1) { return agnosai_load_from_json(content, out_err); }
     return agnosai_load_from_yaml(content, out_err);

@@ -158,22 +158,30 @@ fn main(): i64 {
     assert(str_eq_cstr(agnosai_relay_message_topic(got2), "inbound") == 1,
     "and it is the inbound one");
 
-    # --- the two documented divergences, asserted as they BEHAVE --------
-    # Not as the oracle behaves. Written down so a reader sees them as known
-    # rather than as an accident — both are owed to majra.
+    # --- the two divergences that were owed to majra, now CLOSED -------
+    # ✅ Both fixed in majra 2.6.5, filed from here. These used to assert the
+    # broken behaviour, written down so a reader saw them as known rather than
+    # accidental; they now assert the oracle's.
 
-    # 1. Channel capacity is recorded but not applied.
-    var rcap = agnosai_relay_new(str_from("node-1"), 4096);
-    assert_eq(agnosai_relay_capacity(rcap), 4096, "the requested capacity is recorded");
-    assert(agnosai_relay_subscribe(rcap) != 0,
-    "but subscribe still succeeds at majra's hardcoded 256 — the request is advisory");
+    # 1. Channel capacity REACHES the channel. A depth of 2 is the
+    # discriminator: with nobody draining, the third send must be refused, where
+    # the old hardcoded 256 swallowed it.
+    var rcap = agnosai_relay_new(str_from("node-1"), 2);
+    assert_eq(agnosai_relay_capacity(rcap), 2, "the requested capacity is recorded");
+    var cap_ch = agnosai_relay_subscribe(rcap);
+    assert(cap_ch != 0, "and subscribe hands back a channel");
+    assert_eq(chan_try_send(cap_ch, 1), 0, "first send fits");
+    assert_eq(chan_try_send(cap_ch, 2), 0, "second send fits");
+    assert_eq(chan_try_send(cap_ch, 3), 0 - 2,
+    "the THIRD is refused — the capacity is APPLIED, not advisory");
 
-    # 2. The timestamp is monotonic, not wall clock. A wall-clock stamp would be
-    # ~1.7e18 ns since the epoch; a monotonic one is uptime and far smaller.
+    # 2. The timestamp is a WALL-CLOCK epoch instant, as the oracle's
+    # `DateTime<Utc>` is. A monotonic reading is uptime and orders of magnitude
+    # smaller; 1.577e18 is 2020-01-01.
     var tm = agnosai_relay_message_timestamp(_t_msg(1, "a", "", "t"));
-    assert(tm > 0, "a message carries a timestamp");
-    assert(tm < 1000000000000000000,
-    "and it is MONOTONIC uptime, not wall-clock epoch nanoseconds");
+    assert(tm > 1577836800000000000,
+    "the stamp is an epoch instant, not monotonic uptime");
+    assert(tm <= clock_epoch_ns(), "and it is not in the future");
 
     # --- past the oracle: the inner relay is reachable ------------------
     # For the majra APIs this wrapper deliberately does not re-export.

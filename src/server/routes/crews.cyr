@@ -542,6 +542,7 @@ fn agnosai_route_create_crew_a(a, state, body: Str): i64 {
     var st = agnosai_orchestrator_run_crew(
     agnosai_app_state_orchestrator(state), _agnosai_route_build_spec(req));
     if (st == 0) {
+        _agnosai_route_crew_run_error(agnosai_crew_req_name(req));
         return agnosai_route_error_a(a, HTTP_INTERNAL, str_from_a(a, "crew execution failed"));
     }
 
@@ -601,9 +602,29 @@ fn agnosai_route_create_crew(state, body: Str): i64 {
 }
 
 # The oracle's `tracing::warn!(crew = .., error = .., "crew request validation failed")`.
+#
+# ⚠ **`err` was taken and never emitted**, so the record named the crew and not
+# the reason — which is the half an operator needs. The oracle logs both keys.
 fn _agnosai_route_crew_warn(name: Str, err: Str): i64 {
     if (sakshi_get_level() < SK_WARN) { return 0; }
+    # sakshi carries one key/value per record, so the two the oracle logs are
+    # packed into one — the same shape `_agnosai_lt_log` uses.
+    var sb = str_builder_new();
+    str_builder_add(sb, name);
+    str_builder_add_cstr(sb, " error=");
+    str_builder_add(sb, err);
+    var line = str_builder_build(sb);
     sakshi_log_kv(SK_WARN, "crew request validation failed", 30, "crew", 4,
+    str_data(line), str_len(line));
+    return 0;
+}
+
+# The oracle's `tracing::error!(error = %e, crew = %crew_name, "crew execution
+# failed")` (`crews.rs:233`). Without it a crew whose execution failed left the
+# 500 on the wire and **no server-side record at all**.
+fn _agnosai_route_crew_run_error(name: Str): i64 {
+    if (sakshi_get_level() < SK_ERROR) { return 0; }
+    sakshi_log_kv(SK_ERROR, "crew execution failed", 21, "crew", 4,
     str_data(name), str_len(name));
     return 0;
 }

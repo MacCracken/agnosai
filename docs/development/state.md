@@ -130,9 +130,10 @@ because each version read only direct siblings.
 | repo | version | pin | state |
 |---|---|---|---|
 | **patra** | **1.13.0** | 6.5.19 | ✅ **committed + tagged** (`9aed017`, 2026-08-11 20:02). Zero `[deps.*]` blocks; sakshi from the fold. 893 tests, 7/7 fuzz, benches, fmt/lint/vet/deny clean. |
-| **majra** | **2.6.4** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.6.3, so this took a **patch bump**. **249 assertions** (189 core + 43 backends + 17 patra_queue). ⚠ **2.6.4 fixes a rate limiter that refused nothing**: `ratelimit_check`/`sliding_window_check` stored the caller's key pointer by reference, so a key built per request — which is every real caller — minted a fresh full-burst bucket each time; and eviction leaked both key and bucket. Both limiters now own their key and `fl_free` on evict; the sweep itself no longer leaks its own scratch vecs on the global bump (it walks the entries array in place and allocates nothing), and `total_evicted` is wired to a real counter and surfaced by `_admin_ratelimit_json` as `evicted`. Reported from here, measured through agnosai's handler as 3 identical requests -> 3 keys, 0 rejections. 7 mutation probes, 7 kills. Prior content (2.6.3): **218 assertions**, `cyrius audit` green, all 4 `dist/` bundles regenerated at v2.6.3. Content: `relay_receive_ex` allocates outside the lock again, + the toolchain bump. ⚠ `tests/test_live.tcyr` is unrunnable here — `redis-server` and `postgres` are **not installed**, and it **exits 139 (SIGSEGV)** rather than failing cleanly. Environment, and a pre-existing harness defect. |
+| **majra** | **2.6.5** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.6.4. **258 assertions** (198 core + 43 backends + 17 patra_queue). **2.6.5** closes both relay divergences agnosai carried as "owed to majra": `capacity` was accepted and discarded (`relay_subscribe` hardcoded `chan_new(256)`, so 4 and 4096 behaved identically) and the message timestamp was `CLOCK_MONOTONIC` where the oracle stamps `DateTime<Utc>` — meaningless once a message leaves the emitting process. New `relay_with_capacity` / `relay_capacity` / `relay_msg_timestamp`; struct 96 -> 104, appended. ⚠ **The first cut FAILED CI**: it used the stdlib's `clock_epoch_ns`, which lives in `chrono` and is not prepended by the `--no-deps` build CI runs — see the `--no-deps` lesson above. Fixed with majra's own `time_epoch_ns`. **2.6.4** fixed a rate limiter that refused nothing: both limiters stored the caller's key pointer by reference, so a key built per request minted a fresh full-burst bucket each time, and eviction leaked key, bucket and its own scratch vecs. 9 mutation probes, 9 kills across both releases. ⚠ `tests/test_live.tcyr` needs Redis and PostgreSQL, absent here. |
 | **libro** | **2.8.5** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.8.4, so this took a **patch bump**. **512 assertions** (524 with `-D LIBRO_TPM`), fmt clean, 23 files lint / 0 warnings, vet 45 deps / 0 untrusted, deny 0 violations, 3 bench binaries green, `.bss` held at **80,224 bytes**. Content: pin 6.5.10 → 6.5.20, `[deps.patra]` 1.12.12 → **1.13.0**, `[deps.sigil]` + `[deps.sigil_tpm]` 3.12.1 → **3.12.7** with the thin selection kept. |
 | **bote** | **3.3.1** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.3.0. **867 assertions across 13 suites** + the core-only drift guard, 14 benchmarks, both `dist/` bundles at v3.3.1. Content: defensive `[deps.sakshi]` **DELETED**, `[deps.libro]` → 2.8.5, `[deps.majra]` → 2.6.3, pin → 6.5.20. ⚠ bote should take **majra 2.6.4** on its next touch — it is a correctness fix in a module bote republishes. |
+| **kavach** | **3.11.11** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.11.10. Adds `config_fuel`: the WASM fuel budget was derived from `timeout_ms` (`* 1e6`, so 3e10 at the default 30 s — **30x** the oracle's `set_fuel(1e9)`), and no caller could ask for a CPU bound without also shortening its wall clock. `SandboxConfig` 104 -> 112, `fuel` appended. **676 assertions**, mutation-verified. Filed from agnosai. |
 | **agnosai** | 1.1.0 | **6.5.20** | ✅ **done, awaiting commit.** **99 suites, 7,942 assertions, 0 failed**, `check-clean.sh` green, `deps --verify` 113/0. `[deps.majra]` → **2.6.4**. VERSION stays 1.1.0 by design — it bumps at parity, not before. |
 | **cyrius** | 6.5.20 | — | ✅ not a blocker, and **never was**: 6.5.19 already folded patra 1.13.0. |
 
@@ -400,6 +401,30 @@ mutation-verified (breaking it reports `got 15, expected 0`).
 
 The 64 KiB arena at `serve.cyr:259` is a separate matter and still open — it is
 one of the five sites in the arena-pool bite above.
+
+### ⚠ A green local build is not evidence about CI, and `lib/` goes stale silently
+
+Two 2026-08-13 findings that cost real time, both the same shape: **a check that
+could not have detected the problem was read as if it had passed.**
+
+**`cyrius build` without `--no-deps` is not what CI runs.** majra's CI does
+`lib sync --full` -> `deps` -> `build --no-deps`, and that last flag is
+load-bearing: without it the build auto-resolves and pulls modules a `--no-deps`
+build does not prepend. `relay_msg_new` reaching for the stdlib's
+`clock_epoch_ns` (in `chrono`) compiled cleanly here and failed CI with
+`undefined function`. ⚠ **Adding `chrono` to `[deps] stdlib` does NOT fix it** —
+that list controls provisioning, not what a `--no-deps` build has in scope; the
+first fix looked plausible, was wrong, and only reproducing CI's exact
+invocation showed it. The real fix was a local `time_epoch_ns` beside the
+`time_now_ns` majra already had. ⚠ agnosai is unexposed — it declares `chrono`
+AND its CI omits `--no-deps` — but that was **verified, not assumed**.
+
+**`lib/` drifts from the pinned snapshot without anything failing.** agnosai
+built against **sandhi 1.9.9 for a whole session** while the 6.5.20 snapshot
+carried 1.9.10, because `lib sync --full` was never re-run after the fold.
+`check-clean`'s lib-snapshot gate only re-compared once a dep pin changed.
+**Bumping a dep pin and running `cyrius deps` does not refresh the snapshot** —
+run the three-step, and read `lib/` AFTER a build.
 
 ### ⚠ A security control that is *mounted* is not a security control that *works*
 

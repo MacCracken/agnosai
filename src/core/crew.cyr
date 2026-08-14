@@ -476,14 +476,29 @@ fn agnosai_crew_profile_to_value(p): i64 {
     return agnosai_crew_profile_to_value_a(default_alloc(), p);
 }
 
-# Rebuild a profile from a bayan JSON value. Every field is `#[serde(default)]`
-# or plainly present, so a missing one takes its default.
+# Rebuild a profile from a bayan JSON value, or 0 when a required field is
+# missing.
+#
+# ⚠ **Only FOUR of the seven fields are `#[serde(default)]`** — `cost_usd`,
+# `agent_cost_usd`, `task_cost_usd` and `sandbox_strength` (`crew.rs:106-118`).
+# `wall_ms`, `task_ms` and `task_count` are required, so serde rejects a profile
+# object missing any of them. This function's own comment used to claim every
+# field was defaulted, and it defaulted all three — so a truncated record came
+# back as a plausible-looking profile reporting a zero-length run of zero tasks
+# rather than as an error.
 fn agnosai_crew_profile_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var wall_v = bayan_json_v_obj_get(v, "wall_ms");
+    if (wall_v == 0 || bayan_json_v_is_int(wall_v) == 0) { return 0; }
+    var count_v = bayan_json_v_obj_get(v, "task_count");
+    if (count_v == 0 || bayan_json_v_is_int(count_v) == 0) { return 0; }
+    var ms_v = bayan_json_v_obj_get(v, "task_ms");
+    if (ms_v == 0 || bayan_json_v_is_obj(ms_v) == 0) { return 0; }
+
     var p = agnosai_crew_profile_new();
-    if (bayan_json_v_is_obj(v) == 0) { return p; }
-    store64(p + AGN_PROF_WALL_MS, _agnosai_int_field(v, "wall_ms", 0));
-    store64(p + AGN_PROF_TASK_MS, _agnosai_int_map_from_value(bayan_json_v_obj_get(v, "task_ms")));
-    store64(p + AGN_PROF_TASK_COUNT, _agnosai_int_field(v, "task_count", 0));
+    store64(p + AGN_PROF_WALL_MS, bayan_json_v_int(wall_v));
+    store64(p + AGN_PROF_TASK_MS, _agnosai_int_map_from_value(ms_v));
+    store64(p + AGN_PROF_TASK_COUNT, bayan_json_v_int(count_v));
 
     var cv = bayan_json_v_obj_get(v, "cost_usd");
     if (cv != 0) {
@@ -623,7 +638,10 @@ fn agnosai_crew_state_from_value(v): i64 {
 
     var pv = bayan_json_v_obj_get(v, "profile");
     if (pv != 0 && bayan_json_v_is_obj(pv) == 1) {
-        store64(s + AGN_CSTATE_PROFILE, agnosai_crew_profile_from_value(pv));
+        # 0 means a required field was missing; leave the slot unset rather than
+        # storing a null the accessors would dereference.
+        var prof = agnosai_crew_profile_from_value(pv);
+        if (prof != 0) { store64(s + AGN_CSTATE_PROFILE, prof); }
     }
     return s;
 }

@@ -182,6 +182,10 @@ fn agnosai_route_a2a_receive_a(a, state, body: Str): i64 {
     var tid = agnosai_a2a_req_task_id(req);
     if (str_len(tid) > AGNOSAI_A2A_MAX_STRING_LEN
     || str_len(agnosai_a2a_req_description(req)) > AGNOSAI_A2A_MAX_STRING_LEN) {
+        # The oracle warns here with the task id truncated to 100 chars
+        # (`a2a.rs:84-87`); the port returned the 400 with no server-side record
+        # of a rejected delegation at all.
+        _agnosai_a2a_warn("A2A rejected: field exceeds max length", 38, tid);
         return _agnosai_a2a_failed_a(a, HTTP_BAD_REQUEST, tid,
         str_from_a(a, "field exceeds max length"));
     }
@@ -193,6 +197,9 @@ fn agnosai_route_a2a_receive_a(a, state, body: Str): i64 {
     var md = agnosai_a2a_req_metadata(req);
     if (md != 0) {
         if (str_len(bayan_json_v_build_a(a, md)) > AGNOSAI_A2A_MAX_METADATA_BYTES) {
+            # Oracle: `warn!(task_id, metadata_bytes, "A2A rejected: metadata
+            # exceeds limit")` (`a2a.rs:101-105`).
+            _agnosai_a2a_warn("A2A rejected: metadata exceeds limit", 36, tid);
             return _agnosai_a2a_failed_a(a, HTTP_BAD_REQUEST, tid,
             str_from_a(a, "metadata exceeds 64 KiB limit"));
         }
@@ -214,9 +221,21 @@ fn agnosai_route_a2a_receive_a(a, state, body: Str): i64 {
     vec_push(tasks, agnosai_task_new(agnosai_a2a_req_description(req)));
     agnosai_crew_with_tasks(spec, tasks);
 
-    var st = agnosai_orchestrator_run_crew(agnosai_app_state_orchestrator(state), spec);
+    # ⚠ **The oracle sends the orchestrator's OWN error** — `a2a.rs:182` is
+    # `error: Some(e.to_string())`, so the delegating system learns *why* its
+    # task failed. This hardcoded "crew execution failed" regardless, which is
+    # the literal `crews.rs:236` uses for a different route; a2a deliberately
+    # reports the cause instead, and an A2A error field that never says anything
+    # is not an error field.
+    var run_err: i64[1];
+    store64(&run_err, 0);
+    var st = agnosai_orchestrator_run_crew_err(agnosai_app_state_orchestrator(state),
+    spec, &run_err);
     if (st == 0) {
-        return _agnosai_a2a_failed_a(a, HTTP_INTERNAL, tid, str_from_a(a, "crew execution failed"));
+        var why = str_from_a(a, "crew execution failed");
+        if (load64(&run_err) != 0) { why = agnosai_error_message(load64(&run_err)); }
+        _agnosai_a2a_warn("A2A crew execution failed", 25, tid);
+        return _agnosai_a2a_failed_a(a, HTTP_INTERNAL, tid, why);
     }
 
     var arr = bayan_json_v_arr_new_a(a);

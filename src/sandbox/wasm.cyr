@@ -119,8 +119,9 @@ fn agnosai_wasm_sandbox_new(): i64 {
 # A sandbox with explicit memory and wall-clock limits.
 #
 # ⚠ The fuel budget is NOT a parameter, matching the oracle: `with_limits` takes
-# memory and a timeout and leaves `fuel` at its default. A caller wanting a
-# different CPU budget has no way to ask for one, upstream or here.
+# memory and a timeout and leaves `fuel` at its default. `agnosai_wasm_sandbox_set_fuel`
+# is the port-local escape hatch — the oracle has no equivalent because it sets
+# `store.set_fuel(self.fuel)` on a struct the caller can build field-by-field.
 fn agnosai_wasm_sandbox_with_limits(max_memory_bytes, timeout_ms): i64 {
     var s = alloc(AGN_WS_BYTES);
     store64(s + AGN_WS_MAX_MEMORY_BYTES, max_memory_bytes);
@@ -140,8 +141,21 @@ fn agnosai_wasm_sandbox_timeout_ms(s): i64 {
 }
 
 # The sandbox's fuel budget.
+#
+# ⚠ **Advertised AND enforced since kavach 3.11.11.** Before that this accessor
+# reported the oracle's 1e9 while kavach derived its own from the timeout —
+# `timeout_ms * 1e6`, 3e10 at the default 30 s — so the guest ran with thirty
+# times the CPU bound this claimed. `agnosai_wasm_execute` now sends it through
+# `config_fuel`.
 fn agnosai_wasm_sandbox_fuel(s): i64 {
     return load64(s + AGN_WS_FUEL);
+}
+
+# Set the CPU budget, in wasmtime fuel units. Port-local: the oracle builds the
+# struct directly, so it needs no setter.
+fn agnosai_wasm_sandbox_set_fuel(s, fuel): i64 {
+    store64(s + AGN_WS_FUEL, fuel);
+    return s;
 }
 
 # Whether a `wasmtime` runtime is present.
@@ -356,6 +370,15 @@ fn agnosai_wasm_execute(s, module, input: Str, out_err): i64 {
     # later reader is `strlen`-based, but a Str's bytes carry no terminator.
     # The same trap `kavach_bridge`'s `config_agent_id` documents.
     config_stdin(cfg, str_cstr(input), str_len(input));
+
+    # ⚠ **The fuel budget, which never reached wasmtime before kavach 3.11.11.**
+    # `agnosai_wasm_sandbox_fuel` reported the oracle's `DEFAULT_FUEL` of 1e9
+    # while kavach derived its own from the timeout — `timeout_ms * 1e6`, i.e.
+    # **3e10 at the default 30 s, thirty times** the CPU bound the oracle sets
+    # with `store.set_fuel(self.fuel)`. An accessor advertising a limit the
+    # runtime never saw is worse than no accessor. `config_fuel` was added to
+    # kavach for this; agnosai filed it.
+    config_fuel(cfg, load64(s + AGN_WS_FUEL));
 
     var sandbox = sandbox_create(cfg);
     if (sandbox == 0) {

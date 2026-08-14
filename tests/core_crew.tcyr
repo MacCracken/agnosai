@@ -331,6 +331,36 @@ fn main() {
     _t_crew_json_keys_are_hoisted();
     _t_wire_values_are_hoisted();
 
+    # ⚠ **Three CrewProfile fields are required**, not defaulted: `wall_ms`,
+    # `task_ms` and `task_count` carry no `#[serde(default)]` (only the two cost
+    # maps, `cost_usd` and `sandbox_strength` do, `crew.rs:106-118`). The port
+    # defaulted all three and returned a plausible profile reporting a
+    # zero-length run of zero tasks instead of an error.
+    var no_wall = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(no_wall, str_from("task_count"), bayan_json_v_int_new(1));
+    bayan_json_v_obj_set(no_wall, str_from("task_ms"), bayan_json_v_obj_new());
+    assert_eq(agnosai_crew_profile_from_value(no_wall), 0,
+    "a profile without `wall_ms` is rejected, not defaulted to 0");
+
+    var no_count = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(no_count, str_from("wall_ms"), bayan_json_v_int_new(100));
+    bayan_json_v_obj_set(no_count, str_from("task_ms"), bayan_json_v_obj_new());
+    assert_eq(agnosai_crew_profile_from_value(no_count), 0,
+    "nor without `task_count`");
+
+    # ⚠ Oracle `crew_profile_deserializes_missing_cost_as_zero` (crew.rs:279):
+    # the three required fields present and `cost_usd` ABSENT must give zero
+    # cost — the defaulted half, which had no pin here.
+    var no_cost = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(no_cost, str_from("wall_ms"), bayan_json_v_int_new(100));
+    bayan_json_v_obj_set(no_cost, str_from("task_count"), bayan_json_v_int_new(1));
+    bayan_json_v_obj_set(no_cost, str_from("task_ms"), bayan_json_v_obj_new());
+    var okp = agnosai_crew_profile_from_value(no_cost);
+    assert(okp != 0, "with all three required fields it parses");
+    assert_eq(agnosai_crew_profile_cost_micro_usd(okp), 0,
+    "and an absent `cost_usd` is zero, which IS serde-defaulted");
+    assert_eq(agnosai_crew_profile_wall_ms(okp), 100, "carrying the wall_ms it was given");
+
     return assert_summary();
 }
 

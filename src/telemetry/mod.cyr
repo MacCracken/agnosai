@@ -549,8 +549,25 @@ fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
     store64(g + AGN_TG_EXPORTER, exporter);
     _agnosai_telemetry_exporter = exporter;
     store64(g + AGN_TG_OTEL, 1);
-    sakshi_info("OpenTelemetry OTLP export initialised", 37);
+    # ⚠ **The oracle logs `endpoint` and `service_name` as structured fields**,
+    # and the port emitted the bare message — so the JSON line its own formatter
+    # produces carried neither key, and an operator diagnosing a collector that
+    # is not receiving spans could not see which endpoint was actually used.
+    # sakshi carries one key/value per record, so both are packed into one.
+    _agnosai_telemetry_init_log(otlp_endpoint, service_name);
     return g;
+}
+
+fn _agnosai_telemetry_init_log(endpoint: Str, service_name: Str): i64 {
+    if (sakshi_get_level() < SK_INFO) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, endpoint);
+    str_builder_add_cstr(sb, " service_name=");
+    str_builder_add(sb, service_name);
+    var line = str_builder_build(sb);
+    sakshi_log_kv(SK_INFO, "OpenTelemetry OTLP export initialised", 37, "endpoint", 8,
+    str_data(line), str_len(line));
+    return 0;
 }
 
 # The guard's live exporter, or 0 when OTLP is off. This is what a caller

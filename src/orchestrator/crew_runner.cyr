@@ -462,6 +462,24 @@ fn _agnosai_crew_user_message(task): i64 {
 # rebuilt prompt instead. Rebuilding the whole request per retry rather than
 # mutating one is what keeps the retry prompt anchored to the ORIGINAL — the
 # oracle's own guard against exponential prompt growth.
+# A small pool of arenas for the per-task context tree, created on first use.
+#
+# ⚠ Lazily, and pooled rather than per-call: an arena costs its capacity
+# permanently on the no-free bump, so minting one per task would cost more than
+# the tree it reclaims — the lesson the audit scratch learned
+# (`AGN_CR_SCRATCH`). Pooled arenas are mutex-guarded, so the parallel and DAG
+# workers can share them, which the audit scratch deliberately cannot.
+var _agnosai_crew_ctx_pool = 0;
+
+fn _agnosai_crew_ctx_arena(): i64 {
+    if (_agnosai_crew_ctx_pool == 0) {
+        _agnosai_crew_ctx_pool = agnosai_arena_pool_new(4, 8192);
+    }
+    var a = agnosai_arena_pool_acquire(_agnosai_crew_ctx_pool);
+    if (a == 0) { return default_alloc(); }
+    return a;
+}
+
 fn _agnosai_crew_build_request(task, agent, model: Str, user_msg: Str): i64 {
     var req = agnosai_inference_request_new(model);
 
@@ -473,22 +491,36 @@ fn _agnosai_crew_build_request(task, agent, model: Str, user_msg: Str): i64 {
     # `bayan_json_v_build_pretty` produces.
     var ctx = agnosai_task_context(task);
     if (ctx != 0 && map_size(ctx) > 0) {
+        # ⚠ **The one genuinely transient JSON tree in this module** (roadmap
+        # B2's tail). Of the 67 `bayan_json_v_*` calls here, 16 build event
+        # payloads a subscriber reads later, 14 build task-result metadata and 6
+        # build the profile — all RETAINED in the crew state, so none can move to
+        # an arena. This object is different: it exists only to be handed to
+        # `bayan_json_v_build_pretty`, and nothing downstream holds it.
+        #
+        # Measured at **240 B/task** for a task carrying three context keys
+        # (960 B over a 4-task run, 8,504 -> 9,464). The rendered string is built
+        # by the non-`_a` `build_pretty`, so it lands on the global bump and
+        # outlives the reset — only the tree is reclaimed.
+        var ctx_arena = _agnosai_crew_ctx_arena();
         # ⚠ Slot-walked, NOT `map_keys` — standing trap #2 under roadmap B2.
         # `map_keys` builds its key vec with `vec_new()` on the no-free global
         # bump and has no `_a` form, so it leaks per task and silently caps any
         # threading done around it. The walk also drops the second hash lookup:
         # `map_get(ctx, key)` per key became `_agnosai_map_slot_val` on the slot
         # already in hand.
-        var obj = bayan_json_v_obj_new();
+        var obj = bayan_json_v_obj_new_a(ctx_arena);
         var slots = _agnosai_map_slots(ctx);
         for (var i = 0; i < slots; i = i + 1) {
             if (_agnosai_map_slot_live(ctx, i) == 1) {
-                bayan_json_v_obj_set(obj, _agnosai_map_slot_key(ctx, i),
+                bayan_json_v_obj_set_a(ctx_arena, obj, _agnosai_map_slot_key(ctx, i),
                 _agnosai_map_slot_val(ctx, i));
             }
         }
+        var rendered = bayan_json_v_build_pretty(obj, 2);
+        agnosai_arena_pool_release(_agnosai_crew_ctx_pool, ctx_arena);
         agnosai_inference_request_say(req, AGNOSAI_ROLE_USER,
-        agnosai_prompt_sanitize(bayan_json_v_build_pretty(obj, 2), str_from("context")));
+        agnosai_prompt_sanitize(rendered, str_from("context")));
         agnosai_inference_request_say(req, AGNOSAI_ROLE_ASSISTANT,
         str_from("Understood, I have the context."));
     }
@@ -1230,6 +1262,21 @@ fn _agnosai_crew_build_profile(r, results, wall_ms): i64 {
     var profile = agnosai_crew_profile_new();
     agnosai_crew_profile_with_wall_ms(profile, wall_ms);
     agnosai_crew_profile_with_task_count(profile, vec_len(results));
+
+    # ⚠ **`sandbox_strength`, which the port computed nowhere.** The oracle sets
+    # it on every crew profile (`crew_runner.rs:198-214`): `SandboxPolicy::process()`
+    # scored by `kavach_bridge::strength_for_policy(..).value()`. The field, its
+    # setter and its serialization were all ported and covered by
+    # `tests/core_crew.tcyr` — but nothing outside a test ever called the setter,
+    # so every profile this server emitted **omitted** the field where the oracle
+    # emits a number.
+    #
+    # ⚠ It sits behind `#[cfg(all(feature = "kavach", feature = "sandbox"))]` in
+    # the oracle. A cargo feature gate is not a scope boundary here, so the
+    # port computes it unconditionally — the `None` arm has no equivalent,
+    # because both producers are always linked.
+    agnosai_crew_profile_with_sandbox_strength(profile,
+    agnosai_kavach_strength_for_policy(agnosai_sandbox_policy_process()));
 
     var total = 0;
     # **Hoisted: three metadata keys, once instead of once per result.** Each
