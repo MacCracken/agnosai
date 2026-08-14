@@ -93,8 +93,15 @@ cyrius coverage --min 80                    # the 80% gate — its own CI step
 10. Documentation — update CHANGELOG, roadmap, state.md, docs
 11. Version check — `VERSION` is the source of truth; `cyrius.cyml` interpolates it
     (`version = "${file:VERSION}"`) so it cannot drift; confirm the CHANGELOG's top
-    released heading matches. **Do not use `scripts/version-bump.sh` as-is** — it is
-    the Rust-era script and still edits a root `Cargo.toml` that no longer exists
+    released heading matches. **`sh scripts/version-bump.sh <X.Y.Z>` is the tool** —
+    it writes `VERSION`, verifies the manifest still interpolates rather than
+    hardcodes, and cuts `[Unreleased]` over to a dated heading, checking everything
+    before writing anything so a failure leaves the repo untouched.
+    ⚠ This step used to read *"do not use it as-is — it is the Rust-era script and
+    still edits a root `Cargo.toml`"*. **That is no longer true**: the script was
+    rewritten for the Cyrius line and its only remaining `Cargo` mention is a
+    comment recording what it dropped. The stale warning was worse than useless —
+    it steered a release away from the one tool that performs it correctly
 12. Return to step 1
 
 ### Task Sizing
@@ -126,6 +133,34 @@ cyrius coverage --min 80                    # the 80% gate — its own CI step
 - **sakshi on all operations** — structured logging for audit trail
 - **Prefix every public symbol `agnosai_*`.** Cyrius has ONE flat namespace and last-definition-wins. Short names (`add`, `run`) also get falsely credited by coverage's substring matching. `_`-prefix genuine internals so they leave the coverage denominator
 - `var buf[N]` = N **bytes**, not N entries
+
+### ⚠ `cyrius.lock` must be committed TAG-ONLY, and every local build un-does that
+
+CI's *Lockfile is honest* step runs `cyrius deps` on a runner that has **none of
+the sibling checkouts** `path = "../NAME"` points at, so it resolves each dep
+from `git` + `tag` and records a `commit` pin per dep. It then does
+`git diff --exit-code -- cyrius.lock`. **The committed lock must be that
+tag-only resolution** — otherwise the tags no longer name what CI builds.
+
+⚠ **Locally the `path` wins, so `cyrius deps` writes a lock with NO commit
+pins — and a bare `cyrius build` re-resolves and clobbers it the same way.**
+Measured: a tag-only lock has **8 `commit` lines**; one `cyrius build` takes it
+to **0**. That is how a path-shaped lock reached `main` and broke CI on
+2026-08-13.
+
+**So refreshing the lock is the LAST thing before a commit, after all building
+and testing is done:**
+
+```sh
+sed -i '/^path = "\.\.\//d' cyrius.cyml   # drop the sibling overrides
+cyrius deps                                # resolves git+tag, writes commit pins
+git checkout cyrius.cyml                   # put the overrides back
+grep -c '^commit' cyrius.lock              # expect 8 — never 0
+```
+
+Then commit `cyrius.lock` **without running `cyrius deps` or a bare
+`cyrius build` again**. If you must build after refreshing, restore the lock
+from `git` before committing, or pass `--no-deps`.
 
 ## DO NOT
 

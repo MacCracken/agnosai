@@ -1,130 +1,69 @@
 # Adding an LLM Provider
 
-Each LLM provider is a Rust struct implementing the `LlmProvider` trait with direct HTTP calls via `reqwest`.
+⚠ **Read this before anything else: there is almost certainly nothing to add
+here.** This guide used to describe a Rust `LlmProvider` trait with per-provider
+`reqwest` calls. That design does not exist on the Cyrius line, and the thing it
+described — a new HTTP client per vendor — is **not** how a provider is added.
 
-## The Trait
+## AgnosAI has ONE outbound LLM path
 
-```rust
-pub trait LlmProvider: Send + Sync {
-    async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse>;
-    async fn list_models(&self) -> Result<Vec<ModelInfo>>;
-    fn provider_type(&self) -> ProviderType;
+Everything goes to the AGNOS **hoosh** gateway over its OpenAI-compatible
+`/v1/chat/completions` (`src/llm/hoosh.cyr`). There is no `/v1/messages` client,
+no `/api/chat` client, and no vendor SDK anywhere in the tree.
+
+**hoosh owns the per-vendor protocols.** AgnosAI addresses the gateway by
+**model string**; hoosh maps that to a vendor and speaks that vendor's wire.
+
+So:
+
+- **To support a new vendor** — add it to **hoosh**, not here. Nothing in this
+  repo needs to change; a new model string starts working the moment the gateway
+  understands it.
+- **To make agnosai *label* a vendor** (for routing tiers, cost attribution and
+  metadata), extend the enum below. That is a label, not a transport.
+
+## The provider labels
+
+`AgnosaiProviderType` in `src/llm/hoosh.cyr` — seven variants:
+
+```cyr
+enum AgnosaiProviderType {
+    AGNOSAI_PROVIDER_OPENAI = 0;
+    AGNOSAI_PROVIDER_ANTHROPIC = 1;
+    AGNOSAI_PROVIDER_GOOGLE = 2;
+    AGNOSAI_PROVIDER_MISTRAL = 3;
+    AGNOSAI_PROVIDER_DEEPSEEK = 4;
+    AGNOSAI_PROVIDER_GROK = 5;
+    AGNOSAI_PROVIDER_OLLAMA = 6;
 }
 ```
 
-## Steps
+To add one:
 
-### 1. Add the Provider Type
+1. **Append** a variant. ⚠ Append — the numbering is positional and existing
+   values must not shift.
+2. Add its spelling to `agnosai_provider_to_wire` and
+   `agnosai_provider_from_wire`. ⚠ `from_wire` reads an unknown spelling as
+   `OpenAi` rather than failing, matching the oracle.
+3. Teach `_agnosai_crew_infer_provider` (`src/orchestrator/crew_runner.cyr`) the
+   model-string prefix that implies it, if there is one.
+4. Extend the router's tier matrix in `src/llm/router.cyr` if the vendor should
+   participate in Fast / Capable / Premium selection.
 
-In `src/llm/mod.rs` (re-exported from hoosh), add your provider to the `ProviderType` enum:
+⚠ **These spellings are not on any wire agnosai controls.** The comment above the
+enum says so: they are the conventional `snake_case` forms, but the gateway is
+addressed by model string. If a caller ever needs them to match hoosh
+byte-for-byte, **verify against hoosh** rather than trusting the enum.
 
-```rust
-pub enum ProviderType {
-    OpenAi,
-    Anthropic,
-    // ...
-    YourProvider,
-}
-```
+## Why the gateway seam exists
 
-### 2. Create the Implementation
+hoosh is a binary, not a library, so it cannot be `include`d — it is consumed
+over HTTP. That is stated at the top of `src/llm/hoosh.cyr`. The seam is what
+keeps vendor churn out of this repo entirely: agnosai has never needed a change
+to gain a vendor.
 
-Create `src/llm/your_provider.rs`:
+## Testing
 
-```rust
-use reqwest::Client;
-use crate::provider::*;
-
-pub struct YourProvider {
-    client: Client,
-    base_url: String,
-    api_key: String,
-    default_model: String,
-}
-
-impl YourProvider {
-    pub fn new(api_key: String) -> Self {
-        Self {
-            client: Client::new(),
-            base_url: "https://api.yourprovider.com".to_string(),
-            api_key,
-            default_model: "default-model".to_string(),
-        }
-    }
-
-    pub fn with_base_url(api_key: String, base_url: String) -> Self {
-        Self { base_url, ..Self::new(api_key) }
-    }
-}
-
-impl LlmProvider for YourProvider {
-    async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
-        let model = if request.model.is_empty() {
-            &self.default_model
-        } else {
-            &request.model
-        };
-
-        // Build your provider's request format
-        let body = serde_json::json!({
-            "model": model,
-            "messages": request.messages,
-            // ... provider-specific fields
-        });
-
-        let resp = self.client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| agnosai_core::AgnosaiError::LlmProvider(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(agnosai_core::AgnosaiError::LlmProvider(text));
-        }
-
-        // Parse response into InferenceResponse
-        let json: serde_json::Value = resp.json().await
-            .map_err(|e| agnosai_core::AgnosaiError::LlmProvider(e.to_string()))?;
-
-        Ok(InferenceResponse {
-            content: /* extract from json */,
-            model: model.to_string(),
-            usage: TokenUsage { /* ... */ },
-        })
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-        // GET the models endpoint, or return a hardcoded list
-        Ok(vec![])
-    }
-
-    fn provider_type(&self) -> ProviderType {
-        ProviderType::YourProvider
-    }
-}
-```
-
-### 3. Register in the Module
-
-In `src/llm/mod.rs`, add the module and re-export:
-
-```rust
-pub mod your_provider;
-pub use your_provider::YourProvider;
-```
-
-### 4. OpenAI-Compatible Shortcut
-
-If your provider uses the OpenAI API format (many do), just reuse `OpenAiProvider`:
-
-```rust
-let provider = OpenAiProvider::with_base_url(
-    "your-api-key".into(),
-    "https://api.yourprovider.com".into(),
-);
-```
-
-This works for: DeepSeek, Mistral, Groq, LM Studio, and any vLLM/TGI deployment.
+`tests/llm_hoosh.tcyr` and `tests/llm_router.tcyr` drive the request builder and
+the tier matrix without a network, by feeding the response decoder captured
+bytes. Add a case there rather than standing up a live gateway.

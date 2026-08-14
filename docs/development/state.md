@@ -17,7 +17,7 @@ project owner is a **commit + tag** — nothing is left to build.
 | **majra** | **2.6.3** | ❌ no (2.6.2 is) | commit + tag `2.6.3` |
 | **libro** | **2.8.5** | ❌ no (2.8.4 is) | commit + tag `2.8.5` |
 | **bote** | **3.3.1** | ❌ no (3.3.0 is) | commit + tag `3.3.1` |
-| **agnosai** | 1.1.0 (unchanged) | — | commit |
+| **agnosai** | **2.0.0** (cut 2026-08-14) | — | commit + tag `2.0.0` |
 
 Version rule applied: a version already published on GitHub got a **patch bump**
 (libro 2.8.4 → 2.8.5); a version prepared but never tagged absorbed the new work
@@ -134,7 +134,7 @@ because each version read only direct siblings.
 | **libro** | **2.8.5** | **6.5.20** | ✅ **done, awaiting tag** — last tag 2.8.4, so this took a **patch bump**. **512 assertions** (524 with `-D LIBRO_TPM`), fmt clean, 23 files lint / 0 warnings, vet 45 deps / 0 untrusted, deny 0 violations, 3 bench binaries green, `.bss` held at **80,224 bytes**. Content: pin 6.5.10 → 6.5.20, `[deps.patra]` 1.12.12 → **1.13.0**, `[deps.sigil]` + `[deps.sigil_tpm]` 3.12.1 → **3.12.7** with the thin selection kept. |
 | **bote** | **3.3.1** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.3.0. **867 assertions across 13 suites** + the core-only drift guard, 14 benchmarks, both `dist/` bundles at v3.3.1. Content: defensive `[deps.sakshi]` **DELETED**, `[deps.libro]` → 2.8.5, `[deps.majra]` → 2.6.3, pin → 6.5.20. ⚠ bote should take **majra 2.6.4** on its next touch — it is a correctness fix in a module bote republishes. |
 | **kavach** | **3.11.12** | **6.5.20** | ✅ **done, awaiting tag** — last tag 3.11.10. **3.11.12** closes the WASM **memory** bound: `policy_basic()` leaves `memory_limit_mb` at 0 and the backend emitted `-W max-memory-size` only when it was > 0, so every caller on the default policy ran an **unbounded** guest — a wasm32 module can claim 4 GiB. Verified against wasmtime 47 with a 128 MiB module. Now always emitted, defaulting to the oracle's 64 MiB. **684 assertions.** **3.11.11**: Adds `config_fuel`: the WASM fuel budget was derived from `timeout_ms` (`* 1e6`, so 3e10 at the default 30 s — **30x** the oracle's `set_fuel(1e9)`), and no caller could ask for a CPU bound without also shortening its wall clock. `SandboxConfig` 104 -> 112, `fuel` appended. **676 assertions**, mutation-verified. Filed from agnosai. |
-| **agnosai** | 1.1.0 | **6.5.21** | ✅ **done, awaiting commit.** **99 suites, 8,038 assertions, 0 failed**; `check-clean.sh` green, `deps --verify` 113/0, and **every `.tcyr`/`.bcyr`/`.fcyr` compiled explicitly** — `check-clean` does not reach `tests/`, and a hub include broke two suites this session while it stayed green. `[deps.majra]` **2.6.6**, `[deps.kavach]` **3.11.12**, toolchain **6.5.21** with `lib/` re-synced (107 files) and read back AFTER a build. VERSION stays 1.1.0 by design — it bumps at parity, not before. |
+| **agnosai** | **2.0.0** | **6.5.21** | ✅ **done, awaiting commit.** **99 suites, 8,038 assertions, 0 failed**; `check-clean.sh` green, `deps --verify` 113/0, and **every `.tcyr`/`.bcyr`/`.fcyr` compiled explicitly** — `check-clean` does not reach `tests/`, and a hub include broke two suites this session while it stayed green. `[deps.majra]` **2.6.6**, `[deps.kavach]` **3.11.12**, toolchain **6.5.21** with `lib/` re-synced (107 files) and read back AFTER a build. **VERSION cut to 2.0.0 on 2026-08-14** — parity reached, all six v2.0 criteria met. |
 | **cyrius** | 6.5.20 | — | ✅ not a blocker, and **never was**: 6.5.19 already folded patra 1.13.0. |
 
 ## 🔎 Open findings — P(-1) sweep, 2026-08-12 (cyrius 6.5.20)
@@ -576,9 +576,17 @@ it was never invoked*.
 
 ## Version
 
-**1.1.0** (`VERSION`) — the last shipped Rust release, now preserved at
-`rust-old/`. The Cyrius line targets **v2.0.0**; VERSION bumps once parity
-lands, not before, so the number always names something that actually shipped.
+**2.0.0** (`VERSION`) — **cut 2026-08-14, the first Cyrius release.** 1.1.0 was
+the last shipped Rust release and is preserved at `rust-old/` as the parity
+oracle. The rule held: VERSION bumped once parity landed, so the number always
+names something that actually shipped.
+
+⚠ **"At least one downstream consumer green" is post-tag work, not a gate.** A
+consumer cannot integrate against a port that does not exist — the 2.0.0 tag is
+what it pins. This file's own M8 note states the principle: *"zero consumers is
+a consequence of it not being ported, not a reason to leave it."* daimon, listed
+in `CLAUDE.md` as a consumer, has no coupling to agnosai at all and could never
+have served as the check.
 
 ## Toolchain
 
@@ -2125,11 +2133,22 @@ dead-end levers are recorded under *Benchmarks*.
 
 | | |
 |---|---|
-| Cyrius port | **29,518 lines**, 94 files, `src/` mirroring `rust-old/src/` |
-| Rust oracle | **41,163 lines** at `rust-old/` — frozen. (27,683 is the `src/`-only figure this file carried until 2026-08-07; see the banner above.) |
-| Milestones | **M0–M8 complete** — the server tier serves; M7 `sandbox`'s eight modules carry the 2026-08-04 audit's 43 findings all fixed (41 mutation-verified); **M8 `fleet` closed 2026-08-08** at 12/12 modules and 719 assertions. Read the ⚠ below: "complete" is per-milestone, not per-group |
-| Not started | M10 `definitions`, M11 (sandbox-gated tools + hwaccel), M12 (llm residue, tokio tests, benches, non-`src`). **M8 `fleet` closed 2026-08-08**, **M9 `telemetry` closed 2026-08-10** |
-| Gates | build OK · 2,189 symbols / 95 files · fmt·lint·doc·vet·deny·deps--verify·lib-snapshot clean · coverage **100% (1338/1338)** via `cyrius coverage --min 80` · 79 suites / 6,389 assertions |
+| Cyrius port | **37,662 lines**, 112 files, `src/` mirroring `rust-old/src/` |
+| Rust oracle | **27,683 lines** under `rust-old/src/` (41,163 counting the whole frozen tree) — never built, parity reference only |
+| Milestones | ⚠ **ALL CLOSED.** M0–M12. The last open item, the wasmtime-gated WASM execute half, closed 2026-08-13 when `tests/tools_wasm.tcyr` began running a real 152-byte WASI module end to end. **All five roadmap decisions D1–D5 are closed too.** |
+| Module parity | 98 oracle `.rs` under `src/`; **93 have a same-named `.cyr`**, and the 5 that do not are accounted for: `lib.rs` (crate re-exports, no Cyrius meaning — ONE flat namespace), `server/mod.rs` (→ `src/server/router.cyr`), and `tools/builtin/{echo,json_transform,mod}.rs` (→ `src/tools/builtin/basic.cyr`) |
+| Gates | build OK · `check-clean.sh` green · **99 suites / 8,038 assertions / 0 failed** · coverage **99% (1578/1585)** via `cyrius coverage --min 80` · `deps --verify` 113/0 · every `.tcyr`/`.bcyr`/`.fcyr` compiled explicitly · 7,108 benchmark rows across 67 dated runs |
+| ⚠ v2.0 criteria | **5 of 6 met.** The unmet one is *"at least one downstream consumer green"* — see the note below. |
+
+⚠ **The one v2.0 criterion still open: downstream consumer verification.**
+`CLAUDE.md` lists daimon as a consumer, but daimon has **no coupling to agnosai
+at all** — not a `[deps.agnosai]` entry (its deps are sakshi, ai-hwaccel, samay,
+sigil, libro, majra, bote), nothing in its `src/`, and no HTTP client pointed at
+an agnosai endpoint. It is a sibling in the AGNOS ecosystem, not a downstream.
+So this criterion **cannot be satisfied by building daimon**, and no other
+consumer (Agnostic, joshua, kiran) has been verified either. Either wire a real
+consumer against the HTTP API and prove it green, or waive the criterion
+explicitly in the release notes — but do not record it as met.
 
 ### What "M8/M9/M10 not started" actually means — corrected 2026-08-07
 

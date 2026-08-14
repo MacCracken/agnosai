@@ -9,16 +9,55 @@ AgnosAI exposes a REST API from the `agnosai` binary, served by
 
 ## Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Liveness probe |
-| GET | `/ready` | Readiness probe (includes version) |
-| POST | `/api/v1/crews` | Create and execute a crew |
-| GET | `/api/v1/crews/:id` | Get crew status (placeholder) |
-| GET | `/api/v1/agents/definitions` | List agent definitions |
-| POST | `/api/v1/agents/definitions` | Register an agent definition |
-| GET | `/api/v1/tools` | List registered tools |
-| GET | `/api/v1/presets` | List presets |
+⚠ This table listed **6** of the **18** routes the router serves. The rest were
+undocumented, and `/api/v1/crews/{id}` was marked "(placeholder)" long after it
+started returning real state.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/health` | no | Liveness probe |
+| GET | `/ready` | no | Readiness probe (includes version) |
+| GET | `/metrics` | no | Prometheus exposition |
+| POST | `/api/v1/crews` | yes | Create and execute a crew |
+| GET | `/api/v1/crews/{id}` | yes | The crew's state |
+| POST | `/api/v1/crews/{id}/cancel` | yes | Request cancellation |
+| GET | `/api/v1/crews/{id}/stream` | yes | SSE event stream for one crew |
+| GET | `/api/v1/agents/definitions` | yes | List agent definitions |
+| POST | `/api/v1/agents/definitions` | yes | Register an agent definition |
+| GET | `/api/v1/tools` | yes | List registered tools |
+| GET | `/api/v1/tools/{name}` | yes | One tool's schema |
+| GET | `/api/v1/presets` | yes | List presets |
+| GET | `/api/v1/dashboard/crews` | yes | Crew history |
+| GET | `/api/v1/dashboard/agents` | yes | Per-agent performance |
+| POST | `/api/v1/approvals` | yes | Submit a human-in-the-loop decision |
+| POST | `/api/v1/a2a/receive` | yes | Accept a delegated task |
+| POST | `/api/v1/a2a/status` | yes | A2A status |
+| POST | `/mcp` | yes | Model Context Protocol JSON-RPC |
+
+The three probes are the only unauthenticated routes, and the allow-list is
+written that way deliberately — a route added without thought defaults to
+**protected**.
+
+## Rate limiting
+
+⚠ **Mounted by DEFAULT** at **100 req/s per client key, burst 200**
+([ADR 021](../adr/021-rate-limit-mounted-by-default.md)) — a deliberate
+divergence from the Rust tree, which ported the middleware and never installed
+it. Over the limit a route answers **429**.
+
+| variable | effect |
+|---|---|
+| `AGNOSAI_RATE_LIMIT` | requests/second per key. **`0` disables it entirely** |
+| `AGNOSAI_RATE_LIMIT_BURST` | burst allowance (default 200) |
+
+- The key is `X-Forwarded-For`'s first entry, else `X-Real-IP`, else the shared
+  literal `"unknown"`.
+- ⚠ Those headers are **client-settable**. Behind a proxy that OVERWRITES them
+  the key is trustworthy; behind one that APPENDS (nginx's documented
+  `$proxy_add_x_forwarded_for`) a client picks its own key — and can therefore
+  drain a *named victim's* bucket, since the limiter runs before auth.
+- `/health`, `/ready` and `/metrics` are **exempt**, so a flood cannot push a
+  liveness probe into 429 and get the process killed.
 
 ---
 

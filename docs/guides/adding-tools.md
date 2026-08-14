@@ -1,126 +1,106 @@
 # Adding a Native Tool
 
-Tools are Rust structs implementing the `NativeTool` trait. They run in-process with zero overhead.
+⚠ **This guide used to describe a Rust `NativeTool` trait with `async fn` and
+`Pin<Box<dyn Future>>`.** None of that exists on the Cyrius line. A tool is a
+**vtable**: two function pointers plus an opaque context.
 
-## The Trait
+Native tools run in-process with zero overhead — and with the server's full
+privileges. Review one as carefully as you would review the server itself.
 
-```rust
-pub trait NativeTool: Send + Sync {
-    fn name(&self) -> &str;
-    fn description(&self) -> &str;
-    fn schema(&self) -> ToolSchema;
-    fn execute(&self, input: ToolInput) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>>;
+## The shape
+
+`agnosai_tool_new` (`src/tools/native.cyr`) takes a name, a description, and two
+function pointers:
+
+```cyr
+fn agnosai_tool_new(name: Str, description: Str, schema_fp, execute_fp, ctx): i64
+```
+
+| slot | signature | purpose |
+|---|---|---|
+| `schema_fp` | `fn(a, ctx) -> schema` | declares parameters; `a` is an allocator |
+| `execute_fp` | `fn(ctx, input) -> output` | does the work |
+| `ctx` | any pointer, or `0` | per-tool state, handed back to both |
+
+⚠ **`schema_fp` takes the allocator FIRST.** Every one of the fourteen
+implementors threads it, which is what lets `GET /api/v1/tools` render with zero
+global-bump allocation. A schema built with the bare `agnosai_tool_schema_new`
+leaks per request.
+
+## A complete tool
+
+This is `echo`, verbatim from `src/tools/builtin/basic.cyr` — the whole thing:
+
+```cyr
+fn _agnosai_echo_schema(a, ctx): i64 {
+    var s = agnosai_tool_schema_new_a(a, str_from_a(a, "echo"),
+    str_from_a(a, "Returns the input message unchanged. Useful for testing."));
+    agnosai_tool_schema_param_a(a, s, str_from_a(a, "message"),
+    str_from_a(a, "The message to echo back"), str_from_a(a, "string"), 1);
+    return s;
+}
+
+fn _agnosai_echo_execute(ctx, input): i64 {
+    var value = agnosai_tool_input_get(input, str_from("message"));
+    if (value == 0) {
+        return agnosai_tool_output_err(str_from("missing required parameter: message"));
+    }
+    return agnosai_tool_output_ok(value);
+}
+
+fn agnosai_echo_tool(): i64 {
+    return agnosai_tool_new(str_from("echo"),
+    str_from("Returns the input message unchanged. Useful for testing."),
+    &_agnosai_echo_schema, &_agnosai_echo_execute, 0);
 }
 ```
 
-## Example: HTTP Health Check Tool
+The trailing `1` on `agnosai_tool_schema_param_a` marks the parameter
+**required**.
 
-```rust
-use agnosai::tools::{NativeTool, ToolSchema, ParameterSchema, ToolInput, ToolOutput};
-use std::pin::Pin;
-use std::future::Future;
+## Reading input
 
-pub struct HealthCheckTool {
-    client: reqwest::Client,
-}
+| accessor | returns |
+|---|---|
+| `agnosai_tool_input_get(input, key)` | a `bayan` JSON value, or `0` when absent |
+| `agnosai_tool_input_get_int(input, key)` | an integer, or `AGNOSAI_NO_LIMIT` |
+| `agnosai_tool_input_get_f64(input, key, &found)` | an f64, with a found flag |
 
-impl HealthCheckTool {
-    pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
-    }
-}
+⚠ **`agnosai_tool_input_get_int` treats a NEGATIVE as absent**, because the
+oracle's `as_u64` returns `None` for one. Do not read `-1` as a value — it is the
+sentinel.
 
-impl NativeTool for HealthCheckTool {
-    fn name(&self) -> &str { "health_check" }
+## Returning output
 
-    fn description(&self) -> &str {
-        "Check if a URL is reachable and return its HTTP status"
-    }
+- `agnosai_tool_output_ok(value)` — success, carrying a `bayan` JSON value.
+- `agnosai_tool_output_err(msg: Str)` — failure; `result` becomes JSON null.
 
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: self.name().to_string(),
-            description: self.description().to_string(),
-            parameters: vec![
-                ParameterSchema {
-                    name: "url".into(),
-                    description: "URL to check".into(),
-                    param_type: "string".into(),
-                    required: true,
-                },
-            ],
-        }
-    }
+Say **why** in the error. A fixed string like "request failed" for every failure
+mode is a real defect — this port shipped one and had to fix it.
 
-    fn execute(&self, input: ToolInput) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
-        Box::pin(async move {
-            let url = match input.get_str("url") {
-                Some(u) => u,
-                None => return ToolOutput::err("missing required parameter: url"),
-            };
+## Registering
 
-            match self.client.get(url).send().await {
-                Ok(resp) => ToolOutput::ok(serde_json::json!({
-                    "status": resp.status().as_u16(),
-                    "ok": resp.status().is_success(),
-                })),
-                Err(e) => ToolOutput::err(format!("request failed: {e}")),
-            }
-        })
-    }
-}
+```cyr
+agnosai_tool_registry_register(registry, agnosai_echo_tool());
 ```
 
-## Registering the Tool
+⚠ The registry is a hashmap behind a **futex mutex**, and that mutex is
+mandatory: `sandhi_server_run_pooled` makes every worker a real OS thread, so an
+unguarded write during a concurrent read corrupts the table. Registering the same
+name twice **replaces** rather than duplicating.
 
-```rust
-use agnosai::tools::ToolRegistry;
-use std::sync::Arc;
+## Naming rules
 
-let registry = ToolRegistry::new();
-registry.register(Arc::new(HealthCheckTool::new()));
+- **Prefix every public symbol `agnosai_*`.** Cyrius has ONE flat namespace and
+  last-definition-wins. `_`-prefix internals so they leave the coverage
+  denominator.
+- ⚠ **Never name a function `X_str`, `X_int` or `X_ptr` alongside an `X`.** Those
+  are reserved overload slots — Cyrius silently routes `X(a, …)` to `X_str` when
+  `a` is Str-typed, and to `X_int` when `a` is a bare call result. The symptom is
+  the wrong function body running, with no error.
 
-// Use it
-let tool = registry.get("health_check").unwrap();
-let input = ToolInput {
-    parameters: [("url".into(), json!("https://example.com"))].into(),
-};
-let output = tool.execute(input).await;
-```
+## Testing
 
-## Adding to Built-ins
-
-To include your tool in the default set:
-
-1. Create `src/tools/builtin/your_tool.rs`
-2. Export it in `src/tools/builtin/mod.rs`
-3. Register it in `src/main.rs` (follow the pattern of EchoTool, JsonTransformTool)
-
-## AGNOS Service Tools Pattern
-
-For tools that talk to external HTTP services, follow the Synapse/Mneme/Delta pattern:
-
-```rust
-pub struct YourServiceTool {
-    client: reqwest::Client,
-    base_url: String,
-}
-
-impl YourServiceTool {
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            base_url: "http://localhost:PORT".to_string(),
-        }
-    }
-
-    pub fn with_base_url(base_url: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            base_url,
-        }
-    }
-}
-```
-
-This gives callers a zero-config default with the option to point at a different endpoint.
+Suites live in `tests/*.tcyr` and may `include "src/tools/…"` directly. Cover
+the absent-parameter arm, the wrong-type arm, and the success arm — then
+**mutation-verify**: break the tool, confirm a named assertion fails, restore.

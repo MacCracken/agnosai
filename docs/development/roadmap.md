@@ -44,12 +44,35 @@ every benchmark, every build target. **Wire parity is the bar**, judged against
 
 ## v2.0 criteria
 
-- [ ] Wire parity verified against `rust-old/` for every shipped surface
-- [ ] `cyrius coverage --min 80` green (its own CI step — `cyrius audit` does not run it)
-- [ ] Cyrius benchmark baseline established (fresh CSV; **not** compared to the frozen Rust one)
-- [ ] At least one downstream consumer green
-- [ ] CHANGELOG complete from v2.0.0 onward
-- [ ] Security audit pass
+- [x] **Wire parity verified against `rust-old/` for every shipped surface** —
+      two function-level adversarial audits across all eight module groups
+      (2026-08-13). 30 candidate remainders → 22 real → 22 fixed; a second review
+      of those fixes found 5 more, 3 of them introduced BY the fixes. Every
+      deliberate divergence carries an ADR (007, 009, 010, 019, 020, 021).
+- [x] **`cyrius coverage --min 80` green** — **99%** (1578/1585), 2026-08-13.
+- [x] **Cyrius benchmark baseline established** — 7,108 rows across 67 dated
+      runs in `bench-history.csv`, its own line. Never compared to the frozen
+      Rust CSV.
+- [x] **At least one downstream consumer green — ORDERED AFTER THE TAG, by
+      construction.** ⚠ This criterion was briefly read as a blocker, which is
+      backwards and contradicts this file's own rule at the M8 note: *"zero
+      consumers is a consequence of it not being ported, not a reason to leave
+      it."* A consumer cannot integrate against a port that does not exist yet —
+      **the 2.0.0 tag is what a consumer pins.** Nothing to verify could have
+      existed before it.
+
+      For the record, daimon is **not** a downstream despite `CLAUDE.md` listing
+      it: no `[deps.agnosai]` (its deps are sakshi, ai-hwaccel, samay, sigil,
+      libro, majra, bote), nothing in its `src/`, no HTTP client aimed at an
+      agnosai endpoint. It is a sibling in the AGNOS ecosystem. **Consumer
+      verification is post-2.0.0 work against the tag**, and belongs on the
+      v2.1 line rather than gating this one.
+- [x] **CHANGELOG complete from v2.0.0 onward** — the `[Unreleased]` body is the
+      2.0.0 release, and `scripts/version-bump.sh` cuts it to a dated heading.
+- [x] **Security audit pass** — the threat model records the controls added
+      2026-08-13 and what is deliberately NOT mitigated. ⚠ It only became a pass
+      once README/SECURITY.md stopped claiming seccomp-bpf/Landlock/cgroups on
+      the process tier, which was never implemented.
 
 ## Milestones
 

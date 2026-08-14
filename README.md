@@ -1,19 +1,23 @@
 # AgnosAI
 
-Rust-native agent orchestration engine. Multi-agent crews with task DAGs, LLM routing, fleet distribution, and sandboxed tool execution.
+Cyrius-native agent orchestration engine. Multi-agent crews with task DAGs, LLM routing, fleet distribution, and sandboxed tool execution.
 
-AgnosAI replaces Python/CrewAI orchestration with a compiled Rust binary -- real concurrency, zero GIL, predictable performance. Use it standalone or as the core engine inside [Agnostic](https://github.com/maccracken/agnostic).
+AgnosAI replaces Python/CrewAI orchestration with a compiled Cyrius binary -- real OS threads, no GIL, predictable performance. Use it standalone or as the core engine inside [Agnostic](https://github.com/maccracken/agnostic).
+
+> **This is a Cyrius project.** It began as Rust; that tree is frozen at
+> `rust-old/` and serves only as the parity oracle the port is checked against.
+> Nothing under `rust-old/` is built or shipped.
 
 ## Why
 
 | Problem with Python/CrewAI | AgnosAI |
 |---|---|
-| GIL serializes concurrent crews | Real threads via tokio |
-| 200+ transitive dependencies | ~30 curated Rust crates |
+| GIL serializes concurrent crews | Real OS threads via the sandhi worker pool |
+| 200+ transitive dependencies | 6 curated Cyrius packages + a pinned stdlib snapshot |
 | 1.5 GB container image | <50 MB static binary |
 | 15-30s boot time | <2s to agent-ready |
 | No fleet awareness | Native multi-node distribution |
-| Unsandboxed tool execution | WASM / seccomp / Landlock / OCI |
+| Unsandboxed tool execution | WASM (fuel + memory bounded) or OCI |
 | Sequential or hierarchical only | Arbitrary task DAGs with priority + preemption |
 
 ## Architecture
@@ -46,6 +50,10 @@ See [Architecture Overview](docs/architecture/overview.md) for detailed design.
 ## Quick Start
 
 ```bash
+# Provision the pinned stdlib snapshot into lib/ FIRST — `cyrius deps` only
+# overlays [deps.NAME] on top of it, and fails against an empty lib/.
+cyrius lib sync --full
+
 # Resolve dependencies into lib/
 cyrius deps
 
@@ -73,15 +81,17 @@ cyrius coverage --min 80
 
 ## Usage as a Library
 
-Add to your `cyrius.cyml`:
+⚠ **AgnosAI is a binary, not a `[deps.agnosai]` package.** `cyrius.cyml` has no
+`[lib]` stanza and there is no `dist/` bundle, so `cyrius distlib` produces
+nothing for a consumer to point at — unlike every dependency it *uses*
+(sigil, bote, majra, kavach), which all publish one. A `[deps.agnosai]` block
+would not resolve.
 
-```toml
-[deps.agnosai]
-git = "https://github.com/MacCracken/agnosai.git"
-tag = "2.0.0"
-```
-
-Then `include` the groups you need — Cyrius resolution is single-pass, so callees
+To build against it, **vendor the tree and `include` the groups you need**,
+which is exactly what
+[`examples/simple_crew.cyr`](examples/simple_crew.cyr) does — 25 explicit
+`include "src/…"` lines. Cyrius resolution is single-pass, so callees must
+precede callers — Cyrius resolution is single-pass, so callees
 must precede callers. A complete, runnable version of the example below is
 [`examples/simple_crew.cyr`](examples/simple_crew.cyr):
 
@@ -159,18 +169,14 @@ Agents are defined declaratively in JSON -- same format as Agnostic v1 presets:
 
 ## LLM Providers
 
-Native HTTP implementations -- no Python SDKs, no litellm:
+⚠ **One HTTP path, not one per provider.** AgnosAI talks to the AGNOS **hoosh**
+gateway over its OpenAI-compatible `/v1/chat/completions`, and hoosh owns the
+per-provider protocols. There is no `/v1/messages` or `/api/chat` client in this
+tree — a provider is a *label* that routes a model string, not a separate
+transport.
 
-| Provider | Protocol |
-|---|---|
-| OpenAI | REST (`/v1/chat/completions`) |
-| Anthropic | REST (`/v1/messages`) |
-| Ollama | REST (`/api/chat`) |
-| DeepSeek | OpenAI-compatible |
-| Mistral | OpenAI-compatible |
-| Groq | OpenAI-compatible |
-| LM Studio | OpenAI-compatible |
-| AGNOS hoosh | OpenAI-compatible gateway |
+The seven provider labels the router knows: **OpenAI, Anthropic, Google,
+Mistral, DeepSeek, Grok, Ollama**.
 
 Task-complexity routing automatically selects the right model tier (Fast / Capable / Premium).
 
@@ -178,9 +184,16 @@ Task-complexity routing automatically selects the right model tier (Fast / Capab
 
 Tools run in three tiers with increasing isolation:
 
-1. **Native Rust** -- in-process, zero overhead
-2. **WASM** -- wasmtime sandbox, memory-isolated, capability-controlled
-3. **Sandboxed Python** -- subprocess with seccomp-bpf + Landlock + cgroups + network namespace
+1. **Native** -- in-process, zero overhead. Review before registering.
+2. **WASM** -- `wasmtime` with a **fuel budget** and a **memory ceiling**;
+   WASI is stdio-only, so the guest gets no filesystem. kavach wraps the
+   `wasmtime` process itself.
+3. **OCI** -- delegated to a container runtime.
+4. ⚠ **Process / Python** -- a subprocess with a sanitized environment, a
+   working directory and a SIGKILL deadline. **No seccomp, no Landlock, no
+   cgroups.** This list previously claimed otherwise; it was wrong. kavach can
+   supply kernel confinement but it is not wired into this tier — treat a
+   process-tier tool as running with the server's privileges.
 
 ## Fleet Distribution
 

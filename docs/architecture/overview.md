@@ -15,7 +15,7 @@
                                    │
                     ┌──────────────▼──────────────────────┐
                     │            AgnosAI                    │
-                    │   (core engine — Rust crate)          │
+                    │   (core engine — Cyrius binary)       │
                     └──┬───────────┬───────────┬──────────┘
                        │           │           │
               ┌────────▼──┐  ┌────▼─────┐  ┌──▼───────┐
@@ -31,7 +31,9 @@
 
 ## Module Structure
 
-AgnosAI is a single crate with feature-gated modules:
+`src/` mirrors `rust-old/src/` file for file. ⚠ Cargo features have no Cyrius
+equivalent and are **not** a scope boundary — every module is built
+unconditionally:
 
 ```
 agnosai
@@ -100,7 +102,11 @@ Five weighted factors (0.0–1.0 each):
 ### Pub/Sub
 
 - Topic-based with wildcard patterns: `*` (one segment), `#` (zero or more)
-- `tokio::sync::broadcast` channels per subscription pattern (capacity 256)
+- One bounded channel per subscription pattern. ⚠ Not `tokio::sync::broadcast` —
+  the port has no tokio. majra's relay backs it, and since majra 2.6.5 the
+  capacity a caller asks for is the capacity it gets (it was hardcoded to 256
+  before that). A full ring **drops** rather than blocking the sender, matching
+  `broadcast::send`, which never blocks and reports `Lagged` to a slow receiver.
 - `DashMap` for concurrent subscription management
 
 ## Configuration
