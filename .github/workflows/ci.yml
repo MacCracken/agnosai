@@ -151,10 +151,16 @@ jobs:
         # so a red run says only "exit code 1". Diagnosing one cost several
         # round-trips on 2026-08-14 — the tail of the log shows passing suites
         # and the failing one scrolls away. Surface it explicitly.
+        #
+        # ⚠ GitHub runs `run:` under `bash -e`, so a failing pipeline ABORTS the
+        # script immediately — an unguarded `cyrius test | tee` never reaches the
+        # reporting below, which is why the first attempt at this still printed
+        # only "exit code 1". `|| rc=$?` handles the failure so `-e` does not
+        # fire.
         run: |
           set -o pipefail
-          cyrius test 2>&1 | tee /tmp/agnosai-test.log
-          rc=$?
+          rc=0
+          cyrius test 2>&1 | tee /tmp/agnosai-test.log || rc=$?
           if [ "$rc" -ne 0 ]; then
             echo "::group::Failing suites"
             awk '/^=== /{n=$2}

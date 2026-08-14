@@ -691,12 +691,19 @@ fn main() {
     # outcome leaking into another's response).
     var probe_kind: i64[1];
     store64(&probe_kind, 0);
-    assert_eq(agnosai_run_security_audit_err(
-    str_from("http://nonexistent-agnosai.invalid/"), &probe_kind), 0,
-    "an unresolvable host fails the audit");
+    var probe_rc = agnosai_run_security_audit_err(
+    str_from("http://nonexistent-agnosai.invalid/"), &probe_kind);
+    # ⚠ **The OUTCOME is not asserted, only the INVARIANT.** `.invalid` is
+    # reserved by RFC 2606 and must not resolve — but a resolver that hijacks
+    # NXDOMAIN with a wildcard A record turns this into a real connection, and a
+    # runner with no resolver at all makes sandhi return a NULL result with no
+    # kind to report. Asserting "the audit fails" is therefore an assertion
+    # about somebody else's DNS. What holds everywhere: the tool never reports a
+    # reason it did not actually observe.
     var probe_got = load64(&probe_kind);
     if (probe_got != 0) {
-        # A resolver was present: the kind must have propagated intact.
+        # A kind was captured, so the transport must have failed.
+        assert_eq(probe_rc, 0, "a captured kind means the fetch failed");
         assert(str_eq(_agnosai_audit_reason(probe_got), _agnosai_audit_reason(0)) == 0,
         "a captured kind yields a SPECIFIC reason, not the generic fallback");
         assert_eq(probe_got, SANDHI_ERR_DISCOVERY,
