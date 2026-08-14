@@ -107,13 +107,68 @@ jobs:
           mkdir -p build
           cyrius build src/main.cyr build/${{ github.event.repository.name }}
 
+      - name: Install wasmtime
+        # ⚠ **Without this, every WASM path in the suite SKIPS.** The tests are
+        # guarded on `agnosai_wasm_available()`, so a runner with no runtime
+        # takes the no-runtime arm and the execute paths — fuel budget, memory
+        # ceiling, stdin delivery, stdout capture — go unexercised. That is
+        # exactly the class of bug ADR 019 records: two defects survived because
+        # nothing had ever run a real module. CI asserting the skip arm is not
+        # the same as CI testing WASM.
+        #
+        # ⚠ It must land on a path kavach PROBES: `/usr/local/bin/wasmtime`,
+        # `/usr/bin/wasmtime`, then `$HOME/.cargo/bin/wasmtime`
+        # (lib/kavach.cyr:2964). The upstream `wasmtime.dev/install.sh` puts it
+        # in `~/.wasmtime/bin`, which is NOT probed and would silently keep the
+        # tests skipping.
+        #
+        # The version is pinned deliberately: this is a test dependency whose
+        # behaviour the suite asserts against (a fuel budget of 1 must exhaust; a
+        # 128 MiB guest must be refused under a 64 MiB ceiling), so a silent
+        # upgrade could change a result. Unlike the cyrius pin, it has no
+        # manifest to read it from.
+        run: |
+          set -euo pipefail
+          WASMTIME_VERSION=47.0.3
+          ASSET="wasmtime-v${WASMTIME_VERSION}-x86_64-linux"
+          curl -sSfL -o /tmp/wasmtime.tar.xz \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/${ASSET}.tar.xz"
+          tar -xJf /tmp/wasmtime.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/${ASSET}/wasmtime" /usr/local/bin/wasmtime
+          wasmtime --version
+          # Fail loudly here rather than letting the suite quietly skip.
+          test -x /usr/local/bin/wasmtime
+
       - name: Test
         # v5.6.28: bare `cyrius test` picks up the [build].test entry
         # AND auto-discovers tests/*.tcyr — avoids the previous
         # `cyrius test src/test.cyr` form that hard-failed when the
         # stub didn't exist (Issue 1) and also wouldn't ever exercise
         # tests/${proj}.tcyr.
-        run: cyrius test
+        #
+        # ⚠ **Print WHICH suite failed.** `cyrius test` exits non-zero and its
+        # per-suite results are buried in thousands of lines of build warnings,
+        # so a red run says only "exit code 1". Diagnosing one cost several
+        # round-trips on 2026-08-14 — the tail of the log shows passing suites
+        # and the failing one scrolls away. Surface it explicitly.
+        run: |
+          set -o pipefail
+          cyrius test 2>&1 | tee /tmp/agnosai-test.log
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::Failing suites"
+            awk '/^=== /{n=$2}
+                 /passed, [0-9]+ failed/{split($0,a," "); if (a[3]+0 != 0) print n"  ->  "$0}' \
+              /tmp/agnosai-test.log | tee /tmp/agnosai-failed.txt
+            echo "::endgroup::"
+            echo "::group::Failed assertions"
+            grep -E '^\s+FAIL:' /tmp/agnosai-test.log | head -40 || true
+            echo "::endgroup::"
+            while read -r line; do
+              [ -n "$line" ] && echo "::error::suite failed: $line"
+            done < /tmp/agnosai-failed.txt
+          fi
+          exit "$rc"
 
       - name: Coverage
         # CLAUDE.md specifies this as its own CI step. It is reference coverage —
