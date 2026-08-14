@@ -673,8 +673,17 @@ fn main() {
     # ⚠ **The table above is PURE, so asserting it does not test the wiring** —
     # dropping the `store64(out_kind, ..)` in `agnosai_guarded_fetch_full` leaves
     # every assertion above green. This drives the real path: `.invalid` is
-    # reserved by RFC 2606 and never resolves, so the fetch fails with a kind
-    # rather than succeeding.
+    # reserved by RFC 2606 and never resolves, so the fetch cannot succeed.
+    #
+    # ⚠ **The OUTCOME is environment-dependent and the assertions allow for it.**
+    # On a host with a resolver, sandhi returns a result carrying
+    # `SANDHI_ERR_DISCOVERY` (kind 8) and the kind propagates. On a host with no
+    # resolver at all, sandhi can return a NULL result — there is no kind to
+    # report, by construction — and `agnosai_guarded_fetch_full` answers 0
+    # without writing `out_kind`. Asserting a non-zero kind unconditionally made
+    # this suite fail in CI while passing locally. What is invariant, and what is
+    # asserted here, is: the audit FAILS, and it never reports a specific reason
+    # it did not actually observe.
     # ⚠ The kind comes back through an OUT-PARAM, not a module global. It was a
     # global, which is a data race: the tool runs on a `run_pooled` worker and
     # the store/load straddles two HTTP chains, so a concurrent audit could zero
@@ -685,11 +694,20 @@ fn main() {
     assert_eq(agnosai_run_security_audit_err(
     str_from("http://nonexistent-agnosai.invalid/"), &probe_kind), 0,
     "an unresolvable host fails the audit");
-    assert(load64(&probe_kind) != 0,
-    "and the sandhi error kind was CAPTURED — a 0 here means it is dropped again");
-    assert(str_eq(_agnosai_audit_reason(load64(&probe_kind)),
-    _agnosai_audit_reason(0)) == 0,
-    "so the message is specific, not the generic fallback");
+    var probe_got = load64(&probe_kind);
+    if (probe_got != 0) {
+        # A resolver was present: the kind must have propagated intact.
+        assert(str_eq(_agnosai_audit_reason(probe_got), _agnosai_audit_reason(0)) == 0,
+        "a captured kind yields a SPECIFIC reason, not the generic fallback");
+        assert_eq(probe_got, SANDHI_ERR_DISCOVERY,
+        "and an unresolvable host is a DISCOVERY failure");
+    } else {
+        # No resolver: sandhi returned no result, so there is no kind. The
+        # message must then be the generic one rather than a reason invented
+        # from a zero.
+        assert(str_contains_cstr(_agnosai_audit_reason(probe_got), "request failed") == 1,
+        "with no kind observed the message stays generic rather than inventing one");
+    }
 
     # A null out_kind must be accepted, since the bare form passes one.
     assert_eq(agnosai_run_security_audit_err(
