@@ -446,6 +446,33 @@ defects, three of them introduced BY those fixes** — two critical. 2026-08-13:
   window.** The window here was two HTTP chains wide — seconds — and the payload
   was one tenant's transport outcome appearing in another's response.
 
+### ⚠ A test that reads the ENVIRONMENT will pass here and fail in CI
+
+2026-08-13/14, three instances of one pattern — **a check passes locally because
+this box supplies something a runner does not**:
+
+1. **`--no-deps`** — majra's CI builds with it; I built without, so a stdlib
+   module that a `--no-deps` build does not prepend resolved here and failed
+   there.
+2. **`lib/` drift** — the pinned snapshot had moved to sandhi 1.9.10 while this
+   tree still held 1.9.9; `check-clean` only re-compares when a dep pin changes.
+3. **DNS** — a test drove `agnosai_run_security_audit_err` at an RFC 2606
+   `.invalid` host and asserted the sandhi error kind was captured. With a
+   resolver present sandhi returns a result carrying `SANDHI_ERR_DISCOVERY`; with
+   **no resolver at all it can return a NULL result**, so there is no kind to
+   report **by construction** and `agnosai_guarded_fetch_full` correctly writes
+   nothing. The code was right; the assertion was wrong.
+
+⚠ **The fix is to assert what is INVARIANT across environments**, not to widen
+the assertion until it cannot fail. Here that is: the audit fails, and it never
+reports a reason it did not observe — with the resolver-present arm still
+pinning `DISCOVERY` and a specific message, so the mutation is caught wherever a
+resolver exists.
+
+⚠ And an availability guard must assert BOTH arms. `tests/sandbox_wasm.tcyr`
+does this correctly: with no `wasmtime`, execute must return a Sandbox error
+rather than half-working — a skip would have proven nothing.
+
 ### ⚠ A green local build is not evidence about CI, and `lib/` goes stale silently
 
 Two 2026-08-13 findings that cost real time, both the same shape: **a check that
