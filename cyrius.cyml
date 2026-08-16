@@ -11,8 +11,6 @@ cyrius = "6.5.21"
 entry = "src/main.cyr"
 output = "build/agnosai"
 
-# Array order is the auto-include order and resolution is single-pass.
-# Rationale and constraints: docs/development/cyrius-port-plan.md
 [deps]
 stdlib = [
     "syscalls", "alloc", "result", "tagged", "fmt", "io", "fs", "str", "string",
@@ -31,27 +29,17 @@ stdlib = [
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 path = "../sigil"
-# 3.12.9 — the RSA sign path is no longer banked. `_rsa_sign_*`, `_rsa_blind_*`
-# and `_rsa_crt_*` moved from shared `cbank()` lanes to function-scope locals,
-# and secret zeroization is per CALL rather than per lane. That matters here
-# and is not cosmetic: `agnosai_serve` verifies RS256 bearer tokens under
-# `sandhi_server_run_pooled`, whose workers are real OS threads, so two
-# concurrent verifies could alias a lane. 3.12.8 is the other half of the
-# `err_*` → `sigil_err_*` rename that kavach 3.11.13 completes.
-#
-# ⚠ **This pin DOES decide what is built — the previous comment here was
-# wrong.** It claimed sigil comes from the cyrius stdlib fold rather than this
-# dep, because `lib sync --full` supposedly runs *after* `deps` and overwrites
-# the git-dep copy. Both CI and `scripts/lock-refresh.sh` run them the other way
-# round — `lib sync --full` FIRST, then `cyrius deps` — so `deps` overlays the
-# fold and this tag wins. The old claim was untestable while the fold and the
-# tag both said 3.12.7; naming 3.12.9 here makes the two distinguishable, and a
-# clean tag-only resolution then reports 3.12.9 in `lib/sigil.cyr`.
-#
-# The fold (cyrius 6.5.21) still carries 3.12.7, so `lib sync --full` alone
-# leaves the older copy — it is `deps` that brings this one in.
 tag = "3.12.9"
-modules = ["dist/sigil.cyr"]
+modules = [
+    "src/crypto_scratch.cyr",
+    "src/mul64.cyr",
+    "src/bignum.cyr",
+    "src/bigint_ext.cyr",
+    "src/sha_ni.cyr",
+    "src/sha256.cyr",
+    "src/hmac.cyr",
+    "src/rsa.cyr",
+]
 
 [deps.bote]
 git = "https://github.com/MacCracken/bote.git"
@@ -62,53 +50,12 @@ modules = ["dist/bote-core.cyr"]
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
 path = "../majra"
-# 2.6.2 fixes the priority queue twice over, both reported from here:
-#
-#   * **`pq_dequeue` was O(n) per pop**, so draining was O(n²) — it popped with
-#     `vec_remove(tier, 0)`, which shifts every survivor. Now a read index per
-#     tier, amortised O(1): **198.70 µs → 33 ns** at 200,000 deep, flat across a
-#     100× range. `src/llm/inference_queue.cyr` drains through `cpq_dequeue`, and
-#     the whole point of that module is that background work is ALLOWED to pile
-#     up behind interactive work — so the deep-tier path is the design case.
-#   * **`pq_enqueue` clamped over-range priorities but not negatives**, so a −1
-#     reached `load64(pq + pri * 8)` — an OOB read before the struct, then a push
-#     through the result. `agnosai_map_priority` is exactly the compute-a-priority
-#     shape that could reach it; its ladder never emits one, which is why the
-#     module header says the ladder IS the bounds check.
-#
-# 2.6.3 retires the `relay_receive` allocator workaround: 2.6.1 had pulled a
-# 16-byte `fl_alloc` INSIDE the relay's critical section because `fl_alloc` was
-# not thread-safe, and cyrius 6.5.19 fixes that properly, so the allocation moves
-# back outside a lock that is held across a subscriber-list walk. 2.6.1 also
-# dropped majra's own `[deps.sakshi]` — see the sakshi note below.
 tag = "2.6.6"
 modules = ["dist/majra.cyr"]
 
 [deps.kavach]
 git = "https://github.com/MacCracken/kavach.git"
 path = "../kavach"
-# 3.11.10 makes the WASM backend actually RUN. 3.11.9 gave it stdin, an exit code
-# and stderr (`confine_capture_input`) plus `backend_is_available(Backend.WASM)`
-# — but its argv was rejected by wasmtime outright:
-#
-#     error: unexpected argument '--max-memory-size' found
-#
-# `--max-memory-size` and `--fuel` were emitted as top-level `wasmtime run`
-# flags; both live in wasmtime's `-W` group. ⚠ **Never a version skew — the
-# spelling was never valid**, and `-W` has existed since wasmtime 14 (2023). It
-# survived because nothing had run a real module: kavach's two WASM tests both
-# fail before argv is assembled, and the backend was unreachable through the
-# public API until 3.11.8. ADR 019.
-#
-# 3.11.13 renames kavach's fourteen bare `err_*` constructors to
-# `kavach_err_*`. kavach and sigil both fork agnosys's `sys_error.cyr`, so both
-# minted the SAME fourteen names into cyrius's one flat namespace and the
-# compiler resolved them last-def-wins — fourteen silent collisions that
-# survived the whole 3.x line behind a `duplicate fn` warning apiece. agnosai
-# calls none of them (verified: no bare `err_*`, `syserr_*`, `wrap_syscall`,
-# `is_syscall_err` or `result_print_err` anywhere in src/ or tests/), so the
-# rename is a clean bump here and simply removes the warnings. The `syserr_*`
-# accessors and the `KAVACH_ERR_*` enum are deliberately unchanged upstream.
 tag = "3.11.13"
 modules = ["dist/kavach.cyr"]
 
@@ -123,68 +70,6 @@ git = "https://github.com/MacCracken/tyche.git"
 path = "../tyche"
 tag = "1.0.0"
 modules = ["dist/tyche.cyr"]
-
-# ✅ **`[deps.sakshi]` is GONE (2026-08-12), after several releases as a
-# defensive pin. Verified by measurement, not by reasoning: removed, full
-# three-step, then `cyrius build` — `lib/sakshi.cyr` stays at the snapshot's
-# 2.4.10 and `lib/` diffs clean. The check that matters is AFTER A BUILD; the
-# three-step alone was never the failure mode.**
-#
-# The mechanism it guarded against is real and unchanged: `sakshi` is in
-# `[deps].stdlib` above, so `lib sync --full` provisions whatever the toolchain
-# folds — but `cyrius deps` overlays a git dep's resolution ON TOP of the
-# snapshot, recursing through SIBLING manifests, on every `cyrius build` and not
-# only on `deps`. A sibling pinned behind the toolchain therefore downgrades
-# `lib/sakshi.cyr` silently. The only signal is an unnamed "1 bundled lib(s)
-# differ" shadow warning, and `deps --verify` cannot catch it because the lock is
-# written *from disk* and records the downgraded file's hash. Not hypothetical:
-# under the 6.5.10 bump the tree built 2.4.7 while the pin shipped 2.4.8,
-# silently reverting sakshi's `i64::MIN` integer-format fix.
-#
-# ⚠ **The real source was never a direct sibling — it was four links down**, and
-# as of the 6.5.20 bump every link is fixed at its own root rather than absorbed
-# by a downstream counter-pin:
-#
-#     agnosai -> bote -> [deps.libro] -> [deps.patra] -> [deps.sakshi] 2.4.2
-#                 ✅ 3.3.1    ✅ 2.8.5      ✅ 1.13.0        ✅ gone
-#
-# **patra is itself FOLDED INTO the cyrius stdlib** while it carried that git dep
-# on a sakshi eight patch releases behind the sakshi the same snapshot ships.
-# The sequence that closed it, in order, each verified before the next:
-#
-#   1. **patra 1.13.0** — zero `[deps.*]` blocks, sakshi from the fold.
-#   2. **cyrius 6.5.20** — re-folds patra 1.13.0 (`lib/patra.cyr` reads 1.13.0).
-#   3. **libro 2.8.5** — `[deps.patra]` 1.12.12 -> 1.13.0. ⚠ Also
-#      `[deps.sigil]`/`[deps.sigil_tpm]` 3.12.1 -> 3.12.7: **sigil 3.12.1's own
-#      manifest declared `[deps.sakshi]` at 2.4.3**, so libro fed the overlay
-#      through TWO pins, which no earlier analysis here had found.
-#   4. **bote 3.3.1** — the defensive `[deps.sakshi]` 2.4.10 is DELETED, its
-#      reason removed. Re-verified after a build: sakshi holds at 2.4.10.
-#
-# ⚠ **Two corrections to the plan that state.md carried**, both established by
-# measurement rather than reasoning, and both the opposite of what it said:
-#
-#   * **libro must KEEP `[deps.patra]`** (bumped, not deleted). bote consumes
-#     `dist/libro.cyr`, which calls `patra_*` 54 times and defines none, and bote
-#     declares no patra of its own — deleting the block strands bote.
-#   * **libro must KEEP its THIN `[deps.sigil]` sub-bundle selection.** The fold
-#     is the monolith (`lib/sigil.cyr`, 27,550 lines, x509/RSA bignum banks). A
-#     consumer taking `dist/sigil.cyr` builds with `warning: large static data
-#     (10794336 bytes)`; libro's thin build is `.bss` 80,224 bytes. Only the tag
-#     needed to move.
-#
-# The hazard mechanism itself is unchanged and will recur: a sibling pinned
-# behind the toolchain silently downgrades a folded module for every consumer
-# that reaches it, however many levels away. `scripts/check-clean.sh` diffs
-# `lib/` against the toolchain snapshot and fails on any drift, and CI runs it —
-# that gate is what catches a recurrence.
-#
-# ⚠ **Do not re-derive this note from one level of manifests.** Its predecessors
-# were wrong three times for exactly that reason: they named "sigil and bote",
-# then "majra 2.6.0", then "bote". Follow the chain DOWN — start with
-# `grep -l '^\[deps\.sakshi\]' ../*/cyrius.cyml`, then read each hit's OWN
-# manifest, recursively. **13 repos still pin `[deps.sakshi]` at stale tags**
-# (2.3.0-2.4.7); none is in agnosai's dependency path.
 
 [release]
 bins = ["agnosai"]

@@ -134,40 +134,24 @@ cyrius coverage --min 80                    # the 80% gate — its own CI step
 - **Prefix every public symbol `agnosai_*`.** Cyrius has ONE flat namespace and last-definition-wins. Short names (`add`, `run`) also get falsely credited by coverage's substring matching. `_`-prefix genuine internals so they leave the coverage denominator
 - `var buf[N]` = N **bytes**, not N entries
 
-### ⚠ `cyrius.lock` must be committed TAG-ONLY, and every local build un-does that
+### `cyrius.lock` — CI resolves it; do not hand-maintain it
 
-CI's *Lockfile is honest* step runs `cyrius deps` on a runner that has **none of
-the sibling checkouts** `path = "../NAME"` points at, so it resolves each dep
-from `git` + `tag` and records a `commit` pin per dep. It then does
-`git diff --exit-code -- cyrius.lock`. **The committed lock must be that
-tag-only resolution** — otherwise the tags no longer name what CI builds.
+**Commit whatever `cyrius.lock` your tree produces. It does not need commit
+pins, and there is no pre-commit dance.**
 
-⚠ **Locally the `path` wins, so `cyrius deps` writes a lock with NO commit
-pins — and a bare `cyrius build` re-resolves and clobbers it the same way.**
-Measured: a tag-only lock has **8 `commit` lines**; one `cyrius build` takes it
-to **0**. That is how a path-shaped lock reached `main` and broke CI on
-2026-08-13.
+CI runs `cyrius deps` on a runner with none of the sibling checkouts
+`path = "../NAME"` points at, so it resolves every dep from `git` + `tag` and
+builds from *that* resolution. Locally the `path` wins, so any `cyrius deps` /
+`cyrius build` / `cyrius tests` rewrites the lock with zero pins — which is
+correct for a local build and simply not what CI uses.
 
-**So refreshing the lock is the LAST thing before a commit, after all building
-and testing is done — and there is a script for it:**
-
-```sh
-./scripts/lock-refresh.sh        # expects 8 commit pins; fails loudly at 0
-git add cyrius.lock
-```
-
-It holds the `path` overrides aside, resolves tag-only, restores the manifest
-from a backup, and **refuses to run while `cycc` is alive** — a concurrent build
-rewrites the lock underneath it and makes the script look non-deterministic when
-it is not.
-
-Then commit **without running `cyrius deps` or a bare `cyrius build` again**.
-
-⚠ **Do NOT try to fix a CI lock failure by reordering the file.** `cyrius deps`
-writes the hash lines in filesystem-iteration order, which differs per machine;
-CI normalises that by comparing **sorted**. A failure there means the CONTENT
-differs — a changed hash, a missing commit pin, a dep resolved from a path
-instead of its tag.
+CI used to `diff` the two and fail on any difference. That asked a developer to
+hand-produce a byte-equal lock while every local build destroyed it — the lock
+landed wrong **five** times, and a `lock-refresh.sh` script plus a pre-commit
+hook grew to paper over it. All three are gone. What actually protects the build
+is unchanged: `cyrius deps` fails on a tag that will not resolve,
+`deps --verify` confirms the lock matches `lib/` on disk, and the lib-snapshot
+diff in `check-clean.sh` catches a dep silently downgrading a folded module.
 
 ## DO NOT
 

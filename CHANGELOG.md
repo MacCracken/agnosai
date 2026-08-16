@@ -21,19 +21,47 @@ the per-lane wipe could zero a sibling's in-flight secret mid-sign.
 `tests/` for `err_*`, `syserr_*`, `wrap_syscall`, `is_syscall_err` and
 `result_print_err` — so it is a clean bump.
 
-⚠ **The `[deps.sigil]` comment was wrong and is corrected.** It claimed agnosai
-does not get sigil from that dep at all, because `sigil.cyr` is folded into the
-cyrius stdlib snapshot and `lib sync --full` runs *after* `deps` and overwrites
-the git-dep copy — concluding that "bumping it alone changes nothing". Both CI
-and `scripts/lock-refresh.sh` run `lib sync --full` **first** and `cyrius deps`
-second, so `deps` overlays the fold and the tag decides. The claim had been
-untestable while the fold and the tag both said 3.12.7; pinning 3.12.9 makes
-them distinguishable, and a clean tag-only resolution reports **3.12.9** in
-`lib/sigil.cyr` against a fold that still carries 3.12.7. Had the old comment
-been believed, the thread-safety fix above would have been assumed unreachable.
+### Changed — sigil is a THIN dependency, not the whole library
 
-Gate on the new pins: build OK, **98 passed / 0 failed**, coverage 99%,
-`vet` 39 deps / 0 untrusted / 0 missing.
+`[deps.sigil]` took `dist/sigil.cyr` — **1,084 KB and 1,163 functions** — for
+the three symbols agnosai actually calls: `rsa_pkcs1v15_verify_sha256` and
+`rsa_pubkey_from_der` (RS256, `src/server/auth.cyr`) and `hmac_sha256`. It now
+takes eight source modules (~165 KB): `crypto_scratch`, `mul64`, `bignum`,
+`bigint_ext`, `sha_ni`, `sha256`, `hmac`, `rsa`.
+
+This is the pattern the tree already used and agnosai alone ignored — libro and
+kybernet both select thin sigil sub-bundles, and the manifest even carried a
+note that a consumer taking `dist/sigil.cyr` builds with
+`warning: large static data (10794336 bytes)`.
+
+It also removes a CI failure at the root rather than working around it.
+`sigil.cyr` is the one dep file that is **also** in the cyrius stdlib fold, and
+`check-clean.sh` requires every folded file to byte-match the snapshot. While
+this dep pulled `dist/sigil.cyr`, `cyrius deps` overlaid the tag's copy onto the
+fold's, so any tag but the fold's 3.12.7 produced
+`lib: sigil.cyr differs from the 6.5.21 snapshot`. Selecting source modules
+means `deps` never writes `lib/sigil.cyr` at all: the fold keeps it, the gate is
+satisfied, and the tag moves independently of the toolchain — so 3.12.9's
+thread-safety fix lands for real.
+
+### Removed — the cyrius.lock pre-commit dance
+
+CI's *Lockfile is honest* step diffed the committed lock against its own clean
+resolution and failed on any difference. That required a developer to
+hand-produce a byte-equal lock while every local `cyrius deps` / `build` /
+`tests` rewrote it with zero commit pins — two requirements in direct conflict.
+The lock landed wrong **five times**, and `scripts/lock-refresh.sh` plus a
+`scripts/hooks/pre-commit` guard had grown to paper over it.
+
+All three are gone. **CI resolves the lock and publishes it as an artifact.**
+The protections that carried real signal are untouched: `cyrius deps` fails on
+an unresolvable tag, `deps --verify` confirms the lock matches `lib/`, and the
+lib-snapshot diff catches a dep downgrading a folded module.
+
+### Changed — `cyrius.cyml` is configuration again
+
+200 lines, 132 of them comments, down to 76 with none. The rationale lives in
+this file and `docs/development/`.
 
 ### Fixed — `durable_state` segfaulted reading a snapshot path that is a directory
 
