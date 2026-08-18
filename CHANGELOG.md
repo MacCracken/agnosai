@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] — 2026-08-17
+
 ### Changed — kavach 3.11.12 → 3.11.13, sigil 3.12.7 → 3.12.9
 
 **sigil 3.12.9 is the one with teeth here.** It moves the RSA sign, blind and
