@@ -9,7 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.0.1] — 2026-08-17
 
-### Changed — kavach 3.11.12 → 3.11.13, sigil 3.12.7 → 3.12.9
+### Changed — Cyrius pin 6.5.21 → 6.5.27
+
+Part of the ecosystem-wide ML/AI-arc toolchain realign. `cyrius lib sync --full` re-vendored the
+version-matched stdlib snapshot; suite **7940/7940 across 98 suites**, unchanged.
+
+⚠ **The pin move is what broke `scripts/check-clean.sh`**, exactly as the sigil section below
+predicts. The 6.5.21 fold shipped sigil **3.12.7**, which is why `[deps.sigil] tag = "3.12.7"`
+matched it; 6.5.27's fold ships **3.12.9**, and since `cyrius deps` overlays a declared dep's copy
+onto the fold on every resolve, the old tag put a stale `lib/sigil.cyr` back over the synced one:
+`lib: sigil.cyr differs from the 6.5.27 snapshot`. Fixed by moving the tag to 3.12.9 — now
+byte-identical to the snapshot, 107 of 108 folded files match.
+
+⛔ **The thin-sigil selection described below is NOT in `cyrius.cyml`.** `[deps.sigil]` still reads
+`modules = ["dist/sigil.cyr"]`. Every other change in this release landed — the manifest is 66 lines
+with zero comments, `scripts/lock-refresh.sh`, `scripts/hooks/pre-commit` and the *Lockfile is
+honest* CI step are all gone — but the module selection is not, so the tag remains coupled to the
+toolchain fold and **this failure will recur on the next pin bump**. The tag bump is a workaround,
+which is precisely what that section set out to avoid. One likely reason it was never applied: the
+eight modules it names are **not sufficient** — agnosai also calls `sha256_hex`, which lives in
+`src/hex.cyr`. The working set is nine: `crypto_scratch`, `mul64`, `bignum`, `bigint_ext`, `sha_ni`,
+`sha256`, `hex`, `hmac`, `rsa` — matching the pattern libro and kybernet already use.
+
+- **`[deps.kavach]` `3.11.13` -> `3.11.14`** and **`[deps.tyche]` `1.0.0` -> `1.0.1`** (tyche's frozen
+  1.x surface), alongside the sigil bump above.
+- **`[deps.ai-hwaccel]` `2.3.16` -> `2.3.17`.**
+
+### Changed — kavach 3.11.12 → 3.11.14, sigil 3.12.7 → 3.12.9, tyche 1.0.0 → 1.0.1
 
 **sigil 3.12.9 is the one with teeth here.** It moves the RSA sign, blind and
 CRT workspace off shared `cbank()` lanes into function-scope locals, and makes
