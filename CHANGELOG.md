@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.0.1] — 2026-08-17
+## [2.0.1] — 2026-08-18
 
 ### Changed — Cyrius pin 6.5.21 → 6.5.27
 
