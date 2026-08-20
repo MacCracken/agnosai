@@ -49,7 +49,7 @@ fn _t_span_hex(id): i64 {
 # A context with everything fixed, so encodings are byte-comparable.
 fn _t_ctx(): i64 {
     return agnosai_otlp_ctx_new(0x0102030405060708, 0x090a0b0c0d0e0f10,
-    0x1122334455667788, 1000, 2000, AGNOSAI_OTLP_STATUS_OK);
+      0x1122334455667788, 1000, 2000, AGNOSAI_OTLP_STATUS_OK);
 }
 
 # The byte-exact OTLP Span object for the tool-span fixture, assembled from
@@ -77,21 +77,21 @@ fn _t_expect_tool_span(): i64 {
 fn main(): i64 {
     # --- ids are fixed-width lowercase hex ------------------------------
     assert(str_eq_cstr(_t_trace_hex(0x0102030405060708, 0x090a0b0c0d0e0f10),
-    "0102030405060708090a0b0c0d0e0f10") == 1, "a trace id is 32 lowercase hex, high half first");
+        "0102030405060708090a0b0c0d0e0f10") == 1, "a trace id is 32 lowercase hex, high half first");
     assert_eq(str_len(_t_trace_hex(1, 1)), 32, "and always 32 digits");
     assert(str_eq_cstr(_t_trace_hex(0, 1), "00000000000000000000000000000001") == 1,
-    "zero-padded — a small id is not a short id");
+      "zero-padded — a small id is not a short id");
     assert(str_eq_cstr(_t_trace_hex(0, 0), "00000000000000000000000000000000") == 1,
-    "the all-zero id renders in full");
+      "the all-zero id renders in full");
     assert(str_eq_cstr(_t_trace_hex(0 - 1, 0 - 1),
-    "ffffffffffffffffffffffffffffffff") == 1, "and the all-ones id is lowercase f, not F");
+        "ffffffffffffffffffffffffffffffff") == 1, "and the all-ones id is lowercase f, not F");
 
     assert(str_eq_cstr(_t_span_hex(0x1122334455667788), "1122334455667788") == 1,
-    "a span id is 16 lowercase hex");
+      "a span id is 16 lowercase hex");
     assert_eq(str_len(_t_span_hex(1)), 16, "always 16 digits");
     assert(str_eq_cstr(_t_span_hex(0), "0000000000000000") == 1, "zero-padded too");
     assert(str_eq_cstr(_t_span_hex(0xabcdef), "0000000000abcdef") == 1,
-    "with the digits right-aligned");
+      "with the digits right-aligned");
 
     # ⚠ The all-zero trace id is INVALID per W3C, and it is exactly what
     # sakshi answers before anything calls `sakshi_trace_set_128` — so an
@@ -102,16 +102,16 @@ fn main(): i64 {
 
     # --- span kind -------------------------------------------------------
     var inf = agnosai_genai_inference_span(str_from("llama3"), str_from("ollama"),
-    str_from("agent-a"), str_from("task-1"));
+      str_from("agent-a"), str_from("task-1"));
     var tool = agnosai_genai_tool_span(str_from("echo"), str_from("agent-a"),
-    str_from("task-1"));
+      str_from("task-1"));
     var crew = agnosai_genai_crew_span(str_from("crew-1"), str_from("c"), 3);
     # ⚠ A backend's service-dependency graph is built from CLIENT/SERVER pairs,
     # so a mislabelled inference span drops the edge to the model provider.
     assert_eq(agnosai_otlp_span_kind(inf), AGNOSAI_OTLP_KIND_CLIENT,
-    "inference is CLIENT — it leaves the process");
+      "inference is CLIENT — it leaves the process");
     assert_eq(agnosai_otlp_span_kind(tool), AGNOSAI_OTLP_KIND_INTERNAL,
-    "tool execution is INTERNAL");
+      "tool execution is INTERNAL");
     assert_eq(agnosai_otlp_span_kind(crew), AGNOSAI_OTLP_KIND_INTERNAL, "and so is a crew run");
     assert_eq(AGNOSAI_OTLP_KIND_CLIENT, 3, "CLIENT is the wire value 3");
     assert_eq(AGNOSAI_OTLP_KIND_INTERNAL, 1, "and INTERNAL is 1");
@@ -127,48 +127,48 @@ fn main(): i64 {
     # object including every separator.
     var j = agnosai_otlp_span_json(tool, _t_ctx());
     assert(str_eq(j, _t_expect_tool_span()) == 1,
-    "a tool span encodes byte-for-byte to the OTLP/JSON Span object");
+      "a tool span encodes byte-for-byte to the OTLP/JSON Span object");
 
     # ⚠ The timestamps are QUOTED. This is the rule that fails silently.
     assert_eq(str_contains_cstr(j, "\"startTimeUnixNano\":\"1000\""), 1,
-    "startTimeUnixNano is a STRING, not a number");
+      "startTimeUnixNano is a STRING, not a number");
     assert_eq(str_contains_cstr(j, "\"endTimeUnixNano\":\"2000\""), 1,
-    "and so is endTimeUnixNano");
+      "and so is endTimeUnixNano");
     assert_eq(str_contains_cstr(j, "UnixNano\":1000"), 0,
-    "the unquoted form appears nowhere");
+      "the unquoted form appears nowhere");
 
     # --- integer attributes are quoted too -------------------------------
     agnosai_genai_record_usage(inf, 100, 50, str_from("llama3-instruct"));
     var ji = agnosai_otlp_span_json(inf, _t_ctx());
     assert_eq(str_contains_cstr(ji,
-    "{\"key\":\"gen_ai.usage.input_tokens\",\"value\":{\"intValue\":\"100\"}}"), 1,
-    "intValue is a STRING — a bare number is valid JSON and invalid OTLP");
+        "{\"key\":\"gen_ai.usage.input_tokens\",\"value\":{\"intValue\":\"100\"}}"), 1,
+      "intValue is a STRING — a bare number is valid JSON and invalid OTLP");
     assert_eq(str_contains_cstr(ji, "\"intValue\":100"), 0,
-    "the unquoted form appears nowhere");
+      "the unquoted form appears nowhere");
     assert_eq(str_contains_cstr(ji,
-    "{\"key\":\"gen_ai.usage.output_tokens\",\"value\":{\"intValue\":\"50\"}}"), 1,
-    "output tokens likewise");
+        "{\"key\":\"gen_ai.usage.output_tokens\",\"value\":{\"intValue\":\"50\"}}"), 1,
+      "output tokens likewise");
     assert_eq(str_contains_cstr(ji, "\"kind\":3"), 1,
-    "but `kind` IS a bare number — it is an enum, not an int64");
+      "but `kind` IS a bare number — it is an enum, not an int64");
     assert_eq(str_contains_cstr(ji, "\"code\":1"), 1, "and so is the status code");
 
     # The responding model is carried, and differs from the requested one.
     assert_eq(str_contains_cstr(ji, "\"gen_ai.response.model\""), 1,
-    "the response model is emitted once recorded");
+      "the response model is emitted once recorded");
     assert_eq(str_contains_cstr(ji, "\"llama3-instruct\""), 1, "with its value");
 
     # --- absent attributes are OMITTED, not null -------------------------
     # OTLP has no null attribute value; a collector reading one drops the span.
     var bare = agnosai_genai_inference_span(str_from("m"), str_from("s"), str_from("a"),
-    str_from("t"));
+      str_from("t"));
     var jb = agnosai_otlp_span_json(bare, _t_ctx());
     assert_eq(str_contains_cstr(jb, "null"), 0, "an unrecorded span emits no null anywhere");
     assert_eq(str_contains_cstr(jb, "gen_ai.usage.input_tokens"), 0,
-    "an unset integer attribute is omitted entirely");
+      "an unset integer attribute is omitted entirely");
     assert_eq(str_contains_cstr(jb, "gen_ai.response.model"), 0,
-    "as is an unset string attribute");
+      "as is an unset string attribute");
     assert_eq(str_contains_cstr(jb, "agnosai.tool.name"), 0,
-    "and an attribute this span kind never carries");
+      "and an attribute this span kind never carries");
 
     # ⚠ Omission has to get the commas right. A span with ONE attribute must
     # have no comma at all, and none may lead or trail the array.
@@ -181,17 +181,17 @@ fn main(): i64 {
     # crew id — the omission is at the front, which is where a naive
     # "comma before every attribute but the first index" gets it wrong.
     assert_eq(str_contains_cstr(jc,
-    "\"attributes\":[{\"key\":\"agnosai.crew.id\""), 1,
-    "the array opens on the first PRESENT attribute, not the first possible one");
+        "\"attributes\":[{\"key\":\"agnosai.crew.id\""), 1,
+      "the array opens on the first PRESENT attribute, not the first possible one");
     assert_eq(str_contains_cstr(jc,
-    "{\"key\":\"agnosai.crew.task_count\",\"value\":{\"intValue\":\"0\"}}]"), 1,
-    "and closes on the last present one — a 0 task count is present, not unset");
+        "{\"key\":\"agnosai.crew.task_count\",\"value\":{\"intValue\":\"0\"}}]"), 1,
+      "and closes on the last present one — a 0 task count is present, not unset");
 
     # --- values are JSON-escaped -----------------------------------------
     # Model and tool names are caller data. An unescaped quote does not corrupt
     # one attribute, it corrupts the whole batch.
     var evil = agnosai_genai_tool_span(str_from("say \"hi\""), str_from("a\\b"),
-    str_from("t"));
+      str_from("t"));
     var je = agnosai_otlp_span_json(evil, _t_ctx());
     assert_eq(str_contains_cstr(je, "\\\"hi\\\""), 1, "a quote in a value is escaped");
     assert_eq(str_contains_cstr(je, "a\\\\b"), 1, "and a backslash is doubled");
@@ -202,14 +202,14 @@ fn main(): i64 {
     store64(frags + 8, agnosai_otlp_span_json(crew, _t_ctx()));
     var batch = agnosai_otlp_build_batch(str_from("agnosai"), frags, 2);
     assert_eq(str_contains_cstr(batch, "{\"resourceSpans\":[{\"resource\":{\"attributes\":["), 1,
-    "the batch opens with a resourceSpans envelope");
+      "the batch opens with a resourceSpans envelope");
     assert_eq(str_contains_cstr(batch,
-    "{\"key\":\"service.name\",\"value\":{\"stringValue\":\"agnosai\"}}]}"), 1,
-    "whose resource carries service.name — what a backend groups by");
+        "{\"key\":\"service.name\",\"value\":{\"stringValue\":\"agnosai\"}}]}"), 1,
+      "whose resource carries service.name — what a backend groups by");
     assert_eq(str_contains_cstr(batch, "\"scopeSpans\":[{\"scope\":{\"name\":\"agnosai\"},\"spans\":["), 1,
-    "and the scope names the instrumentation");
+      "and the scope names the instrumentation");
     assert_eq(str_contains_cstr(batch, "}},{\"traceId\":"), 1,
-    "the two spans are comma-separated");
+      "the two spans are comma-separated");
     assert_eq(str_contains_cstr(batch, "]}]}]}"), 1, "and the envelope closes");
 
     # A single-span batch has no separator, and an empty one is still a valid
@@ -218,33 +218,33 @@ fn main(): i64 {
     assert_eq(str_contains_cstr(one, "},{\"traceId\":"), 0, "one span means no separator");
     var none = agnosai_otlp_build_batch(str_from("agnosai"), frags, 0);
     assert_eq(str_contains_cstr(none, "\"spans\":[]}]}]}"), 1,
-    "an empty batch is a well-formed document with an empty span list");
+      "an empty batch is a well-formed document with an empty span list");
 
     # The service name is caller-supplied too, so it is escaped.
     assert_eq(str_contains_cstr(agnosai_otlp_build_batch(str_from("a\"b"), frags, 0),
-    "\"stringValue\":\"a\\\"b\""), 1, "the service name is escaped");
+        "\"stringValue\":\"a\\\"b\""), 1, "the service name is escaped");
 
     # --- endpoint parsing -------------------------------------------------
     assert(str_eq_cstr(str_from(agnosai_otlp_path("http://localhost:4318/v1/traces")),
-    "/v1/traces") == 1, "the path is taken from the URL");
+        "/v1/traces") == 1, "the path is taken from the URL");
     assert(str_eq_cstr(str_from(agnosai_otlp_path("http://localhost:4318")),
-    "/v1/traces") == 1, "and defaults when the URL has none");
+        "/v1/traces") == 1, "and defaults when the URL has none");
     assert(str_eq_cstr(str_from(agnosai_otlp_path("http://host/custom/path")),
-    "/custom/path") == 1, "a non-default path is honoured");
+        "/custom/path") == 1, "a non-default path is honoured");
 
     # ⚠ The scheme decides where the scan starts. hoosh hardcodes 7 because it
     # only ever sees `http://`; on an `https://` URL that lands on the second
     # `/` of `//` and answers `/` — a POST to the collector root, which 404s.
     assert(str_eq_cstr(str_from(agnosai_otlp_path("https://collector:4318/v1/traces")),
-    "/v1/traces") == 1, "an https URL's path is found, not the '//' of its scheme");
+        "/v1/traces") == 1, "an https URL's path is found, not the '//' of its scheme");
     assert(str_eq_cstr(str_from(agnosai_otlp_path("https://collector:4318")),
-    "/v1/traces") == 1, "and an https URL with no path defaults");
+        "/v1/traces") == 1, "and an https URL with no path defaults");
 
     assert_eq(agnosai_otlp_is_https("https://c:4318"), 1, "https is detected");
     assert_eq(agnosai_otlp_is_https("http://c:4318"), 0, "http is not");
     assert_eq(agnosai_otlp_is_https(0), 0, "a 0 endpoint is not https");
     assert_eq(agnosai_otlp_is_https("https"), 0,
-    "and a truncated scheme is not — the check is 8 bytes, not 5");
+      "and a truncated scheme is not — the check is 8 bytes, not 5");
     assert_eq(agnosai_otlp_is_https("httpsX//c"), 0, "nor a lookalike");
 
     # --- the context round-trips -----------------------------------------
@@ -252,7 +252,7 @@ fn main(): i64 {
     var errctx = agnosai_otlp_ctx_new(1, 2, 3, 10, 20, AGNOSAI_OTLP_STATUS_ERROR);
     assert_eq(agnosai_otlp_ctx_status(errctx), AGNOSAI_OTLP_STATUS_ERROR, "as does an error one");
     assert_eq(str_contains_cstr(agnosai_otlp_span_json(tool, errctx), "\"status\":{\"code\":2}"), 1,
-    "and it reaches the encoded span");
+      "and it reaches the encoded span");
 
     # --- the export ring --------------------------------------------------
     var ring = agnosai_otlp_ring_new();
@@ -274,12 +274,12 @@ fn main(): i64 {
     assert(agnosai_otlp_ring_frag_arena(ring) != 0, "the fragment arena exists");
     assert(agnosai_otlp_ring_doc_arena(ring) != 0, "the document arena exists");
     assert(agnosai_otlp_ring_frag_arena(ring) != agnosai_otlp_ring_doc_arena(ring),
-    "and they are SEPARATE — fragments must not live where the document is built");
+      "and they are SEPARATE — fragments must not live where the document is built");
 
     # An empty drain is 0, not an empty document — the exporter must be able to
     # tell "nothing to send" from "send this".
     assert_eq(agnosai_otlp_ring_drain(ring, str_from("agnosai")), 0,
-    "draining an empty ring answers 0, not an empty batch");
+      "draining an empty ring answers 0, not an empty batch");
 
     assert_eq(agnosai_otlp_ring_enqueue(ring, tool, _t_ctx()), 1, "a span enqueues");
     assert_eq(agnosai_otlp_ring_count(ring), 1, "and is counted");
@@ -294,7 +294,7 @@ fn main(): i64 {
     assert_eq(str_contains_cstr(doc, "}},{\"traceId\":"), 1, "comma-separated");
     assert_eq(agnosai_otlp_ring_count(ring), 0, "and the ring is emptied");
     assert_eq(agnosai_otlp_ring_drain(ring, str_from("agnosai")), 0,
-    "a second drain has nothing left");
+      "a second drain has nothing left");
 
     # ⚠ Order is OLDEST FIRST. A collector orders by timestamp, but a batch that
     # reverses insertion order makes the ring's own arithmetic untestable — and
@@ -306,7 +306,7 @@ fn main(): i64 {
     agnosai_otlp_ring_enqueue(ord, s2, _t_ctx());
     var od = agnosai_otlp_ring_drain(ord, str_from("agnosai"));
     assert(str_index_of_cstr(od, "\"first\"") < str_index_of_cstr(od, "\"second\""),
-    "the batch is oldest-first");
+      "the batch is oldest-first");
 
     # --- overflow is counted, not silent ------------------------------------
     # ⚠ hoosh's ring overwrites and counts nothing, so loss is invisible. Fill
@@ -318,7 +318,7 @@ fn main(): i64 {
     assert_eq(agnosai_otlp_ring_count(full), 256, "the ring holds at most its capacity");
     assert_eq(agnosai_otlp_ring_dropped(full), 44, "and the other 44 are COUNTED as dropped");
     assert_eq(agnosai_otlp_ring_enqueue(full, tool, _t_ctx()), 0,
-    "an enqueue into a full ring reports failure");
+      "an enqueue into a full ring reports failure");
     assert_eq(agnosai_otlp_ring_dropped(full), 45, "and increments the drop count");
 
     # The overflowed ring still drains to a well-formed document of exactly
@@ -352,7 +352,7 @@ fn main(): i64 {
     assert_eq(str_len(held), held_len, "the handed-out document is unchanged by later enqueues");
     assert_eq(str_contains_cstr(held, "gen_ai.execute_tool"), 1, "and still holds its own span");
     assert_eq(str_contains_cstr(held, "agnosai.crew.run"), 0,
-    "with none of the spans queued after it");
+      "with none of the spans queued after it");
 
     # --- the exporter -------------------------------------------------------
     # `flush` is the testable half: it decides whether and what to send. Only
@@ -371,7 +371,7 @@ fn main(): i64 {
     assert_eq(agnosai_otlp_exporter_flush(ex), 2, "a flush reports the spans in the batch");
     assert_eq(agnosai_otlp_exporter_exported(ex), 2, "and accumulates them");
     assert_eq(agnosai_otlp_ring_count(agnosai_otlp_exporter_ring(ex)), 0,
-    "leaving the ring empty");
+      "leaving the ring empty");
     assert_eq(agnosai_otlp_exporter_flush(ex), 0, "a second flush has nothing to send");
 
     # ⚠ The drain happens even with NO endpoint. Skipping it would let the ring
@@ -383,7 +383,7 @@ fn main(): i64 {
         if (i % 100 == 0) { agnosai_otlp_exporter_flush(noep); }
     }
     assert_eq(agnosai_otlp_ring_dropped(agnosai_otlp_exporter_ring(noep)), 0,
-    "an endpoint-less exporter still drains, so nothing is dropped");
+      "an endpoint-less exporter still drains, so nothing is dropped");
     assert(agnosai_otlp_exporter_exported(noep) > 0, "and it counts what it discarded");
 
     # --- stop flushes what is left -------------------------------------------
@@ -397,7 +397,7 @@ fn main(): i64 {
     assert_eq(agnosai_otlp_exporter_stop(st), 3, "stop flushes the pending spans");
     assert_eq(agnosai_otlp_exporter_stopping(st), 1, "and marks the exporter stopping");
     assert_eq(agnosai_otlp_ring_count(agnosai_otlp_exporter_ring(st)), 0,
-    "leaving nothing behind");
+      "leaving nothing behind");
     assert_eq(agnosai_otlp_exporter_stop(st), 0, "and stopping twice is a no-op");
 
     # --- the background thread actually runs --------------------------------
@@ -415,9 +415,9 @@ fn main(): i64 {
     agnosai_otlp_exporter_start(bg);
     sleep_ms(200);
     assert(agnosai_otlp_exporter_exported(bg) >= 1,
-    "the background thread flushed the queued span on its own");
+      "the background thread flushed the queued span on its own");
     assert_eq(agnosai_otlp_ring_count(agnosai_otlp_exporter_ring(bg)), 0,
-    "draining the ring as it went");
+      "draining the ring as it went");
 
     # It keeps going, rather than flushing once and falling out of the loop.
     agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(bg), crew, _t_ctx());
@@ -455,7 +455,7 @@ fn main(): i64 {
     var ar = agnosai_otlp_ring_new();
     var asvc = str_from("alloc-probe");
     var aspan = agnosai_genai_inference_span(str_from("gpt-4o"), str_from("openai"),
-    str_from("probe-agent"), str_from("task-1"));
+      str_from("probe-agent"), str_from("task-1"));
     agnosai_genai_record_usage(aspan, 1234, 567, str_from("gpt-4o"));
     var actx = _t_ctx();
 
@@ -469,7 +469,7 @@ fn main(): i64 {
     }
     var doc64 = agnosai_otlp_ring_drain(ar, asvc);
     assert_eq(alloc_used() - g_before, 0,
-    "64 spans encoded, batched and drained charge the global bump ZERO bytes");
+      "64 spans encoded, batched and drained charge the global bump ZERO bytes");
     assert(str_len(doc64) > 0, "and still produce a document");
 
     # A FULL ring must not spill either — ARENA_FULL_SPILL spills to the global
@@ -481,7 +481,7 @@ fn main(): i64 {
     }
     agnosai_otlp_ring_drain(ar, asvc);
     assert_eq(alloc_used() - g_full, 0,
-    "a completely full ring drains without spilling to the global bump");
+      "a completely full ring drains without spilling to the global bump");
 
     # --- the POST target carries the OTLP path -------------------------------
     #
@@ -490,17 +490,17 @@ fn main(): i64 {
     # form received `POST /` and 404'd. The whole tier was non-functional.
     var pa = default_alloc();
     assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("http://localhost:4318")),
-    "http://localhost:4318/v1/traces"),
-    "a path-less endpoint gets /v1/traces appended");
+        "http://localhost:4318/v1/traces"),
+      "a path-less endpoint gets /v1/traces appended");
     assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("https://collector:4318")),
-    "https://collector:4318/v1/traces"),
-    "https too — the scheme offset, not a hardcoded 7");
+        "https://collector:4318/v1/traces"),
+      "https too — the scheme offset, not a hardcoded 7");
     assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("http://host/custom/path")),
-    "http://host/custom/path"),
-    "an endpoint that already names a path is passed through untouched");
+        "http://host/custom/path"),
+      "an endpoint that already names a path is passed through untouched");
     assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("http://localhost:4318/v1/traces")),
-    "http://localhost:4318/v1/traces"),
-    "and is not doubled into /v1/traces/v1/traces");
+        "http://localhost:4318/v1/traces"),
+      "and is not doubled into /v1/traces/v1/traces");
 
     return assert_summary();
 }

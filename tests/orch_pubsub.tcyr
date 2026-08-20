@@ -125,7 +125,7 @@ fn main() {
         str_builder_add_cstr(deep_topic, "s");
     }
     assert_eq(agnosai_matches_pattern(str_builder_build(deep_pat), str_builder_build(deep_topic)), 0,
-    "a pattern deeper than the recursion bound fails closed rather than overflowing");
+      "a pattern deeper than the recursion bound fails closed rather than overflowing");
 
     # =====================================================================
     # the blocker #4 primitive
@@ -135,7 +135,7 @@ fn main() {
     assert_eq(agnosai_chan_push_lossy(ch, 11), 0, "a push into a free ring succeeds");
     assert_eq(agnosai_chan_push_lossy(ch, 22), 0, "and fills it");
     assert_eq(agnosai_chan_push_lossy(ch, 33), 1,
-    "a push into a FULL ring still succeeds — it never reports full, which is the contract; the 1 \
+      "a push into a FULL ring still succeeds — it never reports full, which is the contract; the 1 \
     says it had to evict to get there");
     assert_eq(chan_try_recv(ch), 22, "the OLDEST entry was evicted, not the newest");
     assert_eq(chan_try_recv(ch), 33, "and the newest is present");
@@ -146,14 +146,14 @@ fn main() {
     chan_try_send(full, 1);
     assert_eq(chan_try_send(full, 2), 0 - 2, "chan_try_send reports -2 on a full ring");
     assert_eq(agnosai_chan_push_lossy(full, 2), 1,
-    "where the lossy push makes room instead, and reports the eviction so a caller can \
+      "where the lossy push makes room instead, and reports the eviction so a caller can \
     count what a slow reader lost");
     assert_eq(chan_try_recv(full), 2, "and the survivor is the newer value");
 
     var closed = chan_new(2);
     chan_close(closed);
     assert_eq(agnosai_chan_push_lossy(closed, 1), AGNOSAI_CHAN_CLOSED,
-    "a closed channel is reported, since that is not a capacity problem");
+      "a closed channel is reported, since that is not a capacity problem");
 
     # The three non-zero returns must be mutually distinct, or a caller counting
     # lag cannot tell "stored, evicted one" from "dropped this one" from "gone".
@@ -161,17 +161,17 @@ fn main() {
     # topic — a single producer always wins the slot its own eviction freed — so
     # what is pinned here is the contract, not a reachable race.
     assert_neq(AGNOSAI_CHAN_DROPPED, AGNOSAI_CHAN_CLOSED,
-    "DROPPED and CLOSED are distinct — the first cut returned 1 for a drop, which \
+      "DROPPED and CLOSED are distinct — the first cut returned 1 for a drop, which \
     reported a lost event as delivered");
     assert_neq(AGNOSAI_CHAN_DROPPED, 1,
-    "DROPPED is distinct from the stored-after-evicting case");
+      "DROPPED is distinct from the stored-after-evicting case");
     assert_eq(AGNOSAI_CHAN_DROPPED, 0 - 2, "DROPPED is -2");
 
     # A ring that has room takes the value with no eviction and no drop, so the
     # normal path still reports 0 after the added branch.
     var okch = chan_new(2);
     assert_eq(agnosai_chan_push_lossy(okch, 7), 0,
-    "the added DROPPED branch does not disturb the ordinary success path");
+      "the added DROPPED branch does not disturb the ordinary success path");
 
     # =====================================================================
     # the hub
@@ -192,7 +192,7 @@ fn main() {
     var msg = chan_try_recv(rx);
     assert(msg != 0, "the subscriber received the message");
     assert(str_eq(agnosai_topic_message_topic(msg), str_from("task.completed")) == 1,
-    "carrying the CONCRETE topic, not the pattern");
+      "carrying the CONCRETE topic, not the pattern");
     assert_eq(agnosai_topic_message_payload(msg), payload, "and the payload unchanged");
     assert(agnosai_topic_message_timestamp(msg) > 0, "with a publish timestamp");
 
@@ -207,7 +207,7 @@ fn main() {
     var b = agnosai_pubsub_subscribe(ps, str_from("task.done"));
     assert(a != b, "two subscribers get distinct channels");
     assert_eq(agnosai_pubsub_pattern_count(ps), 2,
-    "but only one pattern — the cap counts patterns, not subscribers");
+      "but only one pattern — the cap counts patterns, not subscribers");
     agnosai_pubsub_publish(ps, str_from("task.done"), payload);
     assert(str_eq(_t_next_topic(a), str_from("task.done")) == 1, "the first subscriber received");
     assert(str_eq(_t_next_topic(b), str_from("task.done")) == 1, "and so did the second");
@@ -234,11 +234,11 @@ fn main() {
     agnosai_pubsub_unsubscribe_all(ps, str_from("task.done"));
     assert_eq(agnosai_pubsub_pattern_count(ps), 2, "the pattern is gone");
     assert_eq(agnosai_chan_push_lossy(a, 1), AGNOSAI_CHAN_CLOSED,
-    "and its subscribers' channels are closed, so a parked reader is released");
+      "and its subscribers' channels are closed, so a parked reader is released");
 
     agnosai_pubsub_publish(ps, str_from("task.done"), payload);
     assert(str_eq(_t_next_topic(wide), str_from("task.done")) == 1,
-    "an unrelated pattern still receives after another is dropped");
+      "an unrelated pattern still receives after another is dropped");
 
     # unsubscribing a pattern nobody holds is a no-op, not a crash
     agnosai_pubsub_unsubscribe_all(ps, str_from("never.subscribed"));
@@ -255,7 +255,7 @@ fn main() {
     assert_eq(agnosai_pubsub_pattern_count(ps2), 1, "and no new pattern");
     agnosai_pubsub_publish(ps2, str_from("task.x"), payload);
     assert(str_eq(_t_next_topic(first_sub), str_from("task.x")) == 1,
-    "the original subscriber receives");
+      "the original subscriber receives");
     assert(str_eq(_t_next_topic(again), str_from("task.x")) == 1, "and so does the new one");
 
     # --- a slow subscriber loses its oldest, and the publisher does not stall ---
@@ -269,17 +269,17 @@ fn main() {
     var first = chan_try_recv(slow);
     assert(first != 0, "a flooded subscriber still has messages");
     assert_eq(bayan_json_v_int(agnosai_topic_message_payload(first)), 44,
-    "and they are the NEWEST 256 — the oldest were evicted, matching tokio broadcast's lag");
+      "and they are the NEWEST 256 — the oldest were evicted, matching tokio broadcast's lag");
 
     # --- the message constructor directly ---
     # Exposed so a fan-out can be driven without a publisher; the timestamp is
     # the caller's, which is what lets a test pin it rather than race the clock.
     var built = agnosai_topic_message_new(str_from("t.x"), payload, 12345);
     assert(str_eq(agnosai_topic_message_topic(built), str_from("t.x")) == 1,
-    "the constructor stores the topic");
+      "the constructor stores the topic");
     assert_eq(agnosai_topic_message_payload(built), payload, "and the payload by reference");
     assert_eq(agnosai_topic_message_timestamp(built), 12345,
-    "and the timestamp verbatim rather than reading the clock");
+      "and the timestamp verbatim rather than reading the clock");
 
     return assert_summary();
 }

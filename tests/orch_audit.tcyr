@@ -44,8 +44,8 @@ fn _t_entry_owns_its_strings(): i64 {
     var ar = arena_allocator(65536);
 
     agnosai_audit_record(c, str_from_a(ar, "crew_finished"), str_from_a(ar, "warn"),
-    str_from_a(ar, "the-crew-name"), str_from_a(ar, "hoosh"),
-    str_from_a(ar, "claude-opus-5"), 0);
+      str_from_a(ar, "the-crew-name"), str_from_a(ar, "hoosh"),
+      str_from_a(ar, "claude-opus-5"), 0);
 
     reset_via(ar);
     var scribble = str_builder_new_a(ar);
@@ -56,10 +56,10 @@ fn _t_entry_owns_its_strings(): i64 {
     assert(vec_len(recent) == 1, "the entry is in the chain");
     var e = vec_get(recent, 0);
     assert(str_eq_cstr(agnosai_audit_entry_event(e), "crew_finished") == 1,
-    "the event survives the arena being released and overwritten");
+      "the event survives the arena being released and overwritten");
     assert(str_eq_cstr(agnosai_audit_entry_level(e), "warn") == 1, "...the level too");
     assert(str_eq_cstr(agnosai_audit_entry_message(e), "the-crew-name") == 1,
-    "...and the message, which is where a borrowed crew name would have landed");
+      "...and the message, which is where a borrowed crew name would have landed");
 
     # `provider` and `model` go through the same clone, and are the two the
     # 0-guard exists for — both callers pass 0 today. No accessor exists for
@@ -71,7 +71,7 @@ fn _t_entry_owns_its_strings(): i64 {
     # **0 is valid** — the port's error convention, which every other assertion
     # in this file already uses.
     assert(agnosai_audit_verify(c) == 0,
-    "the chain still verifies — the clone happens before the entry is hashed, \
+      "the chain still verifies — the clone happens before the entry is hashed, \
     so the signature covers the copy the entry actually holds");
     return 0;
 }
@@ -124,7 +124,7 @@ fn _t_hashing_uses_the_scratch(): i64 {
 
     assert(per_global > 0, "recording on the global allocator costs something");
     assert(per_scratch < per_global,
-    "recording through a scratch costs less — the hash tree and the sign \
+      "recording through a scratch costs less — the hash tree and the sign \
     builders move off the global bump");
 
     # **528 is calibrated, not chosen, and a ratio could not do this job.**
@@ -141,7 +141,7 @@ fn _t_hashing_uses_the_scratch(): i64 {
     # doing its job, and the fix is to re-measure and move the number, not to
     # widen it into something that asserts nothing.
     assert(per_scratch < 528,
-    "...and what remains is the retained half — the entry, its cloned strings, \
+      "...and what remains is the retained half — the entry, its cloned strings, \
     the hash and the signature. Un-threading any one of the three transient \
     allocations shows up here and nowhere else");
 
@@ -164,7 +164,7 @@ fn _t_signature_fits_the_inline_buffer(): i64 {
     var c = _t_chain(8);
     var e = _t_rec(c, "ev", "msg");
     assert(str_len(agnosai_audit_entry_signature(e)) == 64,
-    "the signature is exactly 64 hex chars — `str_builder_putc` has no `_a` \
+      "the signature is exactly 64 hex chars — `str_builder_putc` has no `_a` \
     form, so a longer one would grow the builder on the global allocator");
     return 0;
 }
@@ -191,14 +191,14 @@ fn main() {
     var e1 = _t_rec(c, "crew_accepted", "crew queued");
     assert_eq(agnosai_audit_chain_count(c), 1, "recording appends");
     assert(str_eq(agnosai_audit_entry_previous_hash(e1),
-    str_from(AGNOSAI_AUDIT_GENESIS)) == 1, "the first entry links to the genesis hash");
+        str_from(AGNOSAI_AUDIT_GENESIS)) == 1, "the first entry links to the genesis hash");
     assert_eq(str_len(agnosai_audit_entry_signature(e1)), 64,
-    "and carries a 64-hex-char HMAC-SHA256 signature");
+      "and carries a 64-hex-char HMAC-SHA256 signature");
     assert(str_eq(agnosai_audit_entry_event(e1), str_from("crew_accepted")) == 1,
-    "with the event name");
+      "with the event name");
     assert(str_eq(agnosai_audit_entry_level(e1), str_from("info")) == 1, "the level");
     assert(str_eq(agnosai_audit_entry_message(e1), str_from("crew queued")) == 1,
-    "and the message, all readable back off the entry");
+      "and the message, all readable back off the entry");
     assert_eq(agnosai_audit_verify(c), 0, "one entry verifies");
 
     # --- each entry links to the previous ---
@@ -206,13 +206,13 @@ fn main() {
     var e3 = _t_rec(c, "crew_finished", "all done");
     assert_eq(agnosai_audit_chain_count(c), 3, "three entries");
     assert(str_eq(agnosai_audit_entry_previous_hash(e2),
-    agnosai_audit_entry_previous_hash(e3)) == 0,
-    "consecutive entries link to DIFFERENT predecessors");
+        agnosai_audit_entry_previous_hash(e3)) == 0,
+      "consecutive entries link to DIFFERENT predecessors");
     assert_eq(agnosai_audit_verify(c), 0, "a three-entry chain verifies");
 
     # ids are unique
     assert(str_eq(agnosai_audit_entry_id(e1), agnosai_audit_entry_id(e2)) == 0,
-    "every entry gets its own uuid");
+      "every entry gets its own uuid");
 
     # --- TAMPER: every field in the hash must break verification ---
     # This is what a hash chain is FOR. An append-only chain verifies trivially;
@@ -227,11 +227,11 @@ fn main() {
     assert(tampered != 0, "editing a recorded MESSAGE breaks verification");
     assert(str_contains(tampered, str_from("Entry 0")) == 1, "naming the offending entry");
     assert(str_contains(tampered, str_from("signature verification failed")) == 1,
-    "and the reason — the message is inside the signed hash");
+      "and the reason — the message is inside the signed hash");
 
     store64(te + AGN_AE_MESSAGE, str_from("the original message"));
     assert_eq(agnosai_audit_verify(t1), 0,
-    "and restoring the exact original bytes makes it valid again — the check is over content, \
+      "and restoring the exact original bytes makes it valid again — the check is over content, \
     not over some side flag that could be reset");
 
     # the event name
@@ -248,7 +248,7 @@ fn main() {
     var real_ts = agnosai_audit_entry_timestamp(te);
     store64(te + AGN_AE_TIMESTAMP, real_ts - 86400000);
     assert(agnosai_audit_verify(t1) != 0,
-    "and the TIMESTAMP — backdating an entry by a day is exactly the edit an audit trail exists \
+      "and the TIMESTAMP — backdating an entry by a day is exactly the edit an audit trail exists \
     to catch");
     store64(te + AGN_AE_TIMESTAMP, real_ts);
 
@@ -263,7 +263,7 @@ fn main() {
     store64(te + AGN_AE_PREV_HASH, str_from(AGNOSAI_AUDIT_GENESIS));
     var relink = agnosai_audit_verify(t1);
     assert_eq(relink, 0,
-    "entry 0 already linked to genesis, so rewriting it to genesis changes nothing");
+      "entry 0 already linked to genesis, so rewriting it to genesis changes nothing");
     var t2 = _t_chain(AGNOSAI_AUDIT_MAX_ENTRIES);
     _t_rec(t2, "a", "first");
     var second = _t_rec(t2, "b", "second");
@@ -271,7 +271,7 @@ fn main() {
     var broken_link = agnosai_audit_verify(t2);
     assert(broken_link != 0, "re-pointing entry 1 at genesis breaks the chain");
     assert(str_contains(broken_link, str_from("previous hash mismatch")) == 1,
-    "and reports it as a LINK failure rather than a signature one — the two are different \
+      "and reports it as a LINK failure rather than a signature one — the two are different \
     tampering modes and the message says which");
     assert(str_contains(broken_link, str_from("Entry 1")) == 1, "at the right index");
 
@@ -284,7 +284,7 @@ fn main() {
     vec_remove(agnosai_audit_chain_recent(t3, 3), 1);
     # (recent returns a copy, so the chain is untouched — prove that first)
     assert_eq(agnosai_audit_chain_count(t3), 3,
-    "recent() hands back a COPY, so a caller cannot silently edit the chain through it");
+      "recent() hands back a COPY, so a caller cannot silently edit the chain through it");
     assert_eq(agnosai_audit_verify(t3), 0, "and the chain still verifies");
 
     # --- eviction keeps the chain verifiable ---
@@ -300,7 +300,7 @@ fn main() {
     _t_rec(ring, "e4", "four");
     assert_eq(agnosai_audit_chain_count(ring), 3, "a fourth entry evicts the oldest");
     assert_eq(agnosai_audit_verify(ring), 0,
-    "and the chain STILL verifies — first_valid_hash moved with the eviction, which is the bug \
+      "and the chain STILL verifies — first_valid_hash moved with the eviction, which is the bug \
     the Cyrius hoosh has and the Rust oracle does not");
 
     _t_rec(ring, "e5", "five");
@@ -309,12 +309,12 @@ fn main() {
     var survivors = agnosai_audit_chain_recent(ring, 10);
     assert_eq(vec_len(survivors), 3, "only the cap survives");
     assert(str_eq(agnosai_audit_entry_event(vec_get(survivors, 0)), str_from("e4")) == 1,
-    "oldest-first, starting at the oldest survivor");
+      "oldest-first, starting at the oldest survivor");
 
     # --- recent(n) ---
     assert_eq(vec_len(agnosai_audit_chain_recent(ring, 2)), 2, "recent(2) returns two");
     assert(str_eq(agnosai_audit_entry_event(vec_get(agnosai_audit_chain_recent(ring, 2), 1)),
-    str_from("e6")) == 1, "ending at the newest");
+        str_from("e6")) == 1, "ending at the newest");
     assert_eq(vec_len(agnosai_audit_chain_recent(ring, 0)), 0, "recent(0) returns none");
 
     # --- metadata participates in the hash ---
@@ -323,13 +323,13 @@ fn main() {
     bayan_json_v_obj_set(meta, str_from("crew_id"), bayan_json_v_str_new(str_from("crew-1")));
     bayan_json_v_obj_set(meta, str_from("status"), bayan_json_v_str_new(str_from("completed")));
     var me = agnosai_audit_record(m, str_from("crew_finished"), str_from("info"),
-    str_from("done"), 0, 0, meta);
+      str_from("done"), 0, 0, meta);
     assert_eq(agnosai_audit_verify(m), 0, "an entry with metadata verifies");
     assert_eq(agnosai_audit_entry_metadata(me), meta, "and carries it");
 
     bayan_json_v_obj_set(meta, str_from("status"), bayan_json_v_str_new(str_from("failed")));
     assert(agnosai_audit_verify(m) != 0,
-    "editing the METADATA breaks verification — which is the whole reason this chain exists \
+      "editing the METADATA breaks verification — which is the whole reason this chain exists \
     rather than hoosh's, whose audit_record has no metadata slot at all");
 
     # --- serialisation ---
@@ -337,12 +337,12 @@ fn main() {
     var se = _t_rec(s, "task_completed", "ok");
     var json = bayan_json_v_build(agnosai_audit_entry_to_value(se));
     assert(str_contains(json, str_from("\"event\":\"task_completed\"")) == 1,
-    "the entry serialises its event");
+      "the entry serialises its event");
     assert(str_contains(json, str_from("\"integrity\":{\"version\":\"1\"")) == 1,
-    "with the integrity block and its version");
+      "with the integrity block and its version");
     assert(str_contains(json, str_from("\"previous_hash\"")) == 1, "and the chain link");
     assert(str_contains(json, str_from("provider")) == 0,
-    "an unset provider is OMITTED, not emitted as null — skip_serializing_if");
+      "an unset provider is OMITTED, not emitted as null — skip_serializing_if");
     assert(str_contains(json, str_from("metadata")) == 0, "and so is absent metadata");
 
     var mj = bayan_json_v_build(agnosai_audit_entry_to_value(me));
@@ -355,7 +355,7 @@ fn main() {
     var oe = _t_rec(other, "task_completed", "ok");
     assert_eq(agnosai_audit_verify(other), 0, "a chain under another key verifies under that key");
     assert(str_eq(agnosai_audit_entry_signature(oe), agnosai_audit_entry_signature(se)) == 0,
-    "but its signatures differ — so two chains cannot be merged, which is exactly why hoosh's \
+      "but its signatures differ — so two chains cannot be merged, which is exactly why hoosh's \
     inference trail and this orchestration trail stay separate");
 
     # a fresh CSPRNG-keyed chain works the same way

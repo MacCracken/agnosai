@@ -51,15 +51,15 @@ fn _t_state(): i64 {
     var reg = agnosai_tool_registry_new();
     agnosai_tool_registry_register(reg, agnosai_echo_tool());
     return agnosai_app_state_new(agnosai_orchestrator_new(0), reg,
-    agnosai_auth_config_new(), agnosai_event_bus_new(),
-    agnosai_audit_chain_new(), agnosai_approval_gate_new());
+      agnosai_auth_config_new(), agnosai_event_bus_new(),
+      agnosai_audit_chain_new(), agnosai_approval_gate_new());
 }
 
 fn _t_state_no_tools(): i64 {
     return agnosai_app_state_new(agnosai_orchestrator_new(0),
-    agnosai_tool_registry_new(), agnosai_auth_config_new(),
-    agnosai_event_bus_new(), agnosai_audit_chain_new(),
-    agnosai_approval_gate_new());
+      agnosai_tool_registry_new(), agnosai_auth_config_new(),
+      agnosai_event_bus_new(), agnosai_audit_chain_new(),
+      agnosai_approval_gate_new());
 }
 
 fn _t_rpc(method, extra): Str {
@@ -135,18 +135,18 @@ fn _t_initialize(): i64 {
     var b = agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("initialize", "")));
     var r = _t_obj(b, "result");
     assert(str_eq(_t_str(r, "protocolVersion"), str_from("2025-03-26")) == 1,
-    "the protocol version is the oracle's literal");
+      "the protocol version is the oracle's literal");
 
     var info = _t_obj(r, "serverInfo");
     assert(info != 0, "serverInfo is present");
     # **The reason this module does not delegate to bote's dispatcher**, whose
     # _build_initialize_result hardcodes "bote".
     assert(str_eq(_t_str(info, "name"), str_from("agnosai")) == 1,
-    "serverInfo.name is agnosai, NOT bote");
+      "serverInfo.name is agnosai, NOT bote");
     assert(str_eq(_t_str(info, "name"), str_from("bote")) == 0,
-    "...explicitly not bote");
+      "...explicitly not bote");
     assert(str_eq(_t_str(info, "version"), str_from(AGNOSAI_VERSION)) == 1,
-    "serverInfo.version is the build version");
+      "serverInfo.version is the build version");
 
     var caps = _t_obj(r, "capabilities");
     assert(caps != 0, "capabilities is present");
@@ -179,7 +179,7 @@ fn _t_tools_list(): i64 {
     # `#[serde(rename = "type")]` on `schema_type` — a literal transcription of
     # the Rust field name would emit `schema_type` and no client would parse it.
     assert(str_eq(_t_str(sc, "type"), str_from("object")) == 1,
-    "the schema's type key is `type`, from serde's rename");
+      "the schema's type key is `type`, from serde's rename");
     assert(_t_obj(sc, "schema_type") == 0, "...NOT the Rust field name");
     assert(_t_obj(sc, "properties") != 0, "properties is present");
     assert(_t_obj(sc, "required") != 0, "required is present");
@@ -195,7 +195,7 @@ fn _t_tools_list(): i64 {
     var req = _t_obj(sc, "required");
     assert(bayan_json_v_arr_len(req) == 1, "one required parameter");
     assert(str_eq(bayan_json_v_str(bayan_json_v_arr_get(req, 0)), str_from("message")) == 1,
-    "...named message");
+      "...named message");
     return 0;
 }
 
@@ -212,7 +212,7 @@ fn _t_tools_list_empty(): i64 {
 
 fn _t_tools_call(): i64 {
     var b = agnosai_route_body(agnosai_route_mcp(_t_state(),
-    _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hello\"}}")));
+        _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hello\"}}")));
     var r = _t_obj(b, "result");
     assert(r != 0, "a tool call is a JSON-RPC success");
     var content = _t_obj(r, "content");
@@ -224,9 +224,9 @@ fn _t_tools_call(): i64 {
     # **The unwrap the oracle's own test pins**: a String result is emitted
     # bare, not as a quoted JSON string.
     assert(str_eq(_t_str(item, "text"), str_from("hello")) == 1,
-    "a string result is unwrapped to bare text");
+      "a string result is unwrapped to bare text");
     assert(str_eq(_t_str(item, "text"), str_from("\"hello\"")) == 0,
-    "...NOT re-quoted as JSON");
+      "...NOT re-quoted as JSON");
 
     assert(bayan_json_v_bool(_t_obj(r, "isError")) == 0, "isError is false on success");
     assert(bayan_json_v_obj_len(r) == 2, "exactly content and isError");
@@ -240,15 +240,15 @@ fn _t_tools_call(): i64 {
 # protocol-level `-32602`. Tool-level fault versus protocol-level fault.
 fn _t_tools_call_unknown_tool(): i64 {
     var b = agnosai_route_body(agnosai_route_mcp(_t_state(),
-    _t_rpc("tools/call", ",\"params\":{\"name\":\"nope\"}")));
+        _t_rpc("tools/call", ",\"params\":{\"name\":\"nope\"}")));
     assert(_t_obj(b, "error") == 0,
-    "an unknown TOOL is not a JSON-RPC error");
+      "an unknown TOOL is not a JSON-RPC error");
     var r = _t_obj(b, "result");
     assert(r != 0, "...it is a success");
     assert(bayan_json_v_bool(_t_obj(r, "isError")) == 1, "...carrying isError true");
     var item = bayan_json_v_arr_get(_t_obj(r, "content"), 0);
     assert(str_eq(_t_str(item, "text"), str_from("Tool not found: nope")) == 1,
-    "...and the oracle's message, naming the tool");
+      "...and the oracle's message, naming the tool");
     return 0;
 }
 
@@ -259,15 +259,15 @@ fn _t_tools_call_missing_name(): i64 {
     assert(e != 0, "a missing tool NAME is a JSON-RPC error, unlike an unknown tool");
     assert(bayan_json_v_int(_t_obj(e, "code")) == 0 - 32602, "...with code -32602");
     assert(str_eq(_t_str(e, "message"), str_from("Missing tool name")) == 1,
-    "...and the oracle's message");
+      "...and the oracle's message");
     assert(_t_obj(b, "result") == 0, "...and no result");
 
     # Absent params entirely, and a non-string name, are the same fault.
     assert(_t_obj(agnosai_route_body(agnosai_route_mcp(s, _t_rpc("tools/call", ""))),
-    "error") != 0, "absent params is -32602");
+        "error") != 0, "absent params is -32602");
     assert(_t_obj(agnosai_route_body(agnosai_route_mcp(s,
-    _t_rpc("tools/call", ",\"params\":{\"name\":7}"))), "error") != 0,
-    "a non-string name is -32602");
+            _t_rpc("tools/call", ",\"params\":{\"name\":7}"))), "error") != 0,
+      "a non-string name is -32602");
     return 0;
 }
 
@@ -277,16 +277,16 @@ fn _t_tools_call_argument_handling(): i64 {
     var s = _t_state();
     # Absent arguments: echo runs and reports its own missing-parameter error.
     var b = agnosai_route_body(agnosai_route_mcp(s,
-    _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\"}")));
+        _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\"}")));
     assert(_t_obj(b, "error") == 0, "absent arguments is not a protocol error");
     assert(bayan_json_v_bool(_t_obj(_t_obj(b, "result"), "isError")) == 1,
-    "...the tool reports the fault itself");
+      "...the tool reports the fault itself");
 
     # A non-object `arguments` takes the same path, not an error.
     var b2 = agnosai_route_body(agnosai_route_mcp(s,
-    _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\",\"arguments\":42}")));
+        _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\",\"arguments\":42}")));
     assert(_t_obj(b2, "error") == 0,
-    "a non-object arguments is not a protocol error either");
+      "a non-object arguments is not a protocol error either");
     assert(_t_obj(b2, "result") != 0, "...it runs with an empty parameter map");
     return 0;
 }
@@ -299,9 +299,9 @@ fn _t_tools_call_argument_handling(): i64 {
 fn _t_state_with_defs(): i64 {
     var s = _t_state();
     agnosai_app_state_definition_insert(s, str_from("researcher"),
-    agnosai_agent_new(str_from("researcher"), str_from("finds things"), str_from("research")));
+      agnosai_agent_new(str_from("researcher"), str_from("finds things"), str_from("research")));
     agnosai_app_state_definition_insert(s, str_from("writer"),
-    agnosai_agent_new(str_from("writer"), str_from("writes things"), str_from("write")));
+      agnosai_agent_new(str_from("writer"), str_from("writes things"), str_from("write")));
     return s;
 }
 
@@ -335,14 +335,14 @@ fn _t_resources_list_empty(): i64 {
 fn _t_resources_read(): i64 {
     var s = _t_state_with_defs();
     var v = agnosai_route_body(agnosai_route_mcp(s,
-    _t_rpc("resources/read", ",\"params\":{\"uri\":\"agnosai://agents/researcher\"}")));
+        _t_rpc("resources/read", ",\"params\":{\"uri\":\"agnosai://agents/researcher\"}")));
     var contents = _t_obj(_t_obj(v, "result"), "contents");
     assert(contents != 0 && bayan_json_v_is_arr(contents) == 1, "resources/read returns contents");
     assert(bayan_json_v_arr_len(contents) == 1, "...one item");
 
     var item = bayan_json_v_arr_get(contents, 0);
     assert(str_eq_cstr(_t_str(item, "uri"), "agnosai://agents/researcher") == 1,
-    "...echoing the uri it was asked for");
+      "...echoing the uri it was asked for");
     # **The payload is the definition, not a description of it.** The text is
     # the same JSON `GET /api/v1/agents/definitions` serves, which is the whole
     # claim of ADR 015 — re-projection, not a second representation.
@@ -358,7 +358,7 @@ fn _t_resources_read_rejections(): i64 {
 
     # A URI we do not own must not be claimed.
     var foreign = agnosai_route_body(agnosai_route_mcp(s,
-    _t_rpc("resources/read", ",\"params\":{\"uri\":\"file:///etc/passwd\"}")));
+        _t_rpc("resources/read", ",\"params\":{\"uri\":\"file:///etc/passwd\"}")));
     assert(_t_obj(foreign, "error") != 0, "a foreign URI scheme is refused");
     assert(_t_obj(foreign, "result") == 0, "...with no result alongside the error");
 
@@ -370,23 +370,23 @@ fn _t_resources_read_rejections(): i64 {
     # addressed it. The prefix is 17 bytes, so 17 filler bytes put "researcher"
     # exactly where the name is read from.
     var collide = agnosai_route_body(agnosai_route_mcp(s,
-    _t_rpc("resources/read", ",\"params\":{\"uri\":\"aaaaaaaaaaaaaaaaaresearcher\"}")));
+        _t_rpc("resources/read", ",\"params\":{\"uri\":\"aaaaaaaaaaaaaaaaaresearcher\"}")));
     assert(_t_obj(collide, "error") != 0,
-    "a foreign URI whose TAIL matches an agent name is still refused");
+      "a foreign URI whose TAIL matches an agent name is still refused");
     assert(_t_obj(collide, "result") == 0, "...and serves no definition");
     assert(str_contains_cstr(_t_str(_t_obj(collide, "error"), "message"), "scheme") == 1,
-    "...rejected as a scheme mismatch, not as a missing resource");
+      "...rejected as a scheme mismatch, not as a missing resource");
 
     # Our scheme, no such definition.
     var missing = agnosai_route_body(agnosai_route_mcp(s,
-    _t_rpc("resources/read", ",\"params\":{\"uri\":\"agnosai://agents/nobody\"}")));
+        _t_rpc("resources/read", ",\"params\":{\"uri\":\"agnosai://agents/nobody\"}")));
     assert(_t_obj(missing, "error") != 0, "an unknown resource is an error, not empty contents");
 
     # Missing and wrong-typed params.
     var noparams = agnosai_route_body(agnosai_route_mcp(s, _t_rpc("resources/read", "")));
     assert(_t_obj(noparams, "error") != 0, "absent params is invalid-params");
     var nouri = agnosai_route_body(agnosai_route_mcp(s,
-    _t_rpc("resources/read", ",\"params\":{\"uri\":7}")));
+        _t_rpc("resources/read", ",\"params\":{\"uri\":7}")));
     assert(_t_obj(nouri, "error") != 0, "a non-string uri is invalid-params");
     return 0;
 }
@@ -400,7 +400,7 @@ fn _t_resources_capability_advertised(): i64 {
     assert(_t_obj(caps, "tools") != 0, "tools capability still advertised");
     assert(_t_obj(caps, "resources") != 0, "resources capability advertised");
     assert(_t_obj(_t_obj(caps, "resources"), "subscribe") == 0,
-    "...without subscribe, which nothing here can honour");
+      "...without subscribe, which nothing here can honour");
     return 0;
 }
 
@@ -410,14 +410,14 @@ fn _t_unknown_method(): i64 {
     assert(e != 0, "an unknown method is a JSON-RPC error");
     assert(bayan_json_v_int(_t_obj(e, "code")) == 0 - 32601, "...with code -32601");
     assert(str_eq(_t_str(e, "message"), str_from("Method not found")) == 1,
-    "...and the oracle's message");
+      "...and the oracle's message");
     # Method matching is exact — no prefix or case tolerance.
     assert(_t_obj(agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("Initialize", ""))),
-    "error") != 0, "method matching is case-sensitive");
+        "error") != 0, "method matching is case-sensitive");
     assert(_t_obj(agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("tools/", ""))),
-    "error") != 0, "a truncated method is not found");
+        "error") != 0, "a truncated method is not found");
     assert(_t_obj(agnosai_route_body(agnosai_route_mcp(_t_state(), _t_rpc("", ""))),
-    "error") != 0, "an empty method is not found");
+        "error") != 0, "an empty method is not found");
     return 0;
 }
 
@@ -426,14 +426,14 @@ fn _t_unknown_method(): i64 {
 fn _t_malformed_body(): i64 {
     var s = _t_state();
     assert(agnosai_route_status(agnosai_route_mcp(s, str_from("not json")))
-    == HTTP_BAD_REQUEST, "malformed JSON is 400");
+      == HTTP_BAD_REQUEST, "malformed JSON is 400");
     assert(agnosai_route_status(agnosai_route_mcp(s, str_from("[]")))
-    == HTTP_BAD_REQUEST, "an array body is 400");
+      == HTTP_BAD_REQUEST, "an array body is 400");
     assert(agnosai_route_status(agnosai_route_mcp(s, str_from("{}")))
-    == AGNOSAI_HTTP_UNPROCESSABLE, "an object with no method is 422");
+      == AGNOSAI_HTTP_UNPROCESSABLE, "an object with no method is 422");
     assert(agnosai_route_status(agnosai_route_mcp(s,
-    str_from("{\"jsonrpc\":\"2.0\",\"method\":7}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
-    "a non-string method is 422");
+          str_from("{\"jsonrpc\":\"2.0\",\"method\":7}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
+      "a non-string method is 422");
     return 0;
 }
 
@@ -449,7 +449,7 @@ fn _t_malformed_body(): i64 {
 fn _t_state_one_def(): i64 {
     var s = _t_state();
     var def = agnosai_agent_new(str_from("researcher"), str_from("finds things"),
-    str_from("research"));
+      str_from("research"));
     agnosai_agent_with_name(def, str_from("The Researcher"));
     agnosai_app_state_definition_insert(s, str_from("researcher"), def);
     return s;
@@ -458,7 +458,7 @@ fn _t_state_one_def(): i64 {
 fn _t_mcp_prompts_list(): i64 {
     var s = _t_state_one_def();
     var r = agnosai_route_mcp(s, str_from(
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prompts/list\"}"));
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prompts/list\"}"));
     assert(agnosai_route_status(r) == HTTP_OK, "prompts/list answers 200");
     var res = bayan_json_v_obj_get(agnosai_route_body(r), "result");
     assert(res != 0, "...with a result");
@@ -468,15 +468,15 @@ fn _t_mcp_prompts_list(): i64 {
 
     var p0 = bayan_json_v_arr_get(arr, 0);
     assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(p0, "name")), "researcher") == 1,
-    "**the prompt is named by agent key** — the same identifier the REST route \
+      "**the prompt is named by agent key** — the same identifier the REST route \
     stores it under and `agnosai://agents/<name>` addresses");
     var args = bayan_json_v_obj_get(p0, "arguments");
     assert(bayan_json_v_arr_len(args) == 1, "one declared argument");
     var a0 = bayan_json_v_arr_get(args, 0);
     assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(a0, "name")), "task") == 1,
-    "...named task");
+      "...named task");
     assert(bayan_json_v_bool(bayan_json_v_obj_get(a0, "required")) == 0,
-    "...and optional — the persona is useful without one");
+      "...and optional — the persona is useful without one");
     return 0;
 }
 
@@ -491,7 +491,7 @@ fn _t_mcp_prompts_get_matches_the_crew(): i64 {
     var expected = _agnosai_crew_build_system_prompt(def);
 
     var r = agnosai_route_mcp(s, str_from(
-    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\",\
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\",\
     \"params\":{\"name\":\"researcher\"}}"));
     assert(agnosai_route_status(r) == HTTP_OK, "prompts/get answers 200");
     var res = bayan_json_v_obj_get(agnosai_route_body(r), "result");
@@ -499,12 +499,12 @@ fn _t_mcp_prompts_get_matches_the_crew(): i64 {
     assert(bayan_json_v_arr_len(msgs) == 1, "one message");
     var m0 = bayan_json_v_arr_get(msgs, 0);
     assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(m0, "role")), "user") == 1,
-    "**role is `user`** — MCP's PromptMessage has no `system` role");
+      "**role is `user`** — MCP's PromptMessage has no `system` role");
     var content = bayan_json_v_obj_get(m0, "content");
     assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get(content, "type")), "text") == 1,
-    "content is text");
+      "content is text");
     assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get(content, "text")), expected) == 1,
-    "and the text is byte-identical to `_agnosai_crew_build_system_prompt` — \
+      "and the text is byte-identical to `_agnosai_crew_build_system_prompt` — \
     one renderer, so preview and execution cannot diverge");
     return 0;
 }
@@ -512,53 +512,53 @@ fn _t_mcp_prompts_get_matches_the_crew(): i64 {
 fn _t_mcp_prompts_get_appends_the_task(): i64 {
     var s = _t_state_one_def();
     var r = agnosai_route_mcp(s, str_from(
-    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"prompts/get\",\
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"prompts/get\",\
     \"params\":{\"name\":\"researcher\",\"arguments\":{\"task\":\"find the thing\"}}}"));
     var res = bayan_json_v_obj_get(agnosai_route_body(r), "result");
     var txt = bayan_json_v_str(bayan_json_v_obj_get(bayan_json_v_obj_get(
-    bayan_json_v_arr_get(bayan_json_v_obj_get(res, "messages"), 0), "content"), "text"));
+          bayan_json_v_arr_get(bayan_json_v_obj_get(res, "messages"), 0), "content"), "text"));
     assert(str_contains(txt, str_from("find the thing")) == 1,
-    "the task argument is appended when supplied");
+      "the task argument is appended when supplied");
 
     # An empty task is the same as none — no dangling "Task:" header.
     var r2 = agnosai_route_mcp(s, str_from(
-    "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"prompts/get\",\
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"prompts/get\",\
     \"params\":{\"name\":\"researcher\",\"arguments\":{\"task\":\"\"}}}"));
     var txt2 = bayan_json_v_str(bayan_json_v_obj_get(bayan_json_v_obj_get(
-    bayan_json_v_arr_get(bayan_json_v_obj_get(bayan_json_v_obj_get(
-    agnosai_route_body(r2), "result"), "messages"), 0), "content"), "text"));
+          bayan_json_v_arr_get(bayan_json_v_obj_get(bayan_json_v_obj_get(
+                agnosai_route_body(r2), "result"), "messages"), 0), "content"), "text"));
     assert(str_contains(txt2, str_from("Task:")) == 0,
-    "...and an empty one appends nothing rather than a bare `Task:` header");
+      "...and an empty one appends nothing rather than a bare `Task:` header");
     return 0;
 }
 
 fn _t_mcp_prompts_get_rejects(): i64 {
     var s = _t_state_one_def();
     var bad = agnosai_route_mcp(s, str_from(
-    "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"prompts/get\",\
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"prompts/get\",\
     \"params\":{\"name\":\"nosuch\"}}"));
     var e = bayan_json_v_obj_get(agnosai_route_body(bad), "error");
     assert(e != 0, "an unknown prompt name is a JSON-RPC error");
     assert(bayan_json_v_int(bayan_json_v_obj_get(e, "code")) == AGNOSAI_MCP_INVALID_PARAMS,
-    "...with INVALID_PARAMS");
+      "...with INVALID_PARAMS");
 
     var noname = agnosai_route_mcp(s, str_from(
-    "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"prompts/get\",\"params\":{}}"));
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"prompts/get\",\"params\":{}}"));
     assert(bayan_json_v_obj_get(agnosai_route_body(noname), "error") != 0,
-    "and a missing name is an error, not an empty prompt");
+      "and a missing name is an error, not an empty prompt");
     return 0;
 }
 
 fn _t_mcp_advertises_prompts(): i64 {
     var s = _t_state_one_def();
     var r = agnosai_route_mcp(s, str_from(
-    "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}"));
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}"));
     var caps = bayan_json_v_obj_get(bayan_json_v_obj_get(
-    agnosai_route_body(r), "result"), "capabilities");
+        agnosai_route_body(r), "result"), "capabilities");
     assert(bayan_json_v_obj_get(caps, "prompts") != 0,
-    "initialize advertises the prompts capability, because it is answered");
+      "initialize advertises the prompts capability, because it is answered");
     assert(bayan_json_v_obj_get(bayan_json_v_obj_get(caps, "prompts"), "listChanged") == 0,
-    "**without `listChanged`** — definitions can change at any time and nothing \
+      "**without `listChanged`** — definitions can change at any time and nothing \
     here can push a notification, so claiming it would strand a client");
     return 0;
 }

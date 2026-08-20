@@ -75,51 +75,51 @@ fn _t_vec2(a, b): i64 {
 fn main(): i64 {
     # --- oracle: match_by_role -------------------------------------------
     var agents = _t_vec2(_t_agent("qa", "tester", 0, 0, "medium"),
-    _t_agent("dev", "developer", 0, 0, "medium"));
+      _t_agent("dev", "developer", 0, 0, "medium"));
     var team = agnosai_assemble_team(_t_vec1(_t_member("tester", 0, 0)), agents);
     assert_eq(vec_len(team), 1, "one member, one agent");
     assert(str_eq_cstr(agnosai_agent_key(vec_get(team, 0)), "qa") == 1, "the tester wins");
 
     # --- oracle: match_by_tools ------------------------------------------
     var tagents = _t_vec2(_t_agent("a1", "worker", "selenium", "pytest", "medium"),
-    _t_agent("a2", "worker", "docker", "kubectl", "medium"));
+      _t_agent("a2", "worker", "docker", "kubectl", "medium"));
     var tteam = agnosai_assemble_team(_t_vec1(_t_member("worker", "selenium", 0)), tagents);
     assert_eq(vec_len(tteam), 1, "one agent chosen on tools");
     assert(str_eq_cstr(agnosai_agent_key(vec_get(tteam, 0)), "a1") == 1,
-    "the one holding the requested tool");
+      "the one holding the requested tool");
 
     # --- oracle: match_by_complexity -------------------------------------
     var cagents = _t_vec2(_t_agent("simple", "coder", 0, 0, "low"),
-    _t_agent("complex", "coder", 0, 0, "high"));
+      _t_agent("complex", "coder", 0, 0, "high"));
     var cteam = agnosai_assemble_team(_t_vec1(_t_member("coder", 0, "high")), cagents);
     assert_eq(vec_len(cteam), 1, "one agent chosen on complexity");
     assert(str_eq_cstr(agnosai_agent_key(vec_get(cteam, 0)), "complex") == 1,
-    "the matching one");
+      "the matching one");
 
     # --- oracle: partial_role_match --------------------------------------
     var pteam = agnosai_assemble_team(_t_vec1(_t_member("tester", 0, 0)),
-    _t_vec1(_t_agent("lead", "lead tester", 0, 0, "medium")));
+      _t_vec1(_t_agent("lead", "lead tester", 0, 0, "medium")));
     assert_eq(vec_len(pteam), 1, "a containing role still matches");
     assert(str_eq_cstr(agnosai_agent_key(vec_get(pteam, 0)), "lead") == 1, "and is chosen");
 
     # --- oracle: no_match_returns_empty ----------------------------------
     var nteam = agnosai_assemble_team(_t_vec1(_t_member("designer", "figma", 0)),
-    _t_vec1(_t_agent("dev", "developer", 0, 0, "medium")));
+      _t_vec1(_t_agent("dev", "developer", 0, 0, "medium")));
     assert_eq(vec_len(nteam), 0, "nothing matches, nothing is drafted");
 
     # ⚠ Past the oracle, the other side of the same rule: the developer scores
     # exactly 0 for a designer. Without the filter `max_by` would return it
     # anyway, and the crew would silently get the wrong agent.
     _t_assert_f64(agnosai_assembler_match_score(_t_member("designer", "figma", 0),
-    _t_agent("dev", "developer", 0, 0, "medium")), f64_from(0),
-    "an unrelated agent scores exactly 0");
+        _t_agent("dev", "developer", 0, 0, "medium")), f64_from(0),
+      "an unrelated agent scores exactly 0");
 
     # --- oracle: build_complete_crew --------------------------------------
     var bagents = _t_vec2(_t_agent("qa", "tester", "selenium", 0, "medium"),
-    _t_agent("dev", "developer", "git", 0, "high"));
+      _t_agent("dev", "developer", "git", 0, "high"));
     var bmembers = _t_vec2(_t_member("tester", 0, 0), _t_member("developer", 0, 0));
     var tasks = _t_vec2(agnosai_task_new(str_from("Run tests")),
-    agnosai_task_new(str_from("Fix bugs")));
+      agnosai_task_new(str_from("Fix bugs")));
     var crew = agnosai_build_crew(str_from("test-crew"), bmembers, bagents, tasks);
     assert(str_eq_cstr(agnosai_crew_name(crew), "test-crew") == 1, "the crew is named");
     assert_eq(vec_len(agnosai_crew_agents(crew)), 2, "with both agents");
@@ -136,96 +136,96 @@ fn main(): i64 {
     # and no tools score identically — the default shape of a preset team — and
     # a first-wins scan picks the other one while passing all seven oracle tests.
     var tie = _t_vec2(_t_agent("first", "tester", 0, 0, "medium"),
-    _t_agent("second", "tester", 0, 0, "medium"));
+      _t_agent("second", "tester", 0, 0, "medium"));
     var tieteam = agnosai_assemble_team(_t_vec1(_t_member("tester", 0, 0)), tie);
     assert_eq(vec_len(tieteam), 1, "a tie still yields one agent");
     assert(str_eq_cstr(agnosai_agent_key(vec_get(tieteam, 0)), "second") == 1,
-    "and it is the LAST maximum, as Rust's max_by returns");
+      "and it is the LAST maximum, as Rust's max_by returns");
 
     var tie3 = _t_vec2(_t_agent("a", "tester", 0, 0, "medium"),
-    _t_agent("b", "tester", 0, 0, "medium"));
+      _t_agent("b", "tester", 0, 0, "medium"));
     vec_push(tie3, _t_agent("c", "tester", 0, 0, "medium"));
     assert(str_eq_cstr(agnosai_agent_key(vec_get(
-    agnosai_assemble_team(_t_vec1(_t_member("tester", 0, 0)), tie3), 0)), "c") == 1,
-    "and with three tied it is still the last");
+            agnosai_assemble_team(_t_vec1(_t_member("tester", 0, 0)), tie3), 0)), "c") == 1,
+      "and with three tied it is still the last");
 
     # --- past the oracle: the weights, as numbers ------------------------
     # The oracle only ever observes scores through which agent won. A weight
     # that drifted would keep every oracle test green and change every ranking.
     var plain = _t_agent("x", "tester", 0, 0, "medium");
     _t_assert_f64(agnosai_assembler_match_score(_t_member("tester", 0, 0), plain),
-    f64_from(10), "an exact role match is 10");
+      f64_from(10), "an exact role match is 10");
     _t_assert_f64(agnosai_assembler_match_score(_t_member("TESTER", 0, 0), plain),
-    f64_from(10), "case-insensitively");
+      f64_from(10), "case-insensitively");
 
     # ⚠ Exact is `else if` — it does NOT also collect the containment 5.
     assert_eq(f64_lt(agnosai_assembler_match_score(_t_member("tester", 0, 0), plain),
-    f64_from(15)), 1, "an exact match does not also score the containment bonus");
+        f64_from(15)), 1, "an exact match does not also score the containment bonus");
 
     var lead = _t_agent("y", "lead tester", 0, 0, "medium");
     _t_assert_f64(agnosai_assembler_match_score(_t_member("tester", 0, 0), lead),
-    f64_from(5), "a containing agent role is 5");
+      f64_from(5), "a containing agent role is 5");
     # ⚠ Bidirectional: the member's role containing the AGENT's is the direction
     # a one-way `contains` silently drops.
     var short = _t_agent("z", "test", 0, 0, "medium");
     _t_assert_f64(agnosai_assembler_match_score(_t_member("integration test", 0, 0), short),
-    f64_from(5), "and the member's role containing the agent's also scores 5");
+      f64_from(5), "and the member's role containing the agent's also scores 5");
 
     # The name bonus stacks on top of a role match. `_t_agent("tester", ..)`
     # gets the name "tester Agent", which contains the role.
     _t_assert_f64(agnosai_assembler_match_score(_t_member("tester", 0, 0),
-    _t_agent("tester", "tester", 0, 0, "medium")), f64_from(12),
-    "a name containing the role adds 2 on top of the exact-role 10");
+        _t_agent("tester", "tester", 0, 0, "medium")), f64_from(12),
+      "a name containing the role adds 2 on top of the exact-role 10");
 
     _t_assert_f64(agnosai_assembler_match_score(_t_member("tester", "selenium", 0),
-    _t_agent("x", "tester", "selenium", 0, "medium")), f64_from(13),
-    "an overlapping tool adds 3");
+        _t_agent("x", "tester", "selenium", 0, "medium")), f64_from(13),
+      "an overlapping tool adds 3");
     _t_assert_f64(agnosai_assembler_match_score(_t_member("tester", "SELENIUM", 0),
-    _t_agent("x", "tester", "selenium", 0, "medium")), f64_from(13),
-    "case-insensitively too");
+        _t_agent("x", "tester", "selenium", 0, "medium")), f64_from(13),
+      "case-insensitively too");
     _t_assert_f64(agnosai_assembler_match_score(_t_member("tester", 0, "medium"), plain),
-    f64_from(12), "a matching complexity adds 2");
+      f64_from(12), "a matching complexity adds 2");
 
     # ⚠ Complexity only scores when one was REQUESTED. A member with None must
     # not collect the bonus just because the agent happens to be "medium".
     _t_assert_f64(agnosai_assembler_match_score(_t_member("tester", 0, 0), plain),
-    f64_from(10), "an unrequested complexity scores nothing");
+      f64_from(10), "an unrequested complexity scores nothing");
     _t_assert_f64(agnosai_assembler_match_score(_t_member("tester", 0, "high"), plain),
-    f64_from(10), "and a mismatched one scores nothing either");
+      f64_from(10), "and a mismatched one scores nothing either");
 
     # --- past the oracle: duplicates are NOT deduped ----------------------
     # ⚠ Two members asking for the same role against one agent both get it. A
     # caller reading `agents.len()` as "distinct people" is wrong, and the
     # oracle does not dedupe — reproduced rather than quietly fixed.
     var dup = agnosai_assemble_team(_t_vec2(_t_member("tester", 0, 0),
-    _t_member("tester", 0, 0)), _t_vec1(_t_agent("qa", "tester", 0, 0, "medium")));
+        _t_member("tester", 0, 0)), _t_vec1(_t_agent("qa", "tester", 0, 0, "medium")));
     assert_eq(vec_len(dup), 2, "two members matching one agent yield TWO entries");
     assert(str_eq(agnosai_agent_key(vec_get(dup, 0)),
-    agnosai_agent_key(vec_get(dup, 1))) == 1, "both the same agent");
+        agnosai_agent_key(vec_get(dup, 1))) == 1, "both the same agent");
     assert_eq(vec_get(dup, 0), vec_get(dup, 1),
-    "in fact the same object — the oracle clones, the port shares the pointer");
+      "in fact the same object — the oracle clones, the port shares the pointer");
 
     # --- past the oracle: partial teams ------------------------------------
     # A member nothing matches is skipped, and the rest still assemble — the
     # `filter_map` drops it rather than aborting the whole team.
     var mixed = agnosai_assemble_team(_t_vec2(_t_member("tester", 0, 0),
-    _t_member("designer", 0, 0)), _t_vec1(_t_agent("qa", "tester", 0, 0, "medium")));
+        _t_member("designer", 0, 0)), _t_vec1(_t_agent("qa", "tester", 0, 0, "medium")));
     assert_eq(vec_len(mixed), 1, "an unmatched member is skipped, not fatal");
     assert(str_eq_cstr(agnosai_agent_key(vec_get(mixed, 0)), "qa") == 1,
-    "and the matched one is still there");
+      "and the matched one is still there");
 
     # --- past the oracle: an empty pool -----------------------------------
     assert_eq(vec_len(agnosai_assemble_team(_t_vec1(_t_member("tester", 0, 0)), vec_new())), 0,
-    "no available agents yields an empty team, not a fault");
+      "no available agents yields an empty team, not a fault");
 
     # --- past the oracle: the accessors round-trip ------------------------
     var m = _t_member("role", "tool", "high");
     assert(str_eq_cstr(agnosai_team_member_role(m), "role") == 1, "the role round-trips");
     assert_eq(vec_len(agnosai_team_member_tools(m)), 1, "the tools round-trip");
     assert(str_eq_cstr(agnosai_team_member_complexity(m), "high") == 1,
-    "and the complexity");
+      "and the complexity");
     assert_eq(agnosai_team_member_complexity(_t_member("role", 0, 0)), 0,
-    "which is 0 when none was requested — the oracle's None");
+      "which is 0 when none was requested — the oracle's None");
 
     return assert_summary();
 }

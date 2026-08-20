@@ -38,7 +38,7 @@ fn _t_py_have_python(): i64 {
 fn _t_py_skips_are_not_hiding_a_regression(): i64 {
     if (file_exists("/usr/bin/python3") == 0) { return 0; }
     assert(_t_py_have_python() == 1,
-    "python3 is installed, so the interpreter tests below MUST run - a skip here \
+      "python3 is installed, so the interpreter tests below MUST run - a skip here \
     would mean PATH resolution broke, not that python is missing");
     return 0;
 }
@@ -50,7 +50,7 @@ fn _t_py_bridge_script_is_constant(): i64 {
     var b = agnosai_python_bridge_script();
     assert(str_eq(a, b) == 1, "the wrapper script is fixed, not built per call");
     assert(str_contains_cstr(a, "input_data[\"__tool_source__\"]") == 1,
-    "it reads the tool source from the stdin JSON");
+      "it reads the tool source from the stdin JSON");
     assert(str_contains_cstr(a, "create_tool()") == 1, "and calls create_tool()");
     assert(str_contains_cstr(a, "json.dumps") == 1, "and answers in JSON");
     return 0;
@@ -63,7 +63,7 @@ fn _t_py_tool_source_never_enters_the_script(): i64 {
     var nasty = str_from("\"\"\"\nimport os\nos.system('touch /tmp/agnosai-breakout')\n\"\"\"");
     var script = agnosai_python_bridge_script();
     assert(str_contains_cstr(script, "os.system") == 0,
-    "nothing a tool supplies appears in the SCRIPT - the script is a constant");
+      "nothing a tool supplies appears in the SCRIPT - the script is a constant");
 
     var input = agnosai_python_bridge_input(nasty, str_from("evil"), 0);
     assert(str_contains_cstr(input, "__tool_source__") == 1, "the source rides in the input");
@@ -75,7 +75,7 @@ fn _t_py_tool_source_never_enters_the_script(): i64 {
     var parsed = bayan_json_v_parse(input);
     assert(parsed != 0, "the input is parseable JSON despite the payload");
     assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get(parsed, "__tool_source__")),
-    nasty) == 1, "...and the source round-trips byte for byte");
+        nasty) == 1, "...and the source round-trips byte for byte");
     return 0;
 }
 
@@ -87,11 +87,11 @@ fn _t_py_bridge_input_shape(): i64 {
     var v = bayan_json_v_parse(input);
     assert(v != 0, "the bridge input parses");
     assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get(v, "tool_name")),
-    str_from("adder")) == 1, "tool_name is carried");
+        str_from("adder")) == 1, "tool_name is carried");
     var p = bayan_json_v_obj_get(v, "parameters");
     assert(p != 0, "parameters are carried");
     assert(bayan_json_v_int(bayan_json_v_obj_get(p, "x")) == 41,
-    "...unaltered, as caller data");
+      "...unaltered, as caller data");
 
     # Absent parameters become an empty object, never a missing key — the
     # wrapper indexes `input_data["parameters"]` unconditionally.
@@ -105,25 +105,25 @@ fn _t_py_bridge_input_shape(): i64 {
     var np = bayan_json_v_obj_get(none, "parameters");
     assert(np != 0, "no parameters still yields a `parameters` key the wrapper can index");
     assert(load64(np) == JTAG_OBJ,
-    "...and it is an OBJECT, not a JSON null wearing a non-zero pointer");
+      "...and it is an OBJECT, not a JSON null wearing a non-zero pointer");
     return 0;
 }
 
 fn _t_py_sandbox_config(): i64 {
     var s = agnosai_python_sandbox_new();
     assert(str_eq(agnosai_python_sandbox_path(s), str_from("python3")) == 1,
-    "the default interpreter is the bare name python3, resolved on PATH");
+      "the default interpreter is the bare name python3, resolved on PATH");
     assert(agnosai_python_sandbox_timeout_ms(s) == 30000, "with a 30-second deadline");
     assert(agnosai_python_sandbox_work_dir(s) == 0, "and no working directory");
 
     var c = agnosai_python_sandbox_with_config(str_from("/usr/bin/python3"), 5000);
     assert(str_eq(agnosai_python_sandbox_path(c), str_from("/usr/bin/python3")) == 1,
-    "with_config sets the interpreter");
+      "with_config sets the interpreter");
     assert(agnosai_python_sandbox_timeout_ms(c) == 5000, "...and the deadline");
 
     var w = agnosai_python_sandbox_with_work_dir(agnosai_python_sandbox_new(), str_from("/tmp"));
     assert(str_eq(agnosai_python_sandbox_work_dir(w), str_from("/tmp")) == 1,
-    "with_work_dir sets the directory and returns the sandbox");
+      "with_work_dir sets the directory and returns the sandbox");
     return 0;
 }
 
@@ -133,7 +133,7 @@ fn _t_py_result_accessors(): i64 {
     var r = agnosai_python_result_new(str_from("out"), str_from("trace"), 3, 0);
     assert(str_eq(agnosai_python_result_stdout(r), str_from("out")) == 1, "stdout round-trips");
     assert(str_eq(agnosai_python_result_stderr(r), str_from("trace")) == 1,
-    "stderr round-trips - where a traceback lands");
+      "stderr round-trips - where a traceback lands");
     assert(agnosai_python_result_exit_code(r) == 3, "the exit code round-trips");
     assert(agnosai_python_result_timed_out(r) == 0, "and so does timed_out");
 
@@ -151,13 +151,13 @@ fn _t_py_stderr_carries_the_traceback(): i64 {
     var e[8];
     store64(&e, 0);
     var r = agnosai_python_execute_script(s, str_from("raise ValueError('boom')"),
-    str_from(""), &e);
+      str_from(""), &e);
     assert(load64(&e) == 0, "the interpreter ran");
     assert(agnosai_python_result_exit_code(r) == 1, "...and exited 1 on the traceback");
     assert(str_contains_cstr(agnosai_python_result_stderr(r), "ValueError") == 1,
-    "the traceback is on stderr");
+      "the traceback is on stderr");
     assert(str_contains_cstr(agnosai_python_result_stdout(r), "ValueError") == 0,
-    "...and not merged into stdout");
+      "...and not merged into stdout");
     return 0;
 }
 
@@ -168,7 +168,7 @@ fn _t_py_missing_interpreter(): i64 {
     var r = agnosai_python_execute_script(s, str_from("pass"), str_from(""), &e);
     assert(r == 0, "a missing interpreter is an error, not a result");
     assert(str_contains_cstr(agnosai_error_message(load64(&e)), "failed to spawn python") == 1,
-    "...with the oracle's message (python.rs:87)");
+      "...with the oracle's message (python.rs:87)");
     return 0;
 }
 
@@ -194,10 +194,10 @@ fn _t_py_echo_script(): i64 {
     var e[8];
     store64(&e, 0);
     var r = agnosai_python_execute_script(s, str_from("print(input())"),
-    str_from("hello world"), &e);
+      str_from("hello world"), &e);
     assert(load64(&e) == 0, "oracle test_echo_script: the interpreter runs");
     assert(str_contains_cstr(agnosai_python_result_stdout(r), "hello world") == 1,
-    "...and stdin reaches the script");
+      "...and stdin reaches the script");
     assert(agnosai_python_result_exit_code(r) == 0, "...exiting cleanly");
     return 0;
 }
@@ -208,14 +208,14 @@ fn _t_py_json_roundtrip(): i64 {
     var e[8];
     store64(&e, 0);
     var r = agnosai_python_execute_script(s,
-    str_from("import sys, json; d = json.loads(sys.stdin.read()); print(json.dumps({'echo': d['value']}))"),
-    str_from("{\"value\": 42}"), &e);
+      str_from("import sys, json; d = json.loads(sys.stdin.read()); print(json.dumps({'echo': d['value']}))"),
+      str_from("{\"value\": 42}"), &e);
     assert(load64(&e) == 0, "oracle test_json_roundtrip: the script runs");
 
     var v = bayan_json_v_parse(agnosai_python_result_stdout(r));
     assert(v != 0, "...and its stdout is JSON");
     assert(bayan_json_v_int(bayan_json_v_obj_get(v, "echo")) == 42,
-    "...carrying the value that went in");
+      "...carrying the value that went in");
     return 0;
 }
 
@@ -226,8 +226,8 @@ fn _t_py_timeout(): i64 {
     store64(&e, 0);
     var t0 = clock_now_ms();
     var r = agnosai_python_execute_script(s,
-    str_from("import sys, time; print('early'); sys.stdout.flush(); time.sleep(60)"),
-    str_from(""), &e);
+      str_from("import sys, time; print('early'); sys.stdout.flush(); time.sleep(60)"),
+      str_from(""), &e);
     var dt = clock_now_ms() - t0;
 
     assert(load64(&e) == 0, "oracle test_timeout: a timeout is a result, not an error");
@@ -235,7 +235,7 @@ fn _t_py_timeout(): i64 {
     assert(agnosai_python_result_exit_code(r) == 0 - 1, "...and the exit code is -1");
     # The script PRINTS before it sleeps, so blanking is observable.
     assert(str_len(agnosai_python_result_stdout(r)) == 0,
-    "...with output blanked, as python.rs:114-121 does");
+      "...with output blanked, as python.rs:114-121 does");
     assert(dt < 15000, "...and it returned rather than waiting out the sleep");
     return 0;
 }
@@ -259,7 +259,7 @@ fn _t_py_stdin_the_interpreter_never_reads(): i64 {
     var i = 0;
     while (i < 3200) {
         str_builder_add_cstr(sb,
-        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+          "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
         i = i + 1;
     }
     var big = str_builder_build(sb);
@@ -271,7 +271,7 @@ fn _t_py_stdin_the_interpreter_never_reads(): i64 {
     # Closes stdin and stays alive, so the write fails while the drain loop is
     # still running rather than racing the child's exit.
     var r = agnosai_python_execute_script(s,
-    str_from("import os, sys, time; os.close(0); time.sleep(1)"), big, &e);
+      str_from("import os, sys, time; os.close(0); time.sleep(1)"), big, &e);
 
     assert(r == 0, "an input the interpreter never read is an error, not a result");
     assert(load64(&e) != 0, "...with out_err set");
@@ -281,7 +281,7 @@ fn _t_py_stdin_the_interpreter_never_reads(): i64 {
     if (load64(&e) == 0) { return 0; }
     assert(agnosai_error_kind(load64(&e)) == AGNOSAI_ERR_SANDBOX, "...as a sandbox error");
     assert(str_contains_cstr(agnosai_error_message(load64(&e)),
-    "failed to write to python stdin") == 1, "...carrying the oracle's message (python.rs:94)");
+        "failed to write to python stdin") == 1, "...carrying the oracle's message (python.rs:94)");
     return 0;
 }
 
@@ -295,17 +295,17 @@ fn _t_py_stdin_the_interpreter_never_reads(): i64 {
 fn _t_py_work_dir_reaches_the_interpreter(): i64 {
     if (_t_py_have_python() == 0) { return 0; }
     var s = agnosai_python_sandbox_with_work_dir(
-    agnosai_python_sandbox_with_config(str_from("python3"), 10000), str_from("/tmp"));
+      agnosai_python_sandbox_with_config(str_from("python3"), 10000), str_from("/tmp"));
 
     var e[8];
     store64(&e, 0);
     var r = agnosai_python_execute_script(s, str_from("import os; print(os.getcwd())"),
-    str_from(""), &e);
+      str_from(""), &e);
     assert(load64(&e) == 0, "the interpreter runs in the configured directory");
     assert(r != 0, "...returning a result");
     if (r == 0) { return 0; }
     assert(str_contains_cstr(agnosai_python_result_stdout(r), "/tmp") == 1,
-    "...and it IS /tmp — the child chdir'd there, rather than inheriting the parent's cwd");
+      "...and it IS /tmp — the child chdir'd there, rather than inheriting the parent's cwd");
     return 0;
 }
 
@@ -318,8 +318,8 @@ fn _t_py_work_dir_reaches_the_interpreter(): i64 {
 fn _t_py_bad_work_dir_names_the_directory(): i64 {
     if (_t_py_have_python() == 0) { return 0; }
     var s = agnosai_python_sandbox_with_work_dir(
-    agnosai_python_sandbox_with_config(str_from("python3"), 10000),
-    str_from("/nonexistent/workdir"));
+      agnosai_python_sandbox_with_config(str_from("python3"), 10000),
+      str_from("/nonexistent/workdir"));
 
     var e[8];
     store64(&e, 0);
@@ -328,7 +328,7 @@ fn _t_py_bad_work_dir_names_the_directory(): i64 {
     assert(load64(&e) != 0, "...with out_err set");
     if (load64(&e) == 0) { return 0; }
     assert(str_contains_cstr(agnosai_error_message(load64(&e)), "working directory") == 1,
-    "...naming the working directory, not the interpreter");
+      "...naming the working directory, not the interpreter");
     return 0;
 }
 
@@ -357,8 +357,8 @@ fn _t_py_reexec_body(): i64 {
     var e[8];
     store64(&e, 0);
     var r = agnosai_python_execute_script(s,
-    str_from("import os; print('MARKER=' + os.environ.get('DYLD_LIBRARY_PATH', 'ABSENT'))"),
-    str_from(""), &e);
+      str_from("import os; print('MARKER=' + os.environ.get('DYLD_LIBRARY_PATH', 'ABSENT'))"),
+      str_from(""), &e);
     if (r == 0) { return println("CHILD-FAILED-TO-RUN"); }
     return println_str(agnosai_python_result_stdout(r));
 }
@@ -388,9 +388,9 @@ fn _t_py_sanitized_envp_reaches_the_interpreter(): i64 {
 
     var out = agnosai_spawn_stdout(r);
     assert(str_contains_cstr(out, "CHILD-FAILED-TO-RUN") == 0,
-    "...and the child ran an interpreter");
+      "...and the child ran an interpreter");
     assert(str_contains_cstr(out, "MARKER=ABSENT") == 1,
-    "the interpreter does NOT see a sanitized variable its parent was launched with — \
+      "the interpreter does NOT see a sanitized variable its parent was launched with — \
     swapping agnosai_sanitized_envp for _read_environ_envp makes this the marker's value");
     return 0;
 }
@@ -425,9 +425,9 @@ fn _t_py_execute_tool(): i64 {
     var v = bayan_json_v_parse(agnosai_python_result_stdout(r));
     assert(v != 0, "the bridge answers in JSON");
     assert(bayan_json_v_bool(bayan_json_v_obj_get(v, "success")) == 1,
-    "...reporting success");
+      "...reporting success");
     assert(bayan_json_v_int(bayan_json_v_obj_get(v, "result")) == 42,
-    "...with the tool's result");
+      "...with the tool's result");
     return 0;
 }
 
@@ -447,9 +447,9 @@ fn _t_py_tool_failure_is_reported_not_thrown(): i64 {
     var v = bayan_json_v_parse(agnosai_python_result_stdout(r));
     assert(v != 0, "...answering in JSON");
     assert(bayan_json_v_bool(bayan_json_v_obj_get(v, "success")) == 0,
-    "...with success false");
+      "...with success false");
     assert(str_contains_cstr(bayan_json_v_str(bayan_json_v_obj_get(v, "error")),
-    "tool exploded") == 1, "...and the exception's message");
+        "tool exploded") == 1, "...and the exception's message");
     return 0;
 }
 
@@ -467,11 +467,11 @@ fn _t_py_hostile_tool_source_cannot_escape(): i64 {
     var r = agnosai_python_execute_tool(s, hostile, str_from("evil"), 0, &e);
     assert(load64(&e) == 0, "the run completes");
     assert(str_contains_cstr(agnosai_python_result_stdout(r), "ESCAPED") == 0,
-    "the injected statement never runs - the source was DATA, not script text");
+      "the injected statement never runs - the source was DATA, not script text");
 
     var v = bayan_json_v_parse(agnosai_python_result_stdout(r));
     assert(bayan_json_v_bool(bayan_json_v_obj_get(v, "success")) == 0,
-    "...and the tool is reported as failed, not silently successful");
+      "...and the tool is reported as failed, not silently successful");
     return 0;
 }
 

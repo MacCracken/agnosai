@@ -66,39 +66,39 @@ fn main() {
     assert_eq(vec_len(agnosai_tool_schema_parameters(schema)), 3, "three parameters");
     var p0 = vec_get(agnosai_tool_schema_parameters(schema), 0);
     assert(str_eq(agnosai_param_schema_name(p0), str_from("target_url")) == 1,
-    "the first parameter is target_url");
+      "the first parameter is target_url");
     assert_eq(agnosai_param_schema_required(p0), 1, "target_url is required");
     assert_eq(agnosai_param_schema_required(vec_get(agnosai_tool_schema_parameters(schema), 1)), 0,
-    "concurrent_users is optional");
+      "concurrent_users is optional");
     assert_eq(agnosai_param_schema_required(vec_get(agnosai_tool_schema_parameters(schema), 2)), 0,
-    "duration_seconds is optional");
+      "duration_seconds is optional");
 
     # --- load_testing_missing_url ---
     var out = agnosai_tool_execute(tool, agnosai_tool_input_new());
     assert_eq(agnosai_tool_output_success(out), 0, "a missing target_url fails");
     assert(str_contains(agnosai_tool_output_error(out), str_from("target_url")) == 1,
-    "the error names target_url");
+      "the error names target_url");
 
     # --- the SSRF guard runs before any network work ---
     var priv_in = agnosai_tool_input_new();
     agnosai_tool_input_set(priv_in, str_from("target_url"),
-    bayan_json_v_str_new(str_from("http://127.0.0.1:8080/")));
+      bayan_json_v_str_new(str_from("http://127.0.0.1:8080/")));
     var priv_out = agnosai_tool_execute(tool, priv_in);
     assert_eq(agnosai_tool_output_success(priv_out), 0, "a loopback target is refused");
     assert(str_contains(agnosai_tool_output_error(priv_out), str_from("private/internal")) == 1,
-    "the refusal names the reason");
+      "the refusal names the reason");
 
     var meta_in = agnosai_tool_input_new();
     agnosai_tool_input_set(meta_in, str_from("target_url"),
-    bayan_json_v_str_new(str_from("http://169.254.169.254/latest/meta-data/")));
+      bayan_json_v_str_new(str_from("http://169.254.169.254/latest/meta-data/")));
     assert_eq(agnosai_tool_output_success(agnosai_tool_execute(tool, meta_in)), 0,
-    "the cloud metadata endpoint is refused");
+      "the cloud metadata endpoint is refused");
 
     var octal_in = agnosai_tool_input_new();
     agnosai_tool_input_set(octal_in, str_from("target_url"),
-    bayan_json_v_str_new(str_from("http://0177.0.0.1/")));
+      bayan_json_v_str_new(str_from("http://0177.0.0.1/")));
     assert_eq(agnosai_tool_output_success(agnosai_tool_execute(tool, octal_in)), 0,
-    "an octal-encoded loopback target is refused");
+      "an octal-encoded loopback target is refused");
 
     # --- clamps ---
     # ⚠ **There is NO lower clamp — the oracle applies only `.min(500)`.**
@@ -122,11 +122,11 @@ fn main() {
     # the whole server dies. This drives `agnosai_load_test_run` with 0, which
     # the clamp assertions above never did.
     assert_neq(agnosai_load_test_run(str_from("https://example.com"), 0, 1,
-    &_t_exec_ok), 0 - 1,
-    "zero users does NOT divide by zero — a SIGFPE here kills the process");
+        &_t_exec_ok), 0 - 1,
+      "zero users does NOT divide by zero — a SIGFPE here kills the process");
     assert_neq(agnosai_load_test_run(str_from("https://example.com"), 0 - 3, 1,
-    &_t_exec_ok), 0 - 1,
-    "and neither does a negative");
+        &_t_exec_ok), 0 - 1,
+      "and neither does a negative");
     assert_eq(agnosai_lt_clamp_users(10), 10, "a normal user count passes through");
     assert_eq(agnosai_lt_clamp_users(9999), 500, "user count clamps down to 500");
     assert_eq(agnosai_lt_clamp_duration(0), 1, "duration clamps up to 1s");
@@ -161,13 +161,13 @@ fn main() {
     assert(agnosai_lt_result_total_requests(r) > 0, "requests were recorded");
     assert_eq(agnosai_lt_result_failed(r), 0, "an always-200 executor reports no failures");
     assert_eq(agnosai_lt_result_successful(r), agnosai_lt_result_total_requests(r),
-    "every request counted as successful");
+      "every request counted as successful");
     assert_eq(agnosai_lt_status_count(agnosai_lt_result_status_codes(r), 200),
-    agnosai_lt_result_total_requests(r), "every request recorded a 200");
+      agnosai_lt_result_total_requests(r), "every request recorded a 200");
 
     # the per-user budget caps the total: 4 users x (100000/4) each
     assert(agnosai_lt_result_total_requests(r) <= AGNOSAI_LT_MAX_TOTAL_REQUESTS,
-    "the total stays within the 100k cap");
+      "the total stays within the 100k cap");
 
     # latency ordering invariants hold after the sort
     assert(agnosai_lt_result_min_ns(r) <= agnosai_lt_result_p50_ns(r), "min <= p50");
@@ -181,7 +181,7 @@ fn main() {
     var rf = agnosai_load_test_run(str_from("http://example.com/"), 2, 1, &_t_exec_fail);
     assert(rf != 0, "the failing run still produced a result");
     assert_eq(agnosai_lt_result_failed(rf), agnosai_lt_result_total_requests(rf),
-    "every request failed");
+      "every request failed");
     assert_eq(agnosai_lt_result_successful(rf), 0, "none succeeded");
     assert_eq(vec_len(agnosai_lt_result_status_codes(rf)), 0, "no status codes were recorded");
     assert_eq(load64(rf + AGN_LTR_ERROR_RATE_PPM), 1000000, "the error rate is 100%");
@@ -190,60 +190,60 @@ fn main() {
     var rm = agnosai_load_test_run(str_from("http://example.com/"), 4, 1, &_t_exec_mixed);
     assert(rm != 0, "the mixed run produced a result");
     assert_eq(vec_len(agnosai_lt_result_status_codes(rm)), 2,
-    "both status codes survived aggregation across threads");
+      "both status codes survived aggregation across threads");
     assert(agnosai_lt_status_count(agnosai_lt_result_status_codes(rm), 200) > 0, "some 200s");
     assert(agnosai_lt_status_count(agnosai_lt_result_status_codes(rm), 503) > 0, "some 503s");
     assert_eq(agnosai_lt_status_count(agnosai_lt_result_status_codes(rm), 200)
-    + agnosai_lt_status_count(agnosai_lt_result_status_codes(rm), 503),
-    agnosai_lt_result_total_requests(rm), "the status counts account for every request");
+      + agnosai_lt_status_count(agnosai_lt_result_status_codes(rm), 503),
+      agnosai_lt_result_total_requests(rm), "the status counts account for every request");
 
     # --- the result serializes in the oracle's field order ---
     var rv = agnosai_lt_result_to_value(r);
     assert(str_eq(bayan_json_v_obj_key(rv, 0), str_from("target_url")) == 1, "field 0 is target_url");
     assert(str_eq(bayan_json_v_obj_key(rv, 3), str_from("total_requests")) == 1,
-    "field 3 is total_requests");
+      "field 3 is total_requests");
     assert(str_eq(bayan_json_v_obj_key(rv, 14), str_from("status_codes")) == 1,
-    "field 14 is status_codes");
+      "field 14 is status_codes");
     assert(bayan_json_v_is_float(bayan_json_v_obj_get(rv, "p99_latency_ms")) == 1,
-    "latencies serialize as floats in milliseconds");
+      "latencies serialize as floats in milliseconds");
     assert(bayan_json_v_is_obj(bayan_json_v_obj_get(rv, "status_codes")) == 1,
-    "status_codes serializes as an object keyed by code");
+      "status_codes serializes as an object keyed by code");
     assert(bayan_json_v_obj_get(bayan_json_v_obj_get(rv, "status_codes"), "200") != 0,
-    "the 200 count is keyed by its decimal string");
+      "the 200 count is keyed by its decimal string");
 
     # --- rounding matches the oracle's 2- and 4-decimal quantisation ---
     assert(str_eq(bayan_json_v_build(_agnosai_lt_ms_value(1500000)), str_from("1.5")) == 1,
-    "1.5ms renders as 1.5");
+      "1.5ms renders as 1.5");
     assert(str_eq(bayan_json_v_build(_agnosai_lt_ms_value(1234567)), str_from("1.23")) == 1,
-    "latency rounds to 2 decimals");
+      "latency rounds to 2 decimals");
     assert(str_eq(bayan_json_v_build(_agnosai_lt_rps_value(1500)), str_from("1.5")) == 1,
-    "throughput renders in requests per second");
+      "throughput renders in requests per second");
     assert(str_eq(bayan_json_v_build(_agnosai_lt_rate_value(1000000)), str_from("1.0")) == 1,
-    "a 100% error rate renders as 1.0");
+      "a 100% error rate renders as 1.0");
     assert(str_eq(bayan_json_v_build(_agnosai_lt_rate_value(0)), str_from("0.0")) == 1,
-    "a 0% error rate renders as 0.0");
+      "a 0% error rate renders as 0.0");
 
     # --- the tool registers and resolves ---
     var reg = agnosai_register_load_testing_builtin(agnosai_tool_registry_new());
     assert_eq(agnosai_tool_registry_count(reg), 1, "load_testing registered");
     assert(agnosai_tool_registry_get(reg, str_from("load_testing")) != 0,
-    "load_testing resolves from the registry");
+      "load_testing resolves from the registry");
 
     # --- worker accessors ---
     var probe = agnosai_lt_worker_new(str_from("http://example.com/"),
-    clock_now_ns() + 50000000, 5, &_t_exec_ok, 3);
+      clock_now_ns() + 50000000, 5, &_t_exec_ok, 3);
     assert(probe != 0, "a worker allocates its arenas");
     assert_eq(agnosai_lt_worker_id(probe), 3, "the worker knows its id");
     assert(agnosai_lt_worker_arena(probe) != 0, "the worker has a persistent arena");
     assert(agnosai_lt_worker_scratch(probe) != 0, "the worker has a scratch arena");
     assert(agnosai_lt_worker_arena(probe) != agnosai_lt_worker_scratch(probe),
-    "the two arenas are distinct — a shared one would accumulate every response");
+      "the two arenas are distinct — a shared one would accumulate every response");
     agnosai_lt_worker_run(probe);
     assert_eq(vec_len(agnosai_lt_worker_latencies(probe)), 5,
-    "the worker stops at its request budget");
+      "the worker stops at its request budget");
     assert_eq(agnosai_lt_worker_errors(probe), 0, "an always-200 executor records no errors");
     assert_eq(agnosai_lt_status_count(agnosai_lt_worker_status_counts(probe), 200), 5,
-    "the worker recorded five 200s");
+      "the worker recorded five 200s");
 
     # --- agnosai_lt_aggregate directly, across workers ---
     # Two workers, one returning 200 and one 503, so the cross-worker merge of
@@ -261,9 +261,9 @@ fn main() {
     assert(agg != 0, "aggregate returned a result");
     assert_eq(agnosai_lt_result_total_requests(agg), 10, "both workers' latencies merged");
     assert_eq(agnosai_lt_status_count(agnosai_lt_result_status_codes(agg), 200), 4,
-    "worker 0's four 200s survived the merge");
+      "worker 0's four 200s survived the merge");
     assert_eq(agnosai_lt_status_count(agnosai_lt_result_status_codes(agg), 503), 6,
-    "worker 1's six 503s merged alongside them, not over them");
+      "worker 1's six 503s merged alongside them, not over them");
     # 503 is still a *response*, so it is a success by the oracle's accounting —
     # only a transport error increments `failed`.
     assert_eq(agnosai_lt_result_failed(agg), 0, "an HTTP error status is not a transport failure");
@@ -274,34 +274,34 @@ fn main() {
     # wire form is the oracle's float, not the integer carrier.
     var agg_v = agnosai_lt_result_to_value(agg);
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(agg_v, "throughput_rps")),
-    str_from("2.0")) == 1, "throughput divides by the configured window, not elapsed time");
+        str_from("2.0")) == 1, "throughput divides by the configured window, not elapsed time");
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(agg_v, "error_rate")),
-    str_from("0.0")) == 1, "a clean run serialises a 0.0 error rate");
+        str_from("0.0")) == 1, "a clean run serialises a 0.0 error rate");
     assert(str_eq(bayan_json_v_build(
-    bayan_json_v_obj_get(bayan_json_v_obj_get(agg_v, "status_codes"), "503")),
-    str_from("6")) == 1, "status_codes is keyed by the code as a string");
+          bayan_json_v_obj_get(bayan_json_v_obj_get(agg_v, "status_codes"), "503")),
+        str_from("6")) == 1, "status_codes is keyed by the code as a string");
 
     # --- the no-request case ---
     assert_eq(agnosai_lt_aggregate(vec_new(), str_from("http://example.com/"), 1, 1), 0,
-    "aggregating zero workers yields no result rather than dividing by zero");
+      "aggregating zero workers yields no result rather than dividing by zero");
 
     var empty_workers = vec_new();
     vec_push(empty_workers,
-    agnosai_lt_worker_new(str_from("http://example.com/"), 0, 0, &_t_exec_ok, 0));
+      agnosai_lt_worker_new(str_from("http://example.com/"), 0, 0, &_t_exec_ok, 0));
     assert_eq(agnosai_lt_aggregate(empty_workers, str_from("http://example.com/"), 1, 1), 0,
-    "a worker that never fired a request yields no result");
+      "a worker that never fired a request yields no result");
 
     # --- the real HTTP executor fails closed ---
     # `.invalid` is reserved by RFC 2606 and is guaranteed never to resolve, so
     # this exercises the transport-error path identically on and off a network.
     var dead = agnosai_lt_worker_new(str_from("http://nonexistent.invalid/"),
-    clock_now_ns() + 1000000000, 1, &agnosai_lt_http_executor, 0);
+      clock_now_ns() + 1000000000, 1, &agnosai_lt_http_executor, 0);
     assert_eq(agnosai_lt_http_executor(dead), 0,
-    "an unresolvable host reports a transport error, not a status code");
+      "an unresolvable host reports a transport error, not a status code");
     agnosai_lt_worker_run(dead);
     assert_eq(agnosai_lt_worker_errors(dead), 1, "the worker loop counted it as an error");
     assert_eq(vec_len(agnosai_lt_worker_latencies(dead)), 1,
-    "a failed attempt still records a latency — that is why total counts errors");
+      "a failed attempt still records a latency — that is why total counts errors");
 
     # --- an exhausted persistent arena stops the worker, it does not spin ---
     # Unreachable through agnosai_lt_worker_new, which sizes the arena from the
@@ -310,15 +310,15 @@ fn main() {
     # whose latencies are all discarded, so the failing shape is a 3s hang
     # rather than a wrong number.
     var starved = agnosai_lt_worker_new(str_from("http://example.com/"),
-    clock_now_ns() + 3000000000, 100000, &_t_exec_ok, 0);
+      clock_now_ns() + 3000000000, 100000, &_t_exec_ok, 0);
     store64(starved + AGN_LT_ARENA, arena_allocator(64));
     var t0 = clock_now_ns();
     agnosai_lt_worker_run(starved);
     var spent = clock_now_ns() - t0;
     assert(spent < 1000000000,
-    "the worker stopped on arena exhaustion instead of spinning to its deadline");
+      "the worker stopped on arena exhaustion instead of spinning to its deadline");
     assert(vec_len(agnosai_lt_worker_latencies(starved)) < 100000,
-    "it stopped short of its budget");
+      "it stopped short of its budget");
 
     return assert_summary();
 }

@@ -179,12 +179,16 @@ fi
 tmp=$(mktemp /tmp/gen-presets.XXXXXX.cyr)
 trap 'rm -f "$tmp"' EXIT
 printf '%s' "$gen" > "$tmp"
-if ! cyrius fmt "$tmp" > "$tmp.fmt" 2>/dev/null; then
+# `cyrius fmt` formats the file IN PLACE and prints nothing on stdout. This used
+# to redirect stdout into "$tmp.fmt" and read that back, which captured an empty
+# file — so `gen` was empty, the write path emitted a 1-line
+# presets_data.cyr, and `--check` compared 434 lines against nothing and reported
+# "stale" unconditionally. Read the formatted file itself.
+if ! cyrius fmt "$tmp" >/dev/null 2>&1; then
     echo "gen-presets: cyrius fmt failed on the generated source" >&2
     exit 1
 fi
-gen=$(cat "$tmp.fmt")
-rm -f "$tmp.fmt"
+gen=$(cat "$tmp")
 
 if [ "$MODE" = "--check" ]; then
     if [ ! -f "$OUT" ]; then

@@ -52,7 +52,7 @@ fn _t_mixed_inventory(cpus, gpus): i64 {
     }
     for (var j = 0; j < gpus; j = j + 1) {
         vec_push(devs, agnosai_compute_device_new(cpus + j, str_from("gpu"),
-        AGNOSAI_ACCEL_CUDA, 80000));
+            AGNOSAI_ACCEL_CUDA, 80000));
     }
     return agnosai_hw_inventory_new(16, 64000, devs);
 }
@@ -65,19 +65,19 @@ fn _t_nvlink(a, b): i64 {
 fn main(): i64 {
     # --- oracle: single_gpu_scores_perfectly ----------------------------
     _t_assert_f64(agnosai_topology_score(agnosai_node_topology_new(), _t_gpu_inventory(1)),
-    f64_from(1), "one GPU scores 1.0 — topology is irrelevant");
+      f64_from(1), "one GPU scores 1.0 — topology is irrelevant");
 
     # --- past the oracle: ZERO GPUs also scores 1.0 ---------------------
     # The guard is `gpu_count <= 1`, not `== 1`, so a CPU-only node is not
     # penalised for having no interconnect to describe.
     _t_assert_f64(agnosai_topology_score(agnosai_node_topology_new(), _t_gpu_inventory(0)),
-    f64_from(1), "an empty inventory scores 1.0");
+      f64_from(1), "an empty inventory scores 1.0");
     _t_assert_f64(agnosai_topology_score(agnosai_node_topology_new(), _t_mixed_inventory(8, 0)),
-    f64_from(1), "and so does a CPU-only node with eight cores listed as devices");
+      f64_from(1), "and so does a CPU-only node with eight cores listed as devices");
 
     # --- oracle: no_links_scores_zero -----------------------------------
     _t_assert_f64(agnosai_topology_score(agnosai_node_topology_new(), _t_gpu_inventory(4)),
-    f64_from(0), "four GPUs with no link data score 0.0 — pessimistic, not unknown");
+      f64_from(0), "four GPUs with no link data score 0.0 — pessimistic, not unknown");
 
     # --- oracle: full_nvlink_scores_one ---------------------------------
     var full = agnosai_node_topology_new();
@@ -89,7 +89,7 @@ fn main(): i64 {
     agnosai_node_topology_with_link(full, _t_nvlink(2, 3));
     assert_eq(vec_len(agnosai_node_topology_links(full)), 6, "all six pairs are linked");
     _t_assert_f64(agnosai_topology_score(full, _t_gpu_inventory(4)), f64_from(1),
-    "a fully connected quad scores 1.0");
+      "a fully connected quad scores 1.0");
 
     # --- oracle: partial_links_partial_score ----------------------------
     # The oracle only asserts `0 < s < 1`. One of six pairs is exactly 1/6.
@@ -104,11 +104,11 @@ fn main(): i64 {
     agnosai_node_topology_with_link(partial, _t_nvlink(0, 2));
     agnosai_node_topology_with_link(partial, _t_nvlink(0, 3));
     _t_assert_f64(agnosai_topology_score(partial, _t_gpu_inventory(4)), _t_f64_ratio(3, 6),
-    "three of six pairs is 1/2");
+      "three of six pairs is 1/2");
     _t_assert_f64(agnosai_topology_score(partial, _t_gpu_inventory(3)), f64_from(1),
-    "the same three links over THREE GPUs is 3/3 — the denominator is the pair count");
+      "the same three links over THREE GPUs is 3/3 — the denominator is the pair count");
     _t_assert_f64(agnosai_topology_score(partial, _t_gpu_inventory(5)), _t_f64_ratio(3, 10),
-    "and over five GPUs it is 3/10");
+      "and over five GPUs it is 3/10");
 
     # --- past the oracle: CPU devices do not dilute the score -----------
     # `gpu_count` filters on `accelerator != Cpu`. Counting every device would
@@ -116,9 +116,9 @@ fn main(): i64 {
     var two = agnosai_node_topology_new();
     agnosai_node_topology_with_link(two, _t_nvlink(0, 1));
     _t_assert_f64(agnosai_topology_score(two, _t_mixed_inventory(0, 2)), f64_from(1),
-    "one link over two GPUs is 1.0");
+      "one link over two GPUs is 1.0");
     _t_assert_f64(agnosai_topology_score(two, _t_mixed_inventory(16, 2)), f64_from(1),
-    "and sixteen CPU devices alongside them change nothing");
+      "and sixteen CPU devices alongside them change nothing");
 
     # --- past the oracle: the score EXCEEDS 1.0 -------------------------
     # ⚠ The doc comment promises "0.0 to 1.0". Nothing clamps, nothing checks a
@@ -129,26 +129,26 @@ fn main(): i64 {
     agnosai_node_topology_with_link(over, _t_nvlink(0, 1));
     agnosai_node_topology_with_link(over, _t_nvlink(0, 1));
     _t_assert_f64(agnosai_topology_score(over, _t_gpu_inventory(2)), f64_from(3),
-    "three duplicate links over one pair score 3.0 — NOT clamped to 1.0");
+      "three duplicate links over one pair score 3.0 — NOT clamped to 1.0");
     var ghost = agnosai_node_topology_new();
     agnosai_node_topology_with_link(ghost, _t_nvlink(7, 9));
     _t_assert_f64(agnosai_topology_score(ghost, _t_gpu_inventory(2)), f64_from(1),
-    "a link naming devices the inventory does not have still scores");
+      "a link naming devices the inventory does not have still scores");
 
     # --- past the oracle: the 50 GB/s threshold is inclusive ------------
     var exact = agnosai_node_topology_new();
     agnosai_node_topology_with_link(exact, agnosai_device_link_new(0, 1,
-    AGNOSAI_INTERCONNECT_NVLINK, f64_from(50)));
+        AGNOSAI_INTERCONNECT_NVLINK, f64_from(50)));
     _t_assert_f64(agnosai_topology_score(exact, _t_gpu_inventory(2)), f64_from(1),
-    "exactly 50 GB/s counts as high bandwidth");
+      "exactly 50 GB/s counts as high bandwidth");
 
     var under = agnosai_node_topology_new();
     agnosai_node_topology_with_link(under, agnosai_device_link_new(0, 1,
-    AGNOSAI_INTERCONNECT_NVLINK, _t_f64_ratio(4999, 100)));
+        AGNOSAI_INTERCONNECT_NVLINK, _t_f64_ratio(4999, 100)));
     _t_assert_f64(agnosai_topology_score(under, _t_gpu_inventory(2)), f64_from(0),
-    "49.99 GB/s does not — and the score is 0.0, not the empty-links 0.0");
+      "49.99 GB/s does not — and the score is 0.0, not the empty-links 0.0");
     assert_eq(vec_len(agnosai_node_topology_links(under)), 1,
-    "with a link present, so that 0.0 came from the threshold");
+      "with a link present, so that 0.0 came from the threshold");
 
     # --- past the oracle: interconnect never decides --------------------
     # Neither function reads the field. A fast PCIe link counts; a slow NVLink
@@ -156,38 +156,38 @@ fn main(): i64 {
     # pass every oracle test, since all of them use 600 GB/s NVLink.
     var fast_pcie = agnosai_node_topology_new();
     agnosai_node_topology_with_link(fast_pcie, agnosai_device_link_new(0, 1,
-    AGNOSAI_INTERCONNECT_PCIE, f64_from(600)));
+        AGNOSAI_INTERCONNECT_PCIE, f64_from(600)));
     _t_assert_f64(agnosai_topology_score(fast_pcie, _t_gpu_inventory(2)), f64_from(1),
-    "a 600 GB/s PCIe link counts — bandwidth decides, not the interconnect");
+      "a 600 GB/s PCIe link counts — bandwidth decides, not the interconnect");
     var slow_nvlink = agnosai_node_topology_new();
     agnosai_node_topology_with_link(slow_nvlink, agnosai_device_link_new(0, 1,
-    AGNOSAI_INTERCONNECT_NVLINK, f64_from(1)));
+        AGNOSAI_INTERCONNECT_NVLINK, f64_from(1)));
     _t_assert_f64(agnosai_topology_score(slow_nvlink, _t_gpu_inventory(2)), f64_from(0),
-    "and a 1 GB/s NVLink does not");
+      "and a 1 GB/s NVLink does not");
 
     # --- past the oracle: the link round-trips --------------------------
     var l = agnosai_device_link_new(2, 5, AGNOSAI_INTERCONNECT_XGMI, f64_from(400));
     assert_eq(agnosai_device_link_device_a(l), 2, "device_a round-trips");
     assert_eq(agnosai_device_link_device_b(l), 5, "device_b round-trips");
     assert_eq(agnosai_device_link_interconnect(l), AGNOSAI_INTERCONNECT_XGMI,
-    "the interconnect round-trips even though nothing reads it");
+      "the interconnect round-trips even though nothing reads it");
     _t_assert_f64(agnosai_device_link_bandwidth_gbps(l), f64_from(400), "as does the bandwidth");
     assert_eq(vec_len(agnosai_node_topology_links(agnosai_node_topology_new())), 0,
-    "a default topology has no links");
+      "a default topology has no links");
     _t_assert_f64(agnosai_topology_high_bw_threshold(), f64_from(50),
-    "the threshold is 50 GB/s");
+      "the threshold is 50 GB/s");
     assert_eq(AGNOSAI_INTERCONNECT_PCIE, 0, "Pcie is the first variant, as in the oracle");
     assert_eq(AGNOSAI_INTERCONNECT_CXL, 3, "and Cxl the last");
 
     # --- oracle: tensor_parallel_single_device --------------------------
     assert_eq(agnosai_topology_supports_tensor_parallel(agnosai_node_topology_new(), 1), 1,
-    "one device always supports tensor parallelism");
+      "one device always supports tensor parallelism");
 
     # --- past the oracle: zero devices too ------------------------------
     # The guard is `<= 1`, which is also what keeps `device_count - 1` from
     # going negative — in Rust that would underflow `usize` and wrap.
     assert_eq(agnosai_topology_supports_tensor_parallel(agnosai_node_topology_new(), 0), 1,
-    "zero devices too — and that guard is what stops device_count - 1 going negative");
+      "zero devices too — and that guard is what stops device_count - 1 going negative");
 
     # --- oracle: tensor_parallel_needs_links ----------------------------
     var ring = agnosai_node_topology_new();
@@ -195,32 +195,32 @@ fn main(): i64 {
     agnosai_node_topology_with_link(ring, _t_nvlink(1, 2));
     agnosai_node_topology_with_link(ring, _t_nvlink(2, 3));
     assert_eq(agnosai_topology_supports_tensor_parallel(ring, 4), 1,
-    "three links support a four-way ring");
+      "three links support a four-way ring");
     assert_eq(agnosai_topology_supports_tensor_parallel(agnosai_node_topology_new(), 4), 0,
-    "and no links do not");
+      "and no links do not");
 
     # --- past the oracle: the boundary is exactly device_count - 1 ------
     assert_eq(agnosai_topology_supports_tensor_parallel(ring, 5), 0,
-    "three links do NOT support a five-way ring");
+      "three links do NOT support a five-way ring");
     assert_eq(agnosai_topology_supports_tensor_parallel(ring, 3), 1,
-    "and comfortably support a three-way one");
+      "and comfortably support a three-way one");
     assert_eq(agnosai_topology_supports_tensor_parallel(ring, 2), 1, "and a two-way one");
 
     # ⚠ Past the oracle: WHICH devices a link connects is not checked, so three
     # links between the same pair "support" a four-way ring. Reproduced from
     # the oracle, and the reason this is asserted rather than left to chance.
     assert_eq(agnosai_topology_supports_tensor_parallel(over, 4), 1,
-    "three duplicate links between ONE pair also 'support' a four-way ring");
+      "three duplicate links between ONE pair also 'support' a four-way ring");
 
     # And a slow link does not count toward the ring either.
     var mixed = agnosai_node_topology_new();
     agnosai_node_topology_with_link(mixed, _t_nvlink(0, 1));
     agnosai_node_topology_with_link(mixed, agnosai_device_link_new(1, 2,
-    AGNOSAI_INTERCONNECT_NVLINK, f64_from(16)));
+        AGNOSAI_INTERCONNECT_NVLINK, f64_from(16)));
     assert_eq(agnosai_topology_supports_tensor_parallel(mixed, 3), 0,
-    "a sub-threshold link does not count toward the ring");
+      "a sub-threshold link does not count toward the ring");
     assert_eq(agnosai_topology_supports_tensor_parallel(mixed, 2), 1,
-    "leaving only enough for a pair");
+      "leaving only enough for a pair");
 
     return assert_summary();
 }

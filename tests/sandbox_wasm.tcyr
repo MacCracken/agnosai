@@ -202,38 +202,38 @@ fn main(): i64 {
     var s = agnosai_wasm_sandbox_new();
     assert_neq(s, 0, "a default sandbox is created");
     assert_eq(agnosai_wasm_sandbox_max_memory_bytes(s), 67108864,
-    "with the oracle's 64 MiB memory ceiling");
+      "with the oracle's 64 MiB memory ceiling");
     assert_eq(agnosai_wasm_sandbox_timeout_ms(s), 30000,
-    "and its 30-second timeout");
+      "and its 30-second timeout");
     # Past the oracle, which asserts only the two fields its struct exposes.
     assert_eq(agnosai_wasm_sandbox_fuel(s), 1000000000,
-    "and the 1e9 fuel budget it never asserts");
+      "and the 1e9 fuel budget it never asserts");
 
     # --- Oracle: create_sandbox_with_custom_limits ------------------------
     var custom = agnosai_wasm_sandbox_with_limits(33554432, 10000);
     assert_eq(agnosai_wasm_sandbox_max_memory_bytes(custom), 33554432,
-    "custom memory is kept");
+      "custom memory is kept");
     assert_eq(agnosai_wasm_sandbox_timeout_ms(custom), 10000, "and a custom timeout");
     # ⚠ `with_limits` does NOT take fuel, upstream or here — it stays default.
     assert_eq(agnosai_wasm_sandbox_fuel(custom), 1000000000,
-    "while fuel stays at the default, because with_limits cannot set it");
+      "while fuel stays at the default, because with_limits cannot set it");
 
     # --- Oracle: load_invalid_bytes_returns_error -------------------------
     store64(&err, 0);
     var junk = str_from("not valid wasm");
     assert_eq(agnosai_wasm_load_module(s, str_data(junk), str_len(junk), &err), 0,
-    "bytes that are not WASM do not load");
+      "bytes that are not WASM do not load");
     assert_eq(agnosai_error_kind(load64(&err)), AGNOSAI_ERR_SANDBOX,
-    "reporting a Sandbox error");
+      "reporting a Sandbox error");
     # ⚠ The oracle asserts the message CONTAINS "expected" — it is checking the
     # caller is told the bytes are not WASM, not merely that something failed.
     assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "expected"), 1,
-    "with a message naming what was EXPECTED");
+      "with a message naming what was EXPECTED");
 
     # --- Oracle: load_empty_bytes_returns_error ---------------------------
     store64(&err, 0);
     assert_eq(agnosai_wasm_load_module(s, str_data(str_from("")), 0, &err), 0,
-    "empty bytes do not load");
+      "empty bytes do not load");
     assert_neq(load64(&err), 0, "and set an error");
 
     # --- the header check, past the oracle --------------------------------
@@ -244,33 +244,33 @@ fn main(): i64 {
     assert_eq(load64(&err), 0, "with no error");
     assert_eq(agnosai_wasm_module_len(m), 8, "and remembers its length");
     assert_eq(file_exists(str_data(agnosai_wasm_module_path(m))), 1,
-    "and stages the bytes where wasmtime can read them");
+      "and stages the bytes where wasmtime can read them");
 
     # ⚠ Seven bytes is one short and must be refused — the length check has to
     # come before the byte reads, or this reads past the buffer.
     store64(&err, 0);
     assert_eq(agnosai_wasm_load_module(s, hdr, 7, &err), 0,
-    "a seven-byte buffer is too short to be a header");
+      "a seven-byte buffer is too short to be a header");
 
     # Each magic byte matters.
     assert_eq(agnosai_wasm_load_module(s, _t_wasm_header_bad(0, 1), 8, &err), 0,
-    "a wrong first magic byte is refused");
+      "a wrong first magic byte is refused");
     assert_eq(agnosai_wasm_load_module(s, _t_wasm_header_bad(3, 110), 8, &err), 0,
-    "and a wrong fourth");
+      "and a wrong fourth");
 
     # ⚠ **The VERSION matters too.** A magic-only check accepts a version-2
     # module and defers the failure to wasmtime, where it becomes an exec-time
     # trap instead of a load-time refusal — which is the distinction the
     # oracle's `Module::new` draws.
     assert_eq(agnosai_wasm_load_module(s, _t_wasm_header_bad(4, 2), 8, &err), 0,
-    "a version-2 module is refused at LOAD, not deferred to exec");
+      "a version-2 module is refused at LOAD, not deferred to exec");
     assert_eq(agnosai_wasm_load_module(s, _t_wasm_header_bad(7, 1), 8, &err), 0,
-    "and a version with a high byte set");
+      "and a version with a high byte set");
 
     # --- Oracle: load_module_from_nonexistent_file_returns_error ----------
     store64(&err, 0);
     assert_eq(agnosai_wasm_load_module_from_file(s,
-    str_from("/nonexistent/module.wasm"), &err), 0, "a missing file does not load");
+        str_from("/nonexistent/module.wasm"), &err), 0, "a missing file does not load");
     assert_neq(load64(&err), 0, "and sets an error");
 
     # A real file round-trips, and ⚠ is RE-VALIDATED: a caller cannot hand the
@@ -288,46 +288,46 @@ fn main(): i64 {
     file_write_all(str_data(bad_path), str_data(notwasm), str_len(notwasm));
     store64(&err, 0);
     assert_eq(agnosai_wasm_load_module_from_file(s, bad_path, &err), 0,
-    "a file that is NOT WASM is refused even though it exists");
+      "a file that is NOT WASM is refused even though it exists");
     assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "expected"), 1,
-    "by the same header check, not by the filesystem");
+      "by the same header check, not by the filesystem");
 
     # --- the exit taxonomy ------------------------------------------------
     # ⚠ Fed captured stderr as DATA, so the classifier is testable without a
     # runtime. This is the whole of the oracle's `extract_exit_code`, which its
     # own tests only reach through real traps.
     assert_eq(agnosai_wasm_classify_exit(0, 0, str_from("")), 0,
-    "a clean run is 0");
+      "a clean run is 0");
     assert_eq(agnosai_wasm_classify_exit(1, 1, str_from("")), AGNOSAI_WASM_EXIT_TIMEOUT,
-    "a timeout is -1");
+      "a timeout is -1");
     # ⚠ **A timeout that reports exit 0 is still a timeout.** This is the only
     # input where the order of the first two checks is observable, and it is the
     # one that matters: reversed, a run killed at the deadline reads as a clean
     # success and the caller ships whatever partial stdout it had.
     assert_eq(agnosai_wasm_classify_exit(0, 1, str_from("")), AGNOSAI_WASM_EXIT_TIMEOUT,
-    "and a timeout reporting exit 0 is STILL a timeout, never a success");
+      "and a timeout reporting exit 0 is STILL a timeout, never a success");
     # ⚠ The deadline wins over the exit code, and over stderr. A timed-out run
     # also carries a non-zero code, so checking the code first mislabels it.
     assert_eq(agnosai_wasm_classify_exit(2, 1, str_from("all fuel consumed")),
-    AGNOSAI_WASM_EXIT_TIMEOUT, "and the deadline WINS over a fuel message");
+      AGNOSAI_WASM_EXIT_TIMEOUT, "and the deadline WINS over a fuel message");
 
     assert_eq(agnosai_wasm_classify_exit(1, 0, str_from("Error: all fuel consumed")),
-    AGNOSAI_WASM_EXIT_FUEL, "exhausted fuel is -2");
+      AGNOSAI_WASM_EXIT_FUEL, "exhausted fuel is -2");
     assert_eq(agnosai_wasm_classify_exit(1, 0,
-    str_from("wasm trap: interrupt\nepoch deadline reached")),
-    AGNOSAI_WASM_EXIT_TIMEOUT, "an epoch interrupt is -1");
+        str_from("wasm trap: interrupt\nepoch deadline reached")),
+      AGNOSAI_WASM_EXIT_TIMEOUT, "an epoch interrupt is -1");
     assert_eq(agnosai_wasm_classify_exit(1, 0,
-    str_from("Error: wasm trap: integer divide by zero")), AGNOSAI_WASM_EXIT_TRAP,
-    "any other trap is -3");
+        str_from("Error: wasm trap: integer divide by zero")), AGNOSAI_WASM_EXIT_TRAP,
+      "any other trap is -3");
 
     # ⚠ A guest's OWN exit code passes through. wasmtime surfaces WASI
     # `proc_exit(n)` as its own process exit, and the oracle preserves it via
     # `I32Exit`. Mapping every non-zero code onto -3 would erase it — and every
     # assertion above would still pass.
     assert_eq(agnosai_wasm_classify_exit(3, 0, str_from("")), 3,
-    "a guest's own proc_exit(3) is reported as 3, not as a trap");
+      "a guest's own proc_exit(3) is reported as 3, not as a trap");
     assert_eq(agnosai_wasm_classify_exit(42, 0, str_from("some unrelated noise")), 42,
-    "and is not overwritten by unrelated stderr");
+      "and is not overwritten by unrelated stderr");
 
     # The result struct carries both halves.
     var r = agnosai_wasm_result_new(str_from("hello"), 0);
@@ -341,7 +341,7 @@ fn main(): i64 {
     # `backend_is_available` answered a hardcoded 0 while `wasm_health` probed,
     # and the two contradicted each other.
     assert_eq(have, wasm_health(0),
-    "and agrees with wasm_health — these used to contradict each other");
+      "and agrees with wasm_health — these used to contradict each other");
 
     store64(&err, 0);
     var out = agnosai_wasm_execute(s, m, str_from(""), &err);
@@ -349,15 +349,15 @@ fn main(): i64 {
         # The reachable arm on this box, and a real assertion rather than a skip.
         assert_eq(out, 0, "with no runtime, execute does not half-work");
         assert_eq(agnosai_error_kind(load64(&err)), AGNOSAI_ERR_SANDBOX,
-        "it is a Sandbox error");
+          "it is a Sandbox error");
         assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "wasmtime"), 1,
-        "naming the missing binary, so the operator knows what to install");
+          "naming the missing binary, so the operator knows what to install");
     } else {
         # ⚠ Guarded, and the guard is LOUD: if a runtime is present these must
         # run, so a regression in detection cannot quietly skip them.
         assert_neq(out, 0, "with a runtime present, a header-only module executes");
         assert_eq(agnosai_wasm_result_exit_code(out), 0,
-        "and an empty module exits cleanly");
+          "and an empty module exits cleanly");
     }
 
     # --- a REAL module, end to end -------------------------------------------
@@ -380,7 +380,7 @@ fn main(): i64 {
         var rr = agnosai_wasm_execute(rs, rm, str_from("{\"parameters\":{}}"), &err);
         assert_neq(rr, 0, "and EXECUTES — no result here means kavach was never initialised");
         assert_eq(agnosai_wasm_result_exit_code(rr), 0,
-        "and the guest exited 0, so wasmtime accepted kavach's argv");
+          "and the guest exited 0, so wasmtime accepted kavach's argv");
         sys_unlink(str_data(rp));
 
         # ⚠ **stdin must reach the guest, and stdout must come back.** The nop
@@ -402,9 +402,9 @@ fn main(): i64 {
         assert_eq(agnosai_wasm_result_exit_code(er), 0, "exiting 0");
         var got = agnosai_wasm_result_stdout(er);
         assert(str_len(got) > 0,
-        "STDOUT IS CAPTURED — an empty result here means the guest's output is dropped");
+          "STDOUT IS CAPTURED — an empty result here means the guest's output is dropped");
         assert(str_eq(got, payload) == 1,
-        "and it is exactly what was written to STDIN — proving config_stdin reaches the guest");
+          "and it is exactly what was written to STDIN — proving config_stdin reaches the guest");
         sys_unlink(str_data(ep));
 
         # ⚠ **The FUEL ceiling must reach wasmtime too, and until kavach 3.11.11
@@ -424,7 +424,7 @@ fn main(): i64 {
         var fr = agnosai_wasm_execute(starved, fm, str_from("{}"), &err);
         assert_neq(fr, 0, "and execute returns a result");
         assert_neq(agnosai_wasm_result_exit_code(fr), 0,
-        "and the guest was STARVED — a 0 here means the fuel never reached wasmtime");
+          "and the guest was STARVED — a 0 here means the fuel never reached wasmtime");
         sys_unlink(str_data(fp));
 
         # ⚠ **The memory ceiling must actually REACH wasmtime.** Until
@@ -447,7 +447,7 @@ fn main(): i64 {
         var tr = agnosai_wasm_execute(tight, tm, str_from("{}"), &err);
         assert_neq(tr, 0, "and execute returns a result");
         assert_neq(agnosai_wasm_result_exit_code(tr), 0,
-        "and the guest was REFUSED — a 0 here means the ceiling never reached wasmtime");
+          "and the guest was REFUSED — a 0 here means the ceiling never reached wasmtime");
         sys_unlink(str_data(mp));
     }
 

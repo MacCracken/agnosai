@@ -51,7 +51,7 @@ fn _t_one_node(id): i64 {
 fn _t_phase_is(m, run, tag, detail): i64 {
     var s = agnosai_crew_state_manager_get(m, run);
     return agnosai_crew_phase_eq(agnosai_dist_crew_state_phase(s),
-    agnosai_dist_crew_state_phase_detail(s), tag, detail);
+      agnosai_dist_crew_state_phase_detail(s), tag, detail);
 }
 
 fn main(): i64 {
@@ -61,7 +61,7 @@ fn main(): i64 {
     var s = agnosai_crew_state_manager_get(m, run);
     assert(s != 0, "the created run is retrievable");
     assert_eq(agnosai_dist_crew_state_phase(s), AGNOSAI_PHASE_INITIALIZING,
-    "a fresh run starts Initializing");
+      "a fresh run starts Initializing");
     assert_eq(agnosai_dist_crew_state_phase_detail(s), 0, "with no phase payload");
     assert_eq(agnosai_dist_crew_state_is_checkpointing(s), 0, "and not checkpointing");
     assert_eq(vec_len(agnosai_dist_crew_state_participating(s)), 3, "three participants");
@@ -69,20 +69,20 @@ fn main(): i64 {
     assert_eq(vec_len(agnosai_dist_crew_state_checkpoints(s)), 0, "no checkpoints yet");
     assert(agnosai_dist_crew_state_created_at(s) > 0, "created_at is stamped");
     assert_eq(agnosai_dist_crew_state_updated_at(s),
-    agnosai_dist_crew_state_created_at(s), "and updated_at starts equal to it");
+      agnosai_dist_crew_state_created_at(s), "and updated_at starts equal to it");
     assert(str_eq(agnosai_dist_crew_state_run_id(s), run) == 1, "the run carries its own id");
     assert_eq(agnosai_crew_state_manager_get(m, str_from("no-such-run")), 0,
-    "an unknown run is None");
+      "an unknown run is None");
 
     var p_a = map_get(agnosai_dist_crew_state_node_progress(s), str_from("node-a"));
     assert(p_a != 0, "node-a has a progress record");
     assert(str_eq_cstr(agnosai_node_progress_node_id(p_a), "node-a") == 1,
-    "the record carries its own node id, so it survives being read out of the map");
+      "the record carries its own node id, so it survives being read out of the map");
     assert_eq(agnosai_node_progress_tasks_completed(p_a), 0, "starting at zero completed");
     assert_eq(agnosai_node_progress_tasks_total(p_a), 10, "with the per-node task count");
     assert_eq(agnosai_node_progress_current_task(p_a), 0, "and no current task");
     assert_eq(agnosai_node_progress_last_update(p_a), agnosai_dist_crew_state_created_at(s),
-    "and a last_update stamped at run creation");
+      "and a last_update stamped at run creation");
 
     # --- past the oracle: the terminal-phase predicate ------------------
     # `active_runs` and `evict_if_needed` both gate on this, so the exact set
@@ -92,12 +92,12 @@ fn main(): i64 {
     assert_eq(agnosai_crew_phase_is_terminal(AGNOSAI_PHASE_FAILED), 1, "Failed is terminal");
     assert_eq(agnosai_crew_phase_is_terminal(AGNOSAI_PHASE_CANCELLED), 1, "Cancelled is terminal");
     assert_eq(agnosai_crew_phase_is_terminal(AGNOSAI_PHASE_INITIALIZING), 0,
-    "Initializing is not terminal");
+      "Initializing is not terminal");
     assert_eq(agnosai_crew_phase_is_terminal(AGNOSAI_PHASE_RUNNING), 0, "Running is not terminal");
     assert_eq(agnosai_crew_phase_is_terminal(AGNOSAI_PHASE_WAITING_BARRIER), 0,
-    "WaitingBarrier is not terminal — evicting a run mid-barrier would strand it");
+      "WaitingBarrier is not terminal — evicting a run mid-barrier would strand it");
     assert_eq(agnosai_crew_phase_is_terminal(AGNOSAI_PHASE_CHECKPOINTING), 0,
-    "Checkpointing is not terminal");
+      "Checkpointing is not terminal");
 
     # --- past the oracle: a duplicated node id collapses ----------------
     # The oracle takes a HashSet, so duplicates never arrive. Collapsing here
@@ -108,49 +108,49 @@ fn main(): i64 {
     vec_push(dupnodes, str_from("n1"));
     var duprun = agnosai_crew_state_manager_create_run(m, dupnodes, 1);
     assert_eq(vec_len(agnosai_dist_crew_state_participating(
-    agnosai_crew_state_manager_get(m, duprun))), 1,
-    "a duplicated node id collapses to one participant");
+          agnosai_crew_state_manager_get(m, duprun))), 1,
+      "a duplicated node id collapses to one participant");
     assert_eq(agnosai_crew_state_manager_reach_barrier(m, duprun, str_from("n1"),
-    str_from("b")), AGNOSAI_BARRIER_ALL_REACHED,
-    "so a single arrival satisfies the barrier");
+        str_from("b")), AGNOSAI_BARRIER_ALL_REACHED,
+      "so a single arrival satisfies the barrier");
 
     # --- oracle: report_progress_updates_node ---------------------------
     assert_eq(agnosai_crew_state_manager_report_progress(m, run, str_from("node-a"), 5,
-    str_from("task-5")), 1, "progress is applied");
+        str_from("task-5")), 1, "progress is applied");
     var p_a2 = map_get(agnosai_dist_crew_state_node_progress(
-    agnosai_crew_state_manager_get(m, run)), str_from("node-a"));
+        agnosai_crew_state_manager_get(m, run)), str_from("node-a"));
     assert_eq(agnosai_node_progress_tasks_completed(p_a2), 5, "the completed count updates");
     assert(str_eq_cstr(agnosai_node_progress_current_task(p_a2), "task-5") == 1,
-    "and the current task is recorded");
+      "and the current task is recorded");
     assert_eq(agnosai_dist_crew_state_phase(agnosai_crew_state_manager_get(m, run)),
-    AGNOSAI_PHASE_RUNNING, "the first report moves Initializing to Running");
+      AGNOSAI_PHASE_RUNNING, "the first report moves Initializing to Running");
 
     # --- oracle: report_progress_unknown_run / _unknown_node ------------
     assert_eq(agnosai_crew_state_manager_report_progress(m, str_from("nope"),
-    str_from("node-a"), 1, 0), 0, "an unknown run rejects the report");
+        str_from("node-a"), 1, 0), 0, "an unknown run rejects the report");
     assert_eq(agnosai_crew_state_manager_report_progress(m, run, str_from("stranger"), 1, 0), 0,
-    "a non-participating node rejects the report");
+      "a non-participating node rejects the report");
 
     # --- past the oracle: a None current_task clears it -----------------
     assert_eq(agnosai_crew_state_manager_report_progress(m, run, str_from("node-a"), 6, 0), 1,
-    "a report with no current task is applied");
+      "a report with no current task is applied");
     assert_eq(agnosai_node_progress_current_task(map_get(
-    agnosai_dist_crew_state_node_progress(agnosai_crew_state_manager_get(m, run)),
-    str_from("node-a"))), 0, "and clears the previously-recorded task");
+          agnosai_dist_crew_state_node_progress(agnosai_crew_state_manager_get(m, run)),
+          str_from("node-a"))), 0, "and clears the previously-recorded task");
 
     # --- oracle: barrier_first_node_waits / _last_triggers / _progressive
     var m2 = agnosai_crew_state_manager_new();
     var r2 = agnosai_crew_state_manager_create_run(m2, _t_nodes(), 5);
     assert_eq(agnosai_crew_state_manager_reach_barrier(m2, r2, str_from("node-a"),
-    str_from("sync-1")), 2, "the first of three nodes waits on two more");
+        str_from("sync-1")), 2, "the first of three nodes waits on two more");
     assert_eq(_t_phase_is(m2, r2, AGNOSAI_PHASE_WAITING_BARRIER, str_from("sync-1")), 1,
-    "and the phase names the barrier");
+      "and the phase names the barrier");
     assert_eq(agnosai_crew_state_manager_reach_barrier(m2, r2, str_from("node-b"),
-    str_from("sync-1")), 1, "the second waits on one more");
+        str_from("sync-1")), 1, "the second waits on one more");
     assert_eq(agnosai_crew_state_manager_reach_barrier(m2, r2, str_from("node-c"),
-    str_from("sync-1")), AGNOSAI_BARRIER_ALL_REACHED, "the third completes the barrier");
+        str_from("sync-1")), AGNOSAI_BARRIER_ALL_REACHED, "the third completes the barrier");
     assert_eq(agnosai_dist_crew_state_phase(agnosai_crew_state_manager_get(m2, r2)),
-    AGNOSAI_PHASE_RUNNING, "and the phase returns to Running");
+      AGNOSAI_PHASE_RUNNING, "and the phase returns to Running");
 
     # --- past the oracle: a repeated arrival is idempotent --------------
     # The arrival set is a set. A node signalling twice must not count twice, or
@@ -158,9 +158,9 @@ fn main(): i64 {
     var m3 = agnosai_crew_state_manager_new();
     var r3 = agnosai_crew_state_manager_create_run(m3, _t_nodes(), 5);
     assert_eq(agnosai_crew_state_manager_reach_barrier(m3, r3, str_from("node-a"),
-    str_from("b")), 2, "first arrival");
+        str_from("b")), 2, "first arrival");
     assert_eq(agnosai_crew_state_manager_reach_barrier(m3, r3, str_from("node-a"),
-    str_from("b")), 2, "the same node arriving again does not advance the barrier");
+        str_from("b")), 2, "the same node arriving again does not advance the barrier");
 
     # --- past the oracle: the arrival set is NOT cleared on completion --
     # Only force_barrier and remove_node erase it, so a second pass over the
@@ -168,27 +168,27 @@ fn main(): i64 {
     var m4 = agnosai_crew_state_manager_new();
     var r4 = agnosai_crew_state_manager_create_run(m4, _t_one_node("solo"), 1);
     assert_eq(agnosai_crew_state_manager_reach_barrier(m4, r4, str_from("solo"),
-    str_from("once")), AGNOSAI_BARRIER_ALL_REACHED, "a lone node completes immediately");
+        str_from("once")), AGNOSAI_BARRIER_ALL_REACHED, "a lone node completes immediately");
     assert_eq(agnosai_crew_state_manager_reach_barrier(m4, r4, str_from("solo"),
-    str_from("once")), AGNOSAI_BARRIER_ALL_REACHED,
-    "and re-reaching the same barrier answers AllReached, not Waiting");
+        str_from("once")), AGNOSAI_BARRIER_ALL_REACHED,
+      "and re-reaching the same barrier answers AllReached, not Waiting");
 
     # --- past the oracle: distinct barrier names are independent --------
     var m5 = agnosai_crew_state_manager_new();
     var r5 = agnosai_crew_state_manager_create_run(m5, _t_nodes(), 5);
     agnosai_crew_state_manager_reach_barrier(m5, r5, str_from("node-a"), str_from("alpha"));
     assert_eq(agnosai_crew_state_manager_reach_barrier(m5, r5, str_from("node-a"),
-    str_from("beta")), 2, "arriving at alpha does not advance beta");
+        str_from("beta")), 2, "arriving at alpha does not advance beta");
 
     # --- oracle: barrier_unknown_run / _unknown_node --------------------
     assert_eq(agnosai_crew_state_manager_reach_barrier(m5, str_from("nope"),
-    str_from("node-a"), str_from("b")), AGNOSAI_BARRIER_UNKNOWN_RUN, "unknown run");
+        str_from("node-a"), str_from("b")), AGNOSAI_BARRIER_UNKNOWN_RUN, "unknown run");
     assert_eq(agnosai_crew_state_manager_reach_barrier(m5, r5, str_from("stranger"),
-    str_from("b")), AGNOSAI_BARRIER_UNKNOWN_NODE, "unknown node");
+        str_from("b")), AGNOSAI_BARRIER_UNKNOWN_NODE, "unknown node");
     # The two sentinels must be distinguishable — collapsing them to one "error"
     # would lose the caller's ability to tell a dead run from a stray node.
     assert(AGNOSAI_BARRIER_UNKNOWN_RUN != AGNOSAI_BARRIER_UNKNOWN_NODE,
-    "the two failure sentinels are distinct");
+      "the two failure sentinels are distinct");
     assert(AGNOSAI_BARRIER_ALL_REACHED < 0, "AllReached is distinguishable from any Waiting(n)");
 
     # --- past the oracle: force_barrier ---------------------------------
@@ -196,16 +196,16 @@ fn main(): i64 {
     var r6 = agnosai_crew_state_manager_create_run(m6, _t_nodes(), 5);
     agnosai_crew_state_manager_reach_barrier(m6, r6, str_from("node-a"), str_from("stuck"));
     assert_eq(_t_phase_is(m6, r6, AGNOSAI_PHASE_WAITING_BARRIER, str_from("stuck")), 1,
-    "the run is stuck waiting");
+      "the run is stuck waiting");
     assert_eq(agnosai_crew_state_manager_force_barrier(m6, r6, str_from("stuck")), 1,
-    "forcing the barrier succeeds");
+      "forcing the barrier succeeds");
     assert_eq(agnosai_dist_crew_state_phase(agnosai_crew_state_manager_get(m6, r6)),
-    AGNOSAI_PHASE_RUNNING, "and releases the run to Running");
+      AGNOSAI_PHASE_RUNNING, "and releases the run to Running");
     # The arrival set was erased, so the barrier starts over.
     assert_eq(agnosai_crew_state_manager_reach_barrier(m6, r6, str_from("node-a"),
-    str_from("stuck")), 2, "forcing erased the arrivals — the barrier restarts");
+        str_from("stuck")), 2, "forcing erased the arrivals — the barrier restarts");
     assert_eq(agnosai_crew_state_manager_force_barrier(m6, str_from("nope"), str_from("x")), 0,
-    "forcing a barrier on an unknown run reports failure");
+      "forcing a barrier on an unknown run reports failure");
 
     # --- past the oracle: force_barrier is UNCONDITIONAL ----------------
     # It sets Running whatever the phase was, so forcing on a Completed run
@@ -215,27 +215,27 @@ fn main(): i64 {
     var r7 = agnosai_crew_state_manager_create_run(m7, _t_one_node("x"), 1);
     agnosai_crew_state_manager_complete(m7, r7);
     assert_eq(agnosai_crew_state_manager_force_barrier(m7, r7, str_from("any")), 1,
-    "forcing a barrier on a Completed run succeeds");
+      "forcing a barrier on a Completed run succeeds");
     assert_eq(agnosai_dist_crew_state_phase(agnosai_crew_state_manager_get(m7, r7)),
-    AGNOSAI_PHASE_RUNNING, "and revives it out of the terminal phase");
+      AGNOSAI_PHASE_RUNNING, "and revives it out of the terminal phase");
 
     # --- past the oracle: remove_node auto-satisfies a barrier ----------
     var m8 = agnosai_crew_state_manager_new();
     var r8 = agnosai_crew_state_manager_create_run(m8, _t_nodes(), 5);
     agnosai_crew_state_manager_reach_barrier(m8, r8, str_from("node-a"), str_from("sync"));
     assert_eq(agnosai_crew_state_manager_reach_barrier(m8, r8, str_from("node-b"),
-    str_from("sync")), 1, "two of three arrived; one outstanding");
+        str_from("sync")), 1, "two of three arrived; one outstanding");
     assert_eq(agnosai_crew_state_manager_remove_node(m8, r8, str_from("node-c")), 1,
-    "removing the missing node succeeds");
+      "removing the missing node succeeds");
     assert_eq(vec_len(agnosai_dist_crew_state_participating(
-    agnosai_crew_state_manager_get(m8, r8))), 2, "two participants remain");
+          agnosai_crew_state_manager_get(m8, r8))), 2, "two participants remain");
     assert_eq(map_size(agnosai_dist_crew_state_node_progress(
-    agnosai_crew_state_manager_get(m8, r8))), 2, "and its progress record is gone");
+          agnosai_crew_state_manager_get(m8, r8))), 2, "and its progress record is gone");
     assert_eq(agnosai_dist_crew_state_phase(agnosai_crew_state_manager_get(m8, r8)),
-    AGNOSAI_PHASE_RUNNING,
-    "the barrier is now satisfied by the survivors and the run resumes");
+      AGNOSAI_PHASE_RUNNING,
+      "the barrier is now satisfied by the survivors and the run resumes");
     assert_eq(agnosai_crew_state_manager_remove_node(m8, str_from("nope"), str_from("n")), 0,
-    "removing from an unknown run reports failure");
+      "removing from an unknown run reports failure");
 
     # --- past the oracle: remove_node clears only THIS barrier ----------
     # The phase carries the barrier name. Satisfying "alpha" must not clear a
@@ -248,12 +248,12 @@ fn main(): i64 {
     # Now move the phase to a DIFFERENT barrier.
     agnosai_crew_state_manager_reach_barrier(m9, r9, str_from("node-a"), str_from("beta"));
     assert_eq(_t_phase_is(m9, r9, AGNOSAI_PHASE_WAITING_BARRIER, str_from("beta")), 1,
-    "the phase now names beta");
+      "the phase now names beta");
     agnosai_crew_state_manager_remove_node(m9, r9, str_from("node-c"));
     # alpha is satisfied by {a,b}; beta is not (only a arrived, b and c... c gone,
     # so participants are {a,b} and beta has {a} — not a subset).
     assert_eq(_t_phase_is(m9, r9, AGNOSAI_PHASE_WAITING_BARRIER, str_from("beta")), 1,
-    "satisfying alpha does not clear a phase waiting on beta");
+      "satisfying alpha does not clear a phase waiting on beta");
 
     # --- past the oracle: emptying the participants satisfies everything -
     # The empty set is a subset of anything, so every pending barrier completes.
@@ -262,14 +262,14 @@ fn main(): i64 {
     # Put the run in a waiting phase on a barrier nobody has reached.
     agnosai_crew_state_manager_fail(m10, r10, str_from("placeholder"));
     _agnosai_dcs_set_phase(agnosai_crew_state_manager_get(m10, r10),
-    AGNOSAI_PHASE_WAITING_BARRIER, str_from("ghost"));
+      AGNOSAI_PHASE_WAITING_BARRIER, str_from("ghost"));
     _agnosai_csm_arrived(m10, r10, str_from("ghost"));
     agnosai_crew_state_manager_remove_node(m10, r10, str_from("last"));
     assert_eq(vec_len(agnosai_dist_crew_state_participating(
-    agnosai_crew_state_manager_get(m10, r10))), 0, "no participants remain");
+          agnosai_crew_state_manager_get(m10, r10))), 0, "no participants remain");
     assert_eq(agnosai_dist_crew_state_phase(agnosai_crew_state_manager_get(m10, r10)),
-    AGNOSAI_PHASE_RUNNING,
-    "an empty participant set satisfies a barrier nobody reached");
+      AGNOSAI_PHASE_RUNNING,
+      "an empty participant set satisfies a barrier nobody reached");
 
     # --- oracle: checkpoint_stores_node_states / checkpoint_unknown_run -
     var m11 = agnosai_crew_state_manager_new();
@@ -277,28 +277,28 @@ fn main(): i64 {
     var ns = map_new_str();
     map_set(ns, str_from("node-a"), bayan_json_v_int_new(42));
     assert_eq(agnosai_crew_state_manager_checkpoint(m11, r11, str_from("cp-1"), ns), 1,
-    "the checkpoint is taken");
+      "the checkpoint is taken");
     var cps = agnosai_dist_crew_state_checkpoints(agnosai_crew_state_manager_get(m11, r11));
     assert_eq(vec_len(cps), 1, "one checkpoint stored");
     assert(str_eq_cstr(agnosai_checkpoint_name(vec_get(cps, 0)), "cp-1") == 1,
-    "under its name");
+      "under its name");
     assert_eq(map_size(agnosai_checkpoint_node_states(vec_get(cps, 0))), 1,
-    "carrying the node states");
+      "carrying the node states");
     assert(agnosai_checkpoint_created_at(vec_get(cps, 0)) > 0, "and a timestamp");
     assert_eq(agnosai_dist_crew_state_phase(agnosai_crew_state_manager_get(m11, r11)),
-    AGNOSAI_PHASE_RUNNING, "the first checkpoint also moves Initializing to Running");
+      AGNOSAI_PHASE_RUNNING, "the first checkpoint also moves Initializing to Running");
     assert_eq(agnosai_dist_crew_state_is_checkpointing(
-    agnosai_crew_state_manager_get(m11, r11)), 0,
-    "and the in-flight flag is clear again on return");
+        agnosai_crew_state_manager_get(m11, r11)), 0,
+      "and the in-flight flag is clear again on return");
     assert_eq(agnosai_crew_state_manager_checkpoint(m11, str_from("nope"), str_from("c"),
-    map_new_str()), 0, "checkpointing an unknown run reports failure");
+        map_new_str()), 0, "checkpointing an unknown run reports failure");
 
     # --- past the oracle: checkpoints accumulate, newest last -----------
     agnosai_crew_state_manager_checkpoint(m11, r11, str_from("cp-2"), map_new_str());
     var cps2 = agnosai_dist_crew_state_checkpoints(agnosai_crew_state_manager_get(m11, r11));
     assert_eq(vec_len(cps2), 2, "a second checkpoint appends");
     assert(str_eq_cstr(agnosai_checkpoint_name(vec_get(cps2, 1)), "cp-2") == 1,
-    "oldest first, newest last");
+      "oldest first, newest last");
 
     # --- oracle: complete / fail / cancel transitions -------------------
     var m12 = agnosai_crew_state_manager_new();
@@ -307,23 +307,23 @@ fn main(): i64 {
     var rx = agnosai_crew_state_manager_create_run(m12, _t_one_node("c"), 1);
     assert_eq(agnosai_crew_state_manager_complete(m12, rc), 1, "complete succeeds");
     assert_eq(agnosai_dist_crew_state_phase(agnosai_crew_state_manager_get(m12, rc)),
-    AGNOSAI_PHASE_COMPLETED, "and sets Completed");
+      AGNOSAI_PHASE_COMPLETED, "and sets Completed");
     assert_eq(agnosai_crew_state_manager_fail(m12, rf, str_from("boom")), 1, "fail succeeds");
     assert_eq(_t_phase_is(m12, rf, AGNOSAI_PHASE_FAILED, str_from("boom")), 1,
-    "and sets Failed with the reason as payload");
+      "and sets Failed with the reason as payload");
     assert_eq(agnosai_crew_state_manager_cancel(m12, rx), 1, "cancel succeeds");
     assert_eq(agnosai_dist_crew_state_phase(agnosai_crew_state_manager_get(m12, rx)),
-    AGNOSAI_PHASE_CANCELLED, "and sets Cancelled");
+      AGNOSAI_PHASE_CANCELLED, "and sets Cancelled");
     assert_eq(agnosai_crew_state_manager_complete(m12, str_from("nope")), 0,
-    "completing an unknown run reports failure");
+      "completing an unknown run reports failure");
     assert_eq(agnosai_crew_state_manager_fail(m12, str_from("nope"), str_from("x")), 0,
-    "failing an unknown run reports failure");
+      "failing an unknown run reports failure");
     assert_eq(agnosai_crew_state_manager_cancel(m12, str_from("nope")), 0,
-    "cancelling an unknown run reports failure");
+      "cancelling an unknown run reports failure");
 
     # --- past the oracle: Failed payloads are compared, not just tagged -
     assert_eq(_t_phase_is(m12, rf, AGNOSAI_PHASE_FAILED, str_from("different")), 0,
-    "Failed(\"boom\") does not equal Failed(\"different\")");
+      "Failed(\"boom\") does not equal Failed(\"different\")");
 
     # --- oracle: active_runs_excludes_terminal --------------------------
     var m13 = agnosai_crew_state_manager_new();
@@ -334,23 +334,23 @@ fn main(): i64 {
     agnosai_crew_state_manager_complete(m13, a1);
     agnosai_crew_state_manager_fail(m13, a2, str_from("x"));
     assert_eq(vec_len(agnosai_crew_state_manager_active_runs(m13)), 1,
-    "Completed and Failed are both excluded");
+      "Completed and Failed are both excluded");
 
     # --- oracle: overall_progress_calculation / _unknown_run ------------
     var m14 = agnosai_crew_state_manager_new();
     var r14 = agnosai_crew_state_manager_create_run(m14, _t_nodes(), 10);
     _t_assert_f64(agnosai_crew_state_manager_overall_progress(m14, r14), f64_from(0),
-    "a fresh run is at 0.0");
+      "a fresh run is at 0.0");
     agnosai_crew_state_manager_report_progress(m14, r14, str_from("node-a"), 5, 0);
     _t_assert_f64(agnosai_crew_state_manager_overall_progress(m14, r14),
-    _t_f64_ratio(5, 30), "5 of 30 tasks is 1/6");
+      _t_f64_ratio(5, 30), "5 of 30 tasks is 1/6");
     agnosai_crew_state_manager_report_progress(m14, r14, str_from("node-b"), 10, 0);
     agnosai_crew_state_manager_report_progress(m14, r14, str_from("node-c"), 10, 0);
     agnosai_crew_state_manager_report_progress(m14, r14, str_from("node-a"), 10, 0);
     _t_assert_f64(agnosai_crew_state_manager_overall_progress(m14, r14), f64_from(1),
-    "all thirty tasks done is 1.0");
+      "all thirty tasks done is 1.0");
     assert_eq(agnosai_crew_state_manager_overall_progress(m14, str_from("nope")), 0,
-    "an unknown run answers the None sentinel");
+      "an unknown run answers the None sentinel");
 
     # --- past the oracle: no tasks answers 1.0, not 0.0 -----------------
     # `total == 0` returns Some(1.0) rather than dividing by zero — "nothing to
@@ -358,18 +358,18 @@ fn main(): i64 {
     var m15 = agnosai_crew_state_manager_new();
     var r15 = agnosai_crew_state_manager_create_run(m15, _t_one_node("idle"), 0);
     _t_assert_f64(agnosai_crew_state_manager_overall_progress(m15, r15), f64_from(1),
-    "a run with zero tasks is 1.0, not 0.0");
+      "a run with zero tasks is 1.0, not 0.0");
     # And a run with NO participants at all — total is likewise 0.
     var r16 = agnosai_crew_state_manager_create_run(m15, vec_new(), 10);
     _t_assert_f64(agnosai_crew_state_manager_overall_progress(m15, r16), f64_from(1),
-    "a run with no participants is also 1.0");
+      "a run with no participants is also 1.0");
 
     # ⚠ The encoding hazard this port creates: the None sentinel is 0, and
     # `f64_from(0)` is ALSO 0. A caller must test existence separately.
     assert_eq(agnosai_crew_state_manager_overall_progress(m14, str_from("ghost")),
-    f64_from(0), "0.0 progress and the None sentinel are indistinguishable by value");
+      f64_from(0), "0.0 progress and the None sentinel are indistinguishable by value");
     assert_eq(agnosai_crew_state_manager_get(m14, str_from("ghost")), 0,
-    "so existence must be tested with _get, which is unambiguous");
+      "so existence must be tested with _get, which is unambiguous");
 
     return assert_summary();
 }

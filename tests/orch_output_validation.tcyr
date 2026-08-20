@@ -50,34 +50,34 @@ fn main() {
 
     # --- valid_json_object_with_required_fields ---
     _t_valid("{\"name\": \"test\", \"score\": 42}",
-    "{\"type\":\"object\",\"required\":[\"name\",\"score\"]}", "an object with both fields passes");
+      "{\"type\":\"object\",\"required\":[\"name\",\"score\"]}", "an object with both fields passes");
 
     # --- missing_required_field ---
     _t_invalid("{\"name\": \"test\"}", "{\"type\":\"object\",\"required\":[\"name\",\"score\"]}",
-    "score", "a missing field is named in the error");
+      "score", "a missing field is named in the error");
     assert(str_eq(_t_val("{\"name\": \"test\"}",
-    "{\"type\":\"object\",\"required\":[\"name\",\"score\"]}"),
-    str_from("Missing required fields: score")) == 1, "with the oracle's exact wording");
+          "{\"type\":\"object\",\"required\":[\"name\",\"score\"]}"),
+        str_from("Missing required fields: score")) == 1, "with the oracle's exact wording");
 
     # several missing fields join with ", " in the schema's order
     assert(str_eq(_t_val("{}", "{\"required\":[\"a\",\"b\",\"c\"]}"),
-    str_from("Missing required fields: a, b, c")) == 1,
-    "several missing fields join in the schema's order, not the object's");
+        str_from("Missing required fields: a, b, c")) == 1,
+      "several missing fields join in the schema's order, not the object's");
 
     # --- not_valid_json ---
     _t_invalid("this is not json", "{\"type\":\"object\"}", "not valid JSON",
-    "unparseable input is reported as such");
+      "unparseable input is reported as such");
     assert(str_contains(_t_val("this is not json", "{\"type\":\"object\"}"),
-    str_from("Response is not valid JSON: ")) == 1,
-    "the wrapper wording is the oracle's; the detail after the colon is bayan's");
+        str_from("Response is not valid JSON: ")) == 1,
+      "the wrapper wording is the oracle's; the detail after the colon is bayan's");
     _t_invalid("", "{}", "not valid JSON", "empty input is not valid JSON");
     _t_invalid("{\"unterminated\": ", "{}", "not valid JSON", "truncated input is not valid JSON");
 
     # --- wrong_type ---
     _t_invalid("[1, 2, 3]", "{\"type\":\"object\"}", "array", "an array against object names array");
     assert(str_eq(_t_val("[1, 2, 3]", "{\"type\":\"object\"}"),
-    str_from("Expected top-level type \"object\", got \"array\"")) == 1,
-    "with the oracle's exact wording and quoting");
+        str_from("Expected top-level type \"object\", got \"array\"")) == 1,
+      "with the oracle's exact wording and quoting");
 
     # --- array_type_valid ---
     _t_valid("[1, 2, 3]", "{\"type\":\"array\"}", "an array against array passes");
@@ -91,39 +91,39 @@ fn main() {
 
     # --- required_on_non_object_fails ---
     _t_invalid("\"just a string\"", "{\"type\":\"string\",\"required\":[\"field\"]}",
-    "not a JSON object", "required against a non-object is refused");
+      "not a JSON object", "required against a non-object is refused");
     assert(str_eq(_t_val("\"just a string\"", "{\"type\":\"string\",\"required\":[\"field\"]}"),
-    str_from("Schema requires fields but response is not a JSON object")) == 1,
-    "with the oracle's exact wording");
+        str_from("Schema requires fields but response is not a JSON object")) == 1,
+      "with the oracle's exact wording");
 
     # ...but an EMPTY required list does not, because the oracle guards on
     # `!required.is_empty()`. One character of difference in the port.
     _t_valid("\"just a string\"", "{\"type\":\"string\",\"required\":[]}",
-    "an empty required list still admits a non-object");
+      "an empty required list still admits a non-object");
     _t_valid("42", "{\"required\":[]}", "likewise a number");
 
     # --- the type check runs before the required check ---
     # Both are wrong here; the oracle reports the type, because step 2 precedes
     # step 3 and returns early.
     assert(str_contains(_t_val("[1]", "{\"type\":\"object\",\"required\":[\"x\"]}"),
-    str_from("Expected top-level type")) == 1,
-    "with both checks failing the type error wins, matching the oracle's order");
+        str_from("Expected top-level type")) == 1,
+      "with both checks failing the type error wins, matching the oracle's order");
 
     # --- json_type_name covers every serde variant ---
     assert(str_eq_cstr(str_from(agnosai_json_type_name(_t_json("null"))), "null") == 1,
-    "null names null");
+      "null names null");
     assert(str_eq_cstr(str_from(agnosai_json_type_name(_t_json("true"))), "boolean") == 1,
-    "a bool names boolean, not bool");
+      "a bool names boolean, not bool");
     assert(str_eq_cstr(str_from(agnosai_json_type_name(_t_json("42"))), "number") == 1,
-    "an integer names number");
+      "an integer names number");
     assert(str_eq_cstr(str_from(agnosai_json_type_name(_t_json("1.5"))), "number") == 1,
-    "a float names number too — serde does not distinguish them here");
+      "a float names number too — serde does not distinguish them here");
     assert(str_eq_cstr(str_from(agnosai_json_type_name(_t_json("\"s\""))), "string") == 1,
-    "a string names string");
+      "a string names string");
     assert(str_eq_cstr(str_from(agnosai_json_type_name(_t_json("[]"))), "array") == 1,
-    "an array names array");
+      "an array names array");
     assert(str_eq_cstr(str_from(agnosai_json_type_name(_t_json("{}"))), "object") == 1,
-    "an object names object");
+      "an object names object");
 
     _t_valid("true", "{\"type\":\"boolean\"}", "a boolean schema matches a bool");
     _t_valid("1.5", "{\"type\":\"number\"}", "a number schema matches a float");
@@ -132,7 +132,7 @@ fn main() {
 
     # the type match is case-sensitive, as `!=` is in the oracle
     _t_invalid("{}", "{\"type\":\"Object\"}", "Expected top-level type",
-    "the type comparison is case-sensitive");
+      "the type comparison is case-sensitive");
 
     # a non-string `type` is ignored — the oracle's `.and_then(as_str)`
     _t_valid("{}", "{\"type\":42}", "a non-string type is ignored, not an error");
@@ -140,25 +140,25 @@ fn main() {
     _t_valid("{}", "{\"required\":\"name\"}", "a non-array required is ignored");
     # a non-string entry INSIDE required is skipped, not reported missing
     _t_valid("{\"a\":1}", "{\"required\":[\"a\",7]}",
-    "a non-string entry in required is skipped, matching filter_map(as_str)");
+      "a non-string entry in required is skipped, matching filter_map(as_str)");
 
     # --- extract_json_from_markdown_fence ---
     var out = 0;
     var text1 = str_from("Here is the result:\n```json\n{\"key\": \"value\"}\n```\nDone.");
     assert_eq(agnosai_extract_and_validate(text1, _t_json("{\"type\":\"object\",\"required\":[\"key\"]}"),
-    &out), 0, "a fenced object validates");
+        &out), 0, "a fenced object validates");
     assert(str_eq(out, str_from("{\"key\": \"value\"}")) == 1,
-    "and the extracted text is the block, trimmed");
+      "and the extracted text is the block, trimmed");
 
     # --- extract_json_from_plain_fence ---
     var out2 = 0;
     assert_eq(agnosai_extract_and_validate(str_from("Result:\n```\n{\"a\": 1}\n```"),
-    _t_json("{\"type\":\"object\"}"), &out2), 0, "a plain fence works too");
+        _t_json("{\"type\":\"object\"}"), &out2), 0, "a plain fence works too");
 
     # --- no_fence_falls_back_to_raw ---
     var out3 = 0;
     assert_eq(agnosai_extract_and_validate(str_from("{\"valid\": true}"),
-    _t_json("{\"type\":\"object\"}"), &out3), 0, "raw JSON needs no fence");
+        _t_json("{\"type\":\"object\"}"), &out3), 0, "raw JSON needs no fence");
     assert(str_eq(out3, str_from("{\"valid\": true}")) == 1, "and comes back unchanged");
 
     # --- fence_with_backticks_in_json_value ---
@@ -167,22 +167,22 @@ fn main() {
     var out4 = 0;
     var text4 = str_from("Result:\n```json\n{\"code\": \"use ```markdown``` here\"}\n```\nDone.");
     assert_eq(agnosai_extract_and_validate(text4,
-    _t_json("{\"type\":\"object\",\"required\":[\"code\"]}"), &out4), 0,
-    "triple backticks inside a JSON string do not break extraction");
+        _t_json("{\"type\":\"object\",\"required\":[\"code\"]}"), &out4), 0,
+      "triple backticks inside a JSON string do not break extraction");
     assert(str_contains(out4, str_from("markdown")) == 1, "and the value survives intact");
 
     # --- the extractor's control flow, which the oracle's tests do not reach ---
     assert_eq(agnosai_extract_json_block(str_from("no fences here")), 0, "no fence yields 0");
     assert(str_eq(agnosai_extract_json_block(str_from("a\n```json\n{\"x\":1}\n```\nb")),
-    str_from("{\"x\":1}")) == 1, "a json fence extracts its block");
+        str_from("{\"x\":1}")) == 1, "a json fence extracts its block");
     assert(str_eq(agnosai_extract_json_block(str_from("a\n```\n{\"x\":1}\n```\nb")),
-    str_from("{\"x\":1}")) == 1, "a bare fence extracts its block");
+        str_from("{\"x\":1}")) == 1, "a bare fence extracts its block");
 
     # an UNTERMINATED first marker abandons the whole search — the oracle's `?`
     # returns from extract_json_block rather than trying the next marker, so the
     # well-formed bare fence below is NOT reached
     assert_eq(agnosai_extract_json_block(str_from("```json\nunterminated and then\n{\"x\":1}")), 0,
-    "an unterminated fence yields 0 rather than falling through to a later marker");
+      "an unterminated fence yields 0 rather than falling through to a later marker");
 
     # An EMPTY block does fall through to the next marker — the one case where
     # the oracle's loop actually iterates. The result is deliberately quirky and
@@ -195,16 +195,16 @@ fn main() {
     #   the *closing* fence of that empty block at index 9, so its remainder
     #   opens with the next "```" and the extracted block carries a fence.
     assert(str_eq(agnosai_extract_json_block(str_from("```json\n\n```\n```\n{\"y\":2}\n```")),
-    str_from("```\n{\"y\":2}")) == 1,
-    "an empty first block falls through, and the re-scan can capture a fence with it");
+        str_from("```\n{\"y\":2}")) == 1,
+      "an empty first block falls through, and the re-scan can capture a fence with it");
 
     # the block is trimmed
     assert(str_eq(agnosai_extract_json_block(str_from("```json\n   {\"x\":1}   \n```")),
-    str_from("{\"x\":1}")) == 1, "surrounding whitespace is trimmed off the block");
+        str_from("{\"x\":1}")) == 1, "surrounding whitespace is trimmed off the block");
 
     # CRLF fences
     assert(str_eq(agnosai_extract_json_block(str_from("```json\r\n{\"x\":1}\r\n```")),
-    str_from("{\"x\":1}")) == 1, "a CRLF fence works and the \\r is trimmed away");
+        str_from("{\"x\":1}")) == 1, "a CRLF fence works and the \\r is trimmed away");
 
     # --- the fenced error is preferred over the raw error ---
     # The oracle returns the FENCED block's failure even when it also fails,
@@ -212,12 +212,12 @@ fn main() {
     var out5 = 0;
     var text5 = str_from("Sure!\n```json\n{\"wrong\": 1}\n```");
     var r5 = agnosai_extract_and_validate(text5,
-    _t_json("{\"type\":\"object\",\"required\":[\"right\"]}"), &out5);
+      _t_json("{\"type\":\"object\",\"required\":[\"right\"]}"), &out5);
     assert(r5 != 0, "a fenced block that fails validation still fails");
     assert(str_contains(r5, str_from("right")) == 1,
-    "and the error is the FENCED block's, not the surrounding prose's parse failure");
+      "and the error is the FENCED block's, not the surrounding prose's parse failure");
     assert(str_eq(out5, str_from("{\"wrong\": 1}")) == 1,
-    "with the extracted block returned as the text that was checked");
+      "with the extracted block returned as the text that was checked");
 
     # with no fence at all, the raw error comes back with the raw text
     var out6 = 0;
@@ -227,7 +227,7 @@ fn main() {
 
     # --- build_retry_prompt_includes_error ---
     var prompt = agnosai_build_retry_prompt(str_from("Summarize this"), str_from("not json"),
-    str_from("not valid JSON"), _t_json("{\"type\":\"object\"}"));
+      str_from("not valid JSON"), _t_json("{\"type\":\"object\"}"));
     assert(str_contains(prompt, str_from("Summarize this")) == 1, "the prompt carries the original");
     assert(str_contains(prompt, str_from("not valid JSON")) == 1, "and the error");
     assert(str_contains(prompt, str_from("not json")) == 1, "and the failed output");
@@ -235,27 +235,27 @@ fn main() {
 
     # the layout is the oracle's template, not merely a bag of the right pieces
     assert(str_starts_with(prompt, str_from("Summarize this\n\nYour previous response failed")) == 1,
-    "the prompt opens with the original followed by the failure line");
+      "the prompt opens with the original followed by the failure line");
     assert(str_contains(prompt, str_from("Error: not valid JSON\nYour previous response was:\n```\n"))
-    == 1, "the error and the fenced failed output follow in the oracle's order");
+      == 1, "the error and the fenced failed output follow in the oracle's order");
     assert(str_contains(prompt,
-    str_from("Please respond with ONLY valid JSON matching this schema:\n```json\n")) == 1,
-    "and the schema fence closes it");
+        str_from("Please respond with ONLY valid JSON matching this schema:\n```json\n")) == 1,
+      "and the schema fence closes it");
     assert(str_ends_with(prompt, str_from("\n```")) == 1, "the prompt ends with the closing fence");
     assert(str_contains(prompt, str_from("{\"type\":\"object\"}")) == 1,
-    "the schema is rendered compactly, as serde_json's Display does");
+      "the schema is rendered compactly, as serde_json's Display does");
 
     # --- validate_value directly, without a parse ---
     assert_eq(agnosai_validate_value(_t_json("{\"a\":1}"), _t_json("{\"required\":[\"a\"]}")), 0,
-    "validate_value takes an already-parsed value");
+      "validate_value takes an already-parsed value");
     assert(agnosai_validate_value(_t_json("{}"), _t_json("{\"required\":[\"a\"]}")) != 0,
-    "and reports the same failures");
+      "and reports the same failures");
     assert_eq(agnosai_validate_value(_t_json("{}"), 0), 0,
-    "a null schema constrains nothing rather than crashing");
+      "a null schema constrains nothing rather than crashing");
 
     # --- the retry log is guarded on level, not on content ---
     assert_eq(agnosai_validation_log_retry(str_from("task-1"), 1, str_from("boom")), 0,
-    "logging a retry is side-effect only and returns 0");
+      "logging a retry is side-effect only and returns 0");
 
     return assert_summary();
 }

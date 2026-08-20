@@ -53,26 +53,26 @@ fn _t_isolation_levels(): i64 {
 # covers three of these four.
 fn _t_isolation_wire(): i64 {
     assert(str_eq_cstr(agnosai_isolation_level_wire(AGNOSAI_ISOLATION_NONE), "None") == 1,
-    "None serialises as its variant name, not 0");
+      "None serialises as its variant name, not 0");
     assert(str_eq_cstr(agnosai_isolation_level_wire(AGNOSAI_ISOLATION_WASM), "Wasm") == 1, "Wasm");
     assert(str_eq_cstr(agnosai_isolation_level_wire(AGNOSAI_ISOLATION_PROCESS), "Process") == 1,
-    "Process");
+      "Process");
     assert(str_eq_cstr(agnosai_isolation_level_wire(AGNOSAI_ISOLATION_OCI), "Oci") == 1, "Oci");
 
     assert(agnosai_isolation_level_from_wire(str_from("None")) == AGNOSAI_ISOLATION_NONE,
-    "and each parses back");
+      "and each parses back");
     assert(agnosai_isolation_level_from_wire(str_from("Wasm")) == AGNOSAI_ISOLATION_WASM, "Wasm");
     assert(agnosai_isolation_level_from_wire(str_from("Process")) == AGNOSAI_ISOLATION_PROCESS,
-    "Process");
+      "Process");
     assert(agnosai_isolation_level_from_wire(str_from("Oci")) == AGNOSAI_ISOLATION_OCI, "Oci");
 
     # -1, not 0 — 0 is `None`, a real level.
     assert(agnosai_isolation_level_from_wire(str_from("oci")) == 0 - 1,
-    "matching is case-sensitive, as serde's is");
+      "matching is case-sensitive, as serde's is");
     assert(agnosai_isolation_level_from_wire(str_from("Container")) == 0 - 1, "an unknown name is -1");
     assert(agnosai_isolation_level_from_wire(str_from("")) == 0 - 1, "and so is empty");
     assert(agnosai_isolation_level_from_wire(str_from("2")) == 0 - 1,
-    "the DISCRIMINANT is not accepted as a spelling — the wire is names");
+      "the DISCRIMINANT is not accepted as a spelling — the wire is names");
     return 0;
 }
 
@@ -84,7 +84,7 @@ fn _t_named_policies(): i64 {
     var n = agnosai_sandbox_policy_native();
     assert(agnosai_sandbox_policy_min_isolation(n) == AGNOSAI_ISOLATION_NONE, "native: None");
     assert(agnosai_sandbox_policy_effective_isolation(n) == AGNOSAI_ISOLATION_NONE,
-    "native stays None — nothing upgrades it");
+      "native stays None — nothing upgrades it");
     assert(agnosai_sandbox_policy_max_duration_secs(n) == 300, "native: 300 s");
     assert(agnosai_sandbox_policy_max_memory_bytes(n) == 0, "native: no memory cap");
 
@@ -93,7 +93,7 @@ fn _t_named_policies(): i64 {
     assert(agnosai_sandbox_policy_needs_filesystem(w) == 0, "wasm: no filesystem");
     assert(agnosai_sandbox_policy_needs_network(w) == 0, "wasm: no network");
     assert(agnosai_sandbox_policy_effective_isolation(w) == AGNOSAI_ISOLATION_WASM,
-    "wasm stays Wasm");
+      "wasm stays Wasm");
     assert(agnosai_sandbox_policy_max_duration_secs(w) == 30, "wasm: 30 s");
     assert(agnosai_sandbox_policy_max_memory_bytes(w) == 67108864, "wasm: 64 MiB");
 
@@ -105,10 +105,10 @@ fn _t_named_policies(): i64 {
     # `min_isolation` to `None` and all 90 assertions still passed. `native()`
     # and `wasm()` assert theirs directly; `process()` was the one that did not.
     assert(agnosai_sandbox_policy_min_isolation(p) == AGNOSAI_ISOLATION_PROCESS,
-    "process: the STATED minimum is Process, not merely the derived one");
+      "process: the STATED minimum is Process, not merely the derived one");
     assert(agnosai_sandbox_policy_needs_network(p) == 0, "process: no network");
     assert(agnosai_sandbox_policy_effective_isolation(p) == AGNOSAI_ISOLATION_PROCESS,
-    "process: Process");
+      "process: Process");
     assert(agnosai_sandbox_policy_max_duration_secs(p) == 60, "process: 60 s");
     assert(agnosai_sandbox_policy_max_memory_bytes(p) == 268435456, "process: 256 MiB");
 
@@ -126,9 +126,9 @@ fn _t_named_policies(): i64 {
 fn _t_default_is_wasm(): i64 {
     var d = agnosai_sandbox_policy_default();
     assert(agnosai_sandbox_policy_min_isolation(d) == AGNOSAI_ISOLATION_WASM,
-    "the default policy is wasm — an unconfigured tool is ISOLATED, not native");
+      "the default policy is wasm — an unconfigured tool is ISOLATED, not native");
     assert(agnosai_sandbox_policy_min_isolation(d) != AGNOSAI_ISOLATION_NONE,
-    "...explicitly not None");
+      "...explicitly not None");
     return 0;
 }
 
@@ -139,32 +139,32 @@ fn _t_default_is_wasm(): i64 {
 fn _t_effective_isolation(): i64 {
     var net = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_WASM, 0, 1, 30, 0);
     assert(agnosai_sandbox_policy_effective_isolation(net) == AGNOSAI_ISOLATION_OCI,
-    "network upgrades Wasm to Oci");
+      "network upgrades Wasm to Oci");
 
     var fs = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_WASM, 1, 0, 30, 0);
     assert(agnosai_sandbox_policy_effective_isolation(fs) == AGNOSAI_ISOLATION_PROCESS,
-    "filesystem upgrades Wasm to Process");
+      "filesystem upgrades Wasm to Process");
 
     var hi = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_OCI, 0, 0, 30, 0);
     assert(agnosai_sandbox_policy_effective_isolation(hi) == AGNOSAI_ISOLATION_OCI,
-    "a policy already at Oci is never downgraded");
+      "a policy already at Oci is never downgraded");
 
     # Not an oracle case. Both flags set is where an `if`/`if` port that ordered
     # the checks the other way would answer Process and quietly weaken the
     # sandbox for exactly the tool asking for the most access.
     var both = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_WASM, 1, 1, 30, 0);
     assert(agnosai_sandbox_policy_effective_isolation(both) == AGNOSAI_ISOLATION_OCI,
-    "filesystem AND network is Oci — network wins, it does not settle for Process");
+      "filesystem AND network is Oci — network wins, it does not settle for Process");
 
     # None + filesystem crosses two levels in one upgrade.
     var np = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_NONE, 1, 0, 30, 0);
     assert(agnosai_sandbox_policy_effective_isolation(np) == AGNOSAI_ISOLATION_PROCESS,
-    "None + filesystem lands on Process, not one level up");
+      "None + filesystem lands on Process, not one level up");
 
     # Process + network still upgrades — the guard is `<`, not `==`.
     var pn = agnosai_sandbox_policy_new(AGNOSAI_ISOLATION_PROCESS, 0, 1, 30, 0);
     assert(agnosai_sandbox_policy_effective_isolation(pn) == AGNOSAI_ISOLATION_OCI,
-    "Process + network upgrades to Oci");
+      "Process + network upgrades to Oci");
     return 0;
 }
 
@@ -179,7 +179,7 @@ fn _t_wire_roundtrip(): i64 {
     # The level is a STRING on the wire. This is the assertion that catches a
     # port emitting the discriminant.
     assert(str_contains_cstr(j, "\"min_isolation\":\"Oci\"") == 1,
-    "min_isolation is the variant name, quoted — not 3");
+      "min_isolation is the variant name, quoted — not 3");
     assert(str_contains_cstr(j, "\"needs_network\":true") == 1, "bools are JSON bools, not 0/1");
     assert(str_contains_cstr(j, "\"max_memory_bytes\":536870912") == 1, "and numbers are numbers");
 
@@ -191,13 +191,13 @@ fn _t_wire_roundtrip(): i64 {
     # declaration order — which is the order serde emits"). A claim nothing can
     # observe is a claim that drifts.
     assert(str_eq_cstr(j,
-    "{\"min_isolation\":\"Oci\",\"needs_filesystem\":true,\"needs_network\":true,\"max_duration_secs\":120,\"max_memory_bytes\":536870912}")
-    == 1, "the wire document is serde's declaration order, end to end");
+        "{\"min_isolation\":\"Oci\",\"needs_filesystem\":true,\"needs_network\":true,\"max_duration_secs\":120,\"max_memory_bytes\":536870912}")
+      == 1, "the wire document is serde's declaration order, end to end");
 
     var back = agnosai_sandbox_policy_from_json(j);
     assert(back != 0, "and parses back");
     assert(agnosai_sandbox_policy_min_isolation(back) == AGNOSAI_ISOLATION_OCI,
-    "round trip preserves the level");
+      "round trip preserves the level");
     assert(agnosai_sandbox_policy_needs_network(back) == 1, "...the flags");
     assert(agnosai_sandbox_policy_needs_filesystem(back) == 1, "...both of them");
     assert(agnosai_sandbox_policy_max_duration_secs(back) == 120, "...the duration");
@@ -234,25 +234,25 @@ fn _t_wire_roundtrip(): i64 {
     var fromv = agnosai_sandbox_policy_from_value(v);
     assert(fromv != 0, "a policy round-trips through the VALUE form without going via text");
     assert(agnosai_sandbox_policy_min_isolation(fromv) == AGNOSAI_ISOLATION_OCI,
-    "...preserving the level");
+      "...preserving the level");
     assert(agnosai_sandbox_policy_from_value(0) == 0, "a null value is 0");
 
     # Every named policy survives a round trip, not just the container one.
     var w = agnosai_sandbox_policy_from_json(agnosai_sandbox_policy_to_json(
-    agnosai_sandbox_policy_wasm()));
+        agnosai_sandbox_policy_wasm()));
     assert(agnosai_sandbox_policy_min_isolation(w) == AGNOSAI_ISOLATION_WASM, "wasm round-trips");
     var n = agnosai_sandbox_policy_from_json(agnosai_sandbox_policy_to_json(
-    agnosai_sandbox_policy_native()));
+        agnosai_sandbox_policy_native()));
     assert(agnosai_sandbox_policy_min_isolation(n) == AGNOSAI_ISOLATION_NONE, "native round-trips");
 
     # `process()` was the one named policy never serialised in a test, so its
     # wire spelling was unpinned in both directions.
     var pj = agnosai_sandbox_policy_to_json(agnosai_sandbox_policy_process());
     assert(str_contains_cstr(pj, "\"min_isolation\":\"Process\"") == 1,
-    "process spells its level `Process` on the wire");
+      "process spells its level `Process` on the wire");
     var pr = agnosai_sandbox_policy_from_json(pj);
     assert(agnosai_sandbox_policy_min_isolation(pr) == AGNOSAI_ISOLATION_PROCESS,
-    "...and reads back as Process");
+      "...and reads back as Process");
     return 0;
 }
 
@@ -268,15 +268,15 @@ fn _t_wire_malformed(): i64 {
     var e = agnosai_sandbox_policy_from_json(str_from("{}"));
     assert(e != 0, "an empty object parses");
     assert(agnosai_sandbox_policy_min_isolation(e) == AGNOSAI_ISOLATION_WASM,
-    "...to the wasm default, NOT to None — a partial document cannot weaken the sandbox");
+      "...to the wasm default, NOT to None — a partial document cannot weaken the sandbox");
     assert(agnosai_sandbox_policy_max_duration_secs(e) == 30, "and the default duration");
 
     # A field of the wrong type is ignored rather than read through the wrong
     # tag, so it also falls back to the default.
     var bad = agnosai_sandbox_policy_from_json(str_from(
-    "{\"min_isolation\":7,\"needs_network\":\"yes\",\"max_duration_secs\":\"soon\",\"max_memory_bytes\":\"lots\"}"));
+        "{\"min_isolation\":7,\"needs_network\":\"yes\",\"max_duration_secs\":\"soon\",\"max_memory_bytes\":\"lots\"}"));
     assert(agnosai_sandbox_policy_min_isolation(bad) == AGNOSAI_ISOLATION_WASM,
-    "a numeric min_isolation is not a valid spelling — default");
+      "a numeric min_isolation is not a valid spelling — default");
     assert(agnosai_sandbox_policy_needs_network(bad) == 0, "a string bool is ignored");
     assert(agnosai_sandbox_policy_max_duration_secs(bad) == 30, "a string duration is ignored");
     # The wasm default's memory cap is 64 MiB and non-zero, so this one can
@@ -285,27 +285,27 @@ fn _t_wire_malformed(): i64 {
     # is itself tag-safe and the default is 0, so dropping it is an equivalent
     # mutant no input can kill. It is left in place as documentation of intent.)
     assert(agnosai_sandbox_policy_max_memory_bytes(bad) == 67108864,
-    "a string memory cap is ignored — reading it through the wrong tag would answer 0");
+      "a string memory cap is ignored — reading it through the wrong tag would answer 0");
 
     # **Out of DOMAIN, not merely out of type.** The oracle's fields are `u64`
     # and `usize`, so serde refuses a negative outright; the port read it
     # signed, and `-1` reached kavach as `timeout_ms: -1000` — where a deadline
     # is armed only `if (timeout_ms > 0)`, so a negative duration armed none.
     var neg = agnosai_sandbox_policy_from_json(str_from(
-    "{\"max_duration_secs\":-1,\"max_memory_bytes\":-1}"));
+        "{\"max_duration_secs\":-1,\"max_memory_bytes\":-1}"));
     assert(neg != 0, "the document still parses");
     assert(agnosai_sandbox_policy_max_duration_secs(neg) == 30,
-    "a NEGATIVE duration falls back to the default — it does not become 'no deadline'");
+      "a NEGATIVE duration falls back to the default — it does not become 'no deadline'");
     assert(agnosai_sandbox_policy_max_memory_bytes(neg) == 67108864,
-    "...and so does a negative memory cap");
+      "...and so does a negative memory cap");
     assert(agnosai_sandbox_policy_max_duration_secs(
-    agnosai_sandbox_policy_from_json(str_from("{\"max_duration_secs\":0}"))) == 0,
-    "zero is still accepted — it means 'unset', which the manager reads and bounds");
+        agnosai_sandbox_policy_from_json(str_from("{\"max_duration_secs\":0}"))) == 0,
+      "zero is still accepted — it means 'unset', which the manager reads and bounds");
 
     # An unknown LEVEL NAME is likewise refused rather than silently accepted.
     var unk = agnosai_sandbox_policy_from_json(str_from("{\"min_isolation\":\"Nitro\"}"));
     assert(agnosai_sandbox_policy_min_isolation(unk) == AGNOSAI_ISOLATION_WASM,
-    "an unrecognised level name falls back to the default rather than to None");
+      "an unrecognised level name falls back to the default rather than to None");
     return 0;
 }
 
@@ -318,7 +318,7 @@ fn _t_sanitized_env(): i64 {
     assert(agnosai_is_sanitized_env_var(str_from("LD_PRELOAD")) == 1, "LD_PRELOAD");
     assert(agnosai_is_sanitized_env_var(str_from("LD_LIBRARY_PATH")) == 1, "LD_LIBRARY_PATH");
     assert(agnosai_is_sanitized_env_var(str_from("DYLD_INSERT_LIBRARIES")) == 1,
-    "DYLD_INSERT_LIBRARIES — stripped on Linux too, deliberately");
+      "DYLD_INSERT_LIBRARIES — stripped on Linux too, deliberately");
     assert(agnosai_is_sanitized_env_var(str_from("DYLD_LIBRARY_PATH")) == 1, "DYLD_LIBRARY_PATH");
 
     assert(agnosai_is_sanitized_env_var(str_from("PATH")) == 0, "PATH is not stripped");
@@ -328,7 +328,7 @@ fn _t_sanitized_env(): i64 {
     # Case-sensitive, matching the loader's own matching. A case-insensitive
     # test would imply a protection the loader does not provide.
     assert(agnosai_is_sanitized_env_var(str_from("ld_preload")) == 0,
-    "matching is case-sensitive, as the dynamic loader's is");
+      "matching is case-sensitive, as the dynamic loader's is");
 
     # A prefix or a superstring is not a match — `LD_PRELOAD_EXTRA` is not the
     # variable the loader reads.
@@ -337,7 +337,7 @@ fn _t_sanitized_env(): i64 {
 
     # The list is walkable and terminates.
     assert(agnosai_sanitized_env_var(AGNOSAI_SANITIZED_ENV_COUNT) == 0,
-    "walking past the end answers 0");
+      "walking past the end answers 0");
     return 0;
 }
 

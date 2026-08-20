@@ -61,88 +61,88 @@ fn main(): i64 {
 
     # Digits and punctuation compare exactly.
     assert_eq(agnosai_str_eq_ci(str_from("gpt-4"), str_from("GPT-4")), 1,
-    "letters fold, the hyphen and digit do not move");
+      "letters fold, the hyphen and digit do not move");
     assert_eq(agnosai_str_eq_ci(str_from("gpt-4"), str_from("gpt-5")), 0, "and digits differ");
 
     # Bytes above 0x7F are compared as-is, not folded.
     assert_eq(agnosai_str_eq_ci(_t_bytes(0xC3, 0xA9, 65), _t_bytes(0xC3, 0xA9, 97)), 1,
-    "a non-ASCII prefix passes through and the ASCII tail still folds");
+      "a non-ASCII prefix passes through and the ASCII tail still folds");
     assert_eq(agnosai_str_eq_ci(_t_bytes(0xC3, 0xA9, 65), _t_bytes(0xC3, 0xA8, 65)), 0,
-    "and two different non-ASCII bytes are not equal");
+      "and two different non-ASCII bytes are not equal");
 
     # --- agnosai_str_contains_ci ------------------------------------------
     assert_eq(agnosai_str_contains_ci(str_from("hello world"), str_from("world")), 1,
-    "a needle at the end is found");
+      "a needle at the end is found");
     assert_eq(agnosai_str_contains_ci(str_from("hello world"), str_from("hello")), 1,
-    "at the start");
+      "at the start");
     assert_eq(agnosai_str_contains_ci(str_from("hello world"), str_from("lo wo")), 1,
-    "and across the middle");
+      "and across the middle");
     assert_eq(agnosai_str_contains_ci(str_from("Hello World"), str_from("HELLO")), 1,
-    "case-insensitively");
+      "case-insensitively");
     assert_eq(agnosai_str_contains_ci(str_from("hello"), str_from("HELLO")), 1,
-    "in both directions of case");
+      "in both directions of case");
     assert_eq(agnosai_str_contains_ci(str_from("hello"), str_from("xyz")), 0,
-    "an absent needle is not found");
+      "an absent needle is not found");
 
     # ⚠ An EMPTY needle matches anything — Rust's `"abc".contains("")` is true,
     # and `assembler` depends on it: a member with no role matches everything.
     assert_eq(agnosai_str_contains_ci(str_from("hello"), str_from("")), 1,
-    "an empty needle is contained in anything");
+      "an empty needle is contained in anything");
     assert_eq(agnosai_str_contains_ci(str_from(""), str_from("")), 1,
-    "including in an empty haystack");
+      "including in an empty haystack");
     assert_eq(agnosai_str_contains_ci(str_from(""), str_from("a")), 0,
-    "but an empty haystack contains nothing else");
+      "but an empty haystack contains nothing else");
 
     # A needle longer than the haystack cannot match, and must not read past it.
     assert_eq(agnosai_str_contains_ci(str_from("ab"), str_from("abc")), 0,
-    "a needle longer than the haystack is not found");
+      "a needle longer than the haystack is not found");
 
     # Exact-length match — the `i <= last` bound, where `last` is 0.
     assert_eq(agnosai_str_contains_ci(str_from("abc"), str_from("abc")), 1,
-    "a needle exactly as long as the haystack is found");
+      "a needle exactly as long as the haystack is found");
     assert_eq(agnosai_str_contains_ci(str_from("abc"), str_from("abd")), 0,
-    "unless it differs");
+      "unless it differs");
 
     # ⚠ A FALSE START must not end the scan. The first byte matches at offset 0
     # and the rest does not; the real match is later. A scan that abandoned on
     # the first failed offset — easy to write with the hoisted guard — would
     # answer 0 here and pass every other assertion above.
     assert_eq(agnosai_str_contains_ci(str_from("axxabc"), str_from("abc")), 1,
-    "a failed match at offset 0 does not stop the scan");
+      "a failed match at offset 0 does not stop the scan");
     assert_eq(agnosai_str_contains_ci(str_from("aaab"), str_from("aab")), 1,
-    "nor does a run of near-misses");
+      "nor does a run of near-misses");
     assert_eq(agnosai_str_contains_ci(str_from("ababab"), str_from("abab")), 1,
-    "and an overlapping repeat is found");
+      "and an overlapping repeat is found");
 
     # The last possible offset, where an off-by-one in `last` would miss it.
     assert_eq(agnosai_str_contains_ci(str_from("xxxabc"), str_from("abc")), 1,
-    "a needle ending exactly at the last byte is found");
+      "a needle ending exactly at the last byte is found");
 
     # --- agnosai_str_contains_ci_cstr -------------------------------------
     # Same contract, cstring needle — the variant that avoids allocating a Str
     # header inside a per-candidate loop.
     assert_eq(agnosai_str_contains_ci_cstr(str_from("hello world"), "world"), 1,
-    "the cstr variant finds a needle");
+      "the cstr variant finds a needle");
     assert_eq(agnosai_str_contains_ci_cstr(str_from("Hello World"), "HELLO"), 1,
-    "case-insensitively");
+      "case-insensitively");
     assert_eq(agnosai_str_contains_ci_cstr(str_from("hello"), "xyz"), 0,
-    "and reports an absent one");
+      "and reports an absent one");
     assert_eq(agnosai_str_contains_ci_cstr(str_from("hello"), ""), 1,
-    "with the same empty-needle rule");
+      "with the same empty-needle rule");
     assert_eq(agnosai_str_contains_ci_cstr(str_from("ab"), "abc"), 0,
-    "the same over-long rule");
+      "the same over-long rule");
     assert_eq(agnosai_str_contains_ci_cstr(str_from("axxabc"), "abc"), 1,
-    "and the same false-start behaviour");
+      "and the same false-start behaviour");
     assert_eq(agnosai_str_contains_ci_cstr(str_from("["), "{"), 0,
-    "and the same ASCII-only fold");
+      "and the same ASCII-only fold");
 
     # ⚠ The two variants must agree. They are separate implementations, so a fix
     # applied to one and not the other is the failure mode worth pinning.
     assert_eq(agnosai_str_contains_ci(str_from("Model-GPT4-Turbo"), str_from("gpt4")),
-    agnosai_str_contains_ci_cstr(str_from("Model-GPT4-Turbo"), "gpt4"),
-    "Str and cstr needles agree on a real model name");
+      agnosai_str_contains_ci_cstr(str_from("Model-GPT4-Turbo"), "gpt4"),
+      "Str and cstr needles agree on a real model name");
     assert_eq(agnosai_str_contains_ci(str_from("abc"), str_from("")),
-    agnosai_str_contains_ci_cstr(str_from("abc"), ""), "and on the empty needle");
+      agnosai_str_contains_ci_cstr(str_from("abc"), ""), "and on the empty needle");
 
     return assert_summary();
 }

@@ -57,7 +57,7 @@ fn _t_oci_config(): i64 {
 
     # The default that matters most: no network unless asked.
     assert(agnosai_oci_config_allow_network(c) == 0,
-    "networking is OFF by default — the container gets --network=none");
+      "networking is OFF by default — the container gets --network=none");
     assert(vec_len(agnosai_oci_config_env(c)) == 0, "no env pairs by default");
     assert(vec_len(agnosai_oci_config_volumes(c)) == 0, "no volumes by default");
 
@@ -78,15 +78,15 @@ fn _t_oci_config(): i64 {
     agnosai_oci_config_set_memory_limit(c, str_from("1g"));
     assert(str_eq_cstr(agnosai_oci_config_memory_limit(c), "1g") == 1, "so is the memory limit");
     assert(_t_argv_has(agnosai_oci_build_argv(c, 0), "1g") == 1,
-    "...and the new limit reaches the argv, not just the struct");
+      "...and the new limit reaches the argv, not just the struct");
 
     # `set_image` does NOT validate — matching the oracle, where the field is
     # public and `OciSandbox::new` is the gate. The gate must still refuse it.
     agnosai_oci_config_set_image(c, str_from("--privileged"));
     assert(str_eq_cstr(agnosai_oci_config_image(c), "--privileged") == 1,
-    "the setter stores whatever it is given, as the oracle's public field does");
+      "the setter stores whatever it is given, as the oracle's public field does");
     assert(agnosai_oci_sandbox_new(c) == 0,
-    "...and the CONSTRUCTOR is what refuses it — the gate is not bypassable by setting after");
+      "...and the CONSTRUCTOR is what refuses it — the gate is not bypassable by setting after");
     return 0;
 }
 
@@ -98,22 +98,22 @@ fn _t_oci_accepts_valid_images(): i64 {
     assert(agnosai_oci_validate_image_ref(str_from("alpine:latest")) == 1, "name:tag");
     assert(agnosai_oci_validate_image_ref(str_from("ubuntu:22.04")) == 1, "a dotted tag");
     assert(agnosai_oci_validate_image_ref(
-    str_from("registry.example.com/myapp:v1.2.3")) == 1, "registry host + path + tag");
+        str_from("registry.example.com/myapp:v1.2.3")) == 1, "registry host + path + tag");
     assert(agnosai_oci_validate_image_ref(
-    str_from("ghcr.io/org/repo:sha-abc123")) == 1, "nested path with a hyphen");
+        str_from("ghcr.io/org/repo:sha-abc123")) == 1, "nested path with a hyphen");
     assert(agnosai_oci_validate_image_ref(
-    str_from("myimage@sha256:abcdef1234567890")) == 1, "a digest reference");
+        str_from("myimage@sha256:abcdef1234567890")) == 1, "a digest reference");
     # **Underscore is General Category `Pc`**, so no alphanumeric branch covers
     # it — it depends entirely on its own line in the allowed set, and it was
     # the only member of the oracle's literal `-_./:#@` with no covering test.
     # Deleting that line refuses `library/my_image` outright, a hard
     # availability failure with nothing to catch it.
     assert(agnosai_oci_validate_image_ref(str_from("library/my_image:v1")) == 1,
-    "an underscore is a legal reference character");
+      "an underscore is a legal reference character");
 
     # And each is constructible through the gate.
     assert(agnosai_oci_sandbox_new(agnosai_oci_config_new(str_from("alpine:latest"))) != 0,
-    "a valid image builds a sandbox");
+      "a valid image builds a sandbox");
     return 0;
 }
 
@@ -122,22 +122,22 @@ fn _t_oci_accepts_valid_images(): i64 {
 fn _t_oci_rejects_bad_images(): i64 {
     assert(agnosai_oci_validate_image_ref(str_from("")) == 0, "an empty image is refused");
     assert(agnosai_oci_sandbox_new(agnosai_oci_config_new(str_from(""))) == 0,
-    "...and the sandbox does not construct");
+      "...and the sandbox does not construct");
 
     # **Flag injection.** A leading `-` makes the image parse as an option.
     assert(agnosai_oci_validate_image_ref(str_from("--privileged")) == 0,
-    "--privileged is refused — it would be a FLAG, not an image");
+      "--privileged is refused — it would be a FLAG, not an image");
     assert(agnosai_oci_validate_image_ref(str_from("-v")) == 0, "so is a short flag");
     assert(agnosai_oci_validate_image_ref(str_from("-")) == 0, "and a bare hyphen");
     # ...but a hyphen anywhere else is legitimate.
     assert(agnosai_oci_validate_image_ref(str_from("my-image")) == 1,
-    "a hyphen that does not LEAD is fine — it is common in real names");
+      "a hyphen that does not LEAD is fine — it is common in real names");
 
     # **Argument/shell injection.** The oracle tests one; each is checked here,
     # because a validator that happened to allow just one of them is still
     # broken and the oracle's single case would not say which.
     assert(agnosai_oci_validate_image_ref(str_from("alpine; rm -rf /")) == 0,
-    "a semicolon is refused — the oracle's own case");
+      "a semicolon is refused — the oracle's own case");
     assert(agnosai_oci_validate_image_ref(str_from("alpine rm")) == 0, "so is a space");
     assert(agnosai_oci_validate_image_ref(str_from("alpine|cat")) == 0, "a pipe");
     assert(agnosai_oci_validate_image_ref(str_from("alpine&whoami")) == 0, "an ampersand");
@@ -153,7 +153,7 @@ fn _t_oci_rejects_bad_images(): i64 {
     # `#` IS allowed — `oci.rs:80` includes it, though the doc comment above it
     # does not list it. The code is the oracle.
     assert(agnosai_oci_validate_image_ref(str_from("alpine#1")) == 1,
-    "'#' is allowed — the oracle's character set includes it, its comment omits it");
+      "'#' is allowed — the oracle's character set includes it, its comment omits it");
     return 0;
 }
 
@@ -165,24 +165,24 @@ fn _t_oci_rejects_bad_images(): i64 {
 # registry resolves.
 fn _t_oci_unicode_matches_the_oracle(): i64 {
     assert(agnosai_oci_validate_image_ref(str_from("caf\xc3\xa9:latest")) == 1,
-    "a non-ASCII letter is ACCEPTED, as Rust's Unicode is_alphanumeric accepts it");
+      "a non-ASCII letter is ACCEPTED, as Rust's Unicode is_alphanumeric accepts it");
     assert(agnosai_oci_validate_image_ref(str_from("\xd0\xb0lpine")) == 1,
-    "...including a Cyrillic homograph — docker is what refuses to resolve it");
+      "...including a Cyrillic homograph — docker is what refuses to resolve it");
     assert(agnosai_oci_validate_image_ref(str_from("alpine")) == 1,
-    "and the ASCII spelling it imitates, obviously");
+      "and the ASCII spelling it imitates, obviously");
 
     # Non-letter non-ASCII is still refused: an emoji is category So, not
     # alphanumeric. This is the assertion that would fail if the port had
     # accepted "any byte >= 0x80" as a shortcut to looking Unicode-aware.
     assert(agnosai_oci_validate_image_ref(str_from("alpine\xf0\x9f\x92\xa9")) == 0,
-    "a non-ASCII SYMBOL is still refused — the test is the category, not the byte width");
+      "a non-ASCII SYMBOL is still refused — the test is the category, not the byte width");
     assert(agnosai_oci_validate_image_ref(str_from("alpine\xc2\xa0x")) == 0,
-    "...and so is a non-breaking space, which is Zs and would otherwise pass as 'not ASCII'");
+      "...and so is a non-breaking space, which is Zs and would otherwise pass as 'not ASCII'");
 
     # Malformed UTF-8 decodes to U+FFFD (So) and is refused. The oracle cannot
     # express this case at all — a Rust &str cannot hold invalid UTF-8.
     assert(agnosai_oci_validate_image_ref(str_from("alp\xffine")) == 0,
-    "malformed UTF-8 is refused, a case the oracle's &str cannot even represent");
+      "malformed UTF-8 is refused, a case the oracle's &str cannot even represent");
     return 0;
 }
 
@@ -206,17 +206,17 @@ fn _t_oci_argv(): i64 {
     assert(_t_argv_has(argv, "--memory") == 1, "--memory is passed");
     assert(_t_argv_has(argv, "256m") == 1, "...with the configured limit");
     assert(_t_argv_has(argv, "--network=none") == 1,
-    "--network=none by default — the flag whose absence silently grants a network");
+      "--network=none by default — the flag whose absence silently grants a network");
 
     # `--memory` must be immediately followed by its value, not merely present.
     assert(_t_argv_at(argv, "256m") == _t_argv_at(argv, "--memory") + 1,
-    "the memory limit follows its flag");
+      "the memory limit follows its flag");
     assert(_t_argv_at(argv, "/tmp") == _t_argv_at(argv, "--tmpfs") + 1,
-    "and /tmp follows --tmpfs");
+      "and /tmp follows --tmpfs");
 
     # The image is LAST of the runtime's own arguments.
     assert(str_eq_cstr(vec_get(argv, vec_len(argv) - 1), "alpine:latest") == 1,
-    "the image is last — everything after it would belong to the container");
+      "the image is last — everything after it would belong to the container");
     return 0;
 }
 
@@ -225,7 +225,7 @@ fn _t_oci_argv_options(): i64 {
     agnosai_oci_config_set_allow_network(c, 1);
     var argv = agnosai_oci_build_argv(c, 0);
     assert(_t_argv_has(argv, "--network=none") == 0,
-    "allowing the network REMOVES the flag rather than negating it");
+      "allowing the network REMOVES the flag rather than negating it");
 
     # env and volumes.
     var c2 = agnosai_oci_config_new(str_from("alpine"));
@@ -246,10 +246,10 @@ fn _t_oci_argv_options(): i64 {
     # had its adjacency pinned on the line above.
     assert(_t_argv_at(a2, "/h:/c") == _t_argv_at(a2, "-v") + 1, "the mount spec follows its flag");
     assert(_t_argv_at(a2, "-v") < _t_argv_at(a2, "alpine"),
-    "-v precedes the image — after it, docker reads the mount as container argv");
+      "-v precedes the image — after it, docker reads the mount as container argv");
     assert(_t_argv_at(a2, "--env") < _t_argv_at(a2, "alpine"), "...and so does --env");
     assert(_t_argv_at(a2, "alpine") == vec_len(a2) - 1,
-    "the image is last when there are no entrypoint arguments");
+      "the image is last when there are no entrypoint arguments");
 
     # Entrypoint args come after the image.
     var ep = vec_new();
@@ -257,7 +257,7 @@ fn _t_oci_argv_options(): i64 {
     vec_push(ep, str_from("-c"));
     var a3 = agnosai_oci_build_argv(agnosai_oci_config_new(str_from("alpine")), ep);
     assert(_t_argv_at(a3, "python3") > _t_argv_at(a3, "alpine"),
-    "entrypoint arguments come AFTER the image, or the runtime would eat them");
+      "entrypoint arguments come AFTER the image, or the runtime would eat them");
     assert(str_eq_cstr(vec_get(a3, vec_len(a3) - 1), "-c") == 1, "and in the order given");
     return 0;
 }
@@ -283,25 +283,25 @@ fn _t_oci_result(): i64 {
 
 fn _t_oci_error_message(): i64 {
     assert(str_contains_cstr(agnosai_oci_image_error(str_from("")), "empty") == 1,
-    "an empty image reports emptiness");
+      "an empty image reports emptiness");
     assert(str_contains_cstr(
-    agnosai_oci_image_error(str_from("--privileged")), "flag injection") == 1,
-    "a leading hyphen reports flag injection, not a generic bad character");
+        agnosai_oci_image_error(str_from("--privileged")), "flag injection") == 1,
+      "a leading hyphen reports flag injection, not a generic bad character");
     assert(str_contains_cstr(
-    agnosai_oci_image_error(str_from("alpine;x")), "invalid character") == 1,
-    "and anything else reports the character class");
+        agnosai_oci_image_error(str_from("alpine;x")), "invalid character") == 1,
+      "and anything else reports the character class");
     # **Naming the character**, as `oci.rs:82` does — it was dropped until
     # 2026-08-05, leaving an operator with a refused image and no way to tell
     # which byte of it was the problem.
     assert(str_eq_cstr(agnosai_oci_image_error(str_from("alpine;x")),
-    "image name contains invalid character: ';'") == 1,
-    "...and says WHICH character, end to end");
+        "image name contains invalid character: ';'") == 1,
+      "...and says WHICH character, end to end");
     assert(str_eq_cstr(agnosai_oci_image_error(str_from("alp ine")),
-    "image name contains invalid character: ' '") == 1, "...including a space");
+        "image name contains invalid character: ' '") == 1, "...including a space");
     # A multi-byte character comes back whole, not as its first byte — the
     # validator walks codepoints and so must the message.
     assert(str_contains_cstr(agnosai_oci_image_error(str_from("alpine\xe2\x80\x8b")),
-    "\xe2\x80\x8b") == 1, "...and a multi-byte character is reported whole");
+        "\xe2\x80\x8b") == 1, "...and a multi-byte character is reported whole");
     return 0;
 }
 
@@ -326,7 +326,7 @@ fn _t_oci_missing_runtime_returns_error(): i64 {
     assert(load64(&e) != 0, "...with an error set");
     assert(agnosai_error_kind(load64(&e)) == AGNOSAI_ERR_SANDBOX, "...a sandbox error");
     assert(str_contains_cstr(agnosai_error_message(load64(&e)), "/nonexistent/runtime") == 1,
-    "...naming the runtime it could not spawn");
+      "...naming the runtime it could not spawn");
     return 0;
 }
 
@@ -351,11 +351,11 @@ fn _t_oci_execute_runs_the_built_argv(): i64 {
 
     var out = agnosai_oci_result_stdout(r);
     assert(str_contains_cstr(out, "run --rm -i --read-only") == 1,
-    "the isolation flags reach the runtime in the oracle's order");
+      "the isolation flags reach the runtime in the oracle's order");
     assert(str_contains_cstr(out, "--network=none") == 1, "networking is off by default");
     assert(str_contains_cstr(out, "--env KEY=value") == 1, "configured env is passed as --env");
     assert(str_contains_cstr(out, "alpine:latest entrypoint-arg") == 1,
-    "the image precedes the entrypoint arguments, and both are last");
+      "the image precedes the entrypoint arguments, and both are last");
     return 0;
 }
 
@@ -378,18 +378,18 @@ fn _t_oci_fake_runtime(name, body): Str {
 fn _t_oci_execute_feeds_stdin_and_splits_streams(): i64 {
     var c = agnosai_oci_config_new(str_from("alpine:latest"));
     agnosai_oci_config_set_runtime(c,
-    _t_oci_fake_runtime("io", "cat; echo container-err >&2"));
+      _t_oci_fake_runtime("io", "cat; echo container-err >&2"));
 
     var e[8];
     store64(&e, 0);
     var r = agnosai_oci_execute(c, vec_new(), str_from("piped to the container"), &e);
     assert(load64(&e) == 0, "the runtime spawns");
     assert(str_contains_cstr(agnosai_oci_result_stdout(r), "piped to the container") == 1,
-    "input reaches the container's stdin and its output comes back");
+      "input reaches the container's stdin and its output comes back");
     assert(str_contains_cstr(agnosai_oci_result_stderr(r), "container-err") == 1,
-    "stderr is captured separately");
+      "stderr is captured separately");
     assert(str_contains_cstr(agnosai_oci_result_stdout(r), "container-err") == 0,
-    "...not merged into stdout");
+      "...not merged into stdout");
     assert(agnosai_oci_result_timed_out(r) == 0, "and it did not time out");
     return 0;
 }
@@ -412,7 +412,7 @@ fn _t_oci_runtime_that_stops_reading_stdin(): i64 {
     var i = 0;
     while (i < 3200) {
         str_builder_add_cstr(sb,
-        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+          "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
         i = i + 1;
     }
     var big = str_builder_build(sb);
@@ -422,17 +422,17 @@ fn _t_oci_runtime_that_stops_reading_stdin(): i64 {
     # Closes stdin and stays alive, so the write fails while the drain loop is
     # still running rather than racing the runtime's exit.
     agnosai_oci_config_set_runtime(c,
-    _t_oci_fake_runtime("deaf", "exec 0<&-; sleep 1; echo ran-anyway"));
+      _t_oci_fake_runtime("deaf", "exec 0<&-; sleep 1; echo ran-anyway"));
 
     var e[8];
     store64(&e, 0);
     var r = agnosai_oci_execute(c, vec_new(), big, &e);
     assert(load64(&e) == 0,
-    "a runtime that stopped reading is NOT an error here — oci.rs warns and continues");
+      "a runtime that stopped reading is NOT an error here — oci.rs warns and continues");
     assert(r != 0, "...it returns a result");
     if (r == 0) { return 0; }
     assert(str_contains_cstr(agnosai_oci_result_stdout(r), "ran-anyway") == 1,
-    "...carrying everything the container wrote after it closed stdin");
+      "...carrying everything the container wrote after it closed stdin");
     assert(agnosai_oci_result_timed_out(r) == 0, "...and it is not reported as a timeout");
     assert(agnosai_oci_result_exit_code(r) == 0, "...its own exit code stands");
     return 0;
@@ -509,9 +509,9 @@ fn _t_oci_runtime_inherits_the_unfiltered_environment(): i64 {
     var out = agnosai_spawn_stdout(r);
     assert(str_contains_cstr(out, "CHILD-FAILED-TO-RUN") == 0, "...and the child ran a container");
     assert(str_contains_cstr(out, "PATH=") == 1,
-    "the runtime gets an environment at all — envp 0 would give it none");
+      "the runtime gets an environment at all — envp 0 would give it none");
     assert(str_contains_cstr(out, "/tmp/agnosai-oci-marker") == 1,
-    "...and it is the UNFILTERED one: a variable the sandbox filter strips still reaches the \
+      "...and it is the UNFILTERED one: a variable the sandbox filter strips still reaches the \
     container runtime, because filtering here would sanitize the wrong process");
     return 0;
 }
@@ -535,7 +535,7 @@ fn _t_oci_execute_timeout(): i64 {
     # The runtime PRODUCES output before it hangs, so blanking is observable -
     # a version that returned what it drained would show "early" here.
     assert(str_len(agnosai_oci_result_stdout(r)) == 0,
-    "...with output blanked, as oci.rs:180-186 does");
+      "...with output blanked, as oci.rs:180-186 does");
     assert(str_len(agnosai_oci_result_stderr(r)) == 0, "...both streams");
     assert(dt >= 900, "the deadline is SECONDS, not milliseconds - 1s, not 1ms");
     assert(dt < 10000, "...and it fired rather than hanging");

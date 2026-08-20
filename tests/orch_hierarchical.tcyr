@@ -59,7 +59,7 @@ fn _t_v(a, b, c): i64 {
 # Assert the i-th assignment went to a given agent key.
 fn _t_to(assignments, i, want, name): i64 {
     return assert(str_eq(agnosai_assignment_agent_key(vec_get(assignments, i)),
-    str_from(want)) == 1, name);
+        str_from(want)) == 1, name);
 }
 
 fn main() {
@@ -75,21 +75,21 @@ fn main() {
     var coder = _t_agent("coder", "lint", "test", "medium", "quality");
     var deployer = _t_agent("deployer", "ssh", 0, "medium", "devops");
     var code_task = _t_task("write code",
-    "{\"required_tools\":[\"lint\",\"test\"],\"complexity\":\"medium\",\"domain\":\"quality\"}");
+      "{\"required_tools\":[\"lint\",\"test\"],\"complexity\":\"medium\",\"domain\":\"quality\"}");
 
     var one = agnosai_delegate_tasks(manager, _t_v(coder, deployer, 0), _t_v(code_task, 0, 0));
     assert_eq(vec_len(one), 1, "one task yields one assignment");
     _t_to(one, 0, "coder", "and it goes to the best-scoring agent");
     assert(str_eq(agnosai_assignment_task_id(vec_get(one, 0)), agnosai_task_id(code_task)) == 1,
-    "carrying the task's own id");
+      "carrying the task's own id");
 
     # --- delegate_multiple_tasks ---
     # Each task is ranked independently, so two tasks in one call can land on
     # different agents.
     var deploy_task = _t_task("ship it",
-    "{\"required_tools\":[\"ssh\"],\"complexity\":\"medium\",\"domain\":\"devops\"}");
+      "{\"required_tools\":[\"ssh\"],\"complexity\":\"medium\",\"domain\":\"devops\"}");
     var two = agnosai_delegate_tasks(manager, _t_v(coder, deployer, 0),
-    _t_v(code_task, deploy_task, 0));
+      _t_v(code_task, deploy_task, 0));
     assert_eq(vec_len(two), 2, "two tasks yield two assignments");
     _t_to(two, 0, "coder", "the code task goes to the coder");
     _t_to(two, 1, "deployer", "and the deploy task to the deployer");
@@ -98,9 +98,9 @@ fn main() {
     # The result is positionally aligned with the input, which the oracle's own
     # test relies on.
     assert(str_eq(agnosai_assignment_task_id(vec_get(two, 0)),
-    agnosai_task_id(code_task)) == 1, "assignment 0 is for task 0");
+        agnosai_task_id(code_task)) == 1, "assignment 0 is for task 0");
     assert(str_eq(agnosai_assignment_task_id(vec_get(two, 1)),
-    agnosai_task_id(deploy_task)) == 1, "and assignment 1 for task 1");
+        agnosai_task_id(deploy_task)) == 1, "and assignment 1 for task 1");
 
     # --- delegate_no_workers_falls_back_to_manager ---
     # A crew with only a manager still runs: the manager quietly becomes the
@@ -109,20 +109,20 @@ fn main() {
     assert_eq(vec_len(none), 1, "with no workers the task is still assigned");
     _t_to(none, 0, "manager", "to the manager itself");
     assert(str_eq(agnosai_assignment_task_id(vec_get(none, 0)),
-    agnosai_task_id(code_task)) == 1, "with the right task id");
+        agnosai_task_id(code_task)) == 1, "with the right task id");
 
     # every task falls back, not just the first
     var many_none = agnosai_delegate_tasks(manager, vec_new(),
-    _t_v(code_task, deploy_task, 0));
+      _t_v(code_task, deploy_task, 0));
     assert_eq(vec_len(many_none), 2, "all tasks fall back");
     _t_to(many_none, 0, "manager", "the first to the manager");
     _t_to(many_none, 1, "manager", "and the second too");
 
     # --- delegate_empty_tasks ---
     assert_eq(vec_len(agnosai_delegate_tasks(manager, _t_v(coder, deployer, 0), vec_new())), 0,
-    "no tasks yields no assignments");
+      "no tasks yields no assignments");
     assert_eq(vec_len(agnosai_delegate_tasks(manager, vec_new(), vec_new())), 0,
-    "and neither does an empty crew");
+      "and neither does an empty crew");
 
     # --- the manager is never a candidate, only a fallback ---
     # The manager here is a perfect fit for the task and the sole worker is a
@@ -130,14 +130,14 @@ fn main() {
     var perfect_mgr = _t_agent("mgr-perfect", "lint", "test", "medium", "quality");
     var poor_worker = _t_agent("poor", 0, 0, "low", "devops");
     var contested = agnosai_delegate_tasks(perfect_mgr, _t_v(poor_worker, 0, 0),
-    _t_v(code_task, 0, 0));
+      _t_v(code_task, 0, 0));
     _t_to(contested, 0, "poor",
-    "a poorly-matched worker still beats a perfectly-matched manager — the manager does not \
+      "a poorly-matched worker still beats a perfectly-matched manager — the manager does not \
     compete, which is the whole point of hierarchical mode");
 
     # --- one agent can take several tasks: no round-robin, no capacity limit ---
     var solo = agnosai_delegate_tasks(manager, _t_v(coder, 0, 0),
-    _t_v(code_task, deploy_task, 0));
+      _t_v(code_task, deploy_task, 0));
     assert_eq(vec_len(solo), 2, "both tasks are assigned");
     _t_to(solo, 0, "coder", "the only worker takes the first");
     _t_to(solo, 1, "coder", "and the second as well — there is no spreading of load here");
@@ -156,16 +156,16 @@ fn main() {
     # the method and the free function agree, since one calls the other
     var via_fn = agnosai_delegate_tasks(manager, _t_v(worker, 0, 0), _t_v(code_task, 0, 0));
     assert(str_eq(agnosai_assignment_agent_key(vec_get(via_method, 0)),
-    agnosai_assignment_agent_key(vec_get(via_fn, 0))) == 1,
-    "and the method agrees with the free function");
+        agnosai_assignment_agent_key(vec_get(via_fn, 0))) == 1,
+      "and the method agrees with the free function");
 
     # --- a task with no context still delegates ---
     var bare = _t_task("anything", "{}");
     var bare_result = agnosai_delegate_tasks(manager, _t_v(coder, deployer, 0),
-    _t_v(bare, 0, 0));
+      _t_v(bare, 0, 0));
     assert_eq(vec_len(bare_result), 1, "a task with no context is still assigned");
     assert(agnosai_assignment_agent_key(vec_get(bare_result, 0)) != 0,
-    "to some agent rather than to nobody");
+      "to some agent rather than to nobody");
 
     # --- the assignment constructor directly ---
     # Exposed so a caller can build an assignment without going through
@@ -173,9 +173,9 @@ fn main() {
     # assigned_agent and no scoring is needed.
     var built = agnosai_assignment_new(str_from("task-9"), str_from("agent-x"));
     assert(str_eq(agnosai_assignment_task_id(built), str_from("task-9")) == 1,
-    "the constructor stores the task id");
+      "the constructor stores the task id");
     assert(str_eq(agnosai_assignment_agent_key(built), str_from("agent-x")) == 1,
-    "and the agent key");
+      "and the agent key");
 
     return assert_summary();
 }

@@ -150,145 +150,145 @@ fn main(): i64 {
     }
     assert_eq(no_overlap, 1, "no attribute is in both families");
     assert_eq(vec_len(otel) + vec_len(custom), vec_len(all),
-    "and the two families partition the whole set — none is unclassified");
+      "and the two families partition the whole set — none is unclassified");
 
     # ⚠ Past the oracle: `agnosai.crew.task_count` is spelled INLINE in the
     # oracle's `crew_span!` rather than in `attrs`, so it is in neither of the
     # lists above and no oracle test covers it. It is still an emitted
     # attribute name and still has to be right.
     assert(str_eq_cstr(str_from(AGNOSAI_GENAI_CREW_TASK_COUNT),
-    "agnosai.crew.task_count") == 1, "the inline crew task_count key is exact");
+        "agnosai.crew.task_count") == 1, "the inline crew task_count key is exact");
 
     # --- past the oracle: the exact spelling of every key ---------------
     # `starts_with("gen_ai.")` passes for a typo'd suffix. These are wire names
     # an OTLP backend matches literally, so they are asserted literally.
     assert(str_eq_cstr(str_from(AGNOSAI_GENAI_OPERATION_NAME), "gen_ai.operation.name") == 1,
-    "operation.name is exact");
+      "operation.name is exact");
     assert(str_eq_cstr(str_from(AGNOSAI_GENAI_USAGE_INPUT_TOKENS),
-    "gen_ai.usage.input_tokens") == 1, "input_tokens is exact");
+        "gen_ai.usage.input_tokens") == 1, "input_tokens is exact");
     assert(str_eq_cstr(str_from(AGNOSAI_GENAI_USAGE_OUTPUT_TOKENS),
-    "gen_ai.usage.output_tokens") == 1, "output_tokens is exact");
+        "gen_ai.usage.output_tokens") == 1, "output_tokens is exact");
     assert(str_eq_cstr(str_from(AGNOSAI_GENAI_RESPONSE_FINISH_REASON),
-    "gen_ai.response.finish_reason") == 1, "finish_reason is exact");
+        "gen_ai.response.finish_reason") == 1, "finish_reason is exact");
     assert(str_eq_cstr(str_from(AGNOSAI_GENAI_TOOL_NAME), "agnosai.tool.name") == 1,
-    "tool.name is exact");
+      "tool.name is exact");
 
     # --- oracle: inference_span_creates_span ----------------------------
     var inf = agnosai_genai_inference_span(str_from("llama3:70b"), str_from("ollama"),
-    str_from("agent-a"), str_from("task-1"));
+      str_from("agent-a"), str_from("task-1"));
     assert(inf != 0, "an inference span is created");
     assert(str_eq_cstr(str_from(agnosai_genai_span_name(inf)), "gen_ai.invoke_agent") == 1,
-    "named gen_ai.invoke_agent");
+      "named gen_ai.invoke_agent");
 
     # --- past the oracle: its attributes are readable and correct -------
     assert(str_eq_cstr(agnosai_genai_span_attr_str(inf, AGNOSAI_GENAI_OPERATION_NAME),
-    "invoke_agent") == 1, "operation is invoke_agent");
+        "invoke_agent") == 1, "operation is invoke_agent");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(inf, AGNOSAI_GENAI_SYSTEM),
-    "ollama") == 1, "system round-trips");
+        "ollama") == 1, "system round-trips");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(inf, AGNOSAI_GENAI_REQUEST_MODEL),
-    "llama3:70b") == 1, "requested model round-trips");
+        "llama3:70b") == 1, "requested model round-trips");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(inf, AGNOSAI_GENAI_AGENT_NAME),
-    "agent-a") == 1, "agent name round-trips");
+        "agent-a") == 1, "agent name round-trips");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(inf, AGNOSAI_GENAI_TASK_ID),
-    "task-1") == 1, "task id round-trips");
+        "task-1") == 1, "task id round-trips");
 
     # ⚠ The three `tracing::field::Empty` fields read back UNSET, and unset is
     # not zero: a 0/empty default would make "no usage recorded" identical to
     # "recorded 0 tokens", which is the whole reason the oracle declares them
     # Empty rather than defaulting them.
     assert_eq(agnosai_genai_span_attr_int(inf, AGNOSAI_GENAI_USAGE_INPUT_TOKENS), 0 - 1,
-    "input tokens start UNSET, not 0");
+      "input tokens start UNSET, not 0");
     assert_eq(agnosai_genai_span_attr_int(inf, AGNOSAI_GENAI_USAGE_OUTPUT_TOKENS), 0 - 1,
-    "output tokens start UNSET");
+      "output tokens start UNSET");
     assert_eq(agnosai_genai_span_attr_str(inf, AGNOSAI_GENAI_RESPONSE_MODEL), 0,
-    "and the response model starts absent");
+      "and the response model starts absent");
 
     # --- oracle: record_usage_does_not_panic ----------------------------
     # The oracle asserts nothing beyond "no panic". Here it has to land.
     var rec = agnosai_genai_inference_span(str_from("gpt-4"), str_from("openai"),
-    str_from("agent-1"), str_from("task-1"));
+      str_from("agent-1"), str_from("task-1"));
     agnosai_genai_record_usage(rec, 100, 50, str_from("gpt-4-0613"));
     assert_eq(agnosai_genai_span_attr_int(rec, AGNOSAI_GENAI_USAGE_INPUT_TOKENS), 100,
-    "input tokens recorded");
+      "input tokens recorded");
     assert_eq(agnosai_genai_span_attr_int(rec, AGNOSAI_GENAI_USAGE_OUTPUT_TOKENS), 50,
-    "output tokens recorded");
+      "output tokens recorded");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(rec, AGNOSAI_GENAI_RESPONSE_MODEL),
-    "gpt-4-0613") == 1, "and the responding model, which DIFFERS from the requested one");
+        "gpt-4-0613") == 1, "and the responding model, which DIFFERS from the requested one");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(rec, AGNOSAI_GENAI_REQUEST_MODEL),
-    "gpt-4") == 1, "the requested model is untouched by record_usage");
+        "gpt-4") == 1, "the requested model is untouched by record_usage");
 
     # ⚠ Zero tokens is a real recording, distinct from unset.
     var zero = agnosai_genai_inference_span(str_from("m"), str_from("s"), str_from("a"),
-    str_from("t"));
+      str_from("t"));
     agnosai_genai_record_usage(zero, 0, 0, str_from("m"));
     assert_eq(agnosai_genai_span_attr_int(zero, AGNOSAI_GENAI_USAGE_INPUT_TOKENS), 0,
-    "recording 0 tokens reads back 0, not unset");
+      "recording 0 tokens reads back 0, not unset");
 
     # ⚠ `Span::record` overwrites, so a second call wins.
     agnosai_genai_record_usage(rec, 7, 8, str_from("second"));
     assert_eq(agnosai_genai_span_attr_int(rec, AGNOSAI_GENAI_USAGE_INPUT_TOKENS), 7,
-    "a second record_usage overwrites rather than accumulating");
+      "a second record_usage overwrites rather than accumulating");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(rec, AGNOSAI_GENAI_RESPONSE_MODEL),
-    "second") == 1, "including the model");
+        "second") == 1, "including the model");
 
     # --- oracle: tool_span_creates_span ---------------------------------
     var tool = agnosai_genai_tool_span(str_from("echo"), str_from("agent-a"),
-    str_from("task-1"));
+      str_from("task-1"));
     assert(tool != 0, "a tool span is created");
     assert(str_eq_cstr(str_from(agnosai_genai_span_name(tool)), "gen_ai.execute_tool") == 1,
-    "named gen_ai.execute_tool");
+      "named gen_ai.execute_tool");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(tool, AGNOSAI_GENAI_OPERATION_NAME),
-    "execute_tool") == 1, "operation is execute_tool");
+        "execute_tool") == 1, "operation is execute_tool");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(tool, AGNOSAI_GENAI_TOOL_NAME),
-    "echo") == 1, "the tool name round-trips");
+        "echo") == 1, "the tool name round-trips");
 
     # ⚠ Past the oracle: a tool span carries NO model or token fields — not even
     # empty ones. A declared-but-Empty field and an undeclared one both read
     # absent, because the wire carries neither.
     assert_eq(agnosai_genai_span_attr_str(tool, AGNOSAI_GENAI_REQUEST_MODEL), 0,
-    "a tool span has no requested model");
+      "a tool span has no requested model");
     assert_eq(agnosai_genai_span_attr_int(tool, AGNOSAI_GENAI_USAGE_INPUT_TOKENS), 0 - 1,
-    "and no token fields");
+      "and no token fields");
     assert_eq(agnosai_genai_span_attr_str(tool, AGNOSAI_GENAI_SYSTEM), 0,
-    "and no system");
+      "and no system");
 
     # --- oracle: crew_span_creates_span ---------------------------------
     var crew = agnosai_genai_crew_span(str_from("crew-123"), str_from("test-crew"), 5);
     assert(crew != 0, "a crew span is created");
     assert(str_eq_cstr(str_from(agnosai_genai_span_name(crew)), "agnosai.crew.run") == 1,
-    "named agnosai.crew.run");
+      "named agnosai.crew.run");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(crew, AGNOSAI_GENAI_CREW_ID),
-    "crew-123") == 1, "the crew id round-trips");
+        "crew-123") == 1, "the crew id round-trips");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(crew, AGNOSAI_GENAI_CREW_NAME),
-    "test-crew") == 1, "and the crew name");
+        "test-crew") == 1, "and the crew name");
     assert_eq(agnosai_genai_span_attr_int(crew, AGNOSAI_GENAI_CREW_TASK_COUNT), 5,
-    "and the task count");
+      "and the task count");
 
     # ⚠ Past the oracle: a crew span sets NO operation name, while the other two
     # do. A backend grouping by `gen_ai.operation.name` therefore sees crew runs
     # as unclassified. The oracle's `crew_span!` simply omits it; reproduced
     # rather than filled in, because filling it would invent a wire value.
     assert_eq(agnosai_genai_span_attr_str(crew, AGNOSAI_GENAI_OPERATION_NAME), 0,
-    "a crew span carries NO gen_ai.operation.name — the oracle omits it");
+      "a crew span carries NO gen_ai.operation.name — the oracle omits it");
 
     # ⚠ A task count of 0 is a real value, distinct from the -1 the other spans
     # report for it.
     var empty_crew = agnosai_genai_crew_span(str_from("c"), str_from("n"), 0);
     assert_eq(agnosai_genai_span_attr_int(empty_crew, AGNOSAI_GENAI_CREW_TASK_COUNT), 0,
-    "a crew with no tasks reports 0");
+      "a crew with no tasks reports 0");
     assert_eq(agnosai_genai_span_attr_int(inf, AGNOSAI_GENAI_CREW_TASK_COUNT), 0 - 1,
-    "while a non-crew span reports the count as unset");
+      "while a non-crew span reports the count as unset");
 
     # --- past the oracle: unknown keys are absent, not a fault ----------
     assert_eq(agnosai_genai_span_attr_str(inf, "not.a.real.key"), 0,
-    "an unknown string key answers absent");
+      "an unknown string key answers absent");
     assert_eq(agnosai_genai_span_attr_int(inf, "not.a.real.key"), 0 - 1,
-    "an unknown integer key answers unset");
+      "an unknown integer key answers unset");
     # A key from the *other* accessor's family is likewise absent, not crossed.
     assert_eq(agnosai_genai_span_attr_str(inf, AGNOSAI_GENAI_USAGE_INPUT_TOKENS), 0,
-    "an integer attribute is not readable as a string");
+      "an integer attribute is not readable as a string");
     assert_eq(agnosai_genai_span_attr_int(inf, AGNOSAI_GENAI_REQUEST_MODEL), 0 - 1,
-    "nor a string attribute as an integer");
+      "nor a string attribute as an integer");
 
     # --- past the oracle: spans are independent -------------------------
     # One record holds each span's attributes, so two spans of the same kind
@@ -296,12 +296,12 @@ fn main(): i64 {
     var a = agnosai_genai_tool_span(str_from("first"), str_from("agent"), str_from("t1"));
     var b = agnosai_genai_tool_span(str_from("second"), str_from("agent"), str_from("t2"));
     assert(str_eq_cstr(agnosai_genai_span_attr_str(a, AGNOSAI_GENAI_TOOL_NAME),
-    "first") == 1, "the first tool span keeps its own name");
+        "first") == 1, "the first tool span keeps its own name");
     assert(str_eq_cstr(agnosai_genai_span_attr_str(b, AGNOSAI_GENAI_TOOL_NAME),
-    "second") == 1, "and the second keeps its own");
+        "second") == 1, "and the second keeps its own");
     agnosai_genai_record_usage(inf, 1, 2, str_from("x"));
     assert_eq(agnosai_genai_span_attr_int(rec, AGNOSAI_GENAI_USAGE_INPUT_TOKENS), 7,
-    "recording on one inference span does not touch another");
+      "recording on one inference span does not touch another");
 
     # --- past the oracle: scope is explicit, and balanced ---------------
     # `info_span!` builds without entering — the oracle's own example never

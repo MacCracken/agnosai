@@ -37,29 +37,29 @@ fn main(): i64 {
     var r = agnosai_relay_with_defaults(str_from("node-1"));
     assert(str_eq_cstr(agnosai_relay_node_id(r), "node-1") == 1, "the relay knows its node id");
     assert_eq(agnosai_relay_send(r, str_from("node-2"), str_from("t"), 0), 1,
-    "the first send is sequence 1");
+      "the first send is sequence 1");
     assert_eq(agnosai_relay_send(r, str_from("node-2"), str_from("t"), 0), 2,
-    "the second is 2");
+      "the second is 2");
     assert_eq(agnosai_relay_send(r, str_from("node-3"), str_from("t"), 0), 3,
-    "sequence is per-relay, not per-target");
+      "sequence is per-relay, not per-target");
 
     # --- oracle: broadcast_uses_empty_to --------------------------------
     assert_eq(agnosai_relay_broadcast(r, str_from("ann"), 0), 4,
-    "broadcast draws from the same sequence");
+      "broadcast draws from the same sequence");
 
     # --- past the oracle: sequences are per-relay -----------------------
     var r2 = agnosai_relay_with_defaults(str_from("other"));
     assert_eq(agnosai_relay_send(r2, str_from("x"), str_from("t"), 0), 1,
-    "a second relay starts its own sequence at 1");
+      "a second relay starts its own sequence at 1");
 
     # --- oracle: receive_skips_own_messages -----------------------------
     var rx = agnosai_relay_with_defaults(str_from("node-1"));
     assert_eq(agnosai_relay_receive(rx, _t_msg(1, "node-1", "", "t")), 0,
-    "a relay drops its own message");
+      "a relay drops its own message");
 
     # --- oracle: receive_skips_messages_for_other_nodes -----------------
     assert_eq(agnosai_relay_receive(rx, _t_msg(1, "node-2", "node-99", "t")), 0,
-    "a message addressed elsewhere is dropped");
+      "a message addressed elsewhere is dropped");
 
     # --- oracle: receive_accepts_broadcast ------------------------------
     var inc = agnosai_relay_receive(rx, _t_msg(1, "node-2", "", "ann"));
@@ -77,15 +77,15 @@ fn main(): i64 {
     assert(inc2 != 0, "a message addressed to this node is accepted");
     assert_eq(agnosai_incoming_is_broadcast(inc2), 0, "and is NOT flagged a broadcast");
     assert(str_eq_cstr(agnosai_relay_message_to(agnosai_incoming_message(inc2)),
-    "node-1") == 1, "and carries its explicit target");
+        "node-1") == 1, "and carries its explicit target");
 
     # --- oracle: receive_dedup_drops_duplicate --------------------------
     assert_eq(agnosai_relay_receive(rx, _t_msg(2, "node-2", "", "t")), 0,
-    "a replayed sequence is dropped");
+      "a replayed sequence is dropped");
     assert_eq(agnosai_relay_receive(rx, _t_msg(1, "node-2", "", "t")), 0,
-    "an older sequence is dropped too");
+      "an older sequence is dropped too");
     assert(agnosai_relay_receive(rx, _t_msg(3, "node-2", "", "t")) != 0,
-    "the next sequence is accepted");
+      "the next sequence is accepted");
 
     # --- oracle: receive_detects_sequence_gap ---------------------------
     # The oracle warns; majra counts. Same information, and assertable.
@@ -96,27 +96,27 @@ fn main(): i64 {
     assert(agnosai_relay_receive(rg, _t_msg(2, "peer", "", "t")) != 0, "seq 2 accepted");
     assert_eq(agnosai_relay_sequence_gaps(rg), 0, "a contiguous sequence records no gap");
     assert(agnosai_relay_receive(rg, _t_msg(5, "peer", "", "t")) != 0,
-    "a gapped message is still DELIVERED — a gap is not a rejection");
+      "a gapped message is still DELIVERED — a gap is not a rejection");
     assert_eq(agnosai_relay_sequence_gaps(rg), 1, "but the gap is counted");
 
     # --- past the oracle: a duplicate is not a gap ----------------------
     assert_eq(agnosai_relay_receive(rg, _t_msg(5, "peer", "", "t")), 0, "the replay is dropped");
     assert_eq(agnosai_relay_sequence_gaps(rg), 1, "and does not add a gap");
     assert_eq(agnosai_relay_stats_duplicates_dropped(agnosai_relay_stats(rg)), 1,
-    "it is counted as a duplicate instead");
+      "it is counted as a duplicate instead");
 
     # --- past the oracle: a new sender starting past 1 is a gap ---------
     assert(agnosai_relay_receive(rg, _t_msg(7, "latecomer", "", "t")) != 0,
-    "a new sender's first message is accepted");
+      "a new sender's first message is accepted");
     assert_eq(agnosai_relay_sequence_gaps(rg), 2,
-    "and starting past seq 1 counts as a gap — messages were missed before we saw it");
+      "and starting past seq 1 counts as a gap — messages were missed before we saw it");
 
     # --- past the oracle: last-seq tracking is per sender ---------------
     assert_eq(agnosai_relay_last_seq(rg, str_from("peer")), 5, "peer's last seq is tracked");
     assert_eq(agnosai_relay_last_seq(rg, str_from("latecomer")), 7,
-    "and latecomer's independently");
+      "and latecomer's independently");
     assert_eq(agnosai_relay_last_seq(rg, str_from("never-seen")), 0 - 1,
-    "an unknown sender answers -1, distinct from a real sequence 0");
+      "an unknown sender answers -1, distinct from a real sequence 0");
 
     # --- oracle: stats_tracking -----------------------------------------
     var rs = agnosai_relay_with_defaults(str_from("node-1"));
@@ -156,7 +156,7 @@ fn main(): i64 {
     var got2 = chan_recv(ch);
     assert(got2 != 0, "an accepted inbound message also reaches subscribers");
     assert(str_eq_cstr(agnosai_relay_message_topic(got2), "inbound") == 1,
-    "and it is the inbound one");
+      "and it is the inbound one");
 
     # --- the two divergences that were owed to majra, now CLOSED -------
     # ✅ Both fixed in majra 2.6.5, filed from here. These used to assert the
@@ -173,21 +173,21 @@ fn main(): i64 {
     assert_eq(chan_try_send(cap_ch, 1), 0, "first send fits");
     assert_eq(chan_try_send(cap_ch, 2), 0, "second send fits");
     assert_eq(chan_try_send(cap_ch, 3), 0 - 2,
-    "the THIRD is refused — the capacity is APPLIED, not advisory");
+      "the THIRD is refused — the capacity is APPLIED, not advisory");
 
     # 2. The timestamp is a WALL-CLOCK epoch instant, as the oracle's
     # `DateTime<Utc>` is. A monotonic reading is uptime and orders of magnitude
     # smaller; 1.577e18 is 2020-01-01.
     var tm = agnosai_relay_message_timestamp(_t_msg(1, "a", "", "t"));
     assert(tm > 1577836800000000000,
-    "the stamp is an epoch instant, not monotonic uptime");
+      "the stamp is an epoch instant, not monotonic uptime");
     assert(tm <= clock_epoch_ns(), "and it is not in the future");
 
     # --- past the oracle: the inner relay is reachable ------------------
     # For the majra APIs this wrapper deliberately does not re-export.
     assert(agnosai_relay_inner(rs) != 0, "the underlying majra relay is reachable");
     assert_eq(relay_dedup_table_size(agnosai_relay_inner(rs)), 1,
-    "and answers majra's own accessors — one sender tracked");
+      "and answers majra's own accessors — one sender tracked");
 
     # --- past the oracle: the payload is carried BY REFERENCE -----------
     # ⚠ On its OWN relay. An earlier revision put this inline and used seq 9,
@@ -201,16 +201,16 @@ fn main(): i64 {
     # bites once something real is put through the relay.
     var pay = bayan_json_v_int_new(4242);
     var pm = agnosai_relay_message_new(9, str_from("node-2"), str_from(""),
-    str_from("payload-test"), pay);
+      str_from("payload-test"), pay);
     assert_eq(agnosai_relay_message_payload(pm), pay,
-    "the payload round-trips as the SAME object, not a copy");
+      "the payload round-trips as the SAME object, not a copy");
     var rpay = agnosai_relay_with_defaults(str_from("node-1"));
     var pinc = agnosai_relay_receive(rpay, pm);
     assert(pinc != 0, "and a message carrying one is accepted");
     assert_eq(agnosai_relay_message_payload(agnosai_incoming_message(pinc)), pay,
-    "and survives receive by reference");
+      "and survives receive by reference");
     assert_eq(agnosai_relay_message_payload(_t_msg(1, "a", "", "t")), 0,
-    "a message built with no payload carries 0");
+      "a message built with no payload carries 0");
 
 
     return assert_summary();

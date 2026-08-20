@@ -40,12 +40,12 @@ include "tests/test_helpers.cyr"
 # The state `main.rs:107-116` builds, with every part real rather than stubbed.
 fn _t_state(): i64 {
     return agnosai_app_state_new(
-    agnosai_orchestrator_new(0),
-    agnosai_tool_registry_new(),
-    agnosai_auth_config_with_secret(str_from("s3cret")),
-    agnosai_event_bus_new(),
-    agnosai_audit_chain_new(),
-    agnosai_approval_gate_new());
+      agnosai_orchestrator_new(0),
+      agnosai_tool_registry_new(),
+      agnosai_auth_config_with_secret(str_from("s3cret")),
+      agnosai_event_bus_new(),
+      agnosai_audit_chain_new(),
+      agnosai_approval_gate_new());
 }
 
 # Every field comes back as the pointer that went in — the whole contract of a
@@ -69,9 +69,9 @@ fn _t_fields_round_trip(): i64 {
     # The fields are distinct slots, not aliases of one another — the failure a
     # mistyped offset in the enum would produce.
     assert(agnosai_app_state_orchestrator(s) != agnosai_app_state_tools(s),
-    "orchestrator and tools are different slots");
+      "orchestrator and tools are different slots");
     assert(agnosai_app_state_audit(s) != agnosai_app_state_events(s),
-    "audit and events are different slots");
+      "audit and events are different slots");
     return 0;
 }
 
@@ -82,11 +82,11 @@ fn _t_fields_are_live(): i64 {
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "Bearer s3cret");
     assert(agnosai_auth_check(agnosai_app_state_auth(s), 1, str_builder_build(sb)) == HTTP_OK,
-    "the carried auth config accepts its own secret");
+      "the carried auth config accepts its own secret");
     assert(agnosai_auth_check(agnosai_app_state_auth(s), 0, str_from("")) == HTTP_UNAUTHORIZED,
-    "...and rejects a request with no header");
+      "...and rejects a request with no header");
     assert(agnosai_tool_registry_has(agnosai_app_state_tools(s), str_from("nope")) == 0,
-    "the carried registry starts empty");
+      "the carried registry starts empty");
     return 0;
 }
 
@@ -97,23 +97,23 @@ fn _t_definitions_empty(): i64 {
     assert(agnosai_app_state_definition_count(s) == 0, "definitions start empty");
     assert(vec_len(agnosai_app_state_definitions(s)) == 0, "...and list empty");
     assert(agnosai_app_state_definition_get(s, str_from("absent")) == 0,
-    "a missing key is 0");
+      "a missing key is 0");
     return 0;
 }
 
 fn _t_definitions_insert_and_get(): i64 {
     var s = _t_state();
     var a = agnosai_agent_new(str_from("writer"), str_from("Writer"),
-    str_from("writes things"));
+      str_from("writes things"));
     agnosai_app_state_definition_insert(s, str_from("writer"), a);
     assert(agnosai_app_state_definition_count(s) == 1, "one definition stored");
     assert(agnosai_app_state_definition_get(s, str_from("writer")) == a,
-    "the stored definition comes back");
+      "the stored definition comes back");
     assert(agnosai_app_state_definition_get(s, str_from("Writer")) == 0,
-    "lookup is case-sensitive");
+      "lookup is case-sensitive");
 
     var b = agnosai_agent_new(str_from("editor"), str_from("Editor"),
-    str_from("edits things"));
+      str_from("edits things"));
     agnosai_app_state_definition_insert(s, str_from("editor"), b);
     assert(agnosai_app_state_definition_count(s) == 2, "two definitions stored");
     assert(vec_len(agnosai_app_state_definitions(s)) == 2, "...and both list");
@@ -129,7 +129,7 @@ fn _t_definitions_replace(): i64 {
     agnosai_app_state_definition_insert(s, str_from("w"), second);
     assert(agnosai_app_state_definition_count(s) == 1, "replacing does not grow the map");
     assert(agnosai_app_state_definition_get(s, str_from("w")) == second,
-    "the later definition wins");
+      "the later definition wins");
     return 0;
 }
 
@@ -150,7 +150,7 @@ fn _t_definitions_key_is_cloned(): i64 {
     for (var i = 0; i < str_len(key); i = i + 1) { store8(p + i, 88); }
 
     assert(agnosai_app_state_definition_get(s, str_from("ephemeral")) == d,
-    "the stored key survives the caller's buffer being overwritten");
+      "the stored key survives the caller's buffer being overwritten");
     assert(agnosai_app_state_definition_count(s) == 1, "still exactly one entry");
     return 0;
 }
@@ -160,12 +160,12 @@ fn _t_definitions_key_is_cloned(): i64 {
 fn _t_definitions_snapshot_is_detached(): i64 {
     var s = _t_state();
     agnosai_app_state_definition_insert(s, str_from("a"),
-    agnosai_agent_new(str_from("a"), str_from("A"), str_from("d")));
+      agnosai_agent_new(str_from("a"), str_from("A"), str_from("d")));
     var snap = agnosai_app_state_definitions(s);
     assert(vec_len(snap) == 1, "snapshot has one entry");
 
     agnosai_app_state_definition_insert(s, str_from("b"),
-    agnosai_agent_new(str_from("b"), str_from("B"), str_from("d")));
+      agnosai_agent_new(str_from("b"), str_from("B"), str_from("d")));
     assert(vec_len(snap) == 1, "the earlier snapshot did not grow");
     assert(vec_len(agnosai_app_state_definitions(s)) == 2, "a fresh snapshot sees both");
     return 0;
@@ -188,7 +188,7 @@ fn _t_st_worker(id): i64 {
         str_builder_add_int(sb, i);
         var key = str_builder_build(sb);
         agnosai_app_state_definition_insert(_t_st_shared, key,
-        agnosai_agent_new(key, key, key));
+          agnosai_agent_new(key, key, key));
     }
     return 0;
 }
@@ -206,17 +206,17 @@ fn _t_definitions_concurrent_inserts(): i64 {
 
     var want = _T_ST_THREADS * _T_ST_PER_THREAD;
     assert(agnosai_app_state_definition_count(_t_st_shared) == want,
-    "every concurrent insert landed — no lost updates under 8 threads");
+      "every concurrent insert landed — no lost updates under 8 threads");
     assert(vec_len(agnosai_app_state_definitions(_t_st_shared)) == want,
-    "...and the snapshot agrees");
+      "...and the snapshot agrees");
 
     # Spot-check that entries are the right ones, not merely the right count.
     assert(agnosai_app_state_definition_get(_t_st_shared, str_from("k0-0")) != 0,
-    "first thread's first key is present");
+      "first thread's first key is present");
     assert(agnosai_app_state_definition_get(_t_st_shared, str_from("k7-199")) != 0,
-    "last thread's last key is present");
+      "last thread's last key is present");
     assert(agnosai_app_state_definition_get(_t_st_shared, str_from("k8-0")) == 0,
-    "a key no thread wrote is absent");
+      "a key no thread wrote is absent");
     return 0;
 }
 

@@ -80,20 +80,20 @@ fn main(): i64 {
     assert_eq(agnosai_fleet_task_status(t1), AGNOSAI_FTASK_ASSIGNED, "and is Assigned");
     assert(str_eq_cstr(agnosai_fleet_task_assigned_node(t1), "node-a") == 1, "to its node");
     assert(agnosai_fleet_task_assigned_node(
-    agnosai_fleet_coordinator_task(c, str_from("t2"))) != 0, "as is the second");
+        agnosai_fleet_coordinator_task(c, str_from("t2"))) != 0, "as is the second");
     assert(agnosai_fleet_task_assigned_node(
-    agnosai_fleet_coordinator_task(c, str_from("t3"))) != 0, "and the third");
+        agnosai_fleet_coordinator_task(c, str_from("t3"))) != 0, "and the third");
 
     # --- past the oracle: id and description survive fan_out ------------
     assert(str_eq_cstr(agnosai_fleet_task_id(t1), "t1") == 1, "the task carries its id");
     assert(str_eq_cstr(agnosai_fleet_task_description(t1), "task-0") == 1,
-    "and its description");
+      "and its description");
 
     # The crew run knows the two DISTINCT nodes, not the three tasks.
     var st = agnosai_crew_state_manager_get(agnosai_fleet_coordinator_state_manager(c), run);
     assert(st != 0, "the run exists in the state manager");
     assert_eq(vec_len(agnosai_dist_crew_state_participating(st)), 2,
-    "and has one participant per DISTINCT assigned node");
+      "and has one participant per DISTINCT assigned node");
 
     # --- past the oracle: fan_out passes the MAX per-node count ---------
     # node-a gets two tasks and node-b one, so BOTH are provisioned for 2 and
@@ -101,7 +101,7 @@ fn main(): i64 {
     # asserts it; a per-node implementation passes every oracle test.
     var pb = map_get(agnosai_dist_crew_state_node_progress(st), str_from("node-b"));
     assert_eq(agnosai_node_progress_tasks_total(pb), 2,
-    "node-b gets the MAX per-node count (2), not its own (1)");
+      "node-b gets the MAX per-node count (2), not its own (1)");
     var pa = map_get(agnosai_dist_crew_state_node_progress(st), str_from("node-a"));
     assert_eq(agnosai_node_progress_tasks_total(pa), 2, "node-a's own count is also 2");
 
@@ -110,61 +110,61 @@ fn main(): i64 {
     # lose work whenever placement returns fewer assignments than tasks.
     var cu = agnosai_fleet_coordinator_new();
     agnosai_fleet_coordinator_fan_out(cu, _t_vec2(_t_task("u1", "d"), _t_task("u2", "d")),
-    _t_vec1(_t_assign("u1", "node-a")));
+      _t_vec1(_t_assign("u1", "node-a")));
     assert_eq(agnosai_fleet_coordinator_task_count(cu), 2, "both tasks are tracked");
     var u2 = agnosai_fleet_coordinator_task(cu, str_from("u2"));
     assert_eq(agnosai_fleet_task_status(u2), AGNOSAI_FTASK_PENDING,
-    "a task with no assignment is Pending, not dropped");
+      "a task with no assignment is Pending, not dropped");
     assert_eq(agnosai_fleet_task_assigned_node(u2), 0, "and carries no node");
     # ⚠ An unassigned node is 0, not a Str — matching it against an id must not
     # fault or match spuriously. Verified load-bearing: dropping the `n != 0`
     # guard in `tasks_for_node` segfaults here rather than returning a wrong
     # count, so this is the assertion that keeps the guard alive.
     assert_eq(vec_len(agnosai_fleet_coordinator_tasks_for_node(cu, str_from(""))), 0,
-    "an unassigned task does not match the empty node id");
+      "an unassigned task does not match the empty node id");
 
     # --- oracle: task_completed_transitions / task_completed_unknown ----
     assert_eq(agnosai_fleet_coordinator_task_completed(c, str_from("t1")), 1,
-    "completing a known task succeeds");
+      "completing a known task succeeds");
     assert_eq(agnosai_fleet_task_status(agnosai_fleet_coordinator_task(c, str_from("t1"))),
-    AGNOSAI_FTASK_COMPLETED, "and sets Completed");
+      AGNOSAI_FTASK_COMPLETED, "and sets Completed");
     assert_eq(agnosai_fleet_coordinator_task_completed(c, str_from("nope")), 0,
-    "completing an unknown task reports failure");
+      "completing an unknown task reports failure");
 
     # --- oracle: task_failed_with_retries_returns_retry -----------------
     # And past it: max_retries = 3 means failure 1 -> Retry, failure 2 -> Retry,
     # failure 3 -> Exhausted. TWO retries, not three.
     var cr = agnosai_fleet_coordinator_with_max_retries(3);
     agnosai_fleet_coordinator_fan_out(cr, _t_vec1(_t_task("x", "d")),
-    _t_vec1(_t_assign("x", "n")));
+      _t_vec1(_t_assign("x", "n")));
 
     assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("x")),
-    AGNOSAI_FAILOVER_RETRY, "failure 1 of 3 retries");
+      AGNOSAI_FAILOVER_RETRY, "failure 1 of 3 retries");
     assert_eq(agnosai_fleet_task_status(agnosai_fleet_coordinator_task(cr, str_from("x"))),
-    AGNOSAI_FTASK_REASSIGNED, "and marks the task Reassigned");
+      AGNOSAI_FTASK_REASSIGNED, "and marks the task Reassigned");
     assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("x")),
-    AGNOSAI_FAILOVER_RETRY, "failure 2 also retries");
+      AGNOSAI_FAILOVER_RETRY, "failure 2 also retries");
     assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("x")),
-    AGNOSAI_FAILOVER_EXHAUSTED, "failure 3 EXHAUSTS — two retries, not three");
+      AGNOSAI_FAILOVER_EXHAUSTED, "failure 3 EXHAUSTS — two retries, not three");
     assert_eq(agnosai_fleet_task_status(agnosai_fleet_coordinator_task(cr, str_from("x"))),
-    AGNOSAI_FTASK_FAILED, "and marks the task Failed");
+      AGNOSAI_FTASK_FAILED, "and marks the task Failed");
     assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("x")),
-    AGNOSAI_FAILOVER_EXHAUSTED, "and stays exhausted afterwards");
+      AGNOSAI_FAILOVER_EXHAUSTED, "and stays exhausted afterwards");
 
     # --- oracle: task_failed_exhausted_after_max_retries ----------------
     var c2r = agnosai_fleet_coordinator_with_max_retries(2);
     agnosai_fleet_coordinator_fan_out(c2r, _t_vec1(_t_task("w", "d")),
-    _t_vec1(_t_assign("w", "n")));
+      _t_vec1(_t_assign("w", "n")));
     assert_eq(agnosai_fleet_coordinator_task_failed(c2r, str_from("w")),
-    AGNOSAI_FAILOVER_RETRY, "max_retries=2 retries once");
+      AGNOSAI_FAILOVER_RETRY, "max_retries=2 retries once");
     assert_eq(agnosai_fleet_coordinator_task_failed(c2r, str_from("w")),
-    AGNOSAI_FAILOVER_EXHAUSTED, "and exhausts on the second failure");
+      AGNOSAI_FAILOVER_EXHAUSTED, "and exhausts on the second failure");
     assert_eq(agnosai_fleet_task_status(agnosai_fleet_coordinator_task(c2r, str_from("w"))),
-    AGNOSAI_FTASK_FAILED, "leaving the task Failed");
+      AGNOSAI_FTASK_FAILED, "leaving the task Failed");
 
     # --- oracle: task_failed_unknown ------------------------------------
     assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("nope")),
-    AGNOSAI_FAILOVER_UNKNOWN_TASK, "an unknown task reports UnknownTask");
+      AGNOSAI_FAILOVER_UNKNOWN_TASK, "an unknown task reports UnknownTask");
 
     # --- past the oracle: max_retries = 1 exhausts immediately ----------
     # The boundary the `<` test creates: one failure and it is done, with no
@@ -173,78 +173,78 @@ fn main(): i64 {
     agnosai_fleet_coordinator_fan_out(c1, _t_vec1(_t_task("y", "d")), vec_new());
     assert_eq(agnosai_fleet_coordinator_max_retries(c1), 1, "the ceiling round-trips");
     assert_eq(agnosai_fleet_coordinator_task_failed(c1, str_from("y")),
-    AGNOSAI_FAILOVER_EXHAUSTED, "max_retries=1 exhausts on the FIRST failure");
+      AGNOSAI_FAILOVER_EXHAUSTED, "max_retries=1 exhausts on the FIRST failure");
     assert_eq(agnosai_fleet_coordinator_max_retries(agnosai_fleet_coordinator_new()), 3,
-    "and the default ceiling is 3");
+      "and the default ceiling is 3");
 
     # --- past the oracle: retry counts are per task ---------------------
     var cp = agnosai_fleet_coordinator_new();
     agnosai_fleet_coordinator_fan_out(cp, _t_vec2(_t_task("p", "d"), _t_task("q", "d")),
-    vec_new());
+      vec_new());
     agnosai_fleet_coordinator_task_failed(cp, str_from("p"));
     agnosai_fleet_coordinator_task_failed(cp, str_from("p"));
     assert_eq(agnosai_fleet_coordinator_task_failed(cp, str_from("q")),
-    AGNOSAI_FAILOVER_RETRY, "q's counter is its own — p's two failures do not exhaust it");
+      AGNOSAI_FAILOVER_RETRY, "q's counter is its own — p's two failures do not exhaust it");
 
     # --- oracle: tasks_for_node_filters ---------------------------------
     assert_eq(vec_len(agnosai_fleet_coordinator_tasks_for_node(c, str_from("node-a"))), 2,
-    "two tasks on node-a");
+      "two tasks on node-a");
     assert_eq(vec_len(agnosai_fleet_coordinator_tasks_for_node(c, str_from("node-b"))), 1,
-    "one on node-b");
+      "one on node-b");
     assert_eq(vec_len(agnosai_fleet_coordinator_tasks_for_node(c, str_from("node-z"))), 0,
-    "none on an unknown node");
+      "none on an unknown node");
 
     # --- oracle: is_complete_all_done -----------------------------------
     var ic = agnosai_fleet_coordinator_new();
     # ⚠ Past the oracle: an EMPTY coordinator is complete. "Complete" is not
     # "did work", and a caller polling for termination must not read it as one.
     assert_eq(agnosai_fleet_coordinator_is_complete(ic), 1,
-    "an EMPTY coordinator is complete");
+      "an EMPTY coordinator is complete");
     _t_assert_f64(agnosai_fleet_coordinator_completion_pct(ic), f64_from(1),
-    "and its completion is 1.0");
+      "and its completion is 1.0");
 
     agnosai_fleet_coordinator_fan_out(ic, _t_vec2(_t_task("i1", "d"), _t_task("i2", "d")),
-    vec_new());
+      vec_new());
     assert_eq(agnosai_fleet_coordinator_is_complete(ic), 0, "with pending tasks it is not");
     agnosai_fleet_coordinator_task_completed(ic, str_from("i1"));
     assert_eq(agnosai_fleet_coordinator_is_complete(ic), 0, "nor with one still pending");
     agnosai_fleet_coordinator_task_completed(ic, str_from("i2"));
     assert_eq(agnosai_fleet_coordinator_is_complete(ic), 1, "and is once both are done");
     _t_assert_f64(agnosai_fleet_coordinator_completion_pct(ic), f64_from(1),
-    "with completion 1.0");
+      "with completion 1.0");
 
     # --- oracle: is_complete_with_terminal_failure ----------------------
     var itf = agnosai_fleet_coordinator_with_max_retries(1);
     agnosai_fleet_coordinator_fan_out(itf, _t_vec2(_t_task("f1", "d"), _t_task("f2", "d")),
-    vec_new());
+      vec_new());
     agnosai_fleet_coordinator_task_completed(itf, str_from("f1"));
     agnosai_fleet_coordinator_task_failed(itf, str_from("f2"));
     assert_eq(agnosai_fleet_coordinator_is_complete(itf), 1,
-    "a terminally failed task still counts as complete");
+      "a terminally failed task still counts as complete");
     # ⚠ Past the oracle: complete, but NOT fully completed.
     _t_assert_f64(agnosai_fleet_coordinator_completion_pct(itf), _t_f64_ratio(1, 2),
-    "yet completion is 1/2 — finished and succeeded are different questions");
+      "yet completion is 1/2 — finished and succeeded are different questions");
 
     # --- past the oracle: Reassigned is NOT terminal --------------------
     var ir = agnosai_fleet_coordinator_new();
     agnosai_fleet_coordinator_fan_out(ir, _t_vec1(_t_task("r1", "d")), vec_new());
     agnosai_fleet_coordinator_task_failed(ir, str_from("r1"));
     assert_eq(agnosai_fleet_task_status(agnosai_fleet_coordinator_task(ir, str_from("r1"))),
-    AGNOSAI_FTASK_REASSIGNED, "the task is Reassigned");
+      AGNOSAI_FTASK_REASSIGNED, "the task is Reassigned");
     assert_eq(agnosai_fleet_coordinator_is_complete(ir), 0,
-    "and a Reassigned task keeps the coordinator incomplete — it awaits a node");
+      "and a Reassigned task keeps the coordinator incomplete — it awaits a node");
     assert_eq(agnosai_fleet_task_status_is_terminal(AGNOSAI_FTASK_REASSIGNED), 0,
-    "Reassigned is not terminal");
+      "Reassigned is not terminal");
     assert_eq(agnosai_fleet_task_status_is_terminal(AGNOSAI_FTASK_PENDING), 0,
-    "nor is Pending");
+      "nor is Pending");
     assert_eq(agnosai_fleet_task_status_is_terminal(AGNOSAI_FTASK_ASSIGNED), 0,
-    "nor Assigned");
+      "nor Assigned");
     assert_eq(agnosai_fleet_task_status_is_terminal(AGNOSAI_FTASK_RUNNING), 0,
-    "nor Running");
+      "nor Running");
     assert_eq(agnosai_fleet_task_status_is_terminal(AGNOSAI_FTASK_COMPLETED), 1,
-    "Completed is");
+      "Completed is");
     assert_eq(agnosai_fleet_task_status_is_terminal(AGNOSAI_FTASK_FAILED), 1,
-    "and Failed is");
+      "and Failed is");
 
     # --- oracle: completion_pct_calculation -----------------------------
     var cc = agnosai_fleet_coordinator_new();
@@ -253,43 +253,43 @@ fn main(): i64 {
     vec_push(ct, _t_task("c4", "d"));
     agnosai_fleet_coordinator_fan_out(cc, ct, vec_new());
     _t_assert_f64(agnosai_fleet_coordinator_completion_pct(cc), f64_from(0),
-    "nothing completed is 0.0");
+      "nothing completed is 0.0");
     agnosai_fleet_coordinator_task_completed(cc, str_from("c1"));
     _t_assert_f64(agnosai_fleet_coordinator_completion_pct(cc), _t_f64_ratio(1, 4),
-    "one of four is 1/4");
+      "one of four is 1/4");
     agnosai_fleet_coordinator_task_completed(cc, str_from("c2"));
     agnosai_fleet_coordinator_task_completed(cc, str_from("c3"));
     _t_assert_f64(agnosai_fleet_coordinator_completion_pct(cc), _t_f64_ratio(3, 4),
-    "three of four is 3/4");
+      "three of four is 3/4");
 
     # --- oracle: pending_reassignment_lists_retriable -------------------
     var pr = agnosai_fleet_coordinator_new();
     agnosai_fleet_coordinator_fan_out(pr, _t_vec2(_t_task("g1", "d"), _t_task("g2", "d")),
-    vec_new());
+      vec_new());
     assert_eq(vec_len(agnosai_fleet_coordinator_pending_reassignment(pr)), 0,
-    "nothing awaits reassignment initially");
+      "nothing awaits reassignment initially");
     agnosai_fleet_coordinator_task_failed(pr, str_from("g1"));
     assert_eq(vec_len(agnosai_fleet_coordinator_pending_reassignment(pr)), 1,
-    "a retriable failure appears");
+      "a retriable failure appears");
     assert(str_eq_cstr(agnosai_fleet_task_id(
-    vec_get(agnosai_fleet_coordinator_pending_reassignment(pr), 0)), "g1") == 1,
-    "and it is the failed task");
+          vec_get(agnosai_fleet_coordinator_pending_reassignment(pr), 0)), "g1") == 1,
+      "and it is the failed task");
     agnosai_fleet_coordinator_task_completed(pr, str_from("g2"));
     assert_eq(vec_len(agnosai_fleet_coordinator_pending_reassignment(pr)), 1,
-    "a completed task does not appear");
+      "a completed task does not appear");
 
     # --- oracle: reassign_moves_task / reassign_unknown_task ------------
     assert_eq(agnosai_fleet_coordinator_reassign(pr, str_from("g1"), str_from("node-z")), 1,
-    "reassigning a known task succeeds");
+      "reassigning a known task succeeds");
     var g1 = agnosai_fleet_coordinator_task(pr, str_from("g1"));
     assert(str_eq_cstr(agnosai_fleet_task_assigned_node(g1), "node-z") == 1, "it moves node");
     assert_eq(agnosai_fleet_task_status(g1), AGNOSAI_FTASK_ASSIGNED, "and returns to Assigned");
     assert_eq(vec_len(agnosai_fleet_coordinator_pending_reassignment(pr)), 0,
-    "and leaves the reassignment queue");
+      "and leaves the reassignment queue");
     assert_eq(vec_len(agnosai_fleet_coordinator_tasks_for_node(pr, str_from("node-z"))), 1,
-    "and is now found under the new node");
+      "and is now found under the new node");
     assert_eq(agnosai_fleet_coordinator_reassign(pr, str_from("nope"), str_from("n")), 0,
-    "reassigning an unknown task reports failure");
+      "reassigning an unknown task reports failure");
 
     # --- past the oracle: reassign revives AND keeps the retry count ----
     # Unconditional on the current status, and it does not reset the counter —
@@ -300,20 +300,20 @@ fn main(): i64 {
     agnosai_fleet_coordinator_fan_out(rv, _t_vec1(_t_task("z", "d")), vec_new());
     agnosai_fleet_coordinator_task_failed(rv, str_from("z"));
     assert_eq(agnosai_fleet_coordinator_task_failed(rv, str_from("z")),
-    AGNOSAI_FAILOVER_EXHAUSTED, "two failures exhaust at max_retries=2");
+      AGNOSAI_FAILOVER_EXHAUSTED, "two failures exhaust at max_retries=2");
     assert_eq(agnosai_fleet_coordinator_reassign(rv, str_from("z"), str_from("fresh")), 1,
-    "a terminally Failed task can still be reassigned — it is REVIVED");
+      "a terminally Failed task can still be reassigned — it is REVIVED");
     assert_eq(agnosai_fleet_task_status(agnosai_fleet_coordinator_task(rv, str_from("z"))),
-    AGNOSAI_FTASK_ASSIGNED, "back to Assigned");
+      AGNOSAI_FTASK_ASSIGNED, "back to Assigned");
     assert_eq(agnosai_fleet_coordinator_task_failed(rv, str_from("z")),
-    AGNOSAI_FAILOVER_EXHAUSTED,
-    "but the retry count was NOT reset — the next failure exhausts immediately");
+      AGNOSAI_FAILOVER_EXHAUSTED,
+      "but the retry count was NOT reset — the next failure exhausts immediately");
 
     # --- oracle: state_manager_accessible -------------------------------
     assert(agnosai_fleet_coordinator_state_manager(agnosai_fleet_coordinator_new()) != 0,
-    "a fresh coordinator's state manager is reachable");
+      "a fresh coordinator's state manager is reachable");
     assert_eq(vec_len(agnosai_crew_state_manager_active_runs(
-    agnosai_fleet_coordinator_state_manager(c))), 1, "and carries the run fan_out created");
+          agnosai_fleet_coordinator_state_manager(c))), 1, "and carries the run fan_out created");
 
     # --- oracle hwaccel: plan_sharding_single_gpu_no_shard --------------
     # 7B at FP16 (~14GB, ~16.8GB with ai-hwaccel's 20% activation overhead) on
@@ -321,7 +321,7 @@ fn main(): i64 {
     # own test-registry builder, the same shape as the oracle's `from_profiles`.
     var single = _t_vec2(profile_cpu(64 * BYTES_PER_GIB), profile_cuda(0, 80 * BYTES_PER_GIB));
     var plan1 = agnosai_fleet_plan_sharding(registry_from_profiles(single),
-    7000000000, QUANT_FP16);
+      7000000000, QUANT_FP16);
     assert(plan_num_shards(plan1) <= 1, "7B FP16 on 80GiB needs no sharding");
     assert_eq(plan_min_devices(plan1), 1, "and one device suffices");
 
@@ -330,16 +330,16 @@ fn main(): i64 {
     var multi = _t_vec2(profile_cpu(128 * BYTES_PER_GIB), profile_cuda(0, 80 * BYTES_PER_GIB));
     vec_push(multi, profile_cuda(1, 80 * BYTES_PER_GIB));
     var plan2 = agnosai_fleet_plan_sharding(registry_from_profiles(multi),
-    70000000000, QUANT_FP16);
+      70000000000, QUANT_FP16);
     assert(plan_num_shards(plan2) >= 2, "70B FP16 on 2x80GiB shards across devices");
     assert(plan_total_memory(plan2) > 0, "and the plan reports memory usage");
 
     # --- oracle hwaccel: plan_sharding_quantized_fits_single ------------
     # 70B at INT4 (~35GB, ~42GB with overhead) fits one 80GiB GPU.
     var quantized = _t_vec2(profile_cpu(64 * BYTES_PER_GIB),
-    profile_cuda(0, 80 * BYTES_PER_GIB));
+      profile_cuda(0, 80 * BYTES_PER_GIB));
     var plan3 = agnosai_fleet_plan_sharding(registry_from_profiles(quantized),
-    70000000000, QUANT_INT4);
+      70000000000, QUANT_INT4);
     assert(plan_num_shards(plan3) <= 1, "70B INT4 on 80GiB fits without sharding");
 
     # --- past the oracle: the delegation really passes the quant --------
@@ -347,18 +347,18 @@ fn main(): i64 {
     # a dropped or transposed argument. The oracle's three tests each use a
     # different registry, so a hardcoded quant would still pass all three.
     assert(quant_model_bytes(70000000000, QUANT_INT4)
-    < quant_model_bytes(70000000000, QUANT_FP16),
-    "INT4 needs less memory than FP16 for the same parameter count");
+      < quant_model_bytes(70000000000, QUANT_FP16),
+      "INT4 needs less memory than FP16 for the same parameter count");
     var plan4 = agnosai_fleet_plan_sharding(registry_from_profiles(quantized),
-    70000000000, QUANT_FP16);
+      70000000000, QUANT_FP16);
     assert(plan_total_memory(plan4) > plan_total_memory(plan3),
-    "the SAME registry and model at FP16 plans more memory — the quant reaches the planner");
+      "the SAME registry and model at FP16 plans more memory — the quant reaches the planner");
 
     # --- past the oracle: an empty registry still answers a plan --------
     # `reg_best_available` returns 0 with no devices, and the planner's
     # no-accelerator path must produce a usable plan rather than a null.
     var empty_plan = agnosai_fleet_plan_sharding(registry_from_profiles(vec_new()),
-    7000000000, QUANT_FP16);
+      7000000000, QUANT_FP16);
     assert(empty_plan != 0, "a registry with no devices still yields a plan");
     assert(plan_min_devices(empty_plan) >= 0, "and reports a minimum device count");
 

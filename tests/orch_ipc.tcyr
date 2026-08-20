@@ -77,7 +77,7 @@ fn main() {
     assert_eq(AGNOSAI_IPC_MAX_FRAME_SIZE, 16777216, "the frame cap is the oracle's 16 MiB");
     assert_eq(AGNOSAI_IPC_MAX_FRAME_SIZE, 16 * 1024 * 1024, "spelled the oracle's way");
     assert(AGNOSAI_IPC_MAX_FRAME_SIZE > 1048576,
-    "and is larger than majra's 1 MiB, which is why the framing is not delegated");
+      "and is larger than majra's 1 MiB, which is why the framing is not delegated");
 
     var fds: i64[2];
     assert_eq(_t_pair(&fds), 1, "socketpair gives a connected AF_UNIX pair");
@@ -90,7 +90,7 @@ fn main() {
     assert(got != AGNOSAI_IPC_ERR, "and is received without error");
     assert(got != AGNOSAI_IPC_EOF, "and is not EOF");
     assert(str_eq(bayan_json_v_build(got), str_from("{\"hello\":\"world\",\"n\":42}")) == 1,
-    "round-tripping the payload unchanged");
+      "round-tripping the payload unchanged");
     assert_eq(agnosai_ipc_last_error(), 0, "with no error recorded");
 
     # --- multiple_messages_same_connection ---
@@ -100,11 +100,11 @@ fn main() {
     _t_send_json(a, "{\"seq\":2}");
     _t_send_json(a, "{\"seq\":3}");
     assert(str_eq(bayan_json_v_build(agnosai_ipc_recv(b)), str_from("{\"seq\":1}")) == 1,
-    "the first of three queued frames");
+      "the first of three queued frames");
     assert(str_eq(bayan_json_v_build(agnosai_ipc_recv(b)), str_from("{\"seq\":2}")) == 1,
-    "the second, with its boundary intact");
+      "the second, with its boundary intact");
     assert(str_eq(bayan_json_v_build(agnosai_ipc_recv(b)), str_from("{\"seq\":3}")) == 1,
-    "and the third");
+      "and the third");
 
     # --- large_payload_over_64kb ---
     # The oracle tests >64 KiB specifically; this also exceeds a single socket
@@ -145,7 +145,7 @@ fn main() {
     syscall(SYS_WRITE, _t_fd0(&z), &zhdr, 4);
     assert_eq(agnosai_ipc_read_frame(_t_fd1(&z)), AGNOSAI_IPC_ERR, "a zero-length frame is refused");
     assert(str_eq(agnosai_ipc_last_error(), str_from("empty frame (zero-length)")) == 1,
-    "with the oracle's exact wording");
+      "with the oracle's exact wording");
 
     # --- an over-cap declared length is refused before any allocation ---
     var o: i64[2];
@@ -157,28 +157,28 @@ fn main() {
     store8(&ohdr + 3, 255);
     syscall(SYS_WRITE, _t_fd0(&o), &ohdr, 4);
     assert_eq(agnosai_ipc_read_frame(_t_fd1(&o)), AGNOSAI_IPC_ERR,
-    "a 4 GiB declared length is refused");
+      "a 4 GiB declared length is refused");
     assert(str_contains(agnosai_ipc_last_error(), str_from("exceeds maximum")) == 1,
-    "naming the cap rather than attempting the allocation");
+      "naming the cap rather than attempting the allocation");
 
     # writing an over-cap frame is refused symmetrically
     assert_eq(agnosai_ipc_write_frame(_t_fd0(&o), 0, AGNOSAI_IPC_MAX_FRAME_SIZE + 1),
-    AGNOSAI_IPC_ERR, "and an over-cap write is refused too");
+      AGNOSAI_IPC_ERR, "and an over-cap write is refused too");
     assert(str_contains(agnosai_ipc_last_error(), str_from("exceeds maximum")) == 1,
-    "with the same message");
+      "with the same message");
     # exactly at the cap is permitted by the check — the oracle compares with >
     assert(str_contains(_agnosai_ipc_too_large(AGNOSAI_IPC_MAX_FRAME_SIZE),
-    str_from("16777216 exceeds maximum 16777216")) == 1,
-    "the message quotes the offending length and the cap");
+        str_from("16777216 exceeds maximum 16777216")) == 1,
+      "the message quotes the offending length and the cap");
 
     # --- a clean peer close is EOF, not an error ---
     var c: i64[2];
     _t_pair(&c);
     sys_close(_t_fd0(&c));
     assert_eq(agnosai_ipc_read_frame(_t_fd1(&c)), AGNOSAI_IPC_EOF,
-    "a closed peer reads as EOF rather than a failure — a finished peer is not a fault");
+      "a closed peer reads as EOF rather than a failure — a finished peer is not a fault");
     assert(str_contains(agnosai_ipc_last_error(), str_from("peer disconnected")) == 1,
-    "and says so");
+      "and says so");
     assert_eq(agnosai_ipc_recv(_t_fd1(&c)), AGNOSAI_IPC_EOF, "recv propagates EOF too");
 
     # --- a truncated frame is an error, not EOF ---
@@ -193,27 +193,27 @@ fn main() {
     syscall(SYS_WRITE, _t_fd0(&t), "abc", 3);
     sys_close(_t_fd0(&t));
     assert_eq(agnosai_ipc_read_frame(_t_fd1(&t)), AGNOSAI_IPC_ERR,
-    "a frame cut off mid-payload is an ERROR, not the clean EOF above");
+      "a frame cut off mid-payload is an ERROR, not the clean EOF above");
     assert(str_contains(agnosai_ipc_last_error(), str_from("mid-frame")) == 1,
-    "and is reported as mid-frame");
+      "and is reported as mid-frame");
     assert(str_contains(agnosai_ipc_last_error(), str_from("expected 10 bytes")) == 1,
-    "naming how many bytes were promised");
+      "naming how many bytes were promised");
 
     # --- a frame that is not JSON is an error, not EOF ---
     var j: i64[2];
     _t_pair(&j);
     agnosai_ipc_write_frame(_t_fd0(&j), "not json", 8);
     assert_eq(agnosai_ipc_recv(_t_fd1(&j)), AGNOSAI_IPC_ERR,
-    "an intact frame carrying non-JSON is an error");
+      "an intact frame carrying non-JSON is an error");
     assert(str_contains(agnosai_ipc_last_error(), str_from("failed to parse frame as JSON")) == 1,
-    "distinguished from a transport failure");
+      "distinguished from a transport failure");
 
     # --- the error slot is cleared on entry, so it is never stale ---
     var s: i64[2];
     _t_pair(&s);
     assert_eq(_t_send_json(_t_fd0(&s), "{\"ok\":1}"), 0, "a good send succeeds");
     assert_eq(agnosai_ipc_last_error(), 0,
-    "and clears the error left by the failures above rather than leaving it to be misread");
+      "and clears the error left by the failures above rather than leaving it to be misread");
 
     # --- server_bind_and_client_connect ---
     # The only path socketpair cannot stand in for: a real socket file, a real
@@ -231,7 +231,7 @@ fn main() {
     assert(from_client != AGNOSAI_IPC_ERR, "a frame arrives over the real socket");
     assert(from_client != AGNOSAI_IPC_EOF, "and is not EOF");
     assert(str_eq(bayan_json_v_build(from_client), str_from("{\"from\":\"client\"}")) == 1,
-    "carrying the client's payload — the same framing works over a bound socket");
+      "carrying the client's payload — the same framing works over a bound socket");
 
     thread_join(ctid);
     sys_close(conn);
@@ -245,15 +245,15 @@ fn main() {
     # and again WITHOUT unlinking, which is what the oracle's remove-first is for
     var srv3 = agnosai_ipc_bind(str_from(_T_SOCK));
     assert(srv3 != AGNOSAI_IPC_ERR,
-    "binding over an existing socket file succeeds, since bind unlinks it first");
+      "binding over an existing socket file succeeds, since bind unlinks it first");
     sys_close(srv3);
     sys_unlink(str_cstr(str_from(_T_SOCK)));
 
     # --- connecting to a path with no listener fails cleanly ---
     assert_eq(agnosai_ipc_connect(str_from("/tmp/agnosai-no-such-socket.sock")),
-    AGNOSAI_IPC_ERR, "connecting to a dead path is an error, not a hang");
+      AGNOSAI_IPC_ERR, "connecting to a dead path is an error, not a hang");
     assert(str_eq(agnosai_ipc_last_error(), str_from("connect failed")) == 1,
-    "with the oracle's wording");
+      "with the oracle's wording");
 
     return assert_summary();
 }

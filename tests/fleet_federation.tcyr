@@ -73,40 +73,40 @@ fn main(): i64 {
     var online = agnosai_federation_online_clusters(fm);
     assert_eq(vec_len(online), 1, "and it is online");
     assert(str_eq_cstr(agnosai_cluster_info_id(vec_get(online, 0)), "cluster-b") == 1,
-    "with its id");
+      "with its id");
     assert_eq(agnosai_cluster_info_node_count(vec_get(online, 0)), 5, "and its node count");
     assert(str_eq_cstr(agnosai_cluster_info_endpoint(vec_get(online, 0)),
-    "http://b:8080") == 1, "and its endpoint");
+        "http://b:8080") == 1, "and its endpoint");
 
     # --- past the oracle: a new cluster is seeded Follower and Online ---
     assert_eq(agnosai_cluster_info_role(vec_get(online, 0)), AGNOSAI_FED_FOLLOWER,
-    "a joining cluster starts as a Follower");
+      "a joining cluster starts as a Follower");
     assert_eq(agnosai_cluster_info_status(vec_get(online, 0)), AGNOSAI_CLUSTER_ONLINE,
-    "and Online");
+      "and Online");
     assert(agnosai_cluster_info_last_heartbeat_instant(vec_get(online, 0)) > 0,
-    "with a monotonic heartbeat instant");
+      "with a monotonic heartbeat instant");
     assert(agnosai_cluster_info_last_heartbeat(vec_get(online, 0)) > 0,
-    "and a wall-clock one — two clocks, as the oracle carries");
+      "and a wall-clock one — two clocks, as the oracle carries");
 
     # ⚠ Past the oracle: this cluster is NOT in its own map, so a lone
     # federation reports zero known clusters while still electing itself.
     assert_eq(agnosai_federation_cluster(fm, str_from("cluster-a")), 0,
-    "self is not a known cluster");
+      "self is not a known cluster");
 
     # --- oracle: heartbeat_updates_existing -----------------------------
     agnosai_federation_heartbeat(fm, str_from("cluster-b"), str_from("http://b:8080"), 10);
     assert_eq(agnosai_federation_cluster_count(fm), 1, "a repeat heartbeat does not add");
     assert_eq(agnosai_cluster_info_node_count(agnosai_federation_cluster(fm,
-    str_from("cluster-b"))), 10, "it updates the node count");
+          str_from("cluster-b"))), 10, "it updates the node count");
 
     # --- past the oracle: a heartbeat resurrects and re-endpoints -------
     var b = agnosai_federation_cluster(fm, str_from("cluster-b"));
     agnosai_cluster_info_set_status(b, AGNOSAI_CLUSTER_OFFLINE);
     agnosai_federation_heartbeat(fm, str_from("cluster-b"), str_from("http://b2:9090"), 11);
     assert_eq(agnosai_cluster_info_status(b), AGNOSAI_CLUSTER_ONLINE,
-    "a heartbeat resets an Offline cluster to Online unconditionally");
+      "a heartbeat resets an Offline cluster to Online unconditionally");
     assert(str_eq_cstr(agnosai_cluster_info_endpoint(b), "http://b2:9090") == 1,
-    "and adopts the new endpoint");
+      "and adopts the new endpoint");
 
     # ⚠ Past the oracle: the ROLE survives a heartbeat. The oracle seeds it in
     # `or_insert_with` and never touches it again, so a coordinator that beats
@@ -117,7 +117,7 @@ fn main(): i64 {
     assert_eq(agnosai_cluster_info_role(b), AGNOSAI_FED_COORDINATOR, "cluster-b leads");
     agnosai_federation_heartbeat(fm, str_from("cluster-b"), str_from("http://b:8080"), 12);
     assert_eq(agnosai_cluster_info_role(b), AGNOSAI_FED_COORDINATOR,
-    "and a heartbeat does NOT demote it");
+      "and a heartbeat does NOT demote it");
 
     # --- oracle: check_liveness_marks_suspect_and_offline ---------------
     var fl = _t_fed_manager("a");
@@ -125,11 +125,11 @@ fn main(): i64 {
     _t_backdate(fl, "b", 150);
     agnosai_federation_check_liveness(fl);
     assert_eq(agnosai_cluster_info_status(agnosai_federation_cluster(fl, str_from("b"))),
-    AGNOSAI_CLUSTER_SUSPECT, "150 ms past a 100 ms suspect timeout is Suspect");
+      AGNOSAI_CLUSTER_SUSPECT, "150 ms past a 100 ms suspect timeout is Suspect");
     _t_backdate(fl, "b", 250);
     agnosai_federation_check_liveness(fl);
     assert_eq(agnosai_cluster_info_status(agnosai_federation_cluster(fl, str_from("b"))),
-    AGNOSAI_CLUSTER_OFFLINE, "250 ms past a 200 ms offline timeout is Offline");
+      AGNOSAI_CLUSTER_OFFLINE, "250 ms past a 200 ms offline timeout is Offline");
 
     # --- past the oracle: inside the window nothing moves ---------------
     var fw = _t_fed_manager("a");
@@ -137,21 +137,21 @@ fn main(): i64 {
     _t_backdate(fw, "b", 99);
     agnosai_federation_check_liveness(fw);
     assert_eq(agnosai_cluster_info_status(agnosai_federation_cluster(fw, str_from("b"))),
-    AGNOSAI_CLUSTER_ONLINE, "99 ms inside a 100 ms suspect timeout stays Online");
+      AGNOSAI_CLUSTER_ONLINE, "99 ms inside a 100 ms suspect timeout stays Online");
 
     # ⚠ Past the oracle: the sweep only ever DEMOTES. Sweeping a fresh
     # heartbeat must not walk an Offline cluster back to Online.
     _t_backdate(fw, "b", 250);
     agnosai_federation_check_liveness(fw);
     assert_eq(agnosai_cluster_info_status(agnosai_federation_cluster(fw, str_from("b"))),
-    AGNOSAI_CLUSTER_OFFLINE, "and 250 ms past is Offline");
+      AGNOSAI_CLUSTER_OFFLINE, "and 250 ms past is Offline");
     _t_backdate(fw, "b", 0);
     agnosai_federation_check_liveness(fw);
     assert_eq(agnosai_cluster_info_status(agnosai_federation_cluster(fw, str_from("b"))),
-    AGNOSAI_CLUSTER_OFFLINE, "a fresh instant does NOT revive it — only a heartbeat does");
+      AGNOSAI_CLUSTER_OFFLINE, "a fresh instant does NOT revive it — only a heartbeat does");
     agnosai_federation_heartbeat(fw, str_from("b"), str_from("http://b:8080"), 1);
     assert_eq(agnosai_cluster_info_status(agnosai_federation_cluster(fw, str_from("b"))),
-    AGNOSAI_CLUSTER_ONLINE, "and a heartbeat does");
+      AGNOSAI_CLUSTER_ONLINE, "and a heartbeat does");
 
     # ⚠ Past the oracle: the arm ORDER is observable. The timeouts overlap by
     # construction (200 >= 100), so a Suspect-first sweep would pin a long-dead
@@ -159,7 +159,7 @@ fn main(): i64 {
     _t_backdate(fw, "b", 2000);
     agnosai_federation_check_liveness(fw);
     assert_eq(agnosai_cluster_info_status(agnosai_federation_cluster(fw, str_from("b"))),
-    AGNOSAI_CLUSTER_OFFLINE, "a cluster past BOTH timeouts is Offline, not Suspect");
+      AGNOSAI_CLUSTER_OFFLINE, "a cluster past BOTH timeouts is Offline, not Suspect");
 
     # --- oracle: start_election_increments_term / term_increments -------
     var fe = _t_fed_manager("a");
@@ -181,7 +181,7 @@ fn main(): i64 {
     var fd = _t_fed_manager("a");
     agnosai_federation_start_election(fd);
     assert_eq(agnosai_federation_declare_coordinator(fd, 1, str_from("a")), 1,
-    "declaring at the current term is accepted");
+      "declaring at the current term is accepted");
     assert_eq(agnosai_federation_is_coordinator(fd), 1, "we are the coordinator");
     assert(str_eq_cstr(agnosai_federation_coordinator(fd), "a") == 1, "and coordinator() says so");
 
@@ -190,7 +190,7 @@ fn main(): i64 {
     agnosai_federation_start_election(fs);
     agnosai_federation_start_election(fs);
     assert_eq(agnosai_federation_declare_coordinator(fs, 1, str_from("b")), 0,
-    "a declaration below the current term is refused");
+      "a declaration below the current term is refused");
     assert_eq(agnosai_federation_coordinator(fs), 0, "and changes nothing");
     assert_eq(agnosai_federation_role(fs), AGNOSAI_FED_CANDIDATE, "we stay a Candidate");
     assert_eq(agnosai_federation_term(fs), 2, "and the term is untouched");
@@ -200,12 +200,12 @@ fn main(): i64 {
     # a higher term advances this cluster's term with no election running here
     # — Raft-inspired, not Raft. The oracle tests stale and current only.
     assert_eq(agnosai_federation_declare_coordinator(fs, 9, str_from("z")), 1,
-    "a declaration ABOVE the current term is accepted");
+      "a declaration ABOVE the current term is accepted");
     assert_eq(agnosai_federation_term(fs), 9, "and adopts that term outright");
     assert(str_eq_cstr(agnosai_federation_coordinator(fs), "z") == 1, "with that coordinator");
     assert_eq(agnosai_federation_role(fs), AGNOSAI_FED_FOLLOWER, "leaving us a Follower");
     assert_eq(agnosai_federation_declare_coordinator(fs, 8, str_from("y")), 0,
-    "after which term 8 is itself stale");
+      "after which term 8 is itself stale");
 
     # --- oracle: is_coordinator_reflects_election -----------------------
     var fc = _t_fed_manager("a");
@@ -236,7 +236,7 @@ fn main(): i64 {
     assert(agnosai_federation_coordinator(fa) != 0, "a coordinator is elected");
     agnosai_federation_start_election(fa);
     assert_eq(agnosai_federation_coordinator(fa), 0,
-    "and starting another election clears it before any winner exists");
+      "and starting another election clears it before any winner exists");
     assert_eq(agnosai_federation_is_coordinator(fa), 0, "so we stop being the coordinator");
 
     # --- oracle: elect_by_lowest_id -------------------------------------
@@ -246,7 +246,7 @@ fn main(): i64 {
     var winner = agnosai_federation_elect_by_lowest_id(fel);
     assert(str_eq_cstr(winner, "cluster-a") == 1, "the lowest id wins");
     assert(str_eq_cstr(agnosai_federation_coordinator(fel), "cluster-a") == 1,
-    "and is recorded as coordinator");
+      "and is recorded as coordinator");
     assert_eq(agnosai_federation_role(fel), AGNOSAI_FED_FOLLOWER, "we are a Follower");
     assert_eq(agnosai_federation_term(fel), 1, "the election consumed a term");
 
@@ -254,7 +254,7 @@ fn main(): i64 {
     var fss = _t_fed_manager("aaa");
     agnosai_federation_heartbeat(fss, str_from("bbb"), str_from("http://b:8080"), 1);
     assert(str_eq_cstr(agnosai_federation_elect_by_lowest_id(fss), "aaa") == 1,
-    "we win when our id is lowest");
+      "we win when our id is lowest");
     assert_eq(agnosai_federation_is_coordinator(fss), 1, "and become the coordinator");
 
     # --- past the oracle: a lone cluster elects itself ------------------
@@ -263,7 +263,7 @@ fn main(): i64 {
     var fo = _t_fed_manager("solo");
     assert_eq(agnosai_federation_cluster_count(fo), 0, "no peers at all");
     assert(str_eq_cstr(agnosai_federation_elect_by_lowest_id(fo), "solo") == 1,
-    "and the election still returns a winner — never None");
+      "and the election still returns a winner — never None");
     assert_eq(agnosai_federation_is_coordinator(fo), 1, "which is us");
 
     # --- past the oracle: only ONLINE peers are candidates --------------
@@ -273,16 +273,16 @@ fn main(): i64 {
     agnosai_federation_heartbeat(fq, str_from("a"), str_from("http://a:8080"), 1);
     agnosai_federation_heartbeat(fq, str_from("z"), str_from("http://z:8080"), 1);
     agnosai_cluster_info_set_status(agnosai_federation_cluster(fq, str_from("a")),
-    AGNOSAI_CLUSTER_SUSPECT);
+      AGNOSAI_CLUSTER_SUSPECT);
     assert(str_eq_cstr(agnosai_federation_elect_by_lowest_id(fq), "m") == 1,
-    "a Suspect cluster with the lowest id does not win");
+      "a Suspect cluster with the lowest id does not win");
     agnosai_cluster_info_set_status(agnosai_federation_cluster(fq, str_from("a")),
-    AGNOSAI_CLUSTER_OFFLINE);
+      AGNOSAI_CLUSTER_OFFLINE);
     assert(str_eq_cstr(agnosai_federation_elect_by_lowest_id(fq), "m") == 1,
-    "nor does an Offline one");
+      "nor does an Offline one");
     agnosai_federation_heartbeat(fq, str_from("a"), str_from("http://a:8080"), 1);
     assert(str_eq_cstr(agnosai_federation_elect_by_lowest_id(fq), "a") == 1,
-    "and once it beats again it does");
+      "and once it beats again it does");
 
     # --- past the oracle: ids order by BYTE, not by case ----------------
     # `candidates.sort()` is `String: Ord`, so 'Z' (0x5A) sorts before 'a'.
@@ -290,7 +290,7 @@ fn main(): i64 {
     var fb = _t_fed_manager("alpha");
     agnosai_federation_heartbeat(fb, str_from("Zeta"), str_from("http://z:8080"), 1);
     assert(str_eq_cstr(agnosai_federation_elect_by_lowest_id(fb), "Zeta") == 1,
-    "'Zeta' beats 'alpha' — uppercase sorts first, and case is not folded");
+      "'Zeta' beats 'alpha' — uppercase sorts first, and case is not folded");
 
     # --- past the oracle: self sharing an id with a peer ----------------
     # The oracle's `dedup()` exists for exactly this. Taking the minimum makes
@@ -298,10 +298,10 @@ fn main(): i64 {
     var fdup = _t_fed_manager("same");
     agnosai_federation_heartbeat(fdup, str_from("same"), str_from("http://s:8080"), 1);
     assert(str_eq_cstr(agnosai_federation_elect_by_lowest_id(fdup), "same") == 1,
-    "self and a peer sharing an id elect that id");
+      "self and a peer sharing an id elect that id");
     assert_eq(agnosai_federation_is_coordinator(fdup), 1, "and we hold the role");
     assert_eq(agnosai_cluster_info_role(agnosai_federation_cluster(fdup, str_from("same"))),
-    AGNOSAI_FED_COORDINATOR, "as does the peer entry of the same name");
+      AGNOSAI_FED_COORDINATOR, "as does the peer entry of the same name");
 
     # --- oracle: new_coordinator_resets_old_coordinator_role ------------
     var fn2 = _t_fed_manager("a");
@@ -310,15 +310,15 @@ fn main(): i64 {
     agnosai_federation_start_election(fn2);
     agnosai_federation_declare_coordinator(fn2, 1, str_from("b"));
     assert_eq(agnosai_cluster_info_role(agnosai_federation_cluster(fn2, str_from("b"))),
-    AGNOSAI_FED_COORDINATOR, "b holds the role");
+      AGNOSAI_FED_COORDINATOR, "b holds the role");
     assert_eq(agnosai_cluster_info_role(agnosai_federation_cluster(fn2, str_from("c"))),
-    AGNOSAI_FED_FOLLOWER, "and c follows");
+      AGNOSAI_FED_FOLLOWER, "and c follows");
     agnosai_federation_start_election(fn2);
     agnosai_federation_declare_coordinator(fn2, 2, str_from("c"));
     assert_eq(agnosai_cluster_info_role(agnosai_federation_cluster(fn2, str_from("b"))),
-    AGNOSAI_FED_FOLLOWER, "electing c resets b to Follower");
+      AGNOSAI_FED_FOLLOWER, "electing c resets b to Follower");
     assert_eq(agnosai_cluster_info_role(agnosai_federation_cluster(fn2, str_from("c"))),
-    AGNOSAI_FED_COORDINATOR, "and promotes c");
+      AGNOSAI_FED_COORDINATOR, "and promotes c");
 
     # --- past the oracle: declaring an UNKNOWN coordinator --------------
     # Every cluster is reset to Follower first and the promotion is guarded by
@@ -327,9 +327,9 @@ fn main(): i64 {
     agnosai_federation_start_election(fn2);
     agnosai_federation_declare_coordinator(fn2, 3, str_from("ghost"));
     assert_eq(agnosai_cluster_info_role(agnosai_federation_cluster(fn2, str_from("c"))),
-    AGNOSAI_FED_FOLLOWER, "declaring an unknown coordinator demotes the old one anyway");
+      AGNOSAI_FED_FOLLOWER, "declaring an unknown coordinator demotes the old one anyway");
     assert(str_eq_cstr(agnosai_federation_coordinator(fn2), "ghost") == 1,
-    "the id is still recorded");
+      "the id is still recorded");
     assert_eq(agnosai_federation_role(fn2), AGNOSAI_FED_FOLLOWER, "and we are a Follower");
 
     # --- oracle: clusters_and_online_clusters_filtering -----------------
@@ -339,15 +339,15 @@ fn main(): i64 {
     assert_eq(vec_len(agnosai_federation_clusters(ff)), 2, "clusters() returns both");
     assert_eq(vec_len(agnosai_federation_online_clusters(ff)), 2, "and both are online");
     agnosai_cluster_info_set_status(agnosai_federation_cluster(ff, str_from("b")),
-    AGNOSAI_CLUSTER_OFFLINE);
+      AGNOSAI_CLUSTER_OFFLINE);
     assert_eq(vec_len(agnosai_federation_clusters(ff)), 2, "clusters() still returns all");
     assert_eq(vec_len(agnosai_federation_online_clusters(ff)), 1, "online_clusters() filters");
     assert(str_eq_cstr(agnosai_cluster_info_id(
-    vec_get(agnosai_federation_online_clusters(ff), 0)), "c") == 1, "leaving c");
+          vec_get(agnosai_federation_online_clusters(ff), 0)), "c") == 1, "leaving c");
     # ⚠ Past the oracle: Suspect is not Online either — it reads as a soft
     # state and treating it as live is the natural mistake.
     agnosai_cluster_info_set_status(agnosai_federation_cluster(ff, str_from("c")),
-    AGNOSAI_CLUSTER_SUSPECT);
+      AGNOSAI_CLUSTER_SUSPECT);
     assert_eq(vec_len(agnosai_federation_online_clusters(ff)), 0, "a Suspect cluster is not online");
 
     # --- oracle: cluster_count_accuracy ---------------------------------
@@ -364,7 +364,7 @@ fn main(): i64 {
     var fv = _t_fed_manager("a");
     agnosai_federation_heartbeat(fv, str_from("b"), str_from("http://b:8080"), 1);
     agnosai_cluster_info_set_status(agnosai_federation_cluster(fv, str_from("b")),
-    AGNOSAI_CLUSTER_OFFLINE);
+      AGNOSAI_CLUSTER_OFFLINE);
     _t_backdate(fv, "b", 60000);
     var evicted = agnosai_federation_evict_offline(fv, 30000);
     assert_eq(vec_len(evicted), 1, "one cluster evicted");
@@ -376,9 +376,9 @@ fn main(): i64 {
     var fnr = _t_fed_manager("a");
     agnosai_federation_heartbeat(fnr, str_from("b"), str_from("http://b:8080"), 1);
     agnosai_cluster_info_set_status(agnosai_federation_cluster(fnr, str_from("b")),
-    AGNOSAI_CLUSTER_OFFLINE);
+      AGNOSAI_CLUSTER_OFFLINE);
     assert_eq(vec_len(agnosai_federation_evict_offline(fnr, 300000)), 0,
-    "a recently-offline cluster survives a long TTL");
+      "a recently-offline cluster survives a long TTL");
     assert_eq(agnosai_federation_cluster_count(fnr), 1, "and stays known");
 
     # --- oracle: evict_offline_removes_old_clusters ---------------------
@@ -386,7 +386,7 @@ fn main(): i64 {
     agnosai_federation_heartbeat(fom, str_from("b"), str_from("http://b:8080"), 1);
     agnosai_federation_heartbeat(fom, str_from("c"), str_from("http://c:8080"), 1);
     agnosai_cluster_info_set_status(agnosai_federation_cluster(fom, str_from("b")),
-    AGNOSAI_CLUSTER_OFFLINE);
+      AGNOSAI_CLUSTER_OFFLINE);
     _t_backdate(fom, "b", 120000);
     var ev2 = agnosai_federation_evict_offline(fom, 60000);
     assert_eq(vec_len(ev2), 1, "only the old offline cluster is evicted");
@@ -401,20 +401,20 @@ fn main(): i64 {
     var fbo = _t_fed_manager("a");
     agnosai_federation_heartbeat(fbo, str_from("old-suspect"), str_from("http://s:8080"), 1);
     agnosai_cluster_info_set_status(agnosai_federation_cluster(fbo, str_from("old-suspect")),
-    AGNOSAI_CLUSTER_SUSPECT);
+      AGNOSAI_CLUSTER_SUSPECT);
     _t_backdate(fbo, "old-suspect", 600000);
     agnosai_federation_heartbeat(fbo, str_from("young-offline"), str_from("http://y:8080"), 1);
     agnosai_cluster_info_set_status(agnosai_federation_cluster(fbo, str_from("young-offline")),
-    AGNOSAI_CLUSTER_OFFLINE);
+      AGNOSAI_CLUSTER_OFFLINE);
     assert_eq(vec_len(agnosai_federation_evict_offline(fbo, 1000)), 0,
-    "neither an ancient Suspect nor a young Offline cluster is evicted");
+      "neither an ancient Suspect nor a young Offline cluster is evicted");
     assert_eq(agnosai_federation_cluster_count(fbo), 2, "both survive");
     # ⚠ And age is measured from the last HEARTBEAT, not from when the cluster
     # went Offline — so the offline timeout is already spent inside the TTL.
     agnosai_cluster_info_set_status(agnosai_federation_cluster(fbo, str_from("old-suspect")),
-    AGNOSAI_CLUSTER_OFFLINE);
+      AGNOSAI_CLUSTER_OFFLINE);
     assert_eq(vec_len(agnosai_federation_evict_offline(fbo, 1000)), 1,
-    "flipping the ancient one to Offline evicts it immediately — its age already qualified");
+      "flipping the ancient one to Offline evicts it immediately — its age already qualified");
 
     # --- past the oracle: evicting several at once ----------------------
     # A whole map's worth in one pass, which is the shape a fleet-wide outage
@@ -433,21 +433,21 @@ fn main(): i64 {
     }
     assert_eq(agnosai_federation_cluster_count(fme), 12, "twelve offline peers");
     assert_eq(vec_len(agnosai_federation_evict_offline(fme, 1000)), 12,
-    "all twelve are evicted in one pass");
+      "all twelve are evicted in one pass");
     assert_eq(agnosai_federation_cluster_count(fme), 0, "and none is skipped");
 
     # --- past the oracle: the config round-trips ------------------------
     var cfg = agnosai_federation_config_new(str_from("me"), str_from("http://me:8080"));
     assert(str_eq_cstr(agnosai_federation_config_cluster_id(cfg), "me") == 1, "the id is stored");
     assert(str_eq_cstr(agnosai_federation_config_endpoint(cfg), "http://me:8080") == 1,
-    "and the endpoint");
+      "and the endpoint");
     assert_eq(vec_len(agnosai_federation_config_seeds(cfg)), 0, "with no seeds");
     assert_eq(agnosai_federation_config_suspect_timeout_ms(cfg), 10000,
-    "the default suspect timeout is 10 s");
+      "the default suspect timeout is 10 s");
     assert_eq(agnosai_federation_config_offline_timeout_ms(cfg), 30000,
-    "the default offline timeout is 30 s");
+      "the default offline timeout is 30 s");
     assert_eq(agnosai_federation_config_election_timeout_ms(cfg), 5000,
-    "and the default election timeout is 5 s");
+      "and the default election timeout is 5 s");
     agnosai_federation_config_with_seed(cfg, str_from("http://seed:8080"));
     agnosai_federation_config_with_seed(cfg, str_from("http://seed2:8080"));
     assert_eq(vec_len(agnosai_federation_config_seeds(cfg)), 2, "seeds append");
@@ -458,16 +458,16 @@ fn main(): i64 {
 
     var dcfg = agnosai_federation_config_default();
     assert_eq(str_len(agnosai_federation_config_cluster_id(dcfg)), 0,
-    "the default config has an empty cluster id");
+      "the default config has an empty cluster id");
     assert_eq(str_len(agnosai_federation_config_endpoint(dcfg)), 0, "and an empty endpoint");
     assert_eq(agnosai_federation_config_suspect_timeout_ms(dcfg), 10000,
-    "with the same default timeouts");
+      "with the same default timeouts");
 
     # The manager hands its config back, which is the only way a caller reaches
     # the timeouts it was built with.
     var fcfg = _t_fed_manager("z");
     assert(str_eq_cstr(agnosai_federation_config_cluster_id(
-    agnosai_federation_config(fcfg)), "z") == 1, "a manager exposes its config");
+          agnosai_federation_config(fcfg)), "z") == 1, "a manager exposes its config");
 
     return assert_summary();
 }

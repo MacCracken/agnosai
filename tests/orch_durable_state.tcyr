@@ -96,13 +96,13 @@ fn main() {
     var root = str_from(_T_ROOT);
     var store = agnosai_state_store_new(root);
     assert(str_eq(agnosai_state_store_base_dir(store), root) == 1,
-    "the store keeps its base directory verbatim — no canonicalisation, as the oracle does none");
+      "the store keeps its base directory verbatim — no canonicalisation, as the oracle does none");
 
     # --- file_state_store_path_for ---
     var fixed = agnosai_state_store_new(str_from("/tmp/agnosai-state"));
     assert(str_eq(agnosai_state_path_for(fixed, str_from("my-crew-123")),
-    str_from("/tmp/agnosai-state/my-crew-123.json")) == 1,
-    "the path is {base_dir}/{crew_id}.json");
+        str_from("/tmp/agnosai-state/my-crew-123.json")) == 1,
+      "the path is {base_dir}/{crew_id}.json");
 
     # --- serialize_produces_valid_json + the golden bytes ---
     # The oracle only asserts that crew_id and status are present. The exact
@@ -111,19 +111,19 @@ fn main() {
     # incidental. This is bayan_json_v_build_pretty(v, 2) checked against
     # serde_json::to_vec_pretty for the oracle's own sample_state().
     var golden_state = agnosai_crew_state_new(
-    str_from("0191b3f0-1111-4222-8333-444455556666"), AGNOSAI_CREW_RUNNING);
+      str_from("0191b3f0-1111-4222-8333-444455556666"), AGNOSAI_CREW_RUNNING);
     var golden = agnosai_serialize_crew_state(golden_state);
     assert(str_eq(golden, str_cat(str_from("{\n  \"crew_id\": \"0191b3f0-1111-4222-8333-444455556666\",\n"),
-    str_cat(str_from("  \"status\": \"running\",\n"), str_from("  \"results\": []\n}")))) == 1,
-    "the snapshot is 2-space-indented JSON with a space after each colon and [] for an empty \
+          str_cat(str_from("  \"status\": \"running\",\n"), str_from("  \"results\": []\n}")))) == 1,
+      "the snapshot is 2-space-indented JSON with a space after each colon and [] for an empty \
     array — byte-identical to serde_json::to_vec_pretty");
     assert_eq(str_len(golden), 95, "which is 95 bytes for this shape");
     assert_eq(load8(str_data(golden) + str_len(golden) - 1), 125,
-    "and ends with '}' — to_vec_pretty appends no trailing newline");
+      "and ends with '}' — to_vec_pretty appends no trailing newline");
 
     # profile is omitted when unset, not emitted as null
     assert(str_contains(golden, str_from("profile")) == 0,
-    "an unset profile is omitted entirely — skip_serializing_if = Option::is_none");
+      "an unset profile is omitted entirely — skip_serializing_if = Option::is_none");
 
     # --- serialize_deserialize_round_trip ---
     var state = _t_state();
@@ -131,10 +131,10 @@ fn main() {
     var restored = 0;
     store64(&restored, 0);
     assert_eq(agnosai_deserialize_crew_state(str_data(bytes), str_len(bytes), &restored), 0,
-    "a serialized state deserializes");
+      "a serialized state deserializes");
     var back = load64(&restored);
     assert(str_eq(agnosai_crew_state_crew_id(back), agnosai_crew_state_crew_id(state)) == 1,
-    "the crew id survives the round trip");
+      "the crew id survives the round trip");
     assert_eq(agnosai_crew_state_status(back), AGNOSAI_CREW_RUNNING, "and the status");
     assert_eq(vec_len(agnosai_crew_state_results(back)), 0, "and the empty results");
     assert_eq(agnosai_crew_state_profile(back), 0, "and the absent profile");
@@ -155,7 +155,7 @@ fn main() {
     # a bare JSON scalar parses but is not an object
     var scalar = str_from("42");
     assert(agnosai_deserialize_crew_state(str_data(scalar), str_len(scalar), &out) != 0,
-    "a JSON scalar is not a crew state");
+      "a JSON scalar is not a crew state");
 
     # --- required fields: divergence 2 (see the module header) ---
     # serde requires crew_id, status and results; only profile has #[serde(default)].
@@ -168,19 +168,19 @@ fn main() {
     assert_eq(agnosai_error_kind(e1), AGNOSAI_ERR_SERIALIZATION, "as a Serialization error");
 
     var no_results = str_from(
-    "{\"crew_id\":\"0191b3f0-1111-4222-8333-444455556666\",\"status\":\"running\"}");
+      "{\"crew_id\":\"0191b3f0-1111-4222-8333-444455556666\",\"status\":\"running\"}");
     assert(agnosai_deserialize_crew_state(str_data(no_results), str_len(no_results), &out) != 0,
-    "and so is a missing `results` — dropping it would report a finished crew as having done \
+      "and so is a missing `results` — dropping it would report a finished crew as having done \
     nothing");
 
     var bad_status = str_cat(str_from("{\"crew_id\":\"0191b3f0-1111-4222-8333-444455556666\","),
-    str_from("\"status\":\"bogus\",\"results\":[]}"));
+      str_from("\"status\":\"bogus\",\"results\":[]}"));
     assert(agnosai_deserialize_crew_state(str_data(bad_status), str_len(bad_status), &out) != 0,
-    "an unknown status spelling is rejected rather than quietly becoming Pending");
+      "an unknown status spelling is rejected rather than quietly becoming Pending");
 
     var no_id = str_from("{\"status\":\"running\",\"results\":[]}");
     assert(agnosai_deserialize_crew_state(str_data(no_id), str_len(no_id), &out) != 0,
-    "and a missing crew_id is rejected");
+      "and a missing crew_id is rejected");
 
     # every known spelling round-trips
     var spellings = vec_new();
@@ -191,16 +191,16 @@ fn main() {
     vec_push(spellings, str_from("cancelled"));
     for (var si = 0; si < vec_len(spellings); si = si + 1) {
         var doc = str_cat(str_from("{\"crew_id\":\"0191b3f0-1111-4222-8333-444455556666\",\"status\":\""),
-        str_cat(vec_get(spellings, si), str_from("\",\"results\":[]}")));
+          str_cat(vec_get(spellings, si), str_from("\",\"results\":[]}")));
         assert_eq(agnosai_deserialize_crew_state(str_data(doc), str_len(doc), &out), 0,
-        "a known status spelling is accepted");
+          "a known status spelling is accepted");
     }
 
     # an unknown EXTRA field is accepted — CrewState has no deny_unknown_fields
     var extra = str_cat(str_from("{\"crew_id\":\"0191b3f0-1111-4222-8333-444455556666\","),
-    str_from("\"status\":\"running\",\"results\":[],\"future_field\":1}"));
+      str_from("\"status\":\"running\",\"results\":[],\"future_field\":1}"));
     assert_eq(agnosai_deserialize_crew_state(str_data(extra), str_len(extra), &out), 0,
-    "an unknown extra field is accepted — there is no deny_unknown_fields, so a newer writer's \
+      "an unknown extra field is accepted — there is no deny_unknown_fields, so a newer writer's \
     snapshot still loads");
 
     # --- crew_id validation: divergence 1, ADR 008 ---
@@ -223,14 +223,14 @@ fn main() {
     assert(eerr != 0, "save refuses an unsafe crew id BEFORE touching the filesystem");
     assert_eq(agnosai_error_kind(eerr), AGNOSAI_ERR_IO, "reporting it as an I/O error");
     assert_eq(file_exists(str_data(str_from("/tmp/agnosai-durable-pwn.json"))), 0,
-    "and nothing was written outside the base directory");
+      "and nothing was written outside the base directory");
 
     var lbytes = 0;
     var llen = 0;
     store64(&lbytes, 0);
     store64(&llen, 0);
     assert(agnosai_state_store_load(store, evil, &lbytes, &llen) != 0,
-    "load refuses it too — it would otherwise read any path ending .json");
+      "load refuses it too — it would otherwise read any path ending .json");
     assert_eq(load64(&lbytes), AGNOSAI_STATE_ABSENT, "leaving the out-parameter absent");
 
     # --- file_state_store_save_and_load ---
@@ -238,7 +238,7 @@ fn main() {
     var cid = agnosai_crew_state_crew_id(s2);
     var payload2 = agnosai_serialize_crew_state(s2);
     assert_eq(agnosai_state_store_save(store, cid, str_data(payload2), str_len(payload2)), 0,
-    "saving a crew state succeeds");
+      "saving a crew state succeeds");
 
     var got_len = 0;
     store64(&got_len, 0);
@@ -250,9 +250,9 @@ fn main() {
     var round = 0;
     store64(&round, 0);
     assert_eq(agnosai_deserialize_crew_state(got, load64(&got_len), &round), 0,
-    "the loaded bytes deserialize");
+      "the loaded bytes deserialize");
     assert(str_eq(agnosai_crew_state_crew_id(load64(&round)), cid) == 1,
-    "back to the same crew id");
+      "back to the same crew id");
 
     # --- file_state_store_load_missing ---
     var mlen = 0;
@@ -260,9 +260,9 @@ fn main() {
     store64(&mbytes, 0);
     store64(&mlen, 0);
     assert_eq(agnosai_state_store_load(store, str_from("nonexistent-crew"), &mbytes, &mlen), 0,
-    "loading an unsaved crew is NOT an error");
+      "loading an unsaved crew is NOT an error");
     assert_eq(load64(&mbytes), AGNOSAI_STATE_ABSENT,
-    "it reports absent — the oracle's Ok(None), which is what lets a caller tell 'no snapshot' \
+      "it reports absent — the oracle's Ok(None), which is what lets a caller tell 'no snapshot' \
     from 'the disk is broken'");
     assert_eq(load64(&mlen), 0, "with a zero length");
 
@@ -270,38 +270,38 @@ fn main() {
     var v1 = str_from("version-1");
     var v2 = str_from("version-2");
     assert_eq(agnosai_state_store_save(store, str_from("crew-x"), str_data(v1), str_len(v1)), 0,
-    "the first save succeeds");
+      "the first save succeeds");
     assert_eq(agnosai_state_store_save(store, str_from("crew-x"), str_data(v2), str_len(v2)), 0,
-    "and so does the second");
+      "and so does the second");
     var olen = 0;
     store64(&olen, 0);
     var ogot = _t_load_ok(store, str_from("crew-x"), &olen, "the overwritten crew loads");
     assert_eq(load64(&olen), str_len(v2),
-    "and holds only the newer payload — the write REPLACES rather than appending, which is the \
+      "and holds only the newer payload — the write REPLACES rather than appending, which is the \
     one thing patra's append-only jsonl could not have done");
     assert(_t_bytes_eq(ogot, load64(&olen), v2) == 1, "byte for byte");
 
     # raw non-JSON bytes round-trip: save takes &[u8], not a string
     var raw = str_from("test data");
     assert_eq(agnosai_state_store_save(store, str_from("crew-raw"), str_data(raw), str_len(raw)), 0,
-    "arbitrary bytes can be saved");
+      "arbitrary bytes can be saved");
     var rlen = 0;
     store64(&rlen, 0);
     var rgot = _t_load_ok(store, str_from("crew-raw"), &rlen, "and load back");
     assert(_t_bytes_eq(rgot, load64(&rlen), raw) == 1,
-    "unchanged — the store is byte-transparent, it does not require valid JSON");
+      "unchanged — the store is byte-transparent, it does not require valid JSON");
 
     # a zero-length payload is a real snapshot, distinguishable from no snapshot
     assert_eq(agnosai_state_store_save(store, str_from("crew-empty"), str_data(raw), 0), 0,
-    "an empty payload saves");
+      "an empty payload saves");
     var elen = 0;
     var ebytes = 0;
     store64(&ebytes, 0);
     store64(&elen, 0);
     assert_eq(agnosai_state_store_load(store, str_from("crew-empty"), &ebytes, &elen), 0,
-    "and loads without error");
+      "and loads without error");
     assert(load64(&ebytes) != AGNOSAI_STATE_ABSENT,
-    "reporting PRESENT with zero length, not absent — an empty file is a snapshot that says \
+      "reporting PRESENT with zero length, not absent — an empty file is a snapshot that says \
     nothing happened, which is different from never having been saved");
     assert_eq(load64(&elen), 0, "and the length is zero");
 
@@ -310,18 +310,18 @@ fn main() {
     var nested = agnosai_state_store_new(nested_dir);
     assert_eq(is_dir(nested_dir), 0, "the nested directory does not exist yet");
     assert_eq(agnosai_state_store_save(nested, str_from("crew-1"), str_data(raw), str_len(raw)), 0,
-    "saving into a missing nested directory succeeds");
+      "saving into a missing nested directory succeeds");
     assert_eq(is_dir(nested_dir), 1,
-    "because save creates the whole tree — the stdlib has only single-level mkdir, so this is \
+      "because save creates the whole tree — the stdlib has only single-level mkdir, so this is \
     the hand-rolled create_dir_all and it has to walk BOTH missing components");
     var nlen = 0;
     store64(&nlen, 0);
     assert(_t_bytes_eq(_t_load_ok(nested, str_from("crew-1"), &nlen, "and the file is readable"),
-    load64(&nlen), raw) == 1, "with the right bytes");
+        load64(&nlen), raw) == 1, "with the right bytes");
 
     # saving again is idempotent: mkdir_p must swallow EEXIST on every component
     assert_eq(agnosai_state_store_save(nested, str_from("crew-2"), str_data(raw), str_len(raw)), 0,
-    "a second save into the now-existing tree succeeds — mkdir returns -17 EEXIST on every \
+      "a second save into the now-existing tree succeeds — mkdir returns -17 EEXIST on every \
     component and that has to be success, not failure");
 
     # --- a path component that is a FILE, not a directory ---
@@ -329,7 +329,7 @@ fn main() {
     # and surface as a confusing write error one step later instead.
     var blocker = _t_under("/blocker");
     assert_eq(file_write_all(str_data(blocker), str_data(raw), str_len(raw)), str_len(raw),
-    "a plain file sits where a directory component would go");
+      "a plain file sits where a directory component would go");
     var blocked = agnosai_state_store_new(_t_join(blocker, str_from("/deeper")));
     var berr = agnosai_state_store_save(blocked, str_from("crew-1"), str_data(raw), str_len(raw));
     assert(berr != 0, "saving through it fails");
@@ -347,18 +347,18 @@ fn main() {
     store64(&dlen, 0);
     var derr = agnosai_state_store_load(store, str_from("crew-dir"), &dbytes, &dlen);
     assert(derr != 0,
-    "loading it is an ERROR, not an empty success — file_read_all would have returned 0 here, \
+      "loading it is an ERROR, not an empty success — file_read_all would have returned 0 here, \
     exactly as it does for a genuinely empty file");
     assert_eq(agnosai_error_kind(derr), AGNOSAI_ERR_IO, "an I/O error");
     assert_eq(load64(&dbytes), AGNOSAI_STATE_ABSENT, "with nothing handed back");
 
     # --- the error detail carries the path and a readable reason ---
     assert(str_contains(agnosai_error_detail(derr), str_from("crew-dir.json")) == 1,
-    "the error names the path it failed on");
+      "the error names the path it failed on");
     assert(str_contains(agnosai_error_detail(derr), str_from("is a directory")) == 1,
-    "and renders the errno rather than leaking a bare number");
+      "and renders the errno rather than leaking a bare number");
     assert(str_contains(agnosai_error_message(derr), str_from("I/O error: ")) == 1,
-    "and the message keeps the oracle's variant prefix");
+      "and the message keeps the oracle's variant prefix");
 
     # --- teardown ---
     _t_rm(_t_join(_t_under("/"), _t_join(cid, str_from(".json"))));

@@ -44,10 +44,10 @@ fn _t_allows_within_burst(): i64 {
     var s = agnosai_rate_limit_new(10000, 5);
     for (var i = 0; i < 5; i = i + 1) {
         assert(agnosai_rate_limit_check(s, str_from("client-1")) == 1,
-        "each of the first 5 requests is inside the burst");
+          "each of the first 5 requests is inside the burst");
     }
     assert(agnosai_rate_limit_check(s, str_from("client-1")) == 0,
-    "the 6th exhausts the burst and is rejected");
+      "the 6th exhausts the burst and is rejected");
     return 0;
 }
 
@@ -59,7 +59,7 @@ fn _t_separate_keys(): i64 {
     assert(agnosai_rate_limit_check(s, str_from("client-a")) == 1, "a's second");
     assert(agnosai_rate_limit_check(s, str_from("client-a")) == 0, "a is exhausted");
     assert(agnosai_rate_limit_check(s, str_from("client-b")) == 1,
-    "b has its own bucket and still has tokens");
+      "b has its own bucket and still has tokens");
     return 0;
 }
 
@@ -92,45 +92,45 @@ fn _t_evict_stale(): i64 {
 
 fn _t_key_from_xff(): i64 {
     assert(str_eq(agnosai_rate_limit_client_key(str_from("203.0.113.7"), 1,
-    str_from(""), 0), str_from("203.0.113.7")) == 1, "X-Forwarded-For is used");
+          str_from(""), 0), str_from("203.0.113.7")) == 1, "X-Forwarded-For is used");
 
     # `s.split(',').next()` — the FIRST entry, which is the original client.
     assert(str_eq(agnosai_rate_limit_client_key(
-    str_from("203.0.113.7, 198.51.100.2, 192.0.2.9"), 1, str_from(""), 0),
-    str_from("203.0.113.7")) == 1, "the first XFF entry wins, not the last");
+          str_from("203.0.113.7, 198.51.100.2, 192.0.2.9"), 1, str_from(""), 0),
+        str_from("203.0.113.7")) == 1, "the first XFF entry wins, not the last");
 
     # `.trim()`.
     assert(str_eq(agnosai_rate_limit_client_key(str_from("  203.0.113.7  , x"), 1,
-    str_from(""), 0), str_from("203.0.113.7")) == 1, "the entry is trimmed");
+          str_from(""), 0), str_from("203.0.113.7")) == 1, "the entry is trimmed");
     # Tab is trimmed — it is the one non-space byte `to_str()` permits.
     assert(str_eq(agnosai_rate_limit_client_key(str_from("\t203.0.113.7\t"), 1,
-    str_from(""), 0), str_from("203.0.113.7")) == 1, "tabs are trimmed");
+          str_from(""), 0), str_from("203.0.113.7")) == 1, "tabs are trimmed");
 
     # **CR and LF are not**, because they never reach the trim: `is_visible_ascii`
     # admits only 0x20-0x7E plus tab, so a header carrying CRLF fails `to_str()`
     # and is treated as ABSENT. The two gates compose, and the order matters —
     # trimming first would have silently accepted a header-injection shape.
     assert(str_eq(agnosai_rate_limit_client_key(str_from("203.0.113.7\r\n"), 1,
-    str_from(""), 0), str_from("unknown")) == 1,
-    "a CRLF in XFF fails the to_str gate before trimming, so the header is absent");
+          str_from(""), 0), str_from("unknown")) == 1,
+      "a CRLF in XFF fails the to_str gate before trimming, so the header is absent");
     assert(str_eq(agnosai_rate_limit_client_key(str_from("203.0.113.7\n"), 1,
-    str_from("198.51.100.4"), 1), str_from("198.51.100.4")) == 1,
-    "...and falls through to X-Real-IP rather than yielding a trimmed value");
+          str_from("198.51.100.4"), 1), str_from("198.51.100.4")) == 1,
+      "...and falls through to X-Real-IP rather than yielding a trimmed value");
     return 0;
 }
 
 fn _t_key_from_xri(): i64 {
     assert(str_eq(agnosai_rate_limit_client_key(str_from(""), 0,
-    str_from("198.51.100.4"), 1), str_from("198.51.100.4")) == 1,
-    "X-Real-IP is used when XFF is absent");
+          str_from("198.51.100.4"), 1), str_from("198.51.100.4")) == 1,
+      "X-Real-IP is used when XFF is absent");
     assert(str_eq(agnosai_rate_limit_client_key(str_from(""), 0,
-    str_from("  198.51.100.4 "), 1), str_from("198.51.100.4")) == 1,
-    "...and is trimmed");
+          str_from("  198.51.100.4 "), 1), str_from("198.51.100.4")) == 1,
+      "...and is trimmed");
 
     # XFF takes precedence when both are present.
     assert(str_eq(agnosai_rate_limit_client_key(str_from("203.0.113.7"), 1,
-    str_from("198.51.100.4"), 1), str_from("203.0.113.7")) == 1,
-    "XFF is checked before X-Real-IP");
+          str_from("198.51.100.4"), 1), str_from("203.0.113.7")) == 1,
+      "XFF is checked before X-Real-IP");
     return 0;
 }
 
@@ -140,14 +140,14 @@ fn _t_key_from_xri(): i64 {
 # everyone. The oracle's own comment says "single-bucket for all clients".
 fn _t_key_fallback(): i64 {
     assert(str_eq(agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0),
-    str_from("unknown")) == 1, "no headers falls back to `unknown`");
+        str_from("unknown")) == 1, "no headers falls back to `unknown`");
 
     var s = agnosai_rate_limit_new(10000, 1);
     var k = agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0);
     assert(agnosai_rate_limit_check(s, k) == 1, "the first unheadered client is allowed");
     assert(agnosai_rate_limit_check(s,
-    agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0)) == 0,
-    "a SECOND, unrelated unheadered client shares the same bucket and is refused");
+        agnosai_rate_limit_client_key(str_from(""), 0, str_from(""), 0)) == 0,
+      "a SECOND, unrelated unheadered client shares the same bucket and is refused");
     assert(agnosai_rate_limit_active_keys(s) == 1, "...because there is only one bucket");
     return 0;
 }
@@ -160,11 +160,11 @@ fn _t_key_to_str_gate(): i64 {
     str_builder_putc(sb, 200);
     var high = str_builder_build(sb);
     assert(str_eq(agnosai_rate_limit_client_key(high, 1, str_from(""), 0),
-    str_from("unknown")) == 1, "a high byte in XFF makes it absent");
+        str_from("unknown")) == 1, "a high byte in XFF makes it absent");
     assert(str_eq(agnosai_rate_limit_client_key(high, 1, str_from("198.51.100.4"), 1),
-    str_from("198.51.100.4")) == 1, "...and falls through to X-Real-IP");
+        str_from("198.51.100.4")) == 1, "...and falls through to X-Real-IP");
     assert(str_eq(agnosai_rate_limit_client_key(str_from(""), 0, high, 1),
-    str_from("unknown")) == 1, "a high byte in X-Real-IP makes it absent too");
+        str_from("unknown")) == 1, "a high byte in X-Real-IP makes it absent too");
     return 0;
 }
 
@@ -174,7 +174,7 @@ fn _t_key_to_str_gate(): i64 {
 fn _t_empty_xff_does_not_fall_through(): i64 {
     var k = agnosai_rate_limit_client_key(str_from(""), 1, str_from("198.51.100.4"), 1);
     assert(str_eq(k, str_from("")) == 1,
-    "an empty XFF yields the empty-string key, not X-Real-IP");
+      "an empty XFF yields the empty-string key, not X-Real-IP");
     assert(str_eq(k, str_from("198.51.100.4")) == 0, "...it does NOT fall through");
     assert(str_eq(k, str_from("unknown")) == 0, "...nor to the unknown bucket");
     return 0;
@@ -185,22 +185,22 @@ fn _t_empty_xff_does_not_fall_through(): i64 {
 fn _t_middleware(): i64 {
     var s = agnosai_rate_limit_new(10000, 2);
     assert(agnosai_rate_limit_check_request(s, str_from("c")) == HTTP_OK,
-    "the first request passes");
+      "the first request passes");
     assert(agnosai_rate_limit_check_request(s, str_from("c")) == HTTP_OK,
-    "the second passes");
+      "the second passes");
     assert(agnosai_rate_limit_check_request(s, str_from("c"))
-    == AGNOSAI_HTTP_TOO_MANY_REQUESTS, "the third is 429");
+      == AGNOSAI_HTTP_TOO_MANY_REQUESTS, "the third is 429");
     assert(AGNOSAI_HTTP_TOO_MANY_REQUESTS == 429, "...which is 429");
 
     # A different key is unaffected.
     assert(agnosai_rate_limit_check_request(s, str_from("other")) == HTTP_OK,
-    "a different client still passes");
+      "a different client still passes");
 
     # **No limiter installed passes the request through**, rather than failing
     # closed — a router that did not install the layer must not start rejecting
     # traffic. The oracle's `if let Some(limiter)` arm.
     assert(agnosai_rate_limit_check_request(0, str_from("c")) == HTTP_OK,
-    "a request with no limiter installed passes through");
+      "a request with no limiter installed passes through");
     for (var i = 0; i < 100; i = i + 1) {
         assert_silent_ok(agnosai_rate_limit_check_request(0, str_from("c")) == HTTP_OK);
     }

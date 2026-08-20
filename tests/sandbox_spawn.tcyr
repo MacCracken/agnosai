@@ -24,10 +24,10 @@ include "tests/test_helpers.cyr"
 # Matching is on the NAME, and the name is everything before the first `=`.
 fn _t_sp_entry_name(): i64 {
     assert(agnosai_env_entry_is_sanitized("LD_PRELOAD=/tmp/evil.so") == 1,
-    "a sanitized variable is caught by its NAME, with a value attached");
+      "a sanitized variable is caught by its NAME, with a value attached");
     assert(agnosai_env_entry_is_sanitized("LD_LIBRARY_PATH=/x") == 1, "LD_LIBRARY_PATH");
     assert(agnosai_env_entry_is_sanitized("DYLD_INSERT_LIBRARIES=/y") == 1,
-    "DYLD_INSERT_LIBRARIES — stripped on Linux too");
+      "DYLD_INSERT_LIBRARIES — stripped on Linux too");
     assert(agnosai_env_entry_is_sanitized("DYLD_LIBRARY_PATH=/z") == 1, "DYLD_LIBRARY_PATH");
 
     assert(agnosai_env_entry_is_sanitized("PATH=/usr/bin") == 0, "PATH survives");
@@ -38,9 +38,9 @@ fn _t_sp_entry_name(): i64 {
     # drop innocent variables, and would let attacker-supplied data steer which
     # variables the filter removes.
     assert(agnosai_env_entry_is_sanitized("NOTES=see LD_PRELOAD docs") == 0,
-    "a value MENTIONING a sanitized name is not itself sanitized");
+      "a value MENTIONING a sanitized name is not itself sanitized");
     assert(agnosai_env_entry_is_sanitized("CFLAGS=-DLD_PRELOAD=1") == 0,
-    "...even when it looks like an assignment");
+      "...even when it looks like an assignment");
 
     # Prefix and suffix are not matches — the loader reads exact names.
     assert(agnosai_env_entry_is_sanitized("LD_PRELOAD_EXTRA=/x") == 0, "no prefix matching");
@@ -48,7 +48,7 @@ fn _t_sp_entry_name(): i64 {
 
     # A malformed entry with no `=` is still testable, not silently passed.
     assert(agnosai_env_entry_is_sanitized("LD_PRELOAD") == 1,
-    "an entry with NO '=' is matched whole — it is not waved through");
+      "an entry with NO '=' is matched whole — it is not waved through");
     assert(agnosai_env_entry_is_sanitized("HARMLESS") == 0, "...and an innocent one still passes");
 
     assert(agnosai_env_entry_is_sanitized(0) == 0, "a null entry is not a variable");
@@ -75,7 +75,7 @@ fn _t_sp_envp_from(): i64 {
     # sanitizer covering only the inherited case is one an attacker routes
     # around by passing the variable instead.
     assert(agnosai_envp_has(envp, str_from("LD_PRELOAD")) == 0,
-    "LD_PRELOAD is removed even when the CALLER supplied it, not the parent env");
+      "LD_PRELOAD is removed even when the CALLER supplied it, not the parent env");
     assert(agnosai_envp_has(envp, str_from("DYLD_INSERT_LIBRARIES")) == 0, "and DYLD_ too");
 
     # NULL-terminated, so execve can walk it.
@@ -111,12 +111,12 @@ fn _t_sp_envp_inherited(): i64 {
 
     # And the filter is subtractive, not a wipe — an ordinary variable survives.
     assert(agnosai_envp_has(envp, str_from("PATH")) == 1,
-    "PATH survives — the filter removes four names, it does not empty the environment");
+      "PATH survives — the filter removes four names, it does not empty the environment");
 
     var i = 0;
     while (load64(envp + i * 8) != 0) {
         assert(agnosai_env_entry_is_sanitized(load64(envp + i * 8)) == 0,
-        "every surviving entry passes the filter it was filtered by");
+          "every surviving entry passes the filter it was filtered by");
         i = i + 1;
     }
     return 0;
@@ -147,10 +147,10 @@ fn _t_sp_envp_filter_over_a_planted_block(): i64 {
     var envp = _agnosai_sanitized_envp_of(_t_sp_planted_envp());
 
     assert(agnosai_envp_has(envp, str_from("LD_PRELOAD")) == 0,
-    "a PLANTED LD_PRELOAD is removed — not merely absent from this machine");
+      "a PLANTED LD_PRELOAD is removed — not merely absent from this machine");
     assert(agnosai_envp_has(envp, str_from("LD_LIBRARY_PATH")) == 0, "so is LD_LIBRARY_PATH");
     assert(agnosai_envp_has(envp, str_from("DYLD_INSERT_LIBRARIES")) == 0,
-    "so is DYLD_INSERT_LIBRARIES");
+      "so is DYLD_INSERT_LIBRARIES");
     assert(agnosai_envp_has(envp, str_from("DYLD_LIBRARY_PATH")) == 0, "so is DYLD_LIBRARY_PATH");
 
     assert(agnosai_envp_has(envp, str_from("PATH")) == 1, "PATH survives");
@@ -159,11 +159,11 @@ fn _t_sp_envp_filter_over_a_planted_block(): i64 {
     var n = 0;
     while (load64(envp + n * 8) != 0) { n = n + 1; }
     assert(n == 2,
-    "exactly two of the six survive — the count pins that four were removed, not that \
+      "exactly two of the six survive — the count pins that four were removed, not that \
     two happened to be found");
 
     assert(_agnosai_sanitized_envp_of(0) != 0,
-    "a null source still answers with an empty envp, never 0");
+      "a null source still answers with an empty envp, never 0");
     assert(load64(_agnosai_sanitized_envp_of(0)) == 0, "...and that envp is terminated");
     return 0;
 }
@@ -182,13 +182,13 @@ fn _t_sp_cloexec(): i64 {
     assert(agnosai_fd_set_cloexec(wfd) == 1, "the write end is marked close-on-exec");
     # F_GETFD = 1; the flag must actually be set, not merely reported.
     assert((syscall(SYS_FCNTL, wfd, 1, 0) & AGNOSAI_FD_CLOEXEC) == AGNOSAI_FD_CLOEXEC,
-    "...and reading the flags back confirms it — the syscall did the thing");
+      "...and reading the flags back confirms it — the syscall did the thing");
 
     sys_close(rfd);
     sys_close(wfd);
 
     assert(agnosai_fd_set_cloexec(0 - 1) == 0,
-    "marking a bogus fd REPORTS failure — silently succeeding would hang every spawn");
+      "marking a bogus fd REPORTS failure — silently succeeding would hang every spawn");
     return 0;
 }
 
@@ -214,7 +214,7 @@ fn _t_sp_capture_basics(): i64 {
     # The two streams are SEPARATE — a port that merged them would pass the two
     # assertions above and still be wrong.
     assert(str_contains_cstr(agnosai_spawn_stdout(r), "oops") == 0,
-    "...and stderr does NOT leak into stdout");
+      "...and stderr does NOT leak into stdout");
     assert(str_contains_cstr(agnosai_spawn_stderr(r), "hello") == 0, "nor the reverse");
     return 0;
 }
@@ -223,7 +223,7 @@ fn _t_sp_capture_basics(): i64 {
 fn _t_sp_failure_vs_exit_127(): i64 {
     var real = _t_sh("exit 127");
     assert(agnosai_spawn_status(real) == AGNOSAI_SPAWN_OK,
-    "a program that genuinely exits 127 SPAWNED — it is not a spawn failure");
+      "a program that genuinely exits 127 SPAWNED — it is not a spawn failure");
     assert(agnosai_spawn_exit_code(real) == 127, "...and reports 127");
 
     var argv = alloc(16);
@@ -231,9 +231,9 @@ fn _t_sp_failure_vs_exit_127(): i64 {
     store64(argv + 8, 0);
     var bad = agnosai_spawn_capture("/nonexistent/binary", argv, agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
-    "a missing executable is a SPAWN FAILURE, not exit 127 — three oracle sites need this");
+      "a missing executable is a SPAWN FAILURE, not exit 127 — three oracle sites need this");
     assert(agnosai_spawn_status(bad) != agnosai_spawn_status(real),
-    "...and the two are distinguishable, which fork+execve alone cannot do");
+      "...and the two are distinguishable, which fork+execve alone cannot do");
     return 0;
 }
 
@@ -244,7 +244,7 @@ fn _t_sp_signalled(): i64 {
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "it did spawn");
     assert(agnosai_spawn_signal(r) == 9, "SIGKILL is reported as the signal");
     assert(agnosai_spawn_exit_code(r) == 0 - 1,
-    "and the exit code is -1, NOT 0 — a signalled child did not succeed");
+      "and the exit code is -1, NOT 0 — a signalled child did not succeed");
     return 0;
 }
 
@@ -254,9 +254,9 @@ fn _t_sp_large_dual_output(): i64 {
     var r = _t_sh("i=0; while [ $i -lt 700 ]; do echo AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; echo BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB >&2; i=$((i+1)); done");
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the child ran to completion");
     assert(str_len(agnosai_spawn_stdout(r)) == 70700,
-    "70,700 bytes of stdout captured — past the 64 KiB pipe buffer");
+      "70,700 bytes of stdout captured — past the 64 KiB pipe buffer");
     assert(str_len(agnosai_spawn_stderr(r)) == 70700,
-    "...and 70,700 of stderr, which is the half that deadlocks a sequential drain");
+      "...and 70,700 of stderr, which is the half that deadlocks a sequential drain");
     return 0;
 }
 
@@ -293,7 +293,7 @@ fn _t_sp_cloexec_is_what_lets_a_daemon_detach(): i64 {
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the child spawned");
     assert(str_contains_cstr(agnosai_spawn_stdout(r), "detached") == 1, "...and its output came back");
     assert(dt < 2000,
-    "...in well under the grandchild's 4 s — nothing downstream inherited the errno pipe, \
+      "...in well under the grandchild's 4 s — nothing downstream inherited the errno pipe, \
     because FD_CLOEXEC closed its write end at execve");
     return 0;
 }
@@ -318,22 +318,22 @@ fn _t_sp_env_reaches_child(): i64 {
     store64(argv + 24, 0);
 
     var r = agnosai_spawn_capture_input("/bin/sh", argv,
-    _agnosai_sanitized_envp_of(_t_sp_planted_envp()), str_from(""),
-    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+      _agnosai_sanitized_envp_of(_t_sp_planted_envp()), str_from(""),
+      AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "spawned");
     assert(str_contains_cstr(agnosai_spawn_stdout(r), "P=/usr/bin") == 1,
-    "PATH reaches the child — the filter is subtractive, not a wipe");
+      "PATH reaches the child — the filter is subtractive, not a wipe");
     assert(str_contains_cstr(agnosai_spawn_stdout(r), "L=\n") == 1,
-    "and LD_PRELOAD is EMPTY in the child");
+      "and LD_PRELOAD is EMPTY in the child");
 
     # **The control.** The identical block, unfiltered, DOES deliver it — so the
     # assertion above is measuring the filter and not the shell's own output
     # shape. `ld.so` writes a warning to stderr about the missing object here,
     # which is expected and is itself evidence the variable arrived.
     var raw = agnosai_spawn_capture_input("/bin/sh", argv, _t_sp_planted_envp(), str_from(""),
-    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+      AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(str_contains_cstr(agnosai_spawn_stdout(raw), "L=/tmp/evil.so") == 1,
-    "...where the SAME block unfiltered hands it straight through");
+      "...where the SAME block unfiltered hands it straight through");
     return 0;
 }
 
@@ -352,7 +352,7 @@ fn _t_sp_stdin_basics(): i64 {
     var r = _t_sh_in("cat", str_from("hello stdin"));
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "spawned with stdin");
     assert(str_eq_cstr(agnosai_spawn_stdout(r), "hello stdin") == 1,
-    "the input is fed through and comes back verbatim");
+      "the input is fed through and comes back verbatim");
     assert(agnosai_spawn_exit_code(r) == 0, "and the child exited cleanly");
 
     # A child that reads to EOF must SEE EOF — an empty input still has to close
@@ -364,7 +364,7 @@ fn _t_sp_stdin_basics(): i64 {
     # A child that ignores stdin entirely must not hang the writer.
     var ig = _t_sh_in("echo ignored", str_from("unread input"));
     assert(agnosai_spawn_status(ig) == AGNOSAI_SPAWN_OK,
-    "a child that never READS stdin does not hang the parent's write");
+      "a child that never READS stdin does not hang the parent's write");
     assert(str_contains_cstr(agnosai_spawn_stdout(ig), "ignored") == 1, "...and still runs");
     return 0;
 }
@@ -379,7 +379,7 @@ fn _t_sp_stdin_large_roundtrip(): i64 {
     var i = 0;
     while (i < 2000) {
         str_builder_add_cstr(sb,
-        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+          "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
         i = i + 1;
     }
     var big = str_builder_build(sb);
@@ -388,7 +388,7 @@ fn _t_sp_stdin_large_roundtrip(): i64 {
     var r = _t_sh_in("cat", big);
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the round trip completes");
     assert(str_len(agnosai_spawn_stdout(r)) == 200000,
-    "all 200,000 bytes come back — the write interleaves with the drain");
+      "all 200,000 bytes come back — the write interleaves with the drain");
     assert(str_eq(agnosai_spawn_stdout(r), big) == 1, "...byte for byte, in order");
     return 0;
 }
@@ -404,9 +404,9 @@ fn _t_sp_stdin_keeps_the_contract(): i64 {
     store64(argv, "/nonexistent/binary");
     store64(argv + 8, 0);
     var bad = agnosai_spawn_capture_input("/nonexistent/binary", argv,
-    agnosai_sanitized_envp(), str_from("ignored"), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+      agnosai_sanitized_envp(), str_from("ignored"), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
-    "spawn failure is still distinguishable when input was supplied");
+      "spawn failure is still distinguishable when input was supplied");
     return 0;
 }
 
@@ -422,7 +422,7 @@ fn _t_sp_big_input(): Str {
     var i = 0;
     while (i < 3200) {
         str_builder_add_cstr(sb,
-        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+          "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
         i = i + 1;
     }
     return str_builder_build(sb);
@@ -450,11 +450,11 @@ fn _t_sp_stdin_to_a_child_that_stopped_reading(): i64 {
     var r = _t_sh_in("exec 0<&-; sleep 1; echo still-here", big);
 
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK,
-    "a child that stops reading is not a spawn failure — the program ran");
+      "a child that stops reading is not a spawn failure — the program ran");
     assert(agnosai_spawn_stdin_write_failed(r) == 1,
-    "...and the undelivered input is REPORTED, not mistaken for EAGAIN and retried");
+      "...and the undelivered input is REPORTED, not mistaken for EAGAIN and retried");
     assert(str_contains_cstr(agnosai_spawn_stdout(r), "still-here") == 1,
-    "...while everything it wrote afterwards is still captured");
+      "...while everything it wrote afterwards is still captured");
     assert(agnosai_spawn_exit_code(r) == 0, "...and its own exit code stands");
     return 0;
 }
@@ -465,12 +465,12 @@ fn _t_sp_stdin_to_a_child_that_stopped_reading(): i64 {
 fn _t_sp_stdin_delivered_reports_no_failure(): i64 {
     var r = _t_sh_in("cat", str_from("delivered"));
     assert(agnosai_spawn_stdin_write_failed(r) == 0,
-    "an input that arrived reports no stdin failure");
+      "an input that arrived reports no stdin failure");
     assert(str_eq_cstr(agnosai_spawn_stdout(r), "delivered") == 1, "...and came through");
 
     var e = _t_sh_in("cat", str_from(""));
     assert(agnosai_spawn_stdin_write_failed(e) == 0,
-    "nor does an empty input, whose write loop never runs");
+      "nor does an empty input, whose write loop never runs");
     return 0;
 }
 
@@ -497,8 +497,8 @@ fn _t_sp_sigpipe_ignored_in(out: Str): i64 {
     var i = 0;
     while (i + 7 <= n) {
         if (load8(d + i) == 83 && load8(d + i + 1) == 105 && load8(d + i + 2) == 103
-        && load8(d + i + 3) == 73 && load8(d + i + 4) == 103 && load8(d + i + 5) == 110
-        && load8(d + i + 6) == 58) {
+          && load8(d + i + 3) == 73 && load8(d + i + 4) == 103 && load8(d + i + 5) == 110
+          && load8(d + i + 6) == 58) {
             var j = i + 7;
             while (j < n && _t_sp_hex(load8(d + j)) < 0) { j = j + 1; }
             if (j + 16 > n) { return 0 - 1; }
@@ -521,7 +521,7 @@ fn _t_sp_child_gets_the_default_sigpipe(): i64 {
     var r = _t_sh("cat /proc/self/status");
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "the status dump ran");
     assert(_t_sp_sigpipe_ignored_in(agnosai_spawn_stdout(r)) == 0,
-    "the child does NOT inherit the parent's ignored SIGPIPE");
+      "the child does NOT inherit the parent's ignored SIGPIPE");
     return 0;
 }
 
@@ -595,11 +595,11 @@ fn _t_sp_setup_failure_returns_its_descriptors(): i64 {
     store64(argv, "/bin/true");
     store64(argv + 8, 0);
     var r = agnosai_spawn_capture("/bin/true", argv, agnosai_sanitized_envp(),
-    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+      AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_FAILED,
-    "a spawn that cannot open its pipes reports failure");
+      "a spawn that cannot open its pipes reports failure");
     assert(agnosai_spawn_fail_reason(r) == AGNOSAI_SPAWN_FAIL_SETUP,
-    "...as SETUP, distinct from a child that ran and could not exec");
+      "...as SETUP, distinct from a child that ran and could not exec");
 
     var i = 0;
     while (i < h) {
@@ -608,7 +608,7 @@ fn _t_sp_setup_failure_returns_its_descriptors(): i64 {
     }
     var after = _t_sp_fd_headroom();
     assert(after == before,
-    "a setup failure gives every descriptor back — the paths that reach it are \
+      "a setup failure gives every descriptor back — the paths that reach it are \
     exactly the paths where there are none to spare");
 
     store64(&rl, soft);
@@ -658,9 +658,9 @@ fn _t_sp_timeout_kills(): i64 {
 
     assert(agnosai_spawn_timed_out(r) == 1, "a child past its deadline reports timed_out");
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK,
-    "a timeout is a result, not a spawn failure - oracle process.rs:308");
+      "a timeout is a result, not a spawn failure - oracle process.rs:308");
     assert(agnosai_spawn_exit_code(r) == 0 - 1,
-    "exit_code is -1 on timeout, matching ProcessResult");
+      "exit_code is -1 on timeout, matching ProcessResult");
     assert(agnosai_spawn_signal(r) == 9, "SIGKILL is what stopped it");
 
     # The whole point: the call RETURNED, rather than waiting out the sleep.
@@ -705,7 +705,7 @@ fn _t_sp_deadline_lets_fast_children_finish(): i64 {
     assert(agnosai_spawn_timed_out(r) == 0, "a child inside its deadline is not a timeout");
     assert(agnosai_spawn_exit_code(r) == 0, "...and its exit code is its own");
     assert(str_contains_cstr(agnosai_spawn_stdout(r), "quick") == 1,
-    "...and its output survives");
+      "...and its output survives");
     return 0;
 }
 
@@ -716,7 +716,7 @@ fn _t_sp_timeout_keeps_partial_output(): i64 {
     var r = _t_sp_deadline("echo early; sleep 60", 500);
     assert(agnosai_spawn_timed_out(r) == 1, "the child was killed");
     assert(str_contains_cstr(agnosai_spawn_stdout(r), "early") == 1,
-    "output produced before the deadline is still readable");
+      "output produced before the deadline is still readable");
     return 0;
 }
 
@@ -750,25 +750,25 @@ fn _t_sp_work_dir(): i64 {
 
     # `/tmp` is the one directory guaranteed to exist and differ from cwd.
     var r = agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(),
-    AGNOSAI_SPAWN_NO_TIMEOUT, "/tmp");
+      AGNOSAI_SPAWN_NO_TIMEOUT, "/tmp");
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "a child runs in a work_dir");
     assert(str_contains_cstr(agnosai_spawn_stdout(r), "/tmp") == 1,
-    "...and it is the directory the child reports");
+      "...and it is the directory the child reports");
 
     # **The PARENT must not have moved.** A chdir on the parent side would
     # relocate the whole server, and every later relative path with it.
     var here = agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(),
-    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+      AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(str_contains_cstr(agnosai_spawn_stdout(here), "/tmp") == 0,
-    "the next spawn with NO work_dir is unaffected - the parent never moved");
+      "the next spawn with NO work_dir is unaffected - the parent never moved");
 
     # A work_dir that does not exist must not silently run in the wrong place.
     var bad = agnosai_spawn_capture("/bin/sh", argv, agnosai_sanitized_envp(),
-    AGNOSAI_SPAWN_NO_TIMEOUT, "/nonexistent/work/dir");
+      AGNOSAI_SPAWN_NO_TIMEOUT, "/nonexistent/work/dir");
     assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
-    "a missing work_dir FAILS the spawn rather than running somewhere else");
+      "a missing work_dir FAILS the spawn rather than running somewhere else");
     assert(agnosai_spawn_fail_reason(bad) == AGNOSAI_SPAWN_FAIL_CHDIR,
-    "...and says it was the chdir, not the exec - an operator typo is findable");
+      "...and says it was the chdir, not the exec - an operator typo is findable");
     return 0;
 }
 
@@ -777,13 +777,13 @@ fn _t_sp_fail_reason(): i64 {
     store64(argv, "/nonexistent/binary");
     store64(argv + 8, 0);
     var bad = agnosai_spawn_capture("/nonexistent/binary", argv,
-    agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+      agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_fail_reason(bad) == AGNOSAI_SPAWN_FAIL_EXEC,
-    "a missing executable reports EXEC, distinct from a bad work_dir");
+      "a missing executable reports EXEC, distinct from a bad work_dir");
 
     var ok = _t_sh("exit 7");
     assert(agnosai_spawn_fail_reason(ok) == AGNOSAI_SPAWN_FAIL_NONE,
-    "a program that RAN and exited non-zero is not a spawn failure");
+      "a program that RAN and exited non-zero is not a spawn failure");
     return 0;
 }
 
@@ -800,7 +800,7 @@ fn _t_sp_bare_name_resolves(): i64 {
     store64(argv + 16, 0);
 
     var r = agnosai_spawn_capture("echo", argv, agnosai_sanitized_envp(),
-    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+      AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_OK, "a bare name is found on PATH");
     assert(str_contains_cstr(agnosai_spawn_stdout(r), "resolved") == 1, "...and it really ran");
 
@@ -809,9 +809,9 @@ fn _t_sp_bare_name_resolves(): i64 {
     store64(b, "agnosai-no-such-program-anywhere");
     store64(b + 8, 0);
     var bad = agnosai_spawn_capture("agnosai-no-such-program-anywhere", b,
-    agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+      agnosai_sanitized_envp(), AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(bad) == AGNOSAI_SPAWN_FAILED,
-    "an unresolvable bare name still fails");
+      "an unresolvable bare name still fails");
     assert(agnosai_spawn_fail_reason(bad) == AGNOSAI_SPAWN_FAIL_EXEC, "...as an exec failure");
     return 0;
 }
@@ -824,9 +824,9 @@ fn _t_sp_slashed_name_is_not_searched(): i64 {
     store64(argv, "./echo");
     store64(argv + 8, 0);
     var r = agnosai_spawn_capture("./echo", argv, agnosai_sanitized_envp(),
-    AGNOSAI_SPAWN_NO_TIMEOUT, 0);
+      AGNOSAI_SPAWN_NO_TIMEOUT, 0);
     assert(agnosai_spawn_status(r) == AGNOSAI_SPAWN_FAILED,
-    "./echo is NOT resolved against PATH - a slash makes it a path");
+      "./echo is NOT resolved against PATH - a slash makes it a path");
     return 0;
 }
 

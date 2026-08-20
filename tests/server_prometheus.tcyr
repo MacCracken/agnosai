@@ -66,13 +66,13 @@ fn main() {
     agnosai_metrics_record_crew_completed(m);
     assert_eq(agnosai_metrics_crews_active(m), 1, "finishing one lowers the gauge");
     assert_eq(agnosai_metrics_crews_total(m), 2,
-    "but NOT the total — it is monotonic, which is what makes it a counter rather than a gauge");
+      "but NOT the total — it is monotonic, which is what makes it a counter rather than a gauge");
 
     # --- crew_completed_does_not_underflow ---
     var u = agnosai_metrics_new();
     agnosai_metrics_record_crew_completed(u);
     assert_eq(agnosai_metrics_crews_active(u), 0,
-    "completing a crew that never started leaves the gauge at zero — a plain decrement would \
+      "completing a crew that never started leaves the gauge at zero — a plain decrement would \
     WRAP to a huge value and the metric would read as nonsense rather than merely wrong");
     agnosai_metrics_record_crew_completed(u);
     agnosai_metrics_record_crew_completed(u);
@@ -99,23 +99,23 @@ fn main() {
     # A family's three lines, built the way the module builds them.
     var empty = agnosai_metrics_gather(agnosai_metrics_new());
     assert(str_eq(empty, str_cat(str_cat(
-    _t_family("agnosai_crews_total", "Total number of crews created.", "counter", "0"),
-    _t_family("agnosai_crews_active", "Number of currently active crews.", "gauge", "0")),
-    str_cat(str_cat(
-    _t_family("agnosai_tasks_completed_total", "Total tasks completed successfully.",
-    "counter", "0"),
-    _t_family("agnosai_tasks_failed_total", "Total tasks that failed.", "counter", "0")),
-    str_cat(
-    _t_family("agnosai_inference_tokens_total", "Total inference tokens processed.",
-    "counter", "0"),
-    _t_family("agnosai_inference_cost_usd_total", "Total inference cost in USD.",
-    "counter", "0.000000"))))) == 1,
-    "an empty metrics set renders all six families in full — the oracle only spot-checks with \
+            _t_family("agnosai_crews_total", "Total number of crews created.", "counter", "0"),
+            _t_family("agnosai_crews_active", "Number of currently active crews.", "gauge", "0")),
+          str_cat(str_cat(
+              _t_family("agnosai_tasks_completed_total", "Total tasks completed successfully.",
+                "counter", "0"),
+              _t_family("agnosai_tasks_failed_total", "Total tasks that failed.", "counter", "0")),
+            str_cat(
+              _t_family("agnosai_inference_tokens_total", "Total inference tokens processed.",
+                "counter", "0"),
+              _t_family("agnosai_inference_cost_usd_total", "Total inference cost in USD.",
+                "counter", "0.000000"))))) == 1,
+      "an empty metrics set renders all six families in full — the oracle only spot-checks with \
     `contains`, but the names and HELP text are a wire contract a scraper's dashboards key on");
 
     # every line is newline-terminated, including the last
     assert_eq(load8(str_data(empty) + str_len(empty) - 1), 10,
-    "the exposition ends with a newline, as the format requires");
+      "the exposition ends with a newline, as the format requires");
 
     # --- gather_format ---
     var g = agnosai_metrics_new();
@@ -126,13 +126,13 @@ fn main() {
     _t_line(out, "# TYPE agnosai_crews_total counter", "the total is typed as a counter");
     _t_line(out, "agnosai_crews_total 1", "and reports one crew");
     _t_line(out, "# TYPE agnosai_crews_active gauge",
-    "the active metric is typed as a GAUGE, not a counter — it can go down");
+      "the active metric is typed as a GAUGE, not a counter — it can go down");
     _t_line(out, "agnosai_crews_active 1", "with one active");
     _t_line(out, "agnosai_tasks_completed_total 1", "one task completed");
     _t_line(out, "agnosai_tasks_failed_total 0", "none failed");
     _t_line(out, "agnosai_inference_tokens_total 500", "500 tokens");
     _t_line(out, "agnosai_inference_cost_usd_total 0.025000",
-    "and the cost as dollars to six decimals — 25000 micro-USD is $0.025000");
+      "and the cost as dollars to six decimals — 25000 micro-USD is $0.025000");
 
     # --- the fixed-point renderer, which replaces the oracle's f64 round trip ---
     # Integer split rather than micro/1e6 formatted as {:.6}, so the value that
@@ -141,26 +141,26 @@ fn main() {
     var fp = agnosai_metrics_new();
     agnosai_metrics_record_inference(fp, 0, 1);
     assert(str_contains(agnosai_metrics_gather(fp),
-    str_from("agnosai_inference_cost_usd_total 0.000001")) == 1,
-    "one micro-USD renders as 0.000001 — the smallest representable amount is not lost");
+        str_from("agnosai_inference_cost_usd_total 0.000001")) == 1,
+      "one micro-USD renders as 0.000001 — the smallest representable amount is not lost");
 
     var big = agnosai_metrics_new();
     agnosai_metrics_record_inference(big, 0, 1234567890);
     assert(str_contains(agnosai_metrics_gather(big),
-    str_from("agnosai_inference_cost_usd_total 1234.567890")) == 1,
-    "and $1234.567890 renders exactly, with no float rounding at the dollar boundary");
+        str_from("agnosai_inference_cost_usd_total 1234.567890")) == 1,
+      "and $1234.567890 renders exactly, with no float rounding at the dollar boundary");
 
     var whole = agnosai_metrics_new();
     agnosai_metrics_record_inference(whole, 0, 2000000);
     assert(str_contains(agnosai_metrics_gather(whole),
-    str_from("agnosai_inference_cost_usd_total 2.000000")) == 1,
-    "a whole number of dollars keeps all six decimal places rather than collapsing to \"2\"");
+        str_from("agnosai_inference_cost_usd_total 2.000000")) == 1,
+      "a whole number of dollars keeps all six decimal places rather than collapsing to \"2\"");
 
     var sub = agnosai_metrics_new();
     agnosai_metrics_record_inference(sub, 0, 999999);
     assert(str_contains(agnosai_metrics_gather(sub),
-    str_from("agnosai_inference_cost_usd_total 0.999999")) == 1,
-    "and just under a dollar does not round up to 1.000000");
+        str_from("agnosai_inference_cost_usd_total 0.999999")) == 1,
+      "and just under a dollar does not round up to 1.000000");
 
     return assert_summary();
 }

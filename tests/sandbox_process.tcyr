@@ -32,7 +32,7 @@ fn _t_pr_echo_command(): i64 {
     var r = agnosai_process_execute(_t_pr_shell(), str_from("echo hello"), str_from(""), &e);
     assert(load64(&e) == 0, "a shell command succeeds");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "hello") == 1,
-    "oracle echo_command: stdout carries the output");
+      "oracle echo_command: stdout carries the output");
     assert(agnosai_process_result_exit_code(r) == 0, "...and the exit code is 0");
     assert(agnosai_process_result_timed_out(r) == 0, "...and it did not time out");
     return 0;
@@ -44,7 +44,7 @@ fn _t_pr_stdin_passthrough(): i64 {
     var r = agnosai_process_execute(_t_pr_shell(), str_from("cat"), str_from("piped input"), &e);
     assert(load64(&e) == 0, "cat runs");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "piped input") == 1,
-    "oracle stdin_passthrough: input reaches the child and comes back out");
+      "oracle stdin_passthrough: input reaches the child and comes back out");
     return 0;
 }
 
@@ -64,7 +64,7 @@ fn _t_pr_stdin_the_child_never_reads(): i64 {
     var i = 0;
     while (i < 3200) {
         str_builder_add_cstr(sb,
-        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
+          "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
         i = i + 1;
     }
     var big = str_builder_build(sb);
@@ -73,13 +73,13 @@ fn _t_pr_stdin_the_child_never_reads(): i64 {
     var e[8];
     store64(&e, 0);
     var r = agnosai_process_execute(_t_pr_shell(),
-    str_from("exec 0<&-; sleep 1; echo ran-anyway"), big, &e);
+      str_from("exec 0<&-; sleep 1; echo ran-anyway"), big, &e);
     assert(load64(&e) == 0,
-    "an undelivered stdin is NOT an error here — process.rs warns and continues");
+      "an undelivered stdin is NOT an error here — process.rs warns and continues");
     assert(r != 0, "...it returns a result");
     if (r == 0) { return 0; }
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "ran-anyway") == 1,
-    "...carrying what the child wrote after it stopped reading");
+      "...carrying what the child wrote after it stopped reading");
     assert(agnosai_process_result_timed_out(r) == 0, "...and it is not a timeout");
     assert(agnosai_process_result_exit_code(r) == 0, "...its own exit code stands");
     return 0;
@@ -91,7 +91,7 @@ fn _t_pr_nonzero_exit(): i64 {
     var r = agnosai_process_execute(_t_pr_shell(), str_from("exit 42"), str_from(""), &e);
     assert(load64(&e) == 0, "a non-zero exit is a RESULT, not an error");
     assert(agnosai_process_result_exit_code(r) == 42,
-    "oracle nonzero_exit: the exit code is reported");
+      "oracle nonzero_exit: the exit code is reported");
     return 0;
 }
 
@@ -100,9 +100,9 @@ fn _t_pr_stderr_captured(): i64 {
     store64(&e, 0);
     var r = agnosai_process_execute(_t_pr_shell(), str_from("echo oops >&2"), str_from(""), &e);
     assert(str_contains_cstr(agnosai_process_result_stderr(r), "oops") == 1,
-    "oracle stderr_captured: stderr is captured");
+      "oracle stderr_captured: stderr is captured");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "oops") == 0,
-    "...on its own stream, not merged into stdout");
+      "...on its own stream, not merged into stdout");
     return 0;
 }
 
@@ -111,7 +111,7 @@ fn _t_pr_timeout_kills_process(): i64 {
     store64(&e, 0);
     var t0 = clock_now_ms();
     var r = agnosai_process_execute(agnosai_process_config_shell(1000), str_from("sleep 60"),
-    str_from(""), &e);
+      str_from(""), &e);
     var dt = clock_now_ms() - t0;
 
     assert(load64(&e) == 0, "oracle timeout_kills_process: 'should succeed even on timeout'");
@@ -131,7 +131,7 @@ fn _t_pr_clean_env(): i64 {
     var r = agnosai_process_execute(c, str_from("echo $SANDBOX_VAR"), str_from(""), &e);
     assert(load64(&e) == 0, "a clean-env sandbox runs");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "yes") == 1,
-    "oracle clean_env: a configured variable reaches the child");
+      "oracle clean_env: a configured variable reaches the child");
     return 0;
 }
 
@@ -157,7 +157,7 @@ fn _t_pr_invalid_executable(): i64 {
     var msg = agnosai_error_message(load64(&e));
     assert(str_contains_cstr(msg, "failed to spawn") == 1, "...reported as a spawn failure");
     assert(str_contains_cstr(msg, "working directory") == 0,
-    "...NOT as a working-directory fault, which is a different arm");
+      "...NOT as a working-directory fault, which is a different arm");
     assert(str_contains_cstr(msg, "/nonexistent/binary") == 1, "...naming the executable");
     return 0;
 }
@@ -181,15 +181,15 @@ fn _t_pr_empty_args_is_a_direct_invocation(): i64 {
     var r = agnosai_process_execute(c, str_from("hi"), str_from(""), &e);
     assert(load64(&e) == 0, "the direct invocation runs");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "hi") == 1,
-    "the command becomes echo's ARGUMENT, not a script for a shell");
+      "the command becomes echo's ARGUMENT, not a script for a shell");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "-c") == 0,
-    "...with no `-c` prepended — that is what emptying args means");
+      "...with no `-c` prepended — that is what emptying args means");
 
     # And the contrast: the default config DOES prepend `-c`, which is what
     # makes the assertion above discriminate rather than describe.
     var d = agnosai_process_config_shell(5000);
     assert(vec_len(agnosai_process_config_args(d)) > 0,
-    "the shell config carries args, so the empty case is a real difference");
+      "the shell config carries args, so the empty case is a real difference");
     return 0;
 }
 
@@ -205,7 +205,7 @@ fn _t_pr_execute_argv_no_shell_interpretation(): i64 {
     var r = agnosai_process_execute_argv(_t_pr_shell(), argv, str_from(""), &e);
     assert(load64(&e) == 0, "argv mode runs");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "; rm -rf") == 1,
-    "oracle execute_argv_no_shell_interpretation: the metacharacters are ECHOED, not run");
+      "oracle execute_argv_no_shell_interpretation: the metacharacters are ECHOED, not run");
     return 0;
 }
 
@@ -216,7 +216,7 @@ fn _t_pr_execute_argv_empty_returns_error(): i64 {
     assert(r == 0, "oracle execute_argv_empty_returns_error: an empty argv is an error");
     assert(load64(&e) != 0, "...with an error object");
     assert(str_contains_cstr(agnosai_error_message(load64(&e)), "empty argv") == 1,
-    "...saying so");
+      "...saying so");
     return 0;
 }
 
@@ -238,10 +238,10 @@ fn _t_pr_argv_ignores_config_command(): i64 {
     store64(&e, 0);
     var r = agnosai_process_execute_argv(c, argv, str_from(""), &e);
     assert(load64(&e) == 0,
-    "argv mode runs argv[0], NOT config.executable - which here does not exist");
+      "argv mode runs argv[0], NOT config.executable - which here does not exist");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "direct") == 1, "...and it ran");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "-c") == 0,
-    "...with no config.args prepended");
+      "...with no config.args prepended");
     return 0;
 }
 
@@ -275,13 +275,13 @@ fn _t_pr_planted_envp(): i64 {
 # precisely so the question stops depending on who is running the tests.
 fn _t_pr_env_filter_over_a_planted_block(): i64 {
     var envp = _agnosai_process_envp_from(agnosai_process_config_default(),
-    _t_pr_planted_envp());
+      _t_pr_planted_envp());
 
     assert(agnosai_envp_has(envp, str_from("LD_PRELOAD")) == 0,
-    "a PLANTED LD_PRELOAD does not reach the child");
+      "a PLANTED LD_PRELOAD does not reach the child");
     assert(agnosai_envp_has(envp, str_from("LD_LIBRARY_PATH")) == 0, "nor LD_LIBRARY_PATH");
     assert(agnosai_envp_has(envp, str_from("DYLD_INSERT_LIBRARIES")) == 0,
-    "nor DYLD_INSERT_LIBRARIES");
+      "nor DYLD_INSERT_LIBRARIES");
     assert(agnosai_envp_has(envp, str_from("DYLD_LIBRARY_PATH")) == 0, "nor DYLD_LIBRARY_PATH");
     assert(agnosai_envp_has(envp, str_from("PATH")) == 1, "PATH survives the filter");
     assert(agnosai_envp_has(envp, str_from("HOME")) == 1, "and so does HOME");
@@ -298,7 +298,7 @@ fn _t_pr_env_filter_over_a_planted_block(): i64 {
     agnosai_process_config_set_env(c, str_from("LD_LIBRARY_PATH"), str_from("/opt/tool/lib"));
     var oc = _agnosai_process_envp_from(c, _t_pr_planted_envp());
     assert(agnosai_envp_has(oc, str_from("LD_LIBRARY_PATH")) == 1,
-    "a CONFIGURED LD_LIBRARY_PATH survives — config is operator-owned, ambient is not");
+      "a CONFIGURED LD_LIBRARY_PATH survives — config is operator-owned, ambient is not");
 
     # And with clean_env the inherited block is gone entirely, planted or not.
     var cc = agnosai_process_config_default();
@@ -321,13 +321,13 @@ fn _t_pr_env_sanitizes_the_inherited_environment(): i64 {
     var n = 0;
     while (load64(envp + i * 8) != 0) {
         assert(agnosai_env_entry_is_sanitized(load64(envp + i * 8)) == 0,
-        "no entry the child inherits is one the filter removes");
+          "no entry the child inherits is one the filter removes");
         n = n + 1;
         i = i + 1;
     }
     assert(n > 0, "...over a base that was actually populated, not an empty array");
     assert(agnosai_envp_has(envp, str_from("PATH")) == 1,
-    "...and an ordinary variable survived, so this is a filter and not a wipe");
+      "...and an ordinary variable survived, so this is a filter and not a wipe");
 
     return 0;
 }
@@ -346,7 +346,7 @@ fn _t_pr_env_entries_are_nul_terminated(): i64 {
     var r = agnosai_process_execute(c, str_from("echo [$AGNOSAI_PROBE]"), str_from(""), &e);
     assert(load64(&e) == 0, "the child runs");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "[yes]") == 1,
-    "a configured value arrives EXACTLY - bracketed, so a run-on value fails");
+      "a configured value arrives EXACTLY - bracketed, so a run-on value fails");
     return 0;
 }
 
@@ -378,14 +378,14 @@ fn _t_pr_env_overrides_inherited(): i64 {
         i = i + 1;
     }
     assert(paths == 1,
-    "exactly ONE entry is named PATH — a configured variable replaces the inherited one \
+      "exactly ONE entry is named PATH — a configured variable replaces the inherited one \
     rather than appending a duplicate for the child to choose between");
 
     var e[8];
     store64(&e, 0);
     var r = agnosai_process_execute(c, str_from("echo $PATH"), str_from(""), &e);
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "/sandbox-only") == 1,
-    "and the value the child sees is the configured one");
+      "and the value the child sees is the configured one");
     return 0;
 }
 
@@ -402,12 +402,12 @@ fn _t_pr_env_without_clean_keeps_the_rest(): i64 {
     # documents and avoids; this one walked into it. The env COUNT is what the
     # shell cannot invent.
     var probe = str_from(
-    "n=$(env | wc -l); if [ \"$n\" -gt 8 ]; then echo MANY; else echo FEW; fi; echo v=$SANDBOX_VAR");
+      "n=$(env | wc -l); if [ \"$n\" -gt 8 ]; then echo MANY; else echo FEW; fi; echo v=$SANDBOX_VAR");
     var r = agnosai_process_execute(c, probe, str_from(""), &e);
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "v=yes") == 1,
-    "the configured variable is set");
+      "the configured variable is set");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "MANY") == 1,
-    "...and WITHOUT clean_env the inherited block is still there");
+      "...and WITHOUT clean_env the inherited block is still there");
     return 0;
 }
 
@@ -422,14 +422,14 @@ fn _t_pr_clean_env_drops_the_inherited_ones(): i64 {
     store64(&e, 0);
     var full = agnosai_process_execute(agnosai_process_config_shell(5000), probe, str_from(""), &e);
     assert(str_contains_cstr(agnosai_process_result_stdout(full), "MANY") == 1,
-    "the parent HAS a real environment - otherwise the comparison below means nothing");
+      "the parent HAS a real environment - otherwise the comparison below means nothing");
 
     var c = agnosai_process_config_shell(5000);
     agnosai_process_config_set_clean_env(c, 1);
     store64(&e, 0);
     var clean = agnosai_process_execute(c, probe, str_from(""), &e);
     assert(str_contains_cstr(agnosai_process_result_stdout(clean), "FEW") == 1,
-    "clean_env leaves the child only what the shell invents for itself");
+      "clean_env leaves the child only what the shell invents for itself");
     return 0;
 }
 
@@ -439,9 +439,9 @@ fn _t_pr_set_env_replaces_by_name(): i64 {
     agnosai_process_config_set_env(c, str_from("B"), str_from("2"));
     agnosai_process_config_set_env(c, str_from("A"), str_from("3"));
     assert(vec_len(agnosai_process_config_env(c)) == 2,
-    "setting a name twice replaces it - two entries, not three");
+      "setting a name twice replaces it - two entries, not three");
     assert(str_eq(vec_get(agnosai_process_config_env(c), 0), str_from("A=3")) == 1,
-    "...and the LAST value is the one kept, as cmd.env does");
+      "...and the LAST value is the one kept, as cmd.env does");
     return 0;
 }
 
@@ -450,7 +450,7 @@ fn _t_pr_set_env_replaces_by_name(): i64 {
 fn _t_pr_config_defaults(): i64 {
     var c = agnosai_process_config_default();
     assert(str_eq(agnosai_process_config_executable(c), str_from("/bin/sh")) == 1,
-    "the default executable is /bin/sh");
+      "the default executable is /bin/sh");
     assert(vec_len(agnosai_process_config_args(c)) == 1, "with one static argument");
     assert(str_eq(vec_get(agnosai_process_config_args(c), 0), str_from("-c")) == 1, "...which is -c");
     assert(agnosai_process_config_work_dir(c) == 0, "no work_dir - the parent's is inherited");
@@ -461,14 +461,14 @@ fn _t_pr_config_defaults(): i64 {
     var s = agnosai_process_config_shell(1234);
     assert(agnosai_process_config_timeout_ms(s) == 1234, "shell() sets the deadline");
     assert(str_eq(agnosai_process_config_executable(s), str_from("/bin/sh")) == 1,
-    "...and changes nothing else");
+      "...and changes nothing else");
 
     # Two configs must not share one env vec — the default builds a fresh one.
     var a = agnosai_process_config_default();
     var b = agnosai_process_config_default();
     agnosai_process_config_set_env(a, str_from("X"), str_from("1"));
     assert(vec_len(agnosai_process_config_env(b)) == 0,
-    "one config's env does not leak into another's");
+      "one config's env does not leak into another's");
     return 0;
 }
 
@@ -486,7 +486,7 @@ fn _t_pr_result_new_and_timeout_setter(): i64 {
     assert(agnosai_process_result_timed_out(t) == 1, "a timed-out result reports it");
     assert(agnosai_process_result_exit_code(t) == 0 - 1, "...alongside its own exit code");
     assert(str_eq(agnosai_process_result_stdout(t), str_from("a")) == 1,
-    "...without the two string fields aliasing");
+      "...without the two string fields aliasing");
 
     # The deadline setter is the one the manager would use to override a
     # policy-derived timeout onto an existing config.
@@ -499,7 +499,7 @@ fn _t_pr_result_new_and_timeout_setter(): i64 {
     var t0 = clock_now_ms();
     var slow = agnosai_process_execute(c, str_from("sleep 30"), str_from(""), &e);
     assert(agnosai_process_result_timed_out(slow) == 1,
-    "...and the child is actually held to it, not to the 30s default");
+      "...and the child is actually held to it, not to the 30s default");
     assert(clock_now_ms() - t0 < 10000, "...promptly");
     return 0;
 }
@@ -513,14 +513,14 @@ fn _t_pr_work_dir(): i64 {
     var r = agnosai_process_execute(c, str_from("pwd"), str_from(""), &e);
     assert(load64(&e) == 0, "a work_dir sandbox runs");
     assert(str_contains_cstr(agnosai_process_result_stdout(r), "/tmp") == 1,
-    "the child runs in the configured directory");
+      "the child runs in the configured directory");
 
     agnosai_process_config_set_work_dir(c, str_from("/nonexistent/work/dir"));
     store64(&e, 0);
     var bad = agnosai_process_execute(c, str_from("pwd"), str_from(""), &e);
     assert(bad == 0, "a missing work_dir is an error, not a run somewhere else");
     assert(str_contains_cstr(agnosai_error_message(load64(&e)), "working directory") == 1,
-    "...and the message says so, rather than blaming the executable");
+      "...and the message says so, rather than blaming the executable");
     return 0;
 }
 
@@ -534,11 +534,11 @@ fn _t_pr_timeout_blanks_output(): i64 {
     var e[8];
     store64(&e, 0);
     var r = agnosai_process_execute(agnosai_process_config_shell(500),
-    str_from("echo early; sleep 60"), str_from(""), &e);
+      str_from("echo early; sleep 60"), str_from(""), &e);
 
     assert(agnosai_process_result_timed_out(r) == 1, "the child timed out");
     assert(str_len(agnosai_process_result_stdout(r)) == 0,
-    "stdout is EMPTY on timeout, matching ProcessResult - not the partial output");
+      "stdout is EMPTY on timeout, matching ProcessResult - not the partial output");
     assert(str_len(agnosai_process_result_stderr(r)) == 0, "and so is stderr");
     return 0;
 }

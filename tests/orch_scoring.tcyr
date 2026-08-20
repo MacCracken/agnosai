@@ -25,7 +25,7 @@ include "tests/test_helpers.cyr"
 # The oracle's make_agent(tools, complexity, domain).
 fn _t_agent(tools, complexity, domain): i64 {
     var a = agnosai_agent_new(str_from("test-agent"), str_from("tester"),
-    str_from("test things"));
+      str_from("test things"));
     agnosai_agent_with_name(a, str_from("Test Agent"));
     agnosai_agent_with_complexity(a, str_from(complexity));
     if (domain != 0) { agnosai_agent_with_domain(a, str_from(domain)); }
@@ -79,7 +79,7 @@ fn main() {
     sum = f64_add(sum, agnosai_weight_personality());
     _t_assert_f64(sum, f64_from(1), "the five weights sum to exactly 1.0");
     _t_assert_f64(agnosai_weight_tool_coverage(), _t_ratio(35, 100),
-    "tool coverage is 0.35 — the constant, not the rustdoc's stale 0.40");
+      "tool coverage is 0.35 — the constant, not the rustdoc's stale 0.40");
     _t_assert_f64(agnosai_weight_complexity(), _t_ratio(25, 100), "complexity is 0.25");
     _t_assert_f64(agnosai_weight_gpu(), _t_ratio(10, 100), "gpu is 0.10");
     _t_assert_f64(agnosai_weight_domain(), _t_ratio(15, 100), "domain is 0.15");
@@ -92,70 +92,70 @@ fn main() {
     assert_eq(agnosai_complexity_level(str_from("LOW")), 1, "the match is case-insensitive");
     assert_eq(agnosai_complexity_level(str_from("HiGh")), 3, "in either direction");
     assert_eq(agnosai_complexity_level(str_from("banana")), 2,
-    "an unrecognised value degrades to medium rather than erroring");
+      "an unrecognised value degrades to medium rather than erroring");
     assert_eq(agnosai_complexity_level(str_from("")), 2, "and so does an empty one");
 
     # --- test_perfect_score ---
     var perfect_agent = _t_agent(_t_tools("lint", "test"), "medium", "quality");
     var perfect_task = _t_task(
-    "{\"required_tools\":[\"lint\",\"test\"],\"complexity\":\"medium\",\"domain\":\"quality\"}");
+      "{\"required_tools\":[\"lint\",\"test\"],\"complexity\":\"medium\",\"domain\":\"quality\"}");
     _t_assert_f64(agnosai_score_agent(perfect_agent, perfect_task),
-    _t_expected(f64_from(1), f64_from(1), f64_from(1), f64_from(1)),
-    "a perfectly matched agent scores every factor 1.0");
+      _t_expected(f64_from(1), f64_from(1), f64_from(1), f64_from(1)),
+      "a perfectly matched agent scores every factor 1.0");
 
     # the personality floor means a perfect score is NOT 1.0 — it is
     # 0.85 + 0.15*0.5 = 0.925 — because bhava is absent
     _t_assert_f64(agnosai_score_agent(perfect_agent, perfect_task), _t_ratio(925, 1000),
-    "which is 0.925, not 1.0, since personality contributes its neutral half");
+      "which is 0.925, not 1.0, since personality contributes its neutral half");
 
     # --- test_no_tools_match ---
     var no_tools = _t_agent(0, "medium", "quality");
     _t_assert_f64(agnosai_score_agent(no_tools, perfect_task),
-    _t_expected(f64_from(0), f64_from(1), f64_from(1), f64_from(1)),
-    "an agent with none of the required tools scores 0 on coverage");
+      _t_expected(f64_from(0), f64_from(1), f64_from(1), f64_from(1)),
+      "an agent with none of the required tools scores 0 on coverage");
 
     # --- test_partial_tool_coverage ---
     var half = _t_agent(_t_tools("lint", 0), "medium", "quality");
     _t_assert_f64(agnosai_score_agent(half, perfect_task),
-    _t_expected(_t_ratio(1, 2), f64_from(1), f64_from(1), f64_from(1)),
-    "one of two required tools scores 0.5 on coverage");
+      _t_expected(_t_ratio(1, 2), f64_from(1), f64_from(1), f64_from(1)),
+      "one of two required tools scores 0.5 on coverage");
 
     # --- test_complexity_mismatch ---
     var mismatched = _t_agent(_t_tools("lint", "test"), "high", "quality");
     _t_assert_f64(agnosai_score_agent(mismatched, perfect_task),
-    _t_expected(f64_from(1), _t_ratio(2, 3), f64_from(1), f64_from(1)),
-    "high against medium is one level off, so 1 - 1/3");
+      _t_expected(f64_from(1), _t_ratio(2, 3), f64_from(1), f64_from(1)),
+      "high against medium is one level off, so 1 - 1/3");
 
     var far = _t_agent(_t_tools("lint", "test"), "high", "quality");
     var low_task = _t_task(
-    "{\"required_tools\":[\"lint\",\"test\"],\"complexity\":\"low\",\"domain\":\"quality\"}");
+      "{\"required_tools\":[\"lint\",\"test\"],\"complexity\":\"low\",\"domain\":\"quality\"}");
     _t_assert_f64(agnosai_score_agent(far, low_task),
-    _t_expected(f64_from(1), _t_ratio(1, 3), f64_from(1), f64_from(1)),
-    "high against low is two levels off, so 1 - 2/3");
+      _t_expected(f64_from(1), _t_ratio(1, 3), f64_from(1), f64_from(1)),
+      "high against low is two levels off, so 1 - 2/3");
 
     # --- complexity_score directly, at every step of the 1 - |diff|/3 ladder ---
     var med_agent = _t_agent(0, "medium", 0);
     _t_assert_f64(agnosai_complexity_score(med_agent, _t_task("{\"complexity\":\"medium\"}")),
-    f64_from(1), "an exact complexity match is 1.0");
+      f64_from(1), "an exact complexity match is 1.0");
     _t_assert_f64(agnosai_complexity_score(med_agent, _t_task("{\"complexity\":\"low\"}")),
-    _t_ratio(2, 3), "one level off is 2/3");
+      _t_ratio(2, 3), "one level off is 2/3");
     _t_assert_f64(agnosai_complexity_score(_t_agent(0, "high", 0),
-    _t_task("{\"complexity\":\"low\"}")), _t_ratio(1, 3), "two levels off is 1/3");
+        _t_task("{\"complexity\":\"low\"}")), _t_ratio(1, 3), "two levels off is 1/3");
     _t_assert_f64(agnosai_complexity_score(med_agent, _t_task("{}")), f64_from(1),
-    "a task with no complexity defaults to medium, so a medium agent scores 1.0");
+      "a task with no complexity defaults to medium, so a medium agent scores 1.0");
     _t_assert_f64(agnosai_complexity_score(_t_agent(0, "high", 0), _t_task("{}")),
-    _t_ratio(2, 3), "and a high agent is one level off that default");
+      _t_ratio(2, 3), "and a high agent is one level off that default");
     _t_assert_f64(agnosai_complexity_score(med_agent,
-    _t_task("{\"complexity\":\"nonsense\"}")), f64_from(1),
-    "an unrecognised task complexity also degrades to medium");
+        _t_task("{\"complexity\":\"nonsense\"}")), f64_from(1),
+      "an unrecognised task complexity also degrades to medium");
     _t_assert_f64(agnosai_complexity_score(med_agent, _t_task("{\"complexity\":42}")),
-    f64_from(1), "as does a non-string one");
+      f64_from(1), "as does a non-string one");
 
     # --- gpu ---
     var gpu_task = _t_task("{\"gpu_required\":true}");
     var plain = _t_agent(0, "medium", 0);
     _t_assert_f64(agnosai_gpu_score(plain, gpu_task), f64_from(0),
-    "an agent with no GPU scores 0 when the task demands one");
+      "an agent with no GPU scores 0 when the task demands one");
 
     var gpu_req = _t_agent(0, "medium", 0);
     agnosai_agent_with_gpu(gpu_req, 1, 0, AGNOSAI_NO_LIMIT);
@@ -164,35 +164,35 @@ fn main() {
     var gpu_pref = _t_agent(0, "medium", 0);
     agnosai_agent_with_gpu(gpu_pref, 0, 1, AGNOSAI_NO_LIMIT);
     _t_assert_f64(agnosai_gpu_score(gpu_pref, gpu_task), f64_from(1),
-    "and so does gpu_preferred — the oracle accepts either");
+      "and so does gpu_preferred — the oracle accepts either");
 
     _t_assert_f64(agnosai_gpu_score(plain, _t_task("{}")), f64_from(1),
-    "a task with no GPU requirement scores every agent 1.0");
+      "a task with no GPU requirement scores every agent 1.0");
     _t_assert_f64(agnosai_gpu_score(gpu_req, _t_task("{}")), f64_from(1),
-    "including one that has a GPU — having one is never a penalty");
+      "including one that has a GPU — having one is never a penalty");
     _t_assert_f64(agnosai_gpu_score(plain, _t_task("{\"gpu_required\":false}")), f64_from(1),
-    "an explicit false is the same as absent");
+      "an explicit false is the same as absent");
 
     # --- domain ---
     var dom_task = _t_task("{\"domain\":\"quality\"}");
     _t_assert_f64(agnosai_domain_score(_t_agent(0, "medium", "quality"), dom_task), f64_from(1),
-    "a matching domain scores 1.0");
+      "a matching domain scores 1.0");
     _t_assert_f64(agnosai_domain_score(_t_agent(0, "medium", "QUALITY"), dom_task), f64_from(1),
-    "compared case-insensitively");
+      "compared case-insensitively");
     _t_assert_f64(agnosai_domain_score(_t_agent(0, "medium", "devops"), dom_task), f64_from(0),
-    "a mismatched domain scores 0");
+      "a mismatched domain scores 0");
     _t_assert_f64(agnosai_domain_score(_t_agent(0, "medium", 0), dom_task), f64_from(1),
-    "an agent with NO domain constraint is compatible with any, scoring 1.0");
+      "an agent with NO domain constraint is compatible with any, scoring 1.0");
     _t_assert_f64(agnosai_domain_score(_t_agent(0, "medium", "devops"), _t_task("{}")),
-    f64_from(1), "and a task with no domain scores every agent 1.0");
+      f64_from(1), "and a task with no domain scores every agent 1.0");
 
     # --- test_no_context_full_score ---
     # An empty context means no required tools, medium complexity, no GPU and no
     # domain — every factor at 1.0 for a medium agent.
     var bare_task = _t_task("{}");
     _t_assert_f64(agnosai_score_agent(_t_agent(0, "medium", 0), bare_task),
-    _t_expected(f64_from(1), f64_from(1), f64_from(1), f64_from(1)),
-    "a task with no context scores a medium agent at the ceiling");
+      _t_expected(f64_from(1), f64_from(1), f64_from(1), f64_from(1)),
+      "a task with no context scores a medium agent at the ceiling");
 
     # --- required_tools extraction ---
     assert_eq(agnosai_extract_required_tools(bare_task), 0, "an absent required_tools yields 0");
@@ -206,10 +206,10 @@ fn main() {
     # which is the oracle's behaviour and worth pinning as such.
     var bad_task = _t_task("{\"required_tools\":[\"lint\",7]}");
     assert_eq(agnosai_extract_required_tools(bad_task), 0,
-    "one non-string entry rejects the whole list, as serde's Vec<String> does");
+      "one non-string entry rejects the whole list, as serde's Vec<String> does");
     _t_assert_f64(agnosai_tool_coverage_score(_t_agent(0, "medium", 0),
-    agnosai_extract_required_tools(bad_task)), f64_from(1),
-    "and a malformed list scores FULL coverage, not zero — the oracle flatters it");
+        agnosai_extract_required_tools(bad_task)), f64_from(1),
+      "and a malformed list scores FULL coverage, not zero — the oracle flatters it");
 
     var not_arr = _t_task("{\"required_tools\":\"lint\"}");
     assert_eq(agnosai_extract_required_tools(not_arr), 0, "a non-array required_tools yields 0");
@@ -219,25 +219,25 @@ fn main() {
     assert(empty_extracted != 0, "an empty list extracts as an empty vec, not as absent");
     assert_eq(vec_len(empty_extracted), 0, "with no entries");
     _t_assert_f64(agnosai_tool_coverage_score(_t_agent(0, "medium", 0), empty_extracted),
-    f64_from(1), "and scores full coverage");
+      f64_from(1), "and scores full coverage");
 
     # extra tools on the agent are not a penalty
     _t_assert_f64(agnosai_tool_coverage_score(_t_agent(_t_tools("lint", "extra"), "medium", 0),
-    agnosai_extract_required_tools(_t_task("{\"required_tools\":[\"lint\"]}"))), f64_from(1),
-    "an agent carrying tools the task did not ask for still scores full coverage");
+        agnosai_extract_required_tools(_t_task("{\"required_tools\":[\"lint\"]}"))), f64_from(1),
+      "an agent carrying tools the task did not ask for still scores full coverage");
 
     # --- personality is the oracle's None arm ---
     _t_assert_f64(agnosai_personality_score(_t_agent(0, "medium", 0), bare_task),
-    _t_ratio(1, 2), "personality is the neutral 0.5 — bhava defers, so every agent takes None");
+      _t_ratio(1, 2), "personality is the neutral 0.5 — bhava defers, so every agent takes None");
 
     # --- the score is clamped to 0..1 ---
     var worst = _t_agent(0, "high", "devops");
     var worst_task = _t_task(
-    "{\"required_tools\":[\"a\",\"b\"],\"complexity\":\"low\",\"domain\":\"quality\",\"gpu_required\":true}");
+      "{\"required_tools\":[\"a\",\"b\"],\"complexity\":\"low\",\"domain\":\"quality\",\"gpu_required\":true}");
     var worst_score = agnosai_score_agent(worst, worst_task);
     assert_eq(f64_lt(worst_score, f64_from(0)), 0, "even the worst case is not negative");
     assert_eq(f64_gt(agnosai_score_agent(perfect_agent, perfect_task), f64_from(1)), 0,
-    "and the best case does not exceed 1.0");
+      "and the best case does not exceed 1.0");
 
     # --- test_rank_agents_ordering ---
     var good = _t_agent(_t_tools("lint", "test"), "medium", "quality");
@@ -248,13 +248,13 @@ fn main() {
     var ranked = agnosai_rank_agents(pair, perfect_task);
     assert_eq(vec_len(ranked), 2, "both agents are ranked");
     assert_eq(agnosai_scored_index(vec_get(ranked, 0)), 1,
-    "the better agent ranks first, by its ORIGINAL index");
+      "the better agent ranks first, by its ORIGINAL index");
     assert_eq(f64_gt(agnosai_scored_score(vec_get(ranked, 0)),
-    agnosai_scored_score(vec_get(ranked, 1))), 1, "and scores higher");
+        agnosai_scored_score(vec_get(ranked, 1))), 1, "and scores higher");
 
     # --- test_rank_agents_empty ---
     assert_eq(vec_len(agnosai_rank_agents(vec_new(), perfect_task)), 0,
-    "ranking no agents yields no results");
+      "ranking no agents yields no results");
 
     # --- ties keep input order ---
     # The oracle sorts with sort_by, which is a stable merge sort; order.cyr's
@@ -265,7 +265,7 @@ fn main() {
     assert_eq(vec_len(tied_ranked), 6, "six identical agents all rank");
     for (var j = 0; j < 6; j = j + 1) {
         assert_eq(agnosai_scored_index(vec_get(tied_ranked, j)), j,
-        "identically-scoring agents keep their input order");
+          "identically-scoring agents keep their input order");
     }
 
     # ⚠ **40 identical agents, added 2026-08-11 as the guard for replacing the
@@ -280,7 +280,7 @@ fn main() {
     assert_eq(vec_len(wide_ranked), 40, "forty identical agents all rank");
     for (var x = 0; x < 40; x = x + 1) {
         assert_eq(agnosai_scored_index(vec_get(wide_ranked, x)), x,
-        "and hold input order past the introsort threshold, where only the explicit \
+          "and hold input order past the introsort threshold, where only the explicit \
         index tie-break in `_agnosai_scored_before` can produce it");
     }
 
@@ -298,9 +298,9 @@ fn main() {
 
     # --- score_agent_with_tools matches score_agent ---
     _t_assert_f64(agnosai_score_agent_with_tools(perfect_agent, perfect_task,
-    agnosai_extract_required_tools(perfect_task)),
-    agnosai_score_agent(perfect_agent, perfect_task),
-    "pre-extracting the tools does not change the score — only the work done");
+        agnosai_extract_required_tools(perfect_task)),
+      agnosai_score_agent(perfect_agent, perfect_task),
+      "pre-extracting the tools does not change the score — only the work done");
 
     return assert_summary();
 }

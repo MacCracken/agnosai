@@ -120,38 +120,38 @@ fn main() {
     assert_eq(vec_len(agnosai_tool_schema_parameters(schema)), 2, "two parameters");
     var p0 = vec_get(agnosai_tool_schema_parameters(schema), 0);
     assert(str_eq(agnosai_param_schema_name(p0), str_from("target_url")) == 1,
-    "the first parameter is target_url");
+      "the first parameter is target_url");
     assert_eq(agnosai_param_schema_required(p0), 1, "target_url is required");
     var p1 = vec_get(agnosai_tool_schema_parameters(schema), 1);
     assert(str_eq(agnosai_param_schema_name(p1), str_from("scan_profile")) == 1,
-    "the second parameter is scan_profile");
+      "the second parameter is scan_profile");
     assert_eq(agnosai_param_schema_required(p1), 0, "scan_profile is optional");
 
     # --- security_audit_missing_url ---
     var out = agnosai_tool_execute(tool, agnosai_tool_input_new());
     assert_eq(agnosai_tool_output_success(out), 0, "a missing target_url fails");
     assert(str_contains(agnosai_tool_output_error(out), str_from("target_url")) == 1,
-    "the error names target_url");
+      "the error names target_url");
 
     # --- security_audit_ssrf_rejects_private_ip ---
     var priv_in = agnosai_tool_input_new();
     agnosai_tool_input_set(priv_in, str_from("target_url"),
-    bayan_json_v_str_new(str_from("http://192.168.1.1/admin")));
+      bayan_json_v_str_new(str_from("http://192.168.1.1/admin")));
     var priv_out = agnosai_tool_execute(tool, priv_in);
     assert_eq(agnosai_tool_output_success(priv_out), 0, "a private IP is refused");
     assert(str_contains(agnosai_tool_output_error(priv_out), str_from("private")) == 1,
-    "the refusal says private");
+      "the refusal says private");
 
     # --- audit_execute_trait_ssrf_blocks_localhost ---
     # The oracle's point: the SSRF check runs on the execute path, so loopback
     # is refused even when a real server is listening there.
     var lo_in = agnosai_tool_input_new();
     agnosai_tool_input_set(lo_in, str_from("target_url"),
-    bayan_json_v_str_new(str_from("http://127.0.0.1:8080/")));
+      bayan_json_v_str_new(str_from("http://127.0.0.1:8080/")));
     var lo_out = agnosai_tool_execute(tool, lo_in);
     assert_eq(agnosai_tool_output_success(lo_out), 0, "loopback is refused on the execute path");
     assert(str_contains(agnosai_tool_output_error(lo_out), str_from("private")) == 1,
-    "the loopback refusal says private");
+      "the loopback refusal says private");
 
     # --- the percentage rounding, against the oracle's f64 arithmetic ---
     # (count / 7 * 100).round() for count 0..7. None of these is a tie, so this
@@ -172,7 +172,7 @@ fn main() {
     assert(str_eq(_agnosai_audit_risk_level(80), str_from("low")) == 1, "80 is the low boundary");
     assert(str_eq(_agnosai_audit_risk_level(79), str_from("medium")) == 1, "79 is medium");
     assert(str_eq(_agnosai_audit_risk_level(60), str_from("medium")) == 1,
-    "60 is the medium boundary");
+      "60 is the medium boundary");
     assert(str_eq(_agnosai_audit_risk_level(59), str_from("high")) == 1, "59 is high");
     assert(str_eq(_agnosai_audit_risk_level(40), str_from("high")) == 1, "40 is the high boundary");
     assert(str_eq(_agnosai_audit_risk_level(39), str_from("critical")) == 1, "39 is critical");
@@ -181,11 +181,11 @@ fn main() {
     # --- audit_detects_missing_security_headers ---
     # mock_audit_server(false, false): no security headers, so 0 of 7.
     var bare = agnosai_audit_analyze(str_from("http://example.com/"),
-    _t_mock_headers(0, 0), 0);
+      _t_mock_headers(0, 0), 0);
     assert(agnosai_audit_security_score(bare) < 50, "no security headers scores under 50");
     assert(vec_len(agnosai_audit_headers_missing(bare)) > 0, "missing headers are reported");
     assert_eq(_t_missing_has(agnosai_audit_headers_missing(bare), "content-security-policy"), 1,
-    "content-security-policy is reported missing");
+      "content-security-policy is reported missing");
     assert_eq(vec_len(agnosai_audit_headers_missing(bare)), 7, "all seven are missing");
     assert_eq(vec_len(agnosai_audit_headers_present(bare)), 0, "none are present");
     assert_eq(agnosai_audit_header_score(bare), 0, "the header score is 0");
@@ -193,24 +193,24 @@ fn main() {
     # the Server header still fires disclosure, so the overall score is docked 5
     # below the header score — and clamped at 0 rather than going negative.
     assert_eq(agnosai_audit_security_score(bare), 0,
-    "0 minus the 5-point disclosure penalty clamps to 0, not -5");
+      "0 minus the 5-point disclosure penalty clamps to 0, not -5");
 
     # --- the missing-header severities are the oracle's table ---
     var bare_missing = agnosai_audit_headers_missing(bare);
     assert(str_eq(_t_missing_severity(bare_missing, "content-security-policy"),
-    str_from("critical")) == 1, "CSP absence is critical");
+        str_from("critical")) == 1, "CSP absence is critical");
     assert(str_eq(_t_missing_severity(bare_missing, "strict-transport-security"),
-    str_from("critical")) == 1, "HSTS absence is critical");
+        str_from("critical")) == 1, "HSTS absence is critical");
     assert(str_eq(_t_missing_severity(bare_missing, "x-frame-options"), str_from("high")) == 1,
-    "x-frame-options absence is high");
+      "x-frame-options absence is high");
     assert(str_eq(_t_missing_severity(bare_missing, "x-content-type-options"),
-    str_from("high")) == 1, "x-content-type-options absence is high");
+        str_from("high")) == 1, "x-content-type-options absence is high");
     assert(str_eq(_t_missing_severity(bare_missing, "referrer-policy"), str_from("medium")) == 1,
-    "referrer-policy absence is medium");
+      "referrer-policy absence is medium");
     assert(str_eq(_t_missing_severity(bare_missing, "permissions-policy"),
-    str_from("medium")) == 1, "permissions-policy absence is medium");
+        str_from("medium")) == 1, "permissions-policy absence is medium");
     assert(str_eq(_t_missing_severity(bare_missing, "x-xss-protection"), str_from("low")) == 1,
-    "x-xss-protection absence is low");
+      "x-xss-protection absence is low");
 
     # --- audit_scores_well_with_security_headers ---
     # mock_audit_server(true, false): five of seven set.
@@ -220,9 +220,9 @@ fn main() {
     assert_eq(vec_len(agnosai_audit_headers_present(good)), 5, "exactly five are present");
     assert_eq(agnosai_audit_header_score(good), 71, "five of seven is 71%");
     assert_eq(_t_has_str(agnosai_audit_headers_present(good), "content-security-policy"), 1,
-    "CSP is listed present");
+      "CSP is listed present");
     assert_eq(_t_missing_has(agnosai_audit_headers_missing(good), "permissions-policy"), 1,
-    "permissions-policy is still missing");
+      "permissions-policy is still missing");
 
     # 71 minus the 5-point disclosure penalty
     assert_eq(agnosai_audit_security_score(good), 66, "71 less the disclosure penalty is 66");
@@ -231,46 +231,46 @@ fn main() {
     # --- audit_detects_information_disclosure ---
     assert(vec_len(agnosai_audit_disclosure(good)) > 0, "disclosure is reported");
     assert_eq(_t_any_contains(agnosai_audit_disclosure(good), "Apache"), 1,
-    "the Apache version is disclosed");
+      "the Apache version is disclosed");
     assert_eq(_t_has_str(agnosai_audit_disclosure(good), "server: Apache/2.4.99"), 1,
-    "the disclosure line is '<header>: <value>'");
+      "the disclosure line is '<header>: <value>'");
     assert_eq(_t_has_vuln(agnosai_audit_vulnerabilities(good), "information_disclosure"), 1,
-    "disclosure raises a vulnerability");
+      "disclosure raises a vulnerability");
 
     # --- audit_recommends_https_for_http_target ---
     assert_eq(_t_any_contains(agnosai_audit_recommendations(good), "HTTPS"), 1,
-    "an http target is told to enforce HTTPS");
+      "an http target is told to enforce HTTPS");
     var https_target = agnosai_audit_analyze(str_from("https://example.com/"),
-    _t_mock_headers(1, 0), 0);
+      _t_mock_headers(1, 0), 0);
     assert_eq(_t_any_contains(agnosai_audit_recommendations(https_target), "HTTPS"), 0,
-    "an https target is not");
+      "an https target is not");
 
     # --- audit_detects_cors_wildcard_with_credentials ---
     # mock_audit_server(false, true) — the CORS headers come back on the OPTIONS
     # response, which is the set the oracle's analyze_cors reads.
     var cors_hdrs = _t_mock_headers(0, 1);
     var evil = agnosai_audit_analyze(str_from("http://example.com/"), _t_mock_headers(0, 0),
-    cors_hdrs);
+      cors_hdrs);
     var ec = agnosai_audit_cors(evil);
     assert_eq(agnosai_cors_allows_all_origins(ec), 1, "a wildcard origin is all origins");
     assert_eq(agnosai_cors_allows_credentials(ec), 1, "credentials are allowed");
     assert_eq(agnosai_cors_misconfigured(ec), 1, "wildcard plus credentials is misconfigured");
     assert_eq(_t_has_vuln(agnosai_audit_vulnerabilities(evil), "cors_misconfiguration"), 1,
-    "the CORS misconfiguration is raised");
+      "the CORS misconfiguration is raised");
     assert(str_contains(agnosai_cors_detail(ec), str_from("critical")) == 1,
-    "the detail calls it critical");
+      "the detail calls it critical");
     assert_eq(_t_any_contains(agnosai_audit_recommendations(evil), "restrict allowed origins"), 1,
-    "the CORS recommendation appears");
+      "the CORS recommendation appears");
 
     # 0 header score, minus 15 for CORS and 5 for disclosure, clamped at 0
     assert_eq(agnosai_audit_security_score(evil), 0, "both penalties still clamp at 0");
 
     # --- the CORS penalty is visible when the header score can absorb it ---
     var mixed = agnosai_audit_analyze(str_from("https://example.com/"), _t_mock_headers(1, 0),
-    cors_hdrs);
+      cors_hdrs);
     assert_eq(agnosai_audit_header_score(mixed), 71, "the header score is unchanged at 71");
     assert_eq(agnosai_audit_security_score(mixed), 51,
-    "71 less 15 for CORS and 5 for disclosure is 51");
+      "71 less 15 for CORS and 5 for disclosure is 51");
     assert(str_eq(agnosai_audit_risk_level(mixed), str_from("high")) == 1, "51 is high risk");
 
     # --- analyze_cors directly ---
@@ -280,14 +280,14 @@ fn main() {
     assert_eq(agnosai_cors_allows_all_origins(none), 0, "nor does it allow all origins");
     assert_eq(agnosai_cors_allows_credentials(none), 0, "nor credentials");
     assert(str_contains(agnosai_cors_detail(none), str_from("OPTIONS request failed")) == 1,
-    "the detail says the preflight failed");
+      "the detail says the preflight failed");
 
     # a response with no CORS headers at all
     var plain = agnosai_analyze_cors(sandhi_headers_new());
     assert_eq(agnosai_cors_allows_all_origins(plain), 0, "no ACAO header is not all origins");
     assert_eq(agnosai_cors_allows_credentials(plain), 0, "a missing ACAC defaults to false");
     assert(str_eq(agnosai_cors_detail(plain), str_from("CORS properly configured")) == 1,
-    "absent CORS headers read as properly configured");
+      "absent CORS headers read as properly configured");
 
     # a wildcard WITHOUT credentials is reported but not a misconfiguration
     var wild = sandhi_headers_new();
@@ -297,7 +297,7 @@ fn main() {
     assert_eq(agnosai_cors_allows_credentials(wildc), 0, "credentials are not allowed");
     assert_eq(agnosai_cors_misconfigured(wildc), 0, "a wildcard alone is not a misconfiguration");
     assert(str_eq(agnosai_cors_detail(wildc), str_from("Wildcard origin allowed (no credentials)"))
-    == 1, "the detail says so");
+      == 1, "the detail says so");
 
     # --- the reflected-origin bypass: echoing the probe back is a wildcard ---
     # This is the whole reason the probe origin is sent. A server that echoes an
@@ -324,15 +324,15 @@ fn main() {
     sandhi_headers_add(upper, "access-control-allow-origin", "*");
     sandhi_headers_add(upper, "access-control-allow-credentials", "TRUE");
     assert_eq(agnosai_cors_allows_credentials(agnosai_analyze_cors(upper)), 1,
-    "the credentials flag is case-insensitive");
+      "the credentials flag is case-insensitive");
     var mixed_case = sandhi_headers_new();
     sandhi_headers_add(mixed_case, "access-control-allow-credentials", "TrUe");
     assert_eq(agnosai_cors_allows_credentials(agnosai_analyze_cors(mixed_case)), 1,
-    "mixed case too");
+      "mixed case too");
     var falsey = sandhi_headers_new();
     sandhi_headers_add(falsey, "access-control-allow-credentials", "yes");
     assert_eq(agnosai_cors_allows_credentials(agnosai_analyze_cors(falsey)), 0,
-    "only the literal 'true' counts");
+      "only the literal 'true' counts");
 
     assert_eq(_agnosai_audit_cstr_ieq("true", "TRUE"), 1, "cstr_ieq folds case");
     assert_eq(_agnosai_audit_cstr_ieq("true", "true"), 1, "cstr_ieq matches identically");
@@ -352,9 +352,9 @@ fn main() {
     sandhi_headers_add(caps, "Server", "nginx/1.0");
     var caps_r = agnosai_audit_analyze(str_from("https://example.com/"), caps, 0);
     assert_eq(_t_has_str(agnosai_audit_headers_present(caps_r), "content-security-policy"), 1,
-    "a capitalised header name is still found");
+      "a capitalised header name is still found");
     assert_eq(_t_has_str(agnosai_audit_disclosure(caps_r), "server: nginx/1.0"), 1,
-    "the disclosure line uses the canonical lowercase name, not the sent one");
+      "the disclosure line uses the canonical lowercase name, not the sent one");
 
     # --- the perfect case: all seven headers, no disclosure, https ---
     var perfect = sandhi_headers_new();
@@ -372,39 +372,39 @@ fn main() {
 
     # --- vulnerability ordering is the oracle's, and it is wire-visible ---
     var all_bad = agnosai_audit_analyze(str_from("http://example.com/"), _t_mock_headers(0, 0),
-    cors_hdrs);
+      cors_hdrs);
     var av = agnosai_audit_vulnerabilities(all_bad);
     assert_eq(vec_len(av), 3, "all three vulnerabilities fire");
     assert(str_eq(agnosai_vuln_kind(vec_get(av, 0)), str_from("missing_security_headers")) == 1,
-    "missing headers comes first");
+      "missing headers comes first");
     assert(str_eq(agnosai_vuln_kind(vec_get(av, 1)), str_from("cors_misconfiguration")) == 1,
-    "CORS second");
+      "CORS second");
     assert(str_eq(agnosai_vuln_kind(vec_get(av, 2)), str_from("information_disclosure")) == 1,
-    "disclosure third");
+      "disclosure third");
     assert(str_eq(agnosai_vuln_severity(vec_get(av, 0)), str_from("high")) == 1,
-    "missing headers is high");
+      "missing headers is high");
     assert(str_eq(agnosai_vuln_severity(vec_get(av, 1)), str_from("critical")) == 1,
-    "CORS is critical");
+      "CORS is critical");
     assert(str_eq(agnosai_vuln_severity(vec_get(av, 2)), str_from("low")) == 1,
-    "disclosure is low");
+      "disclosure is low");
     assert(str_eq(agnosai_vuln_description(vec_get(av, 0)),
-    str_from("Only 0% of recommended security headers are present")) == 1,
-    "the description renders the score with no decimal point");
+        str_from("Only 0% of recommended security headers are present")) == 1,
+      "the description renders the score with no decimal point");
     assert(str_contains(agnosai_vuln_description(vec_get(av, 2)),
-    str_from("Server discloses: server: Apache/2.4.99")) == 1,
-    "the disclosure description joins the lines");
+        str_from("Server discloses: server: Apache/2.4.99")) == 1,
+      "the disclosure description joins the lines");
     assert(str_eq(agnosai_vuln_remediation(vec_get(av, 1)),
-    str_from("Restrict Access-Control-Allow-Origin to specific trusted domains")) == 1,
-    "the CORS remediation is the oracle's");
+        str_from("Restrict Access-Control-Allow-Origin to specific trusted domains")) == 1,
+      "the CORS remediation is the oracle's");
 
     # --- recommendation ordering, likewise ---
     var ar = agnosai_audit_recommendations(all_bad);
     assert_eq(vec_len(ar), 4, "all four recommendations fire");
     assert(str_contains(vec_get(ar, 0), str_from("Add all recommended security headers")) == 1,
-    "headers first");
+      "headers first");
     assert(str_contains(vec_get(ar, 1), str_from("Fix CORS configuration")) == 1, "CORS second");
     assert(str_contains(vec_get(ar, 2), str_from("Remove server version headers")) == 1,
-    "disclosure third");
+      "disclosure third");
     assert(str_contains(vec_get(ar, 3), str_from("Enforce HTTPS")) == 1, "HTTPS last");
 
     # --- multiple disclosure headers join in table order ---
@@ -414,14 +414,14 @@ fn main() {
     var multi_r = agnosai_audit_analyze(str_from("https://example.com/"), multi, 0);
     assert_eq(vec_len(agnosai_audit_disclosure(multi_r)), 2, "both disclosures are recorded");
     assert(str_eq(vec_get(agnosai_audit_disclosure(multi_r), 0), str_from("server: nginx")) == 1,
-    "the order is the table's, not the response's");
+      "the order is the table's, not the response's");
     assert(str_eq(vec_get(agnosai_audit_disclosure(multi_r), 1),
-    str_from("x-powered-by: PHP/8.0")) == 1, "x-powered-by follows server");
+        str_from("x-powered-by: PHP/8.0")) == 1, "x-powered-by follows server");
     # index 1, not 0 — with no security headers present the missing_security_headers
     # vulnerability is raised first
     assert(str_contains(agnosai_vuln_description(vec_get(agnosai_audit_vulnerabilities(multi_r),
-    1)), str_from("server: nginx, x-powered-by: PHP/8.0")) == 1,
-    "the join separator is ', '");
+            1)), str_from("server: nginx, x-powered-by: PHP/8.0")) == 1,
+      "the join separator is ', '");
 
     # --- a 0 header set is treated as no headers, not as a crash ---
     var nohdr = agnosai_audit_analyze(str_from("https://example.com/"), 0, 0);
@@ -432,23 +432,23 @@ fn main() {
     # --- the wire form ---
     var v = agnosai_audit_result_to_value(good);
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(v, "security_score")), str_from("66.0"))
-    == 1, "the score serialises as a float, matching the oracle's f64 field");
+      == 1, "the score serialises as a float, matching the oracle's f64 field");
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(v, "risk_level")), str_from("\"medium\""))
-    == 1, "risk_level is a string");
+      == 1, "risk_level is a string");
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(
-    bayan_json_v_obj_get(v, "header_analysis"), "score")), str_from("71.0")) == 1,
-    "the header score serialises as a float too");
+            bayan_json_v_obj_get(v, "header_analysis"), "score")), str_from("71.0")) == 1,
+      "the header score serialises as a float too");
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(
-    bayan_json_v_obj_get(v, "cors_analysis"), "misconfigured")), str_from("false")) == 1,
-    "the CORS flags serialise as JSON booleans, not 0/1");
+            bayan_json_v_obj_get(v, "cors_analysis"), "misconfigured")), str_from("false")) == 1,
+      "the CORS flags serialise as JSON booleans, not 0/1");
     assert_eq(bayan_json_v_is_arr(bayan_json_v_obj_get(v, "information_disclosure")), 1,
-    "information_disclosure is an array");
+      "information_disclosure is an array");
     assert_eq(bayan_json_v_is_arr(bayan_json_v_obj_get(v, "vulnerabilities")), 1,
-    "vulnerabilities is an array");
+      "vulnerabilities is an array");
     assert_eq(bayan_json_v_is_arr(bayan_json_v_obj_get(v, "recommendations")), 1,
-    "recommendations is an array");
+      "recommendations is an array");
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(v, "target_url")),
-    str_from("\"http://example.com/\"")) == 1, "target_url round-trips");
+        str_from("\"http://example.com/\"")) == 1, "target_url round-trips");
 
     # the missing-header objects carry both fields, and `type` is the key for
     # the oracle's `r#type`
@@ -456,36 +456,36 @@ fn main() {
     assert_eq(bayan_json_v_arr_len(v_missing), 2, "two headers missing in the wire form");
     var vm0 = bayan_json_v_arr_get(v_missing, 0);
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(vm0, "header")),
-    str_from("\"permissions-policy\"")) == 1, "the missing entry names the header");
+        str_from("\"permissions-policy\"")) == 1, "the missing entry names the header");
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(vm0, "severity")),
-    str_from("\"medium\"")) == 1, "and its severity");
+        str_from("\"medium\"")) == 1, "and its severity");
     var v_vulns = bayan_json_v_obj_get(v, "vulnerabilities");
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(bayan_json_v_arr_get(v_vulns, 0),
-    "type")), str_from("\"information_disclosure\"")) == 1,
-    "r#type serialises under the key 'type'");
+            "type")), str_from("\"information_disclosure\"")) == 1,
+      "r#type serialises under the key 'type'");
 
     # an empty result still emits empty arrays rather than omitting the fields —
     # the oracle has no skip_serializing_if anywhere in this struct
     var bv = agnosai_audit_result_to_value(best);
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(bv, "vulnerabilities")), str_from("[]"))
-    == 1, "an empty vulnerability list is [] rather than absent");
+      == 1, "an empty vulnerability list is [] rather than absent");
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(bv, "recommendations")), str_from("[]"))
-    == 1, "likewise recommendations");
+      == 1, "likewise recommendations");
     assert(str_eq(bayan_json_v_build(bayan_json_v_obj_get(bv, "security_score")),
-    str_from("100.0")) == 1, "a perfect score serialises as 100.0");
+        str_from("100.0")) == 1, "a perfect score serialises as 100.0");
 
     # --- the tool registers and resolves ---
     var reg = agnosai_register_security_audit_builtin(agnosai_tool_registry_new());
     assert_eq(agnosai_tool_registry_count(reg), 1, "security_audit registered");
     assert(agnosai_tool_registry_get(reg, str_from("security_audit")) != 0,
-    "security_audit resolves from the registry");
+      "security_audit resolves from the registry");
 
     # --- the request options carry the oracle's timeout and TLS stance ---
     var opts = _agnosai_audit_options();
     assert(opts != 0, "the options build");
     assert_eq(sandhi_http_options_get_total_ms(opts), 15000, "the 15s timeout is set");
     assert_eq(sandhi_http_options_get_tls_policy(opts), SANDHI_TLS_POLICY_DEFAULT,
-    "certificate validation is left on — the oracle's danger_accept_invalid_certs(false)");
+      "certificate validation is left on — the oracle's danger_accept_invalid_certs(false)");
 
     # --- redirect resolution, the security-critical addition ---
     # The oracle inherits reqwest's follow-by-default and validates only the URL
@@ -504,57 +504,57 @@ fn main() {
 
     # an absolute Location is taken as-is
     assert(str_eq(agnosai_fetch_resolve_location(base, "https://other.example.com/x"),
-    str_from("https://other.example.com/x")) == 1, "an absolute https Location passes through");
+        str_from("https://other.example.com/x")) == 1, "an absolute https Location passes through");
     assert(str_eq(agnosai_fetch_resolve_location(base, "http://other.example.com/x"),
-    str_from("http://other.example.com/x")) == 1, "an absolute http Location passes through");
+        str_from("http://other.example.com/x")) == 1, "an absolute http Location passes through");
 
     # an absolute path is resolved against the base authority
     assert(str_eq(agnosai_fetch_resolve_location(base, "/login"),
-    str_from("https://example.com/login")) == 1, "an absolute path keeps scheme and host");
+        str_from("https://example.com/login")) == 1, "an absolute path keeps scheme and host");
     assert(str_eq(agnosai_fetch_resolve_location(str_from("http://example.com:8080/a"), "/b"),
-    str_from("http://example.com:8080/b")) == 1, "a non-default port is carried across");
+        str_from("http://example.com:8080/b")) == 1, "a non-default port is carried across");
 
     # everything else fails closed rather than being guessed at
     assert_eq(agnosai_fetch_resolve_location(base, "../admin"), 0,
-    "a relative reference is refused rather than resolved by guesswork");
+      "a relative reference is refused rather than resolved by guesswork");
     assert_eq(agnosai_fetch_resolve_location(base, "admin"), 0, "so is a bare relative path");
     assert_eq(agnosai_fetch_resolve_location(base, "//evil.example.com/x"), 0,
-    "a protocol-relative Location carries its own authority and is refused");
+      "a protocol-relative Location carries its own authority and is refused");
     assert_eq(agnosai_fetch_resolve_location(base, ""), 0, "an empty Location is refused");
 
     # the guard would catch a resolved hop into private space — this is the
     # bypass the oracle is open to, closed here
     assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
-    str_from("http://public.example.com/"), "http://169.254.169.254/latest/meta-data/")), 0,
-    "a redirect to the cloud metadata endpoint is refused by the per-hop guard");
+          str_from("http://public.example.com/"), "http://169.254.169.254/latest/meta-data/")), 0,
+      "a redirect to the cloud metadata endpoint is refused by the per-hop guard");
     assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
-    str_from("http://public.example.com/"), "http://127.0.0.1:8080/admin")), 0,
-    "so is one to loopback");
+          str_from("http://public.example.com/"), "http://127.0.0.1:8080/admin")), 0,
+      "so is one to loopback");
     assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
-    str_from("http://public.example.com/"), "http://0177.0.0.1/")), 0,
-    "and one spelled in octal");
+          str_from("http://public.example.com/"), "http://0177.0.0.1/")), 0,
+      "and one spelled in octal");
     assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
-    str_from("http://public.example.com/"), "https://other.example.com/ok")), 1,
-    "a redirect to another public host is still allowed");
+          str_from("http://public.example.com/"), "https://other.example.com/ok")), 1,
+      "a redirect to another public host is still allowed");
 
     # a same-origin absolute path inherits the base's already-validated host, so
     # it stays safe without a second lookup
     assert_eq(agnosai_is_safe_url(agnosai_fetch_resolve_location(
-    str_from("https://example.com/a"), "/b")), 1, "a same-origin path stays allowed");
+          str_from("https://example.com/a"), "/b")), 1, "a same-origin path stays allowed");
 
     assert(AGNOSAI_FETCH_BLOCKED != 0,
-    "the blocked sentinel is distinct from the request-failed 0");
+      "the blocked sentinel is distinct from the request-failed 0");
     assert_eq(AGNOSAI_FETCH_MAX_HOPS, 10, "the hop limit matches reqwest's default");
 
     assert(str_eq(agnosai_audit_target_url(good), str_from("http://example.com/")) == 1,
-    "the result carries the URL it audited");
+      "the result carries the URL it audited");
 
     # --- the live path fails closed on an unresolvable host ---
     # `.invalid` is reserved by RFC 2606 and never resolves, so this exercises
     # the transport-failure arm identically on and off a network. It is also the
     # only assertion here that touches sandhi's dispatch at all.
     assert_eq(agnosai_run_security_audit(str_from("http://nonexistent.invalid/")), 0,
-    "an unresolvable target yields no result rather than a zero-scored one");
+      "an unresolvable target yields no result rather than a zero-scored one");
 
     # --- the to_str() gate: non-visible-ASCII header values are skipped ---
     # The oracle gates each disclosure on `let Ok(v) = val.to_str()`, so a
@@ -568,7 +568,7 @@ fn main() {
     assert_eq(_agnosai_audit_is_visible_ascii("a\x7fb"), 0, "DEL is not visible ASCII");
     assert_eq(_agnosai_audit_is_visible_ascii("a\nb"), 0, "a newline is rejected");
     assert_eq(_agnosai_audit_is_visible_ascii("\x80"), 0,
-    "a high byte is rejected on its value, not on load8 sign extension");
+      "a high byte is rejected on its value, not on load8 sign extension");
 
     var utf8 = sandhi_headers_new();
     for (var s7 = 0; s7 < AGNOSAI_AUDIT_SEC_HEADER_COUNT; s7 = s7 + 1) {
@@ -577,16 +577,16 @@ fn main() {
     sandhi_headers_add(utf8, "server", "nginx caf\xc3\xa9");
     var utf8_r = agnosai_audit_analyze(str_from("https://example.com/"), utf8, 0);
     assert_eq(vec_len(agnosai_audit_disclosure(utf8_r)), 0,
-    "a non-ASCII Server value discloses nothing, matching to_str()");
+      "a non-ASCII Server value discloses nothing, matching to_str()");
     assert_eq(agnosai_audit_security_score(utf8_r), 100,
-    "and so costs no points — the oracle would score this 100 too");
+      "and so costs no points — the oracle would score this 100 too");
 
     # --- scheme comparison is case-insensitive on the security paths ---
     # is_safe_url accepts HTTPS:// because sandhi_url_parse does, so a
     # byte-exact test here would skip the downgrade refusal and mis-slice the
     # origin.
     assert_eq(agnosai_is_safe_url(str_from("HTTPS://example.com/")), 1,
-    "the guard accepts an upper-case scheme");
+      "the guard accepts an upper-case scheme");
     assert_eq(agnosai_fetch_scheme_len(str_from("https://example.com/")), 8, "https is 8 bytes");
     assert_eq(agnosai_fetch_scheme_len(str_from("HTTPS://example.com/")), 8, "so is HTTPS");
     assert_eq(agnosai_fetch_scheme_len(str_from("HtTpS://example.com/")), 8, "and mixed case");
@@ -595,32 +595,32 @@ fn main() {
     assert_eq(agnosai_fetch_scheme_len(str_from("ftp://example.com/")), 0, "ftp is neither");
     assert_eq(agnosai_fetch_scheme_len(str_from("http:/")), 0, "a too-short URL is neither");
     assert_eq(agnosai_fetch_is_https(str_from("HTTPS://example.com/")), 1,
-    "an upper-case https URL is recognised as TLS");
+      "an upper-case https URL is recognised as TLS");
     assert_eq(agnosai_fetch_is_https(str_from("HTTP://example.com/")), 0, "an http one is not");
 
     # the origin slice must not be one byte short on an upper-case scheme —
     # getting this wrong resolves "/login" against "HTTPS:/" and yields a URL
     # pointing at a completely different host
     assert(str_eq(agnosai_fetch_resolve_location(str_from("HTTPS://example.com/a"), "/login"),
-    str_from("HTTPS://example.com/login")) == 1,
-    "an upper-case scheme slices the origin at the right byte");
+        str_from("HTTPS://example.com/login")) == 1,
+      "an upper-case scheme slices the origin at the right byte");
     assert_eq(agnosai_fetch_resolve_location(str_from("ftp://example.com/a"), "/login"), 0,
-    "an unsupported scheme refuses to resolve rather than mis-slicing");
+      "an unsupported scheme refuses to resolve rather than mis-slicing");
 
     # the analyze-side HTTPS recommendation stays BYTE-EXACT, because the
     # oracle's is: `!target_url.starts_with("https://")`
     var upper_https = agnosai_audit_analyze(str_from("HTTPS://example.com/"), perfect, 0);
     assert_eq(_t_any_contains(agnosai_audit_recommendations(upper_https), "HTTPS"), 1,
-    "an upper-case scheme still gets the HTTPS advice — that is the oracle's byte-exact test");
+      "an upper-case scheme still gets the HTTPS advice — that is the oracle's byte-exact test");
 
     # --- the response cap is raised off sandhi's 256 KiB default ---
     # The oracle never reads the body at all, so no body size can fail it;
     # inheriting sandhi's default would turn a large homepage into a hard error.
     assert_eq(sandhi_http_options_get_total_ms(opts), 15000, "the 15s budget is still set");
     assert(AGNOSAI_AUDIT_MAX_BYTES > 262144,
-    "the response cap is raised above sandhi's 256 KiB default");
+      "the response cap is raised above sandhi's 256 KiB default");
     assert(AGNOSAI_AUDIT_ARENA_BYTES > AGNOSAI_AUDIT_MAX_BYTES,
-    "the arena holds one full-size response plus its parse overhead");
+      "the arena holds one full-size response plus its parse overhead");
 
     # --- the header snapshot survives an arena reset ---
     # This is what lets the arena be sized for one exchange rather than for a
@@ -638,17 +638,17 @@ fn main() {
     for (var z = 0; z < 4096; z = z + 1) { store8(scribble + z, 90); }
 
     assert_eq(vec_len(agnosai_audit_headers_present(
-    agnosai_audit_analyze(str_from("https://example.com/"), snap, 0))), 1,
-    "the snapshotted security header survived the reset");
+          agnosai_audit_analyze(str_from("https://example.com/"), snap, 0))), 1,
+      "the snapshotted security header survived the reset");
     assert(str_eq(vec_get(agnosai_audit_disclosure(
-    agnosai_audit_analyze(str_from("https://example.com/"), snap, 0)), 0),
-    str_from("server: Apache/2.4.99")) == 1, "and so did the disclosure value, intact");
+            agnosai_audit_analyze(str_from("https://example.com/"), snap, 0)), 0),
+        str_from("server: Apache/2.4.99")) == 1, "and so did the disclosure value, intact");
     assert_eq(agnosai_cors_allows_all_origins(agnosai_analyze_cors(snap)), 1,
-    "and the CORS header, so one snapshot serves both chains");
+      "and the CORS header, so one snapshot serves both chains");
     assert_eq(sandhi_headers_has(snap, "x-irrelevant"), 0,
-    "a header the audit never reads is not copied");
+      "a header the audit never reads is not copied");
     assert_eq(_agnosai_audit_snapshot(0) != 0, 1,
-    "snapshotting a null header set yields an empty set, not 0");
+      "snapshotting a null header set yields an empty set, not 0");
 
     # ⚠ **The failure message must name the REASON.** The oracle reports the
     # underlying transport error (`security_audit.rs:132-136` maps reqwest's with
@@ -657,18 +657,18 @@ fn main() {
     # DNS from TLS from a timeout. `agnosai_guarded_fetch` computed sandhi's
     # error kind and dropped it — `agnosai_guarded_fetch_full` now surfaces it.
     assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_CONNECT),
-    "connection") == 1, "a connect failure says so");
+        "connection") == 1, "a connect failure says so");
     assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_TLS), "TLS") == 1,
-    "a TLS failure says so");
+      "a TLS failure says so");
     assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_TIMEOUT),
-    "timed out") == 1, "a timeout says so");
+        "timed out") == 1, "a timeout says so");
     assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_DISCOVERY),
-    "resolution") == 1, "a DNS failure says so");
+        "resolution") == 1, "a DNS failure says so");
     assert(str_eq(_agnosai_audit_reason(SANDHI_ERR_CONNECT),
-    _agnosai_audit_reason(SANDHI_ERR_TLS)) == 0,
-    "and the kinds are DISTINCT — one shared string would be the old behaviour");
+        _agnosai_audit_reason(SANDHI_ERR_TLS)) == 0,
+      "and the kinds are DISTINCT — one shared string would be the old behaviour");
     assert(str_contains_cstr(_agnosai_audit_reason(0), "request failed") == 1,
-    "an unknown kind falls back to the generic message");
+      "an unknown kind falls back to the generic message");
 
     # ⚠ **The table above is PURE, so asserting it does not test the wiring** —
     # dropping the `store64(out_kind, ..)` in `agnosai_guarded_fetch_full` leaves
@@ -692,7 +692,7 @@ fn main() {
     var probe_kind: i64[1];
     store64(&probe_kind, 0);
     var probe_rc = agnosai_run_security_audit_err(
-    str_from("http://nonexistent-agnosai.invalid/"), &probe_kind);
+      str_from("http://nonexistent-agnosai.invalid/"), &probe_kind);
     # ⚠ **The OUTCOME is not asserted, only the INVARIANT.** `.invalid` is
     # reserved by RFC 2606 and must not resolve — but a resolver that hijacks
     # NXDOMAIN with a wildcard A record turns this into a real connection, and a
@@ -705,21 +705,21 @@ fn main() {
         # A kind was captured, so the transport must have failed.
         assert_eq(probe_rc, 0, "a captured kind means the fetch failed");
         assert(str_eq(_agnosai_audit_reason(probe_got), _agnosai_audit_reason(0)) == 0,
-        "a captured kind yields a SPECIFIC reason, not the generic fallback");
+          "a captured kind yields a SPECIFIC reason, not the generic fallback");
         assert_eq(probe_got, SANDHI_ERR_DISCOVERY,
-        "and an unresolvable host is a DISCOVERY failure");
+          "and an unresolvable host is a DISCOVERY failure");
     } else {
         # No resolver: sandhi returned no result, so there is no kind. The
         # message must then be the generic one rather than a reason invented
         # from a zero.
         assert(str_contains_cstr(_agnosai_audit_reason(probe_got), "request failed") == 1,
-        "with no kind observed the message stays generic rather than inventing one");
+          "with no kind observed the message stays generic rather than inventing one");
     }
 
     # A null out_kind must be accepted, since the bare form passes one.
     assert_eq(agnosai_run_security_audit_err(
-    str_from("http://nonexistent-agnosai.invalid/"), 0), 0,
-    "a null out_kind is accepted rather than dereferenced");
+        str_from("http://nonexistent-agnosai.invalid/"), 0), 0,
+      "a null out_kind is accepted rather than dereferenced");
 
     return assert_summary();
 }

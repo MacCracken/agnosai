@@ -52,16 +52,16 @@ include "tests/test_helpers.cyr"
 # registry and the audit chain it wants to inspect afterwards.
 fn _t_state_with(o): i64 {
     return agnosai_app_state_new(o,
-    agnosai_tool_registry_new(), agnosai_auth_config_new(),
-    agnosai_event_bus_new(), agnosai_audit_chain_new(),
-    agnosai_approval_gate_new());
+      agnosai_tool_registry_new(), agnosai_auth_config_new(),
+      agnosai_event_bus_new(), agnosai_audit_chain_new(),
+      agnosai_approval_gate_new());
 }
 
 fn _t_state(): i64 {
     return agnosai_app_state_new(agnosai_orchestrator_new(0),
-    agnosai_tool_registry_new(), agnosai_auth_config_new(),
-    agnosai_event_bus_new(), agnosai_audit_chain_new(),
-    agnosai_approval_gate_new());
+      agnosai_tool_registry_new(), agnosai_auth_config_new(),
+      agnosai_event_bus_new(), agnosai_audit_chain_new(),
+      agnosai_approval_gate_new());
 }
 
 fn _t_body_str(r, key): Str {
@@ -90,52 +90,52 @@ fn _t_req_body(extra): Str {
 # Oracle: `safe_callback_rejects_loopback`.
 fn _t_rejects_loopback(): i64 {
     assert(agnosai_route_a2a_callback_allowed(str_from("http://127.0.0.1/callback")) == 0,
-    "127.0.0.1 is rejected");
+      "127.0.0.1 is rejected");
     assert(agnosai_route_a2a_callback_allowed(str_from("http://[::1]/callback")) == 0,
-    "[::1] is rejected");
+      "[::1] is rejected");
     return 0;
 }
 
 # Oracle: `safe_callback_rejects_ipv6_mapped_ipv4`.
 fn _t_rejects_ipv6_mapped(): i64 {
     assert(agnosai_route_a2a_callback_allowed(str_from("http://[::ffff:10.0.0.1]/path")) == 0,
-    "an IPv6-mapped private IPv4 is rejected");
+      "an IPv6-mapped private IPv4 is rejected");
     assert(agnosai_route_a2a_callback_allowed(str_from("http://[::ffff:127.0.0.1]/path")) == 0,
-    "an IPv6-mapped loopback is rejected");
+      "an IPv6-mapped loopback is rejected");
     return 0;
 }
 
 # Oracle: `safe_callback_rejects_localhost_variants`.
 fn _t_rejects_localhost_variants(): i64 {
     assert(agnosai_route_a2a_callback_allowed(str_from("http://localhost/cb")) == 0,
-    "localhost is rejected");
+      "localhost is rejected");
     assert(agnosai_route_a2a_callback_allowed(str_from("http://LOCALHOST/cb")) == 0,
-    "...case-insensitively");
+      "...case-insensitively");
     assert(agnosai_route_a2a_callback_allowed(str_from("http://0.0.0.0/cb")) == 0,
-    "0.0.0.0 is rejected");
+      "0.0.0.0 is rejected");
     return 0;
 }
 
 # Oracle: `safe_callback_rejects_non_http`.
 fn _t_rejects_non_http(): i64 {
     assert(agnosai_route_a2a_callback_allowed(str_from("file:///etc/passwd")) == 0,
-    "file:// is rejected");
+      "file:// is rejected");
     assert(agnosai_route_a2a_callback_allowed(str_from("ftp://example.com/x")) == 0,
-    "ftp:// is rejected");
+      "ftp:// is rejected");
     assert(agnosai_route_a2a_callback_allowed(str_from("not a url")) == 0,
-    "a non-URL is rejected");
+      "a non-URL is rejected");
     return 0;
 }
 
 # Oracle: `safe_callback_accepts_public_urls` and `safe_callback_rejects_metadata_ip`.
 fn _t_accepts_public_rejects_metadata(): i64 {
     assert(agnosai_route_a2a_callback_allowed(str_from("https://example.com/cb")) == 1,
-    "a public https URL is accepted");
+      "a public https URL is accepted");
     assert(agnosai_route_a2a_callback_allowed(str_from("http://example.com/cb")) == 1,
-    "a public http URL is accepted");
+      "a public http URL is accepted");
     # The cloud metadata endpoint — the SSRF target that matters most.
     assert(agnosai_route_a2a_callback_allowed(str_from("http://169.254.169.254/latest/meta-data")) == 0,
-    "the link-local metadata IP is rejected");
+      "the link-local metadata IP is rejected");
     return 0;
 }
 
@@ -145,12 +145,12 @@ fn _t_receive_success(): i64 {
     var r = agnosai_route_a2a_receive(_t_state(), _t_req_body(""));
     assert(agnosai_route_status(r) == HTTP_OK, "a valid delegation is 200");
     assert(str_eq(_t_body_str(r, "task_id"), str_from("t1")) == 1,
-    "the task_id is echoed from the request");
+      "the task_id is echoed from the request");
     assert(str_eq(_t_body_str(r, "status"), str_from("completed")) == 1, "status is completed");
 
     var b = agnosai_route_body(r);
     assert(bayan_json_v_is_null(bayan_json_v_obj_get(b, "error")) == 1,
-    "error is null on success");
+      "error is null on success");
     var result = bayan_json_v_obj_get(b, "result");
     assert(bayan_json_v_is_obj(result) == 1, "result is an object");
     var tasks = bayan_json_v_obj_get(result, "tasks");
@@ -177,11 +177,11 @@ fn _t_receive_field_too_long(): i64 {
     assert(agnosai_route_status(r) == HTTP_BAD_REQUEST, "an over-long description is 400");
     assert(str_eq(_t_body_str(r, "status"), str_from("failed")) == 1, "...status failed");
     assert(str_eq(_t_body_str(r, "error"), str_from("field exceeds max length")) == 1,
-    "...with the oracle's message");
+      "...with the oracle's message");
     assert(str_eq(_t_body_str(r, "task_id"), str_from("t1")) == 1,
-    "...still echoing the task_id");
+      "...still echoing the task_id");
     assert(bayan_json_v_is_null(bayan_json_v_obj_get(agnosai_route_body(r), "result")) == 1,
-    "...and a null result");
+      "...and a null result");
 
     # The task_id arm of the same check.
     var sb2 = str_builder_new();
@@ -189,7 +189,7 @@ fn _t_receive_field_too_long(): i64 {
     str_builder_add_str(sb2, _t_str_of(AGNOSAI_A2A_MAX_STRING_LEN + 1, 116));
     str_builder_add_cstr(sb2, "\",\"description\":\"d\"}");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s, str_builder_build(sb2)))
-    == HTTP_BAD_REQUEST, "an over-long task_id is 400");
+      == HTTP_BAD_REQUEST, "an over-long task_id is 400");
 
     # Exactly at the cap is accepted.
     var sb3 = str_builder_new();
@@ -197,7 +197,7 @@ fn _t_receive_field_too_long(): i64 {
     str_builder_add_str(sb3, _t_str_of(AGNOSAI_A2A_MAX_STRING_LEN, 100));
     str_builder_add_cstr(sb3, "\"}");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s, str_builder_build(sb3)))
-    == HTTP_OK, "a description exactly at the cap is accepted");
+      == HTTP_OK, "a description exactly at the cap is accepted");
     return 0;
 }
 
@@ -212,17 +212,17 @@ fn _t_receive_metadata_cap(): i64 {
     var r = agnosai_route_a2a_receive(s, _t_req_body_raw(str_builder_build(sb)));
     assert(agnosai_route_status(r) == HTTP_BAD_REQUEST, "oversized metadata is 400");
     assert(str_eq(_t_body_str(r, "error"), str_from("metadata exceeds 64 KiB limit")) == 1,
-    "...with the oracle's message");
+      "...with the oracle's message");
 
     # A small metadata object passes, and any JSON shape is allowed there.
     assert(agnosai_route_status(agnosai_route_a2a_receive(s,
-    _t_req_body(",\"metadata\":{\"k\":\"v\"}"))) == HTTP_OK, "small object metadata passes");
+          _t_req_body(",\"metadata\":{\"k\":\"v\"}"))) == HTTP_OK, "small object metadata passes");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s,
-    _t_req_body(",\"metadata\":[1,2,3]"))) == HTTP_OK, "an array is valid metadata");
+          _t_req_body(",\"metadata\":[1,2,3]"))) == HTTP_OK, "an array is valid metadata");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s,
-    _t_req_body(",\"metadata\":42"))) == HTTP_OK, "a scalar is valid metadata");
+          _t_req_body(",\"metadata\":42"))) == HTTP_OK, "a scalar is valid metadata");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s,
-    _t_req_body(",\"metadata\":null"))) == HTTP_OK, "null is valid metadata");
+          _t_req_body(",\"metadata\":null"))) == HTTP_OK, "null is valid metadata");
     return 0;
 }
 
@@ -240,20 +240,20 @@ fn _t_req_body_raw(extra: Str): Str {
 fn _t_bad_callback_does_not_fail_the_request(): i64 {
     var s = _t_state();
     var r = agnosai_route_a2a_receive(s,
-    _t_req_body(",\"callback_url\":\"http://127.0.0.1/steal\""));
+      _t_req_body(",\"callback_url\":\"http://127.0.0.1/steal\""));
     assert(agnosai_route_status(r) == HTTP_OK,
-    "an SSRF-rejected callback URL does NOT fail the request");
+      "an SSRF-rejected callback URL does NOT fail the request");
     assert(str_eq(_t_body_str(r, "status"), str_from("completed")) == 1,
-    "...the delegation still completed");
+      "...the delegation still completed");
     assert(bayan_json_v_is_null(bayan_json_v_obj_get(agnosai_route_body(r), "error")) == 1,
-    "...and no error is reported to the caller");
+      "...and no error is reported to the caller");
 
     # A safe URL is equally invisible in the response.
     var r2 = agnosai_route_a2a_receive(s,
-    _t_req_body(",\"callback_url\":\"https://example.com/cb\""));
+      _t_req_body(",\"callback_url\":\"https://example.com/cb\""));
     assert(agnosai_route_status(r2) == HTTP_OK, "an accepted callback URL is also 200");
     assert(bayan_json_v_obj_len(agnosai_route_body(r2)) == 4,
-    "...and adds nothing to the response shape");
+      "...and adds nothing to the response shape");
     return 0;
 }
 
@@ -265,16 +265,16 @@ fn _t_reader(): i64 {
     str_builder_add_cstr(fb, "\"callback_url\":\"https://x.com/c\",\"metadata\":{\"a\":1}");
     var full = _t_req_body_raw(str_builder_build(fb));
     var req = agnosai_a2a_req_from_value(
-    bayan_json_v_parse_buf(str_data(full), str_len(full)));
+      bayan_json_v_parse_buf(str_data(full), str_len(full)));
     assert(req != 0, "a full A2ARequest reads");
     assert(str_eq(agnosai_a2a_req_task_id(req), str_from("t1")) == 1, "task_id");
     assert(str_eq(agnosai_a2a_req_description(req), str_from("do the thing")) == 1,
-    "description");
+      "description");
     assert(str_eq(agnosai_a2a_req_domain(req), str_from("quality")) == 1, "domain");
     assert(str_eq(agnosai_a2a_req_size(req), str_from("lean")) == 1, "size");
     assert(str_eq(agnosai_a2a_req_preset(req), str_from("p")) == 1, "preset");
     assert(str_eq(agnosai_a2a_req_callback_url(req), str_from("https://x.com/c")) == 1,
-    "callback_url");
+      "callback_url");
     assert(agnosai_a2a_req_metadata(req) != 0, "metadata");
 
     # Only task_id and description are required.
@@ -290,7 +290,7 @@ fn _t_reader(): i64 {
     var blank = agnosai_a2a_req_new(str_from("id"), str_from("desc"));
     assert(str_eq(agnosai_a2a_req_task_id(blank), str_from("id")) == 1, "new stores task_id");
     assert(str_eq(agnosai_a2a_req_description(blank), str_from("desc")) == 1,
-    "new stores description");
+      "new stores description");
     assert(agnosai_a2a_req_domain(blank) == 0, "new leaves domain absent");
     assert(agnosai_a2a_req_size(blank) == 0, "new leaves size absent");
     assert(agnosai_a2a_req_preset(blank) == 0, "new leaves preset absent");
@@ -302,32 +302,32 @@ fn _t_reader(): i64 {
 fn _t_reader_rejections(): i64 {
     var s = _t_state();
     assert(agnosai_route_status(agnosai_route_a2a_receive(s, str_from("not json")))
-    == HTTP_BAD_REQUEST, "malformed JSON is 400");
+      == HTTP_BAD_REQUEST, "malformed JSON is 400");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s, str_from("{}")))
-    == AGNOSAI_HTTP_UNPROCESSABLE, "missing required fields is 422");
+      == AGNOSAI_HTTP_UNPROCESSABLE, "missing required fields is 422");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s,
-    str_from("{\"task_id\":\"t\"}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
-    "missing description is 422");
+          str_from("{\"task_id\":\"t\"}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
+      "missing description is 422");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s,
-    str_from("{\"description\":\"d\"}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
-    "missing task_id is 422");
+          str_from("{\"description\":\"d\"}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
+      "missing task_id is 422");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s,
-    str_from("{\"task_id\":1,\"description\":\"d\"}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
-    "a non-string task_id is 422");
+          str_from("{\"task_id\":1,\"description\":\"d\"}"))) == AGNOSAI_HTTP_UNPROCESSABLE,
+      "a non-string task_id is 422");
 
     # `deny_unknown_fields`.
     assert(agnosai_route_status(agnosai_route_a2a_receive(s, _t_req_body(",\"nope\":1")))
-    == AGNOSAI_HTTP_UNPROCESSABLE, "an unknown field is 422");
+      == AGNOSAI_HTTP_UNPROCESSABLE, "an unknown field is 422");
 
     # A present-but-wrong-typed optional is a deserialization failure.
     assert(agnosai_route_status(agnosai_route_a2a_receive(s, _t_req_body(",\"domain\":5")))
-    == AGNOSAI_HTTP_UNPROCESSABLE, "a non-string domain is 422");
+      == AGNOSAI_HTTP_UNPROCESSABLE, "a non-string domain is 422");
     assert(agnosai_route_status(agnosai_route_a2a_receive(s,
-    _t_req_body(",\"callback_url\":5"))) == AGNOSAI_HTTP_UNPROCESSABLE,
-    "a non-string callback_url is 422");
+          _t_req_body(",\"callback_url\":5"))) == AGNOSAI_HTTP_UNPROCESSABLE,
+      "a non-string callback_url is 422");
     # ...but an explicit null is the same as absent, matching `Option`.
     assert(agnosai_route_status(agnosai_route_a2a_receive(s, _t_req_body(",\"domain\":null")))
-    == HTTP_OK, "an explicit null domain is treated as absent");
+      == HTTP_OK, "an explicit null domain is treated as absent");
     return 0;
 }
 
@@ -337,7 +337,7 @@ fn _t_status(): i64 {
     var r = agnosai_route_a2a_status();
     assert(agnosai_route_status(r) == HTTP_OK, "GET a2a/status is 200");
     assert(str_eq(_t_body_str(r, "status"), str_from("not_implemented")) == 1,
-    "...answering not_implemented, as the oracle's placeholder does");
+      "...answering not_implemented, as the oracle's placeholder does");
     assert(bayan_json_v_obj_len(agnosai_route_body(r)) == 1, "...with one member");
     return 0;
 }
@@ -357,7 +357,7 @@ fn _t_a2a_req_takes_an_allocator(): i64 {
     assert(req != 0, "a2a_req_from_value_a deserialises through the arena");
     assert(str_eq_cstr(agnosai_a2a_req_description(req), "work") == 1, "...the description");
     assert(str_eq_cstr(agnosai_a2a_req_domain(req), "ops") == 1,
-    "...and an optional field, which goes through the same clone");
+      "...and an optional field, which goes through the same clone");
 
     reset_via(ar);
     return 0;
@@ -386,7 +386,7 @@ fn _t_a2a_retained_state_survives_its_arena(): i64 {
     var ar = arena_allocator(262144);
 
     var r = agnosai_route_a2a_receive_a(ar, s,
-    str_from("{\"task_id\":\"t-1\",\"description\":\"do the thing\"}"));
+      str_from("{\"task_id\":\"t-1\",\"description\":\"do the thing\"}"));
     assert(agnosai_route_status(r) == HTTP_OK, "the threaded route answers 200");
 
     # Read anything from the response BEFORE the reset — it lives in `ar`.
@@ -402,10 +402,10 @@ fn _t_a2a_retained_state_survives_its_arena(): i64 {
     var named = 0;
     for (var j = 0; j < vec_len(recent); j = j + 1) {
         if (str_eq_cstr(agnosai_audit_entry_message(vec_get(recent, j)),
-        "a2a-general-t-1") == 1) { named = named + 1; }
+            "a2a-general-t-1") == 1) { named = named + 1; }
     }
     assert(named > 0,
-    "the crew name in the audit trail survives the arena being released and \
+      "the crew name in the audit trail survives the arena being released and \
     overwritten");
 
     # And the description, which became the task result's output.
@@ -415,8 +415,8 @@ fn _t_a2a_retained_state_survives_its_arena(): i64 {
     var results = agnosai_crew_state_results(st);
     assert(vec_len(results) == 1, "...with one task result");
     assert(str_eq_cstr(agnosai_task_result_output(vec_get(results, 0)),
-    "do the thing") == 1,
-    "**and the description carried into that result survives too** — the \
+        "do the thing") == 1,
+      "**and the description carried into that result survives too** — the \
     request owns its strings rather than borrowing the body");
     return 0;
 }
