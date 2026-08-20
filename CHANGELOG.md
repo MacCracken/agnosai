@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.3] — 2026-08-20
+
+### Changed — Cyrius pin 6.5.30 → 6.5.31, bote 3.3.1 → 3.3.2, majra 2.6.6 → 2.6.7
+
+Also closes the toolchain drift that broke the 2.0.2 CI run: with the pin at
+6.5.31 it now equals the installed wrapper, so `cyrius lib sync --full` and
+`cyrius deps` provision from the same version the manifest names. That mismatch
+— pin 6.5.27 against a 6.5.30 wrapper — is what wrote a lock CI could not
+reproduce.
+
+### Removed — the defensive `[deps.patra]` shim
+
+2.0.2 carried `[deps.patra] tag = "1.13.9"` purely to stop a lagging transitive
+sibling downgrading the folded patra. That is now fixed at the source, so the
+shim is gone (20 lines, including its explanatory comment):
+
+- **libro 2.8.8** moved its `[deps.patra]` 1.13.8 → 1.13.9
+- **bote 3.3.2** took libro 2.8.8 (and majra 2.6.3 → 2.6.6, cyrius 6.5.20 → 6.5.31)
+- **majra 2.6.7** moved its `[deps.sigil]` 3.12.7 → 3.12.9
+- **agnosai** takes bote 3.3.2 and majra 2.6.7 here
+
+Verified in a sibling-free tree with git-tag resolution — the only shape that
+exercises the bug, since `path = "../patra"` masks it on any developer machine.
+With the shim removed: `lib sync --full` lands patra **1.13.9** and `cyrius deps`
+leaves it at **1.13.9** (it previously rewrote it to 1.13.0), resolving libro
+2.8.8 and bote 3.3.2 from tags, 8 commit-pinned.
+
+Gates in that same sibling-free tree: `check-symbols.sh` green (2,639
+definitions / 112 files), `check-clean.sh` **OK** across all eight sub-gates,
+build OK.
+
+### Verified — every folded-module pin in the dependency closure
+
+The patra defect was found by accident, so the closure was swept
+systematically: every `[deps.X]` where X is a module the toolchain folds,
+compared against what the pinned toolchain actually ships
+(`head -3 ~/.cyrius/versions/6.5.31/lib/<X>.cyr`). Five such declarations exist
+across agnosai / bote / libro / majra / kavach, and all five now match:
+
+| repo | folded dep | tag | 6.5.31 folds |
+|---|---|---|---|
+| agnosai | sigil | 3.12.9 | 3.12.9 |
+| libro | sigil | 3.12.9 | 3.12.9 |
+| libro | patra | 1.13.9 | 1.13.9 |
+| majra | sigil | 3.12.9 | 3.12.9 |
+| kavach | sigil | 3.12.9 | 3.12.9 |
+
+majra's sigil pin was the last mismatch. It was never observed downgrading
+anything — agnosai and libro both pin 3.12.9 directly, so one of them always won
+— but that is resolution *order*, not correctness, and it is the exact shape
+that broke this repo's CI through patra.
+
+⚠ **If a future toolchain bump moves the folded patra again**, the failure
+returns via whichever sibling lags — the invariant is that every
+`[deps.patra]` in the chain equals what the pinned toolchain folds. Check with
+`head -3 ~/.cyrius/versions/<pin>/lib/patra.cyr`.
+
 ## [2.0.2] — 2026-08-20
 
 ### Added — `[lib]` stanza + `dist/agnosai.cyr` library bundle
