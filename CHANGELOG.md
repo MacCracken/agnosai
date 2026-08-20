@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Cyrius pin 6.5.27 → 6.5.30
+
+Picks up the seven stdlib folds (sakshi 2.4.11, patra 1.13.9, yukti 2.3.8, niyama 1.0.7,
+mabda 4.1.0, ganita 1.1.4, yantra 1.0.3) and — relevant here — the `.30` fix for the
+`[deps] stdlib` key scan matching the word inside a quoted value, swept across all three copies
+(`cmd_deps`, `_distlib_union_declared_stdlib`, `_libsync_declared_mods`).
+
+`cyrius lib sync --full` re-vendored the snapshot, `cyrius deps` re-resolved, `cyrius distlib`
+regenerated the bundle (unchanged at 37,252 lines), `check-symbols.sh` green (2,639 definitions
+across 112 files), build green.
+
+### ⚠ Open — CI build failure not reproduced locally
+
+CI fails the Build step on 2.0.2 with the entire stdlib out of scope — `ARENA_FULL_SPILL`,
+`SK_*`, `SYS_WRITE`, `ACCEL_*`, the `Str` type, and 162 reachable undefined functions across
+sandhi / bayan / sigil / majra. Ruled out locally, each built **green**:
+
+- the `[lib]` stanza itself, at 6.5.27 (CI's pin), 6.5.29 and 6.5.30;
+- the full CI step order — `lib sync --full` → `deps` → `check-symbols` → `check-clean` → `build`;
+- `dist/` being committed (present in every green build);
+- `[lib]` section placement — before `[deps]`, matching majra, patra, sigil, bote, kavach,
+  sandhi, tyche and ai-hwaccel;
+- manifest truncation — `[deps]` sits at byte 5060 and every manifest read on the build path uses
+  a 32,767-byte cap. (`cmd_publish` at `cbt/commands.cyr:3489` does use a 4,095-byte cap, which
+  this manifest now exceeds, but `cyrius publish` is not on the CI path.)
+
+The one CI condition not reproducible locally is dependency resolution: CI has no sibling
+checkouts, so every `[deps.NAME]` resolves from `git` + `tag`, while locally `path = "../NAME"`
+resolves to a working copy. That difference is load-bearing here — **majra 2.6.6 pins
+`[deps.sigil] tag = "3.12.7"` while kavach 3.11.14 and this repo both pin `3.12.9`, and the
+6.5.27 and 6.5.30 folds both ship 3.12.9.** Locally all three resolve to the one `../sigil`
+checkout (3.12.9) and the conflict is invisible; in CI each resolves independently and
+`lib/sigil.cyr` is decided by overlay order. That is the documented "folded module pinned behind
+the snapshot silently downgrades it for every transitive consumer" hazard, and it matches
+`sha256_hex` / `hmac_sha256` appearing in the undefined list.
+
+⛔ Note `docs/ecosystem.md`'s fold table claims `lib/sigil.cyr` is sigil **3.12.7**; the shipped
+snapshots say **3.12.9** (`~/.cyrius/versions/{6.5.27,6.5.30}/lib/sigil.cyr` header). The table is
+rotted — do not pin against it.
+
+### ⚠ Pre-existing — `check-clean.sh` red before this work
+
+Verified identical on 7d5fae0 (pre-`[lib]`): `lib: patra.cyr differs from the <pin> snapshot`
+and `generated: src/definitions/presets_data.cyr is stale — run ./scripts/gen-presets.sh`.
+Neither is caused by the dist target.
+
 ## [2.0.2] — 2026-08-20
 
 ### Added — `[lib]` stanza + `dist/agnosai.cyr` library bundle
