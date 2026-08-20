@@ -7,51 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed — Cyrius pin 6.5.27 → 6.5.30
+### Fixed — CI build broke on 2.0.2: `cyrius.lock` was written by a newer toolchain than the pin
 
-Picks up the seven stdlib folds (sakshi 2.4.11, patra 1.13.9, yukti 2.3.8, niyama 1.0.7,
-mabda 4.1.0, ganita 1.1.4, yantra 1.0.3) and — relevant here — the `.30` fix for the
-`[deps] stdlib` key scan matching the word inside a quoted value, swept across all three copies
-(`cmd_deps`, `_distlib_union_declared_stdlib`, `_libsync_declared_mods`).
+2.0.2 shipped a `cyrius.lock` whose 108 stdlib hashes are **6.5.30**'s while `cyrius.cyml` still
+pinned **6.5.27**. CI installs the pin, provisions `lib/` from the 6.5.27 snapshot, and then
+disagrees with the lock — the stdlib never lands in scope and the build dies with the whole floor
+missing: `ARENA_FULL_SPILL`, `SK_*`, `SYS_WRITE`, `ACCEL_*`, the `Str` type, and 162 reachable
+undefined functions across sandhi / bayan / sigil / majra.
 
-`cyrius lib sync --full` re-vendored the snapshot, `cyrius deps` re-resolved, `cyrius distlib`
-regenerated the bundle (unchanged at 37,252 lines), `check-symbols.sh` green (2,639 definitions
-across 112 files), build green.
+Proof, for `lib/patra.cyr`:
 
-### ⚠ Open — CI build failure not reproduced locally
+| | sha256 |
+|---|---|
+| 6.5.27 snapshot | `39bbf19f1a7b3eab4c5e21d5df23897882d57a7e4ef4d483125c89eec03bf07e` |
+| 6.5.30 snapshot | `4e0b1bcfba2fcca2bca2bfc12af9be0e090e9e980ecf73f5e3c6a9eb1d3f9113` |
+| lock at 2.0.2 | `4e0b1bcfba2fcca2bca2bfc12af9be0e090e9e980ecf73f5e3c6a9eb1d3f9113` |
 
-CI fails the Build step on 2.0.2 with the entire stdlib out of scope — `ARENA_FULL_SPILL`,
-`SK_*`, `SYS_WRITE`, `ACCEL_*`, the `Str` type, and 162 reachable undefined functions across
-sandhi / bayan / sigil / majra. Ruled out locally, each built **green**:
+Eleven modules moved in that lock diff — `dynlib`, `fdlopen`, `libro`, `async`, `freelist`,
+`sandhi`, `patra`, `tls_native_keysched`, `sankoch`, `tls_native_hs12`, `tls_native_hs13`.
 
-- the `[lib]` stanza itself, at 6.5.27 (CI's pin), 6.5.29 and 6.5.30;
-- the full CI step order — `lib sync --full` → `deps` → `check-symbols` → `check-clean` → `build`;
-- `dist/` being committed (present in every green build);
-- `[lib]` section placement — before `[deps]`, matching majra, patra, sigil, bote, kavach,
-  sandhi, tyche and ai-hwaccel;
-- manifest truncation — `[deps]` sits at byte 5060 and every manifest read on the build path uses
-  a 32,767-byte cap. (`cmd_publish` at `cbt/commands.cyr:3489` does use a 4,095-byte cap, which
-  this manifest now exceeds, but `cyrius publish` is not on the CI path.)
+**Cause.** The dist-target work ran `cyrius lib sync --full` and `cyrius deps` on a machine whose
+toolchain had been upgraded to 6.5.30 while the manifest still pinned 6.5.27. Both commands
+provision from the *installed* toolchain, not the pin, so `lib/` and the lock were rewritten at
+6.5.30 and committed. Local builds stayed green throughout precisely because the polluted `lib/`
+matched the polluted lock — the mismatch is only observable where the pin is honoured, i.e. CI.
 
-The one CI condition not reproducible locally is dependency resolution: CI has no sibling
-checkouts, so every `[deps.NAME]` resolves from `git` + `tag`, while locally `path = "../NAME"`
-resolves to a working copy. That difference is load-bearing here — **majra 2.6.6 pins
-`[deps.sigil] tag = "3.12.7"` while kavach 3.11.14 and this repo both pin `3.12.9`, and the
-6.5.27 and 6.5.30 folds both ship 3.12.9.** Locally all three resolve to the one `../sigil`
-checkout (3.12.9) and the conflict is invisible; in CI each resolves independently and
-`lib/sigil.cyr` is decided by overlay order. That is the documented "folded module pinned behind
-the snapshot silently downgrades it for every transitive consumer" hazard, and it matches
-`sha256_hex` / `hmac_sha256` appearing in the undefined list.
+⚠ **The CLI warns about exactly this and the warning was read past.** `cyrius --version` prints
+`manifest-pin: 6.5.27 (drift — wrapper is 6.5.30)` whenever the installed toolchain differs from
+the pin. Treat that line as blocking before any `lib sync` / `deps` / commit.
 
-⛔ Note `docs/ecosystem.md`'s fold table claims `lib/sigil.cyr` is sigil **3.12.7**; the shipped
-snapshots say **3.12.9** (`~/.cyrius/versions/{6.5.27,6.5.30}/lib/sigil.cyr` header). The table is
-rotted — do not pin against it.
+**Fix.** Pin moved 6.5.27 → 6.5.30 so pin and lock agree, then `cyrius lib sync --full`,
+`cyrius deps`, `cyrius distlib`. Verified: all 108 stdlib lock entries byte-match the 6.5.30
+snapshot, `cyrius deps --verify` 114 verified / 0 failed, `check-symbols.sh` green (2,639
+definitions across 112 files), `cyrius distlib --check` reports current, build green.
 
-### ⚠ Pre-existing — `check-clean.sh` red before this work
+The 6.5.30 pin also picks up seven stdlib folds (sakshi 2.4.11, patra 1.13.9, yukti 2.3.8,
+niyama 1.0.7, mabda 4.1.0, ganita 1.1.4, yantra 1.0.3).
 
-Verified identical on 7d5fae0 (pre-`[lib]`): `lib: patra.cyr differs from the <pin> snapshot`
-and `generated: src/definitions/presets_data.cyr is stale — run ./scripts/gen-presets.sh`.
-Neither is caused by the dist target.
+### Note — unrelated, not the cause
+
+`majra` 2.6.6 pins `[deps.sigil] tag = "3.12.7"` while this repo and `kavach` 3.11.14 both pin
+`3.12.9`, and the 6.5.27 and 6.5.30 folds both ship 3.12.9. Locally every path resolves to one
+`../sigil` checkout so the conflict is invisible; in CI each resolves from its own tag and
+`lib/sigil.cyr` is decided by overlay order. Surfaced while diagnosing the above and left alone —
+it did not cause this failure.
+
+### Pre-existing — `check-clean.sh` red before this work
+
+Verified identical on 7d5fae0 (pre-`[lib]`): `generated: src/definitions/presets_data.cyr is
+stale — run ./scripts/gen-presets.sh`. Not caused by the dist target.
 
 ## [2.0.2] — 2026-08-20
 
