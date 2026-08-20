@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.2] — 2026-08-20
+
+### Added — `[lib]` stanza + `dist/agnosai.cyr` library bundle
+
+AgnosAI is now consumable as a normal Cyrius dependency, not only as a binary. `cyrius.cyml` gains a
+`[lib]` stanza and `cyrius distlib` emits `dist/agnosai.cyr` (37,252 lines) plus the
+`dist/agnosai.deps` sidecar (45 stdlib leaves). Downstream consumers declare it the way AgnosAI
+declares majra and kavach:
+
+```toml
+[deps.agnosai]
+git = "https://github.com/MacCracken/agnosai.git"
+path = "../agnosai"
+tag = "2.0.2"
+modules = ["dist/agnosai.cyr"]
+```
+
+The driver is Agnostic 2.0.1, which is being ported Python → Cyrius against `python-port/` as its
+oracle — the same exercise this repo ran against `rust-old/`. Embedding is the only way to reach
+`agnosai_orchestrator_submit_crew` (async crews returning a crew id immediately), the fleet stack,
+the learning stack and `durable_state`: none of those has an HTTP route, and `POST /api/v1/crews` is
+synchronous with its SSE channel torn down at crew finish, so live progress is unreachable over the
+wire. `README.md`'s "AgnosAI is a binary, not a `[deps.agnosai]` package" note is now obsolete.
+
+Three things the module list has to get right, all verified:
+
+- **Order is `src/main.cyr`'s include order fully expanded through the nine `mod.cyr` hubs** —
+  Cyrius resolves forward references in a single pass, so a leaf listed after its consumer breaks
+  the build. Each hub is listed *after* its own leaves; no hub defines anything before its first
+  `include` (checked for all nine), so its trailing definitions must land last. Only
+  `telemetry/mod.cyr` (36 defs), `sandbox/mod.cyr` and `server/routes/mod.cyr` (22 defs, no
+  includes) carry any.
+- **`src/main.cyr` is deliberately absent.** Its last two lines —
+  `var _agnosai_exit_code = main(); _agnosai_exit_process(_agnosai_exit_code);` — are top-level
+  statements that run at include time, so a consumer linking them would start a server on include.
+  Its own header has said so since the port. Verified absent from the bundle: the only occurrence of
+  either symbol is inside a comment.
+- **The hubs' own `include` lines are harmless.** `cyrius distlib` strips every `include` directive
+  (both `lib/` and `src/`) from each bundled module and records the `lib/` leaves in the sidecar
+  instead — `cbt/commands.cyr:3145-3149`. The bundle contains zero `include` lines. That is what
+  makes listing a hub alongside its leaves safe, rather than requiring the hubs to be flattened by
+  hand.
+
+111 modules declared, 111 emitted, bundle self-check green. Verified end to end from a consumer
+project that links the bundle and reaches three separate corners of it — `agnosai_percentile_i64`
+(`src/order.cyr`), `agnosai_uuid_v4`/`_version` (`src/id.cyr`) and
+`agnosai_orchestrator_new`/`_crew_count` (`src/orchestrator/orchestrator.cyr`) — building and exiting
+42.
+
+⚠ **Consumers must NOT also declare `unicode` in their own `[deps].stdlib`.** The sidecar lists it
+(AgnosAI calls `unicode_category`), and `unicode` is the only stdlib module that is a package
+*directory* rather than a single file. Declaring it in both places makes `cbt` emit an unexpanded
+`include "lib/unicode.cyr"` and the consumer build fails with `cannot open include file:
+lib/unicode.cyr`. Filed upstream at
+`cyrius/docs/development/issues/2026-08-19-agnostic-sidecar-package-dir-double-declare.md` with a
+two-line repro; until it lands, omit the declaration and let the sidecar supply it.
+
+⚠ **`AGNOSAI_VERSION` at `src/server/routes/mod.cyr:44` still reads `"1.1.0"`** and is untouched
+here — it is the one place the number is duplicated, and it feeds `/ready` and MCP `initialize`. Its
+comment calls the value deliberate ("the number always names something that actually shipped"), but
+that rationale predates 2.0.0/2.0.1 actually shipping, so by the comment's own rule it is now stale
+and both endpoints under-report. Left as a separate decision rather than bundled into this release.
+
 ## [2.0.1] — 2026-08-18
 
 ### Changed — Cyrius pin 6.5.21 → 6.5.27
