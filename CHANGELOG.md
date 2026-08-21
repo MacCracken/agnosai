@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.4] — 2026-08-20
+
+### Changed — kavach 3.11.14 → 3.11.15, ai-hwaccel 2.3.17 → 2.3.18, Cyrius pin 6.5.31 → 6.5.32
+
+Picks up a **memory-safety fix in the dependency pair**, found while linking AgnosAI in-process into
+agnostic.
+
+Both libraries defined `var BACKEND_COUNT` — 10 in kavach, 18 in ai-hwaccel. Cyrius has one flat
+symbol table with last-definition-wins and is **silent** on a duplicate `var`, so in this binary the
+constant resolved to **18**. kavach uses it as the bounds check in `_backend_fp` over a **10-slot**
+table (`_backend_table[320]` at `BACKEND_SLOT_SIZE = 32`), so the guard admitted ids 0–17 and
+`_backend_slot(17)` read 224 bytes past the end — then `backend_dispatch_exec` `fncall2`s the
+result. kavach's own comment says the check exists to stop exactly that: *"an out-of-range id would
+otherwise index `_backend_table[320]` out of bounds and load a wild function pointer."*
+
+Measured in this repo, not inferred: a probe returning the constant as its exit code printed **18**
+before the bump and **10** after. `AIHW_BACKEND_COUNT` correctly reads 18.
+
+Nothing caught it. The compiler warns on a duplicate `fn` and is silent for `var`; every
+`check-symbols.sh` in the ecosystem — including this repo's — scans `src/` only, so a `lib/`↔`lib/`
+collision between two dependencies is invisible. This build had zero undefined-function warnings
+throughout.
+
+### Not changed — no source edits were needed
+
+The upstream fix also renamed `enum Backend` → `KavachBackend` / `AiHwBackend`. This repo calls
+`Backend.WASM`, `Backend.NOOP`, `Backend.PROCESS` and `Backend.OCI` at 8 sites in
+`src/sandbox/{wasm,kavach_bridge}.cyr` and needs **none of them touched**, because in Cyrius an enum
+**qualifier is cosmetic** — `Backend.WASM` and `KavachBackend.WASM` both resolve to the member
+`WASM`, with the type name playing no part in resolution. Verified: all four values assert correct
+against the new dists.
+
+⚠ The corollary is worth carrying: since only member names resolve, renaming an enum *type* does not
+protect its *members*. kavach's `PROCESS`, `WASM`, `OCI`, `NOOP` remain generic and unprefixed. They
+collide with nothing in the current fold, but that is luck rather than design.
+
+⚠ Also still present, and known: kavach and sigil share the whole `syserr_*` family
+(`syserr_pack`, `syserr_new`, `syserr_kind`, `syserr_errno`, `syserr_message`, `result_print_err`,
+`is_syscall_err`, `wrap_syscall`) plus several `agnosys_*` helpers, and ai-hwaccel redefines
+`path_exists` against kavach's. These warn at build time — they are `fn`, not `var` — so they are
+visible rather than silent. Deferred deliberately.
+
+The pin bump also clears real drift: the manifest said 6.5.31 while the installed toolchain was
+6.5.32, so `lib sync --full` and `deps` were provisioning from a version the manifest did not name.
+
 ## [2.0.3] — 2026-08-20
 
 ### Changed — Cyrius pin 6.5.30 → 6.5.31, bote 3.3.1 → 3.3.2, majra 2.6.6 → 2.6.7

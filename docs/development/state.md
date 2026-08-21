@@ -2,7 +2,45 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-08-12.
+> Last refreshed: 2026-08-20.
+
+## Now — 2.0.4
+
+| | |
+|---|---|
+| **version** | **2.0.4** |
+| **cyrius pin** | **6.5.32** (wrapper matches — no drift) |
+| **tests** | **99 suites, 8,038 assertions, 0 failed** |
+| **dist** | `dist/agnosai.cyr`, 37,252 lines, stamped v2.0.4 |
+| **gates** | `check-symbols.sh` · `check-clean.sh` · `distlib --check` green |
+
+Direct deps (`[deps.*]`, all six): `sigil` **3.12.9**, `bote` **3.3.2**,
+`majra` **2.6.7**, `kavach` **3.11.15**, `ai-hwaccel` **2.3.18**,
+`tyche` **1.0.1**. Everything else — `patra`, `libro`, `sakshi`, `bayan`,
+`sandhi` — arrives folded from the toolchain, not as a direct dep.
+
+**2.0.4 is a dependency-only release.** kavach and ai-hwaccel both defined
+`var BACKEND_COUNT` (10 vs 18); Cyrius has one flat symbol table with
+last-definition-wins and is **silent** on a duplicate `var`, so in this binary
+kavach's `_backend_fp` bounds check read 18 against a 10-slot table. Measured
+here — a probe returning the constant printed **18** before the bump and **10**
+after. No source in this repo changed: the upstream fix also renamed
+`enum Backend`, but a Cyrius enum qualifier is **cosmetic** (`Backend.WASM` and
+`KavachBackend.WASM` both resolve to the member `WASM`), so this repo's 8
+`Backend.X` call sites in `src/sandbox/` build unchanged and correct.
+
+⚠ **Known and deferred**: kavach's enum *members* (`PROCESS`, `WASM`, `OCI`,
+`NOOP`) remain generic and unprefixed — a type rename does not protect them.
+kavach and sigil also share the whole `syserr_*` family. Those are `fn`
+collisions, so they warn at build time rather than resolving silently.
+
+⚠ **Blind spot this exposed**: every `check-symbols.sh` in the ecosystem,
+including this repo's, scans `src/` only. A `lib/`↔`lib/` collision between two
+dependencies is invisible to all of them.
+
+---
+
+## Historical — the 2026-08-12 four-repo sweep *(resolved; kept for the record)*
 
 ## ✅ RESOLVED 2026-08-12 — the four-repo chain is closed at every root
 
