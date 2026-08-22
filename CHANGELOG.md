@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.5] — 2026-08-21
+
+### Changed — bote 3.3.2 → 3.3.3, libro 2.8.8 → 2.8.10, patra 1.13.9 → 1.13.10
+
+Carries a **process-killing defect fix** up the chain. AgnosAI is the middle link
+in `agnostic → agnosai → bote → libro → patra`, and none of it reaches the
+product tier any other way.
+
+**libro 2.8.9 — `PatraStore` read from another thread killed the process.**
+`patrastore_open` prepared its `SELECT` and `COUNT` statements once and cached
+the handles in the store; patra's SQL parse scratch is **per-thread**
+(`patra_init`: *"Install this (main/foreign) thread's TLS block so the per-thread
+SQL parse scratch (sql.cyr) resolves."*). A statement parsed on the opening
+thread and executed on another dereferenced TLS that was not there — no
+diagnostic, no error return, no unwind. Found by Agnostic, which serves a durable
+audit trail from a sandhi worker pool: the first HTTP request to one endpoint
+took the whole server down while every other route kept working.
+
+AgnosAI does not read a PatraStore off-thread itself, so nothing here changes
+behaviour — but any consumer that does is exposed, and Agnostic is one.
+
+**libro 2.8.10 — declares the patra it is built against.** 2.8.9 still said
+`[deps.patra] = 1.13.9`. ⚠ `cyrius deps` applies a declared dep's copy *on top of*
+the `lib sync --full` snapshot on every resolve, so that tag would **downgrade**
+`lib/patra.cyr` for everything downstream the moment the cyrius stdlib folds
+1.13.10 — the same transitive downgrade bote 3.3.2 had to unpick.
+
+**patra 1.13.10 — `patra_init` no longer clobbers the host's log level.** Its last
+line was an unconditional `sakshi_set_level(SK_WARN)`, process-global, so any host
+that had configured its own level silently lost every INFO line the moment it
+opened a database. It suppressed nothing of patra's own: patra's entire sakshi
+surface is one `sakshi_error`, which passes at WARN regardless.
+
+⚠ **`[deps.kavach]` deliberately stays at 3.11.15.** The sibling tree is at an
+untagged 3.12.x under active development, and `path` beats `tag` when a checkout
+is present — so a local resolve silently vendors work-in-progress into the lock.
+This release's lock was produced with kavach resolved **from its tag**, and now
+carries an explicit commit pin for it.
+
 ## [2.0.4] — 2026-08-20
 
 ### Changed — kavach 3.11.14 → 3.11.15, ai-hwaccel 2.3.17 → 2.3.18, Cyrius pin 6.5.31 → 6.5.32
