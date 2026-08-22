@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.0.5] — 2026-08-21
+## [2.0.5] — 2026-08-22
 
 ### Changed — bote 3.3.2 → 3.3.3, libro 2.8.8 → 2.8.10, patra 1.13.9 → 1.13.10
 
@@ -40,11 +40,104 @@ that had configured its own level silently lost every INFO line the moment it
 opened a database. It suppressed nothing of patra's own: patra's entire sakshi
 surface is one `sakshi_error`, which passes at WARN regardless.
 
-⚠ **`[deps.kavach]` deliberately stays at 3.11.15.** The sibling tree is at an
-untagged 3.12.x under active development, and `path` beats `tag` when a checkout
-is present — so a local resolve silently vendors work-in-progress into the lock.
-This release's lock was produced with kavach resolved **from its tag**, and now
-carries an explicit commit pin for it.
+### Changed — Cyrius pin 6.5.32 → 6.5.34
+
+⚠ **This is what turns CI green, and it is inseparable from the libro bump above.**
+`main` had been **red since `5e025a7`**, failing the *Cleanliness check* step on one
+line:
+
+```
+lib: patra.cyr differs from the 6.5.32 snapshot
+```
+
+patra is folded into the Cyrius stdlib, so `lib/patra.cyr` comes from the pinned
+snapshot — but `cyrius deps` applies a *declared* dep's copy on top of that snapshot
+on every resolve, and libro 2.8.10 declares `[deps.patra] = 1.13.10`. Against a
+6.5.32 pin, which folds **1.13.9**, that overlay put a file in `lib/` that did not
+match the snapshot, and `check-clean.sh`'s lib-snapshot rule allows **no** file to
+differ — deliberately:
+
+> **No file is allowed to differ.** An allowance for `sakshi.cyr` lived here from
+> 2026-08-05 to 2026-08-07 and is gone: the tree built 2.4.7 while the pin shipped
+> 2.4.8, silently reverting the `i64::MIN` decimal fix.
+
+**Cyrius 6.5.34 folds patra 1.13.10**, so the pin and the overlay now agree and
+`lib/` matches the snapshot with **zero files differing** — verified byte-for-byte
+against `git show 6.5.34:lib/patra.cyr`. Re-certified end to end on 6.5.34: `cycc`
+differs between patch releases even when `lib/` does not, so the build and the whole
+suite were re-run rather than assumed.
+
+⚠ **Read this as a sequencing rule, not a one-off.** Taking a patra version through a
+transitive `[deps.patra]` obliges a Cyrius pin that folds the same version. The
+delivery path is `patra tag → fold into the cyrius stdlib → cyrius release → consumer
+pin bump`, and a consumer sitting between steps 2 and 4 fails this gate every time.
+The two halves are one change; splitting them is what produced a red `main`.
+
+### Changed — kavach 3.11.15 → 3.12.2
+
+⚠ **An earlier draft of this entry said `[deps.kavach]` "deliberately stays at
+3.11.15".** That was true when written and is no longer: the reason given was that
+*"the sibling tree is at an untagged 3.12.x under active development"*, and 3.12.2
+is now tagged and pushed. The reason expired, so the pin moved. What has **not**
+changed is the discipline it was protecting — `path = "../kavach"` stays deleted
+from the block, so `tag` is the only resolution source and a local checkout can
+never vendor work-in-progress into the lock.
+
+Three additive releases, none of whose new API AgnosAI calls:
+
+- **3.12.0** — `config_env`: a caller-supplied payload environment (`config_env`,
+  `kv_envp_from_vec`, `confine_capture_input_env`). Honoured by the process
+  backend, `sandbox_spawn`, and the OCI spec's `process.env`.
+- **3.12.1** — the command blocklist made a rootfs'd sandbox unable to run a
+  shell, so most images could not start.
+- **3.12.2** — `config_workdir` was decorative: its only reader was the WASM
+  backend's `--dir` preopen, so every process- and OCI-backend caller ran at `/`.
+
+**No source change was needed, and that is measured rather than assumed.**
+AgnosAI's kavach surface across `src/sandbox/*.cyr` is `config_new`,
+`config_backend`, `config_timeout_ms`, `config_network`, `config_policy_seccomp`,
+`config_agent_id` and `config_externalization` — none of the new API.
+`SandboxConfig` grew **112 → 120 bytes** with `env` *appended*, so no existing
+field offset moves, and this repo reads the struct only through kavach's own
+accessors regardless.
+
+⚠ **The `BACKEND_COUNT` class was re-checked BEFORE the bump, not after.** That
+defect (2.0.4) was a `lib/`↔`lib/` duplicate `var` — silent under Cyrius's flat
+symbol table and invisible to `check-symbols.sh`, which scans `src/` only. Every
+top-level `fn`/`var`/`enum`/enum-member across this repo's **real** compile set
+(`[deps].stdlib` + each dist's `.deps` sidecar + every dep dist) was diffed with
+3.11.15 swapped for 3.12.2: kavach adds **8 names** and introduces **zero** new
+cross-file collisions — 84 before, the same 84 after. The build agrees — the
+duplicate-`fn` warning count is **20 before and 20 after**, the same 20 names,
+with **0 undefined-function warnings**.
+
+⚠ **A live value-divergent duplicate was found while doing that. It is NOT fixed
+here, and it is worse than a name clash.** `STDIN` is `var STDIN = 0;` in
+`lib/io.cyr` (the POSIX fd) and `STDIN = 2` in kavach's `enum InjectionMethod`;
+last-definition-wins resolves it silently, and the compiler warns for neither a
+`var` nor an enum member.
+
+**Measured in this repo's exact dependency set, not inferred:** `io.cyr` wins, so
+`InjectionMethod.STDIN` becomes **0** — and `ENV_VAR` is **also 0**. The two
+members are **indistinguishable in the emitted binary**, so both guards in kavach's
+`credential.cyr` fire on both kinds of reference: a secret the caller asked to be
+delivered on **stdin** takes the ENV_VAR branch and is exported into the sandbox's
+**environment** instead. A probe asserting
+`InjectionMethod.STDIN == InjectionMethod.ENV_VAR` exits 1 against these dists.
+
+**Nothing here is exposed today** — `grep -rn 'secretref\|SecretRef\|credential_\|inject_via' src/`
+returns **zero** hits in this repo and in Agnostic, so no call site reaches it. It is
+recorded rather than quietly carried, because the wrongness is already compiled in
+and the next caller of `secretref_stdin()` inherits it.
+
+⚠ **kavach's own 713-assertion suite cannot catch this.** Which definition wins
+depends on the *consumer's* include ordering, so the defect exists only in
+downstream binaries. Filed upstream with a repro
+(`kavach/docs/development/issues/2026-08-22-injectionmethod-stdin-aliases-env-var.md`)
+rather than worked around here — a consumer-side rename fixes nothing, because both
+definitions live in `lib/`.
+
+The lock commit-pins kavach at `37f55c26` (tag `3.12.2`).
 
 ## [2.0.4] — 2026-08-20
 

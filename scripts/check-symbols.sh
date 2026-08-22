@@ -101,6 +101,29 @@ if [ -n "$unprefixed" ]; then
     fail=1
 fi
 
+# --- Rule 4: no lib/ <-> lib/ constant is defined twice with different values ---
+# Rules 1-3 scan src/. They cannot see a collision BETWEEN TWO DEPENDENCIES, and
+# neither can the compiler: cycc warns on a duplicate `fn` and is SILENT for `var`
+# and for enum members. That blind spot is not hypothetical — it is how kavach's
+# `var BACKEND_COUNT = 10` was silently resolved to ai-hwaccel's 18, admitting ids
+# 0-17 into a 10-slot function-pointer table and calling whatever sat 224 bytes past
+# its end. Nothing in this repo, or in any sibling, would have reported it; see
+# CHANGELOG 2.0.4.
+#
+# The check resolves the REAL compile set from cyrius.cyml — [deps].stdlib, each
+# dist's .deps sidecar, and every dep dist lib/ carries, including transitive ones
+# no [deps.*] block names (libro arrives via bote) — and excludes the per-platform
+# stdlib variants, which define the same names on purpose and never co-compile.
+#
+# Verified against the historical defect: with kavach 3.11.14 and ai-hwaccel 2.3.17
+# restored, it reports BACKEND_COUNT 18-vs-10 and fails.
+#
+# Divergences that are known, filed upstream and unreachable from src/ are listed in
+# scripts/lib-symbol-allow.txt, each with its issue reference.
+if ! python3 scripts/check-lib-symbols.py; then
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     n=$(find src -name '*.cyr' -exec grep -hcE '^(fn|var|enum) ' {} + | awk '{s+=$1} END {print s}')
     echo "symbol check OK — $n top-level definitions across $(find src -name "*.cyr" | wc -l) files, no duplicates, all prefixed"

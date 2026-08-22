@@ -2,22 +2,47 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-08-20.
+> Last refreshed: 2026-08-22.
 
-## Now — 2.0.4
+## Now — 2.0.5
 
 | | |
 |---|---|
-| **version** | **2.0.4** |
-| **cyrius pin** | **6.5.32** (wrapper matches — no drift) |
-| **tests** | **99 suites, 8,038 assertions, 0 failed** |
-| **dist** | `dist/agnosai.cyr`, 37,252 lines, stamped v2.0.4 |
-| **gates** | `check-symbols.sh` · `check-clean.sh` · `distlib --check` green |
+| **version** | **2.0.5** |
+| **cyrius pin** | **6.5.34** (folds patra 1.13.10 — required, see below) |
+| **tests** | **98 suites, 7,940 assertions, 0 failed** |
+| **dist** | `dist/agnosai.cyr`, 37,252 lines, stamped v2.0.5 |
+| **gates** | `check-symbols.sh` (now 4 rules) · `check-clean.sh` · `distlib --check` green |
 
-Direct deps (`[deps.*]`, all six): `sigil` **3.12.9**, `bote` **3.3.2**,
-`majra` **2.6.7**, `kavach` **3.11.15**, `ai-hwaccel` **2.3.18**,
-`tyche` **1.0.1**. Everything else — `patra`, `libro`, `sakshi`, `bayan`,
-`sandhi` — arrives folded from the toolchain, not as a direct dep.
+⚠ **The previous entry said "99 suites, 8,038 assertions".** Measured on this tree it
+is **98 suites, 7,940**. The 8,038 figure dates from **2.0.0 (2026-08-14)** and five
+releases of test churn; it was not a valid comparator and should not be treated as a
+regression signal. wasmtime **47.0.3** is installed, so no WASM path was skipped.
+
+Direct deps (`[deps.*]`, all six): `sigil` **3.12.9**, `bote` **3.3.3**,
+`majra` **2.6.7**, `kavach` **3.12.2**, `ai-hwaccel` **2.3.18**, `tyche` **1.0.1**.
+`patra` **1.13.10**, `libro` **2.8.10**, `sakshi`, `bayan` and `sandhi` arrive folded
+from the toolchain or transitively, not as direct deps.
+
+### ⚠ Two things that will bite the next person
+
+**1. The Cyrius pin and a transitive `[deps.patra]` are ONE change.** libro 2.8.10
+declares `[deps.patra] = 1.13.10`; `cyrius deps` overlays a declared dep's copy on top
+of the `lib sync --full` snapshot on every resolve. Against the old **6.5.32** pin,
+which folds patra **1.13.9**, that put a non-matching file in `lib/` and
+`check-clean.sh`'s lib-snapshot rule — which allows **no** file to differ, on purpose —
+failed, leaving `main` red. **6.5.34 folds 1.13.10**, so pin and overlay agree. The
+delivery path is `patra tag → fold into the cyrius stdlib → cyrius release → consumer
+pin bump`; a consumer sitting between steps 2 and 4 fails this gate every time. Do not
+reach for a `[deps.patra]` hold or a `check-clean` allowance — bump the pin.
+
+**2. `~/.cyrius/versions/<pin>/bin/cyrius` does NOT pin `cycc`.** It resolves the
+compiler through `$CYRIUS_HOME/bin` → `~/.cyrius/current`, not relative to itself and
+not via `PATH`, so the 6.5.32 wrapper compiles with whatever is active. Build a
+`CYRIUS_HOME` shim (`bin`, `lib`, `versions`, `deps` symlinks + a `current` file) and
+confirm the drift line is absent. ⚠ And **never read `~/.cyrius/versions/<V>/lib/` as
+ground truth** — a concurrent cyrius session rewrites those files in place; that cost a
+wrong diagnosis this release. Use `git show <tag>:lib/<mod>`.
 
 **2.0.4 is a dependency-only release.** kavach and ai-hwaccel both defined
 `var BACKEND_COUNT` (10 vs 18); Cyrius has one flat symbol table with
