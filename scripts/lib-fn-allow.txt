@@ -1,0 +1,58 @@
+# `fn` names defined by more than one dependency in the compile set WITH DIFFERENT
+# BODIES, which scripts/check-lib-symbols.py's Rule 5 would otherwise fail on.
+#
+# Rule 5 does NOT flag mere duplication. kavach and sigil both vendor the same
+# `agnosys` helper layer, so a dozen of those functions are byte-identical after
+# normalisation and last-definition-wins is genuinely harmless — they pass silently
+# and are only counted. What lands here is a duplicate whose BODY differs, i.e. one
+# where which library "wins" changes behaviour.
+#
+# An entry is a DEFERRAL, not a dispensation. Every line must say why it is safe HERE
+# and, where the fix belongs upstream, name it. Delete the line when the fix lands.
+#
+# ⚠ Do NOT add a name here to make a red build green — the same warning
+# scripts/lib-symbol-allow.txt carries, for the same reason.
+#
+#   <NAME>   # <why it is safe here>
+
+# --- kavach ↔ sigil: the same vendored agnosys error layer, prefix-renamed --------
+# All four differ ONLY in library-specific identifiers: `sigil_err_from_syscall_ret`
+# vs `kavach_err_from_syscall_ret`, and `SIGIL_ERR_*` vs `KAVACH_ERR_*` match arms.
+# kavach's definitions win (defined last under this repo's include order), so sigil's
+# callers take kavach's. That is behaviour-preserving because the two SysErrorKind
+# enums agree numerically on every shared variant — verified 2026-08-23:
+#   SYSCALL_FAILED=1  INVALID_ARGUMENT=2  PERMISSION_DENIED=3  WOULD_BLOCK=4
+#   MODULE_NOT_LOADED=5  NOT_SUPPORTED=6
+# so a value constructed under one prefix prints and compares correctly under the
+# other. ⚠ That agreement is INCIDENTAL, not contractual — if either library
+# reorders its enum this becomes a live defect and nothing but this note will say so.
+# No src/ here calls any of the four.
+wrap_syscall            # sigil vs kavach err constructor; enums agree numerically — see header
+syserr_print            # SIGIL_ERR_* vs KAVACH_ERR_* match arms; enums agree numerically
+agnosys_run_capture     # same helper, library-specific error construction
+agnosys_run_checked     # same helper, library-specific error construction
+
+# --- libro ↔ majra: genuinely different functions sharing a name -----------------
+# The real hazard, and the reason Rule 5 exists. majra's is `(chan, filter_fn)` +
+# `fl_alloc(40)`; libro's is `(pattern)` + `alloc(24)` storing a `vec_new()`. libro's
+# wins here. Unreachable in this repo: agnosai calls none of majra's `pubsub_*` — the
+# only caller of majra's `_sub_new` — verified by grep over src/. A consumer of
+# dist/agnosai.cyr that DOES call majra's pubsub takes a 24-byte allocation where
+# majra writes 40 bytes. Pre-existing since before 2.0.5. Owed upstream: one of the
+# two should prefix the name.
+_sub_new                # majra pubsub vs libro audit-stream; libro wins; no caller here
+
+# --- kavach ↔ sigil: attestation_result_new — the WORST of the set --------------
+# Not the agnosys layer; two unrelated constructors that happen to share a name.
+#   sigil : (passed)  -> fl_alloc(16), `passed` at 0, `vec_new()` at 8
+#   kavach: (backend) -> alloc(48), seven AttestationResult_set_* fields
+# kavach's wins. A sigil caller would hand a bool where a backend id is expected and
+# get a 48-byte kavach struct back; reading sigil's offset 8 as a vec pointer would
+# dereference kavach's `trust` INTEGER — a pointer-deref hazard, not just a wrong
+# value, and it sits on an attestation path, i.e. a trust decision.
+#
+# Safe here only because it is DEAD in this compile set: verified 2026-08-23 that
+# NEITHER library calls it internally (`grep attestation_result_new lib/{sigil,kavach}.cyr`
+# finds only the two definitions) and src/ never mentions attestation. It is reachable
+# for any consumer that links both and calls sigil's. Owed upstream: one must prefix.
+attestation_result_new  # dead in this unit — no caller in sigil, kavach or src/; layouts differ 16 vs 48 B

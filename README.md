@@ -81,18 +81,28 @@ cyrius coverage --min 80
 
 ## Usage as a Library
 
-⚠ **AgnosAI is a binary, not a `[deps.agnosai]` package.** `cyrius.cyml` has no
-`[lib]` stanza and there is no `dist/` bundle, so `cyrius distlib` produces
-nothing for a consumer to point at — unlike every dependency it *uses*
-(sigil, bote, majra, kavach), which all publish one. A `[deps.agnosai]` block
-would not resolve.
+AgnosAI ships **both** a binary and a bundle. `cyrius.cyml` carries a `[lib]`
+stanza of **111** modules, and `cyrius distlib` concatenates them into
+`dist/agnosai.cyr` (**37,268 lines**, stamped with the release) plus a
+`dist/agnosai.deps` sidecar naming the **45** stdlib leaves the fold needs in
+scope — so a `[deps.agnosai]` block resolves like any other dependency:
 
-To build against it, **vendor the tree and `include` the groups you need**,
-which is exactly what
+```cyml
+[deps.agnosai]
+git = "https://github.com/MacCracken/agnosai.git"
+tag = "2.0.6"
+modules = ["dist/agnosai.cyr"]
+```
+
+⚠ **`src/main.cyr` is deliberately absent from the bundle.** Its last two lines
+are top-level statements that run at include time, so a consumer linking them
+would start a server on include. Call the orchestrator directly
+(`agnosai_orchestrator_submit_crew`) or stand up your own serve loop.
+
+Vendoring the tree and `include`-ing the groups you need still works and is what
 [`examples/simple_crew.cyr`](examples/simple_crew.cyr) does — 25 explicit
 `include "src/…"` lines. Cyrius resolution is single-pass, so callees must
-precede callers — Cyrius resolution is single-pass, so callees
-must precede callers. A complete, runnable version of the example below is
+precede callers. A complete, runnable version of the example below is
 [`examples/simple_crew.cyr`](examples/simple_crew.cyr):
 
 ```cyr
@@ -211,12 +221,12 @@ First-class multi-node support:
 ```
 $ cyrius tests tests
 ...
-99 passed, 0 failed
+98 passed, 0 failed
 ```
 
 ```
 $ cyrius coverage --min 80
-Functions referenced: 1561/1561 (100%)  [reference coverage — a floor, not a correctness proof]
+Functions referenced: 1578/1585 (99%)  [reference coverage — a floor, not a correctness proof]
 ```
 
 Tests cover core types, orchestration (all 4 process modes), DAG cycle detection,

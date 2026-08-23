@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Rule 4 — no two lib/ modules in the COMPILE SET define one constant with two values.
+"""Rules 4 and 5 — no two lib/ modules in the COMPILE SET define one name two ways.
+
+Rule 4 covers constants (`var`, enum members); Rule 5 covers `fn` bodies.
 
 Cyrius has one flat symbol table with last-definition-wins, and the compiler is SILENT
 for `var` and for enum members (only a duplicate `fn` warns). A lib/<->lib/ collision
@@ -176,6 +178,114 @@ def constants(path):
         i += 1
     return out
 
+
+# --- Rule 5: no two lib/ modules in the COMPILE SET define one `fn` differently -
+# Rule 4 above covers `var` and enum members, on the reasoning that the compiler is
+# silent for those and *does* warn for a duplicate `fn`. It does warn -- and NOTHING
+# GATES ON THE WARNING. A `fn` collision between two dependencies is therefore caught
+# by a human reading build output, or not at all, which is not a gate.
+#
+# The shape mirrors Rule 4 deliberately: duplication is not the defect, DIVERGENCE is.
+# kavach and sigil both vendor the same `agnosys` helper layer, so a dozen of these
+# are byte-identical after normalisation and last-definition-wins is genuinely
+# harmless. Those pass silently. A duplicate whose BODY differs is the real hazard --
+# `_sub_new` is `(chan, filter_fn)` + `fl_alloc(40)` in majra and `(pattern)` +
+# `alloc(24)` in libro, and libro's wins here.
+#
+# Bodies are compared with comments and whitespace normalised away, so reindentation
+# upstream is not a false positive.
+
+def _strip_for_braces(line):
+    """Drop `#` comments and string literals so brace counting is not fooled."""
+    out, q, i = [], None, 0
+    while i < len(line):
+        ch = line[i]
+        if q:
+            if ch == "\\":
+                i += 2; continue
+            if ch == q: q = None
+        elif ch in '"\'':
+            q = ch
+        elif ch == '#':
+            break
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+def fn_bodies(path):
+    """name -> (normalised body, first line no) for every top-level `fn`."""
+    out, lines, i = {}, open(path, errors="replace").read().split("\n"), 0
+    while i < len(lines):
+        m = re.match(r'^fn\s+([A-Za-z_]\w*)\s*\(', lines[i])
+        if m:
+            depth, buf, j, opened = 0, [], i, False
+            while j < len(lines):
+                buf.append(lines[j])
+                clean = _strip_for_braces(lines[j])
+                if "{" in clean: opened = True
+                depth += clean.count("{") - clean.count("}")
+                if opened and depth <= 0:
+                    break
+                j += 1
+            txt = "\n".join(buf)
+            txt = re.sub(r'#[^\n]*', '', txt)        # comments
+            txt = re.sub(r'\s+', ' ', txt).strip()   # indentation / line breaks
+            # Keep the FIRST definition in a file; a within-file duplicate is Rule 2's
+            # business and would otherwise mask the cross-file one.
+            out.setdefault(m.group(1), (txt, i + 1))
+            i = j
+        i += 1
+    return out
+
+def check_fn_collisions(files):
+    allow = {}
+    ap = "scripts/lib-fn-allow.txt"
+    if os.path.exists(ap):
+        for L in open(ap):
+            L = L.strip()
+            if not L or L.startswith("#"):
+                continue
+            nm, _, why = L.partition("#")
+            allow[nm.strip()] = why.strip()
+
+    seen = collections.defaultdict(list)
+    for f in sorted(files):
+        for nm, (body, ln) in fn_bodies(f).items():
+            seen[nm].append((body, os.path.basename(f), ln))
+
+    identical, diverge = 0, []
+    for nm, e in seen.items():
+        if len({f for _, f, _ in e}) > 1:
+            if len({b for b, _, _ in e}) > 1:
+                diverge.append((nm, e))
+            else:
+                identical += 1
+
+    unflagged = [(n, e) for n, e in sorted(diverge) if n not in allow]
+    flagged   = [(n, e) for n, e in sorted(diverge) if n in allow]
+
+    print(f"lib-fn check: {len(seen)} fn names, {identical} identical duplicate(s), "
+          f"{len(diverge)} divergent")
+    for nm, e in flagged:
+        print(f"  ALLOWED  {nm} — {allow[nm]}")
+        for _, f, ln in e:
+            print(f"             {f}:{ln}")
+    if unflagged:
+        print()
+        print("error: a `fn` is defined by more than one dependency WITH A DIFFERENT BODY.")
+        print("       Cyrius resolves this last-definition-wins. cycc warns, but no gate")
+        print("       reads the warning, so this is the only thing that fails the build.")
+        for nm, e in unflagged:
+            print(f"  {nm}")
+            for _, f, ln in e:
+                print(f"      {f}:{ln}")
+        print()
+        print("       Fix it upstream in the owning library (prefix the name), then add it")
+        print("       to scripts/lib-fn-allow.txt with the reason while the fix lands.")
+        return 1
+    return 0
+
 def main():
     if not os.path.exists("cyrius.cyml"):
         print("lib-symbol check: no cyrius.cyml", file=sys.stderr); return 1
@@ -229,6 +339,6 @@ def main():
         print("       Fix it upstream in the owning library (prefix the name), then add it to")
         print("       scripts/lib-symbol-allow.txt with the issue reference while the fix lands.")
         return 1
-    return 0
+    return check_fn_collisions(files)
 
 sys.exit(main())

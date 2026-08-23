@@ -1,0 +1,89 @@
+# =========================================================================
+# server/routes — `AGNOSAI_VERSION` must equal the root `VERSION` file.
+#
+# ## Why this suite exists
+#
+# `AGNOSAI_VERSION` (`src/server/routes/mod.cyr`) is the one place the version
+# number is duplicated: Cyrius has no compile-time env interpolation, so the
+# oracle's `env!("CARGO_PKG_VERSION")` has to be transcribed by hand.
+#
+# It drifted for **six releases**. It read the Rust oracle's `1.1.0` while
+# `VERSION` had said 2.x since 2026-08-14, so `GET /ready` and the MCP
+# `initialize` `serverInfo` announced a version that had not been current since.
+# Found at the 2.0.6 bump, by inspection rather than by any gate.
+#
+# ⚠ **The three suites that already covered that field could not catch it, and
+# the reason is structural.** `server_routes_health` (x2) and `server_routes_mcp`
+# assert the response body against `AGNOSAI_VERSION` — the *symbol*, not the
+# file — so they are self-referential and stay green at any value whatsoever.
+# Comparing the constant against the file on disk is the only assertion that
+# bites, which is what this suite does.
+#
+# ## Why it reads the file rather than hardcoding the number
+#
+# A hardcoded expectation here would need editing at every release and would
+# itself become a fourth thing that can drift. `VERSION` is the source of truth
+# — `cyrius.cyml` interpolates it as `version = "${file:VERSION}"` — so reading
+# it is the assertion. `cyrius tests` runs from the repo root, so the relative
+# path resolves; a failure to open is asserted rather than silently passed, or
+# a moved cwd would turn this suite into a no-op.
+# =========================================================================
+
+include "src/server/routes/mod.cyr"
+
+# The root VERSION file, trailing newline and any whitespace stripped.
+#
+# `file_read_all` returns the byte count and 0 or negative on failure. A short
+# read cannot be mistaken for success: the length is asserted non-zero before
+# the bytes are used.
+fn _t_version_file(): Str {
+    var buf[64];
+    var n = file_read_all("VERSION", &buf, 64);
+    assert(n > 0,
+      "cannot read ./VERSION — cyrius tests must run from the repo root");
+    # Trim trailing newline / spaces so "2.0.6\n" compares equal to "2.0.6".
+    var end = n;
+    while (end > 0 && (load8(&buf + end - 1) == 10
+        || load8(&buf + end - 1) == 13
+        || load8(&buf + end - 1) == 32)) {
+        end = end - 1;
+    }
+    return str_from_buf(&buf, end);
+}
+
+fn _t_version_matches_the_file(): i64 {
+    var want = _t_version_file();
+    var got = str_from(AGNOSAI_VERSION);
+    assert(str_eq(got, want) == 1,
+      "AGNOSAI_VERSION != root VERSION — /ready and MCP initialize would announce the wrong version; fix src/server/routes/mod.cyr");
+    return 0;
+}
+
+# A version that is merely non-empty is not enough — the drift this suite exists
+# to catch was a perfectly well-formed `1.1.0`. Pin the shape too, so a truncated
+# or empty read cannot pass the equality above by matching an equally broken
+# constant.
+fn _t_version_is_well_formed(): i64 {
+    var v = str_from(AGNOSAI_VERSION);
+    assert(str_len(v) >= 5, "AGNOSAI_VERSION is too short to be X.Y.Z");
+    var dots = 0;
+    for (var i = 0; i < str_len(v); i = i + 1) {
+        if (load8(str_data(v) + i) == 46) { dots = dots + 1; }
+    }
+    assert(dots == 2, "AGNOSAI_VERSION is not a three-part X.Y.Z version");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+
+    _t_version_matches_the_file();
+    _t_version_is_well_formed();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

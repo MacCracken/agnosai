@@ -4,9 +4,10 @@
 # VERSION at the repo root is the single source of truth. cyrius.cyml reads it
 # back with `version = "${file:VERSION}"`, so the manifest cannot drift and
 # needs no edit — this script only verifies the interpolation is still there
-# rather than a hardcoded number. That leaves the CHANGELOG as the one other
-# place the number appears, so a bump cuts the [Unreleased] section over to a
-# dated release heading.
+# rather than a hardcoded number. That leaves the CHANGELOG and `AGNOSAI_VERSION`
+# (src/server/routes/mod.cyr) as the other two places the number appears: a bump
+# cuts [Unreleased] over to a dated release heading, and REFUSES to run at all if
+# the constant does not already match — it drifted for six releases before 2.0.6.
 #
 # The Rust-era script rewrote a root Cargo.toml and regenerated Cargo.lock.
 # Neither exists on the Cyrius line — the Rust tree is frozen at rust-old/ as
@@ -82,6 +83,36 @@ else
     fi
 fi
 
+# `AGNOSAI_VERSION` must track VERSION. It is the one place the number is
+# duplicated — Cyrius has no compile-time env interpolation, so the oracle's
+# `env!("CARGO_PKG_VERSION")` is transcribed by hand — and it silently drifted
+# for SIX releases, reading the Rust oracle's 1.1.0 while VERSION said 2.x. The
+# three suites covering that field assert against the SYMBOL, not the file, so
+# they are self-referential and stayed green throughout. See CHANGELOG 2.0.6.
+#
+# This is a pre-flight check, so a bump that would ship a wrong `/ready` and a
+# wrong MCP `initialize` handshake fails BEFORE anything is written.
+# `tests/server_routes_version_pin.tcyr` is the runtime half of the same guard.
+ROUTES_MOD="$REPO_ROOT/src/server/routes/mod.cyr"
+if [ ! -f "$ROUTES_MOD" ]; then
+    echo "ERROR: missing src/server/routes/mod.cyr — cannot verify AGNOSAI_VERSION"
+    exit 1
+fi
+CONST_LINE="$(grep -m1 '^var AGNOSAI_VERSION = ' "$ROUTES_MOD" || true)"
+CONST_VERSION="$(printf '%s' "$CONST_LINE" | sed -n 's/^var AGNOSAI_VERSION = "\(.*\)";.*/\1/p')"
+if [ -z "$CONST_VERSION" ]; then
+    echo "ERROR: cannot parse AGNOSAI_VERSION from src/server/routes/mod.cyr"
+    echo "       found: ${CONST_LINE:-<no AGNOSAI_VERSION line>}"
+    exit 1
+fi
+if [ "$CONST_VERSION" != "$NEW_VERSION" ]; then
+    echo "ERROR: AGNOSAI_VERSION is ${CONST_VERSION}, but this bump is ${NEW_VERSION}"
+    echo "       src/server/routes/mod.cyr feeds GET /ready and the MCP initialize"
+    echo "       handshake. Shipping the bump without it announces the wrong version."
+    echo "       Fix:  sed -i 's/^var AGNOSAI_VERSION = \".*\";/var AGNOSAI_VERSION = \"${NEW_VERSION}\";/' src/server/routes/mod.cyr"
+    exit 1
+fi
+
 # Write.
 
 echo "$NEW_VERSION" > "$VERSION_FILE"
@@ -120,6 +151,12 @@ fi
 TOP_VERSION="$(grep -m1 -E '^## \[[0-9]' "$CHANGELOG" | sed -n 's/^## \[\([^]]*\)\].*/\1/p' || true)"
 if [ "$TOP_VERSION" != "$NEW_VERSION" ]; then
     echo "ERROR: CHANGELOG top released heading mismatch: expected $NEW_VERSION, got ${TOP_VERSION:-<none>}"
+    exit 1
+fi
+
+CONST_VERSION="$(sed -n 's/^var AGNOSAI_VERSION = "\(.*\)";.*/\1/p' "$ROUTES_MOD" | head -1)"
+if [ "$CONST_VERSION" != "$NEW_VERSION" ]; then
+    echo "ERROR: AGNOSAI_VERSION drifted to ${CONST_VERSION:-<unparseable>} during the bump"
     exit 1
 fi
 

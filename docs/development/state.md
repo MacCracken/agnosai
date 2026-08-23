@@ -2,66 +2,178 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-08-22.
+> Last refreshed: 2026-08-23.
 
-## Now — 2.0.5
+## Now — 2.0.6
 
 | | |
 |---|---|
-| **version** | **2.0.5** |
-| **cyrius pin** | **6.5.34** (folds patra 1.13.10 — required, see below) |
-| **tests** | **98 suites, 7,940 assertions, 0 failed** |
-| **dist** | `dist/agnosai.cyr`, 37,252 lines, stamped v2.0.5 |
-| **gates** | `check-symbols.sh` (now 4 rules) · `check-clean.sh` · `distlib --check` green |
+| **version** | **2.0.6** |
+| **cyrius pin** | **6.5.35** (folds patra 1.13.10 — required, see below) |
+| **tests** | **99 suites, 7,944 assertions, 0 failed** |
+| **coverage** | **99%** — 103/103 files, 1,578/1,585 fns (gate is `--min 80`) |
+| **dist** | `dist/agnosai.cyr`, 37,268 lines, stamped v2.0.6 |
+| **binary** | `build/agnosai` **5,119,848 B** |
+| **gates** | `check-symbols.sh` (**5 rules**) · `check-clean.sh` · `distlib --check` · fuzz 4/4 green |
 
-⚠ **The previous entry said "99 suites, 8,038 assertions".** Measured on this tree it
-is **98 suites, 7,940**. The 8,038 figure dates from **2.0.0 (2026-08-14)** and five
-releases of test churn; it was not a valid comparator and should not be treated as a
-regression signal. wasmtime **47.0.3** is installed, so no WASM path was skipped.
+Direct deps (`[deps.*]`, all six): `sigil` **3.12.9**, `bote` **3.3.7**,
+`majra` **2.7.0**, `kavach` **3.12.2**, `ai-hwaccel` **2.3.18**, `tyche` **1.0.1**.
+`patra` **1.13.10**, `libro` **2.8.12**, `sakshi` **2.4.11**, `bayan` **1.5.2**,
+`sandhi` **1.9.10** and `sankoch` **2.7.8** arrive folded from the toolchain or
+transitively, not as direct deps.
 
-Direct deps (`[deps.*]`, all six): `sigil` **3.12.9**, `bote` **3.3.3**,
-`majra` **2.6.7**, `kavach` **3.12.2**, `ai-hwaccel` **2.3.18**, `tyche` **1.0.1**.
-`patra` **1.13.10**, `libro` **2.8.10**, `sakshi`, `bayan` and `sandhi` arrive folded
-from the toolchain or transitively, not as direct deps.
+⚠ **98 suites / 7,940 assertions of that is unchanged from 2.0.5 on purpose** —
+2.0.6 changed one `src/` constant, so an identical figure is the expected result,
+not a stale copy. The 99th suite (+4) is the new version-pin guard. Re-measured on
+this tree, not carried over.
 
-### ⚠ Two things that will bite the next person
+### ⚠ Four things that will bite the next person
 
-**1. The Cyrius pin and a transitive `[deps.patra]` are ONE change.** libro 2.8.10
-declares `[deps.patra] = 1.13.10`; `cyrius deps` overlays a declared dep's copy on top
-of the `lib sync --full` snapshot on every resolve. Against the old **6.5.32** pin,
-which folds patra **1.13.9**, that put a non-matching file in `lib/` and
-`check-clean.sh`'s lib-snapshot rule — which allows **no** file to differ, on purpose —
-failed, leaving `main` red. **6.5.34 folds 1.13.10**, so pin and overlay agree. The
-delivery path is `patra tag → fold into the cyrius stdlib → cyrius release → consumer
-pin bump`; a consumer sitting between steps 2 and 4 fails this gate every time. Do not
-reach for a `[deps.patra]` hold or a `check-clean` allowance — bump the pin.
+**1. The Cyrius pin and a transitive `[deps.patra]` are ONE change.** libro
+declares `[deps.patra] = 1.13.10`; `cyrius deps` overlays a declared dep's copy on
+top of the `lib sync --full` snapshot on every resolve. Against a pin that folds a
+different patra, that puts a non-matching file in `lib/` and `check-clean.sh`'s
+lib-snapshot rule — which allows **no** file to differ, on purpose — fails. 6.5.35
+folds 1.13.10 and libro 2.8.12 declares 1.13.10, so pin and overlay agree and the
+gate passes **108/108**. The delivery path is `patra tag → fold into the cyrius
+stdlib → cyrius release → consumer pin bump`; a consumer sitting between steps 2
+and 4 fails this gate every time. Do not reach for a `[deps.patra]` hold or a
+`check-clean` allowance — bump the pin.
 
 **2. `~/.cyrius/versions/<pin>/bin/cyrius` does NOT pin `cycc`.** It resolves the
-compiler through `$CYRIUS_HOME/bin` → `~/.cyrius/current`, not relative to itself and
-not via `PATH`, so the 6.5.32 wrapper compiles with whatever is active. Build a
-`CYRIUS_HOME` shim (`bin`, `lib`, `versions`, `deps` symlinks + a `current` file) and
-confirm the drift line is absent. ⚠ And **never read `~/.cyrius/versions/<V>/lib/` as
-ground truth** — a concurrent cyrius session rewrites those files in place; that cost a
-wrong diagnosis this release. Use `git show <tag>:lib/<mod>`.
+compiler through `$CYRIUS_HOME/bin` → `~/.cyrius/current`, not relative to itself
+and not via `PATH`. Build a `CYRIUS_HOME` shim (`bin`, `lib`, `versions`, `deps`
+symlinks + a `current` file) and read the drift line to confirm which compiler you
+actually got — under the shim it reads `cyrius 6.5.34 / manifest-pin: 6.5.35
+(drift — wrapper is 6.5.34)`, which is how the A/B below was measured. ⚠ And
+**never read `~/.cyrius/versions/<V>/lib/` as ground truth** — a concurrent cyrius
+session rewrites those files in place. Use `git show <tag>:lib/<mod>`.
 
-**2.0.4 is a dependency-only release.** kavach and ai-hwaccel both defined
-`var BACKEND_COUNT` (10 vs 18); Cyrius has one flat symbol table with
-last-definition-wins and is **silent** on a duplicate `var`, so in this binary
-kavach's `_backend_fp` bounds check read 18 against a 10-slot table. Measured
-here — a probe returning the constant printed **18** before the bump and **10**
-after. No source in this repo changed: the upstream fix also renamed
-`enum Backend`, but a Cyrius enum qualifier is **cosmetic** (`Backend.WASM` and
-`KavachBackend.WASM` both resolve to the member `WASM`), so this repo's 8
-`Backend.X` call sites in `src/sandbox/` build unchanged and correct.
+**3. The GitHub tags API does not return tags in version order.** Reading its
+first row picks `3.9.x` over `3.12.x`. Every pin must come from a `sort -V` of the
+full list — and then be cross-checked against each sibling's `VERSION`, because a
+version prepared but never tagged is the *other* half of the trap (it bit the
+2026-08-12 four-repo sweep). At 2.0.6 all eight repos have
+`VERSION` == local tag == remote tag.
 
-⚠ **Known and deferred**: kavach's enum *members* (`PROCESS`, `WASM`, `OCI`,
-`NOOP`) remain generic and unprefixed — a type rename does not protect them.
-kavach and sigil also share the whole `syserr_*` family. Those are `fn`
-collisions, so they warn at build time rather than resolving silently.
+**4. A divergent `fn` shared by two deps now fails the build — Rule 5.** It used to
+be caught by nothing: Rule 4 covers `var` and enum members on the reasoning that cycc
+*warns* for a duplicate `fn`, and it does warn, but no gate read the warning.
+`scripts/check-lib-symbols.py` Rule 5 closes it, deferrals in
+`scripts/lib-fn-allow.txt`. Like Rule 4 it fails on **divergence**, not duplication —
+**12** duplicates are byte-identical (kavach and sigil vendor the same `agnosys`
+layer) and pass silently; **6** diverge and are allowlisted with reasons. ⚠ The two
+that matter are `_sub_new` (majra `fl_alloc(40)` vs libro `alloc(24)`) and
+`attestation_result_new` (sigil 16 B vs kavach 48 B, unrelated constructors) — both
+unreachable *here*, neither fixed upstream.
 
-⚠ **Blind spot this exposed**: every `check-symbols.sh` in the ecosystem,
-including this repo's, scans `src/` only. A `lib/`↔`lib/` collision between two
-dependencies is invisible to all of them.
+### 2.0.6 — what moved, and the one defect it exposed
+
+**The pin bump is pure codegen.** `git diff --stat 6.5.34 6.5.35 -- lib/` is
+**empty** — the folded stdlib is byte-identical across the two pins, so the bump
+moves only the code generator. That made a clean A/B possible (same `src/`, same
+`lib/`, two compilers via the shim in note 2):
+
+| | 6.5.34 | 6.5.35 |
+|---|---|---|
+| `build/agnosai` | 5,156,712 B | **5,119,848 B** (−36,864, −0.71%) |
+| frame (`%rbp`-relative) accesses | 163,654 | **154,077** (−5.9%) |
+
+⚠ **No runtime win is claimed.** Cyrius measured one at best-of-7 and it collapsed
+to ±2% at best-of-25. Smaller binaries using more registers is the honest result.
+
+**`AGNOSAI_VERSION` had drifted for six releases.** It read the Rust oracle's
+**1.1.0** while `VERSION` had said 2.x since 2026-08-14, so `GET /ready` and the
+MCP `initialize` `serverInfo` announced 1.1.0 from a 2.0.5 binary. Fixed to
+`2.0.6` and verified **on the wire**, not inferred from the rebuild.
+
+⚠ **The three tests covering that field cannot catch it, by construction.**
+`server_routes_health.tcyr` (×2) and `server_routes_mcp.tcyr` assert the response
+against `AGNOSAI_VERSION` — the *symbol*, not the file — so they are
+self-referential and stay green at any value. **Both halves of the guard shipped in
+2.0.6**: `tests/server_routes_version_pin.tcyr` compares the constant to the root
+`VERSION` file, and `scripts/version-bump.sh` refuses the bump before writing
+anything if they disagree.
+
+⭐ **The mutation demonstrates the gap rather than asserting it.** Restoring the
+real historical `1.1.0` fails the new suite while `server_routes_health` and
+`server_routes_mcp` report **2 passed, 0 failed** on the identical mutation.
+
+### ⚠ OPEN — a ~3.6x regression, found at 2.0.6, NOT caused by it
+
+The benchmark sweep had not run since **2026-08-13** (10 days, 5 releases).
+Running it at 2.0.6 surfaced three regressions that were already in the tree:
+
+| benchmark | 08-1x avg | 2.0.6 | |
+|---|---|---|---|
+| `lt_aggregate_100k_500workers` | ~24 ms | **88.2 ms** | ~3.6x |
+| `durable_load_miss` | ~2.6 us | **4.50 us** | +73% |
+| `durable_load_hit` | ~4.2 us | **6.45 us** | +54% |
+| `run_crew_10_tasks_parallel_4` | ~497 us | 572 us | +15% |
+
+**Three things are already ruled out, by measurement:**
+
+1. **Not the compiler.** Same source, two compilers via the `CYRIUS_HOME` shim —
+   `lt_aggregate` 88.536 ms on 6.5.35 vs **88.928 ms on 6.5.34**; the durable pair
+   likewise within noise. If anything 6.5.35 is faster.
+2. **Not the benchmarked source.** `src/tools/builtin/load_testing.cyr` and
+   `benches/tools.bcyr` differ from the 08-13 baseline by **reindentation plus one
+   divide-by-zero guard**. `_b_workers(500, 200, 3, …)` measures identical work.
+3. **Not noise.** Three repeats land 88.321 / 88.277 / 88.650 ms — a ±0.6% spread.
+
+**Where to start.** `lt_aggregate`'s history is a step function: ~80-88 ms through
+2026-07-31, **~26 ms from 2026-08-03**, ~23-25 ms by 08-11, and 88.2 ms today.
+Today's value is the *pre-optimisation* one, so whatever landed on 2026-08-03 has
+been defeated. That window is the `_a` allocator threading (roadmap **B2**) and
+the arena work around it, and `durable_load_*` moving together points the same
+way. **40 commits** sit between the baseline and 2.0.6; a bisect is ~6 build+bench
+rounds.
+
+⚠ **`fleet_reach_barrier_3nodes` is NOT affected**, though a first pass here said
+it was: against the 08-1x *average* (2.03 us) today's 2.04 us is unchanged, and
+the apparent +38% came from differencing one 08-13 row that was an outlier low.
+**Bound against a period band, never a single row.**
+
+⚠ **The process failure is the real lesson.** CLAUDE.md's work loop puts
+benchmarks at steps 4 and 8 and says *"Never skip benchmarks. Numbers don't lie."*
+Five releases shipped without a sweep, so a 3.6x regression sat in `main`
+unreported. `cyrius bench` runs in CI — but that step exists for the **compile**,
+not the numbers, and it says so; nothing compares timings against the CSV.
+
+### What was verified rather than assumed at this bump
+
+- **All 24 majra entry points this repo uses are signature-identical** across
+  2.6.7 → 2.7.0. agnosai reads exactly one majra struct by raw offset —
+  `ratelimit_stats`'s 32-byte result at 0/8/16/24 — and that function is
+  byte-identical between the tags, despite 2.7.0 growing five internal layouts.
+- **`src/` calls zero bote-core functions**, by design (see
+  `src/server/routes/mcp.cyr`). The bundle grew 236 → 249 fns; the binary executes
+  none of them. bote's four releases reach `dist/agnosai.cyr` consumers only.
+- **Every vendored bundle hash-matches its pinned tag** (all seven), so the local
+  build — where `path = "../NAME"` wins — and CI, which resolves `git` + `tag`,
+  compile identical bytes. `majra` and `ai-hwaccel` each sit one docs-only commit
+  past their tag, which is exactly when that stops being true by accident.
+
+### ⚠ Inherited from libro — for consumers, not for agnosai
+
+libro 2.8.11/2.8.12 changed the entry-hash preimage, the Merkle construction
+(RFC 9162 domain tags; odd trailing node **promoted**, not self-paired) and the
+tree-head signature. **A chain written by libro ≤ 2.8.10 will not verify under
+2.8.12.** Nothing here migrates — `src/` has no `libro_*` / `chain_*` / `merkle_*`
+/ `anchor_*` call site, and `src/orchestrator/audit.cyr` is agnosai's own chain,
+keyed per-process and deliberately never snapshotted. But anyone serving a durable
+audit trail behind bote's `libro_*` tools through `dist/agnosai.cyr` takes libro's
+migration: re-export and re-anchor before upgrading.
+
+### Kept from 2.0.4 — the collision class that started the lib-symbol gate
+
+kavach and ai-hwaccel both defined `var BACKEND_COUNT` (10 vs 18); Cyrius has one
+flat symbol table with last-definition-wins and is **silent** on a duplicate
+`var`, so kavach's `_backend_fp` bounds check read 18 against a 10-slot table.
+That is why `scripts/check-lib-symbols.py` exists. ⚠ Still open: kavach's enum
+*members* (`PROCESS`, `WASM`, `OCI`, `NOOP`) remain generic and unprefixed, and
+kavach and sigil share the whole `syserr_*` family — `fn` collisions, so they warn
+at build time rather than resolving silently. See note 4 on what that is worth.
 
 ---
 
