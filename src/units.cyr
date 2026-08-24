@@ -36,3 +36,23 @@ fn _agnosai_is_digit(b): i64 {
     if (b >= 48 && b <= 57) { return 1; }
     return 0;
 }
+
+# A lowercased copy of `s`, ASCII only — the oracle's `to_ascii_lowercase`.
+#
+# ⚠ Lives HERE, not in llm/retry.cyr where it was written, since 2.0.7. It is a generic ASCII helper with
+# no LLM content, and `src/server/output_filter.cyr` also calls it — which meant the `[lib.guard]` profile
+# could not close without dragging the entire LLM retry module (and its rng_uniform dep on tyche) into a
+# bundle whose whole point is to carry no engine surface. Cyrius has ONE flat namespace, so every existing
+# caller is unaffected by the move.
+fn _agnosai_to_ascii_lower(s: Str): i64 {
+    var len = str_len(s);
+    var src = str_data(s);
+    var buf = alloc(len + 1);
+    for (var i = 0; i < len; i = i + 1) {
+        var c = load8(src + i);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        store8(buf + i, c);
+    }
+    store8(buf + len, 0);
+    return str_new(buf, len);
+}

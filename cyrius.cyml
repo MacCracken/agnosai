@@ -32,6 +32,29 @@ output = "build/agnosai"
 #
 #   cyrius distlib          -> dist/agnosai.cyr + dist/agnosai.deps
 #   cyrius distlib --check  -> regenerate into a temp and byte-compare
+# [lib.guard] — the LEAN OUTPUT-GUARD profile (2.0.7).
+#
+# Published for downstream consumers that want agnosai's output-safety leaves WITHOUT the orchestration
+# engine. Requested by thoth, which needs secret/PII redaction before model output reaches its feed, its
+# /save exports and its persisted conversation store — and which must not vendor the full 1.6 MB fold to
+# get ~500 lines of pure scanning.
+#
+# The alternative was the consumer hand-extracting the two files, which is a fork by another name: it goes
+# stale silently, and the next agnosai fix never reaches it. A profile keeps one source of truth, exactly
+# as sit publishes [lib.read] and sankoch publishes [lib.zlib] for the same reason.
+#
+# CLOSURE, verified rather than assumed: output_filter.cyr calls only stdlib (str/vec/sakshi/alloc),
+# `_uc_decode_utf8` (which lives in the cyrius STDLIB at lib/unicode/, not here), and two helpers
+# `_agnosai_is_digit` / `_agnosai_to_ascii_lower` from units.cyr — which is 38 lines and itself depends on
+# nothing but one of its own. Two modules, no transitive git deps, none of the six [deps.X] bundles the
+# full fold needs. That last point is the whole value: `dist/agnosai.cyr` cannot currently be vendored
+# standalone because dist/agnosai.deps omits those bundles; this profile has no such problem.
+[lib.guard]
+modules = [
+    "src/units.cyr",
+    "src/server/output_filter.cyr",
+]
+
 [lib]
 modules = [
     "src/units.cyr",

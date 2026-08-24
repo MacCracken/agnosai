@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.7] - 2026-08-24
+
+### Added
+
+- **`[lib.guard]` — a lean output-guard distlib profile**, published for downstream consumers that want
+  agnosai's output-safety leaves without the orchestration engine. `cyrius distlib guard` →
+  `dist/agnosai-guard.cyr`, **529 lines**, two modules: `src/units.cyr` + `src/server/output_filter.cyr`.
+
+  Requested by **thoth**, which needs secret/PII redaction before model output reaches its feed, its
+  `/save` exports and its persisted conversation store — and which cannot reasonably vendor the 37,595-line
+  full fold to get ~500 lines of pure scanning. The alternative on the table was thoth hand-extracting the
+  two files, which is a fork by another name: it goes stale silently and the next fix here never reaches
+  it. A profile keeps one source of truth, the same reason sit publishes `[lib.read]` and sankoch publishes
+  `[lib.zlib]`.
+
+  **Closure verified by BUILDING it, not by reading it** — and the first attempt was wrong, which is the
+  point worth recording. `output_filter.cyr` calls only stdlib (str/vec/sakshi/alloc), `_uc_decode_utf8`
+  (which lives in the cyrius **stdlib** at `lib/unicode/`, not here), and two helpers. Inspection said both
+  helpers were in `units.cyr`; the consumer's build then failed with
+  `undefined function '_agnosai_to_ascii_lower'`, because that one actually sat in **`src/llm/retry.cyr`** —
+  behind the LLM layer, whose absence is the entire point of the profile. Closing the profile by adding
+  `retry.cyr` would have dragged in the engine surface (and its `rng_uniform` dep on tyche) and defeated it.
+
+### Changed
+
+- **`_agnosai_to_ascii_lower` moved `src/llm/retry.cyr` → `src/units.cyr`.** It is a generic ASCII helper
+  with no LLM content, sitting beside its sibling `_agnosai_is_digit`, and `src/server/output_filter.cyr`
+  calls it too. Cyrius has ONE flat namespace regardless of file, so **every existing caller is unaffected**
+  and `dist/agnosai.cyr` is byte-equivalent apart from the moved definition. With the move, `[lib.guard]`
+  closes on two modules as intended and a consumer builds clean. `dist/agnosai-guard.deps` therefore names only stdlib leaves
+  (alloc, io, str, string, vec, unicode, sakshi) and **none of the six `[deps.X]` git bundles the full
+  fold needs**. That is the point of the profile: `dist/agnosai.cyr` cannot currently be vendored
+  standalone, because `dist/agnosai.deps` omits those bundles (`kavach_*`, `ratelimit_*`, `sha256`,
+  `dispatcher_*`, `accel_*`, `rng_uniform` are used in the fold and defined nowhere in it). This profile
+  has no such gap.
+
+  No source change: both modules ship exactly as they are, so the full `[lib]` fold is unaffected.
+
 ## [2.0.6] — 2026-08-23
 
 ### Changed — Cyrius pin 6.5.34 → 6.5.35, bote 3.3.3 → 3.3.7, majra 2.6.7 → 2.7.0
