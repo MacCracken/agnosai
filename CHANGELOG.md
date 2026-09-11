@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.8] — 2026-09-11
+
+### Changed
+
+- **Toolchain `6.5.35` → `6.6.2`, plus five dependency pins.** 6.6.0 made
+  `Result` / `Option` / `Either` a two-register `(tag, payload)` value and deleted
+  the `payload()` accessor.
+
+  | dep | was | now |
+  |---|---|---|
+  | cyrius | 6.5.35 | **6.6.2** |
+  | sigil | 3.12.9 | **3.12.16** |
+  | bote | 3.3.7 | **3.3.8** |
+  | majra | 2.7.0 | **2.7.2** |
+  | kavach | 3.12.2 | **3.12.5** |
+  | ai-hwaccel | 2.3.18 | **2.3.22** |
+
+  The bote bump is load-bearing rather than routine: bote ≤ 3.3.7 pinned majra
+  2.7.0, whose `_sub_new(chan, filter_fn)` collides with libro's
+  `_sub_new(pattern)` at a different arity — a silent "last definition wins"
+  warning through 6.5.36 and a **hard error** from 6.5.37 on.
+
+- **Three value-form binds in `src/orchestrator/ipc.cyr`.** `agnosai_ipc_bind`,
+  `agnosai_ipc_accept` and `agnosai_ipc_connect` each bound majra's `Result` with a
+  single `var` and called the one-argument `result_unwrap`. Both halves are now
+  bound and `result_unwrap(tag, val)` takes the pair. Behaviour is unchanged —
+  the guards already tested `is_err_result` correctly.
+
+### Note — every `callptr` dispatch audited, none affected
+
+⚠ **A clean build is not evidence for this class.** `callptr` targets a runtime
+function pointer, so the compiler cannot see that a callee returns a pair; a
+`Result` through `callptr` is silently truncated to its tag with **no diagnostic**.
+agnosai compiles with zero errors, which says nothing either way.
+
+All ten `callptr` sites were traced to their full fp target sets and every target's
+return form read from source — `inference_queue.cyr:367`, `retry.cyr:178`,
+`discovery.cyr:105`, `native.cyr:381`/`414`, `remote_registry.cyr:199`,
+`agnos.cyr:223`/`227`, `loader.cyr:600`, `load_testing.cyr:259`. **No reachable
+target is pair-returning.** The reason is structural, not luck: agnosai's transport
+contract is out-param based — return `0` on success and write the payload through
+`&out` — so no payload ever travels in a return register.
+
+⚠ **Latent hazard worth knowing before anyone touches it.** `agnosai_hoosh_chat`
+(`src/llm/hoosh.cyr:671`) is `: i64` with five error paths encoded as error `Str`s,
+which makes it the natural candidate to become `: Result` some day. If it does,
+`_agnosai_crew_infer_fp` would tail-forward a pair out of a `: i64` fn,
+`retry.cyr:178`'s `callptr` would bind the tag alone, and `agnosai_is_retryable(1)`
+would classify every error as non-retryable — retry dying silently, with nothing to
+see. Changing that signature means revisiting that `callptr`.
+
+
 ## [2.0.7] - 2026-08-24
 
 ### Added

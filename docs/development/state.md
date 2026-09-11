@@ -8,7 +8,7 @@
 
 | | |
 |---|---|
-| **version** | **2.0.6** |
+| **version** | **2.0.8** |
 | **cyrius pin** | **6.5.35** (folds patra 1.13.10 — required, see below) |
 | **tests** | **99 suites, 7,944 assertions, 0 failed** |
 | **coverage** | **99%** — 103/103 files, 1,578/1,585 fns (gate is `--min 80`) |
