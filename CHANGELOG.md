@@ -11,9 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`[lib.guard]` — a lean output-guard distlib profile**, published for downstream consumers that want
-  agnosai's output-safety leaves without the orchestration engine. `cyrius distlib guard` →
-  `dist/agnosai-guard.cyr`, **529 lines**, two modules: `src/units.cyr` + `src/server/output_filter.cyr`.
+- **`[lib.guard]` — a lean trust-boundary profile**, published for downstream consumers that want
+  agnosai's safety leaves without the orchestration engine. `cyrius distlib guard` →
+  `dist/agnosai-guard.cyr`, **915 lines**, four modules: `src/units.cyr` + `src/strcase.cyr` +
+  `src/server/output_filter.cyr` + `src/server/prompt_guard.cyr`.
+
+  The two leaves are the two directions across a trust boundary: **output_filter** scans what LEAVES
+  (secrets and PII on the way out) and **prompt_guard** scans what ARRIVES (injection heuristics over
+  untrusted prose, plus a system-prompt wrapper). `strcase.cyr` is present only because prompt_guard needs
+  its case-insensitive contains.
 
   Requested by **thoth**, which needs secret/PII redaction before model output reaches its feed, its
   `/save` exports and its persisted conversation store — and which cannot reasonably vendor the 37,595-line
