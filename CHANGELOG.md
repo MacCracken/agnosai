@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.9] — 2026-09-12
+
+### Fixed
+
+- **`SYS_DUP2` is x86_64-only — the aarch64 cross-build could never compile.**
+  `src/sandbox/spawn.cyr` wired the child's stdio with three raw
+  `syscall(SYS_DUP2, fd, n)` calls. aarch64 Linux has **no `dup2` syscall at all**
+  (only `dup3`), so `SYS_DUP2` is undefined there and the cross-build failed with:
+
+      error:lib/agnosai.cyr:19584:25: undefined variable 'SYS_DUP2' (missing include or enum?)
+
+  Now calls the stdlib wrapper `sys_dup2(oldfd, newfd)`, which exists on both
+  targets and translates to `dup3(oldfd, newfd, 0)` on aarch64. Surfaced by
+  **agnostic**, whose `Cross-build aarch64` step compiles the vendored bundle —
+  the x86_64 build never touched this path, so it shipped green.
+
+
 ## [2.0.8] — 2026-09-11
 
 ### Changed
