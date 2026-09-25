@@ -74,6 +74,35 @@ every benchmark, every build target. **Wire parity is the bar**, judged against
       once README/SECURITY.md stopped claiming seccomp-bpf/Landlock/cgroups on
       the process tier, which was never implemented.
 
+## Moving the cyrius pin to 6.6.5
+
+⛔ Before bumping the pin to 6.6.5: cross-reference the three deferral comments that turn the lint
+stage of `scripts/check-clean.sh` red (CI runs it at `.github/workflows/ci.yml:108`). 6.6.5's
+cyrlint folds case and joins a phrase wrapped across comment lines, so it sees prose the 6.6.2
+cyrlint never matched.
+
+cyrius 6.6.5 is not tagged yet. Nothing below can land against the pin until it is, except items
+marked **(can land now)**. The pin is 6.6.2 today, and this section lists only what 6.6.5 itself
+changes.
+
+- [ ] ⛔ Put a tracking pointer (CHANGELOG / issue / roadmap / `docs/` path) on a line the phrase
+      itself touches, or mark prose that is not a deferral `#skip-lint`. **(can land now)** — a
+      same-line pointer or `#skip-lint` does not depend on the toolchain.
+  - `src/server/auth.cyr:425` — "is not" / "yet an abstraction", a wrapped "not yet". Prose.
+  - `src/tools/mod.cyr:39` — quotes the retired "Deferred with their features" text. History.
+  - `benches/core.bcyr:384` — "out of" / "scope rather than skipped", a wrapped "out of scope".
+
+  See the cyrius CHANGELOG [6.6.5] entry "cyrlint read every rule ONE PHYSICAL LINE at a time".
+- [ ] `src/fleet/cost_planning.cyr:158-166` describes the old
+      `note: oversized array local kept in shared global (not per-thread)`, which carried no
+      file:line (`:164-165`). From 6.6.5 it is a `warning:` that names the declaration's file:line
+      and says an array local over the per-fn frame budget gets STATIC storage, one buffer shared
+      by all calls and all threads. The citation `parse_decl.cyr:89` (`:162`) is now `:122`. See
+      the CHANGELOG [6.6.5] entry "A fn-local STATIC array no longer takes a program-wide global
+      name".
+- [ ] At the bump, re-run `cyrius deps` — the aarch64 syscall peer moved SYS_UNLINKAT 35 → 263, so
+      an un-re-vendored peer's sys_unlink would run nanosleep.
+
 ## Milestones
 
 Dependency-ordered. Each phase decomposes into commit-sized bites (each
@@ -1504,3 +1533,60 @@ Once it exists, `src/telemetry/otlp.cyr` collapses to a thin adapter and
 ⚠ **This is a note, not a filing.** It is recorded here so the next consumer
 finds the prior art instead of writing a third encoder, and so the cost is
 visible when someone decides whether the ecosystem wants the repo.
+
+## Moving the cyrius pin to 6.6.6
+
+Current pin: `cyrius = "6.6.2"` (`cyrius.cyml`).
+
+agnosai has by far the widest `: Str` parameter surface in the ecosystem, so item 5 of the
+6.6.6 notes ("a by-value struct parameter over 8 B is now DEEP-COPIED where it used to alias a
+pointer") looks alarming here — it is not, and the reason is worth writing down so nobody
+re-raises it.
+
+There are **42 functions taking a `: Str` parameter** across `src/core/`, `src/fleet/`,
+`src/sandbox/`, `src/server/`, `src/tools/`, `src/telemetry/`, `src/definitions/`,
+`src/learning/`, `src/orchestrator/` and `src/llm/`, and **141 distinct sites** where such a
+parameter's value is stored into a heap object or pushed into a `vec` that outlives the call —
+`store64(e + AGN_EDGE_FROM, from)` in `agnosai_edge_new` (`src/core/task.cyr:684`),
+`store64(a + AGN_AGENT_ROLE, role)` in `agnosai_agent_new_a` (`src/core/agent.cyr:83`), and so
+on through the constructors. If a `: Str` param became a frame-local deep copy, every one of
+those stored pointers would dangle after return. **It does not.** The 6.6.6 change
+(`_local_is_sptr_param`, bite 16b) deliberately excludes exactly this case: `Str`, `Result`,
+`Option` and `Tagged` are 16-byte structs *by name* whose slot holds a HEAP HANDLE; they stay
+value-passed and `a = b` between two of them stays the pointer rebind the stdlib is built on.
+The deep-copy change applies only to user-declared structs passed by value, and agnosai
+declares no struct-typed parameters at all. No change, no risk.
+
+Everything else checked, with results:
+
+- **Windows `O_APPEND`/`O_TRUNC` corruption (item 1): does not reach agnosai.** No PE target
+  (`CYRIUS_TARGET_AGNOS` / `CYRIUS_TARGET_LINUX` only, `cross_bins = ["agnosai-aarch64"]`, CI
+  is `ubuntu-latest` only). The `O_APPEND` mentions in
+  `src/orchestrator/durable_state.cyr:37-38` are prose describing the Rust oracle's
+  `jsonl_open`, not code — agnosai's own writes are `file_write_all`
+  (`src/sandbox/wasm.cyr:210`, `src/definitions/packaging.cyr:365`) and `file_write_atomic`
+  (`src/orchestrator/durable_state.cyr:419`), and its reads open mode 0
+  (`src/definitions/loader.cyr:185`, `src/orchestrator/durable_state.cyr:301`).
+- **`file_write_atomic` behaviour did change (item 9)** and durable_state.cyr:419 is the one
+  caller: it now **keeps an existing file's mode** instead of applying `0644 & ~umask`. For a
+  state snapshot that is the better semantics, but if anything ever created those files 0600
+  deliberately, that mode now survives a rewrite where it used to be widened. Worth one look
+  at how the state directory is first created.
+- **New compile errors (item 3): no sites.** No `async fn` in code — the four `async fn`
+  matches are all prose in comments describing the Rust original
+  (`src/fleet/discovery.cyr:8`, `src/server/prometheus.cyr:40`, `src/server/routes/mod.cyr:10`).
+  No `operator` fn (the 54 "operator" hits are all about a human operator), no `ret2`/`rethi`,
+  no SIMD, no struct-valued call at top level, and no `var p: S = f(..)` receive form anywhere
+  — which is the only context in which the new `: cstring` and arity gates on struct receives
+  can fire. Scanned all 3 `: cstring` parameters for a non-zero integer literal at the call
+  site: none (a literal `0` is still allowed, by design).
+- **Item 4 (top-level block scoping):** zero bare `{` blocks at column 0. Nothing to do.
+- **Item 6 (redeclared globals):** no duplicate global declarations.
+- **Items 8 and 9:** no `regression_*` call sites of its own (the two `include` hits are
+  `lib/regression.cyr` pulling `lib/regression_agnos.cyr`), and no own `vec_*` function
+  colliding with the 14 names `lib/vec.cyr` exports, so the new transitive
+  `lib/assert.cyr` → `lib/vec.cyr` include is harmless.
+
+After bumping, verify: the full `.tcyr` suite exits 0 per file (not just the grep summary),
+and one durable-state round trip — write a snapshot, restart, read it back — to confirm the
+`file_write_atomic` mode change did not alter who can read the state directory.
