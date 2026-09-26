@@ -177,8 +177,19 @@ fn _agnosai_msg_fmt_rfc3339(ns): i64 {
     return str_builder_build(sb);
 }
 
-# Parse an RFC3339 UTC timestamp back to epoch nanoseconds, accepting any
-# number of fractional digits. Returns -1 when the seconds part is malformed.
+# Two ASCII digits at `p` as a number, or -1 if either is not a digit.
+fn _agnosai_msg_2digits(p): i64 {
+    var a = load8(p);
+    var b = load8(p + 1);
+    if (a < 48 || a > 57 || b < 48 || b > 57) { return 0 - 1; }
+    return (a - 48) * 10 + (b - 48);
+}
+
+# Parse an RFC3339 timestamp to epoch nanoseconds, accepting any number of
+# fractional digits and a zone of `Z`, `±HH:MM` or none (read as UTC). An offset
+# is applied — `02:00:00+02:00` is `00:00:00Z` — where it used to be ignored,
+# which made a non-UTC timestamp silently wrong by its offset. Returns -1 when
+# the seconds part or the zone is malformed.
 fn _agnosai_msg_parse_rfc3339(s: Str): i64 {
     var cstr = str_cstr(s);
     var secs = iso8601_parse(cstr);
@@ -186,20 +197,34 @@ fn _agnosai_msg_parse_rfc3339(s: Str): i64 {
 
     var ns = secs * AGNOSAI_NS_PER_SEC;
     var len = str_len(s);
-    if (len <= 19) { return ns; }
-    if (load8(cstr + 19) != 46) { return ns; }
-
-    var fract = 0;
-    var scale = AGNOSAI_NS_PER_SEC / 10;
-    for (var i = 20; i < len; i = i + 1) {
-        var c = load8(cstr + i);
-        if (c < 48 || c > 57) { break; }
-        if (scale > 0) {
-            fract = fract + (c - 48) * scale;
-            scale = scale / 10;
+    var i = 19;
+    if (i < len && load8(cstr + i) == 46) {
+        var fract = 0;
+        var scale = AGNOSAI_NS_PER_SEC / 10;
+        i = i + 1;
+        while (i < len) {
+            var c = load8(cstr + i);
+            if (c < 48 || c > 57) { break; }
+            if (scale > 0) {
+                fract = fract + (c - 48) * scale;
+                scale = scale / 10;
+            }
+            i = i + 1;
         }
+        ns = ns + fract;
     }
-    return ns + fract;
+
+    if (i >= len) { return ns; }
+    var z = load8(cstr + i);
+    if ((z == 90 || z == 122) && i + 1 == len) { return ns; }
+    if (z != 43 && z != 45) { return 0 - 1; }
+    if (len - i != 6 || load8(cstr + i + 3) != 58) { return 0 - 1; }
+    var hh = _agnosai_msg_2digits(cstr + i + 1);
+    var mm = _agnosai_msg_2digits(cstr + i + 4);
+    if (hh < 0 || mm < 0 || hh > 23 || mm > 59) { return 0 - 1; }
+    var off = (hh * 3600 + mm * 60) * AGNOSAI_NS_PER_SEC;
+    if (z == 43) { return ns - off; }
+    return ns + off;
 }
 
 # Create a new message with an auto-generated v4 id and the current timestamp.

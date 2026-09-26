@@ -125,6 +125,13 @@ fn agnosai_kavach_build_config(policy, agent_id): i64 {
     var secs = agnosai_sandbox_policy_max_duration_secs(policy);
     if (secs < 0) { secs = 0; }
     config_timeout_ms(c, secs * 1000);
+    # An EMPTY stdin, never the server's. kavach keeps `input == 0` meaning
+    # "inherit the parent's stdin" for its older callers, so without this every
+    # process/OCI tool read the agnosai server's own stdin — a terminal or a
+    # supervisor's pipe — and a tool reading to EOF blocked on it. A non-null
+    # buffer gets its own pipe, closed after `len` bytes: here an immediate EOF.
+    # The literal is static, which matters because kavach does not copy it.
+    config_stdin(c, "", 0);
     # `str_cstr`, not `str_data`: kavach stores the pointer verbatim
     # (`lib/kavach.cyr:3459`) and every later reader is `strlen`-based, but a
     # `Str`'s bytes carry no terminator — `str_new` and `str_substr` do not add

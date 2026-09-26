@@ -106,12 +106,33 @@ fn agnosai_uuid_to_str(u): i64 {
 # `agnosai_uuid_parse` accepts — which matters because the routes decide **404
 # versus 422** on the validator and the oracle's `Path<Uuid>` extractor decided
 # it on the parser.
+#
+# Four spellings are accepted, as the `uuid` crate's parser accepts them:
+# hyphenated (36), simple — 32 hex digits with no hyphens —, braced
+# `{hyphenated}` (38) and `urn:uuid:hyphenated` (45, prefix in either case).
 fn _agnosai_uuid_scan(s: Str, out): i64 {
-    if (str_len(s) != AGNOSAI_UUID_STR_LEN) { return 0; }
     var data = str_data(s);
+    var len = str_len(s);
+    var hy = 1;
+    if (len == 38) {
+        if (load8(data) != 123 || load8(data + 37) != 125) { return 0; }
+        data = data + 1;
+        len = AGNOSAI_UUID_STR_LEN;
+    } elif (len == 45) {
+        for (var k = 0; k < 9; k = k + 1) {
+            var pc = load8(data + k) & 255;
+            if (pc >= 65 && pc <= 90) { pc = pc + 32; }
+            if (pc != load8("urn:uuid:" + k)) { return 0; }
+        }
+        data = data + 9;
+        len = AGNOSAI_UUID_STR_LEN;
+    } elif (len == 32) {
+        hy = 0;
+    }
+    if (hy == 1 && len != AGNOSAI_UUID_STR_LEN) { return 0; }
     var pos = 0;
     for (var i = 0; i < AGNOSAI_UUID_BYTES; i = i + 1) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) {
+        if (hy == 1 && (i == 4 || i == 6 || i == 8 || i == 10)) {
             if (load8(data + pos) != 45) { return 0; }
             pos = pos + 1;
         }
@@ -223,6 +244,13 @@ fn _agnosai_uuid_key_a(a, s: Str): i64 {
     if (agnosai_uuid_is_valid(s) == 0) { return 0; }
     var d = str_data(s);
     var n = str_len(s);
+    # A simple, braced or URN spelling is re-rendered hyphenated, since that is
+    # the form every map is keyed by. Rare, so it takes the plain allocator.
+    if (n != AGNOSAI_UUID_STR_LEN) {
+        var tmp[16];
+        _agnosai_uuid_scan(s, &tmp);
+        return agnosai_uuid_to_str(&tmp);
+    }
     var upper = 0;
     for (var i = 0; i < n; i = i + 1) {
         var c = load8(d + i) & 255;

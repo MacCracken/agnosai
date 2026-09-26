@@ -124,6 +124,18 @@ fn main() {
     var ns0 = 1785283200 * AGNOSAI_NS_PER_SEC;
     assert_eq(_agnosai_msg_parse_rfc3339(_agnosai_msg_fmt_rfc3339(ns0)), ns0, "no-fraction round trip");
 
+    # A zone offset is applied, not ignored: all three are the same instant.
+    var utc = _agnosai_msg_parse_rfc3339(str_from("2026-07-28T00:00:00Z"));
+    assert_eq(_agnosai_msg_parse_rfc3339(str_from("2026-07-28T02:00:00+02:00")), utc,
+      "+02:00 is subtracted to reach UTC");
+    assert_eq(_agnosai_msg_parse_rfc3339(str_from("2026-07-27T18:30:00.000-05:30")), utc,
+      "-05:30 is added, after a fraction");
+    assert_eq(_agnosai_msg_parse_rfc3339(str_from("2026-07-28T00:00:00")), utc, "no zone reads as UTC");
+    assert_eq(_agnosai_msg_parse_rfc3339(str_from("2026-07-28T00:00:00+2")), 0 - 1,
+      "a malformed offset is rejected, not ignored");
+    assert_eq(_agnosai_msg_parse_rfc3339(str_from("2026-07-28T00:00:00Zjunk")), 0 - 1,
+      "and so is trailing junk after the zone");
+
     # --- malformed input is rejected ---
     assert_eq(agnosai_message_from_json(str_from("not json")), 0, "garbage JSON rejected");
     assert_eq(agnosai_message_from_json(str_from("{\"id\":\"x\"}")), 0, "missing fields rejected");

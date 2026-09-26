@@ -21,22 +21,12 @@
 #   * Bounded dedup silently opened a replay window. It is off by default and
 #     now documented at the call site.
 #
-# ## Two divergences that remain, both documented rather than papered over
+# ## Capacity and timestamps
 #
-# 1. **Channel capacity is ignored.** The oracle's `Relay::new(node_id,
-#    capacity)` sizes its broadcast channel; majra's `relay_subscribe` hardcodes
-#    `chan_new(256)`. Since the oracle's `with_defaults` is also 256, this only
-#    diverges for a caller that asks for something else — `agnosai_relay_new`
-#    therefore records the requested capacity and reports it, so the divergence
-#    is visible rather than silent. Owed to majra.
-#
-# 2. **The message timestamp is MONOTONIC, not wall clock.** The oracle stamps
-#    `Utc::now()`; majra's `relay_msg_new` stamps `time_now_ns()`
-#    (CLOCK_MONOTONIC). `RelayMessage` is `Serialize` in the oracle, so a
-#    serialised message would carry a different kind of number — meaningless
-#    across processes. Nothing in `src/` serialises one today, which is why this
-#    is recorded rather than worked around; it must be settled before any relay
-#    message crosses a wire. Owed to majra.
+# Both were once recorded here as gaps; both are closed in majra 2.6.5.
+# `relay_with_capacity` sizes the subscriber channel to the requested capacity,
+# and `relay_msg_new` stamps wall-clock time, so a serialised message carries a
+# timestamp that means something in another process.
 #
 # ## Ownership
 #
@@ -159,6 +149,17 @@ fn agnosai_incoming_message(inc): i64 {
     return incoming_msg(inc);
 }
 
+# Drop this subscriber's reference to a delivered RelayMessage; the last
+# reference frees it. Returns the references left (0 once freed).
+#
+# Since majra 2.9.0 a message is refcounted: `send` takes one reference per
+# subscriber that accepted it, so every message a subscriber takes off its
+# channel must be released once handled, or it is never freed. Only the
+# message block is freed — the strings it points at belong to its builder.
+fn agnosai_relay_message_release(m): i64 {
+    return relay_msg_release(m);
+}
+
 # --- messages ------------------------------------------------------------
 
 # Build a RelayMessage. An empty `to` marks it a broadcast.
@@ -191,10 +192,8 @@ fn agnosai_relay_message_payload(m): i64 {
     return load64(m + 32);
 }
 
-# The message timestamp.
-#
-# ⚠ MONOTONIC nanoseconds, not wall clock — see the header. Comparable within
-# this process and meaningless outside it.
+# The message timestamp: wall-clock nanoseconds since the Unix epoch (majra
+# 2.6.5+), so it is comparable across processes.
 fn agnosai_relay_message_timestamp(m): i64 {
     return load64(m + 40);
 }
@@ -204,12 +203,17 @@ fn agnosai_relay_message_timestamp(m): i64 {
 # The oracle's three counters. majra tracks three more (dedup_evicted,
 # dedup_table_size, sequence_gaps) which are reachable through
 # `agnosai_relay_sequence_gaps` and the inner relay.
+#
+# majra's `relay_stats` returns a fresh 48-byte `fl_alloc` snapshot on every call
+# and has no free of its own, so it is freed here once copied — it used to leak a
+# block per call.
 fn agnosai_relay_stats(r): i64 {
     var m = relay_stats(load64(r + AGN_RLY_INNER));
     var s = alloc(AGN_RS_SIZE);
     store64(s + AGN_RS_MESSAGES_SENT, load64(m));
     store64(s + AGN_RS_MESSAGES_RECEIVED, load64(m + 8));
     store64(s + AGN_RS_DUPLICATES_DROPPED, load64(m + 16));
+    fl_free(m);
     return s;
 }
 
@@ -234,7 +238,10 @@ fn agnosai_relay_stats_duplicates_dropped(s): i64 {
 # all, so this is a counter; the information is the same and it is assertable,
 # which a log line is not.
 fn agnosai_relay_sequence_gaps(r): i64 {
-    return load64(relay_stats(load64(r + AGN_RLY_INNER)) + 40);
+    var m = relay_stats(load64(r + AGN_RLY_INNER));
+    var gaps = load64(m + 40);
+    fl_free(m);
+    return gaps;
 }
 
 # The last sequence seen from `from`, or -1 if that sender is unknown.

@@ -158,19 +158,31 @@ fn agnosai_rate_limit_evict_stale(s): i64 {
       load64(s + AGN_RL_EVICTION_NS));
 }
 
+# One field of majra's stats snapshot. `ratelimit_stats` hands back a fresh
+# 32-byte `fl_alloc` block on every call; these accessors used to read it and
+# drop it, leaking a block per call — and the pressure sweep reads the key
+# count every `AGNOSAI_RL_SWEEP_EVERY` requests.
+fn _agnosai_rl_stat(s, off): i64 {
+    var st = ratelimit_stats(load64(s + AGN_RL_LIMITER));
+    var v = load64(st + off);
+    ratelimit_stats_free(st);
+    return v;
+}
+
 # Total requests allowed since construction.
 fn agnosai_rate_limit_total_allowed(s): i64 {
-    return load64(ratelimit_stats(load64(s + AGN_RL_LIMITER)));
+    return _agnosai_rl_stat(s, 0);
 }
 
 # Total requests rejected since construction.
 fn agnosai_rate_limit_total_rejected(s): i64 {
-    return load64(ratelimit_stats(load64(s + AGN_RL_LIMITER)) + 8);
+    return _agnosai_rl_stat(s, 8);
 }
 
-# How many distinct keys currently hold a bucket.
+# How many distinct keys currently hold a bucket. `ratelimit_key_count` reads
+# the map size directly and allocates nothing.
 fn agnosai_rate_limit_active_keys(s): i64 {
-    return load64(ratelimit_stats(load64(s + AGN_RL_LIMITER)) + 16);
+    return ratelimit_key_count(load64(s + AGN_RL_LIMITER));
 }
 
 # How many buckets every sweep so far has reclaimed, cumulatively.

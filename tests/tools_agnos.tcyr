@@ -45,13 +45,16 @@ var _T_CALLS = 0;
 # What the next synthetic exchange should return: a JSON value, 0 for a
 # transport failure, or AGNOSAI_AGNOS_BAD_JSON for an unparseable body.
 var _T_REPLY = 0;
+# A failure detail the recording transport reports through `detail_out`, or 0.
+var _T_DETAIL = 0;
 
 # The recording transport. Stands in for one sandhi exchange.
-fn _t_capture(c, method, url: Str, body): i64 {
+fn _t_capture(c, method, url: Str, body, detail_out): i64 {
     _T_METHOD = method;
     _T_URL = str_clone(url);
     _T_BODY = body;
     _T_CALLS = _T_CALLS + 1;
+    if (_T_DETAIL != 0) { store64(detail_out, _T_DETAIL); }
     return _T_REPLY;
 }
 
@@ -67,6 +70,7 @@ fn _t_reset(reply): i64 {
     _T_BODY = 0;
     _T_CALLS = 0;
     _T_REPLY = reply;
+    _T_DETAIL = 0;
     return 0;
 }
 
@@ -200,6 +204,24 @@ fn main() {
     assert_eq(agnosai_tool_output_success(bad_out), 0, "an unparseable body is not a success");
     assert(str_eq(agnosai_tool_output_error(bad_out), str_from("failed to parse response")) == 1,
       "and is reported as a parse failure, not a transport one — they are different problems");
+
+    # --- a failure's detail travels with its own call ---
+    _t_reset(0);
+    _T_DETAIL = "connection refused";
+    var det_out = agnosai_agnos_call(c, "GET", str_from("/z"), 0, 0);
+    assert(str_eq(agnosai_tool_output_error(det_out), str_from("testsvc request failed: connection refused")) == 1,
+      "a transport's detail reaches the error of the call that failed");
+    _t_reset(AGNOSAI_AGNOS_BAD_JSON);
+    _T_DETAIL = "expected value";
+    var pdet = agnosai_agnos_call(c, "GET", str_from("/z"), 0, 0);
+    assert(str_eq(agnosai_tool_output_error(pdet), str_from("failed to parse response: expected value")) == 1,
+      "and so does a parse failure's, which used to be dropped");
+
+    # --- path segments are percent-encoded ---
+    var sg = str_builder_new();
+    agnosai_agnos_add_segment(sg, str_from("a b\"#<>?`{}é%x"));
+    assert(str_eq(str_builder_build(sg), str_from("a%20b%22%23%3C%3E%3F%60%7B%7D%C3%A9%x")) == 1,
+      "the path set is encoded, non-ASCII included, and % is left alone");
 
     _t_reset(ok_reply);
     var ok_out = agnosai_agnos_call(c, "GET", str_from("/z"), 0, 0);
@@ -375,6 +397,9 @@ fn main() {
     _t_reset(ok_reply);
     agnosai_tool_execute(get_note, _t_in1("note_id", "abc-123"));
     _t_url_is("http://mneme:8400/api/notes/abc-123");
+    _t_reset(ok_reply);
+    agnosai_tool_execute(get_note, _t_in1("note_id", "my note"));
+    _t_url_is("http://mneme:8400/api/notes/my%20note");
 
     _t_reset(ok_reply);
     var trav = agnosai_tool_execute(get_note, _t_in1("note_id", "../../etc/passwd"));
@@ -565,8 +590,9 @@ fn main() {
     # --- the live transport, called directly ---
     # `.invalid` is reserved by RFC 2606 and never resolves, so this exercises
     # the transport-failure arm identically on and off a network.
+    var live_detail = 0;
     assert_eq(agnosai_agnos_http_transport(agnosai_agnos_client(str_from("http://x.invalid"),
-          str_from("p")), "GET", str_from("http://x.invalid/"), 0), 0,
+          str_from("p")), "GET", str_from("http://x.invalid/"), 0, &live_detail), 0,
       "the live transport reports an unresolvable host as a transport failure");
 
     # --- the _int overload slot, pinned ---

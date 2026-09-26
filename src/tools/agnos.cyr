@@ -109,18 +109,43 @@ fn agnosai_agnos_transport(c): i64 {
 
 # Whether a caller-supplied value is safe to interpolate into a URL path.
 #
-# The oracle's guard, character for character: `val.contains('/') ||
-# val.contains("..")`. mneme applies it to `note_id`, delta to `owner`, `repo`
-# and `pipeline_id`. It is a path-traversal guard, not an encoder — a segment
-# that passes is inserted raw, exactly as the oracle inserts it.
+# `val.contains('/') || val.contains("..")` — a path-traversal guard. mneme
+# applies it to `note_id`, delta to `owner`, `repo` and `pipeline_id`. It is not
+# an encoder: a segment that passes goes through `agnosai_agnos_add_segment`,
+# which percent-encodes it.
 #
-# The empty string passes here because it passes in the oracle. It produces a
-# double slash in the URL and a 404 from the service, which is the oracle's
-# behaviour and not this function's problem to improve on.
+# The empty string passes. It produces a double slash in the URL and a 404 from
+# the service.
 fn agnosai_agnos_segment_ok(v: Str): i64 {
     if (str_contains(v, str_from("/")) == 1) { return 0; }
     if (str_contains(v, str_from("..")) == 1) { return 0; }
     return 1;
+}
+
+# Append `v` to a URL path as one segment, percent-encoding the WHATWG path set:
+# C0 controls, space, `"`, `#`, `<`, `>`, `?`, `` ` ``, `{`, `}`, DEL and every
+# non-ASCII byte. Raw, a `note_id` of `my note` made sandhi reject the whole URL
+# (it refuses a space), so the tool failed with "request failed" instead of
+# asking for `/api/notes/my%20note`. `%` itself is left alone, so an id that is
+# already encoded is not encoded twice.
+fn agnosai_agnos_add_segment(sb, v: Str): i64 {
+    var p = str_data(v);
+    var n = str_len(v);
+    for (var i = 0; i < n; i = i + 1) {
+        var b = load8(p + i) & 255;
+        var enc = 0;
+        if (b <= 32 || b >= 127) { enc = 1; }
+        if (b == 34 || b == 35 || b == 60 || b == 62 || b == 63) { enc = 1; }
+        if (b == 96 || b == 123 || b == 125) { enc = 1; }
+        if (enc == 1) {
+            str_builder_add_byte(sb, 37);
+            str_builder_add_byte(sb, load8("0123456789ABCDEF" + (b >> 4)));
+            str_builder_add_byte(sb, load8("0123456789ABCDEF" + (b & 15)));
+        } else {
+            str_builder_add_byte(sb, b);
+        }
+    }
+    return 0;
 }
 
 # The oracle's "<name> contains invalid characters" rejection.
@@ -218,27 +243,18 @@ var AGNOSAI_AGNOS_BAD_JSON = 0 - 1;
 # `shape_fp` — `fn(value) -> value` — which is where a tool that reshapes the
 # response (only `synapse_infer` does) puts that logic. Pass 0 to return the
 # response unchanged, which is what seven of the nine tools do.
+#
+# The transport reports a failure's detail through `detail_out`, a local of THIS
+# call. It used to be a process-wide global, and tools run on up to 100 server
+# workers at once, so one call's error text could be reported by another's.
 fn agnosai_agnos_call(c, method, path: Str, body, shape_fp): i64 {
     var url = agnosai_agnos_url(c, path);
-    var data = callptr(agnosai_agnos_transport(c), c, method, url, body);
-    if (data == 0) { return agnosai_agnos_request_err(c, _agnosai_agnos_last_detail()); }
-    if (data == AGNOSAI_AGNOS_BAD_JSON) { return agnosai_agnos_parse_err(0); }
+    var detail = 0;
+    var data = callptr(agnosai_agnos_transport(c), c, method, url, body, &detail);
+    if (data == 0) { return agnosai_agnos_request_err(c, detail); }
+    if (data == AGNOSAI_AGNOS_BAD_JSON) { return agnosai_agnos_parse_err(detail); }
     if (shape_fp == 0) { return agnosai_tool_output_ok(data); }
     return agnosai_tool_output_ok(callptr(shape_fp, data));
-}
-
-# The live transport's error detail for the most recent failure, or 0.
-#
-# A thread-local would be the right home for this; Cyrius has `thread_local`,
-# but these tools run one exchange per call on the calling thread and the value
-# is consumed immediately after the call that sets it, so a plain global is
-# sufficient and honest. It is reset on entry to every exchange so a stale
-# message can never be attributed to a later failure.
-var _AGNOSAI_AGNOS_DETAIL = 0;
-
-# Read the detail recorded by the last live exchange.
-fn _agnosai_agnos_last_detail(): i64 {
-    return _AGNOSAI_AGNOS_DETAIL;
 }
 
 # The live transport: one sandhi exchange against an AGNOS service.
@@ -248,8 +264,10 @@ fn _agnosai_agnos_last_detail(): i64 {
 # rather than a route, and following one would take a loopback-scoped tool
 # somewhere it was never pointed — the same reasoning as ADR 007, reaching the
 # opposite conclusion because there is no legitimate redirect to preserve.
-fn agnosai_agnos_http_transport(c, method, url: Str, body): i64 {
-    _AGNOSAI_AGNOS_DETAIL = 0;
+#
+# `detail_out` receives a C string describing a failure, or stays 0.
+fn agnosai_agnos_http_transport(c, method, url: Str, body, detail_out): i64 {
+    store64(detail_out, 0);
 
     var arena = agnosai_arena_pool_acquire(_AGNOSAI_AGNOS_POOL);
     if (arena == 0) { return 0; }
@@ -285,7 +303,7 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body): i64 {
         # exactly that case — so the null check is the common path, not the
         # defensive one.
         var msg = sandhi_http_err_message(r);
-        if (msg != 0) { _AGNOSAI_AGNOS_DETAIL = str_cstr(str_clone(str_from(msg))); }
+        if (msg != 0) { store64(detail_out, str_cstr(str_clone(str_from(msg)))); }
         agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return 0;
     }
@@ -312,11 +330,17 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body): i64 {
     var body_len = sandhi_http_body_len(r);
     var data = 0;
     if (body_len > 0 && sandhi_http_body(r) == 0) {
-        _AGNOSAI_AGNOS_DETAIL = str_cstr(str_from("response body could not be buffered"));
+        store64(detail_out, "response body could not be buffered");
         agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return AGNOSAI_AGNOS_BAD_JSON;
     }
-    if (body_len > 0) { data = bayan_json_v_parse_buf(sandhi_http_body(r), body_len); }
+    # The reentrant parse keeps its error in this call's own state, so the
+    # detail cannot be another thread's.
+    if (body_len > 0) {
+        var ps[48];
+        data = bayan_json_v_parse_ctx(&ps, sandhi_http_body(r), body_len);
+        if (data == 0) { store64(detail_out, str_cstr(str_clone(str_from(bayan_json_state_error(&ps))))); }
+    }
     agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
     if (data == 0) { return AGNOSAI_AGNOS_BAD_JSON; }
     return data;

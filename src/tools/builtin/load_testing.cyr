@@ -56,6 +56,17 @@ var AGNOSAI_LT_MAX_DURATION_SECS = 300;
 # default request cap is 64 KiB.
 var AGNOSAI_LT_SCRATCH_BYTES = 1048576;
 
+# Every request gets a 30 s total budget. Without one sandhi waits forever on a
+# target that accepts and never answers, and the worker — with the
+# `thread_join` behind it — never returns.
+var AGNOSAI_LT_REQUEST_TIMEOUT_MS = 30000;
+
+# Bodies are read and discarded, so this only has to be large enough that an
+# ordinary page is not misreported: at sandhi's 256 KiB default, every request
+# against a larger page counted as a transport failure. The scratch arena is
+# growable and reset after every request, so a large body is transient.
+var AGNOSAI_LT_MAX_RESPONSE_BYTES = 16777216;
+
 # Pools for the worker's two arenas. See `src/arena_pool.cyr`.
 #
 # ⚠ **Was `arena_allocator(...)` twice PER USER**, in the spawn loop — the only
@@ -231,8 +242,15 @@ fn agnosai_lt_http_executor(w): i64 {
     # as soon as the status code has been read.
     var arena = load64(w + AGN_LT_SCRATCH);
     var url = load64(w + AGN_LT_URL);
-    var headers = sandhi_headers_new();
-    var r = sandhi_http_get_a(arena, str_cstr(url), headers);
+    # Headers and options through the scratch arena too: `sandhi_headers_new()`
+    # on the global bump was one permanent allocation per request, up to 100k a
+    # run.
+    var headers = sandhi_headers_new_a(arena);
+    var opts = sandhi_http_options_new_a(arena);
+    if (opts == 0) { return 0; }
+    sandhi_http_options_total_ms(opts, AGNOSAI_LT_REQUEST_TIMEOUT_MS);
+    sandhi_http_options_max_response_bytes(opts, AGNOSAI_LT_MAX_RESPONSE_BYTES);
+    var r = sandhi_http_get_opts_a(arena, str_cstr(url), headers, opts);
     if (r == 0) { return 0; }
     if (sandhi_http_err_kind(r) != SANDHI_OK) { return 0; }
     return sandhi_http_status(r);
@@ -568,7 +586,9 @@ fn agnosai_lt_clamp_duration(secs): i64 {
 # join. Nothing logs from inside a worker: sakshi's ring buffer is a process
 # global, and the worker loop is the one place in this codebase where several
 # OS threads run at once.
-fn _agnosai_lt_log(msg, msg_len, url: Str, a_key, a_val, b_key, b_val): i64 {
+#
+# `c_key` is optional: 0 omits the third pair.
+fn _agnosai_lt_log(msg, msg_len, url: Str, a_key, a_val, b_key, b_val, c_key, c_val): i64 {
     if (sakshi_get_level() < SK_INFO) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, url);
@@ -580,6 +600,12 @@ fn _agnosai_lt_log(msg, msg_len, url: Str, a_key, a_val, b_key, b_val): i64 {
     str_builder_add_cstr(sb, b_key);
     str_builder_add_cstr(sb, "=");
     str_builder_add_int(sb, b_val);
+    if (c_key != 0) {
+        str_builder_add_cstr(sb, " ");
+        str_builder_add_cstr(sb, c_key);
+        str_builder_add_cstr(sb, "=");
+        str_builder_add_int(sb, c_val);
+    }
     var line = str_builder_build(sb);
     sakshi_log_kv(SK_INFO, msg, msg_len, "load_test", 9, str_data(line), str_len(line));
     return 0;
@@ -610,19 +636,20 @@ fn _agnosai_load_testing_execute(ctx, input): i64 {
     duration = agnosai_lt_clamp_duration(duration);
 
     _agnosai_lt_log("load test starting", 18, target, "concurrent_users", users,
-      "duration_secs", duration);
+      "duration_secs", duration, 0, 0);
 
     var result = agnosai_load_test_run(target, users, duration, &agnosai_lt_http_executor);
     if (result == 0) {
         return agnosai_tool_output_err(str_from("load test failed: no requests completed"));
     }
 
-    # The oracle logs throughput as a float; the integer carrier is the same
-    # number in thousandths, and keeping it integral avoids a float in the log
-    # path. p99 is reported in the oracle's milliseconds.
+    # Throughput is logged in thousandths of a request per second — the integer
+    # carrier the result already holds, which keeps a float out of the log path.
+    # p99 is in milliseconds.
     _agnosai_lt_log("load test completed", 19, target,
       "total_requests", load64(result + AGN_LTR_TOTAL_REQUESTS),
-      "p99_latency_ms", load64(result + AGN_LTR_P99_NS) / AGNOSAI_NS_PER_MS);
+      "p99_latency_ms", load64(result + AGN_LTR_P99_NS) / AGNOSAI_NS_PER_MS,
+      "throughput_milli_rps", load64(result + AGN_LTR_THROUGHPUT_MILLI));
 
     return agnosai_tool_output_ok(agnosai_lt_result_to_value(result));
 }

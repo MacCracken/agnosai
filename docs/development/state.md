@@ -4,17 +4,48 @@
 > (durable); this file is **state** (volatile).
 > Last refreshed: 2026-09-26.
 
-## Now — 2.0.10
+## Now — 2.1.0
+
+| | |
+|---|---|
+| **version** | **2.1.0** |
+| **cyrius pin** | **6.6.6** |
+| **tests** | **99 suites, 8,048 assertions, 0 failed** — every suite also exits 0 run on its own |
+| **coverage** | **99%** — 103/103 files, 1,582/1,590 fns (gate is `--min 80`) |
+| **dist** | `dist/agnosai.cyr` 37,608 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.0; sidecars 46 / 8 leaves |
+| **binary** | `build/agnosai` **5,120,736 B** (+8,384 over 2.0.10); aarch64 cross-build **6,217,960 B** |
+| **gates** | `check-symbols.sh` · `check-clean.sh` · `distlib --check` · fuzz 4/4 · coverage — all green |
+
+Dependencies are unchanged from 2.0.10 (below).
+
+### 2.1.0 — the `rust-old/` audit
+
+Seven read-only audits compared every item and every `#[test]` in `rust-old/` with the Cyrius
+tree: orchestrator, server, fleet, tools, core + llm + telemetry, sandbox + definitions +
+learning, and everything outside `src/`. Every `.rs` file has a counterpart, and nothing outside
+`rust-old/` reads it. **It is scheduled for deletion in the next release**; the checklist and
+the remaining findings (B4–B15) are in [`roadmap.md`](roadmap.md). The easy findings were fixed
+here, each with a test that fails on the old code — see the CHANGELOG.
+
+**Measured, not assumed:**
+
+- The IPC SIGPIPE fix: forcing the old `write(2)` path makes the new test die with exit 141.
+- The stats leaks: restoring the old accessors fails the LIFO-freelist assertions.
+- The server path: `benches/server.bcyr` on 2.0.10 against 2.1.0, same machine and session — all
+  33 rows within ±5.4%, most within ±2%, so no regression is claimed and no speed-up either.
+  Single runs; the full `bench-history.sh` sweep was not recorded for this release.
+
+⚠ **Not covered by a test:** the load tester's new timeout, response cap and header arena sit on
+the network path, which needs a live target that no suite stands up (B13).
+
+## 2.0.10 — kept for the record
 
 | | |
 |---|---|
 | **version** | **2.0.10** |
-| **cyrius pin** | **6.6.6** |
-| **tests** | **99 suites, 7,975 assertions, 0 failed** — every suite also exits 0 run on its own |
-| **coverage** | **99%** — 103/103 files, 1,578/1,585 fns (gate is `--min 80`) |
-| **dist** | `dist/agnosai.cyr` 37,625 lines + `dist/agnosai-guard.cyr` 932 lines, both v2.0.10; sidecars 46 / 8 leaves (`sys` is new) |
-| **binary** | `build/agnosai` **5,112,352 B** (2.0.9 on 6.6.2: 4,854,248 B, +5.3%, not attributed); aarch64 cross-build **6,217,784 B** |
-| **gates** | `check-symbols.sh` · `check-clean.sh` · `distlib --check` · fuzz 4/4 · coverage — all green |
+| **tests** | 99 suites, 7,975 assertions, 0 failed |
+| **coverage** | 99% — 103/103 files, 1,578/1,585 fns |
+| **binary** | `build/agnosai` 5,112,352 B |
 
 Direct deps (`[deps.*]`, all six): `sigil` **3.12.18** (= the 6.6.6 fold, byte-identical),
 `bote` **3.3.13**, `majra` **2.9.1**, `kavach` **3.13.1**, `ai-hwaccel` **2.4.0** (`path`
@@ -55,19 +86,15 @@ socket. Test for presence with `xstat`.
 at 1 req/s against a 4,096 cap (the default 100 req/s holds). Owed as roadmap **B4**, requested
 from majra.
 
-### Found by the 2.0.10 dependency review — not caused by it, not fixed here
+### Found by the 2.0.10 dependency review — not caused by it (status as of 2.1.0)
 
-- Delivered relay messages are never released (`relay_msg_release` exists since majra 2.9.0).
-- `ratelimit_stats` / `relay_stats` snapshots are never freed; the rate-limit one sits on the
-  sweep path (`src/server/rate_limit.cyr` sweep).
-- Process-backend tools inherit the server's stdin: `agnosai_kavach_build_config`
-  (`src/sandbox/kavach_bridge.cyr`) never sets `config_stdin`; since kavach 3.13.1 an empty
-  `config_stdin(c, "", 0)` would give them an empty stdin, as agnosai's own spawn path does.
-- Stale prose: `src/fleet/relay.cyr` still says the relay timestamp is monotonic and capacity is
-  ignored (majra fixed both in 2.6.5; `tests/fleet_relay.tcyr` asserts the fixed behaviour);
-  `src/llm/inference_queue.cyr` says `pq_enqueue` does not clamp negatives (it has since majra
-  2.6.2); line citations into `lib/majra.cyr`, `lib/bench.cyr` and `lib/bote-core.cyr` in
-  `benches/*.bcyr` and `src/server/routes/mcp.cyr` no longer point at the cited code.
+- ✅ **2.1.0:** `agnosai_relay_message_release` lets a subscriber drop a delivered message (refcounted since majra 2.9.0).
+- ✅ **2.1.0:** the `ratelimit_stats` / `relay_stats` snapshots are freed after reading.
+- ✅ **2.1.0:** process/OCI tools get an empty stdin (`config_stdin(c, "", 0)`) instead of the
+  server's.
+- ✅ **2.1.0:** the relay and `pq_enqueue` prose is corrected. Still open: ~100 `lib/<file>.cyr:NNN`
+  line citations in comments (into majra, bench, bote-core and others) rot with every dependency
+  bump and several no longer point at the cited code — citing function names would not.
 
 ## 2.0.6 — kept for the record
 
@@ -832,7 +859,7 @@ it was never invoked*.
 
 ## Version
 
-**2.0.10** (`VERSION`), cut 2026-09-26. **2.0.0** was cut 2026-08-14, the first Cyrius release. 1.1.0 was
+**2.1.0** (`VERSION`), cut 2026-09-26. **2.0.0** was cut 2026-08-14, the first Cyrius release. 1.1.0 was
 the last shipped Rust release and is preserved at `rust-old/` as the parity
 oracle. The rule held: VERSION bumped once parity landed, so the number always
 names something that actually shipped.

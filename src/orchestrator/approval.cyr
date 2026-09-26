@@ -233,10 +233,17 @@ fn agnosai_approval_request(g, task_id: Str): i64 {
     }
 
     # Capacity 1: a oneshot is a one-slot channel.
+    #
+    # A second request for a task still pending REPLACES the first. The earlier
+    # waiter sees its channel is no longer the registered one and rejects at
+    # once; the id is not pushed to the key mirror twice, which used to list it
+    # twice in `pending_tasks`. `map_set` stores the key pointer it is given, so
+    # the replacement hands it an owned clone as well.
+    var replacing = map_has(pending, task_id);
     var ch = chan_new(1);
     var key = str_clone(task_id);
     map_set(pending, key, ch);
-    vec_push(load64(g + AGN_AG_KEYS), key);
+    if (replacing == 0) { vec_push(load64(g + AGN_AG_KEYS), key); }
     mutex_unlock(mtx);
     _agnosai_approval_log(SK_DEBUG, "approval requested", 18, task_id);
     return ch;
@@ -314,20 +321,29 @@ fn agnosai_approval_wait_for_decision(g, ch, task_id: Str): i64 {
         var got = chan_try_recv(ch);
         if (got != 0) { return got - 1; }
 
-        # A cancelled gate closed the channel: nothing will ever arrive.
+        # Still registered under THIS channel? A cancelled gate removed the
+        # entry, and a newer request for the same task replaced it — either way
+        # nothing will arrive here. One last receive first, so a decision that
+        # was delivered in between is not lost.
         var mtx = load64(g + AGN_AG_MUTEX);
         mutex_lock(mtx);
-        var still_pending = map_has(load64(g + AGN_AG_PENDING), task_id);
+        var still_mine = 0;
+        if (map_get(load64(g + AGN_AG_PENDING), task_id) == ch) { still_mine = 1; }
         mutex_unlock(mtx);
-        if (still_pending == 0) {
+        if (still_mine == 0) {
+            var late = chan_try_recv(ch);
+            if (late != 0) { return late - 1; }
             _agnosai_approval_log(SK_WARN, "approval channel dropped, rejecting", 35, task_id);
             return AGNOSAI_APPROVAL_REJECTED;
         }
 
         if (clock_now_ns() >= deadline) {
             mutex_lock(mtx);
-            map_delete(load64(g + AGN_AG_PENDING), task_id);
-            _agnosai_approval_forget(g, task_id);
+            # Only this waiter's own registration — never a newer one's.
+            if (map_get(load64(g + AGN_AG_PENDING), task_id) == ch) {
+                map_delete(load64(g + AGN_AG_PENDING), task_id);
+                _agnosai_approval_forget(g, task_id);
+            }
             mutex_unlock(mtx);
             _agnosai_approval_log(SK_WARN, "approval timed out, rejecting", 29, task_id);
             return AGNOSAI_APPROVAL_REJECTED;

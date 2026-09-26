@@ -247,6 +247,19 @@ fn agnosai_wasm_module_len(m): i64 {
     return load64(m + AGN_WM_LEN);
 }
 
+# Remove a module's staged copy from `/tmp`. Every load writes one — wasmtime
+# runs the module from a path — and nothing removed them, so each load left a
+# file behind for good. Call this when a module is discarded; it is safe to call
+# twice. The module must not be executed afterwards.
+fn agnosai_wasm_module_free(m): i64 {
+    if (m == 0) { return 0; }
+    var path = load64(m + AGN_WM_PATH);
+    if (path == 0) { return 0; }
+    sys_unlink(str_cstr(path));
+    store64(m + AGN_WM_PATH, 0);
+    return 1;
+}
+
 # Classify a run that kavach reported — the oracle's `extract_exit_code`.
 #
 # ⚠ The guest's own exit code wins when it is one. wasmtime surfaces WASI
@@ -330,6 +343,17 @@ fn agnosai_wasm_execute(s, module, input: Str, out_err): i64 {
     # returned early and nothing downstream ever ran. Installing wasmtime is what
     # exposed it.
     _agnosai_kavach_ensure_init();
+
+    if (module == 0 || load64(module + AGN_WM_PATH) == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from("WASM module has been freed")));
+        return 0;
+    }
+
+    # kavach writes the guest's stdin through a pipe; a guest that exits without
+    # reading it makes that write raise SIGPIPE, whose default action kills this
+    # process. sandhi's serve loops ignore it, but this must not depend on
+    # running under one.
+    signal_ignore(Signal.SIGPIPE);
 
     if (agnosai_wasm_available() == 0) {
         store64(out_err, agnosai_error_sandbox(str_from(

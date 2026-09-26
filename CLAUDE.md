@@ -13,7 +13,7 @@
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (toolchain pinned in `cyrius.cyml [package].cyrius`)
 - **Version**: `VERSION` at the project root is the source of truth — do not inline the number here
-- **Rust reference**: 27,683 lines preserved at `rust-old/` (v1.1.0) — history only, **not a spec**
+- **Rust reference**: 27,683 lines preserved at `rust-old/` (v1.1.0) — history only, **not a spec**, and **scheduled for deletion in the release after 2.1.0** (the 2.1.0 audit found nothing that still depends on it; the deletion checklist is in `docs/development/roadmap.md`)
 
 ## Consumers
 
@@ -21,7 +21,7 @@ Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran
 
 ## The port
 
-Scaffolded with `cyrius port` on 2026-07-28 from `rust-old/`.
+Scaffolded with `cyrius port` on 2026-07-28 from `rust-old/`. After `rust-old/` is deleted its content stays reachable in git history (any tag up to 2.1.0).
 The plan of record is
 [`docs/development/cyrius-port-plan.md`](docs/development/cyrius-port-plan.md) —
 read it before starting any bite. Its blocker table is a **reasoning archive** —

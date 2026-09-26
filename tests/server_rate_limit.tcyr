@@ -72,6 +72,24 @@ fn _t_stats(): i64 {
     assert(agnosai_rate_limit_total_allowed(s) == 1, "one allowed");
     assert(agnosai_rate_limit_total_rejected(s) == 1, "one rejected");
     assert(agnosai_rate_limit_active_keys(s) == 1, "one active key");
+
+    # The stats accessors must hand majra's 32-byte snapshot back. The freelist is
+    # LIFO: free a block, read a stat, allocate again — the same block comes back
+    # only if the accessor returned the one it borrowed.
+    var p1 = fl_alloc(32);
+    fl_free(p1);
+    agnosai_rate_limit_total_allowed(s);
+    var p2 = fl_alloc(32);
+    assert(p2 == p1, "total_allowed frees its stats snapshot");
+    fl_free(p2);
+    agnosai_rate_limit_total_rejected(s);
+    var p3 = fl_alloc(32);
+    assert(p3 == p1, "total_rejected frees its stats snapshot");
+    fl_free(p3);
+    agnosai_rate_limit_active_keys(s);
+    var p4 = fl_alloc(32);
+    assert(p4 == p1, "active_keys allocates nothing");
+    fl_free(p4);
     return 0;
 }
 

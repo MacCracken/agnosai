@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-09-26
+
+`rust-old/` is **scheduled for deletion in the release after this one.** This release is the
+audit that decided it: every item and every `#[test]` in the Rust tree was read against the
+Cyrius tree. Every `.rs` file has a Cyrius counterpart and nothing outside `rust-old/` depends
+on it. The easy findings are fixed below, and each has a test that fails on the old code. The
+rest is roadmap B4–B15, with the deletion checklist beside them; every Rust spec stays reachable
+as `git show 2.1.0:rust-old/…`.
+
+### Security
+
+- **JSON routes answer 415 to a body that is not declared JSON.** `POST /api/v1/crews`,
+  `/api/v1/agents/definitions`, `/api/v1/approvals`, `/api/v1/a2a/receive` and `/mcp` never read
+  `Content-Type`. With auth off — the default — a cross-site `text/plain` POST, which needs no
+  CORS preflight, could start a crew. `application/json` and `+json` subtypes pass, parameters
+  and case are ignored, and a bodiless POST such as `cancel` needs no type. The check runs after
+  auth, so a bad token is still 401 first. New: `agnosai_content_type_is_json`,
+  `agnosai_route_dispatch_ct_a` (the old dispatch entry points treat the body as JSON, as before).
+- **Sandboxed process and OCI tools get an empty stdin, not the server's.** kavach reads a null
+  `config_stdin` as "inherit the parent's", so every tool read agnosai's own stdin — a terminal
+  or a supervisor's pipe — and one reading to EOF blocked on it.
+- **An IPC write to a departed peer no longer kills the process.** It was a plain `write(2)`, so
+  a closed peer raised SIGPIPE, whose default action is to terminate. It is now
+  `sendto(MSG_NOSIGNAL)` (falling back to `write` for a non-socket), and reads and writes retry
+  `EINTR`. Under the old code the new test dies with exit 141.
+- WASM execution ignores SIGPIPE, as the spawn path already did.
+
+### Fixed
+
+- **A query string no longer makes a route 404.** Routing compared the whole request target, so
+  `GET /health?probe=1` was a 404; the query is now cut off before routing.
+- **HEAD works on every GET route** — 200 with GET's headers and `Content-Length`, no body.
+  It was 405, which fails load balancers that health-check with `HEAD /health`.
+- **RFC 3339 timestamps apply their zone offset.** `02:00:00+02:00` parsed as `02:00:00Z`,
+  silently wrong by the offset; a malformed zone or trailing junk is now rejected.
+- **pub/sub and audit timestamps are wall-clock time.** Both stamped `clock_now_ns`
+  (CLOCK_MONOTONIC — time since boot) into fields documented as epoch time.
+- **The load tester bounds its requests.** A target that accepted and never answered hung a
+  worker forever; each request now has a 30 s budget. Pages over sandhi's 256 KiB default were
+  counted as failures; the cap is now 16 MiB. The per-request header set went on the no-free
+  global allocator — up to 100k a run — and now uses the worker's scratch arena. Completion
+  logs the throughput its comment promised.
+- **AGNOS tools report their own failure.** The detail went through one process-wide global, so
+  concurrent calls — up to 100 server workers — could swap each other's errors. It is now a
+  per-call out-parameter of the transport. Parse failures carry bayan's message, and path
+  segments are percent-encoded, so a `note_id` of `my note` asks for `/api/notes/my%20note`
+  instead of failing.
+- **UUID ids accept the simple, braced and `urn:uuid:` spellings** as well as the hyphenated one,
+  and all of them look up the same entity.
+- **MCP requires `"jsonrpc": "2.0"`**, as JSON-RPC 2.0 does; a request without it is 422.
+- **Re-requesting a pending approval replaces it cleanly.** It listed the task twice, and the
+  superseded waiter, at its timeout, deleted the newer registration. It now rejects at once and
+  leaves the new one alone.
+- **Leaks.** The rate-limit stats accessors dropped a 32-byte majra snapshot on every call, and
+  the pressure sweep calls them. The relay stats accessors dropped a 48-byte one. Every WASM
+  module load left a staged copy in `/tmp` — 56 had built up on the dev box — and
+  `agnosai_wasm_module_free` now removes it.
+
+### Added
+
+- `agnosai_relay_message_release` — delivered relay messages have been refcounted since majra
+  2.9.0, and a subscriber had no way to drop its reference.
+- `agnosai_wasm_module_free`, and an error rather than a crash if a freed module is executed.
+- `.dockerignore` — `COPY . .` was sending `rust-old/`, ~13 GB with its cargo `target/`, as
+  build context.
+- `examples/wasm-tools/hello-tool/`, the Rust tool-SDK example that
+  `docs/guides/adding-wasm-tools.md` already linked to, copied out of `rust-old/`.
+- `docs/guides/getting-started.md` rewritten for the Cyrius build (it was the scaffold stub),
+  and `docs/development/performance.md` rewritten for `cyrius bench` (it described
+  `cargo bench`).
+
+### Changed
+
+- Comments corrected where the dependency or the code had moved on: the relay timestamp and
+  capacity (fixed in majra 2.6.5), `pq_enqueue`'s clamp (majra 2.6.2), the stated reason bhava is
+  not ported (it is a missing Cyrius port, roadmap B5), the fleet hub banner, and the WASM
+  manager note.
+- `tests/server_auth_vectors.cyr` records the commit that holds the test signing key, which
+  lives only under `rust-old/`.
+- Tests: fleet behaviours the Rust suite asserted and no Cyrius suite did — capability matches
+  on two nodes and a second capability, Suspect nodes excluded, unregistering one of two, a
+  Draining node never placed, allocation moving to another device, device filters by type,
+  checkpoint values and the active run's identity, broadcast targets.
+
 ## [2.0.10] — 2026-09-26
 
 ### Changed

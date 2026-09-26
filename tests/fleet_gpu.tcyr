@@ -116,6 +116,16 @@ fn main(): i64 {
     assert_eq(vec_len(agnosai_compute_scheduler_allocations(s2)), 3,
       "and three allocations are tracked");
 
+    # --- allocate moves to another device once the first is depleted ----
+    # `_t_sched` is RTX 4090 (index 0, 24 GB) and A100 (index 1, 80 GB).
+    var sw = _t_sched();
+    var first = agnosai_compute_scheduler_allocate(sw, str_from("first"), 70000, AGNOSAI_ACCEL_ANY);
+    assert_eq(agnosai_compute_allocation_device_index(first), 1, "70 GB lands on the A100");
+    var second = agnosai_compute_scheduler_allocate(sw, str_from("second"), 20000, AGNOSAI_ACCEL_ANY);
+    assert(second != 0, "a 20 GB allocation still fits");
+    assert_eq(agnosai_compute_allocation_device_index(second), 0,
+      "and moves to the RTX 4090 once the A100 is depleted");
+
     # --- oracle: best_device_returns_correct ----------------------------
     var s3 = _t_sched();
     assert(str_eq_cstr(agnosai_fleet_gpu_device_name(
@@ -195,6 +205,12 @@ fn main(): i64 {
       "one TPU device");
     assert_eq(vec_len(agnosai_compute_scheduler_devices_of_type(mix, AGNOSAI_ACCEL_METAL)), 0,
       "no Metal device");
+    var cudas = agnosai_compute_scheduler_devices_of_type(mix, AGNOSAI_ACCEL_CUDA);
+    assert(str_eq_cstr(agnosai_fleet_gpu_device_name(vec_get(cudas, 0)), "A100") == 1,
+      "the CUDA filter returns the A100");
+    var tpus = agnosai_compute_scheduler_devices_of_type(mix, AGNOSAI_ACCEL_TPU);
+    assert(str_eq_cstr(agnosai_fleet_gpu_device_name(vec_get(tpus, 0)), "TPUv4") == 1,
+      "and the TPU filter returns the TPU");
 
     # --- oracle: allocate_on_specific_accelerator_type / allocate_tpu ---
     var tpu_alloc = agnosai_compute_scheduler_allocate(mix, str_from("tpu-task"), 1000,

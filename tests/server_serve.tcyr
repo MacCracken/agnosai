@@ -181,6 +181,7 @@ fn _t_method_mapping(): i64 {
 
     # An unmapped verb becomes a value no route registers, so the router answers
     # 405 (path known, method not) rather than dispatching anything.
+    assert(_agnosai_serve_method("HEAD") == AGNOSAI_METHOD_GET, "HEAD routes as GET");
     assert(_agnosai_serve_method("PUT") == 0, "PUT maps to no route method");
     assert(_agnosai_serve_method("PATCH") == 0, "PATCH likewise");
     assert(_agnosai_serve_method("get") == 0, "method matching is case-sensitive");
@@ -757,6 +758,49 @@ fn _t_handler_end_to_end(): i64 {
         "PUT /health HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
     assert(_t_starts_with(&out, n3, "HTTP/1.1 405 Method Not Allowed\r\n") == 1,
       "405 for a known path with an unmapped verb");
+
+    # HEAD is a GET with no body: same status and length, nothing after them.
+    var nh = _t_serve_over_pipe(str_from("HEAD /health HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, nh, "HTTP/1.1 200 OK\r\n") == 1, "HEAD /health is 200, not 405");
+    assert(_t_contains(&out, nh, "Content-Length:") == 1, "it carries the length GET would send");
+    assert(_t_contains(&out, nh, "\"status\"") == 0, "and no body");
+
+    # A query string does not change the route.
+    var nq = _t_serve_over_pipe(str_from(
+        "GET /health?probe=1 HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, nq, "HTTP/1.1 200 OK\r\n") == 1,
+      "a query string does not change the route");
+
+    # A JSON route refuses a body not declared JSON: 415. This is the guard that
+    # keeps a cross-site text/plain POST, which needs no CORS preflight, out.
+    var nt = _t_serve_over_pipe(str_from(
+        "POST /api/v1/crews HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{}"),
+      &out);
+    assert(_t_starts_with(&out, nt, "HTTP/1.1 415 Unsupported Media Type\r\n") == 1,
+      "a text/plain POST to a JSON route is 415");
+    var nn = _t_serve_over_pipe(str_from(
+        "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"), &out);
+    assert(_t_starts_with(&out, nn, "HTTP/1.1 415 ") == 1, "and so is one with no Content-Type");
+    var nj = _t_serve_over_pipe(str_from(
+        "POST /api/v1/crews HTTP/1.1\r\nHost: x\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 2\r\n\r\n{}"),
+      &out);
+    assert(nj > 0 && _t_starts_with(&out, nj, "HTTP/1.1 415 ") == 0,
+      "a JSON type with parameters reaches the handler");
+    var nc = _t_serve_over_pipe(str_from(
+        "POST /api/v1/crews/00000000-0000-4000-8000-000000000000/cancel HTTP/1.1\r\nHost: x\r\n\r\n"),
+      &out);
+    assert(nc > 0 && _t_starts_with(&out, nc, "HTTP/1.1 415 ") == 0,
+      "a POST that takes no body needs no Content-Type");
+
+    assert_eq(agnosai_content_type_is_json("application/json"), 1, "application/json is JSON");
+    assert_eq(agnosai_content_type_is_json("Application/JSON"), 1, "case-insensitively");
+    assert_eq(agnosai_content_type_is_json(" application/json ; charset=utf-8"), 1,
+      "ignoring parameters and whitespace");
+    assert_eq(agnosai_content_type_is_json("application/problem+json"), 1, "+json subtypes are JSON");
+    assert_eq(agnosai_content_type_is_json("text/plain"), 0, "text/plain is not");
+    assert_eq(agnosai_content_type_is_json("application/jsonx"), 0, "nor is a longer subtype");
+    assert_eq(agnosai_content_type_is_json("application/x-www-form-urlencoded"), 0, "nor a form");
+    assert_eq(agnosai_content_type_is_json(0), 0, "and an absent header is not");
 
     # A protected route reaches its handler when auth is not configured — the
     # oracle's default, and the case that proves the transport routes at all.

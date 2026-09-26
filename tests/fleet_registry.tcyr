@@ -155,6 +155,12 @@ fn main(): i64 {
       "unregister of an absent node reports failure");
     assert_eq(agnosai_node_registry_unregister(r5, str_from("never-existed")), 0,
       "unregister of a never-registered id reports failure");
+    var r5b = agnosai_node_registry_new();
+    var k1 = agnosai_node_registry_register(r5b, str_from("k1"), str_from("k1"), 0, 0, vec_new());
+    var k2 = agnosai_node_registry_register(r5b, str_from("k2"), str_from("k2"), 0, 0, vec_new());
+    agnosai_node_registry_unregister(r5b, k1);
+    assert_eq(agnosai_node_registry_count(r5b), 1, "unregistering one of two nodes leaves one");
+    assert(agnosai_node_registry_get(r5b, k2) != 0, "and it is the other node");
 
     # --- oracle: list_online_filters_correctly / count_and_count_online -
     var r6 = agnosai_node_registry_new();
@@ -198,6 +204,27 @@ fn main(): i64 {
     agnosai_node_info_with_status(agnosai_node_registry_get(r8, g1), AGNOSAI_NODE_OFFLINE);
     assert_eq(vec_len(agnosai_node_registry_find_by_capability(r8, str_from("inference"))), 0,
       "an Offline node keeps its capability list but is not dispatchable");
+
+    # A capability two nodes advertise matches both; a node's SECOND capability
+    # matches too — a scan of `caps[0]` alone, or one stopping at the first node,
+    # fails here.
+    var r8b = agnosai_node_registry_new();
+    var caps2 = vec_new();
+    vec_push(caps2, str_from("inference"));
+    vec_push(caps2, str_from("training"));
+    agnosai_node_registry_register(r8b, str_from("a"), str_from("a"), 0, 0, caps2);
+    agnosai_node_registry_register(r8b, str_from("b"), str_from("b"), 0, 0, _t_caps1("inference"));
+    assert_eq(vec_len(agnosai_node_registry_find_by_capability(r8b, str_from("inference"))), 2,
+      "a capability two nodes advertise matches both");
+    assert_eq(vec_len(agnosai_node_registry_find_by_capability(r8b, str_from("training"))), 1,
+      "a node's second capability matches");
+
+    # A Suspect node is not dispatchable either, not only an Offline one.
+    var r8c = agnosai_node_registry_new();
+    var sus = agnosai_node_registry_register(r8c, str_from("s"), str_from("s"), 0, 0, _t_caps1("inference"));
+    agnosai_node_info_with_status(agnosai_node_registry_get(r8c, sus), AGNOSAI_NODE_SUSPECT);
+    assert_eq(vec_len(agnosai_node_registry_find_by_capability(r8c, str_from("inference"))), 0,
+      "a Suspect node is excluded from capability matches");
 
     # --- past the oracle: a duplicated capability yields one hit --------
     # The oracle's `.any()` short-circuits; a naive loop that kept scanning

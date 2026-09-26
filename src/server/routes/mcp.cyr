@@ -524,8 +524,16 @@ fn agnosai_route_mcp_a(a, state, body: Str): i64 {
         return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
     }
 
+    # JSON-RPC 2.0 requires `"jsonrpc": "2.0"` exactly; a request without it, or
+    # naming another version, is not one this endpoint speaks.
+    var ver_v = bayan_json_v_obj_get(v, "jsonrpc");
     var method_v = bayan_json_v_obj_get(v, "method");
-    if (method_v == 0 || bayan_json_v_is_str(method_v) == 0) {
+    if (ver_v == 0 || bayan_json_v_is_str(ver_v) == 0 || method_v == 0
+      || bayan_json_v_is_str(method_v) == 0) {
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+          str_from_a(a, "body is not a valid JSON-RPC request"));
+    }
+    if (str_eq_cstr(bayan_json_v_str(ver_v), "2.0") == 0) {
         return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
           str_from_a(a, "body is not a valid JSON-RPC request"));
     }

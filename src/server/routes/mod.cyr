@@ -57,7 +57,7 @@
 # **Do not take this from `rust-old/Cargo.toml`**, which is 1.1.0 and frozen. The
 # oracle's `env!("CARGO_PKG_VERSION")` means "this package's version", and for the
 # port that is the root VERSION file.
-var AGNOSAI_VERSION = "2.0.10";
+var AGNOSAI_VERSION = "2.1.0";
 
 # --- Status codes sandhi does not define -----------------------------------
 #
@@ -73,6 +73,42 @@ var AGNOSAI_HTTP_CREATED = 201;
 # route expects. This is what axum's `Json<T>` extractor answers when serde
 # rejects a body, and three oracle tests assert it directly.
 var AGNOSAI_HTTP_UNPROCESSABLE = 422;
+
+# 415 Unsupported Media Type — a JSON route sent a body without a JSON
+# `Content-Type`. Refusing it is what keeps a cross-site browser form or
+# `text/plain` POST, which needs no CORS preflight, from reaching a JSON route:
+# with auth off, the default, that POST could otherwise start a crew.
+var AGNOSAI_HTTP_UNSUPPORTED_MEDIA_TYPE = 415;
+
+# Whether a `Content-Type` value names JSON: `application/json`, or any
+# `application/<subtype>+json`, case-insensitively, ignoring parameters such as
+# `; charset=utf-8` and surrounding whitespace. 0 (header absent) is not JSON.
+fn agnosai_content_type_is_json(ct): i64 {
+    if (ct == 0) { return 0; }
+    var n = strlen(ct);
+    var i = 0;
+    while (i < n && (load8(ct + i) == 32 || load8(ct + i) == 9)) { i = i + 1; }
+    var end = i;
+    while (end < n && load8(ct + end) != 59) { end = end + 1; }
+    while (end > i && (load8(ct + end - 1) == 32 || load8(ct + end - 1) == 9)) { end = end - 1; }
+    var len = end - i;
+    if (len < 16) { return 0; }
+    # "application/" (12 bytes), then either "json" or "<subtype>+json".
+    if (_agnosai_ct_eq_ci(ct + i, "application/", 12) == 0) { return 0; }
+    if (len == 16 && _agnosai_ct_eq_ci(ct + i + 12, "json", 4) == 1) { return 1; }
+    if (len > 17 && _agnosai_ct_eq_ci(ct + end - 5, "+json", 5) == 1) { return 1; }
+    return 0;
+}
+
+# ASCII case-insensitive compare of `n` bytes at `p` against lowercase `lit`.
+fn _agnosai_ct_eq_ci(p, lit, n): i64 {
+    for (var k = 0; k < n; k = k + 1) {
+        var c = load8(p + k);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c != load8(lit + k)) { return 0; }
+    }
+    return 1;
+}
 
 # --- Shared route vocabulary ------------------------------------------------
 #

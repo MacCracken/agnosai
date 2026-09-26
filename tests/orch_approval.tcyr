@@ -139,6 +139,24 @@ fn main() {
       AGNOSAI_APPROVAL_REJECTED,
       "a gate at capacity hands back 0, which waits to a rejection rather than crashing");
 
+    # --- a second request for a pending task replaces the first ---
+    var rg = agnosai_approval_gate_with_timeout(5000);
+    var rt = agnosai_uuid_v4_str();
+    var old_rx = agnosai_approval_request(rg, rt);
+    var new_rx = agnosai_approval_request(rg, rt);
+    assert_eq(vec_len(agnosai_approval_gate_pending_tasks(rg)), 1, "a re-requested task is listed once");
+    assert_eq(agnosai_approval_gate_pending_count(rg), 1, "and counted once");
+    var rt0 = clock_now_ns();
+    assert_eq(agnosai_approval_wait_for_decision(rg, old_rx, rt), AGNOSAI_APPROVAL_REJECTED,
+      "the superseded waiter is rejected");
+    assert((clock_now_ns() - rt0) < 1000000000, "at once, not after its 5 s timeout");
+    assert_eq(agnosai_approval_gate_pending_count(rg), 1,
+      "and it did not delete the newer registration on its way out");
+    assert_eq(agnosai_approval_submit_decision(rg, rt, AGNOSAI_APPROVAL_APPROVED), 1,
+      "which still receives the decision");
+    assert_eq(agnosai_approval_wait_for_decision(rg, new_rx, rt), AGNOSAI_APPROVAL_APPROVED,
+      "and its waiter reads it");
+
     # --- pending_tasks_lists_all ---
     var multi = agnosai_approval_gate_new();
     var a = agnosai_uuid_v4_str();

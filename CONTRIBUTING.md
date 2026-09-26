@@ -3,7 +3,7 @@
 ## Getting Started
 
 ⚠ **AgnosAI is a Cyrius project.** There is no `Cargo.toml` and no `Makefile` —
-the Rust tree is frozen at `rust-old/` as the parity oracle and is never built.
+the Rust tree is frozen at `rust-old/` (history, scheduled for deletion) and is never built.
 This section previously said `cargo build` / `cargo test` / `make check`; none of
 those exist, and following them left a contributor unable to build at all.
 

@@ -244,6 +244,8 @@ fn _agnosai_serve_method(m): i64 {
     if (streq(m, "GET") == 1) { return AGNOSAI_METHOD_GET; }
     if (streq(m, "POST") == 1) { return AGNOSAI_METHOD_POST; }
     if (streq(m, "DELETE") == 1) { return AGNOSAI_METHOD_DELETE; }
+    # HEAD routes as GET; the response is sent without its body.
+    if (streq(m, "HEAD") == 1) { return AGNOSAI_METHOD_GET; }
     return 0;
 }
 
@@ -412,18 +414,21 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
     # including `/health`. Found while mounting it by default.
     var xff = 0;
     var xri = 0;
+    var ctype = 0;
     if (a != 0) {
         method_s = sandhi_server_get_method_a(a, buf, blen);
         path_s = sandhi_server_get_path_a(a, buf, blen);
         auth = sandhi_server_find_header_a(a, buf, blen, "Authorization");
         xff = sandhi_server_find_header_a(a, buf, blen, "X-Forwarded-For");
         xri = sandhi_server_find_header_a(a, buf, blen, "X-Real-IP");
+        ctype = sandhi_server_find_header_a(a, buf, blen, "Content-Type");
     } else {
         method_s = sandhi_server_get_method(buf, blen);
         path_s = sandhi_server_get_path(buf, blen);
         auth = sandhi_server_find_header(buf, blen, "Authorization");
         xff = sandhi_server_find_header(buf, blen, "X-Forwarded-For");
         xri = sandhi_server_find_header(buf, blen, "X-Real-IP");
+        ctype = sandhi_server_find_header(buf, blen, "Content-Type");
     }
 
     # **sandhi's accessors return NUL-terminated cstrings, not `Str`.** Passing
@@ -431,10 +436,16 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
     # silently answers "no method" and `str_len(path)` returns garbage, so every
     # request 404s or faults. `str_from_a` wraps without copying the bytes.
     var method = _agnosai_serve_method(method_s);
+    var head_only = 0;
+    if (method_s != 0 && streq(method_s, "HEAD") == 1) { head_only = 1; }
     var path = str_from("/");
     if (path_s != 0) {
         if (a != 0) { path = str_from_a(a, path_s); } else { path = str_from(path_s); }
     }
+    # Route on the path alone. sandhi hands back the whole request target, so a
+    # query string was part of every segment compare and `GET /health?x=1` was a
+    # 404. The query is not read by any route, so it is simply cut off.
+    path = _agnosai_serve_strip_query(a, path);
 
     # The body Str is a {ptr,len} over sandhi's request buffer — no copy of the
     # bytes either way, and with the arena the descriptor lands there too.
@@ -500,7 +511,7 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
     # 404 even when auth is off, and a known path with bad credentials is 401
     # before any handler runs. Reproducing that ordering here rather than
     # short-circuiting on the path string is what keeps the two paths agreeing.
-    if (method == AGNOSAI_METHOD_GET) {
+    if (method == AGNOSAI_METHOD_GET && head_only == 0) {
         var sm = agnosai_route_resolve(method, path);
         if (agnosai_route_match_id(sm) == AGN_ROUTE_CREW_STREAM) {
             var ok = 1;
@@ -520,7 +531,7 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
             if (stream_id == 0) {
                 _agnosai_serve_send(a, cfd,
                   agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-                    str_from("crew id is not a valid UUID")));
+                    str_from("crew id is not a valid UUID")), 0);
                 ok = 0;
             }
             if (ok == 1) { if (agnosai_route_needs_auth(AGN_ROUTE_CREW_STREAM) == 1) {
@@ -528,7 +539,7 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
                       agnosai_app_state_auth(_agnosai_serve_state), has_auth, auth_str);
                     if (st != HTTP_OK) {
                         _agnosai_serve_send(a, cfd,
-                          agnosai_route_error(st, str_from("unauthorized")));
+                          agnosai_route_error(st, str_from("unauthorized")), 0);
                         ok = 0;
                     }
                 } }
@@ -539,8 +550,8 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
         }
     }
 
-    var resp = agnosai_route_dispatch_a(a, _agnosai_serve_state, method, path,
-      auth_str, has_auth, body);
+    var resp = agnosai_route_dispatch_ct_a(a, _agnosai_serve_state, method, path,
+      auth_str, has_auth, body, agnosai_content_type_is_json(ctype));
 
     # The a2a callback, on the success path only — the oracle spawns it inside
     # the `Ok(crew_state)` arm.
@@ -550,12 +561,15 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
         }
     }
 
-    _agnosai_serve_send(a, cfd, resp);
+    _agnosai_serve_send(a, cfd, resp, head_only);
     return 0;
 }
 
-# Write a response, `_a` where the arena exists.
-fn _agnosai_serve_send(a, cfd, resp): i64 {
+# Write a response, `_a` where the arena exists. `head_only` is 1 for a HEAD
+# request: the same status line and headers, `Content-Length` included, and no
+# body — so `HEAD /health`, which load balancers commonly probe with, is a 200
+# rather than the 405 it used to be.
+fn _agnosai_serve_send(a, cfd, resp, head_only): i64 {
     var status = agnosai_route_status(resp);
     var body = agnosai_route_body(resp);
 
@@ -581,6 +595,23 @@ fn _agnosai_serve_send(a, cfd, resp): i64 {
         }
     }
 
+    if (head_only == 1) {
+        var al = a;
+        if (al == 0) { al = default_alloc(); }
+        var hb = str_builder_new_a(al);
+        str_builder_add_cstr_a(al, hb, "HTTP/1.1 ");
+        str_builder_add_int_a(al, hb, status);
+        str_builder_add_cstr_a(al, hb, " ");
+        str_builder_add_cstr_a(al, hb, _agnosai_serve_reason(status));
+        str_builder_add_cstr_a(al, hb, "\r\nContent-Type: ");
+        str_builder_add_cstr_a(al, hb, ctype);
+        str_builder_add_cstr_a(al, hb, "\r\nContent-Length: ");
+        str_builder_add_int_a(al, hb, str_len(text));
+        str_builder_add_cstr_a(al, hb, "\r\nConnection: close\r\n\r\n");
+        var head = str_builder_build_a(al, hb);
+        sock_send(cfd, str_data(head), str_len(head));
+        return 0;
+    }
     if (a != 0) {
         return sandhi_server_send_response_a(a, cfd, status,
           _agnosai_serve_reason(status), ctype, str_data(text), str_len(text), 0);
@@ -607,6 +638,20 @@ fn _agnosai_serve_send_status(a, cfd, code, msg): i64 {
 }
 
 # The reason phrase for each status this server emits.
+# `path` up to its first `?` — a borrowed view, no copy. A path with no query
+# comes back as is.
+fn _agnosai_serve_strip_query(a, path: Str): Str {
+    var p = str_data(path);
+    var n = str_len(path);
+    for (var i = 0; i < n; i = i + 1) {
+        if (load8(p + i) == 63) {
+            if (a != 0) { return str_new_a(a, p, i); }
+            return str_new(p, i);
+        }
+    }
+    return path;
+}
+
 fn _agnosai_serve_reason(status): i64 {
     if (status == HTTP_OK) { return "OK"; }
     if (status == AGNOSAI_HTTP_CREATED) { return "Created"; }
@@ -616,6 +661,7 @@ fn _agnosai_serve_reason(status): i64 {
     if (status == HTTP_NOT_FOUND) { return "Not Found"; }
     if (status == HTTP_METHOD_NOT_ALLOWED) { return "Method Not Allowed"; }
     if (status == HTTP_PAYLOAD_TOO_LARGE) { return "Payload Too Large"; }
+    if (status == AGNOSAI_HTTP_UNSUPPORTED_MEDIA_TYPE) { return "Unsupported Media Type"; }
     if (status == AGNOSAI_HTTP_UNPROCESSABLE) { return "Unprocessable Entity"; }
     if (status == AGNOSAI_HTTP_TOO_MANY_REQUESTS) { return "Too Many Requests"; }
     if (status == HTTP_NOT_IMPLEMENTED) { return "Not Implemented"; }  #skip-lint: status

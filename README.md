@@ -5,7 +5,8 @@ Cyrius-native agent orchestration engine. Multi-agent crews with task DAGs, LLM 
 AgnosAI replaces Python/CrewAI orchestration with a compiled Cyrius binary -- real OS threads, no GIL, predictable performance. Use it standalone or as the core engine inside [Agnostic](https://github.com/maccracken/agnostic).
 
 > **This is a Cyrius project.** It began as Rust; that tree is frozen at
-> `rust-old/` and serves only as the parity oracle the port is checked against.
+> `rust-old/` as history, not a spec, and is **scheduled for deletion in the
+> release after 2.1.0** — the 2.1.0 audit found nothing that still depends on it.
 > Nothing under `rust-old/` is built or shipped.
 
 ## Why
@@ -37,7 +38,7 @@ agnosai
 ├── benches/              Benchmarks — flat *.bcyr, discovery is NOT recursive
 ├── tests/                Test suites — *.tcyr, discovered recursively
 ├── examples/             Runnable examples — *.cyr, built by CI
-├── rust-old/             The frozen Rust v1.1.0 tree, kept as the parity oracle
+├── rust-old/             The frozen Rust v1.1.0 tree — scheduled for deletion
 └── docs/                 Guides, ADRs, architecture docs
 ```
 
@@ -234,10 +235,10 @@ agent scoring, priority scheduling, pub/sub, IPC, LLM provider routing, the tool
 registry, API routes, the WASM and process sandboxes, and a deterministic parser
 fuzz sweep.
 
-The parity bar is the frozen Rust tree at [`rust-old/`](rust-old/), which carries
-**863** test functions across 84 modules; the Cyrius suites are organised
-differently and go past it in several places — see
-[`docs/development/roadmap.md`](docs/development/roadmap.md).
+The Rust tree this started from (`rust-old/`, scheduled for deletion) carried
+**863** test functions across 84 modules; the 2.1.0 audit checked every one against
+the Cyrius suites, which are organised differently and go past it in several places —
+see [`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 ## Documentation
 

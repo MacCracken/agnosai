@@ -173,11 +173,11 @@ fn agnosai_inference_queue_cpq(q): i64 {
 # silently break the first time either side inserts a level. The oracle writes
 # an explicit five-arm `match` and so does this.
 #
-# The ladder is also the bounds check. majra's `pq_enqueue` clamps
-# `pri >= NUM_PRIORITIES` to Normal but does **not** clamp negatives, so a -1
-# reaches `load64(pq + pri * 8)` and reads eight bytes before the queue. Nothing
-# here can emit one: every arm returns a named constant and the fallthrough is
-# Normal, which is also what majra's own clamp picks for an over-range value.
+# The ladder is also a bounds check of its own: every arm returns a named
+# constant and the fallthrough is Normal, so nothing here can emit an
+# out-of-range priority. majra's `pq_enqueue` clamps both ends too (the lower
+# one since majra 2.6.2 — a negative priority used to read before the queue),
+# which makes this defence in depth rather than the only guard.
 fn agnosai_map_priority(task_priority): i64 {
     if (task_priority == AGNOSAI_PRIORITY_BACKGROUND) { return PRIORITY_BACKGROUND; }
     if (task_priority == AGNOSAI_PRIORITY_LOW) { return PRIORITY_LOW; }

@@ -382,6 +382,7 @@ fn main(): i64 {
         assert_eq(agnosai_wasm_result_exit_code(rr), 0,
           "and the guest exited 0, so wasmtime accepted kavach's argv");
         sys_unlink(str_data(rp));
+        agnosai_wasm_module_free(rm);
 
         # ⚠ **stdin must reach the guest, and stdout must come back.** The nop
         # above proves only that wasmtime ran; these are the two behaviours the
@@ -406,6 +407,7 @@ fn main(): i64 {
         assert(str_eq(got, payload) == 1,
           "and it is exactly what was written to STDIN — proving config_stdin reaches the guest");
         sys_unlink(str_data(ep));
+        agnosai_wasm_module_free(em);
 
         # ⚠ **The FUEL ceiling must reach wasmtime too, and until kavach 3.11.11
         # there was no way to send it.** `agnosai_wasm_sandbox_fuel` reported the
@@ -419,13 +421,14 @@ fn main(): i64 {
         var starved = agnosai_wasm_sandbox_with_limits(67108864, 10000);
         agnosai_wasm_sandbox_set_fuel(starved, 1);
         assert_eq(agnosai_wasm_sandbox_fuel(starved), 1, "the sandbox carries a budget of 1");
-        var fm = agnosai_wasm_load_module_from_file(starved, fp, &err);
-        assert_neq(fm, 0, "it loads");
-        var fr = agnosai_wasm_execute(starved, fm, str_from("{}"), &err);
+        var fum = agnosai_wasm_load_module_from_file(starved, fp, &err);
+        assert_neq(fum, 0, "it loads");
+        var fr = agnosai_wasm_execute(starved, fum, str_from("{}"), &err);
         assert_neq(fr, 0, "and execute returns a result");
         assert_neq(agnosai_wasm_result_exit_code(fr), 0,
           "and the guest was STARVED — a 0 here means the fuel never reached wasmtime");
         sys_unlink(str_data(fp));
+        agnosai_wasm_module_free(fum);
 
         # ⚠ **The memory ceiling must actually REACH wasmtime.** Until
         # 2026-08-11 `agnosai_wasm_execute` sent no policy, kavach's
@@ -449,11 +452,20 @@ fn main(): i64 {
         assert_neq(agnosai_wasm_result_exit_code(tr), 0,
           "and the guest was REFUSED — a 0 here means the ceiling never reached wasmtime");
         sys_unlink(str_data(mp));
+        agnosai_wasm_module_free(tm);
     }
 
+    # --- freeing a module removes its staged copy ---
+    var mstaged = agnosai_wasm_module_path(m);
+    assert_eq(agnosai_wasm_module_free(m), 1, "a module can be freed");
+    assert_eq(file_exists(str_data(mstaged)), 0, "which removes its staged copy from /tmp");
+    assert_eq(agnosai_wasm_module_free(m), 0, "a second free is a no-op");
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_execute(s, m, str_from(""), &err), 0, "a freed module does not execute");
+    assert_neq(load64(&err), 0, "and says why");
+
     # --- teardown -----------------------------------------------------------
-    sys_unlink(str_data(agnosai_wasm_module_path(m)));
-    sys_unlink(str_data(agnosai_wasm_module_path(fm)));
+    agnosai_wasm_module_free(fm);
     sys_unlink(str_data(good_path));
     sys_unlink(str_data(bad_path));
     sys_rmdir(_T_ROOT);

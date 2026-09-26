@@ -223,6 +223,15 @@ fn main() {
     assert_eq(agnosai_ipc_last_error(), 0,
       "and clears the error left by the failures above rather than leaving it to be misread");
 
+    # --- writing to a closed peer is an error, not a SIGPIPE ---
+    # Under a plain write(2) this killed the suite with SIGPIPE (exit 141).
+    var gone[8];
+    assert(_t_pair(&gone) == 1, "a socketpair opens");
+    sys_close(_t_fd1(&gone));
+    assert_eq(_t_send_json(_t_fd0(&gone), "{\"x\":1}"), AGNOSAI_IPC_ERR,
+      "sending to a closed peer fails cleanly instead of killing the process");
+    sys_close(_t_fd0(&gone));
+
     # --- server_bind_and_client_connect ---
     # The only path socketpair cannot stand in for: a real socket file, a real
     # accept, and majra's sockaddr_un handling underneath.

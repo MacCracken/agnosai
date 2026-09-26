@@ -150,6 +150,26 @@ fn main(): i64 {
     assert(got != 0, "the subscriber receives the sent message");
     assert_eq(agnosai_relay_message_seq(got), 1, "with its sequence");
     assert(str_eq_cstr(agnosai_relay_message_topic(got), "evt") == 1, "and its topic");
+    assert_eq(agnosai_relay_message_release(got), 0,
+      "the only subscriber's release frees the delivered message");
+    agnosai_relay_broadcast(rsub, str_from("ann"), 0);
+    var bc = chan_recv(ch);
+    assert_eq(str_len(agnosai_relay_message_to(bc)), 0,
+      "a broadcast reaches subscribers with an empty target");
+    agnosai_relay_message_release(bc);
+
+    # majra's stats snapshot is handed back, not leaked: the freelist is LIFO, so
+    # the same 48-byte block returns only if the accessor freed the one it took.
+    var q1 = fl_alloc(48);
+    fl_free(q1);
+    agnosai_relay_sequence_gaps(rsub);
+    var q2 = fl_alloc(48);
+    assert(q2 == q1, "sequence_gaps frees majra's stats snapshot");
+    fl_free(q2);
+    agnosai_relay_stats(rsub);
+    var q3 = fl_alloc(48);
+    assert(q3 == q1, "relay_stats frees majra's stats snapshot");
+    fl_free(q3);
 
     # An inbound message accepted by receive also fans out to subscribers.
     agnosai_relay_receive(rsub, _t_msg(1, "node-2", "", "inbound"));
