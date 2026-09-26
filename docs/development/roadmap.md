@@ -80,7 +80,7 @@ every benchmark, every build target. **Wire parity is the bar**, judged against
 the Cyrius tree — seven module groups plus everything outside `src/`. Every `.rs` file has a
 Cyrius counterpart; nothing outside `rust-old/` reads it at build, test, bench, fuzz or release
 time. What it found that was easy is fixed in 2.1.0 (see the CHANGELOG); the rest is owed work
-**B4–B15** under *Owed work* below. Every Rust spec stays reachable after deletion:
+**B4–B16** under *Owed work* below. Every Rust spec stays reachable after deletion:
 `git show 2.1.0:rust-old/src/<path>`.
 
 - [ ] `git rm -r rust-old`, then delete the ignored `rust-old/target/` (~13 GB) from disk — `git
@@ -1309,7 +1309,8 @@ A2 (the `main` bind) are in *Recently closed*.
 | B12 | **Behaviours no suite asserts yet** | Easy each | Orchestrator: diamond DAGs (sort, ready set, a run), parallel/DAG `task_ms`, `task_completed` events, event-bus delivery, the cancel audit entry, per-task audit level, a 64 KiB+ IPC echo. Core: `Cpu` → `"cpu"`, multi-device filtering and sums, a negative non-zero cost. Sandbox: real fuel exhaustion (-2), a real timeout, empty stdin to a reading guest, the Python bridge's `"error": null`. Tools: AGNOS schema names/descriptions/parameter types and missing-parameter errors. Server: output-filter pattern text, `http://[::1]:8080`, the echo tool's parameter type. |
 | B13 | **Network-facing tools** | Medium | The load tester has no connection pool (every request is a fresh handshake); its success path and the security audit's live sequence have no test, since no suite stands up a loopback server. |
 | B14 | **Seven benchmarks** | Easy–medium | The sandbox execute path (process argv, stdin, shell; WASM hello) and `audit_recent(10/100/1000)`. |
-| B15 | **Smaller gaps** | Easy each | Output-filter leak detection folds ASCII case only; a pub/sub subscriber cannot detach alone (only `unsubscribe_all(pattern)`); `StateStore` (pluggable persistence) is not ported; `strcase` is ASCII-only though the crew assembler matches user-supplied names. Upstream, each needing your OK to raise: YAML beyond bayan's subset, kavach's WASM limits, sigil keys over 4096 bits, sandhi chunked bodies. |
+| B15 | **Smaller gaps** | Easy each | Output-filter leak detection folds ASCII case only; a pub/sub subscriber cannot detach alone (only `unsubscribe_all(pattern)`); `StateStore` (pluggable persistence) is not ported; `strcase` is ASCII-only though the crew assembler matches user-supplied names. |
+| B16 | **Upstream gaps — noted, NOT raised** | — | ⛔ **Do not raise any of these until agnosai is on the latest version of that project**, then re-check the gap against that version first. bayan, sigil and sandhi are cyrius stdlib folds: agnosai takes the version the pinned cyrius folds, and their newer releases wait for the next cyrius fold (not 6.6.6). **bayan** (fold 1.5.6) — YAML beyond the subset parser: block scalars, flow mappings, anchors, tags, escape decoding in quoted strings. **sigil** (fold 3.12.18) — RSA keys over 4096 bits (a certificate-format key is agnosai's own to fix, B8). **sandhi** (fold 1.9.17) — decoding chunked request bodies. **kavach** (3.13.1, a direct dep) — WASM store limits (instance/table/memory caps, trap on a failed grow) and guest stdin over 64 KiB. |
 
 ### Recently closed
 

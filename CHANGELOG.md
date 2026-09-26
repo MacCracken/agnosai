@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 audit that decided it: every item and every `#[test]` in the Rust tree was read against the
 Cyrius tree. Every `.rs` file has a Cyrius counterpart and nothing outside `rust-old/` depends
 on it. The easy findings are fixed below, and each has a test that fails on the old code. The
-rest is roadmap B4–B15, with the deletion checklist beside them; every Rust spec stays reachable
+rest is roadmap B4–B16, with the deletion checklist beside them; every Rust spec stays reachable
 as `git show 2.1.0:rust-old/…`.
 
 ### Security

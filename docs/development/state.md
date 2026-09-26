@@ -24,7 +24,7 @@ Seven read-only audits compared every item and every `#[test]` in `rust-old/` wi
 tree: orchestrator, server, fleet, tools, core + llm + telemetry, sandbox + definitions +
 learning, and everything outside `src/`. Every `.rs` file has a counterpart, and nothing outside
 `rust-old/` reads it. **It is scheduled for deletion in the next release**; the checklist and
-the remaining findings (B4–B15) are in [`roadmap.md`](roadmap.md). The easy findings were fixed
+the remaining findings (B4–B16) are in [`roadmap.md`](roadmap.md). The easy findings were fixed
 here, each with a test that fails on the old code — see the CHANGELOG.
 
 **Measured, not assumed:**
