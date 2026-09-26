@@ -1,7 +1,7 @@
 # =========================================================================
 # fleet/cost_planning — cost-aware crew planning and model selection.
 #
-# Parity oracle: rust-old/src/fleet/cost_planning.rs
+# Origin: rust-old/src/fleet/cost_planning.rs
 #
 # GPU pricing tables, crew cost estimation, and budget-aware model selection,
 # so callers can plan crew executions within a dollar budget.
@@ -159,12 +159,16 @@ fn agnosai_gpu_pricing_display(p): i64 {
 # per-fn stack budget, so the compiler keeps it in a shared global rather than
 # per-thread", making it a race under `run_pooled`. **That is false.** The
 # budget is 15,360 frame slots — 122,880 bytes, counted cumulatively per
-# function (`cyrius/src/frontend/parse_decl.cyr:89`), verified by bisection:
-# 122,864 B stays on the stack, 122,872 B relocates. A `var buf[256]` is 32
-# slots, a 480x margin. The claim came from misreading the build's two
-# `oversized array local` notes, which carry NO file:line and originate in
-# `lib/sigil.cyr`'s `argon2_hash_into` and `hash_file_into` — neither of which
-# agnosai calls. Recorded because the wrong version was persuasive.
+# function (`cyrius/src/frontend/parse_decl.cyr:122` at 6.6.6), verified by
+# bisection on 6.6.6: 122,864 B stays on the stack, 122,872 B relocates. A
+# `var buf[256]` is 32 slots, a 480x margin. The claim came from misreading the
+# build's `oversized array local` notes, which through 6.6.4 carried NO
+# file:line. From 6.6.5 the diagnostic is a `warning:` that names the
+# declaration — "array local over the per-fn frame budget gets STATIC storage:
+# one buffer shared by all calls and all threads". On 6.6.6 the build emits
+# exactly one, from `lib/sigil.cyr`'s `hash_file_into`, which banks that buffer
+# deliberately and which agnosai does not call. Recorded because the wrong
+# version was persuasive.
 fn _agnosai_contains_ci(hay, needle_cstr): i64 {
     return agnosai_str_contains_ci_cstr(hay, needle_cstr);
 }

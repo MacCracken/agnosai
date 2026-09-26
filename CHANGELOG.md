@@ -7,6 +7,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.10] — 2026-09-26
+
+### Changed
+
+- **Toolchain `6.6.2` → `6.6.6`, and all six dependency pins.** A dependency that is folded
+  into the cyrius stdlib is pinned to exactly the version the new toolchain folds — never to a
+  newer tag that has not been folded yet. sigil's repo is at 3.13.2; 6.6.6 folds **3.12.18**,
+  so that is the pin (and `dist/sigil.cyr` at 3.12.18 is byte-identical to 6.6.6's
+  `lib/sigil.cyr`).
+
+  | dep | was | now | |
+  |---|---|---|---|
+  | cyrius | 6.6.2 | **6.6.6** | |
+  | sigil | 3.12.16 | **3.12.18** | = the 6.6.6 fold |
+  | bote | 3.3.8 | **3.3.13** | |
+  | majra | 2.7.2 | **2.9.1** | |
+  | kavach | 3.12.5 | **3.13.1** | |
+  | ai-hwaccel | 2.3.22 | **2.4.0** | `path` commented out — see below |
+  | tyche | 1.0.1 | **1.1.0** | |
+
+  Arriving with the toolchain rather than declared: sandhi 1.9.16 → 1.9.17, sakshi 2.5.1 →
+  2.5.2, patra 1.14.1 → 1.14.3, bayan 1.5.5 → 1.5.6, sankoch 2.7.14 → 2.8.0; transitively
+  through bote, libro 2.10.0 → 2.10.3.
+
+  **Verified rather than assumed:** every vendored bundle hashes identical to its pinned tag's
+  `dist/` (all eight: the six above plus libro and patra); `lib/` matches the 6.6.6 snapshot
+  111/111; the installed snapshot matches the cyrius `6.6.6` tag 111/111; and a resolve that
+  takes every dependency from `git` + `tag` into an empty `lib/` — what CI does — produces
+  the same 117 file hashes as the local one. The local `../patra` checkout is at 1.15.0, which
+  6.6.6 has not folded; the resolver refused it ("refusing to overwrite stdlib leaf 'patra'")
+  and kept the fold's 1.14.3.
+
+- **`[deps.ai-hwaccel]`'s `path` is commented out.** `../ai-hwaccel` sits one commit past its
+  2.4.0 tag — a docs cleanup that changes only comments in `dist/ai-hwaccel.cyr` — and a local
+  `path` beats the tag, so a local build would have compiled untagged bytes while CI compiled
+  2.4.0. It now resolves from `git` + `tag` like sigil and kavach. Uncomment it once the sibling
+  is back on a tag. (The same override had been compiling 2.3.23's bytes against the 2.3.22 pin,
+  and tyche 1.0.2's against 1.0.1 — both banner-only differences.)
+
+- **Sandboxed tools run under a stricter kavach.** Both fail closed and both apply to the
+  process/OCI backends through `policy_basic()` and to cx guests: from kavach 3.12.8 a 32-bit or
+  x32 syscall under a kavach seccomp filter kills the process, and from 3.12.9 `clone` with any
+  `CLONE_NEW*` flag and the new mount API are killed and `clone3` returns `ENOSYS` — a tool that
+  creates namespaces (a nested container runtime, `bwrap`, `unshare`) now dies with SIGSYS. cx
+  guests no longer inherit agnosai's descriptors ≥ 3, and `sandbox_exec` no longer skips its
+  output scan on a stale flag.
+
+- **ai-hwaccel 2.4.0 changes what `agnosai_hw_inventory_detect` reports** — a GPU listed by both
+  Vulkan and CUDA/ROCm/Metal appears once, a software Vulkan device (lavapipe) is no longer a
+  GPU, and integrated-GPU memory is real and shared. Nothing in this tree calls it; it is
+  exported for consumers of `dist/agnosai.cyr`.
+
+- **Durable state keeps an operator's file mode.** cyrius 6.6.6's `file_write_atomic` carries an
+  existing file's permission bits across the replace. Measured with a write → chmod 0600 →
+  rewrite → restart → read-back probe on both toolchains: 6.6.2 re-widened the snapshot to 0644
+  on the next save; 6.6.6 keeps 0600. The default path is unchanged (file 644, state directory
+  755, read-back intact).
+
+- **`ipc_bind` no longer deletes whatever is at the socket path** (majra 2.8.1). A regular file
+  is refused, not unlinked, and so is a socket a live server is still accepting on — a second
+  instance can no longer silently take over a running server's clients. Only a provably stale
+  socket (one that refuses a connect) is removed. agnosai keeps this; `tests/orch_ipc.tcyr` now
+  pins both refusals and checks that the file and the live socket survive (47 → 52 assertions).
+  ⚠ `file_exists` cannot see a Unix socket — it `open`s the path, which fails with ENXIO — so
+  the test checks presence with `xstat`.
+
+- **The rate-limit key cap is now bounded by time, not by count, under a strict rate.** majra
+  2.8.1's `ratelimit_evict_stale` skips any bucket that has not refilled to burst, so agnosai's
+  zero-threshold pressure sweep no longer evicts a key sprayed within the last 1/rate seconds.
+  Measured with a 200,000-fresh-key spray through agnosai's limiter: at the default 100 req/s
+  the peak held at **4,352** (as on majra 2.7.2); at 1 req/s it reached **72,447** (4,352 on
+  2.7.2). Memory stays bounded — by one refill interval of keys. majra's sweep is also ~115×
+  cheaper under that spray (it no longer allocates, and compacts tombstones). majra has no call
+  that evicts regardless of fill; one is requested in majra's
+  `docs/development/issues/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md`, with a
+  repro run on both tags. Roadmap **B4** adopts it when it ships; `src/server/rate_limit.cyr`
+  and ADR 021 state the current bound.
+
+- **Child processes the dependencies spawn now die with agnosai.** 6.6.6's `lib/process.cyr`
+  sets `PR_SET_PDEATHSIG = SIGKILL` in every child it forks for kavach, ai-hwaccel and sigil
+  (the background-spawn verb, whose contract is to outlive its caller, excepted).
+
+- **Benchmark min/max mean something different from this release on.** 6.6.6's `lib/bench.cyr`
+  takes min/max only from windows at least 100× the clock's worst-case error (otherwise they
+  report the mean) and accounts in picoseconds, so averages move by up to ~1 ns. Compare
+  2.0.10+ rows' min/max with earlier rows' only with that in mind.
+
+- **CLAUDE.md no longer makes Rust parity a correctness bar.** `rust-old/` is history, not a
+  spec: when the Cyrius code or a dependency does it better, the better code stays, and a
+  Rust flaw is never copied forward. The `# Parity oracle:` header in 97 `src/` files is now
+  `# Origin:` — a pointer to where a module came from, nothing more.
+
+### Fixed
+
+- **agnosai's Unix-socket IPC now works on aarch64.** majra 2.7.2 issued a raw x86 `fchmod`
+  (91), which aarch64 Linux runs as `capset(2)`; the bind failed closed and IPC could not bind
+  on that arch at all. majra 2.9.1 uses the per-arch `sys_fchmod`. Verified under
+  `qemu-aarch64`: `tests/orch_ipc.tcyr` fails "binding a Unix socket succeeds" and then SIGSEGVs
+  on the 6.6.2 baseline, and passes 47/0 on this release; `orch_durable_state` passes on both.
+- **Three comment lines the 6.6.5 cyrlint reads as untracked deferrals** now carry `#skip-lint`:
+  6.6.5's cyrlint joins a phrase wrapped across comment lines and folds case, so it matched
+  prose the 6.6.2 linter never saw. All three are prose, not deferrals —
+  `src/server/auth.cyr:425` (the wait-for-a-third-instance rule), `src/tools/mod.cyr:39`
+  (quotes retired text), `benches/core.bcyr:384`.
+- **`src/fleet/cost_planning.cyr`'s note on the frame budget** described the pre-6.6.5
+  `oversized array local` note, which carried no file:line, and cited `parse_decl.cyr:89`. It
+  now cites `:122` and describes 6.6.5's located `warning:`; the 122,864 / 122,872-byte boundary
+  was re-verified on 6.6.6.
+- **The aarch64 syscall peer is re-vendored**: `lib/syscalls_aarch64_linux.cyr` now carries
+  `SYS_UNLINKAT = 263` (6.6.2's was 35), matching 6.6.6's translation row — an un-re-vendored
+  peer would run `nanosleep` for `sys_unlink` on aarch64.
+
+### Removed
+
+- **All seven entries in the lib-collision allowlists** — every collision they deferred is
+  fixed upstream at the pinned versions. kavach 3.12.9 prefixed its vendored error layer
+  (`kavach_syserr_*`), `attestation_result_new` (`kavach_attestation_result_new`) and
+  `InjectionMethod` (`KAVACH_INJECT_*`, which retires the `STDIN` aliasing), and dropped the
+  unused `agnosys_*` helpers; majra renamed `_sub_new` → `_majra_sub_new`.
+  `scripts/check-symbols.sh` now reports 0 divergent and 1 identical duplicate, down from 5
+  divergent and 12 identical at 2.0.9, and the build's 19 duplicate-fn warnings are gone. (The
+  `_sub_new` entry was already stale: majra renamed it in 2.7.1, which 2.0.8's pin bump took.)
+  With the entries deleted, Rules 4 and 5 guard those names again. The one remaining duplicate
+  is `uname_release`, byte-identical in `lib/sigil.cyr` and the newly pulled `lib/sys.cyr`, with
+  `UTS_RELEASE` agreeing on every target; nothing here calls it.
+
 ## [2.0.9] — 2026-09-12
 
 ### Fixed

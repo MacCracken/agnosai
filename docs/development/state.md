@@ -2,9 +2,74 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-08-23.
+> Last refreshed: 2026-09-26.
 
-## Now — 2.0.6
+## Now — 2.0.10
+
+| | |
+|---|---|
+| **version** | **2.0.10** |
+| **cyrius pin** | **6.6.6** |
+| **tests** | **99 suites, 7,975 assertions, 0 failed** — every suite also exits 0 run on its own |
+| **coverage** | **99%** — 103/103 files, 1,578/1,585 fns (gate is `--min 80`) |
+| **dist** | `dist/agnosai.cyr` 37,625 lines + `dist/agnosai-guard.cyr` 932 lines, both v2.0.10; sidecars 46 / 8 leaves (`sys` is new) |
+| **binary** | `build/agnosai` **5,112,352 B** (2.0.9 on 6.6.2: 4,854,248 B, +5.3%, not attributed); aarch64 cross-build **6,217,784 B** |
+| **gates** | `check-symbols.sh` · `check-clean.sh` · `distlib --check` · fuzz 4/4 · coverage — all green |
+
+Direct deps (`[deps.*]`, all six): `sigil` **3.12.18** (= the 6.6.6 fold, byte-identical),
+`bote` **3.3.13**, `majra` **2.9.1**, `kavach` **3.13.1**, `ai-hwaccel` **2.4.0** (`path`
+commented out — its sibling sits a docs-only commit past the tag), `tyche` **1.1.0**. Folded
+from the toolchain: sandhi 1.9.17, sakshi 2.5.2, patra 1.14.3, bayan 1.5.6, sankoch 2.8.0 (plus
+vani, yukti, niyama, mabda, ganita, yantra). Transitively through bote: libro 2.10.3.
+
+### ⚠ What will bite the next person — learned at 2.0.10
+
+**1. A stdlib-folded dep is pinned to the FOLD, never to its repo's newer tag.** The fold table
+is cyrius's `docs/ecosystem.md` at the pinned tag. At 2.0.10 sigil's repo was at 3.13.2 and
+`../patra` at 1.15.0; 6.6.6 folds 3.12.18 and 1.14.3, and those are what agnosai compiles. The
+resolver refuses to overwrite a folded leaf ("refusing to overwrite stdlib leaf 'patra'"), but
+see 3 for what it does NOT protect.
+
+**2. After a tag bump, finish with a plain `cyrius deps`, not `cyrius deps --lock`.** From 6.6.4
+the bare `--lock` verb resolves nothing and carries the OLD lock's `commit` pins forward: after
+the three-step it wrote pins naming sigil 3.12.16 / kavach 3.12.5 and none for ai-hwaccel. A
+plain `cyrius deps` wrote the right three.
+
+**3. If agnosai's own sigil resolution fails, libro's `[deps.sigil]` takes over — from
+`../sigil`.** libro 2.10.3 declares `[deps.sigil] path = "../sigil"` with four extra modules
+(`dist/sigil-mldsa.cyr`, `src/sha_ni.cyr`, `src/sha256.cyr`, `src/hex.cyr`). Normally
+closest-wins skips it. When the primary resolve failed (see 4), the walk vendored those four
+from the local **3.13.2** checkout into `lib/`. A normal resolve never includes them (checked
+with `cyrius build -v`), but they stay on disk and in the lock until `lib/` is regenerated:
+`rm -rf lib && cyrius lib sync --full && cyrius deps` (`lib/` is gitignored and toolchain-owned).
+
+**4. `/tmp` is a tmpfs with a per-user quota.** Hitting it (99 retained ~4.5 MB suite binaries
+plus two scratch tree copies) produced `could not write the output … errno 122` (EDQUOT), a git
+"refusing tampered cache" on `~/.cyrius/deps/sigil/3.12.18` (the cache was fine — `git fsck`
+clean) and "cannot hash the pinned snapshot". Delete each test binary after running it.
+
+**5. `file_exists` cannot see a Unix socket.** It `open`s the path, which fails with ENXIO on a
+socket. Test for presence with `xstat`.
+
+**6. The rate-limit key cap is bounded by time under a strict rate** — majra 2.8.1. 72,447 keys
+at 1 req/s against a 4,096 cap (the default 100 req/s holds). Owed as roadmap **B4**, requested
+from majra.
+
+### Found by the 2.0.10 dependency review — not caused by it, not fixed here
+
+- Delivered relay messages are never released (`relay_msg_release` exists since majra 2.9.0).
+- `ratelimit_stats` / `relay_stats` snapshots are never freed; the rate-limit one sits on the
+  sweep path (`src/server/rate_limit.cyr` sweep).
+- Process-backend tools inherit the server's stdin: `agnosai_kavach_build_config`
+  (`src/sandbox/kavach_bridge.cyr`) never sets `config_stdin`; since kavach 3.13.1 an empty
+  `config_stdin(c, "", 0)` would give them an empty stdin, as agnosai's own spawn path does.
+- Stale prose: `src/fleet/relay.cyr` still says the relay timestamp is monotonic and capacity is
+  ignored (majra fixed both in 2.6.5; `tests/fleet_relay.tcyr` asserts the fixed behaviour);
+  `src/llm/inference_queue.cyr` says `pq_enqueue` does not clamp negatives (it has since majra
+  2.6.2); line citations into `lib/majra.cyr`, `lib/bench.cyr` and `lib/bote-core.cyr` in
+  `benches/*.bcyr` and `src/server/routes/mcp.cyr` no longer point at the cited code.
+
+## 2.0.6 — kept for the record
 
 | | |
 |---|---|
@@ -15,17 +80,6 @@
 | **dist** | `dist/agnosai.cyr`, 37,268 lines, stamped v2.0.6 |
 | **binary** | `build/agnosai` **5,119,848 B** |
 | **gates** | `check-symbols.sh` (**5 rules**) · `check-clean.sh` · `distlib --check` · fuzz 4/4 green |
-
-Direct deps (`[deps.*]`, all six): `sigil` **3.12.9**, `bote` **3.3.7**,
-`majra` **2.7.0**, `kavach` **3.12.2**, `ai-hwaccel` **2.3.18**, `tyche` **1.0.1**.
-`patra` **1.13.10**, `libro` **2.8.12**, `sakshi` **2.4.11**, `bayan` **1.5.2**,
-`sandhi` **1.9.10** and `sankoch` **2.7.8** arrive folded from the toolchain or
-transitively, not as direct deps.
-
-⚠ **98 suites / 7,940 assertions of that is unchanged from 2.0.5 on purpose** —
-2.0.6 changed one `src/` constant, so an identical figure is the expected result,
-not a stale copy. The 99th suite (+4) is the new version-pin guard. Re-measured on
-this tree, not carried over.
 
 ### ⚠ Four things that will bite the next person
 
@@ -40,7 +94,7 @@ stdlib → cyrius release → consumer pin bump`; a consumer sitting between ste
 and 4 fails this gate every time. Do not reach for a `[deps.patra]` hold or a
 `check-clean` allowance — bump the pin.
 
-**2. `~/.cyrius/versions/<pin>/bin/cyrius` does NOT pin `cycc`.** It resolves the
+**2. `~/.cyrius/versions/<pin>/bin/cyrius` does NOT pin `cycc`.** ⚠ **Stale as of 6.6.x** — on 2026-09-26 `cyrius build -v` under a 6.6.2 pin reported `compiler: ~/.cyrius/versions/6.6.2/bin/cycc`, and the build printed 6.6.2's own diagnostic text, so the pinned wrapper now resolves its own compiler. Kept for the history: It resolves the
 compiler through `$CYRIUS_HOME/bin` → `~/.cyrius/current`, not relative to itself
 and not via `PATH`. Build a `CYRIUS_HOME` shim (`bin`, `lib`, `versions`, `deps`
 symlinks + a `current` file) and read the drift line to confirm which compiler you
@@ -778,7 +832,7 @@ it was never invoked*.
 
 ## Version
 
-**2.0.0** (`VERSION`) — **cut 2026-08-14, the first Cyrius release.** 1.1.0 was
+**2.0.10** (`VERSION`), cut 2026-09-26. **2.0.0** was cut 2026-08-14, the first Cyrius release. 1.1.0 was
 the last shipped Rust release and is preserved at `rust-old/` as the parity
 oracle. The rule held: VERSION bumped once parity landed, so the number always
 names something that actually shipped.
@@ -792,7 +846,10 @@ have served as the check.
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.20` (`cyrius.cyml`) — bumped 2026-08-12, three-step,
+- **Cyrius pin: `6.6.6`** (2.0.10, 2026-09-26) — `lib/` matches the snapshot 111/111, the
+  installed snapshot matches the cyrius `6.6.6` tag 111/111, `deps --verify` 117/0, and a fresh
+  CI-style resolve (empty `lib/`, no siblings) reproduces the local lock's 117 hashes. See Now.
+- Previously **Cyrius pin**: `6.5.20` (`cyrius.cyml`) — bumped 2026-08-12, three-step,
   `lib/` diffed after the sync AND again after a build: 107 files, zero content
   differences, `deps --verify` **113 verified / 0 failed**, duplicate-fn warning
   count unchanged at **35**. Folds **patra 1.13.0**, **sigil 3.12.7**, **sakshi

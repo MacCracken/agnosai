@@ -124,6 +124,12 @@ numbers and this ADR is where that is recorded.
      tokens, letting them briefly burst again; that is the deliberate trade,
      since the alternative is unbounded attacker-controlled growth and a flood
      of fresh keys is already outside what per-key limiting can meter.
+     ⚠ **2026-09-26 (majra 2.9.1):** the zero rung no longer evicts a bucket
+     that has not refilled, so the cap holds as "4,096 or one refill interval of
+     keys, whichever is larger" — 4,352 peak at the default 100 req/s, 72,447 at
+     1 req/s. A force-evict call is requested from majra
+     (`docs/development/issues/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md`
+     in the majra repo); `src/server/rate_limit.cyr` carries the detail.
 - **The three unauthenticated probes are exempt.** `/health`, `/ready` and
   `/metrics` — exactly the routes `agnosai_route_needs_auth` leaves open — are
   never refused. ⚠ Without this the default is a self-inflicted outage: a kubelet

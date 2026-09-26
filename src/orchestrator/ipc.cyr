@@ -1,7 +1,7 @@
 # =========================================================================
 # orchestrator/ipc — Unix-socket IPC with length-prefixed framing.
 #
-# Parity oracle: rust-old/src/orchestrator/ipc.rs
+# Origin: rust-old/src/orchestrator/ipc.rs
 #
 # The wire protocol is a 4-byte big-endian length followed by that many bytes
 # of JSON. Local agent-to-orchestrator traffic only; inter-node is fleet's.
@@ -9,7 +9,7 @@
 # **majra already ships this transport** — `ipc_bind` / `ipc_accept` /
 # `ipc_connect` / `ipc_send_frame` / `ipc_recv_frame`, with a byte-identical
 # frame header. Connection establishment is reused from it: it owns the
-# `sockaddr_un` construction, the stale-socket unlink, and the agnos target's
+# `sockaddr_un` construction, the stale-socket handling, and the agnos target's
 # fail-closed path, none of which this port improves on by rewriting.
 #
 # **The framing is NOT reused, for two reasons that would both be silent.**
@@ -203,11 +203,13 @@ fn agnosai_ipc_recv(fd): i64 {
     return value;
 }
 
-# Bind a listening socket at a Unix socket path, removing any stale socket file.
+# Bind a listening socket at a Unix socket path.
 #
-# Returns the listening fd, or `AGNOSAI_IPC_ERR`. Delegates to majra, which
-# owns the `sockaddr_un` construction and the agnos fail-closed path; the
-# narrow unlink-then-bind TOCTOU window the oracle documents is majra's too.
+# Returns the listening fd, or `AGNOSAI_IPC_ERR`. Delegates to majra (2.8.1+),
+# which removes a path only when it is a provably STALE socket — one that refuses
+# a connect. A regular file, or a socket a live server is still accepting on, is
+# refused rather than deleted, so a misconfigured path cannot destroy a file and a
+# second instance cannot silently take over a running server's socket.
 fn agnosai_ipc_bind(path: Str): i64 {
     _AGNOSAI_IPC_ERROR = 0;
     var r_t, r_v = ipc_bind(str_cstr(path));

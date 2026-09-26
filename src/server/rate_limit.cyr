@@ -1,7 +1,7 @@
 # =========================================================================
 # server/rate_limit — per-client token-bucket rate limiting.
 #
-# Parity oracle: rust-old/src/server/rate_limit.rs
+# Origin: rust-old/src/server/rate_limit.rs
 #
 # Backed by majra's `ratelimit_*`, which is what the oracle uses too
 # (`majra::ratelimit::RateLimiter`), so this is a thin adapter rather than a
@@ -78,6 +78,16 @@ var AGNOSAI_RL_MAX_KEYS = 4096;
 # outside what per-key limiting can meter — every new key gets a full burst by
 # construction, which ADR 021 states plainly. The cap's job is memory safety,
 # not metering, and it degrades to "forget everyone" rather than to "die".
+#
+# ⚠ **Since majra 2.8.1 the last rung no longer evicts everything.**
+# `ratelimit_evict_stale` now skips any bucket that has not refilled to burst,
+# so a sprayed key survives for 1/rate seconds after its one request, and the cap
+# holds only as "4,096 or one refill interval of keys, whichever is larger".
+# Measured 2026-09-26 with a 200,000-key spray: 4,352 peak at the default
+# 100 req/s (as before), 72,447 at 1 req/s (4,352 on majra 2.7.2). Memory stays
+# bounded, by time rather than by count. majra has no evict-regardless-of-fill
+# call; one is requested in majra's
+# docs/development/issues/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md
 var AGNOSAI_RL_PRESSURE_NS = 1000000000;
 var AGNOSAI_RL_PRESSURE_FLOOR_NS = 0;
 

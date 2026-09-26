@@ -13,7 +13,7 @@
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (toolchain pinned in `cyrius.cyml [package].cyrius`)
 - **Version**: `VERSION` at the project root is the source of truth — do not inline the number here
-- **Rust reference**: 27,683 lines preserved at `rust-old/` (v1.1.0, green) — the **parity oracle**
+- **Rust reference**: 27,683 lines preserved at `rust-old/` (v1.1.0) — history only, **not a spec**
 
 ## Consumers
 
@@ -21,7 +21,7 @@ Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran
 
 ## The port
 
-Scaffolded with `cyrius port` on 2026-07-28. `rust-old/` is the reference oracle.
+Scaffolded with `cyrius port` on 2026-07-28 from `rust-old/`.
 The plan of record is
 [`docs/development/cyrius-port-plan.md`](docs/development/cyrius-port-plan.md) —
 read it before starting any bite. Its blocker table is a **reasoning archive** —
@@ -31,13 +31,12 @@ the analysis behind several still-live designs, which must not be re-derived.
 ### Layout — `src/` mirrors `rust-old/src/`
 
 `rust-old/src/server/routes/crews.rs` → `src/server/routes/crews.cyr`. A group's
-hub is `mod.cyr`, matching the oracle's `mod.rs`. Directories use the oracle's
+hub is `mod.cyr`, matching `rust-old/`'s `mod.rs`. Directories use `rust-old/`'s
 spelling (`orchestrator/`, not `orch/`).
 
 Cyrius `include` is textual and takes a path — the cyrius compiler's own tree does
 this (`src/backend/x86/emit.cyr`). There was never a flat-layout constraint; the
-correctness bar is "matches what Rust did", judged file-against-file, so the tree
-has to show that correspondence.
+tree mirrors `rust-old/` only so a module's origin is easy to find.
 
 Two things this does **not** change:
 
@@ -48,7 +47,7 @@ Two things this does **not** change:
   to the same source, which is why the reorg was verifiable by a byte-identical
   binary.
 
-Port-local modules with no oracle counterpart (`units`, `order`, `id`,
+Port-local modules with no `rust-old/` counterpart (`units`, `order`, `id`,
 `guarded_fetch`, `chan_lossy`) stay at `src/` root — the directory tree means
 "this mirrors rust-old", and inventing a home for them would dilute that.
 
@@ -119,8 +118,8 @@ cyrius coverage --min 80                    # the 80% gate — its own CI step
 
 ### Key Principles
 
-- **Cross-check against `rust-old/`.** The correctness bar is "matches what Rust did". Diverge only with an ADR.
-- **Correctness over cleverness** — a Cyrius behavior that diverges *silently* from Rust is the worst outcome
+- **NEVER regress code for Rust parity.** `rust-old/` is history, not a spec. When the Cyrius code or a dependency does it better — safer, faster, more correct — keep the better code. Never copy a Rust flaw forward, and never propose "restore parity" as an option.
+- **Correctness over cleverness** — a behavior change nobody noticed is the worst outcome
 - **Never skip benchmarks.** Numbers don't lie. The CSV history is the proof.
 - **Tests + benchmarks are the way.** Minimum 80%+ coverage target.
 - **Own the stack.** If an AGNOS crate wraps an external lib, depend on the AGNOS crate.
@@ -157,7 +156,7 @@ diff in `check-clean.sh` catches a dep silently downgrading a folded module.
 
 - **Do not commit or push** — the user handles all git operations (commit, push, tag)
 - **NEVER use `gh` CLI** — use `curl` to GitHub API only
-- **Do not modify `rust-old/`** — it is the frozen parity oracle
+- **Do not modify `rust-old/`** — it is frozen history
 - Do not modify `lib/` — `cyrius deps` owns it
 - Do not add unnecessary dependencies — keep it lean
 - Do not skip benchmarks before claiming performance improvements
