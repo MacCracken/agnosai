@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] — 2026-09-30
+
+### Fixed
+
+- **kavach's backend enum is named by its own name, `KavachBackend`.** kavach renamed
+  `enum Backend` to `KavachBackend`, but seven code sites here still spelled `Backend.NOOP` /
+  `.WASM` / `.PROCESS` / `.OCI`: `agnosai_kavach_map_backend`, `agnosai_wasm_available`,
+  `agnosai_wasm_execute` and `tests/sandbox_kavach_bridge.tcyr`. Up to cyrius 6.6.10 the
+  compiler ignored the qualifier of `X.NAME`, so the stale spelling still compiled. cyrius
+  6.6.11 checks it and refuses each site with `'Backend' is not an enum`, so 2.1.0 and every
+  consumer of its `dist/agnosai.cyr` fail to build on 6.6.11. `dist/agnosai.cyr` is regenerated
+  and carries the fix. On the pinned 6.6.6 the fixed source builds the same binary as the old
+  one; nothing changes at runtime. The cyrius pin stays **6.6.6**.
+
 ## [2.1.0] — 2026-09-26
 
 `rust-old/` is **scheduled for deletion in the release after this one.** This release is the

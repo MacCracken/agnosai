@@ -2,21 +2,35 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-26.
+> Last refreshed: 2026-09-30.
 
-## Now — 2.1.0
+## Now — 2.1.1
 
 | | |
 |---|---|
-| **version** | **2.1.0** |
+| **version** | **2.1.1** |
 | **cyrius pin** | **6.6.6** |
-| **tests** | **99 suites, 8,048 assertions, 0 failed** — every suite also exits 0 run on its own |
+| **tests** | **99 suites, 8,056 assertions, 0 failed** from the full CI run in a clean copy, with the host's wasmtime 49.0.0 (CI pins 47.0.3). 2.1.0 recorded 8,048 and also ran each suite on its own; 2.1.1 did not repeat the per-suite run |
 | **coverage** | **99%** — 103/103 files, 1,582/1,590 fns (gate is `--min 80`) |
-| **dist** | `dist/agnosai.cyr` 37,608 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.0; sidecars 46 / 8 leaves |
-| **binary** | `build/agnosai` **5,120,736 B** (+8,384 over 2.0.10); aarch64 cross-build **6,217,960 B** |
+| **dist** | `dist/agnosai.cyr` 37,608 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.1; sidecars 46 / 8 leaves |
+| **binary** | `build/agnosai` **5,120,736 B**, unchanged from 2.1.0; aarch64 cross-build **6,217,960 B** (measured at 2.1.0) |
 | **gates** | `check-symbols.sh` · `check-clean.sh` · `distlib --check` · fuzz 4/4 · coverage — all green |
 
 Dependencies are unchanged from 2.0.10 (below).
+
+### 2.1.1 — kavach's backend enum, named by its own name
+
+This is a build-compatibility patch and nothing else. Seven code sites spelled `Backend.X`, but
+kavach renamed that enum `KavachBackend`. Up to cyrius 6.6.10 the compiler ignored the qualifier,
+so they compiled. 6.6.11 refuses each one with `'Backend' is not an enum`. They now read
+`KavachBackend.X`, and `dist/agnosai.cyr` is regenerated.
+
+- On the pinned 6.6.6, HEAD with and without the fix builds a byte-identical `build/agnosai`
+  and `tests/sandbox_kavach_bridge.tcyr`.
+- On the 6.6.11 compiler, the old tree fails with those seven errors. The fixed tree builds,
+  and `sandbox_kavach_bridge` (138) and `sandbox_wasm` (66) pass.
+- The cyrius pin stays 6.6.6. `rust-old/` is still present: this patch does not carry the
+  deletion that the 2.1.0 notes below schedule for "the next release".
 
 ### 2.1.0 — the `rust-old/` audit
 
