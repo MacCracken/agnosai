@@ -2,21 +2,42 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-30.
+> Last refreshed: 2026-10-01.
 
-## Now — 2.1.1
+## Now — 2.1.2
 
 | | |
 |---|---|
-| **version** | **2.1.1** |
-| **cyrius pin** | **6.6.6** |
-| **tests** | **99 suites, 8,056 assertions, 0 failed** from the full CI run in a clean copy, with the host's wasmtime 49.0.0 (CI pins 47.0.3). 2.1.0 recorded 8,048 and also ran each suite on its own; 2.1.1 did not repeat the per-suite run |
-| **coverage** | **99%** — 103/103 files, 1,582/1,590 fns (gate is `--min 80`) |
-| **dist** | `dist/agnosai.cyr` 37,608 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.1; sidecars 46 / 8 leaves |
-| **binary** | `build/agnosai` **5,120,736 B**, unchanged from 2.1.0; aarch64 cross-build **6,217,960 B** (measured at 2.1.0) |
-| **gates** | `check-symbols.sh` · `check-clean.sh` · `distlib --check` · fuzz 4/4 · coverage — all green |
+| **version** | **2.1.2** |
+| **cyrius pin** | **6.6.12** |
+| **tests** | **99 suites, 8,058 assertions, 0 failed** — the CI steps run in a clean copy against an EMPTY dep cache with no sibling checkouts, so every dep resolved from its tag, with the host's wasmtime 49.0.0 (CI pins 47.0.3) |
+| **coverage** | **99%** — 102/102 files, 1,576/1,589 fns (gate is `--min 80`) |
+| **dist** | `dist/agnosai.cyr` 37,608 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.2; sidecars 45 / 6 leaves |
+| **binary** | `build/agnosai` **5,155,624 B**; aarch64 cross-build **6,351,152 B** |
+| **gates** | `check-symbols.sh` (both targets) · `check-clean.sh` · `distlib --check` · fuzz 4/4 · coverage · examples — all green |
 
-Dependencies are unchanged from 2.0.10 (below).
+Direct deps (`[deps.*]`, all six) at their latest tags: `sigil` **3.13.5** (= the 6.6.12
+fold, byte-identical), `bote` **3.3.15**, `majra` **2.9.2**, `kavach` **3.13.1**,
+`ai-hwaccel` **2.4.0**, `tyche` **1.1.0**. Transitively through bote: libro **2.10.4**.
+
+### 2.1.2 — cyrius 6.6.12 and every dep at its latest
+
+A toolchain-and-pins release so that a consumer linking `dist/agnosai.cyr` gets current
+versions from agnosai itself. Agnostic 0.1.7 carried root-level pins for bote, majra,
+ai-hwaccel and tyche "ahead of" agnosai's; it turned out they never took effect (a root
+`[deps.X]` with no `modules` is never cloned), and with this release they are not needed.
+
+- **dist is unchanged but for the version.** `dist/agnosai.cyr` differs from 2.1.1 in the
+  header and the `AGNOSAI_VERSION` literal only; the working tree's regeneration and the
+  clean copy's are byte-identical.
+- **`check-lib-symbols.py` now evaluates `#ifdef` per target.** sigil 3.13.5 declares eight
+  errno names under `#ifdef CYRIUS_TARGET_MACOS` and again under `#ifndef`, and the gate
+  read both arms as live — a false positive against kavach on every target built here.
+  Rules 4 and 5 now run once each for x86_64-linux and aarch64-linux. Mutation-checked in
+  both directions (see the CHANGELOG).
+- ⚠ **Locally, `lib/libro.cyr` is NOT the tag's.** bote's `path = "../libro"` chains from
+  this repo's `path = "../bote"`, so a local resolve reads the `../libro` checkout. dist does
+  not contain libro and is unaffected; the suites above ran on the tag-resolved copy.
 
 ### 2.1.1 — kavach's backend enum, named by its own name
 

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.2] — 2026-10-01
+
+The toolchain and every direct dependency move to their latest releases, so a consumer
+that links `dist/agnosai.cyr` no longer has to pin agnosai's own deps ahead of agnosai
+to get current versions. No `src/` change beyond the `AGNOSAI_VERSION` literal.
+`rust-old/` is still present: like 2.1.1, this patch does not carry the deletion the
+2.1.0 notes schedule.
+
+### Changed
+
+- **Cyrius pin `6.6.6` → `6.6.12`.** 6.6.11's enum-qualifier check is what 2.1.1 fixed
+  ahead of time; 6.6.12 builds this tree and its dist unchanged.
+- **`sigil` 3.12.18 → 3.13.5 — the 6.6.12 fold.** The declared tag tracks the fold of
+  the pinned toolchain (rule 1 of the 2.0.10 notes): `dist/sigil.cyr` at 3.13.5 is
+  byte-identical to `git show 6.6.12:lib/sigil.cyr`, so the copy `cyrius deps` keeps
+  and the one it skips are the same bytes.
+- **`bote` 3.3.13 → 3.3.15** (3.3.14 is libro 2.10.4 + cyrius 6.6.10, 3.3.15 a CI fix;
+  neither changes bote source) and **`majra` 2.9.1 → 2.9.2** (toolchain only).
+  `kavach` 3.13.1, `ai-hwaccel` 2.4.0 and `tyche` 1.1.0 were already the latest.
+  libro arrives through bote at 2.10.4.
+- `dist/agnosai.cyr` and `dist/agnosai-guard.cyr` are regenerated; only the version
+  header and the `AGNOSAI_VERSION` literal differ. The sidecars are 6.6.12 distlib's:
+  `agnosai.deps` drops `sys` (sigil's bundle includes it itself since 3.13.3) and
+  `agnosai-guard.deps` drops `io` and `assert` — 45 and 6 leaves.
+
+### Fixed
+
+- **`check-lib-symbols.py` (Rules 4 and 5) evaluates preprocessor conditionals, once
+  per shipped target.** sigil 3.13.5 gives eight errno names their BSD values under
+  `#ifdef CYRIUS_TARGET_MACOS` and their Linux values under `#ifndef` — `ENOSYS`,
+  `ENOTEMPTY`, `ENODATA`, `EOVERFLOW`, `EOPNOTSUPP`, `EADDRINUSE`, `ECONNREFUSED`,
+  `ETIMEDOUT`. The gate read both arms as live and failed Rule 4 against kavach, which
+  declares the Linux values: a false positive on every target this repo builds.
+  Allow-listing the names would also have hidden a real future divergence, so each
+  `[release]` target (x86_64-linux, aarch64-linux) is now checked on the lines it
+  compiles. String state is carried across lines as the compiler does it, so a line
+  inside a multi-line string that starts `#ifdef` stays data. Mutation-checked: a
+  changed kavach `ENOSYS` fails on both targets, a divergent constant or `fn` under
+  `#ifdef CYRIUS_ARCH_AARCH64` fails on aarch64 only, the same under
+  `CYRIUS_TARGET_MACOS` passes, and a fake directive inside a string blinds nothing.
+- **The same script now finds dep sidecars under `$CYRIUS_HOME/deps`.** It read only
+  `~/.cyrius/deps`, so in the empty-cache replica that certifies a bump it found no
+  sidecar and quietly checked a smaller compile set than it reported.
+
 ## [2.1.1] — 2026-09-30
 
 ### Fixed
