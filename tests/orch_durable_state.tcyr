@@ -360,7 +360,26 @@ fn main() {
     assert(str_contains(agnosai_error_message(derr), str_from("I/O error: ")) == 1,
       "and the message keeps the oracle's variant prefix");
 
+    # --- a borrowed path reads the file it names ---
+    # A Str is not NUL-terminated at its length — a `str_sub` borrows its
+    # parent's bytes — so cutting `borrow.json.bak` back to `borrow.json` leaves
+    # `.bak` in the bytes past the cut, and handing `str_data` to `open` read the
+    # backup. The store builds its own paths, so only a direct call reaches this.
+    # Fails on 2.1.2.
+    var named = _t_under("/borrow.json");
+    var longer = _t_under("/borrow.json.bak");
+    file_write_all(str_data(named), "named", 5);
+    file_write_all(str_data(longer), "backup", 6);
+    var cut = str_sub(longer, 0, str_len(longer) - 4);
+    var clen = 0;
+    store64(&clen, 0);
+    var cbytes = _agnosai_read_file_exact(cut, &clen);
+    assert(_t_bytes_eq(cbytes, load64(&clen), str_from("named")) == 1,
+      "a path cut from a longer one reads the file it names, not the one its bytes run on into");
+
     # --- teardown ---
+    _t_rm(named);
+    _t_rm(longer);
     _t_rm(_t_join(_t_under("/"), _t_join(cid, str_from(".json"))));
     _t_rm(_t_under("/crew-x.json"));
     _t_rm(_t_under("/crew-raw.json"));

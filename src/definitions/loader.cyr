@@ -182,7 +182,10 @@ fn _agnosai_loader_read(path: Str, out_err): Str {
         return 0;
     }
 
-    var fd = file_open(str_data(path), 0, 0);
+    # `str_cstr`, not `str_data`: a Str's bytes need not end in a NUL at its length (a
+    # `str_sub` borrows its parent's), so `str_data` could open a longer path than the one
+    # `is_dir` just checked. cyrius 6.6.13 warns on the old spelling.
+    var fd = file_open(str_cstr(path), 0, 0);
     if (fd < 0) {
         _agnosai_loader_set_err(out_err,
           agnosai_error_io(_agnosai_loader_io_detail("open", path, fd)));
@@ -475,7 +478,7 @@ fn agnosai_preset_to_value(p): i64 {
 
 # Read one required string field, or 0 when it is absent or not a string.
 fn _agnosai_preset_str_field(v, key): i64 {
-    var f = bayan_json_v_obj_get(v, key);
+    var f = bayan_json_v_obj_get_by_cstr(v, key);
     if (f == 0) { return 0; }
     if (bayan_json_v_is_str(f) == 0) { return 0; }
     return bayan_json_v_str(f);
@@ -503,7 +506,7 @@ fn agnosai_preset_from_value(v): i64 {
     if (name == 0 || description == 0 || domain == 0) { return 0; }
     if (size == 0 || version == 0) { return 0; }
 
-    var av = bayan_json_v_obj_get(v, "agents");
+    var av = bayan_json_v_obj_get_by_cstr(v, "agents");
     if (av == 0) { return 0; }
     if (bayan_json_v_is_arr(av) == 0) { return 0; }
 

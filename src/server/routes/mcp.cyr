@@ -242,7 +242,7 @@ fn _agnosai_mcp_tools_list(a, id, state): i64 {
 # thing most likely to be flattened by mistake.
 fn _agnosai_mcp_tools_call(a, id, params, state): i64 {
     var name_v = 0;
-    if (params != 0) { name_v = bayan_json_v_obj_get(params, "name"); }
+    if (params != 0) { name_v = bayan_json_v_obj_get_by_cstr(params, "name"); }
     if (name_v == 0 || bayan_json_v_is_str(name_v) == 0) {
         return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
           str_from_a(a, "Missing tool name"));
@@ -261,7 +261,7 @@ fn _agnosai_mcp_tools_call(a, id, params, state): i64 {
     # `arguments.as_object()` — a non-object `arguments` yields an EMPTY
     # parameter map rather than an error, so the tool runs with no arguments.
     var input = agnosai_tool_input_new();
-    var args = bayan_json_v_obj_get(params, "arguments");
+    var args = bayan_json_v_obj_get_by_cstr(params, "arguments");
     if (args != 0 && bayan_json_v_is_obj(args) == 1) {
         for (var i = 0; i < bayan_json_v_obj_len(args); i = i + 1) {
             agnosai_tool_input_set(input, bayan_json_v_obj_key(args, i),
@@ -359,7 +359,7 @@ fn _agnosai_mcp_prompts_get(a, id, params, state): i64 {
         return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
           str_from_a(a, "params must be an object"));
     }
-    var nv = bayan_json_v_obj_get(params, "name");
+    var nv = bayan_json_v_obj_get_by_cstr(params, "name");
     if (nv == 0 || bayan_json_v_is_str(nv) == 0) {
         return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
           str_from_a(a, "name is required"));
@@ -374,9 +374,9 @@ fn _agnosai_mcp_prompts_get(a, id, params, state): i64 {
     str_builder_add_a(a, sb, _agnosai_crew_build_system_prompt(def));
 
     # `arguments` is optional, and so is `task` within it.
-    var av = bayan_json_v_obj_get(params, "arguments");
+    var av = bayan_json_v_obj_get_by_cstr(params, "arguments");
     if (av != 0 && bayan_json_v_is_obj(av) == 1) {
-        var tv = bayan_json_v_obj_get(av, AGNOSAI_MCP_PROMPT_ARG);
+        var tv = bayan_json_v_obj_get_by_cstr(av, AGNOSAI_MCP_PROMPT_ARG);
         if (tv != 0 && bayan_json_v_is_str(tv) == 1 && str_len(bayan_json_v_str(tv)) > 0) {
             str_builder_add_cstr_a(a, sb, "\n\nTask: ");
             str_builder_add_a(a, sb, bayan_json_v_str(tv));
@@ -462,7 +462,7 @@ fn _agnosai_mcp_resources_read(a, id, params, state): i64 {
         return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
           str_from_a(a, "params must be an object with a uri"));
     }
-    var uri_v = bayan_json_v_obj_get(params, "uri");
+    var uri_v = bayan_json_v_obj_get_by_cstr(params, "uri");
     if (uri_v == 0 || bayan_json_v_is_str(uri_v) == 0) {
         return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
           str_from_a(a, "uri is required and must be a string"));
@@ -526,8 +526,8 @@ fn agnosai_route_mcp_a(a, state, body: Str): i64 {
 
     # JSON-RPC 2.0 requires `"jsonrpc": "2.0"` exactly; a request without it, or
     # naming another version, is not one this endpoint speaks.
-    var ver_v = bayan_json_v_obj_get(v, "jsonrpc");
-    var method_v = bayan_json_v_obj_get(v, "method");
+    var ver_v = bayan_json_v_obj_get_by_cstr(v, "jsonrpc");
+    var method_v = bayan_json_v_obj_get_by_cstr(v, "method");
     if (ver_v == 0 || bayan_json_v_is_str(ver_v) == 0 || method_v == 0
       || bayan_json_v_is_str(method_v) == 0) {
         return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
@@ -539,7 +539,7 @@ fn agnosai_route_mcp_a(a, state, body: Str): i64 {
     }
     var method = bayan_json_v_str(method_v);
 
-    var id = bayan_json_v_obj_get(v, "id");
+    var id = bayan_json_v_obj_get_by_cstr(v, "id");
     if (id == 0) { id = bayan_json_v_null_a(a); }
 
     if (str_eq_cstr(method, "initialize") == 1) {
@@ -550,7 +550,7 @@ fn agnosai_route_mcp_a(a, state, body: Str): i64 {
     }
     if (str_eq_cstr(method, "tools/call") == 1) {
         return agnosai_route_json_a(a, HTTP_OK,
-          _agnosai_mcp_tools_call(a, id, bayan_json_v_obj_get(v, "params"), state));
+          _agnosai_mcp_tools_call(a, id, bayan_json_v_obj_get_by_cstr(v, "params"), state));
     }
     # Beyond the oracle's three — see ADR 015 and ADR 016.
     if (str_eq_cstr(method, "prompts/list") == 1) {
@@ -558,14 +558,14 @@ fn agnosai_route_mcp_a(a, state, body: Str): i64 {
     }
     if (str_eq_cstr(method, "prompts/get") == 1) {
         return agnosai_route_json_a(a, HTTP_OK,
-          _agnosai_mcp_prompts_get(a, id, bayan_json_v_obj_get(v, "params"), state));
+          _agnosai_mcp_prompts_get(a, id, bayan_json_v_obj_get_by_cstr(v, "params"), state));
     }
     if (str_eq_cstr(method, "resources/list") == 1) {
         return agnosai_route_json_a(a, HTTP_OK, _agnosai_mcp_resources_list(a, id, state));
     }
     if (str_eq_cstr(method, "resources/read") == 1) {
         return agnosai_route_json_a(a, HTTP_OK,
-          _agnosai_mcp_resources_read(a, id, bayan_json_v_obj_get(v, "params"), state));
+          _agnosai_mcp_resources_read(a, id, bayan_json_v_obj_get_by_cstr(v, "params"), state));
     }
 
     _agnosai_mcp_unknown(method);

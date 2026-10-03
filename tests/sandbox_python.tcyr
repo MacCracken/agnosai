@@ -74,7 +74,7 @@ fn _t_py_tool_source_never_enters_the_script(): i64 {
     # It must still be valid JSON that reads back to exactly what went in.
     var parsed = bayan_json_v_parse(input);
     assert(parsed != 0, "the input is parseable JSON despite the payload");
-    assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get(parsed, "__tool_source__")),
+    assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(parsed, "__tool_source__")),
         nasty) == 1, "...and the source round-trips byte for byte");
     return 0;
 }
@@ -86,11 +86,11 @@ fn _t_py_bridge_input_shape(): i64 {
     var input = agnosai_python_bridge_input(str_from("src"), str_from("adder"), params);
     var v = bayan_json_v_parse(input);
     assert(v != 0, "the bridge input parses");
-    assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get(v, "tool_name")),
+    assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(v, "tool_name")),
         str_from("adder")) == 1, "tool_name is carried");
-    var p = bayan_json_v_obj_get(v, "parameters");
+    var p = bayan_json_v_obj_get_by_cstr(v, "parameters");
     assert(p != 0, "parameters are carried");
-    assert(bayan_json_v_int(bayan_json_v_obj_get(p, "x")) == 41,
+    assert(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(p, "x")) == 41,
       "...unaltered, as caller data");
 
     # Absent parameters become an empty object, never a missing key — the
@@ -102,7 +102,7 @@ fn _t_py_bridge_input_shape(): i64 {
     # node with a non-zero pointer. The wrapper would then index a null and the
     # tool would fail at run time. The TAG is what discriminates.
     var none = bayan_json_v_parse(agnosai_python_bridge_input(str_from("s"), str_from("t"), 0));
-    var np = bayan_json_v_obj_get(none, "parameters");
+    var np = bayan_json_v_obj_get_by_cstr(none, "parameters");
     assert(np != 0, "no parameters still yields a `parameters` key the wrapper can index");
     assert(load64(np) == JTAG_OBJ,
       "...and it is an OBJECT, not a JSON null wearing a non-zero pointer");
@@ -214,7 +214,7 @@ fn _t_py_json_roundtrip(): i64 {
 
     var v = bayan_json_v_parse(agnosai_python_result_stdout(r));
     assert(v != 0, "...and its stdout is JSON");
-    assert(bayan_json_v_int(bayan_json_v_obj_get(v, "echo")) == 42,
+    assert(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(v, "echo")) == 42,
       "...carrying the value that went in");
     return 0;
 }
@@ -424,9 +424,9 @@ fn _t_py_execute_tool(): i64 {
 
     var v = bayan_json_v_parse(agnosai_python_result_stdout(r));
     assert(v != 0, "the bridge answers in JSON");
-    assert(bayan_json_v_bool(bayan_json_v_obj_get(v, "success")) == 1,
+    assert(bayan_json_v_bool(bayan_json_v_obj_get_by_cstr(v, "success")) == 1,
       "...reporting success");
-    assert(bayan_json_v_int(bayan_json_v_obj_get(v, "result")) == 42,
+    assert(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(v, "result")) == 42,
       "...with the tool's result");
     return 0;
 }
@@ -446,9 +446,9 @@ fn _t_py_tool_failure_is_reported_not_thrown(): i64 {
 
     var v = bayan_json_v_parse(agnosai_python_result_stdout(r));
     assert(v != 0, "...answering in JSON");
-    assert(bayan_json_v_bool(bayan_json_v_obj_get(v, "success")) == 0,
+    assert(bayan_json_v_bool(bayan_json_v_obj_get_by_cstr(v, "success")) == 0,
       "...with success false");
-    assert(str_contains_cstr(bayan_json_v_str(bayan_json_v_obj_get(v, "error")),
+    assert(str_contains_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(v, "error")),
         "tool exploded") == 1, "...and the exception's message");
     return 0;
 }
@@ -470,7 +470,7 @@ fn _t_py_hostile_tool_source_cannot_escape(): i64 {
       "the injected statement never runs - the source was DATA, not script text");
 
     var v = bayan_json_v_parse(agnosai_python_result_stdout(r));
-    assert(bayan_json_v_bool(bayan_json_v_obj_get(v, "success")) == 0,
+    assert(bayan_json_v_bool(bayan_json_v_obj_get_by_cstr(v, "success")) == 0,
       "...and the tool is reported as failed, not silently successful");
     return 0;
 }

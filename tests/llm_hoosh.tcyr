@@ -92,9 +92,9 @@ fn main() {
 
     # unset optionals are OMITTED, not null — a gateway may reject an explicit null
     var minimal = agnosai_inference_request_to_value(req);
-    assert_eq(bayan_json_v_obj_get(minimal, "max_tokens"), 0, "unset max_tokens is omitted");
-    assert_eq(bayan_json_v_obj_get(minimal, "temperature"), 0, "unset temperature is omitted");
-    assert(bayan_json_v_obj_get(minimal, "stream") != 0, "stream is always present");
+    assert_eq(bayan_json_v_obj_get_by_cstr(minimal, "max_tokens"), 0, "unset max_tokens is omitted");
+    assert_eq(bayan_json_v_obj_get_by_cstr(minimal, "temperature"), 0, "unset temperature is omitted");
+    assert(bayan_json_v_obj_get_by_cstr(minimal, "stream") != 0, "stream is always present");
     var want_head = str_cat(str_from("{\"model\":\"llama3\",\"messages\":["),
       str_from("{\"role\":\"system\",\"content\":\"be terse\"},"));
     var want_body = str_cat(want_head,
@@ -108,8 +108,8 @@ fn main() {
     agnosai_inference_request_with_max_tokens(full, 1024);
     agnosai_inference_request_with_temperature_milli(full, 700);
     var fv = agnosai_inference_request_to_value(full);
-    assert(bayan_json_v_obj_get(fv, "max_tokens") != 0, "set max_tokens is emitted");
-    _t_assert_str(bayan_json_v_build(bayan_json_v_obj_get(fv, "temperature")), "0.7",
+    assert(bayan_json_v_obj_get_by_cstr(fv, "max_tokens") != 0, "set max_tokens is emitted");
+    _t_assert_str(bayan_json_v_build(bayan_json_v_obj_get_by_cstr(fv, "temperature")), "0.7",
       "700 milli renders as 0.7");
     assert_eq(agnosai_inference_request_max_tokens(full), 1024, "max_tokens accessor");
     assert_eq(agnosai_inference_request_temperature_milli(full), 700, "temperature accessor");
@@ -117,7 +117,7 @@ fn main() {
     # a temperature of exactly 0 is emitted, not mistaken for unset
     var zero_temp = agnosai_inference_request_new(str_from("m"));
     agnosai_inference_request_with_temperature_milli(zero_temp, 0);
-    assert(bayan_json_v_obj_get(agnosai_inference_request_to_value(zero_temp), "temperature") != 0,
+    assert(bayan_json_v_obj_get_by_cstr(agnosai_inference_request_to_value(zero_temp), "temperature") != 0,
       "temperature 0.0 is emitted, not treated as unset");
 
     # --- streaming turns on stream_options.include_usage ---
@@ -125,11 +125,11 @@ fn main() {
     agnosai_inference_request_say(streamed, AGNOSAI_ROLE_USER, str_from("x"));
     agnosai_inference_request_with_stream(streamed, 1);
     var sv = agnosai_inference_request_to_value(streamed);
-    var so = bayan_json_v_obj_get(sv, "stream_options");
+    var so = bayan_json_v_obj_get_by_cstr(sv, "stream_options");
     assert(so != 0, "streaming emits stream_options");
-    assert_eq(bayan_json_v_bool(bayan_json_v_obj_get(so, "include_usage")), 1,
+    assert_eq(bayan_json_v_bool(bayan_json_v_obj_get_by_cstr(so, "include_usage")), 1,
       "stream_options.include_usage is set, so the stream carries a usage frame");
-    assert_eq(bayan_json_v_obj_get(agnosai_inference_request_to_value(req), "stream_options"), 0,
+    assert_eq(bayan_json_v_obj_get_by_cstr(agnosai_inference_request_to_value(req), "stream_options"), 0,
       "a non-streaming request omits stream_options");
 
     # --- content extraction from a real-shaped response ---
@@ -307,7 +307,7 @@ fn main() {
     var data = agnosai_hoosh_extract_models(models_body);
     assert(data != 0, "models data array found");
     assert_eq(bayan_json_v_arr_len(data), 2, "two models listed");
-    _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get(bayan_json_v_arr_get(data, 0), "id")),
+    _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(bayan_json_v_arr_get(data, 0), "id")),
       "llama3", "first model id");
     assert_eq(agnosai_hoosh_extract_models(str_from("{}")), 0, "no data key yields 0");
     assert_eq(agnosai_hoosh_extract_models(str_from("{\"data\":{}}")), 0, "a non-array data yields 0");
@@ -385,9 +385,9 @@ fn main() {
     # thing keeping the tree referenced.
     var av = agnosai_inference_request_to_value_a(ar, breq);
     assert(bayan_json_v_is_obj(av) == 1, "request_to_value_a builds an object");
-    _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get(av, "model")), "gpt-4",
+    _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(av, "model")), "gpt-4",
       "...carrying the model");
-    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get(av, "messages")), 2,
+    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(av, "messages")), 2,
       "...and both messages");
 
     # The `_a` wire spelling, named directly — it is reached through
@@ -397,7 +397,7 @@ fn main() {
 
     var mv = agnosai_chat_message_to_value_a(ar, agnosai_chat_message_new(
         AGNOSAI_ROLE_USER, str_from("m")));
-    _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get(mv, "content")), "m",
+    _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(mv, "content")), "m",
       "chat_message_to_value_a carries the content");
 
     return assert_summary();

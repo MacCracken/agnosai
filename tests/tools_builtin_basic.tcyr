@@ -139,6 +139,15 @@ fn main() {
     assert_eq(agnosai_tool_output_success(jout7), 0, "a non-object data value fails");
     assert(agnosai_tool_output_error(jout7) != 0, "and carries an error rather than crashing");
 
+    # A field name holding a NUL byte is matched whole: `a\u0000b` finds its own
+    # value, not `a`'s. The lookup used to take a C-string copy of the name, which
+    # ended it at the NUL. Fails on 2.1.2.
+    var jin8 = agnosai_tool_input_new();
+    agnosai_tool_input_set(jin8, str_from("data"), _t_json("{\"a\":1,\"a\\u0000b\":2}"));
+    agnosai_tool_input_set(jin8, str_from("field"), _t_json("\"a\\u0000b\""));
+    assert_eq(bayan_json_v_int(agnosai_tool_output_result(agnosai_tool_execute(jt, jin8))), 2,
+      "a field name is matched whole, not up to a NUL byte inside it");
+
     # --- the builtins register and dispatch through the registry ---
     var reg = agnosai_register_basic_builtins(agnosai_tool_registry_new());
     assert_eq(agnosai_tool_registry_count(reg), 2, "both builtins registered");

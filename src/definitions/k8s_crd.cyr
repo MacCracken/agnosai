@@ -525,8 +525,9 @@ fn agnosai_crew_crd_to_value(c): i64 {
 
 # --- deserialize ---------------------------------------------------------
 #
-# ⚠ **The key types are asymmetric and the compiler will not tell you.**
-# `bayan_json_v_obj_get` takes a **cstring**; `bayan_json_v_obj_set` takes a
+# ⚠ **The key types are asymmetric, and the compiler warns only for a key it
+# can see is a `Str`** (cyrius 6.6.13 — an untyped local holding one passes).
+# `bayan_json_v_obj_get_by_cstr` takes a **cstring**; `bayan_json_v_obj_set` takes a
 # **Str**. Passing a Str to `get` reads a 16-byte header as text and
 # segfaults — which is exactly what the first draft of this module did.
 # `src/core/message.cyr:305` documents the same trap. Use
@@ -543,7 +544,7 @@ fn _agnosai_crd_str_or(v, key, fallback): i64 {
 # A JSON object of strings back into a Str-keyed map.
 fn _agnosai_crd_map_from_value(v, key): i64 {
     var m = map_new_str();
-    var o = bayan_json_v_obj_get(v, key);
+    var o = bayan_json_v_obj_get_by_cstr(v, key);
     if (o == 0) { return m; }
     for (var i = 0; i < bayan_json_v_obj_len(o); i = i + 1) {
         var val = bayan_json_v_obj_val(o, i);
@@ -583,7 +584,7 @@ fn agnosai_agent_crd_spec_from_value(v): i64 {
     if (goal == 0) { return 0; }
 
     var a = agnosai_agent_crd_spec_new(key, name, role, goal);
-    var tools = bayan_json_v_obj_get(v, "tools");
+    var tools = bayan_json_v_obj_get_by_cstr(v, "tools");
     if (tools != 0) {
         var tv = vec_new();
         for (var i = 0; i < bayan_json_v_arr_len(tools); i = i + 1) {
@@ -608,7 +609,7 @@ fn agnosai_task_crd_spec_from_value(v): i64 {
         agnosai_crd_default_priority()));
     store64(t + AGN_TCRD_RISK, _agnosai_crd_str_or(v, "risk",
         agnosai_crd_default_risk()));
-    var deps = bayan_json_v_obj_get(v, "dependencies");
+    var deps = bayan_json_v_obj_get_by_cstr(v, "dependencies");
     if (deps != 0) {
         var dv = vec_new();
         for (var i = 0; i < bayan_json_v_arr_len(deps); i = i + 1) {
@@ -630,7 +631,7 @@ fn agnosai_crew_crd_spec_from_value(v): i64 {
     if (name == 0) { return 0; }
     var s = agnosai_crew_crd_spec_new(name);
 
-    var agents = bayan_json_v_obj_get(v, "agents");
+    var agents = bayan_json_v_obj_get_by_cstr(v, "agents");
     if (agents != 0) {
         var av = vec_new();
         for (var i = 0; i < bayan_json_v_arr_len(agents); i = i + 1) {
@@ -641,7 +642,7 @@ fn agnosai_crew_crd_spec_from_value(v): i64 {
         store64(s + AGN_CSPC_AGENTS, av);
     }
 
-    var tasks = bayan_json_v_obj_get(v, "tasks");
+    var tasks = bayan_json_v_obj_get_by_cstr(v, "tasks");
     if (tasks != 0) {
         var tv = vec_new();
         for (var i = 0; i < bayan_json_v_arr_len(tasks); i = i + 1) {
@@ -668,9 +669,9 @@ fn agnosai_crew_crd_from_value(v): i64 {
     var kind = _agnosai_str_field(v, "kind");
     if (api == 0) { return 0; }
     if (kind == 0) { return 0; }
-    var meta_v = bayan_json_v_obj_get(v, "metadata");
+    var meta_v = bayan_json_v_obj_get_by_cstr(v, "metadata");
     if (meta_v == 0) { return 0; }
-    var spec_v = bayan_json_v_obj_get(v, "spec");
+    var spec_v = bayan_json_v_obj_get_by_cstr(v, "spec");
     if (spec_v == 0) { return 0; }
     var spec = agnosai_crew_crd_spec_from_value(spec_v);
     if (spec == 0) { return 0; }

@@ -298,7 +298,9 @@ fn _agnosai_read_file_exact(path: Str, out_len): i64 {
     # is what std's `read` reports ("Is a directory (os error 21)").
     if (is_dir(path) == 1) { return 0 - 21; }
 
-    var fd = file_open(str_data(path), 0, 0);
+    # `str_cstr`, not `str_data` — a Str is not NUL-terminated at its length; see
+    # `_agnosai_loader_read` in `definitions/loader.cyr`.
+    var fd = file_open(str_cstr(path), 0, 0);
     if (fd < 0) { return fd; }
 
     var size = xlseek(fd, 0, 2);
@@ -505,7 +507,7 @@ fn agnosai_deserialize_crew_state(buf, len, out_state): i64 {
         return agnosai_error_serialization(str_from("expected a JSON object"));
     }
 
-    var sv = bayan_json_v_obj_get(v, "status");
+    var sv = bayan_json_v_obj_get_by_cstr(v, "status");
     if (sv == 0 || bayan_json_v_is_str(sv) == 0) {
         return agnosai_error_serialization(str_from("missing field `status`"));
     }
@@ -516,7 +518,7 @@ fn agnosai_deserialize_crew_state(buf, len, out_state): i64 {
             str_from("unknown variant for field `status`: "), spelling));
     }
 
-    var rv = bayan_json_v_obj_get(v, "results");
+    var rv = bayan_json_v_obj_get_by_cstr(v, "results");
     if (rv == 0 || bayan_json_v_is_arr(rv) == 0) {
         return agnosai_error_serialization(str_from("missing field `results`"));
     }

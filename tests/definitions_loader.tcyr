@@ -307,6 +307,19 @@ fn main(): i64 {
     assert_neq(agnosai_load_from_file(dotted_json, &err), 0,
       "and a real .json under that directory still loads");
 
+    # ⚠ A Str is not NUL-terminated at its length: a `str_sub` borrows its
+    # parent's bytes. Cut `agent.json.bak` back to `agent.json` and the bytes past
+    # the cut still read `.bak`, so a reader that hands `str_data` to `open` loads
+    # the backup — a file `is_dir` never checked. Fails on 2.1.2.
+    store64(&err, 0);
+    var bak = _t_write("/agent.json.bak",
+      "{\"agent_key\":\"backup\",\"name\":\"B\",\"role\":\"r\",\"goal\":\"g\"}");
+    var cut = str_sub(bak, 0, str_len(bak) - 4);
+    var cdef = agnosai_load_from_file(cut, &err);
+    assert_neq(cdef, 0, "a path cut from a longer one loads");
+    _t_seq(agnosai_agent_key(cdef), str_from("file-json"),
+      "and reads the file it names, not the longer path its bytes run on into");
+
     # --- filesystem errors -------------------------------------------------
     store64(&err, 0);
     assert_eq(agnosai_load_from_file(_t_under("/absent.json"), &err), 0,
@@ -497,9 +510,9 @@ fn main(): i64 {
     assert_eq(agnosai_preset_from_value(bayan_json_v_null()), 0, "and a null");
 
     var pv = agnosai_preset_to_value(pre);
-    assert_neq(bayan_json_v_obj_get(pv, "description"), 0, "the object carries description");
-    assert_neq(bayan_json_v_obj_get(pv, "domain"), 0, "and domain");
-    assert_eq(bayan_json_v_is_arr(bayan_json_v_obj_get(pv, "agents")), 1,
+    assert_neq(bayan_json_v_obj_get_by_cstr(pv, "description"), 0, "the object carries description");
+    assert_neq(bayan_json_v_obj_get_by_cstr(pv, "domain"), 0, "and domain");
+    assert_eq(bayan_json_v_is_arr(bayan_json_v_obj_get_by_cstr(pv, "agents")), 1,
       "and agents is an array");
 
     # A hand-built preset serializes the same way.
@@ -594,6 +607,7 @@ fn main(): i64 {
     sys_unlink(str_data(_t_under("/run.d/readme")));
     sys_unlink(str_data(_t_under("/run.d/agent.json")));
     sys_unlink(str_data(_t_under("/agent.json")));
+    sys_unlink(str_data(_t_under("/agent.json.bak")));
     sys_unlink(str_data(_t_under("/agent.yaml")));
     sys_unlink(str_data(_t_under("/agent.yml")));
     sys_unlink(str_data(_t_under("/AGENT.JSON")));

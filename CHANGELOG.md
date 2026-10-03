@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.3] — 2026-10-03
+
+Cyrius **6.6.14**, with `sigil` declared at the 6.6.14 fold and bote at 3.3.16, so every
+commit pin in the lock names the code `lib/` holds. agnosai's own code now builds without a
+warning on 6.6.14. 2.1.2 printed 161 of them in every build of `dist/agnosai.cyr`,
+agnosai's and every consumer's. Two of the 161 were real: file reads that could open a file
+other than the path they were given. `rust-old/` is still present: like 2.1.1 and 2.1.2, this
+patch does not carry the deletion the 2.1.0 notes schedule.
+
+### Changed
+
+- **Cyrius pin `6.6.12` → `6.6.14`.** The compiler changes are in 6.6.13: a wider `Str` →
+  `cstring` diagnostic, `f64_le` / `f64_ge` / `f64_trunc` as builtins, and natural alignment
+  for every global. 6.6.14 changes no compiler source. The re-provisioned `lib/` moves bayan
+  1.5.9 → 1.5.11, sigil 3.13.5 → 3.13.7 and ganita 1.2.9 → 1.2.11, drops the three f64
+  wrappers from `lib/math.cyr`, and carries 6.6.14's TLS fixes (new `lib/tls_hostid.cyr`).
+  All 112 snapshot files are byte-identical to `git show 6.6.14:lib/<mod>`.
+- **`sigil` 3.13.5 → 3.13.7, the 6.6.14 fold.** `dist/sigil.cyr` at 3.13.7 is
+  byte-identical to `git show 6.6.14:lib/sigil.cyr`, so the lock's sigil line now names the
+  commit (`2c8edf8`) whose bytes `lib/` holds. With 3.13.5 declared, the build compiled the
+  fold's 3.13.7 while the lock named 3.13.5.
+- **The `path` overrides on `bote`, `majra` and `tyche` are commented out**, as
+  ai-hwaccel's already was. While they were active, a local resolve read the sibling
+  checkouts and wrote no commit pin for those three. `../bote`'s own `path = "../libro"`
+  also vendored libro 2.10.5, where bote 3.3.15's tag resolves 2.10.4. So neither `lib/` nor
+  `cyrius.lock` matched what CI, or any consumer, resolves. The working tree now resolves
+  exactly as CI does, with 8 commit pins. The local `lib/libro.cyr` had differed from the
+  tag's only in its version header.
+- **`bote` 3.3.15 → 3.3.16**, released for this one on cyrius 6.6.14 with libro 2.10.6.
+  libro 2.10.5 moved its `deps.patra` to 1.15.1 and 2.10.6 its sigil to 3.13.7, the 6.6.14
+  folds. Through bote 3.3.15, libro 2.10.4 made agnosai's lock pin patra 1.14.3 while
+  `lib/patra.cyr` held the fold's 1.15.1; the pin now names 1.15.1. `lib/bote-core.cyr`
+  differs from 3.3.15's only in its version header and the `_bote_server_version()`
+  literal, and `src/` calls no bote-core function. `lib/libro.cyr` differs from 2.10.4's only
+  in its version header.
+- The other four deps were already at their latest tags: majra 2.9.2, kavach 3.13.1,
+  ai-hwaccel 2.4.0 and tyche 1.1.0.
+- `dist/agnosai.cyr` and `dist/agnosai-guard.cyr` are regenerated.
+
+### Fixed
+
+- **Two file reads open the path they are given.** `_agnosai_loader_read` and durable
+  state's `_agnosai_read_file_exact` handed `str_data(path)` to `file_open`, which reads a C
+  string. The loader read sits behind `agnosai_load_from_file`,
+  `agnosai_load_preset_from_file`, `agnosai_package_import_from_file` and the WASM module and
+  package loaders. A `Str` is not NUL-terminated at its length, because a `str_sub` borrows
+  its parent's bytes. So a path cut from a longer one opened the longer one, after `is_dir`
+  had checked the right one: loading `str_sub(".../agent.json.bak", 0, n - 4)` read the
+  backup. Both reads now pass `str_cstr(path)`. agnosai's own callers build NUL-terminated
+  paths, but a consumer passing a substring to the loader reached the bug. New assertions in
+  `definitions_loader` and `orch_durable_state` fail on 2.1.2. 6.6.13 warns on the old
+  spelling.
+- **A key holding a NUL byte is matched whole** by `json_transform` and by output
+  validation's `required` check. Both looked a `Str` key up through a C-string copy, which
+  ended the key at its first NUL, so `a\u0000b` found `a`'s value. They now call
+  `bayan_json_v_obj_get_by_str`, which also drops the copy, a global-allocator allocation per
+  call. Output validation still copies a key it reports missing. New assertions in
+  `tools_builtin_basic` and `orch_output_validation` fail on 2.1.2.
+- **No call to the deprecated `bayan_json_v_obj_get` remains.** bayan 1.5.10 deprecates it,
+  and the 6.6.14 fold is 1.5.11. The other 151 sites in `src/`, 173 in `tests/` and 3 in
+  `benches/` now call `bayan_json_v_obj_get_by_cstr`. Every key at those sites is a literal,
+  a literal-valued global or a `str_cstr` copy, and the old name is a one-line forward to
+  `_by_cstr`, so they return the same values. Comments that named the old getter now name the
+  new one.
+- **The six "assigning non-pointer to typed pointer" warnings are gone.** 6.6.12 printed
+  them too. `var x = str_from(..)` types `x` as a `Str`, and the bayan accessor or builder
+  assigned to it later returns an untyped `i64`. The four locals involved (`resource.cyr` ×2,
+  `scoring.cyr`, `serve.cyr`) are now declared `: i64`. A probe compiled both spellings: the
+  only codegen change is that the `i64` local can live in a register instead of a stack slot.
+
+### Performance
+
+- **The release is a wash.** Every `benches/*.bcyr` was built by 2.1.2 on cyrius 6.6.12 and
+  by 2.1.3 on 6.6.14, and the two binaries ran interleaved with the order alternating: 3
+  rounds for all eleven files, then 5 more for `server` and `orch`. Another session's 7-core
+  job had pushed the first pass of those two to a 1-minute load of 4–6. Across all 212
+  benchmarks the median is −0.8%, with 142 within ±5%. The quiet re-runs give `server` +1.2%
+  (25 of 33 within ±3%; the largest, `route_resolve_probe`, is 127 → 134 ns) and `orch` +0.6%
+  (70 of 79 within ±3%). The first pass's `server` +6.1% and `orch` −5.0% did not reproduce,
+  so neither is claimed. Among the quiet first-pass files the largest movers were
+  `replay_buffer_push_1000cap_full` −12.8% and `hw_inventory_from_hwaccel_8gpu_cpu` +6.4%,
+  from 3 rounds each and not re-run.
+- `bench-history.csv` gains its first rows since 2.0.6: 212 at version 2.1.3, taken at a
+  1-minute load of 0.7–1.3. Against 2.0.6's rows, eight releases and two toolchain lines
+  back, nothing is attributable to 2.1.3. `lt_aggregate_100k_500workers`, open since 2.0.6 as
+  a ~3.6x regression, reads 88.2 → 45.4 ms, still about twice its 2026-08 band.
+
+### Known — in dependencies, unchanged here
+
+- ai-hwaccel 2.4.0, its latest tag, calls the deprecated getter three times in its own bundle
+  and declares bayan 1.5.6, where the fold is 1.5.11. Any build that includes it, this one or
+  a consumer's, still prints those three warnings.
+- kavach 3.13.1 declares sigil 3.12.18. agnosai's own `[deps.sigil]` wins (closest-wins), so
+  that pin is never resolved.
+
 ## [2.1.2] — 2026-10-01
 
 The toolchain and every direct dependency move to their latest releases, so a consumer

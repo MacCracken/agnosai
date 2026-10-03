@@ -2,23 +2,50 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-10-01.
+> Last refreshed: 2026-10-03.
 
-## Now — 2.1.2
+## Now — 2.1.3
 
 | | |
 |---|---|
-| **version** | **2.1.2** |
-| **cyrius pin** | **6.6.12** |
-| **tests** | **99 suites, 8,058 assertions, 0 failed** — the CI steps run in a clean copy against an EMPTY dep cache with no sibling checkouts, so every dep resolved from its tag, with the host's wasmtime 49.0.0 (CI pins 47.0.3) |
+| **version** | **2.1.3** |
+| **cyrius pin** | **6.6.14** |
+| **tests** | **99 suites, 8,077 assertions, 0 failed** — the CI steps run in a sibling-free replica against an EMPTY dep cache, so every dep resolved from its tag, with the host's wasmtime 49.0.1 (CI pins 47.0.3). ⚠ `sandbox_spawn` and `sandbox_process` assert once per environment variable, so the total moves with the environment: a plain shell gave 8,065 |
 | **coverage** | **99%** — 102/102 files, 1,576/1,589 fns (gate is `--min 80`) |
-| **dist** | `dist/agnosai.cyr` 37,608 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.2; sidecars 45 / 6 leaves |
-| **binary** | `build/agnosai` **5,155,624 B**; aarch64 cross-build **6,351,152 B** |
+| **dist** | `dist/agnosai.cyr` 37,619 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.3; sidecars 45 / 6 leaves |
+| **binary** | `build/agnosai` **5,219,192 B**; aarch64 cross-build **6,418,832 B** |
 | **gates** | `check-symbols.sh` (both targets) · `check-clean.sh` · `distlib --check` · fuzz 4/4 · coverage · examples — all green |
+| **build warnings** | none from `src/`; 3 from ai-hwaccel 2.4.0's own bundle (the deprecated bayan getter) |
 
-Direct deps (`[deps.*]`, all six) at their latest tags: `sigil` **3.13.5** (= the 6.6.12
-fold, byte-identical), `bote` **3.3.15**, `majra` **2.9.2**, `kavach` **3.13.1**,
-`ai-hwaccel` **2.4.0**, `tyche` **1.1.0**. Transitively through bote: libro **2.10.4**.
+Direct deps (`[deps.*]`, all six) at their latest tags, **none with an active `path`**: `sigil`
+**3.13.7** (= the 6.6.14 fold, byte-identical), `bote` **3.3.16**, `majra` **2.9.2**, `kavach`
+**3.13.1**, `ai-hwaccel` **2.4.0**, `tyche` **1.1.0**. Transitively through bote: libro
+**2.10.6**, which declares the folds' patra 1.15.1 and sigil 3.13.7. `cyrius.lock` holds 118
+files and 8 commit pins, and every pin on a folded module names the fold `lib/` holds.
+
+### 2.1.3 — cyrius 6.6.14; the build is warning-free and the lock is CI's
+
+- **The working tree resolves exactly as CI does.** The `path` overrides on bote, majra and
+  tyche are commented out (ai-hwaccel's already was), so a local `cyrius deps` writes the
+  same 8-pin lock a runner writes. A sibling-free replica with an empty dep cache reproduces
+  `lib/` and `cyrius.lock` byte for byte; with the overrides active it could not, since the
+  local lock had no pin for the three and `../bote` chained to `../libro`.
+- **A three-repo chain was released for one lock line.** bote 3.3.15 pinned libro 2.10.4,
+  which declared patra 1.14.3, so agnosai's lock named a patra commit `lib/` did not hold.
+  libro 2.10.6 (sigil 3.13.7, cyrius 6.6.14) and bote 3.3.16 (libro 2.10.6, cyrius 6.6.14, no
+  `path` lines) were released first, each certified the same sibling-free way.
+- ⚠ **From cyrius 6.6.11 a thin profile of a stdlib leaf is not vendored.** A consumer that
+  lists `sigil` in `[deps] stdlib` (bote) keeps the fold and never gets libro's thin sigil
+  files ("not vendored" notes in `cyrius deps`). agnosai is unaffected either way: its own
+  `[deps.sigil]` wins closest-wins, so libro's sigil block is skipped.
+- **Deps whose own tags still pin a module off the fold** (all harmless, recorded): kavach
+  3.13.1 declares sigil 3.12.18 (skipped, closest-wins) and ai-hwaccel 2.4.0 declares bayan
+  1.5.6 (the stdlib leaf wins) and calls the deprecated getter three times.
+- **Benchmarks.** `bench-history.csv` has its first sweep since 2.0.6 (212 rows, load
+  0.7–1.3). An interleaved A/B against 2.1.2 on 6.6.12 is a wash: overall median −0.8%, and
+  the quiet re-runs of `server` and `orch` +1.2% / +0.6%. ⚠ A first pass of those two read
+  +6% / −5% while another session held 7 cores, and neither reproduced. **Interleave, and
+  re-run anything measured above a 1-minute load of about 2.**
 
 ### 2.1.2 — cyrius 6.6.12 and every dep at its latest
 
@@ -38,6 +65,7 @@ ai-hwaccel and tyche "ahead of" agnosai's; it turned out they never took effect 
 - ⚠ **Locally, `lib/libro.cyr` is NOT the tag's.** bote's `path = "../libro"` chains from
   this repo's `path = "../bote"`, so a local resolve reads the `../libro` checkout. dist does
   not contain libro and is unaffected; the suites above ran on the tag-resolved copy.
+  ✅ Resolved at 2.1.3: the `path` overrides are commented out and bote 3.3.16 commits none.
 
 ### 2.1.1 — kavach's backend enum, named by its own name
 
@@ -216,6 +244,9 @@ real historical `1.1.0` fails the new suite while `server_routes_health` and
 `server_routes_mcp` report **2 passed, 0 failed** on the identical mutation.
 
 ### ⚠ OPEN — a ~3.6x regression, found at 2.0.6, NOT caused by it
+
+**At 2.1.3 (2026-10-03, cyrius 6.6.14):** `lt_aggregate_100k_500workers` reads **45.4 ms**,
+halved since 2.0.6's 88.2 ms but still about twice the 2026-08 band. Still open.
 
 The benchmark sweep had not run since **2026-08-13** (10 days, 5 releases).
 Running it at 2.0.6 surfaced three regressions that were already in the tree:
