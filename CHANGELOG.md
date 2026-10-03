@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.4] — 2026-10-03
+
+kavach **3.13.2** and ai-hwaccel **2.4.1**, both moved to cyrius 6.6.14. With them,
+`dist/agnosai.cyr` builds without a warning from any code: the three ai-hwaccel 2.4.0 printed
+in agnosai's build and every consumer's are gone, and every dep's own pins now name the folds.
+No `src/` change but the `AGNOSAI_VERSION` literal. `rust-old/` is still present: like 2.1.1 to 2.1.3, this patch does not carry
+the deletion the 2.1.0 notes schedule.
+
+### Changed
+
+- **`ai-hwaccel` 2.4.0 → 2.4.1.** It renames its three `bayan_json_v_obj_get` calls to
+  `_by_cstr` and declares bayan 1.5.11, the fold. Its CLI output is unchanged from 2.4.0.
+- **`kavach` 3.13.1 → 3.13.2.** It declares sigil 3.13.7 and pins ai-hwaccel 2.4.1 and samay
+  1.1.6. Its 3.13.2 behaviour changes reach agnosai's sandbox through three paths:
+  - **WASM** (`src/sandbox/wasm.cyr`, `KavachBackend.WASM` under `policy_basic()`): wasmtime now
+    runs under kavach's exec seccomp filter, where 3.13.1 left it unfiltered. A host that cannot
+    load seccomp (qemu-user) refuses the run with 125. agnosai's CI runs on x86-64 only.
+  - **Process** (`src/sandbox/kavach_bridge.cyr`): the capture closes a full stdout (1 MiB),
+    so a payload that writes more is cut off by SIGPIPE (141) where it hung or timed out. A
+    result keeps its own stderr when the next exec runs. A payload dies with the kavach process
+    capturing it, and starts with SIGPIPE at its default.
+  - **OCI**: the config's deadline now bounds the runtime (30 s unless the config sets one), and
+    the config's stdin reaches it. OCI already reported the runtime's exit status and stderr.
+  - **What does not change here:** an unset `config_stdin` is now an empty stdin, but both
+    agnosai paths set it (`kavach_bridge.cyr` passes `""`, `wasm.cyr` the input). TCP port
+    counts no longer add to the strength score, and agnosai's policies set none.
+- **`cyrius.lock`** holds 118 files and 8 commit pins, kavach and ai-hwaccel at their new tags.
+  `lib/kavach.cyr` and `lib/ai-hwaccel.cyr` are byte-identical to the tags' `dist/` bundles,
+  and they are the only files of `lib/` that change.
+
+### Docs
+
+- **Roadmap B17:** agnostic 0.1.9's six findings about crew events and status. A parallel
+  or DAG wave announces every task before it runs. Workers send no `token` events.
+  `agent_cost_usd` is always empty. `token` events carry `crew_id: "unknown"`. A timed-out crew
+  can report `completed`. The registry never shows RUNNING. They were recorded only in
+  agnostic's roadmap; four are confirmed in the 2.1.3 source.
+- **Roadmap B18:** the `lt_aggregate_100k_500workers` regression, until now recorded only in
+  `state.md`.
+- **Roadmap C (upstream):** two kavach issues are open again, both reaching the sandbox.
+  - Its pinned exec cannot run uutils coreutils, Ubuntu's default from 25.10.
+  - The `basic` seccomp profile lacks `sendto`, which cyrius 6.6.14's TLS uses.
+
+  The sandhi row adds the filing that its chunked-send calls report success to a client that
+  has gone: B8's SSE stream.
+- **Roadmap C2:** the condition for deleting `_agnosai_signal_default` is met. cyrius 6.5.7
+  added `signal_default` to the stdlib. The code was not changed in this dependency-only
+  release.
+- **Roadmap B16** names kavach 3.13.2 as the version its gaps are re-checked against; 3.13.2
+  rebuilt the WASM backend's capture and stdin, which one of them concerns.
+- **Roadmap F, "past parity":** the multi-agent gaps from the 2026-10-03 review of the
+  project's directions (`agnostic/docs/development/research/2026-10-03-herdr-and-multi-agent-landscape.md`).
+  F1–F9 run from a tool-calling loop in `execute_task` and wiring the built hierarchical,
+  approval, durable-state and budget code, through OTel GenAI span names, agent-selection
+  explanations, protocol currency and compressed hand-offs. Each item that changes
+  oracle-defined behaviour needs its own ADR.
+
+### Performance
+
+- **No measured change.** Every `benches/*.bcyr` was built by 2.1.3 and by 2.1.4 (both on cyrius
+  6.6.14; only kavach and ai-hwaccel differ). The two binaries ran interleaved, with the order
+  alternating and pinned to one CPU, for 3 rounds of all eleven files. Across the 212 benchmarks
+  the median is +0.0%, with 144 within ±5%.
+- **`server` read +20.7% in that pass and did not reproduce.** Other sessions had pushed the
+  1-minute load to 10–12 during it. 8 more rounds of `server` and `harness`, at a load of 6–9,
+  give +0.1%: 30 of 33 within ±3%, all within ±5%, and every range overlapping.
+- **Outside `server`:** the pass's largest movers, `orch/pubsub_subscribe_at_cap` (−43%) and
+  `tools/tool_registry_has_50_miss` (−28%), have overlapping ranges. Two `llm` routing rows
+  separate: `route_research_complex` 13.0 → 9.5 ns and `route_all_21_combinations`
+  331 → 287 ns. Neither dependency's code runs there, so this is code layout, and neither is
+  claimed.
+- **`bench-history.csv` gains 212 rows at 2.1.4.** The sweep was pinned to one CPU at a 1-minute
+  load of 3–5. Read those rows against the interleaved run above, not against 2.1.3's, which
+  were taken at a load of 0.7–1.3.
+
+### Verified
+
+- **Suite:** 99 suites and 8,065 assertions pass, 0 failed, in a plain shell against kavach
+  3.13.2 and ai-hwaccel 2.4.1, with wasmtime 49.0.1.
+- **Gates:** `check-symbols.sh` on both targets and `check-clean.sh` (fmt, lint, doc, vet, deny,
+  `deps --verify`, the lib snapshot, generated sources). Coverage is 99%: 102/102 files and
+  1,576 of 1,589 functions.
+- **Sibling-free:** CI's steps ran in a replica with an empty dependency cache. `lib sync --full`
+  followed by `deps`, run from an empty `lib/`, reproduced `lib/` and `cyrius.lock` byte for byte.
+
 ## [2.1.3] — 2026-10-03
 
 Cyrius **6.6.14**, with `sigil` declared at the 6.6.14 fold and bote at 3.3.16, so every

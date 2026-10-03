@@ -84,14 +84,14 @@ cyrius coverage --min 80
 
 AgnosAI ships **both** a binary and a bundle. `cyrius.cyml` carries a `[lib]`
 stanza of **111** modules, and `cyrius distlib` concatenates them into
-`dist/agnosai.cyr` (**37,619 lines** at 2.1.3, stamped with the release) plus a
+`dist/agnosai.cyr` (**37,619 lines** at 2.1.4, stamped with the release) plus a
 `dist/agnosai.deps` sidecar naming the **45** stdlib leaves the fold needs in
 scope — so a `[deps.agnosai]` block resolves like any other dependency:
 
 ```cyml
 [deps.agnosai]
 git = "https://github.com/MacCracken/agnosai.git"
-tag = "2.1.3"
+tag = "2.1.4"
 modules = ["dist/agnosai.cyr"]
 ```
 

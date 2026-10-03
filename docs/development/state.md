@@ -4,24 +4,43 @@
 > (durable); this file is **state** (volatile).
 > Last refreshed: 2026-10-03.
 
-## Now — 2.1.3
+## Now — 2.1.4
 
 | | |
 |---|---|
-| **version** | **2.1.3** |
+| **version** | **2.1.4** |
 | **cyrius pin** | **6.6.14** |
-| **tests** | **99 suites, 8,077 assertions, 0 failed** — the CI steps run in a sibling-free replica against an EMPTY dep cache, so every dep resolved from its tag, with the host's wasmtime 49.0.1 (CI pins 47.0.3). ⚠ `sandbox_spawn` and `sandbox_process` assert once per environment variable, so the total moves with the environment: a plain shell gave 8,065 |
+| **tests** | **99 suites, 8,065 assertions, 0 failed** in a plain shell against kavach 3.13.2 and ai-hwaccel 2.4.1, with wasmtime 49.0.1 (CI pins 47.0.3); certified again in a sibling-free replica with an empty dep cache. ⚠ `sandbox_spawn` and `sandbox_process` assert once per environment variable, so the total moves with the environment (2.1.3's replica gave 8,077) |
 | **coverage** | **99%** — 102/102 files, 1,576/1,589 fns (gate is `--min 80`) |
-| **dist** | `dist/agnosai.cyr` 37,619 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.3; sidecars 45 / 6 leaves |
-| **binary** | `build/agnosai` **5,219,192 B**; aarch64 cross-build **6,418,832 B** |
-| **gates** | `check-symbols.sh` (both targets) · `check-clean.sh` · `distlib --check` · fuzz 4/4 · coverage · examples — all green |
-| **build warnings** | none from `src/`; 3 from ai-hwaccel 2.4.0's own bundle (the deprecated bayan getter) |
+| **dist** | `dist/agnosai.cyr` 37,619 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.4; sidecars 45 / 6 leaves |
+| **binary** | `build/agnosai` **5,223,328 B**; aarch64 cross-build **6,422,976 B** (each about 4.1 KB more than 2.1.3: kavach 3.13.2's capture and confinement code) |
+| **gates** | `check-symbols.sh` (both targets) · `check-clean.sh` · `distlib --check` · fuzz · coverage · examples — all green |
+| **build warnings** | **none from any code** — `src/` or a dependency's bundle. What remains are the toolchain's notes: sigil's static array, large static data, and the two "refusing to overwrite stdlib leaf" lines for sigil and patra |
 
 Direct deps (`[deps.*]`, all six) at their latest tags, **none with an active `path`**: `sigil`
 **3.13.7** (= the 6.6.14 fold, byte-identical), `bote` **3.3.16**, `majra` **2.9.2**, `kavach`
-**3.13.1**, `ai-hwaccel` **2.4.0**, `tyche` **1.1.0**. Transitively through bote: libro
+**3.13.2**, `ai-hwaccel` **2.4.1**, `tyche` **1.1.0**. Transitively through bote: libro
 **2.10.6**, which declares the folds' patra 1.15.1 and sigil 3.13.7. `cyrius.lock` holds 118
-files and 8 commit pins, and every pin on a folded module names the fold `lib/` holds.
+files and 8 commit pins, and every pin on a folded module names the fold `lib/` holds. Every
+dep's own pins now name the folds too: kavach 3.13.2 declares sigil 3.13.7, ai-hwaccel 2.4.1
+bayan 1.5.11.
+
+### 2.1.4 — kavach 3.13.2 and ai-hwaccel 2.4.1; no code warning anywhere
+
+- **Two dependency releases, made for this one.** ai-hwaccel 2.4.1 (cyrius 6.6.14, bayan 1.5.11,
+  the three deprecated getter calls renamed), then samay 1.1.6 (the same, 18 calls) and kavach
+  3.13.2 (its 3.13.2 work plus cyrius 6.6.14, sigil 3.13.7, ai-hwaccel 2.4.1, samay 1.1.6). Each
+  was certified sibling-free before the next could resolve it. No agnosai `src/` change but the
+  version literal.
+- **What kavach 3.13.2 changes under agnosai:** wasmtime runs under kavach's exec seccomp filter
+  (a host without seccomp refuses with 125; agnosai's CI is x86-64 only); the process capture
+  cuts a payload off at 1 MiB of stdout with SIGPIPE, keeps each result's stderr, kills payloads
+  with their kavach, and resets SIGPIPE to default; OCI runs take the config's deadline and
+  stdin. The unset-stdin and TCP-port changes do not reach agnosai (it sets `config_stdin` on
+  both paths and no port counts). All 99 suites pass against it.
+- ⚠ **Open in kavach, reaching the sandbox** (roadmap C): uutils coreutils (Ubuntu 25.10+)
+  refuse kavach's pinned exec, so `/bin/echo` and the like exit 1 on such a host; and the
+  `basic` profile has no `sendto` for cyrius 6.6.14's TLS writes.
 
 ### 2.1.3 — cyrius 6.6.14; the build is warning-free and the lock is CI's
 
@@ -925,7 +944,7 @@ it was never invoked*.
 
 ## Version
 
-**2.1.0** (`VERSION`), cut 2026-09-26. **2.0.0** was cut 2026-08-14, the first Cyrius release. 1.1.0 was
+**2.1.4** (`VERSION`), cut 2026-10-03; 2.1.0 was cut 2026-09-26. **2.0.0** was cut 2026-08-14, the first Cyrius release. 1.1.0 was
 the last shipped Rust release and is preserved at `rust-old/` as the parity
 oracle. The rule held: VERSION bumped once parity landed, so the number always
 names something that actually shipped.
