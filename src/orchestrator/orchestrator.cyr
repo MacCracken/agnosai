@@ -200,6 +200,32 @@ fn _agnosai_orch_evict_locked(o): i64 {
     return evicted;
 }
 
+# Move a registered crew from status `from` to `to`, and only from `from`.
+# Returns 1 when it moved, 0 when the crew is not registered or holds any other
+# status. The caller holds the lock.
+#
+# **Only from `from`** is what lets a cancel stand: `cancel_crew` marks the
+# registered state CANCELLED in place, and a PENDING → RUNNING move that came
+# after it must not overwrite that. It is the same in-place write `cancel_crew`
+# makes — one aligned 8-byte store, so a reader holding the state pointer
+# without the lock sees the old status or the new one, never a torn value.
+fn _agnosai_orch_advance_locked(o, crew_id: Str, from, to): i64 {
+    var state = map_get(load64(o + AGN_OR_CREWS), crew_id);
+    if (state == 0) { return 0; }
+    if (agnosai_crew_state_status(state) != from) { return 0; }
+    agnosai_crew_state_with_status(state, to);
+    return 1;
+}
+
+# `_agnosai_orch_advance_locked`, taking the registry lock itself.
+fn _agnosai_orch_advance(o, crew_id: Str, from, to): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var moved = _agnosai_orch_advance_locked(o, crew_id, from, to);
+    mutex_unlock(mtx);
+    return moved;
+}
+
 # Record one of the orchestrator's three audit events.
 fn _agnosai_orch_audit(o, event: Str, level: Str, message: Str, metadata): i64 {
     var chain = load64(o + AGN_OR_AUDIT);
@@ -218,8 +244,10 @@ fn _agnosai_orch_level_for(status): i64 {
 #
 # Order matters and is the oracle's: audit `crew_accepted` **before** the crew
 # is registered and long before it runs, so a crash mid-run still leaves the
-# acceptance in the trail; register as `Pending`; run; audit `crew_finished`;
-# store the final state; then clean up the cancel token and the event channel.
+# acceptance in the trail; register as `Pending`; mark it `Running` as it is
+# handed to the runner (ADR 022 — the oracle never stores `Running`); run; audit
+# `crew_finished`; store the final state; then clean up the cancel token and the
+# event channel.
 #
 # The event channel is removed at the end, which is what stops a long-lived
 # orchestrator accumulating one channel per crew ever run.
@@ -358,6 +386,13 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
     agnosai_crew_runner_set_deadline_ns(runner,
       clock_now_ns() + timeout_secs * AGNOSAI_NS_PER_SEC);
 
+    # ADR 022 — the registry says RUNNING while the crew runs. The oracle stores
+    # `Pending` at registration and the terminal state at the end, and never
+    # `Running` in between (`orchestrator.rs:168-176`, `:254` as of tag 2.1.4),
+    # so a poller could not tell a queued crew from a working one. It moves only
+    # from PENDING: a cancel that landed first stands.
+    _agnosai_orch_advance(o, crew_id, AGNOSAI_CREW_PENDING, AGNOSAI_CREW_RUNNING);
+
     var run_err: i64[1];
     store64(&run_err, 0);
     var state = agnosai_crew_runner_run(runner, &run_err);
@@ -366,6 +401,11 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
     # — `CrewState { status: Failed, results: vec![], profile: None }`. Matched
     # exactly: a caller must not read a timed-out crew's partial output as if the
     # crew had finished.
+    #
+    # Since ADR 022 the runner already returns that state, and its
+    # `crew_completed` already said `failed`, so this replaces it with an equal
+    # one. It stays for the warning `_agnosai_orch_timeout_state` logs, and so a
+    # runner that did not build the state could not leak partial results here.
     if (state != 0 && agnosai_crew_runner_timed_out(runner) == 1) {
         state = _agnosai_orch_timeout_state(crew_id, timeout_secs);
     }
@@ -376,6 +416,12 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
         # Hand the caller the reason, not just the failure.
         if (out_err != 0) { store64(out_err, load64(&run_err)); }
         mutex_lock(mtx);
+        # ⚠ Put PENDING back (ADR 022). This arm stores no terminal state, so a
+        # RUNNING left here would read "running" forever — and RUNNING is not
+        # terminal, so `_agnosai_orch_evict_locked` would never evict it either.
+        # PENDING is exactly what this arm left before RUNNING was stored. Only
+        # from RUNNING, so a cancel that landed mid-run stands.
+        _agnosai_orch_advance_locked(o, crew_id, AGNOSAI_CREW_RUNNING, AGNOSAI_CREW_PENDING);
         map_delete(load64(o + AGN_OR_CANCEL), crew_id);
         mutex_unlock(mtx);
         return 0;
@@ -454,8 +500,10 @@ fn _agnosai_orch_submit_thread(job): i64 {
 #
 # The id is usable at once: `_agnosai_orch_register` has already put the crew in
 # the map as PENDING and published its cancel flag, so `GET /api/v1/crews/{id}`
-# answers and `cancel_crew` reaches it while it runs. Both statuses are existing
-# wire values (`crew.cyr:69-75`), so a polling client sees nothing new.
+# answers and `cancel_crew` reaches it while it runs. A poller sees `pending`,
+# then `running` once the thread hands the crew to its runner (ADR 022), then
+# the terminal status. All are existing wire values (`agnosai_crew_status_to_wire`),
+# so a polling client sees no new spelling.
 #
 # **Returns 0 if the thread cannot be created**, leaving the crew PENDING and
 # unexecuted rather than reporting a run that never started.

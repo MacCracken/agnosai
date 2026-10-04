@@ -21,10 +21,10 @@
 # `docs/development/roadmap.md`'s note *"an OpenTelemetry library repo"* first.
 # That library is a **sibling repo consumed through `[deps]`**, like sakshi or
 # majra — not a cyrius stdlib module and not a language feature. It would own
-# the protobuf codec, a general span model, W3C context propagation with a
-# **thread-local** current-span (the one thing neither hand-roll solves), and a
+# the protobuf codec, a general span model, W3C context propagation, and a
 # batching exporter. When it lands, this file collapses to a thin adapter, the
-# way `fleet/relay` did onto majra.
+# way `fleet/relay` did onto majra. (Context propagation is no longer missing
+# here: ADR 023 parses `traceparent` and threads span contexts explicitly.)
 #
 # ## The JSON mapping is NOT "just JSON"
 #
@@ -67,8 +67,11 @@ enum AgnosaiOtlpStatusCode {
     AGNOSAI_OTLP_STATUS_ERROR = 2;
 }
 
-# Export context heap layout — 48 bytes. The identity and timing a span record
+# Export context heap layout — 56 bytes. The identity and timing a span record
 # does not carry: the exporter supplies them at enqueue time.
+#
+# `PARENT_SPAN_ID` is 0 for a root span, and the encoder then omits the
+# `parentSpanId` key entirely rather than sending sixteen zeros (ADR 023).
 enum AgnosaiOtlpCtxOff {
     AGN_OTC_TRACE_HI = 0;
     AGN_OTC_TRACE_LO = 8;
@@ -76,27 +79,51 @@ enum AgnosaiOtlpCtxOff {
     AGN_OTC_START_NS = 24;
     AGN_OTC_END_NS = 32;
     AGN_OTC_STATUS = 40;
-    AGN_OTC_SIZE = 48;
+    AGN_OTC_PARENT_SPAN_ID = 48;
+    AGN_OTC_SIZE = 56;
 }
 
-# The identity and timing for one exported span.
+# Fill an export context at `c`, which must hold `AGN_OTC_SIZE` bytes.
 #
-# `trace_hi`/`trace_lo` are the two halves of the W3C 128-bit trace id, which is
-# exactly what `sakshi_trace_id_hi` / `_lo` hold.
-fn agnosai_otlp_ctx_new(trace_hi, trace_lo, span_id, start_ns, end_ns, status): i64 {
-    var c = alloc(AGN_OTC_SIZE);
+# Split from the constructor so the recorder can build the context in a stack
+# buffer: `agnosai_otlp_ring_enqueue` encodes it and keeps nothing, so a heap
+# copy would be 56 bytes on the no-free global bump per span for nothing.
+fn _agnosai_otlp_ctx_fill(c, trace_hi, trace_lo, span_id, parent_span_id, start_ns, end_ns,
+  status): i64 {
     store64(c + AGN_OTC_TRACE_HI, trace_hi);
     store64(c + AGN_OTC_TRACE_LO, trace_lo);
     store64(c + AGN_OTC_SPAN_ID, span_id);
     store64(c + AGN_OTC_START_NS, start_ns);
     store64(c + AGN_OTC_END_NS, end_ns);
     store64(c + AGN_OTC_STATUS, status);
+    store64(c + AGN_OTC_PARENT_SPAN_ID, parent_span_id);
     return c;
+}
+
+# The identity, parent and timing for one exported span. `parent_span_id` is 0
+# for a root span.
+#
+# `trace_hi`/`trace_lo` are the two halves of the W3C 128-bit trace id, which is
+# exactly what `sakshi_trace_id_hi` / `_lo` hold.
+fn agnosai_otlp_ctx_new_child(trace_hi, trace_lo, span_id, parent_span_id, start_ns, end_ns,
+  status): i64 {
+    return _agnosai_otlp_ctx_fill(alloc(AGN_OTC_SIZE), trace_hi, trace_lo, span_id,
+      parent_span_id, start_ns, end_ns, status);
+}
+
+# The identity and timing for one exported ROOT span — no parent.
+fn agnosai_otlp_ctx_new(trace_hi, trace_lo, span_id, start_ns, end_ns, status): i64 {
+    return agnosai_otlp_ctx_new_child(trace_hi, trace_lo, span_id, 0, start_ns, end_ns, status);
 }
 
 # The context's status code.
 fn agnosai_otlp_ctx_status(c): i64 {
     return load64(c + AGN_OTC_STATUS);
+}
+
+# The context's parent span id, or 0 for a root span.
+fn agnosai_otlp_ctx_parent_span_id(c): i64 {
+    return load64(c + AGN_OTC_PARENT_SPAN_ID);
 }
 
 # Whether a trace id is the all-zero id, which the W3C spec declares INVALID.
@@ -148,6 +175,15 @@ fn _agnosai_otlp_putc_a(a, sb, ch): i64 {
 # the remaining controls, and everything >= 0x20 verbatim (RFC 8259 §8.1).
 fn _agnosai_otlp_json_str_a(a, sb, s: Str): i64 {
     _agnosai_otlp_putc_a(a, sb, 34);
+    _agnosai_otlp_json_body_a(a, sb, s);
+    _agnosai_otlp_putc_a(a, sb, 34);
+    return 0;
+}
+
+# The escaped bytes of `s`, with no quotes — the body of
+# `_agnosai_otlp_json_str_a`, split out so a span name can be written as two
+# escaped parts inside one pair of quotes without building the joined string.
+fn _agnosai_otlp_json_body_a(a, sb, s: Str): i64 {
     var data = str_data(s);
     var slen = str_len(s);
     var ji = 0;
@@ -190,7 +226,6 @@ fn _agnosai_otlp_json_str_a(a, sb, s: Str): i64 {
                                     } } } } } } } }
         ji = ji + 1;
     }
-    _agnosai_otlp_putc_a(a, sb, 34);
     return 0;
 }
 
@@ -233,6 +268,185 @@ fn agnosai_otlp_add_span_id(sb, id): i64 {
     return agnosai_otlp_add_span_id_a(default_alloc(), sb, id);
 }
 
+# --- span context (W3C Trace Context Level 1) -------------------------------
+#
+# ADR 023. A span context is the identity a span hands its children: the trace
+# it belongs to, its own span id, and the trace flags. It is **passed down the
+# call path explicitly** — runner, wave job, task, retry context, chat call —
+# and never kept in thread-local storage. `thread_create` gives every worker a
+# zeroed TLS block (`lib/thread.cyr`), agnostic submits crews through a detached
+# orchestrator thread, and `thread_local_get` faults on a main thread that never
+# called `thread_local_init`; a context set on the caller's thread would be
+# invisible to the crew in every process mode.
+#
+# The `traceparent` header is `version-traceid-parentid-flags`:
+# `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01` — 55 bytes.
+
+# Span context heap layout — 32 bytes.
+enum AgnosaiSpanContextOff {
+    AGN_SPC_TRACE_HI = 0;
+    AGN_SPC_TRACE_LO = 8;
+    AGN_SPC_SPAN_ID = 16;
+    # The W3C trace-flags byte. Bit 0 is `sampled`; the others are kept as they
+    # arrived and passed on to children.
+    AGN_SPC_FLAGS = 24;
+    AGN_SPC_SIZE = 32;
+}
+
+# The exact length of a version-00 `traceparent`.
+var AGNOSAI_TRACEPARENT_LEN = 55;
+
+# A span context from its parts.
+fn agnosai_otlp_span_context_new(trace_hi, trace_lo, span_id, flags): i64 {
+    var sc = alloc(AGN_SPC_SIZE);
+    store64(sc + AGN_SPC_TRACE_HI, trace_hi);
+    store64(sc + AGN_SPC_TRACE_LO, trace_lo);
+    store64(sc + AGN_SPC_SPAN_ID, span_id);
+    store64(sc + AGN_SPC_FLAGS, flags);
+    return sc;
+}
+
+# The high half of the context's trace id.
+fn agnosai_otlp_span_context_trace_hi(sc): i64 {
+    return load64(sc + AGN_SPC_TRACE_HI);
+}
+
+# The low half of the context's trace id.
+fn agnosai_otlp_span_context_trace_lo(sc): i64 {
+    return load64(sc + AGN_SPC_TRACE_LO);
+}
+
+# The context's own span id — a child's parent span id.
+fn agnosai_otlp_span_context_span_id(sc): i64 {
+    return load64(sc + AGN_SPC_SPAN_ID);
+}
+
+# The context's trace-flags byte.
+fn agnosai_otlp_span_context_flags(sc): i64 {
+    return load64(sc + AGN_SPC_FLAGS);
+}
+
+# 1 when the context's `sampled` flag is set.
+fn agnosai_otlp_span_context_sampled(sc): i64 {
+    return load64(sc + AGN_SPC_FLAGS) & 1;
+}
+
+# The value of one LOWERCASE hex digit, or -1.
+#
+# ⚠ Uppercase is rejected. W3C Trace Context writes the ids as HEXDIGLC, and a
+# receiver that folds case accepts headers no conforming sender produces.
+fn _agnosai_otlp_hex_lc(c): i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return 0 - 1;
+}
+
+# `n` lowercase hex digits at `p` as a number, or -1 when any is not one.
+#
+# At most 16 digits, so the value fits an i64 bit pattern. A 16-digit value
+# with the top bit set is negative as an i64, and still a valid id — so the
+# caller tests the -1 sentinel through `ok`, never through the sign.
+fn _agnosai_otlp_hex_field(p, n, ok): i64 {
+    var v = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var d = _agnosai_otlp_hex_lc(load8(p + i));
+        if (d < 0) {
+            store64(ok, 0);
+            return 0;
+        }
+        v = (v << 4) | d;
+    }
+    return v;
+}
+
+# Parse a `traceparent` into a span context in `a`, or 0.
+#
+# **Strict, and never an error.** Answers 0 unless every rule of W3C Trace
+# Context Level 1 version `00` holds: exactly 55 bytes; version exactly `00`;
+# `-` at offsets 2, 35 and 52; every other byte lowercase hex; a trace id that
+# is not all zeros; a parent id that is not all zeros. A caller that gets 0
+# starts a new root trace — a malformed header is the sender's problem and must
+# not fail the request that carried it.
+#
+# ⚠ Version `00` only. The spec lets a receiver parse a HIGHER version's first
+# 55 bytes, but no such version exists, and a parser that guesses at one is
+# a parser that accepts what it cannot check.
+fn agnosai_otlp_span_context_parse_a(a, tp: Str): i64 {
+    if (tp == 0) { return 0; }
+    if (str_len(tp) != AGNOSAI_TRACEPARENT_LEN) { return 0; }
+    var d = str_data(tp);
+    if (load8(d) != 48 || load8(d + 1) != 48) { return 0; }
+    if (load8(d + 2) != 45 || load8(d + 35) != 45 || load8(d + 52) != 45) { return 0; }
+
+    var ok: i64[1];
+    store64(&ok, 1);
+    var hi = _agnosai_otlp_hex_field(d + 3, 16, &ok);
+    var lo = _agnosai_otlp_hex_field(d + 19, 16, &ok);
+    var span = _agnosai_otlp_hex_field(d + 36, 16, &ok);
+    var flags = _agnosai_otlp_hex_field(d + 53, 2, &ok);
+    if (load64(&ok) == 0) { return 0; }
+    if (agnosai_otlp_trace_id_is_zero(hi, lo) == 1) { return 0; }
+    if (span == 0) { return 0; }
+
+    var sc = alloc_via(a, AGN_SPC_SIZE);
+    if (sc == 0) { return 0; }
+    store64(sc + AGN_SPC_TRACE_HI, hi);
+    store64(sc + AGN_SPC_TRACE_LO, lo);
+    store64(sc + AGN_SPC_SPAN_ID, span);
+    store64(sc + AGN_SPC_FLAGS, flags);
+    return sc;
+}
+
+# Global-allocator form of `agnosai_otlp_span_context_parse_a`.
+fn agnosai_otlp_span_context_parse(tp: Str): i64 {
+    return agnosai_otlp_span_context_parse_a(default_alloc(), tp);
+}
+
+# A new span context under `parent`, or a new ROOT when `parent` is 0.
+#
+# A child keeps the parent's trace id and flags and takes a fresh random 8-byte
+# span id. A root takes a random 16-byte trace id as well, and flags `01`
+# (sampled) — agnosai records every span it is not told to drop.
+#
+# One `getrandom` either way: 8 bytes for a child, 24 for a root. Both ids are
+# forced non-zero, because the all-zero id is INVALID and a collector drops the
+# span. The chance of drawing zero is 2^-64; the guard costs a compare. A
+# failed `getrandom` leaves the fresh allocation's zeros, which the same guards
+# turn into a valid if unremarkable id — telemetry degrades, the work does not.
+fn agnosai_otlp_span_context_child(parent): i64 {
+    var sc = alloc(AGN_SPC_SIZE);
+    if (parent == 0) {
+        random_bytes(sc, 24);
+        if (agnosai_otlp_trace_id_is_zero(load64(sc + AGN_SPC_TRACE_HI),
+            load64(sc + AGN_SPC_TRACE_LO)) == 1) {
+            store64(sc + AGN_SPC_TRACE_LO, 1);
+        }
+        store64(sc + AGN_SPC_FLAGS, 1);
+    } else {
+        store64(sc + AGN_SPC_TRACE_HI, load64(parent + AGN_SPC_TRACE_HI));
+        store64(sc + AGN_SPC_TRACE_LO, load64(parent + AGN_SPC_TRACE_LO));
+        store64(sc + AGN_SPC_FLAGS, load64(parent + AGN_SPC_FLAGS));
+        random_bytes(sc + AGN_SPC_SPAN_ID, 8);
+    }
+    if (load64(sc + AGN_SPC_SPAN_ID) == 0) { store64(sc + AGN_SPC_SPAN_ID, 1); }
+    return sc;
+}
+
+# The context as a `traceparent` in `a`: exactly 55 lowercase bytes.
+#
+# `format_a(parse(x))` is `x` byte for byte for every `x` parse accepts.
+fn agnosai_otlp_span_context_format_a(a, sc): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "00-");
+    agnosai_otlp_add_trace_id_a(a, sb, load64(sc + AGN_SPC_TRACE_HI),
+      load64(sc + AGN_SPC_TRACE_LO));
+    _agnosai_otlp_putc_a(a, sb, 45);
+    _agnosai_otlp_add_hex_a(a, sb, load64(sc + AGN_SPC_SPAN_ID), 16);
+    _agnosai_otlp_putc_a(a, sb, 45);
+    _agnosai_otlp_add_hex_a(a, sb, load64(sc + AGN_SPC_FLAGS), 2);
+    return str_builder_build_a(a, sb);
+}
+
 # --- attributes -----------------------------------------------------------
 
 # One string attribute: `{"key":"k","value":{"stringValue":"v"}}`.
@@ -272,9 +486,15 @@ fn _agnosai_otlp_attr_int(sb, k, v): i64 {
 
 # Append one string attribute from the span, with a leading comma when anything
 # has already been written. Returns the updated "have written one" flag.
+#
+# ⚠ An EMPTY value is absent too. ADR 017 said the tool span's missing agent
+# name and task id were "omitted rather than faked", while the call sites
+# passed `str_from("")` and this emitted `"stringValue":""` for both — and for
+# the chat span's. An empty attribute says nothing a backend can group by.
 fn _agnosai_otlp_emit_str_a(a, sb, span, key, wrote): i64 {
     var v = agnosai_genai_span_attr_str(span, key);
     if (v == 0) { return wrote; }
+    if (str_len(v) == 0) { return wrote; }
     if (wrote == 1) { str_builder_add_cstr_a(a, sb, ","); }
     _agnosai_otlp_attr_str_a(a, sb, key, v);
     return 1;
@@ -291,15 +511,18 @@ fn _agnosai_otlp_emit_int_a(a, sb, span, key, wrote): i64 {
 
 # --- span kind ------------------------------------------------------------
 
-# The OTel `SpanKind` for a genai span, from its name.
+# The OTel `SpanKind` for a genai span, from its operation.
 #
-# An inference call leaves the process for a model provider, so it is CLIENT;
-# a tool execution and a crew run are local work, so INTERNAL. ⚠ Getting this
-# wrong is not cosmetic — a backend's service-dependency graph is built from
-# CLIENT/SERVER pairs, so a mislabelled inference span drops the provider edge.
+# A `chat` call leaves the process for a model provider, so it is CLIENT; an
+# in-process agent, a crew run and a tool call are local work, so INTERNAL.
+# ⚠ Getting this wrong is not cosmetic — a backend's service-dependency graph
+# is built from CLIENT/SERVER pairs, so a mislabelled inference span drops the
+# provider edge. Before ADR 023 the chat call was named `gen_ai.invoke_agent`
+# and the kind keyed on that name; `invoke_agent` is now the INTERNAL task span.
 fn agnosai_otlp_span_kind(span): i64 {
-    var n = agnosai_genai_span_name(span);
-    if (streq(n, AGNOSAI_GENAI_SPAN_INVOKE_AGENT) == 1) { return AGNOSAI_OTLP_KIND_CLIENT; }
+    if (streq(agnosai_genai_span_name(span), AGNOSAI_GENAI_OP_CHAT) == 1) {
+        return AGNOSAI_OTLP_KIND_CLIENT;
+    }
     return AGNOSAI_OTLP_KIND_INTERNAL;
 }
 
@@ -328,12 +551,28 @@ fn _agnosai_otlp_span_json_into_a(a, sb, span, ctx): i64 {
       load64(ctx + AGN_OTC_TRACE_LO));
     str_builder_add_cstr_a(a, sb, "\",\"spanId\":\"");
     agnosai_otlp_add_span_id_a(a, sb, load64(ctx + AGN_OTC_SPAN_ID));
+    # ⚠ Only for a child. A root span OMITS the key: sixteen zeros are an
+    # invalid span id, not "no parent", and a collector would go looking for it.
+    var parent = load64(ctx + AGN_OTC_PARENT_SPAN_ID);
+    if (parent != 0) {
+        str_builder_add_cstr_a(a, sb, "\",\"parentSpanId\":\"");
+        agnosai_otlp_add_span_id_a(a, sb, parent);
+    }
     str_builder_add_cstr_a(a, sb, "\",\"name\":");
-    # ⚠ `str_from_a`, not `str_from`. A bare `str_from` here was the LAST
-    # per-span allocation on the no-free global bump after the arena threading
-    # landed — 16 bytes of Str header per span, measured, and the only thing
-    # standing between a 1-span cycle and 0 global bytes.
-    _agnosai_otlp_json_str_a(a, sb, str_from_a(a, agnosai_genai_span_name(span)));
+    # `<operation> <subject>` (ADR 023), written as two escaped parts inside one
+    # pair of quotes — `agnosai_genai_span_full_name_a` builds the same string,
+    # and this avoids building it. The operation is the span's own `Str`, so
+    # nothing here allocates a name. (Until 2026-08-12 a bare `str_from` of the
+    # name was the last per-span allocation on the global bump.)
+    _agnosai_otlp_putc_a(a, sb, 34);
+    _agnosai_otlp_json_body_a(a, sb, agnosai_genai_span_attr_str(span,
+        AGNOSAI_GENAI_OPERATION_NAME));
+    var suffix = agnosai_genai_span_name_suffix(span);
+    if (suffix != 0) {
+        _agnosai_otlp_putc_a(a, sb, 32);
+        _agnosai_otlp_json_body_a(a, sb, suffix);
+    }
+    _agnosai_otlp_putc_a(a, sb, 34);
     str_builder_add_cstr_a(a, sb, ",\"kind\":");
     str_builder_add_int_a(a, sb, agnosai_otlp_span_kind(span));
     str_builder_add_cstr_a(a, sb, ",\"startTimeUnixNano\":\"");
@@ -342,16 +581,20 @@ fn _agnosai_otlp_span_json_into_a(a, sb, span, ctx): i64 {
     str_builder_add_int_a(a, sb, load64(ctx + AGN_OTC_END_NS));
     str_builder_add_cstr_a(a, sb, "\",\"attributes\":[");
 
+    # Spec attributes first, then base semconv's `error.type`, then agnosai's
+    # own — an order a reader can scan, and the order the suites pin.
     var wrote = 0;
     wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_OPERATION_NAME, wrote);
-    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_SYSTEM, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_PROVIDER_NAME, wrote);
     wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_REQUEST_MODEL, wrote);
     wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_RESPONSE_MODEL, wrote);
     wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_AGENT_NAME, wrote);
-    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_TASK_ID, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_WORKFLOW_NAME, wrote);
     wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_TOOL_NAME, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_ERROR_TYPE, wrote);
     wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_CREW_ID, wrote);
-    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_CREW_NAME, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_TASK_ID, wrote);
+    wrote = _agnosai_otlp_emit_str_a(a, sb, span, AGNOSAI_GENAI_AGENT_KEY, wrote);
     wrote = _agnosai_otlp_emit_int_a(a, sb, span, AGNOSAI_GENAI_USAGE_INPUT_TOKENS, wrote);
     wrote = _agnosai_otlp_emit_int_a(a, sb, span, AGNOSAI_GENAI_USAGE_OUTPUT_TOKENS, wrote);
     wrote = _agnosai_otlp_emit_int_a(a, sb, span, AGNOSAI_GENAI_CREW_TASK_COUNT, wrote);
@@ -419,18 +662,23 @@ fn agnosai_otlp_path(url): i64 {
 #
 # ## Identity is the CALLER's, never sakshi's
 #
-# The decision this bite owed. sakshi's trace id and span stack are process
-# globals (`sakshi_trace_id_hi` / `_lo`), so under `sandhi_server_run_pooled`
-# two concurrent requests share one trace id and the traces interleave into
-# nonsense. There is no thread-local to reach for — that is the gap the roadmap
-# note asks a real OTel library to close.
+# sakshi's trace id and span stack are process globals (`sakshi_trace_id_hi` /
+# `_lo`), so under `sandhi_server_run_pooled` two concurrent requests share one
+# trace id and the traces interleave into nonsense.
 #
 # So **the export path never reads sakshi's trace context at all.** `enqueue`
-# takes an `agnosai_otlp_ctx_new(..)` the caller built, and correlation is the
-# caller's job: mint one trace id per request (`agnosai_uuid_v4` is already a
-# random 128-bit value) and pass it into every span's context. That is
-# reentrant by construction, needs no upstream change, and is honest about
-# where the responsibility sits.
+# takes an export context the caller built, and correlation is the caller's
+# job. Since ADR 023 the caller does it: each span site takes a span context
+# from its parent (the span-context section above), hands its own context to
+# the work it starts, and records with `agnosai_telemetry_record_span_in`, which
+# fills `trace id`, `span id` and `parentSpanId` from the two contexts. One
+# crew is therefore one trace, in every process mode, and it joins an inbound
+# `traceparent` when there is one.
+#
+# ⚠ Still not thread-local. The cyrius stdlib has `thread_local_*` now, but a
+# context set on one thread is invisible to a `thread_create` worker and to
+# agnostic's detached submit thread, so it is passed explicitly — reentrant by
+# construction and needing no upstream change.
 #
 # ## Two arenas, with single-owner rules
 #

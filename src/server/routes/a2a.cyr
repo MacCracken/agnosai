@@ -169,6 +169,14 @@ fn agnosai_route_a2a_callback_allowed(url: Str): i64 {
 # oracle types this handler `(StatusCode, Json<A2AResponse>)`, so every arm
 # carries `task_id`, `status`, `result` and `error`.
 fn agnosai_route_a2a_receive_a(a, state, body: Str): i64 {
+    return agnosai_route_a2a_receive_tp_a(a, state, body, 0);
+}
+
+# `POST /api/v1/a2a/receive` with the request's `traceparent` header, or 0
+# (ADR 023). A delegation from another agent system is where joining traces
+# across services matters most: the delegated crew's spans land in the
+# delegating system's trace. Responses are byte-identical to the `_a` form's.
+fn agnosai_route_a2a_receive_tp_a(a, state, body: Str, tp: Str): i64 {
     var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
     if (v == 0) {
         return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
@@ -220,6 +228,7 @@ fn agnosai_route_a2a_receive_a(a, state, body: Str): i64 {
     var tasks = vec_new();
     vec_push(tasks, agnosai_task_new(agnosai_a2a_req_description(req)));
     agnosai_crew_with_tasks(spec, tasks);
+    if (tp != 0) { agnosai_crew_with_trace_parent(spec, tp); }
 
     # ⚠ **The oracle sends the orchestrator's OWN error** — `a2a.rs:182` is
     # `error: Some(e.to_string())`, so the delegating system learns *why* its

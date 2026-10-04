@@ -66,6 +66,24 @@ fn _t_spec(name): i64 {
     return spec;
 }
 
+# ── the registry status WHILE a crew runs (ADR 022) ────────────────────────
+# A crew answered by a stub gateway, which reads the registry from inside the
+# run. Globals, because a chat call's signature has no room for them.
+var _t_o = 0;
+var _t_cid = 0;
+
+# The registry status the stub saw, or -1 when it never ran.
+var _t_seen_status = 0 - 1;
+
+# The stub chat call: record the crew's registered status, then answer.
+fn _t_stub_chat(client, request, out_response, parent_sc): i64 {
+    var st = agnosai_orchestrator_crew(_t_o, _t_cid);
+    if (st != 0) { _t_seen_status = agnosai_crew_state_status(st); }
+    store64(out_response, agnosai_hoosh_response_from_body(str_from(
+          "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"done\"}}]}")));
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -191,6 +209,51 @@ fn main() {
     that was never registered has a bug and should hear about it");
     assert_eq(agnosai_error_kind(unknown), AGNOSAI_ERR_CREW_NOT_FOUND, "a CrewNotFound error");
 
+    # --- RUNNING is stored, and only from PENDING (ADR 022) ---
+    # The oracle registers `Pending` and stores the terminal state, never
+    # `Running` in between, so a poller could not tell queued from working.
+    var adv_o = agnosai_orchestrator_new(_t_budget());
+    var adv_spec = _t_spec("advance");
+    var adv_id = agnosai_crew_id(adv_spec);
+    _agnosai_orch_register(adv_o, adv_spec);
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(adv_o, adv_id)),
+      AGNOSAI_CREW_PENDING, "a registered crew is PENDING");
+    assert_eq(_agnosai_orch_advance(adv_o, adv_id, AGNOSAI_CREW_PENDING, AGNOSAI_CREW_RUNNING),
+      1, "PENDING advances to RUNNING");
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(adv_o, adv_id)),
+      AGNOSAI_CREW_RUNNING, "and the registry now says RUNNING");
+    assert_eq(_agnosai_orch_advance(adv_o, adv_id, AGNOSAI_CREW_PENDING, AGNOSAI_CREW_RUNNING),
+      0, "a second PENDING -> RUNNING does not move — it is not PENDING any more");
+    assert_eq(_agnosai_orch_advance(adv_o, agnosai_uuid_v4_str(), AGNOSAI_CREW_PENDING,
+        AGNOSAI_CREW_RUNNING), 0, "an unregistered crew does not move");
+
+    # A cancel that lands before the hand-off must stand.
+    var adv_c_spec = _t_spec("advance-cancelled");
+    var adv_c_id = agnosai_crew_id(adv_c_spec);
+    _agnosai_orch_register(adv_o, adv_c_spec);
+    agnosai_orchestrator_cancel_crew(adv_o, adv_c_id);
+    assert_eq(_agnosai_orch_advance(adv_o, adv_c_id, AGNOSAI_CREW_PENDING,
+        AGNOSAI_CREW_RUNNING), 0, "a CANCELLED crew does not advance to RUNNING");
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(adv_o, adv_c_id)),
+      AGNOSAI_CREW_CANCELLED, "and stays CANCELLED — the hand-off cannot overwrite a cancel");
+
+    # End to end: the stub gateway reads the registry from INSIDE the run.
+    var run_o = agnosai_orchestrator_new(_t_budget());
+    var run_spec = _t_spec("watched");
+    _t_o = run_o;
+    _t_cid = agnosai_crew_id(run_spec);
+    _t_seen_status = 0 - 1;
+    var run_runner = _agnosai_orch_register(run_o, run_spec);
+    agnosai_crew_runner_with_llm(run_runner, agnosai_hoosh_client_with_chat(
+        agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_t_stub_chat));
+    var run_state = _agnosai_orch_finish_err(run_o, run_runner, _t_cid,
+      agnosai_crew_name(run_spec), 0);
+    assert_eq(_t_seen_status, AGNOSAI_CREW_RUNNING,
+      "WHILE the crew runs, the registry says RUNNING — PENDING here means the hand-off is not stored");
+    assert_eq(agnosai_crew_state_status(run_state), AGNOSAI_CREW_COMPLETED, "the run completes");
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(run_o, _t_cid)),
+      AGNOSAI_CREW_COMPLETED, "and the registry ends on the terminal state, not RUNNING");
+
     # --- a cyclic DAG never reaches the registry ---
     var cyc = agnosai_crew_new(str_from("cyclic"));
     var t1 = agnosai_task_new(str_from("t1"));
@@ -205,6 +268,13 @@ fn main() {
 
     var before_entries = agnosai_audit_chain_count(chain);
     assert_eq(agnosai_orchestrator_run_crew(o, cyc), 0, "a cyclic spec returns no state");
+
+    # ⚠ The run-error arm puts PENDING back (ADR 022). It stores no terminal
+    # state, so a RUNNING left behind would read "running" forever, and RUNNING
+    # is not terminal, so eviction would never take it either.
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, agnosai_crew_id(cyc))),
+      AGNOSAI_CREW_PENDING,
+      "a cyclic DAG's registry entry is left PENDING, as before RUNNING was stored — not RUNNING");
 
     # ⚠ **The REASON must reach the caller, not just the failure.** `run_crew`
     # built a `run_err` for `agnosai_crew_runner_run` and then returned a bare 0,
@@ -333,6 +403,9 @@ fn main() {
       "a deadline already in the past is observed at the first loop head");
     assert_eq(vec_len(agnosai_crew_state_results(dl_state)), 0,
       "and no task ran");
+    assert_eq(agnosai_crew_state_status(dl_state), AGNOSAI_CREW_FAILED,
+      "and the RUNNER reports FAILED itself (ADR 022) — it said COMPLETED for zero results, and \
+    only the orchestrator's substitution afterwards made the stored state agree");
 
     # A deadline far in the future must NOT trip — otherwise the assertion above
     # would pass for a runner that always reports timed-out.

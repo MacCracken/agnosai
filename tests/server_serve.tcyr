@@ -733,6 +733,154 @@ fn _t_contains(hay, n, needle): i64 {
     return 0;
 }
 
+# A one-agent, one-task crew request named `traced`, as a cstring.
+fn _t_crew_body(): i64 {
+    var bsb = str_builder_new();
+    str_builder_add_cstr(bsb, "{\"name\":\"traced\",\"agents\":[{\"agent_key\":\"tester\",");
+    str_builder_add_cstr(bsb, "\"name\":\"Tester\",\"role\":\"tester\",\"goal\":\"test\"}],");
+    str_builder_add_cstr(bsb, "\"tasks\":[{\"description\":\"d\"}]}");
+    return str_cstr(str_builder_build(bsb));
+}
+
+# A `POST /api/v1/crews` request with `extra` header lines (each ending CRLF).
+fn _t_crew_post(extra): i64 {
+    var body = _t_crew_body();
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "POST /api/v1/crews HTTP/1.1\r\nHost: x\r\n");
+    str_builder_add_cstr(sb, "Content-Type: application/json\r\n");
+    str_builder_add_cstr(sb, extra);
+    str_builder_add_cstr(sb, "Content-Length: ");
+    str_builder_add_int(sb, strlen(body));
+    str_builder_add_cstr(sb, "\r\n\r\n");
+    str_builder_add_cstr(sb, body);
+    return str_builder_build(sb);
+}
+
+# ADR 023 — the transport reads `traceparent` and the crew joins that trace.
+# Driven through the real handler, so this covers sandhi's header lookup, the
+# router's `_tp_a` dispatch and the route's copy onto the spec.
+fn _t_traceparent_header(): i64 {
+    var s = _t_state();
+    agnosai_serve_mount(s, 0);
+    var g = agnosai_telemetry_init_export(str_from("http://127.0.0.1:1"),
+      str_from("serve-probe"));
+    var ring = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
+    var out[8192];
+    var w3c = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    agnosai_otlp_ring_drain(ring, str_from("x"));
+    var n = _t_serve_over_pipe(_t_crew_post(
+        "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\n"), &out);
+    assert(_t_starts_with(&out, n, "HTTP/1.1 200 OK\r\n") == 1, "a traced crew POST is 200");
+    var doc = agnosai_otlp_ring_drain(ring, str_from("x"));
+    assert(doc != 0, "and exported spans");
+    assert_eq(str_contains_cstr(doc, "\"name\":\"invoke_workflow traced\""), 1,
+      "including the crew's workflow span");
+    assert_eq(str_contains_cstr(doc, "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\""), 1,
+      "in the header's trace");
+    assert_eq(str_contains_cstr(doc, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "as the header's parent-id's child");
+    # The crew's one agent is picked for its one task, so its task span names
+    # that agent — the span every real crew emits, end to end from the wire.
+    assert_eq(str_contains_cstr(doc, "\"name\":\"invoke_agent Tester\""), 1,
+      "and the task's `invoke_agent {agent name}` span");
+    assert_eq(str_contains_cstr(doc,
+        "{\"key\":\"gen_ai.agent.name\",\"value\":{\"stringValue\":\"Tester\"}}"), 1,
+      "carrying gen_ai.agent.name, the agent's display name");
+    assert_eq(str_contains_cstr(doc,
+        "{\"key\":\"agnosai.agent.key\",\"value\":{\"stringValue\":\"tester\"}}"), 1,
+      "and agnosai.agent.key, its definition key (ADR 023)");
+
+    # sandhi's lookup ignores case, as HTTP header names require.
+    var nc = _t_serve_over_pipe(_t_crew_post(
+        "Traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\n"), &out);
+    assert(_t_starts_with(&out, nc, "HTTP/1.1 200 OK\r\n") == 1, "`Traceparent:` is 200 too");
+    assert_eq(str_contains_cstr(agnosai_otlp_ring_drain(ring, str_from("x")),
+        "\"parentSpanId\":\"00f067aa0ba902b7\""), 1, "and joins the trace the same way");
+
+    # ⚠ A malformed header is never an error: the same status as no header, and
+    # the crew starts a new trace.
+    var np = _t_serve_over_pipe(_t_crew_post(""), &out);
+    assert(_t_starts_with(&out, np, "HTTP/1.1 200 OK\r\n") == 1, "no header is 200");
+    var plain = agnosai_otlp_ring_drain(ring, str_from("x"));
+    assert_eq(str_contains_cstr(plain, w3c), 0, "in a trace of its own");
+    var nm = _t_serve_over_pipe(_t_crew_post(
+        "traceparent: 00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01\r\n"), &out);
+    assert(_t_starts_with(&out, nm, "HTTP/1.1 200 OK\r\n") == 1,
+      "a malformed traceparent is the same 200, never a 4xx");
+    var mdoc = agnosai_otlp_ring_drain(ring, str_from("x"));
+    assert_eq(str_contains_cstr(mdoc, "4BF92F3577B34DA6A3CE929D0E0E4736"), 0,
+      "its trace id is not the malformed one");
+    var wf_at = str_index_of_cstr(mdoc, "\"name\":\"invoke_workflow traced\"");
+    var wf_head = str_sub(mdoc, 0, wf_at);
+    var wf_start = str_last_index_of(wf_head, "{\"traceId\":");
+    assert_eq(str_contains_cstr(str_sub(mdoc, wf_start, wf_at - wf_start), "parentSpanId"), 0,
+      "and its workflow span is a new ROOT — no parentSpanId");
+
+    # ⚠ The trust boundary (threat model, surface 7): an unsampled header from
+    # the wire switches the crew's span export off, and the client still gets
+    # the same 200. Pinned so a change to this either way is a decision.
+    var nu = _t_serve_over_pipe(_t_crew_post(
+        "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00\r\n"), &out);
+    assert(_t_starts_with(&out, nu, "HTTP/1.1 200 OK\r\n") == 1, "an unsampled traceparent is 200");
+    assert_eq(agnosai_otlp_ring_drain(ring, str_from("x")), 0,
+      "and the crew exports no span at all — ParentBased sampling honours the caller");
+
+    # The other two traced routes, through the same dispatch.
+    var mbb = str_builder_new();
+    str_builder_add_cstr(mbb, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",");
+    str_builder_add_cstr(mbb, "\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}}");
+    var mcp_body = str_cstr(str_builder_build(mbb));
+    var msb = str_builder_new();
+    str_builder_add_cstr(msb, "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n");
+    str_builder_add_cstr(msb,
+      "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nContent-Length: ");
+    str_builder_add_int(msb, strlen(mcp_body));
+    str_builder_add_cstr(msb, "\r\n\r\n");
+    str_builder_add_cstr(msb, mcp_body);
+    var nmcp = _t_serve_over_pipe(str_builder_build(msb), &out);
+    assert(_t_starts_with(&out, nmcp, "HTTP/1.1 200 OK\r\n") == 1, "a traced /mcp tools/call is 200");
+    var mcpdoc = agnosai_otlp_ring_drain(ring, str_from("x"));
+    assert(mcpdoc != 0 && str_contains_cstr(mcpdoc, "\"name\":\"execute_tool echo\"") == 1,
+      "and records its tool span");
+    assert_eq(str_contains_cstr(mcpdoc, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "under the header's context");
+
+    var a2a_body = "{\"task_id\":\"tp1\",\"description\":\"delegated\"}";
+    var asb = str_builder_new();
+    str_builder_add_cstr(asb,
+      "POST /api/v1/a2a/receive HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n");
+    str_builder_add_cstr(asb,
+      "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nContent-Length: ");
+    str_builder_add_int(asb, strlen(a2a_body));
+    str_builder_add_cstr(asb, "\r\n\r\n");
+    str_builder_add_cstr(asb, a2a_body);
+    var na2a = _t_serve_over_pipe(str_builder_build(asb), &out);
+    assert(_t_starts_with(&out, na2a, "HTTP/1.1 200 OK\r\n") == 1, "a traced A2A delegation is 200");
+    var a2adoc = agnosai_otlp_ring_drain(ring, str_from("x"));
+    assert(a2adoc != 0
+      && str_contains_cstr(a2adoc, "\"name\":\"invoke_workflow a2a-general-tp1\"") == 1,
+      "and records the delegated crew's workflow span");
+    assert_eq(str_contains_cstr(a2adoc, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "under the header's context");
+
+    # The router and the route, called directly as an embedding caller would.
+    var tp = str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    var crew_body = str_from(_t_crew_body());
+    var rd = agnosai_route_dispatch_tp_a(0, s, AGNOSAI_METHOD_POST, str_from("/api/v1/crews"),
+      str_from(""), 0, crew_body, 1, tp);
+    assert_eq(agnosai_route_status(rd), HTTP_OK, "dispatch_tp_a runs the crew");
+    assert_eq(str_contains_cstr(agnosai_otlp_ring_drain(ring, str_from("x")),
+        "\"parentSpanId\":\"00f067aa0ba902b7\""), 1, "under the traceparent it was handed");
+    var rc = agnosai_route_create_crew_tp_a(default_alloc(), s, crew_body, tp);
+    assert_eq(agnosai_route_status(rc), HTTP_OK, "create_crew_tp_a answers 200");
+    assert_eq(str_contains_cstr(agnosai_otlp_ring_drain(ring, str_from("x")),
+        "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\""), 1, "in that trace");
+
+    agnosai_telemetry_shutdown(g);
+    return 0;
+}
+
 fn _t_handler_end_to_end(): i64 {
     var s = _t_state();
     agnosai_serve_mount(s, 0);
@@ -1762,6 +1910,7 @@ fn main(): i64 {
     _t_rate_limit_keys_are_per_client();
     _t_rate_limit_handler_keys_per_client();
     _t_handler_end_to_end();
+    _t_traceparent_header();
     _t_mount();
     _t_parse_port();
     _t_shutdown_flag_wired();

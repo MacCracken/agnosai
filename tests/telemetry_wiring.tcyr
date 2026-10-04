@@ -14,19 +14,25 @@
 # drives the formatter directly; both would stay green if every call site were
 # deleted.
 #
-# Two of the three sites are exercised here:
+# All four span sites are exercised here (ADR 023):
 #
 #   * **tool execution** — a registered builtin through the real vtable
 #     dispatch, which is the chokepoint every tool call in the tree funnels
 #     through;
-#   * **crew run** — a real sequential crew through `agnosai_crew_runner_run`,
-#     including the discipline that every exit closes the span.
+#   * **crew run** — real sequential, parallel and DAG crews through
+#     `agnosai_crew_runner_run`, including the discipline that every exit
+#     closes the workflow span;
+#   * **task** — every task's `invoke_agent` span, and that it is the workflow
+#     span's child in every process mode, worker threads included;
+#   * **chat** — `agnosai_hoosh_chat_in` against a port nothing listens on,
+#     which reaches its transport-error exit offline. Its success exit needs a
+#     gateway; the LLM success arm's THREADING is checked instead through the
+#     client's chat pointer, whose stub receives the span context the live call
+#     would.
 #
-# ⚠ The **inference** site (`llm/hoosh.cyr`) is not reachable here: it records
-# its span around a live `sandhi_http_post` to a hoosh gateway. Its five exit
-# paths are each wired through one helper, `_agnosai_hoosh_span_done`, so the
-# shape is reviewable even though it is not runnable — noted rather than
-# claimed as covered.
+# What links them is checked from the exported bytes, not from internals: one
+# trace id across a crew, and each child's `parentSpanId` equal to its
+# parent's `spanId` — or to an inbound `traceparent`'s parent-id.
 #
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
@@ -69,6 +75,140 @@ include "src/sandbox/mod.cyr"
 include "src/tools/mod.cyr"
 include "tests/test_helpers.cyr"
 
+# Every span object in an exported batch, in order — each starts at
+# `{"traceId":`, and runs to the next one.
+fn _t_frags(doc): i64 {
+    var v = vec_new();
+    var mark = "{\"traceId\":";
+    var off = 0;
+    var start = 0 - 1;
+    var n = str_len(doc);
+    while (off < n) {
+        var rest = str_sub(doc, off, n - off);
+        var i = str_index_of_cstr(rest, mark);
+        if (i < 0) { break; }
+        if (start >= 0) { vec_push(v, str_sub(doc, start, off + i - start)); }
+        start = off + i;
+        off = off + i + 1;
+    }
+    if (start >= 0) { vec_push(v, str_sub(doc, start, n - start)); }
+    return v;
+}
+
+# The fragments whose name is exactly `name`.
+fn _t_named(frags, name): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "\"name\":\"");
+    str_builder_add_cstr(sb, name);
+    str_builder_add_cstr(sb, "\"");
+    var needle = str_builder_build(sb);
+    var v = vec_new();
+    for (var i = 0; i < vec_len(frags); i = i + 1) {
+        if (str_contains(vec_get(frags, i), needle) == 1) { vec_push(v, vec_get(frags, i)); }
+    }
+    return v;
+}
+
+# The string value of `"key":"<value>"` in a fragment, or the empty Str.
+fn _t_val(frag, key): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "\"");
+    str_builder_add_cstr(sb, key);
+    str_builder_add_cstr(sb, "\":\"");
+    var k = str_builder_build(sb);
+    var i = str_index_of_cstr(frag, str_cstr(k));
+    if (i < 0) { return str_from(""); }
+    var from = i + str_len(k);
+    var rest = str_sub(frag, from, str_len(frag) - from);
+    var q = str_index_of(rest, 34);
+    return str_sub(rest, 0, q);
+}
+
+# How many times `needle` occurs in `s`.
+fn _t_count(s, needle): i64 {
+    var n = 0;
+    var off = 0;
+    var len = str_len(s);
+    var nl = strlen(needle);
+    while (off < len) {
+        var i = str_index_of_cstr(str_sub(s, off, len - off), needle);
+        if (i < 0) { break; }
+        n = n + 1;
+        off = off + i + nl;
+    }
+    return n;
+}
+
+# Run `spec` once and drain what it exported.
+fn _t_run_doc(ring, spec): i64 {
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    var err: i64[1];
+    store64(&err, 0);
+    agnosai_crew_runner_run(agnosai_crew_runner_new(spec), &err);
+    return agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+}
+
+# A crew of `n` tasks named `name`, run under `process`.
+fn _t_crew(name, n, process): i64 {
+    var spec = agnosai_crew_new(str_from(name));
+    var tasks = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(tasks, agnosai_task_new(str_from_int(i)));
+    }
+    agnosai_crew_with_tasks(spec, tasks);
+    agnosai_crew_with_process(spec, process);
+    return spec;
+}
+
+# 1 when every `invoke_agent` span in `frags` is a child of the single
+# `invoke_workflow <name>` span, in its trace — and there are `n_tasks` of them.
+fn _t_linked(frags, name, n_tasks): i64 {
+    var wsb = str_builder_new();
+    str_builder_add_cstr(wsb, "invoke_workflow ");
+    str_builder_add_cstr(wsb, name);
+    var wf = _t_named(frags, str_cstr(str_builder_build(wsb)));
+    if (vec_len(wf) != 1) { return 0; }
+    var w = vec_get(wf, 0);
+    var tasks = _t_named(frags, "invoke_agent");
+    if (vec_len(tasks) != n_tasks) { return 0; }
+    for (var i = 0; i < vec_len(tasks); i = i + 1) {
+        var t = vec_get(tasks, i);
+        if (str_eq(_t_val(t, "traceId"), _t_val(w, "traceId")) == 0) { return 0; }
+        if (str_eq(_t_val(t, "parentSpanId"), _t_val(w, "spanId")) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# The span context the stub chat call was handed, and how many calls it saw.
+var _t_chat_parent = 0;
+var _t_chat_calls = 0;
+
+# A chat call that answers without a network and keeps the span context the
+# runner threaded to it — what the live call would have parented its `chat`
+# span to.
+fn _t_chat_capture(client, request, out_response, parent_sc): i64 {
+    _t_chat_parent = parent_sc;
+    _t_chat_calls = _t_chat_calls + 1;
+    store64(out_response, agnosai_hoosh_response_from_body(str_from(
+          "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"done\"}}]}")));
+    return 0;
+}
+
+# The same, failing — every attempt is an error the retry driver gives up on.
+fn _t_chat_fail(client, request, out_response, parent_sc): i64 {
+    _t_chat_parent = parent_sc;
+    return str_from("model refused");
+}
+
+# A tool whose execute answers 0 — which the vtable contract allows.
+fn _t_null_exec(ctx, input): i64 { return 0; }
+
+# Its schema callback, which nothing here calls.
+fn _t_null_schema(a, ctx): i64 { return 0; }
+
+# The W3C example traceparent, which tests pass in as a caller would.
+var _T_TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
 fn main(): i64 {
     var g = agnosai_telemetry_init_tracing(str_from("http://localhost:4318"));
     var ring = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
@@ -92,8 +232,9 @@ fn main(): i64 {
       "executing a tool through the vtable queued exactly ONE span");
 
     var tdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
-    assert_eq(str_contains_cstr(tdoc, "gen_ai.execute_tool"), 1, "named as a tool span");
-    assert_eq(str_contains_cstr(tdoc, "\"agnosai.tool.name\""), 1, "carrying the tool name");
+    assert_eq(str_contains_cstr(tdoc, "\"name\":\"execute_tool echo\""), 1,
+      "named `execute_tool {tool}` (ADR 023)");
+    assert_eq(str_contains_cstr(tdoc, "\"gen_ai.tool.name\""), 1, "carrying the tool name");
     assert_eq(str_contains_cstr(tdoc, "\"echo\""), 1, "which is echo");
     assert_eq(str_contains_cstr(tdoc, "\"kind\":1"), 1, "as an INTERNAL span");
     assert_eq(str_contains_cstr(tdoc, "\"status\":{\"code\":1}"), 1, "with an OK status");
@@ -106,8 +247,38 @@ fn main(): i64 {
     var bdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
     assert_eq(str_contains_cstr(bdoc, "\"status\":{\"code\":2}"), 1,
       "and its span carries ERROR, not OK");
+    assert_eq(str_contains_cstr(bdoc,
+        "{\"key\":\"error.type\",\"value\":{\"stringValue\":\"tool_error\"}}"), 1,
+      "with error.type tool_error (ADR 023)");
+    assert_eq(str_contains_cstr(tdoc, "error.type"), 0, "which a successful call does not carry");
+    # ⚠ The vtable carries no agent or task, so those attributes are ABSENT —
+    # they were sent as empty strings until ADR 023.
+    assert_eq(str_contains_cstr(tdoc, "gen_ai.agent.name"), 0, "no empty agent name");
+    assert_eq(str_contains_cstr(tdoc, "agnosai.task.id"), 0, "and no empty task id");
+    assert_eq(str_contains_cstr(tdoc, "parentSpanId"), 0, "a bare tool call is a root span");
 
-    # --- crew run ---------------------------------------------------------
+    # A tool that answers 0 is an ERROR span with error.type no_output — and
+    # the site checks before it reads the output, so it is not a crash.
+    var null_tool = agnosai_tool_new(str_from("nothing"), str_from("answers 0"),
+      &_t_null_schema, &_t_null_exec, 0);
+    assert_eq(agnosai_tool_execute(null_tool, input), 0, "a tool may answer 0");
+    var ndoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(str_contains_cstr(ndoc, "\"name\":\"execute_tool nothing\""), 1,
+      "and its call is still recorded");
+    assert_eq(str_contains_cstr(ndoc,
+        "{\"key\":\"error.type\",\"value\":{\"stringValue\":\"no_output\"}}"), 1,
+      "as ERROR, error.type no_output");
+
+    # Under a caller's context, the tool span joins its trace.
+    var tp = agnosai_otlp_span_context_parse(str_from(_T_TP));
+    agnosai_tool_execute_in(echo, input, tp);
+    var pdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(str_contains_cstr(pdoc, "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\""), 1,
+      "tool_execute_in records in the parent's trace");
+    assert_eq(str_contains_cstr(pdoc, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "as the parent's child");
+
+    # --- crew run: one trace, every span linked (ADR 023) ------------------
     var spec = agnosai_crew_new(str_from("wired-crew"));
     var tasks = vec_new();
     vec_push(tasks, agnosai_task_new(str_from("first")));
@@ -120,16 +291,254 @@ fn main(): i64 {
     var state = agnosai_crew_runner_run(agnosai_crew_runner_new(spec), &run_err);
     assert_eq(load64(&run_err), 0, "the crew ran without error");
     assert(state != 0, "and returned a state");
-    assert(agnosai_otlp_ring_count(ring) >= 1, "and queued at least its crew span");
+    # ⚠ EXACTLY three: the workflow span and one invoke_agent per task. This
+    # used to be `>= 1`, which a crew that recorded only its own span passed.
+    assert_eq(agnosai_otlp_ring_count(ring), 3,
+      "a 2-task crew queues exactly 3 spans: its workflow and each task's agent");
 
     var cdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
-    assert_eq(str_contains_cstr(cdoc, "agnosai.crew.run"), 1, "named as a crew span");
-    assert_eq(str_contains_cstr(cdoc, "\"agnosai.crew.name\""), 1, "carrying the crew name");
+    assert_eq(str_contains_cstr(cdoc, "\"name\":\"invoke_workflow wired-crew\""), 1,
+      "named `invoke_workflow {crew}` (ADR 023)");
+    assert_eq(str_contains_cstr(cdoc, "\"gen_ai.workflow.name\""), 1, "carrying the crew name");
     assert_eq(str_contains_cstr(cdoc, "\"wired-crew\""), 1, "which is the spec's");
+    assert_eq(str_contains_cstr(cdoc,
+        "{\"key\":\"gen_ai.operation.name\",\"value\":{\"stringValue\":\"invoke_workflow\"}}"),
+      1, "with the operation name the oracle's crew span omitted");
     assert_eq(str_contains_cstr(cdoc,
         "{\"key\":\"agnosai.crew.task_count\",\"value\":{\"intValue\":\"2\"}}"), 1,
       "and the task count, as a quoted OTLP intValue");
-    assert_eq(str_contains_cstr(cdoc, "\"status\":{\"code\":1}"), 1, "with an OK status");
+    assert_eq(_t_count(cdoc, "\"status\":{\"code\":1}"), 3, "all three OK");
+    var cfr = _t_frags(cdoc);
+    assert_eq(vec_len(cfr), 3, "three span objects in the batch");
+    var wf = vec_get(_t_named(cfr, "invoke_workflow wired-crew"), 0);
+    assert_eq(str_contains_cstr(wf, "parentSpanId"), 0,
+      "with no traceparent the workflow span is a ROOT");
+    assert_eq(_t_linked(cfr, "wired-crew", 2), 1,
+      "and both task spans are its children, in its trace");
+    var tk = vec_get(_t_named(cfr, "invoke_agent"), 0);
+    assert_eq(str_contains_cstr(tk, "\"kind\":1"), 1, "a task span is INTERNAL");
+    assert_eq(str_contains_cstr(tk, "\"agnosai.task.id\""), 1, "carrying its task id");
+    assert_eq(str_contains_cstr(tk, "gen_ai.agent.name"), 0,
+      "and no agent name for an unassigned task — `invoke_agent`, bare");
+    assert(str_eq(_t_val(vec_get(_t_named(cfr, "invoke_agent"), 0), "spanId"),
+        _t_val(vec_get(_t_named(cfr, "invoke_agent"), 1), "spanId")) == 0,
+      "two tasks are two spans");
+
+    # ⚠ An ASSIGNED task — what every real crew runs. The runner hands the
+    # picked agent's name and key to the span, and the two are distinct here
+    # so a swap of them, or either set to 0, fails.
+    var aspec = _t_crew("agent-crew", 1, agnosai_process_sequential());
+    var agents = vec_new();
+    vec_push(agents, agnosai_agent_with_name(agnosai_agent_new(str_from("tester"),
+          str_from("tester"), str_from("test")), str_from("Tester")));
+    agnosai_crew_with_agents(aspec, agents);
+    var afr = _t_frags(_t_run_doc(ring, aspec));
+    assert_eq(vec_len(afr), 2, "a 1-task crew with an agent exports 2 spans");
+    assert_eq(vec_len(_t_named(afr, "invoke_agent")), 0, "none of them a bare invoke_agent");
+    var atk = _t_named(afr, "invoke_agent Tester");
+    assert_eq(vec_len(atk), 1, "the task span is `invoke_agent {agent name}` (ADR 023)");
+    # Guarded so that a missing span FAILS the checks below instead of reading
+    # past an empty vec.
+    var at = str_from("");
+    if (vec_len(atk) == 1) { at = vec_get(atk, 0); }
+    assert_eq(str_contains_cstr(at,
+        "{\"key\":\"gen_ai.agent.name\",\"value\":{\"stringValue\":\"Tester\"}}"), 1,
+      "gen_ai.agent.name is the agent's display name");
+    assert_eq(str_contains_cstr(at,
+        "{\"key\":\"agnosai.agent.key\",\"value\":{\"stringValue\":\"tester\"}}"), 1,
+      "and agnosai.agent.key its definition key, not gen_ai.agent.id (ADR 023)");
+    assert_eq(str_contains_cstr(at, "gen_ai.agent.id"), 0, "which is never emitted");
+    var awfs = _t_named(afr, "invoke_workflow agent-crew");
+    var awf = str_from("");
+    if (vec_len(awfs) == 1) { awf = vec_get(awfs, 0); }
+    assert(str_len(_t_val(awf, "spanId")) == 16
+      && str_eq(_t_val(at, "parentSpanId"), _t_val(awf, "spanId")) == 1,
+      "and it is still the workflow's child");
+
+    # --- an inbound traceparent: the crew joins the caller's trace -----------
+    agnosai_crew_with_trace_parent(spec, str_from(_T_TP));
+    var jdoc = _t_run_doc(ring, spec);
+    assert_eq(_t_count(jdoc, "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\""), 3,
+      "with a traceparent all three spans are in the CALLER's trace");
+    assert_eq(_t_count(jdoc, "\"parentSpanId\":"), 3, "and every one has a parent");
+    var jfr = _t_frags(jdoc);
+    var jwf = vec_get(_t_named(jfr, "invoke_workflow wired-crew"), 0);
+    assert(str_eq_cstr(_t_val(jwf, "parentSpanId"), "00f067aa0ba902b7") == 1,
+      "the workflow's parent is the traceparent's parent-id");
+    assert_eq(_t_linked(jfr, "wired-crew", 2), 1, "and the tasks are still the workflow's");
+
+    # ParentBased sampling: a caller that says "not sampled" gets no spans.
+    agnosai_crew_with_trace_parent(spec,
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"));
+    assert_eq(_t_run_doc(ring, spec), 0,
+      "flags 00 suppresses the crew's spans — the workflow's AND its tasks'");
+
+    # A malformed traceparent is a new root, never an error.
+    agnosai_crew_with_trace_parent(spec,
+      str_from("00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01"));
+    store64(&run_err, 0);
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    var bad_state = agnosai_crew_runner_run(agnosai_crew_runner_new(spec), &run_err);
+    assert(bad_state != 0 && load64(&run_err) == 0, "an uppercase traceparent still runs");
+    var mdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(_t_count(mdoc, "4bf92f3577b34da6a3ce929d0e0e4736"), 0, "in a new trace");
+    assert_eq(_t_count(mdoc, "\"parentSpanId\":"), 2, "whose root is the workflow span");
+    agnosai_crew_with_trace_parent(spec, 0);
+
+    # --- parallel and DAG: workers get the parent through the job ------------
+    # ⚠ A worker thread starts with an empty thread-local block, so this is the
+    # check that the context crossed `thread_create` in the job struct.
+    var pfr = _t_frags(_t_run_doc(ring, _t_crew("par-crew", 4, agnosai_process_parallel(2))));
+    assert_eq(vec_len(pfr), 5, "a 4-task parallel crew exports 5 spans");
+    assert_eq(_t_linked(pfr, "par-crew", 4), 1,
+      "every worker's task span is the workflow's child, in its trace");
+    var dag = _t_crew("dag-crew", 3, agnosai_process_dag());
+    var dag_tasks = agnosai_crew_tasks(dag);
+    agnosai_task_with_dependency(vec_get(dag_tasks, 1), agnosai_task_id(vec_get(dag_tasks, 0)));
+    agnosai_task_with_dependency(vec_get(dag_tasks, 2), agnosai_task_id(vec_get(dag_tasks, 1)));
+    var dfr = _t_frags(_t_run_doc(ring, dag));
+    assert_eq(vec_len(dfr), 4, "a 3-task DAG exports 4 spans");
+    assert_eq(_t_linked(dfr, "dag-crew", 3), 1, "and every wave's tasks are the workflow's");
+
+    # A cyclic DAG is an error before any task runs: ONE span, ERROR, with
+    # error.type invalid_dag.
+    var cyc = _t_crew("cyc-crew", 2, agnosai_process_dag());
+    var cyc_tasks = agnosai_crew_tasks(cyc);
+    agnosai_task_with_dependency(vec_get(cyc_tasks, 0), agnosai_task_id(vec_get(cyc_tasks, 1)));
+    agnosai_task_with_dependency(vec_get(cyc_tasks, 1), agnosai_task_id(vec_get(cyc_tasks, 0)));
+    var ydoc = _t_run_doc(ring, cyc);
+    assert_eq(vec_len(_t_frags(ydoc)), 1, "a cyclic DAG closes exactly its workflow span");
+    assert_eq(str_contains_cstr(ydoc, "\"status\":{\"code\":2}"), 1, "as ERROR");
+    assert_eq(str_contains_cstr(ydoc,
+        "{\"key\":\"error.type\",\"value\":{\"stringValue\":\"invalid_dag\"}}"), 1,
+      "with error.type invalid_dag");
+
+    # --- the LLM arm: each attempt's chat call gets the TASK's context -------
+    # The stub is handed exactly what `agnosai_hoosh_chat_in` would parent its
+    # `chat` span to. It must be the task's own span — so the chain is
+    # workflow -> invoke_agent -> chat — not the workflow's and not 0.
+    var llm_spec = _t_crew("llm-crew", 1, agnosai_process_sequential());
+    var llm_r = agnosai_crew_runner_with_llm(agnosai_crew_runner_new(llm_spec),
+      agnosai_hoosh_client_with_chat(agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"),
+          str_from("")), &_t_chat_capture));
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    _t_chat_parent = 0;
+    agnosai_crew_runner_run(llm_r, &run_err);
+    assert(_t_chat_parent != 0, "the chat call is handed a span context");
+    var lfr = _t_frags(agnosai_otlp_ring_drain(ring, str_from("agnosai")));
+    var ltask = vec_get(_t_named(lfr, "invoke_agent"), 0);
+    var psb = str_builder_new();
+    agnosai_otlp_add_span_id(psb, agnosai_otlp_span_context_span_id(_t_chat_parent));
+    assert(str_eq(str_builder_build(psb), _t_val(ltask, "spanId")) == 1,
+      "and it is the TASK span's own context — a chat span is the agent's child");
+    assert_eq(str_contains_cstr(ltask, "\"gen_ai.request.model\""), 1,
+      "the task span names the model the agent was configured with");
+
+    # A failed inference is a Failed task: invoke_agent and the workflow are
+    # both ERROR with error.type task_failed.
+    var fail_r = agnosai_crew_runner_with_llm(agnosai_crew_runner_new(
+        _t_crew("fail-crew", 1, agnosai_process_sequential())),
+      agnosai_hoosh_client_with_chat(agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"),
+          str_from("")), &_t_chat_fail));
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    agnosai_crew_runner_run(fail_r, &run_err);
+    var fdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(_t_count(fdoc, "\"stringValue\":\"task_failed\""), 2,
+      "a failed task is task_failed on its own span and on the crew's");
+    assert_eq(_t_count(fdoc, "\"status\":{\"code\":2}"), 2, "both ERROR");
+
+    # --- the chat span itself, through its transport-error exit --------------
+    # Port 1 refuses at once, so this reaches `agnosai_hoosh_chat_in`'s second
+    # exit offline: a CLIENT `chat {model}` span under the caller's context.
+    var creq = agnosai_inference_request_new(str_from("gpt-4o"));
+    var cresp: i64[1];
+    store64(&cresp, 0);
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    var cerr = agnosai_hoosh_chat_in(str_from("http://127.0.0.1:1"), str_from(""), creq,
+      &cresp, tp);
+    assert(cerr != 0, "a refused connection is an error");
+    var hdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(vec_len(_t_frags(hdoc)), 1, "and the chat call records one span");
+    assert_eq(str_contains_cstr(hdoc, "\"name\":\"chat gpt-4o\",\"kind\":3"), 1,
+      "`chat {model}`, CLIENT");
+    assert_eq(str_contains_cstr(hdoc, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "under the caller's context");
+    assert_eq(str_contains_cstr(hdoc, "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\""), 1,
+      "in the caller's trace");
+    assert_eq(str_contains_cstr(hdoc,
+        "{\"key\":\"gen_ai.provider.name\",\"value\":{\"stringValue\":\"hoosh\"}}"), 1,
+      "naming hoosh as its provider");
+    # ⚠ The VALUE, not just the key: sandhi names the kind `CONNECT`, and the
+    # span sends it lowercase so it shares one vocabulary with the workflow's
+    # `timeout` (ADR 023).
+    assert_eq(str_contains_cstr(hdoc,
+        "{\"key\":\"error.type\",\"value\":{\"stringValue\":\"connect\"}}"), 1,
+      "with error.type connect for the refused connection — sandhi's kind, lowercased");
+    assert_eq(str_contains_cstr(hdoc, "CONNECT"), 0, "never sandhi's capitals");
+    assert_eq(str_contains_cstr(hdoc, "\"status\":{\"code\":2}"), 1, "as ERROR");
+    # `agnosai_hoosh_chat`, with no parent, records its chat span as a root.
+    store64(&cresp, 0);
+    assert(agnosai_hoosh_chat(str_from("http://127.0.0.1:1"), str_from(""), creq, &cresp) != 0,
+      "the parentless chat call fails the same way");
+    var rdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(str_contains_cstr(rdoc, "\"name\":\"chat gpt-4o\""), 1, "and records its span");
+    assert_eq(str_contains_cstr(rdoc, "parentSpanId"), 0, "as a root");
+
+    # The client's live chat pointer — what the crew runner calls when no suite
+    # swapped it — hands its fourth argument on as the chat span's parent.
+    var live = agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from(""));
+    store64(&cresp, 0);
+    callptr(agnosai_hoosh_client_chat_fp(live), live, creq, &cresp, tp);
+    var ldoc0 = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(str_contains_cstr(ldoc0, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "the live chat pointer passes the span context through to the chat span");
+
+    # The decimal-status error type, which only a gateway answering non-2xx
+    # reaches; the helper is checked directly.
+    assert(str_eq_cstr(_agnosai_hoosh_status_error_type(1, 503), "503") == 1,
+      "an HTTP failure's error.type is its decimal status");
+    assert_eq(_agnosai_hoosh_status_error_type(0, 503), 0, "built only for a span");
+    assert_eq(_agnosai_hoosh_error_type(0, "no_response"), 0, "as is every error.type");
+    # Each transport kind lowercased — a timed-out chat is the SAME class as a
+    # timed-out crew, `timeout`, not `TIMEOUT`.
+    assert(str_eq_cstr(_agnosai_hoosh_kind_error_type(1, SANDHI_ERR_TIMEOUT), "timeout") == 1,
+      "a transport timeout is error.type timeout, the workflow's spelling");
+    assert(str_eq_cstr(_agnosai_hoosh_kind_error_type(1, SANDHI_ERR_TLS), "tls") == 1,
+      "a TLS failure is tls");
+    assert_eq(_agnosai_hoosh_kind_error_type(0, SANDHI_ERR_TIMEOUT), 0,
+      "and a kind is lowered only for a span");
+
+    # ⚠ A crew that ran out of time is an ERROR span (ADR 022), error.type
+    # timeout (ADR 023). Its deadline is already past when the run starts, so
+    # no task runs and there are no results to fail: before ADR 022 the empty
+    # result list made the status Completed and the span OK, which hid every
+    # timeout from a collector's error rate.
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    var late = agnosai_crew_new(str_from("late-crew"));
+    var late_tasks = vec_new();
+    vec_push(late_tasks, agnosai_task_new(str_from("never runs")));
+    agnosai_crew_with_tasks(late, late_tasks);
+    var late_r = agnosai_crew_runner_new(late);
+    agnosai_crew_runner_set_deadline_ns(late_r, 1);
+    agnosai_crew_runner_run(late_r, &run_err);
+    assert_eq(agnosai_crew_runner_timed_out(late_r), 1, "a crew past its deadline times out");
+    assert_eq(agnosai_otlp_ring_count(ring), 1, "and closes exactly one span, its crew's");
+    var ldoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(str_contains_cstr(ldoc, "\"late-crew\""), 1, "carrying the crew name");
+    assert_eq(str_contains_cstr(ldoc, "\"status\":{\"code\":2}"), 1,
+      "with an ERROR status — OK before ADR 022");
+    assert_eq(str_contains_cstr(ldoc, "\"stringValue\":\"timeout\""), 1,
+      "and error.type timeout");
+
+    # A cancelled crew is ERROR too, and says so.
+    var cancel_r = agnosai_crew_runner_new(_t_crew("cancel-crew", 2,
+        agnosai_process_sequential()));
+    agnosai_crew_runner_cancel(cancel_r);
+    agnosai_crew_runner_run(cancel_r, &run_err);
+    var kdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(vec_len(_t_frags(kdoc)), 1, "a crew cancelled before it starts runs no task");
+    assert_eq(str_contains_cstr(kdoc, "\"stringValue\":\"cancelled\""), 1,
+      "and its span's error.type is cancelled");
 
     # ⚠ Past the oracle in the sharpest way available here: a crew span must
     # close on EVERY exit, the same discipline the `crews_active` gauge follows.
@@ -152,9 +561,36 @@ fn main(): i64 {
     var quiet_out = agnosai_tool_execute(echo, input);
     assert_eq(agnosai_tool_output_success(quiet_out), 1,
       "a tool still executes with telemetry off");
+    agnosai_crew_with_trace_parent(spec, str_from(_T_TP));
     var quiet_state = agnosai_crew_runner_run(agnosai_crew_runner_new(spec), &run_err);
-    assert(quiet_state != 0, "and a crew still runs");
+    assert(quiet_state != 0, "and a crew still runs, a traceparent and all");
     assert_eq(load64(&run_err), 0, "without error");
+    assert_eq(agnosai_tool_output_success(agnosai_tool_execute_in(echo, input, tp)), 1,
+      "and a tool under a context runs, recording nothing");
+    store64(&cresp, 0);
+    assert(agnosai_hoosh_chat_in(str_from("http://127.0.0.1:1"), str_from(""), creq, &cresp,
+        tp) != 0, "the chat call still answers its error");
+    assert_eq(agnosai_otlp_ring_count(ring), 0, "and the stopped exporter's ring stays empty");
+
+    # ⚠ With telemetry off the span sites allocate NOTHING (ADR 023). Under ADR
+    # 017 every tool call, inference and crew run built a 104-byte record and an
+    # operation Str that the recorder then threw away. Each instrumented entry
+    # point is compared with the uninstrumented work it wraps.
+    var raw0 = alloc_used();
+    callptr(load64(echo + AGN_TOOL_EXECUTE_FP), load64(echo + AGN_TOOL_CTX), input);
+    var raw_cost = alloc_used() - raw0;
+    var ins0 = alloc_used();
+    agnosai_tool_execute_in(echo, input, tp);
+    assert_eq(alloc_used() - ins0, raw_cost,
+      "a tool call costs exactly the tool's own allocations — no span, no context");
+    var off_task = agnosai_task_new(str_from("off"));
+    var body0 = alloc_used();
+    _agnosai_execute_task_body(off_task, 0, 0, 0, 0, 0, 0);
+    var body_cost = alloc_used() - body0;
+    var task0 = alloc_used();
+    agnosai_execute_task_in_crew(off_task, 0, 0, 0, 0, tp);
+    assert_eq(alloc_used() - task0, body_cost,
+      "and a task costs exactly its body's — the invoke_agent wrapper adds nothing");
 
     sakshi_clear_emit_hook();
     return assert_summary();

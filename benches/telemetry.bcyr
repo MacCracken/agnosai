@@ -56,8 +56,10 @@ include "src/telemetry/otlp.cyr"
 var _BR = 5;
 
 fn _b_tel_span(): i64 {
-    var s = agnosai_genai_inference_span(str_from("gpt-4o"), str_from("openai"),
-      str_from("bench-agent"), str_from("task-1"));
+    # A `chat` span since ADR 023 — the old inference span's agent name and task
+    # id belong to its `invoke_agent` parent now, so the encoded fragment is
+    # shorter and these rows re-baseline on 2026-10-03.
+    var s = agnosai_genai_chat_span(str_from("gpt-4o"), str_from("hoosh"));
     agnosai_genai_record_usage(s, 1234, 567, str_from("gpt-4o"));
     return s;
 }
@@ -172,10 +174,67 @@ fn _b_tel_post_url(): i64 {
     return 0;
 }
 
+# ADR 023 — parsing an inbound `traceparent`. Runs once per crew that carries
+# one, in the request arena on the HTTP path; measured on a reset arena so the
+# row is the parse, not the allocator's growth.
+fn _b_tel_span_context_parse(): i64 {
+    var a = arena_allocator(4096);
+    var tp = str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    var n = 50000;
+    var b = bench_new("otlp_span_context_parse");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_otlp_span_context_parse_a(a, tp);
+            reset_via(a);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ADR 023 — a child span context, which every span takes when telemetry is on.
+# ⚠ Includes one `getrandom(2)` for the 8-byte span id: that syscall is the
+# floor, and it replaced the 16-byte one `agnosai_uuid_v4` drew per span.
+fn _b_tel_span_context_child(): i64 {
+    var parent = agnosai_otlp_span_context_new(0x4bf92f3577b34da6, 0x0e0e4736a3ce929d,
+      0x00f067aa0ba902b7, 1);
+    var n = 20000;
+    var b = bench_new("otlp_span_context_child");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_otlp_span_context_child(parent); }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# The encoder on a CHILD span (ADR 023): `parentSpanId` plus the composed
+# `chat gpt-4o` name, against `otlp_encode_span`'s root.
+fn _b_tel_encode_span_child(): i64 {
+    var span = _b_tel_span();
+    var ctx = agnosai_otlp_ctx_new_child(0x0123456789abcdef, 0xfedcba9876543210,
+      0x1122334455667788, 0x0aabbccddeeff001, 1000000, 2000000, AGNOSAI_OTLP_STATUS_OK);
+    var n = 20000;
+    var b = bench_new("otlp_encode_span_child");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_otlp_span_json(span, ctx); }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
 
     _b_tel_encode_span();
+    _b_tel_encode_span_child();
+    _b_tel_span_context_parse();
+    _b_tel_span_context_child();
     _b_tel_ring_enqueue();
     _b_tel_ring_drain(16, "otlp_ring_drain_16");
     _b_tel_ring_drain(256, "otlp_ring_drain_256");

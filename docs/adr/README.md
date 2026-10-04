@@ -43,9 +43,13 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [014](014-sse-stream-holds-a-pooled-worker.md) | An SSE stream holds a pooled worker for its whole life | Accepted |
 | [015](015-mcp-resources-project-agent-definitions.md) | MCP resources project agent definitions, and nothing else | Accepted |
 | [016](016-mcp-prompts-project-agent-personas.md) | MCP prompts project agent personas | Accepted |
-| [017](017-genai-span-call-sites.md) | GenAI spans are recorded at the call sites the oracle only declares | Accepted |
+| [017](017-genai-span-call-sites.md) | GenAI spans are recorded at the call sites the oracle only declares | Accepted — amended by 023 |
 | [018](018-sankoch-path-check-on-import.md) | `.agpkg` import trusts sankoch's path check | Accepted |
 | [019](019-wasm-tools-spawn-wasmtime-directly.md) | WASM tools spawn wasmtime through kavach | Accepted — validated 2026-08-11 |
+| [020](020-output-filter-wired-into-task-output.md) | `output_filter` is wired into task output; the oracle never wires it | Accepted |
+| [021](021-rate-limit-mounted-by-default.md) | `rate_limit` is mounted by default | Accepted |
+| [022](022-crew-events-and-status-say-what-happened.md) | Crew events and registry status say what happened | Accepted — shipped in 2.1.5 |
+| [023](023-genai-semconv-spans-and-w3c-trace-context.md) | GenAI spans follow the semconv agent operations, and join the caller's W3C trace (amends 017) | Accepted — shipped in 2.1.5 |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`). The headings are left as written — renumbering accepted
@@ -53,8 +57,11 @@ decisions buys nothing and breaks inbound links — but **all five now carry a
 `## Status` heading**, added by the 2026-08-11 review. (This paragraph used to
 say they carried none, which stopped being true the moment that review ran.)
 
-⚠ **Two rows above are deliberately not a simple "Accepted".** ADR 006's
-"replacing WASM" half is retired — kavach ships a wasmtime backend and
+⚠ **Six rows above are not a plain "Accepted".** Three of them only add a fact:
+019 records when it was validated, and 022 and 023 the release that shipped them.
+The other three need reading. ADR 017 stays Accepted for the decision it still
+carries (the call sites); 023, accepted with 022 in 2.1.5, amends the rest of
+it. ADR 006's "replacing WASM" half is retired — kavach ships a wasmtime backend and
 [019](019-wasm-tools-spawn-wasmtime-directly.md) supersedes its transport half,
 so cx and WASM are complementary rather than alternatives. ADR 012 is superseded
 outright by 013 and is kept only as the record of a decision that turned out to

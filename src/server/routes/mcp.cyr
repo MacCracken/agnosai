@@ -240,7 +240,11 @@ fn _agnosai_mcp_tools_list(a, id, state): i64 {
 # `isError: true` for the latter (`mcp.rs:101-116`). That asymmetry is the MCP
 # convention — a protocol-level fault versus a tool-level one — and it is the
 # thing most likely to be flattened by mistake.
-fn _agnosai_mcp_tools_call(a, id, params, state): i64 {
+#
+# `tp` is the request's `traceparent`, or 0 (ADR 023). Parsed in the request
+# arena, and only with telemetry on: the tool span is its child, and this is
+# the only `execute_tool` producer until F1's tool loop.
+fn _agnosai_mcp_tools_call(a, id, params, state, tp: Str): i64 {
     var name_v = 0;
     if (params != 0) { name_v = bayan_json_v_obj_get_by_cstr(params, "name"); }
     if (name_v == 0 || bayan_json_v_is_str(name_v) == 0) {
@@ -269,7 +273,11 @@ fn _agnosai_mcp_tools_call(a, id, params, state): i64 {
         }
     }
 
-    var out = agnosai_tool_execute(tool, input);
+    var parent = 0;
+    if (tp != 0 && agnosai_telemetry_exporter() != 0) {
+        parent = agnosai_otlp_span_context_parse_a(a, tp);
+    }
+    var out = agnosai_tool_execute_in(tool, input, parent);
     _agnosai_mcp_log_call(name, agnosai_tool_output_success(out));
 
     if (agnosai_tool_output_success(out) == 1) {
@@ -519,6 +527,12 @@ fn _agnosai_mcp_log_call(name: Str, success): i64 {
 # (`mcp.rs:53`) — and is echoed on every arm, errors included, because
 # `JsonRpcResponse.id` is not `Option`.
 fn agnosai_route_mcp_a(a, state, body: Str): i64 {
+    return agnosai_route_mcp_tp_a(a, state, body, 0);
+}
+
+# `POST /mcp` with the request's `traceparent` header, or 0 (ADR 023). Only
+# `tools/call` reads it; every response is byte-identical to the `_a` form's.
+fn agnosai_route_mcp_tp_a(a, state, body: Str, tp: Str): i64 {
     var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
     if (v == 0 || bayan_json_v_is_obj(v) == 0) {
         return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
@@ -550,7 +564,7 @@ fn agnosai_route_mcp_a(a, state, body: Str): i64 {
     }
     if (str_eq_cstr(method, "tools/call") == 1) {
         return agnosai_route_json_a(a, HTTP_OK,
-          _agnosai_mcp_tools_call(a, id, bayan_json_v_obj_get_by_cstr(v, "params"), state));
+          _agnosai_mcp_tools_call(a, id, bayan_json_v_obj_get_by_cstr(v, "params"), state, tp));
     }
     # Beyond the oracle's three — see ADR 015 and ADR 016.
     if (str_eq_cstr(method, "prompts/list") == 1) {

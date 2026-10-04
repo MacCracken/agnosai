@@ -323,28 +323,41 @@ var AGNOSAI_CREW_RETRY_TEMPERATURE_MILLI = 100;
 var AGNOSAI_CREW_MAX_TOKENS = 4096;
 
 # Cyrius has no closures, so `with_retry`'s callback captures become a struct.
+#
+# `TRACE` is the task's `invoke_agent` span context, or 0: every attempt's
+# `chat` span is that span's child (ADR 023).
 enum AgnosaiInferCtxOff {
     AGN_ICTX_CLIENT = 0;
     AGN_ICTX_REQUEST = 8;
-    AGN_ICTX_SIZE = 16;
+    AGN_ICTX_TRACE = 16;
+    AGN_ICTX_SIZE = 24;
 }
 
 # One inference attempt — the `callptr` target `agnosai_with_retry` drives.
 #
 # Returns 0 and stores the response through `out_value`, or an error Str. That
-# is exactly `agnosai_hoosh_chat`'s contract, and it is what
+# is exactly `agnosai_hoosh_chat_in`'s contract, and it is what
 # `agnosai_is_retryable` classifies on.
+#
+# The call goes through the client's chat pointer, which is the live call unless
+# a suite swapped it (`agnosai_hoosh_client_with_chat`, ADR 022). A pointer of 0
+# — a client not built by `agnosai_hoosh_client_new` — falls back to the live
+# call rather than jumping to address 0. The span context is the pointer's
+# fourth argument, so a stub sees exactly what the live call would.
 fn _agnosai_crew_infer_fp(ctx, out_value): i64 {
     var client = load64(ctx + AGN_ICTX_CLIENT);
-    return agnosai_hoosh_chat(agnosai_hoosh_client_base_url(client),
-      agnosai_hoosh_client_api_key(client), load64(ctx + AGN_ICTX_REQUEST), out_value);
+    var chat = agnosai_hoosh_client_chat_fp(client);
+    if (chat == 0) { chat = &_agnosai_hoosh_client_chat_live; }
+    return callptr(chat, client, load64(ctx + AGN_ICTX_REQUEST), out_value,
+      load64(ctx + AGN_ICTX_TRACE));
 }
 
-# Build the retry context.
-fn _agnosai_crew_infer_ctx_new(client, request): i64 {
+# Build the retry context. `trace` is the task's span context, or 0.
+fn _agnosai_crew_infer_ctx_new(client, request, trace): i64 {
     var c = alloc(AGN_ICTX_SIZE);
     store64(c + AGN_ICTX_CLIENT, client);
     store64(c + AGN_ICTX_REQUEST, request);
+    store64(c + AGN_ICTX_TRACE, trace);
     return c;
 }
 
@@ -415,8 +428,17 @@ fn _agnosai_crew_agent_label(agent): i64 {
 # The crew id a task carries in its context, or "unknown".
 #
 # The oracle reads `task.context["crew_id"]` rather than the spec's own id, and
-# falls back to the literal `"unknown"`. Reproduced including the quirk: a task
-# whose context was never stamped emits events under `"unknown"`.
+# falls back to the literal `"unknown"` (`crew_runner.rs:786-801` as of tag
+# 2.1.4). **This is now the STANDALONE fallback only** — ADR 022. A runner passes
+# its spec's id down through `agnosai_execute_task_in_crew`, so its `token`
+# events carry the crew they belong to, like every other event it emits. Only an
+# `agnosai_execute_task` called outside a runner still lands here.
+#
+# ⚠ **Do not "fix" the runner path by stamping `crew_id` into each task's
+# context.** `_agnosai_crew_build_request` renders the whole context map into
+# the prompt: every context-free task would gain a context preamble, an internal
+# id would reach the model, and the request body — hoosh's cache key — would
+# differ per crew.
 fn _agnosai_crew_event_crew_id(task): i64 {
     var ctx = agnosai_task_context(task);
     if (ctx != 0) {
@@ -577,14 +599,21 @@ fn _agnosai_crew_placeholder_result(task, agent, start_ns): i64 {
 # The oracle sends the whole completed text as one token event rather than
 # streaming, deliberately: a second streaming inference would double latency and
 # cost for text it already has.
-fn _agnosai_crew_emit_token(event_tx, task, text: Str): i64 {
+#
+# `crew_id` is the runner's spec id, or 0 outside a runner. **A given id wins
+# over `task.context["crew_id"]`** (ADR 022): the event is delivered on that
+# crew's channel, and the context is client-supplied request data that could
+# name any crew at all. 0 keeps the oracle's fallback.
+fn _agnosai_crew_emit_token(event_tx, task, crew_id: Str, text: Str): i64 {
     if (event_tx == 0) { return 0; }
+    var id = crew_id;
+    if (id == 0) { id = _agnosai_crew_event_crew_id(task); }
     var data = bayan_json_v_obj_new();
     bayan_json_v_obj_set(data, str_from("task_id"), bayan_json_v_str_new(agnosai_task_id(task)));
     bayan_json_v_obj_set(data, str_from("token"), bayan_json_v_str_new(text));
     bayan_json_v_obj_set(data, str_from("complete"), bayan_json_v_bool_new(1));
-    return agnosai_event_sender_send(event_tx, agnosai_crew_event_new(
-        _agnosai_crew_event_crew_id(task), str_from("token"), data));
+    return agnosai_event_sender_send(event_tx, agnosai_crew_event_new(id, str_from("token"),
+        data));
 }
 
 # Build the success result's metadata.
@@ -598,9 +627,21 @@ fn _agnosai_crew_emit_token(event_tx, task, text: Str): i64 {
 # The key is **omitted entirely** when the gateway did not report a cost (a
 # pre-2.6.0 hoosh), rather than defaulting to 0: zero is a real cost for a local
 # model, so a fabricated zero would be indistinguishable from a free inference.
-fn _agnosai_crew_success_metadata(r, resp, start_ns): i64 {
+#
+# **`agent` is the assigned agent's key** (ADR 022), omitted for an unassigned
+# task. The oracle's profile aggregates `agent_cost_usd` from exactly this key
+# (`crew_runner.rs:186-194` as of tag 2.1.4) and its success arm never wrote it
+# (`:820-841`), so the field was always empty there and here. Writing it
+# completes the design the oracle declared. Only the success arm carries it:
+# the placeholder and error results keep the metadata shapes the oracle's tests
+# pin, and neither has a cost to attribute.
+fn _agnosai_crew_success_metadata(r, resp, start_ns, agent): i64 {
     agnosai_task_result_with_metadata(r, str_from("model"),
       bayan_json_v_str_new(agnosai_inference_response_model(resp)));
+    if (agent != 0) {
+        agnosai_task_result_with_metadata(r, str_from("agent"),
+          bayan_json_v_str_new(agnosai_agent_key(agent)));
+    }
 
     var provider = agnosai_inference_response_provider(resp);
     if (provider == 0) {
@@ -647,17 +688,9 @@ fn _agnosai_crew_error_result(task, err: Str, start_ns): i64 {
     return r;
 }
 
-# Execute one task via the LLM, or return the placeholder when there is no
-# client.
-#
-# `client == 0` selects the placeholder arm (the oracle's `llm: None`);
-# `event_tx == 0` means nobody is subscribed. Returns a TaskResult, never 0 —
-# a failed inference is a `Failed` result, not an error return.
-#
-# **No cache lookup.** The oracle checked an in-process `ResponseCache` here;
-# hoosh caches server-side on the whole request body, which is both automatic
-# and correct where the oracle's client-side key was not. See the module header.
-fn agnosai_execute_task(task, agent, client, event_tx): i64 {
+# The body of `agnosai_execute_task_in_crew`. `span` is the task's
+# `invoke_agent` span and `self_sc` its context — both 0 with telemetry off.
+fn _agnosai_execute_task_body(task, agent, client, event_tx, crew_id: Str, span, self_sc): i64 {
     var start_ns = clock_now_ns();
     var task_id = agnosai_task_id(task);
 
@@ -671,10 +704,13 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
       _agnosai_crew_agent_label(agent));
 
     var model = _agnosai_crew_select_model(agent);
+    # The agent has one configured model, so the span says which (the pinned
+    # convention's `gen_ai.request.model` on `invoke_agent`). A no-op at span 0.
+    agnosai_genai_span_set_request_model(span, model);
     var request = _agnosai_crew_build_request(task, agent, model, 0);
     var original_prompt = _agnosai_crew_user_message(task);
     var config = agnosai_retry_config_default();
-    var ctx = _agnosai_crew_infer_ctx_new(client, request);
+    var ctx = _agnosai_crew_infer_ctx_new(client, request, self_sc);
 
     var resp: i64[1];
     store64(&resp, 0);
@@ -710,7 +746,8 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
               AGNOSAI_CREW_RETRY_TEMPERATURE_MILLI);
 
             err = agnosai_with_retry(config, task_id,
-              &_agnosai_crew_infer_fp, _agnosai_crew_infer_ctx_new(client, retry_req), &resp);
+              &_agnosai_crew_infer_fp, _agnosai_crew_infer_ctx_new(client, retry_req, self_sc),
+              &resp);
         }
     }
 
@@ -721,30 +758,102 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
     var response = load64(&resp);
     var content = _agnosai_crew_filter_output(
       agnosai_inference_response_content(response), agent, task_id);
-    _agnosai_crew_emit_token(event_tx, task, content);
+    _agnosai_crew_emit_token(event_tx, task, crew_id, content);
 
     var result = agnosai_task_result_new(task_id, content, AGNOSAI_STATUS_COMPLETED);
-    return _agnosai_crew_success_metadata(result, response, start_ns);
+    return _agnosai_crew_success_metadata(result, response, start_ns, agent);
+}
+
+# Execute one task of a crew via the LLM, or return the placeholder when there
+# is no client.
+#
+# `client == 0` selects the placeholder arm (the oracle's `llm: None`);
+# `event_tx == 0` means nobody is subscribed. Returns a TaskResult, never 0 —
+# a failed inference is a `Failed` result, not an error return.
+#
+# `crew_id` is the spec's id, which the `token` event carries (ADR 022); the
+# runner passes it on every path. 0 means "no crew" and takes the standalone
+# fallback in `_agnosai_crew_event_crew_id` — that is `agnosai_execute_task`.
+#
+# `parent_sc` is the crew's `invoke_workflow` span context, or 0 (ADR 023).
+# With telemetry on the task is an `invoke_agent` span under it, and every chat
+# attempt is that span's child. The placeholder arm is recorded too: the task
+# ran, and a trace with a hole where it ran would mislead.
+#
+# **No cache lookup.** The oracle checked an in-process `ResponseCache` here;
+# hoosh caches server-side on the whole request body, which is both automatic
+# and correct where the oracle's client-side key was not. See the module header.
+fn agnosai_execute_task_in_crew(task, agent, client, event_tx, crew_id: Str, parent_sc): i64 {
+    # ⚠ Built ONLY with the exporter on. Off — the common case — this costs one
+    # load and a compare, no clock read, and the body is handed span 0 and
+    # context 0.
+    var span = 0;
+    var self_sc = 0;
+    var span_t0 = 0;
+    if (agnosai_telemetry_exporter() != 0) {
+        var agent_name = 0;
+        var agent_key = 0;
+        if (agent != 0) {
+            agent_name = agnosai_agent_name(agent);
+            agent_key = agnosai_agent_key(agent);
+        }
+        span = agnosai_genai_agent_span(agent_name, agent_key, agnosai_task_id(task));
+        self_sc = agnosai_telemetry_span_ctx(parent_sc);
+        span_t0 = clock_epoch_ns();
+    }
+
+    var result = _agnosai_execute_task_body(task, agent, client, event_tx, crew_id, span,
+      self_sc);
+
+    # Recorded ONCE, from the result: a failed inference is a Failed result, not
+    # an early return, so there is no other exit to cover.
+    if (span != 0) {
+        var ok = 0;
+        if (agnosai_task_result_status(result) == AGNOSAI_STATUS_COMPLETED) { ok = 1; }
+        else { agnosai_genai_span_set_error_type(span, str_from("task_failed")); }
+        agnosai_telemetry_record_span_in(span, self_sc, parent_sc, span_t0, clock_epoch_ns(),
+          agnosai_telemetry_status_of(ok));
+    }
+    return result;
+}
+
+# Execute one task outside a crew — the oracle's `execute_task` signature.
+#
+# A `token` event takes its crew id from the task's context, else `"unknown"`,
+# exactly as the oracle's did. A runner calls `agnosai_execute_task_in_crew`
+# instead, so its events name the crew they belong to.
+fn agnosai_execute_task(task, agent, client, event_tx): i64 {
+    return agnosai_execute_task_in_crew(task, agent, client, event_tx, 0, 0);
 }
 
 # ── bite 16: the CrewRunner ────────────────────
 
 # A task queued for a worker thread: the shared inputs plus one task and its
 # chosen agent, with a slot for the result.
+#
+# `EVENT_TX` is the crew's sender when someone is subscribed, else 0, and
+# `CREW_ID` the spec's id — together they let a worker emit the `token` event
+# the sequential path does (ADR 022). `TRACE` is the crew's span context, or 0:
+# the job is how a worker thread gets its parent, because a `thread_create`
+# worker starts with an empty thread-local block (ADR 023).
 enum AgnosaiCrewJobOff {
     AGN_CJ_TASK = 0;
     AGN_CJ_AGENT = 8;
     AGN_CJ_CLIENT = 16;
     AGN_CJ_RESULT = 24;
     AGN_CJ_CANCELLED = 32;
-    AGN_CJ_SIZE = 40;
+    AGN_CJ_EVENT_TX = 40;
+    AGN_CJ_CREW_ID = 48;
+    AGN_CJ_TRACE = 56;
+    AGN_CJ_SIZE = 64;
 }
 
 # One worker thread — `thread_create` passes exactly one argument.
 #
 # Cancellation is checked here rather than only before spawning, matching the
 # oracle's second check after acquiring its semaphore permit: a crew cancelled
-# while a wave is in flight must not start work that was merely queued.
+# while a wave is in flight must not start work that was merely queued. A job
+# cancelled here records no `invoke_agent` span — no agent was invoked.
 fn _agnosai_crew_worker(job): i64 {
     var task = load64(job + AGN_CJ_TASK);
     var cancelled = load64(job + AGN_CJ_CANCELLED);
@@ -753,8 +862,9 @@ fn _agnosai_crew_worker(job): i64 {
             str_from("crew cancelled"), AGNOSAI_STATUS_FAILED));
         return 0;
     }
-    store64(job + AGN_CJ_RESULT, agnosai_execute_task(task, load64(job + AGN_CJ_AGENT),
-        load64(job + AGN_CJ_CLIENT), 0));
+    store64(job + AGN_CJ_RESULT, agnosai_execute_task_in_crew(task, load64(job + AGN_CJ_AGENT),
+        load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX), load64(job + AGN_CJ_CREW_ID),
+        load64(job + AGN_CJ_TRACE)));
     return 0;
 }
 
@@ -772,7 +882,10 @@ enum AgnosaiCrewRunnerOff {
     # Raised to 1 when a loop head observes the deadline has passed, so the
     # orchestrator can tell a timeout from an ordinary cancellation.
     AGN_CR_TIMED_OUT = 56;
-    AGN_CR_SIZE = 64;
+    # The crew's `invoke_workflow` span context while it runs, or 0 — every
+    # task's parent (ADR 023). Set by `agnosai_crew_runner_run`.
+    AGN_CR_TRACE = 64;
+    AGN_CR_SIZE = 72;
 }
 
 # Initial chunk for the sequential run's audit scratch.
@@ -797,6 +910,7 @@ fn agnosai_crew_runner_new(spec): i64 {
     store64(r + AGN_CR_AUDIT, 0);
     store64(r + AGN_CR_DEADLINE_NS, 0);
     store64(r + AGN_CR_TIMED_OUT, 0);
+    store64(r + AGN_CR_TRACE, 0);
     return r;
 }
 
@@ -832,7 +946,10 @@ fn agnosai_crew_runner_cancel_flag(r): i64 {
 # `runner.run()` future and so aborts work in flight
 # (`rust-old/src/orchestrator/orchestrator.rs:204`). The observable contract
 # matches for a multi-task crew: no task starts after the deadline, and the
-# orchestrator substitutes the same `Failed` state with empty results.
+# runner itself returns the oracle's timeout state — `Failed`, no results, no
+# profile — and says `failed` in its `crew_completed` (ADR 022). The
+# orchestrator's own substitution (`_agnosai_orch_timeout_state`) still runs,
+# for its warning, and is idempotent: it replaces that state with an equal one.
 #
 # ⚠ **Parallel was missed until 2026-08-13.** The comment here used to say "the
 # two loop heads that already check cancellation", and the wave loop checked
@@ -852,8 +969,8 @@ fn agnosai_crew_runner_set_deadline_ns(r, ns): i64 {
 }
 
 # Whether a loop head observed the deadline pass. Distinct from cancellation:
-# the orchestrator reports a timeout differently, and only a timeout discards
-# results.
+# a timeout is reported differently, and only a timeout discards results —
+# `agnosai_crew_runner_run` does both itself (ADR 022).
 fn agnosai_crew_runner_timed_out(r): i64 {
     if (load64(r + AGN_CR_TIMED_OUT) != 0) { return 1; }
     return 0;
@@ -1050,7 +1167,8 @@ fn _agnosai_crew_run_sequential(r): i64 {
         }
 
         agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
-        var result = agnosai_execute_task(task, agent, client, load64(r + AGN_CR_EVENT_TX));
+        var result = agnosai_execute_task_in_crew(task, agent, client,
+          load64(r + AGN_CR_EVENT_TX), agnosai_crew_id(spec), load64(r + AGN_CR_TRACE));
         agnosai_task_with_status(task, agnosai_task_result_status(result));
 
         if (wants_events == 1) {
@@ -1073,9 +1191,29 @@ fn _agnosai_crew_run_sequential(r): i64 {
 # `max_concurrency` of 0 or less runs everything in one batch, matching the
 # oracle's `Semaphore::new(0)` being a caller error rather than a stall.
 #
-# Note the workers get `event_tx = 0`: the oracle passes `None` too, so the
-# per-token event only ever fires from the sequential path. Emitting from a
-# worker thread would also mean two threads racing on one channel.
+# ## Events say what happened, when it happened (ADR 022)
+#
+# **`task_started` is emitted as a task is dispatched to its worker**, which is
+# when its batch starts, and **`task_completed` as its worker is joined**, in
+# dispatch order. A task the deadline or a cancel stopped before dispatch gets
+# neither. The oracle emits `task_started` for a whole parallel crew up front
+# (`crew_runner.rs:337-348` as of tag 2.1.4) — the port did the same and also
+# held every `task_completed` until the last batch had joined, so a watcher saw
+# a whole wave "started" and could not tell running from done. The oracle emits
+# `task_completed` per join (`:400-411`, DAG `:521-535`), in COMPLETION order:
+# `join_next` yields whichever task finishes first. The completed half moves
+# back to per-join reporting but joins a batch in dispatch order, so a fast task
+# is reported after any slower one dispatched before it in the same batch, and
+# never later than the end of that batch. Both halves diverge deliberately.
+#
+# **Workers emit `token` events**, as the sequential path does. The oracle
+# passes `None` here (`:393`, `:514`), and this comment used to add "two threads
+# racing on one channel" as a reason. There is no race:
+# `agnosai_event_sender_send` holds the bus mutex across its whole fan-out
+# (`src/server/sse.cyr`). A worker gets the sender only when someone is
+# subscribed, so a bus nobody watches costs the workers nothing — exactly
+# nothing: `tests/orch_crew_runner.tcyr` requires a run with an unwatched bus to
+# allocate the same bytes as one with no bus.
 fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
     # Minted once for the wave rather than once per task, as in the
     # sequential path.
@@ -1088,14 +1226,15 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
     if (limit <= 0) { limit = vec_len(tasks); }
     if (limit <= 0) { return results; }
 
+    var worker_tx = 0;
+    if (wants_events == 1) { worker_tx = load64(r + AGN_CR_EVENT_TX); }
+    var crew_id = agnosai_crew_id(spec);
+
     var jobs = vec_new();
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
         var task = vec_get(tasks, i);
         var agent = _agnosai_crew_pick_best_agent(agents, task);
         agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
-        if (wants_events == 1) {
-            _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data(task, agent));
-        }
 
         var job = alloc(AGN_CJ_SIZE);
         store64(job + AGN_CJ_TASK, task);
@@ -1103,6 +1242,9 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         store64(job + AGN_CJ_CLIENT, client);
         store64(job + AGN_CJ_RESULT, 0);
         store64(job + AGN_CJ_CANCELLED, load64(r + AGN_CR_CANCELLED));
+        store64(job + AGN_CJ_EVENT_TX, worker_tx);
+        store64(job + AGN_CJ_CREW_ID, crew_id);
+        store64(job + AGN_CJ_TRACE, load64(r + AGN_CR_TRACE));
         vec_push(jobs, job);
     }
 
@@ -1122,45 +1264,53 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
     # The batch head is the right granularity: it is where the sequential loop's
     # equivalent check sits, and a running batch is joined rather than abandoned,
     # which is the same cooperative contract the module header documents.
+    #
+    # ⚠ **A job the deadline or a cancellation stopped is never dispatched**, so
+    # it has no result, no `task_started` and no `task_completed`: the same
+    # observable shape the sequential break has, which is a short result list.
     var next = 0;
     while (next < vec_len(jobs)) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
         if (_agnosai_crew_deadline_passed(r) == 1) { break; }
+
+        # One handle per dispatched job, in dispatch order — 0 for a job that
+        # ran inline — so the join below can walk the batch alongside `jobs`.
+        var first = next;
         var threads = vec_new();
         var spawned = 0;
         while (spawned < limit && next < vec_len(jobs)) {
             var job = vec_get(jobs, next);
+            if (wants_events == 1) {
+                _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data(
+                    load64(job + AGN_CJ_TASK), load64(job + AGN_CJ_AGENT)));
+            }
             var t = thread_create(&_agnosai_crew_worker, job);
             if (t == 0) {
                 # The thread could not be created — run it here rather than
                 # dropping the task. A missing result would silently shorten the
-                # crew's output.
+                # crew's output. Its `task_started` is already out, before it runs.
                 _agnosai_crew_worker(job);
-            } else { vec_push(threads, t); }
+            }
+            vec_push(threads, t);
             next = next + 1;
             spawned = spawned + 1;
         }
-        for (var j = 0; j < vec_len(threads); j = j + 1) { thread_join(vec_get(threads, j)); }
-    }
 
-    for (var k = 0; k < vec_len(jobs); k = k + 1) {
-        var jb = vec_get(jobs, k);
-        var res = load64(jb + AGN_CJ_RESULT);
-
-        # ⚠ **A job the deadline or a cancellation stopped never ran, so it has
-        # no result — skip it rather than dereferencing 0.** Every job is built
-        # up front here, unlike the sequential path which creates work as it
-        # goes, so breaking out of the batch loop leaves a tail of jobs with
-        # `AGN_CJ_RESULT == 0`. Pushing those would segfault in
-        # `agnosai_task_result_status`; skipping them gives the same observable
-        # shape the sequential break has, which is a short result list.
-        if (res != 0) {
-            agnosai_task_with_status(load64(jb + AGN_CJ_TASK),
-              agnosai_task_result_status(res));
-            if (wants_events == 1) {
-                _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data(res));
+        # Join in dispatch order and report each task as it is joined, so a
+        # watcher sees this batch's tasks finish before the next batch starts.
+        for (var j = 0; j < vec_len(threads); j = j + 1) {
+            var th = vec_get(threads, j);
+            if (th != 0) { thread_join(th); }
+            var jb = vec_get(jobs, first + j);
+            var res = load64(jb + AGN_CJ_RESULT);
+            if (res != 0) {
+                agnosai_task_with_status(load64(jb + AGN_CJ_TASK),
+                  agnosai_task_result_status(res));
+                if (wants_events == 1) {
+                    _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data(res));
+                }
+                vec_push(results, res);
             }
-            vec_push(results, res);
         }
     }
     return results;
@@ -1270,6 +1420,11 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
 # which is why the key is omitted rather than zeroed when a gateway does not
 # report one: a zero would be indistinguishable from a free local inference and
 # would still be filtered out here by the oracle's own `> 0` guard.
+#
+# `agent_cost_usd` is aggregated from each result's `agent` key, which the LLM
+# success arm writes since ADR 022 — before it, nothing did and the map was
+# always empty. `agnosai_crew_profile_record_agent_cost` sums, so an agent that
+# answered several tasks is charged for all of them.
 fn _agnosai_crew_build_profile(r, results, wall_ms): i64 {
     var profile = agnosai_crew_profile_new();
     agnosai_crew_profile_with_wall_ms(profile, wall_ms);
@@ -1381,6 +1536,19 @@ fn _agnosai_crew_record_metrics(results): i64 {
     return 0;
 }
 
+# Close the crew's `invoke_workflow` span: OK when `err_type` (a cstring) is 0,
+# else ERROR carrying it as `error.type`. Nothing at all with telemetry off.
+fn _agnosai_crew_span_done(span, self_sc, parent_sc, t0, err_type): i64 {
+    if (span == 0) { return 0; }
+    var status = AGNOSAI_OTLP_STATUS_OK;
+    if (err_type != 0) {
+        agnosai_genai_span_set_error_type(span, str_from(err_type));
+        status = AGNOSAI_OTLP_STATUS_ERROR;
+    }
+    return agnosai_telemetry_record_span_in(span, self_sc, parent_sc, t0, clock_epoch_ns(),
+      status);
+}
+
 # Run the crew end to end — the oracle's `run`.
 #
 # Returns a CrewState, or 0 with an error stored through `out_err`. The split
@@ -1400,14 +1568,29 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     var spec = load64(r + AGN_CR_SPEC);
     var tasks = agnosai_crew_tasks(spec);
 
-    # ADR 017 — the GenAI crew span. It follows the SAME discipline as the
-    # `crews_active` gauge below: **every exit must close it**, including the
-    # DAG-cycle error return, or a crew that fails to start is recorded as a
-    # span that never ended. `clock_epoch_ns` rather than the monotonic
-    # `start_ns` above, because OTLP timestamps are wall clock.
-    var span = agnosai_genai_crew_span(agnosai_crew_id(spec), agnosai_crew_name(spec),
-      vec_len(tasks));
-    var span_t0 = clock_epoch_ns();
+    # ADR 017 — the GenAI crew span, `invoke_workflow {crew name}` since ADR
+    # 023. It follows the SAME discipline as the `crews_active` gauge below:
+    # **every exit must close it**, including the DAG-cycle error return, or a
+    # crew that fails to start is recorded as a span that never ended.
+    # `clock_epoch_ns` rather than the monotonic `start_ns` above, because OTLP
+    # timestamps are wall clock.
+    #
+    # ADR 023: built only with the exporter on. Its parent is the spec's inbound
+    # `traceparent` when one parses under the W3C rules — a malformed one starts
+    # a new root, never an error — and its context goes on the runner, where
+    # every task (and through the wave job, every worker) finds its parent.
+    var parent_sc = 0;
+    var span = 0;
+    var self_sc = 0;
+    var span_t0 = 0;
+    if (agnosai_telemetry_exporter() != 0) {
+        parent_sc = agnosai_otlp_span_context_parse(agnosai_crew_trace_parent(spec));
+        span = agnosai_genai_workflow_span(agnosai_crew_id(spec), agnosai_crew_name(spec),
+          vec_len(tasks));
+        self_sc = agnosai_telemetry_span_ctx(parent_sc);
+        span_t0 = clock_epoch_ns();
+    }
+    store64(r + AGN_CR_TRACE, self_sc);
 
     if (_agnosai_crew_wants_events(r) == 1) {
         var started = bayan_json_v_obj_new();
@@ -1436,8 +1619,7 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
             # Balance the active gauge before the error return. No task ran, so
             # no task/inference counters are recorded — only the gauge unwinds.
             agnosai_metrics_record_crew_completed(agnosai_metrics_global());
-            agnosai_telemetry_record_span(span, span_t0, clock_epoch_ns(),
-              AGNOSAI_OTLP_STATUS_ERROR);
+            _agnosai_crew_span_done(span, self_sc, parent_sc, span_t0, "invalid_dag");
             store64(out_err, load64(&dag_err));
             return 0;
         }
@@ -1453,9 +1635,26 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
 
     var wall_ms = _agnosai_crew_elapsed_ms(start_ns);
 
-    # Cancelled beats everything; otherwise every task must have completed.
+    # A timeout beats everything, then a cancel; otherwise every task must have
+    # completed.
+    #
+    # ⚠ **A timeout is reported HERE, by the runner (ADR 022).** It used to be
+    # computed from whatever partial results existed — COMPLETED when they had
+    # all completed, *including when there were none* — and emitted in
+    # `crew_completed`, and only afterwards did the orchestrator store FAILED.
+    # A watcher read "completed" for a crew the registry called failed. The
+    # timeout state is now built here, so the event and the stored state agree by
+    # construction. Timeout outranks cancel, as the orchestrator's substitution
+    # always has (`_agnosai_orch_finish_err`).
+    #
+    # The two can coincide only if a cancel lands between the loop head that saw
+    # the deadline and this read. Both are read at the same loop heads with the
+    # cancel checked first, so no suite can produce it deterministically; the
+    # precedence is stated rather than tested.
+    var timed_out = agnosai_crew_runner_timed_out(r);
     var status = AGNOSAI_CREW_COMPLETED;
-    if (agnosai_crew_runner_is_cancelled(r) == 1) { status = AGNOSAI_CREW_CANCELLED; }
+    if (timed_out == 1) { status = AGNOSAI_CREW_FAILED; }
+    elif (agnosai_crew_runner_is_cancelled(r) == 1) { status = AGNOSAI_CREW_CANCELLED; }
     else {
         for (var i = 0; i < vec_len(results); i = i + 1) {
             if (agnosai_task_result_status(vec_get(results, i)) != AGNOSAI_STATUS_COMPLETED) {
@@ -1466,22 +1665,31 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
 
     # Balance the active gauge and fold this crew's tasks into the counters.
     # Both run for every terminal status — Completed, Failed and Cancelled — so
-    # the gauge cannot drift upward on a cancelled crew.
+    # the gauge cannot drift upward on a cancelled crew. A timed-out crew's
+    # results are counted too: the work ran and its tokens were spent, even
+    # though the state below discards them.
     agnosai_metrics_record_crew_completed(agnosai_metrics_global());
     _agnosai_crew_record_metrics(results);
 
+    # On a timeout this is the oracle's timeout state — `Failed`, no results, no
+    # profile (`orchestrator.rs:204-214` as of tag 2.1.4) — so a caller cannot
+    # read a timed-out crew's partial output as if it had finished.
     var state = agnosai_crew_state_new(agnosai_crew_id(spec), status);
-    for (var j = 0; j < vec_len(results); j = j + 1) {
-        agnosai_crew_state_with_result(state, vec_get(results, j));
+    if (timed_out == 0) {
+        for (var j = 0; j < vec_len(results); j = j + 1) {
+            agnosai_crew_state_with_result(state, vec_get(results, j));
+        }
+        agnosai_crew_state_with_profile(state, _agnosai_crew_build_profile(r, results, wall_ms));
     }
-    agnosai_crew_state_with_profile(state, _agnosai_crew_build_profile(r, results, wall_ms));
 
+    # `task_count` is the STATE's result count, not the run's, so a timed-out
+    # crew reports 0 — what the stored state holds. `wall_ms` stays the real one.
     if (_agnosai_crew_wants_events(r) == 1) {
         var done = bayan_json_v_obj_new();
         bayan_json_v_obj_set(done, str_from("status"),
           bayan_json_v_str_new(agnosai_crew_status_to_wire(status)));
         bayan_json_v_obj_set(done, str_from("task_count"),
-          bayan_json_v_int_new(vec_len(results)));
+          bayan_json_v_int_new(vec_len(agnosai_crew_state_results(state))));
         bayan_json_v_obj_set(done, str_from("wall_ms"), bayan_json_v_int_new(wall_ms));
         _agnosai_crew_emit(r, str_from("crew_completed"), done);
     }
@@ -1489,8 +1697,16 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     # ⚠ CANCELLED is an ERROR span, not OK. A collector's error rate is what an
     # operator alerts on, and a cancelled crew did not do what was asked — the
     # oracle's `CrewStatus` keeps the three apart and OTLP has only two, so the
-    # fold has to pick a side and picks the honest one.
-    agnosai_telemetry_record_span(span, span_t0, clock_epoch_ns(),
-      agnosai_telemetry_status_of(status == AGNOSAI_CREW_COMPLETED));
+    # fold has to pick a side and picks the honest one. A timed-out crew is
+    # FAILED above, so its span is ERROR too — it used to be OK whenever its
+    # partial results had all completed. `error.type` keeps the three apart
+    # (ADR 023), and the timeout is read from the runner itself, so the span
+    # agrees with the orchestrator's FAILED however `status` was reached.
+    var err_type = 0;
+    if (timed_out == 1) { err_type = "timeout"; }
+    elif (status == AGNOSAI_CREW_CANCELLED) { err_type = "cancelled"; }
+    elif (status != AGNOSAI_CREW_COMPLETED) { err_type = "task_failed"; }
+    _agnosai_crew_span_done(span, self_sc, parent_sc, span_t0, err_type);
     return state;
 }
+

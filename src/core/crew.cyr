@@ -27,7 +27,11 @@ enum AgnosaiCrewStatus {
     AGNOSAI_CREW_CANCELLED = 4;
 }
 
-# CrewSpec heap layout — 56 bytes.
+# CrewSpec heap layout — 64 bytes.
+#
+# `TRACE_PARENT` is the caller's W3C `traceparent`, or 0 (ADR 023). It is
+# per-execution transport, not part of the crew's definition, so it is never
+# serialised — see `agnosai_crew_with_trace_parent`.
 enum AgnosaiCrewSpecOff {
     AGN_CREW_ID = 0;
     AGN_CREW_NAME = 8;
@@ -36,7 +40,8 @@ enum AgnosaiCrewSpecOff {
     AGN_CREW_PROCESS = 32;
     AGN_CREW_METADATA = 40;
     AGN_CREW_TRUST_LEVEL = 48;
-    AGN_CREW_SIZE = 56;
+    AGN_CREW_TRACE_PARENT = 56;
+    AGN_CREW_SIZE = 64;
 }
 
 # CrewState heap layout — 32 bytes.
@@ -108,6 +113,7 @@ fn agnosai_crew_new(name: Str): i64 {
     store64(c + AGN_CREW_PROCESS, agnosai_process_sequential());
     store64(c + AGN_CREW_METADATA, map_new_str());
     store64(c + AGN_CREW_TRUST_LEVEL, agnosai_default_trust_level());
+    store64(c + AGN_CREW_TRACE_PARENT, 0);
     return c;
 }
 
@@ -133,6 +139,37 @@ fn agnosai_crew_with_process(c, process): i64 {
 fn agnosai_crew_with_trust_level(c, level: Str): i64 {
     store64(c + AGN_CREW_TRUST_LEVEL, level);
     return c;
+}
+
+# Run this crew inside the caller's trace: `tp` is a W3C `traceparent`, such as
+# the one on the request that submitted the crew. Returns the crew.
+#
+# ⚠ **Stores a COPY.** An in-process caller's traceparent typically lives in a
+# per-request arena — agnostic's does — and a crew submitted asynchronously
+# runs after that request has been answered and its arena reset. Storing the
+# caller's `Str` would hand the runner reclaimed bytes.
+#
+# Only a 55-byte value is kept; anything else stores 0, and so does a `tp` of
+# 0. That is a length check, not validation: the runner parses the value with
+# the W3C rules when the crew starts (`telemetry/otlp.cyr`), and one it rejects
+# simply starts a new trace. The format lives in telemetry so `core` keeps no
+# dependency on it.
+#
+# **Not serialised.** `agnosai_crew_to_value_a` and `from_value` ignore it: trace
+# context is per-execution transport, not part of the crew's definition, so the
+# wire and any persisted spec are unchanged (ADR 023).
+fn agnosai_crew_with_trace_parent(c, tp: Str): i64 {
+    var v = 0;
+    if (tp != 0) {
+        if (str_len(tp) == 55) { v = str_clone(tp); }
+    }
+    store64(c + AGN_CREW_TRACE_PARENT, v);
+    return c;
+}
+
+# The crew's inbound `traceparent` (a private copy), or 0 for none.
+fn agnosai_crew_trace_parent(c): i64 {
+    return load64(c + AGN_CREW_TRACE_PARENT);
 }
 
 # Attach a metadata key-value pair. `value` is a bayan JSON value.
@@ -335,9 +372,22 @@ fn agnosai_crew_profile_agent_cost(p): i64 {
     return load64(p + AGN_PROF_AGENT_COST);
 }
 
-# Record an agent's cost in micro-USD. Returns the profile.
+# Add `micro_usd` to an agent's recorded cost. Returns the profile.
+#
+# **It SUMS** — the oracle's `*agent_cost_usd.entry(key).or_default() += cost`
+# (`crew_runner.rs:192` as of tag 2.1.4). An agent that ran three tasks costs
+# what the three cost. This used to `map_set` the value, so an agent was charged
+# only for its LAST task — latent until ADR 022 made the crew runner write the
+# `agent` metadata the aggregation reads.
+#
+# ⚠ **The key is cloned on every call, not only the first.** `map_set`
+# overwrites the stored KEY pointer as well as the value (`map_set_a` in the
+# stdlib's hashmap), so writing the sum back under the caller's borrowed key
+# would swap the owned clone out for a borrow. Same allocation as before the
+# change, which cloned per call too.
 fn agnosai_crew_profile_record_agent_cost(p, agent_key: Str, micro_usd): i64 {
-    map_set(load64(p + AGN_PROF_AGENT_COST), str_clone(agent_key), micro_usd);
+    var m = load64(p + AGN_PROF_AGENT_COST);
+    map_set(m, str_clone(agent_key), map_get_or(m, agent_key, 0) + micro_usd);
     return p;
 }
 

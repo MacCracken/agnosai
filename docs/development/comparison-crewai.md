@@ -81,16 +81,20 @@ AgnosAI's hierarchical mode uses a dedicated `manager` agent ID with proper dele
 
 ## 3. Agent Scoring & Selection
 
-### AgnosAI — Quantitative 4-Factor Ranking
+### AgnosAI — Quantitative 5-Factor Ranking
 
 Weighted scoring per agent-task pair:
 
 | Factor | Weight | Description |
 |--------|--------|-------------|
-| Tool coverage | 40% | `|required_tools ∩ agent_tools| / |required_tools|` |
-| Complexity alignment | 30% | How well agent complexity matches task complexity |
-| GPU match | 15% | Hardware capability when task requires it |
+| Tool coverage | 35% | `|required_tools ∩ agent_tools| / |required_tools|` |
+| Complexity alignment | 25% | How well agent complexity matches task complexity |
 | Domain match | 15% | Domain compatibility |
+| Personality fit | 15% | Neutral 0.5 for every agent until bhava is ported (reported as `unmeasured`) |
+| GPU match | 10% | Hardware capability when task requires it |
+
+`agnosai_explain_selection_a` returns each agent's five component scores beside
+its total, in the order the crew runner ranks them (roadmap F7).
 
 - rank_agents (10 agents): 823 ns (v1.0.0, was 2.95 us pre-optimization)
 - rank_agents (100 agents): 7.74 us
@@ -245,7 +249,7 @@ CrewAI's memory is more feature-rich (long-term + entity memory with vector stor
 | Operation | Scale | AgnosAI Median | Notes |
 |-----------|-------|----------------|-------|
 | Tool registry lookup | 50 tools | 59 ns | DashMap, lock-free |
-| Score + rank agents | 10 agents | 823 ns | 4-factor weighted, pre-extracted tools |
+| Score + rank agents | 10 agents | 823 ns | 5-factor weighted, pre-extracted tools |
 | Scheduler ready_tasks | 100 workers | 2.04 us | Wide DAG wave detection |
 | PubSub publish | 10 subs | 1.29 us | Wildcard matching |
 | Fleet relay send | — | 161 ns | With dedup |
@@ -326,7 +330,7 @@ AgnosAI's dependency footprint is ~50x smaller. No onnxruntime, no chromadb, no 
 | DAG execution | Yes | No |
 | Hierarchical execution | Yes | Broken |
 | Event-driven flows | No | Yes |
-| Agent scoring | Yes (4-factor) | No |
+| Agent scoring | Yes (5-factor) | No |
 | Task priority tiers | Yes (5 levels) | No |
 | Task risk levels | Yes (3 levels) | No |
 | Model routing | Yes (automatic) | Manual / litellm |

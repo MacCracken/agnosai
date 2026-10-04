@@ -523,6 +523,17 @@ fn _agnosai_route_build_spec(r): i64 {
 # `dashboard.rs`, which formats the same enum with `{:?}` and gets
 # `Completed`. Two endpoints, one enum, two spellings, both deliberate.
 fn agnosai_route_create_crew_a(a, state, body: Str): i64 {
+    return agnosai_route_create_crew_tp_a(a, state, body, 0);
+}
+
+# `POST /api/v1/crews` with the request's `traceparent` header, or 0 for none
+# (ADR 023). The crew's spans join that trace when it parses under the W3C
+# rules; a malformed one starts a new trace and changes nothing about the
+# response. The response is byte-identical to `agnosai_route_create_crew_a`'s.
+#
+# `tp` lives in the request arena; `agnosai_crew_with_trace_parent` copies it,
+# because the registered spec outlives the request.
+fn agnosai_route_create_crew_tp_a(a, state, body: Str, tp: Str): i64 {
     var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
     if (v == 0) {
         return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
@@ -539,8 +550,9 @@ fn agnosai_route_create_crew_a(a, state, body: Str): i64 {
         return agnosai_route_error_a(a, HTTP_BAD_REQUEST, err);
     }
 
-    var st = agnosai_orchestrator_run_crew(
-      agnosai_app_state_orchestrator(state), _agnosai_route_build_spec(req));
+    var spec = _agnosai_route_build_spec(req);
+    if (tp != 0) { agnosai_crew_with_trace_parent(spec, tp); }
+    var st = agnosai_orchestrator_run_crew(agnosai_app_state_orchestrator(state), spec);
     if (st == 0) {
         _agnosai_route_crew_run_error(agnosai_crew_req_name(req));
         return agnosai_route_error_a(a, HTTP_INTERNAL, str_from_a(a, "crew execution failed"));

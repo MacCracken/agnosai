@@ -522,6 +522,9 @@ fn agnosai_tracing_guard_service_name(g): i64 {
 # stderr format. Reproduced rather than smoothed over: an operator whose log
 # shipper parses JSON needs to know that enabling the collector breaks it.
 #
+# The exporter half is `agnosai_telemetry_init_export`, which an in-process
+# consumer calls on its own (ADR 023).
+#
 # Returns a guard the caller must keep for the process lifetime.
 fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
     var service_name = agnosai_telemetry_service_name();
@@ -531,11 +534,10 @@ fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
     if (lvl < 0) { lvl = SK_INFO; }
     sakshi_set_level(lvl);
 
-    var g = alloc(AGN_TG_SIZE);
-    store64(g + AGN_TG_SERVICE_NAME, service_name);
-    store64(g + AGN_TG_EXPORTER, 0);
-
     if (otlp_endpoint == 0) {
+        var g = alloc(AGN_TG_SIZE);
+        store64(g + AGN_TG_SERVICE_NAME, service_name);
+        store64(g + AGN_TG_EXPORTER, 0);
         agnosai_telemetry_init_json_logging();
         store64(g + AGN_TG_OTEL, 0);
         return g;
@@ -543,6 +545,42 @@ fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
 
     # Text stderr, as the oracle's OTLP branch uses.
     sakshi_clear_emit_hook();
+    return agnosai_telemetry_init_export(otlp_endpoint, service_name);
+}
+
+# Start OTLP span export to `otlp_endpoint` as `service_name`, and touch
+# NOTHING else. Returns a guard; `agnosai_telemetry_shutdown(g)` flushes it.
+#
+# ⚠ **For an in-process consumer, which owns its own logging** (ADR 023).
+# agnostic links agnosai and installs its own JSON emit hook, so
+# `agnosai_telemetry_init_tracing` — which sets sakshi's level and replaces the
+# hook — is not something it can call, and until this existed no agnosai span
+# ever left its process: the exporter global stayed 0. This leaves sakshi's
+# level and emit hook exactly as they were.
+#
+# ⚠ **One exporter per process.** If one is already running this starts no
+# second thread — two would drain the same spans from two rings, and the first
+# would be leaked with no guard to stop it. The second caller gets a guard
+# over the SAME exporter, so either guard's shutdown stops it.
+#
+# `otlp_endpoint` of 0 answers a guard with OTLP off, as `init_tracing` does.
+fn agnosai_telemetry_init_export(otlp_endpoint, service_name: Str): i64 {
+    var g = alloc(AGN_TG_SIZE);
+    store64(g + AGN_TG_SERVICE_NAME, service_name);
+    store64(g + AGN_TG_EXPORTER, 0);
+    store64(g + AGN_TG_OTEL, 0);
+    if (otlp_endpoint == 0) { return g; }
+
+    var existing = _agnosai_telemetry_exporter;
+    if (existing != 0) {
+        if (sakshi_get_level() >= SK_DEBUG) {
+            sakshi_debug("OpenTelemetry OTLP export already running; reusing it", 53);
+        }
+        store64(g + AGN_TG_EXPORTER, existing);
+        store64(g + AGN_TG_OTEL, 1);
+        return g;
+    }
+
     var exporter = agnosai_otlp_exporter_new(otlp_endpoint, service_name,
       AGNOSAI_OTLP_BATCH_MS);
     agnosai_otlp_exporter_start(exporter);
@@ -587,6 +625,11 @@ fn agnosai_tracing_guard_exporter(g): i64 {
 #
 # See ADR 017 for why those call sites exist at all: the oracle defines the
 # genai span helpers and never calls them, and this port must.
+#
+# ⚠ **The exporter is global; the trace context is NOT** (ADR 023). One
+# exporter per process is the oracle's shape and is right. A span's parent is
+# per crew and per task, so it travels down the call path as a span context
+# instead — `agnosai_telemetry_record_span_in` takes it explicitly.
 var _agnosai_telemetry_exporter = 0;
 
 # The exporter every span call site enqueues into, or 0 when OTLP is off.
@@ -617,29 +660,72 @@ fn agnosai_telemetry_shutdown(g): i64 {
 
 # --- the span call sites' entry point ------------------------------------
 
-# Record a finished genai span, if telemetry is on. Returns 1 if it was queued.
+# A span context for a new span under `parent_sc`, or 0 when telemetry is off.
 #
-# The single call every span site uses, so instrumenting a call path is two
-# lines — build the span, then hand it here with its timing — rather than
-# twenty of exporter lookup, identity minting and context construction. See
-# ADR 017.
+# The call sites' first half: a site that is about to start a span asks for its
+# context here, before it does the work, so the context can be handed to the
+# work's own children. `parent_sc` of 0 makes a new root trace.
 #
-# ⚠ **Identity is minted per span, not read from sakshi.** sakshi's trace id is
-# a process global and two concurrent requests would share it; a fresh
-# `agnosai_uuid_v4` per span is 128 random bits, which is exactly a trace id.
-# The cost is that spans do not correlate into one trace yet — see ADR 017 and
-# the roadmap's OpenTelemetry-library note, where the thread-local current-span
-# that would fix it belongs.
+# ⚠ Answers 0 with OTLP off, the common case, so the off path makes no
+# `getrandom` syscall and allocates nothing. A context of 0 handed down to a
+# child is simply "no parent" — and with telemetry off the child records
+# nothing either.
+fn agnosai_telemetry_span_ctx(parent_sc): i64 {
+    if (agnosai_telemetry_exporter() == 0) { return 0; }
+    return agnosai_otlp_span_context_child(parent_sc);
+}
+
+# Record a finished genai span under its own context `self_sc`, a child of
+# `parent_sc`, if telemetry is on. Returns 1 if it was queued.
 #
-# ⚠ Returns 0 immediately when OTLP is off, which is the common case. Nothing
-# above this line allocates in that path.
-fn agnosai_telemetry_record_span(span, start_ns, end_ns, status): i64 {
+# The second half of a call site (ADR 023): `self_sc` came from
+# `agnosai_telemetry_span_ctx(parent_sc)` when the span started, and is the
+# context the site's children were given, so their `parentSpanId` is this
+# span's id. `parent_sc` of 0 records a root span.
+#
+# * **The exporter came on mid-flight** — `self_sc` is 0 because the span
+#   started while OTLP was off. A child of `parent_sc` is minted here, so the
+#   span is still exported, just with no children of its own.
+# * **ParentBased sampling**, the OTel SDK default: a context whose `sampled`
+#   flag is 0 is not queued. An inbound `traceparent` with flags `00` therefore
+#   suppresses the whole crew's spans, and so does nothing else.
+#
+# ⚠ **Identity is threaded, never read from sakshi or thread-local storage.**
+# sakshi's trace id is a process global, so two concurrent requests would share
+# it; and thread-local storage does not cross `thread_create` or the
+# orchestrator's detached submit thread (see `telemetry/otlp.cyr`'s span-context
+# section). Before ADR 023 every span minted its own trace, and its span id was
+# the high half of its own trace id.
+#
+# ⚠ Returns 0 immediately when OTLP is off or `span` is 0, which is the common
+# case. Nothing above that line allocates.
+fn agnosai_telemetry_record_span_in(span, self_sc, parent_sc, start_ns, end_ns, status): i64 {
     var e = agnosai_telemetry_exporter();
     if (e == 0) { return 0; }
-    var u = agnosai_uuid_v4();
-    var ctx = agnosai_otlp_ctx_new(load64(u), load64(u + 8), load64(u),
-      start_ns, end_ns, status);
-    return agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(e), span, ctx);
+    if (span == 0) { return 0; }
+    var sc = self_sc;
+    if (sc == 0) { sc = agnosai_otlp_span_context_child(parent_sc); }
+    if (agnosai_otlp_span_context_sampled(sc) == 0) { return 0; }
+
+    var parent_id = 0;
+    if (parent_sc != 0) { parent_id = agnosai_otlp_span_context_span_id(parent_sc); }
+    # The export context lives on this frame: `ring_enqueue` encodes it and
+    # keeps nothing, so a heap copy would be 56 bytes per span on the no-free
+    # global bump for nothing. `var ctx[56]` is `AGN_OTC_SIZE` bytes.
+    var ctx[56];
+    _agnosai_otlp_ctx_fill(&ctx, agnosai_otlp_span_context_trace_hi(sc),
+      agnosai_otlp_span_context_trace_lo(sc), agnosai_otlp_span_context_span_id(sc),
+      parent_id, start_ns, end_ns, status);
+    return agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(e), span, &ctx);
+}
+
+# Record a finished genai span as the root of its own trace. Returns 1 if it
+# was queued.
+#
+# `agnosai_telemetry_record_span_in(span, 0, 0, ..)`: for a span with no parent
+# and no children. Every call site in `src/` now uses the `_in` form (ADR 023).
+fn agnosai_telemetry_record_span(span, start_ns, end_ns, status): i64 {
+    return agnosai_telemetry_record_span_in(span, 0, 0, start_ns, end_ns, status);
 }
 
 # `AGNOSAI_OTLP_STATUS_OK` when `ok` is 1, else ERROR — the mapping every call

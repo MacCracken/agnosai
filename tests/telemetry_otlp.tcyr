@@ -18,9 +18,11 @@
 #
 # Also pinned: absent attributes are OMITTED rather than sent as null (OTLP has
 # no null attribute value); the comma placement that omission has to get right;
-# `SpanKind` CLIENT for inference and INTERNAL for local work; and the all-zero
+# `SpanKind` CLIENT for `chat` and INTERNAL for local work; the all-zero
 # trace id, which `sakshi_trace_id_hi`/`_lo` answer with when nothing ever set
-# one and which the W3C spec declares invalid.
+# one and which the W3C spec declares invalid; and, since ADR 023, the span
+# context — strict `traceparent` parsing, children, roots, and `parentSpanId`
+# on every span that has a parent.
 #
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
@@ -59,17 +61,17 @@ fn _t_expect_tool_span(): i64 {
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"traceId\":\"0102030405060708090a0b0c0d0e0f10\"");
     str_builder_add_cstr(sb, ",\"spanId\":\"1122334455667788\"");
-    str_builder_add_cstr(sb, ",\"name\":\"gen_ai.execute_tool\",\"kind\":1");
+    str_builder_add_cstr(sb, ",\"name\":\"execute_tool echo\",\"kind\":1");
     str_builder_add_cstr(sb, ",\"startTimeUnixNano\":\"1000\"");
     str_builder_add_cstr(sb, ",\"endTimeUnixNano\":\"2000\",\"attributes\":[");
     str_builder_add_cstr(sb, "{\"key\":\"gen_ai.operation.name\"");
     str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"execute_tool\"}},");
     str_builder_add_cstr(sb, "{\"key\":\"gen_ai.agent.name\"");
     str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"agent-a\"}},");
+    str_builder_add_cstr(sb, "{\"key\":\"gen_ai.tool.name\"");
+    str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"echo\"}},");
     str_builder_add_cstr(sb, "{\"key\":\"agnosai.task.id\"");
-    str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"task-1\"}},");
-    str_builder_add_cstr(sb, "{\"key\":\"agnosai.tool.name\"");
-    str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"echo\"}}]");
+    str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"task-1\"}}]");
     str_builder_add_cstr(sb, ",\"status\":{\"code\":1}}");
     return str_builder_build(sb);
 }
@@ -101,18 +103,24 @@ fn main(): i64 {
     assert_eq(agnosai_otlp_trace_id_is_zero(1, 0), 0, "as is a high-half-only id");
 
     # --- span kind -------------------------------------------------------
-    var inf = agnosai_genai_inference_span(str_from("llama3"), str_from("ollama"),
-      str_from("agent-a"), str_from("task-1"));
+    var inf = agnosai_genai_chat_span(str_from("llama3"), str_from("hoosh"));
     var tool = agnosai_genai_tool_span(str_from("echo"), str_from("agent-a"),
       str_from("task-1"));
-    var crew = agnosai_genai_crew_span(str_from("crew-1"), str_from("c"), 3);
+    var crew = agnosai_genai_workflow_span(str_from("crew-1"), str_from("c"), 3);
+    var agent = agnosai_genai_agent_span(str_from("Analyst"), str_from("analyst"),
+      str_from("task-1"));
     # ⚠ A backend's service-dependency graph is built from CLIENT/SERVER pairs,
     # so a mislabelled inference span drops the edge to the model provider.
     assert_eq(agnosai_otlp_span_kind(inf), AGNOSAI_OTLP_KIND_CLIENT,
-      "inference is CLIENT — it leaves the process");
+      "chat is CLIENT — it leaves the process");
     assert_eq(agnosai_otlp_span_kind(tool), AGNOSAI_OTLP_KIND_INTERNAL,
       "tool execution is INTERNAL");
-    assert_eq(agnosai_otlp_span_kind(crew), AGNOSAI_OTLP_KIND_INTERNAL, "and so is a crew run");
+    assert_eq(agnosai_otlp_span_kind(crew), AGNOSAI_OTLP_KIND_INTERNAL,
+      "and so is a workflow (crew) run");
+    # ⚠ The regression guard for ADR 023: `invoke_agent` used to be the chat
+    # call's name and was exported CLIENT. It is now the in-process task span.
+    assert_eq(agnosai_otlp_span_kind(agent), AGNOSAI_OTLP_KIND_INTERNAL,
+      "invoke_agent is INTERNAL — an in-process agent, no longer the chat call");
     assert_eq(AGNOSAI_OTLP_KIND_CLIENT, 3, "CLIENT is the wire value 3");
     assert_eq(AGNOSAI_OTLP_KIND_INTERNAL, 1, "and INTERNAL is 1");
 
@@ -128,6 +136,61 @@ fn main(): i64 {
     var j = agnosai_otlp_span_json(tool, _t_ctx());
     assert(str_eq(j, _t_expect_tool_span()) == 1,
       "a tool span encodes byte-for-byte to the OTLP/JSON Span object");
+    # The encoder writes the name in two parts rather than building it; it must
+    # agree with the one place that does build it.
+    var fa = default_alloc();
+    var four = vec_new();
+    vec_push(four, inf);
+    vec_push(four, tool);
+    vec_push(four, crew);
+    vec_push(four, agent);
+    var names_agree = 1;
+    for (var ni = 0; ni < 4; ni = ni + 1) {
+        var nsb = str_builder_new();
+        str_builder_add_cstr(nsb, "\"name\":\"");
+        str_builder_add(nsb, agnosai_genai_span_full_name_a(fa, vec_get(four, ni)));
+        str_builder_add_cstr(nsb, "\",\"kind\":");
+        if (str_contains(agnosai_otlp_span_json(vec_get(four, ni), _t_ctx()),
+            str_builder_build(nsb)) == 0) { names_agree = 0; }
+    }
+    assert_eq(names_agree, 1, "the encoded name is full_name_a's, for all four operations");
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(inf, _t_ctx()),
+        "\"name\":\"chat llama3\""), 1, "chat {model}");
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(agent, _t_ctx()),
+        "\"name\":\"invoke_agent Analyst\""), 1, "invoke_agent {agent name}");
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(crew, _t_ctx()),
+        "\"name\":\"invoke_workflow c\""), 1, "invoke_workflow {crew name}");
+    # A name is caller data like any attribute, so it is escaped.
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(
+          agnosai_genai_chat_span(str_from("m\"x"), 0), _t_ctx()),
+        "\"name\":\"chat m\\\"x\""), 1, "a quote in a span name's subject is escaped");
+    # A subject that is absent or empty leaves the bare operation.
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(agnosai_genai_agent_span(0, 0, 0),
+          _t_ctx()), "\"name\":\"invoke_agent\",\"kind\":1"), 1,
+      "an agent span with no name is the bare operation");
+    # The agent span's attributes, in the pinned order.
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(agent, _t_ctx()),
+        "\"gen_ai.agent.name\",\"value\":{\"stringValue\":\"Analyst\"}},{\"key\":\"agnosai.task.id\""
+        ), 1, "agent name, then the task id");
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(agent, _t_ctx()),
+        "{\"key\":\"agnosai.agent.key\",\"value\":{\"stringValue\":\"analyst\"}}]"), 1,
+      "and the agent key last");
+    # error.type sits after the gen_ai. attributes and before agnosai.'s.
+    var errspan = agnosai_genai_workflow_span(str_from("cid"), str_from("w"), 2);
+    agnosai_genai_span_set_error_type(errspan, str_from("timeout"));
+    var esb = str_builder_new();
+    str_builder_add_cstr(esb, "\"gen_ai.workflow.name\",\"value\":{\"stringValue\":\"w\"}},");
+    str_builder_add_cstr(esb, "{\"key\":\"error.type\",\"value\":{\"stringValue\":\"timeout\"}},");
+    str_builder_add_cstr(esb, "{\"key\":\"agnosai.crew.id\"");
+    assert_eq(str_contains(agnosai_otlp_span_json(errspan, _t_ctx()), str_builder_build(esb)), 1,
+      "error.type is emitted between the spec attributes and agnosai's");
+    # ⚠ An EMPTY string attribute is absent, like a 0 one. The call sites used
+    # to pass `str_from("")` and this emitted `"stringValue":""` for each.
+    var empties = agnosai_genai_tool_span(str_from("t"), str_from(""), str_from(""));
+    var je0 = agnosai_otlp_span_json(empties, _t_ctx());
+    assert_eq(str_contains_cstr(je0, "gen_ai.agent.name"), 0, "an empty agent name is omitted");
+    assert_eq(str_contains_cstr(je0, "agnosai.task.id"), 0, "as is an empty task id");
+    assert_eq(str_contains_cstr(je0, "\"stringValue\":\"\""), 0, "no empty string value at all");
 
     # ⚠ The timestamps are QUOTED. This is the rule that fails silently.
     assert_eq(str_contains_cstr(j, "\"startTimeUnixNano\":\"1000\""), 1,
@@ -159,30 +222,41 @@ fn main(): i64 {
 
     # --- absent attributes are OMITTED, not null -------------------------
     # OTLP has no null attribute value; a collector reading one drops the span.
-    var bare = agnosai_genai_inference_span(str_from("m"), str_from("s"), str_from("a"),
-      str_from("t"));
+    var bare = agnosai_genai_chat_span(str_from("m"), str_from("s"));
     var jb = agnosai_otlp_span_json(bare, _t_ctx());
     assert_eq(str_contains_cstr(jb, "null"), 0, "an unrecorded span emits no null anywhere");
     assert_eq(str_contains_cstr(jb, "gen_ai.usage.input_tokens"), 0,
       "an unset integer attribute is omitted entirely");
     assert_eq(str_contains_cstr(jb, "gen_ai.response.model"), 0,
       "as is an unset string attribute");
-    assert_eq(str_contains_cstr(jb, "agnosai.tool.name"), 0,
+    assert_eq(str_contains_cstr(jb, "gen_ai.tool.name"), 0,
       "and an attribute this span kind never carries");
 
     # ⚠ Omission has to get the commas right. A span with ONE attribute must
     # have no comma at all, and none may lead or trail the array.
-    var crew_only = agnosai_genai_crew_span(str_from("only"), str_from("n"), 0);
+    var crew_only = agnosai_genai_workflow_span(str_from("only"), 0, 0);
     var jc = agnosai_otlp_span_json(crew_only, _t_ctx());
     assert_eq(str_contains_cstr(jc, "[,"), 0, "no leading comma in the attribute array");
     assert_eq(str_contains_cstr(jc, ",]"), 0, "no trailing comma");
     assert_eq(str_contains_cstr(jc, ",,"), 0, "and no doubled comma from a skipped attribute");
-    # A crew span sets no operation name, so its FIRST emitted attribute is the
-    # crew id — the omission is at the front, which is where a naive
-    # "comma before every attribute but the first index" gets it wrong.
+    # A tool span with only its name skips five attributes between the
+    # operation and the tool name, and the task id after it — the omissions sit
+    # in the MIDDLE and at the END, where a naive "comma before every attribute
+    # but the first index" gets it wrong. (Before ADR 023 the crew span set no
+    # operation name, which put the omission at the front instead; every span
+    # now opens on its operation.)
     assert_eq(str_contains_cstr(jc,
-        "\"attributes\":[{\"key\":\"agnosai.crew.id\""), 1,
-      "the array opens on the first PRESENT attribute, not the first possible one");
+        "\"attributes\":[{\"key\":\"gen_ai.operation.name\""), 1,
+      "the array opens on the operation, which every span carries");
+    assert_eq(str_contains_cstr(jc,
+        "\"stringValue\":\"invoke_workflow\"}},{\"key\":\"agnosai.crew.id\""), 1,
+      "and a workflow span with no name skips straight to the crew id");
+    var lone = agnosai_otlp_span_json(agnosai_genai_tool_span(str_from("x"), 0, 0), _t_ctx());
+    var lsb = str_builder_new();
+    str_builder_add_cstr(lsb, "\"stringValue\":\"execute_tool\"}},");
+    str_builder_add_cstr(lsb, "{\"key\":\"gen_ai.tool.name\",\"value\":{\"stringValue\":\"x\"}}]");
+    assert_eq(str_contains(lone, str_builder_build(lsb)), 1,
+      "a lone tool name closes the array with no trailing comma");
     assert_eq(str_contains_cstr(jc,
         "{\"key\":\"agnosai.crew.task_count\",\"value\":{\"intValue\":\"0\"}}]"), 1,
       "and closes on the last present one — a 0 task count is present, not unset");
@@ -254,6 +328,153 @@ fn main(): i64 {
     assert_eq(str_contains_cstr(agnosai_otlp_span_json(tool, errctx), "\"status\":{\"code\":2}"), 1,
       "and it reaches the encoded span");
 
+    # --- parentSpanId (ADR 023) -------------------------------------------
+    # ⚠ A ROOT span omits the key. Sixteen zeros are an invalid span id, not
+    # "no parent", and a collector would render a missing parent for every root.
+    assert_eq(agnosai_otlp_ctx_parent_span_id(_t_ctx()), 0, "ctx_new makes a root");
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(tool, _t_ctx()), "parentSpanId"), 0,
+      "and a root span carries NO parentSpanId key");
+    var cctx = agnosai_otlp_ctx_new_child(0x0102030405060708, 0x090a0b0c0d0e0f10,
+      0x1122334455667788, 0xaabbccddeeff0011, 1000, 2000, AGNOSAI_OTLP_STATUS_OK);
+    assert_eq(agnosai_otlp_ctx_parent_span_id(cctx), 0xaabbccddeeff0011,
+      "ctx_new_child keeps the parent");
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(tool, cctx),
+        "\"spanId\":\"1122334455667788\",\"parentSpanId\":\"aabbccddeeff0011\",\"name\":"), 1,
+      "a child carries parentSpanId right after spanId, as 16 lowercase hex");
+    # The parent is the only difference: everything after the name is the same.
+    var root_tail = str_index_of_cstr(agnosai_otlp_span_json(tool, _t_ctx()), "\"name\":");
+    var child_j = agnosai_otlp_span_json(tool, cctx);
+    assert_eq(str_index_of_cstr(child_j, "\"name\":") - root_tail, 34,
+      "and adds exactly the 34 bytes of one parentSpanId member");
+    # A parent with the top bit set is a NEGATIVE i64 and still a valid id.
+    var neg = agnosai_otlp_ctx_new_child(1, 2, 3, 0 - 1, 10, 20, AGNOSAI_OTLP_STATUS_OK);
+    assert_eq(str_contains_cstr(agnosai_otlp_span_json(tool, neg),
+        "\"parentSpanId\":\"ffffffffffffffff\""), 1, "a top-bit parent id is still emitted");
+
+    # --- span context: parse ----------------------------------------------
+    # The W3C spec's own example.
+    var w3c = str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    var sc = agnosai_otlp_span_context_parse(w3c);
+    assert(sc != 0, "the W3C example parses");
+    assert_eq(agnosai_otlp_span_context_trace_hi(sc), 0x4bf92f3577b34da6, "trace id high half");
+    assert_eq(agnosai_otlp_span_context_trace_lo(sc), 0xa3ce929d0e0e4736, "trace id low half");
+    assert_eq(agnosai_otlp_span_context_span_id(sc), 0x00f067aa0ba902b7,
+      "the parent-id becomes the context's span id");
+    assert_eq(agnosai_otlp_span_context_flags(sc), 1, "flags 01");
+    assert_eq(agnosai_otlp_span_context_sampled(sc), 1, "are sampled");
+    assert(str_eq(agnosai_otlp_span_context_format_a(default_alloc(), sc), w3c) == 1,
+      "and format(parse(x)) is x byte for byte");
+
+    # The shape agnostic mints (`agnostic_trace_generate_a`): version 00, random
+    # ids, flags 01 — with top-bit-set halves, which are negative as i64.
+    var ag = str_from("00-f0e1d2c3b4a5968778695a4b3c2d1e0f-8899aabbccddeeff-01");
+    var agc = agnosai_otlp_span_context_parse(ag);
+    assert(agc != 0, "an agnostic-shaped traceparent parses");
+    assert_eq(agnosai_otlp_span_context_trace_hi(agc), 0xf0e1d2c3b4a59687,
+      "a top-bit trace half round-trips as its bit pattern");
+    assert_eq(agnosai_otlp_span_context_span_id(agc), 0x8899aabbccddeeff, "and so does the span id");
+    assert(str_eq(agnosai_otlp_span_context_format_a(default_alloc(), agc), ag) == 1,
+      "and it formats back byte for byte");
+
+    # Flags other than 01 are kept whole, and only bit 0 is `sampled`.
+    var unsampled = agnosai_otlp_span_context_parse(
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"));
+    assert(unsampled != 0, "flags 00 parse");
+    assert_eq(agnosai_otlp_span_context_sampled(unsampled), 0, "and are NOT sampled");
+    var f02 = agnosai_otlp_span_context_parse(
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-02"));
+    assert_eq(agnosai_otlp_span_context_flags(f02), 2, "an unknown flag bit is kept");
+    assert_eq(agnosai_otlp_span_context_sampled(f02), 0, "and is not `sampled`");
+    assert(str_eq_cstr(agnosai_otlp_span_context_format_a(default_alloc(), f02),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-02") == 1,
+      "and is passed on as it arrived");
+
+    # Everything else is a new root, never an error.
+    assert_eq(agnosai_otlp_span_context_parse(0), 0, "0 is not a traceparent");
+    assert_eq(agnosai_otlp_span_context_parse(str_from("")), 0, "nor is the empty Str");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0")), 0, "54 bytes");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-011")), 0, "56 bytes");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01")), 0,
+      "uppercase hex — W3C writes HEXDIGLC");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902B7-01")), 0,
+      "even one uppercase digit");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")), 0,
+      "version ff, which the spec forbids");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")), 0,
+      "version 01, which does not exist");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-00000000000000000000000000000000-00f067aa0ba902b7-01")), 0,
+      "the all-zero trace id");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01")), 0,
+      "the all-zero parent id");
+    assert(agnosai_otlp_span_context_parse(
+        str_from("00-00000000000000000000000000000001-0000000000000001-01")) != 0,
+      "but a trace id with only its low bit set is valid");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00_4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")), 0,
+      "a missing first dash");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-4bf92f3577b34da6a3ce929d0e0e47-3600f067aa0ba902b7-01")), 0, "a moved dash");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7+01")), 0, "a wrong last dash");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01")), 0, "a non-hex byte");
+    assert_eq(agnosai_otlp_span_context_parse(
+        str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0x")), 0,
+      "a non-hex flags byte");
+
+    # An exhausted allocator answers 0, not a context it could not store.
+    # (ARENA_FULL_NULL, the default policy, answers 0 when full.)
+    var tiny = arena_allocator(16);
+    assert_eq(agnosai_otlp_span_context_parse_a(tiny, w3c), 0,
+      "parse_a in an arena too small for 32 bytes answers 0");
+
+    # --- span context: children and roots ---------------------------------
+    var kid = agnosai_otlp_span_context_child(sc);
+    assert_eq(agnosai_otlp_span_context_trace_hi(kid), 0x4bf92f3577b34da6,
+      "a child keeps the parent's trace id");
+    assert_eq(agnosai_otlp_span_context_trace_lo(kid), 0xa3ce929d0e0e4736, "both halves");
+    assert_eq(agnosai_otlp_span_context_flags(kid), 1, "and its flags");
+    assert(agnosai_otlp_span_context_span_id(kid) != 0, "with a non-zero span id");
+    assert(agnosai_otlp_span_context_span_id(kid) != agnosai_otlp_span_context_span_id(sc),
+      "different from the parent's");
+    var kid2 = agnosai_otlp_span_context_child(sc);
+    assert(agnosai_otlp_span_context_span_id(kid2) != agnosai_otlp_span_context_span_id(kid),
+      "and two children of one parent differ");
+    assert_eq(agnosai_otlp_span_context_flags(agnosai_otlp_span_context_child(unsampled)), 0,
+      "an unsampled parent's children are unsampled too");
+
+    var root = agnosai_otlp_span_context_child(0);
+    assert_eq(agnosai_otlp_trace_id_is_zero(agnosai_otlp_span_context_trace_hi(root),
+        agnosai_otlp_span_context_trace_lo(root)), 0, "child(0) is a root with a trace id");
+    assert(agnosai_otlp_span_context_span_id(root) != 0, "and a span id");
+    assert_eq(agnosai_otlp_span_context_flags(root), 1, "sampled — flags 01");
+    var root2 = agnosai_otlp_span_context_child(0);
+    assert(agnosai_otlp_span_context_trace_hi(root2) != agnosai_otlp_span_context_trace_hi(root)
+      || agnosai_otlp_span_context_trace_lo(root2) != agnosai_otlp_span_context_trace_lo(root),
+      "two roots are two traces");
+    # ⚠ The old identity reused the trace id's high half as the span id.
+    assert(agnosai_otlp_span_context_span_id(root) != agnosai_otlp_span_context_trace_hi(root),
+      "a root's span id is drawn, not the high half of its trace id");
+    # A formatted root is a traceparent this parser accepts.
+    var rtp = agnosai_otlp_span_context_format_a(default_alloc(), root);
+    assert_eq(str_len(rtp), 55, "a formatted root is 55 bytes");
+    var rback = agnosai_otlp_span_context_parse(rtp);
+    assert(rback != 0, "and parses back");
+    assert_eq(agnosai_otlp_span_context_span_id(rback), agnosai_otlp_span_context_span_id(root),
+      "to the same span id");
+    var made = agnosai_otlp_span_context_new(7, 8, 9, 1);
+    assert(str_eq_cstr(agnosai_otlp_span_context_format_a(default_alloc(), made),
+        "00-00000000000000070000000000000008-0000000000000009-01") == 1,
+      "span_context_new formats zero-padded");
+
     # --- the export ring --------------------------------------------------
     var ring = agnosai_otlp_ring_new();
     assert(ring != 0, "a ring is created");
@@ -289,8 +510,8 @@ fn main(): i64 {
     var doc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
     assert(doc != 0, "the drain yields a document");
     assert_eq(str_contains_cstr(doc, "\"service.name\""), 1, "with the resource envelope");
-    assert_eq(str_contains_cstr(doc, "gen_ai.execute_tool"), 1, "carrying the first span");
-    assert_eq(str_contains_cstr(doc, "agnosai.crew.run"), 1, "and the second");
+    assert_eq(str_contains_cstr(doc, "\"execute_tool echo\""), 1, "carrying the first span");
+    assert_eq(str_contains_cstr(doc, "\"invoke_workflow c\""), 1, "and the second");
     assert_eq(str_contains_cstr(doc, "}},{\"traceId\":"), 1, "comma-separated");
     assert_eq(agnosai_otlp_ring_count(ring), 0, "and the ring is emptied");
     assert_eq(agnosai_otlp_ring_drain(ring, str_from("agnosai")), 0,
@@ -350,8 +571,9 @@ fn main(): i64 {
         agnosai_otlp_ring_enqueue(lr, crew, _t_ctx());
     }
     assert_eq(str_len(held), held_len, "the handed-out document is unchanged by later enqueues");
-    assert_eq(str_contains_cstr(held, "gen_ai.execute_tool"), 1, "and still holds its own span");
-    assert_eq(str_contains_cstr(held, "agnosai.crew.run"), 0,
+    assert_eq(str_contains_cstr(held, "\"execute_tool echo\""), 1,
+      "and still holds its own span");
+    assert_eq(str_contains_cstr(held, "invoke_workflow"), 0,
       "with none of the spans queued after it");
 
     # --- the exporter -------------------------------------------------------
@@ -454,10 +676,12 @@ fn main(): i64 {
     # it is simply not detectable here. Read the calls, don't rely on this alone.
     var ar = agnosai_otlp_ring_new();
     var asvc = str_from("alloc-probe");
-    var aspan = agnosai_genai_inference_span(str_from("gpt-4o"), str_from("openai"),
-      str_from("probe-agent"), str_from("task-1"));
+    var aspan = agnosai_genai_chat_span(str_from("gpt-4o"), str_from("hoosh"));
     agnosai_genai_record_usage(aspan, 1234, 567, str_from("gpt-4o"));
-    var actx = _t_ctx();
+    # A CHILD context, so the probe covers `parentSpanId` and the composed
+    # `chat gpt-4o` name too (ADR 023) — both must write into the arena.
+    var actx = agnosai_otlp_ctx_new_child(0x0102030405060708, 0x090a0b0c0d0e0f10,
+      0x1122334455667788, 0xaabbccddeeff0011, 1000, 2000, AGNOSAI_OTLP_STATUS_OK);
 
     # Warm once — the first cycle faults in the arena chunks.
     agnosai_otlp_ring_enqueue(ar, aspan, actx);

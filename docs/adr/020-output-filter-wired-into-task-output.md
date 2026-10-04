@@ -83,6 +83,10 @@ request was built from — `agnosai_wrap_system_prompt(_agnosai_crew_build_syste
   that arm needs a live gateway — the same limitation `_agnosai_otlp_post`
   carries. The placeholder arm IS covered: unwiring it fails two assertions.
   Read the call site; do not trust the suite alone for the LLM half.
+  ✅ **Closed 2026-10-03 by [ADR 022](022-crew-events-and-status-say-what-happened.md)'s
+  test seam.** The hoosh client's chat pointer lets `tests/orch_crew_runner.tcyr`
+  answer a task with a stub gateway whose output carries a key; with redaction on,
+  unwiring the filter from the LLM arm now fails the suite.
 - ⚠ **A redaction-enabled deployment can corrupt legitimate output.** That is the
   explicit trade the flag exists to make the operator own. If a crew's purpose is
   extracting contact details, redaction must stay off for that deployment.

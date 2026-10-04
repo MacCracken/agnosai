@@ -7,6 +7,653 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.5] — 2026-10-04
+
+Three roadmap items, on 2.1.4's toolchain and dependencies: cyrius 6.6.14, the same six
+`[deps.*]` tags and a byte-identical `cyrius.lock`. ⚠ **B17** makes crew events and registry
+status say what happened ([ADR 022](docs/adr/022-crew-events-and-status-say-what-happened.md)),
+which changes what `/api/v1/crews/{id}/stream` and `GET /api/v1/crews/{id}` report. **F7**
+explains agent selection through a library call, `agnosai_explain_selection_a`, and changes no
+wire. ⚠ **F6** exports the four OTel GenAI semconv operations under one trace per crew and joins
+an inbound W3C `traceparent` ([ADR 023](docs/adr/023-genai-semconv-spans-and-w3c-trace-context.md)).
+It **breaks** the exported span vocabulary, and it renames the library's genai span functions
+and constants: `agnosai_genai_inference_span` → `agnosai_genai_chat_span`,
+`agnosai_genai_crew_span` → `agnosai_genai_workflow_span`, `AGNOSAI_GENAI_SYSTEM` →
+`AGNOSAI_GENAI_PROVIDER_NAME`, and the rest under *Breaking*. No known consumer calls them. ADRs
+022 and 023 are Accepted with this release. 99 suites and **8,573** assertions pass (2.1.4:
+8,065), coverage is 99% (1,616 of 1,628 functions), `build/agnosai` is 5,240,304 B (2.1.4:
+5,223,328) and `dist/agnosai.cyr` is 38,905 lines (37,619). `rust-old/` is still present: like
+2.1.1 to 2.1.4, this patch does not carry the deletion the 2.1.0 notes schedule.
+
+Roadmap **B17**: crew events and registry status say what happened
+([ADR 022](docs/adr/022-crew-events-and-status-say-what-happened.md)). agnostic 0.1.9 found six
+places where what a watcher of `/api/v1/crews/{id}/stream` or `GET /api/v1/crews/{id}` reads is
+not what happened. All six are fixed, and each diverges deliberately from `rust-old/`. In the
+first, `task_completed` moves back toward the oracle, which reports each task as it joins, but
+the port joins a batch in dispatch order where the oracle reports in completion order. The ADR
+records each with its oracle line as of tag 2.1.4. agnostic needs no code change.
+
+Roadmap **F7**: explain agent selection. `agnosai_explain_selection_a` returns each agent's five
+component scores beside its total, in the crew runner's rank order, and two renderers turn that
+into JSON. It is a library call only: agnosai's REST, MCP and A2A wire does not change, so there
+is no ADR (design principle 1 governs the wire, and ADR 015's trigger was a wire-visible
+addition), and `docs/guides/api-reference.md` is deliberately unchanged. agnostic surfaces it on
+its plan route when it re-pins.
+
+Roadmap **F6** (agnosai half): OTel GenAI semantic-convention spans, and inbound W3C trace
+context ([ADR 023](docs/adr/023-genai-semconv-spans-and-w3c-trace-context.md), amending ADR 017).
+agnosai now exports the four semconv operations — `invoke_workflow` per crew, `invoke_agent` per
+task, `chat` per inference attempt and `execute_tool` per tool call — linked parent to child under
+one trace, and joins a caller's `traceparent`. The convention is pinned at
+`open-telemetry/semantic-conventions-genai` commit `e07f4ebacb08f56db8c4c882d117720333fbca04`
+(gen-ai-dev/1.42.0-dev on base semconv v1.44.0, status Development). `rust-old/` had none of this:
+no propagator, and its genai helpers were never called. **The telemetry wire changes** (see
+*Breaking*); the REST, MCP and A2A responses do not. agnostic's half — stamping its request's
+traceparent on the crews it submits, and `agnosai_telemetry_init_export` at boot — lands at its
+re-pin.
+
+⚠ **Wire-visible changes**, all deliberate:
+
+- `/api/v1/crews/{id}/stream` (B17, *Changed*): a parallel or DAG crew's task events interleave
+  per batch, its workers send `token` events, every runner `token` carries the real crew id, and
+  a timed-out crew's `crew_completed` says `failed` with `task_count: 0`.
+- `GET /api/v1/crews/{id}` (B17, *Changed*): `running` is now stored, with one backward edge,
+  `running` → `pending`, on the DAG error arm. LLM-answered results carry `metadata.agent`,
+  which `GET /api/v1/dashboard/agents` also reads.
+- A `traceparent` request header is honoured on `POST /api/v1/crews`, `POST /api/v1/a2a/receive`
+  and `/mcp` `tools/call` (F6, *Added*). Responses are unchanged.
+- The exported OTLP span vocabulary (F6, *Breaking*).
+
+F7 changes no wire.
+
+### Breaking
+
+- **The exported span vocabulary (F6, ADR 023).** No dual emission; a dashboard built on 2.1.4
+  must be updated.
+
+  | 2.1.4 | now |
+  |---|---|
+  | span `gen_ai.invoke_agent` (CLIENT) — it was the hoosh chat call | `chat {model}` (CLIENT) |
+  | — (no per-task span) | `invoke_agent {agent name}` (INTERNAL), one per task |
+  | span `agnosai.crew.run`, no `gen_ai.operation.name` | `invoke_workflow {crew name}` (INTERNAL), `gen_ai.operation.name` = `invoke_workflow` |
+  | span `gen_ai.execute_tool` | `execute_tool {tool name}` |
+  | `gen_ai.operation.name` = `invoke_agent` on the chat call | `chat` |
+  | `gen_ai.system` (deprecated upstream) | `gen_ai.provider.name` (still `hoosh`) |
+  | `agnosai.tool.name` | `gen_ai.tool.name` |
+  | `agnosai.crew.name` | `gen_ai.workflow.name` |
+  | — | `error.type`, `agnosai.agent.key`, and `gen_ai.request.model` on `invoke_agent` |
+  | every span its own one-span trace | one trace per crew; `parentSpanId` on every child |
+
+- **Library API (F6).** For a Cyrius consumer of `dist/agnosai.cyr` — no known consumer calls any
+  of these (agnostic, daimon and thoth checked):
+  - `agnosai_genai_inference_span(model, system, agent_name, task_id)` →
+    `agnosai_genai_chat_span(model, provider)`; the agent and task belong to the `invoke_agent`
+    parent now. `agnosai_genai_crew_span` → `agnosai_genai_workflow_span` (same arguments).
+  - Constants: `AGNOSAI_GENAI_SYSTEM` → `AGNOSAI_GENAI_PROVIDER_NAME`, `AGNOSAI_GENAI_CREW_NAME`
+    → `AGNOSAI_GENAI_WORKFLOW_NAME`, `AGNOSAI_GENAI_RESPONSE_FINISH_REASON` →
+    `AGNOSAI_GENAI_RESPONSE_FINISH_REASONS` (`gen_ai.response.finish_reasons`, the spec's
+    plural). The three `AGNOSAI_GENAI_SPAN_*` name constants are replaced by the operations
+    `AGNOSAI_GENAI_OP_CHAT` / `_INVOKE_AGENT` / `_INVOKE_WORKFLOW` / `_EXECUTE_TOOL`, and
+    `agnosai_genai_span_name` returns the operation; the exported name is
+    `agnosai_genai_span_full_name_a`'s.
+  - ⚠ A reachable call to a removed function fails the build, but an unreachable one is only a
+    warning, so a consumer that re-pins should also check its build log for
+    `undefined function 'agnosai_genai_`.
+  - The span record grows from 104 to 120 bytes; the export context from 48 to 56.
+
+### Changed
+
+- ⚠ **Parallel and DAG `task_started` / `task_completed`** (B17, `_agnosai_crew_run_wave`). A task's
+  `task_started` now goes out as it is dispatched to its worker, and its `task_completed` as its
+  worker is joined, in dispatch order. A wave used to announce every task before its first batch ran
+  and complete them all after its last, so a five-task parallel crew at concurrency 2 showed five
+  tasks in flight; it now shows two. A task the deadline or a cancel stops before dispatch gets
+  neither event; it used to get a `task_started` and no `task_completed`. **Event order changes:**
+  `s0 s1 c0 c1 s2 …` instead of `s0 … sN … cN`. Both halves diverge from the oracle (ADR 022). The
+  oracle announces a whole wave up front (`crew_runner.rs:337-348`). It does report each task as it
+  joins (`:400-411`), but in completion order, because `JoinSet::join_next` yields whichever task
+  finishes first. The port joins a batch in dispatch order, so a fast task's `task_completed` waits
+  behind any slower task dispatched before it in the same batch. It never waits past the end of its
+  own batch.
+- ⚠ **Parallel and DAG workers send `token` events** (B17), one per LLM-answered task, as the
+  sequential path does. They used to pass no sender. A worker gets the sender only when someone is
+  subscribed, so an unwatched bus costs the workers nothing. The old comment's "two threads racing
+  on one channel" was never true: `agnosai_event_sender_send` holds the bus mutex across its
+  fan-out.
+- ⚠ **LLM-answered results carry `metadata.agent`** (B17), the assigned agent's key (omitted for an
+  unassigned task). The crew profile's `agent_cost_usd` is aggregated from that key, which nothing
+  wrote, so it was always empty — in the oracle too. Placeholder and error results keep their
+  metadata shapes. `GET /api/v1/dashboard/agents` reads the same key and now lists the agents of
+  LLM-answered crews.
+- ⚠ **Runner `token` events carry the spec's crew id** (B17). They took it from
+  `task.context["crew_id"]`, which the runner never stamps, so every one said `"unknown"`. The id is
+  passed down rather than stamped into the context, which `_agnosai_crew_build_request` renders into
+  the prompt and hoosh's cache key. `agnosai_execute_task` outside a runner keeps the old fallback.
+- ⚠ **A timed-out crew reports the timeout itself** (B17). `agnosai_crew_runner_run` with a deadline
+  returns `failed` with no results and no profile, and its `crew_completed` says `status: "failed"`
+  and `task_count: 0`. It used to compute `completed` from the partial results — including when
+  there were none — and announce that, while the orchestrator stored `failed`. The GenAI crew span
+  is ERROR for a timed-out crew (it was OK when the partial results had all completed). Metrics
+  still count the tasks that ran. The orchestrator's substitution is kept for its warning and is now
+  idempotent.
+- ⚠ **The registry stores `running`** while a crew runs (B17). `_agnosai_orch_finish_err` moves the
+  registered state `pending → running` as it hands the crew to its runner, and only from `pending`,
+  so a cancel that landed first stands. A run that errors before producing a state (a cyclic DAG, a
+  DAG deadlock) puts `pending` back, so that arm reads exactly as before rather than `running`
+  forever. `AGNOSAI_CREW_RUNNING` was parsed and rendered and never stored. **This adds a backward
+  edge a poller can see, `running` → `pending`.** The crew is marked `running` before the runner
+  sorts its DAG, and a deadlock reverts only after the earlier waves have run and sent their task
+  events. `POST /api/v1/crews` cannot reach either error, because it range-checks and cycle-checks
+  its dependency indices. `docs/guides/api-reference.md` documents the edge.
+
+- **`agnosai_score_agent_with_tools` folds through `_agnosai_score_fold`** (F7), the body
+  `agnosai_explain_selection_a` folds through too, so an explanation's total is the runner's
+  score by construction. The multiply-add order (tool, complexity, GPU, domain, personality) and
+  the clamp are unchanged, so every score is bit-identical: the suite compares raw f64 bits.
+- **`agnosai_extract_required_tools` delegates to a private allocator form**,
+  `_agnosai_extract_required_tools_a(a, task)` (F7). It is private because it has a third answer,
+  -1 for an exhausted allocator. A public `_a` form would have to fold that into 0, which means
+  "no requirement" and scores every agent full coverage. The bare form still allocates its vec on
+  the global bump, 152 B for up to 16 tools. It allocates slightly less than before, because it no
+  longer mints its `required_tools` key there on every call.
+- **`AGN_JK_AGENT_KEY` moves from `server/routes/dashboard.cyr` to `core/json.cyr`** (F7).
+  Scoring is included long before the dashboard and now emits `agent_key` too. Same name, same
+  `Str`.
+
+- **The hoosh client's chat pointer takes the task's span context** as a fourth argument (F6):
+  `fn(client, request, out_response, parent_sc)`. The live call passes it to
+  `agnosai_hoosh_chat_in`, and a suite's stub receives exactly what the live call would. B17
+  added the pointer in this same release, so no released contract changes; the
+  suites' stubs take the fourth argument.
+- **`agnosai_execute_task_in_crew` takes a trailing `parent_sc`**, the crew's span context (F6).
+  It is ADR 022's, new in this release; the parent is crew-scoped like the crew id, so
+  it joined that signature rather than adding a third task entry point. `agnosai_execute_task`
+  passes 0 for both.
+- **Span sites build nothing with the exporter off** (F6). The chat, task, workflow and tool sites
+  construct their span, draw random bytes and read the clock only while
+  `agnosai_telemetry_exporter()` is set. A tool call and a task now allocate exactly what the
+  work they wrap allocates; `tests/telemetry_wiring.tcyr` compares each against its bare body.
+- **`agnosai_telemetry_init_tracing` is now logging init plus `agnosai_telemetry_init_export`**
+  (F6). Same behaviour, including the oracle's text-stderr switch when OTLP is on.
+- **`agnosai_telemetry_record_span` records a root under a fresh span context** rather than a
+  `uuid_v4` split into trace id and span id (F6, and see *Fixed*).
+- **The span kind follows the operation**: CLIENT for `chat`, INTERNAL for the other three (F6).
+  It used to follow the name, and the CLIENT name was the chat call's.
+
+### Fixed
+
+- **`agnosai_crew_profile_record_agent_cost` replaced the agent's cost instead of summing it**
+  (B17), so an agent was charged only for its last task. It now adds, as the oracle's `+=` does
+  (`crew_runner.rs:192`). Latent until `metadata.agent` was written. The key is still cloned on
+  every call: `map_set` overwrites the stored key pointer, so writing the sum back under the
+  caller's borrowed key would have swapped the owned clone for a borrow.
+
+- **A task domain with an embedded NUL matched its own prefix** (`agnosai_domain_score`). The
+  task's domain was copied into a C string (`str_cstr`) and compared by `strlen`, so
+  `"quality\u0000x"` matched an agent in `quality`. The two `Str`s are now compared whole with
+  `agnosai_str_eq_ci`, as the oracle's `eq_ignore_ascii_case` compares the whole string. The copy
+  was also one global allocation per agent scored (see *Performance*).
+
+- **A span's id was the high half of its own trace id** (F6, `telemetry/mod.cyr:640` at 2.1.4).
+  `agnosai_telemetry_record_span` split one `agnosai_uuid_v4` into trace id and span id and passed
+  the same high half as both, so every exported span was a one-span trace whose span id was
+  derivable from its trace id — and carried the uuid's version nibble. Span ids are now drawn
+  separately (8 random bytes, forced non-zero), and spans share their crew's trace.
+- **Empty attributes were exported as `"stringValue":""`** (F6). ADR 017 said the tool span's
+  missing agent name and task id were "omitted rather than faked", but the call sites passed
+  `str_from("")` and the encoder emitted both — on every tool span, and on every chat span for the
+  same two. An empty string attribute is now absent, like a 0 one; the sites pass 0.
+
+### Added
+
+- **`agnosai_execute_task_in_crew(task, agent, client, event_tx, crew_id, parent_sc)`** (B17) —
+  `execute_task` for a task that belongs to a crew. `agnosai_execute_task` keeps its signature
+  and delegates with crew id 0 and no parent span (F6 added `parent_sc`).
+- **A chat function pointer on the hoosh client** (B17; `AGN_HC_CHAT_FP`; the client grows from 16
+  to 24 bytes): `agnosai_hoosh_client_chat_fp` and `agnosai_hoosh_client_with_chat`. The default is
+  the live call, `with_chat` is called only by suites, and a pointer of 0 falls back to the live
+  call. It makes the crew runner's LLM success arm reachable offline, the pattern `tools/agnos.cyr`
+  and `llm/inference_queue.cyr` already use. Nothing is injected in production.
+
+- **orchestrator/scoring — agent-selection explanations (roadmap F7).**
+  - `agnosai_explain_selection_a(a, agents, task)` returns a vec, in `a`, of explained entries,
+    best first and in exactly `agnosai_rank_agents`'s order. Each entry is 56 bytes: the 16-byte
+    scored entry (`agnosai_scored_index` / `agnosai_scored_score` read it unchanged) plus the five
+    component scores. Read them with `agnosai_selection_tool_coverage`, `_complexity`, `_gpu`,
+    `_domain` and `_personality` (f64 bits). An empty roster gives an empty vec. If any one
+    allocation fails, the call answers 0, never a partial explanation.
+  - **Entry 0 is the agent `_agnosai_crew_pick_best_agent` assigns.** Both use the same component
+    calls, the same `_agnosai_score_fold` and the same total-order comparator, and a test pins it.
+  - `agnosai_selection_to_value_a(a, explained, agents, limit)` renders
+    `{"winner": {"index", "agent_key"} | null, "candidate_count", "candidates": [{"index",
+    "agent_key", "total", "scores": {"tool_coverage", "complexity", "gpu", "domain",
+    "personality"}}]}`. Candidates are in rank order. A `limit` of 0 or less renders all of them,
+    otherwise the best `limit`, and `candidate_count` always counts the roster. The floats are the
+    raw f64s, so the weighted components, summed in that order, give back `total` exactly.
+  - `agnosai_selection_scorer_to_value_a(a)` renders `{"weights": {the same five keys},
+    "unmeasured": ["personality"]}`.
+  - **Personality is reported as its neutral 0.5 and listed as unmeasured**, not as `null`, which
+    would make the scores not add up to the total.
+  - All three allocate only in `a`; a test checks the global bump's byte count is unchanged.
+  - **Recomputed, never recorded.** The crew run keeps no breakdown: that would cost every run
+    agents × tasks entries on the never-freed global bump, whether or not anyone asks. A
+    recomputation is exact while selection is a pure function of roster and task, as it is today.
+    F2's manager delegation, learning-driven selection or a stateful bhava personality would end
+    that, and the scoring module's header says the choice must then be recorded on the run.
+
+- **Span context (F6, `telemetry/otlp.cyr`).** `agnosai_otlp_span_context_parse_a` /
+  `_parse` (strict W3C Trace Context Level 1 version `00`: 55 bytes, `-` at 2, 35 and 52,
+  lowercase hex, non-zero trace and parent ids; anything else answers 0, never an error),
+  `agnosai_otlp_span_context_child` (a fresh 8-byte span id under the parent's trace and flags;
+  with no parent, a new root with flags `01`), `agnosai_otlp_span_context_format_a` (exactly 55
+  lowercase bytes; `format(parse(x))` is `x`), `agnosai_otlp_span_context_new` and accessors for
+  the trace halves, span id, flags and `sampled`.
+- **`parentSpanId` on the wire (F6).** `agnosai_otlp_ctx_new_child(trace_hi, trace_lo, span_id,
+  parent_span_id, start, end, status)` and `agnosai_otlp_ctx_parent_span_id`; the encoder emits
+  `"parentSpanId"` right after `"spanId"` for a child and omits the key for a root.
+- **Recording under a parent (F6).** `agnosai_telemetry_span_ctx(parent_sc)` (0 with telemetry
+  off — no syscall) and `agnosai_telemetry_record_span_in(span, self_sc, parent_sc, start, end,
+  status)`. **ParentBased sampling**: a context whose sampled flag is clear is not queued.
+- **`agnosai_telemetry_init_export(endpoint, service_name)`** (F6): OTLP export for an in-process
+  consumer that owns its logging — sakshi's level and emit hook are left alone. A second call
+  starts no second exporter thread; it returns a guard over the running one.
+- **The per-task `invoke_agent` span** (F6), INTERNAL, named by the agent, carrying the task id,
+  the agent's key as `agnosai.agent.key`, and the model the agent was configured with. The
+  placeholder arm is recorded too. ⚠ The key is not `gen_ai.agent.id`: at the pinned commit the
+  registry reserves that for a hosted agent's provider id.
+- **`error.type`** on every span kind that can fail (F6): `timeout`, `cancelled`, `task_failed`,
+  `invalid_dag` (workflow); `task_failed` (agent); `no_response`, sandhi's error-kind name
+  lowercased (`connect`, `tls`, `timeout`, `protocol`, ...), the decimal HTTP status,
+  `invalid_response` (chat); `no_output`, `tool_error` (tool). ⚠ sandhi spells its kinds in
+  capitals; sent as-is a backend would count a chat's `TIMEOUT` and a crew's `timeout` as two
+  classes, so the chat span lowercases them.
+- **`agnosai_crew_with_trace_parent(spec, tp)` / `agnosai_crew_trace_parent`** (F6). Stores a
+  COPY of a 55-byte traceparent (anything else stores 0), because an in-process caller's value
+  lives in its request arena and an async crew outlives it. Not serialised: the crew's JSON and
+  any persisted spec are unchanged.
+- **`traceparent` on three routes** (F6): `POST /api/v1/crews`, `POST /api/v1/a2a/receive` and
+  `/mcp` `tools/call` join the header's trace. A malformed header starts a new trace and never
+  changes a response. New: `agnosai_route_dispatch_tp_a`, `agnosai_route_create_crew_tp_a`,
+  `agnosai_route_a2a_receive_tp_a`, `agnosai_route_mcp_tp_a`; every `_a` form delegates with 0.
+- **`_in` forms at the span sites** (F6): `agnosai_hoosh_chat_in(base_url, api_key, request,
+  out_response, parent_sc)` and `agnosai_tool_execute_in(t, input, parent_sc)`;
+  `agnosai_hoosh_chat` and `agnosai_tool_execute` delegate with 0.
+- **genai helpers** (F6): `agnosai_genai_chat_span`, `agnosai_genai_agent_span`,
+  `agnosai_genai_workflow_span`, `agnosai_genai_span_set_request_model`,
+  `agnosai_genai_span_set_error_type`, `agnosai_genai_span_name_suffix`,
+  `agnosai_genai_span_full_name_a`. Every setter, and `agnosai_genai_record_usage`, takes span 0
+  and does nothing.
+
+### Tests
+
+- **B17:** `tests/orch_crew_runner.tcyr` answers tasks through a stub gateway: token events in every
+  mode and their crew id, per-agent cost summed end to end, a wave's in-flight count, event order in
+  a DAG, and a timeout's `crew_completed`. A stub that moves the deadline into the past while
+  answering task 1 gives a deterministic mid-run timeout. It also closes ADR 020's admitted gap: the
+  output filter on the LLM arm now has a test that fails when it is unwired.
+- `tests/orch_orchestrator.tcyr` reads the registry from inside a running crew (`running`), and
+  checks `pending → running` moves only from `pending` and that a cyclic DAG is left `pending`.
+- `tests/core_crew.tcyr`: the recorder sums per agent and keeps its own key.
+- `tests/orch_crew_runner.tcyr` checks that an unwatched bus costs nothing, exactly: a parallel or
+  DAG LLM crew, and a sequential placeholder crew, allocate the same bytes with a bus nobody
+  subscribes to as with no bus at all. Before this check, removing the wave's worker-sender gate or
+  its dispatch-time `task_started` gate failed no test; both mutants survived the first review
+  round. The existing `per_quiet < per_listened` comparison could not see a single unguarded site,
+  as its own comment said.
+- 22 mutants across the six parts and the seam, each killed. Seven more, one per event gate (the
+  wave's worker sender, `task_started` and `task_completed`; sequential `task_started` and
+  `task_completed`; `crew_started`; `crew_completed`), are each killed by the exact check.
+- `tests/orch_crew_runner.tcyr` checks that a task's `task_completed` goes out as its own worker
+  is joined, not at the end of its batch. A stub holds the second task of a two-wide batch until it
+  sees the first task's `task_completed`, for at most 5 s. A runner that joined the whole batch
+  before reporting any of it would still be blocked on that worker, so the wait runs out. The
+  in-flight and order checks pass under both shapes, and that mutant survived until review.
+- `tests/telemetry_wiring.tcyr` checks that a timed-out crew's GenAI span is ERROR: a run whose
+  deadline has already passed closes one span, with status code 2. A mutant that kept it OK
+  survived until review.
+
+- `tests/orch_scoring.tcyr` (109 → 235 assertions, F7):
+  - **Bite 1.** Every existing value assertion passes unchanged. A domain with an embedded NUL
+    now scores 0, and the test first checks the parsed domain really holds the NUL. The allocator
+    form extracts the same borrowed entries with nothing on the global bump, and answers -1 (not 0)
+    for an arena too small for the vec or for a seventeenth tool's grow. Two checks reach the
+    domain compare and find nothing on the global bump: explaining and rendering a roster whose
+    agent states a domain, and `score_agent_with_tools` on a domain equal to the task's, so the
+    compare walks every byte.
+  - **Bite 2.** The explanation matches `rank_agents` entry for entry: same index, and a total
+    bit-equal to `rank_agents`' and to `score_agent`'s. The weighted components reproduce each
+    total exactly. Personality is exactly 0.5, and 1 - 1/3 is exact. Forty tied agents keep input
+    order, past the introsort threshold. The JSON is checked field by field and bit by bit, as are
+    `limit` (2, 1, the roster size, one past it, 0 and -1), an empty roster's
+    `{"winner":null,"candidate_count":0,"candidates":[]}`, and the scorer's exact serialisation.
+  - **Exhaustion.** For seven call shapes, two sweeps cover every allocation: a FAIL arena of
+    every size below what the call needs, and an allocator that fails only the n-th allocation,
+    for every n. Every case must answer 0. The second sweep exists because a FAIL arena always
+    repeats a failure on the very next allocation, which hid three unchecked answers.
+- `tests/orch_crew_runner.tcyr` (276 → 283): **an explanation's entry 0 is pointer-equal to
+  `_agnosai_crew_pick_best_agent`'s pick**. That holds for the solo, mixed and tied rosters, a
+  20-agent varied roster whose winner is not the first agent, and the empty roster (no
+  candidates, no pick). agnostic's recomputation relies on this.
+- `tests/orch_scoring.tcyr` and `tests/orch_hierarchical.tcyr` include `src/strcase.cyr`, which
+  the domain compare now needs.
+- **F7 mutants: 32 killed, 3 equivalent.** Bite 1: 10, each killed (the NUL compare, both -1
+  answers, the arena form leaking to the global bump, each of the four hoisted keys, and a
+  NUL-safe copy of the task's domain put back with `str_clone`). The copy mutant survived the
+  suite until review. The zero-allocation check explained a roster with no domains, so
+  `domain_score` returned before its compare, and the NUL test checks only the answer. Bite 2:
+  22 killed. They include a skipped sort, swapped fold arguments, swapped component stores, every
+  `limit` boundary, the winner taken from the wrong entry, and each unchecked allocation answer.
+  Five survived their first run, and a new fixture killed each: a GPU-against-domain store swap
+  (no fixture told those two apart), the required-tools -1 check, the candidates array's grow,
+  and two set checks only the single-failure sweep reaches. Three are equivalent and kept as
+  defensive checks: the candidates and `unmeasured` arrays' 0 checks, where the next check
+  repeats the failure, and the one-element `unmeasured` push, which cannot grow.
+
+- **F6 suites.**
+  - `tests/telemetry_otlp.tcyr`: `traceparent` parsing against the W3C example and an
+    agnostic-shaped value with top-bit-set halves, and rejection of 54 and 56 bytes, uppercase
+    hex (one digit is enough), versions `ff` and `01`, all-zero trace and parent ids, a missing,
+    moved or wrong dash, a non-hex byte or flags byte, 0, the empty Str and an exhausted arena;
+    `format(parse(x)) == x`; children keep the trace and flags with a fresh span id; two roots are
+    two traces; `parentSpanId` emitted only for a child, as exactly 34 bytes after `spanId`; the
+    four composed names agree with `agnosai_genai_span_full_name_a`; the pinned attribute order;
+    empty attributes absent; `invoke_agent` INTERNAL, the regression guard. The zero-global-byte
+    probe now encodes a child span with a composed name.
+  - `tests/telemetry_genai.tcyr`: every key's exact spelling; the families re-partitioned (13
+    `gen_ai.`, 3 `agnosai.` plus the inline task count, and `error.type` with neither); the four
+    constructors; the workflow span **carries** `gen_ai.operation.name` (the old assertion that it
+    did not is reversed, citing ADR 023); each operation names itself by its own subject; the bare
+    operation for a 0 or empty subject, and `agnosai_genai_span_name_suffix` on its own; every
+    setter on span 0.
+  - `tests/telemetry_mod.tcyr`: `init_export` leaves sakshi's level and hook unchanged and a second
+    call reuses the exporter; `init_tracing` with OTLP takes the JSON hook off (that mutant
+    survived until this check); `record_span_in` under a parsed parent, minted mid-flight, as a
+    root whose span id is not its trace id's high half, and not at all for an unsampled parent or
+    span 0; `span_ctx` is 0 with telemetry off.
+  - `tests/telemetry_wiring.tcyr` (30 → 102): a two-task crew queues **exactly** three spans (was
+    `>= 1`), every task the workflow's child in its trace; with a traceparent all three are in the
+    caller's trace; flags `00` export nothing; a malformed traceparent starts a new root; parallel
+    and DAG workers get their parent through the job; a cyclic DAG is one ERROR span with
+    `invalid_dag`; the stub chat call receives the TASK's span context; a failed inference is
+    `task_failed` twice; `agnosai_hoosh_chat_in` against a refused port records a CLIENT
+    `chat gpt-4o` span under the caller's context with an `error.type`, and so does the client's
+    live chat pointer, while `agnosai_hoosh_chat` records a root; a tool that answers 0 is
+    `no_output`; timeout and cancel carry their `error.type`; with telemetry off a tool call and a
+    task allocate exactly what their bare work allocates. **Fix round 1:** a crew with an ASSIGNED
+    agent (`tester` / `Tester`) — every earlier crew here was unassigned, so swapping the agent's
+    name and key on the runner's `invoke_agent` span survived every suite (mutant M8) — now asserts
+    `invoke_agent Tester`, `gen_ai.agent.name` = `Tester`, `agnosai.agent.key` = `tester` and no
+    `gen_ai.agent.id`; the refused chat span's `error.type` VALUE is pinned as `connect`, not just
+    its key; and each transport kind lowercases (`timeout`, `tls`).
+  - `tests/core_crew.tcyr`: the traceparent is a COPY (overwriting the caller's bytes leaves it),
+    54 and 56 bytes and 0 store 0, and neither `to_json` nor a round trip carries it.
+  - `tests/server_serve.tcyr`: `traceparent` and `Traceparent` through the real handler on
+    `POST /api/v1/crews`, `/mcp` and `/api/v1/a2a/receive`; a malformed header is the same 200
+    and a new root; `agnosai_route_dispatch_tp_a` and `agnosai_route_create_crew_tp_a` called
+    directly. `tests/server_routes_mcp.tcyr` and `tests/server_routes_a2a.tcyr`: the
+    `_tp_a` forms answer what the `_a` forms answer, and their spans join the trace. **Fix round
+    1:** the traced crew POST also asserts its task's `invoke_agent Tester` span with
+    `gen_ai.agent.name` and `agnosai.agent.key` — the span every real crew emits, end to end from
+    the wire (M8 now fails three assertions here) — and an unsampled `-00` header is the same 200
+    with no span exported, pinning the trust-boundary behaviour the threat model records.
+  - `tests/llm_hoosh.tcyr`: both `callptr`s through the client's chat pointer pass the fourth
+    argument (0). With three, the callee read a stale register as its span context and the live
+    call forwarded it to `agnosai_hoosh_chat_in`, harmless only because the suite never turns the
+    exporter on.
+  - `tests/orch_crew_runner.tcyr`: a traced placeholder answers what `agnosai_execute_task` does.
+- **F6 mutants: 60, all killed.** Bite 1 (span context and encoder) 10, bite 2 (vocabulary,
+  names, kind, attribute order) 11, bite 3 (recording and init) 8, bite 4 (the four sites and the
+  threading) 20, bite 5 (spec field and HTTP) 11. Three survived their first run and a new
+  assertion killed each: `init_tracing` no longer clearing the JSON hook, the chat span minting
+  a root instead of a child, and the live chat pointer dropping its fourth argument. One more
+  first compiled away (a removed `if` left a dangling `elif`) and was replaced by a semantic
+  mutant, which is killed.
+
+### Docs
+
+- **B17: ADR 022** (new), and the ADR index gains its missing rows for 020 and 021 as well as 022.
+  ADR 020 gains a dated note: the LLM arm of its filter wiring is now mutation-covered.
+- **Roadmap:** B17 moves to *Recently closed*. F3 keeps the approval wiring, `awaiting_approval`,
+  the lifecycle state machine and the per-crew `seq`, and builds on ADR 022's semantics.
+- **`docs/guides/api-reference.md`:** `GET /api/v1/crews/{id}` said "returns 404 for all
+  requests"; it now describes the statuses (`pending → running → completed | failed |
+  cancelled`), and a new *Crew events* section documents the stream's events and their order. It
+  also says `task_completed` is in dispatch order within a batch, and that a client subscribing
+  mid-run can miss that run's or wave's task events. The runner checks for a subscriber once per
+  run or wave, as it did at 2.1.4.
+- **`state.md`:** the test-seam table has four rows (the hoosh chat pointer), and the standing
+  decisions table names ADR 022.
+
+- **F7:** `docs/architecture/overview.md` said "4-factor" and that personality came "via bhava".
+  It now says five factors and that personality is a neutral 0.5 reported as `unmeasured`, and
+  adds a section on explaining a selection. `docs/guides/crew-patterns.md` showed the oracle
+  rustdoc's stale four-factor 0.40 / 0.30 / 0.15 / 0.15 weights. It now shows the five real
+  ones, 0.35 / 0.25 / 0.15 / 0.15 / 0.10, plus an explain snippet.
+  `docs/development/comparison-crewai.md` said "4-factor" in two tables and in its section 3
+  heading, whose table also carried the stale four weights; all three now say five, and the
+  section names the explain call. The Rust build it describes had the same five `WEIGHT_*`
+  constants. The roadmap marks F7 done and
+  corrects its "personality (`null`)". `scoring.cyr`'s header gains *Explaining a selection*,
+  and `state.md` an F7 section and a standing-decisions row.
+
+- **F6:** ADR 023 (new); ADR 017 gains an *Amended by 023* note under its status (its table and
+  re-check are left as the record); ADR 022 notes the two signatures 023 widened; the ADR index
+  gains 023 and marks 017 amended. `docs/guides/api-reference.md` gains *Trace context*: the four
+  spans, which routes honour `traceparent`, that a malformed one is never a 4xx, ParentBased
+  sampling, export only with `OTEL_EXPORTER_OTLP_ENDPOINT`, and the crew-name cardinality
+  caveat. The roadmap marks F6 done (agnostic's half deferred to its re-pin), lists what B7 still
+  owes, records the hoosh filing to make (its own span id and `parentSpanId`, then agnosai's
+  outbound header), notes on F1 that its tool loop must pass the task's span context, and updates
+  the OpenTelemetry-library note. Module headers: `telemetry/genai.cyr` (the pin and the four
+  operations), `telemetry/otlp.cyr` (span context; identity is threaded, not thread-local),
+  `telemetry/mod.cyr`, `tools/native.cyr`, `orchestrator/crew_runner.cyr`; the
+  `benches/orch.bcyr` and `benches/tools.bcyr` notes that said every run built a span.
+- **F6, fix round 1:** `docs/development/threat-model.md` gains surface 7, *Inbound trace
+  context*: any caller that reaches the three traced routes (anyone, with auth off, the default)
+  chooses the trace its spans join and can switch their export off with sampled flag `0`; both
+  are recorded as not mitigated and as an accepted risk, and the trust-boundary diagram gains the
+  header. ADR 023 records the same choice (*The inbound context is trusted as-is*), the chat
+  span's lowercased transport `error.type` set, the opt-in `delegate` tool's unlinked trace and
+  the operator switch as out of scope, and that a three-argument `callptr` through the chat
+  pointer hands the callee a stale register. `api-reference.md`'s sampling bullet now says the
+  header is trusted as-is. The roadmap's B7 gains item 9 (the `delegate` tool's trace) and item
+  10 (the operator switch), and two new rows: **B20**, a second live thread moving a crew's cost
+  both ways, and **B21**, two drainers sharing the OTLP ring's doc arena at shutdown.
+
+- **The cut:** ADR 022 and ADR 023 move from Proposed to Accepted, and the ADR index with them;
+  ADR 017's amendment note says 2.1.5. The roadmap's B17, F6 and F7 rows, and F3's note, name
+  2.1.5 instead of a planned release. README's consumer snippet pins `tag = "2.1.5"`, its
+  `dist/agnosai.cyr` line count reads 38,905 (2.1.4: 37,619), and its sample test and coverage
+  output are current. `state.md` gets its *Now* table, the 2.1.5 section headings, its *Version*
+  section and its last-refreshed line. Roadmap **B22** records four comments, three of them in
+  `src/`, that still point at `CHANGELOG [Unreleased]` for work that shipped in 2.0.0. A new
+  roadmap section, *Moving the cyrius pin to 6.6.15*, records that 6.6.15 is tagged and folds
+  sigil 3.13.9; the pin move is not started. That section names what agnosai reaches at 6.6.14:
+  - Native TLS offers x25519 only. 3.13.8's P-256 / P-384 ECDH is new API, which native TLS
+    first uses in 6.6.15.
+  - ECDSA signing (CVE-68) runs only for a TLS server or for a client with a client
+    certificate, and agnosai is neither.
+  - The fix for HMAC and HKDF state left in dead stack (CVE-68 part B) does apply: every
+    outbound handshake's key schedule runs on them.
+
+  It also records that kavach 3.13.2 and libro 2.10.6 pin sigil 3.13.7 and cyrius 6.6.14, so
+  they, and then bote, need releases before the move.
+- **Release-prep corrections**, from a read-only check of the cut:
+  - `state.md`'s *Toolchain* names the 6.6.14 pin, not 6.6.6.
+  - Its *Source* table is regenerated from the tree: 112 files, 39,426 lines, `telemetry/`
+    2,270.
+  - Its *Dependencies* list names 2.1.5's 45 stdlib modules and pins.
+  - Its *Tests* and *Benchmarks* sections lead with 2.1.5's 99 suites and 223 rows, and date
+    the older figures.
+  - Roadmap B16 records that sigil's repo has moved past the fold.
+  - The roadmap's F intro no longer points at a **→ next release** marker that no row carries.
+  - The ADR index counts the six rows that are not a plain "Accepted".
+  - ADR 017 dates 023's acceptance, 2026-10-04.
+  - `api-reference.md`'s `GET /ready` example answers `2.1.5`, not 1.1.0.
+  - README and the roadmap stop scheduling the `rust-old/` deletion for "the release after
+    2.1.0" as if it were still ahead.
+  - *Performance* below names the item gate behind each single full-`cyrius bench` figure, and
+    adds the release gate's own figures beside F6's.
+
+### Performance
+
+- **No measured change on the `run_crew_*` rows** (B17). `benches/orch.bcyr` built from 2.1.4 and
+  from this tree, run interleaved for three rounds, medians: `run_crew_1_task_sequential`
+  99.1 → 99.0 µs, `run_crew_10_tasks_sequential` 399.7 → 405.5 µs (per-round means 399–413 µs
+  before and 397–413 µs after), `run_crew_10_tasks_parallel_4` 615.4 → 618.9 µs. Those rows go
+  through an orchestrator with no event bus, so they build no event on any path and cannot see the
+  wave change. What they price is the extra registry lock for `pending → running`, which is below
+  their resolution.
+- **No measured change on the path the wave change touched** (B17). New rows in `benches/orch.bcyr`
+  run a 10-task parallel crew at concurrency 4 through the runner with a sender attached.
+  `crew_runner_10_tasks_parallel_4_watched` has a drained subscriber, and `_quiet` has a bus with
+  none. The two placeholder rows were built against 2.1.4 and against this tree and run in eight
+  interleaved rounds, at a load average of 7–11 from other sessions. Medians, 2.1.4 → now:
+  `_watched` 710.6 → 699.1 µs and `_quiet` 648.0 → 641.3 µs. The events' own cost per run (watched
+  minus quiet, 22 events) was 59.2 → 63.1 µs. Round-to-round spread was wider than any of these
+  differences. The `_llm_watched` / `_llm_quiet` rows answer through the stub gateway and include
+  each worker's `token` event. They have no 2.1.4 counterpart, because the stub needs the new seam.
+  In the gate run, `_llm_watched` took 1.727 ms and `_llm_quiet` 1.661 ms. The 66 µs difference
+  covers 32 events, 10 of them `token`s. The placeholder pair in the same run differed by 60 µs for
+  22 events.
+- **The component scorers no longer allocate** (F7 bite 1). The four context keys are hoisted to
+  module globals, the "medium" default is `core/task.cyr`'s `AGN_JV_MEDIUM`, and the domain
+  compare no longer copies. So `agnosai_score_agent_with_tools` allocates nothing, and a test
+  checks that with a domain compare that actually runs. The bare entry points still allocate on
+  the global bump, but no longer once per component on top of that:
+  - `agnosai_score_agent` extracts `required_tools` into a vec on every call: 152 B when the task
+    has the key, 0 when it does not.
+  - `agnosai_rank_agents` allocates its vec plus a 16-byte entry per agent, 216 B for four
+    agents, and the one extraction on top.
+
+  Measured with a harness of `benches/orch.bcyr`'s scoring rows and `run_crew_10_tasks_sequential`,
+  built from the tree before F7 and after it. Five interleaved rounds, medians (ranges are
+  per-round means):
+
+  | row | before | after | |
+  |---|---|---|---|
+  | `score_agent_rich_context` | 1,185 ns | 922 ns | −22% |
+  | `score_agent_no_context` | 530 ns | 313 ns | −41% |
+  | `score_agent_gpu_required` | 560 ns | 353 ns | −37% |
+  | `score_agent_domain_mismatch` | 832 ns | 578 ns | −31% |
+  | `rank_agents_varied_100` | 95.3 µs | 75.3 µs | −21% |
+  | `rank_agents_varied_300` | 302.2 µs | 238.5 µs | −21% |
+  | `rank_agents_varied_1000` | 1,049 µs | 850 µs | −19% |
+  | `rank_agents_16` | 11.6 µs | 8.2 µs | −30% |
+  | `delegate_16_tasks_16_agents` | 187.8 µs | 127.3 µs | −32% |
+  | `run_crew_10_tasks_sequential` | 335.7 µs | 330.1 µs | −1.6% |
+
+  The scoring rows' before and after ranges do not overlap. `run_crew_10_tasks_sequential`'s do
+  (334.4–347.4 against 325.7–338.6 µs). In a separate bite-1-only run it measured
+  343.9 → 328.0 µs without overlap, so call it at most a few percent. Ranking is a small part of
+  a crew run.
+
+  F7's own item gate ran the full `cyrius bench` once (not the release gate under *Verified*),
+  and it agrees with `bench-history.csv`'s 2.1.4 rows: `score_agent_rich_context` 1,208 → 857 ns, `score_agent_no_context` 534 → 292 ns,
+  `score_agent_gpu_required` 580 → 329 ns, `score_agent_domain_mismatch` 870 → 553 ns,
+  `rank_agents_varied_100/300/1000` 97.2 / 303.0 / 1,060 → 71.9 / 222.6 / 790 µs,
+  `rank_agents_16` 11.9 → 7.6 µs and `delegate_16_tasks_16_agents` 191.3 → 122.2 µs.
+- **The fold refactor is free** (F7). `_agnosai_score_fold` adds one call per score. Measured
+  against bite 1 alone, five interleaved rounds, every row moved between −3.6% and 0.0%, inside
+  its spread, so the plan's fallback (leaving `score_agent_with_tools` unrefactored) was not
+  needed.
+- **New rows** (F7), `benches/orch.bcyr`: `explain_selection_100` 74.1 µs (100 varied agents and the
+  rich task, arena reset per call; `rank_agents_varied_100` is 75.3 µs in the same run) and
+  `selection_to_value_100` 56.3 µs (all 100 candidates rendered).
+
+- **The span sites cost nothing with telemetry off** (F6). Measured against a pre-F6 build of the
+  same tree (B17 and F7 included; the three files F6 shares with B17 taken from the
+  `dist/agnosai.cyr` F7 regenerated, which held them exactly), interleaved rounds, medians:
+
+  | row | before | after | rounds | |
+  |---|---|---|---|---|
+  | `tool_execute_echo` | 3.67 µs | 0.79 µs | 5 | −78.5%; ranges 3.66–3.68 against 0.78–0.80 |
+  | `run_crew_1_task_sequential` | 94.2 µs | 92.0 µs | 3 | −2.4%, ranges apart |
+  | `run_crew_10_tasks_sequential` | 375.2 µs | 373.6 µs | 3 | −0.4%, ranges overlap |
+  | `run_crew_10_tasks_parallel_4` | 452.3 µs | 447.8 µs | 3 | −1.0%, ranges overlap |
+  | `crew_runner_10_tasks_parallel_4_llm_watched` | 1.443 ms | 1.384 ms | 3 | −4.1% |
+  | `crew_runner_10_tasks_parallel_4_llm_quiet` | 1.377 ms | 1.333 ms | 3 | −3.2% |
+
+  `tool_execute_echo` was mostly instrumentation: a span record and two `clock_epoch_ns` reads per
+  call, discarded with no exporter. The crew rows save one span per crew and nothing per task, so
+  they barely move. ⚠ **`crew_runner_10_tasks_parallel_4_quiet` read 405.3 → 482.5 µs in the
+  full file and is NOT a regression.** That row's level depends on what ran before it in the
+  process: run alone, in either order with `_watched`, both builds measure the same (quiet
+  549 / 552 µs before, 552 / 548 after; watched 597 / 596 before, 597 / 600 after, two runs
+  each), and its level alone (~550 µs) is not its level in the full file (405–482 µs).
+- **With telemetry on, a span's encode is cheaper** (F6, `benches/telemetry.bcyr`, five
+  interleaved rounds): `otlp_encode_span` 11.76 → 11.00 µs (−6.5%), `otlp_ring_enqueue`
+  15.19 → 13.90 µs (−8.5%), `otlp_ring_drain_16` 56.7 → 47.0 µs (−17%), `otlp_ring_drain_256`
+  924 → 772 µs (−16.5%). ⚠ These rows re-baseline: the fixture is now a `chat` span, which carries
+  two attributes fewer than the old inference span (the agent and task belong to its
+  `invoke_agent` parent), and its name is composed. The escape and URL rows did not move.
+- **New rows**: `otlp_encode_span_child` 11.54 µs (the same span with `parentSpanId`; +0.5 µs on
+  the root), `otlp_span_context_parse` 303 ns, and `otlp_span_context_child` 501 ns, which
+  includes the `getrandom(2)` for the 8-byte span id. A span also stops paying for its export
+  context on the global bump: it is built on the recorder's stack.
+- **What turning telemetry ON costs a crew** (F6 fix round 1). F6 took a crew from one span to
+  1 + N, so two rows now price it: `run_crew_10_tasks_sequential_traced` and
+  `run_crew_10_tasks_parallel_4_traced` (`benches/orch.bcyr`; the production exporter from
+  `agnosai_telemetry_init_export`, the ring drained after every run). A/B against 2.1.4
+  (`git archive HEAD`, the same rows added), one process per row, seven interleaved rounds,
+  medians [ranges]. ⚠ The baseline is the same crew with telemetry off **plus one idle thread**:
+  the exporter's thread alone moves these rows, sequential +20% and parallel −27% (roadmap B20),
+  so against a single-threaded baseline the parallel row would read as telemetry making it faster.
+
+  | 10-task crew | 2.1.4 | now |
+  |---|---|---|
+  | sequential, off + idle thread | 414.4 µs [402.6–416.4] | 400.0 µs [385.8–401.5] |
+  | sequential, `_traced` | 427.4 µs [414.9–480.5] | 628.1 µs [612.6–633.6] |
+  | **cost of telemetry on** | **+13 µs, +3.1%** (1 span) | **+228 µs, +57%** (11 spans) |
+  | parallel_4, off + idle thread | 471.8 µs [468.9–474.4] | 455.6 µs [454.2–462.5] |
+  | parallel_4, `_traced` | 486.1 µs [484.8–490.3] | 592.6 µs [588.0–599.4] |
+  | **cost of telemetry on** | **+14 µs, +3.0%** (1 span) | **+137 µs, +30%** (11 spans) |
+
+  About 21 µs a span on the sequential crew: the `getrandom(2)` for its id, two clock reads, the
+  encode under the ring mutex and its share of the drain. The parallel crew's four workers
+  overlap everything but the lock-held encode. Telemetry off is unchanged (rows above). F6
+  fix round 1's item gate ran the full `cyrius bench` once, where an earlier row has already left
+  a second thread alive: sequential 380.1 → `_traced` 612.8 µs (+233 µs), parallel_4 456.0 → `_traced`
+  668.6 µs (+213 µs; that row's range was 592–696 µs, so the controlled A/B above is the figure
+  to quote).
+- F6's own full `cyrius bench`, one run before fix round 1, agrees with the A/B:
+  `tool_execute_echo` 808 ns (`bench-history.csv`'s 2.1.4 row: 3,834 ns), `otlp_encode_span`
+  11.06 µs, `run_crew_*` 96.6 / 399.2 / 456.8 µs, the three new rows 11.61 µs / 307 ns / 507 ns.
+  The release gate's run (*Verified*) read `tool_execute_echo` 794 ns, `run_crew_*`
+  91.8 / 374.2 / 448.3 µs and the `_traced` pair 603.3 / 660.6 µs.
+- **`bench-history.csv` gains 223 rows at 2.1.5**: 2.1.4's 212 benchmarks and the 11 new rows
+  above. `./scripts/bench-history.sh` was held through B17, F7 and F6, because it stamps
+  `VERSION`, and ran once at the cut: unpinned, at a 1-minute load of 0.1 rising to 1.7 (the
+  sweep's own load), 11 files, 0 failed. Read these rows against 2.1.3's, not 2.1.4's. 2.1.4's
+  sweep was pinned to one CPU at a load of 3–5, so against it the 212 shared rows read a median
+  of −5.7%, and rows the interleaved runs above found unchanged move by up to 62%:
+  `otlp_post_url_passthrough` 332 → 127 ns, `run_crew_10_tasks_parallel_4` 775.8 → 457.3 µs.
+  Against 2.1.3's unpinned sweep the median is +0.0%, with 175 of 212 within ±5%. The rows this
+  release claims are the interleaved A/B tables above, and the sweep agrees with them:
+  `tool_execute_echo` 788 ns, `score_agent_rich_context` 859 ns, `rank_agents_16` 7.6 µs,
+  `delegate_16_tasks_16_agents` 122.3 µs, `otlp_encode_span` 11.06 µs. `tool_registry_has_50_miss`
+  reads 185 ns (2.1.3: 142, 2.1.4: 95). 2.1.4 already recorded that row moving within
+  overlapping ranges, and this is one sweep, so nothing is claimed for it either way.
+
+### Verified
+
+- **Suite:** 99 suites and 8,573 assertions pass, 0 failed, with wasmtime 49.0.1 (CI pins
+  47.0.3), so the WASM paths ran. The suite builds print 23 `undefined function
+  '_agnosai_loader_read'` warnings (roadmap B19), as at the integration gate.
+- **Gates**, in CI order, all green: `cyrius lib sync --full` (112 files) → `cyrius deps` (118
+  locked, 8 commit pins; `cyrius.lock` byte-identical to 2.1.4's) → the lock's pin check →
+  `check-symbols.sh` (2,733 definitions in 112 files; the lib checks on both targets) →
+  `check-clean.sh` (fmt 223, lint 124, doc 113 and doctest 1 files; `deps --verify` 118; lib
+  snapshot 112) → build → `cyrius test` → `cyrius coverage --min 80` (99%: 102/102 files,
+  1,616/1,628 functions) → `cyrius distlib --all --check` (both bundles current: 38,905 and 915
+  lines, 45 and 6 leaves) → examples (1) → `cyrius fuzz` (4/4) → `cyrius bench` (11 files, 223
+  benchmarks).
+- **Version:** `VERSION`, `cyrius.cyml`'s interpolation, `AGNOSAI_VERSION`,
+  `tests/server_routes_version_pin.tcyr` and this heading agree on 2.1.5, and release.yml's tag
+  check and changelog extraction pass for a `2.1.5` tag. `GET /ready` answers
+  `"version":"2.1.5"` from `build/agnosai` and from the aarch64 cross-build (6,423,568 B) on a
+  Raspberry Pi 4, and both exit 0 on SIGTERM.
+
 ## [2.1.4] — 2026-10-03
 
 kavach **3.13.2** and ai-hwaccel **2.4.1**, both moved to cyrius 6.6.14. With them,

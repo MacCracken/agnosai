@@ -7,12 +7,19 @@
 # constant moves, these tests move with it, which is what the oracle's helper
 # is for.
 #
+# Port-added, roadmap F7: `agnosai_explain_selection_a` and its two renderers,
+# which the oracle has no counterpart for. Their totals are compared with
+# `assert_eq` on raw f64 bits, not `_t_assert_f64`'s tolerance, because the claim
+# is bit-equality with the score the runner ranks by.
+#
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
 
 include "src/units.cyr"
 include "src/order.cyr"
 include "src/id.cyr"
+# strcase — `domain_score` compares the two domains with `agnosai_str_eq_ci`.
+include "src/strcase.cyr"
 include "src/core/error.cyr"
 include "src/core/json.cyr"
 include "src/core/message.cyr"
@@ -65,6 +72,70 @@ fn _t_expected(tool, complexity, gpu, domain): i64 {
 # An f64 from a simple ratio.
 fn _t_ratio(n, d): i64 {
     return f64_div(f64_from(n), f64_from(d));
+}
+
+# An allocator that fails exactly one allocation, the `_t_nth_at`-th, and serves
+# every other from the global bump. 0 never fails, which counts the allocations.
+var _t_nth_count = 0;
+var _t_nth_at = 0;
+
+fn _t_nth_alloc(state, size): i64 {
+    _t_nth_count = _t_nth_count + 1;
+    if (_t_nth_count == _t_nth_at) { return 0; }
+    return alloc(size);
+}
+
+fn _t_nth_none(state, ptr): i64 {
+    return 0;
+}
+
+fn _t_nth_realloc(state, old_ptr, old_size, new_size): i64 {
+    return 0;
+}
+
+fn _t_nth_reset(state): i64 {
+    return 0;
+}
+
+fn _t_fail_nth(n): i64 {
+    _t_nth_count = 0;
+    _t_nth_at = n;
+    return allocator_new(&_t_nth_alloc, &_t_nth_realloc, &_t_nth_none, &_t_nth_reset, 0);
+}
+
+# One call of the explain family in `a`: 0 explains, 1 renders `ex`, 2 renders
+# the scorer.
+fn _t_sel_call(kind, a, roster, task, ex, limit): i64 {
+    if (kind == 0) { return agnosai_explain_selection_a(a, roster, task); }
+    if (kind == 1) { return agnosai_selection_to_value_a(a, ex, roster, limit); }
+    return agnosai_selection_scorer_to_value_a(a);
+}
+
+# How many exhausted-allocator cases of one call answered anything but 0 — the
+# two sweeps described where this is called. Asserts that each sweep had cases
+# to try and that the call succeeds with room, so a 0 here is never vacuous.
+fn _t_sel_failures(kind, roster, task, ex, limit, name): i64 {
+    var probe = arena_allocator(65536);
+    assert(_t_sel_call(kind, probe, roster, task, ex, limit) != 0, name);
+    var need = arena_used(load64(probe + 32));
+    assert(need > 8, name);
+    var partial = 0;
+    for (var sz = 8; sz < need; sz = sz + 8) {
+        if (_t_sel_call(kind, arena_allocator(sz), roster, task, ex, limit) != 0) {
+            partial = partial + 1;
+        }
+    }
+    assert(_t_sel_call(kind, arena_allocator(need), roster, task, ex, limit) != 0, name);
+
+    _t_sel_call(kind, _t_fail_nth(0), roster, task, ex, limit);
+    var total = _t_nth_count;
+    assert(total > 1, name);
+    for (var n = 1; n <= total; n = n + 1) {
+        if (_t_sel_call(kind, _t_fail_nth(n), roster, task, ex, limit) != 0) {
+            partial = partial + 1;
+        }
+    }
+    return partial;
 }
 
 fn main() {
@@ -186,6 +257,17 @@ fn main() {
     _t_assert_f64(agnosai_domain_score(_t_agent(0, "medium", "devops"), _t_task("{}")),
       f64_from(1), "and a task with no domain scores every agent 1.0");
 
+    # The whole domain is compared, not its prefix up to a NUL. The scorer used
+    # to copy the task's domain into a C string and compare by `strlen`, so this
+    # domain matched "quality". The length check proves bayan decoded the escape
+    # into a real NUL byte, without which the assertion below would prove nothing.
+    var nul_task = _t_task("{\"domain\":\"quality\\u0000x\"}");
+    assert_eq(str_len(bayan_json_v_str(map_get(agnosai_task_context(nul_task),
+            str_from("domain")))), 9, "the task's domain holds the NUL and the byte after it");
+    _t_assert_f64(agnosai_domain_score(_t_agent(0, "medium", "quality"), nul_task), f64_from(0),
+      "a domain with an embedded NUL does not match its own prefix — the oracle compares the \
+    whole string");
+
     # --- test_no_context_full_score ---
     # An empty context means no required tools, medium complexity, no GPU and no
     # domain — every factor at 1.0 for a medium agent.
@@ -220,6 +302,39 @@ fn main() {
     assert_eq(vec_len(empty_extracted), 0, "with no entries");
     _t_assert_f64(agnosai_tool_coverage_score(_t_agent(0, "medium", 0), empty_extracted),
       f64_from(1), "and scores full coverage");
+
+    # --- the allocator form behind agnosai_explain_selection_a ---
+    # The same borrowed entries, with nothing on the global bump.
+    var xa = arena_allocator(4096);
+    var used_before = alloc_used();
+    var in_arena = _agnosai_extract_required_tools_a(xa, perfect_task);
+    assert_eq(alloc_used() - used_before, 0,
+      "extracting into an arena allocates nothing on the global bump");
+    assert_eq(vec_len(in_arena), 2, "the arena form extracts both entries");
+    assert_eq(vec_get(in_arena, 0), vec_get(extracted, 0),
+      "the same borrowed Str as the bare form, not a copy");
+    assert_eq(vec_get(in_arena, 1), vec_get(extracted, 1), "for every entry");
+    assert_eq(_agnosai_extract_required_tools_a(xa, bare_task), 0, "absent is still 0");
+    assert_eq(_agnosai_extract_required_tools_a(xa, _t_task("{\"required_tools\":[\"lint\",7]}")),
+      0, "and so is malformed");
+
+    # Exhaustion is -1, never 0: 0 would read as "no requirement" and score
+    # every agent full coverage. 16 bytes cannot hold the 24-byte vec header.
+    assert_eq(_agnosai_extract_required_tools_a(arena_allocator(16), perfect_task), 0 - 1,
+      "an arena too small for the vec answers -1");
+    # 152 bytes hold the header and its 16 slots exactly, so the 17th tool's grow fails.
+    var many_arr = bayan_json_v_arr_new();
+    for (var mt = 0; mt < 17; mt = mt + 1) {
+        bayan_json_v_arr_push(many_arr, bayan_json_v_str_new(str_from("tool")));
+    }
+    var many_task = agnosai_task_new(str_from("many tools"));
+    agnosai_task_with_context(many_task, str_from("required_tools"), many_arr);
+    assert_eq(vec_len(agnosai_extract_required_tools(many_task)), 17,
+      "the bare form extracts all seventeen");
+    assert_eq(_agnosai_extract_required_tools_a(arena_allocator(152), many_task), 0 - 1,
+      "and an arena that runs out on a grow answers -1 too, not a truncated list");
+    assert_eq(vec_len(_agnosai_extract_required_tools_a(arena_allocator(4096), many_task)), 17,
+      "while one with room extracts them all");
 
     # extra tools on the agent are not a penalty
     _t_assert_f64(agnosai_tool_coverage_score(_t_agent(_t_tools("lint", "extra"), "medium", 0),
@@ -301,6 +416,224 @@ fn main() {
         agnosai_extract_required_tools(perfect_task)),
       agnosai_score_agent(perfect_agent, perfect_task),
       "pre-extracting the tools does not change the score — only the work done");
+
+    # =====================================================================
+    # agnosai_explain_selection_a — roadmap F7
+    # =====================================================================
+    assert_eq(AGN_SEL_TOOL, AGN_SC_SIZE,
+      "an explained entry extends a scored entry, so the scored accessors and comparator read it");
+
+    var xb = arena_allocator(65536);
+    var ex = agnosai_explain_selection_a(xb, mixed, perfect_task);
+    assert_eq(vec_len(ex), 4, "every agent in the roster is explained");
+    for (var k = 0; k < 4; k = k + 1) {
+        var ek = vec_get(ex, k);
+        var rk = vec_get(mixed_ranked, k);
+        assert_eq(agnosai_scored_index(ek), agnosai_scored_index(rk), "in rank_agents' order");
+        assert_eq(agnosai_scored_score(ek), agnosai_scored_score(rk),
+          "with rank_agents' total, bit for bit");
+        assert_eq(agnosai_scored_score(ek),
+          agnosai_score_agent(vec_get(mixed, agnosai_scored_index(ek)), perfect_task),
+          "which is score_agent's, bit for bit");
+        assert_eq(_t_expected(agnosai_selection_tool_coverage(ek), agnosai_selection_complexity(ek),
+            agnosai_selection_gpu(ek), agnosai_selection_domain(ek)), agnosai_scored_score(ek),
+          "and the weighted components, summed in the fold's order, reproduce it exactly");
+        assert_eq(agnosai_selection_personality(ek), _t_ratio(1, 2),
+          "personality is exactly the neutral 0.5");
+    }
+
+    # mixed is [high tool-less, medium tooled, high tool-less, medium tooled]
+    var ex_best = vec_get(ex, 0);
+    assert_eq(agnosai_scored_index(ex_best), 1, "the first tooled medium agent explains first");
+    assert_eq(agnosai_selection_tool_coverage(ex_best), f64_from(1), "covering both tools");
+    assert_eq(agnosai_selection_complexity(ex_best), f64_from(1), "at the task's complexity");
+    assert_eq(agnosai_selection_gpu(ex_best), f64_from(1), "with no GPU asked for");
+    assert_eq(agnosai_selection_domain(ex_best), f64_from(1),
+      "and no domain of its own to mismatch");
+    var ex_low = vec_get(ex, 2);
+    assert_eq(agnosai_scored_index(ex_low), 0, "the first tool-less high agent explains third");
+    assert_eq(agnosai_selection_tool_coverage(ex_low), f64_from(0), "covering neither tool");
+    assert_eq(agnosai_selection_complexity(ex_low),
+      f64_sub(f64_from(1), f64_div(f64_from(1), f64_from(3))),
+      "one level off medium, exactly 1 - 1/3");
+
+    # 40 identical agents: past _vec_introsort's 16-element threshold, the same
+    # guard rank_agents has above. Only the index tie-break holds this order.
+    var wide_ex = agnosai_explain_selection_a(xb, wide_tie, bare_task);
+    var wide_order = 0;
+    for (var wx = 0; wx < 40; wx = wx + 1) {
+        if (agnosai_scored_index(vec_get(wide_ex, wx)) != wx) { wide_order = wide_order + 1; }
+    }
+    assert_eq(vec_len(wide_ex), 40, "forty tied agents are all explained");
+    assert_eq(wide_order, 0, "in input order past the introsort threshold");
+
+    # --- the JSON an explanation renders to ---
+    var alpha = agnosai_agent_new(str_from("alpha"), str_from("tester"), str_from("test things"));
+    agnosai_agent_with_complexity(alpha, str_from("high"));
+    # A stated domain that is not the task's: domain 0 beside gpu 1, the one pair
+    # of components the other fixtures never tell apart.
+    agnosai_agent_with_domain(alpha, str_from("devops"));
+    var beta = agnosai_agent_new(str_from("beta"), str_from("tester"), str_from("test things"));
+    agnosai_agent_with_tools(beta, _t_tools("lint", "test"));
+    var keyed = vec_new();
+    vec_push(keyed, alpha);
+    vec_push(keyed, beta);
+    var keyed_ex = agnosai_explain_selection_a(xb, keyed, perfect_task);
+    var alpha_e = vec_get(keyed_ex, 1);
+    assert_eq(agnosai_selection_gpu(alpha_e), f64_from(1), "alpha needs no GPU it lacks");
+    assert_eq(agnosai_selection_domain(alpha_e), f64_from(0), "but is in the wrong domain");
+    assert_eq(_t_expected(agnosai_selection_tool_coverage(alpha_e),
+        agnosai_selection_complexity(alpha_e), agnosai_selection_gpu(alpha_e),
+        agnosai_selection_domain(alpha_e)), agnosai_scored_score(alpha_e),
+      "and its components still reproduce its total");
+    var kv = agnosai_selection_to_value_a(xb, keyed_ex, keyed, 0);
+    var kw = bayan_json_v_obj_get_by_cstr(kv, "winner");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(kw, "index")), 1,
+      "the winner is the second agent");
+    assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(kw, "agent_key")),
+        str_from("beta")) == 1, "named by its key");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(kv, "candidate_count")), 2,
+      "candidate_count counts the roster");
+    var kc = bayan_json_v_obj_get_by_cstr(kv, "candidates");
+    assert_eq(bayan_json_v_arr_len(kc), 2, "a limit of 0 renders every candidate");
+    for (var kci = 0; kci < 2; kci = kci + 1) {
+        var cand = bayan_json_v_arr_get(kc, kci);
+        var ce = vec_get(keyed_ex, kci);
+        assert_eq(bayan_json_v_is_int(bayan_json_v_obj_get_by_cstr(cand, "index")), 1,
+          "a candidate's index is an integer");
+        assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(cand, "index")),
+          agnosai_scored_index(ce), "in rank order");
+        assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(cand, "agent_key")),
+            agnosai_agent_key(vec_get(keyed, agnosai_scored_index(ce)))) == 1,
+          "with the key of the agent at that index");
+        assert_eq(bayan_json_v_is_float(bayan_json_v_obj_get_by_cstr(cand, "total")), 1,
+          "the total is a float");
+        assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(cand, "total")),
+          agnosai_scored_score(ce), "the entry's own total, unrounded");
+        var cs = bayan_json_v_obj_get_by_cstr(cand, "scores");
+        assert_eq(bayan_json_v_obj_len(cs), 5, "five factors, no more");
+        assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(cs, "tool_coverage")),
+          agnosai_selection_tool_coverage(ce), "tool_coverage is the entry's");
+        assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(cs, "complexity")),
+          agnosai_selection_complexity(ce), "complexity is the entry's");
+        assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(cs, "gpu")),
+          agnosai_selection_gpu(ce), "gpu is the entry's");
+        assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(cs, "domain")),
+          agnosai_selection_domain(ce), "domain is the entry's");
+        assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(cs, "personality")),
+          agnosai_selection_personality(ce), "personality is the entry's");
+    }
+    assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(bayan_json_v_arr_get(kc, 1),
+            "agent_key")), str_from("alpha")) == 1, "and the loser follows the winner");
+
+    # --- limit ---
+    var tied_ex = agnosai_explain_selection_a(xb, tied, bare_task);
+    var lim2 = agnosai_selection_to_value_a(xb, tied_ex, tied, 2);
+    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(lim2, "candidates")), 2,
+      "a limit of 2 renders the best two");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(lim2, "candidate_count")), 6,
+      "while candidate_count still counts all six");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(
+          bayan_json_v_obj_get_by_cstr(lim2, "winner"), "index")), 0,
+      "and a tie goes to the first agent, as the runner's pick does");
+    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(
+          agnosai_selection_to_value_a(xb, tied_ex, tied, 1), "candidates")), 1,
+      "a limit of 1 renders only the winner");
+    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(
+          agnosai_selection_to_value_a(xb, tied_ex, tied, 6), "candidates")), 6,
+      "a limit equal to the roster renders it all");
+    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(
+          agnosai_selection_to_value_a(xb, tied_ex, tied, 7), "candidates")), 6,
+      "and so does one past it");
+    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(
+          agnosai_selection_to_value_a(xb, tied_ex, tied, 0 - 1), "candidates")), 6,
+      "and so does a negative one, like 0");
+
+    # --- an empty roster ---
+    var none_ex = agnosai_explain_selection_a(xb, vec_new(), perfect_task);
+    assert(none_ex != 0, "an empty roster explains as an empty vec, not as a failure");
+    assert_eq(vec_len(none_ex), 0, "with no entries");
+    assert(str_eq(bayan_json_v_build(agnosai_selection_to_value_a(xb, none_ex, vec_new(), 10)),
+        str_from("{\"winner\":null,\"candidate_count\":0,\"candidates\":[]}")) == 1,
+      "and renders a null winner, the runner's 'unassigned'");
+    assert_eq(agnosai_selection_to_value_a(xb, 0, keyed, 0), 0,
+      "a failed explanation renders as 0, not as an empty one");
+
+    # --- the scorer ---
+    var sc = agnosai_selection_scorer_to_value_a(xb);
+    var sw = bayan_json_v_obj_get_by_cstr(sc, "weights");
+    assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(sw, "tool_coverage")),
+      agnosai_weight_tool_coverage(), "the tool_coverage weight is the constant");
+    assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(sw, "complexity")),
+      agnosai_weight_complexity(), "and complexity's");
+    assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(sw, "gpu")),
+      agnosai_weight_gpu(), "and gpu's");
+    assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(sw, "domain")),
+      agnosai_weight_domain(), "and domain's");
+    assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(sw, "personality")),
+      agnosai_weight_personality(), "and personality's");
+    var sc_want = str_cat(
+      str_from("{\"weights\":{\"tool_coverage\":0.35,\"complexity\":0.25,\"gpu\":0.1,"),
+      str_from("\"domain\":0.15,\"personality\":0.15},\"unmeasured\":[\"personality\"]}"));
+    assert(str_eq(bayan_json_v_build(sc), sc_want) == 1,
+      "the scorer renders its weights in the fold's order and lists personality as unmeasured");
+
+    # --- nothing outside the caller's allocator ---
+    # Exact: alloc_used sums the global bump's request sizes. This is what bite 1
+    # of F7 made possible — before it, every component call minted its key.
+    var xc = arena_allocator(65536);
+    var used_ex = alloc_used();
+    var ex_c = agnosai_explain_selection_a(xc, mixed, perfect_task);
+    var val_c = agnosai_selection_to_value_a(xc, ex_c, mixed, 0);
+    var sc_c = agnosai_selection_scorer_to_value_a(xc);
+    assert_eq(alloc_used() - used_ex, 0,
+      "explaining and rendering allocate nothing on the global bump");
+    assert(val_c != 0, "and the rendering in the arena is whole");
+    assert(sc_c != 0, "as is the scorer's");
+    # ⚠ **Every agent in `mixed` has no domain**, so `agnosai_domain_score`
+    # returns before its compare and the check above never reaches the one
+    # data-dependent allocation bite 1 removed: the copy of the task's domain.
+    # `keyed`'s alpha states "devops" against the task's "quality", so the
+    # compare runs. A mutant that copies either side again (`str_cstr`, or a
+    # NUL-safe `str_clone`) passed the check above and fails this one.
+    var used_dom = alloc_used();
+    var ex_dom = agnosai_explain_selection_a(xc, keyed, perfect_task);
+    var val_dom = agnosai_selection_to_value_a(xc, ex_dom, keyed, 0);
+    assert_eq(alloc_used() - used_dom, 0,
+      "a roster whose agent states a domain allocates nothing on the global bump either");
+    assert(val_dom != 0, "and renders whole");
+    # The same for the runner's own scorer, given its tools already extracted.
+    # perfect_agent's "quality" EQUALS the task's, so the compare walks every
+    # byte rather than stopping at a length mismatch.
+    var pre_tools = agnosai_extract_required_tools(perfect_task);
+    var used_sc = alloc_used();
+    agnosai_score_agent_with_tools(perfect_agent, perfect_task, pre_tools);
+    agnosai_score_agent_with_tools(alpha, perfect_task, pre_tools);
+    assert_eq(alloc_used() - used_sc, 0,
+      "score_agent_with_tools allocates nothing on the global bump, domain compare included");
+
+    # --- exhaustion answers 0, never a partial explanation ---
+    # Two sweeps per call shape, each over every allocation the call makes.
+    #   * A FAIL arena of every size below what the call needs. A missed check
+    #     would let a later, smaller allocation succeed and hand back a tree with
+    #     a hole in it.
+    #   * One failed allocation, the n-th, for every n, with every other served.
+    #     That is the only way to reach a check whose failure a FAIL arena always
+    #     repeats on the very next allocation, which hides a missing check.
+    # Each answer must be 0 for every case. Shapes: four agents, which fit the
+    # first vec slots; seventeen required tools, which grow the extracted vec;
+    # forty agents and seventeen candidates, which grow the entry vec and the
+    # candidates array; an empty roster's null winner; the scorer.
+    var sweeps = 0;
+    sweeps = sweeps + _t_sel_failures(0, mixed, perfect_task, 0, 0, "explaining four agents");
+    sweeps = sweeps + _t_sel_failures(0, keyed, many_task, 0, 0,
+      "explaining against seventeen required tools");
+    sweeps = sweeps + _t_sel_failures(0, wide_tie, bare_task, 0, 0, "explaining forty agents");
+    sweeps = sweeps + _t_sel_failures(1, mixed, 0, ex, 0, "rendering four candidates");
+    sweeps = sweeps + _t_sel_failures(1, wide_tie, 0, wide_ex, 17, "rendering seventeen");
+    sweeps = sweeps + _t_sel_failures(1, vec_new(), 0, none_ex, 0, "rendering no candidate");
+    sweeps = sweeps + _t_sel_failures(2, 0, 0, 0, 0, "rendering the scorer");
+    assert_eq(sweeps, 0, "no exhausted allocation, anywhere, yields a partial explanation");
 
     return assert_summary();
 }

@@ -2,28 +2,188 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-10-03.
+> Last refreshed: 2026-10-04 (the 2.1.5 release gate).
 
-## Now — 2.1.4
+## Now — 2.1.5
 
 | | |
 |---|---|
-| **version** | **2.1.4** |
+| **version** | **2.1.5** (cut 2026-10-04): B17, F7 and F6, with ADRs 022 and 023 Accepted |
 | **cyrius pin** | **6.6.14** |
-| **tests** | **99 suites, 8,065 assertions, 0 failed** in a plain shell against kavach 3.13.2 and ai-hwaccel 2.4.1, with wasmtime 49.0.1 (CI pins 47.0.3); certified again in a sibling-free replica with an empty dep cache. ⚠ `sandbox_spawn` and `sandbox_process` assert once per environment variable, so the total moves with the environment (2.1.3's replica gave 8,077) |
-| **coverage** | **99%** — 102/102 files, 1,576/1,589 fns (gate is `--min 80`) |
-| **dist** | `dist/agnosai.cyr` 37,619 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.4; sidecars 45 / 6 leaves |
-| **binary** | `build/agnosai` **5,223,328 B**; aarch64 cross-build **6,422,976 B** (each about 4.1 KB more than 2.1.3: kavach 3.13.2's capture and confinement code) |
-| **gates** | `check-symbols.sh` (both targets) · `check-clean.sh` · `distlib --check` · fuzz · coverage · examples — all green |
-| **build warnings** | **none from any code** — `src/` or a dependency's bundle. What remains are the toolchain's notes: sigil's static array, large static data, and the two "refusing to overwrite stdlib leaf" lines for sigil and patra |
+| **tests** | **99 suites, 8,573 assertions, 0 failed** in a plain shell with wasmtime 49.0.1 (CI pins 47.0.3), so the WASM paths ran. ⚠ `sandbox_spawn` and `sandbox_process` assert once per environment variable, so the total moves with the environment (2.1.4: 8,065 in a plain shell) |
+| **coverage** | **99%**: 102/102 files, 1,616/1,628 fns (gate is `--min 80`) |
+| **dist** | `dist/agnosai.cyr` 38,905 lines + `dist/agnosai-guard.cyr` 915 lines, both v2.1.5 (distlib's counts; 2.1.4: 37,619 / 915); sidecars 45 / 6 leaves |
+| **binary** | `build/agnosai` **5,240,304 B** (2.1.4: 5,223,328); aarch64 cross-build **6,423,568 B** (6,422,976). Both answer `GET /ready` with `"version":"2.1.5"`, the aarch64 one on the Pi |
+| **lock** | `cyrius.lock` 118 files, 8 commit pins, byte-identical to 2.1.4's: no dependency or toolchain change |
+| **gates** | `cyrius lib sync --full` (112 files) → `deps` → lock pin check → `check-symbols.sh` (2,733 definitions, both targets) → `check-clean.sh` (fmt 223, lint 124, doc 113, doctest 1 files; `deps --verify` 118; lib snapshot 112) → build → test → coverage → `distlib --all --check` → examples (1) → fuzz 4/4 → `cyrius bench` (11 files, 223 benchmarks): all green |
+| **benchmarks** | `bench-history.csv` has 223 rows at 2.1.5 (212 at 2.1.4, plus 11 new rows), one unpinned sweep at a 1-minute load of 0.1 to 1.7. Read them against 2.1.3's (median +0.0%, 175 of 212 within ±5%), not 2.1.4's, which was pinned to one CPU at a load of 3–5. CHANGELOG 2.1.5 *Performance* |
+| **build warnings** | `build/agnosai`: toolchain notes only (sigil's static array, large static data, and the two "refusing to overwrite stdlib leaf" lines for sigil and patra). The suite builds print **23** `undefined function '_agnosai_loader_read'` lines (roadmap B19) |
 
-Direct deps (`[deps.*]`, all six) at their latest tags, **none with an active `path`**: `sigil`
-**3.13.7** (= the 6.6.14 fold, byte-identical), `bote` **3.3.16**, `majra` **2.9.2**, `kavach`
-**3.13.2**, `ai-hwaccel` **2.4.1**, `tyche` **1.1.0**. Transitively through bote: libro
+Direct deps (`[deps.*]`, all six), **none with an active `path`**, unchanged since 2.1.4:
+`sigil` **3.13.7** (= the 6.6.14 fold, byte-identical), `bote` **3.3.16**, `majra` **2.9.2**,
+`kavach` **3.13.2**, `ai-hwaccel` **2.4.1**, `tyche` **1.1.0**. The last five are their repos'
+latest tags. sigil's repo is at 3.13.9, which cyrius 6.6.15 folds, so it moves with the pin
+(roadmap, *Moving the cyrius pin to 6.6.15*). Transitively through bote: libro
 **2.10.6**, which declares the folds' patra 1.15.1 and sigil 3.13.7. `cyrius.lock` holds 118
 files and 8 commit pins, and every pin on a folded module names the fold `lib/` holds. Every
 dep's own pins now name the folds too: kavach 3.13.2 declares sigil 3.13.7, ai-hwaccel 2.4.1
-bayan 1.5.11.
+bayan 1.5.11. That holds only at the 6.6.14 pin: kavach 3.13.2 and libro 2.10.6 pin sigil 3.13.7
+and cyrius 6.6.14, so they (and bote, for libro) need releases before the 6.6.15 move (roadmap).
+
+### 2.1.5 — B17, F7 and F6 (the integration gate, 2026-10-04)
+
+This gate ran on the working tree before the cut, with `VERSION` still 2.1.4; the release gate's
+figures are in *Now*. The three item sections below record each item's own deltas. These are the
+figures for all three together, from one gate run in CI order with `TMPDIR` off `/tmp`:
+
+| | |
+|---|---|
+| **tests** | **99 suites, 8,573 assertions, 0 failed** (2.1.4: 8,065). wasmtime 49.0.1 present, so the WASM paths ran |
+| **coverage** | **99%**: 102/102 files, 1,616/1,628 fns (gate `--min 80`) |
+| **dist** | `cyrius distlib --all --check`: both bundles current. `dist/agnosai-guard.cyr` is unchanged from 2.1.4; sidecars 45 / 6 leaves |
+| **binary** | `build/agnosai` **5,240,304 B** (2.1.4: 5,223,328) |
+| **gates** | `cyrius lib sync --full` → `deps` (118 locked, 8 commit pins, `cyrius.lock` byte-identical before and after) → `check-symbols.sh` (both targets, 2,733 definitions) → `check-clean.sh` (fmt 223, lint 124, doc 113 files; `deps --verify` 118) → build → test → coverage → distlib → examples (1) → fuzz 4/4 → `cyrius bench` (11 files): all green |
+| **build warnings** | `build/agnosai` as at 2.1.4: toolchain notes only. The full test log carries **23** `undefined function '_agnosai_loader_read'` lines from suite builds (roadmap B19, not from these items; it counted 20 at F7's gate) |
+
+The bench rows these items claim reproduce in the gate's single `cyrius bench` run, against
+`bench-history.csv`'s 2.1.4 rows: `tool_execute_echo` 3,834 → 823 ns, `score_agent_rich_context`
+1,208 → 879 ns, `rank_agents_16` 11.9 → 7.9 µs, `delegate_16_tasks_16_agents` 191.3 → 125.7 µs,
+`otlp_encode_span` 12.8 → 11.1 µs, `run_crew_10_tasks_sequential` 403.5 → 383.2 µs. B18's
+`lt_aggregate_100k_500workers` reads 45.2 ms, unchanged. `bench-history.sh` was held for the release,
+because it stamps `VERSION`; it ran at the cut (see *Now*).
+
+### 2.1.5 — B17: crew events and status say what happened (ADR 022)
+
+Shipped in 2.1.5. Measured on the working tree before the cut:
+
+- **What changed** — all six of agnostic 0.1.9's findings, in
+  [ADR 022](../adr/022-crew-events-and-status-say-what-happened.md): a parallel/DAG
+  `task_started` at dispatch and `task_completed` per join; `token` events from parallel and DAG
+  workers, carrying the spec's crew id in every mode; `metadata.agent` on LLM-answered results,
+  with `agnosai_crew_profile_record_agent_cost` now summing; a timed-out runner reports `failed`
+  with no results itself; the registry stores `running`, and the DAG error arm puts `pending` back.
+- **New test seam** — the hoosh client's chat pointer (see *Test-design decisions* below), so the
+  crew runner's LLM success arm runs offline. 22 mutants across the change, each killed, plus seven
+  on the event gates. Those seven are killed by an exact check that an unwatched bus allocates
+  what no bus does. Two of them, the wave's worker sender and dispatch-time `task_started`,
+  survived the first review round.
+- **Review fixes** — review found two more surviving mutants, and both are now killed. The
+  first deferred each `task_completed` to the end of its batch. A stub now holds the second task
+  of a two-wide batch until it sees the first task's `task_completed`. The second kept a timed-out
+  crew's GenAI span OK, and `telemetry_wiring` now drains the OTLP ring after a run whose deadline
+  has already passed. `docs/guides/api-reference.md` now documents the `running` → `pending`
+  edge on the DAG error arm, and `POST /api/v1/crews` cannot reach that edge. That adds 7
+  assertions (`orch_crew_runner` 283 → 286, `telemetry_wiring` 26 → 30), so the working tree,
+  with F7 below included, runs **99 suites, 8,297 assertions, 0 failed**. No `src/` change, so
+  dist, binary and benchmarks are as recorded.
+- **tests** — **99 suites, 8,157 assertions, 0 failed** (2.1.4: 8,065). The +92 are all this
+  change's: `orch_crew_runner` 208 → 276, `orch_orchestrator` 72 → 84, `llm_hoosh` 131 → 139,
+  `core_crew` 99 → 103. **coverage** 1,579/1,592 fns, 102/102 files (99%).
+- **dist** — `dist/agnosai.cyr` 37,841 lines (distlib's count; 37,619 at 2.1.4);
+  `dist/agnosai-guard.cyr` unchanged. **binary** `build/agnosai` 5,227,440 B (+4,112).
+- **Benchmarks flat** — `run_crew_*`, three interleaved rounds against a 2.1.4 build of
+  `benches/orch.bcyr`, medians: `1_task_sequential` 99.1 → 99.0 µs, `10_tasks_sequential`
+  399.7 → 405.5 µs (ranges overlap), `10_tasks_parallel_4` 615.4 → 618.9 µs. Those rows have no
+  event bus, so they cannot see the wave change. Four new rows,
+  `crew_runner_10_tasks_parallel_4_{watched,quiet,llm_watched,llm_quiet}`, run the runner with a
+  sender attached. The two placeholder rows ran eight interleaved rounds against 2.1.4, medians:
+  `_watched` 710.6 → 699.1 µs, `_quiet` 648.0 → 641.3 µs. The LLM rows are new-only
+  (CHANGELOG *Performance*). `bench-history.sh` was held for the release, because it stamps
+  `VERSION`.
+- **agnostic** needs only the re-pin and a comment refresh (its "registry never reports RUNNING"
+  comments, ADR 0009's note, Swarm Command's workaround comments).
+
+### 2.1.5 — F7: explain agent selection (library only)
+
+Shipped in 2.1.5. Measured on the working tree beside B17:
+
+- **What changed** — `agnosai_explain_selection_a` returns each agent's total and five component
+  scores in the runner's rank order, so entry 0 is the agent `_agnosai_crew_pick_best_agent`
+  assigns (a test pins it). `agnosai_selection_to_value_a` and
+  `agnosai_selection_scorer_to_value_a` render the JSON. Library only: the wire is unchanged, so
+  there is no ADR. Personality is reported as its neutral 0.5 and listed as `unmeasured`.
+  Nothing is retained on the crew path: a consumer recomputes, which is exact while selection is
+  a pure function of roster and task.
+- **Prerequisite, bite 1** — the scorer's four context keys are module globals, the "medium"
+  default is `AGN_JV_MEDIUM`, and the domain compare is `agnosai_str_eq_ci` on the two `Str`s,
+  with no `str_cstr` copy. The component scorers and `agnosai_score_agent_with_tools` now
+  allocate nothing. `agnosai_score_agent` still extracts `required_tools` into a 152 B vec on the
+  global bump when the task has them, and `agnosai_rank_agents` still allocates its entries. A
+  domain with an embedded NUL no longer matches its prefix. `AGN_JK_AGENT_KEY` moved to
+  `core/json.cyr`.
+- **tests** — **99 suites, 8,297 assertions, 0 failed** on the working tree (B17's tree: 8,157;
+  B17's review fixes add 7). The +133 are F7's: `orch_scoring` 109 → 235 and `orch_crew_runner`
+  276 → 283. 32 mutants killed, 3 equivalent (CHANGELOG *Tests*). **coverage** 1,587/1,600 fns
+  (+8 public), 102/102 files (99%).
+- **dist** — `dist/agnosai.cyr` 38,145 lines (distlib's count; 37,841 after B17);
+  `dist/agnosai-guard.cyr` unchanged. **binary** `build/agnosai` 5,231,792 B (+4,352 on B17's).
+- **Benchmarks** — five interleaved rounds of the scoring rows against the pre-F7 tree, medians:
+  `score_agent_*` −22% to −41% (rich context 1,185 → 922 ns), `rank_agents_varied_100/300/1000`
+  −21% / −21% / −19%, `rank_agents_16` −30%, `delegate_16_tasks_16_agents` −32%,
+  `run_crew_10_tasks_sequential` −1.6% (ranges overlap). Two new rows: `explain_selection_100`
+  74.1 µs and `selection_to_value_100` 56.3 µs. The full table is in CHANGELOG *Performance*.
+  `bench-history.sh` was held for the release.
+- **agnostic** surfaces it when it re-pins: `GET /api/v1/crews/{id}/plan?explain=selection`,
+  with its own ADR for recomputing rather than recording. It shows that agnostic's selection is
+  degenerate today: it forwards no task context, so tools, domain and GPU score 1.0 for every
+  agent and complexity alone decides.
+
+### 2.1.5 — F6: OTel GenAI semconv spans and inbound trace context (ADR 023)
+
+Shipped in 2.1.5. Measured on the working tree beside B17 and F7. agnosai's half only — agnostic's
+lands at its re-pin.
+
+- **What changed** — [ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md),
+  amending ADR 017. Four semconv operations, linked parent to child under one trace per crew in
+  every process mode: `invoke_workflow {crew}`, a new per-task `invoke_agent {agent}`, the hoosh
+  call re-labelled `chat {model}` (it was the span called `gen_ai.invoke_agent`), and
+  `execute_tool {tool}`. `gen_ai.provider.name`, `gen_ai.tool.name`, `gen_ai.workflow.name`,
+  `error.type`, and the agent key as `agnosai.agent.key`. Pinned at
+  `semantic-conventions-genai` `e07f4eba` (gen-ai-dev/1.42.0-dev on base v1.44.0,
+  Development). Span contexts are threaded explicitly (runner → wave job → task → retry context
+  → the hoosh client's chat pointer → `agnosai_hoosh_chat_in`), never thread-local. Inbound
+  `traceparent`: `agnosai_crew_with_trace_parent` in process, and the header on
+  `POST /api/v1/crews`, `POST /api/v1/a2a/receive` and `/mcp` `tools/call`. ParentBased sampling.
+  `agnosai_telemetry_init_export` exports without touching sakshi. With the exporter off no span
+  site builds anything.
+- **Deviations from the plan, recorded in ADR 023:** the agent key goes out as
+  `agnosai.agent.key`, because the pinned registry reserves `gen_ai.agent.id` for hosted agents;
+  the task entry point is ADR 022's `agnosai_execute_task_in_crew` with a trailing `parent_sc`,
+  not a new `agnosai_execute_task_in`; the chat pointer's contract gained the fourth argument.
+- **tests** — **99 suites, 8,557 assertions, 0 failed** on the working tree (8,297 before
+  F6). 60 mutants across five bites, all killed; three survived their first run (CHANGELOG
+  *Tests*). **coverage** 1,616/1,628 fns, 102/102 files (99%); every new public fn is referenced.
+- **dist** — `dist/agnosai.cyr` 38,905 lines after fix round 1 (distlib's count; 38,893 at F6,
+  38,145 after F7), `.deps` unchanged at 45 leaves; `dist/agnosai-guard.cyr` unchanged.
+  **binary** `build/agnosai` 5,240,304 B (+8,512 on F7's; unchanged by fix round 1).
+- **Benchmarks** — against a pre-F6 build of this tree, interleaved: `tool_execute_echo`
+  3.67 → 0.79 µs (−78.5%, the instrumentation it paid with telemetry off), `run_crew_*` −0.4% to
+  −2.4%, the OTLP encode/enqueue/drain rows −6.5% to −17% on a re-based `chat` fixture. Three new
+  rows: `otlp_encode_span_child` 11.54 µs, `otlp_span_context_parse` 303 ns,
+  `otlp_span_context_child` 501 ns. `crew_runner_10_tasks_parallel_4_quiet` reads +19% in the
+  full file and equal when run alone; CHANGELOG *Performance* has both. `bench-history.sh` was held
+  for the release.
+- **agnostic, at its re-pin:** `agnosai_crew_with_trace_parent(spec, agnostic_trace_current())`
+  where it submits a crew; `agnosai_telemetry_init_export` at boot when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and `agnosai_telemetry_shutdown` on shutdown; tighten its
+  traceparent check from length-only to the W3C shape. Its roadmap's "sakshi W3C trace id" is
+  agnostic's own thread-local (`src/trace.cyr`), not sakshi's.
+- **Fix round 1 (review findings)** — the runner's `invoke_agent` span is asserted with an agent
+  ASSIGNED, in `telemetry_wiring` and end to end from the wire in `server_serve`: before, every
+  traced crew was unassigned and swapping the agent's name and key on the span survived every
+  suite (mutant M8; now 4 failures in `telemetry_wiring`, 3 in `server_serve`). The chat span's
+  transport `error.type` is sandhi's kind lowercased (`connect`, `timeout`), its value pinned. Both
+  `llm_hoosh` chat-pointer `callptr`s pass the fourth argument. The inbound-traceparent trust
+  boundary is threat-model surface 7 and in ADR 023, with an unsampled `-00` header pinned at the
+  wire. Two telemetry-on bench rows price the 1 + N spans: a 10-task crew costs **+228 µs
+  sequential, +137 µs parallel_4** with the exporter on (2.1.4: +13 / +14 µs, one span), measured
+  against an idle-thread baseline because a second live thread alone moves these rows (B20).
+  **tests** — **99 suites, 8,573 assertions, 0 failed** (+16: `telemetry_wiring` 91 → 102,
+  `server_serve` 306 → 311). **coverage** 1,616/1,628 fns, 102/102 files (99%).
+- **Left:** hoosh's own span id and `parentSpanId`, then agnosai's outbound header (roadmap C,
+  hoosh row, to file); the rest of B7, which now includes the opt-in `delegate` tool's unlinked
+  trace (item 9) and an operator switch for an untrusted inbound context (item 10); B20 (a second
+  live thread moves crew cost) and B21 (two drainers share the OTLP doc arena at shutdown).
 
 ### 2.1.4 — kavach 3.13.2 and ai-hwaccel 2.4.1; no code warning anywhere
 
@@ -944,7 +1104,7 @@ it was never invoked*.
 
 ## Version
 
-**2.1.4** (`VERSION`), cut 2026-10-03; 2.1.0 was cut 2026-09-26. **2.0.0** was cut 2026-08-14, the first Cyrius release. 1.1.0 was
+**2.1.5** (`VERSION`), cut 2026-10-04; 2.1.0 was cut 2026-09-26. **2.0.0** was cut 2026-08-14, the first Cyrius release. 1.1.0 was
 the last shipped Rust release and is preserved at `rust-old/` as the parity
 oracle. The rule held: VERSION bumped once parity landed, so the number always
 names something that actually shipped.
@@ -958,9 +1118,14 @@ have served as the check.
 
 ## Toolchain
 
-- **Cyrius pin: `6.6.6`** (2.0.10, 2026-09-26) — `lib/` matches the snapshot 111/111, the
-  installed snapshot matches the cyrius `6.6.6` tag 111/111, `deps --verify` 117/0, and a fresh
-  CI-style resolve (empty `lib/`, no siblings) reproduces the local lock's 117 hashes. See Now.
+- **Cyrius pin: `6.6.14`** (since 2.1.3, 2026-10-03; unchanged at 2.1.5) — at the 2.1.5
+  release gate `cyrius lib sync --full` wrote 112 files, `check-clean.sh`'s lib snapshot matched
+  112, `deps --verify` verified 118, and `cyrius.lock` was byte-identical to 2.1.4's. See Now.
+  cyrius 6.6.15 is tagged upstream; the move is the roadmap's *Moving the cyrius pin to 6.6.15*.
+- Previously **`6.6.12`** (2.1.2, 2026-10-01), and before that **`6.6.6`** (2.0.10,
+  2026-09-26): at 6.6.6 `lib/` matched the snapshot 111/111, the installed snapshot matched the
+  cyrius `6.6.6` tag 111/111, `deps --verify` 117/0, and a fresh CI-style resolve (empty `lib/`,
+  no siblings) reproduced the local lock's 117 hashes.
 - Previously **Cyrius pin**: `6.5.20` (`cyrius.cyml`) — bumped 2026-08-12, three-step,
   `lib/` diffed after the sync AND again after a build: 107 files, zero content
   differences, `deps --verify` **113 verified / 0 failed**, duplicate-fn warning
@@ -1236,24 +1401,26 @@ unchanged at **35**, and all 57 suites stayed green across the bump.
 ## Source
 
 `src/` mirrors `rust-old/src/` — see CLAUDE.md's *Layout* rule. **Regenerated
-from the tree 2026-08-12**; every number below was measured, not carried forward:
+from the tree 2026-10-04 (2.1.5)** with the commands below; every number was measured, not
+carried forward. The previous table was dated 2026-08-12 (112 files, 36,721 lines); at
+tag 2.1.4 the tree was 112 files, 38,140 lines, `telemetry/` 1,786:
 
 | Group | Files | Lines | Oracle |
 |---|---|---|---|
-| `orchestrator/` | 16 | 5,854 | ✅ complete (M5) |
-| `server/` | 11 | 4,342 | ✅ complete (M6) |
-| `sandbox/` | 10 | 3,739 | ✅ complete (M7) |
-| `fleet/` | 12 | 3,653 | ✅ complete (M8) |
-| `core/` | 8 | 3,637 | ✅ complete (M2) |
-| `definitions/` | 7 | 2,757 | ✅ complete (M10) |
-| `server/routes/` | 11 | 2,720 | ✅ complete (M6) |
-| `tools/builtin/` | 7 | 2,152 | ✅ complete (M4) |
-| `tools/` | 8 | 1,905 | ✅ complete (M4) |
-| `llm/` | 5 | 1,762 | ✅ complete (M3) |
-| `telemetry/` | 3 | 1,769 | ✅ complete (M9) — `mod` + `genai` + OTLP, with the span call sites wired ([ADR 017](../adr/017-genai-span-call-sites.md)) |
-| `learning/` | 6 | 1,018 | ✅ complete (M2) |
-| root (port-local) | 8 | 1,413 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy`, `strcase`, **`arena_pool`** |
-| **total** | **112** | **36,721** | against **27,683** lines of `rust-old/src/` |
+| `orchestrator/` | 16 | 6,621 | ✅ complete (M5) |
+| `server/` | 11 | 4,871 | ✅ complete (M6) |
+| `sandbox/` | 10 | 3,798 | ✅ complete (M7) |
+| `core/` | 8 | 3,754 | ✅ complete (M2) |
+| `fleet/` | 12 | 3,676 | ✅ complete (M8) |
+| `server/routes/` | 11 | 2,863 | ✅ complete (M6) |
+| `definitions/` | 7 | 2,843 | ✅ complete (M10) |
+| `tools/builtin/` | 7 | 2,280 | ✅ complete (M4) |
+| `telemetry/` | 3 | 2,270 | ✅ complete (M9) — `mod` + `genai` + OTLP, with the span call sites wired ([ADR 017](../adr/017-genai-span-call-sites.md)). 2.1.5's F6 ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)): four semconv span kinds (`invoke_workflow`, `invoke_agent`, `chat`, `execute_tool`) pinned at `semantic-conventions-genai` `e07f4eba`, linked by `parentSpanId`, inbound W3C `traceparent` (in process and on three routes), `agnosai_telemetry_init_export` |
+| `tools/` | 8 | 1,984 | ✅ complete (M4) |
+| `llm/` | 5 | 1,852 | ✅ complete (M3) |
+| `learning/` | 6 | 1,043 | ✅ complete (M2) |
+| root (port-local) | 8 | 1,571 | no oracle — `main`, `units`, `order`, `id`, `guarded_fetch`, `chan_lossy`, `strcase`, **`arena_pool`** |
+| **total** | **112** | **39,426** | against **27,683** lines of `rust-old/src/` |
 
 Regenerate with:
 
@@ -1267,8 +1434,8 @@ for d in $(find src -type d | sort); do
 done
 ```
 
-⚠ **The previous table was stale in every row and omitted a whole group.** It
-read 97 files / 31,163 lines from 2026-08-08 and had no `definitions/` row at
+⚠ **The 2026-08-08 table was stale in every row and omitted a whole group.** It
+read 97 files / 31,163 lines and had no `definitions/` row at
 all, despite M10 completing on 2026-08-09 — so it under-counted by 14 files and
 4,787 lines. The `find … -maxdepth 1` per-group form it documented cannot find a
 group nobody adds a row for; the loop above enumerates directories instead, so a
@@ -1493,11 +1660,19 @@ Standing decisions that shaped the port, each with its record:
 | JWT requires configured `iss`/`aud` | [ADR 010](../adr/010-jwt-require-configured-iss-aud.md) |
 | `/metrics` serves agnosai's registry, not hoosh's | [ADR 011](../adr/011-metrics-endpoint-serves-agnosai-metrics.md) |
 | `agnosai_chan_push_lossy` gives tokio-broadcast evict-oldest semantics | `src/chan_lossy.cyr` |
+| Crew events and registry status say what happened: dispatch-time `task_started`, per-join `task_completed`, worker `token` events with the spec's crew id, `metadata.agent`, a timeout reported by the runner, `running` stored | [ADR 022](../adr/022-crew-events-and-status-say-what-happened.md) |
+| An agent-selection explanation is recomputed from roster and task, never recorded on the run; library only, no wire field (F7) | `src/orchestrator/scoring.cyr` header, *Explaining a selection* |
+| GenAI spans are the four semconv operations (`invoke_workflow`, `invoke_agent`, `chat`, `execute_tool`), pinned at `semantic-conventions-genai` `e07f4eba`, linked parent to child by span contexts threaded explicitly (never thread-local), and joining an inbound W3C `traceparent`; ParentBased sampling; no span is built with the exporter off (F6) | [ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md), amending [ADR 017](../adr/017-genai-span-call-sites.md) |
 
 ## Tests
 
-**97 suites, all passing** — re-verified 2026-08-12 on cyrius 6.5.20 — plus
-**4 fuzz harnesses** and **1 doctest**. The most recent: `tests/core_mod_doctest.tcyr` (13 — the ONE real
+**Current (2.1.5 release gate, 2026-10-04): 99 suites, 8,573 assertions, 0 failed**, plus
+**4 fuzz harnesses** (4/4) and **1 doctest**; coverage 99% (1,616/1,628 fns, 102/102 files).
+*Now* above has the detail. The rest of this section is dated history: each suite, assertion
+and coverage figure in it is as of the date it names, not the current tree.
+
+**At 2026-08-12: 97 suites, all passing** on cyrius 6.5.20, plus 4 fuzz harnesses and 1
+doctest. The most recent then: `tests/core_mod_doctest.tcyr` (13 — the ONE real
 doctest under `rust-old/src/`; the other three fenced blocks are
 `text`/`ignore`/`yaml` and `cargo test` compiles none of them), and:
 `tests/llm_inference_queue.tcyr` (69 assertions, 18 mutation probes / 18 kills),
@@ -1558,7 +1733,8 @@ the pre-bump baseline on 6.5.19, so the toolchain bump is behaviour-neutral here
 ⚠ **No assertion total is recorded for that run.** It was captured through
 `| tail -25`, which discards the per-suite `(N total)` lines the sum needs — so
 quoting one would be inventing it. The earlier figure of **5,559 assertions
-across 66 suites (2026-08-05)** is the last one actually measured; it predates
+across 66 suites (2026-08-05)** was the last one measured at the time (the current measured
+total is in the lead paragraph); it predates
 31 suites and must not be presented as current. To get a real total, run without
 truncating and sum only the `(N total)`-suffixed lines.
 
@@ -1576,7 +1752,7 @@ moved it by one. (The **1099/1099** this line carried until now was the
 2026-08-05 figure and had gone stale by 462 functions.)
 
 ```sh
-cyrius tests tests          # 97 suites; each prints "N passed" with an "(N total)" suffix
+cyrius tests tests          # 99 suites at 2.1.5; each prints "N passed" with an "(N total)" suffix
 cyrius coverage --min 80    # the gate, and its own CI step
 ```
 
@@ -1586,12 +1762,12 @@ caught it said to *regenerate from command output rather than editing rows by
 hand*. A table that can only be maintained by hand will drift again, so the two
 commands above are the authority. Counting gotcha if you sum by hand:
 `cyrius tests tests` prints one line **per suite** carrying an `(N total)` suffix,
-plus a final `97 passed, 0 failed` line that counts **suites, not assertions** —
+plus a final `N passed, 0 failed` line that counts **suites, not assertions** —
 sum only the suffixed lines. ⚠ And do not pipe the run through `tail`: it drops
 the very lines the sum needs, which is how the 2026-08-12 run ended up with no
 recorded assertion total.
 
-Corpus size: **1,125,915 bytes** of `.tcyr`. `cyrius coverage` had a fixed 1 MiB
+Corpus size: **1,927,115 bytes** of `.tcyr` at 2.1.5 (1,125,915 when this note was written). `cyrius coverage` had a fixed 1 MiB
 corpus buffer that silently under-reported past it; fixed upstream in **6.5.8**,
 so there is no corpus ceiling to work around and no local coverage script.
 Re-verified on 6.5.9 by the filing's own repro — padded to 1,765,916 bytes, well
@@ -1605,7 +1781,7 @@ formula itself, the `max_by` last-wins tie rule, replay's zero-priority and NaN
 fallback branches, and the Q-table's packed-key distinctness — none of which the
 Rust tests reach.
 
-**Three seams exist so an offline test can reach a path that needs a network.**
+**Four seams exist so an offline test can reach a path that needs a network.**
 They are a pattern, not one-offs, and the third one confirmed it:
 
 | module | seam | what it makes reachable |
@@ -1613,13 +1789,14 @@ They are a pattern, not one-offs, and the third one confirmed it:
 | `tools/agnos.cyr` | transport fn pointer on the client (`:67`) | URL construction, query encoding, the path-traversal guards, response reshaping |
 | `tools/wasm_tool.cyr` | `agnosai_wasm_tool_output_of` split out of `execute` | the whole result ladder, with `wasmtime` absent |
 | `llm/inference_queue.cyr` | `run_item_with(item, client, chat_fp)` | the **success** arm — see below |
+| `llm/hoosh.cyr` | chat fn pointer on the client (`AGN_HC_CHAT_FP`, `agnosai_hoosh_client_with_chat`) | the crew runner's LLM **success** arm: `token` events, `metadata.agent`, ADR 020's filter on model output, and the registry read from inside a running crew ([ADR 022](../adr/022-crew-events-and-status-say-what-happened.md)). Since ADR 023 its fourth argument is the task's span context, so a stub checks the `invoke_agent` → `chat` threading offline (`tests/telemetry_wiring.tcyr`) |
 
 ⚠ **The inference-queue seam exists because a mutant survived without it.** With
 no gateway listening only the failure arm is reachable, and on that arm the
 response is unused — so a mutant passing 0 to `settle` instead of the response
 passed every assertion. That is the class of defect these seams exist to catch:
 not "the code is wrong" but "no test can tell." Nothing is injected in
-production in any of the three.
+production in any of the four.
 
 **A threaded test must wait on a CAUSE, not a duration.** `server_routes_sse`
 drives the streaming handler on its own thread and ends it by removing the crew
@@ -1759,7 +1936,12 @@ Rust oracle for comparison: **863 unit + 2 integration + 1 doctest, all passing.
 
 ## Benchmarks
 
-**11 `.bcyr` files, 207 rows per sweep, all compiling — re-run 2026-08-12 on
+**Current (2.1.5, 2026-10-04): 11 `.bcyr` files, 223 rows per sweep** — `bench-history.csv`'s
+2.1.5 sweep, and the release gate's `cyrius bench` reads `11 passed, 0 failed`. *Now* above says
+which earlier sweep to read the rows against. The rest of this section is dated history; each
+row count in it is as of the date it names.
+
+**At 2026-08-12: 11 `.bcyr` files, 207 rows per sweep, all compiling** — re-run on
 6.5.20 after the OTLP fix: `11 passed, 0 failed`. `benches/telemetry.bcyr` is NEW (8 ids) — `grep
 'agnosai_otlp_' benches/*.bcyr` was empty, so the span encoder every instrumented
 operation crosses had never been timed.
@@ -1780,7 +1962,7 @@ on this path with redaction off. ⚠ An earlier shape of the filter — scanning
 placeholder path unconditionally — measured **+90%** on the 10-task sequential
 run and was restructured rather than shipped; `agnosai_output_scan` alone is
 16.7 µs against a ~40 µs/task crew path. See ADR 020. Previously verified
-2026-08-11** — against 106 rows and three non-compiling files that morning. See
+2026-08-11 — against 106 rows and three non-compiling files that morning. See
 the Tests section for how they had stopped. `benches/llm.bcyr`,
 `benches/fleet.bcyr` and `benches/definitions.bcyr` are new; `llm` was the first
 to touch `src/llm/` at all, and `harness.bcyr` is the relocated `noop` floor.
@@ -2230,13 +2412,24 @@ persisted crew, needs an `id` no request carries, and has no caller in `src/`.
 
 ## Dependencies
 
-**stdlib** (44 declared, now including `unicode`, order-sensitive — rationale in [`cyrius-port-plan.md`](cyrius-port-plan.md)):
-base substrate · general utilities · bayan · patra · concurrency+crypto floor ·
-dynamic-link floor · async · net/http/tls/ws/sakshi/sandhi
+**stdlib** (45 declared, order-sensitive — rationale in [`cyrius-port-plan.md`](cyrius-port-plan.md)):
+base substrate · general utilities · `unicode` · bayan · patra · concurrency+crypto floor ·
+dynamic-link floor · async · net/http/tls/ws/sakshi/sandhi · sankoch
 
-**git deps** (declare-ahead pattern, read from `cyrius.cyml` 2026-08-05):
-sigil 3.12.2 · **bote 3.3.0** · majra 2.5.3 · **kavach 3.11.7** · ai-hwaccel 2.3.16 ·
-tyche 1.0.0.
+**git deps** (read from `cyrius.cyml` 2026-10-04, 2.1.5; *Now* above has the detail):
+sigil 3.13.7 (the 6.6.14 fold) · bote 3.3.16 · majra 2.9.2 · kavach 3.13.2 · ai-hwaccel 2.4.1 ·
+tyche 1.1.0, none with an active `path`. Transitively through bote: libro 2.10.6. Upstream tags
+checked through the GitHub API the same day: the last five are their repos' latest, and sigil's
+repo is at 3.13.9, which agnosai takes with the cyrius 6.6.15 pin (roadmap, *Moving the cyrius
+pin to 6.6.15*).
+
+The hoosh seam targets **hoosh 2.6.0** — `usage.cost_micro_usd`, `usage.provider` and
+`X-Hoosh-Cache` are read when present, and an older gateway degrades to an absent cost
+rather than a fabricated one.
+
+**Everything below in this section is dated history (2026-08-03 to 2026-08-05)**: the pins it
+names (kavach 3.11.7, bote 3.3.0, libro 2.8.4) were current then, not now. The method it
+records — checking upstream tags through the GitHub API — still applies.
 
 **kavach 3.11.7 verified end to end, 2026-08-05** — the check `state.md` itself
 prescribes, run in all three places rather than assumed:
@@ -2256,7 +2449,7 @@ to enforce, satisfied rather than merely intended.
 before it, so an older pin does not compile rather than silently under-scanning
 — see roadmap C2.
 
-**All six pins are now the newest upstream tag**, confirmed against the GitHub API
+**All six pins were then the newest upstream tag** (2026-08-05), confirmed against the GitHub API
 rather than a local `git fetch` — the dep remotes are SSH (`git@github.com:`) and a
 keyless fetch fails *silently enough to look like "no new tags"*. Use
 `curl -sf https://api.github.com/repos/MacCracken/<dep>/tags` to check.
@@ -2269,10 +2462,8 @@ keyless fetch fails *silently enough to look like "no new tags"*. Use
 > uses bote's protocol types and explicitly declines its Dispatcher
 > (`rust-old/src/server/routes/mcp.rs:3-5`), so hand-building the envelope IS the
 > parity behaviour.
-The hoosh seam targets **hoosh 2.6.0** — `usage.cost_micro_usd`, `usage.provider` and
-`X-Hoosh-Cache` are read when present, and an older gateway degrades to an absent cost
-rather than a fabricated one.
-libro 2.8.4 arrives transitively via bote.
+
+libro 2.8.4 arrived transitively via bote then (2.10.6 at 2.1.5).
 
 ## Known issues in the current build
 

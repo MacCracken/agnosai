@@ -3,9 +3,32 @@
 #
 # Origin: rust-old/src/telemetry/genai.rs
 #
-# Standard attribute names per the OTel GenAI Semantic Conventions (v1.37+), so
-# an OTLP backend (Datadog, Grafana, Arize) can categorise agent and inference
-# operations rather than seeing opaque span names.
+# Standard attribute names and span names per the OTel GenAI semantic
+# conventions, so an OTLP backend (Datadog, Grafana, Arize, Langfuse) can
+# categorise agent and inference operations rather than seeing opaque names.
+#
+# ## The convention is pinned, because it is still "Development"
+#
+# `open-telemetry/semantic-conventions-genai` at commit
+# `e07f4ebacb08f56db8c4c882d117720333fbca04` (2026-10-02). The repo has no tags;
+# its `model/manifest.yaml` declares schema `gen-ai-dev/1.42.0-dev` on top of
+# base semconv v1.44.0, stability `development`. Every name below was read from
+# that commit's `docs/gen-ai/gen-ai-spans.md`, `gen-ai-agent-spans.md` and
+# `docs/registry/attributes/gen-ai.md`. Re-check them when the convention
+# leaves Development — ADR 023.
+#
+# ## Four operations, one span each (ADR 023)
+#
+# | operation | agnosai site | span name | kind |
+# |---|---|---|---|
+# | `invoke_workflow` | a crew run | `invoke_workflow {gen_ai.workflow.name}` | INTERNAL |
+# | `invoke_agent` | one task, in-process agent | `invoke_agent {gen_ai.agent.name}` | INTERNAL |
+# | `chat` | the hoosh chat-completion call | `chat {gen_ai.request.model}` | CLIENT |
+# | `execute_tool` | one tool call | `execute_tool {gen_ai.tool.name}` | INTERNAL |
+#
+# The oracle's vocabulary (`gen_ai.invoke_agent` on the chat call,
+# `agnosai.crew.run` with no operation name, `gen_ai.system`) was replaced
+# rather than dual-emitted; ADR 023 records the old-to-new table.
 #
 # ## `tracing::Span` becomes a held attribute record
 #
@@ -15,7 +38,7 @@
 # attribute channel at all, so the two halves are split:
 #
 # * the **attributes** live in a heap record this module owns, which is what
-#   the OTLP exporter will encode (roadmap M9's remaining half);
+#   the OTLP exporter encodes;
 # * the **scope** is sakshi's stack, entered and exited explicitly.
 #
 # ## Creating a span does NOT enter it
@@ -33,14 +56,25 @@
 # `agnosai_genai_span_attr_str` / `_attr_int` keyed by the very constants above.
 # That makes the constants load-bearing — the oracle's tests only ever check
 # their *shape* — and it is the shape an OTLP attribute encoder wants anyway.
+#
+# ## Absent is 0, for every argument
+#
+# Every constructor and setter takes 0 for "this span does not carry that
+# attribute", and an EMPTY Str is treated the same by the encoder and by the
+# span name. Since ADR 023 a span is only built when the exporter is on, so the
+# setters also take span 0 and do nothing: a call site never has to repeat the
+# exporter check before recording usage or an error.
 # =========================================================================
 
 # --- attribute keys (the oracle's `pub mod attrs`) -----------------------
 
-# The name of the GenAI operation (e.g. "invoke_agent", "execute_tool").
+# The name of the GenAI operation — one of the four `AGNOSAI_GENAI_OP_*`.
 var AGNOSAI_GENAI_OPERATION_NAME = "gen_ai.operation.name";
-# The GenAI system/provider (e.g. "openai", "anthropic", "ollama").
-var AGNOSAI_GENAI_SYSTEM = "gen_ai.system";
+# The provider as the client knows it. Replaces the deprecated `gen_ai.system`
+# (deprecated in base semconv v1.44.0). agnosai's chat calls go to hoosh, so
+# the value is `hoosh` — the spec says the client's best knowledge, which may
+# differ from the upstream behind a proxy (ADR 023).
+var AGNOSAI_GENAI_PROVIDER_NAME = "gen_ai.provider.name";
 # The model requested for inference.
 var AGNOSAI_GENAI_REQUEST_MODEL = "gen_ai.request.model";
 # The model that actually responded (may differ from requested).
@@ -49,50 +83,75 @@ var AGNOSAI_GENAI_RESPONSE_MODEL = "gen_ai.response.model";
 var AGNOSAI_GENAI_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens";
 # Number of output/completion tokens.
 var AGNOSAI_GENAI_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens";
-# The reason the model stopped generating (e.g. "stop", "length").
-var AGNOSAI_GENAI_RESPONSE_FINISH_REASON = "gen_ai.response.finish_reason";
+# Why the model stopped, one entry per choice. ⚠ **Declared, never emitted.**
+# The spec types it `string[]`, which needs an OTLP `arrayValue` the encoder
+# does not write yet (roadmap B7). The oracle's singular `finish_reason` was
+# never a spec attribute.
+var AGNOSAI_GENAI_RESPONSE_FINISH_REASONS = "gen_ai.response.finish_reasons";
 # Agent name.
 var AGNOSAI_GENAI_AGENT_NAME = "gen_ai.agent.name";
-# Agent identifier.
+# The provider-assigned id of a HOSTED agent resource (a Bedrock agent ARN).
+# ⚠ **Declared, never emitted.** At the pinned commit the registry defines it
+# for hosted agents and advises against in-memory ids, and the in-process
+# `invoke_agent` span does not list it. agnosai's agents are in-process, so
+# their key goes out as `agnosai.agent.key` instead (ADR 023).
 var AGNOSAI_GENAI_AGENT_ID = "gen_ai.agent.id";
-# Tool name. ⚠ AgnosAI-specific — deliberately NOT in the OTel GenAI spec, so
-# it carries the `agnosai.` prefix rather than `gen_ai.`.
-var AGNOSAI_GENAI_TOOL_NAME = "agnosai.tool.name";
+# Tool name. In the spec since the oracle was written — the oracle's
+# `agnosai.tool.name` predates it.
+var AGNOSAI_GENAI_TOOL_NAME = "gen_ai.tool.name";
+# The workflow's name — a crew's name. The spec requires it to be
+# low-cardinality, and crew names are caller-supplied (ADR 023).
+var AGNOSAI_GENAI_WORKFLOW_NAME = "gen_ai.workflow.name";
+# The class of error the operation ended with. Base semconv, so neither prefix.
+# Conditionally Required on every span kind when the operation failed.
+var AGNOSAI_GENAI_ERROR_TYPE = "error.type";
 # Crew identifier. AgnosAI-specific.
 var AGNOSAI_GENAI_CREW_ID = "agnosai.crew.id";
-# Crew name. AgnosAI-specific.
-var AGNOSAI_GENAI_CREW_NAME = "agnosai.crew.name";
 # Task identifier. AgnosAI-specific.
 var AGNOSAI_GENAI_TASK_ID = "agnosai.task.id";
+# The agent's definition key — what `metadata.agent` on a task result carries
+# (ADR 022). AgnosAI-specific: see `AGNOSAI_GENAI_AGENT_ID` for why it is not
+# `gen_ai.agent.id`.
+var AGNOSAI_GENAI_AGENT_KEY = "agnosai.agent.key";
 # Inference temperature.
 var AGNOSAI_GENAI_REQUEST_TEMPERATURE = "gen_ai.request.temperature";
 # Maximum tokens requested.
 var AGNOSAI_GENAI_REQUEST_MAX_TOKENS = "gen_ai.request.max_tokens";
-# Task count on a crew span. ⚠ The oracle spells this one inline rather than in
-# `attrs`, which is why it has no `attrs::` counterpart to mirror.
+# Task count on a workflow span. ⚠ The oracle spells this one inline rather
+# than in `attrs`, which is why it has no `attrs::` counterpart to mirror.
 var AGNOSAI_GENAI_CREW_TASK_COUNT = "agnosai.crew.task_count";
 
-# --- span names ----------------------------------------------------------
+# --- operations ----------------------------------------------------------
+#
+# The `gen_ai.operation.name` values, and the first word of each span name.
 
-# The oracle's `info_span!("gen_ai.invoke_agent", ..)`.
-var AGNOSAI_GENAI_SPAN_INVOKE_AGENT = "gen_ai.invoke_agent";
-# The oracle's `info_span!("gen_ai.execute_tool", ..)`.
-var AGNOSAI_GENAI_SPAN_EXECUTE_TOOL = "gen_ai.execute_tool";
-# The oracle's `info_span!("agnosai.crew.run", ..)`.
-var AGNOSAI_GENAI_SPAN_CREW_RUN = "agnosai.crew.run";
+# An inference call: the hoosh chat completion.
+var AGNOSAI_GENAI_OP_CHAT = "chat";
+# One agent doing one task, in this process.
+var AGNOSAI_GENAI_OP_INVOKE_AGENT = "invoke_agent";
+# A crew run — CrewAI's `Crew.kickoff()` is the spec's own example.
+var AGNOSAI_GENAI_OP_INVOKE_WORKFLOW = "invoke_workflow";
+# One tool call.
+var AGNOSAI_GENAI_OP_EXECUTE_TOOL = "execute_tool";
 
-# GenAiSpan heap layout — 104 bytes (13 slots x 8). Str fields are 0 when the
+# The four operations as `Str`s, minted once rather than once per span — the
+# `gen_ai.operation.name` attribute value every span carries.
+var _AGNOSAI_GENAI_OP_CHAT_S = str_from(AGNOSAI_GENAI_OP_CHAT);
+var _AGNOSAI_GENAI_OP_INVOKE_AGENT_S = str_from(AGNOSAI_GENAI_OP_INVOKE_AGENT);
+var _AGNOSAI_GENAI_OP_INVOKE_WORKFLOW_S = str_from(AGNOSAI_GENAI_OP_INVOKE_WORKFLOW);
+var _AGNOSAI_GENAI_OP_EXECUTE_TOOL_S = str_from(AGNOSAI_GENAI_OP_EXECUTE_TOOL);
+
+# GenAiSpan heap layout — 120 bytes (15 slots x 8). Str fields are 0 when the
 # span does not carry that attribute; integer fields are -1.
 #
-# ⚠ Said "112 bytes" until 2026-08-11 while `AGN_GAS_SIZE` was 104 — a field was
-# removed and the prose was not. `alloc(AGN_GAS_SIZE)` always used the enum, so
-# nothing was over- or under-allocated; the comment was simply wrong. Read the
-# enum, not this line.
+# ⚠ The prose said "112 bytes" until 2026-08-11 while `AGN_GAS_SIZE` was 104.
+# `alloc(AGN_GAS_SIZE)` always used the enum. Read the enum, not this line.
 enum AgnosaiGenAiSpanOff {
-    # The span name, a cstring from the three constants above.
+    # The operation, a cstring — one of the four `AGNOSAI_GENAI_OP_*`.
     AGN_GAS_NAME = 0;
+    # The same operation as a `Str`, for the attribute.
     AGN_GAS_OPERATION = 8;
-    AGN_GAS_SYSTEM = 16;
+    AGN_GAS_PROVIDER = 16;
     AGN_GAS_REQUEST_MODEL = 24;
     # 0 until `record_usage` — the oracle's `tracing::field::Empty`.
     AGN_GAS_RESPONSE_MODEL = 32;
@@ -100,86 +159,127 @@ enum AgnosaiGenAiSpanOff {
     AGN_GAS_TASK_ID = 48;
     AGN_GAS_TOOL_NAME = 56;
     AGN_GAS_CREW_ID = 64;
-    AGN_GAS_CREW_NAME = 72;
+    AGN_GAS_WORKFLOW_NAME = 72;
     AGN_GAS_CREW_TASK_COUNT = 80;
     # -1 until `record_usage` — also `Empty`.
     AGN_GAS_INPUT_TOKENS = 88;
     AGN_GAS_OUTPUT_TOKENS = 96;
-    AGN_GAS_SIZE = 104;
+    AGN_GAS_AGENT_KEY = 104;
+    # 0 until `agnosai_genai_span_set_error_type`.
+    AGN_GAS_ERROR_TYPE = 112;
+    AGN_GAS_SIZE = 120;
 }
 
-# An empty span record with `name`. Every attribute starts unset.
-fn _agnosai_genai_span_new(name): i64 {
+# An empty span record for operation `op` (a cstring) and its `Str`. Every
+# attribute but the operation starts unset.
+fn _agnosai_genai_span_new(op, op_s: Str): i64 {
     var s = alloc(AGN_GAS_SIZE);
-    store64(s + AGN_GAS_NAME, name);
-    store64(s + AGN_GAS_OPERATION, 0);
-    store64(s + AGN_GAS_SYSTEM, 0);
+    store64(s + AGN_GAS_NAME, op);
+    store64(s + AGN_GAS_OPERATION, op_s);
+    store64(s + AGN_GAS_PROVIDER, 0);
     store64(s + AGN_GAS_REQUEST_MODEL, 0);
     store64(s + AGN_GAS_RESPONSE_MODEL, 0);
     store64(s + AGN_GAS_AGENT_NAME, 0);
     store64(s + AGN_GAS_TASK_ID, 0);
     store64(s + AGN_GAS_TOOL_NAME, 0);
     store64(s + AGN_GAS_CREW_ID, 0);
-    store64(s + AGN_GAS_CREW_NAME, 0);
+    store64(s + AGN_GAS_WORKFLOW_NAME, 0);
     store64(s + AGN_GAS_CREW_TASK_COUNT, 0 - 1);
     store64(s + AGN_GAS_INPUT_TOKENS, 0 - 1);
     store64(s + AGN_GAS_OUTPUT_TOKENS, 0 - 1);
+    store64(s + AGN_GAS_AGENT_KEY, 0);
+    store64(s + AGN_GAS_ERROR_TYPE, 0);
     return s;
 }
 
-# --- the three span constructors -----------------------------------------
+# --- the four span constructors ------------------------------------------
 
-# A span for an agent inference call.
+# A `chat` span: one inference call. CLIENT — it leaves the process.
 #
 # ⚠ `response_model`, `input_tokens` and `output_tokens` are declared but unset,
 # matching the oracle's three `tracing::field::Empty` fields — `record_usage`
 # fills them. An unrecorded span is therefore distinguishable from one recorded
 # with zero tokens, which a 0 default would have collapsed.
-fn agnosai_genai_inference_span(model: Str, system: Str, agent_name: Str, task_id: Str): i64 {
-    var s = _agnosai_genai_span_new(AGNOSAI_GENAI_SPAN_INVOKE_AGENT);
-    store64(s + AGN_GAS_OPERATION, str_from("invoke_agent"));
-    store64(s + AGN_GAS_SYSTEM, system);
+fn agnosai_genai_chat_span(model: Str, provider: Str): i64 {
+    var s = _agnosai_genai_span_new(AGNOSAI_GENAI_OP_CHAT, _AGNOSAI_GENAI_OP_CHAT_S);
+    store64(s + AGN_GAS_PROVIDER, provider);
     store64(s + AGN_GAS_REQUEST_MODEL, model);
+    return s;
+}
+
+# An `invoke_agent` span: one agent doing one task in this process. INTERNAL.
+#
+# `agent_key` is the agent definition's key, emitted as `agnosai.agent.key`.
+# Any argument may be 0 — a task with no agent assigned still runs, and its
+# span is then named the bare `invoke_agent`.
+fn agnosai_genai_agent_span(agent_name: Str, agent_key: Str, task_id: Str): i64 {
+    var s = _agnosai_genai_span_new(AGNOSAI_GENAI_OP_INVOKE_AGENT,
+      _AGNOSAI_GENAI_OP_INVOKE_AGENT_S);
     store64(s + AGN_GAS_AGENT_NAME, agent_name);
+    store64(s + AGN_GAS_AGENT_KEY, agent_key);
     store64(s + AGN_GAS_TASK_ID, task_id);
     return s;
 }
 
-# A span for a tool execution.
+# A tool span: one tool call. INTERNAL.
 #
 # ⚠ Carries no token or model fields at all — not even empty ones. In the
 # oracle a declared-but-`Empty` field and an undeclared one are both absent from
 # the emitted span, so the two collapse here and both read back unset.
 fn agnosai_genai_tool_span(tool_name: Str, agent_name: Str, task_id: Str): i64 {
-    var s = _agnosai_genai_span_new(AGNOSAI_GENAI_SPAN_EXECUTE_TOOL);
-    store64(s + AGN_GAS_OPERATION, str_from("execute_tool"));
+    var s = _agnosai_genai_span_new(AGNOSAI_GENAI_OP_EXECUTE_TOOL,
+      _AGNOSAI_GENAI_OP_EXECUTE_TOOL_S);
     store64(s + AGN_GAS_TOOL_NAME, tool_name);
     store64(s + AGN_GAS_AGENT_NAME, agent_name);
     store64(s + AGN_GAS_TASK_ID, task_id);
     return s;
 }
 
-# A span for a crew execution.
+# An `invoke_workflow` span: one crew run. INTERNAL.
 #
-# ⚠ Sets **no** `gen_ai.operation.name`. The oracle's `crew_span!` omits it
-# while the other two set it, so a backend grouping by operation sees crew runs
-# as unclassified. Reproduced rather than filled in.
-fn agnosai_genai_crew_span(crew_id: Str, crew_name: Str, task_count): i64 {
-    var s = _agnosai_genai_span_new(AGNOSAI_GENAI_SPAN_CREW_RUN);
+# ⚠ **Sets `gen_ai.operation.name`, which the oracle's `crew_span!` omits** —
+# while its other two spans set it, so a backend grouping by operation saw crew
+# runs as unclassified. The port reproduced the omission until ADR 023, which
+# reverses it: the spec makes the operation name Required on this span.
+fn agnosai_genai_workflow_span(crew_id: Str, workflow_name: Str, task_count): i64 {
+    var s = _agnosai_genai_span_new(AGNOSAI_GENAI_OP_INVOKE_WORKFLOW,
+      _AGNOSAI_GENAI_OP_INVOKE_WORKFLOW_S);
     store64(s + AGN_GAS_CREW_ID, crew_id);
-    store64(s + AGN_GAS_CREW_NAME, crew_name);
+    store64(s + AGN_GAS_WORKFLOW_NAME, workflow_name);
     store64(s + AGN_GAS_CREW_TASK_COUNT, task_count);
     return s;
 }
+
+# --- setters -------------------------------------------------------------
+#
+# Each takes span 0 and does nothing: since ADR 023 a span exists only while
+# the exporter is on, and the call sites record unconditionally.
 
 # Record token usage and the responding model on an existing span.
 #
 # The oracle's `record_usage`. Overwrites unconditionally, as `Span::record`
 # does — calling it twice keeps the second set.
 fn agnosai_genai_record_usage(span, input_tokens, output_tokens, model: Str): i64 {
+    if (span == 0) { return 0; }
     store64(span + AGN_GAS_INPUT_TOKENS, input_tokens);
     store64(span + AGN_GAS_OUTPUT_TOKENS, output_tokens);
     store64(span + AGN_GAS_RESPONSE_MODEL, model);
+    return 0;
+}
+
+# Set `gen_ai.request.model` — on an `invoke_agent` span, the model the agent
+# was configured with, once the runner has chosen it.
+fn agnosai_genai_span_set_request_model(span, model: Str): i64 {
+    if (span == 0) { return 0; }
+    store64(span + AGN_GAS_REQUEST_MODEL, model);
+    return 0;
+}
+
+# Set `error.type`, the low-cardinality class of the failure. ADR 023 lists
+# every value agnosai emits.
+fn agnosai_genai_span_set_error_type(span, error_type: Str): i64 {
+    if (span == 0) { return 0; }
+    store64(span + AGN_GAS_ERROR_TYPE, error_type);
     return 0;
 }
 
@@ -204,9 +304,55 @@ fn agnosai_genai_span_exit(): i64 {
 
 # --- attribute access ----------------------------------------------------
 
-# The span's name.
+# The span's operation, a cstring — one of the four `AGNOSAI_GENAI_OP_*`.
+#
+# ⚠ Not the exported name, which also carries the operation's subject (see
+# `agnosai_genai_span_full_name_a`). sakshi's span stack takes this one: it is
+# a constant, so entering a span allocates nothing.
 fn agnosai_genai_span_name(span): i64 {
     return load64(span + AGN_GAS_NAME);
+}
+
+# The subject a span name follows its operation with, or 0 when there is none.
+#
+# Per the pinned convention: the requested model for `chat`, the agent's name
+# for `invoke_agent`, the workflow's name for `invoke_workflow` and the tool's
+# name for `execute_tool`. An EMPTY subject answers 0 too, so a span whose
+# subject is absent is named by its bare operation, never `"chat "`.
+fn agnosai_genai_span_name_suffix(span): i64 {
+    var op = load64(span + AGN_GAS_NAME);
+    var v = 0;
+    if (streq(op, AGNOSAI_GENAI_OP_CHAT) == 1) { v = load64(span + AGN_GAS_REQUEST_MODEL); }
+    elif (streq(op, AGNOSAI_GENAI_OP_INVOKE_AGENT) == 1) {
+        v = load64(span + AGN_GAS_AGENT_NAME);
+    }
+    elif (streq(op, AGNOSAI_GENAI_OP_INVOKE_WORKFLOW) == 1) {
+        v = load64(span + AGN_GAS_WORKFLOW_NAME);
+    }
+    elif (streq(op, AGNOSAI_GENAI_OP_EXECUTE_TOOL) == 1) {
+        v = load64(span + AGN_GAS_TOOL_NAME);
+    }
+    if (v == 0) { return 0; }
+    if (str_len(v) == 0) { return 0; }
+    return v;
+}
+
+# The span's exported name in `a`: `"<operation> <subject>"`, or the bare
+# operation when the subject is absent — `chat gpt-4o`, `invoke_agent Analyst`,
+# `invoke_workflow wired-crew`, `execute_tool echo`.
+#
+# The OTLP encoder writes the same two parts straight into its fragment rather
+# than building this intermediate; the two must agree, and the suite checks
+# that they do.
+fn agnosai_genai_span_full_name_a(a, span): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, load64(span + AGN_GAS_OPERATION));
+    var suffix = agnosai_genai_span_name_suffix(span);
+    if (suffix != 0) {
+        str_builder_add_cstr_a(a, sb, " ");
+        str_builder_add_a(a, sb, suffix);
+    }
+    return str_builder_build_a(a, sb);
 }
 
 # The Str-valued attribute `key`, or 0 when this span does not carry it.
@@ -219,7 +365,7 @@ fn agnosai_genai_span_attr_str(span, key): i64 {
     if (streq(key, AGNOSAI_GENAI_OPERATION_NAME) == 1) {
         return load64(span + AGN_GAS_OPERATION);
     }
-    if (streq(key, AGNOSAI_GENAI_SYSTEM) == 1) { return load64(span + AGN_GAS_SYSTEM); }
+    if (streq(key, AGNOSAI_GENAI_PROVIDER_NAME) == 1) { return load64(span + AGN_GAS_PROVIDER); }
     if (streq(key, AGNOSAI_GENAI_REQUEST_MODEL) == 1) {
         return load64(span + AGN_GAS_REQUEST_MODEL);
     }
@@ -227,10 +373,14 @@ fn agnosai_genai_span_attr_str(span, key): i64 {
         return load64(span + AGN_GAS_RESPONSE_MODEL);
     }
     if (streq(key, AGNOSAI_GENAI_AGENT_NAME) == 1) { return load64(span + AGN_GAS_AGENT_NAME); }
-    if (streq(key, AGNOSAI_GENAI_TASK_ID) == 1) { return load64(span + AGN_GAS_TASK_ID); }
+    if (streq(key, AGNOSAI_GENAI_WORKFLOW_NAME) == 1) {
+        return load64(span + AGN_GAS_WORKFLOW_NAME);
+    }
     if (streq(key, AGNOSAI_GENAI_TOOL_NAME) == 1) { return load64(span + AGN_GAS_TOOL_NAME); }
+    if (streq(key, AGNOSAI_GENAI_ERROR_TYPE) == 1) { return load64(span + AGN_GAS_ERROR_TYPE); }
     if (streq(key, AGNOSAI_GENAI_CREW_ID) == 1) { return load64(span + AGN_GAS_CREW_ID); }
-    if (streq(key, AGNOSAI_GENAI_CREW_NAME) == 1) { return load64(span + AGN_GAS_CREW_NAME); }
+    if (streq(key, AGNOSAI_GENAI_TASK_ID) == 1) { return load64(span + AGN_GAS_TASK_ID); }
+    if (streq(key, AGNOSAI_GENAI_AGENT_KEY) == 1) { return load64(span + AGN_GAS_AGENT_KEY); }
     return 0;
 }
 

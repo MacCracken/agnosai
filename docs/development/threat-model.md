@@ -77,12 +77,35 @@ Dependencies could contain malicious code.
 | Typosquatting | `deny.toml` restricts to crates.io registry only |
 | Wildcard versions | `cargo-deny` denies wildcard version specs |
 
+### 7. Inbound trace context (W3C `traceparent`, [ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md))
+
+`POST /api/v1/crews`, `POST /api/v1/a2a/receive` and `/mcp` `tools/call` read
+the `traceparent` header, and the work's spans join that trace. In-process,
+`agnosai_crew_with_trace_parent` does the same for an embedding caller.
+
+**Who can send it:** any client that reaches those routes. With auth on that is
+any authenticated caller; with auth off — the default, which is fail-open
+(`agnosai_auth_config_new`) — it is anyone. The header is honoured whenever the
+OTLP exporter is on; nothing else gates it.
+
+| Threat | Mitigation |
+|--------|------------|
+| Header as a parser attack (oversized, non-hex, uppercase, zero ids) | Strict W3C Trace Context Level 1 version `00` parse: exactly 55 bytes, `-` at fixed offsets, lowercase hex, non-zero trace and parent ids. Anything else starts a new root trace — never an error, never a different response. The spec keeps a 55-byte copy and nothing longer |
+| Header changing what the client sees | The response does not depend on it: a missing, malformed or unsampled header answers the same status as a valid one, never a 4xx (`tests/server_serve.tcyr`) |
+| **Trace-id choice** — the caller picks the trace id agnosai's spans join, so it can plant spans into an arbitrary trace on the collector, including a trace id it observed from another tenant | ⚠ **Not mitigated.** Joining the caller's trace is the feature. A collector shared across trust domains must not treat a trace id as proof of who produced a span |
+| **Export suppression** — sampled flag `0` (`-00`) switches OFF span export for the work that caller starts (its crews, its tool calls), because sampling is ParentBased | ⚠ **Not mitigated.** A caller can hide its own work from OTLP tracing. Only spans are lost: sakshi logs, the audit chain, `/metrics` counters and the task results are unaffected. An operator switch to restart (or ignore) an inbound context is on the roadmap (B7, item 10) |
+
+The W3C spec leaves to a receiving service whether an inbound trace crossing a
+trust boundary is honoured or restarted. agnosai honours it unconditionally
+today; that is a recorded choice, not an oversight.
+
 ## Trust Boundaries
 
 ```
 Untrusted                    Trusted
 ─────────────────────────────────────────
 HTTP clients          →  API validation layer  →  Orchestrator
+traceparent header    →  strict W3C v00 parse  →  span parent + sampling (honoured as-is)
 WASM tool modules     →  Sandbox (wasmtime)    →  Tool registry
 Python tool scripts   →  Subprocess sandbox    →  Tool registry
 LLM provider responses →  Response parsing     →  Agent execution
@@ -123,3 +146,8 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
   process-tier tool as running with the server's privileges.
 - **Fleet coordinator election**: Simple "first node wins" election. No Byzantine
   fault tolerance. Suitable for trusted internal networks.
+- **Caller-controlled trace context** (surface 7): any caller of a traced route
+  chooses the trace its spans join and can suppress their export with sampled
+  flag `0`. Accepted because joining the caller's trace is the point of the
+  feature and nothing but OTLP spans is lost; the operator switch that would
+  restart an untrusted inbound context is a roadmap item.

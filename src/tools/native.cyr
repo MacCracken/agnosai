@@ -395,30 +395,54 @@ fn agnosai_tool_schema(t): i64 {
     return agnosai_tool_schema_a(default_alloc(), t);
 }
 
-# Execute the tool, via its vtable. Synchronous — see the module note.
+# Execute the tool, via its vtable, as a child of `parent_sc`. Synchronous —
+# see the module note.
 #
 # ⚠ **Every tool call in the tree funnels through here**, which is why the
 # GenAI tool span is recorded at this one site rather than at each caller: the
 # vtable dispatch is the chokepoint, so a tool added later is instrumented
 # without touching it. ADR 017 covers why the port creates spans the oracle
-# does not.
+# does not; ADR 023 why the span is `execute_tool {tool}` and has a parent.
 #
-# The agent name and task id are empty because the vtable carries neither — a
+# `parent_sc` is the caller's span context, or 0 for a root span. `/mcp`
+# `tools/call` passes the request's inbound `traceparent`; **F1's tool loop**
+# must pass the calling task's `invoke_agent` context, so a tool call nests
+# under the agent that made it.
+#
+# The agent name and task id are absent because the vtable carries neither — a
 # tool is invoked with an input value and nothing about who asked. Threading
-# that through would change the calling convention for every implementor, which
-# is a bigger change than this bite; the attributes are omitted rather than
-# faked, and an omitted OTLP attribute is simply absent on the wire.
-fn agnosai_tool_execute(t, input): i64 {
-    var span = agnosai_genai_tool_span(agnosai_tool_name(t), str_from(""), str_from(""));
-    var t0 = clock_epoch_ns();
+# that through would change the calling convention for every implementor; the
+# attributes are omitted rather than faked. (They were faked until ADR 023: the
+# span was built with two empty strings, which the encoder emitted.)
+fn agnosai_tool_execute_in(t, input, parent_sc): i64 {
+    # ⚠ Built ONLY with the exporter on (ADR 023): with telemetry off a tool
+    # call allocates no span and reads no clock.
+    var span = 0;
+    var self_sc = 0;
+    var t0 = 0;
+    if (agnosai_telemetry_exporter() != 0) {
+        span = agnosai_genai_tool_span(agnosai_tool_name(t), 0, 0);
+        self_sc = agnosai_telemetry_span_ctx(parent_sc);
+        t0 = clock_epoch_ns();
+    }
     var out = callptr(load64(t + AGN_TOOL_EXECUTE_FP), load64(t + AGN_TOOL_CTX), input);
+    if (span == 0) { return out; }
     # ⚠ A tool may answer 0. `agnosai_tool_output_success` would dereference it,
     # so the null check comes FIRST — instrumenting this site must not turn a
     # tool's 0 into a crash, which is exactly what the first draft did.
     # A 0 output is recorded as an ERROR span: no output is not success.
     var ok = 0;
-    if (out != 0) { ok = agnosai_tool_output_success(out); }
-    agnosai_telemetry_record_span(span, t0, clock_epoch_ns(),
+    if (out == 0) { agnosai_genai_span_set_error_type(span, str_from("no_output")); }
+    else {
+        ok = agnosai_tool_output_success(out);
+        if (ok != 1) { agnosai_genai_span_set_error_type(span, str_from("tool_error")); }
+    }
+    agnosai_telemetry_record_span_in(span, self_sc, parent_sc, t0, clock_epoch_ns(),
       agnosai_telemetry_status_of(ok));
     return out;
+}
+
+# Execute the tool with no parent span — `agnosai_tool_execute_in(t, input, 0)`.
+fn agnosai_tool_execute(t, input): i64 {
+    return agnosai_tool_execute_in(t, input, 0);
 }

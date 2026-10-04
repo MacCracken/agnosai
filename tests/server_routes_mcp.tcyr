@@ -233,6 +233,54 @@ fn _t_tools_call(): i64 {
     return 0;
 }
 
+# --- ADR 023: a tools/call joins the request's trace ----------------------
+
+# `agnosai_route_mcp_tp_a` hands `tools/call` the request's `traceparent`, and
+# the `execute_tool` span becomes its child. With `tp` 0 every response is
+# byte-identical to `agnosai_route_mcp_a`'s — the wire is unchanged.
+fn _t_tools_call_traced(): i64 {
+    var a = default_alloc();
+    var call = _t_rpc("tools/call",
+      ",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hello\"}}");
+    var tp = str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+
+    # The wire-parity guard, telemetry off: every method answers the same bytes.
+    var bodies = vec_new();
+    vec_push(bodies, call);
+    vec_push(bodies, _t_rpc("tools/list", ""));
+    vec_push(bodies, _t_rpc("initialize", ""));
+    vec_push(bodies, _t_rpc("tools/call", ",\"params\":{\"name\":\"nope\"}"));
+    var same = 1;
+    for (var i = 0; i < vec_len(bodies); i = i + 1) {
+        var r0 = agnosai_route_mcp_a(a, _t_state(), vec_get(bodies, i));
+        var r1 = agnosai_route_mcp_tp_a(a, _t_state(), vec_get(bodies, i), tp);
+        if (agnosai_route_status(r0) != agnosai_route_status(r1)) { same = 0; }
+        if (str_eq(bayan_json_v_build(agnosai_route_body(r0)),
+            bayan_json_v_build(agnosai_route_body(r1))) == 0) { same = 0; }
+    }
+    assert_eq(same, 1, "a traceparent changes no MCP response, byte for byte");
+
+    var g = agnosai_telemetry_init_export(str_from("http://127.0.0.1:1"), str_from("mcp-probe"));
+    var ring = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
+    agnosai_otlp_ring_drain(ring, str_from("x"));
+    var rt = agnosai_route_mcp_tp_a(a, _t_state(), call, tp);
+    assert(str_eq(_t_str(bayan_json_v_arr_get(_t_obj(_t_obj(agnosai_route_body(rt), "result"),
+              "content"), 0), "text"), str_from("hello")) == 1, "the traced call still answers");
+    var doc = agnosai_otlp_ring_drain(ring, str_from("x"));
+    assert(doc != 0, "and records its tool span");
+    assert_eq(str_contains_cstr(doc, "\"name\":\"execute_tool echo\""), 1, "execute_tool echo");
+    assert_eq(str_contains_cstr(doc, "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\""), 1,
+      "in the request's trace");
+    assert_eq(str_contains_cstr(doc, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "as its parent-id's child");
+    # Without one it is a root, as before.
+    agnosai_route_mcp_a(a, _t_state(), call);
+    assert_eq(str_contains_cstr(agnosai_otlp_ring_drain(ring, str_from("x")), "parentSpanId"), 0,
+      "an untraced tools/call is a root span");
+    agnosai_telemetry_shutdown(g);
+    return 0;
+}
+
 # --- Oracle: tools_call_unknown_tool_returns_is_error --------------------
 
 # **The asymmetry that is easiest to flatten by mistake**: an unknown tool is a
@@ -595,6 +643,7 @@ fn main(): i64 {
     _t_mcp_prompts_get_appends_the_task();
     _t_mcp_prompts_get_rejects();
     _t_mcp_advertises_prompts();
+    _t_tools_call_traced();
 
     return assert_summary();
 }

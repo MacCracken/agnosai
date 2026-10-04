@@ -30,6 +30,13 @@ fn _t_assert_str(actual, expected, name): i64 {
     return assert(str_eq(actual, str_from(expected)) == 1, name);
 }
 
+# A chat call that answers without a network: stores the client it was handed
+# through `out_response` so the caller can see which client reached it.
+fn _t_stub_chat(client, request, out_response, parent_sc): i64 {
+    store64(out_response, client);
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -239,6 +246,36 @@ fn main() {
     var hc_anon = agnosai_hoosh_client_new(str_from("http://gw"), str_from(""));
     assert_eq(str_len(agnosai_hoosh_client_api_key(hc_anon)), 0,
       "an unauthenticated gateway takes an empty key, which is still a present Str");
+
+    # --- the chat pointer (ADR 022) ---
+    # The crew runner calls through it, so a suite can reach the LLM success arm
+    # offline. Production never swaps it: a new client carries the live call.
+    assert_eq(agnosai_hoosh_client_chat_fp(hc), &_agnosai_hoosh_client_chat_live,
+      "a new client's chat call is the LIVE one — nothing is injected in production");
+    assert_eq(agnosai_hoosh_client_with_chat(hc_anon, &_t_stub_chat), hc_anon,
+      "with_chat returns the client it was given");
+    assert_eq(agnosai_hoosh_client_chat_fp(hc_anon), &_t_stub_chat, "and swaps the pointer");
+    assert_eq(agnosai_hoosh_client_chat_fp(hc), &_agnosai_hoosh_client_chat_live,
+      "on that client only — the other keeps the live call");
+    # ⚠ The pointer takes FOUR arguments (ADR 023): the fourth is the chat
+    # span's parent context, 0 for none. Omitted, the callee reads a stale
+    # register as a span context pointer.
+    var stub_out: i64[1];
+    store64(&stub_out, 0);
+    assert_eq(callptr(agnosai_hoosh_client_chat_fp(hc_anon), hc_anon, 0, &stub_out, 0), 0,
+      "a call through the swapped pointer reaches the stub");
+    assert_eq(load64(&stub_out), hc_anon, "which saw the client it was called with");
+
+    # The live call, through the pointer, against a port nothing listens on: it
+    # must come back as hoosh's error Str, which proves the default is the real
+    # transport and not a no-op that happens to return 0.
+    var dead = agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from(""));
+    var live_out: i64[1];
+    store64(&live_out, 0);
+    var live_rc = callptr(agnosai_hoosh_client_chat_fp(dead), dead,
+      agnosai_inference_request_new(str_from("m")), &live_out, 0);
+    assert(live_rc != 0, "the live call to a dead gateway returns an error Str");
+    assert_eq(load64(&live_out), 0, "and stores no response");
 
     # --- the cache signal ---
     assert_eq(agnosai_hoosh_cache_from_header(str_from("HIT")), AGNOSAI_HOOSH_CACHE_HIT,

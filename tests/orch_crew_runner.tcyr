@@ -95,12 +95,272 @@ fn _t_task(desc): i64 {
     return agnosai_task_new(str_from(desc));
 }
 
+# ── the stub gateway (ADR 022's seam) ──────────────────────────────────────
+# With no gateway listening, `agnosai_execute_task`'s LLM SUCCESS arm is
+# unreachable offline, so everything that happens only there — the `token`
+# event, the result's `agent` metadata, ADR 020's output filter on model output
+# — could be unwired without failing a test. The hoosh client's chat pointer
+# lets this suite answer instead of a gateway.
+
+# The body the stub answers with, or 0 for `_t_ok_body()`. A global so one block
+# can swap in a leaky answer for the output-filter check.
+var _t_stub_body = 0;
+
+# A gateway answer: content "done", 1500 tokens, 450 micro-USD, served by openai.
+fn _t_ok_body(): i64 {
+    return str_cat(str_cat(
+        str_from("{\"model\":\"gpt-4o-mini\",\"choices\":[{\"message\":{\"content\":\"done\"}}],"),
+        str_from("\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,")),
+      str_from("\"cost_micro_usd\":450,\"provider\":\"openai\"}}"));
+}
+
+# The stub chat call — `agnosai_hoosh_chat`'s contract, with no network.
+fn _t_stub_chat(client, request, out_response, parent_sc): i64 {
+    var body = _t_stub_body;
+    if (body == 0) { body = _t_ok_body(); }
+    store64(out_response, agnosai_hoosh_response_from_body(body));
+    return 0;
+}
+
+# The runner whose deadline `_t_stub_chat_expire` moves into the past, or 0.
+var _t_expire_runner = 0;
+
+# The stub, plus a deadline that passes MID-RUN — deterministically. Answering a
+# task moves the runner's deadline into the past, so the NEXT loop head observes
+# it: exactly one task has run when the crew times out, with no clock involved.
+fn _t_stub_chat_expire(client, request, out_response, parent_sc): i64 {
+    if (_t_expire_runner != 0) { agnosai_crew_runner_set_deadline_ns(_t_expire_runner, 1); }
+    return _t_stub_chat(client, request, out_response, parent_sc);
+}
+
+# A client whose chat call is the stub. The URL is a port nothing listens on, so
+# a call that bypassed the pointer would fail rather than reach a real gateway.
+fn _t_stub_client(): i64 {
+    return agnosai_hoosh_client_with_chat(
+      agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_t_stub_chat);
+}
+
+# A runner over `spec` whose tasks take the LLM success arm through the stub.
+fn _t_llm_runner(spec): i64 {
+    return agnosai_crew_runner_with_llm(agnosai_crew_runner_new(spec), _t_stub_client());
+}
+
+# The bytes one run of `r` allocates. The runner is built before the count
+# starts, so only the run is measured — worker threads included, because
+# `alloc` is one global bump behind a lock.
+fn _t_run_cost(r): i64 {
+    var err: i64[1];
+    store64(&err, 0);
+    var before = alloc_used();
+    agnosai_crew_runner_run(r, &err);
+    return alloc_used() - before;
+}
+
+# ── reading an event stream ────────────────────────────────────────────────
+
+# Every event `sub` holds, in delivery order.
+fn _t_drain(sub): i64 {
+    var v = vec_new();
+    var ev = agnosai_event_sub_try_recv(sub);
+    while (ev != 0) {
+        vec_push(v, ev);
+        ev = agnosai_event_sub_try_recv(sub);
+    }
+    return v;
+}
+
+# Whether event `ev` is of type `t` (a C string).
+fn _t_is(ev, t): i64 {
+    return str_eq_cstr(agnosai_crew_event_event_type(ev), t);
+}
+
+# How many events in `evs` are of type `t`.
+fn _t_count(evs, t): i64 {
+    var n = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        if (_t_is(vec_get(evs, i), t) == 1) { n = n + 1; }
+    }
+    return n;
+}
+
+# How many `token` events in `evs` name crew `crew_id`.
+fn _t_tokens_for(evs, crew_id): i64 {
+    var n = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        var ev = vec_get(evs, i);
+        if (_t_is(ev, "token") == 1 && str_eq(agnosai_crew_event_crew_id(ev), crew_id) == 1) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+# The first event in `evs` of type `t`, or 0.
+fn _t_find(evs, t): i64 {
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        if (_t_is(vec_get(evs, i), t) == 1) { return vec_get(evs, i); }
+    }
+    return 0;
+}
+
+# A string field of an event's data.
+fn _t_ev_str(ev, key): i64 {
+    return bayan_json_v_str(bayan_json_v_obj_get_by_cstr(agnosai_crew_event_data(ev), key));
+}
+
+# An integer field of an event's data.
+fn _t_ev_int(ev, key): i64 {
+    return bayan_json_v_int(bayan_json_v_obj_get_by_cstr(agnosai_crew_event_data(ev), key));
+}
+
+# The index in `evs` of the first event of type `t` for task `task_id`, or -1.
+fn _t_index_of(evs, t, task_id): i64 {
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        var ev = vec_get(evs, i);
+        if (_t_is(ev, t) == 1 && str_eq(_t_ev_str(ev, "task_id"), task_id) == 1) { return i; }
+    }
+    return 0 - 1;
+}
+
+# The most tasks in flight — started and not yet completed — at any point.
+fn _t_max_in_flight(evs): i64 {
+    var cur = 0;
+    var peak = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        var ev = vec_get(evs, i);
+        if (_t_is(ev, "task_started") == 1) { cur = cur + 1; }
+        if (_t_is(ev, "task_completed") == 1) { cur = cur - 1; }
+        if (cur > peak) { peak = cur; }
+    }
+    return peak;
+}
+
+# How many events of type `t` in `evs` have NO earlier event of type `before`
+# for the same task — 0 when every one is preceded.
+fn _t_unpreceded(evs, t, before): i64 {
+    var bad = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        var ev = vec_get(evs, i);
+        if (_t_is(ev, t) == 1) {
+            var at = _t_index_of(evs, before, _t_ev_str(ev, "task_id"));
+            if (at < 0 || at > i) { bad = bad + 1; }
+        }
+    }
+    return bad;
+}
+
+# How many `token` events in `evs` come AFTER their task's `task_completed` —
+# 0 when every token precedes it.
+fn _t_tokens_late(evs): i64 {
+    var bad = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        var ev = vec_get(evs, i);
+        if (_t_is(ev, "token") == 1) {
+            var done_at = _t_index_of(evs, "task_completed", _t_ev_str(ev, "task_id"));
+            if (done_at < i) { bad = bad + 1; }
+        }
+    }
+    return bad;
+}
+
+# What `_t_stub_chat_peer` watches: a second subscription on the crew's sender,
+# the task whose `task_completed` it waits for, and what came of the wait — 0
+# not asked, 1 the event arrived, 2 the wait ran out.
+var _t_peer_sub = 0;
+var _t_peer_task = 0;
+var _t_peer_seen = 0;
+
+# Whether any message of `request` contains `marker` (a C string).
+fn _t_request_mentions(request, marker): i64 {
+    var msgs = agnosai_inference_request_messages(request);
+    for (var i = 0; i < vec_len(msgs); i = i + 1) {
+        if (str_contains_cstr(agnosai_chat_message_content(vec_get(msgs, i)), marker) == 1) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# The stub, except that a task whose prompt says "await-peer" first waits for
+# `_t_peer_task`'s `task_completed` on `_t_peer_sub` — for at most 5 s, so a
+# runner that never sends it fails an assertion instead of hanging the suite.
+fn _t_stub_chat_peer(client, request, out_response, parent_sc): i64 {
+    if (_t_request_mentions(request, "await-peer") == 1) {
+        _t_peer_seen = 2;
+        var until = clock_now_ns() + 5000 * AGNOSAI_NS_PER_MS;
+        var ev = 0;
+        while (clock_now_ns() < until) {
+            ev = agnosai_event_sub_try_recv(_t_peer_sub);
+            if (ev == 0) {
+                sleep_ms(1);
+            } elif (_t_is(ev, "task_completed") == 1) {
+                if (str_eq(_t_ev_str(ev, "task_id"), _t_peer_task) == 1) {
+                    _t_peer_seen = 1;
+                    break;
+                }
+            }
+        }
+    }
+    return _t_stub_chat(client, request, out_response, parent_sc);
+}
+
+# A crew of `n` placeholder tasks named `name`, run by `process`.
+fn _t_crew(name, n, process): i64 {
+    var s = agnosai_crew_new(str_from(name));
+    var ts = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(ts, agnosai_task_new(str_cat(str_from("t-"), str_from_int(i))));
+    }
+    agnosai_crew_with_tasks(s, ts);
+    agnosai_crew_with_process(s, process);
+    return s;
+}
+
+# A fresh subscribed sender for crew `spec`; the subscription goes through `out_sub`.
+fn _t_watch(spec, out_sub): i64 {
+    var tx = agnosai_event_bus_sender(agnosai_event_bus_new(), agnosai_crew_id(spec));
+    store64(out_sub, agnosai_event_sender_subscribe(tx));
+    return tx;
+}
+
 # A vec of up to three agents.
 fn _t_roster(a, b, c): i64 {
     var v = vec_new();
     if (a != 0) { vec_push(v, a); }
     if (b != 0) { vec_push(v, b); }
     if (c != 0) { vec_push(v, c); }
+    return v;
+}
+
+# The agent `agnosai_explain_selection_a` ranks first for `task`, or 0 when it
+# explains no candidate — the shape `_agnosai_crew_pick_best_agent` answers in.
+fn _t_explained_pick(xa, roster, task): i64 {
+    var ex = agnosai_explain_selection_a(xa, roster, task);
+    if (vec_len(ex) == 0) { return 0; }
+    return vec_get(roster, agnosai_scored_index(vec_get(ex, 0)));
+}
+
+# `n` agents "v0".. whose complexity (low, medium, high), domain (quality,
+# devops, none, finance) and one tool (every fifth agent) all cycle, so scores
+# genuinely differ and the sort does real work.
+fn _t_varied_roster(n): i64 {
+    var v = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        var key = str_cat(str_from("v"), str_from_int(i));
+        var a = agnosai_agent_new(key, str_from("tester"), str_from("test things"));
+        agnosai_agent_with_name(a, key);
+        if (i % 5 == 0) {
+            var tools = vec_new();
+            vec_push(tools, str_from("hammer"));
+            agnosai_agent_with_tools(a, tools);
+        }
+        if (i % 3 == 0) { agnosai_agent_with_complexity(a, str_from("low")); }
+        if (i % 3 == 2) { agnosai_agent_with_complexity(a, str_from("high")); }
+        if (i % 4 == 0) { agnosai_agent_with_domain(a, str_from("quality")); }
+        if (i % 4 == 1) { agnosai_agent_with_domain(a, str_from("devops")); }
+        if (i % 4 == 3) { agnosai_agent_with_domain(a, str_from("finance")); }
+        vec_push(v, a);
+    }
     return v;
 }
 
@@ -178,6 +438,36 @@ fn main() {
     assert(str_eq(agnosai_agent_key(tied), str_from("agent-a")) == 1,
       "a tie goes to the earlier roster entry — Rust's sort_by is stable, and this is the property \
     the oracle's suite is structurally blind to");
+
+    # --- F7: an explanation's winner IS the runner's pick ---
+    # agnostic's plan route recomputes the explanation from the crew spec rather
+    # than recording it at run time, which is exact only while this holds. Same
+    # pointer, not just the same key: every fixture above, plus a varied roster
+    # past _vec_introsort's 16-element threshold.
+    var xa = arena_allocator(65536);
+    assert_eq(_t_explained_pick(xa, _t_roster(solo, 0, 0), _t_task("do it")), solo,
+      "a one-agent roster explains the agent the runner picks");
+    assert_eq(_t_explained_pick(xa, _t_roster(poor, good, 0), fitted), best_of_two,
+      "a mixed roster explains the runner's pick, the second agent");
+    assert_eq(_t_explained_pick(xa, _t_roster(tie_a, tie_b, 0), _t_task("bare")), tied,
+      "a tie explains the runner's pick, the first agent");
+    var varied = _t_varied_roster(20);
+    var varied_task = agnosai_task_new(str_from("ship the release"));
+    agnosai_task_with_context(varied_task, str_from("complexity"),
+      bayan_json_v_str_new(str_from("high")));
+    agnosai_task_with_context(varied_task, str_from("domain"),
+      bayan_json_v_str_new(str_from("devops")));
+    agnosai_task_with_context(varied_task, str_from("required_tools"), tools_req);
+    var varied_pick = _agnosai_crew_pick_best_agent(varied, varied_task);
+    assert_eq(_t_explained_pick(xa, varied, varied_task), varied_pick,
+      "twenty varied agents explain the runner's pick");
+    assert(str_eq(agnosai_agent_key(varied_pick), str_from("v5")) == 1,
+      "which is the first agent that is high, in devops and tooled — a winner the roster \
+    order alone would not give");
+    var empty_ex = agnosai_explain_selection_a(xa, vec_new(), fitted);
+    assert_eq(vec_len(empty_ex), 0, "an empty roster explains as no candidates");
+    assert_eq(_agnosai_crew_pick_best_agent(vec_new(), fitted), 0,
+      "matching the runner, which picks no agent");
 
     # =====================================================================
     # infer_provider — the default is OLLAMA, not OPENAI
@@ -544,15 +834,62 @@ fn main() {
       "the retry prompt REPLACES the user turn rather than being appended, which is what stops the \
     prompt growing exponentially across validation retries");
 
-    # --- the crew id for events comes from the task context, not the spec ---
+    # --- the STANDALONE crew id for events comes from the task context ---
+    # `agnosai_execute_task` outside a runner has no spec, so it keeps the
+    # oracle's fallback. A runner passes its spec id instead — ADR 022, below.
     assert(str_eq(_agnosai_crew_event_crew_id(rq_task), str_from("unknown")) == 1,
-      "a task with no crew_id in its context emits events under the literal \"unknown\" — the \
-    oracle reads task.context, NOT the crew spec's own id, and this reproduces that quirk");
+      "a STANDALONE task with no crew_id in its context emits under the literal \"unknown\" — the \
+    oracle's fallback, kept for a call outside a runner; a runner passes its spec id instead");
     var stamped = agnosai_task_new(str_from("t"));
     agnosai_task_with_context(stamped, str_from("crew_id"),
       bayan_json_v_str_new(str_from("crew-7")));
     assert(str_eq(_agnosai_crew_event_crew_id(stamped), str_from("crew-7")) == 1,
       "a stamped task uses its own crew id");
+
+    # --- the token event's crew id: a GIVEN id wins (ADR 022) ---
+    var tk_bus = agnosai_event_bus_new();
+    var tk_tx = agnosai_event_bus_sender(tk_bus, str_from("tk"));
+    var tk_sub = agnosai_event_sender_subscribe(tk_tx);
+    _agnosai_crew_emit_token(tk_tx, stamped, str_from("spec-9"), str_from("out"));
+    var tk_ev = agnosai_event_sub_try_recv(tk_sub);
+    assert(tk_ev != 0, "a token event is sent");
+    assert(str_eq(agnosai_crew_event_crew_id(tk_ev), str_from("spec-9")) == 1,
+      "a runner-supplied crew id WINS over the task context's crew_id — the event goes out on \
+    that crew's channel, and the context is client-supplied data that could name any crew");
+    _agnosai_crew_emit_token(tk_tx, stamped, 0, str_from("out"));
+    assert(str_eq(agnosai_crew_event_crew_id(agnosai_event_sub_try_recv(tk_sub)),
+        str_from("crew-7")) == 1, "with no crew id, the stamped context's id is used");
+    _agnosai_crew_emit_token(tk_tx, rq_task, 0, str_from("out"));
+    assert(str_eq(agnosai_crew_event_crew_id(agnosai_event_sub_try_recv(tk_sub)),
+        str_from("unknown")) == 1, "and with neither, the oracle's \"unknown\"");
+    assert_eq(_agnosai_crew_emit_token(0, rq_task, str_from("spec-9"), str_from("out")), 0,
+      "no sender is a no-op");
+
+    # The entry point a runner uses: `agnosai_execute_task_in_crew` carries the
+    # given crew id onto the token of an LLM-answered task, over the context's.
+    var ic_res = agnosai_execute_task_in_crew(stamped, 0, _t_stub_client(), tk_tx,
+      str_from("spec-9"), 0);
+    assert_eq(agnosai_task_result_status(ic_res), AGNOSAI_STATUS_COMPLETED,
+      "execute_task_in_crew answers through the stub");
+    var ic_ev = agnosai_event_sub_try_recv(tk_sub);
+    assert(ic_ev != 0 && str_eq_cstr(agnosai_crew_event_crew_id(ic_ev), "spec-9") == 1,
+      "and its token names the crew it was given, not the context's \"crew-7\"");
+    agnosai_execute_task(stamped, 0, _t_stub_client(), tk_tx);
+    var sa_ev = agnosai_event_sub_try_recv(tk_sub);
+    assert(sa_ev != 0 && str_eq_cstr(agnosai_crew_event_crew_id(sa_ev), "crew-7") == 1,
+      "while plain execute_task, outside a crew, keeps the oracle's context fallback");
+
+    # A parent span context changes nothing about the RESULT (ADR 023): it only
+    # parents spans, and with telemetry off — this suite's state — not even that.
+    var tp_parent = agnosai_otlp_span_context_parse(
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
+    var tr_task = agnosai_task_new(str_from("placeholder under a trace"));
+    var ph_plain = agnosai_execute_task(tr_task, 0, 0, 0);
+    var ph_traced = agnosai_execute_task_in_crew(tr_task, 0, 0, 0, 0, tp_parent);
+    assert(str_eq(agnosai_task_result_output(ph_traced), agnosai_task_result_output(ph_plain)) == 1,
+      "a traced placeholder answers the same output as execute_task");
+    assert_eq(agnosai_task_result_status(ph_traced), agnosai_task_result_status(ph_plain),
+      "and the same status");
 
     # --- the agent label ---
     assert(str_eq(_agnosai_crew_agent_label(0), str_from("unassigned")) == 1,
@@ -578,8 +915,10 @@ fn main() {
     var ok_resp = agnosai_hoosh_response_from_body(ok_body);
     var ok_r = agnosai_task_result_new(agnosai_task_id(rq_task), str_from("done"),
       AGNOSAI_STATUS_COMPLETED);
-    _agnosai_crew_success_metadata(ok_r, ok_resp, clock_now_ns());
+    _agnosai_crew_success_metadata(ok_r, ok_resp, clock_now_ns(), 0);
     var ok_md = agnosai_task_result_metadata(ok_r);
+    assert_eq(map_get(ok_md, str_from("agent")), 0,
+      "an UNASSIGNED task's success metadata carries no agent key");
     assert(map_get(ok_md, str_from("model")) != 0, "success metadata carries the model");
     assert(map_get(ok_md, str_from("tokens")) != 0, "the token breakdown");
     assert(map_get(ok_md, str_from("task_duration_ms")) != 0, "the duration");
@@ -598,13 +937,74 @@ fn main() {
     var old_r = agnosai_task_result_new(agnosai_task_id(rq_task), str_from("d"),
       AGNOSAI_STATUS_COMPLETED);
     _agnosai_crew_success_metadata(old_r, agnosai_hoosh_response_from_body(old_body),
-      clock_now_ns());
+      clock_now_ns(), 0);
     assert_eq(map_get(agnosai_task_result_metadata(old_r), str_from("cost_micro_usd")), 0,
       "an older gateway's response OMITS cost_micro_usd rather than publishing a fabricated 0 — a \
     real 0 means a free local inference, and the two must stay distinguishable");
     assert(str_eq(bayan_json_v_str(map_get(agnosai_task_result_metadata(old_r),
             str_from("provider"))), str_from("ollama")) == 1,
       "and the provider falls back to the model-name inference, which is what the oracle did");
+
+    # --- an ASSIGNED task's success metadata names its agent (ADR 022) ---
+    # The oracle's profile aggregates `agent_cost_usd` from `metadata["agent"]`
+    # and its success arm never wrote the key, so the map was always empty.
+    var ag_r = agnosai_task_result_new(agnosai_task_id(rq_task), str_from("done"),
+      AGNOSAI_STATUS_COMPLETED);
+    _agnosai_crew_success_metadata(ag_r, ok_resp, clock_now_ns(), _t_agent("writer"));
+    var ag_v = map_get(agnosai_task_result_metadata(ag_r), str_from("agent"));
+    assert(ag_v != 0 && bayan_json_v_is_str(ag_v) == 1,
+      "an assigned task's success metadata carries `agent`, as a string");
+    assert(ag_v != 0 && str_eq(bayan_json_v_str(ag_v), str_from("writer")) == 1,
+      "the agent's KEY");
+
+    # The profile SUMS per agent, over results built by hand: two tasks by one
+    # agent, 450 micro-USD each. The oracle's `+=` gives 900; a replacing
+    # recorder gives 450.
+    var bp_results = vec_new();
+    for (var bpi = 0; bpi < 2; bpi = bpi + 1) {
+        var bp_r = agnosai_task_result_new(agnosai_uuid_v4_str(), str_from("x"),
+          AGNOSAI_STATUS_COMPLETED);
+        agnosai_task_result_with_metadata(bp_r, str_from("cost_micro_usd"),
+          bayan_json_v_int_new(450));
+        agnosai_task_result_with_metadata(bp_r, str_from("agent"),
+          bayan_json_v_str_new(str_from("a1")));
+        vec_push(bp_results, bp_r);
+    }
+    var bp_prof = _agnosai_crew_build_profile(agnosai_crew_runner_new(_t_seq_spec()),
+      bp_results, 1);
+    assert_eq(map_get(agnosai_crew_profile_agent_cost(bp_prof), str_from("a1")), 900,
+      "build_profile charges an agent for ALL its tasks — 900, not the last task's 450");
+    assert_eq(agnosai_crew_profile_cost_micro_usd(bp_prof), 900, "and the crew total is 900");
+
+    # --- the LLM SUCCESS arm, end to end, through the stub gateway ---
+    # Unreachable offline before ADR 022's chat pointer: every assertion above
+    # builds the success metadata by hand, and none drives `agnosai_execute_task`
+    # down the arm a real gateway answer takes.
+    var llm_task = agnosai_task_new(str_from("answer me"));
+    var llm_res = agnosai_execute_task(llm_task, 0, _t_stub_client(), 0);
+    assert_eq(agnosai_task_result_status(llm_res), AGNOSAI_STATUS_COMPLETED,
+      "a task answered by the stub gateway COMPLETES — the success arm is reachable offline");
+    assert(str_eq(agnosai_task_result_output(llm_res), str_from("done")) == 1,
+      "with the gateway's content as its output, not the task description");
+    var llm_cost = map_get(agnosai_task_result_metadata(llm_res), str_from("cost_micro_usd"));
+    assert(llm_cost != 0 && bayan_json_v_int(llm_cost) == 450,
+      "and the gateway's cost on its metadata, so the call went through the client's pointer");
+
+    # ADR 020's filter on MODEL output — the half tests/orch_crew_runner.tcyr's
+    # output-filter block below used to admit no offline test could reach.
+    _t_stub_body = str_cat(str_cat(
+        str_from("{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":"),
+        str_from("\"the key is sk-ABCDEFGHIJKLMNOPQRST0123\"}}],")),
+      str_from("\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}"));
+    agnosai_output_redact_set_enabled(1);
+    var leak_res = agnosai_execute_task(agnosai_task_new(str_from("leak it")), 0,
+      _t_stub_client(), 0);
+    agnosai_output_redact_set_enabled(0);
+    _t_stub_body = 0;
+    assert(agnosai_str_contains_ci_cstr(agnosai_task_result_output(leak_res),
+        "sk-ABCDEFGHIJKLMNOPQRST0123") == 0,
+      "with redaction on, a key in the MODEL's answer is redacted on the LLM arm too");
+    assert(str_len(agnosai_task_result_output(leak_res)) > 0, "leaving the rest of the answer");
 
     # =====================================================================
     # the CrewRunner (bite 16)
@@ -715,6 +1115,92 @@ fn main() {
           agnosai_crew_runner_run(nd_runner, &run_err))), 6,
       "with no deadline a parallel crew still runs all six");
     assert_eq(agnosai_crew_runner_timed_out(nd_runner), 0, "and does not report a timeout");
+
+    # --- a timeout's crew_completed agrees with the stored state (ADR 022) ---
+    # The deadline is cooperative, so a timed-out runner still finishes. It used
+    # to compute its status from the partial results — COMPLETED when they all
+    # completed, including when there were NONE — and announce that, while the
+    # orchestrator stored FAILED afterwards. The runner now builds the oracle's
+    # timeout state itself, and announces that.
+    var to_seq = _t_crew("timeout-seq", 3, agnosai_process_sequential());
+    var to_seq_sub: i64[1];
+    var to_seq_r = agnosai_crew_runner_with_events(agnosai_crew_runner_new(to_seq),
+      _t_watch(to_seq, &to_seq_sub));
+    agnosai_crew_runner_set_deadline_ns(to_seq_r, 1);
+    store64(&run_err, 0);
+    var to_seq_state = agnosai_crew_runner_run(to_seq_r, &run_err);
+    assert_eq(agnosai_crew_state_status(to_seq_state), AGNOSAI_CREW_FAILED,
+      "a timed-out SEQUENTIAL crew's state is FAILED — COMPLETED here is the pre-ADR-022 bug");
+    assert_eq(vec_len(agnosai_crew_state_results(to_seq_state)), 0, "with no results");
+    assert_eq(agnosai_crew_state_profile(to_seq_state), 0, "and no profile — the oracle's shape");
+    var to_seq_done = _t_find(_t_drain(load64(&to_seq_sub)), "crew_completed");
+    assert(to_seq_done != 0, "it still closes with crew_completed");
+    assert(str_eq_cstr(_t_ev_str(to_seq_done, "status"), "failed") == 1,
+      "which says \"failed\", agreeing with the state — it said \"completed\" before ADR 022");
+    assert_eq(_t_ev_int(to_seq_done, "task_count"), 0, "with task_count 0, the state's count");
+
+    var to_par = _t_crew("timeout-par", 4, agnosai_process_parallel(2));
+    var to_par_sub: i64[1];
+    var to_par_r = agnosai_crew_runner_with_events(agnosai_crew_runner_new(to_par),
+      _t_watch(to_par, &to_par_sub));
+    agnosai_crew_runner_set_deadline_ns(to_par_r, 1);
+    var to_par_state = agnosai_crew_runner_run(to_par_r, &run_err);
+    assert_eq(agnosai_crew_state_status(to_par_state), AGNOSAI_CREW_FAILED,
+      "a timed-out PARALLEL crew is FAILED too");
+    assert_eq(vec_len(agnosai_crew_state_results(to_par_state)), 0, "with no results");
+    assert_eq(agnosai_crew_state_profile(to_par_state), 0, "and no profile");
+    var to_par_done = _t_find(_t_drain(load64(&to_par_sub)), "crew_completed");
+    assert(str_eq_cstr(_t_ev_str(to_par_done, "status"), "failed") == 1,
+      "and its crew_completed says \"failed\"");
+    assert_eq(_t_ev_int(to_par_done, "task_count"), 0, "with task_count 0");
+
+    # The control: the same crew with no deadline still announces "completed",
+    # so the assertions above are about the deadline and not a blanket FAILED.
+    var to_ok = _t_crew("timeout-ctl", 3, agnosai_process_sequential());
+    var to_ok_sub: i64[1];
+    var to_ok_state = agnosai_crew_runner_run(agnosai_crew_runner_with_events(
+        agnosai_crew_runner_new(to_ok), _t_watch(to_ok, &to_ok_sub)), &run_err);
+    assert_eq(agnosai_crew_state_status(to_ok_state), AGNOSAI_CREW_COMPLETED,
+      "with no deadline the crew completes");
+    var to_ok_done = _t_find(_t_drain(load64(&to_ok_sub)), "crew_completed");
+    assert(str_eq_cstr(_t_ev_str(to_ok_done, "status"), "completed") == 1,
+      "and says \"completed\"");
+    assert_eq(_t_ev_int(to_ok_done, "task_count"), 3, "counting all three results");
+
+    # A deadline that passes MID-RUN, after one task ran. The stub gateway moves
+    # the deadline into the past while answering task 1, so loop head 2 sees it.
+    # This is what separates "the state's count" from "the run's count" — with a
+    # deadline already past, both are 0 and a `vec_len(results)` mutant survives.
+    var mid = _t_crew("timeout-mid", 3, agnosai_process_sequential());
+    var mid_sub: i64[1];
+    var mid_r = agnosai_crew_runner_with_events(agnosai_crew_runner_with_llm(
+        agnosai_crew_runner_new(mid), agnosai_hoosh_client_with_chat(
+          agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")),
+          &_t_stub_chat_expire)), _t_watch(mid, &mid_sub));
+    var mid_m = agnosai_metrics_global();
+    var mid_done_before = agnosai_metrics_tasks_completed(mid_m);
+    _t_expire_runner = mid_r;
+    var mid_state = agnosai_crew_runner_run(mid_r, &run_err);
+    _t_expire_runner = 0;
+    assert_eq(agnosai_crew_runner_timed_out(mid_r), 1, "the mid-run deadline is observed");
+    assert_eq(agnosai_crew_state_status(mid_state), AGNOSAI_CREW_FAILED, "the crew is FAILED");
+    assert_eq(vec_len(agnosai_crew_state_results(mid_state)), 0,
+      "and its one PARTIAL result is discarded, as the oracle's timeout does");
+    assert_eq(agnosai_crew_state_profile(mid_state), 0, "with no profile");
+    var mid_evs = _t_drain(load64(&mid_sub));
+    assert_eq(_t_count(mid_evs, "task_completed"), 1,
+      "exactly one task ran before the deadline was seen — the fixture works as described");
+    assert_eq(_t_ev_int(_t_find(mid_evs, "crew_completed"), "task_count"), 0,
+      "crew_completed counts the STATE's results, 0 — not the run's 1 — so event and state agree");
+    assert(str_eq_cstr(_t_ev_str(_t_find(mid_evs, "crew_completed"), "status"), "failed") == 1,
+      "and says \"failed\" although every task that ran COMPLETED");
+    assert_eq(agnosai_metrics_tasks_completed(mid_m) - mid_done_before, 1,
+      "the task that ran is still COUNTED in the metrics — its tokens were spent");
+
+    # Timeout outranks cancel in the status ladder. The two coincide only if a
+    # cancel lands between the loop head that saw the deadline and the status
+    # read; the loop heads check cancel FIRST, so no suite can produce both
+    # deterministically. Stated rather than tested.
 
     # --- test_dag_execution_with_dependencies ---
     var dag_spec = agnosai_crew_new(str_from("dag"));
@@ -883,6 +1369,207 @@ fn main() {
     assert_eq(seen_task_started, 2, "one task_started per task");
     assert_eq(seen_completed, 1, "and a closing crew_completed");
 
+    # --- token events name their crew (ADR 022) ---
+    # Through the stub gateway, so the LLM success arm — the only arm that emits
+    # a `token` — runs. The runner passes its spec id down; before ADR 022 every
+    # one of these said "unknown", because nothing stamps the task context.
+    var tok_spec = _t_seq_spec();
+    var tok_sub: i64[1];
+    var tok_tx = _t_watch(tok_spec, &tok_sub);
+    store64(&run_err, 0);
+    agnosai_crew_runner_run(agnosai_crew_runner_with_events(_t_llm_runner(tok_spec), tok_tx),
+      &run_err);
+    var tok_evs = _t_drain(load64(&tok_sub));
+    assert_eq(_t_count(tok_evs, "token"), 2,
+      "a sequential crew of two LLM-answered tasks sends two token events");
+    assert_eq(_t_tokens_for(tok_evs, agnosai_crew_id(tok_spec)), 2,
+      "and BOTH carry the spec's crew id, like every other event the runner emits");
+
+    # --- agent cost, end to end through the stub gateway (ADR 022) ---
+    # One agent answers two tasks at 450 micro-USD each. Before ADR 022 nothing
+    # wrote `metadata["agent"]`, so `agent_cost_usd` was empty whatever ran.
+    var ac_spec = _t_seq_spec();
+    agnosai_crew_with_agents(ac_spec, _t_roster(_t_agent("solo"), 0, 0));
+    store64(&run_err, 0);
+    var ac_state = agnosai_crew_runner_run(_t_llm_runner(ac_spec), &run_err);
+    var ac_results = agnosai_crew_state_results(ac_state);
+    assert_eq(vec_len(ac_results), 2, "both tasks are answered");
+    var ac_named = 0;
+    for (var aci = 0; aci < vec_len(ac_results); aci = aci + 1) {
+        var ac_v = map_get(agnosai_task_result_metadata(vec_get(ac_results, aci)),
+          str_from("agent"));
+        if (ac_v != 0 && str_eq_cstr(bayan_json_v_str(ac_v), "solo") == 1) {
+            ac_named = ac_named + 1;
+        }
+    }
+    assert_eq(ac_named, 2, "each LLM-answered result names its agent, \"solo\"");
+    var ac_prof = agnosai_crew_state_profile(ac_state);
+    assert_eq(map_get(agnosai_crew_profile_agent_cost(ac_prof), str_from("solo")), 900,
+      "and the profile charges \"solo\" for BOTH tasks — 900; empty before ADR 022, 450 if the \
+    recorder replaced instead of summing");
+    assert_eq(map_size(agnosai_crew_profile_task_cost(ac_prof)), 2, "with a cost per task");
+    assert_eq(agnosai_crew_profile_cost_micro_usd(ac_prof), 900, "and a crew total of 900");
+
+    # --- wave events: started at dispatch, completed at join (ADR 022) ---
+    # The placeholder path, which is deterministic: 5 tasks at concurrency 2 run
+    # as batches of 2, 2 and 1. Before ADR 022 all five `task_started` went out
+    # before the first batch ran and all five `task_completed` after the last,
+    # so a watcher saw five tasks "running" at once.
+    var wv = _t_crew("wave-events", 5, agnosai_process_parallel(2));
+    var wv_sub: i64[1];
+    store64(&run_err, 0);
+    agnosai_crew_runner_run(agnosai_crew_runner_with_events(agnosai_crew_runner_new(wv),
+        _t_watch(wv, &wv_sub)), &run_err);
+    var wv_evs = _t_drain(load64(&wv_sub));
+    assert_eq(_t_count(wv_evs, "task_started"), 5, "five task_started");
+    assert_eq(_t_count(wv_evs, "task_completed"), 5, "and five task_completed");
+    assert_eq(_t_max_in_flight(wv_evs), 2,
+      "and never more than TWO tasks in flight — the concurrency limit; 5 before ADR 022");
+    assert_eq(_t_unpreceded(wv_evs, "task_completed", "task_started"), 0,
+      "every task_completed follows its own task_started");
+    assert(_t_is(vec_get(wv_evs, 0), "crew_started") == 1, "crew_started is first");
+    assert(_t_is(vec_get(wv_evs, vec_len(wv_evs) - 1), "crew_completed") == 1,
+      "and crew_completed last");
+
+    # A task stopped before dispatch is announced as NEITHER started nor
+    # completed — before ADR 022 all six were announced as started.
+    var wv_dl = _t_crew("wave-deadline", 6, agnosai_process_parallel(2));
+    var wv_dl_sub: i64[1];
+    var wv_dl_r = agnosai_crew_runner_with_events(agnosai_crew_runner_new(wv_dl),
+      _t_watch(wv_dl, &wv_dl_sub));
+    agnosai_crew_runner_set_deadline_ns(wv_dl_r, 1);
+    agnosai_crew_runner_run(wv_dl_r, &run_err);
+    var wv_dl_evs = _t_drain(load64(&wv_dl_sub));
+    assert_eq(_t_count(wv_dl_evs, "task_started"), 0,
+      "a parallel crew past its deadline announces NO task_started — six before ADR 022");
+    assert_eq(_t_count(wv_dl_evs, "task_completed"), 0, "and no task_completed");
+
+    # DAG A -> B: two waves of one, so each task finishes before the next starts.
+    var wd_spec = agnosai_crew_new(str_from("dag-events"));
+    var wd_a = agnosai_task_new(str_from("A"));
+    var wd_b = agnosai_task_new(str_from("B"));
+    agnosai_task_with_dependency(wd_b, agnosai_task_id(wd_a));
+    var wd_tasks = vec_new();
+    vec_push(wd_tasks, wd_b);
+    vec_push(wd_tasks, wd_a);
+    agnosai_crew_with_tasks(wd_spec, wd_tasks);
+    agnosai_crew_with_process(wd_spec, agnosai_process_dag());
+    var wd_sub: i64[1];
+    agnosai_crew_runner_run(agnosai_crew_runner_with_events(agnosai_crew_runner_new(wd_spec),
+        _t_watch(wd_spec, &wd_sub)), &run_err);
+    var wd_evs = _t_drain(load64(&wd_sub));
+    var wd_sa = _t_index_of(wd_evs, "task_started", agnosai_task_id(wd_a));
+    var wd_ca = _t_index_of(wd_evs, "task_completed", agnosai_task_id(wd_a));
+    var wd_sb = _t_index_of(wd_evs, "task_started", agnosai_task_id(wd_b));
+    var wd_cb = _t_index_of(wd_evs, "task_completed", agnosai_task_id(wd_b));
+    assert(wd_sa >= 0 && wd_sa < wd_ca, "DAG: started(A) precedes completed(A)");
+    assert(wd_ca < wd_sb, "completed(A) precedes started(B) — B's wave starts after A's ends");
+    assert(wd_sb < wd_cb, "and started(B) precedes completed(B)");
+
+    # --- workers send token events (ADR 022) ---
+    # Through the stub gateway. The oracle's workers passed no sender, so a
+    # parallel or DAG crew sent no `token` at all — this was 0.
+    var wt = _t_crew("wave-tokens", 4, agnosai_process_parallel(2));
+    var wt_sub: i64[1];
+    agnosai_crew_runner_run(agnosai_crew_runner_with_events(_t_llm_runner(wt),
+        _t_watch(wt, &wt_sub)), &run_err);
+    var wt_evs = _t_drain(load64(&wt_sub));
+    assert_eq(_t_count(wt_evs, "token"), 4,
+      "a parallel crew of four LLM-answered tasks sends four token events — 0 before ADR 022");
+    assert_eq(_t_tokens_for(wt_evs, agnosai_crew_id(wt)), 4, "each naming the spec's crew");
+    assert_eq(_t_tokens_late(wt_evs), 0,
+      "and each before its own task_completed — the worker sends it, the join reports after");
+    assert_eq(_t_max_in_flight(wt_evs), 2, "with the batches still bounded at two");
+
+    var wtd_spec = agnosai_crew_new(str_from("dag-tokens"));
+    var wtd_a = agnosai_task_new(str_from("A"));
+    var wtd_b = agnosai_task_new(str_from("B"));
+    agnosai_task_with_dependency(wtd_b, agnosai_task_id(wtd_a));
+    var wtd_tasks = vec_new();
+    vec_push(wtd_tasks, wtd_a);
+    vec_push(wtd_tasks, wtd_b);
+    agnosai_crew_with_tasks(wtd_spec, wtd_tasks);
+    agnosai_crew_with_process(wtd_spec, agnosai_process_dag());
+    var wtd_sub: i64[1];
+    agnosai_crew_runner_run(agnosai_crew_runner_with_events(_t_llm_runner(wtd_spec),
+        _t_watch(wtd_spec, &wtd_sub)), &run_err);
+    var wtd_evs = _t_drain(load64(&wtd_sub));
+    assert_eq(_t_tokens_for(wtd_evs, agnosai_crew_id(wtd_spec)), 2,
+      "a DAG crew A -> B sends two token events, naming its crew");
+
+    # --- task_completed goes out as ITS worker is joined, not at batch end ---
+    # One batch of two, where the second task's answer waits for the FIRST
+    # task's `task_completed`. The join walks dispatch order, so the runner
+    # joins the first worker and reports it while the second is still waiting,
+    # and the second then sees the event and answers. A runner that joined the
+    # whole batch before reporting any of it would block on the second worker
+    # while that worker waited for an event due only after its own join: the
+    # bounded wait runs out and `_t_peer_seen` says 2. The batch-granularity
+    # checks above pass either way — both shapes keep two tasks in flight.
+    var wj = agnosai_crew_new(str_from("wave-join"));
+    var wj_first = agnosai_task_new(str_from("answer at once"));
+    var wj_second = agnosai_task_new(str_from("await-peer"));
+    var wj_tasks = vec_new();
+    vec_push(wj_tasks, wj_first);
+    vec_push(wj_tasks, wj_second);
+    agnosai_crew_with_tasks(wj, wj_tasks);
+    agnosai_crew_with_process(wj, agnosai_process_parallel(2));
+    var wj_sub: i64[1];
+    var wj_tx = _t_watch(wj, &wj_sub);
+    _t_peer_sub = agnosai_event_sender_subscribe(wj_tx);
+    _t_peer_task = agnosai_task_id(wj_first);
+    _t_peer_seen = 0;
+    var wj_client = agnosai_hoosh_client_with_chat(
+      agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_t_stub_chat_peer);
+    var wj_state = agnosai_crew_runner_run(agnosai_crew_runner_with_events(
+        agnosai_crew_runner_with_llm(agnosai_crew_runner_new(wj), wj_client), wj_tx), &run_err);
+    assert_eq(_t_peer_seen, 1,
+      "the second task saw the first's task_completed while it was still running — 2 if \
+    completions waited for the whole batch to join");
+    assert_eq(vec_len(agnosai_crew_state_results(wj_state)), 2, "and both tasks answered");
+    var wj_evs = _t_drain(load64(&wj_sub));
+    var wj_c1 = _t_index_of(wj_evs, "task_completed", agnosai_task_id(wj_first));
+    var wj_c2 = _t_index_of(wj_evs, "task_completed", agnosai_task_id(wj_second));
+    assert(wj_c1 >= 0 && wj_c1 < wj_c2, "so the first task's completion precedes the second's");
+
+    # Nobody subscribed: the workers get no sender, so they build no payloads.
+    # A crew with a bus but no subscriber still completes normally.
+    var wq = _t_crew("wave-quiet", 3, agnosai_process_parallel(2));
+    var wq_tx = agnosai_event_bus_sender(agnosai_event_bus_new(), agnosai_crew_id(wq));
+    var wq_state = agnosai_crew_runner_run(agnosai_crew_runner_with_events(_t_llm_runner(wq),
+        wq_tx), &run_err);
+    assert_eq(vec_len(agnosai_crew_state_results(wq_state)), 3,
+      "an unwatched parallel LLM crew still answers every task");
+
+    # **An unwatched bus costs a wave exactly nothing.**
+    #
+    # The assertion above passes whether or not the wave's two gates exist, so
+    # this compares the same crew run with a bus nobody is subscribed to against
+    # a run with no bus at all, and requires the SAME byte count. A worker handed
+    # the sender anyway builds a `token` payload and event per task; an ungated
+    # `task_started` builds an event per dispatch. Either reaches nobody, and
+    # either makes the quiet run dearer than the bare one. The bare run is the
+    # baseline rather than a fixed byte count, so a payload changing shape does
+    # not need this re-calibrated.
+    #
+    # Exact rather than approximate: `alloc_used` sums request sizes, which no
+    # thread interleaving changes, and one warm-up pair absorbs first-use growth.
+    var wz_tx = agnosai_event_bus_sender(agnosai_event_bus_new(), str_from("wave-zero"));
+    _t_run_cost(_t_llm_runner(_t_crew("wz", 4, agnosai_process_parallel(2))));
+    _t_run_cost(agnosai_crew_runner_with_events(
+        _t_llm_runner(_t_crew("wz", 4, agnosai_process_parallel(2))), wz_tx));
+    var wz_bare = _t_run_cost(_t_llm_runner(_t_crew("wz", 4, agnosai_process_parallel(2))));
+    var wz_quiet = _t_run_cost(agnosai_crew_runner_with_events(
+        _t_llm_runner(_t_crew("wz", 4, agnosai_process_parallel(2))), wz_tx));
+    assert(wz_bare > 0, "the bare parallel run is measured at all");
+    assert_eq(wz_quiet, wz_bare,
+      "a parallel LLM crew allocates the same with an unwatched bus as with none");
+
+    var wzd_bare = _t_run_cost(_t_llm_runner(_t_crew("wzd", 3, agnosai_process_dag())));
+    var wzd_quiet = _t_run_cost(agnosai_crew_runner_with_events(
+        _t_llm_runner(_t_crew("wzd", 3, agnosai_process_dag())), wz_tx));
+    assert_eq(wzd_quiet, wzd_bare, "and so does a DAG crew, whose waves share the gates");
+
     # **A bus with nobody listening builds no payloads.**
     #
     # `_agnosai_crew_emit` already returned early with no bus attached, but the
@@ -932,9 +1619,20 @@ fn main() {
     # second by losing events the assertions above require). Un-guarding a
     # *single* one of the four emit sites does not: it raises `per_quiet` and
     # `per_listened` toward each other without crossing, and it is below this
-    # comparison's resolution. Catching that needs an absolute bound, which
-    # would have to be re-calibrated whenever a payload changes shape. Stated
-    # rather than left as a gap a reader would have to find by mutating.
+    # comparison's resolution.
+    #
+    # The exact comparison below catches that one, with the baseline the wave
+    # check above uses: a run with no bus at all, so no byte count has to be
+    # re-calibrated when a payload changes shape. It runs the PLACEHOLDER path.
+    # On the LLM path the sequential loop hands `agnosai_execute_task_in_crew`
+    # the sender whether or not anyone listens, so an answer's `token` payload
+    # is built for nobody, and the two runs differ by that much.
+    _t_run_cost(agnosai_crew_runner_new(_t_seq_spec()));
+    var sq_bare = _t_run_cost(agnosai_crew_runner_new(_t_seq_spec()));
+    var sq_quiet = _t_run_cost(agnosai_crew_runner_with_events(
+        agnosai_crew_runner_new(_t_seq_spec()), agnosai_event_bus_sender(q_bus, str_from("idle"))));
+    assert_eq(sq_quiet, sq_bare,
+      "a sequential crew allocates the same with an unwatched bus as with none");
 
     # --- audit ---
     var chain = agnosai_audit_chain_new();
@@ -987,15 +1685,15 @@ fn main() {
     # filter from `agnosai_execute_task` passed the whole suite: exactly the
     # "built, tested, never called" failure ADR 020 exists to end.
     #
-    # The no-client placeholder path is the offline-reachable arm; the LLM arm
-    # needs a gateway. A test process has no `setenv`, which is why the gate is a
-    # settable flag rather than a getenv.
+    # The no-client placeholder path is checked here; the LLM arm is checked
+    # through the stub gateway in the execute_task block above. A test process
+    # has no `setenv`, which is why the gate is a settable flag rather than a
+    # getenv.
     #
-    # ⚠ **Mutation coverage is PARTIAL and the gap is real.** Unwiring the filter
-    # from the placeholder path fails 2 assertions; unwiring it from the LLM path
-    # in `agnosai_execute_task` passes the entire suite, because nothing offline
-    # reaches it — the same limitation `_agnosai_otlp_post` carries. Read that
-    # call site rather than trusting this suite for the LLM half.
+    # ✅ **Both arms are now covered.** Until ADR 022 gave the hoosh client a chat
+    # pointer, unwiring the filter from the LLM path in `agnosai_execute_task`
+    # passed the entire suite, because nothing offline reached it. The stub
+    # gateway's leaky answer above is what closes that.
     agnosai_output_redact_set_enabled(1);
     assert_eq(agnosai_output_redact_enabled(), 1, "the gate flips");
     var of_leaky_task = agnosai_task_new(leaky);

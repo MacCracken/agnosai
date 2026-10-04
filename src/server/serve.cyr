@@ -415,6 +415,9 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
     var xff = 0;
     var xri = 0;
     var ctype = 0;
+    # The W3C trace context a caller sent (ADR 023). sandhi's lookup ignores
+    # case, so `traceparent` and `Traceparent` both arrive here.
+    var tp_s = 0;
     if (a != 0) {
         method_s = sandhi_server_get_method_a(a, buf, blen);
         path_s = sandhi_server_get_path_a(a, buf, blen);
@@ -422,6 +425,7 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
         xff = sandhi_server_find_header_a(a, buf, blen, "X-Forwarded-For");
         xri = sandhi_server_find_header_a(a, buf, blen, "X-Real-IP");
         ctype = sandhi_server_find_header_a(a, buf, blen, "Content-Type");
+        tp_s = sandhi_server_find_header_a(a, buf, blen, "traceparent");
     } else {
         method_s = sandhi_server_get_method(buf, blen);
         path_s = sandhi_server_get_path(buf, blen);
@@ -429,6 +433,14 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
         xff = sandhi_server_find_header(buf, blen, "X-Forwarded-For");
         xri = sandhi_server_find_header(buf, blen, "X-Real-IP");
         ctype = sandhi_server_find_header(buf, blen, "Content-Type");
+        tp_s = sandhi_server_find_header(buf, blen, "traceparent");
+    }
+    # A cstring, wrapped without copying the bytes. 0 when the header is absent;
+    # a malformed value is passed on as it is and becomes a new trace at the
+    # route, never an error here.
+    var traceparent = 0;
+    if (tp_s != 0) {
+        if (a != 0) { traceparent = str_from_a(a, tp_s); } else { traceparent = str_from(tp_s); }
     }
 
     # **sandhi's accessors return NUL-terminated cstrings, not `Str`.** Passing
@@ -550,8 +562,8 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
         }
     }
 
-    var resp = agnosai_route_dispatch_ct_a(a, _agnosai_serve_state, method, path,
-      auth_str, has_auth, body, agnosai_content_type_is_json(ctype));
+    var resp = agnosai_route_dispatch_tp_a(a, _agnosai_serve_state, method, path,
+      auth_str, has_auth, body, agnosai_content_type_is_json(ctype), traceparent);
 
     # The a2a callback, on the success path only — the oracle spawns it inside
     # the `Ok(crew_state)` arm.

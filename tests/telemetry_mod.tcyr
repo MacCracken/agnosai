@@ -482,7 +482,11 @@ fn main(): i64 {
     assert_eq(agnosai_telemetry_record_span(quiet, 1, 2, AGNOSAI_OTLP_STATUS_OK), 0,
       "recording a span with telemetry off queues nothing");
 
+    # ⚠ The oracle's OTLP branch uses the TEXT formatter, so init_tracing with
+    # an endpoint takes the JSON hook OFF — the half init_export must not do.
+    sakshi_set_emit_hook(&_agnosai_telemetry_json_hook);
     var g3 = agnosai_telemetry_init_tracing(str_from("http://localhost:4318"));
+    assert_eq(_sk_emit_hook, 0, "init_tracing with OTLP clears the JSON hook — text stderr");
     assert(agnosai_telemetry_exporter() != 0, "init_tracing installs the global");
     assert_eq(agnosai_telemetry_exporter(), agnosai_tracing_guard_exporter(g3),
       "and it is the same exporter the guard owns");
@@ -498,6 +502,99 @@ fn main(): i64 {
     assert_eq(agnosai_telemetry_exporter(), 0, "shutdown clears the global");
     assert_eq(agnosai_telemetry_record_span(quiet, 1, 2, AGNOSAI_OTLP_STATUS_OK), 0,
       "so a span created after shutdown queues nothing");
+
+    # --- export-only init (ADR 023) -----------------------------------------
+    # An in-process consumer owns its logging: agnostic installs its own JSON
+    # hook. `init_export` must start the exporter and leave sakshi exactly as
+    # it found it — level AND hook.
+    sakshi_set_level(SK_WARN);
+    sakshi_set_emit_hook(&_agnosai_telemetry_json_hook);
+    var hook_before = _sk_emit_hook;
+    var ge = agnosai_telemetry_init_export(str_from("http://localhost:4318"),
+      str_from("probe-svc"));
+    assert_eq(agnosai_tracing_guard_otel_active(ge), 1, "init_export starts OTLP export");
+    assert(agnosai_telemetry_exporter() != 0, "and installs the global exporter");
+    assert_eq(agnosai_telemetry_exporter(), agnosai_tracing_guard_exporter(ge),
+      "the guard's own");
+    assert(str_eq_cstr(agnosai_tracing_guard_service_name(ge), "probe-svc") == 1,
+      "under the caller's service name, not OTEL_SERVICE_NAME's");
+    assert_eq(sakshi_get_level(), SK_WARN, "the sakshi level is untouched");
+    assert_eq(_sk_emit_hook, hook_before, "and so is the emit hook");
+
+    # ⚠ A second init starts no second exporter: two threads would drain the
+    # same spans, and the first would leak with nothing left to stop it.
+    var ge2 = agnosai_telemetry_init_export(str_from("http://localhost:4318"),
+      str_from("other"));
+    assert_eq(agnosai_tracing_guard_exporter(ge2), agnosai_tracing_guard_exporter(ge),
+      "a second init_export reuses the running exporter");
+    assert_eq(agnosai_telemetry_exporter(), agnosai_tracing_guard_exporter(ge),
+      "and the global is the same pointer");
+    assert_eq(agnosai_tracing_guard_otel_active(ge2), 1, "its guard is live too");
+    var ge0 = agnosai_telemetry_init_export(0, str_from("x"));
+    assert_eq(agnosai_tracing_guard_otel_active(ge0), 0, "an endpoint of 0 starts nothing");
+    assert_eq(agnosai_tracing_guard_exporter(ge0), 0, "and holds no exporter");
+    sakshi_clear_emit_hook();
+    sakshi_set_level(SK_INFO);
+
+    # --- recording under a span context (ADR 023) ---------------------------
+    var ering = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
+    agnosai_otlp_ring_drain(ering, str_from("x"));
+    var tp = agnosai_otlp_span_context_parse(
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
+    var self_sc = agnosai_telemetry_span_ctx(tp);
+    assert(self_sc != 0, "with telemetry on, span_ctx mints a context");
+    assert_eq(agnosai_otlp_span_context_trace_hi(self_sc), 0x4bf92f3577b34da6,
+      "under the parent's trace");
+    assert_eq(agnosai_telemetry_record_span_in(quiet, self_sc, tp, 1, 2,
+        AGNOSAI_OTLP_STATUS_OK), 1, "record_span_in queues the span");
+    var rdoc = agnosai_otlp_ring_drain(ering, str_from("x"));
+    assert_eq(str_contains_cstr(rdoc, "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\""), 1,
+      "in the parent's trace");
+    assert_eq(str_contains_cstr(rdoc, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "as a child of the parent's span");
+    var sid = str_builder_new();
+    str_builder_add_cstr(sid, "\"spanId\":\"");
+    agnosai_otlp_add_span_id(sid, agnosai_otlp_span_context_span_id(self_sc));
+    str_builder_add_cstr(sid, "\"");
+    assert_eq(str_contains(rdoc, str_builder_build(sid)), 1,
+      "with its OWN context's span id — the one its children were given");
+
+    # The exporter came on mid-flight: no self context, so one is minted here.
+    agnosai_telemetry_record_span_in(quiet, 0, tp, 1, 2, AGNOSAI_OTLP_STATUS_OK);
+    var mdoc = agnosai_otlp_ring_drain(ering, str_from("x"));
+    assert_eq(str_contains_cstr(mdoc, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "a span with no context of its own is still the parent's child");
+    assert_eq(str_contains_cstr(mdoc, "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\""), 1,
+      "in the parent's trace");
+
+    # A root: no parentSpanId, and a span id that is not its trace id's half.
+    assert_eq(agnosai_telemetry_record_span(quiet, 1, 2, AGNOSAI_OTLP_STATUS_OK), 1,
+      "record_span queues a root");
+    var rootdoc = agnosai_otlp_ring_drain(ering, str_from("x"));
+    assert_eq(str_contains_cstr(rootdoc, "parentSpanId"), 0, "with no parentSpanId");
+    var ti = str_index_of_cstr(rootdoc, "\"traceId\":\"") + 11;
+    var si = str_index_of_cstr(rootdoc, "\"spanId\":\"") + 10;
+    assert_eq(memeq(str_data(rootdoc) + ti, str_data(rootdoc) + si, 16), 0,
+      "and its span id is NOT the first 16 hex digits of its trace id");
+
+    # ⚠ ParentBased sampling: an inbound `00` flags byte suppresses the span.
+    var unsampled = agnosai_otlp_span_context_parse(
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"));
+    assert_eq(agnosai_telemetry_record_span_in(quiet, agnosai_telemetry_span_ctx(unsampled),
+        unsampled, 1, 2, AGNOSAI_OTLP_STATUS_OK), 0, "an unsampled parent's child is not queued");
+    assert_eq(agnosai_telemetry_record_span_in(quiet, 0, unsampled, 1, 2,
+        AGNOSAI_OTLP_STATUS_OK), 0, "nor one minted for it mid-flight");
+    assert_eq(agnosai_otlp_ring_count(ering), 0, "the ring holds nothing");
+    assert_eq(agnosai_telemetry_record_span_in(0, self_sc, tp, 1, 2, AGNOSAI_OTLP_STATUS_OK), 0,
+      "and span 0 — a site that started with telemetry off — records nothing");
+
+    agnosai_telemetry_shutdown(ge);
+    assert_eq(agnosai_telemetry_exporter(), 0, "shutdown of either guard clears the global");
+    # With telemetry off a context costs nothing and a record does nothing.
+    assert_eq(agnosai_telemetry_span_ctx(tp), 0, "span_ctx answers 0 with telemetry off");
+    assert_eq(agnosai_telemetry_span_ctx(0), 0, "for a root too");
+    assert_eq(agnosai_telemetry_record_span_in(quiet, self_sc, tp, 1, 2,
+        AGNOSAI_OTLP_STATUS_OK), 0, "and record_span_in queues nothing");
 
     # --- status folding ------------------------------------------------------
     assert_eq(agnosai_telemetry_status_of(1), AGNOSAI_OTLP_STATUS_OK, "1 folds to OK");

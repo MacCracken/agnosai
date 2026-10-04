@@ -501,12 +501,14 @@ fn agnosai_route_needs_auth(id): i64 {
 # with what the request's `Content-Type` actually said.
 fn agnosai_route_dispatch_a(a, state, method, path: Str, auth_header: Str, has_auth,
   body: Str): i64 {
-    return _agnosai_route_dispatch_inner(a, state, method, path, auth_header, has_auth, body, 1);
+    return _agnosai_route_dispatch_inner(a, state, method, path, auth_header, has_auth, body, 1,
+      0);
 }
 
 # Global-allocator form of `agnosai_route_dispatch_a`.
 fn agnosai_route_dispatch(state, method, path: Str, auth_header: Str, has_auth, body: Str): i64 {
-    return _agnosai_route_dispatch_inner(0, state, method, path, auth_header, has_auth, body, 1);
+    return _agnosai_route_dispatch_inner(0, state, method, path, auth_header, has_auth, body, 1,
+      0);
 }
 
 # Dispatch with the request's `Content-Type` verdict: `json_ct` is 1 when it
@@ -515,7 +517,20 @@ fn agnosai_route_dispatch(state, method, path: Str, auth_header: Str, has_auth, 
 fn agnosai_route_dispatch_ct_a(a, state, method, path: Str, auth_header: Str, has_auth,
   body: Str, json_ct): i64 {
     return _agnosai_route_dispatch_inner(a, state, method, path, auth_header, has_auth, body,
-      json_ct);
+      json_ct, 0);
+}
+
+# `agnosai_route_dispatch_ct_a` plus the request's `traceparent` header, or 0
+# when it carried none (ADR 023). The transport calls this one.
+#
+# Three routes start traced work and hand it on: `POST /api/v1/crews`,
+# `POST /api/v1/a2a/receive` and `/mcp`'s `tools/call`. Every other route
+# ignores it, and no route's response depends on it — a malformed header is
+# never a 4xx, the work simply starts a new trace.
+fn agnosai_route_dispatch_tp_a(a, state, method, path: Str, auth_header: Str, has_auth,
+  body: Str, json_ct, traceparent: Str): i64 {
+    return _agnosai_route_dispatch_inner(a, state, method, path, auth_header, has_auth, body,
+      json_ct, traceparent);
 }
 
 # The routes whose handler parses a JSON request body.
@@ -528,7 +543,7 @@ fn _agnosai_route_takes_json(id): i64 {
 }
 
 fn _agnosai_route_dispatch_inner(a, state, method, path: Str, auth_header: Str, has_auth,
-  body: Str, json_ct): i64 {
+  body: Str, json_ct, tp: Str): i64 {
     # `a` of 0 means "no per-request arena" and every allocation below falls
     # back to the global bump — the un-threaded caller's path, kept working
     # rather than made a special case at each site.
@@ -566,13 +581,11 @@ fn _agnosai_route_dispatch_inner(a, state, method, path: Str, auth_header: Str, 
     if (id == AGN_ROUTE_HEALTH) { return agnosai_route_health(); }
     if (id == AGN_ROUTE_READY) { return agnosai_route_ready(); }
     if (id == AGN_ROUTE_METRICS) { return agnosai_route_metrics(); }
-    if (id == AGN_ROUTE_MCP) {
-        if (a != 0) { return agnosai_route_mcp_a(a, state, body); }
-        return agnosai_route_mcp(state, body);
-    }
+    # The three traced routes take `al`, which is `default_alloc()` when there
+    # is no request arena — exactly what each bare form passes its `_a` form.
+    if (id == AGN_ROUTE_MCP) { return agnosai_route_mcp_tp_a(al, state, body, tp); }
     if (id == AGN_ROUTE_CREATE_CREW) {
-        if (a != 0) { return agnosai_route_create_crew_a(a, state, body); }
-        return agnosai_route_create_crew(state, body);
+        return agnosai_route_create_crew_tp_a(al, state, body, tp);
     }
     if (id == AGN_ROUTE_GET_CREW) {
         if (a != 0) { return agnosai_route_get_crew_a(a, state, param); }
@@ -580,8 +593,7 @@ fn _agnosai_route_dispatch_inner(a, state, method, path: Str, auth_header: Str, 
     }
     if (id == AGN_ROUTE_CANCEL_CREW) { return agnosai_route_cancel_crew(state, param); }
     if (id == AGN_ROUTE_A2A_RECEIVE) {
-        if (a != 0) { return agnosai_route_a2a_receive_a(a, state, body); }
-        return agnosai_route_a2a_receive(state, body);
+        return agnosai_route_a2a_receive_tp_a(al, state, body, tp);
     }
     if (id == AGN_ROUTE_A2A_STATUS) { return agnosai_route_a2a_status(); }
     if (id == AGN_ROUTE_LIST_DEFINITIONS) {

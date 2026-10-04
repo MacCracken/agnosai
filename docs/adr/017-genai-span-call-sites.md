@@ -2,6 +2,17 @@
 
 ## Status: Accepted (2026-08-10)
 
+**Amended by [ADR 023](023-genai-semconv-spans-and-w3c-trace-context.md)
+(accepted 2026-10-04, shipped in 2.1.5).** The decision to call the helpers at the call
+sites stands. 023 supersedes this record's span vocabulary (the table below:
+`gen_ai.invoke_agent` on the chat call becomes `chat {model}`, the crew span
+becomes `invoke_workflow {crew}` with an operation name, and a per-task
+`invoke_agent` span is added) and its "identity is minted per span" decision —
+point 2 below and the Re-check's *Identity is still minted per span* bullet.
+Spans are now linked parent to child under one trace, and join an inbound W3C
+`traceparent`. The table and the Re-check are kept as written: they are the
+historical record.
+
 ## Context
 
 `rust-old/src/telemetry/genai.rs` defines four span helpers — `inference_span`,

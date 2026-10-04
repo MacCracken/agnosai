@@ -165,6 +165,53 @@ fn _t_receive_success(): i64 {
     return 0;
 }
 
+# ADR 023 — a delegation joins the delegating system's trace. With `tp` 0 or
+# any value, the response is what `agnosai_route_a2a_receive_a` answers; only
+# the crew's spans change.
+fn _t_receive_traced(): i64 {
+    var a = default_alloc();
+    var tp = str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    var r0 = agnosai_route_a2a_receive_a(a, _t_state(), _t_req_body(""));
+    var r1 = agnosai_route_a2a_receive_tp_a(a, _t_state(), _t_req_body(""), tp);
+    assert_eq(agnosai_route_status(r1), agnosai_route_status(r0), "the same status");
+    assert(str_eq(_t_body_str(r1, "status"), _t_body_str(r0, "status")) == 1,
+      "the same A2A status");
+    var b0 = agnosai_route_body(r0);
+    var b1 = agnosai_route_body(r1);
+    assert_eq(bayan_json_v_obj_len(b1), bayan_json_v_obj_len(b0), "the same four fields");
+    var o0 = bayan_json_v_obj_get_by_cstr(bayan_json_v_arr_get(bayan_json_v_obj_get_by_cstr(
+          bayan_json_v_obj_get_by_cstr(b0, "result"), "tasks"), 0), "output");
+    var o1 = bayan_json_v_obj_get_by_cstr(bayan_json_v_arr_get(bayan_json_v_obj_get_by_cstr(
+          bayan_json_v_obj_get_by_cstr(b1, "result"), "tasks"), 0), "output");
+    assert(str_eq(bayan_json_v_str(o1), bayan_json_v_str(o0)) == 1, "and the same output");
+    # A rejected delegation is rejected the same way.
+    var long = _t_str_of(AGNOSAI_A2A_MAX_STRING_LEN + 1, 120);
+    var lb = str_builder_new();
+    str_builder_add_cstr(lb, "{\"task_id\":\"t1\",\"description\":\"");
+    str_builder_add(lb, long);
+    str_builder_add_cstr(lb, "\"}");
+    var lbody = str_builder_build(lb);
+    assert_eq(agnosai_route_status(agnosai_route_a2a_receive_tp_a(a, _t_state(), lbody, tp)),
+      agnosai_route_status(agnosai_route_a2a_receive_a(a, _t_state(), lbody)),
+      "an over-long field is the same 400 with or without a traceparent");
+
+    var g = agnosai_telemetry_init_export(str_from("http://127.0.0.1:1"), str_from("a2a-probe"));
+    var ring = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
+    agnosai_otlp_ring_drain(ring, str_from("x"));
+    var rt = agnosai_route_a2a_receive_tp_a(a, _t_state(), _t_req_body(""), tp);
+    assert(agnosai_route_status(rt) == HTTP_OK, "a traced delegation is 200");
+    var doc = agnosai_otlp_ring_drain(ring, str_from("x"));
+    assert(doc != 0, "and exports its crew's spans");
+    assert_eq(str_contains_cstr(doc, "\"name\":\"invoke_workflow a2a-general-t1\""), 1,
+      "the delegated crew's workflow span");
+    assert_eq(str_contains_cstr(doc, "\"parentSpanId\":\"00f067aa0ba902b7\""), 1,
+      "is the delegating system's span's child");
+    assert(str_index_of_cstr(doc, "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\"") >= 0,
+      "in the delegating system's trace");
+    agnosai_telemetry_shutdown(g);
+    return 0;
+}
+
 # The failure arms return the full A2AResponse shape, not the routes tier's
 # `{"error": ..}` — the oracle types this handler `(StatusCode, Json<A2AResponse>)`.
 fn _t_receive_field_too_long(): i64 {
@@ -440,6 +487,7 @@ fn main(): i64 {
 
     _t_a2a_req_takes_an_allocator();
     _t_a2a_retained_state_survives_its_arena();
+    _t_receive_traced();
 
     return assert_summary();
 }

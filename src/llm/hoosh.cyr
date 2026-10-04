@@ -646,17 +646,58 @@ fn agnosai_hoosh_headers(api_key: Str): i64 {
     return h;
 }
 
-# Close an inference span and hand it to the exporter. `ok` is 1 for success.
+# Close a chat span and hand it to the exporter. `ok` is 1 for success, and
+# `err_type` is the `error.type` of a failure, or 0.
 #
-# One helper rather than the same three lines on five exit paths — and it keeps
-# the clock read next to the record, so a path that forgets to stop the timer
-# cannot report a bogus duration.
-fn _agnosai_hoosh_span_done(span, t0, ok): i64 {
-    return agnosai_telemetry_record_span(span, t0, clock_epoch_ns(),
+# One helper rather than the same lines on five exit paths — and it keeps the
+# clock read next to the record, so a path that forgets to stop the timer
+# cannot report a bogus duration. `span` is 0 with telemetry off, and then
+# this records nothing.
+fn _agnosai_hoosh_span_done(span, self_sc, parent_sc, t0, ok, err_type): i64 {
+    if (span == 0) { return 0; }
+    if (err_type != 0) { agnosai_genai_span_set_error_type(span, err_type); }
+    return agnosai_telemetry_record_span_in(span, self_sc, parent_sc, t0, clock_epoch_ns(),
       agnosai_telemetry_status_of(ok));
 }
 
+# An `error.type` from a cstring, or 0 when there is no span to carry it — so
+# a failure with telemetry off allocates nothing it would throw away.
+fn _agnosai_hoosh_error_type(span, name): i64 {
+    if (span == 0) { return 0; }
+    return str_from(name);
+}
+
+# A transport failure's `error.type`: sandhi's error-kind name LOWERCASED —
+# `connect`, `tls`, `timeout`, `protocol` (ADR 023).
+#
+# ⚠ sandhi spells its kinds in capitals, and every other value agnosai emits is
+# lowercase, the workflow's `timeout` among them. Sent as-is, a backend grouping
+# by `error.type` would count `timeout` and `TIMEOUT` as two classes. Lowered
+# only for a span that will be recorded, so telemetry off allocates nothing.
+fn _agnosai_hoosh_kind_error_type(span, kind): i64 {
+    if (span == 0) { return 0; }
+    return str_from(str_lower_cstr(sandhi_err_kind_name(kind)));
+}
+
+# A failed HTTP status as its `error.type`: the decimal status, `"503"`, which
+# is the spec's own example of a low-cardinality error class. Built only for a
+# span that will be recorded.
+fn _agnosai_hoosh_status_error_type(span, status): i64 {
+    if (span == 0) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add_int(sb, status);
+    return str_builder_build(sb);
+}
+
 # POST a chat-completions request to the gateway. **The one I/O call here.**
+#
+# `agnosai_hoosh_chat_in` with no parent span: the chat span, when telemetry is
+# on, is the root of its own trace.
+fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
+    return agnosai_hoosh_chat_in(base_url, api_key, request, out_response, 0);
+}
+
+# POST a chat-completions request to the gateway, as a child of `parent_sc`.
 #
 # Returns 0 on success, having written the InferenceResponse to `out_response`.
 # On failure returns an error-message Str — the same contract llm_retry's driver
@@ -666,22 +707,32 @@ fn _agnosai_hoosh_span_done(span, t0, ok): i64 {
 # `error.message` where present, because `agnosai_is_retryable` classifies on
 # that text: a bare "request failed" would make a 503 look non-retryable.
 #
-# Records a GenAI inference span around the whole round trip — ADR 017, and the
-# reasoning is at the top of the body.
-fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
+# Records a GenAI `chat` span around the whole round trip (ADR 017, ADR 023).
+# `parent_sc` is the calling task's span context — the crew runner passes its
+# `invoke_agent` span's — or 0 for a root span.
+#
+# ⚠ **No outbound `traceparent` header.** hoosh 2.7.1 honours one, but exports
+# its own span with the inbound parent-id as its spanId, which would duplicate
+# this chat span's id inside one trace. It waits on a hoosh fix (roadmap,
+# *Upstream*), then hoosh's server span can be this span's child.
+fn agnosai_hoosh_chat_in(base_url: Str, api_key: Str, request, out_response, parent_sc): i64 {
     # ADR 017 — the oracle defines the GenAI span helpers and never calls them;
     # this port must, or the OTLP exporter has no producers. Built before the
     # request goes out so `start_ns` covers the whole round trip, and handed to
-    # `agnosai_telemetry_record_span` on every exit path below.
+    # the recorder on every exit path below.
     #
-    # ⚠ Costs one `alloc` and a dozen stores when telemetry is OFF, and nothing
-    # else — `record_span` returns immediately with no exporter. It is not
-    # guarded by a `telemetry_exporter() != 0` check here because the span has to
-    # exist before the branch that would need it, and the branch would then have
-    # to be repeated on all five exit paths.
-    var _span = agnosai_genai_inference_span(agnosai_inference_request_model(request),
-      str_from("hoosh"), str_from(""), str_from(""));
-    var _t0 = clock_epoch_ns();
+    # ⚠ Built ONLY when the exporter is on (ADR 023). With telemetry off the
+    # span is 0, nothing is allocated, no random bytes are drawn, the clock is
+    # not read, and `_agnosai_hoosh_span_done` returns at once on all five exits.
+    var _span = 0;
+    var _self = 0;
+    var _t0 = 0;
+    if (agnosai_telemetry_exporter() != 0) {
+        _span = agnosai_genai_chat_span(agnosai_inference_request_model(request),
+          str_from("hoosh"));
+        _self = agnosai_telemetry_span_ctx(parent_sc);
+        _t0 = clock_epoch_ns();
+    }
 
     var url = agnosai_hoosh_endpoint(base_url);
     var headers = agnosai_hoosh_headers(api_key);
@@ -689,7 +740,8 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
 
     var r = sandhi_http_post(str_cstr(url), headers, str_data(body), str_len(body));
     if (r == 0) {
-        _agnosai_hoosh_span_done(_span, _t0, 0);
+        _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
+          _agnosai_hoosh_error_type(_span, "no_response"));
         return str_from("hoosh transport error: no response allocated");
     }
     var kind = sandhi_http_err_kind(r);
@@ -700,7 +752,8 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
         str_builder_add_cstr(sb, " (");
         str_builder_add(sb, url);
         str_builder_add_cstr(sb, ")");
-        _agnosai_hoosh_span_done(_span, _t0, 0);
+        _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
+          _agnosai_hoosh_kind_error_type(_span, kind));
         return str_builder_build(sb);
     }
 
@@ -716,13 +769,15 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
             str_builder_add_cstr(esb, ": ");
             str_builder_add(esb, detail);
         }
-        _agnosai_hoosh_span_done(_span, _t0, 0);
+        _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
+          _agnosai_hoosh_status_error_type(_span, status));
         return str_builder_build(esb);
     }
 
     var parsed = agnosai_hoosh_response_from_body(resp_body);
     if (parsed == 0) {
-        _agnosai_hoosh_span_done(_span, _t0, 0);
+        _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
+          _agnosai_hoosh_error_type(_span, "invalid_response"));
         return str_from("hoosh returned a body with no choices[0].message.content");
     }
 
@@ -740,7 +795,7 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
     agnosai_genai_record_usage(_span, agnosai_inference_response_prompt_tokens(parsed),
       agnosai_inference_response_completion_tokens(parsed),
       agnosai_inference_response_model(parsed));
-    _agnosai_hoosh_span_done(_span, _t0, 1);
+    _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 1, 0);
 
     store64(out_response, parsed);
     return 0;
@@ -753,10 +808,28 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
 # absence of. This is the minimum that shape requires: hoosh's own client is a
 # provider registry, a cache and a cost tracker, all of which live on the far
 # side of the HTTP seam here.
+#
+# `AGN_HC_CHAT_FP` is the chat call the crew runner makes through this client —
+# see `agnosai_hoosh_client_with_chat` for why it is a pointer.
 enum AgnosaiHooshClientOff {
     AGN_HC_BASE_URL = 0;
     AGN_HC_API_KEY = 8;
-    AGN_HC_SIZE = 16;
+    AGN_HC_CHAT_FP = 16;
+    AGN_HC_SIZE = 24;
+}
+
+# The live chat call — every client's default `AGN_HC_CHAT_FP`.
+#
+# `fn(client, request, out_response, parent_sc) -> i64`: 0 on success with the
+# response stored through `out_response`, otherwise the error Str. That is
+# `agnosai_hoosh_chat_in`'s contract with the client's two fields folded in.
+# `parent_sc` is the calling task's span context, or 0 (ADR 023) — a suite's
+# stub receives it too, which is how the threading is tested offline.
+# Defined here, ahead of the constructor that takes its address, and reads the
+# fields directly because the accessors below are not defined yet.
+fn _agnosai_hoosh_client_chat_live(client, request, out_response, parent_sc): i64 {
+    return agnosai_hoosh_chat_in(load64(client + AGN_HC_BASE_URL),
+      load64(client + AGN_HC_API_KEY), request, out_response, parent_sc);
 }
 
 # Create a client over a base URL and an API key. Pass `str_from("")` for the
@@ -765,6 +838,7 @@ fn agnosai_hoosh_client_new(base_url: Str, api_key: Str): i64 {
     var c = alloc(AGN_HC_SIZE);
     store64(c + AGN_HC_BASE_URL, base_url);
     store64(c + AGN_HC_API_KEY, api_key);
+    store64(c + AGN_HC_CHAT_FP, &_agnosai_hoosh_client_chat_live);
     return c;
 }
 
@@ -776,4 +850,31 @@ fn agnosai_hoosh_client_base_url(c): i64 {
 # The client's API key.
 fn agnosai_hoosh_client_api_key(c): i64 {
     return load64(c + AGN_HC_API_KEY);
+}
+
+# The client's chat call — `_agnosai_hoosh_client_chat_live` unless a suite
+# swapped it.
+fn agnosai_hoosh_client_chat_fp(c): i64 {
+    return load64(c + AGN_HC_CHAT_FP);
+}
+
+# Replace the client's chat call. Returns the client. **Called only by suites.**
+#
+# ⚠ **The transport is a function pointer for the reason
+# `llm/inference_queue.cyr`'s and `tools/agnos.cyr`'s are.** The crew runner's
+# LLM success arm needs a gateway that answers, so with the call hard-wired the
+# only arm reachable offline was the failure one — and a mutant could unwire
+# anything that happens only on success (the `token` event, the result's
+# `agent` metadata, ADR 020's output filter) and still pass every assertion.
+# ADR 022 records the change that needed this.
+#
+# Nothing is injected in production: `agnosai_hoosh_client_new` stores the live
+# call, and there is no settable global to get out of step.
+#
+# `chat_fp` is `fn(client, request, out_response, parent_sc) -> i64`, the live
+# call's contract. ⚠ The fourth argument arrived with ADR 023 — a stub written
+# for B17's three-argument form must take it too.
+fn agnosai_hoosh_client_with_chat(c, chat_fp): i64 {
+    store64(c + AGN_HC_CHAT_FP, chat_fp);
+    return c;
 }

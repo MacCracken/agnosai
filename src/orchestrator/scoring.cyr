@@ -24,6 +24,25 @@
 # oracle's arithmetic is genuinely fractional and no integer carrier would be
 # exact. Weight sums, ratios and the 1/3 complexity step are all reproduced in
 # f64 for that reason.
+#
+# ## Explaining a selection
+#
+# The oracle folds the five component scores into one f64 and keeps nothing
+# else, and so did this module until roadmap F7. `agnosai_explain_selection_a`
+# returns the components beside each total, in rank order, and
+# `agnosai_selection_to_value_a` / `agnosai_selection_scorer_to_value_a` render
+# them, so a consumer (agnostic's plan route) never hardcodes a factor name.
+# Library only: no route serves it, so the REST, MCP and A2A wire is unchanged.
+#
+# ⚠ **An explanation is recomputed, never recorded.** The crew runner keeps only
+# the winning agent, and keeping every breakdown would cost every crew run up to
+# agents × tasks entries on the global bump, asked for or not. Recomputing is
+# exact because selection is a pure function of (roster, task): no code writes
+# a task's context or an agent definition once a crew is built, and the runner
+# only stamps task status. Three planned changes would break that, and each must
+# then record the selection on the run instead: **F2** (hierarchical delegation,
+# whose empty roster goes to the manager), **learning-driven selection**, and a
+# **stateful bhava personality**.
 # =========================================================================
 
 # The oracle's five weights. They sum to exactly 1.0.
@@ -50,6 +69,19 @@ fn agnosai_weight_domain(): i64 {
 fn agnosai_weight_personality(): i64 {
     return f64_div(f64_from(15), f64_from(100));
 }
+
+# The task-context keys the scorer reads, minted once at startup.
+#
+# Each component used to `str_from` its key on every call (complexity its
+# "medium" default too), and the domain compare copied the task's domain into a
+# C string: up to six global allocations per agent scored, which nothing freed.
+# These are read-only `map_get` probes, so a process-lifetime `Str` is all they
+# need — the `core/json.cyr` hoisting rule, applied because this is the crew
+# runner's per-task path (`benches/orch.bcyr` `score_agent_*`, `rank_agents_*`).
+var AGN_JK_REQUIRED_TOOLS = str_from("required_tools");
+var AGN_JK_COMPLEXITY = str_from("complexity");
+var AGN_JK_GPU_REQUIRED = str_from("gpu_required");
+var AGN_JK_DOMAIN = str_from("domain");
 
 # Case-insensitive ASCII compare of a Str against a C string — the oracle's
 # `eq_ignore_ascii_case`.
@@ -102,24 +134,44 @@ fn _agnosai_scoring_warn_tools(): i64 {
 # "Malformed" means any element that is not a string, matching serde's
 # all-or-nothing `Vec<String>` decode — a single number in the array rejects the
 # whole list rather than skipping that entry.
+#
+# The entries are borrowed from the task context, not copied; only the vec
+# itself is allocated, on the global bump. `agnosai_explain_selection_a` builds
+# the same vec in its caller's allocator through the private form below.
 fn agnosai_extract_required_tools(task): i64 {
+    var out = _agnosai_extract_required_tools_a(default_alloc(), task);
+    # -1 means the global bump failed, which is mmap failing. The port's bare
+    # forms answer 0 there throughout (`core/json.cyr`'s are the pattern).
+    if (out < 0) { return 0; }
+    return out;
+}
+
+# The body of `agnosai_extract_required_tools`, allocating the vec through `a`.
+#
+# ⚠ **Private because it has a third answer: -1 when `a` is exhausted.** A public
+# `_a` form would have to fold that into 0, and 0 here means "no requirement",
+# which scores every agent full coverage. An explanation built on an exhausted
+# arena would then report scores the runner never computed. The one caller that
+# needs an allocator, `agnosai_explain_selection_a`, fails whole on -1 instead.
+fn _agnosai_extract_required_tools_a(a, task): i64 {
     var ctx = agnosai_task_context(task);
     if (ctx == 0) { return 0; }
-    var val = map_get(ctx, str_from("required_tools"));
+    var val = map_get(ctx, AGN_JK_REQUIRED_TOOLS);
     if (val == 0) { return 0; }
     if (bayan_json_v_is_arr(val) == 0) {
         _agnosai_scoring_warn_tools();
         return 0;
     }
 
-    var out = vec_new();
+    var out = vec_new_a(a);
+    if (out == 0) { return 0 - 1; }
     for (var i = 0; i < bayan_json_v_arr_len(val); i = i + 1) {
         var e = bayan_json_v_arr_get(val, i);
         if (e == 0 || bayan_json_v_is_str(e) == 0) {
             _agnosai_scoring_warn_tools();
             return 0;
         }
-        vec_push(out, bayan_json_v_str(e));
+        if (vec_push_a(a, out, bayan_json_v_str(e)) < 0) { return 0 - 1; }
     }
     return out;
 }
@@ -152,11 +204,12 @@ fn agnosai_tool_coverage_score(agent, required): i64 {
 # A missing `complexity` in the task context defaults to "medium", so an agent
 # declared "medium" scores a full 1.0 against a task that says nothing.
 fn agnosai_complexity_score(agent, task): i64 {
-    # i64, not the Str `str_from` would infer: `bayan_json_v_str` below returns an untyped i64.
-    var task_complexity: i64 = str_from("medium");
+    # i64, not the Str the global's `str_from` would infer: `bayan_json_v_str`
+    # below returns an untyped i64.
+    var task_complexity: i64 = AGN_JV_MEDIUM;
     var ctx = agnosai_task_context(task);
     if (ctx != 0) {
-        var v = map_get(ctx, str_from("complexity"));
+        var v = map_get(ctx, AGN_JK_COMPLEXITY);
         if (v != 0 && bayan_json_v_is_str(v) == 1) { task_complexity = bayan_json_v_str(v); }
     }
 
@@ -175,7 +228,7 @@ fn agnosai_gpu_score(agent, task): i64 {
     var gpu_required = 0;
     var ctx = agnosai_task_context(task);
     if (ctx != 0) {
-        var v = map_get(ctx, str_from("gpu_required"));
+        var v = map_get(ctx, AGN_JK_GPU_REQUIRED);
         if (v != 0 && bayan_json_v_is_bool(v) == 1) { gpu_required = bayan_json_v_bool(v); }
     }
     if (gpu_required == 0) { return f64_from(1); }
@@ -189,17 +242,21 @@ fn agnosai_gpu_score(agent, task): i64 {
 #
 # Two separate paths score 1.0: a task with no domain, and an agent with no
 # domain constraint. Only a *mismatch* between two stated domains scores 0.
+#
+# The two Strs are compared whole, by length and bytes. This used to copy the
+# task's domain into a C string (`str_cstr`, a global allocation per agent
+# scored) and compare by `strlen`, so a domain with an embedded NUL matched its
+# own prefix: "quality\u0000x" matched an agent in "quality". The oracle's
+# `eq_ignore_ascii_case` compares the whole string, as this now does.
 fn agnosai_domain_score(agent, task): i64 {
     var ctx = agnosai_task_context(task);
     if (ctx == 0) { return f64_from(1); }
-    var v = map_get(ctx, str_from("domain"));
+    var v = map_get(ctx, AGN_JK_DOMAIN);
     if (v == 0 || bayan_json_v_is_str(v) == 0) { return f64_from(1); }
 
     var agent_domain = agnosai_agent_domain(agent);
     if (agent_domain == 0) { return f64_from(1); }
-    if (_agnosai_scoring_ieq(agent_domain, str_cstr(bayan_json_v_str(v))) == 1) {
-        return f64_from(1);
-    }
+    if (agnosai_str_eq_ci(agent_domain, bayan_json_v_str(v)) == 1) { return f64_from(1); }
     return f64_from(0);
 }
 
@@ -212,24 +269,35 @@ fn agnosai_personality_score(agent, task): i64 {
     return f64_div(f64_from(1), f64_from(2));
 }
 
+# The five component scores folded into one total: weighted, summed, clamped.
+#
+# ⚠ **The operation order is the contract.** f64 addition is not associative, so
+# this multiplies and adds in exactly the order tool, complexity, gpu, domain,
+# personality, and both `agnosai_score_agent_with_tools` and
+# `agnosai_explain_selection_a` fold through this one body. That is what makes an
+# explanation's total bit-equal to the score the runner ranked by, and what lets
+# a reader recompute it as Σ weight × score in the same order.
+fn _agnosai_score_fold(tool, complexity, gpu, domain, personality): i64 {
+    var score = f64_mul(agnosai_weight_tool_coverage(), tool);
+    score = f64_add(score, f64_mul(agnosai_weight_complexity(), complexity));
+    score = f64_add(score, f64_mul(agnosai_weight_gpu(), gpu));
+    score = f64_add(score, f64_mul(agnosai_weight_domain(), domain));
+    score = f64_add(score, f64_mul(agnosai_weight_personality(), personality));
+
+    if (f64_lt(score, f64_from(0)) == 1) { return f64_from(0); }
+    if (f64_gt(score, f64_from(1)) == 1) { return f64_from(1); }
+    return score;
+}
+
 # Score an agent against a task, with the required tools already extracted.
 #
 # Pass `required` from `agnosai_extract_required_tools` when scoring several
 # agents against one task — the oracle's reason for the split is avoiding N
 # deserializations, and the same saving applies here.
 fn agnosai_score_agent_with_tools(agent, task, required): i64 {
-    var score = f64_mul(agnosai_weight_tool_coverage(),
-      agnosai_tool_coverage_score(agent, required));
-    score = f64_add(score, f64_mul(agnosai_weight_complexity(),
-        agnosai_complexity_score(agent, task)));
-    score = f64_add(score, f64_mul(agnosai_weight_gpu(), agnosai_gpu_score(agent, task)));
-    score = f64_add(score, f64_mul(agnosai_weight_domain(), agnosai_domain_score(agent, task)));
-    score = f64_add(score, f64_mul(agnosai_weight_personality(),
-        agnosai_personality_score(agent, task)));
-
-    if (f64_lt(score, f64_from(0)) == 1) { return f64_from(0); }
-    if (f64_gt(score, f64_from(1)) == 1) { return f64_from(1); }
-    return score;
+    return _agnosai_score_fold(agnosai_tool_coverage_score(agent, required),
+      agnosai_complexity_score(agent, task), agnosai_gpu_score(agent, task),
+      agnosai_domain_score(agent, task), agnosai_personality_score(agent, task));
 }
 
 # Score an agent's suitability for a task, 0.0 to 1.0.
@@ -330,3 +398,235 @@ fn agnosai_rank_agents(agents, task): i64 {
     return scored;
 }
 
+# --- Explaining a selection ------------------------------------------------
+#
+# An explained entry is a scored entry with the five component scores after it.
+# The first two fields are `AgnosaiScoredOff`'s, at the same offsets, so
+# `agnosai_scored_index`, `agnosai_scored_score` and `_agnosai_scored_cmp` read an
+# explained entry unchanged. That is why `AGN_SEL_TOOL` equals `AGN_SC_SIZE`.
+enum AgnosaiSelectionOff {
+    AGN_SEL_TOOL = 16;
+    AGN_SEL_COMPLEXITY = 24;
+    AGN_SEL_GPU = 32;
+    AGN_SEL_DOMAIN = 40;
+    AGN_SEL_PERSONALITY = 48;
+    AGN_SEL_SIZE = 56;
+}
+
+# The explanation's own keys, minted once at startup. Every candidate in a
+# rendered explanation reaches nine of them, so a per-call `str_from_a` would be
+# one allocation per key per candidate — the `core/json.cyr` hoisting criterion.
+# `complexity` and `domain` reuse the scorer's context keys above, and
+# `agent_key` is `core/json.cyr`'s.
+var AGN_JK_INDEX = str_from("index");
+var AGN_JK_TOTAL = str_from("total");
+var AGN_JK_SCORES = str_from("scores");
+var AGN_JK_TOOL_COVERAGE = str_from("tool_coverage");
+var AGN_JK_GPU = str_from("gpu");
+var AGN_JK_PERSONALITY = str_from("personality");
+var AGN_JK_WINNER = str_from("winner");
+var AGN_JK_CANDIDATES = str_from("candidates");
+var AGN_JK_CANDIDATE_COUNT = str_from("candidate_count");
+var AGN_JK_WEIGHTS = str_from("weights");
+var AGN_JK_UNMEASURED = str_from("unmeasured");
+
+# Explain how each agent scored against `task`: a vec of explained entries in
+# `a`, best first, in exactly `agnosai_rank_agents`'s order.
+#
+# Each entry carries the agent's index in `agents`, its total, and the five
+# component scores the total was folded from. **Entry 0 is the agent
+# `_agnosai_crew_pick_best_agent` assigns the task to**: the components are the
+# same calls, the total goes through the same `_agnosai_score_fold`, and the sort
+# is the same total order. `tests/orch_crew_runner.tcyr` pins that as an
+# invariant.
+#
+# ⚠ **This is a recomputation, not a record.** It is exact only while selection
+# is a pure function of the roster and the task, which it is today: nothing
+# writes a task's context or an agent definition once a crew is built. The module
+# header names the changes that would break that.
+#
+# An empty roster gives an empty vec. Answers 0 when `a` is exhausted, rather
+# than an explanation built on a short read. Nothing is allocated outside `a`.
+fn agnosai_explain_selection_a(a, agents, task): i64 {
+    var required = _agnosai_extract_required_tools_a(a, task);
+    if (required < 0) { return 0; }
+    var out = vec_new_a(a);
+    if (out == 0) { return 0; }
+
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        var agent = vec_get(agents, i);
+        var e = alloc_via(a, AGN_SEL_SIZE);
+        if (e == 0) { return 0; }
+        var tool = agnosai_tool_coverage_score(agent, required);
+        var complexity = agnosai_complexity_score(agent, task);
+        var gpu = agnosai_gpu_score(agent, task);
+        var domain = agnosai_domain_score(agent, task);
+        var personality = agnosai_personality_score(agent, task);
+        store64(e + AGN_SC_INDEX, i);
+        store64(e + AGN_SC_SCORE, _agnosai_score_fold(tool, complexity, gpu, domain, personality));
+        store64(e + AGN_SEL_TOOL, tool);
+        store64(e + AGN_SEL_COMPLEXITY, complexity);
+        store64(e + AGN_SEL_GPU, gpu);
+        store64(e + AGN_SEL_DOMAIN, domain);
+        store64(e + AGN_SEL_PERSONALITY, personality);
+        if (vec_push_a(a, out, e) < 0) { return 0; }
+    }
+
+    agnosai_sort(out, &_agnosai_scored_cmp);
+    return out;
+}
+
+# An explained entry's tool coverage, as an f64 bit pattern.
+fn agnosai_selection_tool_coverage(e): i64 {
+    return load64(e + AGN_SEL_TOOL);
+}
+
+# An explained entry's complexity alignment, as an f64 bit pattern.
+fn agnosai_selection_complexity(e): i64 {
+    return load64(e + AGN_SEL_COMPLEXITY);
+}
+
+# An explained entry's GPU score, as an f64 bit pattern.
+fn agnosai_selection_gpu(e): i64 {
+    return load64(e + AGN_SEL_GPU);
+}
+
+# An explained entry's domain score, as an f64 bit pattern.
+fn agnosai_selection_domain(e): i64 {
+    return load64(e + AGN_SEL_DOMAIN);
+}
+
+# An explained entry's personality score, as an f64 bit pattern. Always the
+# neutral 0.5 until bhava is ported; see the module header.
+fn agnosai_selection_personality(e): i64 {
+    return load64(e + AGN_SEL_PERSONALITY);
+}
+
+# Set `key` on `obj` to `val`, answering -1 for a 0 value as well as for a failed
+# set. A builder that checks this one answer therefore sees every exhaustion on
+# its path, including a value constructor that ran out before the set.
+fn _agnosai_selection_set_a(a, obj, key, val): i64 {
+    if (val == 0) { return 0 - 1; }
+    return bayan_json_v_obj_set_a(a, obj, key, val);
+}
+
+# The five factors as a JSON object of floats, in the fold's order. Both the
+# per-candidate `scores` and the scorer's `weights` have this shape. 0 when `a`
+# is exhausted.
+fn _agnosai_selection_factors_a(a, tool, complexity, gpu, domain, personality): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    if (obj == 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_TOOL_COVERAGE,
+        bayan_json_v_float_new_a(a, tool)) < 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_COMPLEXITY,
+        bayan_json_v_float_new_a(a, complexity)) < 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_GPU,
+        bayan_json_v_float_new_a(a, gpu)) < 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_DOMAIN,
+        bayan_json_v_float_new_a(a, domain)) < 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_PERSONALITY,
+        bayan_json_v_float_new_a(a, personality)) < 0) { return 0; }
+    return obj;
+}
+
+# `{"index", "agent_key"}` for one explained entry — the start of a candidate,
+# and the whole of the winner. The key is borrowed from the agent. 0 when `a` is
+# exhausted.
+fn _agnosai_selection_who_a(a, e, agents): i64 {
+    var i = agnosai_scored_index(e);
+    var obj = bayan_json_v_obj_new_a(a);
+    if (obj == 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_INDEX, bayan_json_v_int_new_a(a, i)) < 0) {
+        return 0;
+    }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_AGENT_KEY,
+        bayan_json_v_str_new_a(a, agnosai_agent_key(vec_get(agents, i)))) < 0) { return 0; }
+    return obj;
+}
+
+# One candidate: who it is, its total, and its five component scores.
+fn _agnosai_selection_candidate_a(a, e, agents): i64 {
+    var obj = _agnosai_selection_who_a(a, e, agents);
+    if (obj == 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_TOTAL,
+        bayan_json_v_float_new_a(a, agnosai_scored_score(e))) < 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_SCORES,
+        _agnosai_selection_factors_a(a, agnosai_selection_tool_coverage(e),
+          agnosai_selection_complexity(e), agnosai_selection_gpu(e), agnosai_selection_domain(e),
+          agnosai_selection_personality(e))) < 0) { return 0; }
+    return obj;
+}
+
+# An explanation as JSON, built in `a`:
+#
+#     {"winner": {"index", "agent_key"} | null,
+#      "candidate_count": n,
+#      "candidates": [{"index", "agent_key", "total",
+#                      "scores": {"tool_coverage", "complexity", "gpu",
+#                                 "domain", "personality"}}, ...]}
+#
+# `explained` is what `agnosai_explain_selection_a` returned for `agents`, the
+# roster it indexes into. `candidates` is in rank order, so `candidates[0]` is the
+# winner. `limit` caps it: 0 or less renders every candidate, otherwise the best
+# `limit`, and `candidate_count` always says how many there were.
+#
+# Agnosai renders this rather than each consumer, so the factor names stay the
+# engine's when they change (bhava's personality is the first expected change).
+# The floats are the raw f64s, not rounded, so Σ weight × score over the scorer's
+# weights, in the order listed, reproduces `total` exactly.
+#
+# Answers 0 when `explained` is 0 or `a` is exhausted.
+fn agnosai_selection_to_value_a(a, explained, agents, limit): i64 {
+    if (explained == 0) { return 0; }
+    var n = vec_len(explained);
+    var shown = n;
+    if (limit > 0 && limit < n) { shown = limit; }
+
+    var obj = bayan_json_v_obj_new_a(a);
+    if (obj == 0) { return 0; }
+    var winner = 0;
+    if (n == 0) {
+        winner = bayan_json_v_null_a(a);
+    } else {
+        winner = _agnosai_selection_who_a(a, vec_get(explained, 0), agents);
+    }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_WINNER, winner) < 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_CANDIDATE_COUNT,
+        bayan_json_v_int_new_a(a, n)) < 0) { return 0; }
+
+    var arr = bayan_json_v_arr_new_a(a);
+    if (arr == 0) { return 0; }
+    for (var i = 0; i < shown; i = i + 1) {
+        var c = _agnosai_selection_candidate_a(a, vec_get(explained, i), agents);
+        if (c == 0) { return 0; }
+        if (bayan_json_v_arr_push_a(a, arr, c) < 0) { return 0; }
+    }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_CANDIDATES, arr) < 0) { return 0; }
+    return obj;
+}
+
+# The scorer itself as JSON, built in `a`: its five weights and the factors it
+# cannot measure yet.
+#
+#     {"weights": {"tool_coverage", "complexity", "gpu", "domain", "personality"},
+#      "unmeasured": ["personality"]}
+#
+# Personality is scored, at its neutral 0.5, so every total still adds up; it is
+# listed as unmeasured because no agent can score anything else until bhava is
+# ported. 0 when `a` is exhausted.
+fn agnosai_selection_scorer_to_value_a(a): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    if (obj == 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_WEIGHTS,
+        _agnosai_selection_factors_a(a, agnosai_weight_tool_coverage(), agnosai_weight_complexity(),
+          agnosai_weight_gpu(), agnosai_weight_domain(), agnosai_weight_personality())) < 0) {
+        return 0;
+    }
+    var unmeasured = bayan_json_v_arr_new_a(a);
+    if (unmeasured == 0) { return 0; }
+    var p = bayan_json_v_str_new_a(a, AGN_JK_PERSONALITY);
+    if (p == 0) { return 0; }
+    if (bayan_json_v_arr_push_a(a, unmeasured, p) < 0) { return 0; }
+    if (_agnosai_selection_set_a(a, obj, AGN_JK_UNMEASURED, unmeasured) < 0) { return 0; }
+    return obj;
+}

@@ -73,7 +73,7 @@ CrewRunner::new(spec)
     └── ProcessMode::Hierarchical → manager delegation (falls back to sequential)
     │
     ├── For each task:
-    │   ├── score_agent() → rank agents by suitability (4-factor weighted)
+    │   ├── score_agent() → rank agents by suitability (5-factor weighted)
     │   ├── pick_best_agent() → assign highest-scoring agent
     │   └── execute_task() → LLM inference via hoosh + response caching
     │
@@ -90,8 +90,29 @@ Five weighted factors (0.0–1.0 each):
 | Tool coverage | 0.35 | Fraction of required tools the agent provides |
 | Complexity alignment | 0.25 | How well agent/task complexity levels match |
 | Domain match | 0.15 | Domain compatibility |
-| Personality fit | 0.15 | Personality trait alignment via bhava |
+| Personality fit | 0.15 | Neutral 0.5 for every agent until bhava is ported (reported as `unmeasured`) |
 | GPU match | 0.10 | GPU capability when task requires it |
+
+The total is the weighted sum in the order tool, complexity, GPU, domain,
+personality (`_agnosai_score_fold`), clamped to 0..1. A perfectly matched agent
+scores 0.925, not 1.0, because personality contributes only its neutral half.
+
+#### Explaining a selection
+
+`agnosai_explain_selection_a(a, agents, task)` returns every agent's total and
+its five component scores, in the runner's rank order, so entry 0 is exactly the
+agent the crew runner assigns. `agnosai_selection_to_value_a` renders that as
+JSON (`winner`, `candidate_count`, `candidates[]` with `index`, `agent_key`,
+`total` and `scores`), and `agnosai_selection_scorer_to_value_a` renders the
+weights and `unmeasured: ["personality"]`. All three allocate in the caller's
+allocator only. agnosai renders the JSON so consumers do not hardcode factor names.
+
+It is a library call (roadmap F7), and no route serves it. The explanation is
+**recomputed** from the roster and the task, not recorded during the run, and that
+is exact only while selection is a pure function of those two. Hierarchical
+delegation (F2), learning-driven selection or a stateful bhava personality would
+end that, and would have to record the choice on the run instead. agnostic is to
+surface the explanation on its plan route (`?explain=selection`) when it re-pins.
 
 ### Task DAG Resolution
 

@@ -145,16 +145,17 @@ let result = orchestrator.run_crew(crew).await?;
 
 ## Agent Scoring and Assignment
 
-For every task, the orchestrator scores each available agent and assigns the best match. Scoring uses four weighted factors:
+For every task, the orchestrator scores each available agent and assigns the best match. Scoring uses five weighted factors (the constants in `src/orchestrator/scoring.cyr`):
 
 | Factor | Weight | Description |
 |--------|--------|-------------|
-| Tool coverage | 0.40 | Fraction of `required_tools` the agent provides |
-| Complexity alignment | 0.30 | How well agent complexity matches task complexity |
-| GPU match | 0.15 | Whether the agent has GPU capability when the task requires it |
-| Domain match | 0.15 | Whether agent and task share the same domain |
+| Tool coverage | 0.35 | Fraction of `required_tools` the agent provides |
+| Complexity alignment | 0.25 | How well agent complexity matches task complexity (`1 - abs(diff) / 3` over low/medium/high; a task with none counts as `medium`) |
+| Domain match | 0.15 | Whether agent and task share the same domain (case-insensitive; either side unset matches) |
+| Personality fit | 0.15 | Always the neutral 0.5 until bhava is ported; reported as `unmeasured` |
+| GPU match | 0.10 | Whether the agent has GPU capability when the task requires it |
 
-Scores range from 0.0 to 1.0. The agent with the highest score is assigned.
+Scores range from 0.0 to 1.0, and because personality is fixed at 0.5 the best possible score is 0.925. The agent with the highest score is assigned; on a tie, the one earlier in the roster.
 
 ```cyr
 # Task context controls what the scorer looks for.
@@ -178,6 +179,29 @@ You can also rank agents explicitly:
 # Returns a vec of scored entries, highest first.
 var ranked = agnosai_rank_agents(agents, task);
 ```
+
+To see *why* an agent was chosen, explain the selection. It returns the same ranking
+with each agent's five component scores, so entry 0 is the agent the crew runner
+assigns, and it allocates only in the allocator you pass:
+
+```cyr
+var a = arena_allocator(65536);
+var explained = agnosai_explain_selection_a(a, agents, task);   # 0 if `a` runs out
+var best = vec_get(explained, 0);   # an empty roster explains as an empty vec
+var tool = agnosai_selection_tool_coverage(best);   # f64 bits; also _complexity,
+                                                    # _gpu, _domain, _personality
+
+# As JSON: {"winner": {"index", "agent_key"} | null, "candidate_count",
+#           "candidates": [{"index", "agent_key", "total", "scores": {...}}]}
+# The last argument caps the candidates (0 renders all of them).
+var why = agnosai_selection_to_value_a(a, explained, agents, 10);
+# {"weights": {...}, "unmeasured": ["personality"]}
+var scorer = agnosai_selection_scorer_to_value_a(a);
+```
+
+The explanation is recomputed from the roster and the task, not recorded during the
+run. It names the agent the runner used because selection depends on nothing else
+today.
 
 ---
 

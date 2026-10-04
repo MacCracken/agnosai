@@ -214,6 +214,25 @@ fn main() {
     assert(bayan_json_v_obj_get_by_cstr(pv, "task_cost_usd") != 0, "populated task_cost_usd is emitted");
     assert(bayan_json_v_obj_get_by_cstr(pv, "sandbox_strength") != 0, "set sandbox_strength is emitted");
 
+    # --- record_agent_cost SUMS, as the oracle's `+=` does (ADR 022) ---
+    var sum_p = agnosai_crew_profile_new();
+    var sum_key = str_from("a1");
+    agnosai_crew_profile_record_agent_cost(sum_p, str_from("a1"), 450);
+    agnosai_crew_profile_record_agent_cost(sum_p, sum_key, 450);
+    agnosai_crew_profile_record_agent_cost(sum_p, str_from("a2"), 300);
+    var sum_m = agnosai_crew_profile_agent_cost(sum_p);
+    assert_eq(map_get(sum_m, str_from("a1")), 900,
+      "two costs recorded for one agent SUM to 900 — 450 here is the old replace semantics");
+    assert_eq(map_get(sum_m, str_from("a2")), 300, "a different agent's cost stays independent");
+    assert_eq(map_size(sum_m), 2, "two agents, two entries — the second a1 did not add a key");
+    # The stored key is the profile's own clone, not the caller's Str — on the
+    # ADD path too, where `map_set` rewrites the stored key pointer. A caller
+    # that reuses its Str must not rename the agent in the profile. (A Str is
+    # `{data, len}`; zeroing `len` is that reuse.)
+    store64(sum_key + 8, 0);
+    assert_eq(map_get(sum_m, str_from("a1")), 900,
+      "and the key is OWNED — truncating the caller's Str does not lose the entry");
+
     var prof_back = agnosai_crew_profile_from_value(pv);
     assert_eq(agnosai_crew_profile_wall_ms(prof_back), 1500, "wall_ms survives");
     assert_eq(agnosai_crew_profile_task_count(prof_back), 3, "task_count survives");
@@ -360,6 +379,49 @@ fn main() {
     assert_eq(agnosai_crew_profile_cost_micro_usd(okp), 0,
       "and an absent `cost_usd` is zero, which IS serde-defaulted");
     assert_eq(agnosai_crew_profile_wall_ms(okp), 100, "carrying the wall_ms it was given");
+
+    # --- the inbound traceparent (ADR 023) ----------------------------------
+    var tc = agnosai_crew_new(str_from("tp-crew"));
+    assert_eq(agnosai_crew_trace_parent(tc), 0, "a new crew carries no traceparent");
+    var tp_buf = alloc(56);
+    memcpy(tp_buf, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", 55);
+    store8(tp_buf + 55, 0);
+    var tp = str_new(tp_buf, 55);
+    assert_eq(agnosai_crew_with_trace_parent(tc, tp), tc, "with_trace_parent returns the crew");
+    assert(str_eq_cstr(agnosai_crew_trace_parent(tc),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01") == 1, "and stores it");
+    # ⚠ The stored value is a COPY. An in-process caller's traceparent lives in
+    # its per-request arena, which is reset before an async crew runs; this is
+    # that arena being reused.
+    memset(tp_buf, 120, 55);
+    assert(str_eq_cstr(agnosai_crew_trace_parent(tc),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01") == 1,
+      "overwriting the caller's bytes leaves the crew's copy intact");
+    assert(agnosai_crew_trace_parent(tc) != tp, "it is not the caller's Str");
+
+    # Only a 55-byte value is kept; validation is telemetry's, at run time.
+    agnosai_crew_with_trace_parent(tc,
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0"));
+    assert_eq(agnosai_crew_trace_parent(tc), 0, "54 bytes store 0");
+    agnosai_crew_with_trace_parent(tc,
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-011"));
+    assert_eq(agnosai_crew_trace_parent(tc), 0, "56 bytes store 0");
+    agnosai_crew_with_trace_parent(tc, str_from(
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
+    agnosai_crew_with_trace_parent(tc, 0);
+    assert_eq(agnosai_crew_trace_parent(tc), 0, "and 0 clears it");
+
+    # ⚠ NOT serialised: trace context is per-execution transport, not part of
+    # the crew's definition, so neither the wire nor a persisted spec changes.
+    agnosai_crew_with_trace_parent(tc, str_from(
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
+    var tj = agnosai_crew_to_json(tc);
+    assert_eq(str_contains_cstr(tj, "4bf92f3577b34da6a3ce929d0e0e4736"), 0,
+      "to_json does not carry the traceparent");
+    assert_eq(str_contains_cstr(tj, "trace"), 0, "nor any trace key, or any \"trace\" at all");
+    var back = agnosai_crew_from_json(tj);
+    assert(back != 0, "the crew round-trips");
+    assert_eq(agnosai_crew_trace_parent(back), 0, "without its traceparent");
 
     return assert_summary();
 }

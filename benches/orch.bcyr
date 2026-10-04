@@ -509,6 +509,53 @@ fn _b_rank_agents(): i64 {
     return 0;
 }
 
+# ── explaining a selection (roadmap F7) ──────────────
+#
+# What a consumer pays to explain one task's selection: the 100 varied agents
+# and the rich task of `rank_agents_varied_100`, into an arena reset after every
+# call, which is the shape a request handler gives it. Read the explain row
+# against `rank_agents_varied_100`: the difference is a 56-byte entry with five
+# extra stores in place of a 16-byte one, and an arena in place of the bump.
+fn _b_explain_selection_100(): i64 {
+    var n = 2000;
+    var agents = _b_scoring_agents(100);
+    var task = _b_rich_task();
+    var a = arena_allocator(65536);
+    var b = bench_new("explain_selection_100");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_explain_selection_a(a, agents, task);
+            reset_via(a);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# Rendering that explanation as JSON, every candidate (limit 0). One object, two
+# keyed cells and a five-float scores object per candidate, so this is the
+# row that grows with the roster when a consumer asks for all of it.
+fn _b_selection_to_value_100(): i64 {
+    var n = 2000;
+    var agents = _b_scoring_agents(100);
+    var keep = arena_allocator(65536);
+    var ex = agnosai_explain_selection_a(keep, agents, _b_rich_task());
+    var a = arena_allocator(262144);
+    var b = bench_new("selection_to_value_100");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_selection_to_value_a(a, ex, agents, 0);
+            reset_via(a);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
 # A whole delegation pass: 16 tasks over 16 agents, one ranking each.
 fn _b_delegate(): i64 {
     var n = 2000;
@@ -2049,10 +2096,11 @@ fn _b_orchestrator_new(): i64 {
 # THREAD per task in batches of `limit` and joins each batch before the next: 10
 # thread_create and 10 thread_join per iteration, in 3 waves. The oracle used
 # green threads on an already-running runtime. Two further real differences:
-# workers get `event_tx = 0`, and `run_parallel` never calls
-# `_agnosai_crew_audit_task` (crew_runner.cyr:813-817, reproduced from the
-# oracle deliberately) — so the parallel row costs 2 audit entries per crew, not
-# 12.
+# this orchestrator has no event bus, so no event is built on any path (the
+# `crew_runner_10_tasks_parallel_4_*` rows below price that path), and
+# `run_parallel` never calls `_agnosai_crew_audit_task` (crew_runner.cyr:813-817,
+# reproduced from the oracle deliberately) — so the parallel row costs 2 audit
+# entries per crew, not 12.
 #
 # The numbers make that concrete: parallel 487 µs against sequential 367 µs for
 # the SAME ten tasks, while paying ten fewer ~27 µs audit entries. Netting the
@@ -2061,12 +2109,13 @@ fn _b_orchestrator_new(): i64 {
 # task blocks on something. Reading it as a regression against the oracle would
 # be reading a `clone(2)` as a slow `tokio::spawn`.
 #
-# ⚠ **Every iteration also builds a GenAI crew span.** The telemetry RECORDER
-# no-ops without a configured exporter, but `agnosai_genai_crew_span`
-# (src/telemetry/genai.cyr:162) is called unconditionally at
-# crew_runner.cyr:1192 and allocates 104 B plus two `clock_epoch_ns` calls for a
-# span the recorder then discards. Including telemetry is not free; it is
-# required, because the file does not compile without it.
+# ⚠ **No iteration builds a GenAI span any more (ADR 023).** Until 2026-10-03
+# every crew run built its crew span — 104 B plus two `clock_epoch_ns` calls —
+# for a recorder that then discarded it with no exporter configured. The four
+# span sites now build a span only when the exporter is on, so with telemetry
+# off (these rows) a crew run pays one exporter load per crew and per task, and
+# nothing else. Including telemetry is still required, because the file does
+# not compile without it.
 #
 # ⚠ **The n are set by the audit ring, and the retention behind it is larger
 # than the ring.** `agnosai_audit_record`'s own doc measures the hashing path at
@@ -2081,6 +2130,112 @@ fn _b_run_crew(name, crew_name, n_tasks, process, n): i64 {
         bench_batch_start(b);
         for (var i = 0; i < n / _BR; i = i + 1) {
             agnosai_orchestrator_run_crew(o, _b_o_spec(str_from(crew_name), n_tasks, process));
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ── the same crews with the exporter ON (ADR 023) ─────────────────────────
+#
+# What turning telemetry on costs a crew. F6 took a crew run from one span to
+# 1 + N: the `invoke_workflow` span and one `invoke_agent` per task (plus a
+# `chat` per inference attempt, which these placeholder crews do not make).
+# Each span draws its id from getrandom, reads the clock twice and is ENCODED
+# under the ring mutex, so the parallel row's workers queue on that lock. Read
+# each row beside its untraced sibling above — same spec, same n.
+#
+# ⚠ **That comparison is fair only because both sit in a process that already
+# has a second live thread.** The exporter's background thread is one, and an
+# idle second thread on its own moves these crews: measured in isolation
+# (2026-10-03, one process per row, seven interleaved rounds), a sleeping
+# detached thread took the 10-task sequential crew 334 → 400 µs and the
+# parallel_4 crew 624 → 456 µs. In this file the parallel row already reads
+# ~456 µs (the sequential one 380-400), the second-thread level, so an earlier
+# row leaves a thread alive (roadmap B20). Pulled out on their own, the traced
+# rows must be compared with an idle-thread baseline, or the parallel row reads
+# as telemetry making it FASTER.
+#
+# - The exporter is the production one: `agnosai_telemetry_init_export`, with
+#   its background thread. Its endpoint is a port nothing listens on, so the
+#   once-a-second flush fails at connect instead of waiting on a collector.
+# - The ring is drained after every run, INSIDE the timed loop. Undrained, its
+#   256 slots fill in about 23 runs of 11 spans and start dropping, and its
+#   768 KiB fragment arena, which only a drain resets, spills every further
+#   fragment onto the no-free global bump until the next flush — a retention
+#   row, not a telemetry row. In production the exporter thread pays the
+#   drain; here it is on the clock, and is the small part (it concatenates
+#   fragments the enqueue already encoded).
+fn _b_run_crew_traced(name, crew_name, n_tasks, process, n): i64 {
+    var o = agnosai_orchestrator_new(agnosai_resource_budget_default());
+    var ring = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
+    var svc = str_from("bench");
+
+    var b = bench_new(name);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_orchestrator_run_crew(o, _b_o_spec(str_from(crew_name), n_tasks, process));
+            agnosai_otlp_ring_drain(ring, svc);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ── a parallel crew with a sender attached (ADR 022) ──────────────────────
+#
+# The `run_crew_*` rows go through an orchestrator with no event bus, so ADR
+# 022's wave changes are invisible to them. These rows run the crew runner
+# directly with a sender, which is the path ADR 022 changed: `task_started` at
+# dispatch, `task_completed` at each join, and on the LLM rows one `token` event
+# per task, sent from the worker threads through the bus mutex.
+#
+# - `_watched` has one subscriber, drained after every run. A 10-task LLM crew
+#   sends 32 events into a 256-deep ring, so an undrained ring fills within about
+#   eight runs, and after that the row would measure eviction.
+# - `_quiet` has a bus with no subscriber. `tests/orch_crew_runner.tcyr` pins
+#   that a quiet bus allocates exactly what no bus does, so `_quiet` beside
+#   `_watched` prices the events alone.
+# - The LLM rows answer through a stub chat call on the hoosh client, which is
+#   ADR 022's seam. They also pay for request building, the response parse and
+#   the output filter.
+# - Measured per run: 78 KB watched and 70 KB quiet on the placeholder path,
+#   274 KB and 263 KB on the LLM path. At these n the four rows retain about
+#   128 MB, which is why the LLM rows run fewer iterations.
+
+# The gateway answer the stub returns, built once in `main`.
+var _b_stub_body = 0;
+
+# `agnosai_hoosh_chat`'s contract, answered without a network.
+fn _b_stub_chat(client, request, out_response, parent_sc): i64 {
+    store64(out_response, agnosai_hoosh_response_from_body(_b_stub_body));
+    return 0;
+}
+
+fn _b_crew_watch(name, llm, watched, n): i64 {
+    var tx = agnosai_event_bus_sender(agnosai_event_bus_new(), str_from(name));
+    var sub = 0;
+    if (watched == 1) { sub = agnosai_event_sender_subscribe(tx); }
+    var client = 0;
+    if (llm == 1) {
+        client = agnosai_hoosh_client_with_chat(
+          agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_b_stub_chat);
+    }
+    var err: i64[1];
+    store64(&err, 0);
+
+    var b = bench_new(name);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var r = agnosai_crew_runner_new(_b_o_spec(str_from("bench-10-par"), 10,
+                agnosai_process_parallel(4)));
+            if (client != 0) { agnosai_crew_runner_with_llm(r, client); }
+            agnosai_crew_runner_run(agnosai_crew_runner_with_events(r, tx), &err);
+            if (sub != 0) { while (agnosai_event_sub_try_recv(sub) != 0) { } }
         }
         bench_batch_stop(b, n / _BR);
     }
@@ -2146,6 +2301,8 @@ fn main(): i64 {
     _b_rank_agents_varied_300();
     _b_rank_agents_varied_1000();
     _b_rank_agents();
+    _b_explain_selection_100();
+    _b_selection_to_value_100();
     _b_delegate();
     _b_kahn_sort();
 
@@ -2229,6 +2386,24 @@ fn main(): i64 {
       agnosai_process_sequential(), 500);
     _b_run_crew("run_crew_10_tasks_parallel_4", "bench-10-par", 10,
       agnosai_process_parallel(4), 1000);
+
+    # Exporter ON for these two rows only, and off again before anything else
+    # runs, so no other row in the file pays for it.
+    var tg = agnosai_telemetry_init_export(str_from("http://127.0.0.1:1"), str_from("bench"));
+    _b_run_crew_traced("run_crew_10_tasks_sequential_traced", "bench-10-seq", 10,
+      agnosai_process_sequential(), 500);
+    _b_run_crew_traced("run_crew_10_tasks_parallel_4_traced", "bench-10-par", 10,
+      agnosai_process_parallel(4), 1000);
+    agnosai_telemetry_shutdown(tg);
+
+    _b_stub_body = str_cat(str_cat(
+        str_from("{\"model\":\"gpt-4o-mini\",\"choices\":[{\"message\":{\"content\":\"done\"}}],"),
+        str_from("\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,")),
+      str_from("\"cost_micro_usd\":450,\"provider\":\"openai\"}}"));
+    _b_crew_watch("crew_runner_10_tasks_parallel_4_watched", 0, 1, 500);
+    _b_crew_watch("crew_runner_10_tasks_parallel_4_quiet", 0, 0, 500);
+    _b_crew_watch("crew_runner_10_tasks_parallel_4_llm_watched", 1, 1, 100);
+    _b_crew_watch("crew_runner_10_tasks_parallel_4_llm_quiet", 1, 0, 100);
 
     return 0;
 }
