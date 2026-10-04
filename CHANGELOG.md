@@ -548,7 +548,8 @@ F7 changes no wire.
   343.9 → 328.0 µs without overlap, so call it at most a few percent. Ranking is a small part of
   a crew run.
 
-  F7's own item gate ran the full `cyrius bench` once (not the release gate under *Verified*),
+  A full `cyrius bench` run during F7's development (not the release gate under *Verified*; the
+  later F7-era gate logs read within about 2% of it),
   and it agrees with `bench-history.csv`'s 2.1.4 rows: `score_agent_rich_context` 1,208 → 857 ns, `score_agent_no_context` 534 → 292 ns,
   `score_agent_gpu_required` 580 → 329 ns, `score_agent_domain_mismatch` 870 → 553 ns,
   `rank_agents_varied_100/300/1000` 97.2 / 303.0 / 1,060 → 71.9 / 222.6 / 790 µs,
