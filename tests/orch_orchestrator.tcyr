@@ -199,9 +199,23 @@ fn main() {
     assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, c_id)),
       AGNOSAI_CREW_COMPLETED, "the crew completed");
 
-    assert_eq(agnosai_orchestrator_cancel_crew(o, c_id), 0, "cancelling a registered crew works");
+    # ⚠ A FINISHED crew is left as it finished (2.1.6). Through 2.1.5 this cancel
+    # succeeded and relabelled the completed crew Cancelled.
+    var fin = agnosai_orchestrator_cancel_crew(o, c_id);
+    assert(fin != 0, "cancelling a crew that already finished is refused");
+    assert(agnosai_error_kind(fin) != AGNOSAI_ERR_CREW_NOT_FOUND,
+      "as finished, not as unknown — a caller can tell the two apart");
     assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, c_id)),
+      AGNOSAI_CREW_COMPLETED, "and the crew stays COMPLETED");
+
+    var live_spec = _t_spec("cancel-me-live");
+    var live_id = agnosai_crew_id(live_spec);
+    _agnosai_orch_register(o, live_spec);
+    assert_eq(agnosai_orchestrator_cancel_crew(o, live_id), 0, "cancelling a registered, unfinished crew works");
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, live_id)),
       AGNOSAI_CREW_CANCELLED, "and marks its registered state Cancelled IN PLACE");
+    assert(agnosai_orchestrator_cancel_crew(o, live_id) != 0,
+      "and a second cancel is refused too: CANCELLED is finished");
 
     var unknown = agnosai_orchestrator_cancel_crew(o, agnosai_uuid_v4_str());
     assert(unknown != 0,

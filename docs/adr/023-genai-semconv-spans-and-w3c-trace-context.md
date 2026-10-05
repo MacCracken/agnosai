@@ -2,6 +2,16 @@
 
 ## Status: Accepted (2026-10-04), shipped in 2.1.5. Proposed 2026-10-03. Amends [ADR 017](017-genai-span-call-sites.md).
 
+Note (2026-10-04, 2.1.6): the export this ADR turned on was unbounded. Each
+batch POST used the bare `sandhi_http_post` (the no-free global bump, ~258 KiB of
+RSS per batch, and no timeouts), two flushes could share one batch's memory, and
+the generic `OTEL_EXPORTER_OTLP_ENDPOINT` was read with the per-signal rule (a
+base with a path was posted to as given). 2.1.6 gives the exporter its own arena,
+options with timeouts, and a flush lock; reads the generic endpoint as a base URL
+with `v1/traces` appended; and adds the per-signal
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, used as-is. The span vocabulary and the
+trace-context decisions below are unchanged.
+
 ## Context
 
 ADR 017 made `src/` call the GenAI span helpers that

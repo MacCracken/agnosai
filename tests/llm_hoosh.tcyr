@@ -22,6 +22,8 @@ include "src/telemetry/mod.cyr"
 include "src/core/error.cyr"
 include "src/core/json.cyr"
 include "src/llm/retry.cyr"
+# The chat transport takes its per-call arena from a pool (2.1.6).
+include "src/arena_pool.cyr"
 include "src/llm/hoosh.cyr"
 include "tests/test_helpers.cyr"
 
@@ -276,6 +278,76 @@ fn main() {
       agnosai_inference_request_new(str_from("m")), &live_out, 0);
     assert(live_rc != 0, "the live call to a dead gateway returns an error Str");
     assert_eq(load64(&live_out), 0, "and stores no response");
+
+    # --- 2.1.6: the chat call is bounded, in memory and in time --------------
+    # Through 2.1.5 each call left its URL, headers, body, sandhi's 256 KiB
+    # receive buffer and five parse trees of the answer on the global bump, and
+    # had no timeouts. Now it works in a pooled arena under finite ceilings.
+    #
+    # (a) The response a call keeps is COPIED out of the arena it was parsed in:
+    # reset the arena, scribble over it, and the response still reads right.
+    var ra = arena_allocator_growable(65536);
+    var rbody = str_from("{\"model\":\"m1\",\"choices\":[{\"message\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"cost_micro_usd\":9,\"provider\":\"p\"}}");
+    var rtree = bayan_json_v_parse_buf_a(ra, str_data(rbody), str_len(rbody));
+    var rresp = _agnosai_hoosh_response_of(rtree);
+    reset_via(ra);
+    var scribble = alloc_via(ra, 4096);
+    memset(scribble, 88, 4096);
+    _t_assert_str(agnosai_inference_response_content(rresp), "hello", "content survives its arena's reset");
+    _t_assert_str(agnosai_inference_response_model(rresp), "m1", "and so does the model");
+    _t_assert_str(agnosai_inference_response_finish_reason(rresp), "stop", "the finish reason");
+    _t_assert_str(agnosai_inference_response_provider(rresp), "p", "and the provider");
+    assert_eq(agnosai_inference_response_prompt_tokens(rresp), 3, "with the token counts");
+    assert_eq(agnosai_inference_response_cost_micro_usd(rresp), 9, "and the cost");
+
+    # (b) Memory. A dead gateway exercises the whole request build and connect.
+    # After the first call grows a pooled arena, a call leaves on the global bump
+    # only sandhi's connect path (~120 B measured; filed with sandhi) and its
+    # error Str — 2.1.5 left ~1.5 KB here, and ~256 KiB against a live gateway.
+    var greq = agnosai_inference_request_new(str_from("m"));
+    var gout: i64[1];
+    agnosai_hoosh_chat_in(str_from("http://127.0.0.1:1"), str_from("k"), greq, &gout, 0);
+    var g_before = alloc_used();
+    for (var gi = 0; gi < 20; gi = gi + 1) {
+        agnosai_hoosh_chat_in(str_from("http://127.0.0.1:1"), str_from("k"), greq, &gout, 0);
+    }
+    var g_per = (alloc_used() - g_before) / 20;
+    assert(g_per < 1024, "a chat call leaves under 1 KiB on the global bump (sandhi's connect path and the error Str)");
+
+    # (c) Time. A socket that listens and never accepts: the connect completes in
+    # the backlog, the request is sent, no answer comes.
+    var lt, lfd = tcp_socket();
+    sock_reuse(lfd);
+    var lport = 0;
+    var lp = 47851;
+    while (lp < 47867 && lport == 0) {
+        var bt, bv = sock_bind(lfd, INADDR_LOOPBACK(), lp);
+        if (is_err_result(bt) == 0) { lport = lp; }
+        lp = lp + 1;
+    }
+    var listening = 0;
+    if (lport != 0) {
+        var st2, sv2 = sock_listen(lfd, 8);
+        if (is_err_result(st2) == 0) { listening = 1; }
+    }
+    assert_eq(agnosai_hoosh_set_timeouts(0, 1, 1), 0 - 1, "a timeout of 0 is refused");
+    if (listening == 1) {
+        var hsb = str_builder_new();
+        str_builder_add_cstr(hsb, "http://127.0.0.1:");
+        str_builder_add_int(hsb, lport);
+        var hbase = str_builder_build(hsb);
+        assert_eq(agnosai_hoosh_set_timeouts(200, 200, 400), 0, "the ceilings can be set");
+        assert_eq(agnosai_hoosh_total_timeout_ms(), 400, "and read back");
+        var h0 = clock_now_ns();
+        var hrc = agnosai_hoosh_chat_in(hbase, str_from(""), greq, &gout, 0);
+        var hung_ms = (clock_now_ns() - h0) / 1000000;
+        assert(hrc != 0, "a gateway that never answers is an error");
+        assert(hung_ms < 3000, "after its timeout — not forever, as through 2.1.5");
+        agnosai_hoosh_set_timeouts(AGNOSAI_HOOSH_CONNECT_MS, AGNOSAI_HOOSH_IO_MS, AGNOSAI_HOOSH_TOTAL_MS);
+    } else {
+        println("llm_hoosh: no loopback port to listen on; the hung-gateway check did not run");
+    }
+    sock_close(lfd);
 
     # --- the cache signal ---
     assert_eq(agnosai_hoosh_cache_from_header(str_from("HIT")), AGNOSAI_HOOSH_CACHE_HIT,

@@ -74,7 +74,7 @@ every benchmark, every build target. **Wire parity is the bar**, judged against
       once README/SECURITY.md stopped claiming seccomp-bpf/Landlock/cgroups on
       the process tier, which was never implemented.
 
-## Deleting `rust-old/` — scheduled for the release after 2.1.0, still owed at 2.1.5
+## Deleting `rust-old/` — scheduled for the release after 2.1.0, still owed at 2.1.6
 
 None of 2.1.1 to 2.1.5 carried the deletion. The checklist below is unchanged.
 
@@ -171,10 +171,10 @@ here.
 - [ ] Release kavach and libro on cyrius 6.6.15 with `[deps.sigil] tag = "3.13.9"` (libro's
       `[deps.sigil_tpm]` with it). Then release bote on 6.6.15 with that libro. Certify each in
       a sibling-free replica with an empty dep cache.
-- [ ] ⚠ This host's `~/.cyrius/versions/6.6.15` is not the tag. Its `SOURCE_COMMIT` reads
-      untagged, dirty `5d00a5f` (installed 2026-10-02). It still holds sigil 3.13.7 and 6.6.14's
-      `tls_native_hs12.cyr` / `tls_native_hs13.cyr`. Reinstall the slot from the 6.6.15 tag
-      before the steps below. Otherwise the lib snapshot certifies the wrong files.
+- [x] ~~This host's `~/.cyrius/versions/6.6.15` is not the tag.~~ Reinstalled since: its
+      `SOURCE_COMMIT` reads `2f1ed9d1`, `tree-matches-tag: yes`, which is the 6.6.15 tag's commit
+      (checked 2026-10-04 at the 2.1.6 cut). Check it again before certifying — a concurrent
+      session working on cyrius rewrites these slots.
 - [ ] Read 6.6.15's release notes against this tree; the 6.6.6 section at the end of this file
       is the shape.
 - [ ] Move `cyrius = "6.6.15"`, `[deps.sigil] tag = "3.13.9"` and the new kavach and bote tags
@@ -1429,11 +1429,45 @@ One line each; the reasoning and measurements are in `CHANGELOG.md`.
 | 2026-08-03 | **Dep pins corrected to name what is actually built** — `cyrius.cyml` said bote 3.2.1 / kavach 3.9.3 while `lib/` held 3.3.0 / 3.11.0, because `path = "../NAME"` beats `tag` locally and CI has no sibling checkouts. Both bundles verified byte-identical to their upstream tag dists; all six pins are now the newest upstream tag. Gated going forward by `cyrius deps --verify` in `scripts/check-clean.sh` and a *Lockfile is honest* CI step. |
 | 2026-10-03 (2.1.5) | **B17 — crew events and status say what happened** ([ADR 022](../adr/022-crew-events-and-status-say-what-happened.md)). All six of agnostic 0.1.9's findings: a parallel/DAG `task_started` at dispatch and `task_completed` per join (in dispatch order); `token` events from parallel and DAG workers; `metadata.agent` on LLM-answered results, so `agent_cost_usd` is populated; runner `token` events carry the spec's crew id (passed down, not stamped into the prompt-rendered context); a timed-out runner reports `failed` with no results itself, so `crew_completed` agrees with the stored state; the registry stores `running`, and the DAG error arm puts `pending` back (a `running` → `pending` edge a poller can see, documented in `docs/guides/api-reference.md`). Extra fix: `agnosai_crew_profile_record_agent_cost` replaced where the oracle sums. The hoosh client's chat pointer makes the LLM success arm testable offline. agnostic needs only the re-pin and a comment refresh. |
 | 2026-10-03 (2.1.5) | **F6 — OTel GenAI semconv spans and inbound trace context, agnosai half** ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)). Four linked operations (`invoke_workflow`, `invoke_agent`, `chat`, `execute_tool`) under one trace per crew in every process mode; `parentSpanId` on the wire; a span id no longer reuses its trace id's high half; inbound `traceparent` in process (`agnosai_crew_with_trace_parent`) and on three HTTP routes; `agnosai_telemetry_init_export`; ParentBased sampling; `error.type`. The off path builds no span (`tool_execute_echo` 3.67 → 0.79 µs). agnostic's half lands at its re-pin. |
+| 2026-10-04 (2.1.6) | **Five fixes from agnostic 0.1.14's review of its 2.1.5 re-pin** (CHANGELOG 2.1.6). The OTLP exporter and the hoosh chat call each post through their own arena under finite timeouts (2.1.5 left ~258 KiB of RSS per exporter batch and ~256 KiB per inference on the global bump, and neither could time out); the exporter's flushes are serialised; `OTEL_EXPORTER_OTLP_ENDPOINT` is a base URL and the per-signal `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is honoured; a `dag` crew stranded by a failed branch ends FAILED instead of in the deadlock arm; cancelling a finished crew is refused (409) instead of relabelling it. ADR 022 and 023 carry dated notes. |
 | 2026-10-03 (2.1.5) | **F7 — explain agent selection.** `agnosai_explain_selection_a` plus two JSON renderers, library only (no wire change, no ADR). Entry 0 is pinned equal to the runner's pick. Personality is reported as its neutral 0.5 and listed as `unmeasured`. Prerequisite: the scorer's context keys are hoisted and the domain compare no longer copies, which took 19–41% off the `score_agent_*` / `rank_agents_*` rows and fixed a domain with an embedded NUL matching its own prefix. agnostic surfaces it on its plan route at the re-pin. |
 
 ### C. Upstream — filed and waiting
 
 Nothing here blocks agnosai today; each is a residual agnosai measured and handed off.
+
+**Owed (found 2026-10-04, at 2.1.6), not upstream:** `benches/orch.bcyr`'s
+`crew_runner_10_tasks_parallel_4_{quiet,watched}` rows measure the global heap's position, not the
+runner. With the traced block before them (`run_crew_10_tasks_*_traced`, which starts and stops an
+OTLP exporter) the 2.1.5 tag reads ~420 µs; with that block removed, ~507 µs — and 2.1.6, whose
+exporter no longer leaks there, reads ~505 µs either way. Interleaved A/B builds ruled out job
+false sharing, the data-section layout and the exporter's timeouts. Run these rows first, or in their
+own `.bcyr`, so a change elsewhere in the file cannot move them; then rebase their history.
+
+**Owed (found 2026-10-04, at 2.1.6), not upstream:** 18 log literals whose declared length is not
+the literal's. 17 cut the message short — mostly a multi-byte character (`—`) counted as one byte:
+`fleet/discovery.cyr:141`, `fleet/environment.cyr:263,271,273,279,283,287,290`,
+`main.cyr:211,378,383,412`, `orchestrator/pubsub.cyr:248`, `orchestrator/scoring.cyr:116`,
+`server/output_filter.cyr:292`, `server/sse.cyr:352` — and `main.cyr:434` declares the NUL, so the
+shutdown line ends `gracefully\u0000` in the JSON log. agnostic's `scripts/check-log-lengths.py`
+finds them all when run from this repo's root; fix the 18 and add it to `scripts/check-clean.sh`,
+as agnostic did, so none comes back.
+
+**Owed (found 2026-10-04, at 2.1.6), not upstream:** `tests/smcyr/llm_live.smcyr` does not compile —
+it includes `src/llm/mod.cyr` without `src/telemetry/mod.cyr` (seven undefined `agnosai_genai_*` /
+`agnosai_telemetry_*` functions since ADR 017 put span sites in the chat path) and, since 2.1.6,
+without `src/arena_pool.cyr`; it also fails `cyrius fmt --check`. A live-gateway smoke test, so
+`cyrius tests` does not run it and nothing noticed. Add both includes and format it.
+
+**To file (found 2026-10-04, at 2.1.6):** an `_a` HTTP request still allocates on the global bump.
+With the exporter and the chat call both posting through `sandhi_http_post_opts_a` into their own
+arenas, what remains on the no-free global bump is sandhi's own: **480 B per successful POST** and
+**~120 B per refused connect**, measured with `alloc_used()` around 100 posts to a local stub. 16 B
+of it is `sockaddr_in` (`lib/net.cyr:142-143`, a bare `alloc(16)` on every connect); the rest is in
+sandhi's dispatch and connect path, not yet located. At one exporter batch a second that is ~41 MB a
+day. **The ask:** an `_a` form of `sockaddr_in` (or a caller-supplied buffer), and sandhi's
+`_sandhi_http_dispatch_a` keeping every allocation in `a`. Pinned meanwhile by bounds, not zero:
+`tests/telemetry_otlp.tcyr` (< 512 B a POST) and `tests/llm_hoosh.tcyr` (< 1 KiB a call).
 
 | Dep | Open filings |
 |---|---|

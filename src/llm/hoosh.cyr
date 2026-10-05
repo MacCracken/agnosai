@@ -439,7 +439,11 @@ fn agnosai_hoosh_extract_finish_reason(body: Str): i64 {
 
 # Pull `error.message` out of an error body, or 0 when not present.
 fn agnosai_hoosh_extract_error(body: Str): i64 {
-    var v = agnosai_hoosh_parse_body(body);
+    return _agnosai_hoosh_error_of(agnosai_hoosh_parse_body(body));
+}
+
+# `error.message` of a parsed body `v`, or 0 when not present. Borrowed from `v`.
+fn _agnosai_hoosh_error_of(v): i64 {
     if (v == 0) { return 0; }
     var err = bayan_json_v_obj_get_by_cstr(v, "error");
     if (err == 0) { return 0; }
@@ -561,32 +565,52 @@ fn agnosai_hoosh_extract_models(body: Str): i64 {
 
 # Build a full InferenceResponse from a non-streaming body, or 0 when the body
 # carries no content.
+#
+# One parse, not five (2.1.6): each `agnosai_hoosh_extract_*` re-parses the
+# whole body, so building a response from them parsed it five times on the
+# global bump. The fields are read off one tree by `_agnosai_hoosh_response_of`.
 fn agnosai_hoosh_response_from_body(body: Str): i64 {
-    var content = agnosai_hoosh_extract_content(body);
+    return _agnosai_hoosh_response_of(agnosai_hoosh_parse_body(body));
+}
+
+# A string field of `obj`, cloned onto the global allocator, or 0 when absent or
+# not a string. A response outlives the tree it was read from, which on the
+# chat path is an arena reset as soon as the call returns.
+fn _agnosai_hoosh_str_clone(obj, key): i64 {
+    if (obj == 0) { return 0; }
+    var f = bayan_json_v_obj_get_by_cstr(obj, key);
+    if (f == 0) { return 0; }
+    if (bayan_json_v_is_str(f) == 0) { return 0; }
+    return str_clone(bayan_json_v_str(f));
+}
+
+# An InferenceResponse from a parsed body `v`, or 0 when it carries no content —
+# the same fields, defaults and sentinels as the `agnosai_hoosh_extract_*`
+# readers. Every string it keeps is a COPY, so `v` may live in an arena.
+fn _agnosai_hoosh_response_of(v): i64 {
+    var first = _agnosai_hoosh_first_choice(v);
+    if (first == 0) { return 0; }
+    var content = _agnosai_hoosh_str_clone(bayan_json_v_obj_get_by_cstr(first, "message"), "content");
     if (content == 0) { return 0; }
 
-    var model = agnosai_hoosh_extract_model(body);
+    var model = _agnosai_hoosh_str_clone(v, "model");
     if (model == 0) { model = str_from(""); }
 
     var resp = agnosai_inference_response_new(content, model);
-    store64(resp + AGN_RESP_FINISH_REASON, agnosai_hoosh_extract_finish_reason(body));
+    store64(resp + AGN_RESP_FINISH_REASON, _agnosai_hoosh_str_clone(first, "finish_reason"));
 
-    var prompt: i64[1];
-    var completion: i64[1];
-    store64(&prompt, 0);
-    store64(&completion, 0);
-    if (agnosai_hoosh_extract_usage(body, &prompt, &completion) == 1) {
-        store64(resp + AGN_RESP_PROMPT_TOKENS, load64(&prompt));
-        store64(resp + AGN_RESP_COMPLETION_TOKENS, load64(&completion));
+    var cost = AGNOSAI_NO_LIMIT;
+    var provider = 0;
+    var usage = bayan_json_v_obj_get_by_cstr(v, "usage");
+    if (usage != 0 && bayan_json_v_is_obj(usage) == 1) {
+        store64(resp + AGN_RESP_PROMPT_TOKENS, _agnosai_int_field(usage, "prompt_tokens", 0));
+        store64(resp + AGN_RESP_COMPLETION_TOKENS, _agnosai_int_field(usage, "completion_tokens", 0));
+        provider = _agnosai_hoosh_str_clone(usage, "provider");
+        var c = bayan_json_v_obj_get_by_cstr(usage, "cost_micro_usd");
+        if (c != 0 && bayan_json_v_is_int(c) == 1) { cost = bayan_json_v_int(c); }
     }
-
-    var cost: i64[1];
-    var provider: i64[1];
-    store64(&cost, AGNOSAI_NO_LIMIT);
-    store64(&provider, 0);
-    agnosai_hoosh_extract_cost(body, &cost, &provider);
-    store64(resp + AGN_RESP_COST_MICRO_USD, load64(&cost));
-    store64(resp + AGN_RESP_PROVIDER, load64(&provider));
+    store64(resp + AGN_RESP_COST_MICRO_USD, cost);
+    store64(resp + AGN_RESP_PROVIDER, provider);
     return resp;
 }
 
@@ -697,6 +721,137 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
     return agnosai_hoosh_chat_in(base_url, api_key, request, out_response, 0);
 }
 
+# --- the chat transport: bounded in memory and in time (2.1.6) ------------
+#
+# Through 2.1.5 every chat call used the bare `sandhi_http_post`: the no-free
+# global bump, and no options. Each inference therefore left behind its URL,
+# its headers, its request body, sandhi's 256 KiB receive buffer — allocated at
+# the full cap before a byte arrives — and five parse trees of the response
+# (one per `extract_*` reader): ~256 KiB of RSS per inference for good, ~0.9 GB
+# an hour for a crew runner making one call a second. With no timeouts, a
+# gateway that accepted and never answered held the task's thread forever; the
+# crew's deadline is cooperative and is read only between tasks.
+#
+# Now each call takes an arena from `_AGNOSAI_HOOSH_POOL`, builds and sends the
+# request and parses the answer in it — once — copies out the strings the
+# response keeps, and gives the arena back. What still reaches the global bump
+# per call is sandhi's own connect path (a few hundred bytes, filed with sandhi)
+# and the response the caller keeps.
+#
+# The pool is sized for the concurrent inferences a process runs — crews ×
+# their parallel tasks — and an empty pool mints rather than blocks (see
+# `arena_pool.cyr`), so 32 parked arenas is a memory bound, not a cap on work.
+#
+# ⚠ **Built on the FIRST call, not at load — unlike the other pools here.** Built
+# eagerly, its 32 × 64 KiB came to ~2 MB on the global bump before `main`, in
+# every program that links the chat path whether it ever calls a model or not —
+# and that alone made `crew_runner_10_tasks_parallel_4_{quiet,watched}` ~35%
+# slower (404 → 550 µs, A/B against 2.1.5 on one host; the runs never touch the
+# pool, so it is where the bump's later allocations land, not work). Smaller
+# arenas were not a fix: 16 KiB measured 423 to 681 µs run to run.
+#
+# `arena_pool.cyr`'s rule against a lazy build is about the RACE — two threads
+# both seeing 0 and both building, the loser's arenas leaked. That is closed
+# here by double-checked locking: the pointer is published with `atomic_store`
+# only once the pool is whole, read with `atomic_load`, and built under a mutex
+# that is created at load (one small allocation). A process that never calls a
+# model never builds the pool.
+var _AGNOSAI_HOOSH_ARENA_SLOTS = 32;
+var _AGNOSAI_HOOSH_ARENA_BYTES = 65536;
+var _AGNOSAI_HOOSH_POOL = 0;
+var _AGNOSAI_HOOSH_POOL_LOCK = mutex_new();
+
+# The chat call's arena pool, built on first use. 0 only when it cannot be built.
+fn _agnosai_hoosh_pool(): i64 {
+    var p = atomic_load(&_AGNOSAI_HOOSH_POOL);
+    if (p != 0) { return p; }
+    mutex_lock(_AGNOSAI_HOOSH_POOL_LOCK);
+    p = atomic_load(&_AGNOSAI_HOOSH_POOL);
+    if (p == 0) {
+        p = agnosai_arena_pool_new(_AGNOSAI_HOOSH_ARENA_SLOTS, _AGNOSAI_HOOSH_ARENA_BYTES);
+        if (p != 0) { atomic_store(&_AGNOSAI_HOOSH_POOL, p); }
+    }
+    mutex_unlock(_AGNOSAI_HOOSH_POOL_LOCK);
+    return p;
+}
+
+# The chat call's ceilings, in ms: connect; each read or write; the whole
+# exchange. Generous on purpose — a long non-streaming completion is legitimate
+# and slow — and finite on purpose. `agnosai_hoosh_set_timeouts` changes them.
+var AGNOSAI_HOOSH_CONNECT_MS = 10000;
+var AGNOSAI_HOOSH_IO_MS = 300000;
+var AGNOSAI_HOOSH_TOTAL_MS = 600000;
+
+# The options every chat call posts with — one block, built at load, read-only
+# once the process serves. The response cap is sandhi's default (256 KiB), as
+# it was in 2.1.5.
+fn _agnosai_hoosh_opts_new(): i64 {
+    var o = sandhi_http_options_new();
+    if (o == 0) { return 0; }
+    sandhi_http_options_connect_ms(o, AGNOSAI_HOOSH_CONNECT_MS);
+    sandhi_http_options_read_ms(o, AGNOSAI_HOOSH_IO_MS);
+    sandhi_http_options_write_ms(o, AGNOSAI_HOOSH_IO_MS);
+    sandhi_http_options_total_ms(o, AGNOSAI_HOOSH_TOTAL_MS);
+    return o;
+}
+var _AGNOSAI_HOOSH_OPTS = _agnosai_hoosh_opts_new();
+
+# Set the chat call's connect, per-read/-write and whole-exchange ceilings, in
+# ms. Process-wide. ⚠ **Call at start-up, before any crew runs** — the block is
+# read without a lock on every call. Returns 0, or -1 for a value of 0 or less.
+fn agnosai_hoosh_set_timeouts(connect_ms, io_ms, total_ms): i64 {
+    if (connect_ms <= 0 || io_ms <= 0 || total_ms <= 0) { return 0 - 1; }
+    var o = _AGNOSAI_HOOSH_OPTS;
+    if (o == 0) { return 0 - 1; }
+    sandhi_http_options_connect_ms(o, connect_ms);
+    sandhi_http_options_read_ms(o, io_ms);
+    sandhi_http_options_write_ms(o, io_ms);
+    sandhi_http_options_total_ms(o, total_ms);
+    return 0;
+}
+
+# The chat call's whole-exchange ceiling, in ms.
+fn agnosai_hoosh_total_timeout_ms(): i64 {
+    return sandhi_http_options_get_total_ms(_AGNOSAI_HOOSH_OPTS);
+}
+
+# `base` + `/v1/chat/completions` as a NUL-terminated C string in `a` — what
+# sandhi takes — with one trailing `/` of `base` dropped, as
+# `agnosai_hoosh_join_url` does. 0 when `a` runs out.
+fn _agnosai_hoosh_endpoint_cstr_a(a, base: Str): i64 {
+    var blen = str_len(base);
+    if (blen > 0) {
+        if (load8(str_data(base) + blen - 1) == 47) { blen = blen - 1; }
+    }
+    var path = "/v1/chat/completions";
+    var plen = strlen(path);
+    var buf = alloc_via(a, blen + plen + 1);
+    if (buf == 0) { return 0; }
+    memcpy(buf, str_data(base), blen);
+    memcpy(buf + blen, path, plen);
+    store8(buf + blen + plen, 0);
+    return buf;
+}
+
+# `agnosai_hoosh_headers` in `a`: the same two headers, nothing on the global bump.
+fn _agnosai_hoosh_headers_a(a, api_key: Str): i64 {
+    var h = sandhi_headers_new_a(a);
+    if (h == 0) { return 0; }
+    sandhi_headers_set_a(a, h, "Content-Type", "application/json");
+    if (api_key != 0) {
+        var klen = str_len(api_key);
+        if (klen > 0) {
+            var v = alloc_via(a, 7 + klen + 1);
+            if (v == 0) { return 0; }
+            memcpy(v, "Bearer ", 7);
+            memcpy(v + 7, str_data(api_key), klen);
+            store8(v + 7 + klen, 0);
+            sandhi_headers_set_a(a, h, "Authorization", v);
+        }
+    }
+    return h;
+}
+
 # POST a chat-completions request to the gateway, as a child of `parent_sc`.
 #
 # Returns 0 on success, having written the InferenceResponse to `out_response`.
@@ -734,11 +889,35 @@ fn agnosai_hoosh_chat_in(base_url: Str, api_key: Str, request, out_response, par
         _t0 = clock_epoch_ns();
     }
 
-    var url = agnosai_hoosh_endpoint(base_url);
-    var headers = agnosai_hoosh_headers(api_key);
-    var body = agnosai_inference_request_to_json(request);
+    # One arena per call, from the pool, given back on every exit (2.1.6).
+    var pool = _agnosai_hoosh_pool();
+    var a = agnosai_arena_pool_acquire(pool);
+    if (a == 0) {
+        _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
+          _agnosai_hoosh_error_type(_span, "no_response"));
+        return str_from("hoosh transport error: no arena for the request");
+    }
+    var rc = _agnosai_hoosh_chat_a(a, base_url, api_key, request, out_response,
+      _span, _self, parent_sc, _t0);
+    agnosai_arena_pool_release(pool, a);
+    return rc;
+}
 
-    var r = sandhi_http_post(str_cstr(url), headers, str_data(body), str_len(body));
+# The body of `agnosai_hoosh_chat_in`, in arena `a`. ⚠ **Nothing it returns may
+# point into `a`**: the caller resets it. Error strings are built on the global
+# bump (the caller keeps them), and the response's strings are copies.
+fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
+  _span, _self, parent_sc, _t0): i64 {
+    var url = _agnosai_hoosh_endpoint_cstr_a(a, base_url);
+    var headers = _agnosai_hoosh_headers_a(a, api_key);
+    var body = agnosai_inference_request_to_json_a(a, request);
+    if (url == 0 || headers == 0 || body == 0) {
+        _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
+          _agnosai_hoosh_error_type(_span, "no_response"));
+        return str_from("hoosh transport error: could not build the request");
+    }
+
+    var r = sandhi_http_post_opts_a(a, url, headers, str_data(body), str_len(body), _AGNOSAI_HOOSH_OPTS);
     if (r == 0) {
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_error_type(_span, "no_response"));
@@ -750,7 +929,7 @@ fn agnosai_hoosh_chat_in(base_url: Str, api_key: Str, request, out_response, par
         str_builder_add_cstr(sb, "hoosh transport error: ");
         str_builder_add_cstr(sb, sandhi_err_kind_name(kind));
         str_builder_add_cstr(sb, " (");
-        str_builder_add(sb, url);
+        str_builder_add_cstr(sb, url);
         str_builder_add_cstr(sb, ")");
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_kind_error_type(_span, kind));
@@ -758,13 +937,15 @@ fn agnosai_hoosh_chat_in(base_url: Str, api_key: Str, request, out_response, par
     }
 
     var status = sandhi_http_status(r);
-    var resp_body = str_new(sandhi_http_body(r), sandhi_http_body_len(r));
+    # Parsed ONCE, in the arena: the error detail and every response field are
+    # read off this one tree.
+    var tree = bayan_json_v_parse_buf_a(a, sandhi_http_body(r), sandhi_http_body_len(r));
 
     if (status < 200 || status >= 300) {
         var esb = str_builder_new();
         str_builder_add_cstr(esb, "hoosh returned HTTP ");
         str_builder_add_int(esb, status);
-        var detail = agnosai_hoosh_extract_error(resp_body);
+        var detail = _agnosai_hoosh_error_of(tree);
         if (detail != 0) {
             str_builder_add_cstr(esb, ": ");
             str_builder_add(esb, detail);
@@ -774,7 +955,7 @@ fn agnosai_hoosh_chat_in(base_url: Str, api_key: Str, request, out_response, par
         return str_builder_build(esb);
     }
 
-    var parsed = agnosai_hoosh_response_from_body(resp_body);
+    var parsed = _agnosai_hoosh_response_of(tree);
     if (parsed == 0) {
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_error_type(_span, "invalid_response"));
@@ -786,7 +967,7 @@ fn agnosai_hoosh_chat_in(base_url: Str, api_key: Str, request, out_response, par
     # the header, not the body, is what a caller bills on.
     var cache_hdr = sandhi_headers_get(sandhi_http_headers(r), "X-Hoosh-Cache");
     if (cache_hdr != 0) {
-        store64(parsed + AGN_RESP_CACHE, agnosai_hoosh_cache_from_header(str_from(cache_hdr)));
+        store64(parsed + AGN_RESP_CACHE, agnosai_hoosh_cache_from_header(str_from_a(a, cache_hdr)));
     }
 
     # The success path is the only one with usage to record: the responding

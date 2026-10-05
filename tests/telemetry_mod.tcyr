@@ -93,8 +93,18 @@ fn main(): i64 {
     # meaningful below by driving the parse directly.
     var ep = agnosai_otlp_endpoint_from_env();
     assert(ep >= 0, "reading the OTLP endpoint from the environment does not fault");
+    # 2.1.6 — the per-signal OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, read the same way.
+    var tep = agnosai_otlp_traces_endpoint_from_env();
+    assert(tep >= 0, "reading the traces endpoint from the environment does not fault");
 
     # --- oracle: tracing_guard_can_be_created_without_otel --------------
+    # 2.1.6 — the from-environment form answers a guard whatever the shell holds;
+    # if it did start an exporter (a developer's OTEL_* exported), stop it at once
+    # so nothing below inherits it.
+    var gf = agnosai_telemetry_init_tracing_from_env();
+    assert(gf != 0, "init_tracing_from_env answers a guard");
+    agnosai_telemetry_shutdown(gf);
+    sakshi_clear_emit_hook();
     var g = agnosai_telemetry_init_tracing(0);
     assert(g != 0, "a guard is returned with no OTLP endpoint");
     assert_eq(agnosai_tracing_guard_otel_active(g), 0, "and it holds no exporter");
@@ -535,6 +545,16 @@ fn main(): i64 {
     assert_eq(agnosai_tracing_guard_exporter(ge0), 0, "and holds no exporter");
     sakshi_clear_emit_hook();
     sakshi_set_level(SK_INFO);
+
+    # 2.1.6 — the per-signal form joins the SAME running exporter (one per
+    # process) rather than starting a second; its as-is URL is what a FIRST
+    # init would post to, which `agnosai_otlp_exporter_new_traces` pins in
+    # tests/telemetry_otlp.tcyr.
+    var gt = agnosai_telemetry_init_export_traces(str_from("http://localhost:4318/custom"), str_from("t"));
+    assert_eq(agnosai_tracing_guard_exporter(gt), agnosai_tracing_guard_exporter(ge),
+      "init_export_traces reuses the running exporter too");
+    assert_eq(agnosai_tracing_guard_otel_active(agnosai_telemetry_init_export_traces(0, str_from("t"))), 0,
+      "and a traces URL of 0 starts nothing");
 
     # --- recording under a span context (ADR 023) ---------------------------
     var ering = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());

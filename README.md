@@ -7,7 +7,7 @@ AgnosAI replaces Python/CrewAI orchestration with a compiled Cyrius binary -- re
 > **This is a Cyrius project.** It began as Rust; that tree is frozen at
 > `rust-old/` as history, not a spec, and is **scheduled for deletion** — the
 > 2.1.0 audit found nothing that still depends on it. The 2.1.0 notes put the
-> deletion in the next release; 2.1.1 to 2.1.5 did not carry it, so it is still
+> deletion in the next release; 2.1.1 to 2.1.6 did not carry it, so it is still
 > open on the roadmap. Nothing under `rust-old/` is built or shipped.
 
 ## Why
@@ -85,14 +85,14 @@ cyrius coverage --min 80
 
 AgnosAI ships **both** a binary and a bundle. `cyrius.cyml` carries a `[lib]`
 stanza of **111** modules, and `cyrius distlib` concatenates them into
-`dist/agnosai.cyr` (**38,905 lines** at 2.1.5, stamped with the release) plus a
+`dist/agnosai.cyr` (**39,324 lines** at 2.1.6, stamped with the release) plus a
 `dist/agnosai.deps` sidecar naming the **45** stdlib leaves the fold needs in
 scope — so a `[deps.agnosai]` block resolves like any other dependency:
 
 ```cyml
 [deps.agnosai]
 git = "https://github.com/MacCracken/agnosai.git"
-tag = "2.1.5"
+tag = "2.1.6"
 modules = ["dist/agnosai.cyr"]
 ```
 

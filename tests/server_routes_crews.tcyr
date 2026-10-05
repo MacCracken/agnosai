@@ -591,10 +591,25 @@ fn _t_malformed_id_is_422(): i64 {
 fn _t_cancel_crew(): i64 {
     var o = agnosai_orchestrator_new(0);
     var s = _t_state_with(o);
-    var id = _t_rbody_str(agnosai_route_create_crew(s, _t_valid_body()), "crew_id");
+    # `create_crew` runs the crew inline, so it has FINISHED by the time the id
+    # comes back: cancelling it is a 409 that changes nothing (2.1.6). Through
+    # 2.1.5 it was a 200 that relabelled the completed crew Cancelled.
+    var done_id = _t_rbody_str(agnosai_route_create_crew(s, _t_valid_body()), "crew_id");
+    assert(agnosai_route_status(agnosai_route_cancel_crew(s, done_id)) == AGNOSAI_HTTP_CONFLICT,
+      "cancelling a finished crew is 409");
+    assert(agnosai_crew_state_status(agnosai_orchestrator_crew(o, done_id))
+      == AGNOSAI_CREW_COMPLETED, "...and it stays completed");
+
+    # A crew registered and not yet finished is what a cancel is for.
+    var spec = agnosai_crew_new(str_from("to-cancel"));
+    var ts = vec_new();
+    vec_push(ts, agnosai_task_new(str_from("t")));
+    agnosai_crew_with_tasks(spec, ts);
+    _agnosai_orch_register(o, spec);
+    var id = agnosai_crew_id(spec);
 
     var r = agnosai_route_cancel_crew(s, id);
-    assert(agnosai_route_status(r) == HTTP_OK, "cancelling a known crew is 200");
+    assert(agnosai_route_status(r) == HTTP_OK, "cancelling a known, unfinished crew is 200");
     assert(str_eq(_t_rbody_str(r, "status"), str_from("cancelled")) == 1,
       "...with status cancelled");
     assert(str_eq(_t_rbody_str(r, "crew_id"), id) == 1, "...and the crew id echoed");

@@ -1341,6 +1341,17 @@ fn _agnosai_crew_deps_ready(task, completed): i64 {
 # **Only SUCCESSFUL tasks enter the completed set**, so a failed task's
 # dependents never become ready. That is what makes a failure cascade rather
 # than letting downstream tasks run against missing output.
+#
+# ⚠ **A failure is sticky across waves (2.1.6).** Until 2.1.5 the flag was
+# reset every wave and the stranded check ran only on the wave that failed. A
+# failed branch beside a successful one — `[A fails, X, B <- A, Y <- X]` — let
+# wave 2 ({Y}) succeed and skip the check, so wave 3 found nothing ready and
+# took the DAG-deadlock arm: no state, `crew_completed` never sent, and the
+# registry back at PENDING forever (agnostic, which accepts that crew, read it
+# `running` for good). A run whose remainder a failure stranded now ends like
+# any failed run: a FAILED state with the results it has. The deadlock arm is
+# left to what it was written for — a dependency on a task the spec does not
+# hold, which no failure explains.
 fn _agnosai_crew_run_dag(r, out_err): i64 {
     store64(out_err, 0);
     var spec = load64(r + AGN_CR_SPEC);
@@ -1362,6 +1373,7 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
     var completed = map_new_str();
     var results = vec_new();
     var remaining = order;
+    var any_failed = 0;
 
     while (vec_len(remaining) > 0) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
@@ -1378,6 +1390,9 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
         }
 
         if (vec_len(ready) == 0) {
+            # A failure earlier in the run stranded what is left: its dependents
+            # can never become ready. That is a failed run, not a scheduling error.
+            if (any_failed == 1) { break; }
             # Unreachable after a successful topological sort, but a dangling
             # dependency reaches it — a task depending on an id that is not in
             # the spec is never ready and never sorted away.
@@ -1389,19 +1404,24 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
         var before = vec_len(results);
         _agnosai_crew_run_wave(r, ready, agents, results);
 
-        var wave_failed = 0;
         for (var k = before; k < vec_len(results); k = k + 1) {
             var res = vec_get(results, k);
             if (agnosai_task_result_status(res) == AGNOSAI_STATUS_COMPLETED) {
                 map_set(completed, agnosai_task_result_task_id(res), res);
-            } else { wave_failed = 1; }
+            }
+        }
+        # A ready task that did not end COMPLETED failed — whether its result
+        # says so or it produced none at all, which the result loop above would
+        # never see.
+        for (var q = 0; q < vec_len(ready); q = q + 1) {
+            if (map_get(completed, agnosai_task_id(vec_get(ready, q))) == 0) { any_failed = 1; }
         }
 
         remaining = not_ready;
 
         # Stop early when a failure has stranded everything left, rather than
         # spinning to the deadlock arm.
-        if (wave_failed == 1 && vec_len(remaining) > 0) {
+        if (any_failed == 1 && vec_len(remaining) > 0) {
             var any_runnable = 0;
             for (var m = 0; m < vec_len(remaining); m = m + 1) {
                 var rt = map_get(by_id, vec_get(remaining, m));
@@ -1661,6 +1681,11 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
                 status = AGNOSAI_CREW_FAILED;
             }
         }
+        # ⚠ A task left with no result did not complete (2.1.6): a DAG whose
+        # failure stranded its dependents, or a worker that produced nothing.
+        # Counting only the results that exist is the vacuous-`all()` shape — a
+        # crew reported COMPLETED for work that never ran.
+        if (vec_len(results) < vec_len(tasks)) { status = AGNOSAI_CREW_FAILED; }
     }
 
     # Balance the active gauge and fold this crew's tasks into the counters.

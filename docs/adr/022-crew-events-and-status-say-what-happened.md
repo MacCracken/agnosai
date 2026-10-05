@@ -2,6 +2,17 @@
 
 ## Status: Accepted (2026-10-04), shipped in 2.1.5. Proposed 2026-10-03.
 
+Note (2026-10-04, 2.1.6): two places this ADR's rule had not reached, both found
+by agnostic 0.1.14's review. (1) Decision 6 says `POST /api/v1/crews` "reaches
+neither" error arm. It reached the deadlock arm: a `dag` crew with a failed
+branch beside a successful one ran its waves, found nothing ready and took the
+arm, because the failure flag was per wave. Since 2.1.6 that run ends with a
+FAILED state and `crew_completed`; the arm is left to dependencies on tasks the
+spec does not hold. (2) `agnosai_orchestrator_cancel_crew` overwrote a FINISHED
+crew's state with CANCELLED, so a late cancel relabelled finished work. Since
+2.1.6 it refuses, and the REST route answers 409. Both diverge from the oracle,
+as everything this ADR decides does.
+
 Note (2026-10-03): [ADR 023](023-genai-semconv-spans-and-w3c-trace-context.md),
 in the same release (2.1.5), gave `agnosai_execute_task_in_crew` a trailing
 `parent_sc` (the crew's span context) and the hoosh client's chat pointer a

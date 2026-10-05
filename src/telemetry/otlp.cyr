@@ -633,11 +633,21 @@ fn agnosai_otlp_build_batch(service_name: Str, frags, n): i64 {
 
 # --- endpoint parsing -----------------------------------------------------
 
-# Whether the endpoint is an `https://` collector.
+# Whether the endpoint is an `https://` collector — the scheme in any case.
+#
+# ⚠ Case-insensitive since 2.1.6. A URL scheme is (RFC 3986 §3.1), sandhi parses
+# it so, and through 2.1.5 `HTTPS://host` read as not-https here: the path scan
+# below then started on the second `/` of `//` and called the URL pathed.
 fn agnosai_otlp_is_https(url): i64 {
     if (url == 0) { return 0; }
     if (strlen(url) < 8) { return 0; }
-    return memeq(url, "https://", 8);
+    var lit = "https://";
+    for (var i = 0; i < 8; i = i + 1) {
+        var c = load8(url + i) & 255;
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c != (load8(lit + i) & 255)) { return 0; }
+    }
+    return 1;
 }
 
 # The path component of `http://host:port/path`, or `/v1/traces` when the URL
@@ -897,11 +907,47 @@ fn agnosai_otlp_ring_drain(r, service_name: Str): i64 {
 # POST's result is ignored, the thread is detached, and the ring drops the
 # oldest span when it is full. Telemetry loss is preferable to backpressure on
 # the work the telemetry describes.
+#
+# ## ⚠ Every POST is bounded, in memory and in time (2.1.6)
+#
+# Through 2.1.5 `_agnosai_otlp_post` used the bare `sandhi_http_post`: the
+# no-free global bump, and no options. Each batch therefore left its URL, its
+# headers, its request bytes and sandhi's **256 KiB receive buffer** on the bump
+# for good — measured at ~258 KiB of RSS per batch against a collector that
+# answers (about 0.9 GB an hour at one batch a second), ~1.5 KB against one that
+# is down. And with no options a collector that accepts and never answers held
+# the exporter's `recv` forever, and the final flush in
+# `agnosai_otlp_exporter_stop` with it, so a stop never returned.
+#
+# Now the exporter owns one growable arena, reset before and after every POST,
+# and one options block: the collector's answer is capped at
+# `AGNOSAI_OTLP_RESPONSE_MAX` (it is ignored anyway) and the exchange at
+# `AGNOSAI_OTLP_CONNECT_MS` / `_IO_MS` / `_TOTAL_MS`. The arena's chunks are
+# kept across resets, so it settles at the largest batch and stops growing.
+#
+# ## ⚠ One flush at a time (2.1.6)
+#
+# The exporter thread flushes on its clock and `agnosai_otlp_exporter_stop`
+# flushes on the caller's thread. A drained batch lives in the ring's doc arena
+# only "until the next drain", so two concurrent flushes could reset the batch
+# one of them was still posting — and two posts would share the one arena. A
+# mutex now covers drain and post together. A stop therefore waits for an
+# in-flight post, which the timeouts above bound.
+
+# The collector's answer is read only to finish the exchange; 16 KiB holds any
+# OTLP partial-success body.
+var AGNOSAI_OTLP_RESPONSE_MAX = 16384;
+# Connect, per-read/-write, and whole-exchange ceilings for one batch POST, ms.
+var AGNOSAI_OTLP_CONNECT_MS = 5000;
+var AGNOSAI_OTLP_IO_MS = 5000;
+var AGNOSAI_OTLP_TOTAL_MS = 10000;
+# The exporter arena's first chunk; it grows by this much as a batch needs.
+var AGNOSAI_OTLP_POST_ARENA = 65536;
 
 # The oracle has no equivalent; hoosh batches every 1000 ms and so does this.
 var AGNOSAI_OTLP_BATCH_MS = 1000;
 
-# Exporter heap layout — 48 bytes.
+# Exporter heap layout — 80 bytes.
 enum AgnosaiOtlpExporterOff {
     AGN_OTE_RING = 0;
     # 0 when no endpoint is configured — the exporter still drains, so a
@@ -911,10 +957,19 @@ enum AgnosaiOtlpExporterOff {
     AGN_OTE_INTERVAL_MS = 24;
     AGN_OTE_STOP = 32;
     AGN_OTE_EXPORTED = 40;
-    AGN_OTE_SIZE = 48;
+    # 2.1.6 — the POST's arena, its options, the URL as a C string (built once,
+    # 0 with no endpoint) and the lock that makes a flush one drain-and-post.
+    AGN_OTE_ARENA = 48;
+    AGN_OTE_OPTS = 56;
+    AGN_OTE_URL = 64;
+    AGN_OTE_LOCK = 72;
+    AGN_OTE_SIZE = 80;
 }
 
 # An exporter over its own ring. `endpoint` may be 0 (drain and discard).
+#
+# Everything a POST needs that does not change — the URL, the options — is
+# built here, once, so a flush allocates nothing outside the exporter's arena.
 fn agnosai_otlp_exporter_new(endpoint, service_name: Str, interval_ms): i64 {
     var e = alloc(AGN_OTE_SIZE);
     store64(e + AGN_OTE_RING, agnosai_otlp_ring_new());
@@ -923,6 +978,57 @@ fn agnosai_otlp_exporter_new(endpoint, service_name: Str, interval_ms): i64 {
     store64(e + AGN_OTE_INTERVAL_MS, interval_ms);
     store64(e + AGN_OTE_STOP, 0);
     store64(e + AGN_OTE_EXPORTED, 0);
+    store64(e + AGN_OTE_LOCK, mutex_new());
+    store64(e + AGN_OTE_ARENA, 0);
+    store64(e + AGN_OTE_OPTS, 0);
+    store64(e + AGN_OTE_URL, 0);
+    if (endpoint != 0) {
+        _agnosai_otlp_exporter_target(e, str_cstr(_agnosai_otlp_post_url(default_alloc(), endpoint)));
+    }
+    return e;
+}
+
+# An exporter that POSTs to `traces_url` exactly as given — the
+# `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` form, which the OTel specification says is
+# used as-is (2.1.6). `agnosai_otlp_exporter_new` takes the generic base form.
+fn agnosai_otlp_exporter_new_traces(traces_url: Str, service_name: Str, interval_ms): i64 {
+    var e = agnosai_otlp_exporter_new(0, service_name, interval_ms);
+    if (traces_url != 0) {
+        store64(e + AGN_OTE_ENDPOINT, traces_url);
+        _agnosai_otlp_exporter_target(e, str_cstr(traces_url));
+    }
+    return e;
+}
+
+# Point exporter `e` at C-string `url`: the URL, the POST arena and its options.
+fn _agnosai_otlp_exporter_target(e, url): i64 {
+    store64(e + AGN_OTE_URL, url);
+    store64(e + AGN_OTE_ARENA, arena_allocator_growable(AGNOSAI_OTLP_POST_ARENA));
+    var o = sandhi_http_options_new();
+    sandhi_http_options_max_response_bytes(o, AGNOSAI_OTLP_RESPONSE_MAX);
+    sandhi_http_options_connect_ms(o, AGNOSAI_OTLP_CONNECT_MS);
+    sandhi_http_options_read_ms(o, AGNOSAI_OTLP_IO_MS);
+    sandhi_http_options_write_ms(o, AGNOSAI_OTLP_IO_MS);
+    sandhi_http_options_total_ms(o, AGNOSAI_OTLP_TOTAL_MS);
+    store64(e + AGN_OTE_OPTS, o);
+    return e;
+}
+
+# The URL a batch is POSTed to, or 0 when the exporter has no endpoint.
+fn agnosai_otlp_exporter_url(e): i64 {
+    return load64(e + AGN_OTE_URL);
+}
+
+# Set the POST's connect, per-read/-write and whole-exchange ceilings, in ms.
+# Returns the exporter. A no-op for an exporter with no endpoint. Call before
+# `agnosai_otlp_exporter_start`: the options are read on the exporter thread.
+fn agnosai_otlp_exporter_with_timeouts(e, connect_ms, io_ms, total_ms): i64 {
+    var o = load64(e + AGN_OTE_OPTS);
+    if (o == 0) { return e; }
+    sandhi_http_options_connect_ms(o, connect_ms);
+    sandhi_http_options_read_ms(o, io_ms);
+    sandhi_http_options_write_ms(o, io_ms);
+    sandhi_http_options_total_ms(o, total_ms);
     return e;
 }
 
@@ -966,12 +1072,16 @@ var AGNOSAI_OTLP_HDR_MAX = 16;
 var AGNOSAI_OTLP_HDR_KEY_MAX = 128;
 var AGNOSAI_OTLP_HDR_VAL_MAX = 512;
 
-# Parse `OTEL_EXPORTER_OTLP_HEADERS` onto `h`. Returns the number added.
+# Parse `OTEL_EXPORTER_OTLP_HEADERS` onto `h`, allocating in `a`. Returns the
+# number added.
 #
 # ⚠ An over-long key or value is **SKIPPED, never truncated**. These carry API
 # tokens: a truncated token authenticates as nothing and fails at the collector
 # with a 401 that looks like a credential problem rather than a parser one.
-fn _agnosai_otlp_add_env_headers(h): i64 {
+#
+# The key and value are assembled in two stack buffers reused per entry; that is
+# safe because `sandhi_headers_add_a` copies both into `a`.
+fn _agnosai_otlp_add_env_headers_a(a, h): i64 {
     var raw = getenv("OTEL_EXPORTER_OTLP_HEADERS");
     if (raw == 0) { return 0; }
 
@@ -1015,7 +1125,7 @@ fn _agnosai_otlp_add_env_headers(h): i64 {
             store8(vp + vl, 0);
 
             if (kl > 0 && vl > 0 && kover == 0 && vover == 0) {
-                sandhi_headers_add(h, kp, vp);
+                sandhi_headers_add_a(a, h, kp, vp);
                 n = n + 1;
             }
         }
@@ -1033,25 +1143,50 @@ fn _agnosai_otlp_add_env_headers(h): i64 {
 # module's own header describes) sent `POST /` and every collector answered 404.
 # The whole telemetry tier was silently non-functional. Fixed 2026-08-12.
 #
-# An endpoint that already names a path is passed through untouched — the OTLP
-# spec treats `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` as complete, and appending to
-# it would produce `/v1/traces/v1/traces`.
+# ⚠ **The generic endpoint is a BASE URL (2.1.6)** — the OTel exporter
+# specification: `OTEL_EXPORTER_OTLP_ENDPOINT` gets `v1/traces` appended to its
+# path, so `http://c:4318` and `http://c:4318/` post to `/v1/traces` and a
+# gateway's `https://gw/otlp` to `/otlp/v1/traces`. Through 2.1.5 an endpoint
+# naming any path was posted to as given — the rule the spec gives the
+# per-signal `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` only — so `/` and `/otlp`
+# 404'd at the collector and every span was lost in silence.
+#
+# One leniency, kept from 2.1.5 on purpose: a base that already ends in
+# `/v1/traces` is used as given. The spec would make it `/v1/traces/v1/traces`,
+# a path no collector serves, and it is the commonest way the variable is set
+# by mistake. The as-is form proper is `agnosai_otlp_exporter_new_traces`.
 fn _agnosai_otlp_post_url(a, endpoint: Str): Str {
-    var raw = str_cstr(endpoint);
-    if (agnosai_otlp_path(raw) != AGNOSAI_OTLP_DEFAULT_PATH) { return endpoint; }
+    var n = str_len(endpoint);
+    var d = str_data(endpoint);
+    var tail = AGNOSAI_OTLP_DEFAULT_PATH;   # "/v1/traces"
+    var tl = strlen(tail);
+    if (n >= tl && memeq(d + n - tl, tail, tl) == 1) { return endpoint; }
     var sb = str_builder_new_a(a);
     str_builder_add_a(a, sb, endpoint);
-    str_builder_add_cstr_a(a, sb, AGNOSAI_OTLP_DEFAULT_PATH);
+    if (n > 0 && load8(d + n - 1) == 47) {
+        str_builder_add_cstr_a(a, sb, tail + 1);   # "v1/traces" after the base's own '/'
+    } else {
+        str_builder_add_cstr_a(a, sb, tail);
+    }
     return str_builder_build_a(a, sb);
 }
 
-fn _agnosai_otlp_post(endpoint: Str, doc: Str): i64 {
-    var a = default_alloc();
-    var url = _agnosai_otlp_post_url(a, endpoint);
-    var h = sandhi_headers_new();
-    sandhi_headers_add(h, "Content-Type", "application/json");
-    _agnosai_otlp_add_env_headers(h);
-    sandhi_http_post(str_cstr(url), h, str_data(doc), str_len(doc));
+# POST one batch through exporter `e`'s arena and options. The caller holds the
+# exporter's lock. Everything the POST allocates — headers, the request, the
+# answer — is in the arena, which is reset before and after, so nothing outlives
+# the call (2.1.6; see the module header).
+fn _agnosai_otlp_post_e(e, doc: Str): i64 {
+    var url = load64(e + AGN_OTE_URL);
+    var a = load64(e + AGN_OTE_ARENA);
+    if (url == 0 || a == 0) { return 0; }
+    reset_via(a);
+    var h = sandhi_headers_new_a(a);
+    if (h != 0) {
+        sandhi_headers_add_a(a, h, "Content-Type", "application/json");
+        _agnosai_otlp_add_env_headers_a(a, h);
+        sandhi_http_post_opts_a(a, url, h, str_data(doc), str_len(doc), load64(e + AGN_OTE_OPTS));
+    }
+    reset_via(a);
     return 0;
 }
 
@@ -1060,18 +1195,30 @@ fn _agnosai_otlp_post(endpoint: Str, doc: Str): i64 {
 #
 # The testable half of the exporter: it decides *whether* and *what*, and only
 # the final byte-moving step needs a collector.
+#
+# ⚠ Under the exporter's lock, drain and post together (2.1.6): the batch lives
+# in the ring's doc arena only until the next drain, and the POST's arena is the
+# exporter's one. See the module header.
 fn agnosai_otlp_exporter_flush(e): i64 {
+    var lock = load64(e + AGN_OTE_LOCK);
+    mutex_lock(lock);
     var ring = load64(e + AGN_OTE_RING);
     var n = agnosai_otlp_ring_count(ring);
-    if (n == 0) { return 0; }
+    if (n == 0) {
+        mutex_unlock(lock);
+        return 0;
+    }
     var doc = agnosai_otlp_ring_drain(ring, load64(e + AGN_OTE_SERVICE));
-    if (doc == 0) { return 0; }
+    if (doc == 0) {
+        mutex_unlock(lock);
+        return 0;
+    }
     store64(e + AGN_OTE_EXPORTED, load64(e + AGN_OTE_EXPORTED) + n);
-    var endpoint = load64(e + AGN_OTE_ENDPOINT);
     # ⚠ The drain happens even with no endpoint. Skipping it would let the ring
     # fill and every span report as dropped, which reads like a bug in the
     # exporter rather than an absent collector.
-    if (endpoint != 0) { _agnosai_otlp_post(endpoint, doc); }
+    _agnosai_otlp_post_e(e, doc);
+    mutex_unlock(lock);
     return n;
 }
 
@@ -1119,11 +1266,10 @@ fn agnosai_otlp_exporter_start(e): i64 {
 
 # Stop the loop and flush what is left. Returns the spans in the final batch.
 #
-# ⚠ Racy with a flush already in flight on the exporter thread, and benignly so:
-# the drain itself is under the ring lock, so the two threads split the pending
-# spans between two batches rather than duplicating or losing any. The only
-# casualty is `AGN_OTE_EXPORTED`, a diagnostic counter whose increment is not
-# atomic and can lose an update under that race. Not worth a second lock.
+# A flush already in flight on the exporter thread finishes first: flushes take
+# the exporter's lock (2.1.6). The wait is bounded by the POST's timeouts, so a
+# stop against a collector that never answers returns within about
+# `AGNOSAI_OTLP_TOTAL_MS` twice over — the in-flight batch, then the last one.
 #
 # ⚠ The final flush is the point. The oracle's `TracingGuard` exports pending
 # spans when it drops; without this, every span queued in the last interval is

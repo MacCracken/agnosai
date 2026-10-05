@@ -649,6 +649,66 @@ fn main(): i64 {
     agnosai_otlp_exporter_stop(bg);
     assert_eq(agnosai_otlp_exporter_stopping(bg), 1, "and stops when asked");
 
+    # --- 2.1.6: a POST is bounded, in memory and in time --------------------
+    # Through 2.1.5 every POST went through the bare `sandhi_http_post`: its URL,
+    # headers, request and a 256 KiB receive buffer on the no-free global bump —
+    # ~258 KiB of RSS per batch against a live collector — and no timeouts, so a
+    # collector that never answered held the exporter, and its stop, forever.
+    #
+    # (a) Memory. A port nothing listens on: the POST fails at connect, which
+    # still exercises the whole request build. After the first flush (which
+    # grows the exporter's arena once), what a flush leaves on the global bump
+    # is sandhi's own connect path, not the exporter's: ~120 B a POST measured
+    # here (16 of it `sockaddr_in` in lib/net.cyr), ~480 B against a collector
+    # that answers — against 2.1.5's ~1.5 KB and ~258 KB. Filed upstream with
+    # sandhi; the bound below is what a regression to the bare form breaks.
+    var cl = agnosai_otlp_exporter_new(str_from("http://127.0.0.1:1"), str_from("agnosai"), 1000);
+    assert(str_eq_cstr(str_from(agnosai_otlp_exporter_url(cl)), "http://127.0.0.1:1/v1/traces") == 1,
+      "the POST URL is built once, at creation");
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(cl), tool, _t_ctx());
+    agnosai_otlp_exporter_flush(cl);
+    var cl_before = alloc_used();
+    for (var cli = 0; cli < 20; cli = cli + 1) {
+        agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(cl), tool, _t_ctx());
+        agnosai_otlp_exporter_flush(cl);
+    }
+    var cl_per = (alloc_used() - cl_before) / 20;
+    assert(cl_per < 512,
+      "a POST leaves under 512 B on the global bump (sandhi's connect path) — 2.1.5 left ~1.5 KB, and ~258 KB live");
+
+    # (b) Time. A socket that listens and never accepts: the connect completes
+    # in the kernel's backlog, the request is sent, and no answer ever comes.
+    var lt, lfd = tcp_socket();
+    sock_reuse(lfd);
+    var lport = 0;
+    var lp = 47817;
+    while (lp < 47833 && lport == 0) {
+        var bt, bv = sock_bind(lfd, INADDR_LOOPBACK(), lp);
+        if (is_err_result(bt) == 0) { lport = lp; }
+        lp = lp + 1;
+    }
+    var hung_ok = 0;
+    if (lport != 0) {
+        var st2, sv2 = sock_listen(lfd, 8);
+        if (is_err_result(st2) == 0) { hung_ok = 1; }
+    }
+    if (hung_ok == 1) {
+        var hsb = str_builder_new();
+        str_builder_add_cstr(hsb, "http://127.0.0.1:");
+        str_builder_add_int(hsb, lport);
+        var hung = agnosai_otlp_exporter_with_timeouts(
+          agnosai_otlp_exporter_new(str_builder_build(hsb), str_from("agnosai"), 1000), 200, 200, 400);
+        agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(hung), tool, _t_ctx());
+        var h0 = clock_now_ns();
+        agnosai_otlp_exporter_flush(hung);
+        var hung_ms = (clock_now_ns() - h0) / 1000000;
+        assert(hung_ms < 3000,
+          "a collector that never answers costs a flush its timeout — not forever, as through 2.1.5");
+    } else {
+        println("telemetry_otlp: no loopback port to listen on; the hung-collector check did not run");
+    }
+    sock_close(lfd);
+
     # --- the export path allocates NOTHING on the global bump ----------------
     #
     # ⚠ This suite had no allocator assertion at all, and that is exactly why
@@ -719,12 +779,35 @@ fn main(): i64 {
     assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("https://collector:4318")),
         "https://collector:4318/v1/traces"),
       "https too — the scheme offset, not a hardcoded 7");
+    # ⚠ 2.1.6: the generic endpoint is a BASE URL (the OTel spec). Through 2.1.5 a
+    # base naming any path — a trailing `/`, a gateway's `/otlp` — was posted to as
+    # given, and the collector's 404 was ignored: every span lost in silence.
     assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("http://host/custom/path")),
-        "http://host/custom/path"),
-      "an endpoint that already names a path is passed through untouched");
+        "http://host/custom/path/v1/traces"),
+      "a base with a path gets /v1/traces appended to it (2.1.6)");
+    assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("http://localhost:4318/")),
+        "http://localhost:4318/v1/traces"),
+      "a trailing slash is not doubled");
+    assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("https://gw.example.com/otlp/")),
+        "https://gw.example.com/otlp/v1/traces"),
+      "nor is a gateway path's");
+    assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("HTTPS://otlp.example.com")),
+        "HTTPS://otlp.example.com/v1/traces"),
+      "the scheme in any case — through 2.1.5 an upper-case https read as pathed and posted to /");
     assert(str_eq_cstr(_agnosai_otlp_post_url(pa, str_from("http://localhost:4318/v1/traces")),
         "http://localhost:4318/v1/traces"),
-      "and is not doubled into /v1/traces/v1/traces");
+      "a base already ending in /v1/traces is used as given, not doubled (kept from 2.1.5)");
+    assert_eq(agnosai_otlp_is_https("HTTPS://c:4318"), 1, "https is detected in any case");
+
+    # The per-signal form is used exactly as given (OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).
+    var tx = agnosai_otlp_exporter_new_traces(str_from("http://gw:4318/custom"), str_from("agnosai"), 1000);
+    assert(str_eq_cstr(str_from(agnosai_otlp_exporter_url(tx)), "http://gw:4318/custom") == 1,
+      "a traces endpoint is posted to as-is");
+    var bx = agnosai_otlp_exporter_new(str_from("http://gw:4318/custom"), str_from("agnosai"), 1000);
+    assert(str_eq_cstr(str_from(agnosai_otlp_exporter_url(bx)), "http://gw:4318/custom/v1/traces") == 1,
+      "where the same URL as a generic endpoint is a base");
+    assert_eq(agnosai_otlp_exporter_url(agnosai_otlp_exporter_new_traces(0, str_from("agnosai"), 1000)), 0,
+      "and a traces exporter with no URL posts nowhere");
 
     return assert_summary();
 }

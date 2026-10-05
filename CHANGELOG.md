@@ -7,6 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.6] — 2026-10-04
+
+Five fixes found by agnostic 0.1.14's adversarial review of its re-pin to 2.1.5, released so that
+agnostic takes them from a tag rather than working around them (no toolchain or dependency change:
+cyrius 6.6.14, the same six `[deps.*]` tags, a byte-identical `cyrius.lock`). Two are memory and
+time bounds on agnosai's two outbound HTTP paths, two make crew status say what happened (ADR 022's
+rule, applied where 2.1.5 missed it), and one reads `OTEL_EXPORTER_OTLP_ENDPOINT` as the OTel
+specification does.
+
+⚠ **Wire- and config-visible**, all deliberate:
+- `POST /api/v1/crews/{id}/cancel` on a crew that has already finished answers **409** and changes
+  nothing; it answered 200 and relabelled the finished crew `cancelled`.
+- A `dag` crew whose failed branch stranded the rest ends **FAILED** with `crew_completed`; it
+  ended in a "DAG deadlock" error with no state and its registry entry back at `pending` forever.
+- `OTEL_EXPORTER_OTLP_ENDPOINT` is a **base URL**: `v1/traces` is appended even when it names a
+  path (`https://gw/otlp` → `/otlp/v1/traces`, `http://c:4318/` → `/v1/traces`). A base already
+  ending in `/v1/traces` is still used as given. The per-signal `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+  is new and used as-is.
+- The chat call to the gateway has **timeouts** (connect 10 s, each read or write 300 s, the whole
+  exchange 600 s; `agnosai_hoosh_set_timeouts`); it had none.
+
+### Fixed
+
+- **The OTLP exporter leaked ~258 KiB per batch and could hang for good.** `_agnosai_otlp_post`
+  used the bare `sandhi_http_post`: the no-free global bump and no options, so every batch left its
+  URL, headers, request and sandhi's 256 KiB receive buffer behind (measured: RSS 66 MB → 325 MB
+  over 1,000 posts to a local collector; ~0.9 GB an hour at one batch a second), and a collector
+  that accepted and never answered held the exporter — and `agnosai_otlp_exporter_stop`'s final
+  flush, so the process's shutdown — forever. Now the exporter owns one growable arena, reset around
+  every POST, and one options block: the answer is capped at 16 KiB (it is ignored), the exchange
+  at 5 s connect / 5 s per read or write / 10 s total (`agnosai_otlp_exporter_with_timeouts`). A
+  successful POST now leaves **480 B** on the global bump (was 264,040 B), all of it inside sandhi's
+  own dispatch (16 B of it `sockaddr_in` in the stdlib's `net.cyr`) — filed upstream.
+- **Two flushes could corrupt each other's batch.** The exporter thread and `stop` both flushed,
+  and a drained batch lives in the ring's doc arena only until the next drain; they now share a
+  lock over drain and post, and a stop waits for an in-flight POST (bounded by the timeouts above).
+- **`OTEL_EXPORTER_OTLP_ENDPOINT` with a path, or an upper-case scheme, lost every span.** An
+  endpoint naming any path was posted to as given — the per-signal rule applied to the generic
+  variable — so a trailing `/` posted to `/` and a gateway's `/otlp` to `/otlp`, and both 404s were
+  ignored. `agnosai_otlp_is_https` compared the scheme case-sensitively, so `HTTPS://host` read as
+  pathed. Both fixed (see the ⚠ list); `agnosai_otlp_exporter_new_traces`,
+  `agnosai_telemetry_init_export_traces`, `agnosai_otlp_traces_endpoint_from_env` and
+  `agnosai_telemetry_init_tracing_from_env` (which `main` now calls) carry the per-signal form.
+- **Every inference leaked ~256 KiB and had no timeout.** `agnosai_hoosh_chat_in` posted with the
+  bare `sandhi_http_post` too, and built its response with five `agnosai_hoosh_extract_*` calls,
+  each re-parsing the whole body on the global bump. A gateway that accepted and never answered
+  held the task's thread forever (the crew deadline is read only between tasks). Now each call takes
+  an arena from a 32-slot pool (`_AGNOSAI_HOOSH_POOL`, built on the first call — built at load,
+  its 2 MB made parallel crew runs ~35% slower in an A/B against 2.1.5, though they never use
+  it), builds the request, posts it under the
+  process-wide `_AGNOSAI_HOOSH_OPTS` and parses the answer **once** in it, copying out only what the
+  response keeps (`_agnosai_hoosh_response_of`). Measured against a local gateway: **2,648 B** per
+  inference stays on the global bump in steady state — the 2,000-byte reply the caller keeps, its
+  other fields, and sandhi's residual — after the pool's 32 arenas have each grown once. The
+  timeouts are generous (a long non-streaming completion is legitimate) and finite;
+  `agnosai_hoosh_set_timeouts` sets them at start-up. `agnosai_hoosh_response_from_body` parses once
+  too.
+- **A `dag` crew with a failed branch beside a successful one never ended** (roadmap: found by
+  agnostic's review). `_agnosai_crew_run_dag` reset its failure flag every wave and checked for
+  stranded tasks only after a wave that failed, so `[A fails, X, B ← A, Y ← X]` ran {A, X}, then {Y},
+  then found nothing ready and took the DAG-deadlock arm: no state, no `crew_completed`, and the
+  orchestrator put PENDING back for good. The flag is sticky, a ready task with no completed result
+  counts as failed, and a stranded remainder ends the run like any failure — a FAILED state with
+  the results it has. The deadlock arm is left to what it was written for: a dependency on a task
+  the spec does not hold. A run that left any task without a result is never COMPLETED either.
+  agnosai's ADR 022 said `POST /api/v1/crews` reaches neither error arm; it reached this one.
+- **Cancelling a finished crew relabelled it.** `agnosai_orchestrator_cancel_crew` overwrote any
+  registered state with CANCELLED, so a cancel landing a moment after the crew ended turned
+  finished work into `cancelled` — and agnostic, which latches what it is told, then reported every
+  completed result under `cancelled`. It now refuses a finished crew (an `Other` error, under the
+  registry lock, so no completion slips between the check and the write) and the REST route answers
+  409 (`AGNOSAI_HTTP_CONFLICT`). The oracle did the same as 2.1.5; this diverges on purpose (ADR 022).
+
+### Tests
+
+- `orch_crew_runner`: the stranded DAG ends FAILED with three results and `crew_completed` last, and
+  a dangling dependency still takes the deadlock arm (mutation-verified: a per-wave flag fails it).
+- `orch_orchestrator` / `server_routes_crews`: a finished crew's cancel is refused (409 over REST)
+  and leaves it COMPLETED; an unfinished one is cancelled; a second cancel is refused.
+- `telemetry_otlp`: twenty POSTs to a dead port leave under 512 B each on the global bump, and a
+  collector that listens and never answers costs a flush its timeout (both mutation-verified: the
+  bare `sandhi_http_post` fails the first and hangs the second); the base-URL and as-is rules.
+- `llm_hoosh`: a response's strings survive its arena being reset and overwritten; a chat call to a
+  dead gateway leaves under 1 KiB on the global bump; a gateway that never answers costs a call its
+  timeout (both mutation-verified against the bare call).
+- `telemetry_mod`: the per-signal readers and inits.
+
+### Performance
+
+`bench-history.csv` gains 223 rows at 2.1.6, from one unpinned `bench-history.sh` sweep at a
+1-minute load of 2–3. Against 2.1.5's rows: median **+1.0%**, 174 of 223 within ±5%. What moved,
+and why:
+
+- `crew_runner_10_tasks_parallel_4_llm_quiet` 1,376 → 997 µs (**−27.5%**) and `_llm_watched`
+  1,444 → 1,035 µs (**−28.3%**): the chat call's arena and single parse, on the bench's stub gateway.
+- `otlp_post_url_passthrough` 127 → 52 ns and `otlp_post_url_append` 309 → 251 ns: the base-URL
+  rule is a suffix compare, not a path scan.
+- `crew_runner_10_tasks_parallel_4_quiet` 409 → 500 µs and `_watched` 470 → 560 µs read as a
+  regression and are not one: **these two rows measure where the preceding benches left the global
+  heap, not the runner.** Bisected with interleaved A/B builds on one quiet host: 2.1.5 itself reads
+  ~420 µs as shipped and ~507 µs (501–515 over three rounds) with only the traced block before it
+  in `benches/orch.bcyr` removed. That block starts and stops an OTLP exporter, and 2.1.5's
+  exporter leaked ~1.5 KB of global bump per post, which happened to leave the heap where these rows
+  run fast; 2.1.6's exporter leaks nothing there. No code on the measured path changed —
+  aligning the wave's job structs to a cache line, folding the new OTLP constants and padding the
+  data section each left it at ~505–565 µs. Recorded on the roadmap: run these rows on a heap that
+  does not depend on the benches before them.
+- **One real regression was found this way and fixed before the cut:** building
+  `_AGNOSAI_HOOSH_POOL` at load put ~2 MB on the global bump in every program, and those same rows
+  read ~35% slower with it (A/B, the pool disabled vs eager). It is now built on the first chat
+  call, under double-checked locking.
+
+### Verified
+
+- **The gate**, in CI's order: `check-symbols.sh` (2,764 definitions, both targets) →
+  `check-clean.sh` → build (native 5,248,824 B; aarch64 DCE 6,489,432 B) → **99 suites, 8,611
+  assertions, 0 failed** → coverage 99% (1,624/1,636 fns) → `distlib --all --check` → examples →
+  fuzz 4/4 → `cyrius bench` (11 files).
+- **Certified the CI way:** in a replica of the tree with no sibling checkouts and an empty dep
+  cache, `lib sync --full` + `deps` reproduced `lib/` and `cyrius.lock` byte for byte (118 files,
+  8 commit pins), and symbols, cleanliness, the build, `distlib --check` and the example passed there
+  with nothing left dirty.
+- **The binary:** `GET /ready` answers `"version":"2.1.6"`, and SIGTERM shuts it down gracefully.
+- **agnostic, its consumer:** every one of agnostic 0.1.14's 31 suites passes against this tree
+  (resolved through a replica-only `path`), including the tests for the cancel refusal, the
+  per-signal endpoint and the inference timeouts.
+
 ## [2.1.5] — 2026-10-04
 
 Three roadmap items, on 2.1.4's toolchain and dependencies: cyrius 6.6.14, the same six

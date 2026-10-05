@@ -133,6 +133,15 @@ fn _t_stub_chat_expire(client, request, out_response, parent_sc): i64 {
     return _t_stub_chat(client, request, out_response, parent_sc);
 }
 
+# The stub, refusing every task whose request names FAILME — not a retryable error, so
+# that task fails at once. One branch of a DAG fails while its sibling succeeds.
+fn _t_stub_chat_failme(client, request, out_response, parent_sc): i64 {
+    if (str_contains_cstr(agnosai_inference_request_to_json(request), "FAILME") == 1) {
+        return str_from("model refused");
+    }
+    return _t_stub_chat(client, request, out_response, parent_sc);
+}
+
 # A client whose chat call is the stub. The URL is a port nothing listens on, so
 # a call that bypassed the pointer would fail rather than reach a real gateway.
 fn _t_stub_client(): i64 {
@@ -1250,6 +1259,64 @@ fn main() {
     can tell \"the spec was wrong\" from \"the work failed\"");
     assert(load64(&run_err) != 0, "and reports an error instead");
     assert_eq(agnosai_error_kind(load64(&run_err)), AGNOSAI_ERR_CYCLIC_DAG, "a CyclicDAG error");
+
+    # --- 2.1.6: a failed branch beside a successful one ends FAILED ----------
+    # `[A fails, X, B <- A, Y <- X]`: wave 1 {A, X}, A fails; wave 2 {Y} succeeds;
+    # then nothing is ready, because B waits on A. Through 2.1.5 the failure flag
+    # was per wave, so wave 2 skipped the stranded check and wave 3 took the
+    # DAG-deadlock arm: no state, no crew_completed, and an orchestrator that put
+    # PENDING back forever. agnostic accepts this crew — its dependencies are in
+    # range and acyclic — and read it `running` for good.
+    var sd_spec = agnosai_crew_new(str_from("dag-stranded"));
+    var sd_a = agnosai_task_new(str_from("A FAILME"));
+    var sd_x = agnosai_task_new(str_from("X"));
+    var sd_b = agnosai_task_new(str_from("B"));
+    var sd_y = agnosai_task_new(str_from("Y"));
+    agnosai_task_with_dependency(sd_b, agnosai_task_id(sd_a));
+    agnosai_task_with_dependency(sd_y, agnosai_task_id(sd_x));
+    var sd_tasks = vec_new();
+    vec_push(sd_tasks, sd_a);
+    vec_push(sd_tasks, sd_x);
+    vec_push(sd_tasks, sd_b);
+    vec_push(sd_tasks, sd_y);
+    agnosai_crew_with_tasks(sd_spec, sd_tasks);
+    agnosai_crew_with_process(sd_spec, agnosai_process_dag());
+    var sd_sub: i64[1];
+    var sd_runner = agnosai_crew_runner_with_llm(agnosai_crew_runner_new(sd_spec),
+      agnosai_hoosh_client_with_chat(
+        agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_t_stub_chat_failme));
+    agnosai_crew_runner_with_events(sd_runner, _t_watch(sd_spec, &sd_sub));
+    store64(&run_err, 0);
+    var sd_state = agnosai_crew_runner_run(sd_runner, &run_err);
+    assert(sd_state != 0, "a DAG stranded by a failed branch still returns a STATE (2.1.6)");
+    assert_eq(load64(&run_err), 0, "and no scheduling error — no deadlock");
+    if (sd_state != 0) {
+        assert_eq(agnosai_crew_state_status(sd_state), AGNOSAI_CREW_FAILED, "the state is FAILED");
+        assert_eq(vec_len(agnosai_crew_state_results(sd_state)), 3,
+          "with the three tasks that ran: A failed, X and Y completed; B never ran");
+    }
+    var sd_last = 0;
+    var sd_ev = agnosai_event_sub_try_recv(load64(&sd_sub));
+    while (sd_ev != 0) {
+        sd_last = sd_ev;
+        sd_ev = agnosai_event_sub_try_recv(load64(&sd_sub));
+    }
+    assert(sd_last != 0, "events were published");
+    assert(str_eq_cstr(agnosai_crew_event_event_type(sd_last), "crew_completed") == 1,
+      "and the last is crew_completed, as for every crew that ends");
+
+    # A dangling dependency — no failure explains it — still takes the deadlock arm.
+    var dd_spec = agnosai_crew_new(str_from("dag-dangling"));
+    var dd_t = agnosai_task_new(str_from("waits on nothing that exists"));
+    agnosai_task_with_dependency(dd_t, str_from("00000000-0000-4000-8000-000000000000"));
+    var dd_tasks = vec_new();
+    vec_push(dd_tasks, dd_t);
+    agnosai_crew_with_tasks(dd_spec, dd_tasks);
+    agnosai_crew_with_process(dd_spec, agnosai_process_dag());
+    store64(&run_err, 0);
+    assert_eq(agnosai_crew_runner_run(agnosai_crew_runner_new(dd_spec), &run_err), 0,
+      "a dependency on a task the spec does not hold is still a scheduling error");
+    assert(load64(&run_err) != 0, "reported as one");
 
     # --- ADR 011's producer side: /metrics must stop rendering zeros ---------
     # Counters are process-global and accumulate across this whole file, so every

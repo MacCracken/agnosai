@@ -672,8 +672,9 @@ fn agnosai_route_get_crew(state, id: Str): i64 {
 
 # `POST /api/v1/crews/{id}/cancel` — cancel a running crew.
 #
-# 200 with `{"status":"cancelled","crew_id":"<id>"}`, or 404 when the
-# orchestrator reports it does not know the crew.
+# 200 with `{"status":"cancelled","crew_id":"<id>"}`, 404 when the orchestrator
+# reports it does not know the crew, or 409 when the crew has already finished
+# (2.1.6) — it used to answer 200 and relabel finished work `cancelled`.
 fn agnosai_route_cancel_crew(state, id: Str): i64 {
     var key = _agnosai_uuid_key(id);
     if (key == 0) {
@@ -684,8 +685,13 @@ fn agnosai_route_cancel_crew(state, id: Str): i64 {
     # **0 is success**, a non-zero value is the error object it built. The
     # oracle's `match .. { Ok(()) => .., Err(_) => 404 }` maps onto that, not
     # onto a truthy success flag.
-    if (agnosai_orchestrator_cancel_crew(agnosai_app_state_orchestrator(state), key) != 0) {
-        return agnosai_route_error(HTTP_NOT_FOUND, str_from("crew not found"));
+    var err = agnosai_orchestrator_cancel_crew(agnosai_app_state_orchestrator(state), key);
+    if (err != 0) {
+        if (agnosai_error_kind(err) == AGNOSAI_ERR_CREW_NOT_FOUND) {
+            return agnosai_route_error(HTTP_NOT_FOUND, str_from("crew not found"));
+        }
+        return agnosai_route_error(AGNOSAI_HTTP_CONFLICT,
+          str_from("crew has already finished and cannot be cancelled"));
     }
     var obj = bayan_json_v_obj_new();
     bayan_json_v_obj_set(obj, str_from("status"),

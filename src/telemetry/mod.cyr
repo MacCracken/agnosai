@@ -88,8 +88,19 @@ fn agnosai_telemetry_service_name(): i64 {
 
 # The OTLP endpoint from `OTEL_EXPORTER_OTLP_ENDPOINT`, or 0 for the oracle's
 # `None`. An empty value is `None`, matching the oracle's `.filter(|s| !s.is_empty())`.
+# A BASE URL: the exporter appends `v1/traces` (2.1.6, `_agnosai_otlp_post_url`).
 fn agnosai_otlp_endpoint_from_env(): i64 {
     var v = getenv("OTEL_EXPORTER_OTLP_ENDPOINT");
+    if (v == 0) { return 0; }
+    if (strlen(v) == 0) { return 0; }
+    return str_from(v);
+}
+
+# The per-signal `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or 0 when unset or empty
+# (2.1.6). A complete URL, used as-is, and it wins over the generic endpoint —
+# both as the OTel specification orders them.
+fn agnosai_otlp_traces_endpoint_from_env(): i64 {
+    var v = getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
     if (v == 0) { return 0; }
     if (strlen(v) == 0) { return 0; }
     return str_from(v);
@@ -527,6 +538,19 @@ fn agnosai_tracing_guard_service_name(g): i64 {
 #
 # Returns a guard the caller must keep for the process lifetime.
 fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
+    return _agnosai_telemetry_init_tracing_as(otlp_endpoint, 0);
+}
+
+# `agnosai_telemetry_init_tracing` from the environment (2.1.6): the per-signal
+# `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, used as-is, else the generic
+# `OTEL_EXPORTER_OTLP_ENDPOINT` as a base, else OTLP off.
+fn agnosai_telemetry_init_tracing_from_env(): i64 {
+    var traces = agnosai_otlp_traces_endpoint_from_env();
+    if (traces != 0) { return _agnosai_telemetry_init_tracing_as(traces, 1); }
+    return _agnosai_telemetry_init_tracing_as(agnosai_otlp_endpoint_from_env(), 0);
+}
+
+fn _agnosai_telemetry_init_tracing_as(otlp_endpoint, as_is): i64 {
     var service_name = agnosai_telemetry_service_name();
 
     # Here — unlike `main`'s path — a set RUST_LOG replaces the default.
@@ -545,7 +569,7 @@ fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
 
     # Text stderr, as the oracle's OTLP branch uses.
     sakshi_clear_emit_hook();
-    return agnosai_telemetry_init_export(otlp_endpoint, service_name);
+    return _agnosai_telemetry_init_export_as(otlp_endpoint, service_name, as_is);
 }
 
 # Start OTLP span export to `otlp_endpoint` as `service_name`, and touch
@@ -565,6 +589,18 @@ fn agnosai_telemetry_init_tracing(otlp_endpoint): i64 {
 #
 # `otlp_endpoint` of 0 answers a guard with OTLP off, as `init_tracing` does.
 fn agnosai_telemetry_init_export(otlp_endpoint, service_name: Str): i64 {
+    return _agnosai_telemetry_init_export_as(otlp_endpoint, service_name, 0);
+}
+
+# `agnosai_telemetry_init_export` for a complete traces URL, used as-is — the
+# `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` form (2.1.6).
+fn agnosai_telemetry_init_export_traces(traces_url, service_name: Str): i64 {
+    return _agnosai_telemetry_init_export_as(traces_url, service_name, 1);
+}
+
+# The shared body: `as_is` 1 posts to `otlp_endpoint` exactly, 0 treats it as a
+# base and appends `v1/traces`.
+fn _agnosai_telemetry_init_export_as(otlp_endpoint, service_name: Str, as_is): i64 {
     var g = alloc(AGN_TG_SIZE);
     store64(g + AGN_TG_SERVICE_NAME, service_name);
     store64(g + AGN_TG_EXPORTER, 0);
@@ -581,8 +617,12 @@ fn agnosai_telemetry_init_export(otlp_endpoint, service_name: Str): i64 {
         return g;
     }
 
-    var exporter = agnosai_otlp_exporter_new(otlp_endpoint, service_name,
-      AGNOSAI_OTLP_BATCH_MS);
+    var exporter = 0;
+    if (as_is == 1) {
+        exporter = agnosai_otlp_exporter_new_traces(otlp_endpoint, service_name, AGNOSAI_OTLP_BATCH_MS);
+    } else {
+        exporter = agnosai_otlp_exporter_new(otlp_endpoint, service_name, AGNOSAI_OTLP_BATCH_MS);
+    }
     agnosai_otlp_exporter_start(exporter);
     store64(g + AGN_TG_EXPORTER, exporter);
     _agnosai_telemetry_exporter = exporter;

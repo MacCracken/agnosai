@@ -541,25 +541,41 @@ fn agnosai_orchestrator_submit_crew(o, spec): i64 {
     return crew_id;
 }
 
-# Cancel a crew by id. Returns 0, or a CrewNotFound error.
+# Cancel a crew by id. Returns 0, a CrewNotFound error, or — for a crew that
+# has already finished — an Other error saying so (2.1.6).
 #
 # Sets the shared flag so a running crew stops scheduling new tasks — work
 # already in flight finishes — and marks the registered state Cancelled.
 #
 # An unknown id is an ERROR, not a silent no-op: a caller cancelling a crew that
 # was never registered has a bug, and the oracle says so.
+#
+# ⚠ **A finished crew is left as it finished (2.1.6, ADR 022's rule).** Through
+# 2.1.5 this overwrote any registered state, COMPLETED and FAILED included, so a
+# cancel that arrived a moment after the crew ended relabelled finished work as
+# cancelled — and a consumer that latches what it is told (agnostic) then
+# reported every completed result under `cancelled`. The oracle did the same;
+# this diverges on purpose. The check and the write share the registry lock, so
+# no completion can slip between them.
 fn agnosai_orchestrator_cancel_crew(o, crew_id: Str): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
 
-    var flag = map_get(load64(o + AGN_OR_CANCEL), crew_id);
-    if (flag != 0) { store64(flag, 1); }
-
     var state = map_get(load64(o + AGN_OR_CREWS), crew_id);
     if (state == 0) {
+        # Still raise the flag: a crew whose runner registered its flag but whose
+        # state is not in the map yet is mid-registration, and must stop.
+        var early = map_get(load64(o + AGN_OR_CANCEL), crew_id);
+        if (early != 0) { store64(early, 1); }
         mutex_unlock(mtx);
         return agnosai_error_crew_not_found(crew_id);
     }
+    if (_agnosai_orch_is_finished(state) == 1) {
+        mutex_unlock(mtx);
+        return agnosai_error_other(str_from("crew has already finished and cannot be cancelled"));
+    }
+    var flag = map_get(load64(o + AGN_OR_CANCEL), crew_id);
+    if (flag != 0) { store64(flag, 1); }
     agnosai_crew_state_with_status(state, AGNOSAI_CREW_CANCELLED);
     mutex_unlock(mtx);
 

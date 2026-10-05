@@ -2,9 +2,23 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-10-04 (the 2.1.5 release gate).
+> Last refreshed: 2026-10-04 (the 2.1.6 release gate).
 
-## Now — 2.1.5
+## Now — 2.1.6
+
+| | |
+|---|---|
+| **version** | **2.1.6** (cut 2026-10-04): five fixes from agnostic 0.1.14's review of its 2.1.5 re-pin — the OTLP exporter and the hoosh chat call bounded in memory and time, the generic OTLP endpoint read as a base URL (plus the per-signal one), a stranded `dag` run ends FAILED, a finished crew's cancel is refused (409) |
+| **cyrius pin** | **6.6.14** — unchanged |
+| **tests** | **99 suites, 8,611 assertions, 0 failed** in a plain shell with wasmtime present (2.1.5: 8,573). `server_auth` is counted from its own run: in the full run it failed to compile until the arena-pool include it was missing was added. The seven chat-path suites were re-run after the pool became lazy |
+| **coverage** | **99%**: 102/102 files, 1,624/1,636 fns (gate `--min 80`) |
+| **dist** | `dist/agnosai.cyr` **39,324** lines + `dist/agnosai-guard.cyr` 915, both v2.1.6 (2.1.5: 38,905 / 915); `distlib --all --check` current |
+| **binary** | `build/agnosai` **5,248,824 B** (2.1.5: 5,240,304); aarch64 (DCE) **6,489,432 B**. `GET /ready` answers `"version":"2.1.6"`; SIGTERM shuts it down gracefully |
+| **lock** | `cyrius.lock` byte-identical to 2.1.5's (and so to 2.1.4's): no dependency or toolchain change |
+| **gates** | `check-symbols.sh` (2,764 definitions, both targets) → `check-clean.sh` → build (native, aarch64) → test → coverage → `distlib --all --check` → examples (1) → fuzz 4/4 → `cyrius bench`, then the sibling-free, empty-cache replica (see CHANGELOG 2.1.6 *Verified*) |
+| **benchmarks** | `bench-history.csv` has 223 rows at 2.1.6, one unpinned sweep at a 1-minute load of 2–3: median +1.0% against 2.1.5, 174 of 223 within ±5%. The LLM-path crew rows are −27/−28% (the chat arena); `crew_runner_10_tasks_parallel_4_{quiet,watched}` read +22%/+19%, which a bisect shows is the heap position the traced block before them leaves, not the runner — 2.1.5 itself reads ~507 µs with that block removed (CHANGELOG 2.1.6 *Performance*; roadmap) |
+
+### 2.1.5 — the release (2026-10-04)
 
 | | |
 |---|---|

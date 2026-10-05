@@ -61,7 +61,9 @@ it. Over the limit a route answers **429**.
 
 ## Trace context
 
-agnosai exports OpenTelemetry spans when `OTEL_EXPORTER_OTLP_ENDPOINT` is set
+agnosai exports OpenTelemetry spans when `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (a complete URL,
+used as-is) or `OTEL_EXPORTER_OTLP_ENDPOINT` (a base URL: `v1/traces` is appended, as the OTel
+specification has it, unless the base already ends in `/v1/traces`) is set
 (OTLP/HTTP+JSON; `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_SERVICE_NAME` are
 honoured). The spans follow the OTel GenAI semantic conventions, pinned at
 `open-telemetry/semantic-conventions-genai` commit `e07f4eba`
@@ -132,7 +134,7 @@ Readiness check. Returns 200 when the server is fully initialized and ready to a
 ```json
 {
   "status": "ready",
-  "version": "2.1.5"
+  "version": "2.1.6"
 }
 ```
 
@@ -255,7 +257,10 @@ its `profile` once it has finished.
 `status` moves `pending` → `running` → `completed` | `failed` | `cancelled`. A crew is `pending` from
 the moment it is registered, `running` once it is handed to its runner, and holds its terminal
 status when it finishes. A cancel marks it `cancelled` at once and stands even if it lands before
-the crew starts. A timed-out crew is `failed` with no results and no profile.
+the crew starts; a cancel of a crew that has already finished answers **409** and changes nothing
+(2.1.6 — it used to relabel it `cancelled`). A timed-out crew is `failed` with no results and no
+profile. A `dag` crew whose failed task stranded the tasks that depend on it ends `failed` with
+the results it has (2.1.6).
 ([ADR 022](../adr/022-crew-events-and-status-say-what-happened.md))
 
 **One edge runs backwards: `running` → `pending`.** A DAG crew whose run ends in an error rather
@@ -268,7 +273,8 @@ checks the DAG. There are two such errors:
 - **A DAG deadlock.** A task that depends on an id not in the spec is never ready, and the sort
   does not catch it, since it skips dependency ids it cannot find. Every wave before the stuck
   task runs, and those tasks send `task_started`, `task_completed` and `token` events as usual.
-  Then the crew goes back to `pending`.
+  Then the crew goes back to `pending`. (Through 2.1.5 a failed branch beside a successful one
+  reached this arm too; since 2.1.6 that run ends `failed`.)
 
 Neither error sends `crew_completed`. The run returns the error instead of a state.
 
