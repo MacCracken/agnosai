@@ -239,6 +239,30 @@ day. **The ask:** an `_a` form of `sockaddr_in` (or a caller-supplied buffer), a
 | hoosh | **To file (found 2026-10-03, F6).** hoosh 2.7.1 extracts an inbound `traceparent` strictly (`src/lib/trace.cyr:99-141`, `src/main.cyr:124-127`), but exports its own server span with the inbound **parent-id as its own spanId** and no `parentSpanId` (`src/lib/otlp.cyr:72-77`), then forwards the same traceparent to providers. **The ask:** mint a fresh span id for hoosh's span, emit the inbound parent-id as its `parentSpanId`, and forward a traceparent carrying hoosh's OWN span id. **Then agnosai's half:** `agnosai_hoosh_chat_in` adds an outbound `traceparent` header built from its `chat` span's context (`agnosai_otlp_span_context_format_a` already exists), and hoosh's span becomes the chat span's child. Until hoosh changes, sending the header would give hoosh's span the same id as agnosai's `chat` span inside one trace, so agnosai deliberately sends none ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)). Not filed from this lane: the upstream filing is a separate step. |
 | kavach | **Two open (2026-10-03), both reaching agnosai's sandbox.** `2026-10-03-pinned-exec-breaks-uutils-coreutils.md`: kavach execs a pinned fd, and uutils coreutils (Ubuntu's default from 25.10) refuse that exec, so `/bin/echo`, `cat` and the rest exit 1 under kavach on such a host (44 of kavach's suite fail natively on an Ubuntu 26.04 Pi; 3.13.1 and 3.13.2 alike). `2026-10-02-basic-seccomp-kills-native-tls-writes.md` (read from kavach's source by its filer, not traced): the `basic` profile, which agnosai applies to every process-isolated tool, allows no `sendto`, and cyrius 6.6.14's native TLS writes with it, so a sandboxed native-TLS writer on an inherited socket would be killed (a decision for kavach). |
 
+**Recorded by cyrius 6.6.16 (2026-10-05) — what that release changes here.** ⛔ Nothing to do until cyrius
+6.6.16 is tagged and out; none of it needs an agnosai code change. Fold into the pin move after 6.6.15.
+
+- **sandhi row — the chunked-verbs filing reaches agnosai at 6.6.16.** cyrius 6.6.16 folds sandhi **1.10.7**
+  (1.10.5 and 1.10.6 were never folded on their own): the one-shot and chunked response verbs report their
+  write results (B8's SSE stream can notice a departed client), and concurrent requests no longer run under
+  each other's TLS policy hook. Re-check B8 / B16 against it at the bump.
+- **kavach row — a correction to the `basic`-profile reach.** cyrius 6.6.16's review of kavach 3.13.2
+  (recorded in kavach's `2026-10-02-basic-seccomp-kills-native-tls-writes.md`, 2026-10-05) found that the
+  `basic` POLICY never selects `security_create_basic_seccomp_filter`: every spawn path loads the deny-list
+  `security_create_exec_seccomp_filter`, which allows `sendto` / `poll` / `fcntl`, and the policy's
+  `seccomp_profile` string is never read to pick a filter. So agnosai's process-isolated tools are NOT killed
+  by it; only a process that loads the basic filter on itself is (from 6.6.16 also on a plain socket write).
+- **Channels (cyrius thr-1).** `src/arena_pool.cyr`'s `chan_try_recv` / `chan_try_send` never wait, so their
+  semantics were already right everywhere, but before 6.6.16 the ring was unlocked on arm64 macOS — a data race
+  under real threads; 6.6.16 locks it. `src/llm/inference_queue.cyr:223`'s per-request `chan_new(1)` reply
+  channel now really waits on Windows (it answered 0 at once before); it holds no kernel handle per channel —
+  a waiting call borrows an I/O completion port from a small process-wide pool (measured on cass: 400 reply
+  channels waited on once each, 84 → 85 process handles). Channels are still never freed (no `chan_free`;
+  bump bytes only). Every peer now exports `CHAN_BLOCKING`, and `THREADS_CONCURRENT` reads 1 on Windows.
+- **SIGPIPE (cyrius CVE-74).** Every `lib/net.cyr` socket write (`src/server/serve.cyr:625`'s `sock_send`
+  included) uses `sendto(…, MSG_NOSIGNAL)` on Linux and `SO_NOSIGPIPE` on macOS, so a client that resets
+  mid-write cannot kill the server through a plain socket.
+
 **C2 — one local workaround owed for deletion.**
 Not a defect; it is code that exists only because an upstream API could not express
 the thing, and it has a precise deletion condition. Recorded here because this
