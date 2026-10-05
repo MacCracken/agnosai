@@ -255,7 +255,7 @@ See the [docs/](docs/index.md) directory:
 
 ## Project Status
 
-See [docs/development/roadmap.md](docs/development/roadmap.md) for the full development plan and current phase.
+See [docs/development/roadmap.md](docs/development/roadmap.md) for open work and [docs/development/state.md](docs/development/state.md) for where things stand.
 
 ## License
 

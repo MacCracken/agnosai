@@ -1,82 +1,51 @@
 # AgnosAI — Roadmap
 
-> Milestone plan through v2.0. State lives in [`state.md`](state.md); this file
-> is the sequencing — what ships, in what order, against what dependency gates.
-> The technical plan of record is
-> [`cyrius-port-plan.md`](cyrius-port-plan.md); this is its schedule.
+> **This file is forward-facing only**: open and planned work. What shipped lives in
+> [`CHANGELOG.md`](../../CHANGELOG.md), one entry per release; why a design was chosen lives in
+> the [ADRs](../adr/). What is true right now — versions, pins, test counts, sizes — lives in
+> [`state.md`](state.md). [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning
+> archive (the numbered-blocker table). When an item ships it leaves this file: completed items
+> are removed, not ticked or struck through.
 
-## What v2.0.0 is
+## What agnosai is
 
-**The whole of `rust-old/`.** Every module, every Cargo feature, every test,
-every benchmark, every build target. **Wire parity is the bar**, judged against
-`rust-old/`.
+Provider-agnostic agent orchestration in Cyrius — crews, tasks, tools, delegation — ported from
+the Rust line (`rust-old/`), at parity with it and now past it (*Owed work*, section F). agnosai
+is a library with a binary (design principle 5), and every deliberate divergence from the Rust
+line's wire carries an ADR.
 
-> ### ⚠ Scope was narrowed by prior sessions and the user overturned it — 2026-08-07
->
-> This section previously read *"the Rust default build … plus 77% of sandbox,
-> plus JSON-only definitions"* and carried an **"Excluded, with reason"** table.
-> That framing — that the **default cargo build** (`default = []`) is the parity
-> bar, so anything `full`-gated is "past the bar rather than debt" — was
-> **authored here, not decided by the user**, and it survived four handoffs
-> because each session read it as the plan of record and repeated it back.
->
-> Its own attribution column is the evidence: of the four exclusions, only
-> `bhava` cited a **user decree**. The rest were self-issued — *"explicit cyrius
-> non-goal"*, *"behind the non-default feature"*, *"zero consumers; pending
-> sign-off"* for a sign-off nobody ever gave.
->
-> **A cargo feature gate is not a scope boundary.** `fleet`, `definitions`
-> (ZIP and YAML included), `telemetry` with OTLP, the `sandbox`-gated tools,
-> `genai.rs`, `inference_queue.rs`, the `hwaccel` half of `core/resource.rs`,
-> the `#[tokio::test]` suites, `benches/`, `examples/` and the non-`src` surface
-> are all **owed work**, not extensions.
->
-> **Do not add a new exclusion row.** If something looks impossible, the move is
-> to *prove* it — name the missing primitive, grep `lib/` for it, and file the
-> upstream ask. Filing upstream is ordinary work here, and it lands fast: sandhi
-> 1.9.9 and bayan 1.4.0 each shipped within hours of an agnosai filing.
-
-**The one carve-out, and it is a dependency fact rather than a scope call:**
+**The one carve-out, a dependency fact rather than a scope call:**
 
 | Not ported | Why |
 |---|---|
-| bhava / `personality` | **bhava itself has not been ported to Cyrius yet**, so there is nothing to depend on. The wire keeps emitting `null`, which is what the default Rust build emits. Revisit the moment bhava lands in Cyrius — this is the only item the user ever set aside. |
+| bhava / `personality` | **bhava itself has not been ported to Cyrius yet**, so there is nothing to depend on. The wire keeps emitting `null`, which is what the default Rust build emits. Deferred, never dropped: revisit the moment bhava lands in Cyrius. The work is **B5**; the decision is **D2** under *Settled decisions*. This is the only item the user ever set aside. |
 
-## v2.0 criteria
+## Design principles
 
-- [x] **Wire parity verified against `rust-old/` for every shipped surface** —
-      two function-level adversarial audits across all eight module groups
-      (2026-08-13). 30 candidate remainders → 22 real → 22 fixed; a second review
-      of those fixes found 5 more, 3 of them introduced BY the fixes. Every
-      deliberate divergence carries an ADR (007, 009, 010, 019, 020, 021).
-- [x] **`cyrius coverage --min 80` green** — **99%** (1578/1585), 2026-08-13.
-- [x] **Cyrius benchmark baseline established** — 7,108 rows across 67 dated
-      runs in `bench-history.csv`, its own line. Never compared to the frozen
-      Rust CSV.
-- [x] **At least one downstream consumer green — ORDERED AFTER THE TAG, by
-      construction.** ⚠ This criterion was briefly read as a blocker, which is
-      backwards and contradicts this file's own rule at the M8 note: *"zero
-      consumers is a consequence of it not being ported, not a reason to leave
-      it."* A consumer cannot integrate against a port that does not exist yet —
-      **the 2.0.0 tag is what a consumer pins.** Nothing to verify could have
-      existed before it.
+1. **Wire compatibility** — the REST/MCP/A2A surface matches the Rust line's (`rust-old/`; after
+   its deletion, `git show 2.1.0:rust-old/`). Every deliberate divergence carries an ADR.
+2. **Sandbox by default** — untrusted code never runs unsandboxed
+3. **Single binary** — no container orchestration for single-node deployments
+4. **Concurrency via `sandhi_server_run_pooled`** — follow daimon, not hoosh (see port plan, "The concurrency decision")
+5. **Library first** — agnosai is a library with a binary, not a framework
+6. **Lockstep with ai-hwaccel** — aligned versioning, shared practices, same CI rigor
 
-      For the record, daimon is **not** a downstream despite `CLAUDE.md` listing
-      it: no `[deps.agnosai]` (its deps are sakshi, ai-hwaccel, samay, sigil,
-      libro, majra, bote), nothing in its `src/`, no HTTP client aimed at an
-      agnosai endpoint. It is a sibling in the AGNOS ecosystem. **Consumer
-      verification is post-2.0.0 work against the tag**, and belongs on the
-      v2.1 line rather than gating this one.
-- [x] **CHANGELOG complete from v2.0.0 onward** — the `[Unreleased]` body is the
-      2.0.0 release, and `scripts/version-bump.sh` cuts it to a dated heading.
-- [x] **Security audit pass** — the threat model records the controls added
-      2026-08-13 and what is deliberately NOT mitigated. ⚠ It only became a pass
-      once README/SECURITY.md stopped claiming seccomp-bpf/Landlock/cgroups on
-      the process tier, which was never implemented.
+## Performance targets
+
+Carried from the Rust line as *goals*, not as comparisons — the Cyrius baseline
+starts fresh (see CLAUDE.md).
+
+| Metric | Target |
+|--------|--------|
+| Boot to ready | <2s |
+| Memory (idle) | <100 MB |
+| Crew creation | <10ms |
+| Concurrent crews | 100+ |
+| Fleet msg overhead | <1ms |
 
 ## Deleting `rust-old/` — scheduled for the release after 2.1.0, still owed at 2.1.6
 
-None of 2.1.1 to 2.1.5 carried the deletion. The checklist below is unchanged.
+None of 2.1.1 to 2.1.6 carried the deletion. The deletion itself needs the user's OK.
 
 **The 2.1.0 audit (2026-09-26)** read every item and every `#[test]` in `rust-old/` against
 the Cyrius tree — seven module groups plus everything outside `src/`. Every `.rs` file has a
@@ -88,19 +57,25 @@ time. What it found that was easy is fixed in 2.1.0 (see the CHANGELOG); the res
 - [ ] `git rm -r rust-old`, then delete the ignored `rust-old/target/` (~13 GB) from disk — `git
       rm` leaves it.
 - [ ] Update the text that describes it: CLAUDE.md (identity line, layout section, the DO NOT
-      rule), `CONTRIBUTING.md:47`, `docs/architecture/overview.md:34,53`, the README tree line.
+      rule — the user's file, and **B23** moves with it), `CONTRIBUTING.md:47`,
+      `docs/architecture/overview.md:34,53`, and README.md's note (`:8-11`), tree line (`:42`)
+      and `:239`.
 - [ ] `scripts/gen-presets.sh:124` writes a `rust-old/` comment into
       `src/definitions/presets_data.cyr` — edit it and regenerate that file together
       (`check-clean.sh` runs `--check` on it), then `cyrius distlib --all`.
-- [ ] The ~650 comment lines that cite a `rust-old/` path (`# Origin:` headers, test section
-      labels) stay as historical pointers; nothing breaks if they dangle.
+- [ ] Prune `.gitignore`, which is still the Rust-era file: `/target`, `**/target/`,
+      `**/*.rs.bk`, `criterion/`, `tarpaulin-report.*`, `.cargo/`, and a `Cargo.lock` comment
+      naming `agnosai-server`. Drop what only `rust-old/` needed; `sdk/agnosai-tool-sdk/` is still
+      a Rust crate (see *Settled decisions*), so keep what it needs.
+
+The ~650 comment lines that cite a `rust-old/` path (`# Origin:` headers, test section labels)
+stay as historical pointers; nothing breaks if they dangle.
 
 ## Moving the cyrius pin to 6.6.15 — found at the 2.1.5 cut, not started
 
 cyrius **6.6.15** is tagged upstream (seen 2026-10-04). Its fold carries sigil **3.13.9**
 (sigil tag commit `7d7a880`), which contains 3.13.8 (`bbaecc4`). agnosai pins 6.6.14 and
-`[deps.sigil] tag = "3.13.7"`, the 6.6.14 fold. 2.1.5 did not move the pin, because a version
-cut changes no toolchain.
+`[deps.sigil] tag = "3.13.7"`, the 6.6.14 fold. Neither 2.1.5 nor 2.1.6 moved the pin.
 
 **What sigil 3.13.8 / 3.13.9 fix that agnosai reaches at 6.6.14.** Sources: sigil CHANGELOG
 [3.13.8] and [3.13.9], cyrius CHANGELOG [6.6.15].
@@ -133,8 +108,8 @@ cut changes no toolchain.
   The cyrius [6.6.15] notes name "any HMAC / HKDF output (the TLS key schedule)" as left in the
   dead SHA context. agnosai's audit chain (`src/orchestrator/audit.cyr:210`) and kavach
   (`lib/kavach.cyr:7511`) call the same `hmac_sha256`. What those two leave behind is the MAC
-  they publish anyway, plus `hmac_sha256`'s unwiped inner hash (`lib/sigil.cyr:6800-6801`), which the
-  audit chain does not publish but which does not stand in for the key.
+  they publish anyway, plus `hmac_sha256`'s unwiped inner hash (`lib/sigil.cyr:6800-6801`), which
+  the audit chain does not publish but which does not stand in for the key.
 - **Nothing in 3.13.9.** Its one security fix (cyrius CVE-73) is for Windows only: the TPM,
   Secure Boot, IMA, dm-verity and LUKS helpers probed rooted POSIX paths, which are
   drive-relative on Windows. agnosai builds for x86_64 and aarch64 Linux and calls none of
@@ -171,1189 +146,21 @@ here.
 - [ ] Release kavach and libro on cyrius 6.6.15 with `[deps.sigil] tag = "3.13.9"` (libro's
       `[deps.sigil_tpm]` with it). Then release bote on 6.6.15 with that libro. Certify each in
       a sibling-free replica with an empty dep cache.
-- [x] ~~This host's `~/.cyrius/versions/6.6.15` is not the tag.~~ Reinstalled since: its
-      `SOURCE_COMMIT` reads `2f1ed9d1`, `tree-matches-tag: yes`, which is the 6.6.15 tag's commit
-      (checked 2026-10-04 at the 2.1.6 cut). Check it again before certifying — a concurrent
-      session working on cyrius rewrites these slots.
-- [ ] Read 6.6.15's release notes against this tree; the 6.6.6 section at the end of this file
-      is the shape.
+- [ ] Read 6.6.15's release notes against this tree, checking each numbered item with file:line
+      evidence. The model is the 6.6.6 read-through: `git show
+      2.1.6:docs/development/roadmap.md`, section *Moving the cyrius pin to 6.6.6*.
 - [ ] Move `cyrius = "6.6.15"`, `[deps.sigil] tag = "3.13.9"` and the new kavach and bote tags
       together (the sigil tag tracks the fold: rule 1 of the 2.0.10 notes in `state.md`). Then
       run `cyrius lib sync --full` and `cyrius deps`, and certify in a sibling-free replica with
-      an empty dep cache.
+      an empty dep cache. Before certifying, check that this host's `~/.cyrius/versions/6.6.15`
+      `SOURCE_COMMIT` reads `2f1ed9d1` with `tree-matches-tag: yes` (it did at the 2.1.6 cut,
+      2026-10-04): a concurrent session working on cyrius rewrites these slots.
 - [ ] The full gate, including `check-clean.sh`'s lib snapshot against the 6.6.15 snapshot and
       `check-symbols.sh` on both targets.
 
-## Moving the cyrius pin to 6.6.5
-
-⛔ Before bumping the pin to 6.6.5: cross-reference the three deferral comments that turn the lint
-stage of `scripts/check-clean.sh` red (CI runs it at `.github/workflows/ci.yml:108`). 6.6.5's
-cyrlint folds case and joins a phrase wrapped across comment lines, so it sees prose the 6.6.2
-cyrlint never matched.
-
-✅ **Done at 2.0.10 (2026-09-26)** — the pin moved 6.6.2 → 6.6.6 and every item below landed.
-
-- [x] ✅ **2.0.10** — all three are prose and carry `#skip-lint`. ⛔ Put a tracking pointer (CHANGELOG / issue / roadmap / `docs/` path) on a line the phrase
-      itself touches, or mark prose that is not a deferral `#skip-lint`. **(can land now)** — a
-      same-line pointer or `#skip-lint` does not depend on the toolchain.
-  - `src/server/auth.cyr:425` — "is not" / "yet an abstraction", a wrapped "not yet". Prose.
-  - `src/tools/mod.cyr:39` — quotes the retired "Deferred with their features" text. History.
-  - `benches/core.bcyr:384` — "out of" / "scope rather than skipped", a wrapped "out of scope".
-
-  See the cyrius CHANGELOG [6.6.5] entry "cyrlint read every rule ONE PHYSICAL LINE at a time".
-- [x] ✅ **2.0.10** — rewritten; the 122,864 / 122,872-byte boundary re-verified on 6.6.6. `src/fleet/cost_planning.cyr:158-166` described the old
-      `note: oversized array local kept in shared global (not per-thread)`, which carried no
-      file:line (`:164-165`). From 6.6.5 it is a `warning:` that names the declaration's file:line
-      and says an array local over the per-fn frame budget gets STATIC storage, one buffer shared
-      by all calls and all threads. The citation `parse_decl.cyr:89` (`:162`) is now `:122`. See
-      the CHANGELOG [6.6.5] entry "A fn-local STATIC array no longer takes a program-wide global
-      name".
-- [x] ✅ **2.0.10** — re-vendored; `lib/syscalls_aarch64_linux.cyr` carries 263. At the bump, re-run `cyrius deps` — the aarch64 syscall peer moved SYS_UNLINKAT 35 → 263, so
-      an un-re-vendored peer's sys_unlink would run nanosleep.
-
-## Milestones
-
-Dependency-ordered. Each phase decomposes into commit-sized bites (each
-independently compilable + testable). ~122 bites across 10 groups.
-
-### M0 — Port scaffold — ✅ shipped 2026-07-28
-
-- Rust baseline greened: blocker #7 fixed, fmt + clippy clean, all 9 feature combos compile, 863 + 2 + 1 tests pass
-- Terminal Rust benchmark row set captured (112 rows at v1.1.0), CSV frozen into `rust-old/`
-- Blockers re-verified against cyrius 6.4.83 with adversarial refutation of every "resolved" verdict
-- Upstream: **sandhi 1.9.4** shipped (blocker #1 + two adjacent silent-truncation paths found while fixing it); `chan_try_send` filed against cyrius and shipped in 6.4.84 (blocker #4)
-- `cyrius port` run; Rust preserved at `rust-old/`
-
-### M1 — Dependency scaffold (Phase 0)
-
-Ordered stdlib array + declare-ahead git deps (daimon/stiva pattern, **not**
-vendoring). **Gates:** sigil pinned as a git dep and removed from the stdlib
-array (two packagings = daimon's 227 duplicate-fn warnings); UUID reimplemented
-in `src/id.cyr` (mneme is unusable — no lib block, and AGPL against our GPL);
-`ai_sort`/`ai_select_nth` vendored (blocker #8).
-**Exit:** hello-world builds; `cyrius deps` resolves clean.
-
-### M2 — Beachhead: `learning` + `core` (Phase 1)
-
-Both blocked by nothing. `learning` first — zero coupling, zero async, zero
-serde, zero traits, zero I/O — it exercises tyche, f64-as-bit-patterns, and the
-`.tcyr` harness with no downstream risk. Then `core`, the root of the graph.
-**Exit:** learning + core tests green against `rust-old/` as oracle.
-
-- ✅ **`learning` done** — 5 modules + hub, 112 assertions green against the
-  oracle's 35 tests, 100% reference coverage, 10 benchmarks seeding the Cyrius
-  baseline. It confirmed the harness assumptions the rest of the port rests on:
-  a `.tcyr` can include real `src/` modules (no hoosh-style mirror-defining
-  needed), `cyrius tests` walks `tests/` recursively, `cyrius coverage --min`
-  measures project `src/` and gates properly, and the `agnosai_*` prefix rule
-  keeps our symbols clear of the fold (zero duplicate-fn warnings from our code).
-- ✅ **`core` done** — all six oracle submodules plus a shared `core_json`
-  helper module: 388 assertions green, plus 26 for the `src/id.cyr` UUID
-  prerequisite that `message`, `task` and `crew` all key on. 100% reference
-  coverage across the project. The money-representation question is settled (integer micro-USD),
-  and converting to f64 only at the wire boundary means the wire stays
-  byte-identical to serde. Two things still absent, and ⚠ this line used to
-  call them "exclusions ... outside the v2.0.0 parity bar" — **retired**:
-  `AgentDefinition::personality` (bhava, the one real carve-out — still emits
-  `null` for wire parity) and the `#[cfg(feature = "hwaccel")]` half of
-  `resource.rs`, which is owed under M11.
-
-**M2 exit met:** learning + core tests green against `rust-old/` as oracle.
-
-### M3 — `llm`, the hoosh seam (Phase 2) — ✅ done
-
-Cheapest group; the reference implementation already exists (`thoth/src/hoosh.cyr`).
-llm **defines** the types orchestrator consumes, so it lands early.
-**Exit:** a live chat-completion round-trip against `hoosh serve 8088`.
-
-- ✅ **router + retry + hoosh seam client**, 187 assertions green, 100% reference
-  coverage across the project. **Exit met and verified** through
-  `agnosai_hoosh_chat` itself (`scripts/stack.sh check`), not curl.
-- **Correction to the plan's open question 3.** "~20 zero-consumer re-exports"
-  is wrong: 11 have real consumers. Five are data types the seam now defines
-  locally (ProviderType, Message, Role, InferenceRequest, HooshClient); six are
-  server-side subsystems with no client-side equivalent over an HTTP seam
-  (AuditChain at 36 refs, ResponseCache, CostTracker, llm_metrics, cache_key,
-  LlmProvider). **Every consumer of that second set is in M5 or M6**, so
-  whether agnosai reimplements them locally or drops them is a decision for
-  those milestones — AuditChain especially, since it is the tamper-evident
-  audit trail. Also: `genai.rs` is `src/telemetry/genai.rs`, not llm's, so it
-  belongs to M9; `inference_queue.rs` is llm's, `majra`-gated, and genuinely
-  zero-consumer.
-
-### M4 — `tools` (Phase 3) — ✅ **COMPLETE**
-
-native, registry (+ mandatory registry mutex — `run_pooled` makes every worker a
-thread), remote_registry, builtin/*. Defers python_tool/wasm_tool.
-**Exit:** 94 of 115 tests green — met and exceeded; the Cyrius suites carry 1446
-assertions across 24 files, and every execute path that the Rust suites left
-untested (because it needed a live server) is covered here through a transport
-seam.
-
-- ✅ **native + registry done** — 67 assertions. Two forced shape changes, both
-  documented in-module: the `NativeTool` trait becomes a function-pointer vtable
-  (no traits in Cyrius) with a **synchronous** `execute` (no futures), and the
-  lock-free `DashMap` becomes a hashmap behind a futex mutex.
-- ✅ **blocker #8 closed** — `src/order.cyr` lands heapsort + quickselect ahead
-  of `builtin/load_testing.rs`, which needs them for its 100k percentile vector.
-  Benchmarked; see state.md.
-- ✅ **echo + json_transform** — 37 assertions, registering and dispatching
-  through the registry.
-- ✅ **`server/ssrf` pulled forward from M6** — `builtin/load_testing.rs` and
-  `remote_registry.rs` both gate on `is_safe_url`, so it was port-once rather
-  than stub-twice. 81 assertions, weighted toward the bypass classes.
-- ✅ **load_testing** — 88 assertions, and the **first production user of the
-  blocker #3 arena pattern**: one OS thread per simulated user, each with a
-  persistent arena for its latencies plus a scratch arena `reset_via`'d after
-  every request. Both of its blockers (`order` for percentiles, `ssrf` for the
-  URL guard) were cleared ahead of it. The oracle's two tests drive an axum mock
-  server on loopback, which `is_safe_url` rightly refuses — so the port tests the
-  real thread fan-out against a synthetic executor instead, and the network seam
-  is covered separately by `scripts/stack.sh check`.
-- ✅ **security_audit** — 200 assertions. Split at the network boundary like
-  load_testing, which here lets all five of the oracle's mock-server tests port
-  exactly rather than being replaced. Four inherited-default corrections and one
-  deliberate security divergence, all in
-  [ADR 007](../adr/007-audit-redirect-revalidation.md): the SSRF guard now
-  re-runs on **every redirect hop**, where the oracle validates only the URL the
-  caller supplied and then lets reqwest follow up to 10 hops unchecked.
-- ✅ **synapse + mneme + delta** — nine tools, 140 assertions, over one shared
-  client in `src/tools/agnos.cyr`. The third instance of an identical HTTP shape
-  is where CLAUDE.md says to extract, and extracting also created the seam: the
-  transport is a function pointer, so all nine execute paths are tested without
-  a service running, which the oracle's own suites never manage. These are the
-  one tool family that must **not** run the SSRF guard — they target loopback
-  services by design, and the guard would reject all three default base URLs.
-- ✅ **remote_registry** — 77 assertions. **A complete port, not a partial
-  one:** the oracle's doc comment promises `.agpkg` ZIP and WASM handling plus
-  registration, but the file contains none of it and is `pub mod` with zero
-  consumers. Nothing defers with those formats here — there was never any
-  behaviour to defer. ADR 007 applies and mattered more than it did in
-  security_audit, since this fetches a payload the doc intends to become
-  executable: the guard now re-runs on every redirect hop via the shared
-  `src/guarded_fetch.cyr`, extracted from security_audit at this second
-  consumer rather than left as a copy. remote_registry's payload path
-  (`.agpkg` ZIP + raw WASM) defers with those formats, so it can only deliver a
-  guarded fetch.
-
-### M5 — `orchestrator` (Phase 4)
-
-✅ **COMPLETE.** The default-feature runtime path: orchestrator → crew_runner →
-scoring/scheduler/output_validation, + approval, budget, audit, memory,
-multi_tenant, plan_cache, durable_state, hierarchical — all 15 modules, plus
-`server/sse` and `server/prompt_guard` pulled forward from M6 and an `orch_audit`
-chain the hoosh seam cannot delegate. **Gate (met):** the crew-event fan-out needs
-**overwrite-oldest** semantics (`agnosai_chan_push_lossy`), not `chan_send` — a
-1:1 port of tokio's broadcast `tx.send` onto a blocking send converts
-never-block-lossy into block-forever. See port-plan blocker #4.
-
-**Correction (2026-07-29, verified while porting):** this line read
-`durable_state (→ patra)`. It does not use patra. patra is a full embedded SQL
-database over its own paged format with no dump/export verb, and its `jsonl` mode
-opens `O_APPEND` with no `O_TRUNC`; `durable_state`'s contract is one overwritable,
-human-readable JSON file per crew at a caller-chosen path, which patra
-structurally cannot produce. It is built on `lib/io.cyr` instead, and **no M5
-module touches patra** — `grep -rn 'patra_\|jsonl_' src/ tests/` is empty. patra
-stays a declared stdlib dep for later phases.
-
-**Exit:** a crew runs end-to-end headless.
-
-### M6 — `server` (Phase 5)
-
-22 bites. Pure leaves first (ssrf → prompt_guard → output_filter → prometheus —
-string/number work, independently testable), then auth, hot_config, sse/EventBus,
-routes/*, router, main. **Gates:** per-worker arena + `_a` variants throughout
-(blocker #3); JWT RS256 implemented locally over sigil's existing
-`rsa_pkcs1v15_verify_sha256` + SPKI decoder rather than waiting upstream.
-**Exit:** the 11-route API serves; SSE streams; load-tested with `alloc_used()` asserted flat.
-
-**Status: ✅ COMPLETE (2026-08-03).** All 21 files, and **the binary serves** — bite 16 landed
-2026-08-03, so `./build/agnosai` binds, reads the oracle's environment, and
-answers the route table instead of printing `agnosai ready` and exiting. Bites
-1-15b landed earlier (routes tier, router, sandhi adapter); **15c (SSE)** and
-**16 (bind)** closed the milestone.
-
-**Exit met**, with one qualification worth reading before deploying: SSE streams
-*do* stream, but each holds one of the 100 pool workers for its life, where the
-oracle serves effectively unbounded concurrent streams
-([ADR 014](../adr/014-sse-stream-holds-a-pooled-worker.md)).
-
-**Graceful shutdown ships too**, though it took a same-day round trip through
-two repos. Bite 16 first landed *without* it and with an ADR explaining why it
-was impossible ([012](../adr/012-no-graceful-shutdown-on-sandhi.md)) — the
-blocker being that sandhi's accept loop could not be made to return, **not** the
-missing signal helper this roadmap used to cite (`signal_ignore` exists at
-`lib/syscalls.cyr:98`, and `sys_signalfd4` / `sys_rt_sigprocmask` are both
-wrapped). agnosai filed it, sandhi 1.9.9 added the stop flag, cyrius 6.5.6
-vendored it, and `main` now installs a `signalfd` handler and drains
-([ADR 013](../adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md),
-superseding 012).
-
-The `alloc_used()`-flat exit criterion is **partly met and cannot be fully met
-here.** Blocker #3's arena makes sandhi's half flat, but bayan threads no
-allocator on parse/build, so the handler half still grows the global bump —
-measured, and owed upstream as B3. The exit bar should read "transport flat,
-handler cost bounded and measured" until that filing lands.
-
-### M7 — `sandbox`, 77% (Phase 6) — ✅ audit remediation complete
-
-**The audit of 2026-08-04 found 43 confirmed defects behind a green suite. All
-43 are now fixed** — full evidence and a per-finding fix in
-[m7-audit-2026-08-04.md](m7-audit-2026-08-04.md), where every entry is marked
-`✅ FIXED` in place.
-
-**41 of the 43 are mutation-verified**: the stated mutation applied to a working
-tree, the suite rebuilt and re-run, the failing assertion named, the tree
-restored. The two that are not are log-only (L5, L9) — nothing in this tree
-captures sakshi output, so their mutants survive and the document says so rather
-than counting them as verified.
-
-Suites, before → after: policy 90 → **102**, oci 100 → **118**, kavach_bridge
-93 → **136**, spawn 144 → **169**, process 108 → **130**, python 61 → **76**,
-manager 69 → **90**, cx 62 → **87**. **627 → 727 assertions**, and the spawn
-suite runs in **10 s against 32.6 s**, because the 30-second sleep that finding
-H5 proved was measuring nothing is gone.
-
-Fix order as worked, hardest-consequence first:
-
-1. ✅ **Live defects (crash / leak) — all closed.** `spawn` dup2 fd leak; `cx`
-   stdin double-close; `cx` stdout fd leak per run (2026-08-04). Then
-   2026-08-05: the SIGPIPE pair in `python` and `oci` — `spawn` now ignores
-   `SIGPIPE` before the fork, hands the child the default back before `execve`,
-   and tells `EPIPE` apart from `EAGAIN` in the stdin write loop, so an
-   undelivered input is reported instead of killing the calling process; and
-   `spawn`'s `_agnosai_spawn_failure()` early returns, which stranded six
-   descriptors per attempt on exactly the exhausted table that triggers them.
-   All four mutations are killed by a named assertion (the missing `SIG_IGN`
-   one by an exit-141 crash, which is the defect itself).
-2. ✅ **Security controls that could be deleted with the suite green — all
-   closed (2026-08-05).** `kavach_bridge`'s `scan_output` handed the gate a raw
-   pointer, so the scan length was `strlen()` not `str_len()` and a secret after
-   an embedded NUL was released as PASS while ten borrowed clean bytes were
-   BLOCKed by an over-read; it now copies into a NUL-free, NUL-terminated buffer
-   and both directions are pinned. The two env filters — `spawn`'s inherited-env
-   sanitizer and `process`'s loader-injection filter — were **untestable, not
-   merely untested**: no dev or CI environment carries an `LD_*`, so both tests
-   were measuring the machine. Each now takes its source block as a parameter
-   and is driven with all four vectors planted, and `process` calls the shared
-   filter instead of its own copy, so a mutation in `spawn.cyr` fails the
-   `process` suite. The `FD_CLOEXEC` test's premise was false and cost 30 s a
-   run; the replacement closes the grandchild's stdio too, so the errno pipe is
-   the only descriptor left that could hold the spawn open. cx's network
-   isolation is asserted on the policy *and* through a guest reporting its own
-   uid, which is what `require_ns` actually buys.
-3. ✅ **`cx`'s skip guards are real everywhere (2026-08-05).** The hardcoded
-   `/home/macro/...` is gone — the guard resolves `cycc_cx` through the module's
-   own search — and a counter now insists the execution half really ran when
-   both binaries are installed. Renaming either binary away used to drop 22
-   assertions and still exit 0; it now fails. `agnosai_cx_interpreter_path` can
-   answer 0 again (M22), which also refuses a cwd-plantable relative name that
-   `access()` and `execve()` would otherwise resolve against the process's
-   directory.
-4. ✅ **Fail-open divergences — both closed (2026-08-05).** `manager` treated a
-   0-second timeout as *no deadline*, the opposite of the "0 means unset"
-   reading applied elsewhere, and a `/bin/sleep 3` ran to completion under it
-   (M17). The helper now works in **milliseconds** so 0 can resolve to "fires at
-   once" — and the OCI arm floors its seconds conversion at 1, because rounding
-   1 ms down to 0 would have restored the same fail-open one layer lower, which
-   only a second test caught. `policy`'s parser now refuses negative durations
-   and sizes (M1); `-1` reached kavach as `timeout_ms: -1000`, and kavach arms a
-   deadline only `if (timeout_ms > 0)`.
-5. ✅ **The vacuous-assertion backlog — all 25 worked (2026-08-05).**
-
-**Method note, because it is the transferable part.** The recurring shape was
-not a missing assertion but an **unreachable** one — the control was fine, and
-no test could be written that would fail without it. Five fixes worked by
-splitting a function so the thing under test could be handed its input
-(`_agnosai_sanitized_envp_of`, `_agnosai_process_envp_from`,
-`_agnosai_cx_resolve_interpreter`, `_agnosai_cx_budget_ms`,
-`_agnosai_sandbox_manager_timeout_ms`); two more by **re-execing the suite
-through its own spawn primitive with a planted `envp`**, which is the only way a
-process with no `setenv` can put a variable in its own environment. When an
-assertion cannot be made to fail, that is usually a statement about the shape of
-the code, not about the test.
-
-And the standing rule: *"if I deleted this, which assertion fails?"* — then
-**actually apply the mutation and run the suite**. Two tests written during
-remediation asserted nothing on the first attempt, and one mutation written to
-verify a fix was not a faithful revert and passed for the wrong reason.
-
-**Unrelated, noticed while verifying:** the full `cyrius tests tests` run now
-exceeds ~570 s and stalls in **`server_sse`**, which no sandbox change touches.
-Every sandbox suite passes individually in 1-3 s. Worth timing before assuming
-a sandbox regression.
-
-
-
-**Bites 1-11 done (2026-08-04).** Bite 11: `manager` — backend selection and
-dispatch, all eight oracle tests ported. **The oracle's module sequence is now
-complete**: `policy`, `oci`, `kavach_bridge`, spawn, `process`, `python`,
-`manager` all have counterparts.
-
-**What is left in M7 is the work with no oracle line to copy**, and it is not
-small:
-
-- ~~**`kavach_bridge`'s exec half**~~ — **done, bite 12 (2026-08-04).**
-
-  **The `max_duration_secs` constraint is NOT gone, and a note here previously
-  said it was.** That note reasoned that agnosai's spawn primitive gained a
-  deadline in bite 7 — true, and irrelevant: this path runs through kavach's
-  `sandbox_exec`, not agnosai's spawn. Measured against kavach 3.11.2 and filed:
-  `timeout_ms` is read by `wasm_exec` alone, so a 1000 ms deadline let
-  `/bin/sleep 8` run 8001 ms and report `timed_out = 0`. A second filing covers
-  the process backend reporting exit code 0 and empty stderr for everything that
-  ran. Both are kavach-side; neither is worked around here.
-- **cx, compile half — done, bite 13 (2026-08-04).** `cycc_cx` through the spawn
-  primitive, float-literal rejection, `.cyx` validation.
-- ✅ **cx, execution half — done, bite 14 (2026-08-04).** `agnosai_cx_run`
-  spawns `cxvm` through `persistent_spawn_confined` under a landlock policy
-  allowing only the interpreter's own directory, with an agnosai-side deadline.
-  **ADR-006's acceptance test is a suite assertion and passes.** History kept
-  because the premise it tested is the milestone's whole security argument:
-- ~~🔴 **BLOCKED on kavach**~~ ADR-006's premise is that
-  "kavach's seccomp + landlock *are* the security boundary", because `cxvm`
-  dispatches guest syscalls straight to the host kernel. **Measured against
-  kavach 3.11.2 on 2026-08-04: it is not.** Neither `sandbox_exec` (without a
-  rootfs) nor `persistent_spawn` applies seccomp or landlock, and the ADR's own
-  acceptance test — a `.cyx` calling `open("/etc/passwd")` — **succeeded**
-  through the persistent channel, which is the only kavach API with the stdin
-  `cxvm` needs.
-
-  Three kavach filings, which together are the blocker set:
-  1. `2026-08-04-neither-exec-path-applies-seccomp-or-landlock-without-a-rootfs.md`
-     — Critical. `seccomp_enabled = 1` is stored, scored, and never applied;
-     `landlock_rules_len` is a counter with no path API, so landlock is
-     currently applied by nothing. Also: `persistent_spawn` takes no policy at
-     all.
-  2. `2026-08-04-sandbox-config-timeout-ms-is-ignored-by-every-backend-except-wasm.md`
-     — ADR-006 accepts losing wasmtime's fuel metering *because* a wall-clock
-     timeout remains. There is no wall-clock timeout either.
-  3. `2026-08-04-process-backend-never-reports-the-payload-exit-code-or-stderr.md`
-     — cx's result channel is "process stdout + exit code" per the same ADR.
-
-  (1) landed as kavach 3.11.3 — routing on the policy rather than the rootfs, a
-  real landlock rule API, and `persistent_spawn_confined`. Re-measured with the
-  ADR's own test: the `.cyx` now gets **EACCES** where it got fd 3. (2) and (3)
-  remain open; (3) is half-closed, since a confining policy now reports the
-  payload's real exit code.
-
-  **A probe gotcha worth keeping**: the first escape `.cyx` tested `fd >= 0`,
-  and cx evaluates that **unsigned**, so `-EACCES` read as success and the
-  confined run looked like an escape. Probes must report the raw syscall return,
-  not a comparison.
-
-  **Closed in kavach 3.11.4**: `timeout_ms` is enforced on the process backend,
-  and the real payload exit code is reported on both the confined and
-  unconfined paths.
-
-  **Closed in kavach 3.11.5**: network isolation without a rootfs is available
-  opt-in and fail-closed (`config_require_namespaces`), and the payload's stderr
-  is captured on its own stream. **All kavach filings from this milestone are
-  now resolved.**
-
-  ✅ **Closed in kavach 3.11.6** — `persistent_spawn_confined_ns` applies the
-  policy's namespaces on the persistent path, and `agnosai_cx_run` requests
-  them. **Every kavach filing and gap from this milestone is resolved.** The
-  history below is kept because the reasoning took three wrong turns.
-
-  ~~One gap remains, and it is kavach-side after all.~~ An earlier note here
-  said the cx runner "does not yet set `require_namespaces`", implying agnosai
-  could. It cannot: `config_require_namespaces` is a **`SandboxConfig`** field
-  read by `process_exec`, while the cx runner must use
-  `persistent_spawn_confined` — the only kavach API with the stdin channel
-  `cxvm` needs — and that path applies landlock and seccomp in the child and
-  **nothing else**. It takes a `SandboxPolicy`, which carries `network_enabled`,
-  and acts on none of it.
-
-  So a `.cyx` guest can open a socket. That is the last difference between the
-  cx sandbox and the WASI contract ADR-006 replaces, where a tool got **only
-  stdin and stdout**. Closing it means teaching kavach's persistent path to
-  create namespaces, with the same opt-in fail-closed shape 3.11.5 gave
-  `process_exec`. ADR-006's hard requirement
-  is that "no code path may execute a `.cyx` outside a kavach sandbox — a `cxvm`
-  spawn that is not wrapped is a full sandbox escape, not a degraded one."
-- **The cx confinement bites (B14-B15)** — `wasm.rs`'s successor per
-  [ADR-006](../adr/006-cx-tool-sandbox.md): `cycc_cx` → `.cyx` → `cxvm` spawned
-  **inside** a kavach sandbox, with the milestone's own gate — a test asserting
-  a `.cyx` attempting `open("/etc/passwd")` is refused. Unblocked by kavach
-  3.11.1.
-
-An earlier note here said only `manager` remained. That was the oracle's file
-list, not the milestone.
-
-Bite 10: `python` — the interpreter bridge and
-the last consumer of the spawn primitive. Building it
-surfaced a defect in bite 9: `execve` does not search `PATH` where `Command::new`
-does, so the default runtime `"docker"` and the default interpreter `"python3"`
-— both bare names — could not be spawned at all. Resolution now happens before
-the fork, `execvp`-style.
-
- Bite 9: `oci`'s exec half — the argv bite 2
-built as a value, run through the spawn primitive. `python` and `manager` remain.
-
- Bite 8: `process` — `ProcessSandbox`, all nine
-oracle tests ported, and the first consumer of the spawn primitive. It needed two
-additions there: `work_dir` (applied in the child, failing the spawn rather than
-running it elsewhere) and a failure reason carried on the errno pipe bytes the
-parent already read and threw away. `oci`'s exec half, `python` and `manager`
-follow on the same primitive.
-
-Bite 7: the deadline. Cyrius has no `kill_on_drop`, so `_agnosai_spawn_kill_and_reap`
-does by hand what tokio does on drop; a child that ignores SIGTERM proves why the
-signal is SIGKILL. Two defects in the already-shipped loop surfaced with it: it
-**burned 100% of a core** for as long as any child ran (both read ends are
-`O_NONBLOCK` and it simply retried — measured at 2.006 s of CPU against
-`sleep 2`, now 0%), and `agnosai_spawn_capture` was a second copy of the loop
-that left the child's stdin **inherited from the server**, where the oracle pipes
-stdin on every spawn. The copy is gone — `capture` is now `capture_input` with an
-empty input.
-
-Bite 6: the stdin feed — a second deadlock,
-distinct from the output one and caused by the oracle's own write-then-read
-shape; the write now interleaves with the drain.
-
-Bite 5: `agnosai_spawn_capture` — fork, three
-pipes, exec, status decode. Spawn failure is distinguishable from exit 127, and
-the drain interleaves so a child filling both pipes cannot deadlock it. Two
-spawn sub-bites remain: stdin feed, then deadline/SIGKILL/reap.
-
-Bite 4: `spawn`'s sanitized `envp` + the
-CLOEXEC primitive (77 assertions) — the first of four spawn sub-bites, and the
-only one testable without forking.
-
-Bite 3: `kavach_bridge`'s pure half — backend
-mapping, config, strength scoring, the 4→2 scan collapse, the trust table
-(66 assertions).
-
-Bite 2: `oci`'s pure half — config, image
-validation, and the `docker run` argv built as a testable value (75 assertions).
-Bite 1: `policy` + the group hub `mod` — isolation levels,
-the five named policies, `effective_isolation`, the JSON wire, and the shared
-env-sanitization list. 90 assertions, all 11 oracle tests ported.
-
-A survey of the remaining modules was refuted 3/3 on adversarial review. The
-sequencing that came out of it, and the three findings that shape it:
-
-**Order** (each independently compilable + testable): `oci` pure half →
-`kavach_bridge` pure half → **the spawn primitive** (`envp` + sanitization →
-fork/pipes/execve → stdin feed + interleaved drain → deadline/SIGKILL/reap) →
-`process` → `oci` exec half → `python` → `manager`. The spawn primitive is the
-irreducible prerequisite: nothing in `lib/` supplies the four-tuple these
-modules need (separate stdout, separate stderr, real exit code, stdin write).
-
-**✅ CLEARED — the Landlock hole is fixed.** ADR-006 makes kavach's seccomp +
-Landlock the *entire* security boundary for untrusted tool code, and on the
-Landlock half that premise did not hold: `security_apply_landlock` named only
-**3 of Landlock's 13 filesystem rights** in `handled_access`, and Landlock
-permits every right it is not told to handle. **Measured: a confined process
-deleted files and directories outside its allowed path, and created directories
-anywhere** — while the obvious smoke test ("cannot read `/etc/passwd`") passed,
-because reading was one of the three that *were* handled.
-
-Fixed in **kavach 3.11.1** (2026-08-03, agnosai-reported and agnosai-fixed): all
-thirteen ABI v1 rights, plus `REFER` (v2) and `TRUNCATE` (v3) where the kernel
-knows them, with an ABI-version query masking down so an older kernel does not
-EINVAL. `EXECUTE` is granted inside read-only paths deliberately — it was
-permitted *everywhere* before, and a sandbox that read-only-mounts `/usr` to run
-`python3` is the ordinary case. agnosai pins 3.11.1 and re-ran the original
-probe: the victim file and directory now survive. The cx bites are unblocked.
-
-**✅ CLEARED — spawn-failure parity is reachable.** `fork` + `execve` alone
-cannot distinguish "spawn failed" from "child ran and exited 127", and three
-oracle sites need `Err` on the former (`oci.rs:219`, `process.rs:331`,
-`python.rs:87`). The fix is a fourth **exec-errno pipe** whose write end carries
-`FD_CLOEXEC`, so it closes itself iff `execve` succeeds: a parent that reads
-bytes knows the exec failed, and EOF means it worked.
-
-**Proven on this box before committing to it** (2026-08-03). `pipe2` is not
-wrapped on x86_64, but `sys_pipe` + `syscall(SYS_FCNTL, wfd, F_SETFD,
-FD_CLOEXEC)` is — `SYS_FCNTL = 72` and `O_CLOEXEC = 524288` are both defined. A
-probe run against two children — `/bin/sh -c 'exit 127'` and
-`/nonexistent/binary` — reports **spawned (exit 127)** for the first and **spawn
-failed** for the second, which is exactly the distinction the three oracle sites
-need.
-
-**Smaller, recorded so they are not re-derived:** kavach's `SandboxConfig` has no
-`externalization` field, so `build_config`'s per-call policy is unrepresentable
-and one oracle test cannot port as written; `kavach_bridge::execute` cannot
-honour `max_duration_secs` because nothing on the process path reads
-`timeout_ms`; and `scan_output` is a lossy 4→2 collapse
-(`{Pass,Warn}→Pass`, `{Block,Quarantine}→Block`) that a naive port returning the
-raw verdict would get wrong in both directions.
-
-
-policy (rename to `AgnSandboxPolicy` first), kavach_bridge, exec, process, python,
-oci, manager. **`wasm.rs`'s successor rides cx** per
-[ADR-006](../adr/006-cx-tool-sandbox.md): `cycc_cx` → `.cyx` → `cxvm`, spawned
-**inside** a kavach sandbox. `cxvm` does no syscall filtering of its own, so
-kavach's seccomp + landlock *are* the security boundary — an unwrapped `cxvm`
-spawn is a full escape, and the milestone needs a test asserting a `.cyx` that
-attempts `open("/etc/passwd")` is refused. Tool code is **integer-only** until cx
-arc B (float literals miscompile) and **Linux-x86 only** until arc C. agnosai consumes only kavach's scoring + gate,
-which port 1:1; uses `persistent_spawn/send/read/terminate` for the stdin-JSON
-tool protocol.
-
-### M8 — `fleet` (Phase 7) — ✅ **COMPLETE 2026-08-08**
-
-All 4,443 lines, twelve of twelve modules, **721 assertions** covering all
-**140** oracle test fns (137 `#[test]` plus `discovery`'s 3 `#[tokio::test]`). The per-module bite log is in
-[`state.md`](state.md#source).
-
-⚠ *"zero consumers; sequence last"* used to justify deprioritising this. Zero
-consumers is a consequence of it not being ported, not a reason to leave it.
-
-Two predictions in the original plan turned out wrong, and are recorded here so
-the next milestone does not repeat the mistake:
-
-- **"`relay.rs` maps near-1:1 onto majra's `relay_*`"** — the *names* matched
-  and the semantics did not. Wrapping majra 2.5.3 would have shipped a
-  `relay_receive` that was not reentrant two ways (file-scope globals *and* no
-  lock, against agnosai's 100-worker pool), a discarded `is_broadcast`, and no
-  sequence-gap detection. All four were fixed upstream in **majra 2.6.0** before
-  the wrapper was written. A name match is not an API match — compare
-  semantics.
-- **"`discovery.rs` needs no sandhi at all — 174 lines of stub"** — true, and it
-  is the oracle's stub, not a port gap. `rust-old` says so in its own doc
-  comment and `lib/net.cyr` has no SRV resolver either (verified, not assumed).
-  Finishing it is a scope decision, not a port bite.
-
-Beyond the port, three behaviours were reproduced that read like defects and
-are the oracle's: `FleetCoordinator::max_retries` allows one fewer retry than it
-names, `FederationManager::declare_coordinator` adopts any term that is not
-stale, and `topology_score` is not clamped to the 1.0 its doc promises. Each is
-pinned by an assertion so a later reader cannot "fix" it by accident.
-
-### M9 — `telemetry` (Phase 8) — ✅ **COMPLETE 2026-08-10**
-
-**All 322 lines, plus the logging init in `main.rs`.** Three pieces:
-
-- **JSON stderr logging + `EnvFilter`** — ✅ **done 2026-08-08**
-  (`src/telemetry/mod.cyr`, `tests/telemetry_mod.tcyr`, 84 assertions).
-
-  > ⚠ **This entry used to say "sakshi has neither, so this starts as a sakshi
-  > filing".** That premise was **false and was never checked against the
-  > library.** `sakshi_set_emit_hook` (`lib/sakshi.cyr:1038`) routes every event
-  > through a caller-supplied formatter and its own doc comment names this exact
-  > use. The formatter belongs in agnosai, and `./build/agnosai` now emits the
-  > oracle's JSON byte for byte. **Nothing was filed for it.**
-  >
-  > The one real gap the work *did* surface is narrower and is filed:
-  > `sakshi_log_kv` flattens `key=val` into the message before the hook, so
-  > per-event fields cannot be recovered (section C, sakshi row).
-
-  `EnvFilter` reduces to sakshi's single process-wide level. Only a bare level
-  and `agnosai=<level>` are honoured; a multi-target `RUST_LOG` is refused
-  outright rather than half-applied.
-
-- **OTLP export** — ✅ **done 2026-08-09** (`src/telemetry/otlp.cyr`,
-  `tests/telemetry_otlp.tcyr`, 115 assertions, twelve mutation-verified).
-  Written in two halves so the wire format could be pinned first: the
-  **encoder** — OTLP/JSON `Span` and `ResourceSpans`, ids, attributes, endpoint
-  parsing — is pure functions, testable byte-for-byte without a collector.
-
-  The **ring, exporter thread and POST** landed the same day: a 256-slot ring
-  under a mutex with two arenas, a detached thread on a sliced sleep, and
-  `sandhi_http_post` for both schemes. `agnosai_telemetry_init_tracing` starts
-  it and `agnosai_telemetry_shutdown` stops it with a final flush, which is the
-  oracle's `TracingGuard::drop`.
-
-  ✅ **The thread-local trace-context question is answered, not deferred.**
-  sakshi's trace id is a process global, so under `run_pooled` two concurrent
-  requests share one. The export path therefore **never reads sakshi's trace
-  context**: `agnosai_otlp_ring_enqueue` takes an explicit
-  `agnosai_otlp_ctx_new(..)` and correlation is the caller's job — mint one
-  trace id per request and pass it to every span. Reentrant by construction and
-  needs no upstream change. A genuine thread-local current-span is listed as
-  work for the OpenTelemetry library repo (see *Out of scope for v2.0*), not
-  for agnosai.
-
-  ✅ **The call sites are wired** (2026-08-10, `tests/telemetry_wiring.tcyr`,
-  26 assertions): `llm/hoosh` for inference, `tools/native`'s vtable dispatch
-  for tool execution, `orchestrator/crew_runner` for crew runs. That is a
-  **deliberate divergence** — the oracle defines the helpers and never calls
-  them — recorded as [ADR 017](../adr/017-genai-span-call-sites.md).
-
-**M9 is complete.** `telemetry/` is source-complete against the oracle, the OTLP
-exporter is live, and spans reach it from the production paths.
-- **`genai.rs`** (206 lines) — ✅ **done 2026-08-09**
-  (`src/telemetry/genai.cyr`, `tests/telemetry_genai.tcyr`, 64 assertions). It
-  lives here, not in `llm`. `tracing::Span` became a held attribute record; the
-  15 constants are the key for real accessors rather than decoration, since
-  four of the oracle's seven tests are tautologies.
-
-**M9 is source-complete except the OTLP exporter body** — both oracle files are
-ported, and what remains is hoosh's `otlp.cyr` behind the branch
-`agnosai_telemetry_init_tracing` already takes.
-
-### M10 — `definitions` (Phase 9) — ✅ COMPLETE 2026-08-09
-
-**All 1,460 lines.** assembler, loader, presets, versioning, k8s_crd, **plus the
-ZIP container, packaging and YAML halves.**
-
-✅ **`versioning`, `assembler`, `k8s_crd`, `loader` and the eighteen presets, 2026-08-09.**
-433 assertions across five suites; the per-module table is in
-[state.md](state.md). `GET /api/v1/presets` answers eighteen presets and the
-handler now lives in `src/server/routes/definitions.cyr`, mirroring the oracle.
-
-- **YAML needed nothing** — bayan's `bayan_yaml_parse` returns the same tagged
-  value tree as its JSON parser, so `load_from_yaml` is the JSON path with a
-  different parser call and a different error variant. The variant is the part
-  worth guarding: the oracle maps YAML failures through `InvalidDefinition` and
-  JSON failures through `Serialization`, and no oracle test distinguishes them.
-- **`include_str!` has no Cyrius equivalent**, so the presets are generated into
-  source by `./scripts/gen-presets.sh` and the generated file is committed;
-  `scripts/check-clean.sh` fails on drift. ⚠ The generator has to run its own
-  output through `cyrius fmt`, because **`cyrius fmt` reindents inside
-  multi-line string literals and the spaces land in the string** — filed as
-  `cyrius/docs/development/issues/2026-08-09-cyrius-fmt-reindents-inside-multi-line-string-literals.md`.
-  It corrupted a YAML fixture before it was understood.
-
-✅ **`packaging`, 2026-08-09.** 127 assertions, all 7 oracle tests, 14 mutation
-probes and 14 kills.
-
-- **The ZIP prerequisite was one line.** This row used to say ZIP was "an
-  upstream ask to sankoch (deflate + crc32 already exist there; ~250 lines)".
-  That was written before the fold and was **wrong**: `lib/sankoch.cyr` ships 26
-  `zip_*` fns, and all the bite needed was `"sankoch"` in `cyrius.cyml`'s
-  `[deps].stdlib`. Nothing was written upstream.
-- **Seven documented divergences, all stricter than the oracle**
-  ([ADR 018](../adr/018-sankoch-path-check-on-import.md)). The two that matter:
-  the oracle's 1 MiB zip-bomb guard reads attacker-written metadata the `zip`
-  crate never enforces, so a bomb declaring `uncompressed_size = 10` inflates
-  unbounded — sankoch bounds the output and verifies the CRC, so the cap is
-  real here. And an `agent_key` containing a `..` component fails export loudly
-  instead of exporting and silently vanishing on the way back in.
-- **sankoch's writer never allocates and has no sizing API**, so `export`
-  computes an upper bound. That is only possible because DEFLATE degrades to
-  STORE rather than growing a member; the test writes every member STORED into
-  exactly the bound, because checking it against compressed output proves
-  nothing.
-- ⚠ **Upstream ask worth filing:** a `zip_bound(count, name_bytes, payload_bytes)`
-  helper in sankoch. The bound here is derived from sankoch's record layout and
-  will silently need revisiting if that layout changes — it fails loudly rather
-  than corrupting, but it is a consumer re-deriving a library's internals.
-
-### M11 — the `sandbox`-gated tools and `hwaccel` (Phase 10) — ✅ COMPLETE 2026-08-10
-
-✅ **`llm/router` hwaccel** (2 fns), **`core/resource` hwaccel** (6 items),
-**`tools/python_tool`** — 2026-08-09. 25 mutation probes, 25 kills.
-
-✅ **`sandbox/wasm`, 2026-08-10** — 43 assertions, 10 mutation probes, 10 kills.
-On kavach 3.11.8's backend per ADR 019, with `config_stdin` carrying the tool's
-input. ⚠ `load_module` **validates** the eight-byte header where the oracle
-compiles, because a CLI cannot pre-compile — magic *and* version, so a
-version-2 module is refused at load rather than deferred to an exec-time trap.
-
-✅ **`tools/wasm_tool` and `tools/wasm_loader`, 2026-08-10** — 66 assertions, 13
-mutation probes, 13 kills. ⚠ The `.wasm` filename comes from the **manifest's**
-name, not the directory's, which every oracle fixture hides by having the two
-agree. ⚠ `load_tool_package` propagates every failure and
-`load_all_tool_packages` logs and skips them, so one broken package in a
-directory is a count that is quietly one lower.
-
-⚠ **`sandbox/wasm.rs` was missing from this row entirely.** `src/sandbox/mod.cyr`
-called it "excluded rather than postponed"; ADR-006's own 2026-08-07 correction
-overturned that, and the full-port mandate settles it. 521 lines and 11 tests.
-
-✅ **The transport question is settled.** ADR-006's correction named kavach's
-wasmtime backend; against kavach 3.11.7 that backend was hardcoded unavailable,
-had no stdin channel and discarded the guest's exit code. All three were filed
-and **fixed in kavach 3.11.8**, which agnosai now pins — so the WASM bites go
-through kavach after all, and get seccomp and landlock around the runtime
-process on top of wasmtime's own WASI sandbox.
-[ADR 019](../adr/019-wasm-tools-spawn-wasmtime-directly.md) records the round
-trip; kavach 3.11.8 is a **floor**, because 3.11.7 reports every WASM failure as
-a success.
-
-⚠ **`wasmtime` is not installed on this box**, and no `.wasm` fixture exists
-anywhere in the tree. That blocks the *end-to-end test*, not the bite: the
-loader, the validator, the argv builder, the exit-code classifier and the whole
-output ladder are all testable, fixtures are hand-encodable as byte literals,
-and the "runtime absent" arm is itself a real assertion here.
-
-### M12 — `llm` residue, tests, benches and the non-`src` surface (Phase 11)
-
-`llm/inference_queue.rs`, the `llm/mod.rs` re-exports, every oracle test with no
-Cyrius assertion (including the 153 `#[tokio::test]` suites, which need a
-synchronous re-expression — that is work, not an exemption), every oracle bench
-with no `.bcyr`, the doctest, and the non-`src` artifacts (`examples/`, the tool
-SDK, Python bindings, extra Cargo build targets).
-
-**Measured scope, 2026-08-10.** The counts the phase description gestures at,
-taken rather than estimated:
-
-| surface | oracle | ported | owed |
-|---|---|---|---|
-| `src/` modules | — | **all** | **0** — `llm/inference_queue` was the last |
-| test fns (`#[test]` + `#[tokio::test]`) | **863** in 84 modules | **97** suites | see bite 2 |
-| bench ids (criterion) | **117** in 19 files | **9** `.bcyr`, **190** rows | **0** — closed, bite 3b |
-| `rust-old/tests/` integration | 2 fns | 1 suite | **0** (bite 4) |
-| `rust-old/fuzz/` | 4 targets | **4** `.fcyr` | **0** (bite 6) |
-| doctests | **1** real one | 1 `# >>>` + 1 suite | **0** (bite 5) |
-| `examples/` | 1 Cyrius + 1 wasm fixture | 1 | the wasm fixture (needs wasmtime) |
-| `sdk/agnosai-tool-sdk/` | Rust, for tool authors | **stays Rust** | conformance only — see below |
-
-#### Bite 1 — `llm/inference_queue` ✅ 2026-08-10
-
-Ported; 18 mutation probes, 18 kills; 69 assertions. `src/llm/mod.cyr`'s claim
-that it "defers with that feature" was wrong on the standing rule and was already
-contradicted by `llm/router`'s own header — corrected in place. **Nothing under
-`src/` is now unported.**
-
-#### Bite 2 — the oracle-test audit ✅ first pass 2026-08-10
-
-All 863 oracle test fns screened against the suite corpus by token match against
-the *matching* suite rather than the whole corpus. **Two flagged, both real:**
-
-- **`src/server/routes/sse.cyr` had no test file at all** — the only `routes/*`
-  module without one. `tests/server_routes_sse.tcyr` now exists, 31 assertions.
-- **`multiple_crews_tracked_independently`** had no counterpart, so
-  `tests/orch_orchestrator.tcyr` only ever ran one crew and a single-slot
-  registry would have passed it. Added; the suite is now 55 assertions.
-
-⚠ **The screen is a heuristic and its clean result is not proof.** It matches
-oracle fn-name tokens against suite prose, so a suite that covers a behaviour
-under different words scores as covered whether or not it asserts the same
-thing. It found a whole missing suite, so it earned its keep — but the remaining
-work is a **per-module read** of oracle test bodies against suite assertions, and
-that has not been done. The 15 suites that state an explicit oracle count in
-their header are the ones that can be checked cheaply; the other 79 cannot.
-
-#### Bite 3a — the bench gate was broken ✅ 2026-08-10
-
-⚠ **Three of the six `.bcyr` files did not compile**, so `cyrius bench` had been
-reporting `5 passed, 3 failed` and **50 of the tree's 79 benchmarks — including
-the entire 35-shape orchestration set — had stopped running.** Stale include
-lists against `src/`: `telemetry/mod` (ADR 017 spans) missing from all three,
-`strcase` from two, and `sandbox`/`definitions/loader`/`routes/definitions` from
-`server.bcyr`. Fixed; all seven files now compile and report.
-
-Found by an **adversarial audit** of the gap analysis below, which flagged it as
-a blocker the analysis itself had not mentioned.
-
-⚠ **The gate was never silent — it was never invoked.** `cyrius bench` exits 1 on
-a compile error (verified against a deliberately broken `.bcyr`), and
-`scripts/bench-history.sh` runs it under `set -euo pipefail`. The last recorded
-run was 2026-08-07; `src/` moved under `benches/` in the days after and nothing
-ran it again. **106 rows recorded on the fixed tree.** The structural hole was that **`check-clean.sh` did not
-sweep `benches/` and CI never compiled it** — so the only thing standing between
-a rotted benchmark and nobody noticing was someone remembering to run
-`bench-history.sh`. Both fixed: `.bcyr` joins the fmt and lint loops, and CI
-gains a `Benchmarks` step for the compile (not the numbers — CI timings are too
-noisy to gate on).
-
-#### Bite 3b — the 83 gaps closed ✅ 2026-08-10
-
-Six agents, one per `benches/*.bcyr`, each compiling and running its own file;
-every result then handed to a separate agent told to assume it was wrong.
-**83 benchmarks added, all 9 files compile, 190 rows in `bench-history.csv`**
-against 106 before.
-
-The adversarial reports are kept verbatim in
-[`m12-bench-audit-2026-08-10.md`](m12-bench-audit-2026-08-10.md) with triage.
-**Read that file's section before editing any row** — several shipped comments
-are known-wrong and are listed there rather than fixed.
-
-Two acted on, and the pair is the lesson:
-
-- **FIXED** — four fleet placement shapes never reached the sort
-  (`vec_sort_by`'s O(n) already-ordered pre-check returns before introsort), and
-  their comments claimed they guarded the exact regression they were blind to.
-  ⚠ Reordering the input does **not** fix it: `AGN_PR_INDEX` comes from the scan
-  position, so output indices are ascending by construction. Measured 11.763us
-  vs 11.722us — no difference. Varying the *scores* prices it: **19.53us vs
-  11.80us**.
-- **REJECTED** — the verifier called `clock_epoch_secs = 1.318us` fabricated,
-  citing `lib/bench.cyr:6`'s documented ~120ns. Measured at 2,000,000
-  iterations: **1.315us**. The implementing agent was right; it is
-  `lib/bench.cyr`'s constant that is wrong on this host by 11x, and that
-  constant is what every bench in the ecosystem implicitly subtracts. Now a
-  measured row rather than a claim.
-
-  ✅ **Filed and resolved in cyrius 6.5.19**: the constant is gone, replaced by
-  a runtime-calibrated `bench_clock_overhead_ns()` that every reporting path
-  subtracts. ⚠ A *corrected constant* would still have been wrong — one clock
-  read spans 15 ns to 3,550 ns across the four release-gate hosts.
-
-#### Bite 3c — the scoring benchmarks ✅ 2026-08-11
-
-The six gaps the fan-out shipped nowhere. All seven `rust-old/benches/scoring.rs`
-ids are now in `benches/orch.bcyr`, and the ranking series **confirms an O(n²)
-sort**:
-
-| agents | measured | |
-|---|---|---|
-| 100 | 127.8 µs | sort ≈ 33% |
-| 300 | 626.0 µs | predicted 637.8 — **within 2%** |
-| 1000 | 5093.0 µs | sort ≈ 83% |
-
-The oracle sorts with `sort_by` (pdqsort, O(n log n),
-`rust-old/src/orchestrator/scoring.rs:212`); the port hand-rolls an insertion
-sort (`src/orchestrator/scoring.cyr:294-303`). Fitting `a·n + b·n²` to the 100
-and 1000 points gives a = 0.863 µs (scoring) and b = 0.00421 µs (sort); the
-**independent** 300-agent point tests that fit rather than being used to make it.
-The sort overtakes the scoring at **n ≈ 205**.
-
-⚠ **It is a performance note, NOT a DoS vector — an earlier entry here said
-otherwise and was wrong.** `AGNOSAI_CREW_MAX_AGENTS` is **100** and
-`src/server/routes/crews.cyr:353` rejects more, so nothing reachable over HTTP
-passes n = 100, where the sort is a third of a 128 µs call. The crossover is
-beyond the cap. Only a direct library caller is unbounded.
-
-⚠ Three sizes, not two: two points can be *fitted* by a quadratic but not
-*tested* against one. And the agents must be varied — identical agents tie, and a
-stable insertion sort walks a tied list in O(n), which is precisely why
-`rank_agents_16` never showed this.
-
-✅ **RESOLVED 2026-08-11 — it was a fix, not an ADR.** `agnosai_rank_agents` now
-calls `agnosai_sort` (introsort), the same call `fleet/placement.cyr:287` already
-makes for the same job. **100: 127.8 → 95.8 µs (−25%) · 300: 626.0 → 296.9
-(−52.6%) · 1000: 5093.0 → 1021.0 (−80%)**, and scaling per 10x the agents drops
-from **39.9x to 10.7x**. Behaviour-preserving because `_agnosai_scored_cmp` is a
-total order (index breaks every tie), pinned by a new 40-identical-agent case —
-the existing 6-agent one sits below introsort's 16-element threshold and would
-have passed regardless. 109/109 identical either side.
-
-#### Bite 3 — the gap analysis
-
-`benches/llm.bcyr` added: all three of `rust-old/benches/llm_router.rs`'s
-criterion groups plus the inference queue. `benches/` previously held six `.bcyr`
-and **none of them touched `src/llm/`**.
-
-That benchmark found an O(n²) drain in majra's priority queue (filed upstream;
-see CHANGELOG).
-
-**The remaining gap is mapped.** A seven-way parallel analysis, each result
-adversarially audited, classified every oracle bench id against the tree:
-
-| target | claimed gaps | already covered |
-|---|---|---|
-| `benches/core.bcyr` (resource, serde_types) | 9 | 4 |
-| `benches/orch.bcyr` (scheduler, pubsub, approval) | 16 | 0 |
-| `benches/orch.bcyr` (ipc, relay, orchestrator) | 13 | 1 |
-| `benches/fleet.bcyr` **(new)** (fleet, placement, scoring) | 19 | 1 |
-| `benches/tools.bcyr` (tools, sandbox, audit) | 15 | 3 |
-| `benches/server.bcyr` (server, prompt_guard) | 8 | 1 |
-| `benches/definitions.bcyr` **(new)** | 3 | 0 |
-| | **83** | **10** |
-
-⚠ **The audits corrected the analyses in every group**, and the corrections are
-the valuable part — a fabricated "the oracle's ~4,500 string comparisons" claim,
-a wrong allocator model behind three iteration counts, a `sakshi` log-level trap
-that does not exist, and the compile blocker above. Read the audit before
-implementing any row; the raw analyses are not safe to follow verbatim.
-
-✅ **The redundant O(n²) sort is FIXED — 2026-08-11.** `scheduler_load_dag`
-went **3129.0 µs → 1271.0 µs at 500 tasks (−59.4%)**, 561.1 → 485.4 at wide-100,
-154.8 → 136.2 at linear-50 — the saving growing with n, which is the O(n²) term
-leaving. `tests/orch_scheduler.tcyr` gained the twelve-roots-in-reverse and mixed
-roots/dependents cases *before* the deletion and reports **86/86 identical either
-side of it**. The original finding, kept below because the reasoning is the
-point:
-
-⚠ **A redundant O(n²) sort surfaced in passing.**
-`agnosai_scheduler_load_dag` (`src/orchestrator/scheduler.cyr:247-249`) and
-`agnosai_scheduler_topological_sort` (`:233`) each insertion-sort **all** DAG
-keys before calling `agnosai_scheduler_kahn_sort`.
-
-**That sort is dead work, not a divergence.** An audit agent reported it as a
-parity divergence needing a fix or an ADR; reading `kahn_sort` shows otherwise.
-It sorts the zero-in-degree seed itself (`:169`) and sorts each successor list
-inside its loop (`:180`) — both faithful to `scheduler.rs:183-230`. The caller's
-key order therefore affects **nothing** in the output: the seed is re-sorted
-regardless, and `in_degree` is a map. The output is byte-identical with or
-without the pre-sort.
-
-So the port is correct and pays for it twice. The cost is real —
-`_agnosai_sched_sort_strs` is insertion sort (`:136`, and its own comment says
-it is fine "because the oracle sorts only small lists", which stopped being true
-when a caller handed it every key). On a 500-task DAG in pseudo-random `map_keys`
-order that is ~n²/4 ≈ 62,500 comparisons per load, against ~0 for the oracle.
-
-**Do not fix it blind.** It lands with the scheduler benchmarks in the
-orch-queueing group above, so the deletion can be shown rather than argued.
-
-#### Bite 4 — the oracle's integration test ✅ 2026-08-10
-
-`rust-old/tests/crew_with_tools.rs` lives under `rust-old/tests/`, not inside a
-module's `#[cfg(test)]` block, so **the per-module screen could not see it** and
-it had no counterpart. Its two `#[tokio::test]`s are the only end-to-end
-registry → crew → runner exercises in the whole oracle.
-`tests/integration_crew_with_tools.tcyr`, 29 assertions.
-
-⚠ Worth recording: the file's name oversells what it couples. The oracle builds
-a `ToolRegistry`, registers `EchoTool`, asserts on it — and then calls
-`CrewRunner::new(spec)` **without it**. So the crew runs the placeholder path
-throughout and the tool assertions are standalone. Reproduced exactly rather
-than "improved", because wiring the registry in would test something the oracle
-does not and would paper over the same gap upstream has.
-
-#### Bite 5 — the doctest and the first example ✅ 2026-08-10
-
-- **The doctest is closed in full.** Only **one** of the four ` ``` ` blocks
-  under `rust-old/src/` is a real doctest — `core/mod.rs`'s. The others are
-  ` ```text ` (wasm_loader), ` ```ignore ` (telemetry/genai) and ` ```yaml `
-  (definitions/k8s_crd), and `cargo test` compiles none of them.
-  `tests/core_mod_doctest.tcyr`, 13 assertions, transcribes it.
-
-  ⚠ Every symbol it touches is already covered by `core_agent`/`core_task`/
-  `core_crew`, and that is not the point. A doctest asserts **the example a
-  reader is shown still works** — it is the one test that fails when an API
-  change silently invalidates the prose. `src/core/mod.cyr`'s header carries the
-  block it mirrors; if either moves, move both.
-
-- **`examples/simple_crew.cyr`** — the port of `rust-old/examples/simple_crew.rs`,
-  and the first file in a directory `README.md:35` had been documenting for
-  months. Builds and runs with nothing installed:
-
-  ```
-  Crew completed with status: completed
-    task output: Analyze the project structure
-  ```
-
-  ⚠ **Nothing discovered `examples/`** — not `cyrius tests`, not `cyrius bench`,
-  not the build entry — which is the same shape of hole that let three `.bcyr`
-  files rot. `check-clean.sh` now sweeps it for fmt, lint **and doc**, and CI
-  builds every `examples/*.cyr` as its own step.
-
-#### Bite 6 — the four fuzz targets ✅ 2026-08-10
-
-`fuzz/{agent_definition,crew_request,preset_json,tool_input}.fcyr` — **3,414
-malformed inputs, zero faults**. All four `cargo-fuzz` targets are the same four lines — arbitrary UTF-8
-into a parser, result discarded — so the property is *no panic*, and the value
-is entirely in the input distribution.
-
-⚠ **`cyrius fuzz` exists** — `fuzz/*.fcyr` harnesses, discovered from both
-`fuzz/` and `tests/`. A first draft of this bite was written around a claim that
-it did not, alongside the same wrong claim about `cyrius doctest`. Both are
-listed under *Quality* in bare `cyrius`. Verify a toolchain gap before writing
-around it.
-
-⚠ **`tests/agnosai.fcyr`, the `cyrius port` scaffold, had a `fuzz_main` that
-returned 0 without reading its input** — `cyrius fuzz` had reported `1 passed`
-for it since 2026-07-28, and nothing in CI ran it. Same story for
-`tests/agnosai.bcyr`, a scaffolded `noop` in `tests/` where an audit of
-`benches/*.bcyr` could not see it.
-
-`cyrius fuzz` does not generate input, and a random generator would be **worse**:
-a fuzz failure CI cannot reproduce is a failure nobody fixes. So the corpus is deterministic and
-uses the two generators that actually find parser bugs — a **truncation sweep**
-(every prefix of a valid document, which walks every length check and look-ahead
-straight off its boundary) and a **byte-substitution sweep** (each offset × NUL,
-`"`, `\`, `{`, `]`, 0xFF), plus 25 hand-written JSON-killers: lone surrogates,
-`1e999999`, `9223372036854775808`, an embedded NUL, 64-deep nesting opened and
-closed and opened-and-never-closed.
-
-⚠ **It goes past the oracle.** libfuzzer guards with
-`if let Ok(s) = std::str::from_utf8(data)`, so the Rust targets only ever see
-valid UTF-8. A Cyrius `Str` is bytes and `bayan_json_v_parse_buf` takes
-(ptr, len), so the **0xFF substitution reaches the parser here and cannot
-upstream**.
-
-⚠ Two design points worth not re-deriving. The suite re-parses the pristine seed
-after each sweep — a parser can survive malformed input by leaving a scratch
-buffer or a global error slot in a state that breaks the *next* caller, and that
-never shows up as a crash during the sweep. And the corpus count is asserted
-**exactly**, not as a threshold: a threshold passes while half the corpus quietly
-stops being generated, which is the failure mode a sweep is most likely to grow.
-
-It also caught a real fact about the port: **`agnosai_crew_from_value` requires
-`id`** and it is the only required field — name, agents and tasks all default —
-so a seed without one makes the entire sweep re-measure the same early return.
-
-#### Bite 7 — the user-facing docs ✅ 2026-08-10
-
-`README.md`, `docs/guides/api-reference.md` and `docs/architecture/overview.md`
-all documented **`agnosai-server`**, the Rust `[[bin]]`. The Cyrius build
-produces one binary, **`agnosai`**. Every Quick Start command was `cargo`
-against a tree with no root `Cargo.toml`, including a `make check` with no
-Makefile.
-
-⚠ **`docs/guides/adding-wasm-tools.md`'s `cargo build --target wasm32-wasip1`
-is correct and was left alone** — it is a *tool author* building against the
-Rust SDK, the surface that deliberately stays Rust. A blanket sweep of `cargo`
-out of the docs would have broken the one instruction that should keep it.
-
-#### Bite 8 — the oracle's shipped WASM fixture ✅ 2026-08-11
-
-`tests/tools_wasm.tcyr` loads `rust-old/examples/wasm-tools/hello-tool/manifest.json`
-byte for byte through `agnosai_wasm_load_tool_package` — **84 assertions**. See
-*Still not started* below for what remains.
-
-#### Bite 9 — the audit remediated ✅ 2026-08-11
-
-Four agents, one per file, each told the audit had already been refuted three
-times and to verify every finding against the tree. **42 applied, 14 rejected
-with evidence, 11 escalated.**
-
-⚠ **The audit itself had six errors**, listed in
-[`m12-bench-audit-2026-08-10.md`](m12-bench-audit-2026-08-10.md) under *Known
-errors IN this document* rather than edited out. A reviewing pass is not more
-reliable than the thing it reviews; it is only differently wrong.
-
-⚠ **A verifier caught a stale claim I created.** `benches/definitions.bcyr` said
-the assembler divergence was "unrecorded in `src/`" — true when written, false
-ninety minutes later because the note landed concurrently. A comment asserting
-another file's contents is a comment that rots.
-
-Escalations acted on: the assembler memoization note
-(`src/definitions/assembler.cyr:33-54`), `src/server/prompt_guard.cyr`'s 29%-stale
-scan figure, and `lib/bench.cyr:6`'s 11x-wrong `clock_gettime` constant (filed
-upstream). Three became decisions — **D3/D4/D5** under *Owed work*.
-
-#### M12 — what is left
-
-**Nothing under `src/`, `tests/`, `benches/`, `fuzz/` or `examples/`.** Every
-bite is closed. What remains is one wasmtime-gated half; **all five decisions are closed.**
-
-| | |
-|---|---|
-| the WASM **execute** path | needs `wasmtime` installed; the manifest half is done |
-| ~~**D1**~~ mount `rate_limit`? | ✅ **DECIDED, closed 2026-08-13 — yes, by default.** [ADR 021](../adr/021-rate-limit-mounted-by-default.md). Not a question. |
-| ~~**D2**~~ `"personality": null` | ✅ **DECIDED, closed — defer, do not drop.** bhava is coming; the wire keeps `null`. Not a question. |
-| ~~**D3**~~ memoize `builtin_presets()`? | ✅ **DECIDED, closed 2026-08-13 — no. Leave it cold.** Not a question. |
-| ~~**D4**~~ `rounds x batch` for the bench sweep? | ✅ **DECIDED AND DONE 2026-08-13 — yes, across all eleven `.bcyr`.** Not a question. |
-| ~~**D5**~~ dispatch rows include body serialization? | ✅ **DECIDED AND DONE 2026-08-13 — full route confirmation, not half.** Not a question. |
-
-#### Still not started
-
-⚠ **`sdk/agnosai-tool-sdk/` and `rust-old/examples/wasm-tools/` STAY RUST, and
-that is not a deferral.** The SDK is a crate published to *third-party tool
-authors*, who compile it to `wasm32-wasip1`; the sandbox then executes the
-resulting binary. Neither is linked into `build/agnosai` and neither has a
-Cyrius counterpart to be. Rewriting them in Cyrius would be actively wrong — it
-would break every tool author on the published protocol.
-
-What agnosai genuinely owes here is **conformance**, not translation: that
-`src/tools/wasm_tool.cyr` implements the `{"parameters": …}` stdin and
-`{"result", "success", "error"}` stdout contract the SDK documents. It does, its
-header cites the SDK as the reason, and `tests/tools_wasm.tcyr` pins both halves.
-✅ **The manifest half of `examples/wasm-tools/hello-tool/` is now tested**
-(2026-08-11). `tests/tools_wasm.tcyr` loads the oracle's own shipped
-`manifest.json`, transcribed byte for byte, through `load_tool_package` with an
-8-byte header stub for the `.wasm` — 84 assertions, and it is the only place
-`"required": false` arrives from a real published manifest rather than from a
-case written to test it. That is the conformance check the SDK is owed.
-
-⚠ **Only the EXECUTE half is wasmtime-gated**, and it is the whole of what
-remains here: `wasmtime` is not installed on this box, so a built module cannot
-be run. The manifest parse, the `<name>.wasm` resolution, both error policies and
-the entire result ladder are all reachable without it.
-
-⚠ Noted while adding it: `_T_ROOT` in that suite is created but never cleaned,
-so the `load_all_tool_packages` count assertions are sensitive to anything left
-behind — a stale directory reports as "got 3, expected 2" and points at the
-counting logic rather than the leftover. Recorded in the file.
-- **Repo hygiene found in passing.** `probe_key_tmp.pem` — a tracked RSA private
-  key at the root, referenced by nothing — is **deleted**, and `.gitignore` now
-  carries `*.pem` / `*.key` because agnosai has no legitimate PEM in the tree.
-  ⚠ **The key is still in history** (`bb76e67`); a rewrite is a maintainer call
-  and is open. See `state.md` known issue 0. Still owed: README's Rust-era Quick
-  Start, and the rest of a `.gitignore` that is otherwise the Rust-era file.
-
-⚠ `rust-old/tests/fixtures/` is **already ported** and needs nothing: both RSA
-PEMs live on as frozen RS256 vectors in `tests/server_auth_vectors.cyr`, kept in
-a `.cyr` deliberately so ~16 KB of base64 stays out of the `.tcyr` coverage
-budget.
-
-### ~~D3~~ — ✅ **DECIDED 2026-08-13: NO. Leave `builtin_presets()` cold. Do not re-raise it.**
-
-The user's reasoning, recorded verbatim: *"presets can be cold; as agent might
-get different instruction sets than presets and seems a waste of speed
-improvements."* The route is not hot, the parse is not on any agent's critical
-path, and a process-lifetime cache of parsed structs buys speed nowhere it is
-needed while adding the one thing this tier deliberately avoids. **The oracle's
-shape stands and no ADR is owed** — the divergence is not taken.
-
-The measurements below are kept as the reasoning archive for why the question
-was worth asking, not as an open question.
-
-#### (archived) the numbers behind the question
-
-**Measured, not speculated.** Every `GET /api/v1/presets` re-parses all 18 embedded
-preset documents and re-serializes them:
-
-| | |
-|---|---|
-| parse (`builtin_presets_18`) | **~744 µs** |
-| serialize (`preset_to_value_18`) | **~145 µs** |
-| allocation per call | **1,016,776 bytes** |
-
-So ~0.9 ms of CPU and ~1 MB before the response is framed, for data that is a
-compile-time constant generated into `src/definitions/presets_data.cyr`.
-
-⚠ **The oracle does exactly the same.** `rust-old/src/definitions/loader.rs:122`
-is a plain `fn builtin_presets()` over `include_str!` with no `LazyLock` and no
-cache. So memoizing would be a **divergence needing an ADR**, not a fix — which
-is why this is a decision and not a task.
-
-⚠ **The worst half is already gone.** Until 2026-08-11 that 1 MB landed on the
-no-free global bump on every request, because the dispatch ladder was missing its
-arena arm for this id. With the arm wired the allocation is per-request and
-reclaimed by `reset_via`, so what remains is CPU and arena churn (~16 chunks at
-the 64 KiB `AGNOSAI_SERVE_ARENA_BYTES`), not a leak.
-
-The argument for memoizing is that the parse result never changes. The argument
-against is that it is the oracle's shape, the route is unlikely to be hot, and a
-process-lifetime cache of parsed structs is shared mutable state that every other
-route in this tier deliberately avoids. **The argument against won.**
-
-### ~~D4~~ — ✅ **DECIDED AND DONE 2026-08-13: yes, across all eleven `.bcyr`.**
-
-⚠ **Every one of the ~200 rows in `bench-history.csv` prints `min == max == avg`,
-by construction.** Each benchmark calls `bench_batch_start`/`bench_batch_stop`
-exactly once, so there is one sample and the reported dispersion is not
-information — `preset_to_value_18: 148.534us avg (min=148.534us max=148.534us)`
-carries no more than the average alone.
-
-`lib/bench.cyr:198-211` documents the alternative: wrap the batch in a `rounds`
-loop, so min/max span real samples. Measured run-to-run spread on this host is
-**~5%** (`builtin_presets_18` ranged 738.3–775.1 µs over eight runs), which is
-exactly the band a reader currently cannot see.
-
-✅ **Taken across all eleven files at once**, which re-baselines the entire CSV on
-2026-08-13 — the deliberate choice, since changing a subset would leave rows
-mutually incomparable. `_BR = 5`; the inner loop bound and the batch size are both
-divided by it, so **total work is unchanged**.
-
-**Result: 201 of 207 rows now carry real dispersion, against 0 before.** The six
-that do not are correct as they stand — `tool_registry_register` is a
-monotonically-growing structure where rounds would measure fill level rather than
-variance, and the other five are 2–9 ns shapes where every round rounds to the
-same integer.
-
-⚠ **Six rows CONSUMED state and had to be exempted or re-indexed, and only
-measurement found them.** Wrapping them moved their averages by −22% to −80%:
-`scheduler_dequeue_{100,1000}_priority_order` re-drained already-drained
-schedulers, `relay_receive_accept` re-sent deduped sequence numbers,
-`pubsub_subscribe_new_pattern` re-subscribed existing patterns, and
-`fleet_compute_{allocate,release_only}_8dev` already had a 200-round outer loop
-that a nested one sliced into the reject path. The first three now index a
-distinct slice per round (`_r * (n / _BR)`); fleet's two had the nested loop
-removed; `tool_registry_register` stays single-batch. **`tools.bcyr`'s own
-`_b_require` caught one of them; the other five were found by diffing every
-average against the pre-change run.** Any future bench edit of this shape needs
-the same check.
-
-### ~~D5~~ — ✅ **DECIDED AND DONE 2026-08-13: yes, full route.**
-
-`benches/server.bcyr`'s `route_*_global` / `route_*_arena` rows time
-`agnosai_route_dispatch` and stop at the response **object**.
-`rust-old/benches/server.rs:43-62` drives a real `tower` service, so the oracle's
-number includes serializing the body to bytes.
-
-✅ **Done — the rows now measure the full route.** `_b_render_body` /
-`_b_render_body_a` reproduce `_agnosai_serve_send`'s branch set exactly (text
-routes render nothing extra; JSON routes build the tree to bytes; null/204 arms
-guarded identically), applied at all four timed dispatch call sites. This
-**re-baselines every JSON dispatch row on 2026-08-13**, and makes a serialisation
-regression visible here for the first time. `route_metrics_global` is unaffected —
-it already carried its whole body render — and is now comparable with its
-siblings instead of a measurement-class outlier.
-
 ## Owed work
 
-**Status as of 2026-08-03. Nothing here blocks anything.** Every remaining item
+**Status as of 2.1.6 (2026-10-04). Nothing here blocks anything.** Every remaining item
 is work we owe ourselves — quality, coverage, or a decision — and any of it can
 be picked up in any order. Each entry is self-contained: file paths, measured
 numbers, and what "done" means, so it can be started without reading the session
@@ -1371,93 +178,49 @@ that found it.
 Nothing here is a discovery in progress — this is the complete list. **If an item
 is not on it, it is not owed.**
 
-Completed items are removed from these tables rather than struck through, so the
-list stays short enough to read. What shipped and why lives in `CHANGELOG.md`; the
-one-line ledger is under *Recently closed* at the end of this section.
-
-### A. Blocked the M6 milestone — ✅ retired 2026-08-03
-
-Empty by completion, and kept as a heading only so the **B/C/D/E** letters below
-stay stable: they are cited from `state.md` and from `src/` comments, and
-renumbering to close a cosmetic gap would break every one of them. A1 (SSE) and
-A2 (the `main` bind) are in *Recently closed*.
+Completed items are removed rather than struck through; what shipped is in `CHANGELOG.md`.
+Labels are never reused, because `state.md`, ADRs and `src/` comments cite them: there is no
+section A (it blocked M6 and was retired 2026-08-03), and B1–B3, B17, B21, F6 and F7 are closed.
+B2's allocator-threading traps, which `src/` and `tests/` comments still cite as "roadmap B2", are
+in `state.md` (*Test-design decisions worth not re-deriving*, *Standing rules a new session should
+not re-derive*) and CHANGELOG [2.0.0].
+Rows below still name F6 (the GenAI spans, [ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md))
+as where they were found; F7's non-goal is under *Settled decisions*.
 
 ### B. Owed — flagged in earlier bites, never done
 
 | # | Item | Effort | Notes |
 |---|------|--------|-------|
-| B1 | **Grow the MCP surface onto bote** — ✅ **complete 2026-08-06** | Medium | `src/server/routes/mcp.cyr` answers **seven** methods against the oracle's three. The oracle's `initialize` / `tools/list` / `tools/call` are full parity; `resources/list` + `resources/read` project stored agent definitions over `agnosai://agents/<name>` ([ADR 015](../adr/015-mcp-resources-project-agent-definitions.md)), and `prompts/list` + `prompts/get` project the same definitions as personas, rendered by the crew's **own** `_agnosai_crew_build_system_prompt` so preview and execution cannot drift ([ADR 016](../adr/016-mcp-prompts-project-agent-personas.md)). Named by agent key across all three surfaces. `capabilities` advertises `tools`, `resources` and `prompts` — **without `subscribe` or `listChanged`**, because nothing here can push a notification and a capability key is a promise a client acts on. No new state or lifecycle in either: both project what `POST /api/v1/agents/definitions` already stores. **Struck: subscriptions** — `lib/bote-core.cyr` has no `resources/subscribe`; what it has is JSON-RPC notification *detection*. **Still not delegating to bote's `Dispatcher`**: the oracle uses bote's protocol types and hand-builds its envelope (`mcp.rs:3-5`), which is the parity behaviour; bote 3.3.0's `dispatcher_set_server_info` cleared the blocker but delegating is a separate decision. |
-| B2 | **Thread the bayan `_a` constructors** — 🟡 **every GET read route done; write routes and off-path modules remain** | Large (small bites) | **Unblocked by cyrius 6.5.5** (bayan 1.4.0); the upstream ask this row used to carry shipped there, so nothing waits on anything. ✅ **`core` complete** — json, task, resource, agent, message, crew: **27 `_a` forms**, each with a bare-name wrapper delegating through `default_alloc()`. Measured: `agnosai_task_to_json` **1792 → 0 B/response**, `agnosai_crew_to_json` on a 10x10 crew **44,032 → 0 B** and 11% faster. ✅ **`llm`, `server/routes` + `server/state`, `tools`, and the `orchestrator` group's request-reachable surface complete, 2026-08-05** — four bites, 20 new `_a` forms. **All six GET read routes now charge the global bump 32–320 B/request against 384–4,368, and each is 7–21% faster**; the full table (both halves) is in [state.md](state.md) under `benches/server.bcyr`. Five of the six have a handler half of **exactly zero** — the residual is `agnosai_route_resolve`'s match struct, which is minted before dispatch reaches any arm and is in both columns. `/api/v1/tools` floors at 320 B because `agnosai_tool_schema` calls the tool's own `schema_fp` and the vtable has no allocator parameter. **`benches/server.bcyr` is new** (13 rows) and back-fills timing for the three bites that shipped allocation numbers alone. **Traps for the next bite** — five now, all mutation-caught, and 1 and 2 have each turned up four times: (1) **Cyrius silently accepts a duplicate parameter name** — `agnosai_agent_to_value(a)` already used `a`, and adding an allocator also named `a` compiled clean while every `load64(a + OFFSET)` read the allocator, SIGSEGV with no assertion output. Check the existing parameter names before prepending. (2) **`map_keys` survives every substitution** — it allocates its key vec via `vec_new()` on the global bump with no `_a` form, and it silently caps the win. Use `_agnosai_map_slots` / `_slot_live` / `_slot_key` / `_slot_val` from `src/core/json.cyr`. (3) **A route's failure arms are separately threadable and separately forgettable** — measuring only the success path let `route_error_a` revert inside `get_crew_a` with the suite green. (4) **An empty fixture cannot tell a threaded route from an un-threaded one**, and `/api/v1/dashboard/agents` needs *agent metadata* on its results or it renders `[]` over any number of crews. (5) **Round-number thresholds assert less than they look like they do** — 128 B sat above a 32 B baseline and below the smallest mutation at 176 B, and still passed one at 48 B. Bound against a residual measured in the same run instead. **Remaining: the write routes** (`POST /api/v1/crews`, `/api/v1/agents/definitions`, `/api/v1/approvals`, `/api/v1/a2a`, `/mcp`), which parse a request body and are the other half of the problem, **and the orchestrator group's off-request-path modules**, `crew_runner` foremost at 63 bayan calls. ✅ **CLOSED 2026-08-13, and the "63 bayan calls" framing was wrong.** Classifying all 67 `bayan_json_v_*` sites in `crew_runner` by LIFETIME rather than counting them: **16 build event payloads** (`_started_data` 7, `_completed_data` 5, `_emit_token` 4) which a subscriber reads *after* the emit, so they are retained by the channel and cannot move — and they are already skipped entirely when nobody is subscribed, which is the ordinary state; **14 build task-result metadata** (`_success_metadata` 11, `_placeholder_result` 1, `_error_result` 2) and **6 build the profile**, all retained process-lifetime in the crew state, which is precisely the ownership hazard this row documents for `agnosai_agent_from_value`. **Exactly 4 are transient**: the context object in `_agnosai_crew_build_request`, which exists only to be handed to `bayan_json_v_build_pretty` and is dropped. That one is now pooled — **2,504 -> 2,280 B per `build_request` carrying three context keys (-8.9%)**, measured A/B against the same binary; the no-context path is unchanged at 1,744 B, confirming the arena is touched only when there is a tree. ⚠ **The first measurement of this was WRONG and is worth remembering**: a 4-task crew run showed no change, because with no LLM client `agnosai_execute_task` takes the placeholder arm and never calls `build_request` at all — the 960 B being attributed to it was the fixture's own context maps. Measure the function, not a caller that does not reach it. ✅ **The router itself is threaded and restructured, 2026-08-05.** `route_resolve` was 1.675 µs — 57% of the cheapest threaded request — and its 32 B was 100% of that route's remaining allocation. The flat sixteen-pattern table (each matched from byte 0, so `/api/v1/dashboard/crews` matched on attempt sixteen having re-compared `api` and `v1` twelve times) is now a prefix consumed once plus a group of at most four: **1.675 µs → 343 ns (−79%)**, and `agnosai_route_resolve_a` puts the match struct, the parameter buffer and any captured Str in the arena. **Four read routes now charge the global bump literally nothing.** The restructure is a *filter, not a decision* — the selectors choose which patterns are tried, a full pattern comparison still decides the answer — verified by `_t_resolve_is_equivalent` against the flat table kept verbatim in the test file, 56 paths × 4 methods. 13 mutations, 13 caught. ✅ **`agnosai_uuid_is_valid`, 2026-08-05** — the `{id}` routes' last 16 B. `agnosai_uuid_parse` allocated a buffer all five of its callers in `src/` discarded (every one a validity test), so `/api/v1/crews/{id}` went **2,352 → 0 B** and its 404 arm **320 → 0**. It also **stopped leaking on rejection**: the buffer was allocated before validating and returned 0 from inside the loop, reachable through `agnosai_uuid_canonical` from the `*_from_json` deserialisers and `routes/sse.cyr` — attacker-controlled and unauthenticated. The clean-looking fix (validate, then decode) measured **+83%** and was rejected; one scan into a stack buffer plus a `memcpy` costs **+6.6%**. 5 mutations, 5 caught. ✅ **The tool vtable, 2026-08-05 — and with it every GET read route is at zero.** `schema_fp` is now `fn(a, ctx)`, allocator first, threaded by all **fourteen** implementors, so `/api/v1/tools` went **1,720 → 0 B/request** (it had floored at 288 through three bites, and the floor was always the vtable rather than the routes or registry tier). New `_a` forms: `agnosai_param_schema_new`, `agnosai_tool_schema_new`, `agnosai_tool_schema_with_param`, `agnosai_tool_schema_param`, `agnosai_tool_schema`. **Not an API break** — agnosai has no `[lib]` block and no `dist/`; `bins = ["agnosai"]` is the whole package, so every implementor is in-tree and consumers reach tools over HTTP/MCP. 6 mutations, 6 caught. 🟡 **The write routes, 2026-08-05 — two of five, and the other three are blocked by an ownership bug rather than by effort.** `POST /mcp` **3,224 → 0 B/request** (−32% latency) and `POST /api/v1/approvals` **1,352 → 0** (−20%) are threaded parse tree and all, because they retain nothing. **`POST /api/v1/crews`, `/api/v1/agents/definitions` and `/api/v1/a2a/receive` cannot be**: `agnosai_agent_from_value` and `agnosai_crew_from_value` borrow the parse tree's Strs without cloning, and what they build is stored process-lifetime in `AppState.definitions` and the orchestrator registry — so a threaded parse would be reclaimed by `reset_via` and the next request handed the same bytes. It corrupts silently rather than crashing. **The current code is correct only because the global allocator never frees**, which nothing had stated; `definition_insert` already `str_clone`s the *key* for exactly this reason and left the value borrowed. Pinned from both sides (`server_routes_agents` reproduces the corruption; `server_serve` asserts the route stays un-threaded). ✅ **Done for agents, 2026-08-05:** `agnosai_agent_from_value_a(al, v)` clones every Str into `al`, so the caller picks the lifetime — `create_definition_a` passes `default_alloc()` for the retained definition while parsing and responding in the arena. **`POST /api/v1/agents/definitions` 2,280 → 392 B/request (−83%)**, and the 392 is the retained definition itself, which is the floor by design. The hazard test was inverted rather than deleted; 4 mutations, 4 caught (one by segfault). ✅ **Done for crews, 2026-08-05:** `agnosai_crew_req_from_value_a` clones the crew name and `process`, `agnosai_task_req_from_value_a` clones each task's `description` and `expected_output`. **`POST /api/v1/crews` 21,184 → 17,048 B/request (−19.5%)** — the remainder is crew execution held in the registry, which is retained state and must not move. **The retainer is the audit chain, not the crew registry**: `_agnosai_orch_register`/`_agnosai_orch_finish` pass the crew name as the audit *message* and `agnosai_audit_record` stores it without cloning; the task description separately becomes a task result's output (`crew_runner.cyr:460`). Asserting on `crew_state_crew_id` — a minted UUID — pinned nothing and every mutation survived it. ⚠ Not `agnosai_crew_from_value`, which an earlier note named from its name alone: persisted-crew deserialiser, needs an `id` no request carries, no caller in `src/`. ✅ **Done for a2a, 2026-08-05:** `agnosai_a2a_req_from_value_a` clones the task id, description and four optional strings — **17,192 → 15,624 B/request**; `metadata` stays borrowed deliberately (re-serialised for the size check, never retained). **Every route in the table is now threaded**, with all residuals being retained state rather than garbage. ⚠ **Arena overflow was a segfault, fixed 2026-08-05.** `arena_alloc` answers 0 when full and nothing downstream checks, so threading the routes turned an unbounded leak into a crash — **200 registered crews segfaulted `GET /api/v1/dashboard/crews`** through the 64 KiB request arena, against a 1,000-crew retention cap. `agnosai_spill_arena` falls back to the global bump per allocation; sandhi still owns and resets the arena. Pinned both ways (the big render completes AND the arena is asserted full); both mutations reproduce the crash. **Lesson: an allocation measurement proves the common case and says nothing about the ceiling.** ✅ **`agnosai_audit_record` owns the strings it keeps, 2026-08-05** — `event`, `level`, `message`, `provider`, `model` cloned, so the chain no longer depends on every caller passing an owned Str. Free at this scale (inside its 28.3–29.8 µs band; SHA-256 dominates). 4 mutations, 4 caught, three by segfault. ⚠ `metadata` stays by reference — bayan has no deep-copy primitive and a build/parse round trip would cost a full serialise per record; the contract is narrowed to that one field and stated in the header. ✅ **The audit hashing path, 2026-08-06** — `agnosai_audit_record_a` takes a scratch allocator for the JSON tree it builds and discards per entry (twice, once the chain evicts). A four-task crew run **33,008 → 26,296 B (−20%)**; a record **2,432 → 496 B** on the global bump; latency unchanged (SHA-256 dominates). 5 mutations, 5 caught — **a ratio threshold caught none**, so the bound is absolute at 528 B with 32 B of headroom, which is all the smallest transient allocation allows. Three constraints found by breaking things: `thread_local_get` **faults on the main thread** (so the scratch is a parameter, not a TLS); an arena costs its capacity permanently on the no-free bump (so create it lazily — an unconditional one made audit-less runs 4.2 KB *worse*); and 1 KiB initial chunk was chosen by measuring 512/1024/2048/4096. ⚠ **Correction: there is no per-worker scratch owed.** An earlier note here said parallel and DAG modes were left on the global allocator pending a per-worker arena. They do not audit per task **at all** — `_agnosai_crew_audit_task` is called only from `_agnosai_crew_run_sequential`, and the oracle has exactly one `audit_record` call site, in its own `run_sequential` (`rust-old/src/orchestrator/crew_runner.rs:294`). So this is **parity, not a gap**, and there is nothing on those paths for a scratch to serve. The `AGN_CR_SCRATCH`-stays-0 fallback remains correct and is now belt-and-braces rather than load-bearing. ✅ **The event-payload guard, 2026-08-06** — payloads were built before `_agnosai_crew_emit` could decline them, and `agnosai_event_sender_send` with zero subscribers drops them; **zero subscribers is the normal state**, since a client attaches to `/crews/{id}/stream` only when watching. `crew_runner`'s own cost **9,360 → 6,088 B** for a four-task run (−35%). Nothing observable changes — the oracle also builds before checking `event_tx`, so this moves *when* the work happens, not what a client sees. 3 mutations, 2 caught, and the test states which one is below its resolution. ⚠ **An earlier "~14 KB residual" for `crew_runner` was over-attributed.** Of a 13,832 B four-task run, **4,472 B is building the spec** — the caller's, and in production it comes from the request parse — leaving 9,360 as this module's before the guard. Measure the parts; never subtract a serialised size from an allocation figure. |
-| B3 | **Remaining `str_from("lit")` classes** | Medium | 86 `str_eq(x, str_from("lit"))` sites are **done** (→ `str_eq_cstr`, which already existed at `lib/str.cyr:617`): the decode path went 482 ns / 128 B per 3-decode round → **213 ns / 0 B**, and `src/` from 910 to 824 sites. **Re-scoped now that B2's core group has landed.** The 149 `return str_from("lit")` constant returns were measured at 48 B of 1944 B (2.5%) and deferred as not worth 121 new top-level symbols — that verdict **no longer applies to a module B2 has threaded**, because in `core` those wire spellings now come from the arena via `*_to_wire_a` and cost nothing. ⚠ **That guidance said "do not hoist constant returns to globals" and is SUPERSEDED as of 2026-08-07** — for literals on a **per-item path** only. It rested on "in `core` those wire spellings now come from the arena via `*_to_wire_a` and cost nothing", and *cost nothing* was wrong: an arena allocation is an `alloc_via`, measured at **15.1 ns on 6.5.9 and 11.1 ns on 6.5.10**, plus a 16-byte header. Hoisting the wire values and the remaining per-item keys to process-lifetime globals took `GET /api/v1/dashboard/crews` **6,881 → 5,217 ns (−24%)** and **160 → 112 allocations (−30%)** on the same toolchain, with `/mcp` −14% and `/dashboard/agents` −17%. The `_a` forms stay (the signature is the API) and simply return the global; the `a` parameter goes unused, which is documented at each site. **The original verdict still stands for everything else** — the scope rule is "a literal a loop body or an unconditional envelope reaches", not "a literal". Error *messages* stay inline: built at most once per request, and only for a request that already failed. Counting them: 338 `str_from_a(a, "…")` sites over 237 distinct strings remain in `src/`, and that is deliberate. ✅ **The in-loop hoists are done, 2026-08-06.** A brace-tracking scan found **46**, not ~49 — close enough that the hand count held — but they split into two classes B2 created: **27 bare `str_from`** (16 B on the no-free global bump per iteration, a real leak) and **19 `str_from_a`** (arena bytes, reclaimed at the next `reset_via`). **24 of the 27 are fixed**; the other three sit inside loops but on `return` paths (`sandbox/oci.cyr:250-251`, `crew_runner.cyr:990`), so they run once and hoisting them would move an allocation off an error path onto the hot one — left deliberately, and noted because a naive scan keeps finding them. The 19 arena-backed ones are left too, and the distinction is recorded. By site: `crew_runner` 11 (a 4-task run 26,296 → 26,024 B, an 8-task 23,128 → 22,472 — ~82 B/task), `routes/sse` 6 (**one of them per streamed event** on a long-lived connection — the only site there that compounded without bound), `security_audit` 6, `sandbox/oci` 4. ⚠ A single-iteration loop is +16 B, since the hoist pays once either way; the cost is constant and the saving scales. The 380 sites under `tests/` stay: a test binary is short-lived, so the leak is inert. |
-| B4 | **Hard rate-limit key cap: adopt majra's force-evict when it ships** | Small | majra 2.8.1 made `ratelimit_evict_stale` skip any bucket not yet refilled to burst, so agnosai's zero-threshold pressure sweep (`src/server/rate_limit.cyr:409`) no longer holds the 4,096-key cap under a strict rate: 72,447 keys at 1 req/s against 4,352 on majra 2.7.2 (default 100 req/s unaffected). Requested 2026-09-26 in majra's `docs/development/issues/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md`. When a majra release carries the call: bump `[deps.majra]`, call it from the pressure sweep only, and re-run the 200k-key spray at 1 req/s. |
-| B5 | **Agent personality (bhava)** | Large, blocked | `personality`, `with_personality`, `mood_adjusted_temperature`, the personality score and the system-prompt block. `../bhava` has no Cyrius port, so nothing can supply a profile. Unblocked by porting bhava (a separate repo). |
+| B4 | **Hard rate-limit key cap: adopt majra's force-evict when it ships** | Small | majra 2.8.1 made `ratelimit_evict_stale` skip any bucket not yet refilled to burst, so agnosai's zero-threshold pressure sweep (`_agnosai_rl_maybe_sweep`, `src/server/rate_limit.cyr:419`) no longer holds the 4,096-key cap under a strict rate: 72,447 keys at 1 req/s against 4,352 on majra 2.7.2 (default 100 req/s unaffected). Requested 2026-09-26 in majra's `docs/development/issues/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md` (still open; majra 2.9.2, the pin, has no force-evict). When a majra release carries the call: bump `[deps.majra]`, call it from the pressure sweep only, and re-run the 200k-key spray at 1 req/s. |
+| B5 | **Agent personality (bhava)** | Large, blocked | `personality`, `with_personality`, `mood_adjusted_temperature`, the personality score and the system-prompt block. `../bhava` has no Cyrius port, so nothing can supply a profile. Unblocked by porting bhava (a separate repo). See *What agnosai is* and D2. |
 | B6 | **Crew concurrency** | Medium | No cap on concurrent crews: `submit_crew` spawns a thread per call, where the Rust tree held a semaphore of `max_concurrent_tasks` (default 10). Parallel mode runs fixed batches, so one slow task idles the other slots until its batch ends. Both want a counting semaphore, which the stdlib does not have. |
-| B7 | **Tracing export** | Large | The Rust tree exported every `#[tracing::instrument]` span over OTLP (20 of them: sandbox, routes, crew runner, orchestrator, scoring, cost planning); agnosai exports the four GenAI semconv operations (`invoke_workflow`, `invoke_agent`, `chat`, `execute_tool`), linked into one trace and joining an inbound `traceparent` since F6 ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)). **What remains:** (1) the other `#[instrument]` sites as spans, under the same explicit span-context threading (no thread-local: ADR 023 records why); (2) trace and span ids in JSON log lines, and per-module targets, which needs sakshi's log hook to expose them; (3) aggregate usage on `invoke_agent` (the sum of its `chat` spans' tokens); (4) request parameters on `chat` (`gen_ai.request.temperature`, `max_tokens`, declared and never set); (5) `gen_ai.response.finish_reasons`, a `string[]` that needs an OTLP `arrayValue` the encoder does not write; (6) `Span.flags` with the W3C is-remote bit for a span whose parent arrived in a header; (7) `tracestate` passthrough; (8) tool-call arguments and results on `execute_tool`, which need F1; (9) **the `delegate` tool starts an unlinked trace** (found 2026-10-03, F6 review): `src/tools/builtin/delegate.cyr:78-83` builds the delegated spec and calls `agnosai_orchestrator_submit_crew` with no trace parent, because the tool vtable carries no span context. **Repro:** a deployment that calls `agnosai_register_delegate_builtin`, with the exporter on, sends `/mcp` `tools/call` `delegate` with a `traceparent`: the `execute_tool delegate` span joins the header's trace, the delegated crew's `invoke_workflow delegate:<agent>` span is a new root. The pinned semconv (`gen-ai-agent-spans.md`, *Invoke workflow span*) also says an `invoke_workflow` span SHOULD NOT be reported when an agent or tool spins up a workflow to delegate to a sub-agent. **Fix direction:** once a tool call has a span context (F1, or a context on the vtable), format it with `agnosai_otlp_span_context_format_a` and stamp it on the spec through `agnosai_crew_with_trace_parent`, and decide whether a delegated crew emits `invoke_workflow` or only its `invoke_agent` spans; (10) **an operator switch for an untrusted inbound context** (found 2026-10-03, F6 review): any caller of the three traced routes picks the trace id agnosai's spans join and can turn their export off with sampled flag `0` (`src/telemetry/mod.cyr`, `agnosai_telemetry_record_span_in`: `if (agnosai_otlp_span_context_sampled(sc) == 0) { return 0; }`; pinned by `tests/server_serve.tcyr`'s unsampled-header check). Recorded as surface 7 in `threat-model.md` and in ADR 023. **Fix direction:** an env switch read at boot, e.g. `AGNOSAI_OTEL_INBOUND=honour|restart|record` — `restart` ignores the header (new root, the inbound id at most as a span link), `record` keeps the trace but samples regardless of the flag. |
-| B8 | **Server edges** | Medium each | An SSE stream holds one of the 100 pool workers for the crew's life and does not notice a departed client (sandhi's `send_chunk` ignores send errors); shutdown does not drain in-flight requests; chunked request bodies are 501 (sandhi has no decoder); a 405 carries no `Allow` header; path parameters are not percent-decoded; a certificate-format JWT key (and a key over 4096 bits) is refused; `hot_config` has no change notification. |
-| B9 | **WASM** | Medium | A module with no `_start` export runs and "succeeds"; a module is validated by its header only, so a malformed body fails at execute; the Rust store limits (10 instances/tables/memories, trap on failed grow) and stdin over 64 KiB need kavach options; WASM tools held by a registry never free their staged module (`agnosai_wasm_module_free` exists; the registry has no destroy hook). |
+| B7 | **Tracing export** | Large | The Rust tree exported every `#[tracing::instrument]` span over OTLP (20 of them: sandbox, routes, crew runner, orchestrator, scoring, cost planning); agnosai exports the four GenAI semconv operations (`invoke_workflow`, `invoke_agent`, `chat`, `execute_tool`), linked into one trace and joining an inbound `traceparent` since 2.1.5 ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)). **What remains:** (1) the other `#[instrument]` sites as spans, under the same explicit span-context threading (no thread-local: ADR 023 records why); (2) trace and span ids in JSON log lines, and per-module targets, which needs sakshi's log hook to expose them; (3) aggregate usage on `invoke_agent` (the sum of its `chat` spans' tokens); (4) request parameters on `chat` (`gen_ai.request.temperature`, `max_tokens`, declared and never set); (5) `gen_ai.response.finish_reasons`, a `string[]` that needs an OTLP `arrayValue` the encoder does not write; (6) `Span.flags` with the W3C is-remote bit for a span whose parent arrived in a header; (7) `tracestate` passthrough; (8) tool-call arguments and results on `execute_tool`, which need F1; (9) **the `delegate` tool starts an unlinked trace** (found 2026-10-03, F6 review): `src/tools/builtin/delegate.cyr:78-83` builds the delegated spec and calls `agnosai_orchestrator_submit_crew` with no trace parent, because the tool vtable carries no span context. **Repro:** a deployment that calls `agnosai_register_delegate_builtin`, with the exporter on, sends `/mcp` `tools/call` `delegate` with a `traceparent`: the `execute_tool delegate` span joins the header's trace, the delegated crew's `invoke_workflow delegate:<agent>` span is a new root. The pinned semconv (`gen-ai-agent-spans.md`, *Invoke workflow span*) also says an `invoke_workflow` span SHOULD NOT be reported when an agent or tool spins up a workflow to delegate to a sub-agent. **Fix direction:** once a tool call has a span context (F1, or a context on the vtable), format it with `agnosai_otlp_span_context_format_a` and stamp it on the spec through `agnosai_crew_with_trace_parent`, and decide whether a delegated crew emits `invoke_workflow` or only its `invoke_agent` spans; (10) **an operator switch for an untrusted inbound context** (found 2026-10-03, F6 review): any caller of the three traced routes picks the trace id agnosai's spans join and can turn their export off with sampled flag `0` (`src/telemetry/mod.cyr`, `agnosai_telemetry_record_span_in`: `if (agnosai_otlp_span_context_sampled(sc) == 0) { return 0; }`; pinned by `tests/server_serve.tcyr`'s unsampled-header check). Recorded as surface 7 in `threat-model.md` and in ADR 023. **Fix direction:** an env switch read at boot, e.g. `AGNOSAI_OTEL_INBOUND=honour|restart|record` — `restart` ignores the header (new root, the inbound id at most as a span link), `record` keeps the trace but samples regardless of the flag. |
+| B8 | **Server edges** | Medium each | An SSE stream holds one of the 100 pool workers for the crew's life and does not notice a departed client (sandhi's `send_chunk` ignores send errors; filed, see *C*, sandhi); shutdown does not drain in-flight requests; chunked request bodies are 501 (sandhi has no decoder); a 405 carries no `Allow` header; path parameters are not percent-decoded; a certificate-format JWT key (and a key over 4096 bits) is refused; `hot_config` has no change notification. |
+| B9 | **WASM** | Medium | A module with no `_start` export runs and "succeeds"; a module is validated by its header only, so a malformed body fails at execute; the Rust store limits (10 instances/tables/memories, trap on failed grow) and stdin over 64 KiB need kavach options; WASM tools held by a registry never free their staged module (`agnosai_wasm_module_free` exists; the registry has no destroy hook). The execute path runs the `wasmtime` CLI through kavach's WASM backend ([ADR 019](../adr/019-wasm-tools-spawn-wasmtime-directly.md); the filename names the reversed draft). |
 | B10 | **JSON forms nothing calls** | Easy each | Serde shapes the Rust types derived but no Rust code serialised: fleet `NodeInfo`/`NodeStatus`/`NodeTopology`/`DeviceLink`/`InterconnectType`/`FederationRole`/`ClusterStatus`/`ClusterInfo`/`RelayMessage`; `RetryConfig`; `TaskProfile`, `BudgetExceeded`, `CachedPlan` and `ToolSchema`/`ToolOutput` parsers; `ToolInput` and the manifests' writers; `KavachToolResult`. |
 | B11 | **Structured-log fields** | Easy each | Log events that lost their fields or are absent: fleet (17, federation's nine above all), wasm (no sakshi calls at all), kavach bridge, process/OCI exit lines, wasm loader and remote registry error details, the MCP tool-call line's `success`/`duration_ms`, a2a rejections' id prefix and `metadata_bytes`, `latency_ms` in task-result metadata. |
-| B12 | **Behaviours no suite asserts yet** | Easy each | Orchestrator: diamond DAGs (sort, ready set, a run), parallel/DAG `task_ms`, event-bus delivery, the cancel audit entry, per-task audit level, a 64 KiB+ IPC echo. Core: `Cpu` → `"cpu"`, multi-device filtering and sums, a negative non-zero cost. Sandbox: real fuel exhaustion (-2), a real timeout, empty stdin to a reading guest, the Python bridge's `"error": null`. Tools: AGNOS schema names/descriptions/parameter types and missing-parameter errors. Server: output-filter pattern text, `http://[::1]:8080`, the echo tool's parameter type. |
+| B12 | **Behaviours no suite asserts yet** | Easy each | Orchestrator: diamond DAGs (sort, ready set, a run), parallel/DAG `task_ms`, event-bus delivery, the cancel audit entry, per-task audit level, a 64 KiB+ IPC echo, and **concurrent cancel** — mid-execution interruption and parallel/DAG cancel stress (`tests/orch_crew_runner.tcyr:1382-1408` cancels only before a run starts; the Rust tree never tested it either, see *Carried over from the Rust line*). Core: `Cpu` → `"cpu"`, multi-device filtering and sums, a negative non-zero cost. Sandbox: real fuel exhaustion (-2), a real timeout, empty stdin to a reading guest, the Python bridge's `"error": null`. Tools: AGNOS schema names/descriptions/parameter types and missing-parameter errors. Server: output-filter pattern text, `http://[::1]:8080`, the echo tool's parameter type. |
 | B13 | **Network-facing tools** | Medium | The load tester has no connection pool (every request is a fresh handshake); its success path and the security audit's live sequence have no test, since no suite stands up a loopback server. |
 | B14 | **Seven benchmarks** | Easy–medium | The sandbox execute path (process argv, stdin, shell; WASM hello) and `audit_recent(10/100/1000)`. |
-| B15 | **Smaller gaps** | Easy each | Output-filter leak detection folds ASCII case only; a pub/sub subscriber cannot detach alone (only `unsubscribe_all(pattern)`); `StateStore` (pluggable persistence) is not ported; `strcase` is ASCII-only though the crew assembler matches user-supplied names; `tests/telemetry_wiring.tcyr` exits **0** with an assertion failing (seen 2026-10-03 under a mutant), because a thread is still alive when its epilogue's `syscall(60, f)` ends only the main thread. `cyrius test` still fails it on the printed summary, so the gate holds, but CI's per-suite bisect reads exit codes and would not name it. An epilogue that called exit_group would make the exit code honest. **Not one suite (F6 gate run, 2026-10-03):** `tests/telemetry_otlp.tcyr` and `tests/telemetry_mod.tcyr` exit 0 with failing assertions too, while `core_crew` and `server_serve` exited 1. Whether a suite is hit depends on whether an exporter thread is still running at exit: `agnosai_otlp_exporter_stop` only sets a flag and flushes (`src/telemetry/otlp.cyr:1132-1135`, no join), and the thread trampoline exits with status 0 (`lib/thread.cyr:197-199`). **Repro:** a `.tcyr` that fails one `assert` and then `thread_create`s a body that sleeps 300 ms exits 0; the same file without the thread exits 1. **Fix direction:** the exit_group epilogue (a CLAUDE.md rule change), or, with no rule change, have CI's bisect also fail any suite whose run log matches `[1-9][0-9]* failed`. `/mcp` `tools/call` dereferences a tool's output without checking it (found 2026-10-03, F6): `src/server/routes/mcp.cyr:281` passes `agnosai_tool_output_success(out)` to the log line, and `:283` and `:289` read it again, while the vtable contract allows a tool to answer 0 (`src/tools/native.cyr`, `agnosai_tool_execute_in`, which null-checks for exactly that reason and records `error.type` `no_output`). **Repro:** register a tool whose execute fn returns 0 and call it through `POST /mcp` `tools/call`: the handler segfaults. No builtin returns 0 today, so it is latent. **Fix:** treat `out == 0` as a tool-level failure — `isError: true` with "Unknown error", the oracle's fallback text — before any read. |
-| B16 | **Upstream gaps — noted, NOT raised** | — | ⛔ **Do not raise any of these until agnosai is on the latest version of that project**, then re-check the gap against that version first. bayan, sigil and sandhi are cyrius stdlib folds: agnosai takes the version the pinned cyrius folds, and their newer releases wait for the next cyrius fold. ⚠ At 2.1.4 (cyrius 6.6.14) all four were on their project's latest tag — bayan 1.5.11, sigil 3.13.7, sandhi 1.10.4, kavach 3.13.2. At 2.1.5 three still are. sigil's repo is at 3.13.9, which agnosai takes only with the 6.6.15 pin (*Moving the cyrius pin to 6.6.15* above), so the rule above holds the sigil gap until that move; 6.6.15 folds the same bayan and sandhi. The bayan, sandhi and kavach gaps are due their re-check against those versions; none has been re-checked yet. **bayan** (fold 1.5.11; listed at 1.5.6) — YAML beyond the subset parser: block scalars, flow mappings, anchors, tags, escape decoding in quoted strings. **sigil** (fold 3.13.7; listed at 3.12.18) — RSA keys over 4096 bits (a certificate-format key is agnosai's own to fix, B8). **sandhi** (fold 1.10.4; listed at 1.9.17) — decoding chunked request bodies. **kavach** (3.13.2, a direct dep; 3.13.2 rebuilt the WASM backend's capture and stdin, so re-check the stdin gap against it) — WASM store limits (instance/table/memory caps, trap on a failed grow) and guest stdin over 64 KiB. |
+| B15 | **Smaller gaps** | Easy each | Output-filter leak detection folds ASCII case only; a pub/sub subscriber cannot detach alone (only `unsubscribe_all(pattern)`); `StateStore` (pluggable persistence) is not ported; `strcase` is ASCII-only though the crew assembler matches user-supplied names. **Suites that exit 0 with an assertion failing:** `tests/telemetry_wiring.tcyr` (seen 2026-10-03 under a mutant), because a thread is still alive when its epilogue's `syscall(60, f)` ends only the main thread. `cyrius test` still fails it on the printed summary, so the gate holds, but CI's per-suite bisect reads exit codes and would not name it. **Not one suite (F6 gate run, 2026-10-03):** `tests/telemetry_otlp.tcyr` and `tests/telemetry_mod.tcyr` exit 0 with failing assertions too, while `core_crew` and `server_serve` exited 1. Whether a suite is hit depends on whether an exporter thread is still running at exit: `agnosai_otlp_exporter_stop` only sets a flag and flushes (`src/telemetry/otlp.cyr:1278-1281`, no join), and the thread trampoline exits with status 0 (`lib/thread.cyr:197-199`). **Repro:** a `.tcyr` that fails one `assert` and then `thread_create`s a body that sleeps 300 ms exits 0; the same file without the thread exits 1. **Fix direction:** an epilogue that calls exit_group (a CLAUDE.md rule change); or make the OTLP exporter thread joinable, so `stop` sets the flag, joins, then flushes and no exporter thread outlives `main` (2.1.6 serialised the two flushes under one lock but added no join); or, with no code change, have CI's bisect also fail any suite whose run log matches `[1-9][0-9]* failed`. **`/mcp` `tools/call` dereferences a tool's output without checking it** (found 2026-10-03, F6): `src/server/routes/mcp.cyr:281` passes `agnosai_tool_output_success(out)` to the log line, and `:283` and `:289` read it again, while the vtable contract allows a tool to answer 0 (`src/tools/native.cyr`, `agnosai_tool_execute_in`, which null-checks for exactly that reason and records `error.type` `no_output`). **Repro:** register a tool whose execute fn returns 0 and call it through `POST /mcp` `tools/call`: the handler segfaults. No builtin returns 0 today, so it is latent. **Fix:** treat `out == 0` as a tool-level failure — `isError: true` with "Unknown error", the oracle's fallback text — before any read. |
+| B16 | **Upstream gaps — noted, NOT raised** | — | ⛔ **Do not raise any of these until agnosai is on the latest version of that project**, then re-check the gap against that version first. bayan, sigil and sandhi are cyrius stdlib folds: agnosai takes the version the pinned cyrius folds, and their newer releases wait for the next cyrius fold. As of 2.1.6 (cyrius 6.6.14), bayan 1.5.11, sandhi 1.10.4 and kavach 3.13.2 are their projects' latest tags, so those three gaps are due their re-check against those versions; none has been re-checked yet. sigil's repo is at 3.13.9, which agnosai takes only with the 6.6.15 pin (*Moving the cyrius pin to 6.6.15* above), so the rule holds the sigil gap until that move; 6.6.15 folds the same bayan and sandhi. **bayan** (fold 1.5.11; listed at 1.5.6) — YAML beyond the subset parser: block scalars, flow mappings, anchors, tags, escape decoding in quoted strings. **sigil** (fold 3.13.7; listed at 3.12.18) — RSA keys over 4096 bits (a certificate-format key is agnosai's own to fix, B8). **sandhi** (fold 1.10.4; listed at 1.9.17) — decoding chunked request bodies. **kavach** (3.13.2, a direct dep; 3.13.2 rebuilt the WASM backend's capture and stdin, so re-check the stdin gap against it) — WASM store limits (instance/table/memory caps, trap on a failed grow) and guest stdin over 64 KiB. |
 | B18 | **`lt_aggregate_100k_500workers` is ~2x its 2026-08 band** | Medium | Found at 2.0.6 (88.2 ms against ~24 ms), 45.4 ms at 2.1.3 on cyrius 6.6.14, and still open. The measurements, what is ruled out (not the compiler, not the benchmarked source, not noise) and where to start (the 2026-08-03 `_a` allocator work, a ~6-round bisect over 40 commits) are in `state.md`, "⚠ OPEN — a ~3.6x regression, found at 2.0.6". |
-| B19 | **Suites compile with `warning: undefined function '_agnosai_loader_read'`** (found 2026-10-03, F7 gate run) | Easy | `src/sandbox/wasm.cyr:235` and `src/tools/wasm_loader.cyr:142,163` call `definitions/loader`'s private reader. A suite that includes `src/sandbox/mod.cyr` or `src/tools/mod.cyr` without `src/definitions/loader.cyr` compiles with a dangling call: 20 such warnings in a full `cyrius test` log at F7's gate run, 23 at the 2026-10-04 integration gate (B17 + F7 + F6). **Repro:** `cyrius build tests/telemetry_wiring.tcyr build/tw` prints the warning. No suite reaches the call, so they pass, but a suite that did would jump through an unresolved symbol. The standing warning also hides any *new* `undefined function` line, which is how real breakage has been caught before (CHANGELOG, `_agnosai_to_ascii_lower`). Not caused by F7; no include line changed. **Fix:** do the hoist `src/sandbox/wasm.cyr:228-234` already prescribes. Move one whole-file reader into a port-local root module, used by `definitions/loader`, `sandbox/wasm`, `tools/wasm_loader` and `orchestrator/durable_state`'s `_agnosai_read_file_exact`. Then check that the full `cyrius test` log has no `undefined function` line. |
-| B20 | **A second live thread moves a crew's cost — both ways** (found 2026-10-03, F6 fix round) | Medium | Measured with one process per row, seven interleaved rounds, medians: an idle detached thread that only `sleep_ms(25)`s took `run_crew_10_tasks_sequential` **334 → 400 µs (+20%)** and `run_crew_10_tasks_parallel_4` **624 → 456 µs (−27%)**, at 2.1.4 and on the current tree alike. `benches/orch.bcyr` already runs those rows at the second-thread level (parallel ~456 µs; sequential 380–400 µs across two gate runs), so some earlier row leaves a thread alive, which is also the likeliest reading of the `crew_runner_10_tasks_parallel_4_quiet` level shift recorded under CHANGELOG 2.1.5 → Performance. **Repro:** add a mode to a copy of `benches/orch.bcyr` that calls `thread_create_detached` on a `while (!stop) { sleep_ms(25); }` body before `_b_run_crew("run_crew_10_tasks_parallel_4", ...)`, and run it beside the plain row in separate processes. **Why it matters:** a production server always has other threads (the pool, the exporter), so the single-threaded bench level is not what a deployment sees, and a row's number depends on what ran before it. **Direction:** find which stdlib path switches on a second live thread (mutex/futex, the allocator, `thread_create`/`thread_join`, stack mmap) — if it is the stdlib, file it against cyrius rather than patch it — and then decide whether `benches/orch.bcyr` should pin the level explicitly (start one idle thread in `main`) so rows stop depending on their neighbours. |
-| B21 | **Two drainers share the OTLP ring's doc arena at shutdown** (found 2026-10-03, F6 fix round) | Easy | `agnosai_otlp_ring_doc_arena` is documented "private to the draining thread" (`src/telemetry/otlp.cyr:791`), but there are two: the exporter thread's `agnosai_otlp_exporter_flush` drains and then POSTs the doc outside the ring lock (`:1063-1074`), and `agnosai_otlp_exporter_stop` (`:1132`) drains again on the caller's thread, whose `reset_via(doc_arena)` (`:852`) rewinds and overwrites the arena under a POST that may still be sending it. The result is a corrupted final-but-one batch, which a collector rejects. Rare: it needs a flush in flight at shutdown and new spans queued since. **Repro:** a loopback listener that accepts and reads slowly; enqueue spans, let the exporter thread start its POST, enqueue more, call `agnosai_telemetry_shutdown`, and compare the bytes received with the first drain's doc. **Fix direction:** give `stop`'s final flush its own arena, or make the exporter thread joinable and have `stop` set the flag, join, then flush — which would also end B15's exit-code-0 suites, since no exporter thread would outlive `main`. |
-| B22 | **Four comments still point at `CHANGELOG [Unreleased]` for work that shipped in 2.0.0** (found 2026-10-04, at the 2.1.5 cut) | Easy | `src/server/router.cyr:15` (bite 15b, the sandhi adapter), `src/server/auth.cyr:113` (the RS256 half, M6), `src/server/routes/a2a.cyr:266` (the A2A callback's SSRF gate) and `tests/server_routes_health.tcyr:136` (ADR 011's wiring job) each cite `CHANGELOG [Unreleased]`, which since the 2.0.0 cut has meant whatever the next release holds. Written 2026-07-31 to 2026-08-03. Point each at the release that carried it (or at the ADR or roadmap row), then regenerate `dist/agnosai.cyr` with `cyrius distlib --all`, since the three `src/` comments are in the fold. Left out of 2.1.5 because a version cut changes no `src/` but the version literal. |
-| B23 | **`CLAUDE.md` still describes `rust-old/` as of 2.1.0** (found 2026-10-04, at the 2.1.5 cut) | Easy | `CLAUDE.md:16` (the identity line) says rust-old/ is "scheduled for deletion in the release after 2.1.0". `CLAUDE.md:24` says it is reachable at "any tag up to 2.1.0". rust-old/ is still present in 2.1.1 through 2.1.5. Fix: name the last tag that carries rust-old/ once it is deleted, or until then "every tag through the current one". **CLAUDE.md is the user's file: the user edits it, or approves the edit.** README.md:8-9 and this file's deletion section (around :77) carry the same "after 2.1.0" schedule and should move with it. |
-| B24 | **`cyrius distlib --all --check` is a gate in `state.md` but nothing runs it** (found 2026-10-03, integration pass) | Easy | Neither `.github/workflows/ci.yml` nor `scripts/check-clean.sh` calls it, so a `src/` change committed without `cyrius distlib --all` would ship a stale `dist/agnosai.cyr` to every consumer, and CI would stay green. It was run by hand at the 2.1.5 cut and passed. Fix: add it to check-clean.sh, which CI already runs. Then mutation-check the gate: edit one `src/` comment without regenerating, and the gate must fail. |
+| B19 | **Suites compile with `warning: undefined function '_agnosai_loader_read'`** (found 2026-10-03, F7 gate run) | Easy | `src/sandbox/wasm.cyr:235` and `src/tools/wasm_loader.cyr:142,163` call `definitions/loader`'s private reader. A suite that includes `src/sandbox/mod.cyr` or `src/tools/mod.cyr` without `src/definitions/loader.cyr` compiles with a dangling call: 20 such warnings in a full `cyrius test` log at F7's gate run, and 23 at the 2026-10-04 integration gate and in a full run during 2.1.6's work. **Repro:** `cyrius build tests/telemetry_wiring.tcyr build/tw` prints the warning. No suite reaches the call, so they pass, but a suite that did would jump through an unresolved symbol. The standing warning also hides any *new* `undefined function` line, which is how real breakage has been caught before (CHANGELOG, `_agnosai_to_ascii_lower`). **Fix:** do the hoist `src/sandbox/wasm.cyr:228-234` already prescribes. Move one whole-file reader into a port-local root module, used by `definitions/loader`, `sandbox/wasm`, `tools/wasm_loader` and `orchestrator/durable_state`'s `_agnosai_read_file_exact`. Then check that the full `cyrius test` log has no `undefined function` line. |
+| B20 | **A second live thread moves a crew's cost — both ways** (found 2026-10-03, F6 fix round) | Medium | Measured with one process per row, seven interleaved rounds, medians: an idle detached thread that only `sleep_ms(25)`s took `run_crew_10_tasks_sequential` **334 → 400 µs (+20%)** and `run_crew_10_tasks_parallel_4` **624 → 456 µs (−27%)**, at 2.1.4 and on the then-current tree alike. `benches/orch.bcyr` already runs those rows at the second-thread level (parallel ~456 µs; sequential 380–400 µs across two gate runs), so some earlier row leaves a thread alive, which is also the likeliest reading of the `crew_runner_10_tasks_parallel_4_quiet` level shift recorded under CHANGELOG 2.1.5 → Performance. **Repro:** add a mode to a copy of `benches/orch.bcyr` that calls `thread_create_detached` on a `while (!stop) { sleep_ms(25); }` body before `_b_run_crew("run_crew_10_tasks_parallel_4", ...)`, and run it beside the plain row in separate processes. **Why it matters:** a production server always has other threads (the pool, the exporter), so the single-threaded bench level is not what a deployment sees, and a row's number depends on what ran before it. **Direction:** find which stdlib path switches on a second live thread (mutex/futex, the allocator, `thread_create`/`thread_join`, stack mmap) — if it is the stdlib, file it against cyrius rather than patch it — and then decide whether `benches/orch.bcyr` should pin the level explicitly (start one idle thread in `main`) so rows stop depending on their neighbours. Related: **B27**, the same file's rows moved by heap position. |
+| B22 | **Comments and docs that point at places that no longer say it** — four at `CHANGELOG [Unreleased]` for work that shipped in 2.0.0 (found 2026-10-04, at the 2.1.5 cut), and the pointers into this roadmap that clearing it left (2026-10-04) | Easy | `src/server/router.cyr:15` (bite 15b, the sandhi adapter), `src/server/auth.cyr:113` (the RS256 half, M6), `src/server/routes/a2a.cyr:266` (the A2A callback's SSRF gate) and `tests/server_routes_health.tcyr:136` (ADR 011's wiring job) each cite `CHANGELOG [Unreleased]`, which since the 2.0.0 cut has meant whatever the next release holds. Written 2026-07-31 to 2026-08-03. Point each at the release that carried it (or at the ADR), then regenerate `dist/agnosai.cyr` with `cyrius distlib --all`, since the three `src/` comments are in the fold. `src/server/auth.cyr:113` also cites `docs/development/roadmap.md (M6)`, a section this file no longer has; point it at CHANGELOG [2.0.0] in the same edit. **The same sweep, for pointers into this roadmap** (left when completed items were cleared from it, 2026-10-04): line numbers that now land elsewhere — `src/core/mod.cyr:34` (`roadmap.md:43`) and `src/orchestrator/crew_runner.cyr:194` (`roadmap.md:18`), both meaning the bhava carve-out, now *What agnosai is* and D2; `crew_runner.cyr:1582,1649` (`roadmap.md:160`, the hierarchical fallback, now F2). Sections that are gone — `src/main.cyr:88` (M8), `src/telemetry/mod.cyr:9` (M9), `src/telemetry/otlp.cyr:795,1054` ("section E"; 2.1.6's `tests/telemetry_otlp.tcyr` now POSTs to a local stub, so `:1054`'s "not reachable from the suite" is stale too). Comments that still call B2 open (`src/server/serve.cyr:32`, `src/server/routes/mod.cyr:29`, `src/server/auth.cyr:647`); B2 is closed and its traps are in `state.md`. Name sections, not line numbers, and run `cyrius distlib --all` after. Outside `src/`: `tests/sandbox_spawn.tcyr:6` and `tests/sandbox_policy.tcyr:18` say the *Carried over* **table** records env sanitization, which is now the prose under it; `docs/adr/017-*.md:99,135` cite *Out of scope for v2.0*, now *Out of scope* → *Owed to the ecosystem* (a dated note, since ADRs are records); `docs/adr/006-*.md:147` cites an M7 record now only in CHANGELOG [2.0.0]; `state.md` cites the M7/M11/M12 sections (`:1510`, `:1513`, `:1616`, `:1717`), A2 (`:1595`), D1 as open (`:2305`) and B2 as open (`:2699`) — fix at the next state refresh; `docs/guides/api-reference.md:441` says "the preset library endpoint is on the roadmap", which it is not. |
+| B23 | **`CLAUDE.md` describes `rust-old/` as of 2.1.0, and its consumer list is stale** (found 2026-10-04, at the 2.1.5 cut) | Easy | `CLAUDE.md:16` (the identity line) says rust-old/ is "scheduled for deletion in the release after 2.1.0". `CLAUDE.md:24` says it is reachable at "any tag up to 2.1.0". rust-old/ is still present in 2.1.1 through 2.1.6. Fix: name the last tag that carries rust-old/ once it is deleted, or until then "every tag through the current one". `CLAUDE.md:20` lists daimon as a consumer, but daimon has no `[deps.agnosai]` (its deps are sakshi, ai-hwaccel, samay, sigil, libro, majra, bote) and no HTTP client aimed at an agnosai endpoint — checked at 2.0.0 and still true at 2.1.6; agnostic is the consumer. `CLAUDE.md:187` describes `roadmap.md` as "milestones through v1.0, dependency gates". **CLAUDE.md is the user's file: the user edits it, or approves the edit.** `state.md`'s *Consumers* (`:2929-2930`) also says "none consuming the Cyrius line yet"; fix it at the next state refresh. Moves with the `rust-old/` deletion. |
+| B24 | **`cyrius distlib --all --check` is a gate in `state.md` but nothing runs it** (found 2026-10-03, integration pass) | Easy | Neither `.github/workflows/ci.yml` nor `scripts/check-clean.sh` calls it, so a `src/` change committed without `cyrius distlib --all` would ship a stale `dist/agnosai.cyr` to every consumer, and CI would stay green. It is run by hand at each cut (2.1.5, 2.1.6) and passed. Fix: add it to check-clean.sh, which CI already runs. Then mutation-check the gate: edit one `src/` comment without regenerating, and the gate must fail. |
 | B25 | **The serve handler's arena read of `traceparent` is not covered by a test** (found 2026-10-03, F6) | Medium | `sandhi_server_find_header_a(…, "traceparent")` runs only on the arena branch, which needs a sandhi worker arena. The pipe harness reaches only the bare branch, as it does for every other header. Fix: a harness that runs one request through a real pooled worker with an arena, asserting that the crew's spans carry the inbound trace id. That would cover the other arena-branch header reads too. |
-| B26 | **x86_64 grew 16,976 B at 2.1.5 but aarch64 only 592 B** (found 2026-10-04, at the cut) | Easy (investigation) | The x86 growth is accounted for item by item (+4,112, +4,352, +8,512). The aarch64 figure was not explained. Both binaries contain the new code and answer `/ready` with 2.1.5. Fix: compare the symbol sizes of the two builds (`CYRIUS_DCE_VERBOSE=1`) to see whether aarch64's DCE or code generation absorbs the difference, or whether something is missing. If it reveals a toolchain anomaly, file it with cyrius; do not patch the toolchain. |
-
-### Recently closed
-
-One line each; the reasoning and measurements are in `CHANGELOG.md`.
-
-| Closed | What |
-|---|---|
-| 2026-07-31 | **Wire the metrics producer** — `/metrics` stopped rendering zeros; ADR 011's staged producer landed in `crew_runner`. Found and fixed a gauge leak on the cyclic-DAG path in the same change. |
-| 2026-07-31 | **`src/order.cyr` → stdlib sort** — 184 → 98 lines; `sort_100k` 79.6 → 20.3 ms, already-sorted 79.1 → 3.31 ms. Public API and bounds contract kept as a wrapper, because `vec_select_nth` aborts where this returns 0. |
-| 2026-07-31 | **`src/` mirrors `rust-old/src/`** — 65 `git mv` renames, verified by a byte-identical binary. |
-| 2026-07-31 | **bayan `_a` JSON surface** — filed, implemented and released as bayan 1.4.0, folded in cyrius 6.5.5. Was the blocker under B2. |
-| 2026-07-31 | **bote `serverInfo` hardcode** — filed and fixed as bote 3.3.0 (`dispatcher_set_server_info`). Pin bump owed under B1. |
-| 2026-08-03 | **Bite 15c — SSE (A1), the last file in M6** — `/api/v1/crews/{id}/stream` streams for real. The plan drafted for this was refuted 3/3 on adversarial review and every finding was addressed: the capacity divergence is [ADR 014](../adr/014-sse-stream-holds-a-pooled-worker.md) (the oracle serves *unbounded* streams — tower's permit drops before the body streams), `Closed` reads a flag on our own subscription rather than the bus or chan's layout, `Lagged` terminates *before* draining, ids are canonicalised, all three oracle warns and fallbacks ported. Found and fixed an unauthenticated SIGSEGV on a malformed id while testing. |
-| 2026-08-03 | **Graceful shutdown (ADR 013, superseding 012)** — cyrius 6.5.6 vendored sandhi 1.9.9's stop flag, which agnosai had filed hours earlier. `main` installs a `signalfd` SIGINT/SIGTERM handler; `agnosai_serve` returns 0 for a requested stop vs 1 for a failure. Verified live: both signals exit 0 in ~100 ms, an in-flight request still completes 200. |
-| 2026-08-03 | **Bite 16 — `src/main.cyr` bind (A2)** — the binary serves for the first time. Env config (`PORT`/`AGNOSAI_PORT`/`HOOSH_URL`/the four auth vars) ports branch-for-branch, `agnosai_serve_parse_port` reproduces `u16::from_str` where neither stdlib parser does, and the epilogue moved to `exit_group` because `SYS_EXIT` exits one thread. Graceful shutdown is deliberately absent — [ADR 012](../adr/012-no-graceful-shutdown-on-sandhi.md). |
-| 2026-08-03 | **Dep pins corrected to name what is actually built** — `cyrius.cyml` said bote 3.2.1 / kavach 3.9.3 while `lib/` held 3.3.0 / 3.11.0, because `path = "../NAME"` beats `tag` locally and CI has no sibling checkouts. Both bundles verified byte-identical to their upstream tag dists; all six pins are now the newest upstream tag. Gated going forward by `cyrius deps --verify` in `scripts/check-clean.sh` and a *Lockfile is honest* CI step. |
-| 2026-10-03 (2.1.5) | **B17 — crew events and status say what happened** ([ADR 022](../adr/022-crew-events-and-status-say-what-happened.md)). All six of agnostic 0.1.9's findings: a parallel/DAG `task_started` at dispatch and `task_completed` per join (in dispatch order); `token` events from parallel and DAG workers; `metadata.agent` on LLM-answered results, so `agent_cost_usd` is populated; runner `token` events carry the spec's crew id (passed down, not stamped into the prompt-rendered context); a timed-out runner reports `failed` with no results itself, so `crew_completed` agrees with the stored state; the registry stores `running`, and the DAG error arm puts `pending` back (a `running` → `pending` edge a poller can see, documented in `docs/guides/api-reference.md`). Extra fix: `agnosai_crew_profile_record_agent_cost` replaced where the oracle sums. The hoosh client's chat pointer makes the LLM success arm testable offline. agnostic needs only the re-pin and a comment refresh. |
-| 2026-10-03 (2.1.5) | **F6 — OTel GenAI semconv spans and inbound trace context, agnosai half** ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)). Four linked operations (`invoke_workflow`, `invoke_agent`, `chat`, `execute_tool`) under one trace per crew in every process mode; `parentSpanId` on the wire; a span id no longer reuses its trace id's high half; inbound `traceparent` in process (`agnosai_crew_with_trace_parent`) and on three HTTP routes; `agnosai_telemetry_init_export`; ParentBased sampling; `error.type`. The off path builds no span (`tool_execute_echo` 3.67 → 0.79 µs). agnostic's half lands at its re-pin. |
-| 2026-10-04 (2.1.6) | **Five fixes from agnostic 0.1.14's review of its 2.1.5 re-pin** (CHANGELOG 2.1.6). The OTLP exporter and the hoosh chat call each post through their own arena under finite timeouts (2.1.5 left ~258 KiB of RSS per exporter batch and ~256 KiB per inference on the global bump, and neither could time out); the exporter's flushes are serialised; `OTEL_EXPORTER_OTLP_ENDPOINT` is a base URL and the per-signal `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is honoured; a `dag` crew stranded by a failed branch ends FAILED instead of in the deadlock arm; cancelling a finished crew is refused (409) instead of relabelling it. ADR 022 and 023 carry dated notes. |
-| 2026-10-03 (2.1.5) | **F7 — explain agent selection.** `agnosai_explain_selection_a` plus two JSON renderers, library only (no wire change, no ADR). Entry 0 is pinned equal to the runner's pick. Personality is reported as its neutral 0.5 and listed as `unmeasured`. Prerequisite: the scorer's context keys are hoisted and the domain compare no longer copies, which took 19–41% off the `score_agent_*` / `rank_agents_*` rows and fixed a domain with an embedded NUL matching its own prefix. agnostic surfaces it on its plan route at the re-pin. |
+| B26 | **x86_64 and aarch64 binary growth do not track each other** (found 2026-10-04, at the 2.1.5 cut) | Easy (investigation) | At 2.1.5 x86_64 grew 16,976 B but aarch64 only 592 B. The x86 growth is accounted for item by item (+4,112, +4,352, +8,512); the aarch64 figure was not explained. At 2.1.6 the reverse: x86_64 grew 8,520 B (5,240,304 → 5,248,824) and aarch64 65,864 B (6,423,568 → 6,489,432) — but `state.md` labels the 2.1.6 aarch64 figure "(DCE)" and the 2.1.5 one "cross-build", so first confirm both were built the same way. Both binaries contain the new code and answer `/ready` with their version. Fix: compare the symbol sizes of the two builds (`CYRIUS_DCE_VERBOSE=1`) to see whether aarch64's DCE or code generation absorbs the difference, or whether something is missing; investigate both releases' deltas together. If it reveals a toolchain anomaly, file it with cyrius; do not patch the toolchain. |
+| B27 | **`crew_runner_10_tasks_parallel_4_{quiet,watched}` measure the global heap's position, not the runner** (found 2026-10-04, at 2.1.6) | Easy–medium | In `benches/orch.bcyr`, with the traced block before them (`run_crew_10_tasks_*_traced`, which starts and stops an OTLP exporter) the 2.1.5 tag reads ~420 µs; with that block removed, ~507 µs — and 2.1.6, whose exporter no longer leaks there, reads ~505 µs either way. Interleaved A/B builds ruled out job false sharing, the data-section layout and the exporter's timeouts. **Fix:** run these rows first, or in their own `.bcyr`, so a change elsewhere in the file cannot move them; then rebase their history. Related: **B20**. |
+| B28 | **18 log literals whose declared length is not the literal's** (found 2026-10-04, at 2.1.6) | Easy | 17 cut the message short — mostly a multi-byte character (`—`) counted as one byte. Under `src/`: `fleet/discovery.cyr:141`, `fleet/environment.cyr:263,271,273,279,283,287,290`, `main.cyr:211,378,383,412`, `orchestrator/pubsub.cyr:248`, `orchestrator/scoring.cyr:116`, `server/output_filter.cyr:292`, `server/sse.cyr:352` — and `main.cyr:434` declares the NUL (28 for a 27-byte literal), so the shutdown line ends `gracefully\u0000` in the JSON log. agnostic's `scripts/check-log-lengths.py` finds them all when run from this repo's root. **Fix:** fix the 18 and add that script to `scripts/check-clean.sh`, as agnostic did, so none comes back. |
+| B29 | **`tests/smcyr/llm_live.smcyr` does not compile** (found 2026-10-04, at 2.1.6) | Easy | It includes `src/llm/mod.cyr` without `src/telemetry/mod.cyr` (seven undefined `agnosai_genai_*` / `agnosai_telemetry_*` functions since ADR 017 put span sites in the chat path) and, since 2.1.6, without `src/arena_pool.cyr`; it also fails `cyrius fmt --check`. A live-gateway smoke test, so `cyrius tests` does not run it and nothing noticed. **Fix:** add both includes and format it. |
+| B30 | **Oracle flaws reproduced before the "never copy a Rust flaw forward" rule** (recorded at the fleet port, 2026-08-08; the rule is `CLAUDE.md:121`, added at 2.0.10) | Easy each | Four behaviours that read like defects were reproduced from the oracle and pinned by assertions so nobody would "fix" them by accident: (1) **`fleet/gpu`: allocating twice for one task id leaks the first allocation** — `allocate` ends with a map insert that replaces, so the first allocation stays charged to its device with no record and `release` can never return it (`src/fleet/gpu.cyr:24-31`, which points here); (2) **`FleetCoordinator`'s `max_retries` allows one retry fewer than it names** — `task_failed` increments first and then tests `count < max_retries`, so the default 3 yields two Retry answers and Exhausted on the third failure (`src/fleet/coordinator.cyr:7-12`; the oracle's own tests pin both ends); (3) **`topology_score` is not clamped to the 1.0 its doc promises** — a raw link count over the device-pair count, so three links between two GPUs score 3.0 (`src/fleet/topology.cyr:10-16,149`); (4) **`FederationManager::declare_coordinator` adopts any term that is not stale** (`src/fleet/federation.cyr:19-26`). `CLAUDE.md:121` now says never copy a Rust flaw forward and never propose "restore parity" as an option. **Fix direction:** fix each, invert its pinning assertion, and add an ADR where the change is visible on the wire. Look at (4) before changing it: accepting a higher term is the usual leader-election rule, and its header already says not to change the guard to `<=` without an ADR; if it is correct as it is, say so in place and drop it from this row. |
 
 ### C. Upstream — filed and waiting
 
-Nothing here blocks agnosai today; each is a residual agnosai measured and handed off.
-
-**Owed (found 2026-10-04, at 2.1.6), not upstream:** `benches/orch.bcyr`'s
-`crew_runner_10_tasks_parallel_4_{quiet,watched}` rows measure the global heap's position, not the
-runner. With the traced block before them (`run_crew_10_tasks_*_traced`, which starts and stops an
-OTLP exporter) the 2.1.5 tag reads ~420 µs; with that block removed, ~507 µs — and 2.1.6, whose
-exporter no longer leaks there, reads ~505 µs either way. Interleaved A/B builds ruled out job
-false sharing, the data-section layout and the exporter's timeouts. Run these rows first, or in their
-own `.bcyr`, so a change elsewhere in the file cannot move them; then rebase their history.
-
-**Owed (found 2026-10-04, at 2.1.6), not upstream:** 18 log literals whose declared length is not
-the literal's. 17 cut the message short — mostly a multi-byte character (`—`) counted as one byte:
-`fleet/discovery.cyr:141`, `fleet/environment.cyr:263,271,273,279,283,287,290`,
-`main.cyr:211,378,383,412`, `orchestrator/pubsub.cyr:248`, `orchestrator/scoring.cyr:116`,
-`server/output_filter.cyr:292`, `server/sse.cyr:352` — and `main.cyr:434` declares the NUL, so the
-shutdown line ends `gracefully\u0000` in the JSON log. agnostic's `scripts/check-log-lengths.py`
-finds them all when run from this repo's root; fix the 18 and add it to `scripts/check-clean.sh`,
-as agnostic did, so none comes back.
-
-**Owed (found 2026-10-04, at 2.1.6), not upstream:** `tests/smcyr/llm_live.smcyr` does not compile —
-it includes `src/llm/mod.cyr` without `src/telemetry/mod.cyr` (seven undefined `agnosai_genai_*` /
-`agnosai_telemetry_*` functions since ADR 017 put span sites in the chat path) and, since 2.1.6,
-without `src/arena_pool.cyr`; it also fails `cyrius fmt --check`. A live-gateway smoke test, so
-`cyrius tests` does not run it and nothing noticed. Add both includes and format it.
+Nothing here blocks agnosai today; each is a residual agnosai measured and handed off, or one
+still to hand off.
 
 **To file (found 2026-10-04, at 2.1.6):** an `_a` HTTP request still allocates on the global bump.
 With the exporter and the chat call both posting through `sandhi_http_post_opts_a` into their own
@@ -1469,90 +232,47 @@ day. **The ask:** an `_a` form of `sockaddr_in` (or a caller-supplied buffer), a
 `_sandhi_http_dispatch_a` keeping every allocation in `a`. Pinned meanwhile by bounds, not zero:
 `tests/telemetry_otlp.tcyr` (< 512 B a POST) and `tests/llm_hoosh.tcyr` (< 1 KiB a call).
 
-| Dep | Open filings |
+| Dep | Open |
 |---|---|
-| cyrius | `2026-07-28-agnosai-no-nlogn-sort-in-stdlib.md` — ✅ **resolved in 6.5.4 and consumed** (`src/order.cyr` is now a wrapper). **Filed 2026-08-03:** `2026-08-03-agnosai-no-sys-exit-group-wrapper.md` (no `sys_exit_group` wrapper — `sys_exit` ends one thread, so a threaded program's idiomatic epilogue hangs the process; repro + measured 124-vs-0 included) and `2026-08-03-sandhi-async-await-readable-has-no-timeout.md` (hardcoded `-1` epoll timeout at `lib/async.cyr:823` makes a cooperative server unwakeable; found while building sandhi 1.9.9's stop facility, worked around there with a bounded sleep). Still open: `2026-07-28-sock-send-result-allocates-per-call.md` (16 B/response, pinned by an exact-bound test in sandhi), `2026-07-29-no-portable-xmkdir-in-io-cyr.md`, `2026-07-29-mutex-unlock-unconditional-futex-wake.md` (✅ **resolved in 6.5.9** — three-state mutex, 394 → 48 ns; agnosai changed nothing and gained 15–77% across every lock-bound benchmark), `2026-07-29-fmt-int-buf-i64-min.md` (✅ **resolved** — `fmt.cyr`, `string.cyr`, `log.cyr` and sakshi 2.4.8 all guard `i64::MIN`, verified 2026-08-07 by formatting it; agnosai only actually *received* the sakshi half once the transitive `[deps.sakshi]` downgrade was fixed). **Filed 2026-08-07, ✅ resolved in 6.5.10 and consumed:** `alloc_via` cost 15.1 ns of which ~9 was call plumbing — inlining its two accessor loads and registering `&arena_alloc`/`&arena_reset` instead of the `_arena_*` trampolines took it to **11.1 ns**, worth **5–13% on every arena-threaded route** with the global arm unmoved. **So every agnosai cyrius filing to date is resolved except two:** `2026-07-28-sock-send-result-allocates-per-call.md` and `2026-07-29-no-portable-xmkdir-in-io-cyr.md`. **Filed 2026-08-06, ✅ resolved in 6.5.9 and consumed:** `2026-08-06-arena-is-fixed-capacity-and-answers-0-so-unbounded-work-cannot-use-one.md` — shipped as an exhaustion policy (`ARENA_FULL_NULL`/`GROW`/`SPILL`/`ABORT`); agnosai's hand-rolled wrapper is deleted and `server/serve.cyr` now sets `ARENA_FULL_SPILL` on sandhi's arena. **`ARENA_FULL_GROW` also unblocks `crew_runner`**, which was the filing's second half. Original text: — the stdlib has only a fixed-capacity arena, and exhausting one is a **segfault in practice**: the primitives correctly return 0, but a `Str` of 0 is indistinguishable from a valid one and the next deref faults. Two consequences measured here: threading the routes turned an unbounded leak into a reachable crash (200 crews on the 64 KiB request arena), fixed locally with a spilling wrapper; and **`crew_runner` cannot use an arena at all** — the majority of a crew run is transient but its size is unbounded, so no fixed capacity works and spilling would spill most of it. ⚠ The filing first said "97% transient" from comparing 33 KB of allocation against 894 B of *serialised* CrewState; that ignored the audit chain (~18 KB of a 4-task run, the largest consumer) and treated serialised size as an allocation figure. Corrected to two thirds–four fifths, decomposed by switching subsystems off. Asks for a growable arena. **Filed 2026-08-05, ✅ both resolved in 6.5.8 and consumed:** `2026-08-05-no-thread-detach-so-a-fire-and-forget-thread-leaks-its-2-mib-stack.md` (→ `thread_create_detached`; `agnosai_orchestrator_submit_crew` uses it, and 6.5.8 is now the floor for `src/orchestrator/`) and `2026-08-05-coverage-corpus-is-a-fixed-1-mib-buffer-and-silently-under-reports-past-it.md` (**agnosai is already 5,307 bytes past the buffer** — `cbt/quality.cyr:59` reads every `.tcyr` into a fixed 1 MiB `alloc` and `if (n > 0)` makes a truncated read indistinguishable from a refused one, so coverage under-reports with no diagnostic and **exit 0**; measured 100% → 85% across seven corpus sizes, and padding one suite deletes an unrelated suite's evidence. Same fail-open class as the `bench` filing. ⚠ **The hand gate is gone** — 6.5.8 replaced the fixed buffer with grow-and-retry, re-verified on 6.5.10 at a 1,765,916-byte corpus still reading 100%, so `scripts/check-coverage.sh` and the corpus-size check were deleted. Do not reintroduce a corpus budget), `2026-08-05-syscalls-has-signal-ignore-but-no-way-back-to-sig-dfl.md` (`signal_ignore` has no counterpart, so a process that ignores a signal cannot hand the default back to a child it execs — `SIG_IGN` survives `execve`; workaround owed for deletion under C2) and `2026-08-05-cyrius-bench-accepts-an-unusable-argument-and-exits-0.md` (`cyrius bench <dir>` / a misspelled path runs nothing, prints nothing, exits **0** — same root cause as the already-filed `cyrius build` missing-file bug, since `bench <file>` is build-and-run; cross-triage the two) |
-| sandhi | **Filed 2026-10-03, open:** `2026-10-03-chunked-response-verbs-discard-send-result.md` — `sandhi_server_send_chunk` and the chunked start/end verbs return 0 for a client that has gone, so B8's SSE stream cannot notice a departed client; reproduced on 6.6.14 (sandhi 1.10.4). Reaches agnosai only with a cyrius release that refolds sandhi. **Before it:** **Serve-loop stop facility — ✅ FILED, FIXED as sandhi 1.9.9, VENDORED in cyrius 6.5.6, and CONSUMED** (all 2026-08-03). `sandhi_server_options_stop_flag(opts, ptr)` on all five loops; agnosai now drains on SIGINT/SIGTERM ([ADR 013](../adr/013-graceful-shutdown-via-signalfd-and-stop-flag.md), superseding 012). Still open: `backlog` silently ignored by `run_opts`/`run_async`; chunked start hardcodes `" OK"`; **inbound** chunked decoding unsupported (1.9.4 answers 501 — honest, but not support) |
-| bayan | **Nothing open.** The `_a` JSON ask shipped as bayan 1.4.0 (folded in cyrius 6.5.5). The YAML ask (`2026-07-16-...`) has **also shipped and this row was stale** — `bayan_yaml_parse` / `_parse_buf` / `_parse_ctx` return a `json_v*` tagged value tree, plus `bayan_yaml_frontmatter_split`. Verified 2026-08-03 by parsing a scalar+sequence document, resolving a key through `bayan_json_v_obj_get`, and re-serializing via `bayan_json_v_build`. **This unblocks M10's YAML half**, which the exclusion table still lists as deferred — revisit that scope call before starting M10. |
-| sigil | `2026-07-30-rsa-verify-uses-secret-exponent-ladder.md` — ✅ **archived upstream**, fixed, vendored and **measured** (see C1). ✅ **RESOLVED upstream and consumed — the RSA verify workspace was shared across threads and it was an auth bypass.** Fixed in sigil **3.12.5** (PKCS#1 v1.5) and **3.12.6** (the same class in RSA-PSS); root cause of the latter was a cyrius tail-call frame-release bug fixed in 6.5.14. Re-verified against the 6.5.19 fold (sigil 3.12.7): every buffer on the RS256 verify path is function-scope — `rsa_pkcs1v15_verify_sha256`, `_rsa_pkcs1v15_check` (**both operands of the deciding compare**), `_rsa_recover_em`, and `bn_mont_modexp_pub` since 3.12.4. The banked `_rsa_em` / `_rsa_expected` no longer exist. **agnosai's serialising mutex was deleted at the 6.5.14 bump**, staged across four sigil releases on the pinned-lane harness (3.12.2: 888 forged accepted of 400,000; 3.12.5: 2000/2000 valid, 0 forged); `tests/server_auth_lane_race.tcyr` stays as the regression guard. ⚠ Still open: `sha256` keeps a `cbank()`-banked message schedule (`&W + cbank() * 512`) — fail-closed for a verify, but the same structural pattern, and not probed. The original text follows. `_rsa_pkcs1v15_check` (`lib/sigil.cyr:17887`) ends `return ct_eq_bytes(rem, rexp, n_len)` with **both operands** in lane-indexed *file-scope* globals that are never wiped per lane, and `cbank()` (`:4403-4418`) hands out 63 lanes and **never releases one** — so the bound is 63 *lifetime* crypto-touching threads, which agnosai passes with its 100 pool workers alone. Measured on this tree: **888 of 400,000 forged signatures accepted** and 281,965 of 400,000 valid ones rejected (reproduced 3x: 888 / 1674 / 314). **The ask is function-scope locals, not a bigger bank count** — 1,536 B against a 122,880 B per-fn stack budget, and sigil's "function-scope arrays are static globals" premise (`:17779`) is stale, disproven by probe. ⚠ **Scope is wider than RSA verify**: 62 file-scope banked globals including the shared bignum engine (`_bn_mont_*`, `_bn_exp_*`, `_bn_inv_*`) and the PSS/ECDSA/Ed25519 lanes `lib/tls_native_hs13.cyr:257-284` uses for TLS 1.3 peer auth — which agnosai reaches on every outbound HTTPS call. agnosai was protected on the JWT path only, by the local mutex in C2 — now deleted, see above. |
-| sakshi | **Filed 2026-08-08, ✅ FIXED as sakshi 2.4.9 (2026-08-09) — awaiting the cyrius fold.** `2026-08-08-emit-hook-loses-structured-fields.md` (archived upstream) — `sakshi_log_kv` renders `key=val` into the message text *before* `_sk_emit`, so the emit hook (the mechanism sakshi documents for structured consumers) receives one flat string and cannot recover the fields. agnosai's JSON therefore emits `"message":"… hoosh_url=http://…"` where the oracle emits a separate `hoosh_url` member — real output from `./build/agnosai`, in the filing. Same function also truncates silently at `var buf[256]` and takes exactly one pair. **Nothing is blocked**: `src/telemetry/mod.cyr` ships the JSON formatter without it. ⚠ This filing **replaces** the "sakshi has no JSON output mode / no EnvFilter" ask M9 used to plan — that premise was false, see M9.<br><br>**Fix, for the consumer side:** for `SK_OUT_HOOK` the message now arrives **unflattened** with a count-prefixed fields block (`{key, key_len, val, val_len}` records) in the hook's **sixth argument** — `level` discriminates, 0-5 log and 10-11 span. No new symbols, so it stayed a patch; read the block with four `load64`s. Verified through the generated `dist/sakshi.cyr`. Measured 36 → 25 ns (−31%) on the hook path. **`_agnosai_telemetry_json_hook` owes a follow-up** once cyrius vendors 2.4.9: read the block and emit each field as its own `fields` member, which closes the last stated divergence in `src/telemetry/mod.cyr`. ⚠ Until then the hook must keep ignoring its sixth argument — on 2.4.8 it is always 0, and on 2.4.9 the flattened tail disappears from `msg`, so the update is **required** at the fold, not optional. |
-| bote | `serverInfo` hardcoded to `"bote"` in `dispatcher_dispatch` — ✅ **fixed as bote 3.3.0** (`dispatcher_set_server_info`). Pin bump owed under B1. |
+| sandhi | **Filed 2026-10-03, open:** `2026-10-03-chunked-response-verbs-discard-send-result.md` — `sandhi_server_send_chunk` and the chunked start/end verbs return 0 for a client that has gone, so B8's SSE stream cannot notice a departed client; reproduced on 6.6.14 (sandhi 1.10.4). Reaches agnosai only with a cyrius release that refolds sandhi. **Not filed:** `backlog` is silently ignored by `run_opts`/`run_async` (only `run_pooled`, `run_tls` and `run_pooled_tls` read it); the chunked start hardcodes `" OK"`; **inbound** chunked decoding is unsupported (answers 501 — honest, but not support; B8, B16). |
+| sigil | **Not filed, not probed (re-check against 3.13.9 after the 6.6.15 move, B16 rule).** At the pinned 3.13.7 the asymmetric stack (RSA sign and verify, PSS, the bignum engine) has been stack-local since 3.12.9, but the symmetric/EC scratch — sha256/512, hmac, hkdf, aes-gcm, chacha20-poly1305, ecdsa, ed25519, x25519 — is still `cbank()`-banked per lane (e.g. sha256's message schedule, `var Wb = &W + cbank() * 512`, `lib/sigil.cyr:6419`), and lanes are never released. The bound is 63 *lifetime* crypto-touching threads, which agnosai passes: 100 pool workers (JWT sha256, `AGNOSAI_SERVE_WORKERS`, `src/server/serve.cyr:149`), plus one detached thread per crew (the audit chain's `hmac_sha256`, `src/orchestrator/audit.cyr:210`, and outbound TLS to hoosh), one per A2A callback, and the exporter. Past it, two threads can share a lane. sigil calls the result fail-closed (`lib/sigil.cyr:5286-5317`): a corrupted digest or a failed handshake, not a forged accept — which here could still mean a corrupted audit-chain HMAC or a spuriously failed outbound handshake. sigil offers `crypto_banks_exhausted()` for consumers to poll at steady state; nothing in `src/` calls it. **Next step:** probe it (poll after the pool is up, and under a crew load), then decide between polling, capping, or a sigil filing. `tests/server_auth_lane_race.tcyr` stays as the RSA lane-bypass regression guard. |
 | hoosh | **To file (found 2026-10-03, F6).** hoosh 2.7.1 extracts an inbound `traceparent` strictly (`src/lib/trace.cyr:99-141`, `src/main.cyr:124-127`), but exports its own server span with the inbound **parent-id as its own spanId** and no `parentSpanId` (`src/lib/otlp.cyr:72-77`), then forwards the same traceparent to providers. **The ask:** mint a fresh span id for hoosh's span, emit the inbound parent-id as its `parentSpanId`, and forward a traceparent carrying hoosh's OWN span id. **Then agnosai's half:** `agnosai_hoosh_chat_in` adds an outbound `traceparent` header built from its `chat` span's context (`agnosai_otlp_span_context_format_a` already exists), and hoosh's span becomes the chat span's child. Until hoosh changes, sending the header would give hoosh's span the same id as agnosai's `chat` span inside one trace, so agnosai deliberately sends none ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)). Not filed from this lane: the upstream filing is a separate step. |
-| kavach | **Two open (2026-10-03), both reaching agnosai's sandbox.** `2026-10-03-pinned-exec-breaks-uutils-coreutils.md`: kavach execs a pinned fd, and uutils coreutils (Ubuntu's default from 25.10) refuse that exec, so `/bin/echo`, `cat` and the rest exit 1 under kavach on such a host (44 of kavach's suite fail natively on an Ubuntu 26.04 Pi; 3.13.1 and 3.13.2 alike). `2026-10-02-basic-seccomp-kills-native-tls-writes.md` (read from kavach's source by its filer, not traced): the `basic` profile, which agnosai applies to every process-isolated tool, allows no `sendto`, and cyrius 6.6.14's native TLS writes with it, so a sandboxed native-TLS writer on an inherited socket would be killed (a decision for kavach). **Before these: nothing open — all six earlier filings resolved.** The five M7 ones landed in 3.11.3–3.11.6 (seccomp/landlock on both exec paths, `timeout_ms` honoured, real exit code and stderr, namespaces on the persistent path). `2026-08-05-gate-apply-measures-with-strlen-...` landed in **3.11.7** and is ✅ **consumed** — see C2. |
+| kavach | **Two open (2026-10-03), both reaching agnosai's sandbox.** `2026-10-03-pinned-exec-breaks-uutils-coreutils.md`: kavach execs a pinned fd, and uutils coreutils (Ubuntu's default from 25.10) refuse that exec, so `/bin/echo`, `cat` and the rest exit 1 under kavach on such a host (44 of kavach's suite fail natively on an Ubuntu 26.04 Pi; 3.13.1 and 3.13.2 alike). `2026-10-02-basic-seccomp-kills-native-tls-writes.md` (read from kavach's source by its filer, not traced): the `basic` profile, which agnosai applies to every process-isolated tool, allows no `sendto`, and cyrius 6.6.14's native TLS writes with it, so a sandboxed native-TLS writer on an inherited socket would be killed (a decision for kavach). |
 
 **C2 — one local workaround owed for deletion.**
-Not a defect; it is code that exists only because an upstream API cannot express
+Not a defect; it is code that exists only because an upstream API could not express
 the thing, and it has a precise deletion condition. Recorded here because this
 list is the project's definition of "owed", and a temporary workaround that no
 list names is a permanent one.
 
 | Workaround | Where | Delete when |
 |---|---|---|
-| `_agnosai_signal_default` | `src/sandbox/spawn.cyr` | cyrius ships `signal_default` (filed `2026-08-05-syscalls-has-signal-ignore-but-no-way-back-to-sig-dfl.md`). ~20 lines, Linux arms only; the call site in the child stays, only the local definition goes. ⚠ **The condition is met:** `signal_default` is in the stdlib from cyrius 6.5.7 (kavach 3.13.2's notes; `lib/syscalls.cyr:171` at 6.6.14), so the deletion is unblocked. Not done at 2.1.4, a dependency-only release. |
-| ~~`_agnosai_auth_rsa_verify_locked` + `_AGNOSAI_RSA_VERIFY_MUTEX`~~ | ~~`src/server/auth.cyr`~~ | ✅ **DELETED 2026-08-08**, on the cyrius 6.5.13 / sigil 3.12.5 fold. sigil moved the whole public RSA verify path to function-scope locals across three releases — 3.12.3 the v1.5 workspace (closing the bypass), 3.12.4 the Montgomery scratch, 3.12.5 `bn_mod`'s `modrembuf`/`modn1buf`, the last shared state, which this tree located and filed. The call site in `src/server/auth.cyr` is direct again and the ~0.85 ms/verify serialisation cost is reclaimed. **`tests/server_auth_lane_race.tcyr` stays** as the regression guard — it measured 1/2000 valid on 3.12.3, 712/2000 on 3.12.4 and 2000/2000 on 3.12.5, so it demonstrably detects a relapse. |
-
-~~`_agnosai_kavach_gate_bytes`~~ — ✅ **deleted 2026-08-05**, on the kavach
-**3.11.7** pin. `agnosai_kavach_scan_output` now calls
-`exec_result_set_stdout_n(r, str_data(output), str_len(output))`, so the
-artifact's true length crosses the API and the copy is gone. **The NUL rewrite
-went with it**, which was the part worth removing: kavach normalises its own
-scanning copy now, so the gate sees every byte *and* the artifact reaching it is
-unaltered. The two audit assertions still pass and still discriminate —
-reverting to the pre-3.11.7 `ExecResult_set_stdout(r, str_data(output))` fails
-both, one per direction.
-
-**3.11.7 is the floor for `kavach_bridge`.** Against 3.11.6 or earlier
-`exec_result_set_stdout_n` does not exist and the module does not compile, which
-is the right failure: the silent one is a released secret.
-
-The pin is verified against the published tag rather than assumed: `git show
-3.11.7:dist/kavach.cyr`, the kavach worktree, and `agnosai/cyrius.lock` all
-hash to `e959d81a…`, and the GitHub API puts the remote tag on the same commit
-(`6567a65`). So a tag-only CI resolution and the local `path = "../kavach"`
-override agree — see `state.md`.
-
-**C1 — ✅ RESOLVED 2026-07-31.** This read *"`cyrius deps` has not been re-run
-since the fix landed"*, which is no longer true: `lib/sigil.cyr` is the pinned
-**3.12.2** and `lib/` matches the 6.5.5 snapshot exactly. Re-measured on this box:
-
-| benchmark | before (3.12.1 era) | now |
-|---|---|---|
-| `auth_jwt_verify_ok` | 3.31 ms | **1.202 ms** (2.75x) |
-| `auth_jwt_reject_bad_alg` | 3.29 ms | **1.201 ms** |
-| `auth_jwt_key_prepare` | 10.7 µs | 10.5 µs |
-
-The per-core JWT ceiling therefore moves from **~300/sec to ~830/sec**. The
-`alg` check still sits *after* signature verification by design — parsing
-attacker-controlled JSON before authenticating was measured at ~53x heap
-amplification — so a rejected token still pays the modexp, which is why the two
-rows match. That ordering is unchanged and deliberate; see the CHANGELOG's
-Security section for the reasoning. **D1's argument moves with these numbers.**
+| `_agnosai_signal_default` | `src/sandbox/spawn.cyr:518` | cyrius ships `signal_default` (filed `2026-08-05-syscalls-has-signal-ignore-but-no-way-back-to-sig-dfl.md`). ~20 lines, Linux arms only; the call site in the child stays, only the local definition goes. ⚠ **The condition is met:** `signal_default` is in the stdlib from cyrius 6.5.7 (kavach 3.13.2's notes; `lib/syscalls.cyr:171` at 6.6.14), so the deletion is unblocked. |
 
 ### D. Decisions deferred to a human
 
 > ⚠ **Before adding anything here, or re-raising anything in it: a decision the
 > user has ALREADY MADE does not belong in this table.** D2 sat here for weeks
 > after bhava was settled and got asked again as a result, which is a documented
-> way to waste the user's time. If an item is decided, close it in place with the
-> decision written out — do not leave it phrased as a question.
+> way to waste the user's time. When an item is decided, move it to *Settled
+> decisions* with the decision written out — do not leave it phrased as a question.
+> D1–D6 are there.
 
 | # | Decision | Where it stands |
 |---|---|---|
-| ~~D1~~ | ~~**Mount `rate_limit`?**~~ | ✅ **DECIDED 2026-08-13 — YES, mounted by default. Do not re-raise it.** The user's reasoning, recorded verbatim: *"agnosai ships safe-by-default for operators who don't read docs; cause most people and even agents TLDR."* 100 req/s per client key, burst 200, `AGNOSAI_RATE_LIMIT=0` restores the oracle's exact wire. The full argument, the numbers, and the wire-divergence accounting are in [ADR 021](../adr/021-rate-limit-mounted-by-default.md). ⚠ Two defects had to be fixed first or the default would have been actively harmful — the handler ignored the headers and keyed everything as `"unknown"` (one shared bucket for the whole world), and the key was passed to majra as a `Str` where a cstr was expected, so **the limiter refused nothing at all**. Both closed 2026-08-13; majra 2.6.4 carries its half. |
-| ~~D2~~ | ~~**`"personality": null` on the wire**~~ | ✅ **DECIDED — NOT an open question. Do not re-raise it.** bhava is **coming** and is simply not ported to Cyrius yet, so there is nothing to depend on: `personality` stays unported and the wire **keeps emitting `null`**, which is what the default Rust build emits. **DEFER, never DROP.** Revisit only when bhava lands in Cyrius. This is the ONE carve-out the user ever set (see line 43 and `cyrius-port-plan.md:297`); listing it under *Decisions deferred to a human* was a documentation error that caused it to be asked again. |
-| D6 | **Is 2.1.5 the right number for a release with a Breaking section?** | **Open — the user's call, before the 2.1.5 tag.** `CHANGELOG.md:6` says agnosai follows Semantic Versioning, and 2.1.5 is the file's first patch with a `### Breaking` section: F6 renamed the exported genai span functions and constants (`agnosai_genai_inference_span` / `_crew_span` and their constants) and changed the span vocabulary. No known consumer is affected; agnostic, daimon and thoth were checked and call none of the removed names. The options: keep 2.1.5 and note the exception, renumber to 2.2.0 (or 3.0.0 under strict SemVer) before tagging, or change the policy line. agnostic's roadmap plans its re-pin as "agnosai 2.1.5" and would follow the number. Once decided, close this row in place with the decision written out. |
+| D7 | **Note the 2.1.5 exception in the CHANGELOG, or change its policy line?** | **Open — the user's call.** `CHANGELOG.md:6` says agnosai adheres to Semantic Versioning, but 2.1.5 shipped a `### Breaking` section — the F6 span vocabulary and the genai library API (`agnosai_genai_inference_span` → `agnosai_genai_chat_span` and the rest) — under a patch number (D6), and neither the policy line nor the 2.1.5 entry says so. The options: note the exception in the 2.1.5 entry, or change the policy line. |
 
 ### E. Known-unreachable code kept for oracle shape
 
 Not defects and not owed — recorded so nobody re-derives them as findings. Each is
 documented in place as unreachable rather than implied to fire: `agents.rs`'s
 serialize skip, the cycle-detector's `== 2` memoization arm, `crews.rs`'s profile
-skip, and `crew_runner.rs`'s personality prompt block (bhava, post-v2 per the
-user decree at line 18 of this file).
+skip, and `crew_runner.rs`'s personality prompt block (bhava; see *What agnosai is*).
 
-**Added from M7 (2026-08-05), so the next audit does not re-find them.** The
-2026-08-04 audit reached both and correctly rated neither a defect; they are
-listed because "no test covers this" is true of both and will keep being true:
+The entries below came from the 2026-08-04 sandbox audit
+([`m7-audit-2026-08-04.md`](m7-audit-2026-08-04.md)) and the fleet and telemetry ports. Each
+was reached and correctly rated not a defect; "no test covers this" is true of each and will
+stay true:
 
 - **`kavach_bridge`'s "start failed" arm.** kavach's `valid_transition` accepts
   `CREATED -> RUNNING` unconditionally, so a freshly created sandbox always
@@ -1564,7 +284,6 @@ listed because "no test covers this" is true of both and will keep being true:
   cannot fire. The oracle needs it because Rust's `u64` underflow panics in
   debug. Mutation-verified as unreachable: deleting the guard in `release`
   leaves all 65 assertions green. Kept for oracle shape, documented in place.
-
 - **`fleet/federation`'s `elect_by_lowest_id` `None` arm (added 2026-08-08).**
   The candidate list is the online peers **plus this cluster's own id**, so it
   is never empty and `candidates.first()` is always `Some`. The port returns the
@@ -1599,7 +318,18 @@ listed because "no test covers this" is true of both and will keep being true:
   method, exactly as upstream: the oracle logs `seeds.len()` once at startup and
   its `election_timeout` doc claims a randomization nothing performs. Accessors
   exist so a caller that owns the election timer has one place to configure it.
-
+- **`fleet/state`'s `is_checkpointing` is observably always false.** `checkpoint()`
+  sets it, pushes, and clears it before returning, and every oracle method takes
+  `&mut self`, so no caller can observe it set. The field and both writes are
+  ported anyway: the oracle's comment says it exists so barrier operations can be
+  queued against it, a contract for a future concurrent caller rather than dead
+  code (`src/fleet/state.cyr:26-32`).
+- **`fleet/cost_planning`'s missing `model_throughput` `None` arm.** The oracle's
+  `let Some(..) = model_throughput(..) else { return 0.0 }` is unreachable — every
+  branch of `model_throughput` returns `Some`, including its fallthrough. There is no
+  Cyrius branch because `_agnosai_cost_tier` is total; the oracle's `0.0` is documented
+  in place rather than reproduced as a branch nothing can enter
+  (`src/fleet/cost_planning.cyr:224-228`).
 - **Two log-only fixes whose mutants survive — L5 and L9.** Nothing in this tree
   captures sakshi output, so `sakshi_warn`'s corrected length and the manager's
   restored dispatch `debug!` cannot be asserted. Both are correct; neither is
@@ -1621,22 +351,18 @@ loop** at all.
 - `crew_runner.rs:148` falls back from hierarchical to sequential.
 - Nothing in the Rust orchestrator outside `approval.rs` calls the approval gate.
 
-So none of F changes the v2.0 verdict, and design principle 1 (wire compatibility) is why
-**each item that changes behaviour the oracle defined needs its own ADR** recording the
-divergence (as 007/009/010/019/020/021 do). The order is by leverage. No row carries a **→ next
-release** marker now. F6, F7 and B17's cheap parts (in F3's note) had it, and all three shipped
-in 2.1.5, which did not delete `rust-old/`.
+So design principle 1 (wire compatibility) is why **each item that changes behaviour the oracle
+defined needs its own ADR** recording the divergence (as 007/009/010/019/020/021 do). The
+order is by leverage.
 
 | # | Item | Effort | Notes |
 |---|------|--------|-------|
-| F1 | **A tool-calling loop in `execute_task`** | Large | Model → `tool_calls` → execute via the registry and sandbox tier → append the result → model, until a final answer, a step cap or a budget. It is the core of every harness (Claude Agent SDK, Codex, OpenHands). Without it an agent is a single prompt and registered tools are never invoked. Verified 2026-10-03: no `tool_call` handling in `crew_runner.cyr` or `src/llm/`. hoosh's OpenAI-compatible `/v1/chat/completions` carries `tools` / `tool_calls`, so the seam exists. **agnostic M6 is gated on this.** Pair it with the tool-registry ownership question agnostic records in its `handoff.md`. ADR required. **Tracing (F6):** the loop must call `agnosai_tool_execute_in` with the task's `invoke_agent` span context, so tool spans nest under the agent that made them, and should pass the agent name onto the span. |
-| F2 | **Wire hierarchical (manager → workers)** | Medium | `orchestrator/hierarchical.cyr` is built and tested; `crew_runner.cyr:1630` logs and falls back (line as of 2.1.5). Orchestrator-worker is the pattern the field converged on: Claude subagents, Codex subagents, manager Devins, the ADK supervisor, Magentic-One. Google/DeepMind's 2025 scaling study measured error amplification of 17.2× for independent agents against 4.4× centralized. Workers return summaries, not transcripts (see F9). The comment at `crew_runner.cyr:1561` defers this "until it lands upstream". The upstream is the frozen `rust-old/`, so it never will, and this is the ADR that lifts that deferral. agnostic drops its `hierarchical` refusal on the re-pin. |
-| F3 | **Wire the approval gate, and specify the crew/task lifecycle as a contract** | Medium | `orchestrator/approval.cyr` is built at `main.cyr:390` and its routes exist, but `crew_runner` never calls it. Add `awaiting_approval` to the task and crew states. Write the lifecycle down as one state machine: the states, the legal transitions, and a **per-crew monotonic `seq` on every event**. Test it as an invariant: no event without a legal transition, and no `seq` gap. **B17's six parts shipped ahead of it** (2.1.5, [ADR 022](../adr/022-crew-events-and-status-say-what-happened.md)): dispatch-time `task_started` and per-join `task_completed`, worker `token` events with the spec's crew id, `metadata.agent`, a timeout's `crew_completed` agreeing with FAILED, and `running` stored. **F3 keeps** the approval wiring, the `awaiting_approval` task and crew states, the lifecycle written down as one state machine with its legal transitions, and the per-crew `seq` — building on ADR 022's semantics rather than replacing them. It also inherits one ordering gap ADR 022 records: a parallel/DAG batch reports `task_completed` in dispatch order, where the oracle's `join_next` reports completion order (bounded by the batch). It also inherits the DAG error arm's `running` → `pending` revert (a cyclic or deadlocked DAG), which the state machine should replace with a terminal state. The model is herdr's self-report contract (`--state … --seq N`) and its `blocked` roll-up. |
-| F4 | **Durable execution — an event-sourced crew log, resumable from the last completed task** | Large | `orchestrator/durable_state.cyr` has **zero callers**, and B15 notes `StateStore` is unported. This is now baseline in the field: LangGraph checkpointers, Pydantic AI and the OpenAI Agents SDK on Temporal, MAF's Durable Task, OpenHands' event sourcing, Claude's resumable workflows. Build on F3's `seq` stream. Today agnostic answers a restart by marking crews `interrupted`; this is what would let it resume them. |
+| F1 | **A tool-calling loop in `execute_task`** | Large | Model → `tool_calls` → execute via the registry and sandbox tier → append the result → model, until a final answer, a step cap or a budget. It is the core of every harness (Claude Agent SDK, Codex, OpenHands). Without it an agent is a single prompt and registered tools are never invoked. Verified 2026-10-03: no `tool_call` handling in `crew_runner.cyr` or `src/llm/`. hoosh's OpenAI-compatible `/v1/chat/completions` carries `tools` / `tool_calls`, so the seam exists. **agnostic M6 is gated on this.** Pair it with the tool-registry ownership question agnostic records in its `handoff.md`. ADR required. **Tracing ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)):** the loop must call `agnosai_tool_execute_in` with the task's `invoke_agent` span context, so tool spans nest under the agent that made them, and should pass the agent name onto the span. |
+| F2 | **Wire hierarchical (manager → workers)** | Medium | `orchestrator/hierarchical.cyr` is built and tested; `crew_runner.cyr:1647-1650` logs and falls back. Orchestrator-worker is the pattern the field converged on: Claude subagents, Codex subagents, manager Devins, the ADK supervisor, Magentic-One. Google/DeepMind's 2025 scaling study measured error amplification of 17.2× for independent agents against 4.4× centralized. Workers return summaries, not transcripts (see F9). The comment at `crew_runner.cyr:1580-1584` defers this "until it lands upstream". The upstream is the frozen `rust-old/`, so it never will, and this is the ADR that lifts that deferral. agnostic drops its `hierarchical` refusal on the re-pin. **Constraint from F7:** `agnosai_explain_selection_a` is exact only while selection is a pure function of roster and task, and consumers recompute it from the spec. F2, learning-driven selection or a stateful bhava personality ends that, so the run must then record its choice. |
+| F3 | **Wire the approval gate, and specify the crew/task lifecycle as a contract** | Medium | `orchestrator/approval.cyr` is built at `main.cyr:391` and its routes exist, but `crew_runner` never calls it. Add `awaiting_approval` to the task and crew states. Write the lifecycle down as one state machine: the states, the legal transitions, and a **per-crew monotonic `seq` on every event**. Test it as an invariant: no event without a legal transition, and no `seq` gap. Build on [ADR 022](../adr/022-crew-events-and-status-say-what-happened.md)'s event semantics rather than replacing them. It inherits one ordering gap ADR 022 records: a parallel/DAG batch reports `task_completed` in dispatch order, where the oracle's `join_next` reports completion order (bounded by the batch). It also inherits the error arm's `running` → `pending` revert (a cyclic DAG, or a dependency on a task the spec does not hold; `src/orchestrator/orchestrator.cyr:412-424`), which the state machine should replace with a terminal state. Since 2.1.6 a branch stranded by a failure already ends FAILED. The model is herdr's self-report contract (`--state … --seq N`) and its `blocked` roll-up. |
+| F4 | **Durable execution — an event-sourced crew log, resumable from the last completed task** | Large | `orchestrator/durable_state.cyr` has **zero callers**, and B15 notes `StateStore` is unported. This is now baseline in the field: LangGraph checkpointers, Pydantic AI and the OpenAI Agents SDK on Temporal, MAF's Durable Task, OpenHands' event sourcing, Claude's resumable workflows. Build on F3's `seq` stream. Today agnostic answers a restart by marking crews `interrupted`; this is what would let it resume them. `durable_state` is built on `lib/io.cyr`, not patra (`src/orchestrator/durable_state.cyr:31-34`). An event-sourced log may want patra's jsonl mode, which opens `O_APPEND` without `O_TRUNC`; patra is first-party and can be extended upstream. |
 | F5 | **Enforce budgets and caps** | Medium | `budget.cyr` and `multi_tenant.cyr` have no callers outside their own files; only `max_duration_secs` is read. Enforce token and cost per crew and per tenant, plus max tasks per crew. Pair with **B6** (concurrent crews, and the counting semaphore the stdlib lacks). Multi-agent runs about 15× chat tokens (Anthropic 2025); Claude Code caps subagents at 20 concurrent and depth 3. agnostic removed `max_concurrent_tasks` because nothing enforced it, and gets it back on this. |
-| F6 | **OTel GenAI span names, and inbound trace context** — ✅ **done, agnosai half** (2.1.5, [ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)) | Medium (the line said Small) | Four semconv operations, linked parent to child: `invoke_workflow {crew}` (INTERNAL), a new per-task `invoke_agent {agent}` (INTERNAL), the hoosh call re-labelled `chat {model}` (CLIENT; it was the span called `gen_ai.invoke_agent`), and `execute_tool {tool}`. Attributes: `gen_ai.provider.name` (was the deprecated `gen_ai.system`), `gen_ai.tool.name`, `gen_ai.workflow.name`, `error.type`, and the agent key as `agnosai.agent.key` (the pinned registry reserves `gen_ai.agent.id` for hosted agents). Semconv pinned at `semantic-conventions-genai` commit `e07f4eba` (gen-ai-dev/1.42.0-dev on base v1.44.0, Development). Inbound W3C `traceparent`: in process through `agnosai_crew_with_trace_parent`, and over HTTP on `POST /api/v1/crews`, `POST /api/v1/a2a/receive` and `/mcp` `tools/call`. `agnosai_telemetry_init_export` exports without touching sakshi. The off path no longer builds spans at all. **agnostic's consumer half is deferred to its re-pin to 2.1.5**: call `agnosai_crew_with_trace_parent(spec, agnostic_trace_current())` where it submits a crew, call `agnosai_telemetry_init_export` at boot when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (and `agnosai_telemetry_shutdown` on its shutdown path), and tighten its traceparent check from length-only to the W3C shape so its logged id and agnosai's trace agree. **Left for later:** the outbound header to hoosh (*Upstream*, hoosh row) and the remaining span coverage (**B7**), which now also carries the `delegate` tool's unlinked trace (item 9) and an operator switch for an untrusted inbound `traceparent` (item 10). The cost of turning telemetry on is benched: `run_crew_10_tasks_{sequential,parallel_4}_traced` in `benches/orch.bcyr`. |
-| F7 | **Explain agent selection** — ✅ **done** (2.1.5) | Small | Return the weighted score breakdown per task: tool coverage, complexity, domain, personality (its neutral 0.5, listed as `unmeasured` — not `null`, which would stop the scores adding up to the total) and GPU. herdr's `agent explain` is the model. **Shipped as a library call, with no wire field:** `agnosai_explain_selection_a` returns each agent's total and five components in the runner's rank order, so entry 0 is the agent `_agnosai_crew_pick_best_agent` assigns (pinned by a test). `agnosai_selection_to_value_a` and `agnosai_selection_scorer_to_value_a` render the JSON, so consumers never hardcode factor names. REST, MCP and A2A are unchanged, so no ADR. **Non-goal, recorded:** the crew run keeps no breakdown, which would cost every run agents × tasks entries on the global bump. A consumer **recomputes** from the spec, which is exact while selection is a pure function of roster and task. F2, learning-driven selection or a stateful bhava personality would end that and must then record the choice on the run. **agnostic surfaces it at its re-pin to 2.1.5**, as `GET /api/v1/crews/{id}/plan?explain=selection`; that half, and its ADR on recomputing, are agnostic's. |
-| F8 | **Protocol currency** | Medium, partly upstream | (a) `/mcp` speaks the `initialize`-handshake revision (`server/routes/mcp.cyr`). MCP 2026-07-28 removed the handshake and `Mcp-Session-Id`, added the `Mcp-Method` / `Mcp-Name` headers and made **Tasks** an official extension, and deprecated Sampling, Roots and Logging. The dispatch belongs to bote, so this starts as a **bote filing**. (b) Actually send the A2A callback POST; the SSRF check is already ported. Target A2A v1.0.x. |
+| F8 | **Protocol currency** | Medium, partly upstream | (a) `/mcp` speaks the `initialize`-handshake revision (`server/routes/mcp.cyr`). MCP 2026-07-28 removed the handshake and `Mcp-Session-Id`, added the `Mcp-Method` / `Mcp-Name` headers and made **Tasks** an official extension, and deprecated Sampling, Roots and Logging. The dispatch belongs to bote, so this starts as a **bote filing**. `/mcp` hand-builds its JSON-RPC envelope as the oracle did (`mcp.rs:3-5`) instead of delegating to bote's `Dispatcher`; bote 3.3.0's `dispatcher_set_server_info` removed the obstacle, and delegating is a separate decision. `capabilities` advertises no `subscribe` or `listChanged` ([ADR 015](../adr/015-mcp-resources-project-agent-definitions.md)). (b) Target A2A v1.0.x. The A2A callback POST is already sent (since 2.0.0): one detached thread per callback, posting the serialized `A2AResponse` through the SSRF-guarded fetch with a 30 s timeout, result ignored as the oracle does (`src/server/serve.cyr:309-337`). |
 | F9 | **Hand downstream tasks compressed context** | Medium | A summarizing hand-off strategy beside Full, SlidingWindow and HeadTail (`orchestrator/memory.cyr`): a dependent task receives its upstream's `expected_output` or summary, not the full transcript. Every coordinator-worker system the review covered relies on clean-context workers that return short summaries. F2 needs it. |
 
 Not adopted, recorded so nobody re-derives it:
@@ -1647,46 +373,119 @@ Not adopted, recorded so nobody re-derives it:
 
 ## Carried over from the Rust line
 
-Test-coverage gaps the Rust tree never closed; the port should not reintroduce them:
+Test-coverage gaps the Rust tree never closed; the port should not reintroduce them.
 
 | Area | What was missing |
 |------|------------------|
-| Process sandbox | env sanitization, timeout enforcement, kill-on-drop |
-| Python sandbox | subprocess execution, timeout, env sanitization |
-| Concurrent cancel | mid-execution interruption, parallel/DAG cancel stress |
-| Telemetry init | OTLP error paths, env var override, guard lifecycle |
+| Concurrent cancel | mid-execution interruption, parallel/DAG cancel stress (owed as part of **B12**) |
+
+The Rust tree also never tested process and Python sandbox env sanitization, timeout
+enforcement and kill-on-drop, or the telemetry init paths (OTLP error paths, env var
+override, guard lifecycle). The port's suites cover them (`tests/sandbox_spawn.tcyr`,
+`sandbox_policy.tcyr`, `sandbox_process.tcyr`, `sandbox_python.tcyr`, `telemetry_mod.tcyr`,
+`telemetry_otlp.tcyr`) and must keep doing so.
 
 Demand-gated, unchanged: Python bindings (separate crate, `cdylib`, maturin build).
 
-## Performance targets
+## Settled decisions
 
-Carried from the Rust line as *goals*, not as comparisons — the Cyrius baseline
-starts fresh (see CLAUDE.md).
+Decided, and **not to be re-raised**. Each entry gives the date, the decision, the reason, and
+where the full reasoning lives. The D and F labels are kept because benches, `src/` comments and
+docs cite them.
 
-| Metric | Target |
-|--------|--------|
-| Boot to ready | <2s |
-| Memory (idle) | <100 MB |
-| Crew creation | <10ms |
-| Concurrent crews | 100+ |
-| Fleet msg overhead | <1ms |
+- **Scope: the whole Rust line was owed** (2026-08-07). The user overturned a narrowing of v2.0
+  to the default cargo build. That narrowing was written by earlier sessions and repeated across
+  four handoffs, but never decided by the user; only bhava was a user decree. **A cargo feature
+  gate is not a scope boundary.** Never add an exclusion row: if something looks impossible,
+  prove it — name the missing primitive, grep `lib/` for it, and file the upstream ask.
+  [`cyrius-port-plan.md`](cyrius-port-plan.md) (lines 12, 320).
+- **D1 — `rate_limit` is mounted by default** (2026-08-13). 100 req/s per client key, burst
+  200; `AGNOSAI_RATE_LIMIT=0` restores the oracle's exact wire. The user's reason, verbatim:
+  *"agnosai ships safe-by-default for operators who don't read docs; cause most people and even
+  agents TLDR."* [ADR 021](../adr/021-rate-limit-mounted-by-default.md).
+- **D2 — `personality` is deferred, never dropped** (recorded 2026-08-07, re-affirmed
+  2026-08-13). bhava is coming and has no Cyrius port, so `personality` stays unported and the
+  wire keeps emitting `null` until bhava lands in Cyrius. It is the one carve-out the user ever
+  set; listing it as an open question once caused it to be asked again. *What agnosai is*,
+  **B5**, [`cyrius-port-plan.md`](cyrius-port-plan.md) (:297, :380).
+- **D3 — `builtin_presets()` stays cold** (2026-08-13). No memoization; the oracle's shape
+  stands (`rust-old/src/definitions/loader.rs:122` has no cache either) and no ADR is owed. The
+  user's reason, verbatim: *"presets can be cold; as agent might get different instruction sets
+  than presets and seems a waste of speed improvements."* The route is not hot, and a
+  process-lifetime cache of parsed structs is shared mutable state this tier avoids. The cost
+  accepted: ~0.9 ms CPU and ~1 MB of arena churn per `GET /api/v1/presets`, reclaimed per
+  request since 2026-08-11. CHANGELOG [2.0.0].
+- **D4 — benchmarks run rounds × batch** (2026-08-13). Every `.bcyr` runs `_BR = 5` rounds of
+  batch/5, so min/max are real samples (one sample per row had made min == max == avg, hiding
+  ~5% run-to-run spread); total work is unchanged, and the whole CSV was re-baselined that day.
+  `tool_registry_register` stays single-batch (it would measure fill level). **Standing rule for
+  bench edits:** a row that consumes state (drains, dedups, subscribes) must index a distinct
+  slice per round (`_r * (n / _BR)`) or be exempted. Find such rows by diffing every average
+  against the pre-change run: of the six found, an assertion caught one. CHANGELOG [2.0.0].
+- **D5 — dispatch bench rows include body serialization** (2026-08-13). `benches/server.bcyr`'s
+  `route_*` rows measure the full route: `_b_render_body` / `_b_render_body_a` reproduce
+  `_agnosai_serve_send`'s branch set, matching the oracle's tower-service bench
+  (`rust-old/benches/server.rs:43-62`). Stopping at the response object hid serialization
+  regressions. CHANGELOG [2.0.0].
+- **D6 — 2.1.5 shipped as a patch despite a `### Breaking` section** (2026-10-04). The user
+  tagged 2.1.5, then 2.1.6: the F6 span-vocabulary and genai API break shipped under a patch
+  number, not 2.2.0 or 3.0.0. No known consumer was affected (agnostic, daimon and thoth were
+  checked and call none of the removed names). Open follow-up: **D7**. CHANGELOG [2.1.5].
+- **F7 — selection explanation keeps no per-run record** (2026-10-03).
+  `agnosai_explain_selection_a` is a library call with no wire field and no ADR. The crew run
+  keeps no breakdown, which would cost agents × tasks entries on the global bump every run;
+  consumers recompute from the spec. That is exact while selection is a pure function of roster
+  and task — **F2** carries the constraint for when it stops being one. CHANGELOG [2.1.5].
+- **The tool SDK and `examples/wasm-tools/` stay Rust** (2026-08-11). Not a deferral.
+  `sdk/agnosai-tool-sdk/` is a crate third-party tool authors compile to `wasm32-wasip1`;
+  rewriting it in Cyrius would break every tool author on the published protocol. agnosai owes
+  conformance only — the `{"parameters": …}` stdin and `{"result", "success", "error"}` stdout
+  contract — which `src/tools/wasm_tool.cyr` implements and `tests/tools_wasm.tcyr` pins.
+  [`adding-wasm-tools.md`](../guides/adding-wasm-tools.md).
+- **No history rewrite for `probe_key_tmp.pem`** (2026-08-10). The deleted test key stays
+  reachable in `bb76e67`. It was generated locally for a probe and never a credential; rewriting
+  `main` costs more than it saves. `.gitignore` carries `*.pem` / `*.key`. `state.md`, *Known
+  issues*, item 0.
+- **Trace context is threaded explicitly, not thread-local** (2026-10-03). agnosai passes span
+  contexts down its call path and never reads sakshi's process-global trace id: `thread_create`
+  gives each worker a zeroed TLS block, agnostic's crews run on a detached thread, and
+  `thread_local_get` faults on a main thread with no block.
+  [ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md).
+- **Per-task audit only in sequential mode is parity** (2026-08-06). The oracle's only
+  `audit_record` call site is in its `run_sequential` (`rust-old/src/orchestrator/crew_runner.rs:294`),
+  so parallel and DAG modes never audit per task, and no per-worker audit scratch is owed.
+  CHANGELOG [2.0.0].
+- **Literal hoisting scope** (2026-08-07, the former B3). Hoist a literal to a process-lifetime
+  global only when a loop body or an unconditional envelope reaches it; an arena allocation is
+  not free (~11 ns plus a 16 B header), and hoisting took `/dashboard/crews` 6,881 → 5,217 ns.
+  Error messages stay inline: built at most once, for a request that already failed. The
+  `str_from_a` sites left in `src/` (338 at the count) are deliberate, as are three in-loop sites
+  on return paths (`sandbox/oci.cyr:250-251`, `crew_runner.cyr:990`) that a naive scan keeps
+  finding. The `_a` forms keep their signature and return the global.
+  [`cyrius-port-plan.md`](cyrius-port-plan.md) (:372), CHANGELOG [2.0.0].
+- **The JWT `alg` check runs after signature verification** (2026-07-31). By design: parsing
+  attacker-controlled JSON before authenticating measured ~53x heap amplification, so a rejected
+  token paying the modexp is the accepted cost. CHANGELOG [2.0.0], *Security*.
+- **cyrius 6.6.6's by-value struct deep copy does not reach `: Str` parameters** (2026-09-26).
+  42 functions take a `: Str` and 141 sites store one into a heap object or a `vec` that
+  outlives the call; they would dangle if the copy applied. It does not: `Str`, `Result`,
+  `Option` and `Tagged` are excluded by name (`_local_is_sptr_param`, 6.6.6 bite 16b) and stay
+  pointer rebinds, and agnosai declares no struct-typed parameters. No change needed. Full
+  read-through: `git show 2.1.6:docs/development/roadmap.md`, *Moving the cyrius pin to 6.6.6*.
+- **Not adopted: free-form swarms and screen-scraping coordination** (2026-10-03). See F,
+  *Not adopted*.
 
-## Design principles
+## Out of scope
 
-1. **Wire compatibility** — REST/MCP/A2A surface matches `rust-old/`
-2. **Sandbox by default** — untrusted code never runs unsandboxed
-3. **Single binary** — no container orchestration for single-node deployments
-4. **Concurrency via `sandhi_server_run_pooled`** — follow daimon, not hoosh (see port plan, "The concurrency decision")
-5. **Library first** — agnosai is a library with a binary, not a framework
-6. **Lockstep with ai-hwaccel** — aligned versioning, shared practices, same CI rigor
+- The bhava carve-out (see *What agnosai is*).
+- Inbound chunked request bodies — sandhi answers 501, honest but not support; B8 and B16
+  track the upstream gap.
+- Any comparison of Cyrius benchmark numbers against the frozen Rust CSV.
+- `fleet/discovery` beyond the oracle's own 174-line stub. `rust-old` says it is a stub in its
+  own doc comment, and `lib/net.cyr` has no SRV resolver. Finishing it is a scope decision
+  nobody has made, not owed work.
 
-## Out of scope for v2.0
-
-Everything in the exclusion table above, plus: inbound chunked request bodies
-(sandhi 1.9.4 answers 501 — honest, but not support), and any comparison of
-Cyrius benchmark numbers against the frozen Rust CSV.
-
-### Owed to the ecosystem, not to v2.0 — an OpenTelemetry library repo
+### Owed to the ecosystem — an OpenTelemetry library repo
 
 **There is no Cyrius OTel library, and two projects have now hand-rolled the
 same subset independently.** hoosh wrote `src/lib/otlp.cyr` (199 lines);
@@ -1727,11 +526,11 @@ What it would own, in rough order of value:
 - **Context propagation.** W3C `traceparent` parse/serialise, and a current
   span. sakshi's trace id and span stack are process globals, so under
   `sandhi_server_run_pooled` two concurrent requests share one trace id.
-  ⚠ **Updated 2026-10-03 (F6, ADR 023):** agnosai now parses and formats
-  `traceparent` itself (`telemetry/otlp.cyr`'s span-context section) and
-  threads span contexts **explicitly** down its call path. The cyrius stdlib
-  has `thread_local_*` now, but a thread-local current span would not help
-  here: `thread_create` gives each worker a zeroed TLS block
+  agnosai parses and formats `traceparent` itself (`telemetry/otlp.cyr`'s
+  span-context section) and threads span contexts **explicitly** down its call
+  path ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)). The
+  cyrius stdlib has `thread_local_*`, but a thread-local current span would not
+  help here: `thread_create` gives each worker a zeroed TLS block
   (`lib/thread.cyr`), agnostic's crews run on the orchestrator's detached
   thread, and `thread_local_get` faults on a main thread with no block
   (`orchestrator/audit.cyr`, `arena_pool.cyr`). A library would still own this
@@ -1748,60 +547,3 @@ Once it exists, `src/telemetry/otlp.cyr` collapses to a thin adapter and
 ⚠ **This is a note, not a filing.** It is recorded here so the next consumer
 finds the prior art instead of writing a third encoder, and so the cost is
 visible when someone decides whether the ecosystem wants the repo.
-
-## Moving the cyrius pin to 6.6.6
-
-✅ **Done at 2.0.10 (2026-09-26).** Pin `cyrius = "6.6.6"`. Both checks below were run: all 99 suites exit 0 individually (7,970 assertions), and a durable-state write → chmod 0600 → rewrite → restart → read-back round trip on both toolchains showed the default path unchanged (file 644, directory 755) while an operator's 0600 now survives a save (6.6.2 re-widened it to 0644).
-
-agnosai has by far the widest `: Str` parameter surface in the ecosystem, so item 5 of the
-6.6.6 notes ("a by-value struct parameter over 8 B is now DEEP-COPIED where it used to alias a
-pointer") looks alarming here — it is not, and the reason is worth writing down so nobody
-re-raises it.
-
-There are **42 functions taking a `: Str` parameter** across `src/core/`, `src/fleet/`,
-`src/sandbox/`, `src/server/`, `src/tools/`, `src/telemetry/`, `src/definitions/`,
-`src/learning/`, `src/orchestrator/` and `src/llm/`, and **141 distinct sites** where such a
-parameter's value is stored into a heap object or pushed into a `vec` that outlives the call —
-`store64(e + AGN_EDGE_FROM, from)` in `agnosai_edge_new` (`src/core/task.cyr:684`),
-`store64(a + AGN_AGENT_ROLE, role)` in `agnosai_agent_new_a` (`src/core/agent.cyr:83`), and so
-on through the constructors. If a `: Str` param became a frame-local deep copy, every one of
-those stored pointers would dangle after return. **It does not.** The 6.6.6 change
-(`_local_is_sptr_param`, bite 16b) deliberately excludes exactly this case: `Str`, `Result`,
-`Option` and `Tagged` are 16-byte structs *by name* whose slot holds a HEAP HANDLE; they stay
-value-passed and `a = b` between two of them stays the pointer rebind the stdlib is built on.
-The deep-copy change applies only to user-declared structs passed by value, and agnosai
-declares no struct-typed parameters at all. No change, no risk.
-
-Everything else checked, with results:
-
-- **Windows `O_APPEND`/`O_TRUNC` corruption (item 1): does not reach agnosai.** No PE target
-  (`CYRIUS_TARGET_AGNOS` / `CYRIUS_TARGET_LINUX` only, `cross_bins = ["agnosai-aarch64"]`, CI
-  is `ubuntu-latest` only). The `O_APPEND` mentions in
-  `src/orchestrator/durable_state.cyr:37-38` are prose describing the Rust oracle's
-  `jsonl_open`, not code — agnosai's own writes are `file_write_all`
-  (`src/sandbox/wasm.cyr:210`, `src/definitions/packaging.cyr:365`) and `file_write_atomic`
-  (`src/orchestrator/durable_state.cyr:419`), and its reads open mode 0
-  (`src/definitions/loader.cyr:185`, `src/orchestrator/durable_state.cyr:301`).
-- **`file_write_atomic` behaviour did change (item 9)** and durable_state.cyr:419 is the one
-  caller: it now **keeps an existing file's mode** instead of applying `0644 & ~umask`. For a
-  state snapshot that is the better semantics, but if anything ever created those files 0600
-  deliberately, that mode now survives a rewrite where it used to be widened. Worth one look
-  at how the state directory is first created.
-- **New compile errors (item 3): no sites.** No `async fn` in code — the four `async fn`
-  matches are all prose in comments describing the Rust original
-  (`src/fleet/discovery.cyr:8`, `src/server/prometheus.cyr:40`, `src/server/routes/mod.cyr:10`).
-  No `operator` fn (the 54 "operator" hits are all about a human operator), no `ret2`/`rethi`,
-  no SIMD, no struct-valued call at top level, and no `var p: S = f(..)` receive form anywhere
-  — which is the only context in which the new `: cstring` and arity gates on struct receives
-  can fire. Scanned all 3 `: cstring` parameters for a non-zero integer literal at the call
-  site: none (a literal `0` is still allowed, by design).
-- **Item 4 (top-level block scoping):** zero bare `{` blocks at column 0. Nothing to do.
-- **Item 6 (redeclared globals):** no duplicate global declarations.
-- **Items 8 and 9:** no `regression_*` call sites of its own (the two `include` hits are
-  `lib/regression.cyr` pulling `lib/regression_agnos.cyr`), and no own `vec_*` function
-  colliding with the 14 names `lib/vec.cyr` exports, so the new transitive
-  `lib/assert.cyr` → `lib/vec.cyr` include is harmless.
-
-After bumping, verify: the full `.tcyr` suite exits 0 per file (not just the grep summary),
-and one durable-state round trip — write a snapshot, restart, read it back — to confirm the
-`file_write_atomic` mode change did not alter who can read the state directory.
