@@ -582,3 +582,23 @@ is this repo's to adopt when it pins ≥ 6.6.17. Nothing here gates a cyrius rel
   pin move went unchecked. That lock carries the previous pin's rows for files `deps` does not vendor, and
   from 6.6.17 `lib sync` refuses them by name. After a pin move run `cyrius lib sync --full` before committing
   the lock, or `cyrius lib sync --full --relock` if `deps` / `build` already ran under the new pin.
+
+## Recorded by cyrius 6.6.19 (2026-10-06) — for the next cyrius pin move
+
+⛔ **Needs cyrius >= 6.6.19 — do not bump the pin until 6.6.19 is tagged and out.** Docs-only note from the cyrius
+6.6.19 lanes; each item is this repo's to adopt when it pins ≥ 6.6.19. Nothing here gates a cyrius release.
+
+- **`scripts/gen-presets.sh` and the checked-in `src/definitions/presets_data.cyr` can retire for `[embed]`**
+  (cyrius P2 — your 2026-08-10 proposal, shipped in 6.6.19).
+  `[embed] NAME = "path"` in cyrius.cyml gives every compile `NAME()` (the file's bytes, NUL-terminated) and
+  `NAME_len()`, read from the file at build time — no generated `.cyr`, nothing to drift. Explicit entries only
+  (the `{dir, glob}` set form is refused by name). All embeds share cycc's 2 MiB string pool with the program's
+  own literals, and every binary of the project (test binaries too) carries every declared embed. Reference: the
+  cyrius guide's *Embedding data files: [embed]*, CHANGELOG [6.6.19] *Embed — P2*.
+  - One entry per preset, in the order you list them: `AGNOSAI_PRESET_QUALITY_LEAN =
+    "src/presets/quality-lean.json"`, … ×18.
+  - `var AGNOSAI_PRESET_X` becomes the call `AGNOSAI_PRESET_X()` (a fn, not a var: a top-level string var is a
+    deferred runtime store); the length is `AGNOSAI_PRESET_X_len()`.
+  - Stays yours: the JSON COMPACTION the script does. `[embed]` embeds the bytes verbatim, so the presets keep
+    their whitespace (~810 lines). Keep a compaction step (or commit compact JSON) if binary size matters — a
+    data-file step, no longer a source generator.
