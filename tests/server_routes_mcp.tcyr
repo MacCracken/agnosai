@@ -233,6 +233,31 @@ fn _t_tools_call(): i64 {
     return 0;
 }
 
+# --- 2.1.7 (roadmap B15): a tool that answers no output --------------------
+
+# A tool whose execute answers 0 — which the vtable contract allows.
+fn _t_silent_schema(a, ctx): i64 {
+    return agnosai_tool_schema_new_a(a, str_from_a(a, "silent"), str_from_a(a, "says nothing"));
+}
+fn _t_silent_execute(ctx, input): i64 { return 0; }
+
+fn _t_tools_call_no_output(): i64 {
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_tool_new(str_from("silent"), str_from("says nothing"),
+        &_t_silent_schema, &_t_silent_execute, 0));
+    var st = agnosai_app_state_new(agnosai_orchestrator_new(0), reg,
+      agnosai_auth_config_new(), agnosai_event_bus_new(),
+      agnosai_audit_chain_new(), agnosai_approval_gate_new());
+    var b = agnosai_route_body(agnosai_route_mcp(st,
+        _t_rpc("tools/call", ",\"params\":{\"name\":\"silent\"}")));
+    var r = _t_obj(b, "result");
+    assert(r != 0, "a tool that answers no output is still a JSON-RPC success — the worker did not die");
+    assert(bayan_json_v_bool(_t_obj(r, "isError")) == 1, "...reported as a tool-level failure");
+    var item = bayan_json_v_arr_get(_t_obj(r, "content"), 0);
+    assert(str_eq(_t_str(item, "text"), str_from("Unknown error")) == 1, "...with the oracle's fallback text");
+    return 0;
+}
+
 # --- ADR 023: a tools/call joins the request's trace ----------------------
 
 # `agnosai_route_mcp_tp_a` hands `tools/call` the request's `traceparent`, and
@@ -627,6 +652,7 @@ fn main(): i64 {
     _t_tools_list();
     _t_tools_list_empty();
     _t_tools_call();
+    _t_tools_call_no_output();
     _t_tools_call_unknown_tool();
     _t_tools_call_missing_name();
     _t_tools_call_argument_handling();

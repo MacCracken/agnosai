@@ -278,6 +278,15 @@ fn _agnosai_mcp_tools_call(a, id, params, state, tp: Str): i64 {
         parent = agnosai_otlp_span_context_parse_a(a, tp);
     }
     var out = agnosai_tool_execute_in(tool, input, parent);
+    # ⚠ **A tool may answer no output at all** — the vtable contract allows 0, and
+    # `agnosai_tool_execute_in` null-checks for it and records `error.type` `no_output`. Until
+    # 2.1.7 this handler read it three times without checking and segfaulted the worker
+    # (roadmap B15). No builtin answers 0, so it was latent; a registered tool could. It is
+    # a tool-level failure, `isError: true` with the oracle's fallback text.
+    if (out == 0) {
+        _agnosai_mcp_log_call(name, 0);
+        return _agnosai_mcp_success(a, id, _agnosai_mcp_content(a, str_from_a(a, "Unknown error"), 1));
+    }
     _agnosai_mcp_log_call(name, agnosai_tool_output_success(out));
 
     if (agnosai_tool_output_success(out) == 1) {

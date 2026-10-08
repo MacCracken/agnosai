@@ -141,8 +141,9 @@ var _AGNOSAI_GENAI_OP_INVOKE_AGENT_S = str_from(AGNOSAI_GENAI_OP_INVOKE_AGENT);
 var _AGNOSAI_GENAI_OP_INVOKE_WORKFLOW_S = str_from(AGNOSAI_GENAI_OP_INVOKE_WORKFLOW);
 var _AGNOSAI_GENAI_OP_EXECUTE_TOOL_S = str_from(AGNOSAI_GENAI_OP_EXECUTE_TOOL);
 
-# GenAiSpan heap layout — 120 bytes (15 slots x 8). Str fields are 0 when the
-# span does not carry that attribute; integer fields are -1.
+# GenAiSpan heap layout — 152 bytes (19 slots x 8). Str fields are 0 when the
+# span does not carry that attribute; integer fields are -1. The last four are an HTTP
+# server span's (2.1.7, ADR 024), and 0 / -1 on every GenAI one.
 #
 # ⚠ The prose said "112 bytes" until 2026-08-11 while `AGN_GAS_SIZE` was 104.
 # `alloc(AGN_GAS_SIZE)` always used the enum. Read the enum, not this line.
@@ -167,13 +168,37 @@ enum AgnosaiGenAiSpanOff {
     AGN_GAS_AGENT_KEY = 104;
     # 0 until `agnosai_genai_span_set_error_type`.
     AGN_GAS_ERROR_TYPE = 112;
-    AGN_GAS_SIZE = 120;
+    # An HTTP server span's request: the route as a pattern, the path as sent, and the
+    # status answered (2.1.7, ADR 024). The method is the operation slot's Str.
+    AGN_GAS_HTTP_ROUTE = 120;
+    AGN_GAS_URL_PATH = 128;
+    AGN_GAS_HTTP_STATUS = 136;
+    AGN_GAS_URL_SCHEME = 144;
+    AGN_GAS_SIZE = 152;
 }
+
+# The operation an HTTP server span carries in place of a GenAI one (2.1.7, ADR 024). Not a
+# `gen_ai.operation.name` value: the encoder writes an HTTP span through its own branch.
+var AGNOSAI_SPAN_OP_HTTP_SERVER = "http.server";
+
+# The HTTP semantic-convention attribute keys an HTTP server span carries.
+var AGNOSAI_HTTP_REQUEST_METHOD = "http.request.method";
+var AGNOSAI_HTTP_ROUTE = "http.route";
+var AGNOSAI_HTTP_RESPONSE_STATUS = "http.response.status_code";
+var AGNOSAI_URL_PATH = "url.path";
+var AGNOSAI_URL_SCHEME = "url.scheme";
 
 # An empty span record for operation `op` (a cstring) and its `Str`. Every
 # attribute but the operation starts unset.
 fn _agnosai_genai_span_new(op, op_s: Str): i64 {
-    var s = alloc(AGN_GAS_SIZE);
+    return _agnosai_genai_span_new_a(default_alloc(), op, op_s);
+}
+
+# `_agnosai_genai_span_new` in `a` (2.1.7). The export path encodes a span when it is
+# recorded and keeps nothing of it, so a span may live in a request's arena.
+fn _agnosai_genai_span_new_a(a, op, op_s: Str): i64 {
+    var s = alloc_via(a, AGN_GAS_SIZE);
+    if (s == 0) { return 0; }
     store64(s + AGN_GAS_NAME, op);
     store64(s + AGN_GAS_OPERATION, op_s);
     store64(s + AGN_GAS_PROVIDER, 0);
@@ -189,7 +214,65 @@ fn _agnosai_genai_span_new(op, op_s: Str): i64 {
     store64(s + AGN_GAS_OUTPUT_TOKENS, 0 - 1);
     store64(s + AGN_GAS_AGENT_KEY, 0);
     store64(s + AGN_GAS_ERROR_TYPE, 0);
+    store64(s + AGN_GAS_HTTP_ROUTE, 0);
+    store64(s + AGN_GAS_URL_PATH, 0);
+    store64(s + AGN_GAS_HTTP_STATUS, 0 - 1);
+    store64(s + AGN_GAS_URL_SCHEME, 0);
     return s;
+}
+
+# An HTTP server span, in `a`: one request this process answered — SERVER, named
+# `<method> <route>` (`GET /api/v1/crews/{id}`) as the HTTP semantic conventions name one
+# (2.1.7, ADR 024). `route` is the matched route's PATTERN, low-cardinality; `path` is the
+# path as the request sent it, and `scheme` `http` or `https`. `status` is the status
+# answered. Built for an EMBEDDING consumer: agnosai's own server does not record one yet
+# (roadmap B7), but a product tier that mints a crew's parent span id records it here, so
+# the crew's `invoke_workflow` span has a parent the backend can find.
+#
+# Answers 0 when `a` is exhausted or `method` is 0; `agnosai_telemetry_record_span_in` takes
+# 0 and records nothing.
+fn agnosai_http_server_span_a(a, method: Str, route: Str, path: Str, scheme: Str, status): i64 {
+    if (method == 0) { return 0; }
+    var s = _agnosai_genai_span_new_a(a, AGNOSAI_SPAN_OP_HTTP_SERVER, method);
+    if (s == 0) { return 0; }
+    store64(s + AGN_GAS_HTTP_ROUTE, route);
+    store64(s + AGN_GAS_URL_PATH, path);
+    store64(s + AGN_GAS_HTTP_STATUS, status);
+    store64(s + AGN_GAS_URL_SCHEME, scheme);
+    return s;
+}
+
+# 1 when `span` is an HTTP server span (`agnosai_http_server_span_a`), 0 for a GenAI one.
+fn agnosai_span_is_http_server(span): i64 {
+    if (span == 0) { return 0; }
+    return streq(load64(span + AGN_GAS_NAME), AGNOSAI_SPAN_OP_HTTP_SERVER);
+}
+
+# An HTTP server span's request method, route, path and scheme (Strs, or 0), and status
+# (-1 when unset). 0 / -1 on a GenAI span, and on no span at all.
+fn agnosai_http_span_method(span): i64 {
+    if (agnosai_span_is_http_server(span) == 0) { return 0; }
+    return load64(span + AGN_GAS_OPERATION);
+}
+# The matched route's pattern.
+fn agnosai_http_span_route(span): i64 {
+    if (span == 0) { return 0; }
+    return load64(span + AGN_GAS_HTTP_ROUTE);
+}
+# The path as the request sent it.
+fn agnosai_http_span_path(span): i64 {
+    if (span == 0) { return 0; }
+    return load64(span + AGN_GAS_URL_PATH);
+}
+# The URL scheme, `http` or `https`.
+fn agnosai_http_span_scheme(span): i64 {
+    if (span == 0) { return 0; }
+    return load64(span + AGN_GAS_URL_SCHEME);
+}
+# The status answered, or -1.
+fn agnosai_http_span_status(span): i64 {
+    if (span == 0) { return -1; }
+    return load64(span + AGN_GAS_HTTP_STATUS);
 }
 
 # --- the four span constructors ------------------------------------------

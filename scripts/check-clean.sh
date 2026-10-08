@@ -195,8 +195,30 @@ else
     fail=1
 fi
 
+# --- log literals: the declared length is the literal's (2.1.7, roadmap B28) ---
+# sakshi takes (pointer, length); a miscount truncates the message or hands sakshi its NUL,
+# and neither fails a build or a suite. 17 had shipped before this gate.
+if out=$(python3 scripts/check-log-lengths.py 2>&1); then
+    echo "$out"
+else
+    note "log lengths: a declared length does not match its literal"
+    printf '%s\n' "$out" | grep -E '^    ' | sed 's/^/  /'
+    fail=1
+fi
+
+# --- dist/ is what src/ builds (2.1.7, roadmap B24) ------------------------------
+# Consumers link `dist/agnosai.cyr`, not `src/`. A `src/` change committed without
+# `cyrius distlib --all` would ship a stale bundle to every consumer while CI stayed green;
+# until 2.1.7 only a hand run at each cut caught it.
+if cyrius distlib --all --check >/dev/null 2>&1; then
+    echo "distlib: dist/ matches src/"
+else
+    note "distlib: dist/ is stale — run cyrius distlib --all"
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "cleanliness check FAILED"
     exit 1
 fi
-echo "cleanliness check OK — fmt, lint, doc, vet, deny, deps --verify, lib snapshot, generated sources all clean"
+echo "cleanliness check OK — fmt, lint, doc, vet, deny, deps --verify, lib snapshot, generated sources, log lengths, dist all clean"

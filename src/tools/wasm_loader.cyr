@@ -28,6 +28,9 @@
 # That asymmetry is the oracle's and it is reproduced; it is also exactly the
 # shape that hides a deployment mistake, which is why it is stated here.
 # =========================================================================
+# The shared whole-file reader (2.1.7, roadmap B19); include-once, so this costs nothing
+# where `src/main.cyr` already has it.
+include "src/read_file.cyr"
 
 # The on-disk manifest's default version, when the field is absent.
 #
@@ -139,7 +142,7 @@ fn _agnosai_wasm_pkg_path(dir: Str, leaf: Str): Str {
 # walk below.
 fn agnosai_wasm_load_tool_package(dir: Str, out_err): i64 {
     var manifest_path = _agnosai_wasm_pkg_path(dir, str_from("manifest.json"));
-    var src = _agnosai_loader_read(manifest_path, out_err);
+    var src = _agnosai_read_file(manifest_path, out_err);
     if (src == 0) {
         # ⚠ `InvalidDefinition`, not the `Io` the reader produced. The oracle
         # maps the read failure with `.map_err(|e| InvalidDefinition(...))`
@@ -160,7 +163,7 @@ fn agnosai_wasm_load_tool_package(dir: Str, out_err): i64 {
     # ⚠ The MANIFEST's name, not the directory's.
     var wasm_path = _agnosai_wasm_pkg_path(dir, str_cat(
         load64(pkg + AGN_WPKG_NAME), str_from(".wasm")));
-    var bytes = _agnosai_loader_read(wasm_path, out_err);
+    var bytes = _agnosai_read_file(wasm_path, out_err);
     if (bytes == 0) {
         store64(out_err, agnosai_error_invalid_definition(str_cat(
               str_from("failed to read "), wasm_path)));

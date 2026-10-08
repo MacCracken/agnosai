@@ -27,9 +27,10 @@
 # false.** The reason has changed, though, and the old one is worth not
 # repeating: this header used to say bayan "exposes **no** `_a` variants" for
 # parse and build. **bayan 1.4.0 shipped them** (folded in cyrius 6.5.5), so the
-# capability exists. What remains is consuming it — each module's
-# `bayan_json_v_*` calls have to be moved onto their `_a` forms one bite at a
-# time, which is roadmap **B2**, and only `core` is done.
+# capability exists. Consuming it meant moving each module's `bayan_json_v_*`
+# calls onto their `_a` forms one bite at a time — roadmap B2, closed at 2.0.0
+# (CHANGELOG [2.0.0]); its traps are in `docs/development/state.md`. A bare call
+# left in a handler still builds on the no-free global bump.
 #
 # So the honest statement is: **the transport is flat; a handler is flat once
 # its module has been threaded.** `tests/server_serve.tcyr` measures the two
@@ -584,6 +585,8 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
 fn _agnosai_serve_send(a, cfd, resp, head_only): i64 {
     var status = agnosai_route_status(resp);
     var body = agnosai_route_body(resp);
+    # Extra header lines, CRLF-terminated, or 0 — a 405's `Allow` (2.1.7, roadmap B8).
+    var extra = agnosai_route_headers(resp);
 
     # 204 carries no body and no content type.
     if (status == HTTP_NO_CONTENT) {
@@ -620,17 +623,19 @@ fn _agnosai_serve_send(a, cfd, resp, head_only): i64 {
         str_builder_add_cstr_a(al, hb, ctype);
         str_builder_add_cstr_a(al, hb, "\r\nContent-Length: ");
         str_builder_add_int_a(al, hb, str_len(text));
-        str_builder_add_cstr_a(al, hb, "\r\nConnection: close\r\n\r\n");
+        str_builder_add_cstr_a(al, hb, "\r\n");
+        if (extra != 0) { str_builder_add_cstr_a(al, hb, extra); }
+        str_builder_add_cstr_a(al, hb, "Connection: close\r\n\r\n");
         var head = str_builder_build_a(al, hb);
         sock_send(cfd, str_data(head), str_len(head));
         return 0;
     }
     if (a != 0) {
         return sandhi_server_send_response_a(a, cfd, status,
-          _agnosai_serve_reason(status), ctype, str_data(text), str_len(text), 0);
+          _agnosai_serve_reason(status), ctype, str_data(text), str_len(text), extra);
     }
     return sandhi_server_send_response(cfd, status, _agnosai_serve_reason(status),
-      ctype, str_data(text), str_len(text), 0);
+      ctype, str_data(text), str_len(text), extra);
 }
 
 # Whether this request is one of the three unauthenticated probes, which the

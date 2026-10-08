@@ -227,3 +227,6 @@ cyrius 6.5.18; the platform constraint is carried forward from the original pass
 **Revisit at cx arc B** (float) **and arc C** (cross-OS, caps). Until arc C, cx tool
 execution is a Linux-x86-only feature and the other platforms must degrade explicitly rather
 than silently.
+
+*Note, 2026-10-07 (2.1.7):* the roadmap no longer records the kavach process-backend gap as
+resolved — completed items leave it — so that record is in CHANGELOG [2.0.0].

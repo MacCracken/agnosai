@@ -7,6 +7,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.7] — 2026-10-08
+
+Owed work from the roadmap, with no toolchain or dependency change (cyrius 6.6.14, the same six
+`[deps.*]` tags), and one addition an embedding consumer needs: an HTTP server span agnostic can
+record through agnosai's exporter (ADR 024).
+
+⚠ **Wire-visible**, both additive: a 405 carries `Allow`; a `/mcp` `tools/call` of a tool that
+answers no output is a tool-level failure where it killed the worker.
+
+### Added
+
+- **An HTTP server span** (ADR 024): `agnosai_http_server_span_a(a, method, route, path, scheme,
+  status)`, recorded with `agnosai_telemetry_record_span_in` like any other. SERVER, named
+  `<method> <route>`, with `http.request.method`, `http.route`, `http.response.status_code`,
+  `url.path` and `url.scheme` and no `gen_ai.*` attribute, built in the caller's allocator so a
+  per-request span costs the global heap nothing (`_agnosai_genai_span_new_a`). For agnostic, whose
+  crews' `invoke_workflow` spans name a parent span it mints and nothing exported; agnosai's own
+  server does not record one yet (B7). The span record grows from 120 to 152 bytes. Its fields
+  read back through `agnosai_http_span_{method,route,path,scheme,status}`, which answer 0 (the
+  status -1) for a GenAI span or none. `_t_http_server_span` (`tests/telemetry_otlp.tcyr`, +24;
+  without the accessors' null check the suite dies with SIGSEGV).
+
+### Fixed
+
+- **`/mcp` `tools/call` segfaulted on a tool that answers no output** (roadmap B15). The vtable
+  allows a tool to answer 0, and `agnosai_tool_execute_in` null-checks for it, but the handler read
+  the output three times unchecked. It is now `isError: true` with the oracle's "Unknown error". No
+  builtin answers 0, so it was latent. `_t_tools_call_no_output` (`tests/server_routes_mcp.tcyr`);
+  without the guard the suite dies with SIGSEGV.
+- **A 405 names the methods its path takes** (`Allow`, RFC 9110 §15.5.6; roadmap B8). The router's
+  `seen` flag is a method mask now (`AGN_ALLOW_*`, `agnosai_route_match_allow`), the route
+  response has a headers slot (`agnosai_route_with_headers`), and the send path forwards it — the
+  HEAD path too. `agnosai_route_allow_header_a` writes the line, for a consumer with its own send
+  path. Every path's `Allow` is pinned in `tests/server_router.tcyr`
+  (`_t_method_mismatch_says_allow`, +27, the mask and the line directly too) and on the wire in
+  `tests/server_serve.tcyr` (+4); without the forwarding the wire assertions fail by name.
+- **The OTLP exporter thread could outlive `main`, and a failing suite then exited 0** (roadmap
+  B15). The thread was detached and `stop` only set a flag, so a `.tcyr` epilogue ended the main
+  thread while the exporter ran on and the trampoline exited 0: `telemetry_wiring`,
+  `telemetry_otlp` and `telemetry_mod` each passed CI's per-suite exit-code check with an assertion
+  failing. The thread is joinable now; `agnosai_otlp_exporter_stop` joins it (outside the lock),
+  then makes the final flush, and starting twice starts one thread. The suite counts the process's
+  threads around start and stop (+4), and with a failing assertion added, all three suites exit 1.
+- **17 log literals whose declared length was not the literal's** (roadmap B28): 16 cut short —
+  mostly a multi-byte `—` counted as one byte, up to five bytes short — and the shutdown line
+  declared its NUL, so it ended `gracefully\u0000` in the JSON log. All corrected; the roadmap's
+  "18" counted one of them twice.
+- **`tests/smcyr/llm_live.smcyr` compiles again** (roadmap B29): it lacked
+  `src/arena_pool.cyr` and `src/telemetry/mod.cyr`, which the chat path has needed since 2.1.6 and
+  ADR 017. `cyrius tests` does not run smoke checks, so nothing noticed.
+
+### Changed
+
+- **One whole-file reader, `src/read_file.cyr`** (roadmap B19). `definitions/loader`'s private
+  `_agnosai_loader_read` was reached into by `sandbox/wasm`, `tools/wasm_loader` and
+  `definitions/packaging`, so a suite that included the sandbox or the tools without the loader
+  compiled with a dangling call — 20 to 23 `undefined function` warnings a full run, hiding any new
+  one. It is `_agnosai_read_file` now, in a port-local root module each caller includes itself
+  (include-once). `durable_state`'s reader stays its own: its callers want the errno back.
+  `telemetry_wiring` builds with no `undefined function` line.
+- **The local `_agnosai_signal_default` is gone** (roadmap C2): the stdlib has had
+  `signal_default` since cyrius 6.5.7, filed from here. The child still gets the default `SIGPIPE`;
+  `tests/sandbox_spawn.tcyr`'s check that it does not inherit the ignored one holds.
+- **`scripts/check-clean.sh` runs two more gates**: `scripts/check-log-lengths.py` (adopted from
+  agnostic; B28), and `cyrius distlib --all --check`, so `dist/` cannot ship stale against `src/`
+  (B24; it was run by hand at each cut).
+- **Pointers that no longer said what they cited** (roadmap B22): four comments citing `CHANGELOG
+  [Unreleased]` for 2.0.0's work, roadmap line numbers and gone sections, three comments calling B2
+  open, two suites' "table", the presets guide (it said `GET /api/v1/presets` returned `[]` and was
+  on the roadmap; it serves the 18 built-in presets), and dated notes on ADRs 006 and 017.
+- **The API reference's endpoint table matches the router** (`docs/guides/api-reference.md`). It
+  listed a `GET /api/v1/tools/{name}` ("one tool's schema") that the router has never served — the
+  route is `DELETE`, as in the oracle — and left out `GET /api/v1/approvals`, so it counted 18 of 19
+  routes. It now also says a 405 carries `Allow`, and how an embedding program records an HTTP
+  server span.
+
+### Performance
+
+No change claimed. `bench-history.csv` gains 223 rows at 2.1.7, from one unpinned
+`bench-history.sh` sweep at a 1-minute load of 1–2. Against 2.1.6's rows: median **+1.1%**, 209 of
+223 within ±5%. Six rows moved more than 10%, so each was re-run in five interleaved rounds against
+a 2.1.6 build of the same harness:
+
+- `pubsub_subscribe_at_cap` (+27.7% in the sweep), `scheduler_load_dag_linear_500` (+13.9%),
+  `ipc_frame_1mib_transport` (−13.9%) and `tool_registry_has_50_hit` (−29.3%) read +0.0%, −0.4%,
+  −0.2% and +0.9% interleaved: the sweep's noise.
+- `default_model_premium` reads 48 → 37 ns interleaved too, but nothing on its path
+  (`src/llm/`) changed: code placement, not a win.
+- `crew_runner_10_tasks_parallel_4_quiet` reads +7.5% interleaved: roadmap B27, the row that
+  measures where the preceding benches leave the global heap.
+
+### Verified
+
+- **The gate**, in CI's order: `cyrius lib sync --full` → `deps` (`lib/` and `cyrius.lock`
+  unchanged, 118 files) → `check-symbols.sh` (2,785 definitions, both targets) → `check-clean.sh` →
+  build (native 5,253,128 B; aarch64 6,489,640 B) → **99 suites, 8,679 assertions, 0 failed**
+  (2.1.6's tree in the same shell: 8,617; the +62 are this release's tests) → coverage 99%
+  (1,635/1,647 fns; the 12 unreferenced are 2.1.5's) → `distlib --all --check` → examples → fuzz 4/4
+  → `cyrius bench` (11 files, 223 benchmarks). The full test log has no `undefined function` line.
+- **Certified the CI way:** in a replica of the tree with no sibling checkouts and an empty dep
+  cache, `lib sync --full` + `deps` reproduced `lib/` and `cyrius.lock` byte for byte (118 files,
+  8 commit pins); symbols, cleanliness, the build (byte-identical to the working tree's),
+  `distlib --check` and the example passed there with nothing left dirty.
+- **The binary:** `GET /ready` answers `"version":"2.1.7"`, a `DELETE /health` is a 405 with
+  `Allow: GET`, and SIGTERM shuts it down gracefully, logging `server shut down gracefully` with no
+  trailing NUL. The aarch64 binary does the same natively on a Raspberry Pi 4.
+- **agnostic, its consumer:** all 32 of agnostic 0.1.15's suites pass against this tree, resolved
+  through a replica-only `path` (2,701 assertions, each suite's count the same as against 2.1.6).
+  ADR 024's span was checked against agnostic's plan for it before the cut: parsing its
+  traceparent in the request's arena gives the span its id, and recording costs the global heap
+  nothing.
+- **Roadmap B26, x86_64 and aarch64 binary growth, is explained:** the aarch64 file grows in 64 KiB
+  steps. Its data segment starts on a 64 KiB boundary (`Align 0x10000`; x86_64's on 4 KiB), so the
+  file grows by a whole step when the text crosses one and otherwise only by the data's growth. The
+  text itself tracks x86_64's. Rebuilt from the tags, every size reproduces its recorded figure to
+  the byte:
+
+  | | x86_64 text | aarch64 text | data (both) | aarch64 file |
+  |---|---|---|---|---|
+  | 2.1.4 → 2.1.5 | +16,968 | +19,248 | +592 | +592 (no step) |
+  | 2.1.5 → 2.1.6 | +6,184 | +7,392 | +328 | +65,864 (one step + 328) |
+  | 2.1.6 → 2.1.7 | +5,152 | +5,096 | +208 | +208 (no step) |
+
+  `CYRIUS_DCE=1` does not change the aarch64 size (it NOP-fills there), so 2.1.6's "(DCE)" label
+  and 2.1.5's "cross-build" name the same build. 55,624 B of text remain before the next step.
+
 ## [2.1.6] — 2026-10-04
 
 Five fixes found by agnostic 0.1.14's adversarial review of its re-pin to 2.1.5, released so that

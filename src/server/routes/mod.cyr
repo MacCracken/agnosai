@@ -23,10 +23,10 @@
 #
 # The per-worker arena landed with the transport (`src/server/serve.cyr`), and
 # bayan's `_a` parse/build forms shipped in 1.4.0. Neither is missing any more.
-# What is missing is the consumption: these handlers still call the bare
-# `bayan_json_v_*` forms, which build on the no-free global bump, so every one
-# that parses a request body grows the heap per request. Moving them onto `_a`
-# is roadmap **B2**, one module per bite; `core` is done and this tier is not.
+# Consuming them was roadmap B2, closed at 2.0.0 (CHANGELOG [2.0.0]; its traps
+# are in `docs/development/state.md`). A handler that still calls a bare
+# `bayan_json_v_*` form builds on the no-free global bump, so one that parses a
+# request body that way grows the heap per request.
 #
 # `server_auth` has the same exposure and closed the *unauthenticated* half by
 # verifying before parsing. Each route suite should assert an `alloc_used()`
@@ -57,7 +57,7 @@
 # **Do not take this from `rust-old/Cargo.toml`**, which is 1.1.0 and frozen. The
 # oracle's `env!("CARGO_PKG_VERSION")` means "this package's version", and for the
 # port that is the root VERSION file.
-var AGNOSAI_VERSION = "2.1.6";
+var AGNOSAI_VERSION = "2.1.7";
 
 # --- Status codes sandhi does not define -----------------------------------
 #
@@ -144,7 +144,8 @@ enum AgnosaiRouteRespOff {
     AGN_RR_STATUS = 0;
     AGN_RR_BODY = 8;
     AGN_RR_IS_TEXT = 16;
-    AGN_ROUTE_RESP_SIZE = 24;
+    AGN_RR_HEADERS = 24;   # extra header lines, CRLF-terminated, or 0 (2.1.7)
+    AGN_ROUTE_RESP_SIZE = 32;
 }
 
 # A handler's answer: an HTTP status plus a JSON body.
@@ -156,6 +157,7 @@ fn agnosai_route_json_a(a, status, body): i64 {
     store64(r + AGN_RR_STATUS, status);
     store64(r + AGN_RR_BODY, body);
     store64(r + AGN_RR_IS_TEXT, 0);
+    store64(r + AGN_RR_HEADERS, 0);
     return r;
 }
 
@@ -176,6 +178,7 @@ fn agnosai_route_text(status, body: Str): i64 {
     store64(r + AGN_RR_STATUS, status);
     store64(r + AGN_RR_BODY, body);
     store64(r + AGN_RR_IS_TEXT, 1);
+    store64(r + AGN_RR_HEADERS, 0);
     return r;
 }
 
@@ -192,6 +195,20 @@ fn agnosai_route_body(r): i64 {
 # Whether the body is preformatted text rather than a JSON value.
 fn agnosai_route_is_text(r): i64 {
     return load64(r + AGN_RR_IS_TEXT);
+}
+
+# The extra header lines this response carries — each ending CRLF, one C string — or 0.
+fn agnosai_route_headers(r): i64 {
+    if (r == 0) { return 0; }
+    return load64(r + AGN_RR_HEADERS);
+}
+
+# Give response `r` extra header lines (2.1.7: a 405's `Allow`). The string must outlive the
+# response; one built in the request's arena does. Answers `r`.
+fn agnosai_route_with_headers(r, headers): i64 {
+    if (r == 0) { return 0; }
+    store64(r + AGN_RR_HEADERS, headers);
+    return r;
 }
 
 # The oracle's error shape, which every failing handler returns:

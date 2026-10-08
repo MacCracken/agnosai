@@ -1,0 +1,148 @@
+# =========================================================================
+# read_file — the one whole-file reader the modules share (2.1.7, roadmap B19).
+#
+# Port-local, so it sits at `src/` root. Until 2.1.7 it was `definitions/loader`'s private
+# `_agnosai_loader_read`, and `sandbox/wasm`, `tools/wasm_loader` and `definitions/packaging`
+# reached across into it. A suite that included the sandbox or the tools without the loader
+# then compiled with a dangling call — `warning: undefined function '_agnosai_loader_read'`,
+# 20 to 23 of them in a full `cyrius tests` log — which no suite reached, but which hid any
+# NEW `undefined function` line, the way real breakage has been caught before.
+#
+# Every module that calls it includes this file itself. cyrius includes are include-once,
+# so `src/main.cyr` gets one copy whatever the order. It needs `core/error.cyr`
+# (`agnosai_error_io`), which every caller already includes before it.
+# =========================================================================
+
+# Store `err` through `out_err`, when the caller passed one.
+fn _agnosai_read_file_err(out_err, err): i64 {
+    if (out_err != 0) { store64(out_err, err); }
+    return 0;
+}
+
+# `{op} {path}: os error {n}` — the detail for an `Io` error.
+#
+# ⚠ Deliberately coarser than `orchestrator/durable_state`'s `_agnosai_io_detail`,
+# which renders `ENOENT` as "No such file or directory" from a table: this is the
+# loader's wording, which its suites pin.
+fn _agnosai_read_file_detail(op, path: Str, errn): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, op);
+    str_builder_add_cstr(sb, " ");
+    str_builder_add(sb, path);
+    str_builder_add_cstr(sb, ": os error ");
+    str_builder_add_int(sb, 0 - errn);
+    return str_builder_build(sb);
+}
+
+# Read a whole file as a Str — the oracle's `std::fs::read_to_string`.
+#
+# Returns 0 with `*out_err` set to an `Io` error. A directory is an error, as it
+# is for std, which is why this is built on the fd verbs rather than
+# `file_read_all`: that reports a directory as a 0-byte success, and truncates
+# silently at its cap. An empty file is a valid empty Str.
+#
+# ⚠ The directory check is FIRST, before the open, and that placement is the
+# point rather than an ordering preference. Put it where it reads more naturally
+# — after the seek — and what it does next is **filesystem-dependent, not
+# OS-dependent**, which is the trap:
+#
+#   * **ext4**: `lseek(SEEK_END)` on a directory fd SUCCEEDS and returns **i64
+#     MAX** (measured: 9223372036854775807). A late check never fires at all,
+#     and the size flows on into the allocation below.
+#   * **tmpfs**: the same call fails `-EINVAL`, so a late check *does* fire —
+#     which is exactly why this never showed up on a dev box, whose `/tmp` is
+#     tmpfs, while a GitHub runner's `/tmp` is ext4.
+#   * **agnos**: it fires earlier still, at the open, because that kernel
+#     refuses a non-regular inode without `AO_DIRECTORY`.
+#
+# So the same input yields three different paths across three targets, and two
+# of them are the same OS. Hoisting makes EISDIR the answer everywhere, at the
+# cost of one extra `is_dir` per direct read.
+#
+# `durable_state`'s `_agnosai_read_file_exact` was the counter-example, checking
+# after the seek. It reached `main` that way and **segfaulted on CI only**: the
+# i64 MAX above made `alloc(size + 1)` overflow negative and return 0, and
+# `store8(buf + size, 0)` wrote at 2^63-1. It now hoists the check as this does.
+# It stays its own function: its callers want the errno back, not an `Io` error.
+#
+# No UTF-8 validation. std's `read_to_string` rejects invalid UTF-8 with
+# `InvalidData`; the bytes here flow straight into a parser that will reject
+# anything it cannot read, so the residual is that a non-UTF-8 definition file
+# fails as a *parse* error rather than an *I/O* one. Recorded, not fixed —
+# validating would mean walking every byte of every file to change which of two
+# errors is returned.
+fn _agnosai_read_file(path: Str, out_err): Str {
+    if (is_dir(path) == 1) {
+        _agnosai_read_file_err(out_err,
+          agnosai_error_io(_agnosai_read_file_detail("read", path, 0 - 21)));
+        return 0;
+    }
+
+    # `str_cstr`, not `str_data`: a Str's bytes need not end in a NUL at its length (a
+    # `str_sub` borrows its parent's), so `str_data` could open a longer path than the one
+    # `is_dir` just checked. cyrius 6.6.13 warns on the old spelling.
+    var fd = file_open(str_cstr(path), 0, 0);
+    if (fd < 0) {
+        _agnosai_read_file_err(out_err,
+          agnosai_error_io(_agnosai_read_file_detail("open", path, fd)));
+        return 0;
+    }
+
+    var size = xlseek(fd, 0, 2);
+    if (size < 0) {
+        file_close(fd);
+        _agnosai_read_file_err(out_err,
+          agnosai_error_io(_agnosai_read_file_detail("seek", path, size)));
+        return 0;
+    }
+    if (xlseek(fd, 0, 0) < 0) {
+        file_close(fd);
+        _agnosai_read_file_err(out_err,
+          agnosai_error_io(_agnosai_read_file_detail("seek", path, 0 - 5)));
+        return 0;
+    }
+
+    # One spare byte so the payload is NUL-terminated and usable as a cstring.
+    #
+    # ⚠ **The allocation is checked before it is written through**, and this one
+    # is REACHABLE rather than defensive. `alloc` fails closed above
+    # `ALLOC_MAX` — 2 GiB (`lib/alloc.cyr:174`, enforced at :225) — and returns
+    # 0. Unchecked, `store8(buf + size, 0)` then writes at address `size`, which
+    # for a 2 GiB file is unmapped: SIGSEGV. Any regular file of 2147483648
+    # bytes or more does it, no privilege needed, and
+    # `agnosai_load_from_file` reads BEFORE it checks the extension, so the
+    # filename does not even have to look loadable. The same line also faults
+    # for an ordinary-sized file whenever the backing mmap fails
+    # (`lib/alloc.cyr:236` returns 0 for that too).
+    #
+    # This is the THIRD whole-file reader in the tree. The other two —
+    # `durable_state`'s `_agnosai_read_file_exact` and `packaging`'s
+    # `_agnosai_pkg_read_member` — were hardened first, and this one was missed
+    # in that same commit even though its comment block was being edited.
+    var buf = alloc(size + 1);
+    if (buf == 0) {
+        file_close(fd);
+        _agnosai_read_file_err(out_err,
+          agnosai_error_io(_agnosai_read_file_detail("allocate", path, 0 - 12)));
+        return 0;
+    }
+    store8(buf + size, 0);
+
+    var total = 0;
+    while (total < size) {
+        var n = file_read(fd, buf + total, size - total);
+        if (n < 0) {
+            file_close(fd);
+            _agnosai_read_file_err(out_err,
+              agnosai_error_io(_agnosai_read_file_detail("read", path, n)));
+            return 0;
+        }
+        # A short read is end-of-file, not an error — someone may have truncated
+        # the file between the seek and here. Keep what arrived.
+        if (n == 0) { break; }
+        total = total + n;
+    }
+    file_close(fd);
+    store8(buf + total, 0);
+    return str_new(buf, total);
+}

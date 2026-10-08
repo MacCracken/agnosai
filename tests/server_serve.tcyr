@@ -906,6 +906,16 @@ fn _t_handler_end_to_end(): i64 {
         "PUT /health HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
     assert(_t_starts_with(&out, n3, "HTTP/1.1 405 Method Not Allowed\r\n") == 1,
       "405 for a known path with an unmapped verb");
+    # ⭐ 2.1.7 (roadmap B8): with `Allow`, on the wire — the send path forwards the
+    # response's header lines, which until 2.1.7 it never had to.
+    assert(_t_contains(&out, n3, "\r\nAllow: GET\r\n") == 1, "the 405 names the methods the path takes");
+    var nd = _t_serve_over_pipe(str_from(
+        "PUT /api/v1/agents/definitions HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_contains(&out, nd, "\r\nAllow: GET, POST\r\n") == 1, "every one of them");
+    var nh405 = _t_serve_over_pipe(str_from("HEAD /mcp HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_contains(&out, nh405, "\r\nAllow: POST\r\n") == 1, "a HEAD 405 carries it too");
+    var n200 = _t_serve_over_pipe(str_from("GET /health HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_contains(&out, n200, "Allow:") == 0, "and a 200 does not");
 
     # HEAD is a GET with no body: same status and length, nothing after them.
     var nh = _t_serve_over_pipe(str_from("HEAD /health HTTP/1.1\r\nHost: x\r\n\r\n"), &out);

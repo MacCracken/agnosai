@@ -61,6 +61,9 @@
 # answered differently for months — availability 1, next call "backend not
 # available: wasm" — because kavach was never initialised from this path.
 # =========================================================================
+# The shared whole-file reader (2.1.7, roadmap B19); include-once, so this costs nothing
+# where `src/main.cyr` already has it.
+include "src/read_file.cyr"
 
 # The oracle's four constants, unchanged.
 var AGNOSAI_WASM_DEFAULT_MAX_MEMORY_BYTES = 67108864;
@@ -225,14 +228,9 @@ fn agnosai_wasm_load_module(s, buf, len, out_err): i64 {
 # lies. The header is validated the same way, and a caller cannot make the
 # sandbox execute an arbitrary path it did not first prove was a WASM module.
 fn agnosai_wasm_load_module_from_file(s, path: Str, out_err): i64 {
-    # ⚠ `_agnosai_loader_read` is `definitions/loader`'s, reached across module
-    # boundaries because `src/main.cyr` puts definitions before sandbox. This is
-    # the **THIRD** whole-file read in the tree — `orchestrator/durable_state`
-    # has `_agnosai_read_file_exact` and `definitions/loader` has this one — so
-    # CLAUDE.md's rule fires: the next bite hoists one reader to a port-local
-    # root module and points all three at it. Using the existing one rather than
-    # writing a fourth copy is the smaller wrong thing meanwhile.
-    var content = _agnosai_loader_read(path, out_err);
+    # The shared reader, `src/read_file.cyr` (2.1.7, roadmap B19) — until then this reached
+    # into `definitions/loader`'s private one.
+    var content = _agnosai_read_file(path, out_err);
     if (content == 0) { return 0; }
     return agnosai_wasm_load_module(s, str_data(content), str_len(content), out_err);
 }

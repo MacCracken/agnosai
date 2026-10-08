@@ -523,6 +523,8 @@ fn agnosai_otlp_span_kind(span): i64 {
     if (streq(agnosai_genai_span_name(span), AGNOSAI_GENAI_OP_CHAT) == 1) {
         return AGNOSAI_OTLP_KIND_CLIENT;
     }
+    # A request this process answered (2.1.7, ADR 024): the server end of a CLIENT/SERVER pair.
+    if (agnosai_span_is_http_server(span) == 1) { return AGNOSAI_OTLP_KIND_SERVER; }
     return AGNOSAI_OTLP_KIND_INTERNAL;
 }
 
@@ -546,6 +548,7 @@ fn agnosai_otlp_span_json(span, ctx): i64 {
 # convenience wrapper above allocates on the global, which is exactly what the
 # ring exists to avoid.
 fn _agnosai_otlp_span_json_into_a(a, sb, span, ctx): i64 {
+    if (agnosai_span_is_http_server(span) == 1) { return _agnosai_otlp_http_span_json_into_a(a, sb, span, ctx); }
     str_builder_add_cstr_a(a, sb, "{\"traceId\":\"");
     agnosai_otlp_add_trace_id_a(a, sb, load64(ctx + AGN_OTC_TRACE_HI),
       load64(ctx + AGN_OTC_TRACE_LO));
@@ -599,6 +602,63 @@ fn _agnosai_otlp_span_json_into_a(a, sb, span, ctx): i64 {
     wrote = _agnosai_otlp_emit_int_a(a, sb, span, AGNOSAI_GENAI_USAGE_OUTPUT_TOKENS, wrote);
     wrote = _agnosai_otlp_emit_int_a(a, sb, span, AGNOSAI_GENAI_CREW_TASK_COUNT, wrote);
 
+    str_builder_add_cstr_a(a, sb, "],\"status\":{\"code\":");
+    str_builder_add_int_a(a, sb, load64(ctx + AGN_OTC_STATUS));
+    str_builder_add_cstr_a(a, sb, "}}");
+    return 0;
+}
+
+# Encode one HTTP server span (2.1.7, ADR 024): named `<method> <route>`, SERVER, carrying the
+# HTTP semantic-convention attributes — `http.request.method`, `http.route`,
+# `http.response.status_code`, `url.path`, `url.scheme` — and none of the `gen_ai.*` ones.
+# The identity and timing are the GenAI encoder's, field for field.
+fn _agnosai_otlp_http_span_json_into_a(a, sb, span, ctx): i64 {
+    str_builder_add_cstr_a(a, sb, "{\"traceId\":\"");
+    agnosai_otlp_add_trace_id_a(a, sb, load64(ctx + AGN_OTC_TRACE_HI),
+      load64(ctx + AGN_OTC_TRACE_LO));
+    str_builder_add_cstr_a(a, sb, "\",\"spanId\":\"");
+    agnosai_otlp_add_span_id_a(a, sb, load64(ctx + AGN_OTC_SPAN_ID));
+    var parent = load64(ctx + AGN_OTC_PARENT_SPAN_ID);
+    if (parent != 0) {
+        str_builder_add_cstr_a(a, sb, "\",\"parentSpanId\":\"");
+        agnosai_otlp_add_span_id_a(a, sb, parent);
+    }
+    str_builder_add_cstr_a(a, sb, "\",\"name\":");
+    _agnosai_otlp_putc_a(a, sb, 34);
+    _agnosai_otlp_json_body_a(a, sb, agnosai_http_span_method(span));
+    var route = agnosai_http_span_route(span);
+    if (route != 0 && str_len(route) > 0) {
+        _agnosai_otlp_putc_a(a, sb, 32);
+        _agnosai_otlp_json_body_a(a, sb, route);
+    }
+    _agnosai_otlp_putc_a(a, sb, 34);
+    str_builder_add_cstr_a(a, sb, ",\"kind\":");
+    str_builder_add_int_a(a, sb, AGNOSAI_OTLP_KIND_SERVER);
+    str_builder_add_cstr_a(a, sb, ",\"startTimeUnixNano\":\"");
+    str_builder_add_int_a(a, sb, load64(ctx + AGN_OTC_START_NS));
+    str_builder_add_cstr_a(a, sb, "\",\"endTimeUnixNano\":\"");
+    str_builder_add_int_a(a, sb, load64(ctx + AGN_OTC_END_NS));
+    str_builder_add_cstr_a(a, sb, "\",\"attributes\":[");
+    _agnosai_otlp_attr_str_a(a, sb, AGNOSAI_HTTP_REQUEST_METHOD, agnosai_http_span_method(span));
+    if (route != 0 && str_len(route) > 0) {
+        str_builder_add_cstr_a(a, sb, ",");
+        _agnosai_otlp_attr_str_a(a, sb, AGNOSAI_HTTP_ROUTE, route);
+    }
+    var st = agnosai_http_span_status(span);
+    if (st >= 0) {
+        str_builder_add_cstr_a(a, sb, ",");
+        _agnosai_otlp_attr_int_a(a, sb, AGNOSAI_HTTP_RESPONSE_STATUS, st);
+    }
+    var path = agnosai_http_span_path(span);
+    if (path != 0) {
+        str_builder_add_cstr_a(a, sb, ",");
+        _agnosai_otlp_attr_str_a(a, sb, AGNOSAI_URL_PATH, path);
+    }
+    var scheme = agnosai_http_span_scheme(span);
+    if (scheme != 0) {
+        str_builder_add_cstr_a(a, sb, ",");
+        _agnosai_otlp_attr_str_a(a, sb, AGNOSAI_URL_SCHEME, scheme);
+    }
     str_builder_add_cstr_a(a, sb, "],\"status\":{\"code\":");
     str_builder_add_int_a(a, sb, load64(ctx + AGN_OTC_STATUS));
     str_builder_add_cstr_a(a, sb, "}}");
@@ -947,7 +1007,7 @@ var AGNOSAI_OTLP_POST_ARENA = 65536;
 # The oracle has no equivalent; hoosh batches every 1000 ms and so does this.
 var AGNOSAI_OTLP_BATCH_MS = 1000;
 
-# Exporter heap layout — 80 bytes.
+# Exporter heap layout — 88 bytes.
 enum AgnosaiOtlpExporterOff {
     AGN_OTE_RING = 0;
     # 0 when no endpoint is configured — the exporter still drains, so a
@@ -963,7 +1023,9 @@ enum AgnosaiOtlpExporterOff {
     AGN_OTE_OPTS = 56;
     AGN_OTE_URL = 64;
     AGN_OTE_LOCK = 72;
-    AGN_OTE_SIZE = 80;
+    # 2.1.7 — the background thread's handle, joined by `stop`; 0 when none runs.
+    AGN_OTE_THREAD = 80;
+    AGN_OTE_SIZE = 88;
 }
 
 # An exporter over its own ring. `endpoint` may be 0 (drain and discard).
@@ -982,6 +1044,7 @@ fn agnosai_otlp_exporter_new(endpoint, service_name: Str, interval_ms): i64 {
     store64(e + AGN_OTE_ARENA, 0);
     store64(e + AGN_OTE_OPTS, 0);
     store64(e + AGN_OTE_URL, 0);
+    store64(e + AGN_OTE_THREAD, 0);
     if (endpoint != 0) {
         _agnosai_otlp_exporter_target(e, str_cstr(_agnosai_otlp_post_url(default_alloc(), endpoint)));
     }
@@ -1049,9 +1112,9 @@ fn agnosai_otlp_exporter_stopping(e): i64 {
 
 # POST one batch document. Best-effort — the result is deliberately ignored.
 #
-# ⚠ Not reachable from the suite: it needs a listening collector. Everything
-# that decides *what* to send is in `drain` and the encoder, which are tested
-# byte-for-byte; this function only moves bytes. Recorded in roadmap section E.
+# Reached from the suite since 2.1.6: `tests/telemetry_otlp.tcyr` POSTs to a local stub
+# collector and to a port nothing listens on. What decides *what* to send is in `drain`
+# and the encoder, which are tested byte for byte; this function only moves bytes.
 # --- OTEL_EXPORTER_OTLP_HEADERS -------------------------------------------
 #
 # ⚠ **Without this, no hosted collector is reachable.** Honeycomb, Grafana Cloud
@@ -1254,13 +1317,21 @@ fn _agnosai_otlp_exporter_thread(e): i64 {
     return 0;
 }
 
-# Start the background exporter. Detached — nothing ever joins it.
+# Start the background exporter. Joinable since 2.1.7: `agnosai_otlp_exporter_stop` joins it.
 #
-# `thread_create_detached` rather than `thread_create`: a joinable thread nobody
-# joins leaks its 2 MiB stack for the life of the process (cyrius 6.5.8's own
-# filing from this repo).
+# It was detached until 2.1.6 — a joinable thread nobody joins leaks its 2 MiB stack for the
+# life of the process (cyrius 6.5.8's own filing from this repo). But a detached thread can
+# outlive `main`: a `.tcyr` epilogue's `syscall(60, ..)` ends one thread, the trampoline then
+# exits with status 0, and a suite with a failing assertion exited 0 (roadmap B15, seen on
+# `telemetry_wiring`, `telemetry_otlp` and `telemetry_mod`). Now `stop` joins it, so after a
+# stop no exporter thread is left, and its stack is released. Starting twice is a no-op.
 fn agnosai_otlp_exporter_start(e): i64 {
-    thread_create_detached(&_agnosai_otlp_exporter_thread, e);
+    if (e == 0) { return 0; }
+    mutex_lock(load64(e + AGN_OTE_LOCK));
+    if (load64(e + AGN_OTE_THREAD) == 0 && load64(e + AGN_OTE_STOP) == 0) {
+        store64(e + AGN_OTE_THREAD, thread_create(&_agnosai_otlp_exporter_thread, e));
+    }
+    mutex_unlock(load64(e + AGN_OTE_LOCK));
     return 0;
 }
 
@@ -1275,7 +1346,16 @@ fn agnosai_otlp_exporter_start(e): i64 {
 # spans when it drops; without this, every span queued in the last interval is
 # lost on a clean shutdown — the batch most likely to explain why the process
 # is shutting down.
+#
+# Joins the background thread first (2.1.7), outside the exporter's lock: the thread notices
+# the flag within `AGNOSAI_OTLP_STOP_POLL_MS`, or once its in-flight flush ends. Then the final
+# flush runs here, with no exporter thread left to race it or to outlive the process.
 fn agnosai_otlp_exporter_stop(e): i64 {
     store64(e + AGN_OTE_STOP, 1);
+    mutex_lock(load64(e + AGN_OTE_LOCK));
+    var t = load64(e + AGN_OTE_THREAD);
+    store64(e + AGN_OTE_THREAD, 0);
+    mutex_unlock(load64(e + AGN_OTE_LOCK));
+    if (t != 0) { thread_join(t); }
     return agnosai_otlp_exporter_flush(e);
 }

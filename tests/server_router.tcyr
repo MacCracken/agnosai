@@ -240,6 +240,66 @@ fn _t_method_mismatch_is_405(): i64 {
     return 0;
 }
 
+# 1 when response `r`'s extra headers are exactly `want` (a C string); 0 for none.
+fn _t_headers_are(r, want): i64 {
+    var h = agnosai_route_headers(r);
+    if (h == 0) { return 0; }
+    return streq(h, want);
+}
+
+# ⭐ 2.1.7 (roadmap B8): a 405 names the methods its path takes. RFC 9110 §15.5.6 makes `Allow`
+# a MUST, and every path's methods are pinned here, so a pattern given a new method without
+# its mask fails by name.
+fn _t_method_mismatch_says_allow(): i64 {
+    var s = _t_open();
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_POST, "/health"), "Allow: GET\r\n") == 1, "/health: GET");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_POST, "/ready"), "Allow: GET\r\n") == 1, "/ready: GET");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_POST, "/metrics"), "Allow: GET\r\n") == 1, "/metrics: GET");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_GET, "/mcp"), "Allow: POST\r\n") == 1, "/mcp: POST");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_GET, "/api/v1/crews"), "Allow: POST\r\n") == 1, "crews: POST");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_POST, "/api/v1/crews/x"), "Allow: GET\r\n") == 1, "crews/{id}: GET");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_GET, "/api/v1/crews/x/cancel"), "Allow: POST\r\n") == 1,
+      "cancel: POST");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_POST, "/api/v1/crews/x/stream"), "Allow: GET\r\n") == 1,
+      "stream: GET");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_GET, "/api/v1/a2a/receive"), "Allow: POST\r\n") == 1,
+      "a2a receive: POST");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_GET, "/api/v1/a2a/status"), "Allow: POST\r\n") == 1,
+      "a2a status: POST");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_DELETE, "/api/v1/agents/definitions"), "Allow: GET, POST\r\n") == 1,
+      "definitions: GET, POST");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_POST, "/api/v1/tools"), "Allow: GET\r\n") == 1, "tools: GET");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_GET, "/api/v1/tools/x"), "Allow: DELETE\r\n") == 1,
+      "tools/{name}: DELETE");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_DELETE, "/api/v1/approvals"), "Allow: GET, POST\r\n") == 1,
+      "approvals: GET, POST");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_POST, "/api/v1/presets"), "Allow: GET\r\n") == 1, "presets: GET");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_POST, "/api/v1/dashboard/crews"), "Allow: GET\r\n") == 1,
+      "dashboard crews: GET");
+    assert(_t_headers_are(_t_go(s, AGNOSAI_METHOD_POST, "/api/v1/dashboard/agents"), "Allow: GET\r\n") == 1,
+      "dashboard agents: GET");
+    assert(agnosai_route_headers(_t_go(s, AGNOSAI_METHOD_GET, "/health")) == 0, "a 200 carries none");
+    assert(agnosai_route_headers(_t_go(s, AGNOSAI_METHOD_POST, "/api/v1/zzz")) == 0, "nor does a 404");
+
+    # The pieces are public — a consumer with its own send path builds the line itself.
+    assert(agnosai_route_match_allow(agnosai_route_resolve(AGNOSAI_METHOD_DELETE, str_from("/api/v1/approvals")))
+      == (AGN_ALLOW_GET | AGN_ALLOW_POST), "a mismatch records every method its path takes");
+    assert(agnosai_route_match_allow(agnosai_route_resolve(AGNOSAI_METHOD_GET, str_from("/health"))) == 0,
+      "a match records none");
+    assert(agnosai_route_match_allow(agnosai_route_resolve(AGNOSAI_METHOD_GET, str_from("/zzz"))) == 0,
+      "nor does an unknown path");
+    var a = arena_allocator_growable(4096);
+    assert(streq(agnosai_route_allow_header_a(a, AGN_ALLOW_GET | AGN_ALLOW_POST | AGN_ALLOW_DELETE),
+        "Allow: GET, POST, DELETE\r\n") == 1, "all three, in a fixed order");
+    assert(streq(agnosai_route_allow_header_a(a, AGN_ALLOW_POST | AGN_ALLOW_DELETE), "Allow: POST, DELETE\r\n") == 1,
+      "a separator only between two methods");
+    assert(agnosai_route_allow_header_a(a, 0) == 0, "no methods, no line");
+    var r = agnosai_route_with_headers(_t_go(s, AGNOSAI_METHOD_GET, "/health"), "X-Probe: 1\r\n");
+    assert(_t_headers_are(r, "X-Probe: 1\r\n") == 1, "a route response carries the lines it is given");
+    assert(agnosai_route_with_headers(0, "X-Probe: 1\r\n") == 0, "and no response stays none");
+    return 0;
+}
+
 # --- Path parameters -----------------------------------------------------
 
 fn _t_path_params(): i64 {
@@ -780,6 +840,7 @@ fn main(): i64 {
     _t_routing_precedes_auth();
     _t_body_limit_is_outermost();
     _t_method_mismatch_is_405();
+    _t_method_mismatch_says_allow();
     _t_path_params();
     _t_param_reaches_the_handler();
     _t_dispatch();

@@ -80,12 +80,15 @@ include "src/arena_pool.cyr"
 # sits first and is available to every module below for the JSON log formatter.
 include "src/telemetry/mod.cyr"
 include "src/core/mod.cyr"
+# read_file — the one whole-file reader (2.1.7, B19). The modules that call it include it
+# themselves (include-once); it is named here so this order and `[lib].modules` agree.
+include "src/read_file.cyr"
 # definitions — needs `core`'s AgentDefinition and nothing else yet (M10).
 include "src/definitions/mod.cyr"
 include "src/learning/mod.cyr"
 # fleet — after `order` (cost_planning sorts candidates through agnosai_sort)
 # and after `core`, whose `resource` module supplies the hardware vocabulary
-# that `registry`, `placement` and `gpu` speak (roadmap M8).
+# that `registry`, `placement` and `gpu` speak (the fleet port, M8 — CHANGELOG [2.0.0]).
 include "src/fleet/mod.cyr"
 include "src/llm/mod.cyr"
 include "src/server/ssrf.cyr"
@@ -210,7 +213,7 @@ fn _agnosai_main_load_auth_config(): i64 {
     if (enabled == 1) { if (str_len(auth_sec) == 0) { if (jwt == 0) {
                 sakshi_warn(
                   "Auth enabled but no secret or JWT key configured — all requests will be rejected",
-                  82);
+                  85);
             } } }
 
     if (jwt != 0) { return agnosai_auth_config_with_jwt(jwt); }
@@ -376,12 +379,12 @@ fn main(): i64 {
         # oracle answers 500 per request rather than failing to start.
         if (jwt != 0) { if (agnosai_jwt_config_prepare(jwt) == 0) {
                 sakshi_warn(
-                  "JWT public key failed to decode — every JWT request will be rejected", 70);
+                  "JWT public key failed to decode — every JWT request will be rejected", 73);
             } }
     }
     if (agnosai_auth_config_enabled(auth) == 0) {
         sakshi_warn(
-          "authentication disabled — set AGNOSAI_AUTH_ENABLED=true for production", 72);
+          "authentication disabled — set AGNOSAI_AUTH_ENABLED=true for production", 75);
     }
 
     # `orchestrator.audit().clone()` (`main.rs:105`) — the SAME chain the
@@ -410,7 +413,7 @@ fn main(): i64 {
     # corresponding refusal.
     if (agnosai_serve_install_signals() == 0) {
         sakshi_warn(
-          "could not install signal handlers — shutdown will not be graceful", 65);
+          "could not install signal handlers — shutdown will not be graceful", 70);
     }
 
     # `INADDR_ANY()` is the oracle's `([0, 0, 0, 0], port)`. Since cyrius 6.5.6
@@ -431,7 +434,7 @@ fn main(): i64 {
         rc = agnosai_serve_with_rate_limit(state, INADDR_ANY(), port,
           rl_x1000, agnosai_rate_limit_env_burst());
     }
-    if (rc == 0) { sakshi_info("server shut down gracefully", 28); }
+    if (rc == 0) { sakshi_info("server shut down gracefully", 27); }
 
     # The oracle's `_tracing_guard` flushes pending spans when it drops at the
     # end of `main`. Cyrius has no `Drop`, so the drop is written out — and it

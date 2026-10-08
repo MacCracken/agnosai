@@ -11,8 +11,7 @@
 #
 # Bite 15b is the sandhi adapter — `sandhi_server_run_pooled`, the per-worker
 # arena (blocker #3), the `alloc_used()`-flat regression test, and the a2a
-# callback dispatch — tracked in docs/development/state.md and
-# CHANGELOG [Unreleased].
+# callback dispatch — shipped in 2.0.0 (CHANGELOG [2.0.0]; docs/development/state.md).
 #
 # ## The auth boundary is the security-critical part of this file
 #
@@ -93,7 +92,15 @@ enum AgnosaiRouteMatchOff {
     AGN_RM_ID = 0;
     AGN_RM_PARAM = 8;
     AGN_RM_METHOD_MISMATCH = 16;
-    AGN_ROUTE_MATCH_SIZE = 24;
+    AGN_RM_ALLOW = 24;   # on a mismatch, the methods the path takes (2.1.7)
+    AGN_ROUTE_MATCH_SIZE = 32;
+}
+
+# The methods a matched path takes, as bits — what a 405's `Allow` lists (2.1.7, roadmap B8).
+enum AgnosaiAllowBit {
+    AGN_ALLOW_GET    = 1;
+    AGN_ALLOW_POST   = 2;
+    AGN_ALLOW_DELETE = 4;
 }
 
 # The resolved route, or `AGN_ROUTE_NONE` when nothing matched.
@@ -112,7 +119,39 @@ fn _agnosai_rm_new_a(a, id, param, mismatch): i64 {
     store64(m + AGN_RM_ID, id);
     store64(m + AGN_RM_PARAM, param);
     store64(m + AGN_RM_METHOD_MISMATCH, mismatch);
+    store64(m + AGN_RM_ALLOW, 0);
     return m;
+}
+
+# A method mismatch: the path matched, under methods `allow` (`AGN_ALLOW_*` bits).
+fn _agnosai_rm_mismatch_a(a, allow): i64 {
+    var m = _agnosai_rm_new_a(a, AGN_ROUTE_NONE, 0, 1);
+    store64(m + AGN_RM_ALLOW, allow);
+    return m;
+}
+
+# On a method mismatch, the methods the matched path takes (`AGN_ALLOW_*` bits); 0 otherwise.
+fn agnosai_route_match_allow(m): i64 { return load64(m + AGN_RM_ALLOW); }
+
+# The `Allow` header line for `allow` — `Allow: GET, POST` and CRLF — as a C string in `a`,
+# or 0 for none (2.1.7). RFC 9110 §15.5.6 makes it a MUST on a 405.
+fn agnosai_route_allow_header_a(a, allow): i64 {
+    if (allow == 0) { return 0; }
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Allow: ");
+    var first = 1;
+    if ((allow & AGN_ALLOW_GET) != 0) { str_builder_add_cstr_a(a, sb, "GET"); first = 0; }
+    if ((allow & AGN_ALLOW_POST) != 0) {
+        if (first == 0) { str_builder_add_cstr_a(a, sb, ", "); }
+        str_builder_add_cstr_a(a, sb, "POST");
+        first = 0;
+    }
+    if ((allow & AGN_ALLOW_DELETE) != 0) {
+        if (first == 0) { str_builder_add_cstr_a(a, sb, ", "); }
+        str_builder_add_cstr_a(a, sb, "DELETE");
+    }
+    str_builder_add_cstr_a(a, sb, "\r\n");
+    return str_data(str_builder_build_a(a, sb));
 }
 
 # Global-allocator form of `_agnosai_rm_new_a`.
@@ -308,25 +347,25 @@ fn agnosai_route_resolve_a(a, method, path: Str): i64 {
     if (api >= 0) {
         if (_agnosai_seg_is(path, api, "crews") == 1) {
             if (_agnosai_path_matches_at(a, path, api, "/crews", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_POST;
                 if (method == AGNOSAI_METHOD_POST) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_CREATE_CREW, 0, 0);
                 }
             }
             if (_agnosai_path_matches_at(a, path, api, "/crews/*", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_GET;
                 if (method == AGNOSAI_METHOD_GET) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_GET_CREW, load64(param), 0);
                 }
             }
             if (_agnosai_path_matches_at(a, path, api, "/crews/*/cancel", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_POST;
                 if (method == AGNOSAI_METHOD_POST) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_CANCEL_CREW, load64(param), 0);
                 }
             }
             if (_agnosai_path_matches_at(a, path, api, "/crews/*/stream", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_GET;
                 if (method == AGNOSAI_METHOD_GET) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_CREW_STREAM, load64(param), 0);
                 }
@@ -334,13 +373,13 @@ fn agnosai_route_resolve_a(a, method, path: Str): i64 {
         }
         if (_agnosai_seg_is(path, api, "a2a") == 1) {
             if (_agnosai_path_matches_at(a, path, api, "/a2a/receive", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_POST;
                 if (method == AGNOSAI_METHOD_POST) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_A2A_RECEIVE, 0, 0);
                 }
             }
             if (_agnosai_path_matches_at(a, path, api, "/a2a/status", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_POST;
                 # POST, not GET — the oracle registers `post(routes::a2a::status)`.
                 if (method == AGNOSAI_METHOD_POST) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_A2A_STATUS, 0, 0);
@@ -349,7 +388,7 @@ fn agnosai_route_resolve_a(a, method, path: Str): i64 {
         }
         if (_agnosai_seg_is(path, api, "agents") == 1) {
             if (_agnosai_path_matches_at(a, path, api, "/agents/definitions", param) == 1) {
-                seen = 1;
+                seen = seen | (AGN_ALLOW_GET | AGN_ALLOW_POST);
                 if (method == AGNOSAI_METHOD_GET) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_LIST_DEFINITIONS, 0, 0);
                 }
@@ -360,13 +399,13 @@ fn agnosai_route_resolve_a(a, method, path: Str): i64 {
         }
         if (_agnosai_seg_is(path, api, "tools") == 1) {
             if (_agnosai_path_matches_at(a, path, api, "/tools", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_GET;
                 if (method == AGNOSAI_METHOD_GET) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_LIST_TOOLS, 0, 0);
                 }
             }
             if (_agnosai_path_matches_at(a, path, api, "/tools/*", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_DELETE;
                 if (method == AGNOSAI_METHOD_DELETE) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_REMOVE_TOOL, load64(param), 0);
                 }
@@ -374,7 +413,7 @@ fn agnosai_route_resolve_a(a, method, path: Str): i64 {
         }
         if (_agnosai_seg_is(path, api, "approvals") == 1) {
             if (_agnosai_path_matches_at(a, path, api, "/approvals", param) == 1) {
-                seen = 1;
+                seen = seen | (AGN_ALLOW_GET | AGN_ALLOW_POST);
                 if (method == AGNOSAI_METHOD_GET) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_LIST_PENDING, 0, 0);
                 }
@@ -385,7 +424,7 @@ fn agnosai_route_resolve_a(a, method, path: Str): i64 {
         }
         if (_agnosai_seg_is(path, api, "presets") == 1) {
             if (_agnosai_path_matches_at(a, path, api, "/presets", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_GET;
                 if (method == AGNOSAI_METHOD_GET) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_LIST_PRESETS, 0, 0);
                 }
@@ -393,13 +432,13 @@ fn agnosai_route_resolve_a(a, method, path: Str): i64 {
         }
         if (_agnosai_seg_is(path, api, "dashboard") == 1) {
             if (_agnosai_path_matches_at(a, path, api, "/dashboard/crews", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_GET;
                 if (method == AGNOSAI_METHOD_GET) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_CREW_HISTORY, 0, 0);
                 }
             }
             if (_agnosai_path_matches_at(a, path, api, "/dashboard/agents", param) == 1) {
-                seen = 1;
+                seen = seen | AGN_ALLOW_GET;
                 if (method == AGNOSAI_METHOD_GET) {
                     return _agnosai_rm_new_a(a, AGN_ROUTE_AGENT_PERFORMANCE, 0, 0);
                 }
@@ -407,38 +446,38 @@ fn agnosai_route_resolve_a(a, method, path: Str): i64 {
         }
 
         # Path known, method not — axum answers 405 rather than 404.
-        if (seen == 1) { return _agnosai_rm_new_a(a, AGN_ROUTE_NONE, 0, 1); }
+        if (seen != 0) { return _agnosai_rm_mismatch_a(a, seen); }
         return _agnosai_rm_new_a(a, AGN_ROUTE_NONE, 0, 0);
     }
 
     # Not under `/api/v1`: the three public probes, and `/mcp`, which is
     # protected and is NOT under /api/v1 — easy to miss.
     if (_agnosai_path_matches_at(a, path, 0, "/health", param) == 1) {
-        seen = 1;
+        seen = seen | AGN_ALLOW_GET;
         if (method == AGNOSAI_METHOD_GET) {
             return _agnosai_rm_new_a(a, AGN_ROUTE_HEALTH, 0, 0);
         }
     }
     if (_agnosai_path_matches_at(a, path, 0, "/ready", param) == 1) {
-        seen = 1;
+        seen = seen | AGN_ALLOW_GET;
         if (method == AGNOSAI_METHOD_GET) {
             return _agnosai_rm_new_a(a, AGN_ROUTE_READY, 0, 0);
         }
     }
     if (_agnosai_path_matches_at(a, path, 0, "/metrics", param) == 1) {
-        seen = 1;
+        seen = seen | AGN_ALLOW_GET;
         if (method == AGNOSAI_METHOD_GET) {
             return _agnosai_rm_new_a(a, AGN_ROUTE_METRICS, 0, 0);
         }
     }
     if (_agnosai_path_matches_at(a, path, 0, "/mcp", param) == 1) {
-        seen = 1;
+        seen = seen | AGN_ALLOW_POST;
         if (method == AGNOSAI_METHOD_POST) {
             return _agnosai_rm_new_a(a, AGN_ROUTE_MCP, 0, 0);
         }
     }
 
-    if (seen == 1) { return _agnosai_rm_new_a(a, AGN_ROUTE_NONE, 0, 1); }
+    if (seen != 0) { return _agnosai_rm_mismatch_a(a, seen); }
     return _agnosai_rm_new_a(a, AGN_ROUTE_NONE, 0, 0);
 }
 
@@ -559,8 +598,10 @@ fn _agnosai_route_dispatch_inner(a, state, method, path: Str, auth_header: Str, 
     var id = agnosai_route_match_id(m);
     if (id == AGN_ROUTE_NONE) {
         if (agnosai_route_match_method_mismatch(m) == 1) {
-            return agnosai_route_error_a(al, HTTP_METHOD_NOT_ALLOWED,
-              str_from_a(al, "method not allowed"));
+            # The methods the path takes (2.1.7, roadmap B8) — RFC 9110 §15.5.6 makes it a MUST.
+            return agnosai_route_with_headers(agnosai_route_error_a(al, HTTP_METHOD_NOT_ALLOWED,
+                str_from_a(al, "method not allowed")),
+              agnosai_route_allow_header_a(al, agnosai_route_match_allow(m)));
         }
         return agnosai_route_error_a(al, HTTP_NOT_FOUND, str_from_a(al, "not found"));
     }

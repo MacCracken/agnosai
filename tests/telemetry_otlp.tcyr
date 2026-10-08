@@ -36,6 +36,12 @@ include "src/telemetry/otlp.cyr"
 include "tests/test_helpers.cyr"
 
 # The hex rendering of a trace id, on its own.
+
+# How many threads this process has: the entries of /proc/self/task (2.1.7).
+fn _t_threads(): i64 {
+    return vec_len(dir_list(str_from("/proc/self/task")));
+}
+
 fn _t_trace_hex(hi, lo): i64 {
     var sb = str_builder_new();
     agnosai_otlp_add_trace_id(sb, hi, lo);
@@ -74,6 +80,49 @@ fn _t_expect_tool_span(): i64 {
     str_builder_add_cstr(sb, ",\"value\":{\"stringValue\":\"task-1\"}}]");
     str_builder_add_cstr(sb, ",\"status\":{\"code\":1}}");
     return str_builder_build(sb);
+}
+
+# ⭐ 2.1.7 (ADR 024): an HTTP server span — SERVER, named `<method> <route>`, with the HTTP
+# semantic-convention attributes and none of the GenAI ones, built in the caller's arena.
+fn _t_http_server_span(): i64 {
+    var a = arena_allocator(65536);
+    var before = alloc_used();
+    var sp = agnosai_http_server_span_a(a, str_from_a(a, "GET"), str_from_a(a, "/api/v1/crews/{id}"),
+      str_from_a(a, "/api/v1/crews/6ba7b810-9dad-41d1-80b4-00c04fd430c8"), str_from_a(a, "http"), 200);
+    assert_eq(alloc_used() - before, 0, "⭐ the span lives in the caller's arena, not the global heap");
+    assert(sp != 0, "an HTTP server span is built");
+    assert_eq(agnosai_span_is_http_server(sp), 1, "and is one");
+    assert_eq(agnosai_otlp_span_kind(sp), AGNOSAI_OTLP_KIND_SERVER, "⭐ of kind SERVER");
+    assert(str_eq_cstr(agnosai_http_span_method(sp), "GET") == 1, "it keeps the method");
+    assert(str_eq_cstr(agnosai_http_span_route(sp), "/api/v1/crews/{id}") == 1, "the route's pattern");
+    assert(str_eq_cstr(agnosai_http_span_path(sp), "/api/v1/crews/6ba7b810-9dad-41d1-80b4-00c04fd430c8") == 1,
+      "the path as sent");
+    assert(str_eq_cstr(agnosai_http_span_scheme(sp), "http") == 1, "the scheme");
+    assert_eq(agnosai_http_span_status(sp), 200, "and the status");
+    var j = agnosai_otlp_span_json(sp, _t_ctx());
+    assert(str_contains_cstr(j, "\"name\":\"GET /api/v1/crews/{id}\"") == 1,
+      "⭐ named <method> <route>, the route's pattern — low-cardinality");
+    assert(str_contains_cstr(j, "\"kind\":2") == 1, "kind 2 on the wire");
+    assert(str_contains_cstr(j, "{\"key\":\"http.request.method\",\"value\":{\"stringValue\":\"GET\"}}") == 1,
+      "http.request.method");
+    assert(str_contains_cstr(j, "{\"key\":\"http.route\",\"value\":{\"stringValue\":\"/api/v1/crews/{id}\"}}") == 1,
+      "http.route");
+    assert(str_contains_cstr(j, "{\"key\":\"http.response.status_code\",\"value\":{\"intValue\":\"200\"}}") == 1,
+      "http.response.status_code, as a quoted int");
+    assert(str_contains_cstr(j, "\"url.path\"") == 1, "url.path");
+    assert(str_contains_cstr(j, "{\"key\":\"url.scheme\",\"value\":{\"stringValue\":\"http\"}}") == 1, "url.scheme");
+    assert(str_contains_cstr(j, "gen_ai.") == 0, "⭐ and no gen_ai attribute at all");
+    assert(str_contains_cstr(j, "\"traceId\":\"0102030405060708090a0b0c0d0e0f10\"") == 1, "the context's identity");
+    assert_eq(agnosai_http_server_span_a(a, 0, 0, 0, 0, 200), 0, "no method, no span");
+    var tool = agnosai_genai_tool_span(str_from("echo"), 0, 0);
+    assert_eq(agnosai_http_span_method(tool), 0, "a GenAI span has no HTTP method");
+    assert_eq(agnosai_http_span_route(tool) + agnosai_http_span_path(tool) + agnosai_http_span_scheme(tool), 0,
+      "nor route, path or scheme");
+    assert_eq(agnosai_http_span_status(tool), -1, "and no status");
+    assert_eq(agnosai_http_span_route(0) + agnosai_http_span_path(0) + agnosai_http_span_scheme(0), 0,
+      "no span answers 0");
+    assert_eq(agnosai_http_span_status(0), -1, "and status -1");
+    return 0;
 }
 
 fn main(): i64 {
@@ -632,9 +681,11 @@ fn main(): i64 {
     # this suite would wait a full interval for the stop to land, and
     # `syscall(60, ..)` exits one thread — a still-sleeping detached thread
     # holds the process open. That was measured at 1004 ms before slicing.
+    var before_bg = _t_threads();
     var bg = agnosai_otlp_exporter_new(0, str_from("agnosai"), 30);
     agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(bg), tool, _t_ctx());
     agnosai_otlp_exporter_start(bg);
+    assert_eq(_t_threads(), before_bg + 1, "start runs one exporter thread");
     sleep_ms(200);
     assert(agnosai_otlp_exporter_exported(bg) >= 1,
       "the background thread flushed the queued span on its own");
@@ -648,6 +699,15 @@ fn main(): i64 {
 
     agnosai_otlp_exporter_stop(bg);
     assert_eq(agnosai_otlp_exporter_stopping(bg), 1, "and stops when asked");
+    # ⭐ 2.1.7 (roadmap B15): and its thread is gone when `stop` returns. It was detached and
+    # never joined, so it could outlive `main` and turn a failing suite's exit status into 0.
+    assert_eq(_t_threads(), before_bg, "⭐ no exporter thread is left once stop returns");
+    var twice = agnosai_otlp_exporter_new(0, str_from("agnosai"), 30);
+    agnosai_otlp_exporter_start(twice);
+    agnosai_otlp_exporter_start(twice);
+    assert_eq(_t_threads(), before_bg + 1, "starting twice starts one thread");
+    agnosai_otlp_exporter_stop(twice);
+    assert_eq(_t_threads(), before_bg, "and stopping it leaves none");
 
     # --- 2.1.6: a POST is bounded, in memory and in time --------------------
     # Through 2.1.5 every POST went through the bare `sandhi_http_post`: its URL,
@@ -809,6 +869,7 @@ fn main(): i64 {
     assert_eq(agnosai_otlp_exporter_url(agnosai_otlp_exporter_new_traces(0, str_from("agnosai"), 1000)), 0,
       "and a traces exporter with no URL posts nowhere");
 
+    _t_http_server_span();
     return assert_summary();
 }
 

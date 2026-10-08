@@ -272,14 +272,6 @@ var AGNOSAI_F_SETFL = 4;
 # turn.
 var AGNOSAI_SPAWN_EPIPE = 32;
 
-# `rt_sigaction`'s syscall number, and the two dispositions this module sets.
-#
-# `lib/syscalls.cyr` exposes `signal_ignore` but no way back to the default, and
-# the child needs the way back — see `_agnosai_signal_default`. Filed upstream;
-# the constant is local until that lands.
-var AGNOSAI_SPAWN_SIG_DFL = 0;
-var AGNOSAI_SPAWN_SIGACTION_SIZE = 32;
-
 # How much is read per drain iteration.
 var AGNOSAI_SPAWN_CHUNK = 4096;
 
@@ -502,39 +494,6 @@ fn _agnosai_spawn_setup_failure(pipes, n): i64 {
     return _agnosai_spawn_failure();
 }
 
-# Set a signal's disposition back to `SIG_DFL`.
-#
-# The counterpart to `lib/syscalls.cyr`'s `signal_ignore`, which the stdlib does
-# not ship — filed upstream, local until it lands.
-#
-# **It exists because ignoring a signal is inherited across `execve`, and a
-# handler is not.** `SIG_IGN` for `SIGPIPE` is the right disposition for the
-# server and the wrong one for a sandboxed tool: the oracle's children get the
-# default, because `std::process::Command` restores it in the child before exec
-# (Rust installs the process-wide `SIG_IGN` at startup for the same reason
-# agnosai installs it here). Without this, a tool running `cmd | head` would see
-# `write` return `EPIPE` where the same tool under the oracle dies on the
-# signal, and the difference is silent.
-fn _agnosai_signal_default(signum): i64 {
-    #ifdef CYRIUS_TARGET_LINUX
-    var act[32];
-    var ap = &act;
-    var i = 0;
-    while (i < AGNOSAI_SPAWN_SIGACTION_SIZE) {
-        store8(ap + i, 0);
-        i = i + 1;
-    }
-    store64(ap, AGNOSAI_SPAWN_SIG_DFL);
-    #ifdef CYRIUS_ARCH_X86
-    return syscall(13, signum, ap, 0, 8);
-    #endif
-    #ifdef CYRIUS_ARCH_AARCH64
-    return syscall(134, signum, ap, 0, 8);
-    #endif
-    #endif
-    return 0;
-}
-
 # Run `path` with `argv` and `envp`, capturing stdout and stderr separately.
 #
 # `argv` and `envp` are NULL-terminated arrays of cstring pointers;
@@ -624,10 +583,14 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
         if (owf != 1) { sys_close(owf); }
         if (ewf != 2) { sys_close(ewf); }
         # And hand the child back the *default* `SIGPIPE`, which the parent just
-        # turned off for itself. `SIG_IGN` survives `execve`; the oracle's
-        # children do not inherit it, because `Command` restores the default in
-        # the child. See `_agnosai_signal_default`.
-        _agnosai_signal_default(Signal.SIGPIPE);
+        # turned off for itself. `SIG_IGN` survives `execve` and a handler does
+        # not; the oracle's children do not inherit it, because `Command` restores
+        # the default in the child. Without this a tool running `cmd | head` would
+        # see `write` return `EPIPE` where the same tool under the oracle dies on
+        # the signal, silently. `signal_default` is the stdlib's since cyrius
+        # 6.5.7 (filed from here); the local copy this called until 2.1.7 is gone
+        # (roadmap C2).
+        signal_default(Signal.SIGPIPE);
         # `work_dir` is applied HERE and not in the parent: a parent-side chdir
         # would move the whole server, every later relative path with it. A
         # failure must not fall through to `execve` — running the child in the

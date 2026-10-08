@@ -9,9 +9,11 @@ AgnosAI exposes a REST API from the `agnosai` binary, served by
 
 ## Endpoints
 
-⚠ This table listed **6** of the **18** routes the router serves. The rest were
+⚠ This table listed **6** of the **19** routes the router serves. The rest were
 undocumented, and `/api/v1/crews/{id}` was marked "(placeholder)" long after it
-started returning real state.
+started returning real state. Until 2.1.7 it still named 18: it listed a `GET`
+on `/api/v1/tools/{name}`, which the router has never served (it is `DELETE`, as
+in the oracle), and left out `GET /api/v1/approvals`.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
@@ -25,10 +27,11 @@ started returning real state.
 | GET | `/api/v1/agents/definitions` | yes | List agent definitions |
 | POST | `/api/v1/agents/definitions` | yes | Register an agent definition |
 | GET | `/api/v1/tools` | yes | List registered tools |
-| GET | `/api/v1/tools/{name}` | yes | One tool's schema |
+| DELETE | `/api/v1/tools/{name}` | yes | Unregister a tool |
 | GET | `/api/v1/presets` | yes | List presets |
 | GET | `/api/v1/dashboard/crews` | yes | Crew history |
 | GET | `/api/v1/dashboard/agents` | yes | Per-agent performance |
+| GET | `/api/v1/approvals` | yes | Pending human-in-the-loop decisions |
 | POST | `/api/v1/approvals` | yes | Submit a human-in-the-loop decision |
 | POST | `/api/v1/a2a/receive` | yes | Accept a delegated task |
 | POST | `/api/v1/a2a/status` | yes | A2A status |
@@ -37,6 +40,10 @@ started returning real state.
 The three probes are the only unauthenticated routes, and the allow-list is
 written that way deliberately — a route added without thought defaults to
 **protected**.
+
+A path in this table requested with another method is **405**, with an `Allow`
+header naming the methods it takes (`Allow: GET, POST` for the definitions
+route; since 2.1.7). A path not in it is 404.
 
 ## Rate limiting
 
@@ -78,6 +85,13 @@ honoured). The spans follow the OTel GenAI semantic conventions, pinned at
 
 Within a crew they form one trace: each task is the workflow's child, and each
 inference is its task's child.
+
+agnosai's own server records no span per HTTP request (roadmap B7). A program
+that embeds agnosai and serves its own HTTP can record one through the same
+exporter: `agnosai_http_server_span_a` builds a SERVER span named
+`<method> <route>` with the HTTP semantic-convention attributes, and
+`agnosai_telemetry_record_span_in` records it
+([ADR 024](../adr/024-an-embedding-consumer-records-http-server-spans.md)).
 
 **A W3C `traceparent` header joins the caller's trace** on the three routes
 that start traced work:
@@ -430,15 +444,20 @@ List all registered tools with their schemas.
 
 ### GET /api/v1/presets
 
-List available crew presets.
+List the built-in crew presets: the 18 documents compiled from `src/presets/`, each with its
+agents rendered as an agent definition is.
 
 **Response (200 OK):**
 
 ```json
-[]
+[
+  {"name": "quality-lean", "description": "…", "domain": "quality", "size": "lean",
+   "version": "…", "agents": [{"agent_key": "…", "name": "…", "role": "…", "goal": "…"}]}
+]
 ```
 
-Currently returns an empty array. The preset library endpoint is on the roadmap.
+(Until the 2.1.7 docs sweep this page said the endpoint returned `[]` and was "on the
+roadmap"; it has served the library since the preset port.)
 
 ---
 

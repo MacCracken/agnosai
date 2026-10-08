@@ -139,3 +139,6 @@ Everything above holds except the one table row corrected in place.
   header is wrong, not this ADR.)
 - **The off path costs no syscalls.** `agnosai_telemetry_record_span` returns 0
   before allocating anything when the exporter is 0.
+
+*Note, 2026-10-07 (2.1.7):* the roadmap's *Out of scope for v2.0* section, cited twice above, is
+now *Out of scope*, and what it owned for tracing is under *Owed to the ecosystem* there.

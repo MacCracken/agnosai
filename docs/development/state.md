@@ -2,9 +2,25 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-10-04 (the 2.1.6 release gate).
+> Last refreshed: 2026-10-08 (the 2.1.7 release gate).
 
-## Now — 2.1.6
+## Now — 2.1.7
+
+| | |
+|---|---|
+| **version** | **2.1.7** (cut 2026-10-08): owed roadmap work and one addition, with no toolchain or dependency change — an HTTP server span an embedding consumer records through agnosai's exporter (ADR 024), `Allow` on a 405 (B8), `/mcp` `tools/call` of a tool that answers no output (B15), the OTLP exporter thread joined at stop (B15), 17 log lengths (B28), one whole-file reader (B19), the stdlib's `signal_default` (C2), and B26 explained |
+| **cyrius pin** | **6.6.14** — unchanged; the move to 6.6.15 is on hold (no lower-lib re-releases for now) |
+| **tests** | **99 suites, 8,679 assertions, 0 failed** in a plain shell with wasmtime 49.0.2 present. 2.1.6's tree, run in the same shell the same day, reads 8,617 (8,611 at its cut: `sandbox_spawn` and `sandbox_process` count environment variables), so the +62 are 2.1.7's tests: `telemetry_otlp` +28 (the HTTP span and its accessors, the exporter thread), `server_router` +27 (`Allow`), `server_serve` +4, `server_routes_mcp` +3 |
+| **coverage** | **99%**: 102/102 files, 1,635/1,647 fns (gate `--min 80`); the 12 unreferenced are the same 12 as at 2.1.5 |
+| **dist** | `dist/agnosai.cyr` **39,541** lines + `dist/agnosai-guard.cyr` 915, both v2.1.7 (2.1.6: 39,324 / 915); `distlib --all --check` current, and a `check-clean.sh` gate since 2.1.7 (B24) |
+| **binary** | `build/agnosai` **5,253,128 B** (2.1.6: 5,248,824); aarch64 **6,489,640 B** (6,489,432), the same with or without `CYRIUS_DCE=1`. Both answer `GET /ready` with `"version":"2.1.7"`, the aarch64 one natively on the Pi; a 405 carries `Allow`; SIGTERM shuts it down gracefully. The aarch64 file grows in 64 KiB steps (CHANGELOG 2.1.7 *Verified*, B26): 55,624 B of text remain before the next |
+| **lock** | `cyrius.lock` byte-identical to 2.1.6's: no dependency or toolchain change |
+| **gates** | `cyrius lib sync --full` (112 files) → `deps` → `check-symbols.sh` (2,785 definitions, both targets) → `check-clean.sh` (fmt 224, lint 125, doc 114, doctest 1 files; `deps --verify` 118; lib snapshot 112; log lengths; dist) → build → test → coverage → `distlib --all --check` → examples (1) → fuzz 4/4 → `cyrius bench` (11 files, 223 benchmarks), then the sibling-free, empty-cache replica: all green. ⚠ The lint loop does not cover `tests/` (B31) |
+| **benchmarks** | `bench-history.csv` has 223 rows at 2.1.7, one unpinned sweep at a 1-minute load of 1–2: median +1.1% against 2.1.6, 209 of 223 within ±5%. The six rows past ±10% were re-run interleaved against a 2.1.6 build: four are flat, `default_model_premium` is code placement, `crew_runner_10_tasks_parallel_4_quiet` is B27 (CHANGELOG 2.1.7 *Performance*) |
+| **build warnings** | `build/agnosai`: toolchain notes only, the same four lines as 2.1.6. The full test log carries **no** `undefined function` line (23 at 2.1.6; B19) |
+| **consumer** | agnostic 0.1.15 (pinned to 2.1.6): all 32 suites pass against this tree through a replica-only `path`, 2,701 assertions, each suite's count as against 2.1.6. It adopts ADR 024's span at its re-pin to 2.1.7 |
+
+### 2.1.6 — the release (2026-10-04)
 
 | | |
 |---|---|
