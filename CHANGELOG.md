@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every agent cost 16 B on the global heap, even one built in an arena.**
+  `agnosai_default_complexity()` returned a new `str_from("medium")` per call, and
+  `agnosai_agent_new_a` stores it in every agent it builds — so the `_a` constructor allocated
+  outside its allocator. The default is interned at load now; its readers only compare or parse
+  it. Found by agnostic 0.1.17, whose crew door checks a body without building anything.
+  `tests/core_agent.tcyr` (+3): `agnosai_agent_new_a` in an arena keeps 0 B, and the default is
+  one shared Str; with the per-call `str_from` back, both fail by name.
+
 ## [2.1.7] — 2026-10-08
 
 Owed work from the roadmap, with no toolchain or dependency change (cyrius 6.6.14, the same six
