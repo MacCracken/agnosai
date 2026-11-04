@@ -7,8 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.8] — 2026-11-04
+
+Cyrius **6.6.20**, and every `[deps.*]` tag moved to its release on the 6.6.20 line. sigil is
+declared at the 6.6.20 fold, so every commit pin in the lock names the code `lib/` holds. This is
+the pin move the roadmap has carried since 2.1.5 (*Moving the cyrius pin to 6.6.15*). The siblings
+it waited on (kavach and libro, then bote) all have releases on 6.6.20, so no override pin was
+needed. Two fixes ride along: a 2.1.7 regression in four startup log lines, and the arena leak
+agnostic 0.1.17 found. `rust-old/` is still present: like 2.1.1 through 2.1.7, this patch does not
+carry the deletion the 2.1.0 notes schedule.
+
+⚠ **Wire-visible**, from the toolchain: the server answers **408** to a connection that has not sent
+a complete request within 60 s of accept (below).
+
+### Changed
+
+- **Cyrius pin `6.6.14` → `6.6.20`.** The re-provisioned `lib/` (113 files; `poison.cyr` is new)
+  moves the folds sandhi 1.10.4 → 1.10.8, sakshi 2.5.6 → 2.5.7, patra 1.15.1 → 1.15.2, sigil
+  3.13.7 → 3.13.10, sankoch 2.8.0 → 2.8.1 and bayan 1.5.11 → 1.5.12. Every snapshot file is
+  byte-identical to `git show 6.6.20:lib/<mod>`. No compiler fix in 6.6.15–6.6.20 changes code
+  agnosai compiles: none of the miscompiled patterns (`continue` three loops deep, `*T` stepping in
+  an inlined or generic fn, a `: f64` early return, a redefined fn, struct operands) occurs in
+  `src/`, and nothing in `src/` uses a newly reserved name or a `#define`. What reaches agnosai is
+  in the stdlib, each item traced to the call that reaches it:
+  - ⚠ **A 60 s whole-request budget on the server** (sandhi 1.10.7, a Slowloris bound).
+    `agnosai_serve_options` (`src/server/serve.cyr:747`) sets no `request_ms`, so sandhi's default
+    applies. From accept to a complete request, a connection gets 60 s. Past it, the server answers
+    408 and closes the connection. Handler time is not counted. With the 10 MiB body cap, a full-size
+    body must arrive at about 175 KB/s or faster.
+  - **The pooled server and SSE no longer risk a channel deadlock** (6.6.16). The Linux channel
+    woke one waiter per operation from a shared futex word, possibly the wrong kind. One producer
+    feeding consumers through a cap-1 channel is the shape of `sandhi_server_run_pooled`, which
+    agnosai runs with 100 workers, and it hung on a Pi. A receiver could also sleep through
+    `chan_close` for good, the shape of `src/server/sse.cyr:180`'s `chan_recv`. The channel is an
+    eventcount now.
+  - **Outbound TLS** (hoosh, the OTLP exporter, the remote registry, the AGNOS and security-audit
+    tools; agnosai's own server is plaintext):
+    - the HMAC and HKDF state and inner hash are wiped (sigil 3.13.8, CVE-68 B). The ECDSA signers
+      are now constant-time (CVE-68 A), which agnosai does not reach: it holds no client
+      certificate;
+    - ephemeral keys and shared secrets are zeroised (CVE-70), and an all-zero x25519 result is
+      refused (CVE-71);
+    - CVE-69's `secret var` epilogue fix now covers every handshake, because the ephemeral key
+      generation is a `secret var` since 6.6.15 (6.6.14's native TLS had none);
+    - a CA's extendedKeyUsage is checked at every depth (CVE-75), and an Ed25519 signature must be
+      64 bytes from an Ed25519 leaf;
+    - the ClientHello offers secp256r1 and secp384r1 beside x25519;
+    - the client framing is fixed for agnosai's `sandhi_http_{get,post}_opts_a` and
+      `sandhi_http_request_auto_a` calls: a body shorter than
+      its `Content-Length` is a protocol error, a `Connection: close` body is not cut at a NUL, and
+      HEAD / 204 / 304 are framed.
+
+    The roadmap's 6.6.15 section reads the sigil items against this tree.
+  - **`lib/hashmap.cyr` counts tombstones and rebuilds in place** (6.6.20). A map under delete and
+    insert churn turned every miss into a full-table scan. The crew-retention eviction
+    (`src/orchestrator/orchestrator.cyr:188`) and the rate limiter's stale-key sweep (through
+    majra) are that shape. Every map's entry table is 8 B larger. The header and the 24-byte slot
+    that `src/core/json.cyr`'s slot walker reads are unchanged.
+  - **`fmt_int_buf` writes exactly its length** (CVE-78). `_agnosai_pricing_field`
+    (`src/fleet/cost_planning.cyr:120`) formats a GPU rate into a 32-byte stack buffer. On 6.6.14
+    the fraction's `fmt_int_buf` always wrote 24 bytes, so a rate of $10,000,000/h or more overran
+    it. On 6.6.20 two decimals write at most 24 bytes, whatever the rate.
+  - **`file_write_atomic` opens its temp file `O_EXCL | O_NOFOLLOW`** (CVE-100), so a symlink
+    planted at the predictable temp name cannot redirect durable state's write
+    (`src/orchestrator/durable_state.cyr:421`).
+- **Every `[deps.*]` tag moves to its 6.6.20 release:**
+
+  | dep | from | to | what changes in the bundle agnosai vendors |
+  |---|---|---|---|
+  | `sigil` | 3.13.7 | **3.13.10** | the 6.6.20 fold: `dist/sigil.cyr` is byte-identical to `git show 6.6.20:lib/sigil.cyr`. 3.13.8 and 3.13.9 carry the fixes above; 3.13.10 is packaging only |
+  | `bote` | 3.3.16 | **3.3.17** | the version header, `_bote_server_version()` and a `# Requires` block; `src/` calls no bote function |
+  | `majra` | 2.9.2 | **2.9.3** | a `# Requires` block and comments on 6.6.20's hashmap; no code |
+  | `kavach` | 3.13.2 | **3.13.3** | a `# Requires` block and four explicit includes; no code |
+  | `ai-hwaccel` | 2.4.1 | **2.4.2** | a `# Requires` block; no code |
+  | `tyche` | 1.1.0 | **1.1.1** | the version header only |
+
+  Transitively through bote, libro moves 2.10.6 → **2.10.8**, adding patrastore's handle guards;
+  `src/` calls no libro function. Every dep's own pins name the 6.6.20 folds:
+  - kavach 3.13.3 and libro 2.10.8 declare sigil 3.13.10;
+  - libro 2.10.8 declares patra 1.15.2;
+  - ai-hwaccel 2.4.2 and samay 1.1.7 declare bayan 1.5.12.
+
+  These are each repo's release on the 6.6.20 line, not its latest tag: every one has newer tags on
+  cyrius 6.7.x.
+- **`cyrius.lock` was regenerated from empty: 119 files, 8 commit pins.** `lib sync` carries commit
+  pins forward by design, so re-resolving over 2.1.7's lock kept each old tag's pin beside the new
+  one (16 pins, 8 of them naming code nothing vendors). The fix was to remove `lib/` and the lock,
+  then run `lib sync --full` + `deps`. That gives the same 119 file rows and only the current pins.
+  The new lock lists its pins sorted by name; 2.1.7's listed them in manifest order.
+- **`dist/agnosai.deps` lists 7 stdlib leaves, down from 45, and `dist/agnosai-guard.deps` 1, down
+  from 6.** cyrius 6.6.18's `distlib` publishes only the leaves its compile-verify proves the
+  bundle needs. Every bundle now opens with a matching `# Requires` include block, so the bundle
+  includes those leaves itself. ⚠ **For a consumer:** a stdlib leaf your own code uses, which you
+  got only through agnosai's sidecar, now has to be in your own `[deps] stdlib`. A failed build
+  names the leaf (cyrius 6.6.18's hint). agnostic (pinned to 2.1.7) and thoth (the guard profile)
+  meet this at their re-pin.
+
 ### Fixed
 
+- **Four startup warnings logged a NUL and two bytes of the next literal**, a 2.1.7 regression.
+  `scripts/check-log-lengths.py` measured a literal as `literal.encode().decode("unicode_escape")
+  .encode("utf-8")`, which reads the UTF-8 bytes as Latin-1 and encodes each one again. So every
+  non-ASCII byte counted twice, and a `—` (3 bytes) read as 6. 2.1.7's B28 pass set four
+  `src/main.cyr` warnings, each with one `—`, to that count: 3 bytes past the literal. Three of them
+  had been right at 2.1.6, and the fourth was 2 bytes short. On every default start the server logged
+  `"authentication disabled — set AGNOSAI_AUTH_ENABLED=true for production\u0000li"`.
+  - The checker now measures with `codecs.escape_decode` on the UTF-8 bytes.
+  - Before it scans, it runs a self-test of seven literals with known byte counts (ASCII, `—`, `é`,
+    `\n`, `\0`, `\"`, `\\`), and it refuses to judge any file if one fails. With the old `byte_len`
+    put back, the self-test fails by name.
+  - The four lengths are 82, 70, 72 and 67 (`src/main.cyr:215`, `:381`, `:386`, `:415`).
+
+  Found by this release's smoke test of the binary. Three of the four were triggered from the
+  environment (auth off; auth on with no secret; a JWT key that does not decode), and each now logs
+  its message whole. The fourth (signal handlers not installed) cannot be triggered from outside;
+  the checker covers it. agnostic's copy of the script, which this one was adopted from, has the
+  same `byte_len`.
+- **The one new warning 6.6.20 printed: `src/server/routes/a2a.cyr:245`, "assigning non-pointer to
+  typed pointer".** `agnosai_error_message` builds and returns a `Str` but was declared `: i64`, and
+  6.6.20 types `var why = str_from_a(..)` before reassigning it. It is declared `: Str` now, like
+  the other 69 Str-returning functions in `src/`. Its three callers pass the result on unchanged.
+  The build prints only the same toolchain notes as 2.1.7.
 - **Every agent cost 16 B on the global heap, even one built in an arena.**
   `agnosai_default_complexity()` returned a new `str_from("medium")` per call, and
   `agnosai_agent_new_a` stores it in every agent it builds — so the `_a` constructor allocated
@@ -16,6 +135,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. Found by agnostic 0.1.17, whose crew door checks a body without building anything.
   `tests/core_agent.tcyr` (+3): `agnosai_agent_new_a` in an arena keeps 0 B, and the default is
   one shared Str; with the per-call `str_from` back, both fail by name.
+
+### Performance
+
+**Channel-bound paths are 1.2x to 6x faster, and everything else is flat.** Other sessions held this
+host at a 1-minute load of 3–7 throughout, so a single sweep was not trusted. Instead every
+`benches/*.bcyr` was built twice: from the 2.1.7 tag on cyrius 6.6.14, and from this tree on 6.6.20.
+The two binaries ran interleaved, alternating which went first: 3 rounds of all eleven files, then
+5 more of `order`, `tools`, `llm` and `orch`. Medians:
+
+- **All 223 benchmarks: median +0.0%, 179 within ±5%.** The four re-run files: median +0.2%.
+- **Faster: every row that moves events through a channel** (6.6.16 made the channel an
+  eventcount, so an uncontended send or receive makes no syscall): the event bus
+  (`src/server/sse.cyr`), pub/sub (`src/orchestrator/pubsub.cyr`), the fleet relay and the approval
+  queue:
+
+  | benchmark | 2.1.7 | 2.1.8 | change |
+  |---|---|---|---|
+  | `event_round_trip_1_sub` | 977 ns | 203 ns | −79% |
+  | `event_fanout_64_subs` | 58.7 µs | 9.6 µs | −84% |
+  | `event_send_evicting` | 1,025 ns | 256 ns | −75% |
+  | `pubsub_publish_100_subs` | 81.5 µs | 20.5 µs | −75% |
+  | `pubsub_publish_10_subs` | 13.0 µs | 5.3 µs | −59% |
+  | `pubsub_publish_1_sub` | 3,146 ns | 2,387 ns | −24% |
+  | `approval_request_cancel_512_pending` | 26.0 µs | 10.8 µs | −59% |
+  | `approval_submit_decision` | 2,402 ns | 1,909 ns | −21% |
+  | `relay_send_1_sub_drained` | 2,775 ns | 1,955 ns | −30% |
+
+- `crew_runner_10_tasks_parallel_4_{quiet,watched}` read −25% / −26% (578 → 433 µs). The runner
+  itself makes no channel call, and roadmap B27 records that this row measures where the preceding
+  benchmarks leave the global heap. So the drop is not claimed as a runner win.
+- **Slower:** `agnos_form_encode_52b`, 1,180 → 1,357 ns (+15%, five tight rounds a side). The
+  encoder and the `str_builder_*` calls it makes are byte-identical in both trees, so this is the
+  compiler's code for its per-byte branch chain. It runs once per `mneme_search` query.
+- **Placement, not claimed either way:** `default_model_premium` +38% (39 → 54 ns),
+  `default_model_capable` −23% (48 → 37 ns), `default_model_fast` +10%. All three are one
+  two-line `str_from` of a literal, unchanged, moving in opposite directions, the same pair 2.1.7
+  saw swap with no source change.
+- **Noise:** the first round's large readings for the `order` sorts (+24–33%),
+  `tool_registry_has_50_miss` (+42%) and `relay_send_no_subs` (+15%) did not survive. Both sides
+  were bimodal under the load, and the five-round medians read +1.8% / +0.9%, +0.0% and +1.4%.
+  `lt_aggregate_100k_500workers` (B18) reads 49.3 → 47.3 ms.
+- `bench-history.csv` gains 223 rows at 2.1.8 from one unpinned `bench-history.sh` sweep at a load
+  of 4–5. Against 2.1.7's rows, which were taken at a load of 1–2, they read median +3.4%. The
+  same-box A/B above says that gap is the load.
+
+### Verified
+
+- **The gate**, in CI's order: `cyrius lib sync --full` (113 files) → `deps` (119 locked, 8 commit
+  pins) → `check-symbols.sh` (2,786 definitions, both targets) → `check-clean.sh` (fmt 224, lint
+  125, doc 114, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths, self-tested; dist)
+  → build → **99 suites, 8,704 assertions, 0 failed** → coverage 99% (1,635/1,647 fns) →
+  `distlib --all --check` → examples → fuzz 4/4 → `cyrius bench` (11 files, 223 benchmarks). The full
+  test log has no `undefined function` line. `check-clean.sh` was run again after the log-length fix.
+- **Assertion counts are unchanged by the move.** 2.1.7's tree, run in the same shell the same day
+  on its own pin, reads 8,701. Suite by suite, the only difference is `core_agent` +3, the arena
+  fix's tests.
+- **The binaries.** Native **5,337,008 B** (2.1.7: 5,253,128, which a rebuild of the tag on 6.6.14
+  reproduces to the byte; text +81,312 B, data +1,960 B). aarch64 **6,032,848 B** (6,489,640):
+  its text is 419,552 B smaller. That comes from 6.6.18's ESYSXLAT fold, which stopped every aarch64
+  `syscall(N, …)` site from inlining the ~1.2 KB x86 → aarch64 translation chain. `CYRIUS_DCE=1`
+  gives the same size. Both answer `GET /ready` with `"version":"2.1.8"`, the aarch64 one natively
+  on a Raspberry Pi 4. A `DELETE /health` is a 405 with `Allow: GET`, SIGTERM shuts down
+  gracefully, and no startup line carries a NUL.
+- **Every dep tag exists on GitHub** (`git ls-remote`) at the commit its local tag names. The fold
+  modules were hashed against the cyrius tag: `dist/sigil.cyr` at 3.13.10 and `dist/patra.cyr` at
+  1.15.2 are byte-identical to `git show 6.6.20:lib/sigil.cyr` / `lib/patra.cyr`.
+- **Certified the CI way.** The replica had no sibling checkouts and an empty dep cache, on 6.6.20
+  (`SOURCE_COMMIT` `ae682e23`, `tree-matches-tag: yes`). There, `lib sync --full` + `deps` reproduced
+  `lib/` and `cyrius.lock` byte for byte (8 commit pins, the lock equal to the committed one). The
+  symbol check, cleanliness, both builds (each byte-identical to the working tree's),
+  `distlib --all --check` and the example passed there, with nothing left dirty. Only
+  `CHANGELOG.md`, `roadmap.md` and `state.md` changed after it.
 
 ## [2.1.7] — 2026-10-08
 

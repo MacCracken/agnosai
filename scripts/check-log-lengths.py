@@ -14,10 +14,12 @@ it. Both ways of getting it wrong fail SILENTLY:
 Neither is a compile error, neither is a lint warning, and neither fails a test:
 the suites check what handlers return, not what they log. Adopted verbatim from
 agnostic (its `scripts/check-log-lengths.py`) at 2.1.7, roadmap B28, which found
-17 such literals in this tree; `scripts/check-clean.sh` runs it.
+17 such literals in this tree; `scripts/check-clean.sh` runs it. Its byte count
+double-counted every non-ASCII byte until 2.1.8; see `byte_len`.
 
 Exits non-zero on any mismatch. Run from the repo root.
 """
+import codecs
 import glob
 import re
 import sys
@@ -40,8 +42,38 @@ SAKSHI_KV = re.compile(
 
 
 def byte_len(literal):
-    """The length sakshi is actually handed: bytes, after resolving escapes."""
-    return len(literal.encode().decode("unicode_escape").encode("utf-8"))
+    """The length sakshi is actually handed: bytes, after resolving escapes.
+
+    `codecs.escape_decode` works on the UTF-8 BYTES: it resolves `\\n`, `\\0`,
+    `\\\\`, `\\"` and the rest and leaves every other byte as it is. The form this
+    replaced, `literal.encode().decode("unicode_escape").encode("utf-8")`, decoded
+    those bytes as Latin-1 and re-encoded each one as UTF-8, so every non-ASCII
+    byte counted twice and a `—` (3 bytes) read as 6. Through 2.1.7 the gate
+    passed four `src/main.cyr` warnings that overran by 3 bytes, a NUL and two
+    bytes of the next literal, because B28 had set them to that count (2.1.8).
+    """
+    return len(codecs.escape_decode(literal.encode("utf-8"))[0])
+
+
+# Known byte counts, checked before any file is scanned: a checker that mismeasures
+# passes every literal sized by its own count. Each pair is (literal as written in
+# source, bytes sakshi is handed).
+SELF_TEST = [
+    ("plain ascii", 11),
+    ("a — b", 7),                  # an em dash is 3 bytes
+    ("café", 5),                   # a 2-byte character
+    ("line\\n", 5),                     # \n is one byte
+    ("nul\\0", 4),                      # \0 is one byte
+    ("q\\\"q", 3),                      # \" is one byte
+    ("back\\\\slash", 10),              # \\ is one byte
+]
+
+
+def self_test():
+    wrong = [(lit, want, byte_len(lit)) for lit, want in SELF_TEST if byte_len(lit) != want]
+    for lit, want, got in wrong:
+        print("    self-test: %r is %d bytes, byte_len says %d" % (lit, want, got))
+    return not wrong
 
 
 def line_of(text, pos):
@@ -80,8 +112,11 @@ def check(path, bad):
 
 
 def main():
+    if not self_test():
+        print("error: byte_len mismeasures a known literal, so no length here can be trusted.")
+        return 1
     bad = []
-    paths = (sorted(glob.glob("src/**/*.cyr", recursive=True))
+    paths =(sorted(glob.glob("src/**/*.cyr", recursive=True))
              + sorted(glob.glob("tests/*.tcyr"))
              + sorted(glob.glob("benches/*.bcyr")))
     for p in paths:

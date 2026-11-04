@@ -2,9 +2,32 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-10-08 (the 2.1.7 release gate).
+> Last refreshed: 2026-11-04 (the 2.1.8 release gate).
 
-## Now — 2.1.7
+## Now — 2.1.8
+
+| | |
+|---|---|
+| **version** | **2.1.8** (cut 2026-11-04): cyrius 6.6.14 → **6.6.20**, with every `[deps.*]` tag on its 6.6.20 release; a 2.1.7 regression fixed (four startup warnings 3 bytes long, and the log-length checker that passed them); the 16 B arena leak in `agnosai_agent_new_a` agnostic 0.1.17 found |
+| **cyrius pin** | **6.6.20** (`~/.cyrius/versions/6.6.20` `SOURCE_COMMIT` `ae682e23`, `tree-matches-tag: yes`). The user's chosen target: cyrius has tagged 6.7.x since (6.7.18 seen 2026-11-04), and every dep has newer 6.7-line tags |
+| **tests** | **99 suites, 8,704 assertions, 0 failed** with wasmtime 50.0.1 present. 2.1.7's tree, run in the same shell the same day on its own pin (6.6.14), reads 8,701, and every suite's count is the same except `core_agent` +3, the arena fix's tests. So the move changes no assertion count |
+| **coverage** | **99%**: 102/102 files, 1,635/1,647 fns (gate `--min 80`); the same 12 unreferenced |
+| **dist** | `dist/agnosai.cyr` 39,894 lines + `dist/agnosai-guard.cyr` 941 (`wc -l`), both v2.1.8. Each now opens with a `# Requires` block (cyrius 6.6.18), and the sidecars list **7 / 1** stdlib leaves (2.1.7: 45 / 6) — see CHANGELOG 2.1.8 for what that asks of a consumer |
+| **binary** | `build/agnosai` **5,337,008 B** (2.1.7: 5,253,128; text +81,312, data +1,960, all toolchain and stdlib); aarch64 **6,032,848 B** (2.1.7: 6,489,640), the same with `CYRIUS_DCE=1`. Both answer `GET /ready` with `"version":"2.1.8"`, the aarch64 one natively on the Pi; a 405 carries `Allow`; SIGTERM shuts down gracefully; no startup line carries a NUL |
+| **lock** | `cyrius.lock` **119 files, 8 commit pins**, regenerated from empty (a re-resolve over 2.1.7's lock kept the old tags' pins beside the new: roadmap, *Recorded by cyrius 6.6.17*) |
+| **gates** | `cyrius lib sync --full` (113 files) → `deps` → `check-symbols.sh` (2,786 definitions, both targets) → `check-clean.sh` (fmt 224, lint 125, doc 114, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths, now self-tested; dist) → build → test → coverage → `distlib --all --check` → examples (1) → fuzz 4/4, then the benchmarks and the sibling-free, empty-cache replica (CHANGELOG 2.1.8 *Verified*) |
+| **benchmarks** | `bench-history.csv` has 223 rows at 2.1.8, one unpinned sweep at a load of 4–5 (other sessions): median +3.4% against 2.1.7's rows, which were taken at a load of 1–2. The same-box interleaved A/B against a 2.1.7 build (3 rounds of all eleven files, then 5 of four) reads **median +0.0%**, 179 of 223 within ±5%. The channel paths (event bus, pub/sub, relay, approval) are 1.2x to 6x faster, from 6.6.16's eventcount channel. `agnos_form_encode_52b` is +15%, the compiler's code with identical source. The `default_model_*` rows swap again, which is placement (CHANGELOG 2.1.8 *Performance*) |
+| **build warnings** | `build/agnosai`: toolchain notes only, the same set as 2.1.7 rebuilt on 6.6.14 (sigil's static array, large static data, the two "refusing to overwrite stdlib leaf" lines, the DCE note). 6.6.20 printed one more, `src/server/routes/a2a.cyr:245`, fixed |
+| **consumer** | Not re-run against this tree. agnostic pins cyrius 6.6.14 and agnosai 2.1.7; thoth pins cyrius 6.6.6. Both meet the smaller sidecars at their re-pin |
+
+Direct deps (`[deps.*]`, all six), **none with an active `path`**: `sigil` **3.13.10** (= the 6.6.20
+fold, byte-identical), `bote` **3.3.17**, `majra` **2.9.3**, `kavach` **3.13.3**, `ai-hwaccel` **2.4.2**,
+`tyche` **1.1.1** — each repo's release on the 6.6.20 line, not its latest tag. Transitively through bote:
+libro **2.10.8**. Every dep's own pins name the 6.6.20 folds: kavach 3.13.3 and libro 2.10.8 declare sigil
+3.13.10, libro patra 1.15.2, ai-hwaccel 2.4.2 and samay 1.1.7 bayan 1.5.12. Every tag was confirmed on
+GitHub (`git ls-remote`) before the move.
+
+### 2.1.7 — the release (2026-10-08)
 
 | | |
 |---|---|
