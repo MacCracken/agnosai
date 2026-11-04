@@ -672,6 +672,34 @@ fn _b_rate_limit_sweep(keys, n): i64 {
     return 0;
 }
 
+# A sustained fresh-key spray through the REQUEST path at a strict rate (2.2.0, roadmap B4).
+#
+# The benchmarks above call `agnosai_rate_limit_check`, which never sweeps. This one goes
+# through `agnosai_rate_limit_check_request`, so each check pays its share of the sweep, and,
+# above `AGNOSAI_RL_MAX_KEYS`, of the least-recently-seen trim. At 1 req/s no sprayed bucket
+# refills, so the lossless rungs find nothing and the trim does all the work. The map is filled
+# past the cap first, so the timed loop runs in the over-cap steady state. Through 2.1.8 the map
+# grew without bound here, and every 256th check walked it whole.
+fn _b_rate_limit_spray_strict(n): i64 {
+    var lim = agnosai_rate_limit_new(1000, 2);
+    var seq = 0;
+    for (var i = 0; i < AGNOSAI_RL_MAX_KEYS + AGNOSAI_RL_SWEEP_EVERY; i = i + 1) {
+        agnosai_rate_limit_check_request(lim, str_from_int(seq));
+        seq = seq + 1;
+    }
+    var b = bench_new("rate_limit_spray_strict_rate");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var j = 0; j < n / _BR; j = j + 1) {
+            agnosai_rate_limit_check_request(lim, str_from_int(seq));
+            seq = seq + 1;
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     # Every route logs on at least one path, and `crew_runner` emits per task.
@@ -692,6 +720,7 @@ fn main(): i64 {
     _b_rate_limit_check_new_key(50000);
     _b_rate_limit_client_key(200000);
     _b_rate_limit_sweep(1000, 500);
+    _b_rate_limit_spray_strict(50000);
 
     _b_resolve("route_resolve", str_from("/api/v1/dashboard/crews"), 200000);
     _b_resolve("route_resolve_probe", str_from("/health"), 200000);

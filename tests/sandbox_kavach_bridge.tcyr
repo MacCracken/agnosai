@@ -368,11 +368,13 @@ fn _t_kv_result(): i64 {
 # which made the suite a test of the runner's coreutils as much as of the
 # bridge, and `ubuntu-latest` moving to 26.04 showed it. 26.04's coreutils are
 # uutils: one multicall binary, hardlinked under every name, that takes the
-# utility's name from the path it was executed by. kavach execs an absolute
-# program through the fd it pinned before the fork (`kv_exec_pinned`,
-# `execveat(AT_EMPTY_PATH)`), so that path is `/dev/fd/9`, and every command
+# utility's name from the path it was executed by. kavach 3.13.x execed an
+# absolute program through the fd it pinned before the fork with
+# `execveat(AT_EMPTY_PATH)`, so that path was `/dev/fd/9`, and every command
 # refused to start: "Requested utility `9` does not match executable name",
 # exit 1, no stdout. 33 assertions failed, and none of them was about agnosai.
+# (kavach 3.14.0, the pin since 2.2.0, execs `/proc/self/fd/N` first, which
+# uutils accept; `_t_kb_execute_runs_a_host_binary` pins that separately.)
 #
 # `/proc/self/exe` pins this very file, so the payload below runs under the
 # same fd exec, no_new_privs, landlock scopes and seccomp filter a real tool
@@ -432,6 +434,26 @@ fn _t_kb_execute_runs_a_command(): i64 {
       "...and the strength score for the policy that ran it");
     assert(agnosai_kavach_result_scan_verdict(r) == AGNOSAI_KAVACH_NO_VERDICT,
       "scan_verdict is None - kavach applies the gate internally (kavach_bridge.rs:146)");
+    return 0;
+}
+
+# The host's own `/bin/echo`, the one execution here that is NOT the payload.
+#
+# ⚠ **This is the production path the payload deliberately avoids.** A process-isolated tool
+# names a host program, and on Ubuntu 25.10+ that program is a uutils multicall binary. kavach
+# 3.13.x could not start any of them (see the payload's header), so every coreutils tool exited
+# 1 on such a host. kavach 3.14.0 execs the pinned fd as `/proc/self/fd/N`, which uutils accept.
+# On a GNU host this passes either way. On `ubuntu-latest` (26.04) it fails with kavach 3.13.x
+# back.
+fn _t_kb_execute_runs_a_host_binary(): i64 {
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_kavach_execute(str_from("/bin/echo host-binary"),
+      agnosai_sandbox_policy_process(), 0, &e);
+    assert(load64(&e) == 0, "the host's /bin/echo runs through the bridge");
+    assert(str_contains_cstr(agnosai_kavach_result_output(r), "host-binary") == 1,
+      "...and prints, whichever coreutils the host has");
+    assert(agnosai_kavach_result_exit_code(r) == 0, "...exiting 0");
     return 0;
 }
 
@@ -628,6 +650,7 @@ fn main(): i64 {
     # first call into the bridge; any earlier execute would have initialized it.
     _t_kb_execute_needs_no_explicit_init();
     _t_kb_execute_runs_a_command();
+    _t_kb_execute_runs_a_host_binary();
     _t_kb_execute_reports_the_exit_code();
     _t_kb_execute_honours_the_policy_deadline();
     _t_kb_execute_with_agent_id();

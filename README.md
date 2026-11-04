@@ -66,7 +66,7 @@ cyrius build src/main.cyr build/agnosai
 ./build/agnosai
 
 # Run every test suite (recursive)
-cyrius tests tests
+cyrius test tests
 
 # Benchmarks, and the 80% coverage gate
 cyrius bench
@@ -221,7 +221,7 @@ First-class multi-node support:
 ## Test Suite
 
 ```
-$ cyrius tests tests
+$ cyrius test tests
 ...
 99 passed, 0 failed
 ```

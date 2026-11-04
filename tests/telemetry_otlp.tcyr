@@ -37,9 +37,70 @@ include "tests/test_helpers.cyr"
 
 # The hex rendering of a trace id, on its own.
 
-# How many threads this process has: the entries of /proc/self/task (2.1.7).
-fn _t_threads(): i64 {
-    return vec_len(dir_list(str_from("/proc/self/task")));
+# How many of this process's threads are LIVE: the entries of /proc/self/task whose stat
+# flags lack PF_EXITING (0x4).
+#
+# ⚠ **Not the raw entry count, which 2.1.7 used and which races a correct join.** `thread_join`
+# returns once the kernel clears the thread's tid, which happens in `exit_mm`, partway through
+# `do_exit`. The task stays listed until `release_task`, at the end of the exit, and the exit in
+# between is preemptible. So under load a joined thread can still be listed when `stop` returns.
+# 2.2.0's full run, at a load average of 10, saw exactly that (got 2, expected 1). Alone, the suite
+# passed 6 runs of 6.
+#
+# PF_EXITING is set when `do_exit` begins, before `exit_mm`, so a listed thread past its join
+# always carries it. A thread that was never joined (B15's regression: detached, still sleeping
+# in its poll loop) does not. A thread gone between the listing and the read counts as not live.
+# A stat line this cannot parse counts as live, so a parse failure fails the assertion rather
+# than passing it.
+fn _t_live_threads(): i64 {
+    var names = dir_list(str_from("/proc/self/task"));
+    var live = 0;
+    var buf[512];
+    for (var i = 0; i < vec_len(names); i = i + 1) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "/proc/self/task/");
+        str_builder_add(sb, vec_get(names, i));
+        str_builder_add_cstr(sb, "/stat");
+        var n = file_read_all(str_cstr(str_builder_build(sb)), &buf, 511);
+        if (n > 0) {
+            # The fields after the LAST ')' (the comm may hold spaces and parens): state ppid
+            # pgrp session tty_nr tpgid flags, so flags is the 7th.
+            var q = n - 1;
+            while (q > 0) {
+                if (load8(&buf + q) == 41) { break; }
+                q = q - 1;
+            }
+            q = q + 1;
+            var tok = 0;
+            var flags = 0;
+            while (q < n) {
+                while (q < n) {
+                    if (load8(&buf + q) != 32) { break; }
+                    q = q + 1;
+                }
+                tok = tok + 1;
+                if (tok == 7) {
+                    while (q < n) {
+                        var c = load8(&buf + q);
+                        if (c < 48) { break; }
+                        if (c > 57) { break; }
+                        flags = flags * 10 + (c - 48);
+                        q = q + 1;
+                    }
+                    break;
+                }
+                while (q < n) {
+                    if (load8(&buf + q) == 32) { break; }
+                    q = q + 1;
+                }
+            }
+            if (tok < 7) { live = live + 1; }
+            if (tok >= 7) {
+                if ((flags & 4) == 0) { live = live + 1; }
+            }
+        }
+    }
+    return live;
 }
 
 fn _t_trace_hex(hi, lo): i64 {
@@ -681,11 +742,11 @@ fn main(): i64 {
     # this suite would wait a full interval for the stop to land, and
     # `syscall(60, ..)` exits one thread — a still-sleeping detached thread
     # holds the process open. That was measured at 1004 ms before slicing.
-    var before_bg = _t_threads();
+    var before_bg = _t_live_threads();
     var bg = agnosai_otlp_exporter_new(0, str_from("agnosai"), 30);
     agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(bg), tool, _t_ctx());
     agnosai_otlp_exporter_start(bg);
-    assert_eq(_t_threads(), before_bg + 1, "start runs one exporter thread");
+    assert_eq(_t_live_threads(), before_bg + 1, "start runs one exporter thread");
     sleep_ms(200);
     assert(agnosai_otlp_exporter_exported(bg) >= 1,
       "the background thread flushed the queued span on its own");
@@ -701,13 +762,13 @@ fn main(): i64 {
     assert_eq(agnosai_otlp_exporter_stopping(bg), 1, "and stops when asked");
     # ⭐ 2.1.7 (roadmap B15): and its thread is gone when `stop` returns. It was detached and
     # never joined, so it could outlive `main` and turn a failing suite's exit status into 0.
-    assert_eq(_t_threads(), before_bg, "⭐ no exporter thread is left once stop returns");
+    assert_eq(_t_live_threads(), before_bg, "⭐ no exporter thread is left once stop returns");
     var twice = agnosai_otlp_exporter_new(0, str_from("agnosai"), 30);
     agnosai_otlp_exporter_start(twice);
     agnosai_otlp_exporter_start(twice);
-    assert_eq(_t_threads(), before_bg + 1, "starting twice starts one thread");
+    assert_eq(_t_live_threads(), before_bg + 1, "starting twice starts one thread");
     agnosai_otlp_exporter_stop(twice);
-    assert_eq(_t_threads(), before_bg, "and stopping it leaves none");
+    assert_eq(_t_live_threads(), before_bg, "and stopping it leaves none");
 
     # --- 2.1.6: a POST is bounded, in memory and in time --------------------
     # Through 2.1.5 every POST went through the bare `sandhi_http_post`: its URL,

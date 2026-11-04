@@ -43,7 +43,7 @@ Auth is off unless `AGNOSAI_AUTH_ENABLED` is set — a shared secret via
 ## Run the tests
 
 ```sh
-cyrius tests tests            # every .tcyr, recursively
+cyrius test tests             # every .tcyr, recursively
 cyrius coverage --min 80      # the coverage gate
 ./scripts/check-clean.sh      # fmt, lint, doc, vet, deny, lock and lib-snapshot checks
 ```
@@ -85,7 +85,7 @@ binary registers none of them — a deployment opts in.
 1. Put the code in the module it belongs to under `src/` (the layout mirrors the
    original module tree), prefixing every public symbol `agnosai_`.
 2. Add a suite, or assertions to an existing one, under `tests/`.
-3. Run `cyrius tests tests` and `./scripts/check-clean.sh`.
+3. Run `cyrius test tests` and `./scripts/check-clean.sh`.
 4. Add a CHANGELOG entry; `sh scripts/version-bump.sh X.Y.Z` cuts a release.
 
 See [`../adr/`](../adr/) for the decisions already made, and add an ADR when a

@@ -22,7 +22,7 @@ cyrius deps
 cyrius build src/main.cyr build/agnosai
 
 # 4. Every test suite, recursively
-cyrius tests tests
+cyrius test tests
 
 # 5. Benchmarks and the coverage gate (its own CI step)
 cyrius bench

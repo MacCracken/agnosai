@@ -7,6 +7,189 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-11-04
+
+Cyrius **6.7.9**, every `[deps.*]` tag on its release on the 6.7.9 line, and the CI and release
+workflows on the latest stable GitHub Actions. kavach 3.14.0 closes the limitation 2.1.8 recorded:
+on a host whose coreutils are uutils (Ubuntu 25.10+), a process-isolated tool that names one now
+runs. majra 2.12.0's force-evict makes the rate limiter's 4,096-key cap hold at any rate (roadmap
+B4). Two test fixes ride along. `rust-old/` is still present: this release does not carry the
+deletion the 2.1.0 notes schedule either.
+
+### Changed
+
+- **Cyrius pin `6.6.20` → `6.7.9`.** The re-provisioned `lib/` (113 files) moves the folds sandhi
+  1.10.8 → 1.10.9, sakshi 2.5.7 → 2.5.8, patra 1.15.2 → 1.16.0, sigil 3.13.10 → 3.13.11, sankoch
+  2.8.1 → 2.8.3 and bayan 1.5.12 → 1.5.13. Each is byte-identical to its tag's `dist/` bundle. The
+  build prints the same toolchain notes as 2.1.8 and nothing new. Read against this tree, 6.7.0–6.7.9
+  changes nothing agnosai sends: no HTTP status, header or timeout moves on Linux. sandhi 1.10.9's
+  accept and pool changes are macOS and Windows only; on Linux `sandhi_server_run_pooled`
+  (`src/server/serve.cyr:798`) runs as before. What does reach agnosai:
+  - **`sha256()` wipes its context** (sigil 3.13.11), about 20 ns a call, with identical output:
+    `src/server/auth.cyr:468-469` and `src/orchestrator/audit.cyr:189`.
+  - **A child the stdlib's capture forks starts with SIGPIPE and SIGXFSZ at their defaults and an
+    empty signal mask** (6.7.9). kavach's capture reaches it (`lib/kavach.cyr:454`). agnosai's own
+    spawner (`src/sandbox/spawn.cyr`) does not use that path and already resets SIGPIPE itself.
+  - **`cyrius tests` is deprecated** (6.7.6) and goes in the next cyrius release. CI already runs bare
+    `cyrius test`. `README.md`, `CONTRIBUTING.md` and `docs/guides/getting-started.md` now say
+    `cyrius test tests`.
+  - **A `path` beside `git` + `tag` applies only in local mode** (`--local` / `CYRIUS_LOCAL`, 6.7.6).
+    agnosai's are commented out, so nothing changes: a local `cyrius deps` writes the same 8-pin lock
+    CI resolves.
+  - **cyrius renumbered its security advisories** (6.7.6). It kept 35 of its 104 `CVE-NN` ids as real
+    vulnerabilities, renamed to `CYRIUS-2026-NNNN`, and withdrew the rest as bugs or hardening items.
+    Earlier entries here keep the ids they were written with. Those that were cited map as follows:
+    CVE-68 → CYRIUS-2026-0023, CVE-73 → 0024, CVE-74 → 0025, CVE-75 → 0026, CVE-78 → 0028, and
+    CVE-100 → 0034. CVE-21, -69, -70 and -71 are withdrawn as hardening items.
+- **Every `[deps.*]` tag moves to its release on the 6.7.9 line:**
+
+  | dep | from | to | what reaches agnosai |
+  |---|---|---|---|
+  | `kavach` | 3.13.3 | **3.14.0** | ⚠ the pinned exec runs uutils (below) |
+  | `majra` | 2.9.3 | **2.12.0** | `ratelimit_evict_to` (roadmap B4, unblocked, not adopted); `relay_msg_release` is atomic and refuses a second release; `ratelimit_check` stamps a last-seen clock |
+  | `bote` | 3.3.17 | **3.4.10** | nothing: `src/` calls no bote function, and none of its 69 new symbols collides |
+  | `sigil` | 3.13.10 | **3.13.11** | the 6.7.9 fold (above) |
+  | `tyche` | 1.1.1 | **1.2.0** | the version header only |
+  | `ai-hwaccel` | 2.4.2 | 2.4.2 | unchanged: there is no ai-hwaccel release on 6.7.9 (2.4.2 pins 6.6.20, 2.5.0 pins 6.7.18), and kavach 3.14.0 and samay 1.2.0, both on 6.7.9, pin 2.4.2 too |
+
+  Through bote, libro moves 2.10.8 → **2.11.0**; its bundle differs only in the version line. Two pins
+  inside the new tags are off the 6.7.9 folds, and the fold wins both. libro 2.11.0 declares sigil
+  3.13.12 (`cyrius deps`: "3.13.12 (wanted by libro) not used; 3.13.11 (the root) resolved first"), and
+  ai-hwaccel 2.4.2 declares bayan 1.5.12.
+
+  ⚠ **kavach 3.14.0 runs uutils coreutils.** 3.13.x execed a pinned program with
+  `execveat(AT_EMPTY_PATH)`, which hands it `/dev/fd/N` as its path, and uutils take their utility
+  name from that path. So on Ubuntu 25.10+ every coreutils program a process-isolated tool named
+  exited 1 with no output (2.1.8's *Fixed*, last item). 3.14.0 execs `/proc/self/fd/N` first, once it
+  has checked procfs, the pinned dev/inode and that the file is not a `#!` script. **A tool that
+  failed on such a host now runs.**
+- **`cyrius.lock` was regenerated from empty: 119 files, 8 commit pins**, each matching its tag on
+  GitHub (`git ls-remote`).
+- **The workflows run the latest stable GitHub Actions**, each still pinned by commit SHA:
+  `actions/checkout` v4 → **v7.0.1**, `actions/upload-artifact` v4 → **v7.0.2**,
+  `softprops/action-gh-release` v2 → **v3.0.3**. All three now run on Node 24, which needs a runner
+  ≥ 2.327.1 (GitHub-hosted runners have it). No input these workflows pass changed. checkout v7's
+  refusal to check out a fork's PR under `pull_request_target` / `workflow_run` does not apply, since
+  neither event is used. The pin comments cited cyrius's CVE-21, now withdrawn, and name the
+  release-integrity hardening item instead.
+
+### Fixed
+
+- **The rate limiter's key cap holds at any rate (roadmap B4).** Since majra 2.8.1,
+  `ratelimit_evict_stale` skips a bucket that has not refilled to burst. So at a strict rate, a client
+  minting a fresh `X-Forwarded-For` per request kept every sprayed bucket out of reach of both pressure
+  rungs, and the 4,096-key cap held only as "one refill interval of keys". A 200,000-key spray at
+  1 req/s peaked at **83,199** keys on 2.1.8, and every 256th request walked that map whole.
+  - `_agnosai_rl_maybe_sweep` (`src/server/rate_limit.cyr`) now has a third rung, majra 2.12.0's
+    `ratelimit_evict_to`. It runs only when the two lossless rungs leave the map over the cap, and
+    trims it to the new `AGNOSAI_RL_TRIM_KEYS` (3,072) by least-recently-seen. The target is below the
+    cap because the call selects over every live key under the limiter's lock: this way it runs about
+    once per five sweeps during a spray instead of every sweep. The peak is the same either way.
+  - The same spray now peaks at **4,352**, the cap plus one sweep interval, at both 1 req/s and
+    100 req/s (2.1.8: 83,199 and 5,284).
+  - ⚠ **The trim is lossy, as the old zero rung was before majra 2.8.1.** An evicted key that had
+    spent tokens gets a fresh burst at its next check. It ranks by last-seen, which every check stamps,
+    refused ones included. So the sprayed one-request keys go first, and a client being metered goes
+    last: spraying does not reset the sprayer's own limit. It runs only above the cap, which only a
+    flood of distinct keys reaches.
+  - `tests/server_serve.tcyr` (+9), two strict-rate tests:
+    - At 1 req/s, a fresh key per request stays within the cap plus one sweep, and the trims reclaimed
+      what the cap kept out.
+    - A drained client that keeps sending through a spray stays refused through every trim, and
+      after it.
+
+    Removing the rung fails three assertions. Trimming to 0 (evict everything) fails two, as does
+    evicting in slot order (5 runs of 5).
+- **`tests/telemetry_otlp.tcyr`'s thread-count assertions raced a correct join.** They counted
+  `/proc/self/task` entries. `thread_join` returns once the kernel clears the thread's tid in
+  `exit_mm`, but the task stays listed until `release_task` at the end of `do_exit`, and the exit in
+  between is preemptible. This release's first full run, at a load average of 10, failed two of them
+  ("got 2, expected 1"). The race predates the move. Under 24 copies in parallel, 2.1.8's suite on
+  6.6.20 failed 22 runs of 72 and this tree's old suite 27 of 72.
+  - The suite now counts **live** threads, the entries whose stat flags lack `PF_EXITING`.
+    `do_exit` sets that flag before `exit_mm`, so a thread still listed after its join always
+    carries it. 0 runs of 72 failed under the same load.
+  - It still catches B15's regression. With `stop`'s `thread_join` removed, the ⭐ assertion and
+    two more fail on every run (3 of 3), because a thread nobody joined is still sleeping in its
+    poll loop.
+- **`tests/sandbox_kavach_bridge.tcyr`'s payload header** described kavach's exec as `execveat` /
+  `/dev/fd/9`, which is 3.13.x. It now says 3.14.0 execs `/proc/self/fd/N`.
+
+### Added
+
+- **`tests/sandbox_kavach_bridge.tcyr` (+3): the host's own `/bin/echo` through the bridge.** The
+  suite's other executions use its own payload so that they test the bridge and not the host. This
+  one pins the production path that payload avoids: a tool naming a host program. On a GNU host it
+  passes either way. In `ubuntu:26.04` it passes on kavach 3.14.0, and against 3.13.3 two of its
+  three assertions fail.
+
+### Performance
+
+**Flat overall: three rows move and are explained, one is a reversal of 2.1.8, and B4's spray is
+3–4x cheaper.** The host was
+shared (a 1-minute load of 2–5), so, as at 2.1.8, every `benches/*.bcyr` was built from the 2.1.8
+tag on cyrius 6.6.20 and from this tree on 6.7.9. The two binaries ran interleaved, alternating which
+went first: 3 rounds of all eleven files, then 5 more of the six holding the movers. Medians:
+
+- **All 223 benchmarks: median +0.0%, 206 within ±5%.** In the six re-run files: median +0.0%, 174
+  of 181 within ±5%.
+- **What moved, and why.** A third build, 2.1.8's source and deps on the 6.7.9 toolchain, splits
+  the toolchain from the dep moves. Interleaved with the other two for 5 rounds:
+
+  | benchmark | 2.1.8 | 2.1.8 source, 6.7.9 | 2.2.0 | cause |
+  |---|---|---|---|---|
+  | `agnos_form_encode_52b` | 1,352 ns | 1,193 ns (−11.8%) | 1,177 ns (**−12.9%**) | the compiler |
+  | `replay_buffer_push_1000cap_full` | 6,154 ns | 7,061 ns (+14.7%) | 7,163 ns (**+16.4%**) | the compiler |
+  | `route_approvals_global` | 3,898 ns | 3,905 ns (+0.2%) | 4,398 ns (**+12.8%**) | placement |
+  | `route_approvals_arena` | 3,690 ns | 3,680 ns (−0.3%) | 4,168 ns (**+13.0%**) | placement |
+
+  - **The compiler's rows:** the stdlib code they run is the same in 6.6.20 and 6.7.9. `math`,
+    `str`, `vec` and `alloc` differ in comments only, apart from `f64_parse`, which neither calls.
+    `agnos_form_encode_52b` is the row 2.1.8 recorded at +15% (1,180 → 1,357 ns) from the compiler,
+    so 6.7.9 gives most of that back.
+  - **The approvals rows are placement:** the toolchain-only build reads ±0.3%. The route calls only
+    `hashmap`, `sync` and `bayan`, which are byte-identical between that build and this one, and
+    agnosai's source is identical apart from the version string. What differs is the size of the
+    dep bundles around it in the binary. Not claimed as a regression in agnosai's code.
+- **Noise:** `tool_registry_has_50_miss` read −20% in both the 3-round and the 5-round run (113 →
+  91 ns), then −1.1% in the three-way run, where all three builds read 91–92 ns: the 2.1.8 side was
+  bimodal. `noop` (2 → 3 ns) and `route_research_complex` (9 → 10 ns) are 1 ns steps.
+- **New: `rate_limit_spray_strict_rate`** (`benches/server.bcyr`, B4) sends a sustained fresh-key
+  spray at 1 req/s through the request path, sweep included, in the over-cap steady state. It reads
+  **2.97 µs** a check. Built without the new rung, it reads 9.5–11.5 µs over three runs, and that
+  side keeps climbing the longer the spray runs, because its map is unbounded. The 200,000-key spray
+  that roadmap B4 measures costs 2,973 ns a check here, against 20,299 ns on 2.1.8, where the map
+  reached 83,199 keys.
+- `bench-history.csv` gains 224 rows at 2.2.0 from one unpinned `bench-history.sh` sweep, started
+  once the 1-minute load fell below 5 (4.6 at the start, 3.9 at the end). Against 2.1.8's 223 rows,
+  taken at a load of 4–5, they read median +0.0%, 207 within ±5%.
+
+### Verified
+
+- **The gate**, in CI's order: `cyrius lib sync --full` (113 files) → `deps` (119 locked, 8 commit
+  pins) → `check-symbols.sh` (2,787 definitions, both targets) → `check-clean.sh` (fmt 224, lint
+  125, doc 114, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist) → build →
+  **99 suites, 8,718 assertions, 0 failed** → coverage 99% (1,635/1,647 fns) → `distlib --all
+  --check` → examples → fuzz 4/4 → `cyrius bench` (11 files, 224 benchmarks).
+- **Assertion counts are unchanged by the move.** Each suite of 2.1.8's tree, built on its own pin and
+  run in the same shell, reads 8,706 in total. With the pin move alone, the only suite that differed
+  was `sandbox_kavach_bridge`, +3 for the new test. B4 adds 9 to `server_serve` (315 → 324). 2.1.8's
+  recorded 8,704 came from another environment: `sandbox_spawn` and `sandbox_process` assert once per
+  environment variable.
+- **The binaries.** Native **5,380,856 B** (2.1.8: 5,337,008; the pin move alone 5,380,840); aarch64
+  **6,097,136 B** (6,032,848; the pin move alone 6,097,128).
+  The native binary answers `GET /ready` with `"version":"2.2.0"`; a `DELETE /health` is a 405 with
+  `Allow: GET`; SIGTERM shuts down gracefully; no startup line carries a NUL. The aarch64 binary
+  was cross-built and not run.
+- **Every dep tag exists on GitHub** (`git ls-remote`) at the commit the lock pins, and the cyrius
+  6.7.9 release carries the `x86_64-linux` tarball CI's `install.sh` fetches. The pinned action SHAs
+  are the release commits of checkout v7.0.1, upload-artifact v7.0.2 and action-gh-release v3.0.3.
+- **The CI way, on the runner's image.** An `ubuntu:26.04` container ran every `ci.yml` step in
+  order as an unprivileged user, from a fresh clone with this diff applied: the `install.sh`
+  toolchain at 6.7.9, `lib sync --full` and `deps` from an empty dep cache with no sibling checkouts,
+  the symbol check, `check-clean.sh`, the build, wasmtime 47.0.3, the tests, coverage, the example,
+  fuzz and `cyrius bench`.
+
 ## [2.1.8] — 2026-11-04
 
 Cyrius **6.6.20**, and every `[deps.*]` tag moved to its release on the 6.6.20 line. sigil is

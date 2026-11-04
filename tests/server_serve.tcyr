@@ -556,6 +556,70 @@ fn _t_rate_limit_sweep_runs_and_bounds_keys(): i64 {
     return 0;
 }
 
+# The cap holds at a STRICT rate too (2.2.0, roadmap B4).
+#
+# ⚠ **The test above runs at 100,000 req/s, where every sprayed bucket has refilled by the
+# next sweep, so the lossless rungs alone hold the cap.** Since majra 2.8.1 they skip a bucket
+# that has not refilled. At 1 req/s with a burst of 2, a key that spent one token stays
+# unevictable for a second, which is longer than this whole loop. Through 2.1.8 such a spray
+# grew the map to one key per request (72,447 keys in a 200,000-key spray). Only the third
+# rung, majra 2.12.0's `ratelimit_evict_to`, bounds it. With that call removed, this fails on
+# the peak.
+fn _t_rate_limit_cap_holds_at_a_strict_rate(): i64 {
+    assert(AGNOSAI_RL_TRIM_KEYS < AGNOSAI_RL_MAX_KEYS,
+      "the lossy rung trims BELOW the cap, so it does not run on every sweep");
+    var lim = agnosai_rate_limit_new(1000, 2);
+    var n = AGNOSAI_RL_MAX_KEYS * 2 + AGNOSAI_RL_SWEEP_EVERY;
+    var peak = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_rate_limit_check_request(lim, str_from_int(i));
+        var k = agnosai_rate_limit_active_keys(lim);
+        if (k > peak) { peak = k; }
+    }
+    assert(peak <= AGNOSAI_RL_MAX_KEYS + AGNOSAI_RL_SWEEP_EVERY,
+      "at 1 req/s a fresh key per request still cannot grow the map past the cap + one sweep");
+    assert(agnosai_rate_limit_total_evicted(lim) >= n - (AGNOSAI_RL_MAX_KEYS + AGNOSAI_RL_SWEEP_EVERY),
+      "the trims reclaimed what the cap kept out, by count");
+    println("  rate_limit_cap_holds_at_a_strict_rate: ok");
+    return 0;
+}
+
+# The lossy trim evicts the sprayed keys, not the client being metered.
+#
+# ⚠ `ratelimit_evict_to` gives an evicted key a fresh burst. If it evicted the hammered key,
+# a client over its limit could reset itself by spraying fresh keys alongside. It ranks by
+# last-seen, which every check stamps (including a refused one), so the hammered key stays
+# among the most recent and is the last to go. This fails if the rung evicts everything or
+# evicts in slot order. The rate is 0.001 req/s, so the drained key cannot refill however
+# slowly the loop runs.
+fn _t_rate_limit_trim_keeps_the_hammered_key(): i64 {
+    var lim = agnosai_rate_limit_new(1, 2);
+    var hot = str_from("10.9.9.9");
+    assert_eq(agnosai_rate_limit_check_request(lim, hot), HTTP_OK, "the client's first request");
+    assert_eq(agnosai_rate_limit_check_request(lim, hot), HTTP_OK, "and its second, the burst");
+    assert_eq(agnosai_rate_limit_check_request(lim, hot), AGNOSAI_HTTP_TOO_MANY_REQUESTS,
+      "its third is refused: the bucket is drained");
+
+    var n = AGNOSAI_RL_MAX_KEYS * 2 + AGNOSAI_RL_SWEEP_EVERY;
+    var refused = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_rate_limit_check_request(lim, str_from_int(i));
+        if (i % 16 == 0) {
+            if (agnosai_rate_limit_check_request(lim, hot) == AGNOSAI_HTTP_TOO_MANY_REQUESTS) {
+                refused = refused + 1;
+            }
+        }
+    }
+    assert(agnosai_rate_limit_active_keys(lim) <= AGNOSAI_RL_MAX_KEYS + AGNOSAI_RL_SWEEP_EVERY,
+      "precondition: the spray was trimmed, so the lossy rung ran");
+    assert_eq(refused, (n + 15) / 16,
+      "the hammered client stayed refused through every trim, never handed a fresh burst");
+    assert_eq(agnosai_rate_limit_check_request(lim, hot), AGNOSAI_HTTP_TOO_MANY_REQUESTS,
+      "and is still refused after the spray");
+    println("  rate_limit_trim_keeps_the_hammered_key: ok");
+    return 0;
+}
+
 # The unauthenticated probes are never refused.
 #
 # ⚠ A kubelet sends neither proxy header, so it keys as `"unknown"` — the one
@@ -1916,6 +1980,8 @@ fn main(): i64 {
     _t_rate_limit_default_is_mounted();
     _t_rate_limit_key_is_capped();
     _t_rate_limit_sweep_runs_and_bounds_keys();
+    _t_rate_limit_cap_holds_at_a_strict_rate();
+    _t_rate_limit_trim_keeps_the_hammered_key();
     _t_rate_limit_probes_are_exempt();
     _t_rate_limit_keys_are_per_client();
     _t_rate_limit_handler_keys_per_client();

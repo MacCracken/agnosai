@@ -130,6 +130,15 @@ numbers and this ADR is where that is recorded.
      1 req/s. A force-evict call is requested from majra
      (`docs/development/issues/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md`
      in the majra repo); `src/server/rate_limit.cyr` carries the detail.
+     ✅ **2026-11-04 (2.2.0, majra 2.12.0): the cap is a count again, at any
+     rate.** majra shipped the force-evict as `ratelimit_evict_to`. It now runs
+     as a third rung, only when the two lossless rungs leave the map over the
+     cap, and trims to `AGNOSAI_RL_TRIM_KEYS` (3,072) by least-recently-seen.
+     A 200,000-key spray peaks at 4,352 (the cap plus one sweep interval) at
+     both 1 req/s and 100 req/s, against 83,199 and 5,284 on 2.1.8. The trim is
+     lossy in the same way the zero rung used to be: an evicted key gets a fresh
+     burst. Ranking by last-seen means the sprayed keys go first, and a client
+     being metered goes last.
 - **The three unauthenticated probes are exempt.** `/health`, `/ready` and
   `/metrics` — exactly the routes `agnosai_route_needs_auth` leaves open — are
   never refused. ⚠ Without this the default is a self-inflicted outage: a kubelet

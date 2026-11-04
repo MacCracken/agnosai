@@ -2,9 +2,34 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-04 (the 2.1.8 release gate).
+> Last refreshed: 2026-11-04 (the 2.2.0 release gate).
 
-## Now — 2.1.8
+## Now — 2.2.0
+
+| | |
+|---|---|
+| **version** | **2.2.0** (cut 2026-11-04): cyrius 6.6.20 → **6.7.9**, with every `[deps.*]` tag on its 6.7.9 release; the CI and release workflows on the latest stable GitHub Actions (checkout v7.0.1, upload-artifact v7.0.2, action-gh-release v3.0.3, SHA-pinned); kavach 3.14.0 runs uutils coreutils, closing 2.1.8's recorded limitation; `telemetry_otlp`'s thread-count race fixed; the rate limiter's key cap holds at any rate (B4, majra 2.12.0's `ratelimit_evict_to`) |
+| **cyrius pin** | **6.7.9** (`~/.cyrius/versions/6.7.9` `SOURCE_COMMIT` `8bb8df56`, `tree-matches-tag: yes`). The user's chosen target: cyrius has tagged up to 6.7.18 (seen 2026-11-04) |
+| **tests** | **99 suites, 8,718 assertions, 0 failed** with wasmtime 50.0.1 present. 2.1.8's tree, run suite by suite in the same shell on its own pin (6.6.20), reads 8,706 (its recorded 8,704 was a different environment: `sandbox_spawn` and `sandbox_process` count per environment variable). The suites that differ are `sandbox_kavach_bridge` +3 (the host-binary test) and `server_serve` +9 (B4's strict-rate tests), so the move itself changes no count |
+| **coverage** | **99%**: 102/102 files, 1,635/1,647 fns (gate `--min 80`); the same 12 unreferenced |
+| **dist** | `dist/agnosai.cyr` 39,926 lines + `dist/agnosai-guard.cyr` 941 (`wc -l`), both v2.2.0. They differ from 2.1.8's in the version lines and B4's `src/server/rate_limit.cyr`, and the sidecars still list **7 / 1** stdlib leaves |
+| **binary** | `build/agnosai` **5,380,856 B** (2.1.8: 5,337,008); aarch64 **6,097,136 B** (2.1.8: 6,032,848). The native one answers `GET /ready` with `"version":"2.2.0"`, a 405 carries `Allow`, SIGTERM shuts down gracefully, and no startup line carries a NUL. The aarch64 one was not run on the Pi this release |
+| **lock** | `cyrius.lock` **119 files, 8 commit pins**, regenerated from empty (`lib/` and the lock removed, then `lib sync --full` + `deps`). Every pin matches its tag on GitHub (`git ls-remote`) |
+| **gates** | `cyrius lib sync --full` (113 files) → `deps` → `check-symbols.sh` (2,787 definitions, both targets) → `check-clean.sh` (fmt 224, lint 125, doc 114, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist) → build → test → coverage → `distlib --all --check` → examples (1) → fuzz 4/4 → `cyrius bench`, then the `ubuntu:26.04` CI replica (CHANGELOG 2.2.0 *Verified*) |
+| **benchmarks** | `bench-history.csv` has 224 rows at 2.2.0, one unpinned sweep at a load of 4–5: median +0.0% against 2.1.8's rows, 207 of 223 within ±5%. The new `rate_limit_spray_strict_rate` (B4) reads 2.97 µs, against 9.5–11.5 µs without the trim. The same-box interleaved A/B against a 2.1.8 build (3 rounds of all eleven files, then 5 of six) reads **median +0.0%**, 206 of 223 within ±5%. A three-way run that adds 2.1.8's source on the 6.7.9 toolchain splits the movers: `agnos_form_encode_52b` −12% and `replay_buffer_push_1000cap_full` +15% are the compiler, and `route_approvals_{global,arena}` +13% is placement, because the toolchain-only build reads ±0.3% and the route's callees are byte-identical (CHANGELOG 2.2.0 *Performance*) |
+| **build warnings** | `build/agnosai`: toolchain notes only, the same set as 2.1.8 (sigil's static array, large static data, the two "refusing to overwrite stdlib leaf" lines, the DCE note) |
+| **consumer** | Not re-run against this tree. agnostic pins agnosai 2.1.7 on cyrius 6.6.14, and thoth pins cyrius 6.6.6 |
+
+Direct deps (`[deps.*]`, all six), **none with an active `path`**: `sigil` **3.13.11** (= the 6.7.9
+fold, byte-identical), `bote` **3.4.10**, `majra` **2.12.0**, `kavach` **3.14.0**, `tyche` **1.2.0**, each
+repo's last release pinned to cyrius 6.7.9, not its latest tag. `ai-hwaccel` stays **2.4.2**: it has no
+release on 6.7.9 (2.4.2 pins 6.6.20, 2.5.0 pins 6.7.18), and kavach 3.14.0 and samay 1.2.0, both on 6.7.9,
+declare 2.4.2 as well. Transitively through bote: libro **2.11.0**. Two pins inside the tags are off the
+6.7.9 folds, and the fold wins both: libro 2.11.0 declares sigil 3.13.12, and ai-hwaccel 2.4.2 declares
+bayan 1.5.12. The other deps' own pins name the folds (kavach 3.14.0: sigil 3.13.11; libro 2.11.0:
+patra 1.16.0; samay 1.2.0: bayan 1.5.13).
+
+### 2.1.8 — the release (2026-11-04)
 
 | | |
 |---|---|
