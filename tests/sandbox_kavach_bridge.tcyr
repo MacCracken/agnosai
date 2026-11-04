@@ -361,13 +361,65 @@ fn _t_kv_result(): i64 {
     return 0;
 }
 
+# --- The payload ----------------------------------------------------------
+#
+# **Every command the execution tests run is this binary, re-executed** — not
+# the host's coreutils. They were `/bin/echo`, `/bin/false` and `/bin/sleep`,
+# which made the suite a test of the runner's coreutils as much as of the
+# bridge, and `ubuntu-latest` moving to 26.04 showed it. 26.04's coreutils are
+# uutils: one multicall binary, hardlinked under every name, that takes the
+# utility's name from the path it was executed by. kavach execs an absolute
+# program through the fd it pinned before the fork (`kv_exec_pinned`,
+# `execveat(AT_EMPTY_PATH)`), so that path is `/dev/fd/9`, and every command
+# refused to start: "Requested utility `9` does not match executable name",
+# exit 1, no stdout. 33 assertions failed, and none of them was about agnosai.
+#
+# `/proc/self/exe` pins this very file, so the payload below runs under the
+# same fd exec, no_new_privs, landlock scopes and seccomp filter a real tool
+# gets, and it is the same program on every host. It answers only to its own
+# argv shapes, so the suite run under `cyrius test` (argc 1) never takes it.
+var _T_KB_SELF = "/proc/self/exe";
+
+# The payload's entry: its exit code, or -1 when this run is the suite. `main`
+# exits with it directly, since the epilogue would fold every failure to 1.
+#   kb-echo WORD   prints WORD and a newline, exits 0
+#   kb-exit N      exits N (one digit)
+#   kb-sleep N     sleeps N seconds, exits 0
+fn _t_kb_payload(): i64 {
+    if (args_init() <= 0) { return 0 - 1; }
+    if (argc() != 3) { return 0 - 1; }
+    var verb = argv(1);
+    var arg = argv(2);
+    if (streq(verb, "kb-echo") == 1) {
+        println(arg);
+        return 0;
+    }
+    if (streq(verb, "kb-exit") == 1) { return load8(arg) - 48; }
+    if (streq(verb, "kb-sleep") == 1) {
+        sleep_ms((load8(arg) - 48) * 1000);
+        return 0;
+    }
+    return 0 - 1;
+}
+
+# `/proc/self/exe <verb> <arg>`, as the command string the bridge takes.
+fn _t_kb_cmd(verb, arg): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, _T_KB_SELF);
+    str_builder_putc(sb, 32);
+    str_builder_add_cstr(sb, verb);
+    str_builder_putc(sb, 32);
+    str_builder_add_cstr(sb, arg);
+    return str_builder_build(sb);
+}
+
 # --- Execution ------------------------------------------------------------
 
 fn _t_kb_execute_runs_a_command(): i64 {
     # A process-level policy maps to kavach's Process backend and really forks.
     var e[8];
     store64(&e, 0);
-    var r = agnosai_kavach_execute(str_from("/bin/echo bridged"),
+    var r = agnosai_kavach_execute(_t_kb_cmd("kb-echo", "bridged"),
       agnosai_sandbox_policy_process(), 0, &e);
 
     assert(load64(&e) == 0, "a kavach sandbox executes");
@@ -390,7 +442,7 @@ fn _t_kb_execute_needs_no_explicit_init(): i64 {
     # the caller really does not have to.
     var e[8];
     store64(&e, 0);
-    var r = agnosai_kavach_execute(str_from("/bin/echo first-call"),
+    var r = agnosai_kavach_execute(_t_kb_cmd("kb-echo", "first-call"),
       agnosai_sandbox_policy_process(), 0, &e);
     assert(load64(&e) == 0,
       "the FIRST call into the bridge works with no initialization step");
@@ -399,7 +451,7 @@ fn _t_kb_execute_needs_no_explicit_init(): i64 {
 
     # And a second call is not broken by the first having initialized.
     store64(&e, 0);
-    var again = agnosai_kavach_execute(str_from("/bin/echo second-call"),
+    var again = agnosai_kavach_execute(_t_kb_cmd("kb-echo", "second-call"),
       agnosai_sandbox_policy_process(), 0, &e);
     assert(load64(&e) == 0, "and so does the second");
     assert(str_contains_cstr(agnosai_kavach_result_output(again), "second-call") == 1,
@@ -408,8 +460,11 @@ fn _t_kb_execute_needs_no_explicit_init(): i64 {
 }
 
 fn _t_kb_execute_reports_the_exit_code(): i64 {
-    # `/bin/false` needs no arguments and no shell, so kavach's command splitter
-    # and runtime guard cannot turn it into something else. It exits 1.
+    # The payload exits 3: one plain argument and no shell, so kavach's command
+    # splitter and runtime guard cannot turn it into something else. The exact
+    # code is asserted, not merely "non-zero": a payload that never started
+    # exits non-zero too (uutils refusing `/dev/fd/9` exited 1, and `!= 0`
+    # passed it).
     #
     # **This asserted the opposite until kavach 3.11.3.** `backend_capture_finish`
     # hardcodes `exit_code = 0`, so every command that ran reported success -
@@ -420,14 +475,14 @@ fn _t_kb_execute_reports_the_exit_code(): i64 {
     # filing stays open on that half.
     var e[8];
     store64(&e, 0);
-    var r = agnosai_kavach_execute(str_from("/bin/false"),
+    var r = agnosai_kavach_execute(_t_kb_cmd("kb-exit", "3"),
       agnosai_sandbox_policy_process(), 0, &e);
 
     assert(load64(&e) == 0,
       "a command that EXITS non-zero is a result, not a bridge error");
     assert(r != 0, "...so a result comes back");
-    assert(agnosai_kavach_result_exit_code(r) != 0,
-      "...carrying the real non-zero code, not flattened to 0");
+    assert(agnosai_kavach_result_exit_code(r) == 3,
+      "...carrying the payload's real code, not flattened to 0");
     return 0;
 }
 fn _t_kb_execute_honours_the_policy_deadline(): i64 {
@@ -439,7 +494,7 @@ fn _t_kb_execute_honours_the_policy_deadline(): i64 {
     var e[8];
     store64(&e, 0);
     var t0 = clock_now_ms();
-    var r = agnosai_kavach_execute(str_from("/bin/sleep 8"), p, 0, &e);
+    var r = agnosai_kavach_execute(_t_kb_cmd("kb-sleep", "8"), p, 0, &e);
     var dt = clock_now_ms() - t0;
 
     assert(load64(&e) == 0, "a timeout is a result, not a bridge error");
@@ -453,7 +508,7 @@ fn _t_kb_execute_honours_the_policy_deadline(): i64 {
 fn _t_kb_execute_with_agent_id(): i64 {
     var e[8];
     store64(&e, 0);
-    var r = agnosai_kavach_execute(str_from("/bin/echo tagged"),
+    var r = agnosai_kavach_execute(_t_kb_cmd("kb-echo", "tagged"),
       agnosai_sandbox_policy_process(), str_from("agent-7"), &e);
     assert(load64(&e) == 0, "an agent-tagged sandbox executes");
     assert(str_contains_cstr(agnosai_kavach_result_output(r), "tagged") == 1,
@@ -472,7 +527,7 @@ fn _t_kb_execute_with_agent_id(): i64 {
 fn _t_kb_blocked_output_is_an_error(): i64 {
     var e[8];
     store64(&e, 0);
-    var r = agnosai_kavach_execute(str_from("/bin/echo AKIAIOSFODNN7EXAMPLE"),
+    var r = agnosai_kavach_execute(_t_kb_cmd("kb-echo", "AKIAIOSFODNN7EXAMPLE"),
       agnosai_sandbox_policy_process(), 0, &e);
 
     assert(r == 0, "an artifact the gate blocks is not released as a result");
@@ -523,7 +578,7 @@ fn _t_kb_repeated_failures_do_not_break_the_bridge(): i64 {
     var i = 0;
     while (i < 12) {
         store64(&e, 0);
-        var f = agnosai_kavach_execute(str_from("/bin/echo AKIAIOSFODNN7EXAMPLE"),
+        var f = agnosai_kavach_execute(_t_kb_cmd("kb-echo", "AKIAIOSFODNN7EXAMPLE"),
           agnosai_sandbox_policy_process(), 0, &e);
         assert(f == 0, "a blocked artifact is a bridge FAILURE, not a result");
         assert(load64(&e) != 0, "...with out_err set — the exec arm's message");
@@ -531,7 +586,7 @@ fn _t_kb_repeated_failures_do_not_break_the_bridge(): i64 {
     }
 
     store64(&e, 0);
-    var good = agnosai_kavach_execute(str_from("/bin/echo still-working"),
+    var good = agnosai_kavach_execute(_t_kb_cmd("kb-echo", "still-working"),
       agnosai_sandbox_policy_process(), 0, &e);
     assert(load64(&e) == 0, "the bridge still works after a dozen failed executions");
     assert(str_contains_cstr(agnosai_kavach_result_output(good), "still-working") == 1,
@@ -553,6 +608,8 @@ fn _t_kb_execute_none_policy_uses_the_noop_backend(): i64 {
 
 fn main(): i64 {
     alloc_init();
+    var payload = _t_kb_payload();
+    if (payload >= 0) { syscall(60, payload); }
     sakshi_set_level(SK_FATAL);
 
     _t_kv_map_backend();

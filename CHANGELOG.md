@@ -13,8 +13,9 @@ Cyrius **6.6.20**, and every `[deps.*]` tag moved to its release on the 6.6.20 l
 declared at the 6.6.20 fold, so every commit pin in the lock names the code `lib/` holds. This is
 the pin move the roadmap has carried since 2.1.5 (*Moving the cyrius pin to 6.6.15*). The siblings
 it waited on (kavach and libro, then bote) all have releases on 6.6.20, so no override pin was
-needed. Two fixes ride along: a 2.1.7 regression in four startup log lines, and the arena leak
-agnostic 0.1.17 found. `rust-old/` is still present: like 2.1.1 through 2.1.7, this patch does not
+needed. Three fixes ride along: a 2.1.7 regression in four startup log lines, the arena leak
+agnostic 0.1.17 found, and the kavach bridge suite, which failed on `ubuntu-latest` once it became
+Ubuntu 26.04. `rust-old/` is still present: like 2.1.1 through 2.1.7, this patch does not
 carry the deletion the 2.1.0 notes schedule.
 
 ⚠ **Wire-visible**, from the toolchain: the server answers **408** to a connection that has not sent
@@ -135,6 +136,26 @@ a complete request within 60 s of accept (below).
   it. Found by agnostic 0.1.17, whose crew door checks a body without building anything.
   `tests/core_agent.tcyr` (+3): `agnosai_agent_new_a` in an arena keeps 0 B, and the default is
   one shared Str; with the per-call `str_from` back, both fail by name.
+- **CI was red on `ubuntu-latest`, which is now Ubuntu 26.04: `tests/sandbox_kavach_bridge.tcyr`
+  failed 33 assertions.** The pin move did not cause it. The docs-only commit before it, still on
+  6.6.14, failed the same Test step. 26.04's coreutils are uutils, one multicall binary hardlinked
+  under every name, and it takes the utility's name from the path it was executed by. kavach execs
+  an absolute program by the fd it pinned before the fork (`execveat(AT_EMPTY_PATH)`), so that path
+  is `/dev/fd/9`. `/bin/echo`, `/bin/false` and `/bin/sleep` each refused to start ("Requested
+  utility `9` does not match executable name"), with exit 1 and no stdout. This is roadmap C's open
+  kavach filing (`2026-10-03-pinned-exec-breaks-uutils-coreutils.md`), now hit on the runner.
+  - The suite's execution tests no longer run the host's coreutils. They run the test binary itself,
+    through `/proc/self/exe`, as a payload that echoes a word, exits with a given code or sleeps. It
+    goes through the same pinned fd exec, no_new_privs, landlock scopes and seccomp filter as a real
+    tool, and it is the same program on every host. The runner image and the toolchain pin are
+    unchanged.
+  - The exit-code test now asserts the payload's exact code (3), not just "non-zero". The uutils
+    refusal exited 1, so `!= 0` had passed a payload that never started.
+  - 138 assertions on Arch and in `ubuntu:26.04`, the same 138 the old suite reads on a GNU host.
+    CI's 134 was 101 passed + 33 failed: four assertions sit behind an early return the failure took.
+  - ⚠ **Production keeps the limitation.** On a uutils host, a process-isolated tool whose program
+    is a coreutils binary exits 1 under kavach 3.13.3. 2.1.7 has the same limitation, since kavach
+    3.13.2 pins the same way, and the filing stays open.
 
 ### Performance
 
@@ -207,6 +228,11 @@ The two binaries ran interleaved, alternating which went first: 3 rounds of all 
   symbol check, cleanliness, both builds (each byte-identical to the working tree's),
   `distlib --all --check` and the example passed there, with nothing left dirty. Only
   `CHANGELOG.md`, `roadmap.md` and `state.md` changed after it.
+- **And on the runner's own image**, after the bridge-suite fix. In an `ubuntu:26.04` container,
+  running as an unprivileged user, a fresh clone ran every `ci.yml` step in order and passed them
+  all: the `install.sh` toolchain at 6.6.20, `lib sync --full`, `deps` (8 pins), the symbol check,
+  `check-clean.sh`, the build (5,337,008 B), wasmtime 47.0.3, **99 suites, 0 failed**, coverage 99%,
+  the example, fuzz 4/4 and `cyrius bench` 11/11.
 
 ## [2.1.7] — 2026-10-08
 

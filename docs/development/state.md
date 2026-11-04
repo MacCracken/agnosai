@@ -8,7 +8,7 @@
 
 | | |
 |---|---|
-| **version** | **2.1.8** (cut 2026-11-04): cyrius 6.6.14 → **6.6.20**, with every `[deps.*]` tag on its 6.6.20 release; a 2.1.7 regression fixed (four startup warnings 3 bytes long, and the log-length checker that passed them); the 16 B arena leak in `agnosai_agent_new_a` agnostic 0.1.17 found |
+| **version** | **2.1.8** (cut 2026-11-04): cyrius 6.6.14 → **6.6.20**, with every `[deps.*]` tag on its 6.6.20 release; a 2.1.7 regression fixed (four startup warnings 3 bytes long, and the log-length checker that passed them); the 16 B arena leak in `agnosai_agent_new_a` agnostic 0.1.17 found; `sandbox_kavach_bridge` runs its own payload, so `ubuntu-latest` (now 26.04, uutils coreutils) passes it |
 | **cyrius pin** | **6.6.20** (`~/.cyrius/versions/6.6.20` `SOURCE_COMMIT` `ae682e23`, `tree-matches-tag: yes`). The user's chosen target: cyrius has tagged 6.7.x since (6.7.18 seen 2026-11-04), and every dep has newer 6.7-line tags |
 | **tests** | **99 suites, 8,704 assertions, 0 failed** with wasmtime 50.0.1 present. 2.1.7's tree, run in the same shell the same day on its own pin (6.6.14), reads 8,701, and every suite's count is the same except `core_agent` +3, the arena fix's tests. So the move changes no assertion count |
 | **coverage** | **99%**: 102/102 files, 1,635/1,647 fns (gate `--min 80`); the same 12 unreferenced |
@@ -253,7 +253,8 @@ lands at its re-pin.
   both paths and no port counts). All 99 suites pass against it.
 - ⚠ **Open in kavach, reaching the sandbox** (roadmap C): uutils coreutils (Ubuntu 25.10+)
   refuse kavach's pinned exec, so `/bin/echo` and the like exit 1 on such a host; and the
-  `basic` profile has no `sendto` for cyrius 6.6.14's TLS writes.
+  `basic` profile has no `sendto` for cyrius 6.6.14's TLS writes. `ubuntu-latest` became 26.04
+  and the first half turned CI red; since 2.1.8 the bridge suite execs itself, not coreutils.
 
 ### 2.1.3 — cyrius 6.6.14; the build is warning-free and the lock is CI's
 
