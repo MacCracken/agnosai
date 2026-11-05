@@ -2,9 +2,32 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-04 (the 2.2.0 release gate).
+> Last refreshed: 2026-11-05 (the 2.2.1 release gate).
 
-## Now — 2.2.0
+## Now — 2.2.1
+
+| | |
+|---|---|
+| **version** | **2.2.1** (cut 2026-11-05): cyrius 6.7.9 → **6.7.18**, with every `[deps.*]` tag on its latest release; the guard bundle's `unicode` requirement restored after 6.7.18's `distlib` dropped it; `server_auth_lane_race`'s pinned arm re-armed (sigil 3.13.14 made `crypto_bank_set` a no-op); `sandbox_cx`'s guest tests made namespace-aware, since 6.7.18's tarball ships `cycc_cx` and CI now runs them. ⚠ JSON bodies and JWTs that repeat a key or carry a leading-zero number are now refused (bayan 1.11.1) |
+| **cyrius pin** | **6.7.18** (`~/.cyrius/versions/6.7.18` `SOURCE_COMMIT` `a1cf8c02`, `tree-matches-tag: yes`), the latest cyrius tag seen 2026-11-04 |
+| **tests** | **99 suites, 8,718 assertions, 0 failed** with wasmtime 50.0.1 present. 2.2.0's tree, run suite by suite in the same shell on its own pin (6.7.9), reads 8,716 (its recorded 8,718 was a different environment). The one suite that differs is `server_auth_lane_race`, +2 for the lane preconditions, so the move itself changes no count. On a host that cannot create the cx sandbox's namespaces (docker, possibly a restricted Ubuntu runner), `sandbox_cx` reads 68 rather than 87, with its fail-closed arm in place of the guest tests |
+| **coverage** | **99%**: 102/102 files, 1,635/1,647 fns (gate `--min 80`); the same 12 unreferenced |
+| **dist** | `dist/agnosai.cyr` + `dist/agnosai-guard.cyr`, both v2.2.1. The sidecars list **6 / 1** stdlib leaves (2.2.0: 7 / 1): `unicode` became `unicode/_decode` in both, and `math` left the base sidecar because bayan 1.11.1 includes it (CHANGELOG 2.2.1 *Fixed*) |
+| **binary** | `build/agnosai` **5,826,992 B** (2.2.0: 5,380,856). The growth is unreachable code: the DCE note reads 2,930,627 dead bytes, against 2,401,264. aarch64 **6,698,984 B** (6,097,136). `CYRIUS_DCE=1` now compacts x86_64 to 2,898,352 B; not adopted (untested). The native binary answers `GET /ready` with `"version":"2.2.1"`, a 405 carries `Allow`, SIGTERM shuts down gracefully, and no startup line carries a NUL |
+| **lock** | `cyrius.lock` **119 files, 8 commit pins**, regenerated from empty. Every pin matches its tag on GitHub |
+| **gates** | `cyrius lib sync --full` (113 files) → `deps` → `check-symbols.sh` (2,787 definitions, both targets) → `check-clean.sh` (fmt 224, lint 125, doc 114, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist) → build → test → coverage → `distlib --all --check` → examples (1) → fuzz 4/4 → `cyrius bench`, then the `ubuntu:26.04` CI replica (CHANGELOG 2.2.1 *Verified*) |
+| **benchmarks** | `bench-history.csv` has 224 rows at 2.2.1, one unpinned sweep at a load of 2.5–4.4: median −1.7% against 2.2.0's rows. The same-box interleaved A/B against a 2.2.0 build (3 rounds of all eleven files) reads **median +0.3%**, 199 of 224 within ±5%. ⚠ **JSON parsing is 38–66% slower** (`*_from_json`, `builtin_presets_18` +55%, the JSON-body routes +12–20%), and a three-way run puts all of it on the toolchain, bayan 1.11.1's bounds-checked parser. `auth_jwt_key_prepare` is +14% (sigil 3.13.15's DER walks). Kept as hardening (CHANGELOG 2.2.1 *Performance*) |
+| **build warnings** | `build/agnosai`: large static data and the DCE note, plus the two "refusing to overwrite stdlib leaf" lines. sigil's static-array warning is gone (sigil 3.13.15) |
+| **consumer** | Not re-run against this tree. thoth (the guard profile) gets `unicode/_decode` from the restored requires block; agnostic pins agnosai 2.1.7 |
+
+Direct deps (`[deps.*]`, all six), **none with an active `path`**, each on its latest release:
+`sigil` **3.13.15** (= the 6.7.18 fold, byte-identical), `bote` **3.8.11**, `majra` **2.13.0**, `kavach`
+**3.14.2**, `ai-hwaccel` **2.5.6**, `tyche` **1.2.2**. Transitively through bote: libro **2.11.3**. Every
+pin inside those tags names a 6.7.18 fold. kavach 3.14.2 and libro 2.11.3 declare sigil 3.13.15, and
+libro declares patra 1.16.6. ai-hwaccel 2.5.6 and samay 1.5.1 declare bayan 1.11.1. samay is kavach's
+optional dep and is not vendored.
+
+### 2.2.0 — the release (2026-11-04)
 
 | | |
 |---|---|
@@ -1831,7 +1854,7 @@ moved it by one. (The **1099/1099** this line carried until now was the
 2026-08-05 figure and had gone stale by 462 functions.)
 
 ```sh
-cyrius tests tests          # 99 suites at 2.1.5; each prints "N passed" with an "(N total)" suffix
+cyrius test tests           # 99 suites; each prints "N passed" with an "(N total)" suffix ("cyrius tests" is gone since cyrius 6.7.12)
 cyrius coverage --min 80    # the gate, and its own CI step
 ```
 
@@ -1840,7 +1863,7 @@ drifted — six rows were wrong at the 2026-07-30 refresh, and the handoff note 
 caught it said to *regenerate from command output rather than editing rows by
 hand*. A table that can only be maintained by hand will drift again, so the two
 commands above are the authority. Counting gotcha if you sum by hand:
-`cyrius tests tests` prints one line **per suite** carrying an `(N total)` suffix,
+`cyrius test tests` prints one line **per suite** carrying an `(N total)` suffix,
 plus a final `N passed, 0 failed` line that counts **suites, not assertions** —
 sum only the suffixed lines. ⚠ And do not pipe the run through `tail`: it drops
 the very lines the sum needs, which is how the 2026-08-12 run ended up with no
@@ -2710,7 +2733,7 @@ Read in this order:
 attributable:
 
 ```sh
-cyrius build src/main.cyr build/agnosai && cyrius tests tests && \
+cyrius build src/main.cyr build/agnosai && cyrius test tests && \
   cyrius coverage --min 80 && ./scripts/check-clean.sh && ./scripts/check-symbols.sh
 ```
 
@@ -2719,7 +2742,7 @@ failed**, coverage **100% (1338/1338)** over 87 referenced files, cleanliness
 clean (fmt 174 · lint 95 · doc 95 · vet+deny · deps 113 verified · lib snapshot
 107), **2,189 symbols across 95 files**.
 
-`cyrius tests tests` takes several minutes; for a single suite use
+`cyrius test tests` takes several minutes; for a single suite use
 `cyrius build tests/<name>.tcyr /tmp/t && /tmp/t`, which is seconds.
 
 ⚠ A backgrounded sweep enumerates its suites **once, at launch**. A suite added

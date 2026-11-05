@@ -210,6 +210,43 @@ fn _t_cx_have_runner(): i64 {
     return 1;
 }
 
+# How many guest-running tests found a host that cannot confine the guest, and whether the
+# fail-closed test then checked the refusal those tests could not run past.
+var _T_CX_NS_REFUSED = 0;
+var _T_CX_FAIL_CLOSED_CHECKED = 0;
+
+# 1 when this host can create the namespaces the cx sandbox demands (2.2.1).
+#
+# ⚠ **Until cyrius 6.7.18 CI never ran the guest half of this suite.** The 6.7.9 release tarball
+# shipped `cxvm` but not `cycc_cx`, so `_t_cx_have_compiler` said no on every runner and each
+# execution test returned before asserting anything. 6.7.18 ships both, so on CI they run now,
+# and they run into the bridge's fail-closed rule (`agnosai_cx_policy`). The policy demands a
+# network namespace. Unprivileged, that needs a new user namespace too, which docker's default
+# seccomp profile and Ubuntu's AppArmor restriction both refuse. There kavach's child exits 123
+# (`SPAWN_EXIT_NS`) before cxvm starts. Seven assertions failed in an `ubuntu:26.04` container
+# because they measured a refusal, not a guest. And ADR-006's acceptance test passed for the
+# wrong reason, since 123 is ≥ 100.
+#
+# Asked through kavach's own probe and with kavach's own flags for this policy, so the answer
+# is the one the spawn will meet.
+fn _t_cx_host_confines(): i64 {
+    var exe = agnosai_cx_interpreter_path();
+    if (exe == 0) { return 0; }
+    var pol = agnosai_cx_policy(_agnosai_cx_interpreter_dir(exe));
+    return spawn_namespaces_available(_spawn_ns_flags(pol, 0));
+}
+
+# The guard for a test that needs the guest to actually RUN. It counts toward
+# `_t_cx_runner_tests_actually_ran` exactly as `_t_cx_have_runner` does. On a host that cannot
+# confine, it records the test, and `_t_cx_fails_closed_without_namespaces` asserts the refusal
+# in its place, so the test is not skipped silently.
+fn _t_cx_have_sandbox(): i64 {
+    if (_t_cx_have_runner() == 0) { return 0; }
+    if (_t_cx_host_confines() == 1) { return 1; }
+    _T_CX_NS_REFUSED = _T_CX_NS_REFUSED + 1;
+    return 0;
+}
+
 # Every execution test really ran, on a machine that can run them.
 #
 # **The counterpart to `_t_cx_skips_are_real`, for the half it does not cover.**
@@ -231,6 +268,10 @@ fn _t_cx_runner_tests_actually_ran(): i64 {
     assert(_T_CX_RUNNER_YESES >= 6,
       "cycc_cx and cxvm are both installed, so every execution test above MUST have run — \
     a guard that answers no everywhere is indistinguishable from a passing suite");
+    if (_T_CX_NS_REFUSED > 0) {
+        assert_eq(_T_CX_FAIL_CLOSED_CHECKED, 1,
+          "every guest test this host could not run is covered by the fail-closed assertion");
+    }
     return 0;
 }
 
@@ -281,7 +322,7 @@ fn _t_cx_interpreter_is_resolved_absolutely(): i64 {
 }
 
 fn _t_cx_run_executes_the_guest(): i64 {
-    if (_t_cx_have_runner() == 0) { return 0; }
+    if (_t_cx_have_sandbox() == 0) { return 0; }
     var e[8];
     store64(&e, 0);
     var r = agnosai_cx_compile_and_run(str_from("var r = 6 * 7;\nsyscall(60, r);\n"),
@@ -295,7 +336,7 @@ fn _t_cx_run_executes_the_guest(): i64 {
 }
 
 fn _t_cx_run_captures_stdout(): i64 {
-    if (_t_cx_have_runner() == 0) { return 0; }
+    if (_t_cx_have_sandbox() == 0) { return 0; }
     var e[8];
     store64(&e, 0);
     # Write to fd 1 directly - cx is a bare target with no stdlib.
@@ -319,7 +360,7 @@ fn _t_cx_run_rejects_invalid_bytecode(): i64 {
 }
 
 fn _t_cx_run_enforces_its_deadline(): i64 {
-    if (_t_cx_have_runner() == 0) { return 0; }
+    if (_t_cx_have_sandbox() == 0) { return 0; }
     # **The deadline is agnosai's, not kavach's.** The persistent API takes no
     # timeout and SandboxConfig.timeout_ms is ignored by every backend except
     # WASM, so a runner that delegated it would have no bound at all - and a
@@ -351,7 +392,7 @@ fn _t_cx_run_enforces_its_deadline(): i64 {
 # blank: a tool that blew its budget produced no result, and half an answer is
 # worse than none because a caller cannot tell it is half.
 fn _t_cx_timeout_blanks_the_output_it_drained(): i64 {
-    if (_t_cx_have_runner() == 0) { return 0; }
+    if (_t_cx_have_sandbox() == 0) { return 0; }
     var e[8];
     store64(&e, 0);
     var cyx = agnosai_cx_compile(str_from(
@@ -391,7 +432,7 @@ fn _t_cx_budget_resolution(): i64 {
 
 # And the resolved default does not kill a guest that finishes inside it.
 fn _t_cx_zero_timeout_takes_the_default(): i64 {
-    if (_t_cx_have_runner() == 0) { return 0; }
+    if (_t_cx_have_sandbox() == 0) { return 0; }
     var e[8];
     store64(&e, 0);
     var cyx = agnosai_cx_compile(str_from("var i = 0;\nwhile (i < 3) { i = i + 1; }\nsyscall(60, 7);\n"), &e);
@@ -503,7 +544,7 @@ fn _t_cx_policy_shape(): i64 {
 # reports the host uid; the network namespace rides on the same user namespace,
 # which is what makes this the test for both.
 fn _t_cx_guest_is_in_its_own_namespaces(): i64 {
-    if (_t_cx_have_runner() == 0) { return 0; }
+    if (_t_cx_have_sandbox() == 0) { return 0; }
     # If the tests themselves run as root the mapping is invisible — 0 either
     # way — so the assertion would be vacuous rather than wrong. Skip loudly by
     # not counting it rather than asserting something that cannot fail.
@@ -527,7 +568,7 @@ fn _t_cx_guest_is_in_its_own_namespaces(): i64 {
 # --- ADR-006's acceptance test --------------------------------------------
 
 fn _t_cx_guest_cannot_open_etc_passwd(): i64 {
-    if (_t_cx_have_runner() == 0) { return 0; }
+    if (_t_cx_have_sandbox() == 0) { return 0; }
     # **The milestone gate.** ADR-006: "a test asserting a .cyx that attempts
     # open("/etc/passwd") is refused". cxvm dispatches guest syscalls straight
     # to the host kernel with no allowlist, so this passing is entirely
@@ -550,6 +591,33 @@ fn _t_cx_guest_cannot_open_etc_passwd(): i64 {
     assert(code != 127,
       "...refused at the OPEN, not by failing to exec cxvm - a denied exec would \
     pass the assertion above for the wrong reason");
+    return 0;
+}
+
+# The other arm of `_t_cx_have_sandbox`: on a host that cannot confine, the guest never runs.
+#
+# This is the bridge's documented contract ("never fall back to an unconfined spawn"), checked
+# where the guest tests cannot check anything. The guest would print a marker and exit 42. A
+# refusal is either the spawn failing (no result, with the sandbox error set) or kavach's child
+# exiting `SPAWN_EXIT_NS` before cxvm starts. The marker is the proof either way.
+fn _t_cx_fails_closed_without_namespaces(): i64 {
+    if (_t_cx_have_runner() == 0) { return 0; }
+    if (_t_cx_host_confines() == 1) { return 0; }
+    println("  cx: no namespaces for the sandbox here; guest tests take the fail-closed arm");
+    var e[8];
+    store64(&e, 0);
+    var r = agnosai_cx_compile_and_run(
+      str_from("syscall(1, 1, \"guest-ran\", 9);\nsyscall(60, 42);\n"), AGNOSAI_CX_TIMEOUT_MS, &e);
+    if (r == 0) {
+        assert(load64(&e) != 0, "a sandbox that cannot be created is a refusal with the error set");
+    }
+    if (r != 0) {
+        assert_eq(agnosai_cx_result_exit_code(r), SPAWN_EXIT_NS,
+          "the confined child refused at the namespace step (kavach's SPAWN_EXIT_NS)");
+        assert(str_contains_cstr(agnosai_cx_result_stdout(r), "guest-ran") == 0,
+          "...so the guest never ran: no unconfined fallback");
+    }
+    _T_CX_FAIL_CLOSED_CHECKED = 1;
     return 0;
 }
 
@@ -578,6 +646,7 @@ fn main(): i64 {
     _t_cx_zero_timeout_takes_the_default();
     _t_cx_guest_cannot_open_etc_passwd();
     _t_cx_guest_is_in_its_own_namespaces();
+    _t_cx_fails_closed_without_namespaces();
     # Last, so every guarded test above has already had its turn.
     _t_cx_runner_tests_actually_ran();
 

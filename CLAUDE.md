@@ -52,13 +52,13 @@ Port-local modules with no `rust-old/` counterpart (`units`, `order`, `id`,
 "this mirrors rust-old", and inventing a home for them would dilute that.
 
 Anything walking `src/` must recurse: `find src -name '*.cyr'`, not `src/*.cyr`,
-which now matches **nothing** and fails open. `cyrius coverage` and `cyrius tests`
+which now matches **nothing** and fails open. `cyrius coverage` and `cyrius test`
 already recurse.
 
 ```sh
 cyrius deps                                 # resolve dependencies into lib/
 cyrius build src/main.cyr build/agnosai     # compile
-cyrius tests tests                          # run every .tcyr (recursive)
+cyrius test tests                           # run every .tcyr (recursive; `cyrius tests` is gone since 6.7.12)
 cyrius coverage --min 80                    # the 80% gate — its own CI step
 ```
 
@@ -140,9 +140,12 @@ pins, and there is no pre-commit dance.**
 
 CI runs `cyrius deps` on a runner with none of the sibling checkouts
 `path = "../NAME"` points at, so it resolves every dep from `git` + `tag` and
-builds from *that* resolution. Locally the `path` wins, so any `cyrius deps` /
-`cyrius build` / `cyrius tests` rewrites the lock with zero pins — which is
-correct for a local build and simply not what CI uses.
+builds from *that* resolution. Since cyrius 6.7.6 a `path` beside `git` + `tag`
+applies only in local mode (`--local` / `CYRIUS_LOCAL`), and agnosai's `path`
+lines are commented out anyway. So a plain local `cyrius deps` / `cyrius build` /
+`cyrius test` resolves the tags too, and writes the same commit-pinned lock CI
+does. Only in local mode does the `path` win: the lock then describes the sibling
+checkout, which is correct for that build and simply not what CI uses.
 
 CI used to `diff` the two and fail on any difference. That asked a developer to
 hand-produce a byte-equal lock while every local build destroyed it — the lock

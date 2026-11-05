@@ -7,6 +7,198 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1] — 2026-11-05
+
+Cyrius **6.7.18**, and every `[deps.*]` tag on its latest release. Every pin inside those tags names
+a 6.7.18 fold, so unlike 2.2.0 nothing is held back and no pin is off its fold. Three fixes ride along:
+the guard bundle, which 6.7.18's `distlib` regenerated with a requirement missing; a lane-race test
+that a sigil change had left checking nothing; and the cx suite, whose guest tests 6.7.18's tarball
+made run on CI for the first time.
+
+⚠ **Wire-visible**, from the toolchain: a JSON body that repeats a key, or has a number with a leading
+zero, is now **400 "malformed JSON body"**, and a JWT whose header or claims do either is **401**
+(below).
+
+### Changed
+
+- **Cyrius pin `6.7.9` → `6.7.18`.** The re-provisioned `lib/` (113 files) moves the folds sandhi
+  1.10.9 → 1.13.7, sakshi 2.5.8 → 2.5.10, patra 1.16.0 → 1.16.6, sigil 3.13.11 → 3.13.15, sankoch
+  2.8.3 → 2.8.9 and bayan 1.5.13 → 1.11.1, each byte-identical to its tag's `dist/` bundle. Of the
+  toolchain notes the build printed at 2.2.0, sigil's static-array warning is gone and static data
+  falls 1,026,656 → 725,456 B. What reaches agnosai:
+  - ⚠ **bayan 1.11.1's JSON parser refuses a duplicate key and a leading zero** (`{"a":1,"a":2}`,
+    `01`, `-01`). Every JSON route parses its body with it, so such a body is now 400 "malformed
+    JSON body" where 2.2.0 parsed it. Measured on `POST /api/v1/approvals`: the duplicate-key and
+    leading-zero bodies were 422 on 2.2.0, past the parser to the field checks, and are 400 on 2.2.1.
+    The JWT header and claims go through the same parser (`src/server/auth.cyr:635`, `:652`), and a
+    parse failure is `HTTP_UNAUTHORIZED`, so a token that repeats a key is refused. That is the
+    hardening: a duplicate key is how two JSON parsers come to disagree about one token.
+  - **bayan's YAML** (definitions loaded from file, `src/definitions/loader.cyr`) now decodes the
+    escapes in a double-quoted scalar (`"x\ny"` is a real newline) and accepts `''` in a
+    single-quoted one, which used to be "malformed quoted scalar".
+  - **Outbound native TLS** (the remote registry, the AGNOS and security-audit tools, guarded fetch,
+    hoosh): nameConstraints are enforced (CYRIUS-2026-0042); the TLS 1.2 client keeps the server's
+    intermediates, so a chain that failed `TLS_ERR_CERT_INVALID` may now verify; a 33rd KeyUpdate
+    with no data between is refused; secrets are wiped on close. ChaCha20-Poly1305's lane aliasing
+    (CYRIUS-2026-0040) reached agnosai only past 63 concurrent crypto threads.
+  - **sandhi 1.13.7:** `sandhi_server_run_pooled` (`src/server/serve.cyr:798`) waits up to 5 s for
+    its workers before it accepts, and logs WARN "worker pool degraded" if fewer start. The client
+    drops a response header line that contains a NUL. No server status, timeout or default changes.
+  - **`cyrius tests` is gone** (6.7.12; "Unknown command"). CI runs `cyrius test`. The procedures in
+    `docs/development/state.md` now say `cyrius test tests`.
+  - **The compiler's output changes** at 6.7.11, 6.7.13, 6.7.14 and 6.7.17, on identical inputs. What
+    reaches agnosai is 6.7.14's constant folding of a const name on the right (`src/server/router.cyr:391`,
+    `:416`) and its dropped startup stores for constant-initialised globals (15,392 B less code). The
+    rest touch derive code agnosai never runs.
+- **Every `[deps.*]` tag moves to its latest release:**
+
+  | dep | from | to | what reaches agnosai |
+  |---|---|---|---|
+  | `ai-hwaccel` | 2.4.2 | **2.5.6** | ⚠ different numbers (below) |
+  | `kavach` | 3.14.0 | **3.14.2** | on aarch64, the cx tool's namespace confinement now runs instead of refusing |
+  | `sigil` | 3.13.11 | **3.13.15** | the 6.7.18 fold. An RSA public key's DER walks are bounds-checked, so a malformed JWT key is refused (`AGNOSAI_JWT_KEY_BAD`). Crypto lanes come from a pool while in use, so `crypto_bank_set` does nothing (*Fixed*) |
+  | `bote` | 3.4.10 | **3.8.11** | nothing: `src/` calls no bote symbol, and none of its new ones collides. Its sidecar names `sys`, which it includes itself |
+  | `majra` | 2.12.0 | **2.13.0** | nothing: `ratelimit_*` and the relay are byte-identical, so B4's sweep is unchanged |
+  | `tyche` | 1.2.0 | **1.2.2** | nothing: `rng_uniform` gives the same bits |
+
+  Through bote, libro moves 2.11.0 → **2.11.3**; `src/` calls none of it. samay 1.5.1, kavach's
+  optional dep, is not vendored, since agnosai enables no features.
+
+  ⚠ **ai-hwaccel 2.5.6 returns different numbers** from what agnosai's wrappers hand back.
+  `estimate_training_memory` (`src/core/resource.cyr:857`) counts full, DPO, RLHF and distill
+  optimizer state at 7x the base instead of 2x. A 7B full fine-tune reads 117.4 GB, against 52.2 GB.
+  LoRA is unchanged. `reg_plan_sharding` (`src/fleet/coordinator.cyr:349`) is rewritten:
+  - tensor parallelism needs one device kind;
+  - pipeline layers split by memory;
+  - tokens/s depends on model size;
+  - a model that fits nowhere returns `fits = 0` and prints a WARN on stderr.
+
+  `reg_suggest_quant` (`src/llm/router.cyr:246`) counts every AI ASIC, not just Gaudi. In a container,
+  `registry_detect` caps the CPU profile's memory at the cgroup limit, and each detection leaks 40 KB
+  instead of 1.28 MB. No production path in `src/` calls these wrappers; they are API for
+  consumers, and every test of them still passes.
+- **`cyrius.lock` was regenerated from empty: 119 files, 8 commit pins**, each matching its tag on
+  GitHub (`git ls-remote`).
+
+### Fixed
+
+- **6.7.18's `distlib` regenerated the guard bundle with a requirement missing.** Its sidecar verify
+  credited `_uc_decode_utf8`, which `src/server/output_filter.cyr:472` calls, to a named dep.
+  bayan 1.11.1 now includes `lib/unicode` itself, and a dep brings bayan. So it dropped `unicode` from
+  both sidecars. `dist/agnosai-guard.cyr` carries no named dep, so it came out with an empty
+  requires block.
+  - Tested with a consumer that vendors only the guard bundle and declares a core stdlib, as thoth
+    does. The 2.2.0 bundle builds. The regenerated one fails: "undefined function
+    '_uc_decode_utf8' … defined by stdlib leaf 'unicode'".
+  - Fixed with the remedy the cyrius guide gives for a leaf the verify misattributes: an `include
+    "lib/unicode/_decode.cyr"` in `src/server/output_filter.cyr`, the first `lib/` include in `src/`.
+    distlib keeps a bundled module's `lib/` includes as sidecar leaves, so both sidecars list
+    `unicode/_decode` again. Includes are include-once by spelling, so agnosai's own builds skip the
+    line, and the binary is unchanged. The same consumer then builds, at 154,240 B against 478,856:
+    one file of the family instead of all seven.
+  - `math` also left the base sidecar. That is consistent: bayan 1.11.1 includes it, and a
+    full-bundle consumer resolves bayan through ai-hwaccel. It is not changed.
+- **`tests/server_auth_lane_race.tcyr`'s pinned arm had stopped pinning.** It put two threads on one
+  crypto lane with `crypto_bank_set(1)`, which sigil 3.13.14 made a no-op, so the RSA verify guard
+  became a second copy of its control arm. It passed and tested nothing.
+  - It uses `_crypto_lane_alias(1)` now, which sigil keeps, marked "TESTS ONLY", for the lane-race
+    tests.
+  - Each worker records the lane it holds, and main asserts both hold lane 1 (+2). With
+    `crypto_bank_set` back, both assertions fail ("got 0, expected 1").
+- **`tests/sandbox_cx.tcyr` ran its guest tests on CI for the first time and failed 7 of them.** The
+  cyrius 6.7.9 release tarball shipped `cxvm` but not `cycc_cx`, so on every runner the suite found
+  no compiler and each execution test returned before asserting anything. 6.7.18's tarball ships
+  both, so they ran in this release's `ubuntu:26.04` CI replica, and they met the bridge's
+  fail-closed rule. The cx policy demands a network namespace. Unprivileged, that needs a new user
+  namespace, which docker's seccomp profile and Ubuntu's AppArmor restriction both refuse. kavach's
+  child then exits 123 (`SPAWN_EXIT_NS`) before cxvm starts. The tests measured that refusal and
+  read it as a broken guest. The failures had nothing to do with the move itself: the 2.2.0 suite
+  with 6.7.9's tools fails the same 7 in the same container.
+  - ADR-006's acceptance test passed there for the wrong reason: it asserts the guest's `open` code
+    is ≥ 100, and 123 is.
+  - The seven guest tests now take `_t_cx_have_sandbox()`, which asks kavach's own
+    `spawn_namespaces_available` with kavach's own flags for this policy (`_spawn_ns_flags`). On a
+    host that can confine, nothing changes: 87 assertions, as before.
+  - On one that cannot, `_t_cx_fails_closed_without_namespaces` asserts the refusal in their place.
+    The guest, which would print a marker and exit 42, must not run, and no fallback may run it. The
+    suite's final check insists that every guest test this host could not run was covered by it.
+    In the container: 68 passed, 0 failed, as root or not.
+  - Mutation-checked with the audit's mutation, an unconfined `persistent_spawn_confined` in place of
+    `_ns`. In the container the fail-closed test fails ("got 42, expected 123"), and on a host with
+    namespaces the uid test fails as it did.
+  - Whether GitHub's `ubuntu-latest` grants the namespaces is not known from here. The suite is
+    correct either way.
+
+### Performance
+
+**⚠ JSON parsing is 38–66% slower: bayan 1.11.1's hardened parser. Everything else is flat.**
+Measured as at 2.2.0: every `benches/*.bcyr` was built from the 2.2.0 tag on cyrius 6.7.9 and from
+this tree on 6.7.18, and the two ran interleaved, alternating which went first, for 3 rounds of all
+eleven files. **All 224 benchmarks: median +0.3%, 199 within ±5%.** A third build, 2.2.0's source
+and deps on the 6.7.18 toolchain, then ran interleaved with both for 5 rounds of the seven files
+holding the movers. That splits the toolchain from the dep moves:
+
+| benchmark | 2.2.0 | 2.2.0 source, 6.7.18 | 2.2.1 | cause |
+|---|---|---|---|---|
+| `resource_budget_from_json` | 1,660 ns | 2,752 ns (+65.8%) | 2,746 ns (**+65.4%**) | bayan's parser |
+| `hw_inventory_from_json_8dev` | 16,538 ns | 27,070 ns (+63.7%) | 26,959 ns (**+63.0%**) | bayan's parser |
+| `agent_from_json` | 7,701 ns | 12,150 ns (+57.8%) | 12,226 ns (**+58.8%**) | bayan's parser |
+| `builtin_presets_18` | 381.0 µs | 592.0 µs (+55.4%) | 592.6 µs (**+55.5%**) | bayan's parser |
+| `load_preset_from_json_5a` | 19,223 ns | 28,171 ns (+46.5%) | 28,358 ns (**+47.5%**) | bayan's parser |
+| `crew_from_json_10x10` | 171.0 µs | 251.6 µs (+47.1%) | 251.2 µs (**+46.9%**) | bayan's parser |
+| `task_from_json` | 8,726 ns | 12,137 ns (+39.1%) | 12,068 ns (**+38.3%**) | bayan's parser |
+| `durable_deserialize_crew_state` | 2,182 ns | 3,056 ns (+40.1%) | 3,007 ns (**+37.8%**) | bayan's parser |
+| `route_mcp_initialize_global` | 8,871 ns | 10,448 ns (+17.8%) | 10,608 ns (**+19.6%**) | the body's parse |
+| `route_approvals_post_global` | 5,670 ns | 6,344 ns (+11.9%) | 6,348 ns (**+12.0%**) | the body's parse |
+| `auth_jwt_key_prepare` | 10,768 ns | 12,284 ns (+14.1%) | 12,233 ns (**+13.6%**) | sigil's DER walks |
+
+- **Every one is the toolchain**: the toolchain-only build already reads it, so no dep move
+  contributes. The toolchain reader then held the compiler fixed and swapped only the stdlib
+  snapshot, and the JSON rows moved the same way. That puts them on bayan 1.11.1, which reads
+  through bounds-checked slices and now refuses duplicate keys (see *Changed*); bayan's own notes
+  put the cost at "~1.5x". `auth_jwt_key_prepare` is sigil 3.13.15's bounds-checked RSA key walks.
+  Both are hardening of the parsers an unauthenticated request reaches first, so they are kept.
+  In absolute terms, a crew body of 10 agents and 10 tasks parses in 251 µs, and the 18 built-in
+  presets load once at startup in 0.59 ms.
+- **Placement, not claimed either way:** `default_model_capable` +28% and `default_model_premium`
+  −27%, the same pair moving in opposite directions as at 2.1.8. `otlp_ring_drain_16` (+6.2%) and
+  `scheduler_enqueue_100_prebuilt` (+8.5%) are flat in the toolchain-only build (−0.2%, +0.8%) and
+  touch no dep that moved. `tool_registry_has_50_miss` is bimodal again.
+- **`tool_registry_list_{50,500}` +7–8%**, of which about 5.5% is already in the toolchain-only build.
+- `bench-history.csv` gains 224 rows at 2.2.1 from one unpinned `bench-history.sh` sweep, started
+  once the 1-minute load fell below 5 (4.4 at the start, 2.5 at the end). Against 2.2.0's rows, taken
+  at a load of 3.9–4.6, they read median −1.7%, 187 of 224 within ±5%. The JSON rows above are among
+  those outside it.
+
+### Verified
+
+- **The gate**, in CI's order: `cyrius lib sync --full` (113 files) → `deps` (119 locked, 8 commit
+  pins) → `check-symbols.sh` (2,787 definitions, both targets) → `check-clean.sh` (fmt 224, lint
+  125, doc 114, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist) → build →
+  **99 suites, 8,718 assertions, 0 failed** → coverage 99% (1,635/1,647 fns) → `distlib --all
+  --check` → examples → fuzz 4/4 → `cyrius bench` (11 files, 224 benchmarks).
+- **Assertion counts are unchanged by the move.** Each suite of 2.2.0's tree, built on its own pin and
+  run in the same shell, reads 8,716 in total. The only suite that differs is
+  `server_auth_lane_race`, +2 for the lane preconditions. 2.2.0's recorded 8,718 came from another
+  environment.
+- **The binaries.** Native **5,826,992 B** (2.2.0: 5,380,856). The growth is unreachable code: the
+  DCE note reads 2,930,627 dead bytes, against 2,401,264. aarch64 **6,698,984 B** (6,097,136). The
+  native binary answers `GET /ready` with `"version":"2.2.1"`; a `DELETE /health` is a 405 with
+  `Allow: GET`; SIGTERM shuts down gracefully; no startup line carries a NUL. The aarch64 binary was
+  cross-built and not run. `CYRIUS_DCE=1` now compacts the native binary to 2,898,352 B. That build
+  is not adopted, because it is untested.
+- **Every dep tag exists on GitHub** (`git ls-remote`) at the commit the lock pins, and the cyrius
+  6.7.18 release carries the `x86_64-linux` tarball CI's `install.sh` fetches.
+- **The guard profile, from the consumer's side.** A project that vendors only
+  `dist/agnosai-guard.cyr` and declares a core stdlib builds against it. Without the `include` in
+  `output_filter.cyr`, it does not (*Fixed*).
+- **The CI way, on the runner's image.** An `ubuntu:26.04` container ran every `ci.yml` step in
+  order, as an unprivileged user, from a fresh clone with this diff applied. That covered the
+  `install.sh` toolchain at 6.7.18; `lib sync --full` and `deps` from an empty dep cache with no
+  sibling checkouts; the symbol check; `check-clean.sh`; the build (5,826,992 B, as here); wasmtime
+  47.0.3; 99 suites, 0 failed; coverage; the example; fuzz; and `cyrius bench`. The run before the cx
+  fix failed `sandbox_cx` 7 times (*Fixed*), and the run after it passed every step.
+
 ## [2.2.0] — 2026-11-04
 
 Cyrius **6.7.9**, every `[deps.*]` tag on its release on the 6.7.9 line, and the CI and release
