@@ -52,6 +52,7 @@ When the `fleet` feature is enabled, nodes exchange placement plans and results.
 | Unauthenticated nodes | Fleet endpoints behind same auth middleware as API |
 | Message tampering | Deploy behind authenticated transport (mTLS, VPN) in production |
 | Node impersonation | Node IDs are self-assigned; use network-level auth for trust |
+| A peer advancing the coordinator term | `agnosai_federation_declare_coordinator` adopts any declaration whose term is not stale: there is no vote or quorum, so any peer can name a coordinator at a higher term. Federation trusts its peers by design (`src/fleet/federation.cyr`, checked at 2.2.2); keep them on an authenticated transport |
 | State corruption | `Arc<RwLock>` with scoped write locks; no shared mutable state across nodes |
 
 ### 5. Serialization / Deserialization

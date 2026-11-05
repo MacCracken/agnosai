@@ -6,12 +6,14 @@
 # The top of the fleet group: it owns a `CrewStateManager` and consumes the
 # `NodeId` vocabulary `registry` defines.
 #
-# ## The retry arithmetic is off-by-one bait
+# ## `max_retries` is the number of retries (2.2.2, roadmap B30)
 #
-# `task_failed` increments FIRST and then tests `count < max_retries`, so the
-# default `max_retries = 3` yields **two** Retry answers and Exhausted on the
-# third failure — not three retries. Reproduced exactly; the oracle's own tests
-# pin both ends.
+# `task_failed` counts the failure, then answers Retry while the count is at most
+# `max_retries`. So the default 3 gives three Retry answers, and the fourth failure
+# is Exhausted. The oracle tested `count < max_retries`, which allowed one retry
+# fewer than the name says: its default gave two retries, and its own tests pinned
+# `max_retries = 2` as "retries once". The port reproduced that until 2.2.2. Now
+# `max_retries = 0` means no retry at all.
 #
 # ## `fan_out` gives every node the MAX tasks-per-node, not its own count
 #
@@ -125,8 +127,8 @@ fn agnosai_fleet_coordinator_state_manager(c): i64 {
     return load64(c + AGN_FC_STATE_MANAGER);
 }
 
-# The retry ceiling. See the module header: this many FAILURES exhausts a task,
-# so it allows `max_retries - 1` retries.
+# The retry ceiling: a task is retried this many times, and the next failure
+# exhausts it. See the module header.
 fn agnosai_fleet_coordinator_max_retries(c): i64 {
     return load64(c + AGN_FC_MAX_RETRIES);
 }
@@ -247,7 +249,7 @@ fn agnosai_fleet_coordinator_task_failed(c, task_id: Str): i64 {
         map_set(counts, task_id, slot);
     }
     store64(slot, load64(slot) + 1);
-    if (load64(slot) < load64(c + AGN_FC_MAX_RETRIES)) {
+    if (load64(slot) <= load64(c + AGN_FC_MAX_RETRIES)) {
         store64(t + AGN_FT_STATUS, AGNOSAI_FTASK_REASSIGNED);
         return AGNOSAI_FAILOVER_RETRY;
     }

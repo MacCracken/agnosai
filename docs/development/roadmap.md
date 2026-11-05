@@ -43,9 +43,93 @@ starts fresh (see CLAUDE.md).
 | Concurrent crews | 100+ |
 | Fleet msg overhead | <1ms |
 
-## Deleting `rust-old/` — scheduled for the release after 2.1.0, still owed at 2.1.6
+## Release plan
 
-None of 2.1.1 to 2.1.6 carried the deletion. The deletion itself needs the user's OK.
+Which release takes which owed item. The items themselves, with their evidence and what "done" means, are
+under *Owed work*; this section only sequences them. One minor line per theme, patch releases inside a
+line as each piece lands. Reorder freely: nothing in *Owed work* blocks anything else unless its row says so.
+
+### 2.2.3 — P(-1) audit and hardening after the language bumps
+
+**Why now.** Three releases moved the toolchain 6.6.14 → 6.6.20 → 6.7.9 → 6.7.18 and every dep with it (2.1.8,
+2.2.0, 2.2.1). Each move was read for what it changes, but nothing has reviewed the whole tree since the 2.1.0
+audit. Two of 2.2.1's fixes are the class of defect such a move leaves behind *without failing anything*. A
+sigil change turned `tests/server_auth_lane_race.tcyr`'s pinned arm into a copy of its control. And
+`tests/sandbox_cx.tcyr`'s guest tests had never run in CI: the 6.7.9 tarball shipped no `cycc_cx`.
+
+**What.** `CLAUDE.md`'s P(-1), steps 0–9, over the whole tree: read, test and benchmark sweep, cleanliness,
+baseline benchmarks, internal deep review, external research, clean again, tests from the findings,
+post-review benchmarks, and repeat if heavy. The inputs known going in:
+
+- **Tests that can pass without testing.** Sweep every guard that returns before asserting (`_t_*_have_*`,
+  an early `return 0` ahead of assertions) and every test leaning on a stdlib or dep API whose semantics
+  moved in the bumps. Each must either run or assert the arm it took, as `sandbox_cx` does since 2.2.1.
+- **Toolchain capabilities not adopted:**
+  - `[test] stdlib` (6.7.6): move `assert` and `bench` out of `[deps] stdlib`, so `dist/agnosai.deps` stops
+    publishing `assert` to consumers.
+  - Drop `hashmap_fast`, which has no caller.
+  - Declare `sys`: bote-core 3.8.11's and sigil's sidecars need it, and today each bundle includes it itself.
+  - `CYRIUS_DCE=1`: native 5.83 MB → 2.90 MB. Adopt only after the full suite and a smoke run pass on the
+    compacted binary.
+  - `--locked` in CI's Lockfile step, so a drifted lock fails instead of printing a notice.
+  - `sandhi_server_last_failure`, for serve-failure diagnostics.
+  - `[embed]` for the presets (*Recorded by cyrius 6.6.19*, below).
+- **Leaks and stale code the dep readers noticed:**
+  - `agnosai_rate_limit_total_evicted` (`src/server/rate_limit.cyr`) never frees its stats block; use
+    `_agnosai_rl_stat`.
+  - `src/fleet/relay.cyr` says `relay_stats` has no free. majra 2.11.0 added `relay_stats_free`.
+- **The JSON parse cost.** bayan 1.11.1 made parsing 38–66% slower (CHANGELOG 2.2.1 *Performance*). Profile
+  `crew_from_json` and `builtin_presets` for anything agnosai-side, such as a double parse. File upstream with
+  the numbers if the cost is bayan's alone.
+- **Benchmarks that measure their neighbours:** B18, B20, B27. Make the harness trustworthy before 2.3 changes
+  the hot paths.
+- **sigil's lane pool under agnosai's thread counts** (*C*, sigil): probe outbound TLS with more than 64
+  concurrent verifies.
+- **The threat model** (`docs/development/threat-model.md`) still describes the Rust build: axum,
+  `Arc<RwLock>`, the `fleet` feature. Refresh it against the Cyrius tree and the `CYRIUS-2026-NNNN` ids.
+- **Stale line citations.** `lib/<file>:<line>` references in `src/` comments drift with every fold; 2.2.2
+  fixed one in `src/server/auth.cyr`. Sweep them, or cite function names.
+- **B16's raise-ready gaps** (sigil, sandhi, kavach): draft the upstream filings, each with its repro.
+  The kavach WASM stdin deadlock first.
+- B25 and B32, which the audit's test sweep reaches anyway.
+
+**Done means** step 6 clean, step 8's numbers in `bench-history.csv`, and every finding fixed or moved to a
+row under *Owed work* with a measure.
+
+### 2.3.x — the tool-calling harness (agnostic's M6 waits on it)
+
+- **F1**, the tool-calling loop, with its ADR. This is the core of the line.
+- **B33**, models from hoosh's catalog. Every agnostic crew takes the guessed-id path today.
+- The tracing items that hang on F1: **B7** (8) tool-call arguments and results, and (9) the `delegate` tool's
+  unlinked trace.
+- The **`rust-old/` deletion** at 2.3.0, if the user OKs it (its section below).
+
+### 2.4.x — the orchestration contract
+
+- **F3**: the approval gate, and the crew and task lifecycle as a state machine with a per-crew `seq`.
+- **F5** with **B6**: budgets and caps enforced, and a cap on concurrent crews.
+- **F9** (compressed hand-off), then **F2** (hierarchical), which needs F9.
+
+### 2.5.x — durable execution
+
+- **F4**: an event-sourced crew log, resumable from the last completed task. It builds on F3's `seq` stream,
+  and B15's `StateStore` goes with it.
+
+### 2.6.x — protocol and server currency
+
+- **F8**: MCP 2026-07-28 through bote, and A2A v1.0.x.
+- **B8**'s server edges: the SSE stream noticing a departed client, draining in-flight requests, path
+  percent-decoding, certificate-format JWT keys, and `hot_config` notification.
+- The rest of **B7**, the tracing export.
+
+### Any release — quality work that fits beside the above
+
+B9–B15, plus B18, B20 and B27 if 2.2.3 does not close them. Each is Easy or Medium and self-contained.
+
+## Deleting `rust-old/` — owed since the release after 2.1.0; proposed for 2.3.0
+
+None of 2.1.1 to 2.2.2 carried the deletion. The deletion itself needs the user's OK; the *Release plan*
+proposes 2.3.0, the first minor after the 2.2.3 audit.
 
 **The 2.1.0 audit (2026-09-26)** read every item and every `#[test]` in `rust-old/` against
 the Cyrius tree — seven module groups plus everything outside `src/`. Every `.rs` file has a
@@ -57,7 +141,7 @@ time. What it found that was easy is fixed in 2.1.0 (see the CHANGELOG); the res
 - [ ] `git rm -r rust-old`, then delete the ignored `rust-old/target/` (~13 GB) from disk — `git
       rm` leaves it.
 - [ ] Update the text that describes it: CLAUDE.md (identity line, layout section, the DO NOT
-      rule — the user's file, and **B23** moves with it), `CONTRIBUTING.md:47`,
+      rule — the user's file; 2.2.2 corrected its other stale facts under B23, so only the `rust-old/` lines remain), `CONTRIBUTING.md:47`,
       `docs/architecture/overview.md:34,53`, and README.md's note (`:8-11`), tree line (`:42`)
       and `:239`.
 - [ ] `scripts/gen-presets.sh:124` writes a `rust-old/` comment into
@@ -71,108 +155,9 @@ time. What it found that was easy is fixed in 2.1.0 (see the CHANGELOG); the res
 The ~650 comment lines that cite a `rust-old/` path (`# Origin:` headers, test section labels)
 stay as historical pointers; nothing breaks if they dangle.
 
-## Moving the cyrius pin to 6.6.15 — found at the 2.1.5 cut, done at 2.1.8 (to 6.6.20)
-
-✅ **Done at 2.1.8 (2026-11-04), and taken past 6.6.15 to 6.6.20**, the user's chosen target. Every sibling
-this section waited on had by then released on the 6.6.20 line, so the move needed no override pin:
-kavach **3.13.3** and libro **2.10.8** declare sigil **3.13.10** (the 6.6.20 fold) and cyrius 6.6.20, and
-bote **3.3.17** takes that libro. With them: majra 2.9.3, ai-hwaccel 2.4.2, tyche 1.1.1. What the move
-changes here is in CHANGELOG 2.1.8. The analysis below is kept as the reasoning record. It was written
-against 6.6.15 / sigil 3.13.9, and 6.6.20's fold contains both.
-
-cyrius **6.6.15** is tagged upstream (seen 2026-10-04). Its fold carries sigil **3.13.9**
-(sigil tag commit `7d7a880`), which contains 3.13.8 (`bbaecc4`). agnosai pins 6.6.14 and
-`[deps.sigil] tag = "3.13.7"`, the 6.6.14 fold. Neither 2.1.5 nor 2.1.6 moved the pin.
-
-**What sigil 3.13.8 / 3.13.9 fix that agnosai reaches at 6.6.14.** Sources: sigil CHANGELOG
-[3.13.8] and [3.13.9], cyrius CHANGELOG [6.6.15].
-
-- **Not the key exchange.** At 6.6.14 native TLS offers x25519 only:
-  `lib/tls_native_hs13.cyr:11` ("Offers x25519 only (no P-256 ECDH in sigil yet)") and
-  `lib/tls_native_hs12.cyr:303-304` ("Our ECDHE stays x25519 alone"). 3.13.8's constant-time
-  P-256 / P-384 ECDH (`ecdh_p256_*` / `ecdh_p384_*`) is new API. Native TLS first uses it in
-  6.6.15, for TLS 1.2 ECDHE on secp256r1 / secp384r1. The move gains a capability here; it
-  fixes no path agnosai runs today.
-- **Not ECDSA signing (CVE-68, HIGH), as agnosai runs today.** 3.13.7's `ecdsa_p256_sign` /
-  `ecdsa_p384_sign` ran the nonce and the private key through variable-time arithmetic. Native
-  TLS signs only in `_tn_sign` (`lib/tls_native_hs13.cyr:1540-1549`), for the 1.3
-  CertificateVerify, the 1.2 ServerKeyExchange and the 1.2 client CertificateVerify. That
-  path runs only for a TLS server or for a client that holds a client certificate. agnosai is
-  neither. Its HTTPS is outbound through sandhi (`SANDHI_TLS_POLICY_DEFAULT` at
-  `src/tools/remote_registry.cyr:168`, `src/tools/agnos.cyr:282` and
-  `src/tools/builtin/security_audit.cyr:644`). Nothing in `src/` loads a client key, and no
-  other `lib/` module calls the signers. A consumer of `dist/agnosai.cyr` that installs a
-  client certificate would reach this path.
-- **Yes: HMAC and HKDF state left in dead stack (CVE-68 part B, MEDIUM).** Through 3.13.7,
-  `hmac_sha256` / `hmac_sha384` never wiped their SHA context or inner hash, and the context's
-  final state is the MAC. `sha384_finalize` kept its output in scratch, and the SHA-NI and AES-NI
-  asm blocks left their state in vector registers. Every outbound HTTPS handshake does the
-  following:
-  - It runs the TLS 1.3 key schedule on sigil's HKDF (`lib/tls_native_keysched.cyr:114-155`).
-  - It computes the Finished MACs with those HMACs (`lib/tls_native_hs13.cyr:553-621`).
-  - It encrypts records with AES-GCM (`lib/tls_native_keysched.cyr:573-612`).
-
-  The cyrius [6.6.15] notes name "any HMAC / HKDF output (the TLS key schedule)" as left in the
-  dead SHA context. agnosai's audit chain (`src/orchestrator/audit.cyr:210`) and kavach
-  (`lib/kavach.cyr:7511`) call the same `hmac_sha256`. What those two leave behind is the MAC
-  they publish anyway, plus `hmac_sha256`'s unwiped inner hash (`lib/sigil.cyr:6800-6801`), which
-  the audit chain does not publish but which does not stand in for the key.
-- **Nothing in 3.13.9.** Its one security fix (cyrius CVE-73) is for Windows only: the TPM,
-  Secure Boot, IMA, dm-verity and LUKS helpers probed rooted POSIX paths, which are
-  drive-relative on Windows. agnosai builds for x86_64 and aarch64 Linux and calls none of
-  those helpers. The rest of 3.13.9 supports that Windows fix (`agnosys_rooted_paths_untrusted()`,
-  `[lib.secureboot]` carrying `src/sys_util.cyr`, `dist/sigil-tpm.deps` gaining `sys`), plus sigil's own
-  toolchain pin (6.6.9 → 6.6.14) and tests. None of it reaches agnosai.
-
-Two fixes in cyrius 6.6.15 itself, not in sigil, also reach agnosai's outbound TLS:
-
-- **CVE-70:** neither TLS 1.3 side zeroised its ephemeral private key or shared secret after
-  use. At 6.6.14 `lib/tls_native_hs13.cyr:24` and `:181` store them and nothing wipes them.
-- **CVE-71:** neither TLS 1.3 side refused an all-zero x25519 result (RFC 8446 §7.4.2).
-
-A third, **CVE-69**, fixes a `secret var` epilogue that left its return registers in dead stack
-after its own wipe. It applies to every function that 6.6.14 compiles with a `secret var`.
-Native TLS has none of those. In agnosai's `lib/`, the ones that exist are sigil's Ed25519
-key-pair generation and libro's key generation and timestamp nonce (`lib/libro.cyr:3928-4728`).
-
-**Siblings first.** Fix this at the source: release the siblings, and add no override pins
-here.
-
-- kavach **3.13.2** and libro **2.10.6** are their repos' latest tags. Both pin cyrius **6.6.14**
-  and `[deps.sigil] tag = "3.13.7"`.
-- libro also takes sigil's `src/sha_ni.cyr`, `src/sha256.cyr`, `src/hex.cyr` and
-  `dist/sigil-mldsa.cyr` at that tag. Its optional `[deps.sigil_tpm]` moves in lockstep with
-  it.
-- If only agnosai's sigil moves, both siblings declare a sigil that is off the fold.
-  Closest-wins would skip both, as it skipped kavach 3.13.1's at 2.1.3. But `state.md`'s *Now*
-  would no longer hold: it records that every dep's own pins name the folds.
-- libro reaches agnosai only through bote. bote **3.3.16** pins libro 2.10.6 and cyrius 6.6.14,
-  and takes `sigil` from its stdlib fold. So bote needs a release after libro, the same
-  three-repo chain as 2.1.3.
-
-- [x] Release kavach and libro on cyrius 6.6.15 with `[deps.sigil] tag = "3.13.9"` (libro's
-      `[deps.sigil_tpm]` with it). Then release bote on 6.6.15 with that libro. Certify each in
-      a sibling-free replica with an empty dep cache. — *Superseded by their 6.6.20 releases*
-      (kavach 3.13.3, libro 2.10.8, bote 3.3.17, all with sigil 3.13.10), made in those repos.
-- [x] Read 6.6.15's release notes against this tree, checking each numbered item with file:line
-      evidence. The model is the 6.6.6 read-through: `git show
-      2.1.6:docs/development/roadmap.md`, section *Moving the cyrius pin to 6.6.6*. — *Done at 2.1.8 for
-      6.6.15 through 6.6.20*. What reaches agnosai, with file:line, is in CHANGELOG 2.1.8 *Changed*. No
-      compiler fix's pattern occurs in `src/`.
-- [x] Move `cyrius = "6.6.15"`, `[deps.sigil] tag = "3.13.9"` and the new kavach and bote tags
-      together (the sigil tag tracks the fold: rule 1 of the 2.0.10 notes in `state.md`). Then
-      run `cyrius lib sync --full` and `cyrius deps`, and certify in a sibling-free replica with
-      an empty dep cache. Before certifying, check that this host's `~/.cyrius/versions/6.6.15`
-      `SOURCE_COMMIT` reads `2f1ed9d1` with `tree-matches-tag: yes` (it did at the 2.1.6 cut,
-      2026-10-04): a concurrent session working on cyrius rewrites these slots. — *Done at 2.1.8 with
-      6.6.20 and sigil 3.13.10*; 6.6.20's slot read `ae682e23`, `tree-matches-tag: yes`.
-- [x] The full gate, including `check-clean.sh`'s lib snapshot against the 6.6.15 snapshot and
-      `check-symbols.sh` on both targets. — *Done at 2.1.8* against the 6.6.20 snapshot (CHANGELOG 2.1.8
-      *Verified*).
-
 ## Owed work
 
-**Status as of 2.1.7 (2026-10-07). Nothing here blocks anything.** Every remaining item
+**Status as of 2.2.2 (2026-11-05). Nothing here blocks anything; the *Release plan* says which release takes what.** Every remaining item
 is work we owe ourselves — quality, coverage, or a decision — and any of it can
 be picked up in any order. Each entry is self-contained: file paths, measured
 numbers, and what "done" means, so it can be started without reading the session
@@ -192,7 +177,7 @@ is not on it, it is not owed.**
 
 Completed items are removed rather than struck through; what shipped is in `CHANGELOG.md`.
 Labels are never reused, because `state.md`, ADRs and `src/` comments cite them: there is no
-section A (it blocked M6 and was retired 2026-08-03), and B1–B3, B17, B19, B21, B22, B24, B26, B28 (its checker double-counted non-ASCII bytes and set four `—` warnings 3 bytes long; both fixed at 2.1.8), B29, C2, F6 and F7 are closed.
+section A (it blocked M6 and was retired 2026-08-03), and B1–B4, B17, B19, B21–B24, B26, B28–B31, C2, F6 and F7 are closed (B23, B30 and B31 at 2.2.2; CHANGELOG 2.2.2).
 B2's allocator-threading traps, which `src/` and `tests/` comments still cite as "roadmap B2", are
 in `state.md` (*Test-design decisions worth not re-deriving*, *Standing rules a new session should
 not re-derive*) and CHANGELOG [2.0.0].
@@ -207,21 +192,18 @@ as where they were found; F7's non-goal is under *Settled decisions*.
 | B6 | **Crew concurrency** | Medium | No cap on concurrent crews: `submit_crew` spawns a thread per call, where the Rust tree held a semaphore of `max_concurrent_tasks` (default 10). Parallel mode runs fixed batches, so one slow task idles the other slots until its batch ends. Both want a counting semaphore, which the stdlib does not have. |
 | B7 | **Tracing export** | Large | The Rust tree exported every `#[tracing::instrument]` span over OTLP (20 of them: sandbox, routes, crew runner, orchestrator, scoring, cost planning); agnosai exports the four GenAI semconv operations (`invoke_workflow`, `invoke_agent`, `chat`, `execute_tool`), linked into one trace and joining an inbound `traceparent` since 2.1.5 ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)). **What remains:** (1) the other `#[instrument]` sites as spans, under the same explicit span-context threading (no thread-local: ADR 023 records why) — the routes' HTTP server spans can use `agnosai_http_server_span_a` (2.1.7, ADR 024), which an embedding consumer already records through; (2) trace and span ids in JSON log lines, and per-module targets, which needs sakshi's log hook to expose them; (3) aggregate usage on `invoke_agent` (the sum of its `chat` spans' tokens); (4) request parameters on `chat` (`gen_ai.request.temperature`, `max_tokens`, declared and never set); (5) `gen_ai.response.finish_reasons`, a `string[]` that needs an OTLP `arrayValue` the encoder does not write; (6) `Span.flags` with the W3C is-remote bit for a span whose parent arrived in a header; (7) `tracestate` passthrough; (8) tool-call arguments and results on `execute_tool`, which need F1; (9) **the `delegate` tool starts an unlinked trace** (found 2026-10-03, F6 review): `src/tools/builtin/delegate.cyr:78-83` builds the delegated spec and calls `agnosai_orchestrator_submit_crew` with no trace parent, because the tool vtable carries no span context. **Repro:** a deployment that calls `agnosai_register_delegate_builtin`, with the exporter on, sends `/mcp` `tools/call` `delegate` with a `traceparent`: the `execute_tool delegate` span joins the header's trace, the delegated crew's `invoke_workflow delegate:<agent>` span is a new root. The pinned semconv (`gen-ai-agent-spans.md`, *Invoke workflow span*) also says an `invoke_workflow` span SHOULD NOT be reported when an agent or tool spins up a workflow to delegate to a sub-agent. **Fix direction:** once a tool call has a span context (F1, or a context on the vtable), format it with `agnosai_otlp_span_context_format_a` and stamp it on the spec through `agnosai_crew_with_trace_parent`, and decide whether a delegated crew emits `invoke_workflow` or only its `invoke_agent` spans; (10) **an operator switch for an untrusted inbound context** (found 2026-10-03, F6 review): any caller of the three traced routes picks the trace id agnosai's spans join and can turn their export off with sampled flag `0` (`src/telemetry/mod.cyr`, `agnosai_telemetry_record_span_in`: `if (agnosai_otlp_span_context_sampled(sc) == 0) { return 0; }`; pinned by `tests/server_serve.tcyr`'s unsampled-header check). Recorded as surface 7 in `threat-model.md` and in ADR 023. **Fix direction:** an env switch read at boot, e.g. `AGNOSAI_OTEL_INBOUND=honour|restart|record` — `restart` ignores the header (new root, the inbound id at most as a span link), `record` keeps the trace but samples regardless of the flag. |
 | B8 | **Server edges** | Medium each | An SSE stream holds one of the 100 pool workers for the crew's life and does not notice a departed client (since the 6.6.20 pin, 2.1.8, sandhi 1.10.8's chunked verbs return the write result, but `src/server/routes/sse.cyr` discards all six: lines 94, 154, 157, 180, 249 and 257; see *C*, sandhi); shutdown does not drain in-flight requests; chunked request bodies are 501 (sandhi has no decoder); path parameters are not percent-decoded; a certificate-format JWT key (and a key over 4096 bits) is refused; `hot_config` has no change notification. |
-| B9 | **WASM** | Medium | A module with no `_start` export runs and "succeeds"; a module is validated by its header only, so a malformed body fails at execute; the Rust store limits (10 instances/tables/memories, trap on failed grow) and stdin over 64 KiB need kavach options; WASM tools held by a registry never free their staged module (`agnosai_wasm_module_free` exists; the registry has no destroy hook). The execute path runs the `wasmtime` CLI through kavach's WASM backend ([ADR 019](../adr/019-wasm-tools-spawn-wasmtime-directly.md); the filename names the reversed draft). |
+| B9 | **WASM** | Medium | A module with no `_start` export runs and "succeeds"; a module is validated by its header only, so a malformed body fails at execute; the Rust store limits (10 instances/tables/memories, trap on failed grow) and stdin over 64 KiB need kavach options; WASM tools held by a registry never free their staged module (`agnosai_wasm_module_free` exists; the registry has no destroy hook). The execute path runs the `wasmtime` CLI through kavach's WASM backend ([ADR 019](../adr/019-wasm-tools-spawn-wasmtime-directly.md); the filename names the reversed draft). **Found at 2.2.2 (B16):** a WASM tool that echoes its input as it reads can hang its worker for good when the input passes roughly two pipe buffers (about 100–200 KB), because kavach's capture writes stdin before it drains stdout and its deadline never fires there. Until kavach fixes it, agnosai could refuse tool input over 64 KiB, or stage it in a file. |
 | B10 | **JSON forms nothing calls** | Easy each | Serde shapes the Rust types derived but no Rust code serialised: fleet `NodeInfo`/`NodeStatus`/`NodeTopology`/`DeviceLink`/`InterconnectType`/`FederationRole`/`ClusterStatus`/`ClusterInfo`/`RelayMessage`; `RetryConfig`; `TaskProfile`, `BudgetExceeded`, `CachedPlan` and `ToolSchema`/`ToolOutput` parsers; `ToolInput` and the manifests' writers; `KavachToolResult`. |
 | B11 | **Structured-log fields** | Easy each | Log events that lost their fields or are absent: fleet (17, federation's nine above all), wasm (no sakshi calls at all), kavach bridge, process/OCI exit lines, wasm loader and remote registry error details, the MCP tool-call line's `success`/`duration_ms`, a2a rejections' id prefix and `metadata_bytes`, `latency_ms` in task-result metadata. |
 | B12 | **Behaviours no suite asserts yet** | Easy each | Orchestrator: diamond DAGs (sort, ready set, a run), parallel/DAG `task_ms`, event-bus delivery, the cancel audit entry, per-task audit level, a 64 KiB+ IPC echo, and **concurrent cancel** — mid-execution interruption and parallel/DAG cancel stress (`tests/orch_crew_runner.tcyr:1382-1408` cancels only before a run starts; the Rust tree never tested it either, see *Carried over from the Rust line*). Core: `Cpu` → `"cpu"`, multi-device filtering and sums, a negative non-zero cost. Sandbox: real fuel exhaustion (-2), a real timeout, empty stdin to a reading guest, the Python bridge's `"error": null`. Tools: AGNOS schema names/descriptions/parameter types and missing-parameter errors. Server: output-filter pattern text, `http://[::1]:8080`, the echo tool's parameter type. |
 | B13 | **Network-facing tools** | Medium | The load tester has no connection pool (every request is a fresh handshake); its success path and the security audit's live sequence have no test, since no suite stands up a loopback server. |
 | B14 | **Seven benchmarks** | Easy–medium | The sandbox execute path (process argv, stdin, shell; WASM hello) and `audit_recent(10/100/1000)`. |
 | B15 | **Smaller gaps** | Easy each | Output-filter leak detection folds ASCII case only; a pub/sub subscriber cannot detach alone (only `unsubscribe_all(pattern)`); `StateStore` (pluggable persistence) is not ported; `strcase` is ASCII-only though the crew assembler matches user-supplied names. |
-| B16 | **Upstream gaps — noted, NOT raised** | — | ⛔ **Do not raise any of these until agnosai is on the latest version of that project**, then re-check the gap against that version first. bayan, sigil and sandhi are cyrius stdlib folds: agnosai takes the version the pinned cyrius folds, and their newer releases wait for the next cyrius fold. **⚠ At 2.2.1 (cyrius 6.7.18) all four are due their re-check.** agnosai now takes each repo's latest release: bayan 1.11.1, sigil 3.13.15 and sandhi 1.13.7 (the 6.7.18 folds) and kavach 3.14.2 (seen 2026-11-04). Re-check each gap below against those versions before raising any of them; some may be closed already (bayan 1.11.1, for one, now decodes escapes in double-quoted YAML scalars). **bayan** (fold 1.5.12; listed at 1.5.6) — YAML beyond the subset parser: block scalars, flow mappings, anchors, tags, escape decoding in quoted strings. **sigil** (fold 3.13.10; listed at 3.12.18) — RSA keys over 4096 bits (a certificate-format key is agnosai's own to fix, B8). **sandhi** (fold 1.10.8; listed at 1.9.17) — decoding chunked request bodies. **kavach** (3.13.3, a direct dep; 3.13.2 rebuilt the WASM backend's capture and stdin, so re-check the stdin gap against it) — WASM store limits (instance/table/memory caps, trap on a failed grow) and guest stdin over 64 KiB. |
+| B16 | **Upstream gaps — re-checked at 2.2.2 against each project's latest release; three are ready to raise** | Small each | The rule was: raise none until agnosai is on that project's latest version, then re-check first. 2.2.1 met it (cyrius 6.7.18's folds bayan 1.11.1, sigil 3.13.15 and sandhi 1.13.7, and kavach 3.14.2), and 2.2.2 re-checked each with a probe. None is filed upstream. **bayan:** escape decoding in quoted scalars is **closed** (since bayan 1.8.0). Block scalars, flow mappings, anchors/aliases and tags are still refused (`lib/bayan.cyr`'s `yaml … not supported` errors), but bayan's roadmap lists full YAML 1.2 under *Out of scope* and its ADR 0008 makes the refusals deliberate, so this is a scope request, not a bug report; raise it only if a definition file needs one. **sigil:** RSA keys over 4096 bits are still refused (`_rsa_recover_em`'s `n_len > 512`): an RSA-8192 key parses and then fails to verify. sigil's CHANGELOG 3.6.2 states the bound. Ready to raise. A certificate-format JWT key is agnosai's own to fix (B8). **sandhi:** a chunked request body is still 501. `sandhi_server_request_has_unsupported_te` refuses any `Transfer-Encoding`, and the pooled worker agnosai runs answers 501 before calling the handler. Ready to raise. **kavach:** (1) WASM store limits: the backend passes only `max-memory-size` and fuel to `wasmtime`, and exposes no option for `max-instances`, `max-tables`, `max-table-elements`, `max-memories` or `trap-on-grow-failure`, all of which wasmtime 50 offers. Ready to raise. (2) ⚠ **Not a 64 KiB limit but a deadlock:** `confine_capture_input` writes the whole stdin with one blocking write before it starts draining stdout. A guest that reads all its input and then writes works at 64 KiB, 100 KB and 200 KB (1 MiB is cut by the 1 MiB stdout cap). A guest that **writes while it reads** hung at 200 KB with kavach blocked on stdin and wasmtime blocked on stdout, and kavach's own timeout never fired. kavach's CHANGELOG 3.11.8 says to pass a large input by file, but nothing refuses it. Raise first; meanwhile see B9. |
 | B18 | **`lt_aggregate_100k_500workers` is ~2x its 2026-08 band** | Medium | Found at 2.0.6 (88.2 ms against ~24 ms), 45.4 ms at 2.1.3 on cyrius 6.6.14, and still open. The measurements, what is ruled out (not the compiler, not the benchmarked source, not noise) and where to start (the 2026-08-03 `_a` allocator work, a ~6-round bisect over 40 commits) are in `state.md`, "⚠ OPEN — a ~3.6x regression, found at 2.0.6". |
 | B20 | **A second live thread moves a crew's cost — both ways** (found 2026-10-03, F6 fix round) | Medium | Measured with one process per row, seven interleaved rounds, medians: an idle detached thread that only `sleep_ms(25)`s took `run_crew_10_tasks_sequential` **334 → 400 µs (+20%)** and `run_crew_10_tasks_parallel_4` **624 → 456 µs (−27%)**, at 2.1.4 and on the then-current tree alike. `benches/orch.bcyr` already runs those rows at the second-thread level (parallel ~456 µs; sequential 380–400 µs across two gate runs), so some earlier row leaves a thread alive, which is also the likeliest reading of the `crew_runner_10_tasks_parallel_4_quiet` level shift recorded under CHANGELOG 2.1.5 → Performance. **Repro:** add a mode to a copy of `benches/orch.bcyr` that calls `thread_create_detached` on a `while (!stop) { sleep_ms(25); }` body before `_b_run_crew("run_crew_10_tasks_parallel_4", ...)`, and run it beside the plain row in separate processes. **Why it matters:** a production server always has other threads (the pool, the exporter), so the single-threaded bench level is not what a deployment sees, and a row's number depends on what ran before it. **Direction:** find which stdlib path switches on a second live thread (mutex/futex, the allocator, `thread_create`/`thread_join`, stack mmap) — if it is the stdlib, file it against cyrius rather than patch it — and then decide whether `benches/orch.bcyr` should pin the level explicitly (start one idle thread in `main`) so rows stop depending on their neighbours. Related: **B27**, the same file's rows moved by heap position. |
-| B23 | **`CLAUDE.md` describes `rust-old/` as of 2.1.0, and its consumer list is stale** (found 2026-10-04, at the 2.1.5 cut) | Easy | `CLAUDE.md:16` (the identity line) says rust-old/ is "scheduled for deletion in the release after 2.1.0". `CLAUDE.md:24` says it is reachable at "any tag up to 2.1.0". rust-old/ is still present in 2.1.1 through 2.1.6. Fix: name the last tag that carries rust-old/ once it is deleted, or until then "every tag through the current one". `CLAUDE.md:20` lists daimon as a consumer, but daimon has no `[deps.agnosai]` (its deps are sakshi, ai-hwaccel, samay, sigil, libro, majra, bote) and no HTTP client aimed at an agnosai endpoint — checked at 2.0.0 and still true at 2.1.6; agnostic is the consumer. `CLAUDE.md:187` describes `roadmap.md` as "milestones through v1.0, dependency gates". **CLAUDE.md is the user's file: the user edits it, or approves the edit.** `state.md`'s *Consumers* (`:2929-2930`) also says "none consuming the Cyrius line yet"; fix it at the next state refresh. Moves with the `rust-old/` deletion. |
 | B25 | **The serve handler's arena read of `traceparent` is not covered by a test** (found 2026-10-03, F6) | Medium | `sandhi_server_find_header_a(…, "traceparent")` runs only on the arena branch, which needs a sandhi worker arena. The pipe harness reaches only the bare branch, as it does for every other header. Fix: a harness that runs one request through a real pooled worker with an arena, asserting that the crew's spans carry the inbound trace id. That would cover the other arena-branch header reads too. |
 | B27 | **`crew_runner_10_tasks_parallel_4_{quiet,watched}` measure the global heap's position, not the runner** (found 2026-10-04, at 2.1.6) | Easy–medium | In `benches/orch.bcyr`, with the traced block before them (`run_crew_10_tasks_*_traced`, which starts and stops an OTLP exporter) the 2.1.5 tag reads ~420 µs; with that block removed, ~507 µs — and 2.1.6, whose exporter no longer leaks there, reads ~505 µs either way. Interleaved A/B builds ruled out job false sharing, the data-section layout and the exporter's timeouts. At 2.1.8 (cyrius 6.6.20) the rows read 578 → 433 µs (quiet) interleaved against a 2.1.7 build. The runner makes no channel call, but the benches before it now run faster (6.6.16's channels), so this too is not claimed. **Fix:** run these rows first, or in their own `.bcyr`, so a change elsewhere in the file cannot move them; then rebase their history. Related: **B20**. |
-| B30 | **Oracle flaws reproduced before the "never copy a Rust flaw forward" rule** (recorded at the fleet port, 2026-08-08; the rule is `CLAUDE.md:121`, added at 2.0.10) | Easy each | Four behaviours that read like defects were reproduced from the oracle and pinned by assertions so nobody would "fix" them by accident: (1) **`fleet/gpu`: allocating twice for one task id leaks the first allocation** — `allocate` ends with a map insert that replaces, so the first allocation stays charged to its device with no record and `release` can never return it (`src/fleet/gpu.cyr:24-31`, which points here); (2) **`FleetCoordinator`'s `max_retries` allows one retry fewer than it names** — `task_failed` increments first and then tests `count < max_retries`, so the default 3 yields two Retry answers and Exhausted on the third failure (`src/fleet/coordinator.cyr:7-12`; the oracle's own tests pin both ends); (3) **`topology_score` is not clamped to the 1.0 its doc promises** — a raw link count over the device-pair count, so three links between two GPUs score 3.0 (`src/fleet/topology.cyr:10-16,149`); (4) **`FederationManager::declare_coordinator` adopts any term that is not stale** (`src/fleet/federation.cyr:19-26`). `CLAUDE.md:121` now says never copy a Rust flaw forward and never propose "restore parity" as an option. **Fix direction:** fix each, invert its pinning assertion, and add an ADR where the change is visible on the wire. Look at (4) before changing it: accepting a higher term is the usual leader-election rule, and its header already says not to change the guard to `<=` without an ADR; if it is correct as it is, say so in place and drop it from this row. |
-| B31 | **`check-clean.sh` lints `src/`, `benches/` and `examples/`, but not `tests/`** (found 2026-10-08, at 2.1.7) | Easy | fmt covers `tests/*.tcyr`; the lint loop does not, so a test line over 120 characters or an untracked deferral passes the gate. At 2.1.7, 20 of the 99 suites carry findings — `tools_wasm` (19) and `sandbox_wasm` (23 and a deferral) most, `orch_crew_runner` three deferrals, the rest one or two long lines or a doubled blank. 2.1.7's own test lines were made clean by hand. Fix: wrap or tag each finding, then add `$(find tests -name "*.tcyr" | sort)` to the lint loop (agnostic has the same gap: its gate lints `tests/**/*.cyr`, the shared support code, but not its suites — its roadmap, 2026-10-08). |
 | B32 | **A WASM tool's staged module outlives the tool, and staging and nine suites ignore `TMPDIR`** (found 2026-10-08, at 2.1.7) | Medium | `agnosai_wasm_load_module` stages every module at `/tmp/agnosai-wasm-<uuid>.wasm` (`src/sandbox/wasm.cyr:192`), because wasmtime runs it from a path. `agnosai_wasm_module_free` removes it, but nothing calls it outside the suites: `agnosai_tool_registry_remove` only drops the map entry, so `DELETE /api/v1/tools/{name}` of a WASM tool, or re-registering one under the same name, leaves its file for the life of the host. Freeing on removal is not enough by itself: another thread may have looked the tool up and not yet started wasmtime on the path, so the free must wait for in-flight executions (a reference count on the tool, or unlink after wasmtime has opened it). Stage under `$TMPDIR` (`/tmp` when unset). The suites: nine write fixed `/tmp` paths — `server_routes_sse`, `sandbox_oci` and `sandbox_manager` never unlink theirs; `orch_durable_state`, `definitions_packaging`, `definitions_loader`, `sandbox_wasm`, `orch_ipc` and `tools_wasm` unlink some — so two runs at once collide, and two full runs at 2.1.7 left 28 staged modules and nine other files behind. agnostic 0.1.15 fixed the same thing in its suites with a shared `tests/support/tmp.cyr`. |
 | B33 | **Choose and attribute models from hoosh's catalog, not from names agnosai carries** (found 2026-10-09, thoth 0.52.7 / hoosh 2.8.0) | Medium | agnosai names models itself in four places. (1) **Selection.** An agent with no `llm_model` gets `agnosai_default_model(agnosai_route(profile))` (`_agnosai_crew_select_model`, `src/orchestrator/crew_runner.cyr:301`, called at `:706` and on the validation retry at `:744`; `src/llm/router.cyr:189-193`): `llama3:70b` for Capable, `llama3:405b` for Premium, and `llama3:70b` with no agent at all. hoosh routes by the id it is given, so a gateway with no `llama*` route answers every such crew 404 ("no provider for model"), and one with an Ollama route sends it to a local 70B model whether the box has one or not. Every agnostic crew takes this path: none of its presets sets `llm_model`. (2) **Attribution.** When a response carries no `usage.provider` (`crew_runner.cyr:646-653`), `_agnosai_crew_infer_provider` (`:160`) guesses from nine name prefixes, so `o4-mini` (pinned, `tests/orch_crew_runner.tcyr:528`), `gpt-oss`, `qwen/…` and every newer family bill to Ollama. Until hoosh 2.8.0 a *streamed* response carried no usage at all, so every streamed crew took this path. (3) **`fleet/cost_planning.cyr`**'s `BUDGET_MODELS` and `agnosai_select_cheapest_model` (`:42`, `:242`, `:283`): the oracle's model and price list, a public library API that nothing in `src/` calls. (4) **Docs**: README.md:178 and `docs/architecture/overview.md:146` show `"llm_model": "capable"`, which is sent literally (hoosh has no tier aliases), and `scripts/stack.sh:35` defaults `AGNOSAI_MODEL` to `llama3` (its comment at `:34` names `claude-opus-4-8`). It also **rewrites the id an agent names**: `_agnosai_crew_strip_provider_prefix` (`crew_runner.cyr:274`, segments at `:243`) drops a leading `openai/`, `anthropic/`, `deepseek/` and nine more, for the oracle's litellm-style ids. Some providers' real ids carry exactly that prefix (Groq serves `openai/gpt-oss-120b`; OpenRouter's ids are `anthropic/…` and `openai/…`), so an id picked from the catalog reaches hoosh renamed, and hoosh routes the bare name to another provider or to none. **What hoosh 2.8.0 offers** (hoosh ADR 012): `GET /v1/models/catalog` lists what each provider serves now, asked of each route live and refreshed every six hours. Each entry is `{id, owned_by, source, routes}` plus, when known, `display_name`, `context_window`, `max_output_tokens`, `capabilities` (`vision`, `thinking`, `effort`) and `pricing` (`input_micro_usd_per_1k`, `output_micro_usd_per_1k`). A stream now ends with a usage chunk carrying `provider` and `cost_micro_usd`. agnosai already has `agnosai_hoosh_models_path` and `agnosai_hoosh_extract_models` (`src/llm/hoosh.cyr:101`, `:557`), exercised by the tests only. **The work:** (a) read the catalog (`/v1/models/catalog`, falling back to `/v1/models` on a 404) once per process and again when a selection fails, into process-lifetime storage, not a request arena; (b) map the router's tier onto it — the catalog carries prices and capabilities but no tier, so either rank the entries whose `capabilities` fit the task by `pricing`, or ask hoosh's `POST /v1/cost/recommend` once it ranks the live catalog (today it ranks only routes' literal patterns, `handle_cost_recommend`; recorded on hoosh's roadmap 2026-10-09) — with an operator override per tier, the choice made in this item's ADR; (c) attribute a response with no `usage.provider` to its catalog entry's `owned_by`, and retire the prefix needles; (d) with no catalog (hoosh unreachable, or an empty list), fail the crew with a named error rather than send a guessed id; (e) price `BUDGET_MODELS` from the catalog's `pricing`, or drop the oracle list — the same ADR decides; (f) fix the two docs and `stack.sh`; (g) send an id the catalog lists exactly as listed, and strip a `provider/` prefix only from one it does not (or retire the strip; the same ADR decides). **Tests:** a canned catalog body, selection per tier, attribution from `owned_by`, the no-catalog error, a listed `openai/…` id sent unchanged; the `llama3:*` assertions (`tests/llm_router.tcyr:84,86`, `tests/orch_crew_runner.tcyr:699`) move with the change. agnostic waits on this (its roadmap, *Waiting on agnosai*). |
 
@@ -243,40 +225,9 @@ day. **The ask:** an `_a` form of `sockaddr_in` (or a caller-supplied buffer), a
 | Dep | Open |
 |---|---|
 | sandhi | **Fixed upstream, reached at 2.1.8:** `2026-10-03-chunked-response-verbs-discard-send-result.md` — sandhi 1.10.5 made the chunked verbs (and 1.10.8 the one-shot verbs) return the write result, and the cyrius 6.6.20 fold agnosai pins carries 1.10.8 (`lib/sandhi.cyr:13715-13757`). agnosai's half is open: `src/server/routes/sse.cyr` discards the result (B8). **Not filed:** `backlog` is silently ignored by `run_opts`/`run_async` (only `run_pooled`, `run_tls` and `run_pooled_tls` read it); the chunked start hardcodes `" OK"`; **inbound** chunked decoding is unsupported (answers 501 — honest, but not support; B8, B16). |
-| sigil | **Not filed, not probed (B16 rule: re-check once agnosai is on sigil's latest).** Read at 3.13.7; the 6.6.20 fold agnosai pins since 2.1.8 is 3.13.10, whose only banking change is ECDSA's (3.13.8's constant-time signer: `cbank()` uses 189 → 184, all in `ecdsa_p256_sign` / `ecdsa_p384_sign` and their helpers); the symmetric scratch this row is about is banked as at 3.13.7 (sha256's schedule is now `lib/sigil.cyr:6546`). At the pinned 3.13.7 the asymmetric stack (RSA sign and verify, PSS, the bignum engine) has been stack-local since 3.12.9, but the symmetric/EC scratch — sha256/512, hmac, hkdf, aes-gcm, chacha20-poly1305, ecdsa, ed25519, x25519 — is still `cbank()`-banked per lane (e.g. sha256's message schedule, `var Wb = &W + cbank() * 512`, `lib/sigil.cyr:6419`), and lanes are never released. The bound is 63 *lifetime* crypto-touching threads, which agnosai passes: 100 pool workers (JWT sha256, `AGNOSAI_SERVE_WORKERS`, `src/server/serve.cyr:149`), plus one detached thread per crew (the audit chain's `hmac_sha256`, `src/orchestrator/audit.cyr:210`, and outbound TLS to hoosh), one per A2A callback, and the exporter. Past it, two threads can share a lane. sigil calls the result fail-closed (`lib/sigil.cyr:5286-5317`): a corrupted digest or a failed handshake, not a forged accept — which here could still mean a corrupted audit-chain HMAC or a spuriously failed outbound handshake. sigil offers `crypto_banks_exhausted()` for consumers to poll at steady state; nothing in `src/` calls it. **Next step:** probe it (poll after the pool is up, and under a crew load), then decide between polling, capping, or a sigil filing. `tests/server_auth_lane_race.tcyr` stays as the RSA lane-bypass regression guard. |
+| sigil | **The lane bound changed at sigil 3.13.14, so re-probe it in the 2.2.3 audit.** Through 3.13.13 a lane was drawn from a never-decremented counter, so past 63 lifetime crypto threads two live threads could share one; agnosai passes that with its 100 pool workers plus a thread per crew. Since 3.13.14 (agnosai's pin carries 3.13.15) lanes are pooled, and no two live threads ever hold one (CYRIUS-2026-0040). The 64 lanes are taken only while a lane-scoped operation runs, and with none free it **refuses**. Two kinds of refusal: the scoped entry points (ECDSA P-256/P-384 verify, the Poly1305 stream) return failure, but a direct call into the variable-time EC arithmetic outside a scope takes a lane for the thread's life and, with none free, **ends the process (exit 70)**. A thread that retires holding a sticky lane keeps it out of the pool. Read at 2.2.2, not probed: agnosai's outbound native TLS reaches only the scoped kind (`ecdsa_p256_verify_der` and `ecdsa_p384_verify` are scoped; ECDH goes through the constant-time `_ect_*` path, which keeps no lane state; hashing and HMAC are function-scope). So the worst case there is a failed handshake when more than 64 verifies run at once, never a shared lane or an exit. **Next step (2.2.3):** probe concurrent outbound TLS past 64 threads and confirm no path reaches a sticky claim. `tests/server_auth_lane_race.tcyr` pins the RSA verify's lane-freedom with `_crypto_lane_alias` since 2.2.1. |
 | hoosh | **To file (found 2026-10-03, F6).** hoosh 2.7.1 extracts an inbound `traceparent` strictly (`src/lib/trace.cyr:99-141`, `src/main.cyr:124-127`), but exports its own server span with the inbound **parent-id as its own spanId** and no `parentSpanId` (`src/lib/otlp.cyr:72-77`), then forwards the same traceparent to providers. **The ask:** mint a fresh span id for hoosh's span, emit the inbound parent-id as its `parentSpanId`, and forward a traceparent carrying hoosh's OWN span id. **Then agnosai's half:** `agnosai_hoosh_chat_in` adds an outbound `traceparent` header built from its `chat` span's context (`agnosai_otlp_span_context_format_a` already exists), and hoosh's span becomes the chat span's child. Until hoosh changes, sending the header would give hoosh's span the same id as agnosai's `chat` span inside one trace, so agnosai deliberately sends none ([ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md)). Not filed from this lane: the upstream filing is a separate step. **Recorded on hoosh's roadmap (2026-10-09, for B33):** `POST /v1/cost/recommend` ranks only routes' exact-model patterns (`handle_cost_recommend`, which skips every pattern ending in `*`), not the live catalog hoosh 2.8.0 keeps, so a gateway whose routes are all `claude-*`-style answers it 404 ("no capable exact-model route"). B33 can map tiers without it; the ADR picks. |
-| kavach | **Both closed: one by the 2.2.0 pin, one by 2.2.1's (and it never reached agnosai).** `2026-10-03-pinned-exec-breaks-uutils-coreutils.md`: **fixed in kavach 3.14.0, the pin since 2.2.0** (archived in its tree). 3.13.x execed the pinned fd with `execveat(AT_EMPTY_PATH)`, which hands the binary `/dev/fd/N` as its path, and uutils coreutils (Ubuntu's default from 25.10) take their utility name from that path, so `/bin/echo`, `cat` and the rest exited 1 under kavach on such a host. 3.14.0's `_kv_exec_via_proc` execs `/proc/self/fd/N` first, after checking procfs, the pinned dev/inode and that the file is no `#!` script, and uutils accept it. `tests/sandbox_kavach_bridge.tcyr` pins it by running the host's `/bin/echo`, which fails on `ubuntu:26.04` against 3.13.3. `2026-10-02-basic-seccomp-kills-native-tls-writes.md`: fixed in kavach 3.14.1, which agnosai's pin carries since 2.2.1 (3.14.2). **It never reached agnosai, though this row said through 2.1.8 that it did.** A policy with `seccomp_enabled` gets `security_create_exec_seccomp_filter()` on every kavach spawn path, a default-allow deny-list (`lib/kavach.cyr:10270`, `:10429`, `:10718`). The `basic` allowlist builder (`:1991`), which lacks `sendto`, has no caller, so agnosai does not apply it to any tool. |
-| bote | **To file (found 2026-10-07).** The client half of MCP: sending `initialize`, `tools/list` and `tools/call` to a server named in bote's `HostRegistry`, whose entries can already declare a `tools/call` capability behind its SSRF guard. F1's registry needs it for tools from external MCP servers (F1, harness rule 4). bote 3.3.17, the pin since 2.1.8, is the server half only — dispatch, six transports, sessions. agnostic records the same ask (its `roadmap.md`, *Upstream*). |
-
-**Recorded by cyrius 6.6.16 (2026-10-05) — what that release changes here.** ✅ In effect since 2.1.8, whose pin
-(6.6.20) contains 6.6.16; none of it needed an agnosai code change. The sandhi item's agnosai half is B8.
-
-- **sandhi row — the chunked-verbs filing reaches agnosai at 6.6.16.** cyrius 6.6.16 folds sandhi **1.10.7**
-  (1.10.5 and 1.10.6 were never folded on their own): the one-shot and chunked response verbs report their
-  write results (B8's SSE stream can notice a departed client), and concurrent requests no longer run under
-  each other's TLS policy hook. Re-check B8 / B16 against it at the bump.
-- **kavach row — a correction to the `basic`-profile reach.** cyrius 6.6.16's review of kavach 3.13.2
-  (recorded in kavach's `2026-10-02-basic-seccomp-kills-native-tls-writes.md`, 2026-10-05) found that the
-  `basic` POLICY never selects `security_create_basic_seccomp_filter`: every spawn path loads the deny-list
-  `security_create_exec_seccomp_filter`, which allows `sendto` / `poll` / `fcntl`, and the policy's
-  `seccomp_profile` string is never read to pick a filter. So agnosai's process-isolated tools are NOT killed
-  by it; only a process that loads the basic filter on itself is (from 6.6.16 also on a plain socket write).
-- **Channels (cyrius thr-1).** `src/arena_pool.cyr`'s `chan_try_recv` / `chan_try_send` never wait, so their
-  semantics were already right everywhere, but before 6.6.16 the ring was unlocked on arm64 macOS — a data race
-  under real threads; 6.6.16 locks it. `src/llm/inference_queue.cyr:223`'s per-request `chan_new(1)` reply
-  channel now really waits on Windows (it answered 0 at once before); it holds no kernel handle per channel —
-  a waiting call borrows an I/O completion port from a small process-wide pool (measured on cass: 400 reply
-  channels waited on once each, 84 → 85 process handles). Channels are still never freed (no `chan_free`;
-  bump bytes only). Every peer now exports `CHAN_BLOCKING`, and `THREADS_CONCURRENT` reads 1 on Windows.
-  *Added at 2.1.8:* the bullet above misses the **Linux** half (cyrius CHANGELOG 6.6.16 *Fixed*). The Linux
-  channel could deadlock with several producers or consumers: one futex word, and a wake that could reach a
-  waiter of the wrong kind. One producer feeding consumers through a cap-1 channel, which is sandhi's pooled-server
-  shape (`src/server/serve.cyr`'s `sandhi_server_run_pooled`, 100 workers), hung on the Pi. A receiver could also
-  sleep through `chan_close` for good, the shape of `src/server/sse.cyr:180`'s `chan_recv` against `:242` /
-  `:407`. The channel is now an eventcount, and agnosai has it from the 6.6.20 pin.
-- **SIGPIPE (cyrius CVE-74).** Every `lib/net.cyr` socket write (`src/server/serve.cyr:625`'s `sock_send`
-  included) uses `sendto(…, MSG_NOSIGNAL)` on Linux and `SO_NOSIGPIPE` on macOS, so a client that resets
-  mid-write cannot kill the server through a plain socket.
+| bote | **To file (found 2026-10-07).** The client half of MCP: sending `initialize`, `tools/list` and `tools/call` to a server named in bote's `HostRegistry`, whose entries can already declare a `tools/call` capability behind its SSRF guard. F1's registry needs it for tools from external MCP servers (F1, harness rule 4). bote 3.3.17 (read at 2.1.8) was the server half only: dispatch, six transports, sessions. Re-check against 3.8.11, the pin since 2.2.1, before filing. agnostic records the same ask (its `roadmap.md`, *Upstream*). |
 
 ### D. Decisions deferred to a human
 
@@ -508,6 +459,11 @@ docs cite them.
   read-through: `git show 2.1.6:docs/development/roadmap.md`, *Moving the cyrius pin to 6.6.6*.
 - **Not adopted: free-form swarms and screen-scraping coordination** (2026-10-03). See F,
   *Not adopted*.
+- **Federation adopts any declaration whose term is not stale** (2026-11-05, the former B30 item 4).
+  `agnosai_federation_declare_coordinator` keeps its `term < current` guard. Adopting a higher term is the
+  leader-election rule. Refusing a conflicting declaration at the same term would buy nothing, because with no
+  vote a peer could declare at term+1 instead. Federation trusts its peers; `threat-model.md` surface 4 says so,
+  and the reasoning is in `src/fleet/federation.cyr`'s header.
 - **The MCP client is bote's** (2026-10-07). A crew's agents reach external MCP servers through
   bote, by way of agnosai's tool registry (F1); neither agnosai nor agnostic carries its own MCP
   client. bote is the ecosystem's MCP layer, built so that apps stop implementing MCP each for
@@ -587,25 +543,9 @@ Once it exists, `src/telemetry/otlp.cyr` collapses to a thin adapter and
 finds the prior art instead of writing a third encoder, and so the cost is
 visible when someone decides whether the ecosystem wants the repo.
 
-## Recorded by cyrius 6.6.17 (2026-10-05) — for the next cyrius pin move
+## `[embed]` for the presets — adoptable since 2.1.8, a 2.2.3 input (recorded by cyrius 6.6.19, 2026-10-06)
 
-✅ **Adopted at 2.1.8 (pin 6.6.20).** Docs-only note from the cyrius 6.6.17 lanes; each item is this repo's to adopt
-when it pins ≥ 6.6.17. Nothing here gates a cyrius release.
-
-- ⚠ **This CAN be a new red at the 6.6.17 pin bump** (cyrius t1). CI runs `lib sync` → `deps` with no final
-  `deps --verify`; before 6.6.17 `lib sync` never looked at the lock, so a lock committed after a build-first
-  pin move went unchecked. That lock carries the previous pin's rows for files `deps` does not vendor, and
-  from 6.6.17 `lib sync` refuses them by name. After a pin move run `cyrius lib sync --full` before committing
-  the lock, or `cyrius lib sync --full --relock` if `deps` / `build` already ran under the new pin.
-- **Learned at 2.1.8: a re-resolve over the old lock keeps the old tags' commit pins.** `deps --no-lock` →
-  `lib sync --full` → `deps` after the tag moves gave 16 `commit` rows, each dep's old tag beside its new one,
-  because `lib sync` "carries commit pins forward" (cyrius CHANGELOG 6.6.17, t1) and `deps` only adds.
-  The fix is to regenerate from empty: remove `lib/` and `cyrius.lock`, then `cyrius lib sync --full` +
-  `cyrius deps`. That gave the same 119 file rows and only the 8 current pins.
-
-## Recorded by cyrius 6.6.19 (2026-10-06) — for the next cyrius pin move
-
-**Adoptable since 2.1.8 (pin 6.6.20); not adopted yet** — the presets are still generated by
+**Not adopted yet** — the presets are still generated by
 `scripts/gen-presets.sh`. Docs-only note from the cyrius 6.6.19 lanes. Nothing here gates a cyrius release.
 
 - **`scripts/gen-presets.sh` and the checked-in `src/definitions/presets_data.cyr` can retire for `[embed]`**

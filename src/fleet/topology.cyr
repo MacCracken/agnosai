@@ -6,14 +6,18 @@
 # The last of the oracle's twelve `fleet` modules, and the smallest: two pure
 # functions over a link list. Both are ported exactly, defects included.
 #
-# ## `topology_score` is NOT bounded by 1.0, whatever its doc says
+# ## `topology_score` counts distinct linked pairs, so it stays within 0.0–1.0 (2.2.2, B30)
 #
-# The oracle's doc comment promises "0.0 ... to 1.0" and the body divides a raw
-# link count by the device-pair count with **no clamp and no validation** —
-# links are never checked against the inventory's device indices and never
-# deduplicated. Two GPUs give one pair, so three high-bandwidth links between
-# them score **3.0**. Reproduced as-is: clamping would be a silent divergence,
-# and a caller that ranks nodes by this number needs to know it can exceed 1.
+# The oracle's doc comment promised "0.0 ... to 1.0", and its body divided a raw
+# link count by the device-pair count with no clamp and no deduplication. Two GPUs
+# give one pair, so three high-bandwidth links between them scored **3.0**, and on
+# three GPUs the same three links read as fully connected when one pair of three
+# was. The port reproduced that until 2.2.2. Now the numerator is the number of
+# DISTINCT unordered device pairs a high-bandwidth link connects: (0,1) and (1,0)
+# are one pair, and a link from a device to itself is none. The result is clamped
+# to 1.0 as well, because links are still not checked against the inventory: their
+# device ids are GPU ordinals, not inventory positions, so a link naming GPUs the
+# node does not have can still add a pair.
 #
 # ## `supports_tensor_parallel` ignores WHICH devices a link connects
 #
@@ -135,6 +139,43 @@ fn _agnosai_topology_high_bw_count(t): i64 {
     return n;
 }
 
+# How many DISTINCT unordered device pairs a high-bandwidth link connects (2.2.2, B30).
+#
+# `topology_score`'s numerator. (a,b) and (b,a) are one pair; (a,a) is none. A
+# quadratic scan over the links, which a node has a handful of.
+fn _agnosai_topology_high_bw_pairs(t): i64 {
+    var links = load64(t + AGN_NTP_LINKS);
+    var thr = agnosai_topology_high_bw_threshold();
+    var los = vec_new();
+    var his = vec_new();
+    for (var i = 0; i < vec_len(links); i = i + 1) {
+        var l = vec_get(links, i);
+        if (f64_ge(load64(l + AGN_DVL_BANDWIDTH_GBPS), thr) == 1) {
+            var a = agnosai_device_link_device_a(l);
+            var b = agnosai_device_link_device_b(l);
+            if (a != b) {
+                var lo = a;
+                var hi = b;
+                if (b < a) {
+                    lo = b;
+                    hi = a;
+                }
+                var seen = 0;
+                for (var j = 0; j < vec_len(los); j = j + 1) {
+                    if (vec_get(los, j) == lo) {
+                        if (vec_get(his, j) == hi) { seen = 1; }
+                    }
+                }
+                if (seen == 0) {
+                    vec_push(los, lo);
+                    vec_push(his, hi);
+                }
+            }
+        }
+    }
+    return vec_len(los);
+}
+
 # --- scoring -------------------------------------------------------------
 
 # Score a node's topology for multi-GPU work, as an f64 bit pattern.
@@ -146,7 +187,7 @@ fn _agnosai_topology_high_bw_count(t): i64 {
 # ⚠ Empty links score 0.0, and that is tested BEFORE the pair count, so "no
 # topology data" is pessimistic rather than unknown.
 #
-# ⚠ The result is **not clamped to 1.0** — see the module header.
+# Distinct linked pairs over all pairs, clamped to 1.0 (2.2.2): see the module header.
 fn agnosai_topology_score(topology, inventory): i64 {
     var devs = agnosai_hw_inventory_devices(inventory);
     var gpu_count = 0;
@@ -162,7 +203,9 @@ fn agnosai_topology_score(topology, inventory): i64 {
     # Unreachable: gpu_count >= 2 here, so total_pairs >= 1. Oracle shape.
     if (total_pairs == 0) { return f64_from(1); }
 
-    return f64_div(f64_from(_agnosai_topology_high_bw_count(topology)), f64_from(total_pairs));
+    var score = f64_div(f64_from(_agnosai_topology_high_bw_pairs(topology)), f64_from(total_pairs));
+    if (f64_gt(score, f64_from(1)) == 1) { return f64_from(1); }
+    return score;
 }
 
 # Whether the topology has enough high-bandwidth links for a `device_count`

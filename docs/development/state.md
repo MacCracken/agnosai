@@ -2,9 +2,27 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-05 (the 2.2.1 release gate).
+> Last refreshed: 2026-11-05 (the 2.2.2 release gate).
 
-## Now — 2.2.1
+## Now — 2.2.2
+
+| | |
+|---|---|
+| **version** | **2.2.2** (cut 2026-11-05): the quick roadmap items. Three fleet defects copied from the Rust line are fixed (B30: GPU re-allocation, `max_retries`, `topology_score`); `check-clean.sh` lints `tests/` (B31); the upstream gaps are re-checked (B16); stale facts in `CLAUDE.md` are corrected (B23). The roadmap is restructured into a release plan, **2.2.3 = P(-1) audit and hardening**. No toolchain or dependency change |
+| **cyrius pin** | **6.7.18**, unchanged (2.2.1 has the slot details) |
+| **tests** | **99 suites, 8,728 assertions, 0 failed** with wasmtime 50.0.1 present. That is 2.2.1's 8,718 plus the fleet fixes' tests (`fleet_gpu` +4, `fleet_coordinator` +4, `fleet_topology` +2) |
+| **coverage** | **99%**: 102/102 files, 1,635/1,647 fns (gate `--min 80`); the new `_agnosai_topology_high_bw_pairs` is `_`-prefixed |
+| **dist** | `dist/agnosai.cyr` 39,989 lines + `dist/agnosai-guard.cyr` 949, both v2.2.2; sidecars **6 / 1** leaves, unchanged |
+| **binary** | `build/agnosai` **5,826,992 B** and aarch64 **6,698,984 B**, the same sizes as 2.2.1 (the fleet code is not reached from `main`). The native binary answers `GET /ready` with `"version":"2.2.2"`, a 405 carries `Allow`, SIGTERM shuts down gracefully, and no startup line carries a NUL |
+| **lock** | Unchanged from 2.2.1: 119 files, 8 commit pins |
+| **gates** | as 2.2.1, with `check-clean.sh`'s lint now covering `tests/`: fmt 224, **lint 224** (2.2.1: 125), doc 114, doctest 1 files; `check-symbols.sh` 2,788 definitions; then the `ubuntu:26.04` CI replica (CHANGELOG 2.2.2 *Verified*) |
+| **benchmarks** | `bench-history.csv` has 224 rows at 2.2.2, one unpinned sweep at a load of 3.8–4.1: median +2.5% against 2.2.1's, 213 of 224 within ±5%. The fleet A/B against a 2.2.1 build (5 interleaved rounds) moves only `fleet_compute_allocate_8dev` +12% and `fleet_compute_release_realloc_8dev` +16.5%, the GPU fix's release-first lookup (CHANGELOG 2.2.2 *Performance*) |
+| **build warnings** | Unchanged from 2.2.1 |
+| **consumer** | Not re-run. agnostic pins agnosai 2.1.7 and calls none of the changed fleet functions; thoth takes the guard profile, which is unchanged |
+
+Direct deps: unchanged from 2.2.1 (below).
+
+### 2.2.1 — the release (2026-11-05)
 
 | | |
 |---|---|
@@ -3014,5 +3032,8 @@ fixed.
 
 ### Consumers
 
-Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI),
-kiran (game AI) — none consuming the Cyrius line yet.
+agnostic consumes the Cyrius line (`[deps.agnosai]`, tag 2.1.7, `dist/agnosai.cyr`), and thoth
+consumes the `[lib.guard]` profile (`dist/agnosai-guard.cyr`; its `src/guard.cyr` calls
+`agnosai_prompt_scan_input`). joshua (NPC AI) and kiran (game AI) are planned; there is no checkout
+here to check. daimon has no agnosai dependency (checked at 2.0.0, 2.1.6 and 2.2.2), so it is no
+longer listed (roadmap B23).

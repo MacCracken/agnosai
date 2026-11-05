@@ -7,6 +7,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.2] — 2026-11-05
+
+The quick items open on the roadmap:
+- three fleet defects the port had reproduced from the Rust line, now fixed (B30);
+- the cleanliness gate now lints `tests/` (B31);
+- the upstream-gap list re-checked against each project's latest release (B16);
+- stale facts in `CLAUDE.md` corrected (B23).
+
+The roadmap is restructured into a release plan: **2.2.3 is a P(-1) audit and hardening** after three language
+bumps, and 2.3.x–2.6.x carry the primary work. There is no toolchain or dependency change: cyrius 6.7.18 and
+the same eight pins as 2.2.1.
+
+⚠ **Library behaviour changes in `fleet/`** (below). No route reaches these modules, so the wire is unchanged,
+and agnostic calls none of them.
+
+### Fixed
+
+- **`fleet/gpu`: allocating again for a task id replaces its allocation** (B30 item 1). The scheduler keys
+  allocations by task id, and the oracle's `allocate` ended with an insert that replaced the record while the
+  first allocation's memory stayed charged. So `release` could never return it: allocating 5 GB twice for one
+  task charged 10 GB and released 5.
+  - `agnosai_compute_scheduler_allocate` now releases a task's previous allocation before placing the new one.
+  - If the new request cannot be placed, the task holds nothing and the call returns 0, as any failed
+    placement does.
+  - `tests/fleet_gpu.tcyr` inverts the pinning assertions and adds a resize and a refused replacement (+4).
+    The old suite fails two assertions against the new code.
+- **`fleet/coordinator`: `max_retries` is the number of retries** (B30 item 2). `task_failed` counted the
+  failure and then tested `count < max_retries`, so the default 3 gave two retries, and `max_retries = 1`
+  gave none. It tests `<=` now: three retries, then Exhausted on the fourth failure, and `max_retries = 0`
+  means no retry.
+  - ⚠ This changes what the oracle's own tests pinned (`max_retries = 2` "retries once").
+  - `tests/fleet_coordinator.tcyr` crosses every boundary from 0 to 3 (+4). The old suite fails seven
+    assertions against the new code.
+- **`fleet/topology`: `topology_score` counts distinct linked pairs, so it stays within 0.0–1.0** (B30 item
+  3). Its doc promised the fraction of GPU pairs with a high-bandwidth link. The body divided a raw link count
+  instead, so two GPUs with three links between them scored 3.0, and on three GPUs the same links read as fully
+  connected.
+  - The numerator is now the number of distinct unordered device pairs a high-bandwidth link connects: (0,1)
+    and (1,0) are one pair, and a link from a device to itself is none.
+  - The result is also clamped to 1.0, because link ids are GPU ordinals the inventory does not validate.
+  - `tests/fleet_topology.tcyr` (+2). A clamp-only implementation fails two of the new assertions: one pair of
+    three GPUs is 1/3, not 1.0.
+- **B30 item 4, federation's term rule, is kept and documented as correct.** `declare_coordinator` adopts any
+  term that is not stale. That is the leader-election rule. Federation has no vote, so refusing a conflicting
+  declaration at the same term would buy nothing: a peer could declare at term+1. `src/fleet/federation.cyr`
+  says so in place, and `docs/development/threat-model.md` surface 4 gains the row "a peer advancing the
+  coordinator term". The decision is under the roadmap's *Settled decisions*.
+- `src/server/auth.cyr`'s comment on the JWT key ceiling cited sigil's size check at `lib/sigil.cyr:17608`; it
+  is at `:21832` in sigil 3.13.15.
+
+### Changed
+
+- **`scripts/check-clean.sh` lints `tests/`** (B31). fmt covered the 99 suites and lint did not, so a test line
+  over 120 characters or an untracked deferral passed the gate: 68 findings across 19 suites at 2.2.1. The fixes
+  are layout only. With whitespace and the markers stripped, every touched file matches 2.2.1 except one reworded
+  header comment.
+  - The 42 WASM module byte-table rows in `sandbox_wasm` and `tools_wasm` are split four `store8` calls a row.
+  - 18 lines carry `#skip-lint`: literals that cannot be wrapped without changing their bytes (hex vectors,
+    embedded Python and cx programs, JSON bodies, a raw request), and four deferral-word false positives such
+    as "not yet completed".
+  - Seven doubled blank lines are removed.
+  - The lint count goes from 125 files to 224.
+- **The upstream-gap list was re-checked** against bayan 1.11.1, sigil 3.13.15, sandhi 1.13.7 and kavach 3.14.2
+  (B16), each with a probe:
+  - bayan's quoted-scalar escapes are closed (since 1.8.0).
+  - Its other YAML refusals are a declared non-goal upstream.
+  - sigil's 4096-bit RSA ceiling, sandhi's 501 on a chunked request body and kavach's missing WASM store-limit
+    options are each still open and ready to raise.
+  - ⚠ **Found:** what the roadmap called kavach's "guest stdin over 64 KiB" is a deadlock. Its capture writes
+    the whole stdin before it drains stdout. A WASM guest that writes while it reads hung at 200 KB of input,
+    and kavach's timeout never fired. A guest that reads first and then writes works at 200 KB. It is recorded
+    under B9 and B16 with a mitigation for agnosai, and drafting the kavach filing is a 2.2.3 input. Nothing in
+    this release changes it.
+- **`CLAUDE.md`** (B23):
+  - Its consumers line named daimon, which has no agnosai dependency. It now names agnostic (the full bundle)
+    and thoth (the guard profile).
+  - Its `rust-old/` lines say the deletion is owed and waits on the user's OK, and that history stays reachable
+    "through the last tag that carries it" instead of "up to 2.1.0".
+  - It described `roadmap.md` as "milestones through v1.0".
+  - `docs/development/state.md`'s *Consumers* is corrected the same way.
+- **`docs/development/roadmap.md` is restructured around a release plan:**
+  - 2.2.3: a P(-1) audit and hardening, with the inputs the three toolchain moves left behind.
+  - 2.3.x: the tool-calling harness (F1, B33).
+  - 2.4.x: the orchestration contract (F3, F5 with B6, F9, F2).
+  - 2.5.x: durable execution (F4).
+  - 2.6.x: protocol and server currency (F8, B8, B7).
+
+  Finished sections are removed as the file's own rule says: the 6.6.15 pin-move analysis, the cyrius 6.6.16 and
+  6.6.17 notes, and the closed kavach row. Every one stays readable with `git show 2.2.1:docs/development/roadmap.md`.
+  The sigil row is rewritten for sigil 3.13.14's lane pool. Read at this release, agnosai's outbound TLS
+  reaches only the scoped entry points, which refuse when all 64 lanes are held. It never reaches the
+  process-ending sticky claim. A probe is a 2.2.3 input.
+
+### Performance
+
+**One cost, and it is the GPU fix's.** The only compiled change is `src/fleet/`, so `benches/fleet.bcyr` was
+built from the 2.2.1 tag and from this tree on the same toolchain. The two ran interleaved for 5 rounds,
+alternating which went first:
+
+| benchmark | 2.2.1 | 2.2.2 | change |
+|---|---|---|---|
+| `fleet_compute_allocate_8dev` | 573 ns | 643 ns | +12.2% |
+| `fleet_compute_release_realloc_8dev` | 411 ns | 479 ns | +16.5% |
+
+- Both are the lookup `allocate` now makes to release a task's previous allocation, about 70 ns. That is the
+  price of not leaking it, on a path taken once per task placement.
+- The other 14 fleet rows are within ±1%, including the topology-based ranking and placement rows.
+- `bench-history.csv` gains 224 rows at 2.2.2 from one unpinned `bench-history.sh` sweep at a 1-minute load of
+  3.8–4.1. Against 2.2.1's rows (load 2.5–4.4) they read median +2.5%, 213 of 224 within ±5%. The two allocate
+  rows read 565 → 637 ns and 400 → 481 ns, as in the A/B. A first sweep, during which the load climbed from 5.0
+  to 7.2, read median +7.0% with 48 of 224 within ±5%. Its rows were removed rather than recorded, since the
+  only compiled change is two fleet functions.
+
+### Verified
+
+- **The gate:** `check-symbols.sh` (2,788 definitions, both targets) → `check-clean.sh` (fmt 224, **lint 224**,
+  doc 114, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist) → build → **99 suites,
+  8,728 assertions, 0 failed** → coverage 99% (1,635/1,647 fns) → `distlib --all --check` → examples → fuzz 4/4
+  → `cyrius bench`. The suite passed at a 1-minute load of 15.
+- **Each fix was checked against its old tests.** The 2.2.1 suites for gpu, coordinator and topology, built
+  against the new code, fail exactly the assertions that pinned the old behaviour: 2, 7 and 1. A clamp-only
+  `topology_score` fails two of the new assertions.
+- **The binaries** are the same sizes as 2.2.1 (5,826,992 B native, 6,698,984 B aarch64), since `main` does not
+  reach the fleet code. The native binary answers `GET /ready` with `"version":"2.2.2"`; a `DELETE /health` is
+  a 405 with `Allow: GET`; SIGTERM shuts down gracefully; no startup line carries a NUL.
+- **The CI way, on the runner's image.** An `ubuntu:26.04` container ran every `ci.yml` step as an
+  unprivileged user, from a fresh clone with this diff applied: the toolchain, `lib sync --full` and `deps`
+  from an empty cache, the symbol check, `check-clean.sh` with lint at 224 files, the build, the tests (99
+  suites, 0 failed), coverage, the example, fuzz and `cyrius bench`.
+
 ## [2.2.1] — 2026-11-05
 
 Cyrius **6.7.18**, and every `[deps.*]` tag on its latest release. Every pin inside those tags names

@@ -13,15 +13,15 @@
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (toolchain pinned in `cyrius.cyml [package].cyrius`)
 - **Version**: `VERSION` at the project root is the source of truth — do not inline the number here
-- **Rust reference**: 27,683 lines preserved at `rust-old/` (v1.1.0) — history only, **not a spec**, and **scheduled for deletion in the release after 2.1.0** (the 2.1.0 audit found nothing that still depends on it; the deletion checklist is in `docs/development/roadmap.md`)
+- **Rust reference**: 27,683 lines preserved at `rust-old/` (v1.1.0) — history only, **not a spec**, and **owed for deletion since the release after 2.1.0**. It is still present: the deletion waits on the user's OK. The 2.1.0 audit found nothing that still depends on it, and the deletion checklist is in `docs/development/roadmap.md`
 
 ## Consumers
 
-Agnostic (Python platform), daimon (agent orchestration), joshua (NPC AI), kiran (game AI)
+agnostic (vendors `dist/agnosai.cyr`), thoth (vendors the `[lib.guard]` output-guard profile, `dist/agnosai-guard.cyr`), joshua (NPC AI) and kiran (game AI). daimon was listed here until 2.2.2 but has no agnosai dependency (roadmap B23)
 
 ## The port
 
-Scaffolded with `cyrius port` on 2026-07-28 from `rust-old/`. After `rust-old/` is deleted its content stays reachable in git history (any tag up to 2.1.0).
+Scaffolded with `cyrius port` on 2026-07-28 from `rust-old/`. After `rust-old/` is deleted its content stays reachable in git history (every tag through the last one that carries it).
 The plan of record is
 [`docs/development/cyrius-port-plan.md`](docs/development/cyrius-port-plan.md) —
 read it before starting any bite. Its blocker table is a **reasoning archive** —
@@ -187,7 +187,7 @@ docs/ (required):
     math.md          — (if applicable) mathematical reference for algorithms/formulas
   development/
     state.md         — VOLATILE state: version, port progress, test counts (refreshed every release)
-    roadmap.md       — milestones through v1.0, dependency gates
+    roadmap.md       — open and planned work by release; forward-facing only
     cyrius-port-plan.md — the port's plan of record: phases, blockers, corrections
 
 docs/ (when earned — not scaffolded empty):

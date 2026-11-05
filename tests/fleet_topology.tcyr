@@ -7,10 +7,10 @@
 #
 # Past the oracle in eight places, the sharpest being:
 #
-#   * **the score is NOT bounded by 1.0.** Links are never validated against
-#     the inventory or deduplicated, so two GPUs (one pair) with three
-#     high-bandwidth links score **3.0** against a doc comment promising
-#     "0.0 to 1.0". Every oracle test happens to use a consistent link set.
+#   * **the score counts distinct linked pairs, and stays within 0.0–1.0**
+#     (2.2.2, roadmap B30). The oracle divided a raw link count, so two GPUs with
+#     three links scored 3.0 against a doc promising "0.0 to 1.0". The port pinned
+#     that until 2.2.2. Every oracle test happens to use a consistent link set.
 #   * **`supports_tensor_parallel` ignores which devices a link connects** —
 #     three links all between devices 0 and 1 satisfy a four-way ring.
 #   * **50.0 GB/s exactly counts** (`>=`), and 49.99 does not.
@@ -120,20 +120,30 @@ fn main(): i64 {
     _t_assert_f64(agnosai_topology_score(two, _t_mixed_inventory(16, 2)), f64_from(1),
       "and sixteen CPU devices alongside them change nothing");
 
-    # --- past the oracle: the score EXCEEDS 1.0 -------------------------
-    # ⚠ The doc comment promises "0.0 to 1.0". Nothing clamps, nothing checks a
-    # link against the inventory, and nothing dedups — so two GPUs with three
-    # links score 3.0. A caller ranking nodes by this must know it can.
+    # --- past the oracle: duplicate links are ONE pair (2.2.2, B30) ------
+    # The oracle divided a raw link count, so two GPUs with three links between
+    # them scored 3.0. The numerator is distinct pairs now.
     var over = agnosai_node_topology_new();
     agnosai_node_topology_with_link(over, _t_nvlink(0, 1));
     agnosai_node_topology_with_link(over, _t_nvlink(0, 1));
     agnosai_node_topology_with_link(over, _t_nvlink(0, 1));
-    _t_assert_f64(agnosai_topology_score(over, _t_gpu_inventory(2)), f64_from(3),
-      "three duplicate links over one pair score 3.0 — NOT clamped to 1.0");
+    _t_assert_f64(agnosai_topology_score(over, _t_gpu_inventory(2)), f64_from(1),
+      "three duplicate links over one pair score 1.0, not 3.0");
+    # Dedup, not just a clamp: over THREE GPUs the same links connect one pair of
+    # three. A clamp alone would read 3/3 = 1.0, fully connected.
+    _t_assert_f64(agnosai_topology_score(over, _t_gpu_inventory(3)), _t_f64_ratio(1, 3),
+      "...and over three GPUs they are 1/3, one pair of three, not fully connected");
+    var rev = agnosai_node_topology_new();
+    agnosai_node_topology_with_link(rev, _t_nvlink(0, 1));
+    agnosai_node_topology_with_link(rev, _t_nvlink(1, 0));
+    agnosai_node_topology_with_link(rev, _t_nvlink(2, 2));
+    _t_assert_f64(agnosai_topology_score(rev, _t_gpu_inventory(3)), _t_f64_ratio(1, 3),
+      "(1,0) is the pair (0,1), and a link from a device to itself is no pair");
     var ghost = agnosai_node_topology_new();
     agnosai_node_topology_with_link(ghost, _t_nvlink(7, 9));
+    agnosai_node_topology_with_link(ghost, _t_nvlink(4, 5));
     _t_assert_f64(agnosai_topology_score(ghost, _t_gpu_inventory(2)), f64_from(1),
-      "a link naming devices the inventory does not have still scores");
+      "links naming GPUs the node does not have still count, but the score is clamped to 1.0");
 
     # --- past the oracle: the 50 GB/s threshold is inclusive ------------
     var exact = agnosai_node_topology_new();

@@ -21,14 +21,18 @@
 # not an exotic one. Ported as "displace only on strictly greater", which is
 # exactly last-wins. `_agnosai_gpu_max_avail_idx` is the single place it lives.
 #
-# ## Two oracle behaviours pinned rather than "fixed"
+# ## Allocating again for a task id replaces its allocation (2.2.2, roadmap B30)
 #
-# * **Allocating twice for one task id leaks the first allocation.**
-#   `allocations` is a map keyed by task id and `allocate` ends with an
-#   `insert`, which REPLACES. The first allocation's memory stays charged to its
-#   device with no record, so `release` can never return it. That is a real
-#   defect in the oracle and it is reproduced, because the port's bar is "what
-#   Rust did" — see `docs/development/roadmap.md` if it is ever fixed here.
+# `allocations` is a map keyed by task id. The oracle's `allocate` ended with an
+# `insert`, which replaced the record while the first allocation's memory stayed
+# charged to its device, so `release` could never return it. The port reproduced
+# that leak until 2.2.2. Now `allocate` releases a task's previous allocation
+# before placing the new one, so its memory goes back to its device first. If the
+# new request cannot be placed, the task holds nothing and the call returns 0, as
+# any failed placement does.
+#
+# ## One oracle behaviour kept for its shape
+#
 # * **The two `saturating_sub` guards are UNREACHABLE, and kept for oracle
 #   shape.** `used` moves only by `allocate` (+) and `release` (-), and
 #   `release` removes the record before subtracting, so each record is
@@ -300,11 +304,11 @@ fn _agnosai_gpu_sync_avail(ds): i64 {
 # Allocate `memory_mb` on the best qualifying device, or 0 for the oracle's
 # `None`. `accel` of AGNOSAI_ACCEL_ANY places on any device with room.
 #
-# ⚠ Allocating twice for one `task_id` LEAKS the first allocation — the map
-# insert replaces the record while the memory stays charged to its device, so
-# `release` can never return it. That is the oracle's behaviour, reproduced
-# deliberately; see the module header.
+# A second allocation for the same `task_id` replaces the first: the first is
+# released, and its memory returned, before the new one is placed (see the
+# module header). The oracle leaked it.
 fn agnosai_compute_scheduler_allocate(s, task_id: Str, memory_mb, accel): i64 {
+    agnosai_compute_scheduler_release(s, task_id);
     var best = _agnosai_gpu_max_avail_idx(s, accel, memory_mb);
     if (best < 0) { return 0; }
     var ds = vec_get(load64(s + AGN_CS_DEVICES), best);

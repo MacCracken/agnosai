@@ -43,9 +43,14 @@ echo "fmt: $n files"
 # A deferral comment ("deferred", "not yet", "TODO") must cross-reference a
 # CHANGELOG, issue, or roadmap entry on the SAME line, or carry `#skip-lint`.
 # The rule is what keeps a deferral from quietly becoming permanent.
+#
+# `tests/` too, since 2.2.2 (roadmap B31). Until then fmt covered the suites and lint did
+# not, so a test line over 120 characters or an untracked deferral passed the gate: 68
+# findings across 19 suites at 2.2.1. A literal that cannot be wrapped without changing
+# its bytes (a hex vector, an embedded program, a request) carries `#skip-lint`.
 n=0
-for f in $(find src -name "*.cyr" | sort) $(find benches -name "*.bcyr" | sort) \
-         $(find examples -name "*.cyr" 2>/dev/null | sort); do
+for f in $(find src -name "*.cyr" | sort) $(find tests -name "*.tcyr" | sort) \
+         $(find benches -name "*.bcyr" | sort) $(find examples -name "*.cyr" 2>/dev/null | sort); do
     [ -e "$f" ] || continue
     n=$((n + 1))
     out=$(cyrius lint "$f" 2>&1)

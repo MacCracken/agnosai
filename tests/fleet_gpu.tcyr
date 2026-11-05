@@ -11,9 +11,10 @@
 #     the ordinary state of a freshly-populated scheduler — so which one wins is
 #     decided by that rule. The oracle's fixtures are always 24 GB + 80 GB, so
 #     no oracle test ever ties.
-#   * **Allocating twice for one task id LEAKS the first allocation.** The map
-#     insert replaces the record while the memory stays charged, so `release`
-#     can never return it. A real oracle defect, reproduced deliberately.
+#   * **Allocating twice for one task id replaces the first allocation**
+#     (2.2.2, roadmap B30). The oracle's map insert replaced the record while the
+#     memory stayed charged, so `release` could never return it. The port pinned
+#     that leak until 2.2.2.
 #   * **`saturating_sub`** on the used counter, so nothing wraps to a huge
 #     number.
 #
@@ -163,20 +164,33 @@ fn main(): i64 {
         agnosai_compute_scheduler_allocate(tie3, str_from("t3"), 100, AGNOSAI_ACCEL_ANY)), 2,
       "a three-way tie resolves to the last device, not the second");
 
-    # --- past the oracle: allocating twice for one task LEAKS -----------
-    # `allocations` is keyed by task id and `allocate` ends with an insert, which
-    # REPLACES. The first allocation's memory stays charged with no record, so
-    # release can never return it. Reproduced from the oracle, not invented.
-    var leak = _t_sched();
-    agnosai_compute_scheduler_allocate(leak, str_from("dup"), 5000, AGNOSAI_ACCEL_ANY);
-    agnosai_compute_scheduler_allocate(leak, str_from("dup"), 5000, AGNOSAI_ACCEL_ANY);
-    assert_eq(agnosai_compute_scheduler_available_vram_mb(leak), 94000,
-      "both allocations charge the devices — 10 GB is gone");
-    assert_eq(vec_len(agnosai_compute_scheduler_allocations(leak)), 1,
-      "but only ONE record survives, keyed by the task id");
-    assert_eq(agnosai_compute_scheduler_release(leak, str_from("dup")), 1, "release succeeds");
-    assert_eq(agnosai_compute_scheduler_available_vram_mb(leak), 99000,
-      "and returns only 5 GB — the first allocation is permanently leaked");
+    # --- past the oracle: allocating twice for one task REPLACES (2.2.2, B30) ---
+    # `allocations` is keyed by task id. The oracle's insert replaced the record
+    # and left the first allocation's memory charged, so release could never
+    # return it: 2 x 5 GB charged, 5 GB back. Now the first is released before the
+    # second is placed.
+    var dup = _t_sched();
+    agnosai_compute_scheduler_allocate(dup, str_from("dup"), 5000, AGNOSAI_ACCEL_ANY);
+    agnosai_compute_scheduler_allocate(dup, str_from("dup"), 5000, AGNOSAI_ACCEL_ANY);
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(dup), 99000,
+      "the second allocation replaces the first: 5 GB is charged, not 10");
+    assert_eq(vec_len(agnosai_compute_scheduler_allocations(dup)), 1,
+      "and one record, keyed by the task id");
+    assert_eq(agnosai_compute_scheduler_release(dup, str_from("dup")), 1, "release succeeds");
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(dup), 104000,
+      "and returns everything: nothing is left charged to a lost record");
+    # A replacement may change the size, and the new size is what is charged.
+    agnosai_compute_scheduler_allocate(dup, str_from("resize"), 5000, AGNOSAI_ACCEL_ANY);
+    agnosai_compute_scheduler_allocate(dup, str_from("resize"), 7000, AGNOSAI_ACCEL_ANY);
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(dup), 97000,
+      "re-allocating at 7 GB charges 7 GB, not 12");
+    # A replacement that cannot be placed leaves the task holding nothing.
+    assert(agnosai_compute_scheduler_allocate(dup, str_from("resize"), 999999, AGNOSAI_ACCEL_ANY) == 0,
+      "a replacement no device can hold is refused");
+    assert_eq(agnosai_compute_scheduler_available_vram_mb(dup), 104000,
+      "...and the old allocation was released, so nothing stays charged");
+    assert_eq(agnosai_compute_scheduler_release(dup, str_from("resize")), 0,
+      "...and the task holds no allocation");
 
     # --- oracle: add_cuda_and_tpu_devices -------------------------------
     var mix = agnosai_compute_scheduler_new();

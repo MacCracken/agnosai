@@ -9,10 +9,10 @@
 #
 # Past the oracle in eight places, the sharpest being:
 #
-#   * **the retry arithmetic.** `max_retries = 3` allows TWO retries, because
-#     the counter increments before a `<` test. The oracle pins Retry at one end
-#     and Exhausted at the other but never crosses a boundary, so an
-#     implementation testing `<=` passes every oracle test.
+#   * **the retry arithmetic.** `max_retries = 3` allows THREE retries (2.2.2,
+#     roadmap B30). The oracle's `<` test allowed one fewer than the name says,
+#     and the port pinned that until 2.2.2. Every boundary is crossed below,
+#     0 to 3, so neither off-by-one passes.
 #   * **`fan_out` passes the MAX per-node count**, not each node's own — so an
 #     uneven fan-out over-provisions the lighter nodes in the state manager.
 #   * **`reassign` revives a terminal task AND keeps its retry count**, so a
@@ -131,9 +131,9 @@ fn main(): i64 {
     assert_eq(agnosai_fleet_coordinator_task_completed(c, str_from("nope")), 0,
       "completing an unknown task reports failure");
 
-    # --- oracle: task_failed_with_retries_returns_retry -----------------
-    # And past it: max_retries = 3 means failure 1 -> Retry, failure 2 -> Retry,
-    # failure 3 -> Exhausted. TWO retries, not three.
+    # --- task_failed_with_retries_returns_retry (past the oracle since 2.2.2) ---
+    # max_retries = 3 means failures 1-3 -> Retry, failure 4 -> Exhausted. The
+    # oracle answered Exhausted on failure 3.
     var cr = agnosai_fleet_coordinator_with_max_retries(3);
     agnosai_fleet_coordinator_fan_out(cr, _t_vec1(_t_task("x", "d")),
       _t_vec1(_t_assign("x", "n")));
@@ -145,20 +145,24 @@ fn main(): i64 {
     assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("x")),
       AGNOSAI_FAILOVER_RETRY, "failure 2 also retries");
     assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("x")),
-      AGNOSAI_FAILOVER_EXHAUSTED, "failure 3 EXHAUSTS — two retries, not three");
+      AGNOSAI_FAILOVER_RETRY, "failure 3 is the third retry — max_retries means retries");
+    assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("x")),
+      AGNOSAI_FAILOVER_EXHAUSTED, "failure 4 EXHAUSTS — three retries, then done");
     assert_eq(agnosai_fleet_task_status(agnosai_fleet_coordinator_task(cr, str_from("x"))),
       AGNOSAI_FTASK_FAILED, "and marks the task Failed");
     assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("x")),
       AGNOSAI_FAILOVER_EXHAUSTED, "and stays exhausted afterwards");
 
-    # --- oracle: task_failed_exhausted_after_max_retries ----------------
+    # --- task_failed_exhausted_after_max_retries (inverted at 2.2.2) ----
     var c2r = agnosai_fleet_coordinator_with_max_retries(2);
     agnosai_fleet_coordinator_fan_out(c2r, _t_vec1(_t_task("w", "d")),
       _t_vec1(_t_assign("w", "n")));
     assert_eq(agnosai_fleet_coordinator_task_failed(c2r, str_from("w")),
       AGNOSAI_FAILOVER_RETRY, "max_retries=2 retries once");
     assert_eq(agnosai_fleet_coordinator_task_failed(c2r, str_from("w")),
-      AGNOSAI_FAILOVER_EXHAUSTED, "and exhausts on the second failure");
+      AGNOSAI_FAILOVER_RETRY, "and twice — the oracle exhausted here");
+    assert_eq(agnosai_fleet_coordinator_task_failed(c2r, str_from("w")),
+      AGNOSAI_FAILOVER_EXHAUSTED, "and exhausts on the third failure");
     assert_eq(agnosai_fleet_task_status(agnosai_fleet_coordinator_task(c2r, str_from("w"))),
       AGNOSAI_FTASK_FAILED, "leaving the task Failed");
 
@@ -166,14 +170,20 @@ fn main(): i64 {
     assert_eq(agnosai_fleet_coordinator_task_failed(cr, str_from("nope")),
       AGNOSAI_FAILOVER_UNKNOWN_TASK, "an unknown task reports UnknownTask");
 
-    # --- past the oracle: max_retries = 1 exhausts immediately ----------
-    # The boundary the `<` test creates: one failure and it is done, with no
-    # retry at all. An implementation using `<=` gives one retry here.
+    # --- past the oracle: the two lowest boundaries ---------------------
+    # max_retries = 1 is one retry; max_retries = 0 is none, so the first failure
+    # exhausts. The oracle's `<` made 1 behave as 0, and 0 the same.
     var c1 = agnosai_fleet_coordinator_with_max_retries(1);
     agnosai_fleet_coordinator_fan_out(c1, _t_vec1(_t_task("y", "d")), vec_new());
     assert_eq(agnosai_fleet_coordinator_max_retries(c1), 1, "the ceiling round-trips");
     assert_eq(agnosai_fleet_coordinator_task_failed(c1, str_from("y")),
-      AGNOSAI_FAILOVER_EXHAUSTED, "max_retries=1 exhausts on the FIRST failure");
+      AGNOSAI_FAILOVER_RETRY, "max_retries=1 retries the FIRST failure");
+    assert_eq(agnosai_fleet_coordinator_task_failed(c1, str_from("y")),
+      AGNOSAI_FAILOVER_EXHAUSTED, "...and exhausts on the second");
+    var c0 = agnosai_fleet_coordinator_with_max_retries(0);
+    agnosai_fleet_coordinator_fan_out(c0, _t_vec1(_t_task("y0", "d")), vec_new());
+    assert_eq(agnosai_fleet_coordinator_task_failed(c0, str_from("y0")),
+      AGNOSAI_FAILOVER_EXHAUSTED, "max_retries=0 exhausts on the FIRST failure: no retries");
     assert_eq(agnosai_fleet_coordinator_max_retries(agnosai_fleet_coordinator_new()), 3,
       "and the default ceiling is 3");
 
@@ -214,7 +224,8 @@ fn main(): i64 {
       "with completion 1.0");
 
     # --- oracle: is_complete_with_terminal_failure ----------------------
-    var itf = agnosai_fleet_coordinator_with_max_retries(1);
+    # max_retries = 0, so the one failure below is terminal (the oracle used 1).
+    var itf = agnosai_fleet_coordinator_with_max_retries(0);
     agnosai_fleet_coordinator_fan_out(itf, _t_vec2(_t_task("f1", "d"), _t_task("f2", "d")),
       vec_new());
     agnosai_fleet_coordinator_task_completed(itf, str_from("f1"));
@@ -299,8 +310,9 @@ fn main(): i64 {
     var rv = agnosai_fleet_coordinator_with_max_retries(2);
     agnosai_fleet_coordinator_fan_out(rv, _t_vec1(_t_task("z", "d")), vec_new());
     agnosai_fleet_coordinator_task_failed(rv, str_from("z"));
+    agnosai_fleet_coordinator_task_failed(rv, str_from("z"));
     assert_eq(agnosai_fleet_coordinator_task_failed(rv, str_from("z")),
-      AGNOSAI_FAILOVER_EXHAUSTED, "two failures exhaust at max_retries=2");
+      AGNOSAI_FAILOVER_EXHAUSTED, "three failures exhaust at max_retries=2");
     assert_eq(agnosai_fleet_coordinator_reassign(rv, str_from("z"), str_from("fresh")), 1,
       "a terminally Failed task can still be reassigned — it is REVIVED");
     assert_eq(agnosai_fleet_task_status(agnosai_fleet_coordinator_task(rv, str_from("z"))),
