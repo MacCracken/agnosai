@@ -40,7 +40,7 @@ dependency change.
   - Reading-first tools with 64 KiB–1 MiB of input, which worked, are refused too. A visible refusal replaces
     a hang that could not be bounded.
   - `tests/sandbox_wasm.tcyr` (+3): one byte over is refused, and exactly 64 KiB runs.
-  - The kavach filing is drafted (below).
+  - It is filed in kavach (below).
 - **`agnosai_rate_limit_total_evicted` leaked majra's stats snapshot**, a 32-byte freelist block per call;
   its siblings all go through `_agnosai_rl_stat`, which frees it. It does too now. `tests/server_rate_limit.tcyr`
   (+1) watches the freelist's carve position: a thousand reads leave it unmoved. Against the old code it moved
@@ -87,14 +87,14 @@ dependency change.
   budget, native TLS's nameConstraints (CYRIUS-2026-0042), and the WASM hang above. The accepted risk that the
   process, Python and OCI tiers run unconfined is confirmed and sharpened. kavach's confined backend is bridged
   and tested, but no production tier calls it (new roadmap B35).
-- **Upstream filings drafted** in `docs/development/upstream-filings/`, for the user to send:
-  - kavach's WASM stdin deadlock;
-  - kavach's missing WASM store limits;
-  - sigil's lane pool refusing a burst (below);
-  - sigil's 4096-bit RSA ceiling;
-  - sandhi's 501 on chunked request bodies.
-
-  agnosai does not write into another repo.
+- **Upstream gaps filed** in each project's own `docs/development/issues/`, with that project's source paths
+  and repros (uncommitted in those repos):
+  - kavach `2026-11-05-agnosai-wasm-capture-deadlocks-when-a-guest-writes-while-reading-stdin.md`, with its
+    probe and guest under `repros/`;
+  - kavach `2026-11-05-agnosai-wasm-backend-has-no-store-limits.md`;
+  - sigil `2026-11-05-agnosai-lane-pool-refuses-the-overflow-of-a-burst.md` (below);
+  - sigil `2026-11-05-agnosai-rsa-over-4096-bits-cannot-verify.md`;
+  - sandhi `2026-11-05-agnosai-server-cannot-receive-a-chunked-request-body.md`.
 - **The roadmap:**
   - Your ruling is recorded: `rust-old/` is deleted at 2.3.0 once every Rust porting item is done.
   - The items are inventoried: five portable (B7's spans, B10, B11, B15's `StateStore`, a certificate-format
@@ -115,7 +115,7 @@ dependency change.
 - **sigil's lane pool refuses a burst.** 100 threads each verifying a valid ECDSA P-256 signature at once gave
   64 accepted and 36 refused, in each of five runs, and 0 lanes held afterwards. Nothing leaks; the overflow of
   a burst fails. On agnosai's outbound TLS that is a failed handshake when more than 64 verify at once. Inbound
-  JWT RSA verification takes no lane. Recorded on the roadmap's sigil row, with the filing drafted.
+  JWT RSA verification takes no lane. Recorded on the roadmap's sigil row, and filed in sigil.
 - **The JSON parse cost** (2.2.1, +38–66%) is bayan's alone: each preset and each request body is parsed once.
   D3 keeps `builtin_presets` uncached by the user's decision, so there is nothing agnosai-side to recover.
 - **39 of the 60 `lib/<file>:<line>` citations in `src/` comments no longer point at the identifier they

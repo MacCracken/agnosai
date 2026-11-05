@@ -8,7 +8,7 @@
 
 | | |
 |---|---|
-| **version** | **2.2.3** (cut 2026-11-05): the P(-1) audit and hardening after the language bumps. A server that cannot bind now says why; WASM input over 64 KiB is refused (a kavach capture deadlock); a stats-block leak is fixed; two guards that could skip silently now assert; the threat model is refreshed against the Cyrius tree; the release binary is DCE-compacted; and the upstream filings are drafted in `docs/development/upstream-filings/`. No dependency change |
+| **version** | **2.2.3** (cut 2026-11-05): the P(-1) audit and hardening after the language bumps. A server that cannot bind now says why; WASM input over 64 KiB is refused (a kavach capture deadlock); a stats-block leak is fixed; two guards that could skip silently now assert; the threat model is refreshed against the Cyrius tree; the release binary is DCE-compacted; and the upstream gaps are filed in kavach's, sigil's and sandhi's own `docs/development/issues/`. No dependency change |
 | **cyrius pin** | **6.7.18**, unchanged |
 | **tests** | **99 suites, 8,746 assertions, 0 failed** with wasmtime 50.0.1 present: 2.2.2's 8,728 plus the audit's 18 (`server_serve` +8, `sandbox_cx` +4, `sandbox_wasm` +4, `tools_wasm` +1, `server_rate_limit` +1). With `CYRIUS_DCE=1`, as CI now runs them, the suite passes too. On a host without the cx sandbox's namespaces, `sandbox_cx` reads fewer (its fail-closed arm) |
 | **coverage** | **99%**: 102/102 files, 1,635/1,647 fns (gate `--min 80`) |
