@@ -2,9 +2,27 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-05 (the 2.2.2 release gate).
+> Last refreshed: 2026-11-05 (the 2.2.3 release gate).
 
-## Now — 2.2.2
+## Now — 2.2.3
+
+| | |
+|---|---|
+| **version** | **2.2.3** (cut 2026-11-05): the P(-1) audit and hardening after the language bumps. A server that cannot bind now says why; WASM input over 64 KiB is refused (a kavach capture deadlock); a stats-block leak is fixed; two guards that could skip silently now assert; the threat model is refreshed against the Cyrius tree; the release binary is DCE-compacted; and the upstream filings are drafted in `docs/development/upstream-filings/`. No dependency change |
+| **cyrius pin** | **6.7.18**, unchanged |
+| **tests** | **99 suites, 8,746 assertions, 0 failed** with wasmtime 50.0.1 present: 2.2.2's 8,728 plus the audit's 18 (`server_serve` +8, `sandbox_cx` +4, `sandbox_wasm` +4, `tools_wasm` +1, `server_rate_limit` +1). With `CYRIUS_DCE=1`, as CI now runs them, the suite passes too. On a host without the cx sandbox's namespaces, `sandbox_cx` reads fewer (its fail-closed arm) |
+| **coverage** | **99%**: 102/102 files, 1,635/1,647 fns (gate `--min 80`) |
+| **dist** | `dist/agnosai.cyr` 40,049 lines + `dist/agnosai-guard.cyr` 949, both v2.2.3. The sidecars are unchanged at **6 / 1** leaves; `assert` stays a production leaf (`panic`) |
+| **binary** | `build/agnosai` **2,897,776 B** with dead-code elimination (`[build] dce = true`; 5,805,848 without, and 2.2.2 shipped 5,826,992). aarch64 **6,632,872 B**: NOP-filled, not compacted, since cyrius has no aarch64 compaction. The same 24 requests to the 2.2.2 binary and this one differ only in the version string and the per-process hash order of tool lists and metadata keys (B36). A port conflict now logs `server failed` with `bind (errno 98)` |
+| **lock** | Unchanged: 119 files, 8 commit pins (dropping `hashmap_fast`, declaring `sys` and moving `bench` to `[test] stdlib` change no locked row) |
+| **gates** | as 2.2.2, with CI's Test step under `CYRIUS_DCE=1`: `check-symbols.sh` 2,791 definitions; `check-clean.sh` fmt 224, lint 224, doc 114, doctest 1; then the `ubuntu:26.04` CI replica (CHANGELOG 2.2.3 *Verified*) |
+| **benchmarks** | `bench-history.csv` has 224 rows at 2.2.3, one sweep at a load of 3.2–3.4: median −1.3% against 2.2.2's, 206 of 224 within ±5%. The interleaved A/B against a 2.2.2 build reads flat: 137 rows outside `orch.bcyr` median −0.2%, and `orch.bcyr`'s 87 median −0.1% once the B27 attempt was reverted (with it, ~50 rows read 25–157% slower: B20's thread level). Sweeps are kept only if the load at their end is below 5 |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.1.7; thoth takes the guard profile, unchanged. A consumer sending a WASM tool more than 64 KiB of input now gets an error |
+
+Direct deps: unchanged from 2.2.1.
+
+### 2.2.2 — the release (2026-11-05)
 
 | | |
 |---|---|

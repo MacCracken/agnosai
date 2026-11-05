@@ -227,6 +227,23 @@ fn _t_middleware(): i64 {
 
 # A no-op wrapper so the loop above does not add 100 assertions to the count
 # while still failing loudly if the property breaks.
+# Reading the eviction total frees majra's stats snapshot (2.2.3 audit).
+#
+# `ratelimit_stats` hands back a fresh freelist block on every call. `agnosai_rate_limit_total_evicted`
+# read offset 24 and dropped the block, one per call, where its siblings all go through
+# `_agnosai_rl_stat`, which frees it. The freelist carves a fresh block by advancing `_fl_arena_pos`
+# and reuses a freed one, so a thousand reads that free leave the position where it was, and a
+# thousand that leak move it by a thousand blocks.
+fn _t_total_evicted_frees_its_snapshot(): i64 {
+    var s = agnosai_rate_limit_new(10000, 5);
+    agnosai_rate_limit_total_evicted(s);
+    var before = _fl_arena_pos;
+    for (var i = 0; i < 1000; i = i + 1) { agnosai_rate_limit_total_evicted(s); }
+    assert_eq(_fl_arena_pos - before, 0,
+      "a thousand reads of the eviction total carve no new freelist block: each snapshot is freed");
+    return 0;
+}
+
 fn assert_silent_ok(cond): i64 {
     if (cond == 0) { assert(0, "no-limiter passthrough failed under repetition"); }
     return 0;
@@ -240,6 +257,7 @@ fn main(): i64 {
     _t_separate_keys();
     _t_stats();
     _t_evict_stale();
+    _t_total_evicted_frees_its_snapshot();
     _t_key_from_xff();
     _t_key_from_xri();
     _t_key_fallback();

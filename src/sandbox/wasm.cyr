@@ -312,6 +312,17 @@ fn agnosai_wasm_result_exit_code(r): i64 {
     return load64(r + AGN_WR_EXIT_CODE);
 }
 
+# The most a WASM guest is handed on stdin: one pipe buffer (2.2.3 audit, roadmap B9).
+#
+# ⚠ **Above it, a guest can hang its worker for good.** kavach 3.14.2's capture writes the whole of
+# stdin with one blocking write before it drains stdout, and checks its deadline only in the drain
+# loop. A guest that writes while it reads then deadlocks once both pipes fill: kavach waits on
+# stdin, wasmtime on stdout, and `timeout_ms` never fires. Measured hung at 200,000 B.
+# 64 KiB is the exact safe bound, because an input that fits the pipe is fully written before the
+# guest runs, whatever the guest does. Larger inputs are refused with an error until kavach fixes
+# the capture (`docs/development/upstream-filings/2026-11-05-kavach-wasm-capture-stdin-deadlock.md`).
+var AGNOSAI_WASM_MAX_STDIN_BYTES = 65536;
+
 # Execute a loaded module with `input` on its stdin — the oracle's `execute`.
 #
 # Returns 0 with `*out_err` set; a module that RAN and failed is a successful
@@ -345,6 +356,15 @@ fn agnosai_wasm_execute(s, module, input: Str, out_err): i64 {
     if (module == 0 || load64(module + AGN_WM_PATH) == 0) {
         store64(out_err, agnosai_error_sandbox(str_from("WASM module has been freed")));
         return 0;
+    }
+
+    # Refused before anything is spawned; see `AGNOSAI_WASM_MAX_STDIN_BYTES`.
+    if (input != 0) {
+        if (str_len(input) > AGNOSAI_WASM_MAX_STDIN_BYTES) {
+            store64(out_err, agnosai_error_sandbox(str_from(
+                  "WASM input over 64 KiB is refused: kavach's capture can deadlock on it past its deadline")));
+            return 0;
+        }
     }
 
     # kavach writes the guest's stdin through a pipe; a guest that exits without

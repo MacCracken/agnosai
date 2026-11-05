@@ -10,6 +10,7 @@ cyrius = "6.7.18"
 [build]
 entry = "src/main.cyr"
 output = "build/agnosai"
+dce = true
 
 # `[lib]` exists so `cyrius distlib` knows what to concatenate into
 # dist/agnosai.cyr for downstream consumers (Agnostic 2.0.1). Order is
@@ -183,17 +184,28 @@ modules = [
 [deps]
 stdlib = [
     "syscalls", "alloc", "result", "tagged", "fmt", "io", "fs", "str", "string",
-    "vec", "slice", "args", "process", "assert", "bench",
-    "fnptr", "freelist", "hashmap", "hashmap_fast", "callback", "chrono", "math", "regex",
+    "vec", "slice", "args", "process", "assert",
+    "fnptr", "freelist", "hashmap", "callback", "chrono", "math", "regex",
     "unicode",
     "bayan",
     "patra",
     "atomic", "sync", "thread", "thread_local", "ct", "keccak", "random", "sha1",
-    "mmap", "dynlib", "fdlopen",
+    "mmap", "dynlib", "fdlopen", "sys",
     "async",
     "net", "http", "tls", "ws", "sakshi", "sandhi",
     "sankoch",
 ]
+
+# 2.2.3 audit: the stdlib list is what a PRODUCTION build prepends, and what a consumer's sidecar can
+# name. Four changes, each checked:
+#   * `bench` moved to `[test] stdlib` (cyrius 6.7.6), since only benches/*.bcyr call it.
+#   * `assert` stays. `src/learning/optimizer.cyr` calls the stdlib's `panic()`, which lives in
+#     `lib/assert.cyr` and is documented there as the runtime guard for library code.
+#   * `hashmap_fast` dropped. Nothing in src/, tests/, benches/ or any dep bundle calls an `fhm_*`.
+#   * `sys` declared. bote-core 3.8.11's and sigil's sidecars name it, and both bundles include it
+#     themselves, so the build already had it. The list now says so.
+[test]
+stdlib = ["bench"]
 
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"

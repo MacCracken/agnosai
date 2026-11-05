@@ -177,9 +177,32 @@ fn _t_out(stdout): i64 {
     return agnosai_wasm_tool_output_of(str_from(stdout), 0);
 }
 
+# ⚠ **A wasmtime where kavach looks must be found** (2.2.3 audit). Every execute path in this suite
+# has a no-runtime arm, and that arm asserts too, so a regression in kavach's wasmtime probe would turn
+# the suite into a test of the missing-runtime message on a machine that HAS wasmtime. CI installs it
+# at `/usr/local/bin` precisely so these paths run. The paths are the three kavach probes
+# (`_wasm_binary_path`); with none present the guard says nothing.
+fn _t_wasm_runtime_is_not_silently_missing(): i64 {
+    var found = 0;
+    if (file_exists("/usr/local/bin/wasmtime") == 1) { found = 1; }
+    if (file_exists("/usr/bin/wasmtime") == 1) { found = 1; }
+    var home = getenv("HOME");
+    if (home != 0) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, home);
+        str_builder_add_cstr(sb, "/.cargo/bin/wasmtime");
+        if (file_exists(str_cstr(str_builder_build(sb))) == 1) { found = 1; }
+    }
+    if (found == 0) { return 0; }
+    assert_eq(agnosai_wasm_available(), 1,
+      "wasmtime is installed where kavach looks, so the WASM execute paths MUST run");
+    return 0;
+}
+
 fn main(): i64 {
     var err = 0;
     store64(&err, 0);
+    _t_wasm_runtime_is_not_silently_missing();
 
     # --- the execute path, against a REAL module ---------------------------
     #

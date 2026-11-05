@@ -4,56 +4,63 @@ AgnosAI orchestrates AI agent crews, executes tools in sandboxed environments,
 communicates with LLM providers via HTTP, and optionally distributes work across
 a fleet of nodes. This document maps the attack surfaces and mitigations.
 
+> **Refreshed at 2.2.3 against the Cyrius tree.** Until then, surfaces 1–6 still described
+> the Rust build: axum, serde, rustls, `Arc<RwLock>`, cargo-audit. Several of those rows
+> claimed mitigations this tree does not have, and each is now marked ⚠. The Rust-era text
+> is `git show 2.2.2:docs/development/threat-model.md`. Cyrius security advisories are cited
+> by their `CYRIUS-2026-NNNN` ids.
+
 ## Attack Surfaces
 
-### 1. HTTP API (axum server)
+### 1. HTTP API (sandhi's pooled server)
 
 Clients send JSON to create crews, submit agent definitions, and stream results.
 
 | Threat | Mitigation |
 |--------|------------|
-| Oversized request body | `DefaultBodyLimit::max(10 MiB)` on all routes |
-| Malformed JSON / extra fields | `#[serde(deny_unknown_fields)]` on API request types |
-| Missing/invalid auth | JWT RS256 validation with issuer + audience + expiry checks |
-| Injection via agent definitions | Input validation (`MAX_AGENTS`, `MAX_TASKS`, `MAX_STRING_LEN`) |
-| Slow-loris / connection exhaustion | axum + hyper connection limits; deploy behind reverse proxy |
+| Oversized request body | `AGNOSAI_MAX_BODY_BYTES` (10 MiB, `src/server/router.cyr`), enforced by sandhi's `max_request` before the handler runs |
+| Malformed JSON / extra fields | bayan's parser refuses malformed JSON, a duplicate key and a leading-zero number (since bayan 1.11.1, CHANGELOG 2.2.1), and nesting past depth 128. Request types reject unknown fields with `agnosai_route_no_unknown_fields` |
+| Missing/invalid auth | JWT RS256 (2048–4096-bit keys), checking signature, then `alg`, `iss`, `aud` and `exp` (`src/server/auth.cyr`). ⚠ **Auth is off by default** (`agnosai_auth_config_new`), and the server warns at boot |
+| Injection via agent definitions | Input validation (`MAX_AGENTS`, `MAX_TASKS`, `MAX_STRING_LEN`); user-supplied fields are wrapped before they reach a prompt |
+| Slow-loris / connection exhaustion | 100 pool workers (`AGNOSAI_SERVE_WORKERS`) as the connection cap, and sandhi's 60 s accept-to-request budget (`SANDHI_SERVER_DEFAULT_REQUEST_MS`, sandhi 1.10.7), after which the request is answered 408. Rate limiting is on by default (below). An SSE stream holds a worker for a crew's life (roadmap B8) |
 
-### 2. Tool Execution (WASM, Python, Process)
+### 2. Tool Execution (WASM, cx, Python, Process, OCI)
 
 Tools run untrusted code from community authors or legacy Python scripts.
 
 | Threat | Mitigation |
 |--------|------------|
-| Memory exhaustion | WASM: 64 MiB `StoreLimits`; Process: `setrlimit` (best-effort) |
-| CPU exhaustion | WASM: 1B fuel budget + 30s epoch timeout |
-| Filesystem access | WASM: no filesystem capability; Process: optional `clean_env` |
-| Network access | WASM: no network capability; Process: namespace isolation (future) |
-| Library injection (`LD_PRELOAD`) | All subprocesses strip `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH` |
-| Zombie processes | Every spawned child is waited on; the sandbox tiers enforce a SIGKILL deadline. ⚠ There is no tokio and no `kill_on_drop` in this tree |
-| Output flooding | WASM: 1 MiB stdout buffer; Process: `wait_with_output` bounded by timeout |
+| Memory exhaustion | WASM: kavach passes `-W max-memory-size` (64 MiB default) to wasmtime. ⚠ **Process / Python / OCI: no memory limit.** There is no `setrlimit` here or in the Rust line (`src/sandbox/process.cyr`'s header) |
+| CPU exhaustion | WASM: 1B fuel (`-W fuel`) plus the sandbox deadline; every tier has a SIGKILL deadline |
+| Filesystem access | WASM: no filesystem capability; cx: landlock read-only on the interpreter's directory; ⚠ Process / Python / OCI: a controlled working directory only (see *Accepted Risks*) |
+| Network access | WASM: no network capability; cx: a new network namespace, and the cx tier **fails closed** where one cannot be made (CHANGELOG 2.2.1); ⚠ Process / Python / OCI: none |
+| Library injection (`LD_PRELOAD`) | All subprocesses strip `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH` (`agnosai_sanitized_envp`) |
+| Zombie processes | Every spawned child is waited on; the sandbox tiers enforce a SIGKILL deadline |
+| Output flooding | 1 MiB stdout cap on the kavach paths; the spawner's capture is bounded by its deadline |
+| ⚠ **A guest that hangs its worker** (found 2.2.2) | **Not mitigated.** kavach's capture writes a WASM guest's whole stdin before draining its stdout, so a guest that writes while it reads deadlocks once its input passes about two pipe buffers (~100–200 KB), and kavach's deadline never fires. Roadmap B9 / B16 |
 
 ### 3. LLM Provider Communication
 
-HTTP requests to OpenAI, Anthropic, Ollama, and other providers.
+HTTP requests to hoosh (the gateway), and through it to providers.
 
 | Threat | Mitigation |
 |--------|------------|
 | API key leakage | Keys in environment variables, never logged or serialized |
-| Provider impersonation | TLS via `rustls` with certificate validation (no `danger_accept_invalid_certs` in production) |
+| Provider impersonation | The stdlib's native TLS with chain and hostname verification, nameConstraints enforced since cyrius 6.7.18 (CYRIUS-2026-0042), and extendedKeyUsage checked at every depth (CYRIUS-2026-0026) |
 | Response injection | LLM responses treated as untrusted data; never executed as code |
-| Cost runaway | `ResourceBudget` with `max_tokens`, `max_cost_usd`, `max_duration_secs` |
+| ⚠ Cost runaway | **Only `max_duration_secs` is enforced** (`src/orchestrator/orchestrator.cyr`). `ResourceBudget`'s token and cost limits are carried and not checked; enforcing them is roadmap F5 |
 
 ### 4. Fleet Communication
 
-When the `fleet` feature is enabled, nodes exchange placement plans and results.
+The fleet modules (`src/fleet/`) are **library API with no route**. agnosai's server exposes no
+fleet endpoint, so a consumer that runs a fleet brings its own transport.
 
 | Threat | Mitigation |
 |--------|------------|
-| Unauthenticated nodes | Fleet endpoints behind same auth middleware as API |
-| Message tampering | Deploy behind authenticated transport (mTLS, VPN) in production |
+| Unauthenticated nodes, message tampering | The consumer's transport. Run it authenticated (mTLS, VPN); agnosai adds no fleet auth of its own |
 | Node impersonation | Node IDs are self-assigned; use network-level auth for trust |
 | A peer advancing the coordinator term | `agnosai_federation_declare_coordinator` adopts any declaration whose term is not stale: there is no vote or quorum, so any peer can name a coordinator at a higher term. Federation trusts its peers by design (`src/fleet/federation.cyr`, checked at 2.2.2); keep them on an authenticated transport |
-| State corruption | `Arc<RwLock>` with scoped write locks; no shared mutable state across nodes |
+| ⚠ State corruption | **No fleet type takes a lock** (`src/fleet/*.cyr`). A consumer that shares one across threads must serialise access itself |
 
 ### 5. Serialization / Deserialization
 
@@ -61,10 +68,11 @@ Agent definitions, crew specs, and presets are loaded from JSON/YAML.
 
 | Threat | Mitigation |
 |--------|------------|
-| Unknown fields in JSON | `#[serde(deny_unknown_fields)]` on API input types |
+| Unknown fields in JSON | `agnosai_route_no_unknown_fields` on API input types |
+| Duplicate keys (one parser reading the first, another the last) | Refused by bayan 1.11.1, so a body or a JWT that repeats a key is 400 / 401 (CHANGELOG 2.2.1) |
 | Type confusion | ⚠ Cyrius has no `#[non_exhaustive]` and far weaker typing than Rust — most values are `i64` handles. The mitigation here is the deserialisers REJECTING a record that is missing a required field rather than defaulting it, plus explicit tag checks on every wire enum |
-| Oversized payloads | Request body limits; validation bounds on string lengths and collection sizes |
-| Malicious YAML | YAML parsing only in `definitions` feature; `serde_yaml_ng` with default limits |
+| Oversized payloads | Request body limits; validation bounds on string lengths and collection sizes; JSON nesting capped at depth 128 |
+| Malicious YAML | Only definition *files* are YAML (`src/definitions/loader.cyr`). bayan's subset parser refuses anchors and aliases (so no alias expansion), tags, block scalars and flow mappings |
 
 ### 6. Supply Chain
 
@@ -72,11 +80,11 @@ Dependencies could contain malicious code.
 
 | Threat | Mitigation |
 |--------|------------|
-| Vulnerable dependencies | `cargo-audit` in CI |
-| License violations | `cargo-deny` with explicit license allowlist |
-| Dependency auditing | `cargo-vet` with Mozilla imports |
-| Typosquatting | `deny.toml` restricts to crates.io registry only |
-| Wildcard versions | `cargo-deny` denies wildcard version specs |
+| A dependency changing under a tag | Every `[deps.*]` resolves to a commit pin in `cyrius.lock`; `deps --verify` (in `check-clean.sh`) checks `lib/` against the lock's hashes |
+| A dependency downgrading a folded stdlib module | `check-clean.sh`'s lib-snapshot diff against the pinned toolchain's `lib/` |
+| The toolchain itself | Pinned in `cyrius.cyml`; CI installs that exact version with a SHA256-checked tarball |
+| CI actions | Every GitHub Action is pinned by commit SHA |
+| Source-level policy | `cyrius vet` and `cyrius deny` in `check-clean.sh` |
 
 ### 7. Inbound trace context (W3C `traceparent`, [ADR 023](../adr/023-genai-semconv-spans-and-w3c-trace-context.md))
 
@@ -107,11 +115,12 @@ Untrusted                    Trusted
 ─────────────────────────────────────────
 HTTP clients          →  API validation layer  →  Orchestrator
 traceparent header    →  strict W3C v00 parse  →  span parent + sampling (honoured as-is)
-WASM tool modules     →  Sandbox (wasmtime)    →  Tool registry
-Python tool scripts   →  Subprocess sandbox    →  Tool registry
+WASM tool modules     →  kavach + wasmtime     →  Tool registry
+cx tool bytecode      →  kavach (ns, landlock) →  Tool registry
+Python / process tools →  agnosai's spawner    →  Tool registry   (⚠ no kernel confinement)
 LLM provider responses →  Response parsing     →  Agent execution
-JSON/YAML definitions →  Serde validation      →  Definition store
-Fleet messages        →  Auth + TLS            →  Coordinator
+JSON/YAML definitions →  bayan + validators    →  Definition store
+Fleet messages        →  the consumer's transport (agnosai serves no fleet endpoint)
 ```
 
 ## Controls added 2026-08-13
@@ -137,16 +146,20 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
 
 ## Accepted Risks
 
-- **TOCTOU on tool paths**: Time-of-check-time-of-use gap between resolving a
-  tool binary path and executing it. Mitigated by running in controlled
-  environments with trusted `$PATH`.
-- **Python/process subprocess escapes**: ⚠ **NOT confined.** seccomp-bpf, Landlock
-  and cgroups are named by the oracle's module doc as "(future)" and are not
-  yet implemented. Current mitigation: a SIGKILL deadline, a controlled working
-  directory and a sanitized environment — no kernel confinement. Treat a
-  process-tier tool as running with the server's privileges.
-- **Fleet coordinator election**: Simple "first node wins" election. No Byzantine
-  fault tolerance. Suitable for trusted internal networks.
+- **TOCTOU on tool paths**: agnosai's own spawner (`src/sandbox/spawn.cyr`) resolves a tool
+  binary against `PATH` and then execs it by path, so what runs is whatever sits at that path at
+  exec time. kavach's paths pin the binary by fd before the fork (ADR-005 §H4 in kavach), but
+  the process, Python and OCI tiers do not go through kavach (next item). Mitigated by running
+  in controlled environments with a trusted `$PATH`.
+- **Python/process/OCI subprocess escapes**: ⚠ **NOT confined.** These tiers spawn through
+  agnosai's own spawner: a SIGKILL deadline, a controlled working directory and a sanitized
+  environment, with no seccomp, landlock, namespaces or cgroup. Treat a process-tier tool as
+  running with the server's privileges. **kavach's confined process backend is already bridged**
+  (`agnosai_kavach_execute`: no_new_privs, landlock scopes and kavach's exec seccomp filter,
+  tested by `tests/sandbox_kavach_bridge.tcyr`). But no production tier calls it; routing them
+  through it is on the roadmap.
+- **Fleet coordinator election**: lowest-id election, and any non-stale term is adopted (surface 4).
+  No Byzantine fault tolerance. Suitable for trusted internal networks.
 - **Caller-controlled trace context** (surface 7): any caller of a traced route
   chooses the trace its spans join and can suppress their export with sampled
   flag `0`. Accepted because joining the caller's trace is the point of the

@@ -620,6 +620,37 @@ fn _t_rate_limit_trim_keeps_the_hammered_key(): i64 {
     return 0;
 }
 
+# The serve loop's failure is named in the log (2.2.3 audit).
+#
+# A server that could not bind used to log "listening on …" and exit 1 with nothing else.
+# `_agnosai_serve_report_failure` now logs `server failed` with `<step> (errno <n>)`, read back with
+# `sandhi_server_last_failure`. Nothing captures sakshi output here, so the line itself is checked by
+# running a second server on a taken port (CHANGELOG 2.2.3). What is pinned here is the step
+# vocabulary, and that sandhi hands back the step and errno the options carry.
+fn _t_serve_failure_is_named(): i64 {
+    assert(str_eq_cstr(str_from(_agnosai_serve_failure_step_name(SANDHI_SERVER_FAIL_BIND)), "bind") == 1,
+      "a failed bind is named bind");
+    assert(str_eq_cstr(str_from(_agnosai_serve_failure_step_name(SANDHI_SERVER_FAIL_LISTEN)), "listen") == 1,
+      "a failed listen, listen");
+    assert(str_eq_cstr(str_from(_agnosai_serve_failure_step_name(SANDHI_SERVER_FAIL_ACCEPT)), "accept") == 1,
+      "a fatal accept, accept");
+    assert(str_eq_cstr(str_from(_agnosai_serve_failure_step_name(SANDHI_SERVER_FAIL_THREAD)), "thread") == 1,
+      "a worker that would not start, thread");
+    assert(str_eq_cstr(str_from(_agnosai_serve_failure_step_name(99)), "unknown") == 1,
+      "and a step this build does not know is unknown, not a crash");
+    var o = agnosai_serve_options();
+    var step = 0 - 1;
+    var err = 0 - 1;
+    sandhi_server_last_failure(o, &step, &err);
+    assert_eq(step, SANDHI_SERVER_FAIL_NONE, "fresh options carry no failure");
+    _sandhi_server_set_failure(o, SANDHI_SERVER_FAIL_BIND, 98);
+    sandhi_server_last_failure(o, &step, &err);
+    assert_eq(step, SANDHI_SERVER_FAIL_BIND, "a recorded bind failure comes back as the step");
+    assert_eq(err, 98, "...with its errno, EADDRINUSE here");
+    println("  serve_failure_is_named: ok");
+    return 0;
+}
+
 # The unauthenticated probes are never refused.
 #
 # ⚠ A kubelet sends neither proxy header, so it keys as `"unknown"` — the one
@@ -1982,6 +2013,7 @@ fn main(): i64 {
     _t_rate_limit_sweep_runs_and_bounds_keys();
     _t_rate_limit_cap_holds_at_a_strict_rate();
     _t_rate_limit_trim_keeps_the_hammered_key();
+    _t_serve_failure_is_named();
     _t_rate_limit_probes_are_exempt();
     _t_rate_limit_keys_are_per_client();
     _t_rate_limit_handler_keys_per_client();

@@ -217,9 +217,32 @@ fn _t_write_nop_module(path: Str): i64 {
     return n;
 }
 
+# ⚠ **A wasmtime where kavach looks must be found** (2.2.3 audit). Every execute path in this suite
+# has a no-runtime arm, and that arm asserts too, so a regression in kavach's wasmtime probe would turn
+# the suite into a test of the missing-runtime message on a machine that HAS wasmtime. CI installs it
+# at `/usr/local/bin` precisely so these paths run. The paths are the three kavach probes
+# (`_wasm_binary_path`); with none present the guard says nothing.
+fn _t_wasm_runtime_is_not_silently_missing(): i64 {
+    var found = 0;
+    if (file_exists("/usr/local/bin/wasmtime") == 1) { found = 1; }
+    if (file_exists("/usr/bin/wasmtime") == 1) { found = 1; }
+    var home = getenv("HOME");
+    if (home != 0) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, home);
+        str_builder_add_cstr(sb, "/.cargo/bin/wasmtime");
+        if (file_exists(str_cstr(str_builder_build(sb))) == 1) { found = 1; }
+    }
+    if (found == 0) { return 0; }
+    assert_eq(agnosai_wasm_available(), 1,
+      "wasmtime is installed where kavach looks, so the WASM execute paths MUST run");
+    return 0;
+}
+
 fn main(): i64 {
     var err = 0;
     store64(&err, 0);
+    _t_wasm_runtime_is_not_silently_missing();
 
     # --- Oracle: create_sandbox_with_defaults -----------------------------
     var s = agnosai_wasm_sandbox_new();
@@ -381,6 +404,28 @@ fn main(): i64 {
         assert_neq(out, 0, "with a runtime present, a header-only module executes");
         assert_eq(agnosai_wasm_result_exit_code(out), 0,
           "and an empty module exits cleanly");
+    }
+
+    # --- 2.2.3 audit: stdin is capped at one pipe buffer ----------------------
+    # Over it, kavach's capture can deadlock past its own deadline on a guest that writes while it
+    # reads (`AGNOSAI_WASM_MAX_STDIN_BYTES`). Refused before anything spawns, so this holds with or
+    # without a runtime.
+    var over = str_builder_new();
+    for (var oi = 0; oi < AGNOSAI_WASM_MAX_STDIN_BYTES + 1; oi = oi + 1) { str_builder_putc(over, 65); }
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_execute(s, m, str_builder_build(over), &err), 0,
+      "a WASM input one byte over 64 KiB is refused");
+    assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "64 KiB"), 1,
+      "...with an error that says why");
+    var at = str_builder_new();
+    for (var ai = 0; ai < AGNOSAI_WASM_MAX_STDIN_BYTES; ai = ai + 1) { str_builder_putc(at, 65); }
+    store64(&err, 0);
+    var at_r = agnosai_wasm_execute(s, m, str_builder_build(at), &err);
+    if (at_r == 0) {
+        assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "64 KiB"), 0,
+          "exactly 64 KiB is not refused by the cap (only a missing runtime refuses it)");
+    } else {
+        assert_eq(agnosai_wasm_result_exit_code(at_r), 0, "exactly 64 KiB runs: the cap is inclusive");
     }
 
     # --- a REAL module, end to end -------------------------------------------

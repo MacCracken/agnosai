@@ -795,14 +795,51 @@ fn agnosai_serve_mount(state, limiter): i64 {
 # `INADDR_ANY()` (`lib/net.cyr:130`) for the oracle's `[0, 0, 0, 0]`, or
 # `INADDR_LOOPBACK()` (`lib/net.cyr:132`) for 127.0.0.1.
 fn agnosai_serve(state, addr, port): i64 {
-    return sandhi_server_run_pooled(addr, port, &agnosai_serve_handler, 0,
-      agnosai_serve_mount(state, 0));
+    var opts = agnosai_serve_mount(state, 0);
+    var rc = sandhi_server_run_pooled(addr, port, &agnosai_serve_handler, 0, opts);
+    if (rc != 0) { _agnosai_serve_report_failure(opts); }
+    return rc;
 }
 
 # The same, with rate limiting mounted — **what `src/main.cyr` calls by default**
 # as of ADR 021. `agnosai_serve` above is now the opt-OUT path, reached when
 # `AGNOSAI_RATE_LIMIT=0`.
 fn agnosai_serve_with_rate_limit(state, addr, port, rate_x1000, burst): i64 {
-    return sandhi_server_run_pooled(addr, port, &agnosai_serve_handler, 0,
-      agnosai_serve_mount(state, agnosai_rate_limit_new(rate_x1000, burst)));
+    var opts = agnosai_serve_mount(state, agnosai_rate_limit_new(rate_x1000, burst));
+    var rc = sandhi_server_run_pooled(addr, port, &agnosai_serve_handler, 0, opts);
+    if (rc != 0) { _agnosai_serve_report_failure(opts); }
+    return rc;
+}
+
+# The step `sandhi_server_last_failure` reports, as a word for the log line (2.2.3 audit).
+fn _agnosai_serve_failure_step_name(step): i64 {
+    if (step == SANDHI_SERVER_FAIL_CONFIG) { return "config"; }
+    if (step == SANDHI_SERVER_FAIL_ALLOC) { return "alloc"; }
+    if (step == SANDHI_SERVER_FAIL_SOCKET) { return "socket"; }
+    if (step == SANDHI_SERVER_FAIL_BIND) { return "bind"; }
+    if (step == SANDHI_SERVER_FAIL_LISTEN) { return "listen"; }
+    if (step == SANDHI_SERVER_FAIL_ACCEPT) { return "accept"; }
+    if (step == SANDHI_SERVER_FAIL_THREAD) { return "thread"; }
+    return "unknown";
+}
+
+# Log why the server loop failed, as `<step> (errno <n>)` (2.2.3 audit).
+#
+# ⚠ **Through 2.2.2 a server that could not start said nothing about why.** `main` logs
+# "listening on 0.0.0.0:<port>" before the loop binds, so a port already in use printed that line,
+# then exited 1 with no other output. sandhi records the failing step and errno in the options
+# since 1.10.10, and `sandhi_server_last_failure` reads them back. The "listening on" line stays,
+# because consumers may watch for it; this line follows it when the bind (or anything after) fails.
+fn _agnosai_serve_report_failure(opts): i64 {
+    var step = 0;
+    var err = 0;
+    sandhi_server_last_failure(opts, &step, &err);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, _agnosai_serve_failure_step_name(step));
+    str_builder_add_cstr(sb, " (errno ");
+    str_builder_add_int(sb, err);
+    str_builder_add_cstr(sb, ")");
+    var why = str_builder_build(sb);
+    sakshi_log_kv(SK_ERROR, "server failed", 13, "reason", 6, str_data(why), str_len(why));
+    return 0;
 }

@@ -204,16 +204,17 @@ fn agnosai_relay_message_timestamp(m): i64 {
 # dedup_table_size, sequence_gaps) which are reachable through
 # `agnosai_relay_sequence_gaps` and the inner relay.
 #
-# majra's `relay_stats` returns a fresh 48-byte `fl_alloc` snapshot on every call
-# and has no free of its own, so it is freed here once copied — it used to leak a
-# block per call.
+# majra's `relay_stats` returns a fresh 48-byte `fl_alloc` snapshot on every call,
+# and it is released here once copied; it used to leak a block per call. Through
+# `relay_stats_free` since 2.2.3, which majra 2.11.0 added. Until then majra had no
+# free of its own, so this file called `fl_free` directly.
 fn agnosai_relay_stats(r): i64 {
     var m = relay_stats(load64(r + AGN_RLY_INNER));
     var s = alloc(AGN_RS_SIZE);
     store64(s + AGN_RS_MESSAGES_SENT, load64(m));
     store64(s + AGN_RS_MESSAGES_RECEIVED, load64(m + 8));
     store64(s + AGN_RS_DUPLICATES_DROPPED, load64(m + 16));
-    fl_free(m);
+    relay_stats_free(m);
     return s;
 }
 
@@ -240,7 +241,7 @@ fn agnosai_relay_stats_duplicates_dropped(s): i64 {
 fn agnosai_relay_sequence_gaps(r): i64 {
     var m = relay_stats(load64(r + AGN_RLY_INNER));
     var gaps = load64(m + 40);
-    fl_free(m);
+    relay_stats_free(m);
     return gaps;
 }
 

@@ -7,6 +7,168 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.3] — 2026-11-05
+
+The P(-1) audit and hardening the roadmap scheduled after three language bumps (cyrius 6.6.14 → 6.7.18 over
+2.1.8–2.2.1): a whole-tree review rather than another per-move read. It found:
+- two guards that could let a suite pass without testing;
+- a server that failed to start without saying why;
+- a WASM path that could hang a worker past every deadline;
+- a stats-block leak;
+- a threat model that still described the Rust build and claimed four mitigations this tree does not have.
+
+The release binary is now built with dead-code elimination: x86_64 is 2.9 MB, down from 5.8 MB. There is no
+dependency change.
+
+⚠ **Behaviour change:** a WASM tool's input over 64 KiB is refused (below).
+
+### Fixed
+
+- **A server that could not start said nothing about why.** `main` logs "listening on 0.0.0.0:<port>"
+  before the loop binds, so a port already in use printed that line and exited 1 with no other output.
+  `agnosai_serve` and `agnosai_serve_with_rate_limit` (`src/server/serve.cyr`) now read the failing step and
+  errno back with `sandhi_server_last_failure` (sandhi 1.10.10+) and log `server failed`, e.g. `"reason":"bind
+  (errno 98)"`. The "listening on" line is kept, because consumers may watch for it.
+  `tests/server_serve.tcyr` pins the step names and the round trip (+8).
+- **⚠ A WASM guest could hang its worker for good; input over 64 KiB is now refused.** kavach 3.14.2's
+  capture writes the whole of stdin before it drains stdout, and checks its deadline only in the drain loop. A
+  guest that writes while it reads deadlocked once both pipes filled, measured at 200 KB of input, and
+  kavach's timeout never fired.
+  - `agnosai_wasm_execute` refuses input over `AGNOSAI_WASM_MAX_STDIN_BYTES` (64 KiB) before anything spawns,
+    with an error that says why. 64 KiB is one pipe buffer, the exact bound under which the write cannot block,
+    whatever the guest does.
+  - Reading-first tools with 64 KiB–1 MiB of input, which worked, are refused too. A visible refusal replaces
+    a hang that could not be bounded.
+  - `tests/sandbox_wasm.tcyr` (+3): one byte over is refused, and exactly 64 KiB runs.
+  - The kavach filing is drafted (below).
+- **`agnosai_rate_limit_total_evicted` leaked majra's stats snapshot**, a 32-byte freelist block per call;
+  its siblings all go through `_agnosai_rl_stat`, which frees it. It does too now. `tests/server_rate_limit.tcyr`
+  (+1) watches the freelist's carve position: a thousand reads leave it unmoved. Against the old code it moved
+  48,000 B.
+- **Two test guards that could let a suite pass without testing**, the class behind 2.2.1's two vacuous tests:
+  - **The WASM suites** (`sandbox_wasm`, `tools_wasm`) assert both arms of `agnosai_wasm_available()`, so a
+    regression in kavach's wasmtime probe would have turned them into tests of the missing-runtime message on a
+    host that has wasmtime, CI included. Each now asserts availability when wasmtime sits on a path kavach
+    probes (+1 each). With availability forced to 0, both fail.
+  - **`sandbox_cx`**'s four `if (cyx == 0) { return 0; }` let a guest that stopped compiling skip its test.
+    Each asserts the compile first (+4).
+- `src/fleet/relay.cyr` frees majra's relay stats with `relay_stats_free` (majra 2.11.0), and its comment no
+  longer says majra has none.
+
+### Changed
+
+- **The release binary is built with dead-code elimination** (`[build] dce = true`; cyrius 6.7.18 compacts
+  x86_64 ELF). Native **5,805,816 → 2,897,688 B**. aarch64 is NOP-filled but not compacted, since cyrius has no
+  aarch64 compaction yet: 6,632,776 B. The checks before adopting it:
+  - The full suite built with `CYRIUS_DCE=1`: 99 suites, 0 failed.
+  - The same 24 requests sent to a plain and a DCE server, with ids and timestamps normalised. Covered: health,
+    the 405, tools, presets, definitions, approvals, the dashboard, five MCP calls, a crew run and its
+    readback, A2A, a tool delete, and `/metrics`. The responses differ only in the order of the tool list, and
+    that order already varies between two runs of the same plain binary (B36).
+  - `[build] dce` reaches only `cyrius build`. So CI's Test step now sets `CYRIUS_DCE=1`, and tests the shape
+    it ships.
+- **`cyrius.cyml`'s stdlib lists:**
+  - `bench` moved to a new `[test] stdlib` (cyrius 6.7.6), so a production build no longer prepends it. A
+    `.bcyr` builds through `cyrius bench`, which CI and `bench-history.sh` already use.
+  - `hashmap_fast` is dropped: no caller in `src/`, tests, benches or any dep bundle.
+  - `sys` is declared, which bote-core 3.8.11's and sigil's sidecars name; both include it themselves.
+  - `assert` **stays**: `src/learning/optimizer.cyr` calls the stdlib's `panic()`, which lives in
+    `lib/assert.cyr`. The roadmap's premise that it was test-only was wrong.
+  - Native, before DCE: 5,826,992 → 5,805,816 B.
+- **`docs/development/threat-model.md` is refreshed against the Cyrius tree.** Surfaces 1–6 still described
+  the Rust build: axum, serde, rustls, `Arc<RwLock>`, cargo-audit. Four of their rows claimed mitigations this
+  tree does not have, each now marked ⚠:
+  - `setrlimit` memory limits on the process tier;
+  - `ResourceBudget` stopping cost runaway (only `max_duration_secs` is enforced, roadmap F5);
+  - "fleet endpoints behind the auth middleware" (no route reaches the fleet modules);
+  - `Arc<RwLock>` fleet state (no fleet type takes a lock).
+
+  New rows cover bayan 1.11.1's duplicate-key refusal, the 128-deep JSON nesting cap, sandhi's 60 s request
+  budget, native TLS's nameConstraints (CYRIUS-2026-0042), and the WASM hang above. The accepted risk that the
+  process, Python and OCI tiers run unconfined is confirmed and sharpened. kavach's confined backend is bridged
+  and tested, but no production tier calls it (new roadmap B35).
+- **Upstream filings drafted** in `docs/development/upstream-filings/`, for the user to send:
+  - kavach's WASM stdin deadlock;
+  - kavach's missing WASM store limits;
+  - sigil's lane pool refusing a burst (below);
+  - sigil's 4096-bit RSA ceiling;
+  - sandhi's 501 on chunked request bodies.
+
+  agnosai does not write into another repo.
+- **The roadmap:**
+  - Your ruling is recorded: `rust-old/` is deleted at 2.3.0 once every Rust porting item is done.
+  - The items are inventoried: five portable (B7's spans, B10, B11, B15's `StateStore`, a certificate-format
+    JWT key) and three blocked upstream (B5 bhava, RSA over 4096 bits, the WASM store limits). Whether the
+    blocked ones are exempt is your call at 2.3.0.
+  - New rows: B34 (stale citations), B35 (unconfined process tiers), B36 (tool order), and D8 (`--locked` in
+    CI, a policy decision).
+  - The 2.2.3 section is removed now that it has shipped.
+
+### Found, not changed
+
+- **B27 cannot be fixed by moving its rows first, so it was tried and reverted.** Moving the four
+  `crew_runner_10_tasks_parallel_4_*` rows to the top of `benches/orch.bcyr` gave them a fresh heap. But they
+  start the parallel runner's threads, so every row after them ran at the threads-have-existed level that B20
+  records. In an interleaved A/B against 2.2.2, about 50 `orch.bcyr` rows read 25–157% slower with no code
+  change: `pattern_match_*` +130–157%, `pubsub_*` +32–81%, the scheduler +27–48%. The file is back as 2.2.2
+  had it, and B27's row now says the fix is a `.bcyr` of the rows' own.
+- **sigil's lane pool refuses a burst.** 100 threads each verifying a valid ECDSA P-256 signature at once gave
+  64 accepted and 36 refused, in each of five runs, and 0 lanes held afterwards. Nothing leaks; the overflow of
+  a burst fails. On agnosai's outbound TLS that is a failed handshake when more than 64 verify at once. Inbound
+  JWT RSA verification takes no lane. Recorded on the roadmap's sigil row, with the filing drafted.
+- **The JSON parse cost** (2.2.1, +38–66%) is bayan's alone: each preset and each request body is parsed once.
+  D3 keeps `builtin_presets` uncached by the user's decision, so there is nothing agnosai-side to recover.
+- **39 of the 60 `lib/<file>:<line>` citations in `src/` comments no longer point at the identifier they
+  name** (a 12-line heuristic). An automated rewrite picked the wrong function for some, so it was not applied.
+  It is roadmap B34, by hand.
+- `CYRIUS_DCE=1` on test builds, `[test] stdlib` and `sandhi_server_last_failure` are adopted (above).
+  `--locked` is not, because it changes `CLAUDE.md`'s lock policy; it is roadmap D8.
+
+### Performance
+
+**Flat.** Every `benches/*.bcyr` was built from the 2.2.2 tag and from this tree on the same toolchain, and the
+two ran interleaved, alternating which went first. Because `bench` now lives in `[test] stdlib`, which a plain
+`cyrius build` does not see, the 2.2.3 side was built from a copy of this tree with `bench` back in
+`[deps] stdlib` and DCE off. So the A/B measures the source and manifest changes, not the build mode.
+
+- **The ten files other than `orch.bcyr`** (3 rounds): 137 rows, median −0.2%, 131 within ±5%. The outliers are
+  1 ns steps (`noop`, `route_research_complex`), the bimodal `tool_registry_has_50_miss`, and the two
+  `fleet_compute_*` rows moving in opposite directions on code unchanged since 2.2.2.
+- **`orch.bcyr`**, after reverting the B27 attempt (*Found, not changed*), 3 rounds: 87 rows, median −0.1%, 85
+  within ±5%. With the attempt in place, the same file read 25–157% slower on about 50 rows.
+- No benchmark covers the changed paths (the serve failure log, the WASM input cap, the eviction-total read),
+  and all three run only on an error or a read the benchmarks do not make.
+- **The release binary halves** with DCE: 5,805,848 → 2,897,776 B (*Changed*).
+- `bench-history.csv` gains 224 rows at 2.2.3 from one unpinned `bench-history.sh` sweep at a 1-minute load of
+  3.2–3.4. Against 2.2.2's rows (load 3.8–4.1) they read median −1.3%, 206 of 224 within ±5%. Three sweeps were
+  thrown out before it. One had the B27 attempt in place. The other two saw the load climb past 5 (one to
+  17.3) while other sessions ran. A sweep is only recorded if the load at its end is below 5.
+
+### Verified
+
+- **The gate:** `check-symbols.sh` (2,791 definitions, both targets) → `check-clean.sh` (fmt 224, lint 224,
+  doc 114, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist) → build → **99 suites,
+  8,746 assertions, 0 failed** → coverage 99% (1,635/1,647 fns) → `distlib --all --check` → examples → fuzz 4/4
+  → `cyrius bench` (11 files). The suite also passes built with `CYRIUS_DCE=1`, which is how CI now runs it.
+- **Every new check was run against the defect it guards:**
+  - the eviction-total leak test against the old code (+48,000 B);
+  - the WASM runtime guard with availability forced to 0 (both suites fail);
+  - the stdin cap one byte over and at the bound.
+
+  The four cx compile asserts were not mutation-checked, because a failing `cycc_cx` compile cannot be induced
+  without breaking the toolchain. Each is a plain `assert(cyx != 0, …)` ahead of the early return it guards.
+- **The shipped binary, end to end.** The same 24 requests went to the 2.2.2 release binary and to the 2.2.3
+  DCE binary. After normalising the version string, only two things differ, and the per-process hash seed
+  varies both between runs of the 2.2.2 binary itself (B36): the order of the tool list, and the key order
+  inside a task's `metadata`. A second server on a taken port now logs `"reason":"bind (errno 98)"`; it used to
+  say nothing.
+- **The CI way, on the runner's image.** An `ubuntu:26.04` container ran every `ci.yml` step as an
+  unprivileged user, from a fresh clone with this diff applied, with the Test step under `CYRIUS_DCE=1`. It
+  covered the toolchain; `lib sync --full` and `deps` from an empty cache; the symbol check; `check-clean.sh`;
+  the DCE build (2,897,776 B, as here); the tests (99 suites, 0 failed); coverage; the example; fuzz and
+  `cyrius bench`. That run had the B27 attempt in place. `orch.bcyr` is since restored byte-for-byte to 2.2.2's
+  version, and `cyrius bench` builds and runs it.
+
 ## [2.2.2] — 2026-11-05
 
 The quick items open on the roadmap:
