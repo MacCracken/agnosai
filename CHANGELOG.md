@@ -121,13 +121,23 @@ zero, is now **400 "malformed JSON body"**, and a JWT whose header or claims do 
     host that can confine, nothing changes: 87 assertions, as before.
   - On one that cannot, `_t_cx_fails_closed_without_namespaces` asserts the refusal in their place.
     The guest, which would print a marker and exit 42, must not run, and no fallback may run it. The
-    suite's final check insists that every guest test this host could not run was covered by it.
-    In the container: 68 passed, 0 failed, as root or not.
+    child's exit must be one of kavach's two namespace-stage codes: `SPAWN_EXIT_NS` (123) where the
+    `unshare` itself is refused, as in docker, and `SPAWN_EXIT_IDMAP` (118) where the namespace is
+    created but its id maps are refused. The suite's final check insists that every guest test this
+    host could not run was covered by it. In the container: 68 passed, 0 failed, as root or not.
   - Mutation-checked with the audit's mutation, an unconfined `persistent_spawn_confined` in place of
     `_ns`. In the container the fail-closed test fails ("got 42, expected 123"), and on a host with
     namespaces the uid test fails as it did.
-  - Whether GitHub's `ubuntu-latest` grants the namespaces is not known from here. The suite is
-    correct either way.
+  - **GitHub's `ubuntu-26.04` runner does not grant them either, and it refuses at the other step.**
+    Ubuntu's AppArmor restriction lets an unprivileged process create the user and network namespaces,
+    then refuses the id maps. The fix's first version demanded 123, and the first 2.2.1 push to
+    `main` failed CI on "got 118, expected 123". That is kavach's own case for 118: "a CI runner
+    already inside a restricted user namespace creates one happily and then cannot write uid_map".
+    `_t_cx_host_confines` probes both steps, so a host that takes this arm refuses at one of the two.
+  - Checked in four places: this host (namespaces work: 87, as before); an unmapped user namespace
+    here and a default docker container (123: 68 each); and docker with seccomp off, where the
+    container does get namespaces and all 87 run. The 118 path itself is checked only by GitHub's
+    runner, since this host has no AppArmor.
 
 ### Performance
 
@@ -197,7 +207,9 @@ holding the movers. That splits the toolchain from the dep moves:
   `install.sh` toolchain at 6.7.18; `lib sync --full` and `deps` from an empty dep cache with no
   sibling checkouts; the symbol check; `check-clean.sh`; the build (5,826,992 B, as here); wasmtime
   47.0.3; 99 suites, 0 failed; coverage; the example; fuzz; and `cyrius bench`. The run before the cx
-  fix failed `sandbox_cx` 7 times (*Fixed*), and the run after it passed every step.
+  fix failed `sandbox_cx` 7 times (*Fixed*), and the run after it passed every step. The replica
+  is docker, so it refuses at the `unshare` (123). GitHub's runner refuses at the id maps (118),
+  which the replica could not show, and the first push failed CI on exactly that.
 
 ## [2.2.0] — 2026-11-04
 

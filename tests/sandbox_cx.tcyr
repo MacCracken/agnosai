@@ -599,7 +599,16 @@ fn _t_cx_guest_cannot_open_etc_passwd(): i64 {
 # This is the bridge's documented contract ("never fall back to an unconfined spawn"), checked
 # where the guest tests cannot check anything. The guest would print a marker and exit 42. A
 # refusal is either the spawn failing (no result, with the sandbox error set) or kavach's child
-# exiting `SPAWN_EXIT_NS` before cxvm starts. The marker is the proof either way.
+# exiting at the namespace stage before cxvm starts. The marker is the proof either way.
+#
+# ⚠ **Which namespace step refuses depends on the host, so either code is accepted.** Docker's
+# seccomp profile refuses the `unshare` itself: `SPAWN_EXIT_NS` (123). GitHub's `ubuntu-26.04`
+# runner, under Ubuntu's AppArmor restriction on unprivileged user namespaces, lets the namespace
+# be created and then refuses its id maps: `SPAWN_EXIT_IDMAP` (118). That is the case kavach
+# gives the code its own exit for: "a CI runner already inside a restricted user namespace
+# creates one happily and then cannot write uid_map". The first version of this test demanded
+# 123 and failed CI on 118. `_t_cx_host_confines` probes both steps, so a host that sends the
+# test down this arm refuses at one of the two.
 fn _t_cx_fails_closed_without_namespaces(): i64 {
     if (_t_cx_have_runner() == 0) { return 0; }
     if (_t_cx_host_confines() == 1) { return 0; }
@@ -612,8 +621,17 @@ fn _t_cx_fails_closed_without_namespaces(): i64 {
         assert(load64(&e) != 0, "a sandbox that cannot be created is a refusal with the error set");
     }
     if (r != 0) {
-        assert_eq(agnosai_cx_result_exit_code(r), SPAWN_EXIT_NS,
-          "the confined child refused at the namespace step (kavach's SPAWN_EXIT_NS)");
+        var code = agnosai_cx_result_exit_code(r);
+        var at_ns = 0;
+        if (code == SPAWN_EXIT_NS) { at_ns = 1; }
+        if (code == SPAWN_EXIT_IDMAP) { at_ns = 1; }
+        if (at_ns == 0) {
+            print("  cx: the confined child exited ", 32);
+            print_num(code);
+            println(", which is neither SPAWN_EXIT_NS (123) nor SPAWN_EXIT_IDMAP (118)");
+        }
+        assert(at_ns == 1,
+          "the confined child refused at the namespace stage (kavach's SPAWN_EXIT_NS or SPAWN_EXIT_IDMAP)");
         assert(str_contains_cstr(agnosai_cx_result_stdout(r), "guest-ran") == 0,
           "...so the guest never ran: no unconfined fallback");
     }
