@@ -613,19 +613,17 @@ fn _agnosai_lt_log(msg, msg_len, url: Str, a_key, a_val, b_key, b_val, c_key, c_
 
 # Execute a load test from tool input.
 #
-# The SSRF guard runs **before** anything else touches the network, and its
-# rejection message is the oracle's. Note this means the tool cannot be pointed
-# at loopback, which is deliberate and is why the tests drive
-# `agnosai_load_test_run` with a synthetic executor instead.
+# The target check runs **before** anything else touches the network, and with no gate its
+# rejection message is the oracle's. So the tool cannot be pointed at loopback unless a gate
+# admits it (ADR 025), which is deliberate. Its requests follow no redirect, as sandhi's
+# default has it, so the target is the only URL this tool ever reaches.
 fn _agnosai_load_testing_execute(ctx, input): i64 {
     var target = agnosai_tool_input_get_str(input, str_from("target_url"));
     if (target == 0) {
         return agnosai_tool_output_err(str_from("missing required parameter: target_url"));
     }
-    if (agnosai_is_safe_url(target) == 0) {
-        return agnosai_tool_output_err(
-          str_from("target_url rejected: cannot target private/internal networks"));
-    }
+    var refused = agnosai_tool_target_refused(input, target);
+    if (refused != 0) { return refused; }
 
     var users = agnosai_tool_input_get_int(input, str_from("concurrent_users"));
     if (users == AGNOSAI_NO_LIMIT) { users = 10; }

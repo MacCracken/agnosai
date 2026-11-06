@@ -34,6 +34,10 @@ Tools run untrusted code from community authors or legacy Python scripts.
 | CPU exhaustion | WASM: 1B fuel (`-W fuel`) plus the sandbox deadline; every tier has a SIGKILL deadline |
 | Filesystem access | WASM: no filesystem capability; cx: landlock read-only on the interpreter's directory; ⚠ Process / Python / OCI: a controlled working directory only (see *Accepted Risks*) |
 | Network access | WASM: no network capability; cx: a new network namespace, and the cx tier **fails closed** where one cannot be made (CHANGELOG 2.2.1); ⚠ Process / Python / OCI: none |
+| A model steered to a host its task did not declare (the system under test writes tool output, so a page can ask for it) | A consumer's gate ([ADR 025](../adr/025-a-tool-call-passes-a-consumers-gate.md)), asked at `agnosai_tool_execute_for` and of each URL, so no tool implements it and no path can skip it. ⚠ With no gate, a tool's target is still the model's to choose, under the SSRF guard alone |
+| A redirect off the checked target | Every hop goes back through `agnosai_tool_url_ok` before its request is made (`agnosai_guarded_fetch_hops`), so the check does not end at the first 302. `load_testing` follows no redirect |
+| A gate's admission reaching cloud credentials | An ADMIT gets a declared host past `agnosai_is_safe_url` and no further: 169.254/16, `fd00:ec2::254`, `metadata.google.internal`, `metadata.goog` and non-HTTP schemes are refused whatever the gate says (`agnosai_url_is_admissible`), and any verdict but PASS or ADMIT refuses. ⚠ Neither check resolves names, so a declared name that resolves somewhere it should not is the gate's to answer for |
+| A private address spelled so the guard and the dialer read it differently | The guard judges a host by `sandhi_net_parse_ipv4`, the parser that dials, as well as the WHATWG reading, and a host must pass under both. Until 2.2.4 `0127.0.0.1` read as public octal and connected to loopback (CHANGELOG 2.2.4 *Security*). A name is compared with its root dots dropped, as a resolver reads it, so `foo.internal.` is `foo.internal` |
 | Library injection (`LD_PRELOAD`) | All subprocesses strip `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH` (`agnosai_sanitized_envp`) |
 | Zombie processes | Every spawned child is waited on; the sandbox tiers enforce a SIGKILL deadline |
 | Output flooding | 1 MiB stdout cap on the kavach paths; the spawner's capture is bounded by its deadline |
@@ -46,6 +50,7 @@ HTTP requests to hoosh (the gateway), and through it to providers.
 | Threat | Mitigation |
 |--------|------------|
 | API key leakage | Keys in environment variables, never logged or serialized |
+| The gateway's URL in a result | A transport error names its failure kind and nothing else, since that text becomes a task's `output`, which a consumer serves and stores. A log line says which gateway from sandhi's parsed scheme, host and port, and withholds a URL holding an `@` or an odd host (`agnosai_hoosh_log_url_a`), at start-up too |
 | Provider impersonation | The stdlib's native TLS with chain and hostname verification, nameConstraints enforced since cyrius 6.7.18 (CYRIUS-2026-0042), and extendedKeyUsage checked at every depth (CYRIUS-2026-0026) |
 | Response injection | LLM responses treated as untrusted data; never executed as code |
 | ⚠ Cost runaway | **Only `max_duration_secs` is enforced** (`src/orchestrator/orchestrator.cyr`). `ResourceBudget`'s token and cost limits are carried and not checked; enforcing them is roadmap F5 |

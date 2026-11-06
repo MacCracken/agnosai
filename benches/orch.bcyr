@@ -2137,6 +2137,47 @@ fn _b_run_crew(name, crew_name, n_tasks, process, n): i64 {
     return 0;
 }
 
+# ── the registry at its cap (ADR 026) ─────────────────────────────────────
+#
+# What a crew costs a registry that is always full. The first row runs on past the low-water
+# mark, so 1 in 100 submits pays for a batch of 100 evictions and the others for one comparison.
+fn _b_run_crew_at_cap(): i64 {
+    var o = agnosai_orchestrator_new(agnosai_resource_budget_default());
+    for (var i = 0; i < AGNOSAI_MAX_RETAINED_CREWS; i = i + 1) {
+        agnosai_orchestrator_run_crew(o, _b_o_spec(str_from("fill"), 1, agnosai_process_sequential()));
+    }
+    var n = 2000;
+    var b = bench_new("run_crew_at_registry_cap");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var j = 0; j < n / _BR; j = j + 1) {
+            agnosai_orchestrator_run_crew(o, _b_o_spec(str_from("bench"), 1, agnosai_process_sequential()));
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# A consumer that reads and forgets: the same crew, plus the forget. It keeps the registry
+# empty, and against `run_crew_1_task_sequential` this row is what the forget and the queue cost.
+fn _b_run_crew_forgotten(): i64 {
+    var o = agnosai_orchestrator_new(agnosai_resource_budget_default());
+    var n = 2000;
+    var b = bench_new("run_crew_then_forget");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var spec = _b_o_spec(str_from("bench"), 1, agnosai_process_sequential());
+            agnosai_orchestrator_run_crew(o, spec);
+            agnosai_orchestrator_forget_crew(o, agnosai_crew_id(spec));
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
 # ── the same crews with the exporter ON (ADR 023) ─────────────────────────
 #
 # What turning telemetry on costs a crew. F6 took a crew run from one span to
@@ -2404,6 +2445,11 @@ fn main(): i64 {
     _b_crew_watch("crew_runner_10_tasks_parallel_4_quiet", 0, 0, 500);
     _b_crew_watch("crew_runner_10_tasks_parallel_4_llm_watched", 1, 1, 100);
     _b_crew_watch("crew_runner_10_tasks_parallel_4_llm_quiet", 1, 0, 100);
+
+    # ⚠ Last, on purpose: a row's position moves the rows after it in this file (roadmap B20,
+    # B27), and rows added above these read 25% slower on a build that changed nothing they run.
+    _b_run_crew_at_cap();
+    _b_run_crew_forgotten();
 
     return 0;
 }

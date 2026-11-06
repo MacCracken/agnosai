@@ -56,6 +56,12 @@ cyrius coverage --min 80      # the coverage gate
 `[deps.agnosai]` block and call the orchestrator directly —
 `agnosai_orchestrator_submit_crew` — or stand up your own serve loop.
 
+The registry keeps finished crews so they can be read, and at 1,000 of them a submit evicts the
+ones that ended longest ago, down to 900. A consumer that reads each crew should call
+`agnosai_orchestrator_forget_crew(o, crew_id)` once it has what it needs: its registry then holds
+only what is running, and eviction never fires
+([ADR 026](../adr/026-the-crew-registry-keeps-what-has-not-been-read.md)).
+
 ### Agent definitions from files
 
 ```cyrius

@@ -1,0 +1,655 @@
+# =========================================================================
+# tools_gate.tcyr — a consumer's gate between the model and its tools (ADR 025).
+#
+# No oracle test block: this is what agnostic asked for when it designed its crew target. A tool
+# used to see only its own ctx and what the model wrote, so a page saying "now scan this other
+# host" could steer the next call, and a declared host on a private network could not be reached.
+#
+# The real tools run here, against a real loopback server, because the guarantee is about
+# connections. `_T_HITS` counts what the server saw, by the host a client asked for: a refused
+# hop must leave no request behind, and a tool that merely reported a refusal would not show that.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/arena_pool.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/llm/retry.cyr"
+include "src/server/ssrf.cyr"
+include "src/server/output_filter.cyr"
+include "src/guarded_fetch.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
+include "src/tools/builtin/load_testing.cyr"
+include "src/tools/builtin/security_audit.cyr"
+include "tests/test_helpers.cyr"
+
+# A Str equal to another, with both shown on a failure.
+fn _t_seq(actual: Str, expected: Str, name): i64 {
+    if (actual == 0) { return assert(0, name); }
+    return assert(str_eq(actual, expected) == 1, name);
+}
+
+# ── a tool that says what it saw ────────────────────────────────────────────
+var _t_ran = 0;
+var _t_saw_task = 0;
+var _t_saw_tool = 0;
+
+fn _t_schema(a, ctx): i64 {
+    return agnosai_tool_schema_new_a(a, str_from_a(a, "probe"), str_from_a(a, "probe"));
+}
+
+fn _t_exec(ctx, input): i64 {
+    _t_ran = _t_ran + 1;
+    _t_saw_task = agnosai_tool_input_task(input);
+    _t_saw_tool = agnosai_tool_input_tool(input);
+    return agnosai_tool_output_ok(bayan_json_v_int_new(42));
+}
+
+fn _t_exec_fails(ctx, input): i64 {
+    _t_ran = _t_ran + 1;
+    return agnosai_tool_output_err(str_from("it did not work"));
+}
+
+fn _t_exec_nothing(ctx, input): i64 {
+    _t_ran = _t_ran + 1;
+    return 0;
+}
+
+fn _t_tool(name, exec): i64 {
+    return agnosai_tool_new(str_from(name), str_from("a probe"), &_t_schema, exec, 0);
+}
+
+# ── gates ───────────────────────────────────────────────────────────────────
+var _t_gate_calls = 0;
+var _t_gate_saw_ctx = 0;
+var _t_gate_saw_task = 0;
+var _t_gate_saw_tool = 0;
+var _t_gate_saw_param = 0;
+
+# Records all it was given, and lets the call through.
+fn _t_call_allow(ctx, input): i64 {
+    _t_gate_calls = _t_gate_calls + 1;
+    _t_gate_saw_ctx = ctx;
+    _t_gate_saw_task = agnosai_tool_input_task(input);
+    _t_gate_saw_tool = agnosai_tool_input_tool(input);
+    _t_gate_saw_param = agnosai_tool_input_get_str(input, str_from("target_url"));
+    return 0;
+}
+
+# Lets any call through, and counts that it was asked.
+var _t_gate_blind = 0;
+
+fn _t_call_no_opinion(ctx, input): i64 {
+    _t_gate_blind = _t_gate_blind + 1;
+    return 0;
+}
+
+fn _t_call_refuse(ctx, input): i64 {
+    _t_gate_calls = _t_gate_calls + 1;
+    return str_from("not what the task declared");
+}
+
+fn _t_url_admit(ctx, input, url: Str): i64 { return AGNOSAI_GATE_ADMIT; }
+fn _t_url_pass(ctx, input, url: Str): i64 { return AGNOSAI_GATE_PASS; }
+fn _t_url_refuse(ctx, input, url: Str): i64 { return AGNOSAI_GATE_REFUSE; }
+fn _t_url_stray(ctx, input, url: Str): i64 { return 7; }
+
+# The rule a consumer actually writes: the declared host, admitted, and nothing else.
+var _t_declared = 0;
+var _t_url_seen = 0;
+
+fn _t_url_declared(ctx, input, url: Str): i64 {
+    _t_url_seen = _t_url_seen + 1;
+    if (agnosai_url_same_host(url, _t_declared) == 1) { return AGNOSAI_GATE_ADMIT; }
+    return AGNOSAI_GATE_REFUSE;
+}
+
+# A hop check of the caller's own: counts what it is asked, and allows what `ctx` says.
+var _t_hops_asked = 0;
+
+fn _t_hop_check(ctx, url: Str): i64 {
+    _t_hops_asked = _t_hops_asked + 1;
+    return ctx;
+}
+
+# An input bound to `gate`, as the chokepoint binds one.
+fn _t_gated_input(gate): i64 {
+    var input = agnosai_tool_input_new();
+    store64(input + AGN_INPUT_GATE, gate);
+    return input;
+}
+
+fn _t_ok(gate, url): i64 {
+    return agnosai_tool_url_ok(_t_gated_input(gate), str_from(url));
+}
+
+# ── a loopback server ───────────────────────────────────────────────────────
+#
+# Answers each request with `_T_RESPONSE`, or `_T_SECOND` once `_T_HITS` passes one, and counts
+# what it saw. `_T_OPTIONS_ONCE` answers the first OPTIONS, the audit's CORS probe, so that chain
+# can be sent somewhere the GET was not. One connection at a time, as the audit makes them.
+var _T_LFD = 0;
+var _T_PORT = 0;
+var _T_RESPONSE = 0;
+var _T_SECOND = 0;
+var _T_OPTIONS_ONCE = 0;
+var _T_HITS = 0;
+var _T_STOP = 0;
+
+fn _t_server(arg): i64 {
+    var buf = alloc(8192);
+    while (load64(&_T_STOP) == 0) {
+        var at, cfd = sock_accept(_T_LFD);
+        if (is_err_result(at) == 0) {
+            if (load64(&_T_STOP) == 0) {
+                var rt, n = sock_recv(cfd, buf, 8192);
+                _T_HITS = _T_HITS + 1;
+                var r = _T_RESPONSE;
+                if (_T_SECOND != 0 && _T_HITS > 1) { r = _T_SECOND; }
+                if (_T_OPTIONS_ONCE != 0 && load8(buf) == 79) {
+                    r = _T_OPTIONS_ONCE;
+                    _T_OPTIONS_ONCE = 0;
+                }
+                sock_send_all(cfd, r, strlen(r));
+            }
+            sock_close(cfd);
+        }
+    }
+    return 0;
+}
+
+fn _t_server_start(): i64 {
+    var lt, lfd = tcp_socket();
+    sock_reuse(lfd);
+    var lp = 47901;
+    while (lp < 47933 && _T_PORT == 0) {
+        var bt, bv = sock_bind(lfd, INADDR_LOOPBACK(), lp);
+        if (is_err_result(bt) == 0) { _T_PORT = lp; }
+        lp = lp + 1;
+    }
+    if (_T_PORT == 0) { return 0; }
+    var st, sv = sock_listen(lfd, 16);
+    if (is_err_result(st) == 1) { return 0; }
+    _T_LFD = lfd;
+    thread_create(&_t_server, 0);
+    return 1;
+}
+
+# The server's URL, with `path`, on `host`.
+fn _t_url(host, path): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "http://");
+    str_builder_add_cstr(sb, host);
+    str_builder_add_cstr(sb, ":");
+    str_builder_add_int(sb, _T_PORT);
+    str_builder_add_cstr(sb, path);
+    return str_builder_build(sb);
+}
+
+# A 200 with the headers the audit looks for.
+fn _t_ok_response(): i64 {
+    return "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+}
+
+# A 302 to `location`.
+fn _t_redirect(location: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\nLocation: ");
+    str_builder_add(sb, location);
+    str_builder_add_cstr(sb, "\r\n\r\n");
+    return str_data(str_builder_build(sb));
+}
+
+# Run a tool at `url`, as the model would ask, under `gate`.
+fn _t_call(tool, url: Str, gate): i64 {
+    agnosai_tool_with_gate(tool, gate);
+    var input = agnosai_tool_input_new();
+    agnosai_tool_input_set(input, str_from("target_url"), bayan_json_v_str_new(url));
+    agnosai_tool_input_set(input, str_from("duration_seconds"), bayan_json_v_int_new(1));
+    agnosai_tool_input_set(input, str_from("concurrent_users"), bayan_json_v_int_new(1));
+    return agnosai_tool_execute(tool, input);
+}
+
+# ── the chokepoint ──────────────────────────────────────────────────────────
+fn _t_chokepoint(): i64 {
+    var t = _t_tool("probe", &_t_exec);
+    var task = agnosai_task_new(str_from("look at staging"));
+
+    # With no gate nothing changes.
+    var out = agnosai_tool_execute(t, agnosai_tool_input_new());
+    assert_eq(_t_ran, 1, "a tool with no gate runs");
+    assert_eq(agnosai_tool_output_success(out), 1, "and succeeds");
+    assert_eq(_t_saw_task, 0, "a call no task made sees no task");
+    assert_eq(_t_saw_tool, t, "and sees its own tool");
+    assert_eq(agnosai_tool_output_effect(out), AGNOSAI_TOOL_EFFECT_COMMITTED,
+      "a call that succeeded is committed");
+
+    # ⚠ The first half of the issue: a tool can now see what its task declared.
+    var input = agnosai_tool_input_new();
+    agnosai_tool_execute_for(t, input, task, 0);
+    assert_eq(_t_saw_task, task, "a call for a task lets the tool see that task");
+    assert_eq(agnosai_tool_input_task(input), task, "as the input says");
+    agnosai_tool_execute(t, input);
+    assert_eq(_t_saw_task, 0, "and an input used again is bound to the new call, not the old task");
+
+    # A gate that lets the call through.
+    _t_ran = 0;
+    var marker = 77;
+    agnosai_tool_with_gate(t, agnosai_tool_gate_new(&_t_call_allow, 0, marker));
+    var gated = agnosai_tool_input_new();
+    agnosai_tool_input_set(gated, str_from("target_url"), bayan_json_v_str_new(str_from("x")));
+    agnosai_tool_execute_for(t, gated, task, 0);
+    assert_eq(_t_ran, 1, "a gate that answers 0 lets the tool run");
+    assert_eq(_t_gate_saw_ctx, marker, "it is handed its own context");
+    assert_eq(_t_gate_saw_task, task, "the task");
+    assert_eq(_t_gate_saw_tool, t, "the tool");
+    assert(str_eq_cstr(_t_gate_saw_param, "x"), "and what the model wrote");
+
+    # A gate that refuses: the tool must not run at all.
+    _t_ran = 0;
+    agnosai_tool_with_gate(t, agnosai_tool_gate_new(&_t_call_refuse, 0, 0));
+    var refused = agnosai_tool_execute(t, agnosai_tool_input_new());
+    assert_eq(_t_ran, 0, "a refused call never reaches the tool");
+    assert_eq(agnosai_tool_output_success(refused), 0, "it comes back as a failed output");
+    _t_seq(agnosai_tool_output_error(refused),
+      str_from("tool call refused: not what the task declared"), "saying why");
+    assert_eq(agnosai_tool_output_effect(refused), AGNOSAI_TOOL_EFFECT_NONE,
+      "and that it had no effect: it never started");
+
+    # Fail closed: a gate cannot judge a call it cannot see. The gate here lets everything
+    # through, and the tool never reads its input, so only the check itself can refuse.
+    var blind = agnosai_tool_with_gate(_t_tool("blind", &_t_exec_nothing),
+      agnosai_tool_gate_new(&_t_call_no_opinion, 0, 0));
+    var unseen = agnosai_tool_execute(blind, 0);
+    assert(unseen != 0, "a gated call with no input is answered");
+    if (unseen != 0) {
+        assert_eq(agnosai_tool_output_success(unseen), 0, "by a refusal");
+    }
+    assert_eq(_t_ran, 0, "without running the tool");
+    assert_eq(_t_gate_blind, 0, "or asking a gate that could not see it");
+
+    # An URL-only gate does not stop the call.
+    _t_ran = 0;
+    agnosai_tool_with_gate(t, agnosai_tool_gate_new(0, &_t_url_refuse, 0));
+    agnosai_tool_execute(t, agnosai_tool_input_new());
+    assert_eq(_t_ran, 1, "a gate with no call_fp lets every call through to its URL check");
+
+    # The gate's parts, and the input's view of it.
+    var parts = agnosai_tool_gate_new(&_t_call_allow, &_t_url_pass, 91);
+    assert_eq(agnosai_tool_gate_url_fp(parts), &_t_url_pass, "a gate holds its url_fp");
+    assert_eq(agnosai_tool_gate_ctx(parts), 91, "and its context");
+    assert_eq(agnosai_tool_input_gate(agnosai_tool_input_new()), 0, "a new input has no gate");
+    var held = agnosai_tool_with_gate(_t_tool("held", &_t_exec), parts);
+    assert_eq(agnosai_tool_gate(held), parts, "a tool holds its gate");
+    var bound = agnosai_tool_input_new();
+    agnosai_tool_execute(held, bound);
+    assert_eq(agnosai_tool_input_gate(bound), parts, "and a call binds it to the input");
+
+    # What a tool of a consumer's own returns for a call it refuses.
+    var own = agnosai_tool_output_refused(0, str_from("no"));
+    assert_eq(agnosai_tool_output_success(own), 0, "a refused output is a failure");
+    assert_eq(agnosai_tool_output_effect(own), AGNOSAI_TOOL_EFFECT_NONE, "with no effect");
+    assert(str_eq_cstr(str_from(agnosai_tool_effect_to_wire(AGNOSAI_TOOL_EFFECT_NONE)), "none"),
+      "whose wire spelling is none");
+    assert(str_eq_cstr(str_from(agnosai_tool_effect_to_wire(AGNOSAI_TOOL_EFFECT_COMMITTED)),
+        "committed"), "and a success's is committed");
+    assert(str_eq_cstr(str_from(agnosai_tool_effect_to_wire(AGNOSAI_TOOL_EFFECT_UNKNOWN)),
+        "unknown"), "and the rest are unknown");
+    assert(str_eq_cstr(str_from(agnosai_tool_effect_to_wire(99)), "unknown"),
+      "an effect nothing knows reads as the one that promises nothing");
+
+    # The effect of a call that did not succeed is not known.
+    var bad = _t_tool("bad", &_t_exec_fails);
+    assert_eq(agnosai_tool_output_effect(agnosai_tool_execute(bad, agnosai_tool_input_new())),
+      AGNOSAI_TOOL_EFFECT_UNKNOWN, "a failed call may have done part of its work: unknown");
+    assert_eq(agnosai_tool_output_effect(agnosai_tool_output_ok(0)), AGNOSAI_TOOL_EFFECT_UNKNOWN,
+      "and an output nothing has judged reads the same");
+    return 0;
+}
+
+# ── the registry ────────────────────────────────────────────────────────────
+fn _t_registry(): i64 {
+    var r = agnosai_tool_registry_new();
+    var before = _t_tool("before", &_t_exec);
+    agnosai_tool_registry_register(r, before);
+    var gate = agnosai_tool_gate_new(&_t_call_refuse, 0, 0);
+    agnosai_tool_registry_set_gate(r, gate);
+    assert_eq(agnosai_tool_gate(before), gate, "a registry's gate reaches the tools it holds");
+    var after = _t_tool("after", &_t_exec);
+    agnosai_tool_registry_register(r, after);
+    assert_eq(agnosai_tool_gate(after), gate, "and those registered later");
+
+    # Through the registry, as every path gets a tool.
+    _t_ran = 0;
+    var got = agnosai_tool_registry_get(r, str_from("after"));
+    assert_eq(agnosai_tool_output_success(agnosai_tool_execute(got, agnosai_tool_input_new())), 0,
+      "so a tool taken from it cannot be called around the gate");
+    assert_eq(_t_ran, 0, "and does not run");
+
+    agnosai_tool_registry_set_gate(r, 0);
+    assert_eq(agnosai_tool_gate(before), 0, "a gate can be lifted");
+    var free = _t_tool("free", &_t_exec);
+    agnosai_tool_registry_register(r, free);
+    assert_eq(agnosai_tool_gate(free), 0, "and a later tool then has none");
+    return 0;
+}
+
+# ── what a URL verdict means ────────────────────────────────────────────────
+fn _t_url_policy(): i64 {
+    assert_eq(agnosai_tool_url_ok(0, str_from("https://example.com/")), 1,
+      "no call at all leaves a public URL to the SSRF guard");
+    assert_eq(agnosai_tool_url_ok(0, str_from("http://10.0.0.5/")), 0, "and a private one too");
+    assert_eq(_t_ok(0, "http://10.0.0.5/"), 0, "as does a tool with no gate");
+
+    var pass = agnosai_tool_gate_new(0, &_t_url_pass, 0);
+    assert_eq(_t_ok(pass, "https://example.com/"), 1, "PASS leaves a public URL to the guard");
+    assert_eq(_t_ok(pass, "http://10.0.0.5/"), 0, "and a private one, which it refuses");
+    var no_url_fp = agnosai_tool_gate_new(&_t_call_allow, 0, 0);
+    assert_eq(_t_ok(no_url_fp, "http://10.0.0.5/"), 0, "a gate with no url_fp admits nothing");
+
+    # ⚠ The second half of the issue: a declared private host can be reached.
+    var admit = agnosai_tool_gate_new(0, &_t_url_admit, 0);
+    assert_eq(_t_ok(admit, "http://10.0.0.5/"), 1, "ADMIT gets a private host past the guard");
+    assert_eq(_t_ok(admit, "http://192.168.1.20:8443/app"), 1, "with a port and a path");
+    assert_eq(_t_ok(admit, "http://127.0.0.1:8080/"), 1, "loopback");
+    assert_eq(_t_ok(admit, "http://staging.internal/"), 1, "and a private name");
+
+    # The floor under an admission, in the spellings the SSRF guard knows.
+    assert_eq(_t_ok(admit, "http://169.254.169.254/latest/meta-data/"), 0,
+      "ADMIT cannot reach the metadata endpoint");
+    assert_eq(_t_ok(admit, "http://169.254.1.1/"), 0, "or anywhere in 169.254/16");
+    assert_eq(_t_ok(admit, "http://2852039166/"), 0, "as a decimal");
+    assert_eq(_t_ok(admit, "http://0xA9FEA9FE/"), 0, "as hex");
+    assert_eq(_t_ok(admit, "http://0251.0376.0251.0376/"), 0, "as octal");
+    assert_eq(_t_ok(admit, "http://169.254.169.254./"), 0, "with a trailing dot");
+    assert_eq(_t_ok(admit, "http://[::ffff:169.254.169.254]/"), 0, "as a mapped IPv6");
+    assert_eq(_t_ok(admit, "http://[::ffff:a9fe:a9fe]/"), 0, "in hex");
+    assert_eq(_t_ok(admit, "http://169.0254.169.254/"), 0, "as sandhi would dial a leading zero");
+    assert_eq(_t_ok(admit, "http://[fd00:ec2::254]/"), 0, "EC2's IPv6 endpoint");
+    assert_eq(_t_ok(admit, "http://metadata.google.internal/"), 0, "GCP's by name");
+    assert_eq(_t_ok(admit, "http://METADATA.Google.Internal./"), 0, "in any case");
+    assert_eq(_t_ok(admit, "http://metadata.goog../"), 0, "with any number of root dots");
+    assert_eq(_t_ok(admit, "http://[fd00:ec2::255]/"), 1,
+      "a neighbouring unique-local host is not the endpoint");
+
+    assert_eq(_t_ok(admit, "ftp://10.0.0.5/"), 0, "ADMIT cannot widen the scheme");
+    assert_eq(_t_ok(admit, "file:///etc/passwd"), 0, "to a file");
+    assert_eq(_t_ok(admit, "http://"), 0, "or admit a URL with no host");
+
+    var refuse = agnosai_tool_gate_new(0, &_t_url_refuse, 0);
+    assert_eq(_t_ok(refuse, "https://example.com/"), 0, "REFUSE stops a URL the guard would pass");
+    var stray = agnosai_tool_gate_new(0, &_t_url_stray, 0);
+    assert_eq(_t_ok(stray, "https://example.com/"), 0, "and any other verdict refuses too");
+
+    _t_seq(agnosai_tool_output_error(agnosai_tool_target_refused(0, str_from("http://10.0.0.5/"))),
+      str_from("target_url rejected: cannot target private/internal networks"),
+      "no call at all is refused the same way as agnosai_tool_url_ok judges it, without a crash");
+    _t_seq(agnosai_tool_output_error(agnosai_tool_target_refused(agnosai_tool_input_new(),
+          str_from("http://10.0.0.5/"))),
+      str_from("target_url rejected: cannot target private/internal networks"),
+      "with no gate the refusal is the oracle's message");
+    _t_seq(agnosai_tool_output_error(agnosai_tool_target_refused(_t_gated_input(refuse),
+          str_from("https://example.com/"))),
+      str_from("target_url rejected: this call may not reach it"),
+      "with one it does not blame private networks for what may be a public host");
+    assert_eq(agnosai_tool_target_refused(_t_gated_input(admit), str_from("http://10.0.0.5/")), 0,
+      "and a reachable target has no refusal");
+    return 0;
+}
+
+# ── the real tools, at a real server ────────────────────────────────────────
+fn _t_tools_end_to_end(): i64 {
+    if (_t_server_start() == 0) {
+        println("tools_gate: no loopback port to listen on; the end-to-end checks did not run");
+        return 0;
+    }
+    var audit = agnosai_security_audit_tool();
+    var load = agnosai_load_testing_tool();
+    var target = _t_url("127.0.0.1", "/");
+    _t_declared = target;
+    var declared = agnosai_tool_gate_new(0, &_t_url_declared, 0);
+
+    # Without a gate neither tool can reach it, which is what the issue reported.
+    _T_RESPONSE = _t_ok_response();
+    _T_HITS = 0;
+    assert_eq(agnosai_tool_output_success(_t_call(audit, target, 0)), 0,
+      "with no gate the audit refuses a loopback target");
+    assert_eq(agnosai_tool_output_success(_t_call(load, target, 0)), 0,
+      "and so does the load test");
+    assert_eq(_T_HITS, 0, "and neither touched the server");
+
+    # ⚠ The SSRF guard read a leading zero as octal and sandhi dials it as decimal, so this
+    # URL passed it as a public address and connected here, with no gate involved at all.
+    var spelled = _t_url("0127.0.0.1", "/");
+    assert_eq(agnosai_tool_output_success(_t_call(audit, spelled, 0)), 0,
+      "loopback spelled with a leading zero is refused");
+    assert_eq(_T_HITS, 0, "and no request lands on it");
+
+    # A target the rule refuses never started, so it had no effect, as a `call_fp` refusal.
+    var off_target = _t_call(load, _t_url("127.0.0.2", "/"), declared);
+    assert_eq(agnosai_tool_output_effect(off_target), AGNOSAI_TOOL_EFFECT_NONE,
+      "a load test refused at its target had no effect");
+    assert_eq(agnosai_tool_output_effect(_t_call(audit, _t_url("127.0.0.2", "/"), declared)),
+      AGNOSAI_TOOL_EFFECT_NONE, "and neither did an audit");
+    assert_eq(agnosai_tool_output_effect(_t_call(audit, target, 0)), AGNOSAI_TOOL_EFFECT_NONE,
+      "nor one the SSRF guard refused");
+    assert_eq(_T_HITS, 0, "and none of the three made a request");
+
+    # A gate that admits it.
+    var audited = _t_call(audit, target, declared);
+    assert_eq(agnosai_tool_output_success(audited), 1, "admitted, the audit reaches the target");
+    assert(_T_HITS > 0, "and the server saw it");
+    assert_eq(agnosai_tool_output_effect(audited), AGNOSAI_TOOL_EFFECT_COMMITTED, "committed");
+
+    _T_HITS = 0;
+    var loaded = _t_call(load, target, declared);
+    assert_eq(agnosai_tool_output_success(loaded), 1, "admitted, the load test reaches it too");
+    assert(_T_HITS > 0, "and the server saw that");
+
+    # A model steered to another host is refused at the target.
+    _T_HITS = 0;
+    var steered = _t_call(audit, _t_url("127.0.0.2", "/"), declared);
+    assert_eq(agnosai_tool_output_success(steered), 0, "a target off the declared host is refused");
+    _t_seq(agnosai_tool_output_error(steered),
+      str_from("target_url rejected: this call may not reach it"), "saying so");
+    assert_eq(_T_HITS, 0, "with no request made");
+    _T_HITS = 0;
+    assert_eq(agnosai_tool_output_success(_t_call(load, _t_url("127.0.0.2", "/"), declared)), 0,
+      "and the load test refuses it the same way");
+    assert_eq(_T_HITS, 0, "with no request made");
+
+    # ⚠ The third half: a redirect off the declared host is refused, or the check ends at the
+    # first 302. `127.0.0.2` reaches this very server, so the count proves no request went.
+    _T_RESPONSE = _t_redirect(_t_url("127.0.0.2", "/elsewhere"));
+    _T_SECOND = _t_ok_response();
+    _T_HITS = 0;
+    _t_url_seen = 0;
+    var off = _t_call(audit, target, declared);
+    assert_eq(agnosai_tool_output_success(off), 0, "a redirect off the declared host is refused");
+    _t_seq(agnosai_tool_output_error(off),
+      str_from("security audit failed: target redirected somewhere this call may not reach"),
+      "and the error does not call the new host private");
+    assert_eq(_T_HITS, 1, "the server saw the first request and never the second");
+    assert_eq(_t_url_seen, 2, "the gate was asked of the target and of the hop");
+
+    # Staying on the host is fine, or a site that redirects to its login could not be audited.
+    _T_RESPONSE = _t_redirect(str_from("/login"));
+    _T_HITS = 0;
+    assert_eq(agnosai_tool_output_success(_t_call(audit, target, declared)), 1,
+      "a redirect that stays on the declared host is followed");
+    assert(_T_HITS >= 2, "and the server saw the hop");
+
+    # The audit makes a second chain, its CORS probe, and that is held to the gate as well. The
+    # hop is on the declared host and is loopback, so the gate follows it where the SSRF guard
+    # would stop: three requests here mean the probe's hop was the gate's to judge.
+    _T_RESPONSE = _t_ok_response();
+    _T_SECOND = 0;
+    _T_OPTIONS_ONCE = _t_redirect(str_from("/cors"));
+    _T_HITS = 0;
+    assert_eq(agnosai_tool_output_success(_t_call(audit, target, declared)), 1, "the audit passes");
+    assert_eq(_T_HITS, 3, "the CORS probe's redirect goes to the gate too, not to the SSRF guard");
+
+    # A gate that admits everything still cannot be redirected to the metadata endpoint.
+    var admit_all = agnosai_tool_gate_new(0, &_t_url_admit, 0);
+    _T_RESPONSE = _t_redirect(str_from("http://169.254.169.254/latest/meta-data/"));
+    _T_SECOND = 0;
+    _T_HITS = 0;
+    assert_eq(agnosai_tool_output_success(_t_call(audit, target, admit_all)), 0,
+      "no admission follows a redirect to the metadata endpoint");
+    assert_eq(_T_HITS, 1, "the floor holds at the hop as it does at the target");
+
+    # With no gate a hop is the SSRF guard's, as it always was.
+    _T_RESPONSE = _t_redirect(_t_url("127.0.0.2", "/"));
+    _T_SECOND = _t_ok_response();
+    _T_HITS = 0;
+    # Over sandhi's 256 KB default read buffer, which the fetch takes from the arena.
+    var arena = arena_allocator(1048576);
+    var opts = sandhi_http_options_new();
+    assert_eq(agnosai_guarded_fetch(arena, "GET", target, sandhi_headers_new(), opts, 2000),
+      AGNOSAI_FETCH_BLOCKED, "the bare fetch still holds a hop to the SSRF guard");
+    assert_eq(_T_HITS, 1, "and went no further");
+
+    # A hop check of the caller's own takes that guard's place, and hears each hop.
+    _t_hops_asked = 0;
+    _T_RESPONSE = _t_redirect(str_from("/next"));
+    _T_HITS = 0;
+    assert_eq(agnosai_guarded_fetch_hops(arena, "GET", target, sandhi_headers_new(), opts, 2000,
+        0, 0, 0, &_t_hop_check, 0), AGNOSAI_FETCH_BLOCKED, "a hop check that answers 0 blocks the hop");
+    assert_eq(_t_hops_asked, 1, "having been asked of it");
+    assert_eq(_T_HITS, 1, "before any request to it");
+    reset_via(arena);
+    _T_HITS = 0;
+    assert(agnosai_guarded_fetch_hops(arena, "GET", target, sandhi_headers_new(), opts, 2000,
+        0, 0, 0, &_t_hop_check, 1) > 0, "and one that answers 1 follows it");
+    assert_eq(_T_HITS, 2, "where the bare fetch would have stopped at a loopback hop");
+
+    # The audit under a call's rule, and under none.
+    _T_RESPONSE = _t_redirect(_t_url("127.0.0.1", "/next"));
+    _T_SECOND = 0;
+    _T_HITS = 0;
+    assert_eq(agnosai_run_security_audit_for(0, target, 0), AGNOSAI_FETCH_BLOCKED,
+      "with no call the audit's hops are the SSRF guard's");
+    _T_SECOND = _t_ok_response();
+    _T_HITS = 0;
+    assert(agnosai_run_security_audit_for(_t_gated_input(declared), target, 0) > 0,
+      "and with one they are its gate's");
+
+    store64(&_T_STOP, 1);
+    var wt, wfd = tcp_socket();
+    sock_connect(wfd, INADDR_LOOPBACK(), _T_PORT);
+    sock_close(wfd);
+    return 0;
+}
+
+# ── the record ──────────────────────────────────────────────────────────────
+fn _t_exec_measured(ctx, input): i64 {
+    var v = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(v, str_from("p99_ms"), bayan_json_v_int_new(4128));
+    bayan_json_v_obj_set(v, str_from("note"), bayan_json_v_str_new(str_from("ssn 123-45-6789")));
+    # A key is text the system under test can write too, as `synapse`'s remote JSON is.
+    bayan_json_v_obj_set(v, str_from("owner ceo@example.com"), bayan_json_v_int_new(1));
+    var hits = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(hits, bayan_json_v_str_new(str_from("mail admin@example.com")));
+    bayan_json_v_arr_push(hits, bayan_json_v_int_new(7));
+    bayan_json_v_obj_set(v, str_from("hits"), hits);
+    return agnosai_tool_output_ok(v);
+}
+
+fn _t_call_at(calls, i, key): i64 {
+    return bayan_json_v_obj_get_by_cstr(bayan_json_v_arr_get(calls, i), key);
+}
+
+fn _t_record(): i64 {
+    # Off by default (ADR 020), since it can corrupt a task whose job is contact details.
+    agnosai_output_redact_set_enabled(1);
+    var r = agnosai_task_result_new(agnosai_uuid_v4_str(), str_from("all passed"),
+      AGNOSAI_STATUS_COMPLETED);
+    assert_eq(map_get(agnosai_task_result_metadata(r), str_from("tool_calls")), 0,
+      "a task that called no tool records nothing");
+
+    var ok = _t_tool("load_testing", &_t_exec_measured);
+    agnosai_task_result_record_tool_call(r, ok, agnosai_tool_execute(ok, agnosai_tool_input_new()));
+    var bad = _t_tool("flaky", &_t_exec_fails);
+    agnosai_task_result_record_tool_call(r, bad, agnosai_tool_execute(bad, agnosai_tool_input_new()));
+    var shut = agnosai_tool_with_gate(_t_tool("gated", &_t_exec),
+      agnosai_tool_gate_new(&_t_call_refuse, 0, 0));
+    agnosai_task_result_record_tool_call(r, shut, agnosai_tool_execute(shut, agnosai_tool_input_new()));
+    var none = _t_tool("silent", &_t_exec_nothing);
+    agnosai_task_result_record_tool_call(r, none, agnosai_tool_execute(none, agnosai_tool_input_new()));
+
+    var calls = map_get(agnosai_task_result_metadata(r), str_from("tool_calls"));
+    assert_eq(bayan_json_v_arr_len(calls), 4, "each call is kept");
+    assert(bayan_json_v_is_obj(agnosai_tool_call_to_value(none, 0)) == 1,
+      "as one object per call, even for a tool that answered nothing");
+
+    _t_seq(bayan_json_v_str(_t_call_at(calls, 0, "tool")), str_from("load_testing"),
+      "under its tool's name, in call order");
+    _t_seq(bayan_json_v_str(_t_call_at(calls, 0, "effect")), str_from("committed"),
+      "with what it did");
+    var result = _t_call_at(calls, 0, "result");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(result, "p99_ms")), 4128,
+      "and a measured number stays that number");
+
+    # ADR 020's filter holds here too, in the strings and only there.
+    var note = bayan_json_v_str(bayan_json_v_obj_get_by_cstr(result, "note"));
+    assert_eq(str_contains_cstr(note, "123-45-6789"), 0, "a secret in a result is redacted");
+    var hits = bayan_json_v_obj_get_by_cstr(result, "hits");
+    assert_eq(str_contains_cstr(bayan_json_v_str(bayan_json_v_arr_get(hits, 0)), "admin@example.com"),
+      0, "however deep it is");
+    assert_eq(bayan_json_v_int(bayan_json_v_arr_get(hits, 1)), 7, "and its neighbours are kept");
+    assert_eq(str_contains_cstr(bayan_json_v_build(result), "ceo@example.com"), 0,
+      "a key is redacted as a value is");
+
+    _t_seq(bayan_json_v_str(_t_call_at(calls, 1, "effect")), str_from("unknown"),
+      "a failed call's effect is unknown");
+    _t_seq(bayan_json_v_str(_t_call_at(calls, 1, "error")), str_from("it did not work"),
+      "with its error");
+    _t_seq(bayan_json_v_str(_t_call_at(calls, 2, "effect")), str_from("none"),
+      "a refused call had no effect");
+    _t_seq(bayan_json_v_str(_t_call_at(calls, 3, "effect")), str_from("unknown"),
+      "and a tool that answered nothing is unknown too");
+    _t_seq(bayan_json_v_str(_t_call_at(calls, 3, "error")), str_from("no output"), "saying so");
+
+    # It lives in `metadata`, so a consumer's stored outcome keeps it with no change.
+    var back = agnosai_task_result_from_value(agnosai_task_result_to_value(r));
+    var back_calls = map_get(agnosai_task_result_metadata(back), str_from("tool_calls"));
+    assert_eq(bayan_json_v_arr_len(back_calls), 4, "the record survives the wire");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(_t_call_at(back_calls, 0, "result"),
+          "p99_ms")), 4128, "with its numbers");
+
+    agnosai_output_redact_set_enabled(0);
+    var raw = agnosai_task_result_new(agnosai_uuid_v4_str(), str_from(""),
+      AGNOSAI_STATUS_COMPLETED);
+    agnosai_task_result_record_tool_call(raw, ok, agnosai_tool_execute(ok, agnosai_tool_input_new()));
+    var raw_calls = map_get(agnosai_task_result_metadata(raw), str_from("tool_calls"));
+    assert(str_contains_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(
+            _t_call_at(raw_calls, 0, "result"), "note")), "123-45-6789") == 1,
+      "the operator's switch for the filter reaches this too: off, nothing is rewritten");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_group("tools_gate");
+    _t_chokepoint();
+    _t_registry();
+    _t_url_policy();
+    _t_tools_end_to_end();
+    _t_record();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

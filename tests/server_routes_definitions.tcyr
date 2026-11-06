@@ -13,7 +13,7 @@
 # oracle's default-build assertion as the parity target is what kept this route
 # answering `[]` until M10.
 #
-# What this covers past the oracle: the eighteen presets are actually in the
+# What this covers past the oracle: the three example presets are actually in the
 # body, in order, each with its team — the oracle only checks `!is_empty()`, so
 # a handler returning one preset would satisfy it.
 #
@@ -48,16 +48,16 @@ fn main(): i64 {
     assert_neq(bayan_json_v_arr_len(arr), 0,
       "and is NOT empty — the port ships the definitions feature the oracle gates on");
 
-    # ⚠ Eighteen, not merely non-empty. `builtin_presets` drops a document it
+    # ⚠ Three, not merely non-empty. `builtin_presets` drops a document it
     # cannot parse, so a broken embed answers 200 with a short array.
-    assert_eq(bayan_json_v_arr_len(arr), 18, "with all eighteen presets");
+    assert_eq(bayan_json_v_arr_len(arr), 3, "with all three example presets");
 
     # --- the body is the presets, in order ---------------------------------
-    assert(str_eq_cstr(_t_body_name(arr, 0), "quality-lean"),
-      "the first is quality-lean");
-    assert(str_eq_cstr(_t_body_name(arr, 3), "software-engineering-lean"),
-      "the fourth opens the software-engineering group");
-    assert(str_eq_cstr(_t_body_name(arr, 17), "security-large"),
+    assert(str_eq_cstr(_t_body_name(arr, 0), "security-lean"),
+      "the first is security-lean");
+    assert(str_eq_cstr(_t_body_name(arr, 1), "security-standard"),
+      "the second security-standard");
+    assert(str_eq_cstr(_t_body_name(arr, 2), "security-large"),
       "and the last is security-large");
 
     # Each entry is a full PresetSpec, not a name stub.
@@ -68,17 +68,17 @@ fn main(): i64 {
     assert_neq(bayan_json_v_obj_get_by_cstr(first, "version"), 0, "and version");
     var agents = bayan_json_v_obj_get_by_cstr(first, "agents");
     assert(bayan_json_v_is_arr(agents) == 1, "and an agents array");
-    assert_eq(bayan_json_v_arr_len(agents), 2, "with quality-lean's two members");
+    assert_eq(bayan_json_v_arr_len(agents), 2, "with security-lean's two members");
     assert_neq(bayan_json_v_obj_get_by_cstr(bayan_json_v_arr_get(agents, 0), "agent_key"), 0,
       "each of which is a full agent definition");
 
-    # Seventy-two agents across the eighteen, serialized.
+    # Twelve agents across the three, serialized.
     var total = 0;
     for (var i = 0; i < bayan_json_v_arr_len(arr); i = i + 1) {
         var team = bayan_json_v_obj_get_by_cstr(bayan_json_v_arr_get(arr, i), "agents");
         if (team != 0) { total = total + bayan_json_v_arr_len(team); }
     }
-    assert_eq(total, 72, "and seventy-two agents in total");
+    assert_eq(total, 12, "and twelve agents in total");
 
     # --- the arena-threaded form -------------------------------------------
     # The route is reached through the `_a` form with a per-request arena; the
@@ -87,14 +87,14 @@ fn main(): i64 {
     arena_allocator_set_on_full(a, ARENA_FULL_SPILL);
     var ra = agnosai_route_list_presets_a(a);
     assert(agnosai_route_status(ra) == HTTP_OK, "the arena form is 200 too");
-    assert_eq(bayan_json_v_arr_len(agnosai_route_body(ra)), 18, "with the same eighteen");
-    assert(str_eq_cstr(_t_body_name(agnosai_route_body(ra), 0), "quality-lean"),
+    assert_eq(bayan_json_v_arr_len(agnosai_route_body(ra)), 3, "with the same three");
+    assert(str_eq_cstr(_t_body_name(agnosai_route_body(ra), 0), "security-lean"),
       "in the same order");
     reset_via(a);
 
     # Called twice, the route answers the same thing — nothing is consumed.
-    assert_eq(bayan_json_v_arr_len(agnosai_route_body(agnosai_route_list_presets())), 18,
-      "and a second call still answers eighteen");
+    assert_eq(bayan_json_v_arr_len(agnosai_route_body(agnosai_route_list_presets())), 3,
+      "and a second call still answers three");
 
     return assert_summary();
 }

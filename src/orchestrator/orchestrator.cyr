@@ -26,14 +26,19 @@
 # `RwLock`-guarded registry. This runs a crew on the calling thread, so the
 # bound is the caller's; the registry is mutex-guarded because
 # `orch_crew_runner`'s parallel and DAG modes spawn real threads and a caller
-# may drive several crews from several threads. `MAX_RETAINED_CREWS` eviction is
-# reproduced exactly, including that it only evicts **finished** crews — a
-# registry full of running crews grows past the cap rather than dropping live
-# state, which is the oracle's behaviour and the safe one.
+# may drive several crews from several threads. `MAX_RETAINED_CREWS` is the
+# oracle's, and so is that eviction only takes **finished** crews: a registry full
+# of running crews grows past the cap rather than dropping live state. Which
+# finished crews go is not the oracle's since 2.2.4 (ADR 026).
 # =========================================================================
 
-# The oracle's `MAX_RETAINED_CREWS`.
+# The oracle's `MAX_RETAINED_CREWS`, over crews that have ended (ADR 026): a submit that finds
+# this many evicts. Crews still running are not counted, and are never evicted.
 var AGNOSAI_MAX_RETAINED_CREWS = 1000;
+
+# How many ended crews eviction leaves (ADR 026). The gap is what makes a submit at the cap
+# cheap on average, and at 10% of the cap it costs a reader almost none of its window.
+var AGNOSAI_CREWS_LOW_WATER = 900;
 
 # The oracle's fallback execution timeout when the budget sets none — one hour.
 var AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS = 3600;
@@ -47,7 +52,9 @@ enum AgnosaiOrchestratorOff {
     AGN_OR_CANCEL = 40;
     AGN_OR_AUDIT = 48;
     AGN_OR_MUTEX = 56;
-    AGN_OR_SIZE = 64;
+    AGN_OR_ENDED = 64;
+    AGN_OR_ENDED_HEAD = 72;
+    AGN_OR_SIZE = 80;
 }
 
 # Create an orchestrator over a resource budget.
@@ -65,6 +72,8 @@ fn agnosai_orchestrator_new(budget): i64 {
     store64(o + AGN_OR_CANCEL, map_new_str());
     store64(o + AGN_OR_AUDIT, agnosai_audit_chain_new());
     store64(o + AGN_OR_MUTEX, mutex_new());
+    store64(o + AGN_OR_ENDED, vec_new());
+    store64(o + AGN_OR_ENDED_HEAD, 0);
     return o;
 }
 
@@ -179,24 +188,100 @@ fn _agnosai_orch_is_finished(state): i64 {
     return 0;
 }
 
-# Drop finished crews when the registry is at capacity. The caller holds the
-# lock.
+# Whether `state` is still the crew its id names in the registry. The caller holds the lock.
 #
-# Only **finished** crews go. A registry full of running crews grows past the
-# cap rather than dropping live state — the oracle's `retain`, and the safe
-# reading of a cap that exists to bound memory rather than to bound work.
+# ⚠ **By identity, not by id.** A queue slot outlives its crew: a forgotten crew leaves one
+# behind, and so does a crew whose id ran again. Going by id would evict the re-run, which
+# may be running, on the strength of its predecessor's slot.
+fn _agnosai_orch_is_current_locked(o, state): i64 {
+    if (map_get(load64(o + AGN_OR_CREWS), agnosai_crew_state_crew_id(state)) == state) {
+        return 1;
+    }
+    return 0;
+}
+
+# Keep the ended queue in proportion to the registry. The caller holds the lock.
+#
+# ⚠ **Without this the queue is a leak, and in the case the API is for.** Eviction is what
+# pops the queue, and a consumer that forgets every crew it reads never reaches the cap, so
+# its queue would hold one stale slot per crew ever run. Past twice what the registry could
+# need, the live slots slide down over the dead ones, and the slots eviction has popped go the
+# same way once there are 1,024 of them. A pass frees half the queue or those 1,024 slots, so
+# the cost per crew stays constant, and it allocates nothing.
+fn _agnosai_orch_compact_ended_locked(o): i64 {
+    var ended = load64(o + AGN_OR_ENDED);
+    var head = load64(o + AGN_OR_ENDED_HEAD);
+    var len = vec_len(ended);
+    if (len - head <= 2 * map_size(load64(o + AGN_OR_CREWS)) + 64 && head < 1024) { return 0; }
+    var kept = 0;
+    for (var i = head; i < len; i = i + 1) {
+        var state = vec_get(ended, i);
+        if (_agnosai_orch_is_current_locked(o, state) == 1) {
+            vec_set(ended, kept, state);
+            kept = kept + 1;
+        }
+    }
+    vec_truncate(ended, kept);
+    store64(o + AGN_OR_ENDED_HEAD, 0);
+    return kept;
+}
+
+# Queue a crew that has ended, in the order crews end. The caller holds the lock.
+fn _agnosai_orch_note_ended_locked(o, state): i64 {
+    vec_push(load64(o + AGN_OR_ENDED), state);
+    _agnosai_orch_compact_ended_locked(o);
+    return 0;
+}
+
+# Evict down to `AGNOSAI_CREWS_LOW_WATER` when the registry is at capacity, oldest ended
+# first, and return how many went. The caller holds the lock.
+#
+# Through 2.2.3 this took **every** finished crew at once, in hash order. A consumer that
+# reads by polling lost whatever it had not reached: agnostic's collector looks every 200 ms,
+# and 1,300 unpolled crews at 190/s lost 885, each with its results. Now a crew keeps its
+# place until 900 others have ended after it. **The order is when a crew ended and not when
+# it was submitted**, since the time a reader has had is what matters: a crew that ran for an
+# hour and has just ended is the newest here, however early it arrived.
+#
+# ⚠ **The marks are over crews that have ended, not over the registry.** Counting running crews
+# gave the window away when it mattered most: with 950 running and 50 ended unread, a submit
+# had to evict all 50 to reach 900. A crew a runner holds has its flag in AGN_OR_CANCEL, so the
+# ended count is one subtraction. A crew that never ran counts as ended, and only the queue
+# can evict, so a registry of those stops at the queue's end.
+#
+# Only crews no runner holds go, as the queue has nothing else in it. A cancelled crew reads
+# CANCELLED while its work finishes, and is queued when it stops, so it can no longer be
+# evicted and then come back as its runner stores the final state. A registry full of running
+# crews still grows past the cap, as the oracle's does, and costs one comparison per submit
+# rather than a walk of the map.
 fn _agnosai_orch_evict_locked(o): i64 {
     var crews = load64(o + AGN_OR_CREWS);
-    if (map_size(crews) < AGNOSAI_MAX_RETAINED_CREWS) { return 0; }
-    var keys = map_keys(crews);
+    var held = map_size(load64(o + AGN_OR_CANCEL));
+    if (map_size(crews) - held < AGNOSAI_MAX_RETAINED_CREWS) { return 0; }
+    var ended = load64(o + AGN_OR_ENDED);
+    var head = load64(o + AGN_OR_ENDED_HEAD);
     var evicted = 0;
-    for (var i = 0; i < vec_len(keys); i = i + 1) {
-        var k = vec_get(keys, i);
-        if (_agnosai_orch_is_finished(map_get(crews, k)) == 1) {
-            map_delete(crews, k);
+    while (head < vec_len(ended) && map_size(crews) - held > AGNOSAI_CREWS_LOW_WATER) {
+        var state = vec_get(ended, head);
+        head = head + 1;
+        if (_agnosai_orch_is_current_locked(o, state) == 1) {
+            map_delete(crews, agnosai_crew_state_crew_id(state));
             evicted = evicted + 1;
         }
     }
+    store64(o + AGN_OR_ENDED_HEAD, head);
+    _agnosai_orch_compact_ended_locked(o);
+    return evicted;
+}
+
+# Log an eviction, outside the registry lock. A consumer that polls should know its window.
+fn _agnosai_orch_log_evicted(evicted): i64 {
+    if (evicted == 0 || sakshi_get_level() < SK_INFO) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add_int(sb, evicted);
+    var n = str_builder_build(sb);
+    sakshi_log_kv(SK_INFO, "crew registry evicted finished crews", 36,
+      "count", 5, str_data(n), str_len(n));
     return evicted;
 }
 
@@ -271,21 +356,21 @@ fn _agnosai_orch_register(o, spec): i64 {
     bayan_json_v_obj_set(accepted, str_from("task_count"), bayan_json_v_int_new(vec_len(tasks)));
     _agnosai_orch_audit(o, str_from("crew_accepted"), str_from("info"), crew_name, accepted);
 
-    var mtx = load64(o + AGN_OR_MUTEX);
-    mutex_lock(mtx);
-    _agnosai_orch_evict_locked(o);
-    map_set(load64(o + AGN_OR_CREWS), str_clone(crew_id),
-      agnosai_crew_state_new(crew_id, AGNOSAI_CREW_PENDING));
-    mutex_unlock(mtx);
-
     var runner = agnosai_crew_runner_new(spec);
     agnosai_crew_runner_with_audit(runner, load64(o + AGN_OR_AUDIT));
 
-    # Publish the cancel flag so `cancel_crew` can reach a running crew.
+    # The state and the cancel flag, published together. ⚠ A flag says a runner holds this
+    # crew, and `cancel_crew` and `forget_crew` both go by it, so there can be no moment with
+    # the state and no flag: a cancel there was lost, and queued a live crew as ended.
+    var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
+    var evicted = _agnosai_orch_evict_locked(o);
+    map_set(load64(o + AGN_OR_CREWS), str_clone(crew_id),
+      agnosai_crew_state_new(crew_id, AGNOSAI_CREW_PENDING));
     map_set(load64(o + AGN_OR_CANCEL), str_clone(crew_id),
       agnosai_crew_runner_cancel_flag(runner));
     mutex_unlock(mtx);
+    _agnosai_orch_log_evicted(evicted);
 
     var rurl = load64(o + AGN_OR_LLM_URL);
     if (rurl != 0) {
@@ -423,6 +508,12 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
         # from RUNNING, so a cancel that landed mid-run stands.
         _agnosai_orch_advance_locked(o, crew_id, AGNOSAI_CREW_RUNNING, AGNOSAI_CREW_PENDING);
         map_delete(load64(o + AGN_OR_CANCEL), crew_id);
+        # A cancel that landed mid-run left it CANCELLED, and left the queueing to this finish.
+        # A crew back at PENDING is not queued, as it is not over: it can only be forgotten.
+        var left = map_get(load64(o + AGN_OR_CREWS), crew_id);
+        if (left != 0) {
+            if (_agnosai_orch_is_finished(left) == 1) { _agnosai_orch_note_ended_locked(o, left); }
+        }
         mutex_unlock(mtx);
         return 0;
     }
@@ -450,6 +541,7 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
     mutex_lock(mtx);
     map_set(load64(o + AGN_OR_CREWS), str_clone(crew_id), state);
     map_delete(load64(o + AGN_OR_CANCEL), crew_id);
+    _agnosai_orch_note_ended_locked(o, state);
     mutex_unlock(mtx);
 
     if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
@@ -496,6 +588,19 @@ fn _agnosai_orch_submit_thread(job): i64 {
     return 0;
 }
 
+# Let go of a registered crew no runner will take: its flag and its event channel go, as a
+# finish would have taken them. Without this a flag says a runner holds it for good, so it could
+# not be forgotten, nothing would queue it, and a subscriber would wait on it forever.
+fn _agnosai_orch_abandon(o, crew_id: Str): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    map_delete(load64(o + AGN_OR_CANCEL), crew_id);
+    mutex_unlock(mtx);
+    var bus = load64(o + AGN_OR_EVENTS);
+    if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
+    return 0;
+}
+
 # Submit a crew for asynchronous execution. Returns its id immediately.
 #
 # The id is usable at once: `_agnosai_orch_register` has already put the crew in
@@ -506,7 +611,8 @@ fn _agnosai_orch_submit_thread(job): i64 {
 # so a polling client sees no new spelling.
 #
 # **Returns 0 if the thread cannot be created**, leaving the crew PENDING and
-# unexecuted rather than reporting a run that never started.
+# unexecuted rather than reporting a run that never started. Nothing holds it then
+# (`_agnosai_orch_abandon`), so a consumer can cancel it or forget it.
 #
 # ✅ **The thread is detached, and it leaks nothing.** This used to call
 # `thread_create` and never join, stranding 2 MiB of stack and 4 KiB of TLS per
@@ -537,7 +643,10 @@ fn agnosai_orchestrator_submit_crew(o, spec): i64 {
     store64(job + AGN_OJ_CREW_ID, crew_id);
     store64(job + AGN_OJ_NAME, agnosai_crew_name(spec));
 
-    if (thread_create_detached(&_agnosai_orch_submit_thread, job) == 0) { return 0; }
+    if (thread_create_detached(&_agnosai_orch_submit_thread, job) == 0) {
+        _agnosai_orch_abandon(o, crew_id);
+        return 0;
+    }
     return crew_id;
 }
 
@@ -563,10 +672,6 @@ fn agnosai_orchestrator_cancel_crew(o, crew_id: Str): i64 {
 
     var state = map_get(load64(o + AGN_OR_CREWS), crew_id);
     if (state == 0) {
-        # Still raise the flag: a crew whose runner registered its flag but whose
-        # state is not in the map yet is mid-registration, and must stop.
-        var early = map_get(load64(o + AGN_OR_CANCEL), crew_id);
-        if (early != 0) { store64(early, 1); }
         mutex_unlock(mtx);
         return agnosai_error_crew_not_found(crew_id);
     }
@@ -577,11 +682,52 @@ fn agnosai_orchestrator_cancel_crew(o, crew_id: Str): i64 {
     var flag = map_get(load64(o + AGN_OR_CANCEL), crew_id);
     if (flag != 0) { store64(flag, 1); }
     agnosai_crew_state_with_status(state, AGNOSAI_CREW_CANCELLED);
+    # With no flag nothing is running this crew, so no finish will queue it, and without this
+    # it could never be evicted. A crew with a flag is queued when its runner stops.
+    if (flag == 0) { _agnosai_orch_note_ended_locked(o, state); }
     mutex_unlock(mtx);
 
     var md = bayan_json_v_obj_new();
     bayan_json_v_obj_set(md, str_from("crew_id"), bayan_json_v_str_new(crew_id));
     _agnosai_orch_audit(o, str_from("crew_cancelled"), str_from("warn"),
       str_from("crew cancelled by caller"), md);
+    return 0;
+}
+
+# Take a crew out of the registry, once a consumer has read all it needs. Returns 0, a
+# CrewNotFound error, or an Other error for a crew still running.
+#
+# **The other half of ADR 026.** Eviction is a backstop: a window of 900 is enough for a poller
+# that keeps up and not for one that falls behind. A consumer that forgets what it has read
+# keeps the registry at the crews still running, so eviction never fires and no reader can lose
+# one. Reading first is the caller's job, and the state stays valid after this for a caller
+# that still holds it, since a registry entry is a pointer and nothing here frees it.
+#
+# ⚠ **Refused while a runner holds the crew, and the test is the cancel flag, not the status.**
+# `cancel_crew` marks a crew CANCELLED in place while its work finishes, so a terminal status
+# does not mean it has stopped. Forgetting that crew would not stick: its runner stores the
+# final state on the way out, and the crew would come back with nobody left to forget it. The
+# flag goes under this same lock as the final state lands, so "no flag" means the state here is
+# final. A crew left PENDING with no flag never ran (a cyclic DAG, or a thread that would not
+# start), and may be forgotten. This all holds for one run of an id at a time: overlapping runs
+# of one id have always shared an entry and a flag, and the first to end takes both.
+#
+# A crew's event channel is removed after its final state is stored, so a consumer that waits
+# for its subscription to close can always forget what it then finds.
+fn agnosai_orchestrator_forget_crew(o, crew_id: Str): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var crews = load64(o + AGN_OR_CREWS);
+    if (map_get(crews, crew_id) == 0) {
+        mutex_unlock(mtx);
+        return agnosai_error_crew_not_found(crew_id);
+    }
+    if (map_get(load64(o + AGN_OR_CANCEL), crew_id) != 0) {
+        mutex_unlock(mtx);
+        return agnosai_error_other(str_from("crew is still running and cannot be forgotten"));
+    }
+    map_delete(crews, crew_id);
+    _agnosai_orch_compact_ended_locked(o);
+    mutex_unlock(mtx);
     return 0;
 }

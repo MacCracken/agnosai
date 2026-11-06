@@ -7,6 +7,164 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.4] — 2026-11-06
+
+agnostic's four reports from its 0.2.2 audit and its crew-target design, repaired, and bote moved to its
+latest release. An independent review of this work found an SSRF bypass older than the work itself, and
+building it turned up a second. Both are fixed here too. The rest of the stack was already on its latest tags, cyrius 6.7.18 included.
+
+⚠ **Behaviour changes:** `GET /api/v1/presets` answers three presets, not eighteen (below). A transport
+error no longer carries the gateway's URL. The crew registry keeps finished crews it used to drop. A host
+spelled with a leading zero is refused if either reading of it is private, and a blocked name is refused with
+a trailing dot.
+
+### Breaking
+
+- **The built-in presets are three examples, not a library (ADR 027).** `GET /api/v1/presets` and
+  `agnosai_builtin_presets()` answer `security-lean`, `security-standard` and `security-large`, the three
+  agnosai names agnostic's canonical library does not use, so a name now means one thing across the two. The
+  other fifteen documents are deleted. **Migration:** nothing in this stack reads them. A deployment that
+  did can take its document from git history (`git show 2.2.3:src/presets/<name>.json`) and pass it to
+  `agnosai_load_preset_from_file`, which is unchanged.
+
+### Security
+
+- **⚠ A leading zero got a private address past the SSRF guard.** `agnosai_is_safe_url` read `0127.0.0.1` as
+  octal, the public 87.0.0.1, as a browser does. sandhi reads it as decimal and connected to loopback: a real
+  request landed on a test server there, with no gate involved. `169.0254.169.254`, `010.0.0.1` and
+  `172.016.0.1` passed the same way, and sandhi's parser reads each as the private address it spells, at a
+  target and at a redirect hop alike. The rule came across from the Rust line, where the `url` crate
+  normalises the host before it is dialed.
+  - A host is now judged by `sandhi_net_parse_ipv4`, the parser that dials, as well as the WHATWG reading,
+    and must pass under both (`_agnosai_dialed_ipv4`).
+  - `tests/server_ssrf.tcyr` asserted that `010.0.0.1` was safe, and called refusing it a mirror-image bug.
+    That pinned this bug, so it is reversed, with the reason beside it.
+- **A trailing dot took a name off the SSRF guard's blocked list.** `_agnosai_is_blocked_hostname` compares exact
+  names and suffixes, so `http://localhost./`, `http://foo.internal./` and `http://foo.local./` passed as public
+  names, and a resolver reads each as the name it spells. Root dots now go first, as many as there are, and the
+  metadata floor shares the helper. `localhost.` did not connect on the test box, where sandhi's resolver
+  answered DISCOVERY, so what this opened depended on a network's DNS.
+- **A hoosh transport error no longer names the gateway's URL.** It reads `hoosh transport error: <KIND>`. That
+  text becomes a task's `output` and `error`, which a consumer serves to any reader and stores, and a URL with
+  userinfo put its password there. The URL's place is a WARN line (`agnosai_hoosh_log_url_a`), rebuilt from
+  sandhi's parsed scheme, host and port, and withheld if it holds an `@` or an odd host, because no cut of a
+  URL's text can be made safe. `src/main.cyr`'s start-up line logged `HOOSH_URL` raw, and goes through it too.
+
+### Added
+
+- **A consumer's gate between the model and its tools (ADR 025).** `agnosai_tool_gate_new(call_fp, url_fp, ctx)`,
+  held on the tool and set for a whole registry by `agnosai_tool_registry_set_gate`. It is asked at the one
+  chokepoint every call passes, so no tool implements the rule and no path can skip it. `/mcp` `tools/call` is
+  held to it with no change to its route.
+  - **A tool can see its task.** `agnosai_tool_execute_for(t, input, task, parent_sc)` stamps the call on its
+    input, read with `agnosai_tool_input_task` and `_tool`. `execute_fp` is unchanged, as is every tool.
+  - **A declared private host can be reached.** A `url_fp` answers `AGNOSAI_GATE_PASS`, `_ADMIT` or `_REFUSE`,
+    so a gate narrows and widens. Anything else refuses. `load_testing` and `security_audit` take the rule from
+    `agnosai_tool_target_refused`.
+  - **A redirect goes through the same gate.** `agnosai_guarded_fetch_hops` takes a hop check, and both of the
+    audit's chains use it, or a target check would end at the first 302. `load_testing` follows no redirect.
+  - **An admission has a floor:** `agnosai_url_is_admissible` refuses 169.254/16, `fd00:ec2::254`,
+    `metadata.google.internal`, `metadata.goog` and any scheme sandhi will not speak, whatever a gate says.
+  - `agnosai_url_host` and `agnosai_url_same_host`, so a gate compares what sandhi will connect to and not
+    the text of a URL.
+- **What a tool measured stays on its task result.** `agnosai_task_result_record_tool_call(r, t, out)` appends
+  `tool`, `effect`, `success` and `result` or `error` to `metadata.tool_calls`. The effect is F1's rule 1:
+  `none`, it never started; `committed`, it reported success; `unknown`, it may have done part of its work.
+  ADR 020's redaction applies under its own switch, to strings and keys only, so a measured number stays
+  that number.
+- **`agnosai_orchestrator_forget_crew(o, crew_id)`** takes a crew a consumer has read out of the registry,
+  and refuses one a runner still holds. agnostic's `_agnostic_crew_retire_a` can stop reaching into
+  `AGN_OR_CREWS`.
+- `tests/tools_gate.tcyr` and `tests/orch_crew_retention.tcyr`, which run the real tools against a loopback
+  server and a real polling consumer on threads. `benches/tools.bcyr` and `benches/orch.bcyr` gain four rows.
+
+### Changed
+
+- **The crew registry evicts oldest-first (ADR 026).** Through 2.2.3 the next submit at 1,000 entries dropped
+  every finished crew at once: agnostic's 1,300 unpolled crews at 190/s lost 885, and clients polling every
+  crew to its end lost 7 of 4,000. Now it evicts the crews that ended longest ago, down to 900, so a crew
+  stays readable until 900 others have ended after it. The marks are over ended crews, so running crews
+  cannot shrink the window, and the order is when a crew ended and not when it arrived.
+- **bote 3.8.11 → 3.8.15.** `dist/bote-core.cyr` grew by about 4,450 lines of JSON Schema work. agnosai calls no
+  bote function, so nothing here changes with it. `cyrius.lock` was regenerated, since `cyrius deps` keeps a
+  pin the manifest has moved past until the lock is deleted.
+- `tools/native`'s input, output and tool structs each grew by the fields above, and `agnosai_tool_execute_in`
+  is now `agnosai_tool_execute_for` with no task.
+
+### Fixed
+
+- **A cancelled crew could be evicted while its work was running**, and its runner's final state then put it
+  back. A crew is queued for eviction only once it has stopped.
+- `_agnosai_orch_register` published a crew's state and its cancel flag in two steps, so a cancel between them
+  was lost. They are published together, and `cancel_crew`'s branch for the opposite order, which could
+  never run, is gone.
+- A crew whose thread would not start kept its cancel flag and event channel for good. It gives both up.
+
+### Performance
+
+Interleaved A/B against a 2.2.3 build, three rounds of all eleven bench files, medians: **−0.0%**, 208 of 222
+rows within ±5%. The one sweep in `bench-history.csv` reads −1.0% against 2.2.3's rows, at a load of 1.9–2.1
+against 3.2–3.4, 183 of 222 within ±5%. The trailing-dot fix came after the A/B and touches only the SSRF guard,
+so its rows were measured again, five interleaved rounds.
+
+- **What this release costs:** `tool_execute_no_gate` 21 ns, `tool_execute_gated` 26 ns, so a gate costs about
+  5 ns before its own callback. `is_safe_url_octal_host` 1,033 → 1,124 ns (+8.8%), the second parse, and
+  `is_safe_url_public_host` 989 → 1,003 ns (+1.4%). `orchestrator_new` 2,888 → 3,064 ns (+6.1%), one `vec_new`.
+- **Eviction costs nothing a crew can see:** `run_crew_at_registry_cap` 92.5 µs and `run_crew_then_forget`
+  91.8 µs, against `run_crew_1_task_sequential` at 92.7 µs on the same build.
+- **`GET /api/v1/presets` does a sixth of the work:** `builtin_presets_18` 564.5 µs → `builtin_presets_3`
+  95.8 µs, and `preset_to_value_18` 109.7 µs → `preset_to_value_3` 18.1 µs. That is the set shrinking, not a
+  faster parser. The rows are renamed, and do not continue the old ones.
+- **The rows outside ±5% are not this change.** `crew_runner_10_tasks_parallel_4_{quiet,watched}` read +30–34%,
+  and that is B27: the 2.2.3 build alone read 407, 399 and 551 µs over its three rounds, and this one sits at
+  its upper mode, with `crew_runner.cyr` untouched. `default_model_premium` +31% and `_capable` −23% move
+  opposite ways on unchanged code, as do `otlp_post_url_passthrough` +28% and `route_summarize_simple` −12%.
+- ⚠ **Rows added above existing ones move them.** The first sweep had the new `orch.bcyr` rows ahead of the
+  crew rows, and `run_crew_10_tasks_parallel_4` read +22% with nothing changed under it. Moved to the end of
+  `main` it reads +0.3%, so new rows go last.
+
+### Found, not changed
+
+- **A cyclic crew stays PENDING, with its event channel open** (roadmap B37). Older than this release, and
+  `forget_crew` is now a way out of the registry for it.
+
+### Verified
+
+- **The gate:** `check-symbols.sh` (2,818 definitions across 114 files, both targets) → `check-clean.sh` (fmt 227,
+  lint 227, doc 115, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist) → build → **101
+  suites, 8,912 assertions, 0 failed** under `CYRIUS_DCE=1` → coverage 99% (1,660/1,672 fns) → `distlib --all
+  --check` → examples → fuzz 4/4 → `cyrius bench` (229 rows). 2.2.3's tree reads 8,748 in the same shell, and
+  the +164 is accounted for suite by suite in `state.md`.
+- **Every fix was run against the defect it guards.** 29 mutations, each reverting one decision, all re-run
+  against the final code, and all 29 fail by name: the registry's identity check, compaction, the flag test, the
+  marks over ended crews, the queueing at a finish, a cancel and a failed run, abandoning a crew; the
+  chokepoint's refusal, its fail-closed check, the hop check, ADMIT's floor, a stray verdict, redaction of values
+  and of keys, the CORS chain, each tool's target check, the registry stamp; the transport error's text and the
+  log line's two refusals; both readings of an address; and root dots at the guard and the floor.
+  - One first survived: the fail-closed check for a gated call with no input. Its test's gate refused anyway,
+    so the check was not what passed it. The test now passes through a gate that lets everything by.
+  - ⚠ **One test was disarmed by a later fix, and only the final re-run showed it.** Moving the marks to ended
+    crews left `_t_reused_id` at 999 ended, one short of eviction, so it passed for nothing and the identity
+    mutation survived. It now crosses the cap and asserts that eviction fired.
+  - Three first crashed rather than failed, and one of those was a real defect: `agnosai_tool_target_refused`'s
+    first form dereferenced the 0 input its sibling accepts.
+- **An independent review of the diff found eight defects, and all eight were confirmed before they were fixed.**
+  The SSRF bypass above, reproduced here with a real request landing on loopback; a window that collapsed with
+  950 crews running; a crew stranded when its thread would not start; keys missing redaction; two inputs that
+  beat the first cut of the log line; a cancelled crew that could never be evicted; a refused target reading
+  `unknown`; and a window in registration. One sub-case is documented, not fixed: overlapping runs of one id have
+  always shared an entry and a flag.
+- **The shipped binary, end to end.** `/ready` says 2.2.4; `/api/v1/presets` lists the three; `/mcp` refuses
+  `http://0127.0.0.1:<port>/`, `http://169.0254.169.254/`, `http://localhost./` and `http://foo.internal./`; a crew against a dead gateway answers `LLM error:
+  hoosh transport error: CONNECT` with the URL on a WARN line only; a `HOOSH_URL` holding a password logs
+  `(withheld)`; SIGTERM exits cleanly.
+- **The CI way, on the runner's image.** An `ubuntu:26.04` container ran every `ci.yml` step as an unprivileged
+  user from a clean copy of this tree, with the Test step under `CYRIUS_DCE=1` and wasmtime 47.0.3: the toolchain;
+  `lib sync --full` and `deps` from an empty cache, resolving bote 3.8.15 from its tag; the symbol check;
+  `check-clean.sh`; the DCE build (2,908,008 B, as here); 101 suites, 0 failed; coverage; the example; fuzz and
+  `cyrius bench` (229 rows). It reads 8,768 assertions, as the suites that count per environment variable and `sandbox_cx`
+  read fewer in a container. The aarch64 binary builds at 6,897,048 B and was not run on the Pi this release.
+
 ## [2.2.3] — 2026-11-05
 
 The P(-1) audit and hardening the roadmap scheduled after three language bumps (cyrius 6.6.14 → 6.7.18 over

@@ -51,6 +51,9 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [022](022-crew-events-and-status-say-what-happened.md) | Crew events and registry status say what happened | Accepted — shipped in 2.1.5 |
 | [023](023-genai-semconv-spans-and-w3c-trace-context.md) | GenAI spans follow the semconv agent operations, and join the caller's W3C trace (amends 017) | Accepted — shipped in 2.1.5 |
 | [024](024-an-embedding-consumer-records-http-server-spans.md) | An embedding consumer can record an HTTP server span through agnosai's exporter | Accepted — 2.1.7 |
+| [025](025-a-tool-call-passes-a-consumers-gate.md) | A tool call passes a consumer's gate, and leaves a record on its task | Accepted |
+| [026](026-the-crew-registry-keeps-what-has-not-been-read.md) | The crew registry keeps what has not been read | Accepted |
+| [027](027-the-built-in-presets-are-an-example-library.md) | The built-in presets are an example library | Accepted |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`). The headings are left as written — renumbering accepted

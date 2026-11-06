@@ -311,8 +311,9 @@ the profile's `agent_cost_usd` is broken down per agent.
 }
 ```
 
-**Response (404):** the id is not registered (finished crews are evicted once the registry holds
-1,000). A malformed id is **422**.
+**Response (404):** the id is not registered. Once 1,000 finished crews are held, a submit evicts
+the ones that ended longest ago, down to 900 ([ADR 026](../adr/026-the-crew-registry-keeps-what-has-not-been-read.md)),
+so a crew stays readable until 900 others have ended after it. A malformed id is **422**.
 
 ```json
 {
@@ -444,14 +445,16 @@ List all registered tools with their schemas.
 
 ### GET /api/v1/presets
 
-List the built-in crew presets: the 18 documents compiled from `src/presets/`, each with its
-agents rendered as an agent definition is.
+List the built-in crew presets: three examples of the format compiled from `src/presets/`,
+`security-lean`, `security-standard` and `security-large`
+([ADR 027](../adr/027-the-built-in-presets-are-an-example-library.md)), each with its agents
+rendered as an agent definition is.
 
 **Response (200 OK):**
 
 ```json
 [
-  {"name": "quality-lean", "description": "…", "domain": "quality", "size": "lean",
+  {"name": "security-lean", "description": "…", "domain": "security", "size": "lean",
    "version": "…", "agents": [{"agent_key": "…", "name": "…", "role": "…", "goal": "…"}]}
 ]
 ```

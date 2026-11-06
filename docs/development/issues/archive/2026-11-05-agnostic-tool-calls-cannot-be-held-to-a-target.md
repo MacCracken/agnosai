@@ -1,8 +1,10 @@
-# A tool call cannot be held to what its task declared, and leaves no result behind — OPEN
+# A tool call cannot be held to what its task declared, and leaves no result behind — RESOLVED
 
 **Discovered:** 2026-11-05, designing agnostic's crew target. **Severity:** Medium, High once F1 runs tools.
 **Affects:** agnosai 2.2.3, `agnosai_tool_execute_in`, `_agnosai_load_testing_execute`,
-`_agnosai_security_audit_execute`, `agnosai_is_safe_url`. **Status:** 🔴 OPEN.
+`_agnosai_security_audit_execute`, `agnosai_is_safe_url`.
+**Status:** ✅ **RESOLVED in agnosai 2.2.4** (2026-11-05) as far as it can be before F1. Was 🔴 OPEN.
+**Resolution:** all of the asks exist and run ([ADR 025](../../../adr/025-a-tool-call-passes-a-consumers-gate.md)): a gate given the task, the tool and the input, that refuses a call and can admit a declared host past `agnosai_is_safe_url`; every redirect hop through the same gate; and each call's tool, result and effect status on the task result (`metadata.tool_calls`). It is enforced at the chokepoint today, so `/mcp` `tools/call` is held to it. **What still waits on F1 (2.3.x):** no crew runs a tool yet, so nothing passes a task to `agnosai_tool_execute_for` or fills `metadata.tool_calls`. F1's roadmap row says what the loop owes. **An admission has a floor agnostic should know of:** it cannot reach a cloud metadata endpoint, whatever a gate says.
 
 agnostic's crew body will carry a checked `target`, which it forwards into each task's context. The model
 reads it there, through `_agnosai_crew_build_request`. Two things stop that declaration from meaning anything

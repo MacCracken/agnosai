@@ -33,6 +33,60 @@ fn _t_private_host(host, name): i64 {
     return assert_eq(agnosai_is_private_host(str_from(host)), 1, name);
 }
 
+# ── what a gate compares (ADR 025) ──────────────────────────────────────────
+fn _t_same_host(a, b): i64 {
+    return agnosai_url_same_host(str_from(a), str_from(b));
+}
+
+fn _t_url_helpers(): i64 {
+    assert(str_eq_cstr(agnosai_url_host(str_from("https://Staging.Example:8443/a?b=1")),
+        "Staging.Example"), "a URL's host is what sandhi will connect to");
+    assert(str_eq_cstr(agnosai_url_host(str_from("http://[::1]:8080/")), "::1"),
+      "an IPv6 host comes without its brackets");
+    assert_eq(agnosai_url_host(0), 0, "no URL has no host");
+    assert_eq(agnosai_url_host(str_from("")), 0, "nor has an empty one");
+    assert_eq(agnosai_url_host(str_from("ftp://a/")), 0, "nor has a scheme sandhi refuses");
+    assert_eq(agnosai_url_host(str_from("http://")), 0, "nor has one that names no host");
+
+    assert_eq(_t_same_host("http://staging/a", "http://staging/b"), 1, "the path does not matter");
+    assert_eq(_t_same_host("http://STAGING/", "http://staging/"), 1, "nor does case");
+    assert_eq(_t_same_host("http://staging/", "https://staging:8443/"), 1,
+      "nor the scheme or port: redirecting to https stays on the host");
+    assert_eq(_t_same_host("http://staging/", "http://staging.evil.test/"), 0,
+      "a declared host is not a prefix of another");
+    assert_eq(_t_same_host("http://evil-staging/", "http://staging/"), 0, "nor a suffix");
+    assert_eq(_t_same_host("http://staging@evil.test/", "http://staging/"), 0,
+      "userinfo spelling the declared host does not make it the host");
+    assert_eq(_t_same_host("http://evil.test/staging/", "http://staging/"), 0,
+      "and neither does a path");
+    assert_eq(_t_same_host("ftp://x/", "ftp://x/"), 0, "a URL with no host matches nothing");
+
+    # ⚠ A leading zero is octal to a browser and decimal to sandhi, and sandhi is what dials.
+    # Read only the first way, `0127.0.0.1` was the public 87.0.0.1 and connected to loopback.
+    _t_unsafe("http://0127.0.0.1/", "a leading zero does not hide loopback");
+    _t_unsafe("http://010.0.0.1/", "or 10/8");
+    _t_unsafe("http://172.016.0.1/", "or 172.16/12");
+    _t_unsafe("http://192.0168.0.1/", "or 192.168/16");
+    _t_unsafe("http://169.0254.169.254/", "or the metadata endpoint");
+    _t_safe("http://8.8.8.8/", "and a public address is still public");
+    assert_eq(agnosai_is_metadata_host(str_from("169.0254.169.254")), 1,
+      "the floor reads an address as sandhi will dial it");
+    assert_eq(agnosai_is_metadata_host(str_from("metadata.goog")), 1, "and knows GCP's other name");
+
+    assert_eq(agnosai_is_metadata_host(str_from("169.254.169.254")), 1, "the metadata address");
+    assert_eq(agnosai_is_metadata_host(str_from("metadata.google.internal.")), 1,
+      "and a name, with its root dot");
+    assert_eq(agnosai_is_metadata_host(str_from("10.0.0.5")), 0, "a private host is not one");
+    assert_eq(agnosai_is_metadata_host(str_from("staging.internal")), 0,
+      "nor is a private name: only the metadata name is");
+    assert_eq(agnosai_is_metadata_host(str_from("1.2.3.999")), 1,
+      "and a host that must be an address and is not one counts, as nothing can say it is not");
+    assert_eq(agnosai_url_is_admissible(str_from("http://10.0.0.5/")), 1, "a private URL may be");
+    assert_eq(agnosai_url_is_admissible(str_from("http://169.254.169.254/")), 0, "this one may not");
+    assert_eq(agnosai_url_is_admissible(str_from("ftp://10.0.0.5/")), 0, "nor another scheme");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -93,13 +147,25 @@ fn main() {
     _t_unsafe("http://2130706433", "decimal-integer loopback");
     _t_unsafe("http://127.1", "two-part short-form loopback");
     _t_unsafe("http://127.0.1", "three-part short-form loopback");
-    # 010 is octal 8, so this really is 8.0.0.1 — a PUBLIC address. Reading it
-    # as decimal 10 (and rejecting it as 10/8) would be the mirror-image bug to
-    # the one the permissive parser exists to prevent.
-    _t_safe("http://010.0.0.1", "octal 010 is 8, so 010.0.0.1 is public 8.0.0.1");
+    # ⚠ Reversed at 2.2.4. This asserted that 010 is octal 8, so the host is the public 8.0.0.1
+    # and refusing it would be a mirror-image bug. That is true of the Rust line, whose `url`
+    # crate normalises the host before reqwest dials it. Here sandhi reads 010 as decimal 10 and
+    # dials 10.0.0.1, so the guard has to refuse a host that is private under EITHER reading.
+    # A public host spelled with a leading zero pays for that, and nobody writes one.
+    _t_unsafe("http://010.0.0.1", "010.0.0.1 is 8.0.0.1 to a browser and 10.0.0.1 to sandhi");
     _t_unsafe("http://0300.0250.0.1", "octal-encoded 192.168.0.1");
     _t_unsafe("http://3232235777", "decimal-integer 192.168.1.1");
     _t_unsafe("http://127.0.0.1.", "a trailing dot does not evade the check");
+    # ⚠ Only the numeric form was covered, and the name list compared exact text, so a dot took
+    # a blocked name off the list until 2.2.4. It is the root of the DNS tree, so a resolver reads
+    # `foo.internal.` as `foo.internal`.
+    _t_unsafe("http://localhost./", "a trailing dot does not unblock localhost");
+    _t_unsafe("http://LOCALHOST./", "in any case");
+    _t_unsafe("http://foo.internal./", "or a .internal name");
+    _t_unsafe("http://foo.local./", "or a .local name");
+    _t_unsafe("http://foo.localhost./", "or a .localhost name");
+    _t_unsafe("http://localhost../", "nor do two dots");
+    _t_safe("https://example.com./", "and a public name with its root dot is still public");
 
     # a host whose last label is numeric but which is not a parseable address
     # fails CLOSED rather than being treated as a name
@@ -168,6 +234,7 @@ fn main() {
     _t_unsafe("http://example.com/\r\nX-Injected: 1", "CRLF in a URL is rejected");
     _t_unsafe("http://exa mple.com", "a space in a URL is rejected");
 
+    _t_url_helpers();
     return assert_summary();
 }
 

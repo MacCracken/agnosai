@@ -258,6 +258,28 @@ fn _t_tools_call_no_output(): i64 {
     return 0;
 }
 
+# --- ADR 025: /mcp is held to the registry's gate --------------------------
+#
+# The one call path that runs today, and it knows nothing of gates: the gate is on the tool, so
+# a consumer's rule holds here with no change to this route.
+fn _t_gate_refuses(ctx, input): i64 {
+    return str_from("off target");
+}
+
+fn _t_tools_call_gated(): i64 {
+    var s = _t_state();
+    agnosai_tool_registry_set_gate(agnosai_app_state_tools(s),
+      agnosai_tool_gate_new(&_t_gate_refuses, 0, 0));
+    var call = _t_rpc("tools/call",
+      ",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hello\"}}");
+    var result = _t_obj(agnosai_route_body(agnosai_route_mcp(s, call)), "result");
+    assert(result != 0, "a refused tools/call is a tool-level failure, not a JSON-RPC error");
+    assert_eq(bayan_json_v_bool(_t_obj(result, "isError")), 1, "with isError set");
+    var text = _t_str(bayan_json_v_arr_get(_t_obj(result, "content"), 0), "text");
+    assert(str_eq_cstr(text, "tool call refused: off target"), "and the refusal as its text");
+    return 0;
+}
+
 # --- ADR 023: a tools/call joins the request's trace ----------------------
 
 # `agnosai_route_mcp_tp_a` hands `tools/call` the request's `traceparent`, and
@@ -652,6 +674,7 @@ fn main(): i64 {
     _t_tools_list();
     _t_tools_list_empty();
     _t_tools_call();
+    _t_tools_call_gated();
     _t_tools_call_no_output();
     _t_tools_call_unknown_tool();
     _t_tools_call_missing_name();

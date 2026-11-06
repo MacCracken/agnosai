@@ -22,11 +22,12 @@
 #     ("52 `Arc<` in src/, of which 49 are process-lifetime shared-immutable").
 # =========================================================================
 
-# ToolRegistry heap layout — 16 bytes.
+# ToolRegistry heap layout — 24 bytes.
 enum AgnosaiToolRegistryOff {
     AGN_REG_TOOLS = 0;
     AGN_REG_MUTEX = 8;
-    AGN_REG_SIZE = 16;
+    AGN_REG_GATE = 16;
+    AGN_REG_SIZE = 24;
 }
 
 # Create an empty registry with its own lock.
@@ -34,6 +35,7 @@ fn agnosai_tool_registry_new(): i64 {
     var r = alloc(AGN_REG_SIZE);
     store64(r + AGN_REG_TOOLS, map_new_str());
     store64(r + AGN_REG_MUTEX, mutex_new());
+    store64(r + AGN_REG_GATE, 0);
     return r;
 }
 
@@ -43,9 +45,27 @@ fn agnosai_tool_registry_register(r, tool): i64 {
     var name = agnosai_tool_name(tool);
     _agnosai_registry_log(SK_DEBUG, "registering tool", 16, name);
     mutex_lock(load64(r + AGN_REG_MUTEX));
+    var gate = load64(r + AGN_REG_GATE);
+    if (gate != 0) { agnosai_tool_with_gate(tool, gate); }
     map_set(load64(r + AGN_REG_TOOLS), str_clone(name), tool);
     mutex_unlock(load64(r + AGN_REG_MUTEX));
     return 0;
+}
+
+# Hold every tool in the registry to `gate`, now and as tools are registered later (ADR 025).
+# 0 lifts it from the tools held here.
+#
+# A tool object may be shared between registries, and it holds one gate: the last set wins.
+fn agnosai_tool_registry_set_gate(r, gate): i64 {
+    mutex_lock(load64(r + AGN_REG_MUTEX));
+    store64(r + AGN_REG_GATE, gate);
+    var tools = load64(r + AGN_REG_TOOLS);
+    var keys = map_keys(tools);
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        agnosai_tool_with_gate(map_get(tools, vec_get(keys, i)), gate);
+    }
+    mutex_unlock(load64(r + AGN_REG_MUTEX));
+    return r;
 }
 
 # Look up a tool by name, or 0 when not registered.

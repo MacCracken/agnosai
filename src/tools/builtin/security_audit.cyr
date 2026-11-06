@@ -722,6 +722,12 @@ fn agnosai_run_security_audit(url: Str): i64 {
 # actively misdirecting the operator and leaking one request's outcome into
 # another's response. An out-param has none of that; the caller owns the slot.
 fn agnosai_run_security_audit_err(url: Str, out_kind): i64 {
+    return agnosai_run_security_audit_for(0, url, out_kind);
+}
+
+# `agnosai_run_security_audit_err` for the call `input` belongs to: both chains are held to
+# that call's gate at every hop (ADR 025). An `input` of 0 holds them to the SSRF guard.
+fn agnosai_run_security_audit_for(input, url: Str, out_kind): i64 {
     if (out_kind != 0) { store64(out_kind, 0); }
     var arena = agnosai_arena_pool_acquire(_AGNOSAI_AUDIT_POOL);
     if (arena == 0) { return 0; }
@@ -735,8 +741,8 @@ fn agnosai_run_security_audit_err(url: Str, out_kind): i64 {
     # before the CORS probe starts, so the two chains never share the arena.
     var get_kind: i64[1];
     store64(&get_kind, 0);
-    var get_resp = agnosai_guarded_fetch_full(arena, "GET", url, sandhi_headers_new(),
-      opts, AGNOSAI_AUDIT_TIMEOUT_MS, 0, 0, &get_kind);
+    var get_resp = agnosai_guarded_fetch_hops(arena, "GET", url, sandhi_headers_new(),
+      opts, AGNOSAI_AUDIT_TIMEOUT_MS, 0, 0, &get_kind, &agnosai_tool_url_ok, input);
     if (get_resp == AGNOSAI_FETCH_BLOCKED) {
         agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return AGNOSAI_FETCH_BLOCKED;
@@ -759,7 +765,8 @@ fn agnosai_run_security_audit_err(url: Str, out_kind): i64 {
     var cors_headers = 0;
     var probe = sandhi_headers_new();
     sandhi_headers_add(probe, "Origin", AGNOSAI_AUDIT_PROBE_ORIGIN);
-    var cors_resp = agnosai_guarded_fetch(arena, "OPTIONS", url, probe, opts, AGNOSAI_AUDIT_TIMEOUT_MS);
+    var cors_resp = agnosai_guarded_fetch_hops(arena, "OPTIONS", url, probe, opts,
+      AGNOSAI_AUDIT_TIMEOUT_MS, 0, 0, 0, &agnosai_tool_url_ok, input);
     if (cors_resp != 0 && cors_resp != AGNOSAI_FETCH_BLOCKED) {
         cors_headers = _agnosai_audit_snapshot(sandhi_http_headers(cors_resp));
     }
@@ -814,10 +821,8 @@ fn _agnosai_security_audit_execute(ctx, input): i64 {
     if (target == 0) {
         return agnosai_tool_output_err(str_from("missing required parameter: target_url"));
     }
-    if (agnosai_is_safe_url(target) == 0) {
-        return agnosai_tool_output_err(
-          str_from("target_url rejected: cannot target private/internal networks"));
-    }
+    var refused = agnosai_tool_target_refused(input, target);
+    if (refused != 0) { return refused; }
 
     _agnosai_audit_log("security audit starting", 23, target);
 
@@ -826,9 +831,13 @@ fn _agnosai_security_audit_execute(ctx, input): i64 {
     # on a pooled-worker path.
     var audit_kind: i64[1];
     store64(&audit_kind, 0);
-    var result = agnosai_run_security_audit_err(target, &audit_kind);
+    var result = agnosai_run_security_audit_for(input, target, &audit_kind);
     if (result == AGNOSAI_FETCH_BLOCKED) {
         _agnosai_audit_log("security audit redirect refused", 31, target);
+        if (agnosai_tool_input_gate(input) != 0) {
+            return agnosai_tool_output_err(
+              str_from("security audit failed: target redirected somewhere this call may not reach"));
+        }
         return agnosai_tool_output_err(
           str_from("security audit failed: target redirected to a private/internal address"));
     }

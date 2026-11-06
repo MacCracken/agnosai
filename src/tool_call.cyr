@@ -1,0 +1,138 @@
+# =========================================================================
+# tool_call — what a tool call may reach, and what it leaves on its task (ADR 025).
+#
+# No Rust origin. agnostic asked for both halves when it designed its crew target:
+#
+#   * The URL half decides whether a call may reach a URL: the consumer's gate first, the SSRF
+#     guard under it. A gate narrows, which is how a call is held to what its task declared,
+#     and it widens, which is how a declared host on a private network is reached at all.
+#   * The record half keeps what a tool reported on the task result, so a consumer can store a
+#     measurement and label it as one. A model saying "all passed" is a claim, and a load
+#     test's p99 is a number something measured.
+#
+# Apart from `tools/native` because it needs the SSRF guard and the output filter, which a
+# suite that only registers a tool should not have to include.
+#
+# Include order: after `src/server/ssrf.cyr`, `src/server/output_filter.cyr`,
+# `src/core/task.cyr` and `src/tools/native.cyr`, and before any tool that fetches a URL.
+# =========================================================================
+
+# Whether the call `input` belongs to may reach `url`. An `input` of 0, a tool with no gate, or
+# a gate with no `url_fp` leaves it to `agnosai_is_safe_url`.
+#
+# ⚠ **Fails closed on the verdict.** Anything but PASS or ADMIT refuses, so a stray value cannot
+# open anything. A callback that falls off its end answers 0, which is PASS and leaves the URL to
+# the SSRF guard: it opens nothing either.
+#
+# An ADMIT still has `agnosai_url_is_admissible` under it: a gate can get a private host past
+# the guard, and it cannot get a metadata endpoint or a non-HTTP scheme past that.
+#
+# Its shape is `agnosai_guarded_fetch_hops`' `hop_fp`, with `input` as the context, which is
+# how the redirect chain is held to the same rule as the target.
+fn agnosai_tool_url_ok(input, url: Str): i64 {
+    var gate = 0;
+    if (input != 0) { gate = agnosai_tool_input_gate(input); }
+    if (gate == 0) { return agnosai_is_safe_url(url); }
+    var url_fp = agnosai_tool_gate_url_fp(gate);
+    if (url_fp == 0) { return agnosai_is_safe_url(url); }
+
+    var verdict = callptr(url_fp, agnosai_tool_gate_ctx(gate), input, url);
+    if (verdict == AGNOSAI_GATE_PASS) { return agnosai_is_safe_url(url); }
+    if (verdict == AGNOSAI_GATE_ADMIT) { return agnosai_url_is_admissible(url); }
+    return 0;
+}
+
+# 0 when the call `input` belongs to may reach its target, or the output to return when it may
+# not: a call refused there never started, so it reads as having no effect, as one a gate's
+# `call_fp` stopped does. With no gate the message is the oracle's. A gate's refusal may not be
+# about private networks at all, so it says only what is true of every refusal.
+fn agnosai_tool_target_refused(input, url: Str): i64 {
+    if (agnosai_tool_url_ok(input, url) == 1) { return 0; }
+    var tool = 0;
+    var gate = 0;
+    if (input != 0) {
+        tool = agnosai_tool_input_tool(input);
+        gate = agnosai_tool_input_gate(input);
+    }
+    if (gate != 0) {
+        return agnosai_tool_output_refused(tool,
+          str_from("target_url rejected: this call may not reach it"));
+    }
+    return agnosai_tool_output_refused(tool,
+      str_from("target_url rejected: cannot target private/internal networks"));
+}
+
+# `v` with the output filter's redaction applied to every string in it, object keys included:
+# the system under test can write those too.
+#
+# ⚠ **Only strings.** What a tool measured stays the number it measured, which is the reason
+# this walks the value rather than filtering its JSON text: a redaction there could not tell a
+# figure from a phone number, and would rewrite the value a report labels as measured.
+fn _agnosai_tool_value_redacted(v): i64 {
+    if (bayan_json_v_is_str(v) == 1) {
+        return bayan_json_v_str_new(agnosai_output_redact(bayan_json_v_str(v)));
+    }
+    if (bayan_json_v_is_arr(v) == 1) {
+        var arr = bayan_json_v_arr_new();
+        for (var i = 0; i < bayan_json_v_arr_len(v); i = i + 1) {
+            bayan_json_v_arr_push(arr, _agnosai_tool_value_redacted(bayan_json_v_arr_get(v, i)));
+        }
+        return arr;
+    }
+    if (bayan_json_v_is_obj(v) == 1) {
+        var obj = bayan_json_v_obj_new();
+        for (var j = 0; j < bayan_json_v_obj_len(v); j = j + 1) {
+            bayan_json_v_obj_set(obj, agnosai_output_redact(bayan_json_v_obj_key(v, j)),
+              _agnosai_tool_value_redacted(bayan_json_v_obj_val(v, j)));
+        }
+        return obj;
+    }
+    return v;
+}
+
+# One tool call as a bayan JSON value: `tool`, `effect`, `success`, and `result` or `error`.
+#
+# `out` is what `agnosai_tool_execute_for` returned, so 0 is a tool that answered nothing, which
+# reads as an unknown effect. ADR 020's filter applies, since this reaches the same readers as
+# a task's output does: tool output can hold whatever the system under test wrote.
+fn agnosai_tool_call_to_value(t, out): i64 {
+    var obj = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(obj, str_from("tool"), bayan_json_v_str_new(agnosai_tool_name(t)));
+    var effect = AGNOSAI_TOOL_EFFECT_UNKNOWN;
+    if (out != 0) { effect = agnosai_tool_output_effect(out); }
+    bayan_json_v_obj_set(obj, str_from("effect"),
+      bayan_json_v_str_new(str_from(agnosai_tool_effect_to_wire(effect))));
+
+    var ok = 0;
+    if (out != 0) { ok = agnosai_tool_output_success(out); }
+    bayan_json_v_obj_set(obj, str_from("success"), _agnosai_bool_to_value_a(default_alloc(), ok));
+    if (ok == 1) {
+        var result = agnosai_tool_output_result(out);
+        if (agnosai_output_redact_enabled() == 1) { result = _agnosai_tool_value_redacted(result); }
+        bayan_json_v_obj_set(obj, str_from("result"), result);
+        return obj;
+    }
+
+    var err = 0;
+    if (out != 0) { err = agnosai_tool_output_error(out); }
+    if (err == 0) { err = str_from("no output"); }
+    if (agnosai_output_redact_enabled() == 1) { err = agnosai_output_redact(err); }
+    bayan_json_v_obj_set(obj, str_from("error"), bayan_json_v_str_new(err));
+    return obj;
+}
+
+# Append a tool call to a task result, under `metadata.tool_calls` in call order. Returns `r`.
+#
+# In `metadata` because that is what a consumer already stores, and because the task result's
+# wire form stays the oracle's. **F1's loop calls this once per call** with what
+# `agnosai_tool_execute_for` returned. Until then no crew runs a tool, so nothing does.
+fn agnosai_task_result_record_tool_call(r, t, out): i64 {
+    var key = str_from("tool_calls");
+    var calls = map_get(agnosai_task_result_metadata(r), key);
+    if (calls == 0) {
+        calls = bayan_json_v_arr_new();
+        agnosai_task_result_with_metadata(r, key, calls);
+    }
+    bayan_json_v_arr_push(calls, agnosai_tool_call_to_value(t, out));
+    return r;
+}

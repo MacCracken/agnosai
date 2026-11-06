@@ -206,6 +206,24 @@ fn agnosai_guarded_fetch_body(arena, method, url: Str, headers, opts, timeout_ms
 # before any request was made. Pass 0 to ignore it.
 fn agnosai_guarded_fetch_full(arena, method, url: Str, headers, opts, timeout_ms,
   body, body_len, out_kind): i64 {
+    return agnosai_guarded_fetch_hops(arena, method, url, headers, opts, timeout_ms,
+      body, body_len, out_kind, 0, 0);
+}
+
+# Whether a redirect may be followed to `url`: `hop_fp`'s word, or the SSRF guard's.
+fn _agnosai_fetch_hop_ok(url: Str, hop_fp, hop_ctx): i64 {
+    if (hop_fp == 0) { return agnosai_is_safe_url(url); }
+    return callptr(hop_fp, hop_ctx, url);
+}
+
+# `agnosai_guarded_fetch_full` under a caller's hop check (ADR 025).
+#
+# `hop_fp` is `fn(hop_ctx, url): 1 or 0`, asked of every redirect target before the request to
+# it is issued, in place of `agnosai_is_safe_url`. 0 keeps that guard. It is what holds a tool
+# to its gate past the first 302: a target check that passed once says nothing of where the
+# target sends the call next. The https downgrade refusal below is not the hop check's to lift.
+fn agnosai_guarded_fetch_hops(arena, method, url: Str, headers, opts, timeout_ms,
+  body, body_len, out_kind, hop_fp, hop_ctx): i64 {
     var current = url;
     var verb = method;
     var hops = 0;
@@ -235,7 +253,7 @@ fn agnosai_guarded_fetch_full(arena, method, url: Str, headers, opts, timeout_ms
             return AGNOSAI_FETCH_BLOCKED;
         }
         # The guard, on every hop. This is the check the oracle never makes.
-        if (agnosai_is_safe_url(next) == 0) { return AGNOSAI_FETCH_BLOCKED; }
+        if (_agnosai_fetch_hop_ok(next, hop_fp, hop_ctx) == 0) { return AGNOSAI_FETCH_BLOCKED; }
 
         # A 303 turns the next request into a GET, per RFC 9110. Only reachable
         # on the CORS probe here, since the header fetch is already a GET.

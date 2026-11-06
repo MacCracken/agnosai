@@ -40,21 +40,51 @@ enum AgnosaiToolSchemaOff {
     AGN_SCHEMA_SIZE = 24;
 }
 
-# ToolInput heap layout — 8 bytes: a Str-keyed map of bayan values.
+# ToolInput heap layout — 32 bytes: a Str-keyed map of bayan values, and what the
+# chokepoint knows of the call (ADR 025). An input belongs to one call, which is what lets it
+# carry this without a thread-local and without changing `execute_fp`.
 enum AgnosaiToolInputOff {
     AGN_INPUT_PARAMETERS = 0;
-    AGN_INPUT_SIZE = 8;
+    AGN_INPUT_TASK = 8;
+    AGN_INPUT_TOOL = 16;
+    AGN_INPUT_GATE = 24;
+    AGN_INPUT_SIZE = 32;
 }
 
-# ToolOutput heap layout — 24 bytes.
+# ToolOutput heap layout — 32 bytes.
 enum AgnosaiToolOutputOff {
     AGN_OUTPUT_SUCCESS = 0;
     AGN_OUTPUT_RESULT = 8;
     AGN_OUTPUT_ERROR = 16;
-    AGN_OUTPUT_SIZE = 24;
+    AGN_OUTPUT_EFFECT = 24;
+    AGN_OUTPUT_SIZE = 32;
 }
 
-# Tool vtable heap layout — 40 bytes. `schema_fp` and `execute_fp` are called
+# What a tool call did to the world (ADR 025). UNKNOWN is 0, so an output nothing has judged
+# reads as the one answer that promises nothing.
+enum AgnosaiToolEffect {
+    AGNOSAI_TOOL_EFFECT_UNKNOWN = 0;
+    AGNOSAI_TOOL_EFFECT_NONE = 1;
+    AGNOSAI_TOOL_EFFECT_COMMITTED = 2;
+}
+
+# What a gate's `url_fp` answers for a URL (ADR 025). PASS has no opinion, so the SSRF guard
+# decides. ADMIT gets a declared host past that guard. REFUSE ends it. Any other value refuses.
+enum AgnosaiToolGateVerdict {
+    AGNOSAI_GATE_PASS = 0;
+    AGNOSAI_GATE_ADMIT = 1;
+    AGNOSAI_GATE_REFUSE = 2;
+}
+
+# ToolGate heap layout — 24 bytes.
+enum AgnosaiToolGateOff {
+    AGN_GATE_CALL_FP = 0;
+    AGN_GATE_URL_FP = 8;
+    AGN_GATE_CTX = 16;
+    AGN_GATE_SIZE = 24;
+}
+
+# Tool vtable heap layout — 48 bytes. `schema_fp` and `execute_fp` are called
 # with the tool's own `ctx` as the first argument, so one implementation can
 # back many instances.
 enum AgnosaiToolOff {
@@ -63,7 +93,8 @@ enum AgnosaiToolOff {
     AGN_TOOL_SCHEMA_FP = 16;
     AGN_TOOL_EXECUTE_FP = 24;
     AGN_TOOL_CTX = 32;
-    AGN_TOOL_SIZE = 40;
+    AGN_TOOL_GATE = 40;
+    AGN_TOOL_SIZE = 48;
 }
 
 # Describe a single tool parameter. `required` is 1 or 0.
@@ -209,9 +240,35 @@ fn agnosai_tool_schema_to_value(s): i64 {
 
 # Create an empty tool input.
 fn agnosai_tool_input_new(): i64 {
+    return _agnosai_tool_input_over(map_new_str());
+}
+
+# A tool input over `parameters`, belonging to no call yet.
+fn _agnosai_tool_input_over(parameters): i64 {
     var i = alloc(AGN_INPUT_SIZE);
-    store64(i + AGN_INPUT_PARAMETERS, map_new_str());
+    store64(i + AGN_INPUT_PARAMETERS, parameters);
+    store64(i + AGN_INPUT_TASK, 0);
+    store64(i + AGN_INPUT_TOOL, 0);
+    store64(i + AGN_INPUT_GATE, 0);
     return i;
+}
+
+# The task this call serves, or 0 for a call no task made, such as `/mcp`'s `tools/call`.
+#
+# A tool, or a gate, reads what the task declared here. The rest of the input is what the model
+# wrote, and for a QA consumer the system under test can steer that (ADR 025).
+fn agnosai_tool_input_task(input): i64 {
+    return load64(input + AGN_INPUT_TASK);
+}
+
+# The tool this call is for, set by the chokepoint.
+fn agnosai_tool_input_tool(input): i64 {
+    return load64(input + AGN_INPUT_TOOL);
+}
+
+# The gate this call passed, or 0 for a tool with none.
+fn agnosai_tool_input_gate(input): i64 {
+    return load64(input + AGN_INPUT_GATE);
 }
 
 # Set a parameter to a bayan JSON value. Returns the input so calls chain.
@@ -283,9 +340,7 @@ fn agnosai_tool_input_get_int(input, key: Str): i64 {
 
 # Build a tool input from a bayan JSON object of parameters.
 fn agnosai_tool_input_from_value(v): i64 {
-    var input = alloc(AGN_INPUT_SIZE);
-    store64(input + AGN_INPUT_PARAMETERS, _agnosai_map_from_value(v));
-    return input;
+    return _agnosai_tool_input_over(_agnosai_map_from_value(v));
 }
 
 # A successful tool output carrying `result`.
@@ -294,6 +349,7 @@ fn agnosai_tool_output_ok(result): i64 {
     store64(o + AGN_OUTPUT_SUCCESS, 1);
     store64(o + AGN_OUTPUT_RESULT, result);
     store64(o + AGN_OUTPUT_ERROR, 0);
+    store64(o + AGN_OUTPUT_EFFECT, AGNOSAI_TOOL_EFFECT_UNKNOWN);
     return o;
 }
 
@@ -303,6 +359,7 @@ fn agnosai_tool_output_err(msg: Str): i64 {
     store64(o + AGN_OUTPUT_SUCCESS, 0);
     store64(o + AGN_OUTPUT_RESULT, bayan_json_v_null());
     store64(o + AGN_OUTPUT_ERROR, msg);
+    store64(o + AGN_OUTPUT_EFFECT, AGNOSAI_TOOL_EFFECT_UNKNOWN);
     return o;
 }
 
@@ -319,6 +376,19 @@ fn agnosai_tool_output_result(o): i64 {
 # The error message, or 0 when the output succeeded.
 fn agnosai_tool_output_error(o): i64 {
     return load64(o + AGN_OUTPUT_ERROR);
+}
+
+# What this call did: an `AGNOSAI_TOOL_EFFECT_*`, set by the chokepoint. Not in the output's
+# wire form, which stays the oracle's. `agnosai_task_result_record_tool_call` carries it.
+fn agnosai_tool_output_effect(o): i64 {
+    return load64(o + AGN_OUTPUT_EFFECT);
+}
+
+# An effect's wire spelling.
+fn agnosai_tool_effect_to_wire(effect): i64 {
+    if (effect == AGNOSAI_TOOL_EFFECT_NONE) { return "none"; }
+    if (effect == AGNOSAI_TOOL_EFFECT_COMMITTED) { return "committed"; }
+    return "unknown";
 }
 
 # A tool output as a bayan JSON value. `error` is **omitted** when absent,
@@ -358,7 +428,51 @@ fn agnosai_tool_new(name: Str, description: Str, schema_fp, execute_fp, ctx): i6
     store64(t + AGN_TOOL_SCHEMA_FP, schema_fp);
     store64(t + AGN_TOOL_EXECUTE_FP, execute_fp);
     store64(t + AGN_TOOL_CTX, ctx);
+    store64(t + AGN_TOOL_GATE, 0);
     return t;
+}
+
+# Create a consumer's gate between the model and its tools (ADR 025). Either callback may be 0.
+#
+# `call_fp` is `fn(ctx, input): Str`, called before a tool runs. It answers 0 to let the call
+# through, or the reason to refuse it. The input holds what it needs: the task, the tool and
+# what the model wrote.
+#
+# `url_fp` is `fn(ctx, input, url): verdict`, an `AGNOSAI_GATE_*`, asked of a tool's target and
+# of **every redirect hop**, so a target check does not end at the first 302.
+#
+# Both run on the calling thread, once per call or hop, and may run on many threads at once.
+fn agnosai_tool_gate_new(call_fp, url_fp, ctx): i64 {
+    var g = alloc(AGN_GATE_SIZE);
+    store64(g + AGN_GATE_CALL_FP, call_fp);
+    store64(g + AGN_GATE_URL_FP, url_fp);
+    store64(g + AGN_GATE_CTX, ctx);
+    return g;
+}
+
+# The gate's URL callback, or 0.
+fn agnosai_tool_gate_url_fp(g): i64 {
+    return load64(g + AGN_GATE_URL_FP);
+}
+
+# The gate's own context, handed to both callbacks.
+fn agnosai_tool_gate_ctx(g): i64 {
+    return load64(g + AGN_GATE_CTX);
+}
+
+# Hold a tool to a gate. 0 removes it. Returns the tool.
+#
+# The gate lives on the tool, so a path that forgets it cannot exist: every call goes through
+# `agnosai_tool_execute_for`, which reads it here. `agnosai_tool_registry_set_gate` does this
+# for a whole registry, and is what a consumer normally calls.
+fn agnosai_tool_with_gate(t, gate): i64 {
+    store64(t + AGN_TOOL_GATE, gate);
+    return t;
+}
+
+# The gate this tool is held to, or 0.
+fn agnosai_tool_gate(t): i64 {
+    return load64(t + AGN_TOOL_GATE);
 }
 
 # Unique tool name.
@@ -395,26 +509,75 @@ fn agnosai_tool_schema(t): i64 {
     return agnosai_tool_schema_a(default_alloc(), t);
 }
 
-# Execute the tool, via its vtable, as a child of `parent_sc`. Synchronous —
+# The output of a call that never started, so it had no effect, saying why. `t` may be 0 for a
+# tool driven directly rather than through the chokepoint. Logged, as a refused call is what an
+# audit trail is for.
+fn agnosai_tool_output_refused(t, text: Str): i64 {
+    if (sakshi_get_level() >= SK_WARN && t != 0) {
+        var name = agnosai_tool_name(t);
+        sakshi_log_kv(SK_WARN, str_data(text), str_len(text),
+          "tool", 4, str_data(name), str_len(name));
+    }
+    var out = agnosai_tool_output_err(text);
+    store64(out + AGN_OUTPUT_EFFECT, AGNOSAI_TOOL_EFFECT_NONE);
+    return out;
+}
+
+# A gate's refusal, in the words a caller reads.
+fn _agnosai_tool_refused(t, reason: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "tool call refused: ");
+    str_builder_add(sb, reason);
+    return agnosai_tool_output_refused(t, str_builder_build(sb));
+}
+
+# Bind the call to its input, ask the gate, and run the tool.
+fn _agnosai_tool_run(t, input, task): i64 {
+    var gate = load64(t + AGN_TOOL_GATE);
+    if (input != 0) {
+        store64(input + AGN_INPUT_TASK, task);
+        store64(input + AGN_INPUT_TOOL, t);
+        store64(input + AGN_INPUT_GATE, gate);
+    }
+    if (gate != 0) {
+        # Fail closed: a gate cannot judge a call it cannot see.
+        if (input == 0) { return _agnosai_tool_refused(t, str_from("no input to judge")); }
+        var call_fp = load64(gate + AGN_GATE_CALL_FP);
+        if (call_fp != 0) {
+            var reason = callptr(call_fp, load64(gate + AGN_GATE_CTX), input);
+            if (reason != 0) { return _agnosai_tool_refused(t, reason); }
+        }
+    }
+    var out = callptr(load64(t + AGN_TOOL_EXECUTE_FP), load64(t + AGN_TOOL_CTX), input);
+    # A tool that reported success did its work. One that reported failure may have done part
+    # of it, and a tool that answered nothing says less still, so both stay UNKNOWN.
+    if (out != 0) {
+        if (load64(out + AGN_OUTPUT_SUCCESS) == 1) {
+            store64(out + AGN_OUTPUT_EFFECT, AGNOSAI_TOOL_EFFECT_COMMITTED);
+        }
+    }
+    return out;
+}
+
+# Execute the tool for `task`, via its vtable, as a child of `parent_sc`. Synchronous —
 # see the module note.
 #
 # ⚠ **Every tool call in the tree funnels through here**, which is why the
-# GenAI tool span is recorded at this one site rather than at each caller: the
-# vtable dispatch is the chokepoint, so a tool added later is instrumented
-# without touching it. ADR 017 covers why the port creates spans the oracle
-# does not; ADR 023 why the span is `execute_tool {tool}` and has a parent.
+# GenAI tool span is recorded at this one site rather than at each caller, and why the gate
+# is asked here: the vtable dispatch is the chokepoint, so a tool added later is instrumented
+# and held to its gate without touching it. ADR 017 covers why the port creates spans the
+# oracle does not; ADR 023 why the span is `execute_tool {tool}` and has a parent; ADR 025 what
+# the gate may do.
 #
-# `parent_sc` is the caller's span context, or 0 for a root span. `/mcp`
-# `tools/call` passes the request's inbound `traceparent`; **F1's tool loop**
-# must pass the calling task's `invoke_agent` context, so a tool call nests
-# under the agent that made it.
+# `task` is the task the call serves, or 0. **F1's tool loop** must pass it, and the calling
+# task's `invoke_agent` context as `parent_sc`, so a tool call nests under the agent that made
+# it. `/mcp` `tools/call` has no task, and passes the request's inbound `traceparent`.
 #
-# The agent name and task id are absent because the vtable carries neither — a
-# tool is invoked with an input value and nothing about who asked. Threading
-# that through would change the calling convention for every implementor; the
+# The agent name and task id are absent from the span. A tool is reached from `tools/native`,
+# which sits below `core/task`, so the id cannot be read here; F1 passes both (roadmap B7). The
 # attributes are omitted rather than faked. (They were faked until ADR 023: the
 # span was built with two empty strings, which the encoder emitted.)
-fn agnosai_tool_execute_in(t, input, parent_sc): i64 {
+fn agnosai_tool_execute_for(t, input, task, parent_sc): i64 {
     # ⚠ Built ONLY with the exporter on (ADR 023): with telemetry off a tool
     # call allocates no span and reads no clock.
     var span = 0;
@@ -425,7 +588,7 @@ fn agnosai_tool_execute_in(t, input, parent_sc): i64 {
         self_sc = agnosai_telemetry_span_ctx(parent_sc);
         t0 = clock_epoch_ns();
     }
-    var out = callptr(load64(t + AGN_TOOL_EXECUTE_FP), load64(t + AGN_TOOL_CTX), input);
+    var out = _agnosai_tool_run(t, input, task);
     if (span == 0) { return out; }
     # ⚠ A tool may answer 0. `agnosai_tool_output_success` would dereference it,
     # so the null check comes FIRST — instrumenting this site must not turn a
@@ -435,11 +598,22 @@ fn agnosai_tool_execute_in(t, input, parent_sc): i64 {
     if (out == 0) { agnosai_genai_span_set_error_type(span, str_from("no_output")); }
     else {
         ok = agnosai_tool_output_success(out);
-        if (ok != 1) { agnosai_genai_span_set_error_type(span, str_from("tool_error")); }
+        if (ok != 1) {
+            if (agnosai_tool_output_effect(out) == AGNOSAI_TOOL_EFFECT_NONE) {
+                agnosai_genai_span_set_error_type(span, str_from("refused"));
+            } else {
+                agnosai_genai_span_set_error_type(span, str_from("tool_error"));
+            }
+        }
     }
     agnosai_telemetry_record_span_in(span, self_sc, parent_sc, t0, clock_epoch_ns(),
       agnosai_telemetry_status_of(ok));
     return out;
+}
+
+# Execute the tool for no task, as a child of `parent_sc`.
+fn agnosai_tool_execute_in(t, input, parent_sc): i64 {
+    return agnosai_tool_execute_for(t, input, 0, parent_sc);
 }
 
 # Execute the tool with no parent span — `agnosai_tool_execute_in(t, input, 0)`.

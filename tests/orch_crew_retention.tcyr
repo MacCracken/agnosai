@@ -1,0 +1,446 @@
+# =========================================================================
+# orch_crew_retention.tcyr — which crews the registry keeps, and for how long (ADR 026).
+#
+# No oracle test block: the oracle's `retain` drops every finished crew at once, and these
+# pin what replaced it, which agnostic's 0.2.2 audit asked for. Through 2.2.3 a consumer that
+# reads by polling lost what it had not reached: 1,300 unpolled crews at 190/s lost 885, and
+# clients polling every crew to its end still lost 7 of 4,000.
+#
+# Apart from `orch_orchestrator.tcyr` because each section walks a registry to its cap, which
+# takes a thousand real runs. They are real on purpose: every crew here goes through
+# `_agnosai_orch_register` and `_agnosai_orch_finish`, so an entry point that forgot to queue
+# a crew would show up as one that can never be evicted.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+# strcase — `prompt_guard`, `cost_planning` and `definitions/assembler` all
+# fold ASCII case; the shared helpers live here (extracted at the third use).
+include "src/strcase.cyr"
+# telemetry — `tools/native` and `orchestrator/crew_runner` record GenAI
+# spans (ADR 017), so every suite that reaches them needs the module that
+# defines the recorder. It depends on nothing in `src/` except `id`.
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/core/agent.cyr"
+include "src/core/crew.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/router.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/output_validation.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/server/prometheus.cyr"
+# `_agnosai_crew_build_profile` scores the crew's sandbox policy, which the
+# oracle does too (`crew_runner.rs:198-214`), so both producers are needed here.
+# `_agnosai_crew_build_request` pools an arena for the per-task context tree
+# (roadmap B2's tail), so this file needs the pool alongside crew_runner.
+include "src/arena_pool.cyr"
+include "src/sandbox/policy.cyr"
+include "src/sandbox/kavach_bridge.cyr"
+include "src/orchestrator/crew_runner.cyr"
+include "src/orchestrator/orchestrator.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_budget(): i64 {
+    return agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT,
+      AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT);
+}
+
+# A crew of one trivial task.
+fn _t_spec(name): i64 {
+    var spec = agnosai_crew_new(str_from(name));
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("do the thing")));
+    agnosai_crew_with_tasks(spec, tasks);
+    return spec;
+}
+
+# Run `n` crews to their end, keeping each id in `ids`.
+fn _t_run_many(o, n, ids): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var spec = _t_spec("retained");
+        agnosai_orchestrator_run_crew(o, spec);
+        if (ids != 0) { vec_push(ids, agnosai_crew_id(spec)); }
+    }
+    return 0;
+}
+
+# How many of `ids[from..to)` the registry still holds.
+fn _t_present(o, ids, from, to): i64 {
+    var n = 0;
+    for (var i = from; i < to; i = i + 1) {
+        if (agnosai_orchestrator_crew(o, vec_get(ids, i)) != 0) { n = n + 1; }
+    }
+    return n;
+}
+
+# Slots the ended queue holds beyond its head: what a long-lived orchestrator keeps.
+fn _t_queued(o): i64 {
+    return vec_len(load64(o + AGN_OR_ENDED)) - load64(o + AGN_OR_ENDED_HEAD);
+}
+
+# Where `id` is in `ids`, by its text, or -1.
+fn _t_index_of(ids, id: Str): i64 {
+    for (var i = 0; i < vec_len(ids); i = i + 1) {
+        if (str_eq(vec_get(ids, i), id) == 1) { return i; }
+    }
+    return 0 - 1;
+}
+
+# A cyclic crew: it registers, and its run fails before any task. It leaves PENDING, no flag.
+fn _t_cyclic(): i64 {
+    var cyc = agnosai_crew_new(str_from("cyclic"));
+    var t1 = agnosai_task_new(str_from("t1"));
+    var t2 = agnosai_task_new(str_from("t2"));
+    agnosai_task_with_dependency(t1, agnosai_task_id(t2));
+    agnosai_task_with_dependency(t2, agnosai_task_id(t1));
+    var tasks = vec_new();
+    vec_push(tasks, t1);
+    vec_push(tasks, t2);
+    agnosai_crew_with_tasks(cyc, tasks);
+    agnosai_crew_with_process(cyc, agnosai_process_dag());
+    return cyc;
+}
+
+# ── the cap and the low-water mark ──────────────────────────────────────────
+fn _t_oldest_first(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    var ids = vec_new();
+    _t_run_many(o, AGNOSAI_MAX_RETAINED_CREWS, ids);
+    assert_eq(agnosai_orchestrator_crew_count(o), 1000, "a thousand finished crews are all kept");
+    assert_eq(_t_present(o, ids, 0, 1000), 1000, "every one of them, by id");
+
+    var spec = _t_spec("the one past the cap");
+    agnosai_orchestrator_run_crew(o, spec);
+    assert_eq(agnosai_orchestrator_crew_count(o), 901,
+      "the next submit evicts down to the low-water mark and registers itself");
+    assert_eq(_t_present(o, ids, 0, 100), 0, "the hundred that ended first are the ones gone");
+    assert_eq(_t_present(o, ids, 100, 1000), 900,
+      "and the nine hundred after them are all there: through 2.2.3 this read 0");
+    assert(agnosai_orchestrator_crew(o, agnosai_crew_id(spec)) != 0, "with the new crew");
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, vec_get(ids, 999))),
+      AGNOSAI_CREW_COMPLETED, "a kept crew still has its state");
+
+    # A steady load holds the registry between the marks, and the queue with it.
+    _t_run_many(o, 2500, 0);
+    var count = agnosai_orchestrator_crew_count(o);
+    assert(count > AGNOSAI_CREWS_LOW_WATER && count <= AGNOSAI_MAX_RETAINED_CREWS,
+      "a steady load holds the registry between the marks");
+    assert(_t_queued(o) <= count, "and the queue holds no more than the registry does");
+    return 0;
+}
+
+# ── the order is when a crew ended, not when it arrived ─────────────────────
+fn _t_order_is_end_time(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    # Submitted first, ended last: the crew a submit-time order would evict at once.
+    var slow = _t_spec("slow");
+    var slow_id = agnosai_crew_id(slow);
+    var runner = _agnosai_orch_register(o, slow);
+    var ids = vec_new();
+    _t_run_many(o, 999, ids);
+    _agnosai_orch_finish_err(o, runner, slow_id, agnosai_crew_name(slow), 0);
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, slow_id)),
+      AGNOSAI_CREW_COMPLETED, "the slow crew has just ended");
+
+    agnosai_orchestrator_run_crew(o, _t_spec("past the cap"));
+    assert(agnosai_orchestrator_crew(o, slow_id) != 0,
+      "a crew that just ended stays, however early it arrived: a reader has had no time");
+    assert_eq(_t_present(o, ids, 0, 100), 0, "and the ones that ended long before it go first");
+    return 0;
+}
+
+# ── what eviction may never take ────────────────────────────────────────────
+fn _t_live_crews_stay(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    var ids = vec_new();
+    for (var i = 0; i < AGNOSAI_MAX_RETAINED_CREWS; i = i + 1) {
+        var spec = _t_spec("live");
+        _agnosai_orch_register(o, spec);
+        vec_push(ids, agnosai_crew_id(spec));
+    }
+    _agnosai_orch_register(o, _t_spec("one more"));
+    assert_eq(agnosai_orchestrator_crew_count(o), 1001,
+      "a registry full of live crews grows past the cap rather than dropping live state");
+    assert_eq(_t_present(o, ids, 0, 1000), 1000, "and every live crew is there");
+
+    # A cancelled crew reads CANCELLED while its work finishes. Through 2.2.3 that made it
+    # evictable mid-run, and its runner's final state then put it back.
+    var c = agnosai_orchestrator_new(_t_budget());
+    var mid = _t_spec("cancelled mid-run");
+    var mid_id = agnosai_crew_id(mid);
+    var runner = _agnosai_orch_register(c, mid);
+    assert_eq(agnosai_orchestrator_cancel_crew(c, mid_id), 0, "a live crew is cancelled");
+    _t_run_many(c, 1000, 0);
+    agnosai_orchestrator_run_crew(c, _t_spec("past the cap"));
+    assert_eq(agnosai_orchestrator_crew_count(c), 902,
+      "the cap is crossed: 900 ended, the new crew, and the one its runner holds");
+    assert(agnosai_orchestrator_crew(c, mid_id) != 0,
+      "the oldest crew here stays while its runner holds it, though it reads CANCELLED");
+    _agnosai_orch_finish_err(c, runner, mid_id, agnosai_crew_name(mid), 0);
+    assert_eq(agnosai_orchestrator_forget_crew(c, mid_id), 0, "once it has stopped it can go");
+    return 0;
+}
+
+# A crew nothing is running must not be immortal for it.
+fn _t_cancelled_unrun_is_evictable(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    var cyc = _t_cyclic();
+    var cyc_id = agnosai_crew_id(cyc);
+    assert_eq(agnosai_orchestrator_run_crew(o, cyc), 0, "a cyclic crew does not run");
+    assert_eq(_t_queued(o), 0, "so it has ended nothing, and nothing is queued");
+    assert_eq(agnosai_orchestrator_cancel_crew(o, cyc_id), 0, "it can still be cancelled");
+    assert_eq(_t_queued(o), 1, "and nothing else will end it, so the cancel queues it");
+    _t_run_many(o, 999, 0);
+    agnosai_orchestrator_run_crew(o, _t_spec("past the cap"));
+    assert_eq(agnosai_orchestrator_crew(o, cyc_id), 0, "as the oldest, it is evicted first");
+    return 0;
+}
+
+# ⚠ The window is over ended crews. Counting the running ones took it away just when it mattered:
+# with 950 crews running and 50 ended unread, the next submit evicted all 50.
+fn _t_window_ignores_running(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    for (var i = 0; i < 950; i = i + 1) { _agnosai_orch_register(o, _t_spec("running")); }
+    var ids = vec_new();
+    _t_run_many(o, 50, ids);
+    assert_eq(agnosai_orchestrator_crew_count(o), 1000, "the registry is at the cap");
+    agnosai_orchestrator_run_crew(o, _t_spec("past the cap"));
+    assert_eq(_t_present(o, ids, 0, 50), 50, "and fifty unread crews are not what pays for it");
+
+    # Ended crews are still capped, however many are running.
+    _t_run_many(o, 1000, 0);
+    var ended = agnosai_orchestrator_crew_count(o) - 950;
+    assert(ended > AGNOSAI_CREWS_LOW_WATER && ended <= AGNOSAI_MAX_RETAINED_CREWS,
+      "the ended crews stay between the marks beside 950 running ones");
+    assert_eq(_t_present(o, ids, 0, 50), 0, "and the oldest of them have gone");
+    return 0;
+}
+
+# A crew whose thread could not start. Nothing will ever run it, so nothing may stay waiting.
+fn _t_abandoned(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    var bus = agnosai_event_bus_new();
+    agnosai_orchestrator_with_events(o, bus);
+    var spec = _t_spec("never started");
+    var id = agnosai_crew_id(spec);
+    _agnosai_orch_register(o, spec);
+    assert(agnosai_orchestrator_forget_crew(o, id) != 0, "a registered crew counts as held");
+    _agnosai_orch_abandon(o, id);
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, id)), AGNOSAI_CREW_PENDING,
+      "an abandoned crew stays PENDING, as submit_crew documents");
+    assert_eq(map_get(load64(o + AGN_OR_CANCEL), id), 0, "with no flag to say a runner holds it");
+    assert_eq(agnosai_event_bus_has(bus, id), 0, "and no channel left open for it");
+    assert_eq(agnosai_orchestrator_forget_crew(o, id), 0, "so a consumer can forget it");
+
+    var c = _t_spec("never started, then cancelled");
+    _agnosai_orch_register(o, c);
+    _agnosai_orch_abandon(o, agnosai_crew_id(c));
+    var before = _t_queued(o);
+    assert_eq(agnosai_orchestrator_cancel_crew(o, agnosai_crew_id(c)), 0, "or cancel it");
+    assert_eq(_t_queued(o), before + 1, "which queues it, so it can be evicted");
+    return 0;
+}
+
+# A cyclic crew cancelled while its run fails: the failure stores no final state, and until 2.2.4
+# nothing queued it. The cancel saw a runner, so it left the queueing to the finish.
+fn _t_cancelled_while_failing(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    var cyc = _t_cyclic();
+    var id = agnosai_crew_id(cyc);
+    var runner = _agnosai_orch_register(o, cyc);
+    agnosai_orchestrator_cancel_crew(o, id);
+    assert_eq(_t_queued(o), 0, "a cancel leaves a held crew to its runner");
+    assert_eq(_agnosai_orch_finish_err(o, runner, id, agnosai_crew_name(cyc), 0), 0,
+      "the run fails with no state");
+    assert_eq(_t_queued(o), 1, "and the crew is queued all the same, CANCELLED and over");
+    _t_run_many(o, 999, 0);
+    agnosai_orchestrator_run_crew(o, _t_spec("past the cap"));
+    assert_eq(agnosai_orchestrator_crew(o, id), 0, "so it can be evicted");
+    return 0;
+}
+
+# ── an id that runs twice ───────────────────────────────────────────────────
+fn _t_reused_id(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    var spec = _t_spec("runs twice");
+    var id = agnosai_crew_id(spec);
+    agnosai_orchestrator_run_crew(o, spec);
+    # The re-run is live, and the oldest slot in the queue carries its id.
+    _agnosai_orch_register(o, spec);
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, id)), AGNOSAI_CREW_PENDING,
+      "the id is registered again");
+    _t_run_many(o, 1000, 0);
+    agnosai_orchestrator_run_crew(o, _t_spec("past the cap"));
+    # ⚠ Eviction has to have fired, or the check below passes for nothing. The cap counts ended
+    # crews, so 999 others beside this live one stop short of it.
+    assert_eq(agnosai_orchestrator_crew_count(o), 902,
+      "the cap is crossed: 900 ended, the new crew, and the re-run");
+    var rerun = agnosai_orchestrator_crew(o, id);
+    assert(rerun != 0, "the first run's slot does not evict the re-run: the queue goes by state");
+    if (rerun != 0) {
+        assert_eq(agnosai_crew_state_status(rerun), AGNOSAI_CREW_PENDING, "which is still live");
+    }
+    return 0;
+}
+
+# ── forget_crew ─────────────────────────────────────────────────────────────
+fn _t_forget(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    var spec = _t_spec("read and forgotten");
+    var id = agnosai_crew_id(spec);
+    var state = agnosai_orchestrator_run_crew(o, spec);
+    assert_eq(agnosai_orchestrator_forget_crew(o, id), 0, "a finished crew is forgotten");
+    assert_eq(agnosai_orchestrator_crew(o, id), 0, "and the registry no longer has it");
+    assert_eq(agnosai_orchestrator_crew_count(o), 0, "nor counts it");
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED,
+      "a state the caller already holds stays readable");
+
+    var again = agnosai_orchestrator_forget_crew(o, id);
+    assert(again != 0, "forgetting it twice is an error");
+    assert_eq(agnosai_error_kind(again), AGNOSAI_ERR_CREW_NOT_FOUND, "the crew is not found");
+    assert_eq(agnosai_error_kind(agnosai_orchestrator_forget_crew(o, agnosai_uuid_v4_str())),
+      AGNOSAI_ERR_CREW_NOT_FOUND, "as for an id never registered");
+
+    var live = _t_spec("still running");
+    var live_id = agnosai_crew_id(live);
+    var runner = _agnosai_orch_register(o, live);
+    var refused = agnosai_orchestrator_forget_crew(o, live_id);
+    assert(refused != 0, "a running crew is not forgotten");
+    assert(agnosai_error_kind(refused) != AGNOSAI_ERR_CREW_NOT_FOUND,
+      "and says it is running, not that it is unknown");
+    assert(agnosai_orchestrator_crew(o, live_id) != 0, "it stays");
+
+    # ⚠ The status alone would pass this crew: it reads CANCELLED, and its runner is still
+    # going. Forgotten now, its final state would bring it back with nobody to forget it.
+    agnosai_orchestrator_cancel_crew(o, live_id);
+    assert(agnosai_orchestrator_forget_crew(o, live_id) != 0,
+      "a cancelled crew whose runner has not stopped is not forgotten either");
+    _agnosai_orch_finish_err(o, runner, live_id, agnosai_crew_name(live), 0);
+    assert_eq(agnosai_orchestrator_forget_crew(o, live_id), 0, "and is, once it has");
+    assert_eq(agnosai_orchestrator_crew(o, live_id), 0, "for good");
+
+    var cyc = _t_cyclic();
+    agnosai_orchestrator_run_crew(o, cyc);
+    assert_eq(agnosai_orchestrator_forget_crew(o, agnosai_crew_id(cyc)), 0,
+      "a crew left PENDING with no runner can be forgotten, or nothing could ever remove it");
+
+    # ⚠ The reason compaction exists. A consumer that forgets every crew never reaches the
+    # cap, so eviction never pops the queue: without compaction this reads 5,000.
+    var q = agnosai_orchestrator_new(_t_budget());
+    for (var i = 0; i < 5000; i = i + 1) {
+        var s = _t_spec("forgotten at once");
+        agnosai_orchestrator_run_crew(q, s);
+        agnosai_orchestrator_forget_crew(q, agnosai_crew_id(s));
+    }
+    assert_eq(agnosai_orchestrator_crew_count(q), 0, "a consumer that forgets keeps it empty");
+    assert(vec_len(load64(q + AGN_OR_ENDED)) <= 65,
+      "and the queue stays bounded, not one slot per crew ever run");
+
+    # Compaction keeps what is still registered, in order.
+    var k = agnosai_orchestrator_new(_t_budget());
+    var kept = vec_new();
+    _t_run_many(k, 80, kept);
+    for (var f = 0; f < 80; f = f + 2) {
+        agnosai_orchestrator_forget_crew(k, vec_get(kept, f));
+    }
+    assert_eq(agnosai_orchestrator_crew_count(k), 40, "half of eighty are forgotten");
+    _agnosai_orch_compact_ended_locked(k);
+    var kept_in_order = 1;
+    var ended = load64(k + AGN_OR_ENDED);
+    var live_slots = 0;
+    var last = 0 - 1;
+    for (var w = load64(k + AGN_OR_ENDED_HEAD); w < vec_len(ended); w = w + 1) {
+        var st = vec_get(ended, w);
+        if (_agnosai_orch_is_current_locked(k, st) == 1) {
+            live_slots = live_slots + 1;
+            var at = _t_index_of(kept, agnosai_crew_state_crew_id(st));
+            if (at <= last) { kept_in_order = 0; }
+            last = at;
+        }
+    }
+    assert_eq(live_slots, 40, "every live crew keeps its slot");
+    assert_eq(kept_in_order, 1, "in the order they ended");
+    return 0;
+}
+
+# ── a consumer that polls, on real threads ──────────────────────────────────
+#
+# What agnostic reported as 7 of 4,000: submit in bursts, read each crew when it ends, forget
+# it. Every crew read must be a real one, so a miss here is a crew lost.
+fn _t_polling_consumer(): i64 {
+    var o = agnosai_orchestrator_new(_t_budget());
+    var read = 0;
+    var lost = 0;
+    for (var round = 0; round < 40; round = round + 1) {
+        var ids = vec_new();
+        for (var i = 0; i < 50; i = i + 1) {
+            var spec = _t_spec("polled");
+            agnosai_orchestrator_submit_crew(o, spec);
+            vec_push(ids, agnosai_crew_id(spec));
+        }
+        var left = 50;
+        var tries = 0;
+        while (left > 0 && tries < 5000) {
+            tries = tries + 1;
+            for (var j = 0; j < vec_len(ids); j = j + 1) {
+                var id = vec_get(ids, j);
+                if (id != 0) {
+                    var st = agnosai_orchestrator_crew(o, id);
+                    if (st == 0) {
+                        lost = lost + 1;
+                        vec_set(ids, j, 0);
+                        left = left - 1;
+                    } elif (agnosai_orchestrator_forget_crew(o, id) == 0) {
+                        read = read + 1;
+                        vec_set(ids, j, 0);
+                        left = left - 1;
+                    }
+                }
+            }
+            if (left > 0) { sleep_ms(1); }
+        }
+    }
+    assert_eq(lost, 0, "a consumer that reads and forgets loses no crew");
+    assert_eq(read, 2000, "and reads all two thousand");
+    assert_eq(agnosai_orchestrator_crew_count(o), 0, "leaving the registry empty");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_group("orch_crew_retention");
+
+    assert_eq(AGNOSAI_MAX_RETAINED_CREWS, 1000, "the cap is the oracle's 1000");
+    assert_eq(AGNOSAI_CREWS_LOW_WATER, 900, "and eviction stops at 900");
+
+    _t_oldest_first();
+    _t_order_is_end_time();
+    _t_live_crews_stay();
+    _t_cancelled_unrun_is_evictable();
+    _t_window_ignores_running();
+    _t_abandoned();
+    _t_cancelled_while_failing();
+    _t_reused_id();
+    _t_forget();
+    _t_polling_consumer();
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -324,11 +324,28 @@ fn _agnosai_last_label_numeric(host: Str): i64 {
     return 1;
 }
 
+# `host` without its trailing dots, which name the root of the DNS tree. `foo.internal.` is
+# `foo.internal` to a resolver, so a list of names has to be compared without them, and all of
+# them go, as nothing here should depend on how many dots a resolver will put up with.
+fn _agnosai_host_sans_root(host: Str): i64 {
+    var end = str_len(host);
+    var d = str_data(host);
+    while (end > 0) {
+        if (load8(d + end - 1) != 46) { break; }
+        end = end - 1;
+    }
+    if (end == str_len(host)) { return host; }
+    return str_sub(host, 0, end);
+}
+
 # Whether a host is blocked by name: localhost, the loopback literals, or a
 # `.local` / `.internal` / `.localhost` suffix. Case-insensitive, as the
 # oracle's `to_ascii_lowercase` makes it.
+#
+# ⚠ Root dots first (2.2.4). These are exact and suffix comparisons, so `localhost.` and
+# `foo.internal.` used to fall off the list and pass as public names.
 fn _agnosai_is_blocked_hostname(host: Str): i64 {
-    var lower = _agnosai_to_ascii_lower(host);
+    var lower = _agnosai_host_sans_root(_agnosai_to_ascii_lower(host));
     if (str_eq_cstr(lower, "localhost") == 1) { return 1; }
     if (str_eq_cstr(lower, "127.0.0.1") == 1) { return 1; }
     if (str_eq_cstr(lower, "::1") == 1) { return 1; }
@@ -337,6 +354,22 @@ fn _agnosai_is_blocked_hostname(host: Str): i64 {
     if (str_ends_with(lower, str_from(".internal")) == 1) { return 1; }
     if (str_ends_with(lower, str_from(".localhost")) == 1) { return 1; }
     return 0;
+}
+
+# The address sandhi would dial for `host`, packed as `agnosai_is_private_ipv4` reads it, or
+# AGNOSAI_NOT_AN_IP when sandhi would not read it as an address.
+#
+# ⚠ **A security check has to read a host the way the connection will (2.2.4).** The WHATWG
+# parser below reads a leading zero as octal, as a browser does, and sandhi reads it as decimal.
+# So `0127.0.0.1` passed as the public 87.0.0.1 and sandhi connected to loopback, and
+# `169.0254.169.254` reached the metadata endpoint. Asking sandhi's own parser means the two
+# cannot differ. The WHATWG reading stays, as a host may yet be read that way by whatever a
+# redirect or a proxy hands it to, and a host must pass under both.
+fn _agnosai_dialed_ipv4(host: Str): i64 {
+    var net = sandhi_net_parse_ipv4(str_cstr(host));
+    if (net == 0 - 1) { return AGNOSAI_NOT_AN_IP; }
+    return ((net & 255) << 24) | (((net >> 8) & 255) << 16) | (((net >> 16) & 255) << 8)
+    | ((net >> 24) & 255);
 }
 
 # Whether a host string resolves to a private, loopback, link-local, metadata
@@ -351,6 +384,10 @@ fn agnosai_is_private_host(host: Str): i64 {
     }
 
     if (_agnosai_last_label_numeric(host) == 1) {
+        var dialed = _agnosai_dialed_ipv4(host);
+        if (dialed != AGNOSAI_NOT_AN_IP) {
+            if (agnosai_is_private_ipv4(dialed) == 1) { return 1; }
+        }
         var addr = _agnosai_parse_ipv4_whatwg(host);
         # Fail closed: a host that must be an address literal but will not
         # parse as one is rejected rather than treated as a name.
@@ -360,6 +397,87 @@ fn agnosai_is_private_host(host: Str): i64 {
     return 0;
 }
 
+# The host a URL would connect to, as sandhi parses it, or 0 when it has none.
+#
+# sandhi's parser refuses any scheme but http/https, a URL holding CR/LF/TAB/SPACE, and a
+# malformed authority, and it has no userinfo form: `http://a@b/` has the host `a@b`, which is
+# nothing a declared host can equal. A gate compares this, and never a prefix of the URL's
+# text, since `http://staging.example@evil.test/` starts with what it is pretending to be.
+fn agnosai_url_host(url: Str): i64 {
+    if (url == 0) { return 0; }
+    if (str_len(url) == 0) { return 0; }
+    var parsed = sandhi_url_parse(str_cstr(url));
+    if (parsed == 0) { return 0; }
+    var host_cstr = sandhi_url_host(parsed);
+    if (host_cstr == 0) { return 0; }
+    var host = str_from(host_cstr);
+    if (str_len(host) == 0) { return 0; }
+    return host;
+}
+
+# Whether two URLs name the same host, case-insensitively. Ports and schemes are not compared:
+# a declared `http://staging/` redirecting to `https://staging/` has stayed on its host. A URL
+# with no host matches nothing, not even another such URL.
+fn agnosai_url_same_host(a: Str, b: Str): i64 {
+    var ha = agnosai_url_host(a);
+    var hb = agnosai_url_host(b);
+    if (ha == 0 || hb == 0) { return 0; }
+    return str_eq(_agnosai_to_ascii_lower(ha), _agnosai_to_ascii_lower(hb));
+}
+
+# Whether a host is a cloud metadata endpoint: all of 169.254/16 under either reading of an
+# address, EC2's `fd00:ec2::254`, or GCP's two names. A host that must be an address literal and
+# will not parse as one counts, since nothing can say it is not. Names are not resolved, so a
+# name of someone else's that resolves to one is not caught here, as with `agnosai_is_safe_url`.
+fn agnosai_is_metadata_host(host: Str): i64 {
+    var lower = _agnosai_host_sans_root(_agnosai_to_ascii_lower(host));
+    if (str_eq_cstr(lower, "metadata.google.internal") == 1) { return 1; }
+    if (str_eq_cstr(lower, "metadata.goog") == 1) { return 1; }
+
+    var segs: i64[8];
+    if (_agnosai_parse_ipv6(host, &segs) == 1) {
+        var low_zero = 1;
+        for (var i = 0; i < 5; i = i + 1) {
+            if (load64(&segs + i * 8) != 0) { low_zero = 0; }
+        }
+        # ::ffff:a.b.c.d carries the IPv4 it maps.
+        if (low_zero == 1 && load64(&segs + 40) == 65535) {
+            if (load64(&segs + 48) == 43518) { return 1; }
+        }
+        # fd00:ec2::254
+        if (load64(&segs) == 64768 && load64(&segs + 8) == 3778) {
+            var middle_zero = 1;
+            for (var j = 2; j < 7; j = j + 1) {
+                if (load64(&segs + j * 8) != 0) { middle_zero = 0; }
+            }
+            if (middle_zero == 1 && load64(&segs + 56) == 596) { return 1; }
+        }
+        return 0;
+    }
+
+    if (_agnosai_last_label_numeric(host) == 1) {
+        var dialed = _agnosai_dialed_ipv4(host);
+        if (dialed != AGNOSAI_NOT_AN_IP) {
+            if (((dialed >> 16) & 65535) == 43518) { return 1; }
+        }
+        var addr = _agnosai_parse_ipv4_whatwg(host);
+        if (addr == AGNOSAI_NOT_AN_IP) { return 1; }
+        if (((addr >> 16) & 65535) == 43518) { return 1; }
+    }
+    return 0;
+}
+
+# Whether a URL a gate has admitted may be fetched (ADR 025). An admission gets a declared
+# host past `agnosai_is_safe_url`, and this is the floor under it: the URL must have a host
+# sandhi can reach over http or https, and the host cannot be a metadata endpoint. No QA target
+# lives there, and a model that talks a gate into one is reading the host's cloud credentials.
+fn agnosai_url_is_admissible(url: Str): i64 {
+    var host = agnosai_url_host(url);
+    if (host == 0) { return 0; }
+    if (agnosai_is_metadata_host(host) == 1) { return 0; }
+    return 1;
+}
+
 # Whether a URL is safe for an outbound HTTP request.
 #
 # Rejects non-HTTP(S) schemes, a missing host, the blocked hostnames, and any
@@ -367,19 +485,8 @@ fn agnosai_is_private_host(host: Str): i64 {
 # unspecified address — including the octal, hex and short-form spellings of
 # those addresses.
 fn agnosai_is_safe_url(url: Str): i64 {
-    if (url == 0) { return 0; }
-    if (str_len(url) == 0) { return 0; }
-
-    # sandhi_url_parse returns 0 for any scheme but http/https, for a URL
-    # containing CR/LF/TAB/SPACE, and for a malformed authority.
-    var parsed = sandhi_url_parse(str_cstr(url));
-    if (parsed == 0) { return 0; }
-
-    var host_cstr = sandhi_url_host(parsed);
-    if (host_cstr == 0) { return 0; }
-    var host = str_from(host_cstr);
-    if (str_len(host) == 0) { return 0; }
-
+    var host = agnosai_url_host(url);
+    if (host == 0) { return 0; }
     if (_agnosai_is_blocked_hostname(host) == 1) { return 0; }
     if (agnosai_is_private_host(host) == 1) { return 0; }
     return 1;

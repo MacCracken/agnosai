@@ -2,9 +2,27 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-05 (the 2.2.3 release gate).
+> Last refreshed: 2026-11-06 (the 2.2.4 release gate).
 
-## Now — 2.2.3
+## Now — 2.2.4
+
+| | |
+|---|---|
+| **version** | **2.2.4** (cut 2026-11-06, the bump script's UTC date; 2026-11-05 Pacific): agnostic's four reports repaired, with `docs/development/issues/` now holding them under `archive/`. Crew retention is oldest-first with `agnosai_orchestrator_forget_crew` (ADR 026); a consumer's tool gate, target admission, redirect check and call record (ADR 025); three example presets (ADR 027); a transport error that no longer names the gateway. An independent review of that work found an SSRF bypass older than it, and building it turned up a second, both fixed here: a leading zero got a private address past `agnosai_is_safe_url`, and a trailing dot took a name off its blocked list |
+| **cyrius pin** | **6.7.18**, unchanged: still the latest tag |
+| **tests** | **101 suites, 8,912 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1 present. 2.2.3's tree reads 8,748 in the same shell (its recorded 8,746 was a different environment: `sandbox_spawn` and `sandbox_process` count per environment variable). The +164 is the new `tools_gate` 130 and `orch_crew_retention` 66, `server_ssrf` +37, `llm_hoosh` +18 and `server_routes_mcp` +3, less 90 from `definitions_loader_presets` as the set went from eighteen to three. `sandbox_spawn` fails one assertion in a tree under `/tmp`, as it asserts a spawned `pwd` holds no `/tmp` |
+| **coverage** | **99%**: 103/103 files, 1,660/1,672 fns (gate `--min 80`), the same 12 unreferenced. Every new public name is named by a test |
+| **dist** | `dist/agnosai.cyr` 40,386 lines + `dist/agnosai-guard.cyr` 949, both v2.2.4. Sidecars **6 / 1** leaves, unchanged. `src/tool_call.cyr` joins `[lib]` after `src/tools/registry.cyr` |
+| **binary** | `build/agnosai` **2,908,008 B** (2.2.3: 2,897,776; bote adds what DCE cannot drop). aarch64 **6,897,048 B** (6,632,872), which is not compacted. The native binary answers `/ready` with `"version":"2.2.4"`, lists three presets, refuses `http://0127.0.0.1:<port>/` and `http://169.0254.169.254/` on `/mcp`, and exits cleanly on SIGTERM. A crew against a dead gateway answers `LLM error: hoosh transport error: CONNECT`, with the URL on a WARN line only. A `HOOSH_URL` with userinfo logs `(withheld)` at start-up |
+| **lock** | `cyrius.lock` **119 files, 8 commit pins**. One pin moved: bote 3.8.15 at `1503109d`, matching its tag on GitHub. ⚠ `cyrius deps` keeps a pin the manifest has moved past, and says so in a note, so a dep bump needs the lock deleted first |
+| **gates** | `check-symbols.sh` 2,818 definitions across 114 files; `check-clean.sh` fmt 227, lint 227, doc 115, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist. Then build, tests under DCE, coverage, `distlib --all --check`, examples, fuzz 4/4, `cyrius bench`. CI replica: CHANGELOG 2.2.4 *Verified* |
+| **benchmarks** | `bench-history.csv` has 229 rows at 2.2.4, one sweep at a load of 1.9–2.1: median −1.0% against 2.2.3's rows, which ran at 3.2–3.4, and 183 of 222 within ±5%. The interleaved A/B against a 2.2.3 build, three rounds of all eleven files, reads **median −0.0%**, 208 of 222 within ±5%. The rows outside it are placement or B27, and two are real: `is_safe_url_octal_host` +8.8% and `orchestrator_new` +6.1% (CHANGELOG 2.2.4 *Performance*) |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.1.7, and its roadmap can now take the re-pin: `forget_crew` replaces `_agnostic_crew_retire_a`'s reach, and `_agnostic_scrub_gateway_a` has nothing left to scrub from this path. thoth's guard profile is unchanged. No consumer in the stack reads the fifteen presets that went |
+
+Direct deps: as 2.2.1 below, with `bote` **3.8.15**. Everything else was already on its latest tag.
+
+### 2.2.3 — the release (2026-11-05)
 
 | | |
 |---|---|

@@ -92,10 +92,15 @@ include "src/arena_pool.cyr"
 include "src/telemetry/mod.cyr"
 include "src/core/error.cyr"
 include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
 include "src/llm/retry.cyr"
 include "src/server/ssrf.cyr"
+include "src/server/output_filter.cyr"
 include "src/tools/native.cyr"
 include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
 include "src/tools/builtin/basic.cyr"
 include "src/tools/builtin/load_testing.cyr"
 include "src/tools/agnos.cyr"
@@ -242,6 +247,48 @@ fn _b_is_safe_url(): i64 {
     for (var _r = 0; _r < _BR; _r = _r + 1) {
         bench_batch_start(b);
         for (var i = 0; i < n / _BR; i = i + 1) { agnosai_is_safe_url(url); }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ── the gate (ADR 025) ───────────────────────────────────────────────────────
+fn _b_gate_schema(a, ctx): i64 {
+    return agnosai_tool_schema_new_a(a, str_from_a(a, "b"), str_from_a(a, "b"));
+}
+
+fn _b_gate_exec(ctx, input): i64 { return ctx; }
+fn _b_gate_call(ctx, input): i64 { return 0; }
+fn _b_gate_url(ctx, input, url: Str): i64 { return AGNOSAI_GATE_ADMIT; }
+
+# The chokepoint with no gate: what every tool call pays for the gate existing. A tool that
+# does nothing, so the row is the dispatch itself.
+fn _b_tool_execute(name, gate): i64 {
+    var t = agnosai_tool_with_gate(agnosai_tool_new(str_from("b"), str_from("b"),
+        &_b_gate_schema, &_b_gate_exec, agnosai_tool_output_ok(0)), gate);
+    var input = agnosai_tool_input_new();
+    var n = 2000000;
+    var b = bench_new(name);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_tool_execute(t, input); }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# An admitted URL, the path a declared private host takes: the gate's verdict and the floor.
+fn _b_tool_url_ok_admit(): i64 {
+    var input = agnosai_tool_input_new();
+    store64(input + AGN_INPUT_GATE, agnosai_tool_gate_new(0, &_b_gate_url, 0));
+    var url = str_from("http://10.0.0.5:8443/v1/endpoint?q=1");
+    var n = 200000;
+    var b = bench_new("tool_url_ok_admitted");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_tool_url_ok(input, url); }
         bench_batch_stop(b, n / _BR);
     }
     bench_report(b);
@@ -677,6 +724,10 @@ fn main() {
     _b_tool_execute_echo();
     _b_form_encode();
     _b_segment_ok();
+
+    _b_tool_execute("tool_execute_no_gate", 0);
+    _b_tool_execute("tool_execute_gated", agnosai_tool_gate_new(&_b_gate_call, 0, 0));
+    _b_tool_url_ok_admit();
 
     return 0;
 }

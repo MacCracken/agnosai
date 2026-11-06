@@ -903,6 +903,63 @@ fn agnosai_hoosh_chat_in(base_url: Str, api_key: Str, request, out_response, par
     return rc;
 }
 
+# Which gateway `url`, a C string, names, for a log line, in arena `a`: its scheme, host and port
+# as sandhi parses them, or `(withheld)`. 0 when `a` runs out.
+#
+# ⚠ **Rebuilt from what the parser found, never cut from the URL's text.** Cutting cannot be made
+# safe: sandhi has no userinfo form to ask, so the text gives no reliable place to cut. A password
+# may hold a `/`, `?` or `#`, which end the authority early, and an `@` in a query moves a cut
+# past the query it was meant to drop. So only three parsed fields are ever written, and a URL
+# holding an `@` anywhere is withheld, as is a host holding anything a host name does not. The
+# path goes too, which costs an operator nothing the failure kind and the host do not give.
+fn agnosai_hoosh_log_url_a(a, url): i64 {
+    var n = strlen(url);
+    for (var i = 0; i < n; i = i + 1) {
+        if (load8(url + i) == 64) { return str_from_a(a, "(withheld)"); }
+    }
+    var parsed = sandhi_url_parse_a(a, url);
+    if (parsed == 0) { return str_from_a(a, "(withheld)"); }
+
+    var host = sandhi_url_host(parsed);
+    var hlen = strlen(host);
+    for (var j = 0; j < hlen; j = j + 1) {
+        var c = load8(host + j);
+        var ok = 0;
+        if (c >= 97 && c <= 122) { ok = 1; }
+        if (c >= 65 && c <= 90) { ok = 1; }
+        if (c >= 48 && c <= 57) { ok = 1; }
+        if (c == 45 || c == 46 || c == 58 || c == 95) { ok = 1; }
+        if (ok == 0) { return str_from_a(a, "(withheld)"); }
+    }
+
+    var sb = str_builder_new_a(a);
+    if (sb == 0) { return 0; }
+    if (sandhi_url_scheme(parsed) == SANDHI_URL_HTTPS) {
+        str_builder_add_cstr_a(a, sb, "https://");
+    } else {
+        str_builder_add_cstr_a(a, sb, "http://");
+    }
+    str_builder_add_cstr_a(a, sb, host);
+    str_builder_add_cstr_a(a, sb, ":");
+    str_builder_add_int_a(a, sb, sandhi_url_port(parsed));
+    return str_builder_build_a(a, sb);
+}
+
+# Log a failed exchange with the gateway: the kind, and which gateway as
+# `agnosai_hoosh_log_url_a` gives it. In arena `a`, which the caller resets.
+fn _agnosai_hoosh_log_transport_a(a, url, kind): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    var shown = agnosai_hoosh_log_url_a(a, url);
+    var sb = str_builder_new_a(a);
+    if (shown == 0 || sb == 0) { return 0; }
+    str_builder_add_cstr_a(a, sb, "hoosh transport error: ");
+    str_builder_add_cstr_a(a, sb, sandhi_err_kind_name(kind));
+    var msg = str_builder_build_a(a, sb);
+    if (msg == 0) { return 0; }
+    sakshi_log_kv(SK_WARN, str_data(msg), str_len(msg), "url", 3, str_data(shown), str_len(shown));
+    return 0;
+}
+
 # The body of `agnosai_hoosh_chat_in`, in arena `a`. ⚠ **Nothing it returns may
 # point into `a`**: the caller resets it. Error strings are built on the global
 # bump (the caller keeps them), and the response's strings are copies.
@@ -925,12 +982,14 @@ fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
     }
     var kind = sandhi_http_err_kind(r);
     if (kind != SANDHI_OK) {
+        # ⚠ **The kind, and never the URL (2.2.4).** This text becomes a task's `output` and
+        # `error`, so a consumer's API serves it to any reader and stores it for good. It
+        # named the gateway's URL through 2.2.3, password included for a URL with userinfo.
+        # The log line says which gateway instead, and that line is the operator's.
+        _agnosai_hoosh_log_transport_a(a, url, kind);
         var sb = str_builder_new();
         str_builder_add_cstr(sb, "hoosh transport error: ");
         str_builder_add_cstr(sb, sandhi_err_kind_name(kind));
-        str_builder_add_cstr(sb, " (");
-        str_builder_add_cstr(sb, url);
-        str_builder_add_cstr(sb, ")");
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_kind_error_type(_span, kind));
         return str_builder_build(sb);

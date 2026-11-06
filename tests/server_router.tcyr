@@ -361,18 +361,18 @@ fn _t_dispatch(): i64 {
     assert(bayan_json_v_arr_len(agnosai_route_body(tools)) == 1,
       "/api/v1/tools returns the registered tool");
 
-    # Eighteen, not the empty array this asserted while the handler was a stub:
+    # Three, not the empty array this asserted while the handler was a stub:
     # the port ships the `definitions` feature the oracle cfg-gates off by
     # default. The contents are `tests/server_routes_definitions.tcyr`'s job;
     # what matters here is that the dispatch reaches the populated handler.
     var presets = _t_go(s, AGNOSAI_METHOD_GET, "/api/v1/presets");
-    assert(bayan_json_v_arr_len(agnosai_route_body(presets)) == 18,
+    assert(bayan_json_v_arr_len(agnosai_route_body(presets)) == 3,
       "/api/v1/presets dispatches to the built-in presets");
 
     # ⚠ **The arena arm, which was MISSING for this id until 2026-08-11.**
     # `agnosai_route_list_presets_a` had existed since M10, and this was the only
     # id in the dispatch ladder with an `_a` form that went unwired — so every
-    # `GET /api/v1/presets` parsed all 18 preset documents onto the no-free
+    # `GET /api/v1/presets` parsed every preset document onto the no-free
     # global bump instead of the per-request arena, and never reclaimed them.
     # `benches/definitions.bcyr` prices that parse at ~744us per request.
     #
@@ -389,7 +389,7 @@ fn _t_dispatch(): i64 {
     # bounded at the type level, so any fixed capacity is a guess.
     var arena = arena_allocator_growable(65536);
     # ⚠ **Assert the ARENA GREW, not that the body is right.** Both arms return
-    # the same 18 presets and the same 200 — `agnosai_route_list_presets()` is
+    # the same presets and the same 200 — `agnosai_route_list_presets()` is
     # just `_a(default_alloc())` — so a body assertion passes whether or not the
     # wire exists. The first version of this test did exactly that and still
     # passed with the fix reverted, which is worth stating because it is the
@@ -408,11 +408,11 @@ fn _t_dispatch(): i64 {
     var before = arena_used(allocator_state(arena));
     var presets_a = agnosai_route_dispatch_a(arena, s, AGNOSAI_METHOD_GET,
       str_from("/api/v1/presets"), str_from(""), 0, str_from(""));
-    assert(bayan_json_v_arr_len(agnosai_route_body(presets_a)) == 18,
-      "the ARENA arm reaches the same 18 presets");
+    assert(bayan_json_v_arr_len(agnosai_route_body(presets_a)) == 3,
+      "the ARENA arm reaches the same 3 presets");
     assert(agnosai_route_status(presets_a) == HTTP_OK, "answering 200 either way");
     assert(arena_used(allocator_state(arena)) - before > 8192,
-      "and the 18 documents were parsed INTO the arena — under 8 KiB here means the \
+      "and the preset documents were parsed INTO the arena — under 8 KiB here means the \
     dispatch fell through to the global-allocator arm and the per-request arena was \
     bypassed, which is what shipped from M10 until 2026-08-11");
 

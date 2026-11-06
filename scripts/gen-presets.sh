@@ -13,11 +13,11 @@
 # `--check` mode is what keeps that copy honest: edit a preset and forget to
 # regenerate, and CI says so instead of shipping the stale bytes.
 #
-# ⚠ THE ORDER IS NOT THE GLOB ORDER. `builtin_presets()` returns a `Vec` and its
-# eighteen `include_str!`s go domain by domain, lean → standard → large. Sorted
-# alphabetically the list starts `data-engineering-large`, which is neither the
-# right domain nor the right size tier. The order lives in PRESETS below and is
-# asserted by tests/definitions_loader_presets.tcyr.
+# ⚠ THE ORDER IS NOT THE GLOB ORDER. It lives in PRESETS below, lean → standard → large, and is
+# asserted by tests/definitions_loader_presets.tcyr. Sorted alphabetically the list starts
+# `security-large`, the largest team, where a reader of an example wants the smallest first.
+#
+# Three examples, not a library (2.2.4, ADR 027): agnostic's presets are canonical.
 #
 # Filed as an ergonomics gap upstream:
 # cyrius/docs/development/proposals/2026-08-10-embed-data-files-as-source-strings.md
@@ -31,16 +31,9 @@ MODE="${1:-generate}"
 gen=$(python3 - <<'PY'
 import json, os, sys
 
-# rust-old/src/definitions/loader.rs, builtin_presets(), in its order.
+# The example library (ADR 027): one domain at each size. `security` is the one domain whose
+# names agnostic's canonical library does not use, so a name means one thing across the two.
 PRESETS = [
-    ("Quality", ["quality-lean", "quality-standard", "quality-large"]),
-    ("Software Engineering", ["software-engineering-lean",
-                              "software-engineering-standard",
-                              "software-engineering-large"]),
-    ("DevOps", ["devops-lean", "devops-standard", "devops-large"]),
-    ("Data Engineering", ["data-engineering-lean", "data-engineering-standard",
-                          "data-engineering-large"]),
-    ("Design", ["design-lean", "design-standard", "design-large"]),
     ("Security", ["security-lean", "security-standard", "security-large"]),
 ]
 
@@ -120,13 +113,12 @@ L.append("#")
 L.append("# Regenerate with `./scripts/gen-presets.sh`; that script's `--check` mode")
 L.append("# fails when this file has drifted from `src/presets/*.json`.")
 L.append("#")
-L.append("# The oracle embeds these with eighteen `include_str!`s in")
-L.append("# `rust-old/src/definitions/loader.rs`. Cyrius `include` is textual and takes")
-L.append("# a path to source, so the documents are turned into source here instead.")
+L.append("# Three examples of the preset format, one domain at each size (ADR 027). Cyrius")
+L.append("# `include` is textual and takes a path to source, so the documents are turned")
+L.append("# into source here.")
 L.append("#")
-L.append("# ⚠ The ORDER is the oracle's — domain by domain, lean → standard → large —")
-L.append("# and not the alphabetical order of the directory. `builtin_presets()`")
-L.append("# returns a `Vec`, so position is observable.")
+L.append("# ⚠ The ORDER is lean → standard → large, and not the alphabetical order of the")
+L.append("# directory. `agnosai_builtin_presets()` returns a vec, so position is observable.")
 L.append("#")
 L.append("# Each document is whitespace-collapsed to a single logical line. JSON")
 L.append("# whitespace between tokens is insignificant, so the parse is unaffected.")
@@ -155,7 +147,7 @@ L.append("# The `i`th embedded preset document as a NUL-terminated C string, or 
 L.append("# `i` is out of range.")
 L.append("#")
 L.append("# A chain rather than a table because a `var` array of string literals has no")
-L.append("# spelling in Cyrius, and the caller is a one-shot loop over eighteen items.")
+L.append("# spelling in Cyrius, and the caller is a one-shot loop.")
 L.append("fn agnosai_preset_json(i): i64 {")
 for n in range(len(flat)):
     L.append("    if (i == %d) { return _AGNOSAI_PRESET_JSON_%02d; }" % (n, n))

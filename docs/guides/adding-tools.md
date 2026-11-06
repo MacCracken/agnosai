@@ -89,6 +89,41 @@ mandatory: `sandhi_server_run_pooled` makes every worker a real OS thread, so an
 unguarded write during a concurrent read corrupts the table. Registering the same
 name twice **replaces** rather than duplicating.
 
+## Holding tools to a gate
+
+A consumer can put a gate between the model and its tools, so a call is judged against what its
+task declared rather than only what the model wrote
+([ADR 025](../adr/025-a-tool-call-passes-a-consumers-gate.md)). No tool has to implement it: a gate
+is read from the tool at the chokepoint every call passes through.
+
+```cyrius
+# Refuse a call before it runs: answer the reason, or 0 to let it through.
+fn my_gate_call(ctx, input): i64 {
+    var task = agnosai_tool_input_task(input);  # 0 for a call no task made
+    if (my_rule_allows(task, input) == 1) { return 0; }
+    return str_from("not what the task declared");
+}
+
+# Judge a target and every redirect hop. Compare hosts, never URL prefixes.
+fn my_gate_url(ctx, input, url: Str): i64 {
+    if (agnosai_url_same_host(url, my_declared_url(input)) == 1) { return AGNOSAI_GATE_ADMIT; }
+    return AGNOSAI_GATE_REFUSE;
+}
+
+agnosai_tool_registry_set_gate(registry, agnosai_tool_gate_new(&my_gate_call, &my_gate_url, 0));
+```
+
+`AGNOSAI_GATE_ADMIT` gets a declared host past `agnosai_is_safe_url`, private networks included,
+`AGNOSAI_GATE_REFUSE` stops any URL, and `AGNOSAI_GATE_PASS` leaves it to that guard. Any other value
+refuses, and no admission reaches a cloud metadata endpoint.
+
+A tool that fetches a URL itself should return what `agnosai_tool_target_refused(input, url)` gives
+it, if that is not 0, before it does, and take its redirects through `agnosai_guarded_fetch_hops`
+with `&agnosai_tool_url_ok`, as `security_audit` does.
+
+`agnosai_task_result_record_tool_call(result, tool, out)` keeps a call's name, result and effect on
+its task result, under `metadata.tool_calls`, so a consumer can label a measured number as measured.
+
 ## Naming rules
 
 - **Prefix every public symbol `agnosai_*`.** Cyrius has ONE flat namespace and

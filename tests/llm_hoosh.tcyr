@@ -314,6 +314,49 @@ fn main() {
     var g_per = (alloc_used() - g_before) / 20;
     assert(g_per < 1024, "a chat call leaves under 1 KiB on the global bump (sandhi's connect path and the error Str)");
 
+    # --- a transport error says what failed, and not where (2.2.4) ---
+    # This text becomes a task's `output`, which a consumer serves and stores. Through 2.2.3 it
+    # ended ` (<url>)`, password included when the URL held one.
+    var terr = agnosai_hoosh_chat_in(str_from("http://127.0.0.1:1"), str_from("k"), greq, &gout, 0);
+    _t_assert_str(terr, "hoosh transport error: CONNECT",
+      "a transport error names its kind and nothing else");
+    assert_eq(str_contains_cstr(terr, "127.0.0.1"), 0, "so not the gateway's host");
+    var uerr = agnosai_hoosh_chat_in(str_from("http://root:hunter2@127.0.0.1:1"), str_from("k"),
+      greq, &gout, 0);
+    assert(str_starts_with(uerr, str_from("hoosh transport error: ")),
+      "a URL with userinfo fails as a transport error too");
+    assert_eq(str_contains_cstr(uerr, "hunter2"), 0, "and its password is not in the text");
+    assert_eq(str_contains_cstr(uerr, "root"), 0, "nor is its user name");
+
+    # What the log line keeps of a URL: which gateway, and nothing a credential could be in.
+    var la = arena_allocator(4096);
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "http://gw:8088/v1/chat/completions"),
+      "http://gw:8088", "a log line says which gateway");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "https://gw/v1"), "https://gw:443",
+      "with the port it dials");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "https://u:hunter2@gw:8088/v1"), "(withheld)",
+      "a URL with userinfo is not logged");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "https://secret@gw/v1"), "(withheld)",
+      "nor with a user name alone");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "https://u:hun/ter2@gw/v1"), "(withheld)",
+      "a password holding a slash cannot end the authority early");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "https://u:hun?ter#2@gw/v1"), "(withheld)",
+      "nor can one holding a query or a fragment mark");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "https://u:123@gw/v1"), "(withheld)",
+      "nor one of digits, which reads as a port");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "http://gw/v1?key=hunter2"), "http://gw:80",
+      "a query is not logged");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "http://gw/v1#hunter2"), "http://gw:80",
+      "and neither is a fragment");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "http://gw#hunter2"), "(withheld)",
+      "nor one the parser leaves in the host");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "http://gw/v1?user=me@corp.com&api_key=hunter2"),
+      "(withheld)", "an @ in a query does not move the cut past the query");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "u:hunter2@gw:80/x?u=http://y"), "(withheld)",
+      "nor does a :// in a query make a URL with no scheme look like one");
+    _t_assert_str(agnosai_hoosh_log_url_a(la, "gw:8088/v1"), "(withheld)",
+      "a URL with no scheme is not logged");
+
     # (c) Time. A socket that listens and never accepts: the connect completes in
     # the backlog, the request is sent, no answer comes.
     var lt, lfd = tcp_socket();
