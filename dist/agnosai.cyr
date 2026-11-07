@@ -16238,10 +16238,16 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
 #
 # `arena_pool.cyr`'s rule against a lazy build is about the RACE — two threads
 # both seeing 0 and both building, the loser's arenas leaked. That is closed
-# here by double-checked locking: the pointer is published with `atomic_store`
-# only once the pool is whole, read with `atomic_load`, and built under a mutex
-# that is created at load (one small allocation). A process that never calls a
-# model never builds the pool.
+# here by double-checked locking: the pool is built under a mutex that is created
+# at load (one small allocation), published only once it is whole, and read with
+# `atomic_load`. A process that never calls a model never builds the pool.
+#
+# ⚠ **Publication is a fence and then a store.** `atomic_store` is a plain store,
+# so on aarch64, which ships, the fast path could otherwise see the pointer before
+# the pool's fields and fault on them. The `mutex_unlock` does not help, as it comes
+# after the store. The readers' own loads follow the pointer, so they need no fence
+# of their own, and only the one build pays for this. x86 cannot show this, and no
+# suite here would.
 var _AGNOSAI_HOOSH_ARENA_SLOTS = 32;
 var _AGNOSAI_HOOSH_ARENA_BYTES = 65536;
 var _AGNOSAI_HOOSH_POOL = 0;
@@ -16255,7 +16261,10 @@ fn _agnosai_hoosh_pool(): i64 {
     p = atomic_load(&_AGNOSAI_HOOSH_POOL);
     if (p == 0) {
         p = agnosai_arena_pool_new(_AGNOSAI_HOOSH_ARENA_SLOTS, _AGNOSAI_HOOSH_ARENA_BYTES);
-        if (p != 0) { atomic_store(&_AGNOSAI_HOOSH_POOL, p); }
+        if (p != 0) {
+            atomic_fence();
+            atomic_store(&_AGNOSAI_HOOSH_POOL, p);
+        }
     }
     mutex_unlock(_AGNOSAI_HOOSH_POOL_LOCK);
     return p;
@@ -19267,17 +19276,26 @@ var _agnosai_metrics_singleton = 0;
 
 # The process-wide metrics set, created on first use.
 #
-# **Not thread-safe to *create* concurrently**, and it does not need to be: the
-# server builds its state at startup, before any worker thread exists, and
-# `agnosai_metrics_gather` / the record verbs are called on it afterwards. Call
-# this once during boot to make the initialization explicit rather than relying
-# on whichever request arrives first — the same reason
+# **Not thread-safe to *create* concurrently**, and the server does not need it to
+# be: `agnosai_serve_mount` builds this at startup, before any worker thread
+# exists, and `agnosai_metrics_gather` / the record verbs are called on it
+# afterwards. Call this once during boot to make the initialization explicit
+# rather than relying on whichever request arrives first — the same reason
 # `agnosai_jwt_config_prepare` is a startup call.
+#
+# ⚠ **A library consumer never mounts**, so its first crew builds this on whatever
+# thread that crew runs. Publication is therefore a fence and then a store, as
+# `_agnosai_hoosh_pool`'s banner says why. That closes the order and not the race:
+# two first crews can each build a set, and the counts of the one whose store lost
+# are gone. Calling this at boot closes both.
 fn agnosai_metrics_global(): i64 {
-    if (_agnosai_metrics_singleton == 0) {
-        _agnosai_metrics_singleton = agnosai_metrics_new();
+    var m = atomic_load(&_agnosai_metrics_singleton);
+    if (m == 0) {
+        m = agnosai_metrics_new();
+        atomic_fence();
+        atomic_store(&_agnosai_metrics_singleton, m);
     }
-    return _agnosai_metrics_singleton;
+    return m;
 }
 
 enum AgnosaiMetricsOff {
@@ -21778,14 +21796,26 @@ var _agnosai_kavach_ready = 0;
 # v6.1.23 — before that a re-call mmap'd a fresh 256 MB chunk and abandoned the
 # live one, which would have made lazy initialization here a heap leak per call.
 #
-# The flag is not synchronized. A race between two threads runs `kavach_init`
-# twice, which registers the same function pointers over themselves and
-# recomputes a SHA-256 table; both are idempotent, so the race is benign rather
-# than merely unlikely.
+# There is no lock. A race between two threads runs `kavach_init` twice, which
+# registers the same function pointers over themselves and takes sigil's own
+# once-guard on the SHA-256 table; both are idempotent, so that race is benign
+# rather than merely unlikely.
+#
+# ⚠ **The order is not benign, so the flag has fences on both sides.** `atomic_store`
+# is a plain store, so on aarch64 a thread could see the flag before the backend table
+# behind it and report "backend not available" for a backend that is registered. A
+# flag is not a pointer: the loads after it do not follow it, so a fence before the
+# store is not enough here and the fast path has its own, as `_agnosai_crew_job_wait`
+# does. Every caller is about to start a sandbox, so the fence costs nothing that
+# shows. x86 cannot show this, and no suite here would.
 fn _agnosai_kavach_ensure_init(): i64 {
-    if (_agnosai_kavach_ready == 1) { return 0; }
+    if (atomic_load(&_agnosai_kavach_ready) == 1) {
+        atomic_fence();
+        return 0;
+    }
     kavach_init();
-    _agnosai_kavach_ready = 1;
+    atomic_fence();
+    atomic_store(&_agnosai_kavach_ready, 1);
     return 0;
 }
 
@@ -26023,17 +26053,27 @@ enum AgnosaiWasmToolOff {
 var _agnosai_wasm_tool_sandbox = 0;
 
 # The sandbox WasmTools execute in, defaulting on first use.
+#
+# ⚠ **Publication is a fence and then a store**, as `_agnosai_hoosh_pool`'s banner
+# says why: the first use can be a tool call's worker thread, and a reader that saw
+# the pointer first could read limits of 0. There is no lock. Two threads racing the
+# first use each build a default and the last store stands, which costs 24 bytes.
 fn agnosai_wasm_tool_sandbox(): i64 {
-    if (_agnosai_wasm_tool_sandbox == 0) {
-        _agnosai_wasm_tool_sandbox = agnosai_wasm_sandbox_new();
+    var s = atomic_load(&_agnosai_wasm_tool_sandbox);
+    if (s == 0) {
+        s = agnosai_wasm_sandbox_new();
+        atomic_fence();
+        atomic_store(&_agnosai_wasm_tool_sandbox, s);
     }
-    return _agnosai_wasm_tool_sandbox;
+    return s;
 }
 
 # Replace the sandbox WasmTools execute in — the oracle's `Arc<WasmSandbox>`
-# constructor parameter, hoisted.
+# constructor parameter, hoisted. A fence and then a store, as a reader cannot tell
+# which of the two wrote the pointer it loaded.
 fn agnosai_wasm_tool_set_sandbox(s): i64 {
-    _agnosai_wasm_tool_sandbox = s;
+    atomic_fence();
+    atomic_store(&_agnosai_wasm_tool_sandbox, s);
     return 0;
 }
 
@@ -34123,7 +34163,8 @@ fn agnosai_tool_loop_set_limits(max_steps, max_calls, result_bytes, transcript_b
 # --- the transcript's arena ------------------------------------------------
 #
 # Built on first use, as `_agnosai_hoosh_pool` is and for the same two reasons: a process that
-# runs no tool must not pay for this, and the bump's position moves the benches.
+# runs no tool must not pay for this, and the bump's position moves the benches. Published as that
+# one is, a fence and then a store, and for the reason its banner gives.
 var _AGNOSAI_TOOL_POOL_SLOTS = 8;
 var _AGNOSAI_TOOL_POOL_BYTES = 32768;
 var _AGNOSAI_TOOL_POOL = 0;
@@ -34137,7 +34178,10 @@ fn _agnosai_tool_pool(): i64 {
     p = atomic_load(&_AGNOSAI_TOOL_POOL);
     if (p == 0) {
         p = agnosai_arena_pool_new(_AGNOSAI_TOOL_POOL_SLOTS, _AGNOSAI_TOOL_POOL_BYTES);
-        if (p != 0) { atomic_store(&_AGNOSAI_TOOL_POOL, p); }
+        if (p != 0) {
+            atomic_fence();
+            atomic_store(&_AGNOSAI_TOOL_POOL, p);
+        }
     }
     mutex_unlock(_AGNOSAI_TOOL_POOL_LOCK);
     return p;
@@ -42095,6 +42139,9 @@ fn agnosai_config_holder_new(initial): i64 {
 # An **atomic load**, so a reader on a `run_pooled` worker never blocks and
 # never observes a half-published value: the config is swapped by a single
 # pointer store, so a reader sees either the whole old one or the whole new one.
+# The store alone does not give that on aarch64. The fence in
+# `agnosai_config_holder_update` does, and this load needs none of its own, as a
+# reader's loads follow the pointer.
 fn agnosai_config_holder_get(h): i64 {
     return atomic_load(h + AGN_HOLD_CURRENT);
 }
@@ -42110,7 +42157,13 @@ fn agnosai_config_holder_get(h): i64 {
 # no refcount to decide when the last reader is done. Configs are published on
 # operator action, not per request, so the leak is bounded by reload count
 # rather than by traffic.
+#
+# ⚠ **Publication is a fence and then a store.** `atomic_store` is a plain store,
+# so on aarch64, which ships, a reader could otherwise see the pointer before the
+# new config's fields. Unlike a lazy build this happens with readers running, on
+# every reload. x86 cannot show this, and no suite here would.
 fn agnosai_config_holder_update(h, new_config): i64 {
+    atomic_fence();
     atomic_store(h + AGN_HOLD_CURRENT, new_config);
     return 0;
 }

@@ -44,17 +44,27 @@ enum AgnosaiWasmToolOff {
 var _agnosai_wasm_tool_sandbox = 0;
 
 # The sandbox WasmTools execute in, defaulting on first use.
+#
+# ⚠ **Publication is a fence and then a store**, as `_agnosai_hoosh_pool`'s banner
+# says why: the first use can be a tool call's worker thread, and a reader that saw
+# the pointer first could read limits of 0. There is no lock. Two threads racing the
+# first use each build a default and the last store stands, which costs 24 bytes.
 fn agnosai_wasm_tool_sandbox(): i64 {
-    if (_agnosai_wasm_tool_sandbox == 0) {
-        _agnosai_wasm_tool_sandbox = agnosai_wasm_sandbox_new();
+    var s = atomic_load(&_agnosai_wasm_tool_sandbox);
+    if (s == 0) {
+        s = agnosai_wasm_sandbox_new();
+        atomic_fence();
+        atomic_store(&_agnosai_wasm_tool_sandbox, s);
     }
-    return _agnosai_wasm_tool_sandbox;
+    return s;
 }
 
 # Replace the sandbox WasmTools execute in — the oracle's `Arc<WasmSandbox>`
-# constructor parameter, hoisted.
+# constructor parameter, hoisted. A fence and then a store, as a reader cannot tell
+# which of the two wrote the pointer it loaded.
 fn agnosai_wasm_tool_set_sandbox(s): i64 {
-    _agnosai_wasm_tool_sandbox = s;
+    atomic_fence();
+    atomic_store(&_agnosai_wasm_tool_sandbox, s);
     return 0;
 }
 

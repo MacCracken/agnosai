@@ -72,6 +72,21 @@ it always sent, but for an id the catalog lists with a `provider/` prefix, which
 - **`README.md` and `docs/architecture/overview.md` showed `"llm_model": "capable"`**, which is sent as the word, as hoosh has no
   tier aliases.
 - `docs/guides/adding-providers.md` described an enum nothing in `src/` reads since this release.
+- **A lazy build is published with a fence and then a store.** `atomic_store` is a plain store, so on aarch64, which
+  ships, a thread on an unlocked path could see a pointer before what it points at. The later `mutex_unlock` does not
+  help, as it comes after the store. `_agnosai_hoosh_pool` and `_agnosai_tool_pool`, the tree's only double-checked
+  locks, now fence first. So do the two lazy builds that take no lock: `agnosai_wasm_tool_sandbox`, whose first use can
+  be a tool call's worker, with `agnosai_wasm_tool_set_sandbox`, which writes the same pointer, and
+  `agnosai_metrics_global`, which a library consumer's first crew builds on whatever thread it runs on. Their readers
+  follow the pointer, so they need no fence. `_agnosai_kavach_ensure_init` publishes a flag, and nothing follows a flag,
+  so its fast path has a fence too: without one a thread could report "backend not available" for a backend that is
+  registered. x86 is unaffected. ⚠ **No test here can show this, none was added, and it has not been run on aarch64.**
+  What was checked is the aarch64 build: its disassembly has a `dmb ish` before each store it holds, which is all of
+  them but `agnosai_wasm_tool_set_sandbox`, a consumer's call that the binary does not reach.
+- **`agnosai_config_holder_update` fences before it publishes**, for the same reason. It is not lazy: a reload swaps
+  the pointer with readers running, so `agnosai_config_holder_get`'s promise of the whole old config or the whole new
+  one did not hold on aarch64. Nothing in `src/` calls it, so this reaches a library consumer and not the binary, and
+  the test and aarch64 caveats above apply to it too.
 
 ### Removed
 
@@ -99,6 +114,11 @@ at a load of about 2.3, medians: **−0.6% across 157 rows**, 152 within ±5%.
 - `crew_runner_10_tasks_parallel_4_{quiet,llm_quiet,llm_watched}` read −19% to −29% in both A/B runs. **Not claimed:** this
   release does not touch what those rows spend their time on, and they have swung by as much on placement before (B27).
   `ipc_accept_close_under_load` +5.3% is on a path this does not touch.
+- **The fences cost nothing a row can see**, as each is paid once, by the build, or beside a sandbox starting. Three
+  interleaved rounds of `llm.bcyr` and `orch.bcyr` against a build without them read median 0.0% across 112 rows.
+  `task_one_tool_call`: 29.6 → 30.4 µs. `task_four_tool_calls_at_once`: 240.0 → 243.2 µs. Each range overlaps the other.
+- **`hoosh_pool_fast_path` is new**, as no row reached that function: the crew benches answer through the client's
+  stub. It reads 4 ns on both sides, and 21 ns on a mutant with the fence moved onto the fast path.
 
 ### Tests
 
@@ -138,7 +158,7 @@ at a load of about 2.3, medians: **−0.6% across 157 rows**, 152 within ±5%.
 
 - **Selection cannot see tools.** The catalog has no such bit, and `gpt-6-astra` takes none on Chat Completions, so on an
   OpenAI-only gateway a `complexity: high` agent with tools fails with the provider's 400 until `AGNOSAI_MODEL_PREMIUM` is set.
-  The ask is on the roadmap, with `tier`, `kind`, and the two hoosh bugs this found.
+  hoosh 2.10.2 now publishes `tier`, `kind` and `tools`, so reading them is owed (roadmap), as are its two fixes this found.
 - **A local embedder the twelve words miss.** On a box of local models the first listed is every tier, so a tag like `bge-m3`
   listed first is sent to chat.
 
@@ -190,9 +210,9 @@ used to answer and the name was only words in its prompt. A crew naming `echo`, 
   another project, and "any release" is gone. Rows are cut to what is still open, checked against the tree: B10, B11 and
   B12 lost what had shipped, the 2.2.x re-check narrative left B16, the filed sandhi paragraph left C, and the
   `gen-presets` line left the deletion checklist, as it no longer writes a `rust-old/` comment.
-- **The `rust-old/` deletion is pinned to 2.3.7**, the first release that can meet the condition on it. The roadmap said
-  "at 2.3.0" and scheduled the same porting items for 2.5.x and 2.6.x. B10, B11, B7 (1), the JWT key and `StateStore` move
-  up to 2.3.5 and 2.3.6 to get it there.
+- **The `rust-old/` deletion waits on bhava.** The roadmap said "at 2.3.0, once every Rust porting item is done", and the
+  port is not done while `personality` is missing, so it has no number until B5 lands. What else the Rust line had is
+  pinned: B10 and B11 at 2.3.5, `StateStore` at 2.5.0, the JWT key at 2.6.1 and B7 (1) at 2.6.2.
 - **`docs/development/m7-audit-2026-08-04.md` and `m12-bench-audit-2026-08-10.md` moved to `docs/audit/`.**
 - **`agnosai_tool_execute_for` puts the call's own span context on its input**, and reads the call's id, agent and task
   from it, so an `execute_tool` span names them. A call no loop made, such as `/mcp`'s, has none, and they are omitted.
@@ -284,8 +304,7 @@ The loop itself, with a stub gateway and a tool that does nothing, so a real cal
 
 ### Not in this release
 
-- **`rust-old/` stays.** The condition on deleting it is not met: B7 (1), B10, B11, B15 and the JWT key are open. It is
-  pinned to 2.3.7, and D9 is the user's call before then.
+- **`rust-old/` stays**, until bhava is ported and B5 is done.
 - **B33 is next, at 2.3.1.** A crew whose agent names no model still sends a guessed id, so agnostic's M6 needs it too.
 - **agnostic has to adopt this.** It needs `agnosai_orchestrator_with_tools` at engine init, and a preset that names its
   36 unresolved tools will fail rather than run. No consumer was re-run against this release.

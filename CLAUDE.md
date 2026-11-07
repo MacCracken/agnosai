@@ -13,7 +13,7 @@
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (toolchain pinned in `cyrius.cyml [package].cyrius`)
 - **Version**: `VERSION` at the project root is the source of truth — do not inline the number here
-- **Rust reference**: 27,683 lines preserved at `rust-old/` (v1.1.0) — history only, **not a spec**, and **owed for deletion since the release after 2.1.0**. It is still present: the deletion waits on the user's OK. The 2.1.0 audit found nothing that still depends on it, and the deletion checklist is in `docs/development/roadmap.md`
+- **Rust reference**: 27,683 lines preserved at `rust-old/` (v1.1.0) — history only, **not a spec**, and **owed for deletion since the release after 2.1.0**. It is still present: the deletion waits on the bhava port (B5), as the port is not done without it. The 2.1.0 audit found nothing that still depends on it, and the deletion checklist is in `docs/development/roadmap.md`
 
 ## Consumers
 

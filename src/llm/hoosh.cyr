@@ -1040,10 +1040,16 @@ fn agnosai_hoosh_chat(base_url: Str, api_key: Str, request, out_response): i64 {
 #
 # `arena_pool.cyr`'s rule against a lazy build is about the RACE — two threads
 # both seeing 0 and both building, the loser's arenas leaked. That is closed
-# here by double-checked locking: the pointer is published with `atomic_store`
-# only once the pool is whole, read with `atomic_load`, and built under a mutex
-# that is created at load (one small allocation). A process that never calls a
-# model never builds the pool.
+# here by double-checked locking: the pool is built under a mutex that is created
+# at load (one small allocation), published only once it is whole, and read with
+# `atomic_load`. A process that never calls a model never builds the pool.
+#
+# ⚠ **Publication is a fence and then a store.** `atomic_store` is a plain store,
+# so on aarch64, which ships, the fast path could otherwise see the pointer before
+# the pool's fields and fault on them. The `mutex_unlock` does not help, as it comes
+# after the store. The readers' own loads follow the pointer, so they need no fence
+# of their own, and only the one build pays for this. x86 cannot show this, and no
+# suite here would.
 var _AGNOSAI_HOOSH_ARENA_SLOTS = 32;
 var _AGNOSAI_HOOSH_ARENA_BYTES = 65536;
 var _AGNOSAI_HOOSH_POOL = 0;
@@ -1057,7 +1063,10 @@ fn _agnosai_hoosh_pool(): i64 {
     p = atomic_load(&_AGNOSAI_HOOSH_POOL);
     if (p == 0) {
         p = agnosai_arena_pool_new(_AGNOSAI_HOOSH_ARENA_SLOTS, _AGNOSAI_HOOSH_ARENA_BYTES);
-        if (p != 0) { atomic_store(&_AGNOSAI_HOOSH_POOL, p); }
+        if (p != 0) {
+            atomic_fence();
+            atomic_store(&_AGNOSAI_HOOSH_POOL, p);
+        }
     }
     mutex_unlock(_AGNOSAI_HOOSH_POOL_LOCK);
     return p;

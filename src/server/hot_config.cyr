@@ -157,6 +157,9 @@ fn agnosai_config_holder_new(initial): i64 {
 # An **atomic load**, so a reader on a `run_pooled` worker never blocks and
 # never observes a half-published value: the config is swapped by a single
 # pointer store, so a reader sees either the whole old one or the whole new one.
+# The store alone does not give that on aarch64. The fence in
+# `agnosai_config_holder_update` does, and this load needs none of its own, as a
+# reader's loads follow the pointer.
 fn agnosai_config_holder_get(h): i64 {
     return atomic_load(h + AGN_HOLD_CURRENT);
 }
@@ -172,7 +175,13 @@ fn agnosai_config_holder_get(h): i64 {
 # no refcount to decide when the last reader is done. Configs are published on
 # operator action, not per request, so the leak is bounded by reload count
 # rather than by traffic.
+#
+# ⚠ **Publication is a fence and then a store.** `atomic_store` is a plain store,
+# so on aarch64, which ships, a reader could otherwise see the pointer before the
+# new config's fields. Unlike a lazy build this happens with readers running, on
+# every reload. x86 cannot show this, and no suite here would.
 fn agnosai_config_holder_update(h, new_config): i64 {
+    atomic_fence();
     atomic_store(h + AGN_HOLD_CURRENT, new_config);
     return 0;
 }

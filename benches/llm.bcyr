@@ -344,6 +344,23 @@ fn _b_map_priority(): i64 {
     return 0;
 }
 
+# `_agnosai_hoosh_pool`'s fast path: the one load every chat call pays to reach its arena. No other
+# row reaches this function, as the crew benches answer through the client's stub and a real chat
+# needs a network. The build runs once, before the clock starts, and its fence with it. A fence
+# moved onto this path reads 21 ns here against 4 (x86, measured on a mutant).
+fn _b_hoosh_pool_fast_path(): i64 {
+    _agnosai_hoosh_pool();
+    var n = 5000000;
+    var b = bench_new("hoosh_pool_fast_path");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { _agnosai_hoosh_pool(); }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
 
@@ -369,6 +386,10 @@ fn main(): i64 {
     _b_iq_dequeue_background(2000, "inference_queue_dequeue_background_2k");
     _b_iq_dequeue_background(16000, "inference_queue_dequeue_background_16k");
     _b_map_priority();
+
+    # ⚠ Last, on purpose: this builds a pool of 2 MiB, and a row's position moves the rows after it
+    # (roadmap B20, B27).
+    _b_hoosh_pool_fast_path();
 
     return 0;
 }

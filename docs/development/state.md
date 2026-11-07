@@ -12,7 +12,7 @@
 | **cyrius pin** | **6.7.18**, unchanged: still the latest tag |
 | **tests** | **105 suites, 10,990 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1 present. 2.3.0's tree reads 10,721. The new suites are `llm_model_catalog` 192 and `orch_model_selection` 111, less what moved out of `orch_crew_runner` and `fleet_cost_planning` with the code they pinned |
 | **coverage** | **99%**: 106/106 files, 1,795/1,806 fns (gate `--min 80`), the same 11 unreferenced as 2.3.0. Every new public name is named by a test |
-| **dist** | `dist/agnosai.cyr` 43,808 lines + `dist/agnosai-guard.cyr` 1,014, both v2.3.1. Sidecars **6 / 1** leaves, unchanged. `src/model_catalog.cyr` joins `[lib]` after `src/llm/hoosh.cyr` |
+| **dist** | `dist/agnosai.cyr` 43,861 lines + `dist/agnosai-guard.cyr` 1,014, both v2.3.1. Sidecars **6 / 1** leaves, unchanged. `src/model_catalog.cyr` joins `[lib]` after `src/llm/hoosh.cyr` |
 | **binary** | `build/agnosai` **2,994,840 B** (2.3.0: 2,977,840). aarch64 **6,967,496 B** (6,966,880), not compacted, built and not started |
 | **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins. ⚠ A fresh worktree needs `cyrius lib sync --full` first, as CI does: `cyrius deps` alone leaves `lib/` at 87 files, the lock 26 lines short, and the lib snapshot gate failing on files it was never given |
 | **gates** | `check-symbols.sh` 3,110 definitions across 117 files; `check-clean.sh` fmt 234, lint 234, doc 118, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist. Then build, tests under DCE, coverage, `distlib --all --check`, examples, fuzz 4/4. The `ubuntu:26.04` CI replica was not run |
@@ -27,7 +27,7 @@ Direct deps: as 2.2.5 below.
 
 | | |
 |---|---|
-| **version** | **2.3.0** (cut 2026-11-07, the bump script's UTC date; 2026-11-06 Pacific): the tool-calling harness. An agent is offered the tools it names, and the model calls them until it answers, under ADR 029's four rules. B7 items 8 and 9 hang on it, and `delegate`'s crew joins the caller's trace. The audits moved to `docs/audit/`, and the roadmap is now release pins from 2.3.1 to 2.7.2, with `rust-old/`'s deletion at 2.3.7 |
+| **version** | **2.3.0** (cut 2026-11-07, the bump script's UTC date; 2026-11-06 Pacific): the tool-calling harness. An agent is offered the tools it names, and the model calls them until it answers, under ADR 029's four rules. B7 items 8 and 9 hang on it, and `delegate`'s crew joins the caller's trace. The audits moved to `docs/audit/`, and the roadmap is now release pins from 2.3.1 to 2.7.2, with `rust-old/`'s deletion waiting on bhava (B5) |
 | **cyrius pin** | **6.7.18**, unchanged: still the latest tag |
 | **tests** | **103 suites, 10,721 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1 present. 2.2.5's tree reads 10,281. The +440 is mostly the new `orch_tool_loop` 361, with `llm_hoosh` +40 and the rest in `telemetry_wiring`, `tools_builtin_delegate` and `server_routes_crews`. 74 mutants, all killed. `sandbox_spawn` fails one assertion in a tree under `/tmp`, as it asserts a spawned `pwd` holds no `/tmp` |
 | **coverage** | **99%**: 105/105 files, 1,772/1,783 fns (gate `--min 80`), the same 11 unreferenced as 2.2.5. Every new public name is named by a test. The loop's internals are `_`-prefixed, as only `crew_runner` calls them |

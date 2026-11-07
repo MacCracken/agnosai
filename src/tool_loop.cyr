@@ -79,7 +79,8 @@ fn agnosai_tool_loop_set_limits(max_steps, max_calls, result_bytes, transcript_b
 # --- the transcript's arena ------------------------------------------------
 #
 # Built on first use, as `_agnosai_hoosh_pool` is and for the same two reasons: a process that
-# runs no tool must not pay for this, and the bump's position moves the benches.
+# runs no tool must not pay for this, and the bump's position moves the benches. Published as that
+# one is, a fence and then a store, and for the reason its banner gives.
 var _AGNOSAI_TOOL_POOL_SLOTS = 8;
 var _AGNOSAI_TOOL_POOL_BYTES = 32768;
 var _AGNOSAI_TOOL_POOL = 0;
@@ -93,7 +94,10 @@ fn _agnosai_tool_pool(): i64 {
     p = atomic_load(&_AGNOSAI_TOOL_POOL);
     if (p == 0) {
         p = agnosai_arena_pool_new(_AGNOSAI_TOOL_POOL_SLOTS, _AGNOSAI_TOOL_POOL_BYTES);
-        if (p != 0) { atomic_store(&_AGNOSAI_TOOL_POOL, p); }
+        if (p != 0) {
+            atomic_fence();
+            atomic_store(&_AGNOSAI_TOOL_POOL, p);
+        }
     }
     mutex_unlock(_AGNOSAI_TOOL_POOL_LOCK);
     return p;
