@@ -7,6 +7,165 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.5] — 2026-11-06
+
+agnostic's two reports from 2026-11-06, repaired, and kavach moved to its latest release. A task that declares
+an `output_schema` is now held to it, and a crew built in an arena can be given back whole, so a long-lived
+consumer's memory follows the crews it holds and not the crews it has served. kavach's new release closes two of
+agnosai's own reports, so the 64 KiB cap on WASM input is gone and a guest is held to the Rust line's store limits.
+The rest of the stack was already on its latest tags, cyrius 6.7.18 included.
+
+⚠ **Behaviour changes:** a task whose answers never meet its `output_schema` is `failed`, not `completed`, so
+its crew fails too and a DAG's dependents do not run. The first prompt of a task with a schema is longer. A
+fenced answer that passes is returned as the block, without its fence. `tokens` and `cost_micro_usd` on such a
+task count every call. `agnosai_event_bus_remove` empties the sender's subscriber list. A WASM input over 64 KiB
+runs, where it was refused. A guest declaring more than 10 tables or memories is refused, with an error.
+
+### Added
+
+- **A crew can live in an arena and be given back (ADR 028).** `agnosai_crew_new_in(a, name)` builds a crew in an
+  arena from `agnosai_crew_pool_acquire`, and everything the engine allocates for it comes from there.
+  `agnosai_orchestrator_release_crew(o, spec)` ends it, scrubbed, and gives the arena back to its pool for the
+  next crew. Opt-in, crew by crew: a crew from `agnosai_crew_new` runs on the global heap as it always did, and
+  `agnosai_orchestrator_forget_crew` keeps its contract.
+  - **`src/crew_arena.cyr`:** `agnosai_crew_pool_new`, `_acquire`, `_minted`; `agnosai_crew_arena_is`, `_holds`,
+    `_used`, `_give_back`. Locked, as a parallel crew's workers share one. Scrubbed on release, so the next
+    tenant cannot read a crew's prompts through an allocation it never wrote.
+  - **`agnosai_event_bus_subscribe_a` and `agnosai_event_bus_recycle`:** a crew's 2 KiB channel goes back to the
+    bus and serves the next one. `agnosai_chan_reopen` is the one store into a private field it takes.
+  - **`_a` forms** of everything a consumer needs to build a spec in the arena: `agnosai_crew_new_a`,
+    `agnosai_task_new_a`, `agnosai_task_with_dependency_a`, `agnosai_task_with_context_a`,
+    `agnosai_process_*_a`, `agnosai_uuid_*_a`. The engine's own path has them throughout, with a bare form beside
+    each public one.
+- **`agnosai_inference_response_carry_usage(r, prior)`:** what an earlier call cost, added to `r`.
+
+### Changed
+
+- **A task's `output_schema` is in its first prompt.** It reached the model only inside the retry prompt, after a
+  failure, so every task with a schema paid for a call that could not have passed. It goes after
+  `expected_output`, sanitized the same way. A retry is anchored to the prompt without it, as its own template
+  ends with the schema, so a retry says it once.
+- **A fenced answer that passes is returned as the validated block**, so a consumer that parses `output` need not
+  strip the fence again.
+- **A task's `tokens` and `cost_micro_usd` count every call it made.** A validation retry replaced the response
+  it retried and its usage with it, so a task that took three calls reported one.
+- **A parallel crew's workers are detached.** `thread_create` left a handle and 4 KiB of TLS on the global heap
+  per task, which `thread_join` does not give back. A worker now says it is done through a futex-woken word on
+  its job, and the wave waits on that, in dispatch order, as it joined.
+- **`agnosai_event_bus_remove` empties the sender's subscriber list**, so a stale sender cannot publish into a
+  subscription the bus has given to another crew.
+- **kavach 3.14.2 → 3.14.6.** A payload with a rootfs on the process path holds twelve capabilities and enters by
+  `pivot_root`, an OCI container is bounded under any policy with `/proc` masked, and a failed WASM `memory.grow`
+  traps. `cyrius.lock`'s pin is `b772c152`, matching its tag.
+- **WASM input has no size limit (roadmap B9).** 2.2.3 refused anything over 64 KiB, because kavach's capture wrote
+  stdin before draining stdout, so a guest that wrote while it read hung its worker past any deadline. kavach 3.14.4
+  writes stdin from the drain loop, so `AGNOSAI_WASM_MAX_STDIN_BYTES` and the refusal are gone. Re-run here rather
+  than taken from its CHANGELOG: an echoing guest finishes 200,000 B in 103 ms, 10 MiB in 609 ms, and a guest that
+  reads nothing is killed at 307 ms of a 300 ms deadline, with stdin still full. Output stays cut at 1 MiB.
+- **A WASM guest is held to the Rust line's store limits (roadmap B9).** 10 instances, tables and memories, through
+  kavach's new `-W` options, and a failed grow traps. Blocked on kavach until 3.14.4. A guest past a limit never runs,
+  so it is an error and not an exit code, as it is in the oracle, and a forced grow trap reads
+  `AGNOSAI_WASM_EXIT_TRAP`, where it read a bare 1.
+
+### Fixed
+
+- **The last answer to a task with a schema was never checked** (agnostic, 2026-11-06). The loop validated before
+  each retry, so response 2 went unread, and the result was built `COMPLETED` regardless: a model that never
+  produced the shape got three calls and the crew read `completed`. Every answer is checked now, and a task that
+  never passed is `Failed`, with what the model last said as `output`, filtered as any answer is, and metadata
+  `error`, `validation_attempts` and its usage. It emits no `token` event.
+- **A crew a consumer had forgotten kept about 9 KiB of the engine's for the life of the process** (agnostic,
+  2026-11-06). See *Added*, and ADR 028.
+- **`agnosai_contains_prompt_leak` left 4 KiB on the global heap per task a model answered.** It minted a 16-byte
+  `Str` for each 50-byte window of the system prompt. A window is compared in place now.
+- **`agnosai_is_retryable` left about 300 B per error**: a lowered copy, and a `Str` per needle. It folds as it
+  compares.
+- **An arena pool leaked an arena on every overflow.** `agnosai_arena_pool_release` dropped what a full channel
+  would not take, on the reasoning that this bounded the pool. The bump has no free, so it bounded nothing, and
+  every acquire past `slots` cost another: the crew context pool's 8 KiB under load, and the hoosh pool's 64 KiB
+  and up past 32 calls at once. Measured, 6 threads of parallel crews left 7.1 MB over 360 crews. Surplus is kept
+  and reused, so a pool settles at its peak. `tests/arena_pool.tcyr` pinned the old behaviour as a feature.
+- **`agnosai_wasm_execute` copied its whole input onto the global heap on every call.** `str_cstr`, for a reader
+  that was `strlen`-based once. kavach has gone by the length since 3.11.9 and copies nothing, so neither does this.
+  A cap made that tolerable, and lifting one needed it gone.
+- **`agnosai_prompt_scan_input` minted its reason on every hit.** "you are a" is one of its patterns, so honest
+  task descriptions paid it. The five reasons are made once.
+- **Per-crew constants on the no-free bump:** the sandbox strength's policy, the retry policy, and the spellings
+  `agnosai_parse_complexity` compares against are each made once.
+
+### Performance
+
+Interleaved A/B against a 2.2.4 build: all eleven bench files three rounds, and `orch.bcyr` and `server.bcyr` five
+more on a quiet machine. `orch.bcyr` reads **median 0.0%**, 79 of 89 rows within ±5%, and `server.bcyr` −0.0%, 34 of
+34. Across all files, three noisier rounds read median −0.7%, 178 of 229 within ±5%. `auth_jwt_verify_ok`'s +22.5% in
+those rounds was load: five quiet rounds a side read 1,186 µs on both builds. Rows in the other nine files were not
+re-run. The one row past +5% in `orch.bcyr`'s quiet rounds is `conv_buffer_push_sliding_32`, 108 → 115 ns, on code
+this release does not touch. The sweep in `bench-history.csv` reads +0.2% against 2.2.4's rows, 185 of 229 within ±5%, at a load of 3.0–3.3
+against 1.9–2.1. An earlier sweep ended at 6.6 with other work on the machine, and was thrown out.
+
+- **A parallel crew is faster with detached workers:** `crew_runner_10_tasks_parallel_4_quiet` 542 → 478 µs (−12%),
+  `_watched` 576 → 414 µs (−28%), `_llm_quiet` 1,007 → 737 µs (−27%), `_llm_watched` 1,063 → 766 µs (−28%).
+  `run_crew_10_tasks_parallel_4` is flat, 450 → 448 µs.
+- **A crew in an arena costs less than one on the global heap, scrub and lock included:** `run_crew_then_release`
+  87.4 µs against `run_crew_then_forget` 92.2 µs, on the same build.
+- **Model selection does not allocate its spellings:** `parse_complexity_*` −56 to −78% (`_medium` 193 → 43 ns), and
+  `crew_select_model_routed` 247 → 121 ns (−51%). `output_scan_clean` 6,659 → 6,230 ns (−6%).
+- **What this costs:** bare forms now go through the allocator's vtable. `uuid_v4_generate` 545 → 579 ns (+6.2%),
+  `uuid_to_str` 214 → 226 ns (+5.6%), `run_crew_10_tasks_sequential` 372 → 380 µs (+2.0%),
+  `run_crew_1_task_sequential` 91.4 → 92.2 µs (+0.9%).
+
+**Bytes, which is what this release is about.** One placeholder task, measured as the issue measures it:
+
+| Bytes per crew, on the global heap | 2.2.4 | 2.2.5 |
+|---|---|---|
+| A crew in an arena, released | 9,368 | **0** |
+| A crew on the global heap | 9,368 | 8,361 |
+| What an arena crew uses, while held: one task, no gateway | | 6,912 |
+| The same, one task a model answered | | 14,568 |
+
+### Found, not changed
+
+- **`POST /api/v1/crews` takes no `output_schema`.** The route refuses the field, so the schema repair reaches
+  embedding consumers and not the binary's REST callers. `agnosai_task_from_value` does read one.
+- **The binary's own crews stay on the global heap** (roadmap B38), and **sandhi leaves 480 B per exchange** (B39).
+  ADR 028 lists these with the rest of what still grows, and who owns each.
+- **agnostic has to adopt this.** It builds specs with `agnosai_crew_new`, so its measurement does not move until it
+  does. No consumer was re-run against this release.
+- **Every WASM call leaves about 1 MiB on the global heap, whatever its input** (roadmap B40). kavach's `wasm_exec`
+  allocates its stdout buffer on each call, 1,051,728 B measured, and takes no allocator. Found measuring the copy above.
+
+### Verified
+
+- **The gate:** `check-symbols.sh` (2,931 definitions across 115 files, both targets) → `check-clean.sh` (fmt 229,
+  lint 229, doc 116, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist) → build → **102
+  suites, 10,281 assertions, 0 failed** under `CYRIUS_DCE=1` → coverage 99% (1,724/1,735 fns) → `distlib --all
+  --check` → examples → fuzz 4/4 → `cyrius bench` (230 rows). 2.2.4's tree reads 8,908 in the same shell, and the
+  +1,373 is the new `orch_crew_arena` 1,288, `sandbox_wasm` +42, `orch_crew_runner` +38 and `arena_pool` +5.
+- **The measurement the issue asked for reads 0.** `tests/orch_crew_arena.tcyr` runs crews to their release and reads
+  `alloc_used()`: sequential, parallel and DAG, with a model answering, a schema met and failed, redaction on, a
+  description the guard flags, and 600 crews submitted on detached threads and released the moment their channel
+  closed. Against a real socket the bound is sandhi's 480 B per exchange, and the suite holds the crew path to it.
+- **A stub hid the real path.** The first run against a real socket showed what the stubbed gateway could not: 4 KiB
+  a task in the prompt-leak scan, and the retry classifier's allocations.
+- **Every fix was run against the defect it guards.** 37 mutations, each reverting one decision, and all 37 fail by
+  name. Four first survived, each a real gap, and each now has a test: a chain's link past a chunk too small to
+  reuse, a worker that finds its crew cancelled, the idle stack's link in the lag slot, and redaction tests that
+  compared a function with its own wrapper.
+- **An independent review of the diff found six defects, and all six were confirmed before they were fixed:** a
+  worker's result published with no ordering on aarch64, the arena pools' leak on overflow (above), a release that
+  purged before it waited, so a second run of a spec put a dangling entry back, usage dropped by a refused retry,
+  the guard's reasons, and a fault on `agnosai_event_bus_recycle(bus, 0)`. `tests/arena_pool.tcyr` had pinned the
+  overflow leak as a feature.
+- **The WASM limits, against real guests.** Hand-assembled modules under wasmtime 50.0.1, kept as hex so no toolchain is
+  needed: the echoing guest the 2.2.3 audit hung on, two that never end, one that grows past its ceiling, and 10 and
+  11 tables and memories, so neither half of a limit passes on a run that failed for another reason. A core module is
+  one instance and `agnosai_wasm_load_module` takes nothing else, so `max-instances` is read from the config and not
+  run. 12 more mutations, each reverting one decision, all fail by name.
+- ⚠ **The fences are reasoned, not measured.** `tests/orch_crew_arena.tcyr` passes as an aarch64 build under qemu, 1,288
+  assertions, but qemu on an x86 host cannot show weak ordering, and nothing here ran on aarch64 hardware.
+- **The shipped binary, end to end.** `/ready` says 2.2.5, `/metrics` answers, and a sequential and a parallel crew ran
+  through `build/agnosai` against a gateway on a socket, each billed its calls, and SIGTERM drains and exits.
+
 ## [2.2.4] — 2026-11-06
 
 agnostic's four reports from its 0.2.2 audit and its crew-target design, repaired, and bote moved to its

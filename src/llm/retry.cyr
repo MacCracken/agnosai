@@ -114,48 +114,43 @@ fn agnosai_compute_delay(config, attempt): i64 {
 # `_agnosai_to_ascii_lower` moved to src/units.cyr at 2.0.7 — a generic ASCII helper that the
 # [lib.guard] profile also needs, and which cannot live behind the LLM layer for that reason.
 
-# Whether the already-lowercased `hay` contains `needle`.
-fn _agnosai_lower_contains(hay: Str, needle) : i64 {
-    return str_contains(hay, str_from(needle));
-}
-
 # Whether an error message indicates a transient, retryable failure.
 #
 # The needle list is the oracle's, in its order. Matching is substring-based
-# after ASCII-lowercasing, so "HTTP 429 Too Many Requests" retries and
-# "invalid API key" does not.
+# after ASCII-folding, so "HTTP 429 Too Many Requests" retries and "invalid API key"
+# does not. It folds as it compares: a lowered copy and a `Str` per needle cost 300
+# bytes of no-free bump for every error a crew met.
 fn agnosai_is_retryable(error_msg: Str): i64 {
-    var lower = _agnosai_to_ascii_lower(error_msg);
-    if (_agnosai_lower_contains(lower, "rate limit") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "429") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "503") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "502") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "timeout") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "timed out") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "connection reset") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "connection refused") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "temporarily unavailable") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "service unavailable") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "server error") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "500") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "overloaded") == 1) { return 1; }
-    if (_agnosai_lower_contains(lower, "capacity") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "rate limit") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "429") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "503") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "502") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "timeout") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "timed out") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "connection reset") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "connection refused") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "temporarily unavailable") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "service unavailable") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "server error") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "500") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "overloaded") == 1) { return 1; }
+    if (agnosai_str_contains_ci_cstr(error_msg, "capacity") == 1) { return 1; }
     return 0;
 }
 
 # Emit the retry trace the oracle's `warn!`/`debug!` calls carry. Guarded on
 # the live level so formatting is only paid when it would be emitted.
-fn _agnosai_retry_log(level, msg, msg_len, task_id: Str, attempt, err): i64 {
+fn _agnosai_retry_log_a(a, level, msg, msg_len, task_id: Str, attempt, err): i64 {
     if (sakshi_get_level() < level) { return 0; }
-    var sb = str_builder_new();
-    str_builder_add(sb, task_id);
-    str_builder_add_cstr(sb, " attempt=");
-    str_builder_add_int(sb, attempt);
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, task_id);
+    str_builder_add_cstr_a(a, sb, " attempt=");
+    str_builder_add_int_a(a, sb, attempt);
     if (err != 0) {
-        str_builder_add_cstr(sb, " error=");
-        str_builder_add(sb, err);
+        str_builder_add_cstr_a(a, sb, " error=");
+        str_builder_add_a(a, sb, err);
     }
-    var line = str_builder_build(sb);
+    var line = str_builder_build_a(a, sb);
     sakshi_log_kv(level, msg, msg_len, "task", 4, str_data(line), str_len(line));
     return 0;
 }
@@ -171,6 +166,11 @@ fn _agnosai_retry_log(level, msg, msg_len, task_id: Str, attempt, err): i64 {
 # the oracle's behaviour, and the reason its `with_retry_skips_non_retryable`
 # test asserts the callback ran exactly once.
 fn agnosai_with_retry(config, task_id: Str, fp, ctx, out_value): i64 {
+    return agnosai_with_retry_a(default_alloc(), config, task_id, fp, ctx, out_value);
+}
+
+# `agnosai_with_retry`, building its log lines in allocator `a`.
+fn agnosai_with_retry_a(a, config, task_id: Str, fp, ctx, out_value): i64 {
     var max_retries = load64(config + AGN_RETRY_MAX_RETRIES);
     var last_err = 0;
 
@@ -178,22 +178,25 @@ fn agnosai_with_retry(config, task_id: Str, fp, ctx, out_value): i64 {
         var err = callptr(fp, ctx, out_value);
         if (err == 0) {
             if (attempt > 0) {
-                _agnosai_retry_log(SK_DEBUG, "inference succeeded after retry", 31, task_id, attempt, 0);
+                _agnosai_retry_log_a(a, SK_DEBUG, "inference succeeded after retry", 31, task_id,
+                  attempt, 0);
             }
             return 0;
         }
         last_err = err;
 
         if (attempt >= max_retries) {
-            _agnosai_retry_log(SK_WARN, "inference failed, retries exhausted", 35, task_id, attempt, err);
+            _agnosai_retry_log_a(a, SK_WARN, "inference failed, retries exhausted", 35, task_id,
+              attempt, err);
             return err;
         }
         if (agnosai_is_retryable(err) == 0) {
-            _agnosai_retry_log(SK_WARN, "inference failed with non-retryable error", 41, task_id, attempt, err);
+            _agnosai_retry_log_a(a, SK_WARN, "inference failed with non-retryable error", 41,
+              task_id, attempt, err);
             return err;
         }
 
-        _agnosai_retry_log(SK_WARN, "inference failed, retrying", 26, task_id, attempt, err);
+        _agnosai_retry_log_a(a, SK_WARN, "inference failed, retrying", 26, task_id, attempt, err);
         sleep_ms(agnosai_compute_delay(config, attempt) / AGNOSAI_NS_PER_MS);
     }
 

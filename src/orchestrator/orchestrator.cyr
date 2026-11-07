@@ -277,11 +277,9 @@ fn _agnosai_orch_evict_locked(o): i64 {
 # Log an eviction, outside the registry lock. A consumer that polls should know its window.
 fn _agnosai_orch_log_evicted(evicted): i64 {
     if (evicted == 0 || sakshi_get_level() < SK_INFO) { return 0; }
-    var sb = str_builder_new();
-    str_builder_add_int(sb, evicted);
-    var n = str_builder_build(sb);
-    sakshi_log_kv(SK_INFO, "crew registry evicted finished crews", 36,
-      "count", 5, str_data(n), str_len(n));
+    var count[24];
+    var len = fmt_int_buf(evicted, &count);
+    sakshi_log_kv(SK_INFO, "crew registry evicted finished crews", 36, "count", 5, &count, len);
     return evicted;
 }
 
@@ -350,11 +348,19 @@ fn _agnosai_orch_register(o, spec): i64 {
     var crew_id = agnosai_crew_id(spec);
     var crew_name = agnosai_crew_name(spec);
     var tasks = agnosai_crew_tasks(spec);
+    var a = agnosai_crew_alloc(spec);
+    atomic_fetch_add(spec + AGN_CREW_RUNS, 1);
 
-    var accepted = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(accepted, str_from("crew_id"), bayan_json_v_str_new(crew_id));
-    bayan_json_v_obj_set(accepted, str_from("task_count"), bayan_json_v_int_new(vec_len(tasks)));
-    _agnosai_orch_audit(o, str_from("crew_accepted"), str_from("info"), crew_name, accepted);
+    # ⚠ **Built only for a chain, on the global heap, owning its strings.** The entry keeps
+    # this for as long as the chain keeps it, which outlives a crew in an arena.
+    if (load64(o + AGN_OR_AUDIT) != 0) {
+        var accepted = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(accepted, str_from("crew_id"),
+          bayan_json_v_str_new(str_clone(crew_id)));
+        bayan_json_v_obj_set(accepted, str_from("task_count"),
+          bayan_json_v_int_new(vec_len(tasks)));
+        _agnosai_orch_audit(o, str_from("crew_accepted"), str_from("info"), crew_name, accepted);
+    }
 
     var runner = agnosai_crew_runner_new(spec);
     agnosai_crew_runner_with_audit(runner, load64(o + AGN_OR_AUDIT));
@@ -365,9 +371,9 @@ fn _agnosai_orch_register(o, spec): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
     var evicted = _agnosai_orch_evict_locked(o);
-    map_set(load64(o + AGN_OR_CREWS), str_clone(crew_id),
-      agnosai_crew_state_new(crew_id, AGNOSAI_CREW_PENDING));
-    map_set(load64(o + AGN_OR_CANCEL), str_clone(crew_id),
+    map_set(load64(o + AGN_OR_CREWS), str_clone_a(a, crew_id),
+      agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_PENDING));
+    map_set(load64(o + AGN_OR_CANCEL), str_clone_a(a, crew_id),
       agnosai_crew_runner_cancel_flag(runner));
     mutex_unlock(mtx);
     _agnosai_orch_log_evicted(evicted);
@@ -375,12 +381,12 @@ fn _agnosai_orch_register(o, spec): i64 {
     var rurl = load64(o + AGN_OR_LLM_URL);
     if (rurl != 0) {
         agnosai_crew_runner_with_llm(runner,
-          agnosai_hoosh_client_new(rurl, load64(o + AGN_OR_LLM_KEY)));
+          agnosai_hoosh_client_new_a(a, rurl, load64(o + AGN_OR_LLM_KEY)));
     }
 
     var rbus = load64(o + AGN_OR_EVENTS);
     if (rbus != 0) {
-        agnosai_crew_runner_with_events(runner, agnosai_event_bus_sender(rbus, crew_id));
+        agnosai_crew_runner_with_events(runner, agnosai_event_bus_sender_a(a, rbus, crew_id));
     }
     return runner;
 }
@@ -437,18 +443,23 @@ fn agnosai_orchestrator_run_crew_err(o, spec, out_err): i64 {
 # greps — and the timeout is folded into the message text, so no information is
 # dropped even though the shape differs.
 fn _agnosai_orch_timeout_state(crew_id: Str, timeout_secs): i64 {
+    return _agnosai_orch_timeout_state_a(default_alloc(), crew_id, timeout_secs);
+}
+
+# `_agnosai_orch_timeout_state`, in allocator `a`.
+fn _agnosai_orch_timeout_state_a(a, crew_id: Str, timeout_secs): i64 {
     # Level-gated so the message is not built when nothing will emit it — the
     # same shape as `_agnosai_rl_warn` in `src/server/rate_limit.cyr`.
     if (sakshi_get_level() >= SK_WARN) {
-        var msg = str_builder_new();
-        str_builder_add_cstr(msg, "crew execution timed out after ");
-        str_builder_add_int(msg, timeout_secs);
-        str_builder_add_cstr(msg, "s");
-        var m = str_builder_build(msg);
+        var msg = str_builder_new_a(a);
+        str_builder_add_cstr_a(a, msg, "crew execution timed out after ");
+        str_builder_add_int_a(a, msg, timeout_secs);
+        str_builder_add_cstr_a(a, msg, "s");
+        var m = str_builder_build_a(a, msg);
         sakshi_log_kv(SK_WARN, str_data(m), str_len(m),
           "crew_id", 7, str_data(crew_id), str_len(crew_id));
     }
-    return agnosai_crew_state_new(crew_id, AGNOSAI_CREW_FAILED);
+    return agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_FAILED);
 }
 
 fn _agnosai_orch_finish(o, runner, crew_id: Str, crew_name: Str): i64 {
@@ -458,6 +469,8 @@ fn _agnosai_orch_finish(o, runner, crew_id: Str, crew_name: Str): i64 {
 fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     var bus = load64(o + AGN_OR_EVENTS);
+    var a = load64(runner + AGN_CR_ALLOC);
+    var spec = load64(runner + AGN_CR_SPEC);
 
     # Enforce the execution timeout from the budget, matching
     # `rust-old/src/orchestrator/orchestrator.rs:197-214`.
@@ -492,7 +505,7 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
     # one. It stays for the warning `_agnosai_orch_timeout_state` logs, and so a
     # runner that did not build the state could not leak partial results here.
     if (state != 0 && agnosai_crew_runner_timed_out(runner) == 1) {
-        state = _agnosai_orch_timeout_state(crew_id, timeout_secs);
+        state = _agnosai_orch_timeout_state_a(a, crew_id, timeout_secs);
     }
 
     # A cyclic DAG errors out. The oracle's `?` propagates it, so no state is
@@ -515,6 +528,7 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
             if (_agnosai_orch_is_finished(left) == 1) { _agnosai_orch_note_ended_locked(o, left); }
         }
         mutex_unlock(mtx);
+        atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
         return 0;
     }
 
@@ -527,24 +541,32 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
         cost = agnosai_crew_profile_cost_micro_usd(profile);
     }
 
-    var finished = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(finished, str_from("crew_id"), bayan_json_v_str_new(crew_id));
-    bayan_json_v_obj_set(finished, str_from("status"),
-      bayan_json_v_str_new(agnosai_crew_status_to_wire(status)));
-    bayan_json_v_obj_set(finished, str_from("task_count"),
-      bayan_json_v_int_new(vec_len(agnosai_crew_state_results(state))));
-    bayan_json_v_obj_set(finished, str_from("wall_ms"), bayan_json_v_int_new(wall_ms));
-    bayan_json_v_obj_set(finished, str_from("cost_micro_usd"), bayan_json_v_int_new(cost));
-    _agnosai_orch_audit(o, str_from("crew_finished"), _agnosai_orch_level_for(status),
-      crew_name, finished);
+    # See `_agnosai_orch_register`: built only for a chain, on the global heap, owning
+    # its strings, as the entry outlives a crew in an arena.
+    if (load64(o + AGN_OR_AUDIT) != 0) {
+        var finished = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(finished, str_from("crew_id"),
+          bayan_json_v_str_new(str_clone(crew_id)));
+        bayan_json_v_obj_set(finished, str_from("status"),
+          bayan_json_v_str_new(agnosai_crew_status_to_wire(status)));
+        bayan_json_v_obj_set(finished, str_from("task_count"),
+          bayan_json_v_int_new(vec_len(agnosai_crew_state_results(state))));
+        bayan_json_v_obj_set(finished, str_from("wall_ms"), bayan_json_v_int_new(wall_ms));
+        bayan_json_v_obj_set(finished, str_from("cost_micro_usd"), bayan_json_v_int_new(cost));
+        _agnosai_orch_audit(o, str_from("crew_finished"), _agnosai_orch_level_for(status),
+          crew_name, finished);
+    }
 
     mutex_lock(mtx);
-    map_set(load64(o + AGN_OR_CREWS), str_clone(crew_id), state);
+    map_set(load64(o + AGN_OR_CREWS), str_clone_a(a, crew_id), state);
     map_delete(load64(o + AGN_OR_CANCEL), crew_id);
     _agnosai_orch_note_ended_locked(o, state);
     mutex_unlock(mtx);
 
     if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
+    # ⚠ **The run's last touch of the crew**, on either exit. Once this lands a release may
+    # scrub the spec, its id and its runner, and the caller has only pointers left to return.
+    atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
     return state;
 }
 
@@ -637,7 +659,7 @@ fn agnosai_orchestrator_submit_crew(o, spec): i64 {
     var crew_id = agnosai_crew_id(spec);
     var runner = _agnosai_orch_register(o, spec);
 
-    var job = alloc(AGN_OJ_SIZE);
+    var job = alloc_via(agnosai_crew_alloc(spec), AGN_OJ_SIZE);
     store64(job + AGN_OJ_ORCH, o);
     store64(job + AGN_OJ_RUNNER, runner);
     store64(job + AGN_OJ_CREW_ID, crew_id);
@@ -645,6 +667,7 @@ fn agnosai_orchestrator_submit_crew(o, spec): i64 {
 
     if (thread_create_detached(&_agnosai_orch_submit_thread, job) == 0) {
         _agnosai_orch_abandon(o, crew_id);
+        atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
         return 0;
     }
     return crew_id;
@@ -687,10 +710,12 @@ fn agnosai_orchestrator_cancel_crew(o, crew_id: Str): i64 {
     if (flag == 0) { _agnosai_orch_note_ended_locked(o, state); }
     mutex_unlock(mtx);
 
-    var md = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(md, str_from("crew_id"), bayan_json_v_str_new(crew_id));
-    _agnosai_orch_audit(o, str_from("crew_cancelled"), str_from("warn"),
-      str_from("crew cancelled by caller"), md);
+    if (load64(o + AGN_OR_AUDIT) != 0) {
+        var md = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(md, str_from("crew_id"), bayan_json_v_str_new(str_clone(crew_id)));
+        _agnosai_orch_audit(o, str_from("crew_cancelled"), str_from("warn"),
+          str_from("crew cancelled by caller"), md);
+    }
     return 0;
 }
 
@@ -729,5 +754,84 @@ fn agnosai_orchestrator_forget_crew(o, crew_id: Str): i64 {
     map_delete(crews, crew_id);
     _agnosai_orch_compact_ended_locked(o);
     mutex_unlock(mtx);
+    return 0;
+}
+
+# Drop every ended-queue slot that points into arena `a`. The caller holds the lock.
+#
+# A queue slot is a pointer to a crew's state, and `_agnosai_orch_is_current_locked` reads
+# through it, so a slot left behind would read scrubbed memory, or another crew's. A forgotten
+# crew leaves one and so does an id run twice, which is why this goes by address: a crew may
+# have more than one state in here, and `AGN_OR_CREWS` no longer names any of them.
+fn _agnosai_orch_purge_ended_locked(o, a): i64 {
+    var ended = load64(o + AGN_OR_ENDED);
+    var head = load64(o + AGN_OR_ENDED_HEAD);
+    var len = vec_len(ended);
+    var kept = head;
+    for (var i = head; i < len; i = i + 1) {
+        var state = vec_get(ended, i);
+        if (agnosai_crew_arena_holds(a, state) == 0) {
+            vec_set(ended, kept, state);
+            kept = kept + 1;
+        }
+    }
+    vec_truncate(ended, kept);
+    return len - kept;
+}
+
+# Give a crew back: it leaves the registry if it is still there, and an arena crew's memory
+# goes back to its pool for the next crew. Returns 0, or an Other error for a crew still
+# running or already released, which is left as it is. A crew on the global heap has no
+# arena to give back, so for one of those this is `forget_crew`.
+#
+# **The other half of `agnosai_crew_new_in` (ADR 028).** `forget_crew` takes a crew out of the
+# registry and frees nothing, and it keeps that contract: a consumer may read a forgotten crew
+# for as long as it likes. This is the call that ends that. It is separate because a consumer
+# forgets a crew when it has read it, and is done with it some time later.
+#
+# ⚠ **After this, nothing the crew had is valid**: the spec and its id, its tasks, its state and
+# results, its events. It is scrubbed and will be reused. So a consumer clears its own pointers
+# first, under whatever lock its readers take, and calls this exactly once. Passing a spec a
+# second time is refused only until its arena serves another crew.
+#
+# ⚠ **Waits out the run's last few instructions, and only then takes the crew out.** A run that
+# has dropped its flag still has its event channel to remove, with the crew's id in hand, and a
+# consumer can get here in between. `AGN_CREW_RUNS` reaching 0 is the run's last touch of the
+# crew, and the flag and that count are read under one lock, so the delete and the purge happen
+# after everything that could put the crew back. Doing them first left a dangling entry behind
+# a second run of the same spec: overlapping runs share one flag and the first to end takes it,
+# and the other then stored its final state into the registry, under a key in the arena, on its
+# way to being scrubbed. So for that case, and only that one, this waits for the whole of the
+# other run. Otherwise it is a window of a few instructions.
+#
+# The channel is removed here too, as a crew that never ran left its own behind. That closes a
+# subscription, which `agnosai_event_bus_recycle` then takes back.
+fn agnosai_orchestrator_release_crew(o, spec): i64 {
+    var crew_id = agnosai_crew_id(spec);
+    if (crew_id == 0) {
+        return agnosai_error_other(str_from("crew has already been released"));
+    }
+    var a = agnosai_crew_arena(spec);
+
+    var mtx = load64(o + AGN_OR_MUTEX);
+    while (1 == 1) {
+        mutex_lock(mtx);
+        if (map_get(load64(o + AGN_OR_CANCEL), crew_id) != 0) {
+            mutex_unlock(mtx);
+            return agnosai_error_other(str_from("crew is still running and cannot be released"));
+        }
+        if (atomic_load(spec + AGN_CREW_RUNS) == 0) { break; }
+        mutex_unlock(mtx);
+        sys_sched_yield();
+    }
+    atomic_fence();
+    map_delete(load64(o + AGN_OR_CREWS), crew_id);
+    if (a != 0) { _agnosai_orch_purge_ended_locked(o, a); }
+    _agnosai_orch_compact_ended_locked(o);
+    mutex_unlock(mtx);
+
+    var bus = load64(o + AGN_OR_EVENTS);
+    if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
+    if (a != 0) { agnosai_crew_arena_give_back(a); }
     return 0;
 }

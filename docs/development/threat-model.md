@@ -41,7 +41,8 @@ Tools run untrusted code from community authors or legacy Python scripts.
 | Library injection (`LD_PRELOAD`) | All subprocesses strip `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH` (`agnosai_sanitized_envp`) |
 | Zombie processes | Every spawned child is waited on; the sandbox tiers enforce a SIGKILL deadline |
 | Output flooding | 1 MiB stdout cap on the kavach paths; the spawner's capture is bounded by its deadline |
-| ⚠ **A guest that hangs its worker** (found 2.2.2) | **Not mitigated.** kavach's capture writes a WASM guest's whole stdin before draining its stdout, so a guest that writes while it reads deadlocks once its input passes about two pipe buffers (~100–200 KB), and kavach's deadline never fires. Roadmap B9 / B16 |
+| A guest that hangs its worker (found 2.2.2) | Closed by kavach 3.14.4, pinned at 2.2.5: stdin goes out while stdout drains, and the deadline is read on every pass. Re-run here with real guests (`tests/sandbox_wasm.tcyr`): a guest that writes while it reads finishes 200,000 B in about 100 ms, and one that reads nothing is killed at its deadline with stdin still full. The 64 KiB refusal that stood in for this is gone |
+| A guest that declares more than it should | Held to the Rust line's store limits, 10 instances, tables and memories, through `-W`, and refused at instantiation past them, so it never runs. A failed `memory.grow` traps. `tests/sandbox_wasm.tcyr` runs 10 and 11 of each it can reach. A core module is one instance, so `max-instances` is read from the config and not run |
 
 ### 3. LLM Provider Communication
 
@@ -151,6 +152,13 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
 
 ## Accepted Risks
 
+- **A crew arena is reused** ([ADR 028](../adr/028-a-crew-lives-in-an-arena-its-consumer-gives-back.md)):
+  the memory a crew lived in serves the next one, which in a multi-tenant consumer may be another
+  tenant's. It is zeroed on release, every byte handed out, so no allocation can read a previous
+  crew's prompts or keys, and `tests/orch_crew_arena.tcyr` asserts that. What it cannot stop is a
+  stale pointer: a consumer that reads a released crew reads zeros, or the next crew's bytes once the
+  arena is reused. Clearing its own pointers before `agnosai_orchestrator_release_crew` is the
+  consumer's half of that contract, and a crew that does not opt in cannot meet this at all.
 - **TOCTOU on tool paths**: agnosai's own spawner (`src/sandbox/spawn.cyr`) resolves a tool
   binary against `PATH` and then execs it by path, so what runs is whatever sits at that path at
   exec time. kavach's paths pin the binary by fd before the fork (ADR-005 §H4 in kavach), but

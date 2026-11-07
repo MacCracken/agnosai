@@ -398,6 +398,229 @@ fn _t_model_complexity(complexity, want, name): i64 {
     return assert(str_eq(_agnosai_crew_select_model(a), str_from(want)) == 1, name);
 }
 
+# ── the output-schema loop (2.2.5) ─────────────────────────────────────────
+# A scripted gateway: each call answers the next body in `_t_script`, the last
+# one for good, and every request is kept so a case can read what the model was
+# told. Nothing drove this loop before it, which is how its last answer went
+# unchecked and its first prompt went without the schema.
+var _t_script = 0;
+var _t_script_at = 0;
+var _t_script_seen = 0;
+
+# A gateway answer carrying `content`, as a JSON string body. 10 prompt tokens, 5
+# completion tokens, 100 micro-USD, so a task's totals say how many calls it took.
+fn _t_answer(content): i64 {
+    var body = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(body, str_from("model"), bayan_json_v_str_new(str_from("m")));
+    var msg = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(msg, str_from("content"), bayan_json_v_str_new(str_from(content)));
+    var choice = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(choice, str_from("message"), msg);
+    var choices = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(choices, choice);
+    bayan_json_v_obj_set(body, str_from("choices"), choices);
+    var usage = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(usage, str_from("prompt_tokens"), bayan_json_v_int_new(10));
+    bayan_json_v_obj_set(usage, str_from("completion_tokens"), bayan_json_v_int_new(5));
+    bayan_json_v_obj_set(usage, str_from("cost_micro_usd"), bayan_json_v_int_new(100));
+    bayan_json_v_obj_set(body, str_from("usage"), usage);
+    return bayan_json_v_build(body);
+}
+
+fn _t_stub_chat_script(client, request, out_response, parent_sc): i64 {
+    vec_push(_t_script_seen, request);
+    var at = _t_script_at;
+    if (at >= vec_len(_t_script)) { at = vec_len(_t_script) - 1; }
+    _t_script_at = _t_script_at + 1;
+    store64(out_response, agnosai_hoosh_response_from_body(vec_get(_t_script, at)));
+    return 0;
+}
+
+# The script's first answer, then a refusal no retry can get past.
+fn _t_stub_chat_then_refuse(client, request, out_response, parent_sc): i64 {
+    _t_script_at = _t_script_at + 1;
+    if (_t_script_at > 1) { return str_from("invalid API key"); }
+    store64(out_response, agnosai_hoosh_response_from_body(vec_get(_t_script, 0)));
+    return 0;
+}
+
+# Run a task with a schema against scripted answers. Returns its result.
+fn _t_script_run(task, a0, a1, a2): i64 {
+    _t_script = vec_new();
+    _t_script_at = 0;
+    _t_script_seen = vec_new();
+    vec_push(_t_script, _t_answer(a0));
+    if (a1 != 0) { vec_push(_t_script, _t_answer(a1)); }
+    if (a2 != 0) { vec_push(_t_script, _t_answer(a2)); }
+    return agnosai_execute_task(task, 0, agnosai_hoosh_client_with_chat(
+        agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")),
+        &_t_stub_chat_script), 0);
+}
+
+# The last message of the `n`th request the script saw: the turn the task wrote.
+fn _t_script_turn(n): i64 {
+    var msgs = agnosai_inference_request_messages(vec_get(_t_script_seen, n));
+    return agnosai_chat_message_content(vec_get(msgs, vec_len(msgs) - 1));
+}
+
+# How many times `needle` occurs in `s`.
+fn _t_occurrences(s: Str, needle): i64 {
+    var n = 0;
+    var rest = s;
+    while (1 == 1) {
+        var at = str_index_of_cstr(rest, needle);
+        if (at < 0) { return n; }
+        n = n + 1;
+        rest = str_substr(rest, at + 1, str_len(rest));
+    }
+    return n;
+}
+
+fn _t_schema_task(): i64 {
+    var t = agnosai_task_new(str_from("name the finding"));
+    var src = str_from("{\"type\":\"object\",\"required\":[\"finding\"]}");
+    agnosai_task_with_output_schema(t, bayan_json_v_parse_buf(str_data(src), str_len(src)));
+    return t;
+}
+
+fn _t_meta_int(r, key): i64 {
+    var v = map_get(agnosai_task_result_metadata(r), str_from(key));
+    if (v == 0) { return 0 - 1; }
+    return bayan_json_v_int(v);
+}
+
+fn _t_schema_suite(): i64 {
+    var good = "{\"finding\":\"none\"}";
+
+    # --- a model given the schema first can pass on its first call ---
+    var r = _t_script_run(_t_schema_task(), good, 0, 0);
+    assert_eq(_t_script_at, 1, "a first answer that meets the schema is the only call");
+    assert_eq(agnosai_task_result_status(r), AGNOSAI_STATUS_COMPLETED, "and the task completes");
+    var first = _t_script_turn(0);
+    assert(str_index_of_cstr(first, "\"required\":[\"finding\"]") >= 0,
+      "the FIRST prompt carries the schema, which only a retry used to");
+    assert(str_index_of_cstr(first, "<user_input field=\"output_schema\">") >= 0,
+      "inside the same markers as the rest of a consumer's input");
+    assert(str_index_of_cstr(first, "ONLY valid JSON") >= 0, "and led in by a line of ours");
+    assert_eq(agnosai_inference_request_temperature_milli(vec_get(_t_script_seen, 0)),
+      AGNOSAI_CREW_TEMPERATURE_MILLI, "at the task's own temperature");
+
+    # A task with no schema is told nothing about one.
+    var plain = _t_script_run(agnosai_task_new(str_from("just talk")), "free text", 0, 0);
+    assert_eq(agnosai_task_result_status(plain), AGNOSAI_STATUS_COMPLETED, "no schema, no check");
+    assert_eq(_t_occurrences(_t_script_turn(0), "ONLY valid JSON"), 0,
+      "and a task with no schema gets no schema line");
+
+    # --- a fenced answer that passes loses its fence ---
+    var fenced = _t_script_run(_t_schema_task(), "here it is:\n```json\n{\"finding\":\"x\"}\n```\nthanks", 0, 0);
+    assert_eq(agnosai_task_result_status(fenced), AGNOSAI_STATUS_COMPLETED, "a fenced answer passes");
+    assert(str_eq(agnosai_task_result_output(fenced), str_from("{\"finding\":\"x\"}")) == 1,
+      "and `output` is the validated block, so a consumer need not strip it again");
+
+    # --- a retry that passes ---
+    var second = _t_script_run(_t_schema_task(), "not json", good, 0);
+    assert_eq(_t_script_at, 2, "one failure, one retry");
+    assert_eq(agnosai_task_result_status(second), AGNOSAI_STATUS_COMPLETED, "the retry's answer stands");
+    assert(str_eq(agnosai_task_result_output(second), str_from(good)) == 1, "as the output");
+    assert_eq(agnosai_inference_request_temperature_milli(vec_get(_t_script_seen, 1)),
+      AGNOSAI_CREW_RETRY_TEMPERATURE_MILLI, "at the retry's temperature");
+    var retry_turn = _t_script_turn(1);
+    assert(str_index_of_cstr(retry_turn, "failed validation") >= 0, "and told why");
+    assert_eq(_t_occurrences(retry_turn, "\"required\":[\"finding\"]"), 1,
+      "the retry says the schema ONCE: it is anchored to the task's prompt, not the first message");
+    assert_eq(_t_meta_int(second, "cost_micro_usd"), 200, "and the task reports BOTH calls' cost");
+    var toks = map_get(agnosai_task_result_metadata(second), str_from("tokens"));
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(toks, "total")), 30,
+      "and both calls' tokens, not the last one's");
+
+    # --- the LAST answer is checked: the third call can pass ---
+    var last = _t_script_run(_t_schema_task(), "no", "still no", good);
+    assert_eq(_t_script_at, 3, "two retries is three calls");
+    assert_eq(agnosai_task_result_status(last), AGNOSAI_STATUS_COMPLETED,
+      "and the third answer is read, which it never was");
+
+    # --- a model that never meets the schema ---
+    var bad_events = agnosai_event_bus_new();
+    var never_task = _t_schema_task();
+    var never = _t_script_run(never_task, "no", "still no", "{\"other\":1}");
+    assert_eq(_t_script_at, 3, "it gets its retries and no more");
+    assert_eq(agnosai_task_result_status(never), AGNOSAI_STATUS_FAILED,
+      "and the task is FAILED, not a clean completed");
+    assert(str_eq(agnosai_task_result_output(never), str_from("{\"other\":1}")) == 1,
+      "`output` keeps what the model last said");
+    var why = map_get(agnosai_task_result_metadata(never), str_from("error"));
+    assert(why != 0, "`error` is on the metadata, where a consumer reads a failure");
+    assert(str_index_of_cstr(bayan_json_v_str(why), "Missing required fields: finding") >= 0,
+      "naming the reason from the LAST answer, the one that used to go unread");
+    assert_eq(_t_meta_int(never, "validation_attempts"), 3, "and saying how many answers were checked");
+    assert_eq(_t_meta_int(never, "cost_micro_usd"), 300, "and all three calls were paid for");
+
+    # A retry the gateway refused: an error, and the call before it was still paid for.
+    _t_script = vec_new();
+    _t_script_at = 0;
+    vec_push(_t_script, _t_answer("no"));
+    var refused = agnosai_execute_task(_t_schema_task(), 0, agnosai_hoosh_client_with_chat(
+        agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")),
+        &_t_stub_chat_then_refuse), 0);
+    assert_eq(agnosai_task_result_status(refused), AGNOSAI_STATUS_FAILED, "a refused retry fails");
+    assert(str_index_of_cstr(agnosai_task_result_output(refused), "LLM error") >= 0,
+      "as an LLM error");
+    assert_eq(_t_meta_int(refused, "cost_micro_usd"), 100,
+      "and what the first call cost is still on it");
+    assert(map_get(agnosai_task_result_metadata(refused), str_from("tokens")) != 0,
+      "with its tokens");
+
+    # A failed answer is filtered like any other answer.
+    agnosai_output_redact_set_enabled(1);
+    var leaky_never = _t_script_run(_t_schema_task(), "the key is sk-ABCDEFGHIJKLMNOPQRST0123", 0, 0);
+    agnosai_output_redact_set_enabled(0);
+    assert_eq(agnosai_task_result_status(leaky_never), AGNOSAI_STATUS_FAILED, "still failed");
+    assert(agnosai_str_contains_ci_cstr(agnosai_task_result_output(leaky_never),
+        "sk-ABCDEFGHIJKLMNOPQRST0123") == 0, "and a key in a failed answer is redacted too");
+
+    # --- what the crew reads ---
+    var tx = agnosai_event_bus_sender(bad_events, str_from("c"));
+    var sub = agnosai_event_sender_subscribe(tx);
+    _t_script_at = 0;
+    agnosai_execute_task_in_crew(_t_schema_task(), 0, agnosai_hoosh_client_with_chat(
+        agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")),
+        &_t_stub_chat_script), tx, str_from("c"), 0);
+    assert_eq(agnosai_event_sub_try_recv(sub), 0,
+      "no `token` event: that is a finished task's output, and this is not one");
+
+    # --- a worker that finds its crew cancelled ---
+    # The wave waits on `DONE`, so a job that returned without setting it would hold the wave
+    # for good. The batch head checks first, so this arm is reached only by a cancel landing
+    # after dispatch, and has to be driven directly.
+    var flag = alloc(8);
+    store64(flag, 1);
+    var job = alloc(AGN_CJ_SIZE);
+    store64(job + AGN_CJ_TASK, _t_schema_task());
+    store64(job + AGN_CJ_CANCELLED, flag);
+    store64(job + AGN_CJ_ALLOC, default_alloc());
+    _agnosai_crew_worker(job);
+    assert_eq(agnosai_task_result_status(load64(job + AGN_CJ_RESULT)), AGNOSAI_STATUS_FAILED,
+      "a cancelled job records a failure");
+    assert_eq(load64(job + AGN_CJ_DONE), 1, "and says it is over, or the wave would wait for good");
+    _agnosai_crew_job_wait(job);
+
+    var spec = agnosai_crew_new(str_from("schema-crew"));
+    var tasks = vec_new();
+    vec_push(tasks, _t_schema_task());
+    agnosai_crew_with_tasks(spec, tasks);
+    _t_script_at = 0;
+    var cr = agnosai_crew_runner_with_llm(agnosai_crew_runner_new(spec),
+      agnosai_hoosh_client_with_chat(agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"),
+          str_from("")), &_t_stub_chat_script));
+    var err: i64[1];
+    store64(&err, 0);
+    var st = agnosai_crew_runner_run(cr, &err);
+    assert_eq(agnosai_crew_state_status(st), AGNOSAI_CREW_FAILED, "so the crew reads failed");
+    assert_eq(agnosai_crew_profile_cost_micro_usd(agnosai_crew_state_profile(st)), 300,
+      "with what its failed task cost in the profile");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -924,7 +1147,7 @@ fn main() {
     var ok_resp = agnosai_hoosh_response_from_body(ok_body);
     var ok_r = agnosai_task_result_new(agnosai_task_id(rq_task), str_from("done"),
       AGNOSAI_STATUS_COMPLETED);
-    _agnosai_crew_success_metadata(ok_r, ok_resp, clock_now_ns(), 0);
+    _agnosai_crew_answer_metadata(ok_r, ok_resp, clock_now_ns(), 0);
     var ok_md = agnosai_task_result_metadata(ok_r);
     assert_eq(map_get(ok_md, str_from("agent")), 0,
       "an UNASSIGNED task's success metadata carries no agent key");
@@ -945,7 +1168,7 @@ fn main() {
       str_from("\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}"));
     var old_r = agnosai_task_result_new(agnosai_task_id(rq_task), str_from("d"),
       AGNOSAI_STATUS_COMPLETED);
-    _agnosai_crew_success_metadata(old_r, agnosai_hoosh_response_from_body(old_body),
+    _agnosai_crew_answer_metadata(old_r, agnosai_hoosh_response_from_body(old_body),
       clock_now_ns(), 0);
     assert_eq(map_get(agnosai_task_result_metadata(old_r), str_from("cost_micro_usd")), 0,
       "an older gateway's response OMITS cost_micro_usd rather than publishing a fabricated 0 — a \
@@ -959,7 +1182,7 @@ fn main() {
     # and its success arm never wrote the key, so the map was always empty.
     var ag_r = agnosai_task_result_new(agnosai_task_id(rq_task), str_from("done"),
       AGNOSAI_STATUS_COMPLETED);
-    _agnosai_crew_success_metadata(ag_r, ok_resp, clock_now_ns(), _t_agent("writer"));
+    _agnosai_crew_answer_metadata(ag_r, ok_resp, clock_now_ns(), _t_agent("writer"));
     var ag_v = map_get(agnosai_task_result_metadata(ag_r), str_from("agent"));
     assert(ag_v != 0 && bayan_json_v_is_str(ag_v) == 1,
       "an assigned task's success metadata carries `agent`, as a string");
@@ -1781,6 +2004,8 @@ fn main() {
     # Clean content produces no findings, so the flag path is not a constant.
     assert_eq(vec_len(agnosai_output_scan(str_from("an ordinary answer"),
           str_from("unrelated system prompt"))), 0, "clean output flags nothing");
+
+    _t_schema_suite();
 
     return assert_summary();
 }

@@ -71,7 +71,9 @@ enum AgnosaiInferenceReqOff {
     AGN_REQ_MAX_TOKENS = 16;
     AGN_REQ_TEMPERATURE_MILLI = 24;
     AGN_REQ_STREAM = 32;
-    AGN_INFER_REQ_SIZE = 40;
+    # The allocator this request and its answer come from (ADR 028).
+    AGN_REQ_ALLOC = 40;
+    AGN_INFER_REQ_SIZE = 48;
 }
 
 # InferenceResponse heap layout — 40 bytes.
@@ -155,13 +157,18 @@ fn agnosai_chat_role_from_wire(s: Str): i64 {
 
 # The snake_case spelling of a provider. See the enum's note on wire fidelity.
 fn agnosai_provider_to_wire(provider): i64 {
-    if (provider == AGNOSAI_PROVIDER_ANTHROPIC) { return str_from("anthropic"); }
-    if (provider == AGNOSAI_PROVIDER_GOOGLE) { return str_from("google"); }
-    if (provider == AGNOSAI_PROVIDER_MISTRAL) { return str_from("mistral"); }
-    if (provider == AGNOSAI_PROVIDER_DEEPSEEK) { return str_from("deep_seek"); }
-    if (provider == AGNOSAI_PROVIDER_GROK) { return str_from("grok"); }
-    if (provider == AGNOSAI_PROVIDER_OLLAMA) { return str_from("ollama"); }
-    return str_from("open_ai");
+    return agnosai_provider_to_wire_a(default_alloc(), provider);
+}
+
+# `agnosai_provider_to_wire`, in allocator `a`.
+fn agnosai_provider_to_wire_a(a, provider): i64 {
+    if (provider == AGNOSAI_PROVIDER_ANTHROPIC) { return str_from_a(a, "anthropic"); }
+    if (provider == AGNOSAI_PROVIDER_GOOGLE) { return str_from_a(a, "google"); }
+    if (provider == AGNOSAI_PROVIDER_MISTRAL) { return str_from_a(a, "mistral"); }
+    if (provider == AGNOSAI_PROVIDER_DEEPSEEK) { return str_from_a(a, "deep_seek"); }
+    if (provider == AGNOSAI_PROVIDER_GROK) { return str_from_a(a, "grok"); }
+    if (provider == AGNOSAI_PROVIDER_OLLAMA) { return str_from_a(a, "ollama"); }
+    return str_from_a(a, "open_ai");
 }
 
 # A provider from its spelling. Unknown spellings read as OpenAi.
@@ -177,7 +184,12 @@ fn agnosai_provider_from_wire(s: Str): i64 {
 
 # Create a chat message.
 fn agnosai_chat_message_new(role, content: Str): i64 {
-    var m = alloc(AGN_CHAT_SIZE);
+    return agnosai_chat_message_new_a(default_alloc(), role, content);
+}
+
+# `agnosai_chat_message_new`, in allocator `a`.
+fn agnosai_chat_message_new_a(a, role, content: Str): i64 {
+    var m = alloc_via(a, AGN_CHAT_SIZE);
     store64(m + AGN_CHAT_ROLE, role);
     store64(m + AGN_CHAT_CONTENT, content);
     return m;
@@ -211,24 +223,38 @@ fn agnosai_chat_message_to_value(m): i64 {
 # Create an inference request for a model. `max_tokens` and `temperature` start
 # unset; streaming starts off.
 fn agnosai_inference_request_new(model: Str): i64 {
-    var r = alloc(AGN_INFER_REQ_SIZE);
+    return agnosai_inference_request_new_a(default_alloc(), model);
+}
+
+# `agnosai_inference_request_new`, in allocator `a`. The request remembers `a`, so
+# the chat call's contract stays `fn(client, request, out_response, parent_sc)` and
+# the answer lands where the request lives: a suite's stub reads it the same way.
+fn agnosai_inference_request_new_a(a, model: Str): i64 {
+    var r = alloc_via(a, AGN_INFER_REQ_SIZE);
     store64(r + AGN_REQ_MODEL, model);
-    store64(r + AGN_REQ_MESSAGES, vec_new());
+    store64(r + AGN_REQ_MESSAGES, vec_new_a(a));
     store64(r + AGN_REQ_MAX_TOKENS, AGNOSAI_NO_LIMIT);
     store64(r + AGN_REQ_TEMPERATURE_MILLI, AGNOSAI_NO_LIMIT);
     store64(r + AGN_REQ_STREAM, 0);
+    store64(r + AGN_REQ_ALLOC, a);
     return r;
+}
+
+# The allocator this request and its answer come from.
+fn agnosai_inference_request_alloc(r): i64 {
+    return load64(r + AGN_REQ_ALLOC);
 }
 
 # Append a message. Returns the request so calls chain.
 fn agnosai_inference_request_with_message(r, m): i64 {
-    vec_push(load64(r + AGN_REQ_MESSAGES), m);
+    vec_push_a(load64(r + AGN_REQ_ALLOC), load64(r + AGN_REQ_MESSAGES), m);
     return r;
 }
 
 # Append a message built from a role and content. Returns the request.
 fn agnosai_inference_request_say(r, role, content: Str): i64 {
-    vec_push(load64(r + AGN_REQ_MESSAGES), agnosai_chat_message_new(role, content));
+    var a = load64(r + AGN_REQ_ALLOC);
+    vec_push_a(a, load64(r + AGN_REQ_MESSAGES), agnosai_chat_message_new_a(a, role, content));
     return r;
 }
 
@@ -340,7 +366,12 @@ fn agnosai_inference_request_to_json(r): Str {
 
 # Create an inference response.
 fn agnosai_inference_response_new(content: Str, model: Str): i64 {
-    var r = alloc(AGN_RESP_SIZE);
+    return agnosai_inference_response_new_a(default_alloc(), content, model);
+}
+
+# `agnosai_inference_response_new`, in allocator `a`.
+fn agnosai_inference_response_new_a(a, content: Str, model: Str): i64 {
+    var r = alloc_via(a, AGN_RESP_SIZE);
     store64(r + AGN_RESP_CONTENT, content);
     store64(r + AGN_RESP_MODEL, model);
     store64(r + AGN_RESP_PROMPT_TOKENS, 0);
@@ -375,6 +406,26 @@ fn agnosai_inference_response_completion_tokens(r): i64 {
 # Total tokens for the turn.
 fn agnosai_inference_response_total_tokens(r): i64 {
     return load64(r + AGN_RESP_PROMPT_TOKENS) + load64(r + AGN_RESP_COMPLETION_TOKENS);
+}
+
+# Add what an earlier call cost to `r`, so one answer can say what getting it took.
+#
+# A validation retry replaces the response it retried, and its tokens and cost
+# went with it, so a task that took three calls reported one. The cost keeps its
+# sentinel rule: a call that reported none adds nothing, and `r` keeps
+# `AGNOSAI_NO_LIMIT` only when neither reported one.
+fn agnosai_inference_response_carry_usage(r, prior): i64 {
+    store64(r + AGN_RESP_PROMPT_TOKENS,
+      load64(r + AGN_RESP_PROMPT_TOKENS) + load64(prior + AGN_RESP_PROMPT_TOKENS));
+    store64(r + AGN_RESP_COMPLETION_TOKENS,
+      load64(r + AGN_RESP_COMPLETION_TOKENS) + load64(prior + AGN_RESP_COMPLETION_TOKENS));
+    var earlier = load64(prior + AGN_RESP_COST_MICRO_USD);
+    if (earlier != AGNOSAI_NO_LIMIT) {
+        var cost = load64(r + AGN_RESP_COST_MICRO_USD);
+        if (cost == AGNOSAI_NO_LIMIT) { cost = 0; }
+        store64(r + AGN_RESP_COST_MICRO_USD, cost + earlier);
+    }
+    return r;
 }
 
 # Why generation stopped ("stop", "length", ...), or 0 when absent.
@@ -570,34 +621,41 @@ fn agnosai_hoosh_extract_models(body: Str): i64 {
 # whole body, so building a response from them parsed it five times on the
 # global bump. The fields are read off one tree by `_agnosai_hoosh_response_of`.
 fn agnosai_hoosh_response_from_body(body: Str): i64 {
-    return _agnosai_hoosh_response_of(agnosai_hoosh_parse_body(body));
+    return agnosai_hoosh_response_from_body_a(default_alloc(), body);
 }
 
-# A string field of `obj`, cloned onto the global allocator, or 0 when absent or
-# not a string. A response outlives the tree it was read from, which on the
-# chat path is an arena reset as soon as the call returns.
-fn _agnosai_hoosh_str_clone(obj, key): i64 {
+# `agnosai_hoosh_response_from_body`, in allocator `a`.
+fn agnosai_hoosh_response_from_body_a(a, body: Str): i64 {
+    return _agnosai_hoosh_response_of_a(a,
+      bayan_json_v_parse_buf_a(a, str_data(body), str_len(body)));
+}
+
+# A string field of `obj`, cloned into allocator `a`, or 0 when absent or not a
+# string. A response outlives the tree it was read from, which on the chat path is
+# an arena reset as soon as the call returns.
+fn _agnosai_hoosh_str_clone_a(a, obj, key): i64 {
     if (obj == 0) { return 0; }
     var f = bayan_json_v_obj_get_by_cstr(obj, key);
     if (f == 0) { return 0; }
     if (bayan_json_v_is_str(f) == 0) { return 0; }
-    return str_clone(bayan_json_v_str(f));
+    return str_clone_a(a, bayan_json_v_str(f));
 }
 
 # An InferenceResponse from a parsed body `v`, or 0 when it carries no content —
 # the same fields, defaults and sentinels as the `agnosai_hoosh_extract_*`
-# readers. Every string it keeps is a COPY, so `v` may live in an arena.
-fn _agnosai_hoosh_response_of(v): i64 {
+# readers. Every string it keeps is a COPY in `a`, so `v` may live in an arena.
+fn _agnosai_hoosh_response_of_a(a, v): i64 {
     var first = _agnosai_hoosh_first_choice(v);
     if (first == 0) { return 0; }
-    var content = _agnosai_hoosh_str_clone(bayan_json_v_obj_get_by_cstr(first, "message"), "content");
+    var content = _agnosai_hoosh_str_clone_a(a, bayan_json_v_obj_get_by_cstr(first, "message"),
+      "content");
     if (content == 0) { return 0; }
 
-    var model = _agnosai_hoosh_str_clone(v, "model");
-    if (model == 0) { model = str_from(""); }
+    var model = _agnosai_hoosh_str_clone_a(a, v, "model");
+    if (model == 0) { model = str_from_a(a, ""); }
 
-    var resp = agnosai_inference_response_new(content, model);
-    store64(resp + AGN_RESP_FINISH_REASON, _agnosai_hoosh_str_clone(first, "finish_reason"));
+    var resp = agnosai_inference_response_new_a(a, content, model);
+    store64(resp + AGN_RESP_FINISH_REASON, _agnosai_hoosh_str_clone_a(a, first, "finish_reason"));
 
     var cost = AGNOSAI_NO_LIMIT;
     var provider = 0;
@@ -605,7 +663,7 @@ fn _agnosai_hoosh_response_of(v): i64 {
     if (usage != 0 && bayan_json_v_is_obj(usage) == 1) {
         store64(resp + AGN_RESP_PROMPT_TOKENS, _agnosai_int_field(usage, "prompt_tokens", 0));
         store64(resp + AGN_RESP_COMPLETION_TOKENS, _agnosai_int_field(usage, "completion_tokens", 0));
-        provider = _agnosai_hoosh_str_clone(usage, "provider");
+        provider = _agnosai_hoosh_str_clone_a(a, usage, "provider");
         var c = bayan_json_v_obj_get_by_cstr(usage, "cost_micro_usd");
         if (c != 0 && bayan_json_v_is_int(c) == 1) { cost = bayan_json_v_int(c); }
     }
@@ -895,7 +953,8 @@ fn agnosai_hoosh_chat_in(base_url: Str, api_key: Str, request, out_response, par
     if (a == 0) {
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_error_type(_span, "no_response"));
-        return str_from("hoosh transport error: no arena for the request");
+        return str_from_a(agnosai_inference_request_alloc(request),
+          "hoosh transport error: no arena for the request");
     }
     var rc = _agnosai_hoosh_chat_a(a, base_url, api_key, request, out_response,
       _span, _self, parent_sc, _t0);
@@ -961,24 +1020,26 @@ fn _agnosai_hoosh_log_transport_a(a, url, kind): i64 {
 }
 
 # The body of `agnosai_hoosh_chat_in`, in arena `a`. ⚠ **Nothing it returns may
-# point into `a`**: the caller resets it. Error strings are built on the global
-# bump (the caller keeps them), and the response's strings are copies.
+# point into `a`**: the caller resets it. Error strings and the response are built
+# where the request lives (`ra`), so a crew in an arena gets them back with the rest
+# of it, and a request on the global heap keeps what it always had.
 fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
   _span, _self, parent_sc, _t0): i64 {
+    var ra = agnosai_inference_request_alloc(request);
     var url = _agnosai_hoosh_endpoint_cstr_a(a, base_url);
     var headers = _agnosai_hoosh_headers_a(a, api_key);
     var body = agnosai_inference_request_to_json_a(a, request);
     if (url == 0 || headers == 0 || body == 0) {
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_error_type(_span, "no_response"));
-        return str_from("hoosh transport error: could not build the request");
+        return str_from_a(ra, "hoosh transport error: could not build the request");
     }
 
     var r = sandhi_http_post_opts_a(a, url, headers, str_data(body), str_len(body), _AGNOSAI_HOOSH_OPTS);
     if (r == 0) {
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_error_type(_span, "no_response"));
-        return str_from("hoosh transport error: no response allocated");
+        return str_from_a(ra, "hoosh transport error: no response allocated");
     }
     var kind = sandhi_http_err_kind(r);
     if (kind != SANDHI_OK) {
@@ -987,12 +1048,12 @@ fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
         # named the gateway's URL through 2.2.3, password included for a URL with userinfo.
         # The log line says which gateway instead, and that line is the operator's.
         _agnosai_hoosh_log_transport_a(a, url, kind);
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "hoosh transport error: ");
-        str_builder_add_cstr(sb, sandhi_err_kind_name(kind));
+        var sb = str_builder_new_a(a);
+        str_builder_add_cstr_a(a, sb, "hoosh transport error: ");
+        str_builder_add_cstr_a(a, sb, sandhi_err_kind_name(kind));
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_kind_error_type(_span, kind));
-        return str_builder_build(sb);
+        return str_builder_build_a(ra, sb);
     }
 
     var status = sandhi_http_status(r);
@@ -1001,24 +1062,24 @@ fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
     var tree = bayan_json_v_parse_buf_a(a, sandhi_http_body(r), sandhi_http_body_len(r));
 
     if (status < 200 || status >= 300) {
-        var esb = str_builder_new();
-        str_builder_add_cstr(esb, "hoosh returned HTTP ");
-        str_builder_add_int(esb, status);
+        var esb = str_builder_new_a(a);
+        str_builder_add_cstr_a(a, esb, "hoosh returned HTTP ");
+        str_builder_add_int_a(a, esb, status);
         var detail = _agnosai_hoosh_error_of(tree);
         if (detail != 0) {
-            str_builder_add_cstr(esb, ": ");
-            str_builder_add(esb, detail);
+            str_builder_add_cstr_a(a, esb, ": ");
+            str_builder_add_a(a, esb, detail);
         }
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_status_error_type(_span, status));
-        return str_builder_build(esb);
+        return str_builder_build_a(ra, esb);
     }
 
-    var parsed = _agnosai_hoosh_response_of(tree);
+    var parsed = _agnosai_hoosh_response_of_a(ra, tree);
     if (parsed == 0) {
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_error_type(_span, "invalid_response"));
-        return str_from("hoosh returned a body with no choices[0].message.content");
+        return str_from_a(ra, "hoosh returned a body with no choices[0].message.content");
     }
 
     # hoosh 2.6.0's cache signal. A HIT replays the cached body verbatim, cost
@@ -1075,7 +1136,12 @@ fn _agnosai_hoosh_client_chat_live(client, request, out_response, parent_sc): i6
 # Create a client over a base URL and an API key. Pass `str_from("")` for the
 # key when the gateway is unauthenticated.
 fn agnosai_hoosh_client_new(base_url: Str, api_key: Str): i64 {
-    var c = alloc(AGN_HC_SIZE);
+    return agnosai_hoosh_client_new_a(default_alloc(), base_url, api_key);
+}
+
+# `agnosai_hoosh_client_new`, in allocator `a`.
+fn agnosai_hoosh_client_new_a(a, base_url: Str, api_key: Str): i64 {
+    var c = alloc_via(a, AGN_HC_SIZE);
     store64(c + AGN_HC_BASE_URL, base_url);
     store64(c + AGN_HC_API_KEY, api_key);
     store64(c + AGN_HC_CHAT_FP, &_agnosai_hoosh_client_chat_live);

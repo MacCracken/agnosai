@@ -27,11 +27,15 @@ enum AgnosaiCrewStatus {
     AGNOSAI_CREW_CANCELLED = 4;
 }
 
-# CrewSpec heap layout — 64 bytes.
+# CrewSpec heap layout — 80 bytes.
 #
 # `TRACE_PARENT` is the caller's W3C `traceparent`, or 0 (ADR 023). It is
 # per-execution transport, not part of the crew's definition, so it is never
 # serialised — see `agnosai_crew_with_trace_parent`.
+#
+# `ARENA` is the arena the crew lives in, or 0 for the global heap (ADR 028). Set
+# by `agnosai_crew_new_in`, and read through `agnosai_crew_alloc`. `RUNS` counts the
+# orchestrator's runs of this spec still going, up to the last word of the last one.
 enum AgnosaiCrewSpecOff {
     AGN_CREW_ID = 0;
     AGN_CREW_NAME = 8;
@@ -41,7 +45,9 @@ enum AgnosaiCrewSpecOff {
     AGN_CREW_METADATA = 40;
     AGN_CREW_TRUST_LEVEL = 48;
     AGN_CREW_TRACE_PARENT = 56;
-    AGN_CREW_SIZE = 64;
+    AGN_CREW_ARENA = 64;
+    AGN_CREW_RUNS = 72;
+    AGN_CREW_SIZE = 80;
 }
 
 # CrewState heap layout — 32 bytes.
@@ -105,16 +111,37 @@ fn agnosai_crew_status_from_wire(s: Str): i64 {
 
 # Create a new crew spec with the given name and default settings.
 fn agnosai_crew_new(name: Str): i64 {
-    var c = alloc(AGN_CREW_SIZE);
-    store64(c + AGN_CREW_ID, agnosai_uuid_v4_str());
+    return agnosai_crew_new_a(default_alloc(), name);
+}
+
+# `agnosai_crew_new`, in allocator `a`. This only places the spec: the engine goes on
+# allocating from the global heap, as a request arena must not be asked to outlive
+# its request. `agnosai_crew_new_in` is the crew that lives in an arena.
+fn agnosai_crew_new_a(a, name: Str): i64 {
+    var c = alloc_via(a, AGN_CREW_SIZE);
+    store64(c + AGN_CREW_ID, agnosai_uuid_v4_str_a(a));
     store64(c + AGN_CREW_NAME, name);
-    store64(c + AGN_CREW_AGENTS, vec_new());
-    store64(c + AGN_CREW_TASKS, vec_new());
-    store64(c + AGN_CREW_PROCESS, agnosai_process_sequential());
-    store64(c + AGN_CREW_METADATA, map_new_str());
-    store64(c + AGN_CREW_TRUST_LEVEL, agnosai_default_trust_level());
+    store64(c + AGN_CREW_AGENTS, vec_new_a(a));
+    store64(c + AGN_CREW_TASKS, vec_new_a(a));
+    store64(c + AGN_CREW_PROCESS, agnosai_process_sequential_a(a));
+    store64(c + AGN_CREW_METADATA, map_new_str_a(a));
+    store64(c + AGN_CREW_TRUST_LEVEL, str_from_a(a, "basic"));
     store64(c + AGN_CREW_TRACE_PARENT, 0);
+    store64(c + AGN_CREW_ARENA, 0);
+    store64(c + AGN_CREW_RUNS, 0);
     return c;
+}
+
+# The allocator everything of this crew comes from: its arena, or the global heap.
+fn agnosai_crew_alloc(c): i64 {
+    var a = load64(c + AGN_CREW_ARENA);
+    if (a == 0) { return default_alloc(); }
+    return a;
+}
+
+# The arena this crew lives in, or 0 when it is on the global heap.
+fn agnosai_crew_arena(c): i64 {
+    return load64(c + AGN_CREW_ARENA);
 }
 
 # Set the crew's agent roster (a vec of agent definitions). Returns the crew.
@@ -161,7 +188,7 @@ fn agnosai_crew_with_trust_level(c, level: Str): i64 {
 fn agnosai_crew_with_trace_parent(c, tp: Str): i64 {
     var v = 0;
     if (tp != 0) {
-        if (str_len(tp) == 55) { v = str_clone(tp); }
+        if (str_len(tp) == 55) { v = str_clone_a(agnosai_crew_alloc(c), tp); }
     }
     store64(c + AGN_CREW_TRACE_PARENT, v);
     return c;
@@ -174,7 +201,8 @@ fn agnosai_crew_trace_parent(c): i64 {
 
 # Attach a metadata key-value pair. `value` is a bayan JSON value.
 fn agnosai_crew_with_metadata(c, key: Str, value): i64 {
-    map_set(load64(c + AGN_CREW_METADATA), str_clone(key), value);
+    var a = agnosai_crew_alloc(c);
+    map_set_a(a, load64(c + AGN_CREW_METADATA), str_clone_a(a, key), value);
     return c;
 }
 
@@ -312,13 +340,18 @@ fn agnosai_crew_from_json(src: Str): i64 {
 
 # Create an empty execution profile.
 fn agnosai_crew_profile_new(): i64 {
-    var p = alloc(AGN_PROF_SIZE);
+    return agnosai_crew_profile_new_a(default_alloc());
+}
+
+# `agnosai_crew_profile_new`, in allocator `a`.
+fn agnosai_crew_profile_new_a(a): i64 {
+    var p = alloc_via(a, AGN_PROF_SIZE);
     store64(p + AGN_PROF_WALL_MS, 0);
-    store64(p + AGN_PROF_TASK_MS, map_new_str());
+    store64(p + AGN_PROF_TASK_MS, map_new_str_a(a));
     store64(p + AGN_PROF_TASK_COUNT, 0);
     store64(p + AGN_PROF_COST_MICRO_USD, 0);
-    store64(p + AGN_PROF_AGENT_COST, map_new_str());
-    store64(p + AGN_PROF_TASK_COST, map_new_str());
+    store64(p + AGN_PROF_AGENT_COST, map_new_str_a(a));
+    store64(p + AGN_PROF_TASK_COST, map_new_str_a(a));
     store64(p + AGN_PROF_SANDBOX_STRENGTH, AGNOSAI_NO_LIMIT);
     return p;
 }
@@ -341,7 +374,12 @@ fn agnosai_crew_profile_task_ms(p): i64 {
 
 # Record a task's duration in milliseconds. Returns the profile.
 fn agnosai_crew_profile_record_task_ms(p, task_id, ms): i64 {
-    map_set(load64(p + AGN_PROF_TASK_MS), task_id, ms);
+    return agnosai_crew_profile_record_task_ms_a(default_alloc(), p, task_id, ms);
+}
+
+# `agnosai_crew_profile_record_task_ms`, for a profile built in allocator `a`.
+fn agnosai_crew_profile_record_task_ms_a(a, p, task_id, ms): i64 {
+    map_set_a(a, load64(p + AGN_PROF_TASK_MS), task_id, ms);
     return p;
 }
 
@@ -386,8 +424,13 @@ fn agnosai_crew_profile_agent_cost(p): i64 {
 # would swap the owned clone out for a borrow. Same allocation as before the
 # change, which cloned per call too.
 fn agnosai_crew_profile_record_agent_cost(p, agent_key: Str, micro_usd): i64 {
+    return agnosai_crew_profile_record_agent_cost_a(default_alloc(), p, agent_key, micro_usd);
+}
+
+# `agnosai_crew_profile_record_agent_cost`, for a profile built in allocator `a`.
+fn agnosai_crew_profile_record_agent_cost_a(a, p, agent_key: Str, micro_usd): i64 {
     var m = load64(p + AGN_PROF_AGENT_COST);
-    map_set(m, str_clone(agent_key), map_get_or(m, agent_key, 0) + micro_usd);
+    map_set_a(a, m, str_clone_a(a, agent_key), map_get_or(m, agent_key, 0) + micro_usd);
     return p;
 }
 
@@ -398,7 +441,12 @@ fn agnosai_crew_profile_task_cost(p): i64 {
 
 # Record a task's cost in micro-USD. Returns the profile.
 fn agnosai_crew_profile_record_task_cost(p, task_id, micro_usd): i64 {
-    map_set(load64(p + AGN_PROF_TASK_COST), task_id, micro_usd);
+    return agnosai_crew_profile_record_task_cost_a(default_alloc(), p, task_id, micro_usd);
+}
+
+# `agnosai_crew_profile_record_task_cost`, for a profile built in allocator `a`.
+fn agnosai_crew_profile_record_task_cost_a(a, p, task_id, micro_usd): i64 {
+    map_set_a(a, load64(p + AGN_PROF_TASK_COST), task_id, micro_usd);
     return p;
 }
 
@@ -567,10 +615,15 @@ fn agnosai_crew_profile_from_value(v): i64 {
 
 # Create a crew execution state.
 fn agnosai_crew_state_new(crew_id, status): i64 {
-    var s = alloc(AGN_CSTATE_SIZE);
+    return agnosai_crew_state_new_a(default_alloc(), crew_id, status);
+}
+
+# `agnosai_crew_state_new`, in allocator `a`.
+fn agnosai_crew_state_new_a(a, crew_id, status): i64 {
+    var s = alloc_via(a, AGN_CSTATE_SIZE);
     store64(s + AGN_CSTATE_CREW_ID, crew_id);
     store64(s + AGN_CSTATE_STATUS, status);
-    store64(s + AGN_CSTATE_RESULTS, vec_new());
+    store64(s + AGN_CSTATE_RESULTS, vec_new_a(a));
     store64(s + AGN_CSTATE_PROFILE, 0);
     return s;
 }
@@ -614,7 +667,12 @@ fn agnosai_crew_state_with_profile(s, profile): i64 {
 
 # Append a task result. Returns the state.
 fn agnosai_crew_state_with_result(s, result): i64 {
-    vec_push(load64(s + AGN_CSTATE_RESULTS), result);
+    return agnosai_crew_state_with_result_a(default_alloc(), s, result);
+}
+
+# `agnosai_crew_state_with_result`, for a state built in allocator `a`.
+fn agnosai_crew_state_with_result_a(a, s, result): i64 {
+    vec_push_a(a, load64(s + AGN_CSTATE_RESULTS), result);
     return s;
 }
 

@@ -37,12 +37,17 @@ fn _agnosai_hex_digit(n): i64 {
     return 87 + n;
 }
 
-# Generate a random (version 4) UUID.
-fn agnosai_uuid_v4(): i64 {
-    var u = alloc(AGNOSAI_UUID_BYTES);
+# Generate a random (version 4) UUID, in allocator `a`.
+fn agnosai_uuid_v4_a(a): i64 {
+    var u = alloc_via(a, AGNOSAI_UUID_BYTES);
     random_bytes(u, AGNOSAI_UUID_BYTES);
     _agnosai_uuid_stamp(u, 4);
     return u;
+}
+
+# Global-allocator form of `agnosai_uuid_v4_a`.
+fn agnosai_uuid_v4(): i64 {
+    return agnosai_uuid_v4_a(default_alloc());
 }
 
 # Generate a name-based (version 5, SHA-1) UUID: SHA-1 over the 16-byte
@@ -81,8 +86,8 @@ fn agnosai_uuid_version(u): i64 {
 }
 
 # Render a UUID in the canonical lowercase 8-4-4-4-12 hyphenated form.
-fn agnosai_uuid_to_str(u): i64 {
-    var out = alloc(AGNOSAI_UUID_STR_LEN + 1);
+fn agnosai_uuid_to_str_a(a, u): i64 {
+    var out = alloc_via(a, AGNOSAI_UUID_STR_LEN + 1);
     var pos = 0;
     for (var i = 0; i < AGNOSAI_UUID_BYTES; i = i + 1) {
         if (i == 4) { store8(out + pos, 45); pos = pos + 1; }
@@ -95,7 +100,12 @@ fn agnosai_uuid_to_str(u): i64 {
         pos = pos + 2;
     }
     store8(out + pos, 0);
-    return str_new(out, AGNOSAI_UUID_STR_LEN);
+    return str_new_a(a, out, AGNOSAI_UUID_STR_LEN);
+}
+
+# Global-allocator form of `agnosai_uuid_to_str_a`.
+fn agnosai_uuid_to_str(u): i64 {
+    return agnosai_uuid_to_str_a(default_alloc(), u);
 }
 
 # Walk a canonical hyphenated UUID string, writing the decoded bytes through
@@ -203,6 +213,11 @@ fn agnosai_uuid_parse(s: Str): i64 {
 # buffers `agnosai_uuid_v4` returns.
 fn agnosai_uuid_v4_str(): i64 {
     return agnosai_uuid_to_str(agnosai_uuid_v4());
+}
+
+# `agnosai_uuid_v4_str`, in allocator `a`.
+fn agnosai_uuid_v4_str_a(a): i64 {
+    return agnosai_uuid_to_str_a(a, agnosai_uuid_v4_a(a));
 }
 
 # Validate and canonicalise a UUID string, or 0 when it is not a UUID.

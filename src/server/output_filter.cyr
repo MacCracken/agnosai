@@ -117,7 +117,12 @@ fn agnosai_finding_redacted(f): i64 {
 
 # Build a finding.
 fn agnosai_finding_new(category: Str, pattern: Str, redacted): i64 {
-    var f = alloc(AGN_FD_SIZE);
+    return agnosai_finding_new_a(default_alloc(), category, pattern, redacted);
+}
+
+# `agnosai_finding_new`, in allocator `a`.
+fn agnosai_finding_new_a(a, category: Str, pattern: Str, redacted): i64 {
+    var f = alloc_via(a, AGN_FD_SIZE);
     store64(f + AGN_FD_CATEGORY, category);
     store64(f + AGN_FD_PATTERN, pattern);
     store64(f + AGN_FD_REDACTED, redacted);
@@ -129,31 +134,31 @@ fn agnosai_finding_new(category: Str, pattern: Str, redacted): i64 {
 #
 # Note `"Bearer "` carries its trailing space, which is what makes redaction of
 # that pattern behave the way the module header describes.
-fn _agnosai_api_key_prefix(i): i64 {
-    if (i == 0) { return str_from("AKIA"); }
-    if (i == 1) { return str_from("ASIA"); }
-    if (i == 2) { return str_from("ghp_"); }
-    if (i == 3) { return str_from("gho_"); }
-    if (i == 4) { return str_from("ghs_"); }
-    if (i == 5) { return str_from("ghr_"); }
-    if (i == 6) { return str_from("github_pat_"); }
-    if (i == 7) { return str_from("sk-"); }
-    if (i == 8) { return str_from("Bearer "); }
-    return str_from("xox");
+fn _agnosai_api_key_prefix_a(a, i): i64 {
+    if (i == 0) { return str_from_a(a, "AKIA"); }
+    if (i == 1) { return str_from_a(a, "ASIA"); }
+    if (i == 2) { return str_from_a(a, "ghp_"); }
+    if (i == 3) { return str_from_a(a, "gho_"); }
+    if (i == 4) { return str_from_a(a, "ghs_"); }
+    if (i == 5) { return str_from_a(a, "ghr_"); }
+    if (i == 6) { return str_from_a(a, "github_pat_"); }
+    if (i == 7) { return str_from_a(a, "sk-"); }
+    if (i == 8) { return str_from_a(a, "Bearer "); }
+    return str_from_a(a, "xox");
 }
 
 # The description paired with each prefix.
-fn _agnosai_api_key_desc(i): i64 {
-    if (i == 0) { return str_from("AWS access key"); }
-    if (i == 1) { return str_from("AWS temporary access key"); }
-    if (i == 2) { return str_from("GitHub personal access token"); }
-    if (i == 3) { return str_from("GitHub OAuth token"); }
-    if (i == 4) { return str_from("GitHub server token"); }
-    if (i == 5) { return str_from("GitHub refresh token"); }
-    if (i == 6) { return str_from("GitHub fine-grained PAT"); }
-    if (i == 7) { return str_from("OpenAI / Stripe secret key"); }
-    if (i == 8) { return str_from("Bearer token"); }
-    return str_from("Slack token");
+fn _agnosai_api_key_desc_a(a, i): i64 {
+    if (i == 0) { return str_from_a(a, "AWS access key"); }
+    if (i == 1) { return str_from_a(a, "AWS temporary access key"); }
+    if (i == 2) { return str_from_a(a, "GitHub personal access token"); }
+    if (i == 3) { return str_from_a(a, "GitHub OAuth token"); }
+    if (i == 4) { return str_from_a(a, "GitHub server token"); }
+    if (i == 5) { return str_from_a(a, "GitHub refresh token"); }
+    if (i == 6) { return str_from_a(a, "GitHub fine-grained PAT"); }
+    if (i == 7) { return str_from_a(a, "OpenAI / Stripe secret key"); }
+    if (i == 8) { return str_from_a(a, "Bearer token"); }
+    return str_from_a(a, "Slack token");
 }
 
 # How many API-key prefixes there are.
@@ -279,30 +284,49 @@ fn agnosai_contains_ssn(text: Str): i64 {
 # window-loop quirks this reproduces: a prompt of 50 bytes or fewer is never
 # detected, and the final window is never checked.
 fn agnosai_contains_prompt_leak(response: Str, system_prompt: Str): i64 {
+    return agnosai_contains_prompt_leak_a(default_alloc(), response, system_prompt);
+}
+
+# Whether the `n` bytes at `needle` occur in the `hlen` bytes at `hay`.
+fn _agnosai_bytes_contain(hay, hlen, needle, n): i64 {
+    for (var i = 0; i + n <= hlen; i = i + 1) {
+        if (memeq(hay + i, needle, n) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# `agnosai_contains_prompt_leak`, with its two lowered copies in allocator `a`.
+#
+# ⚠ **A window is compared in place, and is not a `Str`.** This minted a 16-byte header
+# per window on the no-free bump, so a 300-byte prompt cost 4 KiB on every task a model
+# answered, for good, and it was the largest single thing that path left behind.
+fn agnosai_contains_prompt_leak_a(a, response: Str, system_prompt: Str): i64 {
     var plen = str_len(system_prompt);
     if (plen == 0) { return 0; }
     var threshold = AGNOSAI_LEAK_WINDOW;
     if (plen < threshold) { threshold = plen; }
     if (threshold == 0) { return 0; }
 
-    var lower_resp = _agnosai_to_ascii_lower(response);
-    var lower_prompt = _agnosai_to_ascii_lower(system_prompt);
+    var lower_resp = _agnosai_to_ascii_lower_a(a, response);
+    var lower_prompt = _agnosai_to_ascii_lower_a(a, system_prompt);
     var pd = str_data(lower_prompt);
+    var rd = str_data(lower_resp);
+    var rlen = str_len(lower_resp);
 
     # The oracle's exclusive `0..len - threshold`.
     for (var start = 0; start < plen - threshold; start = start + 1) {
-        if (str_contains(lower_resp, str_new(pd + start, threshold)) == 1) { return 1; }
+        if (_agnosai_bytes_contain(rd, rlen, pd + start, threshold) == 1) { return 1; }
     }
     return 0;
 }
 
 # The oracle's `warn!` when a scan finds anything.
-fn _agnosai_filter_warn(count): i64 {
+fn _agnosai_filter_warn_a(a, count): i64 {
     if (sakshi_get_level() < SK_WARN) { return 0; }
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "count=");
-    str_builder_add_int(sb, count);
-    var line = str_builder_build(sb);
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "count=");
+    str_builder_add_int_a(a, sb, count);
+    var line = str_builder_build_a(a, sb);
     sakshi_log_kv(SK_WARN, "output filter detected sensitive information", 44, "filter", 6,
       str_data(line), str_len(line));
     return 0;
@@ -313,59 +337,80 @@ fn _agnosai_filter_warn(count): i64 {
 #
 # The order is the oracle's and is observable: system-prompt leakage first, then
 # each API-key prefix in table order, then email, phone and SSN.
-fn agnosai_output_scan(response: Str, system_prompt: Str): i64 {
-    var findings = vec_new();
+fn agnosai_output_scan_a(a, response: Str, system_prompt: Str): i64 {
+    var findings = vec_new_a(a);
 
-    if (agnosai_contains_prompt_leak(response, system_prompt) == 1) {
-        vec_push(findings, agnosai_finding_new(str_from(AGNOSAI_FINDING_SYSTEM_PROMPT),
-            str_from("system prompt text detected in response"), 0));
+    if (agnosai_contains_prompt_leak_a(a, response, system_prompt) == 1) {
+        vec_push_a(a, findings, agnosai_finding_new_a(a, str_from_a(a, AGNOSAI_FINDING_SYSTEM_PROMPT),
+            str_from_a(a, "system prompt text detected in response"), 0));
     }
 
     for (var i = 0; i < AGNOSAI_API_KEY_PATTERNS; i = i + 1) {
-        if (str_contains(response, _agnosai_api_key_prefix(i)) == 1) {
-            vec_push(findings, agnosai_finding_new(str_from(AGNOSAI_FINDING_API_KEY),
-                _agnosai_api_key_desc(i), 0));
+        if (str_contains(response, _agnosai_api_key_prefix_a(a, i)) == 1) {
+            vec_push_a(a, findings, agnosai_finding_new_a(a, str_from_a(a, AGNOSAI_FINDING_API_KEY),
+                _agnosai_api_key_desc_a(a, i), 0));
         }
     }
 
     if (agnosai_contains_email(response) == 1) {
-        vec_push(findings, agnosai_finding_new(str_from(AGNOSAI_FINDING_PII),
-            str_from("email address"), 0));
+        vec_push_a(a, findings, agnosai_finding_new_a(a, str_from_a(a, AGNOSAI_FINDING_PII),
+            str_from_a(a, "email address"), 0));
     }
     if (agnosai_contains_phone(response) == 1) {
-        vec_push(findings, agnosai_finding_new(str_from(AGNOSAI_FINDING_PII),
-            str_from("phone number"), 0));
+        vec_push_a(a, findings, agnosai_finding_new_a(a, str_from_a(a, AGNOSAI_FINDING_PII),
+            str_from_a(a, "phone number"), 0));
     }
     if (agnosai_contains_ssn(response) == 1) {
-        vec_push(findings, agnosai_finding_new(str_from(AGNOSAI_FINDING_PII),
-            str_from("social security number"), 0));
+        vec_push_a(a, findings, agnosai_finding_new_a(a, str_from_a(a, AGNOSAI_FINDING_PII),
+            str_from_a(a, "social security number"), 0));
     }
 
-    if (vec_len(findings) > 0) { _agnosai_filter_warn(vec_len(findings)); }
+    if (vec_len(findings) > 0) { _agnosai_filter_warn_a(a, vec_len(findings)); }
     return findings;
+}
+
+# Global-allocator form of `agnosai_output_scan_a`.
+fn agnosai_output_scan(response: Str, system_prompt: Str): i64 {
+    return agnosai_output_scan_a(default_alloc(), response, system_prompt);
+}
+
+# Copy the bytes `from..to` of `d` onto a builder in allocator `a`. The redactors copy
+# what they keep as runs, since the stdlib's `str_builder_putc` has no `_a` form, and a
+# `cstr` byte at a time would lose a NUL the text may hold.
+fn _agnosai_sb_add_run_a(a, sb, d, from, to): i64 {
+    if (to <= from) { return 0; }
+    return str_builder_add_a(a, sb, str_new_a(a, d + from, to - from));
 }
 
 # Replace every SSN pattern with `[REDACTED]`.
 #
 # Bytes are copied through unchanged — unlike the oracle, which re-encodes each
 # byte as a char and so mangles non-ASCII. See the module header.
-fn agnosai_redact_ssn(text: Str): i64 {
+fn agnosai_redact_ssn_a(a, text: Str): i64 {
     var len = str_len(text);
     if (len < 11) { return text; }
     var d = str_data(text);
-    var sb = str_builder_new();
+    var sb = str_builder_new_a(a);
 
     var i = 0;
+    var run = 0;
     while (i < len) {
         if (i + 11 <= len && _agnosai_ssn_at(d, i) == 1) {
-            str_builder_add_cstr(sb, AGNOSAI_REDACTED);
+            _agnosai_sb_add_run_a(a, sb, d, run, i);
+            str_builder_add_cstr_a(a, sb, AGNOSAI_REDACTED);
             i = i + 11;
+            run = i;
         } else {
-            str_builder_putc(sb, load8(d + i) & 255);
             i = i + 1;
         }
     }
-    return str_builder_build(sb);
+    _agnosai_sb_add_run_a(a, sb, d, run, len);
+    return str_builder_build_a(a, sb);
+}
+
+# Global-allocator form of `agnosai_redact_ssn_a`.
+fn agnosai_redact_ssn(text: Str): i64 {
+    return agnosai_redact_ssn_a(default_alloc(), text);
 }
 
 # Whether a byte can appear in an email's local part.
@@ -389,15 +434,16 @@ fn _agnosai_email_domain_byte(b): i64 {
 # oracle rewinds already-written local-part characters; this looks ahead
 # instead, deciding the span before emitting any of it — same output, and no
 # builder truncate is needed (the stdlib has none).
-fn agnosai_redact_email(text: Str): i64 {
+fn agnosai_redact_email_a(a, text: Str): i64 {
     var len = str_len(text);
     var d = str_data(text);
-    var sb = str_builder_new();
+    var sb = str_builder_new_a(a);
 
     # Look AHEAD for the '@' rather than reacting to it, so the span is decided
     # before any of it is emitted. The oracle emits then rewinds; there is no
     # builder truncate here, and deciding first is the same output either way.
     var i = 0;
+    var run = 0;
     while (i < len) {
         var span_end = 0 - 1;
         if (_agnosai_email_local_byte(load8(d + i) & 255) == 1) {
@@ -420,14 +466,21 @@ fn agnosai_redact_email(text: Str): i64 {
         }
 
         if (span_end >= 0) {
-            str_builder_add_cstr(sb, AGNOSAI_REDACTED);
+            _agnosai_sb_add_run_a(a, sb, d, run, i);
+            str_builder_add_cstr_a(a, sb, AGNOSAI_REDACTED);
             i = span_end;
+            run = i;
         } else {
-            str_builder_putc(sb, load8(d + i) & 255);
             i = i + 1;
         }
     }
-    return str_builder_build(sb);
+    _agnosai_sb_add_run_a(a, sb, d, run, len);
+    return str_builder_build_a(a, sb);
+}
+
+# Global-allocator form of `agnosai_redact_email_a`.
+fn agnosai_redact_email(text: Str): i64 {
+    return agnosai_redact_email_a(default_alloc(), text);
 }
 
 # Redact API-key spans, then SSNs, then emails — the oracle's order.
@@ -459,11 +512,11 @@ fn _agnosai_is_unicode_space(cp): i64 {
 #
 # Each prefix is redacted from its match to the next Unicode whitespace, or to
 # `prefix + 20` bytes when the token runs to the end.
-fn agnosai_output_redact(response: Str): i64 {
+fn agnosai_output_redact_a(a, response: Str): i64 {
     var result = response;
 
     for (var i = 0; i < AGNOSAI_API_KEY_PATTERNS; i = i + 1) {
-        var prefix = _agnosai_api_key_prefix(i);
+        var prefix = _agnosai_api_key_prefix_a(a, i);
         var plen = str_len(prefix);
         # ⚠ **No iteration cap.** This was `while (guard < 1000)`, which silently
         # stopped after a thousand replacements of one prefix and left occurrence
@@ -493,13 +546,18 @@ fn agnosai_output_redact(response: Str): i64 {
             }
             if (token_end < pos + plen) { token_end = pos + plen; }
 
-            var sb = str_builder_new();
-            str_builder_add(sb, str_new(d, pos));
-            str_builder_add_cstr(sb, AGNOSAI_REDACTED);
-            str_builder_add(sb, str_new(d + token_end, len - token_end));
-            result = str_builder_build(sb);
+            var sb = str_builder_new_a(a);
+            str_builder_add_a(a, sb, str_new_a(a, d, pos));
+            str_builder_add_cstr_a(a, sb, AGNOSAI_REDACTED);
+            str_builder_add_a(a, sb, str_new_a(a, d + token_end, len - token_end));
+            result = str_builder_build_a(a, sb);
         }
     }
 
-    return agnosai_redact_email(agnosai_redact_ssn(result));
+    return agnosai_redact_email_a(a, agnosai_redact_ssn_a(a, result));
+}
+
+# Global-allocator form of `agnosai_output_redact_a`.
+fn agnosai_output_redact(response: Str): i64 {
+    return agnosai_output_redact_a(default_alloc(), response);
 }

@@ -213,40 +213,53 @@ fn agnosai_task_status_from_wire(s: Str): i64 {
     return AGNOSAI_STATUS_PENDING;
 }
 
+# A process record in allocator `a`, every field stated.
+fn _agnosai_process_new_a(a, kind, manager, max_concurrency): i64 {
+    var p = alloc_via(a, AGN_PROC_SIZE);
+    store64(p + AGN_PROC_KIND, kind);
+    store64(p + AGN_PROC_MANAGER, manager);
+    store64(p + AGN_PROC_MAX_CONCURRENCY, max_concurrency);
+    return p;
+}
+
+# Execute tasks one after another in order, in allocator `a`.
+fn agnosai_process_sequential_a(a): i64 {
+    return _agnosai_process_new_a(a, AGNOSAI_PROCESS_SEQUENTIAL, 0, 0);
+}
+
 # Execute tasks one after another in order.
 fn agnosai_process_sequential(): i64 {
-    var p = alloc(AGN_PROC_SIZE);
-    store64(p + AGN_PROC_KIND, AGNOSAI_PROCESS_SEQUENTIAL);
-    store64(p + AGN_PROC_MANAGER, 0);
-    store64(p + AGN_PROC_MAX_CONCURRENCY, 0);
-    return p;
+    return agnosai_process_sequential_a(default_alloc());
+}
+
+# A manager agent delegates and coordinates sub-tasks, in allocator `a`.
+fn agnosai_process_hierarchical_a(a, manager): i64 {
+    return _agnosai_process_new_a(a, AGNOSAI_PROCESS_HIERARCHICAL, manager, 0);
 }
 
 # A manager agent delegates and coordinates sub-tasks.
 fn agnosai_process_hierarchical(manager): i64 {
-    var p = alloc(AGN_PROC_SIZE);
-    store64(p + AGN_PROC_KIND, AGNOSAI_PROCESS_HIERARCHICAL);
-    store64(p + AGN_PROC_MANAGER, manager);
-    store64(p + AGN_PROC_MAX_CONCURRENCY, 0);
-    return p;
+    return agnosai_process_hierarchical_a(default_alloc(), manager);
+}
+
+# Execute respecting a directed acyclic graph of dependencies, in allocator `a`.
+fn agnosai_process_dag_a(a): i64 {
+    return _agnosai_process_new_a(a, AGNOSAI_PROCESS_DAG, 0, 0);
 }
 
 # Execute respecting a directed acyclic graph of dependencies.
 fn agnosai_process_dag(): i64 {
-    var p = alloc(AGN_PROC_SIZE);
-    store64(p + AGN_PROC_KIND, AGNOSAI_PROCESS_DAG);
-    store64(p + AGN_PROC_MANAGER, 0);
-    store64(p + AGN_PROC_MAX_CONCURRENCY, 0);
-    return p;
+    return agnosai_process_dag_a(default_alloc());
+}
+
+# Execute tasks concurrently up to a concurrency limit, in allocator `a`.
+fn agnosai_process_parallel_a(a, max_concurrency): i64 {
+    return _agnosai_process_new_a(a, AGNOSAI_PROCESS_PARALLEL, 0, max_concurrency);
 }
 
 # Execute tasks concurrently up to a concurrency limit.
 fn agnosai_process_parallel(max_concurrency): i64 {
-    var p = alloc(AGN_PROC_SIZE);
-    store64(p + AGN_PROC_KIND, AGNOSAI_PROCESS_PARALLEL);
-    store64(p + AGN_PROC_MANAGER, 0);
-    store64(p + AGN_PROC_MAX_CONCURRENCY, max_concurrency);
-    return p;
+    return agnosai_process_parallel_a(default_alloc(), max_concurrency);
 }
 
 # Which execution mode this is.
@@ -325,15 +338,21 @@ fn agnosai_process_from_value(v): i64 {
 # Create a new task with a description. Every other field takes the oracle's
 # default: no expected output, unassigned, Normal priority, Pending, Low risk.
 fn agnosai_task_new(description: Str): i64 {
-    var t = alloc(AGN_TASK_SIZE);
-    store64(t + AGN_TASK_ID, agnosai_uuid_v4_str());
+    return agnosai_task_new_a(default_alloc(), description);
+}
+
+# `agnosai_task_new`, in allocator `a`. A task of a crew in an arena is built here,
+# with its description in that arena too, so it goes when the crew does.
+fn agnosai_task_new_a(a, description: Str): i64 {
+    var t = alloc_via(a, AGN_TASK_SIZE);
+    store64(t + AGN_TASK_ID, agnosai_uuid_v4_str_a(a));
     store64(t + AGN_TASK_DESCRIPTION, description);
     store64(t + AGN_TASK_EXPECTED_OUTPUT, 0);
     store64(t + AGN_TASK_ASSIGNED_AGENT, 0);
     store64(t + AGN_TASK_PRIORITY, AGNOSAI_PRIORITY_NORMAL);
     store64(t + AGN_TASK_STATUS, AGNOSAI_STATUS_PENDING);
-    store64(t + AGN_TASK_DEPENDENCIES, vec_new());
-    store64(t + AGN_TASK_CONTEXT, map_new_str());
+    store64(t + AGN_TASK_DEPENDENCIES, vec_new_a(a));
+    store64(t + AGN_TASK_CONTEXT, map_new_str_a(a));
     store64(t + AGN_TASK_RISK, AGNOSAI_RISK_LOW);
     store64(t + AGN_TASK_OUTPUT_SCHEMA, 0);
     return t;
@@ -377,13 +396,23 @@ fn agnosai_task_with_status(t, status): i64 {
 
 # Add a dependency on another task. Returns the task.
 fn agnosai_task_with_dependency(t, dep): i64 {
-    vec_push(load64(t + AGN_TASK_DEPENDENCIES), dep);
+    return agnosai_task_with_dependency_a(default_alloc(), t, dep);
+}
+
+# `agnosai_task_with_dependency`, for a task built in allocator `a`.
+fn agnosai_task_with_dependency_a(a, t, dep): i64 {
+    vec_push_a(a, load64(t + AGN_TASK_DEPENDENCIES), dep);
     return t;
 }
 
 # Add a context key-value pair. `value` is a bayan JSON value. Returns the task.
 fn agnosai_task_with_context(t, key: Str, value): i64 {
-    map_set(load64(t + AGN_TASK_CONTEXT), str_clone(key), value);
+    return agnosai_task_with_context_a(default_alloc(), t, key, value);
+}
+
+# `agnosai_task_with_context`, for a task built in allocator `a`.
+fn agnosai_task_with_context_a(a, t, key: Str, value): i64 {
+    map_set_a(a, load64(t + AGN_TASK_CONTEXT), str_clone_a(a, key), value);
     return t;
 }
 
@@ -590,11 +619,16 @@ fn agnosai_task_from_json(src: Str): i64 {
 
 # Create a result produced by executing a task.
 fn agnosai_task_result_new(task_id, output: Str, status): i64 {
-    var r = alloc(AGN_TRES_SIZE);
+    return agnosai_task_result_new_a(default_alloc(), task_id, output, status);
+}
+
+# `agnosai_task_result_new`, in allocator `a`.
+fn agnosai_task_result_new_a(a, task_id, output: Str, status): i64 {
+    var r = alloc_via(a, AGN_TRES_SIZE);
     store64(r + AGN_TRES_TASK_ID, task_id);
     store64(r + AGN_TRES_OUTPUT, output);
     store64(r + AGN_TRES_STATUS, status);
-    store64(r + AGN_TRES_METADATA, map_new_str());
+    store64(r + AGN_TRES_METADATA, map_new_str_a(a));
     return r;
 }
 
@@ -620,7 +654,12 @@ fn agnosai_task_result_metadata(r): i64 {
 
 # Attach a metadata key-value pair. `value` is a bayan JSON value.
 fn agnosai_task_result_with_metadata(r, key: Str, value): i64 {
-    map_set(load64(r + AGN_TRES_METADATA), str_clone(key), value);
+    return agnosai_task_result_with_metadata_a(default_alloc(), r, key, value);
+}
+
+# `agnosai_task_result_with_metadata`, for a result built in allocator `a`.
+fn agnosai_task_result_with_metadata_a(a, r, key: Str, value): i64 {
+    map_set_a(a, load64(r + AGN_TRES_METADATA), str_clone_a(a, key), value);
     return r;
 }
 

@@ -333,12 +333,17 @@ fn agnosai_scheduler_ready_tasks(s, completed): i64 {
 # first. Equal priorities tie-break on raw UUID bytes there and on input order
 # here; see the module header.
 fn agnosai_topological_sort_tasks(tasks): i64 {
+    return agnosai_topological_sort_tasks_a(default_alloc(), tasks);
+}
+
+# `agnosai_topological_sort_tasks`, in allocator `al`.
+fn agnosai_topological_sort_tasks_a(al, tasks): i64 {
     var n = vec_len(tasks);
-    var in_degree = vec_new();
-    var dependents = vec_new();
+    var in_degree = vec_new_a(al);
+    var dependents = vec_new_a(al);
     for (var i = 0; i < n; i = i + 1) {
-        vec_push(in_degree, 0);
-        vec_push(dependents, vec_new());
+        vec_push_a(al, in_degree, 0);
+        vec_push_a(al, dependents, vec_new_a(al));
     }
 
     for (var a = 0; a < n; a = a + 1) {
@@ -348,16 +353,16 @@ fn agnosai_topological_sort_tasks(tasks): i64 {
             for (var b = 0; b < n; b = b + 1) {
                 if (str_eq(agnosai_task_id(vec_get(tasks, b)), dep_id) == 1) {
                     vec_set(in_degree, a, vec_get(in_degree, a) + 1);
-                    vec_push(vec_get(dependents, b), a);
+                    vec_push_a(al, vec_get(dependents, b), a);
                     break;
                 }
             }
         }
     }
 
-    var order = vec_new();
-    var taken = vec_new();
-    for (var t = 0; t < n; t = t + 1) { vec_push(taken, 0); }
+    var order = vec_new_a(al);
+    var taken = vec_new_a(al);
+    for (var t = 0; t < n; t = t + 1) { vec_push_a(al, taken, 0); }
 
     # A linear scan for the highest-priority ready task stands in for the
     # oracle's BinaryHeap. At the task counts a crew carries this is cheaper
@@ -374,7 +379,7 @@ fn agnosai_topological_sort_tasks(tasks): i64 {
         if (best < 0) { return 0; }
 
         vec_set(taken, best, 1);
-        vec_push(order, agnosai_task_id(vec_get(tasks, best)));
+        vec_push_a(al, order, agnosai_task_id(vec_get(tasks, best)));
         var kids = vec_get(dependents, best);
         for (var k = 0; k < vec_len(kids); k = k + 1) {
             var child = vec_get(kids, k);

@@ -1,0 +1,308 @@
+# =========================================================================
+# crew_arena — the memory one crew lives in, handed back whole (ADR 028).
+#
+# **Port-local. No oracle counterpart**, and there cannot be one: Rust frees on
+# drop. Lives at `src/` root per CLAUDE.md's rule for modules that do not mirror
+# `rust-old/`.
+#
+# ## The defect this exists to close
+#
+# The global heap has no `free`, so `agnosai_orchestrator_forget_crew` bounds how
+# many crews are reachable and not what they cost: about 9 KiB a crew of the
+# engine's, for the life of the process. A consumer that serves a million crews
+# spends 9 GiB, and only a restart gives it back.
+#
+# ## Why this and not `arena_pool`
+#
+# `src/arena_pool.cyr` lends an arena for one operation on one thread. A crew's
+# arena differs in three ways, and each is why it is its own module:
+#
+#   * **Several threads allocate from it at once.** A parallel crew's workers share
+#     it, and the stdlib's arena has no lock. `AGN_CRA_MUTEX` is held for the bump, so
+#     a crew contends only with itself.
+#   * **It is scrubbed on release.** A crew's prompts, answers and keys must not be
+#     readable by the next tenant through an allocation that was never written, and
+#     `arena_reset` only rewinds. A scrub also keeps the promise `alloc` makes, that
+#     memory arrives zeroed, which the engine's constructors have always relied on
+#     where they leave a field unset. `alloc_reset` learned the same lesson (the
+#     CVE-2026-34988 class, in `lib/alloc.cyr`).
+#   * **Its pool is unbounded and starts empty.** An arena is held until a consumer is
+#     finished with the crew, so the number held is the consumer's retention and not
+#     this process's concurrency: agnostic keeps thousands. A bounded `arena_pool`
+#     would have to prefill them, and drop what it could not park, which is a leak.
+#     Here an arena is minted when none is free and always parked.
+#
+# ## What it costs
+#
+# A pool settles at the most crews a consumer held at once times the most any of them
+# needed, then allocates nothing. A chunk is never returned, only reused: the bump
+# under it has no free. `chunk_bytes` is the common crew, and one that needs more
+# chains another chunk and keeps it.
+#
+# A crew that is never released keeps its arena, which costs what it always did,
+# rounded up to a chunk. So a consumer opts in crew by crew, with
+# `agnosai_crew_new_in`, and one that does not is unchanged.
+# =========================================================================
+
+# Chunk header. The data follows at `AGN_CC_HEADER`.
+enum AgnosaiCrewChunkOff {
+    AGN_CC_NEXT = 0;
+    AGN_CC_CAP = 8;
+    AGN_CC_USED = 16;
+    AGN_CC_HEADER = 24;
+}
+
+# The arena — the `state` of the allocator handed out. Lives on the global heap for
+# the life of the process, so a stale handle reads a record and not reused memory.
+#
+# `MUTEX` is held for the bump and the scrub. `HELD` is 1 from acquire to give-back.
+enum AgnosaiCrewArenaOff {
+    AGN_CRA_MUTEX = 0;
+    AGN_CRA_FIRST = 8;
+    AGN_CRA_CUR = 16;
+    AGN_CRA_CHUNK_BYTES = 24;
+    AGN_CRA_POOL = 32;
+    AGN_CRA_NEXT_FREE = 40;
+    AGN_CRA_HELD = 48;
+    AGN_CRA_SIZE = 56;
+}
+
+# The pool — a stack of free arenas.
+enum AgnosaiCrewPoolOff {
+    AGN_CRP_MUTEX = 0;
+    AGN_CRP_FREE = 8;
+    AGN_CRP_CHUNK_BYTES = 16;
+    AGN_CRP_MINTED = 24;
+    AGN_CRP_SIZE = 32;
+}
+
+# The chunk a crew arena starts with. Measured: one task with no gateway uses 6.9 KiB and
+# one a model answered 14.6 KiB, so a one-task crew fits and each task after it costs
+# about 10 KiB plus its output. Three answered tasks use 34 KiB, which chains two chunks.
+var AGNOSAI_CREW_ARENA_BYTES = 16384;
+
+# A chunk with room for `n` bytes of data. 0 when the heap cannot serve it.
+fn _agnosai_crew_chunk_new(n): i64 {
+    var ch = alloc(n + AGN_CC_HEADER);
+    if (ch == 0) { return 0; }
+    store64(ch + AGN_CC_NEXT, 0);
+    store64(ch + AGN_CC_CAP, n);
+    store64(ch + AGN_CC_USED, 0);
+    return ch;
+}
+
+# Move past chunk `ch` to one with `n` bytes free. The caller holds the mutex.
+#
+# The next chunk in the chain is used when it fits, and it is always empty: chunks fill in
+# order and a scrub empties them all. When it does not fit, a new one goes in front of it.
+fn _agnosai_crew_arena_advance(state, ch, n): i64 {
+    var nxt = load64(ch + AGN_CC_NEXT);
+    if (nxt != 0 && load64(nxt + AGN_CC_CAP) >= n) {
+        store64(state + AGN_CRA_CUR, nxt);
+        return nxt;
+    }
+    var want = load64(state + AGN_CRA_CHUNK_BYTES);
+    if (n > want) { want = n; }
+    var fresh = _agnosai_crew_chunk_new(want);
+    if (fresh == 0) { return 0; }
+    store64(fresh + AGN_CC_NEXT, nxt);
+    store64(ch + AGN_CC_NEXT, fresh);
+    store64(state + AGN_CRA_CUR, fresh);
+    return fresh;
+}
+
+# The allocator's `alloc_fn`: 8-byte aligned, zeroed, or 0 when the heap cannot serve it.
+fn _agnosai_crew_arena_alloc(state, size): i64 {
+    if (size <= 0) { return 0; }
+    var n = (size + 7) & (0 - 8);
+    var mtx = load64(state + AGN_CRA_MUTEX);
+    mutex_lock(mtx);
+    var ch = load64(state + AGN_CRA_CUR);
+    var used = load64(ch + AGN_CC_USED);
+    if (used + n > load64(ch + AGN_CC_CAP)) {
+        ch = _agnosai_crew_arena_advance(state, ch, n);
+        if (ch == 0) {
+            mutex_unlock(mtx);
+            return 0;
+        }
+        used = 0;
+    }
+    store64(ch + AGN_CC_USED, used + n);
+    mutex_unlock(mtx);
+    return ch + AGN_CC_HEADER + used;
+}
+
+# The allocator's `realloc_fn`: a new block and a copy, as nothing here frees.
+fn _agnosai_crew_arena_realloc(state, old_ptr, old_size, new_size): i64 {
+    var p = _agnosai_crew_arena_alloc(state, new_size);
+    if (p == 0) { return 0; }
+    var n = old_size;
+    if (new_size < n) { n = new_size; }
+    if (old_ptr != 0 && n > 0) { memcpy(p, old_ptr, n); }
+    return p;
+}
+
+# The allocator's `free_fn`. A block goes when its arena does.
+fn _agnosai_crew_arena_free(state, ptr): i64 {
+    return 0;
+}
+
+# The allocator's `reset_fn`: every byte handed out is zeroed, and the chain rewinds to
+# its first chunk, keeping every chunk it has.
+fn _agnosai_crew_arena_reset(state): i64 {
+    var mtx = load64(state + AGN_CRA_MUTEX);
+    mutex_lock(mtx);
+    var ch = load64(state + AGN_CRA_FIRST);
+    while (ch != 0) {
+        var used = load64(ch + AGN_CC_USED);
+        if (used > 0) {
+            memset(ch + AGN_CC_HEADER, 0, used);
+            store64(ch + AGN_CC_USED, 0);
+        }
+        ch = load64(ch + AGN_CC_NEXT);
+    }
+    store64(state + AGN_CRA_CUR, load64(state + AGN_CRA_FIRST));
+    mutex_unlock(mtx);
+    return 0;
+}
+
+# A new arena, as an allocator. 0 when the heap cannot serve it.
+fn _agnosai_crew_arena_new(p): i64 {
+    var state = alloc(AGN_CRA_SIZE);
+    if (state == 0) { return 0; }
+    var ch = _agnosai_crew_chunk_new(load64(p + AGN_CRP_CHUNK_BYTES));
+    if (ch == 0) { return 0; }
+    store64(state + AGN_CRA_MUTEX, mutex_new());
+    store64(state + AGN_CRA_FIRST, ch);
+    store64(state + AGN_CRA_CUR, ch);
+    store64(state + AGN_CRA_CHUNK_BYTES, load64(p + AGN_CRP_CHUNK_BYTES));
+    store64(state + AGN_CRA_POOL, p);
+    store64(state + AGN_CRA_NEXT_FREE, 0);
+    store64(state + AGN_CRA_HELD, 0);
+    return allocator_new(&_agnosai_crew_arena_alloc, &_agnosai_crew_arena_realloc,
+      &_agnosai_crew_arena_free, &_agnosai_crew_arena_reset, state);
+}
+
+# A pool of crew arenas whose chunks are `chunk_bytes` each. 0 for a size of 0 or less, or
+# when the heap cannot serve it.
+fn agnosai_crew_pool_new(chunk_bytes): i64 {
+    if (chunk_bytes <= 0) { return 0; }
+    var p = alloc(AGN_CRP_SIZE);
+    if (p == 0) { return 0; }
+    store64(p + AGN_CRP_MUTEX, mutex_new());
+    store64(p + AGN_CRP_FREE, 0);
+    store64(p + AGN_CRP_CHUNK_BYTES, chunk_bytes);
+    store64(p + AGN_CRP_MINTED, 0);
+    return p;
+}
+
+# Take an arena for a new crew: a free one, else a new one. Never blocks. Returns an
+# allocator, empty and zeroed, for `agnosai_crew_new_in`. 0 when the heap cannot serve it.
+fn agnosai_crew_pool_acquire(p): i64 {
+    if (p == 0) { return 0; }
+    var mtx = load64(p + AGN_CRP_MUTEX);
+    mutex_lock(mtx);
+    var a = load64(p + AGN_CRP_FREE);
+    if (a != 0) {
+        var state = allocator_state(a);
+        store64(p + AGN_CRP_FREE, load64(state + AGN_CRA_NEXT_FREE));
+        store64(state + AGN_CRA_NEXT_FREE, 0);
+        store64(state + AGN_CRA_HELD, 1);
+    }
+    mutex_unlock(mtx);
+    if (a != 0) { return a; }
+
+    a = _agnosai_crew_arena_new(p);
+    if (a == 0) { return 0; }
+    store64(allocator_state(a) + AGN_CRA_HELD, 1);
+    atomic_fetch_add(p + AGN_CRP_MINTED, 1);
+    return a;
+}
+
+# How many arenas this pool has ever minted. Flat under load means it is reusing them: this
+# rises only when more crews are held at once than ever were.
+fn agnosai_crew_pool_minted(p): i64 {
+    if (p == 0) { return 0; }
+    return atomic_load(p + AGN_CRP_MINTED);
+}
+
+# Whether allocator `a` is a crew arena.
+fn agnosai_crew_arena_is(a): i64 {
+    if (a == 0) { return 0; }
+    if (allocator_alloc_fn(a) == &_agnosai_crew_arena_alloc) { return 1; }
+    return 0;
+}
+
+# Whether `ptr` lies in the memory of crew arena `a`, held or not.
+fn agnosai_crew_arena_holds(a, ptr): i64 {
+    var state = allocator_state(a);
+    var mtx = load64(state + AGN_CRA_MUTEX);
+    mutex_lock(mtx);
+    var found = 0;
+    var ch = load64(state + AGN_CRA_FIRST);
+    while (ch != 0 && found == 0) {
+        var base = ch + AGN_CC_HEADER;
+        if (ptr >= base && ptr < base + load64(ch + AGN_CC_CAP)) { found = 1; }
+        ch = load64(ch + AGN_CC_NEXT);
+    }
+    mutex_unlock(mtx);
+    return found;
+}
+
+# Bytes this crew arena has handed out since it was last scrubbed.
+fn agnosai_crew_arena_used(a): i64 {
+    var state = allocator_state(a);
+    var mtx = load64(state + AGN_CRA_MUTEX);
+    mutex_lock(mtx);
+    var total = 0;
+    var ch = load64(state + AGN_CRA_FIRST);
+    while (ch != 0) {
+        total = total + load64(ch + AGN_CC_USED);
+        ch = load64(ch + AGN_CC_NEXT);
+    }
+    mutex_unlock(mtx);
+    return total;
+}
+
+# Give arena `a` back to its pool, scrubbed. Returns 0, or -1 for one that is not a crew arena
+# or is not held, which is left as it is.
+#
+# Nothing it handed out may be read after this. `agnosai_orchestrator_release_crew` is the
+# call for a crew that ran, and this is the rest of it. A consumer that took an arena and
+# never built a crew in it calls this directly.
+fn agnosai_crew_arena_give_back(a): i64 {
+    if (agnosai_crew_arena_is(a) == 0) { return 0 - 1; }
+    var state = allocator_state(a);
+    var p = load64(state + AGN_CRA_POOL);
+    var mtx = load64(p + AGN_CRP_MUTEX);
+
+    mutex_lock(mtx);
+    var held = load64(state + AGN_CRA_HELD);
+    store64(state + AGN_CRA_HELD, 0);
+    mutex_unlock(mtx);
+    if (held == 0) { return 0 - 1; }
+
+    # Scrubbed before it is on the free stack, so no acquire can take it mid-scrub.
+    reset_via(a);
+    mutex_lock(mtx);
+    store64(state + AGN_CRA_NEXT_FREE, load64(p + AGN_CRP_FREE));
+    store64(p + AGN_CRP_FREE, a);
+    mutex_unlock(mtx);
+    return 0;
+}
+
+# A new crew that lives in arena `a`, from `agnosai_crew_pool_acquire`: the spec is built
+# there, and everything the engine allocates for the crew comes from it. Returns the crew, or
+# 0 for an allocator that is not a crew arena.
+#
+# ⚠ **Refused for any other allocator**, as a request arena must not be asked to hold a crew
+# that outlives its request. `agnosai_crew_new_a` places a spec without that promise.
+#
+# The rest of the spec is built with the `_a` forms in `a`, and anything it stores by pointer,
+# a name or a description, belongs in `a` too.
+fn agnosai_crew_new_in(a, name: Str): i64 {
+    if (agnosai_crew_arena_is(a) == 0) { return 0; }
+    var c = agnosai_crew_new_a(a, name);
+    store64(c + AGN_CREW_ARENA, a);
+    return c;
+}

@@ -125,6 +125,7 @@ include "src/arena_pool.cyr"
 include "src/sandbox/policy.cyr"
 include "src/sandbox/kavach_bridge.cyr"
 include "src/orchestrator/crew_runner.cyr"
+include "src/crew_arena.cyr"
 include "src/orchestrator/orchestrator.cyr"
 
 # An agent with two tools, a complexity and a domain — the shape scoring reads.
@@ -2178,6 +2179,32 @@ fn _b_run_crew_forgotten(): i64 {
     return 0;
 }
 
+# The same crew again, in an arena that goes back at the end (ADR 028). Against
+# `run_crew_then_forget` this row is what the arena, the lock on it, the scrub and the
+# release cost, and what they save: no page of it is fresh, and the bump does not move.
+fn _b_run_crew_released(): i64 {
+    var o = agnosai_orchestrator_new(agnosai_resource_budget_default());
+    var pool = agnosai_crew_pool_new(AGNOSAI_CREW_ARENA_BYTES);
+    var n = 2000;
+    var b = bench_new("run_crew_then_release");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var a = agnosai_crew_pool_acquire(pool);
+            var spec = agnosai_crew_new_in(a, str_from_a(a, "bench"));
+            var tasks = vec_new_a(a);
+            vec_push_a(a, tasks, agnosai_task_new_a(a, str_from_a(a, "bench task")));
+            agnosai_crew_with_tasks(spec, tasks);
+            agnosai_orchestrator_run_crew(o, spec);
+            agnosai_orchestrator_forget_crew(o, agnosai_crew_id(spec));
+            agnosai_orchestrator_release_crew(o, spec);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
 # ── the same crews with the exporter ON (ADR 023) ─────────────────────────
 #
 # What turning telemetry on costs a crew. F6 took a crew run from one span to
@@ -2450,6 +2477,7 @@ fn main(): i64 {
     # B27), and rows added above these read 25% slower on a build that changed nothing they run.
     _b_run_crew_at_cap();
     _b_run_crew_forgotten();
+    _b_run_crew_released();
 
     return 0;
 }

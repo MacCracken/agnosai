@@ -84,7 +84,12 @@ fn agnosai_crew_event_data(e): i64 {
 
 # Build an event.
 fn agnosai_crew_event_new(crew_id: Str, event_type: Str, data): i64 {
-    var e = alloc(AGN_SSE_EVENT_SIZE);
+    return agnosai_crew_event_new_a(default_alloc(), crew_id, event_type, data);
+}
+
+# `agnosai_crew_event_new`, in allocator `a`.
+fn agnosai_crew_event_new_a(a, crew_id: Str, event_type: Str, data): i64 {
+    var e = alloc_via(a, AGN_SSE_EVENT_SIZE);
     store64(e + AGN_CE_CREW_ID, crew_id);
     store64(e + AGN_CE_EVENT_TYPE, event_type);
     store64(e + AGN_CE_DATA, data);
@@ -188,14 +193,17 @@ fn agnosai_event_sub_recv(sub): i64 {
 enum AgnosaiEventSenderOff {
     AGN_ES_SUBS = 0;
     AGN_ES_MUTEX = 8;
-    AGN_ES_SIZE = 16;
+    # The allocator the sender and its subscriber list are in (ADR 028).
+    AGN_ES_ALLOC = 16;
+    AGN_ES_SIZE = 24;
 }
 
 # Create a sender bound to a bus's lock.
-fn _agnosai_event_sender_new(mtx): i64 {
-    var tx = alloc(AGN_ES_SIZE);
-    store64(tx + AGN_ES_SUBS, vec_new());
+fn _agnosai_event_sender_new_a(a, mtx): i64 {
+    var tx = alloc_via(a, AGN_ES_SIZE);
+    store64(tx + AGN_ES_SUBS, vec_new_a(a));
     store64(tx + AGN_ES_MUTEX, mtx);
+    store64(tx + AGN_ES_ALLOC, a);
     return tx;
 }
 
@@ -212,10 +220,14 @@ fn agnosai_event_sender_receiver_count(tx): i64 {
 #
 # The new subscriber starts empty: events already sent are not replayed into it.
 fn agnosai_event_sender_subscribe(tx): i64 {
-    var sub = _agnosai_event_sub_new();
+    return _agnosai_event_sender_add(tx, _agnosai_event_sub_new());
+}
+
+# Add a subscription to a sender.
+fn _agnosai_event_sender_add(tx, sub): i64 {
     var mtx = load64(tx + AGN_ES_MUTEX);
     mutex_lock(mtx);
-    vec_push(load64(tx + AGN_ES_SUBS), sub);
+    vec_push_a(load64(tx + AGN_ES_ALLOC), load64(tx + AGN_ES_SUBS), sub);
     mutex_unlock(mtx);
     return sub;
 }
@@ -276,10 +288,15 @@ fn agnosai_event_sender_send(tx, event): i64 {
 }
 
 # EventBus — the registry of per-crew senders.
+#
+# `IDLE` is a stack of subscriptions given back (`agnosai_event_bus_recycle`), linked
+# through their own `AGN_ER_LAGGED` slot, so a crew's channel is used again and
+# not minted again (ADR 028).
 enum AgnosaiEventBusOff {
     AGN_EB_CHANNELS = 0;
     AGN_EB_MUTEX = 8;
-    AGN_EB_SIZE = 16;
+    AGN_EB_IDLE = 16;
+    AGN_EB_SIZE = 24;
 }
 
 # Create an empty bus.
@@ -287,6 +304,7 @@ fn agnosai_event_bus_new(): i64 {
     var bus = alloc(AGN_EB_SIZE);
     store64(bus + AGN_EB_CHANNELS, map_new_str());
     store64(bus + AGN_EB_MUTEX, mutex_new());
+    store64(bus + AGN_EB_IDLE, 0);
     return bus;
 }
 
@@ -361,6 +379,12 @@ fn _agnosai_event_bus_log_capacity(n): i64 {
 # to publish, and a crew running with its events silently discarded is worse
 # than a bus over its advisory bound.
 fn agnosai_event_bus_sender(bus, crew_id: Str): i64 {
+    return agnosai_event_bus_sender_a(default_alloc(), bus, crew_id);
+}
+
+# `agnosai_event_bus_sender`, with a new sender and its key in allocator `a`. A sender
+# that exists stays where it is, so a caller that subscribed first decides.
+fn agnosai_event_bus_sender_a(a, bus, crew_id: Str): i64 {
     var mtx = load64(bus + AGN_EB_MUTEX);
     mutex_lock(mtx);
     var channels = load64(bus + AGN_EB_CHANNELS);
@@ -378,8 +402,8 @@ fn agnosai_event_bus_sender(bus, crew_id: Str): i64 {
         }
     }
 
-    tx = _agnosai_event_sender_new(mtx);
-    map_set(channels, str_clone(crew_id), tx);
+    tx = _agnosai_event_sender_new_a(a, mtx);
+    map_set(channels, str_clone_a(a, crew_id), tx);
     mutex_unlock(mtx);
     return tx;
 }
@@ -389,12 +413,65 @@ fn agnosai_event_bus_subscribe(bus, crew_id: Str): i64 {
     return agnosai_event_sender_subscribe(agnosai_event_bus_sender(bus, crew_id));
 }
 
+# A subscription off the bus's idle stack, or 0.
+fn _agnosai_event_bus_take_idle(bus): i64 {
+    var mtx = load64(bus + AGN_EB_MUTEX);
+    mutex_lock(mtx);
+    var sub = load64(bus + AGN_EB_IDLE);
+    if (sub != 0) {
+        store64(bus + AGN_EB_IDLE, load64(sub + AGN_ER_LAGGED));
+        store64(sub + AGN_ER_LAGGED, 0);
+    }
+    mutex_unlock(mtx);
+    return sub;
+}
+
+# `agnosai_event_bus_subscribe` for a crew in arena `a`, taking a channel given back
+# to the bus if there is one. The sender and its key go in `a`. The channel does not:
+# it is 2 KiB of ring that outlives the crew, to serve the next one.
+fn agnosai_event_bus_subscribe_a(a, bus, crew_id: Str): i64 {
+    var tx = agnosai_event_bus_sender_a(a, bus, crew_id);
+    var sub = _agnosai_event_bus_take_idle(bus);
+    if (sub == 0) { sub = _agnosai_event_sub_new(); }
+    return _agnosai_event_sender_add(tx, sub);
+}
+
+# Give back a subscription its crew has finished with, so the next crew's subscribe
+# takes it. Answers 1, or 0 for one still open, which is left as it is.
+#
+# ⚠ **Only after the channel has closed**, which `agnosai_event_bus_remove` does after
+# a crew's final state is stored, so no publisher is left. And only once nobody will
+# read `sub`: this drains what is still in the ring, and whoever takes it next reads
+# their own crew's events from it. A consumer clears its own pointer first.
+#
+# A `sub` of 0, a crew with no subscription, answers 0. `agnosai_event_sub_closed` calls it
+# closed, which is right for a reader and is not a channel to take back.
+fn agnosai_event_bus_recycle(bus, sub): i64 {
+    if (sub == 0) { return 0; }
+    if (agnosai_event_sub_closed(sub) == 0) { return 0; }
+    var ch = load64(sub + AGN_ER_CHAN);
+    while (chan_try_recv(ch) != 0) { }
+    agnosai_chan_reopen(ch);
+    store64(sub + AGN_ER_CLOSED, 0);
+    var mtx = load64(bus + AGN_EB_MUTEX);
+    mutex_lock(mtx);
+    store64(sub + AGN_ER_LAGGED, load64(bus + AGN_EB_IDLE));
+    store64(bus + AGN_EB_IDLE, sub);
+    mutex_unlock(mtx);
+    return 1;
+}
+
 # Remove a crew's channel — call once the crew is finished.
 #
 # The oracle drops the map's sender, after which any receiver still holding on
 # sees `RecvError::Closed`. `chan_close` on each subscriber is that signal. A
 # `sender()` handle someone else already took keeps working against a detached
 # subscriber list, which is also what dropping the map's clone does.
+#
+# ⚠ **That list is emptied, not left holding closed channels (2.2.5).** A closed channel
+# dropped whatever a stale sender pushed, so leaving them cost nothing until a channel could
+# be reopened. A subscription given back to the bus now serves the next crew, and a sender
+# that still listed it would publish one crew's events into another's (ADR 028).
 fn agnosai_event_bus_remove(bus, crew_id: Str): i64 {
     var mtx = load64(bus + AGN_EB_MUTEX);
     mutex_lock(mtx);
@@ -407,6 +484,7 @@ fn agnosai_event_bus_remove(bus, crew_id: Str): i64 {
             chan_close(load64(sub + AGN_ER_CHAN));
             store64(sub + AGN_ER_CLOSED, 1);   # see agnosai_event_sub_closed
         }
+        vec_truncate(subs, 0);
         map_delete(channels, crew_id);
     }
     mutex_unlock(mtx);

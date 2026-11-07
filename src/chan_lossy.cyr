@@ -83,3 +83,21 @@ fn agnosai_chan_push_lossy(ch, val): i64 {
     if (rc != 0) { return AGNOSAI_CHAN_DROPPED; }
     return 1;
 }
+
+# Open a closed, drained channel again, so a pool can use it a second time.
+#
+# ⚠ **The one place this module reaches into the channel, and it was not done lightly.**
+# The header above keeps to the public verbs, and `chan_lossy` would rather not know
+# the 56-byte layout. But the stdlib has no verb for this, a closed channel cannot be
+# opened any other way, and the alternative is 2 KiB of ring per crew for the life of
+# the process, which was the largest single thing a crew left behind (ADR 028). `closed`
+# is at +48 in all four thread backends (`lib/thread.cyr` and its agnos, macOS and
+# Windows siblings). `tests/orch_crew_arena.tcyr` closes, reopens and sends through a
+# channel, so a layout that moves fails there and not in a consumer.
+#
+# The caller owns the channel: closed, drained, and with no reader or writer left. So
+# no lock is taken, as nothing else can be looking.
+fn agnosai_chan_reopen(ch): i64 {
+    store64(ch + 48, 0);
+    return ch;
+}

@@ -54,6 +54,7 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [025](025-a-tool-call-passes-a-consumers-gate.md) | A tool call passes a consumer's gate, and leaves a record on its task | Accepted |
 | [026](026-the-crew-registry-keeps-what-has-not-been-read.md) | The crew registry keeps what has not been read | Accepted |
 | [027](027-the-built-in-presets-are-an-example-library.md) | The built-in presets are an example library | Accepted |
+| [028](028-a-crew-lives-in-an-arena-its-consumer-gives-back.md) | A crew lives in an arena its consumer gives back | Accepted |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`). The headings are left as written — renumbering accepted

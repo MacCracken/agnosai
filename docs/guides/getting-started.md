@@ -62,6 +62,33 @@ ones that ended longest ago, down to 900. A consumer that reads each crew should
 only what is running, and eviction never fires
 ([ADR 026](../adr/026-the-crew-registry-keeps-what-has-not-been-read.md)).
 
+Forgetting a crew frees nothing, as the global heap has no `free`. A long-lived consumer builds each
+crew in an arena and gives the arena back when it is done with the crew, so a server's memory follows
+the crews it holds and not the crews it has served
+([ADR 028](../adr/028-a-crew-lives-in-an-arena-its-consumer-gives-back.md)):
+
+```cyrius
+var pool = agnosai_crew_pool_new(AGNOSAI_CREW_ARENA_BYTES);          # once
+
+var a = agnosai_crew_pool_acquire(pool);
+var spec = agnosai_crew_new_in(a, str_clone_a(a, name));
+var tasks = vec_new_a(a);
+vec_push_a(a, tasks, agnosai_task_new_a(a, str_clone_a(a, description)));
+agnosai_crew_with_tasks(spec, tasks);
+
+var sub = agnosai_event_bus_subscribe_a(a, bus, agnosai_crew_id(spec));
+agnosai_orchestrator_submit_crew(o, spec);
+# ... read the crew, then forget it ...
+agnosai_orchestrator_release_crew(o, spec);     # refused while it runs
+agnosai_event_bus_recycle(bus, sub);
+```
+
+After the release nothing the crew had is valid, its id included, so clear your own pointers first.
+
+A task with an `output_schema` is told the schema in its first prompt, and an answer is checked after
+every call. If none meets it the task is `failed`: `output` is what the model last said, and the
+`error` metadata says why.
+
 ### Agent definitions from files
 
 ```cyrius

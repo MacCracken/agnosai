@@ -1,6 +1,7 @@
-# A task with an `output_schema` completes whether or not it met it, and the model is not told the shape until it has failed
+# A task with an `output_schema` completes whether or not it met it, and the model is not told the shape until it has failed — RESOLVED
 
-**Status:** 🟡 **OPEN**
+**Status:** ✅ **RESOLVED in agnosai 2.2.5** (2026-11-06). Was 🟡 OPEN.
+**Resolution:** every answer is checked, the last included, so a task gets `AGNOSAI_MAX_VALIDATION_RETRIES` retries, each followed by a check. A task whose answers never met its schema is `Failed`: `output` is what the model last said, filtered as any answer is, metadata `error` says why, `validation_attempts` says how many were checked, and the usage metadata is there, summed over every call. It emits no `token` event, and a DAG's dependents do not run. The schema is in the first prompt, sanitized as `expected_output` is. A fenced answer that passes is returned as the block, without its fence. **For agnostic:** nothing to change. `output_valid` reads only completed tasks, and a failed one carries `error`.
 **Placement:** unpinned. agnostic 0.4.0 forwards `output_schema` and reports the result on its own side, so nothing waits on this, but its reviewer preset and M8's structured result both lean on it.
 **Discovered:** 2026-11-06, wiring `output_schema` through agnostic. Read from the source; not reproduced against a model.
 **Severity:** Medium. Nothing crashes. A consumer that declares a shape is told `completed` about an answer that does not have it.

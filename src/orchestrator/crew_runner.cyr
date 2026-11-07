@@ -95,6 +95,15 @@
 # (medium) for **agent selection**. `select_model` must call
 # `agnosai_parse_complexity` and must never call `agnosai_complexity_level`;
 # pointing both at one helper would silently change agent-selection scores.
+#
+# ## Everything here allocates through `a`
+#
+# `a` is the crew's allocator (`agnosai_crew_alloc`, ADR 028): the arena a crew lives
+# in, or the global heap, which is what every crew had through 2.2.4 and is what a
+# crew built without an arena still has. So a bare `alloc`, `str_from`, `vec_new`
+# or `bayan_json_v_*_new` on this path is a leak in an arena crew, and
+# `tests/orch_crew_arena.tcyr` measures for one: a crew it runs and releases must
+# leave `alloc_used()` where it found it.
 # =========================================================================
 
 # Pick the highest-scoring agent for a task, or 0 when the roster is empty.
@@ -125,18 +134,23 @@
 # roster means no agent, and the callers turn that into the generic system
 # prompt and the label "unassigned".
 fn _agnosai_crew_pick_best_agent(agents, task): i64 {
+    return _agnosai_crew_pick_best_agent_a(default_alloc(), agents, task);
+}
+
+# `_agnosai_crew_pick_best_agent`, in allocator `a`.
+fn _agnosai_crew_pick_best_agent_a(a, agents, task): i64 {
     if (vec_len(agents) == 0) { return 0; }
 
-    var ranked = agnosai_rank_agents(agents, task);
+    var ranked = agnosai_rank_agents_a(a, agents, task);
     if (vec_len(ranked) == 0) { return 0; }
 
     var best = vec_get(agents, agnosai_scored_index(vec_get(ranked, 0)));
     if (sakshi_get_level() >= SK_DEBUG) {
-        var sb = str_builder_new();
-        str_builder_add(sb, agnosai_agent_key(best));
-        str_builder_add_cstr(sb, " task=");
-        str_builder_add(sb, agnosai_task_id(task));
-        var line = str_builder_build(sb);
+        var sb = str_builder_new_a(a);
+        str_builder_add_a(a, sb, agnosai_agent_key(best));
+        str_builder_add_cstr_a(a, sb, " task=");
+        str_builder_add_a(a, sb, agnosai_task_id(task));
+        var line = str_builder_build_a(a, sb);
         sakshi_log_kv(SK_DEBUG, "picked best agent for task", 26, "agent_key", 9,
           str_data(line), str_len(line));
     }
@@ -158,17 +172,22 @@ fn _agnosai_crew_pick_best_agent(agents, task): i64 {
 # and anchored at byte 0, so a non-ASCII leading byte fails all nine arms either
 # way, and lowering it cannot create or destroy an ASCII prefix match.
 fn _agnosai_crew_infer_provider(model: Str): i64 {
-    var m = _agnosai_to_ascii_lower(model);
+    return _agnosai_crew_infer_provider_a(default_alloc(), model);
+}
 
-    if (str_starts_with(m, str_from("gpt-")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
-    if (str_starts_with(m, str_from("o1")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
-    if (str_starts_with(m, str_from("o3")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
-    if (str_starts_with(m, str_from("claude")) == 1) { return AGNOSAI_PROVIDER_ANTHROPIC; }
-    if (str_starts_with(m, str_from("deepseek")) == 1) { return AGNOSAI_PROVIDER_DEEPSEEK; }
-    if (str_starts_with(m, str_from("gemini")) == 1) { return AGNOSAI_PROVIDER_GOOGLE; }
-    if (str_starts_with(m, str_from("grok")) == 1) { return AGNOSAI_PROVIDER_GROK; }
-    if (str_starts_with(m, str_from("mistral")) == 1) { return AGNOSAI_PROVIDER_MISTRAL; }
-    if (str_starts_with(m, str_from("mixtral")) == 1) { return AGNOSAI_PROVIDER_MISTRAL; }
+# `_agnosai_crew_infer_provider`, in allocator `a`.
+fn _agnosai_crew_infer_provider_a(a, model: Str): i64 {
+    var m = _agnosai_to_ascii_lower_a(a, model);
+
+    if (str_starts_with(m, str_from_a(a, "gpt-")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
+    if (str_starts_with(m, str_from_a(a, "o1")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
+    if (str_starts_with(m, str_from_a(a, "o3")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
+    if (str_starts_with(m, str_from_a(a, "claude")) == 1) { return AGNOSAI_PROVIDER_ANTHROPIC; }
+    if (str_starts_with(m, str_from_a(a, "deepseek")) == 1) { return AGNOSAI_PROVIDER_DEEPSEEK; }
+    if (str_starts_with(m, str_from_a(a, "gemini")) == 1) { return AGNOSAI_PROVIDER_GOOGLE; }
+    if (str_starts_with(m, str_from_a(a, "grok")) == 1) { return AGNOSAI_PROVIDER_GROK; }
+    if (str_starts_with(m, str_from_a(a, "mistral")) == 1) { return AGNOSAI_PROVIDER_MISTRAL; }
+    if (str_starts_with(m, str_from_a(a, "mixtral")) == 1) { return AGNOSAI_PROVIDER_MISTRAL; }
 
     # Local models (llama and friends) — free via Ollama.
     return AGNOSAI_PROVIDER_OLLAMA;
@@ -197,40 +216,45 @@ fn _agnosai_crew_infer_provider(model: Str): i64 {
 # the only part of this function that is not ported, and it comes back with
 # bhava alongside `agnosai_personality_score`.
 fn _agnosai_crew_build_system_prompt(agent): i64 {
+    return _agnosai_crew_build_system_prompt_a(default_alloc(), agent);
+}
+
+# `_agnosai_crew_build_system_prompt`, in allocator `a`.
+fn _agnosai_crew_build_system_prompt_a(a, agent): i64 {
     if (agent == 0) {
-        return str_from("You are a helpful AI assistant executing tasks within a crew.");
+        return str_from_a(a, "You are a helpful AI assistant executing tasks within a crew.");
     }
 
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "You are ");
-    str_builder_add(sb, agnosai_agent_name(agent));
-    str_builder_add_cstr(sb, ", a ");
-    str_builder_add(sb, agnosai_agent_role(agent));
-    str_builder_add_cstr(sb, ".\n\nGoal: ");
-    str_builder_add(sb, agnosai_agent_goal(agent));
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "You are ");
+    str_builder_add_a(a, sb, agnosai_agent_name(agent));
+    str_builder_add_cstr_a(a, sb, ", a ");
+    str_builder_add_a(a, sb, agnosai_agent_role(agent));
+    str_builder_add_cstr_a(a, sb, ".\n\nGoal: ");
+    str_builder_add_a(a, sb, agnosai_agent_goal(agent));
 
     var backstory = agnosai_agent_backstory(agent);
     if (backstory != 0) {
-        str_builder_add_cstr(sb, "\n\nBackstory: ");
-        str_builder_add(sb, backstory);
+        str_builder_add_cstr_a(a, sb, "\n\nBackstory: ");
+        str_builder_add_a(a, sb, backstory);
     }
 
     var domain = agnosai_agent_domain(agent);
     if (domain != 0) {
-        str_builder_add_cstr(sb, "\n\nDomain expertise: ");
-        str_builder_add(sb, domain);
+        str_builder_add_cstr_a(a, sb, "\n\nDomain expertise: ");
+        str_builder_add_a(a, sb, domain);
     }
 
     var tools = agnosai_agent_tools(agent);
     if (vec_len(tools) > 0) {
-        str_builder_add_cstr(sb, "\n\nAvailable tools: ");
+        str_builder_add_cstr_a(a, sb, "\n\nAvailable tools: ");
         for (var i = 0; i < vec_len(tools); i = i + 1) {
-            if (i > 0) { str_builder_add_cstr(sb, ", "); }
-            str_builder_add(sb, vec_get(tools, i));
+            if (i > 0) { str_builder_add_cstr_a(a, sb, ", "); }
+            str_builder_add_a(a, sb, vec_get(tools, i));
         }
     }
 
-    return str_builder_build(sb);
+    return str_builder_build_a(a, sb);
 }
 
 # The twelve litellm provider segments the oracle strips, and only those.
@@ -272,10 +296,15 @@ fn _agnosai_crew_is_provider_segment(seg: Str): i64 {
 # than the input — the oracle ships the empty remainder as-is with no
 # validation and no fallback.
 fn _agnosai_crew_strip_provider_prefix(model: Str): i64 {
+    return _agnosai_crew_strip_provider_prefix_a(default_alloc(), model);
+}
+
+# `_agnosai_crew_strip_provider_prefix`, in allocator `a`.
+fn _agnosai_crew_strip_provider_prefix_a(a, model: Str): i64 {
     var idx = str_index_of(model, 47);
     if (idx < 0) { return model; }
-    if (_agnosai_crew_is_provider_segment(str_sub(model, 0, idx)) == 0) { return model; }
-    return str_sub(model, idx + 1, str_len(model) - idx - 1);
+    if (_agnosai_crew_is_provider_segment(str_sub_a(a, model, 0, idx)) == 0) { return model; }
+    return str_sub_a(a, model, idx + 1, str_len(model) - idx - 1);
 }
 
 # Select the model for an agent: its own override, else routed by complexity.
@@ -299,16 +328,21 @@ fn _agnosai_crew_strip_provider_prefix(model: Str): i64 {
 # `low → fast → "llama3"` and pass every test that does not cover `low`. As a
 # consequence `AGNOSAI_TIER_FAST`'s `"llama3"` is unreachable from here at all.
 fn _agnosai_crew_select_model(agent): i64 {
-    if (agent == 0) { return agnosai_default_model(AGNOSAI_TIER_CAPABLE); }
+    return _agnosai_crew_select_model_a(default_alloc(), agent);
+}
+
+# `_agnosai_crew_select_model`, in allocator `a`.
+fn _agnosai_crew_select_model_a(a, agent): i64 {
+    if (agent == 0) { return agnosai_default_model_a(a, AGNOSAI_TIER_CAPABLE); }
 
     var override_model = agnosai_agent_llm_model(agent);
     if (override_model != 0) {
-        return _agnosai_crew_strip_provider_prefix(override_model);
+        return _agnosai_crew_strip_provider_prefix_a(a, override_model);
     }
 
     var complexity = agnosai_parse_complexity(agnosai_agent_complexity(agent));
-    var profile = agnosai_task_profile_new(AGNOSAI_TASKTYPE_REASON, complexity);
-    return agnosai_default_model(agnosai_route(profile));
+    var profile = agnosai_task_profile_new_a(a, AGNOSAI_TASKTYPE_REASON, complexity);
+    return agnosai_default_model_a(a, agnosai_route(profile));
 }
 
 # ── bite 15: execute_task ───────────────────
@@ -353,8 +387,8 @@ fn _agnosai_crew_infer_fp(ctx, out_value): i64 {
 }
 
 # Build the retry context. `trace` is the task's span context, or 0.
-fn _agnosai_crew_infer_ctx_new(client, request, trace): i64 {
-    var c = alloc(AGN_ICTX_SIZE);
+fn _agnosai_crew_infer_ctx_new_a(a, client, request, trace): i64 {
+    var c = alloc_via(a, AGN_ICTX_SIZE);
     store64(c + AGN_ICTX_CLIENT, client);
     store64(c + AGN_ICTX_REQUEST, request);
     store64(c + AGN_ICTX_TRACE, trace);
@@ -382,46 +416,56 @@ fn _agnosai_crew_infer_ctx_new(client, request, trace): i64 {
 # tell a genuine leak from ordinary text, exactly as the module's own signature
 # asks for.
 fn _agnosai_crew_filter_output(content: Str, agent, task_id: Str): i64 {
-    var findings = agnosai_output_scan(content,
-      agnosai_wrap_system_prompt(_agnosai_crew_build_system_prompt(agent)));
+    return _agnosai_crew_filter_output_a(default_alloc(), content, agent, task_id);
+}
+
+# `_agnosai_crew_filter_output`, in allocator `a`.
+fn _agnosai_crew_filter_output_a(a, content: Str, agent, task_id: Str): i64 {
+    var findings = agnosai_output_scan_a(a, content,
+      agnosai_wrap_system_prompt_a(a, _agnosai_crew_build_system_prompt_a(a, agent)));
     var n = vec_len(findings);
     if (n == 0) { return content; }
 
     if (sakshi_get_level() >= SK_WARN) {
         for (var i = 0; i < n; i = i + 1) {
             var f = vec_get(findings, i);
-            var sb = str_builder_new();
-            str_builder_add(sb, task_id);
-            str_builder_add_cstr(sb, " category=");
-            str_builder_add(sb, agnosai_finding_category(f));
-            str_builder_add_cstr(sb, " pattern=");
-            str_builder_add(sb, agnosai_finding_pattern(f));
-            var line = str_builder_build(sb);
+            var sb = str_builder_new_a(a);
+            str_builder_add_a(a, sb, task_id);
+            str_builder_add_cstr_a(a, sb, " category=");
+            str_builder_add_a(a, sb, agnosai_finding_category(f));
+            str_builder_add_cstr_a(a, sb, " pattern=");
+            str_builder_add_a(a, sb, agnosai_finding_pattern(f));
+            var line = str_builder_build_a(a, sb);
             sakshi_log_kv(SK_WARN, "sensitive content in model output", 33,
               "task_id", 7, str_data(line), str_len(line));
         }
     }
 
     if (agnosai_output_redact_enabled() == 0) { return content; }
-    return agnosai_output_redact(content);
+    return agnosai_output_redact_a(a, content);
 }
 
-fn _agnosai_crew_log(level, msg, msg_len, task_id: Str, agent_label: Str): i64 {
+fn _agnosai_crew_log_a(a, level, msg, msg_len, task_id: Str, agent_label: Str): i64 {
     if (sakshi_get_level() < level) { return 0; }
-    var sb = str_builder_new();
-    str_builder_add(sb, task_id);
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, task_id);
     if (agent_label != 0) {
-        str_builder_add_cstr(sb, " agent=");
-        str_builder_add(sb, agent_label);
+        str_builder_add_cstr_a(a, sb, " agent=");
+        str_builder_add_a(a, sb, agent_label);
     }
-    var line = str_builder_build(sb);
+    var line = str_builder_build_a(a, sb);
     sakshi_log_kv(level, msg, msg_len, "task_id", 7, str_data(line), str_len(line));
     return 0;
 }
 
 # The agent's key, or the oracle's `"unassigned"` when there is no agent.
 fn _agnosai_crew_agent_label(agent): i64 {
-    if (agent == 0) { return str_from("unassigned"); }
+    return _agnosai_crew_agent_label_a(default_alloc(), agent);
+}
+
+# `_agnosai_crew_agent_label`, in allocator `a`.
+fn _agnosai_crew_agent_label_a(a, agent): i64 {
+    if (agent == 0) { return str_from_a(a, "unassigned"); }
     return agnosai_agent_key(agent);
 }
 
@@ -453,19 +497,51 @@ fn _agnosai_crew_elapsed_ms(start_ns): i64 {
     return (clock_now_ns() - start_ns) / AGNOSAI_NS_PER_MS;
 }
 
-# Assemble the user message: the sanitized description, plus the sanitized
-# expected output after a blank line when the task has one.
-fn _agnosai_crew_user_message(task): i64 {
-    var msg = agnosai_prompt_sanitize(agnosai_task_description(task),
-      str_from("task_description"));
+# The task's own prompt: the sanitized description, plus the sanitized expected
+# output after a blank line when the task has one.
+#
+# This is what a validation retry is anchored to, which is why it is apart from
+# `_agnosai_crew_user_message`: `agnosai_build_retry_prompt` ends with the schema
+# itself, and an original that carried it too would say it twice.
+fn _agnosai_crew_task_prompt_a(a, task): i64 {
+    var msg = agnosai_prompt_sanitize_a(a, agnosai_task_description(task),
+      str_from_a(a, "task_description"));
     var expected = agnosai_task_expected_output(task);
     if (expected == 0) { return msg; }
 
-    var sb = str_builder_new();
-    str_builder_add(sb, msg);
-    str_builder_add_cstr(sb, "\n\n");
-    str_builder_add(sb, agnosai_prompt_sanitize(expected, str_from("expected_output")));
-    return str_builder_build(sb);
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, msg);
+    str_builder_add_cstr_a(a, sb, "\n\n");
+    str_builder_add_a(a, sb, agnosai_prompt_sanitize_a(a, expected,
+        str_from_a(a, "expected_output")));
+    return str_builder_build_a(a, sb);
+}
+
+# Assemble the first user message: the task's prompt, then its `output_schema`
+# when it declares one.
+#
+# ⚠ **The schema is in the first prompt (2.2.5).** It used to reach the model only
+# inside `agnosai_build_retry_prompt`, after a failure, so unless a task's text
+# happened to describe the shape, every task with a schema paid for a call that
+# could not have passed. The oracle has the same gap. A consumer's schema is
+# request input like `expected_output`, so it is sanitized the same way, and the
+# line that leads it in is ours and stays outside the markers.
+fn _agnosai_crew_user_message(task): i64 {
+    return _agnosai_crew_user_message_a(default_alloc(), task);
+}
+
+# `_agnosai_crew_user_message`, in allocator `a`.
+fn _agnosai_crew_user_message_a(a, task): i64 {
+    var msg = _agnosai_crew_task_prompt_a(a, task);
+    var schema = agnosai_task_output_schema(task);
+    if (schema == 0) { return msg; }
+
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, msg);
+    str_builder_add_cstr_a(a, sb, "\n\nRespond with ONLY valid JSON matching this schema:\n");
+    str_builder_add_a(a, sb, agnosai_prompt_sanitize_a(a, bayan_json_v_build_a(a, schema),
+        str_from_a(a, "output_schema")));
+    return str_builder_build_a(a, sb);
 }
 
 # Build the inference request for a task.
@@ -502,10 +578,15 @@ fn _agnosai_crew_user_message(task): i64 {
 var _AGNOSAI_CREW_CTX_POOL = agnosai_arena_pool_new(4, 8192);
 
 fn _agnosai_crew_build_request(task, agent, model: Str, user_msg: Str): i64 {
-    var req = agnosai_inference_request_new(model);
+    return _agnosai_crew_build_request_a(default_alloc(), task, agent, model, user_msg);
+}
+
+# `_agnosai_crew_build_request`, in allocator `a`.
+fn _agnosai_crew_build_request_a(a, task, agent, model: Str, user_msg: Str): i64 {
+    var req = agnosai_inference_request_new_a(a, model);
 
     agnosai_inference_request_say(req, AGNOSAI_ROLE_SYSTEM,
-      agnosai_wrap_system_prompt(_agnosai_crew_build_system_prompt(agent)));
+      agnosai_wrap_system_prompt_a(a, _agnosai_crew_build_system_prompt_a(a, agent)));
 
     # The context preamble, when the task has one. The oracle serialises the
     # context map with `to_string_pretty` — the same 2-space form
@@ -549,18 +630,18 @@ fn _agnosai_crew_build_request(task, agent, model: Str, user_msg: Str): i64 {
                   _agnosai_map_slot_val(ctx, i));
             }
         }
-        var rendered = bayan_json_v_build_pretty(obj, 2);
+        var rendered = bayan_json_v_build_pretty_a(a, obj, 2);
         if (ctx_arena != 0) {
             agnosai_arena_pool_release(_AGNOSAI_CREW_CTX_POOL, ctx_arena);
         }
         agnosai_inference_request_say(req, AGNOSAI_ROLE_USER,
-          agnosai_prompt_sanitize(rendered, str_from("context")));
+          agnosai_prompt_sanitize_a(a, rendered, str_from_a(a, "context")));
         agnosai_inference_request_say(req, AGNOSAI_ROLE_ASSISTANT,
-          str_from("Understood, I have the context."));
+          str_from_a(a, "Understood, I have the context."));
     }
 
     var turn = user_msg;
-    if (turn == 0) { turn = _agnosai_crew_user_message(task); }
+    if (turn == 0) { turn = _agnosai_crew_user_message_a(a, task); }
     agnosai_inference_request_say(req, AGNOSAI_ROLE_USER, turn);
     agnosai_inference_request_with_max_tokens(req, AGNOSAI_CREW_MAX_TOKENS);
     agnosai_inference_request_with_temperature_milli(req, AGNOSAI_CREW_TEMPERATURE_MILLI);
@@ -571,7 +652,7 @@ fn _agnosai_crew_build_request(task, agent, model: Str, user_msg: Str): i64 {
 #
 # Output is the task description **verbatim**, status Completed, and metadata
 # carrying exactly `task_duration_ms`. Two oracle tests pin this shape.
-fn _agnosai_crew_placeholder_result(task, agent, start_ns): i64 {
+fn _agnosai_crew_placeholder_result_a(a, task, agent, start_ns): i64 {
     # ⚠ The placeholder ECHOES the task description, which is request input — so
     # a key a user pasted into a description lands in crew output and the audit
     # trail. It goes through the same filter as model output for that reason.
@@ -585,12 +666,13 @@ fn _agnosai_crew_placeholder_result(task, agent, start_ns): i64 {
     # network-dominated, so the same scan is noise there.
     var placeholder = agnosai_task_description(task);
     if (agnosai_output_redact_enabled() == 1) {
-        placeholder = _agnosai_crew_filter_output(placeholder, agent, agnosai_task_id(task));
+        placeholder = _agnosai_crew_filter_output_a(a, placeholder, agent,
+          agnosai_task_id(task));
     }
-    var r = agnosai_task_result_new(agnosai_task_id(task), placeholder,
+    var r = agnosai_task_result_new_a(a, agnosai_task_id(task), placeholder,
       AGNOSAI_STATUS_COMPLETED);
-    agnosai_task_result_with_metadata(r, str_from("task_duration_ms"),
-      bayan_json_v_int_new(_agnosai_crew_elapsed_ms(start_ns)));
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "task_duration_ms"),
+      bayan_json_v_int_new_a(a, _agnosai_crew_elapsed_ms(start_ns)));
     return r;
 }
 
@@ -605,18 +687,24 @@ fn _agnosai_crew_placeholder_result(task, agent, start_ns): i64 {
 # crew's channel, and the context is client-supplied request data that could
 # name any crew at all. 0 keeps the oracle's fallback.
 fn _agnosai_crew_emit_token(event_tx, task, crew_id: Str, text: Str): i64 {
+    return _agnosai_crew_emit_token_a(default_alloc(), event_tx, task, crew_id, text);
+}
+
+# `_agnosai_crew_emit_token`, in allocator `a`.
+fn _agnosai_crew_emit_token_a(a, event_tx, task, crew_id: Str, text: Str): i64 {
     if (event_tx == 0) { return 0; }
     var id = crew_id;
     if (id == 0) { id = _agnosai_crew_event_crew_id(task); }
-    var data = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(data, str_from("task_id"), bayan_json_v_str_new(agnosai_task_id(task)));
-    bayan_json_v_obj_set(data, str_from("token"), bayan_json_v_str_new(text));
-    bayan_json_v_obj_set(data, str_from("complete"), bayan_json_v_bool_new(1));
-    return agnosai_event_sender_send(event_tx, agnosai_crew_event_new(id, str_from("token"),
-        data));
+    var data = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, data, str_from_a(a, "task_id"),
+      bayan_json_v_str_new_a(a, agnosai_task_id(task)));
+    bayan_json_v_obj_set_a(a, data, str_from_a(a, "token"), bayan_json_v_str_new_a(a, text));
+    bayan_json_v_obj_set_a(a, data, str_from_a(a, "complete"), bayan_json_v_bool_new_a(a, 1));
+    return agnosai_event_sender_send(event_tx,
+      agnosai_crew_event_new_a(a, id, str_from_a(a, "token"), data));
 }
 
-# Build the success result's metadata.
+# Build the metadata of a result the model answered.
 #
 # **`cost_micro_usd`, not `cost_usd`.** The oracle emitted an f64 dollar amount
 # from its in-process cost tracker; the port reports the integer micro-USD hoosh
@@ -632,15 +720,21 @@ fn _agnosai_crew_emit_token(event_tx, task, crew_id: Str, text: Str): i64 {
 # task. The oracle's profile aggregates `agent_cost_usd` from exactly this key
 # (`crew_runner.rs:186-194` as of tag 2.1.4) and its success arm never wrote it
 # (`:820-841`), so the field was always empty there and here. Writing it
-# completes the design the oracle declared. Only the success arm carries it:
-# the placeholder and error results keep the metadata shapes the oracle's tests
-# pin, and neither has a cost to attribute.
-fn _agnosai_crew_success_metadata(r, resp, start_ns, agent): i64 {
-    agnosai_task_result_with_metadata(r, str_from("model"),
-      bayan_json_v_str_new(agnosai_inference_response_model(resp)));
+# completes the design the oracle declared. Only a result the model answered
+# carries it, which since 2.2.5 includes one that never met its schema: those calls
+# were made and paid for. The placeholder and error results keep the metadata
+# shapes the oracle's tests pin, and neither has a cost to attribute.
+fn _agnosai_crew_answer_metadata(r, resp, start_ns, agent): i64 {
+    return _agnosai_crew_answer_metadata_a(default_alloc(), r, resp, start_ns, agent);
+}
+
+# `_agnosai_crew_answer_metadata`, in allocator `a`.
+fn _agnosai_crew_answer_metadata_a(a, r, resp, start_ns, agent): i64 {
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "model"),
+      bayan_json_v_str_new_a(a, agnosai_inference_response_model(resp)));
     if (agent != 0) {
-        agnosai_task_result_with_metadata(r, str_from("agent"),
-          bayan_json_v_str_new(agnosai_agent_key(agent)));
+        agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "agent"),
+          bayan_json_v_str_new_a(a, agnosai_agent_key(agent)));
     }
 
     var provider = agnosai_inference_response_provider(resp);
@@ -648,120 +742,183 @@ fn _agnosai_crew_success_metadata(r, resp, start_ns, agent): i64 {
         # No provider on the wire — infer it from the model name, which is what
         # the oracle's own cost path did. Less accurate than hoosh's answer: it
         # cannot see a DLP re-route to a local provider.
-        provider = agnosai_provider_to_wire(
-          _agnosai_crew_infer_provider(agnosai_inference_response_model(resp)));
+        provider = agnosai_provider_to_wire_a(a,
+          _agnosai_crew_infer_provider_a(a, agnosai_inference_response_model(resp)));
     }
-    agnosai_task_result_with_metadata(r, str_from("provider"), bayan_json_v_str_new(provider));
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "provider"),
+      bayan_json_v_str_new_a(a, provider));
 
-    var tokens = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(tokens, str_from("prompt"),
-      bayan_json_v_int_new(agnosai_inference_response_prompt_tokens(resp)));
-    bayan_json_v_obj_set(tokens, str_from("completion"),
-      bayan_json_v_int_new(agnosai_inference_response_completion_tokens(resp)));
-    bayan_json_v_obj_set(tokens, str_from("total"),
-      bayan_json_v_int_new(agnosai_inference_response_total_tokens(resp)));
-    agnosai_task_result_with_metadata(r, str_from("tokens"), tokens);
+    var tokens = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, tokens, str_from_a(a, "prompt"),
+      bayan_json_v_int_new_a(a, agnosai_inference_response_prompt_tokens(resp)));
+    bayan_json_v_obj_set_a(a, tokens, str_from_a(a, "completion"),
+      bayan_json_v_int_new_a(a, agnosai_inference_response_completion_tokens(resp)));
+    bayan_json_v_obj_set_a(a, tokens, str_from_a(a, "total"),
+      bayan_json_v_int_new_a(a, agnosai_inference_response_total_tokens(resp)));
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "tokens"), tokens);
 
     var cost = agnosai_inference_response_cost_micro_usd(resp);
     if (cost != AGNOSAI_NO_LIMIT) {
-        agnosai_task_result_with_metadata(r, str_from("cost_micro_usd"),
-          bayan_json_v_int_new(cost));
+        agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "cost_micro_usd"),
+          bayan_json_v_int_new_a(a, cost));
     }
 
-    agnosai_task_result_with_metadata(r, str_from("task_duration_ms"),
-      bayan_json_v_int_new(_agnosai_crew_elapsed_ms(start_ns)));
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "task_duration_ms"),
+      bayan_json_v_int_new_a(a, _agnosai_crew_elapsed_ms(start_ns)));
     return r;
 }
 
 # The failure result — status Failed, output `"LLM error: " + err`, and metadata
 # carrying exactly `error` and `task_duration_ms`.
 fn _agnosai_crew_error_result(task, err: Str, start_ns): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "LLM error: ");
-    str_builder_add(sb, err);
+    return _agnosai_crew_error_result_a(default_alloc(), task, err, start_ns);
+}
 
-    var r = agnosai_task_result_new(agnosai_task_id(task), str_builder_build(sb),
+# `_agnosai_crew_error_result`, in allocator `a`.
+fn _agnosai_crew_error_result_a(a, task, err: Str, start_ns): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "LLM error: ");
+    str_builder_add_a(a, sb, err);
+
+    var r = agnosai_task_result_new_a(a, agnosai_task_id(task), str_builder_build_a(a, sb),
       AGNOSAI_STATUS_FAILED);
-    agnosai_task_result_with_metadata(r, str_from("error"), bayan_json_v_str_new(err));
-    agnosai_task_result_with_metadata(r, str_from("task_duration_ms"),
-      bayan_json_v_int_new(_agnosai_crew_elapsed_ms(start_ns)));
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "error"),
+      bayan_json_v_str_new_a(a, err));
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "task_duration_ms"),
+      bayan_json_v_int_new_a(a, _agnosai_crew_elapsed_ms(start_ns)));
     return r;
 }
 
-# The body of `agnosai_execute_task_in_crew`. `span` is the task's
+# The result of a task whose answers never met its `output_schema`: status Failed,
+# what the model last said as `output`, and `error` saying why.
+#
+# ⚠ **Failed, not Completed (2.2.5).** The loop used to end and the task to read
+# `completed` whatever came back, so a consumer that declared a shape was told the
+# work was done about an answer that did not have it. A DAG's dependents ran
+# against that output, too. A failed task stops them, which is the point of a
+# failure being sticky (`_agnosai_crew_run_dag`).
+#
+# `output` stays the model's text and not a message, so a caller can see what it
+# said, and it goes through the same filter as any other answer. No `token` event
+# is emitted: that event is a finished task's output, and this is not one.
+#
+# `validation_attempts` counts every call that was checked, so the first counts.
+fn _agnosai_crew_invalid_result_a(a, task, content: Str, verr: Str, attempts, resp, start_ns,
+  agent): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "output failed validation: ");
+    str_builder_add_a(a, sb, verr);
+
+    var r = agnosai_task_result_new_a(a, agnosai_task_id(task), content, AGNOSAI_STATUS_FAILED);
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "error"),
+      bayan_json_v_str_new_a(a, str_builder_build_a(a, sb)));
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "validation_attempts"),
+      bayan_json_v_int_new_a(a, attempts));
+    return _agnosai_crew_answer_metadata_a(a, r, resp, start_ns, agent);
+}
+
+# The default retry policy every task shares: it is read and never written, and
+# minting one per task is 32 bytes for good on the global heap.
+var _AGNOSAI_CREW_RETRY = agnosai_retry_config_default();
+
+# The body of `agnosai_execute_task_in_crew_a`. `span` is the task's
 # `invoke_agent` span and `self_sc` its context — both 0 with telemetry off.
-fn _agnosai_execute_task_body(task, agent, client, event_tx, crew_id: Str, span, self_sc): i64 {
+fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, span,
+  self_sc): i64 {
     var start_ns = clock_now_ns();
     var task_id = agnosai_task_id(task);
 
     if (client == 0) {
-        _agnosai_crew_log(SK_DEBUG, "executing task (placeholder - no LLM client)", 42,
-          task_id, _agnosai_crew_agent_label(agent));
-        return _agnosai_crew_placeholder_result(task, agent, start_ns);
+        _agnosai_crew_log_a(a, SK_DEBUG, "executing task (placeholder - no LLM client)", 42,
+          task_id, _agnosai_crew_agent_label_a(a, agent));
+        return _agnosai_crew_placeholder_result_a(a, task, agent, start_ns);
     }
 
-    _agnosai_crew_log(SK_DEBUG, "executing task via LLM", 22, task_id,
-      _agnosai_crew_agent_label(agent));
+    _agnosai_crew_log_a(a, SK_DEBUG, "executing task via LLM", 22, task_id,
+      _agnosai_crew_agent_label_a(a, agent));
 
-    var model = _agnosai_crew_select_model(agent);
+    var model = _agnosai_crew_select_model_a(a, agent);
     # The agent has one configured model, so the span says which (the pinned
     # convention's `gen_ai.request.model` on `invoke_agent`). A no-op at span 0.
     agnosai_genai_span_set_request_model(span, model);
-    var request = _agnosai_crew_build_request(task, agent, model, 0);
-    var original_prompt = _agnosai_crew_user_message(task);
-    var config = agnosai_retry_config_default();
-    var ctx = _agnosai_crew_infer_ctx_new(client, request, self_sc);
+    var request = _agnosai_crew_build_request_a(a, task, agent, model, 0);
+    var config = _AGNOSAI_CREW_RETRY;
+    var ctx = _agnosai_crew_infer_ctx_new_a(a, client, request, self_sc);
 
     var resp: i64[1];
     store64(&resp, 0);
-    var err = agnosai_with_retry(config, task_id, &_agnosai_crew_infer_fp, ctx, &resp);
+    var err = agnosai_with_retry_a(a, config, task_id, &_agnosai_crew_infer_fp, ctx, &resp);
 
-    # The output-schema validation retry loop. Each attempt rebuilds the prompt
-    # from the ORIGINAL, never the accumulated one — otherwise the prompt grows
-    # exponentially across retries — and drops the temperature to 0.1.
+    # The output-schema validation loop. Every answer is checked, the last one
+    # included: `AGNOSAI_MAX_VALIDATION_RETRIES` retries are each followed by a
+    # check. Through 2.2.4 the check ran before each retry, so the last answer was
+    # never read at all. A retry rebuilds its prompt from the ORIGINAL, never the
+    # accumulated one, or the prompt would grow exponentially, and drops the
+    # temperature to 0.1.
+    #
+    # `verr` is 0 when the answer passed, and holds the reason when none did.
+    # `extracted` is the text that was validated, so a fenced answer that passes
+    # is returned without its fence, and a consumer that parses `output` need not
+    # strip it again.
     var schema = agnosai_task_output_schema(task);
-    if (schema != 0) {
+    var verr = 0;
+    var attempts = 1;
+    var extracted: i64[1];
+    store64(&extracted, 0);
+    if (schema != 0 && err == 0) {
+        var original_prompt = _agnosai_crew_task_prompt_a(a, task);
         # Hoisted out of the retry loop — a constant minted per attempt.
-        var k_failed_output = str_from("failed_output");
-        for (var attempt = 1; attempt <= AGNOSAI_MAX_VALIDATION_RETRIES; attempt = attempt + 1) {
-            if (err != 0) { break; }
-
-            var extracted: i64[1];
-            store64(&extracted, 0);
-            var verr = agnosai_extract_and_validate(
+        var k_failed_output = str_from_a(a, "failed_output");
+        while (err == 0) {
+            verr = agnosai_extract_and_validate_a(a,
               agnosai_inference_response_content(load64(&resp)), schema, &extracted);
-            if (verr == 0) { break; }
+            if (verr == 0 || attempts > AGNOSAI_MAX_VALIDATION_RETRIES) { break; }
 
-            agnosai_validation_log_retry(task_id, attempt, verr);
+            agnosai_validation_log_retry_a(a, task_id, attempts, verr);
 
             # The failed output is sanitized before it goes back to the model —
             # it is model output being fed to a model, which is an injection
             # vector the oracle closes here.
-            var retry_prompt = agnosai_build_retry_prompt(original_prompt,
-              agnosai_prompt_sanitize(load64(&extracted), k_failed_output), verr, schema);
+            var retry_prompt = agnosai_build_retry_prompt_a(a, original_prompt,
+              agnosai_prompt_sanitize_a(a, load64(&extracted), k_failed_output), verr, schema);
 
-            var retry_req = _agnosai_crew_build_request(task, agent,
-              _agnosai_crew_select_model(agent), retry_prompt);
+            var retry_req = _agnosai_crew_build_request_a(a, task, agent,
+              _agnosai_crew_select_model_a(a, agent), retry_prompt);
             agnosai_inference_request_with_temperature_milli(retry_req,
               AGNOSAI_CREW_RETRY_TEMPERATURE_MILLI);
 
-            err = agnosai_with_retry(config, task_id,
-              &_agnosai_crew_infer_fp, _agnosai_crew_infer_ctx_new(client, retry_req, self_sc),
-              &resp);
+            var prior = load64(&resp);
+            err = agnosai_with_retry_a(a, config, task_id, &_agnosai_crew_infer_fp,
+              _agnosai_crew_infer_ctx_new_a(a, client, retry_req, self_sc), &resp);
+            attempts = attempts + 1;
+            if (err == 0) { agnosai_inference_response_carry_usage(load64(&resp), prior); }
         }
     }
 
     if (err != 0) {
-        return _agnosai_crew_error_result(task, err, start_ns);
+        var failed = _agnosai_crew_error_result_a(a, task, err, start_ns);
+        # A retry that failed leaves the last answer in `resp`, and those calls were paid
+        # for. A first call that failed leaves 0, and the shape the oracle's tests pin.
+        if (load64(&resp) != 0) {
+            _agnosai_crew_answer_metadata_a(a, failed, load64(&resp), start_ns, agent);
+        }
+        return failed;
     }
 
     var response = load64(&resp);
-    var content = _agnosai_crew_filter_output(
-      agnosai_inference_response_content(response), agent, task_id);
-    _agnosai_crew_emit_token(event_tx, task, crew_id, content);
+    var answer = agnosai_inference_response_content(response);
+    if (schema != 0 && verr == 0) { answer = load64(&extracted); }
+    var content = _agnosai_crew_filter_output_a(a, answer, agent, task_id);
+    if (verr != 0) {
+        _agnosai_crew_log_a(a, SK_WARN, "task output never met its schema", 32, task_id,
+          _agnosai_crew_agent_label_a(a, agent));
+        return _agnosai_crew_invalid_result_a(a, task, content, verr, attempts, response,
+          start_ns, agent);
+    }
+    _agnosai_crew_emit_token_a(a, event_tx, task, crew_id, content);
 
-    var result = agnosai_task_result_new(task_id, content, AGNOSAI_STATUS_COMPLETED);
-    return _agnosai_crew_success_metadata(result, response, start_ns, agent);
+    var result = agnosai_task_result_new_a(a, task_id, content, AGNOSAI_STATUS_COMPLETED);
+    return _agnosai_crew_answer_metadata_a(a, result, response, start_ns, agent);
 }
 
 # Execute one task of a crew via the LLM, or return the placeholder when there
@@ -784,6 +941,13 @@ fn _agnosai_execute_task_body(task, agent, client, event_tx, crew_id: Str, span,
 # hoosh caches server-side on the whole request body, which is both automatic
 # and correct where the oracle's client-side key was not. See the module header.
 fn agnosai_execute_task_in_crew(task, agent, client, event_tx, crew_id: Str, parent_sc): i64 {
+    return agnosai_execute_task_in_crew_a(default_alloc(), task, agent, client, event_tx,
+      crew_id, parent_sc);
+}
+
+# `agnosai_execute_task_in_crew`, with everything the task costs in allocator `a`.
+fn agnosai_execute_task_in_crew_a(a, task, agent, client, event_tx, crew_id: Str,
+  parent_sc): i64 {
     # ⚠ Built ONLY with the exporter on. Off — the common case — this costs one
     # load and a compare, no clock read, and the body is handed span 0 and
     # context 0.
@@ -802,7 +966,7 @@ fn agnosai_execute_task_in_crew(task, agent, client, event_tx, crew_id: Str, par
         span_t0 = clock_epoch_ns();
     }
 
-    var result = _agnosai_execute_task_body(task, agent, client, event_tx, crew_id, span,
+    var result = _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id, span,
       self_sc);
 
     # Recorded ONCE, from the result: a failed inference is a Failed result, not
@@ -836,6 +1000,9 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
 # the sequential path does (ADR 022). `TRACE` is the crew's span context, or 0:
 # the job is how a worker thread gets its parent, because a `thread_create`
 # worker starts with an empty thread-local block (ADR 023).
+#
+# `ALLOC` is the crew's allocator (ADR 028). `DONE` turns 1 as the worker's last act,
+# and is what the wave waits on: see `_agnosai_crew_job_finish`.
 enum AgnosaiCrewJobOff {
     AGN_CJ_TASK = 0;
     AGN_CJ_AGENT = 8;
@@ -845,10 +1012,49 @@ enum AgnosaiCrewJobOff {
     AGN_CJ_EVENT_TX = 40;
     AGN_CJ_CREW_ID = 48;
     AGN_CJ_TRACE = 56;
-    AGN_CJ_SIZE = 64;
+    AGN_CJ_ALLOC = 64;
+    AGN_CJ_DONE = 72;
+    AGN_CJ_SIZE = 80;
 }
 
-# One worker thread — `thread_create` passes exactly one argument.
+# Say a job is over, and wake the wave if it is parked on that.
+#
+# ⚠ **The worker's last touch of crew memory.** Once `DONE` reads 1 the wave may go
+# on, the crew may end, and its arena may be scrubbed and reused, so nothing after
+# this store may read the job. The wake takes the word's address and reads nothing
+# through it: a stale wake is a spurious one, and a waiter re-checks.
+#
+# ⚠ **The fences are what `thread_join` gave for nothing.** `atomic_store` and `atomic_load`
+# are plain moves, atomic and unordered (`lib/atomic.cyr`), and the wave usually finds `DONE`
+# set and never reaches the kernel. So on aarch64 the wave could read 1 and then a result
+# pointer of 0, dropping the task, or a pointer to a result whose fields had not landed. x86
+# cannot show this, and no suite here would. This fence pairs with the one in
+# `_agnosai_crew_job_wait`.
+fn _agnosai_crew_job_finish(job): i64 {
+    atomic_fence();
+    atomic_store(job + AGN_CJ_DONE, 1);
+    syscall(SYS_FUTEX, job + AGN_CJ_DONE, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+    return 0;
+}
+
+# Wait for a job's worker to say it is over.
+#
+# ⚠ **One load per iteration, feeding both uses**, as `thread_join` learned: the kernel
+# compares the word to what this thread saw, so a store landing between the check and
+# the park reads as EAGAIN and the loop re-checks, and it cannot park on a 1 it missed.
+fn _agnosai_crew_job_wait(job): i64 {
+    while (1 == 1) {
+        var d = atomic_load(job + AGN_CJ_DONE);
+        if (d != 0) {
+            atomic_fence();
+            return 0;
+        }
+        syscall(SYS_FUTEX, job + AGN_CJ_DONE, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, d, 0, 0, 0);
+    }
+    return 0;
+}
+
+# One worker thread — a thread passes exactly one argument.
 #
 # Cancellation is checked here rather than only before spawning, matching the
 # oracle's second check after acquiring its semaphore permit: a crew cancelled
@@ -856,15 +1062,18 @@ enum AgnosaiCrewJobOff {
 # cancelled here records no `invoke_agent` span — no agent was invoked.
 fn _agnosai_crew_worker(job): i64 {
     var task = load64(job + AGN_CJ_TASK);
+    var a = load64(job + AGN_CJ_ALLOC);
     var cancelled = load64(job + AGN_CJ_CANCELLED);
     if (cancelled != 0 && load64(cancelled) != 0) {
-        store64(job + AGN_CJ_RESULT, agnosai_task_result_new(agnosai_task_id(task),
-            str_from("crew cancelled"), AGNOSAI_STATUS_FAILED));
+        store64(job + AGN_CJ_RESULT, agnosai_task_result_new_a(a, agnosai_task_id(task),
+            str_from_a(a, "crew cancelled"), AGNOSAI_STATUS_FAILED));
+        _agnosai_crew_job_finish(job);
         return 0;
     }
-    store64(job + AGN_CJ_RESULT, agnosai_execute_task_in_crew(task, load64(job + AGN_CJ_AGENT),
-        load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX), load64(job + AGN_CJ_CREW_ID),
-        load64(job + AGN_CJ_TRACE)));
+    store64(job + AGN_CJ_RESULT, agnosai_execute_task_in_crew_a(a, task,
+        load64(job + AGN_CJ_AGENT), load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX),
+        load64(job + AGN_CJ_CREW_ID), load64(job + AGN_CJ_TRACE)));
+    _agnosai_crew_job_finish(job);
     return 0;
 }
 
@@ -885,7 +1094,9 @@ enum AgnosaiCrewRunnerOff {
     # The crew's `invoke_workflow` span context while it runs, or 0 — every
     # task's parent (ADR 023). Set by `agnosai_crew_runner_run`.
     AGN_CR_TRACE = 64;
-    AGN_CR_SIZE = 72;
+    # The crew's allocator (ADR 028), read once from the spec.
+    AGN_CR_ALLOC = 72;
+    AGN_CR_SIZE = 80;
 }
 
 # Initial chunk for the sequential run's audit scratch.
@@ -900,13 +1111,15 @@ var AGNOSAI_CREW_SCRATCH_BYTES = 1024;
 
 # Create a runner over a crew spec. Everything optional starts absent.
 fn agnosai_crew_runner_new(spec): i64 {
-    var r = alloc(AGN_CR_SIZE);
+    var a = agnosai_crew_alloc(spec);
+    var r = alloc_via(a, AGN_CR_SIZE);
     store64(r + AGN_CR_SCRATCH, 0);
     store64(r + AGN_CR_SPEC, spec);
     store64(r + AGN_CR_CLIENT, 0);
     store64(r + AGN_CR_EVENT_TX, 0);
-    store64(r + AGN_CR_CANCELLED, alloc(8));
+    store64(r + AGN_CR_CANCELLED, alloc_via(a, 8));
     store64(load64(r + AGN_CR_CANCELLED), 0);
+    store64(r + AGN_CR_ALLOC, a);
     store64(r + AGN_CR_AUDIT, 0);
     store64(r + AGN_CR_DEADLINE_NS, 0);
     store64(r + AGN_CR_TIMED_OUT, 0);
@@ -1048,7 +1261,7 @@ fn _agnosai_crew_wants_events(r): i64 {
 fn _agnosai_crew_emit(r, event_type: Str, data): i64 {
     var tx = load64(r + AGN_CR_EVENT_TX);
     if (tx == 0) { return 0; }
-    return agnosai_event_sender_send(tx, agnosai_crew_event_new(
+    return agnosai_event_sender_send(tx, agnosai_crew_event_new_a(load64(r + AGN_CR_ALLOC),
         agnosai_crew_id(load64(r + AGN_CR_SPEC)), event_type, data));
 }
 
@@ -1076,26 +1289,28 @@ fn _agnosai_crew_audit(r, event: Str, level: Str, message: Str, metadata): i64 {
 }
 
 # The `task_started` payload: id, description, and the agent key or null.
-fn _agnosai_crew_started_data(task, agent): i64 {
-    var d = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(d, str_from("task_id"), bayan_json_v_str_new(agnosai_task_id(task)));
-    bayan_json_v_obj_set(d, str_from("description"),
-      bayan_json_v_str_new(agnosai_task_description(task)));
-    if (agent == 0) { bayan_json_v_obj_set(d, str_from("agent"), bayan_json_v_null()); }
-    else {
-        bayan_json_v_obj_set(d, str_from("agent"),
-          bayan_json_v_str_new(agnosai_agent_key(agent)));
+fn _agnosai_crew_started_data_a(a, task, agent): i64 {
+    var d = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "task_id"),
+      bayan_json_v_str_new_a(a, agnosai_task_id(task)));
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "description"),
+      bayan_json_v_str_new_a(a, agnosai_task_description(task)));
+    if (agent == 0) {
+        bayan_json_v_obj_set_a(a, d, str_from_a(a, "agent"), bayan_json_v_null_a(a));
+    } else {
+        bayan_json_v_obj_set_a(a, d, str_from_a(a, "agent"),
+          bayan_json_v_str_new_a(a, agnosai_agent_key(agent)));
     }
     return d;
 }
 
 # The `task_completed` payload: id and status.
-fn _agnosai_crew_completed_data(result): i64 {
-    var d = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(d, str_from("task_id"),
-      bayan_json_v_str_new(agnosai_task_result_task_id(result)));
-    bayan_json_v_obj_set(d, str_from("status"),
-      bayan_json_v_str_new(agnosai_task_status_to_wire(agnosai_task_result_status(result))));
+fn _agnosai_crew_completed_data_a(a, result): i64 {
+    var d = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "task_id"),
+      bayan_json_v_str_new_a(a, agnosai_task_result_task_id(result)));
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "status"), bayan_json_v_str_new_a(a,
+        agnosai_task_status_to_wire(agnosai_task_result_status(result))));
     return d;
 }
 
@@ -1110,17 +1325,20 @@ fn _agnosai_crew_audit_task(r, task, result, agent): i64 {
     if (agnosai_task_result_status(result) != AGNOSAI_STATUS_COMPLETED) {
         level = str_from("error");
     }
+    # ⚠ **On the global heap, and owning its strings, whatever the crew lives in.** The
+    # chain keeps this for as long as it keeps the entry, so it outlives an arena crew,
+    # and a JSON string value holds its Str by pointer (ADR 028).
     var md = bayan_json_v_obj_new();
     bayan_json_v_obj_set(md, str_from("crew_id"),
-      bayan_json_v_str_new(agnosai_crew_id(load64(r + AGN_CR_SPEC))));
+      bayan_json_v_str_new(str_clone(agnosai_crew_id(load64(r + AGN_CR_SPEC)))));
     bayan_json_v_obj_set(md, str_from("task_id"),
-      bayan_json_v_str_new(agnosai_task_result_task_id(result)));
+      bayan_json_v_str_new(str_clone(agnosai_task_result_task_id(result))));
     bayan_json_v_obj_set(md, str_from("status"),
       bayan_json_v_str_new(agnosai_task_status_to_wire(agnosai_task_result_status(result))));
     if (agent == 0) { bayan_json_v_obj_set(md, str_from("agent"), bayan_json_v_null()); }
     else {
         bayan_json_v_obj_set(md, str_from("agent"),
-          bayan_json_v_str_new(agnosai_agent_key(agent)));
+          bayan_json_v_str_new(str_clone(agnosai_agent_key(agent))));
     }
     return _agnosai_crew_audit(r, str_from("task_completed"), level,
       agnosai_task_description(task), md);
@@ -1148,34 +1366,35 @@ fn _agnosai_crew_run_sequential(r): i64 {
     var tasks = agnosai_crew_tasks(spec);
     var agents = agnosai_crew_agents(spec);
     var client = load64(r + AGN_CR_CLIENT);
-    var results = vec_new();
+    var a = load64(r + AGN_CR_ALLOC);
+    var results = vec_new_a(a);
 
     # Two event names, minted once rather than once per task — and one check
     # for whether the payloads are worth building at all.
-    var ev_started = str_from("task_started");
-    var ev_completed = str_from("task_completed");
+    var ev_started = str_from_a(a, "task_started");
+    var ev_completed = str_from_a(a, "task_completed");
     var wants_events = _agnosai_crew_wants_events(r);
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
         if (_agnosai_crew_deadline_passed(r) == 1) { break; }
 
         var task = vec_get(tasks, i);
-        var agent = _agnosai_crew_pick_best_agent(agents, task);
+        var agent = _agnosai_crew_pick_best_agent_a(a, agents, task);
         agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
         if (wants_events == 1) {
-            _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data(task, agent));
+            _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data_a(a, task, agent));
         }
 
         agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
-        var result = agnosai_execute_task_in_crew(task, agent, client,
+        var result = agnosai_execute_task_in_crew_a(a, task, agent, client,
           load64(r + AGN_CR_EVENT_TX), agnosai_crew_id(spec), load64(r + AGN_CR_TRACE));
         agnosai_task_with_status(task, agnosai_task_result_status(result));
 
         if (wants_events == 1) {
-            _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data(result));
+            _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data_a(a, result));
         }
         _agnosai_crew_audit_task(r, task, result, agent);
-        vec_push(results, result);
+        vec_push_a(a, results, result);
     }
     store64(r + AGN_CR_SCRATCH, 0);
     return results;
@@ -1183,10 +1402,17 @@ fn _agnosai_crew_run_sequential(r): i64 {
 
 # Run a set of tasks concurrently, at most `max_concurrency` at a time.
 #
-# One OS thread per task, in batches — `thread_create` is the port's only
-# concurrency primitive and there is no semaphore, so the batch size IS the
-# concurrency limit. `alloc` has been thread-safe since cyrius 6.0.64, which is
-# what makes real threads viable here at all.
+# One OS thread per task, in batches — a thread is the port's only concurrency
+# primitive and there is no semaphore, so the batch size IS the concurrency limit.
+# `alloc` has been thread-safe since cyrius 6.0.64, which is what makes real threads
+# viable here at all.
+#
+# ⚠ **Detached, and waited on through the job (2.2.5).** `thread_create` allocates a
+# handle and 4 KiB of TLS on the no-free bump, and `thread_join` gives back only the
+# stack, so a crew cost over 4 KiB per task for good, in any arena. A detached thread
+# keeps both in its own mapping and unmaps it, and allocates nothing, which is why
+# `agnosai_orchestrator_submit_crew` uses one too. It leaves no handle to join, so the
+# job's `DONE` word does that work, in dispatch order, as the join did.
 #
 # `max_concurrency` of 0 or less runs everything in one batch, matching the
 # oracle's `Semaphore::new(0)` being a caller error rather than a stall.
@@ -1217,8 +1443,9 @@ fn _agnosai_crew_run_sequential(r): i64 {
 fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
     # Minted once for the wave rather than once per task, as in the
     # sequential path.
-    var ev_started = str_from("task_started");
-    var ev_completed = str_from("task_completed");
+    var a = load64(r + AGN_CR_ALLOC);
+    var ev_started = str_from_a(a, "task_started");
+    var ev_completed = str_from_a(a, "task_completed");
     var wants_events = _agnosai_crew_wants_events(r);
     var client = load64(r + AGN_CR_CLIENT);
     var spec = load64(r + AGN_CR_SPEC);
@@ -1230,13 +1457,13 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
     if (wants_events == 1) { worker_tx = load64(r + AGN_CR_EVENT_TX); }
     var crew_id = agnosai_crew_id(spec);
 
-    var jobs = vec_new();
+    var jobs = vec_new_a(a);
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
         var task = vec_get(tasks, i);
-        var agent = _agnosai_crew_pick_best_agent(agents, task);
+        var agent = _agnosai_crew_pick_best_agent_a(a, agents, task);
         agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
 
-        var job = alloc(AGN_CJ_SIZE);
+        var job = alloc_via(a, AGN_CJ_SIZE);
         store64(job + AGN_CJ_TASK, task);
         store64(job + AGN_CJ_AGENT, agent);
         store64(job + AGN_CJ_CLIENT, client);
@@ -1245,11 +1472,13 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         store64(job + AGN_CJ_EVENT_TX, worker_tx);
         store64(job + AGN_CJ_CREW_ID, crew_id);
         store64(job + AGN_CJ_TRACE, load64(r + AGN_CR_TRACE));
-        vec_push(jobs, job);
+        store64(job + AGN_CJ_ALLOC, a);
+        store64(job + AGN_CJ_DONE, 0);
+        vec_push_a(a, jobs, job);
     }
 
-    # Batches of `limit`. Every spawned thread is joined before the next batch,
-    # so no more than `limit` run at once and none is left detached.
+    # Batches of `limit`. Every spawned thread is waited for before the next batch,
+    # so no more than `limit` run at once and none outlives its wave.
     #
     # ⚠ **The deadline is checked HERE, at the batch head.** The oracle's timeout
     # is a `tokio::time::timeout` wrapping the whole `runner.run()`, so it fires
@@ -1273,43 +1502,38 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
         if (_agnosai_crew_deadline_passed(r) == 1) { break; }
 
-        # One handle per dispatched job, in dispatch order — 0 for a job that
-        # ran inline — so the join below can walk the batch alongside `jobs`.
+        # The batch is `first..next` of `jobs`, in dispatch order.
         var first = next;
-        var threads = vec_new();
         var spawned = 0;
         while (spawned < limit && next < vec_len(jobs)) {
             var job = vec_get(jobs, next);
             if (wants_events == 1) {
-                _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data(
+                _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data_a(a,
                     load64(job + AGN_CJ_TASK), load64(job + AGN_CJ_AGENT)));
             }
-            var t = thread_create(&_agnosai_crew_worker, job);
-            if (t == 0) {
+            if (thread_create_detached(&_agnosai_crew_worker, job) == 0) {
                 # The thread could not be created — run it here rather than
                 # dropping the task. A missing result would silently shorten the
                 # crew's output. Its `task_started` is already out, before it runs.
                 _agnosai_crew_worker(job);
             }
-            vec_push(threads, t);
             next = next + 1;
             spawned = spawned + 1;
         }
 
-        # Join in dispatch order and report each task as it is joined, so a
-        # watcher sees this batch's tasks finish before the next batch starts.
-        for (var j = 0; j < vec_len(threads); j = j + 1) {
-            var th = vec_get(threads, j);
-            if (th != 0) { thread_join(th); }
-            var jb = vec_get(jobs, first + j);
+        # Wait in dispatch order and report each task as it is done, so a watcher
+        # sees this batch's tasks finish before the next batch starts.
+        for (var j = first; j < next; j = j + 1) {
+            var jb = vec_get(jobs, j);
+            _agnosai_crew_job_wait(jb);
             var res = load64(jb + AGN_CJ_RESULT);
             if (res != 0) {
                 agnosai_task_with_status(load64(jb + AGN_CJ_TASK),
                   agnosai_task_result_status(res));
                 if (wants_events == 1) {
-                    _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data(res));
+                    _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data_a(a, res));
                 }
-                vec_push(results, res);
+                vec_push_a(a, results, res);
             }
         }
     }
@@ -1320,7 +1544,7 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
 fn _agnosai_crew_run_parallel(r): i64 {
     var spec = load64(r + AGN_CR_SPEC);
     return _agnosai_crew_run_wave(r, agnosai_crew_tasks(spec), agnosai_crew_agents(spec),
-      vec_new());
+      vec_new_a(load64(r + AGN_CR_ALLOC)));
 }
 
 # Whether every dependency of `task` is in the completed set.
@@ -1354,24 +1578,25 @@ fn _agnosai_crew_deps_ready(task, completed): i64 {
 # hold, which no failure explains.
 fn _agnosai_crew_run_dag(r, out_err): i64 {
     store64(out_err, 0);
+    var a = load64(r + AGN_CR_ALLOC);
     var spec = load64(r + AGN_CR_SPEC);
     var tasks = agnosai_crew_tasks(spec);
     var agents = agnosai_crew_agents(spec);
 
-    var order = agnosai_topological_sort_tasks(tasks);
+    var order = agnosai_topological_sort_tasks_a(a, tasks);
     if (order == 0) {
         store64(out_err, agnosai_error_cyclic_dag());
         return 0;
     }
 
     # Index the tasks by id so a sorted id can find its task.
-    var by_id = map_new_str();
+    var by_id = map_new_str_a(a);
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
-        map_set(by_id, agnosai_task_id(vec_get(tasks, i)), vec_get(tasks, i));
+        map_set_a(a, by_id, agnosai_task_id(vec_get(tasks, i)), vec_get(tasks, i));
     }
 
-    var completed = map_new_str();
-    var results = vec_new();
+    var completed = map_new_str_a(a);
+    var results = vec_new_a(a);
     var remaining = order;
     var any_failed = 0;
 
@@ -1380,13 +1605,16 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
         if (_agnosai_crew_deadline_passed(r) == 1) { break; }
 
         # Partition into the ready front and the rest, preserving order.
-        var ready = vec_new();
-        var not_ready = vec_new();
+        var ready = vec_new_a(a);
+        var not_ready = vec_new_a(a);
         for (var j = 0; j < vec_len(remaining); j = j + 1) {
             var id = vec_get(remaining, j);
             var t = map_get(by_id, id);
-            if (t != 0 && _agnosai_crew_deps_ready(t, completed) == 1) { vec_push(ready, t); }
-            else { vec_push(not_ready, id); }
+            if (t != 0 && _agnosai_crew_deps_ready(t, completed) == 1) {
+                vec_push_a(a, ready, t);
+            } else {
+                vec_push_a(a, not_ready, id);
+            }
         }
 
         if (vec_len(ready) == 0) {
@@ -1407,7 +1635,7 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
         for (var k = before; k < vec_len(results); k = k + 1) {
             var res = vec_get(results, k);
             if (agnosai_task_result_status(res) == AGNOSAI_STATUS_COMPLETED) {
-                map_set(completed, agnosai_task_result_task_id(res), res);
+                map_set_a(a, completed, agnosai_task_result_task_id(res), res);
             }
         }
         # A ready task that did not end COMPLETED failed — whether its result
@@ -1436,7 +1664,7 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
 # Aggregate the crew's profile from per-task metadata.
 #
 # `cost_micro_usd` replaces the oracle's f64 `cost_usd` — see
-# `_agnosai_crew_success_metadata`. A task with no cost key contributes nothing,
+# `_agnosai_crew_answer_metadata`. A task with no cost key contributes nothing,
 # which is why the key is omitted rather than zeroed when a gateway does not
 # report one: a zero would be indistinguishable from a free local inference and
 # would still be filtered out here by the oracle's own `> 0` guard.
@@ -1445,8 +1673,15 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
 # success arm writes since ADR 022 — before it, nothing did and the map was
 # always empty. `agnosai_crew_profile_record_agent_cost` sums, so an agent that
 # answered several tasks is charged for all of them.
+#
+# The sandbox strength is worked out once: it scores a fixed policy, so it is the same
+# number for every crew, and each working-out allocates a policy on the global heap.
+# Two crews racing the first store write the same value.
+var _AGNOSAI_CREW_SANDBOX_STRENGTH = 0 - 1;
+
 fn _agnosai_crew_build_profile(r, results, wall_ms): i64 {
-    var profile = agnosai_crew_profile_new();
+    var a = load64(r + AGN_CR_ALLOC);
+    var profile = agnosai_crew_profile_new_a(a);
     agnosai_crew_profile_with_wall_ms(profile, wall_ms);
     agnosai_crew_profile_with_task_count(profile, vec_len(results));
 
@@ -1462,17 +1697,20 @@ fn _agnosai_crew_build_profile(r, results, wall_ms): i64 {
     # the oracle. A cargo feature gate is not a scope boundary here, so the
     # port computes it unconditionally — the `None` arm has no equivalent,
     # because both producers are always linked.
-    agnosai_crew_profile_with_sandbox_strength(profile,
-      agnosai_kavach_strength_for_policy(agnosai_sandbox_policy_process()));
+    if (_AGNOSAI_CREW_SANDBOX_STRENGTH < 0) {
+        _AGNOSAI_CREW_SANDBOX_STRENGTH = agnosai_kavach_strength_for_policy(
+          agnosai_sandbox_policy_process());
+    }
+    agnosai_crew_profile_with_sandbox_strength(profile, _AGNOSAI_CREW_SANDBOX_STRENGTH);
 
     var total = 0;
     # **Hoisted: three metadata keys, once instead of once per result.** Each
     # `str_from` mints a 16-byte Str on the no-free global bump, so in a loop
     # over a crew's results they are a permanent leak proportional to task
     # count — for a constant that never changes.
-    var k_ms = str_from("task_duration_ms");
-    var k_cost = str_from("cost_micro_usd");
-    var k_agent = str_from("agent");
+    var k_ms = str_from_a(a, "task_duration_ms");
+    var k_cost = str_from_a(a, "cost_micro_usd");
+    var k_agent = str_from_a(a, "agent");
     for (var i = 0; i < vec_len(results); i = i + 1) {
         var res = vec_get(results, i);
         var md = agnosai_task_result_metadata(res);
@@ -1480,17 +1718,17 @@ fn _agnosai_crew_build_profile(r, results, wall_ms): i64 {
 
         var ms = map_get(md, k_ms);
         if (ms != 0 && bayan_json_v_is_int(ms) == 1) {
-            agnosai_crew_profile_record_task_ms(profile, task_id, bayan_json_v_int(ms));
+            agnosai_crew_profile_record_task_ms_a(a, profile, task_id, bayan_json_v_int(ms));
         }
 
         var cost = map_get(md, k_cost);
         if (cost != 0 && bayan_json_v_is_int(cost) == 1 && bayan_json_v_int(cost) > 0) {
             var c = bayan_json_v_int(cost);
             total = total + c;
-            agnosai_crew_profile_record_task_cost(profile, task_id, c);
+            agnosai_crew_profile_record_task_cost_a(a, profile, task_id, c);
             var agent = map_get(md, k_agent);
             if (agent != 0 && bayan_json_v_is_str(agent) == 1) {
-                agnosai_crew_profile_record_agent_cost(profile, bayan_json_v_str(agent), c);
+                agnosai_crew_profile_record_agent_cost_a(a, profile, bayan_json_v_str(agent), c);
             }
         }
     }
@@ -1517,15 +1755,18 @@ fn _agnosai_crew_build_profile(r, results, wall_ms): i64 {
 # saturating active gauge — see `src/server/prometheus.cyr`), so worker-thread
 # recording would have been *safe*; it is simply not needed.
 #
-# `tokens` is the nested `{prompt, completion, total}` object the success path
-# writes; a failed task has no `tokens` key and contributes nothing, matching the
-# `cost_micro_usd` convention immediately below it.
+# `tokens` is the nested `{prompt, completion, total}` object a result the model
+# answered carries. A task that failed before any answer has no `tokens` key and
+# contributes nothing, matching the `cost_micro_usd` convention immediately below
+# it. One whose answers never met its schema has both, as those calls were paid for.
+#
+# The two keys are minted once for the process: this has no allocator of its own, and
+# keeps nothing.
+var _AGN_CREW_K_TOKENS = str_from("tokens");
+var _AGN_CREW_K_COST = str_from("cost_micro_usd");
+
 fn _agnosai_crew_record_metrics(results): i64 {
     var m = agnosai_metrics_global();
-    # Hoisted for the same reason as `_agnosai_crew_build_profile`'s keys: two
-    # constants that would otherwise be minted once per task result.
-    var k_tokens = str_from("tokens");
-    var k_cost_m = str_from("cost_micro_usd");
     for (var i = 0; i < vec_len(results); i = i + 1) {
         var res = vec_get(results, i);
         if (agnosai_task_result_status(res) == AGNOSAI_STATUS_COMPLETED) {
@@ -1536,19 +1777,20 @@ fn _agnosai_crew_record_metrics(results): i64 {
 
         var md = agnosai_task_result_metadata(res);
         var total_tokens = 0;
-        var tok = map_get(md, k_tokens);
+        var tok = map_get(md, _AGN_CREW_K_TOKENS);
         if (tok != 0 && bayan_json_v_is_obj(tok) == 1) {
             var t = bayan_json_v_obj_get_by_cstr(tok, "total");
             if (t != 0 && bayan_json_v_is_int(t) == 1) { total_tokens = bayan_json_v_int(t); }
         }
         var cost_micro = 0;
-        var c = map_get(md, k_cost_m);
+        var c = map_get(md, _AGN_CREW_K_COST);
         if (c != 0 && bayan_json_v_is_int(c) == 1 && bayan_json_v_int(c) > 0) {
             cost_micro = bayan_json_v_int(c);
         }
-        # One inference per completed task. Skipped entirely when the task
-        # recorded neither — a failed task never reached a provider, and adding
-        # a zero would inflate the inference count without moving either total.
+        # One inference per answered task. Skipped entirely when the task
+        # recorded neither — a task with neither never reached a provider, and
+        # adding a zero would inflate the inference count without moving either
+        # total.
         if (total_tokens > 0 || cost_micro > 0) {
             agnosai_metrics_record_inference(m, total_tokens, cost_micro);
         }
@@ -1584,6 +1826,7 @@ fn _agnosai_crew_span_done(span, self_sc, parent_sc, t0, err_type): i64 {
 fn agnosai_crew_runner_run(r, out_err): i64 {
     store64(out_err, 0);
     var start_ns = clock_now_ns();
+    var a = load64(r + AGN_CR_ALLOC);
     var spec = load64(r + AGN_CR_SPEC);
     var tasks = agnosai_crew_tasks(spec);
 
@@ -1612,12 +1855,12 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     store64(r + AGN_CR_TRACE, self_sc);
 
     if (_agnosai_crew_wants_events(r) == 1) {
-        var started = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(started, str_from("name"),
-          bayan_json_v_str_new(agnosai_crew_name(spec)));
-        bayan_json_v_obj_set(started, str_from("task_count"),
-          bayan_json_v_int_new(vec_len(tasks)));
-        _agnosai_crew_emit(r, str_from("crew_started"), started);
+        var started = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, started, str_from_a(a, "name"),
+          bayan_json_v_str_new_a(a, agnosai_crew_name(spec)));
+        bayan_json_v_obj_set_a(a, started, str_from_a(a, "task_count"),
+          bayan_json_v_int_new_a(a, vec_len(tasks)));
+        _agnosai_crew_emit(r, str_from_a(a, "crew_started"), started);
     }
     # Bumps crews_total and the crews_active gauge. **Every exit below must
     # balance the gauge**, including the DAG-cycle error return — that path does
@@ -1644,7 +1887,7 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
         }
     } else {
         if (kind == AGNOSAI_PROCESS_HIERARCHICAL) {
-            _agnosai_crew_log(SK_WARN,
+            _agnosai_crew_log_a(a, SK_WARN,
               # The oracle's own message, verbatim — see roadmap F2.
               "hierarchical mode not yet implemented, falling back to sequential", 63,  #skip-lint: oracle string
               agnosai_crew_id(spec), 0);
@@ -1698,10 +1941,10 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     # On a timeout this is the oracle's timeout state — `Failed`, no results, no
     # profile (`orchestrator.rs:204-214` as of tag 2.1.4) — so a caller cannot
     # read a timed-out crew's partial output as if it had finished.
-    var state = agnosai_crew_state_new(agnosai_crew_id(spec), status);
+    var state = agnosai_crew_state_new_a(a, agnosai_crew_id(spec), status);
     if (timed_out == 0) {
         for (var j = 0; j < vec_len(results); j = j + 1) {
-            agnosai_crew_state_with_result(state, vec_get(results, j));
+            agnosai_crew_state_with_result_a(a, state, vec_get(results, j));
         }
         agnosai_crew_state_with_profile(state, _agnosai_crew_build_profile(r, results, wall_ms));
     }
@@ -1709,13 +1952,14 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     # `task_count` is the STATE's result count, not the run's, so a timed-out
     # crew reports 0 — what the stored state holds. `wall_ms` stays the real one.
     if (_agnosai_crew_wants_events(r) == 1) {
-        var done = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(done, str_from("status"),
-          bayan_json_v_str_new(agnosai_crew_status_to_wire(status)));
-        bayan_json_v_obj_set(done, str_from("task_count"),
-          bayan_json_v_int_new(vec_len(agnosai_crew_state_results(state))));
-        bayan_json_v_obj_set(done, str_from("wall_ms"), bayan_json_v_int_new(wall_ms));
-        _agnosai_crew_emit(r, str_from("crew_completed"), done);
+        var done = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, done, str_from_a(a, "status"),
+          bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire(status)));
+        bayan_json_v_obj_set_a(a, done, str_from_a(a, "task_count"),
+          bayan_json_v_int_new_a(a, vec_len(agnosai_crew_state_results(state))));
+        bayan_json_v_obj_set_a(a, done, str_from_a(a, "wall_ms"),
+          bayan_json_v_int_new_a(a, wall_ms));
+        _agnosai_crew_emit(r, str_from_a(a, "crew_completed"), done);
     }
 
     # ⚠ CANCELLED is an ERROR span, not OK. A collector's error rate is what an

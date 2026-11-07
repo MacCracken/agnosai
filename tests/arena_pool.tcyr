@@ -115,16 +115,34 @@ fn main() {
     assert(s3 != s1, "which is a distinct arena");
     assert(s3 != s2, "from both pooled ones");
 
-    # Surplus is dropped, not accumulated: releasing all three into two slots
-    # parks two and discards one, so the pool cannot grow past its capacity.
+    # Surplus is kept, not dropped (2.2.5). This used to assert the opposite, and that
+    # was the leak: the bump has no free, so a dropped arena held its memory all the same
+    # and every overflow minted another.
     agnosai_arena_pool_release(small, s1);
     agnosai_arena_pool_release(small, s2);
     agnosai_arena_pool_release(small, s3);
     var t1 = agnosai_arena_pool_acquire(small);
     var t2 = agnosai_arena_pool_acquire(small);
     assert(t1 != 0 && t2 != 0, "both slots are still serviceable");
-    assert_eq(agnosai_arena_pool_fallbacks(small), 1,
-      "and the surplus release did not inflate the pool — a third acquire would fall back again");
+    assert_eq(agnosai_arena_pool_fallbacks(small), 1, "two slots serve two acquires");
+    var t3 = agnosai_arena_pool_acquire(small);
+    assert(t3 != 0, "and a third acquire finds the arena that overflowed");
+    assert_eq(agnosai_arena_pool_fallbacks(small), 2, "the slots were empty, so it counts");
+    assert_eq(agnosai_arena_pool_minted(small), 3, "but nothing was minted for it");
+
+    # The property itself: past `slots` for as long as it lasts, the heap stops moving.
+    agnosai_arena_pool_release(small, t1);
+    agnosai_arena_pool_release(small, t2);
+    agnosai_arena_pool_release(small, t3);
+    var oh = vec_new();
+    var over_before = alloc_used();
+    for (var ov = 0; ov < 200; ov = ov + 1) {
+        vec_truncate(oh, 0);
+        for (var oi = 0; oi < 3; oi = oi + 1) { vec_push(oh, agnosai_arena_pool_acquire(small)); }
+        for (var oj = 0; oj < 3; oj = oj + 1) { agnosai_arena_pool_release(small, vec_get(oh, oj)); }
+    }
+    assert_eq(alloc_used() - over_before, 0, "200 rounds over the slots leave nothing");
+    assert_eq(agnosai_arena_pool_minted(small), 3, "and mint nothing");
 
     # --- null handling -------------------------------------------------------
     assert_eq(agnosai_arena_pool_acquire(0), 0, "acquiring from a null pool is 0, not a fault");

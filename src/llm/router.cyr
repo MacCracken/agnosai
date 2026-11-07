@@ -96,7 +96,12 @@ fn agnosai_complexity_to_wire(complexity): i64 {
 
 # Create a new task profile.
 fn agnosai_task_profile_new(task_type, complexity): i64 {
-    var p = alloc(AGN_TP_SIZE);
+    return agnosai_task_profile_new_a(default_alloc(), task_type, complexity);
+}
+
+# `agnosai_task_profile_new`, in allocator `a`.
+fn agnosai_task_profile_new_a(a, task_type, complexity): i64 {
+    var p = alloc_via(a, AGN_TP_SIZE);
     store64(p + AGN_TP_TASK_TYPE, task_type);
     store64(p + AGN_TP_COMPLEXITY, complexity);
     return p;
@@ -187,9 +192,14 @@ fn agnosai_route(profile): i64 {
 # These are the defaults when no explicit `llm_model` is set on the agent; the
 # hoosh server resolves them to whichever provider is configured.
 fn agnosai_default_model(tier): i64 {
-    if (tier == AGNOSAI_TIER_CAPABLE) { return str_from("llama3:70b"); }
-    if (tier == AGNOSAI_TIER_PREMIUM) { return str_from("llama3:405b"); }
-    return str_from("llama3");
+    return agnosai_default_model_a(default_alloc(), tier);
+}
+
+# `agnosai_default_model`, in allocator `a`.
+fn agnosai_default_model_a(a, tier): i64 {
+    if (tier == AGNOSAI_TIER_CAPABLE) { return str_from_a(a, "llama3:70b"); }
+    if (tier == AGNOSAI_TIER_PREMIUM) { return str_from_a(a, "llama3:405b"); }
+    return str_from_a(a, "llama3");
 }
 
 # Whether two Strs match ignoring ASCII case.
@@ -208,16 +218,23 @@ fn _agnosai_eq_ignore_ascii_case(a: Str, b: Str): i64 {
     return 1;
 }
 
+# The four spellings of `agnosai_parse_complexity`, minted once: it runs once per task and
+# each `str_from` is 16 bytes on the no-free bump for a constant.
+var _AGN_CX_LOW = str_from("low");
+var _AGN_CX_SIMPLE = str_from("simple");
+var _AGN_CX_HIGH = str_from("high");
+var _AGN_CX_COMPLEX = str_from("complex");
+
 # Map an agent's complexity string to a complexity level.
 #
 # "low" and "simple" are Simple; "high" and "complex" are Complex; everything
 # else — including unrecognized input — is Medium. Matching ignores ASCII case,
 # as the oracle's `eq_ignore_ascii_case` does.
 fn agnosai_parse_complexity(s: Str): i64 {
-    if (_agnosai_eq_ignore_ascii_case(s, str_from("low")) == 1) { return AGNOSAI_COMPLEXITY_SIMPLE; }
-    if (_agnosai_eq_ignore_ascii_case(s, str_from("simple")) == 1) { return AGNOSAI_COMPLEXITY_SIMPLE; }
-    if (_agnosai_eq_ignore_ascii_case(s, str_from("high")) == 1) { return AGNOSAI_COMPLEXITY_COMPLEX; }
-    if (_agnosai_eq_ignore_ascii_case(s, str_from("complex")) == 1) { return AGNOSAI_COMPLEXITY_COMPLEX; }
+    if (_agnosai_eq_ignore_ascii_case(s, _AGN_CX_LOW) == 1) { return AGNOSAI_COMPLEXITY_SIMPLE; }
+    if (_agnosai_eq_ignore_ascii_case(s, _AGN_CX_SIMPLE) == 1) { return AGNOSAI_COMPLEXITY_SIMPLE; }
+    if (_agnosai_eq_ignore_ascii_case(s, _AGN_CX_HIGH) == 1) { return AGNOSAI_COMPLEXITY_COMPLEX; }
+    if (_agnosai_eq_ignore_ascii_case(s, _AGN_CX_COMPLEX) == 1) { return AGNOSAI_COMPLEXITY_COMPLEX; }
     return AGNOSAI_COMPLEXITY_MEDIUM;
 }
 

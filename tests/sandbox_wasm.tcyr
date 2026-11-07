@@ -217,6 +217,243 @@ fn _t_write_nop_module(path: Str): i64 {
     return n;
 }
 
+# ── guests that stress what a sandbox bounds (2.2.5) ──────────────────────
+# Assembled and run under wasmtime 50.0.1, and kept as hex so no toolchain is needed. A hex
+# string is enough here because these never change: each carries the WAT it came from.
+
+# Append the bytes of a hex string to builder `sb`.
+fn _t_hex(sb, hex): i64 {
+    var n = strlen(hex);
+    for (var i = 0; i + 1 < n; i = i + 2) {
+        var hi = load8(hex + i);
+        var lo = load8(hex + i + 1);
+        if (hi >= 97) { hi = hi - 87; } else { hi = hi - 48; }
+        if (lo >= 97) { lo = lo - 87; } else { lo = lo - 48; }
+        str_builder_putc(sb, hi * 16 + lo);
+    }
+    return 0;
+}
+
+# Write the builder's bytes under `_T_ROOT` as `name`, load them, and return the module.
+fn _t_guest(sb, s, name, out_err): i64 {
+    var built = str_builder_build(sb);
+    var path = _t_join(str_from(_T_ROOT), str_from(name));
+    file_write_all(str_data(path), str_data(built), str_len(built));
+    var m = agnosai_wasm_load_module_from_file(s, path, out_err);
+    sys_unlink(str_data(path));
+    return m;
+}
+
+# (loop: fd_read into a 4 KiB buffer, stop at 0 bytes, fd_write what came) — the guest the 2.2.3
+# audit hung on: it writes while it reads, so stdin and stdout fill at the same time.
+fn _t_echo_loop(s, out_err): i64 {
+    var b = str_builder_new();
+    _t_hex(b, "0061736d01000000010c0260047f7f7f7f017f60000002440216776173695f736e617073");
+    _t_hex(b, "686f745f70726576696577310766645f72656164000016776173695f736e617073686f74");
+    _t_hex(b, "5f70726576696577310866645f77726974650000030201010503010001071302066d656d");
+    _t_hex(b, "6f72790200065f737461727400020a330131000340410041004101411010001a41102802");
+    _t_hex(b, "004504400f0b410c4110280200360200410141084101411810011a0c000b0b0b17020041");
+    _t_hex(b, "000b0840000000001000000041080b0440000000");
+    return _t_guest(b, s, "/echo-loop.wasm", out_err);
+}
+
+# (func _start (loop (br 0))): reads nothing, and never ends.
+fn _t_spin(s, out_err): i64 {
+    var b = str_builder_new();
+    _t_hex(b, "0061736d01000000010c0260047f7f7f7f017f60000002220116776173695f736e617073");
+    _t_hex(b, "686f745f70726576696577310766645f726561640000030201010503010001071302066d");
+    _t_hex(b, "656d6f72790200065f737461727400010a0901070003400c000b0b0b0e010041000b0840");
+    _t_hex(b, "00000000100000");
+    return _t_guest(b, s, "/spin.wasm", out_err);
+}
+
+# (func _start (fd_read 4 KiB) (loop (br 0))): takes one bite, and never ends.
+fn _t_spin_after_read(s, out_err): i64 {
+    var b = str_builder_new();
+    _t_hex(b, "0061736d01000000010c0260047f7f7f7f017f60000002220116776173695f736e617073");
+    _t_hex(b, "686f745f70726576696577310766645f726561640000030201010503010001071302066d");
+    _t_hex(b, "656d6f72790200065f737461727400010a14011200410041004101411010001a03400c00");
+    _t_hex(b, "0b0b0b0e010041000b084000000000100000");
+    return _t_guest(b, s, "/spin-read.wasm", out_err);
+}
+
+# (if (memory.grow 1 GiB) == -1 (proc_exit 42)) (proc_exit 7): 42 means the guest saw the failed
+# grow, 7 that the grow worked, and anything else that it never got back.
+fn _t_grower(s, out_err): i64 {
+    var b = str_builder_new();
+    _t_hex(b, "0061736d0100000001080260017f0060000002240116776173695f736e617073686f745f");
+    _t_hex(b, "70726576696577310970726f635f657869740000030201010503010001071302066d656d");
+    _t_hex(b, "6f72790200065f737461727400010a18011600418080014000417f460440412a10000b41");
+    _t_hex(b, "0710000b");
+    return _t_guest(b, s, "/grow.wasm", out_err);
+}
+
+# A module declaring `tables` tables and `memories` memories, with an empty `_start`. Both counts
+# are under 128, so each section's length and count are one byte.
+fn _t_many(s, tables, memories, out_err): i64 {
+    var b = str_builder_new();
+    _t_hex(b, "0061736d0100000001040160000003020100");
+    if (tables > 0) {
+        str_builder_putc(b, 4);
+        str_builder_putc(b, tables * 3 + 1);
+        str_builder_putc(b, tables);
+        for (var t = 0; t < tables; t = t + 1) { _t_hex(b, "700001"); }
+    }
+    if (memories > 0) {
+        str_builder_putc(b, 5);
+        str_builder_putc(b, memories * 2 + 1);
+        str_builder_putc(b, memories);
+        for (var m = 0; m < memories; m = m + 1) { _t_hex(b, "0001"); }
+    }
+    _t_hex(b, "070a01065f737461727400000a040102000b");
+    return _t_guest(b, s, "/many.wasm", out_err);
+}
+
+# Run `m` with `n` bytes of input. Stores how long it took, in ms, through `out_ms`.
+fn _t_run_sized(s, m, n, out_ms, out_err): i64 {
+    var buf = alloc(n + 1);
+    memset(buf, 65, n);
+    var t0 = clock_now_ns();
+    var r = agnosai_wasm_execute(s, m, str_new(buf, n), out_err);
+    store64(out_ms, (clock_now_ns() - t0) / 1000000);
+    return r;
+}
+
+fn _t_input_suite(): i64 {
+    var err: i64[1];
+    var ms: i64[1];
+    store64(&err, 0);
+    var s = agnosai_wasm_sandbox_with_limits(AGNOSAI_WASM_DEFAULT_MAX_MEMORY_BYTES, 8000);
+    var echo = _t_echo_loop(s, &err);
+    assert_neq(echo, 0, "the looping echo guest loads");
+
+    # What 2.2.3 refused, and what hung before that: past two pipe buffers, the guest blocked
+    # on stdout while the host blocked on stdin, and no deadline ever fired.
+    var r = _t_run_sized(s, echo, 200000, &ms, &err);
+    assert_neq(r, 0, "200,000 B is not refused");
+    assert_eq(agnosai_wasm_result_exit_code(r), 0, "and a guest that writes while it reads finishes");
+    var out = agnosai_wasm_result_stdout(r);
+    assert_eq(str_len(out), 200000, "and hands every byte back");
+    assert_eq(load8(str_data(out) + 199999), 65, "to the last one");
+    assert(load64(&ms) < 8000, "well inside its deadline");
+
+    # Output is bounded on its own, whatever the input.
+    var big = _t_run_sized(s, echo, 4194304, &ms, &err);
+    assert_neq(big, 0, "4 MiB is not refused either");
+    assert(str_len(agnosai_wasm_result_stdout(big)) <= AGNOSAI_WASM_STDOUT_CAPACITY,
+      "and what comes back stops at the stdout cap");
+    assert(load64(&ms) < 8000, "inside its deadline, with the guest's stdout cut off");
+
+    # A guest that takes none of it. This is what a blocking write could never get past.
+    var quick = agnosai_wasm_sandbox_with_limits(AGNOSAI_WASM_DEFAULT_MAX_MEMORY_BYTES, 300);
+    var spin = _t_spin(quick, &err);
+    assert_neq(spin, 0, "the spinning guest loads");
+    var stuck = _t_run_sized(quick, spin, 200000, &ms, &err);
+    assert_neq(stuck, 0, "a guest that reads nothing still comes back");
+    assert_eq(agnosai_wasm_result_exit_code(stuck), AGNOSAI_WASM_EXIT_TIMEOUT, "killed at its deadline");
+    assert(load64(&ms) < 3000, "of 300 ms, with stdin still full");
+
+    var bite = _t_spin_after_read(quick, &err);
+    var bitten = _t_run_sized(quick, bite, 200000, &ms, &err);
+    assert_neq(bitten, 0, "and one that reads a little and stops");
+    assert_eq(agnosai_wasm_result_exit_code(bitten), AGNOSAI_WASM_EXIT_TIMEOUT, "the same");
+    assert(load64(&ms) < 3000, "at the same deadline");
+
+    # A guest that exits with stdin unread. Its reader goes away mid-write, which was SIGPIPE.
+    var nop_path = _t_join(str_from(_T_ROOT), str_from("/early-exit.wasm"));
+    _t_write_nop_module(nop_path);
+    var nop = agnosai_wasm_load_module_from_file(s, nop_path, &err);
+    sys_unlink(str_data(nop_path));
+    var early = _t_run_sized(s, nop, 200000, &ms, &err);
+    assert_neq(early, 0, "a guest that never reads its input");
+    assert_eq(agnosai_wasm_result_exit_code(early), 0, "exits 0, and this process survives it");
+
+    # The input is not copied. It was, onto the no-free bump, so this cost 4 MiB for good. Read
+    # against an empty input, as every call leaves kavach's own 1 MiB capture buffer behind
+    # (roadmap B40), which this suite cannot do anything about.
+    var buf = alloc(4194305);
+    memset(buf, 65, 4194304);
+    var input = str_new(buf, 4194304);
+    var before = alloc_used();
+    agnosai_wasm_execute(s, nop, str_from(""), &err);
+    var base_cost = alloc_used() - before;
+    before = alloc_used();
+    agnosai_wasm_execute(s, nop, input, &err);
+    var big_cost = alloc_used() - before;
+    assert(big_cost - base_cost < 65536, "a call does not keep its input");
+
+    # An empty input and no input at all are both an empty stdin.
+    var none = agnosai_wasm_execute(s, nop, 0, &err);
+    assert_neq(none, 0, "no input is an empty stdin");
+    assert_eq(agnosai_wasm_result_exit_code(none), 0, "and runs");
+
+    agnosai_wasm_module_free(echo);
+    agnosai_wasm_module_free(spin);
+    agnosai_wasm_module_free(bite);
+    agnosai_wasm_module_free(nop);
+    return 0;
+}
+
+# Each limit at its value and over it, so neither half passes on a run that failed for another
+# reason.
+fn _t_store_limit_suite(): i64 {
+    var err: i64[1];
+    store64(&err, 0);
+    var s = agnosai_wasm_sandbox_new();
+
+    assert_eq(AGNOSAI_WASM_MAX_TABLES, 10, "the oracle's tables");
+    assert_eq(AGNOSAI_WASM_MAX_MEMORIES, 10, "memories");
+    assert_eq(AGNOSAI_WASM_MAX_INSTANCES, 10, "and instances");
+
+    var t_at = _t_many(s, AGNOSAI_WASM_MAX_TABLES, 0, &err);
+    assert_neq(t_at, 0, "ten tables load");
+    var r1 = agnosai_wasm_execute(s, t_at, str_from(""), &err);
+    assert_neq(r1, 0, "and run");
+    assert_eq(agnosai_wasm_result_exit_code(r1), 0, "ten tables are at the limit");
+
+    var t_over = _t_many(s, AGNOSAI_WASM_MAX_TABLES + 1, 0, &err);
+    assert_neq(t_over, 0, "eleven tables load: the limit is the runtime's");
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_execute(s, t_over, str_from(""), &err), 0, "and are refused, as an error");
+    assert(load64(&err) != 0, "the module never ran, so there is no exit code to report");
+    assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "store limits"), 1,
+      "and the error says what it hit");
+
+    var m_at = _t_many(s, 0, AGNOSAI_WASM_MAX_MEMORIES, &err);
+    assert_neq(m_at, 0, "ten memories load");
+    var r2 = agnosai_wasm_execute(s, m_at, str_from(""), &err);
+    assert_neq(r2, 0, "and run");
+    assert_eq(agnosai_wasm_result_exit_code(r2), 0, "ten memories are at the limit");
+
+    var m_over = _t_many(s, 0, AGNOSAI_WASM_MAX_MEMORIES + 1, &err);
+    store64(&err, 0);
+    assert_eq(agnosai_wasm_execute(s, m_over, str_from(""), &err), 0, "eleven memories are refused");
+    assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "store limits"), 1, "by name");
+
+    # No core module can reach `max-instances`, so this reads what goes to the runtime.
+    var cfg = _agnosai_wasm_store_limits(config_new());
+    assert_eq(SandboxConfig_wasm_max_instances(cfg), 10, "instances are held at 10");
+    assert_eq(SandboxConfig_wasm_max_tables(cfg), 10, "tables");
+    assert_eq(SandboxConfig_wasm_max_memories(cfg), 10, "memories");
+    assert_eq(SandboxConfig_wasm_grow_returns_failure(cfg), 0, "and a failed grow traps");
+
+    # The oracle's `trap_on_grow_failure(true)`, past the 64 MiB ceiling.
+    var grower = _t_grower(s, &err);
+    assert_neq(grower, 0, "the growing guest loads");
+    var g = agnosai_wasm_execute(s, grower, str_from(""), &err);
+    assert_neq(g, 0, "and runs");
+    assert(agnosai_wasm_result_exit_code(g) != 42, "a failed grow never reaches the guest");
+    assert(agnosai_wasm_result_exit_code(g) != 7, "and the grow did not succeed");
+    assert_eq(agnosai_wasm_result_exit_code(g), AGNOSAI_WASM_EXIT_TRAP, "it is reported as a trap");
+
+    agnosai_wasm_module_free(t_at);
+    agnosai_wasm_module_free(t_over);
+    agnosai_wasm_module_free(m_at);
+    agnosai_wasm_module_free(m_over);
+    agnosai_wasm_module_free(grower);
+    return 0;
+}
+
 # ⚠ **A wasmtime where kavach looks must be found** (2.2.3 audit). Every execute path in this suite
 # has a no-runtime arm, and that arm asserts too, so a regression in kavach's wasmtime probe would turn
 # the suite into a test of the missing-runtime message on a machine that HAS wasmtime. CI installs it
@@ -406,28 +643,6 @@ fn main(): i64 {
           "and an empty module exits cleanly");
     }
 
-    # --- 2.2.3 audit: stdin is capped at one pipe buffer ----------------------
-    # Over it, kavach's capture can deadlock past its own deadline on a guest that writes while it
-    # reads (`AGNOSAI_WASM_MAX_STDIN_BYTES`). Refused before anything spawns, so this holds with or
-    # without a runtime.
-    var over = str_builder_new();
-    for (var oi = 0; oi < AGNOSAI_WASM_MAX_STDIN_BYTES + 1; oi = oi + 1) { str_builder_putc(over, 65); }
-    store64(&err, 0);
-    assert_eq(agnosai_wasm_execute(s, m, str_builder_build(over), &err), 0,
-      "a WASM input one byte over 64 KiB is refused");
-    assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "64 KiB"), 1,
-      "...with an error that says why");
-    var at = str_builder_new();
-    for (var ai = 0; ai < AGNOSAI_WASM_MAX_STDIN_BYTES; ai = ai + 1) { str_builder_putc(at, 65); }
-    store64(&err, 0);
-    var at_r = agnosai_wasm_execute(s, m, str_builder_build(at), &err);
-    if (at_r == 0) {
-        assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "64 KiB"), 0,
-          "exactly 64 KiB is not refused by the cap (only a missing runtime refuses it)");
-    } else {
-        assert_eq(agnosai_wasm_result_exit_code(at_r), 0, "exactly 64 KiB runs: the cap is inclusive");
-    }
-
     # --- a REAL module, end to end -------------------------------------------
     #
     # ⚠ This is the only test in the tree that reaches wasmtime. It is what
@@ -531,6 +746,11 @@ fn main(): i64 {
     store64(&err, 0);
     assert_eq(agnosai_wasm_execute(s, m, str_from(""), &err), 0, "a freed module does not execute");
     assert_neq(load64(&err), 0, "and says why");
+
+    if (agnosai_wasm_available() == 1) {
+        _t_input_suite();
+        _t_store_limit_suite();
+    }
 
     # --- teardown -----------------------------------------------------------
     agnosai_wasm_module_free(fm);

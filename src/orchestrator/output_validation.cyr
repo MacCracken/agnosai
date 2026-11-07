@@ -49,33 +49,33 @@ fn agnosai_json_type_name(v): i64 {
 }
 
 # The oracle's `Response is not valid JSON: {e}`.
-fn _agnosai_validation_parse_err(): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "Response is not valid JSON: ");
-    str_builder_add_cstr(sb, bayan_json_last_error());
-    return str_builder_build(sb);
+fn _agnosai_validation_parse_err_a(a): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Response is not valid JSON: ");
+    str_builder_add_cstr_a(a, sb, bayan_json_last_error());
+    return str_builder_build_a(a, sb);
 }
 
 # The oracle's `Expected top-level type "{expected}", got "{actual}"`.
-fn _agnosai_validation_type_err(expected, actual): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "Expected top-level type \"");
-    str_builder_add_cstr(sb, expected);
-    str_builder_add_cstr(sb, "\", got \"");
-    str_builder_add_cstr(sb, actual);
-    str_builder_add_cstr(sb, "\"");
-    return str_builder_build(sb);
+fn _agnosai_validation_type_err_a(a, expected, actual): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Expected top-level type \"");
+    str_builder_add_cstr_a(a, sb, expected);
+    str_builder_add_cstr_a(a, sb, "\", got \"");
+    str_builder_add_cstr_a(a, sb, actual);
+    str_builder_add_cstr_a(a, sb, "\"");
+    return str_builder_build_a(a, sb);
 }
 
 # The oracle's `Missing required fields: {}` over `missing.join(", ")`.
-fn _agnosai_validation_missing_err(missing): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "Missing required fields: ");
+fn _agnosai_validation_missing_err_a(a, missing): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Missing required fields: ");
     for (var i = 0; i < vec_len(missing); i = i + 1) {
-        if (i > 0) { str_builder_add_cstr(sb, ", "); }
-        str_builder_add_cstr(sb, vec_get(missing, i));
+        if (i > 0) { str_builder_add_cstr_a(a, sb, ", "); }
+        str_builder_add_cstr_a(a, sb, vec_get(missing, i));
     }
-    return str_builder_build(sb);
+    return str_builder_build_a(a, sb);
 }
 
 # Byte-exact compare of two C strings. The schema's `type` is matched
@@ -100,16 +100,22 @@ fn _agnosai_validation_cstr_eq(a, b): i64 {
 #
 # Returns 0 when valid, else the error message.
 fn agnosai_validate_value(parsed, schema): i64 {
+    return agnosai_validate_value_a(default_alloc(), parsed, schema);
+}
+
+# `agnosai_validate_value`, with its message in allocator `a`.
+fn agnosai_validate_value_a(a, parsed, schema): i64 {
     # Step 2 in the oracle: the top-level type, only when the schema names one.
     var type_v = 0;
     if (schema != 0 && bayan_json_v_is_obj(schema) == 1) {
         type_v = bayan_json_v_obj_get_by_cstr(schema, "type");
     }
     if (type_v != 0 && bayan_json_v_is_str(type_v) == 1) {
-        var expected = str_cstr(bayan_json_v_str(type_v));
+        # A NUL-terminated copy in `a`: `str_cstr` would make its own on the global heap.
+        var expected = str_data(str_clone_a(a, bayan_json_v_str(type_v)));
         var actual = agnosai_json_type_name(parsed);
         if (_agnosai_validation_cstr_eq(expected, actual) == 0) {
-            return _agnosai_validation_type_err(expected, actual);
+            return _agnosai_validation_type_err_a(a, expected, actual);
         }
     }
 
@@ -123,22 +129,24 @@ fn agnosai_validate_value(parsed, schema): i64 {
     if (bayan_json_v_is_obj(parsed) == 1) {
         # `filter_map(as_str)` in the oracle: a non-string entry in `required`
         # is skipped, not reported as missing.
-        var missing = vec_new();
+        var missing = vec_new_a(a);
         for (var i = 0; i < bayan_json_v_arr_len(required); i = i + 1) {
             var entry = bayan_json_v_arr_get(required, i);
             if (entry != 0 && bayan_json_v_is_str(entry) == 1) {
                 var key = bayan_json_v_str(entry);
-                if (bayan_json_v_obj_get_by_str(parsed, key) == 0) { vec_push(missing, str_cstr(key)); }
+                if (bayan_json_v_obj_get_by_str(parsed, key) == 0) {
+                    vec_push_a(a, missing, str_data(str_clone_a(a, key)));
+                }
             }
         }
-        if (vec_len(missing) > 0) { return _agnosai_validation_missing_err(missing); }
+        if (vec_len(missing) > 0) { return _agnosai_validation_missing_err_a(a, missing); }
         return 0;
     }
 
     # Not an object. The oracle only complains when `required` is non-empty, so
     # a schema carrying `"required": []` still admits a bare string or number.
     if (bayan_json_v_arr_len(required) > 0) {
-        return str_from("Schema requires fields but response is not a JSON object");
+        return str_from_a(a, "Schema requires fields but response is not a JSON object");
     }
     return 0;
 }
@@ -148,9 +156,14 @@ fn agnosai_validate_value(parsed, schema): i64 {
 # Returns **0 when the output is valid**, else the error message — the oracle's
 # `ValidationResult`, flattened.
 fn agnosai_validate_output(output: Str, schema): i64 {
-    var parsed = bayan_json_v_parse_buf(str_data(output), str_len(output));
-    if (parsed == 0) { return _agnosai_validation_parse_err(); }
-    return agnosai_validate_value(parsed, schema);
+    return agnosai_validate_output_a(default_alloc(), output, schema);
+}
+
+# `agnosai_validate_output`, with its parse and its message in allocator `a`.
+fn agnosai_validate_output_a(a, output: Str, schema): i64 {
+    var parsed = bayan_json_v_parse_buf_a(a, str_data(output), str_len(output));
+    if (parsed == 0) { return _agnosai_validation_parse_err_a(a); }
+    return agnosai_validate_value_a(a, parsed, schema);
 }
 
 # Build the retry prompt that hands the model its failed output and the reason.
@@ -159,17 +172,24 @@ fn agnosai_validate_output(output: Str, schema): i64 {
 # including the fenced blocks and the trailing schema fence.
 fn agnosai_build_retry_prompt(original_prompt: Str, failed_output: Str, validation_error: Str,
   schema): i64 {
-    var sb = str_builder_new();
-    str_builder_add(sb, original_prompt);
-    str_builder_add_cstr(sb, "\n\nYour previous response failed validation.\nError: ");
-    str_builder_add(sb, validation_error);
-    str_builder_add_cstr(sb, "\nYour previous response was:\n```\n");
-    str_builder_add(sb, failed_output);
-    str_builder_add_cstr(sb,
+    return agnosai_build_retry_prompt_a(default_alloc(), original_prompt, failed_output,
+      validation_error, schema);
+}
+
+# `agnosai_build_retry_prompt`, in allocator `a`.
+fn agnosai_build_retry_prompt_a(a, original_prompt: Str, failed_output: Str,
+  validation_error: Str, schema): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, original_prompt);
+    str_builder_add_cstr_a(a, sb, "\n\nYour previous response failed validation.\nError: ");
+    str_builder_add_a(a, sb, validation_error);
+    str_builder_add_cstr_a(a, sb, "\nYour previous response was:\n```\n");
+    str_builder_add_a(a, sb, failed_output);
+    str_builder_add_cstr_a(a, sb,
       "\n```\n\nPlease respond with ONLY valid JSON matching this schema:\n```json\n");
-    if (schema != 0) { str_builder_add(sb, bayan_json_v_build(schema)); }
-    str_builder_add_cstr(sb, "\n```");
-    return str_builder_build(sb);
+    if (schema != 0) { str_builder_add_a(a, sb, bayan_json_v_build_a(a, schema)); }
+    str_builder_add_cstr_a(a, sb, "\n```");
+    return str_builder_build_a(a, sb);
 }
 
 # Extract the first fenced block from text, or 0 when there is none.
@@ -187,6 +207,11 @@ fn agnosai_build_retry_prompt(original_prompt: Str, failed_output: Str, validati
 # what lets a JSON string value contain literal triple backticks — the oracle
 # has a test for exactly that.
 fn agnosai_extract_json_block(text: Str): i64 {
+    return agnosai_extract_json_block_a(default_alloc(), text);
+}
+
+# `agnosai_extract_json_block`, in allocator `a`.
+fn agnosai_extract_json_block_a(a, text: Str): i64 {
     for (var m = 0; m < 4; m = m + 1) {
         var marker = "```json\n";
         if (m == 1) { marker = "```json\r\n"; }
@@ -196,12 +221,12 @@ fn agnosai_extract_json_block(text: Str): i64 {
         var start = str_index_of_cstr(text, marker);
         if (start >= 0) {
             var content_start = start + strlen(marker);
-            var remainder = str_substr(text, content_start, str_len(text));
+            var remainder = str_sub_a(a, text, content_start, str_len(text) - content_start);
             var end = str_index_of_cstr(remainder, "\n```");
             if (end < 0) { end = str_index_of_cstr(remainder, "\r\n```"); }
             # The oracle's `?`: no closing fence anywhere means None overall.
             if (end < 0) { return 0; }
-            var block = str_trim(str_substr(remainder, 0, end));
+            var block = str_trim_a(a, str_sub_a(a, remainder, 0, end));
             if (str_len(block) > 0) { return block; }
             # An empty block falls through to the next marker, which is the one
             # case where the oracle's loop actually iterates.
@@ -222,16 +247,21 @@ fn agnosai_extract_json_block(text: Str): i64 {
 # retrying gets the error about the JSON the model meant to emit, not about the
 # prose wrapped around it.
 fn agnosai_extract_and_validate(output: Str, schema, out_text): i64 {
-    var result = agnosai_validate_output(output, schema);
+    return agnosai_extract_and_validate_a(default_alloc(), output, schema, out_text);
+}
+
+# `agnosai_extract_and_validate`, in allocator `a`.
+fn agnosai_extract_and_validate_a(a, output: Str, schema, out_text): i64 {
+    var result = agnosai_validate_output_a(a, output, schema);
     if (result == 0) {
         store64(out_text, output);
         return 0;
     }
 
-    var block = agnosai_extract_json_block(output);
+    var block = agnosai_extract_json_block_a(a, output);
     if (block != 0) {
         store64(out_text, block);
-        return agnosai_validate_output(block, schema);
+        return agnosai_validate_output_a(a, block, schema);
     }
 
     store64(out_text, output);
@@ -240,16 +270,21 @@ fn agnosai_extract_and_validate(output: Str, schema, out_text): i64 {
 
 # Trace a validation retry — the oracle's `warn!` with task, attempt and max.
 fn agnosai_validation_log_retry(task_id: Str, attempt, error: Str): i64 {
+    return agnosai_validation_log_retry_a(default_alloc(), task_id, attempt, error);
+}
+
+# `agnosai_validation_log_retry`, building its line in allocator `a`.
+fn agnosai_validation_log_retry_a(a, task_id: Str, attempt, error: Str): i64 {
     if (sakshi_get_level() < SK_WARN) { return 0; }
-    var sb = str_builder_new();
-    str_builder_add(sb, task_id);
-    str_builder_add_cstr(sb, " attempt=");
-    str_builder_add_int(sb, attempt);
-    str_builder_add_cstr(sb, " max=");
-    str_builder_add_int(sb, AGNOSAI_MAX_VALIDATION_RETRIES);
-    str_builder_add_cstr(sb, " error=");
-    str_builder_add(sb, error);
-    var line = str_builder_build(sb);
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, task_id);
+    str_builder_add_cstr_a(a, sb, " attempt=");
+    str_builder_add_int_a(a, sb, attempt);
+    str_builder_add_cstr_a(a, sb, " max=");
+    str_builder_add_int_a(a, sb, AGNOSAI_MAX_VALIDATION_RETRIES);
+    str_builder_add_cstr_a(a, sb, " error=");
+    str_builder_add_a(a, sb, error);
+    var line = str_builder_build_a(a, sb);
     sakshi_log_kv(SK_WARN, "output validation failed, retrying", 34, "task", 4, str_data(line),
       str_len(line));
     return 0;

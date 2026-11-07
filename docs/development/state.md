@@ -2,9 +2,28 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-06 (the 2.2.4 release gate).
+> Last refreshed: 2026-11-06 (the 2.2.5 release gate).
 
-## Now — 2.2.4
+## Now — 2.2.5
+
+| | |
+|---|---|
+| **version** | **2.2.5** (cut 2026-11-06): agnostic's two reports repaired, with `docs/development/issues/` holding only `archive/`. A task is held to its `output_schema`, which is in its first prompt, and one that never meets it is `failed`. A crew built with `agnosai_crew_new_in` lives in an arena that `agnosai_orchestrator_release_crew` gives back (ADR 028). kavach 3.14.6 closed two of agnosai's reports, so the 64 KiB cap on WASM input is gone and a guest is held to the Rust line's store limits (B9). An independent review of the crew work found six defects, all fixed here |
+| **cyrius pin** | **6.7.18**, unchanged: still the latest tag |
+| **tests** | **102 suites, 10,281 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1 present. 2.2.4's tree reads 8,908 in the same shell (its recorded 8,912 was a different environment). The +1,373 is the new `orch_crew_arena` 1,288, `sandbox_wasm` +42, `orch_crew_runner` +38 and `arena_pool` +5. `sandbox_spawn` fails one assertion in a tree under `/tmp`, as it asserts a spawned `pwd` holds no `/tmp` |
+| **coverage** | **99%**: 104/104 files, 1,724/1,735 fns (gate `--min 80`), 11 unreferenced. Every new public name is named by a test |
+| **dist** | `dist/agnosai.cyr` 41,191 lines + `dist/agnosai-guard.cyr` 1,014, both v2.2.5. Sidecars **6 / 1** leaves, unchanged. `src/crew_arena.cyr` joins `[lib]` after `src/orchestrator/crew_runner.cyr` |
+| **binary** | `build/agnosai` **2,939,232 B** (2.2.4: 2,908,008). aarch64 **6,899,584 B** (6,897,048), which is not compacted. The native binary answers `/ready` with `"version":"2.2.5"`, ran a sequential and a parallel crew against a gateway on a socket, and exits cleanly on SIGTERM |
+| **lock** | `cyrius.lock` **119 files, 8 commit pins**. One pin moved: kavach 3.14.6 at `b772c152`, matching its tag on GitHub. ⚠ `cyrius deps` keeps a pin the manifest has moved past, and says so in a note, so a dep bump needs the lock deleted first |
+| **gates** | `check-symbols.sh` 2,931 definitions across 115 files; `check-clean.sh` fmt 229, lint 229, doc 116, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist. Then build, tests under DCE, coverage, `distlib --all --check`, examples, fuzz 4/4, `cyrius bench`. Not run: the `ubuntu:26.04` CI replica. CHANGELOG 2.2.5 *Verified* has what was |
+| **benchmarks** | `bench-history.csv` has 230 rows at 2.2.5, one sweep at a load of 3.0–3.3: median +0.2% against 2.2.4's rows, 185 of 229 within ±5%. The interleaved A/B against a 2.2.4 build reads `orch.bcyr` median 0.0%, 79 of 89 within ±5%, and `server.bcyr` −0.0%, 34 of 34, on a quiet machine. Parallel crews 12–28% faster, `run_crew_then_release` 87.4 µs beside `run_crew_then_forget` 92.2 µs (CHANGELOG 2.2.5 *Performance*). No row reaches the WASM path |
+| **bytes per crew** | **0** on the global heap for a crew in an arena, released, in every process mode. 8,361 for a crew that does not opt in (2.2.4: 9,368). Against a socket the floor is sandhi's 480 B per exchange (B39). A WASM call leaves about 1 MiB of kavach's, whatever its input (B40) |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4, and nothing in its schema path changes: `output_valid` reads completed tasks, and a failed one carries `error`. Its memory does not move until it adopts `agnosai_crew_new_in` and `release_crew` (ADR 028). thoth's guard profile gains `_a` forms and no new leaf |
+
+Direct deps: as 2.2.4 below, with `kavach` **3.14.6**. Everything else was already on its latest tag.
+
+### 2.2.4 — the release (2026-11-06)
 
 | | |
 |---|---|

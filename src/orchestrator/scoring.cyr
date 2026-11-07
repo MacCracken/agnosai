@@ -362,14 +362,22 @@ fn _agnosai_scored_cmp(a, b): i64 {
 # that tie-break, "which of two equally good agents gets the task" would vary
 # with the sort's internal swaps.
 fn agnosai_rank_agents(agents, task): i64 {
-    var required = agnosai_extract_required_tools(task);
-    var scored = vec_new();
+    return agnosai_rank_agents_a(default_alloc(), agents, task);
+}
+
+# `agnosai_rank_agents`, in allocator `a`.
+fn agnosai_rank_agents_a(a, agents, task): i64 {
+    var required = _agnosai_extract_required_tools_a(a, task);
+    # -1 means `a` ran out, which a growable arena reaches only when mmap does. It
+    # reads as no requirement here, as `agnosai_extract_required_tools` folds it.
+    if (required < 0) { required = 0; }
+    var scored = vec_new_a(a);
     for (var i = 0; i < vec_len(agents); i = i + 1) {
-        var e = alloc(AGN_SC_SIZE);
+        var e = alloc_via(a, AGN_SC_SIZE);
         store64(e + AGN_SC_INDEX, i);
         store64(e + AGN_SC_SCORE,
           agnosai_score_agent_with_tools(vec_get(agents, i), task, required));
-        vec_push(scored, e);
+        vec_push_a(a, scored, e);
     }
 
     # ⚠ **`agnosai_sort` (introsort), not the hand-rolled insertion sort this

@@ -1,6 +1,7 @@
-# A crew a consumer has forgotten still holds about 11 KB, for the life of the process
+# A crew a consumer has forgotten still holds about 11 KB, for the life of the process — RESOLVED
 
-**Status:** 🟡 **OPEN**
+**Status:** ✅ **RESOLVED in agnosai 2.2.5** (2026-11-06), for a consumer that adopts it. Was 🟡 OPEN.
+**Resolution:** a crew built with `agnosai_crew_new_in(a, name)`, in an arena from `agnosai_crew_pool_acquire`, keeps everything the engine allocates for it there, and `agnosai_orchestrator_release_crew(o, spec)` gives the arena back ([ADR 028](../../../adr/028-a-crew-lives-in-an-arena-its-consumer-gives-back.md)). The subscribe channel goes back with `agnosai_event_bus_recycle(bus, sub)`. `forget_crew` is unchanged, so its contract stands. `tests/orch_crew_arena.tcyr` measures the loop this issue describes and reads 0 B per crew in every process mode. The part that still grows is named in the ADR: 480 B per exchange in sandhi, agnostic's own ledger, and the audit chain and telemetry when they are on. **For agnostic:** none of this reaches it until it adopts it. Build the spec with `agnosai_crew_new_in` and the `_a` forms, subscribe with `agnosai_event_bus_subscribe_a`, and at ledger eviction, where the ring goes back, clear the entry's pointers under the ledger lock, call `release_crew` once, then `agnosai_event_bus_recycle`.
 **Placement:** unpinned. agnostic's 0.3.x line carried its half at 0.3.1, and this is what is left.
 **Discovered:** 2026-11-05 (agnostic's audit, P2). Measured again 2026-11-06 at agnosai 2.2.4.
 **Severity:** Medium. Nothing fails. A long-lived server spends about 11 GB per million crews, and only a restart gives it back.
