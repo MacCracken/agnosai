@@ -334,7 +334,7 @@ it, so none has a number of its own.
 | Item | Waits on | State | agnosai's half |
 |---|---|---|---|
 | **B5** `personality` | bhava | ⛔ No Cyrius port yet, and the user plans to start one soon. `personality`, `with_personality`, `mood_adjusted_temperature`, the personality score and the system-prompt block | Port them against it. D2. ⛔ **Gates the `rust-old/` deletion** |
-| **B8** RSA over 4096 bits | sigil | Filed (sigil `docs/development/issues/2026-11-05-agnosai-rsa-over-4096-bits-cannot-verify.md`). `_rsa_recover_em`'s `n_len > 512`; the Rust line took 8192 | Nothing until then. See D9 |
+| **B8** RSA over 4096 bits | sigil | Filed (sigil `docs/development/issues/2026-11-05-agnosai-rsa-over-4096-bits-cannot-verify.md`). `_rsa_recover_em`'s `n_len > 512`; the Rust line took 8192 | Raise `AGNOSAI_JWT_MAX_MODULUS` from 512 to 1024 bytes, and the buffers it sizes in `src/server/auth.cyr`, once sigil does. Does not hold the `rust-old/` deletion |
 | **B39** 480 B per exchange | sandhi | Filed, as an addendum to sandhi `docs/development/issues/2026-11-05-agnostic-outbound-calls-keep-bytes-on-the-global-heap.md`. 328 B is `_sandhi_http_recv_framed`'s bare header parse (about 40 B per response header) and 120 B `_sandhi_client_host_header_a`'s builder | Tighten `_T_SANDHI_BYTES_PER_CALL` to 0 in `tests/orch_crew_arena.tcyr`, and the bounds in `telemetry_otlp` and `llm_hoosh`. A `chan_reopen` in the stdlib would retire `agnosai_chan_reopen`'s reach into `closed`, not filed |
 | **B40** 1 MiB per exec | kavach | Filed (kavach `docs/development/issues/2026-11-06-agnosai-every-exec-keeps-its-1-mib-capture-buffer.md`). All nine backends `alloc(out_cap)` per exec: 400 execs took RSS from 9.5 MB to 421 MB | `tests/sandbox_wasm.tcyr`'s cost of a call reads near 0. ⛔ **Gates 2.3.2** |
 | **B16** chunked requests | sandhi | Filed. `sandhi_server_request_has_unsupported_te` answers 501 | Nothing: out of scope until it lands |
@@ -368,7 +368,6 @@ The ~650 comment lines citing a `rust-old/` path stay as historical pointers. No
 
 | # | Decision | Needed by | Where it stands |
 |---|---|---|---|
-| **D9** | **Does the deletion also wait on RSA keys over 4096 bits?** | When bhava lands | The Rust line took 8192-bit keys and sigil refuses them, filed. B5's half of this was decided (*Settled decisions*), so this is the row that ruling left open: the deletion could go with bhava and leave this as a known gap, or wait for sigil too |
 | **D8** | **Make CI's Lockfile step fail on a drifted lock (`cyrius deps --locked`)?** | Any time | `CLAUDE.md` has CI resolve the lock rather than audit a committed one. Since cyrius 6.7.6 a plain local `cyrius deps` writes the same 8-pin lock CI does, so `--locked` would now catch a tag that moved upstream. Adopting it changes the policy that file states |
 | **D7** | **Note the 2.1.5 exception in the CHANGELOG, or change its policy line?** | Any time | `CHANGELOG.md:6` claims Semantic Versioning, but 2.1.5 shipped a `### Breaking` section under a patch number (D6) and neither says so |
 
@@ -469,7 +468,8 @@ docs cite them.
 - **`rust-old/` goes once every Rust porting item is done, and bhava is one of them** (2026-11-05 and 2026-11-06, the
   user). "If all the rust porting items are done then deleting at 2.3.0 is fine", then, when asked whether the carve-out
   was exempt: "rust port is not done if bhava is still missing", with the bhava port to start soon. So the deletion waits
-  on B5 and has no number. RSA over 4096 is **D9**.
+  on B5 and has no number. **RSA keys over 4096 bits do not hold it** (D9, the same day): that gap is sigil's, and the
+  user's ask was that it be filed, which it is (*Waiting on upstream*).
 - **`assert` stays in `[deps] stdlib`; only `bench` moved to `[test] stdlib`** (2026-11-05, 2.2.3 audit).
   `src/learning/optimizer.cyr` calls the stdlib's `panic()`, which lives in `lib/assert.cyr` and is documented
   there as the runtime guard for library code. So `assert` is a real production leaf, and a consumer's sidecar
