@@ -6,7 +6,7 @@
 > test counts, sizes) is in [`state.md`](state.md). [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's
 > reasoning archive, and [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.3.0 (2026-11-07).** Labels (B, C, D, F) are never reused, because `state.md`, ADRs and `src/`
+**Status as of 2.3.1 (2026-11-07).** Labels (B, C, D, F) are never reused, because `state.md`, ADRs and `src/`
 comments cite them. A label that is not here is closed, and the CHANGELOG has it.
 
 ## What agnosai is
@@ -51,7 +51,6 @@ does not change without telling it.
 
 | Release | Theme | Items | Waits on |
 |---|---|---|---|
-| **2.3.1** | Models from hoosh's catalog | B33 | |
 | **2.3.2** | Tools in a confined tier | B35, B41 | B40 in kavach |
 | **2.3.3** | The WASM tool's lifecycle | B9, B32 | |
 | **2.3.4** | Tools on the network | B13, B36 | |
@@ -74,41 +73,8 @@ does not change without telling it.
 
 ### 2.3.x — the tool-calling harness (agnostic's M6 waits on this line)
 
-2.3.0 shipped the loop ([ADR 029](../adr/029-the-tool-loop.md)).
-
-#### 2.3.1 — models from hoosh's catalog
-
-**B33. Choose and attribute models from hoosh's catalog, not from names agnosai carries.** Every agnostic crew
-takes the guessed-id path today. agnosai names models itself in four places:
-
-1. **Selection.** An agent with no `llm_model` gets `agnosai_default_model(agnosai_route(profile))`
-   (`_agnosai_crew_select_model_a`; `src/llm/router.cyr`): `llama3:70b` for Capable, `llama3:405b` for Premium.
-   hoosh routes by the id it is given, so a gateway with no `llama*` route answers every such crew 404, and one
-   with an Ollama route sends it to a local 70B model whether the box has one or not.
-2. **Attribution.** With no `usage.provider`, `_agnosai_crew_infer_provider_a` guesses from nine name prefixes, so
-   `o4-mini`, `gpt-oss`, `qwen/…` and every newer family bill to Ollama.
-3. **`fleet/cost_planning.cyr`**'s `BUDGET_MODELS` and `agnosai_select_cheapest_model`: the oracle's model and
-   price list, a public API nothing in `src/` calls.
-4. **Docs:** README.md and `docs/architecture/overview.md` show `"llm_model": "capable"`, which is sent literally
-   (hoosh has no tier aliases), and `scripts/stack.sh` defaults `AGNOSAI_MODEL` to `llama3`.
-
-It also **rewrites the id an agent names**: `_agnosai_crew_strip_provider_prefix_a` drops a leading `openai/`,
-`anthropic/` and ten more. Groq serves `openai/gpt-oss-120b` and OpenRouter's ids are `anthropic/…`, so an id
-picked from the catalog can reach hoosh renamed.
-
-**What hoosh offers** (hoosh ADR 012): `GET /v1/models/catalog` lists what each provider serves now, each entry
-`{id, owned_by, source, routes}` plus, when known, `display_name`, `context_window`, `max_output_tokens`,
-`capabilities` (`vision`, `thinking`, `effort`) and `pricing`. `POST /v1/cost/recommend` ranks only routes' exact
-patterns, not the catalog. agnosai already has `agnosai_hoosh_models_path` and `agnosai_hoosh_extract_models`.
-
-**The work, with an ADR:** (a) read the catalog (falling back to `/v1/models` on a 404) once per process and again
-when a selection fails, into process-lifetime storage; (b) map the router's tier onto it, by `capabilities` and
-`pricing`, with an operator override per tier; (c) attribute a response with no `usage.provider` to its entry's
-`owned_by`, and retire the prefix needles; (d) with no catalog, fail the crew with a named error rather than send
-a guessed id; (e) price `BUDGET_MODELS` from the catalog, or drop it; (f) fix the docs and `stack.sh`; (g) send a
-listed id exactly as listed. **Done means:** a canned catalog body, selection per tier, attribution from
-`owned_by`, the no-catalog error and a listed `openai/…` id sent unchanged are all pinned; the `llama3:*`
-assertions in `tests/llm_router.tcyr` and `tests/orch_crew_runner.tcyr` move with the change.
+2.3.0 shipped the loop ([ADR 029](../adr/029-the-tool-loop.md)), and 2.3.1 chose its models from hoosh's catalog
+([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)).
 
 #### 2.3.2 — tools in a confined tier
 
@@ -359,6 +325,9 @@ it, so none has a number of its own.
 | **B16** chunked requests | sandhi | Filed. `sandhi_server_request_has_unsupported_te` answers 501 | Nothing: out of scope until it lands |
 | **C** lane pool | sigil | Filed (sigil `docs/development/issues/2026-11-05-agnosai-lane-pool-refuses-the-overflow-of-a-burst.md`). Of 100 threads, 64 verify and 36 are refused, so a burst fails a TLS handshake. `tests/server_auth_lane_race.tcyr` pins the RSA verify's lane-freedom | Cap outbound TLS at 64 with B6's semaphore |
 | **C** span ids | hoosh | **To file.** hoosh exports its span with the inbound parent-id as its own spanId and no `parentSpanId` (`src/lib/otlp.cyr`), then forwards that traceparent. **The ask:** mint a span id, emit the inbound one as `parentSpanId`, forward hoosh's own | `agnosai_hoosh_chat_in` adds an outbound `traceparent` from its `chat` span. It sends none today, or hoosh's span would repeat the chat span's id |
+| **C** catalog fields | hoosh | **To file.** `GET /v1/models/catalog` has no tier, no tools bit and no way to tell a chat model, though hoosh's table holds the first two for each model it knows and each route knows what it serves, so agnosai reads a tier from prices and capabilities, cannot keep an agent with tools off `gpt-6-astra`, and keeps hoosh's twelve non-chat words (ADR 030). **The ask:** `tier`, `tools` in `capabilities`, and a `kind` or an `endpoints` list. The word filter also skips Ollama's tags and the compiled table at hoosh, so a picker offers `nomic-embed-text` as a chat model | Read them in `_agnosai_model_pick_a` and `_agnosai_model_is_chat`, and pass a task's need for tools to the pick. Nothing until then |
+| **C** error bodies | hoosh | **To file.** `_resp_err` writes a provider's raw text into a JSON string unescaped, so a provider 404 with no `message` key (Ollama's) answers `{"error":{"message":"upstream provider returned HTTP 404: {"error": …`, which no client can parse. Measured on 2.10.1. **The ask:** `sb_add_json_escaped`, which `provider_err.cyr` already has | Drop `_agnosai_hoosh_detail_a`'s raw scan, and take the detail off the tree |
+| **C** catalog GET | hoosh | **To file.** `handle_models_catalog` builds on the heap that never frees: 15.4 KB per GET at 9 entries, measured on 2.10.1 over 3,000 GETs. Every picker open pays it. **The ask:** the request arena its ADR 013 plans, or a cached body rebuilt at each refresh | Widen `_AGN_CAT_REREAD_MS`'s reasoning, as the ration is there for this |
 | **C** MCP client | bote | **To file.** bote 3.8.15 has `HostRegistry` entries and no client send path. **The ask:** `initialize`, `tools/list` and `tools/call` to a server named there. agnostic records the same | Register each remote tool with `agnosai_tool_new`: the registry and the loop need nothing else (ADR 029, rule 4) |
 | **C** server verbs | sandhi | **Not filed.** `backlog` is ignored by `run_opts` and `run_async`, and the chunked start hardcodes `" OK"` | None needed today |
 

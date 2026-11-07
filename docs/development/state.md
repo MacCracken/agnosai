@@ -2,9 +2,28 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-07 (the 2.3.0 release gate).
+> Last refreshed: 2026-11-07 (the 2.3.1 release gate).
 
-## Now — 2.3.0
+## Now — 2.3.1
+
+| | |
+|---|---|
+| **version** | **2.3.1** (cut 2026-11-07, the bump script's UTC date; 2026-11-06 Pacific): models from hoosh's catalog, B33. A tier means what the gateway lists, by what each model declares and costs, a listed id goes out as listed, and with no catalog and no override a crew that names no model fails by name (ADR 030). With 2.3.0 this is all of what agnostic's M6 was waiting on |
+| **cyrius pin** | **6.7.18**, unchanged: still the latest tag |
+| **tests** | **105 suites, 10,990 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1 present. 2.3.0's tree reads 10,721. The new suites are `llm_model_catalog` 192 and `orch_model_selection` 111, less what moved out of `orch_crew_runner` and `fleet_cost_planning` with the code they pinned |
+| **coverage** | **99%**: 106/106 files, 1,795/1,806 fns (gate `--min 80`), the same 11 unreferenced as 2.3.0. Every new public name is named by a test |
+| **dist** | `dist/agnosai.cyr` 43,808 lines + `dist/agnosai-guard.cyr` 1,014, both v2.3.1. Sidecars **6 / 1** leaves, unchanged. `src/model_catalog.cyr` joins `[lib]` after `src/llm/hoosh.cyr` |
+| **binary** | `build/agnosai` **2,994,840 B** (2.3.0: 2,977,840). aarch64 **6,967,496 B** (6,966,880), not compacted, built and not started |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins. ⚠ A fresh worktree needs `cyrius lib sync --full` first, as CI does: `cyrius deps` alone leaves `lib/` at 87 files, the lock 26 lines short, and the lib snapshot gate failing on files it was never given |
+| **gates** | `check-symbols.sh` 3,110 definitions across 117 files; `check-clean.sh` fmt 234, lint 234, doc 118, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist. Then build, tests under DCE, coverage, `distlib --all --check`, examples, fuzz 4/4. The `ubuntu:26.04` CI replica was not run |
+| **benchmarks** | The interleaved A/B against a 2.3.0 build, three rounds of `llm`, `orch`, `fleet` and `server` at a load of about 2.3, reads **median −0.6% across 157 rows**, 152 within ±5%. `crew_select_model_routed` is +15.9%, 126 to 146 ns, and real: the walk to a gateway's slot. `crew_runner_10_tasks_parallel_4_{quiet,llm_quiet,llm_watched}` read −19% to −29% and are not claimed (B27). New: `model_for_tier_*` 57 ns, `crew_attribute_owned_by` 143 ns, `model_catalog_owner_200_last` 3.8 µs, `model_catalog_parse_200` 1.8 ms. `bench-history.csv` has 236 rows at 2.3.1, one sweep ending at a load of 3.2: median +0.7% against 2.3.0's rows, 178 of 230 within ±5% (CHANGELOG 2.3.1 *Performance*) |
+| **bytes per crew** | **0** for a selection once a catalog is held. A re-read that finds the same bytes leaves under 1 KiB on a real socket, which is sandhi's (B39). A catalog is about 150 B per entry for each change at hoosh, and the first live read reserves 2 MiB of address space per gateway for good. The rest as 2.3.0 below |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4. On 2.3.1 a crew with no `llm_model` gets a model its gateway lists and needs no change. ⚠ `complexity: high` then costs what the gateway's dearest reasoning model costs, `claude-fable-5-1` at $10/$50 on hoosh's table, and selection cannot see tools (ADR 030), so a crew on an OpenAI-only gateway needs `AGNOSAI_MODEL_PREMIUM`. joshua and kiran are not on this machine, so that neither calls the removed functions is unchecked |
+
+Direct deps: as 2.2.5 below.
+
+### 2.3.0 — the release (2026-11-07)
 
 | | |
 |---|---|

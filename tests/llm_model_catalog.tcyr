@@ -1,0 +1,956 @@
+# =========================================================================
+# llm_model_catalog.tcyr — what a gateway lists, and what a tier means there (ADR 030).
+#
+# No oracle tests: the Rust line carried names, and this replaced them.
+#
+# ⚠ **The bodies are hoosh's own shape**, `catalog_emit_entry` in hoosh's `src/lib/catalog.cyr`, and
+# the prices are hoosh's table (`src/lib/pricing.cyr`), because the rule was written against what
+# those two make it do. The `claude-opus-4-1` row below is why it reads capabilities at all: priced
+# higher than Fable, it wins Premium by price alone.
+#
+# Each read test uses a gateway of its own, as a catalog is held for the life of the process. That
+# is also what keeps this suite from needing a reset the product has no use for.
+# =========================================================================
+
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/arena_pool.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/llm/router.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/model_catalog.cyr"
+include "tests/test_helpers.cyr"
+
+# --- canned bodies --------------------------------------------------------
+
+var _T_THINK_BUDGET = "\"capabilities\":{\"thinking\":[\"budget\"],\"effort\":[]}";
+var _T_THINK_ADAPTIVE = "\"capabilities\":{\"vision\":true,\"thinking\":[\"adaptive\"],\"effort\":[]}";
+var _T_EFFORT = "\"capabilities\":{\"vision\":true,\"thinking\":[\"adaptive\"],\"effort\":[\"low\",\"max\"]}";
+var _T_VISION = "\"capabilities\":{\"vision\":true}";
+
+# Append one element, as hoosh writes it. `caps` is a cstring or 0; a price of -1 writes none.
+fn _t_entry(sb, id, owner, input, output, caps): i64 {
+    str_builder_add_cstr(sb, ",{\"id\":\"");
+    str_builder_add_cstr(sb, id);
+    str_builder_add_cstr(sb, "\",\"object\":\"model\",\"owned_by\":\"");
+    str_builder_add_cstr(sb, owner);
+    str_builder_add_cstr(sb, "\",\"source\":\"live\",\"routes\":[\"https://gw\"]");
+    if (caps != 0) {
+        str_builder_add_cstr(sb, ",");
+        str_builder_add_cstr(sb, caps);
+    }
+    if (input >= 0) {
+        str_builder_add_cstr(sb, ",\"pricing\":{\"input_micro_usd_per_1k\":");
+        str_builder_add_int(sb, input);
+        str_builder_add_cstr(sb, ",\"output_micro_usd_per_1k\":");
+        str_builder_add_int(sb, output);
+        str_builder_add_cstr(sb, "}");
+    }
+    str_builder_add_cstr(sb, "}");
+    return 0;
+}
+
+# `sb`'s elements, each with a comma before it, as a list body.
+fn _t_list(sb): i64 {
+    var elements = str_builder_build(sb);
+    var out = str_builder_new();
+    str_builder_add_cstr(out, "{\"object\":\"list\",\"data\":[");
+    str_builder_add(out, str_new(str_data(elements) + 1, str_len(elements) - 1));
+    str_builder_add_cstr(out, "]}");
+    return str_builder_build(out);
+}
+
+# A gateway with one Anthropic route: a current lineup and two models that cost more than they are
+# worth, in the order Anthropic lists them, at hoosh's prices.
+fn _t_claude_body(): i64 {
+    var sb = str_builder_new();
+    _t_entry(sb, "claude-fable-5-1", "anthropic", 10000, 50000, _T_EFFORT);
+    _t_entry(sb, "claude-opus-5-5", "anthropic", 4000, 20000, _T_EFFORT);
+    _t_entry(sb, "claude-sonnet-5-5", "anthropic", 2000, 10000, _T_EFFORT);
+    _t_entry(sb, "claude-haiku-5-5", "anthropic", 100, 500, _T_THINK_ADAPTIVE);
+    _t_entry(sb, "claude-sonnet-4-6", "anthropic", 3000, 15000, _T_EFFORT);
+    _t_entry(sb, "claude-haiku-4-5", "anthropic", 1000, 5000, _T_THINK_BUDGET);
+    _t_entry(sb, "claude-opus-4-1", "anthropic", 15000, 75000, _T_THINK_BUDGET);
+    return _t_list(sb);
+}
+
+# Parse a body in a throwaway arena: a catalog must not need it afterwards. ⚠ A reset arena keeps its
+# bytes, so it is written over too, or an entry dangling into the tree would read fine.
+fn _t_parse(body: Str): i64 {
+    var a = arena_allocator_growable(65536);
+    var c = agnosai_model_catalog_parse_a(a, body);
+    reset_via(a);
+    memset(alloc_via(a, 60000), 65, 60000);
+    return c;
+}
+
+# Assert the id `tier` means in `c`.
+fn _t_pick(c, tier, want, name): i64 {
+    var e = agnosai_model_catalog_pick(c, tier);
+    if (e == 0) { return assert(0, name); }
+    return assert(str_eq(agnosai_model_entry_id(e), str_from(want)) == 1, name);
+}
+
+# --- a gateway on a pointer -----------------------------------------------
+
+var _t_gets = 0;
+var _t_status = 200;
+var _t_body = 0;
+var _t_last_path = 0;
+var _t_first_path = 0;
+# A list for `/v1/models` alone, for the fallback.
+var _t_models_body = 0;
+var _t_gw_n = 0;
+# How many threads a read waits to have arrived, and for how long after, so that they all meet at it.
+var _t_arrived = 0;
+var _t_meet = 0;
+var _t_get_ms = 0;
+
+fn _t_get(client, a, path: Str, out_body): i64 {
+    atomic_fetch_add(&_t_gets, 1);
+    if (_t_first_path == 0) { _t_first_path = path; }
+    _t_last_path = path;
+    var waited = 0;
+    while (atomic_load(&_t_arrived) < _t_meet && waited < 5000) {
+        sleep_ms(1);
+        waited = waited + 1;
+    }
+    if (_t_get_ms > 0) { sleep_ms(_t_get_ms); }
+    if (_t_models_body != 0) {
+        if (str_eq_cstr(path, "/v1/models") == 1) {
+            store64(out_body, _t_models_body);
+            return 200;
+        }
+    }
+    if (_t_status >= 200 && _t_status < 300) { store64(out_body, _t_body); }
+    return _t_status;
+}
+
+# A fresh client on a gateway nothing has read, answering `body` with `status`.
+fn _t_gw(status, body: Str): i64 {
+    _t_gw_n = _t_gw_n + 1;
+    _t_gets = 0;
+    _t_status = status;
+    _t_body = body;
+    _t_first_path = 0;
+    _t_last_path = 0;
+    _t_models_body = 0;
+    _t_get_ms = 0;
+    _t_meet = 0;
+    _t_arrived = 0;
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "http://gw-");
+    str_builder_add_int(sb, _t_gw_n);
+    return agnosai_hoosh_client_with_get(agnosai_hoosh_client_new(str_builder_build(sb),
+        str_from("")), &_t_get);
+}
+
+# Choose for `tier` in the global allocator: the error Str, or 0 with the id in `_t_chosen`.
+var _t_chosen = 0;
+fn _t_choose(client, tier): i64 {
+    var out: i64[1];
+    store64(&out, 0);
+    var err = agnosai_model_for_tier_a(default_alloc(), client, tier, &out);
+    _t_chosen = load64(&out);
+    return err;
+}
+
+# Assert that `tier` means `want` on `client`.
+fn _t_means(client, tier, want, name): i64 {
+    var err = _t_choose(client, tier);
+    if (err != 0) { return assert(0, name); }
+    return assert(str_eq(_t_chosen, str_from(want)) == 1, name);
+}
+
+# Assert that a selection fails with exactly `want`.
+fn _t_refused(client, tier, want, name): i64 {
+    var err = _t_choose(client, tier);
+    if (err == 0) { return assert(0, name); }
+    return assert(str_eq(err, str_from(want)) == 1, name);
+}
+
+# Worker for the single-flight test: `arg` is the client.
+fn _t_racer(arg): i64 {
+    atomic_fetch_add(&_t_arrived, 1);
+    _t_choose(arg, AGNOSAI_TIER_CAPABLE);
+    return 0;
+}
+
+# Run `n` selections at once on `client`: the read holds until all `n` have arrived, and then for
+# `_t_get_ms`, so that the rest are at its mutex and not still on their way.
+fn _t_race(client, n): i64 {
+    _t_arrived = 0;
+    _t_meet = n;
+    var ts = vec_new();
+    for (var i = 0; i < n; i = i + 1) { vec_push(ts, thread_create(&_t_racer, client)); }
+    for (var j = 0; j < n; j = j + 1) { thread_join(vec_get(ts, j)); }
+    return assert_eq(_t_arrived, n, "every thread reached the race");
+}
+
+# Worker that reads on `arg`, holding the slot's mutex for `_t_get_ms`.
+fn _t_slow_reread(arg): i64 {
+    agnosai_model_catalog_reread(arg);
+    return 0;
+}
+
+# --- a gateway on a socket ------------------------------------------------
+#
+# The stub above stands in for `agnosai_hoosh_get_a`, so this is what proves its success arm.
+var _T_LFD = 0;
+var _T_PORT = 0;
+var _T_STOP = 0;
+# Answers in turn, each a whole HTTP response in a cstring; the last repeats.
+var _T_ANSWERS = 0;
+var _T_SERVED = 0;
+var _T_FIRST_LINE = 0;
+
+fn _t_server(arg): i64 {
+    var buf = alloc(65536);
+    while (load64(&_T_STOP) == 0) {
+        var at, cfd = sock_accept(_T_LFD);
+        if (is_err_result(at) == 0) {
+            if (load64(&_T_STOP) == 0) {
+                var got = 0;
+                while (got < 60000) {
+                    var rt, n = sock_recv(cfd, buf + got, 60000 - got);
+                    if (is_err_result(rt) == 1 || n <= 0) { break; }
+                    got = got + n;
+                    if (str_index_of_cstr(str_new(buf, got), "\r\n\r\n") >= 0) { break; }
+                }
+                _T_FIRST_LINE = str_clone(str_new(buf, str_index_of_cstr(str_new(buf, got), "\r\n")));
+                var i = _T_SERVED;
+                if (i >= vec_len(_T_ANSWERS)) { i = vec_len(_T_ANSWERS) - 1; }
+                _T_SERVED = _T_SERVED + 1;
+                var r = vec_get(_T_ANSWERS, i);
+                sock_send_all(cfd, r, strlen(r));
+            }
+            sock_close(cfd);
+        }
+    }
+    return 0;
+}
+
+fn _t_server_start(): i64 {
+    var lt, lfd = tcp_socket();
+    sock_reuse(lfd);
+    var lp = 47981;
+    while (lp < 48013 && _T_PORT == 0) {
+        var bt, bv = sock_bind(lfd, INADDR_LOOPBACK(), lp);
+        if (is_err_result(bt) == 0) { _T_PORT = lp; }
+        lp = lp + 1;
+    }
+    if (_T_PORT == 0) { return 0; }
+    var st, sv = sock_listen(lfd, 64);
+    if (is_err_result(st) == 1) { return 0; }
+    _T_LFD = lfd;
+    thread_create(&_t_server, 0);
+    return 1;
+}
+
+# `body` as a whole HTTP response, in a cstring.
+fn _t_http(status_line, body: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, status_line);
+    str_builder_add_cstr(sb, "\r\nContent-Type: application/json\r\nContent-Length: ");
+    str_builder_add_int(sb, str_len(body));
+    str_builder_add_cstr(sb, "\r\nConnection: close\r\n\r\n");
+    str_builder_add(sb, body);
+    return str_cstr(str_builder_build(sb));
+}
+
+# A base URL for the socket.
+fn _t_socket_url(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "http://127.0.0.1:");
+    str_builder_add_int(sb, _T_PORT);
+    return str_builder_build(sb);
+}
+
+fn test_parse(): i64 {
+    # --- what an entry keeps ---
+    var c = _t_parse(_t_claude_body());
+    assert(c != 0, "a catalog body parses");
+    assert_eq(agnosai_model_catalog_count(c), 7, "with every entry");
+    var fable = agnosai_model_catalog_get(c, 0);
+    assert(str_eq(agnosai_model_entry_id(fable), str_from("claude-fable-5-1")) == 1,
+      "the first entry first: list order is a preference");
+    assert(str_eq(agnosai_model_entry_owned_by(fable), str_from("anthropic")) == 1,
+      "owned_by, in hoosh's spelling");
+    assert_eq(agnosai_model_entry_input_price(fable), 10000, "the input price in hoosh's unit");
+    assert_eq(agnosai_model_entry_output_price(fable), 50000, "and the output price");
+    assert_eq(agnosai_model_entry_reasoning(fable), AGNOSAI_REASONING_EFFORT, "effort is declared");
+    assert_eq(agnosai_model_entry_reasoning(agnosai_model_catalog_get(c, 6)),
+      AGNOSAI_REASONING_THINKING, "thinking with an empty effort list is only thinking");
+
+    # --- reasoning: nothing but a non-empty list counts ---
+    var sb = str_builder_new();
+    _t_entry(sb, "vision-only", "openrouter", 1, 1, _T_VISION);
+    _t_entry(sb, "no-caps", "openai", 1, 1, 0);
+    _t_entry(sb, "caps-string", "openai", 1, 1, "\"capabilities\":\"effort\"");
+    _t_entry(sb, "effort-string", "openai", 1, 1, "\"capabilities\":{\"effort\":\"high\"}");
+    _t_entry(sb, "thinking-empty", "openai", 1, 1, "\"capabilities\":{\"thinking\":[]}");
+    var rc = _t_parse(_t_list(sb));
+    for (var i = 0; i < 5; i = i + 1) {
+        assert_eq(agnosai_model_entry_reasoning(agnosai_model_catalog_get(rc, i)),
+          AGNOSAI_REASONING_UNDECLARED, "vision, no capabilities, or not a list declares nothing");
+    }
+
+    # --- a price is a pair, and a sane one ---
+    var pb = str_builder_new();
+    _t_entry(pb, "free", "ollama", 0, 0, 0);
+    _t_entry(pb, "unpriced", "anthropic", 0 - 1, 0, 0);
+    _t_entry(pb, "half", "x", 0 - 1, 0, "\"pricing\":{\"input_micro_usd_per_1k\":5}");
+    _t_entry(pb, "negative", "x", 5, 0 - 7, 0);
+    _t_entry(pb, "huge", "x", 9000000000000000000, 9000000000000000000, 0);
+    _t_entry(pb, "float", "x", 0 - 1, 0,
+      "\"pricing\":{\"input_micro_usd_per_1k\":1.5,\"output_micro_usd_per_1k\":2}");
+    var pc = _t_parse(_t_list(pb));
+    assert_eq(agnosai_model_entry_input_price(agnosai_model_catalog_get(pc, 0)), 0,
+      "0 is a real price, as a local model is free");
+    for (var j = 1; j < 6; j = j + 1) {
+        assert_eq(agnosai_model_entry_input_price(agnosai_model_catalog_get(pc, j)), 0 - 1,
+          "absent, half, negative, overflowing or not an integer is unknown");
+    }
+
+    # --- an entry with no usable id is not an entry ---
+    var long = str_builder_new();
+    for (var k = 0; k < 256; k = k + 1) { str_builder_add_cstr(long, "x"); }
+    var ib = str_builder_new();
+    str_builder_add_cstr(ib, ",{\"owned_by\":\"a\"},{\"id\":\"\"},{\"id\":7},\"bare\",null,");
+    str_builder_add_cstr(ib, "{\"id\":\"");
+    str_builder_add(ib, str_builder_build(long));
+    str_builder_add_cstr(ib, "\"}");
+    _t_entry(ib, "kept", "a", 1, 1, 0);
+    var ic = _t_parse(_t_list(ib));
+    assert_eq(agnosai_model_catalog_count(ic), 1,
+      "no id, an empty one, a number, a non-object or 256 bytes are all dropped");
+
+    # --- an id goes in a log line, and the older list has not been through hoosh's check ---
+    var vb = str_builder_new();
+    str_builder_add_cstr(vb, ",{\"id\":\"has space\"},{\"id\":\"quo\\\"te\"},{\"id\":\"back\\\\slash\"}");
+    str_builder_add_cstr(vb, ",{\"id\":\"new\\nline\"},{\"id\":\"del\\u007f\"},{\"id\":\"caf\\u00e9\"}");
+    _t_entry(vb, "openai/gpt-oss:120b_v1.2-x", "a", 1, 1, 0);
+    var vc = _t_parse(_t_list(vb));
+    assert_eq(agnosai_model_catalog_count(vc), 1,
+      "a space, quote, backslash, control byte, DEL or non-ASCII byte is dropped, as hoosh drops one");
+    assert(str_eq(agnosai_model_entry_id(agnosai_model_catalog_get(vc, 0)),
+        str_from("openai/gpt-oss:120b_v1.2-x")) == 1, "and every byte a real id uses stays");
+
+    # --- owned_by is optional ---
+    var oc = _t_parse(str_from("{\"data\":[{\"id\":\"a\"},{\"id\":\"b\",\"owned_by\":\"\"},\
+{\"id\":\"c\",\"owned_by\":3}]}"));
+    for (var m = 0; m < 3; m = m + 1) {
+        assert_eq(agnosai_model_entry_owned_by(agnosai_model_catalog_get(oc, m)), 0,
+          "absent, empty or not a string names no owner");
+    }
+
+    var dirty = _t_parse(str_from("{\"data\":[{\"id\":\"a\",\"owned_by\":\"has space\"}]}"));
+    assert_eq(agnosai_model_entry_owned_by(agnosai_model_catalog_get(dirty, 0)), 0,
+      "and an owner goes on a result, so it is held to what an id is");
+
+    # --- not a list ---
+    assert_eq(_t_parse(str_from("{}")), 0, "no data key is no catalog");
+    assert_eq(_t_parse(str_from("{\"data\":{}}")), 0, "nor is a non-array one");
+    assert_eq(_t_parse(str_from("not json")), 0, "nor text");
+    assert_eq(_t_parse(str_from("")), 0, "nor nothing");
+    var none = _t_parse(str_from("{\"data\":[]}"));
+    assert(none != 0, "an empty list is a list");
+    assert_eq(agnosai_model_catalog_count(none), 0, "of nothing");
+    assert_eq(agnosai_model_catalog_pick(none, AGNOSAI_TIER_FAST), 0, "and picks nothing");
+
+    # --- a tier that is none of the three reads past nothing ---
+    var some = _t_parse(_t_claude_body());
+    assert_eq(agnosai_model_catalog_pick(some, 3), 0, "one past the end picks nothing");
+    assert_eq(agnosai_model_catalog_pick(some, 0 - 1), 0, "nor does one before the start");
+    return 0;
+}
+
+fn test_tiers(): i64 {
+    # --- the rule on a real price list ---
+    var c = _t_parse(_t_claude_body());
+    _t_pick(c, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "Fast is the cheapest thing on the ladder");
+    _t_pick(c, AGNOSAI_TIER_PREMIUM, "claude-fable-5-1",
+      "Premium is Fable, NOT claude-opus-4-1: it costs more and takes no effort, so price alone \
+    would send a crew's hardest task to the older model");
+    _t_pick(c, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5",
+      "Capable is the lower median of the prices that reason, up to Premium's: left in, the dearer \
+    claude-opus-4-1 moves it to claude-sonnet-4-6, an older model at a higher price");
+
+    # --- Capable asks for reasoning, when anyone declares it ---
+    var rb = str_builder_new();
+    _t_entry(rb, "plain-0", "x", 1, 1, 0);
+    _t_entry(rb, "plain-1", "x", 2, 2, 0);
+    _t_entry(rb, "plain-2", "x", 3, 3, 0);
+    _t_entry(rb, "thinks-a", "x", 50, 50, _T_THINK_BUDGET);
+    _t_entry(rb, "thinks-b", "x", 60, 60, _T_THINK_BUDGET);
+    var rc = _t_parse(_t_list(rb));
+    _t_pick(rc, AGNOSAI_TIER_CAPABLE, "thinks-a", "the median of what reasons, not of the list");
+    _t_pick(rc, AGNOSAI_TIER_FAST, "plain-0", "and Fast asks nothing");
+    _t_pick(rc, AGNOSAI_TIER_PREMIUM, "thinks-b",
+      "Premium takes the most declared, and thinking outranks undeclared");
+
+    # --- Capable never costs more than Premium, whose candidates are not its own ---
+    var ib = str_builder_new();
+    _t_entry(ib, "claude-sonnet-5-5", "anthropic", 2000, 10000, _T_EFFORT);
+    _t_entry(ib, "claude-sonnet-4-5", "anthropic", 3000, 15000, _T_THINK_BUDGET);
+    _t_entry(ib, "claude-opus-4-1", "anthropic", 15000, 75000, _T_THINK_BUDGET);
+    var ic = _t_parse(_t_list(ib));
+    _t_pick(ic, AGNOSAI_TIER_PREMIUM, "claude-sonnet-5-5", "only one model tunes its effort");
+    _t_pick(ic, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5",
+      "so the median of what reasons, $3/$15, would cost more than Premium does");
+
+    # --- effort outranks thinking, however cheap ---
+    var eb = str_builder_new();
+    _t_entry(eb, "thinks-dear", "x", 900, 900, _T_THINK_BUDGET);
+    _t_entry(eb, "tunes-cheap", "x", 10, 10, _T_EFFORT);
+    _t_pick(_t_parse(_t_list(eb)), AGNOSAI_TIER_PREMIUM, "tunes-cheap",
+      "Premium is a capability gate first and a price second");
+
+    # --- a price list with no capabilities still has a ladder ---
+    var nb = str_builder_new();
+    _t_entry(nb, "gpt-6-luna", "openai", 100, 500, 0);
+    _t_entry(nb, "gpt-6-sol", "openai", 2000, 10000, 0);
+    _t_entry(nb, "gpt-6-astra", "openai", 10000, 50000, 0);
+    var nc = _t_parse(_t_list(nb));
+    _t_pick(nc, AGNOSAI_TIER_FAST, "gpt-6-luna", "with prices alone Fast is the cheapest");
+    _t_pick(nc, AGNOSAI_TIER_CAPABLE, "gpt-6-sol", "Capable the middle");
+    _t_pick(nc, AGNOSAI_TIER_PREMIUM, "gpt-6-astra", "and Premium the dearest");
+
+    # --- the median is of prices, not of how many ids share one ---
+    var db = str_builder_new();
+    _t_entry(db, "cheap", "x", 1, 1, 0);
+    _t_entry(db, "mid", "x", 5, 5, 0);
+    _t_entry(db, "dear", "x", 9, 9, 0);
+    _t_entry(db, "dear-20250101", "x", 9, 9, 0);
+    _t_entry(db, "dear-20250601", "x", 9, 9, 0);
+    _t_entry(db, "dear-20251001", "x", 9, 9, 0);
+    _t_pick(_t_parse(_t_list(db)), AGNOSAI_TIER_CAPABLE, "mid",
+      "dated aliases of one model do not drag Capable up to it");
+
+    # --- ties go to the first listed, at every tier ---
+    var tb = str_builder_new();
+    _t_entry(tb, "second-rate", "x", 1, 1, 0);
+    _t_entry(tb, "tied-a", "x", 2, 2, 0);
+    _t_entry(tb, "tied-b", "x", 2, 2, 0);
+    var tc = _t_parse(_t_list(tb));
+    _t_pick(tc, AGNOSAI_TIER_PREMIUM, "tied-a", "the first of the dearest");
+    var fb = str_builder_new();
+    _t_entry(fb, "tied-c", "x", 2, 2, 0);
+    _t_entry(fb, "tied-d", "x", 2, 2, 0);
+    _t_entry(fb, "top", "x", 3, 3, 0);
+    _t_pick(_t_parse(_t_list(fb)), AGNOSAI_TIER_FAST, "tied-c", "the first of the cheapest");
+
+    # --- rungs: two and one ---
+    var two = str_builder_new();
+    _t_entry(two, "low", "x", 1, 1, 0);
+    _t_entry(two, "high", "x", 2, 2, 0);
+    var twc = _t_parse(_t_list(two));
+    _t_pick(twc, AGNOSAI_TIER_CAPABLE, "low", "the LOWER median, of two");
+    _t_pick(twc, AGNOSAI_TIER_PREMIUM, "high", "leaving Premium the other");
+    var one = str_builder_new();
+    _t_entry(one, "only", "x", 1, 1, 0);
+    var onc = _t_parse(_t_list(one));
+    _t_pick(onc, AGNOSAI_TIER_FAST, "only", "one model is every tier");
+    _t_pick(onc, AGNOSAI_TIER_CAPABLE, "only", "at Capable");
+    _t_pick(onc, AGNOSAI_TIER_PREMIUM, "only", "and Premium");
+
+    # --- free is off the ladder while anything is paid ---
+    var mb = str_builder_new();
+    _t_entry(mb, "llama3.2:1b", "ollama", 0, 0, 0);
+    _t_entry(mb, "qwen3:70b", "ollama", 0, 0, 0);
+    _t_entry(mb, "claude-haiku-5-5", "anthropic", 100, 500, 0);
+    _t_entry(mb, "claude-opus-5-5", "anthropic", 4000, 20000, 0);
+    var mc = _t_parse(_t_list(mb));
+    _t_pick(mc, AGNOSAI_TIER_FAST, "claude-haiku-5-5",
+      "a price of 0 says local, not capable, so it does not win Fast by being 0");
+    _t_pick(mc, AGNOSAI_TIER_PREMIUM, "claude-opus-5-5", "or anything else");
+
+    # --- an unpriced model is a spend nobody can state ---
+    var ub = str_builder_new();
+    _t_entry(ub, "new-and-unpriced", "anthropic", 0 - 1, 0, _T_EFFORT);
+    _t_entry(ub, "priced", "anthropic", 100, 500, 0);
+    var uc = _t_parse(_t_list(ub));
+    _t_pick(uc, AGNOSAI_TIER_PREMIUM, "priced", "unpriced stays off a ladder that has prices");
+    _t_pick(uc, AGNOSAI_TIER_FAST, "priced", "at every tier");
+
+    # --- a box of local models: nothing tells them apart, so the first serves ---
+    var lb = str_builder_new();
+    _t_entry(lb, "llama3.2:1b", "ollama", 0, 0, 0);
+    _t_entry(lb, "qwen3:70b", "ollama", 0, 0, 0);
+    _t_entry(lb, "phi4:latest", "ollama", 0, 0, 0);
+    var lc = _t_parse(_t_list(lb));
+    _t_pick(lc, AGNOSAI_TIER_FAST, "llama3.2:1b", "all free: the first listed is Fast");
+    _t_pick(lc, AGNOSAI_TIER_CAPABLE, "llama3.2:1b", "and Capable, not the middle of a tie");
+    _t_pick(lc, AGNOSAI_TIER_PREMIUM, "llama3.2:1b", "and Premium, not the end of one");
+
+    # --- `/v1/models`: ids and owners ---
+    var old = _t_parse(str_from("{\"object\":\"list\",\"data\":[\
+{\"id\":\"llama3.2:1b\",\"object\":\"model\",\"owned_by\":\"ollama\"},\
+{\"id\":\"claude-sonnet-5-5\",\"object\":\"model\",\"owned_by\":\"anthropic\"}]}"));
+    _t_pick(old, AGNOSAI_TIER_PREMIUM, "llama3.2:1b", "the older list has no tiers to tell apart");
+    assert(str_eq(agnosai_model_entry_owned_by(agnosai_model_catalog_get(old, 1)),
+        str_from("anthropic")) == 1, "and still has owners");
+
+    # --- what no chat call can use never stands for a tier ---
+    var xb = str_builder_new();
+    _t_entry(xb, "nomic-embed-text", "ollama", 0, 0, 0);
+    _t_entry(xb, "text-embedding-3-small", "openai", 1, 1, 0);
+    _t_entry(xb, "whisper-1", "whisper", 0, 0, 0);
+    _t_entry(xb, "tts-1", "openai", 1, 1, 0);
+    _t_entry(xb, "gpt-4o-transcribe", "openai", 1, 1, 0);
+    _t_entry(xb, "dall-e-3", "openai", 1, 1, 0);
+    _t_entry(xb, "gpt-image-1", "openai", 1, 1, 0);
+    _t_entry(xb, "omni-moderation-latest", "openai", 1, 1, 0);
+    _t_entry(xb, "gpt-4o-realtime", "openai", 1, 1, 0);
+    _t_entry(xb, "gpt-4o-audio", "openai", 1, 1, 0);
+    _t_entry(xb, "davinci-002", "openai", 1, 1, 0);
+    _t_entry(xb, "babbage-002", "openai", 1, 1, 0);
+    _t_entry(xb, "sora-2", "openai", 1, 1, 0);
+    _t_entry(xb, "Nomic-EMBED-Large", "openai", 1, 1, 0);
+    var xc = _t_parse(_t_list(xb));
+    assert_eq(agnosai_model_catalog_count(xc), 14, "all still listed: an agent can name one");
+    assert_eq(agnosai_model_catalog_pick(xc, AGNOSAI_TIER_FAST), 0,
+      "and none stands for a tier, as one embedder costs less than any chat model");
+    assert_eq(agnosai_model_catalog_pick(xc, AGNOSAI_TIER_PREMIUM), 0, "at any tier");
+    var chat = str_builder_new();
+    _t_entry(chat, "nomic-embed-text", "ollama", 0, 0, 0);
+    _t_entry(chat, "llama3.2:1b", "ollama", 0, 0, 0);
+    _t_pick(_t_parse(_t_list(chat)), AGNOSAI_TIER_FAST, "llama3.2:1b",
+      "a box with an embedder pulled serves its chat model, first listed or not");
+    return 0;
+}
+
+fn test_lookup(): i64 {
+    var c = _t_parse(_t_claude_body());
+    assert(agnosai_model_catalog_find(c, str_from("claude-opus-5-5")) != 0, "a listed id is found");
+    assert_eq(agnosai_model_catalog_find(c, str_from("claude-opus-5")), 0,
+      "a prefix of one is not, as the id goes on the wire exactly");
+    assert_eq(agnosai_model_catalog_find(c, str_from("CLAUDE-OPUS-5-5")), 0, "and neither is a fold");
+
+    var client = _t_gw(200, _t_claude_body());
+    assert(str_eq(agnosai_model_catalog_owner(client, str_from("claude-opus-5-5")),
+        str_from("anthropic")) == 1, "who owns a listed id");
+    assert_eq(agnosai_model_catalog_owner(client, str_from("gpt-6-sol")), 0, "nobody owns the rest");
+    assert_eq(agnosai_model_catalog_listed(client, str_from("claude-opus-5-5")), 1, "listed");
+    assert_eq(agnosai_model_catalog_listed(client, str_from("gpt-6-sol")), 0, "not listed");
+
+    var nobody = _t_gw(200, str_from("{\"data\":[{\"id\":\"anon\"}]}"));
+    assert_eq(agnosai_model_catalog_owner(nobody, str_from("anon")), 0, "an entry with no owner");
+
+    var down = _t_gw(503, 0);
+    assert_eq(agnosai_model_catalog_owner(down, str_from("x")), 0, "no catalog owns nothing");
+    assert_eq(agnosai_model_catalog_listed(down, str_from("x")), 0, "and lists nothing");
+    return 0;
+}
+
+fn test_reads(): i64 {
+    # --- once per process ---
+    var once = _t_gw(200, _t_claude_body());
+    _t_means(once, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5", "the first selection reads");
+    _t_means(once, AGNOSAI_TIER_PREMIUM, "claude-fable-5-1", "the second is served from it");
+    _t_means(once, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "as is every tier");
+    agnosai_model_catalog_owner(once, str_from("claude-opus-5-5"));
+    agnosai_model_catalog_listed(once, str_from("claude-opus-5-5"));
+    assert_eq(_t_gets, 1, "one GET, however often it is asked");
+    assert(str_eq_cstr(_t_first_path, "/v1/models/catalog") == 1, "of the catalog");
+
+    # --- one gateway's models are a guess on another ---
+    var left = _t_gw(200, _t_claude_body());
+    var right = _t_gw(200, str_from("{\"data\":[{\"id\":\"only-here\"}]}"));
+    _t_means(right, AGNOSAI_TIER_FAST, "only-here", "a gateway's own list");
+    _t_body = _t_claude_body();
+    _t_means(left, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "and the other's");
+    _t_means(right, AGNOSAI_TIER_FAST, "only-here", "neither touching the other");
+
+    # --- two clients on one gateway share its catalog ---
+    var a1 = _t_gw(200, _t_claude_body());
+    _t_means(a1, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "the crew that read it");
+    var a2 = agnosai_hoosh_client_with_get(agnosai_hoosh_client_new(
+        agnosai_hoosh_client_base_url(a1), str_from("")), &_t_get);
+    _t_means(a2, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "and the next crew's client");
+    assert_eq(_t_gets, 1, "a crew's client is new each time and the catalog is not");
+
+    # --- the URL is a copy: a client goes with its crew's arena ---
+    var ar = arena_allocator_growable(4096);
+    _t_gw_n = _t_gw_n + 1;
+    var gone = agnosai_hoosh_client_with_get(agnosai_hoosh_client_new_a(ar,
+        str_from_a(ar, "http://arena-gw"), str_from_a(ar, "")), &_t_get);
+    _t_gets = 0;
+    _t_status = 200;
+    _t_body = _t_claude_body();
+    _t_means(gone, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "read through a client in an arena");
+    reset_via(ar);
+    var scrawl = alloc_via(ar, 64);
+    memset(scrawl, 65, 64);
+    var back = agnosai_hoosh_client_with_get(agnosai_hoosh_client_new(str_from("http://arena-gw"),
+        str_from("")), &_t_get);
+    _t_means(back, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "and found again after it went");
+    assert_eq(_t_gets, 1, "with no second read");
+
+    # --- /v1/models on a 404, and only then ---
+    var fb = _t_gw(404, 0);
+    _t_models_body = str_from("{\"data\":[{\"id\":\"llama3.2:1b\",\"owned_by\":\"ollama\"}]}");
+    _t_means(fb, AGNOSAI_TIER_CAPABLE, "llama3.2:1b", "a gateway with no catalog falls back");
+    assert_eq(_t_gets, 2, "two GETs: the catalog, then the list");
+    assert(str_eq_cstr(_t_first_path, "/v1/models/catalog") == 1, "the catalog first");
+    assert(str_eq_cstr(_t_last_path, "/v1/models") == 1, "and the list after");
+
+    var nofb = _t_gw(503, 0);
+    _t_models_body = str_from("{\"data\":[{\"id\":\"llama3.2:1b\"}]}");
+    _t_refused(nofb, AGNOSAI_TIER_CAPABLE,
+      "no model catalog: hoosh returned HTTP 503; name a model on the agent, or set AGNOSAI_MODEL_CAPABLE",
+      "a 503 is a gateway that has one, and an older list would quietly lose the prices");
+    assert_eq(_t_gets, 1, "so nothing else is asked");
+
+    # --- no catalog: the named error ---
+    var t = _t_gw(0 - SANDHI_ERR_CONNECT, 0);
+    _t_refused(t, AGNOSAI_TIER_PREMIUM,
+      "no model catalog: hoosh transport error: CONNECT; name a model on the agent, or set AGNOSAI_MODEL_PREMIUM",
+      "a transport failure says its kind and the tier's variable, and no URL");
+    var both = _t_gw(404, 0);
+    _t_refused(both, AGNOSAI_TIER_FAST,
+      "no model catalog: hoosh returned HTTP 404; name a model on the agent, or set AGNOSAI_MODEL_FAST",
+      "a 404 on the fallback too is a 404");
+    assert_eq(_t_gets, 2, "after trying both");
+    _t_refused(_t_gw(200, str_from("<html>")), AGNOSAI_TIER_CAPABLE,
+      "no model catalog: hoosh answered with no model list; name a model on the agent, or set AGNOSAI_MODEL_CAPABLE",
+      "a 2xx that is no list says so");
+    _t_refused(_t_gw(200, str_from("{\"data\":[]}")), AGNOSAI_TIER_CAPABLE,
+      "no model catalog: hoosh lists no chat model; name a model on the agent, or set AGNOSAI_MODEL_CAPABLE",
+      "as does an empty list");
+
+    # --- a selection that failed reads again ---
+    var up = _t_gw(503, 0);
+    assert(_t_choose(up, AGNOSAI_TIER_CAPABLE) != 0, "a gateway that was down");
+    assert_eq(_t_gets, 1, "read once");
+    assert(_t_choose(up, AGNOSAI_TIER_CAPABLE) != 0, "stays down");
+    assert_eq(_t_gets, 2, "and is asked again by the next selection");
+    _t_status = 200;
+    _t_body = _t_claude_body();
+    _t_means(up, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5", "and once it is back, it serves");
+    assert_eq(_t_gets, 3, "with no restart");
+    _t_means(up, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5", "and that read holds");
+    assert_eq(_t_gets, 3, "with no more GETs");
+
+    # --- a caller with an answer without one reads once ---
+    var lazy = _t_gw(503, 0);
+    assert_eq(agnosai_model_catalog_of(lazy), 0, "nothing to hold");
+    assert_eq(agnosai_model_catalog_owner(lazy, str_from("x")), 0, "and no owner");
+    assert_eq(agnosai_model_catalog_listed(lazy, str_from("x")), 0, "and nothing listed");
+    assert_eq(_t_gets, 1, "and none of them keeps asking: only a selection goes back");
+
+    # --- a re-read: new bytes replace, the same bytes keep, a failure keeps ---
+    var body_a = _t_claude_body();
+    var moved = _t_gw(200, body_a);
+    var held = agnosai_model_catalog_of(moved);
+    assert(held != 0, "a catalog to re-read");
+    agnosai_model_catalog_reread(moved);
+    assert_eq(_t_gets, 2, "a re-read is a GET");
+    assert_eq(agnosai_model_catalog_of(moved), held,
+      "the same bytes keep the catalog, so a re-read driven by failures retains nothing");
+
+    var before = alloc_used();
+    for (var i = 0; i < 200; i = i + 1) { agnosai_model_catalog_reread(moved); }
+    var grown = alloc_used() - before;
+    assert(grown < 1024, "and 200 of them leave nothing on the global heap");
+
+    _t_status = 503;
+    agnosai_model_catalog_reread(moved);
+    assert_eq(agnosai_model_catalog_of(moved), held, "a failed one keeps what was held");
+    _t_means(moved, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5", "which still serves");
+
+    _t_status = 200;
+    _t_body = str_from("<html>");
+    agnosai_model_catalog_reread(moved);
+    assert_eq(agnosai_model_catalog_of(moved), held, "as does one that is no list");
+
+    _t_body = str_from("{\"data\":[{\"id\":\"replacement\"}]}");
+    agnosai_model_catalog_reread(moved);
+    assert(agnosai_model_catalog_of(moved) != held, "other bytes replace it");
+    _t_means(moved, AGNOSAI_TIER_CAPABLE, "replacement", "and the tier moves with them");
+    assert(agnosai_model_catalog_find(held, str_from("claude-opus-5-5")) != 0,
+      "and a reader still holding the old one is holding something whole");
+    return 0;
+}
+
+fn test_rationed(): i64 {
+    # --- a re-read costs the gateway memory it never gets back ---
+    agnosai_model_catalog_set_reread_ms(60000);
+    var c = _t_gw(200, _t_claude_body());
+    assert(agnosai_model_catalog_of(c) != 0, "a read");
+    for (var i = 0; i < 50; i = i + 1) { agnosai_model_catalog_reread(c); }
+    assert_eq(_t_gets, 1, "fifty refusals inside the interval ask the gateway nothing");
+
+    agnosai_model_catalog_set_reread_ms(1);
+    sleep_ms(3);
+    agnosai_model_catalog_reread(c);
+    assert_eq(_t_gets, 2, "and the first one past it does");
+
+    # --- a read that failed counts too: a gateway returning 503 is not asked harder ---
+    # The good read is left to age past the interval, so only the failed one can be what stops this.
+    var hurt = _t_gw(200, _t_claude_body());
+    assert(agnosai_model_catalog_of(hurt) != 0, "held");
+    sleep_ms(300);
+    agnosai_model_catalog_set_reread_ms(0);
+    _t_status = 503;
+    agnosai_model_catalog_reread(hurt);
+    agnosai_model_catalog_set_reread_ms(200);
+    agnosai_model_catalog_reread(hurt);
+    assert_eq(_t_gets, 2, "a failed re-read starts the interval");
+
+    # --- a selection with nothing to pick is not rationed: that is a gateway coming back ---
+    var back = _t_gw(503, 0);
+    assert(_t_choose(back, AGNOSAI_TIER_CAPABLE) != 0, "down");
+    assert(_t_choose(back, AGNOSAI_TIER_CAPABLE) != 0, "still down");
+    assert_eq(_t_gets, 2, "and asked each time, as the next crew should not wait out an interval");
+    _t_status = 200;
+    _t_body = _t_claude_body();
+    _t_means(back, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5", "and it serves as soon as it is back");
+    agnosai_model_catalog_set_reread_ms(0);
+    return 0;
+}
+
+fn test_override(): i64 {
+    assert(str_eq_cstr(str_from(agnosai_model_tier_env(AGNOSAI_TIER_FAST)),
+        "AGNOSAI_MODEL_FAST") == 1, "each tier's variable");
+    assert(str_eq_cstr(str_from(agnosai_model_tier_env(AGNOSAI_TIER_CAPABLE)),
+        "AGNOSAI_MODEL_CAPABLE") == 1, "by name");
+    assert(str_eq_cstr(str_from(agnosai_model_tier_env(AGNOSAI_TIER_PREMIUM)),
+        "AGNOSAI_MODEL_PREMIUM") == 1, "for all three");
+    assert_eq(agnosai_model_tier_override(AGNOSAI_TIER_CAPABLE), 0, "none by default");
+
+    # --- the operator's word needs no catalog ---
+    var client = _t_gw(503, 0);
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("openai/gpt-oss-120b"));
+    _t_means(client, AGNOSAI_TIER_CAPABLE, "openai/gpt-oss-120b",
+      "an override answers with a gateway down, as it is, prefix and all");
+    assert_eq(_t_gets, 0, "and reads nothing");
+    assert(_t_choose(client, AGNOSAI_TIER_PREMIUM) != 0, "it is per tier: the others still ask");
+    assert(_t_choose(client, AGNOSAI_TIER_FAST) != 0, "both of them");
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, 0);
+
+    # --- and beats a catalog that has an answer ---
+    var listed = _t_gw(200, _t_claude_body());
+    _t_means(listed, AGNOSAI_TIER_PREMIUM, "claude-fable-5-1", "the catalog's word");
+    agnosai_model_set_tier_override(AGNOSAI_TIER_PREMIUM, str_from("claude-opus-5-5"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_FAST, str_from("claude-sonnet-5-5"));
+    _t_means(listed, AGNOSAI_TIER_PREMIUM, "claude-opus-5-5", "gives way to the operator's");
+    _t_means(listed, AGNOSAI_TIER_FAST, "claude-sonnet-5-5", "at Fast too");
+    _t_means(listed, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5", "and an untouched tier stays");
+
+    # --- the value is the override's own ---
+    var ar = arena_allocator_growable(4096);
+    agnosai_model_set_tier_override(AGNOSAI_TIER_PREMIUM, str_from_a(ar, "kept"));
+    reset_via(ar);
+    memset(alloc_via(ar, 64), 65, 64);
+    _t_means(listed, AGNOSAI_TIER_PREMIUM, "kept", "a copy, not the caller's bytes");
+
+    # --- cleared by 0 or by empty, which is how an unset variable reads ---
+    agnosai_model_set_tier_override(AGNOSAI_TIER_PREMIUM, str_from(""));
+    _t_means(listed, AGNOSAI_TIER_PREMIUM, "claude-fable-5-1", "an empty override is none");
+    agnosai_model_set_tier_override(AGNOSAI_TIER_FAST, 0);
+    _t_means(listed, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "as is 0");
+    return 0;
+}
+
+fn test_concurrent(): i64 {
+    # --- a crew's first tasks all arrive at once ---
+    var ok = _t_gw(200, _t_claude_body());
+    _t_get_ms = 50;
+    _t_race(ok, 8);
+    assert_eq(_t_gets, 1, "eight selections racing the first read cost one GET");
+
+    # --- and against a dead gateway that read must not repeat ---
+    var dead = _t_gw(503, 0);
+    _t_get_ms = 200;
+    _t_race(dead, 8);
+    assert_eq(_t_gets, 1,
+      "a thread that waited takes the read it waited for: repeated, a connect timeout is paid once \
+    for each task in turn");
+
+    # --- a task that has an answer without one does not wait out a read in flight ---
+    var flight = _t_gw(503, 0);
+    assert_eq(agnosai_model_catalog_of(flight), 0, "a first read that found nothing");
+    _t_get_ms = 400;
+    var reader = thread_create(&_t_slow_reread, flight);
+    var spun = 0;
+    while (_t_gets < 2 && spun < 2000) {
+        sleep_ms(1);
+        spun = spun + 1;
+    }
+    assert_eq(_t_gets, 2, "a read is in flight");
+    var t0 = clock_now_ns();
+    assert_eq(agnosai_model_catalog_of(flight), 0, "asked while another read holds the slot");
+    assert((clock_now_ns() - t0) / 1000000 < 200, "and answered at once, not after it");
+    thread_join(reader);
+
+    # --- a read must not stand in for one that had not started ---
+    var next = _t_gw(503, 0);
+    assert(_t_choose(next, AGNOSAI_TIER_CAPABLE) != 0, "a failed read");
+    _t_status = 200;
+    _t_body = _t_claude_body();
+    _t_means(next, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5", "does not excuse the next");
+    return 0;
+}
+
+fn test_seam(): i64 {
+    # --- the paths the read goes to ---
+    assert(str_eq_cstr(agnosai_hoosh_catalog_path(), "/v1/models/catalog") == 1, "the catalog");
+    assert(str_eq_cstr(agnosai_hoosh_models_path(), "/v1/models") == 1, "and the list");
+
+    # --- the live GET fails as a kind, not as a fault ---
+    var a = arena_allocator_growable(65536);
+    var out: i64[1];
+    store64(&out, 0);
+    var kind = agnosai_hoosh_get_a(a, str_from("http://127.0.0.1:1"), str_from(""),
+      agnosai_hoosh_catalog_path(), &out);
+    assert_eq(kind, 0 - SANDHI_ERR_CONNECT, "nothing listening is a negative CONNECT");
+    assert_eq(load64(&out), 0, "with no body");
+    var bad = agnosai_hoosh_get_a(a, str_from("not a url"), str_from(""),
+      agnosai_hoosh_catalog_path(), &out);
+    assert(bad < 0, "a URL that does not parse is one too");
+    reset_via(a);
+
+    # --- a chat failure's detail, when hoosh's error body is not JSON ---
+    var ar = arena_allocator_growable(4096);
+    var broken = str_from("{\"error\":{\"message\":\"upstream provider returned HTTP 404: \
+{\"error\": \"model 'x' not found\"}\",\"type\":\"upstream_error\"}}");
+    assert_eq(bayan_json_v_parse_buf_a(ar, str_data(broken), str_len(broken)), 0,
+      "what hoosh writes for a provider's 404 with no message key does not parse");
+    var said = _agnosai_hoosh_detail_a(ar, 0, str_data(broken), str_len(broken));
+    assert(said != 0, "so its words are read off the body");
+    assert_eq(agnosai_hoosh_refused_model(said), 1, "and they say the id does not exist");
+    assert(str_eq_cstr(said, "upstream provider returned HTTP 404") == 1,
+      "those words alone: the rest is a provider's text, and it would reach a task's output");
+    var html = str_from("<html>bad gateway</html>");
+    assert_eq(_agnosai_hoosh_detail_a(ar, 0, str_data(html), str_len(html)), 0,
+      "anything else that does not parse says nothing");
+    assert_eq(_agnosai_hoosh_detail_a(ar, 0, 0, 0), 0, "as does no body");
+    var good = str_from("{\"error\":{\"message\":\"no provider for model\"}}");
+    assert(str_eq_cstr(_agnosai_hoosh_detail_a(ar,
+          bayan_json_v_parse_buf_a(ar, str_data(good), str_len(good)), str_data(good), str_len(good)),
+        "no provider for model") == 1, "and one that parses says what it says");
+    reset_via(ar);
+
+    # --- the live pointer, end to end, to nothing ---
+    var client = agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from(""));
+    assert_eq(agnosai_hoosh_client_get_fp(client), &_agnosai_hoosh_client_get_live,
+      "a client reads live unless a suite says otherwise");
+    assert_eq(agnosai_model_catalog_of(client), 0, "and a live read with nothing there is no catalog");
+
+    # --- a chat failure that says the id does not exist ---
+    assert_eq(agnosai_hoosh_refused_model(
+        str_from("hoosh returned HTTP 404: no provider for model")), 1,
+      "hoosh with no route for it");
+    assert_eq(agnosai_hoosh_refused_model(str_from(
+          "hoosh returned HTTP 502: upstream provider returned HTTP 404: model: claude-x")), 1,
+      "and a provider's 404, which hoosh hands back as a 502");
+    assert_eq(agnosai_hoosh_refused_model(str_from(
+          "hoosh returned HTTP 502: upstream provider returned HTTP 529: overloaded")), 0,
+      "a provider that is unwell is not one");
+    assert_eq(agnosai_hoosh_refused_model(str_from("hoosh returned HTTP 502: bad gateway")), 0,
+      "nor a bare 502");
+    assert_eq(agnosai_hoosh_refused_model(str_from("hoosh returned HTTP 500: model gpt-404")), 0,
+      "nor a 404 in a model's name");
+    assert_eq(agnosai_hoosh_refused_model(str_from("hoosh transport error: CONNECT")), 0,
+      "nor a transport failure");
+    assert_eq(agnosai_hoosh_refused_model(0), 0, "and no error is no refusal");
+    return 0;
+}
+
+fn test_socket(): i64 {
+    _T_ANSWERS = vec_new();
+    vec_push(_T_ANSWERS, _t_http("HTTP/1.1 200 OK", _t_claude_body()));
+    if (_t_server_start() == 0) { return assert(0, "a port for the socket gateway"); }
+
+    # --- a GET that works, which no stub can say ---
+    var a = arena_allocator_growable(65536);
+    var out: i64[1];
+    store64(&out, 0);
+    var status = agnosai_hoosh_get_a(a, _t_socket_url(), str_from("sk-key"),
+      agnosai_hoosh_catalog_path(), &out);
+    assert_eq(status, 200, "the status");
+    assert(str_eq(load64(&out), _t_claude_body()) == 1, "and the whole body, in the arena");
+    assert(str_eq_cstr(_T_FIRST_LINE, "GET /v1/models/catalog HTTP/1.1") == 1, "a GET of the path");
+    reset_via(a);
+
+    # --- a trailing slash on the base is one slash on the wire ---
+    var sb = str_builder_new();
+    str_builder_add(sb, _t_socket_url());
+    str_builder_add_cstr(sb, "/");
+    store64(&out, 0);
+    agnosai_hoosh_get_a(a, str_builder_build(sb), str_from(""), agnosai_hoosh_models_path(), &out);
+    assert(str_eq_cstr(_T_FIRST_LINE, "GET /v1/models HTTP/1.1") == 1, "a base with a trailing slash");
+    reset_via(a);
+
+    # --- end to end: a live client's selection ---
+    var client = agnosai_hoosh_client_new(_t_socket_url(), str_from(""));
+    var err = _t_choose(client, AGNOSAI_TIER_PREMIUM);
+    assert_eq(err, 0, "a live client selects");
+    assert(str_eq(_t_chosen, str_from("claude-fable-5-1")) == 1, "off a catalog read over a socket");
+
+    # --- and the fallback, live, in one read ---
+    _T_ANSWERS = vec_new();
+    _T_SERVED = 0;
+    vec_push(_T_ANSWERS, _t_http("HTTP/1.1 404 Not Found", str_from("{\"error\":{\"message\":\"no\"}}")));
+    vec_push(_T_ANSWERS, _t_http("HTTP/1.1 200 OK",
+        str_from("{\"data\":[{\"id\":\"llama3.2:1b\",\"owned_by\":\"ollama\"}]}")));
+    var sb2 = str_builder_new();
+    str_builder_add(sb2, _t_socket_url());
+    str_builder_add_cstr(sb2, "/fallback");
+    var older = agnosai_hoosh_client_new(str_builder_build(sb2), str_from(""));
+    var pre = alloc_used();
+    assert_eq(_t_choose(older, AGNOSAI_TIER_CAPABLE), 0, "a gateway with no catalog");
+    assert(alloc_used() - pre < 3 * 1048576,
+      "reserves one receive buffer for its two exchanges, as sandhi sizes each to the cap up front");
+    assert(str_eq(_t_chosen, str_from("llama3.2:1b")) == 1, "is read through its model list");
+    assert_eq(_T_SERVED, 2, "in two exchanges");
+    assert(str_eq_cstr(_T_FIRST_LINE, "GET /fallback/v1/models HTTP/1.1") == 1, "the second of them this");
+
+    # --- what a re-read that finds the same bytes costs, on the live path ---
+    _T_ANSWERS = vec_new();
+    _T_SERVED = 0;
+    vec_push(_T_ANSWERS, _t_http("HTTP/1.1 200 OK", _t_claude_body()));
+    var live = agnosai_hoosh_client_new(_t_socket_url(), str_from(""));
+    agnosai_model_catalog_reread(live);
+    for (var i = 0; i < 8; i = i + 1) { agnosai_model_catalog_reread(live); }
+    var before = alloc_used();
+    for (var j = 0; j < 50; j = j + 1) { agnosai_model_catalog_reread(live); }
+    var each = (alloc_used() - before) / 50;
+    # sandhi's own 480 B or so per exchange (roadmap B39), and nothing of the catalog's.
+    assert(each < 1024, "a live re-read keeps no catalog, and leaves only what any exchange does");
+
+    # --- what no gateway holds: a cap is a failed read, not a fault ---
+    store64(&_T_STOP, 1);
+    var ct, cfd = tcp_socket();
+    sock_connect(cfd, INADDR_LOOPBACK(), _T_PORT);
+    sock_close(cfd);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_parse();
+    test_tiers();
+    test_lookup();
+    # A suite re-reads at once to see what a re-read does. `test_rationed` is the interval's own.
+    agnosai_model_catalog_set_reread_ms(0);
+    test_reads();
+    test_rationed();
+    test_override();
+    test_concurrent();
+    test_seam();
+    test_socket();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

@@ -6,7 +6,7 @@
 # OpenAI chat-completions wire format plus thoth/src/hoosh.cyr's own
 # builder/extractor tests.
 #
-# Everything here runs offline. `agnosai_hoosh_chat` is the one I/O call and is
+# Everything here runs offline. `agnosai_hoosh_chat` is the one chat I/O call and is
 # NOT exercised here — that is M3's exit criterion and needs a running
 # `hoosh serve 8088`; use scripts/stack.sh.
 #
@@ -587,6 +587,20 @@ fn main() {
       "llama3", "first model id");
     assert_eq(agnosai_hoosh_extract_models(str_from("{}")), 0, "no data key yields 0");
     assert_eq(agnosai_hoosh_extract_models(str_from("{\"data\":{}}")), 0, "a non-array data yields 0");
+
+    # The same in an arena, which is how a catalog is read: the tree goes when the arena does.
+    var models_ar = arena_allocator_growable(4096);
+    var models_before = alloc_used();
+    var in_arena = agnosai_hoosh_extract_models_a(models_ar, models_body);
+    assert_eq(bayan_json_v_arr_len(in_arena), bayan_json_v_arr_len(data), "the arena form reads the list");
+    assert_eq(alloc_used() - models_before, 0, "and leaves nothing on the global heap");
+    assert_eq(agnosai_hoosh_extract_models_a(models_ar, str_from("{}")), 0, "no data key yields 0 there too");
+
+    # --- a provider named after the fact ---
+    var unnamed = agnosai_inference_response_new(str_from("c"), str_from("m"));
+    assert_eq(agnosai_inference_response_provider(unnamed), 0, "a response starts with no provider");
+    assert_eq(agnosai_inference_response_with_provider(unnamed, str_from("groq")), unnamed, "the setter chains");
+    _t_assert_str(agnosai_inference_response_provider(unnamed), "groq", "and it is read back");
 
     # --- the remaining public surface ---
     _t_assert_str(agnosai_hoosh_chat_path(), "/v1/chat/completions", "chat completions path");

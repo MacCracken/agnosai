@@ -1,0 +1,651 @@
+# =========================================================================
+# model_catalog — what a gateway serves, and which model a tier means (ADR 030).
+#
+# **Port-local. No oracle counterpart.** The Rust line carried a table of model names, and this
+# replaces the one agnosai inherited. Lives at `src/` root per CLAUDE.md's rule for such modules.
+#
+# hoosh routes by the id it is given, so a name agnosai made up is a 404 on any gateway with no such
+# route. `GET /v1/models/catalog` lists what each provider serves now (hoosh ADR 012), and this
+# reads it, keeps it for the life of the process, and answers three questions from it: which id a
+# tier means, whether an id is listed, and who owns one.
+#
+# ## Storage
+#
+# One slot per gateway, keyed by base URL, on a list that only grows: an orchestrator can name any
+# gateway, and an id from another's catalog is a guess. A crew's client is built in the crew's
+# allocator and goes when the crew does, so a slot owns its own URL and nothing in it points at a
+# client. A catalog is on the global heap and is never freed, as a reader may be holding it. Readers
+# take no lock: an entry does not change once a catalog is published.
+#
+# ⚠ **Publication is a fence and then a store.** `atomic_store` is a plain store, and on aarch64, which
+# ships, a reader could otherwise see the pointer before what it points at, and fault on a slot's URL
+# or a catalog's entries. The readers' own loads follow the pointer, so they need no fence of their own.
+#
+# ⚠ **A catalog is kept only if it is new.** Each read that finds other bytes keeps another catalog
+# for good, and a re-read is driven by failures, which an operator cannot bound. So a read that finds
+# the bytes it already holds keeps nothing: what is retained is one catalog per change at hoosh, and
+# hoosh changes its list at most at a refresh (six hours by default) or a reload.
+#
+# ⚠ **A re-read is rationed, and not for agnosai's sake.** hoosh's heap never frees either, and it
+# keeps about 1.7 KB per entry per `GET /v1/models/catalog` (15.4 KB at 9 entries, measured on hoosh
+# 2.10.1 over 3000 GETs), so one per refused task would let a caller grow the gateway without bound
+# by naming models. `_AGN_CAT_REREAD_MS` bounds that. A task inside the interval still selects again,
+# from what the last read found, which is what lets the rest of a crew follow the first task that
+# looked.
+#
+# A slot's mutex covers its read and nothing else, so a dead gateway holds up nobody on another. A
+# read that fails leaves the catalog it found in place: a blip must not empty what a crew can pick
+# from, which is the rule hoosh keeps for a provider's list too.
+# =========================================================================
+
+# How much reasoning an entry declares.
+#
+# `effort` outranks `thinking`, and the order is the point of this enum. Only models with tunable
+# reasoning list `effort`, and it is what separates a current model from an old one that costs more:
+# hoosh prices `claude-opus-4-1` at $15/$75 and Fable 5.1 at $10/$50, both think, and only Fable
+# takes `effort`. Absence here means nobody said, as a provider that lists no capabilities is not
+# declaring that a model has none.
+enum AgnosaiModelReasoning {
+    AGNOSAI_REASONING_UNDECLARED = 0;
+    AGNOSAI_REASONING_THINKING = 1;
+    AGNOSAI_REASONING_EFFORT = 2;
+}
+
+# Catalog entry heap layout — 56 bytes. Prices are micro-USD per 1K tokens, -1 unknown. `RATE` is
+# their sum, what a tier compares, and -1 when either is unknown. Prices are the catalog's own unit,
+# never converted, so one from a gateway needs no float to compare.
+enum AgnosaiModelEntryOff {
+    AGN_ME_ID = 0;
+    AGN_ME_OWNED_BY = 8;
+    AGN_ME_INPUT = 16;
+    AGN_ME_OUTPUT = 24;
+    AGN_ME_RATE = 32;
+    AGN_ME_REASONING = 40;
+    AGN_ME_CHAT = 48;
+    AGN_ME_SIZE = 56;
+}
+
+# Catalog heap layout — 40 bytes. `PICKS` holds one entry or 0 per `AGNOSAI_TIER_*`, in tier order.
+enum AgnosaiModelCatalogOff {
+    AGN_CAT_ENTRIES = 0;
+    AGN_CAT_HASH = 8;
+    AGN_CAT_PICKS = 16;
+    AGN_CAT_SIZE = 40;
+}
+
+# Slot heap layout — 64 bytes. `READS` counts attempts, and is what a waiter compares. `LAST` says how
+# the last one went: an HTTP status, a negative sandhi error kind, or `_AGN_CAT_UNREADABLE`. `READ_NS`
+# is when it finished, for `agnosai_model_catalog_reread`.
+enum AgnosaiCatalogSlotOff {
+    AGN_MS_NEXT = 0;
+    AGN_MS_BASE_URL = 8;
+    AGN_MS_MUTEX = 16;
+    AGN_MS_ARENA = 24;
+    AGN_MS_CATALOG = 32;
+    AGN_MS_READS = 40;
+    AGN_MS_LAST = 48;
+    AGN_MS_READ_NS = 56;
+    AGN_MS_SIZE = 64;
+}
+
+# A 2xx whose body is no model list. Below every negative sandhi error kind.
+var _AGN_CAT_UNREADABLE = 0 - 1000;
+
+# The first arena size a slot reads in. ⚠ sandhi sizes its receive buffer to the response cap before a
+# byte arrives, so the first live read chains `AGNOSAI_HOOSH_GET_MAX_BYTES` onto this for the life of
+# the gateway's slot. That is address space, as only the pages a list reaches are touched.
+var _AGN_CAT_ARENA_BYTES = 65536;
+
+# How long a refused selection waits for the list to be asked again, in ms. See the module header.
+var _AGN_CAT_REREAD_MS = 60000;
+
+var _AGN_CAT_SLOTS = 0;
+var _AGN_CAT_SLOTS_LOCK = mutex_new();
+
+# The paths, minted once: a read is rare, and these outlive every one of them.
+var _AGN_CAT_CATALOG_PATH = agnosai_hoosh_catalog_path();
+var _AGN_CAT_MODELS_PATH = agnosai_hoosh_models_path();
+
+# The operator's model for each tier, or 0.
+var _AGN_MODEL_OVERRIDE_FAST = 0;
+var _AGN_MODEL_OVERRIDE_CAPABLE = 0;
+var _AGN_MODEL_OVERRIDE_PREMIUM = 0;
+
+# The environment variable that overrides `tier`, a cstring.
+fn agnosai_model_tier_env(tier): i64 {
+    if (tier == AGNOSAI_TIER_CAPABLE) { return "AGNOSAI_MODEL_CAPABLE"; }
+    if (tier == AGNOSAI_TIER_PREMIUM) { return "AGNOSAI_MODEL_PREMIUM"; }
+    return "AGNOSAI_MODEL_FAST";
+}
+
+# The operator's model for `tier`, or 0.
+fn agnosai_model_tier_override(tier): i64 {
+    if (tier == AGNOSAI_TIER_CAPABLE) { return _AGN_MODEL_OVERRIDE_CAPABLE; }
+    if (tier == AGNOSAI_TIER_PREMIUM) { return _AGN_MODEL_OVERRIDE_PREMIUM; }
+    return _AGN_MODEL_OVERRIDE_FAST;
+}
+
+# Have `tier` mean `model`, exactly as given and whatever the catalog says, or clear it with 0 or an
+# empty Str. It is the operator's word, so it is not checked against the catalog, and it needs no
+# catalog at all, which makes it the way to run against a gateway that has none. Process-wide.
+# ⚠ **Call at start-up, before any crew runs**: it is read without a lock.
+fn agnosai_model_set_tier_override(tier, model: Str): i64 {
+    var v = 0;
+    if (model != 0) {
+        if (str_len(model) > 0) { v = str_clone(model); }
+    }
+    if (tier == AGNOSAI_TIER_CAPABLE) { _AGN_MODEL_OVERRIDE_CAPABLE = v; }
+    elif (tier == AGNOSAI_TIER_PREMIUM) { _AGN_MODEL_OVERRIDE_PREMIUM = v; }
+    else { _AGN_MODEL_OVERRIDE_FAST = v; }
+    return 0;
+}
+
+# Whether `id` is worth keeping: at most 255 bytes of printable ASCII with no space, quote or
+# backslash. hoosh's `catalog_id_ok`, which a list from `/v1/models` has not been through, or one from
+# a gateway that is not hoosh. An id goes in a log line and a consumer's terminal, and one that fails
+# this is dropped rather than repaired, as no provider in use issues one.
+fn _agnosai_model_id_ok(id: Str): i64 {
+    var n = str_len(id);
+    if (n == 0 || n > 255) { return 0; }
+    var d = str_data(id);
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(d + i) & 255;
+        if (c <= 32 || c >= 127) { return 0; }
+        if (c == 34 || c == 92) { return 0; }
+    }
+    return 1;
+}
+
+# Have a re-read ask the gateway at most once per `ms`, 0 for every time. Process-wide.
+# ⚠ **Call at start-up, before any crew runs**: it is read without a lock.
+fn agnosai_model_catalog_set_reread_ms(ms): i64 {
+    _AGN_CAT_REREAD_MS = ms;
+    return 0;
+}
+
+# Whether `id` is a chat model, as far as its name can say.
+#
+# ⚠ **Not a way of choosing models, and the one list of names here.** The catalog has no field for
+# this, and without one a price ranks a text embedder as a cheap model. hoosh drops these families
+# from an OpenAI-compatible list only (`catalog_openai_nonchat`, the same twelve words): Ollama's
+# tags and the compiled table reach the catalog unfiltered, and a box with `nomic-embed-text` pulled
+# would otherwise answer Fast with it. A word here can only keep an id from standing for a tier. An
+# agent can still name one, and it is still listed.
+fn _agnosai_model_is_chat(id: Str): i64 {
+    if (agnosai_str_contains_ci_cstr(id, "embed") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "whisper") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "tts") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "transcribe") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "dall-e") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "image") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "moderation") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "realtime") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "audio") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "davinci") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "babbage") == 1) { return 0; }
+    if (agnosai_str_contains_ci_cstr(id, "sora") == 1) { return 0; }
+    return 1;
+}
+
+# How much reasoning a `capabilities` object declares. `vision` says nothing about it.
+fn _agnosai_model_reasoning_of(caps): i64 {
+    if (caps == 0) { return AGNOSAI_REASONING_UNDECLARED; }
+    if (bayan_json_v_is_obj(caps) == 0) { return AGNOSAI_REASONING_UNDECLARED; }
+    var effort = bayan_json_v_obj_get_by_cstr(caps, "effort");
+    if (effort != 0 && bayan_json_v_is_arr(effort) == 1) {
+        if (bayan_json_v_arr_len(effort) > 0) { return AGNOSAI_REASONING_EFFORT; }
+    }
+    var thinking = bayan_json_v_obj_get_by_cstr(caps, "thinking");
+    if (thinking != 0 && bayan_json_v_is_arr(thinking) == 1) {
+        if (bayan_json_v_arr_len(thinking) > 0) { return AGNOSAI_REASONING_THINKING; }
+    }
+    return AGNOSAI_REASONING_UNDECLARED;
+}
+
+# Fill in an entry's prices from a `pricing` object. A price is known only as a pair, as hoosh writes
+# it, and a rate that would not fit is no price.
+fn _agnosai_model_read_pricing(e, pricing): i64 {
+    if (pricing == 0) { return 0; }
+    if (bayan_json_v_is_obj(pricing) == 0) { return 0; }
+    var input = _agnosai_int_field(pricing, "input_micro_usd_per_1k", 0 - 1);
+    var output = _agnosai_int_field(pricing, "output_micro_usd_per_1k", 0 - 1);
+    if (input < 0 || output < 0) { return 0; }
+    if (input + output < 0) { return 0; }
+    store64(e + AGN_ME_INPUT, input);
+    store64(e + AGN_ME_OUTPUT, output);
+    store64(e + AGN_ME_RATE, input + output);
+    return 0;
+}
+
+# One catalog element as an entry on the global heap, or 0 for one with no usable id. Every Str is a
+# copy: the tree goes when the read does.
+fn _agnosai_model_entry_of(v): i64 {
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var idv = bayan_json_v_obj_get_by_cstr(v, "id");
+    if (idv == 0) { return 0; }
+    if (bayan_json_v_is_str(idv) == 0) { return 0; }
+    var id = bayan_json_v_str(idv);
+    if (_agnosai_model_id_ok(id) == 0) { return 0; }
+
+    var e = alloc(AGN_ME_SIZE);
+    store64(e + AGN_ME_ID, str_clone(id));
+    store64(e + AGN_ME_OWNED_BY, 0);
+    var owner = bayan_json_v_obj_get_by_cstr(v, "owned_by");
+    if (owner != 0) {
+        if (bayan_json_v_is_str(owner) == 1) {
+            if (_agnosai_model_id_ok(bayan_json_v_str(owner)) == 1) {
+                store64(e + AGN_ME_OWNED_BY, str_clone(bayan_json_v_str(owner)));
+            }
+        }
+    }
+    store64(e + AGN_ME_INPUT, 0 - 1);
+    store64(e + AGN_ME_OUTPUT, 0 - 1);
+    store64(e + AGN_ME_RATE, 0 - 1);
+    _agnosai_model_read_pricing(e, bayan_json_v_obj_get_by_cstr(v, "pricing"));
+    store64(e + AGN_ME_REASONING,
+      _agnosai_model_reasoning_of(bayan_json_v_obj_get_by_cstr(v, "capabilities")));
+    store64(e + AGN_ME_CHAT, _agnosai_model_is_chat(id));
+    return e;
+}
+
+# What `e` costs for comparing: free and unpriced tie, so neither outranks the other.
+fn _agnosai_model_rate_of(e): i64 {
+    var r = load64(e + AGN_ME_RATE);
+    if (r < 0) { return 0; }
+    return r;
+}
+
+# Whether `e` is on a ladder: a chat model, paid if `paid` says the ladder is, at `floor` or better,
+# and no dearer than `cap`, or at any price with a `cap` below 0.
+fn _agnosai_model_on_ladder(e, paid, floor, cap): i64 {
+    if (load64(e + AGN_ME_CHAT) == 0) { return 0; }
+    if (paid == 1 && load64(e + AGN_ME_RATE) <= 0) { return 0; }
+    if (load64(e + AGN_ME_REASONING) < floor) { return 0; }
+    if (cap >= 0 && _agnosai_model_rate_of(e) > cap) { return 0; }
+    return 1;
+}
+
+# The entry `tier` means in `entries`, or 0 when no chat model is listed. In arena `a`.
+#
+# The rule, and ADR 030 has why (every step of it was a wrong answer on a real price list first):
+#
+#   1. **The ladder is the paid chat models.** A price of 0 says local, not cheap and good, so a free
+#      model is on the ladder only when nothing is paid. An unpriced one is a spend nobody can state.
+#   2. **Each tier asks its own of the ladder.** Fast asks nothing. Capable asks for reasoning, when
+#      any entry declares it. Premium asks for the most declared on the ladder.
+#   3. **Each tier names a price, and the first listed at that price wins.** Fast is the lowest and
+#      Premium the highest. Capable is the lower median of the DISTINCT prices, as a median over
+#      entries is moved by how many dated aliases of one model a provider happens to list. hoosh
+#      lists the operator's `[[models]]` first, then routes in router order, so first listed is a
+#      preference someone expressed, and the only one a list with one price has.
+#   4. **Capable never costs more than Premium.** Their candidates differ, so nothing else says so.
+#      Beside `claude-sonnet-5-5` (effort, $2/$10), a `claude-sonnet-4-5` and a `claude-opus-4-1` that
+#      only think leave Premium at $2/$10 and the median of what thinks at $3/$15.
+fn _agnosai_model_pick_a(a, entries, tier): i64 {
+    var n = vec_len(entries);
+    var paid = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var e = vec_get(entries, i);
+        if (load64(e + AGN_ME_CHAT) == 1 && load64(e + AGN_ME_RATE) > 0) { paid = 1; }
+    }
+
+    var top = AGNOSAI_REASONING_UNDECLARED;
+    for (var j = 0; j < n; j = j + 1) {
+        var ej = vec_get(entries, j);
+        if (_agnosai_model_on_ladder(ej, paid, 0, 0 - 1) == 1) {
+            if (load64(ej + AGN_ME_REASONING) > top) { top = load64(ej + AGN_ME_REASONING); }
+        }
+    }
+    var floor = 0;
+    if (tier == AGNOSAI_TIER_PREMIUM) { floor = top; }
+    if (tier == AGNOSAI_TIER_CAPABLE && top > AGNOSAI_REASONING_UNDECLARED) {
+        floor = AGNOSAI_REASONING_THINKING;
+    }
+
+    var cap = 0 - 1;
+    if (tier == AGNOSAI_TIER_CAPABLE) {
+        var dear = _agnosai_model_pick_a(a, entries, AGNOSAI_TIER_PREMIUM);
+        if (dear != 0) { cap = _agnosai_model_rate_of(dear); }
+    }
+
+    var rates = vec_new_a(a);
+    for (var k = 0; k < n; k = k + 1) {
+        var ek = vec_get(entries, k);
+        if (_agnosai_model_on_ladder(ek, paid, floor, cap) == 1) {
+            vec_push_a(a, rates, _agnosai_model_rate_of(ek));
+        }
+    }
+    if (vec_len(rates) == 0) { return 0; }
+    agnosai_sort_i64(rates);
+
+    var distinct = vec_new_a(a);
+    for (var m = 0; m < vec_len(rates); m = m + 1) {
+        var r = vec_get(rates, m);
+        if (m == 0 || r != vec_get(rates, m - 1)) { vec_push_a(a, distinct, r); }
+    }
+
+    var at = 0;
+    if (tier == AGNOSAI_TIER_PREMIUM) { at = vec_len(distinct) - 1; }
+    if (tier == AGNOSAI_TIER_CAPABLE) { at = (vec_len(distinct) - 1) / 2; }
+    var rate = vec_get(distinct, at);
+
+    for (var q = 0; q < n; q = q + 1) {
+        var eq = vec_get(entries, q);
+        if (_agnosai_model_on_ladder(eq, paid, floor, cap) == 1) {
+            if (_agnosai_model_rate_of(eq) == rate) { return eq; }
+        }
+    }
+    return 0;
+}
+
+# A catalog from a list body, on the global heap, or 0 when the body is not one. `a` holds the parse
+# tree, and the caller resets it. `/v1/models` is the same shape with `id` and `owned_by` alone, so
+# an older gateway's list parses here too, with no prices and no tier to tell apart.
+fn agnosai_model_catalog_parse_a(a, body: Str): i64 {
+    var data = agnosai_hoosh_extract_models_a(a, body);
+    if (data == 0) { return 0; }
+
+    var entries = vec_new();
+    var n = bayan_json_v_arr_len(data);
+    for (var i = 0; i < n; i = i + 1) {
+        var e = _agnosai_model_entry_of(bayan_json_v_arr_get(data, i));
+        if (e != 0) { vec_push(entries, e); }
+    }
+
+    var c = alloc(AGN_CAT_SIZE);
+    store64(c + AGN_CAT_ENTRIES, entries);
+    store64(c + AGN_CAT_HASH, hash_str_v(body));
+    for (var tier = AGNOSAI_TIER_FAST; tier <= AGNOSAI_TIER_PREMIUM; tier = tier + 1) {
+        store64(c + AGN_CAT_PICKS + tier * 8, _agnosai_model_pick_a(a, entries, tier));
+    }
+    return c;
+}
+
+# How many models a catalog lists.
+fn agnosai_model_catalog_count(c): i64 {
+    return vec_len(load64(c + AGN_CAT_ENTRIES));
+}
+
+# The i-th entry of a catalog, in the gateway's order.
+fn agnosai_model_catalog_get(c, i): i64 {
+    return vec_get(load64(c + AGN_CAT_ENTRIES), i);
+}
+
+# The entry `tier` means in a catalog, or 0 when it lists no chat model or `tier` is none of the
+# three.
+fn agnosai_model_catalog_pick(c, tier): i64 {
+    if (tier < AGNOSAI_TIER_FAST || tier > AGNOSAI_TIER_PREMIUM) { return 0; }
+    return load64(c + AGN_CAT_PICKS + tier * 8);
+}
+
+# The entry listed as exactly `model`, or 0.
+fn agnosai_model_catalog_find(c, model: Str): i64 {
+    var n = agnosai_model_catalog_count(c);
+    for (var i = 0; i < n; i = i + 1) {
+        var e = agnosai_model_catalog_get(c, i);
+        if (str_eq(load64(e + AGN_ME_ID), model) == 1) { return e; }
+    }
+    return 0;
+}
+
+# An entry's id, exactly as the gateway listed it.
+fn agnosai_model_entry_id(e): i64 {
+    return load64(e + AGN_ME_ID);
+}
+
+# The provider that would serve an entry, in hoosh's spelling, or 0 when not listed.
+fn agnosai_model_entry_owned_by(e): i64 {
+    return load64(e + AGN_ME_OWNED_BY);
+}
+
+# An entry's input price, in micro-USD per 1K tokens, or -1 when unknown.
+fn agnosai_model_entry_input_price(e): i64 {
+    return load64(e + AGN_ME_INPUT);
+}
+
+# An entry's output price, in micro-USD per 1K tokens, or -1 when unknown.
+fn agnosai_model_entry_output_price(e): i64 {
+    return load64(e + AGN_ME_OUTPUT);
+}
+
+# How much reasoning an entry declares: one of `AGNOSAI_REASONING_*`.
+fn agnosai_model_entry_reasoning(e): i64 {
+    return load64(e + AGN_ME_REASONING);
+}
+
+# The slot of the gateway `client` talks to, made on first sight. Found without a lock: a slot is
+# published whole and never leaves the list.
+fn _agnosai_model_slot(client): i64 {
+    var url = agnosai_hoosh_client_base_url(client);
+    var s = atomic_load(&_AGN_CAT_SLOTS);
+    while (s != 0) {
+        if (str_eq(load64(s + AGN_MS_BASE_URL), url) == 1) { return s; }
+        s = load64(s + AGN_MS_NEXT);
+    }
+
+    mutex_lock(_AGN_CAT_SLOTS_LOCK);
+    s = atomic_load(&_AGN_CAT_SLOTS);
+    while (s != 0) {
+        if (str_eq(load64(s + AGN_MS_BASE_URL), url) == 1) { break; }
+        s = load64(s + AGN_MS_NEXT);
+    }
+    if (s == 0) {
+        s = alloc(AGN_MS_SIZE);
+        store64(s + AGN_MS_NEXT, atomic_load(&_AGN_CAT_SLOTS));
+        store64(s + AGN_MS_BASE_URL, str_clone(url));
+        store64(s + AGN_MS_MUTEX, mutex_new());
+        store64(s + AGN_MS_ARENA, 0);
+        store64(s + AGN_MS_CATALOG, 0);
+        store64(s + AGN_MS_READS, 0);
+        store64(s + AGN_MS_LAST, 0);
+        store64(s + AGN_MS_READ_NS, 0);
+        atomic_fence();
+        atomic_store(&_AGN_CAT_SLOTS, s);
+    }
+    mutex_unlock(_AGN_CAT_SLOTS_LOCK);
+    return s;
+}
+
+# One GET through the client's pointer.
+fn _agnosai_model_get(client, a, path: Str, out_body): i64 {
+    var get = agnosai_hoosh_client_get_fp(client);
+    if (get == 0) { get = &_agnosai_hoosh_client_get_live; }
+    return callptr(get, client, a, path, out_body);
+}
+
+# Say how a read that found nothing went, from a slot's `LAST`, onto `sb`.
+fn _agnosai_model_add_why_a(a, sb, last): i64 {
+    if (last == _AGN_CAT_UNREADABLE) {
+        str_builder_add_cstr_a(a, sb, "hoosh answered with no model list");
+    } elif (last < 0) {
+        str_builder_add_cstr_a(a, sb, "hoosh transport error: ");
+        str_builder_add_cstr_a(a, sb, sandhi_err_kind_name(0 - last));
+    } elif (last >= 200 && last < 300) {
+        str_builder_add_cstr_a(a, sb, "hoosh lists no chat model");
+    } else {
+        str_builder_add_cstr_a(a, sb, "hoosh returned HTTP ");
+        str_builder_add_int_a(a, sb, last);
+    }
+    return 0;
+}
+
+# Log a read: why it failed, or what each tier now means. `catalog` is the new one, or 0.
+fn _agnosai_model_log_read_a(a, slot, catalog): i64 {
+    if (catalog == 0) {
+        if (sakshi_get_level() < SK_WARN) { return 0; }
+        var wsb = str_builder_new_a(a);
+        _agnosai_model_add_why_a(a, wsb, load64(slot + AGN_MS_LAST));
+        var w = str_builder_build_a(a, wsb);
+        sakshi_log_kv(SK_WARN, "model catalog not read", 22, "why", 3, str_data(w), str_len(w));
+        return 0;
+    }
+    if (sakshi_get_level() < SK_INFO) { return 0; }
+    var sb = str_builder_new_a(a);
+    str_builder_add_int_a(a, sb, agnosai_model_catalog_count(catalog));
+    str_builder_add_cstr_a(a, sb, " listed");
+    for (var tier = AGNOSAI_TIER_FAST; tier <= AGNOSAI_TIER_PREMIUM; tier = tier + 1) {
+        var e = agnosai_model_catalog_pick(catalog, tier);
+        if (e != 0) {
+            str_builder_add_cstr_a(a, sb, " ");
+            str_builder_add_a(a, sb, agnosai_model_tier_to_wire(tier));
+            str_builder_add_cstr_a(a, sb, "=");
+            str_builder_add_a(a, sb, agnosai_model_entry_id(e));
+        }
+    }
+    var line = str_builder_build_a(a, sb);
+    sakshi_log_kv(SK_INFO, "model catalog read", 18, "tiers", 5, str_data(line), str_len(line));
+    return 0;
+}
+
+# Read the gateway's list into `slot`, unless a read finished since this thread counted `seen`.
+#
+# ⚠ **`seen` is what keeps a dead gateway from costing a crew its width times the connect timeout.**
+# Parallel tasks arrive together, the first reads, and the rest wait on the mutex. Left at that, each
+# would then read in turn, and with nothing listening that is a queue of timeouts. A thread that
+# waited takes what the read it waited for found, whichever way it went.
+#
+# `/v1/models` only on a 404: any other failure is a gateway that has the catalog and is not giving
+# it, and an older list in its place would quietly lose the prices. A 2xx whose bytes are the ones
+# held keeps nothing (see the module header).
+fn _agnosai_model_read(client, slot, seen): i64 {
+    var body: i64[1];
+    store64(&body, 0);
+    mutex_lock(load64(slot + AGN_MS_MUTEX));
+    if (atomic_load(slot + AGN_MS_READS) != seen) {
+        mutex_unlock(load64(slot + AGN_MS_MUTEX));
+        return 0;
+    }
+
+    var a = load64(slot + AGN_MS_ARENA);
+    if (a == 0) {
+        a = arena_allocator_growable(_AGN_CAT_ARENA_BYTES);
+        store64(slot + AGN_MS_ARENA, a);
+    }
+
+    var last = 0 - SANDHI_ERR_INTERNAL;
+    var fresh = 0;
+    if (a != 0) {
+        last = _agnosai_model_get(client, a, _AGN_CAT_CATALOG_PATH, &body);
+        if (last == 404) {
+            # The first answer is not needed, and sandhi would size a second buffer past it.
+            reset_via(a);
+            last = _agnosai_model_get(client, a, _AGN_CAT_MODELS_PATH, &body);
+        }
+
+        if (last >= 200 && last < 300) {
+            var held = atomic_load(slot + AGN_MS_CATALOG);
+            var same = 0;
+            if (held != 0) {
+                if (load64(held + AGN_CAT_HASH) == hash_str_v(load64(&body))) { same = 1; }
+            }
+            if (same == 0) {
+                fresh = agnosai_model_catalog_parse_a(a, load64(&body));
+                if (fresh == 0) { last = _AGN_CAT_UNREADABLE; }
+                else {
+                    atomic_fence();
+                    atomic_store(slot + AGN_MS_CATALOG, fresh);
+                }
+            }
+        }
+    }
+
+    store64(slot + AGN_MS_LAST, last);
+    store64(slot + AGN_MS_READ_NS, clock_now_ns());
+    if (a != 0 && (fresh != 0 || last < 200 || last >= 300)) {
+        _agnosai_model_log_read_a(a, slot, fresh);
+    }
+    # After the catalog and the outcome: a waiter that counts this read must find what it left.
+    atomic_fetch_add(slot + AGN_MS_READS, 1);
+    if (a != 0) { reset_via(a); }
+    mutex_unlock(load64(slot + AGN_MS_MUTEX));
+    return 0;
+}
+
+# Read the gateway's list again, for a selection the gateway refused, unless it was read within
+# `_AGN_CAT_REREAD_MS`. Keeps what it holds if it cannot.
+fn agnosai_model_catalog_reread(client): i64 {
+    var slot = _agnosai_model_slot(client);
+    var at = atomic_load(slot + AGN_MS_READ_NS);
+    if (at != 0) {
+        if ((clock_now_ns() - at) / 1000000 < _AGN_CAT_REREAD_MS) { return 0; }
+    }
+    return _agnosai_model_read(client, slot, atomic_load(slot + AGN_MS_READS));
+}
+
+# The catalog of `client`'s gateway, read if it never was, or 0. Reads once whatever happens, as a
+# caller here has an answer without one: only a selection that failed goes back. The count is looked
+# at before the lock as well as under it, so a task naming its own model does not wait out a read in
+# flight, up to two GETs' ceilings, to learn what it would have done anyway.
+fn agnosai_model_catalog_of(client): i64 {
+    var slot = _agnosai_model_slot(client);
+    var c = atomic_load(slot + AGN_MS_CATALOG);
+    if (c == 0 && atomic_load(slot + AGN_MS_READS) == 0) {
+        _agnosai_model_read(client, slot, 0);
+        c = atomic_load(slot + AGN_MS_CATALOG);
+    }
+    return c;
+}
+
+# Whether `client`'s gateway lists exactly `model`. 0 too with no catalog to ask.
+fn agnosai_model_catalog_listed(client, model: Str): i64 {
+    var c = agnosai_model_catalog_of(client);
+    if (c == 0) { return 0; }
+    if (agnosai_model_catalog_find(c, model) != 0) { return 1; }
+    return 0;
+}
+
+# Who owns `model` on `client`'s gateway, in hoosh's spelling, or 0. The Str lasts the process.
+fn agnosai_model_catalog_owner(client, model: Str): i64 {
+    var c = agnosai_model_catalog_of(client);
+    if (c == 0) { return 0; }
+    var e = agnosai_model_catalog_find(c, model);
+    if (e == 0) { return 0; }
+    return load64(e + AGN_ME_OWNED_BY);
+}
+
+# Why no model could be chosen, in `a`.
+#
+# ⚠ This text becomes a task's `output` and `error`, so it carries a status or a kind and never the
+# URL, as on the chat path. It starts `no model catalog: ` whatever the cause, as that is the name a
+# caller looks for, and it says what the operator can do about it.
+fn _agnosai_model_no_catalog_a(a, slot, tier): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "no model catalog: ");
+    _agnosai_model_add_why_a(a, sb, load64(slot + AGN_MS_LAST));
+    str_builder_add_cstr_a(a, sb, "; name a model on the agent, or set ");
+    str_builder_add_cstr_a(a, sb, agnosai_model_tier_env(tier));
+    return str_builder_build_a(a, sb);
+}
+
+# The entry `tier` means in `slot`'s catalog as it stands, or 0.
+fn _agnosai_model_slot_pick(slot, tier): i64 {
+    var c = atomic_load(slot + AGN_MS_CATALOG);
+    if (c == 0) { return 0; }
+    return agnosai_model_catalog_pick(c, tier);
+}
+
+# Choose the model for `tier`: the operator's word, else the catalog's. Returns 0 with the id through
+# `out_model`, or the reason there is none, in `a`.
+#
+# A selection with nothing to pick is the failure that reads again, so a gateway that was down for the
+# last crew is asked for this one. Allocates nothing on the way to an answer, and the id lasts the
+# process, so nothing that keeps it needs a copy.
+fn agnosai_model_for_tier_a(a, client, tier, out_model): i64 {
+    var chosen = agnosai_model_tier_override(tier);
+    if (chosen != 0) {
+        store64(out_model, chosen);
+        return 0;
+    }
+
+    var slot = _agnosai_model_slot(client);
+    # Counted before the catalog is looked at, so a read that lands between the two is not repeated.
+    var seen = atomic_load(slot + AGN_MS_READS);
+    var pick = _agnosai_model_slot_pick(slot, tier);
+    if (pick == 0) {
+        _agnosai_model_read(client, slot, seen);
+        pick = _agnosai_model_slot_pick(slot, tier);
+    }
+    if (pick == 0) { return _agnosai_model_no_catalog_a(a, slot, tier); }
+    store64(out_model, load64(pick + AGN_ME_ID));
+    return 0;
+}

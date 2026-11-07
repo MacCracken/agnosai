@@ -2,7 +2,7 @@
 # llm_live.smcyr — the M3 exit check: a live chat-completion round trip
 # through agnosai's own seam client.
 #
-# This is the one test that exercises `agnosai_hoosh_chat`, the single I/O call
+# This is the one test that exercises `agnosai_hoosh_chat`, the single chat I/O call
 # in src/llm/hoosh.cyr. Everything else about the seam is unit-tested offline in
 # tests/llm_hoosh.tcyr; this proves the target is real and that our request
 # shape is one the gateway actually accepts.
@@ -15,12 +15,14 @@
 # it does fail loudly if the gateway answers and the exchange is wrong, which is
 # the case that actually matters.
 #
-# Takes the model as argv[1]; with no argument it uses llm_router's Fast tier.
-# scripts/stack.sh passes $AGNOSAI_MODEL through.
+# Takes the model as argv[1]; with no argument it uses the gateway's Fast tier.
+# scripts/stack.sh passes $AGNOSAI_MODEL through, and with none the gateway's catalog says.
 # =========================================================================
 
 include "src/units.cyr"
+include "src/order.cyr"
 include "src/id.cyr"
+include "src/strcase.cyr"
 # The chat path opens GenAI spans (ADR 017) and posts from a pooled arena (2.1.6), so it
 # needs both, in `src/main.cyr`'s order. Without them this file stopped compiling and,
 # since `cyrius tests` does not run smoke checks, nothing noticed (roadmap B29, 2.1.7).
@@ -33,12 +35,33 @@ fn main() {
     alloc_init();
 
     args_init();
-    var model = agnosai_default_model(AGNOSAI_TIER_FAST);
+    var model = 0;
     if (argc() > 1) {
         var a1 = argv(1);
         if (a1 != 0) {
             if (strlen(a1) > 0) { model = str_from(a1); }
         }
+    }
+
+    # No model named: ask the gateway what its Fast tier means, through the path a crew takes.
+    if (model == 0) {
+        var client = agnosai_hoosh_client_new(agnosai_hoosh_default_url(), str_from(""));
+        var chosen: i64[1];
+        store64(&chosen, 0);
+        var why = agnosai_model_for_tier_a(default_alloc(), client, AGNOSAI_TIER_FAST, &chosen);
+        if (why != 0) {
+            # The same line as the chat call's below: no gateway is a SKIP, the rest a failure.
+            if (agnosai_str_contains_ci_cstr(why, "hoosh transport error") == 1) {
+                syscall(1, 1, "SKIP: ", 6);
+                str_println(why);
+                println("      start the gateway with: scripts/stack.sh up");
+                return 0;
+            }
+            syscall(1, 1, "FAIL: ", 6);
+            str_println(why);
+            return 1;
+        }
+        model = load64(&chosen);
     }
 
     var req = agnosai_inference_request_new(model);

@@ -3,8 +3,9 @@
 #
 # Origin: rust-old/src/fleet/cost_planning.rs
 #
-# GPU pricing tables, crew cost estimation, and budget-aware model selection,
-# so callers can plan crew executions within a dollar budget.
+# GPU pricing tables and crew cost estimation, so callers can plan a self-hosted
+# crew's execution within a dollar budget. Which model a crew runs and what a
+# provider charges for it are the gateway's to say (`src/model_catalog.cyr`).
 #
 # Every price, throughput and cost here is an f64 carried as its IEEE-754 bit
 # pattern in an i64 — compare with f64_lt / f64_gt / f64_eq / f64_le, never
@@ -39,19 +40,6 @@ enum AgnosaiCostTier {
     AGNOSAI_COST_TIER_UNKNOWN = 4;
 }
 
-# The oracle's `BUDGET_MODELS` const slice, cheapest-intent order preserved.
-# Hoisted to process-lifetime globals rather than built per call: the selection
-# loop reaches every one of them, and a `str_from` inside a loop body costs 16
-# bytes on the no-free global bump per iteration (roadmap B3).
-var AGN_CP_M_LLAMA_7B = str_from("llama-7b");
-var AGN_CP_M_MISTRAL_7B = str_from("mistral-7b");
-var AGN_CP_M_GPT_35_TURBO = str_from("gpt-3.5-turbo");
-var AGN_CP_M_LLAMA_70B = str_from("llama-70b");
-var AGN_CP_M_MIXTRAL_8X7B = str_from("mixtral-8x7b");
-var AGN_CP_M_CLAUDE_3_SONNET = str_from("claude-3-sonnet");
-var AGN_CP_M_GPT_4 = str_from("gpt-4");
-var AGN_CP_M_CLAUDE_3_OPUS = str_from("claude-3-opus");
-
 # The tier labels the oracle's tuple carries. Every caller binds them to `_tier`
 # and discards them, so nothing in `src/` reads these — they exist because the
 # oracle's shape has them, and a later consumer would expect the same spellings.
@@ -60,9 +48,6 @@ var AGN_CP_T_MEDIUM = str_from("medium");
 var AGN_CP_T_OPEN_LARGE = str_from("open-large");
 var AGN_CP_T_OPEN_SMALL = str_from("open-small");
 var AGN_CP_T_UNKNOWN = str_from("unknown");
-
-# Number of entries in the budget-selection table above.
-var AGN_CP_BUDGET_MODEL_COUNT = 8;
 
 # --- GpuPricing --------------------------------------------------------
 
@@ -235,72 +220,4 @@ fn agnosai_estimate_crew_cost(tasks, avg_tokens_per_task, model, pricing): i64 {
     var hours = f64_div(seconds, f64_from(3600));
     sakshi_debug("crew cost estimate", 18);
     return f64_mul(hours, hourly);
-}
-
-# --- budget-aware selection ---------------------------------------------
-
-# The i-th entry of the oracle's `BUDGET_MODELS`.
-fn _agnosai_budget_model(i): i64 {
-    if (i == 0) { return AGN_CP_M_LLAMA_7B; }
-    if (i == 1) { return AGN_CP_M_MISTRAL_7B; }
-    if (i == 2) { return AGN_CP_M_GPT_35_TURBO; }
-    if (i == 3) { return AGN_CP_M_LLAMA_70B; }
-    if (i == 4) { return AGN_CP_M_MIXTRAL_8X7B; }
-    if (i == 5) { return AGN_CP_M_CLAUDE_3_SONNET; }
-    if (i == 6) { return AGN_CP_M_GPT_4; }
-    return AGN_CP_M_CLAUDE_3_OPUS;
-}
-
-# (model, cost) candidate pair — 16 bytes.
-enum AgnosaiCostPairOff {
-    AGN_CPAIR_MODEL = 0;
-    AGN_CPAIR_COST = 8;
-    AGN_CPAIR_SIZE = 16;
-}
-
-# Ascending comparator over candidate cost, reproducing the oracle's
-# `a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)`: a NaN on either side makes
-# both f64_lt and f64_gt answer 0, which falls through to Equal exactly as the
-# `unwrap_or` does.
-fn _agnosai_cmp_cost_asc(x, y): i64 {
-    var ca = load64(x + AGN_CPAIR_COST);
-    var cb = load64(y + AGN_CPAIR_COST);
-    if (f64_lt(ca, cb) == 1) { return 0 - 1; }
-    if (f64_gt(ca, cb) == 1) { return 1; }
-    return 0;
-}
-
-# Select the cheapest model whose estimated cost fits `budget_usd`, or 0 for the
-# oracle's `None`.
-#
-# The tie between "llama-7b" and "mistral-7b" is REACHABLE and its resolution is
-# observable: both classify open-small, so both cost identically and the sort
-# order decides which is returned. Rust's `sort_by` is stable, and `vec_sort_by`
-# is introsort whose `while (h - l > 16)` guard is never entered at 8 elements —
-# it runs pure insertion sort, which is also stable. Both therefore return
-# "llama-7b", the earlier entry. A table that ever grows past 17 entries loses
-# that guarantee and needs a stable sort here.
-fn agnosai_select_cheapest_model(budget_usd, tasks, avg_tokens_per_task, pricing): i64 {
-    var v = vec_new();
-    var i = 0;
-    while (i < AGN_CP_BUDGET_MODEL_COUNT) {
-        var m = _agnosai_budget_model(i);
-        var pair = alloc(AGN_CPAIR_SIZE);
-        store64(pair + AGN_CPAIR_MODEL, m);
-        store64(pair + AGN_CPAIR_COST, agnosai_estimate_crew_cost(tasks, avg_tokens_per_task, m, pricing));
-        vec_push(v, pair);
-        i = i + 1;
-    }
-    agnosai_sort(v, &_agnosai_cmp_cost_asc);
-    i = 0;
-    while (i < vec_len(v)) {
-        var e = vec_get(v, i);
-        if (f64_le(load64(e + AGN_CPAIR_COST), budget_usd) == 1) {
-            sakshi_info("selected cheapest model within budget", 37);
-            return load64(e + AGN_CPAIR_MODEL);
-        }
-        i = i + 1;
-    }
-    sakshi_warn("no model fits within budget", 27);
-    return 0;
 }

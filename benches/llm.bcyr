@@ -11,8 +11,8 @@
 # is added because it is new in this milestone and because the priority queue is
 # the one llm path with a lock on it.
 #
-# ⚠ **`route` and `default_model` are branch ladders over small enums**, so a
-# single call is a handful of compares and lands under timer resolution. Each is
+# ⚠ **`route` and `model_for_tier` are a few compares and loads each**, so a
+# single call lands under timer resolution. Each is
 # therefore batched over many iterations and reported per-op, exactly as
 # `core.bcyr`'s uuid shapes are. The oracle gets the same effect from
 # criterion's own sampling.
@@ -39,6 +39,7 @@ include "src/llm/router.cyr"
 # The chat transport takes its per-call arena from a pool (2.1.6).
 include "src/arena_pool.cyr"
 include "src/llm/hoosh.cyr"
+include "src/model_catalog.cyr"
 include "src/llm/inference_queue.cyr"
 
 # All 21 (task_type, complexity) profiles, built once so the loop measures the
@@ -131,18 +132,93 @@ fn _b_route_premium(): i64 {
     return 0;
 }
 
-# The oracle's three `default_model` shapes.
-#
-# ⚠ Each returns a Str built with `str_from` over a literal, so this measures
-# the ladder AND one Str header allocation per call — which is the honest cost
-# at the call site, and worth knowing precisely because it is not free the way
-# the Rust `&'static str` was.
-fn _b_default_model(tier, name): i64 {
+# A 200-model list, the size of a gateway with several live routes, in hoosh's shape.
+fn _b_catalog_body(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"object\":\"list\",\"data\":[");
+    for (var i = 0; i < 200; i = i + 1) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        str_builder_add_cstr(sb, "{\"id\":\"model-");
+        str_builder_add_int(sb, i);
+        str_builder_add_cstr(sb, "\",\"object\":\"model\",\"owned_by\":\"anthropic\",\"source\":\"live\",");
+        str_builder_add_cstr(sb, "\"routes\":[\"https://api.anthropic.com\"],\"context_window\":1000000,");
+        str_builder_add_cstr(sb, "\"capabilities\":{\"vision\":true,\"thinking\":[\"adaptive\"],");
+        str_builder_add_cstr(sb, "\"effort\":[\"low\",\"medium\",\"high\"]},\"pricing\":{");
+        str_builder_add_cstr(sb, "\"input_micro_usd_per_1k\":");
+        str_builder_add_int(sb, 100 + i * 10);
+        str_builder_add_cstr(sb, ",\"output_micro_usd_per_1k\":");
+        str_builder_add_int(sb, 500 + i * 50);
+        str_builder_add_cstr(sb, "}}");
+    }
+    str_builder_add_cstr(sb, "]}");
+    return str_builder_build(sb);
+}
+
+var _B_CATALOG_BODY = 0;
+
+fn _b_catalog_get(client, a, path: Str, out_body): i64 {
+    store64(out_body, _B_CATALOG_BODY);
+    return 200;
+}
+
+# The gateway every catalog row reads, already read.
+var _B_CATALOG_CLIENT = 0;
+
+fn _b_catalog_client(): i64 {
+    if (_B_CATALOG_CLIENT == 0) {
+        _B_CATALOG_BODY = _b_catalog_body();
+        _B_CATALOG_CLIENT = agnosai_hoosh_client_with_get(agnosai_hoosh_client_new(
+            str_from("http://bench-gw"), str_from("")), &_b_catalog_get);
+        agnosai_model_catalog_of(_B_CATALOG_CLIENT);
+    }
+    return _B_CATALOG_CLIENT;
+}
+
+# What every task with no `llm_model` pays once a catalog is held: a walk to its gateway's slot, one
+# atomic load and an array read, and no allocation at all.
+fn _b_model_for_tier(tier, name): i64 {
     var n = 1000000;
+    var client = _b_catalog_client();
+    var out: i64[1];
+    var a = default_alloc();
     var b = bench_new(name);
     for (var _r = 0; _r < _BR; _r = _r + 1) {
         bench_batch_start(b);
-        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_default_model(tier); }
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_model_for_tier_a(a, client, tier, &out); }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# A read of a list that changed: the parse, a copy of every entry, and the three picks. Rare, and
+# worth having a number for because a task waits on it.
+fn _b_catalog_parse(): i64 {
+    var n = 200;
+    var body = _b_catalog_body();
+    var ar = arena_allocator_growable(1048576);
+    var b = bench_new("model_catalog_parse_200");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_model_catalog_parse_a(ar, body);
+            reset_via(ar);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# A lookup by id, for attribution and for a prefixed `llm_model`: the worst case, the last entry.
+fn _b_catalog_owner(): i64 {
+    var n = 200000;
+    var client = _b_catalog_client();
+    var model = str_from("model-199");
+    var b = bench_new("model_catalog_owner_200_last");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_model_catalog_owner(client, model); }
         bench_batch_stop(b, n / _BR);
     }
     bench_report(b);
@@ -275,9 +351,11 @@ fn main(): i64 {
     _b_route_fast();
     _b_route_premium();
 
-    _b_default_model(AGNOSAI_TIER_FAST, "default_model_fast");
-    _b_default_model(AGNOSAI_TIER_CAPABLE, "default_model_capable");
-    _b_default_model(AGNOSAI_TIER_PREMIUM, "default_model_premium");
+    _b_model_for_tier(AGNOSAI_TIER_FAST, "model_for_tier_fast");
+    _b_model_for_tier(AGNOSAI_TIER_CAPABLE, "model_for_tier_capable");
+    _b_model_for_tier(AGNOSAI_TIER_PREMIUM, "model_for_tier_premium");
+    _b_catalog_parse();
+    _b_catalog_owner();
 
     _b_parse_complexity("low", "parse_complexity_low");
     _b_parse_complexity("simple", "parse_complexity_simple");

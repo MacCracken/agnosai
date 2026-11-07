@@ -39,7 +39,7 @@ unconditionally:
 agnosai
   ├── core           (foundation types — agents, tasks, crews, errors)
   ├── orchestrator   (scheduling, scoring, pub/sub, crew runner)
-  ├── llm            (hoosh re-exports, task-complexity routing)
+  ├── llm            (hoosh seam, task-complexity routing, model catalog)
   ├── fleet          (registry, placement, GPU, state, relay, discovery,
   │                   coordinator, federation, topology, cost, environment)
   │                                                        [feature: fleet]
@@ -76,6 +76,8 @@ CrewRunner::new(spec)
     │   ├── score_agent() → rank agents by suitability (5-factor weighted)
     │   ├── pick_best_agent() → assign highest-scoring agent
     │   └── execute_task() → LLM inference via hoosh + response caching
+    │       ├── model (ADR 030): the agent's own, else the operator's for its
+    │       │   tier, else the tier's in hoosh's catalog, else the task fails
     │       └── tool loop (ADR 029): while the model asks for the tools its agent
     │           was granted: prepare → approve the set → journal → run → deliver
     │
@@ -144,10 +146,14 @@ Agent definitions are JSON/YAML — same format as Agnostic v1 presets:
   "goal": "Ensure comprehensive test coverage",
   "domain": "quality",
   "tools": ["code_analysis", "test_generation"],
-  "complexity": "high",
-  "llm_model": "capable"
+  "complexity": "high"
 }
 ```
+
+`llm_model` is optional, and is an id as hoosh lists it. With none, `complexity` picks a tier and
+hoosh's catalog says what that tier means
+([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)). `capable` is not a model: hoosh
+has no tier aliases, and the word would be sent as it stands.
 
 ## Binary Distribution
 

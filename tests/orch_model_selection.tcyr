@@ -1,0 +1,631 @@
+# =========================================================================
+# orch_model_selection.tcyr — a task's model, from the agent to the wire (ADR 030).
+#
+# `llm_model_catalog.tcyr` pins what the catalog says. This pins what a crew does with it: which id
+# reaches the gateway, whose name goes on the result, a crew that has no model to send, and a
+# selection the gateway refuses. No oracle tests: the Rust line sent names it carried.
+#
+# Each test has a gateway of its own, as a catalog is held for the life of the process.
+# =========================================================================
+
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/core/agent.cyr"
+include "src/core/crew.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/router.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/output_validation.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/server/prometheus.cyr"
+include "src/arena_pool.cyr"
+include "src/sandbox/policy.cyr"
+include "src/sandbox/kavach_bridge.cyr"
+include "src/server/ssrf.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
+include "src/tool_loop.cyr"
+include "src/model_catalog.cyr"
+include "src/orchestrator/crew_runner.cyr"
+include "tests/test_helpers.cyr"
+
+# --- a gateway on two pointers --------------------------------------------
+
+var _t_gets = 0;
+var _t_status = 200;
+var _t_list = 0;
+var _t_gw_n = 0;
+
+fn _t_get(client, a, path: Str, out_body): i64 {
+    _t_gets = _t_gets + 1;
+    if (_t_status >= 200 && _t_status < 300) { store64(out_body, _t_list); }
+    return _t_status;
+}
+
+# What each chat call was asked for, and how each one goes: an error cstring, or 0 to answer. Past
+# the end of the script a call answers.
+var _t_models = 0;
+var _t_requests = 0;
+var _t_script = 0;
+var _t_answers = 0;
+var _t_at = 0;
+
+# The body the next answer uses, a Str, or 0 for one naming the model it was asked for.
+var _t_body = 0;
+
+fn _t_answer_for(model: Str, provider, content): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"model\":\"");
+    str_builder_add(sb, model);
+    str_builder_add_cstr(sb, "\",\"choices\":[{\"message\":{\"content\":\"");
+    str_builder_add_cstr(sb, content);
+    str_builder_add_cstr(sb, "\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1");
+    if (provider != 0) {
+        str_builder_add_cstr(sb, ",\"provider\":\"");
+        str_builder_add_cstr(sb, provider);
+        str_builder_add_cstr(sb, "\"");
+    }
+    str_builder_add_cstr(sb, "}}");
+    return str_builder_build(sb);
+}
+
+fn _t_chat(client, request, out_response, parent_sc): i64 {
+    var model = agnosai_inference_request_model(request);
+    vec_push(_t_models, str_clone(model));
+    vec_push(_t_requests, agnosai_inference_request_to_json(request));
+    var at = _t_at;
+    _t_at = _t_at + 1;
+    if (at < vec_len(_t_script)) {
+        if (vec_get(_t_script, at) != 0) { return str_from(vec_get(_t_script, at)); }
+    }
+    var body = 0;
+    if (at < vec_len(_t_answers)) { body = vec_get(_t_answers, at); }
+    if (body == 0) { body = _t_body; }
+    if (body == 0) { body = _t_answer_for(model, "p", "done"); }
+    store64(out_response, agnosai_hoosh_response_from_body_a(agnosai_inference_request_alloc(request),
+        body));
+    return 0;
+}
+
+# A fresh client on a gateway nothing has read, listing `list`.
+fn _t_gw(status, list: Str): i64 {
+    _t_gw_n = _t_gw_n + 1;
+    _t_gets = 0;
+    _t_status = status;
+    _t_list = list;
+    _t_models = vec_new();
+    _t_requests = vec_new();
+    _t_script = vec_new();
+    _t_answers = vec_new();
+    _t_at = 0;
+    _t_body = 0;
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "http://gw-");
+    str_builder_add_int(sb, _t_gw_n);
+    return agnosai_hoosh_client_with_get(agnosai_hoosh_client_with_chat(
+        agnosai_hoosh_client_new(str_builder_build(sb), str_from("")), &_t_chat), &_t_get);
+}
+
+# Have chat call `i` of the script fail with `err`, a cstring, or answer with 0.
+fn _t_then(err): i64 {
+    vec_push(_t_script, err);
+    return 0;
+}
+
+# A list of `id:owner:input:output` elements. A price of 0 and 0 is what a local model gets.
+fn _t_entry(sb, id, owner, input, output): i64 {
+    if (str_len(str_builder_build(sb)) > 0) { str_builder_add_cstr(sb, ","); }
+    str_builder_add_cstr(sb, "{\"id\":\"");
+    str_builder_add_cstr(sb, id);
+    str_builder_add_cstr(sb, "\",\"object\":\"model\",\"owned_by\":\"");
+    str_builder_add_cstr(sb, owner);
+    str_builder_add_cstr(sb, "\",\"source\":\"live\",\"pricing\":{\"input_micro_usd_per_1k\":");
+    str_builder_add_int(sb, input);
+    str_builder_add_cstr(sb, ",\"output_micro_usd_per_1k\":");
+    str_builder_add_int(sb, output);
+    str_builder_add_cstr(sb, "}}");
+    return 0;
+}
+
+fn _t_wrap(sb): i64 {
+    var out = str_builder_new();
+    str_builder_add_cstr(out, "{\"object\":\"list\",\"data\":[");
+    str_builder_add(out, str_builder_build(sb));
+    str_builder_add_cstr(out, "]}");
+    return str_builder_build(out);
+}
+
+# Three tiers, and the ids the attribution tests need, priced at Capable's rate so that they add no
+# rung to the ladder.
+fn _t_lineup(): i64 {
+    var sb = str_builder_new();
+    _t_entry(sb, "tier-fast", "anthropic", 100, 500);
+    _t_entry(sb, "tier-capable", "anthropic", 2000, 10000);
+    _t_entry(sb, "tier-premium", "anthropic", 10000, 50000);
+    _t_entry(sb, "o4-mini", "openai", 2000, 10000);
+    _t_entry(sb, "openai/gpt-oss-120b", "groq", 2000, 10000);
+    _t_entry(sb, "qwen/qwen3.8-27b", "groq", 2000, 10000);
+    _t_entry(sb, "anthropic/claude-sonnet-5-5", "openrouter", 2000, 10000);
+    return _t_wrap(sb);
+}
+
+fn _t_agent(complexity): i64 {
+    var a = agnosai_agent_new(str_from("worker"), str_from("tester"), str_from("test things"));
+    if (complexity != 0) { agnosai_agent_with_complexity(a, str_from(complexity)); }
+    return a;
+}
+
+fn _t_named(model): i64 {
+    var a = _t_agent(0);
+    agnosai_agent_with_llm_model(a, str_from(model));
+    return a;
+}
+
+fn _t_task(): i64 {
+    return agnosai_task_new(str_from("do it"));
+}
+
+# Assert the id selection gives `agent` on `client`.
+fn _t_selects(client, agent, want, name): i64 {
+    var out: i64[1];
+    store64(&out, 0);
+    var err = _agnosai_crew_select_model(client, agent, &out);
+    if (err != 0) { return assert(0, name); }
+    return assert(str_eq(load64(&out), str_from(want)) == 1, name);
+}
+
+# Assert the model chat call `i` was asked for.
+fn _t_sent(i, want, name): i64 {
+    if (i >= vec_len(_t_models)) { return assert(0, name); }
+    return assert(str_eq(vec_get(_t_models, i), str_from(want)) == 1, name);
+}
+
+# A string in a result's metadata, or 0.
+fn _t_meta(r, key): i64 {
+    var v = map_get(agnosai_task_result_metadata(r), str_from(key));
+    if (v == 0) { return 0; }
+    return bayan_json_v_str(v);
+}
+
+fn _t_meta_is(r, key, want, name): i64 {
+    var v = _t_meta(r, key);
+    if (v == 0) { return assert(0, name); }
+    return assert(str_eq(v, str_from(want)) == 1, name);
+}
+
+fn test_tiers(): i64 {
+    var c = _t_gw(200, _t_lineup());
+    _t_selects(c, 0, "tier-capable", "no agent is the Capable tier");
+    _t_selects(c, _t_agent(0), "tier-capable", "an agent with no complexity set too");
+    _t_selects(c, _t_agent("medium"), "tier-capable", "medium routes to Capable");
+    _t_selects(c, _t_agent("low"), "tier-capable",
+      "low routes to CAPABLE, not Fast: Simple + Reason never reaches the fast tier, so a direct \
+    complexity-to-tier table would answer tier-fast here and pass every other assertion");
+    _t_selects(c, _t_agent("simple"), "tier-capable", "as does simple");
+    _t_selects(c, _t_agent("high"), "tier-premium", "high routes to Premium");
+    _t_selects(c, _t_agent("complex"), "tier-premium", "and complex");
+    _t_selects(c, _t_agent("CoMpLeX"), "tier-premium", "in any case");
+    _t_selects(c, _t_agent(""), "tier-capable", "an empty complexity is Medium");
+    _t_selects(c, _t_agent("lowe"), "tier-capable", "as is a near-miss");
+    assert_eq(_t_gets, 1, "and a whole crew's worth of selections costs one read");
+
+    # --- all the way out ---
+    var run = _t_gw(200, _t_lineup());
+    var r = agnosai_execute_task(_t_task(), _t_agent("high"), run, 0);
+    assert_eq(agnosai_task_result_status(r), AGNOSAI_STATUS_COMPLETED, "a routed task runs");
+    _t_sent(0, "tier-premium", "and asks for what its tier means");
+    assert(str_index_of_cstr(vec_get(_t_requests, 0), "\"model\":\"tier-premium\"") >= 0,
+      "on the wire");
+
+    # --- an id from the catalog outlives the crew that chose it ---
+    var ar = arena_allocator_growable(65536);
+    var keep = _t_gw(200, _t_lineup());
+    var out: i64[1];
+    store64(&out, 0);
+    assert_eq(_agnosai_crew_select_model_a(ar, keep, 0, &out), 0, "chosen in a crew's arena");
+    reset_via(ar);
+    memset(alloc_via(ar, 4096), 65, 4096);
+    assert(str_eq(load64(&out), str_from("tier-capable")) == 1, "and untouched when it goes");
+
+    # --- a selection costs a task nothing it would keep ---
+    var quiet = _t_gw(200, _t_lineup());
+    _t_selects(quiet, 0, "tier-capable", "read");
+    var before = alloc_used();
+    for (var i = 0; i < 1000; i = i + 1) {
+        store64(&out, 0);
+        agnosai_model_for_tier_a(default_alloc(), quiet, AGNOSAI_TIER_PREMIUM, &out);
+    }
+    assert_eq(alloc_used() - before, 0, "a tier's id is found, not built");
+    return 0;
+}
+
+fn test_named(): i64 {
+    # --- a listed id goes out exactly as listed ---
+    var g = _t_gw(200, _t_lineup());
+    var r = agnosai_execute_task(_t_task(), _t_named("openai/gpt-oss-120b"), g, 0);
+    assert_eq(agnosai_task_result_status(r), AGNOSAI_STATUS_COMPLETED, "a task naming a listed id runs");
+    _t_sent(0, "openai/gpt-oss-120b",
+      "and keeps its prefix: Groq serves this name, and the strip would send one nobody does");
+    assert(str_index_of_cstr(vec_get(_t_requests, 0), "\"model\":\"openai/gpt-oss-120b\"") >= 0,
+      "on the wire");
+    _t_selects(g, _t_named("anthropic/claude-sonnet-5-5"), "anthropic/claude-sonnet-5-5",
+      "an OpenRouter id, the same");
+
+    # --- what is not listed gets what it always got ---
+    _t_selects(g, _t_named("openai/gpt-4o"), "gpt-4o", "an unlisted litellm id is stripped");
+    _t_selects(g, _t_named("ollama/llama3.2:1b"), "llama3.2:1b", "for every segment on the list");
+    _t_selects(g, _t_named("ollama/openai/gpt-4o"), "openai/gpt-4o", "and only one level");
+    _t_selects(g, _t_named("google/gemini-pro"), "google/gemini-pro", "a segment off it stays");
+    _t_selects(g, _t_named("gpt-4o"), "gpt-4o", "as does a bare id");
+
+    # --- only the catalog can tell the two apart, so only a prefixed id asks ---
+    var plain = _t_gw(503, 0);
+    _t_selects(plain, _t_named("gpt-4o"), "gpt-4o", "a bare id needs no catalog");
+    _t_selects(plain, _t_named("google/gemini-pro"), "google/gemini-pro", "nor one the strip leaves");
+    assert_eq(_t_gets, 0, "so neither reads");
+    _t_selects(plain, _t_named("openai/gpt-oss-120b"), "gpt-oss-120b",
+      "with no catalog a prefixed id gets the strip: it cannot be told apart");
+    assert_eq(_t_gets, 1, "having asked");
+    _t_selects(plain, _t_named("openai/gpt-oss-120b"), "gpt-oss-120b", "and it does not keep asking");
+    assert_eq(_t_gets, 1, "for every task of every crew");
+
+    # --- the agent's own model never needs a catalog to run ---
+    var down = _t_gw(503, 0);
+    var ok = agnosai_execute_task(_t_task(), _t_named("gpt-4o"), down, 0);
+    assert_eq(agnosai_task_result_status(ok), AGNOSAI_STATUS_COMPLETED,
+      "an agent naming its model runs on a gateway with no catalog");
+    _t_sent(0, "gpt-4o", "as named");
+
+    # --- `""` is still the agent's word ---
+    _t_selects(_t_gw(200, _t_lineup()), _t_named(""), "",
+      "an llm_model of \"\" is \"\", NOT the tier's: the presence test is `!= 0`");
+
+    # --- the bare strip is as it was ---
+    assert(str_eq(_agnosai_crew_strip_provider_prefix(str_from("openai/gpt-4o")),
+        str_from("gpt-4o")) == 1, "the strip itself still strips");
+    return 0;
+}
+
+fn test_attribution(): i64 {
+    # --- the families the prefix needles billed to Ollama ---
+    var g = _t_gw(200, _t_lineup());
+    _t_body = _t_answer_for(str_from("o4-mini"), 0, "done");
+    _t_meta_is(agnosai_execute_task(_t_task(), _t_named("o4-mini"), g, 0), "provider", "openai",
+      "o4-mini is OpenAI's by its entry, where no prefix matched it and it billed to Ollama");
+    _t_body = _t_answer_for(str_from("openai/gpt-oss-120b"), 0, "done");
+    _t_meta_is(agnosai_execute_task(_t_task(), _t_named("openai/gpt-oss-120b"), g, 0), "provider",
+      "groq", "a gpt-oss id is Groq's, whatever its name starts with");
+    _t_body = _t_answer_for(str_from("qwen/qwen3.8-27b"), 0, "done");
+    _t_meta_is(agnosai_execute_task(_t_task(), _t_named("qwen/qwen3.8-27b"), g, 0), "provider",
+      "groq", "and qwen/ too");
+
+    # --- a provider answers with the dated form of an alias ---
+    _t_body = _t_answer_for(str_from("o4-mini-20260101"), 0, "done");
+    _t_meta_is(agnosai_execute_task(_t_task(), _t_named("o4-mini"), g, 0), "provider", "openai",
+      "an answer the catalog does not list falls back to the id asked for");
+
+    # --- the gateway's word beats the catalog's ---
+    var said = _t_gw(200, _t_lineup());
+    _t_body = _t_answer_for(str_from("o4-mini"), "ollama", "done");
+    _t_meta_is(agnosai_execute_task(_t_task(), _t_named("o4-mini"), said, 0), "provider", "ollama",
+      "usage.provider is the serving route, which a DLP re-route makes differ from owned_by");
+    assert_eq(_t_gets, 0, "and with it the catalog is not read at all");
+
+    # --- nobody knows: the key is omitted, not guessed ---
+    var unknown = _t_gw(200, _t_lineup());
+    _t_body = _t_answer_for(str_from("not-listed"), 0, "done");
+    var r = agnosai_execute_task(_t_task(), _t_named("not-listed"), unknown, 0);
+    assert_eq(agnosai_task_result_status(r), AGNOSAI_STATUS_COMPLETED, "an id nobody lists still runs");
+    assert_eq(_t_meta(r, "provider"), 0,
+      "and names no provider, rather than the Ollama it used to fall through to");
+    assert(_t_meta(r, "model") != 0, "with the rest of its metadata");
+
+    var nocat = _t_gw(503, 0);
+    _t_body = _t_answer_for(str_from("gpt-4o"), 0, "done");
+    assert_eq(_t_meta(agnosai_execute_task(_t_task(), _t_named("gpt-4o"), nocat, 0), "provider"), 0,
+      "as with no catalog at all");
+    agnosai_execute_task(_t_task(), _t_named("gpt-4o"), nocat, 0);
+    assert_eq(_t_gets, 1, "which a second answer does not read for again");
+
+    # --- a result in an arena is attributed like any other ---
+    var ar = arena_allocator_growable(65536);
+    var ag = _t_gw(200, _t_lineup());
+    _t_body = _t_answer_for(str_from("o4-mini"), 0, "done");
+    var ar_r = agnosai_execute_task_in_crew_a(ar, agnosai_task_new_a(ar, str_from_a(ar, "go")),
+      _t_named("o4-mini"), ag, 0, 0, 0);
+    _t_meta_is(ar_r, "provider", "openai", "attributed in an arena");
+    return 0;
+}
+
+fn test_no_catalog(): i64 {
+    # --- a task with nothing to send does not send ---
+    var g = _t_gw(503, 0);
+    var r = agnosai_execute_task(_t_task(), _t_agent(0), g, 0);
+    assert_eq(agnosai_task_result_status(r), AGNOSAI_STATUS_FAILED, "no catalog fails the task");
+    assert_eq(vec_len(_t_models), 0, "before any request: a guessed id is what this replaced");
+    _t_meta_is(r, "error",
+      "no model catalog: hoosh returned HTTP 503; name a model on the agent, or set AGNOSAI_MODEL_CAPABLE",
+      "by name, with what to do about it");
+    assert(str_eq(agnosai_task_result_output(r), str_from(
+          "LLM error: no model catalog: hoosh returned HTTP 503; name a model on the agent, or set AGNOSAI_MODEL_CAPABLE")) == 1, #skip-lint
+      "and the output is any failed task's");
+
+    var hi = _t_gw(0 - SANDHI_ERR_CONNECT, 0);
+    var hr = agnosai_execute_task(_t_task(), _t_agent("high"), hi, 0);
+    _t_meta_is(hr, "error",
+      "no model catalog: hoosh transport error: CONNECT; name a model on the agent, or set AGNOSAI_MODEL_PREMIUM",
+      "it names the variable of the tier that wanted a model");
+
+    # --- a crew ends failed ---
+    var spec = agnosai_crew_new(str_from("no-catalog"));
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_from("one")));
+    vec_push(tasks, agnosai_task_new(str_from("two")));
+    agnosai_crew_with_tasks(spec, tasks);
+    var client = _t_gw(503, 0);
+    var runner = agnosai_crew_runner_with_llm(agnosai_crew_runner_new(spec), client);
+    var err: i64[1];
+    store64(&err, 0);
+    var state = agnosai_crew_runner_run(runner, &err);
+    assert(state != 0, "the crew runs to an end");
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_FAILED, "and that end is failed");
+    assert_eq(vec_len(_t_models), 0, "having sent nothing");
+
+    # --- no client is the placeholder, not a failure ---
+    var ph = agnosai_execute_task(_t_task(), _t_agent(0), 0, 0);
+    assert_eq(agnosai_task_result_status(ph), AGNOSAI_STATUS_COMPLETED, "no LLM configured is no error");
+
+    # --- the override is the way out ---
+    var way = _t_gw(503, 0);
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("operators-own"));
+    var ok = agnosai_execute_task(_t_task(), _t_agent(0), way, 0);
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, 0);
+    assert_eq(agnosai_task_result_status(ok), AGNOSAI_STATUS_COMPLETED, "an override runs without one");
+    _t_sent(0, "operators-own", "and is what is sent");
+    assert_eq(_t_gets, 0, "with no read");
+
+    # --- and a gateway that comes back serves the next crew ---
+    var back = _t_gw(503, 0);
+    agnosai_execute_task(_t_task(), _t_agent(0), back, 0);
+    _t_status = 200;
+    _t_list = _t_lineup();
+    var later = agnosai_execute_task(_t_task(), _t_agent(0), back, 0);
+    assert_eq(agnosai_task_result_status(later), AGNOSAI_STATUS_COMPLETED, "with no restart");
+    return 0;
+}
+
+# A one-entry list, for a catalog that has moved on.
+fn _t_only(id): i64 {
+    var sb = str_builder_new();
+    _t_entry(sb, id, "anthropic", 100, 500);
+    return _t_wrap(sb);
+}
+
+fn test_reselect(): i64 {
+    # --- no route for it any more ---
+    var g = _t_gw(200, _t_only("retired"));
+    _t_selects(g, 0, "retired", "a catalog holding an id");
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    _t_list = _t_only("current");
+    var r = agnosai_execute_task(_t_task(), 0, g, 0);
+    assert_eq(agnosai_task_result_status(r), AGNOSAI_STATUS_COMPLETED,
+      "a refused id reads the catalog again and the task is answered");
+    _t_sent(0, "retired", "having tried what it held");
+    _t_sent(1, "current", "then what is there now");
+    assert_eq(vec_len(_t_models), 2, "two calls");
+    assert_eq(_t_gets, 2, "and one re-read");
+    _t_selects(g, 0, "current", "and the next task starts from there");
+    assert_eq(_t_gets, 2, "with no more reads");
+
+    # --- a provider's 404, which reaches us as a 502 ---
+    var up = _t_gw(200, _t_only("retired"));
+    _t_selects(up, 0, "retired", "the catalog again");
+    for (var i = 0; i < 4; i = i + 1) {
+        _t_then("hoosh returned HTTP 502: upstream provider returned HTTP 404: model: retired");
+    }
+    _t_list = _t_only("current");
+    var ur = agnosai_execute_task(_t_task(), 0, up, 0);
+    assert_eq(agnosai_task_result_status(ur), AGNOSAI_STATUS_COMPLETED,
+      "the case a stale catalog actually hits: the id routes, and the provider refuses it");
+    _t_sent(4, "current", "after the retries a 502 gets");
+
+    # --- anything else is not about the id ---
+    var other = _t_gw(200, _t_only("fine"));
+    _t_selects(other, 0, "fine", "held");
+    _t_then("invalid API key");
+    _t_list = _t_only("current");
+    var or_r = agnosai_execute_task(_t_task(), 0, other, 0);
+    assert_eq(agnosai_task_result_status(or_r), AGNOSAI_STATUS_FAILED, "another failure stands");
+    assert_eq(_t_gets, 1, "and reads nothing");
+    assert_eq(vec_len(_t_models), 1, "and asks once");
+
+    # --- the same id coming back is the true failure ---
+    var same = _t_gw(200, _t_only("stuck"));
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    var sr = agnosai_execute_task(_t_task(), 0, same, 0);
+    assert_eq(agnosai_task_result_status(sr), AGNOSAI_STATUS_FAILED, "a list with no better answer");
+    _t_meta_is(sr, "error", "hoosh returned HTTP 404: no provider for model",
+      "fails with what the gateway said");
+    assert_eq(vec_len(_t_models), 1, "and does not repeat it");
+    assert_eq(_t_gets, 2, "having looked");
+
+    # --- nor does a failed re-read cost the task its reason ---
+    var gone = _t_gw(200, _t_only("stuck"));
+    _t_selects(gone, 0, "stuck", "held");
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    _t_status = 503;
+    _t_meta_is(agnosai_execute_task(_t_task(), 0, gone, 0), "error",
+      "hoosh returned HTTP 404: no provider for model", "the gateway's own word still stands");
+
+    # --- one re-selection, not a loop ---
+    var once = _t_gw(200, _t_only("first"));
+    _t_selects(once, 0, "first", "held");
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    _t_list = _t_only("second");
+    var nr = agnosai_execute_task(_t_task(), 0, once, 0);
+    assert_eq(agnosai_task_result_status(nr), AGNOSAI_STATUS_FAILED, "the new id refused too");
+    assert_eq(vec_len(_t_models), 2, "ends there");
+
+    # --- what the agent or the operator named is theirs ---
+    var own = _t_gw(200, _t_lineup());
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    var ow = agnosai_execute_task(_t_task(), _t_named("typo"), own, 0);
+    assert_eq(agnosai_task_result_status(ow), AGNOSAI_STATUS_FAILED, "an agent's own id fails");
+    assert_eq(vec_len(_t_models), 1, "and is not swapped for a tier it did not ask for");
+    assert_eq(_t_gets, 0,
+      "and asks the gateway nothing: a read cannot change it, and hoosh never frees what one costs, \
+    so a crew of typos would grow the gateway");
+
+    var op = _t_gw(200, _t_lineup());
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("operators-typo"));
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    var opr = agnosai_execute_task(_t_task(), 0, op, 0);
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, 0);
+    assert_eq(agnosai_task_result_status(opr), AGNOSAI_STATUS_FAILED, "as does the operator's");
+    assert_eq(vec_len(_t_models), 1, "just as plainly");
+    assert_eq(_t_gets, 0, "and with as little asked");
+
+    # --- inside the interval a refusal costs the gateway nothing, and the list still counts ---
+    agnosai_model_catalog_set_reread_ms(60000);
+    var paced = _t_gw(200, _t_only("retired"));
+    _t_selects(paced, 0, "retired", "held");
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    _t_list = _t_only("current");
+    var pr = agnosai_execute_task(_t_task(), 0, paced, 0);
+    agnosai_model_catalog_set_reread_ms(0);
+    assert_eq(agnosai_task_result_status(pr), AGNOSAI_STATUS_FAILED, "a refusal just after a read");
+    assert_eq(_t_gets, 1, "does not read again");
+
+    # --- an id the held catalog is too old to know ---
+    var young = _t_gw(200, _t_only("something-else"));
+    _t_selects(young, _t_named("openai/gpt-oss-120b"), "gpt-oss-120b", "not listed yet, so stripped");
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    _t_list = _t_lineup();
+    var yr = agnosai_execute_task(_t_task(), _t_named("openai/gpt-oss-120b"), young, 0);
+    assert_eq(agnosai_task_result_status(yr), AGNOSAI_STATUS_COMPLETED, "the re-read finds it");
+    _t_sent(1, "openai/gpt-oss-120b", "and it goes as listed");
+
+    # --- a retry after a failed validation asks for the id that answered ---
+    var v = _t_gw(200, _t_only("retired"));
+    _t_selects(v, 0, "retired", "held");
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    _t_then(0);
+    _t_then(0);
+    _t_list = _t_only("current");
+    vec_push(_t_answers, 0);
+    vec_push(_t_answers, _t_answer_for(str_from("current"), "p", "not json"));
+    vec_push(_t_answers, _t_answer_for(str_from("current"), "p", "{\\\"finding\\\":\\\"x\\\"}"));
+    var t = agnosai_task_new(str_from("name it"));
+    var src = str_from("{\"type\":\"object\",\"required\":[\"finding\"]}");
+    agnosai_task_with_output_schema(t, bayan_json_v_parse_buf(str_data(src), str_len(src)));
+    var vr = agnosai_execute_task(t, 0, v, 0);
+    assert_eq(agnosai_task_result_status(vr), AGNOSAI_STATUS_COMPLETED, "the schema is met");
+    _t_sent(2, "current", "by a retry that kept the id that worked, not the one first chosen");
+    return 0;
+}
+
+# --- with tools -----------------------------------------------------------
+
+var _t_runs = 0;
+
+fn _t_tool_schema(a, ctx): i64 {
+    return agnosai_tool_schema_new_a(a, str_from_a(a, "ignored"), str_from_a(a, "a test tool"));
+}
+
+fn _t_counted(ctx, input): i64 {
+    _t_runs = _t_runs + 1;
+    return agnosai_tool_output_ok(bayan_json_v_null());
+}
+
+fn _t_tool_agent(): i64 {
+    var tools = vec_new();
+    vec_push(tools, str_from("counted"));
+    var a = _t_agent(0);
+    agnosai_agent_with_tools(a, tools);
+    return a;
+}
+
+fn _t_tool_loop(): i64 {
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_tool_new(str_from("counted"), str_from("a test tool"),
+        &_t_tool_schema, &_t_counted, 0));
+    return agnosai_tool_loop_new_a(default_alloc(), reg, 0, 0, 0, 0, 0, str_from("crew-1"));
+}
+
+# An answer asking for one call of `counted`.
+fn _t_asks(model): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"model\":\"");
+    str_builder_add_cstr(sb, model);
+    str_builder_add_cstr(sb, "\",\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[");
+    str_builder_add_cstr(sb, "{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"counted\",");
+    str_builder_add_cstr(sb, "\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":1,");
+    str_builder_add_cstr(sb, "\"completion_tokens\":1,\"provider\":\"p\"}}");
+    return str_builder_build(sb);
+}
+
+fn test_tools(): i64 {
+    # --- a first call that is refused has run nothing, and starts over with tools ---
+    var g = _t_gw(200, _t_only("retired"));
+    _t_selects(g, 0, "retired", "held");
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    _t_list = _t_only("current");
+    var r = agnosai_execute_task_with_tools_a(default_alloc(), _t_task(), _t_tool_agent(), g, 0, 0,
+      0, _t_tool_loop());
+    assert_eq(agnosai_task_result_status(r), AGNOSAI_STATUS_COMPLETED, "a tool agent is re-selected");
+    _t_sent(1, "current", "onto the new id");
+    assert(str_index_of_cstr(vec_get(_t_requests, 1), "\"tools\"") >= 0,
+      "with its tools still offered: dropped, the model would write what they would have said");
+
+    # --- ⚠ once a tool has run, nothing starts over ---
+    var ran = _t_gw(200, _t_only("retired"));
+    _t_selects(ran, 0, "retired", "held");
+    _t_runs = 0;
+    _t_then(0);
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    vec_push(_t_answers, _t_asks("retired"));
+    _t_list = _t_only("current");
+    var rr = agnosai_execute_task_with_tools_a(default_alloc(), _t_task(), _t_tool_agent(), ran, 0,
+      0, 0, _t_tool_loop());
+    assert_eq(agnosai_task_result_status(rr), AGNOSAI_STATUS_FAILED,
+      "an id refused after a tool ran fails the task");
+    assert_eq(_t_runs, 1, "and the tool ran once: this path rebuilds the request");
+    assert_eq(vec_len(_t_models), 2, "with no third call");
+    assert_eq(_t_gets, 1, "and no re-read");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    # A suite re-reads at once to see what a re-read does. The interval has a test of its own.
+    agnosai_model_catalog_set_reread_ms(0);
+    test_tiers();
+    test_named();
+    test_attribution();
+    test_no_catalog();
+    test_reselect();
+    test_tools();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+syscall(60, f);

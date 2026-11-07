@@ -57,6 +57,8 @@ HTTP requests to hoosh (the gateway), and through it to providers.
 | The gateway's URL in a result | A transport error names its failure kind and nothing else, since that text becomes a task's `output`, which a consumer serves and stores. A log line says which gateway from sandhi's parsed scheme, host and port, and withholds a URL holding an `@` or an odd host (`agnosai_hoosh_log_url_a`), at start-up too |
 | Provider impersonation | The stdlib's native TLS with chain and hostname verification, nameConstraints enforced since cyrius 6.7.18 (CYRIUS-2026-0042), and extendedKeyUsage checked at every depth (CYRIUS-2026-0026) |
 | Response injection | LLM responses treated as untrusted data; never executed as code |
+| A caller growing the gateway by naming models | hoosh's heap never frees, and a catalog GET keeps about 1.7 KB per entry there. A refused id that no list could change reads nothing, and any other reads at most once a minute (ADR 030). ⚠ What a chat request itself leaves on hoosh is hoosh's (its ADR 013) |
+| A gateway naming the model | An id the catalog lists goes on a request as a JSON string, through the serializer, and reaches nothing else, so a hostile list can choose a model and do no more. Ids over 255 bytes are dropped, a price that does not fit is no price, and a body over 2 MiB is a failed read. ⚠ agnosai trusts its gateway on this: a list can point Premium at the dearest thing it serves, and the only controls are `AGNOSAI_MODEL_*` and an agent's own `llm_model` (ADR 030) |
 | ⚠ Cost runaway | **Only `max_duration_secs` is enforced** (`src/orchestrator/orchestrator.cyr`). `ResourceBudget`'s token and cost limits are carried and not checked; enforcing them is roadmap F5 |
 
 ### 4. Fleet Communication

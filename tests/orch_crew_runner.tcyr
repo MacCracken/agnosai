@@ -12,10 +12,9 @@
 # and a fully-tied roster. The oracle's rosters are always two identical agents,
 # so its suite is structurally blind to both the sort direction and the tie rule.
 #
-# The oracle also leaves three of `infer_provider`'s nine needles completely
-# untested (`gemini`, `grok`, `mistral`/`mixtral`) and never exercises
-# `strip_provider_prefix`'s case sensitivity or whole-segment matching. Matching
-# its test set would not have been sufficient diligence.
+# The oracle also never exercises `strip_provider_prefix`'s case sensitivity or
+# whole-segment matching. Matching its test set would not have been sufficient
+# diligence.
 #
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
@@ -61,6 +60,7 @@ include "src/tools/native.cyr"
 include "src/tools/registry.cyr"
 include "src/tool_call.cyr"
 include "src/tool_loop.cyr"
+include "src/model_catalog.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "tests/test_helpers.cyr"
 
@@ -150,8 +150,9 @@ fn _t_stub_chat_failme(client, request, out_response, parent_sc): i64 {
 # A client whose chat call is the stub. The URL is a port nothing listens on, so
 # a call that bypassed the pointer would fail rather than reach a real gateway.
 fn _t_stub_client(): i64 {
-    return agnosai_hoosh_client_with_chat(
-      agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_t_stub_chat);
+    return agnosai_hoosh_client_with_get(agnosai_hoosh_client_with_chat(
+        agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_t_stub_chat),
+      &_t_stub_get);
 }
 
 # A runner over `spec` whose tasks take the LLM success arm through the stub.
@@ -378,29 +379,44 @@ fn _t_varied_roster(n): i64 {
     return v;
 }
 
-# Assert infer_provider maps a model name to a provider.
-fn _t_prov(model, want, name): i64 {
-    return assert_eq(_agnosai_crew_infer_provider(str_from(model)), want, name);
-}
-
 # Assert strip_provider_prefix's output.
 fn _t_strip(model, want, name): i64 {
     return assert(str_eq(_agnosai_crew_strip_provider_prefix(str_from(model)),
         str_from(want)) == 1, name);
 }
 
+# The canned gateway every suite client below talks to: Capable and Premium are told apart by price.
+fn _t_stub_get(client, a, path: Str, out_body): i64 {
+    store64(out_body, str_from("{\"data\":[\
+{\"id\":\"stub-fast\",\"owned_by\":\"openai\",\"pricing\":{\"input_micro_usd_per_1k\":1,\
+\"output_micro_usd_per_1k\":1}},\
+{\"id\":\"stub-capable\",\"owned_by\":\"openai\",\"pricing\":{\"input_micro_usd_per_1k\":5,\
+\"output_micro_usd_per_1k\":5}},\
+{\"id\":\"stub-premium\",\"owned_by\":\"openai\",\"pricing\":{\"input_micro_usd_per_1k\":9,\
+\"output_micro_usd_per_1k\":9}}]}"));
+    return 200;
+}
+
+# select_model's output for `agent`, or 0.
+fn _t_selected(agent): i64 {
+    var out: i64[1];
+    store64(&out, 0);
+    if (_agnosai_crew_select_model(_t_stub_client(), agent, &out) != 0) { return 0; }
+    return load64(&out);
+}
+
 # Assert select_model's output for an agent whose llm_model is set.
 fn _t_model_override(model, want, name): i64 {
     var a = _t_agent("m");
     agnosai_agent_with_llm_model(a, str_from(model));
-    return assert(str_eq(_agnosai_crew_select_model(a), str_from(want)) == 1, name);
+    return assert(str_eq(_t_selected(a), str_from(want)) == 1, name);
 }
 
 # Assert select_model's output for an agent routed by complexity.
 fn _t_model_complexity(complexity, want, name): i64 {
     var a = _t_agent("c");
     agnosai_agent_with_complexity(a, str_from(complexity));
-    return assert(str_eq(_agnosai_crew_select_model(a), str_from(want)) == 1, name);
+    return assert(str_eq(_t_selected(a), str_from(want)) == 1, name);
 }
 
 # ── the output-schema loop (2.2.5) ─────────────────────────────────────────
@@ -707,68 +723,6 @@ fn main() {
       "matching the runner, which picks no agent");
 
     # =====================================================================
-    # infer_provider — the default is OLLAMA, not OPENAI
-    # =====================================================================
-
-    # --- test_infer_provider_openai ---
-    _t_prov("gpt-4o", AGNOSAI_PROVIDER_OPENAI, "gpt-4o is OpenAI");
-    _t_prov("gpt-4o-mini", AGNOSAI_PROVIDER_OPENAI, "and gpt-4o-mini");
-    _t_prov("o1", AGNOSAI_PROVIDER_OPENAI, "a bare o1 is OpenAI — the needle has no hyphen");
-    _t_prov("o3-mini", AGNOSAI_PROVIDER_OPENAI, "and o3-mini");
-
-    # --- test_infer_provider_anthropic ---
-    _t_prov("claude-sonnet-4", AGNOSAI_PROVIDER_ANTHROPIC, "claude-sonnet-4 is Anthropic");
-    _t_prov("claude-sonnet-4-20250514", AGNOSAI_PROVIDER_ANTHROPIC,
-      "and a dated variant — it is a prefix test, not a model table");
-    _t_prov("claude-opus-4", AGNOSAI_PROVIDER_ANTHROPIC, "and claude-opus-4");
-
-    # --- test_infer_provider_deepseek ---
-    _t_prov("deepseek-chat", AGNOSAI_PROVIDER_DEEPSEEK, "deepseek-chat is DeepSeek");
-    _t_prov("deepseek-coder", AGNOSAI_PROVIDER_DEEPSEEK, "and deepseek-coder");
-
-    # --- test_infer_provider_local_models ---
-    _t_prov("llama3", AGNOSAI_PROVIDER_OLLAMA, "llama3 falls through to Ollama");
-    _t_prov("llama3:70b", AGNOSAI_PROVIDER_OLLAMA, "and llama3:70b");
-    _t_prov("phi3", AGNOSAI_PROVIDER_OLLAMA, "and phi3");
-    _t_prov("unknown-model", AGNOSAI_PROVIDER_OLLAMA,
-      "and anything unrecognised — this is the assertion standing between the port and a bare \
-    `return 0`, which would silently mean OpenAI");
-
-    # --- test_infer_provider_case_insensitive ---
-    _t_prov("GPT-4o", AGNOSAI_PROVIDER_OPENAI, "matching ignores case");
-    _t_prov("Claude-Opus-4", AGNOSAI_PROVIDER_ANTHROPIC, "for the Anthropic arm too");
-    _t_prov("DEEPSEEK-CHAT", AGNOSAI_PROVIDER_DEEPSEEK, "and DeepSeek");
-
-    # --- PORT-ADDED: the three arms the oracle never tests ---
-    _t_prov("gemini-1.5-pro", AGNOSAI_PROVIDER_GOOGLE, "gemini is Google — untested upstream");
-    _t_prov("grok-2", AGNOSAI_PROVIDER_GROK, "grok is Grok — untested upstream");
-    _t_prov("mistral-large-latest", AGNOSAI_PROVIDER_MISTRAL, "mistral is Mistral");
-    _t_prov("mixtral-8x7b", AGNOSAI_PROVIDER_MISTRAL,
-      "and so is mixtral — one letter from mistral, so a transcription slip reads as correct at a \
-    glance and would send Mixtral traffic to the free Ollama arm");
-    _t_prov("GEMINI-1.5-PRO", AGNOSAI_PROVIDER_GOOGLE, "the untested arms fold case as well");
-    _t_prov("MIXTRAL-8X7B", AGNOSAI_PROVIDER_MISTRAL, "including mixtral");
-
-    # --- PORT-ADDED: the anchoring and boundary guards ---
-    _t_prov("", AGNOSAI_PROVIDER_OLLAMA, "an empty model name is Ollama, and does not fault");
-    _t_prov("gpt4", AGNOSAI_PROVIDER_OLLAMA, "gpt4 without the hyphen misses the needle");
-    _t_prov("gpt", AGNOSAI_PROVIDER_OLLAMA, "and a bare gpt");
-    _t_prov("o4-mini", AGNOSAI_PROVIDER_OLLAMA, "o4 is not o1 or o3 — there is no generalisation");
-    _t_prov("groq", AGNOSAI_PROVIDER_OLLAMA,
-      "groq is not grok — q is not k, and the oracle's provider enum has no Groq variant at all");
-    _t_prov("openai/gpt-4o", AGNOSAI_PROVIDER_OLLAMA,
-      "a prefixed id is Ollama — the match is anchored at position 0, with no substring fallback");
-    _t_prov("anthropic/claude-3", AGNOSAI_PROVIDER_OLLAMA, "for Anthropic too");
-    _t_prov(" gpt-4o", AGNOSAI_PROVIDER_OLLAMA, "a leading space defeats it — nothing is trimmed");
-    _t_prov("gpt-4o ", AGNOSAI_PROVIDER_OPENAI, "but a trailing space does not");
-
-    # the caller's Str is untouched: the fold works on a copy
-    var orig = str_from("GPT-4o");
-    _agnosai_crew_infer_provider(orig);
-    assert(str_eq(orig, str_from("GPT-4o")) == 1,
-      "the caller's model string is unchanged — the lowercase fold allocates rather than mutating");
-
-    # =====================================================================
     # build_system_prompt — full equality, never `contains`
     # =====================================================================
 
@@ -921,11 +875,7 @@ fn main() {
     # =====================================================================
 
     # --- test_select_model_no_agent ---
-    assert(str_eq(_agnosai_crew_select_model(0),
-        agnosai_default_model(AGNOSAI_TIER_CAPABLE)) == 1,
-      "no agent uses the Capable tier default");
-    assert(str_eq(_agnosai_crew_select_model(0), str_from("llama3:70b")) == 1,
-      "which is llama3:70b");
+    assert(str_eq(_t_selected(0), str_from("stub-capable")) == 1, "no agent uses the Capable tier");
 
     # --- test_select_model_agent_override ---
     _t_model_override("gpt-4o", "gpt-4o", "an agent's llm_model overrides the routing");
@@ -938,40 +888,35 @@ fn main() {
       "and anthropic/ — this is the case that catches a strip list built from the wire spellings");
 
     # --- test_select_model_routes_by_complexity ---
-    _t_model_complexity("low", "llama3:70b",
+    _t_model_complexity("low", "stub-capable",
       "low complexity routes to CAPABLE, not Fast — Simple + Reason never reaches the fast tier, \
-    so a direct complexity-to-model table would write llama3 here and pass every other test");
-    _t_model_complexity("high", "llama3:405b", "high complexity routes to Premium");
+    so a direct complexity-to-tier table would pick stub-fast here and pass every other test");
+    _t_model_complexity("high", "stub-premium", "high complexity routes to Premium");
 
     # --- PORT-ADDED: the complexity spellings the oracle skips ---
-    _t_model_complexity("medium", "llama3:70b", "medium routes to Capable");
-    _t_model_complexity("MEDIUM", "llama3:70b", "case-insensitively");
-    _t_model_complexity("simple", "llama3:70b", "simple is Simple, which still routes Capable");
-    _t_model_complexity("complex", "llama3:405b", "complex is Complex, which routes Premium");
-    _t_model_complexity("HIGH", "llama3:405b", "and HIGH");
-    _t_model_complexity("CoMpLeX", "llama3:405b", "and mixed case");
-    _t_model_complexity("", "llama3:70b", "an empty complexity falls back to Medium");
-    _t_model_complexity("unknown", "llama3:70b", "as does an unrecognised spelling");
-    _t_model_complexity("lowe", "llama3:70b",
+    _t_model_complexity("medium", "stub-capable", "medium routes to Capable");
+    _t_model_complexity("MEDIUM", "stub-capable", "case-insensitively");
+    _t_model_complexity("simple", "stub-capable", "simple is Simple, which still routes Capable");
+    _t_model_complexity("complex", "stub-premium", "complex is Complex, which routes Premium");
+    _t_model_complexity("HIGH", "stub-premium", "and HIGH");
+    _t_model_complexity("CoMpLeX", "stub-premium", "and mixed case");
+    _t_model_complexity("", "stub-capable", "an empty complexity falls back to Medium");
+    _t_model_complexity("unknown", "stub-capable", "as does an unrecognised spelling");
+    _t_model_complexity("lowe", "stub-capable",
       "and a near-miss — parse_complexity compares whole strings, not prefixes");
-
-    # the Fast tier's model is unreachable from select_model at all
-    assert(str_eq(agnosai_default_model(AGNOSAI_TIER_FAST), str_from("llama3")) == 1,
-      "the Fast tier's model is llama3 — recorded here because select_model can never return it: \
-    every complexity level routes Reason to Capable or Premium");
 
     # --- PORT-ADDED: precedence proven on visibly different answers ---
     var high_override = _t_agent("h");
     agnosai_agent_with_complexity(high_override, str_from("high"));
     agnosai_agent_with_llm_model(high_override, str_from("gpt-4o"));
-    assert(str_eq(_agnosai_crew_select_model(high_override), str_from("gpt-4o")) == 1,
+    assert(str_eq(_t_selected(high_override), str_from("gpt-4o")) == 1,
       "an override beats a HIGH-complexity route — the oracle's medium fixture makes its own \
     precedence evidence weaker than it looks, since both arms could agree");
 
     # --- PORT-ADDED: an explicitly empty override survives ---
     var blank_override = _t_agent("z");
     agnosai_agent_with_llm_model(blank_override, str_from(""));
-    var blank_model = _agnosai_crew_select_model(blank_override);
+    var blank_model = _t_selected(blank_override);
     assert_eq(str_len(blank_model), 0,
       "an llm_model of \"\" yields \"\", NOT the routed default — the presence test is `!= 0`, and \
     `if (m != 0 && str_len(m) > 0)` is the likeliest silent divergence in this function");
@@ -979,7 +924,7 @@ fn main() {
     # an agent with no llm_model set is genuinely absent, not empty
     var routed = _t_agent("r");
     assert_eq(agnosai_agent_llm_model(routed), 0, "an unset llm_model is 0");
-    assert(str_eq(_agnosai_crew_select_model(routed), str_from("llama3:70b")) == 1,
+    assert(str_eq(_t_selected(routed), str_from("stub-capable")) == 1,
       "so it routes by complexity instead");
 
     # =====================================================================
@@ -1178,9 +1123,9 @@ fn main() {
     assert_eq(map_get(agnosai_task_result_metadata(old_r), str_from("cost_micro_usd")), 0,
       "an older gateway's response OMITS cost_micro_usd rather than publishing a fabricated 0 — a \
     real 0 means a free local inference, and the two must stay distinguishable");
-    assert(str_eq(bayan_json_v_str(map_get(agnosai_task_result_metadata(old_r),
-            str_from("provider"))), str_from("ollama")) == 1,
-      "and the provider falls back to the model-name inference, which is what the oracle did");
+    assert_eq(map_get(agnosai_task_result_metadata(old_r), str_from("provider")), 0,
+      "and a response nobody attributed OMITS the provider, for the same reason (ADR 030): the \
+    catalog's `owned_by` is filled in before this, and orch_model_selection pins that");
 
     # --- an ASSIGNED task's success metadata names its agent (ADR 022) ---
     # The oracle's profile aggregates `agent_cost_usd` from `metadata["agent"]`

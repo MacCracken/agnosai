@@ -66,6 +66,31 @@ it. Over the limit a route answers **429**.
 - `/health`, `/ready` and `/metrics` are **exempt**, so a flood cannot push a
   liveness probe into 429 and get the process killed.
 
+## Model selection
+
+An agent with no `llm_model` gets a model from hoosh's `GET /v1/models/catalog`, read once per process and again when a
+selection fails ([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)). `complexity` picks the tier: `low`
+and `medium` are Capable, `high` is Premium.
+
+| variable | effect |
+|---|---|
+| `AGNOSAI_MODEL_FAST` | the id the Fast tier means, sent exactly as written and checked against nothing |
+| `AGNOSAI_MODEL_CAPABLE` | the same for Capable. With one set, that tier needs no catalog |
+| `AGNOSAI_MODEL_PREMIUM` | the same for Premium |
+
+An empty variable is none. Fast is reachable from the library's router and not from a crew today.
+
+- ⚠ **With no catalog a crew that names no model fails**, before any request, and the task's `output` reads
+  `LLM error: no model catalog: <why>; name a model on the agent, or set AGNOSAI_MODEL_CAPABLE`. A gateway with no
+  `/v1/models/catalog` is read through `/v1/models`, where every tier is the first chat model listed.
+- A selection the gateway refuses reads the catalog again, at most once a minute, and selects once more, unless a tool has
+  already run.
+- ⚠ **`Premium` is the dearest model that declares the most reasoning.** On hoosh's table today that is `claude-fable-5-1`,
+  at $10/$50 per million tokens. Set `AGNOSAI_MODEL_PREMIUM` to hold a crew's `high` agents to less.
+- ⚠ **Selection cannot see tools**, as the catalog does not say which models take them. `gpt-6-astra` takes none on Chat
+  Completions, so on an OpenAI-only gateway an agent with tools and `complexity: high` fails with the provider's 400 until
+  `AGNOSAI_MODEL_PREMIUM` names a model that does.
+
 ## Trace context
 
 agnosai exports OpenTelemetry spans when `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (a complete URL,
@@ -232,7 +257,7 @@ Create and execute a crew. The server assembles the crew from the provided agent
 | `domain` | string | no | null |
 | `tools` | array of string | no | [] — the registered tools this agent may call, and no others. ⚠ A name the server does not hold fails the task, naming the tool. That includes the names in `GET /api/v1/presets`, which are a vocabulary for a consumer to resolve |
 | `complexity` | string | no | "medium" |
-| `llm_model` | string | no | null |
+| `llm_model` | string | no | null — the tier `complexity` calls for, from hoosh's catalog (see *Model selection*). An id as hoosh lists it, sent exactly as listed. There are no tier aliases: `"capable"` is sent as the word |
 | `gpu_required` | bool | no | false |
 | `gpu_preferred` | bool | no | false |
 | `gpu_memory_min_mb` | int | no | null |
@@ -305,8 +330,9 @@ gains the same list as `tool_calls`, one entry per call in the order the model m
 `result` or `error`, with `flagged`, `held_back` or `asked_for` when they apply ([ADR 029](../adr/029-the-tool-loop.md)).
 `metadata.tool_calls_dropped` counts calls past the limit of a turn, when there were any.
 
-An LLM-answered task's result `metadata` carries `model`, `provider`, `tokens`, `cost_micro_usd`
-(when the gateway reports a cost), `task_duration_ms`, and `agent` — the assigned agent's key — so
+An LLM-answered task's result `metadata` carries `model`, `tokens`, `task_duration_ms`, `provider`
+(the gateway's `usage.provider`, else the catalog's `owned_by` for the model, and omitted when neither
+says), `cost_micro_usd` (when the gateway reports a cost), and `agent` — the assigned agent's key — so
 the profile's `agent_cost_usd` is broken down per agent.
 
 **Response (200 OK):**

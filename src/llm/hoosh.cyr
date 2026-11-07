@@ -24,7 +24,7 @@
 # the latter is core_message's inter-agent Message, and Cyrius has ONE flat
 # namespace.
 #
-# Everything here is pure except `agnosai_hoosh_chat`, which is the one I/O
+# Everything here is pure except `agnosai_hoosh_chat` and `agnosai_hoosh_get_a`, the two I/O
 # call. That split is deliberate: it is what lets the builders and extractors
 # be unit-tested with no gateway running.
 # =========================================================================
@@ -118,6 +118,11 @@ fn agnosai_hoosh_chat_path(): i64 {
 # The OpenAI-compatible model-list path.
 fn agnosai_hoosh_models_path(): i64 {
     return str_from("/v1/models");
+}
+
+# What hoosh lists each provider as serving now, with prices and capabilities (hoosh ADR 012).
+fn agnosai_hoosh_catalog_path(): i64 {
+    return str_from("/v1/models/catalog");
 }
 
 # Join a gateway base URL and a path, trimming exactly one trailing '/' from the
@@ -714,6 +719,12 @@ fn agnosai_inference_response_provider(r): i64 {
     return load64(r + AGN_RESP_PROVIDER);
 }
 
+# Say which provider served the response, for one the gateway did not name. Returns `r`.
+fn agnosai_inference_response_with_provider(r, provider: Str): i64 {
+    store64(r + AGN_RESP_PROVIDER, provider);
+    return r;
+}
+
 # Whether the response came from hoosh's cache — one of the
 # `AGNOSAI_HOOSH_CACHE_*` constants.
 fn agnosai_inference_response_cache(r): i64 {
@@ -765,7 +776,13 @@ fn agnosai_hoosh_extract_usage(body: Str, out_prompt, out_completion): i64 {
 # The `data` array of an OpenAI `/v1/models` body, or 0 when the shape does not
 # match. The caller walks it with `bayan_json_v_arr_*`.
 fn agnosai_hoosh_extract_models(body: Str): i64 {
-    var v = agnosai_hoosh_parse_body(body);
+    return agnosai_hoosh_extract_models_a(default_alloc(), body);
+}
+
+# `agnosai_hoosh_extract_models`, with the parse tree in allocator `a`. `/v1/models/catalog` has
+# the same shape, with more on each entry.
+fn agnosai_hoosh_extract_models_a(a, body: Str): i64 {
+    var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
     if (v == 0) { return 0; }
     var data = bayan_json_v_obj_get_by_cstr(v, "data");
     if (data == 0) { return 0; }
@@ -984,7 +1001,7 @@ fn _agnosai_hoosh_status_error_type(span, status): i64 {
     return str_builder_build(sb);
 }
 
-# POST a chat-completions request to the gateway. **The one I/O call here.**
+# POST a chat-completions request to the gateway. **The one chat I/O call here.**
 #
 # `agnosai_hoosh_chat_in` with no parent span: the chat span, when telemetry is
 # on, is the root of its own trace.
@@ -1086,22 +1103,26 @@ fn agnosai_hoosh_total_timeout_ms(): i64 {
     return sandhi_http_options_get_total_ms(_AGNOSAI_HOOSH_OPTS);
 }
 
-# `base` + `/v1/chat/completions` as a NUL-terminated C string in `a` — what
-# sandhi takes — with one trailing `/` of `base` dropped, as
-# `agnosai_hoosh_join_url` does. 0 when `a` runs out.
-fn _agnosai_hoosh_endpoint_cstr_a(a, base: Str): i64 {
+# `base` + `path` as a NUL-terminated C string in `a` — what sandhi takes — with
+# one trailing `/` of `base` dropped, as `agnosai_hoosh_join_url` does. 0 when
+# `a` runs out.
+fn _agnosai_hoosh_url_cstr_a(a, base: Str, path, plen): i64 {
     var blen = str_len(base);
     if (blen > 0) {
         if (load8(str_data(base) + blen - 1) == 47) { blen = blen - 1; }
     }
-    var path = "/v1/chat/completions";
-    var plen = strlen(path);
     var buf = alloc_via(a, blen + plen + 1);
     if (buf == 0) { return 0; }
     memcpy(buf, str_data(base), blen);
     memcpy(buf + blen, path, plen);
     store8(buf + blen + plen, 0);
     return buf;
+}
+
+# The chat-completions endpoint of `base`, as `_agnosai_hoosh_url_cstr_a` gives it.
+fn _agnosai_hoosh_endpoint_cstr_a(a, base: Str): i64 {
+    var path = "/v1/chat/completions";
+    return _agnosai_hoosh_url_cstr_a(a, base, path, strlen(path));
 }
 
 # `agnosai_hoosh_headers` in `a`: the same two headers, nothing on the global bump.
@@ -1121,6 +1142,25 @@ fn _agnosai_hoosh_headers_a(a, api_key: Str): i64 {
         }
     }
     return h;
+}
+
+# What a failed chat's body says, for its error text, or 0. `tree` is the parsed body, 0 if it did not
+# parse.
+#
+# ⚠ **hoosh's error body is not always JSON.** With no `message` key in a provider's answer it passes
+# the raw body on, unescaped, inside a JSON string (`_provider_err_capture`, `_resp_err`), so Ollama's
+# `{"error":"model 'x' not found"}` arrives as `{"error":{"message":"upstream provider returned HTTP
+# 404: {"error": …`, which parses to nothing. That is a retired model on the provider that has no
+# other way to say so, and `agnosai_hoosh_refused_model` has to see it. So those words are carried over
+# and no others: the rest is a provider's text that nothing here has read.
+fn _agnosai_hoosh_detail_a(a, tree, body, body_len): i64 {
+    if (tree != 0) { return _agnosai_hoosh_error_of(tree); }
+    if (body == 0 || body_len <= 0) { return 0; }
+    var needle = "upstream provider returned HTTP 404";
+    if (agnosai_str_contains_ci_cstr(str_new_a(a, body, body_len), needle) == 1) {
+        return str_from_a(a, needle);
+    }
+    return 0;
 }
 
 # POST a chat-completions request to the gateway, as a child of `parent_sc`.
@@ -1278,7 +1318,7 @@ fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
         var esb = str_builder_new_a(a);
         str_builder_add_cstr_a(a, esb, "hoosh returned HTTP ");
         str_builder_add_int_a(a, esb, status);
-        var detail = _agnosai_hoosh_error_of(tree);
+        var detail = _agnosai_hoosh_detail_a(a, tree, sandhi_http_body(r), sandhi_http_body_len(r));
         if (detail != 0) {
             str_builder_add_cstr_a(a, esb, ": ");
             str_builder_add_a(a, esb, detail);
@@ -1315,6 +1355,65 @@ fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
     return 0;
 }
 
+# Whether a chat failure says the id does not exist, as opposed to the gateway or the provider
+# being unwell (ADR 030). `err` is what `agnosai_hoosh_chat_in` returned.
+#
+# ⚠ **Two spellings, and the second is a 502.** hoosh answers 404 only when no route matches the id
+# (`no provider for model`). A provider's own 404, which is what a retired id gets, reaches here as
+# `hoosh returned HTTP 502: upstream provider returned HTTP 404: …`, so a test for 404 alone would
+# miss the case a held catalog goes stale on. Anchored to those words, as a 404 in the provider's
+# prose or in a model's id says nothing.
+fn agnosai_hoosh_refused_model(err: Str): i64 {
+    if (err == 0) { return 0; }
+    if (agnosai_str_contains_ci_cstr(err, "hoosh returned HTTP 404") == 1) { return 1; }
+    return agnosai_str_contains_ci_cstr(err, "upstream provider returned HTTP 404");
+}
+
+# --- the gateway's lists: short, and bigger than a chat answer ---------------
+#
+# A GET here is a list, not a completion, and a task waits on it, so its ceilings are a tenth of the
+# chat call's. The body cap is not sandhi's 256 KiB: an entry is about 350 bytes,
+# and a gateway with OpenRouter on a live catalog lists several hundred models for that route alone.
+# Too big is a transport failure (`PROTOCOL`), which is the catalog not being read.
+var AGNOSAI_HOOSH_GET_CONNECT_MS = 5000;
+var AGNOSAI_HOOSH_GET_IO_MS = 10000;
+var AGNOSAI_HOOSH_GET_TOTAL_MS = 15000;
+var AGNOSAI_HOOSH_GET_MAX_BYTES = 2097152;
+
+# The options every GET goes out with — one block, built at load, never written after.
+fn _agnosai_hoosh_get_opts_new(): i64 {
+    var o = sandhi_http_options_new();
+    if (o == 0) { return 0; }
+    sandhi_http_options_connect_ms(o, AGNOSAI_HOOSH_GET_CONNECT_MS);
+    sandhi_http_options_read_ms(o, AGNOSAI_HOOSH_GET_IO_MS);
+    sandhi_http_options_write_ms(o, AGNOSAI_HOOSH_GET_IO_MS);
+    sandhi_http_options_total_ms(o, AGNOSAI_HOOSH_GET_TOTAL_MS);
+    sandhi_http_options_max_response_bytes(o, AGNOSAI_HOOSH_GET_MAX_BYTES);
+    return o;
+}
+var _AGNOSAI_HOOSH_GET_OPTS = _agnosai_hoosh_get_opts_new();
+
+# GET `path` from the gateway, all of it in arena `a`, which sandhi's receive buffer is sized into.
+#
+# Returns the HTTP status, with the body through `out_body` as a Str in `a`, or a transport failure
+# as a negative sandhi error kind. The kind is what a task may repeat: the URL is for the log alone,
+# as on the chat path.
+fn agnosai_hoosh_get_a(a, base_url: Str, api_key: Str, path: Str, out_body): i64 {
+    var url = _agnosai_hoosh_url_cstr_a(a, base_url, str_data(path), str_len(path));
+    var headers = _agnosai_hoosh_headers_a(a, api_key);
+    if (url == 0 || headers == 0) { return 0 - SANDHI_ERR_INTERNAL; }
+
+    var r = sandhi_http_get_opts_a(a, url, headers, _AGNOSAI_HOOSH_GET_OPTS);
+    if (r == 0) { return 0 - SANDHI_ERR_INTERNAL; }
+    var kind = sandhi_http_err_kind(r);
+    if (kind != SANDHI_OK) {
+        _agnosai_hoosh_log_transport_a(a, url, kind);
+        return 0 - kind;
+    }
+    store64(out_body, str_new_a(a, sandhi_http_body(r), sandhi_http_body_len(r)));
+    return sandhi_http_status(r);
+}
+
 # A configured hoosh endpoint — base URL plus optional API key.
 #
 # The oracle's `execute_task` takes `Option<&Arc<HooshClient>>`, where `None`
@@ -1324,12 +1423,14 @@ fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
 # side of the HTTP seam here.
 #
 # `AGN_HC_CHAT_FP` is the chat call the crew runner makes through this client —
-# see `agnosai_hoosh_client_with_chat` for why it is a pointer.
+# see `agnosai_hoosh_client_with_chat` for why it is a pointer. `AGN_HC_GET_FP` is
+# the same for a read of the gateway's model lists.
 enum AgnosaiHooshClientOff {
     AGN_HC_BASE_URL = 0;
     AGN_HC_API_KEY = 8;
     AGN_HC_CHAT_FP = 16;
-    AGN_HC_SIZE = 24;
+    AGN_HC_GET_FP = 24;
+    AGN_HC_SIZE = 32;
 }
 
 # The live chat call — every client's default `AGN_HC_CHAT_FP`.
@@ -1346,6 +1447,15 @@ fn _agnosai_hoosh_client_chat_live(client, request, out_response, parent_sc): i6
       load64(client + AGN_HC_API_KEY), request, out_response, parent_sc);
 }
 
+# The live GET — every client's default `AGN_HC_GET_FP`.
+#
+# `fn(client, a, path, out_body) -> i64`, `agnosai_hoosh_get_a`'s contract with the client's two
+# fields folded in.
+fn _agnosai_hoosh_client_get_live(client, a, path: Str, out_body): i64 {
+    return agnosai_hoosh_get_a(a, load64(client + AGN_HC_BASE_URL),
+      load64(client + AGN_HC_API_KEY), path, out_body);
+}
+
 # Create a client over a base URL and an API key. Pass `str_from("")` for the
 # key when the gateway is unauthenticated.
 fn agnosai_hoosh_client_new(base_url: Str, api_key: Str): i64 {
@@ -1358,6 +1468,7 @@ fn agnosai_hoosh_client_new_a(a, base_url: Str, api_key: Str): i64 {
     store64(c + AGN_HC_BASE_URL, base_url);
     store64(c + AGN_HC_API_KEY, api_key);
     store64(c + AGN_HC_CHAT_FP, &_agnosai_hoosh_client_chat_live);
+    store64(c + AGN_HC_GET_FP, &_agnosai_hoosh_client_get_live);
     return c;
 }
 
@@ -1395,5 +1506,19 @@ fn agnosai_hoosh_client_chat_fp(c): i64 {
 # for B17's three-argument form must take it too.
 fn agnosai_hoosh_client_with_chat(c, chat_fp): i64 {
     store64(c + AGN_HC_CHAT_FP, chat_fp);
+    return c;
+}
+
+# The client's GET — `_agnosai_hoosh_client_get_live` unless a suite swapped it.
+fn agnosai_hoosh_client_get_fp(c): i64 {
+    return load64(c + AGN_HC_GET_FP);
+}
+
+# Replace the client's GET. Returns the client. **Called only by suites**, for the reason
+# `agnosai_hoosh_client_with_chat` is: a catalog can only be canned offline if the read is a pointer.
+#
+# `get_fp` is `fn(client, a, path, out_body) -> i64`, the live call's contract.
+fn agnosai_hoosh_client_with_get(c, get_fp): i64 {
+    store64(c + AGN_HC_GET_FP, get_fp);
     return c;
 }

@@ -7,6 +7,141 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1] — 2026-11-07
+
+An agent with no `llm_model` now gets a model its gateway lists. agnosai carried `llama3:70b` and `llama3:405b`, so a gateway
+with no such route answered every agnostic crew 404, and one with an Ollama route sent the task to a model the box might not
+have. A tier now means what hoosh's catalog says, by what each model declares and costs, a listed id goes out exactly as
+listed, and a response with no `usage.provider` is attributed to the catalog's `owned_by` (ADR 030). With the tool loop in
+2.3.0, this is the other half of what agnostic's M6 was waiting on.
+
+⚠ **Behaviour changes, for a consumer that names no model:** a crew with an agent that has no `llm_model` now reads the
+gateway's catalog before its first request, and fails with `no model catalog: …` if it cannot, where it used to send a guess.
+`complexity: high` now means the dearest model that declares the most reasoning, which on hoosh's table today is
+`claude-fable-5-1` at $10/$50. `AGNOSAI_MODEL_PREMIUM` holds it to less. A crew whose agents name their models sends the bytes
+it always sent, but for an id the catalog lists with a `provider/` prefix, which now keeps it.
+
+### Breaking
+
+- **A crew that names no model needs a catalog or an override (ADR 030).** With neither, a task fails before any request,
+  with `no model catalog: <why>; name a model on the agent, or set AGNOSAI_MODEL_CAPABLE`. **Migration:** a hoosh since 2.4.9
+  has the catalog, and an older one's `/v1/models` is read in its place. On anything else set `AGNOSAI_MODEL_CAPABLE` and
+  `AGNOSAI_MODEL_PREMIUM`, or `agnosai_model_set_tier_override`.
+- **`agnosai_default_model` and `agnosai_default_model_a` are removed.** Each named a model nobody had listed. **Migration:**
+  `agnosai_model_for_tier_a(a, client, tier, &out)`, which answers an id or says why there is none.
+- **`agnosai_select_cheapest_model` and `BUDGET_MODELS` are removed.** It priced eight models that no longer exist, and
+  nothing called it. **Migration:** `agnosai_model_catalog_pick(catalog, AGNOSAI_TIER_FAST)` is the cheapest listed chat model.
+  `agnosai_estimate_crew_cost` stays: it estimates self-hosted GPU hours, not a provider's price.
+- **`metadata.provider` can be absent.** With no `usage.provider` and no catalog entry it used to read `ollama`, whatever
+  served the task. It is now omitted, as `cost_micro_usd` is, since a guess cannot be told from a report. Only a hoosh before
+  2.6.0 reaches this. **Migration:** read it as optional.
+
+### Added
+
+- **`src/model_catalog.cyr`.** `GET /v1/models/catalog`, falling back to `/v1/models` on a 404, once per process per gateway
+  and again when a selection fails, into storage that outlives every crew. A read that fails keeps what was held, and one that
+  finds the same bytes keeps nothing.
+- **A tier from the catalog.** The ladder is the paid chat models, or every chat model when none is paid. Fast is the cheapest.
+  Capable is the lower median of the distinct prices that declare reasoning, and never costs more than Premium. Premium is the
+  dearest of what declares the most, with `effort` outranking `thinking`. The first listed wins a tie. ADR 030 has the price
+  list each clause was a wrong answer on: by price alone, Premium is `claude-opus-4-1`, which is dearer than Fable and older.
+- **`AGNOSAI_MODEL_FAST`, `AGNOSAI_MODEL_CAPABLE`, `AGNOSAI_MODEL_PREMIUM`** and `agnosai_model_set_tier_override`: the operator's
+  word on a tier, sent exactly as written, needing no catalog.
+- **A selection the gateway refuses reads again.** A held catalog goes stale, so a refused id re-reads the list and the task
+  selects once more, unless a tool has already run, as this rebuilds the request. Both spellings of a refusal are recognised,
+  including the 502 hoosh hands back for a provider's 404 (`agnosai_hoosh_refused_model`). A read is rationed to one a minute
+  (`agnosai_model_catalog_set_reread_ms`), and an id no list could change reads nothing.
+- **Public:** `agnosai_model_for_tier_a`, `agnosai_model_catalog_of`, `_parse_a`, `_count`, `_get`, `_pick`, `_find`, `_listed`,
+  `_owner`, `_reread`, `agnosai_model_entry_id`, `_owned_by`, `_input_price`, `_output_price`, `_reasoning`,
+  `agnosai_model_tier_override`, `agnosai_model_tier_env`, `agnosai_hoosh_get_a`, `agnosai_hoosh_catalog_path`,
+  `agnosai_hoosh_extract_models_a`, `agnosai_hoosh_client_get_fp`, `agnosai_hoosh_client_with_get`,
+  `agnosai_inference_response_with_provider`.
+
+### Changed
+
+- **Attribution.** A response with no `usage.provider` gets its entry's `owned_by`, then that of the id asked for, as a provider
+  answers with the dated form of an alias. The spelling is hoosh's, so it matches `usage.provider`. `o4-mini`, `gpt-oss` and
+  `qwen/…` no longer bill to Ollama. The nine prefix needles are gone.
+- **A listed id goes out as listed.** `_agnosai_crew_strip_provider_prefix_a` no longer renames `openai/gpt-oss-120b`. The strip
+  stands for an id the catalog does not list, and with no catalog. An id it would not touch reads nothing.
+- **A validation retry asks for the id that answered**, where it selected again from the start.
+- **`scripts/stack.sh`** no longer defaults `AGNOSAI_MODEL` to `llama3`: `check` sends what the gateway's Fast tier means.
+
+### Fixed
+
+- **`README.md` and `docs/architecture/overview.md` showed `"llm_model": "capable"`**, which is sent as the word, as hoosh has no
+  tier aliases.
+- `docs/guides/adding-providers.md` described an enum nothing in `src/` reads since this release.
+
+### Removed
+
+- `_agnosai_crew_infer_provider` and its nine needles; `agnosai_default_model`; `agnosai_select_cheapest_model` and
+  `BUDGET_MODELS` (see *Breaking*).
+
+### Performance
+
+An interleaved A/B against a 2.3.0 build, three rounds of `llm`, `orch`, `fleet` and `server` with the order flipped each round,
+at a load of about 2.3, medians: **−0.6% across 157 rows**, 152 within ±5%.
+
+| Row | 2.3.0 | 2.3.1 | |
+|---|---|---|---|
+| `crew_select_model_routed` | 126 ns | 146 ns | +15.9% |
+| `run_crew_1_task_sequential` | 98.1 µs | 96.2 µs | −1.9% |
+| `run_crew_10_tasks_sequential` | 403.2 µs | 391.4 µs | −2.9% |
+| `run_crew_10_tasks_parallel_4` | 462.5 µs | 461.9 µs | −0.1% |
+| `task_one_tool_call` | 31.3 µs | 30.4 µs | −2.7% |
+| `task_four_tool_calls_at_once` | 243.7 µs | 246.4 µs | +1.1% |
+
+- `crew_select_model_routed`'s +20 ns is real: the walk to a gateway's slot, once per task. A selection now allocates nothing,
+  where it minted a 16-byte Str per task.
+- New rows: `model_for_tier_*` 57 ns, `crew_attribute_owned_by` 143 ns, `model_catalog_owner_200_last` 3.8 µs,
+  `model_catalog_parse_200` 1.8 ms. `default_model_*` and `crew_infer_provider_fallthrough` are gone with what they measured.
+- `crew_runner_10_tasks_parallel_4_{quiet,llm_quiet,llm_watched}` read −19% to −29% in both A/B runs. **Not claimed:** this
+  release does not touch what those rows spend their time on, and they have swung by as much on placement before (B27).
+  `ipc_accept_close_under_load` +5.3% is on a path this does not touch.
+
+### Tests
+
+- **`tests/llm_model_catalog.tcyr`, new**, on bodies in the shape `catalog_emit_entry` writes and at hoosh's prices: parsing,
+  each tier on real lineups, the reads, the ration, the override, a race of eight, and a real socket for `agnosai_hoosh_get_a`'s
+  success arm, which no stub can reach.
+- **`tests/orch_model_selection.tcyr`, new:** from the agent to the wire. Selection per tier, a listed `openai/…` id sent
+  unchanged, attribution from `owned_by`, the no-catalog error at task and crew level, and a refused selection, with and without
+  tools. A tool that has run is not run again.
+- The `llama3:*` assertions moved with the change: `tests/llm_router.tcyr`'s to the catalog suite, and
+  `tests/orch_crew_runner.tcyr`'s onto a canned catalog. `tests/fleet_cost_planning.tcyr` loses `select_cheapest_model`'s.
+- **63 mutants, every one killed by an assertion.** Of the first 46, one survived, and it was a guard written twice. Of the rest,
+  one survived because a good read had just stamped the time a failed read was meant to be tested for, and one test could only
+  fail by hanging. Both are fixed. ⚠ The aarch64 fences are not among them: x86 cannot show that reordering.
+
+### Verified
+
+- `check-symbols.sh` 3,110 definitions; `check-clean.sh` fmt 234, lint 234, doc 118, doctest 1 files; `deps --verify` 119;
+  then build, 105 suites and 10,990 assertions with 0 failed under `CYRIUS_DCE=1`, coverage 99% with the same 11 unreferenced
+  as 2.3.0 and every new public name named by a test, `distlib --all --check`, examples, fuzz 4/4.
+- **Against a real hoosh 2.10.1**, with a stub provider behind it speaking Anthropic's and OpenAI's wire and the binary
+  taking `POST /api/v1/crews`. hoosh's parsers built the catalog, so its shape, capabilities and prices are hoosh's own. `medium`
+  reached the provider as `claude-sonnet-5-5` and `high` as `claude-fable-5-1`. `openai/gpt-oss-120b` arrived unchanged, on a
+  route that lists it as Groq's. A retired id, past the interval, was refused and the same task finished on the new pick. A
+  list with no catalog path read through `/v1/models`, and a dead gateway failed the crew by name.
+- **An independent review** found one must-fix and eight should-fixes, all taken here or recorded in ADR 030 and the roadmap.
+  The worst: publication with no fence, which on aarch64 could fault a reader on a half-built slot. A provider's 404 with no
+  `message` key reached agnosai as a bare 502, as hoosh writes it into JSON unescaped, so Ollama's never re-read. An unrationed
+  re-read let a caller grow hoosh by naming models: measured at 15.4 KB per GET at 9 entries. Capable could cost more than
+  Premium, and the span kept the refused id.
+- ⚠ **Not run:** a provider that is not a stub, so no real model answered; `usage.provider`-less attribution end to end, as
+  a current hoosh always writes one and REST results do not carry `metadata`, so that is pinned by suites only; the aarch64 binary,
+  which was built and not started, so **the fences are unproven by any run**; the `ubuntu:26.04` CI replica; a consumer.
+  joshua and kiran are not on this machine, so that neither calls the removed functions is unchecked.
+
+### Not in this release
+
+- **Selection cannot see tools.** The catalog has no such bit, and `gpt-6-astra` takes none on Chat Completions, so on an
+  OpenAI-only gateway a `complexity: high` agent with tools fails with the provider's 400 until `AGNOSAI_MODEL_PREMIUM` is set.
+  The ask is on the roadmap, with `tier`, `kind`, and the two hoosh bugs this found.
+- **A local embedder the twelve words miss.** On a box of local models the first listed is every tier, so a tag like `bge-m3`
+  listed first is sent to chat.
+
 ## [2.3.0] — 2026-11-07
 
 An agent can now use its tools. Until this release an agent was one prompt, and a registered tool was never called by

@@ -30,9 +30,10 @@ HOOSH_DIR="${HOOSH_DIR:-$HOME/Repos/hoosh}"
 AGNOSAI_DIR="${AGNOSAI_DIR:-$HOME/Repos/agnosai}"
 KEY_FILE="${AGNOS_KEY_FILE:-$HOME/.ssh/.api_keys}"
 HOOSH_PORT="${HOOSH_PORT:-8088}"
-# The default_model() Fast tier from src/llm/router.cyr. Override for a
-# provider-backed model (e.g. AGNOSAI_MODEL=claude-opus-4-8).
-MODEL="${AGNOSAI_MODEL:-llama3}"
+# Empty: `check` sends what the gateway's catalog says its Fast tier means, which is what a crew
+# would get. Set it to send one id exactly as given (e.g. AGNOSAI_MODEL=claude-opus-5-5). Not the
+# binary's AGNOSAI_MODEL_FAST / _CAPABLE / _PREMIUM, which override a tier for a server.
+MODEL="${AGNOSAI_MODEL:-}"
 
 RUN_DIR="$STACK_HOME/run"
 LOG_DIR="$STACK_HOME/logs"
@@ -144,7 +145,7 @@ cmd_status() {
 # driven through **agnosai's own seam client** rather than curl.
 #
 # That distinction is the whole point: a curl POST proves the gateway is up, but
-# only tests/smcyr/llm_live.smcyr exercises `agnosai_hoosh_chat` — the one I/O
+# only tests/smcyr/llm_live.smcyr exercises `agnosai_hoosh_chat` — the one chat I/O
 # call in src/llm/hoosh.cyr. Everything else about the seam is unit-tested
 # offline in tests/llm_hoosh.tcyr.
 cmd_check() {

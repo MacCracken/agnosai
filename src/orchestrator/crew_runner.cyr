@@ -8,10 +8,10 @@
 # sizing says large items go in small verified bites. The split, in dependency
 # order:
 #
-#   * bite 14 (here) — the pure leaves: `pick_best_agent`, `infer_provider`,
+#   * bite 14 (here) — the pure leaves: `pick_best_agent`,
 #     `build_system_prompt`, `strip_provider_prefix`, `select_model`,
 #     `topological_sort`. No async, no I/O, no struct, and 12 of the module's
-#     30 tests land on them.
+#     30 tests land on them. (`select_model` reads hoosh's catalog since ADR 030.)
 #   * bite 15 — `execute_task` (crew_runner.rs:619-898), the LLM call path.
 #   * bite 16 — the `CrewRunner` struct, its builders, and the three process
 #     modes (`run`, `run_sequential`, `run_parallel`, `run_dag`).
@@ -64,25 +64,26 @@
 # This is the highest drift risk in the module, so it is written down rather
 # than left for a reviewer to "tidy":
 #
-#   1. `_agnosai_crew_infer_provider`'s **model-name needles** — `gpt-`, `o1`,
-#      `o3`, `claude`, `deepseek`, `gemini`, `grok`, `mistral`, `mixtral`.
-#      Matched case-INSENSITIVELY, anchored at position 0.
+#   1. hoosh's **`provider_name` spellings**, which are `usage.provider` and a
+#      catalog entry's `owned_by`: `openai`, `anthropic`, `groq`, `ollama` and so
+#      on. What a result's `provider` says. agnosai holds no copy of the list
+#      (ADR 030).
 #   2. `_agnosai_crew_strip_provider_prefix`'s **twelve litellm segment names**
 #      — `ollama`, `openai`, `anthropic`, `groq`, `deepseek`, `mistral`,
 #      `together`, `fireworks`, `anyscale`, `perplexity`, `bedrock`, `azure`.
 #      Matched case-SENSITIVELY and as a whole segment.
 #   3. `agnosai_provider_to_wire` / `_from_wire` (`src/llm/hoosh.cyr`) — the
 #      **wire spellings**: `open_ai`, `anthropic`, `google`, `mistral`,
-#      `deep_seek`, `grok`, `ollama`.
+#      `deep_seek`, `grok`, `ollama`. Nothing in `src/` reads these since ADR 030.
 #
 # The collisions that would drift: `deepseek` is one word in (1) and (2) but
-# `deep_seek` in (3), and `openai` is one word in (2) but `open_ai` in (3).
-# Copying (3)'s spellings into (2) makes `openai/gpt-4o` and `deepseek/x` stop
-# stripping — and `openai/gpt-4o` is one of the three cases the oracle's own
+# `deep_seek` in (3), and `openai` is one word in (1) and (2) but `open_ai` in
+# (3). Copying (3)'s spellings into (2) makes `openai/gpt-4o` and `deepseek/x`
+# stop stripping — and `openai/gpt-4o` is one of the three cases the oracle's own
 # `test_select_model_strips_provider_prefix` asserts. Set (3) also carries
 # `google` and `grok`, which are not strippable prefixes, and lacks six of set
-# (2)'s twelve. Separately, `groq` in (2) is one letter from `grok` in (1) and
-# (3), and the oracle's provider enum has no Groq variant at all.
+# (2)'s twelve. Separately, `groq` in (2) is one letter from `grok` in (3), and
+# the oracle's provider enum has no Groq variant at all.
 #
 # ## Two complexity vocabularies, and the asymmetry is the contract
 #
@@ -155,42 +156,6 @@ fn _agnosai_crew_pick_best_agent_a(a, agents, task): i64 {
           str_data(line), str_len(line));
     }
     return best;
-}
-
-# Infer the provider from a model name, for cost tracking.
-#
-# The arms are the oracle's, in the oracle's order, all anchored at position 0
-# (`starts_with`, never a substring search). Order matters where patterns could
-# overlap, and the `mistral`/`mixtral` pair shares one arm.
-#
-# The default is **Ollama**, not OpenAI. That matters because `AGNOSAI_PROVIDER_
-# OPENAI` is 0, so a port that fell through to a bare `return 0` would silently
-# bill every local model to OpenAI.
-#
-# The oracle uses `to_lowercase()` (full Unicode) where this uses
-# `_agnosai_to_ascii_lower`. Not a reachable difference: every needle is ASCII
-# and anchored at byte 0, so a non-ASCII leading byte fails all nine arms either
-# way, and lowering it cannot create or destroy an ASCII prefix match.
-fn _agnosai_crew_infer_provider(model: Str): i64 {
-    return _agnosai_crew_infer_provider_a(default_alloc(), model);
-}
-
-# `_agnosai_crew_infer_provider`, in allocator `a`.
-fn _agnosai_crew_infer_provider_a(a, model: Str): i64 {
-    var m = _agnosai_to_ascii_lower_a(a, model);
-
-    if (str_starts_with(m, str_from_a(a, "gpt-")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
-    if (str_starts_with(m, str_from_a(a, "o1")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
-    if (str_starts_with(m, str_from_a(a, "o3")) == 1) { return AGNOSAI_PROVIDER_OPENAI; }
-    if (str_starts_with(m, str_from_a(a, "claude")) == 1) { return AGNOSAI_PROVIDER_ANTHROPIC; }
-    if (str_starts_with(m, str_from_a(a, "deepseek")) == 1) { return AGNOSAI_PROVIDER_DEEPSEEK; }
-    if (str_starts_with(m, str_from_a(a, "gemini")) == 1) { return AGNOSAI_PROVIDER_GOOGLE; }
-    if (str_starts_with(m, str_from_a(a, "grok")) == 1) { return AGNOSAI_PROVIDER_GROK; }
-    if (str_starts_with(m, str_from_a(a, "mistral")) == 1) { return AGNOSAI_PROVIDER_MISTRAL; }
-    if (str_starts_with(m, str_from_a(a, "mixtral")) == 1) { return AGNOSAI_PROVIDER_MISTRAL; }
-
-    # Local models (llama and friends) — free via Ollama.
-    return AGNOSAI_PROVIDER_OLLAMA;
 }
 
 # Build the system prompt from an agent definition, or the generic one when
@@ -307,42 +272,96 @@ fn _agnosai_crew_strip_provider_prefix_a(a, model: Str): i64 {
     return str_sub_a(a, model, idx + 1, str_len(model) - idx - 1);
 }
 
-# Select the model for an agent: its own override, else routed by complexity.
+# The id to send for a model an agent names.
 #
-# Returns a view, like the oracle. Three arms, in the oracle's precedence:
+# **A listed id goes as listed** (ADR 030). The strip is for litellm's `provider/model` spelling, and
+# `provider/` is also how some providers spell a model: Groq serves `openai/gpt-oss-120b` and every
+# OpenRouter id is `vendor/model`. Only the catalog can tell the two apart. An id the strip would not
+# touch needs no catalog, so an agent naming `gpt-4o` causes no read at all. With no catalog, or an id
+# it does not list, the strip stands, which is what such an id has always got.
+fn _agnosai_crew_named_model_a(a, client, named: Str): i64 {
+    var stripped = _agnosai_crew_strip_provider_prefix_a(a, named);
+    if (stripped == named) { return named; }
+    if (agnosai_model_catalog_listed(client, named) == 1) { return named; }
+    return stripped;
+}
+
+# The tier of `agent`'s task. No agent is Capable. In `a`.
+fn _agnosai_crew_tier_a(a, agent): i64 {
+    if (agent == 0) { return AGNOSAI_TIER_CAPABLE; }
+    var complexity = agnosai_parse_complexity(agnosai_agent_complexity(agent));
+    return agnosai_route(agnosai_task_profile_new_a(a, AGNOSAI_TASKTYPE_REASON, complexity));
+}
+
+# Select the model for a task: its agent's own, else the one its tier means.
 #
-#   1. An agent with `llm_model` set — stripped of any provider prefix. The
-#      override runs THROUGH the strip, not around it.
-#   2. An agent without one — `parse_complexity` on the agent's complexity, then
-#      the router's Reason-task matrix, then that tier's default model.
-#   3. No agent at all — the Capable tier default.
+# Returns 0 with the id through `out_model`, or why there is none, which is a task that does not run
+# rather than one that sends a guess (ADR 030). The id may be in `a` or last the process. Three arms,
+# in the oracle's precedence:
+#
+#   1. An agent with `llm_model` set — sent as `_agnosai_crew_named_model_a` says.
+#   2. An agent without one — `parse_complexity` on the agent's complexity, then the router's
+#      Reason-task matrix, then that tier in the gateway's catalog.
+#   3. No agent at all — the Capable tier.
 #
 # The presence test in arm 1 is `!= 0`, never `str_len(...) > 0`: an agent whose
 # `llm_model` is explicitly `""` gets `""`, not the routed default. `str_from("")`
 # is a real 16-byte header with length 0, so absent and empty are genuinely
 # distinguishable here and conflating them is the likeliest silent divergence.
 #
-# Arm 2 goes through the full router rather than a direct complexity→model
+# Arm 2 goes through the full router rather than a direct complexity→tier
 # table, and the reason is the counter-intuitive `low` case: Simple + Reason
-# routes to **Capable**, never Fast. A shortcut table would write
-# `low → fast → "llama3"` and pass every test that does not cover `low`. As a
-# consequence `AGNOSAI_TIER_FAST`'s `"llama3"` is unreachable from here at all.
-fn _agnosai_crew_select_model(agent): i64 {
-    return _agnosai_crew_select_model_a(default_alloc(), agent);
+# routes to **Capable**, never Fast. A shortcut table would write `low → fast`
+# and pass every test that does not cover `low`. As a consequence
+# `AGNOSAI_TIER_FAST` is unreachable from here at all.
+fn _agnosai_crew_select_model(client, agent, out_model): i64 {
+    return _agnosai_crew_select_model_a(default_alloc(), client, agent, out_model);
 }
 
 # `_agnosai_crew_select_model`, in allocator `a`.
-fn _agnosai_crew_select_model_a(a, agent): i64 {
-    if (agent == 0) { return agnosai_default_model_a(a, AGNOSAI_TIER_CAPABLE); }
-
-    var override_model = agnosai_agent_llm_model(agent);
-    if (override_model != 0) {
-        return _agnosai_crew_strip_provider_prefix_a(a, override_model);
+fn _agnosai_crew_select_model_a(a, client, agent, out_model): i64 {
+    if (agent != 0) {
+        var named = agnosai_agent_llm_model(agent);
+        if (named != 0) {
+            store64(out_model, _agnosai_crew_named_model_a(a, client, named));
+            return 0;
+        }
     }
+    return agnosai_model_for_tier_a(a, client, _agnosai_crew_tier_a(a, agent), out_model);
+}
 
-    var complexity = agnosai_parse_complexity(agnosai_agent_complexity(agent));
-    var profile = agnosai_task_profile_new_a(a, AGNOSAI_TASKTYPE_REASON, complexity);
-    return agnosai_default_model_a(a, agnosai_route(profile));
+# Whether nothing a catalog says could change what `agent`'s task sends: an id the strip leaves alone,
+# or a tier the operator named. A refused id of that kind is not worth asking the gateway about, and
+# with an agent that names a typo, every task would.
+fn _agnosai_crew_selection_fixed_a(a, agent): i64 {
+    if (agent != 0) {
+        var named = agnosai_agent_llm_model(agent);
+        if (named != 0) {
+            if (_agnosai_crew_strip_provider_prefix_a(a, named) == named) { return 1; }
+            return 0;
+        }
+    }
+    if (agnosai_model_tier_override(_agnosai_crew_tier_a(a, agent)) != 0) { return 1; }
+    return 0;
+}
+
+# What to send instead of `model` after the gateway refused it with `err`, or 0 to let `err` stand.
+#
+# A held catalog goes stale: hoosh refreshes every six hours, a provider retires an id between two of
+# them, and a process keeps its first read for good. So a refused id reads the list again, at most
+# once a minute, and the task selects from what is there. The same id coming back means the list had
+# no better answer, and the failure is the true one. What the agent or the operator named is theirs,
+# and costs the gateway nothing, unless the strip renamed it and a read might let it go out as listed.
+# In `a`.
+fn _agnosai_crew_reselect_a(a, client, agent, model: Str, err: Str): Str {
+    if (agnosai_hoosh_refused_model(err) == 0) { return 0; }
+    if (_agnosai_crew_selection_fixed_a(a, agent) == 1) { return 0; }
+    agnosai_model_catalog_reread(client);
+    var next: i64[1];
+    store64(&next, 0);
+    if (_agnosai_crew_select_model_a(a, client, agent, &next) != 0) { return 0; }
+    if (str_eq(load64(&next), model) == 1) { return 0; }
+    return load64(&next);
 }
 
 # ── bite 15: execute_task ───────────────────
@@ -737,16 +756,13 @@ fn _agnosai_crew_answer_metadata_a(a, r, resp, start_ns, agent): i64 {
           bayan_json_v_str_new_a(a, agnosai_agent_key(agent)));
     }
 
+    # Omitted when nobody knows, as `cost_micro_usd` is, and for the same reason: a name that was
+    # guessed cannot be told from one that was reported.
     var provider = agnosai_inference_response_provider(resp);
-    if (provider == 0) {
-        # No provider on the wire — infer it from the model name, which is what
-        # the oracle's own cost path did. Less accurate than hoosh's answer: it
-        # cannot see a DLP re-route to a local provider.
-        provider = agnosai_provider_to_wire_a(a,
-          _agnosai_crew_infer_provider_a(a, agnosai_inference_response_model(resp)));
+    if (provider != 0) {
+        agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "provider"),
+          bayan_json_v_str_new_a(a, provider));
     }
-    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "provider"),
-      bayan_json_v_str_new_a(a, provider));
 
     var tokens = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, tokens, str_from_a(a, "prompt"),
@@ -766,6 +782,19 @@ fn _agnosai_crew_answer_metadata_a(a, r, resp, start_ns, agent): i64 {
     agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "task_duration_ms"),
       bayan_json_v_int_new_a(a, _agnosai_crew_elapsed_ms(start_ns)));
     return r;
+}
+
+# Name the provider of a response the gateway did not name one on: the catalog entry's `owned_by`.
+#
+# Only a hoosh before 2.6.0 leaves this to do, and a gateway's own word is better than this one:
+# `owned_by` is the first route that matches, which cannot see a DLP re-route to a local provider.
+# The id asked for is tried second, as a provider answers with the dated form of an alias.
+fn _agnosai_crew_attribute(client, resp, model: Str): i64 {
+    if (agnosai_inference_response_provider(resp) != 0) { return 0; }
+    var owner = agnosai_model_catalog_owner(client, agnosai_inference_response_model(resp));
+    if (owner == 0) { owner = agnosai_model_catalog_owner(client, model); }
+    if (owner != 0) { agnosai_inference_response_with_provider(resp, owner); }
+    return 0;
 }
 
 # The failure result — status Failed, output `"LLM error: " + err`, and metadata
@@ -866,8 +895,8 @@ fn _agnosai_crew_converse_a(ra, task_id: Str, client, request, trace, st, out_re
 # result may point into `ra`.** The final response and the error are copied out below, and that is
 # the only place a copy is made: with no tools the two are one allocator, and no byte of this path
 # is any different from what it was.
-fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, self_sc, model: Str,
-  st, start_ns): i64 {
+fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, span, self_sc,
+  model: Str, st, start_ns): i64 {
     var task_id = agnosai_task_id(task);
     var request = _agnosai_crew_build_request_a(ra, task, agent, model, 0);
     if (st != 0) {
@@ -877,6 +906,22 @@ fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, se
     var resp: i64[1];
     store64(&resp, 0);
     var err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, &resp);
+
+    # A refused id, once. ⚠ Only with no answer yet, which is what says no tool has run: this builds
+    # the request again, and a task that has called a tool keeps its transcript (below).
+    if (err != 0 && load64(&resp) == 0) {
+        var better = _agnosai_crew_reselect_a(ra, client, agent, model, err);
+        if (better != 0) {
+            model = better;
+            # In `a`, as `ra` may be gone by the time the span is recorded. A no-op at span 0.
+            if (span != 0) { agnosai_genai_span_set_request_model(span, str_clone_a(a, model)); }
+            request = _agnosai_crew_build_request_a(ra, task, agent, model, 0);
+            if (st != 0) {
+                agnosai_inference_request_with_tools(request, _agnosai_tool_task_definitions(st));
+            }
+            err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, &resp);
+        }
+    }
 
     # The output-schema validation loop. Every answer is checked, the last one
     # included: `AGNOSAI_MAX_VALIDATION_RETRIES` retries are each followed by a
@@ -926,8 +971,7 @@ fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, se
             if (called == 1) {
                 agnosai_inference_request_say(request, AGNOSAI_ROLE_USER, retry_prompt);
             } else {
-                request = _agnosai_crew_build_request_a(ra, task, agent,
-                  _agnosai_crew_select_model_a(ra, agent), retry_prompt);
+                request = _agnosai_crew_build_request_a(ra, task, agent, model, retry_prompt);
                 if (st != 0) {
                     agnosai_inference_request_with_tools(request, _agnosai_tool_task_definitions(st));
                 }
@@ -953,6 +997,7 @@ fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, se
         if (err != 0) { err = str_clone_a(a, err); }
         if (load64(&extracted) != 0) { store64(&extracted, str_clone_a(a, load64(&extracted))); }
     }
+    if (load64(&resp) != 0) { _agnosai_crew_attribute(client, load64(&resp), model); }
 
     if (err != 0) {
         var failed = 0;
@@ -988,7 +1033,7 @@ fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, se
 #
 # The arena is given back on the one way out. Pool empty and nothing to mint leaves `ra` the crew's
 # allocator, which costs a global-heap crew its transcript and nothing else.
-fn _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id: Str, self_sc,
+fn _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id: Str, span, self_sc,
   model: Str, loop, start_ns): i64 {
     var arena = _agnosai_tool_arena_acquire();
     var ra = arena;
@@ -1002,8 +1047,8 @@ fn _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id: 
           agnosai_task_id(task), load64(&miss));
         result = _agnosai_crew_tool_failed_result_a(a, task, load64(&miss), start_ns);
     } else {
-        result = _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id, self_sc,
-          model, st, start_ns);
+        result = _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id, span,
+          self_sc, model, st, start_ns);
         _agnosai_tool_task_finish_a(st, result);
     }
 
@@ -1027,19 +1072,27 @@ fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, 
     _agnosai_crew_log_a(a, SK_DEBUG, "executing task via LLM", 22, task_id,
       _agnosai_crew_agent_label_a(a, agent));
 
-    var model = _agnosai_crew_select_model_a(a, agent);
+    var selected: i64[1];
+    store64(&selected, 0);
+    var unselected = _agnosai_crew_select_model_a(a, client, agent, &selected);
+    if (unselected != 0) {
+        _agnosai_crew_log_a(a, SK_WARN, "task refused: no model to send", 30, task_id,
+          _agnosai_crew_agent_label_a(a, agent));
+        return _agnosai_crew_error_result_a(a, task, unselected, start_ns);
+    }
+    var model = load64(&selected);
     # The agent has one configured model, so the span says which (the pinned
     # convention's `gen_ai.request.model` on `invoke_agent`). A no-op at span 0.
     agnosai_genai_span_set_request_model(span, model);
 
     if (loop != 0 && agent != 0) {
         if (vec_len(agnosai_agent_tools(agent)) > 0) {
-            return _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id,
+            return _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id, span,
               self_sc, model, loop, start_ns);
         }
     }
-    return _agnosai_crew_answer_a(a, a, task, agent, client, event_tx, crew_id, self_sc, model, 0,
-      start_ns);
+    return _agnosai_crew_answer_a(a, a, task, agent, client, event_tx, crew_id, span, self_sc,
+      model, 0, start_ns);
 }
 
 # Execute one task of a crew via the LLM, or return the placeholder when there

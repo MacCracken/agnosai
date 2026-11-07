@@ -19,12 +19,13 @@ So:
 - **To support a new vendor** — add it to **hoosh**, not here. Nothing in this
   repo needs to change; a new model string starts working the moment the gateway
   understands it.
-- **To make agnosai *label* a vendor** (for routing tiers, cost attribution and
-  metadata), extend the enum below. That is a label, not a transport.
+- **To have a vendor take part in tiers and attribution**, nothing here changes
+  either: both are read from hoosh's catalog (`src/model_catalog.cyr`, ADR 030).
 
 ## The provider labels
 
-`AgnosaiProviderType` in `src/llm/hoosh.cyr` — seven variants:
+`AgnosaiProviderType` in `src/llm/hoosh.cyr` — seven variants, public, and read by
+nothing in `src/` since ADR 030. A result's `provider` is hoosh's own word:
 
 ```cyr
 enum AgnosaiProviderType {
@@ -38,17 +39,16 @@ enum AgnosaiProviderType {
 }
 ```
 
-To add one:
+If a consumer of the library needs one added:
 
 1. **Append** a variant. ⚠ Append — the numbering is positional and existing
    values must not shift.
 2. Add its spelling to `agnosai_provider_to_wire` and
    `agnosai_provider_from_wire`. ⚠ `from_wire` reads an unknown spelling as
    `OpenAi` rather than failing, matching the oracle.
-3. Teach `_agnosai_crew_infer_provider` (`src/orchestrator/crew_runner.cyr`) the
-   model-string prefix that implies it, if there is one.
-4. Extend the router's tier matrix in `src/llm/router.cyr` if the vendor should
-   participate in Fast / Capable / Premium selection.
+
+Which models a provider serves, what they cost and who owns them come from hoosh's catalog, so it
+takes part in Fast / Capable / Premium selection and in attribution as soon as hoosh lists it.
 
 ⚠ **These spellings are not on any wire agnosai controls.** The comment above the
 enum says so: they are the conventional `snake_case` forms, but the gateway is

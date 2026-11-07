@@ -74,6 +74,7 @@ include "src/tools/native.cyr"
 include "src/tools/registry.cyr"
 include "src/tool_call.cyr"
 include "src/tool_loop.cyr"
+include "src/model_catalog.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "src/sandbox/mod.cyr"
 include "src/tools/mod.cyr"
@@ -198,6 +199,23 @@ fn _t_chat_capture(client, request, out_response, parent_sc): i64 {
     return 0;
 }
 
+# A gateway whose list moves on: `span-old` until the chat call has refused it.
+var _t_refused = 0;
+
+fn _t_get_moved(client, a, path: Str, out_body): i64 {
+    if (_t_refused == 1) { store64(out_body, str_from("{\"data\":[{\"id\":\"span-new\"}]}")); }
+    else { store64(out_body, str_from("{\"data\":[{\"id\":\"span-old\"}]}")); }
+    return 200;
+}
+
+fn _t_chat_refuses_old(client, request, out_response, parent_sc): i64 {
+    if (str_eq_cstr(agnosai_inference_request_model(request), "span-old") == 1) {
+        _t_refused = 1;
+        return str_from("hoosh returned HTTP 404: no provider for model");
+    }
+    return _t_chat_capture(client, request, out_response, parent_sc);
+}
+
 # The same, failing — every attempt is an error the retry driver gives up on.
 fn _t_chat_fail(client, request, out_response, parent_sc): i64 {
     _t_chat_parent = parent_sc;
@@ -248,6 +266,9 @@ fn _t_tool_crew_doc(ring, reg): i64 {
 var _T_TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
 fn main(): i64 {
+    # A crew with no `llm_model` needs a model to send, and which one is not what this suite is about.
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("stub-model"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_PREMIUM, str_from("stub-model"));
     var g = agnosai_telemetry_init_tracing(str_from("http://localhost:4318"));
     var ring = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
     assert(ring != 0, "telemetry is on and the exporter has a ring");
@@ -471,6 +492,22 @@ fn main(): i64 {
       "and it is the TASK span's own context — a chat span is the agent's child");
     assert_eq(str_contains_cstr(ltask, "\"gen_ai.request.model\""), 1,
       "the task span names the model the agent was configured with");
+
+    # A selection the gateway refused: the span says what answered, not what was first chosen. That
+    # is the case an operator opens a trace for (ADR 030).
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, 0);
+    agnosai_model_catalog_set_reread_ms(0);
+    var moved_r = agnosai_crew_runner_with_llm(agnosai_crew_runner_new(
+        _t_crew("moved-crew", 1, agnosai_process_sequential())),
+      agnosai_hoosh_client_with_get(agnosai_hoosh_client_with_chat(agnosai_hoosh_client_new(
+            str_from("http://moved-gw"), str_from("")), &_t_chat_refuses_old), &_t_get_moved));
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    agnosai_crew_runner_run(moved_r, &run_err);
+    var mtask = vec_get(_t_named(_t_frags(agnosai_otlp_ring_drain(ring, str_from("agnosai"))),
+        "invoke_agent"), 0);
+    assert_eq(str_contains_cstr(mtask, "span-new"), 1, "a re-selected task's span names the new id");
+    assert_eq(str_contains_cstr(mtask, "span-old"), 0, "and not the one the gateway refused");
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("stub-model"));
 
     # A failed inference is a Failed task: invoke_agent and the workflow are
     # both ERROR with error.type task_failed.

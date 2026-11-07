@@ -68,20 +68,6 @@ fn main(): i64 {
     var c_unknown = agnosai_estimate_crew_cost(10, 1000, str_from("some-custom-model"), p);
     _t_assert_f64(c_unknown, _t_expect_cost(10000, 80, 8, 10), "unknown model uses the medium tier");
 
-    # --- oracle: select_cheapest_model_within_budget --------------------
-    var tight = agnosai_select_cheapest_model(_t_f64_ratio(1, 100), 5, 500, p);
-    assert(tight != 0, "a tight budget still finds a model");
-    assert(str_eq_cstr(tight, "llama-7b") == 1 || str_eq_cstr(tight, "mistral-7b") == 1,
-      "a tight budget picks a small open model");
-
-    # --- oracle: select_cheapest_model_large_budget ---------------------
-    assert(agnosai_select_cheapest_model(f64_from(100), 5, 500, p) != 0,
-      "a generous budget finds a model");
-
-    # --- oracle: select_cheapest_model_zero_budget ----------------------
-    assert(agnosai_select_cheapest_model(f64_from(0), 100, 10000, p) == 0,
-      "zero budget against real work fits nothing");
-
     # --- oracle: pricing_display ----------------------------------------
     var d = agnosai_gpu_pricing_display(p);
     assert(_t_has(d, "A100=$3.00/h") == 1, "display carries A100 at two decimals");
@@ -134,18 +120,6 @@ fn main(): i64 {
     assert(_agnosai_cost_tier(str_from("")) == AGNOSAI_COST_TIER_UNKNOWN, "an empty model tiers unknown");
     _t_assert_f64(agnosai_estimate_crew_cost(1, 1, str_from(""), p),
       _t_expect_cost(1, 80, 8, 10), "an empty model prices at the medium tier");
-
-    # --- past the oracle: the tie is resolved, not merely accepted ------
-    # llama-7b and mistral-7b both classify open-small, so their costs are
-    # bit-identical and the sort decides which is returned. Rust's sort_by is
-    # stable; vec_sort_by never enters its quicksort path at 8 elements and runs
-    # pure insertion sort, which is also stable. Both therefore answer with the
-    # earlier entry. The oracle's own assertion accepts either and pins nothing.
-    _t_assert_f64(agnosai_estimate_crew_cost(5, 500, str_from("llama-7b"), p),
-      agnosai_estimate_crew_cost(5, 500, str_from("mistral-7b"), p),
-      "llama-7b and mistral-7b cost identically, so the tie is real");
-    assert(str_eq_cstr(tight, "llama-7b") == 1,
-      "the tie resolves to llama-7b, the earlier BUDGET_MODELS entry");
 
     # --- past the oracle: tier labels and rates -------------------------
     assert(str_eq_cstr(agnosai_cost_tier_label(AGNOSAI_COST_TIER_LARGE), "large") == 1, "label large");

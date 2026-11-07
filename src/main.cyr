@@ -248,6 +248,24 @@ fn _agnosai_main_hoosh_url(): i64 {
     return str_from(v);
 }
 
+# The operator's model per tier: `AGNOSAI_MODEL_FAST`, `_CAPABLE` and `_PREMIUM` (ADR 030). Each is
+# an id sent exactly as written, checked by nobody, and with one set that tier never reads the
+# catalog. An empty one is none, which is what makes a variable a compose file passes through blank
+# harmless.
+fn _agnosai_main_load_tier_overrides(): i64 {
+    for (var tier = AGNOSAI_TIER_FAST; tier <= AGNOSAI_TIER_PREMIUM; tier = tier + 1) {
+        var v = getenv(agnosai_model_tier_env(tier));
+        if (v != 0) {
+            agnosai_model_set_tier_override(tier, str_from(v));
+            if (strlen(v) > 0) {
+                _agnosai_main_log_kv(SK_INFO, "model tier overridden", 21, "variable", 8,
+                  str_from(agnosai_model_tier_env(tier)));
+            }
+        }
+    }
+    return 0;
+}
+
 # The listening port: `PORT`, else `AGNOSAI_PORT`, else 8080
 # (`rust-old/src/main.rs:120-124`).
 #
@@ -366,6 +384,7 @@ fn main(): i64 {
     var orchestrator = agnosai_orchestrator_new(agnosai_resource_budget_default());
     agnosai_orchestrator_with_llm_url(orchestrator, hoosh_url, str_from(""));
     agnosai_orchestrator_with_events(orchestrator, events);
+    _agnosai_main_load_tier_overrides();
 
     var tools = agnosai_tool_registry_new();
     agnosai_register_basic_builtins(tools);

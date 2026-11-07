@@ -174,10 +174,12 @@ Agents are defined declaratively in JSON -- same format as Agnostic v1 presets:
   "goal": "Ensure comprehensive test coverage and quality standards",
   "domain": "quality",
   "tools": ["json_transform", "security_audit"],
-  "complexity": "high",
-  "llm_model": "capable"
+  "complexity": "high"
 }
 ```
+
+An agent with no `llm_model` gets the model its `complexity` calls for, from what the gateway lists. To name one, use an
+id from hoosh's `GET /v1/models/catalog`, exactly as listed: `"llm_model": "claude-sonnet-5-5"`.
 
 ## LLM Providers
 
@@ -187,10 +189,11 @@ per-provider protocols. There is no `/v1/messages` or `/api/chat` client in this
 tree — a provider is a *label* that routes a model string, not a separate
 transport.
 
-The seven provider labels the router knows: **OpenAI, Anthropic, Google,
-Mistral, DeepSeek, Grok, Ollama**.
-
-Task-complexity routing automatically selects the right model tier (Fast / Capable / Premium).
+agnosai carries no model names. Task complexity picks a tier (Fast / Capable / Premium), and what a tier means is read
+from hoosh's catalog, by what each model declares and costs ([ADR 030](docs/adr/030-a-model-comes-from-the-gateways-catalog.md)),
+so a provider's new model needs no agnosai release. `AGNOSAI_MODEL_FAST`, `AGNOSAI_MODEL_CAPABLE` and
+`AGNOSAI_MODEL_PREMIUM` override a tier. ⚠ With no catalog and no override, a crew that names no model fails, with an
+error starting `no model catalog:`, rather than send a guess.
 
 ## Tool Execution
 
