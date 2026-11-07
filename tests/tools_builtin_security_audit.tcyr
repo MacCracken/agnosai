@@ -111,8 +111,59 @@ fn _t_has_vuln(vulns, want): i64 {
     return 0;
 }
 
+# What an audit leaves on the global heap (B41). Its two fetches need a server, which no suite has
+# (roadmap B13), so this holds what they feed.
+fn _t_cost_suite(): i64 {
+    test_group("what a call leaves on the global heap");
+    var url = str_from("http://example.com/");
+    var good = _t_mock_headers(1, 0);
+    var wide = _t_mock_headers(0, 1);
+    var ar = arena_allocator_growable(65536);
+    var before = alloc_used();
+    for (var i = 0; i < 50; i = i + 1) {
+        agnosai_audit_result_to_value_a(ar, agnosai_audit_analyze_a(ar, url, good, 0));
+        agnosai_audit_result_to_value_a(ar, agnosai_audit_analyze_a(ar, url, wide, wide));
+        _agnosai_audit_snapshot_a(ar, good);
+        _agnosai_audit_options_a(ar);
+        agnosai_analyze_cors_a(ar, 0);
+        reset_via(ar);
+    }
+    assert_eq(alloc_used() - before, 0, "an audit's analysis and report leave nothing");
+    assert_eq(agnosai_cors_misconfigured(agnosai_analyze_cors_a(ar, wide)), agnosai_cors_misconfigured(
+        agnosai_analyze_cors(wide)), "and the `_a` form reads a preflight as the bare form does");
+    var failed_a = agnosai_cors_detail(agnosai_analyze_cors_a(ar, 0));
+    assert_eq(str_eq(failed_a, agnosai_cors_detail(agnosai_analyze_cors(0))), 1, "and a failed one");
+    reset_via(ar);
+
+    var tool = agnosai_security_audit_tool();
+    var missing = agnosai_tool_input_with_alloc(agnosai_tool_input_new(), ar);
+    var private_url = agnosai_tool_input_new();
+    agnosai_tool_input_set(private_url, str_from("target_url"), bayan_json_v_str_new(str_from("http://127.0.0.1/")));
+    agnosai_tool_input_with_alloc(private_url, ar);
+    agnosai_tool_execute(tool, missing);
+    agnosai_tool_execute(tool, private_url);
+    reset_via(ar);
+    var quiet = alloc_used();
+    for (var j = 0; j < 50; j = j + 1) {
+        agnosai_tool_execute(tool, missing);
+        reset_via(ar);
+    }
+    assert_eq(alloc_used() - quiet, 0, "nor does a call with a parameter missing");
+
+    # ⚠ Not 0: the SSRF guard parses the URL on the global heap, 136 B a check (roadmap B13). The
+    # refusal itself is in `a`, which is what this bounds.
+    var guarded = alloc_used();
+    for (var k = 0; k < 50; k = k + 1) {
+        agnosai_tool_execute(tool, private_url);
+        reset_via(ar);
+    }
+    assert(alloc_used() - guarded <= 50 * 136, "and a refused target leaves only the guard's parse");
+    return 0;
+}
+
 fn main() {
     alloc_init();
+    _t_cost_suite();
 
     test_group("tools_builtin_security_audit");
 
@@ -174,15 +225,15 @@ fn main() {
     assert_eq(_agnosai_audit_pct(1, 0), 0, "a zero denominator yields 0 rather than dividing");
 
     # --- risk bands, on both sides of every boundary ---
-    assert(str_eq(_agnosai_audit_risk_level(100), str_from("low")) == 1, "100 is low risk");
-    assert(str_eq(_agnosai_audit_risk_level(80), str_from("low")) == 1, "80 is the low boundary");
-    assert(str_eq(_agnosai_audit_risk_level(79), str_from("medium")) == 1, "79 is medium");
-    assert(str_eq(_agnosai_audit_risk_level(60), str_from("medium")) == 1,
+    assert(str_eq(_agnosai_audit_risk_level_a(default_alloc(), 100), str_from("low")) == 1, "100 is low risk");
+    assert(str_eq(_agnosai_audit_risk_level_a(default_alloc(), 80), str_from("low")) == 1, "80 is the low boundary");
+    assert(str_eq(_agnosai_audit_risk_level_a(default_alloc(), 79), str_from("medium")) == 1, "79 is medium");
+    assert(str_eq(_agnosai_audit_risk_level_a(default_alloc(), 60), str_from("medium")) == 1,
       "60 is the medium boundary");
-    assert(str_eq(_agnosai_audit_risk_level(59), str_from("high")) == 1, "59 is high");
-    assert(str_eq(_agnosai_audit_risk_level(40), str_from("high")) == 1, "40 is the high boundary");
-    assert(str_eq(_agnosai_audit_risk_level(39), str_from("critical")) == 1, "39 is critical");
-    assert(str_eq(_agnosai_audit_risk_level(0), str_from("critical")) == 1, "0 is critical");
+    assert(str_eq(_agnosai_audit_risk_level_a(default_alloc(), 59), str_from("high")) == 1, "59 is high");
+    assert(str_eq(_agnosai_audit_risk_level_a(default_alloc(), 40), str_from("high")) == 1, "40 is the high boundary");
+    assert(str_eq(_agnosai_audit_risk_level_a(default_alloc(), 39), str_from("critical")) == 1, "39 is critical");
+    assert(str_eq(_agnosai_audit_risk_level_a(default_alloc(), 0), str_from("critical")) == 1, "0 is critical");
 
     # --- audit_detects_missing_security_headers ---
     # mock_audit_server(false, false): no security headers, so 0 of 7.
@@ -487,7 +538,7 @@ fn main() {
       "security_audit resolves from the registry");
 
     # --- the request options carry the oracle's timeout and TLS stance ---
-    var opts = _agnosai_audit_options();
+    var opts = _agnosai_audit_options_a(default_alloc());
     assert(opts != 0, "the options build");
     assert_eq(sandhi_http_options_get_total_ms(opts), 15000, "the 15s timeout is set");
     assert_eq(sandhi_http_options_get_tls_policy(opts), SANDHI_TLS_POLICY_DEFAULT,
@@ -637,7 +688,7 @@ fn main() {
     sandhi_headers_add_a(snap_arena, live, "server", "Apache/2.4.99");
     sandhi_headers_add_a(snap_arena, live, "access-control-allow-origin", "*");
     sandhi_headers_add_a(snap_arena, live, "x-irrelevant", "dropped");
-    var snap = _agnosai_audit_snapshot(live);
+    var snap = _agnosai_audit_snapshot_a(default_alloc(), live);
     reset_via(snap_arena);
     # scribble over the released region so a borrowed pointer would show up
     var scribble = alloc_via(snap_arena, 4096);
@@ -653,7 +704,7 @@ fn main() {
       "and the CORS header, so one snapshot serves both chains");
     assert_eq(sandhi_headers_has(snap, "x-irrelevant"), 0,
       "a header the audit never reads is not copied");
-    assert_eq(_agnosai_audit_snapshot(0) != 0, 1,
+    assert_eq(_agnosai_audit_snapshot_a(default_alloc(), 0) != 0, 1,
       "snapshotting a null header set yields an empty set, not 0");
 
     # ⚠ **The failure message must name the REASON.** The oracle reports the
@@ -662,18 +713,18 @@ fn main() {
     # failure to the fixed string "request failed", so an operator could not tell
     # DNS from TLS from a timeout. `agnosai_guarded_fetch` computed sandhi's
     # error kind and dropped it — `agnosai_guarded_fetch_full` now surfaces it.
-    assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_CONNECT),
+    assert(str_contains_cstr(_agnosai_audit_reason_a(default_alloc(), SANDHI_ERR_CONNECT),
         "connection") == 1, "a connect failure says so");
-    assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_TLS), "TLS") == 1,
+    assert(str_contains_cstr(_agnosai_audit_reason_a(default_alloc(), SANDHI_ERR_TLS), "TLS") == 1,
       "a TLS failure says so");
-    assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_TIMEOUT),
+    assert(str_contains_cstr(_agnosai_audit_reason_a(default_alloc(), SANDHI_ERR_TIMEOUT),
         "timed out") == 1, "a timeout says so");
-    assert(str_contains_cstr(_agnosai_audit_reason(SANDHI_ERR_DISCOVERY),
+    assert(str_contains_cstr(_agnosai_audit_reason_a(default_alloc(), SANDHI_ERR_DISCOVERY),
         "resolution") == 1, "a DNS failure says so");
-    assert(str_eq(_agnosai_audit_reason(SANDHI_ERR_CONNECT),
-        _agnosai_audit_reason(SANDHI_ERR_TLS)) == 0,
+    assert(str_eq(_agnosai_audit_reason_a(default_alloc(), SANDHI_ERR_CONNECT),
+        _agnosai_audit_reason_a(default_alloc(), SANDHI_ERR_TLS)) == 0,
       "and the kinds are DISTINCT — one shared string would be the old behaviour");
-    assert(str_contains_cstr(_agnosai_audit_reason(0), "request failed") == 1,
+    assert(str_contains_cstr(_agnosai_audit_reason_a(default_alloc(), 0), "request failed") == 1,
       "an unknown kind falls back to the generic message");
 
     # ⚠ **The table above is PURE, so asserting it does not test the wiring** —
@@ -710,7 +761,8 @@ fn main() {
     if (probe_got != 0) {
         # A kind was captured, so the transport must have failed.
         assert_eq(probe_rc, 0, "a captured kind means the fetch failed");
-        assert(str_eq(_agnosai_audit_reason(probe_got), _agnosai_audit_reason(0)) == 0,
+        var reason_alloc = default_alloc();
+        assert(str_eq(_agnosai_audit_reason_a(reason_alloc, probe_got), _agnosai_audit_reason_a(reason_alloc, 0)) == 0,
           "a captured kind yields a SPECIFIC reason, not the generic fallback");
         assert_eq(probe_got, SANDHI_ERR_DISCOVERY,
           "and an unresolvable host is a DISCOVERY failure");
@@ -718,7 +770,7 @@ fn main() {
         # No resolver: sandhi returned no result, so there is no kind. The
         # message must then be the generic one rather than a reason invented
         # from a zero.
-        assert(str_contains_cstr(_agnosai_audit_reason(probe_got), "request failed") == 1,
+        assert(str_contains_cstr(_agnosai_audit_reason_a(default_alloc(), probe_got), "request failed") == 1,
           "with no kind observed the message stays generic rather than inventing one");
     }
 

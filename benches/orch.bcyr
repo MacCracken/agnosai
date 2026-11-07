@@ -2360,6 +2360,15 @@ fn _b_tool_exec(ctx, input): i64 {
     return _b_tool_out;
 }
 
+# Answers in its call's allocator, as a built-in does (B41). Beside `_b_tool_exec`'s row this is
+# what building an answer costs, not the loop.
+fn _b_tool_exec_kept(ctx, input): i64 {
+    var a = agnosai_tool_input_alloc(input);
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "note"), bayan_json_v_str_new_a(a, str_from_a(a, "done")));
+    return agnosai_tool_output_ok_a(a, o);
+}
+
 fn _b_tool_chat(client, request, out_response, parent_sc): i64 {
     var msgs = agnosai_inference_request_messages(request);
     var last = vec_get(msgs, vec_len(msgs) - 1);
@@ -2384,11 +2393,11 @@ fn _b_tool_body(n): i64 {
     return str_builder_build(sb);
 }
 
-fn _b_tool_task(name, calls, n): i64 {
+fn _b_tool_task(name, calls, n, exec): i64 {
     _b_tool_ask = _b_tool_body(calls);
     var reg = agnosai_tool_registry_new();
     agnosai_tool_registry_register(reg, agnosai_tool_new(str_from("work"), str_from("a bench tool"),
-        &_b_tool_schema, &_b_tool_exec, 0));
+        &_b_tool_schema, exec, 0));
     var tools = vec_new();
     vec_push(tools, str_from("work"));
     var agent = agnosai_agent_with_tools(agnosai_agent_new(str_from("worker"), str_from("tester"),
@@ -2609,8 +2618,10 @@ fn main(): i64 {
     _b_tool_done = str_from("{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"done\"}}]}");
     _b_tool_wrap("tool_result_wrap_clean_4k", _b_tool_text(4096, 0), 20000);
     _b_tool_wrap("tool_result_wrap_marked_4k", _b_tool_text(4096, "</user_input>"), 20000);
-    _b_tool_task("task_one_tool_call", 1, 5000);
-    _b_tool_task("task_four_tool_calls_at_once", 4, 2000);
+    _b_tool_task("task_one_tool_call", 1, 5000, &_b_tool_exec);
+    _b_tool_task("task_four_tool_calls_at_once", 4, 2000, &_b_tool_exec);
+    _b_tool_task("task_one_tool_call_kept", 1, 5000, &_b_tool_exec_kept);
+    _b_tool_task("task_four_tool_calls_kept", 4, 2000, &_b_tool_exec_kept);
 
     return 0;
 }

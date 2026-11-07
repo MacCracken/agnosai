@@ -31,11 +31,12 @@ fn _agnosai_echo_schema(a, ctx): i64 {
 
 # Echo the `message` parameter back verbatim, whatever its JSON type.
 fn _agnosai_echo_execute(ctx, input): i64 {
-    var value = agnosai_tool_input_get(input, str_from("message"));
+    var a = agnosai_tool_input_alloc(input);
+    var value = agnosai_tool_input_get(input, str_from_a(a, "message"));
     if (value == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: message"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: message"));
     }
-    return agnosai_tool_output_ok(value);
+    return agnosai_tool_output_ok_a(a, value);
 }
 
 # The echo tool — returns its `message` parameter unchanged.
@@ -63,33 +64,34 @@ fn _agnosai_json_transform_schema(a, ctx): i64 {
 # the object. The last one names the field, because a tool that says only
 # "not found" is unusable in an agent transcript.
 fn _agnosai_json_transform_execute(ctx, input): i64 {
-    var data = agnosai_tool_input_get(input, str_from("data"));
+    var a = agnosai_tool_input_alloc(input);
+    var data = agnosai_tool_input_get(input, str_from_a(a, "data"));
     if (data == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: data"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: data"));
     }
-    var field = agnosai_tool_input_get_str(input, str_from("field"));
+    var field = agnosai_tool_input_get_str(input, str_from_a(a, "field"));
     if (field == 0) {
-        return agnosai_tool_output_err(
-          str_from("missing required parameter: field (must be a string)"));
+        return agnosai_tool_output_err_a(a,
+          str_from_a(a, "missing required parameter: field (must be a string)"));
     }
 
     if (bayan_json_v_is_obj(data) == 0) {
-        return _agnosai_field_not_found(field);
+        return _agnosai_field_not_found_a(a, field);
     }
     var value = bayan_json_v_obj_get_by_str(data, field);
     if (value == 0) {
-        return _agnosai_field_not_found(field);
+        return _agnosai_field_not_found_a(a, field);
     }
-    return agnosai_tool_output_ok(value);
+    return agnosai_tool_output_ok_a(a, value);
 }
 
-# The oracle's "field '<name>' not found in data" error.
-fn _agnosai_field_not_found(field: Str): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "field '");
-    str_builder_add(sb, field);
-    str_builder_add_cstr(sb, "' not found in data");
-    return agnosai_tool_output_err(str_builder_build(sb));
+# The oracle's "field '<name>' not found in data" error, in allocator `a`.
+fn _agnosai_field_not_found_a(a, field: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "field '");
+    str_builder_add_a(a, sb, field);
+    str_builder_add_cstr_a(a, sb, "' not found in data");
+    return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
 }
 
 # The json_transform tool — extracts a named field from a JSON object.

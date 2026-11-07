@@ -354,6 +354,59 @@ fn _t_dl_joins_the_trace_with_telemetry_on(): i64 {
     return 0;
 }
 
+# What a call refused for its parameters leaves on the global heap.
+#
+# ⚠ **First of all, as `alloc_used` counts every thread.** The tests below leave detached crews
+# running, and one still allocating while this measures reads as this call's: run after them it
+# read 912 and 1,208 B in two runs of the whole suite, and 0 alone.
+fn _t_dl_refusal_leaves_nothing(): i64 {
+    var st = _t_dl_state();
+    var ar = arena_allocator_growable(4096);
+    var missing = agnosai_tool_input_with_alloc(agnosai_tool_input_new(), ar);
+    _agnosai_delegate_execute(st, missing);
+    reset_via(ar);
+    var before = alloc_used();
+    for (var i = 0; i < 50; i = i + 1) {
+        _agnosai_delegate_execute(st, missing);
+        reset_via(ar);
+    }
+    assert_eq(alloc_used() - before, 0, "a call refused for its parameters leaves nothing");
+    return 0;
+}
+
+# What goes back with the call is its answer. The crew it starts outlives the call, so that stays
+# off the call's allocator: a crew reading memory its parent's turn has given back would be the
+# worst failure this tool could have.
+fn _t_dl_answers_in_the_calls_allocator(): i64 {
+    var st = _t_dl_state();
+    var ar = arena_allocator_growable(4096);
+    var input = agnosai_tool_input_with_alloc(_t_dl_input("researcher", "find things"), ar);
+    # A bump arena hands out rising addresses, so what lands between two markers is in it.
+    var below = alloc_via(ar, 8);
+    var out = _agnosai_delegate_execute(st, input);
+    var above = alloc_via(ar, 8);
+    assert(out > below && out < above, "its answer is in the call's allocator");
+    var answer = agnosai_tool_output_result(out);
+    assert(answer > below && answer < above, "all of it");
+    var cid = str_clone(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(answer, "crew_id")));
+    # Scribble over what the call held, and the crew must still run.
+    reset_via(ar);
+    memset(alloc_via(ar, 4000), 90, 4000);
+    var o = agnosai_app_state_orchestrator(st);
+    var waited = 0;
+    var status = AGNOSAI_CREW_PENDING;
+    while (waited < 5000 && status != AGNOSAI_CREW_COMPLETED && status != AGNOSAI_CREW_FAILED) {
+        sleep_ms(10);
+        waited = waited + 10;
+        status = agnosai_crew_state_status(agnosai_orchestrator_crew(o, cid));
+    }
+    assert(status == AGNOSAI_CREW_COMPLETED || status == AGNOSAI_CREW_FAILED,
+      "the crew it started finishes with the call's arena long gone");
+    assert(str_eq(agnosai_crew_state_crew_id(agnosai_orchestrator_crew(o, cid)), cid) == 1,
+      "and holds its own id");
+    return 0;
+}
+
 fn _t_dl_is_not_registered_by_default(): i64 {
     # **The parity guard.** `delegate` is library surface; a default registry
     # must not carry it, or the binary's tools/list stops matching the oracle's
@@ -377,6 +430,8 @@ fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
 
+    # Measures the global heap, so it goes before any thread exists. Starts no crew.
+    _t_dl_refusal_leaves_nothing();
     # ⚠ **First, before any crew exists.** The tests below leave detached crews running, and the
     # exporter is process-wide, so a crew still going when this starts writes a trace of its own
     # into the document this test reads. Run after them, that failed about 1 run in 300.
@@ -392,6 +447,7 @@ fn main(): i64 {
     _t_dl_missing_params();
     _t_dl_keeps_nothing_of_its_input();
     _t_dl_stays_in_the_trace();
+    _t_dl_answers_in_the_calls_allocator();
     _t_dl_is_not_registered_by_default();
 
     return assert_summary();

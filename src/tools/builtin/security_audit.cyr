@@ -202,8 +202,8 @@ fn _agnosai_audit_pct(count, max): i64 {
 }
 
 # Build a MissingHeader.
-fn _agnosai_audit_missing_new(header: Str, severity: Str): i64 {
-    var m = alloc(AGN_MISS_SIZE);
+fn _agnosai_audit_missing_new_a(a, header: Str, severity: Str): i64 {
+    var m = alloc_via(a, AGN_MISS_SIZE);
     store64(m + AGN_MISS_HEADER, header);
     store64(m + AGN_MISS_SEVERITY, severity);
     return m;
@@ -220,8 +220,8 @@ fn agnosai_missing_header_severity(m): i64 {
 }
 
 # Build a Vulnerability.
-fn _agnosai_audit_vuln_new(kind: Str, severity: Str, description: Str, remediation: Str): i64 {
-    var v = alloc(AGN_VULN_SIZE);
+fn _agnosai_audit_vuln_new_a(a, kind: Str, severity: Str, description: Str, remediation: Str): i64 {
+    var v = alloc_via(a, AGN_VULN_SIZE);
     store64(v + AGN_VULN_KIND, kind);
     store64(v + AGN_VULN_SEVERITY, severity);
     store64(v + AGN_VULN_DESCRIPTION, description);
@@ -278,15 +278,15 @@ fn agnosai_cors_detail(c): i64 {
 # The oracle treats a reflected probe origin exactly like a wildcard. That is
 # the point of sending one — a server that echoes `https://evil.example.com`
 # back is allowing all origins, it is just doing so one request at a time.
-fn agnosai_analyze_cors(headers): i64 {
-    var c = alloc(AGN_CORS_SIZE);
+fn agnosai_analyze_cors_a(a, headers): i64 {
+    var c = alloc_via(a, AGN_CORS_SIZE);
 
     if (headers == 0) {
         store64(c + AGN_CORS_MISCONFIGURED, 0);
         store64(c + AGN_CORS_ALLOWS_ALL, 0);
         store64(c + AGN_CORS_ALLOWS_CREDS, 0);
         store64(c + AGN_CORS_DETAIL,
-          str_from("OPTIONS request failed (CORS may not be configured)"));
+          str_from_a(a, "OPTIONS request failed (CORS may not be configured)"));
         return c;
     }
 
@@ -300,7 +300,7 @@ fn agnosai_analyze_cors(headers): i64 {
 
     var allows_all = 0;
     if (_agnosai_audit_cstr_ieq(acao, "*") == 1) { allows_all = 1; }
-    if (str_eq_cstr(str_from(acao), AGNOSAI_AUDIT_PROBE_ORIGIN) == 1) { allows_all = 1; }
+    if (str_eq_cstr(str_from_a(a, acao), AGNOSAI_AUDIT_PROBE_ORIGIN) == 1) { allows_all = 1; }
 
     var allows_creds = _agnosai_audit_cstr_ieq(acac, "true");
 
@@ -313,15 +313,20 @@ fn agnosai_analyze_cors(headers): i64 {
 
     if (misconfigured == 1) {
         store64(c + AGN_CORS_DETAIL,
-          str_from("Wildcard origin with credentials — critical misconfiguration"));
+          str_from_a(a, "Wildcard origin with credentials — critical misconfiguration"));
     } else {
         if (allows_all == 1) {
-            store64(c + AGN_CORS_DETAIL, str_from("Wildcard origin allowed (no credentials)"));
+            store64(c + AGN_CORS_DETAIL, str_from_a(a, "Wildcard origin allowed (no credentials)"));
         } else {
-            store64(c + AGN_CORS_DETAIL, str_from("CORS properly configured"));
+            store64(c + AGN_CORS_DETAIL, str_from_a(a, "CORS properly configured"));
         }
     }
     return c;
+}
+
+# Global-allocator form of `agnosai_analyze_cors_a`.
+fn agnosai_analyze_cors(headers): i64 {
+    return agnosai_analyze_cors_a(default_alloc(), headers);
 }
 
 # The "<header>: <value>" line the oracle formats for each disclosure.
@@ -347,48 +352,48 @@ fn _agnosai_audit_is_visible_ascii(s): i64 {
     return 1;
 }
 
-fn _agnosai_audit_disclosure_line(name, value): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, name);
-    str_builder_add_cstr(sb, ": ");
-    str_builder_add_cstr(sb, value);
-    return str_builder_build(sb);
+fn _agnosai_audit_disclosure_line_a(a, name, value): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, name);
+    str_builder_add_cstr_a(a, sb, ": ");
+    str_builder_add_cstr_a(a, sb, value);
+    return str_builder_build_a(a, sb);
 }
 
 # Join a vec of Str with ", " — the oracle's `disclosure.join(", ")`.
-fn _agnosai_audit_join(items): i64 {
-    var sb = str_builder_new();
+fn _agnosai_audit_join_a(a, items): i64 {
+    var sb = str_builder_new_a(a);
     for (var i = 0; i < vec_len(items); i = i + 1) {
-        if (i > 0) { str_builder_add_cstr(sb, ", "); }
-        str_builder_add(sb, vec_get(items, i));
+        if (i > 0) { str_builder_add_cstr_a(a, sb, ", "); }
+        str_builder_add_a(a, sb, vec_get(items, i));
     }
-    return str_builder_build(sb);
+    return str_builder_build_a(a, sb);
 }
 
 # The oracle's `format!("Only {:.0}% of ... are present", score)`. The score is
 # integral, so `{:.0}` renders it with no decimal point at all.
-fn _agnosai_audit_missing_headers_desc(score): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "Only ");
-    str_builder_add_int(sb, score);
-    str_builder_add_cstr(sb, "% of recommended security headers are present");
-    return str_builder_build(sb);
+fn _agnosai_audit_missing_headers_desc_a(a, score): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Only ");
+    str_builder_add_int_a(a, sb, score);
+    str_builder_add_cstr_a(a, sb, "% of recommended security headers are present");
+    return str_builder_build_a(a, sb);
 }
 
 # The oracle's `format!("Server discloses: {}", disclosure.join(", "))`.
-fn _agnosai_audit_disclosure_desc(disclosure): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "Server discloses: ");
-    str_builder_add(sb, _agnosai_audit_join(disclosure));
-    return str_builder_build(sb);
+fn _agnosai_audit_disclosure_desc_a(a, disclosure): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Server discloses: ");
+    str_builder_add_a(a, sb, _agnosai_audit_join_a(a, disclosure));
+    return str_builder_build_a(a, sb);
 }
 
 # The oracle's risk bands: >=80 low, >=60 medium, >=40 high, else critical.
-fn _agnosai_audit_risk_level(score): i64 {
-    if (score >= 80) { return str_from("low"); }
-    if (score >= 60) { return str_from("medium"); }
-    if (score >= 40) { return str_from("high"); }
-    return str_from("critical");
+fn _agnosai_audit_risk_level_a(a, score): i64 {
+    if (score >= 80) { return str_from_a(a, "low"); }
+    if (score >= 60) { return str_from_a(a, "medium"); }
+    if (score >= 40) { return str_from_a(a, "high"); }
+    return str_from_a(a, "critical");
 }
 
 # The whole audit, over two already-fetched header sets.
@@ -399,53 +404,53 @@ fn _agnosai_audit_risk_level(score): i64 {
 # is free to release the response memory the moment this returns. That is what
 # lets `agnosai_run_security_audit` run both requests through a scratch arena
 # and reset it before returning.
-fn agnosai_audit_analyze(url: Str, get_headers, cors_headers): i64 {
-    var present = vec_new();
-    var missing = vec_new();
+fn agnosai_audit_analyze_a(a, url: Str, get_headers, cors_headers): i64 {
+    var present = vec_new_a(a);
+    var missing = vec_new_a(a);
     var found = 0;
 
     for (var i = 0; i < AGNOSAI_AUDIT_SEC_HEADER_COUNT; i = i + 1) {
         var name = _agnosai_audit_sec_header(i);
         if (get_headers != 0 && sandhi_headers_has(get_headers, name) == 1) {
-            vec_push(present, str_from(name));
+            vec_push_a(a, present, str_from_a(a, name));
             found = found + 1;
         } else {
-            vec_push(missing,
-              _agnosai_audit_missing_new(str_from(name), str_from(_agnosai_audit_sec_severity(i))));
+            vec_push_a(a, missing,
+              _agnosai_audit_missing_new_a(a, str_from_a(a, name), str_from_a(a, _agnosai_audit_sec_severity(i))));
         }
     }
     var header_score = _agnosai_audit_pct(found, AGNOSAI_AUDIT_SEC_HEADER_COUNT);
 
-    var disclosure = vec_new();
+    var disclosure = vec_new_a(a);
     for (var d = 0; d < AGNOSAI_AUDIT_DISCLOSURE_COUNT; d = d + 1) {
         var dname = _agnosai_audit_disclosure_header(d);
         if (get_headers != 0) {
             var dval = sandhi_headers_get(get_headers, dname);
             # The second condition is the oracle's `let Ok(v) = val.to_str()`.
             if (dval != 0 && _agnosai_audit_is_visible_ascii(dval) == 1) {
-                vec_push(disclosure, _agnosai_audit_disclosure_line(dname, dval));
+                vec_push_a(a, disclosure, _agnosai_audit_disclosure_line_a(a, dname, dval));
             }
         }
     }
 
-    var cors = agnosai_analyze_cors(cors_headers);
+    var cors = agnosai_analyze_cors_a(a, cors_headers);
 
     # Vulnerabilities, in the oracle's order. The order is wire-visible.
-    var vulns = vec_new();
+    var vulns = vec_new_a(a);
     if (header_score < 50) {
-        vec_push(vulns, _agnosai_audit_vuln_new(str_from("missing_security_headers"),
-            str_from("high"), _agnosai_audit_missing_headers_desc(header_score),
-            str_from("Add missing security headers to all responses")));
+        vec_push_a(a, vulns, _agnosai_audit_vuln_new_a(a, str_from_a(a, "missing_security_headers"),
+            str_from_a(a, "high"), _agnosai_audit_missing_headers_desc_a(a, header_score),
+            str_from_a(a, "Add missing security headers to all responses")));
     }
     if (agnosai_cors_allows_all_origins(cors) == 1 && agnosai_cors_allows_credentials(cors) == 1) {
-        vec_push(vulns, _agnosai_audit_vuln_new(str_from("cors_misconfiguration"),
-            str_from("critical"), str_from("CORS allows all origins with credentials"),
-            str_from("Restrict Access-Control-Allow-Origin to specific trusted domains")));
+        vec_push_a(a, vulns, _agnosai_audit_vuln_new_a(a, str_from_a(a, "cors_misconfiguration"),
+            str_from_a(a, "critical"), str_from_a(a, "CORS allows all origins with credentials"),
+            str_from_a(a, "Restrict Access-Control-Allow-Origin to specific trusted domains")));
     }
     if (vec_len(disclosure) > 0) {
-        vec_push(vulns, _agnosai_audit_vuln_new(str_from("information_disclosure"),
-            str_from("low"), _agnosai_audit_disclosure_desc(disclosure),
-            str_from("Remove or obfuscate server identification headers")));
+        vec_push_a(a, vulns, _agnosai_audit_vuln_new_a(a, str_from_a(a, "information_disclosure"),
+            str_from_a(a, "low"), _agnosai_audit_disclosure_desc_a(a, disclosure),
+            str_from_a(a, "Remove or obfuscate server identification headers")));
     }
 
     # The overall score starts from the header score and is docked for the two
@@ -459,25 +464,25 @@ fn agnosai_audit_analyze(url: Str, get_headers, cors_headers): i64 {
     if (security_score > 100) { security_score = 100; }
 
     # Recommendations, in the oracle's order — also wire-visible.
-    var recs = vec_new();
+    var recs = vec_new_a(a);
     if (header_score < 100) {
-        vec_push(recs, str_from(
+        vec_push_a(a, recs, str_from_a(a,
             "Add all recommended security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options)"));
     }
     if (agnosai_cors_misconfigured(cors) == 1) {
-        vec_push(recs, str_from("Fix CORS configuration: restrict allowed origins"));
+        vec_push_a(a, recs, str_from_a(a, "Fix CORS configuration: restrict allowed origins"));
     }
     if (vec_len(disclosure) > 0) {
-        vec_push(recs, str_from("Remove server version headers to reduce attack surface"));
+        vec_push_a(a, recs, str_from_a(a, "Remove server version headers to reduce attack surface"));
     }
-    if (str_starts_with(url, str_from("https://")) == 0) {
-        vec_push(recs, str_from("Enforce HTTPS for all endpoints"));
+    if (str_starts_with(url, str_from_a(a, "https://")) == 0) {
+        vec_push_a(a, recs, str_from_a(a, "Enforce HTTPS for all endpoints"));
     }
 
-    var r = alloc(AGN_AUD_SIZE);
+    var r = alloc_via(a, AGN_AUD_SIZE);
     store64(r + AGN_AUD_TARGET_URL, url);
     store64(r + AGN_AUD_SECURITY_SCORE, security_score);
-    store64(r + AGN_AUD_RISK_LEVEL, _agnosai_audit_risk_level(security_score));
+    store64(r + AGN_AUD_RISK_LEVEL, _agnosai_audit_risk_level_a(a, security_score));
     store64(r + AGN_AUD_HDR_PRESENT, present);
     store64(r + AGN_AUD_HDR_MISSING, missing);
     store64(r + AGN_AUD_HDR_SCORE, header_score);
@@ -486,6 +491,11 @@ fn agnosai_audit_analyze(url: Str, get_headers, cors_headers): i64 {
     store64(r + AGN_AUD_VULNS, vulns);
     store64(r + AGN_AUD_RECOMMENDATIONS, recs);
     return r;
+}
+
+# Global-allocator form of `agnosai_audit_analyze_a`.
+fn agnosai_audit_analyze(url: Str, get_headers, cors_headers): i64 {
+    return agnosai_audit_analyze_a(default_alloc(), url, get_headers, cors_headers);
 }
 
 # The audited URL.
@@ -543,89 +553,94 @@ fn agnosai_audit_recommendations(r): i64 {
 # The scores are the only conversion: they are carried as whole percents and
 # emitted as floats, which is what `f64` fields serialized to. bayan's Grisu2
 # renders 57 as `57.0`, the same shortest round-tripping form serde emits.
-fn agnosai_audit_result_to_value(r): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("target_url"),
-      bayan_json_v_str_new(load64(r + AGN_AUD_TARGET_URL)));
-    bayan_json_v_obj_set(obj, str_from("security_score"),
-      bayan_json_v_float_new(f64_from(load64(r + AGN_AUD_SECURITY_SCORE))));
-    bayan_json_v_obj_set(obj, str_from("risk_level"),
-      bayan_json_v_str_new(load64(r + AGN_AUD_RISK_LEVEL)));
+fn agnosai_audit_result_to_value_a(a, r): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "target_url"),
+      bayan_json_v_str_new_a(a, load64(r + AGN_AUD_TARGET_URL)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "security_score"),
+      bayan_json_v_float_new_a(a, f64_from(load64(r + AGN_AUD_SECURITY_SCORE))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "risk_level"),
+      bayan_json_v_str_new_a(a, load64(r + AGN_AUD_RISK_LEVEL)));
 
-    var ha = bayan_json_v_obj_new();
+    var ha = bayan_json_v_obj_new_a(a);
     var present = load64(r + AGN_AUD_HDR_PRESENT);
-    var present_v = bayan_json_v_arr_new();
+    var present_v = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(present); i = i + 1) {
-        bayan_json_v_arr_push(present_v, bayan_json_v_str_new(vec_get(present, i)));
+        bayan_json_v_arr_push_a(a, present_v, bayan_json_v_str_new_a(a, vec_get(present, i)));
     }
-    bayan_json_v_obj_set(ha, str_from("present"), present_v);
+    bayan_json_v_obj_set_a(a, ha, str_from_a(a, "present"), present_v);
 
     var missing = load64(r + AGN_AUD_HDR_MISSING);
-    var missing_v = bayan_json_v_arr_new();
+    var missing_v = bayan_json_v_arr_new_a(a);
     # Hoisted: two keys per missing header, minted once instead.
-    var k_header = str_from("header");
-    var k_sev = str_from("severity");
+    var k_header = str_from_a(a, "header");
+    var k_sev = str_from_a(a, "severity");
     for (var m = 0; m < vec_len(missing); m = m + 1) {
         var entry = vec_get(missing, m);
-        var mo = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(mo, k_header,
-          bayan_json_v_str_new(agnosai_missing_header_name(entry)));
-        bayan_json_v_obj_set(mo, k_sev,
-          bayan_json_v_str_new(agnosai_missing_header_severity(entry)));
-        bayan_json_v_arr_push(missing_v, mo);
+        var mo = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, mo, k_header,
+          bayan_json_v_str_new_a(a, agnosai_missing_header_name(entry)));
+        bayan_json_v_obj_set_a(a, mo, k_sev,
+          bayan_json_v_str_new_a(a, agnosai_missing_header_severity(entry)));
+        bayan_json_v_arr_push_a(a, missing_v, mo);
     }
-    bayan_json_v_obj_set(ha, str_from("missing"), missing_v);
-    bayan_json_v_obj_set(ha, str_from("score"),
-      bayan_json_v_float_new(f64_from(load64(r + AGN_AUD_HDR_SCORE))));
-    bayan_json_v_obj_set(obj, str_from("header_analysis"), ha);
+    bayan_json_v_obj_set_a(a, ha, str_from_a(a, "missing"), missing_v);
+    bayan_json_v_obj_set_a(a, ha, str_from_a(a, "score"),
+      bayan_json_v_float_new_a(a, f64_from(load64(r + AGN_AUD_HDR_SCORE))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "header_analysis"), ha);
 
     var cors = load64(r + AGN_AUD_CORS);
-    var co = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(co, str_from("misconfigured"),
-      bayan_json_v_bool_new(agnosai_cors_misconfigured(cors)));
-    bayan_json_v_obj_set(co, str_from("allows_all_origins"),
-      bayan_json_v_bool_new(agnosai_cors_allows_all_origins(cors)));
-    bayan_json_v_obj_set(co, str_from("allows_credentials"),
-      bayan_json_v_bool_new(agnosai_cors_allows_credentials(cors)));
-    bayan_json_v_obj_set(co, str_from("detail"),
-      bayan_json_v_str_new(agnosai_cors_detail(cors)));
-    bayan_json_v_obj_set(obj, str_from("cors_analysis"), co);
+    var co = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, co, str_from_a(a, "misconfigured"),
+      bayan_json_v_bool_new_a(a, agnosai_cors_misconfigured(cors)));
+    bayan_json_v_obj_set_a(a, co, str_from_a(a, "allows_all_origins"),
+      bayan_json_v_bool_new_a(a, agnosai_cors_allows_all_origins(cors)));
+    bayan_json_v_obj_set_a(a, co, str_from_a(a, "allows_credentials"),
+      bayan_json_v_bool_new_a(a, agnosai_cors_allows_credentials(cors)));
+    bayan_json_v_obj_set_a(a, co, str_from_a(a, "detail"),
+      bayan_json_v_str_new_a(a, agnosai_cors_detail(cors)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "cors_analysis"), co);
 
     var disclosure = load64(r + AGN_AUD_DISCLOSURE);
-    var disc_v = bayan_json_v_arr_new();
+    var disc_v = bayan_json_v_arr_new_a(a);
     for (var d = 0; d < vec_len(disclosure); d = d + 1) {
-        bayan_json_v_arr_push(disc_v, bayan_json_v_str_new(vec_get(disclosure, d)));
+        bayan_json_v_arr_push_a(a, disc_v, bayan_json_v_str_new_a(a, vec_get(disclosure, d)));
     }
-    bayan_json_v_obj_set(obj, str_from("information_disclosure"), disc_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "information_disclosure"), disc_v);
 
     var vulns = load64(r + AGN_AUD_VULNS);
-    var vulns_v = bayan_json_v_arr_new();
+    var vulns_v = bayan_json_v_arr_new_a(a);
     # Hoisted: four keys per vulnerability.
-    var k_type = str_from("type");
-    var k_vsev = str_from("severity");
-    var k_desc = str_from("description");
-    var k_rem = str_from("remediation");
+    var k_type = str_from_a(a, "type");
+    var k_vsev = str_from_a(a, "severity");
+    var k_desc = str_from_a(a, "description");
+    var k_rem = str_from_a(a, "remediation");
     for (var v = 0; v < vec_len(vulns); v = v + 1) {
         var vuln = vec_get(vulns, v);
-        var vo = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(vo, k_type, bayan_json_v_str_new(agnosai_vuln_kind(vuln)));
-        bayan_json_v_obj_set(vo, k_vsev,
-          bayan_json_v_str_new(agnosai_vuln_severity(vuln)));
-        bayan_json_v_obj_set(vo, k_desc,
-          bayan_json_v_str_new(agnosai_vuln_description(vuln)));
-        bayan_json_v_obj_set(vo, k_rem,
-          bayan_json_v_str_new(agnosai_vuln_remediation(vuln)));
-        bayan_json_v_arr_push(vulns_v, vo);
+        var vo = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, vo, k_type, bayan_json_v_str_new_a(a, agnosai_vuln_kind(vuln)));
+        bayan_json_v_obj_set_a(a, vo, k_vsev,
+          bayan_json_v_str_new_a(a, agnosai_vuln_severity(vuln)));
+        bayan_json_v_obj_set_a(a, vo, k_desc,
+          bayan_json_v_str_new_a(a, agnosai_vuln_description(vuln)));
+        bayan_json_v_obj_set_a(a, vo, k_rem,
+          bayan_json_v_str_new_a(a, agnosai_vuln_remediation(vuln)));
+        bayan_json_v_arr_push_a(a, vulns_v, vo);
     }
-    bayan_json_v_obj_set(obj, str_from("vulnerabilities"), vulns_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "vulnerabilities"), vulns_v);
 
     var recs = load64(r + AGN_AUD_RECOMMENDATIONS);
-    var recs_v = bayan_json_v_arr_new();
+    var recs_v = bayan_json_v_arr_new_a(a);
     for (var c = 0; c < vec_len(recs); c = c + 1) {
-        bayan_json_v_arr_push(recs_v, bayan_json_v_str_new(vec_get(recs, c)));
+        bayan_json_v_arr_push_a(a, recs_v, bayan_json_v_str_new_a(a, vec_get(recs, c)));
     }
-    bayan_json_v_obj_set(obj, str_from("recommendations"), recs_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "recommendations"), recs_v);
     return obj;
+}
+
+# Global-allocator form of `agnosai_audit_result_to_value_a`.
+fn agnosai_audit_result_to_value(r): i64 {
+    return agnosai_audit_result_to_value_a(default_alloc(), r);
 }
 
 # Request options matching the oracle's reqwest client: a 15s total budget and
@@ -636,8 +651,8 @@ fn agnosai_audit_result_to_value(r): i64 {
 # set explicitly because "we validate certificates" is the kind of property that
 # should be stated in the code rather than inherited from a default that could
 # change underneath us.
-fn _agnosai_audit_options(): i64 {
-    var opts = sandhi_http_options_new();
+fn _agnosai_audit_options_a(a): i64 {
+    var opts = sandhi_http_options_new_a(a);
     if (opts == 0) { return 0; }
     sandhi_http_options_total_ms(opts, AGNOSAI_AUDIT_TIMEOUT_MS);
     sandhi_http_options_max_response_bytes(opts, AGNOSAI_AUDIT_MAX_BYTES);
@@ -653,23 +668,23 @@ fn _agnosai_audit_options(): i64 {
 # in the two oracle tables plus the two CORS headers are copied — the audit
 # never looks at anything else, and copying a whole response's header table to
 # keep thirteen of them would defeat the point.
-fn _agnosai_audit_snapshot(src): i64 {
-    var out = sandhi_headers_new();
+fn _agnosai_audit_snapshot_a(a, src): i64 {
+    var out = sandhi_headers_new_a(a);
     if (src == 0) { return out; }
     for (var i = 0; i < AGNOSAI_AUDIT_SEC_HEADER_COUNT; i = i + 1) {
         var sname = _agnosai_audit_sec_header(i);
         var sval = sandhi_headers_get(src, sname);
-        if (sval != 0) { sandhi_headers_add(out, sname, sval); }
+        if (sval != 0) { sandhi_headers_add_a(a, out, sname, sval); }
     }
     for (var d = 0; d < AGNOSAI_AUDIT_DISCLOSURE_COUNT; d = d + 1) {
         var dname = _agnosai_audit_disclosure_header(d);
         var dval = sandhi_headers_get(src, dname);
-        if (dval != 0) { sandhi_headers_add(out, dname, dval); }
+        if (dval != 0) { sandhi_headers_add_a(a, out, dname, dval); }
     }
     var acao = sandhi_headers_get(src, "access-control-allow-origin");
-    if (acao != 0) { sandhi_headers_add(out, "access-control-allow-origin", acao); }
+    if (acao != 0) { sandhi_headers_add_a(a, out, "access-control-allow-origin", acao); }
     var acac = sandhi_headers_get(src, "access-control-allow-credentials");
-    if (acac != 0) { sandhi_headers_add(out, "access-control-allow-credentials", acac); }
+    if (acac != 0) { sandhi_headers_add_a(a, out, "access-control-allow-credentials", acac); }
     return out;
 }
 
@@ -689,16 +704,16 @@ fn _agnosai_audit_snapshot(src): i64 {
 # `security_audit.rs:132-136` maps reqwest's with `.map_err(|e| e.to_string())`,
 # so an operator sees DNS, TLS, connect or timeout. The port collapsed every
 # failure to "request failed", which tells them only that something went wrong.
-fn _agnosai_audit_reason(kind): i64 {
-    if (kind == SANDHI_ERR_CONNECT) { return str_from("connection failed"); }
-    if (kind == SANDHI_ERR_TLS) { return str_from("TLS handshake failed"); }
-    if (kind == SANDHI_ERR_TIMEOUT) { return str_from("request timed out"); }
-    if (kind == SANDHI_ERR_PROTOCOL) { return str_from("protocol error"); }
-    if (kind == SANDHI_ERR_PARSE) { return str_from("malformed response"); }
-    if (kind == SANDHI_ERR_REMOTE) { return str_from("remote error"); }
-    if (kind == SANDHI_ERR_AUTH) { return str_from("authentication failed"); }
-    if (kind == SANDHI_ERR_DISCOVERY) { return str_from("host resolution failed"); }
-    return str_from("request failed");
+fn _agnosai_audit_reason_a(a, kind): i64 {
+    if (kind == SANDHI_ERR_CONNECT) { return str_from_a(a, "connection failed"); }
+    if (kind == SANDHI_ERR_TLS) { return str_from_a(a, "TLS handshake failed"); }
+    if (kind == SANDHI_ERR_TIMEOUT) { return str_from_a(a, "request timed out"); }
+    if (kind == SANDHI_ERR_PROTOCOL) { return str_from_a(a, "protocol error"); }
+    if (kind == SANDHI_ERR_PARSE) { return str_from_a(a, "malformed response"); }
+    if (kind == SANDHI_ERR_REMOTE) { return str_from_a(a, "remote error"); }
+    if (kind == SANDHI_ERR_AUTH) { return str_from_a(a, "authentication failed"); }
+    if (kind == SANDHI_ERR_DISCOVERY) { return str_from_a(a, "host resolution failed"); }
+    return str_from_a(a, "request failed");
 }
 
 # Run the audit against `url` — the header fetch plus the CORS probe.
@@ -727,11 +742,16 @@ fn agnosai_run_security_audit_err(url: Str, out_kind): i64 {
 
 # `agnosai_run_security_audit_err` for the call `input` belongs to: both chains are held to
 # that call's gate at every hop (ADR 025). An `input` of 0 holds them to the SSRF guard.
+#
+# The result is in `agnosai_tool_input_alloc`'s allocator, so a tool's goes back with its call. So
+# are the headers and options: `agnosai_guarded_fetch_hops` resets `arena` between hops, and they
+# are read on every hop.
 fn agnosai_run_security_audit_for(input, url: Str, out_kind): i64 {
+    var a = agnosai_tool_input_alloc(input);
     if (out_kind != 0) { store64(out_kind, 0); }
     var arena = agnosai_arena_pool_acquire(_AGNOSAI_AUDIT_POOL);
     if (arena == 0) { return 0; }
-    var opts = _agnosai_audit_options();
+    var opts = _agnosai_audit_options_a(a);
     if (opts == 0) {
         agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return 0;
@@ -741,7 +761,7 @@ fn agnosai_run_security_audit_for(input, url: Str, out_kind): i64 {
     # before the CORS probe starts, so the two chains never share the arena.
     var get_kind: i64[1];
     store64(&get_kind, 0);
-    var get_resp = agnosai_guarded_fetch_hops(arena, "GET", url, sandhi_headers_new(),
+    var get_resp = agnosai_guarded_fetch_hops(arena, "GET", url, sandhi_headers_new_a(a),
       opts, AGNOSAI_AUDIT_TIMEOUT_MS, 0, 0, &get_kind, &agnosai_tool_url_ok, input);
     if (get_resp == AGNOSAI_FETCH_BLOCKED) {
         agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
@@ -752,7 +772,7 @@ fn agnosai_run_security_audit_for(input, url: Str, out_kind): i64 {
         agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return 0;
     }
-    var get_headers = _agnosai_audit_snapshot(sandhi_http_headers(get_resp));
+    var get_headers = _agnosai_audit_snapshot_a(a, sandhi_http_headers(get_resp));
     reset_via(arena);
 
     # The CORS probe. A server that reflects this Origin back is treated exactly
@@ -763,16 +783,16 @@ fn agnosai_run_security_audit_for(input, url: Str, out_kind): i64 {
     # That includes a blocked redirect: the GET already passed the guard, so a
     # probe that wanders somewhere it should not is dropped, not escalated.
     var cors_headers = 0;
-    var probe = sandhi_headers_new();
-    sandhi_headers_add(probe, "Origin", AGNOSAI_AUDIT_PROBE_ORIGIN);
+    var probe = sandhi_headers_new_a(a);
+    sandhi_headers_add_a(a, probe, "Origin", AGNOSAI_AUDIT_PROBE_ORIGIN);
     var cors_resp = agnosai_guarded_fetch_hops(arena, "OPTIONS", url, probe, opts,
       AGNOSAI_AUDIT_TIMEOUT_MS, 0, 0, 0, &agnosai_tool_url_ok, input);
     if (cors_resp != 0 && cors_resp != AGNOSAI_FETCH_BLOCKED) {
-        cors_headers = _agnosai_audit_snapshot(sandhi_http_headers(cors_resp));
+        cors_headers = _agnosai_audit_snapshot_a(a, sandhi_http_headers(cors_resp));
     }
     agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
 
-    return agnosai_audit_analyze(url, get_headers, cors_headers);
+    return agnosai_audit_analyze_a(a, url, get_headers, cors_headers);
 }
 
 # Trace the start of an audit. The oracle has no tracing here — this follows
@@ -785,15 +805,15 @@ fn _agnosai_audit_log(msg, msg_len, url: Str): i64 {
 }
 
 # Trace a completed audit with its score and risk band.
-fn _agnosai_audit_log_done(url: Str, score, risk: Str): i64 {
+fn _agnosai_audit_log_done_a(a, url: Str, score, risk: Str): i64 {
     if (sakshi_get_level() < SK_INFO) { return 0; }
-    var sb = str_builder_new();
-    str_builder_add(sb, url);
-    str_builder_add_cstr(sb, " score=");
-    str_builder_add_int(sb, score);
-    str_builder_add_cstr(sb, " risk=");
-    str_builder_add(sb, risk);
-    var line = str_builder_build(sb);
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, url);
+    str_builder_add_cstr_a(a, sb, " score=");
+    str_builder_add_int_a(a, sb, score);
+    str_builder_add_cstr_a(a, sb, " risk=");
+    str_builder_add_a(a, sb, risk);
+    var line = str_builder_build_a(a, sb);
     sakshi_log_kv(SK_INFO, "security audit completed", 24, "audit", 5, str_data(line),
       str_len(line));
     return 0;
@@ -817,9 +837,10 @@ fn _agnosai_security_audit_schema(a, ctx): i64 {
 # would change the tool's declared surface; honouring it would invent behaviour
 # the oracle does not have.
 fn _agnosai_security_audit_execute(ctx, input): i64 {
-    var target = agnosai_tool_input_get_str(input, str_from("target_url"));
+    var a = agnosai_tool_input_alloc(input);
+    var target = agnosai_tool_input_get_str(input, str_from_a(a, "target_url"));
     if (target == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: target_url"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: target_url"));
     }
     var refused = agnosai_tool_target_refused(input, target);
     if (refused != 0) { return refused; }
@@ -835,23 +856,23 @@ fn _agnosai_security_audit_execute(ctx, input): i64 {
     if (result == AGNOSAI_FETCH_BLOCKED) {
         _agnosai_audit_log("security audit redirect refused", 31, target);
         if (agnosai_tool_input_gate(input) != 0) {
-            return agnosai_tool_output_err(
-              str_from("security audit failed: target redirected somewhere this call may not reach"));
+            return agnosai_tool_output_err_a(a,
+              str_from_a(a, "security audit failed: target redirected somewhere this call may not reach"));
         }
-        return agnosai_tool_output_err(
-          str_from("security audit failed: target redirected to a private/internal address"));
+        return agnosai_tool_output_err_a(a,
+          str_from_a(a, "security audit failed: target redirected to a private/internal address"));
     }
     if (result == 0) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "security audit failed: ");
-        str_builder_add(sb, _agnosai_audit_reason(load64(&audit_kind)));
-        return agnosai_tool_output_err(str_builder_build(sb));
+        var sb = str_builder_new_a(a);
+        str_builder_add_cstr_a(a, sb, "security audit failed: ");
+        str_builder_add_a(a, sb, _agnosai_audit_reason_a(a, load64(&audit_kind)));
+        return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
     }
 
-    _agnosai_audit_log_done(target, agnosai_audit_security_score(result),
+    _agnosai_audit_log_done_a(a, target, agnosai_audit_security_score(result),
       agnosai_audit_risk_level(result));
 
-    return agnosai_tool_output_ok(agnosai_audit_result_to_value(result));
+    return agnosai_tool_output_ok_a(a, agnosai_audit_result_to_value_a(a, result));
 }
 
 # The security_audit tool.

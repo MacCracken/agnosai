@@ -82,8 +82,8 @@ enum AgnosaiAgnosOff {
 }
 
 # Create a client. `service` is the label in "<service> request failed";
-# `transport_fp` is `fn(client, method, url: Str, body) -> i64` returning a
-# parsed JSON value, or 0 for a transport failure.
+# `transport_fp` is `fn(a, client, method, url: Str, body, detail_out)`, answering
+# a JSON value parsed in `a`, 0 for a transport failure, or `AGNOSAI_AGNOS_BAD_JSON`.
 fn agnosai_agnos_client_new(base_url: Str, service: Str, transport_fp): i64 {
     var c = alloc(AGN_CL_SIZE);
     store64(c + AGN_CL_BASE_URL, base_url);
@@ -117,9 +117,32 @@ fn agnosai_agnos_transport(c): i64 {
 # The empty string passes. It produces a double slash in the URL and a 404 from
 # the service.
 fn agnosai_agnos_segment_ok(v: Str): i64 {
-    if (str_contains(v, str_from("/")) == 1) { return 0; }
-    if (str_contains(v, str_from("..")) == 1) { return 0; }
+    if (str_contains_cstr(v, "/") == 1) { return 0; }
+    if (str_contains_cstr(v, "..") == 1) { return 0; }
     return 1;
+}
+
+# The most bytes an encoder below holds on its stack before it appends them: a full chunk leaves
+# room for one more byte's three and the terminator.
+#
+# ⚠ **A chunk, not a byte at a time.** The stdlib has no `_a` form of `str_builder_add_byte`, and
+# appending a C string per byte read 2.05 µs for 52 B against that form's 1.15. Neither encoder
+# passes a NUL through raw, so a C string can carry the chunk.
+var _AGNOSAI_AGNOS_CHUNK_FULL = 252;
+
+# Append the `n` bytes of `chunk` to `sb`, in allocator `a`.
+fn _agnosai_agnos_flush_a(a, sb, chunk, n): i64 {
+    store8(chunk + n, 0);
+    return str_builder_add_cstr_a(a, sb, chunk);
+}
+
+# Write `b` percent-encoded at `p`, uppercase hex. Returns the 3 bytes it wrote.
+fn _agnosai_agnos_put_pct(p, b): i64 {
+    var hex = "0123456789ABCDEF";
+    store8(p, 37);
+    store8(p + 1, load8(hex + ((b >> 4) & 15)));
+    store8(p + 2, load8(hex + (b & 15)));
+    return 3;
 }
 
 # Append `v` to a URL path as one segment, percent-encoding the WHATWG path set:
@@ -128,41 +151,47 @@ fn agnosai_agnos_segment_ok(v: Str): i64 {
 # (it refuses a space), so the tool failed with "request failed" instead of
 # asking for `/api/notes/my%20note`. `%` itself is left alone, so an id that is
 # already encoded is not encoded twice.
-fn agnosai_agnos_add_segment(sb, v: Str): i64 {
+fn agnosai_agnos_add_segment_a(a, sb, v: Str): i64 {
     var p = str_data(v);
     var n = str_len(v);
+    var chunk[256];
+    var at = 0;
     for (var i = 0; i < n; i = i + 1) {
+        if (at >= _AGNOSAI_AGNOS_CHUNK_FULL) {
+            _agnosai_agnos_flush_a(a, sb, &chunk, at);
+            at = 0;
+        }
         var b = load8(p + i) & 255;
         var enc = 0;
         if (b <= 32 || b >= 127) { enc = 1; }
         if (b == 34 || b == 35 || b == 60 || b == 62 || b == 63) { enc = 1; }
         if (b == 96 || b == 123 || b == 125) { enc = 1; }
         if (enc == 1) {
-            str_builder_add_byte(sb, 37);
-            str_builder_add_byte(sb, load8("0123456789ABCDEF" + (b >> 4)));
-            str_builder_add_byte(sb, load8("0123456789ABCDEF" + (b & 15)));
+            at = at + _agnosai_agnos_put_pct(&chunk + at, b);
         } else {
-            str_builder_add_byte(sb, b);
+            store8(&chunk + at, b);
+            at = at + 1;
         }
     }
-    return 0;
+    return _agnosai_agnos_flush_a(a, sb, &chunk, at);
 }
 
-# The oracle's "<name> contains invalid characters" rejection.
+# Global-allocator form of `agnosai_agnos_add_segment_a`.
+fn agnosai_agnos_add_segment(sb, v: Str): i64 {
+    return agnosai_agnos_add_segment_a(default_alloc(), sb, v);
+}
+
+# The oracle's "<name> contains invalid characters" rejection, in allocator `a`.
+fn agnosai_agnos_segment_err_a(a, name: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, name);
+    str_builder_add_cstr_a(a, sb, " contains invalid characters");
+    return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
+}
+
+# Global-allocator form of `agnosai_agnos_segment_err_a`.
 fn agnosai_agnos_segment_err(name: Str): i64 {
-    var sb = str_builder_new();
-    str_builder_add(sb, name);
-    str_builder_add_cstr(sb, " contains invalid characters");
-    return agnosai_tool_output_err(str_builder_build(sb));
-}
-
-# Append one byte percent-encoded, uppercase hex.
-fn _agnosai_agnos_pct_byte(sb, b): i64 {
-    var hex = "0123456789ABCDEF";
-    str_builder_add_byte(sb, 37);
-    str_builder_add_byte(sb, load8(hex + ((b >> 4) & 15)));
-    str_builder_add_byte(sb, load8(hex + (b & 15)));
-    return 0;
+    return agnosai_agnos_segment_err_a(default_alloc(), name);
 }
 
 # Append a value in `application/x-www-form-urlencoded` form.
@@ -173,28 +202,52 @@ fn _agnosai_agnos_pct_byte(sb, b): i64 {
 # everything else becomes `%XX` in uppercase hex. The stdlib has no
 # percent-encoder, so it is written out here rather than approximated — getting
 # it wrong would send a query the service silently mis-parses.
-fn agnosai_agnos_form_encode(sb, v: Str): i64 {
+fn agnosai_agnos_form_encode_a(a, sb, v: Str): i64 {
     var d = str_data(v);
     var n = str_len(v);
+    var chunk[256];
+    var at = 0;
     for (var i = 0; i < n; i = i + 1) {
+        if (at >= _AGNOSAI_AGNOS_CHUNK_FULL) {
+            _agnosai_agnos_flush_a(a, sb, &chunk, at);
+            at = 0;
+        }
         var b = load8(d + i) & 255;
-        if (b >= 48 && b <= 57) { str_builder_add_byte(sb, b); }
-        elif (b >= 65 && b <= 90) { str_builder_add_byte(sb, b); }
-        elif (b >= 97 && b <= 122) { str_builder_add_byte(sb, b); }
-        elif (b == 42 || b == 45 || b == 46 || b == 95) { str_builder_add_byte(sb, b); }
-        elif (b == 32) { str_builder_add_byte(sb, 43); }
-        else { _agnosai_agnos_pct_byte(sb, b); }
+        var keep = 0;
+        if (b >= 48 && b <= 57) { keep = 1; }
+        elif (b >= 65 && b <= 90) { keep = 1; }
+        elif (b >= 97 && b <= 122) { keep = 1; }
+        elif (b == 42 || b == 45 || b == 46 || b == 95) { keep = 1; }
+        if (keep == 1) {
+            store8(&chunk + at, b);
+            at = at + 1;
+        } elif (b == 32) {
+            store8(&chunk + at, 43);
+            at = at + 1;
+        } else {
+            at = at + _agnosai_agnos_put_pct(&chunk + at, b);
+        }
     }
-    return 0;
+    return _agnosai_agnos_flush_a(a, sb, &chunk, at);
+}
+
+# Global-allocator form of `agnosai_agnos_form_encode_a`.
+fn agnosai_agnos_form_encode(sb, v: Str): i64 {
+    return agnosai_agnos_form_encode_a(default_alloc(), sb, v);
 }
 
 # Join the client's base URL with a path, producing the oracle's
 # `format!("{}{}", base_url, path)`.
+fn agnosai_agnos_url_a(a, c, path: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, agnosai_agnos_base_url(c));
+    str_builder_add_a(a, sb, path);
+    return str_builder_build_a(a, sb);
+}
+
+# Global-allocator form of `agnosai_agnos_url_a`.
 fn agnosai_agnos_url(c, path: Str): i64 {
-    var sb = str_builder_new();
-    str_builder_add(sb, agnosai_agnos_base_url(c));
-    str_builder_add(sb, path);
-    return str_builder_build(sb);
+    return agnosai_agnos_url_a(default_alloc(), c, path);
 }
 
 # The oracle's "<service> request failed: <detail>".
@@ -203,15 +256,20 @@ fn agnosai_agnos_url(c, path: Str): i64 {
 # condition. sandhi's equivalent is `sandhi_http_err_message`, threaded through
 # by the live transport; a synthetic transport passes 0 and the message stops
 # at the colon-free form.
-fn agnosai_agnos_request_err(c, detail): i64 {
-    var sb = str_builder_new();
-    str_builder_add(sb, agnosai_agnos_service(c));
-    str_builder_add_cstr(sb, " request failed");
+fn agnosai_agnos_request_err_a(a, c, detail): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, agnosai_agnos_service(c));
+    str_builder_add_cstr_a(a, sb, " request failed");
     if (detail != 0) {
-        str_builder_add_cstr(sb, ": ");
-        str_builder_add_cstr(sb, detail);
+        str_builder_add_cstr_a(a, sb, ": ");
+        str_builder_add_cstr_a(a, sb, detail);
     }
-    return agnosai_tool_output_err(str_builder_build(sb));
+    return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
+}
+
+# Global-allocator form of `agnosai_agnos_request_err_a`.
+fn agnosai_agnos_request_err(c, detail): i64 {
+    return agnosai_agnos_request_err_a(default_alloc(), c, detail);
 }
 
 # The oracle's "failed to parse response: <detail>".
@@ -221,14 +279,19 @@ fn agnosai_agnos_request_err(c, detail): i64 {
 # sentinel rather than folding it into a transport failure, because "the service
 # answered with something that is not JSON" and "the service did not answer" are
 # different operational problems.
-fn agnosai_agnos_parse_err(detail): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "failed to parse response");
+fn agnosai_agnos_parse_err_a(a, detail): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "failed to parse response");
     if (detail != 0) {
-        str_builder_add_cstr(sb, ": ");
-        str_builder_add_cstr(sb, detail);
+        str_builder_add_cstr_a(a, sb, ": ");
+        str_builder_add_cstr_a(a, sb, detail);
     }
-    return agnosai_tool_output_err(str_builder_build(sb));
+    return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
+}
+
+# Global-allocator form of `agnosai_agnos_parse_err_a`.
+fn agnosai_agnos_parse_err(detail): i64 {
+    return agnosai_agnos_parse_err_a(default_alloc(), detail);
 }
 
 # Returned by a transport when the exchange succeeded but the body would not
@@ -236,25 +299,31 @@ fn agnosai_agnos_parse_err(detail): i64 {
 var AGNOSAI_AGNOS_BAD_JSON = 0 - 1;
 
 # Perform an exchange through the client's transport and turn the result into a
-# ToolOutput, applying the oracle's two error arms.
+# ToolOutput in allocator `a`, applying the oracle's two error arms. A tool passes
+# `agnosai_tool_input_alloc`'s answer, so what the service said goes back with the call.
 #
 # `method` is a C string verb, `path` is appended to the base URL, and `body` is
 # a bayan JSON value or 0. On success the parsed response is handed to
-# `shape_fp` — `fn(value) -> value` — which is where a tool that reshapes the
+# `shape_fp` — `fn(a, value) -> value` — which is where a tool that reshapes the
 # response (only `synapse_infer` does) puts that logic. Pass 0 to return the
 # response unchanged, which is what seven of the nine tools do.
 #
 # The transport reports a failure's detail through `detail_out`, a local of THIS
 # call. It used to be a process-wide global, and tools run on up to 100 server
 # workers at once, so one call's error text could be reported by another's.
-fn agnosai_agnos_call(c, method, path: Str, body, shape_fp): i64 {
-    var url = agnosai_agnos_url(c, path);
+fn agnosai_agnos_call_a(a, c, method, path: Str, body, shape_fp): i64 {
+    var url = agnosai_agnos_url_a(a, c, path);
     var detail = 0;
-    var data = callptr(agnosai_agnos_transport(c), c, method, url, body, &detail);
-    if (data == 0) { return agnosai_agnos_request_err(c, detail); }
-    if (data == AGNOSAI_AGNOS_BAD_JSON) { return agnosai_agnos_parse_err(detail); }
-    if (shape_fp == 0) { return agnosai_tool_output_ok(data); }
-    return agnosai_tool_output_ok(callptr(shape_fp, data));
+    var data = callptr(agnosai_agnos_transport(c), a, c, method, url, body, &detail);
+    if (data == 0) { return agnosai_agnos_request_err_a(a, c, detail); }
+    if (data == AGNOSAI_AGNOS_BAD_JSON) { return agnosai_agnos_parse_err_a(a, detail); }
+    if (shape_fp == 0) { return agnosai_tool_output_ok_a(a, data); }
+    return agnosai_tool_output_ok_a(a, callptr(shape_fp, a, data));
+}
+
+# Global-allocator form of `agnosai_agnos_call_a`.
+fn agnosai_agnos_call(c, method, path: Str, body, shape_fp): i64 {
+    return agnosai_agnos_call_a(default_alloc(), c, method, path, body, shape_fp);
 }
 
 # The live transport: one sandhi exchange against an AGNOS service.
@@ -265,8 +334,9 @@ fn agnosai_agnos_call(c, method, path: Str, body, shape_fp): i64 {
 # somewhere it was never pointed — the same reasoning as ADR 007, reaching the
 # opposite conclusion because there is no legitimate redirect to preserve.
 #
-# `detail_out` receives a C string describing a failure, or stays 0.
-fn agnosai_agnos_http_transport(c, method, url: Str, body, detail_out): i64 {
+# `detail_out` receives a C string in `a` describing a failure, or stays 0. The exchange itself has
+# an arena of its own, as it is 5 MiB of buffers a tool's answer has no use for.
+fn agnosai_agnos_http_transport(a, c, method, url: Str, body, detail_out): i64 {
     store64(detail_out, 0);
 
     var arena = agnosai_arena_pool_acquire(_AGNOSAI_AGNOS_POOL);
@@ -286,13 +356,15 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body, detail_out): i64 {
     var payload_len = 0;
     if (body != 0) {
         sandhi_headers_add_a(arena, headers, "Content-Type", "application/json");
-        var encoded = bayan_json_v_build(body);
+        var encoded = bayan_json_v_build_a(arena, body);
         payload = str_data(encoded);
         payload_len = str_len(encoded);
     }
 
-    var r = sandhi_http_request_auto_a(arena, method, str_cstr(url), headers, payload, payload_len,
-      opts);
+    # ⚠ Not `str_cstr`, which copies onto the global heap whatever it is given. A clone is
+    # NUL-terminated, and this one goes back with the exchange.
+    var r = sandhi_http_request_auto_a(arena, method, str_data(str_clone_a(arena, url)), headers, payload,
+      payload_len, opts);
     if (r == 0) {
         agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return 0;
@@ -303,12 +375,12 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body, detail_out): i64 {
         # exactly that case — so the null check is the common path, not the
         # defensive one.
         var msg = sandhi_http_err_message(r);
-        if (msg != 0) { store64(detail_out, str_cstr(str_clone(str_from(msg)))); }
+        if (msg != 0) { store64(detail_out, str_data(str_clone_a(a, str_from_a(a, msg)))); }
         agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return 0;
     }
 
-    # bayan parses into the default allocator, so the value outlives the arena.
+    # bayan parses into `a`, the caller's, so the value outlives this exchange's arena.
     #
     # ⚠ **The null-body guard is NOT defensive — it closes a real null-pointer
     # read.** sandhi can return `SANDHI_OK` with `body_ptr == 0` and a positive
@@ -338,8 +410,10 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body, detail_out): i64 {
     # detail cannot be another thread's.
     if (body_len > 0) {
         var ps[48];
-        data = bayan_json_v_parse_ctx(&ps, sandhi_http_body(r), body_len);
-        if (data == 0) { store64(detail_out, str_cstr(str_clone(str_from(bayan_json_state_error(&ps))))); }
+        data = bayan_json_v_parse_ctx_a(a, &ps, sandhi_http_body(r), body_len);
+        if (data == 0) {
+            store64(detail_out, str_data(str_clone_a(a, str_from_a(a, bayan_json_state_error(&ps)))));
+        }
     }
     agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
     if (data == 0) { return AGNOSAI_AGNOS_BAD_JSON; }

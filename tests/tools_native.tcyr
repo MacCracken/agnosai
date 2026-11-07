@@ -210,9 +210,38 @@ fn _t_registry_concurrent_access(): i64 {
     return 0;
 }
 
+# The allocator a tool answers in (B41).
+fn _t_tn_call_alloc(): i64 {
+    assert_eq(agnosai_tool_input_alloc(0), default_alloc(), "with no input, the global allocator");
+    var input = agnosai_tool_input_new();
+    assert_eq(agnosai_tool_input_alloc(input), default_alloc(), "and for a call nothing gave one to");
+    var built = agnosai_tool_input_from_value_a(arena_allocator_growable(4096), bayan_json_v_obj_new());
+    assert_eq(agnosai_tool_input_alloc(built), default_alloc(),
+      "an input's own arena is not its answer's: the loop's is shared by calls running at once");
+
+    var ar = arena_allocator_growable(4096);
+    assert_eq(agnosai_tool_input_with_alloc(input, ar), input, "giving one returns the input");
+    assert_eq(agnosai_tool_input_alloc(input), ar, "and a tool reads what it was given");
+
+    var before = alloc_used();
+    var ok = agnosai_tool_output_ok_a(ar, bayan_json_v_int_new_a(ar, 7));
+    var bad = agnosai_tool_output_err_a(ar, str_from_a(ar, "nope"));
+    assert_eq(alloc_used() - before, 0, "and its outputs leave the global heap alone");
+    assert_eq(agnosai_tool_output_success(ok), 1, "an arena's ok output succeeds");
+    assert_eq(bayan_json_v_int(agnosai_tool_output_result(ok)), 7, "with its result");
+    assert_eq(agnosai_tool_output_error(ok), 0, "and no error");
+    assert_eq(agnosai_tool_output_effect(ok), AGNOSAI_TOOL_EFFECT_UNKNOWN, "and an effect nothing has judged");
+    assert_eq(agnosai_tool_output_success(bad), 0, "an arena's failed output fails");
+    assert(str_eq_cstr(agnosai_tool_output_error(bad), "nope") == 1, "with its message");
+    assert_eq(bayan_json_v_is_null(agnosai_tool_output_result(bad)), 1, "and a null result, as the oracle's");
+    assert_eq(agnosai_tool_output_effect(bad), AGNOSAI_TOOL_EFFECT_UNKNOWN, "and an effect nothing has judged");
+    return 0;
+}
+
 fn main() {
     _t_registry_concurrent_access();
     _t_tn_a_forms();
+    _t_tn_call_alloc();
     alloc_init();
 
     test_group("tools_native");

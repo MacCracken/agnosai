@@ -20556,7 +20556,7 @@ fn agnosai_guarded_fetch_hops(arena, method, url: Str, headers, opts, timeout_ms
         if (left_ms <= 0) { return 0; }
         sandhi_http_options_total_ms(opts, left_ms);
 
-        var r = sandhi_http_request_auto_a(arena, verb, str_cstr(current), headers,
+        var r = sandhi_http_request_auto_a(arena, verb, str_data(str_clone_a(arena, current)), headers,
           body, body_len, opts);
         if (r == 0) { return 0; }
         if (sandhi_http_err_kind(r) != SANDHI_OK) {
@@ -25083,13 +25083,14 @@ enum AgnosaiToolSchemaOff {
     AGN_SCHEMA_SIZE = 24;
 }
 
-# ToolInput heap layout — 80 bytes: a Str-keyed map of bayan values, and what the
+# ToolInput heap layout — 88 bytes: a Str-keyed map of bayan values, and what the
 # chokepoint knows of the call (ADR 025). An input belongs to one call, which is what lets it
 # carry this without a thread-local and without changing `execute_fp`.
 #
 # `CALL_ID` to `CAPTURE_FP` are the tool loop's (ADR 029), for the span. `SPAN_CTX` is the call's
 # own `execute_tool` context, set by the chokepoint, which is how a tool that starts more work
-# keeps it in the trace.
+# keeps it in the trace. `ALLOC` is where this call's answer belongs, or 0 for the global heap
+# (`agnosai_tool_input_alloc`).
 enum AgnosaiToolInputOff {
     AGN_INPUT_PARAMETERS = 0;
     AGN_INPUT_TASK = 8;
@@ -25101,7 +25102,8 @@ enum AgnosaiToolInputOff {
     AGN_INPUT_ARGUMENTS = 56;
     AGN_INPUT_CAPTURE_FP = 64;
     AGN_INPUT_SPAN_CTX = 72;
-    AGN_INPUT_SIZE = 80;
+    AGN_INPUT_ALLOC = 80;
+    AGN_INPUT_SIZE = 88;
 }
 
 # ToolOutput heap layout — 32 bytes.
@@ -25317,6 +25319,7 @@ fn _agnosai_tool_input_over_a(a, parameters): i64 {
     store64(i + AGN_INPUT_ARGUMENTS, 0);
     store64(i + AGN_INPUT_CAPTURE_FP, 0);
     store64(i + AGN_INPUT_SPAN_CTX, 0);
+    store64(i + AGN_INPUT_ALLOC, 0);
     return i;
 }
 
@@ -25367,6 +25370,28 @@ fn agnosai_tool_input_arguments(input): i64 {
 # starts more work passes this on, so that work stays in the call's trace (`delegate` does).
 fn agnosai_tool_input_span_ctx(input): i64 {
     return load64(input + AGN_INPUT_SPAN_CTX);
+}
+
+# The allocator this call's answer belongs in: what a tool builds its `ToolOutput` and result with,
+# through the `_a` forms, so that what it answers goes back with the call. The global allocator for
+# a call nothing gave one to, which is every call off the tool loop and an input of 0, so a tool
+# needs no second path.
+#
+# ⚠ **It is this call's, and this thread's.** The loop hands each call an arena of its own, as a
+# turn's calls run at once and an arena has no lock, and takes it back when the turn's results have
+# been read. So a tool that starts a thread gives that thread its own, and anything that outlives
+# the call, a crew it submits or state on its `ctx`, does not belong here (ADR 029).
+fn agnosai_tool_input_alloc(input): i64 {
+    if (input == 0) { return default_alloc(); }
+    var a = load64(input + AGN_INPUT_ALLOC);
+    if (a == 0) { return default_alloc(); }
+    return a;
+}
+
+# Give this call an allocator for its answer. Returns the input.
+fn agnosai_tool_input_with_alloc(input, a): i64 {
+    store64(input + AGN_INPUT_ALLOC, a);
+    return input;
 }
 
 # Set a parameter to a bayan JSON value. Returns the input so calls chain.
@@ -25455,9 +25480,10 @@ fn agnosai_tool_input_from_value_a(a, v): i64 {
     return _agnosai_tool_input_over_a(a, m);
 }
 
-# A successful tool output carrying `result`.
-fn agnosai_tool_output_ok(result): i64 {
-    var o = alloc(AGN_OUTPUT_SIZE);
+# A successful tool output carrying `result`, in allocator `a`. A tool passes
+# `agnosai_tool_input_alloc`'s answer.
+fn agnosai_tool_output_ok_a(a, result): i64 {
+    var o = alloc_via(a, AGN_OUTPUT_SIZE);
     store64(o + AGN_OUTPUT_SUCCESS, 1);
     store64(o + AGN_OUTPUT_RESULT, result);
     store64(o + AGN_OUTPUT_ERROR, 0);
@@ -25465,14 +25491,24 @@ fn agnosai_tool_output_ok(result): i64 {
     return o;
 }
 
-# A failed tool output. `result` is JSON null, matching the oracle.
-fn agnosai_tool_output_err(msg: Str): i64 {
-    var o = alloc(AGN_OUTPUT_SIZE);
+# Global-allocator form of `agnosai_tool_output_ok_a`.
+fn agnosai_tool_output_ok(result): i64 {
+    return agnosai_tool_output_ok_a(default_alloc(), result);
+}
+
+# A failed tool output, in allocator `a`. `result` is JSON null, matching the oracle.
+fn agnosai_tool_output_err_a(a, msg: Str): i64 {
+    var o = alloc_via(a, AGN_OUTPUT_SIZE);
     store64(o + AGN_OUTPUT_SUCCESS, 0);
-    store64(o + AGN_OUTPUT_RESULT, bayan_json_v_null());
+    store64(o + AGN_OUTPUT_RESULT, bayan_json_v_null_a(a));
     store64(o + AGN_OUTPUT_ERROR, msg);
     store64(o + AGN_OUTPUT_EFFECT, AGNOSAI_TOOL_EFFECT_UNKNOWN);
     return o;
+}
+
+# Global-allocator form of `agnosai_tool_output_err_a`.
+fn agnosai_tool_output_err(msg: Str): i64 {
+    return agnosai_tool_output_err_a(default_alloc(), msg);
 }
 
 # Whether execution succeeded.
@@ -25536,7 +25572,8 @@ fn agnosai_tool_output_to_value(o): i64 {
 #
 # ⚠ **An input lasts as long as its call.** Through the tool loop it lives in an arena that goes
 # back with the task, so a tool that keeps anything from it past `execute_fp`'s return, for a crew
-# it submits or a thread it leaves running, must copy it first (ADR 029). Its output is copied.
+# it submits or a thread it leaves running, must copy it first (ADR 029). Its output is copied, so
+# a tool that builds it in `agnosai_tool_input_alloc` leaves nothing behind.
 fn agnosai_tool_new(name: Str, description: Str, schema_fp, execute_fp, ctx): i64 {
     var t = alloc(AGN_TOOL_SIZE);
     store64(t + AGN_TOOL_NAME, name);
@@ -25682,12 +25719,12 @@ fn agnosai_tool_output_refused_a(a, t, text: Str): i64 {
     return o;
 }
 
-# A gate's refusal, in the words a caller reads.
-fn _agnosai_tool_refused(t, reason: Str): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "tool call refused: ");
-    str_builder_add(sb, reason);
-    return agnosai_tool_output_refused(t, str_builder_build(sb));
+# A gate's refusal, in the words a caller reads, in allocator `a`.
+fn _agnosai_tool_refused_a(a, t, reason: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "tool call refused: ");
+    str_builder_add_a(a, sb, reason);
+    return agnosai_tool_output_refused_a(a, t, str_builder_build_a(a, sb));
 }
 
 # Bind a call to its input, so a tool or a gate can read what it belongs to. Returns the input.
@@ -25707,11 +25744,15 @@ fn _agnosai_tool_run(t, input, task): i64 {
     if (input != 0) { agnosai_tool_input_bind(input, t, task); }
     if (gate != 0) {
         # Fail closed: a gate cannot judge a call it cannot see.
-        if (input == 0) { return _agnosai_tool_refused(t, str_from("no input to judge")); }
+        if (input == 0) {
+            var d = default_alloc();
+            return _agnosai_tool_refused_a(d, t, str_from_a(d, "no input to judge"));
+        }
         var call_fp = load64(gate + AGN_GATE_CALL_FP);
         if (call_fp != 0) {
             var reason = callptr(call_fp, load64(gate + AGN_GATE_CTX), input);
-            if (reason != 0) { return _agnosai_tool_refused(t, reason); }
+            # The allocator is read here, as a gate that lets a call through pays nothing for it.
+            if (reason != 0) { return _agnosai_tool_refused_a(agnosai_tool_input_alloc(input), t, reason); }
         }
     }
     var out = callptr(load64(t + AGN_TOOL_EXECUTE_FP), load64(t + AGN_TOOL_CTX), input);
@@ -26734,6 +26775,7 @@ fn agnosai_tool_url_ok(input, url: Str): i64 {
 # about private networks at all, so it says only what is true of every refusal.
 fn agnosai_tool_target_refused(input, url: Str): i64 {
     if (agnosai_tool_url_ok(input, url) == 1) { return 0; }
+    var a = agnosai_tool_input_alloc(input);
     var tool = 0;
     var gate = 0;
     if (input != 0) {
@@ -26741,11 +26783,11 @@ fn agnosai_tool_target_refused(input, url: Str): i64 {
         gate = agnosai_tool_input_gate(input);
     }
     if (gate != 0) {
-        return agnosai_tool_output_refused(tool,
-          str_from("target_url rejected: this call may not reach it"));
+        return agnosai_tool_output_refused_a(a, tool,
+          str_from_a(a, "target_url rejected: this call may not reach it"));
     }
-    return agnosai_tool_output_refused(tool,
-      str_from("target_url rejected: cannot target private/internal networks"));
+    return agnosai_tool_output_refused_a(a, tool,
+      str_from_a(a, "target_url rejected: cannot target private/internal networks"));
 }
 
 # A deep copy of `v` in allocator `a`, with the output filter's redaction applied to every string
@@ -26879,11 +26921,12 @@ fn _agnosai_echo_schema(a, ctx): i64 {
 
 # Echo the `message` parameter back verbatim, whatever its JSON type.
 fn _agnosai_echo_execute(ctx, input): i64 {
-    var value = agnosai_tool_input_get(input, str_from("message"));
+    var a = agnosai_tool_input_alloc(input);
+    var value = agnosai_tool_input_get(input, str_from_a(a, "message"));
     if (value == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: message"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: message"));
     }
-    return agnosai_tool_output_ok(value);
+    return agnosai_tool_output_ok_a(a, value);
 }
 
 # The echo tool — returns its `message` parameter unchanged.
@@ -26911,33 +26954,34 @@ fn _agnosai_json_transform_schema(a, ctx): i64 {
 # the object. The last one names the field, because a tool that says only
 # "not found" is unusable in an agent transcript.
 fn _agnosai_json_transform_execute(ctx, input): i64 {
-    var data = agnosai_tool_input_get(input, str_from("data"));
+    var a = agnosai_tool_input_alloc(input);
+    var data = agnosai_tool_input_get(input, str_from_a(a, "data"));
     if (data == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: data"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: data"));
     }
-    var field = agnosai_tool_input_get_str(input, str_from("field"));
+    var field = agnosai_tool_input_get_str(input, str_from_a(a, "field"));
     if (field == 0) {
-        return agnosai_tool_output_err(
-          str_from("missing required parameter: field (must be a string)"));
+        return agnosai_tool_output_err_a(a,
+          str_from_a(a, "missing required parameter: field (must be a string)"));
     }
 
     if (bayan_json_v_is_obj(data) == 0) {
-        return _agnosai_field_not_found(field);
+        return _agnosai_field_not_found_a(a, field);
     }
     var value = bayan_json_v_obj_get_by_str(data, field);
     if (value == 0) {
-        return _agnosai_field_not_found(field);
+        return _agnosai_field_not_found_a(a, field);
     }
-    return agnosai_tool_output_ok(value);
+    return agnosai_tool_output_ok_a(a, value);
 }
 
-# The oracle's "field '<name>' not found in data" error.
-fn _agnosai_field_not_found(field: Str): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "field '");
-    str_builder_add(sb, field);
-    str_builder_add_cstr(sb, "' not found in data");
-    return agnosai_tool_output_err(str_builder_build(sb));
+# The oracle's "field '<name>' not found in data" error, in allocator `a`.
+fn _agnosai_field_not_found_a(a, field: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "field '");
+    str_builder_add_a(a, sb, field);
+    str_builder_add_cstr_a(a, sb, "' not found in data");
+    return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
 }
 
 # The json_transform tool — extracts a named field from a JSON object.
@@ -27101,8 +27145,8 @@ enum AgnosaiLtResultOff {
 
 # Create a worker context. `executor_fp` is `fn(ctx): i64` returning the HTTP
 # status code, or 0 to record a transport error.
-fn agnosai_lt_worker_new(url: Str, deadline_ns, max_requests, executor_fp, worker_id): i64 {
-    var w = alloc(AGN_LT_SIZE);
+fn agnosai_lt_worker_new_a(a, url: Str, deadline_ns, max_requests, executor_fp, worker_id): i64 {
+    var w = alloc_via(a, AGN_LT_SIZE);
 
     # Both arenas come from pools now, so nothing here computes a size: a pooled
     # arena is GROWABLE and converges on what the run actually needs. The old
@@ -27118,7 +27162,9 @@ fn agnosai_lt_worker_new(url: Str, deadline_ns, max_requests, executor_fp, worke
     var scratch = agnosai_arena_pool_acquire(_AGNOSAI_LT_SCRATCH_POOL);
     if (arena == 0 || scratch == 0) { return 0; }
 
-    store64(w + AGN_LT_URL, url);
+    # A copy, as a C string is what a request takes: `str_cstr` per request is a global
+    # allocation per request, up to 100k a run.
+    store64(w + AGN_LT_URL, str_clone_a(arena, url));
     store64(w + AGN_LT_DEADLINE_NS, deadline_ns);
     store64(w + AGN_LT_MAX_REQUESTS, max_requests);
     store64(w + AGN_LT_EXECUTOR_FP, executor_fp);
@@ -27134,6 +27180,11 @@ fn agnosai_lt_worker_new(url: Str, deadline_ns, max_requests, executor_fp, worke
     store64(w + AGN_LT_ERRORS, 0);
     store64(w + AGN_LT_WORKER_ID, worker_id);
     return w;
+}
+
+# Global-allocator form of `agnosai_lt_worker_new_a`.
+fn agnosai_lt_worker_new(url: Str, deadline_ns, max_requests, executor_fp, worker_id): i64 {
+    return agnosai_lt_worker_new_a(default_alloc(), url, deadline_ns, max_requests, executor_fp, worker_id);
 }
 
 # The worker's per-request scratch arena, reset after every request.
@@ -27212,7 +27263,7 @@ fn agnosai_lt_http_executor(w): i64 {
     if (opts == 0) { return 0; }
     sandhi_http_options_total_ms(opts, AGNOSAI_LT_REQUEST_TIMEOUT_MS);
     sandhi_http_options_max_response_bytes(opts, AGNOSAI_LT_MAX_RESPONSE_BYTES);
-    var r = sandhi_http_get_opts_a(arena, str_cstr(url), headers, opts);
+    var r = sandhi_http_get_opts_a(arena, str_data(url), headers, opts);
     if (r == 0) { return 0; }
     if (sandhi_http_err_kind(r) != SANDHI_OK) { return 0; }
     return sandhi_http_status(r);
@@ -27275,21 +27326,21 @@ fn _agnosai_lt_thread_main(w): i64 {
 # `duration_secs` is the **configured** duration, not the measured elapsed
 # time — the oracle computes throughput against the requested window, so a run
 # that finishes early still divides by what was asked for.
-fn agnosai_lt_aggregate(workers, url: Str, users, duration_secs): i64 {
-    var latencies = vec_new();
-    var statuses = vec_new();
+fn agnosai_lt_aggregate_a(a, workers, url: Str, users, duration_secs): i64 {
+    var latencies = vec_new_a(a);
+    var statuses = vec_new_a(a);
     var errors = 0;
 
     for (var i = 0; i < vec_len(workers); i = i + 1) {
         var w = vec_get(workers, i);
         var wl = load64(w + AGN_LT_LATENCIES);
         for (var j = 0; j < vec_len(wl); j = j + 1) {
-            vec_push(latencies, vec_get(wl, j));
+            vec_push_a(a, latencies, vec_get(wl, j));
         }
         var ws = load64(w + AGN_LT_STATUS_COUNTS);
         for (var k = 0; k < vec_len(ws); k = k + 1) {
             var pair = vec_get(ws, k);
-            _agnosai_lt_status_bump(default_alloc(), statuses, load64(pair), load64(pair + 8));
+            _agnosai_lt_status_bump(a, statuses, load64(pair), load64(pair + 8));
         }
         errors = errors + load64(w + AGN_LT_ERRORS);
     }
@@ -27307,7 +27358,7 @@ fn agnosai_lt_aggregate(workers, url: Str, users, duration_secs): i64 {
     var successful = total - errors;
     if (successful < 0) { successful = 0; }
 
-    var r = alloc(AGN_LTR_SIZE);
+    var r = alloc_via(a, AGN_LTR_SIZE);
     store64(r + AGN_LTR_TARGET_URL, url);
     store64(r + AGN_LTR_CONCURRENT_USERS, users);
     store64(r + AGN_LTR_DURATION_SECS, duration_secs);
@@ -27330,6 +27381,11 @@ fn agnosai_lt_aggregate(workers, url: Str, users, duration_secs): i64 {
     return r;
 }
 
+# Global-allocator form of `agnosai_lt_aggregate_a`.
+fn agnosai_lt_aggregate(workers, url: Str, users, duration_secs): i64 {
+    return agnosai_lt_aggregate_a(default_alloc(), workers, url, users, duration_secs);
+}
+
 # The oracle's percentile index: `(len * p / 100).min(len - 1)`.
 #
 # Deliberately NOT `agnosai_percentile_i64`'s nearest-rank index — for n=100
@@ -27343,24 +27399,24 @@ fn _agnosai_lt_pct_index(len, p): i64 {
 }
 
 # Nanoseconds as the oracle's milliseconds: a float rounded to 2 decimals.
-fn _agnosai_lt_ms_value(ns): i64 {
+fn _agnosai_lt_ms_value_a(a, ns): i64 {
     var ms = f64_div(f64_from(ns), f64_from(1000000));
     var rounded = f64_div(f64_round(f64_mul(ms, f64_from(100))), f64_from(100));
-    return bayan_json_v_float_new(rounded);
+    return bayan_json_v_float_new_a(a, rounded);
 }
 
 # Total requests per second as the oracle's float, rounded to 2 decimals.
-fn _agnosai_lt_rps_value(milli): i64 {
+fn _agnosai_lt_rps_value_a(a, milli): i64 {
     var rps = f64_div(f64_from(milli), f64_from(1000));
     var rounded = f64_div(f64_round(f64_mul(rps, f64_from(100))), f64_from(100));
-    return bayan_json_v_float_new(rounded);
+    return bayan_json_v_float_new_a(a, rounded);
 }
 
 # Error rate as the oracle's float, rounded to 4 decimals.
-fn _agnosai_lt_rate_value(ppm): i64 {
+fn _agnosai_lt_rate_value_a(a, ppm): i64 {
     var rate = f64_div(f64_from(ppm), f64_from(1000000));
     var rounded = f64_div(f64_round(f64_mul(rate, f64_from(10000))), f64_from(10000));
-    return bayan_json_v_float_new(rounded);
+    return bayan_json_v_float_new_a(a, rounded);
 }
 
 # Total requests recorded, errors included.
@@ -27414,53 +27470,58 @@ fn agnosai_lt_result_status_codes(r): i64 {
 }
 
 # The result as a bayan JSON value, fields in the oracle's declaration order.
-fn agnosai_lt_result_to_value(r): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("target_url"),
-      bayan_json_v_str_new(load64(r + AGN_LTR_TARGET_URL)));
-    bayan_json_v_obj_set(obj, str_from("concurrent_users"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_CONCURRENT_USERS)));
-    bayan_json_v_obj_set(obj, str_from("duration_seconds"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_DURATION_SECS)));
-    bayan_json_v_obj_set(obj, str_from("total_requests"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_TOTAL_REQUESTS)));
-    bayan_json_v_obj_set(obj, str_from("successful_requests"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_SUCCESSFUL)));
-    bayan_json_v_obj_set(obj, str_from("failed_requests"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_FAILED)));
-    bayan_json_v_obj_set(obj, str_from("avg_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_AVG_NS)));
-    bayan_json_v_obj_set(obj, str_from("p50_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_P50_NS)));
-    bayan_json_v_obj_set(obj, str_from("p95_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_P95_NS)));
-    bayan_json_v_obj_set(obj, str_from("p99_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_P99_NS)));
-    bayan_json_v_obj_set(obj, str_from("min_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_MIN_NS)));
-    bayan_json_v_obj_set(obj, str_from("max_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_MAX_NS)));
-    bayan_json_v_obj_set(obj, str_from("throughput_rps"),
-      _agnosai_lt_rps_value(load64(r + AGN_LTR_THROUGHPUT_MILLI)));
-    bayan_json_v_obj_set(obj, str_from("error_rate"),
-      _agnosai_lt_rate_value(load64(r + AGN_LTR_ERROR_RATE_PPM)));
+fn agnosai_lt_result_to_value_a(a, r): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "target_url"),
+      bayan_json_v_str_new_a(a, load64(r + AGN_LTR_TARGET_URL)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "concurrent_users"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_CONCURRENT_USERS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "duration_seconds"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_DURATION_SECS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "total_requests"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_TOTAL_REQUESTS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "successful_requests"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_SUCCESSFUL)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "failed_requests"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_FAILED)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "avg_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_AVG_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "p50_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_P50_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "p95_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_P95_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "p99_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_P99_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "min_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_MIN_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_MAX_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "throughput_rps"),
+      _agnosai_lt_rps_value_a(a, load64(r + AGN_LTR_THROUGHPUT_MILLI)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "error_rate"),
+      _agnosai_lt_rate_value_a(a, load64(r + AGN_LTR_ERROR_RATE_PPM)));
 
     var codes = load64(r + AGN_LTR_STATUS_CODES);
-    var codes_v = bayan_json_v_obj_new();
+    var codes_v = bayan_json_v_obj_new_a(a);
     for (var i = 0; i < vec_len(codes); i = i + 1) {
         var pair = vec_get(codes, i);
-        bayan_json_v_obj_set(codes_v, str_from_int(load64(pair)),
-          bayan_json_v_int_new(load64(pair + 8)));
+        bayan_json_v_obj_set_a(a, codes_v, str_from_int_a(a, load64(pair)),
+          bayan_json_v_int_new_a(a, load64(pair + 8)));
     }
-    bayan_json_v_obj_set(obj, str_from("status_codes"), codes_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status_codes"), codes_v);
     return obj;
+}
+
+# Global-allocator form of `agnosai_lt_result_to_value_a`.
+fn agnosai_lt_result_to_value(r): i64 {
+    return agnosai_lt_result_to_value_a(default_alloc(), r);
 }
 
 # Run a load test: spawn `users` worker threads, join them, aggregate.
 #
 # Returns the result, or 0 when no request completed. `duration_secs` must
 # already be clamped by the caller.
-fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
+fn agnosai_load_test_run_a(a, url: Str, users, duration_secs, executor_fp): i64 {
     # ⚠ **`.max(1)` HERE, at the divide — this is where the oracle puts it.**
     # `load_testing.rs:135` is `MAX_TOTAL_REQUESTS / concurrent_users.max(1)`,
     # and it is the ONLY floor the oracle applies: `concurrent_users` itself is
@@ -27478,15 +27539,15 @@ fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
     if (per_user < 1) { per_user = 1; }
     var deadline = clock_now_ns() + duration_secs * AGNOSAI_NS_PER_SEC;
 
-    var workers = vec_new();
-    var threads = vec_new();
+    var workers = vec_new_a(a);
+    var threads = vec_new_a(a);
     for (var i = 0; i < users; i = i + 1) {
-        var w = agnosai_lt_worker_new(url, deadline, per_user, executor_fp, i);
+        var w = agnosai_lt_worker_new_a(a, url, deadline, per_user, executor_fp, i);
         # A worker that could not get its arenas is skipped rather than run —
         # every allocation in its loop would return 0 and be dereferenced.
         if (w != 0) {
-            vec_push(workers, w);
-            vec_push(threads, thread_create(&_agnosai_lt_thread_main, w));
+            vec_push_a(a, workers, w);
+            vec_push_a(a, threads, thread_create(&_agnosai_lt_thread_main, w));
         }
     }
     if (vec_len(workers) == 0) { return 0; }
@@ -27494,11 +27555,11 @@ fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
         thread_join(vec_get(threads, j));
     }
 
-    var result = agnosai_lt_aggregate(workers, url, users, duration_secs);
+    var result = agnosai_lt_aggregate_a(a, workers, url, users, duration_secs);
 
     # Every worker arena is released here — nothing in the aggregate points
     # into one, because agnosai_lt_aggregate copies each latency and status
-    # count into globally-allocated structures.
+    # count into `a`.
     for (var k = 0; k < vec_len(workers); k = k + 1) {
         agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL,
           load64(vec_get(workers, k) + AGN_LT_ARENA));
@@ -27506,6 +27567,11 @@ fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
           load64(vec_get(workers, k) + AGN_LT_SCRATCH));
     }
     return result;
+}
+
+# Global-allocator form of `agnosai_load_test_run_a`.
+fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
+    return agnosai_load_test_run_a(default_alloc(), url, users, duration_secs, executor_fp);
 }
 
 # The load_testing tool's parameter schema.
@@ -27550,25 +27616,25 @@ fn agnosai_lt_clamp_duration(secs): i64 {
 # OS threads run at once.
 #
 # `c_key` is optional: 0 omits the third pair.
-fn _agnosai_lt_log(msg, msg_len, url: Str, a_key, a_val, b_key, b_val, c_key, c_val): i64 {
+fn _agnosai_lt_log_a(a, msg, msg_len, url: Str, a_key, a_val, b_key, b_val, c_key, c_val): i64 {
     if (sakshi_get_level() < SK_INFO) { return 0; }
-    var sb = str_builder_new();
-    str_builder_add(sb, url);
-    str_builder_add_cstr(sb, " ");
-    str_builder_add_cstr(sb, a_key);
-    str_builder_add_cstr(sb, "=");
-    str_builder_add_int(sb, a_val);
-    str_builder_add_cstr(sb, " ");
-    str_builder_add_cstr(sb, b_key);
-    str_builder_add_cstr(sb, "=");
-    str_builder_add_int(sb, b_val);
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, url);
+    str_builder_add_cstr_a(a, sb, " ");
+    str_builder_add_cstr_a(a, sb, a_key);
+    str_builder_add_cstr_a(a, sb, "=");
+    str_builder_add_int_a(a, sb, a_val);
+    str_builder_add_cstr_a(a, sb, " ");
+    str_builder_add_cstr_a(a, sb, b_key);
+    str_builder_add_cstr_a(a, sb, "=");
+    str_builder_add_int_a(a, sb, b_val);
     if (c_key != 0) {
-        str_builder_add_cstr(sb, " ");
-        str_builder_add_cstr(sb, c_key);
-        str_builder_add_cstr(sb, "=");
-        str_builder_add_int(sb, c_val);
+        str_builder_add_cstr_a(a, sb, " ");
+        str_builder_add_cstr_a(a, sb, c_key);
+        str_builder_add_cstr_a(a, sb, "=");
+        str_builder_add_int_a(a, sb, c_val);
     }
-    var line = str_builder_build(sb);
+    var line = str_builder_build_a(a, sb);
     sakshi_log_kv(SK_INFO, msg, msg_len, "load_test", 9, str_data(line), str_len(line));
     return 0;
 }
@@ -27580,38 +27646,39 @@ fn _agnosai_lt_log(msg, msg_len, url: Str, a_key, a_val, b_key, b_val, c_key, c_
 # admits it (ADR 025), which is deliberate. Its requests follow no redirect, as sandhi's
 # default has it, so the target is the only URL this tool ever reaches.
 fn _agnosai_load_testing_execute(ctx, input): i64 {
-    var target = agnosai_tool_input_get_str(input, str_from("target_url"));
+    var a = agnosai_tool_input_alloc(input);
+    var target = agnosai_tool_input_get_str(input, str_from_a(a, "target_url"));
     if (target == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: target_url"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: target_url"));
     }
     var refused = agnosai_tool_target_refused(input, target);
     if (refused != 0) { return refused; }
 
-    var users = agnosai_tool_input_get_int(input, str_from("concurrent_users"));
+    var users = agnosai_tool_input_get_int(input, str_from_a(a, "concurrent_users"));
     if (users == AGNOSAI_NO_LIMIT) { users = 10; }
     users = agnosai_lt_clamp_users(users);
 
-    var duration = agnosai_tool_input_get_int(input, str_from("duration_seconds"));
+    var duration = agnosai_tool_input_get_int(input, str_from_a(a, "duration_seconds"));
     if (duration == AGNOSAI_NO_LIMIT) { duration = 10; }
     duration = agnosai_lt_clamp_duration(duration);
 
-    _agnosai_lt_log("load test starting", 18, target, "concurrent_users", users,
+    _agnosai_lt_log_a(a, "load test starting", 18, target, "concurrent_users", users,
       "duration_secs", duration, 0, 0);
 
-    var result = agnosai_load_test_run(target, users, duration, &agnosai_lt_http_executor);
+    var result = agnosai_load_test_run_a(a, target, users, duration, &agnosai_lt_http_executor);
     if (result == 0) {
-        return agnosai_tool_output_err(str_from("load test failed: no requests completed"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "load test failed: no requests completed"));
     }
 
     # Throughput is logged in thousandths of a request per second — the integer
     # carrier the result already holds, which keeps a float out of the log path.
     # p99 is in milliseconds.
-    _agnosai_lt_log("load test completed", 19, target,
+    _agnosai_lt_log_a(a, "load test completed", 19, target,
       "total_requests", load64(result + AGN_LTR_TOTAL_REQUESTS),
       "p99_latency_ms", load64(result + AGN_LTR_P99_NS) / AGNOSAI_NS_PER_MS,
       "throughput_milli_rps", load64(result + AGN_LTR_THROUGHPUT_MILLI));
 
-    return agnosai_tool_output_ok(agnosai_lt_result_to_value(result));
+    return agnosai_tool_output_ok_a(a, agnosai_lt_result_to_value_a(a, result));
 }
 
 # The load_testing tool.
@@ -27713,8 +27780,8 @@ enum AgnosaiAgnosOff {
 }
 
 # Create a client. `service` is the label in "<service> request failed";
-# `transport_fp` is `fn(client, method, url: Str, body) -> i64` returning a
-# parsed JSON value, or 0 for a transport failure.
+# `transport_fp` is `fn(a, client, method, url: Str, body, detail_out)`, answering
+# a JSON value parsed in `a`, 0 for a transport failure, or `AGNOSAI_AGNOS_BAD_JSON`.
 fn agnosai_agnos_client_new(base_url: Str, service: Str, transport_fp): i64 {
     var c = alloc(AGN_CL_SIZE);
     store64(c + AGN_CL_BASE_URL, base_url);
@@ -27748,9 +27815,32 @@ fn agnosai_agnos_transport(c): i64 {
 # The empty string passes. It produces a double slash in the URL and a 404 from
 # the service.
 fn agnosai_agnos_segment_ok(v: Str): i64 {
-    if (str_contains(v, str_from("/")) == 1) { return 0; }
-    if (str_contains(v, str_from("..")) == 1) { return 0; }
+    if (str_contains_cstr(v, "/") == 1) { return 0; }
+    if (str_contains_cstr(v, "..") == 1) { return 0; }
     return 1;
+}
+
+# The most bytes an encoder below holds on its stack before it appends them: a full chunk leaves
+# room for one more byte's three and the terminator.
+#
+# ⚠ **A chunk, not a byte at a time.** The stdlib has no `_a` form of `str_builder_add_byte`, and
+# appending a C string per byte read 2.05 µs for 52 B against that form's 1.15. Neither encoder
+# passes a NUL through raw, so a C string can carry the chunk.
+var _AGNOSAI_AGNOS_CHUNK_FULL = 252;
+
+# Append the `n` bytes of `chunk` to `sb`, in allocator `a`.
+fn _agnosai_agnos_flush_a(a, sb, chunk, n): i64 {
+    store8(chunk + n, 0);
+    return str_builder_add_cstr_a(a, sb, chunk);
+}
+
+# Write `b` percent-encoded at `p`, uppercase hex. Returns the 3 bytes it wrote.
+fn _agnosai_agnos_put_pct(p, b): i64 {
+    var hex = "0123456789ABCDEF";
+    store8(p, 37);
+    store8(p + 1, load8(hex + ((b >> 4) & 15)));
+    store8(p + 2, load8(hex + (b & 15)));
+    return 3;
 }
 
 # Append `v` to a URL path as one segment, percent-encoding the WHATWG path set:
@@ -27759,41 +27849,47 @@ fn agnosai_agnos_segment_ok(v: Str): i64 {
 # (it refuses a space), so the tool failed with "request failed" instead of
 # asking for `/api/notes/my%20note`. `%` itself is left alone, so an id that is
 # already encoded is not encoded twice.
-fn agnosai_agnos_add_segment(sb, v: Str): i64 {
+fn agnosai_agnos_add_segment_a(a, sb, v: Str): i64 {
     var p = str_data(v);
     var n = str_len(v);
+    var chunk[256];
+    var at = 0;
     for (var i = 0; i < n; i = i + 1) {
+        if (at >= _AGNOSAI_AGNOS_CHUNK_FULL) {
+            _agnosai_agnos_flush_a(a, sb, &chunk, at);
+            at = 0;
+        }
         var b = load8(p + i) & 255;
         var enc = 0;
         if (b <= 32 || b >= 127) { enc = 1; }
         if (b == 34 || b == 35 || b == 60 || b == 62 || b == 63) { enc = 1; }
         if (b == 96 || b == 123 || b == 125) { enc = 1; }
         if (enc == 1) {
-            str_builder_add_byte(sb, 37);
-            str_builder_add_byte(sb, load8("0123456789ABCDEF" + (b >> 4)));
-            str_builder_add_byte(sb, load8("0123456789ABCDEF" + (b & 15)));
+            at = at + _agnosai_agnos_put_pct(&chunk + at, b);
         } else {
-            str_builder_add_byte(sb, b);
+            store8(&chunk + at, b);
+            at = at + 1;
         }
     }
-    return 0;
+    return _agnosai_agnos_flush_a(a, sb, &chunk, at);
 }
 
-# The oracle's "<name> contains invalid characters" rejection.
+# Global-allocator form of `agnosai_agnos_add_segment_a`.
+fn agnosai_agnos_add_segment(sb, v: Str): i64 {
+    return agnosai_agnos_add_segment_a(default_alloc(), sb, v);
+}
+
+# The oracle's "<name> contains invalid characters" rejection, in allocator `a`.
+fn agnosai_agnos_segment_err_a(a, name: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, name);
+    str_builder_add_cstr_a(a, sb, " contains invalid characters");
+    return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
+}
+
+# Global-allocator form of `agnosai_agnos_segment_err_a`.
 fn agnosai_agnos_segment_err(name: Str): i64 {
-    var sb = str_builder_new();
-    str_builder_add(sb, name);
-    str_builder_add_cstr(sb, " contains invalid characters");
-    return agnosai_tool_output_err(str_builder_build(sb));
-}
-
-# Append one byte percent-encoded, uppercase hex.
-fn _agnosai_agnos_pct_byte(sb, b): i64 {
-    var hex = "0123456789ABCDEF";
-    str_builder_add_byte(sb, 37);
-    str_builder_add_byte(sb, load8(hex + ((b >> 4) & 15)));
-    str_builder_add_byte(sb, load8(hex + (b & 15)));
-    return 0;
+    return agnosai_agnos_segment_err_a(default_alloc(), name);
 }
 
 # Append a value in `application/x-www-form-urlencoded` form.
@@ -27804,28 +27900,52 @@ fn _agnosai_agnos_pct_byte(sb, b): i64 {
 # everything else becomes `%XX` in uppercase hex. The stdlib has no
 # percent-encoder, so it is written out here rather than approximated — getting
 # it wrong would send a query the service silently mis-parses.
-fn agnosai_agnos_form_encode(sb, v: Str): i64 {
+fn agnosai_agnos_form_encode_a(a, sb, v: Str): i64 {
     var d = str_data(v);
     var n = str_len(v);
+    var chunk[256];
+    var at = 0;
     for (var i = 0; i < n; i = i + 1) {
+        if (at >= _AGNOSAI_AGNOS_CHUNK_FULL) {
+            _agnosai_agnos_flush_a(a, sb, &chunk, at);
+            at = 0;
+        }
         var b = load8(d + i) & 255;
-        if (b >= 48 && b <= 57) { str_builder_add_byte(sb, b); }
-        elif (b >= 65 && b <= 90) { str_builder_add_byte(sb, b); }
-        elif (b >= 97 && b <= 122) { str_builder_add_byte(sb, b); }
-        elif (b == 42 || b == 45 || b == 46 || b == 95) { str_builder_add_byte(sb, b); }
-        elif (b == 32) { str_builder_add_byte(sb, 43); }
-        else { _agnosai_agnos_pct_byte(sb, b); }
+        var keep = 0;
+        if (b >= 48 && b <= 57) { keep = 1; }
+        elif (b >= 65 && b <= 90) { keep = 1; }
+        elif (b >= 97 && b <= 122) { keep = 1; }
+        elif (b == 42 || b == 45 || b == 46 || b == 95) { keep = 1; }
+        if (keep == 1) {
+            store8(&chunk + at, b);
+            at = at + 1;
+        } elif (b == 32) {
+            store8(&chunk + at, 43);
+            at = at + 1;
+        } else {
+            at = at + _agnosai_agnos_put_pct(&chunk + at, b);
+        }
     }
-    return 0;
+    return _agnosai_agnos_flush_a(a, sb, &chunk, at);
+}
+
+# Global-allocator form of `agnosai_agnos_form_encode_a`.
+fn agnosai_agnos_form_encode(sb, v: Str): i64 {
+    return agnosai_agnos_form_encode_a(default_alloc(), sb, v);
 }
 
 # Join the client's base URL with a path, producing the oracle's
 # `format!("{}{}", base_url, path)`.
+fn agnosai_agnos_url_a(a, c, path: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, agnosai_agnos_base_url(c));
+    str_builder_add_a(a, sb, path);
+    return str_builder_build_a(a, sb);
+}
+
+# Global-allocator form of `agnosai_agnos_url_a`.
 fn agnosai_agnos_url(c, path: Str): i64 {
-    var sb = str_builder_new();
-    str_builder_add(sb, agnosai_agnos_base_url(c));
-    str_builder_add(sb, path);
-    return str_builder_build(sb);
+    return agnosai_agnos_url_a(default_alloc(), c, path);
 }
 
 # The oracle's "<service> request failed: <detail>".
@@ -27834,15 +27954,20 @@ fn agnosai_agnos_url(c, path: Str): i64 {
 # condition. sandhi's equivalent is `sandhi_http_err_message`, threaded through
 # by the live transport; a synthetic transport passes 0 and the message stops
 # at the colon-free form.
-fn agnosai_agnos_request_err(c, detail): i64 {
-    var sb = str_builder_new();
-    str_builder_add(sb, agnosai_agnos_service(c));
-    str_builder_add_cstr(sb, " request failed");
+fn agnosai_agnos_request_err_a(a, c, detail): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, agnosai_agnos_service(c));
+    str_builder_add_cstr_a(a, sb, " request failed");
     if (detail != 0) {
-        str_builder_add_cstr(sb, ": ");
-        str_builder_add_cstr(sb, detail);
+        str_builder_add_cstr_a(a, sb, ": ");
+        str_builder_add_cstr_a(a, sb, detail);
     }
-    return agnosai_tool_output_err(str_builder_build(sb));
+    return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
+}
+
+# Global-allocator form of `agnosai_agnos_request_err_a`.
+fn agnosai_agnos_request_err(c, detail): i64 {
+    return agnosai_agnos_request_err_a(default_alloc(), c, detail);
 }
 
 # The oracle's "failed to parse response: <detail>".
@@ -27852,14 +27977,19 @@ fn agnosai_agnos_request_err(c, detail): i64 {
 # sentinel rather than folding it into a transport failure, because "the service
 # answered with something that is not JSON" and "the service did not answer" are
 # different operational problems.
-fn agnosai_agnos_parse_err(detail): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "failed to parse response");
+fn agnosai_agnos_parse_err_a(a, detail): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "failed to parse response");
     if (detail != 0) {
-        str_builder_add_cstr(sb, ": ");
-        str_builder_add_cstr(sb, detail);
+        str_builder_add_cstr_a(a, sb, ": ");
+        str_builder_add_cstr_a(a, sb, detail);
     }
-    return agnosai_tool_output_err(str_builder_build(sb));
+    return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
+}
+
+# Global-allocator form of `agnosai_agnos_parse_err_a`.
+fn agnosai_agnos_parse_err(detail): i64 {
+    return agnosai_agnos_parse_err_a(default_alloc(), detail);
 }
 
 # Returned by a transport when the exchange succeeded but the body would not
@@ -27867,25 +27997,31 @@ fn agnosai_agnos_parse_err(detail): i64 {
 var AGNOSAI_AGNOS_BAD_JSON = 0 - 1;
 
 # Perform an exchange through the client's transport and turn the result into a
-# ToolOutput, applying the oracle's two error arms.
+# ToolOutput in allocator `a`, applying the oracle's two error arms. A tool passes
+# `agnosai_tool_input_alloc`'s answer, so what the service said goes back with the call.
 #
 # `method` is a C string verb, `path` is appended to the base URL, and `body` is
 # a bayan JSON value or 0. On success the parsed response is handed to
-# `shape_fp` — `fn(value) -> value` — which is where a tool that reshapes the
+# `shape_fp` — `fn(a, value) -> value` — which is where a tool that reshapes the
 # response (only `synapse_infer` does) puts that logic. Pass 0 to return the
 # response unchanged, which is what seven of the nine tools do.
 #
 # The transport reports a failure's detail through `detail_out`, a local of THIS
 # call. It used to be a process-wide global, and tools run on up to 100 server
 # workers at once, so one call's error text could be reported by another's.
-fn agnosai_agnos_call(c, method, path: Str, body, shape_fp): i64 {
-    var url = agnosai_agnos_url(c, path);
+fn agnosai_agnos_call_a(a, c, method, path: Str, body, shape_fp): i64 {
+    var url = agnosai_agnos_url_a(a, c, path);
     var detail = 0;
-    var data = callptr(agnosai_agnos_transport(c), c, method, url, body, &detail);
-    if (data == 0) { return agnosai_agnos_request_err(c, detail); }
-    if (data == AGNOSAI_AGNOS_BAD_JSON) { return agnosai_agnos_parse_err(detail); }
-    if (shape_fp == 0) { return agnosai_tool_output_ok(data); }
-    return agnosai_tool_output_ok(callptr(shape_fp, data));
+    var data = callptr(agnosai_agnos_transport(c), a, c, method, url, body, &detail);
+    if (data == 0) { return agnosai_agnos_request_err_a(a, c, detail); }
+    if (data == AGNOSAI_AGNOS_BAD_JSON) { return agnosai_agnos_parse_err_a(a, detail); }
+    if (shape_fp == 0) { return agnosai_tool_output_ok_a(a, data); }
+    return agnosai_tool_output_ok_a(a, callptr(shape_fp, a, data));
+}
+
+# Global-allocator form of `agnosai_agnos_call_a`.
+fn agnosai_agnos_call(c, method, path: Str, body, shape_fp): i64 {
+    return agnosai_agnos_call_a(default_alloc(), c, method, path, body, shape_fp);
 }
 
 # The live transport: one sandhi exchange against an AGNOS service.
@@ -27896,8 +28032,9 @@ fn agnosai_agnos_call(c, method, path: Str, body, shape_fp): i64 {
 # somewhere it was never pointed — the same reasoning as ADR 007, reaching the
 # opposite conclusion because there is no legitimate redirect to preserve.
 #
-# `detail_out` receives a C string describing a failure, or stays 0.
-fn agnosai_agnos_http_transport(c, method, url: Str, body, detail_out): i64 {
+# `detail_out` receives a C string in `a` describing a failure, or stays 0. The exchange itself has
+# an arena of its own, as it is 5 MiB of buffers a tool's answer has no use for.
+fn agnosai_agnos_http_transport(a, c, method, url: Str, body, detail_out): i64 {
     store64(detail_out, 0);
 
     var arena = agnosai_arena_pool_acquire(_AGNOSAI_AGNOS_POOL);
@@ -27917,13 +28054,15 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body, detail_out): i64 {
     var payload_len = 0;
     if (body != 0) {
         sandhi_headers_add_a(arena, headers, "Content-Type", "application/json");
-        var encoded = bayan_json_v_build(body);
+        var encoded = bayan_json_v_build_a(arena, body);
         payload = str_data(encoded);
         payload_len = str_len(encoded);
     }
 
-    var r = sandhi_http_request_auto_a(arena, method, str_cstr(url), headers, payload, payload_len,
-      opts);
+    # ⚠ Not `str_cstr`, which copies onto the global heap whatever it is given. A clone is
+    # NUL-terminated, and this one goes back with the exchange.
+    var r = sandhi_http_request_auto_a(arena, method, str_data(str_clone_a(arena, url)), headers, payload,
+      payload_len, opts);
     if (r == 0) {
         agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return 0;
@@ -27934,12 +28073,12 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body, detail_out): i64 {
         # exactly that case — so the null check is the common path, not the
         # defensive one.
         var msg = sandhi_http_err_message(r);
-        if (msg != 0) { store64(detail_out, str_cstr(str_clone(str_from(msg)))); }
+        if (msg != 0) { store64(detail_out, str_data(str_clone_a(a, str_from_a(a, msg)))); }
         agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return 0;
     }
 
-    # bayan parses into the default allocator, so the value outlives the arena.
+    # bayan parses into `a`, the caller's, so the value outlives this exchange's arena.
     #
     # ⚠ **The null-body guard is NOT defensive — it closes a real null-pointer
     # read.** sandhi can return `SANDHI_OK` with `body_ptr == 0` and a positive
@@ -27969,8 +28108,10 @@ fn agnosai_agnos_http_transport(c, method, url: Str, body, detail_out): i64 {
     # detail cannot be another thread's.
     if (body_len > 0) {
         var ps[48];
-        data = bayan_json_v_parse_ctx(&ps, sandhi_http_body(r), body_len);
-        if (data == 0) { store64(detail_out, str_cstr(str_clone(str_from(bayan_json_state_error(&ps))))); }
+        data = bayan_json_v_parse_ctx_a(a, &ps, sandhi_http_body(r), body_len);
+        if (data == 0) {
+            store64(detail_out, str_data(str_clone_a(a, str_from_a(a, bayan_json_state_error(&ps)))));
+        }
     }
     agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
     if (data == 0) { return AGNOSAI_AGNOS_BAD_JSON; }
@@ -28188,8 +28329,8 @@ fn _agnosai_audit_pct(count, max): i64 {
 }
 
 # Build a MissingHeader.
-fn _agnosai_audit_missing_new(header: Str, severity: Str): i64 {
-    var m = alloc(AGN_MISS_SIZE);
+fn _agnosai_audit_missing_new_a(a, header: Str, severity: Str): i64 {
+    var m = alloc_via(a, AGN_MISS_SIZE);
     store64(m + AGN_MISS_HEADER, header);
     store64(m + AGN_MISS_SEVERITY, severity);
     return m;
@@ -28206,8 +28347,8 @@ fn agnosai_missing_header_severity(m): i64 {
 }
 
 # Build a Vulnerability.
-fn _agnosai_audit_vuln_new(kind: Str, severity: Str, description: Str, remediation: Str): i64 {
-    var v = alloc(AGN_VULN_SIZE);
+fn _agnosai_audit_vuln_new_a(a, kind: Str, severity: Str, description: Str, remediation: Str): i64 {
+    var v = alloc_via(a, AGN_VULN_SIZE);
     store64(v + AGN_VULN_KIND, kind);
     store64(v + AGN_VULN_SEVERITY, severity);
     store64(v + AGN_VULN_DESCRIPTION, description);
@@ -28264,15 +28405,15 @@ fn agnosai_cors_detail(c): i64 {
 # The oracle treats a reflected probe origin exactly like a wildcard. That is
 # the point of sending one — a server that echoes `https://evil.example.com`
 # back is allowing all origins, it is just doing so one request at a time.
-fn agnosai_analyze_cors(headers): i64 {
-    var c = alloc(AGN_CORS_SIZE);
+fn agnosai_analyze_cors_a(a, headers): i64 {
+    var c = alloc_via(a, AGN_CORS_SIZE);
 
     if (headers == 0) {
         store64(c + AGN_CORS_MISCONFIGURED, 0);
         store64(c + AGN_CORS_ALLOWS_ALL, 0);
         store64(c + AGN_CORS_ALLOWS_CREDS, 0);
         store64(c + AGN_CORS_DETAIL,
-          str_from("OPTIONS request failed (CORS may not be configured)"));
+          str_from_a(a, "OPTIONS request failed (CORS may not be configured)"));
         return c;
     }
 
@@ -28286,7 +28427,7 @@ fn agnosai_analyze_cors(headers): i64 {
 
     var allows_all = 0;
     if (_agnosai_audit_cstr_ieq(acao, "*") == 1) { allows_all = 1; }
-    if (str_eq_cstr(str_from(acao), AGNOSAI_AUDIT_PROBE_ORIGIN) == 1) { allows_all = 1; }
+    if (str_eq_cstr(str_from_a(a, acao), AGNOSAI_AUDIT_PROBE_ORIGIN) == 1) { allows_all = 1; }
 
     var allows_creds = _agnosai_audit_cstr_ieq(acac, "true");
 
@@ -28299,15 +28440,20 @@ fn agnosai_analyze_cors(headers): i64 {
 
     if (misconfigured == 1) {
         store64(c + AGN_CORS_DETAIL,
-          str_from("Wildcard origin with credentials — critical misconfiguration"));
+          str_from_a(a, "Wildcard origin with credentials — critical misconfiguration"));
     } else {
         if (allows_all == 1) {
-            store64(c + AGN_CORS_DETAIL, str_from("Wildcard origin allowed (no credentials)"));
+            store64(c + AGN_CORS_DETAIL, str_from_a(a, "Wildcard origin allowed (no credentials)"));
         } else {
-            store64(c + AGN_CORS_DETAIL, str_from("CORS properly configured"));
+            store64(c + AGN_CORS_DETAIL, str_from_a(a, "CORS properly configured"));
         }
     }
     return c;
+}
+
+# Global-allocator form of `agnosai_analyze_cors_a`.
+fn agnosai_analyze_cors(headers): i64 {
+    return agnosai_analyze_cors_a(default_alloc(), headers);
 }
 
 # The "<header>: <value>" line the oracle formats for each disclosure.
@@ -28333,48 +28479,48 @@ fn _agnosai_audit_is_visible_ascii(s): i64 {
     return 1;
 }
 
-fn _agnosai_audit_disclosure_line(name, value): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, name);
-    str_builder_add_cstr(sb, ": ");
-    str_builder_add_cstr(sb, value);
-    return str_builder_build(sb);
+fn _agnosai_audit_disclosure_line_a(a, name, value): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, name);
+    str_builder_add_cstr_a(a, sb, ": ");
+    str_builder_add_cstr_a(a, sb, value);
+    return str_builder_build_a(a, sb);
 }
 
 # Join a vec of Str with ", " — the oracle's `disclosure.join(", ")`.
-fn _agnosai_audit_join(items): i64 {
-    var sb = str_builder_new();
+fn _agnosai_audit_join_a(a, items): i64 {
+    var sb = str_builder_new_a(a);
     for (var i = 0; i < vec_len(items); i = i + 1) {
-        if (i > 0) { str_builder_add_cstr(sb, ", "); }
-        str_builder_add(sb, vec_get(items, i));
+        if (i > 0) { str_builder_add_cstr_a(a, sb, ", "); }
+        str_builder_add_a(a, sb, vec_get(items, i));
     }
-    return str_builder_build(sb);
+    return str_builder_build_a(a, sb);
 }
 
 # The oracle's `format!("Only {:.0}% of ... are present", score)`. The score is
 # integral, so `{:.0}` renders it with no decimal point at all.
-fn _agnosai_audit_missing_headers_desc(score): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "Only ");
-    str_builder_add_int(sb, score);
-    str_builder_add_cstr(sb, "% of recommended security headers are present");
-    return str_builder_build(sb);
+fn _agnosai_audit_missing_headers_desc_a(a, score): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Only ");
+    str_builder_add_int_a(a, sb, score);
+    str_builder_add_cstr_a(a, sb, "% of recommended security headers are present");
+    return str_builder_build_a(a, sb);
 }
 
 # The oracle's `format!("Server discloses: {}", disclosure.join(", "))`.
-fn _agnosai_audit_disclosure_desc(disclosure): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "Server discloses: ");
-    str_builder_add(sb, _agnosai_audit_join(disclosure));
-    return str_builder_build(sb);
+fn _agnosai_audit_disclosure_desc_a(a, disclosure): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Server discloses: ");
+    str_builder_add_a(a, sb, _agnosai_audit_join_a(a, disclosure));
+    return str_builder_build_a(a, sb);
 }
 
 # The oracle's risk bands: >=80 low, >=60 medium, >=40 high, else critical.
-fn _agnosai_audit_risk_level(score): i64 {
-    if (score >= 80) { return str_from("low"); }
-    if (score >= 60) { return str_from("medium"); }
-    if (score >= 40) { return str_from("high"); }
-    return str_from("critical");
+fn _agnosai_audit_risk_level_a(a, score): i64 {
+    if (score >= 80) { return str_from_a(a, "low"); }
+    if (score >= 60) { return str_from_a(a, "medium"); }
+    if (score >= 40) { return str_from_a(a, "high"); }
+    return str_from_a(a, "critical");
 }
 
 # The whole audit, over two already-fetched header sets.
@@ -28385,53 +28531,53 @@ fn _agnosai_audit_risk_level(score): i64 {
 # is free to release the response memory the moment this returns. That is what
 # lets `agnosai_run_security_audit` run both requests through a scratch arena
 # and reset it before returning.
-fn agnosai_audit_analyze(url: Str, get_headers, cors_headers): i64 {
-    var present = vec_new();
-    var missing = vec_new();
+fn agnosai_audit_analyze_a(a, url: Str, get_headers, cors_headers): i64 {
+    var present = vec_new_a(a);
+    var missing = vec_new_a(a);
     var found = 0;
 
     for (var i = 0; i < AGNOSAI_AUDIT_SEC_HEADER_COUNT; i = i + 1) {
         var name = _agnosai_audit_sec_header(i);
         if (get_headers != 0 && sandhi_headers_has(get_headers, name) == 1) {
-            vec_push(present, str_from(name));
+            vec_push_a(a, present, str_from_a(a, name));
             found = found + 1;
         } else {
-            vec_push(missing,
-              _agnosai_audit_missing_new(str_from(name), str_from(_agnosai_audit_sec_severity(i))));
+            vec_push_a(a, missing,
+              _agnosai_audit_missing_new_a(a, str_from_a(a, name), str_from_a(a, _agnosai_audit_sec_severity(i))));
         }
     }
     var header_score = _agnosai_audit_pct(found, AGNOSAI_AUDIT_SEC_HEADER_COUNT);
 
-    var disclosure = vec_new();
+    var disclosure = vec_new_a(a);
     for (var d = 0; d < AGNOSAI_AUDIT_DISCLOSURE_COUNT; d = d + 1) {
         var dname = _agnosai_audit_disclosure_header(d);
         if (get_headers != 0) {
             var dval = sandhi_headers_get(get_headers, dname);
             # The second condition is the oracle's `let Ok(v) = val.to_str()`.
             if (dval != 0 && _agnosai_audit_is_visible_ascii(dval) == 1) {
-                vec_push(disclosure, _agnosai_audit_disclosure_line(dname, dval));
+                vec_push_a(a, disclosure, _agnosai_audit_disclosure_line_a(a, dname, dval));
             }
         }
     }
 
-    var cors = agnosai_analyze_cors(cors_headers);
+    var cors = agnosai_analyze_cors_a(a, cors_headers);
 
     # Vulnerabilities, in the oracle's order. The order is wire-visible.
-    var vulns = vec_new();
+    var vulns = vec_new_a(a);
     if (header_score < 50) {
-        vec_push(vulns, _agnosai_audit_vuln_new(str_from("missing_security_headers"),
-            str_from("high"), _agnosai_audit_missing_headers_desc(header_score),
-            str_from("Add missing security headers to all responses")));
+        vec_push_a(a, vulns, _agnosai_audit_vuln_new_a(a, str_from_a(a, "missing_security_headers"),
+            str_from_a(a, "high"), _agnosai_audit_missing_headers_desc_a(a, header_score),
+            str_from_a(a, "Add missing security headers to all responses")));
     }
     if (agnosai_cors_allows_all_origins(cors) == 1 && agnosai_cors_allows_credentials(cors) == 1) {
-        vec_push(vulns, _agnosai_audit_vuln_new(str_from("cors_misconfiguration"),
-            str_from("critical"), str_from("CORS allows all origins with credentials"),
-            str_from("Restrict Access-Control-Allow-Origin to specific trusted domains")));
+        vec_push_a(a, vulns, _agnosai_audit_vuln_new_a(a, str_from_a(a, "cors_misconfiguration"),
+            str_from_a(a, "critical"), str_from_a(a, "CORS allows all origins with credentials"),
+            str_from_a(a, "Restrict Access-Control-Allow-Origin to specific trusted domains")));
     }
     if (vec_len(disclosure) > 0) {
-        vec_push(vulns, _agnosai_audit_vuln_new(str_from("information_disclosure"),
-            str_from("low"), _agnosai_audit_disclosure_desc(disclosure),
-            str_from("Remove or obfuscate server identification headers")));
+        vec_push_a(a, vulns, _agnosai_audit_vuln_new_a(a, str_from_a(a, "information_disclosure"),
+            str_from_a(a, "low"), _agnosai_audit_disclosure_desc_a(a, disclosure),
+            str_from_a(a, "Remove or obfuscate server identification headers")));
     }
 
     # The overall score starts from the header score and is docked for the two
@@ -28445,25 +28591,25 @@ fn agnosai_audit_analyze(url: Str, get_headers, cors_headers): i64 {
     if (security_score > 100) { security_score = 100; }
 
     # Recommendations, in the oracle's order — also wire-visible.
-    var recs = vec_new();
+    var recs = vec_new_a(a);
     if (header_score < 100) {
-        vec_push(recs, str_from(
+        vec_push_a(a, recs, str_from_a(a,
             "Add all recommended security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options)"));
     }
     if (agnosai_cors_misconfigured(cors) == 1) {
-        vec_push(recs, str_from("Fix CORS configuration: restrict allowed origins"));
+        vec_push_a(a, recs, str_from_a(a, "Fix CORS configuration: restrict allowed origins"));
     }
     if (vec_len(disclosure) > 0) {
-        vec_push(recs, str_from("Remove server version headers to reduce attack surface"));
+        vec_push_a(a, recs, str_from_a(a, "Remove server version headers to reduce attack surface"));
     }
-    if (str_starts_with(url, str_from("https://")) == 0) {
-        vec_push(recs, str_from("Enforce HTTPS for all endpoints"));
+    if (str_starts_with(url, str_from_a(a, "https://")) == 0) {
+        vec_push_a(a, recs, str_from_a(a, "Enforce HTTPS for all endpoints"));
     }
 
-    var r = alloc(AGN_AUD_SIZE);
+    var r = alloc_via(a, AGN_AUD_SIZE);
     store64(r + AGN_AUD_TARGET_URL, url);
     store64(r + AGN_AUD_SECURITY_SCORE, security_score);
-    store64(r + AGN_AUD_RISK_LEVEL, _agnosai_audit_risk_level(security_score));
+    store64(r + AGN_AUD_RISK_LEVEL, _agnosai_audit_risk_level_a(a, security_score));
     store64(r + AGN_AUD_HDR_PRESENT, present);
     store64(r + AGN_AUD_HDR_MISSING, missing);
     store64(r + AGN_AUD_HDR_SCORE, header_score);
@@ -28472,6 +28618,11 @@ fn agnosai_audit_analyze(url: Str, get_headers, cors_headers): i64 {
     store64(r + AGN_AUD_VULNS, vulns);
     store64(r + AGN_AUD_RECOMMENDATIONS, recs);
     return r;
+}
+
+# Global-allocator form of `agnosai_audit_analyze_a`.
+fn agnosai_audit_analyze(url: Str, get_headers, cors_headers): i64 {
+    return agnosai_audit_analyze_a(default_alloc(), url, get_headers, cors_headers);
 }
 
 # The audited URL.
@@ -28529,89 +28680,94 @@ fn agnosai_audit_recommendations(r): i64 {
 # The scores are the only conversion: they are carried as whole percents and
 # emitted as floats, which is what `f64` fields serialized to. bayan's Grisu2
 # renders 57 as `57.0`, the same shortest round-tripping form serde emits.
-fn agnosai_audit_result_to_value(r): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("target_url"),
-      bayan_json_v_str_new(load64(r + AGN_AUD_TARGET_URL)));
-    bayan_json_v_obj_set(obj, str_from("security_score"),
-      bayan_json_v_float_new(f64_from(load64(r + AGN_AUD_SECURITY_SCORE))));
-    bayan_json_v_obj_set(obj, str_from("risk_level"),
-      bayan_json_v_str_new(load64(r + AGN_AUD_RISK_LEVEL)));
+fn agnosai_audit_result_to_value_a(a, r): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "target_url"),
+      bayan_json_v_str_new_a(a, load64(r + AGN_AUD_TARGET_URL)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "security_score"),
+      bayan_json_v_float_new_a(a, f64_from(load64(r + AGN_AUD_SECURITY_SCORE))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "risk_level"),
+      bayan_json_v_str_new_a(a, load64(r + AGN_AUD_RISK_LEVEL)));
 
-    var ha = bayan_json_v_obj_new();
+    var ha = bayan_json_v_obj_new_a(a);
     var present = load64(r + AGN_AUD_HDR_PRESENT);
-    var present_v = bayan_json_v_arr_new();
+    var present_v = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(present); i = i + 1) {
-        bayan_json_v_arr_push(present_v, bayan_json_v_str_new(vec_get(present, i)));
+        bayan_json_v_arr_push_a(a, present_v, bayan_json_v_str_new_a(a, vec_get(present, i)));
     }
-    bayan_json_v_obj_set(ha, str_from("present"), present_v);
+    bayan_json_v_obj_set_a(a, ha, str_from_a(a, "present"), present_v);
 
     var missing = load64(r + AGN_AUD_HDR_MISSING);
-    var missing_v = bayan_json_v_arr_new();
+    var missing_v = bayan_json_v_arr_new_a(a);
     # Hoisted: two keys per missing header, minted once instead.
-    var k_header = str_from("header");
-    var k_sev = str_from("severity");
+    var k_header = str_from_a(a, "header");
+    var k_sev = str_from_a(a, "severity");
     for (var m = 0; m < vec_len(missing); m = m + 1) {
         var entry = vec_get(missing, m);
-        var mo = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(mo, k_header,
-          bayan_json_v_str_new(agnosai_missing_header_name(entry)));
-        bayan_json_v_obj_set(mo, k_sev,
-          bayan_json_v_str_new(agnosai_missing_header_severity(entry)));
-        bayan_json_v_arr_push(missing_v, mo);
+        var mo = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, mo, k_header,
+          bayan_json_v_str_new_a(a, agnosai_missing_header_name(entry)));
+        bayan_json_v_obj_set_a(a, mo, k_sev,
+          bayan_json_v_str_new_a(a, agnosai_missing_header_severity(entry)));
+        bayan_json_v_arr_push_a(a, missing_v, mo);
     }
-    bayan_json_v_obj_set(ha, str_from("missing"), missing_v);
-    bayan_json_v_obj_set(ha, str_from("score"),
-      bayan_json_v_float_new(f64_from(load64(r + AGN_AUD_HDR_SCORE))));
-    bayan_json_v_obj_set(obj, str_from("header_analysis"), ha);
+    bayan_json_v_obj_set_a(a, ha, str_from_a(a, "missing"), missing_v);
+    bayan_json_v_obj_set_a(a, ha, str_from_a(a, "score"),
+      bayan_json_v_float_new_a(a, f64_from(load64(r + AGN_AUD_HDR_SCORE))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "header_analysis"), ha);
 
     var cors = load64(r + AGN_AUD_CORS);
-    var co = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(co, str_from("misconfigured"),
-      bayan_json_v_bool_new(agnosai_cors_misconfigured(cors)));
-    bayan_json_v_obj_set(co, str_from("allows_all_origins"),
-      bayan_json_v_bool_new(agnosai_cors_allows_all_origins(cors)));
-    bayan_json_v_obj_set(co, str_from("allows_credentials"),
-      bayan_json_v_bool_new(agnosai_cors_allows_credentials(cors)));
-    bayan_json_v_obj_set(co, str_from("detail"),
-      bayan_json_v_str_new(agnosai_cors_detail(cors)));
-    bayan_json_v_obj_set(obj, str_from("cors_analysis"), co);
+    var co = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, co, str_from_a(a, "misconfigured"),
+      bayan_json_v_bool_new_a(a, agnosai_cors_misconfigured(cors)));
+    bayan_json_v_obj_set_a(a, co, str_from_a(a, "allows_all_origins"),
+      bayan_json_v_bool_new_a(a, agnosai_cors_allows_all_origins(cors)));
+    bayan_json_v_obj_set_a(a, co, str_from_a(a, "allows_credentials"),
+      bayan_json_v_bool_new_a(a, agnosai_cors_allows_credentials(cors)));
+    bayan_json_v_obj_set_a(a, co, str_from_a(a, "detail"),
+      bayan_json_v_str_new_a(a, agnosai_cors_detail(cors)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "cors_analysis"), co);
 
     var disclosure = load64(r + AGN_AUD_DISCLOSURE);
-    var disc_v = bayan_json_v_arr_new();
+    var disc_v = bayan_json_v_arr_new_a(a);
     for (var d = 0; d < vec_len(disclosure); d = d + 1) {
-        bayan_json_v_arr_push(disc_v, bayan_json_v_str_new(vec_get(disclosure, d)));
+        bayan_json_v_arr_push_a(a, disc_v, bayan_json_v_str_new_a(a, vec_get(disclosure, d)));
     }
-    bayan_json_v_obj_set(obj, str_from("information_disclosure"), disc_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "information_disclosure"), disc_v);
 
     var vulns = load64(r + AGN_AUD_VULNS);
-    var vulns_v = bayan_json_v_arr_new();
+    var vulns_v = bayan_json_v_arr_new_a(a);
     # Hoisted: four keys per vulnerability.
-    var k_type = str_from("type");
-    var k_vsev = str_from("severity");
-    var k_desc = str_from("description");
-    var k_rem = str_from("remediation");
+    var k_type = str_from_a(a, "type");
+    var k_vsev = str_from_a(a, "severity");
+    var k_desc = str_from_a(a, "description");
+    var k_rem = str_from_a(a, "remediation");
     for (var v = 0; v < vec_len(vulns); v = v + 1) {
         var vuln = vec_get(vulns, v);
-        var vo = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(vo, k_type, bayan_json_v_str_new(agnosai_vuln_kind(vuln)));
-        bayan_json_v_obj_set(vo, k_vsev,
-          bayan_json_v_str_new(agnosai_vuln_severity(vuln)));
-        bayan_json_v_obj_set(vo, k_desc,
-          bayan_json_v_str_new(agnosai_vuln_description(vuln)));
-        bayan_json_v_obj_set(vo, k_rem,
-          bayan_json_v_str_new(agnosai_vuln_remediation(vuln)));
-        bayan_json_v_arr_push(vulns_v, vo);
+        var vo = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, vo, k_type, bayan_json_v_str_new_a(a, agnosai_vuln_kind(vuln)));
+        bayan_json_v_obj_set_a(a, vo, k_vsev,
+          bayan_json_v_str_new_a(a, agnosai_vuln_severity(vuln)));
+        bayan_json_v_obj_set_a(a, vo, k_desc,
+          bayan_json_v_str_new_a(a, agnosai_vuln_description(vuln)));
+        bayan_json_v_obj_set_a(a, vo, k_rem,
+          bayan_json_v_str_new_a(a, agnosai_vuln_remediation(vuln)));
+        bayan_json_v_arr_push_a(a, vulns_v, vo);
     }
-    bayan_json_v_obj_set(obj, str_from("vulnerabilities"), vulns_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "vulnerabilities"), vulns_v);
 
     var recs = load64(r + AGN_AUD_RECOMMENDATIONS);
-    var recs_v = bayan_json_v_arr_new();
+    var recs_v = bayan_json_v_arr_new_a(a);
     for (var c = 0; c < vec_len(recs); c = c + 1) {
-        bayan_json_v_arr_push(recs_v, bayan_json_v_str_new(vec_get(recs, c)));
+        bayan_json_v_arr_push_a(a, recs_v, bayan_json_v_str_new_a(a, vec_get(recs, c)));
     }
-    bayan_json_v_obj_set(obj, str_from("recommendations"), recs_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "recommendations"), recs_v);
     return obj;
+}
+
+# Global-allocator form of `agnosai_audit_result_to_value_a`.
+fn agnosai_audit_result_to_value(r): i64 {
+    return agnosai_audit_result_to_value_a(default_alloc(), r);
 }
 
 # Request options matching the oracle's reqwest client: a 15s total budget and
@@ -28622,8 +28778,8 @@ fn agnosai_audit_result_to_value(r): i64 {
 # set explicitly because "we validate certificates" is the kind of property that
 # should be stated in the code rather than inherited from a default that could
 # change underneath us.
-fn _agnosai_audit_options(): i64 {
-    var opts = sandhi_http_options_new();
+fn _agnosai_audit_options_a(a): i64 {
+    var opts = sandhi_http_options_new_a(a);
     if (opts == 0) { return 0; }
     sandhi_http_options_total_ms(opts, AGNOSAI_AUDIT_TIMEOUT_MS);
     sandhi_http_options_max_response_bytes(opts, AGNOSAI_AUDIT_MAX_BYTES);
@@ -28639,23 +28795,23 @@ fn _agnosai_audit_options(): i64 {
 # in the two oracle tables plus the two CORS headers are copied — the audit
 # never looks at anything else, and copying a whole response's header table to
 # keep thirteen of them would defeat the point.
-fn _agnosai_audit_snapshot(src): i64 {
-    var out = sandhi_headers_new();
+fn _agnosai_audit_snapshot_a(a, src): i64 {
+    var out = sandhi_headers_new_a(a);
     if (src == 0) { return out; }
     for (var i = 0; i < AGNOSAI_AUDIT_SEC_HEADER_COUNT; i = i + 1) {
         var sname = _agnosai_audit_sec_header(i);
         var sval = sandhi_headers_get(src, sname);
-        if (sval != 0) { sandhi_headers_add(out, sname, sval); }
+        if (sval != 0) { sandhi_headers_add_a(a, out, sname, sval); }
     }
     for (var d = 0; d < AGNOSAI_AUDIT_DISCLOSURE_COUNT; d = d + 1) {
         var dname = _agnosai_audit_disclosure_header(d);
         var dval = sandhi_headers_get(src, dname);
-        if (dval != 0) { sandhi_headers_add(out, dname, dval); }
+        if (dval != 0) { sandhi_headers_add_a(a, out, dname, dval); }
     }
     var acao = sandhi_headers_get(src, "access-control-allow-origin");
-    if (acao != 0) { sandhi_headers_add(out, "access-control-allow-origin", acao); }
+    if (acao != 0) { sandhi_headers_add_a(a, out, "access-control-allow-origin", acao); }
     var acac = sandhi_headers_get(src, "access-control-allow-credentials");
-    if (acac != 0) { sandhi_headers_add(out, "access-control-allow-credentials", acac); }
+    if (acac != 0) { sandhi_headers_add_a(a, out, "access-control-allow-credentials", acac); }
     return out;
 }
 
@@ -28675,16 +28831,16 @@ fn _agnosai_audit_snapshot(src): i64 {
 # `security_audit.rs:132-136` maps reqwest's with `.map_err(|e| e.to_string())`,
 # so an operator sees DNS, TLS, connect or timeout. The port collapsed every
 # failure to "request failed", which tells them only that something went wrong.
-fn _agnosai_audit_reason(kind): i64 {
-    if (kind == SANDHI_ERR_CONNECT) { return str_from("connection failed"); }
-    if (kind == SANDHI_ERR_TLS) { return str_from("TLS handshake failed"); }
-    if (kind == SANDHI_ERR_TIMEOUT) { return str_from("request timed out"); }
-    if (kind == SANDHI_ERR_PROTOCOL) { return str_from("protocol error"); }
-    if (kind == SANDHI_ERR_PARSE) { return str_from("malformed response"); }
-    if (kind == SANDHI_ERR_REMOTE) { return str_from("remote error"); }
-    if (kind == SANDHI_ERR_AUTH) { return str_from("authentication failed"); }
-    if (kind == SANDHI_ERR_DISCOVERY) { return str_from("host resolution failed"); }
-    return str_from("request failed");
+fn _agnosai_audit_reason_a(a, kind): i64 {
+    if (kind == SANDHI_ERR_CONNECT) { return str_from_a(a, "connection failed"); }
+    if (kind == SANDHI_ERR_TLS) { return str_from_a(a, "TLS handshake failed"); }
+    if (kind == SANDHI_ERR_TIMEOUT) { return str_from_a(a, "request timed out"); }
+    if (kind == SANDHI_ERR_PROTOCOL) { return str_from_a(a, "protocol error"); }
+    if (kind == SANDHI_ERR_PARSE) { return str_from_a(a, "malformed response"); }
+    if (kind == SANDHI_ERR_REMOTE) { return str_from_a(a, "remote error"); }
+    if (kind == SANDHI_ERR_AUTH) { return str_from_a(a, "authentication failed"); }
+    if (kind == SANDHI_ERR_DISCOVERY) { return str_from_a(a, "host resolution failed"); }
+    return str_from_a(a, "request failed");
 }
 
 # Run the audit against `url` — the header fetch plus the CORS probe.
@@ -28713,11 +28869,16 @@ fn agnosai_run_security_audit_err(url: Str, out_kind): i64 {
 
 # `agnosai_run_security_audit_err` for the call `input` belongs to: both chains are held to
 # that call's gate at every hop (ADR 025). An `input` of 0 holds them to the SSRF guard.
+#
+# The result is in `agnosai_tool_input_alloc`'s allocator, so a tool's goes back with its call. So
+# are the headers and options: `agnosai_guarded_fetch_hops` resets `arena` between hops, and they
+# are read on every hop.
 fn agnosai_run_security_audit_for(input, url: Str, out_kind): i64 {
+    var a = agnosai_tool_input_alloc(input);
     if (out_kind != 0) { store64(out_kind, 0); }
     var arena = agnosai_arena_pool_acquire(_AGNOSAI_AUDIT_POOL);
     if (arena == 0) { return 0; }
-    var opts = _agnosai_audit_options();
+    var opts = _agnosai_audit_options_a(a);
     if (opts == 0) {
         agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return 0;
@@ -28727,7 +28888,7 @@ fn agnosai_run_security_audit_for(input, url: Str, out_kind): i64 {
     # before the CORS probe starts, so the two chains never share the arena.
     var get_kind: i64[1];
     store64(&get_kind, 0);
-    var get_resp = agnosai_guarded_fetch_hops(arena, "GET", url, sandhi_headers_new(),
+    var get_resp = agnosai_guarded_fetch_hops(arena, "GET", url, sandhi_headers_new_a(a),
       opts, AGNOSAI_AUDIT_TIMEOUT_MS, 0, 0, &get_kind, &agnosai_tool_url_ok, input);
     if (get_resp == AGNOSAI_FETCH_BLOCKED) {
         agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
@@ -28738,7 +28899,7 @@ fn agnosai_run_security_audit_for(input, url: Str, out_kind): i64 {
         agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
         return 0;
     }
-    var get_headers = _agnosai_audit_snapshot(sandhi_http_headers(get_resp));
+    var get_headers = _agnosai_audit_snapshot_a(a, sandhi_http_headers(get_resp));
     reset_via(arena);
 
     # The CORS probe. A server that reflects this Origin back is treated exactly
@@ -28749,16 +28910,16 @@ fn agnosai_run_security_audit_for(input, url: Str, out_kind): i64 {
     # That includes a blocked redirect: the GET already passed the guard, so a
     # probe that wanders somewhere it should not is dropped, not escalated.
     var cors_headers = 0;
-    var probe = sandhi_headers_new();
-    sandhi_headers_add(probe, "Origin", AGNOSAI_AUDIT_PROBE_ORIGIN);
+    var probe = sandhi_headers_new_a(a);
+    sandhi_headers_add_a(a, probe, "Origin", AGNOSAI_AUDIT_PROBE_ORIGIN);
     var cors_resp = agnosai_guarded_fetch_hops(arena, "OPTIONS", url, probe, opts,
       AGNOSAI_AUDIT_TIMEOUT_MS, 0, 0, 0, &agnosai_tool_url_ok, input);
     if (cors_resp != 0 && cors_resp != AGNOSAI_FETCH_BLOCKED) {
-        cors_headers = _agnosai_audit_snapshot(sandhi_http_headers(cors_resp));
+        cors_headers = _agnosai_audit_snapshot_a(a, sandhi_http_headers(cors_resp));
     }
     agnosai_arena_pool_release(_AGNOSAI_AUDIT_POOL, arena);
 
-    return agnosai_audit_analyze(url, get_headers, cors_headers);
+    return agnosai_audit_analyze_a(a, url, get_headers, cors_headers);
 }
 
 # Trace the start of an audit. The oracle has no tracing here — this follows
@@ -28771,15 +28932,15 @@ fn _agnosai_audit_log(msg, msg_len, url: Str): i64 {
 }
 
 # Trace a completed audit with its score and risk band.
-fn _agnosai_audit_log_done(url: Str, score, risk: Str): i64 {
+fn _agnosai_audit_log_done_a(a, url: Str, score, risk: Str): i64 {
     if (sakshi_get_level() < SK_INFO) { return 0; }
-    var sb = str_builder_new();
-    str_builder_add(sb, url);
-    str_builder_add_cstr(sb, " score=");
-    str_builder_add_int(sb, score);
-    str_builder_add_cstr(sb, " risk=");
-    str_builder_add(sb, risk);
-    var line = str_builder_build(sb);
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, url);
+    str_builder_add_cstr_a(a, sb, " score=");
+    str_builder_add_int_a(a, sb, score);
+    str_builder_add_cstr_a(a, sb, " risk=");
+    str_builder_add_a(a, sb, risk);
+    var line = str_builder_build_a(a, sb);
     sakshi_log_kv(SK_INFO, "security audit completed", 24, "audit", 5, str_data(line),
       str_len(line));
     return 0;
@@ -28803,9 +28964,10 @@ fn _agnosai_security_audit_schema(a, ctx): i64 {
 # would change the tool's declared surface; honouring it would invent behaviour
 # the oracle does not have.
 fn _agnosai_security_audit_execute(ctx, input): i64 {
-    var target = agnosai_tool_input_get_str(input, str_from("target_url"));
+    var a = agnosai_tool_input_alloc(input);
+    var target = agnosai_tool_input_get_str(input, str_from_a(a, "target_url"));
     if (target == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: target_url"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: target_url"));
     }
     var refused = agnosai_tool_target_refused(input, target);
     if (refused != 0) { return refused; }
@@ -28821,23 +28983,23 @@ fn _agnosai_security_audit_execute(ctx, input): i64 {
     if (result == AGNOSAI_FETCH_BLOCKED) {
         _agnosai_audit_log("security audit redirect refused", 31, target);
         if (agnosai_tool_input_gate(input) != 0) {
-            return agnosai_tool_output_err(
-              str_from("security audit failed: target redirected somewhere this call may not reach"));
+            return agnosai_tool_output_err_a(a,
+              str_from_a(a, "security audit failed: target redirected somewhere this call may not reach"));
         }
-        return agnosai_tool_output_err(
-          str_from("security audit failed: target redirected to a private/internal address"));
+        return agnosai_tool_output_err_a(a,
+          str_from_a(a, "security audit failed: target redirected to a private/internal address"));
     }
     if (result == 0) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "security audit failed: ");
-        str_builder_add(sb, _agnosai_audit_reason(load64(&audit_kind)));
-        return agnosai_tool_output_err(str_builder_build(sb));
+        var sb = str_builder_new_a(a);
+        str_builder_add_cstr_a(a, sb, "security audit failed: ");
+        str_builder_add_a(a, sb, _agnosai_audit_reason_a(a, load64(&audit_kind)));
+        return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
     }
 
-    _agnosai_audit_log_done(target, agnosai_audit_security_score(result),
+    _agnosai_audit_log_done_a(a, target, agnosai_audit_security_score(result),
       agnosai_audit_risk_level(result));
 
-    return agnosai_tool_output_ok(agnosai_audit_result_to_value(result));
+    return agnosai_tool_output_ok_a(a, agnosai_audit_result_to_value_a(a, result));
 }
 
 # The security_audit tool.
@@ -28903,26 +29065,31 @@ fn _agnosai_synapse_infer_schema(a, ctx): i64 {
 # a `content` that is not a string. A response that is not an object at all
 # takes the same path. That tolerance is deliberate on the oracle's part — the
 # raw response ships alongside — and is reproduced exactly.
-fn agnosai_synapse_completion_text(data): i64 {
-    if (bayan_json_v_is_obj(data) == 0) { return str_from(""); }
+fn agnosai_synapse_completion_text_a(a, data): i64 {
+    if (bayan_json_v_is_obj(data) == 0) { return str_from_a(a, ""); }
     var choices = bayan_json_v_obj_get_by_cstr(data, "choices");
-    if (choices == 0 || bayan_json_v_is_arr(choices) == 0) { return str_from(""); }
-    if (bayan_json_v_arr_len(choices) == 0) { return str_from(""); }
+    if (choices == 0 || bayan_json_v_is_arr(choices) == 0) { return str_from_a(a, ""); }
+    if (bayan_json_v_arr_len(choices) == 0) { return str_from_a(a, ""); }
     var first = bayan_json_v_arr_get(choices, 0);
-    if (first == 0 || bayan_json_v_is_obj(first) == 0) { return str_from(""); }
+    if (first == 0 || bayan_json_v_is_obj(first) == 0) { return str_from_a(a, ""); }
     var message = bayan_json_v_obj_get_by_cstr(first, "message");
-    if (message == 0 || bayan_json_v_is_obj(message) == 0) { return str_from(""); }
+    if (message == 0 || bayan_json_v_is_obj(message) == 0) { return str_from_a(a, ""); }
     var content = bayan_json_v_obj_get_by_cstr(message, "content");
-    if (content == 0 || bayan_json_v_is_str(content) == 0) { return str_from(""); }
+    if (content == 0 || bayan_json_v_is_str(content) == 0) { return str_from_a(a, ""); }
     return bayan_json_v_str(content);
 }
 
-# The oracle's `json!({ "completion": text, "raw": data })`.
-fn _agnosai_synapse_shape_infer(data): i64 {
-    var out = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(out, str_from("completion"),
-      bayan_json_v_str_new(agnosai_synapse_completion_text(data)));
-    bayan_json_v_obj_set(out, str_from("raw"), data);
+# Global-allocator form of `agnosai_synapse_completion_text_a`.
+fn agnosai_synapse_completion_text(data): i64 {
+    return agnosai_synapse_completion_text_a(default_alloc(), data);
+}
+
+# The oracle's `json!({ "completion": text, "raw": data })`, in allocator `a`.
+fn _agnosai_synapse_shape_infer_a(a, data): i64 {
+    var out = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, out, str_from_a(a, "completion"),
+      bayan_json_v_str_new_a(a, agnosai_synapse_completion_text_a(a, data)));
+    bayan_json_v_obj_set_a(a, out, str_from_a(a, "raw"), data);
     return out;
 }
 
@@ -28931,44 +29098,50 @@ fn _agnosai_synapse_shape_infer(data): i64 {
 # `max_tokens` and `temperature` are inserted only when present, matching the
 # oracle's `if let Some(..)` guards — sending `"max_tokens": null` to an
 # OpenAI-compatible endpoint is not the same request as omitting the key.
-fn agnosai_synapse_infer_body(model: Str, prompt: Str, max_tokens, temperature, has_temp): i64 {
-    var body = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(body, str_from("model"), bayan_json_v_str_new(model));
+fn agnosai_synapse_infer_body_a(a, model: Str, prompt: Str, max_tokens, temperature, has_temp): i64 {
+    var body = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "model"), bayan_json_v_str_new_a(a, model));
 
-    var msg = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(msg, str_from("role"), bayan_json_v_str_new(str_from("user")));
-    bayan_json_v_obj_set(msg, str_from("content"), bayan_json_v_str_new(prompt));
-    var messages = bayan_json_v_arr_new();
-    bayan_json_v_arr_push(messages, msg);
-    bayan_json_v_obj_set(body, str_from("messages"), messages);
+    var msg = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, msg, str_from_a(a, "role"), bayan_json_v_str_new_a(a, str_from_a(a, "user")));
+    bayan_json_v_obj_set_a(a, msg, str_from_a(a, "content"), bayan_json_v_str_new_a(a, prompt));
+    var messages = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, messages, msg);
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "messages"), messages);
 
     if (max_tokens != AGNOSAI_NO_LIMIT) {
-        bayan_json_v_obj_set(body, str_from("max_tokens"), bayan_json_v_int_new(max_tokens));
+        bayan_json_v_obj_set_a(a, body, str_from_a(a, "max_tokens"), bayan_json_v_int_new_a(a, max_tokens));
     }
     if (has_temp == 1) {
-        bayan_json_v_obj_set(body, str_from("temperature"), bayan_json_v_float_new(temperature));
+        bayan_json_v_obj_set_a(a, body, str_from_a(a, "temperature"), bayan_json_v_float_new_a(a, temperature));
     }
     return body;
 }
 
+# Global-allocator form of `agnosai_synapse_infer_body_a`.
+fn agnosai_synapse_infer_body(model: Str, prompt: Str, max_tokens, temperature, has_temp): i64 {
+    return agnosai_synapse_infer_body_a(default_alloc(), model, prompt, max_tokens, temperature, has_temp);
+}
+
 # Run inference through Synapse's chat-completions endpoint.
 fn _agnosai_synapse_infer_execute(ctx, input): i64 {
-    var model = agnosai_tool_input_get_str(input, str_from("model"));
+    var a = agnosai_tool_input_alloc(input);
+    var model = agnosai_tool_input_get_str(input, str_from_a(a, "model"));
     if (model == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: model"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: model"));
     }
-    var prompt = agnosai_tool_input_get_str(input, str_from("prompt"));
+    var prompt = agnosai_tool_input_get_str(input, str_from_a(a, "prompt"));
     if (prompt == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: prompt"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: prompt"));
     }
 
     var has_temp = 0;
-    var temperature = agnosai_tool_input_get_f64(input, str_from("temperature"), &has_temp);
-    var body = agnosai_synapse_infer_body(model, prompt,
-      agnosai_tool_input_get_int(input, str_from("max_tokens")), temperature, has_temp);
+    var temperature = agnosai_tool_input_get_f64(input, str_from_a(a, "temperature"), &has_temp);
+    var body = agnosai_synapse_infer_body_a(a, model, prompt,
+      agnosai_tool_input_get_int(input, str_from_a(a, "max_tokens")), temperature, has_temp);
 
-    return agnosai_agnos_call(ctx, "POST", str_from("/v1/chat/completions"), body,
-      &_agnosai_synapse_shape_infer);
+    return agnosai_agnos_call_a(a, ctx, "POST", str_from_a(a, "/v1/chat/completions"), body,
+      &_agnosai_synapse_shape_infer_a);
 }
 
 # The synapse_infer tool, bound to a client.
@@ -28990,7 +29163,8 @@ fn _agnosai_synapse_list_models_schema(a, ctx): i64 {
 
 # List the models Synapse can serve.
 fn _agnosai_synapse_list_models_execute(ctx, input): i64 {
-    return agnosai_agnos_call(ctx, "GET", str_from("/v1/models"), 0, 0);
+    var a = agnosai_tool_input_alloc(input);
+    return agnosai_agnos_call_a(a, ctx, "GET", str_from_a(a, "/v1/models"), 0, 0);
 }
 
 # The synapse_list_models tool, bound to a client.
@@ -29012,7 +29186,8 @@ fn _agnosai_synapse_status_schema(a, ctx): i64 {
 
 # Report Synapse's loaded models, backends and hardware.
 fn _agnosai_synapse_status_execute(ctx, input): i64 {
-    return agnosai_agnos_call(ctx, "GET", str_from("/system/status"), 0, 0);
+    var a = agnosai_tool_input_alloc(input);
+    return agnosai_agnos_call_a(a, ctx, "GET", str_from_a(a, "/system/status"), 0, 0);
 }
 
 # The synapse_status tool, bound to a client.
@@ -29079,26 +29254,32 @@ fn _agnosai_mneme_search_schema(a, ctx): i64 {
 # The oracle stringifies `limit` through `to_string()` and hands it to the same
 # form encoder as `q`; digits survive encoding unchanged, so appending it
 # directly is the same bytes.
+fn agnosai_mneme_search_path_a(a, query: Str, limit): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "/api/search?q=");
+    agnosai_agnos_form_encode_a(a, sb, query);
+    str_builder_add_cstr_a(a, sb, "&limit=");
+    str_builder_add_int_a(a, sb, limit);
+    return str_builder_build_a(a, sb);
+}
+
+# Global-allocator form of `agnosai_mneme_search_path_a`.
 fn agnosai_mneme_search_path(query: Str, limit): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "/api/search?q=");
-    agnosai_agnos_form_encode(sb, query);
-    str_builder_add_cstr(sb, "&limit=");
-    str_builder_add_int(sb, limit);
-    return str_builder_build(sb);
+    return agnosai_mneme_search_path_a(default_alloc(), query, limit);
 }
 
 # Search Mneme for notes matching a query.
 fn _agnosai_mneme_search_execute(ctx, input): i64 {
-    var query = agnosai_tool_input_get_str(input, str_from("query"));
+    var a = agnosai_tool_input_alloc(input);
+    var query = agnosai_tool_input_get_str(input, str_from_a(a, "query"));
     if (query == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: query"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: query"));
     }
     # The oracle's `unwrap_or(10)`.
-    var limit = agnosai_tool_input_get_int(input, str_from("limit"));
+    var limit = agnosai_tool_input_get_int(input, str_from_a(a, "limit"));
     if (limit == AGNOSAI_NO_LIMIT) { limit = 10; }
 
-    return agnosai_agnos_call(ctx, "GET", agnosai_mneme_search_path(query, limit), 0, 0);
+    return agnosai_agnos_call_a(a, ctx, "GET", agnosai_mneme_search_path_a(a, query, limit), 0, 0);
 }
 
 # The mneme_search tool, bound to a client.
@@ -29123,19 +29304,20 @@ fn _agnosai_mneme_get_note_schema(a, ctx): i64 {
 
 # Fetch one note by id.
 fn _agnosai_mneme_get_note_execute(ctx, input): i64 {
-    var note_id = agnosai_tool_input_get_str(input, str_from("note_id"));
+    var a = agnosai_tool_input_alloc(input);
+    var note_id = agnosai_tool_input_get_str(input, str_from_a(a, "note_id"));
     if (note_id == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: note_id"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: note_id"));
     }
     # The oracle's path-traversal guard, before the id reaches the URL.
     if (agnosai_agnos_segment_ok(note_id) == 0) {
-        return agnosai_agnos_segment_err(str_from("note_id"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "note_id"));
     }
 
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "/api/notes/");
-    agnosai_agnos_add_segment(sb, note_id);
-    return agnosai_agnos_call(ctx, "GET", str_builder_build(sb), 0, 0);
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "/api/notes/");
+    agnosai_agnos_add_segment_a(a, sb, note_id);
+    return agnosai_agnos_call_a(a, ctx, "GET", str_builder_build_a(a, sb), 0, 0);
 }
 
 # The mneme_get_note tool, bound to a client.
@@ -29170,29 +29352,35 @@ fn _agnosai_mneme_create_note_schema(a, ctx): i64 {
 # forwards a string and lets Mneme decide. Validating here would be an
 # improvement the oracle does not make, and would reject a request the oracle
 # accepts.
-fn agnosai_mneme_create_note_body(title: Str, content: Str, tags): i64 {
-    var body = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(body, str_from("title"), bayan_json_v_str_new(title));
-    bayan_json_v_obj_set(body, str_from("content"), bayan_json_v_str_new(content));
-    if (tags == 0) { tags = bayan_json_v_arr_new(); }
-    bayan_json_v_obj_set(body, str_from("tags"), tags);
+fn agnosai_mneme_create_note_body_a(a, title: Str, content: Str, tags): i64 {
+    var body = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "title"), bayan_json_v_str_new_a(a, title));
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "content"), bayan_json_v_str_new_a(a, content));
+    if (tags == 0) { tags = bayan_json_v_arr_new_a(a); }
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "tags"), tags);
     return body;
+}
+
+# Global-allocator form of `agnosai_mneme_create_note_body_a`.
+fn agnosai_mneme_create_note_body(title: Str, content: Str, tags): i64 {
+    return agnosai_mneme_create_note_body_a(default_alloc(), title, content, tags);
 }
 
 # Create a note in Mneme.
 fn _agnosai_mneme_create_note_execute(ctx, input): i64 {
-    var title = agnosai_tool_input_get_str(input, str_from("title"));
+    var a = agnosai_tool_input_alloc(input);
+    var title = agnosai_tool_input_get_str(input, str_from_a(a, "title"));
     if (title == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: title"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: title"));
     }
-    var content = agnosai_tool_input_get_str(input, str_from("content"));
+    var content = agnosai_tool_input_get_str(input, str_from_a(a, "content"));
     if (content == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: content"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: content"));
     }
 
-    var body = agnosai_mneme_create_note_body(title, content,
-      agnosai_tool_input_get(input, str_from("tags")));
-    return agnosai_agnos_call(ctx, "POST", str_from("/api/notes"), body, 0);
+    var body = agnosai_mneme_create_note_body_a(a, title, content,
+      agnosai_tool_input_get(input, str_from_a(a, "tags")));
+    return agnosai_agnos_call_a(a, ctx, "POST", str_from_a(a, "/api/notes"), body, 0);
 }
 
 # The mneme_create_note tool, bound to a client.
@@ -29245,7 +29433,8 @@ fn _agnosai_delta_list_repos_schema(a, ctx): i64 {
 
 # List the repositories Delta knows about.
 fn _agnosai_delta_list_repos_execute(ctx, input): i64 {
-    return agnosai_agnos_call(ctx, "GET", str_from("/api/v1/repos"), 0, 0);
+    var a = agnosai_tool_input_alloc(input);
+    return agnosai_agnos_call_a(a, ctx, "GET", str_from_a(a, "/api/v1/repos"), 0, 0);
 }
 
 # The delta_list_repos tool, bound to a client.
@@ -29273,18 +29462,18 @@ fn _agnosai_delta_trigger_schema(a, ctx): i64 {
 }
 
 # `/api/v1/<owner>/<repo>/pipelines`, with an optional trailing segment.
-fn _agnosai_delta_pipeline_path(owner: Str, repo: Str, run_id): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "/api/v1/");
-    agnosai_agnos_add_segment(sb, owner);
-    str_builder_add_cstr(sb, "/");
-    agnosai_agnos_add_segment(sb, repo);
-    str_builder_add_cstr(sb, "/pipelines");
+fn _agnosai_delta_pipeline_path_a(a, owner: Str, repo: Str, run_id): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "/api/v1/");
+    agnosai_agnos_add_segment_a(a, sb, owner);
+    str_builder_add_cstr_a(a, sb, "/");
+    agnosai_agnos_add_segment_a(a, sb, repo);
+    str_builder_add_cstr_a(a, sb, "/pipelines");
     if (run_id != 0) {
-        str_builder_add_cstr(sb, "/");
-        agnosai_agnos_add_segment(sb, run_id);
+        str_builder_add_cstr_a(a, sb, "/");
+        agnosai_agnos_add_segment_a(a, sb, run_id);
     }
-    return str_builder_build(sb);
+    return str_builder_build_a(a, sb);
 }
 
 # Trigger a pipeline run.
@@ -29295,30 +29484,31 @@ fn _agnosai_delta_pipeline_path(owner: Str, repo: Str, run_id): i64 {
 # server-side, if at all. Reproducing the description instead of the code would
 # send a request the oracle never sends.
 fn _agnosai_delta_trigger_execute(ctx, input): i64 {
-    var owner = agnosai_tool_input_get_str(input, str_from("owner"));
+    var a = agnosai_tool_input_alloc(input);
+    var owner = agnosai_tool_input_get_str(input, str_from_a(a, "owner"));
     if (owner == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: owner"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: owner"));
     }
-    var repo = agnosai_tool_input_get_str(input, str_from("repo"));
+    var repo = agnosai_tool_input_get_str(input, str_from_a(a, "repo"));
     if (repo == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: repo"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: repo"));
     }
 
     # Guarded in the oracle's array order, so the reported name matches.
     if (agnosai_agnos_segment_ok(owner) == 0) {
-        return agnosai_agnos_segment_err(str_from("owner"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "owner"));
     }
     if (agnosai_agnos_segment_ok(repo) == 0) {
-        return agnosai_agnos_segment_err(str_from("repo"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "repo"));
     }
 
-    var body = bayan_json_v_obj_new();
-    var branch = agnosai_tool_input_get_str(input, str_from("branch"));
+    var body = bayan_json_v_obj_new_a(a);
+    var branch = agnosai_tool_input_get_str(input, str_from_a(a, "branch"));
     if (branch != 0) {
-        bayan_json_v_obj_set(body, str_from("branch"), bayan_json_v_str_new(branch));
+        bayan_json_v_obj_set_a(a, body, str_from_a(a, "branch"), bayan_json_v_str_new_a(a, branch));
     }
 
-    return agnosai_agnos_call(ctx, "POST", _agnosai_delta_pipeline_path(owner, repo, 0), body, 0);
+    return agnosai_agnos_call_a(a, ctx, "POST", _agnosai_delta_pipeline_path_a(a, owner, repo, 0), body, 0);
 }
 
 # The delta_trigger_pipeline tool, bound to a client.
@@ -29347,31 +29537,32 @@ fn _agnosai_delta_get_pipeline_schema(a, ctx): i64 {
 
 # Report one pipeline run's status.
 fn _agnosai_delta_get_pipeline_execute(ctx, input): i64 {
-    var owner = agnosai_tool_input_get_str(input, str_from("owner"));
+    var a = agnosai_tool_input_alloc(input);
+    var owner = agnosai_tool_input_get_str(input, str_from_a(a, "owner"));
     if (owner == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: owner"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: owner"));
     }
-    var repo = agnosai_tool_input_get_str(input, str_from("repo"));
+    var repo = agnosai_tool_input_get_str(input, str_from_a(a, "repo"));
     if (repo == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: repo"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: repo"));
     }
-    var pipeline_id = agnosai_tool_input_get_str(input, str_from("pipeline_id"));
+    var pipeline_id = agnosai_tool_input_get_str(input, str_from_a(a, "pipeline_id"));
     if (pipeline_id == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: pipeline_id"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: pipeline_id"));
     }
 
     # Guarded in the oracle's array order: owner, repo, pipeline_id.
     if (agnosai_agnos_segment_ok(owner) == 0) {
-        return agnosai_agnos_segment_err(str_from("owner"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "owner"));
     }
     if (agnosai_agnos_segment_ok(repo) == 0) {
-        return agnosai_agnos_segment_err(str_from("repo"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "repo"));
     }
     if (agnosai_agnos_segment_ok(pipeline_id) == 0) {
-        return agnosai_agnos_segment_err(str_from("pipeline_id"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "pipeline_id"));
     }
 
-    return agnosai_agnos_call(ctx, "GET", _agnosai_delta_pipeline_path(owner, repo, pipeline_id),
+    return agnosai_agnos_call_a(a, ctx, "GET", _agnosai_delta_pipeline_path_a(a, owner, repo, pipeline_id),
       0, 0);
 }
 
@@ -34109,10 +34300,18 @@ fn agnosai_deserialize_crew_state(buf, len, out_state): i64 {
 # records. `ra` below is that arena and `a` the crew's allocator. The two are the same only when
 # the pool could not give one.
 #
+# ## Why a call has an arena of its own
+#
+# What a tool answers belongs to the turn: nothing reads it once the model and the record have
+# their copies. So each call that runs takes an arena from the same pool, handed to its tool through
+# `agnosai_tool_input_alloc`, and the turn gives them back after delivery, the one place every call
+# has been read. ⚠ **Not `ra`:** a turn's calls run at once, on threads of their own, and an arena
+# has no lock.
+#
 # ## What still lands on the global heap
 #
-# What a tool allocates. `execute_fp` takes no allocator, so a tool's output and whatever it built
-# stay where the tool put them, for good. Recorded in ADR 029, with a figure, and on the roadmap.
+# What a tool puts there itself: `execute_fp` is unchanged, so a tool that ignores its input's
+# allocator is as it was, and that is its own cost. ADR 029 has the figure.
 #
 # Include order: after `src/tools/registry.cyr`, `src/tool_call.cyr`, `src/llm/hoosh.cyr`,
 # `src/server/prompt_guard.cyr`, `src/orchestrator/audit.cyr` and `src/core/task.cyr`, and before
@@ -34303,7 +34502,9 @@ enum AgnosaiToolCallOff {
     AGN_TC_DONE = 64;
     # The name a model asked for that the agent does not hold, or 0. For the record alone.
     AGN_TC_ASKED = 72;
-    AGN_TC_SIZE = 80;
+    # The arena this call's tool answers in, while it holds one. See the banner.
+    AGN_TC_ARENA = 80;
+    AGN_TC_SIZE = 88;
 }
 
 # The id this call carries in the conversation, unique within its task. hoosh restarts its own at
@@ -34329,7 +34530,8 @@ fn agnosai_tool_call_input(c): i64 {
     return load64(c + AGN_TC_INPUT);
 }
 
-# What the tool answered, or 0 before it ran and for a tool that answered nothing.
+# What the tool answered, or 0 before it ran, for a tool that answered nothing, and once the turn
+# is over: it lives as long as the turn, so a journal or a gate that keeps it must copy it.
 fn agnosai_tool_call_output(c): i64 {
     return load64(c + AGN_TC_OUTPUT);
 }
@@ -34946,6 +35148,7 @@ fn _agnosai_tool_call_prepare_a(st, asked, i): i64 {
     store64(c + AGN_TC_ST, st);
     store64(c + AGN_TC_DONE, 0);
     store64(c + AGN_TC_ASKED, 0);
+    store64(c + AGN_TC_ARENA, 0);
 
     var name = agnosai_chat_tool_call_name(asked);
     var t = _agnosai_tool_granted(st, name);
@@ -35080,8 +35283,35 @@ fn _agnosai_tool_call_wait(c): i64 {
     return 0;
 }
 
+# Give a call an arena for its tool to answer in. With none to be had, its allocator stays the
+# global one, as it would off the loop: that costs bytes and breaks nothing.
+fn _agnosai_tool_call_take_arena(c): i64 {
+    var arena = _agnosai_tool_arena_acquire();
+    if (arena == 0) { return 0; }
+    store64(c + AGN_TC_ARENA, arena);
+    agnosai_tool_input_with_alloc(load64(c + AGN_TC_INPUT), arena);
+    return 0;
+}
+
+# Give back what this turn's calls held, once delivery has read them all. Their outputs go with
+# it, so a callback that kept a call reads 0 rather than what the next turn wrote there.
+fn _agnosai_tool_turn_give_back(calls): i64 {
+    for (var i = 0; i < vec_len(calls); i = i + 1) {
+        var c = vec_get(calls, i);
+        var arena = load64(c + AGN_TC_ARENA);
+        if (arena != 0) {
+            store64(c + AGN_TC_OUTPUT, 0);
+            store64(c + AGN_TC_ARENA, 0);
+            _agnosai_tool_arena_release(arena);
+        }
+    }
+    return 0;
+}
+
 # Run the calls that are left, at once, and wait for them all. One call runs here, so a task that
 # makes one call at a time spawns nothing. A thread that cannot start runs here too.
+#
+# Each takes its arena here, on the turn's thread, so a worker has one before it starts.
 #
 # Detached for the reason a parallel crew's workers are: a joined thread leaves its handle and
 # 4 KiB of TLS on the global heap for good. A tool already runs on many threads at once, on `/mcp`,
@@ -35091,7 +35321,10 @@ fn _agnosai_tool_turn_run(st, calls): i64 {
     var live = vec_new_a(ra);
     for (var i = 0; i < vec_len(calls); i = i + 1) {
         var c = vec_get(calls, i);
-        if (load64(c + AGN_TC_REFUSED) == 0) { vec_push_a(ra, live, c); }
+        if (load64(c + AGN_TC_REFUSED) == 0) {
+            vec_push_a(ra, live, c);
+            _agnosai_tool_call_take_arena(c);
+        }
     }
     var n = vec_len(live);
     if (n == 0) { return 0; }
@@ -35270,6 +35503,7 @@ fn _agnosai_tool_turn_a(st, request, response): i64 {
     _agnosai_tool_turn_journal_intents(st, calls);
     _agnosai_tool_turn_run(st, calls);
     _agnosai_tool_turn_deliver(st, request, calls);
+    _agnosai_tool_turn_give_back(calls);
 
     if (total > kept) {
         store64(st + AGN_TT_DROPPED, load64(st + AGN_TT_DROPPED) + total - kept);
@@ -38971,13 +39205,16 @@ fn _agnosai_delegate_spec(def, agent_name: Str, task: Str): i64 {
 # `ctx` is the app state, which is what carries both the definitions map (to
 # resolve `agent`) and the orchestrator (to submit against).
 fn _agnosai_delegate_execute(ctx, input): i64 {
-    var agent_v = agnosai_tool_input_get(input, str_from("agent"));
+    # Only the answer goes here. The crew outlives this call, so what it holds stays off this
+    # allocator, and that cost is the crew's (B38).
+    var a = agnosai_tool_input_alloc(input);
+    var agent_v = agnosai_tool_input_get(input, str_from_a(a, "agent"));
     if (agent_v == 0 || bayan_json_v_is_str(agent_v) == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: agent"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: agent"));
     }
-    var task_v = agnosai_tool_input_get(input, str_from("task"));
+    var task_v = agnosai_tool_input_get(input, str_from_a(a, "task"));
     if (task_v == 0 || bayan_json_v_is_str(task_v) == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: task"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: task"));
     }
     var agent_name = bayan_json_v_str(agent_v);
 
@@ -38986,7 +39223,7 @@ fn _agnosai_delegate_execute(ctx, input): i64 {
     # discover a mistake it could have been told about synchronously.
     var def = agnosai_app_state_definition_get(ctx, agent_name);
     if (def == 0) {
-        return agnosai_tool_output_err(str_cat(str_from("no such agent definition: "),
+        return agnosai_tool_output_err_a(a, str_cat_a(a, str_from_a(a, "no such agent definition: "),
             agent_name));
     }
 
@@ -39003,16 +39240,16 @@ fn _agnosai_delegate_execute(ctx, input): i64 {
     var crew_id = agnosai_orchestrator_submit_crew(
       agnosai_app_state_orchestrator(ctx), spec);
     if (crew_id == 0) {
-        return agnosai_tool_output_err(str_from("could not start the delegated crew"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "could not start the delegated crew"));
     }
 
-    var o = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(o, str_from("crew_id"), bayan_json_v_str_new(crew_id));
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "crew_id"), bayan_json_v_str_new_a(a, crew_id));
     # `pending`, not `running` — the crew is registered and the thread is
     # started, but nothing here waits to see it picked up, so claiming `running`
     # would be a guess. It is the same wire spelling the crew map holds.
-    bayan_json_v_obj_set(o, str_from("status"), bayan_json_v_str_new(str_from("pending")));
-    return agnosai_tool_output_ok(o);
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "status"), bayan_json_v_str_new_a(a, str_from_a(a, "pending")));
+    return agnosai_tool_output_ok_a(a, o);
 }
 
 # The delegate tool, bound to an app state.

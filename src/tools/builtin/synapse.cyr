@@ -47,26 +47,31 @@ fn _agnosai_synapse_infer_schema(a, ctx): i64 {
 # a `content` that is not a string. A response that is not an object at all
 # takes the same path. That tolerance is deliberate on the oracle's part — the
 # raw response ships alongside — and is reproduced exactly.
-fn agnosai_synapse_completion_text(data): i64 {
-    if (bayan_json_v_is_obj(data) == 0) { return str_from(""); }
+fn agnosai_synapse_completion_text_a(a, data): i64 {
+    if (bayan_json_v_is_obj(data) == 0) { return str_from_a(a, ""); }
     var choices = bayan_json_v_obj_get_by_cstr(data, "choices");
-    if (choices == 0 || bayan_json_v_is_arr(choices) == 0) { return str_from(""); }
-    if (bayan_json_v_arr_len(choices) == 0) { return str_from(""); }
+    if (choices == 0 || bayan_json_v_is_arr(choices) == 0) { return str_from_a(a, ""); }
+    if (bayan_json_v_arr_len(choices) == 0) { return str_from_a(a, ""); }
     var first = bayan_json_v_arr_get(choices, 0);
-    if (first == 0 || bayan_json_v_is_obj(first) == 0) { return str_from(""); }
+    if (first == 0 || bayan_json_v_is_obj(first) == 0) { return str_from_a(a, ""); }
     var message = bayan_json_v_obj_get_by_cstr(first, "message");
-    if (message == 0 || bayan_json_v_is_obj(message) == 0) { return str_from(""); }
+    if (message == 0 || bayan_json_v_is_obj(message) == 0) { return str_from_a(a, ""); }
     var content = bayan_json_v_obj_get_by_cstr(message, "content");
-    if (content == 0 || bayan_json_v_is_str(content) == 0) { return str_from(""); }
+    if (content == 0 || bayan_json_v_is_str(content) == 0) { return str_from_a(a, ""); }
     return bayan_json_v_str(content);
 }
 
-# The oracle's `json!({ "completion": text, "raw": data })`.
-fn _agnosai_synapse_shape_infer(data): i64 {
-    var out = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(out, str_from("completion"),
-      bayan_json_v_str_new(agnosai_synapse_completion_text(data)));
-    bayan_json_v_obj_set(out, str_from("raw"), data);
+# Global-allocator form of `agnosai_synapse_completion_text_a`.
+fn agnosai_synapse_completion_text(data): i64 {
+    return agnosai_synapse_completion_text_a(default_alloc(), data);
+}
+
+# The oracle's `json!({ "completion": text, "raw": data })`, in allocator `a`.
+fn _agnosai_synapse_shape_infer_a(a, data): i64 {
+    var out = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, out, str_from_a(a, "completion"),
+      bayan_json_v_str_new_a(a, agnosai_synapse_completion_text_a(a, data)));
+    bayan_json_v_obj_set_a(a, out, str_from_a(a, "raw"), data);
     return out;
 }
 
@@ -75,44 +80,50 @@ fn _agnosai_synapse_shape_infer(data): i64 {
 # `max_tokens` and `temperature` are inserted only when present, matching the
 # oracle's `if let Some(..)` guards — sending `"max_tokens": null` to an
 # OpenAI-compatible endpoint is not the same request as omitting the key.
-fn agnosai_synapse_infer_body(model: Str, prompt: Str, max_tokens, temperature, has_temp): i64 {
-    var body = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(body, str_from("model"), bayan_json_v_str_new(model));
+fn agnosai_synapse_infer_body_a(a, model: Str, prompt: Str, max_tokens, temperature, has_temp): i64 {
+    var body = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "model"), bayan_json_v_str_new_a(a, model));
 
-    var msg = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(msg, str_from("role"), bayan_json_v_str_new(str_from("user")));
-    bayan_json_v_obj_set(msg, str_from("content"), bayan_json_v_str_new(prompt));
-    var messages = bayan_json_v_arr_new();
-    bayan_json_v_arr_push(messages, msg);
-    bayan_json_v_obj_set(body, str_from("messages"), messages);
+    var msg = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, msg, str_from_a(a, "role"), bayan_json_v_str_new_a(a, str_from_a(a, "user")));
+    bayan_json_v_obj_set_a(a, msg, str_from_a(a, "content"), bayan_json_v_str_new_a(a, prompt));
+    var messages = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, messages, msg);
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "messages"), messages);
 
     if (max_tokens != AGNOSAI_NO_LIMIT) {
-        bayan_json_v_obj_set(body, str_from("max_tokens"), bayan_json_v_int_new(max_tokens));
+        bayan_json_v_obj_set_a(a, body, str_from_a(a, "max_tokens"), bayan_json_v_int_new_a(a, max_tokens));
     }
     if (has_temp == 1) {
-        bayan_json_v_obj_set(body, str_from("temperature"), bayan_json_v_float_new(temperature));
+        bayan_json_v_obj_set_a(a, body, str_from_a(a, "temperature"), bayan_json_v_float_new_a(a, temperature));
     }
     return body;
 }
 
+# Global-allocator form of `agnosai_synapse_infer_body_a`.
+fn agnosai_synapse_infer_body(model: Str, prompt: Str, max_tokens, temperature, has_temp): i64 {
+    return agnosai_synapse_infer_body_a(default_alloc(), model, prompt, max_tokens, temperature, has_temp);
+}
+
 # Run inference through Synapse's chat-completions endpoint.
 fn _agnosai_synapse_infer_execute(ctx, input): i64 {
-    var model = agnosai_tool_input_get_str(input, str_from("model"));
+    var a = agnosai_tool_input_alloc(input);
+    var model = agnosai_tool_input_get_str(input, str_from_a(a, "model"));
     if (model == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: model"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: model"));
     }
-    var prompt = agnosai_tool_input_get_str(input, str_from("prompt"));
+    var prompt = agnosai_tool_input_get_str(input, str_from_a(a, "prompt"));
     if (prompt == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: prompt"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: prompt"));
     }
 
     var has_temp = 0;
-    var temperature = agnosai_tool_input_get_f64(input, str_from("temperature"), &has_temp);
-    var body = agnosai_synapse_infer_body(model, prompt,
-      agnosai_tool_input_get_int(input, str_from("max_tokens")), temperature, has_temp);
+    var temperature = agnosai_tool_input_get_f64(input, str_from_a(a, "temperature"), &has_temp);
+    var body = agnosai_synapse_infer_body_a(a, model, prompt,
+      agnosai_tool_input_get_int(input, str_from_a(a, "max_tokens")), temperature, has_temp);
 
-    return agnosai_agnos_call(ctx, "POST", str_from("/v1/chat/completions"), body,
-      &_agnosai_synapse_shape_infer);
+    return agnosai_agnos_call_a(a, ctx, "POST", str_from_a(a, "/v1/chat/completions"), body,
+      &_agnosai_synapse_shape_infer_a);
 }
 
 # The synapse_infer tool, bound to a client.
@@ -134,7 +145,8 @@ fn _agnosai_synapse_list_models_schema(a, ctx): i64 {
 
 # List the models Synapse can serve.
 fn _agnosai_synapse_list_models_execute(ctx, input): i64 {
-    return agnosai_agnos_call(ctx, "GET", str_from("/v1/models"), 0, 0);
+    var a = agnosai_tool_input_alloc(input);
+    return agnosai_agnos_call_a(a, ctx, "GET", str_from_a(a, "/v1/models"), 0, 0);
 }
 
 # The synapse_list_models tool, bound to a client.
@@ -156,7 +168,8 @@ fn _agnosai_synapse_status_schema(a, ctx): i64 {
 
 # Report Synapse's loaded models, backends and hardware.
 fn _agnosai_synapse_status_execute(ctx, input): i64 {
-    return agnosai_agnos_call(ctx, "GET", str_from("/system/status"), 0, 0);
+    var a = agnosai_tool_input_alloc(input);
+    return agnosai_agnos_call_a(a, ctx, "GET", str_from_a(a, "/system/status"), 0, 0);
 }
 
 # The synapse_status tool, bound to a client.

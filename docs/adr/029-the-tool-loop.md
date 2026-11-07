@@ -78,7 +78,8 @@ provider's charset, and, with redaction on, one the filter would touch.
 
 ⚠ **A tool's input lasts as long as its call.** It lives in the conversation's arena, which goes back with the task. A
 tool that keeps anything from it past `execute_fp`'s return, for a crew it submits or a thread it leaves running, copies
-it first. `delegate` is the one built-in that does. A tool's output is always copied.
+it first. `delegate` is the one built-in that does. A tool's output is always copied, into the model's text and the
+record, before the turn's arenas go back.
 
 ### Rule 1: journaled before it runs
 
@@ -159,8 +160,18 @@ and called none rebuilds as ever, and is offered them again.
 A conversation lives in an arena of its own from a pool built on first use, and what outlives it is copied out: the
 final response and the records. Copied, not borrowed, as a tool may answer with its own input. So a crew on the
 global heap does not keep its transcript. **A call through the loop leaves 0 B on the global heap**
-(`tests/orch_tool_loop.tcyr`), for one call, for two at once and for a refusal. What remains is the tool's: a small
-one leaves 489 B a call (B41), as `execute_fp` takes no allocator.
+(`tests/orch_tool_loop.tcyr`), for one call, for two at once and for a refusal.
+
+**So does a tool that answers in `agnosai_tool_input_alloc`** (B41). `execute_fp` is unchanged: the allocator is on the
+input, as the task is, so a tool that ignores it works as it did and keeps what it built on the global heap. Each call
+that runs takes **an arena of its own** from the same pool, on the turn's thread before any worker starts, and every one
+goes back after delivery, the one place the model and the record have each taken their copy. Not `ra`: a turn's calls
+run at once and an arena has no lock, so sharing it hands two calls one block. A pool acquire never blocks, and with no
+arena to be had a call answers on the global heap, as it would off the loop. Giving back also zeroes the call's output,
+so a journal that kept the call reads 0, and not what the next turn wrote there.
+
+A tool on the network is not at 0, and what is left is not the tool's: sandhi leaves 480 B an exchange (B39), the SSRF
+guard parses a URL on the global heap, 136 B a check, and `load_testing` joins its threads, 4,120 B a user (B13).
 
 What is read of a result is rendered to the cap and no further, and redaction reads 256 bytes past the cut, so it sees a
 key the cut would halve. `bayan_json_v_build_a` renders all of it, and an arena keeps its chunks: a 4 MiB object left this

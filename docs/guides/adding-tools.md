@@ -41,11 +41,12 @@ fn _agnosai_echo_schema(a, ctx): i64 {
 }
 
 fn _agnosai_echo_execute(ctx, input): i64 {
-    var value = agnosai_tool_input_get(input, str_from("message"));
+    var a = agnosai_tool_input_alloc(input);
+    var value = agnosai_tool_input_get(input, str_from_a(a, "message"));
     if (value == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: message"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: message"));
     }
-    return agnosai_tool_output_ok(value);
+    return agnosai_tool_output_ok_a(a, value);
 }
 
 fn agnosai_echo_tool(): i64 {
@@ -72,8 +73,20 @@ sentinel.
 
 ## Returning output
 
-- `agnosai_tool_output_ok(value)` — success, carrying a `bayan` JSON value.
-- `agnosai_tool_output_err(msg: Str)` — failure; `result` becomes JSON null.
+- `agnosai_tool_output_ok_a(a, value)` — success, carrying a `bayan` JSON value.
+- `agnosai_tool_output_err_a(a, msg: Str)` — failure; `result` becomes JSON null.
+
+`a` is `agnosai_tool_input_alloc(input)`, the allocator this call's answer belongs in. Build everything the tool answers
+with it, through the `_a` forms. On the tool loop that is an arena of the call's own, so what the tool built goes back
+with the turn and a crew leaves nothing behind. Off the loop it is the global allocator, so the tool needs no second
+path. The bare `agnosai_tool_output_ok` and `_err` still work, and what they build stays on the global heap for good.
+
+⚠ **Not `str_cstr`.** It copies onto the global heap whatever it is given. `str_data(str_clone_a(a, s))` is NUL-terminated
+and goes back with the call.
+
+⚠ **The allocator is this call's, and this thread's.** An arena has no lock, so a tool that starts threads gives each one
+its own. Anything that outlives the call, a crew it submits or state on its `ctx`, does not belong in it: `delegate`
+answers there and builds its crew elsewhere.
 
 Say **why** in the error. A fixed string like "request failed" for every failure
 mode is a real defect — this port shipped one and had to fix it.
@@ -147,7 +160,8 @@ The model calls them until it answers, within 16 turns, 8 calls a turn, 32 KiB a
 
 ⚠ **An input lasts as long as its call.** Through the loop it lives in an arena that goes back with the task, so a tool
 that keeps anything from it past `execute_fp`'s return, for a crew it submits or a thread it leaves running, must copy it
-first. What a tool returns is copied for you.
+first. What a tool returns is copied for you, so it may live in `agnosai_tool_input_alloc`, and a gate or a journal that
+keeps an output past its turn must copy it: `agnosai_tool_call_output` reads 0 once the turn is over.
 
 **A journal** writes every call down before it runs. A call it refuses does not start, and an intent with no result
 after a crash reads as an unknown effect, so have it on disk before you return. Key entries on the task and the call's id

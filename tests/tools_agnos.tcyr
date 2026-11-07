@@ -50,7 +50,7 @@ var _T_REPLY = 0;
 var _T_DETAIL = 0;
 
 # The recording transport. Stands in for one sandhi exchange.
-fn _t_capture(c, method, url: Str, body, detail_out): i64 {
+fn _t_capture(a, c, method, url: Str, body, detail_out): i64 {
     _T_METHOD = method;
     _T_URL = str_clone(url);
     _T_BODY = body;
@@ -118,8 +118,291 @@ fn _t_openai_reply(content): i64 {
     return reply;
 }
 
+# ── the `_a` forms ──────────────────────────────────────────────────────────
+# Each is its bare form in allocator `a`: the same bytes, and nothing on the global heap.
+fn _t_a_forms_suite(): i64 {
+    test_group("the _a forms");
+    var c = _t_client("http://svc:1", "svc");
+    var reply = _t_openai_reply("hi");
+    var ar = arena_allocator_growable(65536);
+
+    var before = alloc_used();
+    var seg = str_builder_new_a(ar);
+    agnosai_agnos_add_segment_a(ar, seg, str_from_a(ar, "my note"));
+    var seg_s = str_builder_build_a(ar, seg);
+    var form = str_builder_new_a(ar);
+    agnosai_agnos_form_encode_a(ar, form, str_from_a(ar, "a b&c"));
+    var form_s = str_builder_build_a(ar, form);
+    var url = agnosai_agnos_url_a(ar, c, str_from_a(ar, "/x"));
+    var seg_err = agnosai_agnos_segment_err_a(ar, str_from_a(ar, "id"));
+    var req_err = agnosai_agnos_request_err_a(ar, c, "refused");
+    var parse_err = agnosai_agnos_parse_err_a(ar, "bad");
+    var path = agnosai_mneme_search_path_a(ar, str_from_a(ar, "a b"), 3);
+    var note = agnosai_mneme_create_note_body_a(ar, str_from_a(ar, "t"), str_from_a(ar, "c"), 0);
+    var text = agnosai_synapse_completion_text_a(ar, reply);
+    var none = agnosai_synapse_completion_text_a(ar, bayan_json_v_int_new_a(ar, 1));
+    var infer = agnosai_synapse_infer_body_a(ar, str_from_a(ar, "m"), str_from_a(ar, "p"), 5, f64_from(1), 1);
+    assert_eq(alloc_used() - before, 0, "none of them touches the global heap");
+
+    assert_eq(str_eq_cstr(seg_s, "my%20note"), 1, "a segment encodes as the bare form does");
+    assert_eq(str_eq_cstr(form_s, "a+b%26c"), 1, "and a form value");
+    assert_eq(str_eq_cstr(url, "http://svc:1/x"), 1, "and a url joins");
+    assert_eq(str_eq_cstr(agnosai_tool_output_error(seg_err), "id contains invalid characters"), 1,
+      "a segment is refused");
+    assert_eq(str_eq_cstr(agnosai_tool_output_error(req_err), "svc request failed: refused"), 1, "a request fails");
+    assert_eq(str_eq_cstr(agnosai_tool_output_error(parse_err), "failed to parse response: bad"), 1, "a parse fails");
+    assert_eq(str_eq_cstr(path, "/api/search?q=a+b&limit=3"), 1, "a search path builds");
+    assert_eq(str_eq(_t_json(note), _t_json(agnosai_mneme_create_note_body(str_from("t"), str_from("c"), 0))), 1,
+      "a note body matches its bare form");
+    assert_eq(str_eq_cstr(text, "hi"), 1, "a completion reads");
+    assert_eq(str_len(none), 0, "and a body that is not one reads empty");
+    assert_eq(str_eq(_t_json(infer), _t_json(agnosai_synapse_infer_body(str_from("m"), str_from("p"), 5, f64_from(1),
+            1))), 1, "an infer body matches its bare form");
+
+    # The encoders work a stack chunk at a time, so what matters is the chunk's edge. A value of
+    # 1,200 encoded bytes crosses it three times, and the padding walks a `%XX` over every offset.
+    for (var pad = 0; pad < 8; pad = pad + 1) {
+        var raw_seg = str_builder_new();
+        var want_seg = str_builder_new();
+        var raw_form = str_builder_new();
+        var want_form = str_builder_new();
+        for (var p = 0; p < pad; p = p + 1) {
+            str_builder_add_cstr(raw_seg, "a");
+            str_builder_add_cstr(want_seg, "a");
+            str_builder_add_cstr(raw_form, "a");
+            str_builder_add_cstr(want_form, "a");
+        }
+        for (var i = 0; i < 400; i = i + 1) {
+            str_builder_add_cstr(raw_seg, " ");
+            str_builder_add_cstr(want_seg, "%20");
+            str_builder_add_cstr(raw_form, "&");
+            str_builder_add_cstr(want_form, "%26");
+        }
+        var got_seg = str_builder_new();
+        agnosai_agnos_add_segment(got_seg, str_builder_build(raw_seg));
+        assert_eq(str_eq(str_builder_build(got_seg), str_builder_build(want_seg)), 1,
+          "a segment longer than the chunk loses nothing at its edge");
+        var got_form = str_builder_new();
+        agnosai_agnos_form_encode(got_form, str_builder_build(raw_form));
+        assert_eq(str_eq(str_builder_build(got_form), str_builder_build(want_form)), 1,
+          "nor does a form value");
+    }
+
+    # An empty value appends nothing, and a NUL is encoded rather than ending the chunk.
+    var nothing = str_builder_new();
+    agnosai_agnos_form_encode(nothing, str_from(""));
+    assert_eq(str_len(str_builder_build(nothing)), 0, "an empty value appends nothing");
+    var with_nul = str_builder_new();
+    agnosai_agnos_add_segment(with_nul, str_new("a\0b", 3));
+    assert_eq(str_eq_cstr(str_builder_build(with_nul), "a%00b"), 1, "a NUL is encoded, so it cannot end a chunk early");
+    return 0;
+}
+
+# ── the live transport, on a socket ─────────────────────────────────────────
+# Every suite above stands in for the exchange, so this is what proves the transport itself.
+#
+# sandhi's own cost on the global heap (roadmap B39) is the bound, so anything of ours shows above
+# it. It is exact, as `str_cstr(url)` is only 40 B: 408 for this response's three headers, where
+# hoosh's nearly nine read 480 at about 40 B a header. Lower it when sandhi moves.
+var _T_SANDHI_BYTES_PER_CALL = 408;
+var _T_LFD = 0;
+var _T_PORT = 0;
+var _T_RESPONSE = 0;
+var _T_REQUEST = 0;
+var _T_STOP = 0;
+
+fn _t_server(arg): i64 {
+    var buf = alloc(65536);
+    while (load64(&_T_STOP) == 0) {
+        var at, cfd = sock_accept(_T_LFD);
+        if (is_err_result(at) == 0) {
+            if (load64(&_T_STOP) == 0) {
+                # The head is one read on loopback, and a body, when there is one, follows it.
+                var rt, n = sock_recv(cfd, buf, 65535);
+                if (is_err_result(rt) == 0 && n > 0) {
+                    store8(buf + n, 0);
+                    _T_REQUEST = buf;
+                }
+                sock_send_all(cfd, _T_RESPONSE, strlen(_T_RESPONSE));
+            }
+            sock_close(cfd);
+        }
+    }
+    return 0;
+}
+
+fn _t_server_start(): i64 {
+    var lt, lfd = tcp_socket();
+    sock_reuse(lfd);
+    var lp = 48041;
+    while (lp < 48073 && _T_PORT == 0) {
+        var bt, bv = sock_bind(lfd, INADDR_LOOPBACK(), lp);
+        if (is_err_result(bt) == 0) { _T_PORT = lp; }
+        lp = lp + 1;
+    }
+    if (_T_PORT == 0) { return 0; }
+    var st, sv = sock_listen(lfd, 16);
+    if (is_err_result(st) == 1) { return 0; }
+    _T_LFD = lfd;
+    thread_create(&_t_server, 0);
+    return 1;
+}
+
+# A whole HTTP response carrying `body`, as a C string.
+fn _t_http(body): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n");
+    str_builder_add_cstr(sb, "Content-Length: ");
+    str_builder_add_int(sb, strlen(body));
+    str_builder_add_cstr(sb, "\r\n\r\n");
+    str_builder_add_cstr(sb, body);
+    return str_data(str_builder_build(sb));
+}
+
+fn _t_live_suite(): i64 {
+    test_group("the live transport, on a socket");
+    if (_t_server_start() == 0) {
+        println("tools_agnos: no loopback port to listen on; the live transport did not run");
+        return 0;
+    }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "http://127.0.0.1:");
+    str_builder_add_int(sb, _T_PORT);
+    var c = agnosai_agnos_client(str_builder_build(sb), str_from("svc"));
+
+    _T_RESPONSE = _t_http("{\"ok\":true,\"n\":7}");
+    var ar = arena_allocator_growable(65536);
+    var out = agnosai_agnos_call_a(ar, c, "GET", str_from("/v1/x"), 0, 0);
+    assert_eq(agnosai_tool_output_success(out), 1, "a real exchange succeeds");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(agnosai_tool_output_result(out), "n")), 7,
+      "and its answer outlives the exchange's arena, which has gone back to the pool");
+    reset_via(ar);
+
+    # A body goes out as JSON through the exchange's arena.
+    var body = bayan_json_v_obj_new_a(ar);
+    bayan_json_v_obj_set_a(ar, body, str_from_a(ar, "q"), bayan_json_v_str_new_a(ar, str_from_a(ar, "hello")));
+    assert_eq(agnosai_tool_output_success(agnosai_agnos_call_a(ar, c, "POST", str_from("/v1/y"), body, 0)), 1,
+      "and so does a POST with a body");
+    assert_eq(str_contains_cstr(str_from(_T_REQUEST), "POST /v1/y"), 1, "which reaches the service");
+    reset_via(ar);
+
+    _T_RESPONSE = _t_http("<html>not json</html>");
+    var bad = agnosai_agnos_call_a(ar, c, "GET", str_from("/v1/x"), 0, 0);
+    assert_eq(agnosai_tool_output_success(bad), 0, "a body that is not JSON fails");
+    assert_eq(str_contains_cstr(agnosai_tool_output_error(bad), "failed to parse response: "), 1,
+      "and says why, in a detail that outlived the exchange");
+    reset_via(ar);
+
+    # Eight slots, first in first out, so every one has held an exchange before this counts.
+    _T_RESPONSE = _t_http("{\"ok\":true,\"n\":7}");
+    for (var w = 0; w < 16; w = w + 1) {
+        agnosai_agnos_call_a(ar, c, "GET", str_from_a(ar, "/v1/x"), 0, 0);
+        reset_via(ar);
+    }
+    var before = alloc_used();
+    for (var i = 0; i < 40; i = i + 1) {
+        agnosai_agnos_call_a(ar, c, "GET", str_from_a(ar, "/v1/x"), 0, 0);
+        reset_via(ar);
+    }
+    assert((alloc_used() - before) / 40 <= _T_SANDHI_BYTES_PER_CALL,
+      "a real exchange leaves no more than sandhi's own, and nothing of ours");
+
+    # ⚠ This suite's exit ends one thread, so the server has to stop for the process to.
+    store64(&_T_STOP, 1);
+    var wt, wfd = tcp_socket();
+    sock_connect(wfd, INADDR_LOOPBACK(), _T_PORT);
+    sock_close(wfd);
+    return 0;
+}
+
+# ── what a call leaves on the global heap (B41) ─────────────────────────────
+
+# How the quiet transport answers: 0 with `_T_QUIET`, 1 a failure, 2 a body that is not JSON.
+var _T_QUIET = 0;
+var _T_QUIET_ARM = 0;
+
+# A transport that allocates only in `a`, as the live one does past the exchange's own arena.
+fn _t_quiet(a, c, method, url: Str, body, detail_out): i64 {
+    if (_T_QUIET_ARM == 1) {
+        store64(detail_out, str_data(str_clone_a(a, str_from_a(a, "connection refused"))));
+        return 0;
+    }
+    if (_T_QUIET_ARM == 2) {
+        store64(detail_out, str_data(str_clone_a(a, str_from_a(a, "expected value"))));
+        return AGNOSAI_AGNOS_BAD_JSON;
+    }
+    return bayan_json_v_parse_buf_a(a, _T_QUIET, strlen(_T_QUIET));
+}
+
+# What 50 calls of `t` leave on the global heap, each answering in an arena reset after it.
+fn _t_tool_cost(t, input): i64 {
+    var ar = arena_allocator_growable(65536);
+    agnosai_tool_input_with_alloc(input, ar);
+    agnosai_tool_execute(t, input);
+    reset_via(ar);
+    var before = alloc_used();
+    for (var i = 0; i < 50; i = i + 1) {
+        agnosai_tool_execute(t, input);
+        reset_via(ar);
+    }
+    return alloc_used() - before;
+}
+
+fn _t_cost_suite(): i64 {
+    test_group("what a call leaves on the global heap");
+    var c = agnosai_agnos_client_new(str_from("http://svc:1"), str_from("svc"), &_t_quiet);
+    _T_QUIET = "{\"choices\":[{\"message\":{\"content\":\"hello\"}}],\"ok\":true}";
+    _T_QUIET_ARM = 0;
+
+    var note = _t_in1("note_id", "my note");
+    var search = _t_with_num(_t_in1("query", "a b&c"), "limit", 3);
+    var create = _t_with_str(_t_in1("title", "t"), "content", "c");
+    var infer = _t_with_str(_t_in1("model", "m"), "prompt", "p");
+    _t_with_num(infer, "max_tokens", 5);
+    agnosai_tool_input_set(infer, str_from("temperature"), bayan_json_v_float_new(f64_from(1)));
+    var repo = _t_with_str(_t_in1("owner", "o"), "repo", "r");
+    var run = _t_with_str(_t_with_str(_t_in1("owner", "o"), "repo", "r"), "pipeline_id", "9");
+    var branch = _t_with_str(_t_with_str(_t_in1("owner", "o"), "repo", "r"), "branch", "dev");
+    var empty = agnosai_tool_input_new();
+
+    assert_eq(_t_tool_cost(agnosai_synapse_infer_tool(c), infer), 0, "synapse_infer leaves nothing, shaped");
+    assert_eq(_t_tool_cost(agnosai_synapse_list_models_tool(c), empty), 0, "nor synapse_list_models");
+    assert_eq(_t_tool_cost(agnosai_synapse_status_tool(c), empty), 0, "nor synapse_status");
+    assert_eq(_t_tool_cost(agnosai_mneme_search_tool(c), search), 0, "nor mneme_search, form-encoding its query");
+    assert_eq(_t_tool_cost(agnosai_mneme_get_note_tool(c), note), 0, "nor mneme_get_note, encoding its segment");
+    assert_eq(_t_tool_cost(agnosai_mneme_create_note_tool(c), create), 0, "nor mneme_create_note");
+    assert_eq(_t_tool_cost(agnosai_delta_list_repos_tool(c), empty), 0, "nor delta_list_repos");
+    assert_eq(_t_tool_cost(agnosai_delta_trigger_pipeline_tool(c), branch), 0, "nor delta_trigger_pipeline");
+    assert_eq(_t_tool_cost(agnosai_delta_get_pipeline_tool(c), run), 0, "nor delta_get_pipeline");
+
+    # A failure is built in the call's allocator as well, on every arm.
+    assert_eq(_t_tool_cost(agnosai_mneme_get_note_tool(c), empty), 0, "nor a missing parameter");
+    assert_eq(_t_tool_cost(agnosai_mneme_get_note_tool(c), _t_in1("note_id", "../etc")), 0, "nor a refused segment");
+    assert_eq(_t_tool_cost(agnosai_delta_get_pipeline_tool(c), repo), 0, "nor the last parameter missing");
+    _T_QUIET_ARM = 1;
+    assert_eq(_t_tool_cost(agnosai_delta_list_repos_tool(c), empty), 0, "nor a transport failure");
+    _T_QUIET_ARM = 2;
+    assert_eq(_t_tool_cost(agnosai_delta_list_repos_tool(c), empty), 0, "nor a body that is not JSON");
+    _T_QUIET_ARM = 0;
+
+    # What it answers really is in the allocator it was given.
+    var ar = arena_allocator_growable(65536);
+    agnosai_tool_input_with_alloc(infer, ar);
+    var before = alloc_used();
+    var out = agnosai_tool_execute(agnosai_synapse_infer_tool(c), infer);
+    assert_eq(agnosai_tool_output_success(out), 1, "the call succeeds");
+    assert_eq(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(agnosai_tool_output_result(out),
+            "completion")), "hello"), 1, "and shapes its response");
+    # The tool's own vtable is global, built once, so only the call is measured.
+    assert(alloc_used() - before < 256, "with the output nowhere on the global heap");
+    return 0;
+}
+
 fn main() {
     alloc_init();
+    _t_a_forms_suite();
+    _t_cost_suite();
+    _t_live_suite();
 
     test_group("tools_agnos");
 
@@ -592,7 +875,7 @@ fn main() {
     # `.invalid` is reserved by RFC 2606 and never resolves, so this exercises
     # the transport-failure arm identically on and off a network.
     var live_detail = 0;
-    assert_eq(agnosai_agnos_http_transport(agnosai_agnos_client(str_from("http://x.invalid"),
+    assert_eq(agnosai_agnos_http_transport(default_alloc(), agnosai_agnos_client(str_from("http://x.invalid"),
           str_from("p")), "GET", str_from("http://x.invalid/"), 0, &live_detail), 0,
       "the live transport reports an unresolvable host as a transport failure");
 

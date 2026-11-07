@@ -26,8 +26,50 @@ fn _t_json(src): i64 {
     return bayan_json_v_parse_buf(str_data(s), str_len(s));
 }
 
+# What 50 calls of `t` leave on the global heap, each answering in an arena reset after it (B41).
+fn _t_tool_cost(t, input): i64 {
+    var ar = arena_allocator_growable(4096);
+    agnosai_tool_input_with_alloc(input, ar);
+    agnosai_tool_execute(t, input);
+    reset_via(ar);
+    var before = alloc_used();
+    for (var i = 0; i < 50; i = i + 1) {
+        agnosai_tool_execute(t, input);
+        reset_via(ar);
+    }
+    return alloc_used() - before;
+}
+
+fn _t_cost_suite(): i64 {
+    test_group("what a call leaves on the global heap");
+    var echo = agnosai_echo_tool();
+    var jt = agnosai_json_transform_tool();
+
+    var said = agnosai_tool_input_new();
+    agnosai_tool_input_set(said, str_from("message"), bayan_json_v_str_new(str_from("hi")));
+    assert_eq(_t_tool_cost(echo, said), 0, "echo leaves nothing");
+    assert_eq(_t_tool_cost(echo, agnosai_tool_input_new()), 0, "nor when its message is missing");
+
+    var picked = agnosai_tool_input_new();
+    agnosai_tool_input_set(picked, str_from("data"), _t_json("{\"a\":1}"));
+    agnosai_tool_input_set(picked, str_from("field"), bayan_json_v_str_new(str_from("a")));
+    assert_eq(_t_tool_cost(jt, picked), 0, "json_transform leaves nothing");
+    assert_eq(_t_tool_cost(jt, agnosai_tool_input_new()), 0, "nor when its data is missing");
+
+    var no_field = agnosai_tool_input_new();
+    agnosai_tool_input_set(no_field, str_from("data"), _t_json("{\"a\":1}"));
+    assert_eq(_t_tool_cost(jt, no_field), 0, "nor when its field is missing");
+
+    var absent = agnosai_tool_input_new();
+    agnosai_tool_input_set(absent, str_from("data"), _t_json("{\"a\":1}"));
+    agnosai_tool_input_set(absent, str_from("field"), bayan_json_v_str_new(str_from("b")));
+    assert_eq(_t_tool_cost(jt, absent), 0, "nor when the field is not in the data");
+    return 0;
+}
+
 fn main() {
     alloc_init();
+    _t_cost_suite();
 
     test_group("tools_builtin_basic");
 

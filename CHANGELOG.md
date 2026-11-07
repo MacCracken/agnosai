@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A tool's answer goes back with its turn. A tool used to leave what it built on the global heap for good, the one thing on
+a crew's path an arena could not give back (roadmap B41, ADR 029). Now the loop gives each call an arena of its own, a
+tool reads it from its input, and `execute_fp` is unchanged, so a tool that ignores it works as it did. Every built-in is
+on it, and in the suites `echo`, `json_transform` and all nine AGNOS tools leave 0 B, on every arm.
+
+### Breaking
+
+- **`agnosai_agnos_client_new`'s `transport_fp` and `agnosai_agnos_call`'s `shape_fp` take the allocator first.** They were
+  `fn(client, method, url, body, detail_out)` and `fn(value)`, and are now `fn(a, client, method, url, body, detail_out)`
+  and `fn(a, value)`, as a response has to be parsed where the call's answer lives. **To migrate:** add `a` as the first
+  parameter, and parse and shape in it, as `agnosai_agnos_http_transport` does. agnostic and thoth call neither. joshua and
+  kiran are not on this machine, so that neither does is unchecked.
+
+### Added
+
+- **`agnosai_tool_input_alloc(input)`**, the allocator a call's answer belongs in, and `agnosai_tool_input_with_alloc`. Off
+  the loop, and for an input of 0, it is the global allocator, so a tool needs no second path. `agnosai_tool_output_ok_a` and
+  `agnosai_tool_output_err_a` build an output in it. ⚠ **The allocator is this call's and this thread's**: an arena has no
+  lock, so a tool that starts a thread gives it its own, and what outlives the call does not go here. The guide says how
+  (`docs/guides/adding-tools.md`).
+- `_a` forms, each beside a bare one that keeps its behaviour: `agnosai_agnos_add_segment_a`, `_form_encode_a`, `_url_a`,
+  `_segment_err_a`, `_request_err_a`, `_parse_err_a`, `_call_a`; `agnosai_mneme_search_path_a`,
+  `agnosai_mneme_create_note_body_a`; `agnosai_synapse_completion_text_a`, `agnosai_synapse_infer_body_a`;
+  `agnosai_analyze_cors_a`, `agnosai_audit_analyze_a`, `agnosai_audit_result_to_value_a`; `agnosai_lt_worker_new_a`,
+  `agnosai_lt_aggregate_a`, `agnosai_lt_result_to_value_a`, `agnosai_load_test_run_a`.
+
+### Changed
+
+- **tool_loop:** each call that runs takes an arena from the loop's pool, on the turn's thread before any worker starts, and
+  the turn gives them all back after delivery, the one place the model and the record have each taken their copy. **Not the
+  conversation's arena:** a turn's calls run at once, and sharing it segfaults. With no arena to be had a call answers on the
+  global heap, as it would off the loop.
+- **A call's output lives as long as its turn.** Giving back zeroes it, so `agnosai_tool_call_output` reads 0 afterwards, and
+  a gate or a journal that keeps one must copy it. It used to stay on the global heap for good, so a consumer could have kept
+  the pointer. ⚠ A pointer kept from `result_fp` or a journal was never promised, but it did work, and now it does not.
+- **tools/builtin:** `echo`, `json_transform`, `delta_*`, `mneme_*`, `synapse_*`, `load_testing` and `security_audit` build
+  what they answer in the call's allocator. `delegate` does for its answer, and its crew stays where a crew lives, as it
+  outlives the call. A gate's refusal at the chokepoint and a refused `target_url` are built there too.
+- **security_audit:** its request headers and options live in the call's allocator rather than the exchange's arena, as
+  `agnosai_guarded_fetch_hops` resets that arena between hops and they are read on every one.
+
+### Fixed
+
+- **`str_cstr` copies onto the global heap whatever it is given, and three paths called it per exchange:**
+  `agnosai_lt_http_executor`, once per request, up to 100,000 a run; `agnosai_guarded_fetch_hops`, once per hop; and
+  `agnosai_agnos_http_transport`. Each now uses a NUL-terminated copy in an arena. A load test leaves nothing per request:
+  4,120 B a user across 100,000 requests, which is its threads.
+- `agnosai_agnos_segment_ok` allocated two Strs on the global heap per check, to search for a literal.
+
+### Performance
+
+Interleaved A/B against a 2.3.1 build, three rounds of `tools`, `orch` and `server` at a mean load of 3.3: **median +0.2%
+across 149 rows**, 109 within ±5%. The rows that moved in code this does not touch, `rank_agents_*`, `pubsub_*` and
+`prompt_*` among them, are the position effect (B20, B27) and are not claimed, and nor are `route_mcp_*` at −7%.
+
+- agnos_form_encode_52b: 1,161 ns → 767 ns (−33.9%). The encoders work a stack chunk at a time. Appending per byte, which was
+  this change's first draft, read 2,050 ns, so the bench is what caught it.
+- agnos_segment_ok: 279 ns → 230 ns (−17.6%), allocating nothing.
+- lt_result_to_value: 2,165 ns → 1,940 ns (−10.4%).
+- task_one_tool_call: 31,279 ns → 31,891 ns (+2.0%). ⚠ **This is the cost:** about 600 ns for the arena's acquire and release.
+- task_four_tool_calls_at_once: 250.6 µs → 249.8 µs (−0.3%), and tool_execute_gated, tool_execute_no_gate and tool_execute_echo
+  flat, as the allocator is read only by a tool or a refusal.
+- New rows: `task_one_tool_call_kept` 33.4 µs and `task_four_tool_calls_kept` 259.1 µs, beside the rows above: what building
+  an answer costs on top of the loop.
+
+### Tests
+
+- `tests/orch_tool_loop.tcyr` +18: a tool on its call's arena through the loop, what it answers read by the model and the
+  record, each surviving `_t_churn` over every slot, three calls at once on three arenas with 4,000 stamped blocks each, and a
+  journal reading 0 for an output past its turn. The per-call bound for a real tool reads **0**, for one call, three at once,
+  a full turn of eight past the pool's slots, a failure and a gate's refusal.
+- `tests/tools_agnos.tcyr` +54: all nine tools at 0 on every arm, each `_a` form against its bare form, the encoders across
+  their stack chunk's edge at every offset, and **the live transport on a socket**, which no suite had run: it succeeds,
+  POSTs, reports a body that is not JSON, and leaves no more than sandhi's own, 408 B for this response's headers.
+- `tests/tools_gate.tcyr` +7, on its loopback server: an audit in a call's arena following a redirect, its result where the
+  call said, and the two paths that called `str_cstr` held to sandhi's own, exact: 352 B a load-test request and 928 B a
+  two-hop chain. Each bound is under the leak it guards, which is the URL's length.
+- `tests/tools_native.tcyr` +14, `tests/tools_builtin_load_testing.tcyr` +10, `_security_audit` +5, `_basic` +6 and `_delegate`
+  +5: the rest of the built-ins, and a crew from `delegate` finishing with the call's arena written over.
+- **105 suites, 11,105 assertions** (2.3.1's tree reads 10,986 here, so +119). **31 mutants, every one killed.** Five survived
+  the first pass: three bounds were looser than the leak they guarded and two tests proved behaviour and not where the bytes
+  lived, so each was tightened, and the last "survivor" was the exit code below.
+- ⚠ **Found, not fixed: a suite that fails can exit 0.** The epilogue `CLAUDE.md` asks of every `.tcyr` ends in `syscall(60, f)`,
+  which on Linux ends the calling thread only, so with a thread still running the process takes the last thread's status, and
+  a worker's is 0. Measured: a probe that returns 1 with a thread asleep exits 0, every time, and with `sys_exit_group` exits
+  1. 17 suites can have a thread alive at exit, and a mutant here passed CI's check while printing `1 failed`. No run of this
+  tree or 2.3.1's hides a failure: every printed failure was also named by its exit code. `src/main.cyr` already exits with
+  `sys_exit_group`.
+
+### Verified
+
+- `check-symbols.sh` 3,136 definitions; `check-clean.sh` fmt 234, lint 234, doc 118, doctest 1 files; `deps --verify` 119; lib
+  snapshot 113; then build (2,998,968 B), aarch64 (6,967,520 B, built and not started), 105 suites and 11,105 assertions with 0
+  failed under `CYRIUS_DCE=1`, counted from each suite's printed line as well as its exit code, coverage 99% with the same 11
+  unreferenced as 2.3.1, `distlib --all --check`, the example, fuzz 4/4, and `cyrius bench`. The binary answers `/ready` and
+  exits cleanly on SIGTERM.
+- **The `ubuntu:26.04` CI replica**, from a clone of 2.3.1 with this diff on it, as an unprivileged user with wasmtime 47.0.3:
+  every `ci.yml` step, 105 suites and 0 failed. It read the first draft's `tools_builtin_delegate` failing too, as did this
+  machine: a measurement taken while another test's crew was still allocating, fixed by running it before any crew exists,
+  then 400 runs of that suite on four CPUs with none failing.
+- ⚠ **Not run:** a provider or an AGNOS service that is not a stub; `load_testing`'s HTTP executor against anything but a
+  loopback server; the aarch64 binary; a consumer.
+- ⚠ **What is not 0 is pinned, not hidden:** the SSRF guard's parse is 136 B a check and `load_testing`'s threads 4,120 B a
+  user, both moved to roadmap B13, and sandhi's 480 B an exchange is B39.
+
 ## [2.3.1] — 2026-11-07
 
 An agent with no `llm_model` now gets a model its gateway lists. agnosai carried `llama3:70b` and `llama3:405b`, so a gateway

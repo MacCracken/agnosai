@@ -139,8 +139,8 @@ enum AgnosaiLtResultOff {
 
 # Create a worker context. `executor_fp` is `fn(ctx): i64` returning the HTTP
 # status code, or 0 to record a transport error.
-fn agnosai_lt_worker_new(url: Str, deadline_ns, max_requests, executor_fp, worker_id): i64 {
-    var w = alloc(AGN_LT_SIZE);
+fn agnosai_lt_worker_new_a(a, url: Str, deadline_ns, max_requests, executor_fp, worker_id): i64 {
+    var w = alloc_via(a, AGN_LT_SIZE);
 
     # Both arenas come from pools now, so nothing here computes a size: a pooled
     # arena is GROWABLE and converges on what the run actually needs. The old
@@ -156,7 +156,9 @@ fn agnosai_lt_worker_new(url: Str, deadline_ns, max_requests, executor_fp, worke
     var scratch = agnosai_arena_pool_acquire(_AGNOSAI_LT_SCRATCH_POOL);
     if (arena == 0 || scratch == 0) { return 0; }
 
-    store64(w + AGN_LT_URL, url);
+    # A copy, as a C string is what a request takes: `str_cstr` per request is a global
+    # allocation per request, up to 100k a run.
+    store64(w + AGN_LT_URL, str_clone_a(arena, url));
     store64(w + AGN_LT_DEADLINE_NS, deadline_ns);
     store64(w + AGN_LT_MAX_REQUESTS, max_requests);
     store64(w + AGN_LT_EXECUTOR_FP, executor_fp);
@@ -172,6 +174,11 @@ fn agnosai_lt_worker_new(url: Str, deadline_ns, max_requests, executor_fp, worke
     store64(w + AGN_LT_ERRORS, 0);
     store64(w + AGN_LT_WORKER_ID, worker_id);
     return w;
+}
+
+# Global-allocator form of `agnosai_lt_worker_new_a`.
+fn agnosai_lt_worker_new(url: Str, deadline_ns, max_requests, executor_fp, worker_id): i64 {
+    return agnosai_lt_worker_new_a(default_alloc(), url, deadline_ns, max_requests, executor_fp, worker_id);
 }
 
 # The worker's per-request scratch arena, reset after every request.
@@ -250,7 +257,7 @@ fn agnosai_lt_http_executor(w): i64 {
     if (opts == 0) { return 0; }
     sandhi_http_options_total_ms(opts, AGNOSAI_LT_REQUEST_TIMEOUT_MS);
     sandhi_http_options_max_response_bytes(opts, AGNOSAI_LT_MAX_RESPONSE_BYTES);
-    var r = sandhi_http_get_opts_a(arena, str_cstr(url), headers, opts);
+    var r = sandhi_http_get_opts_a(arena, str_data(url), headers, opts);
     if (r == 0) { return 0; }
     if (sandhi_http_err_kind(r) != SANDHI_OK) { return 0; }
     return sandhi_http_status(r);
@@ -313,21 +320,21 @@ fn _agnosai_lt_thread_main(w): i64 {
 # `duration_secs` is the **configured** duration, not the measured elapsed
 # time — the oracle computes throughput against the requested window, so a run
 # that finishes early still divides by what was asked for.
-fn agnosai_lt_aggregate(workers, url: Str, users, duration_secs): i64 {
-    var latencies = vec_new();
-    var statuses = vec_new();
+fn agnosai_lt_aggregate_a(a, workers, url: Str, users, duration_secs): i64 {
+    var latencies = vec_new_a(a);
+    var statuses = vec_new_a(a);
     var errors = 0;
 
     for (var i = 0; i < vec_len(workers); i = i + 1) {
         var w = vec_get(workers, i);
         var wl = load64(w + AGN_LT_LATENCIES);
         for (var j = 0; j < vec_len(wl); j = j + 1) {
-            vec_push(latencies, vec_get(wl, j));
+            vec_push_a(a, latencies, vec_get(wl, j));
         }
         var ws = load64(w + AGN_LT_STATUS_COUNTS);
         for (var k = 0; k < vec_len(ws); k = k + 1) {
             var pair = vec_get(ws, k);
-            _agnosai_lt_status_bump(default_alloc(), statuses, load64(pair), load64(pair + 8));
+            _agnosai_lt_status_bump(a, statuses, load64(pair), load64(pair + 8));
         }
         errors = errors + load64(w + AGN_LT_ERRORS);
     }
@@ -345,7 +352,7 @@ fn agnosai_lt_aggregate(workers, url: Str, users, duration_secs): i64 {
     var successful = total - errors;
     if (successful < 0) { successful = 0; }
 
-    var r = alloc(AGN_LTR_SIZE);
+    var r = alloc_via(a, AGN_LTR_SIZE);
     store64(r + AGN_LTR_TARGET_URL, url);
     store64(r + AGN_LTR_CONCURRENT_USERS, users);
     store64(r + AGN_LTR_DURATION_SECS, duration_secs);
@@ -368,6 +375,11 @@ fn agnosai_lt_aggregate(workers, url: Str, users, duration_secs): i64 {
     return r;
 }
 
+# Global-allocator form of `agnosai_lt_aggregate_a`.
+fn agnosai_lt_aggregate(workers, url: Str, users, duration_secs): i64 {
+    return agnosai_lt_aggregate_a(default_alloc(), workers, url, users, duration_secs);
+}
+
 # The oracle's percentile index: `(len * p / 100).min(len - 1)`.
 #
 # Deliberately NOT `agnosai_percentile_i64`'s nearest-rank index — for n=100
@@ -381,24 +393,24 @@ fn _agnosai_lt_pct_index(len, p): i64 {
 }
 
 # Nanoseconds as the oracle's milliseconds: a float rounded to 2 decimals.
-fn _agnosai_lt_ms_value(ns): i64 {
+fn _agnosai_lt_ms_value_a(a, ns): i64 {
     var ms = f64_div(f64_from(ns), f64_from(1000000));
     var rounded = f64_div(f64_round(f64_mul(ms, f64_from(100))), f64_from(100));
-    return bayan_json_v_float_new(rounded);
+    return bayan_json_v_float_new_a(a, rounded);
 }
 
 # Total requests per second as the oracle's float, rounded to 2 decimals.
-fn _agnosai_lt_rps_value(milli): i64 {
+fn _agnosai_lt_rps_value_a(a, milli): i64 {
     var rps = f64_div(f64_from(milli), f64_from(1000));
     var rounded = f64_div(f64_round(f64_mul(rps, f64_from(100))), f64_from(100));
-    return bayan_json_v_float_new(rounded);
+    return bayan_json_v_float_new_a(a, rounded);
 }
 
 # Error rate as the oracle's float, rounded to 4 decimals.
-fn _agnosai_lt_rate_value(ppm): i64 {
+fn _agnosai_lt_rate_value_a(a, ppm): i64 {
     var rate = f64_div(f64_from(ppm), f64_from(1000000));
     var rounded = f64_div(f64_round(f64_mul(rate, f64_from(10000))), f64_from(10000));
-    return bayan_json_v_float_new(rounded);
+    return bayan_json_v_float_new_a(a, rounded);
 }
 
 # Total requests recorded, errors included.
@@ -452,53 +464,58 @@ fn agnosai_lt_result_status_codes(r): i64 {
 }
 
 # The result as a bayan JSON value, fields in the oracle's declaration order.
-fn agnosai_lt_result_to_value(r): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("target_url"),
-      bayan_json_v_str_new(load64(r + AGN_LTR_TARGET_URL)));
-    bayan_json_v_obj_set(obj, str_from("concurrent_users"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_CONCURRENT_USERS)));
-    bayan_json_v_obj_set(obj, str_from("duration_seconds"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_DURATION_SECS)));
-    bayan_json_v_obj_set(obj, str_from("total_requests"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_TOTAL_REQUESTS)));
-    bayan_json_v_obj_set(obj, str_from("successful_requests"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_SUCCESSFUL)));
-    bayan_json_v_obj_set(obj, str_from("failed_requests"),
-      bayan_json_v_int_new(load64(r + AGN_LTR_FAILED)));
-    bayan_json_v_obj_set(obj, str_from("avg_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_AVG_NS)));
-    bayan_json_v_obj_set(obj, str_from("p50_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_P50_NS)));
-    bayan_json_v_obj_set(obj, str_from("p95_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_P95_NS)));
-    bayan_json_v_obj_set(obj, str_from("p99_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_P99_NS)));
-    bayan_json_v_obj_set(obj, str_from("min_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_MIN_NS)));
-    bayan_json_v_obj_set(obj, str_from("max_latency_ms"),
-      _agnosai_lt_ms_value(load64(r + AGN_LTR_MAX_NS)));
-    bayan_json_v_obj_set(obj, str_from("throughput_rps"),
-      _agnosai_lt_rps_value(load64(r + AGN_LTR_THROUGHPUT_MILLI)));
-    bayan_json_v_obj_set(obj, str_from("error_rate"),
-      _agnosai_lt_rate_value(load64(r + AGN_LTR_ERROR_RATE_PPM)));
+fn agnosai_lt_result_to_value_a(a, r): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "target_url"),
+      bayan_json_v_str_new_a(a, load64(r + AGN_LTR_TARGET_URL)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "concurrent_users"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_CONCURRENT_USERS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "duration_seconds"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_DURATION_SECS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "total_requests"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_TOTAL_REQUESTS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "successful_requests"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_SUCCESSFUL)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "failed_requests"),
+      bayan_json_v_int_new_a(a, load64(r + AGN_LTR_FAILED)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "avg_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_AVG_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "p50_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_P50_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "p95_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_P95_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "p99_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_P99_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "min_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_MIN_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_latency_ms"),
+      _agnosai_lt_ms_value_a(a, load64(r + AGN_LTR_MAX_NS)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "throughput_rps"),
+      _agnosai_lt_rps_value_a(a, load64(r + AGN_LTR_THROUGHPUT_MILLI)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "error_rate"),
+      _agnosai_lt_rate_value_a(a, load64(r + AGN_LTR_ERROR_RATE_PPM)));
 
     var codes = load64(r + AGN_LTR_STATUS_CODES);
-    var codes_v = bayan_json_v_obj_new();
+    var codes_v = bayan_json_v_obj_new_a(a);
     for (var i = 0; i < vec_len(codes); i = i + 1) {
         var pair = vec_get(codes, i);
-        bayan_json_v_obj_set(codes_v, str_from_int(load64(pair)),
-          bayan_json_v_int_new(load64(pair + 8)));
+        bayan_json_v_obj_set_a(a, codes_v, str_from_int_a(a, load64(pair)),
+          bayan_json_v_int_new_a(a, load64(pair + 8)));
     }
-    bayan_json_v_obj_set(obj, str_from("status_codes"), codes_v);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "status_codes"), codes_v);
     return obj;
+}
+
+# Global-allocator form of `agnosai_lt_result_to_value_a`.
+fn agnosai_lt_result_to_value(r): i64 {
+    return agnosai_lt_result_to_value_a(default_alloc(), r);
 }
 
 # Run a load test: spawn `users` worker threads, join them, aggregate.
 #
 # Returns the result, or 0 when no request completed. `duration_secs` must
 # already be clamped by the caller.
-fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
+fn agnosai_load_test_run_a(a, url: Str, users, duration_secs, executor_fp): i64 {
     # ⚠ **`.max(1)` HERE, at the divide — this is where the oracle puts it.**
     # `load_testing.rs:135` is `MAX_TOTAL_REQUESTS / concurrent_users.max(1)`,
     # and it is the ONLY floor the oracle applies: `concurrent_users` itself is
@@ -516,15 +533,15 @@ fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
     if (per_user < 1) { per_user = 1; }
     var deadline = clock_now_ns() + duration_secs * AGNOSAI_NS_PER_SEC;
 
-    var workers = vec_new();
-    var threads = vec_new();
+    var workers = vec_new_a(a);
+    var threads = vec_new_a(a);
     for (var i = 0; i < users; i = i + 1) {
-        var w = agnosai_lt_worker_new(url, deadline, per_user, executor_fp, i);
+        var w = agnosai_lt_worker_new_a(a, url, deadline, per_user, executor_fp, i);
         # A worker that could not get its arenas is skipped rather than run —
         # every allocation in its loop would return 0 and be dereferenced.
         if (w != 0) {
-            vec_push(workers, w);
-            vec_push(threads, thread_create(&_agnosai_lt_thread_main, w));
+            vec_push_a(a, workers, w);
+            vec_push_a(a, threads, thread_create(&_agnosai_lt_thread_main, w));
         }
     }
     if (vec_len(workers) == 0) { return 0; }
@@ -532,11 +549,11 @@ fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
         thread_join(vec_get(threads, j));
     }
 
-    var result = agnosai_lt_aggregate(workers, url, users, duration_secs);
+    var result = agnosai_lt_aggregate_a(a, workers, url, users, duration_secs);
 
     # Every worker arena is released here — nothing in the aggregate points
     # into one, because agnosai_lt_aggregate copies each latency and status
-    # count into globally-allocated structures.
+    # count into `a`.
     for (var k = 0; k < vec_len(workers); k = k + 1) {
         agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL,
           load64(vec_get(workers, k) + AGN_LT_ARENA));
@@ -544,6 +561,11 @@ fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
           load64(vec_get(workers, k) + AGN_LT_SCRATCH));
     }
     return result;
+}
+
+# Global-allocator form of `agnosai_load_test_run_a`.
+fn agnosai_load_test_run(url: Str, users, duration_secs, executor_fp): i64 {
+    return agnosai_load_test_run_a(default_alloc(), url, users, duration_secs, executor_fp);
 }
 
 # The load_testing tool's parameter schema.
@@ -588,25 +610,25 @@ fn agnosai_lt_clamp_duration(secs): i64 {
 # OS threads run at once.
 #
 # `c_key` is optional: 0 omits the third pair.
-fn _agnosai_lt_log(msg, msg_len, url: Str, a_key, a_val, b_key, b_val, c_key, c_val): i64 {
+fn _agnosai_lt_log_a(a, msg, msg_len, url: Str, a_key, a_val, b_key, b_val, c_key, c_val): i64 {
     if (sakshi_get_level() < SK_INFO) { return 0; }
-    var sb = str_builder_new();
-    str_builder_add(sb, url);
-    str_builder_add_cstr(sb, " ");
-    str_builder_add_cstr(sb, a_key);
-    str_builder_add_cstr(sb, "=");
-    str_builder_add_int(sb, a_val);
-    str_builder_add_cstr(sb, " ");
-    str_builder_add_cstr(sb, b_key);
-    str_builder_add_cstr(sb, "=");
-    str_builder_add_int(sb, b_val);
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, url);
+    str_builder_add_cstr_a(a, sb, " ");
+    str_builder_add_cstr_a(a, sb, a_key);
+    str_builder_add_cstr_a(a, sb, "=");
+    str_builder_add_int_a(a, sb, a_val);
+    str_builder_add_cstr_a(a, sb, " ");
+    str_builder_add_cstr_a(a, sb, b_key);
+    str_builder_add_cstr_a(a, sb, "=");
+    str_builder_add_int_a(a, sb, b_val);
     if (c_key != 0) {
-        str_builder_add_cstr(sb, " ");
-        str_builder_add_cstr(sb, c_key);
-        str_builder_add_cstr(sb, "=");
-        str_builder_add_int(sb, c_val);
+        str_builder_add_cstr_a(a, sb, " ");
+        str_builder_add_cstr_a(a, sb, c_key);
+        str_builder_add_cstr_a(a, sb, "=");
+        str_builder_add_int_a(a, sb, c_val);
     }
-    var line = str_builder_build(sb);
+    var line = str_builder_build_a(a, sb);
     sakshi_log_kv(SK_INFO, msg, msg_len, "load_test", 9, str_data(line), str_len(line));
     return 0;
 }
@@ -618,38 +640,39 @@ fn _agnosai_lt_log(msg, msg_len, url: Str, a_key, a_val, b_key, b_val, c_key, c_
 # admits it (ADR 025), which is deliberate. Its requests follow no redirect, as sandhi's
 # default has it, so the target is the only URL this tool ever reaches.
 fn _agnosai_load_testing_execute(ctx, input): i64 {
-    var target = agnosai_tool_input_get_str(input, str_from("target_url"));
+    var a = agnosai_tool_input_alloc(input);
+    var target = agnosai_tool_input_get_str(input, str_from_a(a, "target_url"));
     if (target == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: target_url"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: target_url"));
     }
     var refused = agnosai_tool_target_refused(input, target);
     if (refused != 0) { return refused; }
 
-    var users = agnosai_tool_input_get_int(input, str_from("concurrent_users"));
+    var users = agnosai_tool_input_get_int(input, str_from_a(a, "concurrent_users"));
     if (users == AGNOSAI_NO_LIMIT) { users = 10; }
     users = agnosai_lt_clamp_users(users);
 
-    var duration = agnosai_tool_input_get_int(input, str_from("duration_seconds"));
+    var duration = agnosai_tool_input_get_int(input, str_from_a(a, "duration_seconds"));
     if (duration == AGNOSAI_NO_LIMIT) { duration = 10; }
     duration = agnosai_lt_clamp_duration(duration);
 
-    _agnosai_lt_log("load test starting", 18, target, "concurrent_users", users,
+    _agnosai_lt_log_a(a, "load test starting", 18, target, "concurrent_users", users,
       "duration_secs", duration, 0, 0);
 
-    var result = agnosai_load_test_run(target, users, duration, &agnosai_lt_http_executor);
+    var result = agnosai_load_test_run_a(a, target, users, duration, &agnosai_lt_http_executor);
     if (result == 0) {
-        return agnosai_tool_output_err(str_from("load test failed: no requests completed"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "load test failed: no requests completed"));
     }
 
     # Throughput is logged in thousandths of a request per second — the integer
     # carrier the result already holds, which keeps a float out of the log path.
     # p99 is in milliseconds.
-    _agnosai_lt_log("load test completed", 19, target,
+    _agnosai_lt_log_a(a, "load test completed", 19, target,
       "total_requests", load64(result + AGN_LTR_TOTAL_REQUESTS),
       "p99_latency_ms", load64(result + AGN_LTR_P99_NS) / AGNOSAI_NS_PER_MS,
       "throughput_milli_rps", load64(result + AGN_LTR_THROUGHPUT_MILLI));
 
-    return agnosai_tool_output_ok(agnosai_lt_result_to_value(result));
+    return agnosai_tool_output_ok_a(a, agnosai_lt_result_to_value_a(a, result));
 }
 
 # The load_testing tool.

@@ -1462,6 +1462,125 @@ fn _t_mode(process, label): i64 {
     return 0;
 }
 
+# ── what a tool answers goes back with its turn (B41) ──────────────────────
+
+# Builds all it answers in its call's allocator, as a tool should.
+fn _t_kept_exec(ctx, input): i64 {
+    var a = agnosai_tool_input_alloc(input);
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "note"),
+      bayan_json_v_str_new_a(a, str_from_a(a, "built in the call's own arena")));
+    return agnosai_tool_output_ok_a(a, o);
+}
+
+# Fails, in its call's allocator.
+fn _t_kept_boom_exec(ctx, input): i64 {
+    var a = agnosai_tool_input_alloc(input);
+    return agnosai_tool_output_err_a(a, str_from_a(a, "it went wrong in the arena"));
+}
+
+# What each `stamp` call was handed, by the `id` the model gave it, and how many blocks read wrong.
+var _t_stamp_allocs[64];
+var _t_stamp_torn = 0;
+
+# Stamps a run of blocks from its call's allocator, then reads them all back. An arena has no lock,
+# so two calls on one would now and then be handed the same block.
+fn _t_stamp_exec(ctx, input): i64 {
+    var a = agnosai_tool_input_alloc(input);
+    var id = agnosai_tool_input_get_int(input, str_from_a(a, "id"));
+    store64(&_t_stamp_allocs + id * 8, a);
+    var blocks = vec_new_a(a);
+    for (var i = 0; i < 4000; i = i + 1) {
+        var p = alloc_via(a, 48);
+        store64(p, id);
+        store64(p + 40, i);
+        vec_push_a(a, blocks, p);
+    }
+    for (var j = 0; j < vec_len(blocks); j = j + 1) {
+        var q = vec_get(blocks, j);
+        if (load64(q) != id || load64(q + 40) != j) { atomic_fetch_add(&_t_stamp_torn, 1); }
+    }
+    return agnosai_tool_output_ok_a(a, bayan_json_v_int_new_a(a, id));
+}
+
+# A journal that keeps the first call it saw finish, to read it again on the next turn.
+var _t_kept_call = 0;
+var _t_kept_during = 0;
+var _t_kept_after = 0;
+
+fn _t_keep_call_journal(ctx, phase, c): i64 {
+    if (phase == AGNOSAI_TOOL_PHASE_RESULT && _t_kept_call == 0) {
+        _t_kept_call = c;
+        _t_kept_during = agnosai_tool_call_output(c);
+    } elif (phase == AGNOSAI_TOOL_PHASE_INTENT && _t_kept_call != 0) {
+        _t_kept_after = agnosai_tool_call_output(_t_kept_call);
+    }
+    return 0;
+}
+
+fn _t_call_arena_suite(): i64 {
+    var reg = _t_registry();
+    agnosai_tool_registry_register(reg, _t_tool("kept", &_t_kept_exec, 0));
+    agnosai_tool_registry_register(reg, _t_tool("kept_boom", &_t_kept_boom_exec, 0));
+    agnosai_tool_registry_register(reg, _t_tool("stamp", &_t_stamp_exec, 0));
+    var loop = _t_loop(reg, 0, 0);
+
+    # The model and the record each read it before its arena goes back, and keep a copy.
+    _t_reset();
+    _t_asks(_t_calls(_t_call("c1", "kept", "\"{}\""), 0, 0));
+    _t_says("done");
+    var ok = _t_run(_t_agent("kept", 0, 0), loop);
+    assert_eq(agnosai_task_result_status(ok), AGNOSAI_STATUS_COMPLETED, "a tool on its call's arena finishes its task");
+    assert_eq(str_contains_cstr(_t_msg_str(1, 0 - 1, "content"), "built in the call's own arena"), 1,
+      "the model reads what it answered");
+
+    _t_reset();
+    _t_asks(_t_calls(_t_call("c1", "kept_boom", "\"{}\""), 0, 0));
+    _t_says("done");
+    var bad = _t_run(_t_agent("kept_boom", 0, 0), loop);
+    assert_eq(str_contains_cstr(_t_msg_str(1, 0 - 1, "content"), "it went wrong in the arena"), 1,
+      "and what it says went wrong");
+
+    # ⚠ Only after every slot has been written over does this show anything (`_t_churn`).
+    _t_churn(loop);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(_t_rec(ok, 0, "result"), "note")),
+        "built in the call's own arena") == 1, "the record holds a copy, not the arena's bytes");
+    assert_eq(_t_rec_is(bad, 0, "error", "it went wrong in the arena"), 1, "and of a failure too");
+
+    # A turn's calls run at once. A shared arena would hand two of them one block.
+    _t_reset();
+    _t_asks(_t_calls(_t_call("c1", "stamp", "\"{\\\"id\\\":1}\""), _t_call("c2", "stamp", "\"{\\\"id\\\":2}\""),
+        _t_call("c3", "stamp", "\"{\\\"id\\\":3}\"")));
+    _t_says("done");
+    _t_stamp_torn = 0;
+    var three = _t_run(_t_agent("stamp", 0, 0), loop);
+    assert_eq(_t_stamp_torn, 0, "no block went to two calls");
+    var a1 = load64(&_t_stamp_allocs + 8);
+    var a2 = load64(&_t_stamp_allocs + 16);
+    var a3 = load64(&_t_stamp_allocs + 24);
+    assert(a1 != a2 && a2 != a3 && a1 != a3, "each call held an arena of its own");
+    assert(a1 != default_alloc() && a2 != default_alloc() && a3 != default_alloc(), "and none the global heap");
+    for (var i = 0; i < 3; i = i + 1) {
+        assert_eq(bayan_json_v_int(_t_rec(three, i, "result")), i + 1, "each read back its own, in order");
+    }
+
+    # An output is the turn's. A journal that keeps a call reads 0 once the turn is over, and not
+    # whatever the next turn wrote in that arena.
+    var journal = agnosai_tool_journal_new(&_t_keep_call_journal, 0);
+    var kept_loop = _t_loop(reg, journal, 0);
+    _t_reset();
+    _t_asks(_t_calls(_t_call("c1", "kept", "\"{}\""), 0, 0));
+    _t_asks(_t_calls(_t_call("c2", "kept", "\"{}\""), 0, 0));
+    _t_says("done");
+    _t_kept_call = 0;
+    _t_kept_during = 0;
+    _t_kept_after = 1;
+    _t_run(_t_agent("kept", 0, 0), kept_loop);
+    assert(_t_kept_during != 0, "a journal reads a call's output during its turn");
+    assert_eq(_t_kept_after, 0, "and 0 after it");
+    return 0;
+}
+
 # ── what a call leaves on the global heap ──────────────────────────────────
 
 var _t_quiet_ask = 0;
@@ -1499,6 +1618,28 @@ fn _t_cost(agent, loop, rounds): i64 {
     return alloc_used() - before;
 }
 
+# A JSON array of `n` calls to `name`, in a cstring.
+fn _t_calls_n(name, n): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "[");
+    for (var i = 0; i < n; i = i + 1) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        var id = str_builder_new();
+        str_builder_add_cstr(id, "c");
+        str_builder_add_int(id, i);
+        str_builder_add_cstr(sb, _t_call(str_cstr(str_builder_build(id)), name, "\"{}\""));
+    }
+    str_builder_add_cstr(sb, "]");
+    return str_cstr(str_builder_build(sb));
+}
+
+# The reason `_t_no_fp` refuses with, built once so a refusal's cost is the chokepoint's alone.
+var _t_no_reason = 0;
+
+fn _t_no_fp(ctx, input): i64 {
+    return _t_no_reason;
+}
+
 fn _t_cost_suite(): i64 {
     var reg = _t_registry();
     agnosai_tool_registry_register(reg, _t_tool("big", &_t_mute_exec, 0));
@@ -1517,10 +1658,34 @@ fn _t_cost_suite(): i64 {
     _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "nope", "\"{}\""), 0, 0));
     assert_eq(_t_cost(_t_agent("mute", 0, 0), loop, 100), 0, "and a call refused at the grant");
 
-    # What a real tool costs is the tool's: `execute_fp` takes no allocator (ADR 029).
+    # A tool that answers in its call's allocator leaves nothing either (B41).
+    agnosai_tool_registry_register(reg, _t_tool("kept", &_t_kept_exec, 0));
+    agnosai_tool_registry_register(reg, _t_tool("kept_boom", &_t_kept_boom_exec, 0));
+    _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "kept", "\"{}\""), 0, 0));
+    assert_eq(_t_cost(_t_agent("kept", 0, 0), loop, 100), 0, "a real tool on its call's allocator leaves nothing");
+    _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "kept_boom", "\"{}\""), 0, 0));
+    assert_eq(_t_cost(_t_agent("kept_boom", 0, 0), loop, 100), 0, "nor does one that fails");
+    _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "kept", "\"{}\""), _t_call("c2", "kept", "\"{}\""),
+        _t_call("c3", "kept", "\"{}\"")));
+    assert_eq(_t_cost(_t_agent("kept", 0, 0), loop, 100), 0, "nor three at once, on an arena each");
+
+    # Past the pool's eight slots: the turn's eight and the conversation's make nine. An acquire
+    # past `slots` mints once, and that arena comes back as a spare, so this settles too.
+    _t_quiet_ask = _t_body("", _t_calls_n("kept", AGNOSAI_TOOL_MAX_CALLS_PER_TURN));
+    assert_eq(_t_cost(_t_agent("kept", 0, 0), loop, 50), 0, "nor a full turn, past the pool's slots");
+
+    # A gate's refusal at the chokepoint is built in the call's allocator too.
+    var gated = _t_registry();
+    agnosai_tool_registry_register(gated, _t_tool("kept", &_t_kept_exec, 0));
+    agnosai_tool_registry_set_gate(gated, agnosai_tool_gate_new(&_t_no_fp, 0, 0));
+    _t_no_reason = str_from("not this one");
+    _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "kept", "\"{}\""), 0, 0));
+    assert_eq(_t_cost(_t_agent("kept", 0, 0), _t_loop(gated, 0, 0), 100), 0, "nor a gate's refusal");
+
+    # `execute_fp` is unchanged, so a tool that ignores its allocator still works, at its own cost.
     _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "double", "\"{\\\"x\\\":1}\""), 0, 0));
     var per_call = _t_cost(_t_agent("double", 0, 0), loop, 100) / 100;
-    assert(per_call > 0, "a tool that allocates does, for good");
+    assert(per_call > 0, "a tool on the global heap stays there, for good");
     assert(per_call < 1024, "and only what it allocated");
     return 0;
 }
@@ -1606,6 +1771,7 @@ fn main(): i64 {
     _t_stop_suite();
     _t_retry_suite();
     _t_runner_suite();
+    _t_call_arena_suite();
     _t_cost_suite();
     return assert_summary();
 }

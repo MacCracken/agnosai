@@ -44,26 +44,32 @@ fn _agnosai_mneme_search_schema(a, ctx): i64 {
 # The oracle stringifies `limit` through `to_string()` and hands it to the same
 # form encoder as `q`; digits survive encoding unchanged, so appending it
 # directly is the same bytes.
+fn agnosai_mneme_search_path_a(a, query: Str, limit): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "/api/search?q=");
+    agnosai_agnos_form_encode_a(a, sb, query);
+    str_builder_add_cstr_a(a, sb, "&limit=");
+    str_builder_add_int_a(a, sb, limit);
+    return str_builder_build_a(a, sb);
+}
+
+# Global-allocator form of `agnosai_mneme_search_path_a`.
 fn agnosai_mneme_search_path(query: Str, limit): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "/api/search?q=");
-    agnosai_agnos_form_encode(sb, query);
-    str_builder_add_cstr(sb, "&limit=");
-    str_builder_add_int(sb, limit);
-    return str_builder_build(sb);
+    return agnosai_mneme_search_path_a(default_alloc(), query, limit);
 }
 
 # Search Mneme for notes matching a query.
 fn _agnosai_mneme_search_execute(ctx, input): i64 {
-    var query = agnosai_tool_input_get_str(input, str_from("query"));
+    var a = agnosai_tool_input_alloc(input);
+    var query = agnosai_tool_input_get_str(input, str_from_a(a, "query"));
     if (query == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: query"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: query"));
     }
     # The oracle's `unwrap_or(10)`.
-    var limit = agnosai_tool_input_get_int(input, str_from("limit"));
+    var limit = agnosai_tool_input_get_int(input, str_from_a(a, "limit"));
     if (limit == AGNOSAI_NO_LIMIT) { limit = 10; }
 
-    return agnosai_agnos_call(ctx, "GET", agnosai_mneme_search_path(query, limit), 0, 0);
+    return agnosai_agnos_call_a(a, ctx, "GET", agnosai_mneme_search_path_a(a, query, limit), 0, 0);
 }
 
 # The mneme_search tool, bound to a client.
@@ -88,19 +94,20 @@ fn _agnosai_mneme_get_note_schema(a, ctx): i64 {
 
 # Fetch one note by id.
 fn _agnosai_mneme_get_note_execute(ctx, input): i64 {
-    var note_id = agnosai_tool_input_get_str(input, str_from("note_id"));
+    var a = agnosai_tool_input_alloc(input);
+    var note_id = agnosai_tool_input_get_str(input, str_from_a(a, "note_id"));
     if (note_id == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: note_id"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: note_id"));
     }
     # The oracle's path-traversal guard, before the id reaches the URL.
     if (agnosai_agnos_segment_ok(note_id) == 0) {
-        return agnosai_agnos_segment_err(str_from("note_id"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "note_id"));
     }
 
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "/api/notes/");
-    agnosai_agnos_add_segment(sb, note_id);
-    return agnosai_agnos_call(ctx, "GET", str_builder_build(sb), 0, 0);
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "/api/notes/");
+    agnosai_agnos_add_segment_a(a, sb, note_id);
+    return agnosai_agnos_call_a(a, ctx, "GET", str_builder_build_a(a, sb), 0, 0);
 }
 
 # The mneme_get_note tool, bound to a client.
@@ -135,29 +142,35 @@ fn _agnosai_mneme_create_note_schema(a, ctx): i64 {
 # forwards a string and lets Mneme decide. Validating here would be an
 # improvement the oracle does not make, and would reject a request the oracle
 # accepts.
-fn agnosai_mneme_create_note_body(title: Str, content: Str, tags): i64 {
-    var body = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(body, str_from("title"), bayan_json_v_str_new(title));
-    bayan_json_v_obj_set(body, str_from("content"), bayan_json_v_str_new(content));
-    if (tags == 0) { tags = bayan_json_v_arr_new(); }
-    bayan_json_v_obj_set(body, str_from("tags"), tags);
+fn agnosai_mneme_create_note_body_a(a, title: Str, content: Str, tags): i64 {
+    var body = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "title"), bayan_json_v_str_new_a(a, title));
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "content"), bayan_json_v_str_new_a(a, content));
+    if (tags == 0) { tags = bayan_json_v_arr_new_a(a); }
+    bayan_json_v_obj_set_a(a, body, str_from_a(a, "tags"), tags);
     return body;
+}
+
+# Global-allocator form of `agnosai_mneme_create_note_body_a`.
+fn agnosai_mneme_create_note_body(title: Str, content: Str, tags): i64 {
+    return agnosai_mneme_create_note_body_a(default_alloc(), title, content, tags);
 }
 
 # Create a note in Mneme.
 fn _agnosai_mneme_create_note_execute(ctx, input): i64 {
-    var title = agnosai_tool_input_get_str(input, str_from("title"));
+    var a = agnosai_tool_input_alloc(input);
+    var title = agnosai_tool_input_get_str(input, str_from_a(a, "title"));
     if (title == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: title"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: title"));
     }
-    var content = agnosai_tool_input_get_str(input, str_from("content"));
+    var content = agnosai_tool_input_get_str(input, str_from_a(a, "content"));
     if (content == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: content"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: content"));
     }
 
-    var body = agnosai_mneme_create_note_body(title, content,
-      agnosai_tool_input_get(input, str_from("tags")));
-    return agnosai_agnos_call(ctx, "POST", str_from("/api/notes"), body, 0);
+    var body = agnosai_mneme_create_note_body_a(a, title, content,
+      agnosai_tool_input_get(input, str_from_a(a, "tags")));
+    return agnosai_agnos_call_a(a, ctx, "POST", str_from_a(a, "/api/notes"), body, 0);
 }
 
 # The mneme_create_note tool, bound to a client.

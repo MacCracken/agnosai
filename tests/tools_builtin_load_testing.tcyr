@@ -57,8 +57,85 @@ fn _t_exec_mixed(w): i64 {
     return 503;
 }
 
+# What a load test leaves on the global heap (B41).
+fn _t_cost_suite(): i64 {
+    test_group("what a call leaves on the global heap");
+    var url = str_from("http://example.com/");
+    var deadline = clock_now_ns() + 50000000;
+    var workers = vec_new();
+    var w0 = agnosai_lt_worker_new(url, deadline, 4, &_t_exec_mixed, 0);
+    var w1 = agnosai_lt_worker_new(url, deadline, 6, &_t_exec_mixed, 1);
+    agnosai_lt_worker_run(w0);
+    agnosai_lt_worker_run(w1);
+    vec_push(workers, w0);
+    vec_push(workers, w1);
+
+    # The report: what the workers measured, merged and written up, in the call's allocator.
+    var ar = arena_allocator_growable(65536);
+    var in_arena = agnosai_lt_worker_new_a(ar, url, deadline, 4, &_t_exec_mixed, 2);
+    assert_neq(in_arena, 0, "a worker builds in the call's allocator");
+    assert_eq(agnosai_lt_worker_id(in_arena), 2, "with its id");
+    agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL, agnosai_lt_worker_arena(in_arena));
+    agnosai_arena_pool_release(_AGNOSAI_LT_SCRATCH_POOL, agnosai_lt_worker_scratch(in_arena));
+    reset_via(ar);
+    var before = alloc_used();
+    for (var i = 0; i < 50; i = i + 1) {
+        agnosai_lt_result_to_value_a(ar, agnosai_lt_aggregate_a(ar, workers, url, 2, 5));
+        reset_via(ar);
+    }
+    assert_eq(alloc_used() - before, 0, "a report leaves nothing");
+
+    # A worker's url is a C string of its own, or the HTTP executor makes one per request.
+    assert_eq(load8(str_data(load64(w0 + AGN_LT_URL)) + str_len(url)), 0, "a worker's url is NUL-terminated");
+    assert_neq(str_data(load64(w0 + AGN_LT_URL)), str_data(url), "and a copy, for the worker's life");
+
+    # ⚠ What a run still costs: `thread_create`'s handle and TLS, for good, per user (roadmap B13).
+    # Everything else it builds is in `a`, so this is the bound, and a request adds nothing to it.
+    #
+    # ⚠ The pool hands arenas out first in, first out, so a first run warms only the slots it took,
+    # and a second of the same size takes fresh ones and reads 1 MiB a user. One worker per slot
+    # warms them all. Measured at 100,000 requests: 4,120 B a user, 4 KiB of TLS and a handle.
+    var tool = agnosai_load_testing_tool();
+    agnosai_load_test_run_a(ar, url, _AGNOSAI_LT_POOL_SLOTS, 1, &_t_exec_ok);
+    reset_via(ar);
+    var run_before = alloc_used();
+    var r = agnosai_load_test_run_a(ar, url, _AGNOSAI_LT_POOL_SLOTS, 1, &_t_exec_ok);
+    var per_user = (alloc_used() - run_before) / _AGNOSAI_LT_POOL_SLOTS;
+    assert_neq(r, 0, "a run on the call's allocator finishes");
+    assert_eq(agnosai_lt_result_total_requests(r), AGNOSAI_LT_MAX_TOTAL_REQUESTS,
+      "having made enough requests that a per-request cost could not hide");
+    assert(per_user < 4200, "and leaves only its threads, whatever the requests");
+    reset_via(ar);
+
+    var missing = agnosai_tool_input_with_alloc(agnosai_tool_input_new(), ar);
+    agnosai_tool_execute(tool, missing);
+    reset_via(ar);
+    var private_url = agnosai_tool_input_new();
+    agnosai_tool_input_set(private_url, str_from("target_url"), bayan_json_v_str_new(str_from("http://127.0.0.1/")));
+    agnosai_tool_input_with_alloc(private_url, ar);
+    agnosai_tool_execute(tool, private_url);
+    reset_via(ar);
+    var quiet = alloc_used();
+    for (var j = 0; j < 50; j = j + 1) {
+        agnosai_tool_execute(tool, missing);
+        reset_via(ar);
+    }
+    assert_eq(alloc_used() - quiet, 0, "a call with a parameter missing leaves nothing");
+
+    # ⚠ Not 0: the SSRF guard parses the URL on the global heap, 136 B a check (roadmap B13). The
+    # refusal itself is in `a`, which is what this bounds.
+    var guarded = alloc_used();
+    for (var k = 0; k < 50; k = k + 1) {
+        agnosai_tool_execute(tool, private_url);
+        reset_via(ar);
+    }
+    assert(alloc_used() - guarded <= 50 * 136, "a refused target leaves only the guard's parse");
+    return 0;
+}
+
 fn main() {
     alloc_init();
+    _t_cost_suite();
 
     test_group("tools_builtin_load_testing");
 
@@ -218,15 +295,15 @@ fn main() {
       "the 200 count is keyed by its decimal string");
 
     # --- rounding matches the oracle's 2- and 4-decimal quantisation ---
-    assert(str_eq(bayan_json_v_build(_agnosai_lt_ms_value(1500000)), str_from("1.5")) == 1,
+    assert(str_eq(bayan_json_v_build(_agnosai_lt_ms_value_a(default_alloc(), 1500000)), str_from("1.5")) == 1,
       "1.5ms renders as 1.5");
-    assert(str_eq(bayan_json_v_build(_agnosai_lt_ms_value(1234567)), str_from("1.23")) == 1,
+    assert(str_eq(bayan_json_v_build(_agnosai_lt_ms_value_a(default_alloc(), 1234567)), str_from("1.23")) == 1,
       "latency rounds to 2 decimals");
-    assert(str_eq(bayan_json_v_build(_agnosai_lt_rps_value(1500)), str_from("1.5")) == 1,
+    assert(str_eq(bayan_json_v_build(_agnosai_lt_rps_value_a(default_alloc(), 1500)), str_from("1.5")) == 1,
       "throughput renders in requests per second");
-    assert(str_eq(bayan_json_v_build(_agnosai_lt_rate_value(1000000)), str_from("1.0")) == 1,
+    assert(str_eq(bayan_json_v_build(_agnosai_lt_rate_value_a(default_alloc(), 1000000)), str_from("1.0")) == 1,
       "a 100% error rate renders as 1.0");
-    assert(str_eq(bayan_json_v_build(_agnosai_lt_rate_value(0)), str_from("0.0")) == 1,
+    assert(str_eq(bayan_json_v_build(_agnosai_lt_rate_value_a(default_alloc(), 0)), str_from("0.0")) == 1,
       "a 0% error rate renders as 0.0");
 
     # --- the tool registers and resolves ---

@@ -51,7 +51,7 @@ does not change without telling it.
 
 | Release | Theme | Items | Waits on |
 |---|---|---|---|
-| **2.3.2** | Tools in a confined tier | B35, B41 | B40 in kavach |
+| **2.3.2** | Tools in a confined tier | B35 (B41 is in `[Unreleased]`) | B40 in kavach |
 | **2.3.3** | The WASM tool's lifecycle | B9, B32 | |
 | **2.3.4** | Tools on the network | B13, B36 | |
 | **2.3.5** | The Rust line's forms and fields | B10, B11 | |
@@ -85,11 +85,8 @@ stdin, environment and deadline semantics, with an ADR, since a tool that relied
 
 ⛔ **Waits on B40.** Routed before kavach stops, every exec on three more tiers keeps 1 MiB, resident, for good.
 
-**B41. What a tool allocates stays on the global heap for good** (found 2026-11-06, ADR 029). `execute_fp` takes
-no allocator, so a tool's `ToolOutput` and result are the one thing on the crew path a crew arena cannot give back.
-The loop itself leaves 0 B (`tests/orch_tool_loop.tcyr`). **The work:** an allocator on the input
-(`agnosai_tool_input_alloc`), with no change to `execute_fp`, and the built-ins moved onto it. **Done means:** the
-suite's per-call bound for a real tool reads 0.
+B41 landed the allocator this needs (`agnosai_tool_input_alloc`, ADR 029), and `python_tool` and `wasm_tool` are the two
+tools not on it, as what they build comes back through these tiers. They move with this work.
 
 #### 2.3.3 — the WASM tool's lifecycle
 
@@ -108,8 +105,11 @@ runs at once collide. agnostic 0.1.15 fixed the same thing with a shared `tests/
 
 #### 2.3.4 — tools on the network
 
-**B13. Network-facing tools.** The load tester has no connection pool, so every request is a fresh handshake, and
-its success path and the security audit's live sequence have no test, since no suite stands up a loopback server.
+**B13. Network-facing tools.** The load tester has no connection pool, so every request is a fresh handshake, and its
+HTTP executor's success path has no test. Two costs these tools still leave on the global heap, found moving them onto
+the call's allocator (B41): `load_testing` joins its threads, 4,120 B a user for good, where a detached thread and a
+futex would leave none, which would be the third copy of `_agnosai_crew_job_wait`'s wait, so extract it. And the SSRF
+guard's `agnosai_url_host` parses on the global heap, 136 B a check, per call and per hop.
 
 **B36. `GET /api/v1/tools`, MCP `tools/list` and a task's `metadata` keys come out in a random order per process.**
 The registry and the metadata map are hash maps, and `lib/hashmap.cyr` seeds per process. The Rust line's was

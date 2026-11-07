@@ -30,7 +30,8 @@ fn _agnosai_delta_list_repos_schema(a, ctx): i64 {
 
 # List the repositories Delta knows about.
 fn _agnosai_delta_list_repos_execute(ctx, input): i64 {
-    return agnosai_agnos_call(ctx, "GET", str_from("/api/v1/repos"), 0, 0);
+    var a = agnosai_tool_input_alloc(input);
+    return agnosai_agnos_call_a(a, ctx, "GET", str_from_a(a, "/api/v1/repos"), 0, 0);
 }
 
 # The delta_list_repos tool, bound to a client.
@@ -58,18 +59,18 @@ fn _agnosai_delta_trigger_schema(a, ctx): i64 {
 }
 
 # `/api/v1/<owner>/<repo>/pipelines`, with an optional trailing segment.
-fn _agnosai_delta_pipeline_path(owner: Str, repo: Str, run_id): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "/api/v1/");
-    agnosai_agnos_add_segment(sb, owner);
-    str_builder_add_cstr(sb, "/");
-    agnosai_agnos_add_segment(sb, repo);
-    str_builder_add_cstr(sb, "/pipelines");
+fn _agnosai_delta_pipeline_path_a(a, owner: Str, repo: Str, run_id): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "/api/v1/");
+    agnosai_agnos_add_segment_a(a, sb, owner);
+    str_builder_add_cstr_a(a, sb, "/");
+    agnosai_agnos_add_segment_a(a, sb, repo);
+    str_builder_add_cstr_a(a, sb, "/pipelines");
     if (run_id != 0) {
-        str_builder_add_cstr(sb, "/");
-        agnosai_agnos_add_segment(sb, run_id);
+        str_builder_add_cstr_a(a, sb, "/");
+        agnosai_agnos_add_segment_a(a, sb, run_id);
     }
-    return str_builder_build(sb);
+    return str_builder_build_a(a, sb);
 }
 
 # Trigger a pipeline run.
@@ -80,30 +81,31 @@ fn _agnosai_delta_pipeline_path(owner: Str, repo: Str, run_id): i64 {
 # server-side, if at all. Reproducing the description instead of the code would
 # send a request the oracle never sends.
 fn _agnosai_delta_trigger_execute(ctx, input): i64 {
-    var owner = agnosai_tool_input_get_str(input, str_from("owner"));
+    var a = agnosai_tool_input_alloc(input);
+    var owner = agnosai_tool_input_get_str(input, str_from_a(a, "owner"));
     if (owner == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: owner"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: owner"));
     }
-    var repo = agnosai_tool_input_get_str(input, str_from("repo"));
+    var repo = agnosai_tool_input_get_str(input, str_from_a(a, "repo"));
     if (repo == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: repo"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: repo"));
     }
 
     # Guarded in the oracle's array order, so the reported name matches.
     if (agnosai_agnos_segment_ok(owner) == 0) {
-        return agnosai_agnos_segment_err(str_from("owner"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "owner"));
     }
     if (agnosai_agnos_segment_ok(repo) == 0) {
-        return agnosai_agnos_segment_err(str_from("repo"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "repo"));
     }
 
-    var body = bayan_json_v_obj_new();
-    var branch = agnosai_tool_input_get_str(input, str_from("branch"));
+    var body = bayan_json_v_obj_new_a(a);
+    var branch = agnosai_tool_input_get_str(input, str_from_a(a, "branch"));
     if (branch != 0) {
-        bayan_json_v_obj_set(body, str_from("branch"), bayan_json_v_str_new(branch));
+        bayan_json_v_obj_set_a(a, body, str_from_a(a, "branch"), bayan_json_v_str_new_a(a, branch));
     }
 
-    return agnosai_agnos_call(ctx, "POST", _agnosai_delta_pipeline_path(owner, repo, 0), body, 0);
+    return agnosai_agnos_call_a(a, ctx, "POST", _agnosai_delta_pipeline_path_a(a, owner, repo, 0), body, 0);
 }
 
 # The delta_trigger_pipeline tool, bound to a client.
@@ -132,31 +134,32 @@ fn _agnosai_delta_get_pipeline_schema(a, ctx): i64 {
 
 # Report one pipeline run's status.
 fn _agnosai_delta_get_pipeline_execute(ctx, input): i64 {
-    var owner = agnosai_tool_input_get_str(input, str_from("owner"));
+    var a = agnosai_tool_input_alloc(input);
+    var owner = agnosai_tool_input_get_str(input, str_from_a(a, "owner"));
     if (owner == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: owner"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: owner"));
     }
-    var repo = agnosai_tool_input_get_str(input, str_from("repo"));
+    var repo = agnosai_tool_input_get_str(input, str_from_a(a, "repo"));
     if (repo == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: repo"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: repo"));
     }
-    var pipeline_id = agnosai_tool_input_get_str(input, str_from("pipeline_id"));
+    var pipeline_id = agnosai_tool_input_get_str(input, str_from_a(a, "pipeline_id"));
     if (pipeline_id == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: pipeline_id"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: pipeline_id"));
     }
 
     # Guarded in the oracle's array order: owner, repo, pipeline_id.
     if (agnosai_agnos_segment_ok(owner) == 0) {
-        return agnosai_agnos_segment_err(str_from("owner"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "owner"));
     }
     if (agnosai_agnos_segment_ok(repo) == 0) {
-        return agnosai_agnos_segment_err(str_from("repo"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "repo"));
     }
     if (agnosai_agnos_segment_ok(pipeline_id) == 0) {
-        return agnosai_agnos_segment_err(str_from("pipeline_id"));
+        return agnosai_agnos_segment_err_a(a, str_from_a(a, "pipeline_id"));
     }
 
-    return agnosai_agnos_call(ctx, "GET", _agnosai_delta_pipeline_path(owner, repo, pipeline_id),
+    return agnosai_agnos_call_a(a, ctx, "GET", _agnosai_delta_pipeline_path_a(a, owner, repo, pipeline_id),
       0, 0);
 }
 

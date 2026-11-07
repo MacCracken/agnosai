@@ -69,13 +69,16 @@ fn _agnosai_delegate_spec(def, agent_name: Str, task: Str): i64 {
 # `ctx` is the app state, which is what carries both the definitions map (to
 # resolve `agent`) and the orchestrator (to submit against).
 fn _agnosai_delegate_execute(ctx, input): i64 {
-    var agent_v = agnosai_tool_input_get(input, str_from("agent"));
+    # Only the answer goes here. The crew outlives this call, so what it holds stays off this
+    # allocator, and that cost is the crew's (B38).
+    var a = agnosai_tool_input_alloc(input);
+    var agent_v = agnosai_tool_input_get(input, str_from_a(a, "agent"));
     if (agent_v == 0 || bayan_json_v_is_str(agent_v) == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: agent"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: agent"));
     }
-    var task_v = agnosai_tool_input_get(input, str_from("task"));
+    var task_v = agnosai_tool_input_get(input, str_from_a(a, "task"));
     if (task_v == 0 || bayan_json_v_is_str(task_v) == 0) {
-        return agnosai_tool_output_err(str_from("missing required parameter: task"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "missing required parameter: task"));
     }
     var agent_name = bayan_json_v_str(agent_v);
 
@@ -84,7 +87,7 @@ fn _agnosai_delegate_execute(ctx, input): i64 {
     # discover a mistake it could have been told about synchronously.
     var def = agnosai_app_state_definition_get(ctx, agent_name);
     if (def == 0) {
-        return agnosai_tool_output_err(str_cat(str_from("no such agent definition: "),
+        return agnosai_tool_output_err_a(a, str_cat_a(a, str_from_a(a, "no such agent definition: "),
             agent_name));
     }
 
@@ -101,16 +104,16 @@ fn _agnosai_delegate_execute(ctx, input): i64 {
     var crew_id = agnosai_orchestrator_submit_crew(
       agnosai_app_state_orchestrator(ctx), spec);
     if (crew_id == 0) {
-        return agnosai_tool_output_err(str_from("could not start the delegated crew"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "could not start the delegated crew"));
     }
 
-    var o = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(o, str_from("crew_id"), bayan_json_v_str_new(crew_id));
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "crew_id"), bayan_json_v_str_new_a(a, crew_id));
     # `pending`, not `running` — the crew is registered and the thread is
     # started, but nothing here waits to see it picked up, so claiming `running`
     # would be a guess. It is the same wire spelling the crew map holds.
-    bayan_json_v_obj_set(o, str_from("status"), bayan_json_v_str_new(str_from("pending")));
-    return agnosai_tool_output_ok(o);
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "status"), bayan_json_v_str_new_a(a, str_from_a(a, "pending")));
+    return agnosai_tool_output_ok_a(a, o);
 }
 
 # The delegate tool, bound to an app state.

@@ -40,13 +40,14 @@ enum AgnosaiToolSchemaOff {
     AGN_SCHEMA_SIZE = 24;
 }
 
-# ToolInput heap layout — 80 bytes: a Str-keyed map of bayan values, and what the
+# ToolInput heap layout — 88 bytes: a Str-keyed map of bayan values, and what the
 # chokepoint knows of the call (ADR 025). An input belongs to one call, which is what lets it
 # carry this without a thread-local and without changing `execute_fp`.
 #
 # `CALL_ID` to `CAPTURE_FP` are the tool loop's (ADR 029), for the span. `SPAN_CTX` is the call's
 # own `execute_tool` context, set by the chokepoint, which is how a tool that starts more work
-# keeps it in the trace.
+# keeps it in the trace. `ALLOC` is where this call's answer belongs, or 0 for the global heap
+# (`agnosai_tool_input_alloc`).
 enum AgnosaiToolInputOff {
     AGN_INPUT_PARAMETERS = 0;
     AGN_INPUT_TASK = 8;
@@ -58,7 +59,8 @@ enum AgnosaiToolInputOff {
     AGN_INPUT_ARGUMENTS = 56;
     AGN_INPUT_CAPTURE_FP = 64;
     AGN_INPUT_SPAN_CTX = 72;
-    AGN_INPUT_SIZE = 80;
+    AGN_INPUT_ALLOC = 80;
+    AGN_INPUT_SIZE = 88;
 }
 
 # ToolOutput heap layout — 32 bytes.
@@ -274,6 +276,7 @@ fn _agnosai_tool_input_over_a(a, parameters): i64 {
     store64(i + AGN_INPUT_ARGUMENTS, 0);
     store64(i + AGN_INPUT_CAPTURE_FP, 0);
     store64(i + AGN_INPUT_SPAN_CTX, 0);
+    store64(i + AGN_INPUT_ALLOC, 0);
     return i;
 }
 
@@ -324,6 +327,28 @@ fn agnosai_tool_input_arguments(input): i64 {
 # starts more work passes this on, so that work stays in the call's trace (`delegate` does).
 fn agnosai_tool_input_span_ctx(input): i64 {
     return load64(input + AGN_INPUT_SPAN_CTX);
+}
+
+# The allocator this call's answer belongs in: what a tool builds its `ToolOutput` and result with,
+# through the `_a` forms, so that what it answers goes back with the call. The global allocator for
+# a call nothing gave one to, which is every call off the tool loop and an input of 0, so a tool
+# needs no second path.
+#
+# ⚠ **It is this call's, and this thread's.** The loop hands each call an arena of its own, as a
+# turn's calls run at once and an arena has no lock, and takes it back when the turn's results have
+# been read. So a tool that starts a thread gives that thread its own, and anything that outlives
+# the call, a crew it submits or state on its `ctx`, does not belong here (ADR 029).
+fn agnosai_tool_input_alloc(input): i64 {
+    if (input == 0) { return default_alloc(); }
+    var a = load64(input + AGN_INPUT_ALLOC);
+    if (a == 0) { return default_alloc(); }
+    return a;
+}
+
+# Give this call an allocator for its answer. Returns the input.
+fn agnosai_tool_input_with_alloc(input, a): i64 {
+    store64(input + AGN_INPUT_ALLOC, a);
+    return input;
 }
 
 # Set a parameter to a bayan JSON value. Returns the input so calls chain.
@@ -412,9 +437,10 @@ fn agnosai_tool_input_from_value_a(a, v): i64 {
     return _agnosai_tool_input_over_a(a, m);
 }
 
-# A successful tool output carrying `result`.
-fn agnosai_tool_output_ok(result): i64 {
-    var o = alloc(AGN_OUTPUT_SIZE);
+# A successful tool output carrying `result`, in allocator `a`. A tool passes
+# `agnosai_tool_input_alloc`'s answer.
+fn agnosai_tool_output_ok_a(a, result): i64 {
+    var o = alloc_via(a, AGN_OUTPUT_SIZE);
     store64(o + AGN_OUTPUT_SUCCESS, 1);
     store64(o + AGN_OUTPUT_RESULT, result);
     store64(o + AGN_OUTPUT_ERROR, 0);
@@ -422,14 +448,24 @@ fn agnosai_tool_output_ok(result): i64 {
     return o;
 }
 
-# A failed tool output. `result` is JSON null, matching the oracle.
-fn agnosai_tool_output_err(msg: Str): i64 {
-    var o = alloc(AGN_OUTPUT_SIZE);
+# Global-allocator form of `agnosai_tool_output_ok_a`.
+fn agnosai_tool_output_ok(result): i64 {
+    return agnosai_tool_output_ok_a(default_alloc(), result);
+}
+
+# A failed tool output, in allocator `a`. `result` is JSON null, matching the oracle.
+fn agnosai_tool_output_err_a(a, msg: Str): i64 {
+    var o = alloc_via(a, AGN_OUTPUT_SIZE);
     store64(o + AGN_OUTPUT_SUCCESS, 0);
-    store64(o + AGN_OUTPUT_RESULT, bayan_json_v_null());
+    store64(o + AGN_OUTPUT_RESULT, bayan_json_v_null_a(a));
     store64(o + AGN_OUTPUT_ERROR, msg);
     store64(o + AGN_OUTPUT_EFFECT, AGNOSAI_TOOL_EFFECT_UNKNOWN);
     return o;
+}
+
+# Global-allocator form of `agnosai_tool_output_err_a`.
+fn agnosai_tool_output_err(msg: Str): i64 {
+    return agnosai_tool_output_err_a(default_alloc(), msg);
 }
 
 # Whether execution succeeded.
@@ -493,7 +529,8 @@ fn agnosai_tool_output_to_value(o): i64 {
 #
 # ⚠ **An input lasts as long as its call.** Through the tool loop it lives in an arena that goes
 # back with the task, so a tool that keeps anything from it past `execute_fp`'s return, for a crew
-# it submits or a thread it leaves running, must copy it first (ADR 029). Its output is copied.
+# it submits or a thread it leaves running, must copy it first (ADR 029). Its output is copied, so
+# a tool that builds it in `agnosai_tool_input_alloc` leaves nothing behind.
 fn agnosai_tool_new(name: Str, description: Str, schema_fp, execute_fp, ctx): i64 {
     var t = alloc(AGN_TOOL_SIZE);
     store64(t + AGN_TOOL_NAME, name);
@@ -639,12 +676,12 @@ fn agnosai_tool_output_refused_a(a, t, text: Str): i64 {
     return o;
 }
 
-# A gate's refusal, in the words a caller reads.
-fn _agnosai_tool_refused(t, reason: Str): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "tool call refused: ");
-    str_builder_add(sb, reason);
-    return agnosai_tool_output_refused(t, str_builder_build(sb));
+# A gate's refusal, in the words a caller reads, in allocator `a`.
+fn _agnosai_tool_refused_a(a, t, reason: Str): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "tool call refused: ");
+    str_builder_add_a(a, sb, reason);
+    return agnosai_tool_output_refused_a(a, t, str_builder_build_a(a, sb));
 }
 
 # Bind a call to its input, so a tool or a gate can read what it belongs to. Returns the input.
@@ -664,11 +701,15 @@ fn _agnosai_tool_run(t, input, task): i64 {
     if (input != 0) { agnosai_tool_input_bind(input, t, task); }
     if (gate != 0) {
         # Fail closed: a gate cannot judge a call it cannot see.
-        if (input == 0) { return _agnosai_tool_refused(t, str_from("no input to judge")); }
+        if (input == 0) {
+            var d = default_alloc();
+            return _agnosai_tool_refused_a(d, t, str_from_a(d, "no input to judge"));
+        }
         var call_fp = load64(gate + AGN_GATE_CALL_FP);
         if (call_fp != 0) {
             var reason = callptr(call_fp, load64(gate + AGN_GATE_CTX), input);
-            if (reason != 0) { return _agnosai_tool_refused(t, reason); }
+            # The allocator is read here, as a gate that lets a call through pays nothing for it.
+            if (reason != 0) { return _agnosai_tool_refused_a(agnosai_tool_input_alloc(input), t, reason); }
         }
     }
     var out = callptr(load64(t + AGN_TOOL_EXECUTE_FP), load64(t + AGN_TOOL_CTX), input);

@@ -25,10 +25,18 @@
 # records. `ra` below is that arena and `a` the crew's allocator. The two are the same only when
 # the pool could not give one.
 #
+# ## Why a call has an arena of its own
+#
+# What a tool answers belongs to the turn: nothing reads it once the model and the record have
+# their copies. So each call that runs takes an arena from the same pool, handed to its tool through
+# `agnosai_tool_input_alloc`, and the turn gives them back after delivery, the one place every call
+# has been read. ⚠ **Not `ra`:** a turn's calls run at once, on threads of their own, and an arena
+# has no lock.
+#
 # ## What still lands on the global heap
 #
-# What a tool allocates. `execute_fp` takes no allocator, so a tool's output and whatever it built
-# stay where the tool put them, for good. Recorded in ADR 029, with a figure, and on the roadmap.
+# What a tool puts there itself: `execute_fp` is unchanged, so a tool that ignores its input's
+# allocator is as it was, and that is its own cost. ADR 029 has the figure.
 #
 # Include order: after `src/tools/registry.cyr`, `src/tool_call.cyr`, `src/llm/hoosh.cyr`,
 # `src/server/prompt_guard.cyr`, `src/orchestrator/audit.cyr` and `src/core/task.cyr`, and before
@@ -219,7 +227,9 @@ enum AgnosaiToolCallOff {
     AGN_TC_DONE = 64;
     # The name a model asked for that the agent does not hold, or 0. For the record alone.
     AGN_TC_ASKED = 72;
-    AGN_TC_SIZE = 80;
+    # The arena this call's tool answers in, while it holds one. See the banner.
+    AGN_TC_ARENA = 80;
+    AGN_TC_SIZE = 88;
 }
 
 # The id this call carries in the conversation, unique within its task. hoosh restarts its own at
@@ -245,7 +255,8 @@ fn agnosai_tool_call_input(c): i64 {
     return load64(c + AGN_TC_INPUT);
 }
 
-# What the tool answered, or 0 before it ran and for a tool that answered nothing.
+# What the tool answered, or 0 before it ran, for a tool that answered nothing, and once the turn
+# is over: it lives as long as the turn, so a journal or a gate that keeps it must copy it.
 fn agnosai_tool_call_output(c): i64 {
     return load64(c + AGN_TC_OUTPUT);
 }
@@ -862,6 +873,7 @@ fn _agnosai_tool_call_prepare_a(st, asked, i): i64 {
     store64(c + AGN_TC_ST, st);
     store64(c + AGN_TC_DONE, 0);
     store64(c + AGN_TC_ASKED, 0);
+    store64(c + AGN_TC_ARENA, 0);
 
     var name = agnosai_chat_tool_call_name(asked);
     var t = _agnosai_tool_granted(st, name);
@@ -996,8 +1008,35 @@ fn _agnosai_tool_call_wait(c): i64 {
     return 0;
 }
 
+# Give a call an arena for its tool to answer in. With none to be had, its allocator stays the
+# global one, as it would off the loop: that costs bytes and breaks nothing.
+fn _agnosai_tool_call_take_arena(c): i64 {
+    var arena = _agnosai_tool_arena_acquire();
+    if (arena == 0) { return 0; }
+    store64(c + AGN_TC_ARENA, arena);
+    agnosai_tool_input_with_alloc(load64(c + AGN_TC_INPUT), arena);
+    return 0;
+}
+
+# Give back what this turn's calls held, once delivery has read them all. Their outputs go with
+# it, so a callback that kept a call reads 0 rather than what the next turn wrote there.
+fn _agnosai_tool_turn_give_back(calls): i64 {
+    for (var i = 0; i < vec_len(calls); i = i + 1) {
+        var c = vec_get(calls, i);
+        var arena = load64(c + AGN_TC_ARENA);
+        if (arena != 0) {
+            store64(c + AGN_TC_OUTPUT, 0);
+            store64(c + AGN_TC_ARENA, 0);
+            _agnosai_tool_arena_release(arena);
+        }
+    }
+    return 0;
+}
+
 # Run the calls that are left, at once, and wait for them all. One call runs here, so a task that
 # makes one call at a time spawns nothing. A thread that cannot start runs here too.
+#
+# Each takes its arena here, on the turn's thread, so a worker has one before it starts.
 #
 # Detached for the reason a parallel crew's workers are: a joined thread leaves its handle and
 # 4 KiB of TLS on the global heap for good. A tool already runs on many threads at once, on `/mcp`,
@@ -1007,7 +1046,10 @@ fn _agnosai_tool_turn_run(st, calls): i64 {
     var live = vec_new_a(ra);
     for (var i = 0; i < vec_len(calls); i = i + 1) {
         var c = vec_get(calls, i);
-        if (load64(c + AGN_TC_REFUSED) == 0) { vec_push_a(ra, live, c); }
+        if (load64(c + AGN_TC_REFUSED) == 0) {
+            vec_push_a(ra, live, c);
+            _agnosai_tool_call_take_arena(c);
+        }
     }
     var n = vec_len(live);
     if (n == 0) { return 0; }
@@ -1186,6 +1228,7 @@ fn _agnosai_tool_turn_a(st, request, response): i64 {
     _agnosai_tool_turn_journal_intents(st, calls);
     _agnosai_tool_turn_run(st, calls);
     _agnosai_tool_turn_deliver(st, request, calls);
+    _agnosai_tool_turn_give_back(calls);
 
     if (total > kept) {
         store64(st + AGN_TT_DROPPED, load64(st + AGN_TT_DROPPED) + total - kept);

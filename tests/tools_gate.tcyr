@@ -134,6 +134,59 @@ fn _t_ok(gate, url): i64 {
     return agnosai_tool_url_ok(_t_gated_input(gate), str_from(url));
 }
 
+# ── what a real request leaves on the global heap (B41) ─────────────────────
+#
+# Each bound is sandhi's own (roadmap B39), exact and for this server's response, so that a copy of
+# ours shows above it: `str_cstr` per request or per hop is only the URL's length. Lower them when
+# sandhi moves.
+var _T_SANDHI_BYTES_PER_CHAIN = 928;
+var _T_SANDHI_BYTES_PER_REQUEST = 352;
+
+# What one redirect chain leaves on the global heap, its arena warm.
+fn _t_chain_cost(target: Str, opts, arena): i64 {
+    var headers = sandhi_headers_new();
+    for (var w = 0; w < 4; w = w + 1) {
+        _T_HITS = 0;
+        agnosai_guarded_fetch_hops(arena, "GET", target, headers, opts, 2000, 0, 0, 0, &_t_hop_check, 1);
+        reset_via(arena);
+    }
+    var before = alloc_used();
+    for (var i = 0; i < 20; i = i + 1) {
+        _T_HITS = 0;
+        agnosai_guarded_fetch_hops(arena, "GET", target, headers, opts, 2000, 0, 0, 0, &_t_hop_check, 1);
+        reset_via(arena);
+    }
+    return (alloc_used() - before) / 20;
+}
+
+# What one request of the real load-test executor leaves on the global heap. The worker runs twice
+# on the same arenas, the first run warming them: the pool would hand a new worker cold ones.
+fn _t_request_cost(target: Str): i64 {
+    _T_SECOND = 0;
+    var w = agnosai_lt_worker_new(target, clock_now_ns() + 30000000000, 20, &agnosai_lt_http_executor, 0);
+    agnosai_lt_worker_run(w);
+    store64(w + AGN_LT_MAX_REQUESTS, 220);
+    var before = alloc_used();
+    agnosai_lt_worker_run(w);
+    var cost = (alloc_used() - before) / 200;
+    assert_eq(vec_len(agnosai_lt_worker_latencies(w)), 220, "the executor ran every request");
+    assert_eq(load64(w + AGN_LT_ERRORS), 0, "against a real socket, and each one answered");
+    agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL, agnosai_lt_worker_arena(w));
+    agnosai_arena_pool_release(_AGNOSAI_LT_SCRATCH_POOL, agnosai_lt_worker_scratch(w));
+    return cost;
+}
+
+fn _t_socket_cost_suite(target: Str, opts, arena): i64 {
+    _T_RESPONSE = _t_redirect(str_from("/next"));
+    _T_SECOND = _t_ok_response();
+    assert(_t_chain_cost(target, opts, arena) <= _T_SANDHI_BYTES_PER_CHAIN,
+      "a redirect chain leaves only sandhi's own: nothing of ours, per hop");
+    _T_RESPONSE = _t_ok_response();
+    assert(_t_request_cost(target) <= _T_SANDHI_BYTES_PER_REQUEST,
+      "a real load-test request leaves only sandhi's own: nothing of ours, per request");
+    return 0;
+}
+
 # ── a loopback server ───────────────────────────────────────────────────────
 #
 # Answers each request with `_T_RESPONSE`, or `_T_SECOND` once `_T_HITS` passes one, and counts
@@ -544,6 +597,21 @@ fn _t_tools_end_to_end(): i64 {
     _T_HITS = 0;
     assert(agnosai_run_security_audit_for(_t_gated_input(declared), target, 0) > 0,
       "and with one they are its gate's");
+
+    # A call with an arena of its own, across that redirect: the fetch resets its arena between
+    # hops, so what a hop reads must not be there, and the result must be where the call said. A
+    # bump arena hands out rising addresses, so what lands between two markers is in it.
+    _T_HITS = 0;
+    var ar = arena_allocator_growable(1048576);
+    var in_arena = agnosai_tool_input_with_alloc(_t_gated_input(declared), ar);
+    var below = alloc_via(ar, 8);
+    var kept = agnosai_run_security_audit_for(in_arena, target, 0);
+    var above = alloc_via(ar, 8);
+    assert(kept > 0, "an audit in a call's arena follows the redirect too");
+    assert(kept > below && kept < above, "and builds its result there");
+    assert_eq(str_eq(agnosai_audit_target_url(kept), target), 1, "which reads back whole");
+
+    _t_socket_cost_suite(target, opts, arena);
 
     store64(&_T_STOP, 1);
     var wt, wfd = tcp_socket();
