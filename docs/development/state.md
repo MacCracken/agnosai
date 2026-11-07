@@ -2,9 +2,27 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-07 (the 2.3.1 release gate).
+> Last refreshed: 2026-11-07 (the 2.3.2 release gate).
 
-## Now — 2.3.1
+## Now — 2.3.2
+
+| | |
+|---|---|
+| **version** | **2.3.2** (cut 2026-11-07): a tool's answer goes back with its call. Each call the tool loop runs takes an arena of its own, a tool reads it from `agnosai_tool_input_alloc`, and every built-in answers there. A suite that failed could exit 0 and pass CI; every suite now ends in `sys_exit_group`. The roadmap is by release, in plain words. Confining the process, Python and OCI tools, planned for this release, waits on kavach |
+| **cyrius pin** | **6.7.18**, unchanged |
+| **tests** | **105 suites, 11,105 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.3.1's tree reads 10,986 here. The `ubuntu:26.04` CI replica reads 10,959, as suites that count per environment do. 31 mutants, all killed |
+| **coverage** | **99%**: 106/106 files, 1,817/1,828 fns (gate `--min 80`), the same 11 unreferenced as 2.3.1 |
+| **dist** | `dist/agnosai.cyr` 44,098 lines + `dist/agnosai-guard.cyr` 1,014, both v2.3.2. Sidecars **6 / 1** leaves, unchanged |
+| **binary** | `build/agnosai` **2,998,968 B** (2.3.1: 2,994,840). aarch64 **6,967,520 B** (6,967,496), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.3.2"` and exits cleanly on SIGTERM |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh` 3,136 definitions across 117 files; `check-clean.sh` fmt 234, lint 234, doc 118, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist. Then build, aarch64, tests under DCE, coverage, `distlib --all --check`, the example, fuzz 4/4, `cyrius bench`. **The `ubuntu:26.04` CI replica ran**, on the bumped tree with wasmtime 47.0.3: every `ci.yml` step, 105 suites, 0 failed |
+| **benchmarks** | The interleaved A/B against a 2.3.1 build, three rounds of `tools`, `orch` and `server` at a mean load of 3.3, reads **median +0.2% across 149 rows**, 109 within ±5%. `agnos_form_encode_52b` −34%, `agnos_segment_ok` −18%, `lt_result_to_value` −10%. `task_one_tool_call` +2.0%, about 600 ns for the call's arena. New: `task_one_tool_call_kept` and `task_four_tool_calls_kept`. `bench-history.csv` has 239 rows at 2.3.2, one sweep at a load of 1.2–1.4: median −2.8% against 2.3.1's rows, 169 of 236 within ±5%, not claimed, as 2.3.1's sweep ran at a load of 3.2 |
+| **bytes per crew** | **0** for a call whose tool answers in its arena, on every arm of `echo`, `json_transform` and all nine AGNOS tools. What the network tools still leave is not theirs: sandhi's 352–480 B an exchange, the SSRF guard's 136 B a check, and `load_testing`'s joined threads at 4,120 B a user (roadmap 2.3.5) |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4. ⚠ `transport_fp` and `shape_fp` take an allocator first (CHANGELOG *Breaking*): agnostic and thoth call neither, and joshua and kiran are not on this machine, so that neither does is unchecked |
+| **upstream filings** | kavach's, the capture buffer that holds back confinement, is committed and on GitHub. ⚠ **The other six are not committed**, so not visible upstream: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies), hoosh (span ids, new) and bote (the MCP client, new, with a scope conflict). The roadmap's *Waiting on another project* has each path |
+
+### 2.3.1 — the release (2026-11-07)
 
 | | |
 |---|---|

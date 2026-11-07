@@ -7,8 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.2] — 2026-11-07
+
 A tool's answer goes back with its turn. A tool used to leave what it built on the global heap for good, the one thing on
-a crew's path an arena could not give back (roadmap B41, ADR 029). Now the loop gives each call an arena of its own, a
+a crew's path an arena could not give back (ADR 029). Now the loop gives each call an arena of its own, a
 tool reads it from its input, and `execute_fp` is unchanged, so a tool that ignores it works as it did. Every built-in is
 on it, and in the suites `echo`, `json_transform` and all nine AGNOS tools leave 0 B, on every arm.
 
@@ -48,6 +50,17 @@ on it, and in the suites `echo`, `json_transform` and all nine AGNOS tools leave
 - **security_audit:** its request headers and options live in the call's allocator rather than the exchange's arena, as
   `agnosai_guarded_fetch_hops` resets that arena between hops and they are read on every one.
 
+- **The roadmap is by release, in plain words.** Each release says what it does, releases are in the order they can
+  ship, and work that waits on another project has no number until its fix ships. An appendix maps the item codes older
+  comments cite to where that work is now. Model choice by what hoosh's catalog says moved to the front, 2.3.3, as hoosh
+  2.10.2 already shipped it. MCP 2026-07-28 and trace ids in log lines turned out to wait on nothing: bote serves both
+  eras, and sakshi's hook passes fields apart.
+- **Two upstream filings that the roadmap said were owed:** hoosh exports its span with the caller's span id
+  (`hoosh/docs/development/issues/2026-11-07-agnosai-inference-span-takes-the-callers-span-id.md`), and bote has no MCP
+  client while its roadmap lists one as a non-goal (`bote/docs/development/issues/2026-11-07-agnosai-no-mcp-client-to-call-a-hosts-tools.md`).
+  ⚠ Neither is committed, nor are the four agnosai filings already in sigil and sandhi, so none of those six is visible
+  upstream. kavach's is.
+
 ### Fixed
 
 - **`str_cstr` copies onto the global heap whatever it is given, and three paths called it per exchange:**
@@ -56,11 +69,19 @@ on it, and in the suites `echo`, `json_transform` and all nine AGNOS tools leave
   4,120 B a user across 100,000 requests, which is its threads.
 - `agnosai_agnos_segment_ok` allocated two Strs on the global heap per check, to search for a literal.
 
+- **A suite that failed could exit 0, and CI would count it as passing.** The epilogue `CLAUDE.md` asked of every `.tcyr`
+  ended in `syscall(60, f)`, which on Linux ends the calling thread only. With another thread still running, the process
+  took the *last* thread's status, and a worker's is 0. Measured: a probe returning 1 with one thread asleep exited 0
+  every time, and a mutant here exited 0 while printing `1 failed`. 17 suites can have a thread alive at exit. Every
+  suite and fuzz harness now ends in `sys_exit_group`, as `src/main.cyr` already did, and `CLAUDE.md` and
+  `CONTRIBUTING.md` teach it. That mutant now exits 1, five runs of five. **No run hid a failure before this:** every
+  failure printed in this tree's runs and in 2.3.1's CI was also caught by its exit code.
+
 ### Performance
 
 Interleaved A/B against a 2.3.1 build, three rounds of `tools`, `orch` and `server` at a mean load of 3.3: **median +0.2%
 across 149 rows**, 109 within ±5%. The rows that moved in code this does not touch, `rank_agents_*`, `pubsub_*` and
-`prompt_*` among them, are the position effect (B20, B27) and are not claimed, and nor are `route_mcp_*` at −7%.
+`prompt_*` among them, are the position effect (roadmap 2.7.1) and are not claimed, and nor are `route_mcp_*` at −7%.
 
 - agnos_form_encode_52b: 1,161 ns → 767 ns (−33.9%). The encoders work a stack chunk at a time. Appending per byte, which was
   this change's first draft, read 2,050 ns, so the bench is what caught it.
@@ -88,21 +109,23 @@ across 149 rows**, 109 within ±5%. The rows that moved in code this does not to
   +5: the rest of the built-ins, and a crew from `delegate` finishing with the call's arena written over.
 - **105 suites, 11,105 assertions** (2.3.1's tree reads 10,986 here, so +119). **31 mutants, every one killed.** Five survived
   the first pass: three bounds were looser than the leak they guarded and two tests proved behaviour and not where the bytes
-  lived, so each was tightened, and the last "survivor" was the exit code below.
-- ⚠ **Found, not fixed: a suite that fails can exit 0.** The epilogue `CLAUDE.md` asks of every `.tcyr` ends in `syscall(60, f)`,
-  which on Linux ends the calling thread only, so with a thread still running the process takes the last thread's status, and
-  a worker's is 0. Measured: a probe that returns 1 with a thread asleep exits 0, every time, and with `sys_exit_group` exits
-  1. 17 suites can have a thread alive at exit, and a mutant here passed CI's check while printing `1 failed`. No run of this
-  tree or 2.3.1's hides a failure: every printed failure was also named by its exit code. `src/main.cyr` already exits with
-  `sys_exit_group`.
+  lived, so each was tightened, and the last "survivor" was the exit code above (*Fixed*).
+
+### Not in this release
+
+- **Confining the process, Python and OCI tools**, which was this release's other half. Through kavach today, every run
+  would keep a 1 MiB capture buffer for good, so it waits on kavach's fix
+  (`kavach/docs/development/issues/2026-11-06-agnosai-every-exec-keeps-its-1-mib-capture-buffer.md`, filed and on
+  GitHub). The roadmap lists it under *Waiting on another project* and gives it the next free release once kavach
+  ships.
 
 ### Verified
 
 - `check-symbols.sh` 3,136 definitions; `check-clean.sh` fmt 234, lint 234, doc 118, doctest 1 files; `deps --verify` 119; lib
   snapshot 113; then build (2,998,968 B), aarch64 (6,967,520 B, built and not started), 105 suites and 11,105 assertions with 0
   failed under `CYRIUS_DCE=1`, counted from each suite's printed line as well as its exit code, coverage 99% with the same 11
-  unreferenced as 2.3.1, `distlib --all --check`, the example, fuzz 4/4, and `cyrius bench`. The binary answers `/ready` and
-  exits cleanly on SIGTERM.
+  unreferenced as 2.3.1, `distlib --all --check`, the example, fuzz 4/4, and `cyrius bench`. The binary answers `/ready` with
+  `"version":"2.3.2"` and exits cleanly on SIGTERM.
 - **The `ubuntu:26.04` CI replica**, from a clone of 2.3.1 with this diff on it, as an unprivileged user with wasmtime 47.0.3:
   every `ci.yml` step, 105 suites and 0 failed. It read the first draft's `tools_builtin_delegate` failing too, as did this
   machine: a measurement taken while another test's crew was still allocating, fixed by running it before any crew exists,
@@ -110,7 +133,7 @@ across 149 rows**, 109 within ±5%. The rows that moved in code this does not to
 - ⚠ **Not run:** a provider or an AGNOS service that is not a stub; `load_testing`'s HTTP executor against anything but a
   loopback server; the aarch64 binary; a consumer.
 - ⚠ **What is not 0 is pinned, not hidden:** the SSRF guard's parse is 136 B a check and `load_testing`'s threads 4,120 B a
-  user, both moved to roadmap B13, and sandhi's 480 B an exchange is B39.
+  user, both now in the roadmap's 2.3.5, and sandhi's own share of an exchange waits on sandhi.
 
 ## [2.3.1] — 2026-11-07
 

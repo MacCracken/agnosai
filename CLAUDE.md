@@ -164,7 +164,8 @@ diff in `check-clean.sh` catches a dep silently downgrading a folded module.
 - Do not add unnecessary dependencies — keep it lean
 - Do not skip benchmarks before claiming performance improvements
 - Do not hardcode toolchain versions in CI YAML — `cyrius = "X.Y.Z"` in `cyrius.cyml` is the source of truth
-- Do not use the stock `proj-tcyr` epilogue — the exit code is masked `& 0xFF`, so exactly 256/512/768 failures score PASS. Every `.tcyr` ends `var f = main(); if (f > 0) { f = 1; } syscall(60, f);`
+- Do not use the stock `proj-tcyr` epilogue — the exit code is masked `& 0xFF`, so exactly 256/512/768 failures score PASS. Every `.tcyr` ends `var f = main(); if (f > 0) { f = 1; } sys_exit_group(f);`
+  — **not `syscall(60, f)`**, which ends the calling thread only: with any other thread still running, the process exits with the *last* thread's status, a worker's 0, so a failing suite passes CI. Measured at 2.3.2, every time, with one sleeping thread
 - Do not put `.bcyr` files in subdirectories — `cyrius bench` no-arg discovery is **not** recursive
 - Do not `include "lib/syscalls.cyr"` (or any stdlib module) in a `.tcyr`/`.bcyr` — the stdlib is auto-prepended, so an explicit include lands *after* it and single-passes into an undefined-symbol error
 

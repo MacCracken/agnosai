@@ -89,7 +89,9 @@ agnosai
 - Suites are `tests/*.tcyr` and may `include "src/foo.cyr"` directly
 - ⚠ Never end a `.tcyr` with the stock epilogue — the exit code is masked
   `& 0xFF`, so exactly 256/512/768 failures score PASS. Use:
-  `var f = main(); if (f > 0) { f = 1; } syscall(60, f);`
+  `var f = main(); if (f > 0) { f = 1; } sys_exit_group(f);`
+  Not `syscall(60, f)`: it ends one thread, so with another still running a
+  failing suite exits 0.
 - ⚠ Do NOT `include` a stdlib module in a `.tcyr`/`.bcyr` — the stdlib is
   auto-prepended, so an explicit include lands after it and single-passes into
   an undefined-symbol error
