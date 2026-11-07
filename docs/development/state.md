@@ -8,7 +8,7 @@
 
 | | |
 |---|---|
-| **version** | **2.3.0** (cut 2026-11-07, the bump script's UTC date; 2026-11-06 Pacific): the tool-calling harness. An agent is offered the tools it names, and the model calls them until it answers, under ADR 029's four rules. B7 items 8 and 9 hang on it, and `delegate`'s crew joins the caller's trace. The audits moved to `docs/audit/`, and the roadmap is now release pins from 2.3.1 to 2.7.2, with `rust-old/`'s deletion at 2.3.7 |
+| **version** | **2.3.0** (cut 2026-11-07, the bump script's UTC date; 2026-11-06 Pacific): the tool-calling harness. An agent is offered the tools it names, and the model calls them until it answers, under ADR 029's four rules. B7 items 8 and 9 hang on it, and `delegate`'s crew joins the caller's trace. The audits moved to `docs/audit/`, and the roadmap is now release pins from 2.3.1 to 2.7.2, with `rust-old/`'s deletion waiting on bhava (B5) |
 | **cyrius pin** | **6.7.18**, unchanged: still the latest tag |
 | **tests** | **103 suites, 10,721 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1 present. 2.2.5's tree reads 10,281. The +440 is mostly the new `orch_tool_loop` 361, with `llm_hoosh` +40 and the rest in `telemetry_wiring`, `tools_builtin_delegate` and `server_routes_crews`. 74 mutants, all killed. `sandbox_spawn` fails one assertion in a tree under `/tmp`, as it asserts a spawned `pwd` holds no `/tmp` |
 | **coverage** | **99%**: 105/105 files, 1,772/1,783 fns (gate `--min 80`), the same 11 unreferenced as 2.2.5. Every new public name is named by a test. The loop's internals are `_`-prefixed, as only `crew_runner` calls them |

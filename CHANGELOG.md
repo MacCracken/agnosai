@@ -55,9 +55,9 @@ used to answer and the name was only words in its prompt. A crew naming `echo`, 
   another project, and "any release" is gone. Rows are cut to what is still open, checked against the tree: B10, B11 and
   B12 lost what had shipped, the 2.2.x re-check narrative left B16, the filed sandhi paragraph left C, and the
   `gen-presets` line left the deletion checklist, as it no longer writes a `rust-old/` comment.
-- **The `rust-old/` deletion is pinned to 2.3.7**, the first release that can meet the condition on it. The roadmap said
-  "at 2.3.0" and scheduled the same porting items for 2.5.x and 2.6.x. B10, B11, B7 (1), the JWT key and `StateStore` move
-  up to 2.3.5 and 2.3.6 to get it there.
+- **The `rust-old/` deletion waits on bhava.** The roadmap said "at 2.3.0, once every Rust porting item is done", and the
+  port is not done while `personality` is missing, so it has no number until B5 lands. What else the Rust line had is
+  pinned: B10 and B11 at 2.3.5, `StateStore` at 2.5.0, the JWT key at 2.6.1 and B7 (1) at 2.6.2.
 - **`docs/development/m7-audit-2026-08-04.md` and `m12-bench-audit-2026-08-10.md` moved to `docs/audit/`.**
 - **`agnosai_tool_execute_for` puts the call's own span context on its input**, and reads the call's id, agent and task
   from it, so an `execute_tool` span names them. A call no loop made, such as `/mcp`'s, has none, and they are omitted.
@@ -149,8 +149,7 @@ The loop itself, with a stub gateway and a tool that does nothing, so a real cal
 
 ### Not in this release
 
-- **`rust-old/` stays.** The condition on deleting it is not met: B7 (1), B10, B11, B15 and the JWT key are open. It is
-  pinned to 2.3.7, and D9 is the user's call before then.
+- **`rust-old/` stays**, until bhava is ported and B5 is done.
 - **B33 is next, at 2.3.1.** A crew whose agent names no model still sends a guessed id, so agnostic's M6 needs it too.
 - **agnostic has to adopt this.** It needs `agnosai_orchestrator_with_tools` at engine init, and a preset that names its
   36 unresolved tools will fail rather than run. No consumer was re-run against this release.
