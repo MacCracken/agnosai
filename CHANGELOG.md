@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A lazy build is published with a fence and then a store.** `atomic_store` is a plain store, so on aarch64, which
+  ships, a thread on an unlocked path could see a pointer before what it points at. The later `mutex_unlock` does not
+  help, as it comes after the store. `_agnosai_hoosh_pool` and `_agnosai_tool_pool`, the tree's only double-checked
+  locks, now fence first. So do the two lazy builds that take no lock: `agnosai_wasm_tool_sandbox`, whose first use can
+  be a tool call's worker, with `agnosai_wasm_tool_set_sandbox`, which writes the same pointer, and
+  `agnosai_metrics_global`, which a library consumer's first crew builds on whatever thread it runs on. Their readers
+  follow the pointer, so they need no fence. `_agnosai_kavach_ensure_init` publishes a flag, and nothing follows a flag,
+  so its fast path has a fence too: without one a thread could report "backend not available" for a backend that is
+  registered. x86 is unaffected. ⚠ **No test here can show this, none was added, and it has not been run on aarch64.**
+  What was checked is the aarch64 build: its disassembly has a `dmb ish` before each store it holds, which is all of
+  them but `agnosai_wasm_tool_set_sandbox`, a consumer's call that the binary does not reach.
+- **`agnosai_config_holder_update` fences before it publishes**, for the same reason. It is not lazy: a reload swaps
+  the pointer with readers running, so `agnosai_config_holder_get`'s promise of the whole old config or the whole new
+  one did not hold on aarch64. Nothing in `src/` calls it, so this reaches a library consumer and not the binary, and
+  the test and aarch64 caveats above apply to it too.
+
+### Performance
+
+- **The fences cost nothing a row can see**, as each is paid once, by the build, or beside a sandbox starting. Three
+  interleaved rounds of `llm.bcyr` and `orch.bcyr` against a build without them read median 0.0% across 112 rows.
+  `task_one_tool_call`: 29.6 → 30.4 µs. `task_four_tool_calls_at_once`: 240.0 → 243.2 µs. Each range overlaps the other.
+- **`hoosh_pool_fast_path` is new**, as no row reached that function: the crew benches answer through the client's
+  stub. It reads 4 ns on both sides, and 21 ns on a mutant with the fence moved onto the fast path.
+
 ## [2.3.0] — 2026-11-07
 
 An agent can now use its tools. Until this release an agent was one prompt, and a registered tool was never called by

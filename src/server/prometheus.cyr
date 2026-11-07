@@ -45,17 +45,26 @@ var _agnosai_metrics_singleton = 0;
 
 # The process-wide metrics set, created on first use.
 #
-# **Not thread-safe to *create* concurrently**, and it does not need to be: the
-# server builds its state at startup, before any worker thread exists, and
-# `agnosai_metrics_gather` / the record verbs are called on it afterwards. Call
-# this once during boot to make the initialization explicit rather than relying
-# on whichever request arrives first — the same reason
+# **Not thread-safe to *create* concurrently**, and the server does not need it to
+# be: `agnosai_serve_mount` builds this at startup, before any worker thread
+# exists, and `agnosai_metrics_gather` / the record verbs are called on it
+# afterwards. Call this once during boot to make the initialization explicit
+# rather than relying on whichever request arrives first — the same reason
 # `agnosai_jwt_config_prepare` is a startup call.
+#
+# ⚠ **A library consumer never mounts**, so its first crew builds this on whatever
+# thread that crew runs. Publication is therefore a fence and then a store, as
+# `_agnosai_hoosh_pool`'s banner says why. That closes the order and not the race:
+# two first crews can each build a set, and the counts of the one whose store lost
+# are gone. Calling this at boot closes both.
 fn agnosai_metrics_global(): i64 {
-    if (_agnosai_metrics_singleton == 0) {
-        _agnosai_metrics_singleton = agnosai_metrics_new();
+    var m = atomic_load(&_agnosai_metrics_singleton);
+    if (m == 0) {
+        m = agnosai_metrics_new();
+        atomic_fence();
+        atomic_store(&_agnosai_metrics_singleton, m);
     }
-    return _agnosai_metrics_singleton;
+    return m;
 }
 
 enum AgnosaiMetricsOff {
