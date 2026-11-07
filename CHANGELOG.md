@@ -133,6 +133,12 @@ at a load of about 2.3, medians: **−0.6% across 157 rows**, 152 within ±5%.
 - **63 mutants, every one killed by an assertion.** Of the first 46, one survived, and it was a guard written twice. Of the rest,
   one survived because a good read had just stamped the time a failed read was meant to be tested for, and one test could only
   fail by hanging. Both are fixed. ⚠ The aarch64 fences are not among them: x86 cannot show that reordering.
+- **Two races in `tests/tools_builtin_delegate.tcyr`, one of which failed CI on this release's merge.** Neither is a product
+  defect, and both predate this release. The suite asserted a crew still read PENDING right after `delegate` returned, but the
+  worker stores RUNNING as soon as its thread starts (ADR 022). It now asserts the crew has not finished, and still fails with
+  `run_crew` swapped in. And the telemetry test ran after tests that leave detached crews running, so one could report a trace
+  of its own into the document it read, so it now runs first. Interleaved on four CPUs, the old suite failed 9 of 1,200 runs and
+  the new one 0 of 1,200.
 
 ### Verified
 

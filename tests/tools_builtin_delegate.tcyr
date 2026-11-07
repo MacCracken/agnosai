@@ -215,14 +215,20 @@ fn _t_dl_id_is_live_before_the_call_returns(): i64 {
     # finished. Measured: `delegate` returns in 0 ms with the crew PENDING, and
     # the same crew reads COMPLETED 300 ms later.
     #
+    # ⚠ **Not finished, rather than PENDING.** The worker stores RUNNING as soon as its thread
+    # starts (ADR 022), so this read can see either, and neither means delegate waited. It
+    # asserted PENDING alone until 2.3.1, which failed about 1 run in 150 on four CPUs, every
+    # failure reading RUNNING, and failed CI on 2.3.1's merge.
+    #
     # Narrow race, stated rather than hidden: the worker could in principle
     # finish between `submit_crew` returning and this read, which would show a
     # terminal status and fail spuriously. It has not been observed — the crew
     # needs milliseconds and this is microseconds behind it — and the
     # alternative is no assertion on the property at all, which is what the
     # mutation caught.
-    assert(agnosai_crew_state_status(crew) == AGNOSAI_CREW_PENDING,
-      "...and still PENDING — delegate did NOT wait for the crew to finish");
+    var seen = agnosai_crew_state_status(crew);
+    assert(seen == AGNOSAI_CREW_PENDING || seen == AGNOSAI_CREW_RUNNING,
+      "...and not finished — delegate did NOT wait for the crew to finish");
     return 0;
 }
 
@@ -371,6 +377,10 @@ fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
 
+    # ⚠ **First, before any crew exists.** The tests below leave detached crews running, and the
+    # exporter is process-wide, so a crew still going when this starts writes a trace of its own
+    # into the document this test reads. Run after them, that failed about 1 run in 300.
+    _t_dl_joins_the_trace_with_telemetry_on();
     _t_dl_tool_constructor();
     _t_dl_submit_crew_directly();
     _t_dl_detached_threads_do_not_leak_va();
@@ -382,7 +392,6 @@ fn main(): i64 {
     _t_dl_missing_params();
     _t_dl_keeps_nothing_of_its_input();
     _t_dl_stays_in_the_trace();
-    _t_dl_joins_the_trace_with_telemetry_on();
     _t_dl_is_not_registered_by_default();
 
     return assert_summary();
