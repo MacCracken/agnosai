@@ -30,4 +30,10 @@
 - [Performance & Benchmarks](development/performance.md)
 - [AgnosAI vs CrewAI Comparison](development/comparison-crewai.md)
 - [Threat Model](development/threat-model.md)
+- [Known-unreachable Code](development/known-unreachable.md)
 - [Changelog](../CHANGELOG.md)
+
+## Audits
+
+- [M7 audit, 2026-08-04](audit/m7-audit-2026-08-04.md)
+- [M12 benchmark audit, 2026-08-10](audit/m12-bench-audit-2026-08-10.md)

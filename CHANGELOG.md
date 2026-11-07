@@ -7,6 +7,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-11-07
+
+An agent can now use its tools. Until this release an agent was one prompt, and a registered tool was never called by
+a model. A crew's agents are now offered the tools they name, and the model calls them until it answers, under four
+rules: every call is journaled before it runs, a tool's output is data and never instructions, the calls of a turn are
+approved as a set, and an agent sees only what it was granted (ADR 029). This is what agnostic's M6 was waiting on.
+The audits moved to `docs/audit/`, and the roadmap is now a list of release pins.
+
+⚠ **Behaviour changes, all opt-in for a library consumer, who gets the loop by calling `agnosai_orchestrator_with_tools`:**
+in the binary, a crew whose agent names a tool the server does not hold now **fails**, naming the tool, where the model
+used to answer and the name was only words in its prompt. A crew naming `echo`, `json_transform`, `load_testing` or
+`security_audit` now runs it. A crew that names no tool sends the bytes it always sent.
+
+### Added
+
+- **The tool loop (`src/tool_loop.cyr`, ADR 029).** Between one answer and the next request a turn prepares each call
+  against the agent's grant, approves the set, journals every call, runs them at once, and delivers each result, checked,
+  in the order the model asked. A task stops at 16 turns, on a cancel or at the crew's deadline, with a reason of its own.
+  A turn runs at most 8 calls, a result is cut at 32 KiB and a task reads 256 KiB of results, so a transcript stays inside
+  hoosh's limits (`agnosai_tool_loop_set_limits`).
+- **`agnosai_orchestrator_with_tools(o, registry)`**, with `agnosai_orchestrator_tools` and
+  `agnosai_crew_runner_with_tools`. The registry stays the caller's, which answers agnostic's `handoff.md` §8.
+  `agnosai_execute_task_with_tools_a` is the same below a runner.
+- **`tool_calls` on a task's entry in `POST /api/v1/crews`' `results`**, when it called any: the one addition to the
+  oracle's response, so a caller of the binary can tell what a tool measured from what a model claimed.
+- **`metadata.tool_calls` is written**, one entry per call in the model's order: `id`, `tool`, `arguments`, `effect`,
+  `success`, `result` or `error`, and `flagged`, `held_back` or `asked_for` when they apply.
+  `metadata.tool_calls_dropped` counts what a turn could not take.
+- **A journal (rule 1).** `agnosai_tool_journal_new(record_fp, ctx)` and `agnosai_orchestrator_with_tool_journal` write a
+  call down before it runs, and a call the journal refuses does not start. The audit chain gets `tool_call_started`,
+  `tool_call_finished` and `tool_call_refused`, with no arguments in them.
+- **Two more gate callbacks.** `agnosai_tool_gate_with_batch` judges a turn's calls as a set (rule 3), and
+  `agnosai_tool_gate_with_result` holds a result back from the model (rule 2).
+- **`gen_ai.tool.call.id` on `execute_tool` spans**, with the agent's name and the task's id (roadmap B7 item 8).
+  `gen_ai.tool.call.arguments` and `.result` need `AGNOSAI_OTEL_CAPTURE_TOOL_CONTENT=1`, as the conventions make them
+  Opt-In, and are filtered by ADR 020 and cut at 4 KiB. `agnosai_telemetry_set_capture_tool_content` is the library's
+  switch.
+- **`agnosai_tool_input_span_ctx(input)`**: a tool that starts more work keeps it in the call's trace.
+- **The wire for it** in `llm/hoosh.cyr`: `agnosai_inference_request_with_tools`, `_say_tool_calls`, `_say_tool_result`,
+  `agnosai_inference_response_tool_calls`, `agnosai_inference_response_clone_a` and `agnosai_chat_tool_call_*`.
+- **`docs/development/known-unreachable.md`**, the record of code kept for oracle shape, out of the roadmap.
+
+### Changed
+
+- **The roadmap is release pins.** Every open item is pinned to one release from 2.3.1 to 2.7.2, or listed as waiting on
+  another project, and "any release" is gone. Rows are cut to what is still open, checked against the tree: B10, B11 and
+  B12 lost what had shipped, the 2.2.x re-check narrative left B16, the filed sandhi paragraph left C, and the
+  `gen-presets` line left the deletion checklist, as it no longer writes a `rust-old/` comment.
+- **The `rust-old/` deletion is pinned to 2.3.7**, the first release that can meet the condition on it. The roadmap said
+  "at 2.3.0" and scheduled the same porting items for 2.5.x and 2.6.x. B10, B11, B7 (1), the JWT key and `StateStore` move
+  up to 2.3.5 and 2.3.6 to get it there.
+- **`docs/development/m7-audit-2026-08-04.md` and `m12-bench-audit-2026-08-10.md` moved to `docs/audit/`.**
+- **`agnosai_tool_execute_for` puts the call's own span context on its input**, and reads the call's id, agent and task
+  from it, so an `execute_tool` span names them. A call no loop made, such as `/mcp`'s, has none, and they are omitted.
+- **`agnosai_task_result_record_tool_call` and `agnosai_tool_call_to_value` copy what they keep**, so a record no longer
+  points at a tool's value, which may be its own input.
+
+### Fixed
+
+- **A chat response with a null `content` and a tool call is an answer** (ADR 029). It read as a body with no content,
+  which is how OpenAI's API answers one. hoosh sends `""`, which is why nothing noticed.
+- **The `delegate` tool's crew starts in the caller's trace** (roadmap B7 item 9). It started a new root, so a call under a
+  `traceparent` lost the crew. With a parent it reports no `invoke_workflow` span, as the conventions ask of a tool
+  delegating to a sub-agent, and its `invoke_agent` spans go under the tool's.
+
+### Security
+
+- **What a tool writes cannot end the markers around it.** `agnosai_prompt_sanitize_a` alters nothing inside them, so a
+  page holding `</user_input>` would have read as ours. In a tool result `user_input` and `system_instructions` are
+  rewritten, in any case and spacing. A model that obeys a page still holds only what it was granted, and each such call
+  meets the gate (`threat-model.md`, surface 2).
+- **A name or an id a model wrote stays out of the audit chain.** A call to a tool its agent does not hold is
+  `unknown_tool` in the journal and the chain, which are kept for good, and an id the filter would touch is replaced.
+
+### Performance
+
+An interleaved A/B against a 2.2.5 build, three rounds of the five files this touches, medians: **+0.3% across 172
+rows**, 146 within ±5%. No crew with no tools costs anything new:
+
+| Row | 2.2.5 | 2.3.0 | |
+|---|---|---|---|
+| `run_crew_1_task_sequential` | 98.4 µs | 98.8 µs | +0.3% |
+| `run_crew_10_tasks_sequential` | 407.6 µs | 406.3 µs | −0.3% |
+| `run_crew_10_tasks_parallel_4` | 492.2 µs | 472.0 µs | −4.1% |
+| `run_crew_10_tasks_sequential_traced` | 656.2 µs | 666.7 µs | +1.6% |
+| `run_crew_then_release` | 94.4 µs | 93.7 µs | −0.7% |
+
+The loop itself, with a stub gateway and a tool that does nothing, so a real call adds the tool and two round trips:
+
+| Row | |
+|---|---|
+| `task_one_tool_call` | 31.0 µs |
+| `task_four_tool_calls_at_once` | 244.9 µs, three threads of it |
+| `tool_result_wrap_clean_4k` | 42.1 µs |
+| `tool_result_wrap_marked_4k` | 85.4 µs |
+
+- `bench-history.csv` has 234 rows at 2.3.0, one sweep ending at a load of 3.3: median +0.1% against 2.2.5's rows. Two
+  earlier sweeps ran beside other sessions' VMs at loads of 7–9 and were discarded, as they read +9% and +10.5% on code
+  the interleaved run reads flat.
+- **Every span is back to one lookup.** The new attributes cost `otlp_encode_span` 12.0 → 13.9 µs, on spans that could not
+  hold them. Asked of a tool span alone, `otlp_ring_enqueue` reads +1.3% and `otlp_encode_span_child` +3.6% over five
+  rounds. ⚠ `otlp_encode_span` still reads +10.3%, 13.05 → 14.38 µs. The rows either side, which run the same encoder, say
+  that is mostly placement, and it is not claimed as nothing.
+- **`tool_execute_no_gate` +13% and `tool_execute_gated` +10.7%**, about 3 ns: the call is bound through a function now,
+  and reads what the loop put on the input. Real, and against a tool of any size it is not a cost.
+- `crew_runner_10_tasks_parallel_4_quiet` +11.9% and its `_llm_` rows −9% and −10% are B27, the rows that measure the
+  heap's position. `lt_aggregate_100k_500workers` +9.3% is B18. `metrics_record_task` +20% is 2 ns of code nobody touched,
+  and the other rows past ±7% are the same: placement.
+
+### Tests
+
+- **`tests/orch_tool_loop.tcyr`, new: 361 assertions.** One section for each rule ADR 029 states, on a scripted gateway
+  whose bodies take a real response's path. Two calls meet at a barrier, which a run one at a time cannot pass, and a
+  model that obeys a hostile page has its call refused.
+- **74 mutants, every one killed.** Seven survived their first run. One was a guard written twice, now once, and six were
+  tests that could not fail, which is the point of running them. A reset arena keeps its bytes and the pool hands arenas out first in, first out, so a result
+  dangling into one read fine until every slot had been written over. A test that counted with the helper under test
+  agreed with its own mutant. A key is known by its prefix alone, so only an SSN shows what the redaction window is for.
+- **A call through the loop leaves 0 B on the global heap**, measured as `tests/orch_crew_arena.tcyr` measures a crew, for
+  one call, for two at once and for a refusal. A small real tool leaves 489 B (roadmap B41).
+- **Roadmap B7 item 9's repro**, in `tests/tools_builtin_delegate.tcyr`: every span of a delegated crew is in the call's
+  trace.
+
+### Verified
+
+- `check-symbols.sh` 3,057 definitions; `check-clean.sh` fmt 231, lint 231, doc 117, doctest 1 files; `deps --verify` 119;
+  then build, 103 suites and 10,721 assertions with 0 failed under `CYRIUS_DCE=1`, coverage 99% with the same 11
+  unreferenced as 2.2.5 and every new public name named by a test, `distlib --all --check`, examples, fuzz 4/4.
+- **Against a real socket:** the binary, a stub gateway speaking hoosh's wire, and `POST /api/v1/crews`. A sequential and
+  a parallel crew each ran two tools in one turn and answered, with the second request's roles `system, user, assistant,
+  tool, tool`, and `results[].tool_calls` said what each did. A crew with no tools sent no `tools` key and answered in the
+  oracle's three keys. A crew naming `vulnerability_scan` failed, naming it. SIGTERM shut it down cleanly.
+- **An independent review** of the loop found 14 defects, all fixed here. The worst: `delegate` kept a pointer into the
+  conversation's arena, so a delegated agent could read another task's bytes. Also a result's control bytes taking six
+  times the bytes the budget counted, a 4 MiB object leaving the pool at 170 MB, and ids that repeat across turns defeating
+  a journal. Its concurrency, grant and gate, and stop-path reviews came back clean.
+- ⚠ **Not run:** a live hoosh or provider, so the wire shapes are read from hoosh's source and not from a provider's
+  answer; the `ubuntu:26.04` CI replica; the aarch64 binary, which was built and not started. Nothing here is a change to
+  how the loop behaves on aarch64 that a suite would see, and the done word's fences are `_agnosai_crew_job_*`'s.
+
+### Not in this release
+
+- **`rust-old/` stays.** The condition on deleting it is not met: B7 (1), B10, B11, B15 and the JWT key are open. It is
+  pinned to 2.3.7, and D9 is the user's call before then.
+- **B33 is next, at 2.3.1.** A crew whose agent names no model still sends a guessed id, so agnostic's M6 needs it too.
+- **agnostic has to adopt this.** It needs `agnosai_orchestrator_with_tools` at engine init, and a preset that names its
+  36 unresolved tools will fail rather than run. No consumer was re-run against this release.
+- **A tool's own allocations stay on the global heap** (roadmap B41), and a crew on the global heap keeps its records for
+  good (B38).
+- **No event carries a tool call**, so a watcher sees nothing of a task's turns until F3.
+- **External MCP tools** wait on bote's client, and the registry needs nothing more for them.
+
 ## [2.2.5] — 2026-11-06
 
 agnostic's two reports from 2026-11-06, repaired, and kavach moved to its latest release. A task that declares
@@ -127,12 +279,14 @@ against 1.9–2.1. An earlier sweep ended at 6.6 with other work on the machine,
 
 - **`POST /api/v1/crews` takes no `output_schema`.** The route refuses the field, so the schema repair reaches
   embedding consumers and not the binary's REST callers. `agnosai_task_from_value` does read one.
-- **The binary's own crews stay on the global heap** (roadmap B38), and **sandhi leaves 480 B per exchange** (B39).
-  ADR 028 lists these with the rest of what still grows, and who owns each.
+- **The binary's own crews stay on the global heap** (roadmap B38), and **sandhi leaves 480 B per exchange** (B39),
+  more with more response headers, attributed site by site and added to agnostic's open report there. ADR 028 lists
+  these with the rest of what still grows, and who owns each.
 - **agnostic has to adopt this.** It builds specs with `agnosai_crew_new`, so its measurement does not move until it
   does. No consumer was re-run against this release.
-- **Every WASM call leaves about 1 MiB on the global heap, whatever its input** (roadmap B40). kavach's `wasm_exec`
-  allocates its stdout buffer on each call, 1,051,728 B measured, and takes no allocator. Found measuring the copy above.
+- **Every kavach exec keeps its 1 MiB capture buffer, whatever the payload writes** (roadmap B40). All nine backends
+  allocate it per exec and hand it to the `ExecResult`, and `sandbox_exec` takes no allocator, so agnosai cannot reach
+  it. Found measuring the copy above, and resident: 100 WASM calls took RSS from 7.4 MB to 110 MB. Filed in kavach.
 
 ### Verified
 
@@ -4530,7 +4684,7 @@ the OTLP/HTTP spec, not a Rust line.
   `bench-history.csv` goes 106 → 190 rows.**
 
   The six adversarial reports are kept verbatim in
-  [`docs/development/m12-bench-audit-2026-08-10.md`](docs/development/m12-bench-audit-2026-08-10.md)
+  [`docs/audit/m12-bench-audit-2026-08-10.md`](docs/audit/m12-bench-audit-2026-08-10.md)
   with triage. **Several shipped comments are known-wrong and are listed there
   rather than fixed** — read a file's section before editing its rows.
 
@@ -6306,7 +6460,7 @@ the OTLP/HTTP spec, not a Rust line.
 - **M7 audit (2026-08-04): three live defects, found by adversarial review of a
   fully green suite.** 43 findings confirmed across the eight sandbox modules,
   each verified by applying the mutation and re-running the tests —
-  [docs/development/m7-audit-2026-08-04.md](docs/development/m7-audit-2026-08-04.md).
+  [docs/audit/m7-audit-2026-08-04.md](docs/audit/m7-audit-2026-08-04.md).
   Coverage was 100% and 4,372 assertions passed throughout; reference coverage
   counts whether a symbol is *named* by a test, not whether an assertion would
   *fail* without it.

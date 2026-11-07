@@ -2,9 +2,28 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-06 (the 2.2.5 release gate).
+> Last refreshed: 2026-11-07 (the 2.3.0 release gate).
 
-## Now — 2.2.5
+## Now — 2.3.0
+
+| | |
+|---|---|
+| **version** | **2.3.0** (cut 2026-11-07, the bump script's UTC date; 2026-11-06 Pacific): the tool-calling harness. An agent is offered the tools it names, and the model calls them until it answers, under ADR 029's four rules. B7 items 8 and 9 hang on it, and `delegate`'s crew joins the caller's trace. The audits moved to `docs/audit/`, and the roadmap is now release pins from 2.3.1 to 2.7.2, with `rust-old/`'s deletion at 2.3.7 |
+| **cyrius pin** | **6.7.18**, unchanged: still the latest tag |
+| **tests** | **103 suites, 10,721 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1 present. 2.2.5's tree reads 10,281. The +440 is mostly the new `orch_tool_loop` 361, with `llm_hoosh` +40 and the rest in `telemetry_wiring`, `tools_builtin_delegate` and `server_routes_crews`. 74 mutants, all killed. `sandbox_spawn` fails one assertion in a tree under `/tmp`, as it asserts a spawned `pwd` holds no `/tmp` |
+| **coverage** | **99%**: 105/105 files, 1,772/1,783 fns (gate `--min 80`), the same 11 unreferenced as 2.2.5. Every new public name is named by a test. The loop's internals are `_`-prefixed, as only `crew_runner` calls them |
+| **dist** | `dist/agnosai.cyr` 43,076 lines + `dist/agnosai-guard.cyr` 1,014, both v2.3.0. Sidecars **6 / 1** leaves, unchanged. `src/tool_loop.cyr` joins `[lib]` before `src/orchestrator/crew_runner.cyr`. ⚠ `distlib` warns of 34 names undefined on `x86_64-windows` and `x86_64-agnos`. 2.2.5 prints the same list |
+| **binary** | `build/agnosai` **2,977,840 B** (2.2.5: 2,939,232). aarch64 **6,966,880 B** (6,899,584), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.3.0"`, ran a sequential and a parallel crew through two tools against a stub gateway on a socket, reports them in `results[].tool_calls`, fails a crew naming a tool it does not hold, and exits cleanly on SIGTERM |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh` 3,057 definitions across 116 files; `check-clean.sh` fmt 231, lint 231, doc 117, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist. Then build, tests under DCE, coverage, `distlib --all --check`, examples, fuzz 4/4, `cyrius bench`. Not run: the `ubuntu:26.04` CI replica, and a live hoosh or provider |
+| **benchmarks** | The interleaved A/B against a 2.2.5 build, three rounds of the five files this touches, reads **median +0.3% across 172 rows**, 146 within ±5%, at a load of about 3.5, and the tool-less `run_crew_*` rows are flat. `task_one_tool_call` 31.0 µs and `task_four_tool_calls_at_once` 244.9 µs are new. `otlp_encode_span` reads +10.3%, with the rows either side flat (CHANGELOG 2.3.0 *Performance*). `bench-history.csv` has 234 rows at 2.3.0, one sweep ending at a load of 3.3: median +0.1% against 2.2.5's rows, 141 of 230 within ±5%. Two earlier sweeps of this code ran beside other sessions' VMs at loads of 7–9, read medians of +9% and +10.5%, and were discarded under the rule below |
+| **bytes per crew** | **0** for a call through the loop, for one call, two at once and a refusal. A small real tool leaves 489 B a call on the global heap (B41), and a crew off ADR 028 keeps its records for good (B38). The rest as 2.2.5 below |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4 and needs `agnosai_orchestrator_with_tools` at engine init to get the loop, which answers its `handoff.md` §8. Until then nothing changes for it. thoth's guard profile is unchanged. ⚠ A crew naming a tool the registry does not hold now fails, so agnostic's presets need its resolver first |
+
+Direct deps: as 2.2.5 below.
+
+### 2.2.5 — the release (2026-11-06)
 
 | | |
 |---|---|
@@ -1874,7 +1893,7 @@ None of the three was silent — each exits non-zero. They were simply never
 invoked. Read the `N passed, M failed` line on all of them.
 
 **65 suites, all passing** was true at the M7 audit, whose 43 findings are **all fixed** as of
-2026-08-05 — `docs/development/m7-audit-2026-08-04.md` marks each one in place
+2026-08-05 — `docs/audit/m7-audit-2026-08-04.md` marks each one in place
 and `roadmap.md`'s M7 section has the shape of the remediation. The sandbox
 suites grew **627 → 727 assertions** working it:
 
@@ -2143,7 +2162,7 @@ the Tests section for how they had stopped. `benches/llm.bcyr`,
 to touch `src/llm/` at all, and `harness.bcyr` is the relocated `noop` floor.
 
 ⚠ **The audit is remediated, and the audit itself had six errors.**
-[`m12-bench-audit-2026-08-10.md`](m12-bench-audit-2026-08-10.md) carries the six
+[`m12-bench-audit-2026-08-10.md`](../audit/m12-bench-audit-2026-08-10.md) carries the six
 adversarial reports verbatim, plus a *Known errors IN this document* section —
 a wrong `.bcyr` count used as load-bearing reasoning, 15-vs-14 field arithmetic,
 a bad struct citation, a wrong envelope byte count, "fires twice" where three

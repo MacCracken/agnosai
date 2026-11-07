@@ -822,8 +822,28 @@ fn _t_audit_trail_owns_the_crew_name(): i64 {
     return 0;
 }
 
+# ADR 029: the one key the route adds to the oracle's wire, only when tools ran.
+fn _t_task_result_shape(): i64 {
+    var a = default_alloc();
+    var plain = agnosai_task_result_new(str_from("t1"), str_from("done"), AGNOSAI_STATUS_COMPLETED);
+    agnosai_task_result_with_metadata(plain, str_from("model"), bayan_json_v_str_new(str_from("m")));
+    assert(str_eq_cstr(bayan_json_v_build(_agnosai_route_task_result_a(a, plain)),
+        "{\"task_id\":\"t1\",\"output\":\"done\",\"status\":\"completed\"}") == 1,
+      "a task that called no tool reads exactly as the oracle's did");
+
+    var used = agnosai_task_result_new(str_from("t2"), str_from("done"), AGNOSAI_STATUS_COMPLETED);
+    var calls = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(calls, bayan_json_v_str_new(str_from("a call")));
+    agnosai_task_result_with_metadata(used, str_from("tool_calls"), calls);
+    var v = _agnosai_route_task_result_a(a, used);
+    assert_eq(bayan_json_v_obj_get_by_cstr(v, "tool_calls"), calls, "one that did carries what they did");
+    assert_eq(bayan_json_v_obj_get_by_cstr(v, "metadata"), 0, "and no more of its metadata than that");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
+    _t_task_result_shape();
     sakshi_set_level(SK_FATAL);
 
     _t_crew_id_is_case_insensitive();

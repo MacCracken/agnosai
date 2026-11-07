@@ -35,6 +35,9 @@ Tools run untrusted code from community authors or legacy Python scripts.
 | Filesystem access | WASM: no filesystem capability; cx: landlock read-only on the interpreter's directory; ⚠ Process / Python / OCI: a controlled working directory only (see *Accepted Risks*) |
 | Network access | WASM: no network capability; cx: a new network namespace, and the cx tier **fails closed** where one cannot be made (CHANGELOG 2.2.1); ⚠ Process / Python / OCI: none |
 | A model steered to a host its task did not declare (the system under test writes tool output, so a page can ask for it) | A consumer's gate ([ADR 025](../adr/025-a-tool-call-passes-a-consumers-gate.md)), asked at `agnosai_tool_execute_for` and of each URL, so no tool implements it and no path can skip it. ⚠ With no gate, a tool's target is still the model's to choose, under the SSRF guard alone |
+| A model that reads what the system under test wrote, and does what it says | [ADR 029](../adr/029-the-tool-loop.md): nothing a tool writes reaches anything but the model. An agent's tools are fixed before its first call, and the limits are the process's, so a page cannot grant a tool or a budget. A result goes to the model inside the markers it is told never to obey, with `user_input` and `system_instructions` rewritten inside so a page cannot end them, and with control bytes and anything that is not UTF-8 taken out, so a binary page cannot cost a task its transcript. The injection table is a signal, and a flagged result is annotated, not held back: it is heuristic, and holding back on it would let a page blind its own QA. `agnosai_tool_gate_with_result` holds one back for a consumer who wants that. ⚠ A model can still be misled by what it reads: its calls are bounded, its claims are not, which is why a task's record keeps what the tool really said |
+| Calls that are harmless alone and leak together | `agnosai_tool_gate_with_batch` sees a turn's calls as a set, before any of them runs, and refuses all or none (ADR 029). ⚠ With no gate, nothing does |
+| A model that never stops | At most 16 turns, 8 calls a turn, 32 KiB a result and 256 KiB of transcript a task, plus the crew's deadline and a cancel, each read between turns. A result's cost follows what is read of it, not its size. ⚠ A tool already running is not interrupted: the deadline is cooperative, and each tier's own deadline is what stops one |
 | A redirect off the checked target | Every hop goes back through `agnosai_tool_url_ok` before its request is made (`agnosai_guarded_fetch_hops`), so the check does not end at the first 302. `load_testing` follows no redirect |
 | A gate's admission reaching cloud credentials | An ADMIT gets a declared host past `agnosai_is_safe_url` and no further: 169.254/16, `fd00:ec2::254`, `metadata.google.internal`, `metadata.goog` and non-HTTP schemes are refused whatever the gate says (`agnosai_url_is_admissible`), and any verdict but PASS or ADMIT refuses. ⚠ Neither check resolves names, so a declared name that resolves somewhere it should not is the gate's to answer for |
 | A private address spelled so the guard and the dialer read it differently | The guard judges a host by `sandhi_net_parse_ipv4`, the parser that dials, as well as the WHATWG reading, and a host must pass under both. Until 2.2.4 `0127.0.0.1` read as public octal and connected to loopback (CHANGELOG 2.2.4 *Security*). A name is compared with its root dots dropped, as a resolver reads it, so `foo.internal.` is `foo.internal` |
@@ -152,6 +155,15 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
 
 ## Accepted Risks
 
+- **A crew's author grants its tools** ([ADR 029](../adr/029-the-tool-loop.md)): anyone who may `POST /api/v1/crews` can
+  name a tool for a model to run. They could already call it on `/mcp`, under the same auth, so this widens what a
+  model can do and not what a caller can. A consumer's gate is the place to narrow it.
+- **`delegate` hands out what the delegate holds** (ADR 029): a delegated crew's agents hold what their own definitions
+  name, not the delegating agent's narrower set, and nothing bounds how deep it nests. It is opt-in and off in the
+  binary. F2's "authority only narrows" and B6's cap close this.
+- **Each WASM call keeps about 1 MiB, resident** (roadmap B40, filed in kavach): a caller that can
+  drive WASM tools can grow this process by that much per call, and only a restart gives it back.
+  Bound it by rate-limiting tool calls until kavach stops allocating the buffer per exec.
 - **A crew arena is reused** ([ADR 028](../adr/028-a-crew-lives-in-an-arena-its-consumer-gives-back.md)):
   the memory a crew lived in serves the next one, which in a multi-tenant consumer may be another
   tenant's. It is zeroed on release, every byte handed out, so no allocation can read a previous

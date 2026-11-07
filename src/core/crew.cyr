@@ -47,7 +47,9 @@ enum AgnosaiCrewSpecOff {
     AGN_CREW_TRACE_PARENT = 56;
     AGN_CREW_ARENA = 64;
     AGN_CREW_RUNS = 72;
-    AGN_CREW_SIZE = 80;
+    # 1 for a crew a tool started on an agent's behalf (ADR 029).
+    AGN_CREW_DELEGATED = 80;
+    AGN_CREW_SIZE = 88;
 }
 
 # CrewState heap layout — 32 bytes.
@@ -129,6 +131,7 @@ fn agnosai_crew_new_a(a, name: Str): i64 {
     store64(c + AGN_CREW_TRACE_PARENT, 0);
     store64(c + AGN_CREW_ARENA, 0);
     store64(c + AGN_CREW_RUNS, 0);
+    store64(c + AGN_CREW_DELEGATED, 0);
     return c;
 }
 
@@ -197,6 +200,21 @@ fn agnosai_crew_with_trace_parent(c, tp: Str): i64 {
 # The crew's inbound `traceparent` (a private copy), or 0 for none.
 fn agnosai_crew_trace_parent(c): i64 {
     return load64(c + AGN_CREW_TRACE_PARENT);
+}
+
+# Say a tool started this crew on an agent's behalf. Returns the crew.
+#
+# The semantic conventions say a tool that spins up a workflow to delegate SHOULD NOT report an
+# `invoke_workflow` span, so with a `traceparent` this crew's `invoke_agent` spans go straight
+# under the tool's span. Not serialised, like the `traceparent` it qualifies.
+fn agnosai_crew_with_delegated(c, delegated): i64 {
+    store64(c + AGN_CREW_DELEGATED, delegated);
+    return c;
+}
+
+# Whether a tool started this crew on an agent's behalf.
+fn agnosai_crew_delegated(c): i64 {
+    return load64(c + AGN_CREW_DELEGATED);
 }
 
 # Attach a metadata key-value pair. `value` is a bayan JSON value.

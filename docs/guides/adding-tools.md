@@ -123,6 +123,80 @@ with `&agnosai_tool_url_ok`, as `security_audit` does.
 
 `agnosai_task_result_record_tool_call(result, tool, out)` keeps a call's name, result and effect on
 its task result, under `metadata.tool_calls`, so a consumer can label a measured number as measured.
+The tool loop writes these itself.
+
+## Giving tools to a crew
+
+An orchestrator with a registry runs a crew's tools ([ADR 029](../adr/029-the-tool-loop.md)). The registry stays
+yours, so serve the same one on `/mcp` or register to it at any time:
+
+```cyrius
+var tools = agnosai_tool_registry_new();
+agnosai_tool_registry_register(tools, my_tool());
+agnosai_orchestrator_with_tools(orchestrator, tools);
+```
+
+An agent is offered exactly the tools its `tools` names, and a name the registry does not hold fails the task before
+the first call, naming the tool. An agent that names none is offered none. With no registry on the orchestrator, an
+agent's `tools` are words in its prompt.
+
+The model calls them until it answers, within 16 turns, 8 calls a turn, 32 KiB a result and 256 KiB of results a task
+(`agnosai_tool_loop_set_limits`). What each call did is on the task result, in the order the model made them, under
+`metadata.tool_calls`: `id`, `tool`, `arguments`, `effect`, `success`, `result` or `error`, and `flagged`, `held_back` or
+`asked_for` when they apply. `effect` is `committed`, `none` (it never started) or `unknown` (it may have run).
+
+⚠ **An input lasts as long as its call.** Through the loop it lives in an arena that goes back with the task, so a tool
+that keeps anything from it past `execute_fp`'s return, for a crew it submits or a thread it leaves running, must copy it
+first. What a tool returns is copied for you.
+
+**A journal** writes every call down before it runs. A call it refuses does not start, and an intent with no result
+after a crash reads as an unknown effect, so have it on disk before you return. Key entries on the task and the call's id
+together: an id is unique within its task, and only there.
+
+```cyrius
+fn my_journal(ctx, phase, call): i64 {
+    if (phase == AGNOSAI_TOOL_PHASE_INTENT) {
+        if (my_store_intent(agnosai_task_id(agnosai_tool_call_task(call)), agnosai_tool_call_id(call),
+            agnosai_tool_call_name(call), agnosai_tool_call_arguments(call)) == 0) {
+            return str_from("the journal is full");
+        }
+        return 0;
+    }
+    my_store_result(agnosai_task_id(agnosai_tool_call_task(call)), agnosai_tool_call_id(call),
+      agnosai_tool_call_effect(call));
+    return 0;
+}
+
+agnosai_orchestrator_with_tool_journal(orchestrator, agnosai_tool_journal_new(&my_journal, 0));
+```
+
+What it is given dies with the task, so copy what you keep. A gate has two more callbacks for the loop:
+
+```cyrius
+# Judge the calls of one turn as a set, before any runs. A reason refuses them all.
+fn my_gate_batch(ctx, calls): i64 {
+    if (reads_a_secret(calls) == 1 && posts_to_the_web(calls) == 1) {
+        return str_from("those leak together");
+    }
+    return 0;
+}
+
+# Answer text for the model to read instead of a result, or 0 to let it through. Asked only about a
+# call that ran. `out` may be 0 for a tool that answered nothing, and `finding` is what the injection
+# scan said, or 0. The task's record keeps the result either way.
+fn my_gate_result(ctx, input, out, finding): i64 {
+    if (finding != 0) { return str_from("result held back: it matched an injection pattern"); }
+    return 0;
+}
+
+var gate = agnosai_tool_gate_new(&my_gate_call, &my_gate_url, 0);
+agnosai_tool_gate_with_batch(gate, &my_gate_batch);
+agnosai_tool_gate_with_result(gate, &my_gate_result);
+```
+
+A result reaches the model as data, inside the markers its system prompt says never to obey, and by default a flagged
+one is annotated rather than held back: the scan is a heuristic, and a page should not be able to hide itself from a
+test by saying a magic phrase.
 
 ## Naming rules
 

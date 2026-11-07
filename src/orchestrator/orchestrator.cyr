@@ -54,7 +54,10 @@ enum AgnosaiOrchestratorOff {
     AGN_OR_MUTEX = 56;
     AGN_OR_ENDED = 64;
     AGN_OR_ENDED_HEAD = 72;
-    AGN_OR_SIZE = 80;
+    # The registry agents get their tools from, and the journal, each 0 for none (ADR 029).
+    AGN_OR_TOOLS = 80;
+    AGN_OR_TOOL_JOURNAL = 88;
+    AGN_OR_SIZE = 96;
 }
 
 # Create an orchestrator over a resource budget.
@@ -74,6 +77,8 @@ fn agnosai_orchestrator_new(budget): i64 {
     store64(o + AGN_OR_MUTEX, mutex_new());
     store64(o + AGN_OR_ENDED, vec_new());
     store64(o + AGN_OR_ENDED_HEAD, 0);
+    store64(o + AGN_OR_TOOLS, 0);
+    store64(o + AGN_OR_TOOL_JOURNAL, 0);
     return o;
 }
 
@@ -88,6 +93,27 @@ fn agnosai_orchestrator_with_events(o, bus): i64 {
 fn agnosai_orchestrator_with_llm_url(o, url: Str, api_key: Str): i64 {
     store64(o + AGN_OR_LLM_URL, url);
     store64(o + AGN_OR_LLM_KEY, api_key);
+    return o;
+}
+
+# Hand the orchestrator the registry its crews' agents get their tools from (ADR 029).
+#
+# The registry stays the caller's: it can register to it at any time, hold it to a gate, and serve
+# the same one on `/mcp`. With none, every crew runs as it did before the tool loop: an agent's
+# `tools` are words in its prompt. Each crew reads this when it is registered.
+fn agnosai_orchestrator_with_tools(o, registry): i64 {
+    store64(o + AGN_OR_TOOLS, registry);
+    return o;
+}
+
+# The registry crews get their tools from, or 0.
+fn agnosai_orchestrator_tools(o): i64 {
+    return load64(o + AGN_OR_TOOLS);
+}
+
+# Attach a journal every tool call is written to before it runs (`agnosai_tool_journal_new`).
+fn agnosai_orchestrator_with_tool_journal(o, journal): i64 {
+    store64(o + AGN_OR_TOOL_JOURNAL, journal);
     return o;
 }
 
@@ -364,6 +390,8 @@ fn _agnosai_orch_register(o, spec): i64 {
 
     var runner = agnosai_crew_runner_new(spec);
     agnosai_crew_runner_with_audit(runner, load64(o + AGN_OR_AUDIT));
+    agnosai_crew_runner_with_tools(runner, load64(o + AGN_OR_TOOLS),
+      load64(o + AGN_OR_TOOL_JOURNAL));
 
     # The state and the cancel flag, published together. ⚠ A flag says a runner holds this
     # crew, and `cancel_crew` and `forget_crew` both go by it, so there can be no moment with

@@ -821,33 +821,62 @@ fn _agnosai_crew_invalid_result_a(a, task, content: Str, verr: Str, attempts, re
 # minting one per task is 32 bytes for good on the global heap.
 var _AGNOSAI_CREW_RETRY = agnosai_retry_config_default();
 
-# The body of `agnosai_execute_task_in_crew_a`. `span` is the task's
-# `invoke_agent` span and `self_sc` its context — both 0 with telemetry off.
-fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, span,
-  self_sc): i64 {
-    var start_ns = clock_now_ns();
-    var task_id = agnosai_task_id(task);
+# The result of a task its tools stopped: status Failed, the reason as `output` and as `error`.
+#
+# Not `_agnosai_crew_error_result_a`, which says "LLM error: ": the gateway did nothing wrong here.
+# Failed before any call, for a tool no registry holds. Failed after some, at the step limit or a
+# cancel, and then the caller adds what those calls cost, as for any other failure.
+fn _agnosai_crew_tool_failed_result_a(a, task, why: Str, start_ns): i64 {
+    var r = agnosai_task_result_new_a(a, agnosai_task_id(task), why, AGNOSAI_STATUS_FAILED);
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "error"),
+      bayan_json_v_str_new_a(a, why));
+    agnosai_task_result_with_metadata_a(a, r, str_from_a(a, "task_duration_ms"),
+      bayan_json_v_int_new_a(a, _agnosai_crew_elapsed_ms(start_ns)));
+    return r;
+}
 
-    if (client == 0) {
-        _agnosai_crew_log_a(a, SK_DEBUG, "executing task (placeholder - no LLM client)", 42,
-          task_id, _agnosai_crew_agent_label_a(a, agent));
-        return _agnosai_crew_placeholder_result_a(a, task, agent, start_ns);
+# Ask the model, and for as long as it answers with tool calls, take the turn and ask again.
+#
+# `st` is the task's conversation with its tools (ADR 029), or 0, which is one call. Returns 0 with
+# the last response through `out_resp`, or an error Str, which leaves the last answer there: those
+# calls were paid for. A task's tokens and cost count every call, as a validation retry's do.
+#
+# An attempt `agnosai_with_retry_a` repeats is only the chat call. A tool already ran once its
+# result is in the request, and nothing here runs one again.
+fn _agnosai_crew_converse_a(ra, task_id: Str, client, request, trace, st, out_resp): i64 {
+    var err = agnosai_with_retry_a(ra, _AGNOSAI_CREW_RETRY, task_id, &_agnosai_crew_infer_fp,
+      _agnosai_crew_infer_ctx_new_a(ra, client, request, trace), out_resp);
+    if (st == 0) { return err; }
+    while (err == 0) {
+        var resp = load64(out_resp);
+        if (agnosai_inference_response_tool_calls(resp) == 0) { return 0; }
+        var stop = _agnosai_tool_turn_a(st, request, resp);
+        if (stop != 0) { return stop; }
+        err = agnosai_with_retry_a(ra, _AGNOSAI_CREW_RETRY, task_id, &_agnosai_crew_infer_fp,
+          _agnosai_crew_infer_ctx_new_a(ra, client, request, trace), out_resp);
+        if (err == 0) { agnosai_inference_response_carry_usage(load64(out_resp), resp); }
     }
+    return err;
+}
 
-    _agnosai_crew_log_a(a, SK_DEBUG, "executing task via LLM", 22, task_id,
-      _agnosai_crew_agent_label_a(a, agent));
-
-    var model = _agnosai_crew_select_model_a(a, agent);
-    # The agent has one configured model, so the span says which (the pinned
-    # convention's `gen_ai.request.model` on `invoke_agent`). A no-op at span 0.
-    agnosai_genai_span_set_request_model(span, model);
-    var request = _agnosai_crew_build_request_a(a, task, agent, model, 0);
-    var config = _AGNOSAI_CREW_RETRY;
-    var ctx = _agnosai_crew_infer_ctx_new_a(a, client, request, self_sc);
+# Answer `task` with `client`, and return its result.
+#
+# `a` is what the result lives in, and `ra` the conversation: the same allocator for a task with
+# no tools, and a turn's arena for one with (`src/tool_loop.cyr`). ⚠ **So nothing that reaches the
+# result may point into `ra`.** The final response and the error are copied out below, and that is
+# the only place a copy is made: with no tools the two are one allocator, and no byte of this path
+# is any different from what it was.
+fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, self_sc, model: Str,
+  st, start_ns): i64 {
+    var task_id = agnosai_task_id(task);
+    var request = _agnosai_crew_build_request_a(ra, task, agent, model, 0);
+    if (st != 0) {
+        agnosai_inference_request_with_tools(request, _agnosai_tool_task_definitions(st));
+    }
 
     var resp: i64[1];
     store64(&resp, 0);
-    var err = agnosai_with_retry_a(a, config, task_id, &_agnosai_crew_infer_fp, ctx, &resp);
+    var err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, &resp);
 
     # The output-schema validation loop. Every answer is checked, the last one
     # included: `AGNOSAI_MAX_VALIDATION_RETRIES` retries are each followed by a
@@ -860,43 +889,77 @@ fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, 
     # `extracted` is the text that was validated, so a fenced answer that passes
     # is returned without its fence, and a consumer that parses `output` need not
     # strip it again.
+    #
+    # ⚠ **A task that has called a tool keeps its transcript through a retry** (ADR 029). Rebuilt,
+    # the model would lose what its tools said and have to run them again, with whatever effect
+    # that has. The retry prompt goes on the end instead. Each adds one failed answer, so the
+    # transcript grows by `AGNOSAI_MAX_VALIDATION_RETRIES` of them at most, and never doubles.
     var schema = agnosai_task_output_schema(task);
     var verr = 0;
     var attempts = 1;
     var extracted: i64[1];
     store64(&extracted, 0);
     if (schema != 0 && err == 0) {
-        var original_prompt = _agnosai_crew_task_prompt_a(a, task);
+        var original_prompt = _agnosai_crew_task_prompt_a(ra, task);
         # Hoisted out of the retry loop — a constant minted per attempt.
-        var k_failed_output = str_from_a(a, "failed_output");
+        var k_failed_output = str_from_a(ra, "failed_output");
         while (err == 0) {
-            verr = agnosai_extract_and_validate_a(a,
+            verr = agnosai_extract_and_validate_a(ra,
               agnosai_inference_response_content(load64(&resp)), schema, &extracted);
             if (verr == 0 || attempts > AGNOSAI_MAX_VALIDATION_RETRIES) { break; }
 
-            agnosai_validation_log_retry_a(a, task_id, attempts, verr);
+            agnosai_validation_log_retry_a(ra, task_id, attempts, verr);
 
             # The failed output is sanitized before it goes back to the model —
             # it is model output being fed to a model, which is an injection
             # vector the oracle closes here.
-            var retry_prompt = agnosai_build_retry_prompt_a(a, original_prompt,
-              agnosai_prompt_sanitize_a(a, load64(&extracted), k_failed_output), verr, schema);
+            #
+            # With tools it is unmarked first: a model repeating a page repeats its `</user_input>`
+            # too, and this goes in a user turn, not a tool's.
+            var failed_text = load64(&extracted);
+            if (st != 0) { failed_text = _agnosai_tool_unmark_a(ra, failed_text); }
+            var retry_prompt = agnosai_build_retry_prompt_a(ra, original_prompt,
+              agnosai_prompt_sanitize_a(ra, failed_text, k_failed_output), verr, schema);
 
-            var retry_req = _agnosai_crew_build_request_a(a, task, agent,
-              _agnosai_crew_select_model_a(a, agent), retry_prompt);
-            agnosai_inference_request_with_temperature_milli(retry_req,
+            var called = 0;
+            if (st != 0) { if (_agnosai_tool_task_steps(st) > 0) { called = 1; } }
+            if (called == 1) {
+                agnosai_inference_request_say(request, AGNOSAI_ROLE_USER, retry_prompt);
+            } else {
+                request = _agnosai_crew_build_request_a(ra, task, agent,
+                  _agnosai_crew_select_model_a(ra, agent), retry_prompt);
+                if (st != 0) {
+                    agnosai_inference_request_with_tools(request, _agnosai_tool_task_definitions(st));
+                }
+            }
+            agnosai_inference_request_with_temperature_milli(request,
               AGNOSAI_CREW_RETRY_TEMPERATURE_MILLI);
 
             var prior = load64(&resp);
-            err = agnosai_with_retry_a(a, config, task_id, &_agnosai_crew_infer_fp,
-              _agnosai_crew_infer_ctx_new_a(a, client, retry_req, self_sc), &resp);
+            err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, &resp);
             attempts = attempts + 1;
-            if (err == 0) { agnosai_inference_response_carry_usage(load64(&resp), prior); }
+            # By what it holds and not by `err`: a retry that called a tool and then failed has a
+            # newer answer in `resp`, and the older calls were paid for too.
+            if (load64(&resp) != prior) {
+                agnosai_inference_response_carry_usage(load64(&resp), prior);
+            }
         }
     }
 
+    if (ra != a) {
+        if (load64(&resp) != 0) {
+            store64(&resp, agnosai_inference_response_clone_a(a, load64(&resp)));
+        }
+        if (err != 0) { err = str_clone_a(a, err); }
+        if (load64(&extracted) != 0) { store64(&extracted, str_clone_a(a, load64(&extracted))); }
+    }
+
     if (err != 0) {
-        var failed = _agnosai_crew_error_result_a(a, task, err, start_ns);
+        var failed = 0;
+        var stopped = 0;
+        if (st != 0) { stopped = _agnosai_tool_task_stopped(st); }
+        if (stopped == 1) { failed = _agnosai_crew_tool_failed_result_a(a, task, err, start_ns); }
+        else { failed = _agnosai_crew_error_result_a(a, task, err, start_ns); }
         # A retry that failed leaves the last answer in `resp`, and those calls were paid
         # for. A first call that failed leaves 0, and the shape the oracle's tests pin.
         if (load64(&resp) != 0) {
@@ -919,6 +982,64 @@ fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, 
 
     var result = agnosai_task_result_new_a(a, task_id, content, AGNOSAI_STATUS_COMPLETED);
     return _agnosai_crew_answer_metadata_a(a, result, response, start_ns, agent);
+}
+
+# `_agnosai_crew_answer_a` for a task whose agent holds tools, in an arena of its own.
+#
+# The arena is given back on the one way out. Pool empty and nothing to mint leaves `ra` the crew's
+# allocator, which costs a global-heap crew its transcript and nothing else.
+fn _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id: Str, self_sc,
+  model: Str, loop, start_ns): i64 {
+    var arena = _agnosai_tool_arena_acquire();
+    var ra = arena;
+    if (ra == 0) { ra = a; }
+
+    var miss: i64[1];
+    var st = _agnosai_tool_task_new_a(a, ra, loop, task, agent, self_sc, &miss);
+    var result = 0;
+    if (st == 0) {
+        _agnosai_crew_log_a(a, SK_WARN, "task refused: its agent names a tool it cannot have", 51,
+          agnosai_task_id(task), load64(&miss));
+        result = _agnosai_crew_tool_failed_result_a(a, task, load64(&miss), start_ns);
+    } else {
+        result = _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id, self_sc,
+          model, st, start_ns);
+        _agnosai_tool_task_finish_a(st, result);
+    }
+
+    if (arena != 0) { _agnosai_tool_arena_release(arena); }
+    return result;
+}
+
+# The body of `agnosai_execute_task_with_tools_a`. `span` is the task's
+# `invoke_agent` span and `self_sc` its context — both 0 with telemetry off.
+fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, span,
+  self_sc, loop): i64 {
+    var start_ns = clock_now_ns();
+    var task_id = agnosai_task_id(task);
+
+    if (client == 0) {
+        _agnosai_crew_log_a(a, SK_DEBUG, "executing task (placeholder - no LLM client)", 42,
+          task_id, _agnosai_crew_agent_label_a(a, agent));
+        return _agnosai_crew_placeholder_result_a(a, task, agent, start_ns);
+    }
+
+    _agnosai_crew_log_a(a, SK_DEBUG, "executing task via LLM", 22, task_id,
+      _agnosai_crew_agent_label_a(a, agent));
+
+    var model = _agnosai_crew_select_model_a(a, agent);
+    # The agent has one configured model, so the span says which (the pinned
+    # convention's `gen_ai.request.model` on `invoke_agent`). A no-op at span 0.
+    agnosai_genai_span_set_request_model(span, model);
+
+    if (loop != 0 && agent != 0) {
+        if (vec_len(agnosai_agent_tools(agent)) > 0) {
+            return _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id,
+              self_sc, model, loop, start_ns);
+        }
+    }
+    return _agnosai_crew_answer_a(a, a, task, agent, client, event_tx, crew_id, self_sc, model, 0,
+      start_ns);
 }
 
 # Execute one task of a crew via the LLM, or return the placeholder when there
@@ -948,6 +1069,17 @@ fn agnosai_execute_task_in_crew(task, agent, client, event_tx, crew_id: Str, par
 # `agnosai_execute_task_in_crew`, with everything the task costs in allocator `a`.
 fn agnosai_execute_task_in_crew_a(a, task, agent, client, event_tx, crew_id: Str,
   parent_sc): i64 {
+    return agnosai_execute_task_with_tools_a(a, task, agent, client, event_tx, crew_id, parent_sc,
+      0);
+}
+
+# `agnosai_execute_task_in_crew_a`, with the crew's tools (ADR 029).
+#
+# `loop` is from `agnosai_tool_loop_new_a`, or 0 for none: an agent's tools are then only words in
+# its system prompt, which is all they were before ADR 029. The agent is offered the tools it
+# names, the model calls them until it answers, and each call leaves a record on the result.
+fn agnosai_execute_task_with_tools_a(a, task, agent, client, event_tx, crew_id: Str, parent_sc,
+  loop): i64 {
     # ⚠ Built ONLY with the exporter on. Off — the common case — this costs one
     # load and a compare, no clock read, and the body is handed span 0 and
     # context 0.
@@ -967,7 +1099,7 @@ fn agnosai_execute_task_in_crew_a(a, task, agent, client, event_tx, crew_id: Str
     }
 
     var result = _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id, span,
-      self_sc);
+      self_sc, loop);
 
     # Recorded ONCE, from the result: a failed inference is a Failed result, not
     # an early return, so there is no other exit to cover.
@@ -1014,7 +1146,9 @@ enum AgnosaiCrewJobOff {
     AGN_CJ_TRACE = 56;
     AGN_CJ_ALLOC = 64;
     AGN_CJ_DONE = 72;
-    AGN_CJ_SIZE = 80;
+    # The crew's tools, or 0 (ADR 029).
+    AGN_CJ_LOOP = 80;
+    AGN_CJ_SIZE = 88;
 }
 
 # Say a job is over, and wake the wave if it is parked on that.
@@ -1070,9 +1204,9 @@ fn _agnosai_crew_worker(job): i64 {
         _agnosai_crew_job_finish(job);
         return 0;
     }
-    store64(job + AGN_CJ_RESULT, agnosai_execute_task_in_crew_a(a, task,
+    store64(job + AGN_CJ_RESULT, agnosai_execute_task_with_tools_a(a, task,
         load64(job + AGN_CJ_AGENT), load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX),
-        load64(job + AGN_CJ_CREW_ID), load64(job + AGN_CJ_TRACE)));
+        load64(job + AGN_CJ_CREW_ID), load64(job + AGN_CJ_TRACE), load64(job + AGN_CJ_LOOP)));
     _agnosai_crew_job_finish(job);
     return 0;
 }
@@ -1096,7 +1230,12 @@ enum AgnosaiCrewRunnerOff {
     AGN_CR_TRACE = 64;
     # The crew's allocator (ADR 028), read once from the spec.
     AGN_CR_ALLOC = 72;
-    AGN_CR_SIZE = 80;
+    # The registry its agents' tools come from, or 0, and the journal, or 0 (ADR 029).
+    AGN_CR_TOOLS = 80;
+    AGN_CR_JOURNAL = 88;
+    # What every task is handed, built when the run starts: a deadline may be set up to then.
+    AGN_CR_LOOP = 96;
+    AGN_CR_SIZE = 104;
 }
 
 # Initial chunk for the sequential run's audit scratch.
@@ -1124,6 +1263,9 @@ fn agnosai_crew_runner_new(spec): i64 {
     store64(r + AGN_CR_DEADLINE_NS, 0);
     store64(r + AGN_CR_TIMED_OUT, 0);
     store64(r + AGN_CR_TRACE, 0);
+    store64(r + AGN_CR_TOOLS, 0);
+    store64(r + AGN_CR_JOURNAL, 0);
+    store64(r + AGN_CR_LOOP, 0);
     return r;
 }
 
@@ -1142,6 +1284,14 @@ fn agnosai_crew_runner_with_events(r, event_tx): i64 {
 # Attach an audit chain.
 fn agnosai_crew_runner_with_audit(r, chain): i64 {
     store64(r + AGN_CR_AUDIT, chain);
+    return r;
+}
+
+# Attach the registry this crew's agents get their tools from, and a journal (either may be 0).
+# Without a registry an agent's tools are words in its prompt (ADR 029).
+fn agnosai_crew_runner_with_tools(r, registry, journal): i64 {
+    store64(r + AGN_CR_TOOLS, registry);
+    store64(r + AGN_CR_JOURNAL, journal);
     return r;
 }
 
@@ -1386,8 +1536,9 @@ fn _agnosai_crew_run_sequential(r): i64 {
         }
 
         agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
-        var result = agnosai_execute_task_in_crew_a(a, task, agent, client,
-          load64(r + AGN_CR_EVENT_TX), agnosai_crew_id(spec), load64(r + AGN_CR_TRACE));
+        var result = agnosai_execute_task_with_tools_a(a, task, agent, client,
+          load64(r + AGN_CR_EVENT_TX), agnosai_crew_id(spec), load64(r + AGN_CR_TRACE),
+          load64(r + AGN_CR_LOOP));
         agnosai_task_with_status(task, agnosai_task_result_status(result));
 
         if (wants_events == 1) {
@@ -1474,6 +1625,7 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         store64(job + AGN_CJ_TRACE, load64(r + AGN_CR_TRACE));
         store64(job + AGN_CJ_ALLOC, a);
         store64(job + AGN_CJ_DONE, 0);
+        store64(job + AGN_CJ_LOOP, load64(r + AGN_CR_LOOP));
         vec_push_a(a, jobs, job);
     }
 
@@ -1845,14 +1997,27 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     var span = 0;
     var self_sc = 0;
     var span_t0 = 0;
+    #
+    # A crew a tool started has no span of its own, with a parent to hang its tasks from: the
+    # conventions say a tool delegating to a sub-agent SHOULD NOT report one, so each
+    # `invoke_agent` span goes straight under the tool's (ADR 029).
     if (agnosai_telemetry_exporter() != 0) {
         parent_sc = agnosai_otlp_span_context_parse(agnosai_crew_trace_parent(spec));
-        span = agnosai_genai_workflow_span(agnosai_crew_id(spec), agnosai_crew_name(spec),
-          vec_len(tasks));
-        self_sc = agnosai_telemetry_span_ctx(parent_sc);
-        span_t0 = clock_epoch_ns();
+        if (parent_sc != 0 && agnosai_crew_delegated(spec) == 1) { self_sc = parent_sc; }
+        else {
+            span = agnosai_genai_workflow_span(agnosai_crew_id(spec), agnosai_crew_name(spec),
+              vec_len(tasks));
+            self_sc = agnosai_telemetry_span_ctx(parent_sc);
+            span_t0 = clock_epoch_ns();
+        }
     }
     store64(r + AGN_CR_TRACE, self_sc);
+
+    if (load64(r + AGN_CR_TOOLS) != 0) {
+        store64(r + AGN_CR_LOOP, agnosai_tool_loop_new_a(a, load64(r + AGN_CR_TOOLS),
+            load64(r + AGN_CR_JOURNAL), load64(r + AGN_CR_AUDIT), load64(r + AGN_CR_CANCELLED),
+            load64(r + AGN_CR_DEADLINE_NS), r + AGN_CR_TIMED_OUT, agnosai_crew_id(spec)));
+    }
 
     if (_agnosai_crew_wants_events(r) == 1) {
         var started = bayan_json_v_obj_new_a(a);

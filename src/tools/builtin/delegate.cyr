@@ -48,6 +48,24 @@ fn _agnosai_delegate_schema(a, ctx): i64 {
 
 # Submit a one-task crew for `agent` and answer with its id.
 #
+# The crew for one delegation.
+#
+# ⚠ **`task` is cloned, and that is the whole point of this being a function.** The crew runs after
+# the call returns, and an input lasts only as long as its call: through the tool loop it lives in
+# the conversation's arena, which goes back with the task. A task keeps its description by pointer,
+# so the delegated agent would read whatever the next conversation wrote there.
+fn _agnosai_delegate_spec(def, agent_name: Str, task: Str): i64 {
+    var agents = vec_new();
+    vec_push(agents, def);
+    var tasks = vec_new();
+    vec_push(tasks, agnosai_task_new(str_clone(task)));
+
+    var spec = agnosai_crew_new(str_cat(str_from("delegate:"), agent_name));
+    agnosai_crew_with_agents(spec, agents);
+    agnosai_crew_with_tasks(spec, tasks);
+    return spec;
+}
+
 # `ctx` is the app state, which is what carries both the definitions map (to
 # resolve `agent`) and the orchestrator (to submit against).
 fn _agnosai_delegate_execute(ctx, input): i64 {
@@ -70,14 +88,15 @@ fn _agnosai_delegate_execute(ctx, input): i64 {
             agent_name));
     }
 
-    var agents = vec_new();
-    vec_push(agents, def);
-    var tasks = vec_new();
-    vec_push(tasks, agnosai_task_new(bayan_json_v_str(task_v)));
+    var spec = _agnosai_delegate_spec(def, agent_name, bayan_json_v_str(task_v));
 
-    var spec = agnosai_crew_new(str_cat(str_from("delegate:"), agent_name));
-    agnosai_crew_with_agents(spec, agents);
-    agnosai_crew_with_tasks(spec, tasks);
+    # The crew stays in the trace of the call that started it. It runs past this call's return,
+    # which a span may do: only the id is handed on. 0 with telemetry off (ADR 029).
+    var sc = agnosai_tool_input_span_ctx(input);
+    if (sc != 0) {
+        agnosai_crew_with_trace_parent(spec, agnosai_otlp_span_context_format_a(default_alloc(), sc));
+        agnosai_crew_with_delegated(spec, 1);
+    }
 
     var crew_id = agnosai_orchestrator_submit_crew(
       agnosai_app_state_orchestrator(ctx), spec);

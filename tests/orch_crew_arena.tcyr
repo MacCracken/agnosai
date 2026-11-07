@@ -46,6 +46,11 @@ include "src/server/prometheus.cyr"
 include "src/arena_pool.cyr"
 include "src/sandbox/policy.cyr"
 include "src/sandbox/kavach_bridge.cyr"
+include "src/server/ssrf.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
+include "src/tool_loop.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "src/crew_arena.cyr"
 include "src/orchestrator/orchestrator.cyr"
@@ -890,12 +895,13 @@ fn _t_live_suite(): i64 {
         str_from("a model's answer")) == 1, "and its text is the task's output");
     agnosai_orchestrator_release_crew(o, spec);
 
-    # ⚠ **480 bytes a call are sandhi's, named here and not fixed here.** One exchange on a
-    # socket leaves them on the global heap inside `sandhi_http_post_opts_a`, whatever arena
-    # it is given: `_sandhi_client_host_header_a`'s `str_builder_new()` and `sockaddr_in`'s
-    # `alloc(16)` are among them. `lib/` is not ours to edit, so the bound is what agnosai
-    # owns, and every byte the crew path adds to it is a failure here. Tighten it to 0 when
-    # sandhi stops allocating there.
+    # ⚠ **480 bytes a call are sandhi's, named here and not fixed here (roadmap B39).** One
+    # exchange on a socket leaves them on the global heap inside `sandhi_http_post_opts_a`,
+    # whatever arena it is given: 328 in `_sandhi_http_recv_framed`'s bare header parse, 120 in
+    # `_sandhi_client_host_header_a`'s builder. The first grows with the response's headers, so
+    # this holds for the four `_t_http` sends. `lib/` is not ours to edit, so the bound is what
+    # agnosai owns, and every byte the crew path adds to it is a failure here. Tighten it to 0
+    # when sandhi stops allocating there.
     var per_call = _T_SANDHI_BYTES_PER_CALL;
     assert(_t_live_growth(o, pool, _T_SEQ, _AGNOSAI_HOOSH_ARENA_SLOTS, 60) <= 60 * 2 * per_call,
       "a crew answered over a real socket leaves only what sandhi leaves");

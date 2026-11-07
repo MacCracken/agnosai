@@ -76,6 +76,8 @@ CrewRunner::new(spec)
     │   ├── score_agent() → rank agents by suitability (5-factor weighted)
     │   ├── pick_best_agent() → assign highest-scoring agent
     │   └── execute_task() → LLM inference via hoosh + response caching
+    │       └── tool loop (ADR 029): while the model asks for the tools its agent
+    │           was granted: prepare → approve the set → journal → run → deliver
     │
     ▼
 CrewState { crew_id, status, results, profile }

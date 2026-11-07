@@ -193,6 +193,8 @@ docs/ (required):
 docs/ (when earned — not scaffolded empty):
   adr/
     NNN-title.md     — architectural decision records (when non-obvious choices are made)
+  audit/
+    NAME-audit-YYYY-MM-DD.md — a dated audit: the findings, each marked in place as it closes
   development/
     threat-model.md  — attack surface, mitigations (when security-relevant)
     dependency-watch.md — deps to monitor for updates/CVEs

@@ -32,7 +32,7 @@
 > | 8 no O(n log n) sort | cyrius 6.5.4 shipped `vec_sort_by`/`vec_select_nth`; `src/order.cyr` consumes them |
 >
 > **Live owed work is not here — it is in [`roadmap.md`](roadmap.md)** under
-> *Owed work*. This file is the plan of record and the reasoning archive; the
+> *Release pins*. This file is the plan of record and the reasoning archive; the
 > roadmap is the schedule.
 > Original 2026-07-28 framing follows, kept because the reasoning must not be
 > re-derived: baseline greened, blockers re-verified against cyrius 6.4.83, two
@@ -230,7 +230,7 @@ kavach's **scoring + gate**, which port 1:1. Uses
 
 **Exit:** all eight modules ported; the 2026-08-04 audit found **43 confirmed
 defects behind a green suite** and all 43 are fixed, 41 mutation-verified — see
-[m7-audit-2026-08-04.md](m7-audit-2026-08-04.md), where each is marked in place.
+[m7-audit-2026-08-04.md](../audit/m7-audit-2026-08-04.md), where each is marked in place.
 That audit is the strongest evidence in the port that *a green suite is not a
 correctness proof*, and is worth reading before auditing any other phase.
 

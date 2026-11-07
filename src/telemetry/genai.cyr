@@ -99,6 +99,12 @@ var AGNOSAI_GENAI_AGENT_ID = "gen_ai.agent.id";
 # Tool name. In the spec since the oracle was written — the oracle's
 # `agnosai.tool.name` predates it.
 var AGNOSAI_GENAI_TOOL_NAME = "gen_ai.tool.name";
+# The id the model gave a tool call, which the conversation repeats (ADR 029).
+var AGNOSAI_GENAI_TOOL_CALL_ID = "gen_ai.tool.call.id";
+# What the model passed, and what the tool answered. **Opt-In** in the conventions, as either can
+# hold what a tool was pointed at, so only `agnosai_telemetry_capture_tool_content` writes them.
+var AGNOSAI_GENAI_TOOL_CALL_ARGUMENTS = "gen_ai.tool.call.arguments";
+var AGNOSAI_GENAI_TOOL_CALL_RESULT = "gen_ai.tool.call.result";
 # The workflow's name — a crew's name. The spec requires it to be
 # low-cardinality, and crew names are caller-supplied (ADR 023).
 var AGNOSAI_GENAI_WORKFLOW_NAME = "gen_ai.workflow.name";
@@ -174,7 +180,30 @@ enum AgnosaiGenAiSpanOff {
     AGN_GAS_URL_PATH = 128;
     AGN_GAS_HTTP_STATUS = 136;
     AGN_GAS_URL_SCHEME = 144;
-    AGN_GAS_SIZE = 152;
+    # An `execute_tool` span's call (ADR 029). The last two are set only on request.
+    AGN_GAS_TOOL_CALL_ID = 152;
+    AGN_GAS_TOOL_ARGUMENTS = 160;
+    AGN_GAS_TOOL_RESULT = 168;
+    AGN_GAS_SIZE = 176;
+}
+
+# The most of a call's arguments or result a span carries, in bytes. A span is one fragment of a
+# batch, and a tool's answer can be far larger than the batch was sized for.
+var AGNOSAI_GENAI_TOOL_CONTENT_MAX = 4096;
+
+# Whether `execute_tool` spans carry a call's content. Off until an operator turns it on.
+var _AGNOSAI_GENAI_CAPTURE_TOOL_CONTENT = 0;
+
+# Turn a tool call's arguments and result on spans on (1) or off (0). Process-wide. Call at
+# start-up. Reads no environment: the binary reads `AGNOSAI_OTEL_CAPTURE_TOOL_CONTENT`.
+fn agnosai_telemetry_set_capture_tool_content(on): i64 {
+    _AGNOSAI_GENAI_CAPTURE_TOOL_CONTENT = on;
+    return 0;
+}
+
+# Whether `execute_tool` spans carry a call's arguments and result.
+fn agnosai_telemetry_capture_tool_content(): i64 {
+    return _AGNOSAI_GENAI_CAPTURE_TOOL_CONTENT;
 }
 
 # The operation an HTTP server span carries in place of a GenAI one (2.1.7, ADR 024). Not a
@@ -218,6 +247,9 @@ fn _agnosai_genai_span_new_a(a, op, op_s: Str): i64 {
     store64(s + AGN_GAS_URL_PATH, 0);
     store64(s + AGN_GAS_HTTP_STATUS, 0 - 1);
     store64(s + AGN_GAS_URL_SCHEME, 0);
+    store64(s + AGN_GAS_TOOL_CALL_ID, 0);
+    store64(s + AGN_GAS_TOOL_ARGUMENTS, 0);
+    store64(s + AGN_GAS_TOOL_RESULT, 0);
     return s;
 }
 
@@ -337,6 +369,27 @@ fn agnosai_genai_workflow_span(crew_id: Str, workflow_name: Str, task_count): i6
 #
 # Each takes span 0 and does nothing: since ADR 023 a span exists only while
 # the exporter is on, and the call sites record unconditionally.
+
+# Set the id the model gave this tool call. A no-op at span 0.
+fn agnosai_genai_span_set_tool_call_id(span, call_id: Str): i64 {
+    if (span == 0) { return 0; }
+    store64(span + AGN_GAS_TOOL_CALL_ID, call_id);
+    return span;
+}
+
+# Set what the model passed this tool. A no-op at span 0.
+fn agnosai_genai_span_set_tool_arguments(span, arguments: Str): i64 {
+    if (span == 0) { return 0; }
+    store64(span + AGN_GAS_TOOL_ARGUMENTS, arguments);
+    return span;
+}
+
+# Set what this tool answered. A no-op at span 0.
+fn agnosai_genai_span_set_tool_result(span, result: Str): i64 {
+    if (span == 0) { return 0; }
+    store64(span + AGN_GAS_TOOL_RESULT, result);
+    return span;
+}
 
 # Record token usage and the responding model on an existing span.
 #
@@ -460,6 +513,15 @@ fn agnosai_genai_span_attr_str(span, key): i64 {
         return load64(span + AGN_GAS_WORKFLOW_NAME);
     }
     if (streq(key, AGNOSAI_GENAI_TOOL_NAME) == 1) { return load64(span + AGN_GAS_TOOL_NAME); }
+    if (streq(key, AGNOSAI_GENAI_TOOL_CALL_ID) == 1) {
+        return load64(span + AGN_GAS_TOOL_CALL_ID);
+    }
+    if (streq(key, AGNOSAI_GENAI_TOOL_CALL_ARGUMENTS) == 1) {
+        return load64(span + AGN_GAS_TOOL_ARGUMENTS);
+    }
+    if (streq(key, AGNOSAI_GENAI_TOOL_CALL_RESULT) == 1) {
+        return load64(span + AGN_GAS_TOOL_RESULT);
+    }
     if (streq(key, AGNOSAI_GENAI_ERROR_TYPE) == 1) { return load64(span + AGN_GAS_ERROR_TYPE); }
     if (streq(key, AGNOSAI_GENAI_CREW_ID) == 1) { return load64(span + AGN_GAS_CREW_ID); }
     if (streq(key, AGNOSAI_GENAI_TASK_ID) == 1) { return load64(span + AGN_GAS_TASK_ID); }

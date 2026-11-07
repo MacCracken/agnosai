@@ -62,70 +62,91 @@ fn agnosai_tool_target_refused(input, url: Str): i64 {
       str_from("target_url rejected: cannot target private/internal networks"));
 }
 
-# `v` with the output filter's redaction applied to every string in it, object keys included:
-# the system under test can write those too.
+# A deep copy of `v` in allocator `a`, with the output filter's redaction applied to every string
+# in it, object keys included, when `redact` is 1: the system under test can write those too.
 #
-# ⚠ **Only strings.** What a tool measured stays the number it measured, which is the reason
-# this walks the value rather than filtering its JSON text: a redaction there could not tell a
-# figure from a phone number, and would rewrite the value a report labels as measured.
-fn _agnosai_tool_value_redacted(v): i64 {
+# bayan has no copy of its own. A build and parse would be one, at the cost of reading a float
+# back from its text, and this has to keep a measurement the value it was.
+#
+# ⚠ **Only strings are redacted.** What a tool measured stays the number it measured, which is
+# the reason this walks the value rather than filtering its JSON text: a redaction there could
+# not tell a figure from a phone number, and would rewrite the value a report labels as measured.
+fn _agnosai_tool_value_copy_a(a, v, redact): i64 {
     if (bayan_json_v_is_str(v) == 1) {
-        return bayan_json_v_str_new(agnosai_output_redact(bayan_json_v_str(v)));
+        if (redact == 1) {
+            return bayan_json_v_str_new_a(a, agnosai_output_redact_a(a, bayan_json_v_str(v)));
+        }
+        return bayan_json_v_str_new_a(a, str_clone_a(a, bayan_json_v_str(v)));
     }
     if (bayan_json_v_is_arr(v) == 1) {
-        var arr = bayan_json_v_arr_new();
+        var arr = bayan_json_v_arr_new_a(a);
         for (var i = 0; i < bayan_json_v_arr_len(v); i = i + 1) {
-            bayan_json_v_arr_push(arr, _agnosai_tool_value_redacted(bayan_json_v_arr_get(v, i)));
+            bayan_json_v_arr_push_a(a, arr, _agnosai_tool_value_copy_a(a, bayan_json_v_arr_get(v, i),
+                redact));
         }
         return arr;
     }
     if (bayan_json_v_is_obj(v) == 1) {
-        var obj = bayan_json_v_obj_new();
+        var obj = bayan_json_v_obj_new_a(a);
         for (var j = 0; j < bayan_json_v_obj_len(v); j = j + 1) {
-            bayan_json_v_obj_set(obj, agnosai_output_redact(bayan_json_v_obj_key(v, j)),
-              _agnosai_tool_value_redacted(bayan_json_v_obj_val(v, j)));
+            var key = bayan_json_v_obj_key(v, j);
+            if (redact == 1) { key = agnosai_output_redact_a(a, key); }
+            else { key = str_clone_a(a, key); }
+            bayan_json_v_obj_set_a(a, obj, key, _agnosai_tool_value_copy_a(a,
+                bayan_json_v_obj_val(v, j), redact));
         }
         return obj;
     }
-    return v;
+    if (bayan_json_v_is_int(v) == 1) { return bayan_json_v_int_new_a(a, bayan_json_v_int(v)); }
+    if (bayan_json_v_is_float(v) == 1) { return bayan_json_v_float_new_a(a, bayan_json_v_float(v)); }
+    if (bayan_json_v_is_bool(v) == 1) { return bayan_json_v_bool_new_a(a, bayan_json_v_bool(v)); }
+    return bayan_json_v_null_a(a);
 }
 
-# One tool call as a bayan JSON value: `tool`, `effect`, `success`, and `result` or `error`.
+# One tool call as a bayan JSON value in allocator `a`: `tool`, `effect`, `success`, and `result`
+# or `error`. `name` is the tool's name, and everything in the value is a copy, as a record
+# outlives the arena a call's input was parsed in, and a tool may answer with its input.
 #
 # `out` is what `agnosai_tool_execute_for` returned, so 0 is a tool that answered nothing, which
 # reads as an unknown effect. ADR 020's filter applies, since this reaches the same readers as
 # a task's output does: tool output can hold whatever the system under test wrote.
-fn agnosai_tool_call_to_value(t, out): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("tool"), bayan_json_v_str_new(agnosai_tool_name(t)));
+fn _agnosai_tool_call_value_a(a, name: Str, out): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "tool"), bayan_json_v_str_new_a(a, name));
     var effect = AGNOSAI_TOOL_EFFECT_UNKNOWN;
     if (out != 0) { effect = agnosai_tool_output_effect(out); }
-    bayan_json_v_obj_set(obj, str_from("effect"),
-      bayan_json_v_str_new(str_from(agnosai_tool_effect_to_wire(effect))));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "effect"),
+      bayan_json_v_str_new_a(a, str_from_a(a, agnosai_tool_effect_to_wire(effect))));
 
     var ok = 0;
     if (out != 0) { ok = agnosai_tool_output_success(out); }
-    bayan_json_v_obj_set(obj, str_from("success"), _agnosai_bool_to_value_a(default_alloc(), ok));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "success"), _agnosai_bool_to_value_a(a, ok));
     if (ok == 1) {
-        var result = agnosai_tool_output_result(out);
-        if (agnosai_output_redact_enabled() == 1) { result = _agnosai_tool_value_redacted(result); }
-        bayan_json_v_obj_set(obj, str_from("result"), result);
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "result"), _agnosai_tool_value_copy_a(a,
+            agnosai_tool_output_result(out), agnosai_output_redact_enabled()));
         return obj;
     }
 
     var err = 0;
     if (out != 0) { err = agnosai_tool_output_error(out); }
-    if (err == 0) { err = str_from("no output"); }
-    if (agnosai_output_redact_enabled() == 1) { err = agnosai_output_redact(err); }
-    bayan_json_v_obj_set(obj, str_from("error"), bayan_json_v_str_new(err));
+    if (err == 0) { err = str_from_a(a, "no output"); }
+    if (agnosai_output_redact_enabled() == 1) { err = agnosai_output_redact_a(a, err); }
+    else { err = str_clone_a(a, err); }
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "error"), bayan_json_v_str_new_a(a, err));
     return obj;
+}
+
+# One tool call as a bayan JSON value: `tool`, `effect`, `success`, and `result` or `error`.
+fn agnosai_tool_call_to_value(t, out): i64 {
+    return _agnosai_tool_call_value_a(default_alloc(), agnosai_tool_name(t), out);
 }
 
 # Append a tool call to a task result, under `metadata.tool_calls` in call order. Returns `r`.
 #
 # In `metadata` because that is what a consumer already stores, and because the task result's
-# wire form stays the oracle's. **F1's loop calls this once per call** with what
-# `agnosai_tool_execute_for` returned. Until then no crew runs a tool, so nothing does.
+# wire form stays the oracle's. The crew runner's loop writes these itself, with the call's id
+# and arguments beside them (`_agnosai_tool_task_finish_a`). This is for a consumer that drives a
+# tool on a task's behalf.
 fn agnosai_task_result_record_tool_call(r, t, out): i64 {
     var key = str_from("tool_calls");
     var calls = map_get(agnosai_task_result_metadata(r), key);

@@ -40,15 +40,25 @@ enum AgnosaiToolSchemaOff {
     AGN_SCHEMA_SIZE = 24;
 }
 
-# ToolInput heap layout — 32 bytes: a Str-keyed map of bayan values, and what the
+# ToolInput heap layout — 80 bytes: a Str-keyed map of bayan values, and what the
 # chokepoint knows of the call (ADR 025). An input belongs to one call, which is what lets it
 # carry this without a thread-local and without changing `execute_fp`.
+#
+# `CALL_ID` to `CAPTURE_FP` are the tool loop's (ADR 029), for the span. `SPAN_CTX` is the call's
+# own `execute_tool` context, set by the chokepoint, which is how a tool that starts more work
+# keeps it in the trace.
 enum AgnosaiToolInputOff {
     AGN_INPUT_PARAMETERS = 0;
     AGN_INPUT_TASK = 8;
     AGN_INPUT_TOOL = 16;
     AGN_INPUT_GATE = 24;
-    AGN_INPUT_SIZE = 32;
+    AGN_INPUT_CALL_ID = 32;
+    AGN_INPUT_AGENT_NAME = 40;
+    AGN_INPUT_TASK_ID = 48;
+    AGN_INPUT_ARGUMENTS = 56;
+    AGN_INPUT_CAPTURE_FP = 64;
+    AGN_INPUT_SPAN_CTX = 72;
+    AGN_INPUT_SIZE = 80;
 }
 
 # ToolOutput heap layout — 32 bytes.
@@ -76,12 +86,15 @@ enum AgnosaiToolGateVerdict {
     AGNOSAI_GATE_REFUSE = 2;
 }
 
-# ToolGate heap layout — 24 bytes.
+# ToolGate heap layout — 40 bytes.
 enum AgnosaiToolGateOff {
     AGN_GATE_CALL_FP = 0;
     AGN_GATE_URL_FP = 8;
     AGN_GATE_CTX = 16;
-    AGN_GATE_SIZE = 24;
+    # The tool loop's two (ADR 029). Each is 0 until a consumer sets it.
+    AGN_GATE_BATCH_FP = 24;
+    AGN_GATE_RESULT_FP = 32;
+    AGN_GATE_SIZE = 40;
 }
 
 # Tool vtable heap layout — 48 bytes. `schema_fp` and `execute_fp` are called
@@ -245,11 +258,22 @@ fn agnosai_tool_input_new(): i64 {
 
 # A tool input over `parameters`, belonging to no call yet.
 fn _agnosai_tool_input_over(parameters): i64 {
-    var i = alloc(AGN_INPUT_SIZE);
+    return _agnosai_tool_input_over_a(default_alloc(), parameters);
+}
+
+# `_agnosai_tool_input_over`, in allocator `a`.
+fn _agnosai_tool_input_over_a(a, parameters): i64 {
+    var i = alloc_via(a, AGN_INPUT_SIZE);
     store64(i + AGN_INPUT_PARAMETERS, parameters);
     store64(i + AGN_INPUT_TASK, 0);
     store64(i + AGN_INPUT_TOOL, 0);
     store64(i + AGN_INPUT_GATE, 0);
+    store64(i + AGN_INPUT_CALL_ID, 0);
+    store64(i + AGN_INPUT_AGENT_NAME, 0);
+    store64(i + AGN_INPUT_TASK_ID, 0);
+    store64(i + AGN_INPUT_ARGUMENTS, 0);
+    store64(i + AGN_INPUT_CAPTURE_FP, 0);
+    store64(i + AGN_INPUT_SPAN_CTX, 0);
     return i;
 }
 
@@ -269,6 +293,37 @@ fn agnosai_tool_input_tool(input): i64 {
 # The gate this call passed, or 0 for a tool with none.
 fn agnosai_tool_input_gate(input): i64 {
     return load64(input + AGN_INPUT_GATE);
+}
+
+# Say which model call this input is, for its `execute_tool` span: `call_id` as the model named
+# it, the agent's name and the task's id, each 0 when absent. Returns the input.
+#
+# `arguments` is the Str of JSON the model wrote, and `capture_fp` is `fn(span, input, out)`,
+# called with the span once the tool has answered, or 0. Together they put a call's content on
+# its span, which only an operator's switch turns on (ADR 029). A callback because this module
+# sits below the output filter that content has to pass through.
+#
+# Handed in because `tools/native` sits below `core/task` in a suite that only registers a tool,
+# so it cannot read a task's id itself.
+fn agnosai_tool_input_with_call(input, call_id: Str, agent_name: Str, task_id: Str,
+  arguments: Str, capture_fp): i64 {
+    store64(input + AGN_INPUT_CALL_ID, call_id);
+    store64(input + AGN_INPUT_AGENT_NAME, agent_name);
+    store64(input + AGN_INPUT_TASK_ID, task_id);
+    store64(input + AGN_INPUT_ARGUMENTS, arguments);
+    store64(input + AGN_INPUT_CAPTURE_FP, capture_fp);
+    return input;
+}
+
+# The Str of JSON the model wrote for this call, or 0 for a call no loop made.
+fn agnosai_tool_input_arguments(input): i64 {
+    return load64(input + AGN_INPUT_ARGUMENTS);
+}
+
+# The span context of this call's own `execute_tool` span, or 0 with telemetry off. A tool that
+# starts more work passes this on, so that work stays in the call's trace (`delegate` does).
+fn agnosai_tool_input_span_ctx(input): i64 {
+    return load64(input + AGN_INPUT_SPAN_CTX);
 }
 
 # Set a parameter to a bayan JSON value. Returns the input so calls chain.
@@ -341,6 +396,20 @@ fn agnosai_tool_input_get_int(input, key: Str): i64 {
 # Build a tool input from a bayan JSON object of parameters.
 fn agnosai_tool_input_from_value(v): i64 {
     return _agnosai_tool_input_over(_agnosai_map_from_value(v));
+}
+
+# `agnosai_tool_input_from_value`, in allocator `a`. The values stay `v`'s, and the keys are not
+# cloned: an input is read while `v` is alive.
+fn agnosai_tool_input_from_value_a(a, v): i64 {
+    var m = map_new_str_a(a);
+    if (v != 0) {
+        if (bayan_json_v_is_obj(v) == 1) {
+            for (var i = 0; i < bayan_json_v_obj_len(v); i = i + 1) {
+                map_set_a(a, m, bayan_json_v_obj_key(v, i), bayan_json_v_obj_val(v, i));
+            }
+        }
+    }
+    return _agnosai_tool_input_over_a(a, m);
 }
 
 # A successful tool output carrying `result`.
@@ -421,6 +490,10 @@ fn agnosai_tool_output_to_value(o): i64 {
 # `fn(ctx, input): ToolOutput`; both receive the tool's own `ctx`, which may be
 # 0 for a stateless tool. This is the vtable that stands in for the oracle's
 # `dyn NativeTool`.
+#
+# ⚠ **An input lasts as long as its call.** Through the tool loop it lives in an arena that goes
+# back with the task, so a tool that keeps anything from it past `execute_fp`'s return, for a crew
+# it submits or a thread it leaves running, must copy it first (ADR 029). Its output is copied.
 fn agnosai_tool_new(name: Str, description: Str, schema_fp, execute_fp, ctx): i64 {
     var t = alloc(AGN_TOOL_SIZE);
     store64(t + AGN_TOOL_NAME, name);
@@ -447,7 +520,42 @@ fn agnosai_tool_gate_new(call_fp, url_fp, ctx): i64 {
     store64(g + AGN_GATE_CALL_FP, call_fp);
     store64(g + AGN_GATE_URL_FP, url_fp);
     store64(g + AGN_GATE_CTX, ctx);
+    store64(g + AGN_GATE_BATCH_FP, 0);
+    store64(g + AGN_GATE_RESULT_FP, 0);
     return g;
+}
+
+# Ask this gate about the calls a model makes in one turn, as a set, before any of them runs
+# (ADR 029). Returns the gate.
+#
+# `batch_fp` is `fn(ctx, calls): Str`, where `calls` is a vec of the turn's calls, read with
+# `agnosai_tool_call_*`. It answers 0 to let the set through, or the reason to refuse every call
+# in it. Two calls that each pass alone can leak together, which `call_fp` cannot see. A call
+# that passes here still meets `call_fp`.
+fn agnosai_tool_gate_with_batch(g, batch_fp): i64 {
+    store64(g + AGN_GATE_BATCH_FP, batch_fp);
+    return g;
+}
+
+# Let this gate hold a result back from the model (ADR 029). Returns the gate.
+#
+# `result_fp` is `fn(ctx, input, out, finding): Str`, called once per call after it ran.
+# `finding` is what `agnosai_prompt_scan_input` said of the result, or 0 when clean. It answers 0
+# to let the result through, or the text the model reads in its place. The task's record keeps
+# the result either way, so a measurement survives a model that may not read it.
+fn agnosai_tool_gate_with_result(g, result_fp): i64 {
+    store64(g + AGN_GATE_RESULT_FP, result_fp);
+    return g;
+}
+
+# The gate's batch callback, or 0.
+fn agnosai_tool_gate_batch_fp(g): i64 {
+    return load64(g + AGN_GATE_BATCH_FP);
+}
+
+# The gate's result callback, or 0.
+fn agnosai_tool_gate_result_fp(g): i64 {
+    return load64(g + AGN_GATE_RESULT_FP);
 }
 
 # The gate's URL callback, or 0.
@@ -513,14 +621,22 @@ fn agnosai_tool_schema(t): i64 {
 # tool driven directly rather than through the chokepoint. Logged, as a refused call is what an
 # audit trail is for.
 fn agnosai_tool_output_refused(t, text: Str): i64 {
+    return agnosai_tool_output_refused_a(default_alloc(), t, text);
+}
+
+# `agnosai_tool_output_refused`, in allocator `a`.
+fn agnosai_tool_output_refused_a(a, t, text: Str): i64 {
     if (sakshi_get_level() >= SK_WARN && t != 0) {
         var name = agnosai_tool_name(t);
         sakshi_log_kv(SK_WARN, str_data(text), str_len(text),
           "tool", 4, str_data(name), str_len(name));
     }
-    var out = agnosai_tool_output_err(text);
-    store64(out + AGN_OUTPUT_EFFECT, AGNOSAI_TOOL_EFFECT_NONE);
-    return out;
+    var o = alloc_via(a, AGN_OUTPUT_SIZE);
+    store64(o + AGN_OUTPUT_SUCCESS, 0);
+    store64(o + AGN_OUTPUT_RESULT, bayan_json_v_null_a(a));
+    store64(o + AGN_OUTPUT_ERROR, text);
+    store64(o + AGN_OUTPUT_EFFECT, AGNOSAI_TOOL_EFFECT_NONE);
+    return o;
 }
 
 # A gate's refusal, in the words a caller reads.
@@ -531,14 +647,21 @@ fn _agnosai_tool_refused(t, reason: Str): i64 {
     return agnosai_tool_output_refused(t, str_builder_build(sb));
 }
 
+# Bind a call to its input, so a tool or a gate can read what it belongs to. Returns the input.
+#
+# The chokepoint does this, and the tool loop does it sooner, as a batch gate reads the input of
+# a call that has not reached the chokepoint yet.
+fn agnosai_tool_input_bind(input, t, task): i64 {
+    store64(input + AGN_INPUT_TASK, task);
+    store64(input + AGN_INPUT_TOOL, t);
+    store64(input + AGN_INPUT_GATE, load64(t + AGN_TOOL_GATE));
+    return input;
+}
+
 # Bind the call to its input, ask the gate, and run the tool.
 fn _agnosai_tool_run(t, input, task): i64 {
     var gate = load64(t + AGN_TOOL_GATE);
-    if (input != 0) {
-        store64(input + AGN_INPUT_TASK, task);
-        store64(input + AGN_INPUT_TOOL, t);
-        store64(input + AGN_INPUT_GATE, gate);
-    }
+    if (input != 0) { agnosai_tool_input_bind(input, t, task); }
     if (gate != 0) {
         # Fail closed: a gate cannot judge a call it cannot see.
         if (input == 0) { return _agnosai_tool_refused(t, str_from("no input to judge")); }
@@ -573,10 +696,11 @@ fn _agnosai_tool_run(t, input, task): i64 {
 # task's `invoke_agent` context as `parent_sc`, so a tool call nests under the agent that made
 # it. `/mcp` `tools/call` has no task, and passes the request's inbound `traceparent`.
 #
-# The agent name and task id are absent from the span. A tool is reached from `tools/native`,
-# which sits below `core/task`, so the id cannot be read here; F1 passes both (roadmap B7). The
-# attributes are omitted rather than faked. (They were faked until ADR 023: the
-# span was built with two empty strings, which the encoder emitted.)
+# The agent name, the task id and the call's id come off the input, where the tool loop puts
+# them (`agnosai_tool_input_with_call`), as a tool is reached from `tools/native`, which sits
+# below `core/task`. A call no loop made has none, and the attributes are omitted rather than
+# faked. (They were faked until ADR 023: the span was built with two empty strings, which the
+# encoder emitted.)
 fn agnosai_tool_execute_for(t, input, task, parent_sc): i64 {
     # ⚠ Built ONLY with the exporter on (ADR 023): with telemetry off a tool
     # call allocates no span and reads no clock.
@@ -584,12 +708,26 @@ fn agnosai_tool_execute_for(t, input, task, parent_sc): i64 {
     var self_sc = 0;
     var t0 = 0;
     if (agnosai_telemetry_exporter() != 0) {
-        span = agnosai_genai_tool_span(agnosai_tool_name(t), 0, 0);
+        var agent_name = 0;
+        var task_id = 0;
+        if (input != 0) {
+            agent_name = load64(input + AGN_INPUT_AGENT_NAME);
+            task_id = load64(input + AGN_INPUT_TASK_ID);
+        }
+        span = agnosai_genai_tool_span(agnosai_tool_name(t), agent_name, task_id);
         self_sc = agnosai_telemetry_span_ctx(parent_sc);
         t0 = clock_epoch_ns();
+        if (input != 0) {
+            agnosai_genai_span_set_tool_call_id(span, load64(input + AGN_INPUT_CALL_ID));
+            store64(input + AGN_INPUT_SPAN_CTX, self_sc);
+        }
     }
     var out = _agnosai_tool_run(t, input, task);
     if (span == 0) { return out; }
+    if (input != 0) {
+        var capture = load64(input + AGN_INPUT_CAPTURE_FP);
+        if (capture != 0) { callptr(capture, span, input, out); }
+    }
     # ⚠ A tool may answer 0. `agnosai_tool_output_success` would dereference it,
     # so the null check comes FIRST — instrumenting this site must not turn a
     # tool's 0 into a crash, which is exactly what the first draft did.

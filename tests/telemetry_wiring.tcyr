@@ -70,6 +70,10 @@ include "src/server/prometheus.cyr"
 # oracle does too (`crew_runner.rs:198-214`), so both producers are needed here.
 include "src/sandbox/policy.cyr"
 include "src/sandbox/kavach_bridge.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
+include "src/tool_loop.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "src/sandbox/mod.cyr"
 include "src/tools/mod.cyr"
@@ -205,6 +209,40 @@ fn _t_null_exec(ctx, input): i64 { return 0; }
 
 # Its schema callback, which nothing here calls.
 fn _t_null_schema(a, ctx): i64 { return 0; }
+
+# A gateway that asks for `echo` once, then answers.
+fn _t_chat_tool(client, request, out_response, parent_sc): i64 {
+    var a = agnosai_inference_request_alloc(request);
+    var msgs = agnosai_inference_request_messages(request);
+    var last = vec_get(msgs, vec_len(msgs) - 1);
+    if (agnosai_chat_message_role(last) == AGNOSAI_ROLE_TOOL) {
+        store64(out_response, agnosai_hoosh_response_from_body_a(a, str_from(
+              "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"done\"}}]}")));
+        return 0;
+    }
+    store64(out_response, agnosai_hoosh_response_from_body_a(a, str_from(
+          "{\"model\":\"m\",\"choices\":[{\"message\":{\"tool_calls\":[{\"id\":\"c7\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"message\\\":\\\"hi there\\\"}\"}}]}}]}")));  #skip-lint: a response
+    return 0;
+}
+
+# Run one crew whose agent calls `echo`, and drain what it exported.
+fn _t_tool_crew_doc(ring, reg): i64 {
+    var spec = _t_crew("tool-crew", 1, agnosai_process_sequential());
+    var tools = vec_new();
+    vec_push(tools, str_from("echo"));
+    var agents = vec_new();
+    vec_push(agents, agnosai_agent_with_tools(agnosai_agent_new(str_from("worker"),
+          str_from("tester"), str_from("test")), tools));
+    agnosai_crew_with_agents(spec, agents);
+    var r = agnosai_crew_runner_with_tools(agnosai_crew_runner_with_llm(agnosai_crew_runner_new(spec),
+        agnosai_hoosh_client_with_chat(agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"),
+            str_from("")), &_t_chat_tool)), reg, 0);
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    var err: i64[1];
+    store64(&err, 0);
+    agnosai_crew_runner_run(r, &err);
+    return agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+}
 
 # The W3C example traceparent, which tests pass in as a caller would.
 var _T_TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -552,6 +590,64 @@ fn main(): i64 {
         "\"agnosai.crew.task_count\",\"value\":{\"intValue\":\"0\"}"), 1,
       "reporting a task count of 0 — present, not unset");
 
+    # --- a tool the model called (ADR 029, roadmap B7 items 8 and 9) --------
+    var tdoc2 = _t_tool_crew_doc(ring, reg);
+    var tfr = _t_frags(tdoc2);
+    var tspan = vec_get(_t_named(tfr, "execute_tool echo"), 0);
+    var tagent = vec_get(_t_named(tfr, "invoke_agent worker"), 0);
+    assert(str_eq(_t_val(tspan, "parentSpanId"), _t_val(tagent, "spanId")) == 1,
+      "a tool the model called nests under the agent that called it");
+    assert(str_eq(_t_val(tspan, "traceId"), _t_val(tagent, "traceId")) == 1, "in its trace");
+    assert_eq(str_contains_cstr(tspan,
+        "{\"key\":\"gen_ai.tool.call.id\",\"value\":{\"stringValue\":\"c7\"}}"), 1,
+      "carrying the id the model gave the call");
+    assert_eq(str_contains_cstr(tspan, "\"gen_ai.agent.name\""), 1, "and the agent's name");
+    assert_eq(str_contains_cstr(tspan, "\"agnosai.task.id\""), 1, "and the task's id");
+    assert_eq(str_contains_cstr(tspan, "gen_ai.tool.call.arguments"), 0,
+      "and, by default, not what it was given: the conventions make that Opt-In");
+    assert_eq(str_contains_cstr(tspan, "gen_ai.tool.call.result"), 0, "nor what it answered");
+
+    assert_eq(agnosai_telemetry_capture_tool_content(), 0, "the switch starts off");
+    agnosai_telemetry_set_capture_tool_content(1);
+    var cap = vec_get(_t_named(_t_frags(_t_tool_crew_doc(ring, reg)), "execute_tool echo"), 0);
+    assert_eq(str_contains_cstr(cap, "\"gen_ai.tool.call.arguments\""), 1, "an operator can ask for the arguments");
+    assert_eq(str_contains_cstr(cap, "hi there"), 1, "which read what the model passed");
+    assert_eq(str_contains_cstr(cap, "\"gen_ai.tool.call.result\""), 1, "and for the result");
+    agnosai_telemetry_set_capture_tool_content(0);
+
+    var big = agnosai_tool_input_with_call(agnosai_tool_input_new(), 0, 0, 0, 0, 0);
+    assert_eq(agnosai_tool_input_arguments(big), 0, "a call no loop made has no arguments text");
+    var long = alloc(AGNOSAI_GENAI_TOOL_CONTENT_MAX + 5);
+    memset(long, 97, AGNOSAI_GENAI_TOOL_CONTENT_MAX + 5);
+    assert_eq(str_len(_agnosai_tool_span_text_a(default_alloc(),
+          str_new(long, AGNOSAI_GENAI_TOOL_CONTENT_MAX))), AGNOSAI_GENAI_TOOL_CONTENT_MAX,
+      "text at the cap is whole");
+    assert(str_contains_cstr(_agnosai_tool_span_text_a(default_alloc(),
+          str_new(long, AGNOSAI_GENAI_TOOL_CONTENT_MAX + 5)), "[cut: 5 more bytes]") == 1,
+      "and past it is cut");
+
+    # A delegated crew: no workflow span of its own, and its agents under the tool's span.
+    var dsc = agnosai_otlp_span_context_parse(str_from(_T_TP));
+    var dspec = _t_crew("delegate:x", 1, agnosai_process_sequential());
+    assert_eq(agnosai_crew_delegated(dspec), 0, "a crew is not delegated until it is said to be");
+    agnosai_crew_with_trace_parent(dspec, agnosai_otlp_span_context_format_a(default_alloc(), dsc));
+    agnosai_crew_with_delegated(dspec, 1);
+    assert_eq(agnosai_crew_delegated(dspec), 1, "and then is");
+    var dgfr = _t_frags(_t_run_doc(ring, dspec));
+    assert_eq(vec_len(_t_named(dgfr, "invoke_workflow delegate:x")), 0,
+      "a crew a tool started reports no invoke_workflow span");
+    var dagent = vec_get(_t_named(dgfr, "invoke_agent"), 0);
+    assert(str_contains_cstr(_t_val(dagent, "traceId"), "4bf92f3577b34da6a3ce929d0e0e4736") == 1,
+      "its agents join the call's trace");
+    assert(str_contains_cstr(_t_val(dagent, "parentSpanId"), "00f067aa0ba902b7") == 1,
+      "directly under the tool's span");
+
+    # Delegated with no context: it has no parent to go under, so it keeps its own span.
+    var nspec = _t_crew("delegate:y", 1, agnosai_process_sequential());
+    agnosai_crew_with_delegated(nspec, 1);
+    assert_eq(vec_len(_t_named(_t_frags(_t_run_doc(ring, nspec)), "invoke_workflow delegate:y")), 1,
+      "a delegated crew with no context keeps its own span");
+
     # --- telemetry off is the common path ---------------------------------
     # ⚠ Every call site runs unconditionally, so with no exporter installed the
     # same calls must be harmless. This is the configuration almost every
@@ -585,7 +681,7 @@ fn main(): i64 {
       "a tool call costs exactly the tool's own allocations — no span, no context");
     var off_task = agnosai_task_new(str_from("off"));
     var body0 = alloc_used();
-    _agnosai_execute_task_body_a(default_alloc(), off_task, 0, 0, 0, 0, 0, 0);
+    _agnosai_execute_task_body_a(default_alloc(), off_task, 0, 0, 0, 0, 0, 0, 0);
     var body_cost = alloc_used() - body0;
     var task0 = alloc_used();
     agnosai_execute_task_in_crew(off_task, 0, 0, 0, 0, tp);

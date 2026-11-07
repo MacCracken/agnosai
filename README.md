@@ -173,7 +173,7 @@ Agents are defined declaratively in JSON -- same format as Agnostic v1 presets:
   "role": "Senior QA Engineer",
   "goal": "Ensure comprehensive test coverage and quality standards",
   "domain": "quality",
-  "tools": ["code_analysis", "test_generation", "edge_case_analysis"],
+  "tools": ["json_transform", "security_audit"],
   "complexity": "high",
   "llm_model": "capable"
 }
@@ -193,6 +193,11 @@ Mistral, DeepSeek, Grok, Ollama**.
 Task-complexity routing automatically selects the right model tier (Fast / Capable / Premium).
 
 ## Tool Execution
+
+An agent is offered the tools its `tools` list names, and the model calls them until it answers
+([ADR 029](docs/adr/029-the-tool-loop.md)). A name the server does not hold fails the task, naming the tool. Every call
+is journaled before it runs, a turn's calls are approved as a set, and what a tool writes reaches the model as data. Each
+call is on the task's result under `tool_calls`, so what a tool measured can be told from what a model said.
 
 Tools run in three tiers with increasing isolation:
 

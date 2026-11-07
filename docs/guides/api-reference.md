@@ -115,6 +115,9 @@ Every other route ignores it. The header name is case-insensitive.
   for that work's spans (logs, audit and metrics are unaffected). See the
   [threat model](../development/threat-model.md), surface 7.
 - **No span is exported without `OTEL_EXPORTER_OTLP_ENDPOINT`**, header or not.
+- **A tool's arguments and result** go on its `execute_tool` span only with
+  `AGNOSAI_OTEL_CAPTURE_TOOL_CONTENT=1`, as either can hold what the tool was pointed at. Each is
+  filtered by `AGNOSAI_OUTPUT_REDACT` when that is on, and cut at 4 KiB.
 - ⚠ **Crew names become span names** (`invoke_workflow {crew name}`, and the
   `gen_ai.workflow.name` attribute). The convention requires that name to be
   low-cardinality, so a client that puts run-specific text in every crew's name
@@ -172,7 +175,7 @@ Create and execute a crew. The server assembles the crew from the provided agent
       "role": "security analyst",
       "goal": "Identify vulnerabilities in the codebase",
       "domain": "security",
-      "tools": ["vulnerability_scan", "dependency_audit"],
+      "tools": ["security_audit"],
       "complexity": "high"
     },
     {
@@ -227,7 +230,7 @@ Create and execute a crew. The server assembles the crew from the provided agent
 | `goal` | string | yes | -- |
 | `backstory` | string | no | null |
 | `domain` | string | no | null |
-| `tools` | array of string | no | [] |
+| `tools` | array of string | no | [] — the registered tools this agent may call, and no others. ⚠ A name the server does not hold fails the task, naming the tool. That includes the names in `GET /api/v1/presets`, which are a vocabulary for a consumer to resolve |
 | `complexity` | string | no | "medium" |
 | `llm_model` | string | no | null |
 | `gpu_required` | bool | no | false |
@@ -296,6 +299,11 @@ Neither error sends `crew_completed`. The run returns the error instead of a sta
 route range-checks and cycle-checks them, so such a request gets a 400 before the crew is
 registered. Only an embedding caller can reach this edge: one that builds its own spec and runs it
 through `agnosai_orchestrator_submit_crew` or `agnosai_orchestrator_run_crew_err`.
+
+A task whose agent called tools adds `metadata.tool_calls`, and an entry in this response's `results`
+gains the same list as `tool_calls`, one entry per call in the order the model made them: `id`, `tool`, `arguments`, `effect` (`committed`, `none` or `unknown`), `success`, and
+`result` or `error`, with `flagged`, `held_back` or `asked_for` when they apply ([ADR 029](../adr/029-the-tool-loop.md)).
+`metadata.tool_calls_dropped` counts calls past the limit of a turn, when there were any.
 
 An LLM-answered task's result `metadata` carries `model`, `provider`, `tokens`, `cost_micro_usd`
 (when the gateway reports a cost), `task_duration_ms`, and `agent` — the assigned agent's key — so

@@ -57,14 +57,26 @@ enum AgnosaiProviderType {
     AGNOSAI_PROVIDER_OLLAMA = 6;
 }
 
-# ChatMessage heap layout — 16 bytes.
+# ChatMessage heap layout — 32 bytes. `TOOL_CALLS` is an assistant turn's vec of calls and
+# `TOOL_CALL_ID` the call a `tool` turn answers, each 0 on every other message (ADR 029).
 enum AgnosaiChatMessageOff {
     AGN_CHAT_ROLE = 0;
     AGN_CHAT_CONTENT = 8;
-    AGN_CHAT_SIZE = 16;
+    AGN_CHAT_TOOL_CALLS = 16;
+    AGN_CHAT_TOOL_CALL_ID = 24;
+    AGN_CHAT_SIZE = 32;
 }
 
-# InferenceRequest heap layout — 40 bytes.
+# One tool call a model asked for, as the wire carries it — 24 bytes. `ARGUMENTS` is a Str of
+# JSON, as OpenAI's shape has it, so it is not parsed until something means to use it.
+enum AgnosaiChatToolCallOff {
+    AGN_TCALL_ID = 0;
+    AGN_TCALL_NAME = 8;
+    AGN_TCALL_ARGUMENTS = 16;
+    AGN_TCALL_SIZE = 24;
+}
+
+# InferenceRequest heap layout — 56 bytes.
 enum AgnosaiInferenceReqOff {
     AGN_REQ_MODEL = 0;
     AGN_REQ_MESSAGES = 8;
@@ -73,10 +85,12 @@ enum AgnosaiInferenceReqOff {
     AGN_REQ_STREAM = 32;
     # The allocator this request and its answer come from (ADR 028).
     AGN_REQ_ALLOC = 40;
-    AGN_INFER_REQ_SIZE = 48;
+    # The bayan array of tool definitions offered to the model, or 0 (ADR 029).
+    AGN_REQ_TOOLS = 48;
+    AGN_INFER_REQ_SIZE = 56;
 }
 
-# InferenceResponse heap layout — 40 bytes.
+# InferenceResponse heap layout — 72 bytes.
 enum AgnosaiInferenceRespOff {
     AGN_RESP_CONTENT = 0;
     AGN_RESP_MODEL = 8;
@@ -86,7 +100,9 @@ enum AgnosaiInferenceRespOff {
     AGN_RESP_COST_MICRO_USD = 40;
     AGN_RESP_PROVIDER = 48;
     AGN_RESP_CACHE = 56;
-    AGN_RESP_SIZE = 64;
+    # The vec of tool calls the model asked for, or 0 for a final answer (ADR 029).
+    AGN_RESP_TOOL_CALLS = 64;
+    AGN_RESP_SIZE = 72;
 }
 
 # The default gateway base URL — a local `hoosh serve 8088`.
@@ -192,6 +208,8 @@ fn agnosai_chat_message_new_a(a, role, content: Str): i64 {
     var m = alloc_via(a, AGN_CHAT_SIZE);
     store64(m + AGN_CHAT_ROLE, role);
     store64(m + AGN_CHAT_CONTENT, content);
+    store64(m + AGN_CHAT_TOOL_CALLS, 0);
+    store64(m + AGN_CHAT_TOOL_CALL_ID, 0);
     return m;
 }
 
@@ -205,13 +223,82 @@ fn agnosai_chat_message_content(m): i64 {
     return load64(m + AGN_CHAT_CONTENT);
 }
 
-# A chat message as a bayan JSON value: `{"role":"user","content":"..."}`.
+# The tool calls an assistant message carries, or 0.
+fn agnosai_chat_message_tool_calls(m): i64 {
+    return load64(m + AGN_CHAT_TOOL_CALLS);
+}
+
+# The call a `tool` message answers, or 0.
+fn agnosai_chat_message_tool_call_id(m): i64 {
+    return load64(m + AGN_CHAT_TOOL_CALL_ID);
+}
+
+# Create a tool call. `arguments` is the Str of JSON the model wrote.
+fn agnosai_chat_tool_call_new_a(a, id: Str, name: Str, arguments: Str): i64 {
+    var c = alloc_via(a, AGN_TCALL_SIZE);
+    store64(c + AGN_TCALL_ID, id);
+    store64(c + AGN_TCALL_NAME, name);
+    store64(c + AGN_TCALL_ARGUMENTS, arguments);
+    return c;
+}
+
+# The call's id, which the `tool` message answering it repeats. 0 when the model sent none.
+fn agnosai_chat_tool_call_id(c): i64 {
+    return load64(c + AGN_TCALL_ID);
+}
+
+# The name of the tool the model asked for. Model output: nothing has checked it.
+fn agnosai_chat_tool_call_name(c): i64 {
+    return load64(c + AGN_TCALL_NAME);
+}
+
+# The arguments the model wrote, a Str of JSON. Model output: nothing has parsed it.
+fn agnosai_chat_tool_call_arguments(c): i64 {
+    return load64(c + AGN_TCALL_ARGUMENTS);
+}
+
+# A tool call as its OpenAI wire form:
+# `{"id":"...","type":"function","function":{"name":"...","arguments":"..."}}`.
+fn agnosai_chat_tool_call_to_value_a(a, c): i64 {
+    var fun = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, fun, str_from_a(a, "name"),
+      bayan_json_v_str_new_a(a, load64(c + AGN_TCALL_NAME)));
+    bayan_json_v_obj_set_a(a, fun, str_from_a(a, "arguments"),
+      bayan_json_v_str_new_a(a, load64(c + AGN_TCALL_ARGUMENTS)));
+
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "id"),
+      bayan_json_v_str_new_a(a, load64(c + AGN_TCALL_ID)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "type"),
+      bayan_json_v_str_new_a(a, str_from_a(a, "function")));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "function"), fun);
+    return obj;
+}
+
+# A chat message as a bayan JSON value: `{"role":"user","content":"..."}`, with `tool_calls`
+# on an assistant turn that made some and `tool_call_id` on the turn that answers one. Both
+# keys are absent otherwise, so a request with no tools is byte for byte what it was, and
+# hoosh keys its cache on those bytes.
 fn agnosai_chat_message_to_value_a(a, m): i64 {
     var obj = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, obj, str_from_a(a, "role"),
       bayan_json_v_str_new_a(a, agnosai_chat_role_to_wire_a(a, load64(m + AGN_CHAT_ROLE))));
     bayan_json_v_obj_set_a(a, obj, str_from_a(a, "content"),
       bayan_json_v_str_new_a(a, load64(m + AGN_CHAT_CONTENT)));
+
+    var calls = load64(m + AGN_CHAT_TOOL_CALLS);
+    if (calls != 0) {
+        var arr = bayan_json_v_arr_new_a(a);
+        for (var i = 0; i < vec_len(calls); i = i + 1) {
+            bayan_json_v_arr_push_a(a, arr, agnosai_chat_tool_call_to_value_a(a, vec_get(calls, i)));
+        }
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "tool_calls"), arr);
+    }
+    var call_id = load64(m + AGN_CHAT_TOOL_CALL_ID);
+    if (call_id != 0) {
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "tool_call_id"),
+          bayan_json_v_str_new_a(a, call_id));
+    }
     return obj;
 }
 
@@ -237,6 +324,7 @@ fn agnosai_inference_request_new_a(a, model: Str): i64 {
     store64(r + AGN_REQ_TEMPERATURE_MILLI, AGNOSAI_NO_LIMIT);
     store64(r + AGN_REQ_STREAM, 0);
     store64(r + AGN_REQ_ALLOC, a);
+    store64(r + AGN_REQ_TOOLS, 0);
     return r;
 }
 
@@ -256,6 +344,39 @@ fn agnosai_inference_request_say(r, role, content: Str): i64 {
     var a = load64(r + AGN_REQ_ALLOC);
     vec_push_a(a, load64(r + AGN_REQ_MESSAGES), agnosai_chat_message_new_a(a, role, content));
     return r;
+}
+
+# Append the assistant turn that asked for `calls`, a vec of tool calls. Returns the request.
+#
+# The model's text goes with them, which is often empty. It stays a string rather than a null:
+# hoosh's providers all take "" here, and one shape is one thing to get right.
+fn agnosai_inference_request_say_tool_calls(r, content: Str, calls): i64 {
+    var a = load64(r + AGN_REQ_ALLOC);
+    var m = agnosai_chat_message_new_a(a, AGNOSAI_ROLE_ASSISTANT, content);
+    store64(m + AGN_CHAT_TOOL_CALLS, calls);
+    vec_push_a(a, load64(r + AGN_REQ_MESSAGES), m);
+    return r;
+}
+
+# Append the `tool` turn answering call `call_id`. Returns the request.
+fn agnosai_inference_request_say_tool_result(r, call_id: Str, content: Str): i64 {
+    var a = load64(r + AGN_REQ_ALLOC);
+    var m = agnosai_chat_message_new_a(a, AGNOSAI_ROLE_TOOL, content);
+    store64(m + AGN_CHAT_TOOL_CALL_ID, call_id);
+    vec_push_a(a, load64(r + AGN_REQ_MESSAGES), m);
+    return r;
+}
+
+# Offer the model `tools`, a bayan array of OpenAI tool definitions (`agnosai_tool_definition_a`).
+# Returns the request. 0 or an empty array offers none, and the key is left off the body.
+fn agnosai_inference_request_with_tools(r, tools): i64 {
+    store64(r + AGN_REQ_TOOLS, tools);
+    return r;
+}
+
+# The tool definitions offered, or 0.
+fn agnosai_inference_request_tools(r): i64 {
+    return load64(r + AGN_REQ_TOOLS);
 }
 
 # Set the completion token ceiling. Returns the request.
@@ -323,6 +444,15 @@ fn agnosai_inference_request_to_value_a(a, r): i64 {
     }
     bayan_json_v_obj_set_a(a, obj, str_from_a(a, "messages"), arr);
 
+    # Omitted when there are none, like every other unset field. OpenAI refuses an empty
+    # `tools`, and a request that offers nothing must stay the bytes hoosh has cached.
+    var tools = load64(r + AGN_REQ_TOOLS);
+    if (tools != 0) {
+        if (bayan_json_v_arr_len(tools) > 0) {
+            bayan_json_v_obj_set_a(a, obj, str_from_a(a, "tools"), tools);
+        }
+    }
+
     var max_tokens = load64(r + AGN_REQ_MAX_TOKENS);
     if (max_tokens != AGNOSAI_NO_LIMIT) {
         bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_tokens"),
@@ -380,6 +510,35 @@ fn agnosai_inference_response_new_a(a, content: Str, model: Str): i64 {
     store64(r + AGN_RESP_COST_MICRO_USD, AGNOSAI_NO_LIMIT);
     store64(r + AGN_RESP_PROVIDER, 0);
     store64(r + AGN_RESP_CACHE, AGNOSAI_HOOSH_CACHE_UNKNOWN);
+    store64(r + AGN_RESP_TOOL_CALLS, 0);
+    return r;
+}
+
+# Copy of `r` in allocator `a`, every string its own, so it outlives an arena `r` lives in. The
+# tool calls stay behind: a response is carried out of a conversation only once it has ended.
+fn agnosai_inference_response_clone_a(a, r): i64 {
+    var c = agnosai_inference_response_new_a(a, str_clone_a(a, load64(r + AGN_RESP_CONTENT)),
+      str_clone_a(a, load64(r + AGN_RESP_MODEL)));
+    store64(c + AGN_RESP_PROMPT_TOKENS, load64(r + AGN_RESP_PROMPT_TOKENS));
+    store64(c + AGN_RESP_COMPLETION_TOKENS, load64(r + AGN_RESP_COMPLETION_TOKENS));
+    store64(c + AGN_RESP_COST_MICRO_USD, load64(r + AGN_RESP_COST_MICRO_USD));
+    store64(c + AGN_RESP_CACHE, load64(r + AGN_RESP_CACHE));
+    var fin = load64(r + AGN_RESP_FINISH_REASON);
+    if (fin != 0) { store64(c + AGN_RESP_FINISH_REASON, str_clone_a(a, fin)); }
+    var provider = load64(r + AGN_RESP_PROVIDER);
+    if (provider != 0) { store64(c + AGN_RESP_PROVIDER, str_clone_a(a, provider)); }
+    return c;
+}
+
+# The tool calls the model asked for, a vec, or 0 when this is a final answer.
+fn agnosai_inference_response_tool_calls(r): i64 {
+    return load64(r + AGN_RESP_TOOL_CALLS);
+}
+
+# Set the tool calls on a response. Returns it. **For a suite's chat stub**: the live path reads
+# them off the body.
+fn agnosai_inference_response_with_tool_calls(r, calls): i64 {
+    store64(r + AGN_RESP_TOOL_CALLS, calls);
     return r;
 }
 
@@ -641,20 +800,74 @@ fn _agnosai_hoosh_str_clone_a(a, obj, key): i64 {
     return str_clone_a(a, bayan_json_v_str(f));
 }
 
-# An InferenceResponse from a parsed body `v`, or 0 when it carries no content —
-# the same fields, defaults and sentinels as the `agnosai_hoosh_extract_*`
-# readers. Every string it keeps is a COPY in `a`, so `v` may live in an arena.
+# One entry of `message.tool_calls` as a tool call in `a`, or 0 when it names no tool.
+#
+# ⚠ **`arguments` may be an object.** OpenAI's shape is a Str of JSON, which is what hoosh
+# forwards, but until hoosh 2.6.1 an Ollama route handed clients the object, and an
+# OpenAI-compatible gateway other than hoosh may yet. Either way the caller gets a Str. A
+# missing one is the empty Str, which a tool with no parameters may well send.
+#
+# An id may be missing too, and stays 0: only the loop knows what else this turn holds.
+fn _agnosai_hoosh_tool_call_of_a(a, entry): i64 {
+    if (bayan_json_v_is_obj(entry) == 0) { return 0; }
+    var fun = bayan_json_v_obj_get_by_cstr(entry, "function");
+    if (fun == 0) { return 0; }
+    if (bayan_json_v_is_obj(fun) == 0) { return 0; }
+    var name = _agnosai_hoosh_str_clone_a(a, fun, "name");
+    if (name == 0) { return 0; }
+    if (str_len(name) == 0) { return 0; }
+
+    var args = _agnosai_hoosh_str_clone_a(a, fun, "arguments");
+    if (args == 0) {
+        var raw = bayan_json_v_obj_get_by_cstr(fun, "arguments");
+        if (raw != 0 && bayan_json_v_is_obj(raw) == 1) { args = bayan_json_v_build_a(a, raw); }
+        else { args = str_from_a(a, ""); }
+    }
+    return agnosai_chat_tool_call_new_a(a, _agnosai_hoosh_str_clone_a(a, entry, "id"), name, args);
+}
+
+# The vec of tool calls in `msg`, a parsed `choices[0].message`, or 0 when it holds none. An
+# entry that names no tool is dropped, as nothing could answer it.
+fn _agnosai_hoosh_tool_calls_of_a(a, msg): i64 {
+    if (msg == 0) { return 0; }
+    var arr = bayan_json_v_obj_get_by_cstr(msg, "tool_calls");
+    if (arr == 0) { return 0; }
+    if (bayan_json_v_is_arr(arr) == 0) { return 0; }
+
+    var calls = 0;
+    for (var i = 0; i < bayan_json_v_arr_len(arr); i = i + 1) {
+        var c = _agnosai_hoosh_tool_call_of_a(a, bayan_json_v_arr_get(arr, i));
+        if (c != 0) {
+            if (calls == 0) { calls = vec_new_a(a); }
+            vec_push_a(a, calls, c);
+        }
+    }
+    return calls;
+}
+
+# An InferenceResponse from a parsed body `v`, or 0 when it carries neither content nor a tool
+# call — the same fields, defaults and sentinels as the `agnosai_hoosh_extract_*` readers.
+# Every string it keeps is a COPY in `a`, so `v` may live in an arena.
+#
+# ⚠ **A tool call may come with no `content`, or a null one** (ADR 029). OpenAI's API sends
+# null, and this refused it as a body with no content. hoosh sends `""`, which is why nothing
+# noticed. It reads as the empty Str, so a caller never holds a 0 there.
 fn _agnosai_hoosh_response_of_a(a, v): i64 {
     var first = _agnosai_hoosh_first_choice(v);
     if (first == 0) { return 0; }
-    var content = _agnosai_hoosh_str_clone_a(a, bayan_json_v_obj_get_by_cstr(first, "message"),
-      "content");
-    if (content == 0) { return 0; }
+    var msg = bayan_json_v_obj_get_by_cstr(first, "message");
+    var calls = _agnosai_hoosh_tool_calls_of_a(a, msg);
+    var content = _agnosai_hoosh_str_clone_a(a, msg, "content");
+    if (content == 0) {
+        if (calls == 0) { return 0; }
+        content = str_from_a(a, "");
+    }
 
     var model = _agnosai_hoosh_str_clone_a(a, v, "model");
     if (model == 0) { model = str_from_a(a, ""); }
 
     var resp = agnosai_inference_response_new_a(a, content, model);
+    store64(resp + AGN_RESP_TOOL_CALLS, calls);
     store64(resp + AGN_RESP_FINISH_REASON, _agnosai_hoosh_str_clone_a(a, first, "finish_reason"));
 
     var cost = AGNOSAI_NO_LIMIT;

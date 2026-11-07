@@ -510,6 +510,27 @@ fn _agnosai_route_build_spec(r): i64 {
     return spec;
 }
 
+# One task's entry in a crew's response: the oracle's `TaskResultResponse`, and `tool_calls` when
+# the task called any.
+#
+# ⚠ **The one key this adds to the oracle's wire (ADR 029), and only when tools ran**, so a crew
+# with none reads byte for byte as it did. The route carries no `metadata`, as the oracle's did not.
+# But a caller of the binary has no other way to tell what a tool measured from what a model said
+# it measured, which is what the record is for.
+fn _agnosai_route_task_result_a(a, res): i64 {
+    var ro = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, ro, AGN_JK_TASK_ID,
+      bayan_json_v_str_new_a(a, agnosai_task_result_task_id(res)));
+    bayan_json_v_obj_set_a(a, ro, AGN_JK_OUTPUT,
+      bayan_json_v_str_new_a(a, agnosai_task_result_output(res)));
+    bayan_json_v_obj_set_a(a, ro, AGN_JK_STATUS,
+      bayan_json_v_str_new_a(a, agnosai_task_status_to_wire(agnosai_task_result_status(res))));
+    var key = str_from_a(a, "tool_calls");
+    var calls = map_get(agnosai_task_result_metadata(res), key);
+    if (calls != 0) { bayan_json_v_obj_set_a(a, ro, key, calls); }
+    return ro;
+}
+
 # `POST /api/v1/crews` — create and run a crew, returning its results.
 #
 # Status contract: **400** for a request that deserializes but fails
@@ -567,15 +588,7 @@ fn agnosai_route_create_crew_tp_a(a, state, body: Str, tp: Str): i64 {
     var results = agnosai_crew_state_results(st);
     var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(results); i = i + 1) {
-        var res = vec_get(results, i);
-        var ro = bayan_json_v_obj_new_a(a);
-        bayan_json_v_obj_set_a(a, ro, AGN_JK_TASK_ID,
-          bayan_json_v_str_new_a(a, agnosai_task_result_task_id(res)));
-        bayan_json_v_obj_set_a(a, ro, AGN_JK_OUTPUT,
-          bayan_json_v_str_new_a(a, agnosai_task_result_output(res)));
-        bayan_json_v_obj_set_a(a, ro, AGN_JK_STATUS,
-          bayan_json_v_str_new_a(a, agnosai_task_status_to_wire(agnosai_task_result_status(res))));
-        bayan_json_v_arr_push_a(a, arr, ro);
+        bayan_json_v_arr_push_a(a, arr, _agnosai_route_task_result_a(a, vec_get(results, i)));
     }
     bayan_json_v_obj_set_a(a, obj, AGN_JK_RESULTS, arr);
 

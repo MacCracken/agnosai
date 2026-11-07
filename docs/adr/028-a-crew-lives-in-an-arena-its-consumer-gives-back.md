@@ -96,9 +96,11 @@ agnosai_event_bus_recycle(bus, sub);
   large crew keeps its chunks. The heap below has no way to give them back.
 - **Negative**: `agnosai_chan_reopen` knows a private offset.
 - **Named, and owned elsewhere** (the issue's *the part that does is named and owned*):
-  - **sandhi, 480 B per exchange on a socket.** `sandhi_http_post_opts_a` leaves them on the global heap
-    whatever arena it is given (`_sandhi_client_host_header_a`'s builder and `sockaddr_in`'s `alloc(16)` among
-    them). `tests/orch_crew_arena.tcyr` holds the crew path to exactly that bound. Owned by sandhi, in `lib/`.
+  - **sandhi, 480 B per exchange on a socket, with four response headers.** `sandhi_http_post_opts_a` leaves them
+    on the global heap whatever arena it is given: 328 B in `_sandhi_http_recv_framed`'s bare header parse, which
+    grows with the response's headers, and 120 B in `_sandhi_client_host_header_a`'s builder.
+    `tests/orch_crew_arena.tcyr` holds the crew path to exactly that bound. Owned by sandhi, in `lib/`, and added
+    to agnostic's open report there (roadmap B39).
   - **agnostic, about 1.7 KiB per crew.** Its ledger entry and what it clones. Owned by agnostic, which also
     has to adopt this: it builds specs with `agnosai_crew_new` today, so none of this reaches it until it does.
   - **The audit chain**, for a consumer with one: entries, and the run's scratch. A log, and off in agnostic.

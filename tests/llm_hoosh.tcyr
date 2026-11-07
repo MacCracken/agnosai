@@ -40,6 +40,129 @@ fn _t_stub_chat(client, request, out_response, parent_sc): i64 {
     return 0;
 }
 
+# ── tool calls on the wire (ADR 029) ───────────────────────────────────────
+
+# A response's tool call `i`.
+fn _t_tc(body, i): i64 {
+    var r = agnosai_hoosh_response_from_body(str_from(body));
+    return vec_get(agnosai_inference_response_tool_calls(r), i);
+}
+
+fn _t_tool_wire_suite(): i64 {
+    # A request with no tools is what it was: hoosh keys its cache on these bytes.
+    var req = agnosai_inference_request_new(str_from("m"));
+    agnosai_inference_request_say(req, AGNOSAI_ROLE_USER, str_from("hi"));
+    var plain = agnosai_inference_request_to_json(req);
+    _t_assert_str(plain, "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}",  #skip-lint: a request
+      "a request that offers no tools has no new key on it");
+    assert_eq(agnosai_inference_request_tools(req), 0, "and holds none");
+
+    agnosai_inference_request_with_tools(req, bayan_json_v_arr_new());
+    _t_assert_str(agnosai_inference_request_to_json(req),
+      "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}",  #skip-lint: a request
+      "an empty array offers none, as OpenAI refuses `tools: []`");
+
+    var tools = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(tools, bayan_json_v_str_new(str_from("t")));
+    agnosai_inference_request_with_tools(req, tools);
+    assert_eq(agnosai_inference_request_tools(req), tools, "the request holds what it is given");
+    assert(str_contains_cstr(agnosai_inference_request_to_json(req), "\"tools\":[\"t\"]") == 1,
+      "and sends it");
+    agnosai_inference_request_with_tools(req, 0);
+
+    # The turns a conversation adds.
+    var calls = vec_new();
+    vec_push(calls, agnosai_chat_tool_call_new_a(default_alloc(), str_from("c1"), str_from("echo"),
+        str_from("{\"a\":1}")));
+    agnosai_inference_request_say_tool_calls(req, str_from(""), calls);
+    agnosai_inference_request_say_tool_result(req, str_from("c1"), str_from("ok"));
+    var msgs = agnosai_inference_request_messages(req);
+    assert_eq(agnosai_chat_message_tool_calls(vec_get(msgs, 1)), calls, "the assistant turn holds its calls");
+    assert_eq(agnosai_chat_message_tool_calls(vec_get(msgs, 0)), 0, "a plain turn holds none");
+    assert_eq(agnosai_chat_message_tool_call_id(vec_get(msgs, 0)), 0, "and answers none");
+    assert_eq(agnosai_chat_message_role(vec_get(msgs, 2)), AGNOSAI_ROLE_TOOL, "the reply is a tool turn");
+    _t_assert_str(agnosai_chat_message_tool_call_id(vec_get(msgs, 2)), "c1", "answering that call");
+
+    var body = agnosai_inference_request_to_json(req);
+    assert(str_contains_cstr(body, "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"a\\\":1}\"}}]}") == 1,  #skip-lint: a request
+      "a call goes out in OpenAI's shape, its arguments a string");
+    assert(str_contains_cstr(body, "{\"role\":\"tool\",\"content\":\"ok\",\"tool_call_id\":\"c1\"}") == 1,
+      "and its reply names it");
+
+    # The shapes a gateway answers with.
+    var call = "\"tool_calls\":[{\"id\":\"a\",\"type\":\"function\",\"function\":{\"name\":\"n\",\"arguments\":\"{\\\"k\\\":2}\"}}]";  #skip-lint: a response
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"model\":\"m\",\"choices\":[{\"finish_reason\":\"tool_calls\",\"message\":{\"content\":null,");  #skip-lint: a response
+    str_builder_add_cstr(sb, call);
+    str_builder_add_cstr(sb, "}}]}");
+    var r = agnosai_hoosh_response_from_body(str_builder_build(sb));
+    assert(r != 0, "a null content with a tool call is an answer, not a bad body");
+    _t_assert_str(agnosai_inference_response_content(r), "", "reading as the empty Str, never 0");
+    var tc = vec_get(agnosai_inference_response_tool_calls(r), 0);
+    _t_assert_str(agnosai_chat_tool_call_id(tc), "a", "the id");
+    _t_assert_str(agnosai_chat_tool_call_name(tc), "n", "the name");
+    _t_assert_str(agnosai_chat_tool_call_arguments(tc), "{\"k\":2}", "and the arguments, unescaped");
+    _t_assert_str(agnosai_inference_response_finish_reason(r), "tool_calls", "and why it stopped");
+
+    sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"choices\":[{\"message\":{");
+    str_builder_add_cstr(sb, call);
+    str_builder_add_cstr(sb, "}}]}");
+    assert(agnosai_hoosh_response_from_body(str_builder_build(sb)) != 0, "no content key at all is fine too");
+
+    assert_eq(agnosai_hoosh_response_from_body(str_from("{\"choices\":[{\"message\":{}}]}")), 0,
+      "neither content nor calls is still a bad body");
+    assert_eq(agnosai_hoosh_response_from_body(str_from(
+          "{\"choices\":[{\"message\":{\"tool_calls\":[]}}]}")), 0, "an empty list is no call");
+    assert_eq(agnosai_hoosh_response_from_body(str_from(
+          "{\"choices\":[{\"message\":{\"tool_calls\":[{\"id\":\"x\"}]}}]}")), 0,
+      "an entry that names no tool is dropped");
+    assert_eq(agnosai_hoosh_response_from_body(str_from(
+          "{\"choices\":[{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"\"}}]}}]}")), 0,
+      "and so is one with an empty name");
+    assert_eq(agnosai_hoosh_response_from_body(str_from(
+          "{\"choices\":[{\"message\":{\"tool_calls\":[7,{\"function\":3}]}}]}")), 0,
+      "and what is not an object at all");
+    assert_eq(agnosai_inference_response_tool_calls(agnosai_hoosh_response_from_body(str_from(
+            "{\"choices\":[{\"message\":{\"content\":\"hi\",\"tool_calls\":\"no\"}}]}"))), 0,
+      "a `tool_calls` that is not a list leaves a plain answer");
+    assert_eq(agnosai_inference_response_tool_calls(agnosai_hoosh_response_from_body(str_from(
+            "{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"))), 0, "and none reads as 0");
+
+    assert_eq(agnosai_chat_tool_call_id(_t_tc(
+          "{\"choices\":[{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"n\"}}]}}]}", 0)), 0,
+      "a missing id stays 0, for the loop to mint");
+    _t_assert_str(agnosai_chat_tool_call_arguments(_t_tc(
+          "{\"choices\":[{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"n\"}}]}}]}", 0)), "",
+      "missing arguments are the empty Str");
+    _t_assert_str(agnosai_chat_tool_call_arguments(_t_tc(
+          "{\"choices\":[{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"n\",\"arguments\":{\"k\":1}}}]}}]}", 0)),  #skip-lint: a response
+      "{\"k\":1}", "and an object reads as the Str it would have been");
+
+    # Carried out of a conversation: every string its own.
+    var a = arena_allocator_growable(4096);
+    var inner = agnosai_hoosh_response_from_body_a(a, str_from(
+        "{\"model\":\"m\",\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":\"keep\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"cost_micro_usd\":5,\"provider\":\"p\"}}"));  #skip-lint: a response
+    var copy = agnosai_inference_response_clone_a(default_alloc(), inner);
+    reset_via(a);
+    memset(str_data(agnosai_inference_response_content(inner)), 88, 4);
+    _t_assert_str(agnosai_inference_response_content(copy), "keep", "a clone outlives its arena");
+    _t_assert_str(agnosai_inference_response_model(copy), "m", "its model too");
+    _t_assert_str(agnosai_inference_response_finish_reason(copy), "stop", "and why it stopped");
+    _t_assert_str(agnosai_inference_response_provider(copy), "p", "and who served it");
+    assert_eq(agnosai_inference_response_total_tokens(copy), 7, "and what it cost");
+    assert_eq(agnosai_inference_response_cost_micro_usd(copy), 5, "in money too");
+
+    var bare = agnosai_inference_response_new(str_from("x"), str_from("y"));
+    var bare_copy = agnosai_inference_response_clone_a(default_alloc(), bare);
+    assert_eq(agnosai_inference_response_finish_reason(bare_copy), 0, "an absent reason stays absent");
+    assert_eq(agnosai_inference_response_provider(bare_copy), 0, "and so does a provider");
+    assert_eq(agnosai_inference_response_cost_micro_usd(bare_copy), AGNOSAI_NO_LIMIT, "and the no-cost sentinel");
+    assert_eq(agnosai_inference_response_with_tool_calls(bare, calls), bare, "a stub's setter returns the response");
+    assert_eq(agnosai_inference_response_tool_calls(bare), calls, "and sets them");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -552,6 +675,8 @@ fn main() {
         AGNOSAI_ROLE_USER, str_from("m")));
     _t_assert_str(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(mv, "content")), "m",
       "chat_message_to_value_a carries the content");
+
+    _t_tool_wire_suite();
 
     return assert_summary();
 }

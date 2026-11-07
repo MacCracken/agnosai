@@ -274,6 +274,80 @@ fn _t_dl_missing_params(): i64 {
     return 0;
 }
 
+# An input lasts as long as its call, and the crew does not (ADR 029). Pinned by pointer, as the bug
+# reads fine until something else is written over the arena.
+fn _t_dl_keeps_nothing_of_its_input(): i64 {
+    var st = _t_dl_state();
+    var def = agnosai_app_state_definition_get(st, str_from("researcher"));
+    var text = str_from("look at this");
+    var spec = _agnosai_delegate_spec(def, str_from("researcher"), text);
+    var kept = agnosai_task_description(vec_get(agnosai_crew_tasks(spec), 0));
+    assert_neq(str_data(kept), str_data(text), "a delegated task holds its own copy of the text");
+    assert(str_eq(kept, text) == 1, "of the same words");
+    return 0;
+}
+
+# ADR 029: the delegated crew stays in the trace through `agnosai_tool_input_span_ctx`. Off, there
+# is no context to hand on. With the exporter on, the chokepoint's half and the runner's are in
+# `telemetry_wiring`, which drives a delegated crew through both.
+fn _t_dl_stays_in_the_trace(): i64 {
+    var state = _t_dl_state();
+    var tool = agnosai_delegate_tool(state);
+    var input = _t_dl_input("researcher", "look at this");
+    assert_eq(agnosai_tool_input_span_ctx(input), 0, "with telemetry off an input carries no context");
+    var out = agnosai_tool_execute(tool, input);
+    assert_eq(agnosai_tool_output_success(out), 1, "and delegating still works");
+    return 0;
+}
+
+# Roadmap B7 item 9's repro. A `delegate` call under a `traceparent` used to start a new root: the
+# crew's spans went to a trace of their own. Now they join the call's, and the crew reports no
+# `invoke_workflow` span, as the conventions say a tool delegating to a sub-agent SHOULD NOT.
+fn _t_dl_joins_the_trace_with_telemetry_on(): i64 {
+    var g = agnosai_telemetry_init_tracing(str_from("http://localhost:4318"));
+    var ring = agnosai_otlp_exporter_ring(agnosai_telemetry_exporter());
+    var st = _t_dl_state();
+    var tool = agnosai_delegate_tool(st);
+    var parent = agnosai_otlp_span_context_parse(
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
+    var input = _t_dl_input("researcher", "find things");
+    var out = agnosai_tool_execute_in(tool, input, parent);
+    assert(agnosai_tool_input_span_ctx(input) != 0, "the chokepoint gives the call its own context");
+    assert_eq(agnosai_otlp_span_context_span_id(agnosai_tool_input_span_ctx(input)) ==
+      agnosai_otlp_span_context_span_id(parent), 0, "which is a span of its own, not its parent's");
+
+    var cid = bayan_json_v_str(bayan_json_v_obj_get_by_cstr(agnosai_tool_output_result(out), "crew_id"));
+    var o = agnosai_app_state_orchestrator(st);
+    var waited = 0;
+    var status = AGNOSAI_CREW_PENDING;
+    while (waited < 5000 && status != AGNOSAI_CREW_COMPLETED && status != AGNOSAI_CREW_FAILED) {
+        sleep_ms(10);
+        waited = waited + 10;
+        status = agnosai_crew_state_status(agnosai_orchestrator_crew(o, cid));
+    }
+    var doc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    agnosai_telemetry_shutdown(g);
+    assert_eq(str_contains_cstr(doc, "invoke_workflow"), 0, "a delegated crew reports no workflow span");
+    assert_eq(str_contains_cstr(doc, "\"name\":\"invoke_agent"), 1, "its agent's span is there");
+    assert_eq(str_contains_cstr(doc, "\"execute_tool delegate\""), 1, "beside the tool's");
+    # Every span in the document is in the call's trace: two trace ids would be the old bug.
+    var first = str_index_of_cstr(doc, "\"traceId\":\"");
+    assert(first >= 0, "there is a trace");
+    assert_eq(str_contains_cstr(doc, "4bf92f3577b34da6a3ce929d0e0e4736"), 1, "the caller's");
+    var n = 0;
+    var off = 0;
+    while (off < str_len(doc)) {
+        var i = str_index_of_cstr(str_sub(doc, off, str_len(doc) - off), "\"traceId\":\"");
+        if (i < 0) { break; }
+        off = off + i + 11;
+        n = n + 1;
+        assert(memeq(str_data(doc) + off, "4bf92f3577b34da6a3ce929d0e0e4736", 32) == 1,
+          "every span of the delegated crew is in the call's trace");
+    }
+    assert(n >= 2, "and there is more than the tool's own");
+    return 0;
+}
+
 fn _t_dl_is_not_registered_by_default(): i64 {
     # **The parity guard.** `delegate` is library surface; a default registry
     # must not carry it, or the binary's tools/list stops matching the oracle's
@@ -306,6 +380,9 @@ fn main(): i64 {
     _t_dl_crew_completes_on_its_thread();
     _t_dl_unknown_agent_is_synchronous();
     _t_dl_missing_params();
+    _t_dl_keeps_nothing_of_its_input();
+    _t_dl_stays_in_the_trace();
+    _t_dl_joins_the_trace_with_telemetry_on();
     _t_dl_is_not_registered_by_default();
 
     return assert_summary();
