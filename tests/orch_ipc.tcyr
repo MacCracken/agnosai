@@ -18,6 +18,7 @@
 include "src/units.cyr"
 include "src/orchestrator/ipc.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_tmp.cyr"
 
 # A connected AF_UNIX stream pair. Returns 0 on failure.
 fn _t_pair(fds): i64 {
@@ -57,7 +58,7 @@ fn _t_big_writer(fd): i64 {
 
 # The socket path the bind/accept/connect test uses. `agnosai_ipc_bind`
 # removes a stale SOCKET left by an earlier run, so a fixed name is safe to re-run.
-var _T_SOCK = "/tmp/agnosai-orch-ipc-test.sock";
+var _T_SOCK = _tt_tmp_socket("orch-ipc");
 
 # 1 when anything exists at `path`. Not `file_exists`, which OPENS the path and so
 # reports a Unix socket as absent (open(2) on a socket fails with ENXIO).
@@ -287,6 +288,9 @@ fn main() {
     assert(str_eq(agnosai_ipc_last_error(), str_from("connect failed")) == 1,
       "with the oracle's wording");
 
+    # 2.3.5: every scratch path this suite made goes, so two runs at once share none and a run
+    # leaves nothing behind (`tests/test_tmp.cyr`).
+    _tt_cleanup();
     return assert_summary();
 }
 

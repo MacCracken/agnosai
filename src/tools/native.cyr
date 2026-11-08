@@ -109,7 +109,9 @@ enum AgnosaiToolOff {
     AGN_TOOL_EXECUTE_FP = 24;
     AGN_TOOL_CTX = 32;
     AGN_TOOL_GATE = 40;
-    AGN_TOOL_SIZE = 48;
+    AGN_TOOL_RELEASE_FP = 48;
+    AGN_TOOL_HOLDS = 56;
+    AGN_TOOL_SIZE = 64;
 }
 
 # Describe a single tool parameter. `required` is 1 or 0.
@@ -539,7 +541,39 @@ fn agnosai_tool_new(name: Str, description: Str, schema_fp, execute_fp, ctx): i6
     store64(t + AGN_TOOL_EXECUTE_FP, execute_fp);
     store64(t + AGN_TOOL_CTX, ctx);
     store64(t + AGN_TOOL_GATE, 0);
+    store64(t + AGN_TOOL_RELEASE_FP, 0);
+    store64(t + AGN_TOOL_HOLDS, 0);
     return t;
+}
+
+# Have `fp(ctx)` called when the last registry holding `t` lets it go (2.3.5): what a tool
+# staged or opened, it gives back there. A WASM tool frees its staged module. A tool used
+# without a registry is never released by one, and its owner frees what it holds. Returns `t`.
+fn agnosai_tool_with_release(t, fp): i64 {
+    store64(t + AGN_TOOL_RELEASE_FP, fp);
+    return t;
+}
+
+# How many registries hold `t`.
+fn agnosai_tool_holds(t): i64 {
+    return atomic_load(t + AGN_TOOL_HOLDS);
+}
+
+# A registry takes `t`. Paired with `agnosai_tool_drop`.
+fn agnosai_tool_hold(t): i64 {
+    atomic_fetch_add(t + AGN_TOOL_HOLDS, 1);
+    return 0;
+}
+
+# A registry lets `t` go, and when it was the last one, `t`'s release runs. Returns 1 when it
+# did. ⚠ **Call it outside a registry's lock**: a release is a tool's own code.
+fn agnosai_tool_drop(t): i64 {
+    var left = atomic_fetch_add(t + AGN_TOOL_HOLDS, 0 - 1) - 1;
+    if (left != 0) { return 0; }
+    var fp = load64(t + AGN_TOOL_RELEASE_FP);
+    if (fp == 0) { return 0; }
+    callptr(fp, load64(t + AGN_TOOL_CTX));
+    return 1;
 }
 
 # Create a consumer's gate between the model and its tools (ADR 025). Either callback may be 0.

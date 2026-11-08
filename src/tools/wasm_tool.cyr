@@ -215,8 +215,14 @@ fn agnosai_wasm_tool(name: Str, description: Str, parameters, module): i64 {
     store64(ctx + AGN_WT_DESCRIPTION, description);
     store64(ctx + AGN_WT_PARAMETERS, parameters);
     store64(ctx + AGN_WT_MODULE, module);
-    return agnosai_tool_new(name, description, &_agnosai_wasm_tool_schema,
-      &_agnosai_wasm_tool_execute, ctx);
+    return agnosai_tool_with_release(agnosai_tool_new(name, description,
+        &_agnosai_wasm_tool_schema, &_agnosai_wasm_tool_execute, ctx), &_agnosai_wasm_tool_release);
+}
+
+# The last registry let the tool go: free its staged module (2.3.5). A run in flight keeps
+# the file until it ends, and `agnosai_wasm_module_free` is safe to call twice.
+fn _agnosai_wasm_tool_release(ctx): i64 {
+    return agnosai_wasm_module_free(load64(ctx + AGN_WT_MODULE));
 }
 
 # A tool built from raw module bytes — the oracle's `WasmTool::from_bytes`.

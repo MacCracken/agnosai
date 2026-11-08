@@ -40,15 +40,21 @@ fn agnosai_tool_registry_new(): i64 {
 }
 
 # Register a tool, keyed by its name. An existing tool of the same name is
-# replaced, matching the oracle's `insert`.
+# replaced, matching the oracle's `insert`, and let go (`agnosai_tool_drop`), so what it
+# staged goes once no registry holds it (2.3.5).
 fn agnosai_tool_registry_register(r, tool): i64 {
     var name = agnosai_tool_name(tool);
     _agnosai_registry_log(SK_DEBUG, "registering tool", 16, name);
+    # Held before the old one is dropped, so a tool registered over itself never reaches 0.
+    agnosai_tool_hold(tool);
     mutex_lock(load64(r + AGN_REG_MUTEX));
     var gate = load64(r + AGN_REG_GATE);
     if (gate != 0) { agnosai_tool_with_gate(tool, gate); }
-    map_set(load64(r + AGN_REG_TOOLS), str_clone(name), tool);
+    var tools = load64(r + AGN_REG_TOOLS);
+    var old = map_get(tools, name);
+    map_set(tools, str_clone(name), tool);
     mutex_unlock(load64(r + AGN_REG_MUTEX));
+    if (old != 0) { agnosai_tool_drop(old); }
     return 0;
 }
 
@@ -85,12 +91,21 @@ fn agnosai_tool_registry_has(r, name: Str): i64 {
 }
 
 # Remove a tool by name. Returns 1 if it was present, 0 otherwise.
+#
+# The tool is let go (`agnosai_tool_drop`) outside the lock, so its release, a tool's own
+# code, stalls no other worker's lookup. A call already holding the tool keeps running: a
+# WASM tool's module, for one, goes when its last run ends.
 fn agnosai_tool_registry_remove(r, name: Str): i64 {
     mutex_lock(load64(r + AGN_REG_MUTEX));
     var tools = load64(r + AGN_REG_TOOLS);
     var present = map_has(tools, name);
-    if (present == 1) { map_delete(tools, name); }
+    var old = 0;
+    if (present == 1) {
+        old = map_get(tools, name);
+        map_delete(tools, name);
+    }
     mutex_unlock(load64(r + AGN_REG_MUTEX));
+    if (old != 0) { agnosai_tool_drop(old); }
     return present;
 }
 

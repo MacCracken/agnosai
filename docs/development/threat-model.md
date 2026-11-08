@@ -190,7 +190,10 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
   `$PATH`.
 - **What confinement leaves a process or Python tool** (ADR 031): it reads `/etc` and the system's
   trees, which hold no secret a non-root uid can read but do describe the host. It keeps the
-  server's network. It shares `/tmp` and `/dev/shm` with every other tool and with the server.
+  server's network. It shares `/tmp` and `/dev/shm` with every other tool and with the server,
+  which is where staged WASM modules sit when `TMPDIR` is unset; a module goes when its tool
+  does (ADR 019's 2.3.5 addendum). A process it starts cannot read its own `/proc`, as the
+  `/proc/self` rule names the confined process alone.
   A host where kavach cannot build its seccomp filter refuses every such tool. A kernel without
   landlock runs them with no filesystem rules, and agnosai warns once. An operator turns
   confinement off per config with `agnosai_process_config_set_confinement(c, 0)` or

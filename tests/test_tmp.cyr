@@ -1,0 +1,107 @@
+# =========================================================================
+# tests/test_tmp — scratch paths a suite owns, and removes (2.3.5).
+#
+# Through 2.3.4 nine suites wrote to fixed `/tmp/agnosai-*` paths and left some or all of them
+# behind, so two runs at once on one machine shared each other's files, `TMPDIR` was ignored,
+# and a full `cyrius test` left a tree in `/tmp`. agnostic 0.1.15 found the same and fixed it
+# the same way (its `tests/support/tmp.cyr`).
+#
+# A path from here is `$TMPDIR/agnosai-<tag>.<pid><ext>`, `/tmp` when `TMPDIR` is unset or
+# empty, so no other process names it. Each is remembered, and `_tt_cleanup()` at the end of a
+# suite's `main` removes them all, a directory with everything under it.
+#
+# ⚠ **A Unix socket path is at most 108 bytes**, and `TMPDIR` can be longer, so
+# `_tt_tmp_socket` stays in `/tmp`, still unique per process.
+#
+# Top-level `var _T_X = _tt_tmp_dir("…");` is safe: the allocator starts itself on first use,
+# and `getenv` reads `/proc/self/environ`.
+# =========================================================================
+
+# Every path handed out, as cstrings, in the order they were made.
+var _TT_PATHS = 0;
+# The base directory, once read.
+var _TT_BASE = 0;
+
+# `$TMPDIR`, else `/tmp`, as a cstring.
+fn _tt_base(): i64 {
+    if (_TT_BASE != 0) { return _TT_BASE; }
+    var dir = getenv("TMPDIR");
+    if (dir == 0) { dir = "/tmp"; }
+    if (strlen(dir) == 0) { dir = "/tmp"; }
+    _TT_BASE = dir;
+    return dir;
+}
+
+# Remember `path` for `_tt_cleanup`, and hand it back.
+fn _tt_keep(path): i64 {
+    if (_TT_PATHS == 0) { _TT_PATHS = vec_new(); }
+    vec_push(_TT_PATHS, path);
+    return path;
+}
+
+# `<dir>/agnosai-<tag>.<pid><ext>` as a cstring, remembered.
+fn _tt_path_in(dir, tag, ext): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, dir);
+    str_builder_add_cstr(sb, "/agnosai-");
+    str_builder_add_cstr(sb, tag);
+    str_builder_add_cstr(sb, ".");
+    str_builder_add_int(sb, sys_getpid());
+    str_builder_add_cstr(sb, ext);
+    return _tt_keep(str_data(str_builder_build(sb)));
+}
+
+# A file path no other process uses, `$TMPDIR/agnosai-<tag>.<pid><ext>`. `ext` carries its dot,
+# or is "". Nothing is created.
+fn _tt_tmp_path(tag, ext): i64 {
+    return _tt_path_in(_tt_base(), tag, ext);
+}
+
+# A directory no other process uses, `$TMPDIR/agnosai-<tag>.<pid>`, made now (0700).
+fn _tt_tmp_dir(tag): i64 {
+    var p = _tt_path_in(_tt_base(), tag, "");
+    sys_mkdir(p, 448);
+    return p;
+}
+
+# A socket path no other process uses, `/tmp/agnosai-<tag>.<pid>.sock`: see the header.
+fn _tt_tmp_socket(tag): i64 {
+    return _tt_path_in("/tmp", tag, ".sock");
+}
+
+# Whether `path` is one this file may remove: under the base or `/tmp`, and named `agnosai-`.
+fn _tt_ours(path): i64 {
+    var b = _tt_base();
+    var n = strlen(b);
+    if (strlen(path) > n + 9) {
+        if (memeq(path, b, n) == 1 && memeq(path + n, "/agnosai-", 9) == 1) { return 1; }
+    }
+    if (strlen(path) > 13 && memeq(path, "/tmp/agnosai-", 13) == 1) { return 1; }
+    return 0;
+}
+
+# Remove `path` and, when it is a directory, everything under it. ⚠ **A link is removed, never
+# followed**: `unlink` takes a link itself, so only a real directory is listed and descended.
+fn _tt_remove(path): i64 {
+    if (sys_unlink(path) == 0) { return 0; }
+    var names = dir_list(str_from(path));
+    for (var i = 0; i < vec_len(names); i = i + 1) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, path);
+        str_builder_add_cstr(sb, "/");
+        str_builder_add(sb, vec_get(names, i));
+        _tt_remove(str_data(str_builder_build(sb)));
+    }
+    sys_rmdir(path);
+    return 0;
+}
+
+# Remove every path this suite was handed, newest first, and only what `_tt_ours` allows.
+fn _tt_cleanup(): i64 {
+    if (_TT_PATHS == 0) { return 0; }
+    for (var i = vec_len(_TT_PATHS) - 1; i >= 0; i = i - 1) {
+        var p = vec_get(_TT_PATHS, i);
+        if (_tt_ours(p) == 1) { _tt_remove(p); }
+    }
+    return 0;
+}

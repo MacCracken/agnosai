@@ -33,14 +33,18 @@
 # probe forking `/bin/sh -c 'exit 127'` and `/nonexistent/binary` reported
 # **spawned, exit 127** for the first and **spawn failed** for the second.
 #
-# ## The loop sleeps when idle, and that is not a nicety
+# ## The loop waits when idle, and that is not a nicety
 #
 # Both read ends are `O_NONBLOCK`, so a read with nothing available returns at
 # once. A loop that just retries therefore **burns a core** for as long as the
 # child is thinking. Measured on the version that shipped in bite 5, against a
-# child running `sleep 2`: **100% CPU for 2.006 s**. A short sleep on an
-# iteration that moved no bytes drops that to nothing, and doubles as the tick
-# the deadline is checked on.
+# child running `sleep 2`: **100% CPU for 2.006 s**.
+#
+# **It waits in `ppoll(2)`** (2.3.5), on the pipes still open, with the deadline as its
+# timeout, so it wakes when the child writes, reads or exits, and not before. Through
+# 2.3.4 it slept 5 ms on every iteration that moved nothing, and a child that finished
+# at once waited out two of them: `/bin/true` took 10.3 ms through the spawner. Where
+# there is no `ppoll` (agnos, Windows) the sleep is still the fallback.
 #
 # ## There is no `kill_on_drop`, so every exit path kills and reaps explicitly
 #
@@ -699,10 +703,60 @@ fn agnosai_spawn_stdin_write_failed(r): i64 { return load64(r + AGN_SPR_STDIN_ER
 
 # How long an idle iteration waits before looking again.
 #
-# The floor on how fast output is noticed, and the granularity of the deadline.
-# 5 ms costs 200 wakeups a second against a child producing nothing, versus the
-# 100%-of-a-core the unslept loop measured.
+# The fallback's sleep, where there is no `ppoll`. 5 ms costs 200 wakeups a second
+# against a child producing nothing, versus the 100%-of-a-core the unslept loop measured.
 var AGNOSAI_SPAWN_IDLE_MS = 5;
+
+# The longest one `ppoll` waits with no deadline, so a wakeup the kernel never sends
+# costs a second, not the call. A child producing nothing costs one wakeup a second.
+var AGNOSAI_SPAWN_WAIT_MAX_MS = 1000;
+
+# `poll(2)`'s readable and writable bits.
+var AGNOSAI_POLLIN = 1;
+var AGNOSAI_POLLOUT = 4;
+
+# Wait until a pipe the loop still reads or writes is ready, or the deadline passes.
+# `deadline` is a `clock_now_ms` value, or 0 for none. In the PARENT.
+#
+# The three pipes go into one `ppoll`: stdout and stderr while they are open, and stdin
+# while there is input left to write. A pipe whose other end closed reads as ready, so
+# a child that exits wakes it at once. A signal or a spurious wakeup returns early, and
+# the loop goes round again, which costs a read.
+fn _agnosai_spawn_wait(orf, oopen, erf, eopen, iwf, iwant, deadline): i64 {
+    var fds[24];
+    var n = 0;
+    if (oopen == 1) {
+        store32(&fds + n * 8, orf);
+        store16(&fds + n * 8 + 4, AGNOSAI_POLLIN);
+        store16(&fds + n * 8 + 6, 0);
+        n = n + 1;
+    }
+    if (eopen == 1) {
+        store32(&fds + n * 8, erf);
+        store16(&fds + n * 8 + 4, AGNOSAI_POLLIN);
+        store16(&fds + n * 8 + 6, 0);
+        n = n + 1;
+    }
+    if (iwant == 1) {
+        store32(&fds + n * 8, iwf);
+        store16(&fds + n * 8 + 4, AGNOSAI_POLLOUT);
+        store16(&fds + n * 8 + 6, 0);
+        n = n + 1;
+    }
+    var ms = AGNOSAI_SPAWN_WAIT_MAX_MS;
+    if (deadline > 0) {
+        var left = deadline - clock_now_ms();
+        if (left < 0) { left = 0; }
+        if (left < ms) { ms = left; }
+    }
+    var ts[16];
+    store64(&ts, ms / 1000);
+    store64(&ts + 8, (ms % 1000) * 1000000);
+    var r = sys_ppoll(&fds, n, &ts, 0, 0);
+    # No `ppoll` here: the sleep it replaced.
+    if (r == 0 - 38 || r == 0 - 78) { sleep_ms(AGNOSAI_SPAWN_IDLE_MS); }
+    return r;
+}
 
 # What the child reported down the errno pipe before it gave up.
 #
@@ -1106,9 +1160,16 @@ fn agnosai_spawn_capture_confined_a(a, path, argv, envp, input: Str, timeout_ms,
             odone = 1;
             edone = 1;
         }
-        # Sleeping only when nothing moved keeps a busy child at full speed and
+        # Waiting only when nothing moved keeps a busy child at full speed and
         # an idle one off the CPU — see the module header.
-        if (moved == 0 && killed == 0) { sleep_ms(AGNOSAI_SPAWN_IDLE_MS); }
+        # ⚠ **Not once both streams have closed**: the loop is about to end, and a wait on no
+        # pipes sleeps its whole timeout. The 5 ms sleep did that on every spawn, which was half
+        # of `/bin/true`'s 10.3 ms.
+        if (moved == 0 && killed == 0 && (odone == 0 || edone == 0)) {
+            var iwant = 0;
+            if (iopen == 1 && isent < ilen) { iwant = 1; }
+            _agnosai_spawn_wait(orf, 1 - odone, erf, 1 - edone, iwf, iwant, deadline);
+        }
     }
     if (iopen == 1) { sys_close(iwf); }
     sys_close(orf);

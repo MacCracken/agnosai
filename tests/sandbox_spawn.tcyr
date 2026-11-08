@@ -738,6 +738,78 @@ fn _t_sp_idle_child_does_not_burn_the_cpu(): i64 {
     return 0;
 }
 
+# 2.3.5: the loop waits in `ppoll` on the pipes, so a child that finishes at once is
+# answered at once. Through 2.3.4 it slept 5 ms on every idle turn, and the last turn after
+# both pipes closed too, so `/bin/true` took 10.3 ms. The fastest of ten is the measure, as
+# load moves the slow ones and not the floor.
+fn _t_sp_a_quick_child_is_answered_at_once(): i64 {
+    var argv = alloc(16);
+    store64(argv, "/bin/true");
+    store64(argv + 8, 0);
+    var env = agnosai_sanitized_envp();
+    var best = 1000000000;
+    for (var i = 0; i < 10; i = i + 1) {
+        var t0 = clock_now_ns();
+        var r = agnosai_spawn_capture("/bin/true", argv, env, 5000, 0);
+        var took = clock_now_ns() - t0;
+        if (agnosai_spawn_exit_code(r) == 0 && took < best) { best = took; }
+    }
+    # 4 ms: the 5 ms sleep this replaced put the floor at 5.5, and a wait after both pipes
+    # closed at a second. A fork and an exec are about 0.5 ms here.
+    assert(best < 4000000,
+      "the fastest of ten /bin/true spawns is under 4 ms: no idle sleep, and no wait after the pipes close");
+    return 0;
+}
+
+# And it wakes for data, both ways, and for the deadline. Each case is timed against what a
+# wait missing that wake costs, measured on 2.3.5's tree: a full pipe, or one the child fills
+# after the loop is already waiting, stalls until the one-second ceiling, and a deadline inside
+# the ceiling fires at the ceiling.
+fn _t_sp_the_loop_wakes_when_it_should(): i64 {
+    var argv = alloc(32);
+    store64(argv, "/bin/sh");
+    store64(argv + 8, "-c");
+    store64(argv + 24, 0);
+    var env = agnosai_sanitized_envp();
+
+    store64(argv + 16, "head -c 1048576 /dev/zero");
+    var t0 = clock_now_ms();
+    var out = agnosai_spawn_capture("/bin/sh", argv, env, 0, 0);
+    var took = clock_now_ms() - t0;
+    assert_eq(str_len(agnosai_spawn_stdout(out)), 1048576, "1 MiB comes back whole");
+    assert(took < 1000, "in under a second (8 ms here; 3 s with no wake for data)");
+
+    store64(argv + 16, "sleep 0.2; head -c 300000 /dev/zero");
+    t0 = clock_now_ms();
+    agnosai_spawn_capture("/bin/sh", argv, env, 0, 0);
+    took = clock_now_ms() - t0;
+    assert(took < 700, "output the child writes while the loop waits wakes it (205 ms here; 1 s without)");
+
+    var big = alloc(1048577);
+    memset(big, 65, 1048576);
+    store8(big + 1048576, 0);
+    store64(argv + 16, "wc -c");
+    t0 = clock_now_ms();
+    var fed = agnosai_spawn_capture_input("/bin/sh", argv, env, str_new(big, 1048576), 30000, 0);
+    took = clock_now_ms() - t0;
+    assert(str_eq_cstr(str_trim(agnosai_spawn_stdout(fed)), "1048576") == 1, "1 MiB goes in whole");
+    assert(took < 700, "and room in stdin wakes the loop (3 ms here; 1 s with no wake for it)");
+
+    store64(argv + 16, "sleep 0.2; wc -c");
+    t0 = clock_now_ms();
+    agnosai_spawn_capture_input("/bin/sh", argv, env, str_new(big, 300000), 30000, 0);
+    took = clock_now_ms() - t0;
+    assert(took < 700, "and so does a child that starts reading late (204 ms here; 1 s without)");
+
+    store64(argv + 16, "sleep 5");
+    t0 = clock_now_ms();
+    var killed = agnosai_spawn_capture("/bin/sh", argv, env, 300, 0);
+    took = clock_now_ms() - t0;
+    assert_eq(agnosai_spawn_timed_out(killed), 1, "a 300 ms deadline kills");
+    assert(took < 700, "on time: the wait ends at the deadline, not at its ceiling (300 ms here; 1 s without)");
+    return 0;
+}
+
 # --- work_dir ------------------------------------------------------------
 
 fn _t_sp_work_dir(): i64 {
@@ -857,6 +929,8 @@ fn main(): i64 {
     _t_sp_deadline_lets_fast_children_finish();
     _t_sp_timeout_keeps_partial_output();
     _t_sp_idle_child_does_not_burn_the_cpu();
+    _t_sp_a_quick_child_is_answered_at_once();
+    _t_sp_the_loop_wakes_when_it_should();
     _t_sp_work_dir();
     _t_sp_fail_reason();
     _t_sp_bare_name_resolves();

@@ -209,7 +209,9 @@ Tools run in four tiers:
 1. **Native** -- in-process, zero overhead. Review before registering.
 2. **WASM** -- `wasmtime` with a **fuel budget** and a **memory ceiling**;
    WASI is stdio-only, so the guest gets no filesystem. kavach wraps the
-   `wasmtime` process itself.
+   `wasmtime` process itself. A module is validated at load, by its sections,
+   its `_start` export and `wasmtime compile`, and its staged copy goes when the
+   last registry holding its tool lets it go.
 3. **OCI** -- a container: read-only root, no network unless the policy allows it,
    a memory limit, every capability dropped, `no-new-privileges` and at most 256
    processes.

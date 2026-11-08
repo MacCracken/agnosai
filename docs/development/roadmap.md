@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.3.4 (2026-11-08).**
+**Status as of 2.3.5 (2026-11-08).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.3.5** | WASM tools: validate a module and clean up what a tool staged; a spawned tool's latency |
 | **2.3.6** | Network tools: pooled connections, detached threads, a cheaper URL check, a stable tool order |
 | **2.3.7** | The Rust line's JSON forms and structured-log fields |
 | **2.4.0** | The crew lifecycle as one state machine, with the approval gate wired |
@@ -70,30 +69,10 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 2.3.0 shipped the loop ([ADR 029](../adr/029-the-tool-loop.md)), 2.3.1 chose its models from hoosh's catalog
 ([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)), 2.3.2 gave each tool call an arena of its own,
-2.3.3 chose a model by hoosh's tier, kind and tools bit (ADR 030's addendum), and 2.3.4 confined the process and Python
+2.3.3 chose a model by hoosh's tier, kind and tools bit (ADR 030's addendum), 2.3.4 confined the process and Python
 tools with kavach's primitives in agnosai's own spawner, and hardened the OCI tier's container
-([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)).
-
-#### 2.3.5 — WASM tools: validate a module and clean up what a tool staged; a spawned tool's latency
-
-**A spawned tool waits on a 5 ms sleep.** The spawner's drain loop sleeps `AGNOSAI_SPAWN_IDLE_MS` whenever nothing
-moved, so `/bin/true` takes 10.3 ms through it and a Python tool call 41 ms (`benches/sandbox.bcyr`, 2.3.4). Waiting in
-`poll(2)` on the three pipes, with the deadline as its timeout, answers when the child does. Every process and Python
-tool pays it. **Done means:** `spawn_true_confined` reads near what a fork and an exec cost, and the deadline tests in
-`tests/sandbox_spawn.tcyr` still hold.
-
-**Validate a module before it runs.** A module with no `_start` export runs and "succeeds", and a module is checked
-by its header alone, so a malformed body fails only at execute. The execute path runs `wasmtime` through kavach's
-backend ([ADR 019](../adr/019-wasm-tools-spawn-wasmtime-directly.md)).
-
-**A staged module outlives its tool, and nine suites ignore `TMPDIR`.** `agnosai_wasm_load_module` stages at
-`/tmp/agnosai-wasm-<uuid>.wasm`, and `agnosai_wasm_module_free` has no caller outside the suites, so
-`DELETE /api/v1/tools/{name}` or a re-register leaves the file for the life of the host. Freeing on removal is not
-enough: another thread may hold the tool and not yet have started wasmtime, so the free must wait for in-flight
-executions (a reference count on the tool, or unlink once wasmtime has opened it). Stage under `$TMPDIR`. In the
-suites, `server_routes_sse`, `sandbox_oci` and `sandbox_manager` never unlink, and `orch_durable_state`,
-`definitions_packaging`, `definitions_loader`, `sandbox_wasm`, `orch_ipc` and `tools_wasm` unlink only some, so two
-runs at once collide. agnostic 0.1.15 fixed the same thing with a shared `tests/support/tmp.cyr`.
+([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)), and 2.3.5 validated a WASM module at
+load, freed it with its tool, and took the spawner's idle sleep out (ADR 019's 2.3.5 addendum).
 
 #### 2.3.6 — network tools: pooled connections, detached threads, a cheaper URL check, a stable tool order
 
@@ -473,7 +452,7 @@ and log fields at 2.3.6.
 | B6 | 2.4.1, crew concurrency |
 | B7 | 2.6.2, the tracing export (its item 8 and 9 shipped in 2.3.0) |
 | B8 | 2.6.1, server edges; RSA over 4096 bits is *Waiting on another project* |
-| B9, B32 | 2.3.5, WASM tools |
+| B9, B32 | shipped in 2.3.5, WASM tools (ADR 019's 2.3.5 addendum) |
 | B10, B11 | 2.3.7, JSON forms and log fields |
 | B12, B14 | 2.7.0, tests and benchmarks |
 | B13, B36 | 2.3.6, network tools |

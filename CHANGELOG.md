@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.5] — 2026-11-08
+
+A spawned tool is answered when it finishes, a WASM module is checked when it is loaded, and a staged module goes with its
+tool. The spawner waited in a 5 ms sleep and now waits in `ppoll`, so `/bin/true` takes about 0.5 ms through it where it
+took 10.3. A module with no `_start` loaded, ran and exited 0 on every call, and now fails to load, as does one wasmtime
+cannot compile. Removing or replacing a WASM tool unlinked nothing, and now frees its module once no run holds it. The
+suites take their scratch paths from `$TMPDIR`, one set per run, and leave none behind.
+
+### ⚠ Behaviour changes
+
+- **A WASM module that is not a WASI command fails to load**: `invalid WASM module: no \`_start\` function export, so
+  wasmtime would run nothing and exit 0`. So does a module whose sections do not fit it, and, where wasmtime is installed,
+  one it cannot compile, with `invalid WASM module: wasmtime refused it: <wasmtime's words>`. A bare eight-byte header
+  loaded through 2.3.4. **To migrate:** export `_start`, as every WASI command and the tool SDK's modules do.
+- **A WASM module is staged under `$TMPDIR`** when it names a directory, else `/tmp`, as before.
+- **Removing a WASM tool, or registering another under its name, frees its staged module**, once its last run ends. A
+  run that starts after that is refused with `WASM module was freed: its tool was removed`. A library consumer holding
+  the tool past its removal holds a tool that will not run.
+
+### Added
+
+- **tools/native:** `agnosai_tool_with_release`, `agnosai_tool_hold`, `agnosai_tool_drop` and `agnosai_tool_holds`: a
+  registry holds a tool while it is registered, and the last to let it go runs its release.
+- **sandbox/wasm:** `agnosai_wasm_stage_dir` and `agnosai_wasm_module_freed`.
+- **`tests/test_tmp.cyr`**: scratch paths a suite owns, `$TMPDIR/agnosai-<tag>.<pid>`, removed by `_tt_cleanup()`
+  without following a link.
+
+### Changed
+
+- **The spawner's drain loop waits in `ppoll(2)`** on the pipes still open, with the deadline as its timeout, capped at a
+  second. It slept 5 ms on every turn that moved nothing, the last one included, after both pipes had closed. agnos and
+  Windows, with no `ppoll`, keep the sleep.
+- **`agnosai_wasm_load_module` walks the sections, requires an `_start` function, and runs `wasmtime compile` on the
+  staged file**, under the process tier's confinement, as it parses bytes a caller sent. About 4 ms a load. ⚠ With
+  `-C cache=n` (`agnosai_wasm_check_argv`): wasmtime otherwise creates `$HOME/.cache/wasmtime` first, which the confinement
+  does not give, and the CI replica, running as a fresh user, refused every module that way.
+- **`agnosai_wasm_module_free` is safe from any thread and while a run holds the module**: the file goes when the last of
+  the two is done, once. A WASM tool frees its module through its release.
+- **A registry holds what it registers**: `register` holds the new tool and lets a replaced one go, and `remove` lets
+  the removed one go, each outside its lock.
+- **Nine suites** take their scratch paths from `tests/test_tmp.cyr` and remove them: `server_routes_sse`, `sandbox_oci`,
+  `sandbox_manager`, `orch_durable_state`, `definitions_packaging`, `definitions_loader`, `sandbox_wasm`, `orch_ipc` and
+  `tools_wasm`. `orch_ipc`'s socket stays in `/tmp`, as a socket path is at most 108 bytes and `TMPDIR` can be longer.
+- **Roadmap.** 2.3.5 shipped and leaves it. 2.3.4's CHANGELOG entry gains the `/proc/self` line its *Verified* note
+  already pointed at, and the threat model says it too.
+
+### Fixed
+
+- **A spawned tool waited out the sleep.** `/bin/true` took 10.3 ms through the spawner and a Python tool call 41 ms,
+  most of it two 5 ms sleeps. Now 0.51 and 35.1 ms (*Performance*).
+- **A WASM module with no `_start` "succeeded".** wasmtime runs nothing for one and exits 0, measured with wasmtime
+  50.0.1, so a tool built on it answered every call with empty output and no error.
+- **A malformed WASM module failed only at execute.** The oracle's `Module::new` refused it at load, and so does this now.
+- **`DELETE /api/v1/tools/{name}` and every re-register left the staged module for the life of the host.**
+  `agnosai_wasm_module_free` had no caller outside the suites. On the development box 305 had built up in `/tmp`.
+- **Nine suites wrote to fixed `/tmp/agnosai-*` paths** and left 314 files there between them, so two runs at once shared
+  each other's files and `TMPDIR` was ignored. A run of all nine now leaves none.
+- **`sandbox_oci`'s re-executed copy** made a script of its own and never removed it.
+
+### Performance
+
+Interleaved A/B against a 2.3.4 build with the same `lib/`, four rounds of `sandbox` and `tools` at a mean load of 3.3:
+**median +0.0% across 25 rows**, 19 within ±5%.
+
+| Row | 2.3.4 | 2.3.5 | |
+|---|---|---|---|
+| `spawn_true_unconfined` | 10.26 ms | 0.51 ms | −95.1% |
+| `spawn_true_confined` | 10.27 ms | 1.12 ms | −89.1% |
+| `python_tool_call_unconfined` | 42.42 ms | 35.08 ms | −17.3% |
+| `python_tool_call_confined` | 44.20 ms | 35.94 ms | −18.7% |
+
+- **Confinement's own cost shows now**, about 0.6 ms a spawn: the 14 landlock paths opened in the child and the filter
+  loaded. The 5 ms sleep hid it.
+- **`tool_registry_register`: 661 → 773 ns, +16.9%**, in a second `tools` A/B, four rounds at a load of 3.6: the hold, the
+  lookup of a tool being replaced and its drop. It runs once for each registration. The first run also read
+  `tool_registry_has_50_miss` +25.1%, on a path this release does not touch, and the second read it −1.1%, so it is not
+  claimed.
+- **A WASM load costs a `wasmtime compile`**, about 4 ms, where wasmtime is installed. No row times a load.
+
+`bench-history.csv` has 245 rows at 2.3.5, one sweep at a load of 1.8–2.3: median +3.6% against 2.3.4's rows, which ran at
+0.3–0.9, 164 of 245 within ±5%, not claimed. Its spawn rows agree with the A/B: 0.51 and 1.13 ms.
+
+### Tests
+
+- `sandbox_spawn` +9: the fastest of ten `/bin/true` spawns under 4 ms; 1 MiB out and in, data the child writes or reads
+  after the loop is already waiting, and a 300 ms deadline, each bounded under what a wait missing that wake costs.
+- `sandbox_wasm` +23: each refusal at load and its reason, wasmtime's verdict and the cache flag it runs with, staging in
+  the stage directory, a free
+  that unlinks once, a freed module refused, and a free 400 ms into a run that holds the file keeping it until the run
+  ends. `tools_wasm` +9: a tool in two registries kept by the second, replaced, re-registered over itself, and removed.
+  `tools_native` +8: a release runs once, when the last holder lets go, and with the tool's ctx.
+- **22 mutants**, each a new check reverted, run against `sandbox_spawn`, `sandbox_wasm` and `tools_wasm` with `TMPDIR`
+  set: all 22 fail a named assertion. The first run found five spawner mutants surviving bounds that were too loose, and
+  one redundant guard, which is gone.
+
+### Verified
+
+- **106 suites, 11,347 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's
+  printed line as well as its exit code. 2.3.4's tree read 11,298. Coverage 99%, 1,853 of 1,864 functions, the same 11
+  unreferenced. **A full `cyrius test` leaves nothing in `/tmp`**, compared before and after.
+- `check-symbols.sh`, `check-clean.sh` (fmt, lint, doc, vet, deny, `deps --verify`, the lib snapshot, log lengths, dist),
+  fmt and lint on every test, bench and fuzz file, the build, the aarch64 build, the example, fuzz 4/4,
+  `distlib --all --check` and `cyrius bench`.
+- **The `ubuntu:26.04` CI replica**, every `ci.yml` step from a clean clone with this tree laid over it, new files
+  included, wasmtime 47.0.3, all 8 pins resolved from GitHub: 106 suites, 11,201 assertions, 0 failed. Its first run refused
+  every WASM module, for the cache directory under *Changed*. `sandbox_wasm` and `tools_wasm` also pass here with a `$HOME`
+  that has no wasmtime cache.
+- The binary answers `/ready` with `"version":"2.3.5"` and exits 0 on SIGTERM.
+
 ## [2.3.4] — 2026-11-08
 
 Process and Python tools run confined. Each child applies kavach's confinement before it execs: NO_NEW_PRIVS, kavach's
@@ -22,7 +131,9 @@ call's arena now keeps nothing on the global heap.
 - **A process or Python tool that reads or writes outside its rules gets EACCES.** Read and execute: `/usr`, `/bin`,
   `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/etc`, `/run/systemd/resolve`, `/proc/self`, `/dev/urandom`,
   `/dev/random`, `/dev/zero`. Read and write: `/tmp`, `/dev/null`, `/dev/shm`, the call's work directory. That leaves out
-  `$HOME` and `~/.local`'s site-packages, `/var`, `/opt`, `/srv` and another process's `/proc`. **To migrate:** give a tree
+  `$HOME` and `~/.local`'s site-packages, `/var`, `/opt`, `/srv` and another process's `/proc`. `/proc/self` is the
+  confined process's own, so a process the tool starts cannot read its own `/proc` (added after the release: the
+  *Verified* note below named this line before it was here). **To migrate:** give a tree
   to every tool with `AGNOSAI_SANDBOX_READ_PATHS` or `AGNOSAI_SANDBOX_WRITE_PATHS` (`:`-separated, read at start-up), to
   one tool with `agnosai_confinement_with_path`, or run an operator's own command unconfined with
   `agnosai_process_config_set_confinement(c, 0)` or `agnosai_python_sandbox_with_confinement(s, 0)`.

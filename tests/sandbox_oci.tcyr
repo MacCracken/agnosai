@@ -24,6 +24,7 @@ include "src/strcase.cyr"
 include "src/core/mod.cyr"
 include "src/sandbox/mod.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_tmp.cyr"
 
 # Whether `argv` contains `needle`, in order-independent form.
 fn _t_argv_has(argv, needle): i64 {
@@ -377,7 +378,7 @@ fn _t_oci_execute_runs_the_built_argv(): i64 {
 # operand. A script that ignores `"$@"` is the only stand-in that behaves like
 # a runtime accepting flags it understands.
 fn _t_oci_fake_runtime(name, body): Str {
-    var path = str_cat(str_from("/tmp/agnosai-oci-test-"), str_from(name));
+    var path = str_from(_tt_tmp_path(str_cstr(str_cat(str_from("oci-test-"), str_from(name))), ""));
     var p = str_cstr(path);
     var src = str_cat(str_cat(str_from("#!/bin/sh\n"), str_from(body)), str_from("\n"));
     file_write_all(p, str_data(src), str_len(src));
@@ -558,7 +559,12 @@ fn main(): i64 {
 
     # A re-exec'd copy runs one thing and prints it — see
     # `_t_oci_runtime_inherits_the_unfiltered_environment`.
-    if (_t_oci_is_reexec() == 1) { return _t_oci_reexec_body(); }
+    # The copy makes scratch paths of its own, under its own pid, so it cleans up too.
+    if (_t_oci_is_reexec() == 1) {
+        var rc = _t_oci_reexec_body();
+        _tt_cleanup();
+        return rc;
+    }
 
     _t_oci_config();
     _t_oci_accepts_valid_images();
@@ -575,6 +581,9 @@ fn main(): i64 {
     _t_oci_runtime_inherits_the_unfiltered_environment();
     _t_oci_execute_timeout();
 
+    # 2.3.5: every scratch path this suite made goes, so two runs at once share none and a run
+    # leaves nothing behind (`tests/test_tmp.cyr`).
+    _tt_cleanup();
     return assert_summary();
 }
 

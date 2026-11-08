@@ -52,8 +52,9 @@ include "src/definitions/presets_data.cyr"
 include "src/definitions/loader.cyr"
 include "src/sandbox/mod.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_tmp.cyr"
 
-var _T_ROOT = "/tmp/agnosai-sandbox-wasm-test";
+var _T_ROOT = _tt_tmp_path("sandbox-wasm", "");
 
 # Assert two Strs are equal.
 fn _t_seq(a: Str, b: Str, name): i64 {
@@ -83,6 +84,10 @@ fn _t_wasm_header(): i64 {
     store8(b + 7, 0);
     return b;
 }
+
+# The smallest WASI command, 36 bytes: `(module (func (export "_start")))`. A type, a function,
+# the export and an empty body.
+var _T_NOP_HEX = "0061736d0100000001040160000003020100070a01065f737461727400000a040102000b";
 
 # The same with a tampered byte at `at`, for the rejection cases.
 fn _t_wasm_header_bad(at, to): i64 {
@@ -480,10 +485,119 @@ fn _t_wasm_runtime_is_not_silently_missing(): i64 {
     return 0;
 }
 
+# What each check at load refuses (2.3.5). `hex` follows the eight-byte header.
+fn _t_refused(s, hex, needle, name): i64 {
+    var b = str_builder_new();
+    _t_hex(b, "0061736d01000000");
+    _t_hex(b, hex);
+    var bytes = str_builder_build(b);
+    var err: i64[1];
+    store64(&err, 0);
+    var m = agnosai_wasm_load_module(s, str_data(bytes), str_len(bytes), &err);
+    if (m != 0) {
+        agnosai_wasm_module_free(m);
+        return assert(0, name);
+    }
+    return assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), needle), 1, name);
+}
+
+fn _t_validation_suite(): i64 {
+    var s = agnosai_wasm_sandbox_new();
+    _t_refused(s, "01ff01", "runs past the end", "a section longer than the module is refused at load");
+    _t_refused(s, "01ffffffffff", "cut off", "and a section size that never ends");
+    _t_refused(s, "0e00", "no WebAssembly version", "and a section id no version defines");
+    _t_refused(s, "0701ff", "export section is malformed", "and an export count with nothing after it");
+    _t_refused(s, "0503010001070a01065f73746172740200", "_start",
+      "an `_start` that is a memory, not a function, is no entry point");
+    # Framed correctly, with an `_start` naming a function the module does not have: only the
+    # engine can say that, and with wasmtime installed it does, at load.
+    if (agnosai_wasm_available() == 1) {
+        _t_refused(s, "070a01065f73746172740000", "wasmtime refused it",
+          "a module the framing passes and wasmtime does not is refused at load, in wasmtime's words");
+    }
+
+    # The check runs wasmtime with its cache off: with it on, wasmtime first makes
+    # `$HOME/.cache/wasmtime`, which the confinement does not give, and refused every module on a
+    # host that had not made it yet (found in the CI replica).
+    var argv = agnosai_wasm_check_argv("/usr/bin/wasmtime", str_from("/tmp/m.wasm"));
+    assert(streq(load64(argv + 8), "compile") == 1, "the check is `wasmtime compile`");
+    assert(streq(load64(argv + 16), "-C") == 1 && streq(load64(argv + 24), "cache=n") == 1,
+      "with `-C cache=n`, as the confinement gives it no cache directory");
+    assert(streq(load64(argv + 32), "/tmp/m.wasm") == 1, "on the staged file");
+    assert(streq(load64(argv + 48), "/dev/null") == 1 && load64(argv + 56) == 0,
+      "keeping nothing");
+
+    # Staged where `$TMPDIR` says.
+    var nb = str_builder_new();
+    _t_hex(nb, _T_NOP_HEX);
+    var nop = str_builder_build(nb);
+    var err: i64[1];
+    store64(&err, 0);
+    var m = agnosai_wasm_load_module(s, str_data(nop), str_len(nop), &err);
+    var dir = str_from(agnosai_wasm_stage_dir());
+    assert(str_starts_with(agnosai_wasm_module_path(m), dir) == 1, "a module is staged in the stage directory");
+    var tmpdir = getenv("TMPDIR");
+    if (tmpdir != 0 && strlen(tmpdir) > 0 && sys_access(tmpdir, 0) == 0) {
+        assert(str_eq_cstr(dir, tmpdir) == 1, "which is $TMPDIR, when it names a directory");
+    } else {
+        assert(str_eq_cstr(dir, "/tmp") == 1, "which is /tmp with no $TMPDIR");
+    }
+
+    # Freed: the file goes, once, and nothing runs it after.
+    var path = str_clone(agnosai_wasm_module_path(m));
+    assert_eq(agnosai_wasm_module_free(m), 1, "a module is freed");
+    assert_eq(file_exists(str_data(path)), 0, "and its staged file is gone");
+    assert_eq(agnosai_wasm_module_free(m), 0, "a second free does nothing");
+    if (agnosai_wasm_available() == 1) {
+        store64(&err, 0);
+        assert_eq(agnosai_wasm_execute(s, m, str_from(""), &err), 0, "a freed module does not run");
+        assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "freed"), 1, "and says why");
+    }
+    return 0;
+}
+
+# --- a free while a run holds the file -------------------------------------
+
+var _t_hold_module = 0;
+var _t_hold_sandbox = 0;
+var _t_hold_done = 0;
+
+fn _t_hold_runner(arg): i64 {
+    var err: i64[1];
+    store64(&err, 0);
+    agnosai_wasm_execute(_t_hold_sandbox, _t_hold_module, str_from(""), &err);
+    atomic_store(&_t_hold_done, 1);
+    return 0;
+}
+
+fn _t_free_during_run_suite(): i64 {
+    if (agnosai_wasm_available() == 0) { return 0; }
+    sys_mkdir(_T_ROOT, 0x1FF);
+    var err: i64[1];
+    store64(&err, 0);
+    _t_hold_sandbox = agnosai_wasm_sandbox_with_limits(67108864, 1500);
+    _t_hold_module = _t_spin(_t_hold_sandbox, &err);
+    if (_t_hold_module == 0) { return assert(0, "a guest that never ends loads"); }
+    var path = str_clone(agnosai_wasm_module_path(_t_hold_module));
+    _t_hold_done = 0;
+    var t = thread_create(&_t_hold_runner, 0);
+    # Long enough for wasmtime to be running it, well inside its 1.5 s deadline.
+    sleep_ms(400);
+    assert_eq(atomic_load(&_t_hold_done), 0, "the guest is still running");
+    assert_eq(agnosai_wasm_module_free(_t_hold_module), 1, "its module is freed meanwhile");
+    assert_eq(file_exists(str_data(path)), 1,
+      "and the file stays while the run holds it: removing a tool mid-call must not pull the module out");
+    thread_join(t);
+    assert_eq(file_exists(str_data(path)), 0, "and goes when the run ends");
+    return 0;
+}
+
 fn main(): i64 {
     var err = 0;
     store64(&err, 0);
     _t_wasm_runtime_is_not_silently_missing();
+    _t_validation_suite();
+    _t_free_during_run_suite();
 
     # --- Oracle: create_sandbox_with_defaults -----------------------------
     var s = agnosai_wasm_sandbox_new();
@@ -524,12 +638,22 @@ fn main(): i64 {
     assert_neq(load64(&err), 0, "and set an error");
 
     # --- the header check, past the oracle --------------------------------
+    # ⚠ 2.3.5: a header and nothing else no longer loads. It has no `_start`, and wasmtime runs
+    # such a module, does nothing, and exits 0, so a tool built on it "succeeded" every call.
     var hdr = _t_wasm_header();
     store64(&err, 0);
-    var m = agnosai_wasm_load_module(s, hdr, 8, &err);
-    assert_neq(m, 0, "a valid eight-byte header loads");
+    assert_eq(agnosai_wasm_load_module(s, hdr, 8, &err), 0,
+      "a bare eight-byte header is refused: no `_start`, so nothing would run");
+    assert_eq(str_contains_cstr(agnosai_error_detail(load64(&err)), "_start"), 1,
+      "and says it is the entry point that is missing");
+    var nb = str_builder_new();
+    _t_hex(nb, _T_NOP_HEX);
+    var nop_bytes = str_builder_build(nb);
+    store64(&err, 0);
+    var m = agnosai_wasm_load_module(s, str_data(nop_bytes), str_len(nop_bytes), &err);
+    assert_neq(m, 0, "the smallest WASI command, 36 bytes, loads");
     assert_eq(load64(&err), 0, "with no error");
-    assert_eq(agnosai_wasm_module_len(m), 8, "and remembers its length");
+    assert_eq(agnosai_wasm_module_len(m), 36, "and remembers its length");
     assert_eq(file_exists(str_data(agnosai_wasm_module_path(m))), 1,
       "and stages the bytes where wasmtime can read them");
 
@@ -564,11 +688,13 @@ fn main(): i64 {
     # sandbox an arbitrary path and have it executed unchecked.
     sys_mkdir(_T_ROOT, 0x1FF);
     var good_path = _t_join(str_from(_T_ROOT), str_from("/good.wasm"));
-    file_write_all(str_data(good_path), _t_wasm_header(), 8);
+    file_write_all(str_data(good_path), str_data(nop_bytes), str_len(nop_bytes));
     store64(&err, 0);
     var fm = agnosai_wasm_load_module_from_file(s, good_path, &err);
     assert_neq(fm, 0, "a valid module file loads");
-    assert_eq(agnosai_wasm_module_len(fm), 8, "with its length");
+    assert_eq(agnosai_wasm_module_len(fm), 36, "with its length");
+    agnosai_wasm_module_free(fm);
+    sys_unlink(str_data(good_path));
 
     var bad_path = _t_join(str_from(_T_ROOT), str_from("/bad.wasm"));
     var notwasm = str_from("#!/bin/sh\nrm -rf /\n");
@@ -642,9 +768,9 @@ fn main(): i64 {
     } else {
         # ⚠ Guarded, and the guard is LOUD: if a runtime is present these must
         # run, so a regression in detection cannot quietly skip them.
-        assert_neq(out, 0, "with a runtime present, a header-only module executes");
+        assert_neq(out, 0, "with a runtime present, the smallest WASI command executes");
         assert_eq(agnosai_wasm_result_exit_code(out), 0,
-          "and an empty module exits cleanly");
+          "and an empty `_start` exits cleanly");
     }
 
     # --- a REAL module, end to end -------------------------------------------
@@ -762,6 +888,9 @@ fn main(): i64 {
     sys_unlink(str_data(bad_path));
     sys_rmdir(_T_ROOT);
 
+    # 2.3.5: every scratch path this suite made goes, so two runs at once share none and a run
+    # leaves nothing behind (`tests/test_tmp.cyr`).
+    _tt_cleanup();
     return assert_summary();
 }
 

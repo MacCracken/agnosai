@@ -2,9 +2,29 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-08 (the 2.3.4 release gate).
+> Last refreshed: 2026-11-08 (the 2.3.5 release gate).
 
-## Now — 2.3.4
+## Now — 2.3.5
+
+| | |
+|---|---|
+| **version** | **2.3.5** (cut 2026-11-08): a spawned tool is answered when it finishes, a WASM module is checked when it is loaded, and a staged module goes with its tool. The spawner waits in `ppoll`, not a 5 ms sleep. A module needs its sections to fit, an `_start` function and, where wasmtime is installed, `wasmtime compile`'s yes. A registry holds its tools, and the last to let a WASM tool go frees its module, once no run holds it. The suites take their scratch paths from `$TMPDIR` and leave none |
+| **cyrius pin** | **6.7.18**, unchanged |
+| **tests** | **106 suites, 11,347 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.3.4's tree reads 11,298. `sandbox_wasm` +23, `sandbox_spawn` +9, `tools_wasm` +9, `tools_native` +8. 22 mutants, all killed. **A full `cyrius test` leaves nothing in `/tmp`**, compared before and after |
+| **coverage** | **99%**: 106/106 files, 1,853/1,864 fns (gate `--min 80`), the same 11 unreferenced as 2.3.3 |
+| **dist** | `dist/agnosai.cyr` 45,750 lines + `dist/agnosai-guard.cyr` 1,034, both v2.3.5, by `wc -l` (2.3.4's read 45,353 and 1,034). Sidecars **6 / 1** leaves, unchanged |
+| **binary** | `build/agnosai` **3,025,400 B** (2.3.4: 3,020,792). aarch64 **7,034,912 B** (7,034,400), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.3.5"` and exits 0 on SIGTERM |
+| **deps** | Unchanged: kavach 3.14.7, and every other dep on its latest tag |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh` 3,238 definitions across 117 files; `check-clean.sh` fmt 236, lint 236, doc 118, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths 235 files; dist. fmt and lint on every test, bench and fuzz file. Then build, aarch64, every test and fuzz unit compiles, tests under DCE, coverage, the example, fuzz 4/4, `distlib --all --check`, `cyrius bench`. **The `ubuntu:26.04` CI replica ran** on the bumped tree with this release's new files laid over a clean clone, wasmtime 47.0.3, all 8 pins from GitHub: every `ci.yml` step, 106 suites, 11,201 assertions, 0 failed. Its first run refused every WASM module, as a fresh user has no `~/.cache/wasmtime` and the confinement gives no `$HOME`, which is why the check runs `-C cache=n` |
+| **benchmarks** | The interleaved A/B against a 2.3.4 build, four rounds of `sandbox` and `tools` at a mean load of 3.3, reads **median +0.0% across 25 rows**. `spawn_true_unconfined` 10.26 → 0.51 ms (−95.1%), `spawn_true_confined` 10.27 → 1.12 ms (−89.1%), the Python tool calls −17% and −19%. `tool_registry_register` +16.9%, 661 → 773 ns, in a second `tools` A/B: the hold, the replaced tool's lookup and its drop. `bench-history.csv` has 245 rows at 2.3.5, one sweep at a load of 1.8–2.3: median +3.6% against 2.3.4's rows, taken at 0.3–0.9, not claimed |
+| **WASM at load** | Refused, each with its reason: a bare header (no `_start`), an `_start` that is a memory, a section past the end, a size that never ends, an unknown section id, a broken export section, and a module wasmtime will not compile. A load runs `wasmtime compile` confined, about 4 ms |
+| **staged modules** | Freed when the last registry lets a WASM tool go. A free 400 ms into a run keeps the file until the run ends, and a run after the free is refused. 305 staged modules had built up in this box's `/tmp` from earlier test runs, and 9 files from the fixed-path suites |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4. ⚠ A WASM module with no `_start` no longer loads, and a tool removed from its registry no longer runs (CHANGELOG *Behaviour changes*) |
+| **upstream filings** | ⚠ **Eight not committed**, so not visible upstream: kavach (concurrent runs read each other's stderr; a network-denying policy needs a namespace), sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies), hoosh (span ids) and bote (the MCP client, with a scope conflict). The roadmap's *Waiting on another project* has each path |
+
+### 2.3.4 — the release (2026-11-08)
 
 | | |
 |---|---|

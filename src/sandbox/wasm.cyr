@@ -43,15 +43,31 @@
 # | ambient authority | WASI ctx with only stdin/stdout | no `--dir` preopens, plus seccomp/landlock |
 # | what a guest may create | `StoreLimitsBuilder` | `-W max-instances` and friends, via kavach |
 #
-# ## `load_module` VALIDATES rather than compiles
+# ## `load_module` validates, and asks wasmtime (2.3.5)
 #
 # The oracle's `load_module` hands the bytes to `Module::new`, so a malformed
-# module fails at LOAD. A CLI cannot pre-compile, so the failure would otherwise
-# move to `execute` — and the oracle's own tests assert that
+# module fails at LOAD. The oracle's own tests assert that
 # `load_module(b"not valid wasm")` errors with a message naming what was
-# *expected*. So this checks the eight-byte header and persists the bytes; a
-# module that gets past the header and is still malformed fails at `execute`,
-# which is a documented residual rather than a silent one.
+# *expected*, which is the eight-byte header check.
+#
+# Through 2.3.4 the header was all, so a module with a broken body failed only at
+# `execute`, and a module with no `_start` export ran and **exited 0**, measured:
+# wasmtime runs nothing for a module with no entry point and reports success. Now
+# a load also walks the sections, requires a `_start` function export (a WASM tool
+# is a WASI command), and, where wasmtime is installed, runs `wasmtime compile` on
+# the staged file under the process tier's confinement (ADR 031), which is the
+# engine's own verdict, the one `Module::new` gave the oracle. About 4 ms a load.
+# With no wasmtime, the sections and the export are checked, and execution is
+# refused anyway.
+#
+# ## A staged module goes when its tool does
+#
+# wasmtime runs a module from a path, so every load stages one, under `$TMPDIR`
+# (else `/tmp`). `agnosai_wasm_module_free` unlinks it, and a WASM tool frees its
+# module when the last registry holding it lets it go. ⚠ **Not while it runs**: a
+# run counts itself in before kavach opens the file and out after, and the file
+# goes with whichever of the two is last, the free or the run. A run that starts
+# after the free is refused.
 #
 # ## `wasmtime` is a host requirement
 #
@@ -97,6 +113,10 @@ var AGNOSAI_WASM_EXIT_TRAP = 0 - 3;
 # The eight-byte WASM header: `\0asm` then a little-endian version of 1.
 var AGNOSAI_WASM_HEADER_LEN = 8;
 
+# How long `wasmtime compile` may take to check a module at load. A module a tool can
+# afford to run compiles in milliseconds, and one that takes longer is refused.
+var AGNOSAI_WASM_CHECK_TIMEOUT_MS = 10000;
+
 # WasmSandbox heap layout — 24 bytes.
 enum AgnosaiWasmSandboxOff {
     AGN_WS_MAX_MEMORY_BYTES = 0;
@@ -112,10 +132,16 @@ enum AgnosaiWasmSandboxOff {
 # oracle's `WasmModule` wraps a `Module` that was compiled at load; the
 # observable difference is *when* a malformed body is rejected, which the header
 # note above covers.
+# A staged module — 40 bytes. `RUNS` counts executions holding the staged file, `FREED` is set
+# once by `agnosai_wasm_module_free`, and `GONE` once the file is unlinked, which happens when
+# both say so: freed, and nothing running (2.3.5).
 enum AgnosaiWasmModuleOff {
     AGN_WM_PATH = 0;
     AGN_WM_LEN = 8;
-    AGN_WM_BYTES = 16;
+    AGN_WM_RUNS = 16;
+    AGN_WM_FREED = 24;
+    AGN_WM_GONE = 32;
+    AGN_WM_BYTES = 40;
 }
 
 # WasmResult heap layout — 16 bytes.
@@ -198,13 +224,215 @@ fn _agnosai_wasm_header_ok(buf, len): i64 {
     return 1;
 }
 
-# A unique path for one module's bytes.
+# The directory modules are staged in: `$TMPDIR` when it names a directory, else `/tmp`.
+# Read once: a process's `TMPDIR` is fixed at its start, and `getenv` copies on every call.
+fn agnosai_wasm_stage_dir(): i64 {
+    var held = atomic_load(&_AGNOSAI_WASM_STAGE_DIR);
+    if (held != 0) { return held; }
+    var dir = "/tmp";
+    var v = getenv("TMPDIR");
+    if (v != 0) {
+        if (strlen(v) > 0 && sys_access(v, 0) == 0) { dir = v; }
+    }
+    atomic_fence();
+    atomic_store(&_AGNOSAI_WASM_STAGE_DIR, dir);
+    return dir;
+}
+
+var _AGNOSAI_WASM_STAGE_DIR = 0;
+
+# A unique path for one module's bytes, in `agnosai_wasm_stage_dir`.
 fn _agnosai_wasm_module_path(): Str {
     var sb = str_builder_new();
-    str_builder_add_cstr(sb, "/tmp/agnosai-wasm-");
+    str_builder_add_cstr(sb, agnosai_wasm_stage_dir());
+    str_builder_add_cstr(sb, "/agnosai-wasm-");
     str_builder_add(sb, agnosai_uuid_v4_str());
     str_builder_add_cstr(sb, ".wasm");
     return str_builder_build(sb);
+}
+
+# Read a LEB128 u32 at `buf + load64(at)`, bounded by `end`, into `out`, and move `at` past
+# it. Returns 1, or 0 for one that runs past `end` or past five bytes.
+fn _agnosai_wasm_leb(buf, end, at, out): i64 {
+    var pos = load64(at);
+    var v = 0;
+    var shift = 0;
+    for (var i = 0; i < 5; i = i + 1) {
+        if (pos >= end) { return 0; }
+        var b = load8(buf + pos) & 255;
+        pos = pos + 1;
+        v = v | ((b & 127) << shift);
+        if ((b & 128) == 0) {
+            store64(at, pos);
+            store64(out, v);
+            return 1;
+        }
+        shift = shift + 7;
+    }
+    return 0;
+}
+
+# Why `buf` is not a module a WASM tool can run, as a cstring, or 0. The header is checked
+# already. Every section's framing must fit, and the exports must name a `_start` function.
+#
+# The framing is what a truncated or corrupted upload breaks first, and `_start` is what
+# makes a module a WASI command: without one wasmtime runs nothing and exits 0, so the tool
+# "succeeds" with empty output on every call. Section ids run to 13, the tag section of the
+# exception-handling proposal, and a custom section (0) is skipped like any other.
+fn _agnosai_wasm_structure_error(buf, len): i64 {
+    var at: i64[1];
+    var v: i64[1];
+    store64(&at, AGNOSAI_WASM_HEADER_LEN);
+    var has_start = 0;
+    while (load64(&at) < len) {
+        var id = load8(buf + load64(&at)) & 255;
+        store64(&at, load64(&at) + 1);
+        if (id > 13) { return "a section has an id no WebAssembly version defines"; }
+        if (_agnosai_wasm_leb(buf, len, &at, &v) == 0) { return "a section's size is cut off"; }
+        var start = load64(&at);
+        var end = start + load64(&v);
+        if (end > len) { return "a section runs past the end of the module"; }
+        if (id == 7) {
+            var eat: i64[1];
+            store64(&eat, start);
+            if (_agnosai_wasm_leb(buf, end, &eat, &v) == 0) { return "the export section is malformed"; }
+            var count = load64(&v);
+            for (var k = 0; k < count; k = k + 1) {
+                if (_agnosai_wasm_leb(buf, end, &eat, &v) == 0) { return "the export section is malformed"; }
+                var nlen = load64(&v);
+                var npos = load64(&eat);
+                if (npos + nlen + 1 > end) { return "the export section is malformed"; }
+                var kind = load8(buf + npos + nlen) & 255;
+                store64(&eat, npos + nlen + 1);
+                if (_agnosai_wasm_leb(buf, end, &eat, &v) == 0) { return "the export section is malformed"; }
+                if (kind == 0 && nlen == 6) {
+                    if (memeq(buf + npos, "_start", 6) == 1) { has_start = 1; }
+                }
+            }
+        }
+        store64(&at, end);
+    }
+    if (has_start == 0) {
+        return "no `_start` function export, so wasmtime would run nothing and exit 0";
+    }
+    return 0;
+}
+
+# The wasmtime binary, where kavach's WASM backend looks for it, in its order, or 0.
+fn _agnosai_wasm_binary(): i64 {
+    if (sys_access("/usr/local/bin/wasmtime", 1) == 0) { return "/usr/local/bin/wasmtime"; }
+    if (sys_access("/usr/bin/wasmtime", 1) == 0) { return "/usr/bin/wasmtime"; }
+    var home = getenv("HOME");
+    if (home == 0) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, home);
+    str_builder_add_cstr(sb, "/.cargo/bin/wasmtime");
+    var p = str_cstr(str_builder_build(sb));
+    if (sys_access(p, 1) == 0) { return p; }
+    return 0;
+}
+
+# The confinement `wasmtime compile` runs under: the default, plus wasmtime's own directory
+# and the stage directory where those are outside its rules. Built once.
+fn _agnosai_wasm_check_confinement(bin): i64 {
+    var held = atomic_load(&_AGNOSAI_WASM_CHECK_CF);
+    if (held != 0) { return held; }
+    var cf = agnosai_confinement_default();
+    if (cf == 0) { return 0; }
+    var bdir = str_from(bin);
+    var slash = 0;
+    for (var i = 0; i < str_len(bdir); i = i + 1) {
+        if (load8(str_data(bdir) + i) == 47) { slash = i; }
+    }
+    var dir = str_sub(bdir, 0, slash);
+    if (_agnosai_wasm_under_base(str_cstr(dir)) == 0) {
+        var with_bin = agnosai_confinement_with_path(cf, dir, 0);
+        if (with_bin != 0) { cf = with_bin; }
+    }
+    var stage = agnosai_wasm_stage_dir();
+    if (_agnosai_wasm_under_base(stage) == 0) {
+        var with_stage = agnosai_confinement_with_path(cf, str_from(stage), 0);
+        if (with_stage != 0) { cf = with_stage; }
+    }
+    atomic_fence();
+    atomic_store(&_AGNOSAI_WASM_CHECK_CF, cf);
+    return cf;
+}
+
+var _AGNOSAI_WASM_CHECK_CF = 0;
+
+# Whether `path` lies under a tree the default confinement already gives.
+fn _agnosai_wasm_under_base(path): i64 {
+    if (_agnosai_wasm_prefix(path, "/usr/") == 1) { return 1; }
+    if (_agnosai_wasm_prefix(path, "/bin") == 1) { return 1; }
+    if (_agnosai_wasm_prefix(path, "/tmp") == 1) { return 1; }
+    return 0;
+}
+
+fn _agnosai_wasm_prefix(s, p): i64 {
+    var n = strlen(p);
+    if (strlen(s) < n) { return 0; }
+    return memeq(s, p, n);
+}
+
+# The argv that checks the module at `path`: `wasmtime compile -C cache=n <path> -o /dev/null`, a
+# NULL-terminated array of cstrings.
+#
+# ⚠ **`-C cache=n` is required.** By default wasmtime creates `$HOME/.cache/wasmtime` first, and the
+# confinement gives no `$HOME`, so on a host where that directory did not exist yet every module was
+# refused: `failed to create cache directory: … Permission denied`. Found in the CI replica, as a fresh
+# user, and missed on the development box, where the directory had long existed. Measured on wasmtime
+# 47.0.3 and 50.0.1. `-o /dev/null` keeps no artifact, so a cache would save nothing anyway.
+fn agnosai_wasm_check_argv(bin, path: Str): i64 {
+    var argv = alloc(64);
+    store64(argv, bin);
+    store64(argv + 8, "compile");
+    store64(argv + 16, "-C");
+    store64(argv + 24, "cache=n");
+    store64(argv + 32, str_cstr(path));
+    store64(argv + 40, "-o");
+    store64(argv + 48, "/dev/null");
+    store64(argv + 56, 0);
+    return argv;
+}
+
+# wasmtime's verdict on the staged module at `path`, as a Str to report, or 0 when it compiled
+# or there is no wasmtime to ask. `wasmtime compile -o /dev/null` validates and compiles and
+# keeps nothing, and runs confined, as it parses bytes a caller sent.
+fn _agnosai_wasm_engine_error(path: Str): i64 {
+    var bin = _agnosai_wasm_binary();
+    if (bin == 0) { return 0; }
+    var cf = _agnosai_wasm_check_confinement(bin);
+    if (cf == 0) { return str_from("wasmtime could not be confined to check it"); }
+    var argv = agnosai_wasm_check_argv(bin, path);
+    var sp = agnosai_spawn_capture_confined(bin, argv, agnosai_sanitized_envp(), str_from(""),
+      AGNOSAI_WASM_CHECK_TIMEOUT_MS, 0, cf);
+    if (agnosai_spawn_status(sp) == AGNOSAI_SPAWN_OK && agnosai_spawn_timed_out(sp) == 0) {
+        if (agnosai_spawn_exit_code(sp) == 0) { return 0; }
+    }
+    return _agnosai_wasm_engine_reason(agnosai_spawn_stderr(sp));
+}
+
+# wasmtime's error text as one line: `Error: a\n\nCaused by:\n    b` reads `a: b`, cut to 300
+# bytes, as it goes into a tool registration's error.
+fn _agnosai_wasm_engine_reason(err: Str): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "wasmtime refused it: ");
+    var lines = str_split(err, 10);
+    var wrote = 0;
+    for (var i = 0; i < vec_len(lines); i = i + 1) {
+        var line = str_trim(vec_get(lines, i));
+        if (str_len(line) == 0) { continue; }
+        if (str_eq_cstr(line, "Caused by:") == 1) { continue; }
+        if (str_starts_with(line, str_from("Error: ")) == 1) { line = str_sub(line, 7, str_len(line) - 7); }
+        if (wrote == 1) { str_builder_add_cstr(sb, ": "); }
+        str_builder_add(sb, line);
+        wrote = 1;
+    }
+    if (wrote == 0) { str_builder_add_cstr(sb, "it did not compile"); }
+    var out = str_builder_build(sb);
+    if (str_len(out) > 300) { out = str_sub(out, 0, 300); }
+    return out;
 }
 
 # Load a module from raw bytes — the oracle's `load_module`.
@@ -220,17 +448,33 @@ fn agnosai_wasm_load_module(s, buf, len, out_err): i64 {
               "invalid WASM module: expected magic bytes \\0asm and version 1")));
         return 0;
     }
+    var why = _agnosai_wasm_structure_error(buf, len);
+    if (why != 0) {
+        store64(out_err, agnosai_error_sandbox(str_cat(str_from("invalid WASM module: "),
+              str_from(why))));
+        return 0;
+    }
 
     var path = _agnosai_wasm_module_path();
     if (file_write_all(str_data(path), buf, len) != len) {
+        sys_unlink(str_data(path));
         store64(out_err, agnosai_error_sandbox(str_cat(
               str_from("could not stage WASM module at "), path)));
+        return 0;
+    }
+    var refused = _agnosai_wasm_engine_error(path);
+    if (refused != 0) {
+        sys_unlink(str_data(path));
+        store64(out_err, agnosai_error_sandbox(str_cat(str_from("invalid WASM module: "), refused)));
         return 0;
     }
 
     var m = alloc(AGN_WM_BYTES);
     store64(m + AGN_WM_PATH, path);
     store64(m + AGN_WM_LEN, len);
+    store64(m + AGN_WM_RUNS, 0);
+    store64(m + AGN_WM_FREED, 0);
+    store64(m + AGN_WM_GONE, 0);
     return m;
 }
 
@@ -257,17 +501,45 @@ fn agnosai_wasm_module_len(m): i64 {
     return load64(m + AGN_WM_LEN);
 }
 
-# Remove a module's staged copy from `/tmp`. Every load writes one — wasmtime
-# runs the module from a path — and nothing removed them, so each load left a
-# file behind for good. Call this when a module is discarded; it is safe to call
-# twice. The module must not be executed afterwards.
+# Remove a module's staged copy. Every load writes one — wasmtime runs the module
+# from a path. Safe to call twice, and from any thread. ⚠ **A run in flight keeps the
+# file**: it goes when that run ends (see the module header), and a run that starts
+# afterwards is refused. Returns 1 the first time, 0 after.
 fn agnosai_wasm_module_free(m): i64 {
     if (m == 0) { return 0; }
-    var path = load64(m + AGN_WM_PATH);
-    if (path == 0) { return 0; }
-    sys_unlink(str_cstr(path));
-    store64(m + AGN_WM_PATH, 0);
+    if (atomic_cas(m + AGN_WM_FREED, 0, 1) == 0) { return 0; }
+    if (atomic_load(m + AGN_WM_RUNS) == 0) { _agnosai_wasm_module_unlink(m); }
     return 1;
+}
+
+# Unlink a module's staged file, once, whoever gets here first.
+fn _agnosai_wasm_module_unlink(m): i64 {
+    if (atomic_cas(m + AGN_WM_GONE, 0, 1) == 0) { return 0; }
+    sys_unlink(str_cstr(load64(m + AGN_WM_PATH)));
+    return 1;
+}
+
+# Whether `m` has been freed.
+fn agnosai_wasm_module_freed(m): i64 {
+    return atomic_load(m + AGN_WM_FREED);
+}
+
+# Count a run in. 1, or 0 for a freed module, which must not run: its file is going.
+fn _agnosai_wasm_module_enter(m): i64 {
+    atomic_fetch_add(m + AGN_WM_RUNS, 1);
+    if (atomic_load(m + AGN_WM_FREED) == 1) {
+        _agnosai_wasm_module_leave(m);
+        return 0;
+    }
+    return 1;
+}
+
+# Count a run out, and unlink the file if the module was freed meanwhile and this was its
+# last run.
+fn _agnosai_wasm_module_leave(m): i64 {
+    var left = atomic_fetch_add(m + AGN_WM_RUNS, 0 - 1) - 1;
+    if (left == 0 && atomic_load(m + AGN_WM_FREED) == 1) { _agnosai_wasm_module_unlink(m); }
+    return 0;
 }
 
 # Classify a run that kavach reported — the oracle's `extract_exit_code`.
@@ -456,7 +728,16 @@ fn agnosai_wasm_execute(s, module, input: Str, out_err): i64 {
         return 0;
     }
 
+    # Counted in for as long as kavach has the file, which is the exec. A freed module does not
+    # run: its file is going.
+    if (_agnosai_wasm_module_enter(module) == 0) {
+        sandbox_transition(sandbox, SandboxState.STOPPED);
+        sandbox_transition(sandbox, SandboxState.DESTROYED);
+        store64(out_err, agnosai_error_sandbox(str_from("WASM module was freed: its tool was removed")));
+        return 0;
+    }
     var result = sandbox_exec(sandbox, str_data(load64(module + AGN_WM_PATH)));
+    _agnosai_wasm_module_leave(module);
 
     sandbox_transition(sandbox, SandboxState.STOPPED);
     sandbox_transition(sandbox, SandboxState.DESTROYED);

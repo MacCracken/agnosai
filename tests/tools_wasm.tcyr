@@ -44,8 +44,9 @@ include "src/tools/registry.cyr"
 include "src/tools/wasm_tool.cyr"
 include "src/tools/wasm_loader.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_tmp.cyr"
 
-var _T_ROOT = "/tmp/agnosai-tools-wasm-test";
+var _T_ROOT = _tt_tmp_path("tools-wasm", "");
 
 fn _t_seq(a: Str, b: Str, name): i64 {
     return assert(str_eq(a, b), name);
@@ -62,17 +63,18 @@ fn _t_under(suffix): i64 {
     return _t_join(str_from(_T_ROOT), str_from(suffix));
 }
 
-# The eight-byte WASM header — a valid module for everything that does not run.
+# The fixture's length, in bytes.
+var _T_WASM_LEN = 36;
+
+# The smallest WASI command, `(module (func (export "_start")))`: a valid module for everything
+# that does not need it to do anything.
+#
+# ⚠ Through 2.3.4 this was the eight-byte header alone. Since 2.3.5 that is refused at load, as
+# it has no `_start` and wasmtime would run nothing and exit 0.
 fn _t_wasm_bytes(): i64 {
-    var b = alloc(8);
-    store8(b + 0, 0);
-    store8(b + 1, 97);
-    store8(b + 2, 115);
-    store8(b + 3, 109);
-    store8(b + 4, 1);
-    store8(b + 5, 0);
-    store8(b + 6, 0);
-    store8(b + 7, 0);
+    var b = alloc(_T_WASM_LEN);
+    var bytes = "\x00asm\x01\x00\x00\x00\x01\x04\x01\x60\x00\x00\x03\x02\x01\x00\x07\x0a\x01\x06_start\x00\x00\x0a\x04\x01\x02\x00\x0b";  #skip-lint
+    memcpy(b, bytes, _T_WASM_LEN);
     return b;
 }
 
@@ -154,7 +156,7 @@ fn _t_write_hello_module(path: Str): i64 {
 
 # Write an eight-byte module at `path`.
 fn _t_write_wasm(path: Str): i64 {
-    return file_write_all(str_data(path), _t_wasm_bytes(), 8);
+    return file_write_all(str_data(path), _t_wasm_bytes(), _T_WASM_LEN);
 }
 
 # Write a text file at `path`.
@@ -231,11 +233,65 @@ fn _t_wasm_tool_allocator_forms(): i64 {
     return 0;
 }
 
+# Remove every tool from `r`, so each is let go.
+fn _t_drain(r): i64 {
+    var names = agnosai_tool_registry_names(r);
+    for (var i = 0; i < vec_len(names); i = i + 1) { agnosai_tool_registry_remove(r, vec_get(names, i)); }
+    return 0;
+}
+
+# Free a WASM tool's staged module, as the owner of a tool no registry holds does.
+fn _t_free_tool(t): i64 {
+    if (t == 0) { return 0; }
+    return agnosai_wasm_module_free(agnosai_wasm_tool_module(agnosai_tool_ctx(t)));
+}
+
+# 2.3.5: a WASM tool frees its staged module when the last registry holding it lets it go.
+fn _t_release_suite(): i64 {
+    var err: i64[1];
+    store64(&err, 0);
+    var t = agnosai_wasm_tool_from_bytes(str_from("rel"), str_from("released"), _t_sample_params(),
+      _t_wasm_bytes(), _T_WASM_LEN, &err);
+    if (t == 0) { return assert(0, "a tool to release"); }
+    var path = str_clone(agnosai_wasm_module_path(agnosai_wasm_tool_module(agnosai_tool_ctx(t))));
+    var r1 = agnosai_tool_registry_new();
+    var r2 = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(r1, t);
+    agnosai_tool_registry_register(r2, t);
+    assert_eq(agnosai_tool_holds(t), 2, "two registries hold the tool");
+    agnosai_tool_registry_remove(r1, str_from("rel"));
+    assert_eq(file_exists(str_data(path)), 1, "removed from one, the other still runs it: the module stays");
+    agnosai_tool_registry_remove(r2, str_from("rel"));
+    assert_eq(file_exists(str_data(path)), 0,
+      "removed from the last, its module goes: DELETE no longer leaves the file for the host's life");
+    assert_eq(agnosai_wasm_module_freed(agnosai_wasm_tool_module(agnosai_tool_ctx(t))), 1, "and is freed");
+
+    # A re-register under the same name lets the old one go.
+    var a = agnosai_wasm_tool_from_bytes(str_from("same"), str_from("first"), _t_sample_params(),
+      _t_wasm_bytes(), _T_WASM_LEN, &err);
+    var b = agnosai_wasm_tool_from_bytes(str_from("same"), str_from("second"), _t_sample_params(),
+      _t_wasm_bytes(), _T_WASM_LEN, &err);
+    var apath = str_clone(agnosai_wasm_module_path(agnosai_wasm_tool_module(agnosai_tool_ctx(a))));
+    var bpath = str_clone(agnosai_wasm_module_path(agnosai_wasm_tool_module(agnosai_tool_ctx(b))));
+    var r3 = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(r3, a);
+    agnosai_tool_registry_register(r3, b);
+    assert_eq(file_exists(str_data(apath)), 0, "a tool replaced under its name frees its module");
+    assert_eq(file_exists(str_data(bpath)), 1, "and the one replacing it keeps its own");
+    agnosai_tool_registry_register(r3, b);
+    assert_eq(file_exists(str_data(bpath)), 1, "and registering a tool over itself frees nothing");
+    assert_eq(agnosai_tool_holds(b), 1, "as it is held once, not twice and then not at all");
+    agnosai_tool_registry_remove(r3, str_from("same"));
+    assert_eq(file_exists(str_data(bpath)), 0, "until it is removed");
+    return 0;
+}
+
 fn main(): i64 {
     var err = 0;
     store64(&err, 0);
     _t_wasm_runtime_is_not_silently_missing();
     _t_wasm_tool_allocator_forms();
+    _t_release_suite();
 
     # --- the execute path, against a REAL module ---------------------------
     #
@@ -336,7 +392,7 @@ fn main(): i64 {
     # --- the tool itself: the oracle's wasm_tool tests ---------------------
     store64(&err, 0);
     var tool = agnosai_wasm_tool_from_bytes(str_from("test_tool"),
-      str_from("A test WASM tool"), _t_sample_params(), _t_wasm_bytes(), 8, &err);
+      str_from("A test WASM tool"), _t_sample_params(), _t_wasm_bytes(), _T_WASM_LEN, &err);
     assert_neq(tool, 0, "a tool builds from module bytes");
     _t_seq(agnosai_tool_name(tool), str_from("test_tool"), "carrying its name");
     _t_seq(agnosai_tool_description(tool), str_from("A test WASM tool"),
@@ -355,8 +411,8 @@ fn main(): i64 {
     # The ctx accessors round-trip, and the module is the one that was loaded.
     var tctx = agnosai_tool_ctx(tool);
     assert_neq(agnosai_wasm_tool_module(tctx), 0, "the ctx holds its module");
-    assert_eq(agnosai_wasm_module_len(agnosai_wasm_tool_module(tctx)), 8,
-      "the eight-byte one it was built from");
+    assert_eq(agnosai_wasm_module_len(agnosai_wasm_tool_module(tctx)), _T_WASM_LEN,
+      "the one it was built from");
     assert_eq(vec_len(agnosai_wasm_tool_parameters(tctx)), 1,
       "and the parameter list it was given");
 
@@ -381,7 +437,7 @@ fn main(): i64 {
     # A tool can also be built from an already-loaded module.
     store64(&err, 0);
     var premod = agnosai_wasm_load_module(agnosai_wasm_tool_sandbox(),
-      _t_wasm_bytes(), 8, &err);
+      _t_wasm_bytes(), _T_WASM_LEN, &err);
     assert_neq(premod, 0, "a module loads on its own");
     var pretool = agnosai_wasm_tool(str_from("pre"), str_from("prebuilt"),
       vec_new(), premod);
@@ -489,7 +545,7 @@ fn main(): i64 {
     # ⚠ Its OWN root, not under `_T_ROOT`. `load_all_tool_packages` is scanned
     # later in this file with an exact package count, and a third directory there
     # breaks it — which is what the first version of this block did.
-    var oracle_root = str_from("/tmp/agnosai-tools-wasm-oracle");
+    var oracle_root = str_from(_tt_tmp_path("tools-wasm-oracle", ""));
     sys_mkdir(str_data(oracle_root), 0x1FF);
     var oracle_pkg = _t_join(oracle_root, str_from("/hello-tool"));
     sys_mkdir(str_data(oracle_pkg), 0x1FF);
@@ -545,8 +601,8 @@ fn main(): i64 {
       "a package whose .wasm is named after the DIRECTORY does not load");
     _t_write_wasm(_t_join(pkg2, str_from("/greet.wasm")));
     store64(&err, 0);
-    assert_neq(agnosai_wasm_load_tool_package(pkg2, &err), 0,
-      "and does once the MANIFEST-named file exists");
+    var pkg2_tool = agnosai_wasm_load_tool_package(pkg2, &err);
+    assert_neq(pkg2_tool, 0, "and does once the MANIFEST-named file exists");
 
     # --- Oracle: load_tool_package_missing_manifest -----------------------
     var empty = _t_under("/empty");
@@ -619,9 +675,12 @@ fn main(): i64 {
     # A plain FILE in the tools directory is skipped too, not treated as a package.
     _t_write(_t_under("/README.md"), "not a package");
     store64(&err, 0);
-    assert_eq(agnosai_wasm_load_all_tool_packages(str_from(_T_ROOT),
-        agnosai_tool_registry_new(), &err), 2,
+    var reg2 = agnosai_tool_registry_new();
+    assert_eq(agnosai_wasm_load_all_tool_packages(str_from(_T_ROOT), reg2, &err), 2,
       "a loose file in the tools directory is skipped, not counted");
+    # Emptied, so each registry lets its tools go and their staged modules with them.
+    _t_drain(reg);
+    _t_drain(reg2);
 
     # --- teardown -----------------------------------------------------------
     # Each load staged a copy in /tmp; freeing removes it.
@@ -644,6 +703,17 @@ fn main(): i64 {
     sys_rmdir(str_data(emptydir));
     sys_rmdir(_T_ROOT);
 
+    # The tools this suite built and never registered free their staged modules, as their owner
+    # would; a registered one is freed by its registry (`_t_release_suite`).
+    _t_free_tool(htool);
+    _t_free_tool(tool);
+    _t_free_tool(pretool);
+    _t_free_tool(otool);
+    _t_free_tool(loaded);
+    _t_free_tool(pkg2_tool);
+    # 2.3.5: every scratch path this suite made goes, so two runs at once share none and a run
+    # leaves nothing behind (`tests/test_tmp.cyr`).
+    _tt_cleanup();
     return assert_summary();
 }
 

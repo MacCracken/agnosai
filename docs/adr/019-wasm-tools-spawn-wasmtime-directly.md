@@ -202,3 +202,37 @@ ADR 006's own correction already overturned; the full-port mandate settled the r
 oracle's 521 lines are ported as `src/sandbox/wasm.cyr` (337 lines) and its 11 tests as
 `tests/sandbox_wasm.tcyr`; **M11 closed 2026-08-10**. `mod.cyr`'s header still says this
 is "owed under M11" — that sentence is stale, not this one.
+
+## Addendum (2.3.5): a module is validated at load, staged under `$TMPDIR`, and goes with its tool
+
+**Validated at load, as the oracle's `Module::new` did.** Through 2.3.4 `agnosai_wasm_load_module` checked the eight-byte
+header and staged the bytes, so a broken body failed only at execute. And a module with no `_start` export loaded, ran,
+and **exited 0**, measured with wasmtime 50.0.1: wasmtime runs nothing for a module without an entry point and reports
+success, so a tool built on one "succeeded" with empty output on every call. A load now does three things after the
+header:
+
+1. **Walks the sections.** Every section's size must fit the module, every id must be one a WebAssembly version defines
+   (0 to 13), and the export section must parse.
+2. **Requires a `_start` function export.** A WASM tool is a WASI command. An `_start` that is a memory or a table is not
+   one.
+3. **Asks wasmtime**, where it is installed: `wasmtime compile -C cache=n <staged> -o /dev/null`, under the process
+   tier's confinement (ADR 031), as it parses bytes a caller sent. That is the engine's own verdict, the one
+   `Module::new` gave. About 4 ms a load. The error reads `invalid WASM module: wasmtime refused it: <wasmtime's own
+   words>`. With no wasmtime the first two still run, and execution is refused anyway.
+   ⚠ **`-C cache=n` is not optional.** By default wasmtime first creates `$HOME/.cache/wasmtime`, which the confinement
+   does not give, so on a host where that directory did not exist yet every module was refused with `failed to create
+   cache directory: … Permission denied`. The CI replica found it, running as a fresh user. The development box had made
+   the directory long before, so it passed there. Measured on wasmtime 47.0.3 and 50.0.1.
+
+**Staged under `$TMPDIR`**, else `/tmp`, read once. Through 2.3.4 the path was always `/tmp`.
+
+**A staged module goes with its tool.** A tool takes a release hook (`agnosai_tool_with_release`) and a hold count: a
+registry holds a tool while it is registered and lets it go when it is removed or replaced, and the last one to let it go
+runs the hook. A WASM tool's hook frees its module. Through 2.3.4 `agnosai_wasm_module_free` had no caller outside the
+suites, so `DELETE /api/v1/tools/{name}` and every re-register left the staged file for the life of the host. On this
+development box 305 of them had built up in `/tmp`.
+
+⚠ **Not while a run holds it.** A tool removed mid-call must not have its module pulled out from under wasmtime. A run
+counts itself in before kavach opens the file and out after, the free sets a flag, and whichever of the two comes last
+unlinks, once. A run that starts after the free is refused with `WASM module was freed: its tool was removed`. Measured
+in `tests/sandbox_wasm.tcyr`: a module freed 400 ms into a run that holds it keeps its file until that run ends.

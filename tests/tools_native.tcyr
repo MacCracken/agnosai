@@ -238,7 +238,35 @@ fn _t_tn_call_alloc(): i64 {
     return 0;
 }
 
+# 2.3.5: a tool's release runs once, when the last holder lets it go.
+var _t_released = 0;
+var _t_released_ctx = 0;
+
+fn _t_count_release(ctx): i64 {
+    _t_released = _t_released + 1;
+    _t_released_ctx = ctx;
+    return 0;
+}
+
+fn _t_release(): i64 {
+    var t = agnosai_tool_new(str_from("r"), str_from("d"), 0, 0, 77);
+    assert_eq(agnosai_tool_with_release(t, &_t_count_release), t, "a release hook is set");
+    agnosai_tool_hold(t);
+    agnosai_tool_hold(t);
+    assert_eq(agnosai_tool_holds(t), 2, "held twice");
+    assert_eq(agnosai_tool_drop(t), 0, "let go once, it is still held");
+    assert_eq(_t_released, 0, "and its release has not run");
+    assert_eq(agnosai_tool_drop(t), 1, "let go by the last holder");
+    assert_eq(_t_released, 1, "its release runs, once");
+    assert_eq(_t_released_ctx, 77, "with the tool's ctx");
+    var plain = agnosai_tool_new(str_from("p"), str_from("d"), 0, 0, 0);
+    agnosai_tool_hold(plain);
+    assert_eq(agnosai_tool_drop(plain), 0, "a tool with no release has nothing to run");
+    return 0;
+}
+
 fn main() {
+    _t_release();
     _t_registry_concurrent_access();
     _t_tn_a_forms();
     _t_tn_call_alloc();

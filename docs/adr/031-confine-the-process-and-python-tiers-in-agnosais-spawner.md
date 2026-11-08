@@ -114,7 +114,9 @@ root-only: it listens on 8080 and writes only `/tmp`. Measured: the image builds
 - **Positive.** Python runs confined. kavach's own exec path refuses it by name.
 - **Positive.** Confinement adds nothing per call, in memory or in time. The policy and the filter are built once, and a
   work directory's policy once per directory. `benches/sandbox.bcyr`: `/bin/true` 10.310 ms unconfined and 10.320 ms
-  confined, a Python tool call 41.27 and 41.24 ms. Both are the spawner's 5 ms idle tick, which roadmap 2.3.5 takes out.
+  confined, a Python tool call 41.27 and 41.24 ms. Both were the spawner's 5 ms idle tick. 2.3.5 waits in `ppoll`
+  instead, and confinement's own cost shows: `/bin/true` 0.51 ms unconfined and 1.12 ms confined in the A/B, the 14 landlock paths
+  opened in the child and the filter loaded.
 - **Positive, with it.** The process and Python tiers take the call's allocator (`agnosai_process_execute_argv_a`,
   `agnosai_python_execute_tool_a`), and the Python and WASM tools read it from their input, as 2.3.2's built-ins do. A
   Python tool call in the call's arena keeps 0 B, where it kept 11,032 B, and a process call 0 B, where it kept 13,992
