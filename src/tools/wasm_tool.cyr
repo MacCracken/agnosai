@@ -118,16 +118,21 @@ fn _agnosai_wasm_tool_schema(a, ctx): i64 {
 #      `Value::String(result.stdout)` with no `.trim()`, so a module that
 #      `println!`s gets a trailing newline in its result. Reproduced.
 fn agnosai_wasm_tool_output_of(stdout: Str, exit_code): i64 {
+    return agnosai_wasm_tool_output_of_a(default_alloc(), stdout, exit_code);
+}
+
+# `agnosai_wasm_tool_output_of`, with the output in `a`: the call's allocator, from the loop.
+fn agnosai_wasm_tool_output_of_a(a, stdout: Str, exit_code): i64 {
     if (exit_code != 0) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "WASM module exited with code ");
-        str_builder_add_int(sb, exit_code);
-        return agnosai_tool_output_err(str_builder_build(sb));
+        var sb = str_builder_new_a(a);
+        str_builder_add_cstr_a(a, sb, "WASM module exited with code ");
+        str_builder_add_int_a(a, sb, exit_code);
+        return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
     }
 
-    var v = bayan_json_v_parse_buf(str_data(stdout), str_len(stdout));
+    var v = bayan_json_v_parse_buf_a(a, str_data(stdout), str_len(stdout));
     if (v == 0) {
-        return agnosai_tool_output_ok(bayan_json_v_str_new(stdout));
+        return agnosai_tool_output_ok_a(a, bayan_json_v_str_new_a(a, stdout));
     }
 
     # ⚠ `success` defaults TRUE, and a NON-BOOLEAN also defaults true —
@@ -142,17 +147,17 @@ fn agnosai_wasm_tool_output_of(stdout: Str, exit_code): i64 {
         # ⚠ An ABSENT `result` means the whole value; a present JSON null does
         # not — the same distinction `python_tool` documents.
         var rv = bayan_json_v_obj_get_by_cstr(v, "result");
-        if (rv == 0) { return agnosai_tool_output_ok(v); }
-        return agnosai_tool_output_ok(rv);
+        if (rv == 0) { return agnosai_tool_output_ok_a(a, v); }
+        return agnosai_tool_output_ok_a(a, rv);
     }
 
     var ev = bayan_json_v_obj_get_by_cstr(v, "error");
     if (ev != 0) {
         if (bayan_json_v_is_str(ev) == 1) {
-            return agnosai_tool_output_err(bayan_json_v_str(ev));
+            return agnosai_tool_output_err_a(a, bayan_json_v_str(ev));
         }
     }
-    return agnosai_tool_output_err(str_from("unknown error"));
+    return agnosai_tool_output_err_a(a, str_from_a(a, "unknown error"));
 }
 
 # The JSON a module receives on stdin — `wasm_tool.rs:93-98`.
@@ -167,17 +172,27 @@ fn agnosai_wasm_tool_output_of(stdout: Str, exit_code): i64 {
 # and a mutant that emitted the bare map survived every assertion until this
 # existed.
 fn agnosai_wasm_tool_input_payload(input): Str {
-    var wrapper = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(wrapper, str_from("parameters"),
-      _agnosai_map_to_value_a(default_alloc(), agnosai_tool_input_parameters(input)));
-    return bayan_json_v_build(wrapper);
+    return agnosai_wasm_tool_input_payload_a(default_alloc(), input);
+}
+
+# `agnosai_wasm_tool_input_payload`, built in `a`.
+fn agnosai_wasm_tool_input_payload_a(a, input): Str {
+    var wrapper = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, wrapper, str_from_a(a, "parameters"),
+      _agnosai_map_to_value_a(a, agnosai_tool_input_parameters(input)));
+    return bayan_json_v_build_a(a, wrapper);
 }
 
 # The oracle's `execute()` — marshal the parameters, run, interpret.
+#
+# ⚠ **The payload and the output are in the call's allocator** (2.3.4, 2.3.2's
+# `agnosai_tool_input_alloc`). What kavach allocates inside its run, about 2.9 KB, is its own
+# and stays on its heap.
 fn _agnosai_wasm_tool_execute(ctx, input): i64 {
-    var payload = agnosai_wasm_tool_input_payload(input);
+    var a = agnosai_tool_input_alloc(input);
+    var payload = agnosai_wasm_tool_input_payload_a(a, input);
     if (payload == 0) {
-        return agnosai_tool_output_err(str_from("failed to serialize input"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "failed to serialize input"));
     }
 
     var err = 0;
@@ -185,11 +200,11 @@ fn _agnosai_wasm_tool_execute(ctx, input): i64 {
     var r = agnosai_wasm_execute(agnosai_wasm_tool_sandbox(),
       load64(ctx + AGN_WT_MODULE), payload, &err);
     if (r == 0) {
-        return agnosai_tool_output_err(str_cat(str_from("WASM execution failed: "),
+        return agnosai_tool_output_err_a(a, str_cat_a(a, str_from_a(a, "WASM execution failed: "),
             agnosai_error_message(load64(&err))));
     }
 
-    return agnosai_wasm_tool_output_of(agnosai_wasm_result_stdout(r),
+    return agnosai_wasm_tool_output_of_a(a, agnosai_wasm_result_stdout(r),
       agnosai_wasm_result_exit_code(r));
 }
 

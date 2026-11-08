@@ -2,9 +2,29 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-07 (the 2.3.3 release gate).
+> Last refreshed: 2026-11-08 (the 2.3.4 release gate).
 
-## Now — 2.3.3
+## Now — 2.3.4
+
+| | |
+|---|---|
+| **version** | **2.3.4** (cut 2026-11-08, the bump script's UTC date; 2026-11-07 Pacific): process and Python tools run confined. The child applies kavach's `confine_child_caps` (NO_NEW_PRIVS, landlock, kavach's seccomp filter) in agnosai's own spawner, with the binary pinned by descriptor (ADR 031). OCI containers drop every capability, take `no-new-privileges` and at most 256 processes. The image runs as uid 10001. A process or Python tool call in the call's arena keeps 0 B |
+| **cyrius pin** | **6.7.18**, unchanged |
+| **tests** | **106 suites, 11,298 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.3.3's tree reads 11,199. New: `sandbox_confine` 87. `tools_wasm` +7, `sandbox_oci` +6. 26 mutants, all killed |
+| **coverage** | **99%**: 106/106 files, 1,846/1,857 fns (gate `--min 80`), the same 11 unreferenced as 2.3.3 |
+| **dist** | `dist/agnosai.cyr` 45,353 lines + `dist/agnosai-guard.cyr` 1,034, both v2.3.4, by `wc -l` (2.3.3's read 44,690 and 1,034). Sidecars **6 / 1** leaves, unchanged |
+| **binary** | `build/agnosai` **3,020,792 B** (2.3.3: 3,011,696). aarch64 **7,034,400 B** (7,033,504), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.3.4"` and exits 0 on SIGTERM. **The image** builds, answers `/ready` and runs as `uid=10001(agnosai)` |
+| **deps** | Unchanged from 2.3.3: kavach 3.14.7, and every other dep on its latest tag |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh` 3,212 definitions across 117 files; `check-clean.sh` fmt 236, lint 236, doc 118, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths 235 files; dist. fmt and lint on every test, bench and fuzz file. Then build, aarch64, every test and fuzz unit compiles, tests under DCE, coverage, the example, fuzz 4/4, `distlib --all --check`, `cyrius bench`. **The `ubuntu:26.04` CI replica ran**, on the bumped tree with this release's new files laid over a clean clone, wasmtime 47.0.3, all 8 pins from GitHub, inside docker's default seccomp profile: every `ci.yml` step, 106 suites, 11,152 assertions, 0 failed, `sandbox_confine` 87 of 87. Its first run failed 4 checks of `sandbox_confine`, found the `/proc/self` limit ADR 031 now states, and the suite was fixed |
+| **benchmarks** | New file `benches/sandbox.bcyr`: `spawn_true_unconfined` 10.310 ms and `spawn_true_confined` 10.320 ms, `python_tool_call_unconfined` 41.27 ms and `python_tool_call_confined` 41.24 ms. Confinement shows nothing; both are the drain loop's 5 ms idle tick, which roadmap 2.3.5 takes out. No row in the other ten files runs code this release changed. `bench-history.csv` has 245 rows at 2.3.4, one sweep at a load of 0.3–0.9: median −1.2% against 2.3.3's rows, 188 of 241 within ±5%, not claimed |
+| **confinement** | Measured from inside the child (`tests/sandbox_confine.tcyr`): a read of the server's tree and of `/proc/1/environ` is EACCES, a write outside `/tmp` and the work directory is EACCES, `NoNewPrivs` 1, `Seccomp` 2, `unshare` killed, a binary outside the rules refused at the exec, a program's own exit 124 not read as kavach's landlock step, 100 calls on four threads with no result crossing. Landlock ABI 10 on this kernel, 14 rules |
+| **bytes per call** | A process call in an arena **0 B** (2.3.3: 13,992 B on the global heap), a Python tool call **0 B** (11,032 B), a bare process call 368 B. A WASM call 3,160 B, kavach's run. The first confined call builds the confinement, the environment and the bridge script once, 22,888 B |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4, and neither it nor thoth calls these tiers directly. ⚠ A tool that read `$HOME`, `/var` or `/opt` gets EACCES (CHANGELOG *Behaviour changes*) |
+| **upstream filings** | ⚠ **Eight not committed**, so not visible upstream: kavach (concurrent runs read each other's stderr; a network-denying policy needs a namespace, both new), sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies), hoosh (span ids) and bote (the MCP client, with a scope conflict). kavach's own capability issue is committed and on GitHub. The roadmap's *Waiting on another project* has each path |
+
+### 2.3.3 — the release (2026-11-08)
 
 | | |
 |---|---|

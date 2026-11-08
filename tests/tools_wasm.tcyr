@@ -199,10 +199,43 @@ fn _t_wasm_runtime_is_not_silently_missing(): i64 {
     return 0;
 }
 
+# Whether `p` was allocated from arena `a` after `lo`: the marker technique, as a bump arena
+# hands out addresses in order.
+fn _t_in_arena(a, lo, p): i64 {
+    var hi = alloc_via(a, 8);
+    if (p > lo && p < hi) { return 1; }
+    return 0;
+}
+
+# 2.3.4: the call's allocator forms build what the bare ones build, in the arena given.
+fn _t_wasm_tool_allocator_forms(): i64 {
+    var a = arena_allocator_growable(65536);
+    var input = agnosai_tool_input_new();
+    agnosai_tool_input_set(input, str_from("input"), bayan_json_v_str_new(str_from("world")));
+    var lo = alloc_via(a, 8);
+    var pa = agnosai_wasm_tool_input_payload_a(a, input);
+    assert(str_eq(pa, agnosai_wasm_tool_input_payload(input)) == 1,
+      "the payload in an arena is the bare payload, byte for byte");
+    assert_eq(_t_in_arena(a, lo, str_data(pa)), 1, "and its bytes are in the arena");
+
+    lo = alloc_via(a, 8);
+    var ok = agnosai_wasm_tool_output_of_a(a, str_from("{\"result\":\"hi\",\"success\":true}"), 0);
+    assert_eq(agnosai_tool_output_success(ok), 1, "the ladder in an arena reads a success");
+    assert_eq(_t_in_arena(a, lo, ok), 1, "and builds its output there");
+    var bad = agnosai_wasm_tool_output_of_a(a, str_from(""), 3);
+    assert_eq(agnosai_tool_output_success(bad), 0, "and an exit code is a failure");
+    assert(str_eq_cstr(agnosai_tool_output_error(bad), "WASM module exited with code 3") == 1,
+      "with the bare ladder's message");
+    var raw = agnosai_wasm_tool_output_of_a(a, str_from("plain text"), 0);
+    assert_eq(agnosai_tool_output_success(raw), 1, "and plain stdout is a success carrying it");
+    return 0;
+}
+
 fn main(): i64 {
     var err = 0;
     store64(&err, 0);
     _t_wasm_runtime_is_not_silently_missing();
+    _t_wasm_tool_allocator_forms();
 
     # --- the execute path, against a REAL module ---------------------------
     #

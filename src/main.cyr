@@ -266,6 +266,36 @@ fn _agnosai_main_load_tier_overrides(): i64 {
     return 0;
 }
 
+# The operator's extra paths for confined process and Python tools (ADR 031):
+# `AGNOSAI_SANDBOX_READ_PATHS` read and execute, `AGNOSAI_SANDBOX_WRITE_PATHS` read and
+# write, each a `:`-separated list. A path the host does not have is skipped when the
+# confinement is built, as every rule is. Read before any tool can run, which is the only
+# time `agnosai_confinement_allow` takes one.
+fn _agnosai_main_load_confinement_paths(): i64 {
+    for (var writable = 0; writable <= 1; writable = writable + 1) {
+        var name = "AGNOSAI_SANDBOX_READ_PATHS";
+        if (writable == 1) { name = "AGNOSAI_SANDBOX_WRITE_PATHS"; }
+        var v = getenv(name);
+        if (v != 0) {
+            var parts = str_split(str_from(v), 58);
+            for (var i = 0; i < vec_len(parts); i = i + 1) {
+                var part = vec_get(parts, i);
+                if (str_len(part) > 0) {
+                    # Said here, as the confinement skips a path it cannot open without a word.
+                    if (sys_access(str_cstr(part), 0) != 0) {
+                        _agnosai_main_log_kv(SK_WARN, "sandbox path not found, skipped", 31, "path", 4,
+                          part);
+                    } else {
+                        agnosai_confinement_allow(part, writable);
+                        _agnosai_main_log_kv(SK_INFO, "sandbox path allowed", 20, "path", 4, part);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 # The listening port: `PORT`, else `AGNOSAI_PORT`, else 8080
 # (`rust-old/src/main.rs:120-124`).
 #
@@ -385,6 +415,7 @@ fn main(): i64 {
     agnosai_orchestrator_with_llm_url(orchestrator, hoosh_url, str_from(""));
     agnosai_orchestrator_with_events(orchestrator, events);
     _agnosai_main_load_tier_overrides();
+    _agnosai_main_load_confinement_paths();
 
     var tools = agnosai_tool_registry_new();
     agnosai_register_basic_builtins(tools);

@@ -1,0 +1,92 @@
+# =========================================================================
+# sandbox.bcyr — what a spawned tool costs, and what confining it adds (2.3.4, ADR 031).
+#
+# A spawn is a fork and an exec, so a row here is about a millisecond, and the iteration
+# counts are small to match. The two `/bin/true` rows differ only in the confinement: the
+# landlock ruleset, the seccomp filter and the two lifted descriptors, all applied in the
+# child. Everything a call keeps is in one arena, reset after each call, as on the tool
+# loop.
+#
+# Its own file, not rows in `tools.bcyr`: including the sandbox there would move every row
+# already recorded, by the position effects `bench-history.csv` cannot tell from a change.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/mod.cyr"
+include "src/sandbox/mod.cyr"
+include "src/server/ssrf.cyr"
+include "src/tools/native.cyr"
+include "src/tools/python_tool.cyr"
+
+# Rounds per row, each a batch of `n / _BR` calls.
+var _BR = 5;
+
+var _B_ARENA = 0;
+
+# A Python tool that answers `{"ok": 1}`.
+var _B_PY_TOOL = "class T:\n    def execute(self, p):\n        return {'ok': 1}\ndef create_tool():\n    return T()\n";
+
+# `/bin/true` through the spawner, under `cf` (0 for none), `n` times.
+fn _b_spawn_true(name, cf, n): i64 {
+    var argv = alloc(16);
+    store64(argv, "/bin/true");
+    store64(argv + 8, 0);
+    var env = agnosai_sanitized_envp();
+    var empty = str_from("");
+    var b = bench_new(name);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_spawn_capture_confined_a(_B_ARENA, "/bin/true", argv, env, empty, 5000, 0, cf);
+            reset_via(_B_ARENA);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# A Python tool call through `agnosai_tool_execute`, in the call's arena, the sandbox
+# confined by `cf` as `agnosai_python_sandbox_with_confinement` takes it.
+fn _b_python_tool(name, cf, n): i64 {
+    var py = agnosai_python_sandbox_with_confinement(agnosai_python_sandbox_new(), cf);
+    var src = str_from(_B_PY_TOOL);
+    var tool = agnosai_python_tool(str_from("t"), str_from("d"), vec_new(), src, py);
+    var input = agnosai_tool_input_new();
+    var b = bench_new(name);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_tool_input_with_alloc(input, _B_ARENA);
+            agnosai_tool_execute(tool, input);
+            reset_via(_B_ARENA);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    _B_ARENA = arena_allocator_growable(262144);
+    # Built here, so no row pays for the first build.
+    var cf = agnosai_confinement_default();
+    _b_spawn_true("spawn_true_unconfined", 0, 500);
+    _b_spawn_true("spawn_true_confined", cf, 500);
+    if (sys_access("/usr/bin/python3", 1) == 0) {
+        _b_python_tool("python_tool_call_unconfined", 0, 50);
+        _b_python_tool("python_tool_call_confined", AGNOSAI_CONFINEMENT_DEFAULT, 50);
+    }
+    return 0;
+}
+
+var r = main();
+syscall(60, r);

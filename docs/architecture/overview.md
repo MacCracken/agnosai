@@ -43,7 +43,7 @@ agnosai
   ├── fleet          (registry, placement, GPU, state, relay, discovery,
   │                   coordinator, federation, topology, cost, environment)
   │                                                        [feature: fleet]
-  ├── sandbox        (WASM, process isolation) [feature: sandbox]
+  ├── sandbox        (WASM, cx, OCI, and process and Python under kavach's confinement, ADR 031)
   ├── tools          (tool trait, registry, builtins)
   ├── learning       (RL, profiling, capability scoring)
   ├── definitions    (loader, assembler, versioning, packaging) [feature: definitions]

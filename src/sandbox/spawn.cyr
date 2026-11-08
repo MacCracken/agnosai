@@ -137,6 +137,9 @@ fn agnosai_env_entry_is_sanitized(entry): i64 {
     return agnosai_is_sanitized_env_var(_agnosai_env_entry_name(entry));
 }
 
+# The sanitized environment, once built. See `agnosai_sanitized_envp`.
+var _AGNOSAI_SANITIZED_ENVP = 0;
+
 # Build a NULL-terminated `envp` for a sandboxed child: the parent's environment
 # with every `SANITIZED_ENV_VARS` entry removed.
 #
@@ -146,8 +149,18 @@ fn agnosai_env_entry_is_sanitized(entry): i64 {
 #
 # The entries point into the same heap blob `_read_environ_envp` allocated, so
 # the array survives `fork` without copying strings.
+#
+# **Built once and shared** (2.3.4). The block it filters is the stdlib's, read once and
+# cached (`env_block`), so the filtered array cannot change either, and every caller only
+# reads it. Built per call, it was two pointer arrays on the global heap for every spawn.
 fn agnosai_sanitized_envp(): i64 {
-    return _agnosai_sanitized_envp_of(_read_environ_envp());
+    var e = atomic_load(&_AGNOSAI_SANITIZED_ENVP);
+    if (e != 0) { return e; }
+    e = _agnosai_sanitized_envp_of(_read_environ_envp());
+    # Two threads racing here build two copies, and the loser's is a few hundred bytes, once.
+    atomic_fence();
+    atomic_store(&_AGNOSAI_SANITIZED_ENVP, e);
+    return e;
 }
 
 # The filter itself, over an explicitly supplied `envp` array.
@@ -216,11 +229,16 @@ fn agnosai_sanitized_envp_from(entries): i64 {
 # an allocator's incidental behaviour for a pointer handed to `execve`. The
 # copy costs one allocation per entry against a `fork` and an `exec`.
 fn _agnosai_envp_build(entries): i64 {
+    return _agnosai_envp_build_a(default_alloc(), entries);
+}
+
+# `_agnosai_envp_build`, in `a`. `str_clone_a` ends each copy with its NUL.
+fn _agnosai_envp_build_a(a, entries): i64 {
     var n = vec_len(entries);
-    var out = alloc((n + 1) * 8);
+    var out = alloc_via(a, (n + 1) * 8);
     var i = 0;
     while (i < n) {
-        store64(out + i * 8, str_cstr(vec_get(entries, i)));
+        store64(out + i * 8, str_data(str_clone_a(a, vec_get(entries, i))));
         i = i + 1;
     }
     store64(out + n * 8, 0);
@@ -255,6 +273,334 @@ fn agnosai_envp_has(envp, name: Str): i64 {
 fn agnosai_fd_set_cloexec(fd): i64 {
     if (syscall(SYS_FCNTL, fd, AGNOSAI_F_SETFD, AGNOSAI_FD_CLOEXEC) < 0) { return 0; }
     return 1;
+}
+
+# --- Confinement (2.3.4, ADR 031) -------------------------------------------
+#
+# The process and Python tiers run their child under kavach's confinement: the child
+# applies `confine_child_caps` (NO_NEW_PRIVS, landlock, kavach's exec seccomp filter, every
+# inherited descriptor closed) and then execs a binary the parent pinned by descriptor.
+# agnosai keeps its own spawner around it, so argv, stdin, the environment, the work
+# directory, the deadline and the two captured streams are exactly what they were.
+#
+# ⚠ **Not `sandbox_exec`.** Measured on kavach 3.14.7, that path refuses `python3`, `sh`
+# and every other interpreter by name when there is no rootfs (`blocked command`, exit 126),
+# and keeps each run's exit code, timeout flag and stderr in process-wide variables, which two
+# tool calls on two threads share: about half of 200 concurrent runs read the other's stderr.
+# The confinement primitives have none of that: everything here is per call, and the child is
+# a copy of this process with nothing shared after the fork.
+#
+# ## The landlock rules
+#
+# Read and execute on the system's own trees, read and write on `/tmp`, `/dev/null`,
+# `/dev/shm` and the call's work directory, and nothing else. A tool can run any program
+# under `/usr`, `/bin` or `/lib` and read `/etc`, and cannot read the server's files,
+# another user's, `/home`, `/root`, `/var`, `/srv` or `/opt`, or write anywhere it was not
+# given. `/proc/self` is the child's own `/proc/<pid>`, as the rule is opened in the child,
+# so a program can read its own status and nobody else's. A path the host does not have is
+# left out, as kavach fails a rule it cannot open. `agnosai_confinement_allow` adds one.
+#
+# ⚠ **Network is not isolated on these tiers.** Without a rootfs that takes a network
+# namespace, which needs a user namespace when unprivileged, and Ubuntu 24.04 and later,
+# docker's default seccomp profile and GitHub's runners refuse one. Requiring it would stop
+# every process and Python tool on those hosts. Landlock ABI 4 can refuse TCP connect and
+# bind with no namespace, and kavach applies no network rule yet (filed). kavach's score has
+# given these tiers no network credit since 3.14.7, so nothing claims what is not applied.
+
+# `F_DUPFD_CLOEXEC` — duplicate onto the lowest free fd at or above an argument.
+var AGNOSAI_F_DUPFD_CLOEXEC = 1030;
+
+# kavach's `_spawn_close_inherited` closes every descriptor below this, and a confined
+# child's errno pipe and pinned binary have to survive it.
+var AGNOSAI_CONFINE_FD_FLOOR = 1024;
+
+# The soft open-file limit a confined child raises itself to when its own is too low to
+# hold a descriptor above the floor. Its own, after the fork: the server's is not touched.
+var AGNOSAI_CONFINE_NOFILE = 4096;
+
+# `RLIMIT_NOFILE` on Linux.
+var AGNOSAI_RLIMIT_NOFILE = 7;
+
+# A confined child could not put a descriptor above the floor: the hard open-file limit
+# is below it.
+var AGNOSAI_SPAWN_FAIL_CONFINE_FDS = 5;
+
+# Confinement layout — 40 bytes. `POLICY` is a kavach `SandboxPolicy` with seccomp on and
+# the landlock rules. `SECCOMP` is kavach's exec filter, built once. `LANDLOCK` is the ABI
+# the kernel reports, 0 where it has none. `WORKDIRS` holds a policy per work directory.
+enum AgnosaiConfinementOff {
+    AGN_CF_POLICY = 0;
+    AGN_CF_SECCOMP = 8;
+    AGN_CF_LANDLOCK = 16;
+    AGN_CF_RULES = 24;
+    AGN_CF_WORKDIRS = 32;
+    AGN_CF_SIZE = 40;
+}
+
+# The read-and-execute trees every confined child gets, where the host has them.
+var _AGNOSAI_CONFINE_READ = 0;
+# The read-and-write ones.
+var _AGNOSAI_CONFINE_WRITE = 0;
+# What `agnosai_confinement_allow` added, as `(cstring, writable)` pairs.
+var _AGNOSAI_CONFINE_EXTRA = 0;
+var _AGNOSAI_CONFINE_DEFAULT = 0;
+var _AGNOSAI_CONFINE_LOCK = mutex_new();
+
+# The base rule list, built on first use.
+fn _agnosai_confine_base_paths(): i64 {
+    if (_AGNOSAI_CONFINE_READ != 0) { return 0; }
+    var r = vec_new();
+    vec_push(r, "/usr");
+    vec_push(r, "/bin");
+    vec_push(r, "/sbin");
+    vec_push(r, "/lib");
+    vec_push(r, "/lib32");
+    vec_push(r, "/lib64");
+    vec_push(r, "/libx32");
+    vec_push(r, "/etc");
+    # `/etc/resolv.conf` is a link into here on systemd hosts, and landlock judges the target.
+    vec_push(r, "/run/systemd/resolve");
+    vec_push(r, "/proc/self");
+    vec_push(r, "/dev/urandom");
+    vec_push(r, "/dev/random");
+    vec_push(r, "/dev/zero");
+    var w = vec_new();
+    vec_push(w, "/tmp");
+    vec_push(w, "/dev/null");
+    vec_push(w, "/dev/shm");
+    _AGNOSAI_CONFINE_WRITE = w;
+    _AGNOSAI_CONFINE_READ = r;
+    return 0;
+}
+
+# Give every confined child `path` as well, writable if `writable` is 1. Returns 0, or -1
+# once the confinement is built, as a child already running has its rules.
+# ⚠ **Call at start-up, before any tool runs.** `AGNOSAI_SANDBOX_READ_PATHS` and
+# `AGNOSAI_SANDBOX_WRITE_PATHS` reach this from the binary.
+fn agnosai_confinement_allow(path: Str, writable): i64 {
+    if (path == 0 || str_len(path) == 0) { return 0 - 1; }
+    mutex_lock(_AGNOSAI_CONFINE_LOCK);
+    if (atomic_load(&_AGNOSAI_CONFINE_DEFAULT) != 0) {
+        mutex_unlock(_AGNOSAI_CONFINE_LOCK);
+        return 0 - 1;
+    }
+    if (_AGNOSAI_CONFINE_EXTRA == 0) { _AGNOSAI_CONFINE_EXTRA = vec_new(); }
+    vec_push(_AGNOSAI_CONFINE_EXTRA, str_cstr(path));
+    vec_push(_AGNOSAI_CONFINE_EXTRA, writable);
+    mutex_unlock(_AGNOSAI_CONFINE_LOCK);
+    return 0;
+}
+
+# Add `path` to `p` with `access`, if it exists. kavach fails a rule it cannot open, and the
+# whole confinement with it.
+fn _agnosai_confine_add(p, rules, path, access): i64 {
+    if (sys_access(path, 0) != 0) { return 0; }
+    policy_landlock_add(p, path, access);
+    vec_push(rules, path);
+    vec_push(rules, access);
+    return 1;
+}
+
+# kavach's basic policy, saying what this confinement applies: seccomp, and the network
+# left on. `policy_basic()` says no network, which nothing applies without a namespace (see
+# the section header), and a kavach that began enforcing it would cut every tool off in a
+# patch release. A tool loses its network when agnosai asks for that, and not before.
+fn _agnosai_confine_base_policy(): i64 {
+    var p = policy_basic();
+    SandboxPolicy_set_network_enabled(p, 1);
+    return p;
+}
+
+# A policy holding `c`'s rules, and `workdir` read-write when it is not 0.
+fn _agnosai_confine_policy(rules, workdir): i64 {
+    var p = _agnosai_confine_base_policy();
+    var n = vec_len(rules);
+    for (var i = 0; i + 1 < n; i = i + 2) {
+        policy_landlock_add(p, vec_get(rules, i), vec_get(rules, i + 1));
+    }
+    if (workdir != 0) {
+        if (sys_access(workdir, 0) == 0) { policy_landlock_add(p, workdir, FS_READ_WRITE); }
+    }
+    return p;
+}
+
+# A confinement over the base rules and what `agnosai_confinement_allow` added, or 0 when
+# kavach cannot build its seccomp filter, which is a host that cannot confine at all.
+fn agnosai_confinement_new(): i64 {
+    _agnosai_confine_base_paths();
+    var sres_t, sres_v = security_create_exec_seccomp_filter();
+    if (is_ok(sres_t) == 0) { return 0; }
+
+    var c = alloc(AGN_CF_SIZE);
+    store64(c + AGN_CF_SECCOMP, result_unwrap(sres_t, sres_v));
+    store64(c + AGN_CF_LANDLOCK, security_landlock_abi_version());
+    var rules = vec_new();
+    var p = _agnosai_confine_base_policy();
+    for (var i = 0; i < vec_len(_AGNOSAI_CONFINE_READ); i = i + 1) {
+        _agnosai_confine_add(p, rules, vec_get(_AGNOSAI_CONFINE_READ, i), FS_READ_ONLY);
+    }
+    for (var j = 0; j < vec_len(_AGNOSAI_CONFINE_WRITE); j = j + 1) {
+        _agnosai_confine_add(p, rules, vec_get(_AGNOSAI_CONFINE_WRITE, j), FS_READ_WRITE);
+    }
+    if (_AGNOSAI_CONFINE_EXTRA != 0) {
+        for (var k = 0; k + 1 < vec_len(_AGNOSAI_CONFINE_EXTRA); k = k + 2) {
+            var access = FS_READ_ONLY;
+            if (vec_get(_AGNOSAI_CONFINE_EXTRA, k + 1) == 1) { access = FS_READ_WRITE; }
+            _agnosai_confine_add(p, rules, vec_get(_AGNOSAI_CONFINE_EXTRA, k), access);
+        }
+    }
+    store64(c + AGN_CF_POLICY, p);
+    store64(c + AGN_CF_RULES, rules);
+    store64(c + AGN_CF_WORKDIRS, vec_new());
+    return c;
+}
+
+# The confinement every process and Python tool runs under, built on first use and kept,
+# or 0 when the host cannot confine. A kernel with no landlock gets one with no filesystem
+# rules, and says so once.
+fn agnosai_confinement_default(): i64 {
+    var c = atomic_load(&_AGNOSAI_CONFINE_DEFAULT);
+    if (c != 0) { return c; }
+    mutex_lock(_AGNOSAI_CONFINE_LOCK);
+    c = atomic_load(&_AGNOSAI_CONFINE_DEFAULT);
+    if (c == 0) {
+        c = agnosai_confinement_new();
+        if (c != 0) {
+            if (load64(c + AGN_CF_LANDLOCK) == 0) {
+                var m = "this kernel has no landlock: process and Python tools run without filesystem confinement";
+                sakshi_warn(m, strlen(m));
+            }
+            atomic_fence();
+            atomic_store(&_AGNOSAI_CONFINE_DEFAULT, c);
+        }
+    }
+    mutex_unlock(_AGNOSAI_CONFINE_LOCK);
+    return c;
+}
+
+# What a tier's config holds to mean "the default confinement", resolved when it runs, as
+# the default is built on first use. 0 means unconfined, and anything else is a confinement.
+var AGNOSAI_CONFINEMENT_DEFAULT = 1;
+
+# The confinement a tier's `v` names, or 0 for unconfined. `ok_out` is set to 0 when `v`
+# asked for one and the host could not build it, which a tier refuses rather than run
+# its child unconfined.
+fn agnosai_confinement_resolve(v, ok_out): i64 {
+    store64(ok_out, 1);
+    if (v == 0) { return 0; }
+    if (v != AGNOSAI_CONFINEMENT_DEFAULT) { return v; }
+    var c = agnosai_confinement_default();
+    if (c == 0) { store64(ok_out, 0); }
+    return c;
+}
+
+# `c` with `path` as well, writable if `writable` is 1: a new confinement, sharing `c`'s
+# seccomp filter. For a tool that needs a tree the default does not give, without giving it
+# to every tool. 0 when `path` does not exist.
+fn agnosai_confinement_with_path(c, path: Str, writable): i64 {
+    var cp = str_cstr(path);
+    if (sys_access(cp, 0) != 0) { return 0; }
+    var rules = vec_new();
+    var old = load64(c + AGN_CF_RULES);
+    for (var i = 0; i < vec_len(old); i = i + 1) { vec_push(rules, vec_get(old, i)); }
+    vec_push(rules, cp);
+    if (writable == 1) { vec_push(rules, FS_READ_WRITE); } else { vec_push(rules, FS_READ_ONLY); }
+    var n = alloc(AGN_CF_SIZE);
+    store64(n + AGN_CF_SECCOMP, load64(c + AGN_CF_SECCOMP));
+    store64(n + AGN_CF_LANDLOCK, load64(c + AGN_CF_LANDLOCK));
+    store64(n + AGN_CF_RULES, rules);
+    store64(n + AGN_CF_POLICY, _agnosai_confine_policy(rules, 0));
+    store64(n + AGN_CF_WORKDIRS, vec_new());
+    return n;
+}
+
+# The landlock ABI the kernel reported when `c` was built, 0 for none.
+fn agnosai_confinement_landlock_abi(c): i64 {
+    return load64(c + AGN_CF_LANDLOCK);
+}
+
+# How many landlock rules `c` holds, the host's paths that exist.
+fn agnosai_confinement_rule_count(c): i64 {
+    return vec_len(load64(c + AGN_CF_RULES)) / 2;
+}
+
+# The policy for a child working in `workdir`, a cstring or 0. One per distinct directory,
+# made once and kept: a tier's work directory is the operator's, so there are few, and a
+# policy a call built for itself would be one more allocation per call that never goes.
+fn _agnosai_confine_policy_for(c, workdir): i64 {
+    if (workdir == 0) { return load64(c + AGN_CF_POLICY); }
+    mutex_lock(_AGNOSAI_CONFINE_LOCK);
+    var dirs = load64(c + AGN_CF_WORKDIRS);
+    var p = 0;
+    for (var i = 0; i + 1 < vec_len(dirs); i = i + 2) {
+        if (streq(vec_get(dirs, i), workdir) == 1) { p = vec_get(dirs, i + 1); }
+    }
+    if (p == 0) {
+        var n = strlen(workdir);
+        var key = alloc(n + 1);
+        memcpy(key, workdir, n);
+        store8(key + n, 0);
+        p = _agnosai_confine_policy(load64(c + AGN_CF_RULES), key);
+        vec_push(dirs, key);
+        vec_push(dirs, p);
+    }
+    mutex_unlock(_AGNOSAI_CONFINE_LOCK);
+    return p;
+}
+
+# `fd` again at or above the floor, close-on-exec, raising this child's own soft open-file
+# limit once if it is too low to allow that. In the CHILD: syscalls only.
+fn _agnosai_confine_lift_fd(fd): i64 {
+    var hi = syscall(SYS_FCNTL, fd, AGNOSAI_F_DUPFD_CLOEXEC, AGNOSAI_CONFINE_FD_FLOOR);
+    if (hi >= 0) { return hi; }
+    var lim[16];
+    if (sys_getrlimit(AGNOSAI_RLIMIT_NOFILE, &lim) != 0) { return 0 - 1; }
+    var want = AGNOSAI_CONFINE_NOFILE;
+    if (load64(&lim + 8) < want) { want = load64(&lim + 8); }
+    store64(&lim, want);
+    #ifdef CYRIUS_ARCH_X86
+    syscall(302, 0, AGNOSAI_RLIMIT_NOFILE, &lim, 0);
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    syscall(261, 0, AGNOSAI_RLIMIT_NOFILE, &lim, 0);
+    #endif
+    return syscall(SYS_FCNTL, fd, AGNOSAI_F_DUPFD_CLOEXEC, AGNOSAI_CONFINE_FD_FLOOR);
+}
+
+# Write one word down the errno pipe.
+fn _agnosai_spawn_report(fd, word): i64 {
+    var w[8];
+    store64(&w, word);
+    sys_write(fd, &w, 8);
+    return 0;
+}
+
+# The confined child's last steps: die with the server, lift the errno pipe and the pin
+# above what kavach closes, confine, say so, and exec the pin. Returns only to exit.
+#
+# Order: `confine_child_caps` closes every inherited descriptor, so the two lifts come
+# first, and seccomp is its last step, so nothing after it needs a syscall it denies.
+# The marker is written after confinement and before the exec, so a child that never
+# writes it was stopped by a confinement step, whose exit code kavach chose.
+fn _agnosai_spawn_confine_child(policy, seccomp, pin, xwf, ppid, argv, envp): i64 {
+    syscall(SYS_PRCTL, 1, 9, 0, 0, 0);
+    if (sys_getppid() != ppid) { syscall(SYS_EXIT_GROUP, 127); }
+    var xhi = _agnosai_confine_lift_fd(xwf);
+    if (xhi < 0) {
+        _agnosai_spawn_report(xwf, AGNOSAI_SPAWN_FAIL_CONFINE_FDS);
+        syscall(SYS_EXIT_GROUP, 127);
+    }
+    var phi = _agnosai_confine_lift_fd(pin);
+    if (phi < 0) {
+        _agnosai_spawn_report(xwf, AGNOSAI_SPAWN_FAIL_CONFINE_FDS);
+        syscall(SYS_EXIT_GROUP, 127);
+    }
+    confine_child_caps(policy, 0, 0, sys_getuid(), sys_getgid(), seccomp, 0, 0, 0);
+    _agnosai_spawn_report(xhi, AGNOSAI_SPAWN_CONFINED);
+    kv_exec_pinned(phi, argv, envp);
+    _agnosai_spawn_report(xhi, AGNOSAI_SPAWN_FAIL_EXEC);
+    syscall(SYS_EXIT_GROUP, 127);
+    return 0;
 }
 
 # --- Spawn ----------------------------------------------------------------
@@ -374,6 +720,15 @@ var AGNOSAI_SPAWN_FAIL_CHDIR = 2;
 # errno pipe and the reason is filled in on the parent side.
 var AGNOSAI_SPAWN_FAIL_SETUP = 3;
 
+# A confined child stopped before its program ran: a step of kavach's sequence
+# refused, and the child's exit code names which (`agnosai_spawn_confine_failure`).
+var AGNOSAI_SPAWN_FAIL_CONFINE = 4;
+
+# What a confined child writes once it is confined and about to exec. A child that
+# exits without it never reached the exec, so its exit code is kavach's and not the
+# program's. 2.3.4, ADR 031.
+var AGNOSAI_SPAWN_CONFINED = 1129270854;
+
 # No deadline — run until the child finishes on its own.
 var AGNOSAI_SPAWN_NO_TIMEOUT = 0;
 
@@ -402,6 +757,12 @@ var AGNOSAI_SPAWN_DEFAULT_PATH = "/bin:/usr/bin";
 # slash is used literally, matching `execvp`. When nothing matches, the original
 # name is returned so the child's `execve` fails and reports it the usual way.
 fn _agnosai_spawn_resolve(name, envp): i64 {
+    return _agnosai_spawn_resolve_a(default_alloc(), name, envp);
+}
+
+# `_agnosai_spawn_resolve`, building its candidates in `a`. The answer is `name` itself or
+# a cstring in `a`.
+fn _agnosai_spawn_resolve_a(a, name, envp): i64 {
     var i = 0;
     while (load8(name + i) != 0) {
         if (load8(name + i) == 47) { return name; }
@@ -412,8 +773,9 @@ fn _agnosai_spawn_resolve(name, envp): i64 {
     var e = 0;
     while (envp != 0 && path == 0 && load64(envp + e * 8) != 0) {
         var entry = load64(envp + e * 8);
-        # `+ 5` steps over `PATH=` to the value.
-        if (str_eq_cstr(_agnosai_env_entry_name(entry), "PATH") == 1) { path = entry + 5; }
+        # `+ 5` steps over `PATH=` to the value. Compared in place: a name taken as a Str was a
+        # 16-byte header per entry checked, kept for good on every spawn by a bare name.
+        if (memeq(entry, "PATH=", 5) == 1) { path = entry + 5; }
         e = e + 1;
     }
     if (path == 0) { path = AGNOSAI_SPAWN_DEFAULT_PATH; }
@@ -424,11 +786,12 @@ fn _agnosai_spawn_resolve(name, envp): i64 {
         var ch = load8(path + j);
         if (ch == 58 || ch == 0) {
             if (j > start) {
-                var sb = str_builder_new();
-                str_builder_add(sb, str_new(path + start, j - start));
-                str_builder_add_cstr(sb, "/");
-                str_builder_add_cstr(sb, name);
-                var cand = str_cstr(str_builder_build(sb));
+                var sb = str_builder_new_a(a);
+                _agnosai_sb_add_bytes_a(a, sb, path + start, j - start);
+                str_builder_add_cstr_a(a, sb, "/");
+                str_builder_add_cstr_a(a, sb, name);
+                # `str_builder_build_a` ends its bytes with a NUL, so the data is a cstring.
+                var cand = str_data(str_builder_build_a(a, sb));
                 if (sys_access(cand, AGNOSAI_SPAWN_X_OK) == 0) { return cand; }
             }
             start = j + 1;
@@ -458,12 +821,26 @@ fn _agnosai_fd_set_nonblock(fd): i64 {
     return 1;
 }
 
+# Append `n` bytes at `p` to `sb` in `a`, with no Str allocated to carry them: the header
+# is on the stack, and `str_builder_add_a` reads only its pointer and length.
+fn _agnosai_sb_add_bytes_a(a, sb, p, n): i64 {
+    var hdr[16];
+    store64(&hdr, p);
+    store64(&hdr + 8, n);
+    return str_builder_add_a(a, sb, &hdr);
+}
+
 # A spawn result carrying nothing but the failure verdict.
 fn _agnosai_spawn_failure(): i64 {
-    var r = alloc(AGN_SPR_SIZE);
+    return _agnosai_spawn_failure_a(default_alloc());
+}
+
+# `_agnosai_spawn_failure`, in `a`.
+fn _agnosai_spawn_failure_a(a): i64 {
+    var r = alloc_via(a, AGN_SPR_SIZE);
     store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_FAILED);
-    store64(r + AGN_SPR_STDOUT, str_from(""));
-    store64(r + AGN_SPR_STDERR, str_from(""));
+    store64(r + AGN_SPR_STDOUT, str_from_a(a, ""));
+    store64(r + AGN_SPR_STDERR, str_from_a(a, ""));
     store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
     store64(r + AGN_SPR_SIGNAL, 0);
     store64(r + AGN_SPR_TIMED_OUT, 0);
@@ -485,13 +862,18 @@ fn _agnosai_spawn_failure(): i64 {
 # `pipes` is the flat 32-byte block the four `sys_pipe` calls fill; `n` is how
 # many of them succeeded, so the loop closes exactly what exists.
 fn _agnosai_spawn_setup_failure(pipes, n): i64 {
+    return _agnosai_spawn_setup_failure_a(default_alloc(), pipes, n);
+}
+
+# `_agnosai_spawn_setup_failure`, with the result in `a`.
+fn _agnosai_spawn_setup_failure_a(a, pipes, n): i64 {
     var i = 0;
     while (i < n) {
         sys_close(load32(pipes + i * 8));
         sys_close(load32(pipes + i * 8 + 4));
         i = i + 1;
     }
-    return _agnosai_spawn_failure();
+    return _agnosai_spawn_failure_a(a);
 }
 
 # Run `path` with `argv` and `envp`, capturing stdout and stderr separately.
@@ -515,6 +897,23 @@ fn _agnosai_spawn_setup_failure(pipes, n): i64 {
 # **The write interleaves with the reads.** Writing the whole input first is
 # what the oracle does and what deadlocks here — see the module header.
 fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_dir): i64 {
+    return agnosai_spawn_capture_confined(path, argv, envp, input, timeout_ms, work_dir, 0);
+}
+
+# `agnosai_spawn_capture_input`, with the child confined by `cf`, or not at all when `cf`
+# is 0 (ADR 031). A confined program is pinned by descriptor before the fork, so a name
+# that resolves to nothing executable is a spawn failure with no child, and the program
+# that runs is the file that was checked, whatever replaces its path in between.
+fn agnosai_spawn_capture_confined(path, argv, envp, input: Str, timeout_ms, work_dir, cf): i64 {
+    return agnosai_spawn_capture_confined_a(default_alloc(), path, argv, envp, input, timeout_ms,
+      work_dir, cf);
+}
+
+# `agnosai_spawn_capture_confined`, with everything a call keeps in `a`: the two captured
+# streams, the result, and a resolved program path. A per-call arena then keeps nothing of
+# the spawn on the global heap. ⚠ **`a` is this thread's**: the drain runs on it, and nothing
+# else does.
+fn agnosai_spawn_capture_confined_a(a, path, argv, envp, input: Str, timeout_ms, work_dir, cf): i64 {
     # **Ignore `SIGPIPE` before anything can be written.** A child that exits
     # without draining its stdin leaves the parent writing into a pipe with no
     # reader, and the default disposition kills the *writer* — agnosai itself,
@@ -534,10 +933,10 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
     # One flat block rather than four, so a setup failure can close exactly the
     # pipes that opened — see `_agnosai_spawn_setup_failure`. Two `i32` fds each.
     var pipes[32];
-    if (sys_pipe(&pipes) < 0) { return _agnosai_spawn_setup_failure(&pipes, 0); }
-    if (sys_pipe(&pipes + 8) < 0) { return _agnosai_spawn_setup_failure(&pipes, 1); }
-    if (sys_pipe(&pipes + 16) < 0) { return _agnosai_spawn_setup_failure(&pipes, 2); }
-    if (sys_pipe(&pipes + 24) < 0) { return _agnosai_spawn_setup_failure(&pipes, 3); }
+    if (sys_pipe(&pipes) < 0) { return _agnosai_spawn_setup_failure_a(a, &pipes, 0); }
+    if (sys_pipe(&pipes + 8) < 0) { return _agnosai_spawn_setup_failure_a(a, &pipes, 1); }
+    if (sys_pipe(&pipes + 16) < 0) { return _agnosai_spawn_setup_failure_a(a, &pipes, 2); }
+    if (sys_pipe(&pipes + 24) < 0) { return _agnosai_spawn_setup_failure_a(a, &pipes, 3); }
     var irf = load32(&pipes);
     var iwf = load32(&pipes + 4);
     var orf = load32(&pipes + 8);
@@ -547,14 +946,34 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
     var xrf = load32(&pipes + 24);
     var xwf = load32(&pipes + 28);
 
-    if (agnosai_fd_set_cloexec(xwf) == 0) { return _agnosai_spawn_setup_failure(&pipes, 4); }
+    if (agnosai_fd_set_cloexec(xwf) == 0) { return _agnosai_spawn_setup_failure_a(a, &pipes, 4); }
 
     # Resolved BEFORE the fork: the search allocates, and doing it in the child
     # would build strings the parent can never see or free.
-    var prog = _agnosai_spawn_resolve(path, envp);
+    var prog = _agnosai_spawn_resolve_a(a, path, envp);
+
+    # Pinned before the fork as well, and refused here: a name the search did not turn
+    # into a path, or a path that is no executable file. The policy for a work directory
+    # is looked up here too, as it may be made, which allocates.
+    var pin = 0 - 1;
+    var cpol = 0;
+    var ppid = 0;
+    if (cf != 0) {
+        pin = kv_exec_pin(prog);
+        if (pin < 0) {
+            var nf = _agnosai_spawn_setup_failure_a(a, &pipes, 4);
+            store64(nf + AGN_SPR_FAIL_REASON, AGNOSAI_SPAWN_FAIL_EXEC);
+            return nf;
+        }
+        cpol = _agnosai_confine_policy_for(cf, work_dir);
+        ppid = sys_getpid();
+    }
 
     var pid = sys_fork();
-    if (pid < 0) { return _agnosai_spawn_setup_failure(&pipes, 4); }
+    if (pid < 0) {
+        if (pin >= 0) { sys_close(pin); }
+        return _agnosai_spawn_setup_failure_a(a, &pipes, 4);
+    }
     if (pid == 0) {
         # ⚠ `sys_dup2`, NOT `syscall(SYS_DUP2, ...)`. SYS_DUP2 is x86_64-only —
         # aarch64 Linux has no dup2 syscall at all, only dup3 — so the raw form
@@ -604,6 +1023,10 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
                 syscall(SYS_EXIT_GROUP, 127);
             }
         }
+        if (cf != 0) {
+            _agnosai_spawn_confine_child(cpol, load64(cf + AGN_CF_SECCOMP), pin, xwf, ppid, argv,
+              envp);
+        }
         sys_execve(prog, argv, envp);
         var e[8];
         store64(&e, AGNOSAI_SPAWN_FAIL_EXEC);
@@ -611,6 +1034,7 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
         syscall(SYS_EXIT_GROUP, 127);
     }
 
+    if (pin >= 0) { sys_close(pin); }
     sys_close(irf);
     sys_close(owf);
     sys_close(ewf);
@@ -619,9 +1043,11 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
     _agnosai_fd_set_nonblock(erf);
     _agnosai_fd_set_nonblock(iwf);
 
-    var ob = str_builder_new();
-    var eb = str_builder_new();
-    var buf = alloc(AGNOSAI_SPAWN_CHUNK);
+    var ob = str_builder_new_a(a);
+    var eb = str_builder_new_a(a);
+    # On the stack: one chunk, reused for every read of this call.
+    var chunk[4096];
+    var buf = &chunk;
     var ilen = str_len(input);
     var idata = str_data(input);
     var isent = 0;
@@ -663,12 +1089,12 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
         }
         if (odone == 0) {
             var n = sys_read(orf, buf, AGNOSAI_SPAWN_CHUNK);
-            if (n > 0) { str_builder_add(ob, str_new(buf, n)); moved = 1; }
+            if (n > 0) { _agnosai_sb_add_bytes_a(a, ob, buf, n); moved = 1; }
             if (n == 0) { odone = 1; }
         }
         if (edone == 0) {
             var m = sys_read(erf, buf, AGNOSAI_SPAWN_CHUNK);
-            if (m > 0) { str_builder_add(eb, str_new(buf, m)); moved = 1; }
+            if (m > 0) { _agnosai_sb_add_bytes_a(a, eb, buf, m); moved = 1; }
             if (m == 0) { edone = 1; }
         }
 
@@ -688,8 +1114,15 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
     sys_close(orf);
     sys_close(erf);
 
-    var xb[8];
-    var xn = sys_read(xrf, &xb, 8);
+    # Up to two words: a failure, or for a confined child the marker and then whatever
+    # stopped the exec. Read to EOF, as the second may follow the first in its own write.
+    var xb[16];
+    var xn = 0;
+    while (xn < 16) {
+        var got = sys_read(xrf, &xb + xn, 16 - xn);
+        if (got <= 0) { break; }
+        xn = xn + got;
+    }
     sys_close(xrf);
 
     var st[8];
@@ -699,17 +1132,39 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
     if (killed == 0) { sys_waitpid(pid, &st, 0); }
     var raw = load64(&st);
 
-    var r = alloc(AGN_SPR_SIZE);
-    store64(r + AGN_SPR_STDOUT, str_builder_build(ob));
-    store64(r + AGN_SPR_STDERR, str_builder_build(eb));
+    var r = alloc_via(a, AGN_SPR_SIZE);
+    store64(r + AGN_SPR_STDOUT, str_builder_build_a(a, ob));
+    store64(r + AGN_SPR_STDERR, str_builder_build_a(a, eb));
     store64(r + AGN_SPR_TIMED_OUT, killed);
     store64(r + AGN_SPR_STDIN_ERR, ierr);
 
-    if (xn > 0) {
+    # A confined child that ran its program wrote the marker first. Without it, the
+    # child exited inside kavach's sequence, and its exit code is the step that refused.
+    var failed = 0;
+    var reason = AGNOSAI_SPAWN_FAIL_NONE;
+    if (xn >= 8) {
+        reason = load64(&xb);
+        failed = 1;
+        if (cf != 0 && reason == AGNOSAI_SPAWN_CONFINED) {
+            failed = 0;
+            if (xn >= 16) {
+                reason = load64(&xb + 8);
+                failed = 1;
+            }
+        }
+    } elif (cf != 0 && killed == 0) {
+        reason = AGNOSAI_SPAWN_FAIL_CONFINE;
+        failed = 1;
+    }
+    if (failed == 1) {
         store64(r + AGN_SPR_STATUS, AGNOSAI_SPAWN_FAILED);
         store64(r + AGN_SPR_EXIT_CODE, 0 - 1);
         store64(r + AGN_SPR_SIGNAL, 0);
-        store64(r + AGN_SPR_FAIL_REASON, load64(&xb));
+        if (reason == AGNOSAI_SPAWN_FAIL_CONFINE) {
+            store64(r + AGN_SPR_EXIT_CODE, (raw >> 8) & 255);
+            store64(r + AGN_SPR_SIGNAL, raw & 127);
+        }
+        store64(r + AGN_SPR_FAIL_REASON, reason);
         return r;
     }
 
@@ -728,6 +1183,22 @@ fn agnosai_spawn_capture_input(path, argv, envp, input: Str, timeout_ms, work_di
         store64(r + AGN_SPR_EXIT_CODE, (raw >> 8) & 255);
     }
     return r;
+}
+
+# Why a confined child stopped before its program ran, a cstring: the step kavach names
+# for the child's exit code, or what agnosai's own setup reports. 0 for a spawn that did
+# not fail that way.
+fn agnosai_spawn_confine_failure(r): i64 {
+    if (agnosai_spawn_status(r) != AGNOSAI_SPAWN_FAILED) { return 0; }
+    var reason = agnosai_spawn_fail_reason(r);
+    if (reason == AGNOSAI_SPAWN_FAIL_CONFINE_FDS) {
+        return "cannot keep a descriptor above 1024 (the hard open-file limit is too low)";
+    }
+    if (reason != AGNOSAI_SPAWN_FAIL_CONFINE) { return 0; }
+    if (agnosai_spawn_signal(r) != 0) { return "the child was killed while being confined"; }
+    var name = spawn_exit_name(agnosai_spawn_exit_code(r));
+    if (name == 0) { return "the child exited while being confined"; }
+    return name;
 }
 
 # Run `path` with no stdin, capturing stdout and stderr.

@@ -209,6 +209,16 @@ fn _t_oci_argv(): i64 {
       "--network=none by default — the flag whose absence silently grants a network");
 
     # `--memory` must be immediately followed by its value, not merely present.
+    # 2.3.4, ADR 031: docker's own hardening, which the Rust line never passed.
+    assert(_t_argv_has(argv, "--cap-drop=ALL") == 1, "every capability is dropped");
+    assert(_t_argv_has(argv, "--security-opt=no-new-privileges") == 1,
+      "and a setuid binary in the image cannot raise its privileges");
+    assert(_t_argv_at(argv, "256") == _t_argv_at(argv, "--pids-limit") + 1,
+      "and a fork bomb stops at 256 processes");
+    assert(_t_argv_at(argv, "--cap-drop=ALL") == _t_argv_at(argv, "--memory") + 2,
+      "right after the memory limit, where a reader of the run line looks for the posture");
+    assert(_t_argv_at(argv, "--cap-drop=ALL") < _t_argv_at(argv, "alpine:latest"),
+      "and before the image, or docker would hand them to the entrypoint");
     assert(_t_argv_at(argv, "256m") == _t_argv_at(argv, "--memory") + 1,
       "the memory limit follows its flag");
     assert(_t_argv_at(argv, "/tmp") == _t_argv_at(argv, "--tmpfs") + 1,

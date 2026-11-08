@@ -42,6 +42,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /build/build/agnosai /usr/local/bin/agnosai
 EXPOSE 8080
 
+# An unprivileged user (2.3.4, ADR 031). kavach confines process and Python tools with
+# NO_NEW_PRIVS, landlock and seccomp, and bounds a root child's capabilities only inside a
+# rootfs, which these tiers do not use. So a server running as root would hand every tool
+# root's capabilities. It needs none: it listens on 8080, above 1024, and writes only /tmp.
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin --uid 10001 agnosai
+USER agnosai
+
 # `RUST_LOG` keeps the oracle's spelling deliberately — the port reads the same
 # variable so a deployment's existing configuration keeps working.
 ENV RUST_LOG=info

@@ -1,0 +1,536 @@
+# =========================================================================
+# sandbox_confine.tcyr — the process and Python tiers under kavach's confinement (ADR 031).
+#
+# No oracle tests: the Rust line confined nothing on these tiers. Each claim is measured from
+# inside the child, as a tool would meet it: a file read or written, a syscall made, a field
+# of `/proc/self/status`. A directory under the suite's own working tree stands for the
+# server's files, as nothing in the rules gives it.
+#
+# ⚠ **Where the kernel has no landlock the filesystem assertions skip**, and say so. kavach
+# installs no ruleset there and agnosai warns at the first build; the seccomp and
+# NO_NEW_PRIVS assertions still run, as those do not depend on it.
+# =========================================================================
+
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/core/mod.cyr"
+include "src/telemetry/mod.cyr"
+include "src/sandbox/mod.cyr"
+include "src/server/ssrf.cyr"
+include "src/tools/native.cyr"
+include "src/tools/python_tool.cyr"
+include "tests/test_helpers.cyr"
+
+# A Python tool that answers `{"ok": 1}`.
+var _T_PY_TOOL = "class T:\n    def execute(self, p):\n        return {'ok': 1}\ndef create_tool():\n    return T()\n";
+
+# A directory outside every rule, made by `_t_setup`, as a cstring, with a file in it.
+var _T_OUT = 0;
+var _T_OUT_FILE = 0;
+# A directory the suite gives confined children through `agnosai_confinement_allow`.
+var _T_ALLOWED = 0;
+var _T_ALLOWED_FILE = 0;
+# Whether the kernel has landlock, so whether the filesystem assertions mean anything.
+var _T_LANDLOCK = 0;
+# Whether the working tree is outside every rule, which the outside assertions need.
+var _T_OUTSIDE_OK = 0;
+
+fn _t_join(a, b): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, a);
+    str_builder_add_cstr(sb, b);
+    return str_cstr(str_builder_build(sb));
+}
+
+fn _t_starts(s, prefix): i64 {
+    var n = strlen(prefix);
+    if (strlen(s) < n) { return 0; }
+    return memeq(s, prefix, n);
+}
+
+fn _t_write(path, text): i64 {
+    return file_write_all(path, text, strlen(text));
+}
+
+# The working tree is the suite's stand-in for the server's files, unless it lies under a
+# tree the rules give, where it would prove nothing.
+fn _t_setup(): i64 {
+    var cwd = alloc(4096);
+    if (syscall(SYS_GETCWD, cwd, 4096) < 0) { return 0; }
+    _T_OUTSIDE_OK = 1;
+    var given = vec_new();
+    vec_push(given, "/usr");
+    vec_push(given, "/bin");
+    vec_push(given, "/sbin");
+    vec_push(given, "/lib");
+    vec_push(given, "/etc");
+    vec_push(given, "/tmp");
+    vec_push(given, "/dev");
+    vec_push(given, "/proc");
+    vec_push(given, "/run/systemd/resolve");
+    for (var i = 0; i < vec_len(given); i = i + 1) {
+        if (_t_starts(cwd, vec_get(given, i)) == 1) { _T_OUTSIDE_OK = 0; }
+    }
+    var tag = str_cstr(str_from_int(sys_getpid()));
+    var base = _t_join(cwd, "/build");
+    sys_mkdir(base, 493);
+    _T_OUT = _t_join(_t_join(base, "/sandbox-confine-out-"), tag);
+    sys_mkdir(_T_OUT, 493);
+    _T_OUT_FILE = _t_join(_T_OUT, "/secret.txt");
+    _t_write(_T_OUT_FILE, "the server's own file\n");
+    _T_ALLOWED = _t_join(_t_join(base, "/sandbox-confine-allowed-"), tag);
+    sys_mkdir(_T_ALLOWED, 493);
+    _T_ALLOWED_FILE = _t_join(_T_ALLOWED, "/data.txt");
+    _t_write(_T_ALLOWED_FILE, "given by the operator\n");
+    return 1;
+}
+
+fn _t_teardown(): i64 {
+    sys_unlink(_T_OUT_FILE);
+    sys_unlink(_t_join(_T_OUT, "/written.txt"));
+    sys_rmdir(_T_OUT);
+    sys_unlink(_T_ALLOWED_FILE);
+    sys_rmdir(_T_ALLOWED);
+    return 0;
+}
+
+# A NULL-terminated argv of up to three cstrings.
+fn _t_argv(a, b, c): i64 {
+    var v = alloc(32);
+    store64(v, a);
+    store64(v + 8, b);
+    store64(v + 16, c);
+    store64(v + 24, 0);
+    return v;
+}
+
+fn _t_sh(script): i64 {
+    return _t_argv("/bin/sh", "-c", script);
+}
+
+# Run `argv` confined by `cf`, in `wd` (a cstring or 0), feeding `input`.
+fn _t_run_in(cf, argv, input, wd): i64 {
+    return agnosai_spawn_capture_confined(load64(argv), argv, agnosai_sanitized_envp(),
+      str_from(input), 20000, wd, cf);
+}
+
+fn _t_run(argv): i64 {
+    return _t_run_in(agnosai_confinement_default(), argv, "", 0);
+}
+
+fn _t_out(sp): i64 {
+    return str_trim(agnosai_spawn_stdout(sp));
+}
+
+fn _t_ran(sp, name): i64 {
+    return assert_eq(agnosai_spawn_status(sp), AGNOSAI_SPAWN_OK, name);
+}
+
+fn _t_landlock(name): i64 {
+    if (_T_LANDLOCK == 0) {
+        println("  skip: this kernel has no landlock");
+        return 0;
+    }
+    if (_T_OUTSIDE_OK == 0) {
+        println("  skip: the working tree is under a tree the rules give");
+        return 0;
+    }
+    return 1;
+}
+
+fn test_files(): i64 {
+    var sp = _t_run(_t_argv("/bin/cat", "/etc/hostname", 0));
+    _t_ran(sp, "a program under /bin runs");
+    assert_eq(agnosai_spawn_exit_code(sp), 0, "and reads /etc");
+
+    var tmp = _t_run(_t_sh(
+        "f=/tmp/agnosai-confine-probe; echo kept > $f && cat $f && rm $f"));
+    assert(str_eq_cstr(_t_out(tmp), "kept") == 1, "/tmp is read and write");
+
+    var nul = _t_run(_t_sh("echo gone > /dev/null && echo ok"));
+    assert(str_eq_cstr(_t_out(nul), "ok") == 1, "/dev/null is written");
+
+    if (_t_landlock("files") == 0) { return 0; }
+    var rd = _t_run(_t_argv("/bin/cat", _T_OUT_FILE, 0));
+    _t_ran(rd, "a read outside the rules still runs the program");
+    assert_eq(agnosai_spawn_exit_code(rd), 1, "and the read fails");
+    assert(str_index_of_cstr(agnosai_spawn_stderr(rd), "Permission denied") >= 0,
+      "with EACCES: the server's own files are not the tool's");
+    assert(str_len(agnosai_spawn_stdout(rd)) == 0, "and not one byte of them reached stdout");
+
+    var wr = _t_run(_t_sh(str_cstr(str_cat(str_cat(str_from("echo x > "), str_from(_T_OUT)),
+            str_from("/written.txt")))));
+    assert(agnosai_spawn_exit_code(wr) != 0, "a write outside the rules fails");
+    assert(sys_access(_t_join(_T_OUT, "/written.txt"), 0) != 0, "and created nothing");
+
+    var other = _t_run(_t_argv("/bin/cat", "/proc/1/environ", 0));
+    assert(agnosai_spawn_exit_code(other) != 0, "another process's /proc is not the tool's");
+    var mine = _t_run(_t_argv("/bin/cat", "/proc/self/status", 0));
+    assert_eq(agnosai_spawn_exit_code(mine), 0, "and its own is");
+    # ⚠ Its own, not its children's: the rule is opened in the confined child, so a process it
+    # starts reads its own `/proc/<pid>` as EACCES. `ADR 031` says so.
+    var kid = _t_run(_t_sh("cat /proc/self/status > /dev/null; echo $?"));
+    assert(str_eq_cstr(_t_out(kid), "0") == 0,
+      "and a child it starts cannot read its own /proc: the rule names the confined process alone");
+
+    # The work directory is read and write, for that call alone.
+    var inwd = _t_run_in(agnosai_confinement_default(), _t_sh("echo here > made.txt && cat made.txt"),
+      "", _T_OUT);
+    assert(str_eq_cstr(_t_out(inwd), "here") == 1,
+      "a call's work directory is written, though no rule names it");
+    var after = _t_run(_t_argv("/bin/cat", _t_join(_T_OUT, "/made.txt"), 0));
+    assert(agnosai_spawn_exit_code(after) != 0, "and the next call, elsewhere, cannot read it");
+    sys_unlink(_t_join(_T_OUT, "/made.txt"));
+    return 0;
+}
+
+fn test_process(): i64 {
+    # `exec`, so grep is the confined process itself. The rule on `/proc/self` is the confined
+    # child's own `/proc/<pid>`, and dash forks a lone command where bash execs it, so without it
+    # grep ran as a child of its own and read EACCES on Ubuntu, and passed on Arch.
+    var sp = _t_run(_t_sh("exec grep -E 'NoNewPrivs|Seccomp:' /proc/self/status"));
+    var out = agnosai_spawn_stdout(sp);
+    assert(str_index_of_cstr(out, "NoNewPrivs:\t1") >= 0,
+      "NO_NEW_PRIVS is set: a setuid binary cannot raise the tool's privileges");
+    assert(str_index_of_cstr(out, "Seccomp:\t2") >= 0, "and a seccomp filter is loaded");
+
+    var un = _t_run(_t_argv("/usr/bin/unshare", "-r", "/bin/true"));
+    _t_ran(un, "unshare runs");
+    assert(agnosai_spawn_signal(un) != 0 || agnosai_spawn_exit_code(un) != 0,
+      "and cannot make a namespace: kavach's filter denies unshare");
+
+    var own = _t_run(_t_sh("exit 124"));
+    _t_ran(own, "a program that exits 124 ran");
+    assert_eq(agnosai_spawn_exit_code(own), 124,
+      "and 124 is its own: kavach's landlock step exits 124 too, and the marker tells them apart");
+    assert_eq(agnosai_spawn_confine_failure(own), 0, "so it is no confinement failure");
+
+    var missing = _t_run(_t_argv("/nonexistent/agnosai-prog", 0, 0));
+    assert_eq(agnosai_spawn_status(missing), AGNOSAI_SPAWN_FAILED, "a missing program is refused");
+    assert_eq(agnosai_spawn_fail_reason(missing), AGNOSAI_SPAWN_FAIL_EXEC,
+      "before any fork: the pin fails");
+
+    var stdin = _t_run_in(agnosai_confinement_default(), _t_argv("/bin/cat", 0, 0), "fed", 0);
+    assert(str_eq_cstr(_t_out(stdin), "fed") == 1, "stdin still reaches the program");
+    var err = _t_run(_t_sh("echo to-stderr >&2; exit 3"));
+    assert(str_index_of_cstr(agnosai_spawn_stderr(err), "to-stderr") >= 0,
+      "and stderr is captured apart from stdout");
+    assert_eq(agnosai_spawn_exit_code(err), 3, "with the exit code");
+
+    var slow = _t_run_in(agnosai_confinement_default(), _t_argv("/bin/sleep", "5", 0), "", 0);
+    _t_ran(slow, "a sleep runs");
+    var dl = agnosai_spawn_capture_confined("/bin/sleep", _t_argv("/bin/sleep", "5", 0),
+      agnosai_sanitized_envp(), str_from(""), 200, 0, agnosai_confinement_default());
+    assert_eq(agnosai_spawn_timed_out(dl), 1, "and the deadline still kills a confined child");
+    assert_eq(agnosai_spawn_status(dl), AGNOSAI_SPAWN_OK,
+      "as a timeout, not a confinement failure, though it never wrote past the marker");
+
+    if (_t_landlock("process") == 0) { return 0; }
+    # A copy of /bin/true where no rule gives execute.
+    var copy = _t_join(_T_OUT, "/true-copy");
+    var cp = _t_run_in(0, _t_argv("/bin/cp", "/bin/true", copy), "", 0);
+    _t_ran(cp, "copied, unconfined");
+    var ex = _t_run(_t_argv(copy, 0, 0));
+    assert_eq(agnosai_spawn_status(ex), AGNOSAI_SPAWN_FAILED,
+      "a program outside the rules does not run: landlock refuses the exec");
+    assert_eq(agnosai_spawn_fail_reason(ex), AGNOSAI_SPAWN_FAIL_EXEC,
+      "and it reads as a failed exec, after the marker");
+    sys_unlink(copy);
+    return 0;
+}
+
+fn test_failure(): i64 {
+    if (_t_landlock("failure") == 0) { return 0; }
+    # A rule kavach cannot open in the child: the directory goes after the rules are made.
+    var gone = _t_join(_T_OUT, "/vanishing");
+    sys_mkdir(gone, 493);
+    var cf = agnosai_confinement_with_path(agnosai_confinement_default(), str_from(gone), 0);
+    assert(cf != 0, "a confinement with one more path");
+    sys_rmdir(gone);
+    var sp = _t_run_in(cf, _t_argv("/bin/true", 0, 0), "", 0);
+    assert_eq(agnosai_spawn_status(sp), AGNOSAI_SPAWN_FAILED,
+      "a confinement step that refuses stops the child before its program");
+    assert_eq(agnosai_spawn_fail_reason(sp), AGNOSAI_SPAWN_FAIL_CONFINE, "and says so");
+    var why = agnosai_spawn_confine_failure(sp);
+    assert(why != 0, "with a reason");
+    if (why != 0) {
+        assert(streq(why, "cannot apply landlock") == 1, "the step kavach names for exit 124");
+    }
+    assert_eq(agnosai_confinement_with_path(agnosai_confinement_default(), str_from(gone), 0), 0,
+      "and a path that does not exist is refused when the confinement is made");
+    return 0;
+}
+
+fn test_allowed(): i64 {
+    assert_eq(agnosai_confinement_allow(str_from("/srv"), 0), 0 - 1,
+      "once built, the default takes no more paths: a child already running has its rules");
+    if (_t_landlock("allowed") == 0) { return 0; }
+    var sp = _t_run(_t_argv("/bin/cat", _T_ALLOWED_FILE, 0));
+    assert(str_eq_cstr(_t_out(sp), "given by the operator") == 1,
+      "a path given before the first build is read by every confined child");
+    var wr = _t_run(_t_sh(str_cstr(str_cat(str_cat(str_from("echo x >> "), str_from(_T_ALLOWED_FILE)),
+            str_from(" && echo wrote")))));
+    assert(str_eq_cstr(_t_out(wr), "wrote") == 0, "read only, as it was given");
+
+    var extra = agnosai_confinement_with_path(agnosai_confinement_default(), str_from(_T_OUT), 0);
+    var rd = _t_run_in(extra, _t_argv("/bin/cat", _T_OUT_FILE, 0), "", 0);
+    assert_eq(agnosai_spawn_exit_code(rd), 0, "a confinement with one more path reads it");
+    var dflt = _t_run(_t_argv("/bin/cat", _T_OUT_FILE, 0));
+    assert(agnosai_spawn_exit_code(dflt) != 0, "and the default still cannot");
+    return 0;
+}
+
+fn test_tiers(): i64 {
+    # The process tier is confined by default, and 0 is the operator's opt-out.
+    var c = agnosai_process_config_default();
+    assert_eq(agnosai_process_config_confinement(c), AGNOSAI_CONFINEMENT_DEFAULT,
+      "a process config is confined by default");
+    var err: i64[1];
+    store64(&err, 0);
+    var argv = vec_new();
+    vec_push(argv, str_from("/bin/sh"));
+    vec_push(argv, str_from("-c"));
+    vec_push(argv, str_from("exec grep NoNewPrivs /proc/self/status"));
+    var r = agnosai_process_execute_argv(c, argv, str_from(""), &err);
+    assert(r != 0, "the process tier runs");
+    if (r != 0) {
+        assert(str_index_of_cstr(agnosai_process_result_stdout(r), "NoNewPrivs:\t1") >= 0,
+          "confined");
+    }
+    agnosai_process_config_set_confinement(c, 0);
+    var u = agnosai_process_execute_argv(c, argv, str_from(""), &err);
+    if (u != 0) {
+        assert(str_index_of_cstr(agnosai_process_result_stdout(u), "NoNewPrivs:\t0") >= 0,
+          "and with 0, not: the operator's command, unconfined as before");
+    }
+
+    # So does the manager, which is how a tool reaches it.
+    var m = agnosai_sandbox_manager_new(agnosai_sandbox_manager_config_default());
+    var mr = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_process(), argv,
+      str_from(""), &err);
+    assert(mr != 0, "the manager's process tier runs");
+    if (mr != 0) {
+        assert(str_index_of_cstr(agnosai_sandbox_result_stdout(mr), "NoNewPrivs:\t1") >= 0,
+          "and it is confined: a tool's command never runs with the server's authority");
+    }
+
+    # The Python tier, which kavach's own exec path refuses by name.
+    if (agnosai_spawn_capture("/usr/bin/python3", _t_argv("/usr/bin/python3", "-V", 0),
+        agnosai_sanitized_envp(), 5000, 0) == 0) { return 0; }
+    var py = agnosai_python_sandbox_new();
+    assert_eq(agnosai_python_sandbox_confinement(py), AGNOSAI_CONFINEMENT_DEFAULT,
+      "a python sandbox is confined by default");
+    store64(&err, 0);
+    var pr = agnosai_python_execute_script(py, str_from(
+        "print(open('/proc/self/status').read().count('NoNewPrivs:\\t1'))"), str_from(""), &err);
+    if (pr == 0) { return assert(0, "python runs confined"); }
+    assert(str_eq_cstr(str_trim(agnosai_python_result_stdout(pr)), "1") == 1,
+      "python runs, confined, where kavach's sandbox_exec answers `blocked command: python3`");
+    var open_py = agnosai_python_sandbox_with_confinement(agnosai_python_sandbox_new(), 0);
+    assert_eq(agnosai_python_sandbox_confinement(open_py), 0, "a sandbox set to 0");
+    var upr = agnosai_python_execute_script(open_py, str_from(
+        "print(open('/proc/self/status').read().count('NoNewPrivs:\t0'))"), str_from(""), &err);
+    if (upr != 0) {
+        assert(str_eq_cstr(str_trim(agnosai_python_result_stdout(upr)), "1") == 1,
+          "runs unconfined, for source the operator wrote");
+    }
+    if (_t_landlock("python") == 0) { return 0; }
+    var src = str_cat(str_cat(str_from("open('"), str_from(_T_OUT_FILE)), str_from("').read()"));
+    var denied = agnosai_python_execute_script(py, src, str_from(""), &err);
+    if (denied != 0) {
+        assert(agnosai_python_result_exit_code(denied) != 0, "a tool's python cannot read the server's files");
+        assert(str_index_of_cstr(agnosai_python_result_stderr(denied), "PermissionError") >= 0,
+          "and says why in its traceback");
+    }
+    return 0;
+}
+
+# --- what a call keeps ------------------------------------------------------
+
+fn test_cost(): i64 {
+    var arena = arena_allocator_growable(262144);
+    var err: i64[1];
+    store64(&err, 0);
+    var argv = vec_new();
+    vec_push(argv, str_from("/bin/true"));
+    var c = agnosai_process_config_default();
+    # Made before the measuring: a Str for the input is the caller's, not the call's.
+    var empty = str_from("");
+    # Warm: the default confinement and the shared environment are built once, on first use.
+    agnosai_process_execute_argv_a(arena, c, argv, empty, &err);
+    reset_via(arena);
+    var before = alloc_used();
+    for (var i = 0; i < 5; i = i + 1) {
+        agnosai_process_execute_argv_a(arena, c, argv, empty, &err);
+        reset_via(arena);
+    }
+    assert_eq(alloc_used() - before, 0,
+      "a process call in an arena keeps nothing: argv, environment, streams and result are the call's");
+    agnosai_process_config_set_confinement(c, 0);
+    before = alloc_used();
+    agnosai_process_execute_argv_a(arena, c, argv, empty, &err);
+    reset_via(arena);
+    assert_eq(alloc_used() - before, 0, "and confinement adds nothing to it");
+
+    var py = agnosai_python_sandbox_new();
+    var src = str_from(_T_PY_TOOL);
+    var tool = agnosai_python_tool(str_from("t"), str_from("d"), vec_new(), src, py);
+    var input = agnosai_tool_input_new();
+    agnosai_tool_input_with_alloc(input, arena);
+    agnosai_tool_execute(tool, input);
+    reset_via(arena);
+    before = alloc_used();
+    var ok = 0;
+    for (var j = 0; j < 3; j = j + 1) {
+        agnosai_tool_input_with_alloc(input, arena);
+        var out = agnosai_tool_execute(tool, input);
+        if (agnosai_tool_output_success(out) == 1) { ok = ok + 1; }
+        reset_via(arena);
+    }
+    assert_eq(ok, 3, "a python tool runs, confined, in the call's arena");
+    assert_eq(alloc_used() - before, 0,
+      "and keeps nothing: it kept 11,032 B a call on 2.3.3, and its bare name's PATH search 16 B an entry");
+    return 0;
+}
+
+# --- the allocator forms build where they are told ------------------------
+
+# Whether `p` was allocated from arena `a` after `lo`: a bump arena hands out addresses in
+# order, so an allocation made now lies above it.
+fn _t_in_arena(a, lo, p): i64 {
+    var hi = alloc_via(a, 8);
+    if (p > lo && p < hi) { return 1; }
+    return 0;
+}
+
+fn test_allocator_forms(): i64 {
+    var a = arena_allocator_growable(262144);
+    var err: i64[1];
+    store64(&err, 0);
+
+    var lo = alloc_via(a, 8);
+    var sp = agnosai_spawn_capture_confined_a(a, "/bin/sh", _t_sh("echo in-arena"),
+      agnosai_sanitized_envp(), str_from_a(a, ""), 5000, 0, agnosai_confinement_default());
+    assert(str_eq_cstr(_t_out(sp), "in-arena") == 1, "a confined spawn in an arena runs");
+    assert_eq(_t_in_arena(a, lo, sp), 1, "and its result is in the arena");
+    assert_eq(_t_in_arena(a, lo, str_data(agnosai_spawn_stdout(sp))), 1, "and so is its stdout");
+
+    lo = alloc_via(a, 8);
+    var pr = agnosai_process_result_new_a(a, str_from("o"), str_from("e"), 7, 0);
+    assert_eq(_t_in_arena(a, lo, pr), 1, "a process result in an arena");
+    assert_eq(agnosai_process_result_exit_code(pr), 7, "holds its exit code");
+    lo = alloc_via(a, 8);
+    var yr = agnosai_python_result_new_a(a, str_from("o"), str_from("e"), 0 - 1, 1);
+    assert_eq(_t_in_arena(a, lo, yr), 1, "and a python result");
+    assert_eq(agnosai_python_result_timed_out(yr), 1, "its timeout");
+
+    var params = bayan_json_v_obj_new();
+    lo = alloc_via(a, 8);
+    var bi = agnosai_python_bridge_input_a(a, str_from("src"), str_from("name"), params);
+    assert(str_eq(bi, agnosai_python_bridge_input(str_from("src"), str_from("name"), params)) == 1,
+      "the bridge input in an arena is the bare one, byte for byte");
+    assert_eq(_t_in_arena(a, lo, str_data(bi)), 1, "and is in the arena");
+
+    if (sys_access("/usr/bin/python3", 1) != 0) { return 0; }
+    var py = agnosai_python_sandbox_new();
+    lo = alloc_via(a, 8);
+    var ps = agnosai_python_execute_script_a(a, py, str_from("print(6 * 7)"), str_from(""), &err);
+    if (ps == 0) { return assert(0, "a python script in an arena runs"); }
+    assert(str_eq_cstr(str_trim(agnosai_python_result_stdout(ps)), "42") == 1, "a python script in an arena runs");
+    assert_eq(_t_in_arena(a, lo, ps), 1, "and its result is in the arena");
+    lo = alloc_via(a, 8);
+    var pt = agnosai_python_execute_tool_a(a, py, str_from(_T_PY_TOOL), str_from("t"), params, &err);
+    if (pt == 0) { return assert(0, "a python tool in an arena runs"); }
+    assert_eq(agnosai_python_result_exit_code(pt), 0, "a python tool in an arena runs");
+    assert_eq(_t_in_arena(a, lo, str_data(agnosai_python_result_stdout(pt))), 1, "with its stdout in the arena");
+
+    lo = alloc_via(a, 8);
+    var out = agnosai_python_tool_output_of_a(a, agnosai_python_result_stdout(pt), str_from(""), 0, 0);
+    assert_eq(agnosai_tool_output_success(out), 1, "the ladder in an arena reads the bridge's success");
+    assert_eq(_t_in_arena(a, lo, out), 1, "and builds its output there");
+    var to = agnosai_python_tool_output_of_a(a, str_from(""), str_from(""), 0 - 1, 1);
+    assert(str_eq_cstr(agnosai_tool_output_error(to), "python tool execution timed out") == 1,
+      "a timeout reads as the bare ladder's");
+    return 0;
+}
+
+fn test_resolve(): i64 {
+    var ok: i64[1];
+    assert_eq(agnosai_confinement_resolve(0, &ok), 0, "0 resolves to no confinement");
+    assert_eq(load64(&ok), 1, "and that is no failure");
+    var d = agnosai_confinement_resolve(AGNOSAI_CONFINEMENT_DEFAULT, &ok);
+    assert_eq(d, agnosai_confinement_default(), "the default's sentinel resolves to the default");
+    var fresh = agnosai_confinement_new();
+    assert(fresh != 0 && fresh != d, "a new confinement is its own");
+    assert_eq(agnosai_confinement_rule_count(fresh), agnosai_confinement_rule_count(d),
+      "with the same rules as the default, built from the same lists");
+    assert_eq(agnosai_confinement_resolve(fresh, &ok), fresh, "and resolves to itself");
+    return 0;
+}
+
+# --- concurrency: nothing shared between two confined calls ----------------
+
+var _t_mismatch = 0;
+
+fn _t_worker(which): i64 {
+    var script = "echo out-a; echo err-a >&2; exit 3";
+    var want = 3;
+    var wo = "out-a";
+    var we = "err-a";
+    if (which == 1) {
+        script = "echo out-b; echo err-b >&2; exit 5";
+        want = 5;
+        wo = "out-b";
+        we = "err-b";
+    }
+    for (var i = 0; i < 25; i = i + 1) {
+        var sp = _t_run(_t_sh(script));
+        if (agnosai_spawn_exit_code(sp) != want) { atomic_fetch_add(&_t_mismatch, 1); }
+        if (str_eq_cstr(_t_out(sp), wo) == 0) { atomic_fetch_add(&_t_mismatch, 1); }
+        if (str_eq_cstr(str_trim(agnosai_spawn_stderr(sp)), we) == 0) { atomic_fetch_add(&_t_mismatch, 1); }
+    }
+    return 0;
+}
+
+fn test_concurrent(): i64 {
+    _t_mismatch = 0;
+    var ts = vec_new();
+    for (var i = 0; i < 4; i = i + 1) { vec_push(ts, thread_create(&_t_worker, i % 2)); }
+    for (var j = 0; j < 4; j = j + 1) { thread_join(vec_get(ts, j)); }
+    return assert_eq(_t_mismatch, 0,
+      "100 confined calls on four threads: each gets its own exit code, stdout and stderr, as no state is shared");
+}
+
+fn main(): i64 {
+    alloc_init();
+    if (_t_setup() == 0) { return assert(0, "a working directory to test from"); }
+    # Before anything builds the default, as `agnosai_confinement_allow` asks.
+    assert_eq(agnosai_confinement_allow(str_from(_T_ALLOWED), 0), 0, "a path given at start-up");
+    var cf = agnosai_confinement_default();
+    if (cf == 0) { return assert(0, "this host can build kavach's seccomp filter"); }
+    _T_LANDLOCK = agnosai_confinement_landlock_abi(cf);
+    assert(agnosai_confinement_rule_count(cf) >= 6, "the base rules, as far as this host has them");
+    assert_eq(SandboxPolicy_network_enabled(load64(cf + AGN_CF_POLICY)), 1,
+      "the policy says the network is on, as applied: a kavach enforcing basic()'s 0 would cut tools off");
+    assert_eq(SandboxPolicy_seccomp_enabled(load64(cf + AGN_CF_POLICY)), 1, "and seccomp on");
+    test_files();
+    test_process();
+    test_failure();
+    test_allowed();
+    test_tiers();
+    test_allocator_forms();
+    test_resolve();
+    # Before the threads: `alloc_used` counts every thread's allocations.
+    test_cost();
+    test_concurrent();
+    _t_teardown();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

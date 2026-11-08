@@ -204,18 +204,24 @@ An agent is offered the tools its `tools` list names, and the model calls them u
 is journaled before it runs, a turn's calls are approved as a set, and what a tool writes reaches the model as data. Each
 call is on the task's result under `tool_calls`, so what a tool measured can be told from what a model said.
 
-Tools run in three tiers with increasing isolation:
+Tools run in four tiers:
 
 1. **Native** -- in-process, zero overhead. Review before registering.
 2. **WASM** -- `wasmtime` with a **fuel budget** and a **memory ceiling**;
    WASI is stdio-only, so the guest gets no filesystem. kavach wraps the
    `wasmtime` process itself.
-3. **OCI** -- delegated to a container runtime.
-4. ⚠ **Process / Python** -- a subprocess with a sanitized environment, a
-   working directory and a SIGKILL deadline. **No seccomp, no Landlock, no
-   cgroups.** This list previously claimed otherwise; it was wrong. kavach can
-   supply kernel confinement but it is not wired into this tier — treat a
-   process-tier tool as running with the server's privileges.
+3. **OCI** -- a container: read-only root, no network unless the policy allows it,
+   a memory limit, every capability dropped, `no-new-privileges` and at most 256
+   processes.
+4. **Process / Python** -- a subprocess under kavach's confinement since 2.3.4
+   ([ADR 031](docs/adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)):
+   NO_NEW_PRIVS, kavach's seccomp filter, and landlock rules that give read and
+   execute on the system's own trees and read and write on `/tmp` and the call's
+   work directory, and nothing else. Plus a sanitized environment and a SIGKILL
+   deadline. ⚠ **The network is not isolated on this tier**, and a server running
+   as root gives these tools root's capabilities, so the image runs as an
+   unprivileged user. `AGNOSAI_SANDBOX_READ_PATHS` and `AGNOSAI_SANDBOX_WRITE_PATHS`
+   give every tool another tree.
 
 ## Fleet Distribution
 
@@ -233,12 +239,12 @@ First-class multi-node support:
 ```
 $ cyrius test tests
 ...
-99 passed, 0 failed
+106 passed, 0 failed
 ```
 
 ```
 $ cyrius coverage --min 80
-Functions referenced: 1616/1628 (99%)  [reference coverage — a floor, not a correctness proof]
+Functions referenced: 1846/1857 (99%)  [reference coverage — a floor, not a correctness proof]
 ```
 
 Tests cover core types, orchestration (all 4 process modes), DAG cycle detection,

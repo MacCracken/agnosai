@@ -98,6 +98,27 @@ An empty variable is none. Fast is reachable from the library's router and not f
   reasoning, selection cannot see tools, and only twelve words in a model's id keep an embedder off a tier. See ADR 030
   for what that gets wrong.
 
+## Tool sandboxes
+
+Process and Python tools run under kavach's confinement
+([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)): NO_NEW_PRIVS, kavach's seccomp
+filter, and landlock rules giving read and execute on `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc` and `/proc/self`, and
+read and write on `/tmp`, `/dev/null`, `/dev/shm` and the call's work directory.
+
+| variable | effect |
+|---|---|
+| `AGNOSAI_SANDBOX_READ_PATHS` | `:`-separated trees every confined tool may also read and execute |
+| `AGNOSAI_SANDBOX_WRITE_PATHS` | `:`-separated trees every confined tool may also read and write |
+
+Read once, at start-up. A path the host does not have is skipped.
+
+- ⚠ **A tool reading outside the rules gets EACCES**, which includes `$HOME`, `~/.local`'s site-packages, `/var`,
+  `/opt` and another process's `/proc`.
+- ⚠ **The network is not isolated on these tiers.** WASM tools have none, and an OCI tool has none unless its policy
+  allows it.
+- ⚠ **A host where kavach cannot build its seccomp filter refuses every process and Python tool**, with
+  `failed to confine: …`. A kernel with no landlock runs them with no filesystem rules, and the server warns once.
+
 ## Trace context
 
 agnosai exports OpenTelemetry spans when `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (a complete URL,

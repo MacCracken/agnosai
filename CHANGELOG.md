@@ -7,6 +7,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.4] — 2026-11-08
+
+Process and Python tools run confined. Each child applies kavach's confinement before it execs: NO_NEW_PRIVS, kavach's
+seccomp filter, and landlock rules that give it the system's own trees to read and run, `/tmp` and its work directory to
+write, and nothing else. agnosai keeps its own spawner around that, so argv, stdin, the environment, the deadline and the
+captured streams are what they were ([ADR 031](docs/adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)).
+Since 2.3.0 a model can reach these tiers, and through 2.3.3 a tool there ran with the server's authority. The OCI tier's
+containers drop every capability, and the image runs as an unprivileged user. A process or Python tool call in the
+call's arena now keeps nothing on the global heap.
+
+### ⚠ Behaviour changes
+
+- **A process or Python tool that reads or writes outside its rules gets EACCES.** Read and execute: `/usr`, `/bin`,
+  `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/etc`, `/run/systemd/resolve`, `/proc/self`, `/dev/urandom`,
+  `/dev/random`, `/dev/zero`. Read and write: `/tmp`, `/dev/null`, `/dev/shm`, the call's work directory. That leaves out
+  `$HOME` and `~/.local`'s site-packages, `/var`, `/opt`, `/srv` and another process's `/proc`. **To migrate:** give a tree
+  to every tool with `AGNOSAI_SANDBOX_READ_PATHS` or `AGNOSAI_SANDBOX_WRITE_PATHS` (`:`-separated, read at start-up), to
+  one tool with `agnosai_confinement_with_path`, or run an operator's own command unconfined with
+  `agnosai_process_config_set_confinement(c, 0)` or `agnosai_python_sandbox_with_confinement(s, 0)`.
+- **A setuid or file-capability binary no longer raises a tool's privileges** (NO_NEW_PRIVS), and `mount`, `unshare`,
+  `setns`, `ptrace`, `bpf`, `kexec_load` and the rest of kavach's list are refused.
+- **A program that resolves to nothing executable fails before any fork**, pinned by descriptor as kavach pins its own.
+  The message is the one it was: `failed to spawn <program>`.
+- **A confinement step that refuses fails the call**, with `failed to confine <program>: cannot apply landlock` (or the
+  step kavach names). A host where kavach cannot build its seccomp filter refuses every process and Python tool.
+- **An OCI tool's container gets `--cap-drop=ALL`, `--security-opt=no-new-privileges` and `--pids-limit 256`**, after
+  `--memory`. A tool that needed a capability inside its container, or more than 256 processes, stops working.
+- **The image runs as `agnosai`, uid 10001**, not root. It listens on 8080 and writes only `/tmp`, so it needs nothing
+  root-only, and a root server would give every process and Python tool root's capabilities (*Security*).
+
+### Added
+
+- **sandbox/spawn:** `agnosai_spawn_capture_confined` and `agnosai_spawn_capture_confined_a`, the spawn with a
+  confinement, and `agnosai_spawn_confine_failure`, the step that refused. `agnosai_confinement_default`,
+  `agnosai_confinement_new`, `agnosai_confinement_allow`, `agnosai_confinement_with_path`, `agnosai_confinement_resolve`,
+  `agnosai_confinement_landlock_abi`, `agnosai_confinement_rule_count`, and `AGNOSAI_CONFINEMENT_DEFAULT`.
+  `AGNOSAI_SPAWN_FAIL_CONFINE` and `AGNOSAI_SPAWN_FAIL_CONFINE_FDS`.
+- **sandbox/process:** `agnosai_process_config_confinement`, `agnosai_process_config_set_confinement`,
+  `agnosai_process_execute_argv_a` and `agnosai_process_result_new_a`.
+- **sandbox/python:** `agnosai_python_sandbox_confinement`, `agnosai_python_sandbox_with_confinement`,
+  `agnosai_python_execute_script_a`, `agnosai_python_execute_tool_a`, `agnosai_python_bridge_input_a` and
+  `agnosai_python_result_new_a`.
+- **tools:** `agnosai_python_tool_output_of_a`, `agnosai_wasm_tool_output_of_a` and `agnosai_wasm_tool_input_payload_a`.
+- **The binary** reads `AGNOSAI_SANDBOX_READ_PATHS` and `AGNOSAI_SANDBOX_WRITE_PATHS`.
+- **`tests/sandbox_confine.tcyr`**, 87 assertions, each measured from inside the child, and **`benches/sandbox.bcyr`**,
+  four rows: `spawn_true_unconfined`, `spawn_true_confined`, `python_tool_call_unconfined` and
+  `python_tool_call_confined`.
+- **ADR 031.**
+
+### Changed
+
+- **The process and Python tiers are confined by default** (`agnosai_process_config_default`, so the manager's, and
+  `agnosai_python_sandbox_new`). kavach's `sandbox_exec` was the door the roadmap named, and it is not used: measured on
+  kavach 3.14.7, it refuses `python3`, `sh` and every other interpreter by name without a rootfs, and it shares each
+  run's stderr between threads (*Fixed* has the numbers). The child calls `confine_child_caps` itself, and reports
+  through agnosai's own pipe. It writes a marker word once confined, so a program exiting 124 is not read as kavach's
+  landlock step, which exits 124 too.
+- **The Python and WASM tools build in the call's allocator** (`agnosai_tool_input_alloc`), as 2.3.2's built-ins do.
+- **The sanitized environment and the Python bridge script are built once and shared.** Each was rebuilt on the global
+  heap on every spawn.
+- **The policy agnosai's confinement builds says the network is on**, which is what it applies. kavach's
+  `policy_basic()` says off, which nothing enforces without a namespace, and a kavach that began enforcing it would cut
+  every tool off in a patch release.
+- **Roadmap.** 2.3.4 shipped, and confinement leaves it. 2.3.5 also takes the spawner's 5 ms idle tick, which is most of
+  a spawned tool's latency. *Waiting on another project* gains three kavach rows: concurrent runs' stderr, network rules
+  without a namespace, and a root child's capabilities. The threat model, README and API reference say what a confined
+  tool can reach.
+
+### Fixed
+
+- **A process or Python tool ran with the server's authority.** Measured from inside the child on this release: a read
+  of a file in the server's tree and of `/proc/1/environ` is EACCES, a write outside `/tmp` and the work directory is
+  EACCES, `NoNewPrivs` is 1, `Seccomp` is 2, and `unshare` is killed.
+- **A process call kept 13,992 B on the global heap, and a Python tool call 11,032 B**, for good. In the call's arena
+  both now keep 0 B. A bare process call keeps 368 B. The 4 KiB read buffer is on the stack, a chunk is appended with no
+  Str made for it, and a bare name's `PATH` search compares `PATH=` in place, where it made a 16-byte Str for each
+  environment entry it passed.
+
+### Security
+
+- **The threat model's largest gap is closed for the process and Python tiers** (ADR 031): landlock, kavach's seccomp
+  filter and NO_NEW_PRIVS, with the binary pinned by descriptor, which also narrows its time-of-check entry. ⚠ Still
+  open, and stated in the threat model: the network is not isolated on these tiers; a root server's tools keep root's
+  capabilities (the image no longer runs as root); a kernel with no landlock runs them with no filesystem rules, and
+  agnosai warns once.
+- **kavach shares a run's stderr between threads.** Measured with kavach's API alone: two threads, 100 runs each, and
+  116, 125 and 100 of the 200 read the other's stderr, or both spliced. agnosai's WASM tier goes through it and reads
+  stderr to call a module refused for its store limits, so a concurrent call can be misclassified. It returns no stderr
+  to a caller. Filed with kavach (`docs/development/issues/2026-11-07-agnosai-concurrent-runs-read-each-others-stderr.md`).
+
+### Performance
+
+**Confinement costs nothing measurable.** `benches/sandbox.bcyr`, one run: `spawn_true_unconfined` 10.310 ms and
+`spawn_true_confined` 10.320 ms, `python_tool_call_unconfined` 41.27 ms and `python_tool_call_confined` 41.24 ms. Both
+pairs are the drain loop's 5 ms idle tick, twice, which roadmap 2.3.5 replaces with `poll(2)`. The rows are new, so
+there is nothing earlier to compare them with. No row in the other ten files runs code this release changed, and
+`bench-history.csv` has 245 rows at 2.3.4, one sweep at a load of 0.3–0.9: median −1.2% against 2.3.3's rows, 188 of 241
+within ±5%, not claimed.
+
+### Tests
+
+- **`tests/sandbox_confine.tcyr`, 87 assertions.** The rules from inside the child, a work directory written and the
+  next call unable to read it, the marker against a program's own 124, a refusing step named, a binary outside the
+  rules refused at the exec, the deadline on a confined child, a path given at start-up and one given to one
+  confinement, both tiers confined by default and unconfined on 0, the manager confined, Python confined, 100 calls on
+  four threads with no result crossing, a call in an arena keeping 0 B, and each new allocator form building what the
+  bare one builds, in the arena it was given.
+- `sandbox_oci` +6 for the run line's hardening, `tools_wasm` +7 for the WASM tool's allocator forms.
+- **26 mutants**, each a new check reverted, run against `sandbox_confine`, `sandbox_spawn` and `sandbox_oci`: all 26
+  fail a named assertion.
+
+### Verified
+
+- **106 suites, 11,298 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's
+  printed line as well as its exit code. 2.3.3's tree read 11,199. Coverage 99%, 1,846 of 1,857 functions, the same 11
+  unreferenced.
+- `check-symbols.sh`, `check-clean.sh` (fmt, lint, doc, vet, deny, `deps --verify`, the lib snapshot, log lengths,
+  dist), fmt and lint on every test, bench and fuzz file, the build, the aarch64 build, the example, fuzz 4/4,
+  `distlib --all --check` and `cyrius bench`.
+- **The `ubuntu:26.04` CI replica**, every `ci.yml` step from a clean clone with this tree laid over it, new files
+  included, wasmtime 47.0.3, all 8 pins resolved from GitHub, inside docker's default seccomp profile: 106 suites, 11,152
+  assertions, 0 failed. Its first run failed four `sandbox_confine` checks, on Ubuntu's dash, which forks a lone command
+  that bash execs: that is the `/proc/self` limit in *Behaviour changes*, and the suite now pins it.
+- **The image** builds, answers `/ready` and runs as `uid=10001(agnosai)`. The binary answers `/ready` with
+  `"version":"2.3.4"`, exits 0 on SIGTERM, and logs a path in `AGNOSAI_SANDBOX_READ_PATHS` as allowed or, where the host
+  has none, skipped.
+- **docker took the OCI tier's run line**: `CapEff` 0, `NoNewPrivs` 1 and `pids.max` 256 inside the container.
+
 ## [2.3.3] — 2026-11-08
 
 A model is chosen by what hoosh says it is. hoosh 2.10.2's catalog says each model's tier, what it is for, and whether it

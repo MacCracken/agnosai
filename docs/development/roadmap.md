@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.3.3 (2026-11-07).**
+**Status as of 2.3.4 (2026-11-08).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,8 +50,7 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.3.4** | Confine the process, Python and OCI tools through kavach |
-| **2.3.5** | WASM tools: validate a module, and clean up what a tool staged |
+| **2.3.5** | WASM tools: validate a module and clean up what a tool staged; a spawned tool's latency |
 | **2.3.6** | Network tools: pooled connections, detached threads, a cheaper URL check, a stable tool order |
 | **2.3.7** | The Rust line's JSON forms and structured-log fields |
 | **2.4.0** | The crew lifecycle as one state machine, with the approval gate wired |
@@ -70,38 +69,18 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 ### 2.3.x — the tool-calling harness (agnostic's M6 waits on this line)
 
 2.3.0 shipped the loop ([ADR 029](../adr/029-the-tool-loop.md)), 2.3.1 chose its models from hoosh's catalog
-([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)), 2.3.2 gave each tool call an arena of its own, and
-2.3.3 chose a model by hoosh's tier, kind and tools bit (ADR 030's addendum).
+([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)), 2.3.2 gave each tool call an arena of its own,
+2.3.3 chose a model by hoosh's tier, kind and tools bit (ADR 030's addendum), and 2.3.4 confined the process and Python
+tools with kavach's primitives in agnosai's own spawner, and hardened the OCI tier's container
+([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)).
 
-#### 2.3.4 — confine the process, Python and OCI tools through kavach
+#### 2.3.5 — WASM tools: validate a module and clean up what a tool staged; a spawned tool's latency
 
-All three spawn through `src/sandbox/spawn.cyr`: a SIGKILL deadline, a controlled working directory, a sanitized
-environment, and no seccomp, landlock, namespaces or memory limit (`threat-model.md`, *Accepted Risks*). kavach's
-confined backend is bridged and tested (`agnosai_kavach_execute`), and no production tier calls it. Since 2.3.0 a model
-can reach these tiers, so this is the threat model's largest gap.
-
-**The work:** route each tier through kavach, keeping its argv, stdin, environment and deadline semantics, with an
-ADR, since a tool that relied on network access will notice. `python_tool` and `wasm_tool` move onto the call's
-allocator with it (2.3.2's `agnosai_tool_input_alloc`), as what they build comes back through these tiers.
-
-**What it waited on has shipped.** Through kavach 3.14.6 every run kept a 1 MiB capture buffer for good, so routing
-three more tiers through it would have kept 1 MiB a call. kavach 3.14.7 copies out what the payload wrote and gives the
-buffer back (its `docs/development/issues/archived/2026-11-06-agnosai-every-exec-keeps-its-1-mib-capture-buffer.md`).
-agnosai 2.3.3 requires 3.14.7. A WASM call already runs through kavach: kavach measured 1,051,513 B a WASM exec on
-3.14.6, and `tests/sandbox_wasm.tcyr` reads 3,160 B a call on 3.14.7.
-
-**For the ADR, from kavach's process-backend issue,** which is still open in part and pinned at kavach 3.14.8
-(`docs/development/issues/2026-11-06-process-backend-keeps-every-capability.md`). As root with no rootfs, a payload
-keeps every capability. And with a caller's `/proc` mounted, a payload can read a sibling sandbox's root through
-`/proc/<pid>/root`. ⚠ **The root case is agnosai's normal case**: the `Dockerfile` sets no `USER`, so the image runs
-the server as root. kavach's rootfs path holds as root since 3.14.6, and its `/proc` guard since 3.14.7. So the ADR
-picks a rootfs for each tier, an unprivileged `USER` for the image, or a refusal to run a tier as root. Each of those
-is agnosai's own to ship, and none waits on kavach 3.14.8.
-
-**Done means:** a call on each tier keeps a few KiB, measured as `tests/sandbox_wasm.tcyr` does for WASM. The threat
-model's *Accepted Risks* entry for these tiers goes, and its TOCTOU entry narrows to what kavach does not pin.
-
-#### 2.3.5 — WASM tools: validate a module, and clean up what a tool staged
+**A spawned tool waits on a 5 ms sleep.** The spawner's drain loop sleeps `AGNOSAI_SPAWN_IDLE_MS` whenever nothing
+moved, so `/bin/true` takes 10.3 ms through it and a Python tool call 41 ms (`benches/sandbox.bcyr`, 2.3.4). Waiting in
+`poll(2)` on the three pipes, with the deadline as its timeout, answers when the child does. Every process and Python
+tool pays it. **Done means:** `spawn_true_confined` reads near what a fork and an exec cost, and the deadline tests in
+`tests/sandbox_spawn.tcyr` still hold.
 
 **Validate a module before it runs.** A module with no `_start` export runs and "succeeds", and a module is checked
 by its header alone, so a malformed body fails only at execute. The execute path runs `wasmtime` through kavach's
@@ -328,6 +307,10 @@ The *Issue* column says where each stands.
 | **Follow one request from a crew to the provider** | hoosh exports its span with the caller's span id and no `parentSpanId`, and forwards that same traceparent | hoosh `docs/development/issues/2026-11-07-agnosai-inference-span-takes-the-callers-span-id.md`, ⚠ **written 2026-11-07, not committed** | `agnosai_hoosh_chat_in` sends an outbound `traceparent` from its `chat` span. It sends none today, or hoosh's span would repeat the chat span's id |
 | **Offer a model the tools of a remote MCP server** | bote has no MCP client, **and its roadmap lists one as a non-goal**, so this needs a decision first (*Decisions for the user*) | bote `docs/development/issues/2026-11-07-agnosai-no-mcp-client-to-call-a-hosts-tools.md`, ⚠ **written 2026-11-07, not committed** | Register each remote tool with `agnosai_tool_new`: the registry and the loop need nothing else (ADR 029, rule 4) |
 
+| **Two WASM calls at once read their own stderr** | kavach keeps a run's stderr, exit code and timeout flag in process-wide variables. Measured: about half of 200 concurrent runs on two threads read the other's stderr | kavach `docs/development/issues/2026-11-07-agnosai-concurrent-runs-read-each-others-stderr.md`, ⚠ **written 2026-11-07, not committed** | Nothing: the WASM tier needs no change once a run's result is the run's. The process and Python tiers do not go through it (ADR 031) |
+| **Process and Python tools lose the network a policy denies them** | kavach enforces `network_enabled = 0` only with a network namespace, which Ubuntu 24.04+, docker and GitHub's runners refuse. Landlock ABI 4 refuses TCP with none | kavach `docs/development/issues/2026-11-07-agnosai-a-policy-denying-network-needs-a-namespace.md`, ⚠ **written 2026-11-07, not committed** | Set `network_enabled` on the confinement's policy from the tier's own policy (it is 1 today, which is what is applied), and say so in the CHANGELOG as the behaviour change it is |
+| **A root server's process and Python tools lose root's capabilities** | kavach bounds a child's capabilities only inside a rootfs (its Ask 3, pinned at kavach 3.14.8) | kavach `docs/development/issues/2026-11-06-process-backend-keeps-every-capability.md`, kavach's own, committed and on GitHub | Pass a capability mask to `confine_child_caps`, which takes one. The image already runs as uid 10001 |
+
 bayan's refusals of block scalars, flow mappings, anchors and tags are deliberate (its ADR 0008), so that is a scope
 request to raise only if a definition file needs one, and it is not owed.
 
@@ -500,7 +483,7 @@ and log fields at 2.3.6.
 | B25 | 2.6.1, server edges |
 | B34 | 2.7.2, housekeeping |
 | B33 | 2.3.1, and its hoosh half in 2.3.3 |
-| B35, B40 | 2.3.4, confine the process, Python and OCI tools. B40's WASM half shipped in 2.3.3 with kavach 3.14.7 |
+| B35, B40 | shipped: confinement in 2.3.4 (ADR 031), and B40's WASM half in 2.3.3 with kavach 3.14.7 |
 | B37 | 2.4.0, the crew lifecycle |
 | B38 | 2.5.1, the server's own crews in arenas |
 | B39 | an HTTP exchange leaves nothing behind (*Waiting on another project*) |

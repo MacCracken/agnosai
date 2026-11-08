@@ -22,7 +22,7 @@ Clients send JSON to create crews, submit agent definitions, and stream results.
 | Malformed JSON / extra fields | bayan's parser refuses malformed JSON, a duplicate key and a leading-zero number (since bayan 1.11.1, CHANGELOG 2.2.1), and nesting past depth 128. Request types reject unknown fields with `agnosai_route_no_unknown_fields` |
 | Missing/invalid auth | JWT RS256 (2048–4096-bit keys), checking signature, then `alg`, `iss`, `aud` and `exp` (`src/server/auth.cyr`). ⚠ **Auth is off by default** (`agnosai_auth_config_new`), and the server warns at boot |
 | Injection via agent definitions | Input validation (`MAX_AGENTS`, `MAX_TASKS`, `MAX_STRING_LEN`); user-supplied fields are wrapped before they reach a prompt |
-| Slow-loris / connection exhaustion | 100 pool workers (`AGNOSAI_SERVE_WORKERS`) as the connection cap, and sandhi's 60 s accept-to-request budget (`SANDHI_SERVER_DEFAULT_REQUEST_MS`, sandhi 1.10.7), after which the request is answered 408. Rate limiting is on by default (below). An SSE stream holds a worker for a crew's life (roadmap B8) |
+| Slow-loris / connection exhaustion | 100 pool workers (`AGNOSAI_SERVE_WORKERS`) as the connection cap, and sandhi's 60 s accept-to-request budget (`SANDHI_SERVER_DEFAULT_REQUEST_MS`, sandhi 1.10.7), after which the request is answered 408. Rate limiting is on by default (below). An SSE stream holds a worker for a crew's life (roadmap 2.6.1) |
 
 ### 2. Tool Execution (WASM, cx, Python, Process, OCI)
 
@@ -30,10 +30,12 @@ Tools run untrusted code from community authors or legacy Python scripts.
 
 | Threat | Mitigation |
 |--------|------------|
-| Memory exhaustion | WASM: kavach passes `-W max-memory-size` (64 MiB default) to wasmtime. ⚠ **Process / Python / OCI: no memory limit.** There is no `setrlimit` here or in the Rust line (`src/sandbox/process.cyr`'s header) |
+| Memory exhaustion | WASM: kavach passes `-W max-memory-size` (64 MiB default) to wasmtime. OCI: `--memory` and `--pids-limit 256`. ⚠ **Process / Python: no memory limit.** There is no `setrlimit` here or in the Rust line (`src/sandbox/process.cyr`'s header), and kavach applies a cgroup only with a path agnosai does not give it |
 | CPU exhaustion | WASM: 1B fuel (`-W fuel`) plus the sandbox deadline; every tier has a SIGKILL deadline |
-| Filesystem access | WASM: no filesystem capability; cx: landlock read-only on the interpreter's directory; ⚠ Process / Python / OCI: a controlled working directory only (see *Accepted Risks*) |
-| Network access | WASM: no network capability; cx: a new network namespace, and the cx tier **fails closed** where one cannot be made (CHANGELOG 2.2.1); ⚠ Process / Python / OCI: none |
+| Filesystem access | WASM: no filesystem capability; cx: landlock read-only on the interpreter's directory; Process / Python: landlock since 2.3.4 ([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)), read and execute on `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc` and `/proc/self`, read and write on `/tmp`, `/dev/null`, `/dev/shm` and the call's work directory, nothing else. ⚠ A kernel with no landlock gets no ruleset, and agnosai warns at the first build. OCI: the container's read-only root and a tmpfs `/tmp` |
+| Network access | WASM: no network capability; cx: a new network namespace, and the cx tier **fails closed** where one cannot be made (CHANGELOG 2.2.1); OCI: `--network=none` unless the policy allows it; ⚠ **Process / Python: not isolated** (ADR 031): it would take a user namespace, which Ubuntu 24.04+, docker and GitHub's runners refuse. Landlock's TCP rules would do it with none, and kavach applies none yet (filed) |
+| Privilege escalation | Process / Python: NO_NEW_PRIVS, so no setuid or file-capability binary raises a tool's privileges. OCI: `--cap-drop=ALL` and `--security-opt=no-new-privileges`. ⚠ A server running as root gives a process or Python tool root's capabilities under landlock and seccomp, as kavach bounds them only inside a rootfs. The image runs as `agnosai`, uid 10001 |
+| Escaping through the kernel | Process / Python: kavach's exec seccomp filter, loaded last: `mount`, `umount2`, `pivot_root`, `unshare`, `setns`, `ptrace`, `process_vm_*`, module loading, `kexec_load`, `reboot`, `swapon`, `bpf`, `perf_event_open`, `userfaultfd`, `syslog` and the new mount API are denied, and so is a `clone` asking for namespaces. Every inherited descriptor is closed. OCI: docker's default seccomp profile |
 | A model steered to a host its task did not declare (the system under test writes tool output, so a page can ask for it) | A consumer's gate ([ADR 025](../adr/025-a-tool-call-passes-a-consumers-gate.md)), asked at `agnosai_tool_execute_for` and of each URL, so no tool implements it and no path can skip it. ⚠ With no gate, a tool's target is still the model's to choose, under the SSRF guard alone |
 | A model that reads what the system under test wrote, and does what it says | [ADR 029](../adr/029-the-tool-loop.md): nothing a tool writes reaches anything but the model. An agent's tools are fixed before its first call, and the limits are the process's, so a page cannot grant a tool or a budget. A result goes to the model inside the markers it is told never to obey, with `user_input` and `system_instructions` rewritten inside so a page cannot end them, and with control bytes and anything that is not UTF-8 taken out, so a binary page cannot cost a task its transcript. The injection table is a signal, and a flagged result is annotated, not held back: it is heuristic, and holding back on it would let a page blind its own QA. `agnosai_tool_gate_with_result` holds one back for a consumer who wants that. ⚠ A model can still be misled by what it reads: its calls are bounded, its claims are not, which is why a task's record keeps what the tool really said |
 | Calls that are harmless alone and leak together | `agnosai_tool_gate_with_batch` sees a turn's calls as a set, before any of them runs, and refuses all or none (ADR 029). ⚠ With no gate, nothing does |
@@ -128,7 +130,7 @@ HTTP clients          →  API validation layer  →  Orchestrator
 traceparent header    →  strict W3C v00 parse  →  span parent + sampling (honoured as-is)
 WASM tool modules     →  kavach + wasmtime     →  Tool registry
 cx tool bytecode      →  kavach (ns, landlock) →  Tool registry
-Python / process tools →  agnosai's spawner    →  Tool registry   (⚠ no kernel confinement)
+Python / process tools →  agnosai's spawner + kavach's confinement (landlock, seccomp, NO_NEW_PRIVS) →  Tool registry
 LLM provider responses →  Response parsing     →  Agent execution
 JSON/YAML definitions →  bayan + validators    →  Definition store
 Fleet messages        →  the consumer's transport (agnosai serves no fleet endpoint)
@@ -166,8 +168,14 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
   this.
 - **Each WASM call keeps a few KiB** on the global heap, 3,160 B in `tests/sandbox_wasm.tcyr`, so a caller that can
   drive WASM tools grows this process by that much per call until a restart. Through 2.3.2 it was about 1 MiB a call,
-  kavach's capture buffer, which kavach 3.14.7 gives back and agnosai 2.3.3 requires. What is left is the result's own
-  bytes, and moves onto the call's allocator with the confinement work (roadmap 2.3.4).
+  kavach's capture buffer, which kavach 3.14.7 gives back and agnosai 2.3.3 requires. Since 2.3.4 the WASM tool's
+  payload and output are in the call's arena, and what is left, about 2.9 KB, is kavach's run, inside kavach.
+  A process or Python tool call in the call's arena keeps 0 B (`tests/sandbox_confine.tcyr`).
+- **Two WASM calls at once can read each other's stderr inside kavach** (ADR 031, filed with kavach). kavach keeps a
+  run's stderr, exit code and timeout flag in process-wide variables, and measured with two threads about half of 200
+  runs read the other's stderr. The WASM tier returns no stderr to a caller, so nothing leaks through it, but it reads
+  stderr to call a module refused for its store limits, so a concurrent call can be misclassified. The process and
+  Python tiers do not go through it.
 - **A crew arena is reused** ([ADR 028](../adr/028-a-crew-lives-in-an-arena-its-consumer-gives-back.md)):
   the memory a crew lived in serves the next one, which in a multi-tenant consumer may be another
   tenant's. It is zeroed on release, every byte handed out, so no allocation can read a previous
@@ -175,18 +183,18 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
   stale pointer: a consumer that reads a released crew reads zeros, or the next crew's bytes once the
   arena is reused. Clearing its own pointers before `agnosai_orchestrator_release_crew` is the
   consumer's half of that contract, and a crew that does not opt in cannot meet this at all.
-- **TOCTOU on tool paths**: agnosai's own spawner (`src/sandbox/spawn.cyr`) resolves a tool
-  binary against `PATH` and then execs it by path, so what runs is whatever sits at that path at
-  exec time. kavach's paths pin the binary by fd before the fork (ADR-005 §H4 in kavach), but
-  the process, Python and OCI tiers do not go through kavach (next item). Mitigated by running
-  in controlled environments with a trusted `$PATH`.
-- **Python/process/OCI subprocess escapes**: ⚠ **NOT confined.** These tiers spawn through
-  agnosai's own spawner: a SIGKILL deadline, a controlled working directory and a sanitized
-  environment, with no seccomp, landlock, namespaces or cgroup. Treat a process-tier tool as
-  running with the server's privileges. **kavach's confined process backend is already bridged**
-  (`agnosai_kavach_execute`: no_new_privs, landlock scopes and kavach's exec seccomp filter,
-  tested by `tests/sandbox_kavach_bridge.tcyr`). But no production tier calls it. Routing them
-  through it is roadmap 2.3.4, the next release, now that kavach 3.14.7 no longer keeps 1 MiB a run.
+- **TOCTOU on tool paths**: since 2.3.4 the process and Python tiers pin a tool's binary by
+  descriptor before the fork and exec through it (`kv_exec_pin`, ADR 031), so what runs is the
+  file that was checked. ⚠ The OCI tier's runtime (`docker`, `podman`) is still resolved against
+  `PATH` and run by path, unconfined, as the daemon builds the container. Mitigated by a trusted
+  `$PATH`.
+- **What confinement leaves a process or Python tool** (ADR 031): it reads `/etc` and the system's
+  trees, which hold no secret a non-root uid can read but do describe the host. It keeps the
+  server's network. It shares `/tmp` and `/dev/shm` with every other tool and with the server.
+  A host where kavach cannot build its seccomp filter refuses every such tool. A kernel without
+  landlock runs them with no filesystem rules, and agnosai warns once. An operator turns
+  confinement off per config with `agnosai_process_config_set_confinement(c, 0)` or
+  `agnosai_python_sandbox_with_confinement(s, 0)`, which is for a command they wrote.
 - **Fleet coordinator election**: lowest-id election, and any non-stale term is adopted (surface 4).
   No Byzantine fault tolerance. Suitable for trusted internal networks.
 - **Caller-controlled trace context** (surface 7): any caller of a traced route

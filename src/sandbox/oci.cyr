@@ -257,6 +257,10 @@ fn agnosai_oci_image_error(image: Str): Str {
 
 # --- Argv -----------------------------------------------------------------
 
+# The most processes a container may hold, for `--pids-limit`. Enough for a tool that runs a
+# shell pipeline or a thread pool, and few enough that a fork bomb stops at it.
+var AGNOSAI_OCI_PIDS_LIMIT = 256;
+
 # The full argv for one `run`, as a vec of `Str` — argv[0] is the runtime.
 #
 # **Order is the oracle's and is wire-visible** (`oci.rs:118-145`): `run --rm -i
@@ -267,6 +271,14 @@ fn agnosai_oci_image_error(image: Str): Str {
 # `--read-only`, `--tmpfs /tmp` and `--network=none` are the isolation posture.
 # A test can read this vec, which is the point of building it as a value: the
 # oracle constructs its argv inside `execute` and cannot assert on it.
+#
+# ⚠ **And since 2.3.4, docker's own hardening, after `--memory`** (ADR 031): every
+# capability dropped, `no-new-privileges`, and at most `AGNOSAI_OCI_PIDS_LIMIT` processes.
+# The container is the confinement on this tier, as the daemon creates it and not this
+# process, so the flags are where it is decided. The Rust line passed none of them: its
+# containers ran with docker's default capabilities, a setuid binary in the image could
+# raise its privileges, and nothing bounded a fork bomb but `--memory`. podman takes all
+# three.
 fn agnosai_oci_build_argv(config, entrypoint_args): i64 {
     var a = vec_new();
     vec_push(a, load64(config + AGN_OCI_RUNTIME));
@@ -278,6 +290,10 @@ fn agnosai_oci_build_argv(config, entrypoint_args): i64 {
     vec_push(a, str_from("/tmp"));
     vec_push(a, str_from("--memory"));
     vec_push(a, load64(config + AGN_OCI_MEMORY_LIMIT));
+    vec_push(a, str_from("--cap-drop=ALL"));
+    vec_push(a, str_from("--security-opt=no-new-privileges"));
+    vec_push(a, str_from("--pids-limit"));
+    vec_push(a, str_from_int(AGNOSAI_OCI_PIDS_LIMIT));
 
     if (load64(config + AGN_OCI_ALLOW_NETWORK) == 0) {
         vec_push(a, str_from("--network=none"));

@@ -41,7 +41,12 @@ enum AgnosaiProcResultOff {
 
 # A finished sandboxed execution.
 fn agnosai_process_result_new(stdout: Str, stderr: Str, exit_code, timed_out): i64 {
-    var r = alloc(AGN_PRR_SIZE);
+    return agnosai_process_result_new_a(default_alloc(), stdout, stderr, exit_code, timed_out);
+}
+
+# `agnosai_process_result_new`, in `a`.
+fn agnosai_process_result_new_a(a, stdout: Str, stderr: Str, exit_code, timed_out): i64 {
+    var r = alloc_via(a, AGN_PRR_SIZE);
     store64(r + AGN_PRR_STDOUT, stdout);
     store64(r + AGN_PRR_STDERR, stderr);
     store64(r + AGN_PRR_EXIT_CODE, exit_code);
@@ -76,7 +81,8 @@ enum AgnosaiProcCfgOff {
     AGN_PRC_TIMEOUT_MS = 24;
     AGN_PRC_ENV = 32;
     AGN_PRC_CLEAN_ENV = 40;
-    AGN_PRC_SIZE = 48;
+    AGN_PRC_CONFINE = 48;
+    AGN_PRC_SIZE = 56;
 }
 
 # The oracle's `Default` — `/bin/sh -c`, 30 s, inherit everything.
@@ -93,6 +99,20 @@ fn agnosai_process_config_default(): i64 {
     store64(c + AGN_PRC_TIMEOUT_MS, 30 * 1000);
     store64(c + AGN_PRC_ENV, vec_new());
     store64(c + AGN_PRC_CLEAN_ENV, 0);
+    # Confined by default since 2.3.4 (ADR 031). The oracle had no confinement at all.
+    store64(c + AGN_PRC_CONFINE, AGNOSAI_CONFINEMENT_DEFAULT);
+    return c;
+}
+
+# The confinement the child runs under: `AGNOSAI_CONFINEMENT_DEFAULT`, a confinement from
+# `agnosai_confinement_with_path`, or 0 for none.
+fn agnosai_process_config_confinement(c): i64 { return load64(c + AGN_PRC_CONFINE); }
+
+# Run the child under `cf` instead, or unconfined with 0. ⚠ **0 is for a command the
+# operator wrote and trusts**, never for one a tool, a model or a request supplied. Returns
+# the config.
+fn agnosai_process_config_set_confinement(c, cf): i64 {
+    store64(c + AGN_PRC_CONFINE, cf);
     return c;
 }
 
@@ -231,6 +251,16 @@ fn _agnosai_process_envp(c): i64 {
     return _agnosai_process_envp_from(c, _read_environ_envp());
 }
 
+# `_agnosai_process_envp` for a run in `a`. A config that adds nothing and clears nothing gets
+# the shared sanitized environment, built once (`agnosai_sanitized_envp`), which is every config
+# the manager makes. One that does is built in `a`.
+fn _agnosai_process_envp_a(a, c): i64 {
+    if (load64(c + AGN_PRC_CLEAN_ENV) == 0 && vec_len(load64(c + AGN_PRC_ENV)) == 0) {
+        return agnosai_sanitized_envp();
+    }
+    return _agnosai_process_envp_from_a(a, c, _read_environ_envp());
+}
+
 # The body of `_agnosai_process_envp`, over an explicitly supplied `envp`.
 #
 # **Split out for the same reason its `spawn` sibling was, and it had a second
@@ -243,12 +273,17 @@ fn _agnosai_process_envp(c): i64 {
 # that actually carries an `LD_PRELOAD` instead of hoping the ambient
 # environment does.
 fn _agnosai_process_envp_from(c, src): i64 {
-    var base = vec_new();
+    return _agnosai_process_envp_from_a(default_alloc(), c, src);
+}
+
+# `_agnosai_process_envp_from`, in `a`.
+fn _agnosai_process_envp_from_a(a, c, src): i64 {
+    var base = vec_new_a(a);
     if (load64(c + AGN_PRC_CLEAN_ENV) == 0) {
         var kept = _agnosai_sanitized_envp_of(src);
         var i = 0;
         while (load64(kept + i * 8) != 0) {
-            vec_push(base, str_from(load64(kept + i * 8)));
+            vec_push_a(a, base, str_from_a(a, load64(kept + i * 8)));
             i = i + 1;
         }
     }
@@ -268,11 +303,11 @@ fn _agnosai_process_envp_from(c, src): i64 {
             }
             k = k + 1;
         }
-        if (placed == 0) { vec_push(base, entry); }
+        if (placed == 0) { vec_push_a(a, base, entry); }
         j = j + 1;
     }
 
-    return _agnosai_envp_build(base);
+    return _agnosai_envp_build_a(a, base);
 }
 
 # ---------------------------------------------------------------------------
@@ -287,7 +322,22 @@ fn _agnosai_process_envp_from(c, src): i64 {
 # the buffers away — it never had them to return. `spawn` does have them, so the
 # blanking is explicit here rather than implicit there.
 fn _agnosai_process_finish(sp, what: Str, out_err): i64 {
+    return _agnosai_process_finish_a(default_alloc(), sp, what, out_err);
+}
+
+# `_agnosai_process_finish`, with the result in `a`.
+fn _agnosai_process_finish_a(a, sp, what: Str, out_err): i64 {
     if (agnosai_spawn_status(sp) == AGNOSAI_SPAWN_FAILED) {
+        var cw = agnosai_spawn_confine_failure(sp);
+        if (cw != 0) {
+            var sb = str_builder_new();
+            str_builder_add_cstr(sb, "failed to confine ");
+            str_builder_add(sb, what);
+            str_builder_add_cstr(sb, ": ");
+            str_builder_add_cstr(sb, cw);
+            store64(out_err, agnosai_error_sandbox(str_builder_build(sb)));
+            return 0;
+        }
         var why = str_from("failed to spawn ");
         if (agnosai_spawn_fail_reason(sp) == AGNOSAI_SPAWN_FAIL_CHDIR) {
             why = str_from("failed to enter the working directory for ");
@@ -307,11 +357,19 @@ fn _agnosai_process_finish(sp, what: Str, out_err): i64 {
     if (agnosai_spawn_timed_out(sp) == 1) {
         var m = str_cat(str_from("sandboxed process timed out, killing: "), what);
         sakshi_warn(str_data(m), str_len(m));
-        return agnosai_process_result_new(str_from(""), str_from(""), 0 - 1, 1);
+        return agnosai_process_result_new_a(a, str_from_a(a, ""), str_from_a(a, ""), 0 - 1, 1);
     }
 
-    return agnosai_process_result_new(agnosai_spawn_stdout(sp), agnosai_spawn_stderr(sp),
+    return agnosai_process_result_new_a(a, agnosai_spawn_stdout(sp), agnosai_spawn_stderr(sp),
       agnosai_spawn_exit_code(sp), 0);
+}
+
+# Refuse a run whose confinement the host could not build. **Never an unconfined run
+# instead**: a child that asked to be confined and was not is the failure ADR 031 exists for.
+fn _agnosai_process_unconfinable(what: Str, out_err): i64 {
+    store64(out_err, agnosai_error_sandbox(str_cat(str_from(
+            "failed to confine: kavach could not build its seccomp filter for "), what)));
+    return 0;
 }
 
 # Run a program directly with explicit arguments, bypassing the shell.
@@ -329,26 +387,42 @@ fn _agnosai_process_finish(sp, what: Str, out_err): i64 {
 #
 # Returns 0 with `out_err` set on failure.
 fn agnosai_process_execute_argv(c, argv, input: Str, out_err): i64 {
+    return agnosai_process_execute_argv_a(default_alloc(), c, argv, input, out_err);
+}
+
+# `agnosai_process_execute_argv`, with the run and its result in `a` (2.3.4): the argv, the
+# environment a config adds to, the captured streams and the result. A per-call arena then
+# keeps nothing on the global heap but an error.
+fn agnosai_process_execute_argv_a(a, c, argv, input: Str, out_err): i64 {
     if (vec_len(argv) == 0) {
         store64(out_err, agnosai_error_sandbox(str_from("empty argv")));
         return 0;
     }
 
     var exe = vec_get(argv, 0);
-    var raw = alloc((vec_len(argv) + 1) * 8);
+    var raw = alloc_via(a, (vec_len(argv) + 1) * 8);
     var i = 0;
     while (i < vec_len(argv)) {
-        store64(raw + i * 8, str_cstr(vec_get(argv, i)));
+        store64(raw + i * 8, str_data(str_clone_a(a, vec_get(argv, i))));
         i = i + 1;
     }
     store64(raw + vec_len(argv) * 8, 0);
 
-    var dm = str_cat(str_from("spawning sandboxed process (argv mode): "), exe);
-    sakshi_debug(str_data(dm), str_len(dm));
+    if (sakshi_get_level() >= SK_DEBUG) {
+        var dm = str_cat_a(a, str_from_a(a, "spawning sandboxed process (argv mode): "), exe);
+        sakshi_debug(str_data(dm), str_len(dm));
+    }
 
-    var sp = agnosai_spawn_capture_input(str_cstr(exe), raw, _agnosai_process_envp(c), input,
-      load64(c + AGN_PRC_TIMEOUT_MS), _agnosai_process_work_dir_cstr(c));
-    return _agnosai_process_finish(sp, exe, out_err);
+    var ok: i64[1];
+    var cf = agnosai_confinement_resolve(load64(c + AGN_PRC_CONFINE), &ok);
+    if (load64(&ok) == 0) { return _agnosai_process_unconfinable(exe, out_err); }
+    var wd = 0;
+    if (load64(c + AGN_PRC_WORK_DIR) != 0) {
+        wd = str_data(str_clone_a(a, load64(c + AGN_PRC_WORK_DIR)));
+    }
+    var sp = agnosai_spawn_capture_confined_a(a, load64(raw), raw, _agnosai_process_envp_a(a, c),
+      input, load64(c + AGN_PRC_TIMEOUT_MS), wd, cf);
+    return _agnosai_process_finish_a(a, sp, exe, out_err);
 }
 
 # Run a command string through the configured executable.
@@ -379,7 +453,10 @@ fn agnosai_process_execute(c, command: Str, input: Str, out_err): i64 {
     var dm = str_cat(str_from("spawning sandboxed process: "), exe);
     sakshi_debug(str_data(dm), str_len(dm));
 
-    var sp = agnosai_spawn_capture_input(str_cstr(exe), raw, _agnosai_process_envp(c), input,
-      load64(c + AGN_PRC_TIMEOUT_MS), _agnosai_process_work_dir_cstr(c));
+    var ok: i64[1];
+    var cf = agnosai_confinement_resolve(load64(c + AGN_PRC_CONFINE), &ok);
+    if (load64(&ok) == 0) { return _agnosai_process_unconfinable(exe, out_err); }
+    var sp = agnosai_spawn_capture_confined(str_cstr(exe), raw, _agnosai_process_envp(c), input,
+      load64(c + AGN_PRC_TIMEOUT_MS), _agnosai_process_work_dir_cstr(c), cf);
     return _agnosai_process_finish(sp, exe, out_err);
 }

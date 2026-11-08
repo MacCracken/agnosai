@@ -104,27 +104,32 @@ fn _agnosai_python_tool_schema(a, ctx): i64 {
 #      "unknown error").
 #   4. **stdout is not JSON** — a **success** carrying the trimmed text.
 fn agnosai_python_tool_output_of(stdout: Str, stderr: Str, exit_code, timed_out): i64 {
+    return agnosai_python_tool_output_of_a(default_alloc(), stdout, stderr, exit_code, timed_out);
+}
+
+# `agnosai_python_tool_output_of`, with the output in `a`: the call's allocator, from the loop.
+fn agnosai_python_tool_output_of_a(a, stdout: Str, stderr: Str, exit_code, timed_out): i64 {
     if (timed_out == 1) {
-        return agnosai_tool_output_err(str_from("python tool execution timed out"));
+        return agnosai_tool_output_err_a(a, str_from_a(a, "python tool execution timed out"));
     }
 
     if (exit_code != 0) {
-        var trimmed_err = str_trim(stderr);
-        if (str_len(trimmed_err) > 0) { return agnosai_tool_output_err(trimmed_err); }
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "python tool exited with code ");
-        str_builder_add_int(sb, exit_code);
-        return agnosai_tool_output_err(str_builder_build(sb));
+        var trimmed_err = str_trim_a(a, stderr);
+        if (str_len(trimmed_err) > 0) { return agnosai_tool_output_err_a(a, trimmed_err); }
+        var sb = str_builder_new_a(a);
+        str_builder_add_cstr_a(a, sb, "python tool exited with code ");
+        str_builder_add_int_a(a, sb, exit_code);
+        return agnosai_tool_output_err_a(a, str_builder_build_a(a, sb));
     }
 
     # ⚠ Trimmed ONCE. `str_trim` allocates, and the oracle calls `stdout.trim()`
     # at both the parse and the fallback.
-    var out = str_trim(stdout);
-    var v = bayan_json_v_parse_buf(str_data(out), str_len(out));
+    var out = str_trim_a(a, stdout);
+    var v = bayan_json_v_parse_buf_a(a, str_data(out), str_len(out));
     if (v == 0) {
         # ⚠ Non-JSON stdout is a **SUCCESS** carrying the raw text, not an
         # error. A tool that `print`s plain text works. Do not "improve" this.
-        return agnosai_tool_output_ok(bayan_json_v_str_new(out));
+        return agnosai_tool_output_ok_a(a, bayan_json_v_str_new_a(a, out));
     }
 
     # ⚠ `success` defaults to TRUE, and so does a NON-BOOLEAN `success`:
@@ -144,27 +149,32 @@ fn agnosai_python_tool_output_of(stdout: Str, stderr: Str, exit_code, timed_out)
         # a `JTAG_NULL` node for a present null. The bridge emits
         # `"result": None` on every failure, so this path is live.
         var rv = bayan_json_v_obj_get_by_cstr(v, "result");
-        if (rv == 0) { return agnosai_tool_output_ok(v); }
-        return agnosai_tool_output_ok(rv);
+        if (rv == 0) { return agnosai_tool_output_ok_a(a, v); }
+        return agnosai_tool_output_ok_a(a, rv);
     }
 
     var ev = bayan_json_v_obj_get_by_cstr(v, "error");
     if (ev != 0) {
         if (bayan_json_v_is_str(ev) == 1) {
-            return agnosai_tool_output_err(bayan_json_v_str(ev));
+            return agnosai_tool_output_err_a(a, bayan_json_v_str(ev));
         }
     }
-    return agnosai_tool_output_err(str_from("unknown error"));
+    return agnosai_tool_output_err_a(a, str_from_a(a, "unknown error"));
 }
 
 # The oracle's `execute()` — marshal the parameters, run, interpret.
+#
+# ⚠ **In the call's allocator** (2.3.4, 2.3.2's `agnosai_tool_input_alloc`): the parameters, the
+# bridge's input, the run, its captured streams and the output. On the tool loop that is the
+# call's arena, which goes back after the turn, so a call keeps nothing on the global heap
+# but an error's text.
 fn _agnosai_python_tool_execute(ctx, input): i64 {
-    var params = _agnosai_map_to_value_a(default_alloc(),
-      agnosai_tool_input_parameters(input));
+    var a = agnosai_tool_input_alloc(input);
+    var params = _agnosai_map_to_value_a(a, agnosai_tool_input_parameters(input));
 
     var err = 0;
     store64(&err, 0);
-    var r = agnosai_python_execute_tool(load64(ctx + AGN_PYT_SANDBOX),
+    var r = agnosai_python_execute_tool_a(a, load64(ctx + AGN_PYT_SANDBOX),
       load64(ctx + AGN_PYT_SOURCE), load64(ctx + AGN_PYT_NAME), params, &err);
     if (r == 0) {
         # ⚠ The prefix DOUBLES, and that is the oracle's output. `e` is an
@@ -174,11 +184,11 @@ fn _agnosai_python_tool_execute(ctx, input): i64 {
         # `"python sandbox error: sandbox error: failed to spawn python
         # process"`. `agnosai_error_message` reproduces Display including the
         # prefix; `agnosai_error_detail` would drop it and quietly diverge.
-        return agnosai_tool_output_err(str_cat(str_from("python sandbox error: "),
+        return agnosai_tool_output_err_a(a, str_cat_a(a, str_from_a(a, "python sandbox error: "),
             agnosai_error_message(load64(&err))));
     }
 
-    return agnosai_python_tool_output_of(agnosai_python_result_stdout(r),
+    return agnosai_python_tool_output_of_a(a, agnosai_python_result_stdout(r),
       agnosai_python_result_stderr(r), agnosai_python_result_exit_code(r),
       agnosai_python_result_timed_out(r));
 }

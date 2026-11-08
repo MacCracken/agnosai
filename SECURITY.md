@@ -40,16 +40,21 @@ within 14 days of confirmation.
     wraps the `wasmtime` process itself. WASI is stdio-only: no `--dir` preopen
     is emitted, so the guest has no filesystem. See
     [ADR 019](docs/adr/019-wasm-tools-spawn-wasmtime-directly.md).
-  - **OCI** (`src/sandbox/oci.cyr`) delegates to a container runtime, which
-    provides whatever isolation that runtime provides.
-  - ⚠ **Process/Python is NOT kernel-confined.** It is a subprocess with a
-    sanitized environment, a working directory and a SIGKILL deadline —
-    **no seccomp-bpf, no Landlock, no cgroups, no network namespace**. This
-    document previously claimed otherwise; the claim was false.
-    `src/sandbox/python.cyr` says so in its own header, and the oracle's
-    `python.rs:4` names that confinement as "(future)". kavach can supply it,
-    but it is not wired into this tier. **Treat a process-tier tool as running
-    with your server's privileges** and review it as you would a native tool.
+  - **OCI** (`src/sandbox/oci.cyr`) delegates to a container runtime. Since
+    2.3.4 the run line carries a read-only root, `--network=none` unless the
+    policy allows it, `--memory`, `--cap-drop=ALL`,
+    `--security-opt=no-new-privileges` and `--pids-limit 256`.
+  - **Process/Python is kernel-confined since 2.3.4**
+    ([ADR 031](docs/adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)):
+    NO_NEW_PRIVS, kavach's seccomp filter, and landlock rules giving read and
+    execute on the system's own trees and read and write on `/tmp` and the
+    call's work directory, with the binary pinned by descriptor. Through 2.3.3
+    it was a plain subprocess with the server's privileges.
+    ⚠ **Still open:** the network is not isolated on this tier; a server
+    running as root gives these tools root's capabilities, so do not run it as
+    root (the image runs as uid 10001); a kernel without landlock runs them
+    with no filesystem rules, and the server warns once. There is no memory
+    limit and no cgroup. `docs/development/threat-model.md` has the detail.
   - **Native** tools run in-process and should be reviewed carefully before
     registration.
 - **LLM provider calls**: HTTP requests are made to configured provider

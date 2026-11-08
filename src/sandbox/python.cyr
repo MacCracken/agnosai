@@ -44,7 +44,12 @@ enum AgnosaiPyResultOff {
 
 # A finished interpreter run.
 fn agnosai_python_result_new(stdout: Str, stderr: Str, exit_code, timed_out): i64 {
-    var r = alloc(AGN_PYR_SIZE);
+    return agnosai_python_result_new_a(default_alloc(), stdout, stderr, exit_code, timed_out);
+}
+
+# `agnosai_python_result_new`, in `a`.
+fn agnosai_python_result_new_a(a, stdout: Str, stderr: Str, exit_code, timed_out): i64 {
+    var r = alloc_via(a, AGN_PYR_SIZE);
     store64(r + AGN_PYR_STDOUT, stdout);
     store64(r + AGN_PYR_STDERR, stderr);
     store64(r + AGN_PYR_EXIT_CODE, exit_code);
@@ -72,7 +77,8 @@ enum AgnosaiPySandboxOff {
     AGN_PYS_PATH = 0;
     AGN_PYS_TIMEOUT_MS = 8;
     AGN_PYS_WORK_DIR = 16;
-    AGN_PYS_SIZE = 24;
+    AGN_PYS_CONFINE = 24;
+    AGN_PYS_SIZE = 32;
 }
 
 # `PythonSandbox::new` — `python3`, a 30-second deadline, no working directory.
@@ -85,8 +91,22 @@ fn agnosai_python_sandbox_new(): i64 {
     store64(s + AGN_PYS_PATH, str_from("python3"));
     store64(s + AGN_PYS_TIMEOUT_MS, 30 * 1000);
     store64(s + AGN_PYS_WORK_DIR, 0);
+    # Confined by default since 2.3.4 (ADR 031): the oracle's "seccomp + Landlock (future)".
+    store64(s + AGN_PYS_CONFINE, AGNOSAI_CONFINEMENT_DEFAULT);
     return s;
 }
+
+# Run the interpreter under `cf` instead: a confinement from `agnosai_confinement_with_path`,
+# `AGNOSAI_CONFINEMENT_DEFAULT`, or 0 for none. ⚠ **0 runs a tool's Python with the server's
+# authority**, and is for source the operator wrote. Returns the sandbox.
+fn agnosai_python_sandbox_with_confinement(s, cf): i64 {
+    store64(s + AGN_PYS_CONFINE, cf);
+    return s;
+}
+
+# The confinement the interpreter runs under, as `agnosai_python_sandbox_with_confinement`
+# takes it.
+fn agnosai_python_sandbox_confinement(s): i64 { return load64(s + AGN_PYS_CONFINE); }
 
 # `PythonSandbox::with_config` — an explicit interpreter and deadline.
 fn agnosai_python_sandbox_with_config(python_path: Str, timeout_ms): i64 {
@@ -127,16 +147,25 @@ fn agnosai_python_sandbox_work_dir(s): i64 { return load64(s + AGN_PYS_WORK_DIR)
 #
 # Returns 0 with `out_err` set when the interpreter cannot be spawned.
 fn agnosai_python_execute_script(s, script: Str, input: Str, out_err): i64 {
+    return agnosai_python_execute_script_a(default_alloc(), s, script, input, out_err);
+}
+
+# `agnosai_python_execute_script`, with the run and its result in `a` (2.3.4). The argv,
+# the captured streams and the result are this call's, so a per-call arena keeps nothing on
+# the global heap but an error. `str_clone_a` ends its copy with a NUL, which `execve` needs.
+fn agnosai_python_execute_script_a(a, s, script: Str, input: Str, out_err): i64 {
     var exe = load64(s + AGN_PYS_PATH);
 
-    var argv = alloc(4 * 8);
-    store64(argv, str_cstr(exe));
-    store64(argv + 8, str_cstr(str_from("-c")));
-    store64(argv + 16, str_cstr(script));
+    var argv = alloc_via(a, 4 * 8);
+    store64(argv, str_data(str_clone_a(a, exe)));
+    store64(argv + 8, "-c");
+    store64(argv + 16, str_data(str_clone_a(a, script)));
     store64(argv + 24, 0);
 
     var wd = 0;
-    if (load64(s + AGN_PYS_WORK_DIR) != 0) { wd = str_cstr(load64(s + AGN_PYS_WORK_DIR)); }
+    if (load64(s + AGN_PYS_WORK_DIR) != 0) {
+        wd = str_data(str_clone_a(a, load64(s + AGN_PYS_WORK_DIR)));
+    }
 
     # `#[tracing::instrument(skip_all)]` on the oracle's `execute_script`
     # (`python.rs:62`), and the shape every sibling backend already used —
@@ -144,13 +173,30 @@ fn agnosai_python_execute_script(s, script: Str, input: Str, out_err): i64 {
     # until 2026-08-05, on the highest-risk operation in the subsystem: running
     # untrusted tool source through an interpreter. Against CLAUDE.md's "sakshi
     # on all operations", silence here was the wrong default.
-    var dm = str_cat(str_from("spawning python interpreter: "), exe);
-    sakshi_debug(str_data(dm), str_len(dm));
+    if (sakshi_get_level() >= SK_DEBUG) {
+        var dm = str_cat_a(a, str_from_a(a, "spawning python interpreter: "), exe);
+        sakshi_debug(str_data(dm), str_len(dm));
+    }
 
-    var sp = agnosai_spawn_capture_input(str_cstr(exe), argv, agnosai_sanitized_envp(), input,
-      load64(s + AGN_PYS_TIMEOUT_MS), wd);
+    var ok: i64[1];
+    var cf = agnosai_confinement_resolve(load64(s + AGN_PYS_CONFINE), &ok);
+    if (load64(&ok) == 0) {
+        store64(out_err, agnosai_error_sandbox(str_from(
+              "failed to confine: kavach could not build its seccomp filter for the python process")));
+        return 0;
+    }
+    var sp = agnosai_spawn_capture_confined_a(a, load64(argv), argv, agnosai_sanitized_envp(),
+      input, load64(s + AGN_PYS_TIMEOUT_MS), wd, cf);
 
     if (agnosai_spawn_status(sp) == AGNOSAI_SPAWN_FAILED) {
+        var cw = agnosai_spawn_confine_failure(sp);
+        if (cw != 0) {
+            var cb = str_builder_new_a(a);
+            str_builder_add_cstr_a(a, cb, "failed to confine the python process: ");
+            str_builder_add_cstr_a(a, cb, cw);
+            store64(out_err, agnosai_error_sandbox(str_builder_build_a(a, cb)));
+            return 0;
+        }
         # **A bad `work_dir` is an operator's typo, not a missing interpreter**,
         # and the spawn primitive already tells them apart — `spawn.cyr:328-334`
         # exists for this, and `_agnosai_process_finish` branches on it. Python
@@ -177,15 +223,18 @@ fn agnosai_python_execute_script(s, script: Str, input: Str, out_err): i64 {
     }
 
     if (agnosai_spawn_timed_out(sp) == 1) {
-        var wm = str_cat(str_from("python interpreter timed out, killing: "), exe);
+        var wm = str_cat_a(a, str_from_a(a, "python interpreter timed out, killing: "), exe);
         sakshi_warn(str_data(wm), str_len(wm));
         # Blanked exactly as `process` and `oci` blank it — `python.rs:114-121`.
-        return agnosai_python_result_new(str_from(""), str_from(""), 0 - 1, 1);
+        return agnosai_python_result_new_a(a, str_from_a(a, ""), str_from_a(a, ""), 0 - 1, 1);
     }
 
-    return agnosai_python_result_new(agnosai_spawn_stdout(sp), agnosai_spawn_stderr(sp),
+    return agnosai_python_result_new_a(a, agnosai_spawn_stdout(sp), agnosai_spawn_stderr(sp),
       agnosai_spawn_exit_code(sp), 0);
 }
+
+# The bridge script, once built. Two threads racing build two, and one is kept.
+var _AGNOSAI_PYTHON_BRIDGE = 0;
 
 # The tool-bridge wrapper — `rust-old/src/sandbox/python.rs:139-152`, verbatim.
 #
@@ -193,7 +242,20 @@ fn agnosai_python_execute_script(s, script: Str, input: Str, out_err): i64 {
 # supplies is ever concatenated into it; the source arrives as
 # `__tool_source__` in the stdin JSON, so no amount of quoting in the tool can
 # add a statement to this script.
+#
+# Built once and kept (2.3.4): it is a constant, and every tool call built it again on the
+# global heap.
 fn agnosai_python_bridge_script(): Str {
+    var held = atomic_load(&_AGNOSAI_PYTHON_BRIDGE);
+    if (held != 0) { return held; }
+    var built = _agnosai_python_bridge_script_build();
+    atomic_fence();
+    atomic_store(&_AGNOSAI_PYTHON_BRIDGE, built);
+    return built;
+}
+
+# The bridge script, written out. Called once.
+fn _agnosai_python_bridge_script_build(): Str {
     var b = str_builder_new();
     str_builder_add_cstr(b, "\nimport sys, json, traceback\n\n");
     str_builder_add_cstr(b, "input_data = json.loads(sys.stdin.read())\n");
@@ -217,12 +279,18 @@ fn agnosai_python_bridge_script(): Str {
 # `parameters` is a `bayan` JSON value and is embedded as-is; a tool's
 # parameters are caller data and must survive unaltered.
 fn agnosai_python_bridge_input(tool_source: Str, tool_name: Str, parameters): Str {
-    var o = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(o, str_from("__tool_source__"), bayan_json_v_str_new(tool_source));
-    bayan_json_v_obj_set(o, str_from("tool_name"), bayan_json_v_str_new(tool_name));
-    if (parameters == 0) { parameters = bayan_json_v_obj_new(); }
-    bayan_json_v_obj_set(o, str_from("parameters"), parameters);
-    return bayan_json_v_build(o);
+    return agnosai_python_bridge_input_a(default_alloc(), tool_source, tool_name, parameters);
+}
+
+# `agnosai_python_bridge_input`, built in `a`.
+fn agnosai_python_bridge_input_a(a, tool_source: Str, tool_name: Str, parameters): Str {
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "__tool_source__"),
+      bayan_json_v_str_new_a(a, tool_source));
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "tool_name"), bayan_json_v_str_new_a(a, tool_name));
+    if (parameters == 0) { parameters = bayan_json_v_obj_new_a(a); }
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "parameters"), parameters);
+    return bayan_json_v_build_a(a, o);
 }
 
 # Run a Python tool through the bridge protocol — `execute_tool`,
@@ -235,6 +303,12 @@ fn agnosai_python_bridge_input(tool_source: Str, tool_name: Str, parameters): St
 #
 # Returns 0 with `out_err` set when the interpreter cannot be spawned.
 fn agnosai_python_execute_tool(s, tool_source: Str, tool_name: Str, parameters, out_err): i64 {
-    return agnosai_python_execute_script(s, agnosai_python_bridge_script(),
-      agnosai_python_bridge_input(tool_source, tool_name, parameters), out_err);
+    return agnosai_python_execute_tool_a(default_alloc(), s, tool_source, tool_name, parameters,
+      out_err);
+}
+
+# `agnosai_python_execute_tool`, with the run and its result in `a`.
+fn agnosai_python_execute_tool_a(a, s, tool_source: Str, tool_name: Str, parameters, out_err): i64 {
+    return agnosai_python_execute_script_a(a, s, agnosai_python_bridge_script(),
+      agnosai_python_bridge_input_a(a, tool_source, tool_name, parameters), out_err);
 }
