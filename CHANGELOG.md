@@ -57,6 +57,9 @@ with kavach 3.14.9. The URL check moved off the global heap, and the tool list a
   it could not end a read already blocked. A model could start one, and a crew waits on its tools. They now set a read and
   write limit beside it, as the hoosh and OTLP clients did. Measured: a 150 ms budget was still blocked at 300 s, and now
   returns a timeout on time. Filed with sandhi.
+- **`tests/sandbox_wasm.tcyr` raced two limits.** Its spinning guests had the default 1e9 fuel, which lasts 476 ms on the
+  development box and under 300 ms on a GitHub runner, so a 300 ms deadline read as exhausted fuel there. The guests whose
+  test is the deadline now have more fuel than a deadline can burn. No code outside the suite changed.
 - **`load_testing`'s real HTTP path asserted nothing about its answer.** It now runs against a loopback server that keeps
   its connections: what status was counted, how many connections were opened, and what a 404, a chunked body, a close with
   and without warning, a timeout and a silent target each count as.

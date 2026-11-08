@@ -262,6 +262,15 @@ fn _t_echo_loop(s, out_err): i64 {
     return _t_guest(b, s, "/echo-loop.wasm", out_err);
 }
 
+# More fuel than any machine can burn inside these suites' deadlines, for a guest whose test is about
+# the deadline.
+#
+# ⚠ **The default budget is a limit of its own, and on a fast core it comes first.** A guest spinning
+# on 1e9 fuel lasts 476 ms on a Ryzen 5800H and under 300 ms on a GitHub runner, so a 300 ms deadline
+# reported fuel there (-2), and a 1.5 s run was already over at 400 ms. It passed here and in the
+# `ubuntu:26.04` replica on this box, and failed at 2.3.6's first push.
+var _T_FUEL_PAST_ANY_DEADLINE = 10000000000000;
+
 # (func _start (loop (br 0))): reads nothing, and never ends.
 fn _t_spin(s, out_err): i64 {
     var b = str_builder_new();
@@ -351,6 +360,7 @@ fn _t_input_suite(): i64 {
 
     # A guest that takes none of it. This is what a blocking write could never get past.
     var quick = agnosai_wasm_sandbox_with_limits(AGNOSAI_WASM_DEFAULT_MAX_MEMORY_BYTES, 300);
+    agnosai_wasm_sandbox_set_fuel(quick, _T_FUEL_PAST_ANY_DEADLINE);
     var spin = _t_spin(quick, &err);
     assert_neq(spin, 0, "the spinning guest loads");
     var stuck = _t_run_sized(quick, spin, 200000, &ms, &err);
@@ -576,6 +586,7 @@ fn _t_free_during_run_suite(): i64 {
     var err: i64[1];
     store64(&err, 0);
     _t_hold_sandbox = agnosai_wasm_sandbox_with_limits(67108864, 1500);
+    agnosai_wasm_sandbox_set_fuel(_t_hold_sandbox, _T_FUEL_PAST_ANY_DEADLINE);
     _t_hold_module = _t_spin(_t_hold_sandbox, &err);
     if (_t_hold_module == 0) { return assert(0, "a guest that never ends loads"); }
     var path = str_clone(agnosai_wasm_module_path(_t_hold_module));
