@@ -1,0 +1,72 @@
+# =========================================================================
+# done_word.tcyr — src/done_word.cyr: a thread saying it is over, and another waiting for it.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/done_word.cyr"
+include "tests/test_helpers.cyr"
+
+# Layout of what a test thread is handed.
+var _T_WORD = 0;
+var _T_RESULT = 8;
+var _T_DELAY_MS = 16;
+var _T_SIZE = 24;
+
+fn _t_job(delay_ms): i64 {
+    var j = alloc(_T_SIZE);
+    store64(j + _T_WORD, 0);
+    store64(j + _T_RESULT, 0);
+    store64(j + _T_DELAY_MS, delay_ms);
+    return j;
+}
+
+# What a worker does: its work, then the set, which is its last touch of the job.
+fn _t_worker(j): i64 {
+    var delay = load64(j + _T_DELAY_MS);
+    if (delay > 0) { sleep_ms(delay); }
+    store64(j + _T_RESULT, 4242);
+    agnosai_done_word_set(j + _T_WORD);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_group("done_word");
+
+    var first = _t_job(0);
+    assert_eq(load64(first + _T_WORD), 0, "a job starts not done");
+    _t_worker(first);
+    assert_eq(load64(first + _T_WORD), 1, "and the set marks it");
+    agnosai_done_word_wait(first + _T_WORD);
+    assert_eq(load64(first + _T_RESULT), 4242, "so a wait on a set word returns at once");
+
+    # The waiter gets here first and has to be woken, which is what a missing wake would hang on.
+    var late = _t_job(40);
+    var t0 = clock_now_ms();
+    assert_neq(thread_create_detached(&_t_worker, late), 0, "a detached thread starts");
+    assert_eq(load64(late + _T_RESULT), 0, "and has not finished yet");
+    agnosai_done_word_wait(late + _T_WORD);
+    assert(clock_now_ms() - t0 >= 30, "so the wait waited for it");
+    assert_eq(load64(late + _T_RESULT), 4242, "and what it wrote before the set is there after the wait");
+
+    var jobs = vec_new();
+    for (var i = 0; i < 64; i = i + 1) {
+        var j = _t_job(i % 5);
+        vec_push(jobs, j);
+        assert_neq(thread_create_detached(&_t_worker, j), 0, "a worker starts");
+    }
+    var total = 0;
+    for (var k = 0; k < 64; k = k + 1) {
+        var job = vec_get(jobs, k);
+        agnosai_done_word_wait(job + _T_WORD);
+        total = total + load64(job + _T_RESULT);
+    }
+    assert_eq(total, 64 * 4242, "every worker's result is there, waited for in order, whatever order they ended");
+
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

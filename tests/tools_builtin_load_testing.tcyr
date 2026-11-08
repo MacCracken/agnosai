@@ -8,10 +8,10 @@
 # local server, and pointing a test suite at a public host is not acceptable.
 #
 # Instead the **real thread fan-out** runs against a synthetic executor. That
-# exercises everything the mock server would have — worker threads, per-worker
-# arenas, the deadline and budget loops, status aggregation, the sort, the
-# percentile indices — with no network at all. The only untested path is
-# sandhi's own behaviour under `sandhi_http_get_a`.
+# exercises worker threads, per-worker arenas, the deadline and budget loops,
+# status aggregation, the sort and the percentile indices with no network at
+# all. The real executor runs against a loopback server here (`_t_http_suite`),
+# driven directly, as the tool's own SSRF guard refuses loopback.
 #
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
@@ -57,6 +57,273 @@ fn _t_exec_mixed(w): i64 {
     return 503;
 }
 
+# ── a loopback server that keeps its connections ────────────────────────────
+#
+# One thread per connection, as a run opens one per user. What it answers is `_T_ANSWER`, and 0 closes
+# the connection unanswered. `_T_CLOSE_AFTER` closes one with no warning after that many answers, and
+# `_T_HANG_AFTER` stops answering after that many, keeping the connection open.
+var _T_LFD = 0;
+var _T_PORT = 0;
+var _T_ANSWER = 0;
+var _T_CLOSE_AFTER = 0;
+var _T_HANG_AFTER = 0;
+var _T_ACCEPTS = 0;
+var _T_SEEN = 0;
+var _T_ENDED = 0;
+
+var _T_KEEP = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+var _T_CLOSES = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
+var _T_MISSING = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+var _T_CHUNKED = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n";
+
+# ⚠ `sys_read` and `sys_write`, and not `sock_recv`: its `Ok` is 16 B on the global heap per request,
+# which is what `_t_http_cost` is measuring the client for.
+fn _t_conn(cfd): i64 {
+    var buf[2048];
+    var served = 0;
+    while (sys_read(cfd, &buf, 2048) > 0) {
+        atomic_fetch_add(&_T_SEEN, 1);
+        var r = _T_ANSWER;
+        if (r == 0) { break; }
+        if (_T_HANG_AFTER != 0 && served >= _T_HANG_AFTER) { continue; }
+        sys_write(cfd, r, strlen(r));
+        served = served + 1;
+        if (_T_CLOSE_AFTER != 0 && served >= _T_CLOSE_AFTER) { break; }
+    }
+    sock_close(cfd);
+    atomic_fetch_add(&_T_ENDED, 1);
+    return 0;
+}
+
+fn _t_server(arg): i64 {
+    while (1 == 1) {
+        var at, cfd = sock_accept(_T_LFD);
+        if (is_err_result(at) == 0) {
+            atomic_fetch_add(&_T_ACCEPTS, 1);
+            thread_create_detached(&_t_conn, cfd);
+        }
+    }
+    return 0;
+}
+
+# Listen on a free loopback port: 1, or 0 when there is none.
+fn _t_server_start(): i64 {
+    var lt, lfd = tcp_socket();
+    sock_reuse(lfd);
+    var lp = 47941;
+    while (lp < 47973 && _T_PORT == 0) {
+        var bt, bv = sock_bind(lfd, INADDR_LOOPBACK(), lp);
+        if (is_err_result(bt) == 0) { _T_PORT = lp; }
+        lp = lp + 1;
+    }
+    if (_T_PORT == 0) { return 0; }
+    var st, sv = sock_listen(lfd, 64);
+    if (is_err_result(st) == 1) { return 0; }
+    _T_LFD = lfd;
+    thread_create_detached(&_t_server, 0);
+    return 1;
+}
+
+fn _t_url(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "http://127.0.0.1:");
+    str_builder_add_int(sb, _T_PORT);
+    str_builder_add_cstr(sb, "/");
+    return str_builder_build(sb);
+}
+
+# Point the server at `answer`, and zero its counts.
+fn _t_serve(answer, close_after): i64 {
+    _T_ANSWER = answer;
+    _T_CLOSE_AFTER = close_after;
+    _T_HANG_AFTER = 0;
+    atomic_store(&_T_ACCEPTS, 0);
+    atomic_store(&_T_SEEN, 0);
+    atomic_store(&_T_ENDED, 0);
+    return 0;
+}
+
+# A real-executor worker with `budget` requests, run to its end. Hands back the worker, unreleased.
+fn _t_http_run(budget): i64 {
+    var w = agnosai_lt_worker_new(_t_url(), clock_now_ns() + 30000000000, budget,
+      &agnosai_lt_http_executor, 0);
+    agnosai_lt_worker_run(w);
+    return w;
+}
+
+# Wait up to a second for the server to have seen `n` connections end.
+fn _t_await_ended(n): i64 {
+    for (var i = 0; i < 1000 && atomic_load(&_T_ENDED) < n; i = i + 1) { sleep_ms(1); }
+    return atomic_load(&_T_ENDED);
+}
+
+fn _t_status(w, code): i64 {
+    return agnosai_lt_status_count(agnosai_lt_worker_status_counts(w), code);
+}
+
+# What a request on a kept connection leaves on the global heap, its arenas warm.
+#
+# ⚠ Sandhi's own, exact and for this response, so that a copy of ours shows above it (roadmap:
+# waiting on sandhi). 256 B of it is the pool's route key, built on the global heap for each take
+# and each put. Lower it when sandhi moves.
+var _T_SANDHI_BYTES_PER_KEPT_REQUEST = 568;
+
+fn _t_http_cost(): i64 {
+    _t_serve(_T_KEEP, 0);
+    var w = agnosai_lt_worker_new(_t_url(), clock_now_ns() + 30000000000, 20, &agnosai_lt_http_executor, 0);
+    agnosai_lt_worker_run(w);
+    store64(w + AGN_LT_MAX_REQUESTS, 220);
+    var pool = load64(w + AGN_LT_POOL);
+    # One request to open the worker's connection again, which the first run closed as it ended.
+    agnosai_lt_http_executor(w);
+    reset_via(agnosai_lt_worker_scratch(w));
+    var before = alloc_used();
+    for (var i = 0; i < 200; i = i + 1) {
+        assert_eq(agnosai_lt_http_executor(w), 200, "every kept-connection request answers");
+        reset_via(agnosai_lt_worker_scratch(w));
+    }
+    var cost = (alloc_used() - before) / 200;
+    assert_eq(sandhi_http_pool_idle_count(pool), 1, "and the connection is still there to measure");
+    assert(cost <= _T_SANDHI_BYTES_PER_KEPT_REQUEST,
+      "a kept-connection request leaves only sandhi's own: nothing of ours");
+    sandhi_http_pool_close(pool);
+    agnosai_lt_worker_release(w);
+    return 0;
+}
+
+fn _t_http_suite(): i64 {
+    test_group("the real executor, on a real socket");
+    if (_t_server_start() == 0) {
+        println("tools_builtin_load_testing: no loopback port to listen on; these checks did not run");
+        return 0;
+    }
+
+    _t_serve(_T_KEEP, 0);
+    var w = _t_http_run(50);
+    assert_eq(vec_len(agnosai_lt_worker_latencies(w)), 50, "every request is measured");
+    assert_eq(agnosai_lt_worker_errors(w), 0, "and none failed");
+    assert_eq(_t_status(w, 200), 50, "and each is counted under the status the server sent");
+    assert_eq(atomic_load(&_T_ACCEPTS), 1, "on one connection: a request is not a handshake");
+    assert_eq(atomic_load(&_T_SEEN), 50, "and the server saw each once");
+    assert_eq(_t_await_ended(1), 1, "and the worker closes it as it ends");
+    assert_eq(sandhi_http_pool_idle_count(load64(w + AGN_LT_POOL)), 0, "leaving nothing in its pool");
+    agnosai_lt_worker_release(w);
+
+    _t_serve(_T_CHUNKED, 0);
+    w = _t_http_run(20);
+    assert_eq(_t_status(w, 200), 20, "a chunked answer is read to its end");
+    assert_eq(atomic_load(&_T_ACCEPTS), 1, "so its connection can be used again");
+    agnosai_lt_worker_release(w);
+
+    _t_serve(_T_MISSING, 0);
+    w = _t_http_run(5);
+    assert_eq(_t_status(w, 404), 5, "a 404 is a status, not a transport error");
+    assert_eq(agnosai_lt_worker_errors(w), 0, "and is not an error here");
+    assert_eq(atomic_load(&_T_ACCEPTS), 5, "sandhi keeps no connection after one");
+    agnosai_lt_worker_release(w);
+
+    _t_serve(_T_CLOSES, 0);
+    w = _t_http_run(5);
+    assert_eq(_t_status(w, 200), 5, "a server that says it is closing is answered in full");
+    assert_eq(atomic_load(&_T_ACCEPTS), 5, "and gets a new connection per request");
+    assert_eq(atomic_load(&_T_SEEN), 5, "with no request sent twice");
+    agnosai_lt_worker_release(w);
+
+    # Each new connection takes the place of the last in its arena. Without the reset that arena
+    # grows by a whole response buffer a request, which is 16 MiB.
+    w = agnosai_lt_worker_new(_t_url(), clock_now_ns() + 30000000000, 1, &agnosai_lt_http_executor, 0);
+    agnosai_lt_http_executor(w);
+    reset_via(agnosai_lt_worker_scratch(w));
+    var grown = alloc_used();
+    for (var ar_i = 0; ar_i < 30; ar_i = ar_i + 1) {
+        agnosai_lt_http_executor(w);
+        reset_via(agnosai_lt_worker_scratch(w));
+    }
+    assert(alloc_used() - grown < 1048576, "and thirty more connections take the first one's place");
+    agnosai_lt_worker_release(w);
+
+    # The one that decides whether a run's numbers can be trusted against a real server.
+    _t_serve(_T_KEEP, 3);
+    w = _t_http_run(30);
+    assert_eq(agnosai_lt_worker_errors(w), 0,
+      "a server closing a kept connection without warning is not reported as a failing target");
+    assert_eq(_t_status(w, 200), 30, "every request still got its answer");
+    assert_eq(atomic_load(&_T_ACCEPTS), 10, "on a new connection each time one went");
+    agnosai_lt_worker_release(w);
+
+    # A kept connection that goes quiet is a finding about the target. A retry would wait out the
+    # deadline twice over and call the result an answer.
+    _t_serve(_T_KEEP, 0);
+    _T_HANG_AFTER = 1;
+    var keep_ms = AGNOSAI_LT_REQUEST_TIMEOUT_MS;
+    AGNOSAI_LT_REQUEST_TIMEOUT_MS = 150;
+    w = _t_http_run(2);
+    AGNOSAI_LT_REQUEST_TIMEOUT_MS = keep_ms;
+    assert_eq(_t_status(w, 200), 1, "the answer that came is counted");
+    assert_eq(agnosai_lt_worker_errors(w), 1, "and the one that never did is an error");
+    assert_eq(atomic_load(&_T_ACCEPTS), 1, "with no second connection tried: a timeout is not retried");
+    agnosai_lt_worker_release(w);
+
+    _t_serve(0, 0);
+    w = _t_http_run(3);
+    assert_eq(agnosai_lt_worker_errors(w), 3, "a target that accepts and never answers is a failure");
+    assert_eq(atomic_load(&_T_ACCEPTS), 3, "and a fresh connection is not tried twice: that would hide it");
+    assert_eq(vec_len(agnosai_lt_worker_latencies(w)), 3, "with each attempt measured");
+    agnosai_lt_worker_release(w);
+
+    # A request can fail without touching the connection, here on a URL sandhi will not parse. The
+    # connection is still in the pool and still alive in its arena, which must not be reset for it.
+    _t_serve(_T_KEEP, 0);
+    w = agnosai_lt_worker_new(_t_url(), clock_now_ns() + 30000000000, 1, &agnosai_lt_http_executor, 0);
+    assert_eq(agnosai_lt_http_executor(w), 200, "a connection is opened");
+    reset_via(agnosai_lt_worker_scratch(w));
+    var conn_arena = load64(w + AGN_LT_CONN);
+    var holds = arena_used(load64(conn_arena + 32));
+    assert(holds > 0, "and lives in the worker's connection arena");
+    var good_url = load64(w + AGN_LT_URL);
+    store64(w + AGN_LT_URL, str_from("http://"));
+    assert_eq(agnosai_lt_http_executor(w), 0, "a URL that does not parse is a transport error");
+    assert_eq(arena_used(load64(conn_arena + 32)), holds, "and the connection's arena is left alone");
+    assert_eq(sandhi_http_pool_idle_count(load64(w + AGN_LT_POOL)), 1, "with the connection still kept");
+    store64(w + AGN_LT_URL, good_url);
+    reset_via(agnosai_lt_worker_scratch(w));
+    assert_eq(agnosai_lt_http_executor(w), 200, "so the next request answers");
+    assert_eq(atomic_load(&_T_ACCEPTS), 1, "on the same connection");
+    sandhi_http_pool_close(load64(w + AGN_LT_POOL));
+    # The server counts this one going, and the fan-out below counts its own.
+    _t_await_ended(1);
+    agnosai_lt_worker_release(w);
+
+    # A pause cannot make a kept connection stale. sandhi would close one it thought stale and open
+    # another in the arena this worker had picked for a reuse, which is reset after the request.
+    _t_serve(_T_KEEP, 0);
+    w = agnosai_lt_worker_new(_t_url(), clock_now_ns() + 30000000000, 1, &agnosai_lt_http_executor, 0);
+    assert_eq(agnosai_lt_http_executor(w), 200, "a connection is opened");
+    reset_via(agnosai_lt_worker_scratch(w));
+    sleep_ms(25);
+    assert_eq(agnosai_lt_http_executor(w), 200, "a request after a pause answers");
+    assert_eq(atomic_load(&_T_ACCEPTS), 1, "on the connection it had");
+    sandhi_http_pool_close(load64(w + AGN_LT_POOL));
+    _t_await_ended(1);
+    agnosai_lt_worker_release(w);
+
+    # The fan-out, end to end: four threads, four connections, and a report built from what they saw.
+    _t_serve(_T_KEEP, 0);
+    var ar = arena_allocator_growable(65536);
+    var r = agnosai_load_test_run_a(ar, _t_url(), 4, 1, &agnosai_lt_http_executor);
+    assert_neq(r, 0, "a run against a real socket finishes");
+    assert(agnosai_lt_result_total_requests(r) > 4, "and made more than one request each");
+    assert_eq(agnosai_lt_result_failed(r), 0, "with none failing");
+    assert_eq(agnosai_lt_status_count(agnosai_lt_result_status_codes(r), 200),
+      agnosai_lt_result_total_requests(r), "and every answer in the report");
+    assert_eq(atomic_load(&_T_ACCEPTS), 4, "one connection per user, whatever the requests");
+    assert_eq(_t_await_ended(4), 4, "each closed by the end of the run");
+    assert(agnosai_lt_result_p50_ns(r) > 0, "and a real latency, not a zero");
+
+    _t_http_cost();
+    return 0;
+}
+
 # What a load test leaves on the global heap.
 fn _t_cost_suite(): i64 {
     test_group("what a call leaves on the global heap");
@@ -75,8 +342,7 @@ fn _t_cost_suite(): i64 {
     var in_arena = agnosai_lt_worker_new_a(ar, url, deadline, 4, &_t_exec_mixed, 2);
     assert_neq(in_arena, 0, "a worker builds in the call's allocator");
     assert_eq(agnosai_lt_worker_id(in_arena), 2, "with its id");
-    agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL, agnosai_lt_worker_arena(in_arena));
-    agnosai_arena_pool_release(_AGNOSAI_LT_SCRATCH_POOL, agnosai_lt_worker_scratch(in_arena));
+    agnosai_lt_worker_release(in_arena);
     reset_via(ar);
     var before = alloc_used();
     for (var i = 0; i < 50; i = i + 1) {
@@ -89,12 +355,12 @@ fn _t_cost_suite(): i64 {
     assert_eq(load8(str_data(load64(w0 + AGN_LT_URL)) + str_len(url)), 0, "a worker's url is NUL-terminated");
     assert_neq(str_data(load64(w0 + AGN_LT_URL)), str_data(url), "and a copy, for the worker's life");
 
-    # ⚠ What a run still costs: `thread_create`'s handle and TLS, for good, per user (roadmap 2.3.6).
-    # Everything else it builds is in `a`, so this is the bound, and a request adds nothing to it.
+    # Everything a run builds is in `a` or a pooled arena, and its threads are detached: this was
+    # 4,120 B a user, for good, through 2.3.5.
     #
     # ⚠ The pool hands arenas out first in, first out, so a first run warms only the slots it took,
     # and a second of the same size takes fresh ones and reads 1 MiB a user. One worker per slot
-    # warms them all. Measured at 100,000 requests: 4,120 B a user, 4 KiB of TLS and a handle.
+    # warms them all.
     var tool = agnosai_load_testing_tool();
     agnosai_load_test_run_a(ar, url, _AGNOSAI_LT_POOL_SLOTS, 1, &_t_exec_ok);
     reset_via(ar);
@@ -104,7 +370,7 @@ fn _t_cost_suite(): i64 {
     assert_neq(r, 0, "a run on the call's allocator finishes");
     assert_eq(agnosai_lt_result_total_requests(r), AGNOSAI_LT_MAX_TOTAL_REQUESTS,
       "having made enough requests that a per-request cost could not hide");
-    assert(per_user < 4200, "and leaves only its threads, whatever the requests");
+    assert_eq(per_user, 0, "and leaves nothing, whatever the requests or the users");
     reset_via(ar);
 
     var missing = agnosai_tool_input_with_alloc(agnosai_tool_input_new(), ar);
@@ -122,20 +388,20 @@ fn _t_cost_suite(): i64 {
     }
     assert_eq(alloc_used() - quiet, 0, "a call with a parameter missing leaves nothing");
 
-    # ⚠ Not 0: the SSRF guard parses the URL on the global heap, 136 B a check (roadmap 2.3.6). The
-    # refusal itself is in `a`, which is what this bounds.
+    # The SSRF guard's parse is in the call's arena since 2.3.6, 136 B a check before that.
     var guarded = alloc_used();
     for (var k = 0; k < 50; k = k + 1) {
         agnosai_tool_execute(tool, private_url);
         reset_via(ar);
     }
-    assert(alloc_used() - guarded <= 50 * 136, "a refused target leaves only the guard's parse");
+    assert_eq(alloc_used() - guarded, 0, "a refused target leaves nothing, the guard's parse included");
     return 0;
 }
 
 fn main() {
     alloc_init();
     _t_cost_suite();
+    _t_http_suite();
 
     test_group("tools_builtin_load_testing");
 
@@ -319,6 +585,7 @@ fn main() {
     assert_eq(agnosai_lt_worker_id(probe), 3, "the worker knows its id");
     assert(agnosai_lt_worker_arena(probe) != 0, "the worker has a persistent arena");
     assert(agnosai_lt_worker_scratch(probe) != 0, "the worker has a scratch arena");
+    assert_eq(load64(probe + AGN_LT_CONN), 0, "and no connection arena before a real request wants one");
     assert(agnosai_lt_worker_arena(probe) != agnosai_lt_worker_scratch(probe),
       "the two arenas are distinct — a shared one would accumulate every response");
     agnosai_lt_worker_run(probe);

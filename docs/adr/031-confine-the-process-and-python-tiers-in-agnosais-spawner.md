@@ -1,7 +1,7 @@
 # 031 — Confine the process and Python tiers in agnosai's spawner, with kavach's primitives
 
 **Status**: Accepted
-**Date**: 2026-11-07
+**Date**: 2026-11-07, updated at 2.3.6 for kavach 3.14.8 and later
 
 ## Context
 
@@ -24,8 +24,7 @@ measured, and `sandbox_exec` turned out to be the wrong door:
   `confine_last_stderr`). agnosai runs tool calls on several threads at once. **Measured:** two threads, one running
   `/bin/ls` and one `/bin/cat` on missing paths, 100 calls each through `agnosai_kavach_execute`. In three runs, 97,
   112 and 102 of the 200 came back with the other program's stderr, or with the two spliced together. No exit code
-  swapped, as that window is a load after a store. Filed with kavach. It reaches agnosai's WASM tier today, which reads
-  kavach's stderr to tell a store-limit refusal from a guest failure (*Consequences*).
+  swapped, as that window is a load after a store. Filed with kavach, which keeps a run's results per run since 3.14.8.
 
 The confinement itself is a separate, exported sequence, `confine_child_caps`, which kavach's own backends call in
 the child. Its order is the security property, which is why kavach keeps it as one function: descriptors, cgroup,
@@ -88,8 +87,9 @@ process and Python tool on the most common hosts, where the cx tier, which does 
 not run. kavach's score has given these tiers no network credit since 3.14.7 (`score_backend`), so nothing reports a
 network isolation that is not applied.
 
-Landlock ABI 4 (Linux 6.7) refuses TCP connect and bind with no namespace and no privilege. kavach applies no network
-rule yet, so that is filed with kavach, and agnosai passes the policy's network flag once it can.
+Landlock ABI 4 (Linux 6.7) refuses TCP connect and bind with no namespace and no privilege, and since 3.14.8 kavach
+applies that to a confined payload whose policy denies the network. agnosai still passes `network_enabled = 1`, what it
+applied before, as taking a tool's network away is a behaviour change with its own release (roadmap 2.3.8).
 
 ### The OCI tier: docker's own hardening
 
@@ -98,13 +98,17 @@ wrong thing. The container is the confinement there, and its flags decide it. Si
 `--cap-drop=ALL`, `--security-opt=no-new-privileges` and `--pids-limit 256`, after `--memory`. Measured through
 docker: `CapEff` 0, `NoNewPrivs` 1, `pids.max` 256. The Rust line passed none of them.
 
-### The image runs as an unprivileged user
+### Capabilities, and the image runs as an unprivileged user
 
-`confine_child_caps` bounds a root child's capabilities only inside a rootfs, which these tiers do not use (kavach's
-process-backend issue, Ask 3, pinned at kavach 3.14.8). So a server running as root would give every tool root's
-capabilities under landlock and seccomp. The `Dockerfile` now runs the server as `agnosai`, uid 10001. It needs nothing
-root-only: it listens on 8080 and writes only `/tmp`. Measured: the image builds, answers `/ready`, and `id` reads
-`uid=10001(agnosai)`.
+Through kavach 3.14.7, `confine_child_caps` bounded a root child's capabilities only inside a rootfs, which these tiers
+do not use. Since 3.14.8 it bounds every confined child, and agnosai passes an empty mask (`AGNOSAI_SPAWN_CAPS_NONE`,
+2.3.6), not `KAVACH_CAPS_DEFAULT`, the twelve a container's init needs. A tool under a root server holds no capabilities.
+Measured in a container as uid 0: `CapEff`, `CapPrm`, `CapBnd` and `CapAmb` all read zero (`tests/sandbox_confine.tcyr`).
+Root without `CAP_SETPCAP` cannot be bounded, so kavach refuses the run: every confined tool fails with `cannot bound
+capabilities`. Measured with `--cap-drop=SETPCAP`.
+
+The `Dockerfile` runs the server as `agnosai`, uid 10001, all the same. It needs nothing root-only: it listens on 8080
+and writes only `/tmp`. Measured: the image builds, answers `/ready`, and `id` reads `uid=10001(agnosai)`.
 
 ## Consequences
 
@@ -130,14 +134,14 @@ root-only: it listens on 8080 and writes only `/tmp`. Measured: the image builds
   reads `/proc/self` sees it fail. Allowing all of `/proc` would give every tool the server's
   `/proc/<pid>/environ`, keys included, so it is not offered. Found in the CI replica, where dash forks a lone
   command that bash on the development box execs.
-- **Negative.** A root process keeps its capabilities under the confinement, until kavach bounds them without a rootfs.
-  The image does not run as root. A library consumer that does is told so by this ADR and the threat model.
+- **Positive, since 2.3.6.** A root server's tools hold no capabilities, and an exec cannot take one back.
+- **Negative, a behaviour change at 2.3.6.** A root server with `CAP_SETPCAP` dropped can run no confined tool. It ran
+  them through 2.3.5, with root's capabilities. Give it `CAP_SETPCAP`, or run it as a user.
 - **Neutral.** The cx tier is unchanged: it already runs under kavach's persistent confinement, with a network
   namespace it requires. WASM is unchanged: kavach runs wasmtime, and its guest has stdin and stdout alone.
-- **Negative, kavach's and filed.** Two WASM calls at once can read each other's stderr inside kavach, as measured
-  above for the process backend. The WASM tier returns no stderr to a caller, so nothing leaks through it, but it reads
-  stderr to call a module "refused: it exceeds the store limits", so a concurrent call can be misclassified either way.
-  It ends when kavach keeps a run's result per run, and agnosai's tier needs no change for that.
+- **Closed by kavach 3.14.8.** Two WASM calls at once read each other's stderr inside kavach, as measured above, which
+  could misclassify a module "refused: it exceeds the store limits" either way. kavach keeps a run's result per run now.
+  Measured again at 3.14.9, the same two threads and 200 runs, three times: none of the 600 read another run's stderr.
 
 ## Alternatives considered
 

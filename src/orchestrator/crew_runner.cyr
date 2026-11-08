@@ -107,6 +107,8 @@
 # leave `alloc_used()` where it found it.
 # =========================================================================
 
+include "src/done_word.cyr"
+
 # Pick the highest-scoring agent for a task, or 0 when the roster is empty.
 #
 # Returns the agent POINTER, not an index: index 0 is a real agent and in fact
@@ -1203,7 +1205,7 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
 # worker starts with an empty thread-local block (ADR 023).
 #
 # `ALLOC` is the crew's allocator (ADR 028). `DONE` turns 1 as the worker's last act,
-# and is what the wave waits on: see `_agnosai_crew_job_finish`.
+# and is what the wave waits on: see `src/done_word.cyr`.
 enum AgnosaiCrewJobOff {
     AGN_CJ_TASK = 0;
     AGN_CJ_AGENT = 8;
@@ -1222,41 +1224,6 @@ enum AgnosaiCrewJobOff {
 
 # Say a job is over, and wake the wave if it is parked on that.
 #
-# ⚠ **The worker's last touch of crew memory.** Once `DONE` reads 1 the wave may go
-# on, the crew may end, and its arena may be scrubbed and reused, so nothing after
-# this store may read the job. The wake takes the word's address and reads nothing
-# through it: a stale wake is a spurious one, and a waiter re-checks.
-#
-# ⚠ **The fences are what `thread_join` gave for nothing.** `atomic_store` and `atomic_load`
-# are plain moves, atomic and unordered (`lib/atomic.cyr`), and the wave usually finds `DONE`
-# set and never reaches the kernel. So on aarch64 the wave could read 1 and then a result
-# pointer of 0, dropping the task, or a pointer to a result whose fields had not landed. x86
-# cannot show this, and no suite here would. This fence pairs with the one in
-# `_agnosai_crew_job_wait`.
-fn _agnosai_crew_job_finish(job): i64 {
-    atomic_fence();
-    atomic_store(job + AGN_CJ_DONE, 1);
-    syscall(SYS_FUTEX, job + AGN_CJ_DONE, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
-    return 0;
-}
-
-# Wait for a job's worker to say it is over.
-#
-# ⚠ **One load per iteration, feeding both uses**, as `thread_join` learned: the kernel
-# compares the word to what this thread saw, so a store landing between the check and
-# the park reads as EAGAIN and the loop re-checks, and it cannot park on a 1 it missed.
-fn _agnosai_crew_job_wait(job): i64 {
-    while (1 == 1) {
-        var d = atomic_load(job + AGN_CJ_DONE);
-        if (d != 0) {
-            atomic_fence();
-            return 0;
-        }
-        syscall(SYS_FUTEX, job + AGN_CJ_DONE, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, d, 0, 0, 0);
-    }
-    return 0;
-}
-
 # One worker thread — a thread passes exactly one argument.
 #
 # Cancellation is checked here rather than only before spawning, matching the
@@ -1270,13 +1237,13 @@ fn _agnosai_crew_worker(job): i64 {
     if (cancelled != 0 && load64(cancelled) != 0) {
         store64(job + AGN_CJ_RESULT, agnosai_task_result_new_a(a, agnosai_task_id(task),
             str_from_a(a, "crew cancelled"), AGNOSAI_STATUS_FAILED));
-        _agnosai_crew_job_finish(job);
+        agnosai_done_word_set(job + AGN_CJ_DONE);
         return 0;
     }
     store64(job + AGN_CJ_RESULT, agnosai_execute_task_with_tools_a(a, task,
         load64(job + AGN_CJ_AGENT), load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX),
         load64(job + AGN_CJ_CREW_ID), load64(job + AGN_CJ_TRACE), load64(job + AGN_CJ_LOOP)));
-    _agnosai_crew_job_finish(job);
+    agnosai_done_word_set(job + AGN_CJ_DONE);
     return 0;
 }
 
@@ -1746,7 +1713,7 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         # sees this batch's tasks finish before the next batch starts.
         for (var j = first; j < next; j = j + 1) {
             var jb = vec_get(jobs, j);
-            _agnosai_crew_job_wait(jb);
+            agnosai_done_word_wait(jb + AGN_CJ_DONE);
             var res = load64(jb + AGN_CJ_RESULT);
             if (res != 0) {
                 agnosai_task_with_status(load64(jb + AGN_CJ_TASK),

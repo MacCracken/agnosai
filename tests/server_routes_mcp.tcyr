@@ -160,6 +160,23 @@ fn _t_initialize(): i64 {
     return 0;
 }
 
+# `tools/list` is in name order, whatever the map's seed or the order of registering.
+fn _t_tools_list_order(): i64 {
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_json_transform_tool());
+    agnosai_tool_registry_register(reg, agnosai_echo_tool());
+    var st = agnosai_app_state_new(agnosai_orchestrator_new(0), reg,
+      agnosai_auth_config_new(), agnosai_event_bus_new(),
+      agnosai_audit_chain_new(), agnosai_approval_gate_new());
+    var arr = _t_obj(_t_obj(agnosai_route_body(agnosai_route_mcp(st, _t_rpc("tools/list", ""))), "result"), "tools");
+    assert(bayan_json_v_arr_len(arr) == 2, "two tools are listed");
+    assert(str_eq(_t_str(bayan_json_v_arr_get(arr, 0), "name"), str_from("echo")) == 1,
+      "the one registered second comes first, by name");
+    assert(str_eq(_t_str(bayan_json_v_arr_get(arr, 1), "name"), str_from("json_transform")) == 1,
+      "and the other after it");
+    return 0;
+}
+
 # --- Oracle: tools_list_returns_registered_tools_in_mcp_format -----------
 
 fn _t_tools_list(): i64 {
@@ -672,6 +689,7 @@ fn main(): i64 {
     _t_id_handling();
     _t_initialize();
     _t_tools_list();
+    _t_tools_list_order();
     _t_tools_list_empty();
     _t_tools_call();
     _t_tools_call_gated();

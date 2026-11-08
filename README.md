@@ -220,9 +220,8 @@ Tools run in four tiers:
    NO_NEW_PRIVS, kavach's seccomp filter, and landlock rules that give read and
    execute on the system's own trees and read and write on `/tmp` and the call's
    work directory, and nothing else. Plus a sanitized environment and a SIGKILL
-   deadline. ⚠ **The network is not isolated on this tier**, and a server running
-   as root gives these tools root's capabilities, so the image runs as an
-   unprivileged user. `AGNOSAI_SANDBOX_READ_PATHS` and `AGNOSAI_SANDBOX_WRITE_PATHS`
+   deadline, and no capabilities, even under a root server. ⚠ **The network is not
+   isolated on this tier.** `AGNOSAI_SANDBOX_READ_PATHS` and `AGNOSAI_SANDBOX_WRITE_PATHS`
    give every tool another tree.
 
 ## Fleet Distribution

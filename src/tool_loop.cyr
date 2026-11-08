@@ -43,6 +43,8 @@
 # `src/orchestrator/crew_runner.cyr`.
 # =========================================================================
 
+include "src/done_word.cyr"
+
 # How many turns of tool calls a task may take. A turn is one answer that asked for tools.
 var AGNOSAI_TOOL_MAX_STEPS = 16;
 
@@ -982,29 +984,11 @@ fn _agnosai_tool_call_run(c): i64 {
     return 0;
 }
 
-# One worker thread: run the call, then say it is over.
-#
-# ⚠ **`_agnosai_crew_job_finish`'s rule holds here, for its reasons.** The fence is what
-# `thread_join` gave for nothing, as `atomic_store` is a plain move, and nothing after the store may
-# read `c`, as the turn may have moved on and the arena gone back.
+# One worker thread: run the call, then say it is over. Nothing after the set may read `c`, as the
+# turn may have moved on and the arena gone back (`src/done_word.cyr`).
 fn _agnosai_tool_call_worker(c): i64 {
     _agnosai_tool_call_run(c);
-    atomic_fence();
-    atomic_store(c + AGN_TC_DONE, 1);
-    syscall(SYS_FUTEX, c + AGN_TC_DONE, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
-    return 0;
-}
-
-# Wait for a call's worker. One load per iteration, as `_agnosai_crew_job_wait` says why.
-fn _agnosai_tool_call_wait(c): i64 {
-    while (1 == 1) {
-        var d = atomic_load(c + AGN_TC_DONE);
-        if (d != 0) {
-            atomic_fence();
-            return 0;
-        }
-        syscall(SYS_FUTEX, c + AGN_TC_DONE, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, d, 0, 0, 0);
-    }
+    agnosai_done_word_set(c + AGN_TC_DONE);
     return 0;
 }
 
@@ -1061,7 +1045,7 @@ fn _agnosai_tool_turn_run(st, calls): i64 {
         else { vec_push_a(ra, spawned, w); }
     }
     _agnosai_tool_call_run(vec_get(live, n - 1));
-    for (var k = 0; k < vec_len(spawned); k = k + 1) { _agnosai_tool_call_wait(vec_get(spawned, k)); }
+    for (var k = 0; k < vec_len(spawned); k = k + 1) { agnosai_done_word_wait(vec_get(spawned, k) + AGN_TC_DONE); }
     return 0;
 }
 

@@ -19,13 +19,35 @@ include "src/llm/retry.cyr"
 include "src/server/ssrf.cyr"
 include "tests/test_helpers.cyr"
 
+# The guard in an arena says what the guard on the global heap says, of every URL in this file, and
+# leaves nothing behind. It runs once per call and once per redirect hop, and through 2.3.5 that
+# was 136 B a check for a refusal and more for a pass.
+var _T_ARENA = 0;
+var _T_ARENA_WRONG = 0;
+var _T_ARENA_KEPT = 0;
+fn _t_arena_form(url, want): i64 {
+    if (_T_ARENA == 0) { _T_ARENA = arena_allocator_growable(4096); }
+    var u = str_from(url);
+    agnosai_is_safe_url_a(_T_ARENA, u);
+    reset_via(_T_ARENA);
+    var before = alloc_used();
+    var got = agnosai_is_safe_url_a(_T_ARENA, u);
+    var kept = alloc_used() - before;
+    reset_via(_T_ARENA);
+    if (got != want) { _T_ARENA_WRONG = _T_ARENA_WRONG + 1; }
+    _T_ARENA_KEPT = _T_ARENA_KEPT + kept;
+    return 0;
+}
+
 # Assert a URL is accepted.
 fn _t_safe(url, name): i64 {
+    _t_arena_form(url, 1);
     return assert_eq(agnosai_is_safe_url(str_from(url)), 1, name);
 }
 
 # Assert a URL is rejected.
 fn _t_unsafe(url, name): i64 {
+    _t_arena_form(url, 0);
     return assert_eq(agnosai_is_safe_url(str_from(url)), 0, name);
 }
 
@@ -37,6 +59,43 @@ fn _t_private_host(host, name): i64 {
 # ── what a gate compares (ADR 025) ──────────────────────────────────────────
 fn _t_same_host(a, b): i64 {
     return agnosai_url_same_host(str_from(a), str_from(b));
+}
+
+# The forms a gate uses, and the two the address checks go through.
+fn _t_arena_helpers(): i64 {
+    var a = arena_allocator_growable(4096);
+    var url = str_from("http://Example.com/x");
+    var mapped = str_from("http://[::ffff:127.0.0.1]/");
+    var lo = str_from("http://0177.0.0.1/");
+    var meta = str_from("http://169.254.169.254/");
+    var name = str_from("http://metadata.google.internal./x");
+    var ok = str_from("https://example.com/");
+    var v6 = str_from("http://[2001:db8::192.0.2.1]/");
+    var quiet = alloc_used();
+    var host = agnosai_url_host_a(a, url);
+    var c_mapped = agnosai_is_safe_url_a(a, mapped);
+    var c_lo = agnosai_is_safe_url_a(a, lo);
+    var c_meta = agnosai_url_is_admissible_a(a, meta);
+    var c_name = agnosai_url_is_admissible_a(a, name);
+    var c_ok = agnosai_url_is_admissible_a(a, ok);
+    var c_v6 = agnosai_is_safe_url_a(a, v6);
+    var c_private = agnosai_is_private_host_a(a, str_new_a(a, "127.0.0.1", 9));
+    var c_public = agnosai_is_private_host_a(a, str_new_a(a, "8.8.8.8", 7));
+    var c_metadata = agnosai_is_metadata_host_a(a, str_new_a(a, "169.254.169.254", 15));
+    var c_not_metadata = agnosai_is_metadata_host_a(a, str_new_a(a, "example.com", 11));
+    assert_eq(alloc_used() - quiet, 0, "every form keeps to the arena it is given");
+    assert_eq(c_private, 1, "a loopback address is private");
+    assert_eq(c_public, 0, "and a public one is not");
+    assert_eq(c_metadata, 1, "the metadata address is one");
+    assert_eq(c_not_metadata, 0, "and a name of someone else's is not");
+    assert(str_eq_cstr(host, "Example.com") == 1, "a host reads as the bare form's does");
+    assert_eq(c_mapped, 0, "an IPv4-mapped loopback is refused in an arena");
+    assert_eq(c_lo, 0, "as is an octal one");
+    assert_eq(c_meta, 0, "and a metadata address, for a gate");
+    assert_eq(c_name, 0, "and its name with a root dot");
+    assert_eq(c_ok, 1, "and a public host is admissible");
+    assert_eq(c_v6, agnosai_is_safe_url(v6), "and an embedded IPv4 in an IPv6 parses as the bare form's does");
+    return 0;
 }
 
 fn _t_url_helpers(): i64 {
@@ -236,6 +295,11 @@ fn main() {
     _t_unsafe("http://exa mple.com", "a space in a URL is rejected");
 
     _t_url_helpers();
+
+    test_group("the guard in the caller's allocator");
+    assert_eq(_T_ARENA_WRONG, 0, "agrees with the bare guard about every URL above");
+    assert_eq(_T_ARENA_KEPT, 0, "and leaves nothing on the global heap for any of them");
+    _t_arena_helpers();
     return assert_summary();
 }
 

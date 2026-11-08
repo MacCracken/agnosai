@@ -50,8 +50,8 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.3.6** | Network tools: pooled connections, detached threads, a cheaper URL check, a stable tool order |
 | **2.3.7** | The Rust line's JSON forms and structured-log fields |
+| **2.3.8** | A tool's policy can deny it the network, and one trace from a crew to the provider |
 | **2.4.0** | The crew lifecycle as one state machine, with the approval gate wired |
 | **2.4.1** | Budgets, caps and crew concurrency enforced |
 | **2.4.2** | Hand a downstream task a summary, not a transcript |
@@ -71,24 +71,10 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 ([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)), 2.3.2 gave each tool call an arena of its own,
 2.3.3 chose a model by hoosh's tier, kind and tools bit (ADR 030's addendum), 2.3.4 confined the process and Python
 tools with kavach's primitives in agnosai's own spawner, and hardened the OCI tier's container
-([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)), and 2.3.5 validated a WASM module at
-load, freed it with its tool, and took the spawner's idle sleep out (ADR 019's 2.3.5 addendum).
-
-#### 2.3.6 — network tools: pooled connections, detached threads, a cheaper URL check, a stable tool order
-
-**The load tester opens a fresh connection per request,** so every request is a handshake, and its HTTP executor's
-success path is measured on a loopback server (`tests/tools_gate.tcyr`) but asserts nothing about the answer.
-
-**Two costs these tools still leave on the global heap,** found when 2.3.2 moved them onto the call's allocator:
-
-- `load_testing` joins its threads, 4,120 B a user for good. A detached thread and a futex leave none, and that wait
-  would be the third copy of `_agnosai_crew_job_wait`'s, so extract it.
-- The SSRF guard's `agnosai_url_host` parses on the global heap, 136 B a check, once per call and once per redirect hop.
-
-**`GET /api/v1/tools`, MCP `tools/list` and a task's `metadata` keys come out in a random order per process.** The
-registry and the metadata map are hash maps, and `lib/hashmap.cyr` seeds per process. The Rust line's was random too,
-so this is wire-compatible, but a stable order by name is kinder to clients. Measure `tool_registry_list_{50,500}`
-before and after. (A crew's `tools` request is already in the agent's order, ADR 029.)
+([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)), 2.3.5 validated a WASM module at
+load, freed it with its tool, and took the spawner's idle sleep out (ADR 019's 2.3.5 addendum), and 2.3.6 gave each
+simulated user of a load test one connection, took a tool's capabilities away under a root server, moved the URL check
+off the global heap, and put the tool list and a task's keys in order.
 
 #### 2.3.7 — the Rust line's JSON forms and structured-log fields
 
@@ -101,6 +87,19 @@ before and after. (A crew's `tools` request is already in the agent's order, ADR
 through plain `sakshi_info`), the WASM sandbox and tool (no sakshi calls at all), the wasm loader's and remote
 registry's error details, the kavach bridge, process and OCI exit lines, the MCP tool-call line's `success` and
 `duration_ms`, a2a rejections' id prefix and `metadata_bytes`, `latency_ms` in task-result metadata.
+
+#### 2.3.8 — a tool's policy can deny it the network, and one trace from a crew to the provider
+
+**A process or Python tool whose policy denies the network should lose it.** kavach enforces that through landlock ABI 4
+since 3.14.8, with no namespace, and agnosai still passes the network as allowed. Set `network_enabled` on the
+confinement's policy from the tier's own policy. It cuts tools off that have it today, so it is a behaviour change, and
+the CHANGELOG says so. A policy with `network_enabled = 1` is unaffected. A kernel before 6.7 has no such rules: state
+what it leaves, and test both.
+
+**Follow one request from a crew to the provider.** hoosh 2.10.3 puts its own span under the caller's, exporting
+`parentSpanId`, so agnosai's half can ship: `agnosai_hoosh_chat_in` sends an outbound `traceparent` from its `chat` span.
+It sends none today, as hoosh's span would have repeated the chat span's id. Check the pair end to end against a real
+hoosh.
 
 ### 2.4.x — the orchestration contract
 
@@ -283,12 +282,8 @@ The *Issue* column says where each stands.
 | **A burst of TLS handshakes all succeeds** | sigil: of 100 threads, 64 verify and 36 are refused by its lane pool | sigil `docs/development/issues/2026-11-05-agnosai-lane-pool-refuses-the-overflow-of-a-burst.md`, ⚠ **written, not committed** | 2.4.1 caps outbound TLS at 64 meanwhile. `tests/server_auth_lane_race.tcyr` pins the RSA verify's lane-freedom |
 | **An HTTP exchange leaves nothing behind** | sandhi keeps 408–480 B a request on the global heap: about 40 B a response header, and 120 B for the host header | sandhi `docs/development/issues/2026-11-05-agnostic-outbound-calls-keep-bytes-on-the-global-heap.md` (agnostic's, with agnosai's addendum), ⚠ **written, not committed** | Tighten the per-exchange bounds to 0: `tests/orch_crew_arena.tcyr`, `tools_agnos`, `tools_gate`, `telemetry_otlp`, `llm_hoosh` |
 | **Accept a chunked request body** | sandhi answers 501 (`sandhi_server_request_has_unsupported_te`) | sandhi `docs/development/issues/2026-11-05-agnosai-server-cannot-receive-a-chunked-request-body.md`, ⚠ **written, not committed** | Nothing: out of scope until it lands |
-| **Follow one request from a crew to the provider** | hoosh exports its span with the caller's span id and no `parentSpanId`, and forwards that same traceparent | hoosh `docs/development/issues/2026-11-07-agnosai-inference-span-takes-the-callers-span-id.md`, ⚠ **written 2026-11-07, not committed** | `agnosai_hoosh_chat_in` sends an outbound `traceparent` from its `chat` span. It sends none today, or hoosh's span would repeat the chat span's id |
 | **Offer a model the tools of a remote MCP server** | bote has no MCP client, **and its roadmap lists one as a non-goal**, so this needs a decision first (*Decisions for the user*) | bote `docs/development/issues/2026-11-07-agnosai-no-mcp-client-to-call-a-hosts-tools.md`, ⚠ **written 2026-11-07, not committed** | Register each remote tool with `agnosai_tool_new`: the registry and the loop need nothing else (ADR 029, rule 4) |
-
-| **Two WASM calls at once read their own stderr** | kavach keeps a run's stderr, exit code and timeout flag in process-wide variables. Measured: about half of 200 concurrent runs on two threads read the other's stderr | kavach `docs/development/issues/2026-11-07-agnosai-concurrent-runs-read-each-others-stderr.md`, ⚠ **written 2026-11-07, not committed** | Nothing: the WASM tier needs no change once a run's result is the run's. The process and Python tiers do not go through it (ADR 031) |
-| **Process and Python tools lose the network a policy denies them** | kavach enforces `network_enabled = 0` only with a network namespace, which Ubuntu 24.04+, docker and GitHub's runners refuse. Landlock ABI 4 refuses TCP with none | kavach `docs/development/issues/2026-11-07-agnosai-a-policy-denying-network-needs-a-namespace.md`, ⚠ **written 2026-11-07, not committed** | Set `network_enabled` on the confinement's policy from the tier's own policy (it is 1 today, which is what is applied), and say so in the CHANGELOG as the behaviour change it is |
-| **A root server's process and Python tools lose root's capabilities** | kavach bounds a child's capabilities only inside a rootfs (its Ask 3, pinned at kavach 3.14.8) | kavach `docs/development/issues/2026-11-06-process-backend-keeps-every-capability.md`, kavach's own, committed and on GitHub | Pass a capability mask to `confine_child_caps`, which takes one. The image already runs as uid 10001 |
+| **A kept connection costs what a new one costs, or less** | sandhi allocates a pooled connection from the request's allocator, builds the pool's route key on the global heap for each take and put, 256 B a request, resolves the host before it asks the pool, and cannot end a blocked read with `total_ms` alone | sandhi `docs/development/issues/2026-11-08-agnosai-a-pooled-connection-lives-in-the-requests-allocator.md`, ⚠ **written 2026-11-08, not committed** | Drop the load tester's third arena, and lower `_T_SANDHI_BYTES_PER_KEPT_REQUEST` in `tests/tools_builtin_load_testing.tcyr` |
 
 bayan's refusals of block scalars, flow mappings, anchors and tags are deliberate (its ADR 0008), so that is a scope
 request to raise only if a definition file needs one, and it is not owed.

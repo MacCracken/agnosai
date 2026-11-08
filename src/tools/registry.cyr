@@ -22,12 +22,17 @@
 #     ("52 `Arc<` in src/, of which 49 are process-lifetime shared-immutable").
 # =========================================================================
 
-# ToolRegistry heap layout — 24 bytes.
+include "src/order.cyr"
+
+# ToolRegistry heap layout. `ORDER` is the tools by name, a vec on the global heap kept for good and
+# rebuilt only when `STALE` says the set has changed (`_agnosai_registry_order`).
 enum AgnosaiToolRegistryOff {
     AGN_REG_TOOLS = 0;
     AGN_REG_MUTEX = 8;
     AGN_REG_GATE = 16;
-    AGN_REG_SIZE = 24;
+    AGN_REG_ORDER = 24;
+    AGN_REG_STALE = 32;
+    AGN_REG_SIZE = 40;
 }
 
 # Create an empty registry with its own lock.
@@ -36,6 +41,8 @@ fn agnosai_tool_registry_new(): i64 {
     store64(r + AGN_REG_TOOLS, map_new_str());
     store64(r + AGN_REG_MUTEX, mutex_new());
     store64(r + AGN_REG_GATE, 0);
+    store64(r + AGN_REG_ORDER, 0);
+    store64(r + AGN_REG_STALE, 1);
     return r;
 }
 
@@ -53,6 +60,7 @@ fn agnosai_tool_registry_register(r, tool): i64 {
     var tools = load64(r + AGN_REG_TOOLS);
     var old = map_get(tools, name);
     map_set(tools, str_clone(name), tool);
+    store64(r + AGN_REG_STALE, 1);
     mutex_unlock(load64(r + AGN_REG_MUTEX));
     if (old != 0) { agnosai_tool_drop(old); }
     return 0;
@@ -103,6 +111,7 @@ fn agnosai_tool_registry_remove(r, name: Str): i64 {
     if (present == 1) {
         old = map_get(tools, name);
         map_delete(tools, name);
+        store64(r + AGN_REG_STALE, 1);
     }
     mutex_unlock(load64(r + AGN_REG_MUTEX));
     if (old != 0) { agnosai_tool_drop(old); }
@@ -117,7 +126,39 @@ fn agnosai_tool_registry_count(r): i64 {
     return n;
 }
 
-# Vec of the schemas of all registered tools, unordered.
+# Two tools by name, for `agnosai_sort`.
+fn _agnosai_tool_cmp_name(a, b): i64 {
+    return agnosai_order_str_cmp(agnosai_tool_name(a), agnosai_tool_name(b));
+}
+
+# The tools by name, rebuilt only when the set has changed. The caller holds the lock.
+#
+# A sort per list more than doubled it: `tool_registry_list_500` went from 123 to 295 µs. A tool set
+# changes rarely and is read on every `GET /api/v1/tools`, and the sort is over pointers and names
+# with no tool's own code in it, so it is safe under the lock.
+fn _agnosai_registry_order(r): i64 {
+    var order = load64(r + AGN_REG_ORDER);
+    if (load64(r + AGN_REG_STALE) == 0) { return order; }
+    if (order == 0) {
+        order = vec_new();
+        store64(r + AGN_REG_ORDER, order);
+    }
+    vec_truncate(order, 0);
+    var tools = load64(r + AGN_REG_TOOLS);
+    var n = _agnosai_map_slots(tools);
+    for (var i = 0; i < n; i = i + 1) {
+        if (_agnosai_map_slot_live(tools, i) == 1) { vec_push(order, _agnosai_map_slot_val(tools, i)); }
+    }
+    agnosai_sort(order, &_agnosai_tool_cmp_name);
+    store64(r + AGN_REG_STALE, 0);
+    return order;
+}
+
+# Vec of the schemas of all registered tools, **by name** (2.3.6).
+#
+# The map's own order is random per process (`lib/hashmap.cyr` seeds it), and this is what
+# `GET /api/v1/tools` and MCP `tools/list` send, so a client reading the list twice across a restart
+# saw two different lists. The Rust line's was random too.
 #
 # The schema callbacks run **outside** the lock: a tool's `schema_fp` is
 # arbitrary user code, and calling it while holding the registry lock would let
@@ -125,14 +166,9 @@ fn agnosai_tool_registry_count(r): i64 {
 # the lock, then released.
 fn agnosai_tool_registry_list_a(a, r): i64 {
     mutex_lock(load64(r + AGN_REG_MUTEX));
-    var tools = load64(r + AGN_REG_TOOLS);
+    var order = _agnosai_registry_order(r);
     var found = vec_new_a(a);
-    var n = _agnosai_map_slots(tools);
-    for (var i = 0; i < n; i = i + 1) {
-        if (_agnosai_map_slot_live(tools, i) == 1) {
-            vec_push_a(a, found, _agnosai_map_slot_val(tools, i));
-        }
-    }
+    for (var i = 0; i < vec_len(order); i = i + 1) { vec_push_a(a, found, vec_get(order, i)); }
     mutex_unlock(load64(r + AGN_REG_MUTEX));
 
     var schemas = vec_new_a(a);
@@ -151,17 +187,18 @@ fn agnosai_tool_registry_list_a(a, r): i64 {
 # to say the opposite, and correctly: before the callback took an allocator,
 # `/api/v1/tools` floored at 288 bytes per request for exactly that reason.
 #
-# Slot-walked rather than `map_keys` (standing rule 5), which is what makes the
+# The kept order rather than `map_keys` (standing rule 5), which is what makes the
 # vec allocation actually land in `a`.
 fn agnosai_tool_registry_list(r): i64 {
     return agnosai_tool_registry_list_a(default_alloc(), r);
 }
 
-# Vec of the names of all registered tools, unordered.
+# Vec of the names of all registered tools, in order.
 fn agnosai_tool_registry_names(r): i64 {
     mutex_lock(load64(r + AGN_REG_MUTEX));
     var keys = map_keys(load64(r + AGN_REG_TOOLS));
     mutex_unlock(load64(r + AGN_REG_MUTEX));
+    agnosai_sort(keys, &agnosai_order_str_cmp);
     return keys;
 }
 

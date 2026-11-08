@@ -21,6 +21,43 @@ fn _t_assert_json(v, expected, name): i64 {
     return assert(str_eq(bayan_json_v_build(v), str_from(expected)) == 1, name);
 }
 
+# A result's metadata as JSON, `n` keys going in in the order `step` makes, named `key-<k>`.
+fn _t_metadata_value(n, step): i64 {
+    var r = agnosai_task_result_new(str_from("t"), str_from("o"), AGNOSAI_STATUS_COMPLETED);
+    for (var i = 0; i < n; i = i + 1) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "key-");
+        str_builder_add_int(sb, 100 + (i * step) % n);
+        agnosai_task_result_with_metadata(r, str_builder_build(sb), bayan_json_v_int_new(i));
+    }
+    return _agnosai_map_to_value(agnosai_task_result_metadata(r));
+}
+
+# `metadata` and `context` come out in key order. `lib/hashmap.cyr` seeds per process, so through
+# 2.3.5 the same task serialized differently on every run.
+fn _t_key_order(): i64 {
+    test_group("a map's keys, in order");
+    # 37 is prime and past the map's first capacity, so a rehash has reshuffled the slots too.
+    var v = _t_metadata_value(37, 11);
+    assert_eq(bayan_json_v_obj_len(v), 37, "every key is written");
+    var sorted = 1;
+    for (var i = 1; i < 37; i = i + 1) {
+        if (agnosai_order_str_cmp(bayan_json_v_obj_key(v, i - 1), bayan_json_v_obj_key(v, i)) >= 0) { sorted = 0; }
+    }
+    assert_eq(sorted, 1, "in order");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(v, "key-111")), 1, "each with its own value");
+
+    var m = map_new_str();
+    assert(str_eq_cstr(bayan_json_v_build(_agnosai_map_to_value(m)), "{}") == 1, "no keys is an empty object");
+    map_set(m, str_from("b"), bayan_json_v_int_new(1));
+    assert(str_eq_cstr(bayan_json_v_build(_agnosai_map_to_value(m)), "{\"b\":1}") == 1, "one key is that key");
+    map_set(m, str_from("a"), bayan_json_v_int_new(2));
+    map_set(m, str_from("Z"), bayan_json_v_int_new(3));
+    assert(str_eq_cstr(bayan_json_v_build(_agnosai_map_to_value(m)), "{\"Z\":3,\"a\":2,\"b\":1}") == 1,
+      "byte order: upper case first, and the values stay with their keys");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -321,6 +358,7 @@ fn main() {
     vec_push(tk_sv, str_from("s1"));
     assert_eq(str_eq(bayan_json_v_build(_agnosai_str_vec_to_value_a(tk_ar, tk_sv)),
         bayan_json_v_build(_agnosai_str_vec_to_value(tk_sv))), 1, "str_vec_to_value_a agrees");
+    _t_key_order();
     return assert_summary();
 }
 

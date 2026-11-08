@@ -116,6 +116,8 @@ Read once, at start-up. A path the host does not have is skipped.
   `/opt` and another process's `/proc`.
 - ⚠ **The network is not isolated on these tiers.** WASM tools have none, and an OCI tool has none unless its policy
   allows it.
+- ⚠ **A server running as root without `CAP_SETPCAP` refuses every process and Python tool**, with `failed to confine
+  <program>: cannot bound capabilities`, since 2.3.6. With it, or as any other user, a tool holds no capabilities.
 - ⚠ **A host where kavach cannot build its seccomp filter refuses every process and Python tool**, with
   `failed to confine: …`. A kernel with no landlock runs them with no filesystem rules, and the server warns once.
 

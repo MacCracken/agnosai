@@ -307,9 +307,10 @@ fn agnosai_fd_set_cloexec(fd): i64 {
 # ⚠ **Network is not isolated on these tiers.** Without a rootfs that takes a network
 # namespace, which needs a user namespace when unprivileged, and Ubuntu 24.04 and later,
 # docker's default seccomp profile and GitHub's runners refuse one. Requiring it would stop
-# every process and Python tool on those hosts. Landlock ABI 4 can refuse TCP connect and
-# bind with no namespace, and kavach applies no network rule yet (filed). kavach's score has
-# given these tiers no network credit since 3.14.7, so nothing claims what is not applied.
+# every process and Python tool on those hosts. Since kavach 3.14.8 a policy that denies the
+# network is enforced through landlock ABI 4, with no namespace, and agnosai still passes the
+# network as allowed, as taking it away is a behaviour change with its own release (roadmap
+# 2.3.8). kavach's score gives these tiers no network credit, so nothing claims what is not applied.
 
 # `F_DUPFD_CLOEXEC` — duplicate onto the lowest free fd at or above an argument.
 var AGNOSAI_F_DUPFD_CLOEXEC = 1030;
@@ -406,9 +407,9 @@ fn _agnosai_confine_add(p, rules, path, access): i64 {
 }
 
 # kavach's basic policy, saying what this confinement applies: seccomp, and the network
-# left on. `policy_basic()` says no network, which nothing applies without a namespace (see
-# the section header), and a kavach that began enforcing it would cut every tool off in a
-# patch release. A tool loses its network when agnosai asks for that, and not before.
+# left on. `policy_basic()` says no network, which kavach enforces since 3.14.8 (see the section
+# header), so this flag is what keeps every tool from being cut off in a patch release. A tool
+# loses its network when agnosai asks for that, and not before.
 fn _agnosai_confine_base_policy(): i64 {
     var p = policy_basic();
     SandboxPolicy_set_network_enabled(p, 1);
@@ -579,6 +580,14 @@ fn _agnosai_spawn_report(fd, word): i64 {
     return 0;
 }
 
+# The capabilities a confined tool keeps: none. Since kavach 3.14.8 `confine_child_caps` bounds
+# a child with no rootfs to this mask as well, so a server running as root gives its tools no
+# capabilities at all. Not `KAVACH_CAPS_DEFAULT`, the twelve a container's init needs: nothing
+# on these tiers sets up a container, and a tool has no use for `CAP_CHOWN` or `CAP_SETUID`.
+# Below root it lowers what is held, which is usually nothing already. Root without
+# `CAP_SETPCAP` cannot be bounded, and kavach refuses that (`SPAWN_EXIT_CAPS`).
+var AGNOSAI_SPAWN_CAPS_NONE = 0;
+
 # The confined child's last steps: die with the server, lift the errno pipe and the pin
 # above what kavach closes, confine, say so, and exec the pin. Returns only to exit.
 #
@@ -599,7 +608,8 @@ fn _agnosai_spawn_confine_child(policy, seccomp, pin, xwf, ppid, argv, envp): i6
         _agnosai_spawn_report(xwf, AGNOSAI_SPAWN_FAIL_CONFINE_FDS);
         syscall(SYS_EXIT_GROUP, 127);
     }
-    confine_child_caps(policy, 0, 0, sys_getuid(), sys_getgid(), seccomp, 0, 0, 0);
+    confine_child_caps(policy, 0, 0, sys_getuid(), sys_getgid(), seccomp, 0, 0,
+      AGNOSAI_SPAWN_CAPS_NONE);
     _agnosai_spawn_report(xhi, AGNOSAI_SPAWN_CONFINED);
     kv_exec_pinned(phi, argv, envp);
     _agnosai_spawn_report(xhi, AGNOSAI_SPAWN_FAIL_EXEC);

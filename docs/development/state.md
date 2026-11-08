@@ -2,9 +2,30 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-08 (the 2.3.5 release gate).
+> Last refreshed: 2026-11-08 (the 2.3.6 release gate).
 
-## Now — 2.3.5
+## Now — 2.3.6
+
+| | |
+|---|---|
+| **version** | **2.3.6** (cut 2026-11-08): a load test keeps one connection per simulated user, and a target that accepts and never answers no longer holds a call for good. A tool holds no capabilities, even under a root server. The URL check is off the global heap, and the tool list and a task's keys are in byte order |
+| **cyrius pin** | **6.7.18**, unchanged |
+| **tests** | **107 suites, 11,711 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.3.5's tree read 11,347. `tools_builtin_load_testing` +245, `done_word` is new at 72. 42 mutants, all killed, the capability one in a container as uid 0. A first pass let two through, each a gap in a new test, and both were closed |
+| **coverage** | **99%**: 107/107 files, 1,862/1,872 fns (gate `--min 80`), 10 unreferenced, one fewer than 2.3.5 |
+| **dist** | `dist/agnosai.cyr` 45,951 lines + `dist/agnosai-guard.cyr` 1,034, both v2.3.6, by `wc -l` (2.3.5's read 45,750 and 1,034). Sidecars **6 / 1** leaves, unchanged |
+| **binary** | `build/agnosai` **3,050,920 B** (2.3.5: 3,025,400; kavach 3.14.9 is about 21 KB of that). aarch64 **7,101,384 B** (7,034,912), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.3.6"` and exits 0 on SIGTERM |
+| **deps** | **kavach 3.14.7 → 3.14.9.** Every other dep was already on its latest tag, checked at the start of this release. hoosh is at 2.10.3, which agnosai talks to and does not pin |
+| **lock** | `cyrius.lock` re-resolved: 119 files, 8 commit pins, kavach's lines the only change |
+| **gates** | `check-symbols.sh` 3,253 definitions across 118 files; `check-clean.sh` fmt 239, lint 239, doc 119, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths 238 files; dist. fmt and lint on every test, bench and fuzz file. Then build, aarch64, every test and fuzz unit compiles, tests under DCE, coverage, the example, fuzz 4/4, `distlib --all --check`. **The `ubuntu:26.04` CI replica ran** on the bumped tree with this release's new files laid over a clean clone, wasmtime 47.0.3, all 8 pins from GitHub: every `ci.yml` step, 107 suites, 11,565 assertions, 0 failed, and `cyrius bench` |
+| **benchmarks** | The interleaved A/B against a 2.3.5 build on the same `lib/`: five rounds of `tools`, `orch` and `server` at a mean load of 1.5, **median −0.2% across 151 rows**, then four rounds of `tools` once the list was fixed, at 2.4, median +0.5% across 21. `load_test_request_kept` 37.4 µs and `load_test_request_new_connection` 127.5 µs. `tool_registry_list_50` −3.6% and `_500` −2.5%, in name order. A sort per list read +83.5% and +139.4%, so the registry keeps the order. `bench-history.csv` has 247 rows at 2.3.6, one sweep after the CI replica at a load of 2–2.5: median +1.8% against 2.3.5's rows, taken at 1.8–2.3, not claimed |
+| **a load test** | One connection per user, on a loopback server through sandhi's pool. Asserted there: the status counted, the connections opened, a 404, a chunked body, a close with and without warning, a timeout, a target that accepts and never answers. A run leaves 0 B per user (it was 4,120). A kept request leaves 568 B on the global heap against 312 B for a new one, sandhi's pool building its route key there for each take and put. Filed |
+| **a silent target** | Fixed on all four paths that set only sandhi's total deadline: a 150 ms budget was still blocked at 300 s, and now times out on time. Measured for the load tester, the guarded fetch and the agnos tools |
+| **capabilities** | A confined tool as uid 0 in a container reads `CapEff`, `CapPrm`, `CapBnd` and `CapAmb` all zero. With `--cap-drop=SETPCAP` every confined tool is refused, exit 116. kavach's concurrent stderr fix measured at 3.14.9: 0 of 600 runs read another's, from 100–125 of 200 |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4. ⚠ A root server without `CAP_SETPCAP` runs no process or Python tool, and a load test's numbers are not comparable with earlier runs (CHANGELOG *Behaviour changes*) |
+| **upstream filings** | ⚠ **Six not committed**, so not visible upstream: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies; the pooled connection's allocator, new at 2.3.6), bote (MCP client). kavach's and hoosh's are closed by their releases |
+
+### 2.3.5 — the release (2026-11-08)
 
 | | |
 |---|---|

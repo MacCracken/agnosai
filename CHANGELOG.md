@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.6] — 2026-11-08
+
+A load test keeps one connection per simulated user, so a latency measures the target and not a handshake, and a target
+that accepts and never answers no longer holds a call for good. A tool holds no capabilities, even under a root server,
+with kavach 3.14.9. The URL check moved off the global heap, and the tool list and a task's keys come out in order.
+
+### ⚠ Behaviour changes
+
+- **A load test's numbers move.** Each simulated user now keeps one connection, so a latency no longer contains a TCP and
+  TLS handshake per request. Compare a run on 2.3.6 with another on 2.3.6, not with an earlier one. A server that closes
+  after each answer still gets a new connection per request.
+- **A process or Python tool holds no capabilities under a root server**, and its bounding set is empty, so an exec cannot
+  take one back (kavach 3.14.8, `AGNOSAI_SPAWN_CAPS_NONE`). Through 2.3.5 it kept root's.
+- **A root server with `CAP_SETPCAP` dropped runs no process or Python tool**: `failed to confine <program>: cannot bound
+  capabilities`. **To migrate:** keep `CAP_SETPCAP`, or run the server as a user. The image runs as uid 10001 and is
+  unaffected, and so is any non-root server.
+- **`GET /api/v1/tools`, MCP `tools/list`, and the keys of a task's `metadata` and `context`, a crew's `metadata` and a
+  tool's parameters are in byte order.** They were in a random order per process, so nothing could have relied on it.
+- **A WASM tool whose stdout is binary can be refused** with `kavach exec failed`. kavach 3.14.9 scans all of stdout, where
+  it stopped at the first NUL, so bytes that read as a secret are quarantined. A tool's contract is JSON on stdout, so a
+  tool keeping to it is unaffected.
+
+### Added
+
+- **`src/done_word.cyr`**: `agnosai_done_word_set` and `agnosai_done_word_wait`, what the owner of a detached thread has in
+  place of `thread_join`. A crew's wave and a turn's tool calls had a copy each, and the load tester would have been
+  the third.
+- **The guard's allocator forms**: `agnosai_is_safe_url_a`, `agnosai_url_is_admissible_a`, `agnosai_url_host_a`,
+  `agnosai_is_private_host_a`, `agnosai_is_metadata_host_a`. The bare forms are unchanged.
+- **`agnosai_lt_worker_release`**, and **`benches/load_test.bcyr`**: a request on a kept connection and on a new one, on a
+  loopback server.
+
+### Changed
+
+- **`load_testing`** gives each user one connection through sandhi's pool, and retries once on a new connection when a
+  reused one dies, since a server may close one without warning. A timeout is not retried, and a failure on a new
+  connection is not either. Each worker holds a third arena, for its connection (see `agnosai_lt_http_executor`).
+- **`load_testing`'s threads are detached**, and the run waits on a done word. A run leaves nothing per user, where it
+  left 4,120 B.
+- **The URL check runs in the caller's allocator**, once per call and once per redirect hop. A check left 136 B on the
+  global heap for a refusal, and more for a pass, and leaves none.
+- **Dependencies:** kavach 3.14.7 → 3.14.9. Every other dependency was already on its latest tag.
+
+### Fixed
+
+- **A target that accepted a connection and never answered held the call for good.** `load_testing`, the security audit,
+  the remote tool registry and the agnos tools set only sandhi's total deadline, and sandhi checks that between reads, so
+  it could not end a read already blocked. A model could start one, and a crew waits on its tools. They now set a read and
+  write limit beside it, as the hoosh and OTLP clients did. Measured: a 150 ms budget was still blocked at 300 s, and now
+  returns a timeout on time. Filed with sandhi.
+- **`load_testing`'s real HTTP path asserted nothing about its answer.** It now runs against a loopback server that keeps
+  its connections: what status was counted, how many connections were opened, and what a 404, a chunked body, a close with
+  and without warning, a timeout and a silent target each count as.
+
+### Performance
+
+- **A kept connection, new rows in `benches/load_test.bcyr`:** `load_test_request_kept` 37.4 µs against
+  `load_test_request_new_connection` 127.5 µs (−71%), on loopback with no TLS, where a handshake is at its cheapest.
+- `tool_registry_list_50`: 12.83 → 12.37 µs (−3.6%), `tool_registry_list_500`: 125.9 → 122.8 µs (−2.5%), and now in name
+  order. A sort per list cost +83% and +139%, so the registry keeps the order and rebuilds it when the set changes.
+- **The interleaved A/B against a 2.3.5 build on the same `lib/`:** five rounds of `tools`, `orch` and `server` at a mean load
+  of 1.5, median −0.2% across 151 rows, then four rounds of `tools` once the list was fixed, at 2.4, median +0.5% across 21.
+- A load test leaves 0 B per user, from 4,120 B. A URL check leaves 0 B, from 136 B for a refusal and more for a pass.
+- ⚠ **Not free:** a request on a kept connection leaves 568 B on the global heap, against 312 B for a new one in the same
+  measurement, because sandhi's pool builds its route key there for each take and put. Filed with sandhi.
+
 ## [2.3.5] — 2026-11-08
 
 A spawned tool is answered when it finishes, a WASM module is checked when it is loaded, and a staged module goes with its

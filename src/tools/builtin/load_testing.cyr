@@ -8,7 +8,7 @@
 #     user; this spawns one OS thread per user via `thread_create`. A load
 #     generator that ran sequentially would not be one, so this is not a place
 #     to take the easy shape.
-#   * **Every worker owns TWO arenas and allocates only through them.** This
+#   * **Every worker owns THREE arenas and allocates only through them.** This
 #     is port plan blocker #3's prescribed pattern, applied here for the first
 #     time. The global bump allocator is not thread-safe (and never frees), so
 #     a worker calling bare `alloc` / `vec_push` / `sandhi_http_get` would race
@@ -22,7 +22,9 @@
 #     at 25,000 requests per worker that is unbounded growth the oracle does
 #     not have, because Rust drops each response as it goes.
 #
-#     Nothing that outlives the run is allocated from either worker arena;
+#     The third holds the worker's **connection**: see `agnosai_lt_http_executor`.
+#
+#     Nothing that outlives the run is allocated from a worker arena;
 #     `agnosai_lt_aggregate` copies every latency and status count out.
 #   * **The request executor is a function pointer.** That is what makes the
 #     fan-out testable: the tests inject a synthetic executor and exercise the
@@ -42,6 +44,8 @@
 # latency vector, and at the 100k cap an O(n^2) sort measured 52.6 s.
 # =========================================================================
 
+include "src/done_word.cyr"
+
 # Maximum total requests across all users, preventing unbounded memory growth.
 # Mirrors the oracle's MAX_TOTAL_REQUESTS.
 var AGNOSAI_LT_MAX_TOTAL_REQUESTS = 100000;
@@ -56,9 +60,9 @@ var AGNOSAI_LT_MAX_DURATION_SECS = 300;
 # default request cap is 64 KiB.
 var AGNOSAI_LT_SCRATCH_BYTES = 1048576;
 
-# Every request gets a 30 s total budget. Without one sandhi waits forever on a
-# target that accepts and never answers, and the worker — with the
-# `thread_join` behind it — never returns.
+# Every request gets a 30 s budget. ⚠ **As a total AND as a read and write limit.** sandhi checks
+# `total_ms` between reads, so on its own it cannot end a read that is already blocked, and through
+# 2.3.5 a target that accepted and never answered held the worker, and the run behind it, for good.
 var AGNOSAI_LT_REQUEST_TIMEOUT_MS = 30000;
 
 # Bodies are read and discarded, so this only has to be large enough that an
@@ -67,13 +71,13 @@ var AGNOSAI_LT_REQUEST_TIMEOUT_MS = 30000;
 # growable and reset after every request, so a large body is transient.
 var AGNOSAI_LT_MAX_RESPONSE_BYTES = 16777216;
 
-# Pools for the worker's two arenas. See `src/arena_pool.cyr`.
+# Pools for the worker's three arenas. See `src/arena_pool.cyr`.
 #
 # ⚠ **Was `arena_allocator(...)` twice PER USER**, in the spawn loop — the only
 # one of the five sites whose cost scaled with a caller-supplied number. Neither
 # was ever returned.
 #
-# **Two pools, because the two arenas have different roles and sizes.** The
+# **A pool each, because the arenas have different roles and sizes.** The
 # persistent one holds every latency for the run and is sized
 # `max_requests * 40 + slack`, which VARIES with the user count
 # (`max_requests = 100000 / users`): ~4 MiB at one user, ~73 KiB at 500. A pool
@@ -81,9 +85,9 @@ var AGNOSAI_LT_MAX_RESPONSE_BYTES = 16777216;
 # arenas are **growable** and converge on whatever each run actually needs. The
 # initial size below is the floor, not the ceiling.
 #
-# **16 slots each.** A worker holds BOTH for the whole run, so a 16-user run is
+# **16 slots each.** A worker on a real target holds all three for the whole run, so a 16-user run is
 # served entirely from the pools and anything larger falls back — which is
-# correct behaviour, not degradation. ⚠ Sizing them equally matters: two pools
+# correct behaviour, not degradation. ⚠ Sizing them equally matters: pools
 # drawn in a fixed order by every worker cannot deadlock, because acquire never
 # blocks. That is the property that makes two-resource-per-holder safe here.
 var _AGNOSAI_LT_POOL_SLOTS = 16;
@@ -91,6 +95,15 @@ var _AGNOSAI_LT_PERSISTENT_POOL = agnosai_arena_pool_new(_AGNOSAI_LT_POOL_SLOTS,
   AGNOSAI_LT_SCRATCH_BYTES);
 var _AGNOSAI_LT_SCRATCH_POOL = agnosai_arena_pool_new(_AGNOSAI_LT_POOL_SLOTS,
   AGNOSAI_LT_SCRATCH_BYTES);
+var _AGNOSAI_LT_CONN_POOL = agnosai_arena_pool_new(_AGNOSAI_LT_POOL_SLOTS,
+  AGNOSAI_LT_SCRATCH_BYTES);
+
+# How long a worker's idle connection stays usable, in milliseconds: for good, in effect (34
+# years). ⚠ **Not a tuning knob.** A connection this calls stale is closed inside sandhi and a new
+# one opens in the arena the worker had picked for a reused one, which `agnosai_lt_http_executor`
+# is not prepared for. A worker has nothing to do between one request and the next, so nothing
+# should be stale, and a paused process must not change that.
+var _AGNOSAI_LT_IDLE_FOR_GOOD_MS = 1 << 40;
 
 # Slack on the persistent arena, over and above the latency vector.
 var AGNOSAI_LT_PERSISTENT_SLACK = 65536;
@@ -101,7 +114,9 @@ var AGNOSAI_LT_PERSISTENT_SLACK = 65536;
 # the vector its ~32 plus room for the status pairs.
 var AGNOSAI_LT_PERSISTENT_PER_REQUEST = 40;
 
-# Worker context heap layout — 72 bytes. One per simulated user.
+# Worker context heap layout. One per simulated user. `CONN` is the arena its connection lives in,
+# `POOL` is sandhi's pool holding that connection between requests, both taken on the first real
+# request, and `DONE` turns 1 as its thread's last act (`src/done_word.cyr`).
 enum AgnosaiLtWorkerOff {
     AGN_LT_URL = 0;
     AGN_LT_DEADLINE_NS = 8;
@@ -113,7 +128,10 @@ enum AgnosaiLtWorkerOff {
     AGN_LT_STATUS_COUNTS = 56;
     AGN_LT_ERRORS = 64;
     AGN_LT_WORKER_ID = 72;
-    AGN_LT_SIZE = 80;
+    AGN_LT_CONN = 80;
+    AGN_LT_POOL = 88;
+    AGN_LT_DONE = 96;
+    AGN_LT_SIZE = 104;
 }
 
 # LoadTestResult heap layout — 120 bytes. Latencies are nanoseconds; the
@@ -137,6 +155,14 @@ enum AgnosaiLtResultOff {
     AGN_LTR_SIZE = 120;
 }
 
+# Give a worker's arenas back. Nothing a run reports points into one: `agnosai_lt_aggregate` copies.
+fn agnosai_lt_worker_release(w): i64 {
+    agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL, load64(w + AGN_LT_ARENA));
+    agnosai_arena_pool_release(_AGNOSAI_LT_SCRATCH_POOL, load64(w + AGN_LT_SCRATCH));
+    agnosai_arena_pool_release(_AGNOSAI_LT_CONN_POOL, load64(w + AGN_LT_CONN));
+    return 0;
+}
+
 # Create a worker context. `executor_fp` is `fn(ctx): i64` returning the HTTP
 # status code, or 0 to record a transport error.
 fn agnosai_lt_worker_new_a(a, url: Str, deadline_ns, max_requests, executor_fp, worker_id): i64 {
@@ -154,7 +180,11 @@ fn agnosai_lt_worker_new_a(a, url: Str, deadline_ns, max_requests, executor_fp, 
     # `alloc_via` dereferences it as a vtable and segfaults.)
     var arena = agnosai_arena_pool_acquire(_AGNOSAI_LT_PERSISTENT_POOL);
     var scratch = agnosai_arena_pool_acquire(_AGNOSAI_LT_SCRATCH_POOL);
-    if (arena == 0 || scratch == 0) { return 0; }
+    if (w == 0 || arena == 0 || scratch == 0) {
+        agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL, arena);
+        agnosai_arena_pool_release(_AGNOSAI_LT_SCRATCH_POOL, scratch);
+        return 0;
+    }
 
     # A copy, as a C string is what a request takes: `str_cstr` per request is a global
     # allocation per request, up to 100k a run.
@@ -164,10 +194,16 @@ fn agnosai_lt_worker_new_a(a, url: Str, deadline_ns, max_requests, executor_fp, 
     store64(w + AGN_LT_EXECUTOR_FP, executor_fp);
     store64(w + AGN_LT_ARENA, arena);
     store64(w + AGN_LT_SCRATCH, scratch);
+    store64(w + AGN_LT_CONN, 0);
+    store64(w + AGN_LT_POOL, 0);
+    store64(w + AGN_LT_DONE, 0);
 
     var latencies = vec_new_a(arena);
     var statuses = vec_new_a(arena);
-    if (latencies == 0 || statuses == 0) { return 0; }
+    if (latencies == 0 || statuses == 0) {
+        agnosai_lt_worker_release(w);
+        return 0;
+    }
     store64(w + AGN_LT_LATENCIES, latencies);
     store64(w + AGN_LT_STATUS_COUNTS, statuses);
 
@@ -241,26 +277,82 @@ fn agnosai_lt_worker_id(w): i64 {
     return load64(w + AGN_LT_WORKER_ID);
 }
 
-# The real HTTP executor: one GET against the worker's target URL, allocating
-# the response through the worker's arena. Returns the status code, or 0 on a
-# transport error.
-fn agnosai_lt_http_executor(w): i64 {
-    # The SCRATCH arena, not the persistent one — this allocation is discarded
-    # as soon as the status code has been read.
-    var arena = load64(w + AGN_LT_SCRATCH);
-    var url = load64(w + AGN_LT_URL);
-    # Headers and options through the scratch arena too: `sandhi_headers_new()`
-    # on the global bump was one permanent allocation per request, up to 100k a
-    # run.
+# One GET against the worker's target, its response in `arena`, on the worker's connection when it
+# has one. The response, or 0.
+fn _agnosai_lt_get(w, arena): i64 {
+    # Headers and options through the same arena: `sandhi_headers_new()` on the global bump was one
+    # permanent allocation per request, up to 100k a run.
     var headers = sandhi_headers_new_a(arena);
     var opts = sandhi_http_options_new_a(arena);
     if (opts == 0) { return 0; }
     sandhi_http_options_total_ms(opts, AGNOSAI_LT_REQUEST_TIMEOUT_MS);
+    sandhi_http_options_read_ms(opts, AGNOSAI_LT_REQUEST_TIMEOUT_MS);
+    sandhi_http_options_write_ms(opts, AGNOSAI_LT_REQUEST_TIMEOUT_MS);
     sandhi_http_options_max_response_bytes(opts, AGNOSAI_LT_MAX_RESPONSE_BYTES);
-    var r = sandhi_http_get_opts_a(arena, str_data(url), headers, opts);
+    sandhi_http_options_pool(opts, load64(w + AGN_LT_POOL));
+    return sandhi_http_get_opts_a(arena, str_data(load64(w + AGN_LT_URL)), headers, opts);
+}
+
+# A response's status code, or 0 for a transport error.
+fn _agnosai_lt_status(r): i64 {
     if (r == 0) { return 0; }
     if (sandhi_http_err_kind(r) != SANDHI_OK) { return 0; }
     return sandhi_http_status(r);
+}
+
+# A worker's connection arena and pool, on its first real request. Here and not in the constructor,
+# as a worker on a synthetic executor has no use for them, and past the pool's 16 slots each arena
+# is a new mapping. Returns the pool, or 0.
+fn _agnosai_lt_worker_connect(w): i64 {
+    if (load64(w + AGN_LT_CONN) == 0) {
+        var conn = agnosai_arena_pool_acquire(_AGNOSAI_LT_CONN_POOL);
+        if (conn == 0) { return 0; }
+        store64(w + AGN_LT_CONN, conn);
+    }
+    var pool = sandhi_http_pool_new_a(load64(w + AGN_LT_ARENA), 1, _AGNOSAI_LT_IDLE_FOR_GOOD_MS);
+    store64(w + AGN_LT_POOL, pool);
+    return pool;
+}
+
+# The real HTTP executor: one GET against the worker's target URL. Returns the status code, or 0 on
+# a transport error.
+#
+# Each simulated user keeps one connection, so a latency measures the target and not a handshake
+# per request, and a TLS target is not spent mostly on those.
+#
+# ⚠ **Which arena a request runs in is what keeps the connection alive.** sandhi allocates a
+# connection from the request's allocator, and the pool only keeps the pointer, so a connection
+# opened in the scratch arena would be overwritten by the next request. A request that will open one
+# (the pool is empty, so no connection is alive in the `CONN` arena) resets that arena and runs
+# there. A request that will reuse one runs in scratch.
+#
+# That rests on a request finding an idle connection opening no other. sandhi follows no redirect
+# here, has no retry at this level, and cannot call the connection stale
+# (`_AGNOSAI_LT_IDLE_FOR_GOOD_MS`). `tests/tools_builtin_load_testing.tcyr` holds it to that.
+#
+# **A reused connection that fails is tried once on a fresh one.** A server may close a keep-alive
+# connection without warning, and that says nothing about the target. A timeout is not retried: that
+# would double the 30 s, and it is a finding.
+#
+# ⚠ **A request can fail before it reaches the connection**, as a name that stopped resolving or an
+# allocation does, and then the pool still holds it, alive in the `CONN` arena. So the arena is reset
+# only with the pool seen empty, and never on the strength of a failure alone.
+fn agnosai_lt_http_executor(w): i64 {
+    var pool = load64(w + AGN_LT_POOL);
+    if (pool == 0) {
+        pool = _agnosai_lt_worker_connect(w);
+        if (pool == 0) { return 0; }
+    }
+    if (sandhi_http_pool_idle_count(pool) != 0) {
+        var reused = _agnosai_lt_get(w, load64(w + AGN_LT_SCRATCH));
+        var status = _agnosai_lt_status(reused);
+        if (status != 0) { return status; }
+        if (reused != 0 && sandhi_http_err_kind(reused) == SANDHI_ERR_TIMEOUT) { return 0; }
+        if (sandhi_http_pool_idle_count(pool) != 0) { return 0; }
+    }
+    var conn = load64(w + AGN_LT_CONN);
+    reset_via(conn);
+    return _agnosai_lt_status(_agnosai_lt_get(w, conn));
 }
 
 # The worker loop — the body of one simulated user.
@@ -305,13 +397,19 @@ fn agnosai_lt_worker_run(w): i64 {
         # this the worker's memory grows with every request it makes.
         reset_via(load64(w + AGN_LT_SCRATCH));
     }
+
+    # Its connection goes with the worker. Only when there is one: a close allocates on the global
+    # heap, and a run that opened nothing should leave nothing.
+    var pool = load64(w + AGN_LT_POOL);
+    if (pool != 0 && sandhi_http_pool_idle_count(pool) != 0) { sandhi_http_pool_close(pool); }
     return 0;
 }
 
-# Thread entry point. `thread_create` passes exactly one argument, so the
-# worker context pointer is it.
+# Thread entry point. A thread passes exactly one argument, so the worker context pointer is it.
+# Nothing after the set may read `w`, as the run may have moved on (`src/done_word.cyr`).
 fn _agnosai_lt_thread_main(w): i64 {
     agnosai_lt_worker_run(w);
+    agnosai_done_word_set(w + AGN_LT_DONE);
     return 0;
 }
 
@@ -534,19 +632,21 @@ fn agnosai_load_test_run_a(a, url: Str, users, duration_secs, executor_fp): i64 
     var deadline = clock_now_ns() + duration_secs * AGNOSAI_NS_PER_SEC;
 
     var workers = vec_new_a(a);
-    var threads = vec_new_a(a);
     for (var i = 0; i < users; i = i + 1) {
         var w = agnosai_lt_worker_new_a(a, url, deadline, per_user, executor_fp, i);
         # A worker that could not get its arenas is skipped rather than run —
         # every allocation in its loop would return 0 and be dereferenced.
         if (w != 0) {
             vec_push_a(a, workers, w);
-            vec_push_a(a, threads, thread_create(&_agnosai_lt_thread_main, w));
+            # Detached, so a run leaves no handle or TLS behind. With no thread to be had, the user
+            # runs here: its deadline is absolute, so the run still ends on time and says what it
+            # measured.
+            if (thread_create_detached(&_agnosai_lt_thread_main, w) == 0) { _agnosai_lt_thread_main(w); }
         }
     }
     if (vec_len(workers) == 0) { return 0; }
-    for (var j = 0; j < vec_len(threads); j = j + 1) {
-        thread_join(vec_get(threads, j));
+    for (var j = 0; j < vec_len(workers); j = j + 1) {
+        agnosai_done_word_wait(vec_get(workers, j) + AGN_LT_DONE);
     }
 
     var result = agnosai_lt_aggregate_a(a, workers, url, users, duration_secs);
@@ -555,10 +655,7 @@ fn agnosai_load_test_run_a(a, url: Str, users, duration_secs, executor_fp): i64 
     # into one, because agnosai_lt_aggregate copies each latency and status
     # count into `a`.
     for (var k = 0; k < vec_len(workers); k = k + 1) {
-        agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL,
-          load64(vec_get(workers, k) + AGN_LT_ARENA));
-        agnosai_arena_pool_release(_AGNOSAI_LT_SCRATCH_POOL,
-          load64(vec_get(workers, k) + AGN_LT_SCRATCH));
+        agnosai_lt_worker_release(vec_get(workers, k));
     }
     return result;
 }

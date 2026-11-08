@@ -1,0 +1,46 @@
+# =========================================================================
+# done_word — a word one thread sets when it is over, and another waits on.
+#
+# Port-local: `rust-old/` had `JoinHandle`. It is what the owner of a detached thread has in place
+# of `thread_join`, which keeps the thread's handle and TLS on the global heap for good, 4,120 B a
+# thread, where a detached thread unmaps its own and leaves nothing. A crew's wave, a turn's tool
+# calls and a load test's users all wait on one (three copies until 2.3.6).
+#
+# The word starts at 0, in memory that outlives the wait, and is set once.
+#
+# ⚠ **The set is the worker's last touch of that memory.** Once it reads 1 the waiter may go on, and
+# whatever holds the word may be scrubbed and reused, so nothing after the set may read it. The wake
+# takes the word's address and reads nothing through it: a stale wake is a spurious one, and a waiter
+# re-checks.
+#
+# ⚠ **The fences are what `thread_join` gave for nothing.** `atomic_store` and `atomic_load` are plain
+# moves, atomic and unordered (`lib/atomic.cyr`), and a waiter usually finds the word set and never
+# reaches the kernel. So on aarch64 it could read 1 and then a result pointer of 0, dropping the
+# result, or a pointer to one whose fields had not landed. x86 cannot show this, and no suite here
+# would.
+#
+# ⚠ **One load per iteration, feeding both uses**, as `thread_join` learned: the kernel compares the
+# word to what this thread saw, so a store landing between the check and the park reads as EAGAIN and
+# the loop re-checks, and it cannot park on a 1 it missed.
+# =========================================================================
+
+# Say that this thread is over: everything it wrote is visible to whoever reads 1 here.
+fn agnosai_done_word_set(word): i64 {
+    atomic_fence();
+    atomic_store(word, 1);
+    syscall(SYS_FUTEX, word, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+    return 0;
+}
+
+# Wait for `agnosai_done_word_set` on this word.
+fn agnosai_done_word_wait(word): i64 {
+    while (1 == 1) {
+        var d = atomic_load(word);
+        if (d != 0) {
+            atomic_fence();
+            return 0;
+        }
+        syscall(SYS_FUTEX, word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, d, 0, 0, 0);
+    }
+    return 0;
+}

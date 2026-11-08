@@ -210,6 +210,81 @@ fn _t_registry_concurrent_access(): i64 {
     return 0;
 }
 
+# A schema named for the tool it describes, which `ctx` is.
+fn _t_named_schema(a, ctx): i64 {
+    return agnosai_tool_schema_new_a(a, ctx, ctx);
+}
+
+# A registry of `names`, registered in the order given.
+fn _t_reg_of(names): i64 {
+    var reg = agnosai_tool_registry_new();
+    for (var i = 0; i < vec_len(names); i = i + 1) {
+        var name = vec_get(names, i);
+        agnosai_tool_registry_register(reg, agnosai_tool_new(name, name, &_t_named_schema, &_t_echo_execute, name));
+    }
+    return reg;
+}
+
+# The list is in name order, whatever order the tools went in. `lib/hashmap.cyr` seeds per process,
+# so through 2.3.5 two runs of a server answered with two lists.
+fn _t_reg_order(): i64 {
+    var forward = vec_new();
+    var backward = vec_new();
+    # Past the map's first capacity, so a rehash has reshuffled the slots too.
+    for (var i = 0; i < 40; i = i + 1) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "tool-");
+        str_builder_add_int(sb, 1000 + i);
+        vec_push(forward, str_builder_build(sb));
+    }
+    for (var j = 39; j >= 0; j = j - 1) { vec_push(backward, vec_get(forward, j)); }
+    var ar = arena_allocator_growable(65536);
+    var a = agnosai_tool_registry_list_a(ar, _t_reg_of(forward));
+    var b = agnosai_tool_registry_list_a(ar, _t_reg_of(backward));
+    assert_eq(vec_len(a), 40, "every tool is listed");
+    var same = 1;
+    var sorted = 1;
+    for (var k = 0; k < 40; k = k + 1) {
+        var name = agnosai_tool_schema_name(vec_get(a, k));
+        if (str_eq(name, vec_get(forward, k)) != 1) { sorted = 0; }
+        if (str_eq(name, agnosai_tool_schema_name(vec_get(b, k))) != 1) { same = 0; }
+    }
+    assert_eq(sorted, 1, "in name order");
+    assert_eq(same, 1, "and registering them backward gives the same list");
+
+    # The order is kept, so it has to follow every change to the set.
+    var live = _t_reg_of(forward);
+    var kept = agnosai_tool_registry_list_a(ar, live);
+    assert(str_eq_cstr(agnosai_tool_schema_name(vec_get(kept, 0)), "tool-1000") == 1, "the first is listed first");
+    agnosai_tool_registry_remove(live, str_from("tool-1000"));
+    var after_remove = agnosai_tool_registry_list_a(ar, live);
+    assert_eq(vec_len(after_remove), 39, "a removed tool leaves the list");
+    assert(str_eq_cstr(agnosai_tool_schema_name(vec_get(after_remove, 0)), "tool-1001") == 1, "and the next moves up");
+    var newcomer = str_from("tool-0500");
+    agnosai_tool_registry_register(live,
+      agnosai_tool_new(newcomer, newcomer, &_t_named_schema, &_t_echo_execute, newcomer));
+    var after_add = agnosai_tool_registry_list_a(ar, live);
+    assert_eq(vec_len(after_add), 40, "a registered tool joins it");
+    assert(str_eq_cstr(agnosai_tool_schema_name(vec_get(after_add, 0)), "tool-0500") == 1, "in its place by name");
+    var other = str_from("replaced");
+    agnosai_tool_registry_register(live,
+      agnosai_tool_new(newcomer, newcomer, &_t_named_schema, &_t_echo_execute, other));
+    assert(str_eq_cstr(agnosai_tool_schema_name(vec_get(agnosai_tool_registry_list_a(ar, live), 0)), "replaced") == 1,
+      "and one registered over another is what is listed");
+
+    var mixed = vec_new();
+    vec_push(mixed, str_from("b"));
+    vec_push(mixed, str_from("a"));
+    vec_push(mixed, str_from("Z"));
+    vec_push(mixed, str_from("ab"));
+    var names = agnosai_tool_registry_names(_t_reg_of(mixed));
+    assert(str_eq_cstr(vec_get(names, 0), "Z") == 1, "the order is bytes: upper case first");
+    assert(str_eq_cstr(vec_get(names, 1), "a") == 1, "a prefix before what extends it");
+    assert(str_eq_cstr(vec_get(names, 2), "ab") == 1, "then what extends it");
+    assert(str_eq_cstr(vec_get(names, 3), "b") == 1, "and the names list is in the same order");
+    return 0;
+}
+
 # The allocator a tool answers in.
 fn _t_tn_call_alloc(): i64 {
     assert_eq(agnosai_tool_input_alloc(0), default_alloc(), "with no input, the global allocator");
@@ -441,6 +516,7 @@ fn main() {
     assert_eq(agnosai_tool_registry_count(reg), 2, "a second tool registers alongside");
     assert_eq(vec_len(agnosai_tool_registry_names(reg)), 2, "names lists both tools");
     assert_eq(vec_len(agnosai_tool_registry_list(reg)), 2, "list returns both schemas");
+    _t_reg_order();
 
     # --- remove ---
     assert_eq(agnosai_tool_registry_remove(reg, str_from("counter")), 1, "remove reports it was present");

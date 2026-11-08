@@ -50,9 +50,8 @@ within 14 days of confirmation.
     execute on the system's own trees and read and write on `/tmp` and the
     call's work directory, with the binary pinned by descriptor. Through 2.3.3
     it was a plain subprocess with the server's privileges.
-    ⚠ **Still open:** the network is not isolated on this tier; a server
-    running as root gives these tools root's capabilities, so do not run it as
-    root (the image runs as uid 10001); a kernel without landlock runs them
+    Since 2.3.6 these tools hold no capabilities, even under a root server.
+    ⚠ **Still open:** the network is not isolated on this tier; a kernel without landlock runs them
     with no filesystem rules, and the server warns once. There is no memory
     limit and no cgroup. `docs/development/threat-model.md` has the detail.
   - **Native** tools run in-process and should be reviewed carefully before

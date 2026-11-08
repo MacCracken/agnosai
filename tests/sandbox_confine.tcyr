@@ -198,6 +198,17 @@ fn test_process(): i64 {
       "NO_NEW_PRIVS is set: a setuid binary cannot raise the tool's privileges");
     assert(str_index_of_cstr(out, "Seccomp:\t2") >= 0, "and a seccomp filter is loaded");
 
+    # Since kavach 3.14.8 the bound holds with no rootfs. The bounding set only falls under
+    # root, as nothing else can lower it, and only root takes it back at an exec.
+    var caps = _t_out(_t_run(_t_sh("exec grep -E 'CapEff|CapPrm|CapBnd|CapAmb' /proc/self/status")));
+    assert(str_index_of_cstr(caps, "CapEff:\t0000000000000000") >= 0, "a confined tool holds no capability");
+    assert(str_index_of_cstr(caps, "CapPrm:\t0000000000000000") >= 0, "and permits itself none");
+    assert(str_index_of_cstr(caps, "CapAmb:\t0000000000000000") >= 0, "and none is ambient");
+    if (sys_geteuid() == 0) {
+        assert(str_index_of_cstr(caps, "CapBnd:\t0000000000000000") >= 0,
+          "and under root the bounding set is empty, so no exec can take one back");
+    }
+
     var un = _t_run(_t_argv("/usr/bin/unshare", "-r", "/bin/true"));
     _t_ran(un, "unshare runs");
     assert(agnosai_spawn_signal(un) != 0 || agnosai_spawn_exit_code(un) != 0,

@@ -140,7 +140,12 @@ fn _t_ok(gate, url): i64 {
 # ours shows above it: `str_cstr` per request or per hop is only the URL's length. Lower them when
 # sandhi moves.
 var _T_SANDHI_BYTES_PER_CHAIN = 928;
-var _T_SANDHI_BYTES_PER_REQUEST = 352;
+# A request's own, and the redirect target's text, which `agnosai_fetch_resolve_location` builds on
+# the global heap. The guard's parse was 136 B more through 2.3.5.
+var _T_BYTES_PER_REFUSED_HOP = 464;
+# 128 B of it is the pool's route key: this server closes after every answer, so each request opens
+# a connection, and the load tester asks the pool first.
+var _T_SANDHI_BYTES_PER_REQUEST = 480;
 
 # What one redirect chain leaves on the global heap, its arena warm.
 fn _t_chain_cost(target: Str, opts, arena): i64 {
@@ -171,8 +176,7 @@ fn _t_request_cost(target: Str): i64 {
     var cost = (alloc_used() - before) / 200;
     assert_eq(vec_len(agnosai_lt_worker_latencies(w)), 220, "the executor ran every request");
     assert_eq(load64(w + AGN_LT_ERRORS), 0, "against a real socket, and each one answered");
-    agnosai_arena_pool_release(_AGNOSAI_LT_PERSISTENT_POOL, agnosai_lt_worker_arena(w));
-    agnosai_arena_pool_release(_AGNOSAI_LT_SCRATCH_POOL, agnosai_lt_worker_scratch(w));
+    agnosai_lt_worker_release(w);
     return cost;
 }
 
@@ -199,6 +203,7 @@ var _T_SECOND = 0;
 var _T_OPTIONS_ONCE = 0;
 var _T_HITS = 0;
 var _T_STOP = 0;
+var _T_SILENT = 0;
 
 fn _t_server(arg): i64 {
     var buf = alloc(8192);
@@ -214,7 +219,12 @@ fn _t_server(arg): i64 {
                     r = _T_OPTIONS_ONCE;
                     _T_OPTIONS_ONCE = 0;
                 }
-                sock_send_all(cfd, r, strlen(r));
+                if (_T_SILENT == 1) {
+                    # Accepted, read, and never answered, until the client gives up.
+                    while (sys_read(cfd, buf, 8192) > 0) { }
+                } else {
+                    sock_send_all(cfd, r, strlen(r));
+                }
             }
             sock_close(cfd);
         }
@@ -571,6 +581,34 @@ fn _t_tools_end_to_end(): i64 {
     var opts = sandhi_http_options_new();
     assert_eq(agnosai_guarded_fetch(arena, "GET", target, sandhi_headers_new(), opts, 2000),
       AGNOSAI_FETCH_BLOCKED, "the bare fetch still holds a hop to the SSRF guard");
+
+    # A target that accepts and never answers is a timeout. sandhi checks a total deadline between
+    # reads, so without a read limit this fetch, and every tool on it, never came back.
+    _T_SILENT = 1;
+    var kind_cell = 0;
+    var t_silent = clock_now_ms();
+    var silent_r = agnosai_guarded_fetch_full(arena, "GET", target, sandhi_headers_new(), opts, 150, 0, 0, &kind_cell);
+    var waited = clock_now_ms() - t_silent;
+    _T_SILENT = 0;
+    assert_eq(silent_r, 0, "a silent target is no response");
+    assert_eq(kind_cell, SANDHI_ERR_TIMEOUT, "and it says it timed out");
+    assert(waited < 2000, "inside its limit");
+    reset_via(arena);
+
+    # The guard runs in the fetch's arena: a hop it refuses leaves one request of sandhi's, and
+    # nothing of its own. The server's replies are counted too, as they are in the other bounds.
+    reset_via(arena);
+    var hop_headers = sandhi_headers_new();
+    agnosai_guarded_fetch(arena, "GET", target, hop_headers, opts, 2000);
+    reset_via(arena);
+    var hop_before = alloc_used();
+    for (var hi = 0; hi < 20; hi = hi + 1) {
+        _T_HITS = 0;
+        agnosai_guarded_fetch(arena, "GET", target, hop_headers, opts, 2000);
+        reset_via(arena);
+    }
+    assert((alloc_used() - hop_before) / 20 <= _T_BYTES_PER_REFUSED_HOP,
+      "a refused hop leaves only sandhi's own: the guard's parse is in the arena");
     assert_eq(_T_HITS, 1, "and went no further");
 
     # A hop check of the caller's own takes that guard's place, and hears each hop.

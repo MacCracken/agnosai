@@ -211,8 +211,8 @@ fn agnosai_guarded_fetch_full(arena, method, url: Str, headers, opts, timeout_ms
 }
 
 # Whether a redirect may be followed to `url`: `hop_fp`'s word, or the SSRF guard's.
-fn _agnosai_fetch_hop_ok(url: Str, hop_fp, hop_ctx): i64 {
-    if (hop_fp == 0) { return agnosai_is_safe_url(url); }
+fn _agnosai_fetch_hop_ok(arena, url: Str, hop_fp, hop_ctx): i64 {
+    if (hop_fp == 0) { return agnosai_is_safe_url_a(arena, url); }
     return callptr(hop_fp, hop_ctx, url);
 }
 
@@ -233,6 +233,10 @@ fn agnosai_guarded_fetch_hops(arena, method, url: Str, headers, opts, timeout_ms
         var left_ms = (deadline - clock_now_ns()) / AGNOSAI_NS_PER_MS;
         if (left_ms <= 0) { return 0; }
         sandhi_http_options_total_ms(opts, left_ms);
+        # ⚠ All three (2.3.6). sandhi checks the total between reads, so alone it cannot end a read
+        # already blocked, and a target that accepted and never answered held the call for good.
+        sandhi_http_options_read_ms(opts, left_ms);
+        sandhi_http_options_write_ms(opts, left_ms);
 
         var r = sandhi_http_request_auto_a(arena, verb, str_data(str_clone_a(arena, current)), headers,
           body, body_len, opts);
@@ -253,7 +257,7 @@ fn agnosai_guarded_fetch_hops(arena, method, url: Str, headers, opts, timeout_ms
             return AGNOSAI_FETCH_BLOCKED;
         }
         # The guard, on every hop. This is the check the oracle never makes.
-        if (_agnosai_fetch_hop_ok(next, hop_fp, hop_ctx) == 0) { return AGNOSAI_FETCH_BLOCKED; }
+        if (_agnosai_fetch_hop_ok(arena, next, hop_fp, hop_ctx) == 0) { return AGNOSAI_FETCH_BLOCKED; }
 
         # A 303 turns the next request into a GET, per RFC 9110. Only reachable
         # on the CORS probe here, since the header fetch is already a GET.

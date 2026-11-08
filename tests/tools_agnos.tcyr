@@ -210,6 +210,7 @@ var _T_PORT = 0;
 var _T_RESPONSE = 0;
 var _T_REQUEST = 0;
 var _T_STOP = 0;
+var _T_SILENT = 0;
 
 fn _t_server(arg): i64 {
     var buf = alloc(65536);
@@ -223,7 +224,12 @@ fn _t_server(arg): i64 {
                     store8(buf + n, 0);
                     _T_REQUEST = buf;
                 }
-                sock_send_all(cfd, _T_RESPONSE, strlen(_T_RESPONSE));
+                if (_T_SILENT == 1) {
+                    # Accepted, read, and never answered, until the client gives up.
+                    while (sys_read(cfd, buf, 65535) > 0) { }
+                } else {
+                    sock_send_all(cfd, _T_RESPONSE, strlen(_T_RESPONSE));
+                }
             }
             sock_close(cfd);
         }
@@ -291,6 +297,20 @@ fn _t_live_suite(): i64 {
     assert_eq(agnosai_tool_output_success(bad), 0, "a body that is not JSON fails");
     assert_eq(str_contains_cstr(agnosai_tool_output_error(bad), "failed to parse response: "), 1,
       "and says why, in a detail that outlived the exchange");
+    reset_via(ar);
+
+    # A service that accepts and never answers is a timeout, however it stops. sandhi checks a total
+    # deadline between reads, so without a read limit this call never came back.
+    _T_SILENT = 1;
+    var keep_ms = AGNOSAI_AGNOS_TIMEOUT_MS;
+    AGNOSAI_AGNOS_TIMEOUT_MS = 150;
+    var t_silent = clock_now_ms();
+    var quiet_out = agnosai_agnos_call_a(ar, c, "GET", str_from("/v1/x"), 0, 0);
+    var waited = clock_now_ms() - t_silent;
+    AGNOSAI_AGNOS_TIMEOUT_MS = keep_ms;
+    _T_SILENT = 0;
+    assert_eq(agnosai_tool_output_success(quiet_out), 0, "a silent service is a failure");
+    assert(waited < 2000, "and the call comes back inside its limit");
     reset_via(ar);
 
     # Eight slots, first in first out, so every one has held an exchange before this counts.

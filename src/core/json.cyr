@@ -18,6 +18,8 @@
 #     note in core_message.cyr), so nothing here is named `X_str`.
 # =========================================================================
 
+include "src/order.cyr"
+
 # The shared "absent" sentinel for optional numeric fields across core. Every
 # such field is a non-negative count, limit or amount, so -1 is unambiguous and
 # keeps the structs allocation-free where a tagged Option would not.
@@ -177,21 +179,38 @@ fn _agnosai_map_slot_key(m, i): i64 { return load64(load64(m) + i * 24); }
 # The value at slot `i`. Only meaningful when `_agnosai_map_slot_live` is 1.
 fn _agnosai_map_slot_val(m, i): i64 { return load64(load64(m) + i * 24 + 8); }
 
+# Two map slots by key, for `agnosai_sort`. A slot's key is its first word.
+fn _agnosai_map_slot_cmp(x, y): i64 {
+    return agnosai_order_str_cmp(load64(x), load64(y));
+}
+
+# A map as a JSON object, its keys **in order** (2.3.6). `lib/hashmap.cyr` seeds per process, so
+# a task's `metadata` and `context` came out in a different order every run. The Rust line's did too.
+#
+# Slot pointers are what is sorted, so the value is there without hashing the key again.
 fn _agnosai_map_to_value_a(a, m): i64 {
     var obj = bayan_json_v_obj_new_a(a);
-    var n = _agnosai_map_slots(m);
-    # **Stop once every live entry is out.** A slot walk is over *capacity*, not
-    # size, and `map_new_str` starts at 16 — a task result's metadata is
-    # typically one or two entries, so the loop was scanning 16 slots to emit
-    # one. Measured at 195 ns for a single-entry map.
     var live = map_size(m);
-    var emitted = 0;
-    for (var i = 0; i < n && emitted < live; i = i + 1) {
-        if (_agnosai_map_slot_live(m, i) == 1) {
-            bayan_json_v_obj_set_a(a, obj, _agnosai_map_slot_key(m, i),
-              _agnosai_map_slot_val(m, i));
-            emitted = emitted + 1;
+    if (live == 0) { return obj; }
+    var n = _agnosai_map_slots(m);
+    # One key has one order, and a task result's metadata is often one entry, so no vec for it.
+    # **Stop once every live entry is out.** A slot walk is over *capacity*, not size.
+    if (live == 1) {
+        for (var s1 = 0; s1 < n; s1 = s1 + 1) {
+            if (_agnosai_map_slot_live(m, s1) == 1) {
+                bayan_json_v_obj_set_a(a, obj, _agnosai_map_slot_key(m, s1), _agnosai_map_slot_val(m, s1));
+                return obj;
+            }
         }
+    }
+    var slots = vec_new_a(a);
+    for (var i = 0; i < n && vec_len(slots) < live; i = i + 1) {
+        if (_agnosai_map_slot_live(m, i) == 1) { vec_push_a(a, slots, load64(m) + i * 24); }
+    }
+    agnosai_sort(slots, &_agnosai_map_slot_cmp);
+    for (var j = 0; j < vec_len(slots); j = j + 1) {
+        var slot = vec_get(slots, j);
+        bayan_json_v_obj_set_a(a, obj, load64(slot), load64(slot + 8));
     }
     return obj;
 }
