@@ -340,6 +340,72 @@ fn _t_release(): i64 {
     return 0;
 }
 
+fn _t_v237_forms(): i64 {
+    test_group("the JSON forms");
+    var ar = arena_allocator_growable(8192);
+    var input = agnosai_tool_input_new();
+    agnosai_tool_input_set(input, str_from("b"), bayan_json_v_int_new(2));
+    agnosai_tool_input_set(input, str_from("a"), bayan_json_v_str_new(str_from("x")));
+    var before = alloc_used();
+    var v = agnosai_tool_input_to_value_a(ar, input);
+    assert_eq(alloc_used() - before, 0, "an input is written in the caller's allocator");
+    assert(str_eq_cstr(bayan_json_v_build(v), "{\"parameters\":{\"a\":\"x\",\"b\":2}}") == 1,
+      "its parameters, in key order");
+    assert_neq(agnosai_tool_input_to_value(input), 0, "the bare form");
+
+    # A schema comes back as it went.
+    var s = agnosai_tool_schema_new(str_from("t"), str_from("does a thing"));
+    agnosai_tool_schema_param(s, str_from("p"), str_from("a param"), str_from("string"), 1);
+    agnosai_tool_schema_param(s, str_from("q"), str_from("another"), str_from("number"), 0);
+    var parsed = agnosai_tool_schema_from_value_a(ar, agnosai_tool_schema_to_value(s));
+    assert_neq(parsed, 0, "a schema reads");
+    assert(str_eq(bayan_json_v_build(agnosai_tool_schema_to_value(parsed)),
+        bayan_json_v_build(agnosai_tool_schema_to_value(s))) == 1,
+      "and writes the same again");
+    assert_neq(agnosai_tool_schema_from_value(agnosai_tool_schema_to_value(s)), 0, "the bare form");
+    assert_eq(agnosai_tool_schema_from_value(_t_parse_cstr("{\"name\":\"t\",\"description\":\"d\"}")), 0,
+      "parameters are required");
+    assert_eq(agnosai_tool_schema_from_value(_t_parse_cstr("{\"name\":\"t\",\"parameters\":[]}")), 0,
+      "as a description is");
+    assert_eq(agnosai_tool_schema_from_value(_t_parse_cstr("{\"description\":\"d\",\"parameters\":[]}")), 0,
+      "and a name");
+    assert_eq(agnosai_tool_schema_from_value(_t_parse_cstr("{\"name\":3,\"description\":\"d\",\"parameters\":[]}")), 0,
+      "a name that is no string");
+    assert_eq(agnosai_tool_schema_from_value(_t_parse_cstr("{\"name\":\"t\",\"description\":\"d\",\"parameters\":{}}")),
+      0,
+      "parameters that are no list");
+    assert_eq(agnosai_tool_schema_from_value(_t_parse_cstr("{\"name\":\"t\",\"description\":\"d\",\"parameters\":[{\"name\":\"p\"}]}")), 0, "one bad parameter fails it all");  #skip-lint
+    assert_eq(agnosai_tool_schema_from_value(0), 0, "and nothing");
+
+    var param = "{\"name\":\"p\",\"description\":\"d\",\"param_type\":\"string\",\"required\":true}";
+    assert_neq(agnosai_param_schema_from_value_a(ar, _t_parse_cstr(param)), 0, "a parameter reads in an arena");
+    var pv = agnosai_param_schema_from_value(_t_parse_cstr(param));
+    assert(str_eq_cstr(agnosai_param_schema_type(pv), "string") == 1, "a parameter reads its type");
+    assert_eq(agnosai_param_schema_required(pv), 1, "and whether it is required");
+    assert_eq(agnosai_param_schema_from_value(_t_parse_cstr("{\"name\":\"p\",\"description\":\"d\",\"param_type\":\"string\",\"required\":1}")), 0, "required must be a bool");  #skip-lint
+
+    # An output, in each shape.
+    var ok = agnosai_tool_output_from_value_a(ar, _t_parse_cstr("{\"success\":true,\"result\":{\"n\":1}}"));
+    assert_eq(agnosai_tool_output_success(ok), 1, "a success reads");
+    assert_eq(agnosai_tool_output_error(ok), 0, "with no error");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(agnosai_tool_output_result(ok), "n")), 1, "and its result");
+    var bad = agnosai_tool_output_from_value(_t_parse_cstr("{\"success\":false,\"result\":null,\"error\":\"no\"}"));
+    assert_eq(agnosai_tool_output_success(bad), 0, "a failure reads");
+    assert(str_eq_cstr(agnosai_tool_output_error(bad), "no") == 1, "with its error");
+    assert_eq(agnosai_tool_output_error(agnosai_tool_output_from_value(_t_parse_cstr("{\"success\":true,\"result\":1,\"error\":null}"))), 0, "a null error is none");  #skip-lint
+    assert_eq(agnosai_tool_output_from_value(_t_parse_cstr("{\"result\":1}")), 0, "success is required");
+    assert_eq(agnosai_tool_output_from_value(_t_parse_cstr("{\"success\":true}")), 0, "as a result is");
+    assert_eq(agnosai_tool_output_from_value(_t_parse_cstr("{\"success\":1,\"result\":1}")), 0,
+      "success must be a bool");
+    assert_eq(agnosai_tool_output_from_value(_t_parse_cstr("{\"success\":true,\"result\":1,\"error\":3}")), 0,
+      "and an error text");
+    assert_eq(agnosai_tool_output_from_value(0), 0, "and nothing");
+    var round = agnosai_tool_output_err(str_from("broke"));
+    assert(str_eq_cstr(agnosai_tool_output_error(agnosai_tool_output_from_value(_t_parse_cstr(str_data(bayan_json_v_build(agnosai_tool_output_to_value(round)))))), "broke") == 1,  #skip-lint
+      "what an output writes reads back");
+    return 0;
+}
+
 fn main() {
     _t_release();
     _t_registry_concurrent_access();
@@ -548,6 +614,7 @@ fn main() {
     assert_eq(agnosai_tool_registry_get_allowed(reg, str_from("ghost"),
         _t_names(str_from("ghost"), 0)), 0, "a permitted but unregistered tool resolves to 0");
 
+    _t_v237_forms();
     return assert_summary();
 }
 

@@ -55,6 +55,8 @@
 # first, which is the same contract every other `fleet` module carries.
 # =========================================================================
 
+include "src/log_fields.cyr"
+
 # This cluster's role in the federation.
 enum AgnosaiFederationRole {
     AGNOSAI_FED_COORDINATOR = 0;
@@ -221,6 +223,39 @@ fn agnosai_cluster_info_node_count(c): i64 {
     return load64(c + AGN_CLI_NODE_COUNT);
 }
 
+# `FederationRole`'s JSON form: its variant name, as a C string.
+fn agnosai_federation_role_to_wire(role): i64 {
+    if (role == AGNOSAI_FED_COORDINATOR) { return "Coordinator"; }
+    if (role == AGNOSAI_FED_CANDIDATE) { return "Candidate"; }
+    return "Follower";
+}
+
+# `ClusterStatus`'s JSON form: its variant name, as a C string.
+fn agnosai_cluster_status_to_wire(status): i64 {
+    if (status == AGNOSAI_CLUSTER_ONLINE) { return "Online"; }
+    if (status == AGNOSAI_CLUSTER_SUSPECT) { return "Suspect"; }
+    return "Offline";
+}
+
+# A peer cluster as a JSON value, in allocator `a`. `last_heartbeat` is RFC 3339, and the monotonic
+# instant is left out.
+fn agnosai_cluster_info_to_value_a(a, c): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    _agnosai_obj_put_str_a(a, obj, "id", load64(c + AGN_CLI_ID));
+    _agnosai_obj_put_str_a(a, obj, "endpoint", load64(c + AGN_CLI_ENDPOINT));
+    _agnosai_obj_put_cstr_a(a, obj, "status", agnosai_cluster_status_to_wire(load64(c + AGN_CLI_STATUS)));
+    _agnosai_obj_put_cstr_a(a, obj, "role", agnosai_federation_role_to_wire(load64(c + AGN_CLI_ROLE)));
+    _agnosai_obj_put_int_a(a, obj, "node_count", load64(c + AGN_CLI_NODE_COUNT));
+    _agnosai_obj_put_str_a(a, obj, "last_heartbeat",
+      _agnosai_msg_fmt_rfc3339_a(a, load64(c + AGN_CLI_LAST_HEARTBEAT) * AGNOSAI_NS_PER_SEC));
+    return obj;
+}
+
+# Global-allocator form of `agnosai_cluster_info_to_value_a`.
+fn agnosai_cluster_info_to_value(c): i64 {
+    return agnosai_cluster_info_to_value_a(default_alloc(), c);
+}
+
 # Wall-clock seconds of the last heartbeat — the serialised field.
 fn agnosai_cluster_info_last_heartbeat(c): i64 {
     return load64(c + AGN_CLI_LAST_HEARTBEAT);
@@ -254,9 +289,20 @@ fn agnosai_cluster_info_set_last_heartbeat_instant(c, instant_ns): i64 {
 
 # --- FederationManager ---------------------------------------------------
 
+# One event naming a cluster, under `key`, with one count after it when `count_key` is not 0.
+fn _agnosai_fed_log(level, msg, msg_len, key, key_len, id: Str, count_key, count): i64 {
+    if (sakshi_get_level() < level) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start(&f, id);
+    if (count_key != 0) { n = agnosai_log_field_int(&f, n, count_key, count); }
+    sakshi_log_kv(level, msg, msg_len, key, key_len, &f, n);
+    return 0;
+}
+
 # A manager for `config`. Starts as a Follower at term 0 with no coordinator.
 fn agnosai_federation_manager_new(config): i64 {
-    sakshi_info("federation manager initialized", 30);
+    _agnosai_fed_log(SK_INFO, "federation manager initialized", 30, "cluster_id", 10,
+      load64(config + AGN_FCF_CLUSTER_ID), "seeds", vec_len(load64(config + AGN_FCF_SEEDS)));
     var fm = alloc(AGN_FDM_SIZE);
     store64(fm + AGN_FDM_CONFIG, config);
     store64(fm + AGN_FDM_ROLE, AGNOSAI_FED_FOLLOWER);
@@ -288,7 +334,7 @@ fn agnosai_federation_heartbeat(fm, cluster_id: Str, endpoint: Str, node_count):
     var m = load64(fm + AGN_FDM_CLUSTERS);
     var c = map_get(m, cluster_id);
     if (c == 0) {
-        sakshi_info("new cluster joined federation", 29);
+        _agnosai_fed_log(SK_INFO, "new cluster joined federation", 29, "cluster", 7, cluster_id, 0, 0);
         c = alloc(AGN_CLI_SIZE);
         store64(c + AGN_CLI_ID, cluster_id);
         store64(c + AGN_CLI_ROLE, AGNOSAI_FED_FOLLOWER);
@@ -299,7 +345,7 @@ fn agnosai_federation_heartbeat(fm, cluster_id: Str, endpoint: Str, node_count):
     store64(c + AGN_CLI_STATUS, AGNOSAI_CLUSTER_ONLINE);
     store64(c + AGN_CLI_LAST_HEARTBEAT, clock_epoch_secs());
     store64(c + AGN_CLI_LAST_HEARTBEAT_INSTANT, now);
-    sakshi_debug("heartbeat received", 18);
+    _agnosai_fed_log(SK_DEBUG, "heartbeat received", 18, "cluster", 7, cluster_id, "node_count", node_count);
     return 0;
 }
 
@@ -325,11 +371,11 @@ fn agnosai_federation_check_liveness(fm): i64 {
             var elapsed = now - load64(c + AGN_CLI_LAST_HEARTBEAT_INSTANT);
             var status = load64(c + AGN_CLI_STATUS);
             if (elapsed > off_ns && status != AGNOSAI_CLUSTER_OFFLINE) {
-                sakshi_warn("cluster marked offline", 22);
+                _agnosai_fed_log(SK_WARN, "cluster marked offline", 22, "cluster", 7, load64(c + AGN_CLI_ID), 0, 0);
                 store64(c + AGN_CLI_STATUS, AGNOSAI_CLUSTER_OFFLINE);
             } else {
                 if (elapsed > sus_ns && status == AGNOSAI_CLUSTER_ONLINE) {
-                    sakshi_warn("cluster marked suspect", 22);
+                    _agnosai_fed_log(SK_WARN, "cluster marked suspect", 22, "cluster", 7, load64(c + AGN_CLI_ID), 0, 0);
                     store64(c + AGN_CLI_STATUS, AGNOSAI_CLUSTER_SUSPECT);
                 }
             }
@@ -348,7 +394,8 @@ fn agnosai_federation_start_election(fm): i64 {
     store64(e + AGN_ELS_COORDINATOR, 0);
     store64(e + AGN_ELS_TERM_STARTED, clock_now_ns());
     store64(fm + AGN_FDM_ROLE, AGNOSAI_FED_CANDIDATE);
-    sakshi_info("starting election", 17);
+    _agnosai_fed_log(SK_INFO, "starting election", 17, "cluster", 7,
+      load64(load64(fm + AGN_FDM_CONFIG) + AGN_FCF_CLUSTER_ID), "term", load64(e + AGN_ELS_TERM));
     return load64(e + AGN_ELS_TERM);
 }
 
@@ -365,10 +412,15 @@ fn agnosai_federation_start_election(fm): i64 {
 fn agnosai_federation_declare_coordinator(fm, term, coordinator_id: Str): i64 {
     var e = load64(fm + AGN_FDM_ELECTION);
     if (term < load64(e + AGN_ELS_TERM)) {
-        sakshi_debug("ignoring stale coordinator declaration", 38);
+        if (sakshi_get_level() >= SK_DEBUG) {
+            var f[AGNOSAI_LOG_FIELDS_BYTES];
+            var n = agnosai_log_fields_start_int(&f, term);
+            n = agnosai_log_field_int(&f, n, "current_term", load64(e + AGN_ELS_TERM));
+            sakshi_log_kv(SK_DEBUG, "ignoring stale coordinator declaration", 38, "declared_term", 13, &f, n);
+        }
         return 0;
     }
-    sakshi_info("coordinator elected", 19);
+    _agnosai_fed_log(SK_INFO, "coordinator elected", 19, "coordinator", 11, coordinator_id, "term", term);
     store64(e + AGN_ELS_TERM, term);
     store64(e + AGN_ELS_COORDINATOR, coordinator_id);
 
@@ -515,7 +567,7 @@ fn agnosai_federation_evict_offline(fm, ttl_ms): i64 {
         }
     }
     for (var i = 0; i < vec_len(evicted); i = i + 1) {
-        sakshi_info("evicting offline cluster", 24);
+        _agnosai_fed_log(SK_INFO, "evicting offline cluster", 24, "cluster", 7, vec_get(evicted, i), 0, 0);
         map_delete(m, vec_get(evicted, i));
     }
     return evicted;

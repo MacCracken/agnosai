@@ -32,6 +32,40 @@ fn _t_cost(micro): i64 {
       AGNOSAI_NO_LIMIT);
 }
 
+fn _t_v237_from_value(): i64 {
+    test_group("a breach from JSON");
+    var ar = arena_allocator_growable(4096);
+    var b = agnosai_budget_exceeded_from_value_a(ar, _t_parse_cstr("{\"Tokens\":{\"used\":12,\"limit\":10}}"));
+    assert_neq(b, 0, "a token breach reads");
+    assert_eq(agnosai_budget_exceeded_kind(b), AGNOSAI_BUDGET_TOKENS, "as tokens");
+    assert_eq(agnosai_budget_exceeded_used(b), 12, "with what was used");
+    assert_eq(agnosai_budget_exceeded_limit(b), 10, "and the limit");
+    var c = agnosai_budget_exceeded_from_value(_t_parse_cstr("{\"Cost\":{\"used_units\":30000,\"limit_units\":20000}}"));  #skip-lint
+    assert_eq(agnosai_budget_exceeded_kind(c), AGNOSAI_BUDGET_COST, "a cost breach reads as cost");
+    assert_eq(agnosai_budget_exceeded_used(c), 30000, "in its own units");
+    assert_eq(agnosai_budget_exceeded_limit(c), 20000, "both");
+    assert_eq(agnosai_budget_exceeded_from_value(_t_parse_cstr("{\"Tokens\":{\"used_units\":1,\"limit_units\":1}}")), 0,
+      "a token breach needs token field names");
+    assert_eq(agnosai_budget_exceeded_from_value(_t_parse_cstr("{\"Cost\":{\"used\":1,\"limit\":1}}")), 0,
+      "a cost breach its own");
+    assert_eq(agnosai_budget_exceeded_from_value(_t_parse_cstr("{\"Tokens\":{\"used\":-1,\"limit\":1}}")), 0,
+      "a negative count is refused");
+    assert_eq(agnosai_budget_exceeded_from_value(_t_parse_cstr("{\"Tokens\":{\"used\":\"1\",\"limit\":1}}")), 0,
+      "a count that is no number");
+    assert_eq(agnosai_budget_exceeded_from_value(_t_parse_cstr("{\"Tokens\":3}")), 0, "a body that is no object");
+    assert_eq(agnosai_budget_exceeded_from_value(_t_parse_cstr("{\"Other\":{\"used\":1,\"limit\":1}}")), 0,
+      "a tag no variant has");
+    assert_eq(agnosai_budget_exceeded_from_value(_t_parse_cstr("{\"Tokens\":{\"used\":1,\"limit\":1},\"Cost\":{\"used_units\":1,\"limit_units\":1}}")), 0, "two tags");  #skip-lint
+    assert_eq(agnosai_budget_exceeded_from_value(0), 0, "and nothing");
+
+    var t = agnosai_budget_tracker_new(_t_tokens(5));
+    agnosai_budget_tracker_record_tokens(t, 9);
+    var round = agnosai_budget_exceeded_from_value(agnosai_budget_exceeded_to_value(t, AGNOSAI_BUDGET_TOKENS));
+    assert_eq(agnosai_budget_exceeded_used(round), 9, "what the tracker writes reads back");
+    assert_eq(agnosai_budget_exceeded_limit(round), 5, "whole");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -190,6 +224,7 @@ fn main() {
     assert_eq(agnosai_budget_tracker_max_cost_units(none), AGNOSAI_NO_LIMIT,
       "as does the cost limit");
 
+    _t_v237_from_value();
     return assert_summary();
 }
 

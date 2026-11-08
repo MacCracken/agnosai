@@ -26,6 +26,7 @@ include "src/id.cyr"
 include "src/core/mod.cyr"
 include "src/fleet/discovery.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 
 # A vec of the three nodes the oracle's static test uses.
 fn _t_three_nodes(): i64 {
@@ -42,6 +43,20 @@ fn _t_custom_discover(ctx): i64 {
     var v = vec_new();
     vec_push(v, agnosai_discovered_node_new(str_from("custom"), ctx));
     return v;
+}
+
+fn _t_v237_events(): i64 {
+    test_group("the events");
+    _tl_start(SK_DEBUG);
+    var nodes = vec_new();
+    vec_push(nodes, agnosai_discovered_node_new(str_from("a"), 1));
+    vec_push(nodes, agnosai_discovered_node_new(str_from("b"), 2));
+    agnosai_discovery_discover(agnosai_static_discovery_new(nodes));
+    _tl_saw("static discovery returning fixed node list count=2", "the static list says how long it is");
+    agnosai_discovery_discover(agnosai_dns_discovery_new(str_from("_a._tcp.example.com")));
+    _tl_saw("available srv_name=_a._tcp.example.com", "the stub names what it was asked for");
+    _tl_stop();
+    return 0;
 }
 
 fn main(): i64 {
@@ -146,6 +161,7 @@ fn main(): i64 {
     assert_eq(agnosai_discovered_node_port(vec_get(cfound, 0)), 7777,
       "and its ctx reached the implementation");
 
+    _t_v237_events();
     return assert_summary();
 }
 

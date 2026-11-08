@@ -28,6 +28,8 @@
 #     oracle's `checked_shl` / `saturating_mul` guards have no work to do.
 # =========================================================================
 
+include "src/core/json.cyr"
+
 # RetryConfig heap layout — 32 bytes.
 enum AgnosaiRetryConfigOff {
     AGN_RETRY_MAX_RETRIES = 0;
@@ -83,6 +85,29 @@ fn agnosai_retry_config_max_delay_ns(c): i64 {
 # Whether random jitter is added to delays.
 fn agnosai_retry_config_jitter(c): i64 {
     return load64(c + AGN_RETRY_JITTER);
+}
+
+# A `Duration` as serde writes one: `{"secs":N,"nanos":N}`.
+fn _agnosai_duration_to_value_a(a, ns): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    _agnosai_obj_put_int_a(a, obj, "secs", ns / AGNOSAI_NS_PER_SEC);
+    _agnosai_obj_put_int_a(a, obj, "nanos", ns % AGNOSAI_NS_PER_SEC);
+    return obj;
+}
+
+# A retry config as a JSON value, in allocator `a`.
+fn agnosai_retry_config_to_value_a(a, c): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    _agnosai_obj_put_int_a(a, obj, "max_retries", load64(c + AGN_RETRY_MAX_RETRIES));
+    _agnosai_obj_put_a(a, obj, "base_delay", _agnosai_duration_to_value_a(a, load64(c + AGN_RETRY_BASE_DELAY_NS)));
+    _agnosai_obj_put_a(a, obj, "max_delay", _agnosai_duration_to_value_a(a, load64(c + AGN_RETRY_MAX_DELAY_NS)));
+    _agnosai_obj_put_a(a, obj, "jitter", _agnosai_bool_to_value_a(a, load64(c + AGN_RETRY_JITTER)));
+    return obj;
+}
+
+# Global-allocator form of `agnosai_retry_config_to_value_a`.
+fn agnosai_retry_config_to_value(c): i64 {
+    return agnosai_retry_config_to_value_a(default_alloc(), c);
 }
 
 # Compute the delay for a retry attempt, in nanoseconds.

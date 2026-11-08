@@ -46,6 +46,32 @@ fn _t_count_status(v, st): i64 {
     return c;
 }
 
+fn _t_v237_form(): i64 {
+    test_group("the JSON form");
+    var n = agnosai_node_info_new(str_from("n1"), 2, 16000);
+    store64(n + AGN_NI_LAST_HEARTBEAT, 1785276000);
+    var caps = vec_new();
+    vec_push(caps, str_from("gpu"));
+    agnosai_node_info_with_capabilities(n, caps);
+    agnosai_node_info_with_status(n, AGNOSAI_NODE_DRAINING);
+    var ar = arena_allocator_growable(4096);
+    var before = alloc_used();
+    var v = agnosai_node_info_to_value_a(ar, n);
+    assert_eq(alloc_used() - before, 0, "the form is built in the caller's allocator");
+    var hw = bayan_json_v_build(bayan_json_v_obj_get_by_cstr(v, "hardware"));
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":\"n1\",\"hostname\":\"n1\",\"address\":\"\",\"status\":\"Draining\",\"gpu_count\":2,\"gpu_vram_mb\":16000,\"capabilities\":[\"gpu\"],\"hardware\":");  #skip-lint
+    str_builder_add(sb, hw);
+    str_builder_add_cstr(sb, ",\"last_heartbeat\":\"2026-07-28T22:00:00Z\"}");
+    assert(str_eq(bayan_json_v_build(v), str_builder_build(sb)) == 1,
+      "a node reads as the Rust line wrote it, in its order");
+    assert(str_eq_cstr(str_from(agnosai_node_status_to_wire(AGNOSAI_NODE_ONLINE)), "Online") == 1, "Online");
+    assert(str_eq_cstr(str_from(agnosai_node_status_to_wire(AGNOSAI_NODE_SUSPECT)), "Suspect") == 1, "Suspect");
+    assert(str_eq_cstr(str_from(agnosai_node_status_to_wire(AGNOSAI_NODE_OFFLINE)), "Offline") == 1, "Offline");
+    assert_neq(agnosai_node_info_to_value(n), 0, "the bare form");
+    return 0;
+}
+
 fn main(): i64 {
     # --- oracle: register_and_retrieve ----------------------------------
     var reg = agnosai_node_registry_new();
@@ -305,6 +331,7 @@ fn main(): i64 {
     assert(str_eq(agnosai_node_info_id(vec_get(agnosai_node_registry_list_online(r12), 0)), t1) == 1,
       "and it is the one that heartbeated");
 
+    _t_v237_form();
     return assert_summary();
 }
 

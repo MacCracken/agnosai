@@ -1,0 +1,88 @@
+# =========================================================================
+# log_fields.tcyr — src/log_fields.cyr: several fields on one event, with no allocation.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/log_fields.cyr"
+include "tests/test_helpers.cyr"
+
+# The `n` bytes at `buf` as a string, for comparing.
+fn _t_is(buf, n, want, name): i64 {
+    return assert(str_eq_cstr(str_new(buf, n), want) == 1, name);
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_group("log_fields");
+    var f[256];
+    memset(&f, 35, 256);
+
+    var n = agnosai_log_fields_start(&f, str_from("east"));
+    n = agnosai_log_field_int(&f, n, "term", 7);
+    n = agnosai_log_field_str(&f, n, "peer", str_from("west"));
+    n = agnosai_log_field_bool(&f, n, "ok", 1);
+    n = agnosai_log_field_bool(&f, n, "gone", 0);
+    n = agnosai_log_field_cstr(&f, n, "topic", "fleet");
+    _t_is(&f, n, "east term=7 peer=west ok=true gone=false topic=fleet", "fields follow the first value, in order");
+    assert_eq(load8(&f + n), 35, "and nothing is written past them");
+
+    _t_is(&f, agnosai_log_fields_start(&f, 0), "", "no first value is an empty start");
+    _t_is(&f, agnosai_log_field_str(&f, 0, "k", 0), " k=none", "a missing string reads as none");
+
+    _t_is(&f, agnosai_log_fields_start_int(&f, 0), "0", "zero");
+    _t_is(&f, agnosai_log_fields_start_int(&f, 0 - 42), "-42", "a negative");
+    _t_is(&f, agnosai_log_fields_start_int(&f, 1234567890123), "1234567890123", "a large one");
+    _t_is(&f, agnosai_log_fields_start_int(&f, 0 - 9223372036854775807 - 1), "-9223372036854775808",
+      "and the smallest there is, which has no positive");
+
+    _t_is(&f, agnosai_log_field_f64(&f, 0, "x", f64_div(f64_from(3), f64_from(2))), " x=1.5000", "an f64");
+    _t_is(&f, agnosai_log_field_f64(&f, 0, "x", f64_div(f64_from(0 - 1), f64_from(4))), " x=-0.2500", "a negative f64");
+    _t_is(&f, agnosai_log_field_f64(&f, 0, "x", f64_from(0)), " x=0.0000", "zero");
+    _t_is(&f, agnosai_log_field_f64(&f, 0, "x", f64_div(f64_from(1), f64_from(3))), " x=0.3333", "rounded");
+    _t_is(&f, agnosai_log_field_f64(&f, 0, "x", f64_from(12000)), " x=12000.0000", "and whole digits stay");
+
+    # What came from a request cannot start a new line of log.
+    n = agnosai_log_fields_start(&f, str_from("a\nb\rc\td\x7fe"));
+    _t_is(&f, n, "a?b?c?d?e", "control bytes read as ?");
+    n = agnosai_log_field_str(&f, 0, "k", str_from("v\nx"));
+    _t_is(&f, n, " k=v?x", "in a field as well");
+
+    # A long value is cut at the room there is, and nothing past it is written.
+    var long = str_builder_new();
+    for (var i = 0; i < 400; i = i + 1) { str_builder_add_cstr(long, "x"); }
+    memset(&f, 35, 256);
+    n = agnosai_log_fields_start(&f, str_builder_build(long));
+    assert_eq(n, AGNOSAI_LOG_FIELDS_BYTES, "a value longer than the buffer stops at it");
+    assert_eq(load8(&f + AGNOSAI_LOG_FIELDS_BYTES), 35, "and not a byte past");
+
+    # With no room left, a field is left out whole.
+    n = agnosai_log_field_int(&f, n, "term", 7);
+    assert_eq(n, AGNOSAI_LOG_FIELDS_BYTES, "a number that does not fit is not written at all");
+    n = agnosai_log_field_bool(&f, n, "ok", 1);
+    n = agnosai_log_field_str(&f, n, "s", str_from("v"));
+    n = agnosai_log_field_f64(&f, n, "x", f64_from(1));
+    n = agnosai_log_field_cstr(&f, n, "c", "v");
+    assert_eq(n, AGNOSAI_LOG_FIELDS_BYTES, "nor any other kind");
+    assert_eq(load8(&f + AGNOSAI_LOG_FIELDS_BYTES), 35, "still nothing past the end");
+
+    # One byte short of a number's room: half of it would read as a smaller number.
+    memset(&f, 35, 256);
+    n = AGNOSAI_LOG_FIELDS_BYTES - 6;
+    assert_eq(agnosai_log_field_int(&f, n, "a", 1234), n, "a number one byte too long is left out");
+    assert_eq(agnosai_log_field_int(&f, n, "a", 123), AGNOSAI_LOG_FIELDS_BYTES, "and one that fits exactly is whole");
+
+    var s = str_from("east");
+    var before = alloc_used();
+    n = agnosai_log_fields_start(&f, s);
+    n = agnosai_log_field_int(&f, n, "a", 1);
+    n = agnosai_log_field_bool(&f, n, "b", 1);
+    n = agnosai_log_field_f64(&f, n, "c", f64_from(1));
+    n = agnosai_log_field_str(&f, n, "d", s);
+    assert_eq(alloc_used() - before, 0, "a line costs nothing on the heap");
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

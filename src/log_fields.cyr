@@ -1,0 +1,156 @@
+# =========================================================================
+# log_fields — several fields on one log event, with no allocation.
+#
+# Port-local. `sakshi_log_kv` carries one key and one value, where the Rust line's `tracing` events
+# carried several, so the first field takes the key and the rest follow in its value as
+# ` key=value`. `{"cluster":"east node_count=3"}` keeps the id first, which is what a long value
+# would otherwise truncate. Each module had its own builder for this on the global heap; these write
+# into the caller's stack buffer, so a line costs nothing beyond its formatting.
+#
+#     var f[AGNOSAI_LOG_FIELDS_BYTES];
+#     var n = agnosai_log_fields_start(&f, cluster);
+#     n = agnosai_log_field_int(&f, n, "node_count", count);
+#     sakshi_log_kv(SK_DEBUG, "heartbeat received", 18, "cluster", 7, &f, n);
+#
+# Guard the block on `sakshi_get_level()`, so an unselected level pays for none of it.
+#
+# A field that does not fit is left out whole, so a line never ends in half a number. A value is cut
+# only when it alone is longer than the room left. **Control bytes read as `?`**: much of what is
+# logged came from a request, and a newline in a task id must not be able to forge a line of log.
+# =========================================================================
+
+# Bytes of fields one event carries, inside the 256 sakshi composes an event into. A caller's buffer
+# is `var f[AGNOSAI_LOG_FIELDS_BYTES];`.
+const AGNOSAI_LOG_FIELDS_BYTES = 192;
+
+# Copy `len` bytes of `src` to `buf + n`, as far as there is room. Returns the new length.
+fn _agnosai_log_put(buf, n, src, len): i64 {
+    var i = 0;
+    while (i < len && n < AGNOSAI_LOG_FIELDS_BYTES) {
+        var c = load8(src + i);
+        if (c < 32 || c == 127) { c = 63; }
+        store8(buf + n, c);
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+# Decimal digits of `val`, sign included, written to `out` (at least 21 bytes). Returns how many.
+fn _agnosai_log_digits(out, val): i64 {
+    var tmp[24];
+    var count = 0;
+    var neg = 0;
+    if (val < 0) { neg = 1; }
+    var left = val;
+    while (count == 0 || left != 0) {
+        var d = left % 10;
+        if (d < 0) { d = 0 - d; }
+        store8(&tmp + count, 48 + d);
+        count = count + 1;
+        left = left / 10;
+    }
+    var w = 0;
+    if (neg == 1) {
+        store8(out, 45);
+        w = 1;
+    }
+    while (count > 0) {
+        count = count - 1;
+        store8(out + w, load8(&tmp + count));
+        w = w + 1;
+    }
+    return w;
+}
+
+# Begin a value with `first`, the value of the event's key. Returns its length.
+fn agnosai_log_fields_start(buf, first: Str): i64 {
+    if (first == 0) { return 0; }
+    return _agnosai_log_put(buf, 0, str_data(first), str_len(first));
+}
+
+# Begin a value with an integer.
+fn agnosai_log_fields_start_int(buf, first): i64 {
+    return _agnosai_log_digits(buf, first);
+}
+
+# Append ` key=` when the whole field can fit in `want` more bytes, else say it cannot. Returns the new
+# length, or -1.
+fn _agnosai_log_key(buf, n, key, want): i64 {
+    var klen = strlen(key);
+    if (n + 2 + klen + want > AGNOSAI_LOG_FIELDS_BYTES) { return 0 - 1; }
+    store8(buf + n, 32);
+    n = _agnosai_log_put(buf, n + 1, key, klen);
+    store8(buf + n, 61);
+    return n + 1;
+}
+
+# Append ` key=value` for a string. A string longer than the room left is cut, as it is still the
+# field, and 0 reads as `none`.
+fn agnosai_log_field_str(buf, n, key, val: Str): i64 {
+    var data = "none";
+    var len = 4;
+    if (val != 0) {
+        data = str_data(val);
+        len = str_len(val);
+    }
+    var at = _agnosai_log_key(buf, n, key, 1);
+    if (at < 0) { return n; }
+    return _agnosai_log_put(buf, at, data, len);
+}
+
+# Append ` key=value` for a C string.
+fn agnosai_log_field_cstr(buf, n, key, cstr): i64 {
+    var at = _agnosai_log_key(buf, n, key, 1);
+    if (at < 0) { return n; }
+    return _agnosai_log_put(buf, at, cstr, strlen(cstr));
+}
+
+# Append ` key=value` for an integer.
+fn agnosai_log_field_int(buf, n, key, val): i64 {
+    var num[24];
+    var len = _agnosai_log_digits(&num, val);
+    var at = _agnosai_log_key(buf, n, key, len);
+    if (at < 0) { return n; }
+    return _agnosai_log_put(buf, at, &num, len);
+}
+
+# Append ` key=true` or ` key=false`.
+fn agnosai_log_field_bool(buf, n, key, flag): i64 {
+    var text = "false";
+    var len = 5;
+    if (flag != 0) {
+        text = "true";
+        len = 4;
+    }
+    var at = _agnosai_log_key(buf, n, key, len);
+    if (at < 0) { return n; }
+    return _agnosai_log_put(buf, at, text, len);
+}
+
+# Append ` key=value` for an f64 bit pattern, to four decimal places.
+fn agnosai_log_field_f64(buf, n, key, bits): i64 {
+    var scaled = f64_to(f64_round(f64_mul(bits, f64_from(10000))));
+    var neg = 0;
+    if (scaled < 0) {
+        neg = 1;
+        scaled = 0 - scaled;
+    }
+    var num[32];
+    var w = 0;
+    if (neg == 1) {
+        store8(&num, 45);
+        w = 1;
+    }
+    w = w + _agnosai_log_digits(&num + w, scaled / 10000);
+    store8(&num + w, 46);
+    var frac = scaled % 10000;
+    store8(&num + w + 1, 48 + frac / 1000);
+    store8(&num + w + 2, 48 + (frac / 100) % 10);
+    store8(&num + w + 3, 48 + (frac / 10) % 10);
+    store8(&num + w + 4, 48 + frac % 10);
+    w = w + 5;
+    var at = _agnosai_log_key(buf, n, key, w);
+    if (at < 0) { return n; }
+    return _agnosai_log_put(buf, at, &num, w);
+}

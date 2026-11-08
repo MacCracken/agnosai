@@ -52,6 +52,7 @@ include "src/definitions/presets_data.cyr"
 include "src/definitions/loader.cyr"
 include "src/sandbox/mod.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 include "tests/test_tmp.cyr"
 
 var _T_ROOT = _tt_tmp_path("sandbox-wasm", "");
@@ -603,6 +604,39 @@ fn _t_free_during_run_suite(): i64 {
     return 0;
 }
 
+fn _t_v237_events(): i64 {
+    test_group("the events");
+    _tl_start(SK_DEBUG);
+    var s = agnosai_wasm_sandbox_with_limits(67108864, 300);
+    _tl_saw("WASM sandbox created max_memory_mb=64 timeout_ms=300", "a sandbox says its limits");
+    var err: i64[1];
+    store64(&err, 0);
+    agnosai_wasm_load_module(s, "x", 1, &err);
+    _tl_saw("loading WASM module from bytes bytes=1", "a load from bytes says how many");
+    store64(&err, 0);
+    agnosai_wasm_load_module_from_file(s, str_from("/nonexistent/m.wasm"), &err);
+    _tl_saw("loading WASM module from file path=/nonexistent/m.wasm", "and from a file says which");
+    if (agnosai_wasm_available() == 1) {
+        store64(&err, 0);
+        sys_mkdir(_T_ROOT, 0x1FF);
+        var path = _t_join(str_from(_T_ROOT), str_from("/log-nop.wasm"));
+        _t_write_nop_module(path);
+        var nop = agnosai_wasm_load_module_from_file(s, path, &err);
+        assert_neq(nop, 0, "a module to run");
+        agnosai_wasm_execute(s, nop, str_from("abc"), &err);
+        _tl_saw("executing WASM module input_len=3", "a run says what it was given");
+        _tl_saw("WASM execution complete exit_code=0 stdout_len=0", "and how it ended");
+        _tl_never("interrupted by its deadline", "with no deadline to report");
+        agnosai_wasm_sandbox_set_fuel(s, _T_FUEL_PAST_ANY_DEADLINE);
+        var spin = _t_spin(s, &err);
+        agnosai_wasm_execute(s, spin, str_from(""), &err);
+        _tl_saw("WASM execution interrupted by its deadline", "a guest stopped at its deadline is a warning");
+        _tl_saw("WASM execution complete exit_code=-1", "with the deadline's exit code");
+    }
+    _tl_stop();
+    return 0;
+}
+
 fn main(): i64 {
     var err = 0;
     store64(&err, 0);
@@ -902,6 +936,7 @@ fn main(): i64 {
     # 2.3.5: every scratch path this suite made goes, so two runs at once share none and a run
     # leaves nothing behind (`tests/test_tmp.cyr`).
     _tt_cleanup();
+    _t_v237_events();
     return assert_summary();
 }
 

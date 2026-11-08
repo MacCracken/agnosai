@@ -85,6 +85,7 @@
 # The shared whole-file reader (2.1.7, roadmap B19); include-once, so this costs nothing
 # where `src/main.cyr` already has it.
 include "src/read_file.cyr"
+include "src/log_fields.cyr"
 
 # The oracle's four constants, unchanged.
 var AGNOSAI_WASM_DEFAULT_MAX_MEMORY_BYTES = 67108864;
@@ -157,6 +158,28 @@ fn agnosai_wasm_sandbox_new(): i64 {
       AGNOSAI_WASM_DEFAULT_TIMEOUT_MS);
 }
 
+# One WASM event with one number.
+fn _agnosai_wasm_log_int(level, msg, msg_len, key, key_len, val): i64 {
+    if (sakshi_get_level() < level) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start_int(&f, val);
+    sakshi_log_kv(level, msg, msg_len, key, key_len, &f, n);
+    return 0;
+}
+
+# How a run ended: a guest stopped at its deadline is a warning, and any other end a debug line.
+fn _agnosai_wasm_log_done(exit_code, stdout_len): i64 {
+    if (exit_code == AGNOSAI_WASM_EXIT_TIMEOUT) {
+        sakshi_warn("WASM execution interrupted by its deadline", 42);
+    }
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start_int(&f, exit_code);
+    n = agnosai_log_field_int(&f, n, "stdout_len", stdout_len);
+    sakshi_log_kv(SK_DEBUG, "WASM execution complete", 23, "exit_code", 9, &f, n);
+    return 0;
+}
+
 # A sandbox with explicit memory and wall-clock limits.
 #
 # ⚠ The fuel budget is NOT a parameter, matching the oracle: `with_limits` takes
@@ -168,6 +191,12 @@ fn agnosai_wasm_sandbox_with_limits(max_memory_bytes, timeout_ms): i64 {
     store64(s + AGN_WS_MAX_MEMORY_BYTES, max_memory_bytes);
     store64(s + AGN_WS_TIMEOUT_MS, timeout_ms);
     store64(s + AGN_WS_FUEL, AGNOSAI_WASM_DEFAULT_FUEL);
+    if (sakshi_get_level() >= SK_INFO) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start_int(&f, max_memory_bytes / 1048576);
+        n = agnosai_log_field_int(&f, n, "timeout_ms", timeout_ms);
+        sakshi_log_kv(SK_INFO, "WASM sandbox created", 20, "max_memory_mb", 13, &f, n);
+    }
     return s;
 }
 
@@ -443,6 +472,7 @@ fn _agnosai_wasm_engine_reason(err: Str): Str {
 # asserts `msg.contains("expected")` — it is checking that the caller is told
 # the bytes are not WASM rather than merely that something went wrong.
 fn agnosai_wasm_load_module(s, buf, len, out_err): i64 {
+    _agnosai_wasm_log_int(SK_DEBUG, "loading WASM module from bytes", 30, "bytes", 5, len);
     if (_agnosai_wasm_header_ok(buf, len) == 0) {
         store64(out_err, agnosai_error_sandbox(str_from(
               "invalid WASM module: expected magic bytes \\0asm and version 1")));
@@ -484,6 +514,11 @@ fn agnosai_wasm_load_module(s, buf, len, out_err): i64 {
 # lies. The header is validated the same way, and a caller cannot make the
 # sandbox execute an arbitrary path it did not first prove was a WASM module.
 fn agnosai_wasm_load_module_from_file(s, path: Str, out_err): i64 {
+    if (sakshi_get_level() >= SK_DEBUG) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start(&f, path);
+        sakshi_log_kv(SK_DEBUG, "loading WASM module from file", 29, "path", 4, &f, n);
+    }
     # The shared reader, `src/read_file.cyr` (2.1.7, roadmap B19) — until then this reached
     # into `definitions/loader`'s private one.
     var content = _agnosai_read_file(path, out_err);
@@ -636,6 +671,9 @@ fn agnosai_wasm_result_exit_code(r): i64 {
 # create/RUNNING/exec/STOPPED/DESTROYED sequence — CLAUDE.md says extract at the
 # third.
 fn agnosai_wasm_execute(s, module, input: Str, out_err): i64 {
+    var input_len = 0;
+    if (input != 0) { input_len = str_len(input); }
+    _agnosai_wasm_log_int(SK_DEBUG, "executing WASM module", 21, "input_len", 9, input_len);
     # ⚠ **Without this, every call fails with "backend not available: wasm"** —
     # kavach's dispatch table is populated by `kavach_init`, and this function
     # reaches `sandbox_create`/`sandbox_exec` DIRECTLY rather than through
@@ -757,7 +795,8 @@ fn agnosai_wasm_execute(s, module, input: Str, out_err): i64 {
         return 0;
     }
 
-    return agnosai_wasm_result_new(str_from(ExecResult_stdout(result)),
-      agnosai_wasm_classify_exit(ExecResult_exit_code(result),
-        ExecResult_timed_out(result), stderr));
+    var stdout = str_from(ExecResult_stdout(result));
+    var exit_code = agnosai_wasm_classify_exit(ExecResult_exit_code(result), ExecResult_timed_out(result), stderr);
+    _agnosai_wasm_log_done(exit_code, str_len(stdout));
+    return agnosai_wasm_result_new(stdout, exit_code);
 }

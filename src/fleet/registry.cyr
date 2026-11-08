@@ -116,6 +116,36 @@ fn agnosai_node_info_with_status(n, status): i64 {
     return n;
 }
 
+# `NodeStatus`'s JSON form: its variant name, as a C string.
+fn agnosai_node_status_to_wire(status): i64 {
+    if (status == AGNOSAI_NODE_ONLINE) { return "Online"; }
+    if (status == AGNOSAI_NODE_SUSPECT) { return "Suspect"; }
+    if (status == AGNOSAI_NODE_DRAINING) { return "Draining"; }
+    return "Offline";
+}
+
+# A node as a JSON value, in allocator `a`. `last_heartbeat` is RFC 3339, and the two monotonic
+# instants are left out, as they mean nothing in another process.
+fn agnosai_node_info_to_value_a(a, n): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    _agnosai_obj_put_str_a(a, obj, "id", load64(n + AGN_NI_ID));
+    _agnosai_obj_put_str_a(a, obj, "hostname", load64(n + AGN_NI_HOSTNAME));
+    _agnosai_obj_put_str_a(a, obj, "address", load64(n + AGN_NI_ADDRESS));
+    _agnosai_obj_put_cstr_a(a, obj, "status", agnosai_node_status_to_wire(load64(n + AGN_NI_STATUS)));
+    _agnosai_obj_put_int_a(a, obj, "gpu_count", load64(n + AGN_NI_GPU_COUNT));
+    _agnosai_obj_put_int_a(a, obj, "gpu_vram_mb", load64(n + AGN_NI_GPU_VRAM_MB));
+    _agnosai_obj_put_a(a, obj, "capabilities", _agnosai_str_vec_to_value_a(a, load64(n + AGN_NI_CAPABILITIES)));
+    _agnosai_obj_put_a(a, obj, "hardware", agnosai_hw_inventory_to_value_a(a, load64(n + AGN_NI_HARDWARE)));
+    _agnosai_obj_put_str_a(a, obj, "last_heartbeat",
+      _agnosai_msg_fmt_rfc3339_a(a, load64(n + AGN_NI_LAST_HEARTBEAT) * AGNOSAI_NS_PER_SEC));
+    return obj;
+}
+
+# Global-allocator form of `agnosai_node_info_to_value_a`.
+fn agnosai_node_info_to_value(n): i64 {
+    return agnosai_node_info_to_value_a(default_alloc(), n);
+}
+
 # The node's id.
 fn agnosai_node_info_id(n): i64 {
     return load64(n + AGN_NI_ID);

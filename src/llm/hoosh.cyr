@@ -102,7 +102,9 @@ enum AgnosaiInferenceRespOff {
     AGN_RESP_CACHE = 56;
     # The vec of tool calls the model asked for, or 0 for a final answer (ADR 029).
     AGN_RESP_TOOL_CALLS = 64;
-    AGN_RESP_SIZE = 72;
+    # How long the model call took, in milliseconds, as this process measured it.
+    AGN_RESP_LATENCY_MS = 72;
+    AGN_RESP_SIZE = 80;
 }
 
 # The default gateway base URL — a local `hoosh serve 8088`.
@@ -516,6 +518,7 @@ fn agnosai_inference_response_new_a(a, content: Str, model: Str): i64 {
     store64(r + AGN_RESP_PROVIDER, 0);
     store64(r + AGN_RESP_CACHE, AGNOSAI_HOOSH_CACHE_UNKNOWN);
     store64(r + AGN_RESP_TOOL_CALLS, 0);
+    store64(r + AGN_RESP_LATENCY_MS, 0);
     return r;
 }
 
@@ -526,6 +529,7 @@ fn agnosai_inference_response_clone_a(a, r): i64 {
       str_clone_a(a, load64(r + AGN_RESP_MODEL)));
     store64(c + AGN_RESP_PROMPT_TOKENS, load64(r + AGN_RESP_PROMPT_TOKENS));
     store64(c + AGN_RESP_COMPLETION_TOKENS, load64(r + AGN_RESP_COMPLETION_TOKENS));
+    store64(c + AGN_RESP_LATENCY_MS, load64(r + AGN_RESP_LATENCY_MS));
     store64(c + AGN_RESP_COST_MICRO_USD, load64(r + AGN_RESP_COST_MICRO_USD));
     store64(c + AGN_RESP_CACHE, load64(r + AGN_RESP_CACHE));
     var fin = load64(r + AGN_RESP_FINISH_REASON);
@@ -717,6 +721,17 @@ fn agnosai_inference_response_cost_micro_usd(r): i64 {
 # price it as remote.
 fn agnosai_inference_response_provider(r): i64 {
     return load64(r + AGN_RESP_PROVIDER);
+}
+
+# How long the model call took, in milliseconds, or 0 for a response this process did not time.
+fn agnosai_inference_response_latency_ms(r): i64 {
+    return load64(r + AGN_RESP_LATENCY_MS);
+}
+
+# Say how long the model call took. Returns the response.
+fn agnosai_inference_response_with_latency_ms(r, ms): i64 {
+    store64(r + AGN_RESP_LATENCY_MS, ms);
+    return r;
 }
 
 # Say which provider served the response, for one the gateway did not name. Returns `r`.
@@ -1287,6 +1302,7 @@ fn _agnosai_hoosh_log_transport_a(a, url, kind): i64 {
 # of it, and a request on the global heap keeps what it always had.
 fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
   _span, _self, parent_sc, _t0): i64 {
+    var began_ns = clock_now_ns();
     var ra = agnosai_inference_request_alloc(request);
     var url = _agnosai_hoosh_endpoint_cstr_a(a, base_url);
     var headers = _agnosai_hoosh_headers_a(a, api_key);
@@ -1360,6 +1376,7 @@ fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
       agnosai_inference_response_model(parsed));
     _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 1, 0);
 
+    store64(parsed + AGN_RESP_LATENCY_MS, (clock_now_ns() - began_ns) / AGNOSAI_NS_PER_MS);
     store64(out_response, parsed);
     return 0;
 }

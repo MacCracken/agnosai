@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.3.7** | The Rust line's JSON forms and structured-log fields |
 | **2.3.8** | A tool's policy can deny it the network, and one trace from a crew to the provider |
 | **2.4.0** | The crew lifecycle as one state machine, with the approval gate wired |
 | **2.4.1** | Budgets, caps and crew concurrency enforced |
@@ -74,19 +73,8 @@ tools with kavach's primitives in agnosai's own spawner, and hardened the OCI ti
 ([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)), 2.3.5 validated a WASM module at
 load, freed it with its tool, and took the spawner's idle sleep out (ADR 019's 2.3.5 addendum), and 2.3.6 gave each
 simulated user of a load test one connection, took a tool's capabilities away under a root server, moved the URL check
-off the global heap, and put the tool list and a task's keys in order.
-
-#### 2.3.7 — the Rust line's JSON forms and structured-log fields
-
-**JSON forms the Rust types derived and nothing serialised.** Writers: the fleet types (`NodeInfo`, `NodeStatus`,
-`NodeTopology`, `DeviceLink`, `InterconnectType`, `FederationRole`, `ClusterStatus`, `ClusterInfo`, `RelayMessage`),
-`RetryConfig`, `ToolInput`, the manifests, `KavachToolResult`. Parsers: `TaskProfile`, `BudgetExceeded`, `CachedPlan`,
-`ToolSchema`, `ToolOutput`.
-
-**Structured-log fields that were lost or never written.** Fleet (17 events, federation's nine above all; it logs
-through plain `sakshi_info`), the WASM sandbox and tool (no sakshi calls at all), the wasm loader's and remote
-registry's error details, the kavach bridge, process and OCI exit lines, the MCP tool-call line's `success` and
-`duration_ms`, a2a rejections' id prefix and `metadata_bytes`, `latency_ms` in task-result metadata.
+off the global heap, and put the tool list and a task's keys in order, and 2.3.7 gave the Rust line's types their JSON
+forms and its log events their fields.
 
 #### 2.3.8 — a tool's policy can deny it the network, and one trace from a crew to the provider
 
@@ -291,7 +279,7 @@ request to raise only if a definition file needs one, and it is not owed.
 ### Deleting `rust-old/` — the release after `personality`
 
 **The Rust port is not done while bhava is missing** (*Settled decisions*), so this has no number until bhava lands.
-Everything else the Rust line had is pinned above: JSON forms and log fields at 2.3.7, `StateStore` at 2.5.0, the
+Everything else the Rust line had is pinned above: `StateStore` at 2.5.0, the
 certificate JWT key at 2.6.1 and the spans at 2.6.2. Every Rust spec stays reachable after:
 `git show 2.1.0:rust-old/src/<path>`.
 

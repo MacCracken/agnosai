@@ -95,6 +95,17 @@ fn agnosai_complexity_to_wire(complexity): i64 {
     return str_from("medium");
 }
 
+# A complexity from its wire spelling, or -1 for one that is not.
+#
+# Stricter than `agnosai_parse_complexity`, which is for a task's free-form hint. This is a value the
+# type itself wrote, so an unknown spelling is a malformed value.
+fn agnosai_complexity_from_wire(s: Str): i64 {
+    if (str_eq_cstr(s, "simple") == 1) { return AGNOSAI_COMPLEXITY_SIMPLE; }
+    if (str_eq_cstr(s, "medium") == 1) { return AGNOSAI_COMPLEXITY_MEDIUM; }
+    if (str_eq_cstr(s, "complex") == 1) { return AGNOSAI_COMPLEXITY_COMPLEX; }
+    return 0 - 1;
+}
+
 # Create a new task profile.
 fn agnosai_task_profile_new(task_type, complexity): i64 {
     return agnosai_task_profile_new_a(default_alloc(), task_type, complexity);
@@ -126,6 +137,27 @@ fn agnosai_task_profile_to_value(p): i64 {
     bayan_json_v_obj_set(obj, str_from("complexity"),
       bayan_json_v_str_new(agnosai_complexity_to_wire(load64(p + AGN_TP_COMPLEXITY))));
     return obj;
+}
+
+# A task profile from its JSON form, in allocator `a`, or 0 when it is malformed. Both fields are
+# required, and a task type no variant spells is refused: `agnosai_task_type_from_wire` reads one as
+# Summarize, so that is checked here.
+fn agnosai_task_profile_from_value_a(a, v): i64 {
+    if (bayan_json_v_is_obj(v) != 1) { return 0; }
+    var tv = bayan_json_v_obj_get_by_cstr(v, "task_type");
+    var cv = bayan_json_v_obj_get_by_cstr(v, "complexity");
+    if (tv == 0 || cv == 0 || bayan_json_v_is_str(tv) == 0 || bayan_json_v_is_str(cv) == 0) { return 0; }
+    var ts = bayan_json_v_str(tv);
+    var task_type = agnosai_task_type_from_wire(ts);
+    if (task_type == AGNOSAI_TASKTYPE_SUMMARIZE && str_eq_cstr(ts, "summarize") == 0) { return 0; }
+    var complexity = agnosai_complexity_from_wire(bayan_json_v_str(cv));
+    if (complexity < 0) { return 0; }
+    return agnosai_task_profile_new_a(a, task_type, complexity);
+}
+
+# Global-allocator form of `agnosai_task_profile_from_value_a`.
+fn agnosai_task_profile_from_value(v): i64 {
+    return agnosai_task_profile_from_value_a(default_alloc(), v);
 }
 
 # Emit the debug trace the oracle's `tracing::debug!` carries. Guarded on the

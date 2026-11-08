@@ -37,12 +37,16 @@ var _T_CALLS = 0;
 var _T_R_OK = 1;
 var _T_R_FAIL = 2;
 var _T_R_BLOCKED = 3;
+var _T_FAIL_KIND = 0;
 
 # A stub transport. Builds a real sandhi response object so the module's
 # accessors are exercised rather than bypassed.
-fn _t_transport(arena, method, url: Str, headers, opts, timeout_ms): i64 {
+fn _t_transport(arena, method, url: Str, headers, opts, timeout_ms, out_kind): i64 {
     _T_CALLS = _T_CALLS + 1;
-    if (_T_RESULT == _T_R_FAIL) { return 0; }
+    if (_T_RESULT == _T_R_FAIL) {
+        store64(out_kind, _T_FAIL_KIND);
+        return 0;
+    }
     if (_T_RESULT == _T_R_BLOCKED) { return AGNOSAI_FETCH_BLOCKED; }
 
     var r = sandhi_http_response_parse_a(arena, "HTTP/1.1 200 OK\r\n\r\n", 19);
@@ -74,6 +78,32 @@ fn _t_hdr(name, value): i64 {
 # Run a fetch through the stub.
 fn _t_fetch(url): i64 {
     return agnosai_fetch_package_via(str_from(url), &_t_transport);
+}
+
+fn _t_v237_download_errors(): i64 {
+    test_group("why a download failed");
+    _T_RESULT = _T_R_FAIL;
+    _T_FAIL_KIND = SANDHI_ERR_TIMEOUT;
+    assert(str_eq_cstr(agnosai_fetch_result_error(_t_fetch("https://example.com/p")),
+        "download failed: timed out") == 1, "a timeout says so");
+    _T_FAIL_KIND = SANDHI_ERR_CONNECT;
+    assert(str_eq_cstr(agnosai_fetch_result_error(_t_fetch("https://example.com/p")),
+        "download failed: could not connect") == 1, "a refused connection");
+    _T_FAIL_KIND = SANDHI_ERR_TLS;
+    assert(str_eq_cstr(agnosai_fetch_result_error(_t_fetch("https://example.com/p")),
+        "download failed: TLS handshake failed") == 1, "TLS");
+    _T_FAIL_KIND = SANDHI_ERR_DISCOVERY;
+    assert(str_eq_cstr(agnosai_fetch_result_error(_t_fetch("https://example.com/p")),
+        "download failed: host did not resolve") == 1, "a name");
+    _T_FAIL_KIND = SANDHI_ERR_PROTOCOL;
+    assert(str_eq_cstr(agnosai_fetch_result_error(_t_fetch("https://example.com/p")),
+        "download failed: bad HTTP response") == 1, "a bad answer");
+    _T_FAIL_KIND = 0;
+    assert(str_eq_cstr(agnosai_remote_download_err(SANDHI_ERR_INTERNAL), "download failed") == 1,
+      "a kind with no words of its own says only that");
+    assert(str_eq_cstr(agnosai_fetch_result_error(_t_fetch("https://example.com/p")), "download failed") == 1,
+      "and no reason, none");
+    return 0;
 }
 
 fn main() {
@@ -321,9 +351,10 @@ fn main() {
 
     var dead = agnosai_fetch_package(str_from("http://nonexistent.invalid/tool.wasm"));
     assert_eq(agnosai_fetch_result_ok(dead), 0, "and so does the live fetch_package");
-    assert(str_eq(agnosai_fetch_result_error(dead), str_from("download failed")) == 1,
+    assert_eq(str_starts_with(agnosai_fetch_result_error(dead), str_from("download failed")), 1,
       "reported with the oracle's download-failed wording");
 
+    _t_v237_download_errors();
     return assert_summary();
 }
 

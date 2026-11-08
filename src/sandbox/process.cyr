@@ -27,6 +27,8 @@
 # trusted command string.
 # =========================================================================
 
+include "src/log_fields.cyr"
+
 # ---------------------------------------------------------------------------
 # ProcessResult — rust-old/src/sandbox/process.rs:20-25
 # ---------------------------------------------------------------------------
@@ -314,6 +316,15 @@ fn _agnosai_process_envp_from_a(a, c, src): i64 {
 # Execution
 # ---------------------------------------------------------------------------
 
+# A run's exit code, at DEBUG.
+fn _agnosai_process_log_exit(msg, msg_len, exit_code): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start_int(&f, exit_code);
+    sakshi_log_kv(SK_DEBUG, msg, msg_len, "exit_code", 9, &f, n);
+    return 0;
+}
+
 # Turn a finished spawn into a `ProcessResult`, or an error if it never ran.
 #
 # **The timeout arm discards the partial output, and that is deliberate, not
@@ -360,6 +371,7 @@ fn _agnosai_process_finish_a(a, sp, what: Str, out_err): i64 {
         return agnosai_process_result_new_a(a, str_from_a(a, ""), str_from_a(a, ""), 0 - 1, 1);
     }
 
+    _agnosai_process_log_exit("sandboxed process finished", 26, agnosai_spawn_exit_code(sp));
     return agnosai_process_result_new_a(a, agnosai_spawn_stdout(sp), agnosai_spawn_stderr(sp),
       agnosai_spawn_exit_code(sp), 0);
 }

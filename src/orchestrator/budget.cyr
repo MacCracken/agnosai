@@ -228,6 +228,65 @@ fn agnosai_budget_exceeded_message(t, kind): i64 {
     return 0;
 }
 
+# A breach read back from JSON: which limit, what was used, and what the limit was.
+enum AgnosaiBudgetBreachOff {
+    AGN_BB_KIND = 0;
+    AGN_BB_USED = 8;
+    AGN_BB_LIMIT = 16;
+    AGN_BB_SIZE = 24;
+}
+
+# Field `key` of `v` as a whole number, or a negative when it is missing, not a number, or negative.
+fn _agnosai_budget_count(v, key): i64 {
+    var f = bayan_json_v_obj_get_by_cstr(v, key);
+    if (f == 0 || bayan_json_v_is_int(f) == 0) { return 0 - 1; }
+    return bayan_json_v_int(f);
+}
+
+# A breach from `inner`, with its two fields under the names given. 0 when either is missing.
+fn _agnosai_budget_breach_a(a, kind, inner, used_key, limit_key): i64 {
+    if (bayan_json_v_is_obj(inner) != 1) { return 0; }
+    var used = _agnosai_budget_count(inner, used_key);
+    var limit = _agnosai_budget_count(inner, limit_key);
+    if (used < 0 || limit < 0) { return 0; }
+    var b = alloc_via(a, AGN_BB_SIZE);
+    store64(b + AGN_BB_KIND, kind);
+    store64(b + AGN_BB_USED, used);
+    store64(b + AGN_BB_LIMIT, limit);
+    return b;
+}
+
+# A breach from its JSON form, in allocator `a`, or 0 when it is malformed. The form is
+# externally tagged, so the value has exactly one key, and it names the limit.
+fn agnosai_budget_exceeded_from_value_a(a, v): i64 {
+    if (bayan_json_v_is_obj(v) != 1 || bayan_json_v_obj_len(v) != 1) { return 0; }
+    var tokens = bayan_json_v_obj_get_by_cstr(v, "Tokens");
+    if (tokens != 0) { return _agnosai_budget_breach_a(a, AGNOSAI_BUDGET_TOKENS, tokens, "used", "limit"); }
+    var cost = bayan_json_v_obj_get_by_cstr(v, "Cost");
+    if (cost != 0) { return _agnosai_budget_breach_a(a, AGNOSAI_BUDGET_COST, cost, "used_units", "limit_units"); }
+    return 0;
+}
+
+# Global-allocator form of `agnosai_budget_exceeded_from_value_a`.
+fn agnosai_budget_exceeded_from_value(v): i64 {
+    return agnosai_budget_exceeded_from_value_a(default_alloc(), v);
+}
+
+# Which limit a parsed breach is: `AGNOSAI_BUDGET_TOKENS` or `AGNOSAI_BUDGET_COST`.
+fn agnosai_budget_exceeded_kind(b): i64 {
+    return load64(b + AGN_BB_KIND);
+}
+
+# What was used: tokens, or cost in the form's 1/10000 unit.
+fn agnosai_budget_exceeded_used(b): i64 {
+    return load64(b + AGN_BB_USED);
+}
+
+# The limit, in the same unit as `agnosai_budget_exceeded_used`.
+fn agnosai_budget_exceeded_limit(b): i64 {
+    return load64(b + AGN_BB_LIMIT);
+}
+
 # Serialise a breach the way `BudgetExceeded` derives.
 #
 # The oracle is an externally-tagged enum, so `Tokens { used, limit }` emits

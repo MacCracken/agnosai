@@ -82,6 +82,29 @@ fn agnosai_device_link_new(device_a, device_b, interconnect, bandwidth_gbps): i6
     return l;
 }
 
+# `InterconnectType`'s JSON form: its variant name, as a C string.
+fn agnosai_interconnect_to_wire(kind): i64 {
+    if (kind == AGNOSAI_INTERCONNECT_NVLINK) { return "NvLink"; }
+    if (kind == AGNOSAI_INTERCONNECT_XGMI) { return "Xgmi"; }
+    if (kind == AGNOSAI_INTERCONNECT_CXL) { return "Cxl"; }
+    return "Pcie";
+}
+
+# A link as a JSON value, in allocator `a`.
+fn agnosai_device_link_to_value_a(a, l): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    _agnosai_obj_put_int_a(a, obj, "device_a", load64(l + AGN_DVL_DEVICE_A));
+    _agnosai_obj_put_int_a(a, obj, "device_b", load64(l + AGN_DVL_DEVICE_B));
+    _agnosai_obj_put_cstr_a(a, obj, "interconnect", agnosai_interconnect_to_wire(load64(l + AGN_DVL_INTERCONNECT)));
+    _agnosai_obj_put_a(a, obj, "bandwidth_gbps", bayan_json_v_float_new_a(a, load64(l + AGN_DVL_BANDWIDTH_GBPS)));
+    return obj;
+}
+
+# Global-allocator form of `agnosai_device_link_to_value_a`.
+fn agnosai_device_link_to_value(l): i64 {
+    return agnosai_device_link_to_value_a(default_alloc(), l);
+}
+
 # The first device's index.
 fn agnosai_device_link_device_a(l): i64 {
     return load64(l + AGN_DVL_DEVICE_A);
@@ -103,6 +126,23 @@ fn agnosai_device_link_bandwidth_gbps(l): i64 {
 }
 
 # --- NodeTopology --------------------------------------------------------
+
+# A topology as a JSON value, in allocator `a`.
+fn agnosai_node_topology_to_value_a(a, t): i64 {
+    var links = load64(t + AGN_NTP_LINKS);
+    var arr = bayan_json_v_arr_new_a(a);
+    for (var i = 0; i < vec_len(links); i = i + 1) {
+        bayan_json_v_arr_push_a(a, arr, agnosai_device_link_to_value_a(a, vec_get(links, i)));
+    }
+    var obj = bayan_json_v_obj_new_a(a);
+    _agnosai_obj_put_a(a, obj, "links", arr);
+    return obj;
+}
+
+# Global-allocator form of `agnosai_node_topology_to_value_a`.
+fn agnosai_node_topology_to_value(t): i64 {
+    return agnosai_node_topology_to_value_a(default_alloc(), t);
+}
 
 # The oracle's `NodeTopology::default()` — no links at all.
 fn agnosai_node_topology_new(): i64 {

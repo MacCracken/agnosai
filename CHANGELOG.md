@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.7] — 2026-11-08
+
+The Rust line's types have their JSON forms, in both directions, and its log events have their fields. Every form is built in
+the caller's allocator, with a bare form beside it.
+
+### ⚠ Behaviour changes
+
+- **A failed remote-registry download says why:** `download failed: timed out`, `: could not connect`, `: TLS handshake
+  failed`, `: host did not resolve` or `: bad HTTP response`. It read `download failed` alone, where the Rust line had the
+  transport's error. A caller matching the exact text should match the prefix. The transport a test injects into
+  `agnosai_fetch_package_via` takes one more argument, `out_kind`.
+- **A task's result metadata has `latency_ms`:** how long the model call that produced the answer took, measured here, as
+  `tokens` are that call's.
+
+### Added
+
+- **`src/log_fields.cyr`:** several `key=value` fields on one log event, in the caller's stack buffer, with no allocation.
+  A field that does not fit is left out whole, and control bytes read as `?`, so what came from a request cannot write a line
+  of its own.
+- **JSON writers**, each with an `_a` form: `agnosai_node_info_to_value`, `agnosai_cluster_info_to_value`,
+  `agnosai_device_link_to_value`, `agnosai_node_topology_to_value`, `agnosai_relay_message_to_value`,
+  `agnosai_retry_config_to_value`, `agnosai_tool_input_to_value`, `agnosai_wasm_pkg_to_value`,
+  `agnosai_wasm_tool_manifest_to_value` and `agnosai_kavach_result_to_value`. An enum writes its variant name, a `Duration`
+  writes `{"secs":N,"nanos":N}`, and a timestamp is RFC 3339.
+- **JSON parsers:** `agnosai_task_profile_from_value`, `agnosai_budget_exceeded_from_value`, `agnosai_cached_plan_from_value`,
+  `agnosai_tool_schema_from_value`, `agnosai_param_schema_from_value` and `agnosai_tool_output_from_value`, each refusing
+  what the type could not have written: a missing required field, a task id that is not one, a negative count, a variant
+  nothing spells. A manifest's parameters now go through the same parser.
+- **`agnosai_inference_response_latency_ms`** and its setter.
+
+### Changed
+
+- **Log events carry the fields the Rust line's did.** The fleet: federation's nine, the relay's three, discovery's two, the crew
+  cost estimate, and the cgroup limits. The WASM sandbox (created, loading, executing, finished, stopped at its deadline), a
+  skipped WASM package's reason, the kavach bridge, the exit code of a process or container, MCP's `success` and
+  `duration_ms`, and an A2A rejection's id prefix and `metadata_bytes`. A relay gap or duplicate is a log line as well as a
+  counter now. Two of the Rust line's fleet events are not here: they belonged to `select_cheapest_model`, which ADR 030 gave
+  to the gateway. `wasm_tool.rs` logged nothing, so there was nothing to bring.
+- **RFC 3339 in an allocator:** `_agnosai_msg_fmt_rfc3339_a` writes a timestamp with no global allocation, where `iso8601` and
+  `epoch_to_date` took two blocks, and `agnosai_message_to_value_a` uses it.
+
+### Performance
+
+- **The interleaved A/B against a 2.3.6 build on the same `lib/`:** four rounds of `tools`, `orch`, `server` and `fleet` at a mean
+  load of 2.5, median +0.1% across 167 rows, 165 of them within 5%. `tool_registry_has_50_miss` read +15.6% (90 to 104 ns)
+  and `is_safe_url_octal_host` −5.7%. The first moved by −38.6% and +1.1% in 2.3.6's two runs with no change to it, so that
+  is where it sits in the binary, and neither is claimed.
+- ⚠ **Not free:** `agnosai_relay_receive` takes 1.76 µs where it took 1.67 (+4.8%, four runs of 2 million receives, at the
+  default log level). The sender's last sequence is read before the receive, which is what lets a gap be logged.
+
 ## [2.3.6] — 2026-11-08
 
 A load test keeps one connection per simulated user, so a latency measures the target and not a handshake, and a target

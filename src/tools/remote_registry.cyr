@@ -169,14 +169,30 @@ fn _agnosai_remote_options(): i64 {
     return opts;
 }
 
+# "download failed", saying why when sandhi said. The kind is one of a fixed set, so nothing from the
+# remote end reaches the message.
+fn agnosai_remote_download_err(kind): i64 {
+    if (kind == SANDHI_ERR_TIMEOUT) { return str_from("download failed: timed out"); }
+    if (kind == SANDHI_ERR_CONNECT) { return str_from("download failed: could not connect"); }
+    if (kind == SANDHI_ERR_TLS) { return str_from("download failed: TLS handshake failed"); }
+    if (kind == SANDHI_ERR_DISCOVERY) { return str_from("download failed: host did not resolve"); }
+    if (kind == SANDHI_ERR_PROTOCOL) { return str_from("download failed: bad HTTP response"); }
+    return str_from("download failed");
+}
+
+# The transport a real fetch uses: the guarded fetch, keeping why it failed.
+fn _agnosai_remote_transport(arena, method, url: Str, headers, opts, timeout_ms, out_kind): i64 {
+    return agnosai_guarded_fetch_full(arena, method, url, headers, opts, timeout_ms, 0, 0, out_kind);
+}
+
 # Fetch a tool package from a remote URL.
 #
 # The oracle's `fetch_package`, arm for arm: the SSRF check first, then the GET,
 # then a 2xx check, then the `Content-Length` pre-check, then the content type,
 # then the body with a second size check against what actually arrived.
 #
-# `transport_fp` is `fn(arena, method, url, headers, opts, timeout_ms) -> resp`
-# — normally `&agnosai_guarded_fetch`. It is a parameter so the tests can drive
+# `transport_fp` is `fn(arena, method, url, headers, opts, timeout_ms, out_kind) -> resp`
+# — normally `&_agnosai_remote_transport`. It is a parameter so the tests can drive
 # every arm above without a network, the same seam `load_testing` and
 # `tools_agnos` use.
 fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
@@ -196,8 +212,10 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
         return _agnosai_remote_err(str_from("download failed"));
     }
 
+    var kind: i64[1];
+    store64(&kind, 0);
     var resp = callptr(transport_fp, arena, "GET", url, sandhi_headers_new(), opts,
-      AGNOSAI_REMOTE_TIMEOUT_MS);
+      AGNOSAI_REMOTE_TIMEOUT_MS, &kind);
 
     if (resp == AGNOSAI_FETCH_BLOCKED) {
         agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
@@ -208,8 +226,9 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
           str_from("URL rejected: private/internal network (via redirect)"));
     }
     if (resp == 0 || sandhi_http_err_kind(resp) != SANDHI_OK) {
+        if (resp != 0) { store64(&kind, sandhi_http_err_kind(resp)); }
         agnosai_arena_pool_release(_AGNOSAI_REMOTE_POOL, arena);
-        return _agnosai_remote_err(str_from("download failed"));
+        return _agnosai_remote_err(agnosai_remote_download_err(load64(&kind)));
     }
 
     var status = sandhi_http_status(resp);
@@ -282,5 +301,5 @@ fn agnosai_fetch_package_via(url: Str, transport_fp): i64 {
 
 # Fetch a tool package over the real, guard-revalidating transport.
 fn agnosai_fetch_package(url: Str): i64 {
-    return agnosai_fetch_package_via(url, &agnosai_guarded_fetch);
+    return agnosai_fetch_package_via(url, &_agnosai_remote_transport);
 }

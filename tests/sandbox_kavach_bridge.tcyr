@@ -24,6 +24,7 @@ include "src/strcase.cyr"
 include "src/core/mod.cyr"
 include "src/sandbox/mod.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 
 # --- map_backend ---------------------------------------------------------
 
@@ -631,6 +632,35 @@ fn _t_kb_execute_none_policy_uses_the_noop_backend(): i64 {
     return 0;
 }
 
+fn _t_v237_form_and_events(): i64 {
+    test_group("the JSON form and the events");
+    var ar = arena_allocator_growable(4096);
+    var r = agnosai_kavach_result_new(str_from("out"), str_from("err"), 2, 1, 42, 75, AGNOSAI_KAVACH_NO_VERDICT);
+    var before = alloc_used();
+    var v = agnosai_kavach_result_to_value_a(ar, r);
+    assert_eq(alloc_used() - before, 0, "the form is built in the caller's allocator");
+    assert(str_eq_cstr(bayan_json_v_build(v), "{\"output\":\"out\",\"stderr\":\"err\",\"exit_code\":2,\"timed_out\":true,\"duration_ms\":42,\"strength\":75,\"scan_verdict\":null}") == 1,  #skip-lint
+      "a result reads as the Rust line wrote it, with no verdict as null");
+    var pass = agnosai_kavach_result_new(str_from(""), str_from(""), 0, 0, 0, 0, ScanVerdict.PASS);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(agnosai_kavach_result_to_value(pass), "scan_verdict")), "Pass") == 1, "a verdict by its name");  #skip-lint
+    assert(str_eq_cstr(str_from(agnosai_scan_verdict_to_wire(ScanVerdict.WARN)), "Warn") == 1, "Warn");
+    assert(str_eq_cstr(str_from(agnosai_scan_verdict_to_wire(ScanVerdict.QUARANTINE)), "Quarantine") == 1,
+      "Quarantine");
+    assert(str_eq_cstr(str_from(agnosai_scan_verdict_to_wire(ScanVerdict.BLOCK)), "Block") == 1, "Block");
+
+    _tl_start(SK_DEBUG);
+    var e[8];
+    store64(&e, 0);
+    var out = agnosai_kavach_execute(_t_kb_cmd("kb-echo", "logged"), agnosai_sandbox_policy_process(), 0, &e);
+    assert_neq(out, 0, "a run to log");
+    _tl_saw("creating kavach sandbox strength=", "the sandbox's strength is said");
+    _tl_saw(" timeout_ms=", "and its limit");
+    _tl_saw("kavach tool execution completed exit_code=0 duration_ms=", "how a run ended is said");
+    _tl_saw(" timed_out=false strength=", "whole");
+    _tl_stop();
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     var payload = _t_kb_payload();
@@ -661,6 +691,7 @@ fn main(): i64 {
     _t_kb_repeated_failures_do_not_break_the_bridge();
     _t_kb_execute_none_policy_uses_the_noop_backend();
 
+    _t_v237_form_and_events();
     return assert_summary();
 }
 

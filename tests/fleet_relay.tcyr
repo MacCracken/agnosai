@@ -26,10 +26,51 @@ include "src/id.cyr"
 include "src/core/mod.cyr"
 include "src/fleet/relay.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 
 # Build an inbound message from `from`, addressed to `to` ("" = broadcast).
 fn _t_msg(seq, from, to, topic): i64 {
     return agnosai_relay_message_new(seq, str_from(from), str_from(to), str_from(topic), 0);
+}
+
+fn _t_v237_form_and_events(): i64 {
+    test_group("the JSON form and the events");
+    var ar = arena_allocator_growable(4096);
+    var pay = bayan_json_v_int_new(7);
+    var m = agnosai_relay_message_new(9, str_from("node-2"), str_from(""), str_from("t"), pay);
+    store64(m + 40, 1785276000500000000);
+    var before = alloc_used();
+    var v = agnosai_relay_message_to_value_a(ar, m);
+    assert_eq(alloc_used() - before, 0, "the form is built in the caller's allocator");
+    assert(str_eq_cstr(bayan_json_v_build(v), "{\"seq\":9,\"from\":\"node-2\",\"to\":\"\",\"topic\":\"t\",\"payload\":7,\"timestamp\":\"2026-07-28T22:00:00.500Z\"}") == 1,  #skip-lint
+      "a message reads as the Rust line wrote it, a half second as .500");
+    var none = agnosai_relay_message_new(1, str_from("a"), str_from("b"), str_from("t"), 0);
+    assert_eq(bayan_json_v_is_null(bayan_json_v_obj_get_by_cstr(agnosai_relay_message_to_value(none), "payload")), 1,
+      "no payload is null");
+
+    _tl_start(SK_DEBUG);
+    var r = agnosai_relay_with_defaults(str_from("node-1"));
+    agnosai_relay_send(r, str_from("node-9"), str_from("jobs"), 0);
+    _tl_saw("relay: sending message seq=1 to=node-9 topic=jobs", "a send says where");
+
+    var first = agnosai_relay_message_new(5, str_from("a"), str_from(""), str_from("t"), 0);
+    agnosai_relay_receive(r, first);
+    _tl_saw("relay: sequence gap detected expected=1 got=5 from=a", "a first message not numbered 1 is a gap");
+    _TL_LINES = vec_new();
+    agnosai_relay_receive(r, agnosai_relay_message_new(6, str_from("a"), str_from(""), str_from("t"), 0));
+    _tl_never("sequence gap", "the next in order is not");
+    _tl_never("duplicate", "nor a duplicate");
+    agnosai_relay_receive(r, agnosai_relay_message_new(6, str_from("a"), str_from(""), str_from("t"), 0));
+    _tl_saw("relay: dropping duplicate message seq=6 from=a", "one seen before is a duplicate");
+    _TL_LINES = vec_new();
+    agnosai_relay_receive(r, agnosai_relay_message_new(9, str_from("a"), str_from(""), str_from("t"), 0));
+    _tl_saw("relay: sequence gap detected expected=7 got=9 from=a", "a skip says what was expected");
+    _TL_LINES = vec_new();
+    # Old enough to be a duplicate, and addressed to someone else, so it is neither of this relay's.
+    agnosai_relay_receive(r, agnosai_relay_message_new(3, str_from("a"), str_from("node-2"), str_from("t"), 0));
+    _tl_never("duplicate", "a message for another node is not called a duplicate");
+    _tl_stop();
+    return 0;
 }
 
 fn main(): i64 {
@@ -232,6 +273,7 @@ fn main(): i64 {
     assert_eq(agnosai_relay_message_payload(_t_msg(1, "a", "", "t")), 0,
       "a message built with no payload carries 0");
 
+    _t_v237_form_and_events();
     return assert_summary();
 }
 

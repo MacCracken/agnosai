@@ -18,6 +18,51 @@ fn _t_assert_route(task_type, complexity, expected, name): i64 {
     return assert_eq(agnosai_route(agnosai_task_profile_new(task_type, complexity)), expected, name);
 }
 
+fn _t_v237_profile_from_value(): i64 {
+    test_group("a task profile from JSON");
+    var types = vec_new();
+    vec_push(types, AGNOSAI_TASKTYPE_SUMMARIZE);
+    vec_push(types, AGNOSAI_TASKTYPE_CLASSIFY);
+    vec_push(types, AGNOSAI_TASKTYPE_CODE);
+    vec_push(types, AGNOSAI_TASKTYPE_PLAN);
+    vec_push(types, AGNOSAI_TASKTYPE_REASON);
+    vec_push(types, AGNOSAI_TASKTYPE_RESEARCH);
+    vec_push(types, AGNOSAI_TASKTYPE_MULTI_STEP);
+    var levels = vec_new();
+    vec_push(levels, AGNOSAI_COMPLEXITY_SIMPLE);
+    vec_push(levels, AGNOSAI_COMPLEXITY_MEDIUM);
+    vec_push(levels, AGNOSAI_COMPLEXITY_COMPLEX);
+    var wrong = 0;
+    for (var i = 0; i < vec_len(types); i = i + 1) {
+        for (var j = 0; j < vec_len(levels); j = j + 1) {
+            var p = agnosai_task_profile_new(vec_get(types, i), vec_get(levels, j));
+            var q = agnosai_task_profile_from_value(agnosai_task_profile_to_value(p));
+            if (q == 0) { wrong = wrong + 1; }
+            elif (agnosai_task_profile_task_type(q) != vec_get(types,
+                i) || agnosai_task_profile_complexity(q) != vec_get(levels, j)) {
+                wrong = wrong + 1;
+            }
+        }
+    }
+    assert_eq(wrong, 0, "every type and level comes back as it went");
+    assert_eq(agnosai_complexity_from_wire(str_from("complex")), AGNOSAI_COMPLEXITY_COMPLEX,
+      "a level by its wire name");
+    assert_eq(agnosai_complexity_from_wire(str_from("Complex")), 0 - 1, "spelled exactly");
+    assert_neq(agnosai_task_profile_from_value_a(arena_allocator_growable(4096),
+        agnosai_task_profile_to_value(agnosai_task_profile_new(AGNOSAI_TASKTYPE_CODE, AGNOSAI_COMPLEXITY_SIMPLE))), 0,
+      "a profile reads in an arena");
+    assert_eq(agnosai_task_profile_from_value(_t_parse_cstr("{\"task_type\":\"poetry\",\"complexity\":\"simple\"}")), 0,
+      "a type no variant spells is refused");
+    assert_eq(agnosai_task_profile_from_value(_t_parse_cstr("{\"task_type\":\"code\",\"complexity\":\"hard\"}")), 0,
+      "and a level");
+    assert_eq(agnosai_task_profile_from_value(_t_parse_cstr("{\"complexity\":\"simple\"}")), 0, "a missing type");
+    assert_eq(agnosai_task_profile_from_value(_t_parse_cstr("{\"task_type\":\"code\"}")), 0, "a missing level");
+    assert_eq(agnosai_task_profile_from_value(_t_parse_cstr("{\"task_type\":3,\"complexity\":\"simple\"}")), 0,
+      "a type that is no string");
+    assert_eq(agnosai_task_profile_from_value(0), 0, "and nothing at all");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -193,6 +238,7 @@ fn main() {
     assert(agnosai_estimate_model_memory(14000000000, QUANT_FP16) > fp16,
       "and a bigger model estimates more");
 
+    _t_v237_profile_from_value();
     return assert_summary();
 }
 

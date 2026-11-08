@@ -35,6 +35,8 @@
 # implementation would drift.
 # =========================================================================
 
+include "src/log_fields.cyr"
+
 # The oracle's default broadcast-channel capacity.
 var AGNOSAI_RELAY_DEFAULT_CAPACITY = 256;
 
@@ -110,7 +112,15 @@ fn agnosai_relay_node_id(r): i64 {
 # Send to a specific node, or broadcast when `to` is empty. Returns the
 # sequence number assigned, which starts at 1 and increments per send.
 fn agnosai_relay_send(r, to: Str, topic: Str, payload): i64 {
-    return relay_send(load64(r + AGN_RLY_INNER), str_cstr(to), str_cstr(topic), payload);
+    var seq = relay_send(load64(r + AGN_RLY_INNER), str_cstr(to), str_cstr(topic), payload);
+    if (sakshi_get_level() >= SK_DEBUG) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start_int(&f, seq);
+        n = agnosai_log_field_str(&f, n, "to", to);
+        n = agnosai_log_field_str(&f, n, "topic", topic);
+        sakshi_log_kv(SK_DEBUG, "relay: sending message", 22, "seq", 3, &f, n);
+    }
+    return seq;
 }
 
 # The oracle's `broadcast` — `send` with an empty target.
@@ -136,7 +146,45 @@ fn agnosai_relay_subscribe(r): i64 {
 # Delegates to `relay_receive_ex` rather than `relay_receive` specifically to
 # keep the broadcast flag, which is the whole reason 2.6.0 added it.
 fn agnosai_relay_receive(r, msg): i64 {
-    return relay_receive_ex(load64(r + AGN_RLY_INNER), msg);
+    var inner = load64(r + AGN_RLY_INNER);
+    # Read before the receive moves it on, and only for a level that would log what it shows.
+    var last = 0 - 2;
+    if (sakshi_get_level() >= SK_WARN && load64(msg + 8) != 0) { last = relay_last_seq(inner, load64(msg + 8)); }
+    var inc = relay_receive_ex(inner, msg);
+    if (last != 0 - 2) { _agnosai_relay_log_receive(inner, msg, last, inc); }
+    return inc;
+}
+
+# Say what a receive showed: a duplicate at DEBUG, a gap at WARN. majra logs nothing and counts both.
+#
+# ⚠ A message refused for being addressed elsewhere also comes back 0, and its sequence may well be
+# behind the last one seen, so that is ruled out before calling it a duplicate. A first message from
+# a sender that is not numbered 1 is a gap too, as majra counts it.
+fn _agnosai_relay_log_receive(inner, msg, last, inc): i64 {
+    var seq = load64(msg);
+    var expected = last + 1;
+    if (last < 0) { expected = 1; }
+    var from = load64(msg + 8);
+    if (inc == 0) {
+        var to = load64(msg + 16);
+        var elsewhere = 0;
+        if (to != 0 && strlen(to) > 0 && streq(to, relay_node_id(inner)) == 0) { elsewhere = 1; }
+        if (last >= 0 && seq <= last && elsewhere == 0 && sakshi_get_level() >= SK_DEBUG) {
+            var f[AGNOSAI_LOG_FIELDS_BYTES];
+            var n = agnosai_log_fields_start_int(&f, seq);
+            n = agnosai_log_field_cstr(&f, n, "from", from);
+            sakshi_log_kv(SK_DEBUG, "relay: dropping duplicate message", 33, "seq", 3, &f, n);
+        }
+        return 0;
+    }
+    if (seq != expected) {
+        var g[AGNOSAI_LOG_FIELDS_BYTES];
+        var m = agnosai_log_fields_start_int(&g, expected);
+        m = agnosai_log_field_int(&g, m, "got", seq);
+        m = agnosai_log_field_cstr(&g, m, "from", from);
+        sakshi_log_kv(SK_WARN, "relay: sequence gap detected", 28, "expected", 8, &g, m);
+    }
+    return 0;
 }
 
 # Whether an IncomingMessage arrived without an explicit target.
@@ -196,6 +244,26 @@ fn agnosai_relay_message_payload(m): i64 {
 # 2.6.5+), so it is comparable across processes.
 fn agnosai_relay_message_timestamp(m): i64 {
     return load64(m + 40);
+}
+
+# A message as a JSON value, in allocator `a`. A payload of 0 is null, and any other is the bayan value
+# it was built with. The timestamp is RFC 3339, from majra's wall-clock nanoseconds.
+fn agnosai_relay_message_to_value_a(a, m): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    _agnosai_obj_put_int_a(a, obj, "seq", load64(m));
+    _agnosai_obj_put_cstr_a(a, obj, "from", load64(m + 8));
+    _agnosai_obj_put_cstr_a(a, obj, "to", load64(m + 16));
+    _agnosai_obj_put_cstr_a(a, obj, "topic", load64(m + 24));
+    var payload = load64(m + 32);
+    if (payload == 0) { payload = bayan_json_v_null_a(a); }
+    _agnosai_obj_put_a(a, obj, "payload", payload);
+    _agnosai_obj_put_str_a(a, obj, "timestamp", _agnosai_msg_fmt_rfc3339_a(a, load64(m + 40)));
+    return obj;
+}
+
+# Global-allocator form of `agnosai_relay_message_to_value_a`.
+fn agnosai_relay_message_to_value(m): i64 {
+    return agnosai_relay_message_to_value_a(default_alloc(), m);
 }
 
 # --- stats ---------------------------------------------------------------

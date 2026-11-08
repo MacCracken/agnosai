@@ -51,6 +51,21 @@ fn _t_ms_ns(n): i64 {
     return n * AGNOSAI_NS_PER_MS;
 }
 
+fn _t_v237_form(): i64 {
+    test_group("the JSON form");
+    var ar = arena_allocator_growable(4096);
+    var c = agnosai_retry_config_new(3, 1500 * AGNOSAI_NS_PER_MS, 30 * AGNOSAI_NS_PER_SEC, 1);
+    var before = alloc_used();
+    var v = agnosai_retry_config_to_value_a(ar, c);
+    assert_eq(alloc_used() - before, 0, "the form is built in the caller's allocator");
+    assert(str_eq_cstr(bayan_json_v_build(v), "{\"max_retries\":3,\"base_delay\":{\"secs\":1,\"nanos\":500000000},\"max_delay\":{\"secs\":30,\"nanos\":0},\"jitter\":true}") == 1,  #skip-lint
+      "a delay is serde's secs and nanos");
+    assert(str_contains_cstr(bayan_json_v_build(agnosai_retry_config_to_value(agnosai_retry_config_new(0, 0, 0, 0))),
+        "\"jitter\":false") == 1,
+      "and no jitter is false");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     rng_seed(42);
@@ -168,6 +183,7 @@ fn main() {
         &_t_cb_always_retryable, 0, &out) != 0, "none config still surfaces the error");
     assert_eq(_t_calls, 1, "none config attempts exactly once");
 
+    _t_v237_form();
     return assert_summary();
 }
 

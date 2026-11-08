@@ -1,0 +1,58 @@
+# =========================================================================
+# tests/test_log — what a suite saw logged.
+#
+# NOT a test file itself. `_tl_start` routes sakshi through a hook that keeps each event as one line,
+# the message and then `key=value`, which is what the `tracing` fields of the Rust line now are.
+# =========================================================================
+
+var _TL_LINES = 0;
+var _TL_LEVEL_WAS = 0;
+
+fn _tl_hook(ts, level, span, msg, msg_len, fields): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, str_new(msg, msg_len));
+    if (fields != 0) {
+        for (var i = 0; i < load64(fields); i = i + 1) {
+            var rec = fields + 8 + i * 32;
+            str_builder_add_cstr(sb, " ");
+            str_builder_add(sb, str_new(load64(rec), load64(rec + 8)));
+            str_builder_add_cstr(sb, "=");
+            str_builder_add(sb, str_new(load64(rec + 16), load64(rec + 24)));
+        }
+    }
+    vec_push(_TL_LINES, str_builder_build(sb));
+    return 0;
+}
+
+# Keep every event from `level` up, from here to `_tl_stop`.
+fn _tl_start(level): i64 {
+    _TL_LINES = vec_new();
+    _TL_LEVEL_WAS = sakshi_get_level();
+    sakshi_set_level(level);
+    sakshi_set_emit_hook(&_tl_hook);
+    return 0;
+}
+
+fn _tl_stop(): i64 {
+    sakshi_clear_emit_hook();
+    sakshi_set_level(_TL_LEVEL_WAS);
+    return 0;
+}
+
+# The first line holding `fragment`, or 0.
+fn _tl_line(fragment): i64 {
+    for (var i = 0; i < vec_len(_TL_LINES); i = i + 1) {
+        if (str_contains_cstr(vec_get(_TL_LINES, i), fragment) == 1) { return vec_get(_TL_LINES, i); }
+    }
+    return 0;
+}
+
+# Assert a line holding `fragment` was logged.
+fn _tl_saw(fragment, name): i64 {
+    return assert(_tl_line(fragment) != 0, name);
+}
+
+# Assert no line holding `fragment` was logged.
+fn _tl_never(fragment, name): i64 {
+    return assert_eq(_tl_line(fragment), 0, name);
+}

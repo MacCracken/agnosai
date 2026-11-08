@@ -44,6 +44,7 @@ include "src/tools/registry.cyr"
 include "src/tools/wasm_tool.cyr"
 include "src/tools/wasm_loader.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 include "tests/test_tmp.cyr"
 
 var _T_ROOT = _tt_tmp_path("tools-wasm", "");
@@ -283,6 +284,36 @@ fn _t_release_suite(): i64 {
     assert_eq(agnosai_tool_holds(b), 1, "as it is held once, not twice and then not at all");
     agnosai_tool_registry_remove(r3, str_from("same"));
     assert_eq(file_exists(str_data(bpath)), 0, "until it is removed");
+    return 0;
+}
+
+fn _t_v237_forms(): i64 {
+    test_group("the JSON forms");
+    var pkg = agnosai_wasm_pkg_from_json(str_from("{\"name\":\"t\",\"description\":\"d\",\"parameters\":[{\"name\":\"p\",\"description\":\"x\",\"param_type\":\"string\",\"required\":true}]}"));  #skip-lint
+    var ar = arena_allocator_growable(4096);
+    var before = alloc_used();
+    var v = agnosai_wasm_pkg_to_value_a(ar, pkg);
+    assert_eq(alloc_used() - before, 0, "a manifest is written in the caller's allocator");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(v, "version")), "0.0.0") == 1,
+      "with the version it defaulted to");
+    var again = agnosai_wasm_pkg_from_json(bayan_json_v_build(agnosai_wasm_pkg_to_value(pkg)));
+    assert_neq(again, 0, "and what it writes loads");
+    assert_eq(vec_len(agnosai_wasm_pkg_parameters(again)), 1, "its parameters with it");
+    assert(str_eq(bayan_json_v_build(agnosai_wasm_pkg_to_value(again)),
+        bayan_json_v_build(agnosai_wasm_pkg_to_value(pkg))) == 1, "unchanged");
+
+    var params = vec_new();
+    vec_push(params, agnosai_param_schema_new(str_from("p"), str_from("x"), str_from("string"), 1));
+    var tool = agnosai_wasm_tool(str_from("wt"), str_from("a tool"), params, 0);
+    assert_neq(agnosai_wasm_tool_manifest_to_value_a(ar, tool), 0,
+      "a tool's manifest is built in the caller's allocator");
+    var m = agnosai_wasm_tool_manifest_to_value(tool);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(m, "name")), "wt") == 1,
+      "a tool's manifest has its name");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(m, "description")), "a tool") == 1,
+      "its description");
+    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(m, "parameters")), 1, "and its parameters");
+    assert_eq(agnosai_param_schema_required(agnosai_param_schema_from_value(bayan_json_v_arr_get(bayan_json_v_obj_get_by_cstr(m, "parameters"), 0))), 1, "in the form a parameter reads back from");  #skip-lint
     return 0;
 }
 
@@ -636,6 +667,19 @@ fn main(): i64 {
     assert_eq(agnosai_error_kind(load64(&err)), AGNOSAI_ERR_SERIALIZATION,
       "as a Serialization error, distinct from a missing file");
 
+    # The scan skips a broken package and says why.
+    var skipdir = _t_under("/skipscan");
+    sys_mkdir(str_data(skipdir), 0x1FF);
+    var skipped = _t_join(skipdir, str_from("/bad"));
+    sys_mkdir(str_data(skipped), 0x1FF);
+    _t_write(_t_join(skipped, str_from("/manifest.json")), "{ not json");
+    _tl_start(SK_WARN);
+    store64(&err, 0);
+    agnosai_wasm_load_all_tool_packages(skipdir, agnosai_tool_registry_new(), &err);
+    _tl_saw("failed to load WASM tool package, skipping dir=", "a broken package is named");
+    _tl_saw(" error=", "with why");
+    _tl_stop();
+
     # --- Oracle: load_all_empty_dir ---------------------------------------
     var emptydir = _t_under("/none");
     sys_mkdir(str_data(emptydir), 0x1FF);
@@ -714,6 +758,7 @@ fn main(): i64 {
     # 2.3.5: every scratch path this suite made goes, so two runs at once share none and a run
     # leaves nothing behind (`tests/test_tmp.cyr`).
     _tt_cleanup();
+    _t_v237_forms();
     return assert_summary();
 }
 

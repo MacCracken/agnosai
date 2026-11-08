@@ -24,6 +24,7 @@ include "src/order.cyr"
 include "src/strcase.cyr"
 include "src/fleet/cost_planning.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 
 # The oracle's cost arithmetic, spelled out: (tasks*tokens / tps / 3600) * rate.
 fn _t_expect_cost(tokens, tps, rate_num, rate_den): i64 {
@@ -35,6 +36,16 @@ fn _t_expect_cost(tokens, tps, rate_num, rate_den): i64 {
 # Whether `hay` contains the literal `needle`.
 fn _t_has(hay, needle): i64 {
     return str_contains_cstr(hay, needle);
+}
+
+fn _t_v237_events(): i64 {
+    test_group("the events");
+    _tl_start(SK_DEBUG);
+    agnosai_estimate_crew_cost(4, 250, str_from("gpt-4"), agnosai_gpu_pricing_default());
+    _tl_saw("crew cost estimate total_tokens=1000 gpu_hours=", "an estimate says what went into it");
+    _tl_saw(" hourly_rate=", "and at what rate");
+    _tl_stop();
+    return 0;
 }
 
 fn main(): i64 {
@@ -154,6 +165,7 @@ fn main(): i64 {
     _t_assert_f64(agnosai_estimate_crew_cost(10, 1000, str_from("gpt-4"), p2),
       f64_mul(c_gpt4, f64_from(2)), "doubling the A100 rate doubles a large-tier estimate");
 
+    _t_v237_events();
     return assert_summary();
 }
 

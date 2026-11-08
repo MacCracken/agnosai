@@ -12,6 +12,8 @@
 # with the integer operators.
 # =========================================================================
 
+include "src/log_fields.cyr"
+
 # GpuPricing heap layout — 40 bytes. Five USD-per-GPU-hour rates, each an f64
 # bit pattern. Mirrors the oracle's five `pub` fields in declaration order.
 enum AgnosaiGpuPricingOff {
@@ -218,6 +220,12 @@ fn agnosai_estimate_crew_cost(tasks, avg_tokens_per_task, model, pricing): i64 {
     var total_tokens = f64_mul(f64_from(tasks), f64_from(avg_tokens_per_task));
     var seconds = f64_div(total_tokens, tps);
     var hours = f64_div(seconds, f64_from(3600));
-    sakshi_debug("crew cost estimate", 18);
+    if (sakshi_get_level() >= SK_DEBUG) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start_int(&f, tasks * avg_tokens_per_task);
+        n = agnosai_log_field_f64(&f, n, "gpu_hours", hours);
+        n = agnosai_log_field_f64(&f, n, "hourly_rate", hourly);
+        sakshi_log_kv(SK_DEBUG, "crew cost estimate", 18, "total_tokens", 12, &f, n);
+    }
     return f64_mul(hours, hourly);
 }

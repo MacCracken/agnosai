@@ -31,6 +31,8 @@
 # passes every oracle test.
 # =========================================================================
 
+include "src/log_fields.cyr"
+
 # The runtime environment of this process.
 enum AgnosaiRuntimeEnvironment {
     AGNOSAI_ENV_BARE = 0;
@@ -291,6 +293,20 @@ fn agnosai_env_detect(): i64 {
     return AGNOSAI_ENV_UNKNOWN;
 }
 
+# Say what the cgroup files gave. A limit the host does not set reads as -1.
+fn _agnosai_env_log_limits(r): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var cpu = 0 - 1;
+    var mem = 0 - 1;
+    if (agnosai_resource_limits_has_cpu_quota(r) == 1) { cpu = agnosai_resource_limits_cpu_quota(r); }
+    if (agnosai_resource_limits_has_memory_limit(r) == 1) { mem = agnosai_resource_limits_memory_limit_bytes(r); }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start_int(&f, cpu);
+    n = agnosai_log_field_int(&f, n, "memory_limit_bytes", mem);
+    sakshi_log_kv(SK_DEBUG, "resource limits read from cgroup", 32, "cpu_quota", 9, &f, n);
+    return 0;
+}
+
 # Read resource limits from the cgroup filesystem, v2 first then v1.
 #
 # ⚠ The two fields fall back INDEPENDENTLY — the oracle's two `.or_else` chains
@@ -319,5 +335,6 @@ fn agnosai_env_resource_limits(): i64 {
     }
     if (got == 1) { agnosai_resource_limits_with_memory_limit(r, load64(out)); }
 
+    _agnosai_env_log_limits(r);
     return r;
 }

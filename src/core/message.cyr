@@ -138,8 +138,8 @@ fn agnosai_message_target_from_value(v): i64 {
 # Append `fract` nanoseconds as chrono's `SecondsFormat::AutoSi` fraction: an
 # empty string when zero, otherwise the fewest of 3, 6 or 9 digits that keeps
 # every non-zero digit.
-fn _agnosai_msg_append_subsec(sb, fract): i64 {
-    if (fract == 0) { return 0; }
+fn _agnosai_msg_put_subsec(buf, pos, fract): i64 {
+    if (fract == 0) { return pos; }
 
     var digits = 9;
     var value = fract;
@@ -151,30 +151,65 @@ fn _agnosai_msg_append_subsec(sb, fract): i64 {
         value = fract / 1000;
     }
 
-    str_builder_putc(sb, 46);
-    var scale = 1;
-    for (var i = 1; i < digits; i = i + 1) { scale = scale * 10; }
-    while (scale > 0) {
-        str_builder_putc(sb, 48 + ((value / scale) % 10));
-        scale = scale / 10;
+    store8(buf + pos, 46);
+    _agnosai_msg_put_digits(buf + pos + 1, value, digits);
+    return pos + 1 + digits;
+}
+
+# `value` as exactly `width` decimal digits at `p`.
+fn _agnosai_msg_put_digits(p, value, width): i64 {
+    var left = value;
+    for (var i = width - 1; i >= 0; i = i - 1) {
+        store8(p + i, 48 + left % 10);
+        left = left / 10;
     }
     return 0;
 }
 
-# Render epoch nanoseconds the way chrono's serde does: RFC3339, UTC, with an
-# AutoSi sub-second fraction. 0 nanos -> "2026-07-28T22:00:00Z".
-fn _agnosai_msg_fmt_rfc3339(ns): i64 {
-    var secs = ns / AGNOSAI_NS_PER_SEC;
-    var fract = ns % AGNOSAI_NS_PER_SEC;
-    var base = iso8601(secs);
+# `YYYY-MM-DD` at `buf`, for days since the Unix epoch. The civil-from-days calculation, which needs no
+# table and no allocation, where `iso8601` and `epoch_to_date` each take a block of the global heap.
+fn _agnosai_msg_put_date(buf, days): i64 {
+    var z = days + 719468;
+    var era = z / 146097;
+    var doe = z - era * 146097;
+    var yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    var doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    var mp = (5 * doy + 2) / 153;
+    var month = mp + 3;
+    if (month > 12) { month = month - 12; }
+    var year = yoe + era * 400;
+    if (month <= 2) { year = year + 1; }
+    _agnosai_msg_put_digits(buf, year, 4);
+    store8(buf + 4, 45);
+    _agnosai_msg_put_digits(buf + 5, month, 2);
+    store8(buf + 7, 45);
+    _agnosai_msg_put_digits(buf + 8, doy - (153 * mp + 2) / 5 + 1, 2);
+    return 0;
+}
 
-    var sb = str_builder_new();
-    # iso8601 is "....SSZ"; take everything up to the seconds, splice the
-    # fraction in, then re-attach the zone.
-    str_builder_add(sb, str_new(base, 19));
-    _agnosai_msg_append_subsec(sb, fract);
-    str_builder_add_cstr(sb, "Z");
-    return str_builder_build(sb);
+# Render epoch nanoseconds the way chrono's serde does, in allocator `a`: RFC3339, UTC, with an
+# AutoSi sub-second fraction. 0 nanos -> "2026-07-28T22:00:00Z".
+fn _agnosai_msg_fmt_rfc3339_a(a, ns): i64 {
+    var secs = ns / AGNOSAI_NS_PER_SEC;
+    var rem = secs % 86400;
+    var buf = alloc_via(a, 32);
+    if (buf == 0) { return 0; }
+    _agnosai_msg_put_date(buf, secs / 86400);
+    store8(buf + 10, 84);
+    _agnosai_msg_put_digits(buf + 11, rem / 3600, 2);
+    store8(buf + 13, 58);
+    _agnosai_msg_put_digits(buf + 14, (rem % 3600) / 60, 2);
+    store8(buf + 16, 58);
+    _agnosai_msg_put_digits(buf + 17, rem % 60, 2);
+    var end = _agnosai_msg_put_subsec(buf, 19, ns % AGNOSAI_NS_PER_SEC);
+    store8(buf + end, 90);
+    store8(buf + end + 1, 0);
+    return str_new_a(a, buf, end + 1);
+}
+
+# Global-allocator form of `_agnosai_msg_fmt_rfc3339_a`.
+fn _agnosai_msg_fmt_rfc3339(ns): i64 {
+    return _agnosai_msg_fmt_rfc3339_a(default_alloc(), ns);
 }
 
 # Two ASCII digits at `p` as a number, or -1 if either is not a digit.
@@ -273,7 +308,7 @@ fn agnosai_message_to_value_a(a, m): i64 {
     bayan_json_v_obj_set_a(a, obj, str_from_a(a, "from"), bayan_json_v_str_new_a(a, from_str));
     bayan_json_v_obj_set_a(a, obj, str_from_a(a, "to"), agnosai_message_target_to_value_a(a, load64(m + AGN_MSG_TO)));
     bayan_json_v_obj_set_a(a, obj, str_from_a(a, "payload"), load64(m + AGN_MSG_PAYLOAD));
-    var ts = _agnosai_msg_fmt_rfc3339(load64(m + AGN_MSG_TIMESTAMP_NS));
+    var ts = _agnosai_msg_fmt_rfc3339_a(a, load64(m + AGN_MSG_TIMESTAMP_NS));
     bayan_json_v_obj_set_a(a, obj, str_from_a(a, "timestamp"), bayan_json_v_str_new_a(a, ts));
     return obj;
 }

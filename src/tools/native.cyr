@@ -165,6 +165,27 @@ fn agnosai_param_schema_to_value_a(a, p): i64 {
     return obj;
 }
 
+# One `ParameterSchema` from its JSON form, in allocator `a`, or 0 when it is malformed. All four
+# fields are required, with the types the form has.
+fn agnosai_param_schema_from_value_a(a, v): i64 {
+    if (bayan_json_v_is_obj(v) != 1) { return 0; }
+    var name = bayan_json_v_obj_get_by_cstr(v, "name");
+    var desc = bayan_json_v_obj_get_by_cstr(v, "description");
+    var ptype = bayan_json_v_obj_get_by_cstr(v, "param_type");
+    var req = bayan_json_v_obj_get_by_cstr(v, "required");
+    if (name == 0 || desc == 0 || ptype == 0 || req == 0) { return 0; }
+    if (bayan_json_v_is_str(name) == 0 || bayan_json_v_is_str(desc) == 0) { return 0; }
+    if (bayan_json_v_is_str(ptype) == 0 || bayan_json_v_is_bool(req) == 0) { return 0; }
+    return agnosai_param_schema_new_a(a, str_clone_a(a, bayan_json_v_str(name)),
+      str_clone_a(a, bayan_json_v_str(desc)), str_clone_a(a, bayan_json_v_str(ptype)),
+      bayan_json_v_bool(req));
+}
+
+# Global-allocator form of `agnosai_param_schema_from_value_a`.
+fn agnosai_param_schema_from_value(v): i64 {
+    return agnosai_param_schema_from_value_a(default_alloc(), v);
+}
+
 # Global-allocator form of `agnosai_param_schema_to_value_a`.
 fn agnosai_param_schema_to_value(p): i64 {
     return agnosai_param_schema_to_value_a(default_alloc(), p);
@@ -244,6 +265,31 @@ fn agnosai_tool_schema_to_value_a(a, s): i64 {
     }
     bayan_json_v_obj_set_a(a, obj, str_from_a(a, "parameters"), arr);
     return obj;
+}
+
+# A tool schema from its JSON form, in allocator `a`, or 0 when it is malformed. `parameters` is
+# required, as it has no default, and one bad entry fails the whole schema.
+fn agnosai_tool_schema_from_value_a(a, v): i64 {
+    if (bayan_json_v_is_obj(v) != 1) { return 0; }
+    var name = bayan_json_v_obj_get_by_cstr(v, "name");
+    var desc = bayan_json_v_obj_get_by_cstr(v, "description");
+    var params = bayan_json_v_obj_get_by_cstr(v, "parameters");
+    if (name == 0 || desc == 0 || params == 0) { return 0; }
+    if (bayan_json_v_is_str(name) == 0 || bayan_json_v_is_str(desc) == 0) { return 0; }
+    if (bayan_json_v_is_arr(params) == 0) { return 0; }
+    var s = agnosai_tool_schema_new_a(a, str_clone_a(a, bayan_json_v_str(name)),
+      str_clone_a(a, bayan_json_v_str(desc)));
+    for (var i = 0; i < bayan_json_v_arr_len(params); i = i + 1) {
+        var one = agnosai_param_schema_from_value_a(a, bayan_json_v_arr_get(params, i));
+        if (one == 0) { return 0; }
+        agnosai_tool_schema_with_param_a(a, s, one);
+    }
+    return s;
+}
+
+# Global-allocator form of `agnosai_tool_schema_from_value_a`.
+fn agnosai_tool_schema_from_value(v): i64 {
+    return agnosai_tool_schema_from_value_a(default_alloc(), v);
 }
 
 # Global-allocator form of `agnosai_tool_schema_to_value_a`.
@@ -496,6 +542,44 @@ fn agnosai_tool_effect_to_wire(effect): i64 {
     if (effect == AGNOSAI_TOOL_EFFECT_NONE) { return "none"; }
     if (effect == AGNOSAI_TOOL_EFFECT_COMMITTED) { return "committed"; }
     return "unknown";
+}
+
+# A tool's parameters as a JSON value, `{"parameters":{...}}`, in allocator `a`. Only what the caller
+# supplied: the call's id, its gate and its allocator are this process's own.
+fn agnosai_tool_input_to_value_a(a, input): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    _agnosai_obj_put_a(a, obj, "parameters", _agnosai_map_to_value_a(a, agnosai_tool_input_parameters(input)));
+    return obj;
+}
+
+# Global-allocator form of `agnosai_tool_input_to_value_a`.
+fn agnosai_tool_input_to_value(input): i64 {
+    return agnosai_tool_input_to_value_a(default_alloc(), input);
+}
+
+# A tool output from its JSON form, in allocator `a`, or 0 when it is malformed. `success` and `result`
+# are required, and `error` may be absent or null. `result` is carried, not copied, so it lives as
+# long as `v`.
+fn agnosai_tool_output_from_value_a(a, v): i64 {
+    if (bayan_json_v_is_obj(v) != 1) { return 0; }
+    var success = bayan_json_v_obj_get_by_cstr(v, "success");
+    var result = bayan_json_v_obj_get_by_cstr(v, "result");
+    if (success == 0 || result == 0 || bayan_json_v_is_bool(success) == 0) { return 0; }
+    var err = 0;
+    var ev = bayan_json_v_obj_get_by_cstr(v, "error");
+    if (ev != 0 && bayan_json_v_is_null(ev) == 0) {
+        if (bayan_json_v_is_str(ev) == 0) { return 0; }
+        err = str_clone_a(a, bayan_json_v_str(ev));
+    }
+    var o = agnosai_tool_output_ok_a(a, result);
+    store64(o + AGN_OUTPUT_SUCCESS, bayan_json_v_bool(success));
+    store64(o + AGN_OUTPUT_ERROR, err);
+    return o;
+}
+
+# Global-allocator form of `agnosai_tool_output_from_value_a`.
+fn agnosai_tool_output_from_value(v): i64 {
+    return agnosai_tool_output_from_value_a(default_alloc(), v);
 }
 
 # A tool output as a bayan JSON value. `error` is **omitted** when absent,

@@ -2,9 +2,29 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-08 (the 2.3.6 release gate).
+> Last refreshed: 2026-11-08 (the 2.3.7 release gate).
 
-## Now — 2.3.6
+## Now — 2.3.7
+
+| | |
+|---|---|
+| **version** | **2.3.7** (cut 2026-11-08): the Rust line's types have their JSON forms, written and parsed, and its log events have their fields. A task's metadata has `latency_ms`, and a failed remote download says why |
+| **cyrius pin** | **6.7.18**, unchanged |
+| **tests** | **108 suites, 11,917 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.3.6's tree read 11,710. `log_fields` is new at 23. 88 mutants, all killed. A first pass let four through: three gaps in new tests, closed, and one guard that could not matter, removed |
+| **coverage** | **99%**: 108/108 files, 1,912/1,922 fns (gate `--min 80`), the same 10 unreferenced as 2.3.6 |
+| **dist** | `dist/agnosai.cyr` 46,804 lines + `dist/agnosai-guard.cyr` 1,034, both v2.3.7, by `wc -l` (2.3.6's read 45,951 and 1,034). Sidecars **6 / 1** leaves, unchanged |
+| **binary** | `build/agnosai` **3,056,208 B** (2.3.6: 3,050,920). aarch64 **7,102,576 B** (7,101,384), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.3.7"` and exits 0 on SIGTERM |
+| **deps** | Unchanged: kavach 3.14.9, and every other dep on its latest tag, checked at the start of this release |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh` 3,328 definitions across 119 files; `check-clean.sh` fmt 241, lint 241, doc 120, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths 240 files; dist. fmt and lint on every test, bench and fuzz file. Then build, aarch64, every test and fuzz unit compiles, tests under DCE, coverage, the example, fuzz 4/4, `distlib --all --check`. **The `ubuntu:26.04` CI replica ran** on the bumped tree with this release's new files laid over a clean clone, wasmtime 47.0.3, all 8 pins from GitHub: every `ci.yml` step, 108 suites, 11,764 assertions, 0 failed, and `cyrius bench`, seven assertions before the last test-only additions |
+| **benchmarks** | The interleaved A/B against a 2.3.6 build on the same `lib/`, four rounds of `tools`, `orch`, `server` and `fleet` at a mean load of 2.5: **median +0.1% across 167 rows**, 165 within 5%. `tool_registry_has_50_miss` +15.6% and `is_safe_url_octal_host` −5.7%, the first of which moved −38.6% and +1.1% across 2.3.6's two runs with no change to it. `agnosai_relay_receive` 1.67 → 1.76 µs, the sender's last sequence read so a gap can be logged. `bench-history.csv` has 247 rows at 2.3.7, one sweep after the CI replica at a load of about 1–2.5: median −5.6% against 2.3.6's rows, not claimed |
+| **JSON forms** | Writers for `NodeInfo`, `ClusterInfo`, `DeviceLink`, `NodeTopology`, `RelayMessage`, `RetryConfig`, `ToolInput`, the package and tool manifests and `KavachToolResult`, each in the caller's allocator with 0 B on the global heap, asserted. Parsers for `TaskProfile`, `BudgetExceeded`, `CachedPlan`, `ToolSchema`, `ParameterSchema` and `ToolOutput`, each refusing what the type could not have written |
+| **log fields** | Asserted through a capturing hook. A relay duplicate is told from a message for another node. Two of the Rust line's fleet events belonged to `select_cheapest_model`, which ADR 030 removed. `wasm_tool.rs` logged nothing. A task id cannot write a line of log of its own |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4. ⚠ A remote-registry failure's text gained a reason, and a task's metadata gained `latency_ms` (CHANGELOG *Behaviour changes*) |
+| **upstream filings** | ⚠ **Six not committed**, so not visible upstream: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies; the pooled connection's allocator), bote (MCP client) |
+
+### 2.3.6 — the release (2026-11-08)
 
 | | |
 |---|---|

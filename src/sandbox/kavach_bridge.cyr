@@ -63,6 +63,8 @@
 # produce.
 # =========================================================================
 
+include "src/log_fields.cyr"
+
 # Field offsets for one sandboxed execution's result.
 enum AgnosaiKavachResultOff {
     AGN_KR_OUTPUT = 0;
@@ -248,6 +250,18 @@ fn agnosai_kavach_scan_output(output: Str): i64 {
 
 # --- Result ---------------------------------------------------------------
 
+# How a run ended.
+fn _agnosai_kavach_log_done(result, strength): i64 {
+    if (sakshi_get_level() < SK_INFO) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start_int(&f, ExecResult_exit_code(result));
+    n = agnosai_log_field_int(&f, n, "duration_ms", ExecResult_duration_ms(result));
+    n = agnosai_log_field_bool(&f, n, "timed_out", ExecResult_timed_out(result));
+    n = agnosai_log_field_int(&f, n, "strength", strength);
+    sakshi_log_kv(SK_INFO, "kavach tool execution completed", 31, "exit_code", 9, &f, n);
+    return 0;
+}
+
 # Build a sandboxed-execution result.
 fn agnosai_kavach_result_new(output: Str, stderr: Str, exit_code, timed_out,
   duration_ms, strength, scan_verdict): i64 {
@@ -260,6 +274,38 @@ fn agnosai_kavach_result_new(output: Str, stderr: Str, exit_code, timed_out,
     store64(r + AGN_KR_STRENGTH, strength);
     store64(r + AGN_KR_SCAN_VERDICT, scan_verdict);
     return r;
+}
+
+# `ScanVerdict`'s JSON form: its variant name, as a C string.
+fn agnosai_scan_verdict_to_wire(verdict): i64 {
+    if (verdict == ScanVerdict.PASS) { return "Pass"; }
+    if (verdict == ScanVerdict.WARN) { return "Warn"; }
+    if (verdict == ScanVerdict.QUARANTINE) { return "Quarantine"; }
+    return "Block";
+}
+
+# A sandboxed-execution result as a JSON value, in allocator `a`. `scan_verdict` is null when no gate
+# ran here.
+fn agnosai_kavach_result_to_value_a(a, r): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    _agnosai_obj_put_str_a(a, obj, "output", load64(r + AGN_KR_OUTPUT));
+    _agnosai_obj_put_str_a(a, obj, "stderr", load64(r + AGN_KR_STDERR));
+    _agnosai_obj_put_int_a(a, obj, "exit_code", load64(r + AGN_KR_EXIT_CODE));
+    _agnosai_obj_put_a(a, obj, "timed_out", _agnosai_bool_to_value_a(a, load64(r + AGN_KR_TIMED_OUT)));
+    _agnosai_obj_put_int_a(a, obj, "duration_ms", load64(r + AGN_KR_DURATION_MS));
+    _agnosai_obj_put_int_a(a, obj, "strength", load64(r + AGN_KR_STRENGTH));
+    var verdict = load64(r + AGN_KR_SCAN_VERDICT);
+    if (verdict == AGNOSAI_KAVACH_NO_VERDICT) {
+        _agnosai_obj_put_a(a, obj, "scan_verdict", bayan_json_v_null_a(a));
+    } else {
+        _agnosai_obj_put_cstr_a(a, obj, "scan_verdict", agnosai_scan_verdict_to_wire(verdict));
+    }
+    return obj;
+}
+
+# Global-allocator form of `agnosai_kavach_result_to_value_a`.
+fn agnosai_kavach_result_to_value(r): i64 {
+    return agnosai_kavach_result_to_value_a(default_alloc(), r);
 }
 
 # The tool's stdout.
@@ -380,6 +426,12 @@ fn agnosai_kavach_execute(command: Str, policy, agent_id, out_err): i64 {
     _agnosai_kavach_ensure_init();
     var config = agnosai_kavach_build_config(policy, agent_id);
     var strength = agnosai_kavach_strength_for_policy(policy);
+    if (sakshi_get_level() >= SK_DEBUG) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start_int(&f, strength);
+        n = agnosai_log_field_int(&f, n, "timeout_ms", agnosai_sandbox_policy_max_duration_secs(policy) * 1000);
+        sakshi_log_kv(SK_DEBUG, "creating kavach sandbox", 23, "strength", 8, &f, n);
+    }
 
     var sandbox = sandbox_create(config);
     if (sandbox == 0) {
@@ -422,6 +474,8 @@ fn agnosai_kavach_execute(command: Str, policy, agent_id, out_err): i64 {
         store64(out_err, agnosai_error_sandbox(str_from("kavach exec failed")));
         return 0;
     }
+
+    _agnosai_kavach_log_done(result, strength);
 
     # `scan_verdict: None` — the gate runs **inside** kavach's `sandbox_exec`
     # and has already been applied to the output by the time it returns

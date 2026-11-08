@@ -37,6 +37,41 @@ fn _t_key(): i64 {
       str_from("sequential"));
 }
 
+fn _t_v237_from_value(): i64 {
+    test_group("a plan from JSON");
+    var a1 = "11111111-1111-4111-8111-111111111111";
+    var a2 = "22222222-2222-4222-8222-222222222222";
+    var plan = agnosai_cached_plan_empty();
+    map_set(agnosai_cached_plan_assignments(plan), str_from(a1), str_from("agent-a"));
+    map_set(agnosai_cached_plan_assignments(plan), str_from(a2), str_from("agent-b"));
+    vec_push(agnosai_cached_plan_execution_order(plan), str_from(a2));
+    vec_push(agnosai_cached_plan_execution_order(plan), str_from(a1));
+    map_set(agnosai_cached_plan_model_selections(plan), str_from(a1), str_from("gpt"));
+    var back = agnosai_cached_plan_from_value(agnosai_cached_plan_to_value(plan));
+    assert_neq(back, 0, "what a plan writes reads back");
+    assert(str_eq_cstr(map_get(agnosai_cached_plan_assignments(back), str_from(a2)), "agent-b") == 1,
+      "with its assignments");
+    assert_eq(map_size(agnosai_cached_plan_assignments(back)), 2, "all of them");
+    assert(str_eq_cstr(vec_get(agnosai_cached_plan_execution_order(back), 0), a2) == 1, "its order, kept");
+    assert(str_eq_cstr(vec_get(agnosai_cached_plan_execution_order(back), 1), a1) == 1, "both places");
+    assert(str_eq_cstr(map_get(agnosai_cached_plan_model_selections(back), str_from(a1)), "gpt") == 1,
+      "and its models");
+    assert_neq(agnosai_cached_plan_from_value(agnosai_cached_plan_to_value(agnosai_cached_plan_empty())), 0,
+      "an empty plan reads");
+    assert_eq(agnosai_cached_plan_from_value(_t_parse_cstr("{\"execution_order\":[],\"model_selections\":{}}")), 0,
+      "a missing map is refused");
+    assert_eq(agnosai_cached_plan_from_value(_t_parse_cstr("{\"assignments\":{},\"model_selections\":{}}")), 0,
+      "a missing order");
+    assert_eq(agnosai_cached_plan_from_value(_t_parse_cstr("{\"assignments\":{},\"execution_order\":[]}")), 0,
+      "the other map");
+    assert_eq(agnosai_cached_plan_from_value(_t_parse_cstr("{\"assignments\":{\"not-an-id\":\"a\"},\"execution_order\":[],\"model_selections\":{}}")), 0, "a key that is no task id");  #skip-lint
+    assert_eq(agnosai_cached_plan_from_value(_t_parse_cstr("{\"assignments\":{},\"execution_order\":[\"not-an-id\"],\"model_selections\":{}}")), 0, "an order entry that is none");  #skip-lint
+    assert_eq(agnosai_cached_plan_from_value(_t_parse_cstr("{\"assignments\":{},\"execution_order\":[3],\"model_selections\":{}}")), 0, "or no string");  #skip-lint
+    assert_eq(agnosai_cached_plan_from_value(_t_parse_cstr("{\"assignments\":{\"11111111-1111-4111-8111-111111111111\":3},\"execution_order\":[],\"model_selections\":{}}")), 0, "a value that is no string");  #skip-lint
+    assert_eq(agnosai_cached_plan_from_value(0), 0, "and nothing");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -206,6 +241,7 @@ fn main() {
         str_from("{\"assignments\":{},\"execution_order\":[],\"model_selections\":{}}")) == 1,
       "an empty plan emits empty collections rather than nulls");
 
+    _t_v237_from_value();
     return assert_summary();
 }
 

@@ -29,6 +29,8 @@
 # `lib/net.cyr` has no SRV resolver either — verified, not assumed.
 # =========================================================================
 
+include "src/log_fields.cyr"
+
 # DiscoveredNode heap layout — 24 bytes.
 enum AgnosaiDiscoveredNodeOff {
     AGN_DN_ADDRESS = 0;
@@ -114,6 +116,11 @@ fn agnosai_discovery_discover(b): i64 {
 # which matches `Clone` on a struct of owned fields closely enough for a caller
 # that only reads them.
 fn _agnosai_static_discover(ctx): i64 {
+    if (sakshi_get_level() >= SK_DEBUG) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start_int(&f, vec_len(ctx));
+        sakshi_log_kv(SK_DEBUG, "static discovery returning fixed node list", 42, "count", 5, &f, n);
+    }
     var out = vec_new();
     for (var i = 0; i < vec_len(ctx); i = i + 1) {
         vec_push(out, vec_get(ctx, i));
@@ -138,7 +145,12 @@ enum AgnosaiDnsDiscoveryOff {
 # ⚠ Returns an EMPTY list, as the oracle does. See the module header: the stub
 # is upstream, not here.
 fn _agnosai_dns_discover(ctx): i64 {
-    sakshi_warn("DNS SRV discovery is a stub - no DNS client dependency available", 64);
+    if (sakshi_get_level() >= SK_WARN) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start(&f, load64(ctx + AGN_DD_SRV_NAME));
+        sakshi_log_kv(SK_WARN, "DNS SRV discovery is a stub - no DNS client dependency available", 64, "srv_name", 8,
+          &f, n);
+    }
     return vec_new();
 }
 

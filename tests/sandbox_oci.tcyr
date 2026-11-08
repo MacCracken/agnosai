@@ -24,6 +24,7 @@ include "src/strcase.cyr"
 include "src/core/mod.cyr"
 include "src/sandbox/mod.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 include "tests/test_tmp.cyr"
 
 # Whether `argv` contains `needle`, in order-independent form.
@@ -553,6 +554,19 @@ fn _t_oci_execute_timeout(): i64 {
     return 0;
 }
 
+fn _t_v237_events(): i64 {
+    test_group("the events");
+    _tl_start(SK_DEBUG);
+    var c = agnosai_oci_config_new(str_from("img"));
+    agnosai_oci_config_set_runtime(c, _t_oci_fake_runtime("logs", "exit 3"));
+    var e[8];
+    store64(&e, 0);
+    agnosai_oci_execute(c, vec_new(), str_from(""), &e);
+    _tl_saw("OCI container finished exit_code=3", "a container says how it ended");
+    _tl_stop();
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -584,6 +598,7 @@ fn main(): i64 {
     # 2.3.5: every scratch path this suite made goes, so two runs at once share none and a run
     # leaves nothing behind (`tests/test_tmp.cyr`).
     _tt_cleanup();
+    _t_v237_events();
     return assert_summary();
 }
 

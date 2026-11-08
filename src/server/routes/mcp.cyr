@@ -277,17 +277,19 @@ fn _agnosai_mcp_tools_call(a, id, params, state, tp: Str): i64 {
     if (tp != 0 && agnosai_telemetry_exporter() != 0) {
         parent = agnosai_otlp_span_context_parse_a(a, tp);
     }
+    var started_ns = clock_now_ns();
     var out = agnosai_tool_execute_in(tool, input, parent);
+    var took_ms = (clock_now_ns() - started_ns) / AGNOSAI_NS_PER_MS;
     # ⚠ **A tool may answer no output at all** — the vtable contract allows 0, and
     # `agnosai_tool_execute_in` null-checks for it and records `error.type` `no_output`. Until
     # 2.1.7 this handler read it three times without checking and segfaulted the worker
     # (roadmap B15). No builtin answers 0, so it was latent; a registered tool could. It is
     # a tool-level failure, `isError: true` with the oracle's fallback text.
     if (out == 0) {
-        _agnosai_mcp_log_call(name, 0);
+        _agnosai_mcp_log_call(name, 0, took_ms);
         return _agnosai_mcp_success(a, id, _agnosai_mcp_content(a, str_from_a(a, "Unknown error"), 1));
     }
-    _agnosai_mcp_log_call(name, agnosai_tool_output_success(out));
+    _agnosai_mcp_log_call(name, agnosai_tool_output_success(out), took_ms);
 
     if (agnosai_tool_output_success(out) == 1) {
         return _agnosai_mcp_success(a, id,
@@ -518,9 +520,13 @@ fn _agnosai_mcp_result_text(a, result): Str {
     return bayan_json_v_build_a(a, result);
 }
 
-fn _agnosai_mcp_log_call(name: Str, success): i64 {
+fn _agnosai_mcp_log_call(name: Str, success, duration_ms): i64 {
     if (sakshi_get_level() < SK_INFO) { return 0; }
-    sakshi_log_kv(SK_INFO, "MCP tool call", 13, "tool", 4, str_data(name), str_len(name));
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start(&f, name);
+    n = agnosai_log_field_bool(&f, n, "success", success);
+    n = agnosai_log_field_int(&f, n, "duration_ms", duration_ms);
+    sakshi_log_kv(SK_INFO, "MCP tool call", 13, "tool", 4, &f, n);
     return 0;
 }
 

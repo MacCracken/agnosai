@@ -19,6 +19,38 @@ fn _t_assert_ts(ns, expected, name): i64 {
     return assert(str_eq(_agnosai_msg_fmt_rfc3339(ns), str_from(expected)) == 1, name);
 }
 
+fn _t_v237_rfc3339(): i64 {
+    test_group("RFC 3339, in an allocator");
+    var ar = arena_allocator_growable(4096);
+    var wrong = 0;
+    var kept = 0;
+    # Leap days, month ends, century rules, and a stride that lands on every day of the month.
+    var secs = 0;
+    while (secs < 5000000000) {
+        var want = str_from(iso8601(secs));
+        var before = alloc_used();
+        var got = _agnosai_msg_fmt_rfc3339_a(ar, secs * AGNOSAI_NS_PER_SEC);
+        kept = kept + alloc_used() - before;
+        if (str_eq(got, want) != 1) { wrong = wrong + 1; }
+        reset_via(ar);
+        secs = secs + 2678411;
+    }
+    assert_eq(wrong, 0, "it agrees with the stdlib's date arithmetic across 150 years");
+    assert_eq(kept, 0, "and leaves nothing on the global heap");
+    var feb29 = _agnosai_msg_fmt_rfc3339_a(ar, 1709164800 * AGNOSAI_NS_PER_SEC);
+    assert(str_eq_cstr(feb29, "2024-02-29T00:00:00Z") == 1, "a leap day");
+    var end = _agnosai_msg_fmt_rfc3339_a(ar, 4102444799 * AGNOSAI_NS_PER_SEC);
+    assert(str_eq_cstr(end, "2099-12-31T23:59:59Z") == 1, "the last second of a year");
+    var one = _agnosai_msg_fmt_rfc3339_a(ar, 1785276000 * AGNOSAI_NS_PER_SEC + 500000000);
+    assert(str_eq_cstr(one, "2026-07-28T22:00:00.500Z") == 1, "whole milliseconds as three digits");
+    var two = _agnosai_msg_fmt_rfc3339_a(ar, 1785276000 * AGNOSAI_NS_PER_SEC + 1500);
+    assert(str_eq_cstr(two, "2026-07-28T22:00:00.000001500Z") == 1, "and anything finer as nine");
+    var three = _agnosai_msg_fmt_rfc3339_a(ar, 1785276000 * AGNOSAI_NS_PER_SEC + 1000);
+    assert(str_eq_cstr(three, "2026-07-28T22:00:00.000001Z") == 1, "whole microseconds as six");
+    assert_eq(load8(str_data(three) + str_len(three)), 0, "NUL-terminated, for what takes a C string");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -151,6 +183,7 @@ fn main() {
         bayan_json_v_build(agnosai_message_to_value(msg))), 1, "message_to_value_a agrees");
     assert_eq(str_eq(agnosai_message_to_json_a(ms_ar, msg), agnosai_message_to_json(msg)), 1,
       "message_to_json_a agrees byte-for-byte");
+    _t_v237_rfc3339();
     return assert_summary();
 }
 

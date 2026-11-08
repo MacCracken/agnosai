@@ -43,6 +43,7 @@ include "src/id.cyr"
 include "src/core/mod.cyr"
 include "src/fleet/federation.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 
 # The oracle's `test_config`: 100 ms suspect, 200 ms offline.
 fn _t_fed_config(id): i64 {
@@ -63,6 +64,52 @@ fn _t_backdate(fm, id, ms): i64 {
     var c = agnosai_federation_cluster(fm, str_from(id));
     agnosai_cluster_info_set_last_heartbeat_instant(c, clock_now_ns() - ms * 1000000);
     return c;
+}
+
+# The JSON form of a peer, and the events a federation writes.
+fn _t_v237_form_and_events(): i64 {
+    test_group("the JSON form and the events");
+    _tl_start(SK_DEBUG);
+    var cfg = agnosai_federation_config_new(str_from("east"), str_from("http://e:1"));
+    var fm = agnosai_federation_manager_new(cfg);
+    _tl_saw("federation manager initialized cluster_id=east seeds=0", "the manager says who it is");
+    agnosai_federation_heartbeat(fm, str_from("west"), str_from("http://w:1"), 3);
+    _tl_saw("new cluster joined federation cluster=west", "a new cluster is named");
+    _tl_saw("heartbeat received cluster=west node_count=3", "and its heartbeat has its count");
+    var c = agnosai_federation_cluster(fm, str_from("west"));
+    agnosai_cluster_info_set_last_heartbeat_instant(c, clock_now_ns() - 15000000000);
+    agnosai_federation_check_liveness(fm);
+    _tl_saw("cluster marked suspect cluster=west", "a late cluster is named");
+    agnosai_cluster_info_set_last_heartbeat_instant(c, clock_now_ns() - 60000000000);
+    agnosai_federation_check_liveness(fm);
+    _tl_saw("cluster marked offline cluster=west", "and an absent one");
+    agnosai_federation_start_election(fm);
+    _tl_saw("starting election cluster=east term=1", "an election says its term");
+    agnosai_federation_declare_coordinator(fm, 0, str_from("west"));
+    _tl_saw("ignoring stale coordinator declaration declared_term=0 current_term=1", "a stale one says both terms");
+    agnosai_federation_declare_coordinator(fm, 1, str_from("west"));
+    _tl_saw("coordinator elected coordinator=west term=1", "the winner is named");
+
+    store64(c + AGN_CLI_LAST_HEARTBEAT, 1785276000);
+    var ar = arena_allocator_growable(4096);
+    var before = alloc_used();
+    var v = agnosai_cluster_info_to_value_a(ar, c);
+    assert_eq(alloc_used() - before, 0, "the form is built in the caller's allocator");
+    assert(str_eq_cstr(bayan_json_v_build(v), "{\"id\":\"west\",\"endpoint\":\"http://w:1\",\"status\":\"Offline\",\"role\":\"Coordinator\",\"node_count\":3,\"last_heartbeat\":\"2026-07-28T22:00:00Z\"}") == 1,  #skip-lint
+      "a cluster reads as the Rust line wrote it");
+    assert(str_eq_cstr(str_from(agnosai_cluster_status_to_wire(AGNOSAI_CLUSTER_ONLINE)), "Online") == 1, "Online");
+    assert(str_eq_cstr(str_from(agnosai_cluster_status_to_wire(AGNOSAI_CLUSTER_SUSPECT)), "Suspect") == 1, "Suspect");
+    assert(str_eq_cstr(str_from(agnosai_federation_role_to_wire(AGNOSAI_FED_FOLLOWER)), "Follower") == 1, "Follower");
+    assert(str_eq_cstr(str_from(agnosai_federation_role_to_wire(AGNOSAI_FED_CANDIDATE)), "Candidate") == 1,
+      "Candidate");
+    assert_neq(agnosai_cluster_info_to_value(c), 0, "the bare form");
+
+    agnosai_cluster_info_set_status(c, AGNOSAI_CLUSTER_OFFLINE);
+    agnosai_cluster_info_set_last_heartbeat_instant(c, clock_now_ns() - 900000000000);
+    agnosai_federation_evict_offline(fm, 1);
+    _tl_saw("evicting offline cluster cluster=west", "and one evicted");
+    _tl_stop();
+    return 0;
 }
 
 fn main(): i64 {
@@ -469,6 +516,7 @@ fn main(): i64 {
     assert(str_eq_cstr(agnosai_federation_config_cluster_id(
           agnosai_federation_config(fcfg)), "z") == 1, "a manager exposes its config");
 
+    _t_v237_form_and_events();
     return assert_summary();
 }
 

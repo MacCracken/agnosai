@@ -47,6 +47,7 @@ include "src/server/routes/dashboard.cyr"
 include "src/server/routes/crews.cyr"
 include "src/server/routes/a2a.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 
 # The same state over a caller-supplied orchestrator, so a test can hold the
 # registry and the audit chain it wants to inspect afterwards.
@@ -468,6 +469,48 @@ fn _t_a2a_retained_state_survives_its_arena(): i64 {
     return 0;
 }
 
+fn _t_v237_events(): i64 {
+    test_group("the events");
+    var s = _t_state();
+    # An id too long to log whole, its 100th and 101st bytes the two halves of a two-byte character.
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"");
+    str_builder_add_str(sb, _t_str_of(99, 97));
+    str_builder_add_cstr(sb, "\u00e9");
+    str_builder_add_str(sb, _t_str_of(AGNOSAI_A2A_MAX_STRING_LEN, 97));
+    str_builder_add_cstr(sb, "\",\"description\":\"d\"}");
+    _tl_start(SK_WARN);
+    agnosai_route_a2a_receive(s, str_builder_build(sb));
+    var line = _tl_line("A2A rejected: field exceeds max length task_id=");
+    assert_neq(line, 0, "a rejection is logged");
+    assert(str_len(line) <= 38 + 9 + 100, "with a prefix of the id, not all of it");
+    assert(str_len(line) >= 38 + 9 + 99, "as much of it as ends on a character");
+    assert_eq(load8(str_data(line) + str_len(line) - 1), 97, "and no half character");
+
+    # An id that can forge a line of log, in a request that is rejected and so logged.
+    var forged = str_builder_new();
+    str_builder_add_cstr(forged, "{\"task_id\":\"a\\nFAKE");
+    str_builder_add_str(forged, _t_str_of(AGNOSAI_A2A_MAX_STRING_LEN, 97));
+    str_builder_add_cstr(forged, "\",\"description\":\"d\"}");
+    _TL_LINES = vec_new();
+    agnosai_route_a2a_receive(s, str_builder_build(forged));
+    _tl_saw("A2A rejected: field exceeds max length task_id=a?FAKE", "a newline in an id is logged as ?");
+    _tl_never("\n", "so it cannot write a line of its own");
+
+    var md = str_builder_new();
+    str_builder_add_cstr(md, ",\"metadata\":{\"blob\":\"");
+    str_builder_add_str(md, _t_str_of(AGNOSAI_A2A_MAX_METADATA_BYTES + 100, 120));
+    str_builder_add_cstr(md, "\"}");
+    _TL_LINES = vec_new();
+    agnosai_route_a2a_receive(s, _t_req_body_raw(str_builder_build(md)));
+    var bytes = str_builder_new();
+    str_builder_add_cstr(bytes, "A2A rejected: metadata exceeds limit task_id=t1 metadata_bytes=");
+    str_builder_add_int(bytes, AGNOSAI_A2A_MAX_METADATA_BYTES + 100 + 11);
+    _tl_saw(str_data(str_builder_build(bytes)), "metadata over the limit says how much it was");
+    _tl_stop();
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -489,6 +532,7 @@ fn main(): i64 {
     _t_a2a_retained_state_survives_its_arena();
     _t_receive_traced();
 
+    _t_v237_events();
     return assert_summary();
 }
 

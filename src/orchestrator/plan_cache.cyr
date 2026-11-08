@@ -181,6 +181,39 @@ fn agnosai_cached_plan_to_value(p): i64 {
     return obj;
 }
 
+# A `{task id: string}` object as a map, or 0 when it is not one or a key is not a task id.
+fn _agnosai_plan_map_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) != 1) { return 0; }
+    var m = map_new_str();
+    for (var i = 0; i < bayan_json_v_obj_len(v); i = i + 1) {
+        var id = agnosai_uuid_canonical(bayan_json_v_obj_key(v, i));
+        var val = bayan_json_v_obj_val(v, i);
+        if (id == 0 || bayan_json_v_is_str(val) == 0) { return 0; }
+        map_set(m, id, str_clone(bayan_json_v_str(val)));
+    }
+    return m;
+}
+
+# A plan from its JSON form, or 0 when it is malformed. All three fields are required, and every key
+# and every entry of the order must be a task id. On the global heap, as a cached plan outlives the
+# request that read it.
+fn agnosai_cached_plan_from_value(v): i64 {
+    if (bayan_json_v_is_obj(v) != 1) { return 0; }
+    var assignments = _agnosai_plan_map_from_value(bayan_json_v_obj_get_by_cstr(v, "assignments"));
+    var models = _agnosai_plan_map_from_value(bayan_json_v_obj_get_by_cstr(v, "model_selections"));
+    var ov = bayan_json_v_obj_get_by_cstr(v, "execution_order");
+    if (assignments == 0 || models == 0 || bayan_json_v_is_arr(ov) != 1) { return 0; }
+    var order = vec_new();
+    for (var i = 0; i < bayan_json_v_arr_len(ov); i = i + 1) {
+        var e = bayan_json_v_arr_get(ov, i);
+        if (bayan_json_v_is_str(e) == 0) { return 0; }
+        var id = agnosai_uuid_canonical(bayan_json_v_str(e));
+        if (id == 0) { return 0; }
+        vec_push(order, id);
+    }
+    return agnosai_cached_plan_new(assignments, order, models);
+}
+
 # A cache entry: the plan plus its LRU and TTL metadata.
 enum AgnosaiCacheEntryOff {
     AGN_CE_KEY = 0;

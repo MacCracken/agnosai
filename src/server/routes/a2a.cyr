@@ -193,7 +193,7 @@ fn agnosai_route_a2a_receive_tp_a(a, state, body: Str, tp: Str): i64 {
         # The oracle warns here with the task id truncated to 100 chars
         # (`a2a.rs:84-87`); the port returned the 400 with no server-side record
         # of a rejected delegation at all.
-        _agnosai_a2a_warn("A2A rejected: field exceeds max length", 38, tid);
+        _agnosai_a2a_warn_prefix("A2A rejected: field exceeds max length", 38, tid);
         return _agnosai_a2a_failed_a(a, HTTP_BAD_REQUEST, tid,
           str_from_a(a, "field exceeds max length"));
     }
@@ -204,10 +204,11 @@ fn agnosai_route_a2a_receive_tp_a(a, state, body: Str, tp: Str): i64 {
     # incoming body does not count against it.
     var md = agnosai_a2a_req_metadata(req);
     if (md != 0) {
-        if (str_len(bayan_json_v_build_a(a, md)) > AGNOSAI_A2A_MAX_METADATA_BYTES) {
+        var md_bytes = str_len(bayan_json_v_build_a(a, md));
+        if (md_bytes > AGNOSAI_A2A_MAX_METADATA_BYTES) {
             # Oracle: `warn!(task_id, metadata_bytes, "A2A rejected: metadata
             # exceeds limit")` (`a2a.rs:101-105`).
-            _agnosai_a2a_warn("A2A rejected: metadata exceeds limit", 36, tid);
+            _agnosai_a2a_warn_metadata(tid, md_bytes);
             return _agnosai_a2a_failed_a(a, HTTP_BAD_REQUEST, tid,
               str_from_a(a, "metadata exceeds 64 KiB limit"));
         }
@@ -323,7 +324,36 @@ fn _agnosai_a2a_failed(status, task_id: Str, message: Str): i64 {
 
 fn _agnosai_a2a_warn(msg, msg_len, task_id: Str): i64 {
     if (sakshi_get_level() < SK_WARN) { return 0; }
-    sakshi_log_kv(SK_WARN, msg, msg_len, "task_id", 7, str_data(task_id), str_len(task_id));
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start(&f, task_id);
+    sakshi_log_kv(SK_WARN, msg, msg_len, "task_id", 7, &f, n);
+    return 0;
+}
+
+# The first 100 bytes of a task id too long to log whole, ending on a character boundary.
+var AGNOSAI_A2A_LOG_ID_PREFIX = 100;
+
+# A rejection whose task id is what was too long, so it logs a prefix. The id came from the request.
+fn _agnosai_a2a_warn_prefix(msg, msg_len, task_id: Str): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    var keep = str_len(task_id);
+    if (keep > AGNOSAI_A2A_LOG_ID_PREFIX) {
+        keep = AGNOSAI_A2A_LOG_ID_PREFIX;
+        while (keep > 0 && (load8(str_data(task_id) + keep) & 192) == 128) { keep = keep - 1; }
+    }
+    var head[16];
+    store64(&head, str_data(task_id));
+    store64(&head + 8, keep);
+    return _agnosai_a2a_warn(msg, msg_len, &head);
+}
+
+# A rejection for metadata over the limit, with how much there was.
+fn _agnosai_a2a_warn_metadata(task_id: Str, metadata_bytes): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start(&f, task_id);
+    n = agnosai_log_field_int(&f, n, "metadata_bytes", metadata_bytes);
+    sakshi_log_kv(SK_WARN, "A2A rejected: metadata exceeds limit", 36, "task_id", 7, &f, n);
     return 0;
 }
 

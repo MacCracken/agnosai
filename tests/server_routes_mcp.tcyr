@@ -45,6 +45,7 @@ include "src/server/routes/crews.cyr"
 include "src/server/routes/a2a.cyr"
 include "src/server/routes/mcp.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 
 # The oracle's `test_app()`: a registry carrying the echo tool.
 fn _t_state(): i64 {
@@ -681,6 +682,19 @@ fn _t_mcp_advertises_prompts(): i64 {
     return 0;
 }
 
+fn _t_v237_events(): i64 {
+    test_group("the events");
+    _tl_start(SK_INFO);
+    agnosai_route_mcp(_t_state(),
+      _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hello\"}}"));
+    _tl_saw("MCP tool call tool=echo success=true duration_ms=", "a call says what it did and how long it took");
+    _TL_LINES = vec_new();
+    agnosai_route_mcp(_t_state(), _t_rpc("tools/call", ",\"params\":{\"name\":\"echo\"}"));
+    _tl_saw("MCP tool call tool=echo success=false duration_ms=", "and when it failed");
+    _tl_stop();
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -712,6 +726,7 @@ fn main(): i64 {
     _t_mcp_advertises_prompts();
     _t_tools_call_traced();
 
+    _t_v237_events();
     return assert_summary();
 }
 

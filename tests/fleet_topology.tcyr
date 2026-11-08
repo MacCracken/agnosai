@@ -62,6 +62,30 @@ fn _t_nvlink(a, b): i64 {
     return agnosai_device_link_new(a, b, AGNOSAI_INTERCONNECT_NVLINK, f64_from(600));
 }
 
+fn _t_v237_form(): i64 {
+    test_group("the JSON form");
+    var t = agnosai_node_topology_new();
+    agnosai_node_topology_with_link(t, agnosai_device_link_new(0, 1, AGNOSAI_INTERCONNECT_NVLINK, f64_from(50)));
+    var ar = arena_allocator_growable(4096);
+    var before = alloc_used();
+    var v = agnosai_node_topology_to_value_a(ar, t);
+    assert_eq(alloc_used() - before, 0, "the form is built in the caller's allocator");
+    var link = bayan_json_v_arr_get(bayan_json_v_obj_get_by_cstr(v, "links"), 0);
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(link, "device_a")), 0, "device_a");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(link, "device_b")), 1, "device_b");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(link, "interconnect")), "NvLink") == 1,
+      "the interconnect's name");
+    assert_eq(bayan_json_v_float(bayan_json_v_obj_get_by_cstr(link, "bandwidth_gbps")), f64_from(50),
+      "the bandwidth, as a float");
+    assert(str_eq_cstr(str_from(agnosai_interconnect_to_wire(AGNOSAI_INTERCONNECT_PCIE)), "Pcie") == 1, "Pcie");
+    assert(str_eq_cstr(str_from(agnosai_interconnect_to_wire(AGNOSAI_INTERCONNECT_XGMI)), "Xgmi") == 1, "Xgmi");
+    assert(str_eq_cstr(str_from(agnosai_interconnect_to_wire(AGNOSAI_INTERCONNECT_CXL)), "Cxl") == 1, "Cxl");
+    assert_neq(agnosai_node_topology_to_value(t), 0, "the bare form");
+    assert_neq(agnosai_device_link_to_value(agnosai_device_link_new(0, 1, 0, f64_from(1))), 0, "and for a link");
+    assert_neq(agnosai_device_link_to_value_a(ar, agnosai_device_link_new(0, 1, 0, f64_from(1))), 0, "in an arena too");
+    return 0;
+}
+
 fn main(): i64 {
     # --- oracle: single_gpu_scores_perfectly ----------------------------
     _t_assert_f64(agnosai_topology_score(agnosai_node_topology_new(), _t_gpu_inventory(1)),
@@ -232,6 +256,7 @@ fn main(): i64 {
     assert_eq(agnosai_topology_supports_tensor_parallel(mixed, 2), 1,
       "leaving only enough for a pair");
 
+    _t_v237_form();
     return assert_summary();
 }
 
