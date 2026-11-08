@@ -369,8 +369,7 @@ fn _t_input_suite(): i64 {
     assert_eq(agnosai_wasm_result_exit_code(early), 0, "exits 0, and this process survives it");
 
     # The input is not copied. It was, onto the no-free bump, so this cost 4 MiB for good. Read
-    # against an empty input, as every call leaves kavach's own 1 MiB capture buffer behind
-    # (roadmap B40, filed), which this suite cannot do anything about.
+    # against an empty input.
     var buf = alloc(4194305);
     memset(buf, 65, 4194304);
     var input = str_new(buf, 4194304);
@@ -381,6 +380,11 @@ fn _t_input_suite(): i64 {
     agnosai_wasm_execute(s, nop, input, &err);
     var big_cost = alloc_used() - before;
     assert(big_cost - base_cost < 65536, "a call does not keep its input");
+    # ⚠ And a call keeps what its guest wrote, not kavach's capture buffer. Through kavach 3.14.6 every
+    # call kept 1 MiB for good, whatever it wrote: 1,051,513 B a call, measured. 3.14.7 copies the
+    # capture out and gives its buffer back, and this call reads 3,160 B here. The bound is not that
+    # figure, as the module's path is in it and CI's temporary directory is not this one.
+    assert(base_cost < 16384, "a call keeps a few KiB, not kavach's 1 MiB capture buffer");
 
     # An empty input and no input at all are both an empty stdin.
     var none = agnosai_wasm_execute(s, nop, 0, &err);

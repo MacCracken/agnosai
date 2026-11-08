@@ -7,6 +7,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.3] — 2026-11-08
+
+A model is chosen by what hoosh says it is. hoosh 2.10.2's catalog says each model's tier, what it is for, and whether it
+takes tools, and agnosai now reads all three ([ADR 030](docs/adr/030-a-model-comes-from-the-gateways-catalog.md)'s
+addendum). An agent with tools is never given a model the gateway says takes none, and an embedder is never sent to
+chat. On 2.3.2 a `complexity: high` agent with tools on an OpenAI route got `gpt-6-astra`, which takes no tools on Chat
+Completions, and a box of local models with `bge-m3` listed first sent every task to it. kavach moves to 3.14.7, which
+gives back the 1 MiB each WASM call kept.
+
+### Added
+
+- **model_catalog:** `agnosai_model_catalog_pick_for(c, tier, tools)` and `agnosai_model_for_tier_tools_a(a, client, tier,
+  tools, out_model)`, which choose for a task that sends tools when `tools` is 1. The bare `agnosai_model_catalog_pick` and
+  `agnosai_model_for_tier_a` choose for a task with none, as before. An entry's `agnosai_model_entry_hoosh_tier`, `_kind`,
+  `_tools` and `_chat`, with `AGNOSAI_HOOSH_TIER_*` (hoosh's four words, and undeclared) and `AGNOSAI_MODEL_KIND_*`.
+- Two benchmark rows: `model_catalog_parse_200_tiered`, hoosh 2.10.2's shape of the 200-model list, and
+  `model_for_tier_premium_tools`.
+
+### Changed
+
+- **Selection reads hoosh's `tier`.** Where any model on the ladder has one, the tier decides and the first listed in it
+  wins. Fast takes `economy`, Capable `standard`, and Premium `premium` and then `reasoning`. A tier with nothing in it takes
+  the nearest tier below it, then the nearest above. A model with no tier is left out while any model has one, and the price
+  rule of 2.3.1 runs only when none does, which is every gateway older than hoosh 2.10.2. On hoosh's Claude lineup the answers
+  are the ones 2.3.1 gave: Fast `claude-haiku-5-5`, Capable `claude-sonnet-5-5`, Premium `claude-fable-5-1`.
+- **`kind` says what is a chat model**, and outranks the twelve words. `chat` is chat even when the id holds one of them
+  (`gpt-4o-audio-preview`), and any other word is not. The words are read only for an entry with no `kind`, which on hoosh
+  2.10.2 hoosh has already run through the same words.
+- **A task whose request carries tools is chosen for under the tools rule.** A task carries tools when its crew has a tool
+  loop and its agent names a tool. Such a task is never given a model with `tools: false`, and a model nobody spoke for may
+  take them. Its ladder is the paid models it can send, so a local model that takes tools serves where every paid one says
+  `false`. A refused id is re-selected under the same rule. The agent's `llm_model` and the `AGNOSAI_MODEL_*` overrides are
+  sent as written, unchecked.
+- **A list with chat models and none that takes tools** fails such a task before any request, with
+  `no model catalog: hoosh lists no chat model that takes tools; name a model on the agent, or set AGNOSAI_MODEL_CAPABLE`.
+  The list is read again at most once a minute in this case, as only hoosh changing it helps. A gateway that is down, or
+  that lists no chat model at all, is still asked again at once.
+- **The `model catalog read` line** also says what a task with tools gets, where that is something else:
+  `capable+tools=gpt-6-sol premium+tools=gpt-5.6-sol`, or `none`.
+- **kavach 3.14.6 → 3.14.7.** ⚠ **A crew profile's `sandbox_strength` for the process policy reads 55, not 60.** kavach's
+  `score_backend` stopped crediting the process backend +5 for `network_enabled = 0`, which its path applies only with a
+  rootfs or `config_require_namespaces`, and agnosai's process tier sets neither. Native (10), WASM (75) and container (60)
+  are unchanged. kavach's other changes reach agnosai only through WASM, below.
+- **Roadmap.** Confinement of the process, Python and OCI tools leaves *Waiting on another project*, as kavach shipped its
+  fix, and is 2.3.4, the threat model's largest gap. So WASM tools move to 2.3.5, network tools to 2.3.6, and JSON forms and
+  log fields to 2.3.7. The roadmap's lookup table says so, for text written before this release, 2.3.2's entry below
+  included. *Require hoosh 2.10.2 or newer?* now lists the twelve words among what it would retire.
+
+### Fixed
+
+- **An agent with tools was sent a model that takes none**, and got the provider's 400, which no re-selection answers. The
+  catalog had no tools bit to read, and ADR 030 listed this as its sharpest known wrong answer. hoosh 2.10.2 added the bit, and
+  selection now reads it.
+- **An embedder listed first was every tier on a box of local models.** `bge-m3` holds none of the twelve words, and was
+  free and first. `kind: embedding` keeps it off every tier.
+- **An Anthropic route limited to Haiku made Premium a Haiku**, as only Anthropic declared reasoning. hoosh's tier decides
+  now, so beside an OpenAI route Premium is OpenAI's first `premium` model.
+- **CONTRIBUTING's check that every unit compiles failed on every benchmark.** It ran `cyrius build` on `benches/*.bcyr`,
+  which does not add the bench library and reports `bench_new` undefined on all eleven. It builds tests and fuzz targets,
+  and leaves the benchmarks to `cyrius bench`, which exits 1 on a compile error.
+- **A WASM call kept 1 MiB for good**: kavach's capture buffer, whatever the guest wrote. kavach 3.14.7 copies the capture out
+  and gives the buffer back. `tests/sandbox_wasm.tcyr` reads 3,160 B a call, where kavach measured 1,051,513 B on 3.14.6, and
+  now bounds it at 16 KiB.
+
+**Measured end to end:** a real hoosh 2.10.2 at stub providers, and the real agnosai server running one-agent crews. Each
+cell is the model the provider was asked for:
+
+| Crew | 2.3.2 | 2.3.3 |
+|---|---|---|
+| OpenAI, `high`, with tools | `gpt-6-astra` | `gpt-5.6-sol` |
+| OpenAI, `high`, no tools | `gpt-6-astra` | `gpt-6-astra` |
+| OpenAI, `medium`, with tools | `gpt-6.1-sol` | `gpt-6-sol` |
+| OpenAI, `medium`, no tools | `gpt-6.1-sol` | `gpt-6.1-sol` |
+| Ollama, `high` | `bge-m3:latest` | `llama3.2:3b` |
+| Ollama, `medium`, with tools | `bge-m3:latest` | `llama3.2:3b` |
+
+### Performance
+
+Interleaved A/B against a 2.3.2 build with the same `lib/`, so kavach 3.14.7 is on both sides: `llm` and `orch`, five
+rounds at a mean load of 1.9, read **median −0.1% across 115 rows**, 109 within ±5%. Two groups moved, and both are a call:
+
+- **`model_for_tier_{fast,capable,premium}`: 59 → 62 ns, +5%**, in a second `llm` A/B, four rounds at a load of 2.5. The
+  bare form now forwards to `agnosai_model_for_tier_tools_a`. The first run read +10.5%, 57 → 63 ns, with the catalog's
+  read also a call of its own, so `_agnosai_model_slot_pick` now reads the pick itself. A crew does not take the bare
+  form, and `model_for_tier_premium_tools`, the path it does take, reads 58 ns.
+- **`crew_select_model_routed`: 144 → 151 ns, +4.9%**, in a second `orch` A/B, three rounds at a load of 2.3, from +6.8%
+  before the read was written out. The row calls the bare `_agnosai_crew_select_model`, one call above the path a task
+  takes. `task_one_tool_call` reads −0.1% and `task_four_tool_calls_kept` −0.9%.
+- **`model_catalog_parse_200`: 1.87 → 1.94 ms, +3.3%**: three more fields read for each entry. It runs once for each
+  change at hoosh. New: `model_catalog_parse_200_tiered`, the same list in hoosh 2.10.2's shape, 2.08 ms, as one entry in
+  four refuses tools, so the three picks for a task with tools are computed too.
+- **A held catalog is 164 B an entry**, 24 B more than 2.3.2's, for the three fields.
+
+`pubsub_subscribe_at_cap` (−19%) and `scheduler_load_dag_linear_500` (+5.3%) moved in the second `orch` run, and this
+release touches neither. They are not claimed. `bench-history.csv` has 241 rows at 2.3.3, one sweep at a load of 1.0–1.3:
+median +0.0% against 2.3.2's rows, 210 of 239 within ±5%, not claimed, as a sweep is one run.
+
+### Tests
+
+- `llm_model_catalog` +62: every field read, absent and unknown words, the four known wrong answers each gone and each
+  fallback still in place, the nearest-tier order, the tools ladder, and the read line. `orch_model_selection` +28: what a
+  task with tools sends end to end, its error, the ration in that case, a gateway coming back, the unchecked overrides, and a
+  re-selection under the tools rule. `sandbox_wasm` bounds a call's cost, and `sandbox_kavach_bridge` pins the process
+  score at 55.
+- **26 mutants** of the new rules, each applied, run against both selection suites, and restored: all 26 fail a named
+  assertion.
+
+### Verified
+
+- **105 suites, 11,199 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's
+  printed line as well as its exit code. 2.3.2's tree read 11,105. Coverage 99%, 1,823 of 1,834 functions.
+- `check-symbols.sh`, `check-clean.sh` (fmt, lint, doc, vet, deny, `deps --verify`, the lib snapshot, log lengths, dist),
+  fmt and lint on every test, bench and fuzz file, the build, the aarch64 build, the example, fuzz 4/4,
+  `distlib --all --check` and `cyrius bench`.
+- **The `ubuntu:26.04` CI replica**, every `ci.yml` step from a clean clone with this tree laid over it, wasmtime 47.0.3,
+  and all 8 pins resolved from GitHub: 105 suites, 11,053 assertions, 0 failed.
+- The binary answers `/ready` with `"version":"2.3.3"` and exits 0 on SIGTERM.
+- The end-to-end run above, through a real hoosh 2.10.2, on both builds.
+
 ## [2.3.2] — 2026-11-07
 
 A tool's answer goes back with its turn. A tool used to leave what it built on the global heap for good, the one thing on

@@ -190,8 +190,10 @@ tree — a provider is a *label* that routes a model string, not a separate
 transport.
 
 agnosai carries no model names. Task complexity picks a tier (Fast / Capable / Premium), and what a tier means is read
-from hoosh's catalog, by what each model declares and costs ([ADR 030](docs/adr/030-a-model-comes-from-the-gateways-catalog.md)),
-so a provider's new model needs no agnosai release. `AGNOSAI_MODEL_FAST`, `AGNOSAI_MODEL_CAPABLE` and
+from hoosh's catalog ([ADR 030](docs/adr/030-a-model-comes-from-the-gateways-catalog.md)): by hoosh's own tier for each
+model on hoosh 2.10.2 or newer, and by what each model declares and costs on an older gateway. A model hoosh calls
+anything but `chat` is never chosen, and an agent with tools is never given one hoosh says takes none. So a provider's
+new model needs no agnosai release. `AGNOSAI_MODEL_FAST`, `AGNOSAI_MODEL_CAPABLE` and
 `AGNOSAI_MODEL_PREMIUM` override a tier. ⚠ With no catalog and no override, a crew that names no model fails, with an
 error starting `no model catalog:`, rather than send a guess.
 

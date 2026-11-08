@@ -171,7 +171,7 @@ arena to be had a call answers on the global heap, as it would off the loop. Giv
 so a journal that kept the call reads 0, and not what the next turn wrote there.
 
 A tool on the network is not at 0, and what is left is not the tool's: sandhi leaves 408–480 B an exchange (waiting on sandhi), the SSRF
-guard parses a URL on the global heap, 136 B a check, and `load_testing` joins its threads, 4,120 B a user (roadmap 2.3.5).
+guard parses a URL on the global heap, 136 B a check, and `load_testing` joins its threads, 4,120 B a user (roadmap 2.3.6).
 
 What is read of a result is rendered to the cap and no further, and redaction reads 256 bytes past the cut, so it sees a
 key the cut would halve. `bayan_json_v_build_a` renders all of it, and an arena keeps its chunks: a 4 MiB object left this

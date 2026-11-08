@@ -2,9 +2,29 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-07 (the 2.3.2 release gate).
+> Last refreshed: 2026-11-07 (the 2.3.3 release gate).
 
-## Now — 2.3.2
+## Now — 2.3.3
+
+| | |
+|---|---|
+| **version** | **2.3.3** (cut 2026-11-08, the bump script's UTC date; 2026-11-07 Pacific): a model is chosen by what hoosh says it is. Where hoosh 2.10.2's catalog gives `tier`, `kind` and `tools`, they decide (ADR 030's addendum). An agent with tools is never given a model hoosh says takes none, and an embedder is never sent to chat. kavach moves to 3.14.7, which gives back each WASM call's 1 MiB. Confinement of the process, Python and OCI tools takes 2.3.4, as kavach shipped its fix |
+| **cyrius pin** | **6.7.18**, unchanged |
+| **tests** | **105 suites, 11,199 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.3.2's tree reads 11,105. `llm_model_catalog` 257 (+65), `orch_model_selection` 139 (+28), `sandbox_wasm` +1, and `sandbox_kavach_bridge` pins the process score at 55. 28 mutants, all killed |
+| **coverage** | **99%**: 106/106 files, 1,823/1,834 fns (gate `--min 80`), the same 11 unreferenced as 2.3.2 |
+| **dist** | `dist/agnosai.cyr` 44,690 lines + `dist/agnosai-guard.cyr` 1,034, both v2.3.3, by `wc -l` (2.3.2's read 44,448 and 1,034 the same way). Sidecars **6 / 1** leaves, unchanged |
+| **binary** | `build/agnosai` **3,011,696 B** (2.3.2: 2,998,968, and 3,007,424 with kavach 3.14.7 alone). aarch64 **7,033,504 B** (6,967,520), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.3.3"` and exits 0 on SIGTERM |
+| **deps** | **kavach 3.14.6 → 3.14.7**, at `f3e64f6a`, its tag on GitHub. Every other dep was already on its latest tag: sigil 3.13.15, bote 3.8.15, majra 2.13.0, ai-hwaccel 2.5.6, tyche 1.2.2, libro 2.11.3, patra 1.16.6 |
+| **lock** | `cyrius.lock` 119 files, 8 commit pins. ⚠ `cyrius deps` kept kavach's 3.14.6 pin beside the new tag and said so, so the lock was deleted and resolved again. The other seven pins and every other line are byte-identical |
+| **gates** | `check-symbols.sh` 3,153 definitions across 117 files; `check-clean.sh` fmt 234, lint 234, doc 118, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths 233 files; dist. fmt and lint on every test, bench and fuzz file. Then build, aarch64, every test and fuzz unit compiles, tests under DCE, coverage, the example, fuzz 4/4, `distlib --all --check`, `cyrius bench`. **The `ubuntu:26.04` CI replica ran** on the bumped tree with wasmtime 47.0.3, resolving all 8 pins from GitHub: every `ci.yml` step, 105 suites, 11,053 assertions, 0 failed, as suites that count per environment do. `sandbox_wasm` 113 of 113, three runs |
+| **benchmarks** | The interleaved A/B against a 2.3.2 build with the same `lib/`, five rounds of `llm` and `orch` at a mean load of 1.9, reads **median −0.1% across 115 rows**, 109 within ±5%. After the catalog's read was written out, `model_for_tier_*` reads 59 → 62 ns, the bare form's call to the tools form, and `crew_select_model_routed` 144 → 151 ns. `model_catalog_parse_200` +3.3%. New: `model_catalog_parse_200_tiered` 2.08 ms, `model_for_tier_premium_tools` 58 ns. `bench-history.csv` has 241 rows at 2.3.3, one sweep at a load of 1.0–1.3: median +0.0% against 2.3.2's rows, 210 of 239 within ±5%, not claimed |
+| **end to end** | A real hoosh 2.10.2 at stub OpenAI and Ollama providers, and the real server running one-agent crews. On 2.3.3 a `high` agent with tools reaches the provider as `gpt-5.6-sol`, and as `gpt-6-astra` without tools. A `medium` one reaches it as `gpt-6-sol` or `gpt-6.1-sol`. Ollama's `bge-m3`, listed first, is passed over for `llama3.2:3b`. 2.3.2 sent tools to `gpt-6-astra` and `gpt-6.1-sol`, and chat to `bge-m3` (CHANGELOG 2.3.3) |
+| **bytes per crew** | A WASM call keeps **3,160 B**, where kavach measured 1,051,513 B on 3.14.6, and `tests/sandbox_wasm.tcyr` bounds it at 16 KiB. A held catalog is 164 B an entry, 24 B more than 2.3.2's. The rest as 2.3.2 below |
+| **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4. Nothing is removed. ⚠ A crew profile's `sandbox_strength` for the process policy reads 55 where it read 60, kavach 3.14.7's scoring (CHANGELOG *Changed*) |
+| **upstream filings** | kavach's, the capture buffer, is fixed in 3.14.7 and archived there. ⚠ **The other six are still not committed**, so not visible upstream: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies), hoosh (span ids) and bote (the MCP client, with a scope conflict). The roadmap's *Waiting on another project* has each path |
+
+### 2.3.2 — the release (2026-11-07)
 
 | | |
 |---|---|
@@ -17,7 +37,7 @@
 | **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
 | **gates** | `check-symbols.sh` 3,136 definitions across 117 files; `check-clean.sh` fmt 234, lint 234, doc 118, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist. Then build, aarch64, tests under DCE, coverage, `distlib --all --check`, the example, fuzz 4/4, `cyrius bench`. **The `ubuntu:26.04` CI replica ran**, on the bumped tree with wasmtime 47.0.3: every `ci.yml` step, 105 suites, 0 failed |
 | **benchmarks** | The interleaved A/B against a 2.3.1 build, three rounds of `tools`, `orch` and `server` at a mean load of 3.3, reads **median +0.2% across 149 rows**, 109 within ±5%. `agnos_form_encode_52b` −34%, `agnos_segment_ok` −18%, `lt_result_to_value` −10%. `task_one_tool_call` +2.0%, about 600 ns for the call's arena. New: `task_one_tool_call_kept` and `task_four_tool_calls_kept`. `bench-history.csv` has 239 rows at 2.3.2, one sweep at a load of 1.2–1.4: median −2.8% against 2.3.1's rows, 169 of 236 within ±5%, not claimed, as 2.3.1's sweep ran at a load of 3.2 |
-| **bytes per crew** | **0** for a call whose tool answers in its arena, on every arm of `echo`, `json_transform` and all nine AGNOS tools. What the network tools still leave is not theirs: sandhi's 352–480 B an exchange, the SSRF guard's 136 B a check, and `load_testing`'s joined threads at 4,120 B a user (roadmap 2.3.5) |
+| **bytes per crew** | **0** for a call whose tool answers in its arena, on every arm of `echo`, `json_transform` and all nine AGNOS tools. What the network tools still leave is not theirs: sandhi's 352–480 B an exchange, the SSRF guard's 136 B a check, and `load_testing`'s joined threads at 4,120 B a user (roadmap 2.3.6) |
 | **build warnings** | Unchanged: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines |
 | **consumer** | Not re-run. agnostic pins 2.2.4. ⚠ `transport_fp` and `shape_fp` take an allocator first (CHANGELOG *Breaking*): agnostic and thoth call neither, and joshua and kiran are not on this machine, so that neither does is unchecked |
 | **upstream filings** | kavach's, the capture buffer that holds back confinement, is committed and on GitHub. ⚠ **The other six are not committed**, so not visible upstream: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies), hoosh (span ids, new) and bote (the MCP client, new, with a scope conflict). The roadmap's *Waiting on another project* has each path |

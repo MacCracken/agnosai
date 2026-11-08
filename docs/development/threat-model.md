@@ -162,10 +162,12 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
   model can do and not what a caller can. A consumer's gate is the place to narrow it.
 - **`delegate` hands out what the delegate holds** (ADR 029): a delegated crew's agents hold what their own definitions
   name, not the delegating agent's narrower set, and nothing bounds how deep it nests. It is opt-in and off in the
-  binary. F2's "authority only narrows" and B6's cap close this.
-- **Each WASM call keeps about 1 MiB, resident** (roadmap B40, filed in kavach): a caller that can
-  drive WASM tools can grow this process by that much per call, and only a restart gives it back.
-  Bound it by rate-limiting tool calls until kavach stops allocating the buffer per exec.
+  binary. Hierarchical crews' "authority only narrows" (roadmap 2.4.3) and the crew concurrency cap (2.4.1) close
+  this.
+- **Each WASM call keeps a few KiB** on the global heap, 3,160 B in `tests/sandbox_wasm.tcyr`, so a caller that can
+  drive WASM tools grows this process by that much per call until a restart. Through 2.3.2 it was about 1 MiB a call,
+  kavach's capture buffer, which kavach 3.14.7 gives back and agnosai 2.3.3 requires. What is left is the result's own
+  bytes, and moves onto the call's allocator with the confinement work (roadmap 2.3.4).
 - **A crew arena is reused** ([ADR 028](../adr/028-a-crew-lives-in-an-arena-its-consumer-gives-back.md)):
   the memory a crew lived in serves the next one, which in a multi-tenant consumer may be another
   tenant's. It is zeroed on release, every byte handed out, so no allocation can read a previous
@@ -183,8 +185,8 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
   environment, with no seccomp, landlock, namespaces or cgroup. Treat a process-tier tool as
   running with the server's privileges. **kavach's confined process backend is already bridged**
   (`agnosai_kavach_execute`: no_new_privs, landlock scopes and kavach's exec seccomp filter,
-  tested by `tests/sandbox_kavach_bridge.tcyr`). But no production tier calls it; routing them
-  through it is on the roadmap.
+  tested by `tests/sandbox_kavach_bridge.tcyr`). But no production tier calls it. Routing them
+  through it is roadmap 2.3.4, the next release, now that kavach 3.14.7 no longer keeps 1 MiB a run.
 - **Fleet coordinator election**: lowest-id election, and any non-stale term is adopted (surface 4).
   No Byzantine fault tolerance. Suitable for trusted internal networks.
 - **Caller-controlled trace context** (surface 7): any caller of a traced route

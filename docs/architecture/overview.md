@@ -151,8 +151,8 @@ Agent definitions are JSON/YAML — same format as Agnostic v1 presets:
 ```
 
 `llm_model` is optional, and is an id as hoosh lists it. With none, `complexity` picks a tier and
-hoosh's catalog says what that tier means
-([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)). `capable` is not a model: hoosh
+hoosh's catalog says what that tier means, and, for an agent with `tools`, which of its models take them
+([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md) and its 2.3.3 addendum). `capable` is not a model: hoosh
 has no tier aliases, and the word would be sent as it stands.
 
 ## Binary Distribution

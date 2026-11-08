@@ -37,10 +37,15 @@ while a suite fails to build, which has happened. Before opening a PR, confirm
 every unit compiles:
 
 ```bash
-for f in tests/*.tcyr benches/*.bcyr fuzz/*.fcyr; do
+for f in tests/*.tcyr fuzz/*.fcyr; do
     cyrius build "$f" /tmp/cb >/dev/null || echo "FAIL: $f"
 done
+cyrius bench >/dev/null || echo "FAIL: a benchmark"
 ```
+
+⚠ A `.bcyr` compiles only through `cyrius bench`. `cyrius build` does not add the bench library, so on a
+benchmark it reports `bench_new` undefined and fails, whatever the file says. This loop used to include
+`benches/*.bcyr` and failed on all eleven.
 
 ## Project Structure
 

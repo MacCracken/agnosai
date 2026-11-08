@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.3.2 (2026-11-07).**
+**Status as of 2.3.3 (2026-11-07).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,10 +50,10 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.3.3** | Choose models by what hoosh's catalog says: tier, kind and tool support |
-| **2.3.4** | WASM tools: validate a module, and clean up what a tool staged |
-| **2.3.5** | Network tools: pooled connections, detached threads, a cheaper URL check, a stable tool order |
-| **2.3.6** | The Rust line's JSON forms and structured-log fields |
+| **2.3.4** | Confine the process, Python and OCI tools through kavach |
+| **2.3.5** | WASM tools: validate a module, and clean up what a tool staged |
+| **2.3.6** | Network tools: pooled connections, detached threads, a cheaper URL check, a stable tool order |
+| **2.3.7** | The Rust line's JSON forms and structured-log fields |
 | **2.4.0** | The crew lifecycle as one state machine, with the approval gate wired |
 | **2.4.1** | Budgets, caps and crew concurrency enforced |
 | **2.4.2** | Hand a downstream task a summary, not a transcript |
@@ -70,16 +70,38 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 ### 2.3.x — the tool-calling harness (agnostic's M6 waits on this line)
 
 2.3.0 shipped the loop ([ADR 029](../adr/029-the-tool-loop.md)), 2.3.1 chose its models from hoosh's catalog
-([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)), and 2.3.2 gave each tool call an arena of its own.
+([ADR 030](../adr/030-a-model-comes-from-the-gateways-catalog.md)), 2.3.2 gave each tool call an arena of its own, and
+2.3.3 chose a model by hoosh's tier, kind and tools bit (ADR 030's addendum).
 
-#### 2.3.3 — choose models by what hoosh's catalog says
+#### 2.3.4 — confine the process, Python and OCI tools through kavach
 
-hoosh 2.10.2 shipped what 2.3.1 asked for (its `docs/development/issues/archived/2026-11-06-agnosai-catalog-cannot-say-tier-tools-or-chat.md`):
-each catalog entry now carries `tier`, `kind` and `tools`. Read them in `_agnosai_model_pick_a` and
-`_agnosai_model_is_chat`, and pass a task's need for tools to the pick. **Done means:** ADR 030's known wrong answers
-are gone, including `gpt-6-astra` chosen for an agent with tools, and the twelve-word list of reasoning names retires.
+All three spawn through `src/sandbox/spawn.cyr`: a SIGKILL deadline, a controlled working directory, a sanitized
+environment, and no seccomp, landlock, namespaces or memory limit (`threat-model.md`, *Accepted Risks*). kavach's
+confined backend is bridged and tested (`agnosai_kavach_execute`), and no production tier calls it. Since 2.3.0 a model
+can reach these tiers, so this is the threat model's largest gap.
 
-#### 2.3.4 — WASM tools: validate a module, and clean up what a tool staged
+**The work:** route each tier through kavach, keeping its argv, stdin, environment and deadline semantics, with an
+ADR, since a tool that relied on network access will notice. `python_tool` and `wasm_tool` move onto the call's
+allocator with it (2.3.2's `agnosai_tool_input_alloc`), as what they build comes back through these tiers.
+
+**What it waited on has shipped.** Through kavach 3.14.6 every run kept a 1 MiB capture buffer for good, so routing
+three more tiers through it would have kept 1 MiB a call. kavach 3.14.7 copies out what the payload wrote and gives the
+buffer back (its `docs/development/issues/archived/2026-11-06-agnosai-every-exec-keeps-its-1-mib-capture-buffer.md`).
+agnosai 2.3.3 requires 3.14.7. A WASM call already runs through kavach: kavach measured 1,051,513 B a WASM exec on
+3.14.6, and `tests/sandbox_wasm.tcyr` reads 3,160 B a call on 3.14.7.
+
+**For the ADR, from kavach's process-backend issue,** which is still open in part and pinned at kavach 3.14.8
+(`docs/development/issues/2026-11-06-process-backend-keeps-every-capability.md`). As root with no rootfs, a payload
+keeps every capability. And with a caller's `/proc` mounted, a payload can read a sibling sandbox's root through
+`/proc/<pid>/root`. ⚠ **The root case is agnosai's normal case**: the `Dockerfile` sets no `USER`, so the image runs
+the server as root. kavach's rootfs path holds as root since 3.14.6, and its `/proc` guard since 3.14.7. So the ADR
+picks a rootfs for each tier, an unprivileged `USER` for the image, or a refusal to run a tier as root. Each of those
+is agnosai's own to ship, and none waits on kavach 3.14.8.
+
+**Done means:** a call on each tier keeps a few KiB, measured as `tests/sandbox_wasm.tcyr` does for WASM. The threat
+model's *Accepted Risks* entry for these tiers goes, and its TOCTOU entry narrows to what kavach does not pin.
+
+#### 2.3.5 — WASM tools: validate a module, and clean up what a tool staged
 
 **Validate a module before it runs.** A module with no `_start` export runs and "succeeds", and a module is checked
 by its header alone, so a malformed body fails only at execute. The execute path runs `wasmtime` through kavach's
@@ -94,7 +116,7 @@ suites, `server_routes_sse`, `sandbox_oci` and `sandbox_manager` never unlink, a
 `definitions_packaging`, `definitions_loader`, `sandbox_wasm`, `orch_ipc` and `tools_wasm` unlink only some, so two
 runs at once collide. agnostic 0.1.15 fixed the same thing with a shared `tests/support/tmp.cyr`.
 
-#### 2.3.5 — network tools: pooled connections, detached threads, a cheaper URL check, a stable tool order
+#### 2.3.6 — network tools: pooled connections, detached threads, a cheaper URL check, a stable tool order
 
 **The load tester opens a fresh connection per request,** so every request is a handshake, and its HTTP executor's
 success path is measured on a loopback server (`tests/tools_gate.tcyr`) but asserts nothing about the answer.
@@ -110,7 +132,7 @@ registry and the metadata map are hash maps, and `lib/hashmap.cyr` seeds per pro
 so this is wire-compatible, but a stable order by name is kinder to clients. Measure `tool_registry_list_{50,500}`
 before and after. (A crew's `tools` request is already in the agent's order, ADR 029.)
 
-#### 2.3.6 — the Rust line's JSON forms and structured-log fields
+#### 2.3.7 — the Rust line's JSON forms and structured-log fields
 
 **JSON forms the Rust types derived and nothing serialised.** Writers: the fleet types (`NodeInfo`, `NodeStatus`,
 `NodeTopology`, `DeviceLink`, `InterconnectType`, `FederationRole`, `ClusterStatus`, `ClusterInfo`, `RelayMessage`),
@@ -298,7 +320,6 @@ The *Issue* column says where each stands.
 
 | What agnosai would do | Waits on | Issue | agnosai's half, once it ships |
 |---|---|---|---|
-| **Confine the process, Python and OCI tools** | kavach: every sandbox run keeps a 1 MiB capture buffer for good. 400 runs took RSS from 9.5 MB to 421 MB | kavach `docs/development/issues/2026-11-06-agnosai-every-exec-keeps-its-1-mib-capture-buffer.md`, committed and on GitHub | Below |
 | **Port `personality`, then delete `rust-old/`** | bhava has no Cyrius port yet, and the user plans to start one soon | None needed: the user's own plan | `personality`, `with_personality`, `mood_adjusted_temperature`, the personality score and the system-prompt block. Then the deletion checklist below |
 | **Verify JWT keys over 4096 bits** | sigil: `_rsa_recover_em` refuses `n_len > 512`; the Rust line took 8192 | sigil `docs/development/issues/2026-11-05-agnosai-rsa-over-4096-bits-cannot-verify.md`, ⚠ **written, not committed** | Raise `AGNOSAI_JWT_MAX_MODULUS` from 512 to 1024 bytes, and the buffers it sizes in `src/server/auth.cyr` |
 | **A burst of TLS handshakes all succeeds** | sigil: of 100 threads, 64 verify and 36 are refused by its lane pool | sigil `docs/development/issues/2026-11-05-agnosai-lane-pool-refuses-the-overflow-of-a-burst.md`, ⚠ **written, not committed** | 2.4.1 caps outbound TLS at 64 meanwhile. `tests/server_auth_lane_race.tcyr` pins the RSA verify's lane-freedom |
@@ -310,21 +331,10 @@ The *Issue* column says where each stands.
 bayan's refusals of block scalars, flow mappings, anchors and tags are deliberate (its ADR 0008), so that is a scope
 request to raise only if a definition file needs one, and it is not owed.
 
-### Confine the process, Python and OCI tools — once kavach ships
-
-All three spawn through `src/sandbox/spawn.cyr`: a SIGKILL deadline, a controlled working directory, a sanitized
-environment, and no seccomp, landlock, namespaces or memory limit (`threat-model.md`, *Accepted Risks*). kavach's
-confined backend is bridged and tested (`agnosai_kavach_execute`), and no production tier calls it. Since 2.3.0 a model
-can reach these tiers, so this is the threat model's largest gap. **The work:** route each tier through it, keeping its
-argv, stdin, environment and deadline semantics, with an ADR, since a tool that relied on network access will notice.
-`python_tool` and `wasm_tool` move onto the call's allocator with it (2.3.2's `agnosai_tool_input_alloc`), as what they
-build comes back through these tiers. **Why it waits:** routed before kavach's fix, every run on three more tiers keeps
-1 MiB, resident, for good. **Done means:** `tests/sandbox_wasm.tcyr`'s cost of a call reads near 0.
-
 ### Deleting `rust-old/` — the release after `personality`
 
 **The Rust port is not done while bhava is missing** (*Settled decisions*), so this has no number until bhava lands.
-Everything else the Rust line had is pinned above: JSON forms and log fields at 2.3.6, `StateStore` at 2.5.0, the
+Everything else the Rust line had is pinned above: JSON forms and log fields at 2.3.7, `StateStore` at 2.5.0, the
 certificate JWT key at 2.6.1 and the spans at 2.6.2. Every Rust spec stays reachable after:
 `git show 2.1.0:rust-old/src/<path>`.
 
@@ -345,7 +355,7 @@ The ~650 comment lines citing a `rust-old/` path stay as historical pointers. No
 | Decision | Needed by | Where it stands |
 |---|---|---|
 | **Who owns the MCP client: bote, or agnosai and agnostic?** | Before remote MCP tools | bote's roadmap lists an MCP client as a non-goal (`docs/development/roadmap.md:206`), its own consumer audit lists it as a gap daimon and thoth want (G10), and agnosai and agnostic settled on 2026-10-07 that it is bote's. The bote filing above states all three |
-| **Require hoosh 2.10.2 or newer?** | Any time | It would drop two workarounds for older gateways: `_agnosai_hoosh_detail_a`'s raw scan of an error body that is not JSON, and `_AGN_CAT_REREAD_MS`'s ration on re-reading the catalog. hoosh 2.10.2 fixed both upstream |
+| **Require hoosh 2.10.2 or newer?** | Any time | It would drop three workarounds for older gateways. `_agnosai_hoosh_detail_a`'s raw scan of an error body that is not JSON. `_AGN_CAT_REREAD_MS`'s ration on re-reading the catalog, which 2.3.3 also applies to a task with tools on a list where nothing takes them: hoosh 2.10.2 holds the catalog's body, so a GET no longer grows its heap. And `_agnosai_model_is_chat`'s twelve words, which on 2.10.2 only repeat what hoosh already did (ADR 030's addendum). ADR 030's price rule stays either way, for models hoosh has no row for |
 | **Make CI's Lockfile step fail on a drifted lock (`cyrius deps --locked`)?** | Any time | `CLAUDE.md` has CI resolve the lock rather than audit a committed one. Since cyrius 6.7.6 a plain local `cyrius deps` writes the same 8-pin lock CI does, so `--locked` would now catch a tag that moved upstream. Adopting it changes the policy that file states |
 | **Note the 2.1.5 exception in the CHANGELOG, or change its policy line?** | Any time | `CHANGELOG.md:6` claims Semantic Versioning, but 2.1.5 shipped a `### Breaking` section under a patch number (*Settled decisions*) and neither says so |
 
@@ -469,22 +479,28 @@ onto majra.
 Releases before 2.3.2 named items by code, and older comments, ADRs and `state.md` still cite them. This only maps a
 code to where its work is now. Nothing new gets one.
 
+⚠ **Three release numbers moved at 2.3.3.** Confinement left *Waiting on another project* when kavach 3.14.7 shipped,
+and took 2.3.4 as the threat model's largest gap. So text written for 2.3.2, its CHANGELOG entry included, means
+2.3.5 where it says WASM tools at 2.3.4, 2.3.6 where it says network tools at 2.3.5, and 2.3.7 where it says JSON forms
+and log fields at 2.3.6.
+
 | Code | Now |
 |---|---|
 | B5 | `personality` (*Waiting on another project*) |
 | B6 | 2.4.1, crew concurrency |
 | B7 | 2.6.2, the tracing export (its item 8 and 9 shipped in 2.3.0) |
 | B8 | 2.6.1, server edges; RSA over 4096 bits is *Waiting on another project* |
-| B9, B32 | 2.3.4, WASM tools |
-| B10, B11 | 2.3.6, JSON forms and log fields |
+| B9, B32 | 2.3.5, WASM tools |
+| B10, B11 | 2.3.7, JSON forms and log fields |
 | B12, B14 | 2.7.0, tests and benchmarks |
-| B13, B36 | 2.3.5, network tools |
+| B13, B36 | 2.3.6, network tools |
 | B15 | `StateStore` at 2.5.0; the rest at 2.7.2, housekeeping |
 | B16 | chunked request bodies (*Waiting on another project*) |
 | B18, B20, B27 | 2.7.1, benchmark levels |
 | B25 | 2.6.1, server edges |
 | B34 | 2.7.2, housekeeping |
-| B35, B40 | confine the process, Python and OCI tools (*Waiting on another project*) |
+| B33 | 2.3.1, and its hoosh half in 2.3.3 |
+| B35, B40 | 2.3.4, confine the process, Python and OCI tools. B40's WASM half shipped in 2.3.3 with kavach 3.14.7 |
 | B37 | 2.4.0, the crew lifecycle |
 | B38 | 2.5.1, the server's own crews in arenas |
 | B39 | an HTTP exchange leaves nothing behind (*Waiting on another project*) |

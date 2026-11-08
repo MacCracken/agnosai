@@ -210,6 +210,71 @@ fn _b_catalog_parse(): i64 {
     return 0;
 }
 
+# The same 200 models as hoosh 2.10.2 lists them: a tier on each, `kind`, and a tools bit, one in four
+# `false`, so the parse also builds the three picks a task with tools reads.
+fn _b_catalog_body_tiered(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"object\":\"list\",\"data\":[");
+    for (var i = 0; i < 200; i = i + 1) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        str_builder_add_cstr(sb, "{\"id\":\"model-");
+        str_builder_add_int(sb, i);
+        str_builder_add_cstr(sb, "\",\"object\":\"model\",\"owned_by\":\"anthropic\",\"source\":\"live\",");
+        str_builder_add_cstr(sb, "\"routes\":[\"https://api.anthropic.com\"],\"context_window\":1000000,");
+        str_builder_add_cstr(sb, "\"tier\":\"");
+        if (i % 4 == 0) { str_builder_add_cstr(sb, "economy"); }
+        elif (i % 4 == 1) { str_builder_add_cstr(sb, "standard"); }
+        elif (i % 4 == 2) { str_builder_add_cstr(sb, "premium"); }
+        else { str_builder_add_cstr(sb, "reasoning"); }
+        str_builder_add_cstr(sb, "\",\"kind\":\"chat\",\"capabilities\":{\"vision\":true,\"tools\":");
+        if (i % 4 == 2) { str_builder_add_cstr(sb, "false"); } else { str_builder_add_cstr(sb, "true"); }
+        str_builder_add_cstr(sb, ",\"thinking\":[\"adaptive\"],\"effort\":[\"low\",\"medium\",\"high\"]},");
+        str_builder_add_cstr(sb, "\"pricing\":{\"input_micro_usd_per_1k\":");
+        str_builder_add_int(sb, 100 + i * 10);
+        str_builder_add_cstr(sb, ",\"output_micro_usd_per_1k\":");
+        str_builder_add_int(sb, 500 + i * 50);
+        str_builder_add_cstr(sb, "}}");
+    }
+    str_builder_add_cstr(sb, "]}");
+    return str_builder_build(sb);
+}
+
+# `model_catalog_parse_200` on hoosh 2.10.2's list: three more fields an entry, and six picks.
+fn _b_catalog_parse_tiered(): i64 {
+    var n = 200;
+    var body = _b_catalog_body_tiered();
+    var ar = arena_allocator_growable(1048576);
+    var b = bench_new("model_catalog_parse_200_tiered");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_model_catalog_parse_a(ar, body);
+            reset_via(ar);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# `model_for_tier_premium` for a task with tools: the same walk, load and array read.
+fn _b_model_for_tier_tools(): i64 {
+    var n = 1000000;
+    var client = _b_catalog_client();
+    var out: i64[1];
+    var a = default_alloc();
+    var b = bench_new("model_for_tier_premium_tools");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_model_for_tier_tools_a(a, client, AGNOSAI_TIER_PREMIUM, 1, &out);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
 # A lookup by id, for attribution and for a prefixed `llm_model`: the worst case, the last entry.
 fn _b_catalog_owner(): i64 {
     var n = 200000;
@@ -386,6 +451,10 @@ fn main(): i64 {
     _b_iq_dequeue_background(2000, "inference_queue_dequeue_background_2k");
     _b_iq_dequeue_background(16000, "inference_queue_dequeue_background_16k");
     _b_map_priority();
+
+    # 2.3.3's rows, after every older one so that none of those moves.
+    _b_model_for_tier_tools();
+    _b_catalog_parse_tiered();
 
     # ⚠ Last, on purpose: this builds a pool of 2 MiB, and a row's position moves the rows after it
     # (roadmap B20, B27).

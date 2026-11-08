@@ -85,11 +85,18 @@ An empty variable is none. Fast is reachable from the library's router and not f
   `/v1/models/catalog` is read through `/v1/models`, where every tier is the first chat model listed.
 - A selection the gateway refuses reads the catalog again, at most once a minute, and selects once more, unless a tool has
   already run.
-- ⚠ **`Premium` is the dearest model that declares the most reasoning.** On hoosh's table today that is `claude-fable-5-1`,
-  at $10/$50 per million tokens. Set `AGNOSAI_MODEL_PREMIUM` to hold a crew's `high` agents to less.
-- ⚠ **Selection cannot see tools**, as the catalog does not say which models take them. `gpt-6-astra` takes none on Chat
-  Completions, so on an OpenAI-only gateway an agent with tools and `complexity: high` fails with the provider's 400 until
-  `AGNOSAI_MODEL_PREMIUM` names a model that does.
+- **On hoosh 2.10.2 or newer, hoosh's `tier` decides**: Capable is the first `standard` model listed, and Premium the
+  first `premium` one, then `reasoning`. A tier with nothing in it takes the nearest tier below, then the nearest above.
+  On hoosh's table today Premium is `claude-fable-5-1`, at $10/$50 per million tokens. Set `AGNOSAI_MODEL_PREMIUM` to
+  hold a crew's `high` agents to less. A model hoosh's `kind` calls anything but `chat` is never chosen.
+- **An agent with tools is never given a model hoosh says takes none.** On an OpenAI route, a `complexity: high` agent
+  with tools gets `gpt-5.6-sol`, and one without gets `gpt-6-astra`, which takes no tools on Chat Completions. Where
+  nothing listed takes tools, the task fails before any request with
+  `LLM error: no model catalog: hoosh lists no chat model that takes tools; …`, and the list is read again at most once a
+  minute. The agent's own `llm_model` and the `AGNOSAI_MODEL_*` overrides are sent as written.
+- ⚠ **A gateway older than hoosh 2.10.2 writes none of this.** There Premium is the dearest model that declares the most
+  reasoning, selection cannot see tools, and only twelve words in a model's id keep an embedder off a tier. See ADR 030
+  for what that gets wrong.
 
 ## Trace context
 

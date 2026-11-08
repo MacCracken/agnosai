@@ -613,6 +613,151 @@ fn test_tools(): i64 {
     return 0;
 }
 
+# --- choosing for a task with tools (hoosh 2.10.2) ------------------------
+
+# An element as hoosh 2.10.2 lists it: a tier, `kind: chat`, and a tools bit of 1, 0, or -1 for none.
+fn _t_hentry(sb, id, tier, tools, input, output): i64 {
+    if (str_len(str_builder_build(sb)) > 0) { str_builder_add_cstr(sb, ","); }
+    str_builder_add_cstr(sb, "{\"id\":\"");
+    str_builder_add_cstr(sb, id);
+    str_builder_add_cstr(sb, "\",\"object\":\"model\",\"owned_by\":\"openai\",\"source\":\"live\"");
+    str_builder_add_cstr(sb, ",\"tier\":\"");
+    str_builder_add_cstr(sb, tier);
+    str_builder_add_cstr(sb, "\",\"kind\":\"chat\"");
+    if (tools == 1) { str_builder_add_cstr(sb, ",\"capabilities\":{\"tools\":true}"); }
+    if (tools == 0) { str_builder_add_cstr(sb, ",\"capabilities\":{\"tools\":false}"); }
+    str_builder_add_cstr(sb, ",\"pricing\":{\"input_micro_usd_per_1k\":");
+    str_builder_add_int(sb, input);
+    str_builder_add_cstr(sb, ",\"output_micro_usd_per_1k\":");
+    str_builder_add_int(sb, output);
+    str_builder_add_cstr(sb, "}}");
+    return 0;
+}
+
+# An OpenAI route's current lineup at hoosh's word: the first of each tier takes no tools.
+fn _t_openai(): i64 {
+    var sb = str_builder_new();
+    _t_hentry(sb, "gpt-6-astra", "premium", 0, 10000, 50000);
+    _t_hentry(sb, "gpt-6.1-sol", "standard", 0, 3000, 15000);
+    _t_hentry(sb, "gpt-6-sol", "standard", 1, 2000, 10000);
+    _t_hentry(sb, "gpt-5.6-sol", "premium", 1, 5000, 25000);
+    _t_hentry(sb, "gpt-6-luna", "economy", 1, 100, 500);
+    return _t_wrap(sb);
+}
+
+# A list where nothing takes tools.
+fn _t_no_tools(): i64 {
+    var sb = str_builder_new();
+    _t_hentry(sb, "gpt-6-astra", "premium", 0, 10000, 50000);
+    _t_hentry(sb, "gpt-6.1-sol", "standard", 0, 3000, 15000);
+    return _t_wrap(sb);
+}
+
+# The tools agent at `complexity`.
+fn _t_tool_agent_at(complexity): i64 {
+    var a = _t_tool_agent();
+    agnosai_agent_with_complexity(a, str_from(complexity));
+    return a;
+}
+
+# Assert the id selection gives `agent` on `client` for a task with tools.
+fn _t_selects_tools(client, agent, want, name): i64 {
+    var out: i64[1];
+    store64(&out, 0);
+    var err = _agnosai_crew_select_model_tools_a(default_alloc(), client, agent, 1, &out);
+    if (err != 0) { return assert(0, name); }
+    return assert(str_eq(load64(&out), str_from(want)) == 1, name);
+}
+
+fn test_tool_selection(): i64 {
+    # --- the agent ADR 030 could not keep off gpt-6-astra ---
+    var c = _t_gw(200, _t_openai());
+    _t_selects(c, _t_agent("high"), "gpt-6-astra", "a Premium task with no tools may have astra");
+    _t_selects_tools(c, _t_agent("high"), "gpt-5.6-sol",
+      "one with tools gets the first premium model that takes them");
+    _t_selects(c, 0, "gpt-6.1-sol", "Capable with no tools: the first standard");
+    _t_selects_tools(c, 0, "gpt-6-sol", "and with tools, the first that takes them");
+    assert_eq(_t_gets, 1, "one read answers both");
+
+    # --- what the agent holds is what decides ---
+    assert_eq(_agnosai_crew_sends_tools(_t_tool_agent(), _t_tool_loop()), 1, "tools and a loop");
+    assert_eq(_agnosai_crew_sends_tools(_t_tool_agent(), 0), 0,
+      "no loop: the request carries no tools, so any model can answer it");
+    assert_eq(_agnosai_crew_sends_tools(_t_agent(0), _t_tool_loop()), 0, "no tools named");
+    assert_eq(_agnosai_crew_sends_tools(0, _t_tool_loop()), 0, "no agent");
+
+    # --- all the way out ---
+    var run = _t_gw(200, _t_openai());
+    vec_push(_t_answers, _t_asks("gpt-5.6-sol"));
+    var r = agnosai_execute_task_with_tools_a(default_alloc(), _t_task(),
+      _t_tool_agent_at("high"), run, 0, 0, 0, _t_tool_loop());
+    assert_eq(agnosai_task_result_status(r), AGNOSAI_STATUS_COMPLETED, "a Premium task with tools runs");
+    _t_sent(0, "gpt-5.6-sol", "on a model that takes them, not the provider's 400 on astra");
+    assert(str_index_of_cstr(vec_get(_t_requests, 0), "\"tools\"") >= 0, "with its tools offered");
+    var plain = _t_gw(200, _t_openai());
+    agnosai_execute_task_with_tools_a(default_alloc(), _t_task(), _t_tool_agent_at("high"), plain,
+      0, 0, 0, 0);
+    _t_sent(0, "gpt-6-astra", "and the same agent with no loop sends no tools, so astra will do");
+
+    # --- nothing takes tools: no request, and the reason ---
+    agnosai_model_catalog_set_reread_ms(60000);
+    var none = _t_gw(200, _t_no_tools());
+    var nr = agnosai_execute_task_with_tools_a(default_alloc(), _t_task(), _t_tool_agent(), none, 0,
+      0, 0, _t_tool_loop());
+    assert_eq(agnosai_task_result_status(nr), AGNOSAI_STATUS_FAILED, "a task with tools and no model");
+    _t_meta_is(nr, "error",
+      "no model catalog: hoosh lists no chat model that takes tools; name a model on the agent, or set AGNOSAI_MODEL_CAPABLE", #skip-lint
+      "says which rule left it nothing");
+    assert_eq(vec_len(_t_models), 0, "and sends nothing");
+    for (var i = 0; i < 9; i = i + 1) {
+        agnosai_execute_task_with_tools_a(default_alloc(), _t_task(), _t_tool_agent(), none, 0, 0, 0,
+          _t_tool_loop());
+    }
+    assert_eq(_t_gets, 1,
+      "⚠ and ten such tasks read once: the list has chat models, so only hoosh changing it helps, and \
+    an unrationed read per task is what the ration exists to stop");
+    agnosai_model_catalog_set_reread_ms(0);
+    var nt = agnosai_execute_task(_t_task(), _t_agent(0), none, 0);
+    assert_eq(agnosai_task_result_status(nt), AGNOSAI_STATUS_COMPLETED, "a task with no tools runs there");
+
+    # --- a gateway coming back is asked at once, tools or not ---
+    agnosai_model_catalog_set_reread_ms(60000);
+    var down = _t_gw(503, _t_openai());
+    var out: i64[1];
+    store64(&out, 0);
+    assert(_agnosai_crew_select_model_tools_a(default_alloc(), down, 0, 1, &out) != 0,
+      "a gateway that is down has no model for a task with tools");
+    _t_status = 200;
+    _t_selects_tools(down, 0, "gpt-6-sol", "and the next one reads it as soon as it is back");
+    assert_eq(_t_gets, 2, "inside the interval: a slot with nothing in it is not rationed");
+    agnosai_model_catalog_set_reread_ms(0);
+
+    # --- the agent's word and the operator's are not checked for tools ---
+    var own = _t_gw(200, _t_openai());
+    _t_selects_tools(own, _t_named("gpt-6-astra"), "gpt-6-astra", "an agent's own model is sent");
+    assert_eq(_t_gets, 0, "and asks nothing");
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("gpt-6.1-sol"));
+    _t_selects_tools(own, 0, "gpt-6.1-sol", "an override is sent as written");
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, 0);
+    assert_eq(_t_gets, 0, "and reads nothing either");
+
+    # --- a refused id selects again under the same rule ---
+    var ob = str_builder_new();
+    _t_hentry(ob, "retired", "standard", 1, 2000, 10000);
+    var g = _t_gw(200, _t_wrap(ob));
+    _t_selects_tools(g, 0, "retired", "held");
+    _t_then("hoosh returned HTTP 404: no provider for model");
+    var nb = str_builder_new();
+    _t_hentry(nb, "current-no-tools", "standard", 0, 2000, 10000);
+    _t_hentry(nb, "current", "standard", 1, 2000, 10000);
+    _t_list = _t_wrap(nb);
+    var rr = agnosai_execute_task_with_tools_a(default_alloc(), _t_task(), _t_tool_agent(), g, 0, 0,
+      0, _t_tool_loop());
+    assert_eq(agnosai_task_result_status(rr), AGNOSAI_STATUS_COMPLETED, "re-selected and answered");
+    _t_sent(1, "current", "onto a model that takes tools, not the first listed, which takes none");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     # A suite re-reads at once to see what a re-read does. The interval has a test of its own.
@@ -623,6 +768,7 @@ fn main(): i64 {
     test_no_catalog();
     test_reselect();
     test_tools();
+    test_tool_selection();
     return assert_summary();
 }
 

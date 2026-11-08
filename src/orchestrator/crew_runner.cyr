@@ -318,8 +318,15 @@ fn _agnosai_crew_select_model(client, agent, out_model): i64 {
     return _agnosai_crew_select_model_a(default_alloc(), client, agent, out_model);
 }
 
-# `_agnosai_crew_select_model`, in allocator `a`.
+# `_agnosai_crew_select_model`, in allocator `a`, for a task that sends no tools.
 fn _agnosai_crew_select_model_a(a, client, agent, out_model): i64 {
+    return _agnosai_crew_select_model_tools_a(a, client, agent, 0, out_model);
+}
+
+# `_agnosai_crew_select_model_a`, for a task that sends tools when `tools` is 1: arm 2 is then never
+# given a model the gateway says takes none (`agnosai_model_for_tier_tools_a`). Arm 1 is the agent's
+# word and is sent as named.
+fn _agnosai_crew_select_model_tools_a(a, client, agent, tools, out_model): i64 {
     if (agent != 0) {
         var named = agnosai_agent_llm_model(agent);
         if (named != 0) {
@@ -327,7 +334,15 @@ fn _agnosai_crew_select_model_a(a, client, agent, out_model): i64 {
             return 0;
         }
     }
-    return agnosai_model_for_tier_a(a, client, _agnosai_crew_tier_a(a, agent), out_model);
+    return agnosai_model_for_tier_tools_a(a, client, _agnosai_crew_tier_a(a, agent), tools,
+      out_model);
+}
+
+# Whether `agent`'s task sends tools: a loop to run them, and an agent that names one. 1 or 0.
+fn _agnosai_crew_sends_tools(agent, loop): i64 {
+    if (loop == 0 || agent == 0) { return 0; }
+    if (vec_len(agnosai_agent_tools(agent)) > 0) { return 1; }
+    return 0;
 }
 
 # Whether nothing a catalog says could change what `agent`'s task sends: an id the strip leaves alone,
@@ -352,14 +367,14 @@ fn _agnosai_crew_selection_fixed_a(a, agent): i64 {
 # once a minute, and the task selects from what is there. The same id coming back means the list had
 # no better answer, and the failure is the true one. What the agent or the operator named is theirs,
 # and costs the gateway nothing, unless the strip renamed it and a read might let it go out as listed.
-# In `a`.
-fn _agnosai_crew_reselect_a(a, client, agent, model: Str, err: Str): Str {
+# `tools` is 1 for a task that sends tools, which selects again under the same rule. In `a`.
+fn _agnosai_crew_reselect_a(a, client, agent, model: Str, err: Str, tools): Str {
     if (agnosai_hoosh_refused_model(err) == 0) { return 0; }
     if (_agnosai_crew_selection_fixed_a(a, agent) == 1) { return 0; }
     agnosai_model_catalog_reread(client);
     var next: i64[1];
     store64(&next, 0);
-    if (_agnosai_crew_select_model_a(a, client, agent, &next) != 0) { return 0; }
+    if (_agnosai_crew_select_model_tools_a(a, client, agent, tools, &next) != 0) { return 0; }
     if (str_eq(load64(&next), model) == 1) { return 0; }
     return load64(&next);
 }
@@ -910,7 +925,9 @@ fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, sp
     # A refused id, once. ⚠ Only with no answer yet, which is what says no tool has run: this builds
     # the request again, and a task that has called a tool keeps its transcript (below).
     if (err != 0 && load64(&resp) == 0) {
-        var better = _agnosai_crew_reselect_a(ra, client, agent, model, err);
+        var sends_tools = 0;
+        if (st != 0) { sends_tools = 1; }
+        var better = _agnosai_crew_reselect_a(ra, client, agent, model, err, sends_tools);
         if (better != 0) {
             model = better;
             # In `a`, as `ra` may be gone by the time the span is recorded. A no-op at span 0.
@@ -1074,7 +1091,8 @@ fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, 
 
     var selected: i64[1];
     store64(&selected, 0);
-    var unselected = _agnosai_crew_select_model_a(a, client, agent, &selected);
+    var unselected = _agnosai_crew_select_model_tools_a(a, client, agent,
+      _agnosai_crew_sends_tools(agent, loop), &selected);
     if (unselected != 0) {
         _agnosai_crew_log_a(a, SK_WARN, "task refused: no model to send", 30, task_id,
           _agnosai_crew_agent_label_a(a, agent));
@@ -1085,11 +1103,9 @@ fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, 
     # convention's `gen_ai.request.model` on `invoke_agent`). A no-op at span 0.
     agnosai_genai_span_set_request_model(span, model);
 
-    if (loop != 0 && agent != 0) {
-        if (vec_len(agnosai_agent_tools(agent)) > 0) {
-            return _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id, span,
-              self_sc, model, loop, start_ns);
-        }
+    if (_agnosai_crew_sends_tools(agent, loop) == 1) {
+        return _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id, span,
+          self_sc, model, loop, start_ns);
     }
     return _agnosai_crew_answer_a(a, a, task, agent, client, event_tx, crew_id, span, self_sc,
       model, 0, start_ns);

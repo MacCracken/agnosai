@@ -527,6 +527,316 @@ fn test_tiers(): i64 {
     return 0;
 }
 
+# --- hoosh 2.10.2: tier, kind and tools ------------------------------------
+
+# Capabilities as hoosh 2.10.2 writes them: vision, tools, thinking, effort, each only when said.
+var _T_TOOLS_NO = "\"capabilities\":{\"vision\":true,\"tools\":false}";
+var _T_TOOLS_YES = "\"capabilities\":{\"vision\":true,\"tools\":true}";
+var _T_EFFORT_TOOLS =
+"\"capabilities\":{\"vision\":true,\"tools\":true,\"thinking\":[\"adaptive\"],\"effort\":[\"low\",\"max\"]}";
+var _T_THINK_TOOLS = "\"capabilities\":{\"vision\":true,\"tools\":true,\"thinking\":[\"budget\"]}";
+
+# Append one element as hoosh 2.10.2 writes it, `tier` and `kind` where its `catalog_emit_entry` puts
+# them. `tier`, `kind` and `caps` are cstrings or 0; a price of -1 writes none.
+fn _t_hentry(sb, id, owner, input, output, tier, kind, caps): i64 {
+    str_builder_add_cstr(sb, ",{\"id\":\"");
+    str_builder_add_cstr(sb, id);
+    str_builder_add_cstr(sb, "\",\"object\":\"model\",\"owned_by\":\"");
+    str_builder_add_cstr(sb, owner);
+    str_builder_add_cstr(sb, "\",\"source\":\"live\",\"routes\":[\"https://gw\"]");
+    if (tier != 0) {
+        str_builder_add_cstr(sb, ",\"tier\":\"");
+        str_builder_add_cstr(sb, tier);
+        str_builder_add_cstr(sb, "\"");
+    }
+    if (kind != 0) {
+        str_builder_add_cstr(sb, ",\"kind\":\"");
+        str_builder_add_cstr(sb, kind);
+        str_builder_add_cstr(sb, "\"");
+    }
+    if (caps != 0) {
+        str_builder_add_cstr(sb, ",");
+        str_builder_add_cstr(sb, caps);
+    }
+    if (input >= 0) {
+        str_builder_add_cstr(sb, ",\"pricing\":{\"input_micro_usd_per_1k\":");
+        str_builder_add_int(sb, input);
+        str_builder_add_cstr(sb, ",\"output_micro_usd_per_1k\":");
+        str_builder_add_int(sb, output);
+        str_builder_add_cstr(sb, "}");
+    }
+    str_builder_add_cstr(sb, "}");
+    return 0;
+}
+
+# Assert the id `tier` means in `c` for a task with tools.
+fn _t_pick_tools(c, tier, want, name): i64 {
+    var e = agnosai_model_catalog_pick_for(c, tier, 1);
+    if (e == 0) { return assert(0, name); }
+    return assert(str_eq(agnosai_model_entry_id(e), str_from(want)) == 1, name);
+}
+
+# An OpenAI route as hoosh 2.10.2 lists it, with its table's tier and tools bit on each live entry,
+# at the table's prices. `with_sol` and `with_o3` leave out the two that take tools above Standard.
+fn _t_openai_body(with_sol, with_o3): i64 {
+    var sb = str_builder_new();
+    _t_hentry(sb, "gpt-6-astra", "openai", 10000, 50000, "premium", "chat", _T_TOOLS_NO);
+    _t_hentry(sb, "gpt-6.1-sol", "openai", 3000, 15000, "standard", "chat", _T_TOOLS_NO);
+    _t_hentry(sb, "gpt-6-sol", "openai", 2000, 10000, "standard", "chat", _T_TOOLS_YES);
+    _t_hentry(sb, "gpt-6-luna", "openai", 100, 500, "economy", "chat", _T_TOOLS_YES);
+    if (with_sol == 1) {
+        _t_hentry(sb, "gpt-5.6-sol", "openai", 5000, 25000, "premium", "chat", _T_TOOLS_YES);
+    }
+    if (with_o3 == 1) {
+        _t_hentry(sb, "o3", "openai", 2000, 8000, "reasoning", "chat", _T_TOOLS_YES);
+    }
+    return _t_list(sb);
+}
+
+fn test_hoosh_fields(): i64 {
+    # --- each field read, and absent read as nobody said ---
+    var pb = str_builder_new();
+    _t_hentry(pb, "gpt-6-astra", "openai", 10000, 50000, "premium", "chat", _T_TOOLS_NO);
+    _t_hentry(pb, "bge-m3:latest", "ollama", 0, 0, 0, "embedding", 0);
+    _t_hentry(pb, "gpt-4o-audio-preview", "openai", 2500, 10000, "standard", "chat", _T_TOOLS_YES);
+    _t_hentry(pb, "rerank-v4", "x", 1, 1, 0, "rerank", 0);
+    _t_hentry(pb, "odd", "x", 1, 1, "legendary", 0, "\"capabilities\":{\"tools\":\"yes\"}");
+    _t_hentry(pb, "o3", "openai", 2000, 8000, "reasoning", "chat", _T_TOOLS_YES);
+    _t_hentry(pb, "plain", "x", 1, 1, 0, 0, 0);
+    _t_hentry(pb, "whisper-1", "openai", 1, 1, 0, 0, 0);
+    _t_hentry(pb, "gpt-6-luna", "openai", 100, 500, "economy", 0, 0);
+    var pc = _t_parse(_t_list(pb));
+    var astra = agnosai_model_catalog_get(pc, 0);
+    assert_eq(agnosai_model_entry_hoosh_tier(astra), AGNOSAI_HOOSH_TIER_PREMIUM, "premium read");
+    assert_eq(agnosai_model_entry_kind(astra), AGNOSAI_MODEL_KIND_CHAT, "chat read");
+    assert_eq(agnosai_model_entry_tools(astra), 0, "tools: false read as 0, not as unknown");
+    assert_eq(agnosai_model_entry_chat(astra), 1, "a chat model");
+    var bge = agnosai_model_catalog_get(pc, 1);
+    assert_eq(agnosai_model_entry_kind(bge), AGNOSAI_MODEL_KIND_EMBEDDING, "embedding read");
+    assert_eq(agnosai_model_entry_chat(bge), 0,
+      "bge-m3 is no chat model, and holds none of the twelve words: only `kind` could say so");
+    assert_eq(agnosai_model_entry_hoosh_tier(bge), AGNOSAI_HOOSH_TIER_UNDECLARED, "no tier: none said");
+    assert_eq(agnosai_model_entry_tools(bge), 0 - 1, "no tools bit: -1, nobody said");
+    var audio = agnosai_model_catalog_get(pc, 2);
+    assert_eq(agnosai_model_entry_chat(audio), 1,
+      "hoosh's `chat` outranks the words: `audio` is one of the twelve, and this one chats");
+    assert_eq(agnosai_model_entry_tools(audio), 1, "tools: true read as 1");
+    assert_eq(agnosai_model_entry_hoosh_tier(audio), AGNOSAI_HOOSH_TIER_STANDARD, "standard read");
+    var rerank = agnosai_model_catalog_get(pc, 3);
+    assert_eq(agnosai_model_entry_kind(rerank), AGNOSAI_MODEL_KIND_OTHER,
+      "a word hoosh may add later is `other`");
+    assert_eq(agnosai_model_entry_chat(rerank), 0, "and not chat, as hoosh writes chat for both");
+    var odd = agnosai_model_catalog_get(pc, 4);
+    assert_eq(agnosai_model_entry_hoosh_tier(odd), AGNOSAI_HOOSH_TIER_UNDECLARED,
+      "a tier word hoosh does not write is no tier");
+    assert_eq(agnosai_model_entry_tools(odd), 0 - 1, "and a tools value that is no bool says nothing");
+    assert_eq(agnosai_model_entry_hoosh_tier(agnosai_model_catalog_get(pc, 5)),
+      AGNOSAI_HOOSH_TIER_REASONING, "reasoning read");
+    var plain = agnosai_model_catalog_get(pc, 6);
+    assert_eq(agnosai_model_entry_kind(plain), AGNOSAI_MODEL_KIND_UNDECLARED, "no kind: undeclared");
+    assert_eq(agnosai_model_entry_chat(plain), 1, "and the words take it for chat, as before");
+    assert_eq(agnosai_model_entry_chat(agnosai_model_catalog_get(pc, 7)), 0,
+      "with no kind the words still keep whisper-1 off, for a gateway older than 2.10.2");
+    assert_eq(agnosai_model_entry_chat(agnosai_model_catalog_get(pc, 8)), 1,
+      "a tier with no kind is still chat by the words");
+
+    # --- the lineup ADR 030 was written against, as hoosh 2.10.2 lists it ---
+    var cb = str_builder_new();
+    _t_hentry(cb, "claude-fable-5-1", "anthropic", 10000, 50000, "premium", "chat", _T_EFFORT_TOOLS);
+    _t_hentry(cb, "claude-opus-5-5", "anthropic", 4000, 20000, "premium", "chat", _T_EFFORT_TOOLS);
+    _t_hentry(cb, "claude-sonnet-5-5", "anthropic", 2000, 10000, "standard", "chat", _T_EFFORT_TOOLS);
+    _t_hentry(cb, "claude-haiku-5-5", "anthropic", 100, 500, "economy", "chat", _T_THINK_TOOLS);
+    _t_hentry(cb, "claude-sonnet-4-6", "anthropic", 3000, 15000, "standard", "chat", _T_EFFORT_TOOLS);
+    _t_hentry(cb, "claude-haiku-4-5", "anthropic", 1000, 5000, "economy", "chat", _T_THINK_TOOLS);
+    _t_hentry(cb, "claude-opus-4-1", "anthropic", 15000, 75000, "premium", "chat", _T_THINK_TOOLS);
+    var cc = _t_parse(_t_list(cb));
+    _t_pick(cc, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "Fast: the first economy model, newest first");
+    _t_pick(cc, AGNOSAI_TIER_CAPABLE, "claude-sonnet-5-5", "Capable: the first standard model");
+    _t_pick(cc, AGNOSAI_TIER_PREMIUM, "claude-fable-5-1",
+      "Premium: the first premium model, past the dearer claude-opus-4-1 with no price rule at all");
+    assert_eq(agnosai_model_catalog_pick_for(cc, AGNOSAI_TIER_PREMIUM, 1),
+      agnosai_model_catalog_pick(cc, AGNOSAI_TIER_PREMIUM),
+      "every model here takes tools, so a task with tools gets the same entry");
+
+    # --- known wrong answer 1: gpt-6-astra for an agent with tools ---
+    var oc = _t_parse(_t_openai_body(1, 1));
+    _t_pick(oc, AGNOSAI_TIER_PREMIUM, "gpt-6-astra", "a task with no tools may have astra");
+    _t_pick_tools(oc, AGNOSAI_TIER_PREMIUM, "gpt-5.6-sol",
+      "a task with tools never does: hoosh says it takes none on Chat Completions, so it was a 400");
+    _t_pick(oc, AGNOSAI_TIER_CAPABLE, "gpt-6.1-sol", "Capable with no tools: the first standard");
+    _t_pick_tools(oc, AGNOSAI_TIER_CAPABLE, "gpt-6-sol", "with tools, the first standard that takes them");
+    _t_pick_tools(_t_parse(_t_openai_body(0, 1)), AGNOSAI_TIER_PREMIUM, "o3",
+      "with no premium that takes tools, a reasoning model is Premium's second");
+    _t_pick_tools(_t_parse(_t_openai_body(0, 0)), AGNOSAI_TIER_PREMIUM, "gpt-6-sol",
+      "and with neither, the nearest tier below");
+
+    # --- known wrong answer 2: what is declared beat what nobody said ---
+    var hb = str_builder_new();
+    _t_hentry(hb, "claude-haiku-5-5", "anthropic", 100, 500, "economy", "chat", _T_THINK_TOOLS);
+    _t_hentry(hb, "claude-haiku-4-5", "anthropic", 1000, 5000, "economy", "chat", _T_THINK_TOOLS);
+    _t_hentry(hb, "gpt-6-astra", "openai", 10000, 50000, "premium", "chat", _T_TOOLS_NO);
+    _t_hentry(hb, "gpt-6-sol", "openai", 2000, 10000, "standard", "chat", _T_TOOLS_YES);
+    var hc = _t_parse(_t_list(hb));
+    _t_pick(hc, AGNOSAI_TIER_PREMIUM, "gpt-6-astra",
+      "an Anthropic route limited to Haiku no longer makes Premium a Haiku");
+    _t_pick(hc, AGNOSAI_TIER_CAPABLE, "gpt-6-sol", "nor Capable");
+    _t_pick(hc, AGNOSAI_TIER_FAST, "claude-haiku-5-5", "and Fast is still the first economy model");
+    var hold = str_builder_new();
+    _t_entry(hold, "claude-haiku-5-5", "anthropic", 100, 500, _T_THINK_BUDGET);
+    _t_entry(hold, "claude-haiku-4-5", "anthropic", 1000, 5000, _T_THINK_BUDGET);
+    _t_entry(hold, "gpt-6-astra", "openai", 10000, 50000, _T_VISION);
+    _t_entry(hold, "gpt-6-sol", "openai", 2000, 10000, _T_VISION);
+    _t_pick(_t_parse(_t_list(hold)), AGNOSAI_TIER_PREMIUM, "claude-haiku-4-5",
+      "the same list from a gateway before 2.10.2 still gets the price rule's Haiku: the fallback");
+
+    # --- known wrong answer 3: a list of prices alone made Premium the dearest ---
+    var pr = str_builder_new();
+    _t_hentry(pr, "dear-but-standard", "x", 9000, 9000, "standard", "chat", 0);
+    _t_hentry(pr, "cheap-but-premium", "x", 10, 10, "premium", "chat", 0);
+    var prc = _t_parse(_t_list(pr));
+    _t_pick(prc, AGNOSAI_TIER_PREMIUM, "cheap-but-premium", "hoosh's tier decides, not the price");
+    _t_pick(prc, AGNOSAI_TIER_CAPABLE, "dear-but-standard", "at every tier");
+    var first = str_builder_new();
+    _t_hentry(first, "claude-opus-4-1", "anthropic", 15000, 75000, "premium", "chat", _T_THINK_TOOLS);
+    _t_hentry(first, "claude-fable-5-1", "anthropic", 10000, 50000, "premium", "chat", _T_EFFORT_TOOLS);
+    _t_pick(_t_parse(_t_list(first)), AGNOSAI_TIER_PREMIUM, "claude-opus-4-1",
+      "within a tier the first listed wins, as an operator's [[models]] lists first: the override's job");
+
+    # --- known wrong answer 4: an embedder listed first was every tier ---
+    var eb = str_builder_new();
+    _t_hentry(eb, "bge-m3:latest", "ollama", 0, 0, 0, "embedding", 0);
+    _t_hentry(eb, "llama3.2:3b", "ollama", 0, 0, "economy", "chat", _T_TOOLS_YES);
+    _t_hentry(eb, "phi4:latest", "ollama", 0, 0, 0, "chat", 0);
+    var ec = _t_parse(_t_list(eb));
+    _t_pick(ec, AGNOSAI_TIER_FAST, "llama3.2:3b", "a box of local models serves its chat model");
+    _t_pick(ec, AGNOSAI_TIER_PREMIUM, "llama3.2:3b", "at every tier");
+    var ewb = str_builder_new();
+    _t_entry(ewb, "bge-m3:latest", "ollama", 0, 0, 0);
+    _t_entry(ewb, "llama3.2:3b", "ollama", 0, 0, 0);
+    _t_pick(_t_parse(_t_list(ewb)), AGNOSAI_TIER_FAST, "bge-m3:latest",
+      "which the words alone could not do: with no kind, the embedder is still first");
+
+    # --- a tier with nothing in it takes the nearest, below before above ---
+    var only = str_builder_new();
+    _t_hentry(only, "claude-haiku-5-5", "anthropic", 100, 500, "economy", "chat", 0);
+    _t_hentry(only, "claude-haiku-4-5", "anthropic", 1000, 5000, "economy", "chat", 0);
+    _t_pick(_t_parse(_t_list(only)), AGNOSAI_TIER_PREMIUM, "claude-haiku-5-5",
+      "a route limited to Haiku: Premium is its first Haiku, not a failure");
+    var up = str_builder_new();
+    _t_hentry(up, "p", "x", 9, 9, "premium", "chat", 0);
+    _t_hentry(up, "s", "x", 5, 5, "standard", "chat", 0);
+    _t_pick(_t_parse(_t_list(up)), AGNOSAI_TIER_FAST, "s", "Fast with none of its own: the nearest above");
+    var gap = str_builder_new();
+    _t_hentry(gap, "p", "x", 9, 9, "premium", "chat", 0);
+    _t_hentry(gap, "e", "x", 1, 1, "economy", "chat", 0);
+    _t_pick(_t_parse(_t_list(gap)), AGNOSAI_TIER_CAPABLE, "e",
+      "Capable with neither neighbour its own: below first, as the crew asked for less");
+    var rp = str_builder_new();
+    _t_hentry(rp, "r", "x", 1, 1, "reasoning", "chat", 0);
+    _t_hentry(rp, "p", "x", 9, 9, "premium", "chat", 0);
+    var rpc = _t_parse(_t_list(rp));
+    _t_pick(rpc, AGNOSAI_TIER_CAPABLE, "p", "reasoning is the furthest from Capable");
+    _t_pick(rpc, AGNOSAI_TIER_PREMIUM, "p", "and Premium takes premium before reasoning, listed first or not");
+    var ds = str_builder_new();
+    _t_hentry(ds, "deepseek-chat", "deepseek", 300, 1200, "economy", "chat", 0);
+    _t_hentry(ds, "deepseek-reasoner", "deepseek", 600, 2400, "reasoning", "chat", 0);
+    var dsc = _t_parse(_t_list(ds));
+    _t_pick(dsc, AGNOSAI_TIER_PREMIUM, "deepseek-reasoner", "where nothing is premium, reasoning is");
+    _t_pick(dsc, AGNOSAI_TIER_CAPABLE, "deepseek-chat", "and Capable stays below");
+
+    # --- what hoosh gave no tier is left to the price rule, which runs only when nothing has one ---
+    var mx = str_builder_new();
+    _t_hentry(mx, "custom-x", "vllm", 1, 1, 0, 0, 0);
+    _t_hentry(mx, "claude-sonnet-5-5", "anthropic", 2000, 10000, "standard", "chat", _T_EFFORT_TOOLS);
+    var mxc = _t_parse(_t_list(mx));
+    _t_pick(mxc, AGNOSAI_TIER_FAST, "claude-sonnet-5-5",
+      "a tiered model beats an untiered one, however cheap: nobody said what custom-x is");
+    assert(agnosai_model_catalog_find(mxc, str_from("custom-x")) != 0, "it is still listed to name");
+    var mt = str_builder_new();
+    _t_hentry(mt, "custom-x", "vllm", 1, 1, 0, 0, 0);
+    _t_hentry(mt, "gpt-6-astra", "openai", 10000, 50000, "premium", "chat", _T_TOOLS_NO);
+    var mtc = _t_parse(_t_list(mt));
+    _t_pick(mtc, AGNOSAI_TIER_PREMIUM, "gpt-6-astra", "with no tools, the tiered model");
+    _t_pick_tools(mtc, AGNOSAI_TIER_PREMIUM, "custom-x",
+      "with tools the only tiered one is out, and the price rule takes what is left");
+
+    # --- a task with tools: the ladder is the paid models it can send ---
+    var fl = str_builder_new();
+    _t_hentry(fl, "gpt-6-astra", "openai", 10000, 50000, "premium", "chat", _T_TOOLS_NO);
+    _t_hentry(fl, "qwen3:32b", "ollama", 0, 0, "standard", "chat", _T_TOOLS_YES);
+    var flc = _t_parse(_t_list(fl));
+    _t_pick(flc, AGNOSAI_TIER_CAPABLE, "gpt-6-astra", "with no tools a paid model keeps free ones off");
+    _t_pick_tools(flc, AGNOSAI_TIER_CAPABLE, "qwen3:32b",
+      "with tools nothing paid can be sent, so the local model is the ladder");
+    var un = str_builder_new();
+    _t_hentry(un, "says-nothing", "x", 5, 5, "standard", "chat", 0);
+    _t_pick_tools(_t_parse(_t_list(un)), AGNOSAI_TIER_CAPABLE, "says-nothing",
+      "a model nobody spoke for may take tools: only a stated false is off");
+    var none = str_builder_new();
+    _t_hentry(none, "gpt-6-astra", "openai", 10000, 50000, "premium", "chat", _T_TOOLS_NO);
+    _t_hentry(none, "gpt-6.1-sol", "openai", 3000, 15000, "standard", "chat", _T_TOOLS_NO);
+    var nc = _t_parse(_t_list(none));
+    assert_eq(agnosai_model_catalog_pick_for(nc, AGNOSAI_TIER_PREMIUM, 1), 0,
+      "a list where nothing takes tools has no model for a task with them");
+    assert(agnosai_model_catalog_pick(nc, AGNOSAI_TIER_PREMIUM) != 0, "and one for a task without");
+    assert_eq(agnosai_model_catalog_pick_for(nc, 3, 1), 0, "and no tier past Premium");
+    assert_eq(agnosai_model_catalog_pick_for(nc, 0 - 1, 0), 0, "nor before Fast");
+
+    # --- and none on the selection path, which reads the picks itself ---
+    var gw = _t_gw(200, _t_openai_body(1, 1));
+    assert(_t_choose(gw, 3) != 0,
+      "a tier past Premium chooses nothing: read unbounded, it is a task with tools' Fast");
+    assert(_t_choose(gw, 0 - 1) != 0, "nor one before Fast, which would read the catalog's hash");
+    var tools_out: i64[1];
+    store64(&tools_out, 0);
+    assert(agnosai_model_for_tier_tools_a(default_alloc(), gw, 3, 1, &tools_out) != 0,
+      "nor past Premium for a task with tools, which would read past the catalog");
+    return 0;
+}
+
+# The `tiers` field of the last `model catalog read` line, a copy.
+var _t_read_line = 0;
+
+fn _t_log_hook(ts, level, category, msg, msg_len, fields): i64 {
+    if (level > SK_TRACE || fields == 0) { return 0; }
+    if (msg_len != 18 || memeq(msg, "model catalog read", 18) == 0) { return 0; }
+    for (var i = 0; i < load64(fields); i = i + 1) {
+        var kp = fields + 8 + i * 32;
+        if (load64(kp + 8) == 5 && memeq(load64(kp), "tiers", 5) == 1) {
+            _t_read_line = str_clone(str_new(load64(kp + 16), load64(kp + 24)));
+        }
+    }
+    return 0;
+}
+
+fn test_read_log(): i64 {
+    var was = sakshi_get_level();
+    sakshi_set_level(SK_INFO);
+    sakshi_set_emit_hook(&_t_log_hook);
+    _t_read_line = 0;
+    _t_means(_t_gw(200, _t_openai_body(1, 1)), AGNOSAI_TIER_FAST, "gpt-6-luna", "read");
+    sakshi_clear_emit_hook();
+    sakshi_set_level(was);
+    if (_t_read_line == 0) { return assert(0, "a read logs what each tier means"); }
+    assert(str_eq_cstr(_t_read_line,
+        "6 listed fast=gpt-6-luna capable=gpt-6.1-sol premium=gpt-6-astra capable+tools=gpt-6-sol premium+tools=gpt-5.6-sol") == 1, #skip-lint
+      "and, where it differs, what a task with tools gets: an operator sees why a tool agent is not on astra");
+
+    sakshi_set_level(SK_INFO);
+    sakshi_set_emit_hook(&_t_log_hook);
+    _t_read_line = 0;
+    var nb = str_builder_new();
+    _t_hentry(nb, "gpt-6-astra", "openai", 10000, 50000, "premium", "chat", _T_TOOLS_NO);
+    _t_means(_t_gw(200, _t_list(nb)), AGNOSAI_TIER_PREMIUM, "gpt-6-astra", "read");
+    sakshi_clear_emit_hook();
+    sakshi_set_level(was);
+    if (_t_read_line == 0) { return assert(0, "a read of one model logs"); }
+    assert(str_eq_cstr(_t_read_line,
+        "1 listed fast=gpt-6-astra capable=gpt-6-astra premium=gpt-6-astra fast+tools=none capable+tools=none premium+tools=none") == 1, #skip-lint
+      "and says none where a task with tools has nothing");
+    return 0;
+}
+
 fn test_lookup(): i64 {
     var c = _t_parse(_t_claude_body());
     assert(agnosai_model_catalog_find(c, str_from("claude-opus-5-5")) != 0, "a listed id is found");
@@ -939,6 +1249,7 @@ fn main(): i64 {
     alloc_init();
     test_parse();
     test_tiers();
+    test_hoosh_fields();
     test_lookup();
     # A suite re-reads at once to see what a re-read does. `test_rationed` is the interval's own.
     agnosai_model_catalog_set_reread_ms(0);
@@ -946,6 +1257,7 @@ fn main(): i64 {
     test_rationed();
     test_override();
     test_concurrent();
+    test_read_log();
     test_seam();
     test_socket();
     return assert_summary();

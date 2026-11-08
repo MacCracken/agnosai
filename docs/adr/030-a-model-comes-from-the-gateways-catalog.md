@@ -210,3 +210,95 @@ self-hosted GPU-hour estimate, not a provider's price.
 - **No ration on a re-read.** The first version of this had none, on the reasoning that a GET costs little beside the chat
   call that failed. That is true of agnosai and false of hoosh, whose heap keeps what the GET allocates. Review found it, and
   a measurement settled it.
+
+## Addendum (2.3.3): hoosh says the tier, the kind and the tools
+
+hoosh 2.10.2 answered the three asks above ([its ADR 012 addendum](https://github.com/MacCracken/hoosh/blob/main/docs/decisions/012-live-model-catalog.md#addendum-2102-tier-kind-and-tools)).
+A catalog entry can carry `tier` (`economy`, `standard`, `premium` or `reasoning`), `kind` (`chat`, `embedding` or
+`other`) and `capabilities.tools`, and each is **absent when nobody said**. agnosai reads all three, and they decide
+wherever they are present. The rule above stays for a gateway that writes none of them.
+
+### Kind
+
+**`kind` outranks the twelve words.** `chat` is a chat model even when its id holds one of the words
+(`gpt-4o-audio-preview`), and any other word is not, including one hoosh adds later, since hoosh writes `chat` for a
+model that does both. The words are read only for an entry with no `kind`. On hoosh 2.10.2 that is an entry the words
+do not match: hoosh runs every entry through the same twelve (`metadata_lend`, then `catalog_id_kind`) and writes a
+`kind` for each match. So the words now matter only on an older gateway, and retire when agnosai requires hoosh 2.10.2
+(the roadmap's *Decisions for the user*).
+
+### Tier
+
+**Where any model on the ladder has a tier, the tier decides, and the first listed in it wins.** The ladder is
+unchanged: paid models first, and free ones only when nothing usable is paid.
+
+| agnosai's tier | Takes hoosh's tiers, nearest first |
+|---|---|
+| Fast | `economy`, then `standard`, `premium`, `reasoning` |
+| Capable | `standard`, then `economy`, then `premium`, `reasoning` |
+| Premium | `premium`, then `reasoning`, then `standard`, `economy` |
+
+- **`reasoning` is read as Premium, after `premium` itself.** hoosh gives it to `o3`, `o4-mini`, `deepseek-reasoner`
+  and `deepseek-r1`. These are a kind of model, not a rung above `claude-fable-5-1`, so a Premium task takes one only
+  where nothing is `premium`, and Capable reaches one last.
+- **A tier with nothing in it takes the nearest, below before above.** A crew that asked for less did not agree to
+  spend more. An Anthropic route limited to Haiku answers Premium with its first Haiku, not a failure.
+- **First listed, not cheapest or dearest.** hoosh lists `[[models]]` first, then routes in router order, then each
+  provider's own order, and Anthropic's is newest first. So `claude-opus-4-1`, `premium` at $15/$75, loses to
+  `claude-fable-5-1` because it is listed later, and the price rule is not consulted. An operator who lists it first,
+  or sets `AGNOSAI_MODEL_PREMIUM`, gets it.
+- **A model with no tier is left out while any model on the ladder has one.** Nobody said what it is, so a cheap
+  untiered `custom-x` does not become Fast beside a tiered Claude. It is still listed, and an agent can name it. The
+  price rule runs over the untiered models only when no model on the ladder has a tier.
+
+### Tools
+
+**A task whose request carries tools is never given a model hoosh says takes none.** A task carries tools when the
+crew has a tool loop and its agent names a tool (ADR 029). A model nobody spoke for may take tools, so only a stated
+`false` is ruled out. The ladder for such a task is the paid models it can send, so with every paid model saying
+`false`, a local model that takes tools is chosen rather than nothing.
+
+A catalog holds six picks, three tiers for each answer to "does the task carry tools". Where no entry says `false`,
+both sets are the same entries, and the second three are not computed.
+
+⚠ **A list with chat models and none that takes tools is asked again at the ration's pace.** "Nothing to pick reads
+again at once" is for a gateway coming back. Here only hoosh changing its list would help, and an unrationed read per
+task would let any crew with tools grow the gateway's heap on every task, which is what the ration exists to stop. The
+task fails before any request, with `no model catalog: hoosh lists no chat model that takes tools`. The agent's own
+`llm_model` and the operator's override are not checked for tools, as they are not checked for anything.
+
+A refused id selects again under the same rule, so a task with tools is re-selected onto a model that takes them.
+
+### The known wrong answers, on hoosh 2.10.2
+
+| Was | Now |
+|---|---|
+| `gpt-6-astra` for a `complexity: high` agent with tools, and a provider's 400 | The first `premium` model that takes tools: `gpt-5.6-sol` on an OpenAI route |
+| Beside OpenAI, Capable and Premium are Anthropic's. An Anthropic route limited to Haiku makes Premium a Haiku | hoosh's tier decides, and the route order breaks a tie between providers. Premium is `gpt-6-astra` beside a Haiku-only route |
+| A catalog of prices alone gets the dearest model as Premium | The first `premium` model listed, at any price |
+| `bge-m3` listed first is every tier on a box of local models | `kind: embedding` keeps it off every tier |
+
+**Measured end to end.** A real hoosh 2.10.2 at stub providers, and the real agnosai server running one-agent crews.
+The stubs listed `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-5.6-sol`, `gpt-6-luna` and `text-embedding-3-small`
+on an OpenAI route, and `bge-m3:latest` then `llama3.2:3b` on an Ollama route. Each cell is the model the provider was
+asked for:
+
+| Crew | 2.3.2 | 2.3.3 |
+|---|---|---|
+| `high`, with tools | `gpt-6-astra` | `gpt-5.6-sol` |
+| `high`, no tools | `gpt-6-astra` | `gpt-6-astra` |
+| `medium`, with tools | `gpt-6.1-sol` | `gpt-6-sol` |
+| `medium`, no tools | `gpt-6.1-sol` | `gpt-6.1-sol` |
+| Ollama, `high` | `bge-m3:latest` | `llama3.2:3b` |
+| Ollama, `medium`, with tools | `bge-m3:latest` | `llama3.2:3b` |
+
+On 2.3.2, all four `gpt-6-astra` and `gpt-6.1-sol` calls carried tools, which hoosh's table says those models do not
+take on Chat Completions, and both Ollama calls sent chat to an embedder.
+
+### Still a heuristic
+
+- **First listed is the provider's order.** Anthropic's is newest first. OpenAI's `/v1/models` order means nothing, so
+  on an OpenAI route an older `premium` model listed before a newer one is Premium. hoosh's tier says both are
+  premium, and agnosai has nothing better to go on. The override, or a `[[models]]` entry, says which.
+- **Older gateways keep the price rule and its four wrong answers.** That is every hoosh before 2.10.2 and any gateway
+  that is not hoosh.
