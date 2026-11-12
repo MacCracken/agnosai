@@ -76,7 +76,7 @@ CrewRunner::new(spec), with a budget tracker under its tenant's
     ├── ProcessMode::Sequential → run tasks in order
     ├── ProcessMode::Parallel   → a sliding window of max_concurrency
     ├── ProcessMode::DAG        → topological sort → each wave a sliding window
-    └── ProcessMode::Hierarchical → manager delegation (falls back to sequential)
+    └── ProcessMode::Hierarchical → workers in order, each within its manager's tools → the manager's answer
     │
     ├── For each task:
     │   ├── score_agent() → rank agents by suitability (5-factor weighted)
@@ -121,9 +121,11 @@ allocator only. agnosai renders the JSON so consumers do not hardcode factor nam
 
 It is a library call (roadmap F7), and no route serves it. The explanation is
 **recomputed** from the roster and the task, not recorded during the run, and that
-is exact only while selection is a pure function of those two. Hierarchical
-delegation (F2), learning-driven selection or a stateful bhava personality would
-end that, and would have to record the choice on the run instead. agnostic is to
+is exact only while selection is a pure function of those two. A hierarchical
+crew keeps it one (2.4.3, ADR 035): its run ranks the workers
+`agnosai_hierarchical_workers_a` returns, so the explanation over those is exact.
+Learning-driven selection or a stateful bhava personality would end that, and
+would have to record the choice on the run instead. agnostic is to
 surface the explanation on its plan route (`?explain=selection`) when it re-pins.
 
 ### Task DAG Resolution

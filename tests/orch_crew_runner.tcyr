@@ -1604,16 +1604,23 @@ fn main() {
       "with both tasks folded into tasks_completed — the counter ADR 011 staged and \
     left rendering zeros");
 
-    # --- test_hierarchical_falls_back_to_sequential ---
+    # --- a hierarchical crew is managed (ADR 035), where the Rust line ran it sequentially ---
     var hier = agnosai_crew_new(str_from("hier"));
     agnosai_crew_with_tasks(hier, seq_tasks);
-    agnosai_crew_with_process(hier, agnosai_process_hierarchical(_t_agent("mgr")));
+    agnosai_crew_with_process(hier, agnosai_process_hierarchical(str_from("mgr")));
+    store64(&run_err, 0);
+    assert_eq(agnosai_crew_runner_run(agnosai_crew_runner_new(hier), &run_err), 0,
+      "a manager that names no agent of the crew's cannot run");
+    assert_eq(agnosai_error_kind(load64(&run_err)), AGNOSAI_ERR_INVALID_DEFINITION,
+      "and says why, as a cycle does");
+    var hier_agents = vec_new();
+    vec_push(hier_agents, _t_agent("mgr"));
+    agnosai_crew_with_agents(hier, hier_agents);
     store64(&run_err, 0);
     var hier_state = agnosai_crew_runner_run(agnosai_crew_runner_new(hier), &run_err);
-    assert_eq(load64(&run_err), 0, "hierarchical mode runs");
-    assert_eq(vec_len(agnosai_crew_state_results(hier_state)), 2,
-      "by falling back to SEQUENTIAL — orch_hierarchical's delegation exists and is tested, but the \
-    oracle has not wired it in, and doing so here would diverge from Phase 2 upstream");
+    assert_eq(load64(&run_err), 0, "managed by an agent of its own, it runs");
+    assert_eq(vec_len(agnosai_crew_state_results(hier_state)), 3,
+      "its two tasks, by the manager alone as it has no workers, then the manager's answer");
 
     # --- cancellation ---
     var cancel_spec = agnosai_crew_new(str_from("cancelled"));

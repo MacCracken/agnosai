@@ -36,7 +36,8 @@ not an answer, and is not handed over.
 
 - **In a DAG**, a task runs only once every dependency has completed, so it is handed every one.
 - **In a sequential crew**, a task is handed the answers of the dependencies listed before it that completed, and told
-  that any other has none. A hierarchical crew runs sequentially until 2.4.3, so it does the same.
+  that any other has none. A hierarchical crew runs its workers in order too, and since 2.4.3 its manager is handed
+  every worker's answer to write the crew's from (ADR 035).
 - **A parallel crew hands nothing.** Its tasks do not wait for their dependencies, so what had ended when a task
   started would be a matter of timing, and two runs of one crew would send different requests.
 

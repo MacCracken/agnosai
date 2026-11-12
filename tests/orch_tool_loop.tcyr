@@ -1798,6 +1798,46 @@ fn _t_runner_suite(): i64 {
     return 0;
 }
 
+# ── the caller, for a tool that hands work on (2.4.3, ADR 035) ─────────────
+
+var _t_spy_agent = 0;
+var _t_spy_budget = 0;
+var _t_spy_runs = 0;
+
+fn _t_spy_exec(ctx, input): i64 {
+    _t_spy_agent = agnosai_tool_input_agent(input);
+    _t_spy_budget = agnosai_tool_input_budget(input);
+    _t_spy_runs = _t_spy_runs + 1;
+    return agnosai_tool_output_ok(bayan_json_v_str_new(str_from("seen")));
+}
+
+fn _t_spy_run(budget): i64 {
+    _t_reset();
+    _t_spy_runs = 0;
+    var registry = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(registry, _t_tool("spy", &_t_spy_exec, 0));
+    var agent = _t_agent("spy", 0, 0);
+    _t_asks(_t_calls(_t_call("c1", "spy", "\"{}\""), 0, 0));
+    _t_says("done");
+    agnosai_execute_task_budgeted_a(default_alloc(), agnosai_task_new(str_from("do it")), agent, _t_client(), 0,
+      0, 0, _t_loop(registry, 0, 0), budget);
+    return agent;
+}
+
+fn _t_caller_suite(): i64 {
+    var tracker = agnosai_budget_tracker_limits_a(default_alloc(), 100000, AGNOSAI_NO_LIMIT, 0, "task");
+    var agent = _t_spy_run(tracker);
+    assert_eq(_t_spy_runs, 1, "the tool ran");
+    assert(_t_spy_agent == agent, "its input names the agent calling, as its task holds it");
+    assert(_t_spy_budget == tracker, "and its task's budget tracker");
+    _t_spy_run(0);
+    assert_eq(_t_spy_budget, 0, "which is 0 when nothing limits the task");
+    var bare = agnosai_tool_input_new();
+    assert_eq(agnosai_tool_input_agent(bare), 0, "a call no task made names no caller");
+    assert_eq(agnosai_tool_input_budget(bare), 0, "and no budget");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     # A crew with no `llm_model` needs a model to send, and which one is not what this suite is about.
@@ -1818,6 +1858,7 @@ fn main(): i64 {
     _t_runner_suite();
     _t_call_arena_suite();
     _t_cost_suite();
+    _t_caller_suite();
     return assert_summary();
 }
 

@@ -45,6 +45,11 @@ here, that would turn every existing crew into a tool-calling one.
 The grant is resolved once, before the first call, into a list held by the task. A call to anything else is refused
 with `effect: none`, though the registry may hold it, and no later text can add to it.
 
+> **2.4.3 note** ([ADR 035](035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md)): a hierarchical crew's
+> worker names only the tools its manager holds too, so its grant is that. A call's input also names its caller, the
+> agent and its task's budget tracker (`agnosai_tool_input_agent`, `agnosai_tool_input_budget`), so a tool that hands
+> work on, `delegate`, gives it no more than the caller holds.
+
 ⚠ **A name the registry does not hold fails the task, before the first call, naming the tool.** Going on would be a
 smaller agent than the crew asked for, told by its own system prompt that it holds a tool it cannot call, and a model
 in that spot writes down what the tool would have said. In a QA report that is a fabricated finding. A name no

@@ -66,6 +66,36 @@ fn _agnosai_delegate_spec(def, agent_name: Str, task: Str): i64 {
     return spec;
 }
 
+# The crew for one delegation, bounded by who delegates (2.4.3, ADR 035): `caller` is the agent
+# delegating and `budget` its task's tracker, either 0. Returns the spec, or 0 when the task has no
+# budget left to hand on. `out_held` gets the vec of tools withheld, in `a`, or 0.
+#
+# **Authority only narrows.** The agent delegated to holds at most the caller's tools, and its crew
+# at most what the caller's task has left. Nothing here widens either: a need beyond them is the
+# crew author's to grant, and the model is told what was withheld. ⚠ **The budget is what was left
+# when it delegated**, a ceiling and not a share: the crew runs past this call and its task, and a
+# tracker under the task's would outlive it, so what the crew spends is not recorded above it.
+fn _agnosai_delegate_bounded_spec_a(a, def, agent_name: Str, task: Str, caller, budget, out_held): i64 {
+    store64(out_held, 0);
+    var tokens = AGNOSAI_NO_LIMIT;
+    var cost = AGNOSAI_NO_LIMIT;
+    if (budget != 0) {
+        tokens = agnosai_budget_tracker_tokens_left(budget);
+        cost = agnosai_budget_tracker_cost_left_micro_usd(budget);
+        if (tokens == 0 || cost == 0) { return 0; }
+    }
+    var worker = def;
+    if (caller != 0) {
+        var held = agnosai_tools_withheld_a(a, def, caller);
+        store64(out_held, held);
+        if (vec_len(held) > 0) { agnosai_log_withheld(caller, def, held); }
+        worker = agnosai_worker_within_a(default_alloc(), def, caller);
+    }
+    var spec = _agnosai_delegate_spec(worker, agent_name, task);
+    if (budget != 0) { agnosai_crew_with_budget(spec, tokens, cost); }
+    return spec;
+}
+
 # `ctx` is the app state, which is what carries both the definitions map (to
 # resolve `agent`) and the orchestrator (to submit against).
 fn _agnosai_delegate_execute(ctx, input): i64 {
@@ -91,7 +121,12 @@ fn _agnosai_delegate_execute(ctx, input): i64 {
             agent_name));
     }
 
-    var spec = _agnosai_delegate_spec(def, agent_name, bayan_json_v_str(task_v));
+    var held = 0;
+    var spec = _agnosai_delegate_bounded_spec_a(a, def, agent_name, bayan_json_v_str(task_v),
+      agnosai_tool_input_agent(input), agnosai_tool_input_budget(input), &held);
+    if (spec == 0) {
+        return agnosai_tool_output_err_a(a, str_from_a(a, "the delegating task has no budget left to hand on"));
+    }
 
     # The crew stays in the trace of the call that started it. It runs past this call's return,
     # which a span may do: only the id is handed on. 0 with telemetry off (ADR 029).
@@ -113,6 +148,13 @@ fn _agnosai_delegate_execute(ctx, input): i64 {
     # started, but nothing here waits to see it picked up, so claiming `running`
     # would be a guess. It is the same wire spelling the crew map holds.
     bayan_json_v_obj_set_a(a, o, str_from_a(a, "status"), bayan_json_v_str_new_a(a, str_from_a(a, "pending")));
+    if (held != 0 && vec_len(held) > 0) {
+        var arr = bayan_json_v_arr_new_a(a);
+        for (var i = 0; i < vec_len(held); i = i + 1) {
+            bayan_json_v_arr_push_a(a, arr, bayan_json_v_str_new_a(a, vec_get(held, i)));
+        }
+        bayan_json_v_obj_set_a(a, o, str_from_a(a, "withheld_tools"), arr);
+    }
     return agnosai_tool_output_ok_a(a, o);
 }
 

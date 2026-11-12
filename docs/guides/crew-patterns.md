@@ -13,7 +13,7 @@ constructor in `src/core/task.cyr`.
 agnosai_process_sequential()              # the default
 agnosai_process_parallel(max_concurrency)
 agnosai_process_dag()
-agnosai_process_hierarchical(manager)     # manager is an agent id
+agnosai_process_hierarchical(manager)     # manager is an agent_key
 ```
 
 Attach one to a crew with `agnosai_crew_with_process(spec, mode)`; read it back
@@ -154,24 +154,41 @@ come after the context preamble, as one user turn and a reply, so the task's own
 
 ## Hierarchical Execution
 
-A designated manager agent delegates tasks to worker agents. Currently falls back to sequential execution while full manager delegation is being implemented.
+A manager, one of the crew's agents, named by its `agent_key`, assigns each task to the best of its workers, and
+writes the crew's answer from what they found (2.4.3,
+[ADR 035](../adr/035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md)).
 
 ```cyr
-var manager_id = agnosai_uuid_v4_str();
+var lead = agnosai_agent_new(str_from("lead"), str_from("tech lead"), str_from("ship the API"));
+agnosai_agent_with_tools(lead, tools_the_lead_may_grant);
+# ... and the workers, each with tools of its own
+
+var design = agnosai_task_new(str_from("Design API schema"));
+var build = agnosai_task_new(str_from("Implement endpoints"));
+agnosai_task_with_dependency(build, agnosai_task_id(design));
 
 var crew = agnosai_crew_new(str_from("managed-team"));
-var tasks = vec_new();
-vec_push(tasks, agnosai_task_new(str_from("Design API schema")));
-    Task::new("Implement endpoints"),
-    Task::new("Write integration tests"),
-];
-crew.process = ProcessMode::Hierarchical { manager: manager_id };
+agnosai_crew_with_agents(crew, agents);   # the lead and its workers
+agnosai_crew_with_tasks(crew, tasks);
+agnosai_crew_with_process(crew, agnosai_process_hierarchical(str_from("lead")));
 
-let result = orchestrator.run_crew(crew).await?;
-// Currently executes sequentially; manager delegation is on the roadmap.
+var state = agnosai_orchestrator_run_crew(orchestrator, crew);
+# Results: [Design, Build, the lead's answer]. Build is handed Design's answer, and the
+# lead is handed both.
 ```
 
-**When to use:** Scenarios where a lead agent should decompose and assign work. Currently equivalent to sequential; full manager delegation is on the roadmap.
+- **The manager is never a candidate.** Each task is ranked against every agent but the manager, as any task is
+  ranked against a crew's agents, so `agnosai_explain_selection_a` over `agnosai_hierarchical_workers_a` explains
+  each assignment exactly. A manager with no workers does every task itself.
+- **Authority only narrows.** A worker holds only the tools its manager holds too, on a copy of its definition: its
+  prompt lists those, it is offered those, and it is ranked on those. The rest are withheld and named on its result
+  (`withheld_tools`). Give the manager a tool to let its workers use it.
+- **The manager writes and calls nothing.** Once every worker has answered, it is handed every answer, in the crew's
+  order, and told what each task was, and its answer is the crew's last result, with `role: "manager"`. A crew whose
+  worker failed, or that was stopped, has no manager's answer and does not complete.
+- **A manager that names no agent of the crew's** fails the crew `invalid_manager` before any task runs.
+
+**When to use:** Work one agent should lead, where the answer is the lead's synthesis of what the others found.
 
 ---
 

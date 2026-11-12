@@ -273,7 +273,9 @@ enum AgnosaiToolTaskOff {
     AGN_TT_SEEN = 104;
     # The sender this task's crew events go on, or 0 (ADR 032).
     AGN_TT_EVENT_TX = 112;
-    AGN_TT_SIZE = 120;
+    # The task's budget tracker, or 0, for a tool that hands work on (2.4.3, ADR 035).
+    AGN_TT_BUDGET = 120;
+    AGN_TT_SIZE = 128;
 }
 
 # One call of one turn. `ST` is its task. The fields a callback reads have accessors below.
@@ -485,6 +487,14 @@ fn _agnosai_tool_task_new_a(a, ra, loop, task, agent, parent_sc, out_err): i64 {
     store64(st + AGN_TT_STOPPED, 0);
     store64(st + AGN_TT_SEEN, vec_new_a(ra));
     store64(st + AGN_TT_EVENT_TX, 0);
+    store64(st + AGN_TT_BUDGET, 0);
+    return st;
+}
+
+# Give this task's calls its budget tracker, so a tool that hands work on can bound it (ADR 035).
+# Returns the state.
+fn _agnosai_tool_task_with_budget(st, budget): i64 {
+    store64(st + AGN_TT_BUDGET, budget);
     return st;
 }
 
@@ -1017,6 +1027,7 @@ fn _agnosai_tool_call_prepare_a(st, asked, i): i64 {
     if (agnosai_telemetry_capture_tool_content() == 1) { capture = &_agnosai_tool_span_capture; }
     agnosai_tool_input_with_call(input, load64(c + AGN_TC_ID), agnosai_agent_name(agent),
       agnosai_task_id(task), args, capture);
+    agnosai_tool_input_with_caller(input, agent, load64(st + AGN_TT_BUDGET));
     store64(c + AGN_TC_INPUT, input);
     return c;
 }

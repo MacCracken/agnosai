@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.4.2 (2026-11-12).**
+**Status as of 2.4.3 (2026-11-12).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.4.3** | Hierarchical crews: a manager and its workers |
 | **2.5.0** | Durable execution: a crew log that resumes from its last finished task |
 | **2.5.1** | The server's own crews in arenas |
 | **2.6.0** | MCP 2026-07-28 on `/mcp`, and A2A 1.0 |
@@ -87,19 +86,11 @@ are written there. 2.4.1 enforced budgets and caps: crews at once, outbound TLS 
 window, and token and cost per tenant, crew and task, each under the one above it
 ([ADR 033](../adr/033-budgets-caps-and-crew-concurrency-are-enforced.md)). 2.4.2 handed a dependent task its
 dependencies' answers, as data, in a DAG and in a sequential crew
-([ADR 034](../adr/034-a-dependent-task-is-handed-its-dependencies-answers.md)).
-
-#### 2.4.3 — hierarchical crews: a manager and its workers
-
-`orchestrator/hierarchical.cyr` is built and tested, and `crew_runner.cyr` logs and falls back to sequential.
-Orchestrator-worker is where the field converged, and Google/DeepMind's 2025 scaling study measured error amplification
-of 17.2× for independent agents against 4.4× centralized. A worker's answer reaches its manager as 2.4.2 hands a
-dependency's answer on (ADR 034). agnostic drops its `hierarchical` refusal on the re-pin. **Selection explanations stay
-exact:** `agnosai_explain_selection_a` is exact only while selection is a pure function of roster and task, so a
-manager's choice must be recorded. **Authority only narrows:** a worker holds at most its manager's tools and budget,
-and a need beyond them goes up to a human. Today a delegated crew's agents hold whatever their own definitions name,
-however little the delegating agent holds, and that is the gap this closes. The budget half is a tracker under the
-manager's task's, which 2.4.1 built (ADR 033): a worker can then never spend what its manager has not got.
+([ADR 034](../adr/034-a-dependent-task-is-handed-its-dependencies-answers.md)). 2.4.3 ran a hierarchical crew as its
+name says: its manager, an agent of its own named by key, assigns each task to its best worker, each worker holds at
+most its manager's tools, and the manager writes the crew's answer from every worker's; the `delegate` tool bounds the
+crew it starts by its caller's tools and what its task has left
+([ADR 035](../adr/035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md)). The line is done.
 
 ### 2.5.x — durable execution
 
@@ -311,8 +302,9 @@ lives.
   user*. CHANGELOG [2.1.5].
 - **A selection explanation keeps no per-run record** (2026-10-03). `agnosai_explain_selection_a` is a library call with
   no wire field and no ADR. The crew run keeps no breakdown, which would cost agents × tasks entries on the global bump
-  every run; consumers recompute from the spec. That is exact while selection is a pure function of roster and task —
-  hierarchical crews (2.4.3) carry the constraint for when it stops being one. CHANGELOG [2.1.5].
+  every run; consumers recompute from the spec. That is exact while selection is a pure function of roster and task,
+  and hierarchical crews (2.4.3) kept it one: a run ranks the workers `agnosai_hierarchical_workers_a` returns
+  (ADR 035). CHANGELOG [2.1.5].
 - **The tool SDK and `examples/wasm-tools/` stay Rust** (2026-08-11). Not a deferral. `sdk/agnosai-tool-sdk/` is a crate
   third-party tool authors compile to `wasm32-wasip1`; rewriting it in Cyrius would break every tool author on the
   published protocol. agnosai owes conformance only — the `{"parameters": …}` stdin and `{"result", "success",
@@ -420,9 +412,9 @@ and log fields at 2.3.6.
 | B41 | shipped in 2.3.2 |
 | C | the rows of *Waiting on another project* |
 | D1–D9, F7 | *Settled decisions* and *Decisions for the user*, by their titles |
-| F2 | 2.4.3, hierarchical crews |
+| F2 | shipped in 2.4.3, hierarchical crews (ADR 035) |
 | F3 | shipped in 2.4.0, the crew lifecycle (ADR 032); its resync snapshot at 2.5.0 |
 | F4 | 2.5.0, durable execution |
-| F5 | shipped in 2.4.1, budgets and caps (ADR 033); the delegated worker's level at 2.4.3 |
+| F5 | shipped in 2.4.1, budgets and caps (ADR 033); the delegated worker's level in 2.4.3 (ADR 035) |
 | F8 | 2.6.0, MCP 2026-07-28 and A2A 1.0 |
 | F9 | shipped in 2.4.2, the hand-off of a dependency's answer (ADR 034) |

@@ -34,6 +34,7 @@ Tools run untrusted code from community authors or legacy Python scripts.
 | Memory exhaustion | WASM: kavach passes `-W max-memory-size` (64 MiB default) to wasmtime. OCI: `--memory` and `--pids-limit 256`. ⚠ **Process / Python: no memory limit.** There is no `setrlimit` here or in the Rust line (`src/sandbox/process.cyr`'s header), and kavach applies a cgroup only with a path agnosai does not give it |
 | CPU exhaustion | WASM: 1B fuel (`-W fuel`) plus the sandbox deadline; every tier has a SIGKILL deadline |
 | Spending exhaustion | Since 2.4.1 ([ADR 033](../adr/033-budgets-caps-and-crew-concurrency-are-enforced.md)): every model call is checked against its task's, its crew's and its tenant's budget, and a crew runs at most `max_concurrent_tasks` at once, 10 by default. ⚠ The server's default budget sets no token or cost limit, so a server takes what a request asks for unless its operator sets one or the request names its own. A budget is checked before each call, so calls in flight can pass it by one call each |
+| A worker doing what its manager may not | Since 2.4.3 ([ADR 035](../adr/035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md)) a hierarchical crew's worker holds only the tools its manager holds too, on a copy of its definition: its prompt lists those, the tool loop offers those, and it is ranked on those. The rest are withheld, named on its result and warned of, and nothing in the run widens a grant: neither the manager nor a model, only the crew's author, by giving the manager the tool. The manager itself is offered no tool when it writes the crew's answer, and every worker's answer reaches it as data (ADR 034) |
 | Filesystem access | WASM: no filesystem capability; cx: landlock read-only on the interpreter's directory; Process / Python: landlock since 2.3.4 ([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)), read and execute on `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc` and `/proc/self`, read and write on `/tmp`, `/dev/null`, `/dev/shm` and the call's work directory, nothing else. ⚠ A kernel with no landlock gets no ruleset, and agnosai warns at the first build. OCI: the container's read-only root and a tmpfs `/tmp` |
 | Network access | WASM: no network capability; cx: a new network namespace, and the cx tier **fails closed** where one cannot be made (CHANGELOG 2.2.1); OCI: `--network=none` unless the policy allows it; Process / Python: **denied by default since 2.3.8** (ADR 031's 2.3.8 addendum), with no namespace: landlock refuses TCP connect and bind and kavach's network filter UDP, raw and the other families, all EACCES. A config allows it with `agnosai_process_config_set_network(c, 1)` or `agnosai_python_sandbox_with_network(s, 1)`. ⚠ **A kernel before landlock ABI 4 (Linux 6.7) leaves the tool the server's network** whatever its config says, and agnosai warns once; a namespace would hold it there and needs a user namespace, which Ubuntu 24.04+, docker and GitHub's runners refuse. Unix sockets stay on every kernel |
 | Privilege escalation | Process / Python: NO_NEW_PRIVS, so no setuid or file-capability binary raises a tool's privileges. OCI: `--cap-drop=ALL` and `--security-opt=no-new-privileges`. Since 2.3.6 a process or Python tool holds no capabilities and has an empty bounding set, even under a root server (kavach 3.14.8), and a root server without `CAP_SETPCAP` refuses to run one. The image runs as `agnosai`, uid 10001 |
@@ -172,11 +173,15 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
 - **A reviewed answer goes to the crew's watchers before it is approved** (ADR 032): `approval_requested` carries it,
   so a reviewer can judge it. A watcher already reads every answer through `token`, under the same auth, so this
   shows the stream nothing it did not already carry.
-- **`delegate` hands out what the delegate holds** (ADR 029): a delegated crew's agents hold what their own definitions
-  name, not the delegating agent's narrower set, and nothing bounds how deep it nests. It is opt-in and off in the
-  binary. Since 2.4.1 the crews it starts wait their turn with every other (ADR 033), so a model nesting them cannot
-  run more than `max_concurrent_tasks` at once, and each is held to the orchestrator's per-crew budget. Hierarchical
-  crews' "authority only narrows" (roadmap 2.4.3) closes the rest.
+- **`delegate` hands out at most what its caller holds** since 2.4.3 ([ADR 035](../adr/035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md)).
+  Through 2.4.2 a delegated crew's agents held what their own definitions named, however little the delegating agent
+  held. Now the agent delegated to holds only the tools its caller holds too, and its crew at most what the caller's
+  task has left, and a task with nothing left is refused. ⚠ **The budget is a ceiling taken when it delegates**, not
+  a share: the delegated crew outlives the call, so what it spends is not recorded against its caller, and a task that
+  delegates and spends on can together pass what it had. Nothing bounds how deep it nests, though each nested crew
+  holds no more than the one above it had left. It is opt-in and off in the binary. Since 2.4.1 the crews it starts
+  wait their turn with every other (ADR 033), so a model nesting them cannot run more than `max_concurrent_tasks` at
+  once.
 - **Each WASM call keeps a few KiB** on the global heap, 3,160 B in `tests/sandbox_wasm.tcyr`, so a caller that can
   drive WASM tools grows this process by that much per call until a restart. Through 2.3.2 it was about 1 MiB a call,
   kavach's capture buffer, which kavach 3.14.7 gives back and agnosai 2.3.3 requires. Since 2.3.4 the WASM tool's

@@ -747,10 +747,83 @@ fn _t_process_mapping(): i64 {
 
     var h = agnosai_crew_req_new(str_from("c"));
     store64(h + AGN_CREQ_PROCESS, str_from("hierarchical"));
+    store64(h + AGN_CREQ_MANAGER, str_from("boss"));
     var hp = _agnosai_route_process_for(h);
     assert(agnosai_process_kind(hp) == AGNOSAI_PROCESS_HIERARCHICAL, "hierarchical");
-    assert(str_len(agnosai_process_manager(hp)) > 0,
-      "...with a placeholder manager UUID, as the oracle's Uuid::new_v4() gives");
+    assert(str_eq_cstr(agnosai_process_manager(hp), "boss") == 1,
+      "...managed by the agent its `manager` names, not a UUID that names none (ADR 035)");
+    return 0;
+}
+
+# A hierarchical crew names its manager, one of its agents, and no other crew names one (ADR 035).
+fn _t_manager_rules(): i64 {
+    var r = _t_req("crew", 1);
+    store64(r + AGN_CREQ_PROCESS, str_from("hierarchical"));
+    assert(str_eq_cstr(agnosai_validate_crew_request(r), "a hierarchical crew must name its manager") == 1,
+      "a hierarchical crew with no manager is refused");
+    store64(r + AGN_CREQ_MANAGER, str_from("nobody"));
+    assert(str_eq_cstr(agnosai_validate_crew_request(r), "manager names no agent in agents") == 1,
+      "and one whose manager is not among its agents");
+    store64(r + AGN_CREQ_MANAGER, str_from("a1"));
+    assert_eq(agnosai_validate_crew_request(r), 0, "one managed by its own agent is accepted");
+    var seq = _t_req("crew", 1);
+    store64(seq + AGN_CREQ_MANAGER, str_from("a1"));
+    assert(str_eq_cstr(agnosai_validate_crew_request(seq), "manager is only for a hierarchical crew") == 1,
+      "a manager on any other crew is refused, not ignored");
+    store64(seq + AGN_CREQ_PROCESS, str_from("dag"));
+    assert(agnosai_validate_crew_request(seq) != 0, "a dag one too");
+    # The reader: a parsed `manager` is the request's, and `null` is none.
+    var parsed = agnosai_crew_req_from_value(_t_parse_cstr(
+        "{\"name\":\"c\",\"agents\":[],\"tasks\":[],\"manager\":\"a1\"}"));
+    assert(str_eq_cstr(agnosai_crew_req_manager(parsed), "a1") == 1, "a request's manager reads back");
+    var nulled = agnosai_crew_req_from_value(_t_parse_cstr(
+        "{\"name\":\"c\",\"agents\":[],\"tasks\":[],\"manager\":null}"));
+    assert_eq(agnosai_crew_req_manager(nulled), 0, "and a null one is none");
+    # The Rust line's messages come first: the manager is checked last.
+    var both = _t_req("", 1);
+    store64(both + AGN_CREQ_PROCESS, str_from("hierarchical"));
+    assert(str_contains(agnosai_validate_crew_request(both), str_from("name must be 1-")) == 1,
+      "a request wrong twice reports what the Rust line reported first");
+    return 0;
+}
+
+# A hierarchical request for one agent, `boss`, with `extra` after its process.
+fn _t_one_agent_body(extra): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"m\",\"agents\":[{\"agent_key\":\"boss\",\"name\":\"B\",");
+    str_builder_add_cstr(sb, "\"role\":\"r\",\"goal\":\"g\"}],\"tasks\":[{\"description\":\"t\"}],");
+    str_builder_add_cstr(sb, "\"process\":\"hierarchical\"");
+    str_builder_add_cstr(sb, extra);
+    str_builder_add_cstr(sb, "}");
+    return str_builder_build(sb);
+}
+
+# A hierarchical crew through the route: each task by a worker, then the manager's answer (ADR 035).
+fn _t_create_crew_hierarchical(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"managed\",\"agents\":[{\"agent_key\":\"boss\",");
+    str_builder_add_cstr(sb, "\"name\":\"Boss\",\"role\":\"lead\",\"goal\":\"lead\"},");
+    str_builder_add_cstr(sb, "{\"agent_key\":\"worker\",\"name\":\"Worker\",\"role\":\"w\",\"goal\":\"w\"}],");
+    str_builder_add_cstr(sb, "\"tasks\":[{\"description\":\"first task\"},{\"description\":\"second task\"}],");
+    str_builder_add_cstr(sb, "\"process\":\"hierarchical\",\"manager\":\"boss\"}");
+    var r = agnosai_route_create_crew(_t_state_with(o), str_builder_build(sb));
+    assert(agnosai_route_status(r) == HTTP_OK, "a managed crew is 200");
+    var results = bayan_json_v_obj_get_by_cstr(agnosai_route_body(r), "results");
+    assert_eq(bayan_json_v_arr_len(results), 3, "two workers' results and its manager's answer");
+    var first = bayan_json_v_arr_get(results, 0);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(first, "assigned_by")), "boss") == 1,
+      "a worker's result says who assigned it");
+    assert_eq(bayan_json_v_obj_get_by_cstr(first, "role"), 0, "and has no role");
+    var last = bayan_json_v_arr_get(results, 2);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(last, "role")), "manager") == 1,
+      "and the last is the manager's");
+    assert_eq(bayan_json_v_obj_get_by_cstr(last, "assigned_by"), 0, "which nobody assigned");
+
+    var none = agnosai_route_create_crew(_t_state_with(o), _t_one_agent_body(""));
+    assert(agnosai_route_status(none) == HTTP_BAD_REQUEST, "a hierarchical request with no manager is a 400");
+    var bad = agnosai_route_create_crew(_t_state_with(o), _t_one_agent_body(",\"manager\":7"));
+    assert(agnosai_route_status(bad) != HTTP_OK, "a manager that is not a string does not parse");
     return 0;
 }
 
@@ -961,6 +1034,8 @@ fn main(): i64 {
     _t_cancel_crew();
     _t_create_crew_rejections();
     _t_process_mapping();
+    _t_manager_rules();
+    _t_create_crew_hierarchical();
     _t_concurrency_clamp();
     _t_dependency_resolution();
 

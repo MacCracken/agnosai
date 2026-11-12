@@ -74,7 +74,9 @@ the error for it, since that caller asked to run a crew and none ran.
 
 `crew_completed` and a terminal crew state carry `reason` when the status is not `completed`: `task_failed`, `timeout`,
 `cancelled`, `invalid_dag` or `not_started`, and since 2.4.1 `budget_exceeded` (ADR 033). The first four are the crew
-span's `error.type` vocabulary (ADR 023), as `budget_exceeded` is.
+span's `error.type` vocabulary (ADR 023), as `budget_exceeded` is. Since 2.4.3 `invalid_manager` joins them
+(ADR 035): a hierarchical crew whose manager names no agent of its own ends as a cycle does, `failed`, with no task
+run and `crew_completed` sent. A hierarchical crew's `task_count` counts its manager's answer.
 
 ### `task_completed` in completion order
 

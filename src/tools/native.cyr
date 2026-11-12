@@ -60,7 +60,10 @@ enum AgnosaiToolInputOff {
     AGN_INPUT_CAPTURE_FP = 64;
     AGN_INPUT_SPAN_CTX = 72;
     AGN_INPUT_ALLOC = 80;
-    AGN_INPUT_SIZE = 88;
+    # The calling agent, as its task holds it, and its task's budget tracker, or 0 (2.4.3, ADR 035).
+    AGN_INPUT_AGENT = 88;
+    AGN_INPUT_BUDGET = 96;
+    AGN_INPUT_SIZE = 104;
 }
 
 # ToolOutput heap layout — 32 bytes.
@@ -325,6 +328,8 @@ fn _agnosai_tool_input_over_a(a, parameters): i64 {
     store64(i + AGN_INPUT_CAPTURE_FP, 0);
     store64(i + AGN_INPUT_SPAN_CTX, 0);
     store64(i + AGN_INPUT_ALLOC, 0);
+    store64(i + AGN_INPUT_AGENT, 0);
+    store64(i + AGN_INPUT_BUDGET, 0);
     return i;
 }
 
@@ -364,6 +369,25 @@ fn agnosai_tool_input_with_call(input, call_id: Str, agent_name: Str, task_id: S
     store64(input + AGN_INPUT_ARGUMENTS, arguments);
     store64(input + AGN_INPUT_CAPTURE_FP, capture_fp);
     return input;
+}
+
+# Say who is calling (2.4.3, ADR 035): the agent, as its task holds it, and its task's budget
+# tracker, either 0. A tool that hands work on, such as `delegate`, gives the work no more than
+# these. Returns the input.
+fn agnosai_tool_input_with_caller(input, agent, budget): i64 {
+    store64(input + AGN_INPUT_AGENT, agent);
+    store64(input + AGN_INPUT_BUDGET, budget);
+    return input;
+}
+
+# The calling agent, or 0 for a call no task made.
+fn agnosai_tool_input_agent(input): i64 {
+    return load64(input + AGN_INPUT_AGENT);
+}
+
+# The calling task's budget tracker, or 0 when nothing limits it.
+fn agnosai_tool_input_budget(input): i64 {
+    return load64(input + AGN_INPUT_BUDGET);
 }
 
 # The Str of JSON the model wrote for this call, or 0 for a call no loop made.

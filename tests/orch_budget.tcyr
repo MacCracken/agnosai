@@ -166,6 +166,38 @@ fn _t_subdivide(): i64 {
     return 0;
 }
 
+# What a tracker leaves for a worker under it (2.4.3, ADR 035): the least along its chain.
+fn _t_left(): i64 {
+    var a = default_alloc();
+    var none = agnosai_budget_tracker_limits_a(a, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, 0, "crew");
+    assert_eq(agnosai_budget_tracker_tokens_left(none), AGNOSAI_NO_LIMIT, "nothing limits an unlimited chain");
+    assert_eq(agnosai_budget_tracker_cost_left_micro_usd(none), AGNOSAI_NO_LIMIT, "nor its cost");
+    var crew = agnosai_budget_tracker_limits_a(a, 1000, 5000, 0, "crew");
+    var task = agnosai_budget_tracker_limits_a(a, 300, AGNOSAI_NO_LIMIT, crew, "task");
+    agnosai_budget_tracker_record_tokens(task, 100);
+    agnosai_budget_tracker_record_cost(task, 1000);
+    assert_eq(agnosai_budget_tracker_tokens_left(task), 200, "a task leaves the least of its own and its crew's");
+    assert_eq(agnosai_budget_tracker_tokens_left(crew), 900, "its crew more");
+    assert_eq(agnosai_budget_tracker_cost_left_micro_usd(task), 4000,
+      "and the cost its crew leaves, as the task sets none");
+    agnosai_budget_tracker_record_cost(task, 150);
+    assert_eq(agnosai_budget_tracker_cost_left_micro_usd(task), 3800,
+      "in whole units, rounded down: 150 micro-USD spent two units");
+    agnosai_budget_tracker_record_tokens(task, 500);
+    assert_eq(agnosai_budget_tracker_tokens_left(task), 0, "a spent one leaves nothing, never less");
+    var deep = agnosai_budget_tracker_limits_a(a, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, task, "worker");
+    assert_eq(agnosai_budget_tracker_tokens_left(deep), 0, "nor does anything under it");
+
+    # The least, not the nearest: a crew with less left than its own task bounds the task.
+    var tight = agnosai_budget_tracker_limits_a(a, 150, 2000, 0, "crew");
+    var loose = agnosai_budget_tracker_limits_a(a, 300, 9000, tight, "task");
+    agnosai_budget_tracker_record_tokens(loose, 100);
+    agnosai_budget_tracker_record_cost(loose, 1000);
+    assert_eq(agnosai_budget_tracker_tokens_left(loose), 50, "a crew with less left than its task bounds it");
+    assert_eq(agnosai_budget_tracker_cost_left_micro_usd(loose), 1000, "in cost too");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -326,6 +358,7 @@ fn main() {
 
     _t_v237_from_value();
     _t_subdivide();
+    _t_left();
     return assert_summary();
 }
 

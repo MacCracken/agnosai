@@ -271,6 +271,7 @@ Create and execute a crew. The server assembles the crew from the provided agent
 | `agents` | array | yes | Agent definitions (see Agent Definition below) |
 | `tasks` | array | yes | Task specifications |
 | `process` | string | no | Execution mode: `"sequential"` (default), `"parallel"`, `"dag"`, or `"hierarchical"` |
+| `manager` | string | for `hierarchical` | The `agent_key` of the agent that manages a hierarchical crew, one of `agents` (2.4.3, [ADR 035](../adr/035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md)). Without it a hierarchical request is a 400 (`a hierarchical crew must name its manager`), as is one naming an agent it does not hold (`manager names no agent in agents`) and a `manager` on any other crew (`manager is only for a hierarchical crew`) |
 | `budget` | object | no | `{"max_tokens": N, "max_cost_usd": X}`, either key optional: the most of the model the crew may use across its tasks. It only tightens what the server gives every crew. A crew that reaches it stops, `failed` with `reason: budget_exceeded` (2.4.1) |
 
 **Task fields:**
@@ -345,7 +346,8 @@ the results it has (2.1.6). ([ADR 022](../adr/022-crew-events-and-status-say-wha
 
 **`reason`** says why a crew that did not complete ended, and is left out when it did: `task_failed`, `timeout`,
 `cancelled`, `invalid_dag` (its tasks form a cycle, or depend on one the spec does not hold), `not_started` (a
-submitted crew whose thread would not start) or `budget_exceeded` (its budget, or its tenant's, ran out, 2.4.1).
+submitted crew whose thread would not start), `budget_exceeded` (its budget, or its tenant's, ran out, 2.4.1) or
+`invalid_manager` (a hierarchical crew whose manager names no agent of its own, 2.4.3).
 `POST /api/v1/crews` and this route both carry it (2.4.0).
 
 **A crew waits for a turn** (2.4.1): the server runs `max_concurrent_tasks` crews at once (10 by default), and the rest
@@ -369,6 +371,14 @@ A task whose agent called tools adds `metadata.tool_calls`, and an entry in this
 gains the same list as `tool_calls`, one entry per call in the order the model made them: `id`, `tool`, `arguments`, `effect` (`committed`, `none` or `unknown`), `success`, and
 `result` or `error`, with `flagged`, `held_back` or `asked_for` when they apply ([ADR 029](../adr/029-the-tool-loop.md)).
 `metadata.tool_calls_dropped` counts calls past the limit of a turn, when there were any.
+
+**A hierarchical crew** (2.4.3, [ADR 035](../adr/035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md))
+assigns each task to the best of its workers, every agent but its `manager`, and runs them in order, each handed the
+answers of the dependencies listed before it. Each worker's entry in `results` carries `assigned_by`, the manager's
+key, and `withheld_tools`, the tools its definition names that its manager does not hold, which it was not offered.
+Then the manager writes the crew's answer from every worker's, offered no tool: **its entry is the last**, with
+`"role": "manager"`, so a crew of three tasks returns four results, and `crew_started`'s `task_count` says 4. A crew
+whose worker failed, or that was stopped, has no manager's answer and does not complete.
 
 An LLM-answered task's result `metadata` carries `model`, `tokens`, `task_duration_ms`, `provider`
 (the gateway's `usage.provider`, else the catalog's `owned_by` for the model, and omitted when neither

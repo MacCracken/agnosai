@@ -3,13 +3,13 @@
 #
 # No oracle: the Rust line handed a dependent task nothing.
 #
-# ⚠ **A file of its own, as the roadmap's 2.7.1 asks of crew rows.** Run last in `orch.bcyr`, the
-# DAG chain row read 550 µs on 2.4.1 and 800 µs here, and 817 µs with the render row taken out: it
-# measured where the heap stood after every row before it, not the hand-off. Here, alone, the two
-# builds read 211 and 203 µs (medians of four, interleaved, 2026-11-12), and the hand-off's cost is
-# what `handoff_render_*` says: 5.5 µs for one short answer, and 1.5 ms for three of 4 KiB, two thirds
-# of it the injection scan's (roadmap 2.7.2). The spec builder and the stub are copies of
-# `orch.bcyr`'s, so the crew is the one its `run_crew_*` rows run.
+# ⚠ **Every crew row exits unless its crew completed (2.4.3).** Through 2.4.2 this file set no model
+# catalog, so every task of the chain failed at once, its dependents never ran, and the row measured
+# that failure: 2.4.2's 211 → 203 µs. With one, against 2.4.1, medians of three interleaved: 721 → 729
+# µs, and a sequential chain of four 238 → 254 µs, about 5 µs a hand-off, which is the render's.
+#
+# A file of its own, as the roadmap's 2.7.1 asks of crew rows. The spec builder, the stub and the
+# catalog are copies of `orch.bcyr`'s, so the crew is the one its `run_crew_*` rows run.
 #
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
@@ -143,6 +143,24 @@ fn _b_chain(n_tasks): i64 {
     return c;
 }
 
+# The gateway every bench client talks to, already read: three models, so a run measures the
+# selection a task really makes and never a GET.
+fn _b_catalog_get(client, a, path: Str, out_body): i64 {
+    store64(out_body, str_from("{\"data\":[\
+{\"id\":\"bench-fast\",\"owned_by\":\"openai\",\"pricing\":{\"input_micro_usd_per_1k\":1,\
+\"output_micro_usd_per_1k\":1}},\
+{\"id\":\"bench-capable\",\"owned_by\":\"openai\",\"pricing\":{\"input_micro_usd_per_1k\":5,\
+\"output_micro_usd_per_1k\":5}},\
+{\"id\":\"bench-premium\",\"owned_by\":\"openai\",\"pricing\":{\"input_micro_usd_per_1k\":9,\
+\"output_micro_usd_per_1k\":9}}]}"));
+    return 200;
+}
+
+fn _b_catalog_client(): i64 {
+    return agnosai_hoosh_client_with_get(agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"),
+        str_from("")), &_b_catalog_get);
+}
+
 var _b_stub_body = 0;
 
 fn _b_stub_chat(client, request, out_response, parent_sc): i64 {
@@ -162,7 +180,9 @@ fn _b_run_chain(): i64 {
         for (var i = 0; i < n / _BR; i = i + 1) {
             var r = agnosai_crew_runner_new(_b_chain(4));
             agnosai_crew_runner_with_llm(r, client);
-            if (agnosai_crew_runner_run(r, &err) == 0) { syscall(60, 1); }
+            var st = agnosai_crew_runner_run(r, &err);
+            # A crew that did not complete measured nothing it names.
+            if (st == 0 || agnosai_crew_state_status(st) != AGNOSAI_CREW_COMPLETED) { syscall(60, 1); }
         }
         bench_batch_stop(b, n / _BR);
     }
@@ -173,6 +193,9 @@ fn _b_run_chain(): i64 {
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
+    # A catalog to choose models from, as `orch.bcyr` has: without one every task fails at once, and
+    # a crew row measures that failure (2.4.3 found 2.4.2's hand-off row doing so).
+    agnosai_model_catalog_of(_b_catalog_client());
     _b_stub_body = str_cat(str_cat(
         str_from("{\"model\":\"gpt-4o-mini\",\"choices\":[{\"message\":{\"content\":\"done\"}}],"),
         str_from("\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,")),

@@ -256,6 +256,76 @@ fn _t_dl_crew_completes_on_its_thread(): i64 {
     return 0;
 }
 
+# Authority only narrows (2.4.3, ADR 035): the agent delegated to holds at most the caller's tools.
+fn _t_dl_narrows_to_the_caller(): i64 {
+    var a = default_alloc();
+    var def = agnosai_agent_new(str_from("researcher"), str_from("r"), str_from("g"));
+    var mine = vec_new();
+    vec_push(mine, str_from("search"));
+    vec_push(mine, str_from("fetch"));
+    agnosai_agent_with_tools(def, mine);
+    var caller = agnosai_agent_new(str_from("lead"), str_from("r"), str_from("g"));
+    var theirs = vec_new();
+    vec_push(theirs, str_from("search"));
+    agnosai_agent_with_tools(caller, theirs);
+
+    var held: i64[1];
+    var spec = _agnosai_delegate_bounded_spec_a(a, def, str_from("researcher"), str_from("t"), caller, 0, &held);
+    var ran = vec_get(agnosai_crew_agents(spec), 0);
+    assert_eq(vec_len(agnosai_agent_tools(ran)), 1, "the delegated agent holds only what its caller holds");
+    assert(str_eq_cstr(vec_get(agnosai_agent_tools(ran), 0), "search") == 1, "this");
+    assert_eq(vec_len(load64(&held)), 1, "and what it was withheld is named");
+    assert(str_eq_cstr(vec_get(load64(&held), 0), "fetch") == 1, "fetch");
+    assert_eq(vec_len(agnosai_agent_tools(def)), 2, "its definition is untouched");
+    assert_eq(agnosai_crew_max_tokens(spec), AGNOSAI_NO_LIMIT, "and with no budget its crew has none of its own");
+
+    var open = _agnosai_delegate_bounded_spec_a(a, def, str_from("researcher"), str_from("t"), 0, 0, &held);
+    assert(vec_get(agnosai_crew_agents(open), 0) == def, "a call no agent made delegates the definition as it is");
+    assert_eq(load64(&held), 0, "withholding nothing");
+
+    # Through the tool, the model is told.
+    var st = _t_dl_state();
+    agnosai_app_state_definition_insert(st, str_from("researcher"), def);
+    var input = _t_dl_input("researcher", "find things");
+    agnosai_tool_input_with_caller(input, caller, 0);
+    var out = _agnosai_delegate_execute(st, input);
+    assert(agnosai_tool_output_success(out) == 1, "a narrowed delegation still starts");
+    var w = bayan_json_v_obj_get_by_cstr(agnosai_tool_output_result(out), "withheld_tools");
+    assert(w != 0 && bayan_json_v_arr_len(w) == 1, "and its answer names what was withheld");
+    var plain = _agnosai_delegate_execute(_t_dl_state(), _t_dl_input("researcher", "find things"));
+    assert_eq(bayan_json_v_obj_get_by_cstr(agnosai_tool_output_result(plain), "withheld_tools"), 0,
+      "where nothing was, it names nothing");
+    return 0;
+}
+
+# A delegated crew holds at most what the delegating task has left (ADR 035).
+fn _t_dl_bounded_by_the_budget(): i64 {
+    var a = default_alloc();
+    var def = agnosai_agent_new(str_from("researcher"), str_from("r"), str_from("g"));
+    var crew = agnosai_budget_tracker_limits_a(a, 1000, 5000, 0, "crew");
+    var task = agnosai_budget_tracker_limits_a(a, 300, AGNOSAI_NO_LIMIT, crew, "task");
+    agnosai_budget_tracker_record_tokens(task, 100);
+    agnosai_budget_tracker_record_cost(task, 1000);
+    var held: i64[1];
+    var spec = _agnosai_delegate_bounded_spec_a(a, def, str_from("researcher"), str_from("t"), 0, task, &held);
+    assert_eq(agnosai_crew_max_tokens(spec), 200, "its crew's tokens are what its task has left");
+    assert_eq(agnosai_crew_max_cost_micro_usd(spec), 4000, "and its cost what the crew above has");
+
+    agnosai_budget_tracker_record_tokens(task, 200);
+    assert_eq(_agnosai_delegate_bounded_spec_a(a, def, str_from("researcher"), str_from("t"), 0, task, &held), 0,
+      "a task with nothing left hands on nothing");
+    var input = _t_dl_input("researcher", "find things");
+    agnosai_tool_input_with_caller(input, 0, task);
+    var st = _t_dl_state();
+    var before = agnosai_orchestrator_crew_count(agnosai_app_state_orchestrator(st));
+    var out = _agnosai_delegate_execute(st, input);
+    assert_eq(agnosai_tool_output_success(out), 0, "so the call is refused");
+    assert(str_contains_cstr(agnosai_tool_output_error(out), "no budget left") == 1, "saying why");
+    assert_eq(agnosai_orchestrator_crew_count(agnosai_app_state_orchestrator(st)), before,
+      "and starts no crew");
+    return 0;
+}
+
 fn _t_dl_unknown_agent_is_synchronous(): i64 {
     # A bad agent name must fail here, not become a crew that can only fail —
     # otherwise the model has to poll to discover a typo.
@@ -444,6 +514,8 @@ fn main(): i64 {
     _t_dl_id_is_live_before_the_call_returns();
     _t_dl_crew_completes_on_its_thread();
     _t_dl_unknown_agent_is_synchronous();
+    _t_dl_narrows_to_the_caller();
+    _t_dl_bounded_by_the_budget();
     _t_dl_missing_params();
     _t_dl_keeps_nothing_of_its_input();
     _t_dl_stays_in_the_trace();

@@ -867,7 +867,8 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
         state = _agnosai_orch_timeout_state_a(a, crew_id, timeout_secs);
     }
 
-    # A crew that could not run: its tasks form a cycle, or depend on one the spec does not hold.
+    # A crew that could not run: its tasks form a cycle, or depend on one the spec does not hold, or
+    # its manager names no agent of its own (ADR 035).
     # The caller of `run_crew_err` still gets 0 and the error, as no crew ran (ADR 032).
     #
     # ⚠ **It ends FAILED, with its reason, and its channel closes** (ADR 032). Through 2.3.8 this
@@ -879,7 +880,7 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
         if (out_err != 0) { store64(out_err, load64(&run_err)); }
         never_ran = 1;
         state = agnosai_crew_state_with_reason(agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_FAILED),
-          AGNOSAI_CREW_REASON_INVALID_DAG);
+          agnosai_crew_unrunnable_reason(load64(&run_err)));
         mutex_lock(mtx);
         var held = map_get(load64(o + AGN_OR_CREWS), crew_id);
         if (held != 0) {

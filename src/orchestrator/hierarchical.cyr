@@ -18,6 +18,8 @@
 # same split, same names.
 # =========================================================================
 
+include "src/log_fields.cyr"
+
 # An assignment: which agent should run which task.
 enum AgnosaiAssignmentOff {
     AGN_AS_TASK_ID = 0;
@@ -141,4 +143,88 @@ fn agnosai_manager_agent_tasks(m): i64 {
 fn agnosai_manager_agent_delegate(m): i64 {
     return agnosai_delegate_tasks(load64(m + AGN_MG_DEFINITION), load64(m + AGN_MG_AGENTS),
       load64(m + AGN_MG_TASKS));
+}
+
+# ── A manager and its workers (2.4.3, ADR 035) ─────────────────────────────
+#
+# **Authority only narrows.** A worker holds at most its manager's tools: what both name, in the
+# worker's order. A tool only the worker names is withheld, and the run records which. Nothing in
+# the run widens a grant, neither the manager nor a model; the crew's author does, by giving the
+# manager the tool.
+
+# Whether `tools`, a vec of names, holds `name`.
+fn _agnosai_hier_holds(tools, name: Str): i64 {
+    if (tools == 0) { return 0; }
+    for (var i = 0; i < vec_len(tools); i = i + 1) {
+        if (str_eq(vec_get(tools, i), name) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# The tools `worker` names that `manager` holds too (`kept` 1), or that it does not (`kept` 0), in
+# the worker's order, in `a`.
+fn _agnosai_hier_tools_a(a, worker, manager, kept): i64 {
+    var out = vec_new_a(a);
+    var mine = agnosai_agent_tools(worker);
+    var theirs = agnosai_agent_tools(manager);
+    if (mine == 0) { return out; }
+    for (var i = 0; i < vec_len(mine); i = i + 1) {
+        var name = vec_get(mine, i);
+        if (_agnosai_hier_holds(theirs, name) == kept) { vec_push_a(a, out, name); }
+    }
+    return out;
+}
+
+# The tools of `worker` that `manager` does not hold, in `a`.
+fn agnosai_tools_withheld_a(a, worker, manager): i64 {
+    return _agnosai_hier_tools_a(a, worker, manager, 0);
+}
+
+# A copy of `worker`, in `a`, holding only the tools `manager` holds too. Every other field is the
+# worker's own, shared, so its system prompt and its score read the tools it may use.
+fn agnosai_worker_within_a(a, worker, manager): i64 {
+    var w = alloc_via(a, AGN_AGENT_SIZE);
+    memcpy(w, worker, AGN_AGENT_SIZE);
+    store64(w + AGN_AGENT_TOOLS, _agnosai_hier_tools_a(a, worker, manager, 1));
+    return w;
+}
+
+# Warn that `manager` withholds `held`, a vec of `worker`'s tool names. A run says it once a worker,
+# and `delegate` once a call. The tools are named in the record, not here.
+fn agnosai_log_withheld(manager, worker, held): i64 {
+    if (sakshi_get_level() < SK_WARN) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start(&f, agnosai_agent_key(worker));
+    n = agnosai_log_field_str(&f, n, "manager", agnosai_agent_key(manager));
+    n = agnosai_log_field_int(&f, n, "withheld", vec_len(held));
+    sakshi_log_kv(SK_WARN, "a worker's tools its manager does not hold are withheld", 55, "worker", 6, &f, n);
+    return 0;
+}
+
+# The agent of `agents` whose `agent_key` is `key`, or 0.
+fn agnosai_find_manager(agents, key: Str): i64 {
+    if (key == 0) { return 0; }
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        if (str_eq(agnosai_agent_key(vec_get(agents, i)), key) == 1) { return vec_get(agents, i); }
+    }
+    return 0;
+}
+
+# The workers a hierarchical crew assigns its tasks to, in `a`: every agent but its manager, each
+# within the manager's tools. With no other agent, the manager itself, as the Rust line's
+# `delegate_tasks` falls back to it. An agent sharing the manager's key is the manager.
+#
+# Ranking these is how a run assigns each task, so `agnosai_explain_selection_a` over them explains
+# a hierarchical run exactly, as it explains any other over the crew's agents.
+fn agnosai_hierarchical_workers_a(a, agents, manager): i64 {
+    var out = vec_new_a(a);
+    var key = agnosai_agent_key(manager);
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        var ag = vec_get(agents, i);
+        if (str_eq(agnosai_agent_key(ag), key) == 0) {
+            vec_push_a(a, out, agnosai_worker_within_a(a, ag, manager));
+        }
+    }
+    if (vec_len(out) == 0) { vec_push_a(a, out, manager); }
+    return out;
 }

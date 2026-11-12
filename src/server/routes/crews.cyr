@@ -211,7 +211,9 @@ enum AgnosaiCrewReqOff {
     # They only tighten what the server gives every crew.
     AGN_CREQ_MAX_TOKENS = 48;
     AGN_CREQ_MAX_COST = 56;
-    AGN_CREQ_SIZE = 64;
+    # The `agent_key` of a hierarchical crew's manager, or 0 (2.4.3, ADR 035).
+    AGN_CREQ_MANAGER = 64;
+    AGN_CREQ_SIZE = 72;
 }
 
 # A crew request with only its required name set.
@@ -225,6 +227,7 @@ fn agnosai_crew_req_new_a(a, name: Str): i64 {
     store64(r + AGN_CREQ_HAS_CONCURRENCY, 0);
     store64(r + AGN_CREQ_MAX_TOKENS, AGNOSAI_NO_LIMIT);
     store64(r + AGN_CREQ_MAX_COST, AGNOSAI_NO_LIMIT);
+    store64(r + AGN_CREQ_MANAGER, 0);
     return r;
 }
 
@@ -249,6 +252,8 @@ fn agnosai_crew_req_has_concurrency(r): i64 { return load64(r + AGN_CREQ_HAS_CON
 fn agnosai_crew_req_max_tokens(r): i64 { return load64(r + AGN_CREQ_MAX_TOKENS); }
 # The crew's own cost limit in micro-USD, or `AGNOSAI_NO_LIMIT`.
 fn agnosai_crew_req_max_cost_micro_usd(r): i64 { return load64(r + AGN_CREQ_MAX_COST); }
+# The `agent_key` of the crew's manager, or 0.
+fn agnosai_crew_req_manager(r): i64 { return load64(r + AGN_CREQ_MANAGER); }
 
 fn _agnosai_crew_req_fields_a(a): i64 {
     var f = agnosai_route_fields_a(a);
@@ -258,6 +263,7 @@ fn _agnosai_crew_req_fields_a(a): i64 {
     agnosai_route_field_a(a, f, "process");
     agnosai_route_field_a(a, f, "max_concurrency");
     agnosai_route_field_a(a, f, "budget");
+    agnosai_route_field_a(a, f, "manager");
     return f;
 }
 
@@ -318,6 +324,12 @@ fn agnosai_crew_req_from_value_a(a, v): i64 {
         if (bayan_json_v_int(mc) < 0) { return 0; }
         store64(r + AGN_CREQ_MAX_CONCURRENCY, bayan_json_v_int(mc));
         store64(r + AGN_CREQ_HAS_CONCURRENCY, 1);
+    }
+
+    var mg = bayan_json_v_obj_get_by_cstr(v, "manager");
+    if (mg != 0 && bayan_json_v_is_null(mg) == 0) {
+        if (bayan_json_v_is_str(mg) == 0) { return 0; }
+        store64(r + AGN_CREQ_MANAGER, str_clone_a(a, bayan_json_v_str(mg)));
     }
 
     var lim: i64[2];
@@ -464,7 +476,26 @@ fn agnosai_validate_crew_request(r): i64 {
     if (agnosai_crew_has_dependency_cycle(tasks) == 1) {
         return str_from("task dependencies contain a cycle");
     }
-    return 0;
+    return _agnosai_crew_check_manager(r);
+}
+
+# A hierarchical crew names its manager, one of its own agents, and no other crew names one
+# (2.4.3, ADR 035). Checked last, so every message the Rust line gave comes first, as it did.
+fn _agnosai_crew_check_manager(r): i64 {
+    var manager = agnosai_crew_req_manager(r);
+    var p = agnosai_crew_req_process(r);
+    var hierarchical = 0;
+    if (p != 0 && str_eq_cstr(p, "hierarchical") == 1) { hierarchical = 1; }
+    if (hierarchical == 0) {
+        if (manager != 0) { return str_from("manager is only for a hierarchical crew"); }
+        return 0;
+    }
+    if (manager == 0) { return str_from("a hierarchical crew must name its manager"); }
+    var agents = agnosai_crew_req_agents(r);
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        if (str_eq(agnosai_agent_key(vec_get(agents, i)), manager) == 1) { return 0; }
+    }
+    return str_from("manager names no agent in agents");
 }
 
 # `name must be 1-{MAX_STRING_LEN} characters`.
@@ -502,15 +533,14 @@ var AGNOSAI_CREW_MAX_CONCURRENCY = 64;
 # `agnosai_crew_req_from_value` does not validate the field; rejecting an
 # unrecognised name would turn a silent fall-through into a 422.
 #
-# `"hierarchical"` gets a **fresh UUID as its manager**, matching the oracle's
-# `manager: Uuid::new_v4()` — a placeholder that names no real agent. Carried
-# across rather than improved: it is what the Rust does, and inventing a real
-# manager here would change which agent runs the crew.
+# `"hierarchical"` is managed by the agent its `manager` names (2.4.3, ADR 035), which
+# `agnosai_validate_crew_request` has checked is one of its agents. Through 2.4.2 it got a fresh
+# UUID, the Rust line's `Uuid::new_v4()`, which named no agent, and ran sequentially.
 fn _agnosai_route_process_for(r): i64 {
     var p = agnosai_crew_req_process(r);
     if (p == 0) { return agnosai_process_sequential(); }
     if (str_eq_cstr(p, "hierarchical") == 1) {
-        return agnosai_process_hierarchical(agnosai_uuid_v4_str());
+        return agnosai_process_hierarchical(agnosai_crew_req_manager(r));
     }
     if (str_eq_cstr(p, "dag") == 1) { return agnosai_process_dag(); }
     if (str_eq_cstr(p, "parallel") == 1) {
@@ -589,10 +619,23 @@ fn _agnosai_route_task_result_a(a, res): i64 {
       bayan_json_v_str_new_a(a, agnosai_task_result_output(res)));
     bayan_json_v_obj_set_a(a, ro, AGN_JK_STATUS,
       bayan_json_v_str_new_a(a, agnosai_task_status_to_wire(agnosai_task_result_status(res))));
-    var key = str_from_a(a, "tool_calls");
-    var calls = map_get(agnosai_task_result_metadata(res), key);
-    if (calls != 0) { bayan_json_v_obj_set_a(a, ro, key, calls); }
+    var md = agnosai_task_result_metadata(res);
+    _agnosai_route_result_key_a(a, ro, md, "tool_calls");
+    # A hierarchical crew's (2.4.3, ADR 035): who assigned a worker's task and the tools its manager
+    # withheld, and `"role": "manager"` on the manager's answer, so a caller can tell it apart.
+    _agnosai_route_result_key_a(a, ro, md, "assigned_by");
+    _agnosai_route_result_key_a(a, ro, md, "withheld_tools");
+    _agnosai_route_result_key_a(a, ro, md, "role");
     return ro;
+}
+
+# Copy `md`'s value for `name` onto `ro` when a result has one.
+fn _agnosai_route_result_key_a(a, ro, md, name): i64 {
+    if (md == 0) { return 0; }
+    var key = str_from_a(a, name);
+    var v = map_get(md, key);
+    if (v != 0) { bayan_json_v_obj_set_a(a, ro, key, v); }
+    return 0;
 }
 
 # `POST /api/v1/crews` — create and run a crew, returning its results.

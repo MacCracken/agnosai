@@ -243,7 +243,8 @@ fn agnosai_process_sequential(): i64 {
     return agnosai_process_sequential_a(default_alloc());
 }
 
-# A manager agent delegates and coordinates sub-tasks, in allocator `a`.
+# A manager agent delegates and coordinates sub-tasks, in allocator `a`. `manager` is its
+# `agent_key` (ADR 035): the Rust line's `Uuid` named no agent, as an agent has no id but its key.
 fn agnosai_process_hierarchical_a(a, manager): i64 {
     return _agnosai_process_new_a(a, AGNOSAI_PROCESS_HIERARCHICAL, manager, 0);
 }
@@ -278,7 +279,7 @@ fn agnosai_process_kind(p): i64 {
     return load64(p + AGN_PROC_KIND);
 }
 
-# The delegating manager's agent id, or 0 unless this is Hierarchical.
+# The managing agent's `agent_key`, or 0 unless this is Hierarchical.
 fn agnosai_process_manager(p): i64 {
     return load64(p + AGN_PROC_MANAGER);
 }
@@ -328,10 +329,11 @@ fn agnosai_process_from_value(v): i64 {
 
     var h = bayan_json_v_obj_get_by_cstr(v, "hierarchical");
     if (h != 0 && bayan_json_v_is_obj(h) == 1) {
+        # The manager is an agent's key (ADR 035), so any non-empty string is one. A UUID through
+        # 2.4.2 is a key that names no agent, and a run says so (`invalid_manager`).
         var m = bayan_json_v_obj_get_by_cstr(h, "manager");
-        if (m != 0 && bayan_json_v_is_str(m) == 1) {
-            var id = agnosai_uuid_canonical(bayan_json_v_str(m));
-            if (id != 0) { return agnosai_process_hierarchical(id); }
+        if (m != 0 && bayan_json_v_is_str(m) == 1 && str_len(bayan_json_v_str(m)) > 0) {
+            return agnosai_process_hierarchical(str_clone(bayan_json_v_str(m)));
         }
         return agnosai_process_sequential();
     }

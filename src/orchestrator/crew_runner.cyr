@@ -111,6 +111,7 @@ include "src/done_word.cyr"
 include "src/log_fields.cyr"
 include "src/orchestrator/budget.cyr"
 include "src/handoff.cyr"
+include "src/orchestrator/hierarchical.cyr"
 
 # Pick the highest-scoring agent for a task, or 0 when the roster is empty.
 #
@@ -1110,7 +1111,10 @@ fn _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id: 
 
     var miss: i64[1];
     var st = _agnosai_tool_task_new_a(a, ra, loop, task, agent, self_sc, &miss);
-    if (st != 0) { _agnosai_tool_task_with_events(st, event_tx); }
+    if (st != 0) {
+        _agnosai_tool_task_with_events(st, event_tx);
+        _agnosai_tool_task_with_budget(st, budget);
+    }
     var result = 0;
     if (st == 0) {
         _agnosai_crew_log_a(a, SK_WARN, "task refused: its agent names a tool it cannot have", 51,
@@ -1869,6 +1873,15 @@ fn _agnosai_crew_review_a(a, r, task, agent, result, tx): i64 {
 # Checks cancellation before each task and stops rather than failing the rest,
 # so a cancelled crew's results hold what actually ran.
 fn _agnosai_crew_run_sequential(r): i64 {
+    return _agnosai_crew_run_in_order(r, agnosai_crew_agents(load64(r + AGN_CR_SPEC)), 0, 0);
+}
+
+# Run every task in order on this thread, each by the best agent of `pool`.
+#
+# `manager` is a hierarchical crew's (ADR 035), or 0. Each result then records it as `assigned_by`,
+# with the tools `withheld` maps its worker's key to, and once every worker has answered the manager
+# writes the crew's answer, as one more result.
+fn _agnosai_crew_run_in_order(r, pool, manager, withheld): i64 {
     # One growable scratch for the whole run, reset after every audit entry.
     # Growable rather than fixed because an entry's metadata is caller-supplied
     # and unbounded; because it is reset each time, it converges on the
@@ -1884,8 +1897,6 @@ fn _agnosai_crew_run_sequential(r): i64 {
     }
     var spec = load64(r + AGN_CR_SPEC);
     var tasks = agnosai_crew_tasks(spec);
-    var agents = agnosai_crew_agents(spec);
-    var client = load64(r + AGN_CR_CLIENT);
     var a = load64(r + AGN_CR_ALLOC);
     var results = vec_new_a(a);
     # Each result by its task's id, for a later task that depends on it (ADR 034). A sequential
@@ -1896,43 +1907,162 @@ fn _agnosai_crew_run_sequential(r): i64 {
     # Two event names, minted once rather than once per task.
     var ev_started = str_from_a(a, "task_started");
     var ev_completed = str_from_a(a, "task_completed");
+    var all_done = 1;
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
-        if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
-        if (_agnosai_crew_deadline_passed(r) == 1) { break; }
-        if (_agnosai_crew_budget_spent(r) == 1) { break; }
-
-        # ⚠ **Asked per task, not once per run (ADR 032).** A subscriber that attached after the
-        # run began got nothing until `crew_completed` through 2.3.8. The task's sender goes to it
-        # only when someone is subscribed, so an unwatched bus builds no token either, as a wave's
-        # workers already did not.
-        var wants_events = _agnosai_crew_wants_events(r);
-        var task_tx = 0;
-        if (wants_events == 1) { task_tx = load64(r + AGN_CR_EVENT_TX); }
+        if (_agnosai_crew_should_stop(r) == 1) {
+            all_done = 0;
+            break;
+        }
         var task = vec_get(tasks, i);
-        var agent = _agnosai_crew_pick_best_agent_a(a, agents, task);
-        agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
-        if (wants_events == 1) {
-            _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data_a(a, task, agent));
-        }
-
-        agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
-        agnosai_task_with_handoff(task, agnosai_handoff_render_a(a, task, by_id));
-        var result = agnosai_execute_task_budgeted_a(a, task, agent, client,
-          task_tx, agnosai_crew_id(spec), load64(r + AGN_CR_TRACE),
-          load64(r + AGN_CR_LOOP), load64(r + AGN_CR_BUDGET));
-        result = _agnosai_crew_review_a(a, r, task, agent, result, task_tx);
-        agnosai_task_with_handoff(task, 0);
-        agnosai_task_with_status(task, agnosai_task_result_status(result));
+        var agent = _agnosai_crew_pick_best_agent_a(a, pool, task);
+        var result = _agnosai_crew_run_one_a(r, task, agent, by_id, load64(r + AGN_CR_LOOP), ev_started,
+          ev_completed);
+        if (manager != 0) { _agnosai_crew_note_assignment_a(a, result, manager, agent, withheld); }
+        if (agnosai_task_result_status(result) != AGNOSAI_STATUS_COMPLETED) { all_done = 0; }
         map_set_a(a, by_id, agnosai_task_id(task), result);
-
-        if (wants_events == 1) {
-            _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data_a(a, result));
-        }
-        _agnosai_crew_audit_task(r, task, result, agent);
         vec_push_a(a, results, result);
+    }
+
+    # The manager's answer, only once every worker has given one and nothing has stopped the crew:
+    # a crew that failed fails without it, and pays for no call it would have wasted.
+    if (manager != 0 && all_done == 1 && _agnosai_crew_should_stop(r) == 0) {
+        var mt = _agnosai_crew_manager_task_a(a, tasks);
+        var answer = _agnosai_crew_run_one_a(r, mt, _agnosai_crew_writer_a(a, manager), by_id, 0,
+          ev_started, ev_completed);
+        agnosai_task_result_with_metadata_a(a, answer, str_from_a(a, "role"),
+          bayan_json_v_str_new_a(a, str_from_a(a, "manager")));
+        vec_push_a(a, results, answer);
     }
     store64(r + AGN_CR_SCRATCH, 0);
     return results;
+}
+
+# Whether the crew must stop before its next task: cancelled, past its deadline or out of budget.
+fn _agnosai_crew_should_stop(r): i64 {
+    if (agnosai_crew_runner_is_cancelled(r) == 1) { return 1; }
+    if (_agnosai_crew_deadline_passed(r) == 1) { return 1; }
+    if (_agnosai_crew_budget_spent(r) == 1) { return 1; }
+    return 0;
+}
+
+# Run one task on this thread: its events, its hand-off, its answer by `agent`, its review and its
+# audit. `loop` is the tool loop it may use, or 0 for none, and the two names are its events'.
+fn _agnosai_crew_run_one_a(r, task, agent, by_id, loop, ev_started, ev_completed): i64 {
+    var a = load64(r + AGN_CR_ALLOC);
+    var spec = load64(r + AGN_CR_SPEC);
+    # ⚠ **Asked per task, not once per run (ADR 032).** A subscriber that attached after the run
+    # began got nothing until `crew_completed` through 2.3.8. The task's sender goes to it only when
+    # someone is subscribed, so an unwatched bus builds no token either, as a wave's workers already
+    # did not.
+    var wants_events = _agnosai_crew_wants_events(r);
+    var task_tx = 0;
+    if (wants_events == 1) { task_tx = load64(r + AGN_CR_EVENT_TX); }
+    agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
+    if (wants_events == 1) {
+        _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data_a(a, task, agent));
+    }
+
+    agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
+    agnosai_task_with_handoff(task, agnosai_handoff_render_a(a, task, by_id));
+    var result = agnosai_execute_task_budgeted_a(a, task, agent, load64(r + AGN_CR_CLIENT),
+      task_tx, agnosai_crew_id(spec), load64(r + AGN_CR_TRACE), loop, load64(r + AGN_CR_BUDGET));
+    result = _agnosai_crew_review_a(a, r, task, agent, result, task_tx);
+    agnosai_task_with_handoff(task, 0);
+    agnosai_task_with_status(task, agnosai_task_result_status(result));
+
+    if (wants_events == 1) {
+        _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data_a(a, result));
+    }
+    _agnosai_crew_audit_task(r, task, result, agent);
+    return result;
+}
+
+# ── A manager and its workers (2.4.3, ADR 035) ─────────────────────────────
+
+# Record on a worker's `result` who assigned it, and the tools its manager withheld from it.
+fn _agnosai_crew_note_assignment_a(a, result, manager, agent, withheld): i64 {
+    agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "assigned_by"),
+      bayan_json_v_str_new_a(a, agnosai_agent_key(manager)));
+    if (agent == 0 || withheld == 0) { return 0; }
+    var held = map_get(withheld, agnosai_agent_key(agent));
+    if (held == 0) { return 0; }
+    var arr = bayan_json_v_arr_new_a(a);
+    for (var i = 0; i < vec_len(held); i = i + 1) {
+        bayan_json_v_arr_push_a(a, arr, bayan_json_v_str_new_a(a, vec_get(held, i)));
+    }
+    agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "withheld_tools"), arr);
+    return 0;
+}
+
+# The manager's own task: write the crew's answer from every worker's, which it is handed as each
+# task's dependency. Its description is ours, and lists the crew's tasks, which are the crew
+# author's, so that the manager knows what each answer was for.
+fn _agnosai_crew_manager_task_a(a, tasks): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Write this crew's answer from your workers' answers above. Bring ");
+    str_builder_add_cstr_a(a, sb, "what they found together, and say where they disagree or fall short. ");
+    str_builder_add_cstr_a(a, sb, "The crew's tasks were:");
+    for (var i = 0; i < vec_len(tasks); i = i + 1) {
+        str_builder_add_cstr_a(a, sb, "\n- ");
+        str_builder_add_a(a, sb, agnosai_task_description(vec_get(tasks, i)));
+    }
+    var t = agnosai_task_new_a(a, str_builder_build_a(a, sb));
+    for (var j = 0; j < vec_len(tasks); j = j + 1) {
+        agnosai_task_with_dependency_a(a, t, agnosai_task_id(vec_get(tasks, j)));
+    }
+    return t;
+}
+
+# The manager as it writes: its own definition with no tools. **It writes and calls nothing**:
+# what it knows is what its workers answered.
+fn _agnosai_crew_writer_a(a, manager): i64 {
+    var w = alloc_via(a, AGN_AGENT_SIZE);
+    memcpy(w, manager, AGN_AGENT_SIZE);
+    store64(w + AGN_AGENT_TOOLS, vec_new_a(a));
+    return w;
+}
+
+# A hierarchical crew (ADR 035): its manager assigns each task to its best worker, each worker
+# within the manager's tools, the workers run in order, and the manager writes the crew's answer.
+#
+# Returns the results, or 0 with an error through `out_err` when the manager names no agent of the
+# crew's, which a run cannot repair: the crew ends `invalid_manager`, as a cycle ends `invalid_dag`.
+fn _agnosai_crew_run_hierarchical(r, out_err): i64 {
+    store64(out_err, 0);
+    var a = load64(r + AGN_CR_ALLOC);
+    var spec = load64(r + AGN_CR_SPEC);
+    var agents = agnosai_crew_agents(spec);
+    var key = agnosai_process_manager(agnosai_crew_process(spec));
+    var manager = agnosai_find_manager(agents, key);
+    if (manager == 0) {
+        var why = str_from("a hierarchical crew's manager names no agent of the crew's");
+        if (key != 0) { why = str_cat(str_from("a hierarchical crew's manager names no agent of the crew's: "), key); }
+        store64(out_err, agnosai_error_invalid_definition(why));
+        return 0;
+    }
+    var withheld = map_new_str_a(a);
+    var mkey = agnosai_agent_key(manager);
+    for (var i = 0; i < vec_len(agents); i = i + 1) {
+        var ag = vec_get(agents, i);
+        if (str_eq(agnosai_agent_key(ag), mkey) == 0) {
+            var held = agnosai_tools_withheld_a(a, ag, manager);
+            if (vec_len(held) > 0) {
+                map_set_a(a, withheld, agnosai_agent_key(ag), held);
+                agnosai_log_withheld(manager, ag, held);
+            }
+        }
+    }
+    return _agnosai_crew_run_in_order(r, agnosai_hierarchical_workers_a(a, agents, manager), manager,
+      withheld);
+}
+
+# The reason a crew that could not run ends with: `invalid_manager` for a manager that names no
+# agent, else `invalid_dag`.
+fn agnosai_crew_unrunnable_reason(err): i64 {
+    if (err != 0 && agnosai_error_kind(err) == AGNOSAI_ERR_INVALID_DEFINITION) {
+        return AGNOSAI_CREW_REASON_INVALID_MANAGER;
+    }
+    return AGNOSAI_CREW_REASON_INVALID_DAG;
 }
 
 # Run a set of tasks concurrently, at most `max_concurrency` at a time.
@@ -2401,6 +2531,13 @@ fn _agnosai_crew_emit_completed(r, status, reason, task_count, wall_ms): i64 {
     return _agnosai_crew_emit(r, str_from_a(a, "crew_completed"), done);
 }
 
+# How many tasks a run of `spec` holds: its own, and a hierarchical crew's manager's answer.
+fn _agnosai_crew_task_count(spec): i64 {
+    var n = vec_len(agnosai_crew_tasks(spec));
+    if (agnosai_process_kind(agnosai_crew_process(spec)) == AGNOSAI_PROCESS_HIERARCHICAL) { return n + 1; }
+    return n;
+}
+
 # Run the crew end to end — the oracle's `run`.
 #
 # Returns a CrewState, or 0 with an error stored through `out_err`. The split
@@ -2409,10 +2546,10 @@ fn _agnosai_crew_emit_completed(r, status, reason, task_count, wall_ms): i64 {
 # `run` guarantees that and a consumer can tell "the spec was wrong" from "the
 # work failed".
 #
-# **Hierarchical falls back to sequential**, with a warning, exactly as the
-# oracle does. `orch_hierarchical`'s delegation exists and is tested, but wiring
-# it in here would change behaviour the oracle never implemented; that was the
-# oracle's own Phase 2. The oracle is frozen, so wiring it is roadmap F2 and its ADR.
+# **A hierarchical crew is managed (2.4.3, ADR 035)**, where the Rust line warned and ran it
+# sequentially: its manager assigns each task to its best worker, within the manager's tools, and
+# writes the crew's answer once every worker has given one. A manager that names no agent of the
+# crew's is an error, as a cycle is, and the crew ends `invalid_manager`.
 fn agnosai_crew_runner_run(r, out_err): i64 {
     store64(out_err, 0);
     var start_ns = clock_now_ns();
@@ -2468,7 +2605,7 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
         bayan_json_v_obj_set_a(a, started, str_from_a(a, "name"),
           bayan_json_v_str_new_a(a, agnosai_crew_name(spec)));
         bayan_json_v_obj_set_a(a, started, str_from_a(a, "task_count"),
-          bayan_json_v_int_new_a(a, vec_len(tasks)));
+          bayan_json_v_int_new_a(a, _agnosai_crew_task_count(spec)));
         _agnosai_crew_emit(r, str_from_a(a, "crew_started"), started);
     }
     # Bumps crews_total and the crews_active gauge. **Every exit below must
@@ -2482,37 +2619,35 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     var kind = agnosai_process_kind(agnosai_crew_process(spec));
     var results = 0;
     if (kind == AGNOSAI_PROCESS_PARALLEL) { results = _agnosai_crew_run_parallel(r); }
-    elif (kind == AGNOSAI_PROCESS_DAG) {
-        var dag_err: i64[1];
-        store64(&dag_err, 0);
-        results = _agnosai_crew_run_dag(r, &dag_err);
-        if (load64(&dag_err) != 0) {
+    elif (kind == AGNOSAI_PROCESS_DAG || kind == AGNOSAI_PROCESS_HIERARCHICAL) {
+        var run_err: i64[1];
+        store64(&run_err, 0);
+        if (kind == AGNOSAI_PROCESS_DAG) { results = _agnosai_crew_run_dag(r, &run_err); }
+        else { results = _agnosai_crew_run_hierarchical(r, &run_err); }
+        if (load64(&run_err) != 0) {
+            var why = agnosai_crew_unrunnable_reason(load64(&run_err));
             # Balance the active gauge before the error return. No task ran, so
             # no task/inference counters are recorded — only the gauge unwinds.
             agnosai_metrics_record_crew_completed(agnosai_metrics_global());
-            _agnosai_crew_span_done(span, self_sc, parent_sc, span_t0, "invalid_dag");
+            var why_type = "invalid_dag";
+            if (why == AGNOSAI_CREW_REASON_INVALID_MANAGER) { why_type = "invalid_manager"; }
+            _agnosai_crew_span_done(span, self_sc, parent_sc, span_t0, why_type);
             # ⚠ **A last word, so a subscriber is not left waiting (ADR 032).** Through 2.3.8
             # this arm sent nothing, and the orchestrator put the crew back to PENDING, so a
             # submitted crew that could not run read `pending` for good. A cancel that landed
             # first stands, as it does in the registry.
-            var dag_status = AGNOSAI_CREW_FAILED;
-            var dag_reason = AGNOSAI_CREW_REASON_INVALID_DAG;
+            var end_status = AGNOSAI_CREW_FAILED;
+            var end_reason = why;
             if (agnosai_crew_runner_is_cancelled(r) == 1) {
-                dag_status = AGNOSAI_CREW_CANCELLED;
-                dag_reason = AGNOSAI_CREW_REASON_CANCELLED;
+                end_status = AGNOSAI_CREW_CANCELLED;
+                end_reason = AGNOSAI_CREW_REASON_CANCELLED;
             }
-            _agnosai_crew_emit_completed(r, dag_status, dag_reason, 0,
+            _agnosai_crew_emit_completed(r, end_status, end_reason, 0,
               _agnosai_crew_elapsed_ms(start_ns));
-            store64(out_err, load64(&dag_err));
+            store64(out_err, load64(&run_err));
             return 0;
         }
     } else {
-        if (kind == AGNOSAI_PROCESS_HIERARCHICAL) {
-            _agnosai_crew_log_a(a, SK_WARN,
-              # The oracle's own message, verbatim — see roadmap F2.
-              "hierarchical mode not yet implemented, falling back to sequential", 63,  #skip-lint: oracle string
-              agnosai_crew_id(spec), 0);
-        }
         results = _agnosai_crew_run_sequential(r);
     }
 
@@ -2558,7 +2693,8 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
         # failure stranded its dependents, or a worker that produced nothing.
         # Counting only the results that exist is the vacuous-`all()` shape — a
         # crew reported COMPLETED for work that never ran.
-        if (vec_len(results) < vec_len(tasks)) { status = AGNOSAI_CREW_FAILED; }
+        # A hierarchical crew also owes its manager's answer (ADR 035).
+        if (vec_len(results) < _agnosai_crew_task_count(spec)) { status = AGNOSAI_CREW_FAILED; }
         if (status == AGNOSAI_CREW_FAILED) {
             reason = AGNOSAI_CREW_REASON_TASK_FAILED;
             if (agnosai_crew_runner_budget_exceeded(r) == 1 || _agnosai_crew_budget_spent(r) == 1) {

@@ -200,6 +200,37 @@ fn agnosai_budget_tracker_record_cost(t, micro_usd): i64 {
     return 0;
 }
 
+# How much of one limit `t` and every tracker above it leave: the least, or `AGNOSAI_NO_LIMIT` when
+# none of them sets one. 0 for a spent one, never less. `max_at` and `used_at` are the offsets.
+fn _agnosai_budget_left(t, max_at, used_at): i64 {
+    var left = AGNOSAI_NO_LIMIT;
+    var at = t;
+    while (at != 0) {
+        var max = load64(at + max_at);
+        if (max != AGNOSAI_NO_LIMIT) {
+            var mine = max - atomic_load(at + used_at);
+            if (mine < 0) { mine = 0; }
+            if (left == AGNOSAI_NO_LIMIT || mine < left) { left = mine; }
+        }
+        at = load64(at + AGN_BT_PARENT);
+    }
+    return left;
+}
+
+# The tokens `t` leaves for one more caller under it (2.4.3, ADR 035): the least any tracker of its
+# chain has left, or `AGNOSAI_NO_LIMIT`. A worker a task delegates to holds at most this.
+fn agnosai_budget_tracker_tokens_left(t): i64 {
+    return _agnosai_budget_left(t, AGN_BT_MAX_TOKENS, AGN_BT_TOKENS_USED);
+}
+
+# The cost `t` leaves, in micro-USD, as `agnosai_budget_tracker_tokens_left` reads tokens. Rounded
+# down to a whole cost unit, so a worker never holds more than is there.
+fn agnosai_budget_tracker_cost_left_micro_usd(t): i64 {
+    var units = _agnosai_budget_left(t, AGN_BT_MAX_COST_UNITS, AGN_BT_COST_UNITS);
+    if (units == AGNOSAI_NO_LIMIT) { return AGNOSAI_NO_LIMIT; }
+    return units * AGNOSAI_MICRO_USD_PER_COST_UNIT;
+}
+
 # The oracle's `warn!` when a limit is hit.
 fn _agnosai_budget_log(msg, msg_len, used, limit): i64 {
     if (sakshi_get_level() < SK_WARN) { return 0; }

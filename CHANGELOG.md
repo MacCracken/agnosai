@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.3] — 2026-11-12
+
+Hierarchical crews: a manager assigns its workers and writes the crew's answer, and authority only narrows
+([ADR 035](docs/adr/035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md)).
+
+### ⚠ Behaviour changes
+
+- **A hierarchical crew is managed**, where through 2.4.2 it warned and ran sequentially, as the Rust line did. Its
+  manager assigns each task to its best worker, the workers run in order, and the manager writes the crew's answer
+  in one more call, reported as one more result with `role: "manager"`. `crew_started`'s `task_count` counts it.
+- **`POST /api/v1/crews` with `"process": "hierarchical"` must name its `manager`**, an `agent_key` of its agents,
+  or it is a 400, where it was accepted with a random UUID as its manager. A `manager` on any other crew is a 400 too.
+  **To migrate:** add `"manager": "<agent_key>"`.
+- **A hierarchical crew whose manager names no agent of its own fails `invalid_manager`**, a new reason, where it ran.
+  A crew built through 2.4.2 carries a UUID manager, which names none.
+- **A worker holds at most its manager's tools**, and an agent the `delegate` tool starts at most its caller's, with
+  at most the budget its caller's task has left. A tool withheld is recorded, not granted.
+
+### Added
+
+- **The manager by its key**: `agnosai_process_hierarchical(agent_key)`, and a crew's JSON carries the key.
+  `agnosai_find_manager`, `agnosai_hierarchical_workers_a`, the roster a run ranks each task against and so the one
+  `agnosai_explain_selection_a` explains a hierarchical run over.
+- **The narrowing**: `agnosai_worker_within_a`, a worker on a copy holding only what its manager holds too, and
+  `agnosai_tools_withheld_a`, `agnosai_log_withheld`. Each worker's result records `assigned_by` and the
+  `withheld_tools` it lost; the manager's answer is handed every worker's (ADR 034) and offered no tool.
+  `AGNOSAI_CREW_REASON_INVALID_MANAGER` and `agnosai_crew_unrunnable_reason`.
+- **A tool call's caller**: `agnosai_tool_input_with_caller`, `agnosai_tool_input_agent` and
+  `agnosai_tool_input_budget`, which the tool loop sets on every call, so a tool that hands work on can bound it.
+  `agnosai_budget_tracker_tokens_left` and `agnosai_budget_tracker_cost_left_micro_usd`, the least any tracker of a
+  chain has left.
+- **On the wire**: the request's `manager`, and `assigned_by`, `withheld_tools` and `role` on each result of the
+  response, when a result has them.
+
+### Changed
+
+- **The `delegate` tool bounds the crew it starts**: its agent holds only the tools its caller holds, its crew at most
+  the tokens and cost its caller's task has left, and a task with nothing left is refused. Its answer names the tools
+  withheld. ⚠ The budget is a ceiling taken when it delegates: the delegated crew outlives the call, so what it spends
+  is not recorded against its caller.
+- `_agnosai_crew_run_sequential`'s body is shared with the hierarchical run, one task at a time
+  (`_agnosai_crew_run_one_a`), and a crew that could not run takes its reason from its error, where the orchestrator
+  said `invalid_dag` for every such crew.
+
+### Fixed
+
+- **2.4.2's hand-off benchmark measured crews that failed.** `benches/handoff.bcyr` set no model catalog, as
+  `orch.bcyr` does, so every task of its DAG chain failed at once (`no model catalog`), its dependents never ran, and
+  no hand-off was made: the 211 → 203 µs 2.4.2 reported was that failure. It sets one now, and every crew row of
+  `benches/handoff.bcyr` and `benches/manager.bcyr` exits unless its crew completed, so a crew that fails cannot be
+  measured again. **The real cost**, against 2.4.1, medians of three interleaved: a DAG chain of four 721 → 729 µs, and
+  a sequential chain of four, where no thread hides it, 238 → 254 µs (+6.7%), about 5 µs a hand-off, which is the
+  render (`handoff_render_1_answer_short` 5.5 µs). 2.4.2's conclusion holds and its number did not. Its
+  `run_crew_4_task_dag_chain` row in `bench-history.csv` is the failure's.
+
+### Performance
+
+- **The interleaved A/B against a 2.4.2 build on the same `lib/`:** four rounds of `orch`, `server`, `core`, `tools`
+  and the new `manager` at a mean load of 4.06, median +1.1% across 177 rows, 152 of them within 5%.
+- **What a manager costs** (`benches/manager.bcyr`, new, a file of its own as roadmap 2.7.1 asks of crew rows), against
+  2.4.2, medians of three interleaved: **`run_crew_4_task_hierarchical` 181.0 → 241.5 µs (+33%)**, where 2.4.2 ran the
+  crew sequentially: its manager's answer is a fifth call, handed four answers. The same crew run sequentially
+  182.8 → 181.3 µs. `hierarchical_workers_3_of_4`, the narrowing alone, 1.1 µs.
+- Not claimed: `route_dashboard_crews_global` +15.4% and `_arena` +13.5%, and `pattern_match_*` +7–14%, which reads
+  code nothing here touched, in the same files and rounds; `pubsub_subscribe_at_cap` −31.7%.
+
 ## [2.4.2] — 2026-11-12
 
 A dependent task is handed its dependencies' answers, as data
@@ -48,7 +114,8 @@ A dependent task is handed its dependencies' answers, as data
 - **What a hand-off costs** (`benches/handoff.bcyr`, new): `handoff_render_1_answer_short` 5.5 µs, and
   `handoff_render_3_answers_4k` 1.5 ms, two thirds of it the injection scan (`prompt_scan_clean_4k` reads 347 µs per
   4 KiB, which the tool loop pays on every result too; roadmap 2.7.2). **A four-task DAG chain on the stub model:
-  211 → 203 µs**, medians of four interleaved, so a crew pays nothing that can be told from noise.
+  211 → 203 µs**, medians of four interleaved, so a crew pays nothing that can be told from noise. ⚠ **Corrected in
+  2.4.3**: these crews' tasks failed for want of a model catalog, so no hand-off ran; the conclusion held.
 - ⚠ **The chain is a file of its own** because run last in `orch.bcyr` it read 550 → 800 µs, and still 817 µs with
   the render row taken out: it measured where the heap stood after the rows before it (roadmap 2.7.1).
 - Not claimed: `task_four_tool_calls_at_once` +19.1% and `_kept` +11.2%, as the 2.4.1 build read 163–411 µs across
