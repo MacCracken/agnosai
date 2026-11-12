@@ -60,6 +60,7 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [031](031-confine-the-process-and-python-tiers-in-agnosais-spawner.md) | Confine the process and Python tiers in agnosai's spawner, with kavach's primitives | Accepted |
 | [032](032-the-crew-lifecycle-is-one-state-machine.md) | The crew lifecycle is one state machine, numbered, with the approval gate in it | Accepted — shipped in 2.4.0; its batches are a sliding window since 2.4.1 (033) |
 | [033](033-budgets-caps-and-crew-concurrency-are-enforced.md) | Budgets, caps and crew concurrency are enforced | Accepted — shipped in 2.4.1 |
+| [034](034-a-dependent-task-is-handed-its-dependencies-answers.md) | A dependent task is handed its dependencies' answers, as data | Accepted — shipped in 2.4.2 |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`). The headings are left as written — renumbering accepted

@@ -34,30 +34,39 @@ finishes. A single wedged LLM call still holds its worker.
 
 ## Sequential Execution
 
-Tasks run one at a time, in the order they appear in the crew spec. Simple and predictable -- use this when each task depends on the previous one's output.
+Tasks run one at a time, in the order they appear in the crew spec. A task is handed nothing from the tasks before it
+unless it names them: one that names a dependency listed before it is handed that dependency's answer (2.4.2,
+[ADR 034](../adr/034-a-dependent-task-is-handed-its-dependencies-answers.md)), and told of one that has not completed.
 
 ```cyr
 var orchestrator = agnosai_orchestrator_new(0);
 
+var gather = agnosai_task_new(str_from("Gather requirements"));
+var write = agnosai_task_new(str_from("Write implementation"));
+agnosai_task_with_dependency(write, agnosai_task_id(gather));
+var review = agnosai_task_new(str_from("Review code"));
+agnosai_task_with_dependency(review, agnosai_task_id(write));
+
 var crew = agnosai_crew_new(str_from("pipeline"));
 var tasks = vec_new();
-vec_push(tasks, agnosai_task_new(str_from("Gather requirements")));
-vec_push(tasks, agnosai_task_new(str_from("Write implementation")));
-vec_push(tasks, agnosai_task_new(str_from("Review code")));
+vec_push(tasks, gather);
+vec_push(tasks, write);
+vec_push(tasks, review);
 agnosai_crew_with_tasks(crew, tasks);
 agnosai_crew_with_process(crew, agnosai_process_sequential());
 
-let result = orchestrator.run_crew(crew).await?;
-// Results are guaranteed in order: [Gather, Write, Review]
+var state = agnosai_orchestrator_run_crew(orchestrator, crew);
+# Results in order: [Gather, Write, Review]. Write is handed Gather's answer, and Review is handed Write's.
 ```
 
-**When to use:** Linear pipelines where task N needs the output of task N-1.
+**When to use:** Linear pipelines where a task needs the answer of one before it. Name that one as a dependency.
 
 ---
 
 ## Parallel Execution
 
-All tasks run concurrently, bounded by a semaphore. Tasks are independent -- no dependency ordering is enforced.
+All tasks run concurrently, at most `max_concurrency` at a time. Tasks are independent: no dependency ordering is
+enforced, and no task is handed another's answer, as what had ended when it started would be a matter of timing.
 
 ```cyr
 var crew = agnosai_crew_new(str_from("batch-analysis"));
@@ -69,7 +78,7 @@ vec_push(tasks, agnosai_task_new(str_from("Analyze module D")));
 agnosai_crew_with_tasks(crew, tasks);
 agnosai_crew_with_process(crew, agnosai_process_parallel(2));
 
-# Each wave spawns real OS threads and joins them before the next.
+# Real OS threads, at most two at a time, the next as one ends.
 var state = agnosai_orchestrator_run_crew(orchestrator, crew);
 // All 4 tasks complete, but at most 2 run simultaneously.
 // Results come back in dispatch order; `task_completed` events in completion
@@ -102,22 +111,42 @@ agnosai_task_with_dependency(transform, agnosai_task_id(gather));
 var validate = agnosai_task_new(str_from("Validate schema compliance"));
 agnosai_task_with_dependency(validate, agnosai_task_id(gather));
 
-let mut report = Task::new("Generate final report");
-report.dependencies.push(transform.id);
-report.dependencies.push(validate.id);
+var report = agnosai_task_new(str_from("Generate final report"));
+agnosai_task_with_dependency(report, agnosai_task_id(transform));
+agnosai_task_with_dependency(report, agnosai_task_id(validate));
 
-let mut crew = CrewSpec::new("etl-pipeline");
-crew.tasks = vec![gather, transform, validate, report];
-crew.process = ProcessMode::Dag;
+var crew = agnosai_crew_new(str_from("etl-pipeline"));
+var tasks = vec_new();
+vec_push(tasks, gather);
+vec_push(tasks, transform);
+vec_push(tasks, validate);
+vec_push(tasks, report);
+agnosai_crew_with_tasks(crew, tasks);
+agnosai_crew_with_process(crew, agnosai_process_dag());
 
-let result = orchestrator.run_crew(crew).await?;
-// Execution waves:
-//   Wave 1: [Gather]
-//   Wave 2: [Transform, Validate]  (run concurrently)
-//   Wave 3: [Report]
+var state = agnosai_orchestrator_run_crew(orchestrator, crew);
+# Execution waves:
+#   Wave 1: [Gather]
+#   Wave 2: [Transform, Validate]  (run concurrently, each handed Gather's answer)
+#   Wave 3: [Report]               (handed Transform's and Validate's, not Gather's)
 ```
 
-Cyclic dependencies produce an `AgnosaiError::CyclicDAG` error at scheduling time, before any task executes.
+Cyclic dependencies fail the crew `invalid_dag` before any task executes, and a task whose dependency failed never
+runs.
+
+### What a dependent task is handed (2.4.2)
+
+Each dependency it names, once and in that order, with that dependency's answer: its result's output, never the calls
+and results of its tool loop ([ADR 034](../adr/034-a-dependent-task-is-handed-its-dependencies-answers.md)). They
+come after the context preamble, as one user turn and a reply, so the task's own turn stays last.
+
+- **An answer is data**, however it was made, since a task that read a page may repeat it. Each goes in its own
+  `<user_input field="dependency_result">` block, with `user_input` and `system_instructions` rewritten inside it,
+  and one the injection scan flags is said to be one outside the markers.
+- **Each is cut at `AGNOSAI_HANDOFF_MAX_BYTES`**, 32 KiB. For a short hand-off, ask for one in the dependency's
+  `expected_output`.
+- **A dependency costs its answer.** The hand-off is part of the request, so it spends the task's budget. Name only
+  the dependencies a task reads.
 
 **When to use:** Complex workflows with branching and merging dependencies (ETL pipelines, build graphs, multi-stage analysis).
 

@@ -57,7 +57,7 @@ enum AgnosaiProcessKind {
     AGNOSAI_PROCESS_PARALLEL = 3;
 }
 
-# Task heap layout — 80 bytes.
+# Task heap layout — 104 bytes.
 enum AgnosaiTaskOff {
     AGN_TASK_ID = 0;
     AGN_TASK_DESCRIPTION = 8;
@@ -73,7 +73,10 @@ enum AgnosaiTaskOff {
     # only tighten: a task never spends past what its crew has left.
     AGN_TASK_MAX_TOKENS = 80;
     AGN_TASK_MAX_COST = 88;
-    AGN_TASK_SIZE = 96;
+    # What a run hands the task from its dependencies (ADR 034), while it runs, else 0. Not part
+    # of its definition, so its JSON never carries it.
+    AGN_TASK_HANDOFF = 96;
+    AGN_TASK_SIZE = 104;
 }
 
 # TaskResult heap layout — 32 bytes.
@@ -365,7 +368,22 @@ fn agnosai_task_new_a(a, description: Str): i64 {
     store64(t + AGN_TASK_OUTPUT_SCHEMA, 0);
     store64(t + AGN_TASK_MAX_TOKENS, AGNOSAI_NO_LIMIT);
     store64(t + AGN_TASK_MAX_COST, AGNOSAI_NO_LIMIT);
+    store64(t + AGN_TASK_HANDOFF, 0);
     return t;
+}
+
+# Hand the task `text` from its dependencies (ADR 034), as `agnosai_handoff_render_a` builds it, or
+# take it back with 0. Its request carries it after the context preamble. A DAG or sequential run
+# sets it as the task starts and takes it back as it ends; a parallel run leaves it as it is.
+# Returns the task.
+fn agnosai_task_with_handoff(t, text: Str): i64 {
+    store64(t + AGN_TASK_HANDOFF, text);
+    return t;
+}
+
+# What the task is handed from its dependencies while it runs, or 0.
+fn agnosai_task_handoff(t): i64 {
+    return load64(t + AGN_TASK_HANDOFF);
 }
 
 # Give the task its own limits (ADR 033): at most `max_tokens` and `max_cost_micro_usd` of the

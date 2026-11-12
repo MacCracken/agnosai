@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.4.1 (2026-11-12).**
+**Status as of 2.4.2 (2026-11-12).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.4.2** | Hand a downstream task a summary, not a transcript |
 | **2.4.3** | Hierarchical crews: a manager and its workers |
 | **2.5.0** | Durable execution: a crew log that resumes from its last finished task |
 | **2.5.1** | The server's own crews in arenas |
@@ -86,26 +85,21 @@ crew that cannot run a terminal state, a task's tool calls their events, and a b
 ([ADR 032](../adr/032-the-crew-lifecycle-is-one-state-machine.md)). Its rules for a model judge, should one be added,
 are written there. 2.4.1 enforced budgets and caps: crews at once, outbound TLS at 64, a parallel crew as a sliding
 window, and token and cost per tenant, crew and task, each under the one above it
-([ADR 033](../adr/033-budgets-caps-and-crew-concurrency-are-enforced.md)).
-
-#### 2.4.2 — hand a downstream task a summary, not a transcript
-
-A summarizing strategy beside Full, SlidingWindow and HeadTail (`orchestrator/memory.cyr`): a dependent task receives
-its upstream's `expected_output` or summary, not the whole transcript. Hierarchical crews (2.4.3) need it. **A summary
-is as untrusted as what it summarised:** a hand-off built from tool output carries that output's trust, so it reaches
-the next task as data (ADR 029's rule 2).
+([ADR 033](../adr/033-budgets-caps-and-crew-concurrency-are-enforced.md)). 2.4.2 handed a dependent task its
+dependencies' answers, as data, in a DAG and in a sequential crew
+([ADR 034](../adr/034-a-dependent-task-is-handed-its-dependencies-answers.md)).
 
 #### 2.4.3 — hierarchical crews: a manager and its workers
 
 `orchestrator/hierarchical.cyr` is built and tested, and `crew_runner.cyr` logs and falls back to sequential.
-Orchestrator-worker is where the field converged, and Google/DeepMind's 2025 scaling study measured error
-amplification of 17.2× for independent agents against 4.4× centralized. Workers return summaries, not transcripts
-(2.4.2). agnostic drops its `hierarchical` refusal on the re-pin. **Selection explanations stay exact:**
-`agnosai_explain_selection_a` is exact only while selection is a pure function of roster and task, so a manager's
-choice must be recorded. **Authority only narrows:** a worker holds at most its manager's tools and budget, and a need
-beyond them goes up to a human. Today a delegated crew's agents hold whatever their own definitions name, however
-little the delegating agent holds, and that is the gap this closes. The budget half is a tracker under the manager's
-task's, which 2.4.1 built (ADR 033): a worker can then never spend what its manager has not got.
+Orchestrator-worker is where the field converged, and Google/DeepMind's 2025 scaling study measured error amplification
+of 17.2× for independent agents against 4.4× centralized. A worker's answer reaches its manager as 2.4.2 hands a
+dependency's answer on (ADR 034). agnostic drops its `hierarchical` refusal on the re-pin. **Selection explanations stay
+exact:** `agnosai_explain_selection_a` is exact only while selection is a pure function of roster and task, so a
+manager's choice must be recorded. **Authority only narrows:** a worker holds at most its manager's tools and budget,
+and a need beyond them goes up to a human. Today a delegated crew's agents hold whatever their own definitions name,
+however little the delegating agent holds, and that is the gap this closes. The budget half is a tracker under the
+manager's task's, which 2.4.1 built (ADR 033): a worker can then never spend what its manager has not got.
 
 ### 2.5.x — durable execution
 
@@ -216,6 +210,11 @@ rebase of their history.
 
 - Output-filter leak detection folds ASCII case only. A pub/sub subscriber cannot detach alone, only
   `unsubscribe_all(pattern)`. `strcase` is ASCII-only though the crew assembler matches user-supplied names.
+- **The injection scan reads a text once per pattern.** `agnosai_prompt_scan_input` makes 31 case-blind passes:
+  347 µs for 4 KiB (`prompt_scan_clean_4k`), so a 32 KiB tool result or dependency's answer costs about 2.8 ms of
+  scan, and a hand-off of three 4 KiB answers 1.05 of its 1.5 ms (measured at 2.4.2). One pass that tries only the
+  patterns a byte's lower case can start must still answer the **first pattern in table order** that matches anywhere,
+  not the first position, as the description it returns is the table's.
 - **`lib/<file>:<line>` citations in `src/` comments drift with every fold.** 63 of them. Convert each to the
   `` `lib/x.cyr`'s `fn_name` `` form by hand, as an automated rewrite picked the wrong function for some, then gate new
   ones.
@@ -426,4 +425,4 @@ and log fields at 2.3.6.
 | F4 | 2.5.0, durable execution |
 | F5 | shipped in 2.4.1, budgets and caps (ADR 033); the delegated worker's level at 2.4.3 |
 | F8 | 2.6.0, MCP 2026-07-28 and A2A 1.0 |
-| F9 | 2.4.2, the summary hand-off |
+| F9 | shipped in 2.4.2, the hand-off of a dependency's answer (ADR 034) |

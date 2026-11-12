@@ -110,6 +110,7 @@
 include "src/done_word.cyr"
 include "src/log_fields.cyr"
 include "src/orchestrator/budget.cyr"
+include "src/handoff.cyr"
 
 # Pick the highest-scoring agent for a task, or 0 when the roster is empty.
 #
@@ -676,6 +677,15 @@ fn _agnosai_crew_build_request_a(a, task, agent, model: Str, user_msg: Str): i64
           agnosai_prompt_sanitize_a(a, rendered, str_from_a(a, "context")));
         agnosai_inference_request_say(req, AGNOSAI_ROLE_ASSISTANT,
           str_from_a(a, "Understood, I have the context."));
+    }
+
+    # What the task's dependencies answered (ADR 034), already in its markers, and a reply, so the
+    # task's own turn still comes last. A validation retry rebuilds the request with it, as it does
+    # with the context.
+    var handoff = agnosai_task_handoff(task);
+    if (handoff != 0) {
+        agnosai_inference_request_say(req, AGNOSAI_ROLE_USER, handoff);
+        agnosai_inference_request_say(req, AGNOSAI_ROLE_ASSISTANT, agnosai_handoff_ack_a(a));
     }
 
     var turn = user_msg;
@@ -1878,6 +1888,10 @@ fn _agnosai_crew_run_sequential(r): i64 {
     var client = load64(r + AGN_CR_CLIENT);
     var a = load64(r + AGN_CR_ALLOC);
     var results = vec_new_a(a);
+    # Each result by its task's id, for a later task that depends on it (ADR 034). A sequential
+    # crew runs its tasks in the order they are listed, so a task is handed the answers of the
+    # dependencies listed before it that completed, and says of any other that it has none.
+    var by_id = map_new_str_a(a);
 
     # Two event names, minted once rather than once per task.
     var ev_started = str_from_a(a, "task_started");
@@ -1902,11 +1916,14 @@ fn _agnosai_crew_run_sequential(r): i64 {
         }
 
         agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
+        agnosai_task_with_handoff(task, agnosai_handoff_render_a(a, task, by_id));
         var result = agnosai_execute_task_budgeted_a(a, task, agent, client,
           task_tx, agnosai_crew_id(spec), load64(r + AGN_CR_TRACE),
           load64(r + AGN_CR_LOOP), load64(r + AGN_CR_BUDGET));
         result = _agnosai_crew_review_a(a, r, task, agent, result, task_tx);
+        agnosai_task_with_handoff(task, 0);
         agnosai_task_with_status(task, agnosai_task_result_status(result));
+        map_set_a(a, by_id, agnosai_task_id(task), result);
 
         if (wants_events == 1) {
             _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data_a(a, result));
@@ -2176,8 +2193,17 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
             return 0;
         }
 
+        # Every ready task is handed what its dependencies answered (ADR 034), which `completed`
+        # holds for each, as a task becomes ready only once all of them have completed.
+        for (var h = 0; h < vec_len(ready); h = h + 1) {
+            var ht = vec_get(ready, h);
+            agnosai_task_with_handoff(ht, agnosai_handoff_render_a(a, ht, completed));
+        }
         var before = vec_len(results);
         _agnosai_crew_run_wave(r, ready, agents, results);
+        for (var hc = 0; hc < vec_len(ready); hc = hc + 1) {
+            agnosai_task_with_handoff(vec_get(ready, hc), 0);
+        }
 
         for (var k = before; k < vec_len(results); k = k + 1) {
             var res = vec_get(results, k);

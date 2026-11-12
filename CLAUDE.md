@@ -48,7 +48,7 @@ Two things this does **not** change:
   binary.
 
 Port-local modules with no `rust-old/` counterpart (`units`, `order`, `id`,
-`guarded_fetch`, `chan_lossy`, `arena_pool`, `crew_arena`, `done_word`, `log_fields`, `semaphore`, `tls_permit`) stay at `src/` root — the directory tree means
+`guarded_fetch`, `chan_lossy`, `arena_pool`, `crew_arena`, `done_word`, `log_fields`, `semaphore`, `tls_permit`, `handoff`) stay at `src/` root — the directory tree means
 "this mirrors rust-old", and inventing a home for them would dilute that.
 
 Anything walking `src/` must recurse: `find src -name '*.cyr'`, not `src/*.cyr`,

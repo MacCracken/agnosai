@@ -280,7 +280,7 @@ Create and execute a crew. The server assembles the crew from the provided agent
 | `description` | string | yes | What the task should accomplish |
 | `expected_output` | string | no | Description of the expected result |
 | `priority` | string | no | `"background"`, `"low"`, `"normal"` (default), `"high"`, or `"critical"` |
-| `dependencies` | array of int | no | Indices into the tasks array indicating which tasks must complete first |
+| `dependencies` | array of int | no | Indices into the tasks array indicating which tasks must complete first. Since 2.4.2 a task in a `dag` or `sequential` crew is handed each one's answer, as data, in its request ([ADR 034](../adr/034-a-dependent-task-is-handed-its-dependencies-answers.md)); a `parallel` crew hands none |
 | `risk` | string | no | `"low"` (default), `"medium"` or `"high"`. A `high` task's answer waits for a reviewer on `/api/v1/approvals` (2.4.0; the Rust line had no such field) |
 | `budget` | object | no | The task's own, in the crew's shape. Reaching it fails this task, and its crew runs on (2.4.1) |
 

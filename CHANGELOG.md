@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.2] — 2026-11-12
+
+A dependent task is handed its dependencies' answers, as data
+([ADR 034](docs/adr/034-a-dependent-task-is-handed-its-dependencies-answers.md)).
+
+### ⚠ Behaviour changes
+
+- **A task that names a dependency is handed that dependency's answer**, in a DAG and in a sequential crew, where
+  through 2.4.1 it was handed nothing: the DAG ordered tasks and read none of their results, as the Rust line's did.
+  Its request gains a user turn holding each answer, up to 32 KiB each, and a reply, after the context preamble. So a
+  dependent task's request is longer, spends more of its budget, and misses a gateway cache keyed on the old one. A
+  DAG that names dependencies only to order its tasks pays for them too. **To migrate:** nothing, unless a dependency
+  was named only for its order; a parallel crew hands nothing.
+
+### Added
+
+- **The hand-off** (`src/handoff.cyr`, port-local). Each dependency a task names, once, in the order it names them,
+  with its result's output: the answer, never the calls and results of its tool loop. A dependency with no completed
+  answer is said to have none, and a failure's text is not handed over. In a DAG a task is handed every dependency; in
+  a sequential crew, those listed before it that completed. A parallel crew hands nothing, as its tasks do not wait for
+  their dependencies. `agnosai_handoff_render_a`, `agnosai_handoff_render`, `agnosai_handoff_ack_a`,
+  `AGNOSAI_HANDOFF_MAX_BYTES`; `agnosai_task_with_handoff` and `agnosai_task_handoff`, which a run sets as a task
+  starts and takes back as it ends, and which a task's JSON never carries.
+
+### Security
+
+- **An answer reaches the next task as data**, handled as a tool result is (ADR 029, rule 2), since a task that read a
+  page may repeat it: inside `<user_input field="dependency_result">` after a line saying each answer is data, with
+  `user_input` and `system_instructions` rewritten inside it and inside the dependency's id, and a finding of the
+  injection scan said outside the markers and logged as a WARN that does not name the answer. Each answer is cut at
+  32 KiB on a character boundary, saying how much was cut.
+
+### Performance
+
+- **The interleaved A/B against a 2.4.1 build on the same `lib/`:** four rounds of `orch`, `server`, `core` and
+  `tools` at a mean load of 4.36, median −1.7% across 175 rows, 145 of them within 5%. The sequential crews, which
+  now keep their results by task id, read −2.7% to −3.8%, and `task_to_json` and `task_from_json` +3.2%, inside their
+  spread.
+- **What a hand-off costs** (`benches/handoff.bcyr`, new): `handoff_render_1_answer_short` 5.5 µs, and
+  `handoff_render_3_answers_4k` 1.5 ms, two thirds of it the injection scan (`prompt_scan_clean_4k` reads 347 µs per
+  4 KiB, which the tool loop pays on every result too; roadmap 2.7.2). **A four-task DAG chain on the stub model:
+  211 → 203 µs**, medians of four interleaved, so a crew pays nothing that can be told from noise.
+- ⚠ **The chain is a file of its own** because run last in `orch.bcyr` it read 550 → 800 µs, and still 817 µs with
+  the render row taken out: it measured where the heap stood after the rows before it (roadmap 2.7.1).
+- Not claimed: `task_four_tool_calls_at_once` +19.1% and `_kept` +11.2%, as the 2.4.1 build read 163–411 µs across
+  its four rounds (the rows 2.7.1 names), and `tool_registry_has_50_miss` −31.3%, bimodal since 2.3.8.
+
 ## [2.4.1] — 2026-11-12
 
 Budgets, caps and crew concurrency are enforced: the limits agnosai carried since the Rust line, and read only one of

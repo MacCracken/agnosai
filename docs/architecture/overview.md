@@ -131,6 +131,8 @@ surface the explanation on its plan route (`?explain=selection`) when it re-pins
 - Kahn's algorithm for topological sort with cycle detection
 - Priority-aware: within each wave, higher-priority tasks run first
 - Wave execution: all tasks with satisfied dependencies run concurrently
+- Hand-off (2.4.2): each task is handed its dependencies' answers, as data, never their tool
+  transcripts (`src/handoff.cyr`, [ADR 034](../adr/034-a-dependent-task-is-handed-its-dependencies-answers.md))
 
 ### Pub/Sub
 

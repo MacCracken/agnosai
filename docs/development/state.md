@@ -2,9 +2,28 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-12 (the 2.4.1 release gate).
+> Last refreshed: 2026-11-12 (the 2.4.2 release gate).
 
-## Now — 2.4.1
+## Now — 2.4.2
+
+| | |
+|---|---|
+| **version** | **2.4.2** (cut 2026-11-12, `version-bump.sh`'s UTC date): a dependent task is handed its dependencies' answers, as data (ADR 034), in a DAG and in a sequential crew. The roadmap had it as a summarizing strategy for `memory.cyr`'s buffer, but nothing had ever been handed over: the DAG read none of its results |
+| **cyrius pin** | **6.7.18**, unchanged, the latest tag |
+| **tests** | **113 suites, 12,712 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.4.1's tree read 12,631: +81, all `orch_handoff`, new. No suite pinned a dependent task's request, so none changed. **22 mutants, all killed** on the first pass, in two groups run side by side in copies of the tree: the hand-off's rules 14 (the cap, the cut, the order, once each, no answer, the markers, the finding, the line it opens with) and the request and both runners 8 (the turn, its reply, its role, each runner setting and taking back). Four crashed the suite rather than failing it, each as expected: a null handed to the builder, or a message read that a mutant took away |
+| **coverage** | **99%**: 111/111 files, 2,000/2,010 fns (gate `--min 80`), the same 10 unreferenced as 2.4.1. A first run read 1,999: `agnosai_handoff_render_a`, which only the runners called, now named by a test that builds a hand-off in an arena |
+| **dist** | `dist/agnosai.cyr` 48,843 lines + `dist/agnosai-guard.cyr` 1,034, both v2.4.2, by `wc -l` (2.4.1's read 48,680 and 1,034). Sidecars **6 / 1** leaves, unchanged. `[lib]` gains `src/handoff.cyr`, 121 modules |
+| **binary** | `build/agnosai` **3,098,888 B** (2.4.1: 3,094,352). aarch64 **7,169,832 B** (7,169,384), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.4.2"` and exits 0 on SIGTERM |
+| **deps** | Unchanged from 2.4.1: every pin on its latest tag. hoosh at 2.12.3 |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh`: 3,481 top-level definitions across 122 files, no duplicates, all prefixed. `check-clean.sh`: fmt and lint 249 files, doc 123, doctest 1, vet, deny, `deps --verify` 119, lib snapshot 113, generated sources, log lengths 248, dist matches src. Fuzz 4/4. The examples run. CI replica (ubuntu:26.04, wasmtime 47.0.3, fresh user, all 8 pins from GitHub): **every `ci.yml` step passed**, 113 suites, 12,681 assertions, 0 failed, coverage, the examples, fuzz and `cyrius bench` |
+| **benchmarks** | The interleaved A/B against a 2.4.1 build on the same `lib/`, four rounds of `orch`, `server`, `core` and `tools` at a mean load of 4.36: median −1.7% across 175 rows, 145 within 5%; the sequential crews −2.7% to −3.8%. **What a hand-off costs** is `benches/handoff.bcyr`, new: one short answer 5.5 µs, three of 4 KiB 1.5 ms, two thirds of that the injection scan (roadmap 2.7.2), and a four-task DAG chain 211 → 203 µs against 2.4.1, medians of four interleaved. ⚠ The chain is a file of its own because, run last in `orch.bcyr`, it read 550 → 800 µs, and 817 µs with the render row taken out: the heap's position (roadmap 2.7.1). `bench-history.sh` appended 257 rows for 2.4.2, at a starting load of 4.5, not used for any claim |
+| **the hand-off** | `tests/orch_handoff.tcyr`: one hand-off byte for byte; the order a task names its dependencies, each once; no answer for a failed or absent one, and not the failure's text; an answer and an id that cannot end the markers; a finding said outside them, before its block; the cut at the cap, on a character boundary; an arena. Crews through a scripted gateway that keeps each task's last request in its own slot, so a wave's threads can share it: a DAG chain and a diamond, a dependency that failed, a sequential crew handed what came before and told what has not, a parallel crew handed nothing, the context before the hand-off, and a hostile answer. Every hand-off is taken back when the run ends |
+| **build warnings** | Unchanged from 2.4.1: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines, and the two `src/tool_loop.cyr` "assigning non-pointer to typed pointer" lines, at 997 and 1173 |
+| **consumer** | Not re-run. agnostic pins 2.2.4. ⚠ Its `dag` crews that name dependencies now hand each task those answers, which its reviewer preset waits on (its roadmap, "A reviewer preset"); its other `dag` crews pay for answers they only ordered by (CHANGELOG *Behaviour changes*) |
+| **upstream filings** | ⚠ **Six not committed**, so not visible upstream, unchanged: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies; the pooled connection's allocator), bote (MCP client) |
+
+### 2.4.1 — the release (2026-11-12)
 
 | | |
 |---|---|
