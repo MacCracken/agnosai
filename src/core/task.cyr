@@ -45,6 +45,8 @@ enum AgnosaiTaskStatus {
     AGNOSAI_STATUS_COMPLETED = 3;
     AGNOSAI_STATUS_FAILED = 4;
     AGNOSAI_STATUS_CANCELLED = 5;
+    # The model answered and a reviewer has yet to decide (ADR 032). The Rust line had no such state.
+    AGNOSAI_STATUS_AWAITING_APPROVAL = 6;
 }
 
 # How tasks within a crew should be executed.
@@ -194,6 +196,7 @@ fn agnosai_task_status_to_wire_a(a, status): i64 {
     if (status == AGNOSAI_STATUS_COMPLETED) { return AGN_JV_COMPLETED; }
     if (status == AGNOSAI_STATUS_FAILED) { return AGN_JV_FAILED; }
     if (status == AGNOSAI_STATUS_CANCELLED) { return AGN_JV_CANCELLED; }
+    if (status == AGNOSAI_STATUS_AWAITING_APPROVAL) { return AGN_JV_AWAITING_APPROVAL; }
     return AGN_JV_PENDING;
 }
 
@@ -210,6 +213,7 @@ fn agnosai_task_status_from_wire(s: Str): i64 {
     if (str_eq_cstr(s, "completed") == 1) { return AGNOSAI_STATUS_COMPLETED; }
     if (str_eq_cstr(s, "failed") == 1) { return AGNOSAI_STATUS_FAILED; }
     if (str_eq_cstr(s, "cancelled") == 1) { return AGNOSAI_STATUS_CANCELLED; }
+    if (str_eq_cstr(s, "awaiting_approval") == 1) { return AGNOSAI_STATUS_AWAITING_APPROVAL; }
     return AGNOSAI_STATUS_PENDING;
 }
 
@@ -650,6 +654,19 @@ fn agnosai_task_result_status(r): i64 {
 # Str-keyed map of metadata attached to the result.
 fn agnosai_task_result_metadata(r): i64 {
     return load64(r + AGN_TRES_METADATA);
+}
+
+# Set a result's status. Returns the result. For a result a reviewer rejected (ADR 032).
+fn agnosai_task_result_with_status(r, status): i64 {
+    store64(r + AGN_TRES_STATUS, status);
+    return r;
+}
+
+# Replace a result's output. Returns the result. For a result whose output a reviewer rejected,
+# which must not reach the next task (ADR 032).
+fn agnosai_task_result_with_output(r, output: Str): i64 {
+    store64(r + AGN_TRES_OUTPUT, output);
+    return r;
 }
 
 # Attach a metadata key-value pair. `value` is a bayan JSON value.

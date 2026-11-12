@@ -26,19 +26,32 @@
 
 # Say that this thread is over: everything it wrote is visible to whoever reads 1 here.
 fn agnosai_done_word_set(word): i64 {
+    return agnosai_done_word_set_value(word, 1);
+}
+
+# `agnosai_done_word_set` with a value of the setter's choosing, never 0: a crew's wave hands
+# the job that finished through one (2.4.0, ADR 032). The same rules hold: it is the setter's
+# last touch of the word, and everything it wrote is visible to whoever reads the value.
+fn agnosai_done_word_set_value(word, value): i64 {
     atomic_fence();
-    atomic_store(word, 1);
+    atomic_store(word, value);
     syscall(SYS_FUTEX, word, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
     return 0;
 }
 
 # Wait for `agnosai_done_word_set` on this word.
 fn agnosai_done_word_wait(word): i64 {
+    agnosai_done_word_wait_value(word);
+    return 0;
+}
+
+# Wait for this word to be set, and return what it was set to.
+fn agnosai_done_word_wait_value(word): i64 {
     while (1 == 1) {
         var d = atomic_load(word);
         if (d != 0) {
             atomic_fence();
-            return 0;
+            return d;
         }
         syscall(SYS_FUTEX, word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, d, 0, 0, 0);
     }

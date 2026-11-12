@@ -61,6 +61,7 @@ include "src/tools/registry.cyr"
 include "src/tool_call.cyr"
 include "src/tool_loop.cyr"
 include "src/model_catalog.cyr"
+include "src/orchestrator/approval.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "tests/test_helpers.cyr"
 
@@ -623,6 +624,21 @@ fn _t_schema_suite(): i64 {
     assert_eq(agnosai_task_result_status(load64(job + AGN_CJ_RESULT)), AGNOSAI_STATUS_FAILED,
       "a cancelled job records a failure");
     assert_eq(load64(job + AGN_CJ_DONE), 1, "and says it is over, or the wave would wait for good");
+    # In a wave the job goes in its batch's next slot as well, which is what the wave waits on.
+    var wslots = alloc(16);
+    store64(wslots, 0);
+    store64(wslots + 8, 0);
+    var wtail = alloc(8);
+    store64(wtail, 0);
+    var wjob = alloc(AGN_CJ_SIZE);
+    store64(wjob + AGN_CJ_TASK, _t_schema_task());
+    store64(wjob + AGN_CJ_CANCELLED, flag);
+    store64(wjob + AGN_CJ_ALLOC, default_alloc());
+    store64(wjob + AGN_CJ_SLOTS, wslots);
+    store64(wjob + AGN_CJ_TAIL, wtail);
+    _agnosai_crew_worker(wjob);
+    assert_eq(agnosai_done_word_wait_value(wslots), wjob, "a cancelled job in a wave takes its slot too");
+    assert_eq(load64(wtail), 1, "the first, and moves the tail on");
     agnosai_done_word_wait(job + AGN_CJ_DONE);
 
     var spec = agnosai_crew_new(str_from("schema-crew"));
@@ -1323,6 +1339,10 @@ fn main() {
     assert(str_eq_cstr(_t_ev_str(to_seq_done, "status"), "failed") == 1,
       "which says \"failed\", agreeing with the state — it said \"completed\" before ADR 022");
     assert_eq(_t_ev_int(to_seq_done, "task_count"), 0, "with task_count 0, the state's count");
+    assert(str_eq_cstr(_t_ev_str(to_seq_done, "reason"), "timeout") == 1,
+      "and says why, timeout (ADR 032)");
+    assert(str_eq_cstr(agnosai_crew_state_reason(to_seq_state), "timeout") == 1,
+      "as the state does");
 
     var to_par = _t_crew("timeout-par", 4, agnosai_process_parallel(2));
     var to_par_sub: i64[1];
@@ -1351,6 +1371,9 @@ fn main() {
     assert(str_eq_cstr(_t_ev_str(to_ok_done, "status"), "completed") == 1,
       "and says \"completed\"");
     assert_eq(_t_ev_int(to_ok_done, "task_count"), 3, "counting all three results");
+    assert_eq(bayan_json_v_obj_get_by_cstr(agnosai_crew_event_data(to_ok_done), "reason"), 0,
+      "with no reason: a crew that completed has nothing to explain");
+    assert_eq(agnosai_crew_state_reason(to_ok_state), 0, "and neither has its state");
 
     # A deadline that passes MID-RUN, after one task ran. The stub gateway moves
     # the deadline into the past while answering task 1, so loop head 2 sees it.
@@ -1468,6 +1491,8 @@ fn main() {
     assert_eq(load64(&run_err), 0, "and no scheduling error — no deadlock");
     if (sd_state != 0) {
         assert_eq(agnosai_crew_state_status(sd_state), AGNOSAI_CREW_FAILED, "the state is FAILED");
+        assert(str_eq_cstr(agnosai_crew_state_reason(sd_state), "task_failed") == 1,
+          "because a task failed, which it says");
         assert_eq(vec_len(agnosai_crew_state_results(sd_state)), 3,
           "with the three tasks that ran: A failed, X and Y completed; B never ran");
     }
@@ -1480,8 +1505,35 @@ fn main() {
     assert(sd_last != 0, "events were published");
     assert(str_eq_cstr(agnosai_crew_event_event_type(sd_last), "crew_completed") == 1,
       "and the last is crew_completed, as for every crew that ends");
+    if (sd_last != 0) {
+        assert(str_eq_cstr(_t_ev_str(sd_last, "reason"), "task_failed") == 1, "saying task_failed");
+    }
 
-    # A dangling dependency — no failure explains it — still takes the deadlock arm.
+    # A cyclic crew cancelled before it ran: the cancel stands in its last word too (ADR 032).
+    var cc_spec = agnosai_crew_new(str_from("dag-cancelled-cycle"));
+    var cc_a = agnosai_task_new(str_from("A"));
+    var cc_b = agnosai_task_new(str_from("B"));
+    agnosai_task_with_dependency(cc_a, agnosai_task_id(cc_b));
+    agnosai_task_with_dependency(cc_b, agnosai_task_id(cc_a));
+    var cc_tasks = vec_new();
+    vec_push(cc_tasks, cc_a);
+    vec_push(cc_tasks, cc_b);
+    agnosai_crew_with_tasks(cc_spec, cc_tasks);
+    agnosai_crew_with_process(cc_spec, agnosai_process_dag());
+    var cc_sub: i64[1];
+    var cc_r = agnosai_crew_runner_with_events(agnosai_crew_runner_new(cc_spec), _t_watch(cc_spec, &cc_sub));
+    agnosai_crew_runner_cancel(cc_r);
+    store64(&run_err, 0);
+    assert_eq(agnosai_crew_runner_run(cc_r, &run_err), 0, "a cancelled cyclic crew is still an error");
+    var cc_done = _t_find(_t_drain(load64(&cc_sub)), "crew_completed");
+    assert(cc_done != 0, "with a last word");
+    if (cc_done != 0) {
+        assert(str_eq_cstr(_t_ev_str(cc_done, "status"), "cancelled") == 1, "saying cancelled, as it was");
+        assert(str_eq_cstr(_t_ev_str(cc_done, "reason"), "cancelled") == 1, "and why");
+    }
+
+    # A dangling dependency — no failure explains it — still takes the deadlock arm, and a
+    # subscriber is told so (ADR 032): it used to get no last word at all.
     var dd_spec = agnosai_crew_new(str_from("dag-dangling"));
     var dd_t = agnosai_task_new(str_from("waits on nothing that exists"));
     agnosai_task_with_dependency(dd_t, str_from("00000000-0000-4000-8000-000000000000"));
@@ -1490,8 +1542,16 @@ fn main() {
     agnosai_crew_with_tasks(dd_spec, dd_tasks);
     agnosai_crew_with_process(dd_spec, agnosai_process_dag());
     store64(&run_err, 0);
-    assert_eq(agnosai_crew_runner_run(agnosai_crew_runner_new(dd_spec), &run_err), 0,
+    var dd_sub: i64[1];
+    assert_eq(agnosai_crew_runner_run(agnosai_crew_runner_with_events(agnosai_crew_runner_new(dd_spec),
+          _t_watch(dd_spec, &dd_sub)), &run_err), 0,
       "a dependency on a task the spec does not hold is still a scheduling error");
+    var dd_done = _t_find(_t_drain(load64(&dd_sub)), "crew_completed");
+    assert(dd_done != 0, "and a subscriber still gets crew_completed");
+    if (dd_done != 0) {
+        assert(str_eq_cstr(_t_ev_str(dd_done, "status"), "failed") == 1, "saying failed");
+        assert(str_eq_cstr(_t_ev_str(dd_done, "reason"), "invalid_dag") == 1, "because of the DAG");
+    }
     assert(load64(&run_err) != 0, "reported as one");
 
     # --- ADR 011's producer side: /metrics must stop rendering zeros ---------
@@ -1500,8 +1560,8 @@ fn main() {
     var _m = agnosai_metrics_global();
 
     # The gauge must balance on the cyclic-DAG path too. That run returned an
-    # error before any task executed and deliberately emits no `crew_completed`
-    # EVENT — but the gauge is a different contract, and if it does not unwind
+    # error before any task executed — and since 2.4.0 emits `crew_completed`
+    # with its reason (ADR 032) — but the gauge is its own contract, and if it does not unwind
     # here it ratchets upward for the life of the process on one malformed spec.
     # This is the assertion that catches that; it failed on the first cut.
     var _act_before_cyc = agnosai_metrics_crews_active(_m);
@@ -1519,7 +1579,7 @@ fn main() {
     agnosai_crew_runner_run(agnosai_crew_runner_new(cyc2), &run_err);
     assert_eq(agnosai_metrics_crews_active(_m), _act_before_cyc,
       "a cyclic DAG leaves crews_active exactly where it found it — the error return must still \
-    balance the gauge even though it emits no crew_completed event");
+    balance the gauge");
 
     # A crew that actually runs moves crews_total, balances the gauge, and folds
     # its tasks into the task counters.
@@ -1566,6 +1626,8 @@ fn main() {
     var cancel_state = agnosai_crew_runner_run(cancel_runner, &run_err);
     assert_eq(agnosai_crew_state_status(cancel_state), AGNOSAI_CREW_CANCELLED,
       "a cancelled crew reports CANCELLED, which beats both completed and failed");
+    assert(str_eq_cstr(agnosai_crew_state_reason(cancel_state), "cancelled") == 1,
+      "and says so in its reason");
     assert_eq(vec_len(agnosai_crew_state_results(cancel_state)), 0,
       "and runs nothing — cancellation is checked BEFORE each task, so results hold what actually \
     ran rather than a set of synthetic failures");
@@ -1774,6 +1836,42 @@ fn main() {
     var wj_c1 = _t_index_of(wj_evs, "task_completed", agnosai_task_id(wj_first));
     var wj_c2 = _t_index_of(wj_evs, "task_completed", agnosai_task_id(wj_second));
     assert(wj_c1 >= 0 && wj_c1 < wj_c2, "so the first task's completion precedes the second's");
+
+    # --- and in COMPLETION order (ADR 032): the inverse ---
+    # One batch of two, where the FIRST task's answer waits for the SECOND task's
+    # `task_completed`. Joined in dispatch order (2.1.5 to 2.3.8) the runner would wait on the
+    # first worker, which waits on an event due only after it: the bounded wait runs out and
+    # `_t_peer_seen` says 2. In completion order the second is reported as it finishes.
+    var wc = agnosai_crew_new(str_from("wave-completion"));
+    var wc_slow = agnosai_task_new(str_from("await-peer"));
+    var wc_fast = agnosai_task_new(str_from("answer at once"));
+    var wc_tasks = vec_new();
+    vec_push(wc_tasks, wc_slow);
+    vec_push(wc_tasks, wc_fast);
+    agnosai_crew_with_tasks(wc, wc_tasks);
+    agnosai_crew_with_process(wc, agnosai_process_parallel(2));
+    var wc_sub: i64[1];
+    var wc_tx = _t_watch(wc, &wc_sub);
+    _t_peer_sub = agnosai_event_sender_subscribe(wc_tx);
+    _t_peer_task = agnosai_task_id(wc_fast);
+    _t_peer_seen = 0;
+    var wc_client = agnosai_hoosh_client_with_chat(
+      agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_t_stub_chat_peer);
+    var wc_state = agnosai_crew_runner_run(agnosai_crew_runner_with_events(
+        agnosai_crew_runner_with_llm(agnosai_crew_runner_new(wc), wc_client), wc_tx), &run_err);
+    assert_eq(_t_peer_seen, 1,
+      "the first task saw the second's task_completed while it was still running — 2 if the wave \
+    still joined in dispatch order");
+    var wc_evs = _t_drain(load64(&wc_sub));
+    var wc_cs = _t_index_of(wc_evs, "task_completed", agnosai_task_id(wc_slow));
+    var wc_cf = _t_index_of(wc_evs, "task_completed", agnosai_task_id(wc_fast));
+    assert(wc_cf >= 0 && wc_cf < wc_cs, "so the fast task's completion is reported first");
+    var wc_res = agnosai_crew_state_results(wc_state);
+    assert_eq(vec_len(wc_res), 2, "both tasks answered");
+    if (vec_len(wc_res) == 2) {
+        assert(str_eq(agnosai_task_result_task_id(vec_get(wc_res, 0)), agnosai_task_id(wc_slow)) == 1,
+          "and the results stay in dispatch order, whichever finished first");
+    }
 
     # Nobody subscribed: the workers get no sender, so they build no payloads.
     # A crew with a bus but no subscriber still completes normally.

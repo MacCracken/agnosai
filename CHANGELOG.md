@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] — 2026-11-12
+
+The crew lifecycle is one state machine, written down and checked as an invariant: every event is numbered, every
+event is a legal move, and a high-risk task's answer waits for a reviewer
+([ADR 032](docs/adr/032-the-crew-lifecycle-is-one-state-machine.md)).
+
+### ⚠ Behaviour changes
+
+- **A `high`-risk task waits for a reviewer.** After the model answers, the task reads `awaiting_approval` and its crew
+  rolls up to `awaiting_approval`, until `POST /api/v1/approvals` decides, the gate's five minutes pass, or the crew is
+  cancelled or out of time. Only a reviewer approves. Anything else rejects: the task fails, and its output is
+  replaced with `output withheld: approval rejected (<reason>)`, so it reaches neither the crew's results nor a
+  dependent task. Through 2.3.8 the gate existed and nothing waited on it, so a high-risk answer was used unreviewed.
+  ⚠ A `POST /api/v1/crews` holding such a task holds its connection while it waits. **To migrate:** decide through
+  `agnosai_orchestrator_approval_gate(o)`, give the orchestrator a gate of your own with a shorter timeout
+  (`agnosai_orchestrator_with_approval_gate`), or mark the task `medium` or `low`. An orchestrator given no gate refuses
+  such a task rather than run it unreviewed.
+- **A crew that cannot run ends `failed`, `reason: invalid_dag`**, and sends `crew_completed`, where it went back to
+  `pending` and stayed there, so a subscriber waited on it for good. A submitted crew whose thread would not start
+  ends `failed`, `reason: not_started`, where it stayed `pending`. `agnosai_orchestrator_run_crew_err` still returns 0
+  and the error for a crew that could not run.
+- **`task_completed` arrives in completion order** within a parallel or DAG batch, as the Rust line's did, where it came
+  in dispatch order since 2.1.5. A crew's `results` stay in dispatch order.
+- **A subscriber that attaches mid-run is told about the tasks after it**, where it heard nothing until
+  `crew_completed`. The runner asks per task and per batch.
+
+### Added
+
+- **`seq` on every crew event**, from 1, assigned under the bus lock as the event goes out, so every subscriber sees one
+  order and a gap is a lost event. On the wire after `event_type`, and as the SSE frame's `id:`.
+  `agnosai_crew_event_seq`, `agnosai_event_sender_seq`.
+- **`reason`** on a crew's state and its `crew_completed`, when it did not complete: `task_failed`, `timeout`,
+  `cancelled`, `invalid_dag` or `not_started`. In `GET /api/v1/crews/{id}`, `POST /api/v1/crews` and the audit trail's
+  `crew_finished`. `agnosai_crew_state_reason`, `agnosai_crew_state_with_reason`, `agnosai_crew_reason_from_wire`.
+- **`risk` on `POST /api/v1/crews`'s tasks**: `low` (the default), `medium` or `high`, refused when it is anything else.
+  The Rust line's request had no such field, so no crew the server ran could need a reviewer.
+- **The `awaiting_approval` status**, for a task and for a crew (`AGNOSAI_STATUS_AWAITING_APPROVAL`,
+  `AGNOSAI_CREW_AWAITING_APPROVAL`; `AwaitingApproval` on the dashboard).
+- **Events:** `approval_requested` (the answer, its risk and agent), `approval_decided` (the decision and why:
+  `reviewer`, `timeout`, `cancelled`, `deadline`, `capacity`, `no_gate`), `tool_call_started` and `tool_call_completed`
+  (`ok`, `error` or `refused`).
+- **The orchestrator's gate:** `agnosai_orchestrator_approval_gate`, `agnosai_orchestrator_with_approval_gate`,
+  `agnosai_orchestrator_with_medium_approval`. The runner's: `agnosai_crew_runner_with_approval`,
+  `agnosai_crew_runner_approval_gate`, `agnosai_crew_runner_awaiting`. The gate's: `agnosai_approval_wait_until`, which
+  also ends on a cancel or a deadline and says why, and `agnosai_approval_request_to_value_a`.
+- **`approval` and `approval_reason`** in a reviewed task's result metadata, and **`approval_decided`** in the audit
+  trail.
+- **`tests/orch_lifecycle.tcyr`:** every crew it runs, in every mode and every way of ending, approvals and tool calls
+  included, is replayed through ADR 032's state machine, and refused for a `seq` gap, an illegal move, or an event after
+  `crew_completed`.
+- `agnosai_done_word_set_value` and `agnosai_done_word_wait_value`; `agnosai_task_result_with_status` and
+  `agnosai_task_result_with_output`.
+
+### Changed
+
+- **The server decides through the orchestrator's gate.** `src/main.cyr` minted a second gate for the app state, as the
+  Rust line did, so `POST /api/v1/approvals` decided for a gate no crew waited on.
+- **The sequential runner hands a task the sender only when someone is subscribed**, so an unwatched bus builds no
+  token, as a wave's workers already did not.
+- **ADR 022's decisions 1 and 6** are amended by ADR 032, which says so in a note on ADR 022.
+
+### Performance
+
+- **The interleaved A/B against a 2.3.8 build on the same `lib/`:** four rounds of `orch`, `server`, `core` and `tools`
+  at a mean load of 1.55, median +0.0% across 170 rows, 164 of them within 5%.
+- ⚠ **Not free: `orchestrator_new` 3.2 → 4.3 µs (+33.5%)**, every round. An orchestrator mints its own approval gate
+  now: a map, a vec and a mutex, once per orchestrator.
+- **`task_four_tool_calls_at_once` and `_kept` read −38%** (243.5 → 150.5 µs and 252.2 → 156.4 µs), and are not
+  claimed. Run alone, in a process of their own, both builds read about 250 µs, three runs each. They run last in
+  `benches/orch.bcyr`, so what moved is what the rows before them leave behind, the problem roadmap 2.7.1 is for.
+  `route_approvals_global` +10.1% has no change on its path either.
+
 ## [2.3.8] — 2026-11-12
 
 A process or Python tool whose policy denies the network loses it, and one request reads as one trace from a crew to the

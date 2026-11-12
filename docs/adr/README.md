@@ -55,8 +55,10 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [026](026-the-crew-registry-keeps-what-has-not-been-read.md) | The crew registry keeps what has not been read | Accepted |
 | [027](027-the-built-in-presets-are-an-example-library.md) | The built-in presets are an example library | Accepted |
 | [028](028-a-crew-lives-in-an-arena-its-consumer-gives-back.md) | A crew lives in an arena its consumer gives back | Accepted |
+| [029](029-the-tool-loop.md) | The tool loop: the model proposes, and agnosai disposes | Accepted |
 | [030](030-a-model-comes-from-the-gateways-catalog.md) | A model comes from the gateway's catalog, not from a name agnosai carries | Accepted |
 | [031](031-confine-the-process-and-python-tiers-in-agnosais-spawner.md) | Confine the process and Python tiers in agnosai's spawner, with kavach's primitives | Accepted |
+| [032](032-the-crew-lifecycle-is-one-state-machine.md) | The crew lifecycle is one state machine, numbered, with the approval gate in it | Accepted — shipped in 2.4.0 |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`). The headings are left as written — renumbering accepted

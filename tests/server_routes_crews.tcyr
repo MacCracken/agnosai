@@ -344,6 +344,21 @@ fn _t_task_req_rejections(): i64 {
     assert(agnosai_task_priority_from_wire(str_from("urgent")) == AGNOSAI_PRIORITY_NORMAL,
       "...even though from_wire on its own would answer Normal");
 
+    # **`risk`**, past the Rust line (2.4.0, ADR 032): validated as `priority` is.
+    var rk = agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"risk\":\"high\"}")));
+    assert(rk != 0, "a task may say its risk");
+    if (rk != 0) { assert_eq(agnosai_task_req_risk(rk), AGNOSAI_RISK_HIGH, "and high is high"); }
+    var rm = agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"risk\":\"medium\"}")));
+    if (rm != 0) { assert_eq(agnosai_task_req_risk(rm), AGNOSAI_RISK_MEDIUM, "medium is medium"); }
+    var rl = agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"risk\":\"low\"}")));
+    assert(rl != 0, "low is accepted");
+    var rn = agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\"}")));
+    assert_eq(agnosai_task_req_risk(rn), AGNOSAI_RISK_LOW, "and a task that says none is low");
+    assert(agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"risk\":\"extreme\"}"))) == 0,
+      "an unknown risk is rejected, NOT read as low");
+    assert(agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"risk\":2}"))) == 0,
+      "and a risk that is not a string");
+
     # `dependencies: Vec<usize>` — negatives and non-integers do not deserialize.
     assert(agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"dependencies\":[-1]}"))) == 0,
       "a negative dependency index is rejected");
@@ -449,6 +464,39 @@ fn _t_rbody_str(r, key): Str {
 # uppercase id passed the gate and then MISSED: a 404 for a crew that exists,
 # and no test saw it because every test echoed the id the server had just
 # returned.
+# A crew that did not complete says why, on POST and on GET (ADR 032). A gateway that refuses at
+# once fails the task, and one that completed says nothing.
+# A crew built from a request carries each task's risk into its spec (2.4.0).
+fn _t_spec_carries_risk(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"risky\",\"agents\":[{\"agent_key\":\"k\",\"name\":\"n\",");
+    str_builder_add_cstr(sb, "\"role\":\"r\",\"goal\":\"g\"}],\"tasks\":[{\"description\":\"a\",\"risk\":\"high\"},");
+    str_builder_add_cstr(sb, "{\"description\":\"b\"}]}");
+    var req = agnosai_crew_req_from_value(_t_parse(str_builder_build(sb)));
+    assert(req != 0, "a crew request with a risky task parses");
+    if (req == 0) { return 0; }
+    var spec = _agnosai_route_build_spec(req);
+    var ts = agnosai_crew_tasks(spec);
+    assert_eq(agnosai_task_risk(vec_get(ts, 0)), AGNOSAI_RISK_HIGH, "and its spec's task is high-risk");
+    assert_eq(agnosai_task_risk(vec_get(ts, 1)), AGNOSAI_RISK_LOW, "beside a low one");
+    return 0;
+}
+
+fn _t_crew_reason_on_the_wire(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    agnosai_orchestrator_with_llm_url(o, str_from("http://127.0.0.1:1"), str_from(""));
+    var r = agnosai_route_create_crew(_t_state_with(o), _t_valid_body());
+    assert(str_eq_cstr(_t_rbody_str(r, "status"), "failed") == 1, "a crew whose gateway refused fails");
+    assert(str_eq_cstr(_t_rbody_str(r, "reason"), "task_failed") == 1, "and POST says why");
+    var g = agnosai_route_get_crew(_t_state_with(o), _t_rbody_str(r, "crew_id"));
+    assert(str_eq_cstr(_t_rbody_str(g, "reason"), "task_failed") == 1, "and so does GET");
+
+    var ok = agnosai_route_create_crew(_t_state_with(agnosai_orchestrator_new(0)), _t_valid_body());
+    assert(str_eq_cstr(_t_rbody_str(ok, "status"), "completed") == 1, "a crew that completed");
+    assert_eq(bayan_json_v_obj_get_by_cstr(agnosai_route_body(ok), "reason"), 0, "has no reason key");
+    return 0;
+}
+
 fn _t_crew_id_is_case_insensitive(): i64 {
     var o = agnosai_orchestrator_new(0);
     var r = agnosai_route_create_crew(_t_state_with(o), _t_valid_body());
@@ -847,6 +895,8 @@ fn main(): i64 {
     sakshi_set_level(SK_FATAL);
 
     _t_crew_id_is_case_insensitive();
+    _t_crew_reason_on_the_wire();
+    _t_spec_carries_risk();
     _t_rejects_empty_name();
     _t_rejects_missing_tasks();
     _t_rejects_missing_agents();

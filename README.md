@@ -242,12 +242,12 @@ First-class multi-node support:
 ```
 $ cyrius test tests
 ...
-106 passed, 0 failed
+109 passed, 0 failed
 ```
 
 ```
 $ cyrius coverage --min 80
-Functions referenced: 1846/1857 (99%)  [reference coverage — a floor, not a correctness proof]
+Functions referenced: 1936/1946 (99%)  [reference coverage — a floor, not a correctness proof]
 ```
 
 Tests cover core types, orchestration (all 4 process modes), DAG cycle detection,

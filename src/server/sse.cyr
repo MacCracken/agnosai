@@ -59,12 +59,14 @@ var AGNOSAI_SSE_CHANNEL_CAPACITY = 256;
 # channel anyway, because refusing one would silently blind a running crew.
 var AGNOSAI_SSE_MAX_EVENT_CHANNELS = 10000;
 
-# CrewEvent — one progress event for one crew.
+# CrewEvent — one progress event for one crew. `SEQ` is its number among the events its crew's
+# sender delivered, from 1, or 0 for one no sender delivered (ADR 032).
 enum AgnosaiCrewEventOff {
     AGN_CE_CREW_ID = 0;
     AGN_CE_EVENT_TYPE = 8;
     AGN_CE_DATA = 16;
-    AGN_SSE_EVENT_SIZE = 24;
+    AGN_CE_SEQ = 24;
+    AGN_SSE_EVENT_SIZE = 32;
 }
 
 # The crew that emitted the event.
@@ -82,6 +84,13 @@ fn agnosai_crew_event_data(e): i64 {
     return load64(e + AGN_CE_DATA);
 }
 
+# The event's number among those its crew's sender delivered: 1 for the first, and one more for
+# each after it, so a gap is an event this subscriber's ring dropped. 0 for one no sender
+# delivered, such as the stream's `connected` (ADR 032).
+fn agnosai_crew_event_seq(e): i64 {
+    return load64(e + AGN_CE_SEQ);
+}
+
 # Build an event.
 fn agnosai_crew_event_new(crew_id: Str, event_type: Str, data): i64 {
     return agnosai_crew_event_new_a(default_alloc(), crew_id, event_type, data);
@@ -93,19 +102,24 @@ fn agnosai_crew_event_new_a(a, crew_id: Str, event_type: Str, data): i64 {
     store64(e + AGN_CE_CREW_ID, crew_id);
     store64(e + AGN_CE_EVENT_TYPE, event_type);
     store64(e + AGN_CE_DATA, data);
+    store64(e + AGN_CE_SEQ, 0);
     return e;
 }
 
 # The event as a JSON value, in the struct's field order.
 #
-# All three fields are unconditional — the oracle has no `skip_serializing_if`
+# The oracle's three fields are unconditional — it has no `skip_serializing_if`
 # here, so a null payload serialises as `"data":null` rather than vanishing.
+# `seq` follows `event_type` for every event a sender delivered, and is left out
+# for one none did (ADR 032). The Rust line had no `seq`.
 fn agnosai_crew_event_to_value(e): i64 {
     var obj = bayan_json_v_obj_new();
     bayan_json_v_obj_set(obj, str_from("crew_id"),
       bayan_json_v_str_new(load64(e + AGN_CE_CREW_ID)));
     bayan_json_v_obj_set(obj, str_from("event_type"),
       bayan_json_v_str_new(load64(e + AGN_CE_EVENT_TYPE)));
+    var seq = load64(e + AGN_CE_SEQ);
+    if (seq > 0) { bayan_json_v_obj_set(obj, str_from("seq"), bayan_json_v_int_new(seq)); }
     var data = load64(e + AGN_CE_DATA);
     if (data == 0) { data = bayan_json_v_null(); }
     bayan_json_v_obj_set(obj, str_from("data"), data);
@@ -195,7 +209,9 @@ enum AgnosaiEventSenderOff {
     AGN_ES_MUTEX = 8;
     # The allocator the sender and its subscriber list are in (ADR 028).
     AGN_ES_ALLOC = 16;
-    AGN_ES_SIZE = 24;
+    # The `seq` of the last event this sender delivered, 0 before the first (ADR 032).
+    AGN_ES_SEQ = 24;
+    AGN_ES_SIZE = 32;
 }
 
 # Create a sender bound to a bus's lock.
@@ -204,7 +220,17 @@ fn _agnosai_event_sender_new_a(a, mtx): i64 {
     store64(tx + AGN_ES_SUBS, vec_new_a(a));
     store64(tx + AGN_ES_MUTEX, mtx);
     store64(tx + AGN_ES_ALLOC, a);
+    store64(tx + AGN_ES_SEQ, 0);
     return tx;
+}
+
+# The `seq` of the last event this sender delivered, or 0 before the first.
+fn agnosai_event_sender_seq(tx): i64 {
+    var mtx = load64(tx + AGN_ES_MUTEX);
+    mutex_lock(mtx);
+    var n = load64(tx + AGN_ES_SEQ);
+    mutex_unlock(mtx);
+    return n;
 }
 
 # How many subscribers this sender feeds.
@@ -266,11 +292,21 @@ fn agnosai_event_sender_unsubscribe(tx, sub): i64 {
 # A subscriber whose ring is full loses its oldest event and has its lag count
 # raised. Nothing here can block, which is the whole point: a crew must not be
 # held up by a browser that stopped reading.
+#
+# ⚠ **`seq` is assigned here, under the bus lock, as the event goes out** (ADR 032), so every
+# subscriber sees the crew's events in one order and numbered without a gap, whichever thread
+# sent them. An event that reaches nobody takes no number: a subscriber that attaches next sees
+# the count go on from the last event anyone received.
 fn agnosai_event_sender_send(tx, event): i64 {
     var mtx = load64(tx + AGN_ES_MUTEX);
     mutex_lock(mtx);
     var subs = load64(tx + AGN_ES_SUBS);
     var n = vec_len(subs);
+    if (n > 0) {
+        var seq = load64(tx + AGN_ES_SEQ) + 1;
+        store64(tx + AGN_ES_SEQ, seq);
+        store64(event + AGN_CE_SEQ, seq);
+    }
     for (var i = 0; i < n; i = i + 1) {
         var sub = vec_get(subs, i);
         # Both non-closed failure shapes mean this subscriber lost a message and

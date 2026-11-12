@@ -57,7 +57,11 @@ enum AgnosaiOrchestratorOff {
     # The registry agents get their tools from, and the journal, each 0 for none (ADR 029).
     AGN_OR_TOOLS = 80;
     AGN_OR_TOOL_JOURNAL = 88;
-    AGN_OR_SIZE = 96;
+    # The gate a task needing a reviewer waits on, or 0 for none, and whether `medium` risk needs
+    # one (ADR 032).
+    AGN_OR_GATE = 96;
+    AGN_OR_APPROVE_MEDIUM = 104;
+    AGN_OR_SIZE = 112;
 }
 
 # Create an orchestrator over a resource budget.
@@ -79,6 +83,31 @@ fn agnosai_orchestrator_new(budget): i64 {
     store64(o + AGN_OR_ENDED_HEAD, 0);
     store64(o + AGN_OR_TOOLS, 0);
     store64(o + AGN_OR_TOOL_JOURNAL, 0);
+    # Its own gate, as it has its own audit chain (ADR 032). The server's `/api/v1/approvals`
+    # decides through this one.
+    store64(o + AGN_OR_GATE, agnosai_approval_gate_new());
+    store64(o + AGN_OR_APPROVE_MEDIUM, 0);
+    return o;
+}
+
+# The gate this orchestrator's crews wait on for a reviewer, or 0 for none (ADR 032). Hand it to
+# whatever decides: `POST /api/v1/approvals` does, through the server's state.
+fn agnosai_orchestrator_approval_gate(o): i64 {
+    return load64(o + AGN_OR_GATE);
+}
+
+# Replace the approval gate, or remove it with 0. ⚠ **With none, a task that needs a reviewer
+# fails**, its answer withheld, as nothing can approve it. Read when a crew is registered.
+fn agnosai_orchestrator_with_approval_gate(o, gate): i64 {
+    store64(o + AGN_OR_GATE, gate);
+    return o;
+}
+
+# Make a `medium` task wait on a reviewer too, with 1. `high` always does, and `low` never.
+fn agnosai_orchestrator_with_medium_approval(o, on): i64 {
+    var v = 0;
+    if (on == 1) { v = 1; }
+    store64(o + AGN_OR_APPROVE_MEDIUM, v);
     return o;
 }
 
@@ -392,6 +421,8 @@ fn _agnosai_orch_register(o, spec): i64 {
     agnosai_crew_runner_with_audit(runner, load64(o + AGN_OR_AUDIT));
     agnosai_crew_runner_with_tools(runner, load64(o + AGN_OR_TOOLS),
       load64(o + AGN_OR_TOOL_JOURNAL));
+    agnosai_crew_runner_with_approval(runner, load64(o + AGN_OR_GATE),
+      load64(o + AGN_OR_APPROVE_MEDIUM));
 
     # The state and the cancel flag, published together. ⚠ A flag says a runner holds this
     # crew, and `cancel_crew` and `forget_crew` both go by it, so there can be no moment with
@@ -399,8 +430,10 @@ fn _agnosai_orch_register(o, spec): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
     var evicted = _agnosai_orch_evict_locked(o);
-    map_set(load64(o + AGN_OR_CREWS), str_clone_a(a, crew_id),
-      agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_PENDING));
+    var registered = agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_PENDING);
+    # The runner moves this state's status while a task awaits a reviewer (ADR 032).
+    _agnosai_crew_runner_with_state(runner, registered);
+    map_set(load64(o + AGN_OR_CREWS), str_clone_a(a, crew_id), registered);
     map_set(load64(o + AGN_OR_CANCEL), str_clone_a(a, crew_id),
       agnosai_crew_runner_cancel_flag(runner));
     mutex_unlock(mtx);
@@ -487,7 +520,34 @@ fn _agnosai_orch_timeout_state_a(a, crew_id: Str, timeout_secs): i64 {
         sakshi_log_kv(SK_WARN, str_data(m), str_len(m),
           "crew_id", 7, str_data(crew_id), str_len(crew_id));
     }
-    return agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_FAILED);
+    return agnosai_crew_state_with_reason(agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_FAILED),
+      AGNOSAI_CREW_REASON_TIMEOUT);
+}
+
+# Audit `crew_finished` for `state`, when a chain is attached. Built on the global heap, owning its
+# strings, as the entry outlives a crew in an arena (see `_agnosai_orch_register`).
+fn _agnosai_orch_audit_finished(o, crew_id: Str, crew_name: Str, state): i64 {
+    if (load64(o + AGN_OR_AUDIT) == 0) { return 0; }
+    var status = agnosai_crew_state_status(state);
+    var profile = agnosai_crew_state_profile(state);
+    var wall_ms = 0;
+    var cost = 0;
+    if (profile != 0) {
+        wall_ms = agnosai_crew_profile_wall_ms(profile);
+        cost = agnosai_crew_profile_cost_micro_usd(profile);
+    }
+    var finished = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(finished, str_from("crew_id"), bayan_json_v_str_new(str_clone(crew_id)));
+    bayan_json_v_obj_set(finished, str_from("status"),
+      bayan_json_v_str_new(agnosai_crew_status_to_wire(status)));
+    var reason = agnosai_crew_state_reason(state);
+    if (reason != 0) { bayan_json_v_obj_set(finished, str_from("reason"), bayan_json_v_str_new(reason)); }
+    bayan_json_v_obj_set(finished, str_from("task_count"),
+      bayan_json_v_int_new(vec_len(agnosai_crew_state_results(state))));
+    bayan_json_v_obj_set(finished, str_from("wall_ms"), bayan_json_v_int_new(wall_ms));
+    bayan_json_v_obj_set(finished, str_from("cost_micro_usd"), bayan_json_v_int_new(cost));
+    return _agnosai_orch_audit(o, str_from("crew_finished"), _agnosai_orch_level_for(status),
+      crew_name, finished);
 }
 
 fn _agnosai_orch_finish(o, runner, crew_id: Str, crew_name: Str): i64 {
@@ -536,54 +596,28 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
         state = _agnosai_orch_timeout_state_a(a, crew_id, timeout_secs);
     }
 
-    # A cyclic DAG errors out. The oracle's `?` propagates it, so no state is
-    # stored and no `crew_finished` is audited — the crew never ran.
+    # A crew that could not run: its tasks form a cycle, or depend on one the spec does not hold.
+    # The caller of `run_crew_err` still gets 0 and the error, as no crew ran (ADR 032).
+    #
+    # ⚠ **It ends FAILED, with its reason, and its channel closes** (ADR 032). Through 2.3.8 this
+    # arm put PENDING back (ADR 022, decision 6) and stored nothing, so a submitted crew read
+    # `pending` for good and a subscriber waited on it for good. A cancel that landed first stands,
+    # as a terminal state never changes.
+    var never_ran = 0;
     if (state == 0) {
-        # Hand the caller the reason, not just the failure.
         if (out_err != 0) { store64(out_err, load64(&run_err)); }
+        never_ran = 1;
+        state = agnosai_crew_state_with_reason(agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_FAILED),
+          AGNOSAI_CREW_REASON_INVALID_DAG);
         mutex_lock(mtx);
-        # ⚠ Put PENDING back (ADR 022). This arm stores no terminal state, so a
-        # RUNNING left here would read "running" forever — and RUNNING is not
-        # terminal, so `_agnosai_orch_evict_locked` would never evict it either.
-        # PENDING is exactly what this arm left before RUNNING was stored. Only
-        # from RUNNING, so a cancel that landed mid-run stands.
-        _agnosai_orch_advance_locked(o, crew_id, AGNOSAI_CREW_RUNNING, AGNOSAI_CREW_PENDING);
-        map_delete(load64(o + AGN_OR_CANCEL), crew_id);
-        # A cancel that landed mid-run left it CANCELLED, and left the queueing to this finish.
-        # A crew back at PENDING is not queued, as it is not over: it can only be forgotten.
-        var left = map_get(load64(o + AGN_OR_CREWS), crew_id);
-        if (left != 0) {
-            if (_agnosai_orch_is_finished(left) == 1) { _agnosai_orch_note_ended_locked(o, left); }
+        var held = map_get(load64(o + AGN_OR_CREWS), crew_id);
+        if (held != 0) {
+            if (agnosai_crew_state_status(held) == AGNOSAI_CREW_CANCELLED) { state = held; }
         }
         mutex_unlock(mtx);
-        atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
-        return 0;
     }
 
-    var status = agnosai_crew_state_status(state);
-    var profile = agnosai_crew_state_profile(state);
-    var wall_ms = 0;
-    var cost = 0;
-    if (profile != 0) {
-        wall_ms = agnosai_crew_profile_wall_ms(profile);
-        cost = agnosai_crew_profile_cost_micro_usd(profile);
-    }
-
-    # See `_agnosai_orch_register`: built only for a chain, on the global heap, owning
-    # its strings, as the entry outlives a crew in an arena.
-    if (load64(o + AGN_OR_AUDIT) != 0) {
-        var finished = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(finished, str_from("crew_id"),
-          bayan_json_v_str_new(str_clone(crew_id)));
-        bayan_json_v_obj_set(finished, str_from("status"),
-          bayan_json_v_str_new(agnosai_crew_status_to_wire(status)));
-        bayan_json_v_obj_set(finished, str_from("task_count"),
-          bayan_json_v_int_new(vec_len(agnosai_crew_state_results(state))));
-        bayan_json_v_obj_set(finished, str_from("wall_ms"), bayan_json_v_int_new(wall_ms));
-        bayan_json_v_obj_set(finished, str_from("cost_micro_usd"), bayan_json_v_int_new(cost));
-        _agnosai_orch_audit(o, str_from("crew_finished"), _agnosai_orch_level_for(status),
-          crew_name, finished);
-    }
+    _agnosai_orch_audit_finished(o, crew_id, crew_name, state);
 
     mutex_lock(mtx);
     map_set(load64(o + AGN_OR_CREWS), str_clone_a(a, crew_id), state);
@@ -592,6 +626,10 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
     mutex_unlock(mtx);
 
     if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
+    if (never_ran == 1) {
+        atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
+        return 0;
+    }
     # ⚠ **The run's last touch of the crew**, on either exit. Once this lands a release may
     # scrub the spec, its id and its runner, and the caller has only pointers left to return.
     atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
@@ -645,6 +683,19 @@ fn _agnosai_orch_abandon(o, crew_id: Str): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
     map_delete(load64(o + AGN_OR_CANCEL), crew_id);
+    # ⚠ **It ends FAILED, `not_started`** (ADR 032): it was left PENDING through 2.3.8, a state
+    # nothing would ever move. Only from PENDING, so a cancel that landed first stands. It is
+    # queued as ended, so eviction can take it.
+    var state = map_get(load64(o + AGN_OR_CREWS), crew_id);
+    if (state != 0) {
+        if (agnosai_crew_state_status(state) == AGNOSAI_CREW_PENDING) {
+            agnosai_crew_state_with_reason(state, AGNOSAI_CREW_REASON_NOT_STARTED);
+            atomic_fence();
+            agnosai_crew_state_with_status(state, AGNOSAI_CREW_FAILED);
+        }
+        # A cancel that landed first left the queueing to a finish there will not be.
+        if (_agnosai_orch_is_finished(state) == 1) { _agnosai_orch_note_ended_locked(o, state); }
+    }
     mutex_unlock(mtx);
     var bus = load64(o + AGN_OR_EVENTS);
     if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
@@ -660,9 +711,10 @@ fn _agnosai_orch_abandon(o, crew_id: Str): i64 {
 # the terminal status. All are existing wire values (`agnosai_crew_status_to_wire`),
 # so a polling client sees no new spelling.
 #
-# **Returns 0 if the thread cannot be created**, leaving the crew PENDING and
-# unexecuted rather than reporting a run that never started. Nothing holds it then
-# (`_agnosai_orch_abandon`), so a consumer can cancel it or forget it.
+# **Returns 0 if the thread cannot be created**, and the crew ends FAILED with
+# reason `not_started`, rather than reporting a run that never started (ADR 032; it
+# was left PENDING through 2.3.8). Nothing holds it then (`_agnosai_orch_abandon`),
+# so a consumer can forget it.
 #
 # ✅ **The thread is detached, and it leaks nothing.** This used to call
 # `thread_create` and never join, stranding 2 MiB of stack and 4 KiB of TLS per
@@ -732,6 +784,9 @@ fn agnosai_orchestrator_cancel_crew(o, crew_id: Str): i64 {
     }
     var flag = map_get(load64(o + AGN_OR_CANCEL), crew_id);
     if (flag != 0) { store64(flag, 1); }
+    # The reason first, so a reader that sees CANCELLED sees why as well.
+    agnosai_crew_state_with_reason(state, AGNOSAI_CREW_REASON_CANCELLED);
+    atomic_fence();
     agnosai_crew_state_with_status(state, AGNOSAI_CREW_CANCELLED);
     # With no flag nothing is running this crew, so no finish will queue it, and without this
     # it could never be evicted. A crew with a flag is queued when its runner stops.
@@ -761,8 +816,8 @@ fn agnosai_orchestrator_cancel_crew(o, crew_id: Str): i64 {
 # does not mean it has stopped. Forgetting that crew would not stick: its runner stores the
 # final state on the way out, and the crew would come back with nobody left to forget it. The
 # flag goes under this same lock as the final state lands, so "no flag" means the state here is
-# final. A crew left PENDING with no flag never ran (a cyclic DAG, or a thread that would not
-# start), and may be forgotten. This all holds for one run of an id at a time: overlapping runs
+# final. A crew that never ran (a cyclic DAG, or a thread that would not start) ends FAILED with
+# no flag since 2.4.0 (ADR 032), and may be forgotten. This all holds for one run of an id at a time: overlapping runs
 # of one id have always shared an entry and a flag, and the first to end takes both.
 #
 # A crew's event channel is removed after its final state is stored, so a consumer that waits

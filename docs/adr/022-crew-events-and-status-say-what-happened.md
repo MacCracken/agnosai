@@ -2,6 +2,12 @@
 
 ## Status: Accepted (2026-10-04), shipped in 2.1.5. Proposed 2026-10-03.
 
+Note (2.4.0): [ADR 032](032-the-crew-lifecycle-is-one-state-machine.md) builds the lifecycle this ADR left to F3, and
+changes three of its decisions. Decision 1's `task_completed` goes out in completion order, the oracle's, not dispatch
+order. Decision 6's run-error arm no longer puts PENDING back: a crew that cannot run ends FAILED with `reason:
+invalid_dag`, and its subscriber gets `crew_completed`, which decides "the crew never ran" as a failed run. And the
+event `seq`, the `awaiting_approval` state and `crew_completed`'s `reason`, listed below as out of scope, are its.
+
 Note (2026-10-04, 2.1.6): two places this ADR's rule had not reached, both found
 by agnostic 0.1.14's review. (1) Decision 6 says `POST /api/v1/crews` "reaches
 neither" error arm. It reached the deadlock arm: a `dag` crew with a failed

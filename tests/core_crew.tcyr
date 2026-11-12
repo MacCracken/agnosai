@@ -71,6 +71,43 @@ fn _t_crew_json_keys_are_hoisted(): i64 {
     return 0;
 }
 
+# Why a crew did not complete, on its state and on the wire (ADR 032): omitted when there is none,
+# carried through a round trip, and only ever one of the fixed words.
+fn _t_crew_state_reason(): i64 {
+    var ok = agnosai_crew_state_new(str_from("id-r1"), AGNOSAI_CREW_COMPLETED);
+    assert_eq(agnosai_crew_state_reason(ok), 0, "a new state has no reason");
+    assert_eq(str_contains_cstr(bayan_json_v_build(agnosai_crew_state_to_value(ok)), "reason"), 0,
+      "and its JSON has no reason key, as profile is left out when unset");
+
+    var bad = agnosai_crew_state_with_reason(
+      agnosai_crew_state_new(str_from("00000000-0000-4000-8000-0000000000aa"), AGNOSAI_CREW_FAILED),
+      AGNOSAI_CREW_REASON_TIMEOUT);
+    var js = bayan_json_v_build(agnosai_crew_state_to_value(bad));
+    assert(str_contains_cstr(js, "\"status\":\"failed\",\"reason\":\"timeout\"") == 1,
+      "a failed state's JSON says why, right after its status");
+    var back = agnosai_crew_state_from_value(bayan_json_v_parse(js));
+    assert(back != 0, "and parses back");
+    assert_eq(agnosai_crew_state_reason(back), AGNOSAI_CREW_REASON_TIMEOUT,
+      "to the same reason word, the process's own Str and not a copy");
+
+    var odd_js = str_cat(str_from("{\"crew_id\":\"00000000-0000-4000-8000-0000000000ab\","),
+      str_from("\"status\":\"failed\",\"reason\":\"gremlins\",\"results\":[]}"));
+    var odd = agnosai_crew_state_from_value(bayan_json_v_parse(odd_js));
+    assert(odd != 0, "a state with a reason nobody spells still parses");
+    assert_eq(agnosai_crew_state_reason(odd), 0, "with no reason, rather than one nothing defines");
+
+    assert_eq(agnosai_crew_reason_from_wire(str_from("task_failed")), AGNOSAI_CREW_REASON_TASK_FAILED,
+      "each word parses: task_failed");
+    assert_eq(agnosai_crew_reason_from_wire(str_from("cancelled")), AGNOSAI_CREW_REASON_CANCELLED,
+      "cancelled");
+    assert_eq(agnosai_crew_reason_from_wire(str_from("invalid_dag")), AGNOSAI_CREW_REASON_INVALID_DAG,
+      "invalid_dag");
+    assert_eq(agnosai_crew_reason_from_wire(str_from("not_started")), AGNOSAI_CREW_REASON_NOT_STARTED,
+      "not_started");
+    assert_eq(agnosai_crew_reason_from_wire(str_from("timeout")), AGNOSAI_CREW_REASON_TIMEOUT, "timeout");
+    return 0;
+}
+
 # The wire **values** are hoisted the same way the keys are, and need the same
 # exact assertion for the same reason: a status spelling re-minted per call is
 # one 16-byte allocation, invisible to any byte bound, and the only difference
@@ -348,6 +385,7 @@ fn main() {
     assert_eq(str_eq(bayan_json_v_build(_agnosai_int_map_to_value_a(cw_ar, cw_im)),
         bayan_json_v_build(_agnosai_int_map_to_value(cw_im))), 1, "int_map_to_value_a agrees");
     _t_crew_json_keys_are_hoisted();
+    _t_crew_state_reason();
     _t_wire_values_are_hoisted();
 
     # ⚠ **Three CrewProfile fields are required**, not defaulted: `wall_ms`,

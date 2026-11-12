@@ -84,7 +84,19 @@ var AGNOSAI_SSE_KEEPALIVE_FRAME = ":ping\n\n";
 # JSON, which escapes them, so the multi-line `data:` continuation the SSE spec
 # allows is unreachable and deliberately not implemented.
 fn _agnosai_sse_frame(a, cfd, name: Str, payload: Str): i64 {
+    return _agnosai_sse_frame_seq(a, cfd, name, payload, 0);
+}
+
+# `_agnosai_sse_frame` with an `id:` line carrying `seq` when it is above 0 (ADR 032), which a
+# browser's `EventSource` reports as `lastEventId`. The Rust line sent no `id:`. Nothing is
+# replayed from it on a reconnect, as the bus keeps no history.
+fn _agnosai_sse_frame_seq(a, cfd, name: Str, payload: Str, seq): i64 {
     var sb = str_builder_new_a(a);
+    if (seq > 0) {
+        str_builder_add_cstr_a(a, sb, "id: ");
+        str_builder_add_int_a(a, sb, seq);
+        str_builder_add_cstr_a(a, sb, "\n");
+    }
     str_builder_add_cstr_a(a, sb, "event: ");
     str_builder_add_a(a, sb, name);
     str_builder_add_cstr_a(a, sb, "\ndata: ");
@@ -238,7 +250,7 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
                 str_builder_add_cstr_a(fa, fb, "\",\"error\":\"serialization failed\"}");
                 j = str_builder_build_a(fa, fb);
             }
-            _agnosai_sse_frame(fa, cfd, etype, j);
+            _agnosai_sse_frame_seq(fa, cfd, etype, j, agnosai_crew_event_seq(e));
             last_ping = clock_epoch_secs();
         } else {
             # Empty. `chan_try_recv` cannot tell empty from closed, so the

@@ -56,6 +56,7 @@ include "src/tools/registry.cyr"
 include "src/tool_call.cyr"
 include "src/tool_loop.cyr"
 include "src/model_catalog.cyr"
+include "src/orchestrator/approval.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "src/crew_arena.cyr"
 include "src/orchestrator/orchestrator.cyr"
@@ -202,15 +203,19 @@ fn _t_live_crews_stay(): i64 {
     return 0;
 }
 
-# A crew nothing is running must not be immortal for it.
-fn _t_cancelled_unrun_is_evictable(): i64 {
+# A crew that could not run must not be immortal for it. Since 2.4.0 it ends FAILED, and its
+# end queues it, as any crew's does (ADR 032).
+fn _t_unrun_is_evictable(): i64 {
     var o = agnosai_orchestrator_new(_t_budget());
     var cyc = _t_cyclic();
     var cyc_id = agnosai_crew_id(cyc);
     assert_eq(agnosai_orchestrator_run_crew(o, cyc), 0, "a cyclic crew does not run");
-    assert_eq(_t_queued(o), 0, "so it has ended nothing, and nothing is queued");
-    assert_eq(agnosai_orchestrator_cancel_crew(o, cyc_id), 0, "it can still be cancelled");
-    assert_eq(_t_queued(o), 1, "and nothing else will end it, so the cancel queues it");
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, cyc_id)), AGNOSAI_CREW_FAILED,
+      "it ends FAILED");
+    assert_eq(_t_queued(o), 1, "and its end queues it");
+    assert(agnosai_orchestrator_cancel_crew(o, cyc_id) != 0,
+      "so it can no longer be cancelled: a terminal state does not change");
+    assert_eq(_t_queued(o), 1, "and the refused cancel queues nothing twice");
     _t_run_many(o, 999, 0);
     agnosai_orchestrator_run_crew(o, _t_spec("past the cap"));
     assert_eq(agnosai_orchestrator_crew(o, cyc_id), 0, "as the oldest, it is evicted first");
@@ -246,24 +251,33 @@ fn _t_abandoned(): i64 {
     var id = agnosai_crew_id(spec);
     _agnosai_orch_register(o, spec);
     assert(agnosai_orchestrator_forget_crew(o, id) != 0, "a registered crew counts as held");
+    var queued = _t_queued(o);
     _agnosai_orch_abandon(o, id);
-    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, id)), AGNOSAI_CREW_PENDING,
-      "an abandoned crew stays PENDING, as submit_crew documents");
+    var left = agnosai_orchestrator_crew(o, id);
+    assert_eq(agnosai_crew_state_status(left), AGNOSAI_CREW_FAILED,
+      "an abandoned crew ends FAILED, not PENDING for good (ADR 032)");
+    assert(str_eq_cstr(agnosai_crew_state_reason(left), "not_started") == 1, "saying it did not start");
+    assert_eq(_t_queued(o), queued + 1, "and is queued, so it can be evicted");
     assert_eq(map_get(load64(o + AGN_OR_CANCEL), id), 0, "with no flag to say a runner holds it");
     assert_eq(agnosai_event_bus_has(bus, id), 0, "and no channel left open for it");
-    assert_eq(agnosai_orchestrator_forget_crew(o, id), 0, "so a consumer can forget it");
+    assert(agnosai_orchestrator_cancel_crew(o, id) != 0, "it cannot be cancelled, being over");
+    assert_eq(agnosai_orchestrator_forget_crew(o, id), 0, "and a consumer can forget it");
 
-    var c = _t_spec("never started, then cancelled");
+    # Cancelled before the thread failed: the cancel stands, and left the queueing to a finish
+    # there will not be, so the abandon does it.
+    var c = _t_spec("cancelled, then never started");
     _agnosai_orch_register(o, c);
-    _agnosai_orch_abandon(o, agnosai_crew_id(c));
+    assert_eq(agnosai_orchestrator_cancel_crew(o, agnosai_crew_id(c)), 0, "a held crew is cancelled");
     var before = _t_queued(o);
-    assert_eq(agnosai_orchestrator_cancel_crew(o, agnosai_crew_id(c)), 0, "or cancel it");
-    assert_eq(_t_queued(o), before + 1, "which queues it, so it can be evicted");
+    _agnosai_orch_abandon(o, agnosai_crew_id(c));
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, agnosai_crew_id(c))),
+      AGNOSAI_CREW_CANCELLED, "and stays CANCELLED");
+    assert_eq(_t_queued(o), before + 1, "and is queued, so it can be evicted");
     return 0;
 }
 
-# A cyclic crew cancelled while its run fails: the failure stores no final state, and until 2.2.4
-# nothing queued it. The cancel saw a runner, so it left the queueing to the finish.
+# A cyclic crew cancelled while its run fails: until 2.2.4 nothing queued it. The cancel saw a
+# runner, so it left the queueing to the finish, and the cancel stands (ADR 032).
 fn _t_cancelled_while_failing(): i64 {
     var o = agnosai_orchestrator_new(_t_budget());
     var cyc = _t_cyclic();
@@ -273,6 +287,8 @@ fn _t_cancelled_while_failing(): i64 {
     assert_eq(_t_queued(o), 0, "a cancel leaves a held crew to its runner");
     assert_eq(_agnosai_orch_finish_err(o, runner, id, agnosai_crew_name(cyc), 0), 0,
       "the run fails with no state");
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, id)), AGNOSAI_CREW_CANCELLED,
+      "the cancel stands: the failure does not overwrite it");
     assert_eq(_t_queued(o), 1, "and the crew is queued all the same, CANCELLED and over");
     _t_run_many(o, 999, 0);
     agnosai_orchestrator_run_crew(o, _t_spec("past the cap"));
@@ -437,7 +453,7 @@ fn main() {
     _t_oldest_first();
     _t_order_is_end_time();
     _t_live_crews_stay();
-    _t_cancelled_unrun_is_evictable();
+    _t_unrun_is_evictable();
     _t_window_ignores_running();
     _t_abandoned();
     _t_cancelled_while_failing();

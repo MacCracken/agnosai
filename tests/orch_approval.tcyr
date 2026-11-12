@@ -203,6 +203,43 @@ fn main() {
         str_from("\"agent\":null")) == 1,
       "and serialises as null, since the field has no skip_serializing_if");
 
+    # --- 2.4.0 (ADR 032): a wait that ends on a cancel or a deadline, and says why ---
+    var wg = agnosai_approval_gate_with_timeout(5000);
+    var flag = alloc(8);
+    store64(flag, 1);
+    var why: i64[1];
+    store64(&why, 0);
+    var wch = agnosai_approval_request(wg, str_from("w-cancel"));
+    assert_eq(agnosai_approval_wait_until(wg, wch, str_from("w-cancel"), flag, 0, &why),
+      AGNOSAI_APPROVAL_REJECTED, "a crew already cancelled rejects at once");
+    assert_eq(load64(&why), AGNOSAI_APPROVAL_REASON_CANCELLED, "saying cancelled");
+    assert_eq(agnosai_approval_gate_pending_count(wg), 0, "and withdraws the request");
+    store64(flag, 0);
+    var dch = agnosai_approval_request(wg, str_from("w-deadline"));
+    assert_eq(agnosai_approval_wait_until(wg, dch, str_from("w-deadline"), flag, clock_now_ns() - 1, &why),
+      AGNOSAI_APPROVAL_REJECTED, "a deadline already passed rejects at once");
+    assert_eq(load64(&why), AGNOSAI_APPROVAL_REASON_DEADLINE, "saying deadline");
+    var ach = agnosai_approval_request(wg, str_from("w-yes"));
+    agnosai_approval_submit_decision(wg, str_from("w-yes"), AGNOSAI_APPROVAL_APPROVED);
+    assert_eq(agnosai_approval_wait_until(wg, ach, str_from("w-yes"), flag, 0, &why),
+      AGNOSAI_APPROVAL_APPROVED, "a decision already in is returned");
+    assert_eq(load64(&why), AGNOSAI_APPROVAL_REASON_REVIEWER, "saying the reviewer made it");
+    assert_eq(agnosai_approval_wait_until(wg, 0, str_from("w-full"), flag, 0, &why), AGNOSAI_APPROVAL_REJECTED,
+      "a gate at capacity handed back no channel, which rejects");
+    assert_eq(load64(&why), AGNOSAI_APPROVAL_REASON_CAPACITY, "saying capacity");
+    var tg = agnosai_approval_gate_with_timeout(10);
+    var tch = agnosai_approval_request(tg, str_from("w-late"));
+    assert_eq(agnosai_approval_wait_until(tg, tch, str_from("w-late"), 0, 0, &why), AGNOSAI_APPROVAL_REJECTED,
+      "nobody answering rejects when the gate's wait runs out");
+    assert_eq(load64(&why), AGNOSAI_APPROVAL_REASON_TIMEOUT, "saying timeout");
+
+    var ar = arena_allocator(4096);
+    var areq = agnosai_approval_request_new(str_from("t-a"), str_from("out"), AGNOSAI_RISK_HIGH, str_from("k"));
+    var av_before = alloc_used();
+    var av = agnosai_approval_request_to_value_a(ar, areq);
+    assert_eq(alloc_used() - av_before, 0, "the request's JSON in an arena keeps nothing on the global heap");
+    assert(str_eq(bayan_json_v_build(av), bayan_json_v_build(agnosai_approval_request_to_value(areq))) == 1,
+      "and is the bare form's, byte for byte");
     return assert_summary();
 }
 

@@ -50,6 +50,15 @@ var AGNOSAI_APPROVAL_REJECTED = 0;
 # The reviewer approved the result.
 var AGNOSAI_APPROVAL_APPROVED = 1;
 
+# Why a decision is what it is (ADR 032), each minted once for the process. Only `reviewer`
+# can approve; every other reason is a rejection, as every failure mode is here.
+var AGNOSAI_APPROVAL_REASON_REVIEWER = str_from("reviewer");
+var AGNOSAI_APPROVAL_REASON_TIMEOUT = str_from("timeout");
+var AGNOSAI_APPROVAL_REASON_CANCELLED = str_from("cancelled");
+var AGNOSAI_APPROVAL_REASON_DEADLINE = str_from("deadline");
+var AGNOSAI_APPROVAL_REASON_CAPACITY = str_from("capacity");
+var AGNOSAI_APPROVAL_REASON_NO_GATE = str_from("no_gate");
+
 # A decision's wire spelling. `serde(rename_all = "snake_case")` on a unit-only
 # enum emits the bare variant name.
 fn agnosai_approval_decision_to_wire(decision): i64 {
@@ -117,18 +126,24 @@ fn agnosai_approval_request_agent(r): i64 {
 # `agent` is `Option<String>` with no `skip_serializing_if`, so it emits as null
 # when absent rather than being omitted.
 fn agnosai_approval_request_to_value(r): i64 {
-    var obj = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(obj, str_from("task_id"),
-      bayan_json_v_str_new(load64(r + AGN_AR_TASK_ID)));
-    bayan_json_v_obj_set(obj, str_from("output"),
-      bayan_json_v_str_new(load64(r + AGN_AR_OUTPUT)));
-    bayan_json_v_obj_set(obj, str_from("risk"),
-      bayan_json_v_str_new(agnosai_task_risk_to_wire(load64(r + AGN_AR_RISK))));
+    return agnosai_approval_request_to_value_a(default_alloc(), r);
+}
+
+# `agnosai_approval_request_to_value`, in allocator `a`: the payload of a crew's
+# `approval_requested` event, in the crew's (ADR 032).
+fn agnosai_approval_request_to_value_a(a, r): i64 {
+    var obj = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "task_id"),
+      bayan_json_v_str_new_a(a, load64(r + AGN_AR_TASK_ID)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "output"),
+      bayan_json_v_str_new_a(a, load64(r + AGN_AR_OUTPUT)));
+    bayan_json_v_obj_set_a(a, obj, str_from_a(a, "risk"),
+      bayan_json_v_str_new_a(a, agnosai_task_risk_to_wire_a(a, load64(r + AGN_AR_RISK))));
     var agent = load64(r + AGN_AR_AGENT);
     if (agent == 0) {
-        bayan_json_v_obj_set(obj, str_from("agent"), bayan_json_v_null());
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "agent"), bayan_json_v_null_a(a));
     } else {
-        bayan_json_v_obj_set(obj, str_from("agent"), bayan_json_v_str_new(agent));
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "agent"), bayan_json_v_str_new_a(a, agent));
     }
     return obj;
 }
@@ -313,13 +328,45 @@ fn agnosai_approval_cancel(g, task_id: Str): i64 {
 # decision arriving afterwards is answered "no pending approval" rather than
 # being delivered to nobody.
 fn agnosai_approval_wait_for_decision(g, ch, task_id: Str): i64 {
+    return agnosai_approval_wait_until(g, ch, task_id, 0, 0, 0);
+}
+
+# `agnosai_approval_wait_for_decision`, also giving up when the word at `cancelled` turns
+# non-zero or the monotonic `deadline_ns` passes, each 0 for none (ADR 032): a crew that is
+# cancelled, or out of time, does not leave a task waiting on its reviewer. Either withdraws the
+# request, so a decision arriving after is answered "no pending approval". The reason goes
+# through `out_reason` when it is not 0: one of the `AGNOSAI_APPROVAL_REASON_*` words.
+fn agnosai_approval_wait_until(g, ch, task_id: Str, cancelled, deadline_ns, out_reason): i64 {
+    if (out_reason != 0) { store64(out_reason, AGNOSAI_APPROVAL_REASON_CAPACITY); }
     # A gate at capacity handed back 0; that is already a rejection.
     if (ch == 0) { return AGNOSAI_APPROVAL_REJECTED; }
 
     var deadline = clock_now_ns() + load64(g + AGN_AG_TIMEOUT_MS) * AGNOSAI_NS_PER_MS;
     while (1 == 1) {
         var got = chan_try_recv(ch);
-        if (got != 0) { return got - 1; }
+        if (got != 0) {
+            if (out_reason != 0) { store64(out_reason, AGNOSAI_APPROVAL_REASON_REVIEWER); }
+            return got - 1;
+        }
+
+        # The crew stopped wanting this answer. Withdrawn first, and then one last receive,
+        # so a decision that landed in between is the one returned.
+        var stop = 0;
+        if (cancelled != 0 && load64(cancelled) != 0) { stop = 1; }
+        elif (deadline_ns > 0 && clock_now_ns() >= deadline_ns) { stop = 2; }
+        if (stop != 0) {
+            agnosai_approval_cancel(g, task_id);
+            var last = chan_try_recv(ch);
+            if (last != 0) {
+                if (out_reason != 0) { store64(out_reason, AGNOSAI_APPROVAL_REASON_REVIEWER); }
+                return last - 1;
+            }
+            if (out_reason != 0) {
+                if (stop == 1) { store64(out_reason, AGNOSAI_APPROVAL_REASON_CANCELLED); }
+                else { store64(out_reason, AGNOSAI_APPROVAL_REASON_DEADLINE); }
+            }
+            return AGNOSAI_APPROVAL_REJECTED;
+        }
 
         # Still registered under THIS channel? A cancelled gate removed the
         # entry, and a newer request for the same task replaced it — either way
@@ -332,8 +379,12 @@ fn agnosai_approval_wait_for_decision(g, ch, task_id: Str): i64 {
         mutex_unlock(mtx);
         if (still_mine == 0) {
             var late = chan_try_recv(ch);
-            if (late != 0) { return late - 1; }
+            if (late != 0) {
+                if (out_reason != 0) { store64(out_reason, AGNOSAI_APPROVAL_REASON_REVIEWER); }
+                return late - 1;
+            }
             _agnosai_approval_log(SK_WARN, "approval channel dropped, rejecting", 35, task_id);
+            if (out_reason != 0) { store64(out_reason, AGNOSAI_APPROVAL_REASON_CANCELLED); }
             return AGNOSAI_APPROVAL_REJECTED;
         }
 
@@ -346,6 +397,7 @@ fn agnosai_approval_wait_for_decision(g, ch, task_id: Str): i64 {
             }
             mutex_unlock(mtx);
             _agnosai_approval_log(SK_WARN, "approval timed out, rejecting", 29, task_id);
+            if (out_reason != 0) { store64(out_reason, AGNOSAI_APPROVAL_REASON_TIMEOUT); }
             return AGNOSAI_APPROVAL_REJECTED;
         }
         sleep_ms(AGNOSAI_APPROVAL_POLL_MS);

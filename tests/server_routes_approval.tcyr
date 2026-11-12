@@ -56,6 +56,44 @@ fn _t_state(): i64 {
       agnosai_approval_gate_new());
 }
 
+# ── the route decides what a crew waits on (ADR 032) ──────────────────────
+#
+# The server's state shares the orchestrator's gate, as `src/main.cyr` builds it, so a decision
+# posted here reaches a submitted crew's high-risk task. Through 2.3.8 the server had a gate of
+# its own that no crew waited on.
+fn _t_route_decides_a_crew(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var g = agnosai_orchestrator_approval_gate(o);
+    var state = agnosai_app_state_new(o, agnosai_tool_registry_new(), agnosai_auth_config_new(),
+      agnosai_event_bus_new(), agnosai_orchestrator_audit(o), g);
+    var spec = agnosai_crew_new(str_from("route-reviewed"));
+    var t = agnosai_task_new(str_from("risky"));
+    agnosai_task_with_risk(t, AGNOSAI_RISK_HIGH);
+    var ts = vec_new();
+    vec_push(ts, t);
+    agnosai_crew_with_tasks(spec, ts);
+    var id = agnosai_orchestrator_submit_crew(o, spec);
+    assert(id != 0, "a crew with a high-risk task is submitted");
+    var until = clock_now_ns() + 5000 * AGNOSAI_NS_PER_MS;
+    while (clock_now_ns() < until && agnosai_approval_gate_pending_count(g) < 1) { sleep_ms(2); }
+    assert_eq(agnosai_approval_gate_pending_count(g), 1, "its task waits on the orchestrator's gate");
+    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, id)), AGNOSAI_CREW_AWAITING_APPROVAL,
+      "and the crew reads awaiting_approval");
+    var listed = agnosai_route_list_pending(state);
+    assert(str_contains_cstr(bayan_json_v_build(agnosai_route_body(listed)), str_cstr(agnosai_task_id(t))) == 1,
+      "GET /api/v1/approvals lists it");
+    var r = agnosai_route_submit_approval(state, _t_body(str_cstr(agnosai_task_id(t)), "approved"));
+    assert_eq(_t_bool(r, "delivered"), 1, "POST /api/v1/approvals delivers the decision to the waiting crew");
+    var done = 0;
+    until = clock_now_ns() + 5000 * AGNOSAI_NS_PER_MS;
+    while (clock_now_ns() < until && done == 0) {
+        if (agnosai_crew_state_status(agnosai_orchestrator_crew(o, id)) == AGNOSAI_CREW_COMPLETED) { done = 1; }
+        else { sleep_ms(2); }
+    }
+    assert_eq(done, 1, "and the crew completes");
+    return 0;
+}
+
 # `{"task_id":"<id>","decision":"<d>"}`
 fn _t_body(id, decision): Str {
     var sb = str_builder_new();
@@ -327,6 +365,7 @@ fn main(): i64 {
     _t_invalid_uuid();
     _t_invalid_decision_is_not_coerced();
     _t_wrong_types();
+    _t_route_decides_a_crew();
 
     return assert_summary();
 }

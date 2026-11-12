@@ -22,6 +22,7 @@ Clients send JSON to create crews, submit agent definitions, and stream results.
 | Malformed JSON / extra fields | bayan's parser refuses malformed JSON, a duplicate key and a leading-zero number (since bayan 1.11.1, CHANGELOG 2.2.1), and nesting past depth 128. Request types reject unknown fields with `agnosai_route_no_unknown_fields` |
 | Missing/invalid auth | JWT RS256 (2048–4096-bit keys), checking signature, then `alg`, `iss`, `aud` and `exp` (`src/server/auth.cyr`). ⚠ **Auth is off by default** (`agnosai_auth_config_new`), and the server warns at boot |
 | Injection via agent definitions | Input validation (`MAX_AGENTS`, `MAX_TASKS`, `MAX_STRING_LEN`); user-supplied fields are wrapped before they reach a prompt |
+| An unreviewed risky answer | Since 2.4.0 a `high`-risk task's answer waits for a reviewer on the orchestrator's gate, which `POST /api/v1/approvals` shares ([ADR 032](../adr/032-the-crew-lifecycle-is-one-state-machine.md)). Only a reviewer's decision approves: a timeout, a cancel, the crew's deadline, a full gate and a missing gate all reject, and a rejected answer is withheld from the crew's results and from any dependent task. Every decision is audited (`approval_decided`). Through 2.3.8 the gate existed and nothing waited on it |
 | Slow-loris / connection exhaustion | 100 pool workers (`AGNOSAI_SERVE_WORKERS`) as the connection cap, and sandhi's 60 s accept-to-request budget (`SANDHI_SERVER_DEFAULT_REQUEST_MS`, sandhi 1.10.7), after which the request is answered 408. Rate limiting is on by default (below). An SSE stream holds a worker for a crew's life (roadmap 2.6.1) |
 
 ### 2. Tool Execution (WASM, cx, Python, Process, OCI)
@@ -162,6 +163,13 @@ proxy" does not fix it on nginx's documented `$proxy_add_x_forwarded_for`, which
 - **A crew's author grants its tools** ([ADR 029](../adr/029-the-tool-loop.md)): anyone who may `POST /api/v1/crews` can
   name a tool for a model to run. They could already call it on `/mcp`, under the same auth, so this widens what a
   model can do and not what a caller can. A consumer's gate is the place to narrow it.
+- **Any caller who may `POST /api/v1/approvals` decides any pending task** (ADR 032): a decision names a task id, and
+  the gate checks nothing about who sends it beyond the route's auth, as in the Rust line. Task ids are random UUIDs,
+  listed only to callers of `GET /api/v1/approvals` under the same auth. A consumer that needs a reviewer per tenant
+  or per crew decides through its own gate (`agnosai_orchestrator_with_approval_gate`).
+- **A reviewed answer goes to the crew's watchers before it is approved** (ADR 032): `approval_requested` carries it,
+  so a reviewer can judge it. A watcher already reads every answer through `token`, under the same auth, so this
+  shows the stream nothing it did not already carry.
 - **`delegate` hands out what the delegate holds** (ADR 029): a delegated crew's agents hold what their own definitions
   name, not the delegating agent's narrower set, and nothing bounds how deep it nests. It is opt-in and off in the
   binary. Hierarchical crews' "authority only narrows" (roadmap 2.4.3) and the crew concurrency cap (2.4.1) close

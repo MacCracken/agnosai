@@ -1,0 +1,1018 @@
+# =========================================================================
+# orch_lifecycle.tcyr — the crew lifecycle as an invariant (ADR 032).
+#
+# Every crew this suite runs is watched from before it starts, and its whole event stream is
+# replayed through the state machine ADR 032 writes down. Two things are checked of every
+# stream, whatever the crew did:
+#
+#   * **No `seq` gap.** The first event is 1 and each is one more than the last.
+#   * **No event without a legal transition.** Each lifecycle event moves its crew or its task
+#     from a state the table allows; `token` and the tool events come only while their task is
+#     running; nothing follows `crew_completed`; and the crew ends with no task left running
+#     and none awaiting a decision.
+#
+# The scenarios are every way a crew runs and ends: each process mode, a failing branch, a
+# cancel and a deadline mid-run, a crew that cannot run, and many tokens from many workers
+# at once.
+# =========================================================================
+
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/core/agent.cyr"
+include "src/core/crew.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/router.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/output_validation.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/server/prometheus.cyr"
+include "src/arena_pool.cyr"
+include "src/sandbox/policy.cyr"
+include "src/sandbox/kavach_bridge.cyr"
+include "src/server/ssrf.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
+include "src/tool_loop.cyr"
+include "src/model_catalog.cyr"
+include "src/orchestrator/approval.cyr"
+include "src/orchestrator/crew_runner.cyr"
+include "src/orchestrator/durable_state.cyr"
+include "src/crew_arena.cyr"
+include "src/orchestrator/orchestrator.cyr"
+include "tests/test_helpers.cyr"
+
+# ── the machine ────────────────────────────────────────────────────────────
+
+var _TL_CREW_PENDING = 0;
+var _TL_CREW_RUNNING = 1;
+var _TL_CREW_AWAITING = 2;
+var _TL_CREW_ENDED = 3;
+
+var _TL_TASK_RUNNING = 2;
+var _TL_TASK_AWAITING = 3;
+var _TL_TASK_DONE = 4;
+
+# The first violation a check found, a Str, for the failure message.
+var _tl_why = 0;
+
+fn _tl_bad(i, ev, what): i64 {
+    if (_tl_why != 0) { return 1; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "event ");
+    str_builder_add_int(sb, i);
+    str_builder_add_cstr(sb, " (");
+    if (ev != 0) { str_builder_add(sb, agnosai_crew_event_event_type(ev)); }
+    str_builder_add_cstr(sb, "): ");
+    str_builder_add_cstr(sb, what);
+    _tl_why = str_builder_build(sb);
+    return 1;
+}
+
+fn _tl_task_id(ev): i64 {
+    var d = agnosai_crew_event_data(ev);
+    if (d == 0) { return 0; }
+    var v = bayan_json_v_obj_get_by_cstr(d, "task_id");
+    if (v == 0 || bayan_json_v_is_str(v) == 0) { return 0; }
+    return bayan_json_v_str(v);
+}
+
+fn _tl_data_str(ev, key): i64 {
+    var d = agnosai_crew_event_data(ev);
+    if (d == 0) { return 0; }
+    var v = bayan_json_v_obj_get_by_cstr(d, key);
+    if (v == 0 || bayan_json_v_is_str(v) == 0) { return 0; }
+    return bayan_json_v_str(v);
+}
+
+# Replay `evs` through the machine for crew `crew_id`. Returns the violation count; the first
+# is kept in `_tl_why`.
+fn _tl_violations(evs, crew_id: Str): i64 {
+    _tl_why = 0;
+    var bad = 0;
+    var crew = _TL_CREW_PENDING;
+    var awaiting = 0;
+    var tasks = map_new_str();
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        var ev = vec_get(evs, i);
+        if (agnosai_crew_event_seq(ev) != i + 1) { bad = bad + _tl_bad(i, ev, "seq is not one more than the last"); }
+        if (str_eq(agnosai_crew_event_crew_id(ev), crew_id) == 0) {
+            bad = bad + _tl_bad(i, ev, "another crew's event");
+        }
+        var t = agnosai_crew_event_event_type(ev);
+        if (crew == _TL_CREW_ENDED) { bad = bad + _tl_bad(i, ev, "an event after crew_completed"); }
+        if (str_eq_cstr(t, "crew_started") == 1) {
+            if (crew != _TL_CREW_PENDING) { bad = bad + _tl_bad(i, ev, "crew_started from a crew not pending"); }
+            crew = _TL_CREW_RUNNING;
+        } elif (str_eq_cstr(t, "crew_completed") == 1) {
+            if (crew != _TL_CREW_RUNNING) { bad = bad + _tl_bad(i, ev, "crew_completed from a crew not running"); }
+            if (awaiting != 0) { bad = bad + _tl_bad(i, ev, "crew_completed with a task awaiting"); }
+            var keys = map_keys(tasks);
+            for (var k = 0; k < vec_len(keys); k = k + 1) {
+                if (map_get(tasks, vec_get(keys, k)) != _TL_TASK_DONE) {
+                    bad = bad + _tl_bad(i, ev, "crew_completed with a task still running");
+                }
+            }
+            var st = _tl_data_str(ev, "status");
+            var why = _tl_data_str(ev, "reason");
+            if (st == 0) { bad = bad + _tl_bad(i, ev, "crew_completed with no status"); }
+            elif (str_eq_cstr(st, "completed") == 1) {
+                if (why != 0) { bad = bad + _tl_bad(i, ev, "a completed crew with a reason"); }
+            } elif (str_eq_cstr(st, "failed") == 1 || str_eq_cstr(st, "cancelled") == 1) {
+                if (why == 0) { bad = bad + _tl_bad(i, ev, "a crew that did not complete, with no reason"); }
+            } else { bad = bad + _tl_bad(i, ev, "crew_completed with a status that is not terminal"); }
+            crew = _TL_CREW_ENDED;
+        } else {
+            var id = _tl_task_id(ev);
+            var ts = 0;
+            if (id == 0) { bad = bad + _tl_bad(i, ev, "a task event with no task_id"); }
+            else { ts = map_get(tasks, id); }
+            if (crew != _TL_CREW_RUNNING && crew != _TL_CREW_AWAITING) {
+                bad = bad + _tl_bad(i, ev, "a task event outside a running crew");
+            }
+            if (str_eq_cstr(t, "task_started") == 1) {
+                if (ts != 0) { bad = bad + _tl_bad(i, ev, "task_started for a task that already started"); }
+                if (id != 0) { map_set(tasks, id, _TL_TASK_RUNNING); }
+            } elif (str_eq_cstr(t, "task_completed") == 1) {
+                if (ts != _TL_TASK_RUNNING) { bad = bad + _tl_bad(i, ev, "task_completed from a task not running"); }
+                var ts_st = _tl_data_str(ev, "status");
+                if (ts_st == 0 || (str_eq_cstr(ts_st, "completed") == 0 && str_eq_cstr(ts_st, "failed") == 0)) {
+                    bad = bad + _tl_bad(i, ev, "task_completed with a status that is not completed or failed");
+                }
+                if (id != 0) { map_set(tasks, id, _TL_TASK_DONE); }
+            } elif (str_eq_cstr(t, "approval_requested") == 1) {
+                if (ts != _TL_TASK_RUNNING) {
+                    bad = bad + _tl_bad(i, ev, "approval_requested from a task not running");
+                }
+                if (id != 0) { map_set(tasks, id, _TL_TASK_AWAITING); }
+                awaiting = awaiting + 1;
+                crew = _TL_CREW_AWAITING;
+            } elif (str_eq_cstr(t, "approval_decided") == 1) {
+                if (ts != _TL_TASK_AWAITING) {
+                    bad = bad + _tl_bad(i, ev, "approval_decided from a task not awaiting");
+                }
+                if (id != 0) { map_set(tasks, id, _TL_TASK_RUNNING); }
+                awaiting = awaiting - 1;
+                if (awaiting == 0) { crew = _TL_CREW_RUNNING; }
+            } elif (str_eq_cstr(t, "token") == 1 || str_eq_cstr(t, "tool_call_started") == 1
+              || str_eq_cstr(t, "tool_call_completed") == 1) {
+                if (ts != _TL_TASK_RUNNING) { bad = bad + _tl_bad(i, ev, "a task's event while it was not running"); }
+            } else { bad = bad + _tl_bad(i, ev, "an event type the lifecycle does not define"); }
+        }
+    }
+    if (crew != _TL_CREW_ENDED) { bad = bad + _tl_bad(vec_len(evs), 0, "the stream ends without crew_completed"); }
+    return bad;
+}
+
+# Assert `evs` is a legal stream for `crew_id`, naming the scenario and the first violation.
+fn _tl_assert_legal(evs, crew_id: Str, name): i64 {
+    var n = _tl_violations(evs, crew_id);
+    if (n != 0) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, name);
+        str_builder_add_cstr(sb, ": ");
+        str_builder_add(sb, _tl_why);
+        println(str_cstr(str_builder_build(sb)));
+    }
+    return assert_eq(n, 0, name);
+}
+
+# ── crews, stubs and a watched run ─────────────────────────────────────────
+
+fn _t_ok_body(): i64 {
+    return str_cat(str_from("{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"done\"}}],"),
+      str_from("\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}"));
+}
+
+fn _t_stub_chat(client, request, out_response, parent_sc): i64 {
+    store64(out_response, agnosai_hoosh_response_from_body(_t_ok_body()));
+    return 0;
+}
+
+# Refuses every task whose request names FAILME, at once.
+fn _t_stub_chat_failme(client, request, out_response, parent_sc): i64 {
+    if (str_contains_cstr(agnosai_inference_request_to_json(request), "FAILME") == 1) {
+        return str_from("model refused");
+    }
+    return _t_stub_chat(client, request, out_response, parent_sc);
+}
+
+# The runner `_t_stub_chat_stop` stops while answering, and how: 1 cancels, 2 moves its deadline
+# into the past.
+var _t_stop_runner = 0;
+var _t_stop_how = 0;
+
+fn _t_stub_chat_stop(client, request, out_response, parent_sc): i64 {
+    if (_t_stop_runner != 0) {
+        if (_t_stop_how == 1) { agnosai_crew_runner_cancel(_t_stop_runner); }
+        if (_t_stop_how == 2) { agnosai_crew_runner_set_deadline_ns(_t_stop_runner, 1); }
+    }
+    return _t_stub_chat(client, request, out_response, parent_sc);
+}
+
+fn _t_client(chat_fp): i64 {
+    return agnosai_hoosh_client_with_chat(
+      agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), chat_fp);
+}
+
+fn _t_task(desc): i64 {
+    return agnosai_task_new(str_from(desc));
+}
+
+fn _t_crew_of(name, tasks, process): i64 {
+    var s = agnosai_crew_new(str_from(name));
+    agnosai_crew_with_tasks(s, tasks);
+    agnosai_crew_with_process(s, process);
+    return s;
+}
+
+fn _t_crew(name, n, process): i64 {
+    var ts = vec_new();
+    for (var i = 0; i < n; i = i + 1) { vec_push(ts, _t_task(str_cstr(str_cat(str_from("t-"), str_from_int(i))))); }
+    return _t_crew_of(name, ts, process);
+}
+
+# A runner for `spec`, watched from before it starts; the subscription goes through `out_sub`.
+fn _t_runner(spec, chat_fp, out_sub): i64 {
+    var tx = agnosai_event_bus_sender(agnosai_event_bus_new(), agnosai_crew_id(spec));
+    store64(out_sub, agnosai_event_sender_subscribe(tx));
+    var r = agnosai_crew_runner_with_events(agnosai_crew_runner_new(spec), tx);
+    if (chat_fp != 0) { agnosai_crew_runner_with_llm(r, _t_client(chat_fp)); }
+    return r;
+}
+
+fn _t_drain(sub): i64 {
+    var v = vec_new();
+    var ev = agnosai_event_sub_try_recv(sub);
+    while (ev != 0) {
+        vec_push(v, ev);
+        ev = agnosai_event_sub_try_recv(sub);
+    }
+    return v;
+}
+
+fn _t_count(evs, t): i64 {
+    var n = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        if (str_eq_cstr(agnosai_crew_event_event_type(vec_get(evs, i)), t) == 1) { n = n + 1; }
+    }
+    return n;
+}
+
+# Run `spec` watched, and check its stream. Returns the events.
+fn _t_run_checked(spec, chat_fp, name): i64 {
+    var sub: i64[1];
+    var r = _t_runner(spec, chat_fp, &sub);
+    var err: i64[1];
+    store64(&err, 0);
+    agnosai_crew_runner_run(r, &err);
+    var evs = _t_drain(load64(&sub));
+    _tl_assert_legal(evs, agnosai_crew_id(spec), name);
+    return evs;
+}
+
+# ── the checker checks ─────────────────────────────────────────────────────
+
+# A checker that passes everything proves nothing, so it is shown illegal streams first.
+fn test_checker_refuses(): i64 {
+    var id = str_from("00000000-0000-4000-8000-0000000000c1");
+    var tx = agnosai_event_bus_sender(agnosai_event_bus_new(), id);
+    var sub = agnosai_event_sender_subscribe(tx);
+    var d = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(d, str_from("task_id"), bayan_json_v_str_new(str_from("t1")));
+    agnosai_event_sender_send(tx, agnosai_crew_event_new(id, str_from("task_started"), d));
+    var evs = _t_drain(sub);
+    assert(_tl_violations(evs, id) > 0, "a task_started before crew_started is refused");
+
+    var tx2 = agnosai_event_bus_sender(agnosai_event_bus_new(), id);
+    var sub2 = agnosai_event_sender_subscribe(tx2);
+    agnosai_event_sender_send(tx2, agnosai_crew_event_new(id, str_from("crew_started"), bayan_json_v_obj_new()));
+    agnosai_event_sender_send(tx2, agnosai_crew_event_new(id, str_from("task_completed"), d));
+    assert(_tl_violations(_t_drain(sub2), id) > 0, "a task_completed for a task never started is refused");
+
+    var evs3 = vec_new();
+    var e1 = agnosai_crew_event_new(id, str_from("crew_started"), bayan_json_v_obj_new());
+    store64(e1 + AGN_CE_SEQ, 1);
+    vec_push(evs3, e1);
+    var e3 = agnosai_crew_event_new(id, str_from("crew_completed"), bayan_json_v_obj_new());
+    store64(e3 + AGN_CE_SEQ, 3);
+    vec_push(evs3, e3);
+    assert(_tl_violations(evs3, id) > 0, "a seq gap is refused");
+
+    var done = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(done, str_from("status"), bayan_json_v_str_new(str_from("failed")));
+    var tx4 = agnosai_event_bus_sender(agnosai_event_bus_new(), id);
+    var sub4 = agnosai_event_sender_subscribe(tx4);
+    agnosai_event_sender_send(tx4, agnosai_crew_event_new(id, str_from("crew_started"), bayan_json_v_obj_new()));
+    agnosai_event_sender_send(tx4, agnosai_crew_event_new(id, str_from("crew_completed"), done));
+    assert(_tl_violations(_t_drain(sub4), id) > 0, "a failed crew with no reason is refused");
+    return 0;
+}
+
+# ── seq ────────────────────────────────────────────────────────────────────
+
+fn test_seq(): i64 {
+    var id = str_from("00000000-0000-4000-8000-0000000000c2");
+    var tx = agnosai_event_bus_sender(agnosai_event_bus_new(), id);
+    assert_eq(agnosai_event_sender_seq(tx), 0, "a new sender has sent nothing");
+    var lost = agnosai_crew_event_new(id, str_from("x"), 0);
+    assert_eq(agnosai_event_sender_send(tx, lost), 0, "an event with nobody to receive it");
+    assert_eq(agnosai_crew_event_seq(lost), 0, "takes no number");
+    assert_eq(agnosai_event_sender_seq(tx), 0, "and the count does not move");
+    var a = agnosai_event_sender_subscribe(tx);
+    var e1 = agnosai_crew_event_new(id, str_from("x"), 0);
+    agnosai_event_sender_send(tx, e1);
+    assert_eq(agnosai_crew_event_seq(e1), 1, "the first event delivered is 1");
+    var b = agnosai_event_sender_subscribe(tx);
+    var e2 = agnosai_crew_event_new(id, str_from("x"), 0);
+    agnosai_event_sender_send(tx, e2);
+    assert_eq(agnosai_crew_event_seq(e2), 2, "the next is 2, for every subscriber");
+    assert_eq(agnosai_crew_event_seq(agnosai_event_sub_try_recv(b)), 2,
+      "so one that attached later starts where the count had reached");
+    assert_eq(agnosai_event_sender_seq(tx), 2, "and the sender says the last it sent");
+    agnosai_event_sub_try_recv(a);
+
+    var js = bayan_json_v_build(agnosai_crew_event_to_value(e2));
+    assert(str_contains_cstr(js, "\"event_type\":\"x\",\"seq\":2,") == 1, "seq is on the wire, after event_type");
+    assert_eq(str_contains_cstr(bayan_json_v_build(agnosai_crew_event_to_value(lost)), "seq"), 0,
+      "and left out of an event no sender delivered, such as the stream's connected");
+
+    # A ring that overflows shows a gap, which is what seq is for.
+    var c = agnosai_event_sender_subscribe(tx);
+    for (var i = 0; i < AGNOSAI_SSE_CHANNEL_CAPACITY + 3; i = i + 1) {
+        agnosai_event_sender_send(tx, agnosai_crew_event_new(id, str_from("x"), 0));
+    }
+    var first = agnosai_event_sub_try_recv(c);
+    assert(agnosai_crew_event_seq(first) > 3, "a subscriber that fell behind starts past what it lost");
+    assert(agnosai_event_sub_lagged(c) > 0, "and is told it lagged");
+    return 0;
+}
+
+# Many workers sending at once still number one stream without a gap or a repeat.
+fn test_seq_under_concurrency(): i64 {
+    var tasks = vec_new();
+    for (var i = 0; i < 24; i = i + 1) { vec_push(tasks, _t_task("concurrent")); }
+    var spec = _t_crew_of("lc-concurrent", tasks, agnosai_process_parallel(8));
+    var evs = _t_run_checked(spec, &_t_stub_chat, "24 tasks on 8 workers, tokens and all, are one legal stream");
+    assert_eq(_t_count(evs, "token"), 24, "with a token from each worker");
+    assert_eq(_t_count(evs, "task_completed"), 24, "and every task reported");
+    return 0;
+}
+
+# ── every way a crew runs ──────────────────────────────────────────────────
+
+fn test_modes(): i64 {
+    _t_run_checked(_t_crew("lc-seq", 3, agnosai_process_sequential()), 0, "a sequential crew");
+    _t_run_checked(_t_crew("lc-seq-llm", 3, agnosai_process_sequential()), &_t_stub_chat,
+      "a sequential crew the model answers");
+    _t_run_checked(_t_crew("lc-par", 5, agnosai_process_parallel(2)), &_t_stub_chat,
+      "a parallel crew in batches");
+    _t_run_checked(_t_crew("lc-par-one", 4, agnosai_process_parallel(0)), &_t_stub_chat,
+      "a parallel crew in one batch");
+
+    # A diamond: a, then b and c, then d.
+    var a = _t_task("a");
+    var b = _t_task("b");
+    var c = _t_task("c");
+    var d = _t_task("d");
+    agnosai_task_with_dependency(b, agnosai_task_id(a));
+    agnosai_task_with_dependency(c, agnosai_task_id(a));
+    agnosai_task_with_dependency(d, agnosai_task_id(b));
+    agnosai_task_with_dependency(d, agnosai_task_id(c));
+    var ts = vec_new();
+    vec_push(ts, d);
+    vec_push(ts, c);
+    vec_push(ts, b);
+    vec_push(ts, a);
+    var evs = _t_run_checked(_t_crew_of("lc-dag", ts, agnosai_process_dag()), &_t_stub_chat, "a DAG crew");
+    assert_eq(_t_count(evs, "task_completed"), 4, "which runs all four");
+    return 0;
+}
+
+fn test_endings(): i64 {
+    # A failed branch strands its dependent: failed, task_failed.
+    var fa = _t_task("A FAILME");
+    var fx = _t_task("X");
+    var fb = _t_task("B");
+    agnosai_task_with_dependency(fb, agnosai_task_id(fa));
+    var fts = vec_new();
+    vec_push(fts, fa);
+    vec_push(fts, fx);
+    vec_push(fts, fb);
+    _t_run_checked(_t_crew_of("lc-dag-fail", fts, agnosai_process_dag()), &_t_stub_chat_failme,
+      "a DAG whose failed branch strands a task");
+
+    # Cancelled while the first task runs, in each mode.
+    var cs = _t_crew("lc-cancel-seq", 3, agnosai_process_sequential());
+    var cs_sub: i64[1];
+    var cs_r = _t_runner(cs, &_t_stub_chat_stop, &cs_sub);
+    _t_stop_runner = cs_r;
+    _t_stop_how = 1;
+    var err: i64[1];
+    store64(&err, 0);
+    agnosai_crew_runner_run(cs_r, &err);
+    _t_stop_runner = 0;
+    var cs_evs = _t_drain(load64(&cs_sub));
+    _tl_assert_legal(cs_evs, agnosai_crew_id(cs), "a sequential crew cancelled mid-run");
+    assert_eq(_t_count(cs_evs, "task_started"), 1, "which started one task and no more");
+
+    var cp = _t_crew("lc-cancel-par", 6, agnosai_process_parallel(2));
+    var cp_sub: i64[1];
+    var cp_r = _t_runner(cp, &_t_stub_chat_stop, &cp_sub);
+    _t_stop_runner = cp_r;
+    _t_stop_how = 1;
+    agnosai_crew_runner_run(cp_r, &err);
+    _t_stop_runner = 0;
+    _tl_assert_legal(_t_drain(load64(&cp_sub)), agnosai_crew_id(cp), "a parallel crew cancelled mid-run");
+
+    # Its deadline passing mid-run.
+    var ds = _t_crew("lc-deadline", 3, agnosai_process_sequential());
+    var ds_sub: i64[1];
+    var ds_r = _t_runner(ds, &_t_stub_chat_stop, &ds_sub);
+    _t_stop_runner = ds_r;
+    _t_stop_how = 2;
+    agnosai_crew_runner_set_deadline_ns(ds_r, clock_now_ns() + 60 * AGNOSAI_NS_PER_SEC);
+    agnosai_crew_runner_run(ds_r, &err);
+    _t_stop_runner = 0;
+    var ds_evs = _t_drain(load64(&ds_sub));
+    _tl_assert_legal(ds_evs, agnosai_crew_id(ds), "a crew whose deadline passes mid-run");
+
+    # Cancelled before it starts, and a crew that cannot run.
+    var cb = _t_crew("lc-cancel-first", 2, agnosai_process_parallel(2));
+    var cb_sub: i64[1];
+    var cb_r = _t_runner(cb, 0, &cb_sub);
+    agnosai_crew_runner_cancel(cb_r);
+    agnosai_crew_runner_run(cb_r, &err);
+    var cb_evs = _t_drain(load64(&cb_sub));
+    _tl_assert_legal(cb_evs, agnosai_crew_id(cb), "a crew cancelled before its first task");
+    assert_eq(vec_len(cb_evs), 2, "which says it started and ended, and nothing else");
+
+    var ya = _t_task("Y");
+    var yb = _t_task("Z");
+    agnosai_task_with_dependency(ya, agnosai_task_id(yb));
+    agnosai_task_with_dependency(yb, agnosai_task_id(ya));
+    var yts = vec_new();
+    vec_push(yts, ya);
+    vec_push(yts, yb);
+    _t_run_checked(_t_crew_of("lc-cycle", yts, agnosai_process_dag()), 0, "a crew whose tasks form a cycle");
+    return 0;
+}
+
+# A subscriber that attaches mid-run is told about what follows, not only the end (ADR 032).
+var _t_late_tx = 0;
+var _t_late_sub = 0;
+
+fn _t_stub_chat_attach(client, request, out_response, parent_sc): i64 {
+    if (_t_late_tx != 0 && _t_late_sub == 0) { _t_late_sub = agnosai_event_sender_subscribe(_t_late_tx); }
+    return _t_stub_chat(client, request, out_response, parent_sc);
+}
+
+fn test_late_subscriber(): i64 {
+    var spec = _t_crew("lc-late", 3, agnosai_process_sequential());
+    var tx = agnosai_event_bus_sender(agnosai_event_bus_new(), agnosai_crew_id(spec));
+    _t_late_tx = tx;
+    _t_late_sub = 0;
+    var r = agnosai_crew_runner_with_llm(agnosai_crew_runner_with_events(agnosai_crew_runner_new(spec), tx),
+      _t_client(&_t_stub_chat_attach));
+    var err: i64[1];
+    store64(&err, 0);
+    agnosai_crew_runner_run(r, &err);
+    _t_late_tx = 0;
+    var evs = _t_drain(_t_late_sub);
+    assert(_t_count(evs, "task_started") >= 2,
+      "a subscriber that attached during the first task hears the tasks after it start");
+    assert_eq(agnosai_crew_event_seq(vec_get(evs, 0)), 1,
+      "numbered from 1, as nothing was sent before it attached");
+    assert_eq(str_eq_cstr(agnosai_crew_event_event_type(vec_get(evs, vec_len(evs) - 1)), "crew_completed"), 1,
+      "and the end");
+
+    # A parallel crew asks per batch: batches of one, and the subscriber attaches in the first.
+    var pspec = _t_crew("lc-late-par", 3, agnosai_process_parallel(1));
+    var ptx = agnosai_event_bus_sender(agnosai_event_bus_new(), agnosai_crew_id(pspec));
+    _t_late_tx = ptx;
+    _t_late_sub = 0;
+    var pr = agnosai_crew_runner_with_llm(agnosai_crew_runner_with_events(agnosai_crew_runner_new(pspec), ptx),
+      _t_client(&_t_stub_chat_attach));
+    agnosai_crew_runner_run(pr, &err);
+    _t_late_tx = 0;
+    var pevs = _t_drain(_t_late_sub);
+    assert(_t_count(pevs, "task_started") >= 2, "in a parallel crew, it hears the batches after it");
+    assert(_t_count(pevs, "token") >= 2, "and their workers' tokens");
+    return 0;
+}
+
+# A bus nobody watches costs a sequential crew nothing: each task asks, finds no subscriber, and
+# builds no event and no token (ADR 022's guard, which since 2.4.0 the sequential path keeps too).
+fn test_unwatched_costs_nothing(): i64 {
+    var err: i64[1];
+    store64(&err, 0);
+    var warm = _t_crew("lc-warm", 3, agnosai_process_sequential());
+    var wr = agnosai_crew_runner_with_llm(agnosai_crew_runner_new(warm), _t_client(&_t_stub_chat));
+    agnosai_crew_runner_run(wr, &err);
+
+    var bare = _t_crew("lc-bare", 3, agnosai_process_sequential());
+    var br = agnosai_crew_runner_with_llm(agnosai_crew_runner_new(bare), _t_client(&_t_stub_chat));
+    var b0 = alloc_used();
+    agnosai_crew_runner_run(br, &err);
+    var bare_cost = alloc_used() - b0;
+
+    var unw = _t_crew("lc-unw", 3, agnosai_process_sequential());
+    var tx = agnosai_event_bus_sender(agnosai_event_bus_new(), agnosai_crew_id(unw));
+    var ur = agnosai_crew_runner_with_llm(agnosai_crew_runner_with_events(agnosai_crew_runner_new(unw), tx),
+      _t_client(&_t_stub_chat));
+    var u0 = alloc_used();
+    agnosai_crew_runner_run(ur, &err);
+    assert_eq(alloc_used() - u0, bare_cost,
+      "a sequential crew on a bus nobody watches allocates exactly what one with no bus does");
+    return 0;
+}
+
+# ── the approval gate (ADR 032) ────────────────────────────────────────────
+
+# A reviewer on its own thread: once the gate holds `want` pending tasks, it decides each with
+# `decision`, in the order they were requested, and says it is done.
+var _t_rv_gate = 0;
+var _t_rv_want = 0;
+var _t_rv_decision = 0;
+var _t_rv_done = 0;
+var _t_rv_seen_awaiting = 0;
+# The registered state the reviewer looks at while it waits, or 0.
+var _t_rv_state = 0;
+
+fn _t_reviewer(arg): i64 {
+    var until = clock_now_ns() + 10000 * AGNOSAI_NS_PER_MS;
+    while (clock_now_ns() < until && agnosai_approval_gate_pending_count(_t_rv_gate) < _t_rv_want) {
+        sleep_ms(2);
+    }
+    if (_t_rv_state != 0) { _t_rv_seen_awaiting = agnosai_crew_state_status(_t_rv_state); }
+    var pending = agnosai_approval_gate_pending_tasks(_t_rv_gate);
+    for (var i = 0; i < vec_len(pending); i = i + 1) {
+        agnosai_approval_submit_decision(_t_rv_gate, vec_get(pending, i), _t_rv_decision);
+    }
+    atomic_store(&_t_rv_done, 1);
+    return 0;
+}
+
+fn _t_review(gate, want, decision, state): i64 {
+    _t_rv_gate = gate;
+    _t_rv_want = want;
+    _t_rv_decision = decision;
+    _t_rv_state = state;
+    _t_rv_seen_awaiting = 0 - 1;
+    atomic_store(&_t_rv_done, 0);
+    return thread_create_detached(&_t_reviewer, 0);
+}
+
+fn _t_review_wait(): i64 {
+    while (atomic_load(&_t_rv_done) == 0) { sleep_ms(1); }
+    return 0;
+}
+
+fn _t_risky(desc, risk): i64 {
+    var t = _t_task(desc);
+    agnosai_task_with_risk(t, risk);
+    return t;
+}
+
+# The first event of type `t` in `evs`, or 0.
+fn _t_find(evs, t): i64 {
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        if (str_eq_cstr(agnosai_crew_event_event_type(vec_get(evs, i)), t) == 1) { return vec_get(evs, i); }
+    }
+    return 0;
+}
+
+fn _t_str_of(ev, key): i64 {
+    if (ev == 0) { return str_from(""); }
+    var v = _tl_data_str(ev, key);
+    if (v == 0) { return str_from(""); }
+    return v;
+}
+
+# Run `spec` watched with `gate` (0 for none), and check its stream. Returns the events; the
+# state goes through `out_state`.
+fn _t_run_gated(spec, gate, medium, chat_fp, name, out_state): i64 {
+    var sub: i64[1];
+    var r = _t_runner(spec, chat_fp, &sub);
+    agnosai_crew_runner_with_approval(r, gate, medium);
+    var err: i64[1];
+    store64(&err, 0);
+    store64(out_state, agnosai_crew_runner_run(r, &err));
+    var evs = _t_drain(load64(&sub));
+    _tl_assert_legal(evs, agnosai_crew_id(spec), name);
+    return evs;
+}
+
+fn test_approvals(): i64 {
+    var st: i64[1];
+
+    # Approved: the answer stands.
+    var g1 = agnosai_approval_gate_new();
+    var ts1 = vec_new();
+    vec_push(ts1, _t_task("plain"));
+    vec_push(ts1, _t_risky("risky", AGNOSAI_RISK_HIGH));
+    var c1 = _t_crew_of("lc-approve", ts1, agnosai_process_sequential());
+    _t_review(g1, 1, AGNOSAI_APPROVAL_APPROVED, 0);
+    var e1 = _t_run_gated(c1, g1, 0, &_t_stub_chat, "a high-risk task a reviewer approves", &st);
+    _t_review_wait();
+    assert_eq(_t_count(e1, "approval_requested"), 1, "the high-risk task, and only it, is held for review");
+    var req = _t_find(e1, "approval_requested");
+    assert(str_eq_cstr(_t_str_of(req, "output"), "done") == 1, "the request carries the answer to judge");
+    assert(str_eq_cstr(_t_str_of(req, "risk"), "high") == 1, "and its risk");
+    var dec = _t_find(e1, "approval_decided");
+    assert(str_eq_cstr(_t_str_of(dec, "decision"), "approved") == 1, "the decision is approved");
+    assert(str_eq_cstr(_t_str_of(dec, "reason"), "reviewer") == 1, "by the reviewer");
+    assert_eq(agnosai_crew_state_status(load64(&st)), AGNOSAI_CREW_COMPLETED, "and the crew completes");
+    var r1 = vec_get(agnosai_crew_state_results(load64(&st)), 1);
+    assert(str_eq_cstr(agnosai_task_result_output(r1), "done") == 1, "with the approved answer");
+    var md1 = map_get(agnosai_task_result_metadata(r1), str_from("approval"));
+    assert(md1 != 0 && str_eq_cstr(bayan_json_v_str(md1), "approved") == 1, "and its result says it was approved");
+    assert_eq(agnosai_approval_gate_pending_count(g1), 0, "leaving nothing pending");
+
+    # Rejected: the task fails, its answer withheld, and a dependent never runs.
+    var g2 = agnosai_approval_gate_new();
+    var ra = _t_risky("risky first", AGNOSAI_RISK_HIGH);
+    var rb = _t_task("depends on it");
+    agnosai_task_with_dependency(rb, agnosai_task_id(ra));
+    var ts2 = vec_new();
+    vec_push(ts2, ra);
+    vec_push(ts2, rb);
+    var c2 = _t_crew_of("lc-reject", ts2, agnosai_process_dag());
+    _t_review(g2, 1, AGNOSAI_APPROVAL_REJECTED, 0);
+    var e2 = _t_run_gated(c2, g2, 0, &_t_stub_chat, "a high-risk task a reviewer rejects", &st);
+    _t_review_wait();
+    assert(str_eq_cstr(_t_str_of(_t_find(e2, "approval_decided"), "decision"), "rejected") == 1, "rejected");
+    assert_eq(agnosai_crew_state_status(load64(&st)), AGNOSAI_CREW_FAILED, "the crew fails");
+    assert(str_eq_cstr(agnosai_crew_state_reason(load64(&st)), "task_failed") == 1, "because a task did");
+    var r2 = agnosai_crew_state_results(load64(&st));
+    assert_eq(vec_len(r2), 1, "and its dependent never ran");
+    var rr = vec_get(r2, 0);
+    assert_eq(agnosai_task_result_status(rr), AGNOSAI_STATUS_FAILED, "the rejected task failed");
+    assert_eq(str_contains_cstr(agnosai_task_result_output(rr), "done"), 0, "and its answer is withheld");
+    assert(str_contains_cstr(agnosai_task_result_output(rr), "approval rejected (reviewer)") == 1,
+      "its output says why instead");
+
+    # No gate: nobody can approve, so the answer is withheld at once.
+    var ts3 = vec_new();
+    vec_push(ts3, _t_risky("risky, no gate", AGNOSAI_RISK_HIGH));
+    var e3 = _t_run_gated(_t_crew_of("lc-nogate", ts3, agnosai_process_sequential()), 0, 0, &_t_stub_chat,
+      "a high-risk task with no gate", &st);
+    assert(str_eq_cstr(_t_str_of(_t_find(e3, "approval_decided"), "reason"), "no_gate") == 1,
+      "is rejected for want of a gate");
+    assert_eq(agnosai_crew_state_status(load64(&st)), AGNOSAI_CREW_FAILED, "and fails");
+
+    # The gate's own timeout.
+    var g4 = agnosai_approval_gate_with_timeout(60);
+    var ts4 = vec_new();
+    vec_push(ts4, _t_risky("risky, nobody answers", AGNOSAI_RISK_HIGH));
+    var e4 = _t_run_gated(_t_crew_of("lc-gate-timeout", ts4, agnosai_process_sequential()), g4, 0, &_t_stub_chat,
+      "a high-risk task nobody reviews", &st);
+    assert(str_eq_cstr(_t_str_of(_t_find(e4, "approval_decided"), "reason"), "timeout") == 1,
+      "is rejected when the gate's wait runs out");
+
+    # Medium waits only when asked to, and low never.
+    var g5 = agnosai_approval_gate_with_timeout(60);
+    var ts5 = vec_new();
+    vec_push(ts5, _t_risky("medium", AGNOSAI_RISK_MEDIUM));
+    vec_push(ts5, _t_risky("low", AGNOSAI_RISK_LOW));
+    var e5 = _t_run_gated(_t_crew_of("lc-medium-off", ts5, agnosai_process_sequential()), g5, 0, &_t_stub_chat,
+      "medium and low risk, medium not asked", &st);
+    assert_eq(_t_count(e5, "approval_requested"), 0, "neither waits");
+    var ts6 = vec_new();
+    vec_push(ts6, _t_risky("medium", AGNOSAI_RISK_MEDIUM));
+    vec_push(ts6, _t_risky("low", AGNOSAI_RISK_LOW));
+    var e6 = _t_run_gated(_t_crew_of("lc-medium-on", ts6, agnosai_process_sequential()), g5, 1, &_t_stub_chat,
+      "medium and low risk, medium asked", &st);
+    assert_eq(_t_count(e6, "approval_requested"), 1, "medium waits when asked, and low still does not");
+
+    # A failed task has nothing to approve.
+    var ts7 = vec_new();
+    vec_push(ts7, _t_risky("risky FAILME", AGNOSAI_RISK_HIGH));
+    var e7 = _t_run_gated(_t_crew_of("lc-failed-risky", ts7, agnosai_process_sequential()), g5, 0,
+      &_t_stub_chat_failme, "a high-risk task that failed", &st);
+    assert_eq(_t_count(e7, "approval_requested"), 0, "is not held for review");
+
+    # Two at once, in a parallel crew, both approved.
+    var g8 = agnosai_approval_gate_new();
+    var ts8 = vec_new();
+    vec_push(ts8, _t_risky("risky one", AGNOSAI_RISK_HIGH));
+    vec_push(ts8, _t_risky("risky two", AGNOSAI_RISK_HIGH));
+    vec_push(ts8, _t_task("plain"));
+    _t_review(g8, 2, AGNOSAI_APPROVAL_APPROVED, 0);
+    var e8 = _t_run_gated(_t_crew_of("lc-two-at-once", ts8, agnosai_process_parallel(3)), g8, 0, &_t_stub_chat,
+      "two parallel tasks awaiting at once", &st);
+    _t_review_wait();
+    assert_eq(_t_count(e8, "approval_decided"), 2, "both decided");
+    assert_eq(agnosai_crew_state_status(load64(&st)), AGNOSAI_CREW_COMPLETED, "and the crew completes");
+    return 0;
+}
+
+# A stub that notes the registered status its second call sees: the crew's, while a later task runs.
+var _t_status_state = 0;
+var _t_status_seen = 0 - 1;
+var _t_status_calls = 0;
+
+fn _t_stub_chat_status(client, request, out_response, parent_sc): i64 {
+    _t_status_calls = _t_status_calls + 1;
+    if (_t_status_calls == 2 && _t_status_state != 0) {
+        _t_status_seen = agnosai_crew_state_status(_t_status_state);
+    }
+    return _t_stub_chat(client, request, out_response, parent_sc);
+}
+
+# The crew's registered status rolls up, and a cancel or a deadline releases a waiting task.
+var _t_cancel_orch = 0;
+var _t_cancel_id = 0;
+
+fn _t_canceller(arg): i64 {
+    var g = agnosai_orchestrator_approval_gate(_t_cancel_orch);
+    var until = clock_now_ns() + 10000 * AGNOSAI_NS_PER_MS;
+    while (clock_now_ns() < until && agnosai_approval_gate_pending_count(g) < 1) { sleep_ms(2); }
+    agnosai_orchestrator_cancel_crew(_t_cancel_orch, _t_cancel_id);
+    return 0;
+}
+
+fn test_registry_rollup(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var bus = agnosai_event_bus_new();
+    agnosai_orchestrator_with_events(o, bus);
+    agnosai_orchestrator_with_llm_url(o, str_from("http://127.0.0.1:1"), str_from(""));
+    assert(agnosai_orchestrator_approval_gate(o) != 0, "an orchestrator has a gate of its own");
+    var probe = _agnosai_orch_register(o, _t_crew("lc-gate-probe", 1, agnosai_process_sequential()));
+    assert_eq(agnosai_crew_runner_approval_gate(probe), agnosai_orchestrator_approval_gate(o),
+      "and gives it to every crew's runner");
+    _agnosai_orch_finish_err(o, probe, agnosai_crew_id(load64(probe + AGN_CR_SPEC)), str_from("probe"), 0);
+
+    var ts = vec_new();
+    vec_push(ts, _t_risky("risky", AGNOSAI_RISK_HIGH));
+    var spec = _t_crew_of("lc-rollup", ts, agnosai_process_sequential());
+    var id = agnosai_crew_id(spec);
+    var sub = agnosai_event_bus_subscribe(bus, id);
+    var runner = _agnosai_orch_register(o, spec);
+    agnosai_crew_runner_with_llm(runner, _t_client(&_t_stub_chat));
+    _t_review(agnosai_orchestrator_approval_gate(o), 1, AGNOSAI_APPROVAL_APPROVED, agnosai_orchestrator_crew(o, id));
+    var final = _agnosai_orch_finish_err(o, runner, id, agnosai_crew_name(spec), 0);
+    _t_review_wait();
+    assert_eq(_t_rv_seen_awaiting, AGNOSAI_CREW_AWAITING_APPROVAL,
+      "while its task waits, the registry says the crew is awaiting_approval");
+    assert_eq(agnosai_crew_state_status(final), AGNOSAI_CREW_COMPLETED, "and once approved it completes");
+    assert_eq(agnosai_crew_runner_awaiting(runner), 0, "with nothing left waiting");
+    _tl_assert_legal(_t_drain(sub), id, "the orchestrator's crew, approved, is a legal stream");
+    var trail = agnosai_audit_chain_recent(agnosai_orchestrator_audit(o), 3);
+    var decided = 0;
+    for (var ti = 0; ti < vec_len(trail); ti = ti + 1) {
+        if (str_eq_cstr(agnosai_audit_entry_event(vec_get(trail, ti)), "approval_decided") == 1) {
+            decided = vec_get(trail, ti);
+        }
+    }
+    assert(decided != 0, "the decision is in the audit trail");
+    if (decided != 0) {
+        var dmd = agnosai_audit_entry_metadata(decided);
+        assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(dmd, "decision")), "approved") == 1,
+          "saying what was decided");
+        assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(dmd, "reason")), "reviewer") == 1,
+          "and by whom");
+    }
+
+    # Back to running once its last waiting task is decided: the next task runs under RUNNING.
+    var bts = vec_new();
+    vec_push(bts, _t_risky("risky first", AGNOSAI_RISK_HIGH));
+    vec_push(bts, _t_task("then plain"));
+    var bspec = _t_crew_of("lc-rollup-back", bts, agnosai_process_sequential());
+    var bid = agnosai_crew_id(bspec);
+    var brun = _agnosai_orch_register(o, bspec);
+    agnosai_crew_runner_with_llm(brun, _t_client(&_t_stub_chat_status));
+    _t_status_state = agnosai_orchestrator_crew(o, bid);
+    _t_status_seen = 0 - 1;
+    _t_status_calls = 0;
+    _t_review(agnosai_orchestrator_approval_gate(o), 1, AGNOSAI_APPROVAL_APPROVED, 0);
+    _agnosai_orch_finish_err(o, brun, bid, agnosai_crew_name(bspec), 0);
+    _t_review_wait();
+    _t_status_state = 0;
+    assert_eq(_t_status_seen, AGNOSAI_CREW_RUNNING,
+      "after its waiting task is decided, the crew reads running again while its next task runs");
+    assert(str_eq_cstr(agnosai_crew_status_to_wire(AGNOSAI_CREW_AWAITING_APPROVAL), "awaiting_approval") == 1,
+      "spelled awaiting_approval on the wire");
+    assert_eq(agnosai_crew_status_from_wire(str_from("awaiting_approval")), AGNOSAI_CREW_AWAITING_APPROVAL,
+      "and parsed back");
+    assert(str_eq_cstr(agnosai_task_status_to_wire(AGNOSAI_STATUS_AWAITING_APPROVAL), "awaiting_approval") == 1,
+      "as is a task's");
+    assert_eq(agnosai_task_status_from_wire(str_from("awaiting_approval")), AGNOSAI_STATUS_AWAITING_APPROVAL,
+      "both ways");
+
+    # Cancelled while it waits: the wait ends at once, and the cancel stands.
+    var cts = vec_new();
+    vec_push(cts, _t_risky("risky, cancelled", AGNOSAI_RISK_HIGH));
+    vec_push(cts, _t_task("never reached"));
+    var cspec = _t_crew_of("lc-cancel-waiting", cts, agnosai_process_sequential());
+    var cid = agnosai_crew_id(cspec);
+    var csub = agnosai_event_bus_subscribe(bus, cid);
+    var crun = _agnosai_orch_register(o, cspec);
+    agnosai_crew_runner_with_llm(crun, _t_client(&_t_stub_chat));
+    _t_cancel_orch = o;
+    _t_cancel_id = cid;
+    thread_create_detached(&_t_canceller, 0);
+    var t0 = clock_now_ns();
+    var cfinal = _agnosai_orch_finish_err(o, crun, cid, agnosai_crew_name(cspec), 0);
+    assert((clock_now_ns() - t0) / AGNOSAI_NS_PER_MS < 5000, "a cancel ends the wait, not the gate's 5 minutes");
+    assert_eq(agnosai_crew_state_status(cfinal), AGNOSAI_CREW_CANCELLED, "the crew is cancelled");
+    var cevs = _t_drain(csub);
+    _tl_assert_legal(cevs, cid, "a crew cancelled while a task awaits a reviewer");
+    assert(str_eq_cstr(_t_str_of(_t_find(cevs, "approval_decided"), "reason"), "cancelled") == 1,
+      "its task's wait ends, rejected because the crew was cancelled");
+    assert_eq(agnosai_approval_gate_pending_count(agnosai_orchestrator_approval_gate(o)), 0,
+      "and the request is withdrawn");
+
+    # Out of time while it waits.
+    var dts = vec_new();
+    vec_push(dts, _t_risky("risky, out of time", AGNOSAI_RISK_HIGH));
+    var dspec = _t_crew_of("lc-deadline-waiting", dts, agnosai_process_sequential());
+    var dsub: i64[1];
+    var dr = _t_runner(dspec, &_t_stub_chat, &dsub);
+    agnosai_crew_runner_with_approval(dr, agnosai_approval_gate_new(), 0);
+    agnosai_crew_runner_set_deadline_ns(dr, clock_now_ns() + 100 * AGNOSAI_NS_PER_MS);
+    var err: i64[1];
+    store64(&err, 0);
+    var dst = agnosai_crew_runner_run(dr, &err);
+    var devs = _t_drain(load64(&dsub));
+    _tl_assert_legal(devs, agnosai_crew_id(dspec), "a crew whose deadline passes while a task awaits");
+    assert(str_eq_cstr(_t_str_of(_t_find(devs, "approval_decided"), "reason"), "deadline") == 1,
+      "its task's wait ends at the deadline");
+    assert_eq(agnosai_crew_state_status(dst), AGNOSAI_CREW_FAILED, "and the crew fails");
+    assert(str_eq_cstr(agnosai_crew_state_reason(dst), "timeout") == 1, "having timed out");
+
+    # A gate the orchestrator was told not to have: the task is refused.
+    var no = _t_no_gate(o);
+    return no;
+}
+
+# The orchestrator without a gate refuses a task that needs one, rather than run it unreviewed.
+fn _t_no_gate(o): i64 {
+    var o2 = agnosai_orchestrator_with_approval_gate(agnosai_orchestrator_new(0), 0);
+    assert_eq(agnosai_orchestrator_approval_gate(o2), 0, "an orchestrator can be given no gate");
+    agnosai_orchestrator_with_llm_url(o2, str_from("http://127.0.0.1:1"), str_from(""));
+    var ts = vec_new();
+    vec_push(ts, _t_risky("risky", AGNOSAI_RISK_HIGH));
+    var spec = _t_crew_of("lc-orch-nogate", ts, agnosai_process_sequential());
+    var r = _agnosai_orch_register(o2, spec);
+    agnosai_crew_runner_with_llm(r, _t_client(&_t_stub_chat));
+    var st = _agnosai_orch_finish_err(o2, r, agnosai_crew_id(spec), agnosai_crew_name(spec), 0);
+    assert_eq(agnosai_crew_state_status(st), AGNOSAI_CREW_FAILED, "and its high-risk task fails, unreviewed and unrun");
+    agnosai_orchestrator_with_medium_approval(o2, 1);
+    assert_eq(load64(o2 + AGN_OR_APPROVE_MEDIUM), 1, "and medium approval can be turned on");
+    agnosai_orchestrator_with_medium_approval(o2, 7);
+    assert_eq(load64(o2 + AGN_OR_APPROVE_MEDIUM), 0, "by 1 and nothing else");
+    return 0;
+}
+
+# ── tool calls (ADR 032) ───────────────────────────────────────────────────
+
+fn _t_tool_schema(a, ctx): i64 {
+    return agnosai_tool_schema_new_a(a, str_from_a(a, "double"), str_from_a(a, "doubles a number"));
+}
+
+fn _t_tool_exec(ctx, input): i64 {
+    var a = agnosai_tool_input_alloc(input);
+    return agnosai_tool_output_ok_a(a, bayan_json_v_int_new_a(a, 2));
+}
+
+fn _t_boom_exec(ctx, input): i64 {
+    var a = agnosai_tool_input_alloc(input);
+    return agnosai_tool_output_err_a(a, str_from_a(a, "it broke"));
+}
+
+fn _t_tool_body(content, calls): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"");
+    str_builder_add_cstr(sb, content);
+    str_builder_add_cstr(sb, "\"");
+    if (calls != 0) {
+        str_builder_add_cstr(sb, ",\"tool_calls\":");
+        str_builder_add_cstr(sb, calls);
+    }
+    str_builder_add_cstr(sb, "}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}");
+    return str_builder_build(sb);
+}
+
+# Asks for `double`, which the agent holds, and `missing`, which it does not, then answers once
+# the results are back.
+fn _t_tool_chat(client, request, out_response, parent_sc): i64 {
+    var a = agnosai_inference_request_alloc(request);
+    var msgs = agnosai_inference_request_messages(request);
+    var last = vec_get(msgs, vec_len(msgs) - 1);
+    if (agnosai_chat_message_role(last) == AGNOSAI_ROLE_TOOL) {
+        store64(out_response, agnosai_hoosh_response_from_body_a(a, _t_tool_body("done", 0)));
+        return 0;
+    }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"double\",");
+    str_builder_add_cstr(sb, "\"arguments\":\"{}\"}},{\"id\":\"c2\",\"type\":\"function\",\"function\":");
+    str_builder_add_cstr(sb, "{\"name\":\"missing\",\"arguments\":\"{}\"}},{\"id\":\"c3\",\"type\":\"function\",");
+    str_builder_add_cstr(sb, "\"function\":{\"name\":\"boom\",\"arguments\":\"{}\"}}]");
+    store64(out_response, agnosai_hoosh_response_from_body_a(a, _t_tool_body("",
+          str_cstr(str_builder_build(sb)))));
+    return 0;
+}
+
+fn _t_tool_spec(process, n): i64 {
+    var spec = agnosai_crew_new(str_from("lc-tools"));
+    var tools = vec_new();
+    vec_push(tools, str_from("double"));
+    vec_push(tools, str_from("boom"));
+    var agent = agnosai_agent_new(str_from("worker"), str_from("tester"), str_from("test things"));
+    agnosai_agent_with_tools(agent, tools);
+    var agents = vec_new();
+    vec_push(agents, agent);
+    agnosai_crew_with_agents(spec, agents);
+    var ts = vec_new();
+    for (var i = 0; i < n; i = i + 1) { vec_push(ts, _t_task("use the tool")); }
+    agnosai_crew_with_tasks(spec, ts);
+    agnosai_crew_with_process(spec, process);
+    return spec;
+}
+
+fn _t_tool_events(process, n, name): i64 {
+    var spec = _t_tool_spec(process, n);
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_tool_new(str_from("double"), str_from("doubles"),
+        &_t_tool_schema, &_t_tool_exec, 0));
+    agnosai_tool_registry_register(reg, agnosai_tool_new(str_from("boom"), str_from("breaks"),
+        &_t_tool_schema, &_t_boom_exec, 0));
+    var sub: i64[1];
+    var r = _t_runner(spec, &_t_tool_chat, &sub);
+    agnosai_crew_runner_with_tools(r, reg, 0);
+    var err: i64[1];
+    store64(&err, 0);
+    agnosai_crew_runner_run(r, &err);
+    var evs = _t_drain(load64(&sub));
+    _tl_assert_legal(evs, agnosai_crew_id(spec), name);
+    return evs;
+}
+
+fn test_tool_events(): i64 {
+    var evs = _t_tool_events(agnosai_process_sequential(), 2, "a sequential crew whose tasks call tools");
+    assert_eq(_t_count(evs, "tool_call_started"), 4, "each task's two held tools say they started");
+    assert_eq(_t_count(evs, "tool_call_completed"), 6, "and each call, held or not, says how it ended");
+    var ok = 0;
+    var refused = 0;
+    var broke = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        var ev = vec_get(evs, i);
+        if (str_eq_cstr(agnosai_crew_event_event_type(ev), "tool_call_completed") == 1) {
+            var st = _t_str_of(ev, "status");
+            if (str_eq_cstr(st, "ok") == 1 && str_eq_cstr(_t_str_of(ev, "tool"), "double") == 1) { ok = ok + 1; }
+            if (str_eq_cstr(st, "error") == 1 && str_eq_cstr(_t_str_of(ev, "tool"), "boom") == 1) { broke = broke + 1; }
+            if (str_eq_cstr(st, "refused") == 1 && str_eq_cstr(_t_str_of(ev, "tool"), "unknown_tool") == 1
+              && str_eq_cstr(_t_str_of(ev, "asked"), "missing") == 1) {
+                refused = refused + 1;
+            }
+        }
+    }
+    assert_eq(ok, 2, "the held tool's calls end ok");
+    assert_eq(broke, 2, "the one that fails ends error");
+    assert_eq(refused, 2, "and the unheld one's are refused, never having started, named as the transcript names them");
+    var first = _t_find(evs, "tool_call_started");
+    assert(str_eq_cstr(_t_str_of(first, "call_id"), "c1") == 1, "an event names its call");
+    var pe = _t_tool_events(agnosai_process_parallel(2), 4, "a parallel crew whose tasks call tools");
+    assert_eq(_t_count(pe, "tool_call_completed"), 12, "from its workers too");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    agnosai_model_set_tier_override(AGNOSAI_TIER_FAST, str_from("stub-model"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("stub-model"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_PREMIUM, str_from("stub-model"));
+    test_checker_refuses();
+    test_seq();
+    test_modes();
+    test_endings();
+    test_late_subscriber();
+    test_unwatched_costs_nothing();
+    test_seq_under_concurrency();
+    test_approvals();
+    test_registry_rollup();
+    test_tool_events();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

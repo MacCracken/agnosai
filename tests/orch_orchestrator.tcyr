@@ -53,6 +53,7 @@ include "src/tools/registry.cyr"
 include "src/tool_call.cyr"
 include "src/tool_loop.cyr"
 include "src/model_catalog.cyr"
+include "src/orchestrator/approval.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "src/crew_arena.cyr"
 include "src/orchestrator/orchestrator.cyr"
@@ -224,6 +225,8 @@ fn main() {
     assert_eq(agnosai_orchestrator_cancel_crew(o, live_id), 0, "cancelling a registered, unfinished crew works");
     assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, live_id)),
       AGNOSAI_CREW_CANCELLED, "and marks its registered state Cancelled IN PLACE");
+    assert_eq(agnosai_crew_state_reason(agnosai_orchestrator_crew(o, live_id)),
+      AGNOSAI_CREW_REASON_CANCELLED, "with its reason, so a poller is told why (ADR 032)");
     assert(agnosai_orchestrator_cancel_crew(o, live_id) != 0,
       "and a second cancel is refused too: CANCELLED is finished");
 
@@ -278,7 +281,7 @@ fn main() {
     assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(run_o, _t_cid)),
       AGNOSAI_CREW_COMPLETED, "and the registry ends on the terminal state, not RUNNING");
 
-    # --- a cyclic DAG never reaches the registry ---
+    # --- a cyclic DAG cannot run, and ends FAILED (ADR 032) ---
     var cyc = agnosai_crew_new(str_from("cyclic"));
     var t1 = agnosai_task_new(str_from("t1"));
     var t2 = agnosai_task_new(str_from("t2"));
@@ -293,12 +296,18 @@ fn main() {
     var before_entries = agnosai_audit_chain_count(chain);
     assert_eq(agnosai_orchestrator_run_crew(o, cyc), 0, "a cyclic spec returns no state");
 
-    # ⚠ The run-error arm puts PENDING back (ADR 022). It stores no terminal
-    # state, so a RUNNING left behind would read "running" forever, and RUNNING
-    # is not terminal, so eviction would never take it either.
-    assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, agnosai_crew_id(cyc))),
-      AGNOSAI_CREW_PENDING,
-      "a cyclic DAG's registry entry is left PENDING, as before RUNNING was stored — not RUNNING");
+    # ⚠ **It ends FAILED, with its reason (ADR 032).** Through 2.3.8 the run-error arm put PENDING
+    # back (ADR 022, decision 6), so a submitted crew read `pending` for good and a subscriber
+    # waited on it for good.
+    var cyc_state = agnosai_orchestrator_crew(o, agnosai_crew_id(cyc));
+    assert_eq(agnosai_crew_state_status(cyc_state), AGNOSAI_CREW_FAILED,
+      "a cyclic DAG's registry entry ends FAILED: not PENDING for good, and not RUNNING");
+    assert(agnosai_crew_state_reason(cyc_state) != 0 &&
+      str_eq(agnosai_crew_state_reason(cyc_state), str_from("invalid_dag")) == 1,
+      "with its reason, invalid_dag");
+    assert_eq(vec_len(agnosai_crew_state_results(cyc_state)), 0, "and no results, as no task ran");
+    assert(str_contains_cstr(bayan_json_v_build(agnosai_crew_state_to_value(cyc_state)),
+        "\"reason\":\"invalid_dag\"") == 1, "and the wire says why");
 
     # ⚠ **The REASON must reach the caller, not just the failure.** `run_crew`
     # built a `run_err` for `agnosai_crew_runner_run` and then returned a bare 0,
@@ -335,12 +344,51 @@ fn main() {
     assert_eq(agnosai_orchestrator_run_crew_err(oe, cyc2, 0), 0,
       "and a null out_err is accepted rather than dereferenced");
     var after_entries = agnosai_audit_chain_count(chain);
-    assert_eq(after_entries - before_entries, 1,
-      "and audits ONLY crew_accepted — no crew_finished, because the crew never ran; the oracle's \
-    `?` propagates before it can be recorded as having finished anything");
-    assert(str_eq(agnosai_audit_entry_event(
-          vec_get(agnosai_audit_chain_recent(chain, 1), 0)), str_from("crew_accepted")) == 1,
-      "the last entry is the acceptance");
+    assert_eq(after_entries - before_entries, 2,
+      "and audits crew_accepted and crew_finished: the trail says how it ended (ADR 032)");
+    var cyc_end = vec_get(agnosai_audit_chain_recent(chain, 1), 0);
+    assert(str_eq(agnosai_audit_entry_event(cyc_end), str_from("crew_finished")) == 1,
+      "the last entry is its end");
+    var cyc_md = agnosai_audit_entry_metadata(cyc_end);
+    assert(cyc_md != 0 && str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(cyc_md, "reason")),
+        "invalid_dag") == 1, "and the trail says why: invalid_dag");
+
+    # A subscriber gets a last word and its channel closes, which is what it waits on.
+    var cbus = agnosai_event_bus_new();
+    var co = agnosai_orchestrator_with_events(agnosai_orchestrator_new(_t_budget()), cbus);
+    var cyc3 = agnosai_crew_new(str_from("cyclic-3"));
+    var c3_a = agnosai_task_new(str_from("A"));
+    var c3_b = agnosai_task_new(str_from("B"));
+    agnosai_task_with_dependency(c3_a, agnosai_task_id(c3_b));
+    agnosai_task_with_dependency(c3_b, agnosai_task_id(c3_a));
+    var c3_tasks = vec_new();
+    vec_push(c3_tasks, c3_a);
+    vec_push(c3_tasks, c3_b);
+    agnosai_crew_with_tasks(cyc3, c3_tasks);
+    agnosai_crew_with_process(cyc3, agnosai_process_dag());
+    var c3_sub = agnosai_event_sender_subscribe(agnosai_event_bus_sender(cbus, agnosai_crew_id(cyc3)));
+    agnosai_orchestrator_run_crew(co, cyc3);
+    var c3_last = 0;
+    var c3_n = 0;
+    var c3_e = agnosai_event_sub_try_recv(c3_sub);
+    while (c3_e != 0) {
+        c3_last = c3_e;
+        c3_n = c3_n + 1;
+        c3_e = agnosai_event_sub_try_recv(c3_sub);
+    }
+    assert(c3_last != 0 && str_eq_cstr(agnosai_crew_event_event_type(c3_last), "crew_completed") == 1,
+      "a subscriber's last event from a crew that could not run is crew_completed");
+    if (c3_last != 0) {
+        var c3_d = agnosai_crew_event_data(c3_last);
+        assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(c3_d, "status")), "failed") == 1,
+          "saying failed");
+        assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(c3_d, "reason")), "invalid_dag") == 1,
+          "and why");
+        assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(c3_d, "task_count")), 0, "with no results");
+    }
+    assert_eq(c3_n, 2, "after crew_started, and nothing between: no task ran");
+    assert_eq(agnosai_event_sub_closed(c3_sub), 1, "and its channel closed: nobody waits on it for good");
+    assert_eq(agnosai_event_bus_len(cbus), 0, "and the bus holds no channel for it");
 
     # --- events: the channel is removed when the crew finishes ---
     var bus = agnosai_event_bus_new();
@@ -452,6 +500,8 @@ fn main() {
     assert_eq(vec_len(agnosai_crew_state_results(to_state)), 0,
       "with partial results DISCARDED, as the oracle does");
     assert_eq(agnosai_crew_state_profile(to_state), 0, "and no profile");
+    assert_eq(agnosai_crew_state_reason(to_state), AGNOSAI_CREW_REASON_TIMEOUT,
+      "and says why, timeout (ADR 032)");
     assert(str_eq_cstr(agnosai_crew_state_crew_id(to_state), "crew-x"),
       "carrying the crew id");
 

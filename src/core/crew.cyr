@@ -25,6 +25,9 @@ enum AgnosaiCrewStatus {
     AGNOSAI_CREW_COMPLETED = 2;
     AGNOSAI_CREW_FAILED = 3;
     AGNOSAI_CREW_CANCELLED = 4;
+    # Running, with at least one task waiting on a reviewer (ADR 032), as herdr's `blocked` rolls
+    # up. Not terminal. The Rust line had no such state.
+    AGNOSAI_CREW_AWAITING_APPROVAL = 5;
 }
 
 # CrewSpec heap layout — 80 bytes.
@@ -52,13 +55,14 @@ enum AgnosaiCrewSpecOff {
     AGN_CREW_SIZE = 88;
 }
 
-# CrewState heap layout — 32 bytes.
+# CrewState heap layout — 40 bytes. `REASON` says why a crew did not complete, or is 0 (ADR 032).
 enum AgnosaiCrewStateOff {
     AGN_CSTATE_CREW_ID = 0;
     AGN_CSTATE_STATUS = 8;
     AGN_CSTATE_RESULTS = 16;
     AGN_CSTATE_PROFILE = 24;
-    AGN_CSTATE_SIZE = 32;
+    AGN_CSTATE_REASON = 32;
+    AGN_CSTATE_SIZE = 40;
 }
 
 # CrewProfile heap layout — 56 bytes.
@@ -93,6 +97,7 @@ fn agnosai_crew_status_to_wire_a(a, status): i64 {
     if (status == AGNOSAI_CREW_COMPLETED) { return AGN_JV_COMPLETED; }
     if (status == AGNOSAI_CREW_FAILED) { return AGN_JV_FAILED; }
     if (status == AGNOSAI_CREW_CANCELLED) { return AGN_JV_CANCELLED; }
+    if (status == AGNOSAI_CREW_AWAITING_APPROVAL) { return AGN_JV_AWAITING_APPROVAL; }
     return AGN_JV_PENDING;
 }
 
@@ -108,6 +113,7 @@ fn agnosai_crew_status_from_wire(s: Str): i64 {
     if (str_eq_cstr(s, "completed") == 1) { return AGNOSAI_CREW_COMPLETED; }
     if (str_eq_cstr(s, "failed") == 1) { return AGNOSAI_CREW_FAILED; }
     if (str_eq_cstr(s, "cancelled") == 1) { return AGNOSAI_CREW_CANCELLED; }
+    if (str_eq_cstr(s, "awaiting_approval") == 1) { return AGNOSAI_CREW_AWAITING_APPROVAL; }
     return AGNOSAI_CREW_PENDING;
 }
 
@@ -643,6 +649,7 @@ fn agnosai_crew_state_new_a(a, crew_id, status): i64 {
     store64(s + AGN_CSTATE_STATUS, status);
     store64(s + AGN_CSTATE_RESULTS, vec_new_a(a));
     store64(s + AGN_CSTATE_PROFILE, 0);
+    store64(s + AGN_CSTATE_REASON, 0);
     return s;
 }
 
@@ -664,6 +671,36 @@ fn agnosai_crew_state_results(s): i64 {
 # Execution profile, or 0 when unset.
 fn agnosai_crew_state_profile(s): i64 {
     return load64(s + AGN_CSTATE_PROFILE);
+}
+
+# Why a crew did not complete, one of the `AGNOSAI_CREW_REASON_*` words, or 0 (ADR 032).
+fn agnosai_crew_state_reason(s): i64 {
+    return load64(s + AGN_CSTATE_REASON);
+}
+
+# Say why a crew did not complete: one of the `AGNOSAI_CREW_REASON_*` words. Returns the state.
+fn agnosai_crew_state_with_reason(s, reason: Str): i64 {
+    store64(s + AGN_CSTATE_REASON, reason);
+    return s;
+}
+
+# Why a crew ended without completing (ADR 032), each minted once for the process. The first
+# four are the crew span's `error.type` words (ADR 023). `not_started` is a submitted crew whose
+# thread would not start.
+var AGNOSAI_CREW_REASON_TASK_FAILED = str_from("task_failed");
+var AGNOSAI_CREW_REASON_TIMEOUT = str_from("timeout");
+var AGNOSAI_CREW_REASON_CANCELLED = str_from("cancelled");
+var AGNOSAI_CREW_REASON_INVALID_DAG = str_from("invalid_dag");
+var AGNOSAI_CREW_REASON_NOT_STARTED = str_from("not_started");
+
+# The reason word `s` spells, or 0 for one that is none of them.
+fn agnosai_crew_reason_from_wire(s: Str): i64 {
+    if (str_eq(s, AGNOSAI_CREW_REASON_TASK_FAILED) == 1) { return AGNOSAI_CREW_REASON_TASK_FAILED; }
+    if (str_eq(s, AGNOSAI_CREW_REASON_TIMEOUT) == 1) { return AGNOSAI_CREW_REASON_TIMEOUT; }
+    if (str_eq(s, AGNOSAI_CREW_REASON_CANCELLED) == 1) { return AGNOSAI_CREW_REASON_CANCELLED; }
+    if (str_eq(s, AGNOSAI_CREW_REASON_INVALID_DAG) == 1) { return AGNOSAI_CREW_REASON_INVALID_DAG; }
+    if (str_eq(s, AGNOSAI_CREW_REASON_NOT_STARTED) == 1) { return AGNOSAI_CREW_REASON_NOT_STARTED; }
+    return 0;
 }
 
 # Attach an execution profile. Returns the state.
@@ -707,6 +744,7 @@ var AGN_JK_COST_USD = str_from("cost_usd");
 var AGN_JK_AGENT_COST = str_from("agent_cost_usd");
 var AGN_JK_TASK_COST = str_from("task_cost_usd");
 var AGN_JK_SANDBOX_STR = str_from("sandbox_strength");
+var AGN_JK_REASON = str_from("reason");
 
 # The crew state as a bayan JSON value. `profile` is **omitted** when unset,
 # matching the oracle's `skip_serializing_if = "Option::is_none"`.
@@ -716,6 +754,9 @@ fn agnosai_crew_state_to_value_a(a, s): i64 {
       bayan_json_v_str_new_a(a, load64(s + AGN_CSTATE_CREW_ID)));
     bayan_json_v_obj_set_a(a, obj, AGN_JK_STATUS,
       bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire_a(a, load64(s + AGN_CSTATE_STATUS))));
+    # Omitted when there is none, as `profile` is (ADR 032). The Rust line had no such field.
+    var reason = load64(s + AGN_CSTATE_REASON);
+    if (reason != 0) { bayan_json_v_obj_set_a(a, obj, AGN_JK_REASON, bayan_json_v_str_new_a(a, reason)); }
 
     var results = load64(s + AGN_CSTATE_RESULTS);
     var results_v = bayan_json_v_arr_new_a(a);
@@ -752,6 +793,10 @@ fn agnosai_crew_state_from_value(v): i64 {
     }
 
     var s = agnosai_crew_state_new(id, status);
+    var why = bayan_json_v_obj_get_by_cstr(v, "reason");
+    if (why != 0 && bayan_json_v_is_str(why) == 1) {
+        store64(s + AGN_CSTATE_REASON, agnosai_crew_reason_from_wire(bayan_json_v_str(why)));
+    }
 
     var rv = bayan_json_v_obj_get_by_cstr(v, "results");
     if (rv != 0 && bayan_json_v_is_arr(rv) == 1) {

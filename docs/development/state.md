@@ -2,9 +2,29 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-12 (the 2.3.8 release gate).
+> Last refreshed: 2026-11-12 (the 2.4.0 release gate).
 
-## Now — 2.3.8
+## Now — 2.4.0
+
+| | |
+|---|---|
+| **version** | **2.4.0** (cut 2026-11-12, `version-bump.sh`'s UTC date): the crew lifecycle is one state machine, written down in ADR 032 and checked as an invariant. Every event is numbered, a high-risk task's answer waits for a reviewer, and a crew that cannot run ends `failed` |
+| **cyrius pin** | **6.7.18**, unchanged, the latest tag |
+| **tests** | **109 suites, 12,192 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.3.8's tree read 11,989: +203, `orch_lifecycle` new at 107. **64 mutants, all killed**, in five bites: the never-ran crew and its reason 19, `seq` 12, completion order 2, the approval gate 25, tool-call events 6. A first pass let four through, each a gap in a new test (a cancelled cyclic crew's last word, the orchestrator's timeout state and its audit carrying the reason, a tool call that fails), and all were closed. A full `cyrius test` leaves nothing in `/tmp` |
+| **coverage** | **99%**: 108/108 files, 1,936/1,946 fns (gate `--min 80`), the same 10 unreferenced as 2.3.8 |
+| **dist** | `dist/agnosai.cyr` 47,506 lines + `dist/agnosai-guard.cyr` 1,034, both v2.4.0, by `wc -l` (2.3.8's read 46,930 and 1,034). Sidecars **6 / 1** leaves, unchanged |
+| **binary** | `build/agnosai` **3,073,192 B** (2.3.8: 3,056,320). aarch64 **7,103,176 B** (7,102,688), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.4.0"` and exits 0 on SIGTERM |
+| **deps** | Unchanged from 2.3.8: every pin on its latest tag. hoosh at 2.12.3 |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh` 3,383 definitions across 119 files; `check-clean.sh` fmt 242, lint 242, doc 120, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths; dist. Then build, aarch64, tests under DCE, coverage, the example built and run, fuzz 4/4, `distlib --all --check`. **The `ubuntu:26.04` CI replica ran** on the bumped tree laid over a clean copy, as a fresh user, wasmtime 47.0.3, all 8 pins from GitHub: every `ci.yml` step passed, 109 suites, 12,048 assertions, 0 failed, `orch_lifecycle` all 107, and `cyrius bench` |
+| **benchmarks** | The interleaved A/B against a 2.3.8 build on the same `lib/`, four rounds of `orch`, `server`, `core` and `tools` at a mean load of 1.55: **median +0.0% across 170 rows**, 164 within 5%. `orchestrator_new` +33.5%, 3.2 → 4.3 µs, the gate each orchestrator mints. `task_four_tool_calls_at_once` and `_kept` −38%, not claimed: alone in a process both builds read about 250 µs, three runs each, so it is what the rows before them leave (roadmap 2.7.1). `bench-history.csv` has 249 rows at 2.4.0, one sweep at a load of 1.1–1.8: median −0.8% against 2.3.8's rows, not claimed |
+| **the lifecycle** | `tests/orch_lifecycle.tcyr` replays every stream it runs through ADR 032's table, and is first shown streams it must refuse: a task event before `crew_started`, a `task_completed` for a task never started, a `seq` gap, a failed crew with no reason. Every process mode, a failing branch, a cancel and a deadline mid-run, a cancel before the first task, a cycle, 24 tasks on 8 workers, a subscriber that attaches mid-run, approvals in each outcome, and tool calls ok, failing and refused |
+| **approvals** | **End to end through the binary**: a crew posted with a `high` task waited, `GET /api/v1/approvals` listed it, `POST /api/v1/approvals` approved it and the crew completed with its answers; rejected, it failed `task_failed` with `output withheld: approval rejected (reviewer)`. In the suites: the registry reads `awaiting_approval` while a task waits and `running` once it is decided, a cancel ends a wait at once, a deadline times the crew out, no gate rejects at once, `medium` only when asked, and every decision is audited |
+| **build warnings** | Unchanged from 2.3.8: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines, and the two `src/tool_loop.cyr` "assigning non-pointer to typed pointer" lines |
+| **consumer** | Not re-run. agnostic pins 2.2.4. ⚠ A `high` task waits for a reviewer, a crew that cannot run reads `failed`, `task_completed` comes in completion order, events carry `seq` (CHANGELOG *Behaviour changes*). agnostic accepts `risk` from its users, so its `high` tasks will wait on `agnosai_orchestrator_approval_gate(o)` once it re-pins |
+| **upstream filings** | ⚠ **Six not committed**, so not visible upstream: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies; the pooled connection's allocator), bote (MCP client) |
+
+### 2.3.8 — the release (2026-11-12)
 
 | | |
 |---|---|

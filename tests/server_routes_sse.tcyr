@@ -142,6 +142,12 @@ fn _t_stream_thread(arg): i64 {
 # 0, the handler takes the unknown-crew path, and every assertion below still
 # has something to match on the wrong frame.
 fn _t_run_live(state, id_raw: Str, live_id: Str): Str {
+    return _t_run_live_sending(state, id_raw, live_id, 0);
+}
+
+# `_t_run_live`, sending `ev` through the crew's sender once the handler has subscribed, and
+# letting the handler stream it before the crew is torn down. `ev` of 0 sends nothing.
+fn _t_run_live_sending(state, id_raw: Str, live_id: Str, ev): Str {
     _t_thread_state = state;
     _t_thread_fd = _t_open_capture();
     _t_thread_id = id_raw;
@@ -158,6 +164,10 @@ fn _t_run_live(state, id_raw: Str, live_id: Str): Str {
     }
     assert(agnosai_event_sender_receiver_count(tx) >= 2,
       "the handler subscribed before the crew was torn down");
+    if (ev != 0) {
+        agnosai_event_sender_send(tx, ev);
+        sleep_ms(200);
+    }
 
     agnosai_event_bus_remove(bus, live_id);
 
@@ -224,6 +234,17 @@ fn main(): i64 {
     _t_has(live, "SSE stream connected", "carrying the oracle's message");
     _t_has(live, _T_CREW, "and the crew id");
     _t_lacks(live, "crew not found", "and never claims the crew is missing");
+    _t_lacks(live, "id: ", "and the connected frame carries no id: it is no crew event (ADR 032)");
+
+    # --- past the oracle: a crew event's frame carries its seq as `id:` (ADR 032) ---
+    var s5 = _t_state();
+    agnosai_event_bus_subscribe(agnosai_app_state_events(s5), str_from(_T_CREW));
+    var td = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(td, str_from("task_id"), bayan_json_v_str_new(str_from("t-1")));
+    var seqd = _t_run_live_sending(s5, str_from(_T_CREW), str_from(_T_CREW),
+      agnosai_crew_event_new(str_from(_T_CREW), str_from("task_started"), td));
+    _t_has(seqd, "id: 1\nevent: task_started\ndata: ", "a crew event's frame says its seq as the SSE id");
+    _t_has(seqd, "\"seq\":1", "and its JSON carries the same seq");
 
     # --- past the oracle: an UPPERCASE id finds a lowercase crew ------------
     # `agnosai_uuid_parse` accepts uppercase hex and crew ids are minted

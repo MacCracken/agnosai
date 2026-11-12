@@ -212,7 +212,9 @@ enum AgnosaiToolTaskOff {
     AGN_TT_STOPPED = 96;
     # Every call id this task has used, in `ra`.
     AGN_TT_SEEN = 104;
-    AGN_TT_SIZE = 112;
+    # The sender this task's crew events go on, or 0 (ADR 032).
+    AGN_TT_EVENT_TX = 112;
+    AGN_TT_SIZE = 120;
 }
 
 # One call of one turn. `ST` is its task. The fields a callback reads have accessors below.
@@ -423,7 +425,48 @@ fn _agnosai_tool_task_new_a(a, ra, loop, task, agent, parent_sc, out_err): i64 {
     store64(st + AGN_TT_DROPPED, 0);
     store64(st + AGN_TT_STOPPED, 0);
     store64(st + AGN_TT_SEEN, vec_new_a(ra));
+    store64(st + AGN_TT_EVENT_TX, 0);
     return st;
+}
+
+# Send this task's tool calls to its crew's watchers, on `tx` (ADR 032). Returns the state.
+fn _agnosai_tool_task_with_events(st, tx): i64 {
+    store64(st + AGN_TT_EVENT_TX, tx);
+    return st;
+}
+
+# Send `tool_call_started` for `c`, or `tool_call_completed` with its status when `done` is 1:
+# `ok`, `error`, or `refused` for a call that never ran (ADR 032). Only when someone is
+# subscribed. ⚠ **In the crew's allocator, not the turn's**: the turn's arena goes back when the
+# task ends, and a subscriber may still hold the event, so the call's id and name are copied.
+fn _agnosai_tool_emit(st, c, done): i64 {
+    var tx = load64(st + AGN_TT_EVENT_TX);
+    if (tx == 0) { return 0; }
+    if (agnosai_event_sender_receiver_count(tx) == 0) { return 0; }
+    var a = load64(st + AGN_TT_ALLOC);
+    var d = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "task_id"),
+      bayan_json_v_str_new_a(a, agnosai_task_id(load64(st + AGN_TT_TASK))));
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "call_id"),
+      bayan_json_v_str_new_a(a, str_clone_a(a, load64(c + AGN_TC_ID))));
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "tool"),
+      bayan_json_v_str_new_a(a, str_clone_a(a, load64(c + AGN_TC_NAME))));
+    # A name the agent does not hold is `unknown_tool`, as in the transcript; what the model asked
+    # for goes beside it, as in the record, when it was a name a provider would take.
+    if (load64(c + AGN_TC_ASKED) != 0) {
+        bayan_json_v_obj_set_a(a, d, str_from_a(a, "asked"),
+          bayan_json_v_str_new_a(a, str_clone_a(a, load64(c + AGN_TC_ASKED))));
+    }
+    var type = "tool_call_started";
+    if (done == 1) {
+        type = "tool_call_completed";
+        var status = "error";
+        if (load64(c + AGN_TC_REFUSED) == 1) { status = "refused"; }
+        elif (agnosai_tool_output_success(load64(c + AGN_TC_OUTPUT)) == 1) { status = "ok"; }
+        bayan_json_v_obj_set_a(a, d, str_from_a(a, "status"), bayan_json_v_str_new_a(a, str_from_a(a, status)));
+    }
+    return agnosai_event_sender_send(tx, agnosai_crew_event_new_a(a, agnosai_tool_call_crew_id(c),
+        str_from_a(a, type), d));
 }
 
 # What to put in a request's `tools`.
@@ -970,6 +1013,7 @@ fn _agnosai_tool_turn_journal_intents(st, calls): i64 {
                 _agnosai_tool_call_refuse_a(ra, c, str_builder_build_a(ra, sb));
             } else {
                 _agnosai_tool_audit(st, c, "tool_call_started", "info");
+                _agnosai_tool_emit(st, c, 0);
             }
         }
     }
@@ -1129,6 +1173,7 @@ fn _agnosai_tool_turn_deliver(st, request, calls): i64 {
         store64(st + AGN_TT_SPENT, load64(st + AGN_TT_SPENT) + str_len(wrapped));
         agnosai_inference_request_say_tool_result(request, load64(c + AGN_TC_ID), wrapped);
         _agnosai_tool_call_record_a(st, c, finding, held);
+        _agnosai_tool_emit(st, c, 1);
     }
     return 0;
 }

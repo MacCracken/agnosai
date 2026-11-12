@@ -72,7 +72,8 @@ agnosai_crew_with_process(crew, agnosai_process_parallel(2));
 # Each wave spawns real OS threads and joins them before the next.
 var state = agnosai_orchestrator_run_crew(orchestrator, crew);
 // All 4 tasks complete, but at most 2 run simultaneously.
-// Result order may differ from input order.
+// Results come back in dispatch order; `task_completed` events in completion
+// order (2.4.0, ADR 032).
 ```
 
 `max_concurrency` controls how many tasks run at once. ⚠ There is no semaphore —

@@ -32,7 +32,9 @@ enum AgnosaiTaskReqOff {
     AGN_TREQ_PRIORITY = 16;
     AGN_TREQ_HAS_PRIORITY = 24;
     AGN_TREQ_DEPENDENCIES = 32;
-    AGN_TREQ_SIZE = 40;
+    # The task's risk, `low` when it is not given (2.4.0, ADR 032). The Rust line's request had none.
+    AGN_TREQ_RISK = 40;
+    AGN_TREQ_SIZE = 48;
 }
 
 # `description` is the only required field; the rest are `#[serde(default)]`.
@@ -45,6 +47,7 @@ fn agnosai_task_req_new_a(a, description: Str): i64 {
     store64(t + AGN_TREQ_PRIORITY, AGNOSAI_PRIORITY_NORMAL);
     store64(t + AGN_TREQ_HAS_PRIORITY, 0);
     store64(t + AGN_TREQ_DEPENDENCIES, vec_new_a(a));
+    store64(t + AGN_TREQ_RISK, AGNOSAI_RISK_LOW);
     return t;
 }
 
@@ -63,6 +66,8 @@ fn agnosai_task_req_priority(t): i64 { return load64(t + AGN_TREQ_PRIORITY); }
 fn agnosai_task_req_has_priority(t): i64 { return load64(t + AGN_TREQ_HAS_PRIORITY); }
 # The task ids this one waits on — empty, never 0.
 fn agnosai_task_req_dependencies(t): i64 { return load64(t + AGN_TREQ_DEPENDENCIES); }
+# The task's risk, an `AGNOSAI_RISK_*`, `low` when the request gave none.
+fn agnosai_task_req_risk(t): i64 { return load64(t + AGN_TREQ_RISK); }
 
 # The fields serde accepts on `TaskRequest`, which is `deny_unknown_fields`.
 fn _agnosai_task_req_fields_a(a): i64 {
@@ -71,6 +76,7 @@ fn _agnosai_task_req_fields_a(a): i64 {
     agnosai_route_field_a(a, f, "expected_output");
     agnosai_route_field_a(a, f, "priority");
     agnosai_route_field_a(a, f, "dependencies");
+    agnosai_route_field_a(a, f, "risk");
     return f;
 }
 
@@ -84,8 +90,13 @@ fn _agnosai_task_req_fields(): i64 {
 # Rejection cases, all of which are serde deserialization failures and so 422 at
 # the endpoint: not an object, an unknown field, a missing or non-string
 # `description`, a non-string `expected_output`, a `priority` that is not one of
-# the five wire spellings, or a `dependencies` that is not an array of
-# non-negative integers.
+# the five wire spellings, a `risk` that is not one of the three, or a
+# `dependencies` that is not an array of non-negative integers.
+#
+# **`risk` is past the Rust line** (2.4.0, ADR 032): a `high` task's answer
+# waits for a reviewer on `/api/v1/approvals`, and without the field no crew
+# this route runs could have one. It is validated as `priority` is: an unknown
+# spelling is refused, never read as `low`.
 #
 # **`priority` is validated, not coerced.** `agnosai_task_priority_from_wire`
 # falls back to Normal on an unknown spelling, which is right for a stored
@@ -112,6 +123,14 @@ fn agnosai_task_req_from_value_a(a, v): i64 {
         if (_agnosai_priority_is_known(ps) == 0) { return 0; }
         store64(t + AGN_TREQ_PRIORITY, agnosai_task_priority_from_wire(ps));
         store64(t + AGN_TREQ_HAS_PRIORITY, 1);
+    }
+
+    var rv = bayan_json_v_obj_get_by_cstr(v, "risk");
+    if (rv != 0 && bayan_json_v_is_null(rv) == 0) {
+        if (bayan_json_v_is_str(rv) == 0) { return 0; }
+        var rs = bayan_json_v_str(rv);
+        if (_agnosai_risk_is_known(rs) == 0) { return 0; }
+        store64(t + AGN_TREQ_RISK, agnosai_task_risk_from_wire(rs));
     }
 
     var dv = bayan_json_v_obj_get_by_cstr(v, "dependencies");
@@ -150,6 +169,15 @@ fn _agnosai_priority_is_known(s: Str): i64 {
     if (str_eq_cstr(s, "normal") == 1) { return 1; }
     if (str_eq_cstr(s, "high") == 1) { return 1; }
     if (str_eq_cstr(s, "critical") == 1) { return 1; }
+    return 0;
+}
+
+# Whether a string is one of `TaskRisk`'s three wire spellings, as `agnosai_task_risk_from_wire`
+# reads anything else as `low`.
+fn _agnosai_risk_is_known(s: Str): i64 {
+    if (str_eq_cstr(s, "low") == 1) { return 1; }
+    if (str_eq_cstr(s, "medium") == 1) { return 1; }
+    if (str_eq_cstr(s, "high") == 1) { return 1; }
     return 0;
 }
 
@@ -492,6 +520,7 @@ fn _agnosai_route_build_spec(r): i64 {
         if (agnosai_task_req_has_priority(tr) == 1) {
             agnosai_task_with_priority(t, agnosai_task_req_priority(tr));
         }
+        agnosai_task_with_risk(t, agnosai_task_req_risk(tr));
         vec_push(tasks, t);
     }
 
@@ -584,6 +613,11 @@ fn agnosai_route_create_crew_tp_a(a, state, body: Str, tp: Str): i64 {
       bayan_json_v_str_new_a(a, agnosai_crew_state_crew_id(st)));
     bayan_json_v_obj_set_a(a, obj, AGN_JK_STATUS,
       bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire(agnosai_crew_state_status(st))));
+    # Why it did not complete, omitted when it did (ADR 032). The Rust line had no such field.
+    if (agnosai_crew_state_reason(st) != 0) {
+        bayan_json_v_obj_set_a(a, obj, AGN_JK_REASON,
+          bayan_json_v_str_new_a(a, agnosai_crew_state_reason(st)));
+    }
 
     var results = agnosai_crew_state_results(st);
     var arr = bayan_json_v_arr_new_a(a);

@@ -280,6 +280,7 @@ Create and execute a crew. The server assembles the crew from the provided agent
 | `expected_output` | string | no | Description of the expected result |
 | `priority` | string | no | `"background"`, `"low"`, `"normal"` (default), `"high"`, or `"critical"` |
 | `dependencies` | array of int | no | Indices into the tasks array indicating which tasks must complete first |
+| `risk` | string | no | `"low"` (default), `"medium"` or `"high"`. A `high` task's answer waits for a reviewer on `/api/v1/approvals` (2.4.0; the Rust line had no such field) |
 
 **Agent definition fields:**
 
@@ -332,34 +333,29 @@ Create and execute a crew. The server assembles the crew from the provided agent
 Retrieve a crew's state from the orchestrator's registry: its `crew_id`, `status`, `results`, and
 its `profile` once it has finished.
 
-`status` moves `pending` → `running` → `completed` | `failed` | `cancelled`. A crew is `pending` from
-the moment it is registered, `running` once it is handed to its runner, and holds its terminal
-status when it finishes. A cancel marks it `cancelled` at once and stands even if it lands before
-the crew starts; a cancel of a crew that has already finished answers **409** and changes nothing
-(2.1.6 — it used to relabel it `cancelled`). A timed-out crew is `failed` with no results and no
-profile. A `dag` crew whose failed task stranded the tasks that depend on it ends `failed` with
-the results it has (2.1.6).
-([ADR 022](../adr/022-crew-events-and-status-say-what-happened.md))
+`status` moves `pending` → `running` → `completed` | `failed` | `cancelled`, and between `running` and
+`awaiting_approval` while any of its tasks waits on a reviewer (2.4.0, [ADR 032](../adr/032-the-crew-lifecycle-is-one-state-machine.md)).
+A crew is `pending` from the moment it is registered, `running` once it is handed to its runner, and holds its terminal
+status when it finishes. A cancel marks it `cancelled` at once and stands even if it lands before the crew starts; a
+cancel of a crew that has already finished answers **409** and changes nothing (2.1.6). A timed-out crew is `failed`
+with no results and no profile. A `dag` crew whose failed task stranded the tasks that depend on it ends `failed` with
+the results it has (2.1.6). ([ADR 022](../adr/022-crew-events-and-status-say-what-happened.md))
 
-**One edge runs backwards: `running` → `pending`.** A DAG crew whose run ends in an error rather
-than a state goes back to `pending` and stays there, since that arm stores no terminal status. A
-poller can see it go `running` first, because the crew is marked `running` before its runner
-checks the DAG. There are two such errors:
+**`reason`** says why a crew that did not complete ended, and is left out when it did: `task_failed`, `timeout`,
+`cancelled`, `invalid_dag` (its tasks form a cycle, or depend on one the spec does not hold) or `not_started` (a
+submitted crew whose thread would not start). `POST /api/v1/crews` and this route both carry it (2.4.0).
 
-- **A cyclic DAG.** The runner's topological sort fails before any task runs, so the crew sends
-  `crew_started` and no task events.
-- **A DAG deadlock.** A task that depends on an id not in the spec is never ready, and the sort
-  does not catch it, since it skips dependency ids it cannot find. Every wave before the stuck
-  task runs, and those tasks send `task_started`, `task_completed` and `token` events as usual.
-  Then the crew goes back to `pending`. (Through 2.1.5 a failed branch beside a successful one
-  reached this arm too; since 2.1.6 that run ends `failed`.)
+**No edge runs backwards since 2.4.0.** Through 2.3.8 a DAG crew that could not run went `running` → `pending` and
+stayed there; it now ends `failed` with `reason: invalid_dag` and sends `crew_completed`. `POST /api/v1/crews` cannot
+produce one: its `dependencies` are task indices, range-checked and cycle-checked, so such a request gets a 400 before
+the crew is registered. An embedding caller that builds its own spec can.
 
-Neither error sends `crew_completed`. The run returns the error instead of a state.
-
-`POST /api/v1/crews` cannot produce either error. Its `dependencies` are task indices, and the
-route range-checks and cycle-checks them, so such a request gets a 400 before the crew is
-registered. Only an embedding caller can reach this edge: one that builds its own spec and runs it
-through `agnosai_orchestrator_submit_crew` or `agnosai_orchestrator_run_crew_err`.
+**A task whose risk is `high` waits for a reviewer** (2.4.0). Its answer is held, the task reads `awaiting_approval`,
+and `GET /api/v1/approvals` lists it until `POST /api/v1/approvals` decides, the gate's five minutes pass, or the crew
+is cancelled or runs out of time. Approved, the answer stands. Anything else rejects: the task fails, and its output is
+`output withheld: approval rejected (<reason>)`. A `medium` task waits too when the orchestrator is told so. The task's
+result `metadata` gains `approval` (`approved` or `rejected`) and `approval_reason`. ⚠ A `POST /api/v1/crews` holding
+such a task holds its connection, and a pool worker, while it waits.
 
 A task whose agent called tools adds `metadata.tool_calls`, and an entry in this response's `results`
 gains the same list as `tool_calls`, one entry per call in the order the model made them: `id`, `tool`, `arguments`, `effect` (`committed`, `none` or `unknown`), `success`, and
@@ -393,38 +389,44 @@ so a crew stays readable until 900 others have ended after it. A malformed id is
 
 ### Crew events — GET /api/v1/crews/:id/stream
 
-A Server-Sent Events stream of one crew's progress. Each frame is `event: <type>` and
-`data: <json>`, where the JSON is `{"crew_id", "event_type", "data"}`. Every event carries the
-crew's own id.
+A Server-Sent Events stream of one crew's progress. Each frame is `id: <seq>`, `event: <type>` and
+`data: <json>`, where the JSON is `{"crew_id", "event_type", "seq", "data"}`. Every event carries the
+crew's own id ([ADR 032](../adr/032-the-crew-lifecycle-is-one-state-machine.md)).
+
+**`seq` numbers the events the crew's sender delivered**, from 1, in the one order every subscriber sees, whatever
+thread sent each. A subscriber attached for the whole run sees 1, 2, 3 … with no gap, so a gap is an event its buffer
+dropped. An event nobody was subscribed to receive takes no number, so one that attaches mid-run starts where the count
+had reached. The stream's own `connected` and `error` frames have no `seq` and no `id:`. Nothing is replayed from a
+`Last-Event-ID`.
 
 | `event_type` | When | `data` |
 |---|---|---|
 | `crew_started` | the run begins | `name`, `task_count` |
 | `task_started` | the task is dispatched — for a parallel or DAG crew, when its batch starts | `task_id`, `description`, `agent` (key or null) |
+| `tool_call_started` | a tool call is about to run | `task_id`, `call_id`, `tool` |
+| `tool_call_completed` | a tool call's result is delivered | `task_id`, `call_id`, `tool`, `status` (`ok`, `error`, `refused`), `asked` for a tool the agent does not hold |
 | `token` | an LLM-answered task succeeds — one per task, in every process mode | `task_id`, `token` (the whole output), `complete: true` |
-| `task_completed` | the task finishes — for a parallel or DAG crew, when its worker is joined (see below) | `task_id`, `status` |
-| `crew_completed` | the run ends | `status`, `task_count`, `wall_ms` |
+| `approval_requested` | the task's answer waits for a reviewer | `task_id`, `output`, `risk`, `agent` |
+| `approval_decided` | the wait ends | `task_id`, `decision` (`approved`, `rejected`), `reason` (`reviewer`, `timeout`, `cancelled`, `deadline`, `capacity`, `no_gate`) |
+| `task_completed` | the task finishes | `task_id`, `status` |
+| `crew_completed` | the run ends — the last event, on every exit | `status`, `reason` (unless `completed`), `task_count`, `wall_ms` |
 
-- A task's `token` precedes its `task_completed`. For a parallel or DAG crew, events of different
-  tasks interleave (`s0 s1 c0 c1 s2 …`): do not assume every `task_started` precedes every
-  `task_completed`.
-- A parallel or DAG crew joins each batch in dispatch order, so `task_completed` arrives in
-  dispatch order, not completion order. A task that finishes early is reported after any slower
-  task dispatched before it in the same batch. Every task of a batch is reported before the next
-  batch starts. A DAG wave is one batch.
-- A task stopped before dispatch, by a cancel or the deadline, gets neither `task_started` nor
-  `task_completed`.
-- `crew_completed`'s `status` matches the state `GET /api/v1/crews/:id` stores: a timed-out crew
-  says `failed` with `task_count: 0`.
-- A DAG crew whose run ends in an error sends no `crew_completed`. That covers a cyclic DAG and
-  a DAG deadlock (see the status lifecycle above). It sends `crew_started` and the task events of
-  any waves that ran.
-- The stream opens with a `connected` frame. A subscriber whose 256-event buffer overflows gets
-  an `error` frame (`stream lagged, N events dropped`) and the stream closes. Events sent before
-  a client subscribed are not replayed. The runner also checks for a subscriber only once per run
-  (sequential) or once per wave (parallel, DAG) before building `task_started` and
-  `task_completed`. A client that subscribes mid-run can therefore miss those events for the rest
-  of that run or wave. It still receives `crew_completed`, which is checked when the run ends.
+- Every event is a legal move of the lifecycle ADR 032 writes down, and `tests/orch_lifecycle.tcyr` checks every
+  stream it runs against it. A task's `token`, tool calls and approval events come between its `task_started` and
+  its `task_completed`. A refused tool call never ran, so it has `tool_call_completed` only.
+- For a parallel or DAG crew, events of different tasks interleave (`s0 s1 c1 c0 s2 …`): do not assume every
+  `task_started` precedes every `task_completed`.
+- **`task_completed` arrives in completion order** (2.4.0): a task that finishes early is reported before a slower one
+  dispatched before it. Every task of a batch is reported before the next batch starts, and a DAG wave is one batch.
+  The crew's `results` stay in dispatch order.
+- A task stopped before dispatch, by a cancel or the deadline, gets neither `task_started` nor `task_completed`.
+- `crew_completed`'s `status` and `reason` match the state `GET /api/v1/crews/:id` stores: a timed-out crew says
+  `failed`, `reason: timeout`, with `task_count: 0`. A crew that cannot run sends `crew_started` and `crew_completed`
+  (`failed`, `invalid_dag`) and nothing between.
+- The stream opens with a `connected` frame. A subscriber whose 256-event buffer overflows gets an `error` frame
+  (`stream lagged, N events dropped`) and the stream closes. Events sent before a client subscribed are not replayed.
+  The runner checks for a subscriber per task (sequential) and per batch (parallel, DAG), so a client that subscribes
+  mid-run is told about the tasks after it (2.4.0; through 2.3.8 it heard nothing until `crew_completed`).
 
 ---
 

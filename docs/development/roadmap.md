@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.3.8 (2026-11-12).**
+**Status as of 2.4.0 (2026-11-12).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.4.0** | The crew lifecycle as one state machine, with the approval gate wired |
 | **2.4.1** | Budgets, caps and crew concurrency enforced |
 | **2.4.2** | Hand a downstream task a summary, not a transcript |
 | **2.4.3** | Hierarchical crews: a manager and its workers |
@@ -75,7 +74,7 @@ simulated user of a load test one connection, took a tool's capabilities away un
 off the global heap, and put the tool list and a task's keys in order, 2.3.7 gave the Rust line's types their JSON
 forms and its log events their fields, and 2.3.8 took the network from a process or Python tool whose policy denies it
 (ADR 031's 2.3.8 addendum) and sent the chat span's `traceparent` to hoosh (ADR 023's 2.3.8 addendum). The line is
-done: 2.4.0 is next.
+done.
 
 ### 2.4.x — the orchestration contract
 
@@ -83,25 +82,10 @@ Source for the harness rules below: a comparison with [turnstone](https://github
 model proposes; the gate disposes"), mirrored in agnostic's roadmap (*Waiting on agnosai*), which holds agnosai to
 them.
 
-#### 2.4.0 — the crew lifecycle as one state machine, with the approval gate wired
-
-**Wire the approval gate, and write the crew and task lifecycle down as one state machine.** `orchestrator/approval.cyr`
-is built and its routes exist, but `crew_runner` never calls it. Add `awaiting_approval` to the task and crew states,
-and write the lifecycle down: the states, the legal transitions, and a **per-crew monotonic `seq` on every event**.
-Test it as an invariant: no event without a legal transition, and no `seq` gap. Build on
-[ADR 022](../adr/022-crew-events-and-status-say-what-happened.md). It inherits two gaps: a parallel batch reports
-`task_completed` in dispatch order where the oracle's `join_next` reports completion order, and the error arm's
-`running` → `pending` revert, which should become a terminal state (below). The model is herdr's self-report contract
-and its `blocked` roll-up. Tool calls get their events here too, as a watcher sees nothing of a task's turns today
-(ADR 029). **A model judge may only tighten:** if approvals gain an LLM judge, it may refuse what the rules allow and
-never allow what they refuse, and it gives its reasons from a fixed list. An automatic approval covers a whole batch or
-none of it, and anything uncertain goes to a human.
-
-**A crew whose tasks form a cycle stays `pending`, and its event channel stays open.** The run-error arm of
-`_agnosai_orch_finish_err` stores no terminal state (ADR 022) and returns before `agnosai_event_bus_remove`, so a
-submitted crew whose DAG is cyclic reads `pending` for good and a subscriber waits for good. **Done means:** a submitted
-crew that cannot run reaches a terminal state, with its reason, and its channel closes. It decides ADR 022's "the crew
-never ran", so it wants a line in that ADR.
+2.4.0 wrote the crew lifecycle down as one state machine and numbered its events, wired the approval gate, and gave a
+crew that cannot run a terminal state, a task's tool calls their events, and a batch's completions their own order
+([ADR 032](../adr/032-the-crew-lifecycle-is-one-state-machine.md)). Its rules for a model judge, should one be added,
+are written there.
 
 #### 2.4.1 — budgets, caps and crew concurrency enforced
 
@@ -114,7 +98,7 @@ lands (ADR 029).
 
 **Crew concurrency.** No cap on concurrent crews: `submit_crew` spawns a thread per call, where the Rust tree held a
 semaphore of `max_concurrent_tasks` (default 10). Parallel mode runs fixed batches, so one slow task idles the other
-slots until its batch ends. Both want a counting semaphore, which the stdlib does not have, so build one here. **The
+slots until its batch ends, and since 2.4.0 a task waiting on a reviewer holds its slot for as long as it waits. Both want a counting semaphore, which the stdlib does not have, so build one here. **The
 same semaphore caps outbound TLS at 64**, which stops a burst of 100 tripping sigil's lane pool (*Waiting on another
 project*) before sigil fixes it.
 
@@ -146,6 +130,10 @@ OpenHands' event sourcing. Build on 2.4.0's `seq` stream. Today agnostic answers
 `interrupted`; this is what would let it resume them. `durable_state` is on `lib/io.cyr`, not patra, and an
 event-sourced log may want patra's jsonl mode, which opens `O_APPEND` without `O_TRUNC`. The tool journal ADR 029 gives
 a consumer becomes agnosai's own here, so a resume can name its unknown effects.
+
+**A snapshot to resync from mid-run,** which agnostic waits on: a reader that fell behind the event ring reads each
+task's state and the crew's `seq`, and goes on from there. It needs a task's status and the crew's `seq` written under
+one lock (ADR 032), and the log is the record it reads.
 
 **The pluggable persistence trait (`StateStore`),** ported for the log to build on. `src/orchestrator/durable_state.cyr`'s
 header records why it is flat today: one implementor, no callers.
@@ -226,6 +214,11 @@ noise (`state.md`, "⚠ OPEN — a ~3.6x regression, found at 2.0.6"). Start fro
 always has other threads. **Direction:** find which stdlib path switches on a second live thread (mutex/futex, the
 allocator, `thread_create`, stack mmap). File it against cyrius if it is the stdlib. Then decide whether
 `benches/orch.bcyr` pins the level by starting one idle thread in `main`.
+
+**`task_four_tool_calls_at_once` and `_kept` read 150 µs at the end of `benches/orch.bcyr` and 250 µs alone**
+(measured at 2.4.0, both builds alike, three runs each). A 2.4.0 build read them 38% faster than 2.3.8's in the A/B
+with nothing on their path changed, so they move with what the rows before them leave behind, and want a file of their
+own as much as the two below.
 
 **`crew_runner_10_tasks_parallel_4_{quiet,watched}` measure the global heap's position, not the runner.** They cannot
 simply run first: 2.2.3 tried, and about 50 rows then read 25–157% slower at the threads-have-existed level (above).
@@ -434,14 +427,14 @@ and log fields at 2.3.6.
 | B34 | 2.7.2, housekeeping |
 | B33 | 2.3.1, and its hoosh half in 2.3.3 |
 | B35, B40 | shipped: confinement in 2.3.4 (ADR 031), and B40's WASM half in 2.3.3 with kavach 3.14.7 |
-| B37 | 2.4.0, the crew lifecycle |
+| B37 | shipped in 2.4.0, the crew lifecycle (ADR 032) |
 | B38 | 2.5.1, the server's own crews in arenas |
 | B39 | an HTTP exchange leaves nothing behind (*Waiting on another project*) |
 | B41 | shipped in 2.3.2 |
 | C | the rows of *Waiting on another project* |
 | D1–D9, F7 | *Settled decisions* and *Decisions for the user*, by their titles |
 | F2 | 2.4.3, hierarchical crews |
-| F3 | 2.4.0, the crew lifecycle |
+| F3 | shipped in 2.4.0, the crew lifecycle (ADR 032); its resync snapshot at 2.5.0 |
 | F4 | 2.5.0, durable execution |
 | F5 | 2.4.1, budgets and caps |
 | F8 | 2.6.0, MCP 2026-07-28 and A2A 1.0 |

@@ -108,6 +108,7 @@
 # =========================================================================
 
 include "src/done_word.cyr"
+include "src/log_fields.cyr"
 
 # Pick the highest-scoring agent for a task, or 0 when the roster is empty.
 #
@@ -1064,6 +1065,7 @@ fn _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id: 
 
     var miss: i64[1];
     var st = _agnosai_tool_task_new_a(a, ra, loop, task, agent, self_sc, &miss);
+    if (st != 0) { _agnosai_tool_task_with_events(st, event_tx); }
     var result = 0;
     if (st == 0) {
         _agnosai_crew_log_a(a, SK_WARN, "task refused: its agent names a tool it cannot have", 51,
@@ -1208,8 +1210,10 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
 # the job is how a worker thread gets its parent, because a `thread_create`
 # worker starts with an empty thread-local block (ADR 023).
 #
-# `ALLOC` is the crew's allocator (ADR 028). `DONE` turns 1 as the worker's last act,
-# and is what the wave waits on: see `src/done_word.cyr`.
+# `ALLOC` is the crew's allocator (ADR 028). `DONE` turns 1 when the worker is over.
+# `SLOTS` and `TAIL` are its batch's: a worker that finishes takes the next slot and puts
+# its job there as its last act, and the wave waits on the slots in turn, so it hears of
+# each job as it finishes, in completion order (ADR 032). See `src/done_word.cyr`.
 enum AgnosaiCrewJobOff {
     AGN_CJ_TASK = 0;
     AGN_CJ_AGENT = 8;
@@ -1223,7 +1227,23 @@ enum AgnosaiCrewJobOff {
     AGN_CJ_DONE = 72;
     # The crew's tools, or 0 (ADR 029).
     AGN_CJ_LOOP = 80;
-    AGN_CJ_SIZE = 88;
+    AGN_CJ_SLOTS = 88;
+    AGN_CJ_TAIL = 96;
+    # The runner, for a worker whose task's answer needs a reviewer (ADR 032), or 0.
+    AGN_CJ_RUNNER = 104;
+    AGN_CJ_SIZE = 112;
+}
+
+# Say a job is over: `DONE`, then its batch's next slot, which is the worker's last touch of
+# anything the wave holds. A job outside a wave (`SLOTS` 0) has only `DONE`.
+fn _agnosai_crew_job_done(job): i64 {
+    var slots = load64(job + AGN_CJ_SLOTS);
+    var tail = load64(job + AGN_CJ_TAIL);
+    agnosai_done_word_set(job + AGN_CJ_DONE);
+    if (slots == 0) { return 0; }
+    var k = atomic_fetch_add(tail, 1);
+    agnosai_done_word_set_value(slots + k * 8, job);
+    return 0;
 }
 
 # Say a job is over, and wake the wave if it is parked on that.
@@ -1241,13 +1261,20 @@ fn _agnosai_crew_worker(job): i64 {
     if (cancelled != 0 && load64(cancelled) != 0) {
         store64(job + AGN_CJ_RESULT, agnosai_task_result_new_a(a, agnosai_task_id(task),
             str_from_a(a, "crew cancelled"), AGNOSAI_STATUS_FAILED));
-        agnosai_done_word_set(job + AGN_CJ_DONE);
+        _agnosai_crew_job_done(job);
         return 0;
     }
-    store64(job + AGN_CJ_RESULT, agnosai_execute_task_with_tools_a(a, task,
-        load64(job + AGN_CJ_AGENT), load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX),
-        load64(job + AGN_CJ_CREW_ID), load64(job + AGN_CJ_TRACE), load64(job + AGN_CJ_LOOP)));
-    agnosai_done_word_set(job + AGN_CJ_DONE);
+    var result = agnosai_execute_task_with_tools_a(a, task,
+      load64(job + AGN_CJ_AGENT), load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX),
+      load64(job + AGN_CJ_CREW_ID), load64(job + AGN_CJ_TRACE), load64(job + AGN_CJ_LOOP));
+    # On this worker's thread, so a task waiting on its reviewer holds up no other.
+    var runner = load64(job + AGN_CJ_RUNNER);
+    if (runner != 0) {
+        result = _agnosai_crew_review_a(a, runner, task, load64(job + AGN_CJ_AGENT), result,
+          load64(job + AGN_CJ_EVENT_TX));
+    }
+    store64(job + AGN_CJ_RESULT, result);
+    _agnosai_crew_job_done(job);
     return 0;
 }
 
@@ -1275,7 +1302,15 @@ enum AgnosaiCrewRunnerOff {
     AGN_CR_JOURNAL = 88;
     # What every task is handed, built when the run starts: a deadline may be set up to then.
     AGN_CR_LOOP = 96;
-    AGN_CR_SIZE = 104;
+    # The gate a task whose answer needs a reviewer waits on, or 0, and whether `medium` risk
+    # needs one too (ADR 032). With no gate such a task is refused.
+    AGN_CR_GATE = 104;
+    AGN_CR_APPROVE_MEDIUM = 112;
+    # The crew's registered state, whose status the approval roll-up moves, or 0 for a runner
+    # outside an orchestrator. And how many of its tasks await a decision now.
+    AGN_CR_STATE = 120;
+    AGN_CR_AWAITING = 128;
+    AGN_CR_SIZE = 136;
 }
 
 # Initial chunk for the sequential run's audit scratch.
@@ -1306,6 +1341,40 @@ fn agnosai_crew_runner_new(spec): i64 {
     store64(r + AGN_CR_TOOLS, 0);
     store64(r + AGN_CR_JOURNAL, 0);
     store64(r + AGN_CR_LOOP, 0);
+    store64(r + AGN_CR_GATE, 0);
+    store64(r + AGN_CR_APPROVE_MEDIUM, 0);
+    store64(r + AGN_CR_STATE, 0);
+    store64(r + AGN_CR_AWAITING, 0);
+    return r;
+}
+
+# Give the runner the gate a task whose answer needs a reviewer waits on, and say whether a
+# `medium` task needs one as well as a `high` one (`require_medium` 1). Returns the runner.
+#
+# ⚠ **With no gate, a task that needs a reviewer is refused** (ADR 032): its answer is
+# withheld and it fails, as there is nobody to approve it. The orchestrator gives every runner
+# its own gate (`agnosai_orchestrator_approval_gate`).
+fn agnosai_crew_runner_with_approval(r, gate, require_medium): i64 {
+    store64(r + AGN_CR_GATE, gate);
+    var m = 0;
+    if (require_medium == 1) { m = 1; }
+    store64(r + AGN_CR_APPROVE_MEDIUM, m);
+    return r;
+}
+
+# The runner's approval gate, or 0.
+fn agnosai_crew_runner_approval_gate(r): i64 {
+    return load64(r + AGN_CR_GATE);
+}
+
+# How many of the crew's tasks are waiting on a reviewer now.
+fn agnosai_crew_runner_awaiting(r): i64 {
+    return atomic_load(r + AGN_CR_AWAITING);
+}
+
+# The registered state whose status the approval roll-up moves (the orchestrator's).
+fn _agnosai_crew_runner_with_state(r, state): i64 {
+    store64(r + AGN_CR_STATE, state);
     return r;
 }
 
@@ -1534,6 +1603,146 @@ fn _agnosai_crew_audit_task(r, task, result, agent): i64 {
       agnosai_task_description(task), md);
 }
 
+# ── the approval gate (ADR 032) ─────────────────────────────────────────────
+#
+# A task whose risk needs a reviewer — `high`, or `medium` when the runner says so — has its
+# answer held after the model gives it: the task goes `awaiting_approval`, `approval_requested`
+# carries the answer to whoever watches, and the task waits on the gate until a reviewer
+# decides, the gate's own timeout passes, or the crew is cancelled or out of time. An approved
+# answer stands. Anything else is a rejection: the task fails and its answer is withheld, so it
+# reaches neither the crew's results nor a dependent task. Every way of not deciding rejects,
+# as the gate always has (`orchestrator/approval.cyr`).
+#
+# **Only a completed answer is reviewed.** A task that failed has nothing to approve.
+#
+# The crew rolls up: it reads `awaiting_approval` while any of its tasks does, as herdr's
+# `blocked` does. A cancel overrides it, as a terminal state is never moved again.
+
+# One lock for every crew's roll-up: it is taken only when a task starts or stops waiting on a
+# reviewer, so it is never contended in earnest, and it costs no crew an allocation of its own.
+var _AGNOSAI_CREW_ROLLUP_LOCK = mutex_new();
+
+# Move the crew's count of tasks awaiting a decision by `delta`, and its registered status
+# with it: RUNNING to AWAITING_APPROVAL as the first task starts waiting, and back as the last
+# stops. Each by compare-and-swap, so a cancel that landed between stands.
+fn _agnosai_crew_rollup(r, delta): i64 {
+    mutex_lock(_AGNOSAI_CREW_ROLLUP_LOCK);
+    var n = load64(r + AGN_CR_AWAITING) + delta;
+    atomic_store(r + AGN_CR_AWAITING, n);
+    var st = load64(r + AGN_CR_STATE);
+    if (st != 0) {
+        if (delta > 0 && n == 1) {
+            atomic_cas(st + AGN_CSTATE_STATUS, AGNOSAI_CREW_RUNNING, AGNOSAI_CREW_AWAITING_APPROVAL);
+        }
+        if (delta < 0 && n == 0) {
+            atomic_cas(st + AGN_CSTATE_STATUS, AGNOSAI_CREW_AWAITING_APPROVAL, AGNOSAI_CREW_RUNNING);
+        }
+    }
+    mutex_unlock(_AGNOSAI_CREW_ROLLUP_LOCK);
+    return n;
+}
+
+# Whether `result`, the answer to `task`, needs a reviewer before it stands.
+fn _agnosai_crew_needs_review(r, task, result): i64 {
+    if (agnosai_task_result_status(result) != AGNOSAI_STATUS_COMPLETED) { return 0; }
+    return agnosai_requires_approval(agnosai_task_risk(task), load64(r + AGN_CR_APPROVE_MEDIUM));
+}
+
+# Send `approval_requested` on `tx`, when someone is subscribed: the answer a reviewer judges.
+fn _agnosai_crew_emit_review_a(a, r, tx, task, agent, result): i64 {
+    if (tx == 0) { return 0; }
+    if (agnosai_event_sender_receiver_count(tx) == 0) { return 0; }
+    var key = 0;
+    if (agent != 0) { key = agnosai_agent_key(agent); }
+    var req = alloc_via(a, AGN_AR_SIZE);
+    store64(req + AGN_AR_TASK_ID, agnosai_task_id(task));
+    store64(req + AGN_AR_OUTPUT, agnosai_task_result_output(result));
+    store64(req + AGN_AR_RISK, agnosai_task_risk(task));
+    store64(req + AGN_AR_AGENT, key);
+    return agnosai_event_sender_send(tx, agnosai_crew_event_new_a(a,
+        agnosai_crew_id(load64(r + AGN_CR_SPEC)), str_from_a(a, "approval_requested"),
+        agnosai_approval_request_to_value_a(a, req)));
+}
+
+# Send `approval_decided` on `tx`, when someone is subscribed.
+fn _agnosai_crew_emit_decided_a(a, r, tx, task, decision, reason: Str): i64 {
+    if (tx == 0) { return 0; }
+    if (agnosai_event_sender_receiver_count(tx) == 0) { return 0; }
+    var d = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "task_id"), bayan_json_v_str_new_a(a, agnosai_task_id(task)));
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "decision"),
+      bayan_json_v_str_new_a(a, agnosai_approval_decision_to_wire(decision)));
+    bayan_json_v_obj_set_a(a, d, str_from_a(a, "reason"), bayan_json_v_str_new_a(a, reason));
+    return agnosai_event_sender_send(tx, agnosai_crew_event_new_a(a,
+        agnosai_crew_id(load64(r + AGN_CR_SPEC)), str_from_a(a, "approval_decided"), d));
+}
+
+# Audit a decision, when a chain is attached: who decided what is the trail's business. On the
+# global heap and owning its strings, as the entry outlives a crew in an arena (ADR 028).
+fn _agnosai_crew_audit_decided(r, task, decision, reason: Str): i64 {
+    if (load64(r + AGN_CR_AUDIT) == 0) { return 0; }
+    var level = str_from("info");
+    if (decision != AGNOSAI_APPROVAL_APPROVED) { level = str_from("warn"); }
+    var md = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(md, str_from("crew_id"),
+      bayan_json_v_str_new(str_clone(agnosai_crew_id(load64(r + AGN_CR_SPEC)))));
+    bayan_json_v_obj_set(md, str_from("task_id"), bayan_json_v_str_new(str_clone(agnosai_task_id(task))));
+    bayan_json_v_obj_set(md, str_from("decision"),
+      bayan_json_v_str_new(agnosai_approval_decision_to_wire(decision)));
+    bayan_json_v_obj_set(md, str_from("reason"), bayan_json_v_str_new(reason));
+    return _agnosai_crew_audit(r, str_from("approval_decided"), level, agnosai_task_description(task), md);
+}
+
+# Hold `result` for a reviewer when `task` needs one, and return what stands: `result` as it was,
+# or, rejected, the same result FAILED with its answer withheld. `tx` is the sender this task's
+# events go on, or 0. In `a`, the crew's allocator.
+fn _agnosai_crew_review_a(a, r, task, agent, result, tx): i64 {
+    if (_agnosai_crew_needs_review(r, task, result) == 0) { return result; }
+    var task_id = agnosai_task_id(task);
+    agnosai_task_with_status(task, AGNOSAI_STATUS_AWAITING_APPROVAL);
+    _agnosai_crew_rollup(r, 1);
+
+    # Registered before it is announced, so a reviewer acting on the event finds it pending.
+    var gate = load64(r + AGN_CR_GATE);
+    var ch = 0;
+    if (gate != 0) { ch = agnosai_approval_request(gate, task_id); }
+    _agnosai_crew_emit_review_a(a, r, tx, task, agent, result);
+
+    var why: i64[1];
+    store64(&why, AGNOSAI_APPROVAL_REASON_NO_GATE);
+    var decision = AGNOSAI_APPROVAL_REJECTED;
+    if (gate != 0) {
+        decision = agnosai_approval_wait_until(gate, ch, task_id, load64(r + AGN_CR_CANCELLED),
+          load64(r + AGN_CR_DEADLINE_NS), &why);
+    }
+    var reason = load64(&why);
+    # Out of time while it waited: the crew has timed out, as it would at its next loop head.
+    if (reason == AGNOSAI_APPROVAL_REASON_DEADLINE) { store64(r + AGN_CR_TIMED_OUT, 1); }
+
+    _agnosai_crew_rollup(r, 0 - 1);
+    agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
+    _agnosai_crew_emit_decided_a(a, r, tx, task, decision, reason);
+    _agnosai_crew_audit_decided(r, task, decision, reason);
+    agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "approval"),
+      bayan_json_v_str_new_a(a, agnosai_approval_decision_to_wire(decision)));
+    agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "approval_reason"),
+      bayan_json_v_str_new_a(a, reason));
+    if (decision == AGNOSAI_APPROVAL_APPROVED) { return result; }
+
+    if (sakshi_get_level() >= SK_WARN) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start(&f, task_id);
+        n = agnosai_log_field_str(&f, n, "reason", reason);
+        sakshi_log_kv(SK_WARN, "task output withheld: approval rejected", 39, "task_id", 7, &f, n);
+    }
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "output withheld: approval rejected (");
+    str_builder_add_a(a, sb, reason);
+    str_builder_add_cstr_a(a, sb, ")");
+    agnosai_task_result_with_output(result, str_builder_build_a(a, sb));
+    return agnosai_task_result_with_status(result, AGNOSAI_STATUS_FAILED);
+}
+
 # Run every task in order on this thread — the oracle's `run_sequential`.
 #
 # Checks cancellation before each task and stops rather than failing the rest,
@@ -1559,15 +1768,20 @@ fn _agnosai_crew_run_sequential(r): i64 {
     var a = load64(r + AGN_CR_ALLOC);
     var results = vec_new_a(a);
 
-    # Two event names, minted once rather than once per task — and one check
-    # for whether the payloads are worth building at all.
+    # Two event names, minted once rather than once per task.
     var ev_started = str_from_a(a, "task_started");
     var ev_completed = str_from_a(a, "task_completed");
-    var wants_events = _agnosai_crew_wants_events(r);
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
         if (_agnosai_crew_deadline_passed(r) == 1) { break; }
 
+        # ⚠ **Asked per task, not once per run (ADR 032).** A subscriber that attached after the
+        # run began got nothing until `crew_completed` through 2.3.8. The task's sender goes to it
+        # only when someone is subscribed, so an unwatched bus builds no token either, as a wave's
+        # workers already did not.
+        var wants_events = _agnosai_crew_wants_events(r);
+        var task_tx = 0;
+        if (wants_events == 1) { task_tx = load64(r + AGN_CR_EVENT_TX); }
         var task = vec_get(tasks, i);
         var agent = _agnosai_crew_pick_best_agent_a(a, agents, task);
         agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
@@ -1577,8 +1791,9 @@ fn _agnosai_crew_run_sequential(r): i64 {
 
         agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
         var result = agnosai_execute_task_with_tools_a(a, task, agent, client,
-          load64(r + AGN_CR_EVENT_TX), agnosai_crew_id(spec), load64(r + AGN_CR_TRACE),
+          task_tx, agnosai_crew_id(spec), load64(r + AGN_CR_TRACE),
           load64(r + AGN_CR_LOOP));
+        result = _agnosai_crew_review_a(a, r, task, agent, result, task_tx);
         agnosai_task_with_status(task, agnosai_task_result_status(result));
 
         if (wants_events == 1) {
@@ -1603,7 +1818,7 @@ fn _agnosai_crew_run_sequential(r): i64 {
 # stack, so a crew cost over 4 KiB per task for good, in any arena. A detached thread
 # keeps both in its own mapping and unmaps it, and allocates nothing, which is why
 # `agnosai_orchestrator_submit_crew` uses one too. It leaves no handle to join, so the
-# job's `DONE` word does that work, in dispatch order, as the join did.
+# batch's slots do that work: a worker that is over puts its job in the next one.
 #
 # `max_concurrency` of 0 or less runs everything in one batch, matching the
 # oracle's `Semaphore::new(0)` being a caller error rather than a stall.
@@ -1611,17 +1826,17 @@ fn _agnosai_crew_run_sequential(r): i64 {
 # ## Events say what happened, when it happened (ADR 022)
 #
 # **`task_started` is emitted as a task is dispatched to its worker**, which is
-# when its batch starts, and **`task_completed` as its worker is joined**, in
-# dispatch order. A task the deadline or a cancel stopped before dispatch gets
-# neither. The oracle emits `task_started` for a whole parallel crew up front
-# (`crew_runner.rs:337-348` as of tag 2.1.4) — the port did the same and also
-# held every `task_completed` until the last batch had joined, so a watcher saw
-# a whole wave "started" and could not tell running from done. The oracle emits
-# `task_completed` per join (`:400-411`, DAG `:521-535`), in COMPLETION order:
-# `join_next` yields whichever task finishes first. The completed half moves
-# back to per-join reporting but joins a batch in dispatch order, so a fast task
-# is reported after any slower one dispatched before it in the same batch, and
-# never later than the end of that batch. Both halves diverge deliberately.
+# when its batch starts, and **`task_completed` as its worker finishes**, in
+# completion order (ADR 032). A task the deadline or a cancel stopped before
+# dispatch gets neither. The oracle emits `task_started` for a whole parallel crew
+# up front (`crew_runner.rs:337-348` as of tag 2.1.4) — the port did the same and
+# also held every `task_completed` until the last batch had joined, so a watcher
+# saw a whole wave "started" and could not tell running from done. The oracle
+# emits `task_completed` per join (`:400-411`, DAG `:521-535`), in completion
+# order: `join_next` yields whichever task finishes first. ADR 022 moved back to
+# per-join reporting in dispatch order, and ADR 032 to completion order, which
+# is the oracle's. The results stay in dispatch order, where the oracle's are in
+# completion order, and `task_started` stays at dispatch.
 #
 # **Workers emit `token` events**, as the sequential path does. The oracle
 # passes `None` here (`:393`, `:514`), and this comment used to add "two threads
@@ -1637,15 +1852,12 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
     var a = load64(r + AGN_CR_ALLOC);
     var ev_started = str_from_a(a, "task_started");
     var ev_completed = str_from_a(a, "task_completed");
-    var wants_events = _agnosai_crew_wants_events(r);
     var client = load64(r + AGN_CR_CLIENT);
     var spec = load64(r + AGN_CR_SPEC);
     var limit = agnosai_process_max_concurrency(agnosai_crew_process(spec));
     if (limit <= 0) { limit = vec_len(tasks); }
     if (limit <= 0) { return results; }
 
-    var worker_tx = 0;
-    if (wants_events == 1) { worker_tx = load64(r + AGN_CR_EVENT_TX); }
     var crew_id = agnosai_crew_id(spec);
 
     var jobs = vec_new_a(a);
@@ -1660,12 +1872,16 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         store64(job + AGN_CJ_CLIENT, client);
         store64(job + AGN_CJ_RESULT, 0);
         store64(job + AGN_CJ_CANCELLED, load64(r + AGN_CR_CANCELLED));
-        store64(job + AGN_CJ_EVENT_TX, worker_tx);
+        # Set at dispatch, from whether anyone is subscribed then (ADR 032).
+        store64(job + AGN_CJ_EVENT_TX, 0);
         store64(job + AGN_CJ_CREW_ID, crew_id);
         store64(job + AGN_CJ_TRACE, load64(r + AGN_CR_TRACE));
         store64(job + AGN_CJ_ALLOC, a);
         store64(job + AGN_CJ_DONE, 0);
         store64(job + AGN_CJ_LOOP, load64(r + AGN_CR_LOOP));
+        store64(job + AGN_CJ_SLOTS, 0);
+        store64(job + AGN_CJ_TAIL, 0);
+        store64(job + AGN_CJ_RUNNER, r);
         vec_push_a(a, jobs, job);
     }
 
@@ -1694,11 +1910,25 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
         if (_agnosai_crew_deadline_passed(r) == 1) { break; }
 
-        # The batch is `first..next` of `jobs`, in dispatch order.
+        # ⚠ **Asked per batch, not once per wave (ADR 032)**, so a subscriber that attached
+        # mid-run is told about the batches after it. A worker gets the sender only then.
+        var wants_events = _agnosai_crew_wants_events(r);
+        var worker_tx = 0;
+        if (wants_events == 1) { worker_tx = load64(r + AGN_CR_EVENT_TX); }
+
+        # The batch is `first..next` of `jobs`, in dispatch order. Its slots are in the crew's
+        # arena, one for each worker it can hold, and its tail counts the workers that are over.
         var first = next;
         var spawned = 0;
+        var slots = alloc_via(a, limit * 8);
+        memset(slots, 0, limit * 8);
+        var tail = alloc_via(a, 8);
+        store64(tail, 0);
         while (spawned < limit && next < vec_len(jobs)) {
             var job = vec_get(jobs, next);
+            store64(job + AGN_CJ_EVENT_TX, worker_tx);
+            store64(job + AGN_CJ_SLOTS, slots);
+            store64(job + AGN_CJ_TAIL, tail);
             if (wants_events == 1) {
                 _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data_a(a,
                     load64(job + AGN_CJ_TASK), load64(job + AGN_CJ_AGENT)));
@@ -1713,11 +1943,12 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
             spawned = spawned + 1;
         }
 
-        # Wait in dispatch order and report each task as it is done, so a watcher
-        # sees this batch's tasks finish before the next batch starts.
-        for (var j = first; j < next; j = j + 1) {
-            var jb = vec_get(jobs, j);
-            agnosai_done_word_wait(jb + AGN_CJ_DONE);
+        # ⚠ **Each task is reported as it finishes, in completion order (ADR 032)**, as the
+        # oracle's `join_next` did. Through 2.3.8 the wave joined in dispatch order, so a fast
+        # task waited behind any slower one dispatched before it in its batch (ADR 022). Every
+        # task of a batch is still reported before the next batch starts.
+        for (var k = 0; k < spawned; k = k + 1) {
+            var jb = agnosai_done_word_wait_value(slots + k * 8);
             var res = load64(jb + AGN_CJ_RESULT);
             if (res != 0) {
                 agnosai_task_with_status(load64(jb + AGN_CJ_TASK),
@@ -1725,8 +1956,13 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
                 if (wants_events == 1) {
                     _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data_a(a, res));
                 }
-                vec_push_a(a, results, res);
             }
+        }
+        # The results stay in dispatch order, so a crew's state does not depend on which of its
+        # tasks happened to finish first.
+        for (var j = first; j < next; j = j + 1) {
+            var done = load64(vec_get(jobs, j) + AGN_CJ_RESULT);
+            if (done != 0) { vec_push_a(a, results, done); }
         }
     }
     return results;
@@ -2003,6 +2239,23 @@ fn _agnosai_crew_span_done(span, self_sc, parent_sc, t0, err_type): i64 {
       status);
 }
 
+# Send `crew_completed`: the crew's terminal `status`, why when it did not complete (`reason`, a
+# `AGNOSAI_CREW_REASON_*` word, or 0 to leave it out), its result count and its wall time. The
+# crew's last event on every exit (ADR 032).
+fn _agnosai_crew_emit_completed(r, status, reason, task_count, wall_ms): i64 {
+    if (_agnosai_crew_wants_events(r) == 0) { return 0; }
+    var a = load64(r + AGN_CR_ALLOC);
+    var done = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, done, str_from_a(a, "status"),
+      bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire(status)));
+    if (reason != 0) {
+        bayan_json_v_obj_set_a(a, done, str_from_a(a, "reason"), bayan_json_v_str_new_a(a, reason));
+    }
+    bayan_json_v_obj_set_a(a, done, str_from_a(a, "task_count"), bayan_json_v_int_new_a(a, task_count));
+    bayan_json_v_obj_set_a(a, done, str_from_a(a, "wall_ms"), bayan_json_v_int_new_a(a, wall_ms));
+    return _agnosai_crew_emit(r, str_from_a(a, "crew_completed"), done);
+}
+
 # Run the crew end to end — the oracle's `run`.
 #
 # Returns a CrewState, or 0 with an error stored through `out_err`. The split
@@ -2087,6 +2340,18 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
             # no task/inference counters are recorded — only the gauge unwinds.
             agnosai_metrics_record_crew_completed(agnosai_metrics_global());
             _agnosai_crew_span_done(span, self_sc, parent_sc, span_t0, "invalid_dag");
+            # ⚠ **A last word, so a subscriber is not left waiting (ADR 032).** Through 2.3.8
+            # this arm sent nothing, and the orchestrator put the crew back to PENDING, so a
+            # submitted crew that could not run read `pending` for good. A cancel that landed
+            # first stands, as it does in the registry.
+            var dag_status = AGNOSAI_CREW_FAILED;
+            var dag_reason = AGNOSAI_CREW_REASON_INVALID_DAG;
+            if (agnosai_crew_runner_is_cancelled(r) == 1) {
+                dag_status = AGNOSAI_CREW_CANCELLED;
+                dag_reason = AGNOSAI_CREW_REASON_CANCELLED;
+            }
+            _agnosai_crew_emit_completed(r, dag_status, dag_reason, 0,
+              _agnosai_crew_elapsed_ms(start_ns));
             store64(out_err, load64(&dag_err));
             return 0;
         }
@@ -2120,9 +2385,14 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     # precedence is stated rather than tested.
     var timed_out = agnosai_crew_runner_timed_out(r);
     var status = AGNOSAI_CREW_COMPLETED;
-    if (timed_out == 1) { status = AGNOSAI_CREW_FAILED; }
-    elif (agnosai_crew_runner_is_cancelled(r) == 1) { status = AGNOSAI_CREW_CANCELLED; }
-    else {
+    var reason = 0;
+    if (timed_out == 1) {
+        status = AGNOSAI_CREW_FAILED;
+        reason = AGNOSAI_CREW_REASON_TIMEOUT;
+    } elif (agnosai_crew_runner_is_cancelled(r) == 1) {
+        status = AGNOSAI_CREW_CANCELLED;
+        reason = AGNOSAI_CREW_REASON_CANCELLED;
+    } else {
         for (var i = 0; i < vec_len(results); i = i + 1) {
             if (agnosai_task_result_status(vec_get(results, i)) != AGNOSAI_STATUS_COMPLETED) {
                 status = AGNOSAI_CREW_FAILED;
@@ -2133,6 +2403,7 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
         # Counting only the results that exist is the vacuous-`all()` shape — a
         # crew reported COMPLETED for work that never ran.
         if (vec_len(results) < vec_len(tasks)) { status = AGNOSAI_CREW_FAILED; }
+        if (status == AGNOSAI_CREW_FAILED) { reason = AGNOSAI_CREW_REASON_TASK_FAILED; }
     }
 
     # Balance the active gauge and fold this crew's tasks into the counters.
@@ -2147,6 +2418,7 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     # profile (`orchestrator.rs:204-214` as of tag 2.1.4) — so a caller cannot
     # read a timed-out crew's partial output as if it had finished.
     var state = agnosai_crew_state_new_a(a, agnosai_crew_id(spec), status);
+    if (reason != 0) { agnosai_crew_state_with_reason(state, reason); }
     if (timed_out == 0) {
         for (var j = 0; j < vec_len(results); j = j + 1) {
             agnosai_crew_state_with_result_a(a, state, vec_get(results, j));
@@ -2156,16 +2428,8 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
 
     # `task_count` is the STATE's result count, not the run's, so a timed-out
     # crew reports 0 — what the stored state holds. `wall_ms` stays the real one.
-    if (_agnosai_crew_wants_events(r) == 1) {
-        var done = bayan_json_v_obj_new_a(a);
-        bayan_json_v_obj_set_a(a, done, str_from_a(a, "status"),
-          bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire(status)));
-        bayan_json_v_obj_set_a(a, done, str_from_a(a, "task_count"),
-          bayan_json_v_int_new_a(a, vec_len(agnosai_crew_state_results(state))));
-        bayan_json_v_obj_set_a(a, done, str_from_a(a, "wall_ms"),
-          bayan_json_v_int_new_a(a, wall_ms));
-        _agnosai_crew_emit(r, str_from_a(a, "crew_completed"), done);
-    }
+    _agnosai_crew_emit_completed(r, status, reason, vec_len(agnosai_crew_state_results(state)),
+      wall_ms);
 
     # ⚠ CANCELLED is an ERROR span, not OK. A collector's error rate is what an
     # operator alerts on, and a cancelled crew did not do what was asked — the
